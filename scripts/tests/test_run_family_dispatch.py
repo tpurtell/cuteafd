@@ -922,3 +922,29 @@ def test_text_only_mimo_auto_default_does_not_start_a_tower(tmp_path):
     launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-mimo" in line)
     assert "--vision auto" in launch
     assert "cuteafd plan" not in result.stderr and "--encoder-listen" not in result.stderr
+
+
+@pytest.mark.parametrize("mode,kind", [("auto", "spark"), ("spark:0", "spark"),
+                                        ("rtx:0", "rtx"), ("off", "off"), (None, "off")])
+def test_qwen_encoder_explicit_placement_and_default_off(tmp_path, mode, kind):
+    config = {"model_type": "qwen4_exp", "text_config": {"num_hidden_layers": 2,
+              "layer_types": ["linear_attention", "full_attention"]}, "vision_config": {"depth": 27}}
+    placement = {"kind": kind}
+    if kind == "spark": placement["rank"] = 0
+    if kind == "rtx": placement["gpu"] = 0
+    plan = {"placement_supported": True, "fits": True, "spark_ranks": 1,
+            "encoder_plan_hash": "ab" * 32, "encoder": {"kind": placement, "replicas": []}}
+    vision_key = f"VISION={mode}\n" if mode is not None else ""
+    result = _family_launch_result(tmp_path, config, "test/qwen", f"{vision_key}RTX_GPUS=1\nSPECULATOR=off\n", encoder_plan=plan)
+    assert result.returncode == 0, result.stderr
+    launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-qwen4" in line)
+    worker = next(line for line in result.stderr.splitlines() if "cuteafd expertd-native" in line)
+    assert f"--vision {kind}" in launch
+    assert ("--encoder-listen" in worker) == (kind == "spark")
+    assert ("--vision-peers 10.0.0.1:19442" in launch) == (kind == "spark")
+    if kind == "spark":
+        assert f"--encoder-plan-hash {'ab' * 32}" in worker
+        assert f"--encoder-plan-hash {'ab' * 32}" in launch
+        assert "--encoder-revision abc" in worker and "--encoder-revision abc" in launch
+    if kind == "off":
+        assert "cuteafd plan" not in result.stderr

@@ -223,6 +223,7 @@ pub(crate) struct Qwen4Placement {
     /// Request metadata from native ids/span grids, recomputed on prefix restore.
     /// Never radix keys; rotary coordinates never change logical cache rows.
     pub rope: cuteafd_loader::families::qwen4::RopePositions,
+    pub media: Option<cuteafd_engine::media::RequestMedia>,
 }
 
 impl Qwen4Placement {
@@ -231,7 +232,7 @@ impl Qwen4Placement {
         let pages = units.iter().flat_map(|&u| (0..UNIT_PAGES as i32).map(move |i| u as i32 * UNIT_PAGES as i32 + i))
             .collect();
         let pool_pages = units.iter().map(|&u| u as i32).collect();
-        Self { units, pages, pool_pages, slot, len: 0, state_len: 0, history, rope: Default::default() }
+        Self { units, pages, pool_pages, slot, len: 0, state_len: 0, history, rope: Default::default(), media: None }
     }
 
     pub fn record(&self, position: usize) -> Result<i64> {
@@ -247,6 +248,28 @@ impl Qwen4Placement {
         let page = *self.pool_pages.get(position / POOL_PAGE_TOKENS).context("position past the pool pages")?;
         Ok(i64::from(page) * PAGE_ROWS as i64 + ((position / BLOCK) % PAGE_ROWS) as i64)
     }
+}
+
+/// Pack media rows in the same order as native token gathers (MTP uses p+1).
+fn embedding_media(groups: &[(&Qwen4Placement, usize, usize)]) -> Result<cuteafd_engine::media::MediaChunk> {
+    let mut packed = cuteafd_engine::media::MediaChunk::default();
+    let mut offset = 0usize;
+    for &(placement, start, rows) in groups {
+        if let Some(media) = placement.media.as_ref().filter(|media| media.needed(start, start + rows).next().is_some()) {
+            let mut chunk = cuteafd_engine::media::MediaChunk::default();
+            media.write_chunk(start, start + rows, &mut chunk)?;
+            packed.indices.extend(chunk.indices.iter().map(|&index| index + offset as u32));
+            packed.features.extend(chunk.features);
+        }
+        offset += rows;
+    }
+    Ok(packed)
+}
+
+fn mtp_embedding_media(groups: &[MtpGroup<'_>]) -> Result<cuteafd_engine::media::MediaChunk> {
+    let rows: Vec<_> = groups.iter().flat_map(|group| group.rows.iter()
+        .map(move |row| (group.placement, row.position + 1, 1))).collect();
+    embedding_media(&rows)
 }
 
 /// The n-gram history after `tokens` (the PLE hash's context is a pure function of the token ids:
@@ -265,6 +288,30 @@ fn ngram_history(eos: u32, ngram_size: usize, tokens: &[u32]) -> NgramHistory {
 #[cfg(test)]
 mod tests {
     use cuteafd_loader::families::qwen4::NgramHasher;
+
+    #[test]
+    fn media_gathers_pack_sequences_and_shift_mtp_by_one_native_row() {
+        use cuteafd_engine::media::{EmbeddingCache, ImageKey, MediaSpan, RequestMedia};
+        let key = ImageKey([7;32]);
+        let mut cache = EmbeddingCache::new(16);
+        let pin = cache.reserve(key, 16).unwrap();
+        let payload: Vec<u8> = (0..16).collect();
+        let lease = cache.complete(key, std::sync::Arc::from(payload.clone())).unwrap();
+        let mut media = RequestMedia::new(vec![MediaSpan { start: 2, len: 4, key }], 2, 8).unwrap();
+        media.attach(lease).unwrap(); drop(pin);
+        let mut image = super::Qwen4Placement::new(vec![0], 0, super::NgramHistory(vec![0]));
+        image.media = Some(media);
+        let text = super::Qwen4Placement::new(vec![1], 1, super::NgramHistory(vec![0]));
+        let packed = super::embedding_media(&[(&text, 0, 2), (&image, 1, 6)]).unwrap();
+        assert_eq!(packed.indices, [3,4,5,6]); assert_eq!(packed.features, payload);
+        // MTP row p embeds token p+1, including the first image row.
+        let shifted = super::mtp_embedding_media(&[super::MtpGroup { placement: &image, rows: vec![
+            super::MtpRow { position: 1, token: 248056, source: 0 },
+            super::MtpRow { position: 4, token: 248056, source: 1 },
+        ] }]).unwrap();
+        assert_eq!(shifted.indices, [0,1]); assert_eq!(shifted.features, [0,1,2,3,12,13,14,15]);
+        assert!(super::embedding_media(&[(&image, 8, 2)]).unwrap().indices.is_empty());
+    }
 
     #[test]
     fn fp8_head_spans_cover_every_logits_row_once() {
@@ -1032,7 +1079,8 @@ impl<'a> Qwen4Engine<'a> {
         let mut tables = StepTables { page_table: placement.pages.clone(), pool_table: placement.pool_pages.clone(),
             page_stride: 0, pool_stride: 0, page_width: placement.pages.len(), ..Default::default() };
         self.rows(placement, tokens, 0, &mut tables)?;
-        let logits = self.step(&tables, tokens, logit_rows.clamp(1, t), on_layer, forced)?;
+        let media = embedding_media(&[(placement, start, t)])?;
+        let logits = self.step(&tables, tokens, logit_rows.clamp(1, t), on_layer, forced, &media)?;
         placement.len += t;
         placement.state_len = placement.len;
         Ok(logits)
@@ -1094,7 +1142,12 @@ impl<'a> Qwen4Engine<'a> {
             }
         }
         tables.pool_width = tables.pool_width.next_power_of_two().min(pool_stride);
-        let logits = self.step(&tables, &tokens, rows, on_layer, None)?;
+        let media = if sequences.iter().any(|(p, t)| p.media.as_ref()
+            .is_some_and(|media| media.needed(p.len, p.len + t.len()).next().is_some())) {
+            let media_rows: Vec<_> = sequences.iter().map(|(p, t)| (&**p, p.len, t.len())).collect();
+            embedding_media(&media_rows)?
+        } else { Default::default() };
+        let logits = self.step(&tables, &tokens, rows, on_layer, None, &media)?;
         for (placement, tokens) in sequences.iter_mut() {
             placement.len += tokens.len();
             if !spec {
@@ -1289,6 +1342,11 @@ impl<'a> Qwen4Engine<'a> {
                     None, w.x.buffer, self.stream)? };
             }
         }
+        if matches!(tokens, MtpTokens::Host(_)) && groups.iter().any(|group| group.placement.media.as_ref()
+            .is_some_and(|media| group.rows.iter().any(|row| media.needed(row.position + 1, row.position + 2).next().is_some()))) {
+            let media = mtp_embedding_media(groups)?;
+            self.inject_media(w, &media, &tables.seq_first, &w.x, t, 1)?;
+        }
         let rows = Scalar::I32(t as i32);
         let cap = if decode { "m64" } else { "m4096" };
         self.run("qwen4_mtp_feedback", &[("hidden", src), ("hidden_rows", w.hidden_rows.buffer.ptr),
@@ -1368,8 +1426,18 @@ impl<'a> Qwen4Engine<'a> {
         self.download(&w.streams[cur], rows * HC * self.cfg.hidden * 2)
     }
 
+    fn inject_media(&self, w: &Workspace<'_>, media: &cuteafd_engine::media::MediaChunk,
+        seq_first: &[i32], out: &Dev<'_>, rows: usize, copies: usize) -> Result<()> {
+        if media.indices.is_empty() { return Ok(()); }
+        // Scratch is consumed before norm/feedback; injection drains before the
+        // reused sequence table is restored. Graph storage stays unchanged.
+        self.library.embedding_injection()?.inject_host(&media.features, &media.indices,
+            w.delta.buffer, w.seq_first.buffer, out.buffer, rows, self.cfg.hidden, copies, self.stream)?;
+        self.put(&w.seq_first, seq_first)
+    }
+
     fn step(&self, tables: &StepTables, tokens: &[u32], logit_rows: usize, mut on_layer: LayerHook<'_>,
-        forced: Forced<'_>) -> Result<Option<DeviceLogits>> {
+        forced: Forced<'_>, media: &cuteafd_engine::media::MediaChunk) -> Result<Option<DeviceLogits>> {
         let (h, t) = (self.cfg.hidden, tables.kv_slots.len());
         let (slot, capacity) = if tables.decode { (&self.decode_workspace, DECODE_ROWS) } else { (&self.workspace, self.prefill_rows) };
         if slot.borrow().as_ref().is_some_and(|w| w.logit_rows < logit_rows) {
@@ -1405,8 +1473,9 @@ impl<'a> Qwen4Engine<'a> {
         // Streams start as four copies of the embedding.
         let row = h * 2;
         ensure!(tokens.len() == t, "{} tokens for a {t}-row step", tokens.len());
-        let graphed = self.use_graphs && tables.decode && on_layer.is_none() && forced.is_none();
+        let graphed = self.use_graphs && tables.decode && on_layer.is_none() && forced.is_none() && media.indices.is_empty();
         self.stage_embedding(w, tokens, HC, &w.streams[0], graphed)?;
+        self.inject_media(w, media, &tables.seq_first, &w.streams[0], t, HC)?;
         let rows = Scalar::I32(t as i32);
         if graphed {
             return self.decode_graphed(w, tables, t, rows, logit_rows);

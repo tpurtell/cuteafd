@@ -598,7 +598,7 @@ vision_peers=()
 encoder_ranks=()
 encoder_hash=""
 encoder_port=$((port + 1))
-if [[ "$family" == mimo_v2 && "$vision" != off ]] &&
+if [[ "$family" =~ ^(mimo_v2|qwen4)$ && "$vision" != off ]] &&
    python3 -c 'import json,sys; sys.exit(0 if json.load(open(sys.argv[1])).get("vision_config") else 1)' "$root/snapshots/$revision/config.json"; then
   plan_rtx=1; ((head_split == 0)) || plan_rtx=2
   plan_pool="$(get POOL_TOKENS 32768)"; [[ "$plan_pool" != auto ]] || plan_pool=0
@@ -630,7 +630,7 @@ else: raise ValueError("idle-host launch needs an explicit inventory")
     family_args+=(--vision-peers "$(IFS=,; printf '%s' "${vision_peers[*]}")" --encoder-plan-hash "$encoder_hash" --encoder-revision "$revision")
   fi
 elif [[ "$vision" == spark* || "$vision" == rtx* ]]; then
-  release_die "explicit encoder placement requires a supported MiMo vision checkpoint"
+  release_die "explicit encoder placement requires a supported MiMo or Qwen vision checkpoint"
 fi
 # Replace the original policy with the selected placement, without duplicated flags.
 for ((arg = 0; arg < ${#family_args[@]}; arg++)); do

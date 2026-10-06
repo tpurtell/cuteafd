@@ -50,6 +50,9 @@ async fn main() -> Result<()> {
     let audio = family_audio.or(initial_audio).unwrap_or(cuteafd_loader::plan::MediaMode::Off);
     if let Commands::Plan(args) = &mut command { args.vision = vision; args.audio = audio; }
     if let Commands::ServeMimo(args) = &mut command { args.vision = vision; }
+    if let Commands::ServeQwen4(args) = &mut command {
+        args.vision = family_vision.or(initial_vision).unwrap_or(cuteafd_loader::plan::MediaMode::Off);
+    }
     cuteafd_api::openai::set_media_input_policy(vision != cuteafd_loader::plan::MediaMode::Off,
         audio != cuteafd_loader::plan::MediaMode::Off);
     cuteafd_api::openai::media::set_preparation_policy(
