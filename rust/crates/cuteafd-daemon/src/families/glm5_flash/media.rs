@@ -109,10 +109,10 @@ pub(super) enum Encoder {
 }
 impl Encoder {
     pub fn health_handle(&self) -> Option<Arc<std::sync::atomic::AtomicBool>> {
-        match self { Self::Remote(client) => Some(client.health_handle()), _ => None }
+        match self { Self::Remote(client) => Some(client.health_handle()), Self::Local(client) => Some(client.health_handle()), Self::Off => None }
     }
     pub fn available(&self) -> bool {
-        match self { Self::Remote(client) => client.healthy(), Self::Local(_) => true, Self::Off => false }
+        match self { Self::Remote(client) => client.healthy(), Self::Local(client) => client.healthy(), Self::Off => false }
     }
 }
 impl cuteafd_engine::media::EncoderClient for Encoder {
@@ -382,7 +382,7 @@ mod tests {
     }
     fn image() -> Arc<PreparedImage> {
         Arc::new(PreparedImage { key: ImageKey([7; 32]), grid: ImageGrid { t: 1, h: 4, w: 4 },
-            rgb8: Arc::from(vec![0; 4 * 4 * 768]), tokens: 4 })
+            rgb8: Arc::from(vec![0; 4 * 4 * 14 * 14 * 3]), tokens: 4 })
     }
     fn feature_request() -> (Prompt, RequestMedia, serde_json::Value) {
         use cuteafd_api::openai::probe::{Probe, ProbeSpec, ProbeMedia, ProbeFixture, ProbeImageUrl};
