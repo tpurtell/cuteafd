@@ -244,6 +244,20 @@ mod tests {
         }
     }
     #[test]
+    #[ignore = "requires an installed official GLM HF snapshot"]
+    fn installed_snapshot_is_header_only_and_has_347_tensors() {
+        let path = std::env::var("CUTEAFD_GLM_VISION_SNAPSHOT").expect("snapshot path");
+        let spec = TowerSpec::from_snapshot(Path::new(&path), 4096).unwrap();
+        assert_eq!(spec.reads.len(), 347);
+        assert_eq!(spec.native.hidden, 1024);
+        assert_eq!(spec.native.output_width, 4096);
+        assert_eq!(spec.native.blocks[0].key0_bias, NO_VISION_OFFSET);
+        assert_eq!(
+            spec.image_family(),
+            cuteafd_loader::media::ImageFamily::GlmFlash
+        );
+    }
+    #[test]
     fn header_plan_fuses_gate_up_and_does_not_open_text_shards() {
         use std::io::Write;
         let dir = tempfile::tempdir().unwrap();
@@ -315,7 +329,11 @@ mod tests {
             serde_json::to_vec(&serde_json::json!({"weight_map":map})).unwrap(),
         )
         .unwrap();
-        let spec = TowerSpec::glm_flash(dir.path(), 4096).unwrap();
+        let spec = TowerSpec::from_snapshot(dir.path(), 4096).unwrap();
+        assert_eq!(
+            spec.image_family(),
+            cuteafd_loader::media::ImageFamily::GlmFlash
+        );
         assert_eq!(spec.reads.len(), 347);
         assert_eq!(spec.native.reserved, 3);
         for i in 0..24 {

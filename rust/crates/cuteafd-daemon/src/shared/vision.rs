@@ -191,6 +191,7 @@ impl TowerSpec {
         match cfg["model_type"].as_str() {
             Some("mimo_v2") => Self::mimo(snapshot, max_tokens),
             Some("qwen4_exp") => Self::qwen(snapshot, max_tokens),
+            Some("glm5_next") => Self::glm_flash(snapshot, max_tokens),
             kind => Err(VisionError::Unsupported(format!("tower model_type {kind:?}; add a tower exporter/kernel"))),
         }
     }
