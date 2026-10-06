@@ -2,7 +2,7 @@
 use super::{normalization_lut, remote::{EncoderHandshake, EncoderServer}, EncoderService, TowerSpec};
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::vision::NativeVision;
-use cuteafd_loader::media::{ImageFamily, ProcessorConfig};
+use cuteafd_loader::media::ProcessorConfig;
 use std::{path::{Path, PathBuf}, time::Duration};
 
 #[derive(Clone, Debug)]
@@ -27,12 +27,12 @@ fn architecture(library: &Path) -> Result<u32> {
 /// Returns a server only after the tower owner has reported ready. The caller
 /// subtracts this exact ledger before any expert weight/workspace admission.
 pub fn start(config: &EncoderWorkerConfig, snapshot: &Path, library: PathBuf, budget: u64) -> Result<(EncoderServer, u64)> {
-    let spec = TowerSpec::mimo(snapshot, config.max_tokens)?;
+    let spec = TowerSpec::from_snapshot(snapshot, config.max_tokens)?;
     let sm = architecture(&library)?;
     let id = spec.encoder_id(&config.revision, sm);
     let ledger = NativeVision::required(&library, &spec.native)?;
     ensure!(ledger.total_bytes() <= budget, "vision tower admission needs {} bytes, budget {budget}", ledger.total_bytes());
-    let processor = ProcessorConfig::from_snapshot(snapshot, ImageFamily::Mimo)?;
+    let processor = ProcessorConfig::from_snapshot(snapshot, spec.image_family())?;
     let handshake = EncoderHandshake { encoder_id: id, max_patches: (config.max_tokens * 4) as u32,
         output_width: spec.native.output_width, patch_size: processor.patch, merge_size: processor.merge, plan_hash: config.plan_hash };
     let service = EncoderService::start(spec, library, 0, ledger.total_bytes())?;
