@@ -1,6 +1,7 @@
 //! Cold-path tower description, resident runtime and bounded local owner service.
 //! MiMo arithmetic/order is ported from Hugh Madden's mimo26f-afd v1.3.0,
 //! crates/mimo26-coordinator/src/vision.rs; weights are resident, never transient.
+mod glm_flash;
 pub mod local;
 pub mod remote;
 pub mod worker;
