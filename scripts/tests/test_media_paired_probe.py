@@ -40,6 +40,58 @@ def test_capture_retains_http_error_body(tmp_path, monkeypatch, family):
     assert not (args.out / "capture.json").exists()
 
 
+def test_server_key_translation_preserves_sealed_window():
+    import copy
+    span = {"start": 2, "len": 1, "kind": "image", "key": "a" * 64, "grid": [1, 2, 2],
+            "fixture": {"path": "image.png", "sha256": "b" * 64}}
+    window = {"tokens": [1, 2, 9, 3], "roles": ["ctx"] * 4, "score_from": 3, "media": [span]}
+    original = copy.deepcopy(window)
+    mapping = {span["key"]: {"old_key": span["key"], "new_key": "c" * 64,
+        "grid": span["grid"], "len": span["len"], "fixture": span["fixture"]}}
+    translated = module.mapped_window(window, mapping)
+    assert window == original
+    assert translated["media"][0]["key"] == "c" * 64
+    translated["media"][0]["key"] = span["key"]
+    assert translated == original
+    mapping[span["key"]]["grid"] = [1, 4, 4]
+    with pytest.raises(ValueError, match="geometry"):
+        module.mapped_window(window, mapping)
+
+
+def test_normal_server_echo_supplies_key_and_preserves_pixels(tmp_path, monkeypatch):
+    import hashlib
+    import io
+    from types import SimpleNamespace
+    Image = pytest.importorskip("PIL.Image")
+    data = io.BytesIO()
+    pixels = Image.new("RGB", (4, 4), (17, 29, 53))
+    pixels.save(data, format="PNG")
+    data = data.getvalue()
+    span = {"key": "a" * 64, "len": 1, "grid": [1, 2, 2],
+        "fixture": {"path": "image.png", "sha256": hashlib.sha256(data).hexdigest()}}
+    panel = {"checkpoint": "model", "family": "qwen4", "windows": [{"media": [span]}, {"media": [span]}]}
+    monkeypatch.setattr(module, "read_fixture", lambda *args: data)
+    calls = []
+    def http(url, token, body, timeout):
+        calls.append(body)
+        assert "prompt_ids" not in body["spec"] and "media" not in body["spec"]
+        assert body["body"]["messages"][0]["content"][0]["type"] == "image_url"
+        return {"server": {"model": "model", "family": "qwen4"}, "probe": {"media": [{"kind": "image",
+            "key": "c" * 64, "grid": span["grid"], "len": 1}]}}
+    monkeypatch.setattr(module, "http", http)
+    args = SimpleNamespace(media_root=tmp_path, out=tmp_path, url="http://localhost", bench_token=None,
+                           timeout=10, mode="native")
+    mapping = module.discover_keys(args, panel)
+    assert len(calls) == 1
+    assert mapping[span["key"]]["new_key"] == "c" * 64
+    assert mapping[span["key"]]["pixel_sha256"] == hashlib.sha256(pixels.tobytes()).hexdigest()
+    capture = {"key_mapping_sha256": module.file_hash(tmp_path / "key-mapping.json"), "server": {"model": "model", "family": "qwen4"}}
+    assert module.capture_mapping(tmp_path, capture) == mapping
+    (tmp_path / (span["key"] + ".prepare.json")).write_text("{}")
+    with pytest.raises(ValueError, match="evidence changed"):
+        module.capture_mapping(tmp_path, capture)
+
+
 def test_window_bootstrap_is_paired_and_deterministic():
     stats, counts = [[.02, .01], [.04, .02]], [10, 20]
     result = module.paired_bounds(stats, counts, 500, 7)
@@ -110,7 +162,8 @@ def test_log_probs_validate_shape_and_normalize(tmp_path):
 
 
 @pytest.mark.parametrize("family", module.FAMILIES)
-def test_compare_uses_golden_difference_not_direct_kl(tmp_path, monkeypatch, family):
+@pytest.mark.parametrize("server_keys", (False, True))
+def test_compare_uses_golden_difference_not_direct_kl(tmp_path, monkeypatch, family, server_keys):
     import hashlib
     from types import SimpleNamespace
     from safetensors.numpy import save_file
@@ -186,6 +239,19 @@ def test_compare_uses_golden_difference_not_direct_kl(tmp_path, monkeypatch, fam
             capture["windows"].append({"id": window["id"], "path": str(dump), "files": files,
                 "response_sha256": hashlib.sha256(response_path.read_bytes()).hexdigest(),
                 "manifest_sha256": hashlib.sha256((dump / "manifest.jsonl").read_bytes()).hexdigest()})
+        if server_keys:
+            mapping = {span["key"]: {"old_key": span["key"], "new_key": "d" * 64,
+                "grid": span["grid"], "len": span["len"], "fixture": span["fixture"]}}
+            monkeypatch.setattr(module, "capture_mapping", lambda *args: mapping)
+            for window in panel["windows"]:
+                path = root / (window["id"] + ".json")
+                response = json.loads(path.read_bytes())
+                response["probe"]["media"][0]["key"] = "d" * 64
+                if mode == "reference":
+                    response["probe"]["provenance"]["features"][0]["key"] = "d" * 64
+                path.write_bytes(canonical(response))
+                entry = next(e for e in capture["windows"] if e["id"] == window["id"])
+                entry["response_sha256"] = hashlib.sha256(path.read_bytes()).hexdigest()
         (root / "capture.json").write_bytes(canonical(capture))
     out = tmp_path / "g4.json"
     args = SimpleNamespace(windows=windows, golden=golden, golden_seal=seal, native=tmp_path / "native",

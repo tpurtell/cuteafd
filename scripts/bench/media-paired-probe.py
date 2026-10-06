@@ -34,8 +34,105 @@ def http(url, token, body=None, timeout=240):
     if token:
         headers.update({"x-cuteafd-bench": token, "Authorization": "Bearer " + token})
     request = urllib.request.Request(url, None if body is None else canonical(body), headers)
-    with urllib.request.urlopen(request, timeout=timeout) as response:
-        return json.load(response)
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            return json.load(response)
+    except urllib.error.HTTPError as error:
+        data = error.read()
+        print(f"HTTP {error.code} {url}: {data.decode('utf-8', errors='replace')}", file=sys.stderr)
+        import io
+        error.fp = io.BytesIO(data)
+        raise
+
+
+def mapped_window(window, mapping):
+    """Translate only encoder-dependent keys, never sealed tokens/geometry/fixtures."""
+    result = json.loads(json.dumps(window))
+    for span in result["media"]:
+        entry = mapping[span["key"]]
+        if entry["old_key"] != span["key"] or entry["grid"] != span["grid"] or entry["len"] != span["len"] or entry["fixture"] != span["fixture"]:
+            raise ValueError("server key mapping changes sealed image geometry/fixture")
+        if len(entry["new_key"]) != 64 or any(c not in "0123456789abcdef" for c in entry["new_key"]):
+            raise ValueError("invalid echoed image key")
+        span["key"] = entry["new_key"]
+    return result
+
+
+def discover_keys(a, panel):
+    """Normal server preparation is authoritative; never derive an ImageKey here."""
+    from PIL import Image
+    import io
+    mapping = {}
+    for window in panel["windows"]:
+        for span in window["media"]:
+            if span["key"] in mapping:
+                continue
+            data = read_fixture(a.media_root, span)
+            pixels = Image.open(io.BytesIO(data)).convert("RGB")
+            body = {"body": {"model": panel["checkpoint"], "messages": [{"role": "user", "content": [
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64," + base64.b64encode(data).decode()}},
+                {"type": "text", "text": "Reply OK."}]}], "max_tokens": 1, "temperature": 0},
+                "spec": {"cold": True, "no_speculation": True, "record_first": True, "top_k": 1}}
+            response = http(a.url.rstrip("/") + "/v1/bench/probe", a.bench_token, body, a.timeout)
+            record = response.get("probe", {})
+            echoed = record.get("media", [])
+            if record.get("error") or len(echoed) != 1 or response["server"]["model"] != panel["checkpoint"] or response["server"].get("family") != panel["family"]:
+                raise ValueError("normal server image preparation failed")
+            image = echoed[0]
+            if image["grid"] != span["grid"] or image["len"] != span["len"] or image["kind"] != "image":
+                raise ValueError("normal server preparation changed sealed grid")
+            evidence = a.out / (span["key"] + ".prepare.json")
+            write_new(evidence, response)
+            fixture_copy = a.out / (span["key"] + ".source.png")
+            with fixture_copy.open("xb") as f:
+                f.write(data)
+            mapping[span["key"]] = {"old_key": span["key"], "new_key": image["key"],
+                "grid": span["grid"], "len": span["len"], "fixture": span["fixture"],
+                "pixel_sha256": hashlib.sha256(pixels.tobytes()).hexdigest(), "pixel_size": list(pixels.size),
+                "source_file": fixture_copy.name,
+                "prepare_file": evidence.name, "prepare_sha256": file_hash(evidence)}
+            if a.mode == "reference":
+                if a.mapped_features is None:
+                    raise ValueError("reference rekey requires --mapped-features server bind")
+                meta = json.loads((a.features / (span["key"] + ".json")).read_bytes())
+                payload = (a.features / (span["key"] + ".bf16")).read_bytes()
+                if meta["key"] != span["key"] or meta["grid"] != span["grid"] or meta["fixture_sha256"] != span["fixture"]["sha256"] or hashlib.sha256(payload).hexdigest() != meta["sha256"]:
+                    raise ValueError("sealed reference payload identity differs")
+                meta["key"] = image["key"]
+                a.mapped_features.mkdir(parents=True, exist_ok=True)
+                with (a.mapped_features / (image["key"] + ".bf16")).open("xb") as f:
+                    f.write(payload)
+                write_new(a.mapped_features / (image["key"] + ".json"), meta)
+    write_new(a.out / "key-mapping.json", mapping)
+    return mapping
+
+
+def capture_mapping(root, capture):
+    seal = capture.get("key_mapping_sha256")
+    if seal is None:
+        return None
+    path = root / "key-mapping.json"
+    if file_hash(path) != seal:
+        raise ValueError("server key mapping changed")
+    mapping = json.loads(path.read_bytes())
+    for entry in mapping.values():
+        from PIL import Image
+        source = root / entry["source_file"]
+        if source.name != entry["source_file"] or file_hash(source) != entry["fixture"]["sha256"]:
+            raise ValueError("mapping source pixels differ from sealed fixture")
+        pixels = Image.open(source).convert("RGB")
+        if hashlib.sha256(pixels.tobytes()).hexdigest() != entry["pixel_sha256"] or list(pixels.size) != entry["pixel_size"]:
+            raise ValueError("mapping decoded pixels changed")
+        path = root / entry["prepare_file"]
+        if path.name != entry["prepare_file"] or file_hash(path) != entry["prepare_sha256"]:
+            raise ValueError("normal prepare evidence changed")
+        response = json.loads(path.read_bytes())
+        if response["server"] != capture["server"]:
+            raise ValueError("key preparation server differs from scored server")
+        media = response["probe"]["media"]
+        if len(media) != 1 or media[0]["key"] != entry["new_key"] or media[0]["grid"] != entry["grid"] or media[0]["len"] != entry["len"]:
+            raise ValueError("mapping differs from authoritative server echo")
+    return mapping
 
 
 FAMILIES = ("mimo_v2", "qwen4", "glm5_flash")
@@ -48,7 +145,7 @@ def load_panel(a):
     return load_set(a.windows, family)
 
 
-def check_record(window, response, checkpoint, mode, features_root=None, family=None):
+def check_record(window, response, checkpoint, mode, features_root=None, family=None, feature_mapping=None):
     record = response.get("probe", {})
     if (record.get("error") or not record.get("engine") or not record.get("cold")
             or not record.get("no_speculation") or record.get("cached_tokens") != 0
@@ -71,7 +168,16 @@ def check_record(window, response, checkpoint, mode, features_root=None, family=
         if provenance is not None:
             raise ValueError("native arm unexpectedly reports feature override provenance")
     else:
-        metadata = [json.loads((features_root / (s["key"] + ".json")).read_text()) for s in window["media"]]
+        metadata = []
+        reverse = {entry["new_key"]: old for old, entry in (feature_mapping or {}).items()}
+        for span in window["media"]:
+            source_key = reverse.get(span["key"], span["key"])
+            meta = json.loads((features_root / (source_key + ".json")).read_text())
+            if source_key != span["key"]:
+                if meta["key"] != source_key:
+                    raise ValueError("original feature identity differs")
+                meta["key"] = span["key"]
+            metadata.append(meta)
         if provenance != {"mode": "reference_features", "probe_only": True,
                           "encoder_bypassed": True, "features": metadata}:
             raise ValueError("reference feature provenance differs from sealed export")
@@ -89,9 +195,12 @@ def capture(a):
         raise ValueError("reference capture needs --features")
     selected = [w for w in panel["windows"] if not a.quick or w["id"] in panel["quick_windows"]]
     a.out.mkdir(parents=True)
+    mapping = discover_keys(a, panel) if getattr(a, "server_keys", False) else None
+    feature_root = a.mapped_features if mapping is not None and a.mode == "reference" else a.features
     entries, server = [], None
     started = time.monotonic()
     for window in selected:
+        window = mapped_window(window, mapping) if mapping is not None else window
         media = []
         for span in window["media"]:
             data = read_fixture(a.media_root, span)
@@ -112,7 +221,7 @@ def capture(a):
             raise
         # Retain an invalid response too; it is evidence of a failed live gate.
         write_new(a.out / (leaf + ".json"), response)
-        check_record(window, response, panel["checkpoint"], a.mode, a.features, panel["family"])
+        check_record(window, response, panel["checkpoint"], a.mode, feature_root, panel["family"])
         current = response["server"]
         if server is not None and current != server:
             raise ValueError("server build/settings changed during capture")
@@ -125,7 +234,8 @@ def capture(a):
                                   for pos, path in rows.items()]})
     write_new(a.out / "capture.json", {"schema": "cuteafd.media.paired.capture/1", "mode": a.mode,
         "set_sha256": panel["set_sha256"], "checkpoint": panel["checkpoint"], "server": server,
-        "quick": a.quick, "seconds": time.monotonic() - started, "windows": entries})
+        "quick": a.quick, "seconds": time.monotonic() - started, "windows": entries,
+        **({"key_mapping_sha256": file_hash(a.out / "key-mapping.json")} if mapping is not None else {})})
 
 
 def dump_rows(root, window, vocab):
@@ -221,6 +331,13 @@ def compare(a):
         server.get("build", {}).pop("image", None)
     if servers[0] != servers[1]:
         raise ValueError("arms have different builds or non-encoder settings")
+    key_maps = [capture_mapping(root, capture) for root, capture in zip((a.native, a.reference), captures)]
+    if (key_maps[0] is None) != (key_maps[1] is None):
+        raise ValueError("arms use different media key policies")
+    if key_maps[0] is not None:
+        comparable = lambda mapping: {key: {k: v for k, v in entry.items() if k not in ("prepare_file", "prepare_sha256")} for key, entry in mapping.items()}
+        if comparable(key_maps[0]) != comparable(key_maps[1]):
+            raise ValueError("arms have different prepared media identities")
     arm_maps = [{w["id"]: w for w in c["windows"]} for c in captures]
     expected = {w["id"] for w in panel["windows"]}
     if captures[0]["quick"] or captures[1]["quick"]:
@@ -259,7 +376,9 @@ def compare(a):
             if hashlib.sha256(response_path.read_bytes()).hexdigest() != sealed["response_sha256"]:
                 raise ValueError("capture response changed")
             response = json.loads(response_path.read_text())
-            check_record(window, response, panel["checkpoint"], mode, a.features, panel["family"])
+            key_map = key_maps[0 if mode == "native" else 1]
+            prepared_window = mapped_window(window, key_map) if key_map is not None else window
+            check_record(prepared_window, response, panel["checkpoint"], mode, a.features, panel["family"], key_map)
             if response["server"] != captures[0 if mode == "native" else 1]["server"]:
                 raise ValueError("capture server differs from manifest")
             root = Path(sealed["path"])
@@ -309,6 +428,8 @@ def main():
         capture_parser.add_argument("--" + flag, type=Path, required=True)
     capture_parser.add_argument("--mode", choices=("native", "reference"), required=True)
     capture_parser.add_argument("--features", type=Path)
+    capture_parser.add_argument("--server-keys", action="store_true", help="map sealed keys through normal server image preparation")
+    capture_parser.add_argument("--mapped-features", type=Path, help="private writable reference-feature directory mounted on the server")
     capture_parser.add_argument("--url", required=True)
     capture_parser.add_argument("--bench-token")
     capture_parser.add_argument("--timeout", type=float, default=240)
