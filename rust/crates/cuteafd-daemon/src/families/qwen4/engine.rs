@@ -403,6 +403,7 @@ impl Allocator {
             Ok(fork) => {
                 let mut placement = Qwen4Placement::new(fork.pages, slot, history_of(&self.cfg, tokens));
                 placement.rope = source.rope.clone();
+                placement.media = source.media.clone();
                 Ok((placement, fork.copy))
             },
             Err(error) => {
