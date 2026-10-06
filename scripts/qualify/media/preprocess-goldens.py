@@ -111,11 +111,30 @@ def fixtures(root):
     return names
 
 
+def glm_processor_config(snapshot=None):
+    config = dict(patch_size=14, merge_size=2, temporal_patch_size=2,
+        patch_expand_factor=1, min_image_tokens=16, max_image_tokens=8000,
+        image_mean=[0.48145466, 0.4578275, 0.40821073],
+        image_std=[0.26862954, 0.26130258, 0.27577711], do_rescale=True)
+    if snapshot is not None:
+        value = json.loads((snapshot / "processor_config.json").read_text()).get("image_processor")
+        if not isinstance(value, dict):
+            raise ValueError("GLM processor_config.json requires image_processor object")
+        config.update(value)
+    if (config["patch_size"] != 14 or config["merge_size"] != 2
+            or config["temporal_patch_size"] != 2 or config["patch_expand_factor"] != 1
+            or not config["do_rescale"] or config.get("resample", 3) != 3):
+        raise ValueError("unsupported GLM G1 processor geometry or rescale/resample")
+    return config
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--transformers", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
+    parser.add_argument("--glm-snapshot", type=Path, help="use the actual nested HF GLM image processor config")
     args = parser.parse_args()
+    glm_config = glm_processor_config(args.glm_snapshot)
     revision = subprocess.check_output(["git", "-C", str(args.transformers), "rev-parse", "HEAD"], text=True).strip()
     if revision != PIN:
         raise SystemExit(f"reference pin differs: expected {PIN}, got {revision}")
@@ -135,7 +154,10 @@ def main():
                 chw = np.asarray(image).transpose(2, 0, 1)
                 if family == "glm_flash":
                     reference = glm["Reference"]()
-                    resized = reference.resize(chw, Image.Resampling.BICUBIC, 28, 2, 16, min(8000, cap))
+                    resized = reference.resize(chw, Image.Resampling.BICUBIC,
+                        glm_config["patch_size"] * glm_config["merge_size"],
+                        glm_config["temporal_patch_size"], glm_config["min_image_tokens"],
+                        min(glm_config["max_image_tokens"], cap))
                 else:
                     reference = qwen["Reference"]()
                     minimum = 3136 if family == "mimo" else 65536
@@ -143,12 +165,19 @@ def main():
                     height, width = qwen["smart_resize"](image.height, image.width, factor=32, min_pixels=minimum, max_pixels=min(maximum, cap * 1024))
                     resized = PilBase().resize(chw, SizeDict(height=height, width=width), Image.Resampling.BICUBIC)
                 mean, std = ([0.5] * 3, [0.5] * 3) if family == "qwen" else ([0.48145466, 0.4578275, 0.40821073], [0.26862954, 0.26130258, 0.27577711])
+                if family == "glm_flash":
+                    mean, std = glm_config["image_mean"], glm_config["image_std"]
                 normalized = transforms["normalize"](transforms["rescale"](resized, 1 / 255), mean, std, input_data_format=ChannelDimension.FIRST)
                 patches, gh, gw = reference.patchify(normalized, patch, 2, 2)
                 cases.append(dict(family=family, file=name, low=low, grid=dict(t=1, h=gh, w=gw),
                                   rgb_sha256=hashlib.sha256(resized.transpose(1, 2, 0).tobytes()).hexdigest(),
                                   patch_sha256=hashlib.sha256(patches.astype("<f4").tobytes()).hexdigest()))
     manifest = dict(transformers=revision, pillow=PIL.__version__, numpy=np.__version__, decode_policy=dict(exif_transpose=True, alpha="drop"), cases=cases)
+    if args.glm_snapshot:
+        manifest["glm_processor"] = {"snapshot": str(args.glm_snapshot.resolve()),
+            "snapshot_revision": args.glm_snapshot.name,
+            "processor_sha256": hashlib.sha256((args.glm_snapshot / "processor_config.json").read_bytes()).hexdigest(),
+            "parameters": glm_config}
     path = args.output / "manifest.json"
     path.write_text(json.dumps(manifest, indent=2) + "\n")
     print(f"Generated {len(names)} fixtures, {len(cases)} reference cases: {path}")

@@ -21,8 +21,16 @@ fn main() -> Result<()> {
             "glm_flash" => ImageFamily::GlmFlash,
             _ => anyhow::bail!("unknown processor"),
         };
-        let config =
-            ProcessorConfig::for_family(family).with_detail(case["low"].as_bool().unwrap_or(false));
+        let config = if family == ImageFamily::GlmFlash && manifest.get("glm_processor").is_some() {
+            let source = &manifest["glm_processor"];
+            let snapshot = Path::new(source["snapshot"].as_str().context("GLM snapshot")?);
+            ensure!(digest(&std::fs::read(snapshot.join("processor_config.json"))?)
+                == source["processor_sha256"].as_str().context("GLM processor hash")?,
+                "GLM processor changed since fixture generation");
+            ProcessorConfig::from_snapshot(snapshot, family)?
+        } else {
+            ProcessorConfig::for_family(family)
+        }.with_detail(case["low"].as_bool().unwrap_or(false));
         let bytes = std::fs::read(root.join(case["file"].as_str().context("file")?))?;
         let image = config.prepare(&bytes, EncoderId([0; 32]))?;
         let rgb = digest(&image.rgb8);

@@ -103,6 +103,25 @@ fn snapshot_processor_overrides_defaults_and_rejects_bad_config() {
     assert!(ProcessorConfig::from_snapshot(dir.path(), ImageFamily::Mimo).is_err());
 }
 #[test]
+fn glm_reads_standard_nested_image_processor_without_video_parameters() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("processor_config.json"), r#"{
+        "image_processor":{"patch_size":14,"temporal_patch_size":2,"merge_size":2,
+            "min_image_tokens":32,"max_image_tokens":2000,"image_mean":[0.1,0.2,0.3]},
+        "video_processor":{"patch_size":99,"max_image_tokens":240000}
+    }"#).unwrap();
+    let config = ProcessorConfig::from_snapshot(dir.path(), ImageFamily::GlmFlash).unwrap();
+    assert_eq!((config.patch, config.temporal, config.merge), (14, 2, 2));
+    assert_eq!((config.min_pixels, config.max_pixels), (32, 2000));
+    assert_eq!(config.mean, [0.1, 0.2, 0.3]);
+    assert!(ProcessorConfig::from_snapshot(dir.path(), ImageFamily::Mimo).is_err());
+    for invalid in [r#"{}"#, r#"{"image_processor":[]}"#,
+        r#"{"image_processor":{"patch_size":0}}"#] {
+        std::fs::write(dir.path().join("processor_config.json"), invalid).unwrap();
+        assert!(ProcessorConfig::from_snapshot(dir.path(), ImageFamily::GlmFlash).is_err());
+    }
+}
+#[test]
 fn span_expansion_rejects_literal_markers_and_preserves_native_ids() {
     let config = serde_json::json!({"image_token_id":12,"vision_start_token_id":11,"vision_end_token_id":13});
     let expander = SpanExpander::from_config(&config, 100).unwrap();

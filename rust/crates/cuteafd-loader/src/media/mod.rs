@@ -123,10 +123,24 @@ impl ProcessorConfig {
     /// HF AutoProcessor reads preprocessor_config.json. It takes precedence
     /// over MiMo config.json's conflicting embedded processor_config (D3).
     pub fn from_snapshot(snapshot: &Path, family: ImageFamily) -> Result<Self> {
-        let bytes = std::fs::read(snapshot.join("preprocessor_config.json"))
+        // GLM's standard HF snapshot embeds image/video processors in this file.
+        // MiMo/Qwen keep their existing AutoProcessor precedence unchanged.
+        let file = if family == ImageFamily::GlmFlash {
+            "processor_config.json"
+        } else {
+            "preprocessor_config.json"
+        };
+        let bytes = std::fs::read(snapshot.join(file))
             .map_err(|e| MediaError::Config(e.to_string()))?;
-        let value: serde_json::Value =
+        let document: serde_json::Value =
             serde_json::from_slice(&bytes).map_err(|e| MediaError::Config(e.to_string()))?;
+        let value = if family == ImageFamily::GlmFlash {
+            document.get("image_processor").filter(|v| v.is_object()).ok_or_else(|| {
+                MediaError::Config("processor_config.json requires image_processor object".into())
+            })?
+        } else {
+            &document
+        };
         let mut config = Self::for_family(family);
         for (name, dest) in [
             ("patch_size", &mut config.patch),
