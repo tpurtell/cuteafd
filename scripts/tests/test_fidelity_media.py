@@ -24,6 +24,7 @@ def load_script(name):
 
 
 def test_g6_additive_ui_question_contract(tmp_path, monkeypatch):
+    pytest.importorskip("PIL")
     import json
     generator = load_script("generate-media-fixtures")
     source = tmp_path / "source"
@@ -51,6 +52,7 @@ def test_g6_additive_ui_question_contract(tmp_path, monkeypatch):
 
 
 def test_fixture_bytes_reproduce_and_vision_recipe(tmp_path):
+    pytest.importorskip("PIL")
     import json
     generator = load_script("generate-media-fixtures")
     one = generator.generate(tmp_path / "one")
