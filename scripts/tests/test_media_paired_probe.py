@@ -12,6 +12,23 @@ module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(module)
 
 
+def feature_metadata(key, family):
+    metadata = {"key": key, "sha256": "c" * 64}
+    if family == "glm5_flash":
+        metadata["snapshot_identity"] = {
+            "modeling_sha256": module.GLM_MODELING_SHA256,
+            "image_processing_sha256": module.GLM_IMAGE_PROCESSING_SHA256}
+    return metadata
+
+
+def reference_provenance(metadata, family):
+    provenance = {"mode": "reference_features", "probe_only": True,
+                  "encoder_bypassed": True, "features": [metadata]}
+    if family == "glm5_flash":
+        provenance["modeling_source_revision"] = module.GLM_TRANSFORMERS_REVISION
+    return provenance
+
+
 @pytest.mark.parametrize("family", module.FAMILIES)
 def test_capture_retains_http_error_body(tmp_path, monkeypatch, family):
     import io
@@ -97,6 +114,62 @@ def test_record_requires_native_identity_and_override_metadata(tmp_path):
         module.check_record(window, response, "model", "reference", tmp_path)
 
 
+@pytest.mark.parametrize("family", module.FAMILIES)
+def test_reference_provenance_keeps_family_contract_exact(tmp_path, family):
+    import copy
+    span = {"start": 0, "len": 1, "kind": "image", "key": "a" * 64, "grid": [1, 2, 2]}
+    window = {"tokens": [9, 2], "score_from": 1, "media": [span]}
+    metadata = feature_metadata(span["key"], family)
+    (tmp_path / (span["key"] + ".json")).write_text(json.dumps(metadata))
+    provenance = reference_provenance(metadata, family)
+    response = {"server": {"model": "model", "family": family}, "probe": {
+        "engine": family, "cold": True, "no_speculation": True, "cached_tokens": 0,
+        "score_path": "decode", "prompt_ids": window["tokens"], "media": [span],
+        "rows": [{"position": 1, "finite": True}], "scored": 1, "provenance": provenance}}
+    module.check_record(window, response, "model", "reference", tmp_path, family)
+    changes = [{**provenance, "unverified_source": "extra"}]
+    for field in ("mode", "probe_only", "encoder_bypassed", "features"):
+        missing = copy.deepcopy(provenance)
+        missing.pop(field)
+        changes.append(missing)
+    mismatched = copy.deepcopy(provenance)
+    mismatched["features"][0]["sha256"] = "d" * 64
+    changes.append(mismatched)
+    if family == "glm5_flash":
+        missing = copy.deepcopy(provenance)
+        missing.pop("modeling_source_revision")
+        changes.extend([missing, {**provenance, "modeling_source_revision": "0" * 40}])
+    else:
+        changes.append({**provenance, "modeling_source_revision": module.GLM_TRANSFORMERS_REVISION})
+    for changed in changes:
+        response["probe"]["provenance"] = changed
+        with pytest.raises(ValueError, match="provenance"):
+            module.check_record(window, response, "model", "reference", tmp_path, family)
+    response["probe"]["provenance"] = provenance
+    with pytest.raises(ValueError, match="native arm"):
+        module.check_record(window, response, "model", "native", tmp_path, family)
+
+
+@pytest.mark.parametrize("field", ["modeling_sha256", "image_processing_sha256"])
+@pytest.mark.parametrize("bad_value", [None, "0" * 64])
+def test_glm_provenance_requires_sealed_pinned_sources(tmp_path, field, bad_value):
+    span = {"start": 0, "len": 1, "kind": "image", "key": "a" * 64, "grid": [1, 2, 2]}
+    window = {"tokens": [9, 2], "score_from": 1, "media": [span]}
+    metadata = feature_metadata(span["key"], "glm5_flash")
+    if bad_value is None:
+        metadata["snapshot_identity"].pop(field)
+    else:
+        metadata["snapshot_identity"][field] = bad_value
+    (tmp_path / (span["key"] + ".json")).write_text(json.dumps(metadata))
+    response = {"server": {"model": "model", "family": "glm5_flash"}, "probe": {
+        "engine": "glm5_flash", "cold": True, "no_speculation": True, "cached_tokens": 0,
+        "score_path": "decode", "prompt_ids": window["tokens"], "media": [span],
+        "rows": [{"position": 1, "finite": True}], "scored": 1,
+        "provenance": reference_provenance(metadata, "glm5_flash")}}
+    with pytest.raises(ValueError, match="modeling source"):
+        module.check_record(window, response, "model", "reference", tmp_path, "glm5_flash")
+
+
 def test_log_probs_validate_shape_and_normalize(tmp_path):
     from safetensors.numpy import save_file
     path = tmp_path / "row.safetensors"
@@ -154,7 +227,7 @@ def test_compare_uses_golden_difference_not_direct_kl(tmp_path, monkeypatch, fam
     assert json.loads(seal.read_text()) == module.golden_seal(golden, panel)
     features = tmp_path / "features"
     features.mkdir()
-    metadata = {"key": span["key"], "sha256": "c" * 64}
+    metadata = feature_metadata(span["key"], family)
     (features / (span["key"] + ".json")).write_text(json.dumps(metadata))
     for mode, row in [("native", [0., -5.]), ("reference", [-5., 0.])]:
         root = tmp_path / mode
@@ -179,8 +252,7 @@ def test_compare_uses_golden_difference_not_direct_kl(tmp_path, monkeypatch, fam
                 "prompt_ids": window["tokens"], "media": [span], "scored": 512,
                 "rows": [{"position": pos, "finite": True} for pos in range(65, 577)]}}
             if mode == "reference":
-                response["probe"]["provenance"] = {"mode": "reference_features", "probe_only": True,
-                    "encoder_bypassed": True, "features": [metadata]}
+                response["probe"]["provenance"] = reference_provenance(metadata, family)
             response_path = root / (window["id"] + ".json")
             response_path.write_bytes(canonical(response))
             capture["windows"].append({"id": window["id"], "path": str(dump), "files": files,

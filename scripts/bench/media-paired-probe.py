@@ -39,6 +39,9 @@ def http(url, token, body=None, timeout=240):
 
 
 FAMILIES = ("mimo_v2", "qwen4", "glm5_flash")
+GLM_TRANSFORMERS_REVISION = "62d7ebd7de4938e072b7aaeb881593b79dc56835"
+GLM_MODELING_SHA256 = "f6dfea36d663a5257cd10ad61924c4f90c29c38f14f40b2af1e446714168b05d"
+GLM_IMAGE_PROCESSING_SHA256 = "c3065c32ece0cd46adf74a1aef5707da48a0596578503dabf47f874da0716663"
 
 
 def load_panel(a):
@@ -72,8 +75,19 @@ def check_record(window, response, checkpoint, mode, features_root=None, family=
             raise ValueError("native arm unexpectedly reports feature override provenance")
     else:
         metadata = [json.loads((features_root / (s["key"] + ".json")).read_text()) for s in window["media"]]
-        if provenance != {"mode": "reference_features", "probe_only": True,
-                          "encoder_bypassed": True, "features": metadata}:
+        expected_provenance = {"mode": "reference_features", "probe_only": True,
+                               "encoder_bypassed": True, "features": metadata}
+        if family == "glm5_flash":
+            # GLM echoes a source revision outside its hash-only feature identity.
+            # Bind that revision to both locked arithmetic sources, not just its label.
+            for feature in metadata:
+                identity = feature.get("snapshot_identity")
+                if (not isinstance(identity, dict)
+                        or identity.get("modeling_sha256") != GLM_MODELING_SHA256
+                        or identity.get("image_processing_sha256") != GLM_IMAGE_PROCESSING_SHA256):
+                    raise ValueError("reference feature modeling source differs from pinned GLM export")
+            expected_provenance["modeling_source_revision"] = GLM_TRANSFORMERS_REVISION
+        if provenance != expected_provenance:
             raise ValueError("reference feature provenance differs from sealed export")
 
 
