@@ -178,6 +178,9 @@ python3 "$staging_dir/scripts/build/verify-sparkinfer-source.py" \
 python3 "$staging_dir/scripts/build/verify-xgrammar-source.py" \
   --source "$staging_dir/third_party/xgrammar" \
   --lock "$staging_dir/third_party/xgrammar.lock.json"
+python3 "$staging_dir/scripts/build/verify-transformers-source.py" \
+  --source "$staging_dir/third_party/transformers" \
+  --lock "$staging_dir/third_party/transformers.lock.json"
 
 sparkinfer_revision="$(python3 "$staging_dir/scripts/build/verify-sparkinfer-source.py" \
   --source "$staging_dir/third_party/sparkinfer" \

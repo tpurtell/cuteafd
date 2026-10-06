@@ -78,6 +78,10 @@ case "$nvfp4_aot" in ON|OFF) ;; *) echo "CUTEAFD_WIP_NVFP4_AOT must be ON or OFF
 python3 "$source_dir/scripts/build/verify-sparkinfer-source.py" \
   --source "$source_dir/third_party/sparkinfer" \
   --lock "$source_dir/third_party/sparkinfer.lock.json"
+# GLM's include_bytes! inputs are compiled into the daemon in both roles.
+transformers_source_digest="$(python3 "$source_dir/scripts/build/verify-transformers-source.py" \
+  --source "$source_dir/third_party/transformers" \
+  --lock "$source_dir/third_party/transformers.lock.json" --print-source-digest)"
 if [[ "$xgrammar" == ON ]]; then
   python3 "$source_dir/scripts/build/verify-xgrammar-source.py" \
     --source "$source_dir/third_party/xgrammar" \
@@ -99,14 +103,14 @@ wip_tree_fingerprint() {
   find "$@" -type f \( -name '*.rs' -o -name '*.toml' -o -name '*.lock' -o -name '*.cu' -o -name '*.cc' -o -name '*.h' -o -name '*.cmake' -o -name 'CMakeLists.txt' -o -name '*.py' \) \
     -print0 | sort -z | xargs -0 sha256sum | sha256sum | awk '{print $1}'
 }
-wip_rust_fingerprint="$(wip_tree_fingerprint "$source_dir/rust")"
+wip_rust_fingerprint="$(printf '%s %s\n' "$(wip_tree_fingerprint "$source_dir/rust")" "$transformers_source_digest" | sha256sum | awk '{print $1}')"
 wip_native_fingerprint="$(wip_tree_fingerprint "$source_dir/native" "$source_dir/python")"
 wip_fingerprint_marker="$build_dir/.source-content-fingerprint"
 wip_previous_fingerprint="$(cat "$wip_fingerprint_marker" 2>/dev/null || true)"
 wip_previous_rust="$(cut -d' ' -f1 <<<"$wip_previous_fingerprint")"
 wip_previous_native="$(cut -d' ' -f2 <<<"$wip_previous_fingerprint")"
 if [[ -z "$wip_previous_fingerprint" || "$wip_previous_rust" != "$wip_rust_fingerprint" ]]; then
-  find "$source_dir/rust" -type f -exec touch {} +
+  find "$source_dir/rust" "$source_dir/third_party/transformers/src" -type f -exec touch {} +
 fi
 if [[ -z "$wip_previous_fingerprint" || "$wip_previous_native" != "$wip_native_fingerprint" ]]; then
   find "$source_dir/native" "$source_dir/python" -type f -exec touch {} +
@@ -224,8 +228,14 @@ if [[ "$coordinator_aot" == ON ]]; then
 else
   printf '%s\n' '{"schema":1,"role":"expert","enabled":false}' >"$output_dir/V41_FP8_AOT.json"
 fi
+# Generic-family tables must come from this build, not an earlier role/opt-in.
+if [[ "$role" == coordinator && "${CUTEAFD_WIP_DSV4_AOT:-OFF};${CUTEAFD_WIP_GLM_AOT:-OFF};${CUTEAFD_WIP_MIMO_AOT:-OFF};${CUTEAFD_WIP_GLMF_AOT:-OFF};${CUTEAFD_WIP_QWEN4_AOT:-OFF}" == *ON* ]]; then
+  install -m 0644 "$build_dir/native/dsv4_programs/dsv4_programs.json" "$output_dir/PROGRAMS.json"
+else
+  printf '%s\n' '{"schema":1,"programs":[]}' >"$output_dir/PROGRAMS.json"
+fi
 (
   cd "$output_dir"
-  sha256sum cuteafd libcuteafd_native.so V41_EXPERT_AOT.json V41_EXPERT_TP_AOT.json V41_FP8_AOT.json >ARTIFACT_SHA256SUMS
+  sha256sum cuteafd libcuteafd_native.so V41_EXPERT_AOT.json V41_EXPERT_TP_AOT.json V41_FP8_AOT.json PROGRAMS.json >ARTIFACT_SHA256SUMS
   sha256sum -c ARTIFACT_SHA256SUMS
 )

@@ -1,7 +1,12 @@
 """Fresh single-role builds succeed; paired and cloned slots stay strict."""
+import hashlib
+import importlib.util
+import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
+import sys
 
 import pytest
 
@@ -80,3 +85,169 @@ def test_wip_state_symlink_is_excluded_from_source_staging(tmp_path):
                             capture_output=True, text=True, timeout=10)
     assert result.returncode == 0, result.stderr
     assert not (release_stage / '.cuteafd-wip').is_symlink()
+
+
+def transformers_verifier():
+    spec = importlib.util.spec_from_file_location(
+        'transformers_source', ROOT / 'scripts/build/verify-transformers-source.py')
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def transformers_fixture(tmp_path):
+    module = transformers_verifier()
+    source = tmp_path / 'transformers'
+    for name in module.REQUIRED:
+        path = source / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text('pinned fixture\n')
+    lock = tmp_path / 'transformers.lock.json'
+    lock.write_text(json.dumps({
+        'schema': 1, 'repository': 'https://github.com/malaiwah/transformers.git',
+        'revision': 'a' * 40, 'source_tree_sha256': module.source_tree_sha256(source),
+    }))
+    return module, source, lock
+
+
+def test_transformers_lock_matches_checkout_gitlink():
+    module = transformers_verifier()
+    lock = module.verify(ROOT / 'third_party/transformers', ROOT / 'third_party/transformers.lock.json')
+    gitlink = subprocess.check_output(
+        ['git', '-C', str(ROOT), 'ls-tree', 'HEAD', 'third_party/transformers'], text=True)
+    assert lock['revision'] == gitlink.split()[2]
+
+
+def test_metadata_free_transformers_freeze_verifies_and_rejects_modified_dependency(tmp_path):
+    module, source, lock = transformers_fixture(tmp_path)
+    frozen = tmp_path / 'frozen'
+    shutil.copytree(source, frozen)
+    assert module.verify(frozen, lock)['revision'] == 'a' * 40
+    (frozen / 'src/transformers/dependency.py').write_text('changed dependency')
+    with pytest.raises(module.VerificationError, match='content does not match'):
+        module.verify(frozen, lock)
+
+
+def test_transformers_requires_include_bytes_inputs_and_confined_links(tmp_path):
+    module, source, lock = transformers_fixture(tmp_path)
+    (source / module.REQUIRED[-1]).unlink()
+    with pytest.raises(module.VerificationError, match='incomplete'):
+        module.verify(source, lock)
+    (source / module.REQUIRED[-1]).write_text('pinned fixture\n')
+    (source / 'escape.py').symlink_to(lock)
+    with pytest.raises(module.VerificationError, match='symlink escapes'):
+        module.verify(source, lock)
+
+
+@pytest.mark.parametrize('role', ['coordinator', 'expert'])
+@pytest.mark.parametrize('enabled', [False, True])
+def test_wip_programs_stage_current_table_or_empty_even_after_previous_opt_in(tmp_path, role, enabled):
+    script = (ROOT / 'scripts/build/build-wip-artifacts.sh').read_text()
+    block = '# Generic-family tables' + script.split('# Generic-family tables', 1)[1]
+    build = tmp_path / 'build'
+    output = tmp_path / 'output'
+    generated = build / 'native/dsv4_programs/dsv4_programs.json'
+    generated.parent.mkdir(parents=True)
+    generated.write_text('{"schema":1,"programs":["current"]}\n')
+    output.mkdir()
+    for name in ('cuteafd', 'libcuteafd_native.so', 'V41_EXPERT_AOT.json',
+                 'V41_EXPERT_TP_AOT.json', 'V41_FP8_AOT.json'):
+        (output / name).write_text('artifact')
+    (output / 'PROGRAMS.json').write_text('stale table')
+    env = {key: value for key, value in os.environ.items() if not key.startswith('CUTEAFD_WIP_')}
+    env.update(role=role, build_dir=str(build), output_dir=str(output),
+               CUTEAFD_WIP_GLMF_AOT='ON' if enabled else 'OFF')
+    result = subprocess.run(['bash', '-c', 'set -euo pipefail\n' + block], env=env,
+                            capture_output=True, text=True, timeout=10)
+    assert result.returncode == 0, result.stderr
+    expected = ['current'] if role == 'coordinator' and enabled else []
+    assert json.loads((output / 'PROGRAMS.json').read_text())['programs'] == expected
+    sums = (output / 'ARTIFACT_SHA256SUMS').read_text()
+    assert hashlib.sha256((output / 'PROGRAMS.json').read_bytes()).hexdigest() + '  PROGRAMS.json' in sums
+    if role == 'coordinator' and enabled:
+        generated.unlink()
+        result = subprocess.run(['bash', '-c', 'set -euo pipefail\n' + block], env=env,
+                                capture_output=True, text=True, timeout=10)
+        assert result.returncode != 0
+
+
+def test_pinned_transformers_digest_invalidates_rust_with_old_source_mtimes(tmp_path):
+    script = (ROOT / 'scripts/build/build-wip-artifacts.sh').read_text()
+    block = 'wip_tree_fingerprint() {' + script.split('wip_tree_fingerprint() {', 1)[1].split('\ncargo build', 1)[0]
+    source = tmp_path / 'source'
+    build = tmp_path / 'build'
+    build.mkdir()
+    for name in ('rust/main.rs', 'native/a.cc', 'python/a.py', 'third_party/transformers/src/a.py'):
+        path = source / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text('same source')
+    target = source / 'rust/main.rs'
+    env = {**os.environ, 'source_dir': str(source), 'build_dir': str(build),
+           'transformers_source_digest': 'a' * 64}
+    command = ['bash', '-c', 'set -euo pipefail\n' + block +
+               '\nprintf "%s" "$wip_current_fingerprint" >"$wip_fingerprint_marker"']
+    assert subprocess.run(command, env=env, capture_output=True).returncode == 0
+    os.utime(target, (1, 1))
+    assert subprocess.run(command, env=env, capture_output=True).returncode == 0
+    assert target.stat().st_mtime == 1
+    env['transformers_source_digest'] = 'b' * 64
+    assert subprocess.run(command, env=env, capture_output=True).returncode == 0
+    assert target.stat().st_mtime > 1
+    assert (source / 'third_party/transformers/src/a.py').stat().st_mtime > 1
+
+
+@pytest.mark.parametrize('role', ['coordinator', 'spark-expert'])
+def test_finalizer_retains_checked_programs_and_frozen_transformers_identity(tmp_path, role):
+    module, transformers, lock = transformers_fixture(tmp_path)
+    source = tmp_path / 'source'
+    (source / 'third_party').mkdir(parents=True)
+    shutil.copytree(transformers, source / 'third_party/transformers')
+    shutil.copyfile(lock, source / 'third_party/transformers.lock.json')
+    scripts = source / 'scripts/build'
+    scripts.mkdir(parents=True)
+    for name in ('verify-transformers-source.py', 'verify-release-source-manifest.py'):
+        shutil.copyfile(ROOT / 'scripts/build' / name, scripts / name)
+    (scripts / 'verify-sparkinfer-source.py').write_text('print("fixture-sparkinfer")\n')
+    output = tmp_path / 'output'
+    output.mkdir()
+    for name in ('cuteafd', 'libcuteafd_native.so', 'V41_EXPERT_AOT.json', 'V41_FP8_AOT.json'):
+        (output / name).write_text('artifact')
+    (output / 'cuteafd').chmod(0o755)
+    (output / 'V41_EXPERT_TP_AOT.json').write_text('{"schema":1,"spark_tp_roles":[]}')
+    (output / 'PROGRAMS.json').write_text('{"schema":1,"programs":[]}')
+    sums = ''.join(hashlib.sha256(path.read_bytes()).hexdigest() + '  ' + path.name + '\n'
+                   for path in sorted(output.iterdir()))
+    (output / 'ARTIFACT_SHA256SUMS').write_text(sums)
+    script = (ROOT / 'scripts/build/finalize-wip-slot.sh').read_text().replace('/wip/', str(tmp_path / 'wip') + '/')
+    command = ['bash', '-c', script, 'finalize', str(source), role, 'WP9', str(output), 'base', 'sha256:base']
+    result = subprocess.run(command, capture_output=True, text=True, timeout=10)
+    assert result.returncode == 0, result.stderr
+    frozen = tmp_path / 'wip/slots/WP9' / role
+    assert (frozen / 'workspace/.cuteafd-wip/PROGRAMS.json').read_bytes() == (output / 'PROGRAMS.json').read_bytes()
+    meta = json.loads((frozen / 'META.json').read_text())
+    assert meta['transformers_revision'] == 'a' * 40
+    assert meta['transformers_source_sha256'] == module.source_tree_sha256(transformers)
+    (output / 'PROGRAMS.json').write_text('corrupted')
+    assert subprocess.run(command, capture_output=True, text=True).returncode != 0
+
+
+def test_wip_verifies_transformers_before_both_role_builds_and_frozen_source(tmp_path):
+    script = (ROOT / 'scripts/build/build-wip-artifacts.sh').read_text()
+    assert script.index('verify-transformers-source.py') < script.index('cargo build')
+    assert script.index('verify-transformers-source.py') > script.index('case "$role" in')
+    assert '--print-source-digest' in script
+    freeze = (ROOT / 'wip.sh').read_text()
+    assert freeze.index('verify-transformers-source.py') > freeze.index('rsync "${snapshot_args[@]}"')
+    assert freeze.index('verify-transformers-source.py') < freeze.index('ensure_local_image()')
+    block = freeze.split('snapshot_args=(\n', 1)[1].split('\n)', 1)[0]
+    _, transformers, lock = transformers_fixture(tmp_path)
+    repo = tmp_path / 'repo'
+    (repo / 'third_party').mkdir(parents=True)
+    shutil.copytree(transformers, repo / 'third_party/transformers')
+    shutil.copyfile(lock, repo / 'third_party/transformers.lock.json')
+    stage = tmp_path / 'stage'
+    result = subprocess.run(['bash', '-c', 'snapshot_args=(\n' + block + '\n)\n'
+                             'rsync "${snapshot_args[@]}" "$1/" "$2/"', 'test', str(repo), str(stage)],
+                            capture_output=True, text=True, timeout=10)
+    assert result.returncode == 0, result.stderr
+    transformers_verifier().verify(stage / 'third_party/transformers', stage / 'third_party/transformers.lock.json')
