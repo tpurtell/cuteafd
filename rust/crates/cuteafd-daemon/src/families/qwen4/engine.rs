@@ -830,6 +830,18 @@ impl<'a> Qwen4Engine<'a> {
         Ok(())
     }
 
+    fn localize_region(&self, name: &str, dev: &Dev<'_>, offset: usize, row_bytes: usize) -> Result<()> {
+        if let Some((out, real, _)) = self.localize.borrow().as_ref() {
+            // SAFETY: each task region is bounded by the persistent capacity workspace.
+            unsafe { self.library.cuda_stream_synchronize(self.stream)? };
+            let region = Self::region(dev, offset, real * row_bytes);
+            let mut bytes = vec![0; region.bytes];
+            self.library.copy_d2h(&mut bytes, region)?;
+            std::fs::write(out.join(format!("{name}.bin")), bytes)?;
+        }
+        Ok(())
+    }
+
     pub fn localize_decode(&self, tokens: &[u32], out: &std::path::Path) -> Result<()> {
         ensure!(std::env::var_os("WP7_QWEN_LOCALIZE").is_some(), "task probe must be explicitly enabled");
         ensure!(tokens.len() >= 49 && self.weights.layers.len() == 48, "probe needs 49 tokens and 48 layers");
@@ -1848,7 +1860,36 @@ impl<'a> Qwen4Engine<'a> {
                         if has_ple {
                             self.finish_ple(w)?;
                         }
-                        self.enter(w, &mut cur, None, next, index + 1, rows, spec)?;
+                        if index == 0 && self.localize.borrow().is_some() {
+                            self.localize_dump("boundary00_post", &w.streams[cur], HC * h * 2)?;
+                            if has_ple {
+                                self.ple(w, &w.streams[cur], next, rows, spec)?;
+                                self.localize_dump("boundary01_ple_out", &w.streams[cur], HC * h * 2)?;
+                                let align = |n: usize| n.next_multiple_of(1024);
+                                let c = HC * h;
+                                let kv = align(t * self.cfg.ple_dim * 2);
+                                let gv = kv + align(t * (c + h) * 2);
+                                let gvn = gv + align(t * c * 2);
+                                self.localize_region("boundary01_ple_embed", &w.scratch, 0, self.cfg.ple_dim * 2)?;
+                                self.localize_region("boundary01_ple_kv", &w.scratch, kv, (c + h) * 2)?;
+                                self.localize_region("boundary01_ple_gv", &w.scratch, gv, c * 2)?;
+                                self.localize_region("boundary01_ple_gvn", &w.scratch, gvn, c * 2)?;
+                            }
+                            let [norm, di, up] = Self::site(next, "attn")?;
+                            self.run("qwen4_hc_pre", &[("residual", w.streams[cur].buffer.ptr), ("norm", norm),
+                                ("w_di", di), ("w_up", up), ("y", w.x.buffer.ptr), ("inject", w.inject.buffer.ptr),
+                                ("scratch", w.scratch.buffer.ptr)], &[rows])?;
+                            let align = |n: usize| n.next_multiple_of(1024);
+                            let d = align(t * HC * h * 2);
+                            let a = d + align(t * 324 * 2);
+                            let u = a + align(t * 320 * 2);
+                            self.localize_region("boundary01_hc_norm", &w.scratch, 0, HC * h * 2)?;
+                            self.localize_region("boundary01_hc_di", &w.scratch, d, 324 * 2)?;
+                            self.localize_region("boundary01_hc_gate", &w.scratch, a, 320 * 2)?;
+                            self.localize_region("boundary01_hc_up", &w.scratch, u, HC * h * 2)?;
+                        } else {
+                            self.enter(w, &mut cur, None, next, index + 1, rows, spec)?;
+                        }
                     } else {
                         self.enter(w, &mut cur, Some(()), next, index + 1, rows, spec)?;
                     }
