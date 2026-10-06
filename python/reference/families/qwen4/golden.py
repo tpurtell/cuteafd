@@ -67,6 +67,19 @@ from fidelity_windows import CheckpointStorage, release_checkpoint, load_set, wr
 
 def run_windows(a, config, ref, dense, experts_src, create_causal_mask):
     manifest = load_set(a.windows, "qwen4")
+    from qwen_media import QSA_KEY_ROWS
+    if any(len(w["tokens"]) > QSA_KEY_ROWS for w in manifest["windows"]):
+        raise ValueError("panel exceeds fixed QSA geometry")
+    geometry = {"qsa_key_rows": QSA_KEY_ROWS,
+                "qsa_padding": "zero-key/value-tail; additive-mask-negative-infinity"}
+    fixed_gdn_rows = getattr(a, "fixed_gdn_rows", None)
+    if fixed_gdn_rows is not None:
+        from qwen_media import fixed_gdn_forward
+        fixed_gdn_forward(None, fixed_gdn_rows)  # Validate before qualification or weight reads.
+        if any(len(w["tokens"]) > fixed_gdn_rows for w in manifest["windows"]):
+            raise ValueError("panel exceeds fixed GDN geometry")
+        geometry.update(gdn_sequence_rows=fixed_gdn_rows,
+                        gdn_padding="zero-hidden-tail; no-cache; cropped-output")
     from fidelity_media import require_media_flag
     media = require_media_flag(manifest, getattr(a, "media", False), "qwen4")
     identity = verify_snapshot(manifest, a.snapshot)
@@ -126,6 +139,8 @@ def run_windows(a, config, ref, dense, experts_src, create_causal_mask):
             load_experts(layer.mlp.experts, experts_src, f"{PREFIX}layers.{layer_id}.")
             log_checkpoint_reads(f"layer {layer_id} load", read_sources, read_before, read_start)
             layer.eval()
+            if fixed_gdn_rows is not None and kind == "linear_attention":
+                layer.linear_attn.forward = fixed_gdn_forward(layer.linear_attn.forward, fixed_gdn_rows)
             if layer.ple is not None:
                 emb = layer.ple.ple_embedding
                 expected = ref._build_layer_multipliers(emb.unigram_vocab_size, emb.ngram_size, emb.ple_layer_index, emb.seed)
@@ -175,6 +190,7 @@ def run_windows(a, config, ref, dense, experts_src, create_causal_mask):
         experts_snapshot=str(a.experts_snapshot or a.snapshot),
         reference="transformers qwen4_exp (pinned 62d7ebd7; eager, FP32 routed sum, lazy PLE rows)",
         seconds=time.time() - started, seconds_per_layer=times, snapshot_identity=identity,
+        **({"reference_geometry": geometry} if geometry is not None else {}),
         prefix_qualification=proof)
 
 
@@ -314,7 +330,11 @@ def main() -> None:
     p.add_argument("--media-features-out", type=Path, help="write immutable BF16 paired-probe feature files")
     p.add_argument("--out", type=Path, required=True)
     p.add_argument("--device", type=int, default=0)
+    p.add_argument("--fixed-gdn-rows", type=int,
+                   help="diagnostic fixed no-cache GDN geometry (multiple of 64); requires --windows")
     a = p.parse_args()
+    if a.fixed_gdn_rows is not None and not a.windows:
+        p.error("--fixed-gdn-rows requires --windows")
     if a.prefix_only and not a.windows:
         p.error("--prefix-only requires --windows")
     if (a.media or a.media_root or a.media_features_out) and not (a.media and a.windows):
@@ -333,6 +353,9 @@ def main() -> None:
     install()
     from shape_invariant import install_eager
     install_eager(ref)
+    if a.windows:
+        from qwen_media import fixed_qsa_eager
+        ref.eager_attention_forward = fixed_qsa_eager(ref.eager_attention_forward)
     config = AutoConfig.from_pretrained(a.snapshot).text_config
     config._attn_implementation = "eager"
     if a.windows:

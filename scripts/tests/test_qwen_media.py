@@ -391,11 +391,13 @@ def test_qwen_media_prefix_adjusted_lengths_and_full_vocab_bits(tmp_path):
             if changed and i:
                 logits[0, -1] = np.float32(1e-8)  # Same top-1 is not enough.
             entries.append(write_scored_logits(args.out, probe, logits))
-        finish_golden(args.out, panel, entries, snapshot_identity=identity, seconds=0)
+        finish_golden(args.out, panel, entries, snapshot_identity=identity, seconds=0,
+                      reference_geometry={"gdn_sequence_rows": 2560})
 
     proof = qualify_prefix(a, manifest, execute)
     assert proof["lengths"] == [108 + 512, 108 + 576] and proof["rows"] == 512
     assert proof["finite"] and proof["passed"] and proof["media"] == w["media"]
+    assert proof["reference_geometry"] == {"gdn_sequence_rows": 2560}
     validate_qualification(proof, manifest, identity)
     changed = True
     with pytest.raises(ValueError, match="prefix invariance failed"):
@@ -415,3 +417,251 @@ def test_golden_injects_before_repeat_and_keeps_ple_native_ids():
     helper = ast.parse((ROOT / "python/reference/qwen_media.py").read_text())
     inject = next(n for n in helper.body if isinstance(n, ast.FunctionDef) and n.name == "inject_embeddings")
     assert isinstance(inject.body[-1], ast.Return) and inject.body[-1].value.func.attr == "repeat"
+
+
+@pytest.mark.parametrize("rows", [0, -64, 63, 65, 16448, True, 2560.0])
+def test_fixed_gdn_geometry_rejects_invalid_capacity(rows):
+    with pytest.raises(ValueError, match="multiple of 64"):
+        media.fixed_gdn_forward(None, rows)
+
+
+class GdnArray(np.ndarray):
+    def new_zeros(self, shape, dtype=None):
+        return np.zeros(shape, dtype=self.dtype if dtype is None else dtype).view(GdnArray)
+
+    def copy_(self, value):
+        self[:] = value
+
+    def contiguous(self):
+        return np.ascontiguousarray(self).view(GdnArray)
+
+
+def test_fixed_gdn_geometry_pads_before_forward_masks_crops_and_preserves_inputs(monkeypatch):
+    monkeypatch.setitem(sys.modules, "torch", types.SimpleNamespace(bool=np.bool_))
+    seen = []
+
+    def original(hidden, cache_params, attention_mask):
+        assert hidden.shape == (1, 2560, 4) and cache_params is None
+        assert attention_mask.shape == (1, 2560) and attention_mask.dtype == np.bool_
+        count = int(attention_mask.sum())
+        assert attention_mask[0, :count].all() and not attention_mask[0, count:].any()
+        assert not hidden[:, count:].any()
+        seen.append(hidden.copy())
+        # A causal surrogate checks the wrapper's geometry, not official arithmetic.
+        return hidden.cumsum(axis=1, dtype=hidden.dtype).view(GdnArray)
+
+    forward = media.fixed_gdn_forward(original, 2560)
+    short = np.ones((1, 826, 4), dtype=np.float32).view(GdnArray)
+    extended = np.full((1, 890, 4), 3, dtype=np.float32).view(GdnArray)
+    extended[:, :826] = short
+    a, b = forward(short), forward(extended)
+    assert a.shape == short.shape and b.shape == extended.shape
+    assert a.dtype == b.dtype == short.dtype and a.flags.c_contiguous
+    assert np.array_equal(a, b[:, :826]) and len(seen) == 2
+    assert np.array_equal(seen[0][:, :826], seen[1][:, :826])
+    assert np.all(short == 1) and np.all(extended[:, 826:] == 3)
+    forward(np.zeros((1, 2560, 4), dtype=np.float32).view(GdnArray))
+    assert len(seen) == 3
+
+
+@pytest.mark.parametrize("case", ["cache", "mask", "packed", "empty", "too_long", "batch", "rank"])
+def test_fixed_gdn_geometry_fails_closed_before_official_call(monkeypatch, case):
+    monkeypatch.setitem(sys.modules, "torch", types.SimpleNamespace(bool=np.bool_))
+    called = []
+    forward = media.fixed_gdn_forward(lambda *args, **kwargs: called.append(True), 128)
+    hidden = np.zeros((1, 65, 4), dtype=np.float32).view(GdnArray)
+    kwargs = {}
+    if case == "cache":
+        kwargs["cache_params"] = object()
+    elif case == "mask":
+        kwargs["attention_mask"] = np.ones((1, 65), dtype=np.bool_)
+    elif case == "packed":
+        kwargs["cu_seq_lens_q"] = [0, 65]
+    else:
+        hidden = np.zeros({"empty": (1, 0, 4), "too_long": (1, 129, 4),
+                           "batch": (2, 65, 4), "rank": (65, 4)}[case], dtype=np.float32).view(GdnArray)
+    with pytest.raises(ValueError):
+        forward(hidden, **kwargs)
+    assert not called
+
+
+@pytest.mark.parametrize("case", ["shape", "dtype"])
+def test_fixed_gdn_geometry_validates_official_output(monkeypatch, case):
+    monkeypatch.setitem(sys.modules, "torch", types.SimpleNamespace(bool=np.bool_))
+    def original(hidden, **kwargs):
+        return hidden[:, :64] if case == "shape" else hidden.astype(np.float64)
+    with pytest.raises(ValueError, match="output differs"):
+        media.fixed_gdn_forward(original, 128)(np.zeros((1, 65, 4), dtype=np.float32).view(GdnArray))
+
+
+def test_fixed_gdn_geometry_is_opt_in_and_records_prefix_provenance():
+    source = (ROOT / "python/reference/families/qwen4/golden.py").read_text()
+    tree = ast.parse(source)
+    loop = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "run_windows")
+    text = ast.unparse(loop)
+    assert text.index("fixed_gdn_forward(None, fixed_gdn_rows)") < text.index("proof = qualify(")
+    assert "kind == 'linear_attention'" in text
+    assert "layer.linear_attn.forward = fixed_gdn_forward(layer.linear_attn.forward, fixed_gdn_rows)" in text
+    assert "reference_geometry" in text and "gdn_sequence_rows" in text
+    assert 'p.add_argument("--fixed-gdn-rows", type=int,' in source
+    # The original family loop retains native PLE ids and M-RoPE; only GDN is padded.
+    assert "ple_input_ids=ids" in text and "rotary(embed_shape, positions[1:])" in text
+    proof_source = (ROOT / "python/reference/fidelity_windows.py").read_text()
+    assert '"reference_geometry": meta["reference_geometry"]' in proof_source
+
+
+def test_real_cpu_fixed_gdn_uses_unchanged_official_forward(monkeypatch):
+    torch = pytest.importorskip("torch")
+    pytest.importorskip("transformers")
+    ref = media.official_reference()
+    from transformers.models.qwen4_exp.configuration_qwen4_exp import Qwen4ExpTextConfig
+    config = Qwen4ExpTextConfig(hidden_size=16, linear_num_key_heads=2,
+        linear_num_value_heads=4, linear_key_head_dim=4, linear_value_head_dim=4,
+        linear_conv_kernel_dim=4, layer_types=["linear_attention"], num_hidden_layers=1)
+    with torch.random.fork_rng(devices=[]):
+        torch.manual_seed(7)
+        module = ref.Qwen4ExpTextGatedDeltaNet(config, 0).to(torch.bfloat16).eval()
+        short = torch.randn(1, 65, 16, dtype=torch.bfloat16)
+        extended = torch.randn(1, 129, 16, dtype=torch.bfloat16)
+        extended[:, :65].copy_(short)
+    forward = media.fixed_gdn_forward(module.forward, 192)
+    with torch.inference_mode():
+        output = forward(short)
+        padded = torch.zeros(1, 192, 16, dtype=short.dtype)
+        padded[:, :65].copy_(short)
+        mask = torch.arange(192).unsqueeze(0) < 65
+        expected = module(padded, cache_params=None, attention_mask=mask)[:, :65]
+        assert torch.equal(output, expected) and output.dtype == torch.bfloat16
+        assert torch.equal(output, forward(extended)[:, :65])
+    assert hashlib.sha256(Path(ref.__file__).read_bytes()).hexdigest() == media.MODELING_SHA256
+
+
+class QsaArray(GdnArray):
+    def new_full(self, shape, fill):
+        return np.full(shape, fill, dtype=self.dtype).view(QsaArray)
+
+    def is_floating_point(self):
+        return np.issubdtype(self.dtype, np.floating)
+
+
+@pytest.mark.parametrize("rows", [0, -128, 127, 129, 16512, True, 2560.0])
+def test_fixed_qsa_rejects_invalid_capacity(rows):
+    with pytest.raises(ValueError, match="multiple of 128"):
+        media.fixed_qsa_eager(None, rows)
+
+
+def test_fixed_qsa_pads_only_keys_values_and_mask_and_keeps_official_call():
+    query = np.ones((1, 4, 826, 8), dtype=np.float32).view(QsaArray)
+    key = np.ones((1, 2, 826, 8), dtype=np.float32).view(QsaArray)
+    value = (key * 3).view(QsaArray)
+    mask = np.zeros((1, 1, 826, 826), dtype=np.float32).view(QsaArray)
+    mask[..., 0, 1:] = -10000
+    original_bytes = [x.tobytes() for x in (query, key, value, mask)]
+    seen = []
+
+    def original(module, q, k, v, m, **kwargs):
+        assert q is query and module.training is False
+        assert k.shape == v.shape == (1, 2, 2560, 8)
+        assert m.shape == (1, 1, 826, 2560)
+        np.testing.assert_array_equal(k[..., :826, :], key)
+        np.testing.assert_array_equal(v[..., :826, :], value)
+        np.testing.assert_array_equal(m[..., :826], mask)
+        assert not k[..., 826:, :].any() and not v[..., 826:, :].any()
+        assert np.isneginf(m[..., 826:]).all()
+        assert kwargs == {"scaling": .25, "dropout": 0.0, "tag": "unchanged"}
+        seen.append(True)
+        return q.transpose(0, 2, 1, 3), None
+
+    result = media.fixed_qsa_eager(original)(types.SimpleNamespace(training=False),
+        query, key, value, mask, .25, tag="unchanged")
+    assert len(seen) == 1 and result[1] is None
+    assert [x.tobytes() for x in (query, key, value, mask)] == original_bytes
+
+
+@pytest.mark.parametrize("case", ["training", "dropout", "no_mask", "bool_mask", "mask_keys",
+    "mask_queries", "too_long", "empty", "key_rank", "value_shape", "query_width"])
+def test_fixed_qsa_fails_closed_before_official_math(case):
+    query = np.zeros((1, 4, 65, 8), dtype=np.float32).view(QsaArray)
+    key = np.zeros((1, 2, 65, 8), dtype=np.float32).view(QsaArray)
+    value = key.copy()
+    mask = np.zeros((1, 1, 65, 65), dtype=np.float32).view(QsaArray)
+    module, dropout = types.SimpleNamespace(training=False), 0.0
+    if case == "training":
+        module.training = True
+    elif case == "dropout":
+        dropout = .1
+    elif case == "no_mask":
+        mask = None
+    elif case == "bool_mask":
+        mask = mask.astype(np.bool_)
+    elif case.startswith("mask_"):
+        mask = np.zeros((1, 1, 64 if case == "mask_queries" else 65,
+                         64 if case == "mask_keys" else 65), dtype=np.float32).view(QsaArray)
+    elif case in ("too_long", "empty"):
+        key = np.zeros((1, 2, 129 if case == "too_long" else 0, 8), dtype=np.float32).view(QsaArray)
+        value = key.copy()
+    elif case == "key_rank":
+        key, value = key[0], value[0]
+    elif case == "value_shape":
+        value = value[..., :64, :]
+    else:
+        query = query[..., :7]
+    called = []
+    with pytest.raises(ValueError):
+        media.fixed_qsa_eager(lambda *a, **kw: called.append(True), 128)(
+            module, query, key, value, mask, .25, dropout=dropout)
+    assert not called
+
+
+def test_fixed_qsa_full_capacity_preserves_tensor_identity():
+    query = np.zeros((1, 4, 3, 8), dtype=np.float32).view(QsaArray)
+    key = np.zeros((1, 2, 128, 8), dtype=np.float32).view(QsaArray)
+    mask = np.zeros((1, 1, 1, 128), dtype=np.float32).view(QsaArray)
+    def original(module, q, k, v, m, **kwargs):
+        assert q is query and k is key and v is key and m is mask
+        return q, None
+    assert media.fixed_qsa_eager(original, 128)(types.SimpleNamespace(training=False),
+        query, key, key, mask, .25)[0] is query
+
+
+def test_fixed_qsa_window_hook_and_geometry_provenance():
+    tree = ast.parse((ROOT / "python/reference/families/qwen4/golden.py").read_text())
+    main = ast.unparse(next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "main"))
+    loop = ast.unparse(next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "run_windows"))
+    assert "if a.windows:\n        from qwen_media import fixed_qsa_eager" in main
+    assert "fixed_qsa_eager(ref.eager_attention_forward)" in main
+    assert loop.index("panel exceeds fixed QSA geometry") < loop.index("proof = qualify(")
+    assert "qsa_key_rows" in loop and "qsa_padding" in loop
+    assert media.QSA_KEY_ROWS == 2560
+    hook = ast.unparse(next(n for n in ast.parse((ROOT / "python/reference/qwen_media.py").read_text()).body
+                           if isinstance(n, ast.FunctionDef) and n.name == "fixed_qsa_eager"))
+    assert "matmul" not in hook and "softmax" not in hook and "topk" not in hook
+
+
+def test_real_cpu_fixed_qsa_calls_unchanged_official_eager():
+    torch = pytest.importorskip("torch")
+    pytest.importorskip("transformers")
+    ref = media.official_reference()
+    module = types.SimpleNamespace(training=False, num_key_value_groups=2)
+    with torch.random.fork_rng(devices=[]):
+        torch.manual_seed(11)
+        query = torch.randn(1, 4, 65, 8, dtype=torch.bfloat16)
+        key = torch.randn(1, 2, 129, 8, dtype=torch.bfloat16)
+        value = torch.randn_like(key)
+    mask = torch.full((1, 1, 65, 129), torch.finfo(torch.bfloat16).min, dtype=torch.bfloat16)
+    mask.masked_fill_(torch.arange(129)[None, :] <= torch.arange(65)[:, None], 0)
+    wrapped = media.fixed_qsa_eager(ref.eager_attention_forward)
+    with torch.inference_mode():
+        output, weights = wrapped(module, query, key, value, mask, .25)
+        padded_key, padded_value = key.new_zeros(1, 2, 2560, 8), value.new_zeros(1, 2, 2560, 8)
+        padded_key[..., :129, :].copy_(key)
+        padded_value[..., :129, :].copy_(value)
+        padded_mask = mask.new_full((1, 1, 65, 2560), -float("inf"))
+        padded_mask[..., :129].copy_(mask)
+        expected, expected_weights = ref.eager_attention_forward(module, query, padded_key,
+            padded_value, padded_mask, scaling=.25)
+        assert torch.equal(output, expected) and torch.equal(weights, expected_weights)
+        assert output.dtype == torch.bfloat16 and not weights[..., 129:].any()
+        short_output, _ = wrapped(module, query, key[..., :65, :], value[..., :65, :], mask[..., :65], .25)
+        assert torch.equal(output, short_output)
+    assert hashlib.sha256(Path(ref.__file__).read_bytes()).hexdigest() == media.MODELING_SHA256

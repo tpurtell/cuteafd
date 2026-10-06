@@ -276,6 +276,7 @@ def qualify_prefix(a, manifest: dict, execute) -> dict:
              "set_sha256": manifest["set_sha256"], "source_window": source["id"],
              "lengths": lengths, "score_from": score_from, "fixed_rows": 128,
              **({"media": source["media"]} if source.get("media") else {}),
+             **({"reference_geometry": meta["reference_geometry"]} if "reference_geometry" in meta else {}),
              "snapshot_identity": meta["snapshot_identity"], "logits_sha256": hashes,
              "seconds": meta["seconds"], **result}
     (root / "qualification.json").write_bytes(canonical(proof) + b"\n")

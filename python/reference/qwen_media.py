@@ -16,6 +16,7 @@ TRANSFORMERS_REVISION = "62d7ebd7de4938e072b7aaeb881593b79dc56835"
 MODELING_SHA256 = "2a44aeadb215acbb5c75939fcc97e9f14bccff5a51c232826427594993f6a760"
 IMAGE_ID, START_ID, END_ID = 248056, 248053, 248054
 WIDTH = 2560
+QSA_KEY_ROWS = 2560
 PROCESSOR_SOURCES = {
     "models.qwen2_vl.image_processing_pil_qwen2_vl": "f7403c897abd3c0b3ed678a3a208233cb4ab21fc030d45b8e16e6153de6a4e87",
     "image_utils": "24e1b8f65481a87f2d294473b238fe7ac3a5dbdf8fe64c4efac72a3616c66437",
@@ -131,6 +132,67 @@ def inject_embeddings(embedding, window, features, hc_count):
             raise ValueError("invalid Qwen BF16 feature shape/dtype/values")
         embedding[0, span["start"]:span["start"] + span["len"]].copy_(value.to(embedding.device))
     return embedding.repeat(1, 1, hc_count)
+
+
+def fixed_qsa_eager(original, rows=QSA_KEY_ROWS):
+    """Fix the PV reduction extent while calling unchanged official eager math."""
+    if type(rows) is not int or not 0 < rows <= 16384 or rows % 128:
+        raise ValueError("fixed QSA keys must be a positive multiple of 128 <= 16384")
+
+    def forward(module, query, key, value, attention_mask, scaling, dropout=0.0, **kwargs):
+        if module.training or dropout != 0.0:
+            raise ValueError("fixed QSA geometry requires inference without dropout")
+        if (query.ndim != 4 or key.ndim != 4 or value.shape != key.shape
+                or query.shape[0] != key.shape[0] or query.shape[-1] != key.shape[-1]):
+            raise ValueError("invalid QSA query/key/value geometry")
+        count = key.shape[-2]
+        if not 0 < count <= rows:
+            raise ValueError("key sequence exceeds fixed QSA geometry")
+        if (attention_mask is None or attention_mask.ndim != 4
+                or not attention_mask.is_floating_point()
+                or attention_mask.shape[-1] != count
+                or attention_mask.shape[-2] not in (1, query.shape[-2])):
+            raise ValueError("fixed QSA geometry requires the full additive causal/indexer mask")
+        if count != rows:
+            shape = (*key.shape[:-2], rows, key.shape[-1])
+            padded_key, padded_value = key.new_zeros(shape), value.new_zeros(shape)
+            padded_key[..., :count, :].copy_(key)
+            padded_value[..., :count, :].copy_(value)
+            mask = attention_mask.new_full((*attention_mask.shape[:-1], rows), -float("inf"))
+            mask[..., :count].copy_(attention_mask)
+            key, value, attention_mask = padded_key, padded_value, mask
+        return original(module, query, key, value, attention_mask,
+                        scaling=scaling, dropout=dropout, **kwargs)
+
+    return forward
+
+
+def fixed_gdn_forward(original, rows):
+    """Diagnostic no-cache prefill geometry; keep the official forward unchanged."""
+    if type(rows) is not int or rows <= 0 or rows > 16384 or rows % 64:
+        raise ValueError("fixed GDN rows must be a positive multiple of 64 <= 16384")
+
+    def forward(hidden_states, cache_params=None, attention_mask=None, **kwargs):
+        import torch
+        if cache_params is not None or attention_mask is not None or kwargs:
+            raise ValueError("fixed GDN geometry supports only unpadded, unpacked no-cache prefill")
+        if hidden_states.ndim != 3 or hidden_states.shape[0] != 1:
+            raise ValueError("fixed GDN geometry requires one batch of hidden states")
+        count, width = hidden_states.shape[1:]
+        if not 0 < count <= rows:
+            raise ValueError("sequence exceeds fixed GDN geometry")
+        # Pad before projections/conv/softplus, not after the decay was computed.
+        padded = hidden_states.new_zeros((1, rows, width))
+        padded[:, :count].copy_(hidden_states)
+        mask = hidden_states.new_zeros((1, rows), dtype=torch.bool)
+        mask[:, :count] = True
+        output = original(padded, cache_params=None, attention_mask=mask)
+        if output.shape != padded.shape or output.dtype != hidden_states.dtype:
+            raise ValueError("official GDN output differs from the fixed geometry/dtype")
+        # Never publish the continuation or its recurrent state to a caller.
+        return output[:, :count].contiguous()
+
+    return forward
 
 
 def load_tower(snapshot):
