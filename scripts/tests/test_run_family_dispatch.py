@@ -453,12 +453,16 @@ def test_mimo_weight_policy_is_resolved_by_runtime_and_explicit_checkpoint_is_fo
 
 
 @pytest.mark.parametrize("quota", [None, "4MiB", "0"])
-def test_mimo_embedding_cache_quota_is_explicit_only(tmp_path, quota):
-    config = {"model_type": "mimo_v2_flash", "num_hidden_layers": 2, "moe_layer_freq": [0, 1]}
-    keys = "" if quota is None else f"MEDIA_CACHE_BYTES={quota}\n"
-    result = _family_launch_result(tmp_path, config, "test/mimo", keys)
+@pytest.mark.parametrize("family,serve", [("mimo_v2_flash", "serve-mimo"), ("glm5_next", "serve-glmf")])
+def test_embedding_cache_quota_is_explicit_only(tmp_path, quota, family, serve):
+    config = {"model_type": family, "num_hidden_layers": 2}
+    config.update({"moe_layer_freq": [0, 1]} if family == "mimo_v2_flash" else
+                  {"mlp_layer_types": ["sparse"] * 2, "layer_types": ["linear_attention", "deepseek_sparse_attention"]})
+    keys = "SPECULATOR=off\n" + ("" if quota is None else f"MEDIA_CACHE_BYTES={quota}\n")
+    model = "test/mimo" if family == "mimo_v2_flash" else "zai-org/GLM-5.3-Flash"
+    result = _family_launch_result(tmp_path, config, model, keys)
     assert result.returncode == 0, result.stderr
-    launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-mimo" in line)
+    launch = next(line for line in result.stderr.splitlines() if f"cuteafd {serve}" in line)
     if quota is None:
         assert "--media-cache-bytes" not in launch
     else:
@@ -896,6 +900,28 @@ def test_mimo_encoder_plan_hash_and_selected_rank(tmp_path, mode, kind):
     else:
         preflight = next(line for line in result.stderr.splitlines() if "cuteafd plan" in line)
         assert f"--vision {mode or 'auto'}" in preflight
+
+
+@pytest.mark.parametrize("mode,kind", [(None, "off"), ("off", "off"), ("auto", "spark"),
+                                      ("spark:0", "spark"), ("rtx:0", "rtx")])
+def test_glmf_encoder_is_opt_in_and_forwards_remote_identity(tmp_path, mode, kind):
+    config = {"model_type": "glm5_next", "num_hidden_layers": 2, "mlp_layer_types": ["sparse"] * 2,
+              "layer_types": ["linear_attention", "deepseek_sparse_attention"], "vision_config": {"depth": 24}}
+    placement = {"kind": kind}
+    if kind == "spark": placement["rank"] = 0
+    if kind == "rtx": placement["gpu"] = 0
+    plan = {"placement_supported": True, "fits": True, "spark_ranks": 1,
+            "encoder_plan_hash": "ab" * 32, "encoder": {"kind": placement, "replicas": []}}
+    keys = "RTX_GPUS=1\nSPECULATOR=off\n" + (f"VISION={mode}\n" if mode else "")
+    result = _family_launch_result(tmp_path, config, "zai-org/GLM-5.3-Flash", keys, encoder_plan=plan)
+    assert result.returncode == 0, result.stderr
+    launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-glmf" in line)
+    assert f"--vision {kind}" in launch
+    assert ("--encoder-listen" in result.stderr) == (kind == "spark")
+    assert ("--vision-peers 10.0.0.1:19442" in launch) == (kind == "spark")
+    if kind == "spark":
+        assert f"--encoder-plan-hash {'ab' * 32}" in launch and "--encoder-revision abc" in launch
+    assert ("cuteafd plan" in result.stderr) == (kind != "off")
 
 
 @pytest.mark.parametrize("family_config,serve", [

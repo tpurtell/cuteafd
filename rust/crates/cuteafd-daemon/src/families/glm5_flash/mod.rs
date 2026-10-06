@@ -5,6 +5,7 @@ pub(crate) mod engine;
 pub(crate) mod fp8;
 pub(crate) mod prefix;
 pub(crate) mod serve;
+mod media;
 mod speculate;
 mod expert_rows;
 mod header;

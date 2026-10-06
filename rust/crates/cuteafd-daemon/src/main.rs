@@ -46,10 +46,15 @@ async fn main() -> Result<()> {
         },
         command => (command, matches, initial_budget, initial_vision, initial_audio, initial_image_cap, initial_fetch),
     };
-    let vision = family_vision.or(initial_vision).unwrap_or(cuteafd_loader::plan::MediaMode::Auto);
+    // GLM Flash vision stays opt-in until the tower and serving hardware gates pass.
+    let vision_default = if matches!(&command, Commands::ServeGlmf(_)) {
+        cuteafd_loader::plan::MediaMode::Off
+    } else { cuteafd_loader::plan::MediaMode::Auto };
+    let vision = family_vision.or(initial_vision).unwrap_or(vision_default);
     let audio = family_audio.or(initial_audio).unwrap_or(cuteafd_loader::plan::MediaMode::Off);
     if let Commands::Plan(args) = &mut command { args.vision = vision; args.audio = audio; }
     if let Commands::ServeMimo(args) = &mut command { args.vision = vision; }
+    if let Commands::ServeGlmf(args) = &mut command { args.vision = vision; }
     cuteafd_api::openai::set_media_input_policy(vision != cuteafd_loader::plan::MediaMode::Off,
         audio != cuteafd_loader::plan::MediaMode::Off);
     cuteafd_api::openai::media::set_preparation_policy(
