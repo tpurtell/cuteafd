@@ -660,6 +660,8 @@ pub(crate) struct Qwen4Engine<'a> {
     pub embedding: TokenEmbedding<'a>,
     /// Deferred MTP drafts of a cycle: U32 [MTP_DEFERRED_STEPS, DECODE_ROWS].
     mtp_drafts: Dev<'a>,
+    // Task-only localization; never set by a serving request.
+    localize: RefCell<Option<(std::path::PathBuf, usize, usize)>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -817,7 +819,59 @@ impl<'a> Qwen4Engine<'a> {
             startup_graphs: std::env::var("CUTEAFD_QWEN4_STARTUP_GRAPHS").is_ok_and(|v| v == "1"),
             warming_graphs: Cell::new(false), w8a8_prefill: false,
             routes_ready: library.cuda_event_create_ordering()?, l2: None, embedding,
-            mtp_drafts: zeroed(MTP_DEFERRED_STEPS * DECODE_ROWS * 4)? })
+            mtp_drafts: zeroed(MTP_DEFERRED_STEPS * DECODE_ROWS * 4)?, localize: RefCell::new(None) })
+    }
+
+    fn localize_dump(&self, name: &str, dev: &Dev<'_>, row_bytes: usize) -> Result<()> {
+        if let Some((out, real, _)) = self.localize.borrow().as_ref() {
+            let bytes = self.download(dev, real * row_bytes)?;
+            std::fs::write(out.join(format!("{name}.bin")), bytes)?;
+        }
+        Ok(())
+    }
+
+    pub fn localize_decode(&self, tokens: &[u32], out: &std::path::Path) -> Result<()> {
+        ensure!(std::env::var_os("WP7_QWEN_LOCALIZE").is_some(), "task probe must be explicitly enabled");
+        ensure!(tokens.len() >= 49 && self.weights.layers.len() == 48, "probe needs 49 tokens and 48 layers");
+        std::fs::create_dir(out)?;
+        self.warm_decode_graphs(1, true)?;
+        let mut allocator = Allocator::new(self.pages, self.slots, &self.cfg);
+        let mut placement = allocator.admit(65)?;
+        self.prefill_device(&mut placement, &tokens[..32], None, None, 1)?;
+        let original = placement.clone();
+        let mut buffers: Vec<_> = [&self.gdn_conv, &self.gdn_state, &self.gdn_replay, &self.ple_state,
+            &self.ple_replay, &self.mtp_pending].into_iter()
+            .filter_map(|pool| pool.as_ref().map(|pool| pool.buffer)).collect();
+        for paged in self.paged_buffers() { buffers.extend(paged); }
+        // SAFETY: snapshot and restoration require all prior engine writes drained.
+        unsafe { self.library.cuda_stream_synchronize(self.stream)? };
+        let before: Vec<Vec<u8>> = buffers.iter().map(|&buffer| {
+            let mut bytes = vec![0; buffer.bytes];
+            self.library.copy_d2h(&mut bytes, buffer)?;
+            Ok(bytes)
+        }).collect::<Result<_>>()?;
+        for (name, bucket, graphs) in [("eager17", 17, false), ("eager64", 64, false), ("graph64", 64, true)] {
+            if graphs {
+                let left = std::fs::read(out.join("eager17/head_logits.bin"))?;
+                let right = std::fs::read(out.join("eager64/head_logits.bin"))?;
+                if left != right {
+                    tracing::info!("WP7 eager M17/M64 differ; graph arm deferred pending localization");
+                    break;
+                }
+            }
+            for (&buffer, bytes) in buffers.iter().zip(&before) { self.library.copy_h2d(buffer, bytes)?; }
+            placement = original.clone();
+            let arm = out.join(name);
+            std::fs::create_dir(&arm)?;
+            *self.localize.borrow_mut() = Some((arm.clone(), 17, bucket));
+            let result = self.verify_step(&mut [(&mut placement, &tokens[32..49])], None, true, graphs);
+            *self.localize.borrow_mut() = None;
+            let mut logits = result?.context("probe logits")?;
+            logits.rows = 17;
+            std::fs::write(arm.join("head_logits.bin"), bytes_of(&logits.to_host(self.library)?))?;
+            tracing::info!(name, bucket, graphs, "WP7 full-chain localization arm complete");
+        }
+        Ok(())
     }
 
     pub fn set_experts(&mut self, experts: Experts<'a>) {
@@ -1401,8 +1455,10 @@ impl<'a> Qwen4Engine<'a> {
             embedding_media(&media_rows)?
         } else { Default::default() };
         let bucketed = self.startup_graphs && self.use_graphs && graphs && on_layer.is_none() && media.indices.is_empty();
-        if bucketed {
-            pad_decode_tables(&mut tables, &mut tokens, decode_bucket(rows), self.ple.as_ref().map_or(0, |_| self.cfg.ple_rows()));
+        let probe_bucket = self.localize.borrow().as_ref().map(|(_, _, bucket)| *bucket);
+        if bucketed || probe_bucket.is_some() {
+            pad_decode_tables(&mut tables, &mut tokens, probe_bucket.unwrap_or_else(|| decode_bucket(rows)),
+                self.ple.as_ref().map_or(0, |_| self.cfg.ple_rows()));
         }
         let physical_rows = tokens.len();
         let mut logits = self.step(&tables, &tokens, physical_rows, on_layer, None, &media, graphs)?;
@@ -1751,14 +1807,29 @@ impl<'a> Qwen4Engine<'a> {
         }
         self.enter(w, &mut cur, None, &layers[0], 0, rows, spec)?;
         for (index, layer) in layers.iter().enumerate() {
+            self.localize_dump(&format!("layer{index:02}_attention_pre"), &w.x, h * 2)?;
             match layer.attention {
                 Qwen4Attention::Gdn => self.gdn(w, index, layer, rows, cap, spec)?,
                 Qwen4Attention::Full => self.full(w, index, layer, rows, cap, tables)?,
             }
+            self.localize_dump(&format!("layer{index:02}_attention_out"), &w.delta, h * 2)?;
             // Attention back into the streams, then the MLP site's input.
             self.post_pre(w, cur, layer, "mlp", rows)?;
             cur ^= 1;
-            self.moe(w, index, layer, t, rows, tables.decode)?;
+            self.localize_dump(&format!("layer{index:02}_mlp_pre"), &w.x, h * 2)?;
+            self.localize_dump(&format!("layer{index:02}_inject"), &w.inject, HC * 2)?;
+            let probe_real = self.localize.borrow().as_ref().map(|(_, real, _)| *real);
+            if let Some(real) = probe_real {
+                real_row_moe(real, t, |real| self.moe(w, index, layer, real, Scalar::I32(real as i32), tables.decode),
+                    |tail| {
+                        let buffer = Self::region(&w.delta, tail.start * h * 2, tail.len() * h * 2);
+                        // SAFETY: the real expert output has completed on this stream; suffix is inside delta.
+                        unsafe { self.library.cuda_zero_bytes_async(buffer, buffer.bytes, self.stream) }
+                    })?;
+            } else {
+                self.moe(w, index, layer, t, rows, tables.decode)?;
+            }
+            self.localize_dump(&format!("layer{index:02}_moe_out"), &w.delta, h * 2)?;
             let forced_rows = forced.and_then(|f| f(index));
             match layers.get(index + 1) {
                 Some(next) => {
@@ -1797,7 +1868,9 @@ impl<'a> Qwen4Engine<'a> {
             unsafe { self.library.cuda_stream_synchronize(self.stream)? };
             return Ok(None);
         }
+        self.localize_dump("final_streams", &w.streams[cur], HC * h * 2)?;
         self.head(w, &w.streams[cur], t, rows, logit_rows)?;
+        self.localize_dump("head_input", &w.x, h * 2)?;
         Ok(Some(self.device_logits(w, logit_rows, false)))
     }
 
@@ -1934,6 +2007,8 @@ impl<'a> Qwen4Engine<'a> {
             })?;
             cur ^= if index == 0 || index == layers.len() { 1 } else { 0 };
             if index < layers.len() {
+                self.localize_dump(&format!("layer{index:02}_mlp_pre"), &w.x, self.cfg.hidden * 2)?;
+                self.localize_dump(&format!("layer{index:02}_inject"), &w.inject, HC * 2)?;
                 if self.startup_graphs {
                     let clear_tail = |tail: std::ops::Range<usize>| -> Result<()> {
                         let tail = Self::region(&w.delta, tail.start * self.cfg.hidden * 2,
@@ -1954,9 +2029,12 @@ impl<'a> Qwen4Engine<'a> {
                 } else if !self.warming_graphs.get() {
                     self.moe_experts(w, index, t, rows, true)?;
                 }
+                self.localize_dump(&format!("layer{index:02}_moe_out"), &w.delta, self.cfg.hidden * 2)?;
                 if !self.warming_graphs.get() { crate::shared::console::layer_mark(index); }
             }
         }
+        self.localize_dump("final_streams", &w.streams[cur], HC * self.cfg.hidden * 2)?;
+        self.localize_dump("head_input", &w.x, self.cfg.hidden * 2)?;
         self.last_streams.set((true, cur));
         if layers.len() < self.cfg.layers {
             // SAFETY: the engine owns this stream.

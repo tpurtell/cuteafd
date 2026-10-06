@@ -502,6 +502,12 @@ pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
 fn golden(args: GoldenArgs) -> Result<()> {
     let opened = open(&args.engine)?;
     opened.with_engine(&args.engine, |engine| {
+        if let Ok(out) = std::env::var("WP7_QWEN_LOCALIZE") {
+            let bytes = std::fs::read(args.golden.join("tokens.bin"))?;
+            ensure!(bytes.len() % 4 == 0, "localize tokens must be U32 aligned");
+            let tokens: Vec<u32> = bytes.chunks_exact(4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).collect();
+            return engine.localize_decode(&tokens, std::path::Path::new(&out));
+        }
         if let Some(dir) = &args.mtp_oracle {
             return mtp_golden::mtp_oracle(&args, &opened, engine, dir);
         }
