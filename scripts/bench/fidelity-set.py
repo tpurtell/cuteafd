@@ -412,6 +412,18 @@ def build_vision_set(*, family, model, checkpoint, version, arm, probe, fixtures
     return validate_set(manifest)
 
 
+def seal_qsa_geometry(manifest, requested=None):
+    if manifest["family"] != "qwen4":
+        if requested is not None:
+            raise ValueError("--qsa-key-rows requires the qwen4 family")
+        return
+    from qwen_media import QSA_KEY_ROWS, qsa_key_rows
+    media = any(w.get("media") for w in manifest["windows"])
+    observed = max(len(w["tokens"]) for w in manifest["windows"])
+    default = QSA_KEY_ROWS if media else max(128, 1 << (observed - 1).bit_length())
+    manifest["qsa_key_rows"] = qsa_key_rows(manifest, default if requested is None else requested)
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--family", required=True, choices=LEGACY)
@@ -422,6 +434,7 @@ def main(argv=None):
     p.add_argument("--arm-manifest", required=True, type=pathlib.Path)
     p.add_argument("--recording", action="append", type=pathlib.Path, default=[])
     p.add_argument("--media-fixtures", type=pathlib.Path, help="build a separate 8-window vision panel from fixtures.json")
+    p.add_argument("--qsa-key-rows", type=int, help="Qwen fixed QSA extent sealed into this set (media default 2560; text next power of two)")
     p.add_argument("--file-list", type=pathlib.Path, help="JSON array of first-party repo-relative paths")
     p.add_argument("--base-url", default="http://127.0.0.1:8000")
     p.add_argument("--bench-token")
@@ -451,6 +464,7 @@ def main(argv=None):
             probe=ProbeClient(a.base_url, a.bench_token, a.timeout),
             recordings=[json.loads(path.read_text()) for path in a.recording],
             files=json.loads(a.file_list.read_text()) if a.file_list else None)
+    seal_qsa_geometry(manifest, a.qsa_key_rows)
     manifest["tokenizer_sha256"] = hashlib.sha256(a.tokenizer.read_bytes()).hexdigest()
     manifest["set_sha256"] = set_hash(manifest)
     out = a.out or ROOT / "set" / a.family / a.version / "windows.json"

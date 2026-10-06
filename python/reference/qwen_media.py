@@ -134,10 +134,41 @@ def inject_embeddings(embedding, window, features, hc_count):
     return embedding.repeat(1, 1, hc_count)
 
 
-def fixed_qsa_eager(original, rows=QSA_KEY_ROWS):
-    """Fix the PV reduction extent while calling unchanged official eager math."""
+def validate_qsa_key_rows(rows):
     if type(rows) is not int or not 0 < rows <= 16384 or rows % 128:
         raise ValueError("fixed QSA keys must be a positive multiple of 128 <= 16384")
+    return rows
+
+
+def qsa_key_rows(manifest, requested=None):
+    """Resolve one sealed extent for admission, prefix probes and eager math."""
+    configured = manifest.get("qsa_key_rows", QSA_KEY_ROWS)
+    if requested is not None:
+        validate_qsa_key_rows(requested)
+        if "qsa_key_rows" in manifest and requested != configured:
+            raise ValueError(f"QSA CLI rows {requested} differ from configured set rows {configured}")
+        configured = requested
+    validate_qsa_key_rows(configured)
+    observed = max(len(w["tokens"]) for w in manifest["windows"])
+    if observed > configured:
+        raise ValueError(f"panel exceeds fixed QSA geometry: observed {observed} rows > configured {configured} rows")
+    return configured
+
+
+def configure_qsa_eager(ref, manifest, requested=None):
+    rows = qsa_key_rows(manifest, requested)
+    current = ref.eager_attention_forward
+    installed = getattr(current, "_qsa_key_rows", None)
+    if installed is not None and installed != rows:
+        raise ValueError(f"QSA factory rows {installed} differ from configured set rows {rows}")
+    if installed is None:
+        ref.eager_attention_forward = fixed_qsa_eager(current, rows)
+    return rows
+
+
+def fixed_qsa_eager(original, rows=QSA_KEY_ROWS):
+    """Fix the PV reduction extent while calling unchanged official eager math."""
+    validate_qsa_key_rows(rows)
 
     def forward(module, query, key, value, attention_mask, scaling, dropout=0.0, **kwargs):
         if module.training or dropout != 0.0:
@@ -147,7 +178,7 @@ def fixed_qsa_eager(original, rows=QSA_KEY_ROWS):
             raise ValueError("invalid QSA query/key/value geometry")
         count = key.shape[-2]
         if not 0 < count <= rows:
-            raise ValueError("key sequence exceeds fixed QSA geometry")
+            raise ValueError(f"key sequence exceeds fixed QSA geometry: observed {count} rows > configured {rows} rows")
         if (attention_mask is None or attention_mask.ndim != 4
                 or not attention_mask.is_floating_point()
                 or attention_mask.shape[-1] != count
@@ -164,6 +195,7 @@ def fixed_qsa_eager(original, rows=QSA_KEY_ROWS):
         return original(module, query, key, value, attention_mask,
                         scaling=scaling, dropout=dropout, **kwargs)
 
+    forward._qsa_key_rows = rows
     return forward
 
 

@@ -628,14 +628,57 @@ def test_fixed_qsa_window_hook_and_geometry_provenance():
     tree = ast.parse((ROOT / "python/reference/families/qwen4/golden.py").read_text())
     main = ast.unparse(next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "main"))
     loop = ast.unparse(next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "run_windows"))
-    assert "if a.windows:\n        from qwen_media import fixed_qsa_eager" in main
-    assert "fixed_qsa_eager(ref.eager_attention_forward)" in main
-    assert loop.index("panel exceeds fixed QSA geometry") < loop.index("proof = qualify(")
+    assert "--qsa-key-rows" in main
+    assert "configure_qsa_eager(ref, manifest, getattr(a, 'qsa_key_rows', None))" in loop
+    assert loop.index("configure_qsa_eager(") < loop.index("proof = qualify(")
     assert "qsa_key_rows" in loop and "qsa_padding" in loop
     assert media.QSA_KEY_ROWS == 2560
     hook = ast.unparse(next(n for n in ast.parse((ROOT / "python/reference/qwen_media.py").read_text()).body
                            if isinstance(n, ast.FunctionDef) and n.name == "fixed_qsa_eager"))
     assert "matmul" not in hook and "softmax" not in hook and "topk" not in hook
+
+
+@pytest.mark.parametrize("rows", (2560, 16384))
+def test_qsa_set_admission_and_factory_cannot_diverge(rows):
+    panel = {"qsa_key_rows": rows, "windows": [{"tokens": [0] * rows}]}
+    ref = types.SimpleNamespace(eager_attention_forward=lambda *a, **kw: None)
+    assert media.configure_qsa_eager(ref, panel) == rows
+    installed = ref.eager_attention_forward
+    assert installed._qsa_key_rows == rows
+    # Prefix qualification preserves set geometry while shortening the sequence.
+    assert media.configure_qsa_eager(ref, {**panel, "windows": [{"tokens": [0] * 640}]}) == rows
+    assert ref.eager_attention_forward is installed
+    with pytest.raises(ValueError, match="CLI rows.*configured set rows"):
+        media.configure_qsa_eager(ref, panel, 128)
+    with pytest.raises(ValueError, match="factory rows.*configured set rows"):
+        media.configure_qsa_eager(ref, {"qsa_key_rows": 128, "windows": [{"tokens": [0]}]})
+    with pytest.raises(ValueError, match=f"observed {rows + 1} rows > configured {rows} rows"):
+        media.configure_qsa_eager(ref, {**panel, "windows": [{"tokens": [0] * (rows + 1)}]})
+
+
+def test_qsa_unsealed_media_default_and_explicit_override():
+    panel = {"windows": [{"tokens": [0] * 13387}]}
+    with pytest.raises(ValueError, match="observed 13387 rows > configured 2560 rows"):
+        media.qsa_key_rows(panel)
+    assert media.qsa_key_rows(panel, 16384) == 16384
+    assert "qsa_key_rows" not in panel
+
+
+def test_qsa_new_sets_seal_media_default_or_text_extent():
+    spec = importlib.util.spec_from_file_location("qsa_set_builder", ROOT / "scripts/bench/fidelity-set.py")
+    builder = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(builder)
+    panel = {"family": "qwen4", "windows": [{"tokens": [0] * 13387}]}
+    builder.seal_qsa_geometry(panel)
+    assert panel["qsa_key_rows"] == 16384
+    panel = {"family": "qwen4", "windows": [{"tokens": [0] * 1980, "media": [{}]}]}
+    builder.seal_qsa_geometry(panel)
+    assert panel["qsa_key_rows"] == 2560
+    other = {"family": "mimo_v2", "windows": []}
+    with pytest.raises(ValueError, match="requires the qwen4 family"):
+        builder.seal_qsa_geometry(other, 2560)
+    builder.seal_qsa_geometry(other)
+    assert "qsa_key_rows" not in other
 
 
 def test_real_cpu_fixed_qsa_calls_unchanged_official_eager():
