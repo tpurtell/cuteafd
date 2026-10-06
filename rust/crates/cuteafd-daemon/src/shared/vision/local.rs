@@ -19,13 +19,14 @@ pub struct LocalEncoder {
     lut: Arc<[f32; 768]>,
     width: usize,
     max_tokens: usize,
+    patch_size: usize,
     queue: VecDeque<Pending>,
     running: Option<Running>,
     next: u64,
 }
 impl LocalEncoder {
     pub fn new(service: EncoderService, config: &ProcessorConfig, width: usize, max_tokens: usize) -> Self {
-        Self { service, lut: normalization_lut(config), width, max_tokens,
+        Self { service, lut: normalization_lut(config), width, max_tokens, patch_size: config.patch as usize,
             queue: VecDeque::new(), running: None, next: 0 }
     }
     pub fn healthy(&self) -> bool { self.service.healthy() }
@@ -36,7 +37,8 @@ impl LocalEncoder {
         if t != 1 || h == 0 || w == 0 || h % 2 != 0 || w % 2 != 0
             || job.tokens != patches / 4 || job.tokens > self.max_tokens
             || job.hidden_width != self.width
-            || patches.checked_mul(768) != Some(job.rgb8.len()) {
+            || self.patch_size.checked_mul(self.patch_size).and_then(|pixels| pixels.checked_mul(3))
+                .and_then(|bytes| patches.checked_mul(bytes)) != Some(job.rgb8.len()) {
             return Err(MediaError::Features);
         }
         job.feature_bytes()?;
@@ -105,6 +107,25 @@ mod tests {
     use super::*;
     use cuteafd_core::ImageKey;
     use std::sync::{atomic::Ordering, mpsc};
+
+    #[test]
+    fn rgb_extent_uses_the_processor_patch_size() {
+        use cuteafd_loader::media::ImageFamily;
+        for family in [ImageFamily::Mimo, ImageFamily::Qwen, ImageFamily::GlmFlash] {
+            let (queue, _jobs) = mpsc::sync_channel::<super::super::Work>(2);
+            let service = EncoderService { queue: Some(queue), owner: None, ledger: Default::default(),
+                healthy: Arc::new(std::sync::atomic::AtomicBool::new(false)) };
+            let config = ProcessorConfig::for_family(family);
+            let encoder = LocalEncoder::new(service, &config, 2, 256);
+            let bytes = (config.patch * config.patch * 3 * 4) as usize;
+            let mut job = media::EncodeJob { key: ImageKey([0;32]), grid: [1,2,2],
+                rgb8: vec![0;bytes].into(), tokens: 1, hidden_width: 2 };
+            assert!(encoder.validate(&job).is_ok());
+            let wrong_patch = if config.patch == 14 { 16 } else { 14 };
+            job.rgb8 = vec![0;wrong_patch * wrong_patch * 3 * 4].into();
+            assert!(matches!(encoder.validate(&job), Err(MediaError::Features)));
+        }
+    }
 
     #[test]
     fn local_health_rejects_cached_or_probe_admission_after_owner_exit() {
