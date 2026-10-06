@@ -424,12 +424,30 @@ struct Work {
     reply: mpsc::SyncSender<Result<Vec<u16>>>,
     cancelled: Arc<AtomicBool>,
 }
+struct OwnerHealth(Arc<AtomicBool>);
+impl Drop for OwnerHealth {
+    fn drop(&mut self) { self.0.store(false, Ordering::Release); }
+}
+
+fn terminal_encode_failure(result: &Result<Vec<u16>>) -> bool {
+    matches!(result, Err(VisionError::Unavailable | VisionError::Native(
+        cuteafd_ffi::vision::VisionError::Native(_) | cuteafd_ffi::vision::VisionError::Runtime(_))))
+}
+
+fn reply_encode(healthy: &AtomicBool, reply: &mpsc::SyncSender<Result<Vec<u16>>>, result: Result<Vec<u16>>) -> bool {
+    let terminal = terminal_encode_failure(&result);
+    if terminal { healthy.store(false, Ordering::Release); }
+    let _ = reply.send(result);
+    terminal
+}
+
 /// Bounded queue, one image at a time. Every CUDA call stays on this thread.
 /// Dropping the service closes admission, drains accepted jobs and joins owner.
 pub struct EncoderService {
     queue: Option<mpsc::SyncSender<Work>>,
     owner: Option<JoinHandle<()>>,
     pub ledger: VisionLedger,
+    healthy: Arc<AtomicBool>,
 }
 impl EncoderService {
     pub fn start(
@@ -440,9 +458,12 @@ impl EncoderService {
     ) -> Result<Self> {
         let (queue, jobs) = mpsc::sync_channel::<Work>(2);
         let (ready, readiness) = mpsc::sync_channel(1);
+        let healthy = Arc::new(AtomicBool::new(false));
+        let owner_health = healthy.clone();
         let owner = thread::Builder::new()
             .name("vision-owner".into())
             .spawn(move || {
+                let _health = OwnerHealth(owner_health.clone());
                 let mut runtime = match VitRuntime::load(spec, &library, device, admitted_bytes) {
                     Ok(runtime) => runtime,
                     Err(error) => {
@@ -457,6 +478,7 @@ impl EncoderService {
                         return;
                     }
                 };
+                owner_health.store(true, Ordering::Release);
                 if ready.send(Ok(ledger)).is_err() {
                     return;
                 }
@@ -482,7 +504,8 @@ impl EncoderService {
                     if let Err(ref error) = result {
                         tracing::debug!(%error, "vision job failed");
                     }
-                    let _ = work.reply.send(result);
+                    // CUDA errors poison this owner: queued tickets fail closed.
+                    if reply_encode(&owner_health, &work.reply, result) { break; }
                 }
             })?;
         match readiness.recv() {
@@ -490,6 +513,7 @@ impl EncoderService {
                 queue: Some(queue),
                 owner: Some(owner),
                 ledger,
+                healthy,
             }),
             Ok(Err(error)) => {
                 drop(queue);
@@ -504,9 +528,11 @@ impl EncoderService {
         }
     }
     pub fn healthy(&self) -> bool {
-        self.owner.as_ref().is_some_and(|owner| !owner.is_finished())
+        self.healthy.load(Ordering::Acquire) && self.owner.as_ref().is_some_and(|owner| !owner.is_finished())
     }
+    pub fn health_handle(&self) -> Arc<AtomicBool> { self.healthy.clone() }
     pub fn submit(&self, job: EncodeJob) -> Result<EncoderTicket> {
+        if !self.healthy() { return Err(VisionError::Unavailable); }
         let (reply, result) = mpsc::sync_channel(1);
         let cancelled = Arc::new(AtomicBool::new(false));
         let work = Work {
@@ -537,6 +563,57 @@ impl Drop for EncoderService {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn owner_exit_and_panic_publish_health_without_scheduler_polling() {
+        for panic in [false, true] {
+            let health = Arc::new(AtomicBool::new(true));
+            let observed = health.clone();
+            let owner = thread::spawn(move || {
+                let _health = OwnerHealth(health);
+                if panic { panic!("injected vision owner failure"); }
+            });
+            assert_eq!(owner.join().is_err(), panic);
+            assert!(!observed.load(Ordering::Acquire));
+        }
+    }
+    #[test]
+    fn only_terminal_native_errors_poison_owner_before_reply() {
+        for error in [VisionError::QueueFull, VisionError::Cancelled,
+            VisionError::Native(cuteafd_ffi::vision::VisionError::InvalidInput("bad grid"))] {
+            assert!(!terminal_encode_failure(&Err(error)));
+        }
+        for error in [VisionError::Unavailable,
+            VisionError::Native(cuteafd_ffi::vision::VisionError::Native(1)),
+            VisionError::Native(cuteafd_ffi::vision::VisionError::Runtime("CUDA failure".into()))] {
+            assert!(terminal_encode_failure(&Err(error)));
+        }
+    }
+    #[test]
+    fn terminal_reply_publishes_unhealthy_and_disconnects_queued_tickets() {
+        let healthy = Arc::new(AtomicBool::new(true));
+        let owner_health = healthy.clone();
+        let (reply, result) = mpsc::sync_channel(0);
+        let (queued_reply, queued_result) = mpsc::sync_channel(1);
+        let owner = thread::spawn(move || {
+            let _health = OwnerHealth(owner_health.clone());
+            assert!(reply_encode(&owner_health, &reply, Err(VisionError::Native(
+                cuteafd_ffi::vision::VisionError::Native(1)))));
+            drop(queued_reply);
+        });
+        assert!(matches!(result.recv().unwrap(), Err(VisionError::Native(_))));
+        assert!(!healthy.load(Ordering::Acquire));
+        let queued = EncoderTicket { result: queued_result, cancelled: Arc::new(AtomicBool::new(false)) };
+        owner.join().unwrap();
+        assert!(matches!(queued.poll(), Err(VisionError::Unavailable)));
+
+        for error in [VisionError::QueueFull, VisionError::Cancelled] {
+            healthy.store(true, Ordering::Release);
+            let (reply, result) = mpsc::sync_channel(1);
+            assert!(!reply_encode(&healthy, &reply, Err(error)));
+            assert!(result.recv().unwrap().is_err());
+            assert!(healthy.load(Ordering::Acquire));
+        }
+    }
     #[test]
     fn reject_unimplemented_geometry_before_weights() {
         let cfg = MimoConfig {
