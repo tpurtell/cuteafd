@@ -79,8 +79,8 @@
     <div class="panel-head"><h2>Mapped tables</h2>
       <select id="mapped-window" class="btn" aria-label="Mapped table counter interval"><option value="interval">Last 60 seconds</option><option value="cumulative">Since launch</option></select>
     </div>
-    <div class="note">Engram / PLE demand reads. nowait-exact counts full NOWAIT completions. mincore is a pre-read residency snapshot (mmap, or io_uring files without NOWAIT); mixed files use mincore only where needed. io_uring miss time starts at batch submission and includes retries; mmap has no miss timer. Accounting-off diagnostics show all-completion tiers without hit/miss classification. Device estimates count miss-row page spans; host-wide reads include unrelated I/O.</div>
-    <div class="tablewrap"><table><caption>Miss latency tiers (rows)</caption><thead><tr><th>Table</th><th>&lt;5 us</th><th>5-10 us</th><th>10-50 us</th><th>50-200 us</th><th>200 us-1 ms</th><th>1-10 ms</th><th>&gt;=10 ms</th><th>Prefetch hits / misses</th><th>mincore overhead</th></tr></thead><tbody id="mapped-tiers"></tbody></table></div>
+    <div class="note">Engram / PLE demand reads. nowait-exact counts full NOWAIT completions. mincore is a pre-read residency snapshot (mmap, or io_uring files without NOWAIT); mixed files use mincore only where needed. io_uring miss time starts at batch submission and includes retries; mmap has no miss timer. Unclassified reads have one submission-to-final-reap makespan per bounded wave (at most 4K rows), including retries; batch tiers are not individual read-service latency. Demand and prefetch are separate. Device estimates count miss-row page spans; host-wide reads include unrelated I/O.</div>
+    <div class="tablewrap"><table><caption>Classified miss latency (rows) / unclassified makespan (batches)</caption><thead><tr><th>Table</th><th>&lt;5 us</th><th>5-10 us</th><th>10-50 us</th><th>50-200 us</th><th>200 us-1 ms</th><th>1-10 ms</th><th>&gt;=10 ms</th><th>Prefetch hits / misses</th><th>mincore overhead</th></tr></thead><tbody id="mapped-tiers"></tbody></table></div>
     <div class="tablewrap"><table><thead><tr><th>Table / backend</th><th>Hit %</th><th>Hits / misses</th><th>Hit bytes</th><th>Miss-request bytes</th><th>Avg miss</th><th>Max miss (lifetime)</th><th>NOWAIT batch avg</th><th>Stall ms / decode step</th><th>Device bytes (estimate)</th><th>Host-wide device reads (since sample)</th></tr></thead><tbody id="mapped-rows"></tbody></table></div>
   </section>
 
@@ -425,9 +425,18 @@ function renderMappedTables() {
       count('decode_steps') ? (count('decode_stall_ns') / count('decode_steps') / 1e6).toFixed(3) : '-',
       bytes(count('device_bytes_estimate')), host];
     rows.push(`<tr>${cells.map(c => `<td>${c}</td>`).join('')}</tr>`);
-    const histogram = unknown ? 'completion_histogram' : 'miss_histogram';
-    const bins = Array.from({length:7}, (_, i) => latency ? number(Math.max(0, Number(total[histogram]?.[i] || 0) - Number(before[histogram]?.[i] || 0))) : '-');
-    tiers.push(`<tr><td>${escape(table.name)}${unknown ? ' (all completions, unclassified)' : ''}${table.backend === 'mincore-routed' ? `<br>resident memcpy ${number(count('resident_copy_rows'))}; late major faults ${number(count('late_major_faults'))}` : ''}</td>${bins.map(c => `<td>${c}</td>`).join('')}<td>${number(count('prefetch_hits'))} / ${number(count('prefetch_misses'))}</td><td>${(count('residency_ns') / 1e6).toFixed(3)} ms</td></tr>`);
+    const bins = (key, available) => Array.from({length:7}, (_, i) => available ? number(Math.max(0, Number(total[key]?.[i] || 0) - Number(before[key]?.[i] || 0))) : '-').map(c => `<td>${c}</td>`).join('');
+    tiers.push(`<tr><td>${escape(table.name)} demand misses (rows)${table.backend === 'mincore-routed' ? `<br>resident memcpy ${number(count('resident_copy_rows'))}; late major faults ${number(count('late_major_faults'))}` : ''}</td>${bins('miss_histogram', latency)}<td>${number(count('prefetch_hits'))} / ${number(count('prefetch_misses'))}</td><td>${(count('residency_ns') / 1e6).toFixed(3)} ms</td></tr>`);
+    if (count('prefetch_hits') + count('prefetch_misses')) {
+      tiers.push(`<tr><td>${escape(table.name)} prefetch misses (rows)</td>${bins('prefetch_miss_histogram', latency)}<td>-</td><td>${(count('prefetch_residency_ns') / 1e6).toFixed(3)} ms</td></tr>`);
+    }
+    for (const [prefix, label] of [['', 'demand'], ['prefetch_', 'prefetch']]) {
+      if (!count(prefix + 'unclassified_rows') && !count(prefix + 'unclassified_batches')) continue;
+      const batches = count(prefix + 'unclassified_batches'), available = Array.isArray(total[prefix + 'unclassified_batch_histogram']);
+      const average = batches ? `${(count(prefix + 'unclassified_batch_ns') / batches / 1000).toFixed(1)} us avg` : '-';
+      const maximum = available ? `${(Number(total[prefix + 'unclassified_batch_max_ns'] || 0) / 1000).toFixed(1)} us max (lifetime)` : 'telemetry unavailable (legacy)';
+      tiers.push(`<tr><td>${escape(table.name)} ${label} makespan (batches)<br>${number(batches)} waves; ${average}; ${maximum}</td>${bins(prefix + 'unclassified_batch_histogram', available)}<td>-</td><td>-</td></tr>`);
+    }
   }
   $('#mapped-rows').innerHTML = rows.join('');
   $('#mapped-tiers').innerHTML = tiers.join('');

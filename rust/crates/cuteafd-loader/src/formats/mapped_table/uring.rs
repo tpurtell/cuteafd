@@ -6,8 +6,16 @@ use std::os::fd::AsRawFd;
 use std::sync::atomic::Ordering;
 use std::time::Instant;
 
-const MAX_BATCH: usize = 32768;
+pub(super) const MAX_BATCH: usize = 4096;
 thread_local! { static RING: RefCell<Option<IoUring>> = const { RefCell::new(None) }; }
+#[cfg(test)]
+thread_local! { static SETUP_FAILURE: std::cell::Cell<Option<i32>> = const { std::cell::Cell::new(None) }; }
+
+#[cfg(test)]
+pub(super) fn fail_next_setup(errno: i32) {
+    RING.with(|ring| *ring.borrow_mut() = None);
+    SETUP_FAILURE.with(|failure| failure.set(Some(errno)));
+}
 
 #[derive(Default, Debug, Clone, Copy)]
 pub(super) struct ReadStats {
@@ -15,7 +23,10 @@ pub(super) struct ReadStats {
     pub late_major_faults: u64,
     pub unclassified_rows: u64,
     pub unclassified_bytes: u64,
-    pub completion_histogram: [u64; 7],
+    pub unclassified_batches: u64,
+    pub unclassified_batch_ns: u64,
+    pub unclassified_batch_max_ns: u64,
+    pub unclassified_batch_histogram: [u64; 7],
     pub hits: u64,
     pub misses: u64,
     pub hit_bytes: u64,
@@ -130,6 +141,13 @@ fn entry(
 }
 
 fn new_ring(entries: u32) -> Result<IoUring> {
+    #[cfg(test)]
+    if let Some(errno) = SETUP_FAILURE.with(|failure| failure.take()) {
+        return Err(io(
+            "io_uring_setup",
+            std::io::Error::from_raw_os_error(errno),
+        ));
+    }
     let mut ring = IoUring::new(entries).map_err(|error| io("io_uring_setup", error))?;
     // Test enter/seccomp in each worker before exposing borrowed destinations.
     // Closing a failed NOP-only ring cannot leave a buffer write in flight.
@@ -203,7 +221,7 @@ pub(super) fn probe(part: &MappedRows) -> Result<bool> {
 }
 
 /// All NOWAIT rows are submitted together, then all misses together. Large
-/// prefill batches use bounded 32K-row waves (decode fits in a single wave).
+/// prefill batches use bounded 4K-row waves, limiting each worker's ring footprint.
 pub(super) fn gather(
     reads: &[Read<'_>],
     output: &mut [u8],
@@ -247,6 +265,11 @@ pub(super) fn gather(
                 .map(|read| read.part.nowait.load(Ordering::Relaxed))
                 .collect();
             let mut nowait_left = nowait.iter().filter(|&&enabled| enabled).count();
+            let unclassified = nowait
+                .iter()
+                .zip(resident)
+                .filter(|&(nowait, resident)| !nowait && resident.is_none())
+                .count();
             let mut batch = Batch {
                 ring,
                 outstanding: 0,
@@ -311,8 +334,6 @@ pub(super) fn gather(
                 if result == width as i32 {
                     if hit == Some(false) {
                         record_miss(&mut stats, started);
-                    } else if hit.is_none() {
-                        record_unclassified(&mut stats, started, width);
                     }
                 } else if !nowait[index] && result == 0 {
                     error = Some(io(
@@ -377,22 +398,33 @@ pub(super) fn gather(
                     batch.submit()?;
                 } else if missed[index] {
                     record_miss(&mut stats, started);
-                } else if !nowait[index] && resident[index].is_none() {
-                    record_unclassified(&mut stats, started, width);
                 }
             }
             if let Some(error) = error {
                 return Err(error);
+            }
+            if unclassified > 0 {
+                // One completed submission wave, including retries, not a clock
+                // read per row or a claim about individual read-service latency.
+                record_unclassified(
+                    &mut stats,
+                    unclassified,
+                    width,
+                    started.elapsed().as_nanos() as u64,
+                );
             }
         }
         Ok(stats)
     })
 }
 
-fn record_unclassified(stats: &mut ReadStats, started: Instant, width: usize) {
-    stats.unclassified_rows += 1;
-    stats.unclassified_bytes += width as u64;
-    stats.completion_histogram[tier(started.elapsed().as_nanos() as u64)] += 1;
+fn record_unclassified(stats: &mut ReadStats, rows: usize, width: usize, elapsed: u64) {
+    stats.unclassified_rows += rows as u64;
+    stats.unclassified_bytes += (rows * width) as u64;
+    stats.unclassified_batches += 1;
+    stats.unclassified_batch_ns += elapsed;
+    stats.unclassified_batch_max_ns = stats.unclassified_batch_max_ns.max(elapsed);
+    stats.unclassified_batch_histogram[tier(elapsed)] += 1;
 }
 
 fn record_miss(stats: &mut ReadStats, started: Instant) {

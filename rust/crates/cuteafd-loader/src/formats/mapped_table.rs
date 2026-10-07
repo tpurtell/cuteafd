@@ -554,10 +554,7 @@ impl MappedTable {
         if self.backend() != TableBackend::Mmap {
             match self.uring_reads(rows, &reads, output, false) {
                 Ok(stats) => { self.stats.record_reads(stats, false); return Ok(()); }
-                Err(error) => {
-                    tracing::warn!(%error, "io_uring table read unavailable; falling back to mmap");
-                    self.stats.uring.store(false, Ordering::Relaxed);
-                }
+                Err(error) => self.uring_fallback(&error),
             }
         }
         self.record_residency(rows)?;
@@ -660,6 +657,14 @@ impl MappedTable {
         uring::gather(reads, output, self.row_bytes(), &hits)
     }
 
+    fn uring_fallback(&self, error: &MappedTableError) {
+        // A demand/prefetch worker can fail concurrently with another worker.
+        // Only the first transition warns; subsequent batches use mmap.
+        if self.stats.uring.swap(false, Ordering::Relaxed) {
+            tracing::warn!(%error, "mapped table io_uring unavailable; falling back to mmap");
+        }
+    }
+
     pub fn backend(&self) -> TableBackend {
         self.stats.backend()
     }
@@ -681,6 +686,7 @@ impl MappedTable {
         self.stats.uring.store(requested != TableBackend::Mmap && available, Ordering::Relaxed);
         self.stats.nowait.store(self.parts.iter().all(|part| part.nowait.load(Ordering::Relaxed)), Ordering::Relaxed);
         tracing::info!(backend = %self.backend(), requested = %requested,
+            max_ring_entries = uring::MAX_BATCH,
             accounting = self.stats.accounting(),
             reason = if !available { "io_uring unavailable" } else if requested == TableBackend::Mmap { "explicit override or qualification default" }
                 else if requested == TableBackend::MincoreRouted && !self.stats.nowait.load(Ordering::Relaxed) { "explicit override; resident memcpy and concurrent buffered misses where NOWAIT unsupported" }
@@ -751,10 +757,7 @@ impl MappedTable {
             }).collect::<Result<_>>()?;
             match self.uring_reads(rows, &reads, &mut output, true) {
                 Ok(stats) => { self.stats.record_reads(stats, true); return Ok(pages.len()); }
-                Err(error) => {
-                    tracing::warn!(%error, "io_uring prefetch unavailable; using mmap advice");
-                    self.stats.uring.store(false, Ordering::Relaxed);
-                }
+                Err(error) => self.uring_fallback(&error),
             }
         }
         let count = pages.len();
@@ -815,17 +818,23 @@ pub struct TableStats {
     approximate: AtomicBool,
     accounting_off: AtomicBool,
     previous: Mutex<TableStatsSnapshot>,
-    interval_max: [AtomicU64; 4],
+    interval_max: [AtomicU64; 6],
     devices: Mutex<Vec<String>>,
     previous_devices: Mutex<HashMap<String, u64>>,
     miss_histogram: [AtomicU64; 7],
     unclassified_rows: AtomicU64,
     unclassified_bytes: AtomicU64,
-    completion_histogram: [AtomicU64; 7],
+    unclassified_batches: AtomicU64,
+    unclassified_batch_ns: AtomicU64,
+    unclassified_batch_max_ns: AtomicU64,
+    unclassified_batch_histogram: [AtomicU64; 7],
     prefetch_miss_histogram: [AtomicU64; 7],
     prefetch_unclassified_rows: AtomicU64,
     prefetch_unclassified_bytes: AtomicU64,
-    prefetch_completion_histogram: [AtomicU64; 7],
+    prefetch_unclassified_batches: AtomicU64,
+    prefetch_unclassified_batch_ns: AtomicU64,
+    prefetch_unclassified_batch_max_ns: AtomicU64,
+    prefetch_unclassified_batch_histogram: [AtomicU64; 7],
     page_hits: AtomicU64,
     page_misses: AtomicU64,
     page_hit_bytes: AtomicU64,
@@ -877,15 +886,31 @@ pub struct TableStatsSnapshot {
     pub prefetch_dropped: u64,
     pub cache_hits: u64,
     pub cache_misses: u64,
-    /// NOWAIT-complete rows, or mincore-resident rows when NOWAIT is unavailable (a snapshot).
+    /// Classified misses timed from initial batch submission through completion/retry.
     pub miss_histogram: [u64; 7],
     pub unclassified_rows: u64,
     pub unclassified_bytes: u64,
-    pub completion_histogram: [u64; 7],
+    #[serde(default)]
+    pub unclassified_batches: u64,
+    #[serde(default)]
+    pub unclassified_batch_ns: u64,
+    #[serde(default)]
+    pub unclassified_batch_max_ns: u64,
+    /// Submission-to-final-reap makespan tiers, in bounded waves, not rows.
+    #[serde(default)]
+    pub unclassified_batch_histogram: [u64; 7],
     pub prefetch_miss_histogram: [u64; 7],
     pub prefetch_unclassified_rows: u64,
     pub prefetch_unclassified_bytes: u64,
-    pub prefetch_completion_histogram: [u64; 7],
+    #[serde(default)]
+    pub prefetch_unclassified_batches: u64,
+    #[serde(default)]
+    pub prefetch_unclassified_batch_ns: u64,
+    #[serde(default)]
+    pub prefetch_unclassified_batch_max_ns: u64,
+    /// Submission-to-final-reap makespan tiers, in bounded waves, not rows.
+    #[serde(default)]
+    pub prefetch_unclassified_batch_histogram: [u64; 7],
     pub page_hits: u64,
     pub page_misses: u64,
     pub page_hit_bytes: u64,
@@ -936,7 +961,7 @@ impl TableStats {
         else if self.backend() == TableBackend::MincoreRouted {
             if self.approximate.load(Ordering::Relaxed) { "fuse: mincore-routed (approx)" } else { "mincore-routed" }
         }
-        else if self.uring.load(Ordering::Relaxed) && self.accounting_off.load(Ordering::Relaxed) { "unclassified completion latency (mincore off)" }
+        else if self.uring.load(Ordering::Relaxed) && self.accounting_off.load(Ordering::Relaxed) { "unclassified batch makespan (mincore off)" }
         else if self.approximate.load(Ordering::Relaxed) { "fuse: mincore (approx)" }
         else { "mincore" }
     }
@@ -982,11 +1007,18 @@ impl TableStats {
         copied.fetch_add(reads.resident_copy_rows, Ordering::Relaxed);
         late.fetch_add(reads.late_major_faults, Ordering::Relaxed);
         let (rows, bytes, completions) = if prefetch {
-            (&self.prefetch_unclassified_rows, &self.prefetch_unclassified_bytes, &self.prefetch_completion_histogram)
-        } else { (&self.unclassified_rows, &self.unclassified_bytes, &self.completion_histogram) };
+            (&self.prefetch_unclassified_rows, &self.prefetch_unclassified_bytes, &self.prefetch_unclassified_batch_histogram)
+        } else { (&self.unclassified_rows, &self.unclassified_bytes, &self.unclassified_batch_histogram) };
         rows.fetch_add(reads.unclassified_rows, Ordering::Relaxed);
         bytes.fetch_add(reads.unclassified_bytes, Ordering::Relaxed);
-        for (counter, value) in completions.iter().zip(reads.completion_histogram) { counter.fetch_add(value, Ordering::Relaxed); }
+        let (batches, ns, max) = if prefetch {
+            (&self.prefetch_unclassified_batches, &self.prefetch_unclassified_batch_ns, &self.prefetch_unclassified_batch_max_ns)
+        } else { (&self.unclassified_batches, &self.unclassified_batch_ns, &self.unclassified_batch_max_ns) };
+        batches.fetch_add(reads.unclassified_batches, Ordering::Relaxed);
+        ns.fetch_add(reads.unclassified_batch_ns, Ordering::Relaxed);
+        max.fetch_max(reads.unclassified_batch_max_ns, Ordering::Relaxed);
+        self.interval_max[if prefetch { 5 } else { 4 }].fetch_max(reads.unclassified_batch_max_ns, Ordering::Relaxed);
+        for (counter, value) in completions.iter().zip(reads.unclassified_batch_histogram) { counter.fetch_add(value, Ordering::Relaxed); }
         let counters = if prefetch {
             [&self.prefetch_hits, &self.prefetch_misses, &self.prefetch_hit_bytes, &self.prefetch_miss_request_bytes,
              &self.prefetch_miss_ns, &self.prefetch_nowait_ns, &self.prefetch_nowait_batches]
@@ -1018,6 +1050,8 @@ impl TableStats {
         delta.nowait_max_ns = self.interval_max[1].swap(0, Ordering::Relaxed);
         delta.prefetch_miss_max_ns = self.interval_max[2].swap(0, Ordering::Relaxed);
         delta.prefetch_nowait_max_ns = self.interval_max[3].swap(0, Ordering::Relaxed);
+        delta.unclassified_batch_max_ns = self.interval_max[4].swap(0, Ordering::Relaxed);
+        delta.prefetch_unclassified_batch_max_ns = self.interval_max[5].swap(0, Ordering::Relaxed);
         *before = now;
         delta
     }
@@ -1040,11 +1074,17 @@ impl TableStats {
             miss_histogram: std::array::from_fn(|i| get(&self.miss_histogram[i])),
             unclassified_rows: get(&self.unclassified_rows),
             unclassified_bytes: get(&self.unclassified_bytes),
-            completion_histogram: std::array::from_fn(|i| get(&self.completion_histogram[i])),
+            unclassified_batches: get(&self.unclassified_batches),
+            unclassified_batch_ns: get(&self.unclassified_batch_ns),
+            unclassified_batch_max_ns: get(&self.unclassified_batch_max_ns),
+            unclassified_batch_histogram: std::array::from_fn(|i| get(&self.unclassified_batch_histogram[i])),
             prefetch_miss_histogram: std::array::from_fn(|i| get(&self.prefetch_miss_histogram[i])),
             prefetch_unclassified_rows: get(&self.prefetch_unclassified_rows),
             prefetch_unclassified_bytes: get(&self.prefetch_unclassified_bytes),
-            prefetch_completion_histogram: std::array::from_fn(|i| get(&self.prefetch_completion_histogram[i])),
+            prefetch_unclassified_batches: get(&self.prefetch_unclassified_batches),
+            prefetch_unclassified_batch_ns: get(&self.prefetch_unclassified_batch_ns),
+            prefetch_unclassified_batch_max_ns: get(&self.prefetch_unclassified_batch_max_ns),
+            prefetch_unclassified_batch_histogram: std::array::from_fn(|i| get(&self.prefetch_unclassified_batch_histogram[i])),
             page_hits: get(&self.page_hits),
             page_misses: get(&self.page_misses),
             page_hit_bytes: get(&self.page_hit_bytes),
@@ -1099,11 +1139,17 @@ impl TableStatsSnapshot {
             miss_histogram: std::array::from_fn(|i| d(self.miss_histogram[i], earlier.miss_histogram[i])),
             unclassified_rows: d(self.unclassified_rows, earlier.unclassified_rows),
             unclassified_bytes: d(self.unclassified_bytes, earlier.unclassified_bytes),
-            completion_histogram: std::array::from_fn(|i| d(self.completion_histogram[i], earlier.completion_histogram[i])),
+            unclassified_batches: d(self.unclassified_batches, earlier.unclassified_batches),
+            unclassified_batch_ns: d(self.unclassified_batch_ns, earlier.unclassified_batch_ns),
+            unclassified_batch_max_ns: self.unclassified_batch_max_ns, // cumulative maximum, not an interval maximum
+            unclassified_batch_histogram: std::array::from_fn(|i| d(self.unclassified_batch_histogram[i], earlier.unclassified_batch_histogram[i])),
             prefetch_miss_histogram: std::array::from_fn(|i| d(self.prefetch_miss_histogram[i], earlier.prefetch_miss_histogram[i])),
             prefetch_unclassified_rows: d(self.prefetch_unclassified_rows, earlier.prefetch_unclassified_rows),
             prefetch_unclassified_bytes: d(self.prefetch_unclassified_bytes, earlier.prefetch_unclassified_bytes),
-            prefetch_completion_histogram: std::array::from_fn(|i| d(self.prefetch_completion_histogram[i], earlier.prefetch_completion_histogram[i])),
+            prefetch_unclassified_batches: d(self.prefetch_unclassified_batches, earlier.prefetch_unclassified_batches),
+            prefetch_unclassified_batch_ns: d(self.prefetch_unclassified_batch_ns, earlier.prefetch_unclassified_batch_ns),
+            prefetch_unclassified_batch_max_ns: self.prefetch_unclassified_batch_max_ns, // cumulative maximum, not an interval maximum
+            prefetch_unclassified_batch_histogram: std::array::from_fn(|i| d(self.prefetch_unclassified_batch_histogram[i], earlier.prefetch_unclassified_batch_histogram[i])),
             page_hits: d(self.page_hits, earlier.page_hits),
             page_misses: d(self.page_misses, earlier.page_misses),
             page_hit_bytes: d(self.page_hit_bytes, earlier.page_hit_bytes),

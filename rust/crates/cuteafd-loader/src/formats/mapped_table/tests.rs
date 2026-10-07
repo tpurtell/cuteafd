@@ -21,6 +21,32 @@ fn uring_setup_failure_falls_back_without_changing_bytes() -> TestResult {
 }
 
 #[test]
+fn runtime_ring_setup_failure_falls_back_for_demand_and_prefetch() -> TestResult {
+    for errno in [libc::ENOMEM, libc::EPERM] {
+        for backend in [TableBackend::Uring, TableBackend::MincoreRouted] {
+            for prefetch in [false, true] {
+                let (_dir, parts) = parted([3, 3, 2])?;
+                // SAFETY: this test owns immutable shards through all gathers.
+                let table = unsafe { MappedTable::open(&parts, u8_rows(4))? };
+                for part in &table.parts { part.nowait.store(true, Ordering::Relaxed); }
+                // Startup probe succeeded; the worker's first setup then fails.
+                table.select_with_probe(backend, || Ok(()));
+                uring::fail_next_setup(errno);
+                let mut output = [0; 12];
+                if prefetch { assert_eq!(table.prefetch(&[7, 2, 7], 8)?, 2); }
+                else { table.gather_slots(&[7, 2, 7], &[2, 0, 1], &mut output)?; }
+                assert_eq!(table.backend(), TableBackend::Mmap);
+                table.gather_slots(&[7, 2, 7], &[2, 0, 1], &mut output)?;
+                assert_eq!(output, [2, 2, 2, 2, 7, 7, 7, 7, 7, 7, 7, 7]);
+                assert_eq!(table.stats().snapshot().unclassified_batches, 0);
+                assert_eq!(table.stats().snapshot().prefetch_unclassified_batches, 0);
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
 fn miss_histogram_tiers_and_interval_counts_are_exact() {
     for (ns, tier) in [(0, 0), (4999, 0), (5000, 1), (9999, 1), (10000, 2),
         (50000, 3), (200000, 4), (1000000, 5), (10000000, 6)] {
@@ -44,6 +70,69 @@ fn miss_histogram_tiers_and_interval_counts_are_exact() {
     assert_eq!((delta.miss_ns, delta.miss_max_ns, delta.nowait_ns), (35000, 15000, 7000));
     stats.record_reads(uring::ReadStats { hits: 4, misses: 5, ..Default::default() }, true);
     assert_eq!((stats.snapshot().page_hits, stats.snapshot().prefetch_hits), (2, 4));
+}
+
+#[test]
+fn unclassified_batch_intervals_keep_units_and_lifetime_maxima() {
+    let stats = TableStats::default();
+    let reads = uring::ReadStats {
+        unclassified_rows: 320, unclassified_bytes: 1280, unclassified_batches: 2,
+        unclassified_batch_ns: 12000, unclassified_batch_max_ns: 7000,
+        unclassified_batch_histogram: [0, 2, 0, 0, 0, 0, 0], ..Default::default()
+    };
+    stats.record_reads(reads, false);
+    stats.record_reads(reads, true);
+    let first = stats.interval();
+    assert_eq!((first.unclassified_rows, first.prefetch_unclassified_rows), (320, 320));
+    assert_eq!(first.unclassified_batch_histogram.iter().sum::<u64>(), first.unclassified_batches);
+    assert_eq!(first.prefetch_unclassified_batch_histogram.iter().sum::<u64>(), first.prefetch_unclassified_batches);
+    assert_eq!((first.unclassified_batch_ns, first.prefetch_unclassified_batch_ns), (12000, 12000));
+    assert_eq!((first.unclassified_batch_max_ns, first.prefetch_unclassified_batch_max_ns), (7000, 7000));
+    assert_eq!(stats.interval(), TableStatsSnapshot::default());
+    stats.record_reads(uring::ReadStats { unclassified_batches: 1, unclassified_batch_max_ns: 3000, ..Default::default() }, true);
+    assert_eq!(stats.interval().prefetch_unclassified_batch_max_ns, 3000);
+    assert_eq!(stats.snapshot().since(&first).prefetch_unclassified_batch_max_ns, 7000);
+    let mut historical = serde_json::to_value(first).unwrap();
+    let fields = historical.as_object_mut().unwrap();
+    fields.retain(|key, _| !key.contains("unclassified_batch"));
+    fields.insert("completion_histogram".into(), serde_json::json!([0, 320, 0, 0, 0, 0, 0]));
+    fields.insert("prefetch_completion_histogram".into(), serde_json::json!([0, 320, 0, 0, 0, 0, 0]));
+    let old: TableStatsSnapshot = serde_json::from_value(historical).unwrap();
+    assert_eq!((old.unclassified_rows, old.prefetch_unclassified_rows), (320, 320));
+    assert_eq!((old.unclassified_batches, old.prefetch_unclassified_batches), (0, 0));
+    assert_eq!(old.unclassified_batch_histogram, [0; 7], "legacy row tiers must not become batch tiers");
+}
+
+#[test]
+fn unclassified_waves_count_batches_not_rows() -> TestResult {
+    let (_dir, parts) = parted([3, 3, 2])?;
+    // SAFETY: this test owns the immutable shards until all reads are drained.
+    let table = unsafe { MappedTable::open(&parts, u8_rows(4))? };
+    table.select_backend(TableBackend::Uring);
+    if table.backend() != TableBackend::Uring {
+        eprintln!("SKIP unclassified wave execution: kernel/seccomp disallows io_uring");
+        return Ok(());
+    }
+    table.parts[0].nowait.store(false, Ordering::Relaxed);
+    assert_eq!(uring::MAX_BATCH, 4096);
+    let n = uring::MAX_BATCH + 1;
+    let reads: Vec<_> = (0..n).map(|i| uring::Read { part: &table.parts[0], row: (i % 3) as u64, slot: n - i - 1 }).collect();
+    // Exercise mixed classified hits and unclassified reads in two waves.
+    let resident: Vec<_> = (0..n).map(|i| if i % 2 == 0 { None } else { Some(true) }).collect();
+    let mut output = vec![0; n * 4];
+    let stats = uring::gather(&reads, &mut output, 4, &resident)?;
+    assert_eq!((stats.unclassified_rows, stats.hits, stats.misses), (2049, 2048, 0));
+    assert_eq!(stats.unclassified_bytes, 2049 * 4);
+    assert_eq!(stats.unclassified_batches, 2);
+    assert_eq!(stats.unclassified_batch_histogram.iter().sum::<u64>(), 2);
+    assert!(stats.unclassified_batch_ns >= stats.unclassified_batch_max_ns && stats.unclassified_batch_max_ns > 0);
+    assert_eq!(stats.miss_histogram, [0; 7]);
+    for i in 0..n {
+        assert_eq!(&output[(n-i-1)*4..(n-i)*4], &[(i % 3) as u8; 4]);
+    }
+    let empty = uring::gather(&[], &mut [], 4, &[])?;
+    assert_eq!((empty.unclassified_rows, empty.unclassified_batches, empty.unclassified_batch_ns), (0, 0, 0));
+    Ok(())
 }
 
 #[test]
@@ -176,12 +265,17 @@ fn unsupported_nowait_keeps_buffered_uring_and_mincore_accounting() -> TestResul
     let off = table.stats().snapshot().since(&before);
     assert_eq!((off.page_hits, off.page_misses, off.residency_ns), (0, 0, 0));
     assert_eq!((off.unclassified_rows, off.unclassified_bytes), (4, (4 * page) as u64));
-    assert_eq!(off.completion_histogram.iter().sum::<u64>(), 4);
+    assert_eq!(off.unclassified_batch_histogram.iter().sum::<u64>(), 1);
+    assert_eq!(off.unclassified_batches, 1);
+    assert!(off.unclassified_batch_ns > 0);
+    assert_eq!(off.unclassified_batch_ns, off.unclassified_batch_max_ns);
     assert_eq!(off.miss_histogram, [0; 7]);
     assert_eq!(table.prefetch(&rows, 8)?, 3);
     let off = table.stats().snapshot().since(&before);
     assert_eq!((off.unclassified_rows, off.prefetch_unclassified_rows), (4, 4));
-    assert_eq!(off.prefetch_completion_histogram.iter().sum::<u64>(), 4);
+    assert_eq!(off.prefetch_unclassified_batch_histogram.iter().sum::<u64>(), 1);
+    assert_eq!((off.unclassified_batches, off.prefetch_unclassified_batches), (1, 1));
+    assert!(off.prefetch_unclassified_batch_ns > 0);
     Ok(())
 }
 

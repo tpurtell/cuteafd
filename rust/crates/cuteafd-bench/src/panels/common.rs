@@ -190,6 +190,28 @@ mod tests {
     }
 
     #[test]
+    fn mapped_intervals_keep_unclassified_wave_units_separate() {
+        use serde_json::json;
+        let before = json!({"name":"ple", "cumulative":{"unclassified_rows":320,
+            "unclassified_batches":2,"unclassified_batch_ns":12000,
+            "unclassified_batch_histogram":[0,2],"unclassified_batch_max_ns":7000,
+            "prefetch_unclassified_batches":1,"prefetch_unclassified_batch_histogram":[0,1]}});
+        let after = json!({"name":"ple", "cumulative":{"unclassified_rows":640,
+            "unclassified_batches":4,"unclassified_batch_ns":24000,
+            "unclassified_batch_histogram":[0,4],"unclassified_batch_max_ns":7000,
+            "prefetch_unclassified_batches":2,"prefetch_unclassified_batch_histogram":[0,2]}});
+        let delta = super::mapped_interval(&[before], &[after]);
+        assert_eq!(delta[0]["interval"]["unclassified_rows"], 320);
+        assert_eq!(delta[0]["interval"]["unclassified_batches"], 2);
+        assert_eq!(delta[0]["interval"]["unclassified_batch_ns"], 12000);
+        assert_eq!(delta[0]["interval"]["unclassified_batch_histogram"], json!([0,2]));
+        assert_eq!(delta[0]["interval"]["prefetch_unclassified_batches"], 1);
+        assert_eq!(delta[0]["interval"]["prefetch_unclassified_batch_histogram"], json!([0,1]));
+        assert!(delta[0]["interval"].get("unclassified_batch_max_ns").is_none());
+        assert_eq!(delta[0]["lifetime_maxima"]["unclassified_batch_max_ns"], 7000);
+    }
+
+    #[test]
     fn doublings_stop_at_the_limit() {
         assert_eq!(super::doublings(1024, 8192), vec![1024, 2048, 4096, 8192]);
         assert!(super::doublings(4096, 1000).is_empty());
