@@ -31,6 +31,23 @@ class NativeReleaseLauncherTest(unittest.TestCase):
             self.assertLess(source.index('release_validate_table_backend'), source.index('docker run'))
             self.assertIn('seccomp=$repo_root/docker/seccomp-code-bench.json', source)
 
+    def test_table_accounting_reaches_coordinator_without_changing_default(self) -> None:
+        for launcher in ['run.sh', 'scripts/launch/run-family.sh']:
+            source = (ROOT / launcher).read_text()
+            block = 'table_env_args=()\n' + source.split('table_env_args=()\n', 1)[1].split('\n', 1)[0]
+            self.assertIn('"${table_env_args[@]}"', source)
+            for value in [None, '', 'full', 'off']:
+                with self.subTest(launcher=launcher, value=value):
+                    environment = dict(os.environ)
+                    environment.pop('CUTEAFD_TABLE_ACCOUNTING', None)
+                    if value is not None:
+                        environment['CUTEAFD_TABLE_ACCOUNTING'] = value
+                    result = subprocess.run(['bash', '-c', block + '\nprintf "%s\\n" "${table_env_args[@]}"'],
+                                            cwd=ROOT, env=environment, capture_output=True, text=True)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    expected = ['-e', f'CUTEAFD_TABLE_ACCOUNTING={value}'] if value else ['']
+                    self.assertEqual(result.stdout.splitlines(), expected)
+
     def test_embedding_placement_registered_and_gpu_default(self) -> None:
         result = subprocess.run(['bash', '-c',
             'source scripts/lib/release-common.sh; release_known_key EMBEDDING; '
