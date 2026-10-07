@@ -12,12 +12,12 @@ reference module's:
 * ``qkv_proj`` (FP8 E4M3, FP32 ``weight_scale_inv``) is stored TP-interleaved
   for the checkpoint's ``tp_size`` (8, index metadata): each of the 8 row
   shards is ``[q (16 heads x 192) | k (1 x 192) | v (1 x 128)]`` with its own
-  128x128 block grid (24 + 2 + 1 row blocks; the 192-row key is a 128-row
-  block then a 64-row block). The shards are dequantized one by one and
-  de-interleaved into the ``[q; k; v]`` the modeling code splits, as SGLang's
-  ``load_mimo_v2_qkv_proj_weight`` / ``_deinterleave_qkv_shards`` do. (Every
-  128x128 block of layers 0 and 7 then has max |e4m3| = 448; a global
-  ``[q; k; v]`` reading fails 7% of the blocks.)
+  128x128 block grid over the whole shard (27 row blocks). Grid row 25
+  spans k rows 128-191 and v rows 0-63: scales do not restart at v.
+  The shards are dequantized before splitting, then de-interleaved into
+  the ``[q; k; v]`` the modeling code splits. Hugh Madden identified the
+  former per-segment scale bug in issue #3. Flash TP4 full layers have the
+  same shard geometry; their SWA shards (3072/384/256) are aligned.
 * Other FP8 tensors: 128x128 blocks. ``o_proj`` is BF16.
 * Routed experts are MXFP4: ``weight`` U8 ``[N, K/2]`` (two E2M1 codes per
   byte, the even element in the low nibble) and ``weight_scale`` U8 ``[N,
@@ -192,18 +192,19 @@ class Weights:
             return fp8_blocks_to_bf16(value, scale)
         q, k, v = self.qkv_shards(layer)
         rows = q + k + v
-        blocks = [-(-q // 128), -(-k // 128), -(-v // 128)]
-        assert value.shape[0] == rows * self.ckpt_tp and scale.shape[0] == sum(blocks) * self.ckpt_tp, \
+        blocks = -(-rows // 128)
+        assert value.shape[0] == rows * self.ckpt_tp and scale.shape[0] == blocks * self.ckpt_tp, \
             (name, value.shape, scale.shape)
         parts: list[list[torch.Tensor]] = [[], [], []]
         for s in range(self.ckpt_tp):
             w = value[s * rows:(s + 1) * rows]
-            g = scale[s * sum(blocks):(s + 1) * sum(blocks)]
-            first, block = 0, 0
+            g = scale[s * blocks:(s + 1) * blocks]
+            # Hugh Madden, issue #3: dequantize across the k/v boundary first.
+            shard = fp8_blocks_to_bf16(w, g)
+            first = 0
             for i, size in enumerate((q, k, v)):
-                parts[i].append(fp8_blocks_to_bf16(w[first:first + size], g[block:block + blocks[i]]))
+                parts[i].append(shard[first:first + size])
                 first += size
-                block += blocks[i]
         return torch.cat([torch.cat(p, 0) for p in parts], 0)
 
 
