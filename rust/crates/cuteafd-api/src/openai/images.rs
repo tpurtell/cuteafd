@@ -272,6 +272,7 @@ mod tests {
             queue,
             limits: NativeLimits::default(),
             images: ImageDecoder::new(1),
+            tables: cuteafd_loader::MappedTableStatsReader::default(),
             admission: crate::openai::admission::Admission::new(1, Duration::from_millis(1)),
             stats: std::sync::Arc::new(std::sync::Mutex::new(serde_json::Value::Null)),
             profile: std::sync::Arc::new(crate::openai::ModelProfile::default()),

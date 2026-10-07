@@ -4,6 +4,31 @@ use std::io::{Seek, SeekFrom, Write};
 type TestResult = std::result::Result<(), Box<dyn std::error::Error>>;
 
 #[test]
+fn live_reader_loads_only_atomics_without_interval_or_device_locks() {
+    let stats = Arc::new(TableStats::default());
+    let reader = MappedTableStatsReader { tables: vec![("lock-free".into(), Arc::downgrade(&stats))] };
+    let _previous = stats.previous.lock().unwrap();
+    let _devices = stats.devices.lock().unwrap();
+    let _previous_devices = stats.previous_devices.lock().unwrap();
+    let _registry = TABLES.lock().unwrap();
+    let initial = reader.snapshot();
+    assert_eq!(initial[0].cumulative, TableStatsSnapshot::default());
+    stats.record_gather(2, 8, Duration::from_micros(4), [0; 3]);
+    stats.uring.store(true, Ordering::Relaxed);
+    let fresh = reader.snapshot();
+    assert_eq!(fresh[0].backend, "uring");
+    assert_eq!(fresh[0].cumulative.gathers, 1);
+    assert_eq!(fresh[0].cumulative.rows, 2);
+    assert!(fresh[0].interval.is_none());
+    assert!(fresh[0].host_wide_device_reads.is_empty());
+    drop(_previous);
+    drop(_devices);
+    drop(_previous_devices);
+    drop(stats);
+    assert!(reader.snapshot().is_empty());
+}
+
+#[test]
 fn uring_setup_failure_falls_back_without_changing_bytes() -> TestResult {
     let (_dir, parts) = parted([3, 3, 2])?;
     // SAFETY: the test owns immutable shard files through the table's lifetime.

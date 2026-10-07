@@ -193,6 +193,7 @@ struct NativeState {
     limits: NativeLimits,
     images: images::ImageDecoder,
     stats: SharedStats,
+    tables: cuteafd_loader::MappedTableStatsReader,
     admission: admission::Admission,
     profile: Arc<ModelProfile>,
 }
@@ -222,6 +223,7 @@ pub fn router_for_model(queue: mpsc::Sender<NativeRequest>, limits: NativeLimits
         profile.capabilities.vision &= vision;
         profile.capabilities.audio &= audio;
     }
+    let tables = cuteafd_loader::MappedTableStatsReader::registered();
     let admission = admission::Admission::new(queue.max_capacity(), wait);
     let images = images::ImageDecoder::new(queue.max_capacity());
     let console_routes = Router::new()
@@ -239,17 +241,36 @@ pub fn router_for_model(queue: mpsc::Sender<NativeRequest>, limits: NativeLimits
         .route("/v1/stats", get(stats_route))
         .route("/v1/chat/completions", post(chat))
         .layer(axum::extract::DefaultBodyLimit::max(if profile.media_preparer.is_some() { 256 << 20 } else { images::BODY_BYTES }))
-        .with_state(NativeState { queue, limits, images, stats, admission, profile: Arc::new(profile) })
+        .with_state(NativeState { queue, limits, images, stats, tables, admission, profile: Arc::new(profile) })
         .merge(console_routes)
 }
 async fn stats_route(State(state): State<NativeState>) -> Json<Value> {
     let mut value = state.stats.lock().map(|stats| stats.clone()).unwrap_or(Value::Null);
     if !value.is_object() { value = json!({}); }
+    refresh_mapped_tables(&mut value, &state.tables);
     let object = value.as_object_mut().unwrap();
     object.extend(state.admission.metrics().as_object().unwrap().clone());
     object.insert("http_queue_len".into(), json!(state.queue.max_capacity() - state.queue.capacity()));
     Json(value)
 }
+// Preserve scheduler-published interval/device diagnostics; refresh only the
+// cumulative counters and backend metadata, including before the first publish.
+fn refresh_mapped_tables(value: &mut Value, reader: &cuteafd_loader::MappedTableStatsReader) {
+    let tables = reader.snapshot();
+    if tables.is_empty() { return; }
+    let fresh = tables.into_iter().map(|table| {
+        let mut entry = value["mapped_tables"].as_array().and_then(|cached| cached.iter()
+            .find(|entry| entry["name"].as_str() == Some(&table.name)))
+            .cloned().filter(Value::is_object).unwrap_or_else(|| json!({}));
+        entry["name"] = json!(table.name);
+        entry["backend"] = json!(table.backend);
+        entry["accounting"] = json!(table.accounting);
+        entry["cumulative"] = json!(table.cumulative);
+        entry
+    }).collect::<Vec<_>>();
+    value["mapped_tables"] = json!(fresh);
+}
+
 async fn models(State(state): State<NativeState>) -> Json<Value> {
     let owner = state.profile.id.split_once('/').map_or("cuteafd", |(owner, _)| owner);
     let mut model = json!({"id":state.profile.id,"object":"model","owned_by":owner,
@@ -901,6 +922,64 @@ mod tests {
     fn request(stream: bool) -> axum::http::Request<Body> {
         axum::http::Request::post("/v1/chat/completions").header("content-type","application/json").body(Body::from(json!({"model":MODEL,"messages":[{"role":"user","content":"What is 2 + 2? Answer with just the number."}],"thinking":{"type":"disabled"},"temperature":0,"max_tokens":16,"stream":stream}).to_string())).unwrap()
     }
+    #[tokio::test]
+    async fn stats_read_live_tables_before_first_publish_and_after_idle_batch() {
+        use cuteafd_loader::{MappedTable, RowFormat, TableBackend, TablePart};
+        let file = tempfile::NamedTempFile::new().unwrap();
+        file.as_file().set_len(4096).unwrap();
+        // SAFETY: the test owns the file and keeps its length fixed while mapped.
+        let table = unsafe { MappedTable::open(&[TablePart { path: file.path().into(),
+            offset: 0, rows: 4 }], RowFormat::of(cuteafd_core::DType::U8, 16).unwrap()).unwrap() };
+        table.select_backend(TableBackend::Mmap);
+        let name = format!("stats-live-{}", file.path().display());
+        table.name_stats(name.clone());
+        for profile in [ModelProfile::default(),
+            ModelProfile::new("test-qwen", ModelEncoding::Qwen(Arc::new(qwen4::fixtures::encoding())))] {
+            let (tx, _rx) = mpsc::channel(4);
+            let cached = Arc::new(Mutex::new(Value::Null));
+            let app = router_for_model(tx, NativeLimits::default(), cached.clone(),
+                std::time::Duration::from_secs(25), ConsoleHub::disabled(), profile);
+            for expected in [table.stats().snapshot().gathers, table.stats().snapshot().gathers + 1] {
+                let response = app.clone().oneshot(axum::http::Request::get("/v1/stats")
+                    .body(Body::empty()).unwrap()).await.unwrap();
+                let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+                let value: Value = serde_json::from_slice(&body).unwrap();
+                let entry = value["mapped_tables"].as_array().unwrap().iter()
+                    .find(|entry| entry["name"] == name).unwrap();
+                assert_eq!(entry["backend"], "mmap");
+                assert_eq!(entry["cumulative"]["gathers"], expected);
+                assert_eq!(value["http_queue_len"], 0);
+                if cached.lock().unwrap().is_null() {
+                    assert_eq!(entry["cumulative"]["rows"], expected * 2);
+                } else {
+                    assert_eq!(value["family_marker"], "unchanged");
+                    assert_eq!(entry["interval"]["gathers"], 77);
+                    assert_eq!(entry["host_wide_device_reads"][0]["bytes"], 123);
+                }
+                // No scheduler publication is necessary after recording a batch.
+                table.stats().record_gather(2, 32, std::time::Duration::from_micros(3), [0; 3]);
+                *cached.lock().unwrap() = json!({"family_marker":"unchanged",
+                    "mapped_tables":[{"name":name,"backend":"stale","cumulative":{"gathers":0},
+                        "interval":{"gathers":77},"host_wide_device_reads":[{"device":"test","bytes":123}]}]});
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn stats_without_tables_preserve_published_family_fields() {
+        let published = json!({"family":"qwen4", "active":0, "nested":{"tokens":12}});
+        let (queue, _receive) = mpsc::channel(4);
+        let state = NativeState { queue, limits: NativeLimits::default(),
+            images: images::ImageDecoder::new(4), stats: Arc::new(Mutex::new(published.clone())),
+            tables: cuteafd_loader::MappedTableStatsReader::default(),
+            admission: admission::Admission::new(4, std::time::Duration::from_secs(25)),
+            profile: Arc::new(ModelProfile::default()) };
+        let Json(value) = stats_route(State(state)).await;
+        for (key, expected) in published.as_object().unwrap() { assert_eq!(&value[key], expected); }
+        assert_eq!(value["http_queue_len"], 0);
+        assert!(value.get("mapped_tables").is_none());
+    }
+
     #[tokio::test]
     async fn streaming_include_usage_emits_spec_shaped_usage_chunk() {
         let profiles = [ModelProfile::default(),

@@ -330,6 +330,27 @@ impl TableBackend {
 }
 static TABLES: Mutex<Vec<(String, Weak<TableStats>)>> = Mutex::new(Vec::new());
 
+/// Captured after model readiness, before the HTTP router starts. Request-time
+/// reads upgrade weak counter references and load atomics only: no table,
+/// gather, interval, or device-counter mutexes and no filesystem I/O.
+#[derive(Clone, Default)]
+pub struct MappedTableStatsReader {
+    tables: Vec<(String, Weak<TableStats>)>,
+}
+impl MappedTableStatsReader {
+    pub fn registered() -> Self {
+        Self { tables: TABLES.lock().unwrap_or_else(|p| p.into_inner()).clone() }
+    }
+    pub fn snapshot(&self) -> Vec<NamedTableStats> {
+        self.tables.iter().filter_map(|(name, stats)| {
+            let stats = stats.upgrade()?;
+            Some(NamedTableStats { name: name.clone(), backend: stats.backend().to_string(),
+                accounting: stats.accounting(), cumulative: stats.snapshot(), interval: None,
+                host_wide_device_reads: Vec::new(), host_wide_device_read_interval: None })
+        }).collect()
+    }
+}
+
 #[derive(Debug, serde::Serialize)]
 pub struct NamedTableStats {
     pub name: String,
