@@ -73,6 +73,12 @@ pub(crate) struct LocalPlan {
     pub peak_bytes: usize,
 }
 
+fn require_exl3_manifest(directory: &Path) -> Result<()> {
+    let manifest = directory.join("v41_exl3.json");
+    ensure!(manifest.is_file(), "EXL3 package manifest not found: {}", manifest.display());
+    Ok(())
+}
+
 pub(crate) fn plan(library: &NativeLibrary, native_lib: &Path, catalog: &OfficialV41Catalog,
     draft_stages: usize, max_layers: usize, max_rows: usize, budget: usize) -> Result<LocalPlan> {
     let shape = *catalog.routed_experts();
@@ -83,7 +89,7 @@ pub(crate) fn plan(library: &NativeLibrary, native_lib: &Path, catalog: &Officia
     let workspace = if let Some(manifest) = catalog.exl3() {
         let directory = aot_layout_directory(native_lib, manifest.decoder_tiers(), "rtx-tp1");
         let directories: Vec<_> = capacities.iter().map(|c| directory.join(format!("m{c}"))).collect();
-        if directories.iter().any(|d| !d.join("v41_exl3.json").is_file()) { return Ok(empty()); }
+        for directory in &directories { require_exl3_manifest(directory)?; }
         Exl3Workspace::plan(&directories, Exl3InputFormat::Fp8K32)? + max_rows * shape.hidden * 2
     } else {
         let mut scratch = 0;
@@ -391,5 +397,22 @@ impl<'a> LocalExperts<'a> {
             self.reducer.finish(state.slots[41].cast(), shared.cast(), self.output.buffer.ptr.cast(),
                 rows as u32, state.kernel.accumulates_tokens(), stream)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn missing_exl3_manifest_names_the_resolved_path() -> Result<()> {
+        let root = tempfile::tempdir_in(std::env::current_dir()?)?;
+        let directory = root.path().join("exl3/exl3-qwen4-k45/rtx-tp1/m256");
+        let manifest = directory.join("v41_exl3.json");
+        let error = require_exl3_manifest(&directory).unwrap_err();
+        assert_eq!(error.to_string(), format!("EXL3 package manifest not found: {}", manifest.display()));
+        std::fs::create_dir_all(&directory)?;
+        std::fs::write(manifest, b"{}")?;
+        require_exl3_manifest(&directory)
     }
 }
