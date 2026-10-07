@@ -734,6 +734,7 @@ dependencies = [
  "cuteafd-core",
  "daachorse",
  "image",
+ "io-uring",
  "libc",
  "rayon",
  "serde",

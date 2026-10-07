@@ -154,6 +154,7 @@ pub(crate) struct PendingRows {
     gather: Option<PendingGather>,
     slot: usize,
     bytes: usize,
+    decode: bool,
 }
 
 /// One mapped table with its gather pool, optional hot-row cache and
@@ -183,6 +184,7 @@ impl<'a> MappedTableDevice<'a> {
     pub fn new(library: &'a NativeLibrary, name: &'static str, table: MappedTable, args: &MappedTableArgs,
         max_rows: usize) -> Result<Self> {
         let _memory_scope = cuteafd_ffi::memory_ledger::scope("mapped-table");
+        table.name_stats(name);
         let row_bytes = table.row_bytes();
         let prefetcher = if args.prefetch {
             // Prefill chunks and every decode row's next token; a row spans at most two pages.
@@ -231,7 +233,7 @@ impl<'a> MappedTableDevice<'a> {
     /// Starts gathering `ids` (in order, duplicates kept) into the next ring
     /// slot on the gather pool; the caller enqueues GPU work that precedes
     /// the rows' use, then [`Self::finish`]es.
-    pub fn begin(&self, ids: &[i64]) -> Result<PendingRows> {
+    pub fn begin(&self, ids: &[i64], decode: bool) -> Result<PendingRows> {
         ensure!(ids.len() <= self.max_rows(), "{} {} rows exceed the step's {}", ids.len(), self.name, self.max_rows());
         let rows = Self::rows(ids)?;
         let bytes = rows.len() * self.table.row_bytes();
@@ -240,7 +242,7 @@ impl<'a> MappedTableDevice<'a> {
         // after this PendingRows is finished (its copy event) or dropped (the
         // gather waited), and nothing else touches it meanwhile.
         let gather = unsafe { self.pool.spawn_gather(self.table.clone(), rows, host, bytes, self.cache.clone()) };
-        Ok(PendingRows { gather: Some(gather), slot, bytes })
+        Ok(PendingRows { gather: Some(gather), slot, bytes, decode })
     }
 
     /// Waits for the gather (the wait counts as stall) and queues the rows'
@@ -252,7 +254,9 @@ impl<'a> MappedTableDevice<'a> {
         -> Result<usize> {
         let waited = Instant::now();
         pending.gather.take().context("rows already finished")?.wait()?;
-        self.table.stats().record_stall(waited.elapsed());
+        let elapsed = waited.elapsed();
+        self.table.stats().record_stall(elapsed);
+        if pending.decode { self.table.stats().record_decode_stall(elapsed); }
         // SAFETY: the gather completed; dst/stream per this function's contract.
         unsafe { self.ring.borrow_mut().submit(pending.slot, dst, pending.bytes, stream)? };
         Ok(pending.bytes)

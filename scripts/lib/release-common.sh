@@ -219,7 +219,7 @@ release_trim() {
 release_known_key() {
   case "$1" in
     SPECULATOR|SPECULATOR_MODEL_ID|SPECULATOR_MODEL_REVISION|SPECULATOR_DEPTH|SPECULATOR_DRAFTS|SPECULATOR_FP8|SPECULATION_TRACE|DRAFT_MODEL_ID|DRAFT_MODEL_REVISION|DRAFT_FP8|DFLASH|MTP|COORDINATOR_TRACE) return 0 ;;
-    FULL_PREFILL_LOGITS) return 0 ;;
+    FULL_PREFILL_LOGITS|TABLE_BACKEND) return 0 ;;
     GLM5_FLASH_FP8_MODEL_ID|GLM5_FLASH_FP8_MODEL_REVISION|GLM5_FLASH_KDA_FP8|GLM5_FLASH_FP8_HEAD|GLM5_FLASH_FP8_PREFILL|GLM5_FLASH_KDA_SPLIT|GLM5_FLASH_EXL3_WORKER_PATH|GLM5_FLASH_EXL3_ROUTE_DUMP|GLM5_FLASH_EXL3_ROUTE_DUMP_CALLS|GLMF_FP8_MODEL_ID|GLMF_FP8_MODEL_REVISION|GLMF_KDA_FP8|GLMF_FP8_HEAD|GLMF_FP8_PREFILL) return 0 ;;
     MIMO_WEIGHT_POLICY|MIMO_FP8_HEAD|MIMO_FP8_O_PROJ|QWEN_FP8_DECODE|QWEN_FP8_HEAD|QWEN_STARTUP_GRAPHS|POOL_TOKENS|PREFIX_PARTIAL|KV_CACHE|DECODE_GRAPHS|EXPERT_INPUT|COPY_DRAFTS|DECODE_SHARE|L2_PREFETCH|FP8_SCALES|DRAFT_CONTEXT_SLOTS|DRAFT_SEQUENCES|SERVED_MODEL_ID|COORDINATOR_GPUS|COORDINATOR_SPLIT|COORDINATOR_SPLIT_GPU|INSTANCE|FP8_EXPERT_PREFILL|SPARK_INTAKE|CONSOLE_TEXT|EXPERT_BACKEND) return 0 ;;
     VISION|VISION_REPLICAS|AUDIO|EMBEDDING|MEDIA_CACHE_BYTES|CHAT_TEMPLATE_FROM|EXL3_PAIRED_TP4|TP2_ATTENTION|TP2_QUERY_PROJECTION|TP2_OUTPUT_PROJECTION|TP2_DSPARK_EXPERTS) return 0 ;;
@@ -259,6 +259,10 @@ release_spark_host_rows() {
 
 # Optional logical per-GPU ceiling. Validate identically in both launchers
 # before any worker/service changes; an empty key keeps physical admission.
+release_validate_table_backend() {
+  case "$1" in uring|mmap|mincore-routed) ;; *) release_die "TABLE_BACKEND must be uring, mmap or mincore-routed" ;; esac
+}
+
 release_validate_coordinator_gpu_budget() {
   local value="$1"
   [[ -z "$value" ]] && return 0
@@ -341,6 +345,7 @@ release_load_config() {
   KV_POOL_TOKENS=
   KV_POOL_SIZE=
   HOST_CACHE_BYTES=auto
+  TABLE_BACKEND="${CUTEAFD_TABLE_BACKEND:-mmap}"
   MEMORY_RESERVATION=
   MAX_CONTEXT_TOKENS=1048576
   MAX_OUTPUT_TOKENS=393216
@@ -471,6 +476,7 @@ release_load_config() {
   [[ -z "$INSTANCE" || "$INSTANCE" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,40}$ ]] ||
     release_die "INSTANCE must be [A-Za-z0-9_.-]"
   [[ "$COORDINATOR_GPU_HEADROOM_GIB" =~ ^[0-9]+([.][0-9]+)?$ ]] || release_die "COORDINATOR_GPU_HEADROOM_GIB must be non-negative"
+  release_validate_table_backend "$TABLE_BACKEND"
   release_validate_coordinator_gpu_budget "$COORDINATOR_GPU_BUDGET_GIB"
   [[ -z "$POOL_TOKENS" || "$POOL_TOKENS" == auto || "$POOL_TOKENS" =~ ^[0-9]+$ ]] || release_die "POOL_TOKENS must be auto or a non-negative integer"
   [[ -z "$POOL_TOKENS" || -z "$KV_POOL_SIZE" ]] || release_die "POOL_TOKENS conflicts with KV_POOL_SIZE"

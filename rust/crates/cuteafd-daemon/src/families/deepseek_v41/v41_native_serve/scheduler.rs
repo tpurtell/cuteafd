@@ -193,7 +193,7 @@ fn serving_stats(prefixes: &PrefixCache<'_>) -> serde_json::Value {
     // `host_cache_config` (packet HC-9), not just `store_pace_ns`: fleet
     // operators tune several of these knobs, and one key keeps the export
     // forward-compatible as new knobs land.
-    serde_json::json!({
+    let mut stats = serde_json::json!({
         "host_cache": prefixes.host_metrics(),
         "host_cache_config": prefixes.host_config(),
         "target_sampling": sampling_stats::snapshot(),
@@ -201,7 +201,9 @@ fn serving_stats(prefixes: &PrefixCache<'_>) -> serde_json::Value {
         "copy_drafts": copy_drafts::stats(),
         "admission": admission::stats(),
         "totals": console::totals::snapshot(),
-    })
+    });
+    crate::shared::probe::graph_capture_stats(&mut stats);
+    stats
 }
 
 pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, args: &crate::cli::NativeServeArgs,

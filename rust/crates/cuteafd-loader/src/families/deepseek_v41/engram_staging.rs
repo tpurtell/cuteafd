@@ -105,6 +105,20 @@ impl EngramBatchStaging {
             self.weights[scale_base..scale_base + rows * 24 * scale_bytes].fill(0x38);
         }
         self.order.sort_unstable();
+        let mut addresses = Vec::with_capacity(self.order.len());
+        let mut slots = Vec::with_capacity(self.order.len());
+        for &(address, slot) in &self.order {
+            if addresses.last() != Some(&address) {
+                addresses.push(address);
+                slots.push(slot);
+            }
+        }
+        // Both backends read the same distinct rows into the same canonical
+        // slots; batching is not an io_uring-only optimization.
+        table.weights().gather_slots(&addresses, &slots, &mut self.weights[..rows * 24 * weight_bytes])?;
+        let scales = if encoding == EngramEncoding::Fp8 { &mut self.scales[..rows * 24 * scale_bytes] }
+            else { &mut self.weights[scale_base..scale_base + rows * 24 * scale_bytes] };
+        table.scales().gather_slots(&addresses, &slots, scales)?;
         let mut previous = None;
         for &(address, slot) in &self.order {
             if let Some((last_address, source)) = previous {
@@ -119,10 +133,6 @@ impl EngramBatchStaging {
                     continue;
                 }
             }
-            table.weights().gather_into(&[address], &mut self.weights[slot * weight_bytes..(slot + 1) * weight_bytes])?;
-            let scales = if encoding == EngramEncoding::Fp8 { &mut self.scales[slot * scale_bytes..(slot + 1) * scale_bytes] }
-                else { &mut self.weights[scale_base + slot * scale_bytes..scale_base + (slot + 1) * scale_bytes] };
-            table.scales().gather_into(&[address], scales)?;
             previous = Some((address, slot));
         }
         self.ready = Some((rows, layer_index, encoding, table.global_scale()));

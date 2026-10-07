@@ -75,14 +75,16 @@ impl EngramTable {
                 "invalid engram checkpoint shard path"
             );
             // SAFETY: forwarded from this function's contract.
-            Ok(unsafe {
+            let table = unsafe {
                 MappedTable::single(
                     &Path::new(&catalog.snapshot_path).join(&tensor.file),
                     tensor.byte_offset,
                     rows as u64,
                     RowFormat::of(dtype, width)?,
                 )?
-            })
+            };
+            table.name_stats(format!("engram.{layer}.{suffix}"));
+            Ok(table)
         };
         Self::new(
             map("weight", DType::F8E4M3, 256)?,

@@ -344,7 +344,7 @@ impl OfficialV41Catalog {
             let metadata = &tensor.metadata;
             ensure!(metadata.shape.len() == 2, "engram tensor {suffix} is not 2-D");
             // SAFETY: forwarded from this function's contract.
-            Ok(unsafe {
+            let table = unsafe {
                 crate::MappedTable::single(
                     &self.snapshot.join(&tensor.shard),
                     metadata.byte_offset,
@@ -352,7 +352,9 @@ impl OfficialV41Catalog {
                     // One byte per element for every engram encoding (FP8, UE8M0, packed NVFP4 bytes).
                     crate::RowFormat { dtype: metadata.dtype.clone(), width: metadata.shape[1], row_bytes: metadata.shape[1] },
                 )?
-            })
+            };
+            table.name_stats(format!("engram.{layer}.{suffix}"));
+            Ok(table)
         };
         if let Some(ple) = self.exl3.as_ref().and_then(|m| m.ple_quantization.as_ref()) {
             use std::os::unix::fs::FileExt;

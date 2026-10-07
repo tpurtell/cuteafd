@@ -1857,7 +1857,7 @@ impl<'a> Qwen4Engine<'a> {
             Some(mapped) => {
                 // A failed step's rows are dropped (their gather waited) first.
                 drop(self.ple_pending.borrow_mut().take());
-                *self.ple_pending.borrow_mut() = Some(mapped.begin(&tables.ple_ids)?);
+                *self.ple_pending.borrow_mut() = Some(mapped.begin(&tables.ple_ids, tables.decode)?);
             }
             None => self.stage_table(w, &w.ple_ids, &tables.ple_ids)?,
         }

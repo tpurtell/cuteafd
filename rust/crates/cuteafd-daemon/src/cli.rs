@@ -7,6 +7,9 @@ pub(crate) const DEFAULT_REAL_FULL_MAX_CONTEXT_TOKENS: usize = 128 * 1024;
 #[derive(Debug, Parser)]
 #[command(name = "cuteafd", about = "CUTEAFD phase0 runtime CLI")]
 pub(crate) struct Cli {
+    /// Buffered mapped-table gathers (engram / PLE); mmap until qualified.
+    #[arg(long, global = true, env = "CUTEAFD_TABLE_BACKEND", value_parser = ["uring", "mmap", "mincore-routed"])]
+    pub(crate) table_backend: Option<String>,
     #[arg(long, global = true, env = "VISION")]
     pub(crate) vision: Option<cuteafd_loader::plan::MediaMode>,
     #[arg(long, global = true, env = "AUDIO")]

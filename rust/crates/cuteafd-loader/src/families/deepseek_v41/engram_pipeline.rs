@@ -23,8 +23,11 @@ pub struct EngramWave {
     prefetch: Vec<PrefetchTicket>,
     layers: [LayerIo; 2],
     finished: bool,
+    waiting: [Option<std::time::Instant>; 2],
+    decode: bool,
 }
 impl EngramWave {
+    pub fn set_decode(&mut self, decode: bool) { self.decode = decode; }
     pub fn batches(&self) -> &[Arc<EngramBatch>] {
         &self.batches
     }
@@ -164,6 +167,8 @@ impl EngramPipeline {
             prefetch: Vec::with_capacity(32),
             layers: [LayerIo::AwaitingAdmission, LayerIo::AwaitingAdmission],
             finished: false,
+            waiting: [None; 2],
+            decode: false,
         };
         for layer in 0..2 {
             for batch in &wave.batches {
@@ -213,7 +218,10 @@ impl EngramPipeline {
             }
             self.admit(wave, layer)?;
             let result = match &mut wave.layers[layer] {
-                LayerIo::AwaitingAdmission => return Ok(EngramGatherPoll::Pending),
+                LayerIo::AwaitingAdmission => {
+                    wave.waiting[layer].get_or_insert_with(std::time::Instant::now);
+                    return Ok(EngramGatherPoll::Pending);
+                },
                 LayerIo::Queued(ticket) => ticket.poll()?,
                 LayerIo::Consumed => anyhow::bail!("engram layer result already consumed"),
             };
@@ -227,6 +235,15 @@ impl EngramPipeline {
                             .all(|(a, b)| Arc::ptr_eq(a, b)),
                     "engram gather result belongs to a different wave"
                 );
+            }
+            if matches!(result, EngramGatherPoll::Pending) {
+                wave.waiting[layer].get_or_insert_with(std::time::Instant::now);
+            } else if matches!(result, EngramGatherPoll::Ready(_)) {
+                let elapsed = wave.waiting[layer].take().map_or(std::time::Duration::ZERO, |t| t.elapsed());
+                for table in [self.tables[layer].weights(), self.tables[layer].scales()] {
+                    table.stats().record_stall(elapsed);
+                    if wave.decode { table.stats().record_decode_stall(elapsed); }
+                }
             }
             if !matches!(result, EngramGatherPoll::Pending) {
                 wave.layers[layer] = LayerIo::Consumed;

@@ -13,6 +13,24 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 class NativeReleaseLauncherTest(unittest.TestCase):
+    def test_table_backend_preflight_and_seccomp_are_narrow(self) -> None:
+        for backend, valid in [('mmap', True), ('uring', True), ('mincore-routed', True), ('direct', False)]:
+            result = subprocess.run(['bash', '-c',
+                'source scripts/lib/release-common.sh; release_known_key TABLE_BACKEND; '
+                'release_validate_table_backend "$1"', 'test', backend],
+                cwd=ROOT, text=True, capture_output=True)
+            self.assertEqual(result.returncode == 0, valid, result.stderr)
+        profile = json.loads((ROOT / 'docker/seccomp-code-bench.json').read_text())
+        self.assertEqual(profile['defaultAction'], 'SCMP_ACT_ERRNO')
+        allowed = {name for rule in profile['syscalls'] if rule['action'] == 'SCMP_ACT_ALLOW'
+                   for name in rule['names']}
+        self.assertTrue({'io_uring_setup', 'io_uring_enter', 'io_uring_register'} <= allowed)
+        for launcher in ['run.sh', 'scripts/launch/run-family.sh']:
+            source = (ROOT / launcher).read_text()
+            self.assertIn('--table-backend', source)
+            self.assertLess(source.index('release_validate_table_backend'), source.index('docker run'))
+            self.assertIn('seccomp=$repo_root/docker/seccomp-code-bench.json', source)
+
     def test_embedding_placement_registered_and_gpu_default(self) -> None:
         result = subprocess.run(['bash', '-c',
             'source scripts/lib/release-common.sh; release_known_key EMBEDDING; '

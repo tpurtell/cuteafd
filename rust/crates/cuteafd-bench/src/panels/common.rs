@@ -105,6 +105,42 @@ pub fn draft_counters(client: &Client) -> Option<(f64, f64)> {
     Some((t["drafted_tokens"].as_f64()?, t["accepted_drafts"].as_f64()?))
 }
 
+/// Cumulative mapped-table counters; absence means this family has no mapped tables.
+pub fn mapped_counters(client: &Client) -> Vec<Value> {
+    client.stats().ok().and_then(|v| v["mapped_tables"].as_array().cloned()).unwrap_or_default()
+}
+
+/// Differences belong to this measurement; maxima remain explicitly lifetime values.
+pub fn mapped_interval(before: &[Value], after: &[Value]) -> Vec<Value> {
+    after.iter().map(|table| {
+        let previous = before.iter().find(|old| old["name"] == table["name"]);
+        let mut counters = serde_json::Map::new();
+        let mut maxima = serde_json::Map::new();
+        if let Some(fields) = table["cumulative"].as_object() {
+            for (key, value) in fields {
+                let old = previous.map(|p| &p["cumulative"][key]);
+                if key.ends_with("max_ns") {
+                    maxima.insert(key.clone(), value.clone());
+                } else if let Some(n) = value.as_u64() {
+                    counters.insert(key.clone(), json!(n.saturating_sub(old.and_then(Value::as_u64).unwrap_or(0))));
+                } else if let Some(bins) = value.as_array() {
+                    counters.insert(key.clone(), json!(bins.iter().enumerate().map(|(i, bin)| {
+                        bin.as_u64().unwrap_or(0).saturating_sub(old.and_then(|v| v.get(i)).and_then(Value::as_u64).unwrap_or(0))
+                    }).collect::<Vec<_>>()));
+                }
+            }
+        }
+        let devices: Vec<_> = table["host_wide_device_reads"].as_array().into_iter().flatten().map(|device| {
+            let old = previous.and_then(|p| p["host_wide_device_reads"].as_array())
+                .and_then(|ds| ds.iter().find(|d| d["device"] == device["device"]))
+                .and_then(|d| d["bytes"].as_u64()).unwrap_or(0);
+            json!({"device": device["device"], "bytes": device["bytes"].as_u64().unwrap_or(0).saturating_sub(old)})
+        }).collect();
+        json!({"name": table["name"], "backend": table["backend"], "accounting": table["accounting"],
+            "interval": counters, "lifetime_maxima": maxima, "host_wide_device_reads": devices})
+    }).collect()
+}
+
 pub fn acceptance(before: Option<(f64, f64)>, after: Option<(f64, f64)>) -> Option<f64> {
     let ((d0, a0), (d1, a1)) = (before?, after?);
     (d1 > d0).then(|| (a1 - a0) / (d1 - d0))
@@ -136,6 +172,23 @@ pub fn doublings(from: u64, max: u64) -> Vec<u64> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn mapped_intervals_preserve_histograms_and_label_lifetime_maxima() {
+        use serde_json::json;
+        let before = json!({"name":"ple", "cumulative":{"page_hits":10,"miss_histogram":[1,2],"miss_max_ns":50},
+            "host_wide_device_reads":[{"device":"259:2","bytes":1024}]});
+        let after = json!({"name":"ple", "backend":"uring", "accounting":"nowait",
+            "cumulative":{"page_hits":14,"miss_histogram":[2,5],"miss_max_ns":50},
+            "host_wide_device_reads":[{"device":"259:2","bytes":4096}]});
+        let delta = super::mapped_interval(&[before], &[after]);
+        assert_eq!(delta[0]["interval"]["page_hits"], 4);
+        assert_eq!(delta[0]["interval"]["miss_histogram"], json!([1,3]));
+        assert!(delta[0]["interval"].get("miss_max_ns").is_none());
+        assert_eq!(delta[0]["lifetime_maxima"]["miss_max_ns"], 50);
+        assert_eq!(delta[0]["host_wide_device_reads"][0]["bytes"], 3072);
+        assert!(super::mapped_interval(&[], &[]).is_empty());
+    }
+
     #[test]
     fn doublings_stop_at_the_limit() {
         assert_eq!(super::doublings(1024, 8192), vec![1024, 2048, 4096, 8192]);

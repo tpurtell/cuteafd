@@ -60,6 +60,11 @@
   ],
   "syscalls": [
     {
+      "names": ["io_uring_setup", "io_uring_enter", "io_uring_register"],
+      "action": "SCMP_ACT_ALLOW",
+      "comment": "Buffered mapped-table gathers; keep the rest of the default deny profile."
+    },
+    {
       "names": [
         "accept",
         "accept4",

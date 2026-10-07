@@ -499,11 +499,18 @@ impl Bench {
                 self.begin(active, panel.id(), estimate, remaining, total, pass, planned.passes, progress);
                 let ctx = Ctx { client: &client, info: &info, baseline: Some(&baseline), rates, progress, pass,
                     history: &earlier, max_context, max_output };
+                let table_before = panels::common::mapped_counters(&client);
                 let outcome = panel.run(&ctx);
+                let table_after = panels::common::mapped_counters(&client);
                 remaining -= estimate;
                 let mut r = report.lock().expect("report lock");
                 match outcome {
-                    Ok(value) => {
+                    Ok(mut value) => {
+                        let tables = panels::common::mapped_interval(&table_before, &table_after);
+                        if !tables.is_empty() {
+                            value["mapped_tables"] = json!(tables);
+                            value["mapped_tables_scope"] = json!("whole panel pass, including panel-internal priming");
+                        }
                         r.panels[index].passes.push(value);
                         r.panels[index].partial = None;
                     }

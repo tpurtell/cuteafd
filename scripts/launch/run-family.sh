@@ -12,15 +12,17 @@ config="$repo_root/cuteafd.config"
 restart=0
 family=""
 embedding_override=""
+table_override=""
 wip_slot=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --config) config="${2:?--config requires FILE}"; shift 2 ;;
     --family) family="${2:?--family requires ID}"; shift 2 ;;
+    --table-backend) table_override="${2:?--table-backend requires uring, mmap or mincore-routed}"; shift 2 ;;
     --embedding-placement) embedding_override="${2:?--embedding-placement requires host or gpu}"; shift 2 ;;
     --restart) restart=1; shift ;;
     --wip) wip_slot="${2:?--wip requires SLOT}"; shift 2 ;;
-    *) echo "usage: $0 [--config FILE] [--family ID] [--embedding-placement host|gpu] [--restart] [--wip SLOT]" >&2; exit 2 ;;
+    *) echo "usage: $0 [--config FILE] [--family ID] [--embedding-placement host|gpu] [--table-backend uring|mmap|mincore-routed] [--restart] [--wip SLOT]" >&2; exit 2 ;;
   esac
 done
 # Plain KEY=VALUE lines; the launch reads only the keys below.
@@ -31,6 +33,8 @@ while IFS='=' read -r key value; do
 done < <(grep -E '^[A-Z_0-9]+=' "$config")
 [[ -z "$embedding_override" ]] || cfg[EMBEDDING]="$embedding_override"
 get() { printf '%s' "${cfg[$1]:-${2:-}}"; }
+table_backend="${table_override:-$(get TABLE_BACKEND "${CUTEAFD_TABLE_BACKEND:-mmap}")}"
+release_validate_table_backend "$table_backend"
 vision="$(get VISION off)"
 audio="$(get AUDIO off)"
 vision_replicas="$(get VISION_REPLICAS 1)"
@@ -877,6 +881,7 @@ intake="$(get SPARK_INTAKE auto)"
 case "$intake" in auto|gpu|pinned|host) ;; *) echo "SPARK_INTAKE must be auto, gpu, pinned or host" >&2; exit 2 ;; esac
 # CONSOLE_TEXT=on lets the live console at / stream generated token text (anyone who
 # can reach the API port can then read every session's output).
+family_args+=(--table-backend "$table_backend")
 console_text="$(get CONSOLE_TEXT off)"
 case "$console_text" in on|off) ;; *) echo "CONSOLE_TEXT must be on or off" >&2; exit 2 ;; esac
 docker run -d --name "$coordinator_name" --restart no --gpus "$gpus" --network host --ipc host \

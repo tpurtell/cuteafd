@@ -57,12 +57,14 @@ impl Panel for DecodeContent {
         let mut rows = Vec::new();
         for (i, (content, prompt)) in CONTENT.iter().enumerate() {
             ctx.progress.step(i as f64 / CONTENT.len() as f64, *content);
+            let table_before = common::mapped_counters(ctx.client);
             let before = common::draft_counters(ctx.client);
             let chat = ctx.client.chat(plain(&format!("[{}] {prompt}", nonce()), DECODE_TOKENS), None)
                 .with_context(|| format!("{content} decode"))?;
             let acceptance = common::acceptance(before, common::draft_counters(ctx.client));
             rows.push(json!({"content": content, "tok_s": chat.timing.decode_tok_s(),
-                "tokens": chat.timing.completion_tokens, "ttft_s": chat.timing.ttft_s, "acceptance": acceptance}));
+                "tokens": chat.timing.completion_tokens, "ttft_s": chat.timing.ttft_s, "acceptance": acceptance,
+                "mapped_tables": common::mapped_interval(&table_before, &common::mapped_counters(ctx.client))}));
             ctx.progress.partial(json!({"rows": rows}));
         }
         let table_rows = rows.iter().map(|r| vec![r["content"].clone(), r["tok_s"].clone(), r["tokens"].clone(),
@@ -95,13 +97,15 @@ impl Panel for Concurrency {
             ctx.progress.step(i as f64 / levels.len() as f64, format!("C{c}"));
             ctx.client.check()?;
             let bodies = (0..c).map(|k| plain(&format!("[{}] {}", nonce(), CONTENT[k % 2 * 6].1), 192)).collect();
+            let table_before = common::mapped_counters(ctx.client);
             let results = wave(ctx.client, bodies);
             let errors = results.iter().filter(|r| r.is_err()).count();
             let ok: Vec<_> = results.into_iter().filter_map(Result::ok).collect();
             let mut per: Vec<f64> = ok.iter().map(|r| r.chat.timing.decode_tok_s()).collect();
             let mut ttft: Vec<f64> = ok.iter().map(|r| r.chat.timing.ttft_s).collect();
             points.push(json!({"c": c, "aggregate_tok_s": aggregate(&ok), "per_request_tok_s": common::median(&mut per),
-                "ttft_s": common::median(&mut ttft), "errors": errors}));
+                "ttft_s": common::median(&mut ttft), "errors": errors,
+                "mapped_tables": common::mapped_interval(&table_before, &common::mapped_counters(ctx.client))}));
             ctx.progress.partial(json!({"points": points}));
         }
         let rows = points.iter().map(|p| vec![json!(format!("C{}", p["c"])), p["aggregate_tok_s"].clone(),

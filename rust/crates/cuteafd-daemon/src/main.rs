@@ -79,13 +79,13 @@ async fn main() -> Result<()> {
 
     let parse = |matches: clap::ArgMatches| {
         match Cli::from_arg_matches(&matches) {
-            Ok(cli) => (cli.command, matches, cli.coordinator_gpu_budget_gib, cli.vision, cli.audio, cli.max_image_tokens, cli.image_url_fetch),
+            Ok(cli) => (cli.command, matches, cli.coordinator_gpu_budget_gib, cli.vision, cli.audio, cli.max_image_tokens, cli.image_url_fetch, cli.table_backend),
             Err(error) => error.exit(),
         }
     };
-    let (command, matches, initial_budget, initial_vision, initial_audio, initial_image_cap, initial_fetch) = parse(Cli::command().get_matches());
+    let (command, matches, initial_budget, initial_vision, initial_audio, initial_image_cap, initial_fetch, initial_table_backend) = parse(Cli::command().get_matches());
     // `serve` and `golden` pick the family and stand for its own command.
-    let (mut command, matches, family_budget, family_vision, family_audio, family_image_cap, family_fetch) = match command {
+    let (mut command, matches, family_budget, family_vision, family_audio, family_image_cap, family_fetch, family_table_backend) = match command {
         Commands::Serve(args) => match commands::family::argv(commands::family::Kind::Serve, args)? {
             Some(argv) => parse(Cli::command().get_matches_from(argv)),
             None => return Ok(()),
@@ -94,8 +94,12 @@ async fn main() -> Result<()> {
             Some(argv) => parse(Cli::command().get_matches_from(argv)),
             None => return Ok(()),
         },
-        command => (command, matches, initial_budget, initial_vision, initial_audio, initial_image_cap, initial_fetch),
+        command => (command, matches, initial_budget, initial_vision, initial_audio, initial_image_cap, initial_fetch, initial_table_backend.clone()),
     };
+    // Preserve the original explicit option when family resolution reparses argv.
+    if let Some(backend) = initial_table_backend.or(family_table_backend) {
+        cuteafd_loader::TableBackend::set_override(backend.parse().expect("clap validates table backend"));
+    }
     let vision = if matches!(&command, Commands::ServeQwen4(_)) {
         resolve_qwen_vision(family_vision, initial_vision)
     } else {

@@ -10,6 +10,12 @@
 .canvas-wrap { position: relative; border-radius: 8px; overflow: hidden; border: 1px solid var(--line); background: var(--well); }
 #ticker { display: block; width: 100%; cursor: crosshair; }
 #layers { width: 100%; height: 64px; display: block; }
+#mapped-tables caption { text-align: left; padding: 8px 0; }
+#mapped-tables th, #mapped-tables td { padding-right: 10px; }
+#mapped-tables th:first-child, #mapped-tables td:first-child { min-width: 160px; max-width: 300px; white-space: normal; overflow-wrap: anywhere; }
+@media (max-width: 600px) {
+  #mapped-tables th:first-child, #mapped-tables td:first-child { min-width: 110px; max-width: 130px; }
+}
 </style>
 </head>
 <body>
@@ -67,6 +73,15 @@
     </div>
     <div class="canvas-wrap" id="ticker-wrap"><canvas id="ticker" height="240"></canvas></div>
     <div class="note" id="ticker-note"></div>
+  </section>
+
+  <section class="panel" id="mapped-tables" hidden>
+    <div class="panel-head"><h2>Mapped tables</h2>
+      <select id="mapped-window" class="btn" aria-label="Mapped table counter interval"><option value="interval">Last 60 seconds</option><option value="cumulative">Since launch</option></select>
+    </div>
+    <div class="note">Engram / PLE demand reads. nowait-exact counts full NOWAIT completions. mincore is a pre-read residency snapshot (mmap, or io_uring files without NOWAIT); mixed files use mincore only where needed. io_uring miss time starts at batch submission and includes retries; mmap has no miss timer. Accounting-off diagnostics show all-completion tiers without hit/miss classification. Device estimates count miss-row page spans; host-wide reads include unrelated I/O.</div>
+    <div class="tablewrap"><table><caption>Miss latency tiers (rows)</caption><thead><tr><th>Table</th><th>&lt;5 us</th><th>5-10 us</th><th>10-50 us</th><th>50-200 us</th><th>200 us-1 ms</th><th>1-10 ms</th><th>&gt;=10 ms</th><th>Prefetch hits / misses</th><th>mincore overhead</th></tr></thead><tbody id="mapped-tiers"></tbody></table></div>
+    <div class="tablewrap"><table><thead><tr><th>Table / backend</th><th>Hit %</th><th>Hits / misses</th><th>Hit bytes</th><th>Miss-request bytes</th><th>Avg miss</th><th>Max miss (lifetime)</th><th>NOWAIT batch avg</th><th>Stall ms / decode step</th><th>Device bytes (estimate)</th><th>Host-wide device reads (since sample)</th></tr></thead><tbody id="mapped-rows"></tbody></table></div>
   </section>
 
   <div class="bottom">
@@ -182,6 +197,7 @@ function onSnapshot(m) {
   header();
 }
 function resetHistory() {
+  S.mappedHistory = []; S.mappedBaseline = null;
   S.requests.clear(); S.rounds = []; S.prefill = []; S.totals = []; S.recent = [];
   for (const k in S.series) S.series[k] = [];
 }
@@ -256,6 +272,12 @@ function addChunk(r, t, segs, g) {
 }
 function gauges(g, now) {
   S.gauges = g;
+  if (g.mapped_tables?.length) {
+    S.mappedBaseline ||= g.mapped_tables;
+    S.mappedHistory ||= [];
+    S.mappedHistory.push({t: now, tables: g.mapped_tables});
+    while (S.mappedHistory.length > 2 && S.mappedHistory[0].t < now - 60000) S.mappedHistory.shift();
+  }
   if (g.totals) {
     S.totals.push({ t: now, ...g.totals });
     while (S.totals.length > 2 && S.totals[0].t < now - 70000) S.totals.shift();
@@ -370,6 +392,47 @@ function renderKpis() {
 const LANE_SHADES = ['var(--target)', 'color-mix(in oklab,var(--target) 55%,var(--well))', 'color-mix(in oklab,var(--target) 35%,var(--well))'];
 function laneCount() { return Math.max(1, S.config.lanes || 1); }
 function laneName(lane) { return laneCount() > 1 ? `lane ${lane}` : 'decoding'; }
+function renderMappedTables() {
+  const tables = S.gauges.mapped_tables || [];
+  $('#mapped-tables').hidden = !tables.length;
+  if (!tables.length) return;
+  const interval = $('#mapped-window').value === 'interval';
+  const earlier = interval ? S.mappedHistory?.[0]?.tables || [] : [];
+  const bytes = n => {
+    n = Number(n || 0);
+    const tier = n > 0 ? Math.min(3, Math.floor(Math.log2(n) / 10)) : 0;
+    return `${(n / 1024 ** tier).toFixed(tier ? 2 : 0)} ${['B','KiB','MiB','GiB'][tier]}`;
+  };
+  const number = n => Number(n || 0).toLocaleString();
+  const escape = text => String(text).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+  const rows = [], tiers = [];
+  for (const table of tables) {
+    const total = table.cumulative || {};
+    const oldTable = earlier.find(t => t.name === table.name);
+    const before = oldTable?.cumulative || {};
+    const count = key => Math.max(0, Number(total[key] || 0) - Number(before[key] || 0));
+    const hits = count('page_hits'), misses = count('page_misses'), unknown = count('unclassified_rows');
+    const latency = table.backend !== 'mmap';
+    const host = (table.host_wide_device_reads || []).map(device => {
+      const previous = (oldTable || S.mappedBaseline?.find(t => t.name === table.name))?.host_wide_device_reads?.find(d => d.device === device.device)?.bytes || 0;
+      return `${escape(device.device)}: ${bytes(Math.max(0, device.bytes - previous))}`;
+    }).join('<br>') || '-';
+    const cells = [escape(`${table.name} / ${table.backend} (${table.accounting})`), hits + misses ? `${(100 * hits / (hits + misses)).toFixed(1)}%` : '-',
+      `${number(hits)} / ${number(misses)}${unknown ? ` (+${number(unknown)} unclassified)` : ''}`, bytes(count('page_hit_bytes')), bytes(count('miss_request_bytes')),
+      latency && misses ? `${(count('miss_ns') / misses / 1000).toFixed(1)} us` : '-',
+      latency ? `${(Number(total.miss_max_ns || 0) / 1000).toFixed(1)} us` : '-',
+      latency && count('nowait_batches') ? `${(count('nowait_ns') / count('nowait_batches') / 1000).toFixed(1)} us` : '-',
+      count('decode_steps') ? (count('decode_stall_ns') / count('decode_steps') / 1e6).toFixed(3) : '-',
+      bytes(count('device_bytes_estimate')), host];
+    rows.push(`<tr>${cells.map(c => `<td>${c}</td>`).join('')}</tr>`);
+    const histogram = unknown ? 'completion_histogram' : 'miss_histogram';
+    const bins = Array.from({length:7}, (_, i) => latency ? number(Math.max(0, Number(total[histogram]?.[i] || 0) - Number(before[histogram]?.[i] || 0))) : '-');
+    tiers.push(`<tr><td>${escape(table.name)}${unknown ? ' (all completions, unclassified)' : ''}${table.backend === 'mincore-routed' ? `<br>resident memcpy ${number(count('resident_copy_rows'))}; late major faults ${number(count('late_major_faults'))}` : ''}</td>${bins.map(c => `<td>${c}</td>`).join('')}<td>${number(count('prefetch_hits'))} / ${number(count('prefetch_misses'))}</td><td>${(count('residency_ns') / 1e6).toFixed(3)} ms</td></tr>`);
+  }
+  $('#mapped-rows').innerHTML = rows.join('');
+  $('#mapped-tiers').innerHTML = tiers.join('');
+}
+
 function renderMeters() {
   const g = S.gauges, limit = S.config.concurrency || 16, lanes = g.lanes || [];
   const pf = g.prefilling_n ?? (g.prefilling ? 1 : 0);
@@ -825,7 +888,7 @@ function prune() {
   }
 }
 setInterval(() => { sampleSeries(); }, 1000);
-setInterval(() => { status(); renderKpis(); renderMeters(); renderSteps(); renderAcceptance(); renderRecent(); prune(); }, 500);
+setInterval(() => { status(); renderKpis(); renderMeters(); renderMappedTables(); renderSteps(); renderAcceptance(); renderRecent(); prune(); }, 500);
 setMode('time');
 connect();
 requestAnimationFrame(draw);

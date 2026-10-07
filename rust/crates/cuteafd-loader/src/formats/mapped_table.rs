@@ -1,9 +1,10 @@
-//! Memory-mapped per-token lookup tables: DeepSeek V4.1 engram, Qwen 3.8 PLE
+//! Page-cache-backed per-token lookup tables: DeepSeek V4.1 engram, Qwen 3.8 PLE
 //! n-grams, and any other checkpoint table too large to preload.
 //!
 //! A table is one or more safetensors tensors (parts) viewed as one row space.
 //! Parts are mapped read-only and page-cache backed with `MADV_RANDOM` (no
-//! sequential read-ahead across a hash table); opening reads only headers.
+//! sequential read-ahead across a hash table). Buffered io_uring reads use
+//! POSIX_FADV_RANDOM and NOWAIT, retrying misses without O_DIRECT.
 //! Rows reach the GPU in three steps, each bounded:
 //!
 //! - prefetch: as soon as row ids are known (a prefill chunk ahead, a wave's
@@ -16,16 +17,19 @@
 //! - upload: the daemon's pinned staging and async H2D (`shared::mapped_table`).
 //!
 //! Page cache is the host cache: under memory pressure the kernel evicts table
-//! pages and the next gather faults them back in (counted as major faults in
-//! [`TableStats`]). [`HotRowCache`] optionally pins the hottest rows by budget.
+//! pages and the next gather brings them back. [`TableStats`] distinguishes
+//! NOWAIT hits from mmap residency snapshots, not just major faults. [`HotRowCache`] optionally pins the hottest rows by budget.
 use cuteafd_core::DType;
+use std::cell::RefCell;
 use std::collections::{BTreeSet, HashMap};
 use std::fs::File;
 use std::os::fd::AsRawFd;
 use std::path::{Component, Path, PathBuf};
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex, Weak};
+
+mod uring;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -79,7 +83,10 @@ pub struct MappedRows {
     rows: u64,
     row_bytes: usize,
     page_bytes: usize,
-    _file: File,
+    file: File,
+    file_offset: u64,
+    nowait: AtomicBool,
+    fuse: bool,
 }
 
 // SAFETY: Only immutable access is exposed; munmap runs after the final owner drops.
@@ -117,6 +124,7 @@ impl MappedRows {
             return Err(invalid("mapped tensor exceeds addressable slice size"));
         }
         let file_offset = libc::off_t::try_from(aligned).map_err(|_| invalid("mapped offset overflow"))?;
+        uring::random(&file)?;
         // SAFETY: a fresh read-only private mapping of a validated file range.
         let raw = unsafe {
             libc::mmap(std::ptr::null_mut(), mapped_len, libc::PROT_READ, libc::MAP_PRIVATE, file.as_raw_fd(),
@@ -133,7 +141,7 @@ impl MappedRows {
             }
             return Err(invalid("checkpoint mapping returned a null address"));
         };
-        let result = Self { base, mapped_len, data_offset, rows, row_bytes, page_bytes, _file: file };
+        let result = Self { base, mapped_len, data_offset, rows, row_bytes, page_bytes, file_offset: offset, nowait: AtomicBool::new(true), fuse: uring::is_fuse(&file), file };
         // Avoid kernel sequential read-ahead across a hundreds-of-GB hash table.
         // SAFETY: advice over exactly the mapping created above.
         if unsafe { libc::madvise(raw, mapped_len, libc::MADV_RANDOM) } != 0 {
@@ -290,6 +298,90 @@ impl RowFormat {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TableBackend { Uring, Mmap, MincoreRouted }
+impl std::fmt::Display for TableBackend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self { Self::Uring => "uring", Self::Mmap => "mmap", Self::MincoreRouted => "mincore-routed" })
+    }
+}
+impl std::str::FromStr for TableBackend {
+    type Err = MappedTableError;
+    fn from_str(value: &str) -> Result<Self> {
+        match value { "uring" => Ok(Self::Uring), "mmap" => Ok(Self::Mmap), "mincore-routed" => Ok(Self::MincoreRouted),
+            _ => Err(invalid("table backend must be uring, mmap or mincore-routed")) }
+    }
+}
+static BACKEND: Mutex<Option<TableBackend>> = Mutex::new(None);
+impl TableBackend {
+    /// CLI override takes precedence over CUTEAFD_TABLE_BACKEND. mmap remains
+    /// the default until identical-config hardware qualification passes.
+    pub fn set_override(backend: Self) { *BACKEND.lock().unwrap_or_else(|p| p.into_inner()) = Some(backend); }
+    fn configured() -> Self {
+        if let Some(backend) = *BACKEND.lock().unwrap_or_else(|p| p.into_inner()) { return backend; }
+        match std::env::var("CUTEAFD_TABLE_BACKEND") {
+            Ok(value) => match value.parse() {
+                Ok(backend) => backend,
+                Err(error) => { tracing::warn!(%error, "invalid mapped-table override; using mmap"); Self::Mmap }
+            },
+            Err(_) => Self::Mmap,
+        }
+    }
+}
+static TABLES: Mutex<Vec<(String, Weak<TableStats>)>> = Mutex::new(Vec::new());
+
+#[derive(Debug, serde::Serialize)]
+pub struct NamedTableStats {
+    pub name: String,
+    pub backend: String,
+    pub accounting: &'static str,
+    pub cumulative: TableStatsSnapshot,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub interval: Option<TableStatsSnapshot>,
+    /// Backing device counters include all host readers, not just this table.
+    pub host_wide_device_reads: Vec<DeviceReads>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub host_wide_device_read_interval: Option<Vec<DeviceReads>>,
+}
+#[derive(Debug, serde::Serialize)]
+pub struct DeviceReads { pub device: String, pub bytes: u64 }
+pub fn mapped_table_stats() -> Vec<NamedTableStats> { named_stats(false) }
+pub fn mapped_table_stats_with_intervals() -> Vec<NamedTableStats> { named_stats(true) }
+fn named_stats(interval: bool) -> Vec<NamedTableStats> {
+    let mut registry = TABLES.lock().unwrap_or_else(|p| p.into_inner());
+    registry.retain(|(_, stats)| stats.strong_count() > 0);
+    registry.iter().filter_map(|(name, stats)| stats.upgrade().map(|stats| {
+        let devices: Vec<_> = stats.devices.lock().unwrap_or_else(|p| p.into_inner()).iter().filter_map(|path| {
+            let contents = std::fs::read_to_string(path).ok()?;
+            let sectors = contents.split_whitespace().nth(2)?.parse::<u64>().ok()?;
+            let device = Path::new(path).parent()?.file_name()?.to_string_lossy().into_owned();
+            Some(DeviceReads { device, bytes: sectors.saturating_mul(512) })
+        }).collect();
+        let device_interval = interval.then(|| {
+            let mut previous = stats.previous_devices.lock().unwrap_or_else(|p| p.into_inner());
+            devices.iter().map(|device| {
+                let before = previous.insert(device.device.clone(), device.bytes).unwrap_or(device.bytes);
+                DeviceReads { device: device.device.clone(), bytes: device.bytes.saturating_sub(before) }
+            }).collect()
+        });
+        NamedTableStats { name: name.clone(), backend: stats.backend().to_string(),
+            accounting: stats.accounting(), cumulative: stats.snapshot(),
+            interval: interval.then(|| stats.interval()), host_wide_device_reads: devices,
+            host_wide_device_read_interval: device_interval }
+
+    })).collect()
+}
+
+#[derive(Default)]
+struct ResidencyWorkspace {
+    pages: Vec<(usize, usize)>,
+    resident: Vec<bool>,
+    mincore: Vec<u8>,
+}
+thread_local! {
+    static RESIDENCY: RefCell<ResidencyWorkspace> = RefCell::new(ResidencyWorkspace::default());
+}
+
 /// A row space over one or more mapped parts, with its stats.
 pub struct MappedTable {
     parts: Vec<MappedRows>,
@@ -298,7 +390,7 @@ pub struct MappedTable {
     /// Rows of every part but possibly the last (division lookup), else 0.
     uniform: u64,
     format: RowFormat,
-    stats: TableStats,
+    stats: Arc<TableStats>,
 }
 
 impl MappedTable {
@@ -326,7 +418,29 @@ impl MappedTable {
         } else {
             0
         };
-        Ok(Self { parts: mapped, starts, uniform, format, stats: TableStats::default() })
+        let table = Self { parts: mapped, starts, uniform, format, stats: Arc::new(TableStats::default()) };
+        {
+            use std::os::unix::fs::MetadataExt;
+            let mut devices = table.stats.devices.lock().unwrap_or_else(|p| p.into_inner());
+            for part in &table.parts {
+                if let Ok(meta) = part.file.metadata() {
+                    let path = format!("/sys/dev/block/{}:{}", libc::major(meta.dev()), libc::minor(meta.dev()));
+                    if let Ok(path) = std::fs::canonicalize(path) {
+                        let path = path.join("stat").to_string_lossy().into_owned();
+                        if !devices.contains(&path) { devices.push(path); }
+                    }
+                }
+            }
+        }
+        table.stats.approximate.store(table.parts.iter().any(|part| part.fuse), Ordering::Relaxed);
+        let off = match std::env::var("CUTEAFD_TABLE_ACCOUNTING").ok().as_deref() {
+            None | Some("full") => false,
+            Some("off") => true,
+            Some(value) => { tracing::warn!(value, "invalid table accounting; using full residency"); false }
+        };
+        table.stats.accounting_off.store(off, Ordering::Relaxed);
+        table.select_backend(TableBackend::configured());
+        Ok(table)
     }
 
     /// One tensor as a table (V4.1 engram weights and scales).
@@ -419,10 +533,170 @@ impl MappedTable {
         for &row in rows {
             self.locate(row)?;
         }
-        for (&row, destination) in rows.iter().zip(output.chunks_exact_mut(self.row_bytes())) {
-            destination.copy_from_slice(self.row(row)?);
+        let slots: Vec<_> = (0..rows.len()).collect();
+        self.gather_slots(rows, &slots, output)?;
+        Ok(())
+    }
+
+    /// Gather into distinct row slots (for deduplicated engram rows). The
+    /// destination layout is shared by both backends; all rows are validated
+    /// before any write, and every io_uring batch drains before returning.
+    pub fn gather_slots(&self, rows: &[u64], slots: &[usize], output: &mut [u8]) -> Result<()> {
+        if rows.len() != slots.len() { return Err(invalid("gather row/slot counts differ")); }
+        let width = self.row_bytes();
+        let mut unique = BTreeSet::new();
+        let reads: Vec<_> = rows.iter().zip(slots).map(|(&row, &slot)| {
+            let (part, local) = self.locate(row)?;
+            if slot.checked_add(1).and_then(|n| n.checked_mul(width)).is_none_or(|n| n > output.len())
+                || !unique.insert(slot) { return Err(invalid("invalid or overlapping gather slots")); }
+            Ok(uring::Read { part: &self.parts[part], row: local, slot })
+        }).collect::<Result<_>>()?;
+        if self.backend() != TableBackend::Mmap {
+            match self.uring_reads(rows, &reads, output, false) {
+                Ok(stats) => { self.stats.record_reads(stats, false); return Ok(()); }
+                Err(error) => {
+                    tracing::warn!(%error, "io_uring table read unavailable; falling back to mmap");
+                    self.stats.uring.store(false, Ordering::Relaxed);
+                }
+            }
+        }
+        self.record_residency(rows)?;
+        for read in reads {
+            output[read.slot * width..(read.slot + 1) * width].copy_from_slice(read.part.row(read.row)?);
         }
         Ok(())
+    }
+
+    /// mincore snapshots every requested page before copying any rows. Pages
+    /// are deduplicated and consecutive runs coalesced; sparse rows cost one
+    /// bounded query per page, never a scan of the hundreds-of-GB table.
+    fn residency(&self, rows: &[u64], prefetch: bool) -> Result<Vec<bool>> {
+        let started = Instant::now();
+        let hits = RESIDENCY.with(|workspace| {
+            let mut workspace = workspace.borrow_mut();
+            let ResidencyWorkspace { pages, resident, mincore } = &mut *workspace;
+            pages.clear();
+            for &row in rows {
+                let (part, local) = self.locate(row)?;
+                pages.extend(self.parts[part].pages(local)?.map(|page| (part, page)));
+            }
+            pages.sort_unstable();
+            pages.dedup();
+            resident.resize(pages.len(), false);
+            let mut at = 0;
+            while at < pages.len() {
+                let part = pages[at].0;
+                let end = at + pages[at..].partition_point(|&(index, _)| index == part);
+                uring::resident(&self.parts[part], &pages[at..end], &mut resident[at..end], mincore)?;
+                at = end;
+            }
+            rows.iter().map(|&row| {
+                let (part, local) = self.locate(row)?;
+                Ok(self.parts[part].pages(local)?.all(|page| {
+                    resident[pages.binary_search(&(part, page)).expect("requested page collected")]
+                }))
+            }).collect::<Result<Vec<_>>>()
+        })?;
+        (if prefetch { &self.stats.prefetch_residency_ns } else { &self.stats.residency_ns })
+            .fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        Ok(hits)
+    }
+
+    fn record_residency(&self, rows: &[u64]) -> Result<()> {
+        let hits = self.residency(rows, false)?;
+        let mut stats = uring::ReadStats::default();
+        for (&row, hit) in rows.iter().zip(hits) {
+            if hit {
+                stats.hits += 1;
+                stats.hit_bytes += self.row_bytes() as u64;
+            } else {
+                let (part, local) = self.locate(row)?;
+                stats.misses += 1;
+                stats.miss_bytes += self.row_bytes() as u64;
+                stats.device_bytes_estimate += self.parts[part].pages(local)?.count() as u64 * self.parts[part].page_bytes as u64;
+            }
+        }
+        self.stats.record_reads(stats, false);
+        Ok(())
+    }
+
+    fn uring_reads(&self, rows: &[u64], reads: &[uring::Read<'_>], output: &mut [u8], prefetch: bool) -> Result<uring::ReadStats> {
+        let routed = self.backend() == TableBackend::MincoreRouted;
+        let unsupported: Vec<_> = reads.iter().enumerate().filter_map(|(i, read)|
+            (!read.part.nowait.load(Ordering::Relaxed)).then_some(i)).collect();
+        let selected: Vec<_> = unsupported.iter().map(|&i| rows[i]).collect();
+        let mut hits = vec![None; reads.len()];
+        if !selected.is_empty() && (routed || !self.stats.accounting_off.load(Ordering::Relaxed)) {
+            for (index, hit) in unsupported.into_iter().zip(self.residency(&selected, prefetch)?) { hits[index] = Some(hit); }
+        }
+        if routed && hits.contains(&Some(true)) {
+            // Unsupported-file resident rows use mmap; NOWAIT-capable files
+            // retain exact completion-based classification in this mode too.
+            let mut pending = Vec::with_capacity(reads.len());
+            let mut pending_hits = Vec::with_capacity(reads.len());
+            let before = thread_faults();
+            let mut copied = 0;
+            for (read, hit) in reads.iter().zip(hits) {
+                if hit == Some(true) {
+                    let width = self.row_bytes();
+                    output[read.slot * width..(read.slot + 1) * width].copy_from_slice(read.part.row(read.row)?);
+                    copied += 1;
+                } else {
+                    pending.push(uring::Read { part: read.part, row: read.row, slot: read.slot });
+                    pending_hits.push(hit);
+                }
+            }
+            // Minor faults can merely populate PTEs for cached pages. Major
+            // faults during these copies witness late faults, not evicted rows.
+            let late = thread_faults_since(before)[1].max(0) as u64;
+            let mut stats = if pending.is_empty() { uring::ReadStats::default() }
+                else { uring::gather(&pending, output, self.row_bytes(), &pending_hits)? };
+            stats.hits += copied;
+            stats.hit_bytes += copied * self.row_bytes() as u64;
+            stats.resident_copy_rows += copied;
+            stats.late_major_faults += late;
+            return Ok(stats);
+        }
+        uring::gather(reads, output, self.row_bytes(), &hits)
+    }
+
+    pub fn backend(&self) -> TableBackend {
+        self.stats.backend()
+    }
+
+    /// Select an explicit backend, retaining mmap only if ring setup or Read
+    /// is unsupported. Files without NOWAIT use bounded mincore accounting.
+    /// Called before any workers start.
+    pub fn select_backend(&self, requested: TableBackend) {
+        self.select_with_probe(requested, || self.parts.iter().try_for_each(|part| {
+            part.nowait.store(uring::probe(part)?, Ordering::Relaxed);
+            Ok(())
+        }));
+    }
+    fn select_with_probe(&self, requested: TableBackend, probe: impl FnOnce() -> Result<()>) {
+        let result = if requested != TableBackend::Mmap { probe() } else { Ok(()) };
+        let available = result.is_ok();
+        if let Err(error) = result { tracing::warn!(%error, "io_uring unavailable (kernel/filesystem/seccomp); using mmap"); }
+        self.stats.routed.store(requested == TableBackend::MincoreRouted && available, Ordering::Relaxed);
+        self.stats.uring.store(requested != TableBackend::Mmap && available, Ordering::Relaxed);
+        self.stats.nowait.store(self.parts.iter().all(|part| part.nowait.load(Ordering::Relaxed)), Ordering::Relaxed);
+        tracing::info!(backend = %self.backend(), requested = %requested,
+            accounting = self.stats.accounting(),
+            reason = if !available { "io_uring unavailable" } else if requested == TableBackend::Mmap { "explicit override or qualification default" }
+                else if requested == TableBackend::MincoreRouted && !self.stats.nowait.load(Ordering::Relaxed) { "explicit override; resident memcpy and concurrent buffered misses where NOWAIT unsupported" }
+                else if !self.stats.nowait.load(Ordering::Relaxed) { "explicit override; buffered reads with mincore where NOWAIT unsupported" } else { "explicit override; NOWAIT supported" },
+            locality_note = if self.stats.approximate.load(Ordering::Relaxed) { "FUSE-mounted tables use approximate residency accounting; a local ext4/xfs copy with NOWAIT gives exact hit/miss counts" } else { "NOWAIT capability is probed per file" },
+            "mapped table backend");
+    }
+
+    /// Register a weak stats reference; endpoint reads neither own nor touch
+    /// mapped storage. Entries disappear when their table is released.
+    pub fn name_stats(&self, name: impl Into<String>) {
+        let mut registry = TABLES.lock().unwrap_or_else(|p| p.into_inner());
+        registry.retain(|(_, stats)| stats.strong_count() > 0);
+        let weak = Arc::downgrade(&self.stats);
+        registry.retain(|(_, stats)| !stats.ptr_eq(&weak));
+        registry.push((name.into(), weak));
     }
 
     /// Reads the whole table into the page cache and maps it, window by
@@ -466,6 +740,20 @@ impl MappedTable {
                 pages.insert((part, page));
                 if pages.len() > max_pages {
                     return Err(MappedTableError::PageBudget(max_pages));
+                }
+            }
+        }
+        if self.backend() != TableBackend::Mmap && !rows.is_empty() {
+            let mut output = vec![0; rows.len().checked_mul(self.row_bytes()).ok_or_else(|| invalid("prefetch size overflow"))?];
+            let reads: Vec<_> = rows.iter().enumerate().map(|(slot, &row)| {
+                let (part, local) = self.locate(row)?;
+                Ok(uring::Read { part: &self.parts[part], row: local, slot })
+            }).collect::<Result<_>>()?;
+            match self.uring_reads(rows, &reads, &mut output, true) {
+                Ok(stats) => { self.stats.record_reads(stats, true); return Ok(pages.len()); }
+                Err(error) => {
+                    tracing::warn!(%error, "io_uring prefetch unavailable; using mmap advice");
+                    self.stats.uring.store(false, Ordering::Relaxed);
                 }
             }
         }
@@ -521,10 +809,57 @@ pub struct TableStats {
     prefetch_dropped: AtomicU64,
     cache_hits: AtomicU64,
     cache_misses: AtomicU64,
+    uring: AtomicBool,
+    routed: AtomicBool,
+    nowait: AtomicBool,
+    approximate: AtomicBool,
+    accounting_off: AtomicBool,
+    previous: Mutex<TableStatsSnapshot>,
+    interval_max: [AtomicU64; 4],
+    devices: Mutex<Vec<String>>,
+    previous_devices: Mutex<HashMap<String, u64>>,
+    miss_histogram: [AtomicU64; 7],
+    unclassified_rows: AtomicU64,
+    unclassified_bytes: AtomicU64,
+    completion_histogram: [AtomicU64; 7],
+    prefetch_miss_histogram: [AtomicU64; 7],
+    prefetch_unclassified_rows: AtomicU64,
+    prefetch_unclassified_bytes: AtomicU64,
+    prefetch_completion_histogram: [AtomicU64; 7],
+    page_hits: AtomicU64,
+    page_misses: AtomicU64,
+    page_hit_bytes: AtomicU64,
+    miss_request_bytes: AtomicU64,
+    miss_ns: AtomicU64,
+    miss_max_ns: AtomicU64,
+    nowait_ns: AtomicU64,
+    nowait_max_ns: AtomicU64,
+    nowait_batches: AtomicU64,
+    residency_ns: AtomicU64,
+    resident_copy_rows: AtomicU64,
+    late_major_faults: AtomicU64,
+    decode_stall_ns: AtomicU64,
+    decode_steps: AtomicU64,
+    device_bytes_estimate: AtomicU64,
+    prefetch_device_bytes_estimate: AtomicU64,
+    consumer_steps: AtomicU64,
+    prefetch_hits: AtomicU64,
+    prefetch_misses: AtomicU64,
+    prefetch_hit_bytes: AtomicU64,
+    prefetch_miss_request_bytes: AtomicU64,
+    prefetch_miss_ns: AtomicU64,
+    prefetch_miss_max_ns: AtomicU64,
+    prefetch_nowait_ns: AtomicU64,
+    prefetch_nowait_max_ns: AtomicU64,
+    prefetch_nowait_batches: AtomicU64,
+    prefetch_residency_ns: AtomicU64,
+    prefetch_resident_copy_rows: AtomicU64,
+    prefetch_late_major_faults: AtomicU64,
+
 }
 
 /// A point-in-time copy of [`TableStats`]; `since` gives an interval.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct TableStatsSnapshot {
     pub gathers: u64,
     pub rows: u64,
@@ -542,9 +877,70 @@ pub struct TableStatsSnapshot {
     pub prefetch_dropped: u64,
     pub cache_hits: u64,
     pub cache_misses: u64,
+    /// NOWAIT-complete rows, or mincore-resident rows when NOWAIT is unavailable (a snapshot).
+    pub miss_histogram: [u64; 7],
+    pub unclassified_rows: u64,
+    pub unclassified_bytes: u64,
+    pub completion_histogram: [u64; 7],
+    pub prefetch_miss_histogram: [u64; 7],
+    pub prefetch_unclassified_rows: u64,
+    pub prefetch_unclassified_bytes: u64,
+    pub prefetch_completion_histogram: [u64; 7],
+    pub page_hits: u64,
+    pub page_misses: u64,
+    pub page_hit_bytes: u64,
+    pub miss_request_bytes: u64,
+    pub miss_ns: u64,
+    pub miss_max_ns: u64,
+    pub nowait_ns: u64,
+    pub nowait_max_ns: u64,
+    pub nowait_batches: u64,
+    pub residency_ns: u64,
+    #[serde(default)]
+    pub resident_copy_rows: u64,
+    /// Thread-scoped major faults during resident copies; not missed rows.
+    #[serde(default)]
+    pub late_major_faults: u64,
+    pub decode_stall_ns: u64,
+    pub decode_steps: u64,
+    /// Miss-row page spans (may double-count shared pages), not measured physical I/O.
+    pub device_bytes_estimate: u64,
+    /// Miss-row page spans (may double-count shared pages), not measured physical I/O.
+    pub prefetch_device_bytes_estimate: u64,
+    pub consumer_steps: u64,
+    pub prefetch_hits: u64,
+    pub prefetch_misses: u64,
+    pub prefetch_hit_bytes: u64,
+    pub prefetch_miss_request_bytes: u64,
+    pub prefetch_miss_ns: u64,
+    pub prefetch_miss_max_ns: u64,
+    pub prefetch_nowait_ns: u64,
+    pub prefetch_nowait_max_ns: u64,
+    pub prefetch_nowait_batches: u64,
+    pub prefetch_residency_ns: u64,
+    #[serde(default)]
+    pub prefetch_resident_copy_rows: u64,
+    #[serde(default)]
+    pub prefetch_late_major_faults: u64,
+
 }
 
 impl TableStats {
+    fn backend(&self) -> TableBackend {
+        if !self.uring.load(Ordering::Relaxed) { TableBackend::Mmap }
+        else if self.routed.load(Ordering::Relaxed) { TableBackend::MincoreRouted }
+        else { TableBackend::Uring }
+    }
+    fn accounting(&self) -> &'static str {
+        if self.uring.load(Ordering::Relaxed) && self.nowait.load(Ordering::Relaxed) { "nowait-exact" }
+        else if self.backend() == TableBackend::MincoreRouted {
+            if self.approximate.load(Ordering::Relaxed) { "fuse: mincore-routed (approx)" } else { "mincore-routed" }
+        }
+        else if self.uring.load(Ordering::Relaxed) && self.accounting_off.load(Ordering::Relaxed) { "unclassified completion latency (mincore off)" }
+        else if self.approximate.load(Ordering::Relaxed) { "fuse: mincore (approx)" }
+        else { "mincore" }
+    }
+
     /// One gather batch: rows and bytes copied, time on the gathering threads
     /// and their fault deltas (negative deltas, from failed queries, are skipped).
     pub fn record_gather(&self, rows: usize, bytes: usize, elapsed: Duration, faults: [i64; 3]) {
@@ -562,7 +958,12 @@ impl TableStats {
         }
     }
     pub fn record_stall(&self, elapsed: Duration) {
+        self.consumer_steps.fetch_add(1, Ordering::Relaxed);
         self.stall_ns.fetch_add(elapsed.as_nanos() as u64, Ordering::Relaxed);
+    }
+    pub fn record_decode_stall(&self, elapsed: Duration) {
+        self.decode_steps.fetch_add(1, Ordering::Relaxed);
+        self.decode_stall_ns.fetch_add(elapsed.as_nanos() as u64, Ordering::Relaxed);
     }
     pub fn record_prefetch(&self, pages: usize) {
         self.prefetch_jobs.fetch_add(1, Ordering::Relaxed);
@@ -574,6 +975,51 @@ impl TableStats {
     pub fn record_cache(&self, hits: usize, misses: usize) {
         self.cache_hits.fetch_add(hits as u64, Ordering::Relaxed);
         self.cache_misses.fetch_add(misses as u64, Ordering::Relaxed);
+    }
+    fn record_reads(&self, reads: uring::ReadStats, prefetch: bool) {
+        let (copied, late) = if prefetch { (&self.prefetch_resident_copy_rows, &self.prefetch_late_major_faults) }
+            else { (&self.resident_copy_rows, &self.late_major_faults) };
+        copied.fetch_add(reads.resident_copy_rows, Ordering::Relaxed);
+        late.fetch_add(reads.late_major_faults, Ordering::Relaxed);
+        let (rows, bytes, completions) = if prefetch {
+            (&self.prefetch_unclassified_rows, &self.prefetch_unclassified_bytes, &self.prefetch_completion_histogram)
+        } else { (&self.unclassified_rows, &self.unclassified_bytes, &self.completion_histogram) };
+        rows.fetch_add(reads.unclassified_rows, Ordering::Relaxed);
+        bytes.fetch_add(reads.unclassified_bytes, Ordering::Relaxed);
+        for (counter, value) in completions.iter().zip(reads.completion_histogram) { counter.fetch_add(value, Ordering::Relaxed); }
+        let counters = if prefetch {
+            [&self.prefetch_hits, &self.prefetch_misses, &self.prefetch_hit_bytes, &self.prefetch_miss_request_bytes,
+             &self.prefetch_miss_ns, &self.prefetch_nowait_ns, &self.prefetch_nowait_batches]
+        } else {
+            [&self.page_hits, &self.page_misses, &self.page_hit_bytes, &self.miss_request_bytes,
+             &self.miss_ns, &self.nowait_ns, &self.nowait_batches]
+        };
+        let device = if prefetch { &self.prefetch_device_bytes_estimate } else { &self.device_bytes_estimate };
+        device.fetch_add(reads.device_bytes_estimate, Ordering::Relaxed);
+        for (counter, value) in counters.into_iter().zip([reads.hits, reads.misses, reads.hit_bytes, reads.miss_bytes,
+            reads.miss_ns, reads.nowait_ns, reads.nowait_batches]) { counter.fetch_add(value, Ordering::Relaxed); }
+        let (histogram, max, nowait_max) = if prefetch {
+            (&self.prefetch_miss_histogram, &self.prefetch_miss_max_ns, &self.prefetch_nowait_max_ns)
+        } else { (&self.miss_histogram, &self.miss_max_ns, &self.nowait_max_ns) };
+        for (counter, value) in histogram.iter().zip(reads.miss_histogram) { counter.fetch_add(value, Ordering::Relaxed); }
+        let base = if prefetch { 2 } else { 0 };
+        self.interval_max[base].fetch_max(reads.miss_max_ns, Ordering::Relaxed);
+        self.interval_max[base + 1].fetch_max(reads.nowait_max_ns, Ordering::Relaxed);
+        max.fetch_max(reads.miss_max_ns, Ordering::Relaxed);
+        nowait_max.fetch_max(reads.nowait_max_ns, Ordering::Relaxed);
+    }
+    /// Interval maxima are reset only by the serving stats publisher. Ordinary
+    /// readers (console and benches) use the non-destructive cumulative view.
+    fn interval(&self) -> TableStatsSnapshot {
+        let mut before = self.previous.lock().unwrap_or_else(|p| p.into_inner());
+        let now = self.snapshot();
+        let mut delta = now.since(&before);
+        delta.miss_max_ns = self.interval_max[0].swap(0, Ordering::Relaxed);
+        delta.nowait_max_ns = self.interval_max[1].swap(0, Ordering::Relaxed);
+        delta.prefetch_miss_max_ns = self.interval_max[2].swap(0, Ordering::Relaxed);
+        delta.prefetch_nowait_max_ns = self.interval_max[3].swap(0, Ordering::Relaxed);
+        *before = now;
+        delta
     }
     pub fn snapshot(&self) -> TableStatsSnapshot {
         let get = |counter: &AtomicU64| counter.load(Ordering::Relaxed);
@@ -591,6 +1037,44 @@ impl TableStats {
             prefetch_dropped: get(&self.prefetch_dropped),
             cache_hits: get(&self.cache_hits),
             cache_misses: get(&self.cache_misses),
+            miss_histogram: std::array::from_fn(|i| get(&self.miss_histogram[i])),
+            unclassified_rows: get(&self.unclassified_rows),
+            unclassified_bytes: get(&self.unclassified_bytes),
+            completion_histogram: std::array::from_fn(|i| get(&self.completion_histogram[i])),
+            prefetch_miss_histogram: std::array::from_fn(|i| get(&self.prefetch_miss_histogram[i])),
+            prefetch_unclassified_rows: get(&self.prefetch_unclassified_rows),
+            prefetch_unclassified_bytes: get(&self.prefetch_unclassified_bytes),
+            prefetch_completion_histogram: std::array::from_fn(|i| get(&self.prefetch_completion_histogram[i])),
+            page_hits: get(&self.page_hits),
+            page_misses: get(&self.page_misses),
+            page_hit_bytes: get(&self.page_hit_bytes),
+            miss_request_bytes: get(&self.miss_request_bytes),
+            miss_ns: get(&self.miss_ns),
+            miss_max_ns: get(&self.miss_max_ns),
+            nowait_ns: get(&self.nowait_ns),
+            nowait_max_ns: get(&self.nowait_max_ns),
+            nowait_batches: get(&self.nowait_batches),
+            residency_ns: get(&self.residency_ns),
+            resident_copy_rows: get(&self.resident_copy_rows),
+            late_major_faults: get(&self.late_major_faults),
+            decode_stall_ns: get(&self.decode_stall_ns),
+            decode_steps: get(&self.decode_steps),
+            device_bytes_estimate: get(&self.device_bytes_estimate),
+            prefetch_device_bytes_estimate: get(&self.prefetch_device_bytes_estimate),
+            consumer_steps: get(&self.consumer_steps),
+            prefetch_hits: get(&self.prefetch_hits),
+            prefetch_misses: get(&self.prefetch_misses),
+            prefetch_hit_bytes: get(&self.prefetch_hit_bytes),
+            prefetch_miss_request_bytes: get(&self.prefetch_miss_request_bytes),
+            prefetch_miss_ns: get(&self.prefetch_miss_ns),
+            prefetch_miss_max_ns: get(&self.prefetch_miss_max_ns),
+            prefetch_nowait_ns: get(&self.prefetch_nowait_ns),
+            prefetch_nowait_max_ns: get(&self.prefetch_nowait_max_ns),
+            prefetch_nowait_batches: get(&self.prefetch_nowait_batches),
+            prefetch_residency_ns: get(&self.prefetch_residency_ns),
+            prefetch_resident_copy_rows: get(&self.prefetch_resident_copy_rows),
+            prefetch_late_major_faults: get(&self.prefetch_late_major_faults),
+
         }
     }
 }
@@ -612,14 +1096,51 @@ impl TableStatsSnapshot {
             prefetch_dropped: d(self.prefetch_dropped, earlier.prefetch_dropped),
             cache_hits: d(self.cache_hits, earlier.cache_hits),
             cache_misses: d(self.cache_misses, earlier.cache_misses),
+            miss_histogram: std::array::from_fn(|i| d(self.miss_histogram[i], earlier.miss_histogram[i])),
+            unclassified_rows: d(self.unclassified_rows, earlier.unclassified_rows),
+            unclassified_bytes: d(self.unclassified_bytes, earlier.unclassified_bytes),
+            completion_histogram: std::array::from_fn(|i| d(self.completion_histogram[i], earlier.completion_histogram[i])),
+            prefetch_miss_histogram: std::array::from_fn(|i| d(self.prefetch_miss_histogram[i], earlier.prefetch_miss_histogram[i])),
+            prefetch_unclassified_rows: d(self.prefetch_unclassified_rows, earlier.prefetch_unclassified_rows),
+            prefetch_unclassified_bytes: d(self.prefetch_unclassified_bytes, earlier.prefetch_unclassified_bytes),
+            prefetch_completion_histogram: std::array::from_fn(|i| d(self.prefetch_completion_histogram[i], earlier.prefetch_completion_histogram[i])),
+            page_hits: d(self.page_hits, earlier.page_hits),
+            page_misses: d(self.page_misses, earlier.page_misses),
+            page_hit_bytes: d(self.page_hit_bytes, earlier.page_hit_bytes),
+            miss_request_bytes: d(self.miss_request_bytes, earlier.miss_request_bytes),
+            miss_ns: d(self.miss_ns, earlier.miss_ns),
+            miss_max_ns: self.miss_max_ns, // cumulative maximum, not an interval maximum
+            nowait_ns: d(self.nowait_ns, earlier.nowait_ns),
+            nowait_max_ns: self.nowait_max_ns, // cumulative maximum, not an interval maximum
+            nowait_batches: d(self.nowait_batches, earlier.nowait_batches),
+            residency_ns: d(self.residency_ns, earlier.residency_ns),
+            resident_copy_rows: d(self.resident_copy_rows, earlier.resident_copy_rows),
+            late_major_faults: d(self.late_major_faults, earlier.late_major_faults),
+            decode_stall_ns: d(self.decode_stall_ns, earlier.decode_stall_ns),
+            decode_steps: d(self.decode_steps, earlier.decode_steps),
+            device_bytes_estimate: d(self.device_bytes_estimate, earlier.device_bytes_estimate),
+            prefetch_device_bytes_estimate: d(self.prefetch_device_bytes_estimate, earlier.prefetch_device_bytes_estimate),
+            consumer_steps: d(self.consumer_steps, earlier.consumer_steps),
+            prefetch_hits: d(self.prefetch_hits, earlier.prefetch_hits),
+            prefetch_misses: d(self.prefetch_misses, earlier.prefetch_misses),
+            prefetch_hit_bytes: d(self.prefetch_hit_bytes, earlier.prefetch_hit_bytes),
+            prefetch_miss_request_bytes: d(self.prefetch_miss_request_bytes, earlier.prefetch_miss_request_bytes),
+            prefetch_miss_ns: d(self.prefetch_miss_ns, earlier.prefetch_miss_ns),
+            prefetch_miss_max_ns: self.prefetch_miss_max_ns, // cumulative maximum, not an interval maximum
+            prefetch_nowait_ns: d(self.prefetch_nowait_ns, earlier.prefetch_nowait_ns),
+            prefetch_nowait_max_ns: self.prefetch_nowait_max_ns, // cumulative maximum, not an interval maximum
+            prefetch_nowait_batches: d(self.prefetch_nowait_batches, earlier.prefetch_nowait_batches),
+            prefetch_residency_ns: d(self.prefetch_residency_ns, earlier.prefetch_residency_ns),
+            prefetch_resident_copy_rows: d(self.prefetch_resident_copy_rows, earlier.prefetch_resident_copy_rows),
+            prefetch_late_major_faults: d(self.prefetch_late_major_faults, earlier.prefetch_late_major_faults),
+
         }
     }
     /// Rows served without a major fault (page cache or hot-row cache), 0..1.
     pub fn resident_rate(&self) -> f64 {
-        if self.rows == 0 {
-            return 1.0;
-        }
-        1.0 - (self.major_faults as f64 / self.rows as f64).min(1.0)
+        let rows = self.page_hits + self.page_misses;
+        if rows == 0 { return 1.0; }
+        self.page_hits as f64 / rows as f64
     }
     pub fn cache_hit_rate(&self) -> Option<f64> {
         let total = self.cache_hits + self.cache_misses;
@@ -828,6 +1349,12 @@ impl GatherPool {
         let chunk = misses.len().div_ceil(self.threads * 4).max(1);
         let base = output.as_mut_ptr() as usize;
         let output_len = output.len();
+        if table.backend() != TableBackend::Mmap {
+            let selected: Vec<_> = misses.iter().map(|&index| rows[index]).collect();
+            table.gather_slots(&selected, &misses, output)?;
+        } else {
+        let selected: Vec<_> = misses.iter().map(|&index| rows[index]).collect();
+        table.record_residency(&selected)?;
         self.pool.install(|| {
             misses.par_chunks(chunk).try_for_each(|indices| -> Result<()> {
                 let before = thread_faults();
@@ -850,6 +1377,7 @@ impl GatherPool {
                 Ok(())
             })
         })?;
+        }
         if let Some(cache) = cache {
             cache.insert(misses.iter().map(|&index| (rows[index], &output[index * row_bytes..(index + 1) * row_bytes])));
             table.stats.record_cache(hits, misses.len());

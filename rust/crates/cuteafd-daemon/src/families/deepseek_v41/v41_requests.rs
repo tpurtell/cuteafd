@@ -351,7 +351,8 @@ impl<'a> Requests<'a> {
             tokens.extend_from_slice(r.tokens);
             mask.extend((0..r.tokens.len()).map(|i| u8::from(image_mask.is_some_and(|m| m[i]))));
         }
-        let engram = self.pipeline.prepare(&inputs)?;
+        let mut engram = self.pipeline.prepare(&inputs)?;
+        engram.set_decode(requests.iter().any(|r| r.kind != ExpertV2SourceKind::Prefill));
         Ok(RequestBatch {
             cache,
             prepared: Vec::new(),

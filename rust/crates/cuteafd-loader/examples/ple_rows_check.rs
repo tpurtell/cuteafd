@@ -25,7 +25,7 @@ fn main() -> Result<()> {
     let tensors: Vec<_> = shards.iter().map(|t| (t.shard.as_str(), &t.meta)).collect();
     // SAFETY: the checkpoint snapshot is immutable while this process runs.
     let table = unsafe { MappedTable::from_tensors(snapshot, &tensors)? };
-    println!("mapped {} parts, {} rows x {} B ({:.1} GiB) in {:.3}s", table.part_count(), table.rows(),
+    println!("mapped backend={} {} parts, {} rows x {} B ({:.1} GiB) in {:.3}s", table.backend(), table.part_count(), table.rows(),
         table.row_bytes(), table.bytes() as f64 / (1u64 << 30) as f64, opened.elapsed().as_secs_f64());
     let hasher = NgramHasher::from_config(cfg.vocab_size, 20_000_000, cfg.ngram_size, cfg.heads_per_ngram, 0, 1234,
         cfg.eos);
@@ -93,5 +93,6 @@ fn main() -> Result<()> {
         println!("{tokens} tokens ({n} rows): inline {:.1} us, pool {:.1} us, spawn+wait {:.1} us per step",
             us(inline), us(pooled), us(spawned));
     }
+    println!("table stats: {}", serde_json::to_string(&table.stats().snapshot())?);
     Ok(())
 }

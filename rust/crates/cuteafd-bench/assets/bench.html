@@ -422,9 +422,19 @@ function tableFor(id, comparedResult = null) {
       }).join('');
   }
   return (r.passes || []).map((pass, i) => {
-    if (pass && pass.table) return `<h3 class="label">pass ${i + 1}</h3>` + tableHtml(pass.table.columns, pass.table.rows);
+    const tables = pass?.mapped_tables || [];
+    const mapped = tables.length ? '<h3>Mapped tables</h3><p>Pass interval. Device bytes are estimates; host-wide reads include unrelated I/O.</p>'
+      + tableHtml(['table / backend', 'miss tiers: <5 / 5-10 / 10-50 / 50-200 us / 0.2-1 / 1-10 / >=10 ms', 'hit %', 'hits / misses', 'hit MiB', 'miss-request MiB', 'avg miss us', 'stall ms / decode step', 'device MiB (estimate)'], tables.map(t => {
+        const n = t.interval || {}, hits = n.page_hits || 0, misses = n.page_misses || 0, unknown = n.unclassified_rows || 0;
+        return [`${t.name} / ${t.backend} (${t.accounting})`, t.backend !== 'mmap' ? ((unknown ? n.completion_histogram : n.miss_histogram) || []).join(' / ') : '-', hits + misses ? (100 * hits / (hits + misses)).toFixed(1) : '-',
+          `${hits} / ${misses}${unknown ? ` (+${unknown} unclassified)` : ''}`, ((n.page_hit_bytes || 0) / 1048576).toFixed(2), ((n.miss_request_bytes || 0) / 1048576).toFixed(2),
+          t.backend !== 'mmap' && misses ? ((n.miss_ns || 0) / misses / 1000).toFixed(1) : '-',
+          n.decode_steps ? ((n.decode_stall_ns || 0) / n.decode_steps / 1e6).toFixed(3) : '-',
+          ((n.device_bytes_estimate || 0) / 1048576).toFixed(2)];
+      })) : '';
+    if (pass && pass.table) return `<h3 class="label">pass ${i + 1}</h3>` + tableHtml(pass.table.columns, pass.table.rows) + mapped;
     const rows = Object.entries(pass || {}).filter(([, v]) => typeof v !== 'object').map(([k, v]) => [k, v]);
-    return `<h3 class="label">pass ${i + 1}</h3>` + tableHtml(['field', 'value'], rows);
+    return `<h3 class="label">pass ${i + 1}</h3>` + tableHtml(['field', 'value'], rows) + mapped;
   }).join('') + (r.error ? `<p class="banner">${fmt.esc(r.error)}</p>` : '');
 }
 
