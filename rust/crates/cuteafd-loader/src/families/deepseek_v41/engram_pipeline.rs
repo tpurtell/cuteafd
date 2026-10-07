@@ -240,10 +240,7 @@ impl EngramPipeline {
                 wave.waiting[layer].get_or_insert_with(std::time::Instant::now);
             } else if matches!(result, EngramGatherPoll::Ready(_)) {
                 let elapsed = wave.waiting[layer].take().map_or(std::time::Duration::ZERO, |t| t.elapsed());
-                for table in [self.tables[layer].weights(), self.tables[layer].scales()] {
-                    table.stats().record_stall(elapsed);
-                    if wave.decode { table.stats().record_decode_stall(elapsed); }
-                }
+                record_layer_wait(&self.tables[layer], elapsed, wave.decode);
             }
             if !matches!(result, EngramGatherPoll::Pending) {
                 wave.layers[layer] = LayerIo::Consumed;
@@ -254,5 +251,38 @@ impl EngramPipeline {
             wave.cancel();
         }
         result
+    }
+}
+
+// A lease contains both weight and scale rows. Its consumer wait belongs to
+// the layer/pair, not each tensor; store it on weights so totals never double.
+fn record_layer_wait(table: &EngramTable, elapsed: std::time::Duration, decode: bool) {
+    table.weights().stats().record_stall(elapsed);
+    if decode { table.weights().stats().record_decode_stall(elapsed); }
+}
+
+#[cfg(test)]
+mod wait_tests {
+    use super::*;
+    #[test]
+    fn layer_wait_is_recorded_once_for_weight_scale_pair() -> Result<()> {
+        let weights = tempfile::NamedTempFile::new()?;
+        let scales = tempfile::NamedTempFile::new()?;
+        weights.as_file().set_len(cuteafd_core::ENGRAM_ROWS[0] * 256)?;
+        scales.as_file().set_len(cuteafd_core::ENGRAM_ROWS[0] * 8)?;
+        // SAFETY: owned immutable sparse fixtures remain live through the maps.
+        let map = |file: &tempfile::NamedTempFile, width| unsafe {
+            crate::MappedTable::single(file.path(), 0, cuteafd_core::ENGRAM_ROWS[0],
+                crate::RowFormat { dtype: cuteafd_core::DType::U8, width, row_bytes: width })
+        };
+        let table = EngramTable::new(map(&weights, 256)?, map(&scales, 8)?)?;
+        record_layer_wait(&table, std::time::Duration::from_micros(7), true);
+        record_layer_wait(&table, std::time::Duration::from_micros(3), false);
+        let weight = table.weights().stats().snapshot();
+        let scale = table.scales().stats().snapshot();
+        assert_eq!((weight.consumer_steps, weight.stall_ns), (2, 10_000));
+        assert_eq!((weight.decode_steps, weight.decode_stall_ns), (1, 7_000));
+        assert_eq!((scale.consumer_steps, scale.stall_ns, scale.decode_steps, scale.decode_stall_ns), (0, 0, 0, 0));
+        Ok(())
     }
 }
