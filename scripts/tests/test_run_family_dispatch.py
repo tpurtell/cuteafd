@@ -1150,6 +1150,26 @@ def test_mimo_encoder_plan_hash_and_selected_rank(tmp_path, mode, kind):
         assert f"--vision {mode or 'auto'}" in preflight
 
 
+@pytest.mark.parametrize("warm", [False, True])
+def test_mimo_warm_marks_reach_startup_layout(tmp_path, warm):
+    config = {"model_type": "mimo_v2_flash", "num_hidden_layers": 2,
+              "moe_layer_freq": [0, 1], "vision_config": {"depth": 28}}
+    plan = {"placement_supported": True, "fits": True, "spark_ranks": 1,
+            "encoder_plan_hash": "ab" * 32,
+            "encoder": {"kind": {"kind": "rtx", "gpu": 0}, "replicas": []}}
+    keys = "VISION=rtx\nAUDIO=off\nRTX_GPUS=1\nSPECULATOR=off\nCONCURRENCY=16\nMAX_CONTEXT_TOKENS=131072\n"
+    keys += f"MIMO_PREFIX_DRAFT={'on' if warm else 'off'}\n"
+    result = _family_launch_result(tmp_path, config, "test/mimo", keys, encoder_plan=plan)
+    assert result.returncode == 0, result.stderr
+    preflight = next(line for line in result.stderr.splitlines() if "cuteafd plan" in line)
+    launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-mimo" in line)
+    assert ("--mimo-prefix-draft" in preflight) == warm
+    assert ("--mimo-prefix-draft" in launch) == warm
+    if warm:
+        assert "--concurrency 16" in preflight
+        assert "--context-tokens 131072" in preflight
+
+
 @pytest.mark.parametrize("vision_kind,audio_kind", [("off", "spark"), ("spark", "spark"), ("rtx", "spark"), ("spark", "rtx"), ("rtx", "rtx")])
 def test_mimo_audio_independent_planner_peers_backend_and_rtx_fallback(tmp_path, vision_kind, audio_kind):
     config = {"model_type": "mimo_v2", "hidden_size": 4096, "num_hidden_layers": 2, "moe_layer_freq": [0, 1],

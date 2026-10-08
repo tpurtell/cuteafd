@@ -783,7 +783,8 @@ impl Opened {
                 }
             }
         }
-        let preflight = admission::preflight(self, args, &programs, split_device, serving, prefill_output, false)?;
+        let prefix_draft = serving.is_some_and(|(prefix, _)| prefix.mimo_prefix_draft);
+        let preflight = admission::preflight(self, args, &programs, split_device, serving, prefill_output, prefix_draft)?;
         // Module allocation is checked against its provisional bound before
         // tensors. It does not qualify later capture or constraint demand.
         for sample in &preflight.memory {
