@@ -293,8 +293,9 @@ impl Opened {
         let pool_tokens = if args.full_prefill_logits || args.pool_tokens == 0 || cuteafd_ffi::coordinator_gpu_budget().is_some() {
             // The planner's GLM costs stay free on each GPU; records fill the rest.
             let devices: Vec<i32> = std::iter::once(args.device).chain(peer_stream.map(|(d, _)| d)).collect();
+            // GLM 5.3's pages are its whole state: no recurrent slots, no mark arena.
             crate::shared::memory_report::planned_pool_tokens_with_reserves(&self.library, &args.snapshot, &devices,
-                args.draft.as_deref(), args.prefill_rows, 0,
+                args.draft.as_deref(), args.prefill_rows, 0, 0,
                 (args.pool_tokens > 0).then_some(args.pool_tokens as u64), 0,
                 &crate::shared::memory_report::lead_reserves(devices.len(),
                     if args.full_prefill_logits { cuteafd_loader::plan::layout::full_prefill_logits_bytes_with_lanes(

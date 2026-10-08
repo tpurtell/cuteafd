@@ -8,6 +8,9 @@
 //!
 //! Identity: a page index is reused after it is freed, so every free bumps the index's
 //! generation. `(index, generation)` names one allocation for the host tier's page sharing.
+//!
+//! Reserved pages ([`RefPagePool::with_reserved`]): the leading page indices that no allocation
+//! ever hands out, so they keep whatever the family put there at start-up.
 use thiserror::Error;
 
 /// Not enough free pages; nothing was allocated.
@@ -44,27 +47,43 @@ pub struct FreedPage {
 pub struct RefPagePool {
     refs: Vec<u32>,
     generation: Vec<u32>,
-    /// Free indices; popped from the end, so a fresh pool hands out 0, 1, 2, ...
+    /// Free indices; popped from the end, so a fresh pool hands out its first unreserved page,
+    /// then the next, ...
     free: Vec<u32>,
+    /// Leading page indices never handed out.
+    reserved: usize,
     page_rows: usize,
     release_epoch: u64,
 }
 
 impl RefPagePool {
     pub fn new(pages: usize, page_rows: usize) -> Self {
+        Self::with_reserved(pages, page_rows, 0)
+    }
+
+    /// A pool of `pages` page indices whose first `reserved` are never handed out (they keep
+    /// whatever the family wrote there at start-up).
+    pub fn with_reserved(pages: usize, page_rows: usize, reserved: usize) -> Self {
         assert!(page_rows > 0, "pages hold at least one row");
-        let pages = u32::try_from(pages).expect("page count fits u32");
+        assert!(reserved <= pages, "{reserved} reserved pages of {pages}");
+        let (pages, first) = (u32::try_from(pages).expect("page count fits u32"), reserved as u32);
         Self {
             refs: vec![0; pages as usize],
             generation: vec![0; pages as usize],
-            free: (0..pages).rev().collect(),
+            free: (first..pages).rev().collect(),
+            reserved,
             page_rows,
             release_epoch: 0,
         }
     }
 
+    /// Pages the pool can hand out (reserved ones excluded).
     pub fn capacity(&self) -> usize {
-        self.refs.len()
+        self.refs.len() - self.reserved
+    }
+    /// Leading page indices never handed out.
+    pub fn reserved(&self) -> usize {
+        self.reserved
     }
     pub fn free(&self) -> usize {
         self.free.len()
@@ -185,6 +204,24 @@ mod tests {
         assert_eq!((pool.refs(0), pool.generation(1)), (1, 1));
         assert_eq!(pool.release(&a[..1]), vec![FreedPage { index: 0, generation: 0 }]);
         assert_eq!(pool.free(), 4);
+    }
+
+    #[test]
+    fn reserved_pages_are_never_handed_out() {
+        let mut pool = RefPagePool::with_reserved(5, 64, 1);
+        assert_eq!((pool.capacity(), pool.free(), pool.reserved()), (4, 4, 1));
+        let a = pool.alloc(4).unwrap();
+        assert_eq!(a, vec![1, 2, 3, 4]);
+        assert_eq!(pool.alloc(1), Err(PoolExhausted { needed: 1, free: 0, capacity: 4 }));
+        pool.release(&a);
+        // Freed pages come back in any order; page 0 never does.
+        let b = pool.alloc(4).unwrap();
+        assert!(!b.contains(&0) && pool.used() == 4, "{b:?}");
+        let fork = pool.fork(&b, 100, 3);
+        assert!(fork.is_err(), "a fork needs two fresh pages and none is free");
+        pool.release(&b);
+        assert_eq!(pool.free(), 4);
+        assert_eq!(RefPagePool::new(3, 64).capacity(), 3);
     }
 
     #[test]

@@ -774,6 +774,18 @@ if [[ $family == glm5_flash ]]; then
       spark_worker_args+=" --exl3-schedule gb10" ;;
     *) echo "GLM5_FLASH_EXL3_SCHEDULE must be default or gb10" >&2; exit 2 ;;
   esac
+  # GLM5_FLASH_PREFIX_MARKS: where prefix-cache snapshots keep their KDA state marks: unset or
+  # arena (the engine default: a 2C + 2 device arena beside the KV pool) or pool (units of the
+  # KV pool itself, evicted like any snapshot's rows, unit 0 reserved; no arena to reserve). Pool
+  # marks turn the pinned host tier on (HOST_CACHE_BYTES=auto) unless HOST_CACHE_BYTES is set (0
+  # keeps it off): snapshots the pool evicts move to RAM instead of being lost.
+  prefix_marks="$(get GLM5_FLASH_PREFIX_MARKS)"
+  case "$prefix_marks" in
+    "") ;;
+    arena|pool) family_args+=(--prefix-marks "$prefix_marks") ;;
+    *) echo "GLM5_FLASH_PREFIX_MARKS must be arena or pool" >&2; exit 2 ;;
+  esac
+  [[ "$prefix_marks" != pool || -n "$(get HOST_CACHE_BYTES)" ]] || family_args+=(--host-cache-bytes auto)
   # GLM5_FLASH_REPLAY_RECORDS: where the KDA speculative replay records live, own (default: their
   # own 321 MB) or shared (the prefill lanes' scratch, which no decode step reads). One GPU whose
   # pool is sized from measured memory (an automatic pool with Spark experts).
@@ -855,6 +867,8 @@ if { [[ ( "$family" == mimo_v2 || "$family" == qwen4 || "$family" == glm5_flash 
       plan_draft_args+=(--mimo-prefix-draft --context-tokens "$(get MAX_CONTEXT_TOKENS 131072)")
     fi
   fi
+  # GLM 5.3 Flash: the server's prefix-mark store, so the plan reserves an arena only when serve-glmf allocates one.
+  [[ "$family" != glm5_flash || -z "${prefix_marks:-}" ]] || plan_draft_args+=(--prefix-marks "$prefix_marks")
   plan_json="$(docker run --rm --network none -v "$hub:/root/.cache/huggingface/hub:ro" "${wip_mount_args[@]}" \
     "$coordinator_image" cuteafd plan "$snapshot" --vision "$vision" --audio "$audio" --json --layout \
     --spark-ranks "$ranks" --spark-budget-gib "$(python3 -c 'import sys;print(int(sys.argv[1])/2**30)' "$budget")" \

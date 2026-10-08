@@ -271,6 +271,10 @@ pub(crate) struct PlanArgs {
     /// Explicit MiMo drafter context arena for --layout.
     #[arg(long)]
     pub(crate) draft_context_slots: Option<u64>,
+    /// GLM 5.3 Flash's prefix marks for --layout (`pool`: in pool units, no arena, one reserved
+    /// unit beside the pool).
+    #[arg(long, value_enum, default_value = "arena")]
+    pub(crate) prefix_marks: crate::families::glm5_flash::prefix::PrefixMarks,
     /// Native drafter stages, 0 disables the native drafter.
     #[arg(long, default_value_t = 3)]
     pub(crate) native_mtp_layers: usize,

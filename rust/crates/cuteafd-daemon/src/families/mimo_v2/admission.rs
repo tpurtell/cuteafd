@@ -177,6 +177,7 @@ pub(super) fn preflight(
                 mark_bytes: usize::try_from(mark_bytes)?,
                 draft_bytes: 0,
                 rule: cuteafd_engine::prefix::ReuseRule::EXACT,
+                mark_store: cuteafd_engine::prefix::MarkStore::Arena,
             };
             prefix.host_config(layout, args.max_context)?
         }

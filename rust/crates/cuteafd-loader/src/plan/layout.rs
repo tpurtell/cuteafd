@@ -48,6 +48,9 @@ pub struct LayoutOptions {
     /// where the engine admits from measured memory (one GPU, Spark experts, an automatic pool),
     /// else in its place only when larger.
     pub graph_budget_bytes: Option<u64>,
+    /// GLM 5.3 Flash's prefix marks in pool units (`--prefix-marks pool`): no mark arena, and
+    /// `GLMF_POOL_MARK_RESERVED_UNITS` units allocated beside the pool and never handed out.
+    pub glmf_pool_marks: bool,
     /// GLM 5.3 Flash's KDA replay records in the prefill lanes' scratch (`--replay-records shared`):
     /// out of the state, and the scratch holds at least them. The engine takes them only where it
     /// sizes the pool from measured memory (one GPU, Spark experts, an automatic pool).
@@ -104,6 +107,7 @@ impl Default for LayoutOptions {
             full_prefill_logits: false,
             prefill_lanes: 0,
             graph_budget_bytes: None,
+            glmf_pool_marks: false,
             glmf_shared_replay: false,
             spark_capacity_rows: 4096,
             pool_tokens: None,
@@ -290,7 +294,6 @@ pub fn family_costs(family: &str) -> FamilyCosts {
             graph_bytes: [gib(150), gib(150), gib(150)],
             workspace_bytes: [gib(268), gib(472), gib(472)],
             drafter_bytes: gib(324),
-            mark_slots: 18,
             mtp_resident: false,
             spark_workspace_bytes: gib(56),
             spark_ring_bytes: gib(78),
@@ -809,16 +812,18 @@ pub fn layout(report: &mut PlanReport, model: &dyn super::FamilyModel, checkpoin
                         .and_then(|draft| mimo_draft_prefix_bytes(&draft, 1, options.mimo_rings.max(concurrency))))
                 } else { None }
             } else { None };
-            let marks = options.prefix_slots.unwrap_or_else(|| {
+            let pool_marks = family == "glm5_flash" && options.glmf_pool_marks;
+            let marks = if pool_marks { 0 } else { options.prefix_slots.unwrap_or_else(|| {
                 let bytes: u64 = geometry.ranks.iter().map(|r| r.retained_mark_bytes).sum();
                 if family == "mimo_v2" {
                     let draft = warm_draft.as_ref().and_then(|r| r.as_ref().ok()).map_or(0, |r| r.0);
                     cuteafd_core::prefix::mark_slots_for(concurrency, options.mimo_prefix_entries,
                         bytes.saturating_add(draft), options.mimo_prefix_mark_bytes)
-                } else if matches!(family, "deepseek_v4" | "qwen4") {
+                } else if matches!(family, "deepseek_v4" | "qwen4" | "glm5_flash") {
+                    // The arena the family's server allocates at the default knobs (`MarkArena::slots_for`).
                     42.min((2 * GIB) / bytes.max(1)).max(2 * concurrency + 2)
                 } else { costs.mark_slots }
-            });
+            }) };
             let unit = geometry.logical_unit_rows.max(1);
             let per_token: Vec<u64> = (0..devices.len()).map(|d| geometry.ranks.get(d)
                 .map_or(0, |r| (r.persistent_unit_bytes + r.pool_metadata_unit_bytes).div_ceil(unit))).collect();
@@ -833,6 +838,12 @@ pub fn layout(report: &mut PlanReport, model: &dyn super::FamilyModel, checkpoin
                 if family != "deepseek_v41" && marks > 0 && rank.retained_mark_bytes > 0 {
                     device.items.push(Item::new(Category::Prefix, "marks", "", rank.retained_mark_bytes * marks,
                         Basis::Formula));
+                }
+                // Pool marks: the reserved units beside the pool (never handed out, so outside its tokens).
+                if pool_marks {
+                    device.items.push(Item::new(Category::Prefix, "reserved units", "",
+                        (rank.persistent_unit_bytes + rank.pool_metadata_unit_bytes)
+                            * crate::serving_capacity::GLMF_POOL_MARK_RESERVED_UNITS, Basis::Formula));
                 }
             }
             if let Some(reservation) = warm_draft {

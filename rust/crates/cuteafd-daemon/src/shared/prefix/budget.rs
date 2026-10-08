@@ -133,7 +133,7 @@ mod tests {
     #[test]
     fn auto_never_allocates_more_than_full_retention_or_a_fractional_chunk() -> Result<()> {
         let layout = FamilyLayout { page_rows: 64, pages: 100, page_bytes: 512, mark_bytes: 140,
-            draft_bytes: 0, rule: cuteafd_core::prefix::ReuseRule::EXACT };
+            draft_bytes: 0, rule: cuteafd_core::prefix::ReuseRule::EXACT, mark_store: Default::default() };
         // Five snapshots: 10 page slabs in five chunks; five marks in one.
         assert_eq!(retained_bytes(layout, 2, 65, 1024)?, 6 * 1024);
         let memory = HostMemory { total: 10000, available: 9900 };

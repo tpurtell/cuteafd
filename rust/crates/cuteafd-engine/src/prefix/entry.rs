@@ -40,14 +40,24 @@ pub fn greedy(logits: &[f32]) -> u32 {
     best.map_or(0, |(_, i)| i as u32)
 }
 
+/// Where a snapshot's positional mark lives ([`super::MarkStore`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Mark {
+    /// A slot of the family's device arena.
+    Slot(MarkSlot),
+    /// Pool pages the snapshot owns alone (never shared), in ascending order, which is the
+    /// order the family lays the mark out in.
+    Pages(Vec<u32>),
+}
+
 /// A device snapshot: `tokens.len()` rows of `pages` (every page immutable: full pages are
-/// shared with their writer, the partial tail is the entry's own copy) and a mark slot.
+/// shared with their writer, the partial tail is the entry's own copy) and its mark.
 pub(crate) struct Entry {
     pub tokens: Vec<u32>,
     pub media: Vec<cuteafd_core::MediaSpan>,
     pub kind: SnapshotKind,
     pub pages: Vec<u32>,
-    pub mark: Option<MarkSlot>,
+    pub mark: Option<Mark>,
     pub after: After,
     pub last_use: u64,
     /// The host tier's write-behind copy, when one was issued.
@@ -57,6 +67,13 @@ pub(crate) struct Entry {
 impl Entry {
     pub fn len(&self) -> usize {
         self.tokens.len()
+    }
+    /// The pool pages of a pool-page mark (none for an arena slot).
+    pub fn mark_pages(&self) -> &[u32] {
+        match &self.mark {
+            Some(Mark::Pages(pages)) => pages,
+            _ => &[],
+        }
     }
 }
 

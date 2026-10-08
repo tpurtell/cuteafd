@@ -30,7 +30,7 @@ use crate::shared::memory::DeviceAllocation;
 use crate::shared::prefix::view;
 use crate::shared::spark_intake::SparkLink;
 use anyhow::{ensure, Context, Result};
-use cuteafd_engine::prefix::{BoxError, FamilyLayout, MarkSlot, PrefixFamily, ReuseRule, TailCopy};
+use cuteafd_engine::prefix::{BoxError, FamilyLayout, MarkSlot, MarkStore, PrefixFamily, ReuseRule, TailCopy};
 use cuteafd_ffi::CuteafdDeviceBuffer;
 use cuteafd_hostcache::copy::DeviceRange;
 
@@ -218,6 +218,7 @@ impl PrefixFamily for Dsv4Prefix<'_, '_> {
             mark_bytes: self.mark_bytes,
             draft_bytes: 0,
             rule: ReuseRule::EXACT,
+            mark_store: MarkStore::Arena,
         }
     }
 

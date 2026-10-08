@@ -18,7 +18,7 @@ use super::engine::{GlmEngine, GlmPlacement, INDEX_PAGE_BYTES, PAGE_ROWS, RECORD
 use crate::shared::memory::DeviceAllocation;
 use crate::shared::prefix::view;
 use anyhow::Result;
-use cuteafd_engine::prefix::{BoxError, FamilyLayout, MarkSlot, PrefixFamily, ReuseRule, TailCopy};
+use cuteafd_engine::prefix::{BoxError, FamilyLayout, MarkSlot, MarkStore, PrefixFamily, ReuseRule, TailCopy};
 use cuteafd_ffi::CuteafdDeviceBuffer;
 use cuteafd_hostcache::copy::DeviceRange;
 
@@ -70,6 +70,7 @@ impl PrefixFamily for GlmPrefix<'_, '_> {
             mark_bytes: 0,
             draft_bytes: 0,
             rule: if self.partial { ReuseRule::paged(PAGE_ROWS) } else { ReuseRule::EXACT },
+            mark_store: MarkStore::Arena,
         }
     }
 

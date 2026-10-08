@@ -84,6 +84,15 @@ const REPLAY_ROWS: usize = DECODE_ROWS;
 fn replay_bytes(heads: usize, channels: usize) -> usize {
     REPLAY_ROWS * heads * 3 * 128 * 4 + REPLAY_ROWS * heads * 4 + REPLAY_ROWS * channels * 2
 }
+
+/// Bytes per KDA layer over `kda_heads` heads, as [`Caches::new`] allocates them: one sequence's
+/// recurrent state `[heads, 128, 128]` (FP32, or BF16 with `--kda-state bf16`) and BF16 conv window
+/// (the last three q/k/v inputs), the two regions `slot_regions_on` hands out per layer and a prefix
+/// mark copies, and the layer's speculative replay record.
+pub(crate) fn kda_layer_bytes(cfg: &GlmNextConfig, kda_heads: usize, state: KdaState) -> (usize, usize, usize) {
+    let d = kda_heads * cfg.kda_head_dim;
+    (d * cfg.kda_head_dim * state.bytes(), 3 * 3 * d * 2, replay_bytes(kda_heads, 3 * d))
+}
 /// One token's BF16 DSA index key | gate row (128 keys after k_norm, 128 gates).
 pub(crate) const KEY_BYTES: usize = 512;
 /// One sequence's index tail in one MLA layer (`TAIL_BYTES` of the fork's `_glmf_kernels.py`):
@@ -469,7 +478,13 @@ pub(crate) struct Allocator {
 impl Allocator {
     /// Over an engine of `pages` MLA pages (a whole number of units) and `slots` KDA slots.
     pub fn new(pages: usize, slots: usize) -> Self {
-        Self { units: cuteafd_engine::prefix::RefPagePool::new(pages / UNIT_PAGES, UNIT_ROWS),
+        Self::with_reserved(pages, slots, 0)
+    }
+
+    /// [`Self::new`] that never hands out the first `reserved` units (pool-page prefix marks keep
+    /// unit 0 zeroed: see `GLMF_POOL_MARK_RESERVED_UNITS`).
+    pub fn with_reserved(pages: usize, slots: usize, reserved: usize) -> Self {
+        Self { units: cuteafd_engine::prefix::RefPagePool::with_reserved(pages / UNIT_PAGES, UNIT_ROWS, reserved),
             slots: (0..slots as i32).rev().collect() }
     }
 
@@ -498,6 +513,17 @@ impl Allocator {
                 Err(error).context("cache pages exhausted")
             }
         }
+    }
+
+    /// `n` units for a pool-page prefix mark, ascending as the prefix cache hands them out.
+    pub fn take_units(&mut self, n: usize) -> Result<Vec<u32>> {
+        let mut units = self.units.alloc(n).context("cache pages exhausted")?;
+        units.sort_unstable();
+        Ok(units)
+    }
+
+    pub fn release_units(&mut self, units: &[u32]) {
+        self.units.release(units);
     }
 
     /// A spare KDA state slot (a speculative verify's backup).
@@ -937,7 +963,7 @@ impl<'a> Caches<'a> {
             library.cuda_zero_bytes(allocation.buffer, allocation.buffer.bytes)?;
             Ok(allocation)
         };
-        let d = kda_heads * cfg.kda_head_dim;
+        let (state, conv, replay) = kda_layer_bytes(cfg, kda_heads, kda_state);
         let keys = index_cache == IndexCache::Keys;
         let (mut kv, mut index, mut kda_layers, mut mla_layers) = (Vec::new(), Vec::new(), 0, 0);
         for layer in layers {
@@ -960,7 +986,7 @@ impl<'a> Caches<'a> {
         let index_tails = if keys || mla_layers == 0 { None } else {
             Some((zeroed(mla_layers * slots * TAIL_BYTES)?, zeroed(mla_layers * REPLAY_ROWS * KEY_BYTES)?))
         };
-        let replay = kda_layers * replay_bytes(kda_heads, 3 * d);
+        let replay = kda_layers * replay;
         let (kda_replay, owner) = match records {
             Some(PrefillScratch(temps)) => {
                 let scratch = temps.scratch.buffer;
@@ -974,8 +1000,8 @@ impl<'a> Caches<'a> {
                 (own.buffer, RecordsOwner::Own { _records: own })
             }
         };
-        Ok(Self { kv, index, kda_state: zeroed(kda_layers * slots * d * cfg.kda_head_dim * kda_state.bytes())?,
-            kda_conv: zeroed(kda_layers * slots * 3 * 3 * d * 2)?,
+        Ok(Self { kv, index, kda_state: zeroed(kda_layers * slots * state)?,
+            kda_conv: zeroed(kda_layers * slots * conv)?,
             kda_replay, _kda_replay_owner: owner, index_tails,
             commit_tables: zeroed(3 * DECODE_ROWS * 4)?, pool_logical: zeroed(pool_pages * 4)?, kda_heads })
     }

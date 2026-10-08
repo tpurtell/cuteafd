@@ -575,6 +575,61 @@ def test_glmf_exl3_schedule_rejects_bad_requests_before_launch(tmp_path, keys, m
     assert not any(line.startswith(("docker ", "ssh ", "nest ")) for line in result.stderr.splitlines())
 
 
+@pytest.mark.parametrize("keys,expected", [("", None), ("GLM5_FLASH_PREFIX_MARKS=arena\n", "arena"),
+                                           ("GLM5_FLASH_PREFIX_MARKS=pool\n", "pool")])
+def test_glmf_prefix_marks_are_forwarded(tmp_path, keys, expected):
+    result = _family_launch_result(tmp_path, GLMF_TWO_LAYER, "test/glmf", f"GLM5_FLASH_FP8_MODEL_ID=off\n{keys}")
+    assert result.returncode == 0, result.stderr
+    launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-glmf" in line)
+    if expected is None:
+        assert "--prefix-marks" not in launch, launch
+    else:
+        assert f"--prefix-marks {expected}" in launch and launch.count("--prefix-marks") == 1, launch
+
+
+@pytest.mark.parametrize("keys,expected", [
+    ("GLM5_FLASH_PREFIX_MARKS=pool\n", "auto"),
+    ("GLM5_FLASH_PREFIX_MARKS=pool\nHOST_CACHE_BYTES=64GiB\n", "64GiB"),
+    ("GLM5_FLASH_PREFIX_MARKS=pool\nHOST_CACHE_BYTES=0\n", None),
+    ("GLM5_FLASH_PREFIX_MARKS=arena\n", None),
+    ("", None),
+])
+def test_glmf_pool_marks_turn_the_host_tier_on(tmp_path, keys, expected):
+    result = _family_launch_result(tmp_path, GLMF_TWO_LAYER, "test/glmf", f"GLM5_FLASH_FP8_MODEL_ID=off\n{keys}")
+    assert result.returncode == 0, result.stderr
+    launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-glmf" in line)
+    if expected is None:
+        assert "--host-cache-bytes" not in launch, launch
+    else:
+        assert launch.count("--host-cache-bytes") == 1 and f"--host-cache-bytes {expected}" in launch, launch
+
+
+@pytest.mark.parametrize("keys,expected", [("", None), ("GLM5_FLASH_PREFIX_MARKS=arena\n", "arena"),
+                                           ("GLM5_FLASH_PREFIX_MARKS=pool\n", "pool")])
+def test_glmf_prefix_marks_reach_the_encoder_plan(tmp_path, keys, expected):
+    config = {"model_type": "glm5_next", "num_hidden_layers": 2, "mlp_layer_types": ["sparse"] * 2,
+              "layer_types": ["linear_attention", "deepseek_sparse_attention"], "vision_config": {"depth": 24}}
+    plan = {"placement_supported": True, "fits": True, "spark_ranks": 1,
+            "encoder_plan_hash": "ab" * 32, "encoder": {"kind": {"kind": "spark", "rank": 0}, "replicas": []}}
+    result = _family_launch_result(tmp_path, config, "zai-org/GLM-5.3-Flash",
+                                  f"RTX_GPUS=1\nSPECULATOR=off\nVISION=auto\n{keys}", encoder_plan=plan)
+    assert result.returncode == 0, result.stderr
+    launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-glmf" in line)
+    planner = next(line for line in result.stderr.splitlines() if "cuteafd plan" in line and "--layout" in line)
+    for command in [launch, planner]:
+        if expected is None:
+            assert "--prefix-marks" not in command, command
+        else:
+            assert command.count("--prefix-marks") == 1 and f"--prefix-marks {expected}" in command, command
+
+
+def test_glmf_prefix_marks_reject_unknown_stores_before_launch(tmp_path):
+    result = _family_launch_result(tmp_path, GLMF_TWO_LAYER, "test/glmf",
+                                  "GLM5_FLASH_FP8_MODEL_ID=off\nGLM5_FLASH_PREFIX_MARKS=host\n")
+    assert result.returncode == 2 and "GLM5_FLASH_PREFIX_MARKS must be arena or pool" in result.stderr
+    assert not any(line.startswith(("docker ", "ssh ", "nest ")) for line in result.stderr.splitlines())
+
+
 @pytest.mark.parametrize("keys,shared", [("", False), ("GLM5_FLASH_REPLAY_RECORDS=own\n", False),
                                         ("GLM5_FLASH_REPLAY_RECORDS=shared\n", True)])
 def test_glmf_replay_records_are_forwarded_only_when_shared(tmp_path, keys, shared):

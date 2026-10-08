@@ -1,6 +1,9 @@
 //! The generic prefix cache (PLAN.md "Prefix cache for every family"): one per generic engine,
 //! owning the device page pool, the mark arena, the retained snapshots and the optional host
-//! tier. Every call runs on the scheduler thread.
+//! tier. Every call runs on the scheduler thread. A family whose marks live in pool pages
+//! ([`MarkStore::Pool`]) has no arena: a capture or promotion takes the mark's pages from the
+//! pool beside the snapshot's rows, evicting least recently used snapshots for both (to the host
+//! tier when it is on), and an eviction releases both.
 //!
 //! Life of a request: [`PrefixCache::admit`] looks the prompt up (device first, then the host
 //! tier, whose hit is promoted to the device), forks the snapshot's pages into the new placement
@@ -18,15 +21,15 @@
 //! cache miss, never a request error.
 use super::chain::{content_id, page_chain_media};
 use crate::media::{round_frontier, snapshot_media, verify_media, MediaError, MediaSpan};
-use super::entry::{victim, After, Entry, EntryId};
-use super::family::{BoxError, FamilyLayout, PrefixFamily};
-use super::marks::{MarkArena, MarkSlot};
+use super::entry::{victim, After, Entry, EntryId, Mark};
+use super::family::{BoxError, FamilyLayout, MarkStore, PrefixFamily};
+use super::marks::MarkArena;
 use super::pages::{PoolExhausted, RefPagePool};
 use cuteafd_core::prefix::{Retention, SnapshotKind};
 use cuteafd_hostcache::cache::{
     DevicePage, DeviceSnapshot, EvictDecision, HostCache, RestoreOutcome, RestoreTarget, StoreOutcome,
 };
-use cuteafd_hostcache::copy::{CopyEngine, Stream};
+use cuteafd_hostcache::copy::{CopyEngine, DeviceRange, Stream};
 use cuteafd_hostcache::snapshot::{DevicePageId, EvictionOrder, SnapshotMeta};
 use serde::Serialize;
 use std::collections::BTreeMap;
@@ -48,6 +51,8 @@ pub enum PrefixError {
     Media(#[from] MediaError),
     #[error("host tier: {0}")]
     Host(String),
+    #[error("family layout: {0}")]
+    Layout(&'static str),
 }
 
 /// Knobs of the device tier.
@@ -55,7 +60,7 @@ pub enum PrefixError {
 pub struct PrefixConfig {
     /// Entries per bank (prompts, turns); 0 disables retention (the pool still allocates).
     pub entries: usize,
-    /// Device mark slots ([`MarkArena::slots_for`]).
+    /// Device mark slots ([`MarkArena::slots_for`]); unused when marks live in pool pages.
     pub mark_slots: usize,
     /// Keep the last logit row with each snapshot, so sampled exact-length hits need no forward.
     pub keep_logits: bool,
@@ -134,7 +139,10 @@ pub struct PrefixStats {
     /// Distinct pages held by retained snapshots; when no request runs, every used page is one.
     pub pages_retained: usize,
     pub mark_slots: usize,
+    /// Retained marks, in arena slots or pool pages.
     pub marks_in_use: usize,
+    /// Pool pages held by marks (counted in `pages_retained` too).
+    pub mark_pages: usize,
     pub host: Option<cuteafd_hostcache::metrics::Snapshot>,
 }
 
@@ -157,6 +165,13 @@ impl<E: CopyEngine> PrefixCache<E> {
     /// `host`: the pinned host tier's knobs and copy engine (`None`, or a zero `bytes`, keeps it off).
     pub fn new(layout: FamilyLayout, config: PrefixConfig, host: Option<(cuteafd_hostcache::config::Config, E)>)
         -> Result<Self, PrefixError> {
+        // Before the host tier pins its memory.
+        if let MarkStore::Pool { pages, reserved } = layout.mark_store {
+            if layout.mark_bytes == 0 || pages == 0 || pages > layout.pages.saturating_sub(reserved) {
+                return Err(PrefixError::Layout("pool-page marks take at least one page and at most the pool's \
+                    unreserved pages"));
+            }
+        }
         let host = match host {
             Some((host_config, engine)) if config.entries > 0 && host_config.enabled() => Some(
                 HostCache::with_rule(host_config, layout.host_layout(), engine, layout.rule, EvictionOrder::LeastRecent)
@@ -164,11 +179,12 @@ impl<E: CopyEngine> PrefixCache<E> {
             ),
             _ => None,
         };
-        let slots = if config.entries > 0 && layout.mark_bytes > 0 { config.mark_slots } else { 0 };
+        let arena = config.entries > 0 && layout.mark_bytes > 0 && layout.mark_store == MarkStore::Arena;
+        let slots = if arena { config.mark_slots } else { 0 };
         Ok(Self {
             retained: Retention::with_rule(config.entries, layout.rule),
             entries: BTreeMap::new(),
-            pool: RefPagePool::new(layout.pages, layout.page_rows),
+            pool: RefPagePool::with_reserved(layout.pages, layout.page_rows, layout.mark_store.reserved()),
             arena: MarkArena::new(slots, layout.mark_bytes),
             host,
             clock: 0,
@@ -364,7 +380,7 @@ impl<E: CopyEngine> PrefixCache<E> {
         let entry = self.entries.get(&hit.id).expect("the hit is kept while making room");
         let fork = self.pool.fork(&entry.pages, hit.resume, total)?;
         let partial = hit.resume != entry.len();
-        let mark = if partial { None } else { entry.mark };
+        let mark = if partial { None } else { entry.mark.clone() };
         let after = (hit.resume == tokens.len()).then(|| entry.after.clone());
         let pages = fork.pages.clone();
         let mut placement = build(fork.pages);
@@ -376,7 +392,11 @@ impl<E: CopyEngine> PrefixCache<E> {
             }
             None => Ok(()),
         }
-        .and_then(|()| family.restore(mark, &mut placement, hit.resume));
+        .and_then(|()| match &mark {
+            Some(Mark::Pages(pages)) => family.restore_pages(pages, &mut placement, hit.resume),
+            Some(Mark::Slot(slot)) => family.restore(Some(*slot), &mut placement, hit.resume),
+            None => family.restore(None, &mut placement, hit.resume),
+        });
         if let Err(source) = restored {
             self.release(family, &pages)?;
             return Err(PrefixError::Family { what: "restore", source });
@@ -431,7 +451,7 @@ impl<E: CopyEngine> PrefixCache<E> {
                 None => break,
             }
         }
-        let slot = if self.layout.mark_bytes > 0 {
+        let slot = if self.arena_marks() {
             loop {
                 match self.arena.take() {
                     Ok(slot) => break Some(slot),
@@ -449,21 +469,37 @@ impl<E: CopyEngine> PrefixCache<E> {
         };
         let len = tokens.len();
         let total = self.pool.pages_for(len);
-        if !self.make_room(family, self.pool.fork_cost(len, total), None)? {
-            self.give_back(family, slot)?;
+        // The rows a fork copies and, for pool-page marks, the mark's own pages.
+        let mark_pages = self.layout.mark_store.pages();
+        if !self.make_room(family, self.pool.fork_cost(len, total) + mark_pages, None)? {
+            self.give_back(family, slot.map(Mark::Slot))?;
             self.stats.capture_skips += 1;
             return Ok(false);
         }
-        let fork = self.pool.fork(family.pages(placement), len, total)?;
+        let mark = match slot {
+            Some(slot) => Some(Mark::Slot(slot)),
+            None => self.take_mark_pages()?,
+        };
+        let fork = match self.pool.fork(family.pages(placement), len, total) {
+            Ok(fork) => fork,
+            Err(error) => {
+                self.give_back(family, mark)?;
+                return Err(error.into());
+            }
+        };
         self.dirty = true;
         let captured = match fork.copy {
             Some(copy) => family.copy_rows(copy),
             None => Ok(()),
         }
-        .and_then(|()| slot.map_or(Ok(()), |slot| family.capture(slot, placement, len)));
+        .and_then(|()| match &mark {
+            Some(Mark::Pages(pages)) => family.capture_pages(pages, placement, len),
+            Some(Mark::Slot(slot)) => family.capture(*slot, placement, len),
+            None => Ok(()),
+        });
         if let Err(source) = captured {
             self.release(family, &fork.pages)?;
-            self.give_back(family, slot)?;
+            self.give_back(family, mark)?;
             return Err(PrefixError::Family { what: "capture", source });
         }
         if !self.config.keep_logits {
@@ -472,7 +508,7 @@ impl<E: CopyEngine> PrefixCache<E> {
         self.clock += 1;
         let id = self.next_id;
         self.next_id += 1;
-        self.entries.insert(id, Entry { tokens: tokens.to_vec(), media: snapshot_media(tokens.len(), media), kind, pages: fork.pages, mark: slot, after,
+        self.entries.insert(id, Entry { tokens: tokens.to_vec(), media: snapshot_media(tokens.len(), media), kind, pages: fork.pages, mark, after,
             last_use: self.clock, ticket: None });
         if let Some(evicted) = self.retained.bank_mut(kind).insert(tokens, id) {
             self.evict(family, evicted)?;
@@ -551,12 +587,15 @@ impl<E: CopyEngine> PrefixCache<E> {
         stats.pages = self.pool.capacity();
         stats.pages_free = self.pool.free();
         stats.pages_shared = self.pool.shared();
-        let mut retained: Vec<u32> = self.entries.values().flat_map(|e| e.pages.iter().copied()).collect();
+        let mut retained: Vec<u32> = self.entries.values()
+            .flat_map(|e| e.pages.iter().chain(e.mark_pages()).copied()).collect();
         retained.sort_unstable();
         retained.dedup();
         stats.pages_retained = retained.len();
         stats.mark_slots = self.arena.slots();
-        stats.marks_in_use = self.arena.in_use();
+        stats.mark_pages = self.entries.values().map(|e| e.mark_pages().len()).sum();
+        stats.marks_in_use = self.arena.in_use()
+            + self.entries.values().filter(|e| matches!(e.mark, Some(Mark::Pages(_)))).count();
         stats.host = self.host.as_ref().map(HostCache::metrics);
         stats
     }
@@ -581,12 +620,46 @@ impl<E: CopyEngine> PrefixCache<E> {
         Ok(())
     }
 
-    fn give_back<F: PrefixFamily>(&mut self, family: &F, slot: Option<MarkSlot>) -> Result<(), PrefixError> {
-        if let Some(slot) = slot {
-            self.drain(family)?;
-            self.arena.give_back(slot);
+    /// Whether marks live in the arena (a family with marks and no pool-page store).
+    fn arena_marks(&self) -> bool {
+        self.layout.mark_bytes > 0 && self.layout.mark_store == MarkStore::Arena
+    }
+
+    /// A pool-page mark's pages (the caller made room), in ascending order so a family's
+    /// segments over consecutive pages coalesce; `None` for arena or mark-less families.
+    fn take_mark_pages(&mut self) -> Result<Option<Mark>, PrefixError> {
+        match self.layout.mark_store {
+            MarkStore::Pool { pages, .. } if self.layout.mark_bytes > 0 => {
+                let mut pages = self.pool.alloc(pages)?;
+                pages.sort_unstable();
+                Ok(Some(Mark::Pages(pages)))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// Return a mark's storage once the family's queued copies drained: its arena slot, or its
+    /// pool pages.
+    fn give_back<F: PrefixFamily>(&mut self, family: &F, mark: Option<Mark>) -> Result<(), PrefixError> {
+        match mark {
+            Some(Mark::Slot(slot)) => {
+                self.drain(family)?;
+                self.arena.give_back(slot);
+            }
+            Some(Mark::Pages(pages)) => self.release(family, &pages)?,
+            None => {}
         }
         Ok(())
+    }
+
+    /// The device ranges of `mark` for the host tier (a mark-less family's stand-in tail).
+    fn mark_segments<F: PrefixFamily>(family: &F, mark: Option<&Mark>) -> Result<Vec<DeviceRange>, PrefixError> {
+        Ok(match mark {
+            Some(&Mark::Slot(slot)) => family.mark_segments(slot),
+            Some(Mark::Pages(pages)) => family.mark_page_segments(pages)
+                .map_err(|source| PrefixError::Family { what: "mark segments", source })?,
+            None => family.host_tail(),
+        })
     }
 
     /// Drop a device snapshot: its host copy finishes within budget first, then its storage goes
@@ -636,7 +709,7 @@ impl<E: CopyEngine> PrefixCache<E> {
         let snapshot = DeviceSnapshot {
             meta: SnapshotMeta { kind: entry.kind, tokens: entry.tokens.clone(), end: entry.len() as u32, has_draft: false },
             pages,
-            tail: entry.mark.map_or_else(|| family.host_tail(), |slot| family.mark_segments(slot)),
+            tail: Self::mark_segments(family, entry.mark.as_ref())?,
             draft: None,
             scores: Vec::new(),
         };
@@ -686,10 +759,11 @@ impl<E: CopyEngine> PrefixCache<E> {
             return Ok(None);
         }
         let need = self.pool.pages_for(len);
-        if !self.make_room(family, need, None)? {
+        let mark_pages = self.layout.mark_store.pages();
+        if !self.make_room(family, need + mark_pages, None)? {
             return Ok(None);
         }
-        let slot = if self.layout.mark_bytes > 0 {
+        let slot = if self.arena_marks() {
             loop {
                 match self.arena.take() {
                     Ok(slot) => break Some(slot),
@@ -702,19 +776,31 @@ impl<E: CopyEngine> PrefixCache<E> {
         } else {
             None
         };
-        if self.pool.free() < need {
-            self.give_back(family, slot)?;
+        if self.pool.free() < need + mark_pages {
+            self.give_back(family, slot.map(Mark::Slot))?;
             return Ok(None);
         }
         let pages = self.pool.alloc(need)?;
-        // The restore stream writes these pages and the slot: nothing queued may still use them.
+        let mark = match slot {
+            Some(slot) => Some(Mark::Slot(slot)),
+            None => self.take_mark_pages()?,
+        };
+        // The restore stream writes these pages and the mark: nothing queued may still use them.
         self.drain(family)?;
         let ids = self.identities(&snapshot_tokens, &saved_media, &pages);
         let mut target_pages: [Vec<DevicePage>; cuteafd_hostcache::COMPRESSORS] = Default::default();
         target_pages[0] = pages.iter().zip(ids).map(|(&page, id)| DevicePage { id, segments: family.page_segments(page) }).collect();
+        let tail = match Self::mark_segments(family, mark.as_ref()) {
+            Ok(tail) => tail,
+            Err(error) => {
+                self.release(family, &pages)?;
+                self.give_back(family, mark)?;
+                return Err(error);
+            }
+        };
         let target = RestoreTarget {
             pages: target_pages,
-            tail: slot.map_or_else(|| family.host_tail(), |slot| family.mark_segments(slot)),
+            tail,
             draft: None,
             scores: Vec::new(),
         };
@@ -730,14 +816,14 @@ impl<E: CopyEngine> PrefixCache<E> {
                 tracing::warn!(target: "cuteafd::prefix", ?outcome, tokens = len, "host restore abandoned; prefilling");
                 self.stats.restore_failures += 1;
                 self.release(family, &pages)?;
-                self.give_back(family, slot)?;
+                self.give_back(family, mark)?;
                 return Ok(None);
             }
         }
         self.clock += 1;
         let id = self.next_id;
         self.next_id += 1;
-        self.entries.insert(id, Entry { tokens: snapshot_tokens.clone(), media: saved_media, kind: hit.kind, pages, mark: slot, after,
+        self.entries.insert(id, Entry { tokens: snapshot_tokens.clone(), media: saved_media, kind: hit.kind, pages, mark, after,
             last_use: self.clock, ticket: None });
         if let Some(evicted) = self.retained.bank_mut(hit.kind).insert(&snapshot_tokens, id) {
             self.evict(family, evicted)?;

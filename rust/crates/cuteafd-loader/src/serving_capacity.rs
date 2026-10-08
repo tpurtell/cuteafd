@@ -61,6 +61,12 @@ pub enum GlmfIndexCache {
 /// three BF16 key | gate rows of 512 B.
 pub const GLMF_INDEX_TAIL_BYTES: u64 = 16 + 3 * 512;
 
+/// Units GLM 5.3 Flash keeps out of every allocation when its prefix marks live in pool units
+/// (`--prefix-marks pool`), beside the pool the admission sizes: unit 0, whose first MLA
+/// record (slot 0) the decode sparse MLA reads for every masked candidate and weights by zero.
+/// A mark there would put arbitrary bytes in it, and 0 x NaN is NaN; reserved, it stays zero.
+pub const GLMF_POOL_MARK_RESERVED_UNITS: u64 = 1;
+
 #[derive(Debug, Clone, Copy)]
 pub struct CacheOptions {
     pub coordinator_ranks: usize,

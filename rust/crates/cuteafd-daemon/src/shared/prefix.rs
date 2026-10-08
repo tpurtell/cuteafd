@@ -63,6 +63,16 @@ pub(crate) enum Toggle {
 }
 
 impl PrefixArgs {
+    /// Slots of the device mark arena for marks of `mark_bytes` (every rank's part) and `lanes`
+    /// decoding sequences: what the runtime allocates (`MarkArena::slots_for`) and what its planner
+    /// reserves ([`cuteafd_core::prefix::mark_slots_for`]).
+    pub fn mark_slots(&self, lanes: usize, mark_bytes: usize) -> usize {
+        let budget = (self.prefix_cache_mark_mib as u64).saturating_mul(1 << 20);
+        let slots = cuteafd_core::prefix::mark_slots_for(lanes as u64, self.prefix_cache_entries as u64,
+            mark_bytes as u64, budget);
+        slots as usize
+    }
+
     pub fn points(&self) -> PointPolicy {
         PointPolicy { gap: self.prefix_point_gap, boundaries: self.prefix_point_boundaries,
             per_request: self.prefix_points_per_request }
@@ -201,7 +211,7 @@ mod tests {
     #[test]
     fn mimo_cap_preserves_explicit_disabled_and_fixed_budgets() {
         let layout = FamilyLayout { page_rows: 64, pages: 1024, page_bytes: 65536, mark_bytes: 4096,
-            draft_bytes: 0, rule: cuteafd_core::prefix::ReuseRule::EXACT };
+            draft_bytes: 0, rule: cuteafd_core::prefix::ReuseRule::EXACT, mark_store: Default::default() };
         let mut disabled = Cli::parse_from(["serve", "--host-cache-bytes", "0"]).prefix;
         disabled.mimo_host_cap = true;
         assert!(disabled.host_config(layout, 32768).unwrap().is_none());
@@ -251,11 +261,11 @@ mod tests {
             .unwrap();
         assert_eq!(cli.prefix.host_cache_bytes, HostBudget::Auto);
         let invalid = FamilyLayout { page_rows: 0, pages: 0, page_bytes: 0, mark_bytes: 0,
-            draft_bytes: 0, rule: cuteafd_core::prefix::ReuseRule::EXACT };
+            draft_bytes: 0, rule: cuteafd_core::prefix::ReuseRule::EXACT, mark_store: Default::default() };
         assert!(cli.prefix.host_config(invalid, 0).unwrap().is_none());
         let cli = Cli::parse_from(["serve", "--host-cache-bytes", "64GiB"]);
         let layout = FamilyLayout { page_rows: 64, pages: 1024, page_bytes: 65536, mark_bytes: 4096,
-            draft_bytes: 0, rule: cuteafd_core::prefix::ReuseRule::EXACT };
+            draft_bytes: 0, rule: cuteafd_core::prefix::ReuseRule::EXACT, mark_store: Default::default() };
         let config = cli.prefix.host_config(layout, 32768).unwrap().unwrap();
         assert_eq!((config.bytes, config.max_tokens), (64 << 30, 32768));
     }

@@ -37,7 +37,7 @@ use super::engine::{MimoEngine, MimoPlacement, DECODE_ROWS, PAGE_ROWS, RING_ROWS
 use super::mtp::HIDDEN_ROWS;
 use crate::shared::memory::device::{Allocation, Device};
 use anyhow::{ensure, Result};
-use cuteafd_engine::prefix::{BoxError, FamilyLayout, MarkSlot, PrefixFamily, ReuseRule, TailCopy};
+use cuteafd_engine::prefix::{BoxError, FamilyLayout, MarkSlot, MarkStore, PrefixFamily, ReuseRule, TailCopy};
 use cuteafd_ffi::CuteafdDeviceBuffer;
 use cuteafd_hostcache::copy::DeviceRange;
 use cuteafd_loader::families::mimo_v2::MimoAttention;
@@ -283,6 +283,7 @@ impl PrefixFamily for MimoPrefix<'_, '_> {
             } else {
                 ReuseRule::EXACT
             },
+            mark_store: MarkStore::Arena,
         }
     }
 

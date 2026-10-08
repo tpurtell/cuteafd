@@ -3,6 +3,12 @@
 //! forward first checks that the whole context it reads is exactly what a straight prefill of
 //! the same tokens would have written. Copies are queued until a drain or a forward (stream
 //! order), so a snapshot published before its copies drained restores wrong bytes and fails.
+//! Its mark (the ring's last `WINDOW` rows) lives in arena slots or, as `pooled`, in
+//! `MARK_PAGES` pages of the same pool (mark row `i` at row `i % ROWS` of page `i / ROWS`).
+//!
+//! Like GLM 5.3 Flash's decode sparse MLA, every forward also reads page 0 row 0 as the stand-in
+//! for masked rows and weights it by zero: mark rows carry a NaN-like byte ([`POISON`]), so a
+//! mark on page 0 poisons every forward. A pooled fake therefore reserves page 0.
 use super::*;
 use cuteafd_hostcache::config::Config as HostConfig;
 use cuteafd_hostcache::copy::{CopyEngine, CopyModel, DeviceRange, Event, Stream, StubCopyEngine};
@@ -19,6 +25,10 @@ const ROWS: usize = 4; // page rows
 const RING: usize = 16; // ring slots per sequence
 const WINDOW: usize = 8; // rows a forward reads back from the ring
 const ROW: usize = 8; // bytes per row
+const MARK_PAGES: usize = WINDOW.div_ceil(ROWS); // pool pages of a pool-page mark
+/// Byte 7 of every ring (and so mark) row: as in an E4M3 record, 0x7F reads as NaN. Page rows
+/// and untouched memory carry 0 there.
+const POISON: u8 = 0x7F;
 
 #[derive(Clone)]
 struct Shared(Rc<RefCell<StubCopyEngine>>);
@@ -62,11 +72,18 @@ impl CopyEngine for Shared {
     }
 }
 
+/// Page rows (salt 1) carry 0 in byte 7, ring rows (salt 2) [`POISON`].
 fn value(salt: u64, tokens: &[u32]) -> [u8; ROW] {
     let mut h = DefaultHasher::new();
     salt.hash(&mut h);
     tokens.hash(&mut h);
-    h.finish().to_le_bytes()
+    let mut bytes = h.finish().to_le_bytes();
+    match salt {
+        1 => bytes[7] = 0,
+        2 => bytes[7] = POISON,
+        _ => {}
+    }
+    bytes
 }
 
 #[derive(Debug, Clone)]
@@ -94,6 +111,10 @@ struct Fake {
     /// A pages-only family (GLM 5.3): no mark; restores resume at the snapshot's length and the
     /// host tier keeps a one-byte stand-in tail.
     markless: bool,
+    /// Marks in pool pages (`MarkStore::Pool`) instead of the arena.
+    pooled: bool,
+    /// Leading pool pages never handed out (a pooled fake reserves page 0, the stand-in).
+    reserved: usize,
 }
 
 impl Fake {
@@ -101,11 +122,34 @@ impl Fake {
         let bytes = (pages * ROWS + rings * RING + slots * WINDOW) * ROW;
         let mem = Rc::new(RefCell::new(StubCopyEngine::new(CopyModel::default(), bytes, 1 << 26)));
         Self { mem, pages, rings, slots, queue: RefCell::new(Vec::new()), fail_restore: Cell::new(false), drains: Cell::new(0),
-            rule: ReuseRule::EXACT, markless: false }
+            rule: ReuseRule::EXACT, markless: false, pooled: false, reserved: 0 }
+    }
+    /// Marks in pool pages: no arena slot exists (any use of one panics). `pages` pages hand
+    /// out, past the reserved page 0.
+    fn pooled(pages: usize, rings: usize) -> Self {
+        Self { pooled: true, reserved: 1, ..Self::new(pages + 1, rings, 0) }
+    }
+    /// [`Fake::pooled`] without the reserved page: a mark can land on the stand-in.
+    fn pooled_unreserved(pages: usize, rings: usize) -> Self {
+        Self { pooled: true, ..Self::new(pages, rings, 0) }
     }
     fn layout(&self) -> FamilyLayout {
         FamilyLayout { page_rows: ROWS, pages: self.pages, page_bytes: ROWS * ROW,
-            mark_bytes: if self.markless { 0 } else { WINDOW * ROW }, draft_bytes: 0, rule: self.rule }
+            mark_bytes: if self.markless { 0 } else { WINDOW * ROW }, draft_bytes: 0, rule: self.rule,
+            mark_store: if self.pooled { MarkStore::Pool { pages: MARK_PAGES, reserved: self.reserved } }
+                else { MarkStore::Arena } }
+    }
+    /// Row `i` of the mark held in pool `pages`.
+    fn mark_row(&self, pages: &[u32], i: usize) -> DeviceRange {
+        assert!(pages.len() == MARK_PAGES && i < WINDOW, "mark of {} pages", pages.len());
+        self.page_row(pages[i / ROWS], i % ROWS)
+    }
+    /// The ring rows a mark at `len` holds, or why `p` cannot capture there.
+    fn mark_window(p: &Placement, len: usize) -> Result<std::ops::Range<usize>, BoxError> {
+        if len > p.len || p.len - len > RING - WINDOW || len.saturating_sub(WINDOW) < p.ring_from.min(len) {
+            return Err(format!("capture at {len} of {} is out of reach", p.len).into());
+        }
+        Ok(len.saturating_sub(WINDOW)..len)
     }
     fn page_row(&self, page: u32, row: usize) -> DeviceRange {
         DeviceRange { addr: ((page as usize * ROWS + row) * ROW) as u64, bytes: ROW }
@@ -125,10 +169,14 @@ impl Fake {
             mem.write_device(to, &bytes);
         }
     }
-    /// Prefill `tokens[p.len..]` after checking the whole context; returns a logit row.
+    /// Prefill `tokens[p.len..]` after checking the whole context and the stand-in for masked
+    /// rows (page 0 row 0); returns a logit row.
     fn forward(&self, p: &mut Placement, tokens: &[u32]) -> Result<Vec<f32>, String> {
         self.flush();
         let mut mem = self.mem.borrow_mut();
+        if mem.read_device(self.page_row(0, 0))[7] == POISON {
+            return Err("the stand-in for masked rows (page 0 row 0) holds mark bytes".into());
+        }
         for r in 0..p.len {
             let page = p.pages[r / ROWS];
             if mem.read_device(self.page_row(page, r % ROWS)) != value(1, &tokens[..=r]) {
@@ -166,14 +214,31 @@ impl PrefixFamily for Fake {
         RING - WINDOW
     }
     fn capture(&self, slot: MarkSlot, p: &Placement, len: usize) -> Result<(), BoxError> {
-        if len > p.len || p.len - len > RING - WINDOW || len.saturating_sub(WINDOW) < p.ring_from.min(len) {
-            return Err(format!("capture at {len} of {} is out of reach", p.len).into());
-        }
-        let first = len.saturating_sub(WINDOW);
-        for (i, r) in (first..len).enumerate() {
+        for (i, r) in Fake::mark_window(p, len)?.enumerate() {
             self.queue.borrow_mut().push(Op::Copy(self.ring_row(p.ring, r), self.slot_row(slot, i)));
         }
         Ok(())
+    }
+    fn capture_pages(&self, pages: &[u32], p: &Placement, len: usize) -> Result<(), BoxError> {
+        assert!(self.pooled, "pool-page capture of an arena family");
+        for (i, r) in Fake::mark_window(p, len)?.enumerate() {
+            self.queue.borrow_mut().push(Op::Copy(self.ring_row(p.ring, r), self.mark_row(pages, i)));
+        }
+        Ok(())
+    }
+    fn restore_pages(&self, pages: &[u32], p: &mut Placement, len: usize) -> Result<(), BoxError> {
+        assert!(self.pooled, "pool-page restore of an arena family");
+        if self.fail_restore.get() {
+            return Err("injected restore failure".into());
+        }
+        for (i, r) in (len.saturating_sub(WINDOW)..len).enumerate() {
+            self.queue.borrow_mut().push(Op::Copy(self.mark_row(pages, i), self.ring_row(p.ring, r)));
+        }
+        p.len = len;
+        Ok(())
+    }
+    fn mark_page_segments(&self, pages: &[u32]) -> Result<Vec<DeviceRange>, BoxError> {
+        Ok((0..WINDOW).map(|i| self.mark_row(pages, i)).collect())
     }
     fn restore(&self, mark: Option<MarkSlot>, p: &mut Placement, len: usize) -> Result<(), BoxError> {
         if self.fail_restore.get() {
@@ -591,8 +656,9 @@ fn pages_only_family_restores_from_device_and_host_without_a_mark() {
 /// whole context; at the end every page and slot is back.
 #[test]
 fn torture_interleaved_conversations_stay_exact_and_leak_nothing() {
-    for host_bytes in [0u64, 1 << 20] {
-        let fake = Fake::new(40, 4, 6);
+    for (host_bytes, pooled) in [(0u64, false), (1 << 20, false), (0, true), (1 << 20, true)] {
+        // Pool-page marks compete with the rows for the same 40 pages.
+        let fake = if pooled { Fake::pooled(40, 4) } else { Fake::new(40, 4, 6) };
         let mut cache = cache(&fake, 3, host_bytes);
         let mut rng = 0x2545_f491_4f6c_dd1du64;
         let mut next = |n: u64| {
@@ -619,11 +685,14 @@ fn torture_interleaved_conversations_stay_exact_and_leak_nothing() {
         }
         let stats = cache.stats();
         assert!(stats.hits > 50, "{stats:?}");
-        // Idle: every used page belongs to a retained snapshot, every used slot to an entry.
+        // Idle: every used page belongs to a retained snapshot (its rows or its mark), every
+        // mark to an entry.
         assert_eq!(stats.pages - stats.pages_free, stats.pages_retained, "{stats:?}");
         assert_eq!(stats.marks_in_use, stats.entries_prompt + stats.entries_turn, "{stats:?}");
+        assert_eq!(stats.mark_pages, if pooled { MARK_PAGES * stats.marks_in_use } else { 0 }, "{stats:?}");
         cache.clear(&fake).unwrap();
-        assert_eq!((cache.pool().free(), cache.arena().in_use()), (40, 0), "{stats:?}");
+        assert_eq!((cache.pool().free(), cache.arena().in_use(), cache.stats().mark_pages), (40, 0, 0), "{stats:?}");
+        assert_eq!((cache.pool().capacity(), cache.pool().reserved()), (40, usize::from(pooled)));
     }
 }
 
@@ -743,27 +812,217 @@ fn sessions_fork_from_the_deepest_earlier_turn() {
 #[test]
 fn failed_store_release_keeps_device_pages_mark_and_host_slabs() {
     use cuteafd_hostcache::copy::CopyFault;
-    let fake = Fake::new(24, 2, 4);
-    let mut cache = cache(&fake, 2, 1 << 20);
-    fake.mem.borrow_mut().inject(CopyFault::StreamStalls(Stream::Store));
-    let prompt = seq(700, 13);
-    let (_, _, placement) = serve(&mut cache, &fake, 0, &prompt, &[], 20);
-    cache.release(&fake, &placement.pages).unwrap();
-    let free = cache.pool().free();
-    let marks = cache.arena().in_use();
-    let held = cache.stats().host.unwrap().bytes_used;
-    assert!(free < 24 && marks > 0 && held > 0);
-    for _ in 0..2 {
-        assert!(cache.clear(&fake).is_err());
-        assert_eq!(cache.pool().free(), free);
-        assert_eq!(cache.arena().in_use(), marks);
-        assert_eq!(cache.stats().host.unwrap().bytes_used, held);
+    for pooled in [false, true] {
+        let fake = if pooled { Fake::pooled(24, 2) } else { Fake::new(24, 2, 4) };
+        let mut cache = cache(&fake, 2, 1 << 20);
+        fake.mem.borrow_mut().inject(CopyFault::StreamStalls(Stream::Store));
+        let prompt = seq(700, 13);
+        let (_, _, placement) = serve(&mut cache, &fake, 0, &prompt, &[], 20);
+        cache.release(&fake, &placement.pages).unwrap();
+        let free = cache.pool().free();
+        let marks = cache.stats().marks_in_use;
+        let held = cache.stats().host.unwrap().bytes_used;
+        assert!(free < 24 && marks > 0 && held > 0);
+        for _ in 0..2 {
+            assert!(cache.clear(&fake).is_err());
+            assert_eq!(cache.pool().free(), free);
+            assert_eq!(cache.stats().marks_in_use, marks);
+            assert_eq!(cache.stats().host.unwrap().bytes_used, held);
+        }
+        // The entry was never removed: its exact positional state still restores.
+        let (resume, _, mut restored) = serve(&mut cache, &fake, 1, &prompt, &[], 20);
+        assert_eq!(resume, prompt.len());
+        let mut continuation = prompt;
+        continuation.push(99);
+        fake.forward(&mut restored, &continuation).unwrap();
+        cache.release(&fake, &restored.pages).unwrap();
     }
-    // The entry was never removed: its exact positional state still restores.
-    let (resume, _, mut restored) = serve(&mut cache, &fake, 1, &prompt, &[], 20);
+}
+
+/// Pool-page marks: a capture takes its mark's pages from the pool beside the snapshot's rows,
+/// a device hit restores the ring from them, and the host tier stores rows and mark together
+/// and brings both back into fresh pages; every forward checks every context row exactly.
+#[test]
+fn pool_page_marks_round_trip_exactly_on_the_device_and_through_the_host_tier() {
+    let fake = Fake::pooled(32, 4);
+    let mut cache = cache(&fake, 8, 1 << 20);
+    assert_eq!((cache.arena().slots(), cache.layout().mark_store),
+        (0, MarkStore::Pool { pages: MARK_PAGES, reserved: 1 }));
+    let prompt = seq(100, 22);
+    let (resume, _, p) = serve(&mut cache, &fake, 0, &prompt, &[], 26);
+    assert_eq!(resume, 0);
+    let stats = cache.stats();
+    assert_eq!((stats.marks_in_use, stats.mark_pages, stats.mark_slots), (1, MARK_PAGES, 0));
+    // 7 placement pages, the snapshot's copied tail page and its mark's pages.
+    assert_eq!(cache.pool().free(), 32 - 7 - 1 - MARK_PAGES);
+    fake.mem.borrow_mut().advance(10_000_000);
+    cache.tick();
+    cache.release(&fake, &p.pages).unwrap();
+    // A device hit: the ring comes back from the mark's pages.
+    let mut next = prompt.clone();
+    next.extend(seq(3000, 5));
+    let (resume, _, mut q) = serve(&mut cache, &fake, 1, &next, &[], 40);
     assert_eq!(resume, prompt.len());
-    let mut continuation = prompt;
-    continuation.push(99);
-    fake.forward(&mut restored, &continuation).unwrap();
-    cache.release(&fake, &restored.pages).unwrap();
+    let mut longer = next.clone();
+    longer.push(7);
+    fake.forward(&mut q, &longer).unwrap();
+    fake.mem.borrow_mut().advance(10_000_000);
+    cache.tick();
+    cache.release(&fake, &q.pages).unwrap();
+    assert_eq!(cache.stats().host.unwrap().stores_completed, 2);
+    // Evicted from the device (rows and marks), the longer prompt comes back from the host tier
+    // into fresh pages, rows and mark, and continues exactly.
+    cache.clear(&fake).unwrap();
+    assert_eq!((cache.pool().free(), cache.stats().mark_pages), (32, 0));
+    let mut fork = next.clone();
+    fork.extend(seq(5000, 3));
+    let (resume, _, mut r) = serve(&mut cache, &fake, 2, &fork, &[], 40);
+    assert_eq!(resume, next.len());
+    let stats = cache.stats();
+    assert_eq!((stats.promotions, stats.host.unwrap().restores), (1, 1));
+    let mut longest = fork.clone();
+    longest.push(9);
+    fake.forward(&mut r, &longest).unwrap();
+    cache.release(&fake, &r.pages).unwrap();
+    cache.clear(&fake).unwrap();
+    assert_eq!((cache.pool().free(), cache.arena().in_use()), (32, 0));
+}
+
+/// Pool-page marks under pressure: a capture into a full pool evicts the least recently used
+/// snapshot, rows and mark, for its own mark pages. The fake has no arena slot and no device
+/// memory beyond the pool and its rings, so no mark can live anywhere but in pool pages.
+#[test]
+fn a_capture_into_a_full_pool_evicts_for_its_mark_pages() {
+    let fake = Fake::pooled(10, 2);
+    let mut cache = cache(&fake, 8, 0);
+    let (_, _, a) = serve(&mut cache, &fake, 0, &seq(100, 12), &[], 12);
+    cache.release(&fake, &a.pages).unwrap();
+    // A's snapshot: its three page-aligned rows pages and its mark's two.
+    assert_eq!((cache.pool().free(), cache.stats().mark_pages), (10 - 3 - MARK_PAGES, MARK_PAGES));
+    // B runs on four pages; its prompt snapshot needs two mark pages with one free: A goes.
+    let (_, _, b) = serve(&mut cache, &fake, 1, &seq(200, 16), &[], 16);
+    let stats = cache.stats();
+    assert_eq!((stats.evictions, stats.captures_prompt, stats.capture_skips), (1, 2, 0));
+    assert_eq!((stats.entries_prompt, stats.marks_in_use, stats.mark_pages), (1, 1, MARK_PAGES));
+    assert_eq!(cache.arena().slots(), 0);
+    cache.release(&fake, &b.pages).unwrap();
+    assert_eq!(cache.pool().free(), 10 - 4 - MARK_PAGES);
+    // B's snapshot restores exactly (ring from its mark pages); A's is gone.
+    let (resume, _, mut b2) = serve(&mut cache, &fake, 1, &seq(200, 16), &[], 20);
+    assert_eq!(resume, 16);
+    let mut longer = seq(200, 16);
+    longer.push(5);
+    fake.forward(&mut b2, &longer).unwrap();
+    cache.release(&fake, &b2.pages).unwrap();
+    let (resume, _, a2) = serve(&mut cache, &fake, 0, &seq(100, 12), &[], 12);
+    assert_eq!(resume, 0);
+    cache.release(&fake, &a2.pages).unwrap();
+    cache.clear(&fake).unwrap();
+    assert_eq!(cache.pool().free(), 10);
+}
+
+/// With every page held by a running request nothing can be evicted: the capture is skipped
+/// and counted, holds no page, and leaves the request's own rows and ring alone.
+#[test]
+fn a_capture_with_nothing_to_evict_is_skipped_and_counted() {
+    let fake = Fake::pooled(6, 2);
+    let mut cache = cache(&fake, 8, 0);
+    let prompt = seq(100, 18);
+    let admitted = cache.admit(&fake, &prompt, 20, false, |pages| Placement { pages, ring: 0, len: 0, ring_from: 0 })
+        .unwrap();
+    let mut a = admitted.placement;
+    let logits = fake.forward(&mut a, &prompt).unwrap();
+    // Five pages run A; its snapshot needs a copied tail page and two mark pages, one is free.
+    assert_eq!(cache.pool().free(), 1);
+    assert!(!cache.capture(&fake, SnapshotKind::Prompt, &prompt, &a, After::from_logits(&logits, true)).unwrap());
+    let stats = cache.stats();
+    assert_eq!((stats.capture_skips, stats.captures_prompt, stats.entries_prompt, stats.mark_pages), (1, 0, 0, 0));
+    assert_eq!(cache.pool().free(), 1);
+    let mut longer = prompt.clone();
+    longer.push(1);
+    fake.forward(&mut a, &longer).unwrap();
+    cache.release(&fake, &a.pages).unwrap();
+    assert_eq!(cache.pool().free(), 6);
+}
+
+/// Pool-page marks with the host tier on: under pressure a capture evicts the least recently
+/// used snapshot only once its rows and mark reached pinned RAM (the eviction waits for the
+/// write-behind copy still in flight), and a later request brings both back into fresh pages
+/// and continues exactly.
+#[test]
+fn pool_mark_evictions_reach_the_host_tier_and_come_back_exactly() {
+    let fake = Fake::pooled(10, 3);
+    let mut cache = cache(&fake, 8, 1 << 20);
+    let first = seq(100, 12);
+    let (_, _, a) = serve(&mut cache, &fake, 0, &first, &[], 12);
+    cache.release(&fake, &a.pages).unwrap();
+    // The second prompt's snapshot needs the first one's pages; nothing has advanced the copy
+    // clock, so the first snapshot's store is still in flight when it is evicted.
+    let (_, _, b) = serve(&mut cache, &fake, 1, &seq(200, 16), &[], 16);
+    cache.release(&fake, &b.pages).unwrap();
+    let stats = cache.stats();
+    let host = stats.host.clone().unwrap();
+    assert_eq!((stats.evictions, stats.host_evict_waits, stats.host_evict_uncached), (1, 1, 0), "{stats:?}");
+    assert_eq!((host.stores_completed, stats.entries_prompt), (1, 1), "{stats:?}");
+    // The first conversation continues: rows and mark come back from RAM (evicting the second
+    // snapshot, again only after its copy landed), and every context row checks out.
+    let mut next = first.clone();
+    next.push(5);
+    let (resume, _, mut c) = serve(&mut cache, &fake, 2, &next, &[], 16);
+    assert_eq!(resume, first.len());
+    let stats = cache.stats();
+    assert_eq!((stats.promotions, stats.host.unwrap().restores, stats.evictions, stats.host_evict_waits), (1, 1, 2, 2));
+    let mut longer = next.clone();
+    longer.push(6);
+    fake.forward(&mut c, &longer).unwrap();
+    cache.release(&fake, &c.pages).unwrap();
+    cache.clear(&fake).unwrap();
+    assert_eq!((cache.pool().free(), cache.stats().mark_pages), (10, 0));
+}
+
+/// A mark on page 0 poisons the stand-in every forward reads for masked rows (GLM 5.3 Flash's
+/// decode sparse MLA reads record slot 0 for every masked candidate and weights it by zero, and
+/// 0 x NaN is NaN). Unreserved, the free list hands page 0 to the second request's mark and its
+/// next forward fails; with page 0 reserved no allocation ever takes it.
+#[test]
+fn a_mark_never_lands_on_the_stand_in_page() {
+    for reserved in [false, true] {
+        let fake = if reserved { Fake::pooled(8, 2) } else { Fake::pooled_unreserved(8, 2) };
+        let mut cache = cache(&fake, 4, 0);
+        // A takes the first page handed out, its mark the next two; evicted, page 0 (unreserved)
+        // goes back under the mark's pages.
+        let (_, _, a) = serve(&mut cache, &fake, 0, &seq(100, 4), &[], 4);
+        assert_eq!(a.pages, vec![if reserved { 1 } else { 0 }]);
+        cache.release(&fake, &a.pages).unwrap();
+        cache.clear(&fake).unwrap();
+        // B's mark takes the two pages freed first: 0 and 1 unreserved.
+        let prompt = seq(200, 4);
+        let (_, _, mut b) = serve(&mut cache, &fake, 1, &prompt, &[], 8);
+        let mut longer = prompt.clone();
+        longer.push(9);
+        match (reserved, fake.forward(&mut b, &longer)) {
+            (false, Err(error)) => assert!(error.contains("stand-in"), "{error}"),
+            (true, Ok(_)) => {}
+            (reserved, outcome) => panic!("reserved {reserved}: {outcome:?}"),
+        }
+        cache.release(&fake, &b.pages).unwrap();
+        cache.clear(&fake).unwrap();
+    }
+}
+
+/// A pool-page layout must hold a mark of at least one page in its unreserved pages; an arena
+/// family keeps its arena.
+#[test]
+fn pool_page_layouts_are_checked() {
+    let fake = Fake::pooled(4, 1);
+    for (pages, reserved) in [(0, 1), (5, 1), (2, 4), (1, 5)] {
+        let layout = FamilyLayout { mark_store: MarkStore::Pool { pages, reserved }, ..fake.layout() };
+        assert!(matches!(PrefixCache::<Shared>::new(layout, config(2, 0), None), Err(PrefixError::Layout(_))));
+    }
+    let fits = FamilyLayout { mark_store: MarkStore::Pool { pages: 4, reserved: 1 }, ..fake.layout() };
+    assert_eq!(PrefixCache::<Shared>::new(fits, config(2, 0), None).unwrap().pool().capacity(), 4);
+    let markless = FamilyLayout { mark_bytes: 0, ..fake.layout() };
+    assert!(matches!(PrefixCache::<Shared>::new(markless, config(2, 0), None), Err(PrefixError::Layout(_))));
+    let arena = Fake::new(4, 1, 3);
+    assert_eq!(PrefixCache::<Shared>::new(arena.layout(), config(2, 3), None).unwrap().arena().slots(), 3);
 }

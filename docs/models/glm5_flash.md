@@ -80,7 +80,15 @@ Attention (KDA), a minority run MLA + DSA.
   decode schedule) and, at m80, 64x128 tiles at two CTAs per SM. On a GB10,
   an expert call at 1-80 rows took 1.4-11.2% less time than the default's.
 - Prefix cache: merged — 256-row units (4 MLA pages plus the pool page) and
-  a KDA recurrent-state mark at the commit point (`kda_len`).
+  a KDA recurrent-state mark at the commit point (`kda_len`). Marks live in a
+  device arena of 2C + 2 marks (147.6 MB each with an FP32 state), which both
+  KV admissions reserve, or with `GLM5_FLASH_PREFIX_MARKS=pool`
+  (`--prefix-marks pool`, opt-in) in units of the KV pool itself (49 per FP32
+  mark), taken at capture and evicted with the snapshot's rows. Unit 0 is then
+  never handed out: the decode sparse MLA reads its first record for masked
+  candidates, and a mark's bytes there would turn decode rows into NaN. Pool
+  marks turn the pinned host tier on (`HOST_CACHE_BYTES=auto` unless set; 0
+  keeps it off), so the snapshots the pool evicts move to RAM.
 
 ## Default precision (single residency)
 

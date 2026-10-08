@@ -36,6 +36,7 @@ fn options(args: &PlanArgs) -> Result<PlanOptions, PlanError> {
                 prefill_lanes: args.prefill_lanes,
                 headroom_bytes: budget_bytes("--headroom-gib", args.headroom_gib)?,
                 graph_budget_bytes: args.graph_budget_mib.map(|mib| mib << 20),
+                glmf_pool_marks: args.prefix_marks == crate::families::glm5_flash::prefix::PrefixMarks::Pool,
                 glmf_shared_replay: args.replay_records == crate::families::glm5_flash::engine::ReplayRecords::Shared,
                 concurrency: args.concurrency,
                 prefix_slots: args.prefix_slots,
@@ -139,6 +140,7 @@ mod tests {
             mimo_rings: 16,
             draft_sequences: 4,
             draft_context_slots: None,
+            prefix_marks: crate::families::glm5_flash::prefix::PrefixMarks::Arena,
             native_mtp_layers: 3,
             workspace_manifest: None,
         }
@@ -226,6 +228,19 @@ mod tests {
         let options = options(&request).unwrap();
         assert_eq!(options.spark_budget_bytes, 82 << 30);
         assert_eq!(options.layout.unwrap().spark_allocation_budget_bytes, Some(82 << 30));
+    }
+
+    #[test]
+    fn glm_flash_prefix_marks_reach_the_layout() {
+        use clap::Parser;
+        let parse = |extra: &[&str]| crate::cli::Cli::try_parse_from(
+            ["cuteafd", "plan", "/not-read", "--layout"].into_iter().chain(extra.iter().copied()));
+        for (extra, pool) in [(&[][..], false), (&["--prefix-marks", "arena"][..], false),
+            (&["--prefix-marks", "pool"][..], true)] {
+            let crate::cli::Commands::Plan(args) = parse(extra).unwrap().command else { panic!("plan") };
+            assert_eq!(options(&args).unwrap().layout.unwrap().glmf_pool_marks, pool);
+        }
+        assert!(parse(&["--prefix-marks", "host"]).is_err());
     }
 
     #[test]
