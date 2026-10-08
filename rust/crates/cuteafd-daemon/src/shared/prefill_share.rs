@@ -72,6 +72,17 @@ impl<P> PrefillQueue<P> {
         Self { waiting: VecDeque::new(), share, owed: 0.0, last_round: 0.0, round_s: ROUND_S }
     }
 
+    /// Limit a family round to one completed wave without changing its row plan.
+    pub fn one_wave_rounds(mut self) -> Self {
+        self.round_s = 0.0;
+        self
+    }
+
+    /// Independent decode lanes stop at a completed boundary after this debt.
+    pub fn decode_seconds(&self) -> f64 {
+        self.owed.max(0.0)
+    }
+
     pub fn len(&self) -> usize {
         self.waiting.len()
     }
@@ -269,6 +280,29 @@ mod tests {
         assert_eq!(run(&mut queue, &mut log, 0), vec![0]);
         queue.settle(true);
         assert!(!queue.due(true) && queue.is_empty());
+    }
+
+    #[test]
+    fn one_wave_rounds_bound_bursts_and_preserve_exclusive_zero_share() {
+        for share in [0.0, 0.2, 0.5] {
+            let mut queue = PrefillQueue::new(share).one_wave_rounds();
+            queue.push(Prompt { id: 0, left: 3 });
+            queue.push(Prompt { id: 1, left: 2 });
+            let mut log = Vec::new();
+            run(&mut queue, &mut log, 0);
+            if share == 0.0 {
+                assert_eq!(log, [0, 0, 0, 1, 1]);
+                assert!(queue.is_empty());
+            } else {
+                assert_eq!(log, [0]);
+                queue.settle(true);
+                assert!(queue.decode_seconds() > 0.0);
+                queue.stepped(queue.decode_seconds());
+                assert!(queue.due(true));
+                run(&mut queue, &mut log, 0);
+                assert_eq!(log, [0, 1]);
+            }
+        }
     }
 
     #[test]

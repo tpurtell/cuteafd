@@ -75,6 +75,7 @@ pub(crate) async fn run(mut args: crate::cli::NativeServeArgs) -> Result<()> {
     if args.pool_tokens == Some(0) && args.memory_reservation.is_none() {
         args.memory_reservation = Some("97%".parse()?);
     }
+    ensure!((0.0..1.0).contains(&args.decode_share), "--decode-share must be in [0, 1)");
     args.host_cache_config()?;
     let api = args.api.load()?;
     let listen = args.listen.clone();
@@ -700,6 +701,12 @@ fn prefill_hold(hold: &mut dyn FnMut() -> Result<()>) {
     }
 }
 
+fn prefill_wave_started(request: Option<u64>, rows: usize) {
+    let started_unix_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+        .map_or(0.0, |elapsed| elapsed.as_secs_f64() * 1000.0);
+    tracing::info!(request_id=?request, rows, started_unix_ms, "V4.1 prefill wave starts");
+}
+
 fn prefill<'a, P: PrefillTarget<'a>, C: DraftChain<'a>>(
     lib: &'a NativeLibrary,
     runtime: &tokio::runtime::Runtime,
@@ -716,6 +723,7 @@ fn prefill<'a, P: PrefillTarget<'a>, C: DraftChain<'a>>(
     hold: &mut dyn FnMut() -> Result<()>,
 ) -> Result<TokenScores> {
     use crate::families::deepseek_v41::v41_backbone_cache::{CacheStage, CacheWork};
+    prefill_wave_started(None, tokens.len());
     let end = tokens.len() as u64;
     let cached = requests.cache().committed_end(lease)? as usize;
     let stage = requests.cache().stage(lease)?;

@@ -143,6 +143,7 @@ pub(super) struct Pending {
 /// drain both lanes before they have executed another token.
 #[derive(Clone, Copy, Default)]
 pub(super) struct Wake<'p> {
+    pub prefill_deadline: Option<std::time::Instant>,
     pub media_pending: bool,
     pub media_slots: usize,
     pub host_pending: bool,
@@ -150,6 +151,9 @@ pub(super) struct Wake<'p> {
     pub pending: Option<&'p NativeRequest>,
 }
 impl Wake<'_> {
+    pub fn prefill_due(self, completed_rounds: u64) -> bool {
+        completed_rounds > 0 && self.prefill_deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline)
+    }
     pub fn poll_media(self, completed_rounds: u64) -> bool {
         self.media_pending && completed_rounds > 0
     }
@@ -318,6 +322,17 @@ mod tests {
         assert!(!backlog.ready(16, 16, false));
         assert!(!Wake::default().poll_media(1));
         assert!(!Wake::default().poll_media(u64::MAX));
+    }
+    #[test]
+    fn prefill_wake_waits_for_a_committed_decode_and_its_time_share() {
+        let now = Instant::now();
+        let due = Wake { prefill_deadline: Some(now), ..Default::default() };
+        assert!(!due.prefill_due(0));
+        assert!(due.prefill_due(1));
+        let later = Wake { prefill_deadline: Some(now + Duration::from_secs(60)), ..Default::default() };
+        assert!(!later.prefill_due(1));
+        assert!(!Wake::default().prefill_due(1));
+        assert!(!Wake { media_slots: 4, ..Default::default() }.ready(12, 16, true));
     }
     #[test]
     fn parked_image_limit_preserves_a_text_slot() -> Result<()> {

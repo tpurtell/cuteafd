@@ -21,6 +21,121 @@ pub(crate) fn exercise_prefill<'a, P: PrefillTarget<'a>, C: DraftChain<'a>>(
         lease, tokens, chunk_rows, &job, draft, &mut || Ok(()))?.select(None)
 }
 
+/// Only request-owned storage survives a yield; every batch has committed and
+/// both execution/transport lanes have drained before a decode wave can start.
+pub(super) enum PrefillProgress<S> {
+    Start,
+    Encoder { suffix: S, next: usize, replay_end: usize, streamed: bool, index: usize },
+    Replay { suffix: S },
+    Continuation { next: usize },
+    Done,
+}
+
+impl<S> Default for PrefillProgress<S> {
+    fn default() -> Self { Self::Start }
+}
+
+impl<S> PrefillProgress<S> {
+    pub(super) fn step<'a, P: PrefillTarget<'a, Suffix = S>, C: DraftChain<'a>>(&mut self,
+        lib: &'a NativeLibrary, runtime: &tokio::runtime::Runtime, pass: &mut P, other: &mut P,
+        requests: &mut Requests<'a>, transports: [&mut P::Transport; 2], lease: CacheLease,
+        tokens: &[u32], chunk_rows: usize, job: &NativeRequest,
+        draft: Option<&mut DraftRuntime<'_, 'a, C>>, hold: &mut dyn FnMut() -> Result<()>,
+    ) -> Result<Option<TokenScores>> {
+        use crate::families::deepseek_v41::v41_backbone_cache::CacheWork;
+        ensure!(!job.events.is_closed(), "client disconnected");
+        let [transport, other_transport] = transports;
+        if matches!(self, Self::Start) {
+            let cached = requests.cache().committed_end(lease)? as usize;
+            let stage = requests.cache().stage(lease)?;
+            if cached > 0 && stage == CacheStage::Full {
+                *self = Self::Continuation { next: cached };
+            } else {
+                let suffix = pass.new_suffix(lib, tokens.len() as u64)?;
+                let next = if stage == CacheStage::EncoderReplay {
+                    let start = requests.cache().history_end(lease)? as usize;
+                    ensure!(cached - start <= 128, "encoder prefix replay exceeds one window");
+                    start
+                } else {
+                    if stage == CacheStage::Full { requests.begin_encoder(lease, tokens.len() as u64)?; }
+                    cached
+                };
+                *self = Self::Encoder { suffix, next, replay_end: cached,
+                    streamed: tokens.len().saturating_sub(cached).div_ceil(chunk_rows) > 1, index: 0 };
+            }
+        }
+        prefill_hold(hold);
+        match self {
+            Self::Encoder { suffix, next, replay_end, streamed, index } => {
+                let replay = *next < *replay_end;
+                let end = (*next + chunk_rows).min(if replay { *replay_end } else { tokens.len() });
+                let chunk = &tokens[*next..end];
+                let started = Instant::now();
+                if !replay && *streamed {
+                    // Keep the original chunk shapes and alternating lane ownership.
+                    // A singleton stream still publishes every compressed/index boundary.
+                    let (first, second, a, b) = if *index % 2 == 0 {
+                        (pass, other, transport, other_transport)
+                    } else { (other, pass, other_transport, transport) };
+                    // SAFETY: this wave owns both lanes and retains its suffix until drained.
+                    runtime.block_on(unsafe { first.execute_encoder_stream_held(second, requests,
+                        lease, &[chunk], [a, b], suffix, &|| !job.events.is_closed(), &|| Ok(())) })?;
+                    *index += 1;
+                } else {
+                    let mut batch = requests.prepare(&[RequestTokens { lease, tokens: chunk,
+                        image_mask: None, kind: ExpertV2SourceKind::Prefill }])?;
+                    let result = (|| -> Result<()> {
+                        // SAFETY: the batch and suffix belong to this live request; completion precedes yielding.
+                        runtime.block_on(unsafe { pass.encoder_part(requests, &mut batch, transport, suffix) })?;
+                        ensure!(!job.events.is_closed(), "client disconnected");
+                        runtime.block_on(pass.commit_prefill::<C>(requests, &mut batch, None, chunk.len() as u32))
+                    })();
+                    if result.is_err() { pass.discard(&mut batch)?; }
+                    result?;
+                    if !replay {
+                        console::totals::prefill(chunk.len());
+                        console::Prefill::done(console::PrefillKind::Single, 0, 0, 1, chunk.len(), started);
+                    }
+                }
+                *next = end;
+                if end == tokens.len() {
+                    let state = std::mem::replace(self, Self::Done);
+                    if let Self::Encoder { suffix, .. } = state { *self = Self::Replay { suffix }; }
+                }
+                Ok(None)
+            }
+            Self::Replay { suffix } => {
+                let start = requests.begin_decoder_replay(lease)?;
+                let rows = (tokens.len() as u64 - start) as u32;
+                let mut batch = requests.prepare_replay(&[CacheWork { lease, tokens: rows, kind: ExpertV2SourceKind::Prefill }])?;
+                let started = Instant::now();
+                let result = (|| -> Result<TokenScores> {
+                    // SAFETY: all encoder rows committed and the retained suffix matches this replay.
+                    let bytes = runtime.block_on(unsafe { pass.prefill_logits(lib, requests, &mut batch,
+                        transport, &[rows as usize - 1], Some(suffix)) })?;
+                    let scores = TokenScores::new(bytes)?;
+                    ensure!(!job.events.is_closed(), "client disconnected");
+                    runtime.block_on(pass.commit_prefill(requests, &mut batch, draft, rows))?;
+                    Ok(scores)
+                })();
+                if result.is_err() { pass.discard(&mut batch)?; }
+                console::Prefill::done(console::PrefillKind::Replay, 0, 0, 1, rows as usize, started);
+                let scores = result?;
+                *self = Self::Done;
+                Ok(Some(scores))
+            }
+            Self::Continuation { next } => {
+                let end = (*next + chunk_rows).min(tokens.len());
+                let scores = super::prefill_continuation(lib, runtime, pass, requests, transport,
+                    lease, &tokens[*next..end], chunk_rows, job, draft, &mut || Ok(()))?;
+                *next = end;
+                if end == tokens.len() { *self = Self::Done; Ok(Some(scores)) } else { Ok(None) }
+            }
+            Self::Start | Self::Done => anyhow::bail!("invalid prefill progress"),
+        }
+    }
+}
+
 pub(crate) trait PrefillTarget<'a>: VerificationTarget<'a> + Sized {
     type Suffix;
     fn new_suffix(&self, lib: &'a NativeLibrary, end: u64) -> Result<Self::Suffix>;

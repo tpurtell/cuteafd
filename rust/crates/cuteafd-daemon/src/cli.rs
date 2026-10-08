@@ -697,6 +697,10 @@ pub(crate) struct NativeServeArgs {
     #[arg(long, default_value_t = 80, value_parser = clap::value_parser!(u32).range(80..=4096))]
     pub prefill_batch_tokens: u32,
 
+    /// Decode time reserved between completed V4.1 prefill waves; 0 keeps exclusive prefill.
+    #[arg(long, env = "CUTEAFD_DECODE_SHARE", default_value_t = 0.0)]
+    pub decode_share: f64,
+
     /// Total prompt plus generated tokens; compressed cache is reserved at startup.
     #[arg(long, default_value_t = cuteafd_api::openai::MAX_CONTEXT_TOKENS, value_parser = clap::value_parser!(u32).range(1..=1048576))]
     pub max_context_tokens: u32,
