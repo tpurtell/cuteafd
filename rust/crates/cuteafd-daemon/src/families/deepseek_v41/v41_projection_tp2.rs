@@ -99,7 +99,8 @@ impl<'w,'a> Rank<'w,'a> {
     // the peer rank. Capture records the next invocation without repeating work.
     fn capture_ready(&mut self,layer:usize,rows:u32)->Result<()> {
         let weights=self.weights.iter().find(|w|w.layer==layer).context("projection layer absent")?;
-        if self.graphs.get_shape(layer,weights,rows).is_some() { return Ok(()); }
+        if !super::v41_layer_graphs::captures_shape(rows)
+            || self.graphs.get_shape(layer,weights,rows).is_some() { return Ok(()); }
         let device=self.stream.device;
         device.run(||unsafe {
             device.library.cuda_graph_begin_capture(self.stream.raw)?;
@@ -187,7 +188,8 @@ impl<'w,'a> Wave<'w,'a> {
     fn capture_gather_ready(&mut self,rows:u32)->Result<()> {
         // The gather uses only this wave's fixed storage, independent of layer.
         let weights=&self.ranks[self.owner].weights[0];
-        if self.gather_graphs.get_shape(0,weights,rows).is_some() { return Ok(()); }
+        if !super::v41_layer_graphs::captures_shape(rows)
+            || self.gather_graphs.get_shape(0,weights,rows).is_some() { return Ok(()); }
         let stream=self.ranks[self.owner].stream.raw;let device=self.output.device;
         device.run(||unsafe {
             device.library.cuda_graph_begin_capture(stream)?;

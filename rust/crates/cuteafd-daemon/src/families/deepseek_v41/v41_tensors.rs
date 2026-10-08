@@ -190,6 +190,14 @@ impl<'library> VocabularyHead<'library> {
     pub fn plan(catalog: &OfficialV41Catalog) -> Result<usize> {
         VocabularyShard::load_bytes(catalog, 0..129280)
     }
+    pub fn resident_bytes(catalog: &OfficialV41Catalog) -> Result<usize> {
+        let source = VocabularyShard::device_bytes(catalog, 0..129280)?;
+        Ok(match fp8_head() {
+            Fp8Head::Off => source,
+            Fp8Head::Draft => source + source / 2 + source / 64,
+            Fp8Head::All => source / 2 + source / 64,
+        })
+    }
     pub fn load(
         library: &'library NativeLibrary,
         catalog: &OfficialV41Catalog,

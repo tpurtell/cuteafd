@@ -1107,7 +1107,7 @@ fn host_embedding_removes_only_the_lead_copy_before_pool_admission() {
     config["tie_word_embeddings"] = json!(false);
     write_snapshot(dir.path(), &config, &mimo_pro_tensors(), Some(8));
     let mut options = PlanOptions {
-        layout: Some(layout::LayoutOptions { rtx_bytes: vec![24 << 30, 96 << 30], ..Default::default() }),
+        layout: Some(layout::LayoutOptions { rtx_bytes: vec![24 << 30, 96 << 30], force_gpu_embedding: true, ..Default::default() }),
         ..sparks(6)
     };
     let probe = plan(dir.path(), &options).unwrap().memory_layout.unwrap();
@@ -1117,7 +1117,8 @@ fn host_embedding_removes_only_the_lead_copy_before_pool_admission() {
     options.layout.as_mut().unwrap().rtx_bytes[0] =
         probe.devices[0].used_bytes()
             - probe.devices[0].items.iter().filter(|i| i.category == Category::Kv && i.group == "records").map(|i| i.bytes).sum::<u64>()
-            + bytes + options.layout.as_ref().unwrap().headroom_bytes;
+            + bytes + options.layout.as_ref().unwrap().headroom_bytes
+                .max(cuteafd_core::serving_capacity::SMALL_CARD_HEADROOM_BYTES);
     let gpu = plan(dir.path(), &options).unwrap().memory_layout.unwrap();
     assert_eq!(gpu.devices[1].by_category().get(&Category::Embedding), None);
     options.layout.as_mut().unwrap().host_embedding = true;
@@ -1133,6 +1134,48 @@ fn host_embedding_removes_only_the_lead_copy_before_pool_admission() {
     assert!(!tied.fits);
     assert!(tied.hints.iter().any(|h| h.what.contains("tie_word_embeddings")));
     assert_eq!(tied.memory_layout.unwrap().devices[0].by_category()[&Category::Embedding], bytes);
+}
+
+#[test]
+fn mimo_small_card_auto_embedding_and_full_context() {
+    use cuteafd_core::memory_layout::Category;
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = mimo_pro_config();
+    config["max_position_embeddings"] = json!(1_048_576);
+    config["tie_word_embeddings"] = json!(false);
+    write_snapshot(dir.path(), &config, &mimo_pro_tensors(), Some(8));
+    let mut options = PlanOptions { layout: Some(layout::LayoutOptions {
+        rtx_bytes: vec![32 << 30], ..Default::default()
+    }), ..sparks(4) };
+    let base = plan(dir.path(), &options).unwrap().memory_layout.unwrap();
+    assert!(!base.devices[0].by_category().contains_key(&Category::Embedding));
+    assert_eq!(base.devices[0].capacity_bytes,
+        (32u64 << 30) - cuteafd_core::serving_capacity::SMALL_CARD_HEADROOM_BYTES);
+    assert!(base.pool_tokens >= 1_048_576, "{}", base.render());
+    assert!(!base.devices[0].items.iter().any(|i| i.group == "DFlash context marks"));
+    options.layout.as_mut().unwrap().force_gpu_embedding = true;
+    assert!(plan(dir.path(), &options).unwrap().memory_layout.unwrap().devices[0].by_category().contains_key(&Category::Embedding));
+}
+
+#[test]
+fn mimo_concurrency_default_is_small_card_only_and_overridable() {
+    let dir = tempfile::tempdir().unwrap();
+    write_snapshot(dir.path(), &mimo_pro_config(), &mimo_pro_tensors(), Some(8));
+    for (gib, expected) in [(32, 16), (96, 8)] {
+        let mut options = PlanOptions { layout: Some(layout::LayoutOptions {
+            rtx_bytes: vec![gib << 30], ..Default::default()
+        }), ..sparks(4) };
+        let automatic = plan(dir.path(), &options).unwrap().memory_layout.unwrap();
+        options.layout.as_mut().unwrap().concurrency = expected;
+        let explicit = plan(dir.path(), &options).unwrap().memory_layout.unwrap();
+        assert_eq!(automatic.pool_tokens, explicit.pool_tokens);
+        assert_eq!(automatic.devices[0].used_bytes(), explicit.devices[0].used_bytes());
+        options.layout.as_mut().unwrap().concurrency = if expected == 16 { 8 } else { 16 };
+        let overridden = plan(dir.path(), &options).unwrap().memory_layout.unwrap();
+        let state = |layout: &cuteafd_core::memory_layout::MemoryLayout| layout.devices[0].items.iter()
+            .find(|item| item.group == "state").unwrap().bytes;
+        assert_ne!(state(&automatic), state(&overridden));
+    }
 }
 
 #[test]
@@ -1188,6 +1231,20 @@ fn qwen_layout_reserves_recurrent_state_before_auto_pool_and_leaves_peer_idle() 
 }
 
 #[test]
+fn v41_small_card_graph_envelope_preserves_pro_allowance() {
+    let dir = snapshot(v41_config(), &[]);
+    for (gib, expected) in [(32, 2u64 << 30), (96, (1u64 << 30) * 150 / 100)] {
+        let options = PlanOptions {
+            layout: Some(layout::LayoutOptions { rtx_bytes: vec![gib << 30], ..Default::default() }),
+            ..sparks(4)
+        };
+        let memory = plan(dir.path(), &options).unwrap().memory_layout.unwrap();
+        let graph = memory.devices[0].items.iter().find(|item| item.group == "graph allowance").unwrap();
+        assert_eq!(graph.bytes, expected);
+    }
+}
+
+#[test]
 fn v41_auto_layout_honors_occupancy_and_disabled_prefix_arenas() {
     use cuteafd_core::memory_layout::Category;
     let mut config = v41_config();
@@ -1212,6 +1269,55 @@ fn v41_auto_layout_honors_occupancy_and_disabled_prefix_arenas() {
     options.layout.as_mut().unwrap().pool_tokens = Some(512);
     let explicit = plan(dir.path(), &options).unwrap().memory_layout.unwrap();
     assert_eq!(explicit.devices[0].capacity_bytes, (96u64 << 30) - (3 << 30));
+}
+
+#[test]
+fn v41_vision_off_removes_only_the_tower_from_fixed_layout() {
+    let mut config = v41_config();
+    let text = &mut config["text_config"];
+    text["num_hidden_layers"] = json!(40);
+    text["head_dim"] = json!(512);
+    text["qk_rope_head_dim"] = json!(64);
+    text["sliding_window"] = json!(128);
+    text["kv_source_layer_ids"] = json!([2, 8, 14, 20]);
+    text["compress_ratios"] = json!((0..40).map(|l| if l < 2 { 0 } else if l < 20 { 2 } else { 1 }).collect::<Vec<_>>());
+    let dir = snapshot(config, &[t("embed.weight", "BF16", &[128, 5120]),
+        t("head.weight", "BF16", &[128, 5120]),
+        t("vision.patch_embed.proj.weight", "BF16", &[16, 3, 14, 14])]);
+    let mut options = sparks(4);
+    options.vision = MediaMode::Auto;
+    options.layout = Some(layout::LayoutOptions { rtx_bytes: vec![32 << 30], pool_tokens: Some(512),
+        local_expert_layers: Some(0), native_mtp_layers: 0, ..Default::default() });
+    use super::encoder::EncoderKind;
+    let auto_report = plan(dir.path(), &options).unwrap();
+    assert_eq!(auto_report.encoder.as_ref().unwrap().kind, EncoderKind::Spark { rank: 0 });
+    let auto = auto_report.memory_layout.unwrap();
+    let vision_item = |i: &&cuteafd_core::memory_layout::Item| i.group.starts_with("vision ");
+    assert!(auto.devices[0].items.iter().all(|i| !i.group.starts_with("vision ")));
+    let tower: u64 = auto.devices[1].items.iter().filter(vision_item).map(|i| i.bytes).sum();
+    assert!(tower > 0);
+    options.vision = MediaMode::Rtx(Some(0));
+    let local = plan(dir.path(), &options).unwrap().memory_layout.unwrap();
+    let local_tower: u64 = local.devices[0].items.iter().filter(vision_item).map(|i| i.bytes).sum();
+    assert!(local_tower > 0);
+    options.vision = MediaMode::Off;
+    let off = plan(dir.path(), &options).unwrap().memory_layout.unwrap();
+    assert!(off.devices.iter().all(|d| d.items.iter().all(|i| !i.group.starts_with("vision "))));
+    assert_eq!(auto.devices[0].used_bytes(), off.devices[0].used_bytes());
+    assert_eq!(auto.devices[1].used_bytes() - off.devices[1].used_bytes(), tower);
+    assert_eq!(local.devices[0].used_bytes() - off.devices[0].used_bytes(), local_tower);
+    assert_eq!(auto.pool_tokens, off.pool_tokens);
+    assert_eq!(local.pool_tokens, off.pool_tokens);
+    use cuteafd_core::memory_layout::Category;
+    assert!(!auto.devices[0].by_category().contains_key(&Category::Embedding));
+    options.layout.as_mut().unwrap().force_gpu_embedding = true;
+    let gpu = plan(dir.path(), &options).unwrap().memory_layout.unwrap();
+    assert!(gpu.devices[0].by_category()[&Category::Embedding] > 0);
+    assert_eq!(gpu.devices[0].used_bytes() - off.devices[0].used_bytes(), 128 * 5120 * 2);
+    options.layout.as_mut().unwrap().force_gpu_embedding = false;
+    options.layout.as_mut().unwrap().rtx_bytes = vec![96 << 30];
+    let pro = plan(dir.path(), &options).unwrap().memory_layout.unwrap();
+    assert!(pro.devices[0].by_category()[&Category::Embedding] > 0);
 }
 
 #[test]
@@ -1362,6 +1468,41 @@ fn media_off_is_disabled_and_saves_checkpoint_bytes() {
     assert_eq!(vision.status, Status::Disabled);
     assert_eq!(vision.bytes, 0);
     assert!(report.disabled_media_bytes > 0);
+}
+
+#[test]
+fn v41_encoder_preserves_experts_and_falls_back_at_runtime_budget() {
+    use super::encoder::EncoderKind;
+    use cuteafd_core::memory_layout::{Category, DeviceKind};
+    let dir = snapshot(v41_config(), &[
+        t("embed.weight", "BF16", &[128, 5120]),
+        t("layers.0.ffn.experts.0.w1.weight", "I8", &[2304, 2560]),
+        t("layers.0.ffn.experts.0.w1.scale", "F8_E8M0", &[2304, 160]),
+        t("vision.embeddings.patch_embedding.weight", "BF16", &[1152, 3, 14, 14]),
+    ]);
+    let options = PlanOptions { layout: Some(layout::LayoutOptions {
+        rtx_bytes: vec![96 << 30], local_expert_layers: Some(0), target_pool_tokens: 32768,
+        spark_allocation_budget_bytes: Some(100 << 30), ..Default::default()
+    }), ..Default::default() };
+    let auto = plan(dir.path(), &options).unwrap();
+    assert_eq!(auto.encoder.as_ref().unwrap().kind, EncoderKind::Spark { rank: 0 });
+    assert_eq!(auto.encoder.as_ref().unwrap().scratch,
+        617_439_296 + super::encoder::V41_SPARK_CUDA_OVERHEAD_BYTES);
+    let local = plan(dir.path(), &PlanOptions { vision: MediaMode::Rtx(Some(0)), ..options.clone() }).unwrap();
+    let off = plan(dir.path(), &PlanOptions { vision: MediaMode::Off, ..options.clone() }).unwrap();
+    assert_eq!(local.encoder.as_ref().unwrap().scratch, 617_439_296);
+    let experts = |report: &PlanReport| report.memory_layout.as_ref().unwrap().devices.iter()
+        .filter(|d| d.kind == DeviceKind::Spark).map(|d| d.items.iter()
+        .filter(|i| i.category == Category::Experts).map(|i| i.bytes).sum::<u64>()).collect::<Vec<_>>();
+    assert_eq!(experts(&auto), experts(&off));
+    assert_eq!(experts(&local), experts(&off));
+    let mut limited = options;
+    limited.layout.as_mut().unwrap().spark_allocation_budget_bytes = Some(1);
+    let fallback = plan(dir.path(), &limited).unwrap();
+    assert_eq!(fallback.encoder.as_ref().unwrap().kind, EncoderKind::Rtx { gpu: 0 });
+    assert_eq!(experts(&fallback), experts(&off));
+    assert_ne!(auto.encoder_plan_hash, local.encoder_plan_hash);
+    assert_ne!(auto.encoder_plan_hash, off.encoder_plan_hash);
 }
 
 #[test]

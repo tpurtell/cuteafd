@@ -101,6 +101,18 @@ def test_wip_builder_streams_every_local_heredoc_into_docker() -> None:
     assert all("-i" in options.split() for options in local_heredocs)
 
 
+def test_dev_image_rebuild_hint_survives_unset_config() -> None:
+    for setup, expected in [("unset RELEASE_CONFIG", "cuteafd.config"),
+                            ("RELEASE_CONFIG=/custom/instance.config", "/custom/instance.config")]:
+        result = subprocess.run(
+            ["bash", "-uc", f'source "$1"; {setup}; release_dev_image_rebuild_hint',
+             "bash", str(ROOT / "scripts/lib/release-common.sh")],
+            text=True, capture_output=True, check=False,
+        )
+        assert result.returncode == 0, result.stderr
+        assert f"--config {expected}, then ./wip.sh --recreate" in result.stdout
+
+
 def test_wip_builder_refuses_stale_dev_images_before_recreating() -> None:
     # A SparkInfer pin bump makes the shared development images stale. The
     # label check must name the rebuild and run before --recreate discards the

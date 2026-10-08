@@ -23,7 +23,10 @@ if tool == 'ssh':
 if tool == 'nvidia-smi':
     gpu = '0, GPU-00000000-0000-0000-0000-000000000000, 00000000:11:00.0'
     memory = os.environ.get('MOCK_GPU_MIB', '97887')
-    print(gpu + (f', {memory}, {memory}' if 'memory.total' in ' '.join(args) else ''))
+    if '--query-gpu=memory.total' in args:
+        print(memory)
+    else:
+        print(gpu + (f', {memory}, {memory}' if 'memory.total' in ' '.join(args) else ''))
     sys.exit(0)
 if tool == 'docker':
     if args == ['info']: sys.exit(0)

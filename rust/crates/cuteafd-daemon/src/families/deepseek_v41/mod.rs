@@ -29,4 +29,5 @@ pub(crate) mod v41_target_head;
 pub(crate) mod v41_target_pass;
 pub(crate) mod v41_tensors;
 pub(crate) mod v41_vision;
+pub(crate) mod v41_vision_encoder;
 pub(crate) mod v41_window;

@@ -18,7 +18,7 @@ pub fn parse_plan_hash(value: &str) -> Result<[u8; 32]> {
     for (i, byte) in hash.iter_mut().enumerate() { *byte = u8::from_str_radix(&value[i*2..i*2+2], 16).context("encoder plan hash")?; }
     Ok(hash)
 }
-fn architecture(library: &Path) -> Result<u32> {
+pub(crate) fn architecture(library: &Path) -> Result<u32> {
     // SAFETY: this is the user-selected, architecture-matching native library.
     let library = unsafe { cuteafd_ffi::NativeLibrary::load(library) }?;
     let info = library.cuda_device_info(0)?;
@@ -52,6 +52,16 @@ pub struct AudioWorkerConfig {
 /// Admit both towers before either owner allocates; ports remain independent.
 pub fn start_encoders(vision: Option<&EncoderWorkerConfig>, audio: Option<&AudioWorkerConfig>,
     snapshot: &Path, library: PathBuf, budget: u64) -> Result<(Option<EncoderServer>, Option<EncoderServer>, u64)> {
+    if vision.is_none() && audio.is_none() { return Ok((None, None, 0)); }
+    let config: serde_json::Value = serde_json::from_reader(std::fs::File::open(snapshot.join("config.json"))?)?;
+    if config["model_type"].as_str() == Some("deepseek_v41") {
+        ensure!(audio.is_none(), "V4.1 audio encoder is unsupported");
+        return match vision {
+            Some(config) => crate::families::deepseek_v41::v41_vision_encoder::start_worker(config, snapshot, library, budget)
+                .map(|(server, bytes)| (Some(server), None, bytes)),
+            None => Ok((None, None, 0)),
+        };
+    }
     if let (Some(vision), Some(audio)) = (vision, audio) {
         ensure!(vision.listen != audio.listen, "image/audio encoder listen addresses must differ");
     }

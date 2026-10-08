@@ -158,8 +158,10 @@ def _family_launch_result(tmp_path: Path, family_config: dict, model: str, keys:
         (bin_dir / tool).chmod(0o755)
     (bin_dir / "curl").write_text('#!/usr/bin/env bash\nprintf \'%s\\n\' \'{"data":[{"id":"test/model"}]}\'\n')
     (bin_dir / "curl").chmod(0o755)
-    (bin_dir / "nvidia-smi").write_text("#!/usr/bin/env bash\nprintf '%s\\n' " +
-                                         " ".join(map(str, physical_gpus)) + "\n" if preferred_ranks is None else
+    (bin_dir / "nvidia-smi").write_text('#!/usr/bin/env bash\ncase "$*" in *memory.total*) echo ' + str(gpu_total_mib) +
+                                         ' ;; *memory.free*) echo ' + str(gpu_free_mib) +
+                                         " ;; *) printf '%s\\n' " + " ".join(map(str, physical_gpus)) +
+                                         ' ;; esac\n' if preferred_ranks is None else
                                          '#!/usr/bin/env bash\ncase "$*" in *memory.free*) echo ' + str(gpu_free_mib) +
                                          ' ;; *memory.total*) echo ' + str(gpu_total_mib) +
                                          ' ;; *query-compute-apps*) printf \'%s\\n\' ' +
@@ -203,6 +205,32 @@ def test_wip_startup_plans_use_staged_slot_mounts_and_entrypoint(tmp_path, qwen)
         for part in ("bin", "lib", "share"):
             assert f"wip-run/plan-test/slot-test/{part}:/opt/cuteafd/{part}:ro" in preflight
         assert "--entrypoint /opt/cuteafd/share/release-entrypoint.sh" in preflight
+
+
+@pytest.mark.parametrize("budget,total,embedding", [("", 32768, "host"), ("31.8", 98304, "host"), ("", 98304, "gpu")])
+def test_mimo_full_context_profile_respects_physical_and_logical_memory(tmp_path, budget, total, embedding):
+    config = {"model_type": "mimo_v2_flash", "num_hidden_layers": 2, "moe_layer_freq": [0, 1]}
+    keys = f"COORDINATOR_GPU_BUDGET_GIB={budget}\nEXPERT_BACKEND=spark\nSPECULATOR=off\nVISION=off\nAUDIO=off\n"
+    result = _family_launch_result(tmp_path, config, "test/mimo", keys, gpu_total_mib=total)
+    assert result.returncode == 0, result.stderr
+    launch = next(line for line in result.stderr.splitlines() if "serve-mimo --snapshot" in line)
+    assert "--max-context 0" in launch
+    assert f"--max-sequences {16 if embedding == 'host' else 8}" in launch
+    assert f"--embedding-placement {embedding}" in launch
+    assert "--pool-tokens 0" in launch
+
+
+@pytest.mark.parametrize("embedding", ["host", "gpu"])
+def test_mimo_small_card_profile_keeps_explicit_overrides(tmp_path, embedding):
+    config = {"model_type": "mimo_v2_flash", "num_hidden_layers": 2, "moe_layer_freq": [0, 1]}
+    keys = f"EMBEDDING={embedding}\nMAX_CONTEXT_TOKENS=65536\nCONCURRENCY=2\nPOOL_TOKENS=131072\nEXPERT_BACKEND=spark\nSPECULATOR=off\nVISION=off\nAUDIO=off\n"
+    result = _family_launch_result(tmp_path, config, "test/mimo", keys, gpu_total_mib=32768)
+    assert result.returncode == 0, result.stderr
+    launch = next(line for line in result.stderr.splitlines() if "serve-mimo --snapshot" in line)
+    assert "--max-context 65536" in launch
+    assert "--max-sequences 2" in launch
+    assert f"--embedding-placement {embedding}" in launch
+    assert "--pool-tokens 131072" in launch
 
 
 @pytest.mark.parametrize("setting,expected", [("", None), ("on", "1"), ("off", "0")])
@@ -676,7 +704,7 @@ def test_mimo_drafter_precision_preserves_auto_and_forwards_explicit_conversion(
         keys += f"{key}={value}\n"
     result = _family_launch_result(tmp_path, config, "test/mimo", keys)
     assert result.returncode == 0, result.stderr
-    launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-mimo" in line)
+    launch = next(line for line in result.stderr.splitlines() if "serve-mimo --snapshot" in line)
     if expected is None:
         assert "--draft-fp8" not in launch
         assert ("--draft-representation checkpoint" in launch) == (value == "auto")
@@ -717,7 +745,7 @@ def test_mimo_weight_policy_is_resolved_by_runtime_and_explicit_checkpoint_is_fo
     keys = "" if policy is None else f"MIMO_WEIGHT_POLICY={policy}\n"
     result = _family_launch_result(tmp_path, config, "arbitrary/local-mimo", keys)
     assert result.returncode == 0, result.stderr
-    launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-mimo" in line)
+    launch = next(line for line in result.stderr.splitlines() if "serve-mimo --snapshot" in line)
     assert "--fp8-head" not in launch and "--fp8-o-proj" not in launch
     if expected is None:
         assert "--weight-policy" not in launch
@@ -794,7 +822,7 @@ def test_mimo_explicit_target_format_overrides_are_forwarded(tmp_path, key, opti
     config = {"model_type": "mimo_v2_flash", "num_hidden_layers": 2, "moe_layer_freq": [0, 1]}
     result = _family_launch_result(tmp_path, config, "test/mimo", f"{key}={value}\n")
     assert result.returncode == 0, result.stderr
-    launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-mimo" in line)
+    launch = next(line for line in result.stderr.splitlines() if "serve-mimo --snapshot" in line)
     if expected is None:
         assert option not in launch
     else:
@@ -892,14 +920,14 @@ def test_both_mimo_model_types_keep_their_supported_split(tmp_path: Path, checkp
     result = _family_launch_result(tmp_path, SPLIT_CONFIGS[checkpoint], "test/model",
                                   "COORDINATOR_GPUS=1,0\n")
     assert result.returncode == 0, result.stderr
-    launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-mimo" in line)
+    launch = next(line for line in result.stderr.splitlines() if "serve-mimo --snapshot" in line)
     assert "--device 1 --split-device 0" in launch and "device=0,1" in launch
 
 
 def test_auto_uses_one_gpu_when_only_one_exists(tmp_path: Path) -> None:
     result = _family_launch_result(tmp_path, SPLIT_CONFIGS["mimo_pro"], "test/model", "", physical_gpus=(0,))
     assert result.returncode == 0, result.stderr
-    launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-mimo" in line)
+    launch = next(line for line in result.stderr.splitlines() if "serve-mimo --snapshot" in line)
     assert "device=0" in launch and "--split-device" not in launch
 
 
@@ -1093,7 +1121,7 @@ def test_flash_mopd_defaults_to_its_qualified_bundled_drafter(tmp_path: Path, ke
     model = "XiaomiMiMo/MiMo-V2.6-Flash-MOPD"
     result = _family_launch_result(tmp_path, config, model, keys)
     assert result.returncode == 0, result.stderr
-    launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-mimo" in line)
+    launch = next(line for line in result.stderr.splitlines() if "serve-mimo --snapshot" in line)
     assert "--fp8-head" not in launch and "--fp8-o-proj" not in launch
     if expected in ("off", "mtp"):
         assert "--draft" not in launch
@@ -1112,7 +1140,7 @@ def test_flash_mopd_external_drafter_does_not_inherit_bundled_precision(tmp_path
                                   "moe_layer_freq": [0, 1]}, "XiaomiMiMo/MiMo-V2.6-Flash-MOPD",
                                   "SPECULATOR=dflash2\nSPECULATOR_MODEL_ID=test/external-draft\n")
     assert result.returncode == 0, result.stderr
-    launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-mimo" in line)
+    launch = next(line for line in result.stderr.splitlines() if "serve-mimo --snapshot" in line)
     assert "models--test--external-draft/snapshots/abc" in launch
     assert "--draft-fp8" not in launch
 
@@ -1257,7 +1285,7 @@ def test_mimo_encoder_plan_hash_and_selected_rank(tmp_path, mode, kind):
     result = _family_launch_result(tmp_path, config, "test/mimo", f"{vision_key}RTX_GPUS=1\nSPECULATOR=off\n", encoder_plan=plan)
     assert result.returncode == 0, result.stderr
     worker = next(line for line in result.stderr.splitlines() if "cuteafd expertd-native" in line)
-    launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-mimo" in line)
+    launch = next(line for line in result.stderr.splitlines() if "serve-mimo --snapshot" in line)
     assert ("--encoder-listen" in worker) == (kind == "spark")
     assert ("--vision-peers 10.0.0.1:19442" in launch) == (kind == "spark")
     assert f"--vision {kind}" in launch
@@ -1273,8 +1301,9 @@ def test_mimo_encoder_plan_hash_and_selected_rank(tmp_path, mode, kind):
 
 
 @pytest.mark.parametrize("warm", [False, True])
-@pytest.mark.parametrize("concurrency", [None, 16])
-def test_mimo_warm_marks_reach_startup_layout(tmp_path, warm, concurrency):
+@pytest.mark.parametrize("concurrency", [None, 8, 16])
+@pytest.mark.parametrize("gpu_total_mib", [32768, 98304])
+def test_mimo_warm_marks_reach_startup_layout(tmp_path, warm, concurrency, gpu_total_mib):
     config = {"model_type": "mimo_v2_flash", "num_hidden_layers": 2,
               "moe_layer_freq": [0, 1], "vision_config": {"depth": 28}}
     plan = {"placement_supported": True, "fits": True, "spark_ranks": 1,
@@ -1284,13 +1313,14 @@ def test_mimo_warm_marks_reach_startup_layout(tmp_path, warm, concurrency):
     if concurrency is not None:
         keys += f"CONCURRENCY={concurrency}\n"
     keys += f"MIMO_PREFIX_DRAFT={'on' if warm else 'off'}\n"
-    result = _family_launch_result(tmp_path, config, "test/mimo", keys, encoder_plan=plan)
+    result = _family_launch_result(tmp_path, config, "test/mimo", keys, encoder_plan=plan,
+                                   gpu_total_mib=gpu_total_mib)
     assert result.returncode == 0, result.stderr
     preflight = next(line for line in result.stderr.splitlines() if "cuteafd plan" in line)
     launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-mimo" in line)
     assert ("--mimo-prefix-draft" in preflight) == warm
     assert ("--mimo-prefix-draft" in launch) == warm
-    effective = concurrency if concurrency is not None else 8
+    effective = concurrency if concurrency is not None else (16 if gpu_total_mib <= 32768 else 8)
     assert f"--concurrency {effective}" in preflight
     assert f"--max-sequences {effective}" in launch
     assert "unbound variable" not in result.stderr
@@ -1309,7 +1339,7 @@ def test_mimo_audio_independent_planner_peers_backend_and_rtx_fallback(tmp_path,
     result = _family_launch_result(tmp_path, config, "test/mimo", f"VISION={vision_kind}\nAUDIO=auto\nRTX_GPUS=1\nSPECULATOR=off\n", encoder_plan=plan)
     assert result.returncode == 0, result.stderr
     worker = next(line for line in result.stderr.splitlines() if "cuteafd expertd-native" in line)
-    launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-mimo" in line)
+    launch = next(line for line in result.stderr.splitlines() if "serve-mimo --snapshot" in line)
     assert f"--audio {audio_kind}:0" in launch
     assert ("--audio-encoder-listen 0.0.0.0:19443" in worker) == (audio_kind == "spark")
     assert ("--encoder-listen 0.0.0.0:19442" in worker) == (vision_kind == "spark")
@@ -1521,7 +1551,7 @@ def test_qualified_mimo_audio_default_and_explicit_off(tmp_path, width, mode, ki
     keys = "VISION=off\nRTX_GPUS=1\nSPECULATOR=off\n" + (f"AUDIO={mode}\n" if mode else "")
     result = _family_launch_result(tmp_path, config, "test/mimo", keys, encoder_plan=plan)
     assert result.returncode == 0, result.stderr
-    launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-mimo" in line)
+    launch = next(line for line in result.stderr.splitlines() if "serve-mimo --snapshot" in line)
     expected = "spark:0" if kind == "spark" else "off"
     assert f"--audio {expected}" in launch
     assert ("--audio-peers" in launch) == (kind == "spark")
@@ -1537,7 +1567,7 @@ def test_mimo_audio_auto_without_admitted_owner_serves_text(tmp_path, tower, rea
             "audio_encoder": {"kind": {"kind": "off"}, "replicas": [], "reason": reason, "shortfall": 1}}
     result = _family_launch_result(tmp_path, config, "test/mimo", "VISION=off\nAUDIO=auto\nRTX_GPUS=1\nSPECULATOR=off\n", encoder_plan=plan)
     assert result.returncode == 0, result.stderr
-    launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-mimo" in line)
+    launch = next(line for line in result.stderr.splitlines() if "serve-mimo --snapshot" in line)
     assert "--audio off" in launch and "--audio-peers" not in launch
     assert ("audio auto disabled" in result.stderr) == tower
 

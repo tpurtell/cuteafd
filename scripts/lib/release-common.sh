@@ -581,9 +581,6 @@ release_load_config() {
 
   [[ "$VISION" =~ ^(auto|off|rtx|spark)(:[0-9]+)?$ && ( "$VISION" != auto:* && "$VISION" != off:* ) ]] ||
     release_die "VISION must be auto, off, rtx[:gpu] or spark[:rank]"
-  if [[ "$MODEL_ID" == deepseek-ai/DeepSeek-V4.1-* ]]; then
-    case "$VISION" in auto|off) ;; *) release_die "V4.1 retains VISION=auto|off" ;; esac
-  fi
   case "$AUDIO" in auto|off) ;; *) release_die "AUDIO must be auto or off" ;; esac
   case "$MODEL_VARIANT" in flash|pro) ;; *) release_die "MODEL_VARIANT must be flash or pro" ;; esac
   case "$EXPERT_FORMAT" in native|exl3) ;; *) release_die "EXPERT_FORMAT must be native or exl3" ;; esac
@@ -1461,7 +1458,7 @@ release_tp2_enabled() {
 # Development images bake in the pinned SparkInfer, so a pin bump needs a
 # rebuild before WIP slots are built or launched from them.
 release_dev_image_rebuild_hint() {
-  printf 'rebuild the shared development images at this pin with scripts/build/build-dev-images.sh --config %s, then ./wip.sh --recreate' "$RELEASE_CONFIG"
+  printf 'rebuild the shared development images at this pin with scripts/build/build-dev-images.sh --config %s, then ./wip.sh --recreate' "${RELEASE_CONFIG:-cuteafd.config}"
 }
 
 # WHERE names the host, LABEL is the image's io.cuteafd.sparkinfer.revision.

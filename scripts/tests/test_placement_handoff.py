@@ -20,20 +20,23 @@ if tool=='docker':
  if args[0]=='inspect':print('running')
  elif args[0]=='exec' and 'cat' in args:
   print(Path(os.environ['PLAN']).read_text())
+ elif args[0]=='run' and 'plan' in args:
+  print(os.environ['ENCODER_PLAN'])
  elif args[0]=='run':print('container-id')
 else:
  sys.stdin.read() if '-s' in args else None
 '''
 
 class PlacementHandoffTest(unittest.TestCase):
-    def run_startup(self, gpus, plan, options=(), spark_count=4, local_layers="auto"):
+    def run_startup(self, gpus, plan, options=(), spark_count=4, local_layers="auto", encoder=None):
         source=(ROOT/'run.sh').read_text()
         block=source[source.index('placement_directory='):source.index('api_url=')]
         with tempfile.TemporaryDirectory() as directory:
             root=Path(directory); (root/'plan').write_text(json.dumps(plan))
             for name in ['docker','ssh','nest']:
                 path=root/name;path.write_text(STUB);path.chmod(0o755)
-            env=dict(os.environ,PATH=str(root)+os.pathsep+os.environ['PATH'],EVENTS=str(root/'events'),PLAN=str(root/'plan'))
+            env=dict(os.environ,PATH=str(root)+os.pathsep+os.environ['PATH'],EVENTS=str(root/'events'),PLAN=str(root/'plan'),
+                ENCODER_PLAN=json.dumps(encoder))
             setup=r'''
 set -euo pipefail
 source scripts/lib/release-common.sh
@@ -57,8 +60,10 @@ KV_POOL_SIZE=
 MEMORY_RESERVATION=
 DSPARK=on
 EMBEDDING=gpu
-VISION=auto
+VISION=off
 AUDIO=off
+RELEASE_MODEL_REVISION=0123456789012345678901234567890123456789
+lanes=(10.55.0.1 10.55.0.2 10.55.0.3 10.55.0.4)
 # Mirror the run.sh scope the extracted block relies on: release_load_config
 # defaults DSPARK_DRAFT_POLICY, and run.sh's argument parsing always defines
 # dspark_draft_limit (empty unless --dspark-draft-limit was passed). Omitting
@@ -88,6 +93,8 @@ spark_first_layer=0
 wip_layout=
 wip_slot=
 '''
+            if encoder is not None:
+                setup+='\nVISION=auto\n'
             setup+=f'\nRTX_EXPERT_LAYERS={local_layers}\nSPARK_COUNT={spark_count}\nhosts=("${{hosts[@]:0:SPARK_COUNT}}")\n'
             # Legacy geometry: release_spark_tp defaults to SPARK_COUNT and
             # release_spark_ep to 1 when no explicit topology is configured.
@@ -141,6 +148,22 @@ wip_slot=
                 starts = [args for tool, args in events if tool == 'ssh' and '-s' in args]
                 self.assertEqual(len(starts), 4)
                 self.assertTrue(all(self.worker_tail(args)[8] == str(layers) for args in starts))
+
+    def test_spark_vision_plan_reaches_only_selected_encoder_rank(self):
+        encoder=dict(encoder=dict(kind=dict(kind='spark',rank=2)),encoder_plan_hash='ab'*32)
+        result,events=self.run_startup(2,dict(version=1,rtx_gpus=2,nonce='fresh',
+            rtx_expert_layers=20,spark_first_layer=20),encoder=encoder)
+        self.assertEqual(result.returncode,0,result.stderr)
+        plans=[args for tool,args in events if tool=='docker' and 'plan' in args]
+        self.assertEqual(len(plans),1)
+        coordinator=next(args for tool,args in events if tool=='docker' and 'serve-native' in args)
+        self.assertEqual(coordinator[coordinator.index('--vision-peers')+1],'10.55.0.3:19541')
+        self.assertEqual(coordinator[coordinator.index('--encoder-plan-hash')+1],'ab'*32)
+        tails=[self.worker_tail(args) for tool,args in events if tool=='ssh' and '-s' in args]
+        self.assertEqual(len(tails),4)
+        self.assertTrue(all(tail[18:]==['2','19541','ab'*32,
+            '0123456789012345678901234567890123456789'] for tail in tails))
+        self.assertIn('if [[ "$rank" == "${19:--1}" ]]', (ROOT/'run.sh').read_text())
 
     def test_compact_starts_exactly_two_workers_and_passes_ceiling(self):
         result,events=self.run_startup(1,dict(version=1,rtx_gpus=1,nonce="fresh",rtx_expert_layers=0,spark_first_layer=0),spark_count=2)

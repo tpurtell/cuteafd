@@ -431,6 +431,10 @@ impl AttentionQueryWave<'_, '_> {
             // The normalized input is complete here; cache producers fork from it.
             unsafe { crate::shared::memory::chain::mark_fork(self.stream.library, self.stream.raw)?; }
             let rows = tokens.len() as u32;
+            if !super::v41_layer_graphs::captures_shape(rows) {
+                unsafe { self.execute(rows)?; }
+                return Ok(());
+            }
             if self
                 .graphs
                 .get_shape(self.weights.layer, self.weights, rows)
@@ -487,7 +491,9 @@ impl AttentionQueryWave<'_, '_> {
         if graph.is_none() {
             // Eager output is complete; capture only records the next execution.
             // Replaying now would duplicate work whenever a shape was evicted.
-            unsafe { self.capture_ready(rows)?; }
+            if super::v41_layer_graphs::captures_shape(rows) {
+                unsafe { self.capture_ready(rows)?; }
+            }
         }
         self.ready = Some(rows);
         self.tokens.extend_from_slice(tokens);
@@ -541,7 +547,7 @@ impl AttentionQueryWave<'_, '_> {
                 self.norm.rope(self.b(3),self.b(6),self.b(3),rows,64,false,stream)
             }).await?;
         }
-        if graph.is_none() {
+        if graph.is_none() && super::v41_layer_graphs::captures_shape(rows) {
             unsafe { self.stream.library.cuda_graph_begin_capture(self.stream.raw)?; }
             let queued=unsafe { self.enqueue_rank(rows) };
             let captured=unsafe { self.stream.library.cuda_graph_end_capture(self.stream.raw) };

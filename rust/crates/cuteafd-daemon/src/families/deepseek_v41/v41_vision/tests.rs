@@ -7,6 +7,7 @@ use std::{path::PathBuf, time::Instant};
 fn scratch_is_bounded_by_patch_capacity() -> Result<()> {
     let sizes = VisionRuntime::buffer_sizes(9216)?;
     assert_eq!(sizes.len(), 18);
+    assert_eq!(sizes.iter().sum::<usize>() + V41VisionOps::WORKSPACE_BYTES, 617_439_296);
     assert!(sizes.iter().sum::<usize>() < 768 << 20);
     assert_eq!(sizes[Slot::Scores as usize], 9216 * 16 * 128 * 4);
     assert!(VisionRuntime::buffer_sizes(0).is_err());
@@ -35,15 +36,17 @@ fn native_full_vision_vectors() -> Result<()> {
         cuteafd_loader::read_official_v41_catalog(cuteafd_loader::OFFICIAL_V41_MODEL_ID, &model)?;
     let bytes = VisionRuntime::device_bytes(&catalog, 9216)?;
     assert!(VisionRuntime::new(&lib, &catalog, 9216, bytes - 1).is_err());
+    let free_before = lib.cuda_memory_info()?.0;
     let started = Instant::now();
     let mut runtime = VisionRuntime::new(&lib, &catalog, 9216, bytes)?;
+    let free_after = lib.cuda_memory_info()?.0;
     runtime.fp32_attention = std::env::var_os("CUTEAFD_VISION_FP32_ATTENTION").is_some();
     let load_seconds = started.elapsed().as_secs_f64();
     let mut cases = Vec::new();
     let grids = if std::env::var_os("CUTEAFD_VISION_SMALL").is_some() {
         vec![(5, 7)]
     } else {
-        vec![(5, 7), (39, 39), (3, 3063), (5, 7)]
+        vec![(5, 7), (39, 39), (93, 93), (3, 3063), (5, 7)]
     };
     let mut inputs = Vec::new();
     for (height, width) in grids {
@@ -121,6 +124,7 @@ fn native_full_vision_vectors() -> Result<()> {
         std::fs::write(
             output.join("cases.json"),
             serde_json::to_vec_pretty(&json!({"device_bytes":bytes,
+            "free_before":free_before,"free_after":free_after,"observed_device_delta":free_before.saturating_sub(free_after),
             "weight_bytes":runtime.weights.resident_bytes(),"fp32_attention":runtime.fp32_attention,"load_seconds":load_seconds,"cases":cases}))?,
         )?;
         eprintln!(

@@ -4,6 +4,10 @@ use serde::Serialize;
 
 const GIB: u64 = 1 << 30;
 
+/// SM121 tower free-memory delta was 2,670,125,056 bytes for a 1,587,976,256-byte
+/// ledger. Reserve 1.25 GiB for CUDA context/modules (measured overhead + margin).
+pub const V41_SPARK_CUDA_OVERHEAD_BYTES: u64 = 5 * GIB / 4;
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case", tag = "kind")]
 pub enum EncoderKind {
@@ -65,14 +69,19 @@ pub fn encoder_placement(mode: MediaMode, hardware: &EncoderHardware, weights: u
         kind: EncoderKind::Off, weights: 0, scratch: 0, replicas: vec![], reason: reason.into(), shortfall,
     };
     if mode == MediaMode::Off || weights == 0 { return off("disabled or no checkpoint tower", 0); }
-    let make = |kind, replicas, reason: &str| EncoderPlacement {
-        kind, weights, scratch, replicas, reason: reason.into(), shortfall: 0,
+    let spark_overhead = if hardware.v41 { V41_SPARK_CUDA_OVERHEAD_BYTES } else { 0 };
+    let spark_required = required.saturating_add(spark_overhead);
+    let make = |kind, replicas, reason: &str| {
+        let overhead = if matches!(&kind, EncoderKind::Spark { .. } | EncoderKind::SparkIdle { .. }) { spark_overhead } else { 0 };
+        EncoderPlacement {
+            kind, weights, scratch: scratch.saturating_add(overhead), replicas, reason: reason.into(), shortfall: 0,
+        }
     };
     let mut sparks: Vec<_> = hardware.sparks.iter()
-        .filter(|s| s.free_bytes >= required.saturating_add(GIB))
+        .filter(|s| s.free_bytes >= spark_required.saturating_add(GIB))
         .collect();
     sparks.sort_by_key(|s| (!s.idle, s.expert_bytes, std::cmp::Reverse(s.free_bytes), s.rank));
-    if !hardware.v41 && matches!(mode, MediaMode::Auto | MediaMode::Spark(_)) {
+    if matches!(mode, MediaMode::Auto | MediaMode::Spark(_)) {
         if let MediaMode::Spark(Some(rank)) = mode {
             if let Some(index) = sparks.iter().position(|s| s.rank == rank) { sparks.swap(0, index); }
             else { sparks.clear(); }
@@ -87,7 +96,7 @@ pub fn encoder_placement(mode: MediaMode, hardware: &EncoderHardware, weights: u
         }
         if matches!(mode, MediaMode::Spark(_)) {
             let room = hardware.sparks.iter().map(|s| s.free_bytes).max().unwrap_or(0);
-            return off("requested Spark encoder/replicas unavailable", required.saturating_add(GIB).saturating_sub(room));
+            return off("requested Spark encoder/replicas unavailable", spark_required.saturating_add(GIB).saturating_sub(room));
         }
     }
     let preferred = match mode {
@@ -126,6 +135,23 @@ mod tests {
         assert_eq!(off.shortfall, 2 * GIB);
         h.v41 = true;
         assert_eq!(default_encoder_placement(&h, 2 * GIB, GIB).kind, EncoderKind::Rtx { gpu: 0 });
+        h.sparks[0].free_bytes = 20 * GIB;
+        assert_eq!(default_encoder_placement(&h, 2 * GIB, GIB).kind, EncoderKind::Spark { rank: 0 });
+    }
+    #[test]
+    fn v41_spark_charges_measured_cuda_overhead_before_guard() {
+        let mut h = hw(1, 1, 96);
+        h.v41 = true;
+        let ledger = 1_587_976_256;
+        let admitted = ledger + V41_SPARK_CUDA_OVERHEAD_BYTES;
+        h.sparks[0].free_bytes = admitted + GIB - 1;
+        assert_eq!(default_encoder_placement(&h, ledger, 0).kind, EncoderKind::Rtx { gpu: 0 });
+        assert_eq!(encoder_placement(MediaMode::Spark(None), &h, ledger, 0, 1).shortfall, 1);
+        h.sparks[0].free_bytes += 1;
+        let spark = default_encoder_placement(&h, ledger, 0);
+        assert_eq!(spark.kind, EncoderKind::Spark { rank: 0 });
+        assert_eq!(spark.admitted_bytes(), admitted);
+        assert!(admitted > 2_670_125_056);
     }
     #[test]
     fn independent_audio_placement_sees_vision_reservation_and_preserves_kv() {

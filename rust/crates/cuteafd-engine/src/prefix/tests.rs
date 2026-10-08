@@ -223,6 +223,27 @@ fn cache(fake: &Fake, entries: usize, host_bytes: u64) -> PrefixCache<Shared> {
     PrefixCache::new(fake.layout(), config(entries, fake.slots), Some((host, Shared(fake.mem.clone())))).unwrap()
 }
 
+#[test]
+fn growing_live_leases_is_atomic_and_never_evicts_live_pages() {
+    let fake = Fake::new(8, 2, 4);
+    let mut cache = cache(&fake, 0, 0);
+    let placement = |pages| Placement { pages, ring: 0, len: 0, ring_from: 0 };
+    let mut a = cache.admit_cold(&fake, 1, 1, placement).unwrap().placement.pages;
+    let b = cache.admit_cold(&fake, 1, 1, placement).unwrap().placement.pages;
+    let rows = cache.pool().page_rows();
+    cache.grow(&fake, &mut a, 7 * rows).unwrap();
+    assert_eq!(a.len(), 7);
+    let before = a.clone();
+    assert!(cache.grow(&fake, &mut a, 8 * rows).is_err());
+    assert_eq!(a, before);
+    assert_eq!(cache.pool().refs(b[0]), 1);
+    cache.release(&fake, &b).unwrap();
+    cache.grow(&fake, &mut a, 8 * rows).unwrap();
+    assert_eq!(a.len(), 8);
+    cache.release(&fake, &a).unwrap();
+    assert_eq!(cache.pool().free(), 8);
+}
+
 /// One request through the cache: admit, prefill the rest, capture its prompt, then optionally
 /// "decode" `generated` tokens and capture a turn. Returns (resume, final tokens, placement).
 fn serve(cache: &mut PrefixCache<Shared>, fake: &Fake, ring: usize, prompt: &[u32], generated: &[u32],

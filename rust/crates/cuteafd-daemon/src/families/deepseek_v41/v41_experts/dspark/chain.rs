@@ -391,6 +391,9 @@ impl DsparkChain<'_, '_> {
         match (launched, captured) {
             (Ok(()), Ok(graph)) => {
                 self.graphs.insert((count, self.width), (graph, reads.each_ref().map(|r| r.owner)));
+                tracing::debug!(target: "cuteafd::graph_capture", count, width=self.width,
+                    bank=self as *const Self as usize, retained=self.graphs.len(),
+                    "native dSpark chain graph captured");
                 Ok(())
             }
             (Err(error), Ok(graph)) => {

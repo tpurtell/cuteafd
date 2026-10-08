@@ -4,7 +4,7 @@ use crate::plan::Checkpoint;
 use cuteafd_core::memory_layout::{Basis, Category, Item};
 use std::collections::BTreeMap;
 
-pub const DEFAULT_POOL_TOKENS: u64 = 14 * 1_048_576;
+pub const DEFAULT_POOL_TOKENS: u64 = 2 * 1_048_576;
 
 /// Native MXFP4 packer storage, including the padding of each intermediate
 /// slice. This applies to full RTX experts and each independently packed TP
@@ -14,7 +14,7 @@ pub fn native_expert_bytes(experts: u64, hidden: u64, intermediate: u64) -> u64 
 }
 
 /// Default backbone/dSpark weights, without routed backbone experts. Vision
-/// remains BF16 on RTX0. Target embedding lives on RTX0, target normalization
+/// is admitted separately by the encoder placement. Target embedding lives on RTX0, target normalization
 /// on the decoder (RTX1 under CED), and vocabulary is evenly partitioned
 /// in the default single-copy FP8 representation.
 /// dSpark weights stay on the decoder; default experts are full copies there.
@@ -58,7 +58,7 @@ pub fn resident_weights(checkpoint: &Checkpoint, ranks: usize, dspark: bool)
         if name == "embed.weight" { add(0, Category::Embedding, "embedding", &format, bytes); continue; }
         if name == "norm.weight" { add(decoder, Category::Weights, "norm", &format, bytes); continue; }
         if name.starts_with("vision.") || name.starts_with("aligner.") || name.starts_with("image_") {
-            add(0, Category::Weights, "vision", &format, bytes); continue;
+            continue;
         }
         let Some((layer, rest)) = name.strip_prefix("layers.").and_then(|s| s.split_once('.')) else { continue; };
         let layer: usize = layer.parse().ok()?;
@@ -189,4 +189,12 @@ mod tests {
         assert_eq!(sum(&dual[0]), 200 + 51 + 3300 + 1650);
         assert_eq!(sum(&dual[1]), 51 + 20 + 6600 + 1650);
     }
+}
+
+/// Exact resident scratch owned by the V4.1 9216-patch tower, excluding weights.
+pub fn vision_scratch_bytes() -> u64 {
+    let n = 9216u64;
+    n*588*2 + n*2048*6 + n*6144 + n*5632*2 + n*2816*2
+        + (n*3072).max(1024*5120)*4 + n*16*128*4 + n*16*128*2
+        + 1024*9216*2 + 3*1024*5120*2 + 16*4 + 4*1024*1024
 }

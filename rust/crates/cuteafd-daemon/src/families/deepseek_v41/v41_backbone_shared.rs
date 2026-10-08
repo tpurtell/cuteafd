@@ -286,6 +286,11 @@ impl BackboneSharedWave<'_, '_> {
                 input.values.bytes, self.stream.raw) { self.synchronize()?; return Err(error); }
         }
         let rows = input.tokens.len() as u32;
+        if !super::v41_layer_graphs::captures_shape(rows) {
+            unsafe { self.execute(rows)?; }
+            self.origin = Some(input.binding());
+            return self.output();
+        }
         if self
             .graphs
             .get_shape(self.layer, self.weights, rows)
@@ -327,7 +332,7 @@ impl BackboneSharedWave<'_, '_> {
         })();
         if let Err(error) = launched { self.synchronize()?; return Err(error); }
         unsafe { crate::shared::memory::chain::finish_cooperative(&self.stream).await?; }
-        if cold {
+        if cold && super::v41_layer_graphs::captures_shape(rows) {
             // The eager execution above already completed these inputs. Capture
             // records future launches without executing them; publish that result
             // instead of running the same work again on every cache miss.

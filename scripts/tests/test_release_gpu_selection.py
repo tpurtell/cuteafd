@@ -87,22 +87,22 @@ class ReleaseGpuSelectionTest(unittest.TestCase):
         selected = json.loads(result.stdout)
         self.assertEqual(selected["count"], 2)
         self.assertEqual(selected["decision"], "automatic-dual")
-        self.assertEqual(selected["groups"], 28_736)
-        self.assertEqual(selected["required_mib"], [96_176, 96_778])
+        self.assertEqual(selected["groups"], 4160)
+        self.assertEqual(selected["required_mib"], [89_840, 92_554])
         self.assertEqual([gpu["uuid"] for gpu in selected["gpus"]], [PRIMARY, SECONDARY])
 
     def test_auto_falls_back_without_memory_or_bidirectional_peer_reads(self) -> None:
-        for free, p2p in ((96_000, True), (96_900, False)):
+        for free, p2p in ((92_000, True), (96_900, False)):
             with self.subTest(free=free, p2p=p2p):
                 result = self.invoke(secondary_free=free, p2p=p2p)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(json.loads(result.stdout)["count"], 1)
 
     def test_force_two_reports_memory_requirements(self) -> None:
-        result = self.invoke(mode="2", secondary_free=96_000)
+        result = self.invoke(mode="2", secondary_free=92_000)
         self.assertEqual(result.returncode, 2)
         self.assertIn("forced two-RTX mode is infeasible", result.stderr)
-        self.assertIn("96176/96778 MiB", result.stderr)
+        self.assertIn("89840/92554 MiB", result.stderr)
 
     def test_force_one_does_not_apply_dual_pool_constraints(self) -> None:
         result = self.invoke(mode="1", extra=("--kv-pool-size", "1B"))

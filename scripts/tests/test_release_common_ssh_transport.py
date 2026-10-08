@@ -254,6 +254,7 @@ topology_explicit=explicit
 spark_tp=2
 spark_ep=2
 wip_slot=
+encoder_rank=-1
 """
 
 BATCH = ["-o", "BatchMode=yes"]

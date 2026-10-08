@@ -7,7 +7,7 @@ use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::{
     CuteafdDeviceBuffer, NativeLibrary, V41CandidateBlocks, V41IndexScores, V41IndexTopK,
 };
-use std::{collections::VecDeque, cell::Cell, ffi::c_void, marker::PhantomData, rc::Rc};
+use std::{collections::{BTreeSet, VecDeque}, cell::Cell, ffi::c_void, marker::PhantomData, rc::Rc};
 const WIDTH: usize = 16384;
 const BLOCKS: usize = WIDTH / 8;
 // Index fingerprints include request layouts; retain a bounded recent set.
@@ -96,6 +96,8 @@ pub(crate) struct IndexSelectionWave<'a> {
     graph: Option<(*mut c_void, Vec<usize>)>,
     retained_graphs: VecDeque<(*mut c_void, Vec<usize>)>,
     retain_decode_graphs: bool,
+    fixed_captures: BTreeSet<Vec<usize>>,
+    fixed_recaptures: usize,
     ready: Option<Ready>,
     pending: Option<Ready>,
     in_flight: bool,
@@ -152,7 +154,7 @@ impl<'a> IndexSelectionWave<'a> {
             score: library.v41_index_scores()?,
             top: library.v41_index_topk()?,
             candidates: library.v41_candidate_blocks()?,
-            graph: None, retained_graphs: VecDeque::new(), retain_decode_graphs: false,
+            graph: None, retained_graphs: VecDeque::new(), retain_decode_graphs: false, fixed_captures: BTreeSet::new(), fixed_recaptures: 0,
             ready: None,
             pending: None,
             in_flight: false,
@@ -185,7 +187,7 @@ impl<'a> IndexSelectionWave<'a> {
             shared_scratch_busy: Some(busy.clone()), staging: LayerStaging::new(library, capacity * 56, 40)?,
             capacity, score: library.v41_index_scores()?, top: library.v41_index_topk()?,
             candidates: library.v41_candidate_blocks()?, graph: None,
-            retained_graphs: VecDeque::new(), retain_decode_graphs: false, ready: None, pending: None, in_flight: false,
+            retained_graphs: VecDeque::new(), retain_decode_graphs: false, fixed_captures: BTreeSet::new(), fixed_recaptures: 0, ready: None, pending: None, in_flight: false,
         };
         source.shared_scratch_busy = Some(busy);
         Ok(value)
@@ -204,24 +206,47 @@ impl<'a> IndexSelectionWave<'a> {
     }
     /// Invalidate published selections without discarding immutable launch shapes.
     pub fn restart(&mut self) -> Result<()> {
-        if !self.retain_decode_graphs { return self.clear_graph(); }
+        if !self.retain_decode_graphs && super::v41_layer_graphs::fixed_binding_limit().is_none() {
+            return self.clear_graph();
+        }
         ensure!(!self.in_flight, "index selection pending");
         self.stream.require_complete()?;
         self.ready = None;
         Ok(())
     }
-    fn select_graph(&mut self, fingerprint: &[usize]) -> Result<()> {
-        if self.graph.as_ref().is_some_and(|(_, key)| key == fingerprint) { return Ok(()); }
-        if !self.retain_decode_graphs { return self.clear_graph(); }
-        self.restart()?;
-        let found = self.retained_graphs.iter().position(|(_, key)| key == fingerprint)
-            .and_then(|index| self.retained_graphs.remove(index));
+    fn select_graph(&mut self, fingerprint: &[usize]) -> Result<bool> {
+        // Eight indexed layers share this owner; source identities remain exact.
+        let policy = super::v41_layer_graphs::fixed_binding_limit().map(|limit| (
+            super::v41_layer_graphs::captures_shape(fingerprint[1] as u32), limit * 8));
+        self.select_graph_with_policy(fingerprint, policy)
+    }
+    fn select_graph_with_policy(&mut self, fingerprint: &[usize], policy: Option<(bool, usize)>) -> Result<bool> {
+        if self.graph.as_ref().is_some_and(|(_, key)| key == fingerprint) { return Ok(true); }
+        let fixed_limit = policy.map(|(_, limit)| limit);
+        let cached = self.retained_graphs.iter().position(|(_, key)| key == fingerprint);
+        if let Some(limit) = fixed_limit {
+            ensure!(!self.in_flight, "index selection pending");
+            self.stream.require_complete()?;
+            self.ready = None;
+            if !fixed_binding_admitted(cached.is_some(), policy.unwrap().0,
+                self.retained_graphs.len() + usize::from(self.graph.is_some()), limit) {
+                tracing::debug!(target: "cuteafd::target_step", rows=fingerprint[1],
+                    retained=self.retained_graphs.len(), "V4.1 index selection eager binding");
+                return Ok(false);
+            }
+        } else if !self.retain_decode_graphs {
+            self.clear_graph()?;
+            return Ok(true);
+        } else {
+            self.restart()?;
+        }
+        let found = cached.and_then(|index| self.retained_graphs.remove(index));
         if let Some(old) = self.graph.take() {
             // Fingerprint begins with layer and row count. All remaining fields
             // (including source pointers, widths and candidate mode) still match
             // exactly before replay. Large prefill graphs are never retained.
-            if old.1[1] <= 8 * (cuteafd_core::MAX_DSPARK_PROPOSALS + 1) {
-                if self.retained_graphs.len() == MAX_RETAINED_DECODE_GRAPHS {
+            if fixed_limit.is_some() || old.1[1] <= 8 * (cuteafd_core::MAX_DSPARK_PROPOSALS + 1) {
+                if fixed_limit.is_none() && self.retained_graphs.len() == MAX_RETAINED_DECODE_GRAPHS {
                     let (graph, _) = self.retained_graphs.pop_front().unwrap();
                     unsafe { self.stream.library.cuda_graph_exec_destroy(graph)?; }
                 }
@@ -236,7 +261,19 @@ impl<'a> IndexSelectionWave<'a> {
                 retained=self.retained_graphs.len(), retain=self.retain_decode_graphs,
                 key=?fingerprint, "graph cache miss");
         }
-        Ok(())
+        Ok(true)
+    }
+    fn record_fixed_capture(&mut self, fingerprint: &[usize]) {
+        if !self.fixed_captures.insert(fingerprint.to_vec()) {
+            self.fixed_recaptures += 1;
+            tracing::warn!(target: "cuteafd::graph_capture", site="index_selection",
+                recaptures=self.fixed_recaptures, key=?fingerprint,
+                "fixed index selection graph recaptured");
+        }
+        tracing::debug!(target: "cuteafd::graph_capture", site="index_selection",
+            captures=self.fixed_captures.len(), recaptures=self.fixed_recaptures,
+            retained=self.retained_graphs.len() + 1,
+            "fixed index selection graph bank");
     }
     pub fn clear_graph(&mut self) -> Result<()> {
         ensure!(!self.in_flight, "index selection pending");
@@ -513,7 +550,7 @@ impl<'a> IndexSelectionWave<'a> {
             }
             staging[rows * 48 + i * 8..rows * 48 + i * 8 + 8].copy_from_slice(&m[1].to_ne_bytes());
         }
-        self.select_graph(&fingerprint)?;
+        let capture = self.select_graph(&fingerprint)?;
         if defer {
             self.in_flight = true;
             if let Some(busy) = &self.shared_scratch_busy { busy.set(true); }
@@ -530,7 +567,7 @@ impl<'a> IndexSelectionWave<'a> {
             self.stream.library.copy_h2d(metadata, &staged[..rows * 48])?;
             self.stream.library.copy_h2d(lengths, &staged[rows * 48..rows * 56])?;
         }
-        if self.graph.is_none() {
+        if capture && self.graph.is_none() {
             unsafe {
                 self.stream
                     .library
@@ -541,7 +578,12 @@ impl<'a> IndexSelectionWave<'a> {
             };
             let captured = unsafe { self.stream.library.cuda_graph_end_capture(self.stream.raw) };
             match (launched, captured) {
-                (Ok(()), Ok(g)) => self.graph = Some((g, fingerprint)),
+                (Ok(()), Ok(g)) => {
+                    if super::v41_layer_graphs::fixed_binding_limit().is_some() {
+                        self.record_fixed_capture(&fingerprint);
+                    }
+                    self.graph = Some((g, fingerprint));
+                },
                 (Err(e), Ok(g)) => {
                     unsafe {
                         self.stream.library.cuda_graph_exec_destroy(g)?;
@@ -551,8 +593,12 @@ impl<'a> IndexSelectionWave<'a> {
                 (Err(e), Err(_)) | (Ok(()), Err(e)) => return Err(e),
             }
         }
-        let g = self.graph.as_ref().context("selection graph missing")?.0;
-        let launched = unsafe { self.stream.library.cuda_graph_launch(g, self.stream.raw) };
+        let launched = if capture {
+            let g = self.graph.as_ref().context("selection graph missing")?.0;
+            unsafe { self.stream.library.cuda_graph_launch(g, self.stream.raw) }
+        } else {
+            unsafe { self.enqueue(query, requests, shared, rows, tiles, width, use_candidates) }
+        };
         let ready = Ready { origin: query.origin(), layer: query.layer, rows, bindings };
         if defer {
             launched?;
@@ -579,6 +625,9 @@ impl<'a> IndexSelectionWave<'a> {
         })
     }
 }
+fn fixed_binding_admitted(cached: bool, allowed_shape: bool, count: usize, limit: usize) -> bool {
+    cached || (allowed_shape && count < limit)
+}
 impl Drop for IndexSelectionWave<'_> {
     fn drop(&mut self) {
         if let Err(error) = self.abort_pending() { tracing::error!(%error, "draining pending index selection"); }
@@ -591,6 +640,17 @@ impl Drop for IndexSelectionWave<'_> {
 #[cfg(test)]
 mod graph_tests {
     use super::*;
+
+    #[test]
+    fn fixed_selection_bank_keeps_hits_and_never_captures_overflow() {
+        for limit in [192, 256] {
+            assert!(fixed_binding_admitted(false, true, limit - 1, limit));
+            assert!(!fixed_binding_admitted(false, true, limit, limit));
+            assert!(fixed_binding_admitted(true, true, limit, limit));
+            assert!(fixed_binding_admitted(true, false, limit, limit));
+            assert!(!fixed_binding_admitted(false, false, 0, limit));
+        }
+    }
 
     #[test]
     fn tile_buckets_cover_causal_rows_without_unaligned_tiles() {
@@ -643,7 +703,7 @@ mod graph_tests {
             .into_iter().enumerate() {
             wave.restart()?;
             let fingerprint = vec![layer, rows, input.ptr as usize, output.ptr as usize];
-            wave.select_graph(&fingerprint)?;
+            assert!(wave.select_graph_with_policy(&fingerprint, None)?);
             if wave.graph.is_none() {
                 unsafe {
                     library.cuda_graph_begin_capture(wave.stream.raw)?;
@@ -675,7 +735,7 @@ mod graph_tests {
         for key in 0..MAX_RETAINED_DECODE_GRAPHS + 3 {
             wave.restart()?;
             let fingerprint = vec![2, 4, input.ptr as usize, output.ptr as usize, key];
-            wave.select_graph(&fingerprint)?;
+            assert!(wave.select_graph_with_policy(&fingerprint, None)?);
             assert!(wave.graph.is_none());
             unsafe {
                 library.cuda_graph_begin_capture(wave.stream.raw)?;
@@ -698,6 +758,49 @@ mod graph_tests {
         assert!(!wave.retained_graphs.iter().any(|(_, key)| key[4] == 0));
         wave.clear_graph()?;
         assert!(wave.graph.is_none() && wave.retained_graphs.is_empty());
+        // A full fixed bank replays exact hits and leaves both handles intact
+        // while overflow or excluded shapes execute directly on the same stream.
+        let mut fixed_handles = std::collections::BTreeMap::new();
+        for (iteration, (key, rows, allowed)) in
+            [(0, 4, true), (1, 4, true), (2, 4, true), (3, 80, false), (0, 4, true), (1, 4, true)]
+                .into_iter().enumerate() {
+            wave.restart()?;
+            let fingerprint = vec![2, rows, input.ptr as usize, output.ptr as usize, key];
+            let capture = wave.select_graph_with_policy(&fingerprint, Some((allowed, 2)))?;
+            assert_eq!(capture, key < 2);
+            if capture && wave.graph.is_none() {
+                // SAFETY: both allocations outlive the bank and the stream is drained.
+                let graph = unsafe {
+                    library.cuda_graph_begin_capture(wave.stream.raw)?;
+                    library.copy_d2d_async(output, input, rows * 4, wave.stream.raw)?;
+                    library.cuda_graph_end_capture(wave.stream.raw)?
+                };
+                wave.graph = Some((graph, fingerprint.clone()));
+                wave.record_fixed_capture(&fingerprint);
+            }
+            let value = iteration as u8 + 1;
+            library.copy_h2d(input, &vec![value; 320])?;
+            library.copy_h2d(output, &[0; 320])?;
+            // SAFETY: inputs/outputs are live, shape-exact, and exclusive until synchronize.
+            unsafe {
+                if capture {
+                    let graph = wave.graph.as_ref().unwrap().0;
+                    assert_eq!(*fixed_handles.entry(key).or_insert(graph), graph);
+                    library.cuda_graph_launch(graph, wave.stream.raw)?;
+                } else {
+                    library.copy_d2d_async(output, input, rows * 4, wave.stream.raw)?;
+                }
+            }
+            wave.synchronize()?;
+            let mut actual = vec![0; 320];
+            library.copy_d2h(&mut actual, output)?;
+            assert_eq!(&actual[..rows * 4], vec![value; rows * 4]);
+            assert!(actual[rows * 4..].iter().all(|&x| x == 0));
+            assert_eq!(wave.fixed_recaptures, 0);
+            assert!(wave.retained_graphs.len() + usize::from(wave.graph.is_some()) <= 2);
+        }
+        assert_eq!(wave.fixed_captures.len(), 2);
+        wave.clear_graph()?;
         Ok(())
     }
 }

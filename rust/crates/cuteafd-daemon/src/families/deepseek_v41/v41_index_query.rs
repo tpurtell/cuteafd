@@ -364,6 +364,12 @@ impl IndexQueryWave<'_, '_> {
             self.stream.library.copy_d2d(dst, src, src.bytes)?;
         }
         let rows = query.rows as u32;
+        if !super::v41_layer_graphs::captures_shape(rows) {
+            unsafe { self.execute(rows)?; }
+            self.origin = Some(binding);
+            self.tokens.extend_from_slice(tokens);
+            return self.output();
+        }
         if self
             .graphs
             .get_shape(self.weights.layer, self.weights, rows)
@@ -392,7 +398,7 @@ impl IndexQueryWave<'_, '_> {
         self.tokens.extend_from_slice(tokens);
         let rows = query.rows as u32;
         let graph = self.graphs.get_shape(self.weights.layer, self.weights, rows);
-        self.pending = Some((rows, binding, graph.is_none()));
+        self.pending = Some((rows, binding, graph.is_none() && super::v41_layer_graphs::captures_shape(rows)));
         let result = (|| -> Result<()> { unsafe {
             crate::shared::memory::chain::join(self.stream.library, self.stream.raw)?;
             for (dst, src) in [(self.qr.buffer, query.normalized_rank),

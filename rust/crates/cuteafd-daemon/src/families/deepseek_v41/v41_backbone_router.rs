@@ -637,6 +637,9 @@ impl BackboneRouterWave<'_, '_> {
     /// Same initialized finite hidden and binary-mask contract as execute.
     pub unsafe fn execute_captured(&mut self, rows: u32) -> Result<RouterOutput<'_>> {
         self.invalidate();
+        if !super::v41_layer_graphs::captures_shape(rows) {
+            return unsafe { self.execute(rows) };
+        }
         if self
             .graphs
             .get_shape(self.layer, self.weights, rows)
@@ -692,7 +695,7 @@ impl BackboneRouterWave<'_, '_> {
         } else {
             self.stream.wait().await?;
         }
-        if cold {
+        if cold && super::v41_layer_graphs::captures_shape(rows) {
             // The eager execution above already completed these inputs. Capture
             // records future launches without executing them; publish that result
             // instead of running the same work again on every cache miss.

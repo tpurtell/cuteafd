@@ -113,6 +113,14 @@ impl<'w, 'a> TargetEmbeddingWave<'w, 'a> {
         );
         let bytes: Vec<u8> = tokens.iter().flat_map(|id| id.to_ne_bytes()).collect();
         self.stream.library.copy_h2d(self.ids.buffer, &bytes)?;
+        if !super::v41_layer_graphs::captures_shape(rows as u32) {
+            let launched = unsafe { self.enqueue(rows) };
+            launched.and(self.synchronize())?;
+            self.tokens.extend_from_slice(tokens);
+            self.positions.extend_from_slice(positions);
+            self.ready = true;
+            return self.output();
+        }
         if self.graphs.get(rows).is_none() {
             let warmup = unsafe { self.enqueue(rows) };
             warmup.and(self.synchronize())?;

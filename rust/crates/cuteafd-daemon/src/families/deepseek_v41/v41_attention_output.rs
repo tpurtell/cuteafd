@@ -371,10 +371,14 @@ impl AttentionOutputWave<'_, '_> {
                 )?;
             }
             let rows = attention.rows as u32;
-            if self.graphs.get_shape(self.weights.layer, self.weights, rows).is_none() {
-                unsafe { self.capture(rows)?; }
+            if super::v41_layer_graphs::captures_shape(rows) {
+                if self.graphs.get_shape(self.weights.layer, self.weights, rows).is_none() {
+                    unsafe { self.capture(rows)?; }
+                }
+                unsafe { self.replay(rows)?; }
+            } else {
+                unsafe { self.execute(rows)?; }
             }
-            unsafe { self.replay(rows)?; }
             Ok(())
         })();
         if let Err(error) = executed {
@@ -411,6 +415,12 @@ impl AttentionOutputWave<'_, '_> {
                 tokens.len() * 8, stream)?;
         }
         let rows = attention.rows as u32;
+        if !super::v41_layer_graphs::captures_shape(rows) {
+            unsafe { self.enqueue_on(rows, stream)?; }
+            let mut output = self.b(2);
+            output.bytes = attention.rows * ROW_BYTES[2];
+            return Ok(output);
+        }
         if self.graphs.get_shape(self.weights.layer, self.weights, rows).is_none() {
             // Cold setup uses the existing drained capture path; its input copies
             // must complete before capture's private-stream warmup can read them.
@@ -447,6 +457,11 @@ impl AttentionOutputWave<'_, '_> {
         let rows = attention.rows as u32;
         if self.graphs.get_shape(self.weights.layer, self.weights, rows).is_none() {
             unsafe { self.enqueue_on(rows, stream)?; }
+            if !super::v41_layer_graphs::captures_shape(rows) {
+                let mut output = self.b(2);
+                output.bytes = attention.rows * ROW_BYTES[2];
+                return Ok(Some(output));
+            }
             return Ok(None);
         }
         unsafe { self.replay_prepared(rows, stream).map(Some) }

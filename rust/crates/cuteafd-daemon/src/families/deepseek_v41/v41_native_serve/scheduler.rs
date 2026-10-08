@@ -211,7 +211,7 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
     first: &mut P, second: &mut P,
     requests: &mut Requests<'a>, first_transport: &mut P::Transport,
     second_transport: &mut P::Transport, mut draft: Option<&mut DraftRuntime<'w, 'a, P::Chain>>,
-    vision: &mut crate::families::deepseek_v41::v41_vision::VisionRuntime<'a>,
+    vision: &mut crate::families::deepseek_v41::v41_vision_encoder::Encoder,
     stats: std::sync::Arc<std::sync::Mutex<serde_json::Value>>,
     mut prefixes: PrefixCache<'a>,
 ) -> Result<()> {
@@ -220,15 +220,33 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
     let mut id = 0u64;
     let mut closed = false;
     let mut pending: Option<admission::Pending> = None;
+    let mut images_waiting: Vec<Option<admission::ImageAdmission>> = (0..args.concurrency).map(|_| None).collect();
+    let image_limit = admission::image_admission_limit(args.concurrency as usize)?;
+    let mut image_backlog = std::collections::VecDeque::new();
     let mut stats_published = Instant::now();
     let limits = cuteafd_api::openai::NativeLimits::new(args.max_context_tokens, args.max_output_tokens)?;
     let copy_windows = draft.is_some() && copy_drafts::enabled();
     tracing::info!(copy_drafts=copy_windows, window=copy_drafts::WINDOW, "copy-window drafting");
+    let result = (|| -> Result<()> {
     loop {
         if let Some(reason) = cuteafd_transport::health::failure_reason() {
             anyhow::bail!("expert wire unavailable until restart: {reason}");
         }
         prefixes.tick();
+        for entry in &mut images_waiting {
+            let Some(image) = entry.as_mut() else { continue };
+            let result = if image.prepared.job.events.is_closed() { Err(anyhow::anyhow!("client disconnected")) }
+                else { image.poll(vision, requests) };
+            if let Err(error) = result {
+                let mut image = entry.take().unwrap();
+                image.cancel(vision);
+                let failure = error.downcast_ref::<cuteafd_api::openai::NativeFailure>()
+                    .cloned().unwrap_or_else(|| cuteafd_api::openai::NativeFailure::Unavailable(format!("{error:#}")));
+                let _ = image.prepared.job.events.send(Err(failure));
+                requests.release_if_present(image.lease)?;
+                if let Some(draft) = draft.as_deref_mut() { draft.release(image.id)?; }
+            }
+        }
         if stats_published.elapsed() >= std::time::Duration::from_secs(1) {
             stats_published = Instant::now();
             if let Ok(mut slot) = stats.lock() {
@@ -255,12 +273,24 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
         }
         // Admit available work at a completed boundary. Prefill currently owns
         // both lanes; mixed prefill/decode interleaving is a subsequent policy.
-        while let Some(slot) = active.iter().position(Option::is_none) {
-            let active_count = active.iter().flatten().count();
-            if pending.as_ref().is_some_and(|p| p.active_when_blocked == active_count
+        let mut intake = receive.len().max(1) + image_backlog.len();
+        while let Some(slot) = (0..active.len()).find(|&slot| images_waiting[slot].as_ref().is_some_and(admission::ImageAdmission::ready))
+            .or_else(|| (0..active.len()).find(|&slot| active[slot].is_none() && images_waiting[slot].is_none())) {
+            if images_waiting[slot].is_none() {
+                if intake == 0 { break; }
+                intake -= 1;
+            }
+            let active_count = active.iter().flatten().count() + images_waiting.iter().flatten().count();
+            if images_waiting[slot].is_none() && pending.as_ref().is_some_and(|p| p.active_when_blocked == active_count
                 && !p.prepared.job.events.is_closed()) { break; }
-            let mut prepared = if let Some(pending) = pending.take() { pending.prepared } else {
-                let job = if active_count == 0 && !closed {
+            let (prepared, id, lease, image_keys, hit, restore) = if let Some(image) = images_waiting[slot].take() {
+                tracing::info!(request_id=image.id, encoded_images=image.needed.len(),
+                    encoder_ms=image.started.elapsed().as_secs_f64()*1000.0, "native asynchronous vision preparation");
+                (image.prepared, image.id, image.lease, image.image_keys, image.hit, image.restore)
+            } else {
+            let mut prepared = if let Some(pending) = pending.take() { pending.prepared }
+                else if images_waiting.iter().flatten().count() < image_limit && !image_backlog.is_empty() { image_backlog.pop_front().unwrap() } else {
+                let job = if active_count == 0 && images_waiting.iter().all(Option::is_none) && !closed {
                     // Going idle: publish final occupancy so the console does not show stale lanes.
                     if let Some(live) = console::live() {
                         live.push(console_gauges(&active, requests, &prefixes, receive.len(), Some(false)));
@@ -286,9 +316,17 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
                 }
             };
             if prepared.job.events.is_closed() { continue; }
+            if !prepared.images.is_empty() && images_waiting.iter().flatten().count() >= image_limit {
+                if image_backlog.len() < (args.concurrency as usize).max(8) {
+                    image_backlog.push_back(prepared);
+                } else {
+                    let _ = prepared.job.events.send(Err(cuteafd_api::openai::NativeFailure::Unavailable(
+                        "image admission queue full".into())));
+                }
+                continue;
+            }
             id = id.checked_add(1).context("request ID exhausted")?;
             let lease = requests.admit(slot, id)?;
-            let lane = usize::from(loads[1] < loads[0]);
             let events = prepared.job.events.clone();
             let admitted = (|| -> Result<_> {
                 let admission::Prepared { job, prompt, images } = &mut prepared;
@@ -308,6 +346,10 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
                     admission::remaining_budget(r.tokens.len(), r.job.max_tokens-r.generated,
                         requests.cache().committed_end(r.lease)?)?)))
                     .collect::<Result<Vec<_>>>()?;
+                for parked in images_waiting.iter().flatten() {
+                    capacity.push((parked.lease, admission::remaining_budget(parked.prepared.prompt.len(),
+                        parked.prepared.job.max_tokens, requests.cache().committed_end(parked.lease)?)?));
+                }
                 capacity.push((lease, admission::remaining_budget(prompt.len(), job.max_tokens,
                     requests.cache().committed_end(lease)?)?));
                 if let Err(error) = prefixes.make_room(requests, &capacity) {
@@ -331,9 +373,16 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
                         "max_tokens shrunk to fit the GPU KV pool");
                     job.max_tokens = granted;
                 }
-                Ok((image_keys, hit, restore))
+                let needed = if images.is_empty() { Vec::new() } else {
+                    let source_end = requests.cache().committed_end(lease)? as usize;
+                    let start = if requests.cache().stage(lease)? == crate::families::deepseek_v41::v41_backbone_cache::CacheStage::EncoderReplay {
+                        requests.cache().history_end(lease)? as usize
+                    } else { source_end };
+                    requests.images(lease)?.needed(start, prompt.len())?
+                };
+                Ok((image_keys, hit, restore, needed))
             })();
-            let (image_keys, hit, restore) = match admitted {
+            let (image_keys, hit, restore, needed) = match admitted {
                 Ok(value) => value,
                 Err(error) => {
                     requests.release_if_present(lease)?;
@@ -354,6 +403,15 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
                     continue;
                 }
             };
+            if !needed.is_empty() {
+                images_waiting[slot] = Some(admission::ImageAdmission { prepared, id, lease, image_keys, hit, restore,
+                    needed, next:0, ticket:None, started:Instant::now() });
+                continue;
+            }
+            (prepared, id, lease, image_keys, hit, restore)
+            };
+            let lane = usize::from(loads[1] < loads[0]);
+            let events = prepared.job.events.clone();
             let admission::Prepared { job, prompt, images } = prepared;
             let mut counted = false;
             let result = (|| -> Result<Active<'a>> {
@@ -362,26 +420,6 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
                 let decoder = cuteafd_loader::streaming_token_decoder(&args.snapshot, false)?;
                 let cached = hit.as_ref().map_or(0, |(end, _)| *end);
                 let image_count = images.len() as u16;
-                let source_end = requests.cache().committed_end(lease)? as usize;
-                if !images.is_empty() {
-                    // Deliberately unheld (packet HC-9): this is per-image pre-prefill
-                    // preparation, not a batch-tokens chunk, so the store-pace pacing hold
-                    // does not apply here; the hold covers prefill chunk dispatch only.
-                    let start = if requests.cache().stage(lease)? == crate::families::deepseek_v41::v41_backbone_cache::CacheStage::EncoderReplay {
-                        requests.cache().history_end(lease)? as usize
-                    } else { source_end };
-                    let needed = requests.images(lease)?.needed(start, prompt.len())?;
-                    let started = Instant::now();
-                    for &index in &needed {
-                        ensure!(!job.events.is_closed(), "client disconnected");
-                        let features = vision.encode(&images[index].image)?;
-                        let mut bytes = vec![0; features.bytes];
-                        lib.copy_d2h(&mut bytes, features)?;
-                        requests.install_image_features(lease, index, bytes)?;
-                    }
-                    tracing::info!(request_id=id, images=images.len(), encoded_images=needed.len(),
-                        encoder_ms=started.elapsed().as_secs_f64()*1000.0, "native vision preparation");
-                }
                 drop(images);
                 job.events.send(Ok(InferenceChunk::Ready {
                     system_fingerprint: Some(if draft.is_some() { "cuteafd-native-fp4-kv-dspark" }
@@ -458,7 +496,11 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
                 }
             }
         }
-        if active.iter().all(Option::is_none) { if closed { break; } else { continue; } }
+        if active.iter().all(Option::is_none) {
+            if closed && images_waiting.iter().all(Option::is_none) && image_backlog.is_empty() { break; }
+            if images_waiting.iter().any(Option::is_some) { std::thread::sleep(Duration::from_millis(1)); }
+            continue;
+        }
         let members: [Vec<usize>; 2] = std::array::from_fn(|lane| active.iter().enumerate()
             .filter_map(|(slot, request)| request.as_ref().filter(|r| r.lane == lane && !r.finished
                 && !r.job.events.is_closed()).map(|_| slot)).collect());
@@ -485,7 +527,10 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
         let result = room.and_then(|_| P::decode_round(lib, runtime, first, second,
             requests, first_transport, second_transport, &mut active, &members,
             draft.as_deref_mut(), &mut prefixes, receive,
-            admission::Wake { blocked_at: pending.as_ref().map(|p| p.active_when_blocked),
+            admission::Wake { media_pending: images_waiting.iter().any(Option::is_some),
+                media_slots: images_waiting.iter().flatten().count(),
+                host_pending: !image_backlog.is_empty(),
+                blocked_at: pending.as_ref().map(|p| p.active_when_blocked.saturating_sub(images_waiting.iter().flatten().count())),
                 pending: pending.as_ref().map(|p| &p.prepared.job) }));
         if let Err(error) = result {
             tracing::error!(error=%format!("{error:#}"), "native decode round failed");
@@ -499,6 +544,22 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
         }
     }
     Ok(())
+    })();
+    // A fatal target/transport error must not orphan encoder tickets or cache owners.
+    for mut image in images_waiting.into_iter().flatten() {
+        image.cancel(vision);
+        let _ = image.prepared.job.events.send(Err(cuteafd_api::openai::NativeFailure::Unavailable(
+            "vision admission stopped".into())));
+        if let Err(error) = requests.release_if_present(image.lease) {
+            tracing::warn!(%error, "releasing stopped image cache owner");
+        }
+        if let Some(draft) = draft.as_deref_mut() {
+            if let Err(error) = draft.release(image.id) {
+                tracing::warn!(%error, "releasing stopped image draft owner");
+            }
+        }
+    }
+    result
 }
 
 /// Process-wide device-terminal instrumentation.

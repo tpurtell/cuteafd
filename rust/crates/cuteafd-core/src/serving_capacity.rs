@@ -8,6 +8,23 @@ use thiserror::Error;
 /// Common logical GPU pool across model families; larger pools are explicit.
 pub const DEFAULT_GPU_KV_TOKENS: u64 = 2 << 20;
 
+/// Absolute free-memory floor for the logical 32 GiB candidate profiles.
+/// Round upward so integer-byte admission never leaves less than 2.9 GiB.
+pub const SMALL_CARD_HEADROOM_BYTES: u64 = (29 * (1u64 << 30)).div_ceil(10);
+
+pub fn small_card_headroom_bytes(total_bytes: u64) -> u64 {
+    if total_bytes <= 32u64 << 30 { SMALL_CARD_HEADROOM_BYTES } else { 0 }
+}
+
+pub fn admission_ceiling(total_bytes: u64, occupancy_percent: u32, minimum_free_bytes: u64)
+    -> Result<u64, CapacityError> {
+    if !(1..=100).contains(&occupancy_percent) {
+        return Err(CapacityError::Invalid("GPU occupancy percent must be in 1..=100"));
+    }
+    let percentage = (u128::from(total_bytes) * u128::from(occupancy_percent) / 100) as u64;
+    Ok(percentage.min(total_bytes.saturating_sub(minimum_free_bytes)))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CapacityPolicy {
     pub concurrency: u32,
@@ -15,6 +32,9 @@ pub struct CapacityPolicy {
     /// Remaining GPU budget is available for expert onboarding.
     pub target_pool_tokens: u64,
     pub gpu_occupancy_percent: u32,
+    /// Apply the absolute 2.9 GiB floor on each logical <=32 GiB device only.
+    #[serde(default)]
+    pub small_card_headroom: bool,
     /// None chooses the checkpoint length bounded by verified kernel support.
     /// Explicit requests beyond either capability are rejected, never clipped.
     pub max_context_tokens: Option<u64>,
@@ -29,6 +49,7 @@ impl Default for CapacityPolicy {
             concurrency: 16,
             target_pool_tokens: DEFAULT_GPU_KV_TOKENS,
             gpu_occupancy_percent: 97,
+            small_card_headroom: false,
             max_context_tokens: None,
             pool_tokens: None,
         }
@@ -199,16 +220,20 @@ pub fn admit_device_reservations(
     memory: DeviceMemory,
     reservations: &[MemoryReservation],
 ) -> Result<ResolvedDeviceCapacity, CapacityError> {
-    if !(1..=100).contains(&gpu_occupancy_percent) {
-        return Err(CapacityError::Invalid(
-            "GPU occupancy percent must be in 1..=100",
-        ));
-    }
+    admit_device_reservations_with_headroom(gpu_occupancy_percent, memory, reservations, 0)
+}
+
+pub fn admit_device_reservations_with_headroom(
+    gpu_occupancy_percent: u32,
+    memory: DeviceMemory,
+    reservations: &[MemoryReservation],
+    minimum_free_bytes: u64,
+) -> Result<ResolvedDeviceCapacity, CapacityError> {
     if memory.total_bytes == 0 || memory.baseline_free_bytes > memory.total_bytes {
         return Err(CapacityError::Invalid("invalid physical GPU memory sample"));
     }
     let non_engine = memory.total_bytes - memory.baseline_free_bytes;
-    let ceiling = (u128::from(memory.total_bytes) * u128::from(gpu_occupancy_percent) / 100) as u64;
+    let ceiling = admission_ceiling(memory.total_bytes, gpu_occupancy_percent, minimum_free_bytes)?;
     let budget = ceiling.saturating_sub(non_engine);
     let reserved = reservations
         .iter()
@@ -311,8 +336,9 @@ pub fn resolve_capacity(
             .ok_or(CapacityError::Invalid(
                 "missing or duplicate physical GPU cost profile",
             ))?;
-        let admitted =
-            admit_device_reservations(policy.gpu_occupancy_percent, memory, &costs.reservations)?;
+        let floor = if policy.small_card_headroom { small_card_headroom_bytes(memory.total_bytes) } else { 0 };
+        let admitted = admit_device_reservations_with_headroom(
+            policy.gpu_occupancy_percent, memory, &costs.reservations, floor)?;
         if costs.pool_unit_bytes > 0 {
             has_kv = true;
             feasible_units =
@@ -405,6 +431,75 @@ mod tests {
             devices,
             host_prefix_bytes: 0,
         }
+    }
+
+    #[test]
+    fn small_card_absolute_floor_charges_existing_usage_and_preserves_pro() {
+        let total = GpuMemoryBudget::from_gib(31.8).unwrap().0;
+        let floor = small_card_headroom_bytes(total);
+        assert!(floor as f64 / GIB as f64 >= 2.9);
+        assert_eq!(admission_ceiling(total, 97, floor).unwrap(), total - floor);
+        assert_eq!(admission_ceiling(total, 80, floor).unwrap(), total * 80 / 100);
+        let memory = DeviceMemory { device: 0, total_bytes: total, baseline_free_bytes: total - GIB };
+        let budget = total - floor - GIB;
+        let costs = vec![MemoryReservation { name: "fixed".into(), bytes: budget }];
+        let exact = admit_device_reservations_with_headroom(97, memory, &costs, floor).unwrap();
+        assert_eq!(exact.engine_budget_bytes, budget);
+        let too_large = vec![MemoryReservation { name: "fixed".into(), bytes: budget + 1 }];
+        assert!(matches!(admit_device_reservations_with_headroom(97, memory, &too_large, floor),
+            Err(CapacityError::ReservationsExceeded { .. })));
+        assert_eq!(small_card_headroom_bytes(32 * GIB), SMALL_CARD_HEADROOM_BYTES);
+        assert_eq!(small_card_headroom_bytes(32 * GIB + 1), 0);
+        let p = profile(vec![device(0, GIB, GIB)]);
+        let small = resolve_capacity(CapacityPolicy { small_card_headroom: true, ..Default::default() }, &p, &[memory]).unwrap();
+        assert_eq!(small.devices[0].engine_budget_bytes, budget);
+        assert_eq!(small.allocated_gpu_kv_tokens, 26 * 64);
+        let pro = hardware(0, GIB);
+        let old = resolve_capacity(CapacityPolicy::default(), &p, &[pro]).unwrap();
+        let new = resolve_capacity(CapacityPolicy { small_card_headroom: true, ..Default::default() }, &p, &[pro]).unwrap();
+        assert_eq!(old, new);
+    }
+
+    #[test]
+    fn measured_mimo_small_card_contract_reports_shortfall_after_absolute_floor() {
+        let memory = DeviceMemory { device: 0, total_bytes: 34_144_990_003,
+            baseline_free_bytes: 34_144_990_003 - 586_416_128 };
+        let mut profile = profile(vec![device(0, 829_704, 17_965_280_768)]);
+        profile.context.checkpoint_max_tokens = 1_048_576;
+        let policy = CapacityPolicy { target_pool_tokens: 1_048_576,
+            small_card_headroom: true, ..Default::default() };
+        let new = resolve_capacity(policy, &profile, &[memory]).unwrap();
+        assert_eq!(new.allocated_gpu_kv_tokens, 962_560);
+        assert_eq!(new.requested_floor_shortfall_tokens, 86_016);
+        assert_eq!(new.active_max_context_sequences, 0);
+        assert!(memory.total_bytes - new.devices[0].non_engine_bytes
+            - new.devices[0].reserved_bytes - new.devices[0].pool_bytes >= SMALL_CARD_HEADROOM_BYTES);
+        assert!(matches!(resolve_capacity(CapacityPolicy { pool_tokens: Some(1_048_576), ..policy },
+            &profile, &[memory]), Err(CapacityError::PoolExceeded { .. })));
+    }
+
+    #[test]
+    fn startup_intake_probe_uses_floor_slack_without_shrinking_the_pool() {
+        let memory = DeviceMemory { device: 0, total_bytes: 34_144_990_003,
+            baseline_free_bytes: 34_144_990_003 - 586_416_128 };
+        let floor = small_card_headroom_bytes(memory.total_bytes);
+        let probe = 64 << 20;
+        let costs = vec![
+            MemoryReservation { name: "steady.fixed".into(), bytes: 17_965_280_768 },
+            MemoryReservation { name: "kv.logical_pool".into(), bytes: 962_560 / 64 * 829_704 },
+            MemoryReservation { name: "startup.spark_intake_probe_temporary".into(), bytes: probe },
+        ];
+        let stacked = admit_device_reservations_with_headroom(97, memory, &costs, floor);
+        assert!(matches!(stacked, Err(CapacityError::ReservationsExceeded { .. })));
+        let admitted = admit_device_reservations_with_headroom(97, memory, &costs,
+            floor.saturating_sub(probe)).unwrap();
+        assert_eq!(admitted.reserved_bytes, 30_511_137_792);
+        assert_eq!(admitted.engine_budget_bytes - admitted.reserved_bytes, 693_657);
+        let steady = admit_device_reservations_with_headroom(97, memory, &costs[..2], floor).unwrap();
+        assert_eq!(steady.engine_budget_bytes - steady.reserved_bytes, 693_657);
+        // A temporary larger than the floor still has to fit the physical ceiling.
+        let oversized = vec![MemoryReservation { name: "startup".into(), bytes: memory.total_bytes }];
+        assert!(admit_device_reservations_with_headroom(97, memory, &oversized, 0).is_err());
     }
 
     #[test]

@@ -331,7 +331,7 @@ impl TargetHeadWave<'_, '_> {
         Ok(())
     }
     unsafe fn capture_block_head(&mut self, rows: usize) -> Result<()> {
-        if self.graph(rows).is_none() {
+        if super::v41_layer_graphs::captures_shape(rows as u32) && self.graph(rows).is_none() {
             unsafe { self.capture(rows)?; }
         }
         Ok(())
@@ -342,7 +342,9 @@ impl TargetHeadWave<'_, '_> {
         let launched = unsafe { self.enqueue(rows) };
         let drained = self.stream.wait().await;
         launched.and(drained)?;
-        unsafe { self.capture_ready(rows) }
+        if super::v41_layer_graphs::captures_shape(rows as u32) {
+            unsafe { self.capture_ready(rows) }
+        } else { Ok(()) }
     }
     fn publish_block(&mut self, block: &BlockOutput<'_>, selected: &[usize]) {
         self.ready = Some(selected.len());
@@ -355,7 +357,9 @@ impl TargetHeadWave<'_, '_> {
         -> Result<TargetLogits<'_>> {
         unsafe { self.copy_block(block, selected)?; }
         self.synchronize()?;
-        unsafe { self.capture_block_head(selected.len())?; self.replay(selected.len())?; }
+        if super::v41_layer_graphs::captures_shape(selected.len() as u32) {
+            unsafe { self.capture_block_head(selected.len())?; self.replay(selected.len())?; }
+        } else { unsafe { self.execute(selected.len())?; } }
         self.publish_block(block, selected);
         self.output()
     }
@@ -365,12 +369,15 @@ impl TargetHeadWave<'_, '_> {
         -> Result<TargetLogits<'_>> {
         unsafe { self.copy_block(block, selected)?; }
         // Warmup and replay consume input copies on this same stream.
-        if self.graph(selected.len()).is_none() {
+        let captured = super::v41_layer_graphs::captures_shape(selected.len() as u32);
+        if captured && self.graph(selected.len()).is_none() {
             unsafe { self.prepare_head_cooperative(selected.len()).await?; }
         }
         self.invalidate();
-        let graph = self.graph(selected.len()).context("target head graph missing")?;
-        let launched = unsafe { self.stream.library.cuda_graph_launch(graph, self.stream.raw) };
+        let launched = if captured {
+            let graph = self.graph(selected.len()).context("target head graph missing")?;
+            unsafe { self.stream.library.cuda_graph_launch(graph, self.stream.raw) }
+        } else { unsafe { self.enqueue(selected.len()) } };
         let drained = self.stream.wait().await;
         launched.and(drained)?;
         self.publish_block(block, selected);
@@ -381,18 +388,20 @@ impl TargetHeadWave<'_, '_> {
         selected: &[usize], cooperative: bool) -> Result<()> {
         unsafe { self.copy_block(block, selected)?; }
         let rows = selected.len();
-        if self.graph(rows).is_none() {
+        let captured = super::v41_layer_graphs::captures_shape(rows as u32);
+        if captured && self.graph(rows).is_none() {
             if cooperative { unsafe { self.prepare_head_cooperative(rows).await?; } }
             else { self.synchronize()?; unsafe { self.capture_block_head(rows)?; } }
         }
         self.invalidate();
-        let graph = self.graph(rows).context("target head graph missing")?;
+        let graph = if captured { Some(self.graph(rows).context("target head graph missing")?) } else { None };
         let logits = Self::slice(self.b(4), 0, rows * STRIDES[4])?;
         let indices = Self::slice(self.b(5), 0, rows * 4)?;
         let scores = Self::slice(self.b(6), 0, rows * 4)?;
         let launched = (|| -> Result<()> { unsafe {
             let lib = self.stream.library;
-            lib.cuda_graph_launch(graph, self.stream.raw)?;
+            if let Some(graph) = graph { lib.cuda_graph_launch(graph, self.stream.raw)?; }
+            else { self.enqueue(rows)?; }
             lib.cuda_logits_argmax_checked_f32_async(logits, indices, scores, rows, 129280, self.stream.raw)?;
             let host = self.greedy_staging.bytes_mut();
             lib.copy_d2h_async(&mut host[..rows*4], indices, self.stream.raw)?;
@@ -436,19 +445,21 @@ impl TargetHeadWave<'_, '_> {
         );
         unsafe { self.copy_block(block, selected)?; }
         let rows = selected.len();
-        if self.graph(rows).is_none() {
+        let captured = super::v41_layer_graphs::captures_shape(rows as u32);
+        if captured && self.graph(rows).is_none() {
             if cooperative { unsafe { self.prepare_head_cooperative(rows).await?; } }
             else { self.synchronize()?; unsafe { self.capture_block_head(rows)?; } }
         }
         self.invalidate();
-        let graph = self.graph(rows).context("target head graph missing")?;
+        let graph = if captured { Some(self.graph(rows).context("target head graph missing")?) } else { None };
         let logits = Self::slice(self.b(4), 0, rows * STRIDES[4])?;
         let staged = self
             .sampling
             .upload(requests, mask_staging, mask_words, self.stream.raw);
         let launched: Result<()> = staged.and_then(|()| {
             (|| -> Result<()> { unsafe {
-                self.stream.library.cuda_graph_launch(graph, self.stream.raw)?;
+                if let Some(graph) = graph { self.stream.library.cuda_graph_launch(graph, self.stream.raw)?; }
+                else { self.enqueue(rows)?; }
                 self.sampling.launch(logits, rows, ordered_rows, self.stream.raw)?;
                 Ok(())
             } })()

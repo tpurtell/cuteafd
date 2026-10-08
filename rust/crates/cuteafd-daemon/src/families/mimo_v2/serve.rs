@@ -125,6 +125,24 @@ pub(crate) struct ServeArgs {
 pub(crate) use crate::shared::prefix::{PrefixArgs, Toggle};
 use crate::shared::probe;
 
+fn initial_reservation(prompt: usize, max_tokens: usize, context: usize) -> usize {
+    prompt.saturating_add(max_tokens.clamp(1024, 8192)).saturating_add(64).min(context)
+}
+
+#[cfg(test)]
+mod reservation_tests {
+    use super::initial_reservation;
+
+    #[test]
+    fn initial_lease_clamps_output_and_context_without_overflow() {
+        assert_eq!(initial_reservation(100, 1, 1 << 20), 1188);
+        assert_eq!(initial_reservation(100, 4000, 1 << 20), 4164);
+        assert_eq!(initial_reservation(100, 100_000, 1 << 20), 8356);
+        assert_eq!(initial_reservation((1 << 20) - 100, 100_000, 1 << 20), 1 << 20);
+        assert_eq!(initial_reservation(usize::MAX, usize::MAX, 1 << 20), 1 << 20);
+    }
+}
+
 pub(crate) async fn run_serve(mut args: ServeArgs) -> Result<()> {
     anyhow::ensure!(args.prefill_chunk_s.is_none_or(|s| s.is_finite() && s > 0.0 && s <= 5.0),
         "--prefill-chunk-s must be finite and in (0, 5]");
@@ -132,6 +150,11 @@ pub(crate) async fn run_serve(mut args: ServeArgs) -> Result<()> {
         "--prefill-chunk-s requires a positive --decode-share");
     let api = args.api.load()?;
     let snapshot: PathBuf = args.engine.snapshot.clone();
+    if args.engine.max_context == 0 {
+        let config = serde_json::from_reader(std::fs::File::open(snapshot.join("config.json"))?)?;
+        args.engine.max_context = cuteafd_loader::serving_capacity::checkpoint_context_limit(&config)?
+            .context("MiMo checkpoint lacks full-context capability")?.try_into()?;
+    }
     let limits = NativeLimits::new(args.engine.max_context as u32, args.max_output)?;
     // MiMo's template and tool calls follow Qwen3-Coder's XML (`<tool_call>
     // <function=NAME><parameter=KEY>VALUE</parameter>`), its reasoning `<think>`.
@@ -427,13 +450,17 @@ impl Active<'_> {
             self.next = token;
             return Ok(false);
         };
+        self.finish(finish)?;
+        Ok(true)
+    }
+
+    fn finish(&mut self, finish: InferenceFinishReason) -> Result<()> {
         let content = self.decoder.finish()?.unwrap_or_default();
         if !content.is_empty() || self.buffered > 0 {
             self.send(InferenceChunk::Text { content, content_tokens: self.buffered })?;
         }
         self.ticket.finishing();
-        self.send(InferenceChunk::Finish { finish_reason: finish })?;
-        Ok(true)
+        self.send(InferenceChunk::Finish { finish_reason: finish })
     }
 }
 
@@ -630,7 +657,8 @@ fn schedule_inner(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path
                 break;
             }
             let cold = ready.cold() || probe::cold(&ready.job().job.probe);
-            let capacity = (ready.job().tokens.len() + ready.job().job.max_tokens).min(engine.max_context);
+            let capacity = ready.job().tokens.len().saturating_add(ready.job().job.max_tokens).min(engine.max_context);
+            let initial_capacity = initial_reservation(ready.job().tokens.len(), ready.job().job.max_tokens, engine.max_context);
             let Some(ring) = free_rings.pop() else {
                 reject(&ready, "SWA rings exhausted".into());
                 continue;
@@ -644,8 +672,8 @@ fn schedule_inner(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path
             let admit_started = Instant::now();
             // Lookup, fork of the retained pages and restore of the mark (byte-exact).
             let build = |pages| MimoPlacement { pages, ring, len: 0 };
-            let admission = if cold { cache.admit_cold(family, ready.job().tokens.len(), capacity, build) }
-                else { cache.admit_media(family, ready.job().keys.tokens(), ready.job().keys.spans(), capacity, true, build) };
+            let admission = if cold { cache.admit_cold(family, ready.job().tokens.len(), initial_capacity, build) }
+                else { cache.admit_media(family, ready.job().keys.tokens(), ready.job().keys.spans(), initial_capacity, true, build) };
             let admitted = match admission {
                 Ok(admitted) => admitted,
                 Err(error) => {
@@ -887,6 +915,23 @@ fn schedule_inner(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path
             if !media.is_empty() { std::thread::park_timeout(Duration::from_millis(1)); }
             continue;
         }
+        // Grow only before submitting a round. Failed growth ends this sequence
+        // cleanly without reallocating CUDA storage or stealing another live lease.
+        for index in (0..active.len()).rev() {
+            let request = &mut active[index];
+            let rows = request.placement.len.saturating_add(64).min(request.capacity);
+            if let Err(error) = cache.grow(family, &mut request.placement.pages, rows) {
+                tracing::warn!(%error, "MiMo KV growth exhausted; finishing at committed frontier");
+                let mut request = active.remove(index);
+                let _ = request.finish(InferenceFinishReason::Length);
+                requests += 1;
+                generated_total += request.generated as u64;
+                failures.finished(&request.job.events);
+                request.ticket.done(request.generated);
+                release(family, cache, &mut free_rings, &mut free_slots, &request.placement, request.slot);
+            }
+        }
+        if active.is_empty() { continue; }
         let cycle = Instant::now();
         let mut tally = console::Step::begin(0);
         let (draft0, emit0) = (draft_s, emit_s);

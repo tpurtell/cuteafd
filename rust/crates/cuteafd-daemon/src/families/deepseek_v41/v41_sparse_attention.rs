@@ -631,6 +631,19 @@ impl<'a,const HEADS:usize> LocalSparseAttentionWave<'a,HEADS> {
             unsafe { tail.as_deref_mut().unwrap().prepare(self.stream.raw)?; }
         }
         let cached = self.graphs[layer].iter().position(|(_, f)| f == &fingerprint);
+        let fixed_limit = super::v41_layer_graphs::fixed_binding_limit();
+        if cached.is_none() && (!super::v41_layer_graphs::captures_shape(rows as u32)
+            || fixed_limit.is_some_and(|limit| self.graphs[layer].len() >= limit)) {
+            // Exact fingerprints can include launch recipes beyond row count.
+            // Freeze the bounded bank rather than evicting and recapturing them.
+            tracing::debug!(target: "cuteafd::target_step", layer, rows,
+                retained=self.graphs[layer].len(), "V4.1 sparse attention eager binding");
+            unsafe {
+                self.enqueue(sink, &launches, selected, batch.as_ref())?;
+                if let Some(tail) = tail.as_deref_mut() { tail.enqueue(&queued, self.stream.raw)?; }
+            }
+            return Ok(Some(queued));
+        }
         let graph = if let Some(index) = cached {
             // Move a used binding to the newest end of the bounded LRU.
             let entry = self.graphs[layer].remove(index).unwrap();
@@ -644,7 +657,7 @@ impl<'a,const HEADS:usize> LocalSparseAttentionWave<'a,HEADS> {
                 "graph cache miss");
             tracing::debug!(target: "cuteafd::timing", layer, rows, batched = batch.is_some(), "sparse graph capture");
             if !defer_warmup { self.synchronize()?; }
-            let limit = if batch.is_some() { self.batch_rows } else { self.graph_limit };
+            let limit = fixed_limit.unwrap_or_else(|| if batch.is_some() { self.batch_rows } else { self.graph_limit });
             if self.graphs[layer].len() >= limit {
                 let (old, _) = self.graphs[layer].pop_front().unwrap();
                 unsafe { self.stream.library.cuda_graph_exec_destroy(old)?; }

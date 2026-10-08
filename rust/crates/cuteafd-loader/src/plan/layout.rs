@@ -29,8 +29,12 @@ pub struct LayoutOptions {
     pub vision_replicas: usize,
     /// One mapped pinned token embedding instead of a device allocation.
     pub host_embedding: bool,
+    /// Explicit device placement disables the memory-constrained auto profile.
+    pub force_gpu_embedding: bool,
     /// Usable bytes of one Spark rank (unified memory).
     pub spark_bytes: u64,
+    /// Runtime allocation ceiling, distinct from unified physical memory.
+    pub spark_allocation_budget_bytes: Option<u64>,
     /// Two coordinator GPUs split attention heads (generic families) rather
     /// than V4.1's layer ranges.
     pub head_split: bool,
@@ -87,8 +91,10 @@ impl Default for LayoutOptions {
             rtx_bytes: vec![95 * GIB + 512 * MIB],
             vision_replicas: 1,
             host_embedding: false,
+            force_gpu_embedding: false,
             // 121.7 GiB GB10 minus the host OS and sparknestd measured idle (~13 GiB).
             spark_bytes: 108 * GIB,
+            spark_allocation_budget_bytes: None,
             head_split: true,
             prefill_rows: 0,
             full_prefill_logits: false,
@@ -373,14 +379,20 @@ pub fn layout(report: &mut PlanReport, model: &dyn super::FamilyModel, checkpoin
         let path = std::path::Path::new("/opt/cuteafd/share/PROGRAMS.json");
         path.is_file().then_some(path)
     }).and_then(|path| std::fs::read(path).ok()).and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok());
+    let small_card = matches!(family, "deepseek_v41" | "mimo_v2")
+        && options.rtx_bytes.first().is_some_and(|&bytes| bytes <= 32 * GIB);
     let prefill_rows = if options.prefill_rows > 0 { options.prefill_rows }
-        else if family == "deepseek_v41" { 2048 }
+        else if family == "deepseek_v41" { if small_card { 1024 } else { 2048 } }
         else { workspace_manifest.as_ref().and_then(|m| m["capacities"]["prefill_rows"].as_u64()).unwrap_or(4096) };
     let decode_rows = workspace_manifest.as_ref().and_then(|m| m["capacities"]["decode_rows"].as_u64()).unwrap_or(64);
-    let concurrency = if options.concurrency > 0 { options.concurrency } else if family == "deepseek_v41" { 16 } else { 8 };
+    let concurrency = if options.concurrency > 0 { options.concurrency }
+        else if family == "deepseek_v41" || (family == "mimo_v2" && small_card) { 16 }
+        else { 8 };
     let context_tokens = if options.context_tokens > 0 { options.context_tokens }
         else if family == "deepseek_v4" { workspace_manifest.as_ref().and_then(|m| m["capacities"]["max_context"].as_u64()).unwrap_or(131072) }
+        else if matches!(family, "deepseek_v41" | "mimo_v2") { crate::serving_capacity::checkpoint_context_limit(&checkpoint.config).ok().flatten().unwrap_or(0) }
         else { 0 };
+    let target_pool_tokens = options.target_pool_tokens.max(context_tokens);
     let conversions = load_conversions(family, checkpoint);
     let costs = family_costs(family);
     let gpus = options.rtx_bytes.len().clamp(1, 2);
@@ -390,8 +402,12 @@ pub fn layout(report: &mut PlanReport, model: &dyn super::FamilyModel, checkpoin
     let automatic = options.pool_tokens.unwrap_or(0) == 0;
     let mut devices: Vec<DeviceLayout> = options.rtx_bytes.iter().take(gpus).enumerate()
         .map(|(index, &bytes)| DeviceLayout { kind: DeviceKind::Rtx, index: index as u32,
-            capacity_bytes: (if family == "deepseek_v41" && automatic { (bytes as u128 * 97 / 100) as u64 } else { bytes })
-                .saturating_sub(if matches!(family, "deepseek_v4" | "deepseek_v41" | "qwen4") { options.headroom_bytes.max(3 * GIB) } else { options.headroom_bytes }), items: Vec::new(), kv_tokens: 0 })
+            capacity_bytes: if matches!(family, "deepseek_v41" | "mimo_v2") && bytes <= 32 * GIB {
+                ((bytes as u128 * 97 / 100) as u64).min(bytes.saturating_sub(
+                    options.headroom_bytes.max(cuteafd_core::serving_capacity::SMALL_CARD_HEADROOM_BYTES)))
+            } else { (if family == "deepseek_v41" && automatic { (bytes as u128 * 97 / 100) as u64 } else { bytes })
+                .saturating_sub(if matches!(family, "deepseek_v4" | "deepseek_v41" | "qwen4") { options.headroom_bytes.max(3 * GIB) } else { options.headroom_bytes }) },
+            items: Vec::new(), kv_tokens: 0 })
         .collect();
     let mut waste = Vec::new();
     let mut notes = Vec::new();
@@ -437,7 +453,10 @@ pub fn layout(report: &mut PlanReport, model: &dyn super::FamilyModel, checkpoin
         qwen_exl3_arenas(checkpoint, native_layers > 0)
     } else { None };
     if let Some(ranks) = &v41_weights {
-        for (device, items) in devices.iter_mut().zip(ranks) { device.items.extend(items.iter().cloned()); }
+        for (device, items) in devices.iter_mut().zip(ranks) {
+            device.items.extend(items.iter().filter(|item|
+                report.vision != super::MediaMode::Off || item.group != "vision").cloned());
+        }
     }
     let exact = resident_layout(family, checkpoint, if split { 2 } else { 1 }, native_layers > 0);
     if let Some(ranks) = &exact {
@@ -465,7 +484,7 @@ pub fn layout(report: &mut PlanReport, model: &dyn super::FamilyModel, checkpoin
         .filter(|c| (c.owner == Owner::Rtx
             || (c.owner == Owner::SparkSliced && report.placement == ExpertPlacement::Local))
             && c.status != Status::Unused && c.status != Status::Disabled
-            && !(family != "deepseek_v41" && matches!(c.component, Component::Vision | Component::Audio)) && !covered(c.component)) {
+            && !matches!(c.component, Component::Vision | Component::Audio) && !covered(c.component)) {
         let (resident, format) = match conversions.iter().find(|c| c.component == component.component) {
             Some(c) => (component.bytes.saturating_sub(c.saved_bytes), c.format.to_string()),
             None => ((component.bytes as f64 * costs.resident_factor) as u64,
@@ -506,7 +525,7 @@ pub fn layout(report: &mut PlanReport, model: &dyn super::FamilyModel, checkpoin
             }
         }
     }
-    if options.host_embedding {
+    if options.host_embedding || (small_card && !options.force_gpu_embedding) {
         let embedding = report.components.iter().find(|c| c.component == Component::Embedding);
         let names: Vec<_> = checkpoint.tensors.iter().filter(|t|
             t.meta.name == "embed.weight" || t.meta.name.ends_with("embed_tokens.weight")).collect();
@@ -598,10 +617,14 @@ pub fn layout(report: &mut PlanReport, model: &dyn super::FamilyModel, checkpoin
         let role = if gpus_now == 1 { 0 } else if index == 0 { 1 } else { 2 };
         device.items.push(Item::new(Category::Runtime, "context+modules", "", costs.runtime_bytes[role],
             allowance_basis));
+        let graph_allowance = if family == "deepseek_v41" && options.rtx_bytes[index] <= 32 * GIB {
+            // Match the qualified fixed-bank envelope reserved by measured_pool_memory.
+            2 * GIB
+        } else { costs.graph_bytes[role] };
         match options.graph_budget_bytes.filter(|&budget| family == "glm5_flash"
-            && (glmf_measured || budget > costs.graph_bytes[role])) {
+            && (glmf_measured || budget > graph_allowance)) {
             Some(budget) => device.items.push(Item::new(Category::Runtime, "graph budget", "", budget, Basis::Formula)),
-            None => device.items.push(Item::new(Category::Runtime, "graph allowance", "", costs.graph_bytes[role],
+            None => device.items.push(Item::new(Category::Runtime, "graph allowance", "", graph_allowance,
                 allowance_basis)),
         }
         let workspace = match glmf_steps {
@@ -825,15 +848,20 @@ pub fn layout(report: &mut PlanReport, model: &dyn super::FamilyModel, checkpoin
                     devices[active_gpus - 1].items.push(Item::new(Category::Drafter, "dSpark window state", "", v41::dspark_cache_bytes(concurrency, prefill_rows), Basis::Formula));
                 }
             }
-            if family != "deepseek_v41" {
+            {
                 let target = options.pool_tokens.filter(|&tokens| tokens != 0)
-                    .unwrap_or_else(|| if options.rtx_bytes[0] <= 32 * GIB { 1_000_000 } else { options.target_pool_tokens });
+                    .unwrap_or_else(|| if small_card { (1 << 20).max(context_tokens) } else { target_pool_tokens });
                 let kv: Vec<u64> = per_token.iter().map(|&cost| cost.saturating_mul(target)).collect();
-                resolve_encoder(checkpoint, report, model, &mut devices, &mut spark_devices, &kv, options.vision_replicas, &mut notes);
+                resolve_encoder(checkpoint, report, model, &mut devices, &mut spark_devices, &kv, options, &mut notes);
             }
             let free: Vec<i64> = devices.iter().map(DeviceLayout::free_bytes).collect();
             pool_tokens = options.pool_tokens.filter(|&tokens| tokens != 0)
-                .unwrap_or_else(|| size_pool(&free, &per_token, unit, if family == "deepseek_v41" { v41::DEFAULT_POOL_TOKENS } else { options.target_pool_tokens }));
+                .unwrap_or_else(|| size_pool(&free, &per_token, unit,
+                    if family == "deepseek_v41" { if small_card { 1 << 20 } else { v41::DEFAULT_POOL_TOKENS } }
+                    else if small_card { (1 << 20).max(context_tokens) } else { target_pool_tokens }));
+            if pool_tokens < context_tokens {
+                notes.push(format!("full-context admission shortfall: context {context_tokens} tokens, pool {pool_tokens} tokens, shortfall {} tokens", context_tokens - pool_tokens));
+            }
             for (device, &cost) in devices.iter_mut().zip(&per_token) {
                 if cost > 0 {
                     let units = pool_tokens.div_ceil(unit);
@@ -877,8 +905,8 @@ pub fn layout(report: &mut PlanReport, model: &dyn super::FamilyModel, checkpoin
         }
     }
 
-    if family != "deepseek_v41" && report.encoder.is_none() {
-        resolve_encoder(checkpoint, report, model, &mut devices, &mut spark_devices, &vec![0; gpus], options.vision_replicas, &mut notes);
+    if report.encoder.is_none() {
+        resolve_encoder(checkpoint, report, model, &mut devices, &mut spark_devices, &vec![0; gpus], options, &mut notes);
     }
     devices.extend(spark_devices);
     MemoryLayout { devices, pool_tokens, waste, notes }
@@ -1072,13 +1100,24 @@ fn resident_layout(family: &str, checkpoint: &super::Checkpoint, ranks: usize, m
     }).collect())
 }
 
-fn resolve_encoder(checkpoint: &super::Checkpoint, report: &mut PlanReport, model: &dyn super::FamilyModel, rtx: &mut [DeviceLayout], sparks: &mut [DeviceLayout], kv: &[u64], replicas: usize, notes: &mut Vec<String>) {
+// The host footprint belongs to physical capacity, not expertd's allocation
+// budget. Neither the tower nor its admission guard may displace experts.
+fn spark_encoder_headroom(device: &DeviceLayout, budget: Option<u64>) -> u64 {
+    let physical = device.free_bytes().max(0) as u64;
+    let allocated: u64 = device.items.iter().filter(|i| i.category != Category::Reserved)
+        .map(|i| i.bytes).sum();
+    budget.map_or(physical, |bytes| physical.min(bytes.saturating_sub(allocated)))
+}
+
+fn resolve_encoder(checkpoint: &super::Checkpoint, report: &mut PlanReport, model: &dyn super::FamilyModel, rtx: &mut [DeviceLayout], sparks: &mut [DeviceLayout], kv: &[u64], options: &LayoutOptions, notes: &mut Vec<String>) {
     use super::encoder::*;
     let source = report.components.iter().find(|c| c.component == Component::Vision);
     let source_bytes = source.map_or(0, |c| c.bytes);
     // MiMo resident vectors are FP32. The measured 4096-token native ledger
     // includes the fixed 4096-row GEMM staging and 4 MiB BLAS workspace.
-    let (weights, scratch) = if report.family.as_deref() == Some("mimo_v2") && source_bytes > 0 {
+    let (weights, scratch) = if report.family.as_deref() == Some("deepseek_v41") && source_bytes > 0 {
+        (source_bytes, v41::vision_scratch_bytes())
+    } else if report.family.as_deref() == Some("mimo_v2") && source_bytes > 0 {
         let width = model.spec().hidden as u64;
         (1_458_170_944 + width.saturating_sub(4096) * 5120 * 2, mimo_scratch_bytes(width))
     } else if report.family.as_deref() == Some("glm5_flash") && source_bytes > 0 {
@@ -1101,14 +1140,20 @@ fn resolve_encoder(checkpoint: &super::Checkpoint, report: &mut PlanReport, mode
     } else if report.family.as_deref() == Some("qwen4") && source_bytes > 0 {
         (898_680_904, qwen_scratch_bytes(crate::media::QWEN_MAX_IMAGE_TOKENS as u64))
     } else { (source_bytes, 512 * MIB) };
-    let hardware = EncoderHardware { v41: false,
+    let hardware = EncoderHardware { v41: report.family.as_deref() == Some("deepseek_v41"),
         gpus: rtx.iter().enumerate().map(|(i,d)| EncoderGpuBudget { free_bytes: d.free_bytes().max(0) as u64, kv_target_bytes: kv.get(i).copied().unwrap_or(0) }).collect(),
         sparks: sparks.iter().map(|d| EncoderSparkBudget { rank: d.index as usize, host: format!("spark{}",d.index), idle: false,
-            expert_bytes: d.items.iter().filter(|i| i.category == Category::Experts).map(|i| i.bytes).sum(), free_bytes: d.free_bytes().max(0) as u64 }).collect() };
-    let placement = encoder_placement(report.vision, &hardware, weights, scratch, replicas);
+            expert_bytes: d.items.iter().filter(|i| i.category == Category::Experts).map(|i| i.bytes).sum(), free_bytes: spark_encoder_headroom(d, options.spark_allocation_budget_bytes) }).collect() };
+    let placement = encoder_placement(report.vision, &hardware, weights, scratch, options.vision_replicas);
     let add = |d: &mut DeviceLayout| {
         d.items.push(Item::new(Category::Weights, "vision tower", "BF16 + FP32 vectors", placement.weights, Basis::Formula));
-        d.items.push(Item::new(Category::Workspace, "vision scratch", "resident", placement.scratch, Basis::Formula));
+        let spark_overhead = if hardware.v41 && d.kind == DeviceKind::Spark {
+            super::encoder::V41_SPARK_CUDA_OVERHEAD_BYTES
+        } else { 0 };
+        d.items.push(Item::new(Category::Workspace, "vision scratch", "resident", placement.scratch.saturating_sub(spark_overhead), Basis::Formula));
+        if spark_overhead > 0 {
+            d.items.push(Item::new(Category::Runtime, "vision CUDA overhead", "SM121 measured delta + margin", spark_overhead, Basis::Formula));
+        }
     };
     match placement.kind {
         EncoderKind::Rtx { gpu } => add(&mut rtx[gpu]),
@@ -1157,7 +1202,7 @@ fn resolve_encoder(checkpoint: &super::Checkpoint, report: &mut PlanReport, mode
             kv_target_bytes: kv.get(i).copied().unwrap_or(0) }).collect(),
         sparks: sparks.iter().map(|d| EncoderSparkBudget { rank: d.index as usize, host: format!("spark{}", d.index),
             idle: false, expert_bytes: d.items.iter().filter(|i| i.category == Category::Experts).map(|i| i.bytes).sum(),
-            free_bytes: d.free_bytes().max(0) as u64 }).collect() };
+            free_bytes: spark_encoder_headroom(d, options.spark_allocation_budget_bytes) }).collect() };
     let placement = encoder_placement(report.audio, &hardware, weights, scratch, 1);
     let add = |d: &mut DeviceLayout| {
         d.items.push(Item::new(Category::Weights, "audio tower", "FP32 native", placement.weights, Basis::Formula));

@@ -848,6 +848,49 @@ Work, in priority order:
    host-mapped embedding (like Engram) is a planner lever only when memory
    binds (32 GB cards, ~1.2–1.3 GB saved) and its measured C1 cost is
    within ~0.5% (TJ, 2026-10-05).
+   **32 GB candidate issues (2026-10-08, work/plat2-32gb):** one serving heap
+   abort (`corrupted size vs. prev_size while consolidating`) in the initial
+   C16 attempt; not reproduced in four corrected launches plus ten distinct
+   C16 soak batches with MALLOC_CHECK_=3/GDB. Separately, one complete CPU
+   loader suite aborted with `corrupted double-linked list`; 50 exact parallel
+   MALLOC_CHECK_=3 repeats, three matching-image ASAN full suites and 24 ASAN
+   Engram/media/tokenizer subgroup runs passed. Baseline parallel/serial and
+   exact GDB repeats also passed. Memcheck/Helgrind were time-boxed; huge
+   fixture mappings limit coverage. Neither abort is fixed or proven related;
+   the heap hunt is closed for v2 unless it recurs. MALLOC_CHECK_=3 serving
+   soaks remain required; no memory-safety qualification is claimed. Independently, lazy target graph retention grew to ~12.6K counted
+   executables with unchanged device owners: untracked residency 3.24 ->
+   5.16 GB after batches 1 -> 5, leaving only 0.35 GiB of the logical 31.8 GiB
+   budget. The small-card fixed eight-shape bank (`1,6,16,24,32,40,43,48`),
+   exact index-selection retention/eager overflow and measured 2 GiB graph
+   envelope passed three interleaved C1/C16 comparisons and ten distinct
+   MALLOC_CHECK_=3 C16 batches on pin c595ba7: C1 +0.56%, C16 ratio 0.98194 (pair ratios
+   1.01965/1.02588/0.95888), minimum warmed logical free 4.084 GiB;
+   all four selection owners captured 256 exact fingerprints without recapture.
+   Accepted for the small-card profile; finite lazy warm-up remains, not a
+   startup freeze. PRO policy remains unchanged. MiMo host/GPU timing was
+   byte-identical with no measured host penalty (+0.51% median); its 256K
+   retrieval passed, but long-prompt free 2.5605 GiB failed the margin.
+   Growth was already-admitted shared KV shadow/lane/drafter storage, not a
+   missing reservation. Both small-card families now use an absolute 2.9 GiB
+   floor with the 97% ceiling; MiMo's measured contract predicts 962,560
+   aggregate tokens across 16 slots, an 86,016-token full-context shortfall.
+   Matching pin 682f5ad confirmation passed: V4.1 production-default auto
+   pool 3,342,848 tokens, C1/C16 code smoke and ten distinct C16 batches,
+   minimum observed logical free 3.9863 GiB, no observed selection recaptures
+   or capture failures. MiMo retained Int8 KV and the predicted 962,560-token
+   aggregate pool; its 64 MiB startup probe shares the floor slack only while
+   the probe is live (max(probe, floor), not their sum). Steady headroom stays
+   2.9 GiB. A 262,048 API-token request returned the exact requested secret
+   with 3.5976 GiB minimum observed logical free. The completed 640-token
+   host/GPU code outputs are byte-identical and pass structural checks, but
+   share an incorrect interval-merging assert; the checker does not execute
+   generated code. Neither heap abort recurred in these gates. PRO-default
+   parity/readiness on the rebased fcb6706d build remains the coordinator's
+   merge gate; no full-1M prompt or real-5090 qualification is claimed.
+   MiMo's launcher/planner auto concurrency is 16 only for physical or logical
+   budgets at most 32 GiB; PRO retains 8 and explicit overrides are preserved.
+   The direct serve-mimo CLI's upstream default of 4 is unchanged.
 4. **Multimodal for every family** with planner placement and the
    embedding cache (#3 FR-M.12 for MiMo). Towers to add: MiMo V2.6
    Pro/Flash MOPD (vision 28×1280, plus audio), Qwen 3.8 (vision 27×1152),

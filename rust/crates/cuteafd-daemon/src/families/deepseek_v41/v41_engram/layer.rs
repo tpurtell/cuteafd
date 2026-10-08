@@ -99,6 +99,9 @@ impl<'weights, 'library> EngramGate<'weights, 'library> {
         gathered: &EngramDeviceView,
     ) -> Result<CuteafdDeviceBuffer> {
         self.ready_rows = None;
+        if !crate::families::deepseek_v41::v41_layer_graphs::captures_shape(gathered.rows as u32) {
+            return unsafe { self.execute(residual, gathered) };
+        }
         if self.graphs.get(gathered.rows).is_none() {
             unsafe { self.capture(residual, gathered)?; }
         }
@@ -360,7 +363,7 @@ impl<'weights, 'library> EngramGate<'weights, 'library> {
             }
         })();
         if let Err(error) = launched { self.synchronize()?; return Err(error); }
-        if cold {
+        if cold && crate::families::deepseek_v41::v41_layer_graphs::captures_shape(gathered.rows as u32) {
             self.stream.wait().await?;
             unsafe { self.capture_ready(gathered.rows)?; }
             let graph = self.graphs.get(gathered.rows).context("engram graph missing after capture")?;

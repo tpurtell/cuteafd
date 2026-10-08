@@ -5,7 +5,7 @@
 // Dual-RTX owners preallocate execution storage before sizing the pool.
 // Keep room for request-time graphs and transient admission allocations.
 pub(crate) const RUNTIME_HEADROOM: usize = 800 * 1024 * 1024;
-const DEFAULT_POOL_TOKENS: usize = 14 * 1_048_576;
+const DEFAULT_POOL_TOKENS: usize = 2 * 1_048_576;
 
 /// CUDA module/stream setup follows the deferred expert loading phase. Keep
 /// this separate from the existing request-time graph/admission headroom.
@@ -124,8 +124,15 @@ impl PoolPlan {
             ensure!(total > 0 && free <= total, "invalid GPU {gpu} memory information");
             occupied_before[gpu] = total - free;
             reservation_bytes[gpu] = reservation.map(|r| r.bytes(total)).transpose()?.unwrap_or(total);
+            let small_card = total <= 32usize << 30;
+            if small_card {
+                reservation_bytes[gpu] = reservation_bytes[gpu].min(
+                    cuteafd_core::serving_capacity::admission_ceiling(total as u64, 97,
+                        cuteafd_core::serving_capacity::small_card_headroom_bytes(total as u64))? as usize);
+            }
+            let runtime = if small_card { 0 } else { RUNTIME_HEADROOM + super::graph_reserve_bytes(total, Some(gpu)) };
             available[gpu] = reservation_bytes[gpu].checked_sub(occupied_before[gpu])
-                .and_then(|n| n.checked_sub(RUNTIME_HEADROOM))
+                .and_then(|n| n.checked_sub(runtime))
                 .with_context(|| format!("GPU {gpu} reservation leaves no cache space after fixed owners and runtime headroom"))?;
         }
         let cache_bytes = |groups| if replicated {
@@ -134,7 +141,8 @@ impl PoolPlan {
         let fits = |groups| -> anyhow::Result<bool> {
             Ok(cache_bytes(groups)?.iter().zip(available).all(|(&used, free)| used <= free))
         };
-        let minimum = 2 * slots + 2 * retained_turns;
+        let tails = 2 * (slots + retained_turns);
+        let minimum = if exact.is_none() && reservation.is_none() { context.div_ceil(512) + tails } else { tails };
         ensure!(fits(minimum)?, "distributed cache cannot fit minimum admission and copy-on-write tails");
         let (mut low, mut high) = (minimum, MAX_GROUPS);
         while low < high {
@@ -147,10 +155,10 @@ impl PoolPlan {
             low
         } else {
             // Snapshot arenas are already charged to fixed occupancy. Cap the
-            // default shared pool at 14M tokens, leaving runtime graph space;
+            // default shared pool at 2M tokens, leaving runtime graph space;
             // concurrency and per-request context limits remain independent.
             // Explicit byte/reservation overrides retain their existing meaning.
-            ((context.div_ceil(512) * slots).min(DEFAULT_POOL_TOKENS / 512)
+            ((if memory.iter().any(|&(_, total)| total <= 32usize << 30) { 1_048_576 / 512 } else { DEFAULT_POOL_TOKENS / 512 })
                 + slots + 2 * retained_turns).max(minimum)
         };
         ensure!(desired_groups >= minimum && desired_groups <= MAX_GROUPS,
@@ -172,9 +180,59 @@ impl PoolPlan {
 mod tests {
     use super::*;
     #[test]
+    fn expert_budget_charges_each_roles_lazy_graph_reserve() -> anyhow::Result<()> {
+        let map = crate::families::deepseek_v41::v41_backbone_cache::CachePlacement::encoder_decoder();
+        let total = 96usize << 30;
+        let free = 8usize << 30;
+        let plan = PoolPlan::new(map, 16, 1_048_576, 20, 0,
+            Some(super::super::ByteSize(100 * super::super::GROUP_BYTES)), None, [(free, total); 2])?;
+        let reserves = [super::super::DUAL_GPU0_GRAPH_RESERVE, super::super::DUAL_GPU1_GRAPH_RESERVE];
+        for gpu in 0..2 {
+            assert_eq!(plan.unused_bytes[gpu], free - plan.cache_bytes[gpu] - RUNTIME_HEADROOM - reserves[gpu]);
+            let mut peaks = [[0; 2]; 40];
+            for (index, peak) in peaks.iter_mut().enumerate() {
+                *peak = plan.unused_bytes.map(|bytes| bytes / 20 * (index + 1));
+            }
+            // A rank-local reserve prevents admitting the next prefix even
+            // when the other rank has enough room.
+            peaks[20] = plan.unused_bytes;
+            peaks[20][gpu] += 1;
+            for index in 21..40 { peaks[index] = peaks[20]; }
+            assert_eq!(expert_layers(super::super::LocalLayers::Auto, &peaks, plan.unused_bytes)?, 20);
+            assert!(expert_layers(super::super::LocalLayers::Count(21), &peaks, plan.unused_bytes).is_err());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn small_card_default_caps_at_one_million_tokens_and_keeps_full_context() -> anyhow::Result<()> {
+        let map = crate::families::deepseek_v41::v41_backbone_cache::CachePlacement::encoder_decoder();
+        let plan = PoolPlan::new(map, 16, 32768, 20, 0, None, None, [(8usize << 30, 32usize << 30); 2])?;
+        assert_eq!(plan.pages[0], 2048 + 16 + 40);
+        let full = PoolPlan::new(map, 16, 1_048_576, 20, 0, None, None, [(8usize << 30, 32usize << 30); 2])?;
+        assert_eq!(full.pages[0], 2048 + 2 * (16 + 20));
+        Ok(())
+    }
+
+    #[test]
+    fn small_card_pool_leaves_absolute_floor_on_each_rank() -> anyhow::Result<()> {
+        let placement = crate::families::deepseek_v41::v41_backbone_cache::CachePlacement::encoder_decoder();
+        let total = 32usize << 30;
+        let free = 8usize << 30;
+        let plan = PoolPlan::new(placement, 16, 1_048_576, 20, 0, None,
+            Some("97%".parse()?), [(free, total); 2])?;
+        let floor = cuteafd_core::serving_capacity::SMALL_CARD_HEADROOM_BYTES as usize;
+        for gpu in 0..2 {
+            assert!(free - plan.cache_bytes[gpu] >= floor);
+            assert_eq!(plan.reservation_bytes[gpu], total - floor);
+        }
+        Ok(())
+    }
+
+    #[test]
     fn replicated_pool_charges_both_cards_without_inflating_tokens()->anyhow::Result<()> {
         let placement=crate::families::deepseek_v41::v41_backbone_cache::CachePlacement::encoder_decoder();
-        let memory=[(8usize<<30,96usize<<30);2];
+        let memory=[((3usize<<30) + (512usize<<20),96usize<<30);2];
         let original=PoolPlan::new(placement,16,1_048_576,20,0,None,None,memory)?;
         let unchanged=PoolPlan::with_replication(placement,16,1_048_576,20,0,None,None,memory,false)?;
         assert_eq!(original.pages,unchanged.pages);
@@ -204,10 +262,10 @@ mod tests {
         let layer_bytes = 2_789_290_000usize;
         let prefix: Vec<_> = (1..=40).map(|n| [n*layer_bytes; 2]).collect();
         let available = std::array::from_fn(|gpu| prefix[19][gpu] + pool.unused_bytes[gpu] - EXPERT_SETUP_HEADROOM);
-        assert_eq!(expert_layers(super::super::LocalLayers::Auto, &prefix, available)?, 25);
-        assert!(expert_layers(super::super::LocalLayers::Count(26), &prefix, available).is_err());
+        assert_eq!(expert_layers(super::super::LocalLayers::Auto, &prefix, available)?, 27);
+        assert!(expert_layers(super::super::LocalLayers::Count(28), &prefix, available).is_err());
         let mut after = memory;
-        for gpu in 0..2 { after[gpu].0 -= 5*layer_bytes + EXPERT_SETUP_HEADROOM; }
+        for gpu in 0..2 { after[gpu].0 -= 7*layer_bytes + EXPERT_SETUP_HEADROOM; }
         let retained = PoolPlan::new(placement, 16, 1_048_576, 24, 146_150_400,
             Some(super::super::ByteSize(pool.global_bytes)), None, after)?;
         assert_eq!(retained.pages, pool.pages);
@@ -234,22 +292,26 @@ mod tests {
     }
 
     #[test]
-    fn measured_dual_budget_reserves_fourteen_full_contexts_and_graph_headroom() -> anyhow::Result<()> {
+    fn measured_dual_budget_reserves_two_million_tokens_and_graph_headroom() -> anyhow::Result<()> {
         let totals = [101_973_491_712usize, 101_970_345_984];
         let occupied = [92_070_477_824usize, 94_956_158_976];
         let memory = std::array::from_fn(|gpu| (totals[gpu] - occupied[gpu], totals[gpu]));
         let plan = PoolPlan::new(crate::families::deepseek_v41::v41_backbone_cache::CachePlacement::encoder_decoder(),
             16, 1_048_576, 24, 146_150_400, None, None, memory)?;
-        assert_eq!(plan.pages, [28_736, 28_736, 28_736, 57_472]);
-        assert_eq!(plan.global_bytes, 13_094_420_480);
-        assert!(plan.unused_bytes[1] >= 2 * 373_293_056);
+        assert_eq!(plan.pages, [4160, 4160, 4160, 8320]);
+        assert_eq!(plan.global_bytes, 4160 * super::super::GROUP_BYTES);
+        assert!(plan.unused_bytes[1] + super::super::DUAL_GPU1_GRAPH_RESERVE >= 2 * 373_293_056);
         // The new default is not a hard cap on explicit user pool requests.
+        assert!(PoolPlan::new(crate::families::deepseek_v41::v41_backbone_cache::CachePlacement::encoder_decoder(),
+            16, 1_048_576, 24, 146_150_400, Some(super::super::ByteSize(14_960_885_760)), None, memory).is_err());
+        let with_graph_space = std::array::from_fn(|gpu|
+            (memory[gpu].0 + super::super::graph_reserve_bytes(totals[gpu], Some(gpu)), totals[gpu]));
         let explicit = PoolPlan::new(crate::families::deepseek_v41::v41_backbone_cache::CachePlacement::encoder_decoder(),
-            16, 1_048_576, 24, 146_150_400, Some(super::super::ByteSize(14_960_885_760)), None, memory)?;
+            16, 1_048_576, 24, 146_150_400, Some(super::super::ByteSize(14_960_885_760)), None, with_graph_space)?;
         assert_eq!(explicit.pages, [32_832, 32_832, 32_832, 65_664]);
         let smaller = PoolPlan::new(crate::families::deepseek_v41::v41_backbone_cache::CachePlacement::encoder_decoder(),
             8, 1_048_576, 24, 146_150_400, None, None, memory)?;
-        assert_eq!(smaller.pages[0], 8 * 2048 + 8 + 48);
+        assert_eq!(smaller.pages[0], 4096 + 8 + 48);
         for gpu in 0..2 {
             assert!(occupied[gpu] + plan.cache_bytes[gpu] + RUNTIME_HEADROOM <= totals[gpu]);
         }
@@ -263,7 +325,7 @@ mod tests {
         let map = CachePlacement::encoder_decoder();
         let bytes = BackboneCache::distributed_device_bytes(map, 16, [100, 100, 100, 200])?;
         assert!(bytes.iter().sum::<usize>() > 100 * GROUP_BYTES);
-        let memory = [(bytes[0] + RUNTIME_HEADROOM, 96 << 30), (20 << 30, 96 << 30)];
+        let memory = [(bytes[0] + RUNTIME_HEADROOM + super::super::DUAL_GPU0_GRAPH_RESERVE, 96 << 30), (20 << 30, 96 << 30)];
         let plan = PoolPlan::new(map, 16, 1_048_576, 24, 0, None,
             Some(Reservation::Percent(100_000_000)), memory)?;
         assert_eq!(plan.pages, [100, 100, 100, 200]);
@@ -275,7 +337,7 @@ mod tests {
         let rounded = PoolPlan::new(map, 16, 1_048_576, 24, 0,
             Some(ByteSize(101 * GROUP_BYTES - 1)), None, memory)?;
         assert_eq!(rounded.pages, plan.pages);
-        let default = PoolPlan::new(map, 16, 1_048_576, 24, 0, None, None, memory)?;
+        let default = PoolPlan::new(map, 16, 4096, 24, 0, None, None, memory)?;
         assert_eq!(default.pages, plan.pages);
         assert!(default.desired_groups > default.pages[0]);
         Ok(())
@@ -287,7 +349,7 @@ mod tests {
         use super::super::Reservation;
         let map = CachePlacement::encoder_decoder();
         let bytes = BackboneCache::distributed_device_bytes(map, 2, [64, 64, 64, 128])?;
-        let memory = [(20 << 30, 96 << 30), (bytes[1] + RUNTIME_HEADROOM, 96 << 30)];
+        let memory = [(20 << 30, 96 << 30), (bytes[1] + RUNTIME_HEADROOM + super::super::DUAL_GPU1_GRAPH_RESERVE, 96 << 30)];
         let plan = PoolPlan::new(map, 2, 4096, 24, 0, None,
             Some(Reservation::Percent(100_000_000)), memory)?;
         assert_eq!(plan.pages[0], 64);

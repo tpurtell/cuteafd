@@ -39,7 +39,7 @@ pub(crate) struct VisionRuntime<'a> {
     ready: Option<V41ImageGrid>,
 }
 impl<'a> VisionRuntime<'a> {
-    fn names() -> Vec<String> {
+    pub(super) fn names() -> Vec<String> {
         let mut names = vec![
             "vision.patch_embed.proj.weight".into(),
             "vision.patch_embed.proj.bias".into(),
@@ -221,7 +221,7 @@ impl<'a> VisionRuntime<'a> {
     }
     // Optional observer is only for numerical qualification, and sees completed
     // outputs. Normal execution queues the entire image before one final drain.
-    fn encode_patches(
+    pub(super) fn encode_patches(
         &mut self,
         patches: &[u8],
         grid: V41ImageGrid,

@@ -40,7 +40,8 @@ impl EncoderHandshake {
             || self.output_width == 0
             || self.output_width > MAX_WIDTH
             || ![14, 16].contains(&self.patch_size)
-            || self.merge_size != 2
+            || ![2, 3].contains(&self.merge_size)
+            || (self.merge_size == 3 && (self.patch_size != 14 || self.output_width != 5120))
         {
             return Err(error("invalid encoder capacity/geometry"));
         }
@@ -61,7 +62,7 @@ impl EncoderHandshake {
         Ok(())
     }
     fn write(&self, stream: &mut Wire) -> Result<()> {
-        stream.write_all(MAGIC).map_err(error)?;
+        stream.write_all(if self.merge_size == 3 { b"CAFDV401" } else { MAGIC }).map_err(error)?;
         stream.write_all(&self.encoder_id.0).map_err(error)?;
         stream.write_all(&self.plan_hash).map_err(error)?;
         for value in [
@@ -74,17 +75,25 @@ impl EncoderHandshake {
         }
         Ok(())
     }
+    fn tokens(&self, h: u32, w: u32) -> u64 {
+        if self.merge_size == 3 { u64::from(h.div_ceil(3)) * (u64::from(w.div_ceil(3)) + 1) + 2 }
+        else { u64::from(h) * u64::from(w) / 4 }
+    }
+    fn input_bytes(&self, patches: u64) -> u64 {
+        patches.saturating_mul(u64::from(self.patch_size).pow(2)).saturating_mul(3)
+            .saturating_mul(if self.merge_size == 3 { 2 } else { 1 })
+    }
     fn validate_job(&self, job: &EncodeJob) -> Result<usize> {
         let ([t, h, w], rgb8) = job.image_input()?;
         let patches = u64::from(h) * u64::from(w);
-        let rgb_bytes = patches * u64::from(self.patch_size).pow(2) * 3;
+        let rgb_bytes = self.input_bytes(patches);
         if t != 1
             || h == 0
             || w == 0
-            || h % self.merge_size != 0
-            || w % self.merge_size != 0
+            || (self.merge_size == 2 && (h % 2 != 0 || w % 2 != 0))
             || patches > u64::from(self.max_patches)
-            || job.tokens as u64 != patches / u64::from(self.merge_size).pow(2)
+            || job.tokens as u64 != self.tokens(h, w)
+            || (self.merge_size == 3 && job.tokens > 1024)
             || job.hidden_width != self.output_width as usize
             || rgb8.len() as u64 != rgb_bytes
         {
@@ -165,7 +174,7 @@ impl Handshake {
     }
     fn read(stream: &mut Wire) -> Result<Self> {
         let magic = read_array::<8>(stream)?;
-        if &magic != MAGIC && &magic != b"CAFDAU01" {
+        if &magic != MAGIC && &magic != b"CAFDV401" && &magic != b"CAFDAU01" {
             return Err(error("unsupported encoder wire version"));
         }
         let encoder_id = EncoderId(read_array(stream)?);
@@ -176,7 +185,7 @@ impl Handshake {
             get_u32(stream)?,
             get_u32(stream)?,
         ];
-        let value = if &magic == MAGIC {
+        let value = if (&magic == MAGIC && merge == 2) || (&magic == b"CAFDV401" && merge == 3) {
             Self::Image(EncoderHandshake {
                 encoder_id,
                 plan_hash,
@@ -452,7 +461,10 @@ impl EncoderClient for RemoteEncoder {
                 reply,
                 cancelled: cancelled.clone(),
             })
-            .map_err(|_| error("vision encoder queue unavailable"))?;
+            .map_err(|failure| match failure {
+                mpsc::TrySendError::Full(_) => MediaError::QueueFull,
+                mpsc::TrySendError::Disconnected(_) => error("vision encoder unavailable"),
+            })?;
         self.pending.insert(ticket, Pending { result, cancelled });
         Ok(ticket)
     }
@@ -651,6 +663,13 @@ impl EncoderServer {
             },
         )
     }
+    /// Family edge backend; transport, heartbeat and bounded frames stay shared.
+    pub fn start_image_backend<F, H>(address: SocketAddr, handshake: EncoderHandshake,
+        timeout: Duration, healthy: H, encode: F) -> Result<Self>
+    where F: FnMut(&EncodeJob) -> Result<EncodeOutput> + Send + 'static,
+        H: Fn() -> bool + Send + 'static,
+    { Self::start_backend(address, handshake.into(), timeout, healthy, encode) }
+
     fn start_backend<F, H>(
         address: SocketAddr,
         handshake: Handshake,
@@ -766,10 +785,10 @@ where
                 if grid[0] != 1
                     || patches == 0
                     || patches > u64::from(handshake.max_patches)
-                    || grid[1] % handshake.merge_size != 0
-                    || grid[2] % handshake.merge_size != 0
-                    || tokens != patches / u64::from(handshake.merge_size).pow(2)
-                    || len != patches * u64::from(handshake.patch_size).pow(2) * 3
+                    || (handshake.merge_size == 2 && (grid[1] % 2 != 0 || grid[2] % 2 != 0))
+                    || tokens != handshake.tokens(grid[1], grid[2])
+                    || (handshake.merge_size == 3 && tokens > 1024)
+                    || len != handshake.input_bytes(patches)
                 {
                     return Err(error("invalid vision frame before allocation"));
                 }
@@ -858,6 +877,57 @@ where
 mod tests {
     use super::*;
     use cuteafd_engine::media::FakeEncoder;
+    #[test]
+    fn rgb_wire_handshake_and_payload_remain_identical() {
+        // MiMo/GLM Flash use patch16; Qwen uses patch14. Both retain CAFDVI01.
+        for patch in [16u32, 14] {
+            let mut h = handshake();
+            h.patch_size = patch;
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let socket = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+            let (mut peer, _) = listener.accept().unwrap();
+            let mut wire = Wire::new(socket, Duration::from_secs(2)).unwrap();
+            h.write(&mut wire).unwrap();
+            let mut actual = vec![0; 88];
+            peer.read_exact(&mut actual).unwrap();
+            let mut expected = b"CAFDVI01".to_vec();
+            expected.extend_from_slice(&[7;32]); expected.extend_from_slice(&[9;32]);
+            for n in [16384u32, 4096, patch, 2] { expected.extend_from_slice(&n.to_le_bytes()); }
+            assert_eq!(actual, expected);
+            let job = EncodeJob::image(ImageKey([3;32]), [1,2,2], vec![11; (4*patch*patch*3) as usize].into(), 1, 4096);
+            let mut expected = 1u32.to_le_bytes().to_vec();
+            expected.extend_from_slice(&[3;32]);
+            for n in [1u32,2,2] { expected.extend_from_slice(&n.to_le_bytes()); }
+            expected.extend_from_slice(&1u64.to_le_bytes());
+            expected.extend_from_slice(&(4u64*u64::from(patch).pow(2)*3).to_le_bytes());
+            expected.extend_from_slice(&vec![11; (4*patch*patch*3) as usize]);
+            let owner = thread::spawn(move || {
+                let mut actual = vec![0; expected.len()]; peer.read_exact(&mut actual).unwrap(); assert_eq!(actual,expected);
+                peer.write_all(&0u32.to_le_bytes()).unwrap(); peer.write_all(&[3;32]).unwrap();
+                peer.write_all(&0u64.to_le_bytes()).unwrap(); peer.write_all(&8192u64.to_le_bytes()).unwrap();
+                peer.write_all(&vec![0;8192]).unwrap();
+            });
+            exchange(&mut wire, &job).unwrap(); owner.join().unwrap();
+        }
+    }
+    #[test]
+    fn v41_bf16_patch_frames_count_complete_spans_and_refuse_1058() {
+        let mut h = handshake(); h.merge_size=3; h.patch_size=14; h.output_width=5120; h.max_patches=9216;
+        let job = EncodeJob::image(ImageKey([1;32]),[1,93,93],vec![0;93*93*588*2].into(),994,5120);
+        assert_eq!(h.validate_job(&job).unwrap(),994*10240);
+        let rejected = EncodeJob::image(ImageKey([1;32]),[1,96,96],vec![0;96*96*588*2].into(),1058,5120);
+        assert!(h.validate_job(&rejected).is_err());
+        let oversized = EncodeJob::image(ImageKey([2;32]), [1,u32::MAX,u32::MAX], vec![].into(), 1, 5120);
+        assert!(h.validate_job(&oversized).is_err());
+        let server = EncoderServer::start_image_backend("127.0.0.1:0".parse().unwrap(),h.clone(),Duration::from_secs(2),||true,
+            |job| Ok(EncodeOutput { key:job.key, features:FakeEncoder::features(job)?, elapsed_ms:0.0 })).unwrap();
+        let mut client = RemoteEncoder::connect(vec![server.address],h,Duration::from_secs(2)).unwrap();
+        let expected = FakeEncoder::features(&job).unwrap();
+        let ticket = client.submit(job).unwrap();
+        let end = Instant::now()+Duration::from_secs(2);
+        loop { if let Some(result)=client.poll(ticket) { assert_eq!(result.unwrap().features,expected); break; }
+            assert!(Instant::now()<end); thread::sleep(Duration::from_millis(1)); }
+    }
     fn handshake() -> EncoderHandshake {
         EncoderHandshake {
             encoder_id: EncoderId([7; 32]),
@@ -1208,6 +1278,21 @@ mod tests {
             assert_eq!(result.is_err(), panic);
             assert!(!health.load(Ordering::Acquire));
         }
+    }
+    #[test]
+    fn saturated_owner_queue_is_transient_without_poisoning_health() {
+        let server = server();
+        let mut client = RemoteEncoder::connect(vec![server.address], handshake(), Duration::from_secs(1)).unwrap();
+        // Detach a bounded queue from its worker so saturation is deterministic.
+        let (queue, receiver) = mpsc::sync_channel(1);
+        let original = client.replicas[0].queue.replace(queue);
+        let ticket = client.submit(job(0)).unwrap();
+        assert!(matches!(client.submit(job(1)), Err(MediaError::QueueFull)));
+        assert!(client.healthy());
+        client.cancel(ticket);
+        assert!(client.pending.is_empty());
+        drop(receiver);
+        client.replicas[0].queue = original;
     }
     #[test]
     fn invalid_geometry_rejected_before_queue_and_rank_failure_visible() {

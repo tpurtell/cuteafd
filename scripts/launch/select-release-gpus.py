@@ -16,7 +16,7 @@ from decimal import Decimal, InvalidOperation
 MIB = 1 << 20
 GIB = 1 << 30
 GROUP_BYTES = 455_680
-DEFAULT_POOL_TOKENS = 14 * 1_048_576
+DEFAULT_POOL_TOKENS = 2 * 1_048_576
 
 # Fixed owners include weights, execution workspaces, snapshots, CUDA contexts,
 # and the constant (window/state) part of the C16 cache. These are conservative
@@ -177,7 +177,8 @@ def desired_groups(args: argparse.Namespace) -> int:
     if args.memory_reservation:
         return minimum
     groups = math.ceil(args.max_context_tokens / 512) * args.concurrency
-    return min(groups, DEFAULT_POOL_TOKENS // 512) + args.concurrency + 2 * args.retained_turns
+    return max(min(groups, DEFAULT_POOL_TOKENS // 512) + args.concurrency + 2 * args.retained_turns,
+               math.ceil(args.max_context_tokens / 512) + minimum)
 
 
 def required_mib(role: int, groups: int, minimum_expert_layers: int = 20,

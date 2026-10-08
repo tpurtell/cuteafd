@@ -507,8 +507,9 @@ pub fn plan(snapshot: &Path, options: &PlanOptions) -> Result<PlanReport, PlanEr
             how: "Finish the download (hf download) or replicate it (nest replicate hf:ORG/NAME).".into(),
         });
     }
-    if options.layout.is_none() && spec.family != "deepseek_v41" {
-        let inventory = layout::LayoutOptions { rtx_bytes: vec![options.coordinator_budget_bytes], spark_bytes: options.spark_budget_bytes, ..Default::default() };
+    if options.layout.is_none() {
+        let inventory = layout::LayoutOptions { rtx_bytes: vec![options.coordinator_budget_bytes], spark_bytes: options.spark_budget_bytes,
+            spark_allocation_budget_bytes: Some(options.spark_budget_bytes), ..Default::default() };
         let _ = layout::layout(&mut report, model.as_ref(), &checkpoint, &inventory);
     }
     if let Some(encoder) = &report.encoder {
@@ -566,7 +567,7 @@ pub fn plan(snapshot: &Path, options: &PlanOptions) -> Result<PlanReport, PlanEr
 fn place(report: &mut PlanReport, options: &PlanOptions, spec: &ModelSpec, model: &dyn FamilyModel,
     routed_operands: &BTreeMap<String, QuantOperand>) {
     let bytes_of = |owner: Owner| -> u64 {
-        report.components.iter().filter(|c| c.owner == owner && !(spec.family != "deepseek_v41" && matches!(c.component, Component::Vision | Component::Audio))).map(|c| c.bytes).sum()
+        report.components.iter().filter(|c| c.owner == owner && !matches!(c.component, Component::Vision | Component::Audio)).map(|c| c.bytes).sum()
     };
     let (routed, rtx, mapped) = (bytes_of(Owner::SparkSliced), bytes_of(Owner::Rtx), bytes_of(Owner::HostMapped));
     for (owner, bytes) in [(Owner::Rtx, rtx), (Owner::SparkSliced, routed), (Owner::HostMapped, mapped)] {

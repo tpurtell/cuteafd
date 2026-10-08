@@ -329,6 +329,9 @@ impl<'w, 'a> TargetPass<'w, 'a> {
         // Prefill, encoder and replay passes keep host-drained stages: their
         // many-row paths publish KV and encoder state through host-ordered copies.
         let verification = matches!(terminal, HeadTerminal::Greedy | HeadTerminal::Sampled { .. });
+        let step_sample = if verification && tracing::enabled!(target: "cuteafd::target_step", tracing::Level::DEBUG) {
+            Some((batch.cache()?.positions().len(), std::time::Instant::now()))
+        } else { None };
         if let Some(chain) = &self.chain {
             chain.set_device_order(std::mem::replace(&mut self.device_order, true));
         }
@@ -350,6 +353,11 @@ impl<'w, 'a> TargetPass<'w, 'a> {
         if result.is_ok() && crate::shared::memory::chain::device_enabled() {
             // Device-ordered local layers left their captured routes in the router's ring.
             self.lane.drain_route_ring()?;
+        }
+        if let Some((rows, started)) = step_sample {
+            tracing::debug!(target: "cuteafd::target_step", rows,
+                eager=!super::v41_layer_graphs::captures_shape(rows as u32),
+                elapsed_us=started.elapsed().as_micros() as u64, success=result.is_ok(), "V4.1 target verification step");
         }
         result
     }

@@ -208,6 +208,31 @@ impl<'library> DsparkWeights<'library> {
             terminal_additional_bytes_per_wave: DsparkTerminal::additional_bytes_with_width(16, width)?,
         })
     }
+    /// Exact single-coordinator serving owners, before reading any payload.
+    pub fn serving_bytes(library: &NativeLibrary, catalog: &OfficialV41Catalog,
+        context_capacity: u32, requests: u32, width: usize, directory: Option<&Path>) -> Result<(usize, usize, usize)> {
+        ensure!((1..=16).contains(&requests), "invalid draft request limit");
+        let lanes = if requests == 1 { 1 } else { 2 };
+        let members = requests.div_ceil(lanes);
+        let capacity = DsparkAttentionWave::projection_capacity_with_width(members, width)?;
+        let budget = Self::plan_with_width(library, catalog, capacity, width, directory)?;
+        let chain = [budget.execution_bytes_per_wave, budget.shared_execution_bytes_per_wave,
+            budget.router_bytes_per_wave, budget.hc_bytes_per_wave,
+            DsparkAttentionWave::device_bytes_with_width(library, members, width)?.checked_mul(3).context("draft attention overflow")?,
+            members as usize * 4, DsparkTerminal::device_bytes_with_width(members as usize, width)?]
+            .into_iter().try_fold(0usize, |n, b| n.checked_add(b).context("draft chain overflow"))?;
+        let head_scratch = if crate::families::deepseek_v41::v41_tensors::fp8_head()
+            != crate::families::deepseek_v41::v41_tensors::Fp8Head::Off {
+            library.fp8_w8a16_workspace(members as usize * width, 5120, 129280)?.max(256)
+        } else { 0 };
+        let mut runtime = chain.checked_add(head_scratch).and_then(|n| n.checked_mul(lanes as usize)).context("draft lanes overflow")?
+            .checked_add(DsparkMainContext::device_bytes(library, context_capacity)?).context("draft main overflow")?;
+        if lanes > 1 { runtime = runtime.checked_add(DsparkMainContext::device_bytes(library, 80)?).context("draft second main overflow")?; }
+        runtime = runtime.checked_add(DsparkWindow::device_bytes(requests as usize, context_capacity)? * 3)
+            .context("draft windows overflow")?;
+        Ok((budget.resident_bytes()?, runtime, budget.load_staging_bytes))
+    }
+
     /// Serving retains a large target-context projection buffer, but expert
     /// execution only needs the bounded speculative request batch. Reserve the
     /// full context owner in addition to the conservative draft-wave plan before

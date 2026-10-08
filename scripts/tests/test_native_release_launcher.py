@@ -60,6 +60,38 @@ class NativeReleaseLauncherTest(unittest.TestCase):
         self.assertIn('family_args=(--embedding-placement "$embedding")', generic)
         self.assertIn('cfg[EMBEDDING]="$embedding_override"', generic)
 
+    def test_small_card_embedding_default_and_explicit_overrides(self) -> None:
+        source = (ROOT / 'run.sh').read_text()
+        block = source.split('if python3 -c', 1)[1].split('\nsnapshot_rel=', 1)[0]
+        block = 'if python3 -c' + block
+        for gib, config_value, override, expected in (
+            ('31.8', '', '', 'host'), ('32', '', '', 'host'),
+            ('96', '', '', 'gpu'), ('31.8', 'gpu', '', 'gpu'),
+            ('31.8', '', 'gpu', 'gpu'), ('96', 'host', '', 'host'),
+        ):
+            with self.subTest(gib=gib, config=config_value, override=override):
+                with tempfile.NamedTemporaryFile(mode='w') as config:
+                    if config_value:
+                        config.write(f'EMBEDDING={config_value}\n')
+                    config.flush()
+                    harness = '''set -euo pipefail
+release_spark_compact_active() { return 1; }
+release_die() { exit 1; }
+declare -A overrides
+profile_gib=$1
+config=$2
+EMBEDDING=${3:-gpu}
+overrides[EMBEDDING]=$4
+[[ -z "$4" ]] || EMBEDDING=$4
+PREFILL_BATCH_TOKENS=2048
+MEMORY_RESERVATION=
+RTX_EXPERT_LAYERS=auto
+'''
+                    result = subprocess.run(['bash', '-c', harness + block + '\nprintf "%s" "$EMBEDDING"',
+                        'test', gib, config.name, config_value, override], cwd=ROOT, text=True, capture_output=True)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(result.stdout, expected)
+
     def test_explicit_dual_layer_boundary_covers_delegated_experts(self) -> None:
         for layout, layers, expected in [('2', 'auto', '20'), ('2', '17', '17'),
                                          ('2', '1', '1'), ('2', '40', '39'),

@@ -103,7 +103,7 @@ pub(crate) async fn run(mut args: crate::cli::NativeServeArgs) -> Result<()> {
             tracing::error!(%reason, "native target worker stopped");
             cuteafd_transport::health::record_failure(reason);
         })?;
-    readiness
+    let vision_health = readiness
         .await
         .context("native target startup stopped")?
         .map_err(anyhow::Error::msg)?;
@@ -111,8 +111,10 @@ pub(crate) async fn run(mut args: crate::cli::NativeServeArgs) -> Result<()> {
     let listener = tokio::net::TcpListener::bind(&listen).await?;
     cuteafd_bench::ready(&listener);
     tracing::info!(%listen,"native V4.1 target API ready");
+    let mut profile = cuteafd_api::openai::ModelProfile::default();
+    profile.vision_health = vision_health;
     let router = cuteafd_api::openai::router_for_model(send, limits, stats, http_queue_wait, console_hub.clone(),
-        crate::shared::api::profile(cuteafd_api::openai::ModelProfile::default()));
+        crate::shared::api::profile(profile));
     axum::serve(listener, api.app(router, console_hub).into_make_service_with_connect_info::<std::net::SocketAddr>())
         .with_graceful_shutdown(async {
             let mut term =
@@ -137,6 +139,12 @@ fn prefill_capacity(batch_tokens: u32) -> Result<u32> {
         .into_iter()
         .find(|&capacity| capacity >= batch_tokens.max(128))
         .context("no prefill capacity covers the requested batch")
+}
+
+fn admit_small_card_capacity(total: usize, batch: u32) -> Result<()> {
+    ensure!(total > 32usize << 30 || prefill_capacity(batch)? <= 1024,
+        "32 GB V4.1 capacity 4096 cannot fit with vision/dSpark; set --prefill-batch-tokens 1024 (256 for pool-first)");
+    Ok(())
 }
 
 #[cfg(test)]
@@ -178,6 +186,19 @@ mod prefill_capacity_tests {
         let mut kv = Some(memory::ByteSize(1usize << 30));
         compact_budget(&mut Some("31GiB".parse().unwrap()), &mut kv).unwrap();
         assert_eq!(kv.unwrap().0, 1usize << 30);
+    }
+
+    #[test]
+    fn small_card_refuses_large_capacity_before_allocation() {
+        for batch in [80, 256, 1024] { assert!(super::admit_small_card_capacity(32usize << 30, batch).is_ok()); }
+        for total in [32usize << 30, (31.8 * (1u64 << 30) as f64) as usize] {
+            for batch in [1025, 2048, 4096] {
+                let reason = super::admit_small_card_capacity(total, batch).unwrap_err().to_string();
+                assert!(reason.contains("capacity 4096"), "{reason}");
+                assert!(reason.contains("--prefill-batch-tokens 1024 (256 for pool-first)"), "{reason}");
+            }
+        }
+        assert!(super::admit_small_card_capacity(96usize << 30, 4096).is_ok());
     }
 
     #[test]
@@ -266,7 +287,7 @@ fn spark_transport(
 fn worker(
     mut args: crate::cli::NativeServeArgs,
     mut receive: mpsc::Receiver<NativeRequest>,
-    ready: &mut Option<oneshot::Sender<std::result::Result<(), String>>>,
+    ready: &mut Option<oneshot::Sender<std::result::Result<Option<std::sync::Arc<std::sync::atomic::AtomicBool>>, String>>>,
     stats: std::sync::Arc<std::sync::Mutex<serde_json::Value>>,
 ) -> Result<()> {
     // Auto placement must publish its live boundary even when no local layer
@@ -301,13 +322,29 @@ fn worker(
             return distributed::worker(args, receive, ready, stats);
         }
     }
+    // SAFETY: the configured library remains owned by this worker until all CUDA work drains.
+    let lib = unsafe { NativeLibrary::load(&args.native_lib)? };
+    let (_, device_total) = lib.cuda_memory_info()?;
+    let small_card = device_total <= 32usize << 30;
+    if small_card {
+        let explicit = std::env::var("CUTEAFD_V41_FIXED_GRAPH_ROWS").ok();
+        if let Some(shapes) = super::v41_layer_graphs::profile_fixed_shapes(device_total, explicit.as_deref())? {
+            tracing::info!(?shapes, "V4.1 small-card fixed exact graph set; other rows execute eagerly");
+            super::v41_layer_graphs::set_fixed_shapes(shapes)?;
+        }
+    }
+    if small_card && !legacy_compact(None, args.peers.len()) {
+        admit_small_card_capacity(device_total, args.prefill_batch_tokens)?;
+        if args.memory_reservation.is_none() { args.memory_reservation = Some("97%".parse()?); }
+        if args.rtx_expert_layers == memory::LocalLayers::Auto { args.rtx_expert_layers = memory::LocalLayers::Count(0); }
+        tracing::info!(device_total, prefill=args.prefill_batch_tokens, "selected V4.1 32 GB all-remote profile; explicit pool/reservation overrides retained");
+    }
     // Local expert waves need an exported AOT capacity; every other row
     // buffer follows the live prefill chunk (as the dual-RTX path does: the
     // FP8 plans keep their full scratch). 2048-row chunks: ~9 GiB less.
     let aot_capacity = prefill_capacity(args.prefill_batch_tokens)?;
     let capacity = args.prefill_batch_tokens.max(256);
     let rows = capacity as usize;
-    let lib = unsafe { NativeLibrary::load(&args.native_lib)? };
     let catalog = cuteafd_loader::read_official_v41_catalog(
         cuteafd_loader::OFFICIAL_V41_MODEL_ID,
         &args.snapshot,
@@ -338,8 +375,12 @@ fn worker(
          a native three-rank group must pass --spark-tp 3 --spark-ep 1"
     );
     let paired_profile = crate::families::deepseek_v41::v41_experts::paired::PairedProfile::for_serving(&catalog, args.exl3_paired_tp4)?;
+    if small_card && !legacy_compact(topology, args.peers.len()) {
+        memory::admit_small_card_startup(&lib, &catalog, &args)?;
+    }
     let start = Instant::now();
     cuteafd_ffi::memory_ledger::relabel_other("v41/startup");
+    if small_card { memory::startup_phase(&lib, "v41/startup", device_total)?; }
     let weights = BackboneLaneWeights::load(
         &lib,
         &catalog,
@@ -358,7 +399,8 @@ fn worker(
         IndexLaneWeights::device_bytes(&lib, &catalog)?,
         16 * 1024 * 1024,
     )?;
-    let table = NativeRtxTensors::load_embedding(&lib, &catalog, args.embedding_placement)?;
+    let table = NativeRtxTensors::load_embedding(&lib, &catalog,
+        memory::embedding_placement(args.embedding_placement, device_total))?;
     eprintln!(
         "native target backbone/index/embedding weights loaded in {:.3}s",
         start.elapsed().as_secs_f64()
@@ -366,6 +408,7 @@ fn worker(
     let embedding =
         TargetEmbeddingWave::new(&lib, &table, rows, TargetEmbeddingWave::device_bytes(rows)?)?;
     cuteafd_ffi::memory_ledger::relabel_other("v41/weights:backbone,cache-producers,index,embedding");
+    if small_card { memory::startup_phase(&lib, "v41/weights:backbone,cache-producers,index,embedding", device_total)?; }
     let lane = BackboneLane::new(
         &weights,
         capacity,
@@ -382,6 +425,7 @@ fn worker(
         BackboneExecution::workspace_bytes(&lib, capacity)?,
     )?;
     cuteafd_ffi::memory_ledger::relabel_other("v41/workspace:backbone-lanes");
+    if small_card { memory::startup_phase(&lib, "v41/workspace:backbone-lanes", device_total)?; }
     let map = cuteafd_loader::EngramTokenMap::from_file(&&args.snapshot.join("tokenizer.json"))?;
     // Both Engram layers retain their staging leases until consumed. Reserve
     // both layers for both active lanes so the second lane can gather early.
@@ -398,6 +442,7 @@ fn worker(
     ];
     let upload = EngramDeviceRows::new(&lib, rows, EngramDeviceRows::device_bytes(rows)?)?;
     cuteafd_ffi::memory_ledger::relabel_other("v41/engram");
+    if small_card { memory::startup_phase(&lib, "v41/engram", device_total)?; }
     let vocabulary = VocabularyHead::load(
         &lib,
         &catalog,
@@ -412,6 +457,7 @@ fn worker(
     )?;
     let head = head_weights.wave(&vocabulary, if args.dspark_draft_limit > 5 { 64 } else { 48 }, TargetHeadWave::device_bytes(if args.dspark_draft_limit > 5 { 64 } else { 48 })?)?;
     cuteafd_ffi::memory_ledger::relabel_other("v41/weights:head");
+    if small_card { memory::startup_phase(&lib, "v41/weights:head", device_total)?; }
     let mut pass = TargetPass::new(
         embedding,
         lane,
@@ -428,6 +474,7 @@ fn worker(
         Duration::from_secs(120),
     )?;
     cuteafd_ffi::memory_ledger::relabel_other("v41/workspace:target-pass");
+    if small_card { memory::startup_phase(&lib, "v41/workspace:target-pass", device_total)?; }
     let protocol_v2_timing = protocol_v2_timing();
     // Every replicated layout reserves its exact physical rank plane count; the
     // legacy 4-rank forecast is no longer reused for six ranks.
@@ -436,6 +483,7 @@ fn worker(
     let mut transport = NativeTp4Wave::new(&lib, roce, wave_bytes)?;
     if let Some(profile) = &paired_profile { transport.install_paired(profile.clone())?; }
     cuteafd_ffi::memory_ledger::relabel_other("v41/transport");
+    if small_card { memory::startup_phase(&lib, "v41/transport", device_total)?; }
     let mut prefill_pass = TargetPass::new(
         TargetEmbeddingWave::new(&lib, &table, rows, TargetEmbeddingWave::device_bytes(rows)?)?,
         BackboneLane::new(&weights, capacity, BackboneLane::workspace_bytes(&lib, capacity)?.into_iter().sum())?,
@@ -453,11 +501,14 @@ fn worker(
         prefill_pass.reserve_sparse_decode_rows(64)?;
     }
     cuteafd_ffi::memory_ledger::relabel_other("v41/workspace:prefill-pass");
+    if small_card { memory::startup_phase(&lib, "v41/workspace:prefill-pass", device_total)?; }
     let prefill_roce = spark_transport(&args.peers, capacity, protocol_v2_timing, topology)?;
     let mut prefill_transport = NativeTp4Wave::new(&lib, prefill_roce, wave_bytes)?;
     if let Some(profile) = &paired_profile { prefill_transport.install_paired(profile.clone())?; }
     cuteafd_ffi::memory_ledger::relabel_other("v41/transport");
+    if small_card { memory::startup_phase(&lib, "v41/transport", device_total)?; }
     let exl3_tiers: &[usize] = catalog.exl3().map(|m| m.decoder_tiers()).unwrap_or(&[]);
+    let draft_free_before = if small_card { lib.cuda_memory_info()?.0 } else { 0 };
     let draft_weights = if args.dspark {
         Some(crate::families::deepseek_v41::v41_experts::dspark::DsparkWeights::load_serving_with_width(
             &lib,
@@ -481,12 +532,16 @@ fn worker(
         draft.set_fixed(args.dspark_fixed);
     }
     cuteafd_ffi::memory_ledger::relabel_other("v41/drafter");
-    let mut vision = crate::families::deepseek_v41::v41_vision::VisionRuntime::new(&lib, &catalog, 9216,
-        crate::families::deepseek_v41::v41_vision::VisionRuntime::device_bytes(&catalog, 9216)?)?;
+    if small_card { memory::startup_phase(&lib, "v41/drafter", device_total)?; }
+    let vision_free_before = if small_card { lib.cuda_memory_info()?.0 } else { 0 };
+    let dspark_bytes = draft_free_before.saturating_sub(vision_free_before);
+    let mut vision = crate::families::deepseek_v41::v41_vision_encoder::Encoder::load(&args, &catalog)?;
+    let vision_bytes = if small_card { vision_free_before.saturating_sub(lib.cuda_memory_info()?.0) } else { 0 };
     // Reserve both retention banks plus one in-flight snapshot per lane. These
     // allocations are counted before choosing KV capacity and local expert layers.
     ensure!(args.prefix_cache_entries <= 128, "invalid retained-turn limit");
     cuteafd_ffi::memory_ledger::relabel_other("v41/vision");
+    if small_card { memory::startup_phase(&lib, "v41/vision", device_total)?; }
     let snapshot_slots = if args.prefix_cache_entries == 0 { 0 } else {
         (args.prefix_cache_entries as usize).checked_mul(2).and_then(|n| n.checked_add(2))
             .context("snapshot slot count overflow")?
@@ -497,8 +552,9 @@ fn worker(
     let snapshot_bytes = target_prefix_pool.as_ref().map_or(0, crate::shared::memory::SnapshotPool::device_bytes) + draft_snapshot_bytes;
     tracing::info!(snapshot_slots, snapshot_bytes, "snapshot arenas reserved before serving");
     cuteafd_ffi::memory_ledger::relabel_other("v41/prefix-snapshots");
+    if small_card { memory::startup_phase(&lib, "v41/prefix-snapshots", device_total)?; }
     // Size after vision, both lanes, transports and optional draft allocations are live.
-    let (free, total) = lib.cuda_memory_info()?;
+    let (free, total) = if small_card { memory::measured_pool_memory(&lib)? } else { lib.cuda_memory_info()? };
     // A nominal 32 GiB card can expose slightly less memory to CUDA. The
     // compact ceiling may become smaller, never larger, on that hardware.
     // This cap belongs to the legacy two- or three-peer EXL3 compact profile
@@ -516,10 +572,14 @@ fn worker(
         args.prefix_cache_entries as usize, snapshot_bytes, args.kv_pool_size, reservation, free, total)?;
     tracing::info!(retained_turn_limit=args.prefix_cache_entries, prompt_snapshot_limit=args.prefix_cache_entries, source_pages=?pool.pages, global_bytes=pool.global_bytes,
         cache_bytes=pool.cache_bytes, device_occupied_bytes=pool.occupied_before,
-        reservation_bytes=pool.reservation_bytes, runtime_headroom_bytes=memory::RUNTIME_HEADROOM,
+        dspark_bytes, vision_bytes, snapshot_bytes,
+        pool_tokens=pool.pages[0].saturating_sub(args.concurrency as usize + 2 * args.prefix_cache_entries as usize) * 512,
+        projected_free_bytes=free.saturating_sub(pool.cache_bytes),
+        reservation_bytes=pool.reservation_bytes, runtime_headroom_bytes=pool.runtime_headroom_bytes,
         "native KV pool reservation");
     let mut requests = Requests::new(&lib, pipeline, args.concurrency as usize, pool.pages, pool.cache_bytes)?;
     cuteafd_ffi::memory_ledger::relabel_other("v41/kv");
+    if small_card { memory::startup_phase(&lib, "v41/kv", device_total)?; }
     if let Some(pool) = target_prefix_pool { requests.install_prefix_pool(pool)?; }
     let mut local_layers = 0usize;
     // Published only on the single-RTX path; the 2-RTX distributed worker owns
@@ -527,6 +587,7 @@ fn worker(
     // launch unpublished, which the launcher treats as a failure.
     let mut placement_handoff: Option<placement::StartupPlacement> = None;
     cuteafd_ffi::memory_ledger::relabel_other("v41/kv-prefix-install");
+    if small_card { memory::startup_phase(&lib, "v41/kv-prefix-install", device_total)?; }
     if args.rtx_expert_layers != memory::LocalLayers::Count(0) {
         use crate::families::deepseek_v41::v41_experts::{ExpertLayer, ExpertWeights, local::LocalExpertWave};
         let local_started = Instant::now();
@@ -550,6 +611,7 @@ fn worker(
         local_layers = plan.layers;
         tracing::info!(layers=plan.layers, resident_bytes=plan.resident_bytes,
             workspace_bytes=plan.workspace_bytes, peak_bytes=plan.peak_bytes,
+            graph_reserve_bytes=plan.graph_reserve_bytes,
             "bottom-up RTX expert placement");
         // Publish the resolved boundary before anything waits on it. On 1 RTX the
         // 2-RTX distributed path never ran, so without this the launcher cannot
@@ -608,22 +670,24 @@ fn worker(
             "compact residency {occupied} bytes plus runtime headroom exceeds {} byte device ceiling", pool.reservation_bytes);
     }
     cuteafd_ffi::memory_ledger::relabel_other("v41/local-experts");
+    if small_card { memory::startup_phase(&lib, "v41/local-experts", device_total)?; }
     crate::shared::memory_report::release_load_staging(&lib);
     tracing::info!(rtx_layers=local_layers, first_remote_dispatch_layer=local_layers,
         remote_dispatch_layers=40-local_layers, spark_world=args.peers.len(),
         spark_topology=?topology.map(|t| (t.tp(), t.ep())),
         device_occupied_bytes=occupied, device_budget_bytes=pool.reservation_bytes,
-        runtime_headroom_bytes=memory::RUNTIME_HEADROOM, "native serving residency ready");
+        runtime_headroom_bytes=pool.runtime_headroom_bytes, "native serving residency ready");
     if let Some(draft) = &mut draft { draft.configure_policy(&transport, catalog.nvfp4().is_some())?; }
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
     let prefixes = scheduler::prepare_prefix_cache(&lib, &args, &requests)?;
     scheduler::publish_capacity(&requests, &prefixes);
+    vision.connect()?;
     ready
         .take()
         .context("startup readiness missing")?
-        .send(Ok(()))
+        .send(Ok(vision.health_handle()))
         .map_err(|_| anyhow::anyhow!("API startup cancelled"))?;
     scheduler::serve(&lib, &args, &runtime, &mut receive, &mut pass, &mut prefill_pass,
         &mut requests, &mut transport, &mut prefill_transport, draft.as_mut(), &mut vision, stats, prefixes)

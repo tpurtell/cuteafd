@@ -526,6 +526,17 @@ impl<E: CopyEngine> PrefixCache<E> {
         Ok(true)
     }
 
+    /// Extend a live lease before a forward pass. Only inactive snapshots can
+    /// be evicted; existing live pages keep their references on failed growth.
+    pub fn grow<F: PrefixFamily>(&mut self, family: &F, pages: &mut Vec<u32>, tokens: usize)
+        -> Result<(), PrefixError> {
+        let additional = self.pool.pages_for(tokens).saturating_sub(pages.len());
+        if additional == 0 { return Ok(()); }
+        self.make_room(family, additional, None)?;
+        pages.extend(self.pool.alloc(additional)?);
+        Ok(())
+    }
+
     /// Poll the host tier's store copies; once per scheduler step.
     pub fn tick(&mut self) {
         if let Some(host) = &mut self.host {

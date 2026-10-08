@@ -5,6 +5,20 @@ fn solid(value: u8) -> V41Image {
 }
 
 #[test]
+fn maximum_square_grid_counts_separators_before_shrinking() {
+    let unshrunk = V41ImageGrid {
+        pixel_height: 1344, pixel_width: 1344, vit_height: 96, vit_width: 96,
+        llm_height: 32, llm_width: 32,
+    };
+    assert_eq!(unshrunk.tokens(), 1058);
+    assert!(unshrunk.tokens() > MAX_IMAGE_TOKENS);
+    let admitted = V41ImageGrid::plan(1344, 1344).unwrap();
+    assert_eq!((admitted.llm_height, admitted.llm_width), (31, 31));
+    assert_eq!(admitted.tokens(), 994);
+    assert_eq!(admitted.token_types().len(), 994);
+}
+
+#[test]
 fn expanded_interleaved_images_have_exact_spans_and_context_accounting() {
     let a = solid(0);
     let b = solid(255);

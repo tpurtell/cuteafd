@@ -47,13 +47,13 @@ pub(crate) struct EngineArgs {
     /// Run only the first N layers (layer 0 is the only dense layer).
     #[arg(long)]
     pub layers: Option<usize>,
-    /// Longest sequence (the RoPE tables and page tables).
-    #[arg(long, default_value_t = 32768)]
+    /// Longest sequence; 0 selects the checkpoint's full context.
+    #[arg(long, default_value_t = 0)]
     pub max_context: usize,
     /// Tokens the full-attention record pool holds across sequences; 0 sizes
     /// it from what every GPU has left after weights, workspaces, graphs and
     /// the drafter (capacity admission), up to the common 2M-token target.
-    #[arg(long, default_value_t = 131_072)]
+    #[arg(long, default_value_t = 0)]
     pub pool_tokens: usize,
     /// Full-attention KV record format: int8 (signed bytes with an FP32 scale
     /// `amax / 127` per 32 dims of each head's key and value: 0.56x the bytes of
@@ -168,7 +168,16 @@ pub(crate) struct EngineArgs {
     #[arg(long, value_enum, default_value_t = engine::ExpertInput::Fp8)]
     pub expert_input: engine::ExpertInput,
     #[command(flatten)]
-    pub token_io: crate::shared::token_io::TokenIoArgs,
+    pub token_io: MimoTokenIoArgs,
+}
+
+#[derive(Debug, Clone, Copy, clap::Args)]
+pub(crate) struct MimoTokenIoArgs {
+    /// Override automatic placement (host for memory-constrained 32 GB cards).
+    #[arg(long = "embedding-placement", alias = "embed-placement", value_enum)]
+    pub embed_placement: Option<crate::shared::token_io::EmbedPlacement>,
+    #[arg(long, value_enum, default_value_t = crate::shared::token_io::SelectPlacement::Device)]
+    pub token_select: crate::shared::token_io::SelectPlacement,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -265,6 +274,18 @@ mod draft_storage_tests {
         assert_eq!(args.draft_storage().unwrap(), MimoDraftRepresentation::Fp8Only);
         args.validate_draft_replay(false).unwrap();
         assert!(args.validate_draft_replay(true).unwrap_err().to_string().contains("bf16-only separately"));
+    }
+
+    #[test]
+    fn serving_defaults_resolve_checkpoint_context_pool_and_embedding_automatically() {
+        let automatic = args(&[]);
+        assert_eq!(automatic.max_context, 0);
+        assert_eq!(automatic.pool_tokens, 0);
+        assert_eq!(automatic.token_io.embed_placement, None);
+        let explicit = args(&["--max-context", "32768", "--pool-tokens", "131072", "--embed-placement", "gpu"]);
+        assert_eq!(explicit.max_context, 32768);
+        assert_eq!(explicit.pool_tokens, 131072);
+        assert_eq!(explicit.token_io.embed_placement, Some(crate::shared::token_io::EmbedPlacement::Gpu));
     }
 
     #[test]
@@ -750,6 +771,19 @@ impl Opened {
     pub fn with_engine_reserved<T>(&self, args: &EngineArgs,
         serving: Option<(&crate::shared::prefix::PrefixArgs, usize)>, prefill_output: MimoPrefillOutput,
         body: impl FnOnce(&engine::MimoEngine<'_>, Option<cuteafd_hostcache::config::Config>) -> Result<T>) -> Result<T> {
+        let mut resolved = args.clone();
+        if resolved.max_context == 0 {
+            resolved.max_context = cuteafd_loader::serving_capacity::checkpoint_context_limit(&self.checkpoint.config)?
+                .context("MiMo checkpoint lacks full-context capability")?.try_into()?;
+        }
+        if resolved.token_io.embed_placement.is_none() {
+            let (_, total) = self.library.cuda_memory_info()?;
+            resolved.token_io.embed_placement = Some(if total <= 32usize << 30 {
+                crate::shared::token_io::EmbedPlacement::Host
+            } else { crate::shared::token_io::EmbedPlacement::Gpu });
+            tracing::info!(total, embedding=?resolved.token_io.embed_placement, "selected MiMo automatic embedding placement before admission");
+        }
+        let args = &resolved;
         let programs = self.library.programs()?.with_manifest(&args.manifest)?;
         let split_device = split::requested_device(&self.cfg, args.device, args.split_device,
             |name| programs.spec(name).is_ok())?;
@@ -826,7 +860,7 @@ impl Opened {
             fp8_scales: args.fp8_scales, device: args.device,
             peers: peer_stream.iter().map(|&(device, stream)| crate::shared::peer_split::RankDevice { device, stream }).collect() };
         let (embedding, (model, mut shares)) = crate::shared::token_io::TokenEmbedding::load(&self.library, self.embed_source()?,
-            args.token_io.embed_placement, || { let _memory_scope = cuteafd_ffi::memory_ledger::scope("weights"); loader.model(&self.cfg, layers) })?;
+            args.token_io.embed_placement.context("MiMo embedding placement must resolve before admission")?, || { let _memory_scope = cuteafd_ffi::memory_ledger::scope("weights"); loader.model(&self.cfg, layers) })?;
         let mtp = if args.mtp > 0 {
             let started = Instant::now();
             let available = self.checkpoint.tensors.iter()

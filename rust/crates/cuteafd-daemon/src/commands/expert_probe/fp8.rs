@@ -220,8 +220,5 @@ fn unified_available() -> usize {
     if !cfg!(target_arch = "aarch64") {
         return 0;
     }
-    std::fs::read_to_string("/proc/meminfo").ok()
-        .and_then(|text| text.lines().find_map(|line| line.strip_prefix("MemAvailable:").map(str::to_owned)))
-        .and_then(|value| value.trim().trim_end_matches("kB").trim().parse::<usize>().ok())
-        .map_or(0, |kib| kib << 10)
+    crate::shared::memory_report::unified_available_bytes().unwrap_or(0)
 }

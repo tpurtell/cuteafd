@@ -122,6 +122,48 @@ pub(crate) fn release_load_staging(library: &cuteafd_ffi::NativeLibrary) {
     }
 }
 
+/// GB10 allocations reclaim page cache; raw CUDA free reports only MemFree.
+/// Use this only after selecting a unified-memory device, and fail closed.
+pub(crate) fn unified_available_bytes() -> anyhow::Result<usize> {
+    use anyhow::Context;
+    let text = std::fs::read_to_string("/proc/meminfo")
+        .context("reading unified-memory admission availability")?;
+    unified_available_from_meminfo(&text)
+}
+
+fn unified_available_from_meminfo(text: &str) -> anyhow::Result<usize> {
+    use anyhow::Context;
+    let value = text.lines().find_map(|line| line.strip_prefix("MemAvailable:"))
+        .context("unified-memory admission requires MemAvailable")?;
+    let mut fields = value.split_whitespace();
+    let kib: usize = fields.next().context("missing MemAvailable value")?
+        .parse().context("invalid MemAvailable value")?;
+    anyhow::ensure!(fields.next() == Some("kB") && fields.next().is_none(),
+        "invalid MemAvailable units");
+    kib.checked_mul(1024).context("MemAvailable byte overflow")
+}
+
+#[cfg(test)]
+mod unified_memory_tests {
+    use super::unified_available_from_meminfo;
+
+    #[test]
+    fn admission_includes_reclaimable_cache_not_just_memfree() {
+        let text = "MemFree: 1024 kB\nMemAvailable: 47185920 kB\nCached: 41943040 kB\n";
+        assert_eq!(unified_available_from_meminfo(text).unwrap(), 45usize << 30);
+        assert_eq!(unified_available_from_meminfo("MemAvailable: 0 kB\n").unwrap(), 0);
+    }
+
+    #[test]
+    fn admission_fails_closed_on_missing_malformed_or_overflowed_values() {
+        for text in ["MemFree: 1024 kB\n", "MemAvailable: nope kB\n",
+            "MemAvailable: 42 MB\n", "MemAvailable: 42\n", "MemAvailable: 42 kB extra\n"] {
+            assert!(unified_available_from_meminfo(text).is_err(), "{text}");
+        }
+        assert!(unified_available_from_meminfo(&format!("MemAvailable: {} kB\n", usize::MAX)).is_err());
+    }
+}
+
 /// The kernel page cache (`Cached` in /proc/meminfo), bytes.
 pub(crate) fn cached_bytes() -> Option<u64> {
     meminfo()["Cached"].as_u64()
