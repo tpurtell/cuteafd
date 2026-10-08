@@ -453,6 +453,26 @@ pub(crate) struct TransportCapabilitiesArgs {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn native_forced_prefill_parking_is_hidden_and_opt_in() {
+        use clap::{CommandFactory, Parser};
+        let base = ["cuteafd", "serve-native", "--snapshot", "/model", "--native-lib", "/native.so",
+            "--peers", "127.0.0.1:19441"];
+        let super::Commands::ServeNative(args) = super::Cli::try_parse_from(base).unwrap().command else {
+            panic!("expected native serving");
+        };
+        assert!(!args.debug_prefill_park);
+        assert_eq!(args.decode_share, 0.0);
+        let super::Commands::ServeNative(args) = super::Cli::try_parse_from(
+            base.into_iter().chain(["--debug-prefill-park"])).unwrap().command else {
+            panic!("expected native serving");
+        };
+        assert!(args.debug_prefill_park);
+        let mut command = super::Cli::command();
+        let help = command.find_subcommand_mut("serve-native").unwrap().render_long_help().to_string();
+        assert!(!help.contains("--debug-prefill-park"));
+    }
+
+    #[test]
     fn dsv4_golden_accepts_nll_and_requires_it_for_saved_logits() {
         use clap::Parser;
         let base = ["cuteafd", "dsv4-golden", "--snapshot", "/model", "--native-lib", "/native.so",
@@ -700,6 +720,10 @@ pub(crate) struct NativeServeArgs {
     /// Decode time reserved between completed V4.1 prefill waves; 0 keeps exclusive prefill.
     #[arg(long, env = "CUTEAFD_DECODE_SHARE", default_value_t = 0.0)]
     pub decode_share: f64,
+
+    /// Qualification only: park at each original wave without intervening work.
+    #[arg(long, env = "CUTEAFD_DEBUG_PREFILL_PARK", hide = true)]
+    pub debug_prefill_park: bool,
 
     /// Total prompt plus generated tokens; compressed cache is reserved at startup.
     #[arg(long, default_value_t = cuteafd_api::openai::MAX_CONTEXT_TOKENS, value_parser = clap::value_parser!(u32).range(1..=1048576))]

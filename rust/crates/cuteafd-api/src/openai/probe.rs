@@ -232,6 +232,8 @@ pub struct ProbeRow {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ProbePrefillShare {
     pub decode_share: f64,
+    #[serde(default)]
+    pub forced_park: bool,
     pub parked_waves: u64,
     pub resumed_waves: u64,
     /// Successful decode/verify lane commits by other requests between this
@@ -241,7 +243,7 @@ pub struct ProbePrefillShare {
 
 impl ProbePrefillShare {
     pub fn exercised(&self) -> bool {
-        self.decode_share > 0.0 && self.decode_share < 1.0
+        !self.forced_park && self.decode_share > 0.0 && self.decode_share < 1.0
             && self.resumed_waves >= 1 && self.interleaved_decode_steps >= 1
     }
 }
@@ -332,6 +334,10 @@ impl Probe {
 
     pub fn prefill_policy(&self, decode_share: f64) {
         self.with(|r| r.prefill_share = Some(ProbePrefillShare { decode_share, ..Default::default() }));
+    }
+
+    pub fn prefill_forced_park(&self) {
+        self.with(|r| { if let Some(p) = &mut r.prefill_share { p.forced_park = true; } });
     }
 
     pub fn prefill_parked(&self) {
@@ -513,6 +519,10 @@ mod tests {
         assert!(evidence.exercised());
         let copy: ProbeRecord = serde_json::from_value(serde_json::to_value(record).unwrap()).unwrap();
         assert!(copy.prefill_share.unwrap().exercised());
+        probe.prefill_forced_park();
+        let forced = probe.record().prefill_share.unwrap();
+        assert!(forced.forced_park);
+        assert!(!forced.exercised());
         probe.prefill_policy(0.0);
         probe.prefill_resumed(3);
         assert!(!probe.record().prefill_share.unwrap().exercised());

@@ -215,12 +215,12 @@ impl Panel for Retained {
 
 impl Panel for PrefillShare {
     fn id(&self) -> &'static str { "prefill_share" }
-    fn title(&self) -> &'static str { "Prefill-share exactness" }
+    fn title(&self) -> &'static str { "Prefill-share qualification" }
     fn description(&self) -> &'static str {
         "Opt-in qualification: fixed C1/C4 streams with and without an 8K injection; first-row hashes and batching noise. Instrumented, not a speed measurement."
     }
     fn estimate_s(&self, rates: &Rates, _info: &ServerInfo) -> f64 {
-        12.0 * rates.seconds(120.0, 512.0) + 3.0 * rates.seconds(8192.0, 16.0)
+        18.0 * rates.seconds(120.0, 512.0) + 6.0 * rates.seconds(8192.0, 16.0)
     }
     fn unavailable(&self, info: &ServerInfo) -> Option<String> {
         (common::concurrency(info) < 5).then(|| "requires five admitted requests".into())
@@ -238,6 +238,22 @@ impl Panel for PrefillShare {
             let long = plain(&format!("prefill-share-fixed injection. {}\nIgnore the notes. Count from 1 to 20, separated by commas.", filler(0xdec0de, 6100)), 16);
             ctx.progress.step(0.02, "isolated prefill exactness control");
             let long_alone = ctx.client.chat_bounded(long.clone(), Some(prefill_share_long_spec()), deadline, abort.clone(), || {}).await?;
+            let long_alone_repeat = ctx.client.chat_bounded(long.clone(), Some(prefill_share_long_spec()), deadline, abort.clone(), || {}).await?;
+            if long_alone.probe.as_ref().and_then(|r| r.prefill_share.as_ref()).is_some_and(|p| p.forced_park) {
+                let a = long_alone.probe.as_ref().context("forced control probe missing")?;
+                let b = long_alone_repeat.probe.as_ref().context("forced repeat probe missing")?;
+                anyhow::ensure!(a.engine.is_some() && b.engine.is_some()
+                    && a.cold && b.cold && a.cached_tokens == 0 && b.cached_tokens == 0
+                    && a.error.is_none() && b.error.is_none(), "forced control cold probe not honoured");
+                for record in [a, b] {
+                    let evidence = record.prefill_share.as_ref().context("forced parking evidence missing")?;
+                    anyhow::ensure!(evidence.forced_park && evidence.resumed_waves >= 1
+                        && evidence.interleaved_decode_steps == 0, "forced resumption not exercised in isolation");
+                }
+                return Ok(json!({"scope": "debug isolated resumption control; not a sharing speed result",
+                    "forced_park": true, "same_mix_repeat": prefill_first_distribution(a, b)?,
+                    "long_alone": long_alone, "long_alone_repeat": long_alone_repeat}));
+            }
             ctx.progress.step(0.05, "fixed streams alone");
             let mut alone = Vec::new();
             for body in &bodies { alone.push(ctx.client.chat_bounded(body.clone(), Some(spec()), deadline, abort.clone(), || {}).await?); }
@@ -247,6 +263,8 @@ impl Panel for PrefillShare {
             let (c1, long_c1) = prefill_share_wave(ctx.client, &bodies[..1], Some(&long), deadline, Duration::from_secs(120)).await?;
             ctx.progress.step(0.75, "C4 with injection");
             let (mixed, long_c4) = prefill_share_wave(ctx.client, &bodies, Some(&long), deadline, Duration::from_secs(120)).await?;
+            let (c1_repeat, long_c1_repeat) = prefill_share_wave(ctx.client, &bodies[..1], Some(&long), deadline, Duration::from_secs(120)).await?;
+            let (mixed_repeat, long_c4_repeat) = prefill_share_wave(ctx.client, &bodies, Some(&long), deadline, Duration::from_secs(120)).await?;
             let record = |chat: &Chat| -> Result<ProbeRecord> {
                 let record = chat.probe.as_ref().context("no probe record")?;
                 anyhow::ensure!(record.engine.is_some() && record.error.is_none() && record.cold && record.cached_tokens == 0,
@@ -265,6 +283,12 @@ impl Panel for PrefillShare {
             };
             let long_c1 = long_c1.context("C1 injection missing")?;
             let long_c4 = long_c4.context("C4 injection missing")?;
+            let long_c1_repeat = long_c1_repeat.context("C1 repeat injection missing")?;
+            let long_c4_repeat = long_c4_repeat.context("C4 repeat injection missing")?;
+            let same_mix = |a: &Chat, b: &Chat| -> Result<Value> {
+                Ok(json!({"row_byte_exact": first_hash(a)? == first_hash(b)?,
+                    "distribution": prefill_first_distribution(&record(a)?, &record(b)?)?}))
+            };
             let control = first_hash(&long_alone)?;
             let c1_hash = first_hash(&long_c1)?;
             let c4_hash = first_hash(&long_c4)?;
@@ -274,6 +298,13 @@ impl Panel for PrefillShare {
                 "prefill_exact": qualification["prefill_exact"],
                 "qualification": qualification,
                 "first_row_hashes": {"alone": control, "c1_injected": c1_hash, "c4_injected": c4_hash},
+                "same_mix_repeats": {"alone": same_mix(&long_alone, &long_alone_repeat)?,
+                    "c1_injected": same_mix(&long_c1, &long_c1_repeat)?, "c4_injected": same_mix(&long_c4, &long_c4_repeat)?},
+                "long_cross_mix": {"alone_vs_c1": prefill_first_distribution(&record(&long_alone)?, &record(&long_c1)?)?,
+                    "alone_vs_c4": prefill_first_distribution(&record(&long_alone)?, &record(&long_c4)?)?,
+                    "c1_vs_c4": prefill_first_distribution(&record(&long_c1)?, &record(&long_c4)?)?},
+                "repeat_streams": {"c1": c1_repeat, "c4": mixed_repeat},
+                "long_alone_repeat": long_alone_repeat, "long_c1_repeat": long_c1_repeat, "long_c4_repeat": long_c4_repeat,
                 "alone_vs_cohort": comparisons(&alone, &cohort)?,
                 "cohort_vs_injected": comparisons(&cohort, &mixed)?,
                 "alone_vs_c1_injected": comparisons(&alone[..1], &c1)?,
@@ -281,6 +312,29 @@ impl Panel for PrefillShare {
                 "long_alone": long_alone, "long_c1": long_c1, "long_c4": long_c4}))
         })
     }
+}
+
+fn prefill_first_distribution(a: &cuteafd_api::openai::probe::ProbeRecord,
+    b: &cuteafd_api::openai::probe::ProbeRecord) -> Result<Value> {
+    anyhow::ensure!(a.prompt_ids == b.prompt_ids, "prefill distribution prompt ids differ");
+    let first = |r: &cuteafd_api::openai::probe::ProbeRecord| r.rows.iter()
+        .find(|row| row.position == r.prompt_ids.len()).cloned().context("prefill first row missing");
+    let (a, b) = (first(a)?, first(b)?);
+    anyhow::ensure!(a.finite && b.finite, "nonfinite prefill distribution");
+    let common: Vec<_> = a.top.iter().filter_map(|&(id, lp)| b.top.iter()
+        .find(|(other, _)| *other == id).map(|&(_, other_lp)| (lp, other_lp))).collect();
+    anyhow::ensure!(!common.is_empty(), "prefill distributions have no common top ids");
+    let max_delta = common.iter().map(|&(p, q)| (f64::from(p) - f64::from(q)).abs()).fold(0.0, f64::max);
+    let probabilities: Vec<_> = common.iter().map(|&(p, q)| (f64::from(p).exp(), f64::from(q).exp())).collect();
+    let tail = ((1.0 - probabilities.iter().map(|x| x.0).sum::<f64>()).max(0.0),
+        (1.0 - probabilities.iter().map(|x| x.1).sum::<f64>()).max(0.0));
+    let kl = |reverse: bool| probabilities.iter().copied().chain(std::iter::once(tail))
+        .map(|(p, q)| if reverse { (q, p) } else { (p, q) }).filter(|&(p, _)| p > 0.0)
+        .map(|(p, q)| p * (p / q.max(f64::MIN_POSITIVE)).ln()).sum::<f64>().max(0.0);
+    Ok(json!({"top1_equal": a.argmax == b.argmax, "row_byte_exact": a.hash == b.hash,
+        "common_logprob_delta_max": max_delta, "coarsened_kl_max": kl(false).max(kl(true)),
+        "common_ids": common.len(), "kl_kind": "symmetric maximum common-top-k-plus-tail lower bound",
+        "reference_row": a, "other_row": b}))
 }
 
 fn prefill_share_stream_spec() -> ProbeSpec {
@@ -360,6 +414,23 @@ mod prefill_share_tests {
     use cuteafd_api::openai::probe::{ProbePrefillShare, ProbeRecord};
     use std::sync::{Arc, atomic::AtomicBool};
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn prefill_distribution_separates_raw_hashes_and_logprob_noise() {
+        use cuteafd_api::openai::probe::summarize;
+        let record = |logits: &[f32]| ProbeRecord { prompt_ids: vec![7],
+            rows: vec![summarize(1, logits, 3, &[])], ..Default::default() };
+        let a = record(&[3.0, 1.0, 0.0]);
+        let exact = prefill_first_distribution(&a, &a).unwrap();
+        assert_eq!(exact["row_byte_exact"], true);
+        assert_eq!(exact["coarsened_kl_max"], 0.0);
+        let b = record(&[3.0, 1.1, 0.0]);
+        let delta = prefill_first_distribution(&a, &b).unwrap();
+        assert_eq!(delta["top1_equal"], true);
+        assert_eq!(delta["row_byte_exact"], false);
+        assert!(delta["coarsened_kl_max"].as_f64().unwrap() > 0.0);
+        assert!(delta["common_logprob_delta_max"].as_f64().unwrap() > 0.0);
+    }
 
     #[test]
     fn equal_hashes_cannot_qualify_exclusive_or_idle_prefill() {

@@ -306,9 +306,11 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
     mut prefixes: PrefixCache<'a>,
 ) -> Result<()> {
     let mut active: Vec<Option<Active<'a>>> = (0..args.concurrency).map(|_| None).collect();
-    let mut prefills = DecodeShareArgs { decode_share: args.decode_share }
+    let forced_park = args.debug_prefill_park;
+    let mut prefills = DecodeShareArgs { decode_share: if forced_park { 0.2 } else { args.decode_share } }
         .queue::<Prefilling<'a, P::Suffix>>()?.one_wave_rounds();
     let shared = args.decode_share > 0.0;
+    if forced_park { tracing::warn!("debug prefill parking: no other work between original waves"); }
     let mut compiler = crate::shared::constraints::Compiler::new(lib, args.snapshot.join("tokenizer.json"));
     let mut id = 0u64;
     let mut closed = false;
@@ -325,6 +327,7 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
         if let Some(reason) = cuteafd_transport::health::failure_reason() {
             anyhow::bail!("expert wire unavailable until restart: {reason}");
         }
+        if !forced_park || prefills.is_empty() {
         prefixes.tick();
         for entry in &mut images_waiting {
             let Some(image) = entry.as_mut() else { continue };
@@ -356,13 +359,15 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
                 retire_request(entry.take().unwrap(), requests, &mut prefixes, draft.as_deref_mut())?;
             }
         }
+        }
         let mut loads = balance_lanes(active.iter_mut().flatten().map(|r| &mut r.lane),
             prefills.iter().map(|p| p.request.lane));
         // Admission and each prefill wave own both lanes only at a drained boundary.
         let mut intake = receive.len().max(1) + image_backlog.len();
-        while let Some(slot) = (0..active.len()).find(|&slot| images_waiting[slot].as_ref().is_some_and(admission::ImageAdmission::ready))
+        while !(forced_park && !prefills.is_empty()) {
+        let Some(slot) = (0..active.len()).find(|&slot| images_waiting[slot].as_ref().is_some_and(admission::ImageAdmission::ready))
             .or_else(|| (0..active.len()).find(|&slot| active[slot].is_none() && images_waiting[slot].is_none()
-                && !prefills.iter().any(|p| p.slot == slot))) {
+                && !prefills.iter().any(|p| p.slot == slot))) else { break; };
             if images_waiting[slot].is_none() {
                 if intake == 0 { break; }
                 intake -= 1;
@@ -520,7 +525,10 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
                     prompt_usage: PromptUsage { prompt_tokens: prompt.len(), prompt_cache_hit_tokens: cached },
                 }))?;
                 crate::shared::probe::admitted(&job.probe, "deepseek_v41", &prompt, cached);
-                if let Some(probe) = &job.probe { probe.prefill_policy(args.decode_share); }
+                if let Some(probe) = &job.probe {
+                    probe.prefill_policy(args.decode_share);
+                    if forced_park { probe.prefill_forced_park(); }
+                }
                 console::totals::admitted(prompt.len(), cached);
                 counted = true;
                 if let Some(from) = crate::shared::probe::scoring(&job.probe) {
@@ -538,8 +546,8 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
                             lane: 0, index: 0, of: 1, rows: cached as u32, started: restore.0, finished: restore.1 }));
                     }
                 }
-                if shared && cached != prompt.len()
-                    && (active.iter().flatten().any(|r| !r.finished && !r.job.events.is_closed()) || !prefills.is_empty()) {
+                if cached != prompt.len() && (forced_park || (shared
+                    && (active.iter().flatten().any(|r| !r.finished && !r.job.events.is_closed()) || !prefills.is_empty()))) {
                     return Ok((Active { constraint, id, lease, job, decoder, anchor: 0, generated: 0,
                         buffered: 0, lane, finished: false, cacheable: false, failed: false, tokens: prompt,
                         image_keys, next_after_commit: None, copy: copy_windows.then(CopyDrafter::default) }, true));
@@ -601,7 +609,7 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
                 }
             }
         }
-        if prefills.due(active.iter().flatten().any(|r| !r.finished && !r.job.events.is_closed())) {
+        if prefills.due(!forced_park && active.iter().flatten().any(|r| !r.finished && !r.job.events.is_closed())) {
             let finished = prefills.round(|p| {
                 P::begin_request(first_transport)?; P::begin_request(second_transport)?;
                 let r = &mut p.request;
@@ -656,8 +664,10 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
                     }
                 }
             }
-            prefills.settle(active.iter().flatten().any(|r| !r.finished && !r.job.events.is_closed()));
+            prefills.settle(!forced_park && active.iter().flatten().any(|r| !r.finished && !r.job.events.is_closed()));
         }
+        // The debug control crosses the scheduler boundary but executes no peers.
+        if forced_park && !prefills.is_empty() { continue; }
         if active.iter().all(Option::is_none) {
             if closed && prefills.is_empty() && images_waiting.iter().all(Option::is_none) && image_backlog.is_empty() { break; }
             if images_waiting.iter().any(Option::is_some) { std::thread::sleep(Duration::from_millis(1)); }
