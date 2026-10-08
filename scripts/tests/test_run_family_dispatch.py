@@ -652,6 +652,42 @@ def test_glmf_replay_records_reject_unsupported_layouts_before_launch(tmp_path, 
     assert not any(line.startswith(("docker ", "ssh ", "nest ")) for line in result.stderr.splitlines())
 
 
+@pytest.mark.parametrize("keys,forwarded", [("", False), ("GLM5_FLASH_DECODE_ROWS=64\n", False),
+                                             ("GLM5_FLASH_DECODE_ROWS=128\n", True)])
+def test_glmf_decode_rows_are_forwarded_only_at_128(tmp_path, keys, forwarded):
+    """GLM5_FLASH_DECODE_ROWS=128 reaches the coordinator as --decode-rows 128 (the wide decode
+    programs); 64, the default, passes nothing; no Spark worker sees it."""
+    result = _family_launch_result(tmp_path, SPLIT_CONFIGS["glm5_flash"], "test/glmf",
+                                  "GLM5_FLASH_FP8_MODEL_ID=off\nRTX_GPUS=1\n" + keys)
+    assert result.returncode == 0, result.stderr
+    lines = result.stderr.splitlines()
+    launch = next(line for line in lines if "cuteafd serve-glmf" in line)
+    assert ("--decode-rows 128" in launch) == forwarded and launch.count("--decode-rows") == int(forwarded)
+    assert not any("--decode-rows" in line for line in lines if "cuteafd expertd-native" in line)
+
+
+def test_glmf_wide_decode_rows_take_shared_replay_records(tmp_path):
+    """128-row steps keep their records in the prefill scratch too: both keys reach the coordinator."""
+    result = _family_launch_result(tmp_path, SPLIT_CONFIGS["glm5_flash"], "test/glmf",
+                                  "GLM5_FLASH_FP8_MODEL_ID=off\nRTX_GPUS=1\nGLM5_FLASH_DECODE_ROWS=128\n"
+                                  "GLM5_FLASH_REPLAY_RECORDS=shared\n")
+    assert result.returncode == 0, result.stderr
+    launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-glmf" in line)
+    assert "--decode-rows 128" in launch and "--replay-records shared" in launch, launch
+
+
+@pytest.mark.parametrize("keys,message", [
+    ("RTX_GPUS=2\nGLM5_FLASH_DECODE_ROWS=128\n", "a head split takes 64"),
+    ("RTX_GPUS=1\nGLM5_FLASH_DECODE_ROWS=127\n", "GLM5_FLASH_DECODE_ROWS must be 64 or 128"),
+    ("RTX_GPUS=1\nGLM5_FLASH_DECODE_ROWS=wide\n", "GLM5_FLASH_DECODE_ROWS must be 64 or 128"),
+])
+def test_glmf_decode_rows_reject_unsupported_layouts_before_launch(tmp_path, keys, message):
+    result = _family_launch_result(tmp_path, SPLIT_CONFIGS["glm5_flash"], "test/glmf",
+                                  "GLM5_FLASH_FP8_MODEL_ID=off\n" + keys)
+    assert result.returncode == 2 and message in result.stderr, result.stderr
+    assert not any(line.startswith(("docker ", "ssh ", "nest ")) for line in result.stderr.splitlines())
+
+
 def test_probe_dump_root_is_mounted_for_remote_row_dumps(tmp_path):
     root = tmp_path / "dumps"
     root.mkdir()

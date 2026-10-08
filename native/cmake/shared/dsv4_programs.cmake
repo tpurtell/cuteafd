@@ -48,6 +48,7 @@ endif()
 set(CUTEAFD_DSV4_DIR "${CMAKE_CURRENT_BINARY_DIR}/dsv4_programs")
 set(CUTEAFD_DSV4_EXPORT_ARGS --geometry "${CUTEAFD_PROGRAM_GEOMETRY}"
   --decode-rows "${CUTEAFD_DSV4_DECODE_ROWS}" --prefill-rows "${CUTEAFD_DSV4_PREFILL_ROWS}"
+  --glmf-wide-decode-rows "${CUTEAFD_GLMF_WIDE_DECODE_ROWS}"
   --max-context "${CUTEAFD_DSV4_MAX_CONTEXT}")
 set(stamp "${CMAKE_CURRENT_BINARY_DIR}/dsv4_programs.stamp")
 file(GENERATE OUTPUT "${stamp}" CONTENT "${CUTEAFD_DSV4_EXPORT_ARGS}\n")

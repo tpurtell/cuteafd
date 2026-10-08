@@ -235,6 +235,10 @@ pub(crate) struct PlanArgs {
     /// Prefill lanes for --layout (GLM 5.3 Flash; 0: the family default).
     #[arg(long, default_value_t = 0)]
     pub(crate) prefill_lanes: u64,
+    /// Decode and verify step rows for --layout (GLM 5.3 Flash's --decode-rows: 64, or 128 with the
+    /// wide programs on one GPU): its decode workspace, token selector and replay records.
+    #[arg(long, default_value_t = 64, value_parser = plan_decode_rows)]
+    pub(crate) decode_rows: u64,
     /// GPU memory (GiB) each coordinator GPU keeps free for runtime growth in --layout (the
     /// engines' --headroom-gib).
     #[arg(long, default_value_t = 2.0)]
@@ -826,6 +830,15 @@ fn parse_spark_tp(value: &str) -> Result<u8, String> {
         _ => Err(format!(
             "unsupported Spark TP degree {value}; expected 2, 3, 4 or 6"
         )),
+    }
+}
+
+/// `cuteafd plan --decode-rows`: GLM 5.3 Flash's decode programs' 64 rows, or the wide programs' 128.
+fn plan_decode_rows(value: &str) -> Result<u64, String> {
+    match value {
+        "64" => Ok(64),
+        "128" => Ok(128),
+        _ => Err("64 or 128".to_string()),
     }
 }
 

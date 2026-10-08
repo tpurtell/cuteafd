@@ -23,7 +23,7 @@
 //! at its last chunk; a decode whose client left is not retained.
 //! `prompt_cache_hit_tokens` reports the restored rows; `/v1/stats` carries
 //! the cache's counters.
-use super::engine::{GlmfEngine, GlmfPlacement, DECODE_ROWS};
+use super::engine::{GlmfEngine, GlmfPlacement, DECODE_ROWS, WIDE_DECODE_ROWS};
 use super::prefix::{GlmfPrefix, PrefixMarks};
 use cuteafd_engine::media::{EmbeddingCache, MediaAdmission, MediaPoll, MediaReady, MediaWaiter, RequestMedia, MediaKeys};
 use crate::families::deepseek_v41::v41_native_serve::prefix::CudaCopyEngine;
@@ -604,15 +604,16 @@ struct VerifyBucket {
     verify_ms_max: f64,
 }
 
+/// Verify steps by real rows and by the rows they ran (their bucket), up to the wide programs' 128.
 struct VerifyStats {
-    real: [VerifyBucket; DECODE_ROWS + 1],
-    bucket: [VerifyBucket; DECODE_ROWS + 1],
+    real: [VerifyBucket; WIDE_DECODE_ROWS + 1],
+    bucket: [VerifyBucket; WIDE_DECODE_ROWS + 1],
 }
 
 impl Default for VerifyStats {
     fn default() -> Self {
-        Self { real: [VerifyBucket::default(); DECODE_ROWS + 1],
-            bucket: [VerifyBucket::default(); DECODE_ROWS + 1] }
+        Self { real: [VerifyBucket::default(); WIDE_DECODE_ROWS + 1],
+            bucket: [VerifyBucket::default(); WIDE_DECODE_ROWS + 1] }
     }
 }
 
@@ -722,7 +723,7 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
     // Made before the KV pool when start-up admitted it from measured memory.
     let mut selector = match engine.take_selector() {
         Some(selector) => selector,
-        None => TokenSelector::new(&opened.library, select, engine.cfg.vocab_size, DECODE_ROWS)?,
+        None => TokenSelector::new(&opened.library, select, engine.cfg.vocab_size, engine.decode_rows)?,
     };
     let markers = crate::shared::prefix::marker_ids(snapshot, &MESSAGE_STARTS)?;
     let mut free_kda: Vec<i32> = (0..engine.slots as i32).rev().collect();
@@ -741,7 +742,10 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
             dflash_policy::widest_slice(engine.cfg.moe_intermediate, ranks)),
         _ => GLMF_TP2_STEP_MS.to_vec(),
     };
-    let mut cost = dflash_policy::step_cost(&table, DECODE_ROWS);
+    // A verify step schedules up to `verify_rows` rows (64, or the GPU's whole sparse MLA waves with
+    // `--decode-rows 128`): the table, measured to 64 rows, extends past them and serving refits it.
+    let verify_rows = engine.verify_rows;
+    let mut cost = dflash_policy::step_cost(&table, verify_rows);
     let mut skip = dflash_policy::DraftSkip::default();
     let mut active: Vec<Active<'_>> = Vec::new();
     let (mut requests, mut generated_total) = (0u64, 0u64);
@@ -1119,10 +1123,19 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
         let mut tally = console::Step::begin(0);
         let (draft0, verify0, emit0) = (draft_s, verify_s, emit_s);
         let engine_before = tally.live().then(|| *engine.profile.borrow());
-        // Rows each sequence may add after its next token.
-        let room = (DECODE_ROWS / active.len()).max(1) - 1;
-        let limits: Vec<usize> = active.iter().map(|a| if probe::no_speculation(&a.job.probe) { 0 } else {
+        // Rows each sequence may add after its next token: an even share of the verify budget.
+        let room = (verify_rows / active.len()).max(1) - 1;
+        let mut limits: Vec<usize> = active.iter().map(|a| if probe::no_speculation(&a.job.probe) { 0 } else {
             room.min(a.job.max_tokens - a.generated - 1).min(a.capacity - a.placement.len - 1) }).collect();
+        // With the wide programs the rows the even share leaves over go to the first sequences that can
+        // draft once more (127 rows at 16 sequences: 15 draft 7, one 6); 64 rows keep the even share.
+        if engine.decode_rows > DECODE_ROWS {
+            super::engine::hand_out_remainder(&mut limits, room, verify_rows, |i| {
+                let a = &active[i];
+                !probe::no_speculation(&a.job.probe)
+                    && room < (a.job.max_tokens - a.generated - 1).min(a.capacity - a.placement.len - 1)
+            });
+        }
         // DFlash2 drafts after every next token, then the policy's counts.
         let timer = Instant::now();
         let drafted: Vec<Option<Draft>> = match drafter {

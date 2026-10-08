@@ -236,9 +236,11 @@ fn state_delta(a: &[u8], b: &[u8], recurrent_bytes: usize, element: usize) -> (u
     (differ, worst)
 }
 
-fn replay_bounds(tokens: usize, rows: usize, prefill: Option<usize>) -> Result<usize> {
-    ensure!(rows > 0 && rows <= super::engine::DECODE_ROWS && rows < tokens,
-        "--replay-check needs 1..={} rows and at least one prefill token", super::engine::DECODE_ROWS);
+/// The prefill before a `rows`-row check of `tokens` golden tokens on an engine of `decode_rows`
+/// decode rows (`--decode-rows`: up to 128 with the wide programs).
+fn replay_bounds(tokens: usize, rows: usize, prefill: Option<usize>, decode_rows: usize) -> Result<usize> {
+    ensure!(rows > 0 && rows <= decode_rows && rows < tokens,
+        "--replay-check needs 1..={decode_rows} rows (--decode-rows) and at least one prefill token");
     let prefill = prefill.unwrap_or(64).min(tokens - rows);
     ensure!(prefill > 0, "--replay-check needs at least one prefill token");
     Ok(prefill)
@@ -272,7 +274,7 @@ pub(super) fn geometry_trace(args: &GoldenArgs, engine: &GlmfEngine<'_>, dir: &s
     let sequence = tokens(args)?;
     let rows = args.step_rows;
     ensure!(rows > 1, "--geometry-trace needs --step-rows > 1");
-    let prefill = replay_bounds(sequence.len(), rows, args.prefill)?;
+    let prefill = replay_bounds(sequence.len(), rows, args.prefill, engine.decode_rows)?;
     let mut allocator = Allocator::new(engine.pages, engine.slots);
     let mut serial = allocator.admit(prefill + rows)?;
     let mut wide = allocator.admit(prefill + rows)?;
@@ -302,7 +304,7 @@ pub(super) fn geometry_trace(args: &GoldenArgs, engine: &GlmfEngine<'_>, dir: &s
 /// See `GoldenArgs::replay_check`.
 pub(super) fn replay_check(args: &GoldenArgs, engine: &GlmfEngine<'_>, rows: usize) -> Result<()> {
     let sequence = tokens(args)?;
-    let prefill = replay_bounds(sequence.len(), rows, args.prefill)?;
+    let prefill = replay_bounds(sequence.len(), rows, args.prefill, engine.decode_rows)?;
     ensure!(engine.slots >= 4, "--replay-check needs --slots >= 4");
     let embed = &sequence[prefill..prefill + rows];
     let family = super::prefix::GlmfPrefix::new(engine, super::prefix::PrefixMarks::Arena, |_| 0)?;
@@ -439,13 +441,17 @@ pub(super) fn replay_check(args: &GoldenArgs, engine: &GlmfEngine<'_>, rows: usi
 mod tests {
     #[test]
     fn replay_check_rejects_invalid_bounds_before_subtracting() {
-        assert!(super::replay_bounds(10, 11, None).is_err());
-        assert!(super::replay_bounds(0, 0, None).is_err());
-        assert!(super::replay_bounds(10, 0, None).is_err());
-        assert!(super::replay_bounds(10, 10, None).is_err());
-        assert!(super::replay_bounds(100, super::super::engine::DECODE_ROWS + 1, None).is_err());
-        assert!(super::replay_bounds(10, 4, Some(0)).is_err());
-        assert_eq!(super::replay_bounds(10, 4, Some(20)).unwrap(), 6);
+        use super::super::engine::{DECODE_ROWS, WIDE_DECODE_ROWS};
+        assert!(super::replay_bounds(10, 11, None, DECODE_ROWS).is_err());
+        assert!(super::replay_bounds(0, 0, None, DECODE_ROWS).is_err());
+        assert!(super::replay_bounds(10, 0, None, DECODE_ROWS).is_err());
+        assert!(super::replay_bounds(10, 10, None, DECODE_ROWS).is_err());
+        assert!(super::replay_bounds(200, DECODE_ROWS + 1, None, DECODE_ROWS).is_err());
+        assert!(super::replay_bounds(10, 4, Some(0), DECODE_ROWS).is_err());
+        assert_eq!(super::replay_bounds(10, 4, Some(20), DECODE_ROWS).unwrap(), 6);
+        // --decode-rows 128: up to 128 rows (`--replay-check 128`), with the 64-row default prefill.
+        assert_eq!(super::replay_bounds(400, WIDE_DECODE_ROWS, None, WIDE_DECODE_ROWS).unwrap(), 64);
+        assert!(super::replay_bounds(400, WIDE_DECODE_ROWS + 1, None, WIDE_DECODE_ROWS).is_err());
     }
 
     #[test]
@@ -478,18 +484,27 @@ pub(super) fn bench_verify(args: &GoldenArgs, engine: &GlmfEngine<'_>, max_rows:
     }).collect::<Result<Vec<_>>>()?;
     let starts: Vec<usize> = placements.iter().map(|p| p.len).collect();
     println!("verify cost, {count} distinct sequence(s) after {prefill} tokens (speculative steps, median of 7):");
-    for rows in 1..=max_rows {
-        if count * rows > super::engine::DECODE_ROWS {
-            break;
-        }
-        let tokens: Vec<u32> = (0..count).flat_map(|i| sequence[i + prefill..i + prefill + rows].iter().copied()).collect();
+    // Rows per sequence of every timed step: 1..=max_rows each while the step fits --decode-rows, and with
+    // the wide programs the verify budget's own step where it is not a multiple of the sequences (the
+    // remainder's rows go to the first sequences: 15 x 8 + 7 rows at 16 sequences on an RTX 5090).
+    let mut shapes: Vec<Vec<usize>> = (1..=max_rows).take_while(|&rows| count * rows <= engine.decode_rows)
+        .map(|rows| vec![rows; count]).collect();
+    let budget = engine.verify_rows;
+    if budget > super::engine::DECODE_ROWS && budget % count != 0 && budget / count < max_rows {
+        shapes.push((0..count).map(|i| budget / count + usize::from(i < budget % count)).collect());
+    }
+    for shape in shapes {
+        let total: usize = shape.iter().sum();
+        let tokens: Vec<u32> = shape.iter().enumerate()
+            .flat_map(|(i, &rows)| sequence[i + prefill..i + prefill + rows].iter().copied()).collect();
         let mut times = Vec::new();
         *engine.profile.borrow_mut() = [0.0; 3];
         for round in 0..9 {
             for (placement, &start) in placements.iter_mut().zip(&starts) {
                 placement.len = start;
             }
-            let mut step: Vec<(&mut GlmfPlacement, usize)> = placements.iter_mut().map(|p| (p, rows)).collect();
+            let mut step: Vec<(&mut GlmfPlacement, usize)> = placements.iter_mut().zip(&shape)
+                .map(|(p, &rows)| (p, rows)).collect();
             let timer = Instant::now();
             engine.verify_spec(&mut step, &tokens)?;
             if round >= 2 {
@@ -501,8 +516,10 @@ pub(super) fn bench_verify(args: &GoldenArgs, engine: &GlmfEngine<'_>, max_rows:
         times.sort_by(f64::total_cmp);
         let phases = std::mem::take(&mut *engine.profile.borrow_mut());
         let n = times.len() as f64;
-        println!("  {rows} rows/sequence ({} rows): {:.2} ms (min {:.2}); GPU until exchanges {:.2} ms, Spark exchanges \
-            {:.2} ms, head {:.2} ms", count * rows, 1e3 * times[times.len() / 2], 1e3 * times[0], 1e3 * phases[0] / n,
+        let per_sequence = if shape.iter().all(|&rows| rows == shape[0]) { shape[0].to_string() }
+            else { format!("{}..{}", shape[count - 1], shape[0]) };
+        println!("  {per_sequence} rows/sequence ({total} rows): {:.2} ms (min {:.2}); GPU until exchanges {:.2} ms, \
+            Spark exchanges {:.2} ms, head {:.2} ms", 1e3 * times[times.len() / 2], 1e3 * times[0], 1e3 * phases[0] / n,
             1e3 * phases[1] / n, 1e3 * phases[2] / n);
     }
     Ok(())

@@ -301,7 +301,7 @@ impl Opened {
                     if args.full_prefill_logits { cuteafd_loader::plan::layout::full_prefill_logits_bytes_with_lanes(
                         "glm5", args.prefill_rows as u64, self.cfg.vocab_size as u64,
                         if args.peers.is_some() { engine::configured_lanes() } else { 1 }) } else { 0 }),
-                Default::default(), 4)?
+                Default::default(), 4, cuteafd_loader::serving_capacity::GLMF_DECODE_ROWS)?
         } else {
             args.pool_tokens
         };

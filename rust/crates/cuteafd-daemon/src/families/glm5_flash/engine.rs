@@ -69,29 +69,93 @@ type Dev<'a> = DeviceAllocation<'a>;
 pub(crate) const PAGE_ROWS: usize = 64;
 /// Rows of the decode-route programs (`_m64`).
 pub(crate) const DECODE_ROWS: usize = 64;
+/// Rows of the wide decode-route programs (`_m128`): with `--decode-rows 128`, a decode or verify
+/// step of more than [`DECODE_ROWS`] rows runs them (fewer rows keep the `_m64` programs).
+pub(crate) const WIDE_DECODE_ROWS: usize = 128;
+/// The prefill programs' capacity.
+const PREFILL_CAP: &str = "m4096";
 /// Selected-slot row width of the sparse MLA programs (2048 + 3, padded to 64).
 pub(crate) const SPARSE_TOPK: usize = 2112;
 /// Most decode rows the FP8 GEMVs take (the programs' FP8_ROWS).
 const FP8_ROWS: i32 = 16;
 /// FP8 latent record bytes (512 E4M3 + 4 FP32 group scales).
 pub(crate) const RECORD_BYTES: usize = 528;
-/// Rows a speculative step records per KDA layer (`REPLAY_ROWS` of the fork's
-/// `_glmf_kernels.py`; the decode programs' rows).
-const REPLAY_ROWS: usize = DECODE_ROWS;
 
-/// Bytes of one KDA layer's replay record (`kda_replay_layout`): k | decay | v
+/// The decode program capacity a step of `rows` rows runs: `m64`, or the wide `m128` past
+/// [`DECODE_ROWS`] rows.
+pub(crate) fn decode_cap(rows: usize) -> &'static str {
+    if rows > DECODE_ROWS { "m128" } else { "m64" }
+}
+
+/// Whether `cap` is a decode program capacity (`m64`, `m128`), not the prefill programs'.
+fn is_decode(cap: &str) -> bool {
+    cap != PREFILL_CAP
+}
+
+/// Rows a speculative step of decode capacity `cap` records per layer: `REPLAY_ROWS` of the fork's
+/// `_glmf_kernels.py` for the `_m64` programs, the wide programs' 128 rows for `_m128`.
+fn replay_rows_of(cap: &str) -> usize {
+    if cap == "m128" { WIDE_DECODE_ROWS } else { DECODE_ROWS }
+}
+
+/// Bytes of one KDA layer's replay record of `rows` rows (`kda_replay_layout`): k | decay | v
 /// FP32 per row and head, beta FP32, the q/k/v in-projection row BF16.
-fn replay_bytes(heads: usize, channels: usize) -> usize {
-    REPLAY_ROWS * heads * 3 * 128 * 4 + REPLAY_ROWS * heads * 4 + REPLAY_ROWS * channels * 2
+pub(crate) fn replay_bytes(heads: usize, channels: usize, rows: usize) -> usize {
+    rows * heads * 3 * 128 * 4 + rows * heads * 4 + rows * channels * 2
+}
+
+/// The replay commit `name` for records of `rows` rows: itself at the `_m64` programs' 64, its wide
+/// `_m128` variant past them.
+fn commit_for(name: &str, rows: usize) -> String {
+    if rows > DECODE_ROWS { format!("{name}_m{WIDE_DECODE_ROWS}") } else { name.to_string() }
+}
+
+/// Waves the sparse MLA decode's split planner allows (SparkInfer's `_CEIL_WAVES_MAX`), and the
+/// decode kernel's CTAs per row at one split (64 heads in blocks of 16).
+const SPARSE_MLA_WAVES: usize = 3;
+const SPARSE_MLA_HEAD_BLOCKS: usize = 4;
+
+/// The most rows a verify step schedules, up to `decode_rows`: the drafts' budget. Past the `_m64`
+/// programs it is the largest row count whose one-split sparse MLA launch (4 CTAs a row, one CTA
+/// per SM) fits three waves of the GPU's `sms` multiprocessors, read from the device: one row more
+/// starts a nearly empty fourth wave. On an RTX 5090 (170 SMs) the wide sparse MLA takes 313 us a
+/// layer at 127 rows (508 CTAs) and 407 us at 128 (512 CTAs). So 127 rows on 170 SMs, 128 on 188,
+/// 99 on 132; never fewer than the `_m64` programs' 64, and `decode_rows` itself at 64. The wide
+/// sparse MLA plans its 128-row bucket at one split (`full_launch_splits=1` at export; at 188 SMs
+/// the planner's own plan), so an object exported on either card keeps 4 CTAs a row.
+pub(crate) fn verify_budget(decode_rows: usize, sms: usize) -> usize {
+    if decode_rows <= DECODE_ROWS {
+        return decode_rows;
+    }
+    (SPARSE_MLA_WAVES * sms / SPARSE_MLA_HEAD_BLOCKS).clamp(DECODE_ROWS, decode_rows)
+}
+
+/// Hands the rows an even share of `verify_rows` leaves over to the first sequences, one each.
+/// `limits` are the drafts each sequence may add after its next token, `room` the even share's:
+/// 127 rows at 16 sequences give 6 each and leave 15 rows, so 15 sequences may draft 7. A
+/// sequence takes one only with the full `room` and `more(i)` (it speculates, and its tokens and
+/// capacity allow another draft). A share that leaves nothing over changes nothing (64 or 128
+/// rows at 16 sequences).
+pub(crate) fn hand_out_remainder(limits: &mut [usize], room: usize, verify_rows: usize, more: impl Fn(usize) -> bool) {
+    let mut left = verify_rows.saturating_sub(limits.len() * (room + 1));
+    for (i, limit) in limits.iter_mut().enumerate() {
+        if left == 0 {
+            break;
+        }
+        if *limit == room && more(i) {
+            *limit += 1;
+            left -= 1;
+        }
+    }
 }
 
 /// Bytes per KDA layer over `kda_heads` heads, as [`Caches::new`] allocates them: one sequence's
 /// recurrent state `[heads, 128, 128]` (FP32, or BF16 with `--kda-state bf16`) and BF16 conv window
 /// (the last three q/k/v inputs), the two regions `slot_regions_on` hands out per layer and a prefix
 /// mark copies, and the layer's speculative replay record.
-pub(crate) fn kda_layer_bytes(cfg: &GlmNextConfig, kda_heads: usize, state: KdaState) -> (usize, usize, usize) {
+pub(crate) fn kda_layer_bytes(cfg: &GlmNextConfig, kda_heads: usize, state: KdaState, decode_rows: usize) -> (usize, usize, usize) {
     let d = kda_heads * cfg.kda_head_dim;
-    (d * cfg.kda_head_dim * state.bytes(), 3 * 3 * d * 2, replay_bytes(kda_heads, 3 * d))
+    (d * cfg.kda_head_dim * state.bytes(), 3 * 3 * d * 2, replay_bytes(kda_heads, 3 * d, decode_rows))
 }
 /// One token's BF16 DSA index key | gate row (128 keys after k_norm, 128 gates).
 pub(crate) const KEY_BYTES: usize = 512;
@@ -661,6 +725,9 @@ pub(crate) struct StepPlan<'p, 'a> {
     scratch: GlmfScratchOptions,
     /// Rank 0's shape (rank 1 is not the lead and runs no experts).
     shape: GlmfStepShape,
+    /// Rows of the decode workspace (`--decode-rows`): it runs the `_m64` programs, and with 128 the
+    /// wide `_m128` ones too.
+    decode_rows: usize,
     /// Bytes of KDA replay records rank 0's prefill scratch holds (`--replay-records shared`): the
     /// scratch is at least this large. 0 with records of their own.
     shared_records: u64,
@@ -682,6 +749,9 @@ pub(crate) struct StepSettings {
     pub kda_state: KdaState,
     /// Where the KDA replay records live.
     pub replay_records: ReplayRecords,
+    /// The most rows of one decode or verify step (`--decode-rows`: [`DECODE_ROWS`], or
+    /// [`WIDE_DECODE_ROWS`] with the wide programs).
+    pub decode_rows: usize,
 }
 
 impl<'p, 'a> StepPlan<'p, 'a> {
@@ -693,11 +763,11 @@ impl<'p, 'a> StepPlan<'p, 'a> {
         // As `GlmfEngine::new` resolves it: without an MLA layer there is no index cache.
         let index_compact = settings.index_cache == IndexCache::Compact
             && layers.iter().any(|layer| layer.attention == GlmNextAttention::Mla);
-        // Every KDA layer's record, over this GPU's KDA heads (as `Caches::new`).
+        // Every KDA layer's record of the decode rows, over this GPU's KDA heads (as `Caches::new`).
         let kda_heads = cfg.kda_heads / if split { 2 } else { 1 };
         let kda_layers = layers.iter().filter(|layer| layer.attention == GlmNextAttention::Kda).count();
         let shared_records = if settings.replay_records == ReplayRecords::Shared {
-            (kda_layers * replay_bytes(kda_heads, 3 * kda_heads * cfg.kda_head_dim)) as u64
+            (kda_layers * replay_bytes(kda_heads, 3 * kda_heads * cfg.kda_head_dim, settings.decode_rows)) as u64
         } else { 0 };
         Self {
             library,
@@ -718,6 +788,7 @@ impl<'p, 'a> StepPlan<'p, 'a> {
                 table_pages,
                 table_pool_pages,
             },
+            decode_rows: settings.decode_rows,
             shared_records,
         }
     }
@@ -730,31 +801,31 @@ impl<'p, 'a> StepPlan<'p, 'a> {
         self
     }
 
-    /// Device bytes of rank `rank`'s step workspaces: the decode workspace, and `lanes` prefill lanes
-    /// of `prefill_rows` rows over their one set of temporaries (what `decode_workspace_of` and
-    /// `prefill_lanes_of` allocate).
+    /// Device bytes of rank `rank`'s step workspaces: the decode workspace of the plan's decode rows,
+    /// and `lanes` prefill lanes of `prefill_rows` rows over their one set of temporaries (what
+    /// `decode_workspace_of` and `prefill_lanes_of` allocate).
     pub(crate) fn workspace_bytes(&self, rank: usize, prefill_rows: usize, lanes: usize) -> Result<u64> {
         let lookup = |name: &str| self.programs.spec(name).ok()
             .map(|spec| spec.scratch.get("scratch").copied().unwrap_or(0));
-        let decode_scratch = glmf_step_scratch(lookup, self.cfg, self.scratch, DECODE_ROWS as u64, true)?;
+        let decode_scratch = glmf_step_scratch(lookup, self.cfg, self.scratch, self.decode_rows as u64, true)?;
         let mut prefill_scratch = glmf_step_scratch(lookup, self.cfg, self.scratch, prefill_rows as u64, false)?;
         if rank == 0 {
             // The prefill scratch also holds the replay records (`--replay-records shared`).
             prefill_scratch.programs = prefill_scratch.programs.max(self.shared_records);
         }
-        Ok(glmf_step_workspaces(self.cfg, lanes, prefill_rows as u64, &self.shape(rank), decode_scratch,
-            prefill_scratch).device_bytes())
+        Ok(glmf_step_workspaces(self.cfg, lanes, prefill_rows as u64, self.decode_rows as u64, &self.shape(rank),
+            decode_scratch, prefill_scratch).device_bytes())
     }
 
-    fn key(&self) -> (GlmfScratchOptions, GlmfStepShape, u64) {
-        (self.scratch, self.shape, self.shared_records)
+    fn key(&self) -> (GlmfScratchOptions, GlmfStepShape, usize, u64) {
+        (self.scratch, self.shape, self.decode_rows, self.shared_records)
     }
 }
 
 /// A GPU's step workspaces allocated before its engine (eager start-up): the decode workspace and
 /// every prefill lane, so the KV pool is sized from the memory they leave.
 pub(crate) struct StepWorkspaces<'a> {
-    key: (GlmfScratchOptions, GlmfStepShape, u64),
+    key: (GlmfScratchOptions, GlmfStepShape, usize, u64),
     rows: usize,
     decode: Workspace<'a>,
     lanes: Vec<Workspace<'a>>,
@@ -767,7 +838,7 @@ pub(crate) struct PrefillScratch<'a>(Rc<Temporaries<'a>>);
 impl<'a> StepWorkspaces<'a> {
     /// The decode workspace and `lanes` prefill lanes of `rows` rows of `plan`, on the current device.
     pub(crate) fn allocate(plan: &StepPlan<'_, 'a>, rows: usize, lanes: usize) -> Result<Self> {
-        let decode = plan.lane(0, DECODE_ROWS, true, Rc::new(plan.temporaries(0, DECODE_ROWS, true)?))?;
+        let decode = plan.lane(0, plan.decode_rows, true, Rc::new(plan.temporaries(0, plan.decode_rows, true)?))?;
         let temps = Rc::new(plan.temporaries(0, rows, false)?);
         let lanes = (0..lanes).map(|_| plan.lane(0, rows, false, temps.clone())).collect::<Result<_>>()?;
         Ok(Self { key: plan.key(), rows, decode, lanes })
@@ -922,11 +993,13 @@ pub(crate) struct PagedLayer {
 /// One GPU's caches. Per MLA layer (None for KDA): the latent record pool and its DSA index
 /// cache. Every KDA layer's pools back to back: FP32 or BF16 recurrent state `[layers, slots,
 /// heads, 128, 128]`, BF16 conv state `[layers, slots, 3, 3D]` and the speculative replay records
-/// (`replay_bytes` per layer), over this GPU's KDA heads. With the compact index cache, every
-/// MLA layer's sequence tails `[MLA layers, slots, TAIL_BYTES]` and speculative key | gate
-/// records `[MLA layers, REPLAY_ROWS, 256]` (BF16). The `glmf_kda_commit` tables (slot, first
-/// row, kept rows per sequence) and the logical page of each pool-cache page within its
-/// sequence.
+/// (`replay_bytes` of the decode rows per layer), over this GPU's KDA heads. With the compact index
+/// cache, every MLA layer's sequence tails `[MLA layers, slots, TAIL_BYTES]` and speculative
+/// key | gate records `[MLA layers, decode rows, 256]` (BF16). A speculative step records at its
+/// programs' capacity (`replay_rows_of`): an `_m64` step packs 64-row records layer by layer from
+/// the start, as the `_m64` commits read them, and an `_m128` step 128-row ones. The
+/// `glmf_kda_commit` tables (slot, first row, kept rows per sequence) and the logical page of each
+/// pool-cache page within its sequence.
 struct Caches<'a> {
     kv: Vec<Option<Dev<'a>>>,
     index: Vec<Option<IndexLayer<'a>>>,
@@ -951,19 +1024,20 @@ enum RecordsOwner<'a> {
 }
 
 impl<'a> Caches<'a> {
-    /// Zeroed caches on the current device for `layers` with `kda_heads` KDA heads. The replay
-    /// records take their own allocation, or the start of `records`' scratch (written by every
-    /// speculative verify before its commit reads them, so they start unzeroed).
+    /// Zeroed caches on the current device for `layers` with `kda_heads` KDA heads, the replay
+    /// records and commit tables for steps of up to `decode_rows` rows. The replay records take their
+    /// own allocation, or the start of `records`' scratch (written by every speculative verify before
+    /// its commit reads them, so they start unzeroed).
     #[allow(clippy::too_many_arguments)]
     fn new(library: &'a NativeLibrary, cfg: &GlmNextConfig, layers: &[GlmfLayer<'_>], pages: usize, pool_pages: usize,
-        slots: usize, kda_heads: usize, index_cache: IndexCache, kda_state: KdaState,
+        slots: usize, kda_heads: usize, index_cache: IndexCache, kda_state: KdaState, decode_rows: usize,
         records: Option<PrefillScratch<'a>>) -> Result<Self> {
         let zeroed = |bytes: usize| -> Result<Dev<'a>> {
             let allocation = DeviceAllocation::new(library, bytes.max(256))?;
             library.cuda_zero_bytes(allocation.buffer, allocation.buffer.bytes)?;
             Ok(allocation)
         };
-        let (state, conv, replay) = kda_layer_bytes(cfg, kda_heads, kda_state);
+        let (state, conv, replay) = kda_layer_bytes(cfg, kda_heads, kda_state, decode_rows);
         let keys = index_cache == IndexCache::Keys;
         let (mut kv, mut index, mut kda_layers, mut mla_layers) = (Vec::new(), Vec::new(), 0, 0);
         for layer in layers {
@@ -984,7 +1058,7 @@ impl<'a> Caches<'a> {
             }
         }
         let index_tails = if keys || mla_layers == 0 { None } else {
-            Some((zeroed(mla_layers * slots * TAIL_BYTES)?, zeroed(mla_layers * REPLAY_ROWS * KEY_BYTES)?))
+            Some((zeroed(mla_layers * slots * TAIL_BYTES)?, zeroed(mla_layers * decode_rows * KEY_BYTES)?))
         };
         let replay = kda_layers * replay;
         let (kda_replay, owner) = match records {
@@ -1003,7 +1077,7 @@ impl<'a> Caches<'a> {
         Ok(Self { kv, index, kda_state: zeroed(kda_layers * slots * state)?,
             kda_conv: zeroed(kda_layers * slots * conv)?,
             kda_replay, _kda_replay_owner: owner, index_tails,
-            commit_tables: zeroed(3 * DECODE_ROWS * 4)?, pool_logical: zeroed(pool_pages * 4)?, kda_heads })
+            commit_tables: zeroed(3 * decode_rows * 4)?, pool_logical: zeroed(pool_pages * 4)?, kda_heads })
     }
 }
 
@@ -1056,6 +1130,19 @@ pub(crate) struct GlmfEngine<'a> {
     pub prefill_lane_count: usize,
     pub pages: usize,
     pub slots: usize,
+    /// The most rows of one decode or verify step (`--decode-rows`): [`DECODE_ROWS`], or
+    /// [`WIDE_DECODE_ROWS`], where a step of more than 64 rows runs the wide `_m128` programs (fewer
+    /// rows keep the `_m64` ones). The decode workspace, the replay records and the commit tables
+    /// hold this many rows.
+    pub decode_rows: usize,
+    /// The most rows a verify step schedules, the drafts' budget: `decode_rows`, or with the wide
+    /// programs this GPU's whole sparse MLA waves ([`verify_budget`]: 127 on an RTX 5090).
+    pub verify_rows: usize,
+    /// The row buckets padded decode steps run at (startup graphs), from `verify_rows`.
+    buckets: DecodeBuckets,
+    /// Rows per layer of the replay records the last speculative step wrote (its programs'
+    /// capacity, `replay_rows_of`): the commit that follows reads records of that many rows.
+    replay_rows: std::cell::Cell<usize>,
     /// Per layer: its index among the KDA layers (None for MLA).
     kda_ordinal: Vec<Option<usize>>,
     /// Per layer: its index among the MLA layers (None for KDA).
@@ -1169,11 +1256,51 @@ const DECODE_PROJECTION_THRESHOLDS: &[ProjectionThreshold] = &[
     ProjectionThreshold { name: "dense.down[4096,12288|6144].fp8", skinny_rows: 16 },
 ];
 
-fn check_decode_thresholds(sequences: usize, speculation: bool) -> Result<()> {
-    let cap = decode_bucket(sequences.clamp(16, DECODE_ROWS), false);
-    let plain: Vec<_> = PLAIN_DECODE_BUCKETS.into_iter().filter(|&rows| rows <= cap).collect();
-    check_bucket_thresholds(&plain, DECODE_PROJECTION_THRESHOLDS)?;
-    if speculation { check_bucket_thresholds(&SPEC_DECODE_BUCKETS, DECODE_PROJECTION_THRESHOLDS)?; }
+// `--decode-rows 128`: a step of 65 to 128 rows runs the `_m128` programs. They keep the `_m64`
+// programs' arithmetic crossovers above (the same `_Fp8Switch` and BF16 projection routes, the
+// 128 x 128 prefill route only from 512 rows, the decode KDA structures, the index producers' 8 and
+// 160 rows), so their capacity is the one new threshold: no bucket may pad a step of up to 64 rows
+// into them, whose sparse MLA plans its rows as its own bucket (FR-G.6).
+const WIDE_DECODE_THRESHOLDS: &[ProjectionThreshold] = &[
+    ProjectionThreshold { name: "glmf.decode_capacity[m64|m128]", skinny_rows: DECODE_ROWS },
+];
+
+/// The row buckets padded decode steps run at (startup graphs): the plain buckets (a plain step has
+/// one row per sequence, at most 64) and the speculative ones, which with the wide programs end at
+/// the verify budget: `[2, 4, 8, 16, 32, 64, 127]` on an RTX 5090, `[.., 64, 128]` on 188 SMs,
+/// `[.., 64, 99]` on 132. A budget of 64 keeps the 64-row sets.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DecodeBuckets {
+    pub plain: Vec<usize>,
+    pub spec: Vec<usize>,
+}
+
+impl DecodeBuckets {
+    /// The sets of a verify budget of `verify_rows` rows ([`verify_budget`]).
+    pub(crate) fn new(verify_rows: usize) -> Self {
+        let mut spec = SPEC_DECODE_BUCKETS.to_vec();
+        if verify_rows > DECODE_ROWS {
+            spec.push(verify_rows);
+        }
+        Self { plain: PLAIN_DECODE_BUCKETS.to_vec(), spec }
+    }
+
+    /// The bucket a step of `rows` rows pads to (the rows themselves past the largest).
+    pub(crate) fn bucket(&self, rows: usize, spec: bool) -> usize {
+        let set = if spec { &self.spec } else { &self.plain };
+        set.iter().copied().find(|&bucket| bucket >= rows).unwrap_or(rows)
+    }
+}
+
+/// Refuses bucket sets that would pad a step across an audited arithmetic crossover: the plain
+/// buckets serving `sequences` reaches and, with `speculation`, the speculative ones.
+fn check_decode_thresholds(buckets: &DecodeBuckets, sequences: usize, speculation: bool) -> Result<()> {
+    let thresholds: Vec<ProjectionThreshold> =
+        DECODE_PROJECTION_THRESHOLDS.iter().chain(WIDE_DECODE_THRESHOLDS).copied().collect();
+    let cap = buckets.bucket(sequences.clamp(16, DECODE_ROWS), false);
+    let plain: Vec<_> = buckets.plain.iter().copied().filter(|&rows| rows <= cap).collect();
+    check_bucket_thresholds(&plain, &thresholds)?;
+    if speculation { check_bucket_thresholds(&buckets.spec, &thresholds)?; }
     Ok(())
 }
 // WP9 official-startup-dflash2-20261006-v1, SM120 RTX PRO 6000, 2026-10-06:
@@ -1271,25 +1398,23 @@ pub(crate) fn admit_beside_decode_graphs(startup: Option<StartupGraphReserve>,
     Ok((tokens, false))
 }
 
-fn decode_bucket(rows: usize, spec: bool) -> usize {
-    if spec { SPEC_DECODE_BUCKETS.into_iter().find(|&bucket| bucket >= rows).unwrap_or(rows) }
-    else { PLAIN_DECODE_BUCKETS.into_iter().find(|&bucket| bucket >= rows).unwrap_or(rows) }
-}
-
 pub(crate) fn graph_reserve_bytes(graphs: usize) -> u64 {
     let measured = graphs as u64 * MEASURED_GRAPH_BYTES;
     measured + (measured * GRAPH_MARGIN_PERCENT).div_ceil(100) + GRAPH_RANK_MARGIN_BYTES
 }
 
+/// The startup decode graph set's bytes per rank: `buckets` (the engine's sets) over every geometry.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn serving_graph_reserve(context: usize, pool_tokens: usize, dense: usize,
-    sequences: usize, speculation: bool, layers: usize, peer: bool) -> Vec<u64> {
-    let shapes = serving_graph_shapes(context, pool_tokens.div_ceil(PAGE_ROWS), dense, sequences, speculation).len();
+    sequences: usize, speculation: bool, layers: usize, peer: bool, buckets: &DecodeBuckets) -> Vec<u64> {
+    let shapes = serving_graph_shapes(context, pool_tokens.div_ceil(PAGE_ROWS), dense, sequences, speculation,
+        buckets).len();
     let graphs = std::iter::once(shapes * (layers + 1))
         .chain(peer.then_some(shapes * layers)).collect::<Vec<_>>();
     let bytes: Vec<_> = graphs.iter().map(|&count| graph_reserve_bytes(count)).collect();
-    tracing::info!(?graphs, ?bytes, shapes, pool_tokens, measured_bytes_per_graph = MEASURED_GRAPH_BYTES,
-        margin_percent = GRAPH_MARGIN_PERCENT, rank_margin_bytes = GRAPH_RANK_MARGIN_BYTES,
-        "GLM Flash graph reserve before KV admission");
+    tracing::info!(?graphs, ?bytes, shapes, pool_tokens, spec_rows = ?buckets.spec,
+        measured_bytes_per_graph = MEASURED_GRAPH_BYTES, margin_percent = GRAPH_MARGIN_PERCENT,
+        rank_margin_bytes = GRAPH_RANK_MARGIN_BYTES, "GLM Flash graph reserve before KV admission");
     bytes
 }
 
@@ -1351,13 +1476,13 @@ fn graph_geometries(context: usize, pages: usize, dense: usize) -> Vec<GraphGeom
     geometries
 }
 
-fn serving_graph_shapes(context: usize, pages: usize, dense: usize, sequences: usize, speculation: bool)
-    -> Vec<(usize, bool, GraphGeometry)> {
-    let plain = decode_bucket(sequences.clamp(16, DECODE_ROWS), false);
+fn serving_graph_shapes(context: usize, pages: usize, dense: usize, sequences: usize, speculation: bool,
+    buckets: &DecodeBuckets) -> Vec<(usize, bool, GraphGeometry)> {
+    let plain = buckets.bucket(sequences.clamp(16, DECODE_ROWS), false);
     graph_geometries(context, pages, dense).into_iter().flat_map(|geometry| {
-        PLAIN_DECODE_BUCKETS.into_iter().filter(move |&rows| rows <= plain)
+        buckets.plain.iter().copied().filter(move |&rows| rows <= plain)
             .map(move |rows| (rows, false, geometry))
-            .chain(SPEC_DECODE_BUCKETS.into_iter().filter(move |_| speculation)
+            .chain(buckets.spec.iter().copied().filter(move |_| speculation)
                 .map(move |rows| (rows, true, geometry)))
     }).collect()
 }
@@ -1445,14 +1570,20 @@ fn audit_route_counts(routes: &[ExpertProtocolV2RouteEntry]) -> std::collections
 
 impl<'a> GlmfEngine<'a> {
     /// `index_cache`: the DSA index cache (`compact` needs at least one MLA layer to matter;
-    /// without one there is no index cache, and the engine records `keys`).
+    /// without one there is no index cache, and the engine records `keys`). `decode_rows`: the most
+    /// rows of one decode or verify step, [`DECODE_ROWS`] or [`WIDE_DECODE_ROWS`].
     #[allow(clippy::too_many_arguments)]
     pub fn new(library: &'a NativeLibrary, programs: &'a Programs<'a>, cfg: GlmNextConfig, weights: GlmfWeights<'a>,
         stream: *mut c_void, max_context: usize, prefill_rows: usize, prefill_lane_count: usize, pages: usize,
-        slots: usize, embedding: TokenEmbedding<'a>, index_cache: IndexCache, kda_state: KdaState,
+        slots: usize, embedding: TokenEmbedding<'a>, index_cache: IndexCache, kda_state: KdaState, decode_rows: usize,
         records: Option<PrefillScratch<'a>>) -> Result<Self> {
         let _memory_scope = cuteafd_ffi::memory_ledger::scope("kv");
-        let quantize_grid = Fp8QuantizeGrid::new(library.sm_count()?, None)?;
+        let sms = library.sm_count()?;
+        let quantize_grid = Fp8QuantizeGrid::new(sms, None)?;
+        ensure!(decode_rows == DECODE_ROWS || decode_rows == WIDE_DECODE_ROWS,
+            "decode steps of up to {decode_rows} rows: the programs take {DECODE_ROWS} or {WIDE_DECODE_ROWS}");
+        let verify_rows = verify_budget(decode_rows, sms);
+        tracing::info!(decode_rows, verify_rows, sms, "GLM Flash decode and verify step rows");
         ensure!(embedding.hidden() == cfg.hidden, "embedding rows of {} for hidden {}", embedding.hidden(), cfg.hidden);
         ensure!((1..=MAX_PREFILL_LANES).contains(&prefill_lane_count) && prefill_rows > 0,
             "{prefill_lane_count} prefill lanes of {prefill_rows} rows (1 to {MAX_PREFILL_LANES} lanes)");
@@ -1474,16 +1605,20 @@ impl<'a> GlmfEngine<'a> {
         // A head split's shares hold half the KDA heads (and their state).
         let split = weights.layers.first().is_some_and(|l| l.split);
         ensure!(!split || index_cache == IndexCache::Keys, "a head split keeps the per-token index keys");
+        // The head split's share programs (`glmf2_*`) exist at 64 decode rows only.
+        ensure!(!split || decode_rows == DECODE_ROWS,
+            "a head split takes decode steps of up to {DECODE_ROWS} rows (--decode-rows {DECODE_ROWS})");
         let kda_heads = cfg.kda_heads / if split { 2 } else { 1 };
         ensure!(records.is_none() || !split, "a head split keeps the replay records of its own (--replay-records own)");
         let replay_records = if records.is_some() { ReplayRecords::Shared } else { ReplayRecords::Own };
         let caches = Caches::new(library, &cfg, &weights.layers, pages, pool_pages, slots, kda_heads, index_cache,
-            kda_state, records)?;
+            kda_state, decode_rows, records)?;
         let device = library.cuda_get_device()?;
         let (table_pages, table_pool_pages) = glmf_table_pages(max_context as u64);
         let (table_pages, table_pool_pages) = (usize::try_from(table_pages)?, usize::try_from(table_pool_pages)?);
         Ok(Self { quantize_grid, library, programs, cfg, weights, stream, max_context, prefill_rows, prefill_lane_count,
-            pages, slots,
+            pages, slots, decode_rows, verify_rows, buckets: DecodeBuckets::new(verify_rows),
+            replay_rows: std::cell::Cell::new(DECODE_ROWS),
             kda_ordinal, mla_ordinal, index_cache, replay_records, records: RecordGuard::new(replay_records), caches,
             device, peer: None, exchange: None, drafter: None, pool_logical_host: RefCell::new(vec![0; pool_pages]), pool_pages,
             table_pages, table_pool_pages, decode_workspace: RefCell::new(None),
@@ -1522,15 +1657,21 @@ impl<'a> GlmfEngine<'a> {
         self.synchronize()
     }
 
-    /// Capture the complete serving key set on masked rows, without expert traffic.
+    /// Capture the complete serving key set on masked rows, without expert traffic. The bucket sets
+    /// pass the projection thresholds before readiness in every graph mode.
     pub fn warm_decode_graphs(&self, sequences: usize, speculation: bool) -> Result<usize> {
-        if !self.use_graphs || !self.startup_graphs { return Ok(0); }
-        check_decode_thresholds(sequences, speculation)?;
-        let shapes = serving_graph_shapes(self.max_context, self.pages, self.cfg.dense_context(), sequences, speculation);
+        if !self.use_graphs { return Ok(0); }
+        check_decode_thresholds(&self.buckets, sequences, speculation)?;
+        tracing::info!(plain_rows = ?self.buckets.plain, spec_rows = ?self.buckets.spec, decode_rows = self.decode_rows,
+            verify_rows = self.verify_rows, startup = self.startup_graphs,
+            "GLM Flash decode buckets pass the projection thresholds");
+        if !self.startup_graphs { return Ok(0); }
+        let shapes = serving_graph_shapes(self.max_context, self.pages, self.cfg.dense_context(), sequences, speculation,
+            &self.buckets);
         let segments = self.weights.layers.len() + 1;
         let expected = shapes.len() * (segments + self.peer.as_ref().map_or(0, |p| p.layers.len()));
-        tracing::info!(shapes = shapes.len(), graphs = expected, plain_rows = ?PLAIN_DECODE_BUCKETS, spec_rows = ?SPEC_DECODE_BUCKETS,
-            "GLM Flash startup decode graph admission");
+        tracing::info!(shapes = shapes.len(), graphs = expected, plain_rows = ?self.buckets.plain,
+            spec_rows = ?self.buckets.spec, "GLM Flash startup decode graph admission");
         // Allocate fixed workspaces before measuring the graph executables' physical memory.
         for rank in 0..self.ranks() {
             drop(self.decode_workspace_of(rank)?);
@@ -1568,11 +1709,18 @@ impl<'a> GlmfEngine<'a> {
         Ok(graphs)
     }
 
-    /// One-GPU real-row byte gate; plain steps restore the complete persistent state.
+    /// One-GPU real-row byte gate; plain steps restore the complete persistent state. With the wide
+    /// programs the speculative steps also pad 65 rows and the verify budget less one into the
+    /// budget's bucket (65 -> 127 and 126 -> 127 on an RTX 5090).
     pub fn check_decode_padding(&self, tokens: &[u32]) -> Result<()> {
         ensure!(self.ranks() == 1 && self.use_graphs && self.startup_graphs,
             "padding check needs one GPU, graphs and CUTEAFD_GLMF_STARTUP_GRAPHS=1");
-        ensure!(tokens.len() >= 65 && self.max_context >= 65, "padding check needs 65 tokens of context");
+        let mut spec_rows = vec![3, 9, 17, 33];
+        if self.verify_rows > DECODE_ROWS {
+            spec_rows.extend([DECODE_ROWS + 1, self.verify_rows - 1]);
+        }
+        let needed = 32 + spec_rows.iter().copied().max().unwrap_or(0);
+        ensure!(tokens.len() >= needed && self.max_context >= needed, "padding check needs {needed} tokens of context");
         let mut placement = GlmfPlacement::new(vec![0], 0);
         self.prefill_device(&mut placement, &tokens[..32])?;
         let caches = self.caches_of(0);
@@ -1613,16 +1761,17 @@ impl<'a> GlmfEngine<'a> {
             placement = original.clone();
             let padded = self.verify_device(&mut [(&mut placement, rows)], input, false)?
                 .context("padding check needs all layers")?.to_host(self.library)?;
+            let bucket = self.buckets.bucket(rows, false);
             ensure!(exact.len() == padded.len() && exact.iter().zip(&padded).all(|(a, b)| a.to_bits() == b.to_bits()),
-                "plain decode padding {rows}->{} changed real-row logits", decode_bucket(rows, false));
+                "plain decode padding {rows}->{bucket} changed real-row logits");
             ensure!(snapshot()? == exact_state && (placement.len, placement.kda_len) == exact_placement,
-                "plain decode padding {rows}->{} changed persistent state", decode_bucket(rows, false));
-            tracing::info!(rows, bucket = decode_bucket(rows, false), bytes = exact.len() * 4,
+                "plain decode padding {rows}->{bucket} changed persistent state");
+            tracing::info!(rows, bucket, bytes = exact.len() * 4,
                 "GLM Flash plain padded decode real-row logits and persistent state byte-exact");
         }
         restore(&before)?;
         placement = original;
-        for rows in [3, 9, 17, 33] {
+        for rows in spec_rows {
             let start = placement.len;
             let input = &tokens[32..32 + rows];
             let mut ignore = |_: usize, _: &[u8]| Ok(());
@@ -1632,9 +1781,10 @@ impl<'a> GlmfEngine<'a> {
             let padded = self.verify_device(&mut [(&mut placement, rows)], input, true)?
                 .context("padding check needs all layers")?.to_host(self.library)?;
             placement.len = start;
+            let bucket = self.buckets.bucket(rows, true);
             ensure!(plain.len() == padded.len() && plain.iter().zip(&padded).all(|(a, b)| a.to_bits() == b.to_bits()),
-                "decode padding {rows}->{} changed real-row logits", decode_bucket(rows, true));
-            tracing::info!(rows, bucket = decode_bucket(rows, true), bytes = plain.len() * 4,
+                "decode padding {rows}->{bucket} changed real-row logits");
+            tracing::info!(rows, bucket, programs = decode_cap(bucket), bytes = plain.len() * 4,
                 "GLM Flash padded decode real-row logits byte-exact");
         }
         self.synchronize()
@@ -1660,6 +1810,9 @@ impl<'a> GlmfEngine<'a> {
     pub fn attach_peer(&mut self, device: i32, stream: *mut c_void, layers: Vec<GlmfLayer<'a>>) -> Result<()> {
         ensure!(layers.len() == self.weights.layers.len() && layers.iter().chain(&self.weights.layers).all(|l| l.split),
             "attach_peer needs the head-split shares of every loaded layer");
+        // The share programs (`glmf2_*`) exist at 64 decode rows only.
+        ensure!(self.decode_rows == DECODE_ROWS,
+            "a head split takes decode steps of up to {DECODE_ROWS} rows (--decode-rows {DECODE_ROWS})");
         let rows = self.prefill_rows.max(DECODE_ROWS);
         let exchange = PeerExchange::new(self.library, [RankDevice { device: self.device, stream: self.stream },
             RankDevice { device, stream }], if self.kda_output_shard { 6 } else { 4 } * self.prefill_lane_count,
@@ -1668,9 +1821,9 @@ impl<'a> GlmfEngine<'a> {
         ensure!(self.index_cache == IndexCache::Keys, "a head split keeps the per-token index keys (--index-cache keys)");
         let peer = exchange.on(1, || -> Result<GlmfPeer<'a>> {
             // Its own and the shares' programs.
-            self.programs.load_matching(|name| super::glmf_startup_program(name, true))?;
+            self.programs.load_matching(|name| super::glmf_startup_program(name, true, self.decode_rows > DECODE_ROWS))?;
             let caches = Caches::new(self.library, &self.cfg, &layers, self.pages, self.pool_pages, self.slots,
-                self.caches.kda_heads, self.index_cache, self.kda_state, None)?;
+                self.caches.kda_heads, self.index_cache, self.kda_state, self.decode_rows, None)?;
             Ok(GlmfPeer { device, stream, layers, caches,
                 decode_workspace: RefCell::new(None), lane_workspaces: RefCell::new(Vec::new()),
                 graphs: RefCell::new(GraphCache::new(self.graphs.borrow().budget())), l2: None })
@@ -1885,14 +2038,17 @@ impl<'a> GlmfEngine<'a> {
     /// of `slot` in every layer, as serial steps over those rows would have,
     /// and (compact index cache, the same launch) rebuilds its index tail in
     /// every MLA layer from the old tail and the kept rows' keys and gates.
-    /// Callers set the committed placements' `kda_len` to their kept length.
+    /// Callers set the committed placements' `kda_len` to their kept length. The records are the last
+    /// speculative step's: `kda_commit*` reads them after an `_m64` step, `kda_commit*_m128` after a
+    /// wide one.
     pub fn commit(&self, sequences: &[(i32, usize, usize)]) -> Result<()> {
         if sequences.is_empty() {
             return Ok(());
         }
         self.records.check_commit()?;
-        ensure!(sequences.len() <= DECODE_ROWS && sequences.iter().all(|&(slot, first, keep)|
-            slot >= 0 && (slot as usize) < self.slots && first + keep <= REPLAY_ROWS), "commit of {sequences:?}");
+        let recorded = self.replay_rows.get();
+        ensure!(sequences.len() <= self.decode_rows && sequences.iter().all(|&(slot, first, keep)|
+            slot >= 0 && (slot as usize) < self.slots && first + keep <= recorded), "commit of {sequences:?}");
         let n = sequences.len();
         let mut tables = vec![0i32; 3 * n];
         for (i, &(slot, first, keep)) in sequences.iter().enumerate() {
@@ -1922,7 +2078,7 @@ impl<'a> GlmfEngine<'a> {
                 }
                 None => self.kda_state.commit_program(),
             };
-            self.run_on(rank, split, program, &pointers, &scalars)?;
+            self.run_on(rank, split, &commit_for(program, recorded), &pointers, &scalars)?;
         }
         Ok(())
     }
@@ -2030,7 +2186,7 @@ impl<'a> GlmfEngine<'a> {
             StepSettings { kda_fp32_partials: self.kda_fp32_partials, kda_output_shard: self.kda_output_shard,
                 kda_prefill_expanded: self.kda_prefill_expanded, full_prefill_logits: self.full_prefill_logits,
                 max_context: self.max_context, index_cache: self.index_cache, kda_state: self.kda_state,
-                replay_records: self.replay_records })
+                replay_records: self.replay_records, decode_rows: self.decode_rows })
     }
 
     /// Installs step workspaces allocated before this engine (`StepWorkspaces`), which must be
@@ -2054,7 +2210,8 @@ impl<'a> GlmfEngine<'a> {
         self.selector.borrow_mut().take()
     }
 
-    /// Rank `rank`'s decode workspace (its own temporaries), allocated on that rank's GPU on first use.
+    /// Rank `rank`'s decode workspace (its own temporaries) of `decode_rows` rows, allocated on that
+    /// rank's GPU on first use.
     fn decode_workspace_of(&self, rank: usize) -> Result<std::cell::Ref<'_, Option<Workspace<'a>>>> {
         let cell = match (rank, &self.peer) {
             (1, Some(peer)) => &peer.decode_workspace,
@@ -2063,7 +2220,7 @@ impl<'a> GlmfEngine<'a> {
         if cell.borrow().is_none() {
             let workspace = self.on(rank, || {
                 let plan = self.step_plan();
-                plan.lane(rank, DECODE_ROWS, true, Rc::new(plan.temporaries(rank, DECODE_ROWS, true)?))
+                plan.lane(rank, self.decode_rows, true, Rc::new(plan.temporaries(rank, self.decode_rows, true)?))
             })?;
             *cell.borrow_mut() = Some(workspace);
         }
@@ -2392,7 +2549,7 @@ impl<'a> GlmfEngine<'a> {
 
     /// Physical row count of an ordinary serving verify (lazy graphs use exact rows).
     pub(crate) fn serving_decode_rows(&self, rows: usize, spec: bool) -> usize {
-        if self.use_graphs && self.startup_graphs { decode_bucket(rows, spec) } else { rows }
+        if self.use_graphs && self.startup_graphs { self.buckets.bucket(rows, spec) } else { rows }
     }
 
     /// [`Self::verify`] (`spec`: [`Self::verify_spec`]) leaving every row's
@@ -2413,7 +2570,8 @@ impl<'a> GlmfEngine<'a> {
         on_layer: Option<&mut dyn FnMut(usize, &[u8]) -> Result<()>>, spec: bool,
         trace: Option<&std::path::Path>, media: Option<&cuteafd_engine::media::RequestMedia>, eager: bool) -> Result<Option<DeviceLogits>> {
         let rows: usize = sequences.iter().map(|(_, n)| n).sum();
-        ensure!(rows > 0 && rows <= DECODE_ROWS && tokens.len() == rows, "decode step of {rows} rows");
+        ensure!(rows > 0 && rows <= self.decode_rows && tokens.len() == rows,
+            "decode step of {rows} rows (--decode-rows {})", self.decode_rows);
         // Power-of-two strides and widths bound the graphs a growing batch captures.
         let (page_stride, pool_stride) = decode_strides(
             sequences.iter().map(|(p, _)| p.pages.len()).max().unwrap_or(1),
@@ -2443,8 +2601,12 @@ impl<'a> GlmfEngine<'a> {
         }
         let graphed = self.use_graphs && !tables.eager && on_layer.is_none() && trace.is_none()
             && media.is_none_or(|m| m.spans().is_empty());
+        let bucket = if graphed { self.serving_decode_rows(rows, spec) } else { rows };
+        if spec {
+            // The step records at its programs' capacity; the commit that follows reads that many rows.
+            self.replay_rows.set(replay_rows_of(decode_cap(bucket)));
+        }
         let logits = if graphed {
-            let bucket = self.serving_decode_rows(rows, spec);
             pad_decode_tables(&mut tables, bucket);
             let mut padded = tokens.to_vec();
             padded.resize(bucket, 0);
@@ -2539,7 +2701,7 @@ impl<'a> GlmfEngine<'a> {
         let norm = w.delta.buffer.ptr.wrapping_byte_add(first * h * 2);
         let (a, b) = if rank == 0 { (norm, peer_norm) } else { (peer_norm, norm) };
         let full = self.full_kda_norm(w);
-        let expanded = if self.kda_prefill_expanded && cap != "m64" { "_expanded" } else { "" };
+        let expanded = if self.kda_prefill_expanded && !is_decode(cap) { "_expanded" } else { "" };
         if owned != 0 {
             self.run_on(rank, true, "join_heads", &[("a", a), ("b", b), ("out", full)],
                 &[Scalar::I32(owned as i32)])?;
@@ -2671,9 +2833,9 @@ impl<'a> GlmfEngine<'a> {
         let key = GraphKey::new(index, t, tables);
         self.replay_on(1, key, || {
             if let Some(previous) = index.checked_sub(1) {
-                self.peer_post(previous, 0, w1, t, "m64")?;
+                self.peer_post(previous, 0, w1, t, decode_cap(t))?;
             }
-            self.peer_attention(index, 0, w1, t, "m64", tables)
+            self.peer_attention(index, 0, w1, t, decode_cap(t), tables)
         })
     }
 
@@ -2712,7 +2874,7 @@ impl<'a> GlmfEngine<'a> {
         if graphed {
             return self.decode_graphed(w, w1, tables, t, rows, logit_rows);
         }
-        let cap = if tables.decode { "m64" } else { "m4096" };
+        let cap = if tables.decode { decode_cap(t) } else { PREFILL_CAP };
         let layers = &self.weights.layers;
         if let Some(w1) = w1 {
             // The streams to the second GPU, which runs a unit ahead of the host's rank-0
@@ -2832,6 +2994,9 @@ impl<'a> GlmfEngine<'a> {
         // Every layer resident: the last segment ends in the head and the greedy selection.
         let head = layers.len() == self.cfg.layers && logit_rows == t;
         let gather = self.embedding.device_gather();
+        // The `_m64` programs up to 64 rows, the wide `_m128` ones past them (the rows are in the
+        // graph key, so one capacity per captured segment).
+        let cap = decode_cap(t);
         for index in 0..=layers.len() {
             let key = GraphKey::new(index, t, tables);
             self.replay(key, || -> Result<()> {
@@ -2868,19 +3033,19 @@ impl<'a> GlmfEngine<'a> {
                     }
                     self.pre(w, &w.streams[0], layer, rows)?;
                 } else {
-                    self.post_pre_on(0, w, out, 1, layer, "attn", "input_norm", rows, "m64")?;
+                    self.post_pre_on(0, w, out, 1, layer, "attn", "input_norm", rows, cap)?;
                     tap()?;
                 }
-                self.attention(0, w, index, layer, rows, "m64", tables, None)?;
-                let attended = self.meet_attention(w, slot(index, false, 0), t, layer, "m64")?;
-                self.post_pre_on(0, w, attended, 0, layer, "ffn", "post_norm", rows, "m64")?;
+                self.attention(0, w, index, layer, rows, cap, tables, None)?;
+                let attended = self.meet_attention(w, slot(index, false, 0), t, layer, cap)?;
+                self.post_pre_on(0, w, attended, 0, layer, "ffn", "post_norm", rows, cap)?;
                 if layer.dense {
-                    self.ffn(w, layer, self.cfg.dense_intermediate, "m64", w.delta.buffer.ptr, rows)
+                    self.ffn(w, layer, self.cfg.dense_intermediate, cap, w.delta.buffer.ptr, rows)
                 } else if self.startup_graphs {
                     // Real width is runtime data, not part of a bucket graph key.
                     Ok(())
                 } else {
-                    self.moe_front(w, index, layer, t, rows, "m64")
+                    self.moe_front(w, index, layer, t, rows, cap)
                 }
             })?;
             if let Some(w1) = w1 {
@@ -2902,8 +3067,11 @@ impl<'a> GlmfEngine<'a> {
                     // Masked startup rows need no routed result; preserve peer event ordering.
                     self.exchange_window(index, true, true)?;
                 } else if self.startup_graphs {
+                    // A padded step's real rows run the router, the expert wire and the shared expert
+                    // at the step's capacity (a bucket past 64 rows holds more than 64 real rows); the
+                    // padding tail of the decode workspace's `delta` is cleared after the expert work.
                     crate::shared::decode_graph::real_row_moe(tables.real_rows, t, |real| {
-                        self.moe(w, index, &layers[index], real, Scalar::I32(real as i32), "m64", true)
+                        self.moe(w, index, &layers[index], real, Scalar::I32(real as i32), cap, true)
                     }, |tail| {
                         let offset = tail.start * self.cfg.hidden * 2;
                         let bytes = tail.len() * self.cfg.hidden * 2;
@@ -2919,7 +3087,7 @@ impl<'a> GlmfEngine<'a> {
                         }
                     })?;
                 } else {
-                    self.moe_experts(w, index, &layers[index], t, rows, "m64", true)?;
+                    self.moe_experts(w, index, &layers[index], t, rows, cap, true)?;
                 }
             }
             if index < layers.len() {
@@ -3138,8 +3306,10 @@ impl<'a> GlmfEngine<'a> {
         let d = caches.kda_heads * self.cfg.kda_head_dim;
         let conv_state = at(caches.kda_conv.buffer, self.slots * 3 * 3 * d * 2);
         let state = at(caches.kda_state.buffer, self.slots * d * self.cfg.kda_head_dim * self.kda_state.bytes());
-        let replay = at(caches.kda_replay, replay_bytes(caches.kda_heads, 3 * d));
-        let decode = cap == "m64";
+        // Records of the step's programs' rows, layer by layer (an `_m64` step's 64-row records, a wide
+        // step's 128-row ones), as the commit that follows reads them.
+        let replay = at(caches.kda_replay, replay_bytes(caches.kda_heads, 3 * d, replay_rows_of(cap)));
+        let decode = is_decode(cap);
         if layer.has("w_in_fp8") {
             return self.kda_w8(rank, w, layer, rows, cap, spec, [conv_state, state, replay]);
         }
@@ -3173,7 +3343,7 @@ impl<'a> GlmfEngine<'a> {
     #[allow(clippy::too_many_arguments)]
     fn kda_w8(&self, rank: usize, w: &Workspace<'_>, layer: &GlmfLayer<'_>, rows: Scalar, cap: &str, spec: bool,
         [conv_state, state, replay]: [*mut c_void; 3]) -> Result<()> {
-        let decode = cap == "m64";
+        let decode = is_decode(cap);
         let mut pointers = vec![("x", w.x.buffer.ptr), ("w_in_fp8", layer.ptr("w_in_fp8")?),
             ("w_in_kscale", layer.ptr("w_in_kscale")?), ("w_fg", layer.ptr("w_fg")?), ("conv_w", layer.ptr("conv_w")?),
             ("a_log", layer.ptr("a_log")?), ("dt_bias", layer.ptr("dt_bias")?), ("o_norm", layer.ptr("o_norm")?),
@@ -3192,7 +3362,7 @@ impl<'a> GlmfEngine<'a> {
         pointers.push(("scratch", w.scratch.buffer.ptr));
         let dtype = if self.output_shard_attention(layer) { "_norm" }
             else if self.precise_attention(layer) { "_f32" } else { "" };
-        let expanded = if self.kda_prefill_expanded && cap != "m64" { "_expanded" } else { "" };
+        let expanded = if self.kda_prefill_expanded && !is_decode(cap) { "_expanded" } else { "" };
         let name = format!("kda_w8{dtype}{expanded}_{cap}");
         self.run_on(rank, layer.split, &name, &pointers, &scalars)
     }
@@ -3233,7 +3403,7 @@ impl<'a> GlmfEngine<'a> {
                 dense.module.launch(&pointers, usize::try_from(rows)?, self.stream)
             });
         }
-        let decode = cap == "m64";
+        let decode = is_decode(cap);
         let pointers = [("x", w.x.buffer.ptr), ("w_gate_up_fp8", layer.ptr("w_gate_up_fp8")?),
             ("w_gate_up_scale", layer.ptr("w_gate_up_scale")?), ("w_down_fp8", layer.ptr("w_down_fp8")?),
             ("w_down_scale", layer.ptr("w_down_scale")?), ("out", out), ("scratch", w.scratch.buffer.ptr)];
@@ -3295,10 +3465,12 @@ impl<'a> GlmfEngine<'a> {
             (None, Some((tails, records))) => {
                 // This MLA layer's tails `[slots, TAIL_BYTES]` and speculative key | gate record.
                 let ordinal = self.mla_ordinal[index].context("MLA layer without an ordinal")?;
-                ensure!(!tables.spec || t <= REPLAY_ROWS, "a speculative step of {t} rows exceeds the replay record");
-                // SAFETY: ordinal < MLA layers: both regions lie inside their pools.
+                let recorded = replay_rows_of(cap);
+                ensure!(!tables.spec || t <= recorded, "a speculative step of {t} rows exceeds the replay record");
+                // SAFETY: ordinal < MLA layers and the records hold `decode_rows` >= `recorded` rows per
+                // layer: both regions lie inside their pools.
                 let (tails, record) = unsafe { (tails.buffer.ptr.cast::<u8>().add(ordinal * self.slots * TAIL_BYTES),
-                    records.buffer.ptr.cast::<u8>().add(ordinal * REPLAY_ROWS * KEY_BYTES)) };
+                    records.buffer.ptr.cast::<u8>().add(ordinal * recorded * KEY_BYTES)) };
                 self.run_on(rank, false, &format!("index_producer_c_{cap}"), &[("x", w.x.buffer.ptr),
                     ("q_resid", w.q_resid.buffer.ptr), ("pool_slots", w.pool_slots.buffer.ptr),
                     ("positions", w.positions.buffer.ptr), ("kda_slots", w.kda_slots.buffer.ptr),
@@ -3361,7 +3533,7 @@ impl<'a> GlmfEngine<'a> {
             std::fs::write(dir.join("mla_latent.bin"), self.download(&w.latent,
                 t * self.cfg.heads * self.cfg.kv_lora_rank * 2)?)?;
             std::fs::write(dir.join("mla_sparse_scratch.bin"), self.download(&w.scratch,
-                self.scratch("sparse_mla_decode_m64")?)?)?;
+                self.scratch(&format!("sparse_mla_decode_{cap}"))?)?)?;
         }
         let pointers = [("attn", w.latent.buffer.ptr), ("w_uv", layer.ptr("w_uv")?),
             ("w_o_fp8", layer.ptr("w_o_fp8")?), ("w_o_scale", layer.ptr("w_o_scale")?),
@@ -3822,6 +3994,14 @@ impl Drop for GlmfEngine<'_> {
     }
 }
 
+/// [`DecodeBuckets::bucket`] of the 64-row sets; serving reads the engine's sets. (Test code starts
+/// here: the source checks read the engine up to the first `#[cfg(test)]` item.)
+#[cfg(test)]
+fn decode_bucket(rows: usize, spec: bool) -> usize {
+    if spec { SPEC_DECODE_BUCKETS.into_iter().find(|&bucket| bucket >= rows).unwrap_or(rows) }
+    else { PLAIN_DECODE_BUCKETS.into_iter().find(|&bucket| bucket >= rows).unwrap_or(rows) }
+}
+
 #[cfg(test)]
 mod prefill_lane_tests {
     use super::{prefill_lane_capacity, prefill_lane_plan, KdaState, DEFAULT_PREFILL_LANES, MAX_PREFILL_LANES,
@@ -3882,14 +4062,31 @@ mod prefill_lane_tests {
         }
         assert_eq!(super::DECODE_PROJECTION_THRESHOLDS.iter().map(|p| p.skinny_rows).collect::<Vec<_>>(),
             [8, 160, 8, 8, 16, 32, 16, 16, 16, 16, 16]);
-        for sequences in [1, 8, 16, 17, 32, 64] {
-            super::check_decode_thresholds(sequences, false).unwrap();
-            super::check_decode_thresholds(sequences, true).unwrap();
+        // The 64-row sets, and with the wide programs the speculative set ending at the verify budget (127 on
+        // 170 SMs, 128 on 188, 99 on 132), pass at every serving width; the `_m128` programs add only
+        // their capacity (`WIDE_DECODE_THRESHOLDS`).
+        let default = super::DecodeBuckets::new(super::DECODE_ROWS);
+        assert_eq!((default.plain.as_slice(), default.spec.as_slice()),
+            (&super::PLAIN_DECODE_BUCKETS[..], &super::SPEC_DECODE_BUCKETS[..]));
+        for verify in [super::DECODE_ROWS, 99, 127, 128] {
+            let buckets = super::DecodeBuckets::new(verify);
+            assert_eq!(buckets.spec.last(), Some(&verify));
+            for sequences in 1..=super::DECODE_ROWS {
+                super::check_decode_thresholds(&buckets, sequences, false).unwrap();
+                super::check_decode_thresholds(&buckets, sequences, true).unwrap();
+            }
         }
         let error = super::check_bucket_thresholds(&[1, 4, 16], super::DECODE_PROJECTION_THRESHOLDS)
             .unwrap_err().to_string();
         assert!(error.contains("index.iq"));
         assert!(super::check_bucket_thresholds(&[1, 4, 8, 16, 64], super::DECODE_PROJECTION_THRESHOLDS).is_err());
+        // A set that pads a step of up to 64 rows into the `_m128` programs is refused.
+        let error = super::check_bucket_thresholds(&[32, 72], super::WIDE_DECODE_THRESHOLDS).unwrap_err().to_string();
+        assert!(error.contains("m64|m128"), "{error}");
+        let crossing = super::DecodeBuckets { plain: super::PLAIN_DECODE_BUCKETS.to_vec(),
+            spec: vec![2, 4, 8, 16, 32, 72, 127] };
+        let error = super::check_decode_thresholds(&crossing, 16, true).unwrap_err().to_string();
+        assert!(error.contains("m64|m128"), "{error}");
     }
 
     #[test]
@@ -4055,10 +4252,10 @@ mod prefill_lane_tests {
         assert_eq!(tracked, 5_079_588_096);
         assert_eq!(tracked - 5_068_061_409, 11_526_687);
         // Two lanes over one set of temporaries, without a head split's rows: 2.13 GB less.
-        let shared = glmf_step_workspaces(&cfg, 2, 4096, &shape, decode, prefill).device_bytes();
+        let shared = glmf_step_workspaces(&cfg, 2, 4096, 64, &shape, decode, prefill).device_bytes();
         assert_eq!(shared, 2_950_470_912);
         let spark = GlmfStepShape { local_experts: false, spark: true, ..shape };
-        assert_eq!(glmf_step_workspaces(&cfg, 2, 4096, &spark, decode, prefill).device_bytes(), 2_882_837_760);
+        assert_eq!(glmf_step_workspaces(&cfg, 2, 4096, 64, &spark, decode, prefill).device_bytes(), 2_882_837_760);
         let reserve = super::workspace_reserve_bytes(shared, 2, true);
         assert_eq!(reserve, shared + 4 * super::WORKSPACE_RUNTIME_OVERHEAD_BYTES);
         assert!(reserve >= shared + 3 * 71_942_144 + 68_269_888);
@@ -4082,17 +4279,18 @@ mod prefill_lane_tests {
         // Scoring's exact union (`--full-prefill-logits`): the same lanes, a serial prefill in lane 0,
         // the all-row logits once in their shared temporaries. Whole workspaces held them three
         // times (a serial workspace and two lanes) at four runtime allowances.
-        let scoring = glmf_step_workspaces(&cfg, 2, 4096, &full, decode, prefill).device_bytes();
+        let scoring = glmf_step_workspaces(&cfg, 2, 4096, 64, &full, decode, prefill).device_bytes();
         assert_eq!(scoring - shared, (4096 - 64) * 154_880 * 4);
         assert_eq!(super::workspace_reserve_bytes(scoring, 2, false), scoring + 3 * super::WORKSPACE_RUNTIME_OVERHEAD_BYTES);
     }
 
     #[test]
     fn startup_graph_shapes_cover_all_admitted_capacities_and_positions() {
-        use super::{decode_bucket, glmf_table_pages, serving_graph_shapes, GraphGeometry, GraphKey, StepTables,
-            MIN_PAGE_STRIDE, UNIT_PAGES, UNIT_ROWS};
+        use super::{decode_bucket, glmf_table_pages, serving_graph_shapes, DecodeBuckets, GraphGeometry, GraphKey,
+            StepTables, DECODE_ROWS, MIN_PAGE_STRIDE, UNIT_PAGES, UNIT_ROWS};
+        let buckets = DecodeBuckets::new(DECODE_ROWS);
         for (context, pages, dense) in [(32768usize, 4096usize, 2051usize), (777, 28, 99), (3000, 36, 2051)] {
-            let shapes = serving_graph_shapes(context, pages, dense, 16, true);
+            let shapes = serving_graph_shapes(context, pages, dense, 16, true, &buckets);
             let set: std::collections::HashSet<_> = shapes.iter().copied().collect();
             assert_eq!(shapes.len(), set.len());
             let (table_pages, table_pools) = glmf_table_pages(context as u64);
@@ -4128,8 +4326,8 @@ mod prefill_lane_tests {
         }
         // 14 geometries of 32,768 tokens (four short ones, one per page stride, and ten long ones), each
         // at 4 plain and 6 speculative buckets.
-        assert_eq!(serving_graph_shapes(32768, 4096, 2051, 16, true).len(), 140);
-        assert_eq!(serving_graph_shapes(32768, 4096, 2051, 16, false).len(), 56);
+        assert_eq!(serving_graph_shapes(32768, 4096, 2051, 16, true, &buckets).len(), 140);
+        assert_eq!(serving_graph_shapes(32768, 4096, 2051, 16, false, &buckets).len(), 56);
     }
 
     #[test]
@@ -4144,15 +4342,16 @@ mod prefill_lane_tests {
         assert_eq!(super::decode_bucket(8, false), 8);
         assert_eq!(super::decode_bucket(9, false), 16);
         assert_eq!(super::decode_bucket(17, false), 32);
+        let buckets = super::DecodeBuckets::new(super::DECODE_ROWS);
         for sequences in [8, 16] {
-            let shapes = super::serving_graph_shapes(32768, 32768, 2051, sequences, true);
+            let shapes = super::serving_graph_shapes(32768, 32768, 2051, sequences, true, &buckets);
             assert_eq!(shapes.len() * 46, 6440);
-            let reserve = super::serving_graph_reserve(32768, 2_097_152, 2051, sequences, true, 45, true);
+            let reserve = super::serving_graph_reserve(32768, 2_097_152, 2051, sequences, true, 45, true, &buckets);
             assert_eq!(reserve, [1_198_944_016, super::graph_reserve_bytes(6300)]);
-            assert_eq!(super::serving_graph_shapes(32768, 32768, 2051, sequences, false).len() * 46, 2576);
+            assert_eq!(super::serving_graph_shapes(32768, 32768, 2051, sequences, false, &buckets).len() * 46, 2576);
         }
-        assert_eq!(super::serving_graph_shapes(32768, 32768, 2051, 32, true).len() * 46, 7084);
-        assert_eq!(super::serving_graph_shapes(32768, 32768, 2051, 64, true).len() * 46, 7728);
+        assert_eq!(super::serving_graph_shapes(32768, 32768, 2051, 32, true, &buckets).len() * 46, 7084);
+        assert_eq!(super::serving_graph_shapes(32768, 32768, 2051, 64, true, &buckets).len() * 46, 7728);
     }
 
     #[test]
@@ -4261,8 +4460,10 @@ mod prefill_lane_tests {
 
     #[test]
     fn the_workspace_arithmetic_uses_the_engine_geometry() {
-        use cuteafd_loader::serving_capacity::{GLMF_DECODE_ROWS, GLMF_HEAD_WORKSPACE, GLMF_SPARSE_TOPK};
+        use cuteafd_loader::serving_capacity::{GLMF_DECODE_ROWS, GLMF_HEAD_WORKSPACE, GLMF_SPARSE_TOPK,
+            GLMF_WIDE_DECODE_ROWS};
         assert_eq!(GLMF_DECODE_ROWS, super::DECODE_ROWS as u64);
+        assert_eq!(GLMF_WIDE_DECODE_ROWS, super::WIDE_DECODE_ROWS as u64);
         assert_eq!(GLMF_SPARSE_TOPK, super::SPARSE_TOPK as u64);
         assert_eq!(GLMF_HEAD_WORKSPACE, cuteafd_ffi::programs::VOCABULARY_HEAD_WORKSPACE as u64);
     }
@@ -4281,10 +4482,199 @@ mod prefill_lane_tests {
 }
 
 #[cfg(test)]
+mod wide_decode_tests {
+    use super::{commit_for, decode_cap, hand_out_remainder, is_decode, replay_bytes, replay_rows_of, verify_budget,
+        DecodeBuckets, KdaState, DECODE_ROWS, KEY_BYTES, WIDE_DECODE_ROWS};
+
+    /// Steps of up to 64 rows keep the `_m64` programs, their 64-row records and commits; wider steps
+    /// run the `_m128` programs, record 128 rows per layer and commit with the `_m128` commits.
+    #[test]
+    fn wide_steps_run_the_m128_programs_and_their_commits() {
+        assert_eq!([1, 16, 63, 64].map(decode_cap), ["m64"; 4]);
+        assert_eq!([65, 100, 127, 128].map(decode_cap), ["m128"; 4]);
+        assert!(is_decode("m64") && is_decode("m128") && !is_decode("m4096"));
+        assert_eq!((replay_rows_of("m64"), replay_rows_of("m128")), (DECODE_ROWS, WIDE_DECODE_ROWS));
+        for state in [KdaState::F32, KdaState::Bf16, KdaState::Bf16Tile] {
+            // Either capacity's KDA program is the state's own.
+            assert_eq!(state.program(decode_cap(100)), state.program("m64").replace("m64", "m128"));
+            for base in [state.commit_program(), state.compact_commit_program()] {
+                assert_eq!(commit_for(base, replay_rows_of(decode_cap(64))), base);
+                assert_eq!(commit_for(base, replay_rows_of(decode_cap(65))), format!("{base}_m128"));
+            }
+        }
+        assert_eq!(commit_for("kda_commit_c_s16", 128), "kda_commit_c_s16_m128");
+        // One layer's record over 64 KDA heads: 9,453,568 B at 64 rows, twice that at 128.
+        assert_eq!(replay_bytes(64, 3 * 64 * 128, 64), 9_453_568);
+        assert_eq!(replay_bytes(64, 3 * 64 * 128, 128), 2 * 9_453_568);
+    }
+
+    /// The engine's caches hold what the measured and planned admissions and the planner charge
+    /// (`glm_flash_rank_cache_geometry_rows`): `Caches::new`'s KDA records of every layer, the compact
+    /// index cache's key | gate records and the commit tables, at either decode rows; and the KDA records
+    /// alone (`glm_flash_kda_replay_bytes_rows`) where `--replay-records shared` places them.
+    #[test]
+    fn the_caches_hold_the_records_the_admissions_charge() {
+        use cuteafd_loader::families::glm5_flash::{GlmNextAttention, GlmNextConfig};
+        use cuteafd_loader::serving_capacity::{glm_flash_kda_replay_bytes_rows, glm_flash_rank_cache_geometry_rows,
+            GlmfIndexCache};
+        let cfg = GlmNextConfig { vocab_size: 154880, hidden: 4096, layers: 45,
+            attention: (0..45).map(|i| if i % 4 == 3 { GlmNextAttention::Mla } else { GlmNextAttention::Kda }).collect(),
+            dense: vec![false; 45], dense_intermediate: 12288, experts: 288, topk: 8, moe_intermediate: 2048,
+            routed_scale: 2.5, swiglu_limit: 10.0, rms_norm_eps: 1e-5, hc_mult: 4, kda_heads: 64, kda_head_dim: 128,
+            heads: 64, q_lora_rank: 1536, kv_lora_rank: 512, qk_nope_dim: 256, v_head_dim: 256, index_topk: 2048,
+            index_kpool: 4, eos: vec![] };
+        let (kda, mla) = (34, 11);
+        for rows in [DECODE_ROWS, WIDE_DECODE_ROWS] {
+            // Shared records: `StepPlan::new`'s and `Caches::new`'s region, what the measured admission and
+            // the planner take out of the state.
+            assert_eq!(glm_flash_kda_replay_bytes_rows(&cfg, 45, 1, rows as u64).unwrap(),
+                (kda * replay_bytes(64, 3 * 64 * 128, rows)) as u64);
+            for (index, compact) in [(GlmfIndexCache::Keys, false), (GlmfIndexCache::Compact, true)] {
+                let geometry = glm_flash_rank_cache_geometry_rows(&cfg, 45, 1, index, 4, rows as u64).unwrap();
+                let rank = &geometry.ranks[0];
+                let records = kda * replay_bytes(64, 3 * 64 * 128, rows) + if compact { mla * rows * KEY_BYTES } else { 0 };
+                assert_eq!(rank.speculative_replay_bytes, records as u64, "{rows} rows, {index:?}");
+                assert_eq!(rank.fixed_state_bytes, (3 * rows * 4) as u64);
+            }
+        }
+    }
+
+    /// The verify budget: the largest row count whose one-split wide sparse MLA (4 CTAs a row) fits
+    /// three waves of the GPU's SMs, at least 64; 64 decode rows keep 64.
+    #[test]
+    fn the_verify_budget_keeps_the_wide_sparse_mla_in_three_waves() {
+        assert_eq!(verify_budget(WIDE_DECODE_ROWS, 170), 127);
+        assert_eq!(verify_budget(WIDE_DECODE_ROWS, 188), 128);
+        assert_eq!(verify_budget(WIDE_DECODE_ROWS, 132), 99);
+        for sms in [86, 100, 132, 170, 188, 200] {
+            let rows = verify_budget(WIDE_DECODE_ROWS, sms);
+            assert!(4 * rows <= 3 * sms && (rows == WIDE_DECODE_ROWS || 4 * (rows + 1) > 3 * sms), "{sms} SMs");
+        }
+        // 85 SMs or fewer keep the 64-row programs' 64, and so does --decode-rows 64 on any GPU.
+        assert_eq!(verify_budget(WIDE_DECODE_ROWS, 84), DECODE_ROWS);
+        for sms in [48, 84, 170, 188] {
+            assert_eq!(verify_budget(DECODE_ROWS, sms), DECODE_ROWS);
+        }
+    }
+
+    /// The rows an even share of the budget leaves over go to the first sequences that can draft once
+    /// more: 127 rows at 16 sequences, 15 sequences draft 7 and one 6.
+    #[test]
+    fn the_remainder_goes_to_the_first_sequences_that_can_draft_again() {
+        let room_of = |rows: usize, sequences: usize| (rows / sequences).max(1) - 1;
+        let room = room_of(127, 16);
+        assert_eq!(room, 6);
+        let mut limits = vec![room; 16];
+        hand_out_remainder(&mut limits, room, 127, |_| true);
+        assert_eq!(limits.iter().filter(|&&limit| limit == 7).count(), 15);
+        assert_eq!(limits.iter().map(|limit| limit + 1).sum::<usize>(), 127);
+        // A sequence that cannot draft again (no speculation, too few tokens or too little capacity
+        // left) or was cut below the room keeps its limit; the next ones take the rows.
+        let mut limits = vec![room; 16];
+        limits[1] = 2;
+        hand_out_remainder(&mut limits, room, 127, |i| i > 2);
+        assert_eq!(&limits[..4], &[6, 2, 6, 7]);
+        assert!(limits.iter().map(|limit| limit + 1).sum::<usize>() <= 127);
+        // A share that leaves nothing over changes nothing: 64 or 128 rows at 16 sequences.
+        for rows in [64, 128] {
+            let room = room_of(rows, 16);
+            let mut limits = vec![room; 16];
+            hand_out_remainder(&mut limits, room, rows, |_| true);
+            assert_eq!(limits, vec![room; 16]);
+        }
+        let mut limits = vec![126];
+        hand_out_remainder(&mut limits, 126, 127, |_| true);
+        assert_eq!(limits, [126]);
+    }
+
+    /// The speculative buckets end at the verify budget; every step pads within its program capacity.
+    #[test]
+    fn wide_buckets_end_at_the_verify_budget() {
+        let wide = DecodeBuckets::new(127);
+        assert_eq!(wide.spec, [2, 4, 8, 16, 32, 64, 127]);
+        assert_eq!(wide.plain, [1, 4, 8, 16, 32, 64]);
+        assert_eq!(DecodeBuckets::new(128).spec.last(), Some(&128));
+        assert_eq!(DecodeBuckets::new(99).spec.last(), Some(&99));
+        for rows in 1..=127 {
+            let bucket = wide.bucket(rows, true);
+            assert!(bucket >= rows && bucket <= 127, "{rows}");
+            assert_eq!(decode_cap(bucket), decode_cap(rows), "{rows}");
+            if rows <= DECODE_ROWS {
+                assert_eq!(bucket, super::decode_bucket(rows, true));
+            }
+        }
+        assert_eq!([65, 100, 126, 127].map(|rows| wide.bucket(rows, true)), [127; 4]);
+        for rows in 1..=DECODE_ROWS {
+            assert_eq!(wide.bucket(rows, false), super::decode_bucket(rows, false));
+        }
+    }
+
+    /// The startup set grows by one speculative bucket per geometry: at 16 sequences and the 2,097,152-
+    /// token pool target, 50 -> 55 shapes at 8,192 tokens, 140 -> 154 at 32,768 and 270 -> 297 at
+    /// 131,072 (the geometries of the graph keys); at 8,192 tokens its reserve grows by 230 graphs
+    /// (40,422,684 B). Each added shape is the budget's bucket, keyed as its own shape by its capture's
+    /// padded tables.
+    #[test]
+    fn the_startup_set_grows_by_one_speculative_bucket_per_geometry() {
+        use super::{graph_reserve_bytes, serving_graph_reserve, serving_graph_shapes, startup_tables, GraphKey, PAGE_ROWS};
+        let pages = 2_097_152usize.div_ceil(PAGE_ROWS);
+        let (narrow, wide) = (DecodeBuckets::new(DECODE_ROWS), DecodeBuckets::new(127));
+        for (context, before, after) in [(8_192usize, 50usize, 55usize), (32_768, 140, 154), (131_072, 270, 297)] {
+            let narrow_shapes = serving_graph_shapes(context, pages, 2051, 16, true, &narrow);
+            let wide_shapes = serving_graph_shapes(context, pages, 2051, 16, true, &wide);
+            assert_eq!((narrow_shapes.len(), wide_shapes.len()), (before, after));
+            let added: Vec<_> = wide_shapes.iter().filter(|shape| !narrow_shapes.contains(shape)).copied().collect();
+            assert_eq!(added.len(), after - before);
+            for (rows, spec, geometry) in added {
+                assert_eq!((rows, spec), (127, true));
+                let tables = startup_tables(rows, spec, geometry);
+                assert_eq!(GraphKey::new(0, rows, &tables), GraphKey { segment: 0, rows, spec, long: geometry.long,
+                    pool_width: geometry.pool_width, page_stride: geometry.page_stride, pool_stride: geometry.pool_stride });
+            }
+            // The plain set is unchanged.
+            assert_eq!(serving_graph_shapes(context, pages, 2051, 16, false, &wide),
+                serving_graph_shapes(context, pages, 2051, 16, false, &narrow));
+        }
+        let reserve = |buckets: &DecodeBuckets| serving_graph_reserve(8_192, 2_097_152, 2051, 16, true, 45, false,
+            buckets)[0];
+        assert_eq!(reserve(&narrow), graph_reserve_bytes(50 * 46));
+        assert_eq!(reserve(&narrow), 471_335_704);
+        assert_eq!(reserve(&wide) - reserve(&narrow), 40_422_684);
+    }
+
+    /// A padded wide step (65, 100 or 126 -> 127 rows) keeps its real tables, masks the rest, runs the
+    /// router, wire and experts on its real rows only and then clears exactly `real..bucket` of the
+    /// decode workspace's `delta`, which holds 128 rows.
+    #[test]
+    fn padded_wide_steps_keep_padding_out_of_the_router_and_off_the_expert_wire() {
+        let buckets = DecodeBuckets::new(127);
+        for rows in [65usize, 100, 126] {
+            let bucket = buckets.bucket(rows, true);
+            assert_eq!(bucket, 127);
+            let mut tables = super::StepTables { decode: true, spec: true, real_rows: rows, page_stride: 8,
+                pool_stride: 2, positions: vec![17; rows], kv_slots: vec![19; rows], kda_slots: vec![2; rows],
+                seq_first: (0..rows as i32).collect(), pool_slots: vec![-1; rows], cache_lengths: vec![4; rows],
+                page_table: vec![3; rows * 8], pool_table: vec![1; rows * 2], ..Default::default() };
+            super::pad_decode_tables(&mut tables, bucket);
+            assert_eq!(&tables.positions[..rows], vec![17; rows]);
+            assert_eq!(&tables.kv_slots[..rows], vec![19; rows]);
+            assert!(tables.positions[rows..].iter().chain(&tables.kv_slots[rows..]).all(|&v| v == -1));
+            assert!(tables.kda_slots[rows..].iter().all(|&slot| slot == -1));
+            assert_eq!((tables.kv_slots.len(), tables.page_table.len(), tables.real_rows), (bucket, bucket * 8, rows));
+            let (mut ran, mut cleared) = (None, None);
+            crate::shared::decode_graph::real_row_moe(tables.real_rows, bucket, |real| { ran = Some(real); Ok(()) },
+                |tail| { cleared = Some(tail); Ok(()) }).unwrap();
+            assert_eq!((ran, cleared), (Some(rows), Some(rows..bucket)));
+            assert!(bucket <= WIDE_DECODE_ROWS && decode_cap(bucket) == "m128");
+        }
+    }
+}
+
+#[cfg(test)]
 mod graph_key_tests {
     use super::{check_bucket_thresholds, check_decode_thresholds, decode_bucket, decode_strides, glmf_table_pages,
         graph_geometries, graph_reserve_bytes, serving_graph_reserve, serving_graph_shapes, startup_tables,
-        GraphGeometry, GraphKey, StepTables, DECODE_PROJECTION_THRESHOLDS, DECODE_ROWS, MIN_PAGE_STRIDE,
+        DecodeBuckets, GraphGeometry, GraphKey, StepTables, DECODE_PROJECTION_THRESHOLDS, DECODE_ROWS, MIN_PAGE_STRIDE,
         PLAIN_DECODE_BUCKETS, SPEC_DECODE_BUCKETS, UNIT_PAGES, UNIT_ROWS};
     use std::collections::HashSet;
 
@@ -4366,6 +4756,8 @@ mod graph_key_tests {
     #[test]
     fn shorter_keys_shrink_the_startup_set_and_change_no_launch() {
         let dense = 2051;
+        // The 64-row bucket sets (`--decode-rows 64`).
+        let buckets = DecodeBuckets::new(DECODE_ROWS);
         // The reserve's pool target (2,097,152 tokens: 32,768 pages) at three contexts, then smaller
         // pools and short contexts, whose pool or table row caps the floors.
         for (context, pages, before_shapes, after_shapes) in [(8192usize, 32768usize, 230usize, 50usize),
@@ -4380,10 +4772,10 @@ mod graph_key_tests {
                 page_stride: g.page_stride.max(MIN_PAGE_STRIDE).min(pages).min(table_pages), pool_stride: 0,
                 long: false }).collect();
             assert_eq!((short.len(), &short), (after.len() - long(&after).len(), &collapsed), "{context}/{pages}");
-            let shapes = serving_graph_shapes(context, pages, dense, 16, true);
+            let shapes = serving_graph_shapes(context, pages, dense, 16, true, &buckets);
             assert_eq!((before.len() * 10, shapes.len()), (before_shapes, after_shapes), "{context}/{pages}");
             // Rows: per geometry, exactly the buckets `check_decode_thresholds` passes for 16 sequences.
-            check_decode_thresholds(16, true).unwrap();
+            check_decode_thresholds(&buckets, 16, true).unwrap();
             let plain: Vec<_> = PLAIN_DECODE_BUCKETS.into_iter()
                 .filter(|&rows| rows <= decode_bucket(16usize.clamp(16, DECODE_ROWS), false)).collect();
             for geometry in &after {
@@ -4410,7 +4802,7 @@ mod graph_key_tests {
         for (context, before, after) in [(8192, 1_926_552_328, 471_335_704), (32768, 3_300_923_584, 1_198_944_016),
             (131_072, 4_998_676_312u64, 2_249_933_800u64)] {
             assert_eq!(graph_reserve_bytes(full_keys(context, 32768, dense).len() * 10 * 46), before);
-            assert_eq!(serving_graph_reserve(context, 2_097_152, dense, 16, true, 45, false), [after]);
+            assert_eq!(serving_graph_reserve(context, 2_097_152, dense, 16, true, 45, false, &buckets), [after]);
         }
     }
 
@@ -4439,7 +4831,7 @@ mod graph_key_tests {
 
 #[cfg(test)]
 mod replay_record_tests {
-    use super::{replay_bytes, RecordGuard, ReplayRecords};
+    use super::{replay_bytes, RecordGuard, ReplayRecords, DECODE_ROWS, WIDE_DECODE_ROWS};
 
     #[test]
     fn shared_records_commit_only_what_no_prefill_overwrote() {
@@ -4473,11 +4865,14 @@ mod replay_record_tests {
 
     /// One KDA layer's records over a GPU's 64 KDA heads: 9,453,568 B; 34 layers 321,421,312 B,
     /// the loader's `glm_flash_kda_replay_bytes`, which the 4,096-row KDA prefill programs'
-    /// 782,236,672-byte scratch holds.
+    /// 782,236,672-byte scratch holds. With `--decode-rows 128` they hold 128 rows: 642,842,624 B
+    /// (`glm_flash_kda_replay_bytes_rows`), which the same scratch still holds.
     #[test]
     fn the_records_fit_the_prefill_scratch() {
-        assert_eq!(replay_bytes(64, 3 * 64 * 128), 9_453_568);
-        assert_eq!(34 * replay_bytes(64, 3 * 64 * 128), 321_421_312);
-        assert!(34 * replay_bytes(64, 3 * 64 * 128) < 782_236_672);
+        assert_eq!(replay_bytes(64, 3 * 64 * 128, DECODE_ROWS), 9_453_568);
+        assert_eq!(34 * replay_bytes(64, 3 * 64 * 128, DECODE_ROWS), 321_421_312);
+        assert!(34 * replay_bytes(64, 3 * 64 * 128, DECODE_ROWS) < 782_236_672);
+        assert_eq!(34 * replay_bytes(64, 3 * 64 * 128, WIDE_DECODE_ROWS), 642_842_624);
+        assert!(34 * replay_bytes(64, 3 * 64 * 128, WIDE_DECODE_ROWS) < 782_236_672);
     }
 }

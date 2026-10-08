@@ -13,10 +13,10 @@ mod deepseek;
 mod exl3_workspace;
 pub use exl3_workspace::exl3_workspace_bytes;
 mod glmf_workspace;
-pub use glmf_workspace::{glmf_lane_bytes, glmf_manifest_scratch, glmf_step_scratch, glmf_step_workspaces,
-    glmf_table_pages, glmf_temporary_bytes, GlmfKdaState, GlmfLaneBytes, GlmfMissingProgram, GlmfScratch, GlmfScratchOptions,
-    GlmfStepShape, GlmfStepWorkspaces, GlmfTemporaryBytes, GLMF_DECODE_ROWS, GLMF_DEFAULT_PREFILL_LANES, GLMF_HEAD_WORKSPACE,
-    GLMF_SPARSE_TOPK};
+pub use glmf_workspace::{glmf_lane_bytes, glmf_manifest_scratch, glmf_selector_bytes, glmf_step_scratch,
+    glmf_step_workspaces, glmf_table_pages, glmf_temporary_bytes, GlmfKdaState, GlmfLaneBytes, GlmfMissingProgram,
+    GlmfScratch, GlmfScratchOptions, GlmfStepShape, GlmfStepWorkspaces, GlmfTemporaryBytes, GLMF_DECODE_ROWS,
+    GLMF_DEFAULT_PREFILL_LANES, GLMF_HEAD_WORKSPACE, GLMF_SPARSE_TOPK, GLMF_WIDE_DECODE_ROWS};
 mod v4_workspace;
 pub use v4_workspace::{deepseek_v4_peer_exchange_bytes, deepseek_v4_workspace_geometry, deepseek_v4_workspace_scratch, V4WorkspaceRank, V4WorkspaceScratch};
 pub use deepseek::{deepseek_v41_cache_bytes, deepseek_v41_cache_geometry, deepseek_v41_pool_groups,
@@ -53,7 +53,7 @@ pub enum GlmfIndexCache {
     #[default]
     Keys,
     /// The pooled keys alone, plus per sequence and MLA layer a tail of at most three BF16
-    /// key | gate rows (`GLMF_INDEX_TAIL_BYTES`) and a speculative record of 64 rows.
+    /// key | gate rows (`GLMF_INDEX_TAIL_BYTES`) and a speculative record of the decode rows.
     Compact,
 }
 
@@ -78,6 +78,9 @@ pub struct CacheOptions {
     pub glmf_index: GlmfIndexCache,
     /// Bytes of one GLM Flash KDA recurrent-state element: 4 (FP32) or 2 (`--kda-state bf16`).
     pub kda_state_bytes: u64,
+    /// Rows of a GLM Flash decode or verify step (`--decode-rows`, 64 or 128): its speculative
+    /// replay records and commit tables hold this many rows.
+    pub glmf_decode_rows: u64,
 }
 
 impl Default for CacheOptions {
@@ -89,6 +92,7 @@ impl Default for CacheOptions {
             prefill_rows: 4096,
             glmf_index: GlmfIndexCache::Keys,
             kda_state_bytes: 4,
+            glmf_decode_rows: GLMF_DECODE_ROWS,
         }
     }
 }
@@ -278,7 +282,28 @@ pub fn glm_flash_rank_cache_geometry(
     index: GlmfIndexCache,
     state_bytes: u64,
 ) -> Result<FamilyCacheGeometry, CacheGeometryError> {
+    glm_flash_rank_cache_geometry_rows(cfg, layers, ranks, index, state_bytes, GLMF_DECODE_ROWS)
+}
+
+/// [`glm_flash_rank_cache_geometry`] for decode and verify steps of up to `decode_rows` rows
+/// (`--decode-rows`: the 64-row programs' 64, or 128 with the wide `_m128` programs): every KDA
+/// layer's speculative replay record, the compact index cache's key | gate records and the commit
+/// tables hold that many rows. Units, state and marks do not depend on it.
+pub fn glm_flash_rank_cache_geometry_rows(
+    cfg: &GlmNextConfig,
+    layers: usize,
+    ranks: usize,
+    index: GlmfIndexCache,
+    state_bytes: u64,
+    decode_rows: u64,
+) -> Result<FamilyCacheGeometry, CacheGeometryError> {
     selected("glm5_flash", cfg.layers, layers)?;
+    if ![GLMF_DECODE_ROWS, GLMF_WIDE_DECODE_ROWS].contains(&decode_rows) {
+        return Err(CacheGeometryError::Unsupported {
+            family: "glm5_flash",
+            what: "decode rows other than the programs' 64 or 128",
+        });
+    }
     if ![1, 2].contains(&ranks)
         || ![2, 4].contains(&state_bytes)
         || cfg.kv_lora_rank != 512
@@ -318,10 +343,10 @@ pub fn glm_flash_rank_cache_geometry(
         &[
             product(
                 "KDA recurrent replay",
-                &[64, (cfg.kda_heads / ranks) as u64, 3, 128, 4],
+                &[decode_rows, (cfg.kda_heads / ranks) as u64, 3, 128, 4],
             )?,
-            product("KDA beta replay", &[64, (cfg.kda_heads / ranks) as u64, 4])?,
-            product("KDA conv replay", &[64, 3, channels, 2])?,
+            product("KDA beta replay", &[decode_rows, (cfg.kda_heads / ranks) as u64, 4])?,
+            product("KDA conv replay", &[decode_rows, 3, channels, 2])?,
         ],
     )?;
     let compact = index == GlmfIndexCache::Compact;
@@ -338,9 +363,9 @@ pub fn glm_flash_rank_cache_geometry(
     } else {
         sum("GLM Flash MLA unit", &[256 * (528 + 512), 64 * 132])?
     };
-    // Compact: each sequence's index tails, and a 64-row key | gate record per MLA layer.
+    // Compact: each sequence's index tails, and a key | gate record of the decode rows per MLA layer.
     let tails = if compact { product("GLM Flash index tails", &[mla, GLMF_INDEX_TAIL_BYTES])? } else { 0 };
-    let index_replay = if compact { product("GLM Flash index replay", &[mla, 64, 512])? } else { 0 };
+    let index_replay = if compact { product("GLM Flash index replay", &[mla, decode_rows, 512])? } else { 0 };
     let kda_state = product("GLM Flash active KDA", &[kda, state])?;
     Ok(FamilyCacheGeometry {
         logical_unit_rows: 256,
@@ -352,7 +377,8 @@ pub fn glm_flash_rank_cache_geometry(
             retained_mark_bytes: sum("GLM Flash mark", &[kda_state, tails])?,
             speculative_replay_bytes: sum("GLM Flash replay",
                 &[product("GLM Flash KDA replay", &[kda, replay])?, index_replay])?,
-            fixed_state_bytes: 3 * 64 * 4,
+            // The commit tables: slot, first row and kept rows of up to `decode_rows` sequences.
+            fixed_state_bytes: product("GLM Flash commit tables", &[3, decode_rows, 4])?,
             context_table_bytes_per_token: 0,
         }; ranks],
     })
@@ -365,7 +391,21 @@ pub fn glm_flash_rank_cache_geometry(
 /// scratch with `--replay-records shared`.
 pub fn glm_flash_kda_replay_bytes(cfg: &GlmNextConfig, layers: usize, ranks: usize)
     -> Result<u64, CacheGeometryError> {
+    glm_flash_kda_replay_bytes_rows(cfg, layers, ranks, GLMF_DECODE_ROWS)
+}
+
+/// [`glm_flash_kda_replay_bytes`] for decode and verify steps of up to `decode_rows` rows
+/// (`--decode-rows`, 64 or 128): every KDA layer's record holds that many rows, as
+/// [`glm_flash_rank_cache_geometry_rows`]'s do.
+pub fn glm_flash_kda_replay_bytes_rows(cfg: &GlmNextConfig, layers: usize, ranks: usize, decode_rows: u64)
+    -> Result<u64, CacheGeometryError> {
     selected("glm5_flash", cfg.layers, layers)?;
+    if ![GLMF_DECODE_ROWS, GLMF_WIDE_DECODE_ROWS].contains(&decode_rows) {
+        return Err(CacheGeometryError::Unsupported {
+            family: "glm5_flash",
+            what: "decode rows other than the programs' 64 or 128",
+        });
+    }
     if ![1, 2].contains(&ranks) || cfg.kda_heads % ranks != 0 || cfg.attention.len() != cfg.layers {
         return Err(CacheGeometryError::Unsupported { family: "glm5_flash", what: "KDA replay geometry" });
     }
@@ -373,9 +413,9 @@ pub fn glm_flash_kda_replay_bytes(cfg: &GlmNextConfig, layers: usize, ranks: usi
     let heads = (cfg.kda_heads / ranks) as u64;
     let channels = product("KDA channels", &[heads, cfg.kda_head_dim as u64])?;
     let replay = sum("KDA replay", &[
-        product("KDA recurrent replay", &[64, heads, 3, 128, 4])?,
-        product("KDA beta replay", &[64, heads, 4])?,
-        product("KDA conv replay", &[64, 3, channels, 2])?,
+        product("KDA recurrent replay", &[decode_rows, heads, 3, 128, 4])?,
+        product("KDA beta replay", &[decode_rows, heads, 4])?,
+        product("KDA conv replay", &[decode_rows, 3, channels, 2])?,
     ])?;
     product("GLM Flash KDA replay", &[kda, replay])
 }
@@ -735,6 +775,57 @@ mod tests {
         assert_eq!(c.speculative_replay_bytes - k.speculative_replay_bytes, 11 * 64 * 512);
         assert_eq!(c.fixed_state_bytes, k.fixed_state_bytes);
         assert!(glm_flash_rank_cache_geometry(&cfg, 45, 2, GlmfIndexCache::Compact, 4).is_err());
+    }
+
+    /// `--decode-rows 128`: every KDA layer's replay record (9,453,568 B at 64 rows over 64 heads),
+    /// the compact index cache's key | gate records and the commit tables double; units, state and
+    /// marks do not move. 64 rows is the default geometry exactly.
+    #[test]
+    fn flash_wide_decode_rows_double_the_replay_records() {
+        let mut config = glm5_flash_config(45);
+        config["text_config"]["layer_types"] = json!((0..45)
+            .map(|i| if i % 4 == 3 { "deepseek_sparse_attention" } else { "linear_attention" })
+            .collect::<Vec<_>>());
+        let cfg = GlmNextConfig::from_hf(&config).unwrap();
+        for (index, state) in [(GlmfIndexCache::Keys, 4), (GlmfIndexCache::Compact, 4), (GlmfIndexCache::Keys, 2)] {
+            let narrow = glm_flash_rank_cache_geometry(&cfg, 45, 1, index, state).unwrap();
+            assert_eq!(glm_flash_rank_cache_geometry_rows(&cfg, 45, 1, index, state, GLMF_DECODE_ROWS).unwrap(), narrow);
+            let wide = glm_flash_rank_cache_geometry_rows(&cfg, 45, 1, index, state, GLMF_WIDE_DECODE_ROWS).unwrap();
+            let (n, w) = (&narrow.ranks[0], &wide.ranks[0]);
+            assert_eq!((w.persistent_unit_bytes, w.pool_metadata_unit_bytes, w.active_state_per_sequence_bytes,
+                w.retained_mark_bytes), (n.persistent_unit_bytes, n.pool_metadata_unit_bytes,
+                n.active_state_per_sequence_bytes, n.retained_mark_bytes));
+            let index_records = if index == GlmfIndexCache::Compact { 11 * 64 * 512 } else { 0 };
+            assert_eq!(n.speculative_replay_bytes, 34 * 9_453_568 + index_records);
+            assert_eq!(w.speculative_replay_bytes, 2 * n.speculative_replay_bytes);
+            assert_eq!((n.fixed_state_bytes, w.fixed_state_bytes), (3 * 64 * 4, 3 * 128 * 4));
+        }
+        // The 5090 arithmetic: +321,421,312 B of KDA records, +360,448 B of compact index records, +768 B
+        // of commit tables.
+        let keys = |rows| glm_flash_rank_cache_geometry_rows(&cfg, 45, 1, GlmfIndexCache::Keys, 4, rows).unwrap();
+        let compact = |rows| glm_flash_rank_cache_geometry_rows(&cfg, 45, 1, GlmfIndexCache::Compact, 4, rows).unwrap();
+        assert_eq!(keys(128).ranks[0].speculative_replay_bytes - keys(64).ranks[0].speculative_replay_bytes, 321_421_312);
+        assert_eq!(compact(128).ranks[0].speculative_replay_bytes - compact(64).ranks[0].speculative_replay_bytes,
+            321_421_312 + 360_448);
+        assert_eq!(keys(128).ranks[0].fixed_state_bytes - keys(64).ranks[0].fixed_state_bytes, 768);
+        // The KDA records alone (what `--replay-records shared` places in the prefill scratch) hold the
+        // same rows: the geometry's records less the compact index's, 34 x 18,907,136 B at 128 rows.
+        for (rows, bytes) in [(GLMF_DECODE_ROWS, 321_421_312u64), (GLMF_WIDE_DECODE_ROWS, 642_842_624)] {
+            assert_eq!(glm_flash_kda_replay_bytes_rows(&cfg, 45, 1, rows).unwrap(), bytes);
+            assert_eq!(keys(rows).ranks[0].speculative_replay_bytes, bytes);
+            assert_eq!(compact(rows).ranks[0].speculative_replay_bytes, bytes + 11 * rows * 512);
+        }
+        assert_eq!(glm_flash_kda_replay_bytes(&cfg, 45, 1).unwrap(),
+            glm_flash_kda_replay_bytes_rows(&cfg, 45, 1, GLMF_DECODE_ROWS).unwrap());
+        // Only the programs' row counts.
+        for rows in [0, 32, 65, 127, 256] {
+            assert!(glm_flash_rank_cache_geometry_rows(&cfg, 45, 1, GlmfIndexCache::Keys, 4, rows).is_err(), "{rows}");
+            assert!(glm_flash_kda_replay_bytes_rows(&cfg, 45, 1, rows).is_err(), "{rows}");
+        }
+        // The family model passes the option through.
+        let wide = CacheOptions { glmf_decode_rows: GLMF_WIDE_DECODE_ROWS, ..Default::default() };
+        assert_eq!(CacheOptions::default().glmf_decode_rows, GLMF_DECODE_ROWS);
+        assert_eq!(wide.glmf_decode_rows, 128);
     }
 
     #[test]

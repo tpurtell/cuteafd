@@ -981,7 +981,7 @@ fn glm5_flash_layout_charges_the_engine_step_workspaces_and_headroom() {
         // What the engine allocates from the same arithmetic and manifest.
         let shape = GlmfStepShape { lead: true, split: false, local_experts: false, spark: true, partial_bytes: 2,
             output_shard: false, full_prefill_logits: false, table_pages: 2048, table_pool_pages: 512 };
-        let engine = glmf_step_workspaces(&cfg, lanes as usize, rows, &shape,
+        let engine = glmf_step_workspaces(&cfg, lanes as usize, rows, 64, &shape,
             glmf_step_scratch(&lookup, &cfg, Default::default(), 64, true).unwrap(),
             glmf_step_scratch(&lookup, &cfg, Default::default(), rows, false).unwrap()).device_bytes();
         let steps = gpu.items.iter().find(|i| i.category == Category::Workspace && i.group == "steps").unwrap();
@@ -1005,6 +1005,106 @@ fn glm5_flash_layout_charges_the_engine_step_workspaces_and_headroom() {
     let graphs: Vec<_> = gpu.items.iter().filter(|i| i.group.starts_with("graph")).map(|i| (i.group.as_str(), i.bytes))
         .collect();
     assert_eq!(graphs, [("graph budget", 512 << 20)]);
+}
+
+/// `--decode-rows 128` in the planner charges what the engine allocates for it: the decode workspace of
+/// 128 rows over both program sets' scratch (planned = allocated, from the same arithmetic and
+/// manifest), the wide token selector and sampler, and the speculative replay records and commit tables
+/// of 128 rows (with `--replay-records shared`, the KDA records of 128 rows in the prefill scratch). A
+/// manifest without the wide programs, or a head split, is refused.
+#[test]
+fn glm5_flash_layout_charges_the_wide_decode_rows() {
+    use crate::families::glm5_flash::GlmNextConfig;
+    use crate::serving_capacity::{glm_flash_kda_replay_bytes_rows, glm_flash_rank_cache_geometry_rows,
+        glmf_manifest_scratch, glmf_selector_bytes, glmf_step_scratch, glmf_step_workspaces, GlmfIndexCache,
+        GlmfStepShape};
+    use cuteafd_core::memory_layout::{Basis, Category};
+    let mut config = glm5_flash_config(2);
+    config["text_config"]["vocab_size"] = 154_880.into();
+    let dir = snapshot(config.clone(), &[t("model.language_model.layers.0.self_attn.A_log", "F32", &[64])]);
+    let base: Vec<(&str, u64)> = vec![("glmf_mhc_pre", 26_214_400u64), ("glmf_index_producer_m64", 561_152),
+        ("glmf_index_topk_decode_m64", 8_653_824), ("glmf_mhc_post_pre_m64", 409_600), ("glmf_kda_m64", 10_526_720),
+        ("glmf_mla_producer_m64", 2_359_296), ("glmf_o_m64", 2_097_152), ("glmf_sparse_mla_decode_m64", 8_404_992),
+        ("glmf_ffn_i2048_m64", 786_432), ("glmf_ffn_i12288_m64", 4_718_592), ("glmf_index_producer_m4096", 35_913_728),
+        ("glmf_index_topk_prefill_m4096", 558_007_296), ("glmf_mhc_post_pre_m4096", 26_214_400),
+        ("glmf_kda_m4096", 782_236_672), ("glmf_mla_producer_m4096", 168_296_448), ("glmf_o_m4096", 203_423_744),
+        ("glmf_sparse_mla_prefill_m4096", 1_048_576), ("glmf_ffn_i2048_m4096", 67_633_152),
+        ("glmf_ffn_i12288_m4096", 353_894_400)];
+    // The offline SM 12.0 export of the 16 wide programs (170 SMs, the sparse MLA at one split).
+    let wide = [("glmf_index_producer_m128", 1_122_304u64), ("glmf_index_topk_decode_m128", 17_304_576),
+        ("glmf_mhc_post_pre_m128", 819_200), ("glmf_kda_m128", 21_053_440), ("glmf_mla_producer_m128", 4_718_592),
+        ("glmf_o_m128", 4_194_304), ("glmf_sparse_mla_decode_m128", 16_809_984), ("glmf_ffn_i2048_m128", 1_572_864),
+        ("glmf_ffn_i12288_m128", 9_437_184)];
+    let write = |name: &str, programs: &[(&str, u64)]| {
+        let programs: Vec<Value> = programs.iter().map(|(name, bytes)|
+            json!({"name": name, "scratch_bytes_at_capacity": {"scratch": bytes}})).collect();
+        let manifest = json!({"capacities": {"decode_rows": 64, "prefill_rows": 4096, "max_context": 131_072},
+            "programs": programs});
+        let path = dir.path().join(name);
+        std::fs::write(&path, manifest.to_string()).unwrap();
+        (path, manifest)
+    };
+    let (narrow_path, _) = write("narrow.json", &base);
+    let (wide_path, manifest) = write("wide.json", &[base.clone(), wide.to_vec()].concat());
+    let cfg = GlmNextConfig::from_hf(&config).unwrap();
+    let lookup = glmf_manifest_scratch(&manifest);
+    let options = |decode_rows: u64, path: &std::path::Path, gpus: usize| PlanOptions { layout: Some(layout::LayoutOptions {
+        rtx_bytes: vec![32 << 30; gpus], context_tokens: 131_072, workspace_manifest: Some(path.to_path_buf()),
+        glmf_decode_rows: decode_rows, ..Default::default() }), ..sparks(4) };
+    let item = |report: &PlanReport, group: &str| report.memory_layout.as_ref().unwrap().devices[0].items
+        .iter().find(|i| i.group == group).map(|i| (i.category, i.bytes, i.basis));
+    let refused = |report: &PlanReport, why: &str| report.memory_layout.as_ref().unwrap().notes.iter()
+        .any(|note| note.contains(why));
+    let (wide_build, one_gpu) = ("CUTEAFD_GLMF_WIDE_DECODE_ROWS=128", "a head split takes --decode-rows 64");
+    let shape = GlmfStepShape { lead: true, split: false, local_experts: false, spark: true, partial_bytes: 2,
+        output_shard: false, full_prefill_logits: false, table_pages: 2048, table_pool_pages: 512 };
+    let intake = 2 * 4 * 4096 * 4096 * 2;
+    let narrow = plan(dir.path(), &options(64, &wide_path, 1)).unwrap();
+    let broad = plan(dir.path(), &options(128, &wide_path, 1)).unwrap();
+    assert_eq!(broad.placement_supported, narrow.placement_supported);
+    assert!(!refused(&broad, wide_build) && !refused(&broad, one_gpu));
+    for (report, rows) in [(&narrow, 64u64), (&broad, 128)] {
+        // What the engine allocates from the same arithmetic and manifest.
+        let engine = glmf_step_workspaces(&cfg, 2, 4096, rows, &shape,
+            glmf_step_scratch(&lookup, &cfg, Default::default(), rows, true).unwrap(),
+            glmf_step_scratch(&lookup, &cfg, Default::default(), 4096, false).unwrap()).device_bytes();
+        assert_eq!(item(report, "steps"), Some((Category::Workspace, engine + intake, Basis::Formula)), "{rows} rows");
+        // The engine's caches: 2 layers (one KDA, one MLA) of records and commit tables of `rows` rows.
+        let geometry = glm_flash_rank_cache_geometry_rows(&cfg, 2, 1, GlmfIndexCache::Keys, 4, rows).unwrap();
+        let rank = &geometry.ranks[0];
+        assert_eq!(item(report, "state").map(|(_, bytes, _)| bytes), Some(rank.fixed_state_bytes
+            + rank.active_state_per_sequence_bytes * (8 + 2) + rank.speculative_replay_bytes));
+    }
+    // 128 rows: +64,606,464 B of decode workspace, the wide selector, one KDA layer's 64 more record rows.
+    let steps = |report| item(report, "steps").unwrap().1;
+    assert_eq!(steps(&broad) - steps(&narrow), 64_606_464);
+    assert_eq!(item(&narrow, "wide decode selector"), None);
+    assert_eq!(item(&broad, "wide decode selector"),
+        Some((Category::Workspace, glmf_selector_bytes(128, 154_880) - glmf_selector_bytes(64, 154_880), Basis::Formula)));
+    assert_eq!(item(&broad, "wide decode selector").unwrap().1, 3_209_984);
+    let state = |report| item(report, "state").unwrap().1;
+    assert_eq!(state(&broad) - state(&narrow), 9_453_568 + 768);
+    // A build without the wide programs, and a head split, cannot run 128 rows.
+    let missing = plan(dir.path(), &options(128, &narrow_path, 1)).unwrap();
+    assert!(!missing.placement_supported && refused(&missing, wide_build));
+    assert!(!refused(&plan(dir.path(), &options(64, &narrow_path, 1)).unwrap(), wide_build));
+    let split = plan(dir.path(), &options(128, &wide_path, 2)).unwrap();
+    assert!(!split.placement_supported && refused(&split, one_gpu));
+    assert!(!refused(&plan(dir.path(), &options(64, &wide_path, 2)).unwrap(), one_gpu));
+    // Shared replay records at either row count: the state sheds the KDA layer's records of those rows
+    // (18,907,136 B at 128), which the 782,236,672-byte prefill scratch holds without growing.
+    let shared = |rows: u64| {
+        let mut shared = options(rows, &wide_path, 1);
+        shared.layout.as_mut().unwrap().glmf_shared_replay = true;
+        plan(dir.path(), &shared).unwrap()
+    };
+    let (narrow_shared, broad_shared) = (shared(64), shared(128));
+    for (report, shared, rows) in [(&narrow, &narrow_shared, 64u64), (&broad, &broad_shared, 128)] {
+        let records = glm_flash_kda_replay_bytes_rows(&cfg, 2, 1, rows).unwrap();
+        assert_eq!(records, rows / 64 * 9_453_568);
+        assert_eq!(state(report) - state(shared), records, "{rows} rows");
+        assert_eq!(steps(shared), steps(report), "{rows} rows");
+    }
 }
 
 #[test]

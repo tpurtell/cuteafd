@@ -516,14 +516,14 @@ impl FamilyModel for GlmModel {
 
     fn cache_geometry(&self, options: crate::serving_capacity::CacheOptions)
         -> Result<Option<crate::serving_capacity::FamilyCacheGeometry>, crate::serving_capacity::CacheGeometryError> {
-        use crate::serving_capacity::{glm_cache_geometry, glm_flash_rank_cache_geometry, CacheGeometryError};
+        use crate::serving_capacity::{glm_cache_geometry, glm_flash_rank_cache_geometry_rows, CacheGeometryError};
         if options.native_mtp_layers > 0 {
             return Err(CacheGeometryError::Unsupported { family: self.id, what: "native MTP is not executed; reserve DFlash separately" });
         }
         match &self.cache_cfg {
             GlmCacheConfig::Dsa(cfg) => glm_cache_geometry(cfg, cfg.layers, options.coordinator_ranks).map(Some),
-            GlmCacheConfig::Flash(cfg) => glm_flash_rank_cache_geometry(cfg, cfg.layers, options.coordinator_ranks,
-                options.glmf_index, options.kda_state_bytes).map(Some),
+            GlmCacheConfig::Flash(cfg) => glm_flash_rank_cache_geometry_rows(cfg, cfg.layers, options.coordinator_ranks,
+                options.glmf_index, options.kda_state_bytes, options.glmf_decode_rows).map(Some),
         }
     }
 
