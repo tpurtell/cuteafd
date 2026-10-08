@@ -9,6 +9,7 @@ import argparse
 import base64
 import concurrent.futures
 import hashlib
+import importlib.util
 import json
 import math
 from pathlib import Path
@@ -99,7 +100,77 @@ def image_body(index, budget=16):
     ]}], 'thinking': {'type': 'disabled'}, 'temperature': 0, 'max_tokens': budget}
 
 
+def strip_ansi(logs):
+    return re.sub(r'\x1b\[[0-9;]*m', '', logs)
+
+
+def completed_prefill_wave(logs):
+    return next((line for line in strip_ansi(logs).splitlines()
+                 if 'V4.1 prefill wave drained' in line and 'complete=false' in line), None)
+
+
+def lifecycle(url, container, tokenizer_path, api_key, require_wave=False):
+    spec = importlib.util.spec_from_file_location('native_api',
+        Path(__file__).resolve().parents[2] / 'qualify-ds41-native-api.py')
+    api = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(api)
+    from tokenizers import Tokenizer
+    tokenizer = Tokenizer.from_file(str(tokenizer_path))
+    ids = tokenizer.encode(Path(__file__).read_text() * 64, add_special_tokens=False).ids
+    long = api.payload('Lifecycle canceled prefill. ' +
+        tokenizer.decode(ids[:8000], skip_special_tokens=False), True)
+    long['max_tokens'] = 512
+    ready = [threading.Event() for _ in range(4)]
+    with concurrent.futures.ThreadPoolExecutor(4) as pool:
+        streams = [pool.submit(stream, url, text_body(i, 512, 'lifecycle-fixed'),
+                               ready[i].set, api_key) for i in range(4)]
+        deadline = time.monotonic() + 120
+        for signal in ready:
+            assert signal.wait(max(0, deadline - time.monotonic())), 'lifecycle streams not ready'
+        started = time.monotonic()
+        cancel_started_wall = time.time()
+        cancel_wave = None
+        with api.open_request(url, long, api_key=api_key):
+            cutoff = time.monotonic() + 5
+            while time.monotonic() < cutoff:
+                logs = subprocess.check_output(['docker', 'logs', '--since',
+                    f'{cancel_started_wall:.9f}', container], stderr=subprocess.STDOUT,
+                    text=True, timeout=10)
+                cancel_wave = completed_prefill_wave(logs)
+                if cancel_wave is not None:
+                    break
+                time.sleep(0.025)
+        closed = time.monotonic()
+        closed_wall = time.time()
+        results = [future.result(timeout=180) for future in streams]
+    assert all(r['stamps'] and r['finished'] >= closed_wall for r in results), \
+        'peer streams did not survive cancellation'
+    simple = api.payload('What is 2 + 2? Answer with just the number.')
+    with api.open_request(url, simple, api_key=api_key) as response:
+        recovery = json.load(response)
+    assert recovery['choices'][0]['message']['content'].strip() == '4'
+    continued = api.payload('Lifecycle prefix fixed. Write a complete Python AVL tree with insertion and deletion.', True)
+    first = api.stream_case(url, continued, api_key=api_key)
+    again = api.stream_case(url, continued, api_key=api_key)
+    assert again['usage']['prompt_cache_hit_tokens'] == again['usage']['prompt_tokens'], again['usage']
+    continued['messages'].append({'role': 'assistant', 'content': first['text']})
+    continued['messages'].append({'role': 'user', 'content': 'Add a validation method. Output code only.'})
+    turn = api.stream_case(url, continued, api_key=api_key)
+    assert turn['text'] and turn['usage']['prompt_cache_hit_tokens'] > 0, turn['usage']
+    logs = strip_ansi(subprocess.check_output(['docker', 'logs', '--since',
+        f'{cancel_started_wall:.9f}', container], stderr=subprocess.STDOUT, text=True, timeout=10))
+    waves = [line for line in logs.splitlines() if completed_prefill_wave(line)]
+    observed = cancel_wave is not None
+    return {'cancel_before_first_delta_s': closed - started, 'surviving_streams': results,
+            'canceled_prefill_completed_wave_observed': observed,
+            'wave_observed_before_close': cancel_wave, 'completed_wave_rows': waves,
+            'post_cancel_recovery': recovery, 'prefix_first': first, 'prefix_restore': again,
+            'prefix_continuation': turn, 'passed': observed or not require_wave,
+            'scope': 'cancel before first delta; four peers survive; restore and continuation use retained prefix'}
+
+
 def encoder_windows(logs, start, end):
+    logs = strip_ansi(logs)
     windows = []
     prefill = []
     for line in logs.splitlines():
@@ -128,8 +199,12 @@ def main():
     parser.add_argument('--container', required=True)
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--api-key-file', type=Path, help='Read bearer key without putting it in argv or evidence')
-    parser.add_argument('--case', choices=['text', 'images'], required=True)
+    parser.add_argument('--case', choices=['text', 'images', 'lifecycle'], required=True)
+    parser.add_argument('--require-completed-wave', action='store_true',
+                        help='Fail lifecycle qualification unless cancellation follows a drained shared wave')
     parser.add_argument('--tokenizer', type=Path)
+    parser.add_argument('--context-file', type=Path,
+                        help='Freeze the 8K text source across benchmark revisions')
     parser.add_argument('--budget', type=int, default=2048)
     parser.add_argument('--concurrency', type=int, choices=[1, 4], default=4)
     parser.add_argument('--warm', action='store_true')
@@ -137,6 +212,16 @@ def main():
                         help='Use the same label across arms and a fresh label for each measured case')
     args = parser.parse_args()
     api_key = args.api_key_file.read_text().strip() if args.api_key_file else None
+    if args.case == 'lifecycle':
+        if args.tokenizer is None:
+            parser.error('--tokenizer required for lifecycle qualification')
+        report = lifecycle(args.url, args.container, args.tokenizer, api_key,
+                           require_wave=args.require_completed_wave)
+        args.output.write_text(json.dumps(report, indent=2) + '\n')
+        print(json.dumps({'passed': report['passed'],
+                          'completed_wave_observed': report['canceled_prefill_completed_wave_observed']}), flush=True)
+        assert report['passed'], 'cancellation did not follow a completed shared wave'
+        return
     def request(body, notify=None):
         return stream(args.url, body, notify, api_key=api_key)
     injected = [image_body(i) for i in range(4)]
@@ -145,7 +230,7 @@ def main():
             parser.error('--tokenizer required for an 8K text prompt')
         from tokenizers import Tokenizer
         tokenizer = Tokenizer.from_file(str(args.tokenizer))
-        context = Path(__file__).read_text() * 64
+        context = (args.context_file or Path(__file__)).read_text() * 64
         ids = tokenizer.encode(context, add_special_tokens=False).ids
         assert len(ids) >= 8000
         injected = [{'model': MODEL, 'messages': [{'role': 'user', 'content':
@@ -182,7 +267,7 @@ def main():
         texts = [future.result() for future in decoding]
     logs = subprocess.check_output(['docker', 'logs', '--since', f'{start:.9f}', args.container],
                                    stderr=subprocess.STDOUT, text=True)
-    logs = re.sub(r'\x1b\[[0-9;]*m', '', logs)
+    logs = strip_ansi(logs)
     windows = encoder_windows(logs, start, end) if args.case == 'images' else []
     if args.case == 'images':
         assert len(windows) == 4, windows

@@ -26,6 +26,18 @@ def test_encode_window_ends_before_any_lm_prefill():
     assert windows[0]['end'] == 1.1
 
 
+def test_styled_logs_preserve_completed_wave_and_encoder_cutoff():
+    wave = 'V4.1 prefill wave drained \x1b[3mrequest_id\x1b[0m=7 \x1b[3mcomplete\x1b[0m=\x1b[32mfalse\x1b[0m'
+    assert BENCH.completed_prefill_wave(wave) == 'V4.1 prefill wave drained request_id=7 complete=false'
+    assert BENCH.completed_prefill_wave(wave.replace('false', 'true')) is None
+    assert BENCH.completed_prefill_wave('V4.1 prefill wave starts complete=false') is None
+    logs = '\n'.join([
+        'V4.1 asynchronous image encoder roundtrip started_unix_ms=1000 finished_unix_ms=1300',
+        'V4.1 prefill wave starts \x1b[3mstarted_unix_ms\x1b[0m=\x1b[32m1100\x1b[0m',
+    ])
+    assert BENCH.encoder_windows(logs, 0.9, 1.5)[0]['end'] == 1.1
+
+
 def test_empty_encode_window_is_not_reported_as_zero_latency():
     assert BENCH.summarize([]) == {'max_ms': None, 'p99_ms': None, 'count': 0}
     assert BENCH.percentile(list(range(100))) == 98
