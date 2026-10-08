@@ -19,6 +19,13 @@ struct Prefilling<'a, S> {
     slot: usize,
     request: Active<'a>,
     progress: PrefillProgress<S>,
+    last_decode_steps: Option<u64>,
+}
+
+static COMMITTED_DECODE_STEPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn committed_decode_steps() -> u64 {
+    COMMITTED_DECODE_STEPS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 fn admission_lane(loads: [usize; 2]) -> usize {
@@ -513,6 +520,7 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
                     prompt_usage: PromptUsage { prompt_tokens: prompt.len(), prompt_cache_hit_tokens: cached },
                 }))?;
                 crate::shared::probe::admitted(&job.probe, "deepseek_v41", &prompt, cached);
+                if let Some(probe) = &job.probe { probe.prefill_policy(args.decode_share); }
                 console::totals::admitted(prompt.len(), cached);
                 counted = true;
                 if let Some(from) = crate::shared::probe::scoring(&job.probe) {
@@ -559,7 +567,8 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
             })();
             match result {
                 Ok((request, true)) => {
-                    prefills.push(Prefilling { slot, request, progress: PrefillProgress::default() });
+                    if let Some(probe) = &request.job.probe { probe.prefill_parked(); }
+                    prefills.push(Prefilling { slot, request, progress: PrefillProgress::default(), last_decode_steps: None });
                     loads[lane] += 1;
                 }
                 Ok((mut request, false)) => {
@@ -596,11 +605,18 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
             let finished = prefills.round(|p| {
                 P::begin_request(first_transport)?; P::begin_request(second_transport)?;
                 let r = &mut p.request;
-                super::prefill_wave_started(Some(r.id), args.prefill_batch_tokens as usize);
                 let wave_started = Instant::now();
+                let decode_steps = committed_decode_steps();
                 let scores = p.progress.step(lib, runtime, first, second, requests,
                     [first_transport, second_transport], r.lease, &r.tokens, args.prefill_batch_tokens as usize,
                     &r.job, draft.as_deref_mut(), &mut || prefixes.prefill_hold())?;
+                if let Some(probe) = &r.job.probe {
+                    if let Some(previous) = p.last_decode_steps {
+                        probe.prefill_resumed(decode_steps.saturating_sub(previous));
+                    }
+                    if scores.is_none() { probe.prefill_parked(); }
+                }
+                p.last_decode_steps = Some(decode_steps);
                 tracing::info!(request_id=r.id, wave_ms=wave_started.elapsed().as_secs_f64()*1000.0,
                     complete=scores.is_some(), "V4.1 prefill wave drained");
                 let Some(scores) = scores else { return Ok(Chunk::More); };
@@ -2025,6 +2041,9 @@ fn publish_commit_lane<'a>(active: &mut [Option<Active<'a>>],
     *owned_batch = None;
     for (&slot, next_token) in members.iter().zip(next_after_commit) {
         active[slot].as_mut().unwrap().next_after_commit = next_token;
+    }
+    if accepted.iter().any(|&rows| rows > 0) {
+        COMMITTED_DECODE_STEPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
     Ok((accepted_drafts, emitted, emissions, accepted))
 }

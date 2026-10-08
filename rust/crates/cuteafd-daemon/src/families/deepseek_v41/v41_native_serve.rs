@@ -701,10 +701,10 @@ fn prefill_hold(hold: &mut dyn FnMut() -> Result<()>) {
     }
 }
 
-fn prefill_wave_started(request: Option<u64>, rows: usize) {
+fn prefill_wave_started(request: Option<u64>, rows: usize, stage: &'static str) {
     let started_unix_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
         .map_or(0.0, |elapsed| elapsed.as_secs_f64() * 1000.0);
-    tracing::info!(request_id=?request, rows, started_unix_ms, "V4.1 prefill wave starts");
+    tracing::info!(request_id=?request, rows, stage, started_unix_ms, "V4.1 prefill wave starts");
 }
 
 fn prefill<'a, P: PrefillTarget<'a>, C: DraftChain<'a>>(
@@ -723,7 +723,7 @@ fn prefill<'a, P: PrefillTarget<'a>, C: DraftChain<'a>>(
     hold: &mut dyn FnMut() -> Result<()>,
 ) -> Result<TokenScores> {
     use crate::families::deepseek_v41::v41_backbone_cache::{CacheStage, CacheWork};
-    prefill_wave_started(None, tokens.len());
+    prefill_wave_started(None, tokens.len(), "exclusive");
     let end = tokens.len() as u64;
     let cached = requests.cache().committed_end(lease)? as usize;
     let stage = requests.cache().stage(lease)?;

@@ -721,6 +721,40 @@ fn c1_c4(run: &mut Run<'_>, check: &mut Check) -> Result<()> {
     Ok(())
 }
 
+/// Qualification comparison at the first generated-token divergence. Only rows
+/// with identical preceding context are comparable; later rows are not noise.
+pub(crate) fn compare_probe_outputs(reference: &ProbeRecord, other: &ProbeRecord) -> Result<Value> {
+    anyhow::ensure!(honoured(reference) && honoured(other) && reference.error.is_none() && other.error.is_none(),
+        "comparison requires honoured, successful probes");
+    anyhow::ensure!(reference.prompt_ids == other.prompt_ids, "comparison prompt ids differ");
+    let at = reference.generated.iter().zip(&other.generated).take_while(|(a, b)| a == b).count();
+    let identical = reference.generated == other.generated;
+    let position = reference.prompt_ids.len() + at;
+    let noise = RowNoise::between(other, reference, position);
+    let mut check = Check::new("prefill_share_noise", "Common-prefix row noise");
+    noise.record(&mut check);
+    let rows = reference.rows.iter().find(|r| r.position == position)
+        .zip(other.rows.iter().find(|r| r.position == position));
+    let divergence = (!identical).then(|| rows.map(|(a, b)| {
+        // Coarsen to ids held by both summaries plus one tail bucket. This is
+        // a KL lower bound, not a claim of full-vocabulary KL from top-k rows.
+        let common: Vec<_> = a.top.iter().filter_map(|&(id, lp)| b.top.iter()
+            .find(|(other, _)| *other == id).map(|&(_, other_lp)| (f64::from(lp).exp(), f64::from(other_lp).exp()))).collect();
+        let p_tail = (1.0 - common.iter().map(|x| x.0).sum::<f64>()).max(0.0);
+        let q_tail = (1.0 - common.iter().map(|x| x.1).sum::<f64>()).max(0.0);
+        let kl: f64 = common.iter().copied().chain(std::iter::once((p_tail, q_tail)))
+            .filter(|&(p, _)| p > 0.0).map(|(p, q)| p * (p / q.max(f64::MIN_POSITIVE)).ln()).sum();
+        let margin = |row: &cuteafd_api::openai::probe::ProbeRow| row.top.first().zip(row.top.get(1))
+            .map(|(a, b)| (a.1 - b.1).abs());
+        json!({"reference_top1": a.argmax, "other_top1": b.argmax, "row_byte_exact": a.hash == b.hash,
+            "reference_top2_margin": margin(a), "other_top2_margin": margin(b),
+            "coarsened_kl": kl.max(0.0), "kl_kind": "common-top-k-plus-tail lower bound", "common_ids": common.len()})
+    })).flatten();
+    Ok(json!({"identical": identical, "first_divergence": (!identical).then_some(at),
+        "reference_tokens": reference.generated.len(), "other_tokens": other.generated.len(),
+        "prefix_noise": check.metrics, "divergence_row": divergence}))
+}
+
 /// Generated token ids when the probe recorded them, else the text's characters.
 fn output_of(chat: &Chat) -> Vec<u32> {
     match chat.probe.as_ref().filter(|r| honoured(r)) {
@@ -739,6 +773,40 @@ pub fn describe(timing: &StreamTiming) -> String {
 mod tests {
     use super::*;
     use crate::report::Check;
+
+    #[test]
+    fn prefill_share_comparison_reports_common_prefix_and_divergence_only() {
+        use cuteafd_api::openai::probe::{summarize, ProbeRecord};
+        let record = |generated: Vec<u32>, logits: &[&[f32]]| ProbeRecord {
+            engine: Some("fixture".into()), prompt_ids: vec![9, 8], generated,
+            rows: logits.iter().enumerate().map(|(i, row)| summarize(2 + i, row, 2, &[])).collect(),
+            ..ProbeRecord::default()
+        };
+        let a = record(vec![0, 0, 1], &[&[1.0, 0.0, -1.0], &[1.0, 0.9, -1.0], &[0.0, 1.0, -1.0]]);
+        let exact = compare_probe_outputs(&a, &a).unwrap();
+        assert_eq!(exact["identical"], true);
+        assert!(exact["first_divergence"].is_null());
+        assert!(exact["divergence_row"].is_null());
+        let b = record(vec![0, 1, 0], &[&[1.0, 0.0, -1.0], &[0.9, 1.0, -1.0], &[100.0, -100.0, 0.0]]);
+        let drift = compare_probe_outputs(&a, &b).unwrap();
+        assert_eq!(drift["first_divergence"], 1);
+        assert_eq!(drift["prefix_noise"]["prefix_rows_compared"], 1);
+        assert_eq!(drift["prefix_noise"]["prefix_rows_identical"], 1);
+        assert_eq!(drift["divergence_row"]["reference_top1"], 0);
+        assert_eq!(drift["divergence_row"]["other_top1"], 1);
+        assert!(drift["divergence_row"]["coarsened_kl"].as_f64().unwrap() > 0.0);
+        let mut wrong = b.clone(); wrong.prompt_ids.push(7);
+        assert!(compare_probe_outputs(&a, &wrong).is_err());
+        wrong = b; wrong.engine = None;
+        assert!(compare_probe_outputs(&a, &wrong).is_err());
+    }
+
+    #[test]
+    fn prefill_share_panel_is_opt_in_only() {
+        assert!(crate::panels::find("prefill_share").is_some());
+        assert!(crate::profiles::builtin().iter().all(|profile| profile.panels.iter()
+            .all(|panel| panel.id != "prefill_share")));
+    }
 
     #[test]
     fn concurrent_width_never_exceeds_server_admission() {

@@ -122,7 +122,86 @@ impl Client {
 
     /// A streamed chat completion. `body` needs no `model` or `stream`;
     /// `probe` registers benchmark diagnostics for this request.
-    pub fn chat(&self, mut body: Value, probe: Option<ProbeSpec>) -> Result<Chat> {
+    pub fn chat(&self, body: Value, probe: Option<ProbeSpec>) -> Result<Chat> {
+        self.chat_with_output(body, probe, || {})
+    }
+
+    /// A cancellable server-local stream for qualification panels. An absolute
+    /// deadline covers connect, headers and body, including non-output keepalives.
+    pub(crate) async fn chat_bounded(&self, mut body: Value, probe: Option<ProbeSpec>,
+        deadline: Instant, mut abort: tokio::sync::watch::Receiver<bool>,
+        mut output: impl FnMut()) -> Result<Chat> {
+        use http_body_util::{BodyExt, Full};
+        use hyper_util::rt::TokioIo;
+        self.check()?;
+        body["model"] = json!(self.model);
+        body["stream"] = json!(true);
+        body["stream_options"] = json!({"include_usage": true});
+        let registered = probe.map(|spec| probe::registry().register(spec));
+        let started = Instant::now();
+        let work = async {
+            let uri: hyper::Uri = format!("{}/v1/chat/completions", self.base).parse()?;
+            let address = bounded_address(&uri, crate::context::loopback().as_deref())?;
+            let socket = tokio::net::TcpStream::connect((address, uri.port_u16().unwrap_or(80))).await?;
+            let (mut sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(socket)).await?;
+            // Aborting this task drops the socket, even while body reads are silent.
+            let _connection = AbortConnection(tokio::spawn(async move { let _ = connection.await; }));
+            let mut request = hyper::Request::builder().method("POST")
+                .uri(uri.path_and_query().context("probe path missing")?.as_str())
+                .header("host", uri.authority().context("probe authority missing")?.as_str())
+                .header("content-type", "application/json");
+            if let Some(key) = &self.api_key { request = request.header("authorization", key.authorization()); }
+            else if let Some(token) = &self.token { request = request.header("authorization", format!("Bearer {token}")); }
+            if let Some(token) = &self.token { request = request.header(BENCH_HEADER, token); }
+            if let Some((id, _)) = &registered { request = request.header(probe::HEADER, id); }
+            let response = sender.send_request(request.body(Full::new(bytes::Bytes::from(body.to_string())))?).await?;
+            let code = response.status().as_u16();
+            let mut reader = response.into_body();
+            if code != 200 {
+                let bytes = reader.collect().await?.to_bytes();
+                return Err(UpstreamHttpError { code, body: String::from_utf8_lossy(&bytes).into_owned() }.into());
+            }
+            let mut state = ChatStream::default();
+            let mut pending = Vec::new();
+            let mut done = false;
+            while let Some(frame) = reader.frame().await {
+                let frame = frame?;
+                let Ok(data) = frame.into_data() else { continue; };
+                pending.extend_from_slice(&data);
+                while let Some(end) = pending.iter().position(|&b| b == b'\n') {
+                    let line = std::str::from_utf8(&pending[..end])?.trim_end_matches('\r');
+                    done = state.line(line, started.elapsed().as_secs_f64(), &mut output)?;
+                    pending.drain(..=end);
+                    if done { break; }
+                }
+                anyhow::ensure!(pending.len() <= 1024 * 1024, "probe event line too large");
+                if done { break; }
+            }
+            anyhow::ensure!(done, "probe stream ended without DONE");
+            let mut chat = state.finish(started.elapsed().as_secs_f64());
+            chat.probe = registered.as_ref().map(|(_, probe)| probe.record());
+            Ok(chat)
+        };
+        let cancelled = async {
+            loop {
+                if self.cancelled() || *abort.borrow() { break; }
+                tokio::select! {
+                    _ = abort.changed() => {},
+                    _ = tokio::time::sleep(Duration::from_millis(20)) => {},
+                }
+            }
+        };
+        tokio::select! {
+            biased;
+            _ = cancelled => Err(Cancelled.into()),
+            result = tokio::time::timeout_at(deadline.into(), work) =>
+                result.context("prefill-share panel deadline exceeded")?,
+        }
+    }
+
+    /// Qualification panels may wait for live SSE output before injecting work.
+    pub(crate) fn chat_with_output(&self, mut body: Value, probe: Option<ProbeSpec>,
+        mut output: impl FnMut()) -> Result<Chat> {
         self.check()?;
         body["model"] = json!(self.model);
         body["stream"] = json!(true);
@@ -145,76 +224,106 @@ impl Client {
             }
             Err(error) => return Err(error).context("chat request"),
         };
-        let mut chat = Chat::default();
-        let (mut first, mut last, mut reasoning_end) = (None::<f64>, None::<f64>, None::<f64>);
-        let mut finish_reason = None;
-        let mut tool_calls: Vec<Value> = Vec::new();
+        let mut state = ChatStream::default();
         for line in BufReader::new(response.into_reader()).lines() {
-            if self.cancelled() {
-                // Dropping the reader closes the connection: the server stops this request.
-                return Err(Cancelled.into());
-            }
-            let line = line.context("reading the event stream")?;
-            let Some(data) = line.strip_prefix("data: ") else { continue };
-            if data == "[DONE]" {
+            self.check()?;
+            if state.line(&line.context("reading the event stream")?, started.elapsed().as_secs_f64(), &mut output)? {
                 break;
             }
-            let at = started.elapsed().as_secs_f64();
-            let event: Value = serde_json::from_str(data).with_context(|| format!("event {data}"))?;
-            if let Some(error) = event.get("error") {
-                bail!("stream error: {error}");
-            }
-            if let Some(usage) = event.get("usage").filter(|u| !u.is_null()) {
-                chat.usage = usage.clone();
-            }
-            let Some(choice) = event["choices"].get(0) else { continue };
-            let delta = &choice["delta"];
-            let mut produced = false;
-            if let Some(text) = delta["reasoning_content"].as_str().filter(|t| !t.is_empty()) {
-                chat.reasoning.push_str(text);
-                produced = true;
-            }
-            let mut answer = false;
-            if let Some(text) = delta["content"].as_str().filter(|t| !t.is_empty()) {
-                chat.content.push_str(text);
-                produced = true;
-                answer = true;
-            }
-            if let Some(calls) = delta["tool_calls"].as_array().filter(|c| !c.is_empty()) {
-                merge_tool_calls(&mut tool_calls, calls);
-                produced = true;
-                answer = true;
-            }
-            if produced {
-                first.get_or_insert(at);
-                last = Some(at);
-            }
-            if answer && !chat.reasoning.is_empty() {
-                reasoning_end.get_or_insert(at);
-            }
-            if let Some(reason) = choice["finish_reason"].as_str() {
-                finish_reason = Some(reason.to_string());
-                last.get_or_insert(at);
-            }
         }
-        let total = started.elapsed().as_secs_f64();
-        let usage = &chat.usage;
+        let mut chat = state.finish(started.elapsed().as_secs_f64());
+        chat.probe = registered.map(|(_, probe)| probe.record());
+        Ok(chat)
+    }
+}
+
+fn bounded_address(uri: &hyper::Uri, server: Option<&str>) -> Result<std::net::IpAddr> {
+    anyhow::ensure!(uri.scheme_str() == Some("http"), "bounded probes require local HTTP");
+    let address: std::net::IpAddr = uri.host().context("probe host missing")?
+        .trim_matches(['[', ']']).parse().context("bounded probes require a local IP")?;
+    let own_endpoint = server.and_then(|s| s.parse::<hyper::Uri>().ok())
+        .is_some_and(|s| s.scheme_str() == uri.scheme_str() && s.authority() == uri.authority());
+    anyhow::ensure!(address.is_loopback() || own_endpoint,
+        "bounded probes require loopback or the server's own listen address");
+    Ok(address)
+}
+
+struct AbortConnection(tokio::task::JoinHandle<()>);
+impl Drop for AbortConnection {
+    fn drop(&mut self) { self.0.abort(); }
+}
+
+#[derive(Default)]
+struct ChatStream {
+    chat: Chat,
+    first: Option<f64>,
+    last: Option<f64>,
+    reasoning_end: Option<f64>,
+    finish_reason: Option<String>,
+}
+impl ChatStream {
+    fn line(&mut self, line: &str, at: f64, output: &mut impl FnMut()) -> Result<bool> {
+        let Some(data) = line.strip_prefix("data: ") else { return Ok(false); };
+        if data == "[DONE]" {
+            return Ok(true);
+        }
+        let event: Value = serde_json::from_str(data).with_context(|| format!("event {data}"))?;
+        if let Some(error) = event.get("error") {
+            bail!("stream error: {error}");
+        }
+        if let Some(usage) = event.get("usage").filter(|u| !u.is_null()) {
+            self.chat.usage = usage.clone();
+        }
+        let Some(choice) = event["choices"].get(0) else { return Ok(false); };
+        let delta = &choice["delta"];
+        let mut produced = false;
+        if let Some(text) = delta["reasoning_content"].as_str().filter(|t| !t.is_empty()) {
+            self.chat.reasoning.push_str(text);
+            produced = true;
+        }
+        let mut answer = false;
+        if let Some(text) = delta["content"].as_str().filter(|t| !t.is_empty()) {
+            self.chat.content.push_str(text);
+            produced = true;
+            answer = true;
+        }
+        if let Some(calls) = delta["tool_calls"].as_array().filter(|c| !c.is_empty()) {
+            merge_tool_calls(&mut self.chat.tool_calls, calls);
+            produced = true;
+            answer = true;
+        }
+        if produced {
+            self.first.get_or_insert(at);
+            self.last = Some(at);
+            output();
+        }
+        if answer && !self.chat.reasoning.is_empty() {
+            self.reasoning_end.get_or_insert(at);
+        }
+        if let Some(reason) = choice["finish_reason"].as_str() {
+            self.finish_reason = Some(reason.to_string());
+            self.last.get_or_insert(at);
+        }
+        Ok(false)
+    }
+
+    fn finish(mut self, total: f64) -> Chat {
+        let usage = &self.chat.usage;
         let number = |v: &Value| v.as_u64().unwrap_or(0);
-        chat.timing = StreamTiming {
+        self.chat.timing = StreamTiming {
             prompt_tokens: number(&usage["prompt_tokens"]),
             completion_tokens: number(&usage["completion_tokens"]),
             cached_tokens: usage.get("prompt_cache_hit_tokens").map(number)
                 .unwrap_or_else(|| number(&usage["prompt_tokens_details"]["cached_tokens"])),
             reasoning_tokens: number(&usage["completion_tokens_details"]["reasoning_tokens"]),
-            ttft_s: first.unwrap_or(total),
+            ttft_s: self.first.unwrap_or(total),
             total_s: total,
-            decode_s: match (first, last) { (Some(a), Some(b)) => (b - a).max(0.0), _ => 0.0 },
-            reasoning_end_s: reasoning_end,
-            finish_reason,
+            decode_s: match (self.first, self.last) { (Some(a), Some(b)) => (b - a).max(0.0), _ => 0.0 },
+            reasoning_end_s: self.reasoning_end,
+            finish_reason: self.finish_reason,
         };
-        chat.tool_calls = tool_calls;
-        chat.probe = registered.map(|(_, probe)| probe.record());
-        Ok(chat)
+
+        self.chat
     }
 }
 
@@ -243,6 +352,20 @@ fn merge_tool_calls(calls: &mut Vec<Value>, deltas: &[Value]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bounded_probes_allow_only_loopback_or_own_bound_endpoint() {
+        for base in ["http://10.55.0.22:8000", "http://[fd00::22]:8000"] {
+            let uri = format!("{base}/v1/chat/completions").parse().unwrap();
+            assert!(bounded_address(&uri, Some(base)).is_ok());
+            assert!(bounded_address(&uri, Some("http://10.55.0.23:8000")).is_err());
+            assert!(bounded_address(&uri, None).is_err());
+        }
+        let uri = "http://127.0.0.1:8000/v1/chat/completions".parse().unwrap();
+        assert!(bounded_address(&uri, None).unwrap().is_loopback());
+        let uri = "https://127.0.0.1:8000/v1/chat/completions".parse().unwrap();
+        assert!(bounded_address(&uri, None).is_err());
+    }
 
     #[test]
     fn chat_rejection_has_a_typed_upstream_status() {

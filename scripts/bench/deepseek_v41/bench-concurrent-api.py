@@ -5,6 +5,7 @@ from pathlib import Path
 parser=argparse.ArgumentParser()
 parser.add_argument('--base-url', default='http://127.0.0.1:18042')
 parser.add_argument('--output', type=Path, required=True)
+parser.add_argument('--api-key-file', type=Path, help='Read bearer key without putting it in argv or evidence')
 parser.add_argument('--concurrency', type=int, nargs='+', default=[1,2,4,8,16])
 parser.add_argument('--repeats', type=int, default=3)
 parser.add_argument('--warm-batches', type=int, default=1, help='untimed batches per concurrency level before measuring (the first wide batch after a launch pays one-time warm-up: engram/host table paging, graph and workspace first use)')
@@ -18,6 +19,7 @@ parser.add_argument('--allow-cold', action='store_true', help='Do not require pr
 parser.add_argument('--no-output-checks', action='store_true', help='Time responses whose content checks fail (speculator A/B runs: verify-width near-ties change greedy text between arms and batch shapes)')
 parser.add_argument('--distinct-prompts', action='store_true', help='Give each concurrent request its own nonce (requests stop sharing routes); implies --allow-cold')
 args=parser.parse_args()
+api_key=args.api_key_file.read_text().strip() if args.api_key_file else None
 if args.repeats < 1 or any(c < 1 or c > 16 for c in args.concurrency):
  parser.error('repeats must be positive and concurrency must be 1..16')
 if args.max_tokens is not None and args.max_tokens < 1:
@@ -47,7 +49,7 @@ def run(i):
  if definition.get('reasoning_effort'):b['reasoning_effort']=definition['reasoning_effort']
  start=time.perf_counter();r=None
  try:
-  r=api['stream_case'](args.base_url,b)
+  r=api['stream_case'](args.base_url,b,api_key=api_key)
   if definition.get('thinking')=='enabled':assert r['reasoning'].strip(),'missing requested reasoning'
   r.pop('events',None)
   return dict(start=start,result=r,output_checks=validate(r),passed=True)

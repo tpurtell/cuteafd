@@ -29,3 +29,19 @@ def test_encode_window_ends_before_any_lm_prefill():
 def test_empty_encode_window_is_not_reported_as_zero_latency():
     assert BENCH.summarize([]) == {'max_ms': None, 'p99_ms': None, 'count': 0}
     assert BENCH.percentile(list(range(100))) == 98
+
+
+def test_stream_auth_is_optional_and_not_in_evidence(monkeypatch):
+    import io
+    import json
+    seen = []
+    event = {'choices': [{'delta': {'content': 'ok'}}], 'usage': {'completion_tokens': 1}}
+    def open_request(request, timeout):
+        seen.append(request)
+        return io.BytesIO(b'data: ' + json.dumps(event).encode() + b'\n\ndata: [DONE]\n\n')
+    monkeypatch.setattr(BENCH.urllib.request, 'urlopen', open_request)
+    record = BENCH.stream('http://127.0.0.1:8000', {'messages': []}, api_key='fixture-key')
+    assert seen[-1].get_header('Authorization') == 'Bearer fixture-key'
+    assert 'fixture-key' not in json.dumps(record)
+    BENCH.stream('http://127.0.0.1:8000', {'messages': []})
+    assert seen[-1].get_header('Authorization') is None

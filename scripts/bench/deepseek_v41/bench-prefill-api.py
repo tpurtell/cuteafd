@@ -14,6 +14,7 @@ def main():
     p.add_argument('--tokenizer', type=Path, required=True)
     p.add_argument('--context-file', type=Path, required=True)
     p.add_argument('--output', type=Path, required=True)
+    p.add_argument('--api-key-file', type=Path, help='Read bearer key without putting it in argv or evidence')
     p.add_argument('--target-url', default='http://127.0.0.1:18041')
     p.add_argument('--speculative-url', default='http://127.0.0.1:18042')
     p.add_argument('--filler-tokens', type=int, nargs='+', default=[3950,16384])
@@ -22,6 +23,7 @@ def main():
     p.add_argument('--modes', nargs='+', choices=['target','speculative'], default=['target','speculative'])
     p.add_argument('--kinds', nargs='+', choices=['repeated','code'], default=['repeated','code'])
     a = p.parse_args()
+    api_key = a.api_key_file.read_text().strip() if a.api_key_file else None
     if not a.filler_tokens or min(a.filler_tokens) < 1:
         p.error('filler token counts must be positive')
     if a.count_to < 1 or a.max_output_tokens < 1:
@@ -51,7 +53,7 @@ def main():
                     continue
                 body = api['payload'](prompt, stream=True)
                 body['max_tokens'] = a.max_output_tokens
-                result = api['stream_case'](base, body)
+                result = api['stream_case'](base, body, api_key=api_key)
                 result.pop('events', None)
                 result.update(mode=mode, kind=kind, filler_tokens=count,
                               prompt_sha256=hashlib.sha256(prompt.encode()).hexdigest())

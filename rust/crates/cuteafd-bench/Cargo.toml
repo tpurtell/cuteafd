@@ -16,6 +16,10 @@ cuteafd-api = { path = "../cuteafd-api" }
 cuteafd-loader = { path = "../cuteafd-loader" }
 cuteafd-transport = { path = "../cuteafd-transport" }
 futures.workspace = true
+bytes.workspace = true
+http-body-util = "0.1"
+hyper = { version = "1", features = ["client", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
 jsonschema = { version = "=0.18.3", default-features = false, features = ["draft201909", "draft202012"] }
 rusqlite = { version = "=0.37.0", features = ["bundled"] }
 resvg = { version = "0.45", default-features = false, features = ["text"] }

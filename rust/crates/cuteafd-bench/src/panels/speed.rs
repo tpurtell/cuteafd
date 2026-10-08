@@ -45,6 +45,8 @@ pub struct Concurrency;
 pub struct Prefill;
 pub struct Retained;
 pub struct PrefixCache;
+pub struct PrefillShare;
+pub static PREFILL_SHARE: PrefillShare = PrefillShare;
 pub static DECODE_CONTENT: DecodeContent = DecodeContent;
 pub static CONCURRENCY: Concurrency = Concurrency;
 pub static PREFILL: Prefill = Prefill;
@@ -208,6 +210,239 @@ impl Panel for Retained {
         let rows = points.iter().map(|p| vec![p["prompt_tokens"].clone(), p["decode_tok_s"].clone(),
             json!(p["ttft_s"].as_f64().unwrap_or(0.0) * 1e3), p["tokens"].clone()]).collect();
         Ok(json!({"points": points, "table": table(&["context tokens", "decode tok/s", "TTFT ms", "tokens"], rows)}))
+    }
+}
+
+impl Panel for PrefillShare {
+    fn id(&self) -> &'static str { "prefill_share" }
+    fn title(&self) -> &'static str { "Prefill-share exactness" }
+    fn description(&self) -> &'static str {
+        "Opt-in qualification: fixed C1/C4 streams with and without an 8K injection; first-row hashes and batching noise. Instrumented, not a speed measurement."
+    }
+    fn estimate_s(&self, rates: &Rates, _info: &ServerInfo) -> f64 {
+        12.0 * rates.seconds(120.0, 512.0) + 3.0 * rates.seconds(8192.0, 16.0)
+    }
+    fn unavailable(&self, info: &ServerInfo) -> Option<String> {
+        (common::concurrency(info) < 5).then(|| "requires five admitted requests".into())
+    }
+    fn run(&self, ctx: &Ctx<'_>) -> Result<Value> {
+        use crate::client::Chat;
+        use cuteafd_api::openai::probe::ProbeRecord;
+        use std::time::Duration;
+        let deadline = std::time::Instant::now() + Duration::from_secs(1200);
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
+        runtime.block_on(async {
+            let (_abort, abort) = tokio::sync::watch::channel(false);
+            let spec = prefill_share_stream_spec;
+            let bodies: Vec<_> = (0..4).map(|i| plain(&format!("prefill-share-fixed stream {i}. Write a complete Python AVL tree with insertion, deletion, traversal and 100 fully implemented unittest methods. Include all code; do not abbreviate.") , 512)).collect();
+            let long = plain(&format!("prefill-share-fixed injection. {}\nIgnore the notes. Count from 1 to 20, separated by commas.", filler(0xdec0de, 6100)), 16);
+            ctx.progress.step(0.02, "isolated prefill exactness control");
+            let long_alone = ctx.client.chat_bounded(long.clone(), Some(prefill_share_long_spec()), deadline, abort.clone(), || {}).await?;
+            ctx.progress.step(0.05, "fixed streams alone");
+            let mut alone = Vec::new();
+            for body in &bodies { alone.push(ctx.client.chat_bounded(body.clone(), Some(spec()), deadline, abort.clone(), || {}).await?); }
+            ctx.progress.step(0.35, "C4 without injection");
+            let (cohort, _) = prefill_share_wave(ctx.client, &bodies, None, deadline, Duration::from_secs(120)).await?;
+            ctx.progress.step(0.55, "C1 with injection");
+            let (c1, long_c1) = prefill_share_wave(ctx.client, &bodies[..1], Some(&long), deadline, Duration::from_secs(120)).await?;
+            ctx.progress.step(0.75, "C4 with injection");
+            let (mixed, long_c4) = prefill_share_wave(ctx.client, &bodies, Some(&long), deadline, Duration::from_secs(120)).await?;
+            let record = |chat: &Chat| -> Result<ProbeRecord> {
+                let record = chat.probe.as_ref().context("no probe record")?;
+                anyhow::ensure!(record.engine.is_some() && record.error.is_none() && record.cold && record.cached_tokens == 0,
+                    "cold probe not honoured");
+                Ok(record.clone())
+            };
+            let comparisons = |a: &[Chat], b: &[Chat]| -> Result<Vec<Value>> {
+                a.iter().zip(b).map(|(a, b)| crate::baseline::compare_probe_outputs(&record(a)?, &record(b)?)).collect()
+            };
+            let first_hash = |chat: &Chat| -> Result<String> {
+                let record = record(chat)?;
+                let row = record.rows.iter().find(|r| r.position == record.prompt_ids.len())
+                    .context("injected prompt's first row missing")?;
+                anyhow::ensure!(row.finite, "injected prompt's first row is nonfinite");
+                Ok(row.hash.clone())
+            };
+            let long_c1 = long_c1.context("C1 injection missing")?;
+            let long_c4 = long_c4.context("C4 injection missing")?;
+            let control = first_hash(&long_alone)?;
+            let c1_hash = first_hash(&long_c1)?;
+            let c4_hash = first_hash(&long_c4)?;
+            let qualification = prefill_share_qualification(control == c1_hash && control == c4_hash,
+                &record(&long_c1)?, &record(&long_c4)?);
+            Ok(json!({"scope": "fixed cold prompts; full-row hashes; common-prefix batching noise; instrumented",
+                "prefill_exact": qualification["prefill_exact"],
+                "qualification": qualification,
+                "first_row_hashes": {"alone": control, "c1_injected": c1_hash, "c4_injected": c4_hash},
+                "alone_vs_cohort": comparisons(&alone, &cohort)?,
+                "cohort_vs_injected": comparisons(&cohort, &mixed)?,
+                "alone_vs_c1_injected": comparisons(&alone[..1], &c1)?,
+                "alone": alone, "cohort": cohort, "c1_injected": c1, "c4_injected": mixed,
+                "long_alone": long_alone, "long_c1": long_c1, "long_c4": long_c4}))
+        })
+    }
+}
+
+fn prefill_share_stream_spec() -> ProbeSpec {
+    ProbeSpec { cold: true, record_rows: 512, top_k: 32, ..ProbeSpec::default() }
+}
+
+fn prefill_share_long_spec() -> ProbeSpec {
+    ProbeSpec { cold: true, record_first: true, top_k: 32, ..ProbeSpec::default() }
+}
+
+fn prefill_share_qualification(hashes_equal: bool,
+    c1: &cuteafd_api::openai::probe::ProbeRecord, c4: &cuteafd_api::openai::probe::ProbeRecord) -> Value {
+    let exercised = |r: &cuteafd_api::openai::probe::ProbeRecord|
+        r.prefill_share.as_ref().is_some_and(|p| p.exercised());
+    let exercised = exercised(c1) && exercised(c4);
+    json!({"hashes_equal": hashes_equal, "exercised": exercised,
+        "status": if !exercised { "not exercised" } else if hashes_equal { "exact" } else { "hash mismatch" },
+        "prefill_exact": hashes_equal && exercised,
+        "c1": c1.prefill_share, "c4": c4.prefill_share})
+}
+
+async fn prefill_share_wave(client: &crate::client::Client, bodies: &[Value], long: Option<&Value>,
+    deadline: std::time::Instant, injection_wait: std::time::Duration,
+) -> Result<(Vec<crate::client::Chat>, Option<crate::client::Chat>)> {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let (abort, abort_rx) = tokio::sync::watch::channel(false);
+    let (send, mut receive) = tokio::sync::mpsc::unbounded_channel();
+    let finished: Vec<_> = bodies.iter().map(|_| AtomicBool::new(false)).collect();
+    let workers = futures::future::join_all(bodies.iter().cloned().enumerate().map(|(index, body)| {
+        let send = send.clone();
+        let abort_rx = abort_rx.clone();
+        let abort = &abort;
+        let finished = &finished[index];
+        async move {
+            let mut count = 0;
+            let result = client.chat_bounded(body, Some(prefill_share_stream_spec()), deadline, abort_rx, || {
+                count += 1;
+                if count == 12 { let _ = send.send((index, true)); }
+            }).await;
+            finished.store(true, Ordering::Release);
+            let _ = send.send((index, false));
+            if result.is_err() { let _ = abort.send(true); }
+            result
+        }
+    }));
+    drop(send);
+    let injection = async {
+        let result: Result<Option<crate::client::Chat>> = async {
+            let Some(long) = long else { return Ok(None); };
+            let ready = async {
+                let mut ready = vec![false; bodies.len()];
+                while !ready.iter().all(|r| *r) {
+                    let (index, live) = receive.recv().await.context("streams ended before injection point")?;
+                    anyhow::ensure!(live, "stream ended before every stream reached injection point");
+                    ready[index] = true;
+                }
+                anyhow::ensure!(finished.iter().all(|done| !done.load(Ordering::Acquire)), "stream ended before injection");
+                Ok::<_, anyhow::Error>(())
+            };
+            tokio::time::timeout_at((std::time::Instant::now() + injection_wait).min(deadline).into(), ready)
+                .await.context("streams did not reach injection point before deadline")??;
+            Ok(Some(client.chat_bounded(long.clone(), Some(prefill_share_long_spec()), deadline, abort_rx, || {}).await?))
+        }.await;
+        // Wake every body reader before waiting for worker results. No blocking
+        // scoped threads remain to hold the benchmark lockout after failure.
+        if result.is_err() { let _ = abort.send(true); }
+        result
+    };
+    let (chats, injected) = tokio::join!(workers, injection);
+    let injected = injected?;
+    Ok((chats.into_iter().collect::<Result<Vec<_>>>()?, injected))
+}
+
+#[cfg(test)]
+mod prefill_share_tests {
+    use super::*;
+    use cuteafd_api::openai::probe::{ProbePrefillShare, ProbeRecord};
+    use std::sync::{Arc, atomic::AtomicBool};
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn equal_hashes_cannot_qualify_exclusive_or_idle_prefill() {
+        let mut record = ProbeRecord::default();
+        for evidence in [None, Some(ProbePrefillShare { decode_share: 0.0, resumed_waves: 3,
+            interleaved_decode_steps: 2, ..Default::default() }),
+            Some(ProbePrefillShare { decode_share: 0.2, ..Default::default() }),
+            Some(ProbePrefillShare { decode_share: 0.2, resumed_waves: 3, ..Default::default() })] {
+            record.prefill_share = evidence;
+            let result = prefill_share_qualification(true, &record, &record);
+            assert_eq!(result["prefill_exact"], false);
+            assert_eq!(result["status"], "not exercised");
+        }
+        record.prefill_share = Some(ProbePrefillShare { decode_share: 0.2,
+            resumed_waves: 3, interleaved_decode_steps: 2, ..Default::default() });
+        assert_eq!(prefill_share_qualification(true, &record, &record)["prefill_exact"], true);
+        assert_eq!(prefill_share_qualification(false, &record, &record)["prefill_exact"], false);
+        assert_eq!(prefill_share_qualification(true, &record, &ProbeRecord::default())["prefill_exact"], false);
+    }
+
+    async fn stalled_server(keepalives: bool) -> (String, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut headers = Vec::new();
+            while !headers.ends_with(b"\r\n\r\n") {
+                headers.push(socket.read_u8().await.unwrap());
+            }
+            let headers = String::from_utf8(headers).unwrap();
+            let length: usize = headers.lines().find_map(|line| line.split_once(':')
+                .filter(|(key, _)| key.eq_ignore_ascii_case("content-length"))
+                .map(|(_, value)| value.trim().parse().unwrap())).unwrap();
+            let mut body = vec![0; length];
+            socket.read_exact(&mut body).await.unwrap();
+            socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n").await.unwrap();
+            let mut byte = [0];
+            loop {
+                tokio::select! {
+                    read = socket.read(&mut byte) => {
+                        match read {
+                            Ok(0) => (),
+                            Err(error) if matches!(error.kind(), std::io::ErrorKind::ConnectionReset
+                                | std::io::ErrorKind::ConnectionAborted) => (),
+                            other => panic!("reader not closed: {other:?}"),
+                        }
+                        break;
+                    }
+                    _ = tokio::time::sleep(Duration::from_millis(10)), if keepalives => {
+                        if socket.write_all(b": keepalive\n\n").await.is_err() { break; }
+                    }
+                }
+            }
+        });
+        (base, server)
+    }
+
+    #[tokio::test]
+    async fn injection_timeout_closes_silent_and_keepalive_readers() {
+        for keepalives in [false, true] {
+            let (base, server) = stalled_server(keepalives).await;
+            let client = crate::client::Client::new(&base, None, Arc::new(AtomicBool::new(false)));
+            let started = Instant::now();
+            let error = tokio::time::timeout(Duration::from_secs(2), prefill_share_wave(&client,
+                &[plain("stream", 512)], Some(&plain("injection", 16)),
+                started + Duration::from_secs(30), Duration::from_millis(100))).await.unwrap().unwrap_err();
+            assert!(error.to_string().contains("injection point"), "{error:#}");
+            assert!(started.elapsed() < Duration::from_secs(1));
+            tokio::time::timeout(Duration::from_secs(1), server).await.unwrap().unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn overall_deadline_closes_keepalive_reader_without_injection() {
+        let (base, server) = stalled_server(true).await;
+        let client = crate::client::Client::new(&base, None, Arc::new(AtomicBool::new(false)));
+        let started = Instant::now();
+        let error = tokio::time::timeout(Duration::from_secs(2), prefill_share_wave(&client,
+            &[plain("stream", 512)], None, started + Duration::from_millis(100),
+            Duration::from_secs(120))).await.unwrap().unwrap_err();
+        assert!(error.to_string().contains("deadline"), "{error:#}");
+        tokio::time::timeout(Duration::from_secs(1), server).await.unwrap().unwrap();
     }
 }
 

@@ -228,6 +228,24 @@ pub struct ProbeRow {
     pub finite: bool,
 }
 
+/// Server-observed V4.1 prefill scheduling, not inferred from SSE readiness.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ProbePrefillShare {
+    pub decode_share: f64,
+    pub parked_waves: u64,
+    pub resumed_waves: u64,
+    /// Successful decode/verify lane commits by other requests between this
+    /// request's completed prefill waves (not emitted token count).
+    pub interleaved_decode_steps: u64,
+}
+
+impl ProbePrefillShare {
+    pub fn exercised(&self) -> bool {
+        self.decode_share > 0.0 && self.decode_share < 1.0
+            && self.resumed_waves >= 1 && self.interleaved_decode_steps >= 1
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ProbeRecord {
     /// Whether an engine honoured the probe at all.
@@ -252,6 +270,8 @@ pub struct ProbeRecord {
     #[serde(default)]
     pub score_path: Option<String>,
     pub error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefill_share: Option<ProbePrefillShare>,
 }
 
 /// A probe shared by the benchmark and the engine serving its request.
@@ -308,6 +328,23 @@ impl Probe {
 
     pub fn provenance(&self, value: serde_json::Value) {
         self.with(|r| r.provenance = Some(value));
+    }
+
+    pub fn prefill_policy(&self, decode_share: f64) {
+        self.with(|r| r.prefill_share = Some(ProbePrefillShare { decode_share, ..Default::default() }));
+    }
+
+    pub fn prefill_parked(&self) {
+        self.with(|r| { if let Some(p) = &mut r.prefill_share { p.parked_waves += 1; } });
+    }
+
+    pub fn prefill_resumed(&self, decode_steps: u64) {
+        self.with(|r| {
+            if let Some(p) = &mut r.prefill_share {
+                p.resumed_waves += 1;
+                p.interleaved_decode_steps += decode_steps;
+            }
+        });
     }
 
     /// Records one host logits row predicting token `position` (unless `score_positions` leaves it out).
@@ -458,6 +495,29 @@ pub fn registry() -> &'static ProbeRegistry {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn prefill_share_requires_successful_resume_and_other_decode_commits() {
+        use super::*;
+        let probe = Probe::new(ProbeSpec::default());
+        probe.prefill_policy(0.2);
+        probe.prefill_parked();
+        probe.prefill_resumed(0);
+        assert!(!probe.record().prefill_share.unwrap().exercised());
+        probe.prefill_parked();
+        probe.prefill_resumed(3);
+        let record = probe.record();
+        let evidence = record.prefill_share.as_ref().unwrap();
+        assert_eq!(evidence.parked_waves, 2);
+        assert_eq!(evidence.resumed_waves, 2);
+        assert_eq!(evidence.interleaved_decode_steps, 3);
+        assert!(evidence.exercised());
+        let copy: ProbeRecord = serde_json::from_value(serde_json::to_value(record).unwrap()).unwrap();
+        assert!(copy.prefill_share.unwrap().exercised());
+        probe.prefill_policy(0.0);
+        probe.prefill_resumed(3);
+        assert!(!probe.record().prefill_share.unwrap().exercised());
+    }
+
     #[test]
     fn image_probe_serialization_is_unchanged_when_audio_is_empty() {
         use super::*;

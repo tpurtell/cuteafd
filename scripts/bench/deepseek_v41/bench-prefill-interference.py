@@ -42,10 +42,11 @@ def summarize(values):
             'count': len(values)}
 
 
-def stream(url, body, notify=None):
+def stream(url, body, notify=None, api_key=None):
     request = urllib.request.Request(url + '/v1/chat/completions',
         data=json.dumps(dict(body, stream=True, stream_options={'include_usage': True})).encode(),
-        headers={'Content-Type': 'application/json'})
+        headers={'Content-Type': 'application/json',
+                 **({'Authorization': 'Bearer ' + api_key} if api_key else {})})
     started = time.time()
     stamps, chunks, usage = [], [], None
     with urllib.request.urlopen(request, timeout=900) as response:
@@ -126,6 +127,7 @@ def main():
     parser.add_argument('--url', required=True)
     parser.add_argument('--container', required=True)
     parser.add_argument('--output', type=Path, required=True)
+    parser.add_argument('--api-key-file', type=Path, help='Read bearer key without putting it in argv or evidence')
     parser.add_argument('--case', choices=['text', 'images'], required=True)
     parser.add_argument('--tokenizer', type=Path)
     parser.add_argument('--budget', type=int, default=2048)
@@ -134,6 +136,9 @@ def main():
     parser.add_argument('--prompt-label', default='decode-share',
                         help='Use the same label across arms and a fresh label for each measured case')
     args = parser.parse_args()
+    api_key = args.api_key_file.read_text().strip() if args.api_key_file else None
+    def request(body, notify=None):
+        return stream(args.url, body, notify, api_key=api_key)
     injected = [image_body(i) for i in range(4)]
     if args.case == 'text':
         if args.tokenizer is None:
@@ -154,7 +159,7 @@ def main():
             content[0]['text'] = args.prompt_label + '. ' + content[0]['text']
     if args.warm:
         with concurrent.futures.ThreadPoolExecutor(4) as pool:
-            list(pool.map(lambda i: stream(args.url, text_body(i + 20, 128, args.prompt_label + '-warm')), range(4)))
+            list(pool.map(lambda i: request(text_body(i + 20, 128, args.prompt_label + '-warm')), range(4)))
         warm = json.loads(json.dumps(injected[0]))
         content = warm['messages'][0]['content']
         if isinstance(content, str):
@@ -163,15 +168,15 @@ def main():
             content[0]['text'] = 'Warm shape only. ' + content[0]['text']
             # Keep the measured image out of the embedding cache as well.
             content[1]['image_url']['url'] = 'data:image/png;base64,' + base64.b64encode(png(1344, 9)).decode()
-        stream(args.url, warm)
+        request(warm)
     events = [threading.Event() for _ in range(args.concurrency)]
     with concurrent.futures.ThreadPoolExecutor(8) as pool:
-        decoding = [pool.submit(stream, args.url, text_body(i, args.budget, args.prompt_label), event.set)
+        decoding = [pool.submit(request, text_body(i, args.budget, args.prompt_label), event.set)
                     for i, event in enumerate(events)]
         for event in events:
             assert event.wait(120), 'text did not reach injection point'
         start = time.time()
-        prefilling = [pool.submit(stream, args.url, body) for body in injected]
+        prefilling = [pool.submit(request, body) for body in injected]
         prompts = [future.result() for future in prefilling]
         end = time.time()
         texts = [future.result() for future in decoding]

@@ -36,6 +36,19 @@ impl<S> Default for PrefillProgress<S> {
 }
 
 impl<S> PrefillProgress<S> {
+    pub(super) fn wave_shape(&self, tokens: usize, chunk_rows: usize) -> (&'static str, usize) {
+        match self {
+            Self::Start => ("start", tokens.min(chunk_rows)),
+            Self::Encoder { next, replay_end, .. } => {
+                let end = if next < replay_end { *replay_end } else { tokens };
+                ("encoder", end.saturating_sub(*next).min(chunk_rows))
+            }
+            Self::Replay { .. } => ("replay", tokens.min(128)),
+            Self::Continuation { next } => ("continuation", tokens.saturating_sub(*next).min(chunk_rows)),
+            Self::Done => ("done", 0),
+        }
+    }
+
     pub(super) fn step<'a, P: PrefillTarget<'a, Suffix = S>, C: DraftChain<'a>>(&mut self,
         lib: &'a NativeLibrary, runtime: &tokio::runtime::Runtime, pass: &mut P, other: &mut P,
         requests: &mut Requests<'a>, transports: [&mut P::Transport; 2], lease: CacheLease,
@@ -65,6 +78,8 @@ impl<S> PrefillProgress<S> {
             }
         }
         prefill_hold(hold);
+        let (stage, rows) = self.wave_shape(tokens.len(), chunk_rows);
+        super::prefill_wave_started(Some(requests.cache().request_id(lease)?), rows, stage);
         match self {
             Self::Encoder { suffix, next, replay_end, streamed, index } => {
                 let replay = *next < *replay_end;
