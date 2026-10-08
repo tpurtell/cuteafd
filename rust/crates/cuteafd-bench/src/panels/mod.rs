@@ -121,7 +121,7 @@ pub trait Panel: Send + Sync {
 /// Every panel this build runs, in display order.
 pub fn catalog() -> Vec<&'static dyn Panel> {
     vec![&info::HARDWARE, &info::CONFIGURATION, &speed::DECODE_CONTENT, &speed::CONCURRENCY, &speed::PREFILL,
-        &speed::RETAINED, &speed::PREFIX_CACHE, &speed::PREFILL_SHARE, &agentic::AGENTIC, &quality::STRUCTURED, &quality::NEEDLE, &quality::IFEVAL,
+        &speed::RETAINED, &speed::PREFIX_CACHE, &speed::PREFILL_SHARE, &speed::PREFILL_RESUMPTION, &agentic::AGENTIC, &quality::STRUCTURED, &quality::NEEDLE, &quality::IFEVAL,
         &fidelity::STANDARD, &fidelity::FULL, &quality::CODE, &quality::MATH, &reasoning::REASONING, &tools::TOOL_EVAL, &info::STARTUP]
 }
 

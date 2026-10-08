@@ -47,6 +47,8 @@ pub struct Retained;
 pub struct PrefixCache;
 pub struct PrefillShare;
 pub static PREFILL_SHARE: PrefillShare = PrefillShare;
+pub struct PrefillResumption;
+pub static PREFILL_RESUMPTION: PrefillResumption = PrefillResumption;
 pub static DECODE_CONTENT: DecodeContent = DecodeContent;
 pub static CONCURRENCY: Concurrency = Concurrency;
 pub static PREFILL: Prefill = Prefill;
@@ -314,6 +316,75 @@ impl Panel for PrefillShare {
     }
 }
 
+impl Panel for PrefillResumption {
+    fn id(&self) -> &'static str { "prefill_resumption" }
+    fn title(&self) -> &'static str { "Isolated prefill resumption" }
+    fn description(&self) -> &'static str {
+        "Opt-in qualification: six cold one-shot and three isolated parked prefills in one launch. Requires hidden per-probe server opt-in; not a speed measurement."
+    }
+    fn estimate_s(&self, rates: &Rates, _info: &ServerInfo) -> f64 { 9.0 * rates.seconds(8192.0, 16.0) }
+    fn run(&self, ctx: &Ctx<'_>) -> Result<Value> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1200);
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
+        runtime.block_on(async {
+            let (_abort, abort) = tokio::sync::watch::channel(false);
+            let long = plain(&format!("prefill-share-fixed injection. {}\nIgnore the notes. Count from 1 to 20, separated by commas.", filler(0xdec0de, 6100)), 16);
+            let mut alone = Vec::new();
+            let mut forced = Vec::new();
+            for index in 0..9 {
+                let park = index >= 6;
+                ctx.progress.step(index as f64 / 9.0, if park { "isolated parked prefill" } else { "cold one-shot repeat" });
+                let mut spec = prefill_share_long_spec();
+                spec.prefill_park = park;
+                let chat = ctx.client.chat_bounded(long.clone(), Some(spec), deadline, abort.clone(), || {}).await?;
+                let record = chat.probe.as_ref().context("resumption probe missing")?;
+                anyhow::ensure!(record.engine.is_some() && record.cold && record.cached_tokens == 0
+                    && record.error.is_none(), "resumption cold probe not honoured");
+                let evidence = record.prefill_share.as_ref().context("resumption policy evidence missing")?;
+                anyhow::ensure!(evidence.decode_share == 0.0 && evidence.forced_park == park
+                    && evidence.interleaved_decode_steps == 0, "isolated resumption policy not honoured");
+                anyhow::ensure!(if park { evidence.resumed_waves > 0 } else {
+                    evidence.parked_waves == 0 && evidence.resumed_waves == 0
+                }, "isolated resumption was not exercised");
+                if park { forced.push(chat); } else { alone.push(chat); }
+            }
+            let mut controls = Vec::new();
+            for i in 0..alone.len() { for j in i + 1..alone.len() {
+                controls.push(prefill_first_distribution(alone[i].probe.as_ref().unwrap(), alone[j].probe.as_ref().unwrap())?);
+            } }
+            let mut resumed = Vec::new();
+            for chat in &forced { for control in &alone {
+                resumed.push(prefill_first_distribution(control.probe.as_ref().unwrap(), chat.probe.as_ref().unwrap())?);
+            } }
+            let envelope = |field: &str| controls.iter().filter_map(|r| r[field].as_f64()).fold(0.0, f64::max);
+            let greedy_equal = alone.iter().chain(&forced).all(|c| c.probe.as_ref().unwrap().generated
+                == alone[0].probe.as_ref().unwrap().generated);
+            let top1_equal = controls.iter().chain(&resumed).all(|r| r["top1_equal"] == true);
+            let within = greedy_equal && top1_equal && resumed.iter().all(|r|
+                ["common_logprob_delta_max", "coarsened_kl_max"].into_iter()
+                    .all(|field| r[field].as_f64().unwrap() <= envelope(field)));
+            Ok(json!({"scope": "one launch; 15 alone/alone and 18 forced/alone pairs; no multiplier",
+                "within_alone_envelope": within, "greedy_equal": greedy_equal, "top1_equal": top1_equal,
+                "alone_distribution": prefill_pair_statistics(&controls),
+                "forced_distribution": prefill_pair_statistics(&resumed),
+                "alone_pairs": controls, "forced_pairs": resumed, "alone": alone, "forced": forced}))
+        })
+    }
+}
+
+fn prefill_pair_statistics(rows: &[Value]) -> Value {
+    let stats = |field: &str| {
+        let mut values: Vec<_> = rows.iter().filter_map(|r| r[field].as_f64()).collect();
+        values.sort_by(f64::total_cmp);
+        if values.is_empty() { return Value::Null; }
+        let n = values.len();
+        let median = if n % 2 == 0 { (values[n / 2 - 1] + values[n / 2]) * 0.5 } else { values[n / 2] };
+        json!({"min": values[0], "median": median, "max": values[n - 1], "pairs": n})
+    };
+    json!({"common_logprob_delta_max": stats("common_logprob_delta_max"),
+        "coarsened_kl_max": stats("coarsened_kl_max")})
+}
+
 fn prefill_first_distribution(a: &cuteafd_api::openai::probe::ProbeRecord,
     b: &cuteafd_api::openai::probe::ProbeRecord) -> Result<Value> {
     anyhow::ensure!(a.prompt_ids == b.prompt_ids, "prefill distribution prompt ids differ");
@@ -414,6 +485,18 @@ mod prefill_share_tests {
     use cuteafd_api::openai::probe::{ProbePrefillShare, ProbeRecord};
     use std::sync::{Arc, atomic::AtomicBool};
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn sampled_resumption_statistics_are_opt_in_and_report_even_medians() {
+        let rows = [json!({"common_logprob_delta_max": 3.0, "coarsened_kl_max": 0.3}),
+            json!({"common_logprob_delta_max": 1.0, "coarsened_kl_max": 0.1})];
+        let stats = prefill_pair_statistics(&rows);
+        assert_eq!(stats["common_logprob_delta_max"], json!({"min":1.0,"median":2.0,"max":3.0,"pairs":2}));
+        assert_eq!(prefill_pair_statistics(&[])["coarsened_kl_max"], Value::Null);
+        for profile in crate::profiles::builtin() {
+            assert!(!profile.panels.iter().any(|p| p.id == "prefill_resumption"));
+        }
+    }
 
     #[test]
     fn prefill_distribution_separates_raw_hashes_and_logprob_noise() {

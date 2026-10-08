@@ -15,6 +15,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 mod rows;
 
+fn is_false(value: &bool) -> bool { !*value }
+
 /// The request header naming a registered probe.
 pub const HEADER: &str = "x-cuteafd-probe";
 
@@ -27,6 +29,9 @@ pub struct ProbeSpec {
     /// Decode one token per step (no drafts of any kind).
     #[serde(default)]
     pub no_speculation: bool,
+    /// Qualification-only isolated V4.1 resumption; honoured only with its hidden server opt-in.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub prefill_park: bool,
     /// Token ids to run instead of tokenizing the rendered prompt.
     #[serde(default)]
     pub prompt_ids: Option<Vec<u32>>,

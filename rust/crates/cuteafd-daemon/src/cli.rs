@@ -461,6 +461,7 @@ mod tests {
             panic!("expected native serving");
         };
         assert!(!args.debug_prefill_park);
+        assert!(!args.debug_prefill_park_probes);
         assert_eq!(args.decode_share, 0.0);
         let super::Commands::ServeNative(args) = super::Cli::try_parse_from(
             base.into_iter().chain(["--debug-prefill-park"])).unwrap().command else {
@@ -470,6 +471,12 @@ mod tests {
         let mut command = super::Cli::command();
         let help = command.find_subcommand_mut("serve-native").unwrap().render_long_help().to_string();
         assert!(!help.contains("--debug-prefill-park"));
+        let super::Commands::ServeNative(args) = super::Cli::try_parse_from(
+            base.into_iter().chain(["--debug-prefill-park-probes"])).unwrap().command else {
+            panic!("expected native serving");
+        };
+        assert!(args.debug_prefill_park_probes);
+        assert!(!args.debug_prefill_park);
     }
 
     #[test]
@@ -724,6 +731,10 @@ pub(crate) struct NativeServeArgs {
     /// Qualification only: park at each original wave without intervening work.
     #[arg(long, env = "CUTEAFD_DEBUG_PREFILL_PARK", hide = true)]
     pub debug_prefill_park: bool,
+
+    /// Qualification only: honour per-probe isolated parking in one warm launch.
+    #[arg(long, env = "CUTEAFD_DEBUG_PREFILL_PARK_PROBES", hide = true)]
+    pub debug_prefill_park_probes: bool,
 
     /// Total prompt plus generated tokens; compressed cache is reserved at startup.
     #[arg(long, default_value_t = cuteafd_api::openai::MAX_CONTEXT_TOKENS, value_parser = clap::value_parser!(u32).range(1..=1048576))]
