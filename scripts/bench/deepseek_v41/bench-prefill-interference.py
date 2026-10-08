@@ -1,0 +1,205 @@
+#!/usr/bin/env python3
+"""C1/C4 streaming gaps under an 8K text admission or four-image burst.
+
+Adapted from parity-v2c's image-smoke driver. Gaps are between nonempty SSE
+emission deltas (a speculative emission may contain several tokens), not GPU
+kernel timing. Encode windows exclude the pair straddling encode completion.
+"""
+import argparse
+import base64
+import concurrent.futures
+import hashlib
+import json
+import math
+from pathlib import Path
+import re
+import struct
+import subprocess
+import threading
+import time
+import urllib.request
+import zlib
+
+MODEL = 'deepseek-ai/DeepSeek-V4.1-Flash'
+
+
+def percentile(values, q=0.99):
+    if not values:
+        return None
+    return sorted(values)[max(0, math.ceil(q * len(values)) - 1)]
+
+
+def gaps(stamps, start, end, contained=False):
+    # Encode is half-open. Never assign a gap ending after encoder completion
+    # to the encoder: that gap includes image LM prefill in the old scheduler.
+    pairs = zip(stamps, stamps[1:])
+    return [(b - a) * 1000 for a, b in pairs
+            if (start <= a < b < end if contained else b >= start and a <= end)]
+
+
+def summarize(values):
+    return {'max_ms': max(values, default=None), 'p99_ms': percentile(values),
+            'count': len(values)}
+
+
+def stream(url, body, notify=None):
+    request = urllib.request.Request(url + '/v1/chat/completions',
+        data=json.dumps(dict(body, stream=True, stream_options={'include_usage': True})).encode(),
+        headers={'Content-Type': 'application/json'})
+    started = time.time()
+    stamps, chunks, usage = [], [], None
+    with urllib.request.urlopen(request, timeout=900) as response:
+        for line in response:
+            if not line.startswith(b'data:'):
+                continue
+            data = line[5:].strip()
+            if data == b'[DONE]':
+                break
+            event = json.loads(data)
+            if event.get('error'):
+                raise RuntimeError(event['error'])
+            if event.get('usage'):
+                usage = event['usage']
+            for choice in event.get('choices', []):
+                delta = choice.get('delta', {})
+                text = delta.get('content', '') + delta.get('reasoning_content', '')
+                if text:
+                    stamps.append(time.time())
+                    chunks.append(text)
+                    if notify and len(stamps) == 12:
+                        notify()
+    text = ''.join(chunks)
+    return {'started': started, 'finished': time.time(), 'stamps': stamps,
+            'text': text, 'sha256': hashlib.sha256(text.encode()).hexdigest(), 'usage': usage,
+            'ttft_ms': (stamps[0] - started) * 1000 if stamps else None}
+
+
+def text_body(index, budget, label='decode-share'):
+    return {'model': MODEL, 'messages': [{'role': 'user', 'content':
+        f'{label} stream {index}. Write a complete Python AVL balanced binary search tree '
+        'implementation with insertion deletion traversal and validation. Include exactly '
+        '100 fully implemented, independently named unittest methods covering rotations, '
+        'deletion edge cases, fuzz tests and differential checks. Include all code, no prose, '
+        'and do not abbreviate or omit any test.'}], 'temperature': 0,
+        'thinking': {'type': 'disabled'}, 'max_tokens': budget}
+
+
+def png(side, seed):
+    def chunk(kind, body):
+        return struct.pack('>I', len(body)) + kind + body + struct.pack('>I', zlib.crc32(kind + body))
+    raw = (b'\0' + bytes([seed]) * (side * 3)) * side
+    return b'\x89PNG\r\n\x1a\n' + chunk(b'IHDR', struct.pack('>IIBBBBB', side, side, 8, 2, 0, 0, 0)) + chunk(b'IDAT', zlib.compress(raw)) + chunk(b'IEND', b'')
+
+
+def image_body(index, budget=16):
+    return {'model': MODEL, 'messages': [{'role': 'user', 'content': [
+        {'type': 'text', 'text': f'Decode share burst image {index}. What color is this image? One word.'},
+        {'type': 'image_url', 'image_url': {'url': 'data:image/png;base64,' + base64.b64encode(png(1344, index)).decode()}}
+    ]}], 'thinking': {'type': 'disabled'}, 'temperature': 0, 'max_tokens': budget}
+
+
+def encoder_windows(logs, start, end):
+    windows = []
+    prefill = []
+    for line in logs.splitlines():
+        if 'V4.1 prefill wave starts' in line:
+            match = re.search(r'started_unix_ms=([0-9.]+)', line)
+            if match:
+                prefill.append(float(match[1]) / 1000)
+        if 'V4.1 asynchronous image encoder roundtrip' not in line:
+            continue
+        fields = dict(re.findall(r'(tokens|started_unix_ms|finished_unix_ms|owner_ms|roundtrip_ms)=([0-9.]+)', line))
+        if 'started_unix_ms' not in fields:
+            continue
+        a, b = [float(fields[k]) / 1000 for k in ('started_unix_ms', 'finished_unix_ms')]
+        if a >= start and b <= end:
+            windows.append(dict(start=a, end=b, telemetry=fields))
+    # Another request can enter LM prefill while a later image is encoding.
+    # Cut there too: isolated encoder interference cannot include any LM wave.
+    for window in windows:
+        window['end'] = min(window['end'], min((p for p in prefill if p >= window['start']), default=window['end']))
+    return windows
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--url', required=True)
+    parser.add_argument('--container', required=True)
+    parser.add_argument('--output', type=Path, required=True)
+    parser.add_argument('--case', choices=['text', 'images'], required=True)
+    parser.add_argument('--tokenizer', type=Path)
+    parser.add_argument('--budget', type=int, default=2048)
+    parser.add_argument('--concurrency', type=int, choices=[1, 4], default=4)
+    parser.add_argument('--warm', action='store_true')
+    parser.add_argument('--prompt-label', default='decode-share',
+                        help='Use the same label across arms and a fresh label for each measured case')
+    args = parser.parse_args()
+    injected = [image_body(i) for i in range(4)]
+    if args.case == 'text':
+        if args.tokenizer is None:
+            parser.error('--tokenizer required for an 8K text prompt')
+        from tokenizers import Tokenizer
+        tokenizer = Tokenizer.from_file(str(args.tokenizer))
+        context = Path(__file__).read_text() * 64
+        ids = tokenizer.encode(context, add_special_tokens=False).ids
+        assert len(ids) >= 8000
+        injected = [{'model': MODEL, 'messages': [{'role': 'user', 'content':
+            tokenizer.decode(ids[:8000], skip_special_tokens=False) + '\nIgnore the code above. Count from 1 to 20, separated by commas. Output only the numbers.'}],
+            'temperature': 0, 'thinking': {'type': 'disabled'}, 'max_tokens': 64}]
+    for body in injected:
+        content = body['messages'][0]['content']
+        if isinstance(content, str):
+            body['messages'][0]['content'] = args.prompt_label + '. ' + content
+        else:
+            content[0]['text'] = args.prompt_label + '. ' + content[0]['text']
+    if args.warm:
+        with concurrent.futures.ThreadPoolExecutor(4) as pool:
+            list(pool.map(lambda i: stream(args.url, text_body(i + 20, 128, args.prompt_label + '-warm')), range(4)))
+        warm = json.loads(json.dumps(injected[0]))
+        content = warm['messages'][0]['content']
+        if isinstance(content, str):
+            warm['messages'][0]['content'] = 'Warm shape only. ' + content
+        else:
+            content[0]['text'] = 'Warm shape only. ' + content[0]['text']
+            # Keep the measured image out of the embedding cache as well.
+            content[1]['image_url']['url'] = 'data:image/png;base64,' + base64.b64encode(png(1344, 9)).decode()
+        stream(args.url, warm)
+    events = [threading.Event() for _ in range(args.concurrency)]
+    with concurrent.futures.ThreadPoolExecutor(8) as pool:
+        decoding = [pool.submit(stream, args.url, text_body(i, args.budget, args.prompt_label), event.set)
+                    for i, event in enumerate(events)]
+        for event in events:
+            assert event.wait(120), 'text did not reach injection point'
+        start = time.time()
+        prefilling = [pool.submit(stream, args.url, body) for body in injected]
+        prompts = [future.result() for future in prefilling]
+        end = time.time()
+        texts = [future.result() for future in decoding]
+    logs = subprocess.check_output(['docker', 'logs', '--since', f'{start:.9f}', args.container],
+                                   stderr=subprocess.STDOUT, text=True)
+    logs = re.sub(r'\x1b\[[0-9;]*m', '', logs)
+    windows = encoder_windows(logs, start, end) if args.case == 'images' else []
+    if args.case == 'images':
+        assert len(windows) == 4, windows
+    metrics = []
+    for result in texts:
+        stamps = result['stamps']
+        assert stamps and stamps[-1] >= max(p['stamps'][0] for p in prompts), 'text ended before injected prefills'
+        encode = [gap for w in windows for gap in gaps(stamps, w['start'], w['end'], contained=True)]
+        prefill_start = min((w['end'] for w in windows), default=start)
+        metrics.append({'normal': summarize(gaps(stamps, result['started'], start, contained=True)),
+                        'burst': summarize(gaps(stamps, start, end)),
+                        'prefill': summarize(gaps(stamps, prefill_start, end)),
+                        'encode': summarize(encode)})
+    waves = [float(value) for value in re.findall(r'wave_ms=([0-9.]+)', logs)]
+    report = {'case': args.case, 'concurrency': args.concurrency, 'burst_start': start, 'burst_end': end,
+              'text_streams': texts, 'injected': prompts, 'metrics': metrics,
+              'encode_windows': windows, 'prefill_wave_ms': summarize(waves),
+              'scope': 'nonempty SSE emission gaps; encoder-only pairs are wholly inside its half-open window',
+              'passed': all(p['stamps'] for p in prompts)}
+    args.output.write_text(json.dumps(report, indent=2) + '\n')
+    print(json.dumps({k: report[k] for k in ('case', 'metrics', 'prefill_wave_ms', 'passed')}), flush=True)
+
+
+if __name__ == '__main__':
+    main()
