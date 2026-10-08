@@ -60,6 +60,12 @@ pub struct MimoDraftGeometry {
     pub sinks: bool,
 }
 
+/// One byte-exact retained DFlash context mark (BF16 K/V and valid floor).
+pub fn mimo_draft_mark_bytes(layers: u64, kv_width: u64) -> Result<u64, MimoDraftStorageError> {
+    mul(mul(mul(layers, 1024)?, kv_width)?, 4)?.checked_add(8)
+        .ok_or(MimoDraftStorageError::Overflow)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MimoDraftWeightLayout {
     /// Owned BF16 GEMM values, excluding the borrowed target head.
@@ -270,6 +276,12 @@ impl MimoDraftWeightLayout {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn retained_draft_context_mark_counts_both_bf16_planes_and_floor() {
+        assert_eq!(mimo_draft_mark_bytes(5, 8 * 128).unwrap(), 20 * 1024 * 1024 + 8);
+        assert!(mimo_draft_mark_bytes(u64::MAX, 1024).is_err());
+    }
+
     fn pro() -> MimoDraftGeometry {
         MimoDraftGeometry {
             hidden: 6144,
