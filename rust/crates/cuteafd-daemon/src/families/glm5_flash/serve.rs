@@ -123,7 +123,6 @@ pub(crate) fn model_id(snapshot: &std::path::Path) -> Option<String> {
 pub(crate) async fn run_serve(args: ServeArgs) -> Result<()> {
     let api = args.api.load()?;
     let snapshot: PathBuf = args.engine.snapshot.clone();
-    let limits = NativeLimits::new(args.engine.max_context as u32, args.max_output)?;
     let encoding = if super::media::vision_config(args.vision, &snapshot)?.is_none() {
         GlmEncoding::from_snapshot(&snapshot)?
     } else {
@@ -152,7 +151,9 @@ pub(crate) async fn run_serve(args: ServeArgs) -> Result<()> {
     let media_cache_bytes = args.media_cache_bytes;
     let worker = tokio::task::spawn_blocking(move ||
         serve_loop(engine_args, receive, ready_tx, worker_stats, max_sequences, policy, decode_share, prefix, vision, media_cache_bytes, remote));
-    if let Some((preparer, health)) = ready_rx.await.context("engine failed before it was ready")?? {
+    let (max_context, media) = ready_rx.await.context("engine failed before it was ready")??;
+    let limits = NativeLimits::new(u32::try_from(max_context)?, args.max_output)?;
+    if let Some((preparer, health)) = media {
         profile = profile.with_loaded_vision(preparer);
         profile.vision_health = health;
     }
@@ -208,7 +209,7 @@ type VisionReady = Option<(Arc<cuteafd_api::openai::media::MediaPreparer>, Optio
 
 #[allow(clippy::too_many_arguments)]
 fn serve_loop(mut args: super::EngineArgs, mut receive: mpsc::Receiver<NativeRequest>,
-    ready: tokio::sync::oneshot::Sender<Result<VisionReady>>, stats: Arc<Mutex<serde_json::Value>>, max_sequences: usize,
+    ready: tokio::sync::oneshot::Sender<Result<(usize, VisionReady)>>, stats: Arc<Mutex<serde_json::Value>>, max_sequences: usize,
     policy: Policy, decode_share: DecodeShareArgs, prefix: PrefixArgs,
     vision: cuteafd_loader::plan::MediaMode, media_cache_bytes: Option<u64>, remote: Option<super::media::RemoteVision>) -> Result<()> {
     args.serving_graph_policy = Some((max_sequences.min(DECODE_ROWS), args.draft.is_some() || policy.copy > 0));
@@ -257,12 +258,12 @@ fn serve_loop(mut args: super::EngineArgs, mut receive: mpsc::Receiver<NativeReq
                 // every start-up allocation.
                 crate::shared::memory_report::log("glm5_flash ready");
                 if let Some(ready) = ready.take() {
-                    let _ = ready.send(Ok(preparer.clone().map(|p| (p, health.clone()))));
+                    let _ = ready.send(Ok((engine.max_context, preparer.clone().map(|p| (p, health.clone())))));
                 }
             })
     });
     if let Some(ready) = ready.take() {
-        let _ = ready.send(result.as_ref().map(|_| preparer.map(|p| (p, health))).map_err(|e| anyhow::anyhow!("{e:#}")));
+        let _ = ready.send(result.as_ref().map(|_| (args.max_context, preparer.map(|p| (p, health)))).map_err(|e| anyhow::anyhow!("{e:#}")));
     }
     result
 }

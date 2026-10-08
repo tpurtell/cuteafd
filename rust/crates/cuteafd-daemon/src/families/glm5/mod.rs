@@ -37,8 +37,8 @@ pub(crate) struct EngineArgs {
     /// Run only the first N layers (dense layers need no experts).
     #[arg(long)]
     pub layers: Option<usize>,
-    /// Longest sequence (the RoPE table and page tables).
-    #[arg(long, default_value_t = 32768)]
+    /// Longest sequence; 0 selects checkpoint full, bounded by compiled support and the admitted pool.
+    #[arg(long, default_value_t = 0)]
     pub max_context: usize,
     /// Tokens the shared latent/index cache pool holds across sequences; 0
     /// sizes it from what every GPU has left after weights and the planner's
@@ -250,6 +250,11 @@ impl Opened {
     pub fn with_engine<T>(&self, args: &EngineArgs,
         body: impl FnOnce(&engine::GlmEngine<'_>, Option<&mut SparkLink<'_>>, &tokio::runtime::Runtime) -> Result<T>)
         -> Result<T> {
+        let automatic_context = args.max_context == 0;
+        let mut context_args = args.clone();
+        context_args.max_context = crate::shared::context::checkpoint_context(
+            &args.snapshot, &args.manifest, "glm5", args.max_context)?;
+        let args = &context_args;
         let programs = self.library.programs()?.with_manifest(&args.manifest)?;
         programs.capacities().require_context("glm5", args.max_context)?;
         programs.load_all()?;
@@ -305,9 +310,10 @@ impl Opened {
         } else {
             args.pool_tokens
         };
+        let max_context = crate::shared::context::pool_context("glm5", args.max_context, automatic_context, pool_tokens, 256)?;
         let pages = pool_tokens.div_ceil(engine::PAGE_ROWS);
         let mut engine = engine::GlmEngine::new(&self.library, &programs, self.cfg.clone(), model, stream,
-            args.max_context, args.prefill_rows, pages, embedding)?;
+            max_context, args.prefill_rows, pages, embedding)?;
         engine.full_prefill_logits = args.full_prefill_logits;
         if let Some((device, stream)) = peer_stream {
             engine.attach_peer(device, stream, shares.pop().context("head-split shares")?)?;

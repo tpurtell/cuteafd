@@ -1738,3 +1738,16 @@ def test_explicit_audio_without_tower_refuses(tmp_path, mode):
     result = _family_launch_result(tmp_path, config, "test/mimo", f"VISION=off\nAUDIO={mode}\nRTX_GPUS=1\nSPECULATOR=off\n")
     assert result.returncode != 0
     assert "cuteafd serve-mimo" not in result.stderr
+
+
+@pytest.mark.parametrize("family", ["glm5", "glm5_flash", "qwen4", "mimo_flash", "mimo_pro", "deepseek_v4"])
+@pytest.mark.parametrize("context", [None, 65536])
+def test_generic_family_checkpoint_context_default_and_override(tmp_path, family, context):
+    config = SPLIT_CONFIGS.get(family, {"model_type": "glm_moe_dsa" if family == "glm5" else "deepseek_v4", "num_hidden_layers": 2, "first_k_dense_replace": 1})
+    keys = "SPECULATOR=off\nVISION=off\nAUDIO=off\nGLM5_FLASH_FP8_MODEL_ID=test/model\n"
+    if context is not None:
+        keys += f"MAX_CONTEXT_TOKENS={context}\n"
+    result = _family_launch_result(tmp_path, config, "test/model", keys)
+    assert result.returncode == 0, result.stderr
+    launch = next(line for line in result.stderr.splitlines() if " --snapshot " in line and "serve-" in line)
+    assert f"--max-context {context or 0}" in launch

@@ -771,6 +771,7 @@ impl Opened {
     pub fn with_engine_reserved<T>(&self, args: &EngineArgs,
         serving: Option<(&crate::shared::prefix::PrefixArgs, usize)>, prefill_output: MimoPrefillOutput,
         body: impl FnOnce(&engine::MimoEngine<'_>, Option<cuteafd_hostcache::config::Config>) -> Result<T>) -> Result<T> {
+        let automatic_context = args.max_context == 0;
         let mut resolved = args.clone();
         if resolved.max_context == 0 {
             resolved.max_context = cuteafd_loader::serving_capacity::checkpoint_context_limit(&self.checkpoint.config)?
@@ -819,7 +820,9 @@ impl Opened {
             }
         }
         let prefix_draft = serving.is_some_and(|(prefix, _)| prefix.mimo_prefix_draft);
-        let preflight = admission::preflight(self, args, &programs, split_device, serving, prefill_output, prefix_draft)?;
+        let preflight = admission::preflight(self, args, &programs, split_device, serving, prefill_output, prefix_draft, automatic_context)?;
+        resolved.max_context = usize::try_from(preflight.capacity.effective_max_context_tokens)?;
+        let args = &resolved;
         // Module allocation is checked against its provisional bound before
         // tensors. It does not qualify later capture or constraint demand.
         for sample in &preflight.memory {

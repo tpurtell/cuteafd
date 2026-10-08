@@ -30,6 +30,9 @@ pub(crate) struct EngineArgs {
     /// dsv4_programs.json written by the exporter next to the library.
     #[arg(long, default_value = "/opt/cuteafd/share/PROGRAMS.json")]
     pub manifest: PathBuf,
+    /// Longest sequence; 0 selects checkpoint full, bounded by compiled support.
+    #[arg(skip)]
+    pub max_context: usize,
     #[arg(long, default_value_t = 0)]
     pub device: i32,
     /// Split every backbone layer's attention heads (w_q rows, sinks, wo
@@ -247,7 +250,8 @@ pub(crate) fn with_engine<T>(
     let (embedding, (model, mut shares)) = crate::shared::token_io::TokenEmbedding::load(&loaded.library,
         embed_source(&loaded.catalog, loaded.cfg.dim)?, args.token_io.embed_placement, || { let _memory_scope = cuteafd_ffi::memory_ledger::scope("weights"); loader.model(&loaded.cfg) })?;
     tracing::info!(elapsed_ms = started.elapsed().as_millis() as u64, "DeepSeek V4 coordinator weights resident");
-    let max_context = caps["max_context"].as_u64().context("manifest max_context")? as usize;
+    let mut max_context = crate::shared::context::checkpoint_context(
+        &args.snapshot, &args.manifest, "deepseek_v4", args.max_context)?;
     let prefill_rows = caps["prefill_rows"].as_u64().context("prefill_rows")? as usize;
     let decode_rows = caps["decode_rows"].as_u64().context("decode_rows")? as usize;
     // The default pool and local-expert placement retain the existing path.
@@ -315,6 +319,8 @@ pub(crate) fn with_engine<T>(
             local_peak_bytes = local.peak_bytes, devices = ?capacity.devices, "DeepSeek V4 planner admission");
         Some((usize::try_from(capacity.allocated_gpu_kv_tokens)?, local))
     } else { None };
+    max_context = crate::shared::context::pool_context("deepseek_v4", max_context, args.max_context == 0,
+        auto.as_ref().map_or(args.pool_tokens, |a| a.0), 256)?;
     let shape = pool::PoolShape::new(
         args.max_sequences,
         caps["prefill_rows"].as_u64().context("prefill_rows")? as usize,

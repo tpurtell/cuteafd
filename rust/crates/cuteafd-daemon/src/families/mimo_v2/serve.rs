@@ -150,12 +150,11 @@ pub(crate) async fn run_serve(mut args: ServeArgs) -> Result<()> {
         "--prefill-chunk-s requires a positive --decode-share");
     let api = args.api.load()?;
     let snapshot: PathBuf = args.engine.snapshot.clone();
-    if args.engine.max_context == 0 {
-        let config = serde_json::from_reader(std::fs::File::open(snapshot.join("config.json"))?)?;
-        args.engine.max_context = cuteafd_loader::serving_capacity::checkpoint_context_limit(&config)?
-            .context("MiMo checkpoint lacks full-context capability")?.try_into()?;
+    let effective_sequences = args.max_sequences.clamp(1, DECODE_ROWS);
+    if effective_sequences != args.max_sequences {
+        tracing::warn!(requested = args.max_sequences, effective = effective_sequences, "clamping MiMo decoding sequences");
+        args.max_sequences = effective_sequences;
     }
-    let limits = NativeLimits::new(args.engine.max_context as u32, args.max_output)?;
     // MiMo's template and tool calls follow Qwen3-Coder's XML (`<tool_call>
     // <function=NAME><parameter=KEY>VALUE</parameter>`), its reasoning `<think>`.
     let encoding = QwenEncoding::from_snapshot(&snapshot)?;
@@ -163,11 +162,6 @@ pub(crate) async fn run_serve(mut args: ServeArgs) -> Result<()> {
         args.model_id.clone().or_else(|| crate::families::glm5_flash::serve::model_id(&snapshot)).context("model id")?,
         ModelEncoding::Qwen(Arc::new(encoding)),
     );
-    let effective_sequences = args.max_sequences.clamp(1, DECODE_ROWS);
-    if effective_sequences != args.max_sequences {
-        tracing::warn!(requested = args.max_sequences, effective = effective_sequences, "clamping MiMo decoding sequences");
-        args.max_sequences = effective_sequences;
-    }
     let depth = serving_queue_depth(args.http_queue_depth);
     anyhow::ensure!(depth > 0, "--http-queue-depth must be positive");
     let (queue, receive) = mpsc::channel::<NativeRequest>(depth);
@@ -192,7 +186,9 @@ pub(crate) async fn run_serve(mut args: ServeArgs) -> Result<()> {
     let media_cache_bytes = args.media_cache_bytes;
     let worker = tokio::task::spawn_blocking(move ||
         serve_loop(engine_args, receive, ready_tx, worker_stats, max_sequences, draft, prefix, vision, audio, media_cache_bytes, remote, remote_audio));
-    if let Some((preparer, audio_preparer, health, audio_health)) = ready_rx.await.context("engine failed before it was ready")?? {
+    let (max_context, media) = ready_rx.await.context("engine failed before it was ready")??;
+    let limits = NativeLimits::new(u32::try_from(max_context)?, args.max_output)?;
+    if let Some((preparer, audio_preparer, health, audio_health)) = media {
         if let Some(preparer) = preparer {
             profile = profile.with_loaded_vision(preparer);
             profile.vision_health = health.clone();
@@ -272,7 +268,7 @@ type VisionReady = Option<(Option<Arc<cuteafd_api::openai::media::MediaPreparer>
     Option<Arc<cuteafd_api::openai::media::audio::AudioPreparer>>, Option<Arc<std::sync::atomic::AtomicBool>>, Option<Arc<std::sync::atomic::AtomicBool>>)>;
 
 fn serve_loop(args: super::EngineArgs, mut receive: mpsc::Receiver<NativeRequest>,
-    ready: tokio::sync::oneshot::Sender<Result<VisionReady>>, stats: Arc<Mutex<serde_json::Value>>, max_sequences: usize,
+    ready: tokio::sync::oneshot::Sender<Result<(usize, VisionReady)>>, stats: Arc<Mutex<serde_json::Value>>, max_sequences: usize,
     draft: Policy, prefix: PrefixArgs, vision: cuteafd_loader::plan::MediaMode, audio: cuteafd_loader::plan::MediaMode, media_cache_bytes: Option<u64>, remote: Option<super::media::RemoteVision>, remote_audio: Option<super::media::RemoteAudio>) -> Result<()> {
     let opened = match open(&args) {
         Ok(opened) => opened,
@@ -311,13 +307,13 @@ fn serve_loop(args: super::EngineArgs, mut receive: mpsc::Receiver<NativeRequest
         anyhow::ensure!(preparer.is_none() || media.encoder().available_for(false), "vision encoder unavailable before readiness");
         anyhow::ensure!(audio_preparer.is_none() || media.encoder().available_for(true), "audio encoder unavailable before readiness");
         if let Some(ready) = ready.take() {
-            let _ = ready.send(Ok((preparer.is_some() || audio_preparer.is_some()).then(|| (preparer.clone(), audio_preparer.clone(), health.clone(), audio_health.clone()))));
+            let _ = ready.send(Ok((engine.max_context, (preparer.is_some() || audio_preparer.is_some()).then(|| (preparer.clone(), audio_preparer.clone(), health.clone(), audio_health.clone())))));
         }
         schedule(engine, &opened, &args.snapshot, &mut receive, &stats, max_sequences.min(DECODE_ROWS), draft, &prefix,
             args.token_io.token_select, host_config, &mut media, preparer.as_deref())
     });
     if let Some(ready) = ready.take() {
-        let _ = ready.send(result.as_ref().map(|_| (preparer.is_some() || audio_preparer.is_some()).then(|| (preparer, audio_preparer, health, audio_health))).map_err(|e| anyhow::anyhow!("{e:#}")));
+        let _ = ready.send(result.as_ref().map(|_| (args.max_context, (preparer.is_some() || audio_preparer.is_some()).then(|| (preparer, audio_preparer, health, audio_health)))).map_err(|e| anyhow::anyhow!("{e:#}")));
     }
     result
 }
