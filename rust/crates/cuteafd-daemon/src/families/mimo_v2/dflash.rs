@@ -130,7 +130,7 @@ impl DflashConfig {
         self.block - 1
     }
 
-    fn kv_width(&self) -> usize {
+    pub fn kv_width(&self) -> usize {
         self.kv_heads * self.head_dim
     }
 
@@ -591,6 +591,10 @@ impl<'a> MimoDrafter<'a> {
         };
         // SAFETY: the selected rows belong to the live BF16 matrix.
         unsafe { self.library.linear_bf16(x, at(bf16, first * k * 2), out, rows, k, n, self.stream) }
+    }
+
+    pub fn context_rings(&self) -> Vec<CuteafdDeviceBuffer> {
+        self.layers.iter().flat_map(|layer| [layer.k_ring.buffer, layer.v_ring.buffer]).collect()
     }
 
     /// Writes the context K/V of committed tapped rows.

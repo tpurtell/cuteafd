@@ -812,6 +812,24 @@ def test_speculator_and_its_pre_rename_keys_launch_the_same(tmp_path: Path) -> N
     assert "does not apply to mimo_v2" in bad
 
 
+@pytest.mark.parametrize("host, expected", [("", "auto"), ("HOST_CACHE_BYTES=0\n", None),
+                                           ("HOST_CACHE_BYTES=16GiB\n", "16GiB")])
+def test_mimo_port_flags_preserve_explicit_host_budget(tmp_path: Path, host: str, expected: str | None) -> None:
+    config = {"model_type": "mimo_v2_flash", "num_hidden_layers": 3, "moe_layer_freq": [0, 1, 1]}
+    keys = ("MIMO_HOST_CACHE=on\nMIMO_PREFIX_DRAFT=on\nMIMO_COPY_WINDOWS=on\n"
+            "MIMO_SNAPSHOT_WAIT=on\nMIMO_PREFILL_CHUNK_S=4\nHTTP_QUEUE_DEPTH=32\nHTTP_QUEUE_WAIT_MS=1234\n") + host
+    result = _family_launch_result(tmp_path, config, "XiaomiMiMo/MiMo-V2-Flash", keys)
+    assert result.returncode == 0, result.stderr
+    launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-mimo" in line)
+    for flag in ("--mimo-host-cache", "--mimo-prefix-draft", "--mimo-copy-windows",
+                 "--mimo-snapshot-wait", "--prefill-chunk-s 4", "--http-queue-depth 32", "--http-queue-wait-ms 1234"):
+        assert flag in launch
+    if expected is None:
+        assert "--host-cache-bytes" not in launch
+    else:
+        assert "--host-cache-bytes " + expected in launch
+
+
 def test_qwen_launches_with_the_prefix_cache_keys(tmp_path: Path) -> None:
     config = {"model_type": "qwen4_exp", "text_config": {"num_hidden_layers": 2,
                                                          "layer_types": ["linear_attention", "full_attention"]}}

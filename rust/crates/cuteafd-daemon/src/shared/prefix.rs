@@ -12,6 +12,11 @@ pub(crate) use budget::HostBudget;
 /// The prefix cache's knobs.
 #[derive(Debug, Clone, clap::Args)]
 pub(crate) struct PrefixArgs {
+    /// MiMo only: retain the DFlash context in positional prefix marks (experimental).
+    #[arg(long, env = "CUTEAFD_MIMO_PREFIX_DRAFT", default_value_t = false)]
+    pub mimo_prefix_draft: bool,
+    #[arg(skip)]
+    pub mimo_host_cap: bool,
     /// Retained snapshots per bank (prompts, completed turns); 0 turns the prefix cache off.
     #[arg(long, env = "CUTEAFD_PREFIX_CACHE_ENTRIES", default_value_t = 20)]
     pub prefix_cache_entries: usize,
@@ -96,6 +101,7 @@ impl PrefixArgs {
                 let memory = budget::host_memory()?;
                 let required = budget::retained_bytes(layout, self.prefix_cache_entries, max_context, chunk)?;
                 let bytes = budget::automatic_bytes(required, chunk, memory, self.host_cache_headroom_bytes);
+                let bytes = if self.mimo_host_cap { bytes.min(mimo_host_ceiling(memory.available, chunk)) } else { bytes };
                 tracing::info!(required_bytes = required, resolved_bytes = bytes, available_bytes = memory.available,
                     total_bytes = memory.total, headroom_bytes = self.host_cache_headroom_bytes,
                     "automatic retained-prefix host budget (does not add active KV capacity)");
@@ -123,6 +129,10 @@ impl PrefixArgs {
         self.host_config(layout, max_context)?.map(|config|
             CudaCopyEngine::new(library, template).map(|engine| (config, engine))).transpose()
     }
+}
+
+fn mimo_host_ceiling(available: u64, chunk: u64) -> u64 {
+    ((32u64 << 30).min(available / 5 * 2)) / chunk * chunk
 }
 
 /// Ids of the `markers` (message-start tokens such as `<|user|>`) that `tokenizer.json`'s added
@@ -178,6 +188,26 @@ mod tests {
     struct Cli {
         #[command(flatten)]
         prefix: PrefixArgs,
+    }
+
+    #[test]
+    fn mimo_auto_ceiling_is_bounded_and_chunk_aligned() {
+        let gib = 1u64 << 30;
+        assert_eq!(mimo_host_ceiling(100 * gib, gib), 32 * gib);
+        assert_eq!(mimo_host_ceiling(20 * gib, gib), 8 * gib);
+        assert_eq!(mimo_host_ceiling(gib, gib), 0);
+    }
+
+    #[test]
+    fn mimo_cap_preserves_explicit_disabled_and_fixed_budgets() {
+        let layout = FamilyLayout { page_rows: 64, pages: 1024, page_bytes: 65536, mark_bytes: 4096,
+            draft_bytes: 0, rule: cuteafd_core::prefix::ReuseRule::EXACT };
+        let mut disabled = Cli::parse_from(["serve", "--host-cache-bytes", "0"]).prefix;
+        disabled.mimo_host_cap = true;
+        assert!(disabled.host_config(layout, 32768).unwrap().is_none());
+        let mut fixed = Cli::parse_from(["serve", "--host-cache-bytes", "64GiB"]).prefix;
+        fixed.mimo_host_cap = true;
+        assert_eq!(fixed.host_config(layout, 32768).unwrap().unwrap().bytes, 64 << 30);
     }
 
     #[test]

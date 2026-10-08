@@ -350,6 +350,16 @@ if [[ ( $family == mimo_v2 || $family == qwen4 || $family == glm5_flash ) && $vi
   [[ -z "$(get MEDIA_CACHE_BYTES)" ]] || family_args+=(--media-cache-bytes "$(get MEDIA_CACHE_BYTES)")
 fi
 if [[ $family == mimo_v2 ]]; then
+  [[ -z "$(get HTTP_QUEUE_DEPTH)" ]] || family_args+=(--http-queue-depth "$(get HTTP_QUEUE_DEPTH)")
+  [[ -z "$(get HTTP_QUEUE_WAIT_MS)" ]] || family_args+=(--http-queue-wait-ms "$(get HTTP_QUEUE_WAIT_MS)")
+  [[ "$(get MIMO_COPY_WINDOWS off)" != on ]] || family_args+=(--mimo-copy-windows)
+  [[ "$(get MIMO_PREFIX_DRAFT off)" != on ]] || family_args+=(--mimo-prefix-draft)
+  [[ "$(get MIMO_SNAPSHOT_WAIT off)" != on ]] || family_args+=(--mimo-snapshot-wait)
+  if [[ "$(get MIMO_HOST_CACHE off)" == on ]]; then
+    family_args+=(--mimo-host-cache)
+    [[ -n "$(get HOST_CACHE_BYTES)" ]] || family_args+=(--host-cache-bytes auto)
+  fi
+  [[ -z "$(get MIMO_PREFILL_CHUNK_S)" ]] || family_args+=(--prefill-chunk-s "$(get MIMO_PREFILL_CHUNK_S)")
   # POOL_TOKENS=auto: the largest pool every GPU admits after all fixed costs (up to 2M tokens).
   # Default auto (measured 2026-10-03, MiMo V2.6 Pro 2 RTX + 6: 131072 -> 2,097,152 tokens, C1/C4/8K
   # prefill unchanged); a number pins the pool.

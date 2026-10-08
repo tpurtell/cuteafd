@@ -80,6 +80,14 @@ impl<P> PrefillQueue<P> {
         self.waiting.is_empty()
     }
 
+    pub fn iter(&self) -> impl Iterator<Item = &P> {
+        self.waiting.iter()
+    }
+
+    pub fn iter_mut(&mut self) -> impl Iterator<Item = &mut P> {
+        self.waiting.iter_mut()
+    }
+
     pub fn push(&mut self, prompt: P) {
         self.waiting.push_back(prompt);
     }
