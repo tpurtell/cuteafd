@@ -9,6 +9,11 @@ pub enum MimoDraftRepresentation {
 
 }
 
+/// Serving contexts cover every target ring; a larger explicit arena does not widen the draft batch.
+pub fn mimo_draft_context_slots(draft_sequences: u64, target_rings: u64, explicit: Option<u64>) -> u64 {
+    explicit.unwrap_or(draft_sequences).max(draft_sequences).max(target_rings)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MimoDraftCapacity {
     pub context_slots: usize,
@@ -276,6 +281,14 @@ impl MimoDraftWeightLayout {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn serving_context_slots_cover_rings_batch_and_explicit_arena() {
+        assert_eq!(mimo_draft_context_slots(4, 16, None), 16);
+        assert_eq!(mimo_draft_context_slots(24, 16, None), 24);
+        assert_eq!(mimo_draft_context_slots(16, 16, Some(25)), 25);
+        assert_eq!(mimo_draft_context_slots(16, 16, Some(1)), 16);
+    }
+
     #[test]
     fn retained_draft_context_mark_counts_both_bf16_planes_and_floor() {
         assert_eq!(mimo_draft_mark_bytes(5, 8 * 128).unwrap(), 20 * 1024 * 1024 + 8);

@@ -148,8 +148,10 @@ pub(crate) async fn run_serve(args: ServeArgs) -> Result<()> {
     engine_args.rings = engine_args.rings.max(args.max_sequences);
     let (worker_stats, max_sequences) = (stats.clone(), args.max_sequences);
     engine_args.draft_sequences = engine_args.draft_sequences.max(args.max_sequences);
-    engine_args.draft_context_slots = Some(engine_args.draft_context_slots.unwrap_or(engine_args.draft_sequences)
-        .max(engine_args.rings));
+    engine_args.draft_context_slots = Some(usize::try_from(
+        cuteafd_loader::families::mimo_v2::draft_representation::mimo_draft_context_slots(
+            engine_args.draft_sequences as u64, engine_args.rings as u64,
+            engine_args.draft_context_slots.map(|n| n as u64)))?);
     let draft = Policy { copy: if args.no_copy_drafts { 0 } else { COPY_DRAFT }, fixed: args.draft_fixed,
         decode_share: args.decode_share, chunk_s: args.prefill_chunk_s, indexed_copy: args.mimo_copy_windows,
         snapshot_wait: args.mimo_snapshot_wait };

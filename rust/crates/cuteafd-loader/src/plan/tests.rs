@@ -1136,6 +1136,36 @@ fn host_embedding_removes_only_the_lead_copy_before_pool_admission() {
 }
 
 #[test]
+fn mimo_draft_prefix_ledger_is_opt_in_and_checked() {
+    let dir = tempfile::tempdir().unwrap();
+    write_snapshot(dir.path(), &mimo_pro_config(), &mimo_pro_tensors(), Some(8));
+    let mut options = PlanOptions { layout: Some(layout::LayoutOptions {
+        concurrency: 16, ..Default::default()
+    }), ..sparks(4) };
+    let base = plan(dir.path(), &options).unwrap().memory_layout.unwrap();
+    assert!(!base.devices[0].items.iter().any(|i| i.group == "DFlash context marks"));
+    let draft = dir.path().join("dflash");
+    std::fs::create_dir(&draft).unwrap();
+    std::fs::write(draft.join("config.json"), json!({"num_hidden_layers": 5,
+        "num_key_value_heads": 8, "head_dim": 128}).to_string()).unwrap();
+    let disabled = plan(dir.path(), &options).unwrap().memory_layout.unwrap();
+    assert_eq!(disabled.devices[0].used_bytes(), base.devices[0].used_bytes());
+    options.layout.as_mut().unwrap().mimo_prefix_draft = true;
+    let marked = plan(dir.path(), &options).unwrap().memory_layout.unwrap();
+    let bytes = marked.devices[0].items.iter().find(|i| i.group == "DFlash context marks").unwrap().bytes;
+    assert_eq!(bytes, (20 * (1 << 20) + 8) * 42);
+    assert_eq!(marked.devices[0].items.iter().find(|i| i.group == "DFlash valid-floor transfer").unwrap().bytes, 16 * 8);
+    options.layout.as_mut().unwrap().draft_context_slots = Some(25);
+    let overridden = plan(dir.path(), &options).unwrap().memory_layout.unwrap();
+    assert_eq!(overridden.devices[0].items.iter().find(|i| i.group == "DFlash valid-floor transfer").unwrap().bytes, 16 * 8);
+    assert!(overridden.notes.iter().any(|note| note.contains("context slots 25")));
+    std::fs::write(draft.join("config.json"), "{}").unwrap();
+    let malformed = plan(dir.path(), &options).unwrap();
+    assert!(!malformed.placement_supported);
+    assert!(!malformed.executable());
+}
+
+#[test]
 fn qwen_layout_reserves_recurrent_state_before_auto_pool_and_leaves_peer_idle() {
     use cuteafd_core::memory_layout::Category;
     let dir = snapshot(qwen4_config(48), &[]);

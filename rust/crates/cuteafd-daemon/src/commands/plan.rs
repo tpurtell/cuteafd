@@ -36,6 +36,10 @@ fn options(args: &PlanArgs) -> Result<PlanOptions, PlanError> {
                 graph_budget_bytes: args.graph_budget_mib.map(|mib| mib << 20),
                 concurrency: args.concurrency,
                 prefix_slots: args.prefix_slots,
+                mimo_prefix_draft: args.mimo_prefix_draft,
+                mimo_rings: args.mimo_rings,
+                draft_sequences: args.draft_sequences,
+                draft_context_slots: args.draft_context_slots,
                 native_mtp_layers: args.native_mtp_layers,
                 workspace_manifest: args.workspace_manifest.clone(),
                 drafter_bytes: if args.drafter_gib > 0.0 { budget_bytes("--drafter-gib", args.drafter_gib)? } else { 0 },
@@ -122,9 +126,27 @@ mod tests {
             graph_budget_mib: None,
             concurrency: 8,
             prefix_slots: None,
+            mimo_prefix_draft: false,
+            mimo_rings: 16,
+            draft_sequences: 4,
+            draft_context_slots: None,
             native_mtp_layers: 3,
             workspace_manifest: None,
         }
+    }
+
+    #[test]
+    fn planner_threads_warm_draft_context_override() {
+        use clap::Parser;
+        let cli = crate::cli::Cli::try_parse_from(["cuteafd", "plan", "/not-read", "--layout",
+            "--mimo-prefix-draft", "--rings", "20", "--draft-sequences", "8",
+            "--draft-context-slots", "25"]).unwrap();
+        let crate::cli::Commands::Plan(args) = cli.command else { unreachable!() };
+        let layout = options(&args).unwrap().layout.unwrap();
+        assert!(layout.mimo_prefix_draft);
+        assert_eq!(layout.mimo_rings, 20);
+        assert_eq!(layout.draft_sequences, 8);
+        assert_eq!(layout.draft_context_slots, Some(25));
     }
 
     #[test]
