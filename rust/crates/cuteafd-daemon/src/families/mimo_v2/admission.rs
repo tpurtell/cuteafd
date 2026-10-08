@@ -18,6 +18,16 @@ pub(super) struct Preflight {
     pub local_expert_budget: usize,
 }
 
+fn resolve_pool_context(capacity: &mut cuteafd_core::serving_capacity::ResolvedCapacity, automatic: bool, unit_rows: u64) -> Result<()> {
+    capacity.effective_max_context_tokens = crate::shared::context::pool_context("mimo_v2",
+        usize::try_from(capacity.effective_max_context_tokens)?, automatic,
+        usize::try_from(capacity.allocated_gpu_kv_tokens)?, super::engine::PAGE_ROWS)? as u64;
+    let sequence_units = capacity.effective_max_context_tokens.div_ceil(unit_rows);
+    capacity.active_max_context_sequences = (capacity.allocated_gpu_kv_tokens / unit_rows / sequence_units)
+        .min(u64::from(capacity.concurrency)) as u32;
+    Ok(())
+}
+
 fn aggregate_mark_bytes(target: u64, draft: u64, enabled: bool) -> Result<u64> {
     target.checked_add(if enabled { draft } else { 0 }).context("MiMo mark size overflow")
 }
@@ -107,9 +117,10 @@ pub(super) fn preflight(
     serving: Option<(&crate::shared::prefix::PrefixArgs, usize)>,
     prefill_output: MimoPrefillOutput,
     prefix_draft: bool,
+    automatic_context: bool,
 ) -> Result<Preflight> {
     use cuteafd_core::serving_capacity::{
-        admit_device_reservations_with_headroom, resolve_capacity, CapacityPolicy, DeviceMemory,
+        admit_device_reservations_with_headroom, resolve_capacity_with_startup_peaks, CapacityPolicy, DeviceMemory,
         small_card_headroom_bytes,
     };
     use cuteafd_ffi::programs::VOCABULARY_HEAD_WORKSPACE;
@@ -407,16 +418,26 @@ pub(super) fn preflight(
             &loading.reservations, small_card_headroom_bytes(sample.total_bytes))
             .with_context(|| format!("MiMo target-loading admission; steady contract {report}"))?;
     }
-    let capacity = resolve_capacity(policy, &profiles.steady, &memory).with_context(|| {
+    let intake_probe_bytes = if spark_ranks > 0 {
+        match std::env::var("CUTEAFD_SPARK_INTAKE").as_deref() {
+            Err(_) | Ok("auto" | "gpu") => 64 << 20,
+            Ok("host" | "pinned") => 0,
+            Ok(other) => {
+                anyhow::bail!("CUTEAFD_SPARK_INTAKE={other:?} is not auto, gpu, pinned or host")
+            }
+        }
+    } else {
+        0
+    };
+    let mut capacity = resolve_capacity_with_startup_peaks(policy, &profiles.steady, &memory,
+        &[(memory[0].device, intake_probe_bytes)]).with_context(|| {
         format!("MiMo steady admission; complete per-GPU reservation contract {report}")
     })?;
     let pool_tokens = capacity.allocated_gpu_kv_tokens;
     let shortfall_tokens = (args.max_context as u64).saturating_sub(pool_tokens);
     tracing::info!(pool_tokens, context_tokens=args.max_context, full_context_sequences=pool_tokens / args.max_context as u64,
         slots=concurrency, shortfall_tokens, "MiMo full-context pool admission before allocation");
-    if shortfall_tokens > 0 {
-        tracing::warn!(shortfall_tokens, "MiMo full context does not fit; lower context/concurrency or use host embedding/add coordinator memory");
-    }
+    resolve_pool_context(&mut capacity, automatic_context, profiles.steady.pool_unit_rows)?;
     if !draft_packing.is_empty() {
         let units = capacity.allocated_gpu_kv_tokens / profiles.steady.pool_unit_rows;
         for (rank, phase) in profiles.post_target_kv.iter().enumerate() {
@@ -446,21 +467,10 @@ pub(super) fn preflight(
             bytes.checked_add(reservation.bytes)
         })
         .context("MiMo admitted local expert size overflow")?;
-    let intake_probe_bytes = if spark_ranks > 0 {
-        match std::env::var("CUTEAFD_SPARK_INTAKE").as_deref() {
-            Err(_) | Ok("auto" | "gpu") => 64 << 20,
-            Ok("host" | "pinned") => 0,
-            Ok(other) => {
-                anyhow::bail!("CUTEAFD_SPARK_INTAKE={other:?} is not auto, gpu, pinned or host")
-            }
-        }
-    } else {
-        0
-    };
     if intake_probe_bytes > 0 {
         // The GPU-landing and H2D probes each release their 64 MiB before
         // transport storage is created. Admit their maximum, not their sum,
-        // as a startup peak without reducing permanent KV/expert capacity.
+        // as the startup peak reserved before automatic pool sizing.
         // On small cards the probe uses floor slack released before serving:
         // charge max(probe, floor), not probe + floor, only for this phase.
         let lead = &capacity.devices[0];
@@ -1124,6 +1134,25 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn automatic_context_clamp_updates_aligned_full_sequence_capacity() {
+        use cuteafd_core::serving_capacity::*;
+        let profile = CapacityProfile {
+            context: ContextLimits { checkpoint_max_tokens: 1048576, compiled_index_max_tokens: None },
+            pool_unit_rows: 64,
+            devices: vec![DeviceCosts { device: 0, pool_unit_bytes: 64, reservations: vec![] }],
+            host_prefix_bytes: 0,
+        };
+        let policy = CapacityPolicy { pool_tokens: Some(962560), ..CapacityPolicy::default() };
+        let memory = [DeviceMemory { device: 0, total_bytes: 2000000, baseline_free_bytes: 2000000 }];
+        let mut capacity = resolve_capacity(policy, &profile, &memory).unwrap();
+        assert_eq!(capacity.active_max_context_sequences, 0);
+        assert!(resolve_pool_context(&mut capacity.clone(), false, 64).is_err());
+        resolve_pool_context(&mut capacity, true, 64).unwrap();
+        assert_eq!(capacity.effective_max_context_tokens, 962496);
+        assert_eq!(capacity.active_max_context_sequences, 1);
+    }
 
     #[test]
     fn independent_prefill_admits_two_lead_heads_and_no_peer_head() {

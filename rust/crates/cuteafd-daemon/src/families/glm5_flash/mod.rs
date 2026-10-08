@@ -44,8 +44,8 @@ pub(crate) struct EngineArgs {
     /// Run only the first N layers (layers 0-2 are the dense ones).
     #[arg(long)]
     pub layers: Option<usize>,
-    /// Longest sequence (the exported index top-k covers up to 131072).
-    #[arg(long, default_value_t = 65_536)]
+    /// Longest sequence; 0 selects checkpoint full, bounded by compiled support and the admitted pool.
+    #[arg(long, default_value_t = 0)]
     pub max_context: usize,
     /// Tokens the MLA record pools hold across sequences.
     #[arg(long, default_value_t = 32_768)]
@@ -1195,6 +1195,11 @@ impl Opened {
             resolved.kda_prefill_expanded = false;
         }
         let args = &resolved;
+        let automatic_context = args.max_context == 0;
+        let mut context_args = args.clone();
+        context_args.max_context = crate::shared::context::checkpoint_context(
+            &args.snapshot, &args.manifest, "glm5_flash", args.max_context)?;
+        let args = &context_args;
         let programs = self.library.programs()?.with_manifest(&args.manifest)?;
         programs.capacities().require_context("glm5_flash", args.max_context)?;
         // The single-copy FP8 consumers of the selected representations, before any weight loads.
@@ -1513,9 +1518,10 @@ impl Opened {
         } else {
             (args.pool_tokens, startup_graphs)
         };
+        let max_context = crate::shared::context::pool_context("glm5_flash", args.max_context, automatic_context, pool_tokens, 256)?;
         let pages = (pool_tokens + reserved_units as usize * engine::UNIT_ROWS).div_ceil(engine::PAGE_ROWS);
         let mut engine = engine::GlmfEngine::new(&self.library, &programs, self.cfg.clone(), model, stream,
-            args.max_context, args.prefill_rows, args.prefill_lanes, pages, args.slots, embedding, index_cache,
+            max_context, args.prefill_rows, args.prefill_lanes, pages, args.slots, embedding, index_cache,
             args.kda_state, args.decode_rows, records)?;
         if !startup_graphs {
             engine.capture_graphs_lazily();

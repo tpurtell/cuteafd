@@ -107,7 +107,6 @@ fn model_id(snapshot: &std::path::Path) -> Option<String> {
 pub(crate) async fn run_serve(args: ServeArgs) -> Result<()> {
     let api = args.api.load()?;
     let snapshot: PathBuf = args.engine.snapshot.clone();
-    let limits = NativeLimits::new(args.engine.max_context as u32, args.max_output)?;
     let encoding = Arc::new(QwenEncoding::from_snapshot(&snapshot)?);
     let eos = encoding.tokens().eos.clone();
     let mut profile = ModelProfile::new(
@@ -134,7 +133,9 @@ pub(crate) async fn run_serve(args: ServeArgs) -> Result<()> {
     let media_cache_bytes = args.media_cache_bytes;
     let worker = tokio::task::spawn_blocking(move ||
         serve_loop(engine_args, receive, ready_tx, worker_stats, max_sequences, drafts, eos, decode_share, prefix, vision, media_cache_bytes, remote));
-    if let Some((preparer, health)) = ready_rx.await.context("engine failed before it was ready")?? {
+    let (max_context, media) = ready_rx.await.context("engine failed before it was ready")??;
+    let limits = NativeLimits::new(u32::try_from(max_context)?, args.max_output)?;
+    if let Some((preparer, health)) = media {
         profile = profile.with_loaded_vision(preparer);
         profile.vision_health = health;
     }
@@ -193,7 +194,7 @@ type VisionReady = Option<(Arc<cuteafd_api::openai::media::MediaPreparer>, Optio
 
 #[allow(clippy::too_many_arguments)]
 fn serve_loop(mut args: super::EngineArgs, mut receive: mpsc::Receiver<NativeRequest>,
-    ready: tokio::sync::oneshot::Sender<Result<VisionReady>>, stats: Arc<Mutex<serde_json::Value>>, max_sequences: usize,
+    ready: tokio::sync::oneshot::Sender<Result<(usize, VisionReady)>>, stats: Arc<Mutex<serde_json::Value>>, max_sequences: usize,
     draft: Drafts, eos: Vec<u32>, decode_share: DecodeShareArgs, prefix: PrefixArgs,
     vision: cuteafd_loader::plan::MediaMode, media_cache_bytes: Option<u64>, remote: Option<super::media::RemoteVision>) -> Result<()> {
     args.planner_graph_modes = Some((max_sequences.min(DECODE_ROWS), !matches!(draft, Drafts::None)));
@@ -244,13 +245,13 @@ fn serve_loop(mut args: super::EngineArgs, mut receive: mpsc::Receiver<NativeReq
             probe::graph_capture_stats(&mut stats);
         }
         if let Some(ready) = ready.take() {
-            let _ = ready.send(Ok(preparer.clone().map(|p| (p, health.clone()))));
+            let _ = ready.send(Ok((engine.max_context, preparer.clone().map(|p| (p, health.clone())))));
         }
         schedule(engine, &opened, &args.snapshot, &mut receive, &stats, max_sequences.min(DECODE_ROWS), draft, eos,
             decode_share, &prefix, args.token_io.token_select, &mut media, preparer.as_deref())
     });
     if let Some(ready) = ready.take() {
-        let _ = ready.send(result.as_ref().map(|_| None).map_err(|e| anyhow::anyhow!("{e:#}")));
+        let _ = ready.send(result.as_ref().map(|_| (args.max_context, None)).map_err(|e| anyhow::anyhow!("{e:#}")));
     }
     result
 }

@@ -36,8 +36,8 @@ pub(crate) struct ServeArgs {
     pub engine: EngineArgs,
     #[arg(long, default_value = "0.0.0.0:8000")]
     pub listen: String,
-    /// Longest prompt + output accepted (at most the programs' max context).
-    #[arg(long, default_value_t = 8192)]
+    /// Longest sequence; 0 selects checkpoint full, bounded by compiled support and the admitted pool.
+    #[arg(long, default_value_t = 0)]
     pub max_context: u32,
     #[arg(long, default_value_t = 4096)]
     pub max_output: u32,
@@ -74,7 +74,6 @@ fn eos_token(snapshot: &Path) -> Result<u32> {
 
 pub(crate) async fn run_serve(args: ServeArgs) -> Result<()> {
     let api = args.api.load()?;
-    let limits = NativeLimits::new(args.max_context, args.max_output)?;
     let profile = ModelProfile::new(
         args.model_id.clone().or_else(|| model_id(&args.engine.snapshot)).context("model id")?,
         ModelEncoding::DeepseekV4,
@@ -82,14 +81,16 @@ pub(crate) async fn run_serve(args: ServeArgs) -> Result<()> {
     let (queue, receive) = mpsc::channel::<NativeRequest>(16);
     let stats = Arc::new(Mutex::new(serde_json::Value::Null));
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
-    let engine_args = args.engine.clone();
+    let mut engine_args = args.engine.clone();
+    engine_args.max_context = args.max_context as usize;
     let worker_stats = stats.clone();
     let (max_context, speculate_max, decode_share, prefix) =
         (args.max_context as usize, args.speculate_max_sequences, args.decode_share, args.prefix.clone());
     let hub = console::hub(args.console.console_text, || Ok(console_layout(&args, &profile.id)));
     let worker = tokio::task::spawn_blocking(move ||
         serve_loop(engine_args, receive, ready_tx, worker_stats, max_context, speculate_max, decode_share, prefix));
-    ready_rx.await.context("engine failed before it was ready")??;
+    let max_context = ready_rx.await.context("engine failed before it was ready")??;
+    let limits = NativeLimits::new(u32::try_from(max_context)?, args.max_output)?;
     cuteafd_bench::context::phase("engine loaded");
     let router = cuteafd_api::openai::router_for_model(queue, limits, stats, Duration::from_secs(25),
         hub.clone(), crate::shared::api::profile(profile.clone()));
@@ -149,7 +150,7 @@ struct StepShape {
 fn serve_loop(
     args: EngineArgs,
     mut receive: mpsc::Receiver<NativeRequest>,
-    ready: tokio::sync::oneshot::Sender<Result<()>>,
+    ready: tokio::sync::oneshot::Sender<Result<usize>>,
     stats: Arc<Mutex<serde_json::Value>>,
     max_context: usize,
     speculate_max: usize,
@@ -180,7 +181,7 @@ fn serve_loop(
                 "--max-context exceeds the exported programs; requests are limited to the programs' context");
         }
         if let Some(ready) = ready.take() {
-            let _ = ready.send(Ok(()));
+            let _ = ready.send(Ok(engine.max_context));
         }
         let local = engine.local_layers();
         console::layer_classes((0..engine.weights.layers.len()).map(|l| console::layer_class(false, l >= local)).collect());
@@ -190,7 +191,7 @@ fn serve_loop(
             decode_share, &prefix, &mut selector)
     });
     if let Some(ready) = ready.take() {
-        let _ = ready.send(result.as_ref().map(|_| ()).map_err(|e| anyhow::anyhow!("{e:#}")));
+        let _ = ready.send(result.as_ref().map(|_| args.max_context).map_err(|e| anyhow::anyhow!("{e:#}")));
     }
     result
 }

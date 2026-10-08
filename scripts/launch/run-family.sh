@@ -276,10 +276,9 @@ case "$family:$speculator" in
 esac
 draft_args=()
 embedding="$(get EMBEDDING gpu)"
-default_context=8192
+default_context=0
 default_concurrency=8
 if [[ "$family" == mimo_v2 ]]; then
-  default_context=0
   profile_gpu="$(get COORDINATOR_GPUS "$(get COORDINATOR_GPU 0)")"; profile_gpu="${profile_gpu%%,*}"
   profile_mib="$(nvidia-smi -i "$profile_gpu" --query-gpu=memory.total --format=csv,noheader,nounits)"
   profile_gib="$(python3 -c 'import sys; print(min(float(sys.argv[1])/1024, float(sys.argv[2]) if sys.argv[2] else float("inf")))' "$profile_mib" "$coordinator_budget")"

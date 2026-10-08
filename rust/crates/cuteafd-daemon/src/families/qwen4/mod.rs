@@ -36,8 +36,8 @@ pub(crate) struct EngineArgs {
     /// Run only the first N layers.
     #[arg(long)]
     pub layers: Option<usize>,
-    /// Longest sequence (the exported index top-k covers the manifest's max_context).
-    #[arg(long, default_value_t = 65_536)]
+    /// Longest sequence; 0 selects checkpoint full, bounded by compiled support and the admitted pool.
+    #[arg(long, default_value_t = 0)]
     pub max_context: usize,
     /// Tokens the K/V record pools hold across sequences (0: planner admission).
     #[arg(long, default_value_t = 32_768)]
@@ -289,6 +289,11 @@ impl Opened {
     /// Builds the engine and hands it to `body`.
     pub fn with_engine<T>(&self, args: &EngineArgs, body: impl FnOnce(&engine::Qwen4Engine<'_>) -> Result<T>)
         -> Result<T> {
+        let automatic_context = args.max_context == 0;
+        let mut context_args = args.clone();
+        context_args.max_context = crate::shared::context::checkpoint_context(
+            &args.snapshot, &args.manifest, "qwen4", args.max_context)?;
+        let args = &context_args;
         let programs = self.library.programs()?.with_manifest(&args.manifest)?;
         programs.capacities().require_context("qwen4", args.max_context)?;
         let mut required: Vec<String> = Vec::new();
@@ -365,9 +370,10 @@ impl Opened {
         let pool_tokens = if budget_admission {
             admission::pool_tokens(&self.library, args, &self.cfg, layers, model.mtp.is_some(), future_expert_bytes)?
         } else { args.pool_tokens };
+        let max_context = crate::shared::context::pool_context("qwen4", args.max_context, automatic_context, pool_tokens, 256)?;
         let pages = pool_tokens.div_ceil(engine::PAGE_ROWS);
         let mut engine = engine::Qwen4Engine::new(&self.library, &programs, self.cfg.clone(), model, ple, stream,
-            args.max_context, args.prefill_rows, pages, args.slots, embedding)?;
+            max_context, args.prefill_rows, pages, args.slots, embedding)?;
         if args.planner_graph_modes.is_some() { engine.enable_startup_graphs(); }
         engine.w8a8_prefill = args.fp8_prefill_w8a8;
         if let Some(experts) = match admitted_experts { Some(experts) => experts, None => self.experts(args, layers, stream)? } {

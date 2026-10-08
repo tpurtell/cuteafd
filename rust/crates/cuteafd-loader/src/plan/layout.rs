@@ -359,9 +359,27 @@ fn mimo_draft_prefix_bytes(config: &serde_json::Value, marks: u64, rings: u64) -
         rings.checked_mul(8).ok_or("DFlash floors overflow")?))
 }
 
+fn resolved_context(family: &str, requested: u64, checkpoint: u64, manifest: Option<&serde_json::Value>) -> u64 {
+    if requested > 0 { return requested; }
+    if matches!(family, "mimo_v2" | "deepseek_v41") { return checkpoint; }
+    manifest.and_then(|m| m["capacities"]["max_context"].as_u64()).filter(|&n| n > 0)
+        .map_or(checkpoint, |limit| if checkpoint > 0 { limit.min(checkpoint) } else { limit })
+}
+
 #[cfg(test)]
 mod draft_prefix_tests {
     use super::*;
+
+    #[test]
+    fn full_context_defaults_preserve_dynamic_families_and_bound_indexed_families() {
+        let manifest = serde_json::json!({"capacities": {"max_context": 131072}});
+        for family in ["mimo_v2", "deepseek_v41", "glm5", "glm5_flash", "qwen4", "deepseek_v4"] {
+            let expected = if matches!(family, "mimo_v2" | "deepseek_v41") { 1048576 } else { 131072 };
+            assert_eq!(resolved_context(family, 0, 1048576, Some(&manifest)), expected);
+            assert_eq!(resolved_context(family, 65536, 1048576, Some(&manifest)), 65536);
+            assert_eq!(resolved_context(family, 0, 1048576, None), 1048576);
+        }
+    }
 
     #[test]
     fn draft_prefix_reserves_marks_and_all_ring_floors() {
@@ -402,10 +420,8 @@ pub fn layout(report: &mut PlanReport, model: &dyn super::FamilyModel, checkpoin
     let concurrency = if options.concurrency > 0 { options.concurrency }
         else if family == "deepseek_v41" || (family == "mimo_v2" && small_card) { 16 }
         else { 8 };
-    let context_tokens = if options.context_tokens > 0 { options.context_tokens }
-        else if family == "deepseek_v4" { workspace_manifest.as_ref().and_then(|m| m["capacities"]["max_context"].as_u64()).unwrap_or(131072) }
-        else if matches!(family, "deepseek_v41" | "mimo_v2") { crate::serving_capacity::checkpoint_context_limit(&checkpoint.config).ok().flatten().unwrap_or(0) }
-        else { 0 };
+    let checkpoint_context = report.cache_requirements.as_ref().and_then(|r| r.checkpoint_max_context_tokens).unwrap_or(0);
+    let context_tokens = resolved_context(family, options.context_tokens, checkpoint_context, workspace_manifest.as_ref());
     let target_pool_tokens = options.target_pool_tokens.max(context_tokens);
     let conversions = load_conversions(family, checkpoint);
     let costs = family_costs(family);
@@ -424,7 +440,7 @@ pub fn layout(report: &mut PlanReport, model: &dyn super::FamilyModel, checkpoin
             items: Vec::new(), kv_tokens: 0 })
         .collect();
     let mut waste = Vec::new();
-    let mut notes = Vec::new();
+    let mut notes = vec![format!("resolved context {context_tokens} tokens (checkpoint {checkpoint_context})")];
     let reference_gpu = gpus == 1 && (94 * GIB..=96 * GIB).contains(&options.rtx_bytes[0])
         && native_layers > 0 && options.local_expert_layers.is_none();
     let package = report.experts.as_ref().map(|e| e.package.as_str());
