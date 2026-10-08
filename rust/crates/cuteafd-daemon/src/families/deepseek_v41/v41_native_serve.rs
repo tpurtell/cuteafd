@@ -335,7 +335,6 @@ fn worker(
     }
     if small_card && !legacy_compact(None, args.peers.len()) {
         admit_small_card_capacity(device_total, args.prefill_batch_tokens)?;
-        if args.memory_reservation.is_none() { args.memory_reservation = Some("97%".parse()?); }
         if args.rtx_expert_layers == memory::LocalLayers::Auto { args.rtx_expert_layers = memory::LocalLayers::Count(0); }
         tracing::info!(device_total, prefill=args.prefill_batch_tokens, "selected V4.1 32 GB all-remote profile; explicit pool/reservation overrides retained");
     }
