@@ -94,6 +94,12 @@ but bounded engineering still goes to Sol.
 
 ## Writing a brief
 
+Hardware-card briefs use `scripts/bench/wip-cards.py`; see
+[WIP hardware cards](README.md#wip-hardware-cards) for the shared kit, arm,
+probe, build and cleanup contract. Do not copy an RC driver or take outer
+serving locks: `cuteafd bench smoke` takes its own locks. CPU builds/tests
+run at nice 19 with 16 jobs (`CARGO_BUILD_JOBS=16`, `RUST_TEST_THREADS=16`).
+
 The same brief works for every model. One bounded task with everything the
 agent needs to finish without asking:
 

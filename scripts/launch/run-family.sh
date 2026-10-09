@@ -1189,10 +1189,12 @@ case "$ENABLE_BENCH" in
 esac
 table_env_args=()
 [[ -z "${CUTEAFD_TABLE_ACCOUNTING:-}" ]] || table_env_args+=(-e "CUTEAFD_TABLE_ACCOUNTING=$CUTEAFD_TABLE_ACCOUNTING")
+bench_nonce_env_args=()
+[[ -z "${CUTEAFD_BENCH_NONCE_SEED:-}" ]] || bench_nonce_env_args+=(-e "CUTEAFD_BENCH_NONCE_SEED=$CUTEAFD_BENCH_NONCE_SEED")
 docker run -d --name "$coordinator_name" --restart no --gpus "$gpus" --network host --ipc host \
   --security-opt "seccomp=$repo_root/docker/seccomp-code-bench.json" \
   --ulimit memlock=-1:-1 --device=/dev/infiniband -e RUST_LOG=info -e "CUTEAFD_SPARK_INTAKE=$intake" \
-  -e "CUTEAFD_CONSOLE_TEXT=$([[ $console_text == on ]] && echo true || echo false)" "${bond_args[@]}" "${table_env_args[@]}" \
+  -e "CUTEAFD_CONSOLE_TEXT=$([[ $console_text == on ]] && echo true || echo false)" "${bond_args[@]}" "${table_env_args[@]}" "${bench_nonce_env_args[@]}" \
   -e "CUTEAFD_FP8_EXPERT_PREFILL=$fp8_prefill" -e "CUTEAFD_IMAGE=$coordinator_image" "${wip_mount_args[@]}" "${device_map_args[@]}" \
   -v "$hub:/root/.cache/huggingface/hub:ro" -v "$bench_dir:/root/.cache/cuteafd/bench" \
   "${api_mount_args[@]}" "${chat_template_mounts[@]}" "${trace_args[@]}" "${probe_args[@]}" "$coordinator_image" cuteafd "${coordinator_budget_args[@]}" $serve --snapshot "$snapshot" \
