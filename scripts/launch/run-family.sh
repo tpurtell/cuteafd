@@ -804,6 +804,9 @@ if [[ $family == glm5_flash ]]; then
     *) echo "GLM5_FLASH_PREFIX_MARKS must be arena or pool" >&2; exit 2 ;;
   esac
   [[ "$prefix_marks" != pool || -n "$(get HOST_CACHE_BYTES)" ]] || family_args+=(--host-cache-bytes auto)
+  # PREFIX_CACHE_MARK_MIB: the device budget of the prefix mark arena, MiB (unset: serve-glmf's
+  # 2048), as for MiMo; the arena still holds at least two marks per sequence plus two.
+  [[ -z "$(get PREFIX_CACHE_MARK_MIB)" ]] || family_args+=(--prefix-cache-mark-mib "$(get PREFIX_CACHE_MARK_MIB)")
   # GLM5_FLASH_REPLAY_RECORDS: where the KDA speculative replay records live, own (default: their
   # own 321 MB, 642 MB with GLM5_FLASH_DECODE_ROWS=128) or shared (the prefill lanes' scratch, which
   # no decode step reads). One GPU whose pool is sized from measured memory (an automatic pool with
@@ -899,8 +902,25 @@ if { [[ ( "$family" == mimo_v2 || "$family" == qwen4 || "$family" == glm5_flash 
       plan_draft_args+=(--mimo-prefix-draft --context-tokens "$(get MAX_CONTEXT_TOKENS 131072)")
     fi
   fi
+  # GLM 5.3 Flash: the counts serve-glmf allocates for the keys a launch sets (unset keys keep
+  # the planner's defaults, which are serving's). Its recurrent state holds max(--slots, which
+  # is 8, --max-sequences) slots, and its prefix mark arena counts min(--max-sequences,
+  # DECODE_ROWS = 64) lanes, so both go to the plan as such beside the sequences.
+  if [[ "$family" == glm5_flash ]]; then
+    glmf_sequences="$(get CONCURRENCY)"
+    if [[ -n "$glmf_sequences" ]]; then
+      [[ "$glmf_sequences" =~ ^[1-9][0-9]*$ ]] || { echo "CONCURRENCY must be a positive sequence count" >&2; exit 2; }
+      plan_draft_args+=(--concurrency "$glmf_sequences" --state-slots "$((glmf_sequences > 8 ? glmf_sequences : 8))"
+        --mark-lanes "$((glmf_sequences < 64 ? glmf_sequences : 64))")
+    fi
+    [[ -z "$(get PREFIX_CACHE_ENTRIES)" ]] || plan_draft_args+=(--prefix-cache-entries "$(get PREFIX_CACHE_ENTRIES)")
+    [[ -z "$(get PREFIX_CACHE_MARK_MIB)" ]] || plan_draft_args+=(--prefix-cache-mark-mib "$(get PREFIX_CACHE_MARK_MIB)")
+  fi
   # GLM 5.3 Flash: the server's prefix-mark store, so the plan reserves an arena only when serve-glmf allocates one.
   [[ "$family" != glm5_flash || -z "${prefix_marks:-}" ]] || plan_draft_args+=(--prefix-marks "$prefix_marks")
+  # GLM 5.3 Flash: shared replay records (GLM5_FLASH_REPLAY_RECORDS above) live in the prefill
+  # scratch, so the plan does not charge their own copy either.
+  [[ "$family" != glm5_flash || "${replay_records:-own}" != shared ]] || plan_draft_args+=(--replay-records shared)
   # GLM 5.3 Flash plans the decode rows serving takes (GLM5_FLASH_DECODE_ROWS above): 128 rows
   # charge their wider decode workspace, selector, replay records and expert intake, as serving
   # admits them, before an encoder placement is chosen.

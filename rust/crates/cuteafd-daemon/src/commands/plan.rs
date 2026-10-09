@@ -42,6 +42,8 @@ fn options(args: &PlanArgs) -> Result<PlanOptions, PlanError> {
                 glmf_pool_marks: args.prefix_marks == crate::families::glm5_flash::prefix::PrefixMarks::Pool,
                 glmf_shared_replay: args.replay_records == crate::families::glm5_flash::engine::ReplayRecords::Shared,
                 concurrency: args.concurrency,
+                state_slots: args.state_slots,
+                glmf_mark_lanes: args.mark_lanes,
                 prefix_slots: args.prefix_slots,
                 mimo_prefix_entries: args.prefix_cache_entries,
                 mimo_prefix_mark_bytes: args.prefix_cache_mark_mib.checked_mul(1 << 20)
@@ -137,6 +139,8 @@ mod tests {
             graph_budget_mib: None,
             replay_records: crate::families::glm5_flash::engine::ReplayRecords::Own,
             concurrency: 8,
+            state_slots: None,
+            mark_lanes: None,
             prefix_slots: None,
             prefix_cache_entries: 20,
             prefix_cache_mark_mib: 2048,
@@ -293,6 +297,88 @@ mod tests {
             assert_eq!(options(&args).unwrap().layout.unwrap().glmf_pool_marks, pool);
         }
         assert!(parse(&["--prefix-marks", "host"]).is_err());
+    }
+
+    /// The flags the launcher's encoder placement plan passes for GLM 5.3 Flash size its layout as
+    /// serve-glmf allocates: its recurrent state holds max(--slots 8, --max-sequences) slots
+    /// (`serve.rs`, `engine_args.slots.max(args.max_sequences)`) and its mark arena counts
+    /// min(--max-sequences, DECODE_ROWS = 64) lanes (`serve.rs`, `prefix.mark_rule(lanes)`), over the
+    /// entries and mark budget it gets. The launcher passes those counts as --state-slots and
+    /// --mark-lanes beside --concurrency; without them the planner derives both from --concurrency.
+    #[test]
+    fn glm_flash_serving_knobs_reach_the_layout() {
+        use clap::Parser;
+        let mut config = cuteafd_loader::plan::testing::glm5_flash_config(45);
+        config["text_config"]["layer_types"] = serde_json::json!((0..45)
+            .map(|l| if l % 4 == 3 { "deepseek_sparse_attention" } else { "linear_attention" }).collect::<Vec<_>>());
+        let cfg = cuteafd_loader::families::glm5_flash::GlmNextConfig::from_hf(&config).unwrap();
+        let rank = cuteafd_loader::serving_capacity::glm_flash_cache_geometry(&cfg, 45).unwrap().ranks[0];
+        // The standard 45-layer FP32-state geometry: a mark and a sequence's state are 147,619,840 B.
+        let (mark, per_sequence) = (rank.retained_mark_bytes, rank.active_state_per_sequence_bytes);
+        assert_eq!((mark, per_sequence), (147_619_840, 147_619_840));
+        let snapshot = tempfile::tempdir().unwrap();
+        write_snapshot(snapshot.path(), &config, &[], None);
+        let model = snapshot.path().display().to_string();
+        let layout = |extra: &[&str]| {
+            let argv = ["cuteafd", "plan", model.as_str(), "--layout", "--spark-ranks", "4", "--rtx", "1",
+                "--rtx-gib", "96", "--pool-tokens", "0"];
+            let cli = crate::cli::Cli::try_parse_from(argv.into_iter().chain(extra.iter().copied())).unwrap();
+            let crate::cli::Commands::Plan(args) = cli.command else { panic!("plan") };
+            options(&args).unwrap()
+        };
+        // (marks, state) bytes on the GPU.
+        let planned = |extra: &[&str]| {
+            let memory = plan(std::path::Path::new(&model), &layout(extra)).unwrap().memory_layout.unwrap();
+            let group = |name: &str| memory.devices[0].items.iter().filter(|i| i.group == name).map(|i| i.bytes)
+                .sum::<u64>();
+            (group("marks"), group("state"))
+        };
+        let state = |slots: u64| rank.fixed_state_bytes + per_sequence * slots + rank.speculative_replay_bytes;
+        // serve-glmf's own counts for `sequences`, `entries` and a mark budget (MiB).
+        let served = |sequences: u64, entries: u64, mib: u64| {
+            let (slots, lanes) = (sequences.max(8), sequences.min(64));
+            (cuteafd_core::prefix::mark_slots_for(lanes, entries, mark, mib << 20) * mark, state(slots))
+        };
+        // The launcher's arguments for CONCURRENCY, PREFIX_CACHE_ENTRIES and PREFIX_CACHE_MARK_MIB.
+        let launcher = |sequences: u64, entries: u64, mib: Option<u64>| {
+            let mut argv = vec!["--concurrency".to_string(), sequences.to_string(), "--state-slots".into(),
+                sequences.max(8).to_string(), "--mark-lanes".into(), sequences.min(64).to_string(),
+                "--prefix-cache-entries".into(), entries.to_string()];
+            if let Some(mib) = mib { argv.extend(["--prefix-cache-mark-mib".into(), mib.to_string()]); }
+            argv
+        };
+        for (sequences, entries, mib) in [(1, 0, None), (1, 20, None), (5, 6, Some(1971)), (8, 20, None),
+            (16, 20, None), (16, 6, Some(1971)), (64, 20, None), (65, 20, None), (128, 20, None), (128, 0, None)] {
+            let argv = launcher(sequences, entries, mib);
+            let argv: Vec<&str> = argv.iter().map(String::as_str).collect();
+            assert_eq!(planned(&argv), served(sequences, entries, mib.unwrap_or(2048)), "{argv:?}");
+        }
+        // The boundaries, against the planner's own rule over --concurrency alone (C + 2 state slots,
+        // C lanes): C1 without entries took 3 slots where serve-glmf keeps 8 (738,099,200 B short), C16
+        // took 18 for 16 (295,239,680 B over), and C128 took 258 marks for 130 (18,895,339,520 B over).
+        assert_eq!(planned(&launcher(1, 0, None).iter().map(String::as_str).collect::<Vec<_>>()), (0, state(8)));
+        assert_eq!(planned(&["--concurrency", "1", "--prefix-cache-entries", "0"]), (0, state(3)));
+        assert_eq!(state(8) - state(3), 738_099_200);
+        assert_eq!(planned(&launcher(16, 20, None).iter().map(String::as_str).collect::<Vec<_>>()),
+            (34 * mark, state(16)));
+        assert_eq!(planned(&["--concurrency", "16"]), (34 * mark, state(18)));
+        assert_eq!(state(18) - state(16), 295_239_680);
+        assert_eq!(planned(&launcher(128, 20, None).iter().map(String::as_str).collect::<Vec<_>>()),
+            (130 * mark, state(128)));
+        assert_eq!(planned(&["--concurrency", "128"]).0, 258 * mark);
+        assert_eq!((258 - 130) * mark, 18_895_339_520);
+        // With no keys set the launcher passes none of them: the planner's defaults (8 sequences,
+        // 20 entries, 2,048 MiB) give serve-glmf's 18 marks, and work/p0's C + 2 = 10 state slots.
+        assert_eq!(planned(&[]), (18 * mark, state(10)));
+        // The other knobs serve-glmf gets reach the layout as given.
+        let custom = layout(&["--concurrency", "16", "--state-slots", "16", "--mark-lanes", "16",
+            "--prefix-cache-entries", "6", "--prefix-cache-mark-mib", "1971", "--replay-records", "shared"]);
+        let knobs = custom.layout.as_ref().unwrap();
+        assert_eq!((knobs.concurrency, knobs.state_slots, knobs.glmf_mark_lanes, knobs.mimo_prefix_entries,
+            knobs.mimo_prefix_mark_bytes, knobs.glmf_shared_replay), (16, Some(16), Some(16), 6, 1971 << 20, true));
+        for zero in ["--state-slots", "--mark-lanes"] {
+            assert!(crate::cli::Cli::try_parse_from(["cuteafd", "plan", "/not-read", "--layout", zero, "0"]).is_err());
+        }
     }
 
     #[test]

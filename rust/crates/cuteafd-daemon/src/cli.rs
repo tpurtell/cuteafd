@@ -270,6 +270,14 @@ pub(crate) struct PlanArgs {
     /// Concurrent sequences for --layout (0: family default).
     #[arg(long, default_value_t = 0)]
     pub(crate) concurrency: u64,
+    /// The engine's recurrent-state slots for --layout, when they differ from the family's rule
+    /// over --concurrency (GLM 5.3 Flash serves max(--slots, --max-sequences)).
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+    pub(crate) state_slots: Option<u64>,
+    /// GLM 5.3 Flash: the lanes its prefix mark arena counts for --layout (the 2C + 2 floor),
+    /// when they differ from --concurrency (serve-glmf counts min(--max-sequences, 64)).
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+    pub(crate) mark_lanes: Option<u64>,
     /// Prefix mark arena slots (0 disables marks).
     #[arg(long)]
     pub(crate) prefix_slots: Option<u64>,

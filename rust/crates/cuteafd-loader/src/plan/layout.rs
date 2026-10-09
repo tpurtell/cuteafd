@@ -73,6 +73,9 @@ pub struct LayoutOptions {
     pub concurrency: u64,
     /// Exact engine slots when they differ from concurrency + 2.
     pub state_slots: Option<u64>,
+    /// The lanes GLM 5.3 Flash's prefix mark arena counts (its 2C + 2 floor), when they differ
+    /// from concurrency: serve-glmf counts at most `DECODE_ROWS` (64) decoding sequences.
+    pub glmf_mark_lanes: Option<u64>,
     /// Prefix mark arena slots; absent selects the family policy.
     pub prefix_slots: Option<u64>,
     /// MiMo's and GLM 5.3 Flash's retained snapshots per bank and device mark budget, matching
@@ -122,6 +125,7 @@ impl Default for LayoutOptions {
             headroom_bytes: 2 * GIB,
             concurrency: 0,
             state_slots: None,
+            glmf_mark_lanes: None,
             prefix_slots: None,
             mimo_prefix_entries: 20,
             mimo_prefix_mark_bytes: 2 * GIB,
@@ -880,8 +884,8 @@ pub fn layout(report: &mut PlanReport, model: &dyn super::FamilyModel, checkpoin
                 } else if family == "glm5_flash" {
                     // serve-glmf's arena with the same knobs, over one whole mark of the layout
                     // planned here (token keys, which a head split keeps).
-                    cuteafd_core::prefix::mark_slots_for(concurrency, options.mimo_prefix_entries, bytes,
-                        options.mimo_prefix_mark_bytes)
+                    cuteafd_core::prefix::mark_slots_for(options.glmf_mark_lanes.unwrap_or(concurrency),
+                        options.mimo_prefix_entries, bytes, options.mimo_prefix_mark_bytes)
                 } else if matches!(family, "deepseek_v4" | "qwen4") {
                     // The arena the family's server allocates at the default knobs (`MarkArena::slots_for`).
                     42.min((2 * GIB) / bytes.max(1)).max(2 * concurrency + 2)
