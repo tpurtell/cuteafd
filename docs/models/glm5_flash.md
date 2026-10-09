@@ -109,6 +109,32 @@ Attention (KDA), a minority run MLA + DSA.
   marks turn the pinned host tier on (`HOST_CACHE_BYTES=auto` unless set; 0
   keeps it off), so the snapshots the pool evicts move to RAM.
 
+## Launcher defaults
+
+The launcher resolves these after selecting the coordinator split. Explicit
+values always win; selecting the old values restores the old command stream.
+The `serve-glmf` CLI defaults remain unchanged.
+
+| Launcher key | Default | Resolution / old value |
+| --- | --- | --- |
+| `GLM5_FLASH_DECODE_ROWS` | `auto` | `128` on one GPU when the selected image has every required m128 program; otherwise `64`. Missing metadata falls back to `64`. |
+| `GLM5_FLASH_INDEX_CACHE` | `auto` | `compact` on one GPU, `keys` with a head split. |
+| `GLM5_FLASH_REPLAY_RECORDS` | `auto` | `shared` on one GPU with Spark experts and an automatic pool; otherwise `own`. |
+| `GLM5_FLASH_DRAFT_HEAD` | `tensor` | With an external drafter; `exact` restores the old path. Target verification is unchanged. |
+| `GLM5_FLASH_DRAFT_LINEAR` | `w8a8` | With an FP8 external drafter; BF16 or no drafter keeps `w8a16`. |
+| `GLM5_FLASH_PREFIX_MARKS` | engine arena | Pool marks remain opt-in pending a matched neutral-or-better hardware gate, including their automatic host tier. |
+
+Each automatic decision logs its resolved value and reason. Encoder placement
+uses the same index storage, replay storage, decode rows and mark store as
+serving. `cuteafd plan --layout --index-cache compact` uses the engine's exact
+compact geometry: 6,172 bytes per token (including the pool-page entry) plus
+per-sequence open-pool state; keys use 11,804 bytes per token. A head split
+plans keys even when compact is explicitly requested, matching serving.
+128-row own replay records double the 64-row allocation (321,421,312 to
+642,842,624 bytes); shared records occupy prefill scratch instead. Pool marks
+reserve unit 0 outside the admitted token count and enable
+`HOST_CACHE_BYTES=auto` unless explicitly set (including `0`).
+
 ## Default precision (single residency)
 
 Every weight has one resident format. The launcher resolves precision after

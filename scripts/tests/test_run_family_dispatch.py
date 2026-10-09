@@ -118,7 +118,8 @@ def _family_launch_result(tmp_path: Path, family_config: dict, model: str, keys:
                           gpu_allocations: tuple[tuple[int, int], ...] = (),
                           previous_peers: str | None = None, encoder_plan: dict | None = None,
                           extra_args: tuple[str, ...] = (), with_nest: bool = True,
-                          extra_env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+                          extra_env: dict[str, str] | None = None,
+                          program_manifest: dict | None = None) -> subprocess.CompletedProcess[str]:
     """Run the real run-family.sh up to its docker calls (docker/ssh/nest/curl are stubs
     that print their argv) and return what it would launch."""
     repo = tmp_path / "repo"
@@ -156,6 +157,21 @@ def _family_launch_result(tmp_path: Path, family_config: dict, model: str, keys:
                                      if tool == "docker" and container_pids else '') +
                                     (f"case \"$*\" in inspect*) echo '[\"serve-qwen4\",\"--peers\",\"{previous_peers}\"]' ;; esac\n"
                                      if tool == "docker" and previous_peers is not None else ''))
+        if tool == "docker":
+            stub = (bin_dir / tool).read_text()
+            if program_manifest is None:
+                stub += 'case "$*" in *"PROGRAMS.json"*) exit 1 ;; esac\n'
+            else:
+                manifest_path = tmp_path / "PROGRAMS.json"
+                manifest_path.write_text(json.dumps(program_manifest))
+                stub += '''case "$*" in *"PROGRAMS.json"*)
+while [[ $1 != -c ]]; do shift; done
+code="${2//\\/opt\\/cuteafd\\/share\\/PROGRAMS.json/$STUB_PROGRAMS}"
+shift 2
+exec python3 -c "$code" "$@"
+;; esac
+'''
+            (bin_dir / tool).write_text(stub)
         (bin_dir / tool).chmod(0o755)
     (bin_dir / "curl").write_text('#!/usr/bin/env bash\nprintf \'%s\\n\' \'{"data":[{"id":"test/model"}]}\'\n')
     (bin_dir / "curl").chmod(0o755)
@@ -171,7 +187,8 @@ def _family_launch_result(tmp_path: Path, family_config: dict, model: str, keys:
     (bin_dir / "nvidia-smi").chmod(0o755)
     config = repo / "f.config"
     config.write_text(f"MODEL_ID={model}\nSPARK_COUNT=1\nSPARK_0_HOST=h0\nSPARK_0_LANE_A=10.0.0.1\n{keys}")
-    env = {**os.environ, "HF_HOME": str(hf), "PATH": f"{bin_dir}:{os.environ['PATH']}", **(extra_env or {})}
+    env = {**os.environ, "HF_HOME": str(hf), "PATH": f"{bin_dir}:{os.environ['PATH']}",
+           "STUB_PROGRAMS": str(tmp_path / "PROGRAMS.json"), **(extra_env or {})}
     if wip:
         env["HOME"] = str(tmp_path / "home")
     if not with_nest:
@@ -670,7 +687,7 @@ def test_glmf_prefix_marks_reject_unknown_stores_before_launch(tmp_path):
     assert not any(line.startswith(("docker ", "ssh ", "nest ")) for line in result.stderr.splitlines())
 
 
-@pytest.mark.parametrize("keys,shared", [("", False), ("GLM5_FLASH_REPLAY_RECORDS=own\n", False),
+@pytest.mark.parametrize("keys,shared", [("", True), ("GLM5_FLASH_REPLAY_RECORDS=own\n", False),
                                         ("GLM5_FLASH_REPLAY_RECORDS=shared\n", True)])
 def test_glmf_replay_records_are_forwarded_only_when_shared(tmp_path, keys, shared):
     result = _family_launch_result(tmp_path, SPLIT_CONFIGS["glm5_flash"], "test/glmf",
@@ -1587,7 +1604,8 @@ def test_glmf_encoder_placement_plans_the_prefix_knobs_serving_takes(tmp_path, k
     its mark-arena lanes, min(--max-sequences, 64), PREFIX_CACHE_ENTRIES, PREFIX_CACHE_MARK_MIB and
     shared replay records. Unset keys reach neither command, so the plan's arguments are unchanged."""
     result = _family_launch_result(tmp_path, GLMF_VISION, "zai-org/GLM-5.3-Flash",
-                                   "RTX_GPUS=1\nSPECULATOR=off\nVISION=rtx\n" + keys, encoder_plan=GLMF_RTX_ENCODER_PLAN)
+                                   "RTX_GPUS=1\nSPECULATOR=off\nVISION=rtx\nGLM5_FLASH_REPLAY_RECORDS=own\n" + keys,
+                                   encoder_plan=GLMF_RTX_ENCODER_PLAN)
     assert result.returncode == 0, result.stderr
     lines = result.stderr.splitlines()
     commands = {"plan": next(line for line in lines if "cuteafd plan" in line and "--layout" in line) + " ",
@@ -1601,6 +1619,78 @@ def test_glmf_encoder_placement_plans_the_prefix_knobs_serving_takes(tmp_path, k
                 assert f" {flag} {expected[flag]} " in command and command.count(f" {flag} ") == 1, (flag, command)
             else:
                 assert f" {flag} " not in command, (flag, command)
+
+
+@pytest.mark.parametrize("split,fixed,local,wide", [
+    (False, False, False, True), (True, False, False, True),
+    (False, True, False, True), (False, False, True, True),
+    (False, False, False, False),
+])
+def test_glmf_auto_defaults_and_encoder_plan_agree(tmp_path, split, fixed, local, wide):
+    config = {**GLMF_VISION, "moe_intermediate_size": 2048, "intermediate_size": 12288}
+    stems = ["mhc_post_pre", "mla_producer", "o", "sparse_mla_decode", "index_producer",
+             "index_topk_decode", "ffn_i2048", "ffn_i12288", "kda", "kda_w8",
+             "index_producer_c", "kda_commit_c"]
+    manifest = {"programs": [{"name": "glmf_" + n + "_m128"} for n in stems]} if wide else None
+    keys = (f"RTX_GPUS={2 if split else 1}\nSPECULATOR=off\nVISION=rtx\n"
+            "GLM5_FLASH_DECODE_ROWS=auto\nGLM5_FLASH_INDEX_CACHE=auto\nGLM5_FLASH_REPLAY_RECORDS=auto\n")
+    if fixed: keys += "POOL_TOKENS=262144\n"
+    if local: keys += "SPARK_COUNT=0\nEXPERT_BACKEND=local\n"
+    else: keys += f"SPARK_COUNT={4 if split else 2}\n"
+    result = _family_launch_result(tmp_path, config, "zai-org/GLM-5.3-Flash", keys,
+                                  program_manifest=manifest, encoder_plan=GLMF_RTX_ENCODER_PLAN)
+    assert result.returncode == 0, result.stderr
+    lines = result.stderr.splitlines()
+    planner = next(line for line in lines if "cuteafd plan" in line)
+    serve = next(line for line in lines if "cuteafd serve-glmf" in line)
+    for command in (planner, serve):
+        assert ("--decode-rows 128" in command) == (wide and not split), command
+        assert ("--index-cache compact" in command) == (not split), command
+        assert ("--replay-records shared" in command) == (not split and not fixed and not local), command
+        assert "--prefix-marks pool" not in command
+    assert result.stderr.count("GLM5_FLASH_DECODE_ROWS=auto ->") == 1
+    assert result.stderr.count("GLM5_FLASH_INDEX_CACHE=auto ->") == 1
+    assert result.stderr.count("GLM5_FLASH_REPLAY_RECORDS=auto ->") == 1
+    assert "--host-cache-bytes auto" not in serve
+
+
+@pytest.mark.parametrize("index,state,missing", [
+    ("keys", "f32", None), ("keys", "bf16", None),
+    ("compact", "bf16", None), ("compact", "bf16-tile", None),
+    ("compact", "f32", "kda_commit_c"),
+])
+def test_glmf_wide_probe_matches_index_and_state_programs(tmp_path, index, state, missing):
+    config = {**GLMF_VISION, "moe_intermediate_size": 2048, "intermediate_size": 12288}
+    stems = ["mhc_post_pre", "mla_producer", "o", "sparse_mla_decode", "index_producer",
+             "index_topk_decode", "ffn_i2048", "ffn_i12288"]
+    stems += ["kda" if state == "f32" else "kda_s16"]
+    if index == "compact": stems += ["index_producer_c"]
+    stems += ["kda_commit" + ("_c" if index == "compact" else "") + ("_s16" if state != "f32" else "")]
+    manifest = {"programs": [{"name": "glmf_" + n + "_m128"} for n in stems if n != missing]}
+    keys = (f"RTX_GPUS=1\nSPECULATOR=off\nVISION=rtx\nSPARK_COUNT=2\n"
+            f"GLM5_FLASH_INDEX_CACHE={index}\nGLM5_FLASH_KDA_STATE={state}\n"
+            "GLM5_FLASH_KDA_FP8=off\nGLM5_FLASH_DECODE_ROWS=auto\n")
+    result = _family_launch_result(tmp_path, config, "zai-org/GLM-5.3-Flash", keys,
+                                  program_manifest=manifest, encoder_plan=GLMF_RTX_ENCODER_PLAN)
+    assert result.returncode == 0, result.stderr
+    for line in result.stderr.splitlines():
+        if "cuteafd plan" in line or "cuteafd serve-glmf" in line:
+            assert ("--decode-rows 128" in line) == (missing is None), line
+    rows = 128 if missing is None else 64
+    assert f"GLM5_FLASH_DECODE_ROWS=auto -> {rows} (" in result.stderr
+    if missing:
+        assert "missing manifest or required m128 programs in selected build" in result.stderr
+
+
+@pytest.mark.parametrize("fp8", ["auto", "off"])
+def test_glmf_draft_defaults_apply_only_to_the_fp8_drafter(tmp_path, fp8):
+    _snapshot(tmp_path / "hf", "incoai/GLM-5.3-Flash-DFlash2", {})
+    result = _family_launch_result(tmp_path, _GLMF, "zai-org/GLM-5.3-Flash",
+                                  f"RTX_GPUS=1\nSPECULATOR_FP8={fp8}\n")
+    assert result.returncode == 0, result.stderr
+    serve = next(line for line in result.stderr.splitlines() if "cuteafd serve-glmf" in line)
+    assert "--draft-head tensor" in serve
+    assert ("--draft-linear w8a8" in serve) == (fp8 != "off")
 
 
 def test_glmf_plan_counts_follow_serve_glmf_formulas():

@@ -48,6 +48,8 @@ pub struct LayoutOptions {
     /// `_m128` programs (one GPU). The decode workspace, the token selector and the speculative
     /// replay records hold this many rows.
     pub glmf_decode_rows: u64,
+    /// GLM Flash index storage; a head split keeps the token keys, as serving does.
+    pub glmf_index: crate::serving_capacity::GlmfIndexCache,
     /// Decode graph budget (GLM 5.3 Flash `--graph-budget-mib`), in place of the graph allowance
     /// where the engine admits from measured memory (one GPU, Spark experts, an automatic pool),
     /// else in its place only when larger.
@@ -115,6 +117,7 @@ impl Default for LayoutOptions {
             full_prefill_logits: false,
             prefill_lanes: 0,
             glmf_decode_rows: crate::serving_capacity::GLMF_DECODE_ROWS,
+            glmf_index: crate::serving_capacity::GlmfIndexCache::Keys,
             graph_budget_bytes: None,
             glmf_pool_marks: false,
             glmf_shared_replay: false,
@@ -681,7 +684,8 @@ pub fn layout(report: &mut PlanReport, model: &dyn super::FamilyModel, checkpoin
     } else { 0 };
     let glmf_steps = (family == "glm5_flash" && !split).then(|| workspace_manifest.as_ref()
         .and_then(|manifest| glmf_step_workspace(manifest, checkpoint, &report.placement, glmf_lanes, prefill_rows,
-            context_tokens, glmf_decode_rows, glmf_shared_records))).flatten();
+            context_tokens, glmf_decode_rows, glmf_shared_records,
+            options.glmf_index == crate::serving_capacity::GlmfIndexCache::Compact))).flatten();
 
     // Fixed runtime costs.
     let gpus_now = active_gpus;
@@ -881,7 +885,9 @@ pub fn layout(report: &mut PlanReport, model: &dyn super::FamilyModel, checkpoin
     // KV pool: per-device bytes per logical token from the family geometry.
     let geometry = model.cache_geometry(CacheOptions { coordinator_ranks: active_gpus,
         native_mtp_layers: if family == "deepseek_v4" || family == "qwen4" { cache_native_layers } else { 0 },
-        prefill_rows: prefill_rows, glmf_decode_rows, ..Default::default() });
+        prefill_rows: prefill_rows, glmf_decode_rows,
+        glmf_index: if split { crate::serving_capacity::GlmfIndexCache::Keys } else { options.glmf_index },
+        ..Default::default() });
     let mut pool_tokens = 0;
     match geometry {
         Ok(Some(mut geometry)) => {
@@ -924,7 +930,9 @@ pub fn layout(report: &mut PlanReport, model: &dyn super::FamilyModel, checkpoin
             // Reserve fixed state and marks before sizing records. Otherwise
             // an automatic pool consumes the bytes those allocations need.
             for (device, rank) in devices.iter_mut().zip(&geometry.ranks) {
-                let state_slots = options.state_slots.unwrap_or(if matches!(family, "qwen4" | "deepseek_v4" | "deepseek_v41") { concurrency } else { concurrency + 2 });
+                let state_slots = options.state_slots.unwrap_or(if family == "glm5_flash" { concurrency.max(8) }
+                    else if matches!(family, "qwen4" | "deepseek_v4" | "deepseek_v41") { concurrency }
+                    else { concurrency + 2 });
                 device.items.push(Item::new(Category::Kv, "state", "", rank.fixed_state_bytes
                     + (rank.active_state_per_sequence_bytes + if family == "deepseek_v4" { rank.pool_metadata_unit_bytes } else { 0 }) * state_slots
                     + rank.speculative_replay_bytes.saturating_sub(glmf_shared_records)
@@ -1040,13 +1048,14 @@ pub fn layout(report: &mut PlanReport, model: &dyn super::FamilyModel, checkpoin
 /// (`serving_capacity::glmf_*`, which the engine sizes its buffers from).
 #[allow(clippy::too_many_arguments)]
 fn glmf_step_workspace(manifest: &serde_json::Value, checkpoint: &super::Checkpoint, placement: &ExpertPlacement,
-    lanes: u64, rows: u64, context: u64, decode_rows: u64, shared_records: u64) -> Option<u64> {
+    lanes: u64, rows: u64, context: u64, decode_rows: u64, shared_records: u64, index_compact: bool) -> Option<u64> {
     use crate::serving_capacity::{glmf_manifest_scratch, glmf_step_scratch, glmf_step_workspaces, glmf_table_pages,
         GlmfScratchOptions, GlmfStepShape};
     let cfg = crate::families::glm5_flash::GlmNextConfig::from_hf(&checkpoint.config).ok()?;
     let lookup = glmf_manifest_scratch(manifest);
     // FP8 KDA projections run the w8 programs: charge their scratch too where the build has them.
-    let options = GlmfScratchOptions { kda_w8: lookup("glmf_kda_w8_m64").is_some() && lookup("glmf_kda_w8_m4096").is_some(),
+    let options = GlmfScratchOptions { index_compact,
+        kda_w8: lookup("glmf_kda_w8_m64").is_some() && lookup("glmf_kda_w8_m4096").is_some(),
         ..Default::default() };
     let context = if context > 0 { context } else { manifest["capacities"]["max_context"].as_u64().unwrap_or(131_072) };
     let (table_pages, table_pool_pages) = glmf_table_pages(context);
