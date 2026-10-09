@@ -1835,6 +1835,28 @@ Gate per family: golden/fidelity, then the quick A/B at the 2M operating
 point on the min and max reference configs. Requalify each family's cards
 as it moves.
 
+## First after rc3: per-key draft confidence calibration (TJ, 2026-10-09)
+
+The shared draft policy refines acceptance with one frozen logistic fit over
+the selector features (margin, top probability, entropy, rank), fit in glmrt
+on 32 GLM-5.3 K4 requests (`glm5/dflash_policy.rs`). GLM 5.3, GLM Flash and
+MiMo DFlash all reuse it. Feature distributions depend on the target model
+and quant, the drafter, and the drafter's numerics, so other combinations are
+miscalibrated. Measured: GLM Flash with the tensor-core head and W8A8 drafter
+kept acceptance (67.1% -> 66.5% median) but the policy chose ~20% shorter
+verify prefixes (tokens/step 2.6 -> 2.1), C1 -12% despite ~7% cheaper steps.
+
+1. Calibrate per key (target model, target quant, drafter, drafter precision
+   options): ~32 fixed-K7 requests, fit the 6 coefficients, ship them as a
+   small file beside the drafter config; fall back to the generic fit with a
+   log line. Recalibrate whenever a key changes (new quant, drafter option or
+   drafter); make it a standard step of adding one.
+2. Online refinement: the frozen fit is the prior, coefficients updated from
+   verified outcomes with forgetting and clamped slopes (as Qwen's
+   `Calibration`), so numerics drift self-corrects.
+3. Gate: emitted tok/s at C1/C4/C16 on min/max per family, then re-enable the
+   GLM Flash drafter options if they win with their own calibration.
+
 ## Explore after v2
 
 Ideas TJ wants kept for later; not v2 work.
