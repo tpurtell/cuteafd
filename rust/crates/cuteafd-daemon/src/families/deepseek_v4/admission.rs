@@ -39,7 +39,8 @@ pub(crate) fn profile(geometry: &FamilyCacheGeometry, memory: &[DeviceMemory], s
             .context("V4 context tables overflow")?;
         let workspace = shape.workspace_bytes.as_ref().and_then(|ranks| ranks.get(rank)).copied()
             .unwrap_or(costs.workspace_bytes[role] * shape.prefill_rows as u64 / 4096);
-        let headroom = shape.reserve_bytes.saturating_sub(workspace + costs.graph_bytes[role]).max(3 << 30);
+        let headroom = cuteafd_loader::serving_capacity::deepseek_v4_headroom_bytes(
+            sample.total_bytes, shape.reserve_bytes, workspace, costs.graph_bytes[role]);
         let mut reservations = vec![
             reservation("active window/compressor state and partial units", state),
             reservation("RoPE context tables", context),
@@ -76,6 +77,27 @@ pub(crate) fn resolve_pool(profile: &CapacityProfile, memory: &[DeviceMemory], s
 mod tests {
     use super::*;
     use cuteafd_loader::serving_capacity::{KvPlacement, RankCacheGeometry};
+
+    #[test]
+    fn runtime_and_planner_share_small_card_headroom() {
+        use cuteafd_core::serving_capacity::{GpuMemoryBudget, SMALL_CARD_HEADROOM_BYTES};
+        let geometry = FamilyCacheGeometry { logical_unit_rows: 256, placement: KvPlacement::SingleDevice,
+            ranks: vec![RankCacheGeometry { persistent_unit_bytes: 1 << 20, ..Default::default() }] };
+        let shape = Shape { sequences: 8, prefill_rows: 4096, decode_rows: 64, max_context: 1 << 20,
+            reserve_bytes: 10 << 30, prefix_bytes: vec![0], workspace_bytes: Some(vec![4 << 30]), peer_bytes: 0 };
+        let graph = cuteafd_loader::plan::layout::family_costs("deepseek_v4").graph_bytes[0];
+        for gib in [31.8, 95.5] {
+            let total = GpuMemoryBudget::from_gib(gib).unwrap().0;
+            let memory = [DeviceMemory { device: 0, total_bytes: total, baseline_free_bytes: total }];
+            let profile = profile(&geometry, &memory, &shape, 0).unwrap();
+            let headroom = profile.devices[0].reservations.iter()
+                .find(|r| r.name == "workspace and headroom reserve").unwrap().bytes;
+            assert_eq!(headroom, cuteafd_loader::serving_capacity::deepseek_v4_headroom_bytes(
+                total, shape.reserve_bytes, 4 << 30, graph));
+            assert_eq!(headroom, if gib == 31.8 { SMALL_CARD_HEADROOM_BYTES }
+                else { shape.reserve_bytes - (4 << 30) - graph });
+        }
+    }
 
     #[test]
     fn peer_pool_metadata_and_prefix_reservation_bound_auto_capacity() {

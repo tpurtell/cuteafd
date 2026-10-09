@@ -715,10 +715,14 @@ pub fn layout(report: &mut PlanReport, model: &dyn super::FamilyModel, checkpoin
         };
         let workspace = workspace + intake;
         if family == "deepseek_v4" {
-            // --reserve-gib 10 covers the future workspace and graph budget;
-            // admission keeps the unused remainder, with a 3 GiB floor.
-            let headroom = (10 * GIB).saturating_sub(workspace + costs.graph_bytes[role])
-                .max(options.headroom_bytes).max(3 * GIB);
+            // Small cards charge exact workspace/graphs plus the shared floor;
+            // PRO retains the historical --reserve-gib 10 envelope.
+            let headroom = if v4_workspace.is_some() {
+                crate::serving_capacity::deepseek_v4_headroom_bytes(
+                    options.rtx_bytes[index], 10 * GIB, workspace, costs.graph_bytes[role])
+            } else {
+                (10 * GIB).saturating_sub(workspace + costs.graph_bytes[role]).max(3 * GIB)
+            }.max(options.headroom_bytes);
             device.capacity_bytes = options.rtx_bytes[index].saturating_sub(headroom);
         }
         let workspace_basis = if v4_workspace.is_some() || (glmf_steps.is_some() && index == 0) { Basis::Formula }
@@ -777,12 +781,23 @@ pub fn layout(report: &mut PlanReport, model: &dyn super::FamilyModel, checkpoin
             let role = if active_gpus == 1 { 0 } else { 1 };
             let workspaces: u64 = devices[0].items.iter().filter(|i| i.group == "steps").map(|i| i.bytes).sum();
             let already = devices[0].used_bytes().saturating_sub(workspaces + costs.graph_bytes[role]);
-            // Auto retains the runtime's legacy expert-placement policy.
-            // A positive pool is allocated before experts by the legacy loader.
+            // Automatic expert placement keeps a 262K pool floor; final
+            // admission gives the pool the remaining space. PRO stays legacy.
             let placement_pool = if automatic { 262144 } else { options.pool_tokens.unwrap_or(262144) };
             let legacy = cache.ranks[0].persistent_unit_bytes * placement_pool.div_ceil(cache.logical_unit_rows);
             let expert_workspace = exl3_workspace.unwrap_or(160 * MIB * prefill_rows / 4096);
-            let reserve = state + legacy + slots * mark_bytes + 10 * GIB + expert_workspace;
+            let reserve = if v4_workspace.is_some()
+                && cuteafd_core::serving_capacity::small_card_headroom_bytes(options.rtx_bytes[0]) > 0 {
+                let tables = (2 * prefill_rows + decode_rows) * 4;
+                let units = placement_pool.div_ceil(cache.logical_unit_rows);
+                state + tables * options.state_slots.unwrap_or(concurrency)
+                    + (cache.ranks[0].persistent_unit_bytes + cache.ranks[0].pool_metadata_unit_bytes + tables) * units
+                    + slots * mark_bytes + workspaces + costs.graph_bytes[role]
+                    + crate::serving_capacity::deepseek_v4_headroom_bytes(options.rtx_bytes[0], 10 * GIB,
+                        workspaces, costs.graph_bytes[role]) + expert_workspace
+            } else {
+                state + legacy + slots * mark_bytes + 10 * GIB + expert_workspace
+            };
             local_layers = (options.rtx_bytes[0].saturating_sub(already + reserve) / layer_bytes)
                 .min(model.spec().layers.len() as u64) as usize;
         }
