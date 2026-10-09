@@ -3034,6 +3034,14 @@ calibration gap remains real but is not this regression.
    refinement does not close the gap within a few hundred drafts.
 3. Gate: emitted tok/s at C1/C4/C16 on min/max per family, then re-enable the
    GLM Flash drafter options if they win with their own calibration.
+4. **Cost-model state across concurrency (found 2026-10-09).** After a C16
+   sweep with GLM Flash decode rows 128, a C1 request selected ~5.4 verified
+   drafts per call (baseline 2.9-3.9): 3.27 tokens/step at 46.7-47.1 ms vs
+   2.44-3.08 at 34.1-39.7 ms, C1 -9.8% with identical 320 output tokens.
+   `CycleCost`'s online fit carries the wide-verify step costs learned at
+   high concurrency into single-sequence decode. Fit per concurrency regime
+   (or forget on a concurrency change), and gate C1 after a C16 run, not
+   only on a fresh server.
 
 ## Explore after v2
 

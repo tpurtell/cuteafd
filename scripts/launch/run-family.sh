@@ -836,21 +836,14 @@ if [[ $family == glm5_flash ]]; then
       family_args+=(--replay-records shared) ;;
     *) echo "GLM5_FLASH_REPLAY_RECORDS must be own or shared" >&2; exit 2 ;;
   esac
-  # GLM5_FLASH_DECODE_ROWS: auto takes 128 when the selected build and layout allow, else 64. With
+  # GLM5_FLASH_DECODE_ROWS: auto keeps 64; 128 remains opt-in after the C16 cost-model gate. With
   # 128 a step of more than 64 rows runs the wide _m128 programs (a build with
   # CUTEAFD_GLMF_WIDE_DECODE_ROWS=128) and a verify step schedules up to the GPU's whole sparse MLA
   # waves (127 rows on an RTX 5090); fewer rows keep the _m64 programs. One GPU only.
   decode_rows="$(get GLM5_FLASH_DECODE_ROWS auto)"
   if [[ "$decode_rows" == auto ]]; then
-    wide_eligible=0; wide_reason="head split takes 64 rows"
-    if [[ $head_split == 0 ]]; then
-      wide_reason="missing manifest or required m128 programs in selected build"
-      if release_glmf_wide_decode_available "$root/snapshots/$revision" "$index_cache" "$kda_state" "$kda_fp8" \
-          "$coordinator_image" "${wip_mount_args[@]}"; then
-        wide_eligible=1; wide_reason="one GPU; selected build has required m128 programs"
-      fi
-    fi
-    decode_rows="$(release_glmf_auto GLM5_FLASH_DECODE_ROWS auto 128 64 "$wide_eligible" "$wide_reason")"
+    decode_rows="$(release_glmf_auto GLM5_FLASH_DECODE_ROWS auto 128 64 0 \
+      "128 rows remain opt-in; C16 and post-C16 C1 draft-cost gate")"
   fi
   case "$decode_rows" in
     ""|64) ;;
