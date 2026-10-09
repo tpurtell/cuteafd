@@ -3014,6 +3014,184 @@ it only through its own gate, because fusing changes rounding.
    numbers show a C1 win (please point to them; the audits found none in
    git).
 
+## v3 API gateway and sessions (design, 2026-10-09)
+
+TJ: Claude Code and Codex CLI must use cuteafd directly as drop-in
+clients, for real users and with no LiteLLM in the path. The Realtime API is
+also required. The APIs are the deliverable.
+
+Work happens on `work/api-gateway` (Opus lead, Sol components). Phase A runs
+against an upstream API with no GPUs. Phase B adds the engine backend and
+the session hooks. Phase C adds Realtime audio (transcription and TTS).
+
+### Layering
+
+```text
+ Anthropic Messages  /v1/messages, count_tokens ─┐
+ OpenAI Responses    /v1/responses (+ get, input_items, ...) ─┼─ TurnRequest ─► Gateway::run ─► Backend
+ OpenAI Realtime     /v1/realtime (WebSocket) ─┘    ▲              (hosted tools,   ├ Upstream (HTTP, now)
+ OpenAI Chat         /v1/chat/completions (unchanged)│              aliasing)       └ Engine   (phase B)
+                                              SessionStore (items, ops, snapshots)
+```
+
+- **Front ends** (`cuteafd-api/src/gateway/{anthropic,responses,realtime}`)
+  parse their wire format into one `TurnRequest`:
+  - the system prompt;
+  - `Item` history: message, reasoning, tool call and result, and server-tool
+    call and result;
+  - tools and tool choice;
+  - sampling and reasoning controls;
+  - hosted web search;
+  - output modalities.
+
+  Each front end renders the `TurnEvent` stream in its own event sequence.
+  The events are reasoning, text and tool-call deltas with stable indexes,
+  server-tool events, cumulative usage, and a typed stop reason. Errors are
+  one `GatewayError`, rendered in Anthropic, OpenAI or Realtime shape.
+- **`Gateway::run`** resolves the model alias and runs hosted tools. Web search
+  goes to the backend as a plain `web_search` function. The driver executes
+  each call through a `SearchProvider` and continues the turn, so no backend
+  needs to know about search.
+- **`trait Backend`** has four methods: `start(turn) -> stream`,
+  `count_tokens`, `models` and `capabilities`. Dropping the stream cancels the
+  turn.
+  - **`Upstream`** speaks to any OpenAI chat-completions or
+    Anthropic-compatible service: DeepSeek for testing, or cuteafd's own
+    `/v1/chat/completions` on another host.
+  - **`Engine`** (phase B) feeds the scheduler directly. It replaces today's
+    chat handler internals without changing that route's behaviour.
+- `/v1/chat/completions` stays the engine's existing path, byte-identical,
+  until the engine backend has a parity gate. The gateway mounts beside it.
+
+### Session layer
+
+`SessionStore` holds two kinds of state:
+- **Live sessions:** Realtime connections, and phase-B explicit sessions.
+- **Immutable response snapshots:** each a chain of `(parent, new items)`.
+  `previous_response_id` continues from any snapshot in O(new items), which
+  is already a virtual fork.
+
+Every operation is a typed `SessionOp`. Each returns an `EngineEffect`, the
+honest cost the engine will pay:
+
+| Operation | Phase A | Engine needs (phase B) | Cost |
+|---|---|---|---|
+| append | real | extend the cached prefix | `PrefixKept`: prefill only the new items |
+| insert / edit / delete | real | invalidate KV from the first changed item | `RecomputeFrom(index)`: positions and attention depend on every earlier token |
+| truncate (Realtime) | real | drop KV after the cut | `RecomputeFrom(item)`; cheap when it is the last item, the barge-in case |
+| cancel | real | the scheduler's cancel path (drop the request) | — |
+| fork | real (copy) | prefix-cache mark at the fork point + `RefPagePool` page sharing (`PrefixCache` fork/restore, `PrefixFamily::capture/restore`) | `SharedPrefix`: no recompute; copy-on-write tail page |
+| steer: inject | stub | a scheduler hook between decode steps or prefill chunks: append tokens to the running sequence | prefill the injected tokens; no recompute |
+| steer: replace | stub | cancel, then recompute from the edited item, then resume | `RecomputeFrom` |
+| compact | stub | summarize with a side turn (forked session), then replace items | a new prefix: full prefill of the summary |
+| splice | stub | general case = edit; recompute from the splice start | `RecomputeFrom(from)`; only an exact token-identical prefix survives |
+| KV pin / evict / mark | stub | `PrefixCache` retention: pin = refcount hold; evict = release; mark = named capture point | none |
+
+Mid-sequence splicing cannot reuse KV after the edit point: rows after it
+were computed against the old tokens. Fork at a prefix is cheap because the
+pages are shared and refcounted. Steering mid-prefill needs the scheduler to
+accept appended tokens on a sequence that is still prefilling chunked work.
+That is the one new engine primitive phase B adds.
+
+### Front ends: what each client needs
+
+- **Claude Code** (`ANTHROPIC_BASE_URL=http://host:port`, key in
+  `ANTHROPIC_API_KEY` (x-api-key) or `ANTHROPIC_AUTH_TOKEN` (Bearer)):
+  - routes: `POST /v1/messages?beta=true` (stream) and
+    `/v1/messages/count_tokens`, plus any others the live capture shows;
+  - beta and cache-control headers are accepted and ignored;
+  - thinking signatures are synthesized as opaque values and accepted on
+    input;
+  - server web search (`web_search_*`) runs gateway-side.
+
+  The model ids come from `ANTHROPIC_MODEL`,
+  `ANTHROPIC_DEFAULT_{OPUS,SONNET,HAIKU}_MODEL`,
+  `ANTHROPIC_SMALL_FAST_MODEL` and `CLAUDE_CODE_SUBAGENT_MODEL`. With
+  `--accept-any-model`, any of them maps to the served model.
+- **Codex CLI** (`model_providers.cuteafd` with `base_url =
+  "http://host:port/v1"`, `wire_api = "responses"`, `env_key`):
+  - `POST /v1/responses` (stream) with `store:false`;
+  - reasoning `encrypted_content` round-tripped (an opaque token decoding to
+    the reasoning text);
+  - function, custom (freeform `apply_patch`), `local_shell` and
+    `web_search` tools;
+  - `previous_response_id` from the snapshot store;
+  - a model listing, if Codex fetches one.
+- **Realtime** (`GET /v1/realtime?model=` WebSocket, GA and beta event
+  names):
+  - each connection is a live session;
+  - `conversation.item.create`, `delete` and `truncate` are `SessionOp`s;
+  - `response.create` runs a turn over the session items (or out-of-band
+    input), and `response.cancel` drops it.
+
+  Audio input is committed (manually or by server VAD) as an `input_audio`
+  part:
+  - **an audio-capable backend** handles it: our MiMo audio path through the
+    engine backend in phase B, or an upstream with audio input;
+  - **otherwise** the response fails with a clear capability error.
+
+  Spoken output needs TTS we don't have. Audio output modality is refused
+  per spec, and a `Synthesizer` seam waits for phase C, as does a
+  `Transcriber` seam for input transcription.
+- **Home Assistant:**
+  - Assist's own voice pipeline speaks Wyoming (STT/TTS/wake word) and a
+    conversation agent.
+  - The first-party OpenAI integration hardcodes api.openai.com. The
+    llama.cpp integration (2026.8) and the community
+    `ha-openai-compatible` integration take a base URL; they use chat
+    completions or Responses, `/v1/models`, `audio/transcriptions` and
+    `audio/speech`.
+  - None speaks Realtime today. Cuteafd connects as a conversation agent
+    through Responses or chat completions now. A Realtime path for
+    multi-microphone rooms means a small bridge, Wyoming satellites →
+    Realtime, or `audio/transcriptions` + `audio/speech` once phase C has
+    STT/TTS.
+
+### Model aliasing
+
+`ModelMap` holds:
+- the served id;
+- explicit aliases (`PATTERN=MODEL`, with a trailing `*` matching a prefix);
+- `--accept-any-model`;
+- extra advertised ids for listings.
+
+Responses echo the id the client requested, so CLIs that check it stay happy.
+`GET /v1/models` returns OpenAI and Anthropic fields side by side, and
+`GET /v1/models/{id}` resolves through the map.
+
+### Hosted web search
+
+The client's server tool (Anthropic `web_search_*`, Responses `web_search`)
+becomes a gateway-executed search. Providers: Exa (keyed) and self-hosted
+SearXNG (no key). Results return in each protocol's own server-tool shapes,
+and `usage.server_tool_use.web_search_requests` is counted.
+
+### Testing without GPUs
+
+- `cuteafd gateway --upstream-url ... --model ...` serves every front end over
+  an upstream.
+- `--record DIR` writes sanitized fixtures: the client exchange plus every
+  upstream and search exchange beneath it.
+- Replay tests serve recorded upstream traffic from an in-process fake, offline
+  in `cargo test`.
+- A secrets scan fails on key-shaped strings, home paths or emails in any
+  fixture.
+
+### Phase B: engine backend
+
+1. Add an `Engine` backend that builds the family's prompt from `TurnRequest`
+   (reusing each family's chat template and tool syntax) and submits
+   `NativeRequest`. Gate it on golden NLL / byte-exact replies against the
+   chat path.
+2. Add session-aware prefix-cache hooks: fork through `PrefixCache` marks,
+   pin and evict by session, and `RecomputeFrom` mapped to token positions.
+3. Add steer-inject between decode steps, then mid-prefill injection.
+4. Add MiMo audio input under Realtime, plus a `Transcriber` from the same
+   encoder.
+
+Phase C covers TTS (a `Synthesizer`), Realtime audio output and the
+Home Assistant bridge.
+
 ## First after rc3: per-key draft confidence calibration (TJ, 2026-10-09)
 
 The shared draft policy refines acceptance with one frozen logistic fit over
