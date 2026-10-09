@@ -30,6 +30,7 @@ pub(super) struct Fold {
     arguments: HashMap<usize, String>,
     finished: HashSet<usize>,
     kinds: HashMap<String, ToolKind>,
+    names: HashMap<String, (String, String)>,
     encrypted: bool,
     summary: bool,
 }
@@ -78,6 +79,7 @@ impl Fold {
             arguments: HashMap::new(),
             finished: HashSet::new(),
             kinds: p.kinds.clone(),
+            names: p.names.clone(),
             encrypted: p.encrypted,
             summary: p.summary,
         };
@@ -189,7 +191,7 @@ impl Fold {
                     return Err(GatewayError::upstream("duplicate backend tool index"));
                 }
                 let kind = self.kinds.get(&name).cloned().unwrap_or(ToolKind::Function);
-                let item = match kind {
+                let mut item = match kind {
                     ToolKind::Function => {
                         json!({"type":"function_call","id":id("fc"),"call_id":call_id,"name":name,"arguments":"","status":"in_progress"})
                     }
@@ -200,6 +202,10 @@ impl Fold {
                         json!({"type":"local_shell_call","id":id("lsc"),"call_id":call_id,"action":{"type":"exec","command":[]},"status":"in_progress"})
                     }
                 };
+                if let Some((namespace, local)) = self.names.get(&name) {
+                    item["namespace"] = json!(namespace);
+                    item["name"] = json!(local);
+                }
                 let i = self.add(item);
                 self.calls.insert(index, i);
                 self.arguments.insert(i, String::new());
@@ -238,7 +244,16 @@ impl Fold {
                     .calls
                     .get(&index)
                     .ok_or_else(|| GatewayError::upstream("tool end without start"))?;
-                self.finish_item(i)?;
+                // Chat adapters close calls before reporting a max-token stop.
+                // Buffer invalid structured calls until Done distinguishes a
+                // truncated response from malformed successful model output.
+                let structured = matches!(
+                    self.response["output"][i]["type"].as_str(),
+                    Some("custom_tool_call" | "local_shell_call")
+                );
+                if !structured || serde_json::from_str::<Value>(&self.arguments[&i]).is_ok() {
+                    self.finish_item(i)?;
+                }
             }
             TurnEvent::ServerToolCall {
                 id: call_id,
@@ -285,10 +300,29 @@ impl Fold {
             }
             TurnEvent::Done { stop } => {
                 for i in 0..self.response["output"].as_array().unwrap().len() {
-                    self.finish_item(i)?;
+                    let kind = self.response["output"][i]["type"].as_str().unwrap();
+                    if matches!(
+                        stop,
+                        StopReason::MaxTokens | StopReason::Cancelled | StopReason::Refusal
+                    ) && !self.finished.contains(&i)
+                        && matches!(
+                            kind,
+                            "function_call" | "custom_tool_call" | "local_shell_call"
+                        )
+                    {
+                        self.response["output"][i]["status"] = json!("incomplete");
+                        self.finished.insert(i);
+                        self.emit(
+                            "response.output_item.done",
+                            json!({"output_index":i,"item":self.response["output"][i]}),
+                        );
+                    } else {
+                        self.finish_item(i)?;
+                    }
                 }
                 let (status, reason) = match stop {
                     StopReason::MaxTokens => ("incomplete", Some("max_output_tokens")),
+                    StopReason::Refusal => ("incomplete", Some("content_filter")),
                     StopReason::Cancelled => ("incomplete", Some("steered")),
                     _ => ("completed", None),
                 };

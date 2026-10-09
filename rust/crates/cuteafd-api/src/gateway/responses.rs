@@ -60,8 +60,8 @@ async fn create(
         Err(e) => return e.openai_response(),
     };
     let streaming = p.wire["stream"].as_bool().unwrap_or(false);
-    let events = run(gateway, p, stream);
     if streaming {
+        let events = run(gateway, p, stream);
         let sse = events.map(|v| {
             Ok::<_, Infallible>(
                 Event::default()
@@ -74,45 +74,30 @@ async fn create(
             .keep_alive(KeepAlive::new().interval(std::time::Duration::from_secs(15)))
             .into_response()
     } else {
-        futures::pin_mut!(events);
-        let mut response = None;
-        while let Some(event) = events.next().await {
-            if event["type"] == "response.failed" {
-                return GatewayError::upstream(
-                    event["response"]["error"]["message"]
-                        .as_str()
-                        .unwrap_or("generation failed"),
-                )
-                .openai_response();
+        let mut stream = stream;
+        let mut fold = render::Fold::new(&p);
+        fold.events.clear();
+        while let Some(event) = stream.next().await {
+            if let Err(e) = event.and_then(|e| fold.accept(e)) {
+                fold.fail(&e);
+                store(&gateway, &p, &fold);
+                return e.openai_response();
             }
-            if event["type"] == "response.completed" || event["type"] == "response.incomplete" {
-                response = Some(event["response"].clone());
+            fold.events.clear();
+            if fold.terminal {
+                store(&gateway, &p, &fold);
+                return Json(fold.response).into_response();
             }
         }
-        response
-            .map(|v| Json(v).into_response())
-            .unwrap_or_else(|| {
-                GatewayError::internal("missing terminal response").openai_response()
-            })
+        let e = GatewayError::upstream("backend stream ended before Done");
+        fold.fail(&e);
+        store(&gateway, &p, &fold);
+        e.openai_response()
     }
 }
 
 fn snapshot(p: &parse::Parsed, fold: &render::Fold) -> Arc<Snapshot> {
-    let mut items: Vec<StoredItem> = p
-        .new_items
-        .iter()
-        .cloned()
-        .enumerate()
-        .map(|(i, item)| StoredItem {
-            id: p
-                .input
-                .get(i)
-                .and_then(|v| v["id"].as_str())
-                .map(str::to_owned)
-                .unwrap_or_else(|| render::id("item")),
-            item,
-        })
-        .collect();
+    let mut items = p.new_stored.clone();
     for (i, v) in fold.response["output"]
         .as_array()
         .unwrap()
@@ -174,13 +159,14 @@ fn run(
         while let Some(event) = stream.next().await {
             if let Err(error) = event.and_then(|e| fold.accept(e)) { fold.fail(&error); }
             if fold.terminal {
-                if fold.response["status"] != "failed" { store(&gateway, &p, &fold); }
+                store(&gateway, &p, &fold);
                 for event in std::mem::take(&mut fold.events) { yield event; }
                 return;
             }
             for event in std::mem::take(&mut fold.events) { yield event; }
         }
         fold.fail(&GatewayError::upstream("backend stream ended before Done"));
+        store(&gateway,&p,&fold);
         for event in fold.events { yield event; }
     }
 }
@@ -290,6 +276,7 @@ async fn compact(
     };
     p.turn.tape = tape;
     p.turn.tools.clear();
+    p.turn.tool_choice = super::turn::ToolChoice::None;
     p.turn.hosted = Default::default();
     p.turn.items.push(Item::Message { role:Role::User, content:vec![Part::text("Summarize this conversation for continuation. Preserve the user's requirements, decisions, tool results and pending work. Return only the compact context, not an answer to the task.")] });
     let mut stream = match gateway.run(p.turn).await {
@@ -366,7 +353,45 @@ async fn websocket_loop(mut socket: WebSocket, gateway: Arc<Gateway>, tape: Tape
             }
         };
         p.turn.tape = tape.clone();
-        let mut stream = match gateway.run(p.turn.clone()).await {
+        if p.wire.get("generate").is_some_and(|v| !v.is_boolean()) {
+            if socket.send(Message::Text(json!({"type":"error","status":400,"error":{"type":"invalid_request_error","message":"generate must be boolean","code":null,"param":"generate"}}).to_string())).await.is_err() { return; }
+            continue;
+        }
+        if p.wire["generate"] == false {
+            if let Err(e) = gateway.count_tokens(p.turn.clone()).await {
+                if socket.send(Message::Text(json!({"type":"error","status":e.status(),"error":e.openai_body()["error"]}).to_string())).await.is_err() { return; }
+                continue;
+            }
+            let mut fold = render::Fold::new(&p);
+            fold.accept(TurnEvent::Done {
+                stop: super::turn::StopReason::EndTurn,
+            })
+            .unwrap();
+            last = Some((
+                fold.response["id"].as_str().unwrap().into(),
+                store(&gateway, &p, &fold),
+            ));
+            for event in fold.events {
+                if socket.send(Message::Text(event.to_string())).await.is_err() {
+                    return;
+                }
+            }
+            continue;
+        }
+        let start = gateway.run(p.turn.clone());
+        tokio::pin!(start);
+        let started = loop {
+            tokio::select! {
+                result = &mut start => break result,
+                message = socket.next() => match message {
+                    Some(Ok(Message::Ping(bytes))) => { if socket.send(Message::Pong(bytes)).await.is_err() { return; } },
+                    Some(Ok(Message::Text(_))) => { if socket.send(Message::Text(json!({"type":"error","status":400,"error":{"type":"invalid_request_error","code":"response_in_progress","message":"a response is already starting","param":null}}).to_string())).await.is_err() { return; } },
+                    Some(Ok(Message::Close(_))) | None | Some(Err(_)) => return,
+                    _ => {},
+                }
+            }
+        };
+        let mut stream = match started {
             Ok(s) => s,
             Err(e) => {
                 if socket.send(Message::Text(json!({"type":"error","status":e.status(),"error":e.openai_body()["error"]}).to_string())).await.is_err() { break; }
@@ -389,7 +414,10 @@ async fn websocket_loop(mut socket: WebSocket, gateway: Arc<Gateway>, tape: Tape
                         Some(event) => if let Err(e) = event.and_then(|e| fold.accept(e)) { fold.fail(&e); },
                         None => fold.fail(&GatewayError::upstream("backend stream ended before Done")),
                     }
-                    if fold.terminal && fold.response["status"] != "failed" { last = Some((fold.response["id"].as_str().unwrap().into(), store(&gateway,&p,&fold))); }
+                    if fold.terminal {
+                        let snap = store(&gateway,&p,&fold);
+                        if fold.response["status"] != "failed" { last = Some((fold.response["id"].as_str().unwrap().into(),snap)); }
+                    }
                 },
                 message = socket.next() => match message {
                     Some(Ok(Message::Ping(bytes))) => { if socket.send(Message::Pong(bytes)).await.is_err() { return; } },

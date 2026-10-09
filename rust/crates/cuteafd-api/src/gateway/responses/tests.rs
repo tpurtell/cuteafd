@@ -1,3 +1,5 @@
+use crate::gateway::search::{SearchHit, SearchProvider, SearchQuery};
+use futures::{future::BoxFuture, SinkExt, StreamExt};
 use std::sync::Arc;
 
 use axum::{
@@ -475,4 +477,379 @@ async fn count_and_compaction_roundtrip() {
     assert!(
         matches!(&backend.turns()[1].items[0],Item::Message { role:Role::System,content } if content == &vec![Part::text("Keep the outstanding task")])
     );
+}
+
+struct Search;
+impl SearchProvider for Search {
+    fn name(&self) -> &str {
+        "offline"
+    }
+    fn search(
+        &self,
+        query: SearchQuery,
+    ) -> BoxFuture<'static, Result<Vec<SearchHit>, GatewayError>> {
+        assert_eq!(query.allowed_domains, vec!["example.org"]);
+        Box::pin(async {
+            Ok(vec![SearchHit {
+                url: "https://example.org/source".into(),
+                title: "Source".into(),
+                content: "fact".into(),
+                published: None,
+            }])
+        })
+    }
+}
+
+#[tokio::test]
+async fn hosted_search_events_and_stored_result() {
+    let backend = Scripted::new(vec![
+        vec![
+            call(0, "search", "web_search"),
+            delta(0, r#"{"query":"question"}"#),
+            end(0),
+            TurnEvent::Done {
+                stop: StopReason::ToolUse,
+            },
+        ],
+        vec![text("fact"), done()],
+        vec![done()],
+    ]);
+    let gateway = Arc::new(
+        Gateway::new(
+            Arc::new(backend.clone()),
+            ModelMap {
+                accept_any: true,
+                ..ModelMap::single("served-model")
+            },
+        )
+        .with_search(Arc::new(Search)),
+    );
+    let app = crate::gateway::router(gateway);
+    let (_,body) = request(&app,"POST","/v1/responses",json!({"model":"gpt-6.1-sol","input":"q","stream":true,"tools":[{"type":"web_search","filters":{"allowed_domains":["example.org"]}}]})).await;
+    let ev = events(&body);
+    let types: Vec<_> = ev.iter().map(|v| v["type"].as_str().unwrap()).collect();
+    for t in [
+        "response.web_search_call.in_progress",
+        "response.web_search_call.searching",
+        "response.web_search_call.completed",
+    ] {
+        assert!(types.contains(&t), "{types:?}");
+    }
+    let response = &ev.last().unwrap()["response"];
+    assert_eq!(
+        response["output"][0]["action"]["sources"][0]["url"],
+        "https://example.org/source"
+    );
+    request(
+        &app,
+        "POST",
+        "/v1/responses",
+        json!({"model":"gpt-6.1-sol","previous_response_id":response["id"],"input":"continue"}),
+    )
+    .await;
+    assert!(backend.turns()[2].items.iter().any(|i| matches!(i,Item::ServerToolResult { output,.. } if output["results"][0]["content"] == "fact")));
+}
+
+#[tokio::test]
+async fn namespace_tools_and_pause_turn() {
+    let (app, backend, _) = app(vec![vec![
+        call(0, "p", "functions.apply_patch"),
+        delta(0, r#"{"input":"patch"}"#),
+        end(0),
+        TurnEvent::Done {
+            stop: StopReason::PauseTurn,
+        },
+    ]]);
+    let (status,body) = request(&app,"POST","/v1/responses",json!({"model":"gpt-6.1-sol","tools":[{"type":"namespace","name":"functions","description":"","tools":[{"type":"custom","name":"apply_patch","format":{"type":"text"}}]}],"tool_choice":{"type":"custom","namespace":"functions","name":"apply_patch"}})).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let v: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["status"], "completed");
+    assert_eq!(v["output"][0]["namespace"], "functions");
+    assert_eq!(v["output"][0]["name"], "apply_patch");
+    assert_eq!(backend.turns()[0].tools[0].name, "functions.apply_patch");
+    let items = parse::parse_item(&v["output"][0]).unwrap();
+    assert!(matches!(&items[0],Item::ToolCall { name,.. } if name == "functions.apply_patch"));
+}
+
+#[tokio::test]
+async fn websocket_warmup_and_ephemeral_previous_response() {
+    let (app, backend, _) = app(vec![
+        vec![text("first"), done()],
+        vec![text("second"), done()],
+    ]);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/v1/responses"))
+        .await
+        .unwrap();
+    for (i, input) in ["warm", "one", "two"].iter().enumerate() {
+        let mut req =
+            json!({"type":"response.create","model":"gpt-6.1-sol","input":input,"store":false});
+        if i == 0 {
+            req["generate"] = json!(false);
+        }
+        if i == 2 {
+            req["previous_response_id"] = json!(LAST_ID.with(|s| s.borrow().clone()));
+        }
+        ws.send(tokio_tungstenite::tungstenite::Message::Text(
+            req.to_string(),
+        ))
+        .await
+        .unwrap();
+        loop {
+            let message = tokio::time::timeout(std::time::Duration::from_secs(5), ws.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            let v: Value = serde_json::from_str(message.to_text().unwrap()).unwrap();
+            assert_ne!(v["type"], "error", "{v}");
+            if v["type"] == "response.completed" {
+                if i == 0 {
+                    assert_eq!(v["response"]["output"], json!([]));
+                    assert!(backend.turns().is_empty());
+                }
+                LAST_ID.with(|s| *s.borrow_mut() = v["response"]["id"].as_str().unwrap().into());
+                break;
+            }
+        }
+    }
+    assert_eq!(backend.turns().len(), 2);
+    assert_eq!(backend.turns()[1].items.len(), 3);
+    ws.close(None).await.unwrap();
+    server.abort();
+}
+thread_local! { static LAST_ID:std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) }; }
+
+#[test]
+fn response_document_eviction_is_atomic() {
+    let sessions = crate::gateway::SessionStore::new(1);
+    let snap = || {
+        Arc::new(Snapshot {
+            parent: None,
+            system: None,
+            items: vec![],
+        })
+    };
+    sessions.put_response_document("a".into(), snap(), json!({"id":"a"}));
+    sessions.put_response_document("b".into(), snap(), json!({"id":"b"}));
+    assert!(sessions.response("a").is_none());
+    assert!(sessions.response_document("a").is_none());
+    assert!(sessions.response("b").is_some());
+    assert!(sessions.response_document("b").is_some());
+    assert!(sessions.delete_response("b"));
+    assert!(sessions.response_document("b").is_none());
+}
+
+#[tokio::test]
+async fn truncated_calls_content_filter_and_typed_error() {
+    let (app, backend, _) = app(vec![
+        vec![
+            call(0, "c", "patch"),
+            delta(0, r#"{"input":"partial"#),
+            end(0),
+            TurnEvent::Done {
+                stop: StopReason::MaxTokens,
+            },
+        ],
+        vec![
+            call(0, "s", "local_shell"),
+            delta(0, r#"{"type":"exec","command":["#),
+            end(0),
+            TurnEvent::Done {
+                stop: StopReason::MaxTokens,
+            },
+        ],
+        vec![
+            text("filtered"),
+            TurnEvent::Done {
+                stop: StopReason::Refusal,
+            },
+        ],
+        vec![],
+        vec![],
+    ]);
+    for tool in [
+        json!({"type":"custom","name":"patch"}),
+        json!({"type":"local_shell"}),
+    ] {
+        let (_, body) = request(
+            &app,
+            "POST",
+            "/v1/responses",
+            json!({"model":"gpt-6.1-sol","stream":true,"tools":[tool]}),
+        )
+        .await;
+        let ev = events(&body);
+        assert_eq!(ev.last().unwrap()["type"], "response.incomplete", "{body}");
+        assert_eq!(
+            ev.last().unwrap()["response"]["output"][0]["status"],
+            "incomplete"
+        );
+    }
+    let (_, body) = request(
+        &app,
+        "POST",
+        "/v1/responses",
+        json!({"model":"gpt-6.1-sol"}),
+    )
+    .await;
+    assert_eq!(
+        serde_json::from_str::<Value>(&body).unwrap()["incomplete_details"]["reason"],
+        "content_filter"
+    );
+    backend.scripts.lock().unwrap()[1] = vec![Err(GatewayError::new(
+        crate::gateway::ErrorKind::RateLimited,
+        "retry later",
+    )
+    .with_param("model"))];
+    let (status, body) = request(
+        &app,
+        "POST",
+        "/v1/responses",
+        json!({"model":"gpt-6.1-sol"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(
+        serde_json::from_str::<Value>(&body).unwrap()["error"]["param"],
+        "model"
+    );
+    backend.scripts.lock().unwrap()[0] = vec![Err(GatewayError::upstream("failed"))];
+    let (_, body) = request(
+        &app,
+        "POST",
+        "/v1/responses",
+        json!({"model":"gpt-6.1-sol","stream":true}),
+    )
+    .await;
+    let ev = events(&body);
+    let id = ev.last().unwrap()["response"]["id"].as_str().unwrap();
+    let (status, body) = request(&app, "GET", &format!("/v1/responses/{id}"), Value::Null).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        serde_json::from_str::<Value>(&body).unwrap()["status"],
+        "failed"
+    );
+}
+
+#[tokio::test]
+#[ignore = "manual localhost fixture for scripts/gateway/check-responses-sdk.py"]
+async fn serve_sdk_fixture() {
+    let (app, _, _) = app(vec![
+        vec![text("hello"), text(" world"), done()],
+        vec![
+            TurnEvent::ReasoningDelta {
+                text: "trace".into(),
+            },
+            text("answer"),
+            done(),
+        ],
+        vec![
+            call(0, "call_function", "f"),
+            delta(0, r#"{"x":1}"#),
+            end(0),
+            done(),
+        ],
+        vec![
+            call(0, "call_custom", "patch"),
+            delta(0, r#"{"input":"patch\ntext"}"#),
+            end(0),
+            done(),
+        ],
+        vec![
+            text("partial"),
+            TurnEvent::Done {
+                stop: StopReason::MaxTokens,
+            },
+        ],
+    ]);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:18491")
+        .await
+        .unwrap();
+    println!("SDK fixture ready on http://127.0.0.1:18491/v1");
+    axum::serve(listener, app).await.unwrap();
+}
+
+#[derive(Clone)]
+struct PendingStart {
+    entered: Arc<tokio::sync::Notify>,
+    dropped: Arc<tokio::sync::Notify>,
+}
+struct SignalOnDrop(Arc<tokio::sync::Notify>);
+impl Drop for SignalOnDrop {
+    fn drop(&mut self) {
+        self.0.notify_one();
+    }
+}
+impl crate::gateway::Backend for PendingStart {
+    fn name(&self) -> &str {
+        "pending"
+    }
+    fn capabilities(&self) -> crate::gateway::BackendCapabilities {
+        Default::default()
+    }
+    fn models(&self) -> Vec<crate::gateway::ModelInfo> {
+        vec![]
+    }
+    fn start(
+        &self,
+        _: crate::gateway::TurnRequest,
+    ) -> BoxFuture<'static, Result<crate::gateway::TurnStream, GatewayError>> {
+        let me = self.clone();
+        Box::pin(async move {
+            let _guard = SignalOnDrop(me.dropped);
+            me.entered.notify_one();
+            futures::future::pending().await
+        })
+    }
+    fn count_tokens(
+        &self,
+        _: crate::gateway::TurnRequest,
+    ) -> BoxFuture<'static, Result<u32, GatewayError>> {
+        Box::pin(async { Ok(0) })
+    }
+}
+#[tokio::test]
+async fn websocket_disconnect_cancels_pending_backend_start() {
+    let backend = PendingStart {
+        entered: Arc::new(tokio::sync::Notify::new()),
+        dropped: Arc::new(tokio::sync::Notify::new()),
+    };
+    let gateway = Arc::new(Gateway::new(
+        Arc::new(backend.clone()),
+        ModelMap::single("test"),
+    ));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, crate::gateway::router(gateway))
+            .await
+            .unwrap();
+    });
+    let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/v1/responses"))
+        .await
+        .unwrap();
+    ws.send(tokio_tungstenite::tungstenite::Message::Text(
+        json!({"type":"response.create","model":"test","input":"hi"}).to_string(),
+    ))
+    .await
+    .unwrap();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        backend.entered.notified(),
+    )
+    .await
+    .unwrap();
+    ws.close(None).await.unwrap();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        backend.dropped.notified(),
+    )
+    .await
+    .unwrap();
+    server.abort();
 }

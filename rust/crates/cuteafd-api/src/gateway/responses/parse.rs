@@ -16,8 +16,11 @@ pub(super) struct Parsed {
     pub wire: Value,
     pub turn: TurnRequest,
     pub kinds: HashMap<String, ToolKind>,
+    pub names: HashMap<String, (String, String)>,
     pub parent: Option<Arc<Snapshot>>,
+    #[cfg(test)]
     pub new_items: Vec<Item>,
+    pub new_stored: Vec<crate::gateway::session::StoredItem>,
     pub input: Vec<Value>,
     pub store: bool,
     pub encrypted: bool,
@@ -83,7 +86,7 @@ pub(super) fn parse(
         None
     };
     let history = parent.as_ref().map(|s| s.history()).unwrap_or_default();
-    let input = match wire.get("input") {
+    let mut input = match wire.get("input") {
         Some(Value::String(text)) => vec![
             json!({"type":"message","role":"user","content":[{"type":"input_text","text":text}]}),
         ],
@@ -95,19 +98,43 @@ pub(super) fn parse(
             )
         }
     };
+    for entry in &mut input {
+        if !entry.is_object() {
+            return Err(GatewayError::invalid("input items must be objects").with_param("input"));
+        }
+        if entry.get("id").is_none() {
+            entry["id"] = json!(super::render::id("item"));
+        }
+        if entry.get("type").is_none() {
+            entry["type"] = json!("message");
+        }
+    }
     let mut new_items = Vec::new();
+    let mut new_stored = Vec::new();
     for entry in &input {
-        if entry["type"] == "item_reference" {
-            let id = string(entry, "id")?;
-            let item = history.iter().find(|item| item.id == id).ok_or_else(|| {
-                GatewayError::not_found(format!(
+        let id = string(entry, "id")?;
+        let parsed = if entry["type"] == "item_reference" {
+            let matches: Vec<Item> = history
+                .iter()
+                .filter(|item| item.id == id)
+                .map(|item| item.item.clone())
+                .collect();
+            if matches.is_empty() {
+                return Err(GatewayError::not_found(format!(
                     "referenced item '{id}' not found in previous response"
                 ))
-                .with_param("input")
-            })?;
-            new_items.push(item.item.clone());
+                .with_param("input"));
+            }
+            matches
         } else {
-            new_items.extend(parse_item(entry)?);
+            parse_item(entry)?
+        };
+        for item in parsed {
+            new_stored.push(crate::gateway::session::StoredItem {
+                id: id.into(),
+                item: item.clone(),
+            });
+            new_items.push(item);
         }
     }
     let mut turn = TurnRequest {
@@ -257,12 +284,38 @@ pub(super) fn parse(
     // Keep reasoning available for opaque round trips even when summaries are hidden.
     turn.reasoning.return_text = summary || encrypted;
     let mut kinds = HashMap::new();
+    let mut names = HashMap::new();
     let tools = match wire.get("tools") {
         None | Some(Value::Null) => Vec::new(),
         Some(Value::Array(a)) => a.clone(),
         _ => return Err(GatewayError::invalid("tools must be an array").with_param("tools")),
     };
+    let mut flattened = Vec::new();
     for tool in tools {
+        if tool["type"] == "namespace" {
+            let namespace = string(&tool, "name")?;
+            let children = tool["tools"].as_array().ok_or_else(|| {
+                GatewayError::invalid("namespace tools must be an array").with_param("tools")
+            })?;
+            for child in children {
+                if !["function", "custom"].contains(&string(child, "type")?) {
+                    return Err(GatewayError::invalid(
+                        "namespaces accept function/custom tools only",
+                    )
+                    .with_param("tools"));
+                }
+                let name = string(child, "name")?;
+                let mapped = format!("{namespace}.{name}");
+                names.insert(mapped.clone(), (namespace.to_owned(), name.to_owned()));
+                let mut child = child.clone();
+                child["name"] = json!(mapped);
+                flattened.push(child);
+            }
+        } else {
+            flattened.push(tool);
+        }
+    }
+    for tool in flattened {
         let kind = string(&tool, "type")?;
         if kind == "web_search" || kind == "web_search_preview" {
             if turn.hosted.web_search.is_some() {
@@ -375,7 +428,7 @@ pub(super) fn parse(
         },
         Some(v) => match string(v, "type")? {
             "function" | "custom" => ToolChoice::Named {
-                name: string(v, "name")?.to_owned(),
+                name: qualified_name(v)?,
             },
             "local_shell" => ToolChoice::Named {
                 name: "local_shell".into(),
@@ -404,12 +457,23 @@ pub(super) fn parse(
         wire,
         turn,
         kinds,
+        names,
         parent,
+        #[cfg(test)]
         new_items,
+        new_stored,
         input,
         store,
         encrypted,
         summary,
+    })
+}
+
+fn qualified_name(v: &Value) -> Result<String, GatewayError> {
+    let name = string(v, "name")?;
+    Ok(match optional_string(v, "namespace")? {
+        Some(ns) => format!("{ns}.{name}"),
+        None => name.to_owned(),
     })
 }
 
@@ -439,12 +503,12 @@ pub(super) fn parse_item(v: &Value) -> Result<Vec<Item>, GatewayError> {
         }
         "function_call" => vec![Item::ToolCall {
             id: call_id()?,
-            name: string(v, "name")?.into(),
+            name: qualified_name(v)?,
             arguments: string(v, "arguments")?.into(),
         }],
         "custom_tool_call" => vec![Item::ToolCall {
             id: call_id()?,
-            name: string(v, "name")?.into(),
+            name: qualified_name(v)?,
             arguments: json!({"input":string(v, "input")?}).to_string(),
         }],
         "local_shell_call" => vec![Item::ToolCall {
