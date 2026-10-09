@@ -439,3 +439,20 @@ async fn sse_errors_are_typed_before_and_after_first_output_without_provider_mes
         }
     }
 }
+
+/// Live Pipecat run (2026-10-10): its warm-up response.create on an empty
+/// conversation reached the upstream as a system-only prompt, rejected with
+/// "Input must have at least 1 token".
+#[test]
+fn empty_conversation_gets_a_stand_in_user_turn() {
+    let mut turn = turn();
+    turn.items.clear();
+    turn.system = Some("be brief".into());
+    let chat = backend(Flavor::OpenaiChat).map_request(&turn).unwrap();
+    let roles: Vec<&str> = chat["messages"].as_array().unwrap().iter().map(|m| m["role"].as_str().unwrap()).collect();
+    assert_eq!(roles, ["system", "user"]);
+    let anthropic = backend(Flavor::Anthropic).map_request(&turn).unwrap();
+    assert_eq!(anthropic["messages"].as_array().unwrap().len(), 1);
+    let normal = backend(Flavor::OpenaiChat).map_request(&self::turn()).unwrap();
+    assert_eq!(normal["messages"].as_array().unwrap().len(), 1, "real turns are untouched");
+}

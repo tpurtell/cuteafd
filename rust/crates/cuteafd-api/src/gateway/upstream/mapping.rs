@@ -14,6 +14,9 @@ pub(super) fn request(turn: &TurnRequest, config: &UpstreamConfig) -> Result<Val
     let names = WireNames::new(turn);
     match config.flavor { Flavor::OpenaiChat => chat(turn, config, &names), Flavor::Anthropic => anthropic(turn, config, &names) }
 }
+/// Stand-in user turn for a request with no conversation yet.
+const EMPTY_TURN: &str = "(The conversation has not started yet.)";
+
 /// Per-turn tool names on the wire. Upstream models see readable names: a
 /// namespaced tool (`functions.exec`) goes out under its local name (`exec`)
 /// when that is unique and doesn't clash with another tool, because client
@@ -153,6 +156,9 @@ fn chat(turn: &TurnRequest, config: &UpstreamConfig, names: &WireNames) -> Resul
             }
         }
     }
+    // Chat upstreams reject a prompt with no conversational turn (a Realtime
+    // response over an empty conversation carries instructions only).
+    if !messages.iter().any(|m| m["role"] != "system") { messages.push(json!({"role":"user","content":EMPTY_TURN})); }
     let mut request = json!({"model":turn.model,"messages":messages,"stream":true,"stream_options":{"include_usage":true}});
     if !turn.tools.is_empty() {
         request["tools"] = json!(turn.tools.iter().map(|tool| {
@@ -224,6 +230,7 @@ fn anthropic(turn: &TurnRequest, config: &UpstreamConfig, names: &WireNames) -> 
             Item::ServerToolResult { call_id, output, .. } => append_block(&mut messages, "user", json!({"type":"tool_result","tool_use_id":call_id,"content":output.to_string()})),
         }
     }
+    if messages.is_empty() { messages.push(json!({"role":"user","content":[{"type":"text","text":EMPTY_TURN}]})); }
     let mut request = json!({"model":turn.model,"messages":messages,"stream":true,"max_tokens":turn.max_output_tokens.unwrap_or(4096)});
     if !system.is_empty() { request["system"] = json!(system); }
     if !turn.tools.is_empty() {
