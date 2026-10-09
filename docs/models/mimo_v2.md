@@ -137,6 +137,12 @@ MiMo V2 Flash 1 RTX + 4 Sparks; V2.6 Pro 1 RTX + 6 Sparks. Coordinator VRAM: V2 
 
 ## Known limits
 
+<!-- release-v2-limits -->
+- **Memory vs. kernel support:** the planner reports 1,048,576 checkpoint context tokens and no compiled-index-extent requirement. Flash uses the memory-fitting two-Spark minimum; Pro needs six Sparks. Pro's 31.8 GiB no-fit is a memory rejection, whereas the PRO-card automatic-pool startup rejection below is runtime admission, not a missing TP kernel. The configured Pro minimum retains full context with a 1,048,576-token pool.
+- **v2.0.0 blocker, Pro minimum at default settings:** automatic KV sizing fills the 97% PRO ceiling, then the 64 MiB Spark intake startup probe is charged on top. Admission needs 98,393,355,060 B against 98,327,870,832 B (65,484,228 B short). Vision/audio are already on Spark ranks 4/5. The configured retry uses a 1,048,576-token pool with full 1,048,576-token context; it does not qualify the broken automatic default. Fix automatic pool sizing after reserving max(intake probe, small-card floor) as a startup peak, so the probe always fits (`rust/crates/cuteafd-daemon/src/families/mimo_v2/admission.rs:460`).
+- Historical text-only Flash MOPD bring-up cards do not qualify multimodal or 1M-context operation. This release smoke enables bundled vision/audio admission but measures text and quick quality, not a full multimodal/context campaign.
+- `XiaomiMiMo/MiMo-V2.6-Pro-MOPD` is not supported on a single 32 GB card with all six available Sparks; needs a larger coordinator card or a different checkpoint/placement. rc1 planner: rtx0 full memory layout needs 33511016304 bytes, budget 31031138713 bytes, shortfall 2479877591 bytes. See the linked planner-only 5090 cell; no performance was measured.
+
 - V2.6 Pro's prefill is intake-bound on the Spark-to-coordinator exchange of
   partial rows at larger TP; Spark-side reduction of partials is a parked
   experiment (small gain, bandwidth-bound either way).
@@ -150,9 +156,10 @@ MiMo V2 Flash 1 RTX + 4 Sparks; V2.6 Pro 1 RTX + 6 Sparks. Coordinator VRAM: V2 
   canonical re-render differs at token95 (Info), not an exact template claim.
   C1/C4 greedy outputs diverge (Info). Exact restore is replay at the same
   chunk boundary, not equivalence to a differently chunked straight prefill.
-- Flash MOPD qualification is text-only: bundled vision/audio towers are
-  skipped. The checkpoint advertises 1M context; the measured16K/32K-pool
-  configuration does not qualify full-context serving or the planned5090 path.
+- Historical Flash MOPD bring-up qualification was text-only with bundled
+  vision/audio towers skipped. Its measured16K/32K-pool configuration does
+  not qualify the advertised1M context or real5090 performance; the v2 cards
+  are distinct release-smoke measurements with current admission defaults.
 - Exact Spark slices remove zero padding. The v1 scope's MXFP4 32-row
   down-projection tails are implemented on the unmerged `work/mxfp4-tails`
   branch; distributed-oracle and unchanged-NLL gates remain open. Larger
@@ -164,6 +171,7 @@ MiMo V2 Flash 1 RTX + 4 Sparks; V2.6 Pro 1 RTX + 6 Sparks. Coordinator VRAM: V2 
 
 | Version | Date | Change | Basic eval |
 | --- | --- | --- | --- |
+| v2 | 2026-10-09 | V2.6 Flash MOPD default; bundled vision and qualified MiMo audio auto admission with audio AOT in release images; full-context/small-card memory admission; Hugh-derived opt-in queue, warm snapshots and indexed copy windows. | Pending rc1 exports |
 | v2-bringup | 2026-10-05 | Flash default moves to V2.6 Flash MOPD: distinct arithmetic programs, official TP4 QKV/MXFP4, TP2 minimum, checkpoint target formats and qualified FP8 bundled DFlash; text-only overlay smoke, not a release cut. | <a href="../../benchmarks/mimo_v2/2026-10-05-smoke-mimo-v2-6-flash-mopd-1rtx-2spark/report.svg"><img src="../../benchmarks/mimo_v2/2026-10-05-smoke-mimo-v2-6-flash-mopd-1rtx-2spark/card.svg" width="360" alt="MiMo-V2.6-Flash-MOPD (mxfp4-g32) (min)"></a> <a href="../../benchmarks/mimo_v2/2026-10-05-smoke-mimo-v2-6-flash-mopd-2rtx-4spark/report.svg"><img src="../../benchmarks/mimo_v2/2026-10-05-smoke-mimo-v2-6-flash-mopd-2rtx-4spark/card.svg" width="360" alt="MiMo-V2.6-Flash-MOPD (mxfp4-g32) (max)"></a> <a href="../../benchmarks/mimo_v2/2026-10-04-smoke-mimo-v2-6-pro-mopd-1rtx-6spark-mimo-pro-min/report.svg"><img src="../../benchmarks/mimo_v2/2026-10-04-smoke-mimo-v2-6-pro-mopd-1rtx-6spark-mimo-pro-min/card.svg" width="360" alt="MiMo-V2.6-Pro-MOPD (mxfp4-g32) (min)"></a> <a href="../../benchmarks/mimo_v2/2026-10-04-smoke-mimo-v2-6-pro-mopd-2rtx-6spark-mimo-pro-max/report.svg"><img src="../../benchmarks/mimo_v2/2026-10-04-smoke-mimo-v2-6-pro-mopd-2rtx-6spark-mimo-pro-max/card.svg" width="360" alt="MiMo-V2.6-Pro-MOPD (mxfp4-g32) (max)"></a> |
 | v1 | 2026-10-04 | V2.6 Pro MOPD checkpoint and DFlash; native A8 MXFP4 down projection and exact Spark slices; single-copy FP8 head/O/drafter; pipelined head-split prefill; Flash two-lane default. | <a href="../../benchmarks/mimo_v2/2026-10-04-smoke-mimo-v2-flash-1rtx-4spark-mimo-flash-min/report.svg"><img src="../../benchmarks/mimo_v2/2026-10-04-smoke-mimo-v2-flash-1rtx-4spark-mimo-flash-min/card.svg" width="360" alt="MiMo-V2-Flash (fp8-block128x128/f32) (min)"></a> <a href="../../benchmarks/mimo_v2/2026-10-04-smoke-mimo-v2-flash-2rtx-4spark-mimo-flash-max/report.svg"><img src="../../benchmarks/mimo_v2/2026-10-04-smoke-mimo-v2-flash-2rtx-4spark-mimo-flash-max/card.svg" width="360" alt="MiMo-V2-Flash (fp8-block128x128/f32) (max)"></a> <a href="../../benchmarks/mimo_v2/2026-10-04-smoke-mimo-v2-6-pro-mopd-1rtx-6spark-mimo-pro-min/report.svg"><img src="../../benchmarks/mimo_v2/2026-10-04-smoke-mimo-v2-6-pro-mopd-1rtx-6spark-mimo-pro-min/card.svg" width="360" alt="MiMo-V2.6-Pro-MOPD (mxfp4-g32) (min)"></a> <a href="../../benchmarks/mimo_v2/2026-10-04-smoke-mimo-v2-6-pro-mopd-2rtx-6spark-mimo-pro-max/report.svg"><img src="../../benchmarks/mimo_v2/2026-10-04-smoke-mimo-v2-6-pro-mopd-2rtx-6spark-mimo-pro-max/card.svg" width="360" alt="MiMo-V2.6-Pro-MOPD (mxfp4-g32) (max)"></a> |
 | v0 | 2026-10-02 | First release | <a href="../../benchmarks/mimo_v2/2026-10-02-smoke-mimo-v2-flash-1rtx-4spark/report.svg"><img src="../../benchmarks/mimo_v2/2026-10-02-smoke-mimo-v2-flash-1rtx-4spark/card.svg" width="360" alt="MiMo-V2-Flash (fp8-block128x128/f32) (min)"></a> <a href="../../benchmarks/mimo_v2/2026-10-02-smoke-mimo-v2-flash-2rtx-4spark/report.svg"><img src="../../benchmarks/mimo_v2/2026-10-02-smoke-mimo-v2-flash-2rtx-4spark/card.svg" width="360" alt="MiMo-V2-Flash (fp8-block128x128/f32) (max)"></a> |

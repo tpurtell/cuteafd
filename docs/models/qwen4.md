@@ -106,6 +106,10 @@ readiness field measures only the coordinator process.
 
 ## Known limits
 
+<!-- release-v2-limits -->
+- **Memory vs. kernel support:** the measured checkpoints support 262,144 context tokens in the planner; this image's compiled index extent is 131,072. Corrected cards request 131,072 explicitly. Local experts fit one PRO card, but the planner separately reports the two-coordinator cache geometry as unsupported; a second RTX is not a supported split.
+- No two-GPU split: the 2x RTX column is n/a rather than a duplicated one-GPU measurement. The minimum is local on one PRO card; small-card simulations may need Spark experts.
+
 - FP8 experts have no Spark TP layout yet: 640 is not evenly divisible the
   way the FP8 MoE kernel currently tiles larger TP degrees. Spark supports
   EXL3 and NVFP4; the official FP8 checkpoint is outside the v1 smoke matrix.
@@ -146,6 +150,7 @@ readiness field measures only the coordinator process.
 
 | Version | Date | Change | Basic eval |
 | --- | --- | --- | --- |
+| v2 | 2026-10-09 | Bundled vision auto admission with calibrated image token cap; precreated serving graphs and bounded verify rows; unified SM120/small-card admission; resident local one-RTX reference and explicit no-two-GPU-split column. | Pending rc1 exports |
 | v1 | 2026-10-05 | Automatic resident local EXL3 placement and native MTP3 with a shared FP8 head; generic coordinator device-budget admission; qualified 32 GiB RTX + one Spark EXL3 minimum with coordinator-local MTP experts and resident one-RTX maximum; resident mixed NVFP4/FP8 local experts for NVFP4 MTP3, with explicit paging fallback. | <a href="../../benchmarks/qwen4/2026-10-05-smoke-qwen38-exl3-32gib-1rtx-1spark-mtp3/report.svg"><img src="../../benchmarks/qwen4/2026-10-05-smoke-qwen38-exl3-32gib-1rtx-1spark-mtp3/card.svg" width="360" alt="Qwen3.8-Flash-Next-EXL3-K4.25-PLE-FP8-v1 (exl3-k4+exl3-k5) (min)"></a> <a href="../../benchmarks/qwen4/2026-10-05-smoke-qwen38-exl3-1rtx-local-mtp3/report.svg"><img src="../../benchmarks/qwen4/2026-10-05-smoke-qwen38-exl3-1rtx-local-mtp3/card.svg" width="360" alt="Qwen3.8-Flash-Next-EXL3-K4.25-PLE-FP8-v1 (exl3-k4+exl3-k5) (max)"></a> <a href="../../benchmarks/qwen4/2026-10-05-smoke-qwen3-8-flash-next-nvfp4-1rtx-rc2/report.svg"><img src="../../benchmarks/qwen4/2026-10-05-smoke-qwen3-8-flash-next-nvfp4-1rtx-rc2/card.svg" width="360" alt="Qwen3.8-Flash-Next-NVFP4 (nvfp4-g16) (min)"></a> <a href="../../benchmarks/qwen4/2026-10-04-smoke-qwen3-8-flash-next-nvfp4-1rtx-4spark-qwen38-nvfp4-max/report.svg"><img src="../../benchmarks/qwen4/2026-10-04-smoke-qwen3-8-flash-next-nvfp4-1rtx-4spark-qwen38-nvfp4-max/card.svg" width="360" alt="Qwen3.8-Flash-Next-NVFP4 (nvfp4-g16) (max)"></a> |
 | v0 | 2026-10-02 | First release | <a href="../../benchmarks/qwen4/2026-10-02-smoke-qwen3-8-flash-next-exl3-k4-25-ple-fp8-v1-1rtx/report.svg"><img src="../../benchmarks/qwen4/2026-10-02-smoke-qwen3-8-flash-next-exl3-k4-25-ple-fp8-v1-1rtx/card.svg" width="360" alt="Qwen3.8-Flash-Next-EXL3-K4.25-PLE-FP8-v1 (exl3-k4+exl3-k5) (min)"></a> <a href="../../benchmarks/qwen4/2026-10-02-smoke-qwen3-8-flash-next-exl3-k4-25-ple-fp8-v1-1rtx-4spark/report.svg"><img src="../../benchmarks/qwen4/2026-10-02-smoke-qwen3-8-flash-next-exl3-k4-25-ple-fp8-v1-1rtx-4spark/card.svg" width="360" alt="Qwen3.8-Flash-Next-EXL3-K4.25-PLE-FP8-v1 (exl3-k4+exl3-k5) (max)"></a> <a href="../../benchmarks/qwen4/2026-10-02-smoke-qwen3-8-flash-next-nvfp4-1rtx-4spark/report.svg"><img src="../../benchmarks/qwen4/2026-10-02-smoke-qwen3-8-flash-next-nvfp4-1rtx-4spark/card.svg" width="360" alt="Qwen3.8-Flash-Next-NVFP4 (nvfp4-g16) (min)"></a> |
 

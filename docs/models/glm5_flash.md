@@ -31,6 +31,7 @@ Attention (KDA), a minority run MLA + DSA.
 
   | checkpoint | layout | DFlash2 | dSpark | no drafter |
   | --- | --- | --- | --- | --- |
+| v2 | 2026-10-09 | Bundled vision auto admission; Hugh Madden ports #14-#24 (pooled prefix marks/pinned host tier, graph accounting, shared lane workspaces, compact-index/BF16-state/GB10-schedule opt-ins); unified SM120 and small-card planning. #25 excluded. | Pending rc1 exports |
   | EXL3 K3.25 | 1 RTX + 2 Sparks | 110.8 / 292 / 100.1 | 101.8 / 275 / 76.6 | 60.7 / 192 / 63.4 |
   | EXL3 K3.25 | 2 RTX + 4 Sparks | 167.4 / 322 / 153.7 | 146.8 / 346 / 100.3 | 82.0 / 287 / 85.9 |
   | NVIDIA NVFP4 | 1 RTX + 2 Sparks | 87.3 / 231 / 77.7 | 69.1 / 190 / 57.4 | 52.8 / 200 / 54.4 |
@@ -293,6 +294,13 @@ bar is FP8 minus same-layout BF16 KL at most 0.005 nat and top-1 loss at most
 about 0.5 percentage point; small top-1 deltas need a larger fidelity set.
 
 ## Known limits
+
+<!-- release-v2-limits -->
+- **Memory vs. kernel support:** the measured checkpoints support 1,048,576 context tokens in the planner; this image's compiled index extent is 131,072. Corrected cards request 131,072 explicitly; a memory-fitting layout does not establish 1M kernel support.
+- The tr3 quant's bundled chat template has no image markers or base-model hint, so rc1 `VISION=auto` rejects its launch. Corrected cards use `CHAT_TEMPLATE_FROM=zai-org/GLM-5.3-Flash` explicitly. Auto should disable vision with a clear log line when the template is incompatible, rather than reject an otherwise usable text checkpoint; this is a configuration finding, not proof of a text-quality defect.
+- Greedy speculative output is not launch-deterministic (historical unchanged lazy/lazy runs diverged at token 6); live draft-cost timing is a candidate, not a proven cause.
+- Synchronized ~440 ms Spark response gaps (normally 15-18 ms) were observed once; coordinator/transport cause is unproven.
+- Hugh PR #25 m128 programs are not in this rc1 source; do not infer qualification of those opt-ins.
 
 - NVFP4 defaults to the official FP8 companion for block projections.
   `GLM5_FLASH_FP8_MODEL_ID=off` now also works with the two-GPU split:

@@ -1,7 +1,6 @@
 # DeepSeek V4.1 Flash
 
-The regression anchor for CuteAFD: every phase and every shared-hot-path
-change is checked against its parity numbers before merging.
+A core CuteAFD reference family. Releases are checked against this engine's own cards; correctness and memory safety gate, speed regressions are reported.
 
 ## Supported checkpoints / quants
 
@@ -29,7 +28,8 @@ change is checked against its parity numbers before merging.
 - KV format: compressed MLA latent in FP8 32x32 blocks; a specialized
   exact prefix cache — radix banks keyed by token ids, shared
   FP4 pages, a copied SWA "front", pinned-host tier in `cuteafd-hostcache`.
-- RTX/Spark layouts: natural minimum is 1 RTX + 4 Sparks; maximum is 2 RTX +
+- RTX/Spark layouts: the v2 native MXFP4 minimum is 1 RTX + 3 Sparks;
+  NVFP4 requires 4 Sparks with this launcher's kernel support. Maximum is 2 RTX +
   4 Sparks. V4.1 keeps the coordinator layer-range split by default — the
   measured head-split hop cost on this fabric does not clear the bar its
   attention weights would need to win (see `PLAN.md` Phase 6).
@@ -43,6 +43,12 @@ change is checked against its parity numbers before merging.
   `vision_config`.
 
 ## Known limits
+
+<!-- release-v2-limits -->
+- Cold-prefill non-bit-reproducibility and prefill/decode stalls remain open; prefix snapshot restore exactness does not establish batch-invariant cold prefill.
+- A historical small-card host-heap abort was not reproduced or root-caused. The hunt is closed for v2 unless it recurs; MALLOC_CHECK_=3 serving soaks remain required and no memory-safety qualification is claimed. The fixed graph bank addresses graph residency, not the heap cause.
+- **Memory vs. kernel support:** NVFP4 fits by memory at 1x RTX + 3 Sparks (TP3), including the 31.8 GiB simulation. Kernel/launcher support requires TP4: the TP3 package is native-only and explicit TP3 rejects NVFP4 (`run.sh:263`). The NVFP4 reference cards therefore use four Sparks; the native MXFP4 minimum uses three.
+- `nvidia/DeepSeek-V4.1-Flash-NVFP4` has no verified published fidelity reference config in rc1. Its C1/C8/8K rates and cache checks are measured, but fidelity is unsupported/unqualified; an aggregate quality badge does not establish logit qualification.
 
 - The FP8 vocabulary head regressed short "hello" replies in its earlier
   comparison. The release C1 recheck covers the two-RTX code workload;
@@ -64,6 +70,7 @@ change is checked against its parity numbers before merging.
 
 | Version | Date | Change | Basic eval |
 | --- | --- | --- | --- |
+| v2 | 2026-10-09 | Spark-rank-0 vision with independent image admission; 2M PRO/1M small-card KV defaults; measured startup/graph admission, host embedding and bounded small-card graphs; unified SM120 launch sizing. | Pending rc1 exports |
 | v1 | 2026-10-04 | Coordinator-first loading and smaller one-RTX workspaces; opt-in device exchange and default shared single-copy FP8 head; exact turn-end restore check; matched dual-RTX C1 requalification. | <a href="../../benchmarks/deepseek_v41/2026-10-04-smoke-deepseek-v4-1-flash-1rtx-4spark-v41-flash-min/report.svg"><img src="../../benchmarks/deepseek_v41/2026-10-04-smoke-deepseek-v4-1-flash-1rtx-4spark-v41-flash-min/card.svg" width="360" alt="DeepSeek-V4.1-Flash (mxfp4-g32) (min)"></a> <a href="../../benchmarks/deepseek_v41/2026-10-05-smoke-deepseek-v4-1-flash-2rtx-4spark-rc2/report.svg"><img src="../../benchmarks/deepseek_v41/2026-10-05-smoke-deepseek-v4-1-flash-2rtx-4spark-rc2/card.svg" width="360" alt="DeepSeek-V4.1-Flash (mxfp4-g32) (max)"></a> <a href="../../benchmarks/deepseek_v41/2026-10-04-smoke-deepseek-v4-1-flash-nvfp4-1rtx-4spark-v41-flash-nvfp4-min/report.svg"><img src="../../benchmarks/deepseek_v41/2026-10-04-smoke-deepseek-v4-1-flash-nvfp4-1rtx-4spark-v41-flash-nvfp4-min/card.svg" width="360" alt="DeepSeek-V4.1-Flash-NVFP4 (nvfp4-g16) (min)"></a> <a href="../../benchmarks/deepseek_v41/2026-10-04-smoke-deepseek-v4-1-flash-nvfp4-2rtx-4spark-v41-flash-nvfp4-max/report.svg"><img src="../../benchmarks/deepseek_v41/2026-10-04-smoke-deepseek-v4-1-flash-nvfp4-2rtx-4spark-v41-flash-nvfp4-max/card.svg" width="360" alt="DeepSeek-V4.1-Flash-NVFP4 (nvfp4-g16) (max)"></a> |
 | v0 | 2026-10-02 | First release | <a href="../../benchmarks/deepseek_v41/2026-10-02-smoke-deepseek-v4-1-flash-1rtx-4spark/report.svg"><img src="../../benchmarks/deepseek_v41/2026-10-02-smoke-deepseek-v4-1-flash-1rtx-4spark/card.svg" width="360" alt="DeepSeek-V4.1-Flash (mxfp4-g32) (min)"></a> <a href="../../benchmarks/deepseek_v41/2026-10-02-smoke-deepseek-v4-1-flash-2rtx-4spark/report.svg"><img src="../../benchmarks/deepseek_v41/2026-10-02-smoke-deepseek-v4-1-flash-2rtx-4spark/card.svg" width="360" alt="DeepSeek-V4.1-Flash (mxfp4-g32) (max)"></a> |
 

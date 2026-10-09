@@ -1,0 +1,2014 @@
+{
+  "schema": "cuteafd.bench.report/1",
+  "id": "609d8329aa584c2baf14474d11ac60c2",
+  "created": "2026-10-08T22:41:02Z",
+  "finished": "2026-10-08T22:42:48Z",
+  "status": "done",
+  "profile": "smoke",
+  "plan": [
+    {
+      "id": "hardware",
+      "passes": 1
+    },
+    {
+      "id": "configuration",
+      "passes": 1
+    }
+  ],
+  "server": {
+    "model": "deepseek-ai/DeepSeek-V4.1-Flash",
+    "family": "deepseek_v41",
+    "revision": "3431dde3247c13b5957f682b1e3c6fcae2566079",
+    "build": {
+      "version": "0.1.0",
+      "release": "v2.0.0-rc1",
+      "image": "ghcr.io/tpurtell/cuteafd-coordinator:v2.0.0-rc1",
+      "remote": null,
+      "commit": "29bc9e04d2b764ec5a33ebd5f4700bfa5549b335",
+      "dirty": false
+    },
+    "hardware": {
+      "host": "raptor",
+      "gpus": [
+        {
+          "index": 0,
+          "name": "NVIDIA RTX PRO 6000 Blackwell Workstation Edition",
+          "uuid": "GPU-fe5b6dd0-a77c-c8fb-6360-e1b9d9918ac0",
+          "memory_mib": 97887,
+          "power_limit_w": 325.0,
+          "power_max_w": 600.0,
+          "sm_count": 188,
+          "compute_cap": "12.0",
+          "pcie": "Gen5 x16",
+          "used": true
+        },
+        {
+          "index": 1,
+          "name": "NVIDIA RTX PRO 6000 Blackwell Workstation Edition",
+          "uuid": "GPU-95f8f212-9131-df99-fd53-7535965197d7",
+          "memory_mib": 97887,
+          "power_limit_w": 325.0,
+          "power_max_w": 600.0,
+          "sm_count": 188,
+          "compute_cap": "12.0",
+          "pcie": "Gen5 x16",
+          "used": true
+        }
+      ],
+      "driver": "595.91.07",
+      "cuda": "13.2",
+      "sparks": [
+        {
+          "address": "10.55.0.1",
+          "name": null,
+          "rank": 0
+        },
+        {
+          "address": "10.55.0.2",
+          "name": null,
+          "rank": 1
+        },
+        {
+          "address": "10.55.0.3",
+          "name": null,
+          "rank": 2
+        },
+        {
+          "address": "10.55.0.4",
+          "name": null,
+          "rank": 3
+        }
+      ],
+      "fabric": [
+        {
+          "device": "mlx5_0",
+          "port": 1,
+          "active": true,
+          "link_gbps": 400.0,
+          "pcie": "32 GT/s x16",
+          "netdev": "enp1s0np0",
+          "subnets": [
+            "10.55.0.0/24",
+            "10.55.1.0/24"
+          ]
+        }
+      ],
+      "rails": "fabric: use 2 rail(s) of [mlx5_0@10.55.0.22/24 400G(eff 400G), mlx5_0@10.55.1.22/24 400G(eff 400G)]: 2 subnets share one 400 Gb/s port; each rail is a subnet of the same link"
+    },
+    "configuration": {
+      "snapshot": "/root/.cache/huggingface/hub/models--nvidia--DeepSeek-V4.1-Flash-NVFP4/snapshots/3431dde3247c13b5957f682b1e3c6fcae2566079",
+      "quant": [
+        {
+          "group": "embedding",
+          "formats": [
+            "bf16"
+          ]
+        },
+        {
+          "group": "lm head",
+          "formats": [
+            "bf16"
+          ]
+        },
+        {
+          "group": "norm",
+          "formats": [
+            "bf16"
+          ]
+        },
+        {
+          "group": "attention",
+          "formats": [
+            "bf16",
+            "f32",
+            "fp8-block32x32/ue8m0"
+          ]
+        },
+        {
+          "group": "indexer",
+          "formats": [
+            "bf16",
+            "fp8-block32x32/ue8m0"
+          ]
+        },
+        {
+          "group": "compressor",
+          "formats": [
+            "bf16"
+          ]
+        },
+        {
+          "group": "hyper connection",
+          "formats": [
+            "f32"
+          ]
+        },
+        {
+          "group": "router",
+          "formats": [
+            "bf16",
+            "f32"
+          ]
+        },
+        {
+          "group": "shared expert",
+          "formats": [
+            "fp8-block32x32/ue8m0"
+          ]
+        },
+        {
+          "group": "routed expert",
+          "formats": [
+            "nvfp4-g16"
+          ]
+        },
+        {
+          "group": "mapped table",
+          "formats": [
+            "fp8-block1x32/ue8m0"
+          ]
+        },
+        {
+          "group": "table projection",
+          "formats": [
+            "bf16",
+            "fp8-block32x32/ue8m0"
+          ]
+        },
+        {
+          "group": "speculator",
+          "formats": [
+            "bf16",
+            "f32",
+            "fp8-block32x32/ue8m0"
+          ]
+        },
+        {
+          "group": "speculator expert",
+          "formats": [
+            "mxfp4-g32"
+          ]
+        },
+        {
+          "group": "vision",
+          "formats": [
+            "bf16"
+          ]
+        }
+      ],
+      "speculator": "dSpark (≤5 drafts)",
+      "layout": "2 RTX · experts TP4 over 4 Sparks",
+      "settings": [
+        {
+          "name": "vision-peers",
+          "value": "10.55.0.1:19626",
+          "default": null,
+          "source": "cli"
+        },
+        {
+          "name": "encoder-plan-hash",
+          "value": "aff7596f148baaad6718e00a1f1e26d2645b977adedbf8d458a0eee487a5c9c9",
+          "default": null,
+          "source": "cli"
+        },
+        {
+          "name": "encoder-revision",
+          "value": "3431dde3247c13b5957f682b1e3c6fcae2566079",
+          "default": null,
+          "source": "cli"
+        },
+        {
+          "name": "embedding-placement",
+          "value": "gpu",
+          "default": null,
+          "source": "cli"
+        },
+        {
+          "name": "rtx-gpus",
+          "value": "2",
+          "default": "1",
+          "source": "cli"
+        },
+        {
+          "name": "placement-directory",
+          "value": "/run/cuteafd-placement",
+          "default": null,
+          "source": "cli"
+        },
+        {
+          "name": "tp2-attention",
+          "value": "false",
+          "default": "false",
+          "source": "default"
+        },
+        {
+          "name": "tp2-query-projection",
+          "value": "false",
+          "default": "false",
+          "source": "default"
+        },
+        {
+          "name": "tp2-output-projection",
+          "value": "false",
+          "default": "false",
+          "source": "default"
+        },
+        {
+          "name": "tp2-dspark-experts",
+          "value": "false",
+          "default": "false",
+          "source": "default"
+        },
+        {
+          "name": "prefill-batch-tokens",
+          "value": "2048",
+          "default": "80",
+          "source": "cli"
+        },
+        {
+          "name": "max-context-tokens",
+          "value": "1048576",
+          "default": "1048576",
+          "source": "cli"
+        },
+        {
+          "name": "max-output-tokens",
+          "value": "393216",
+          "default": "393216",
+          "source": "cli"
+        },
+        {
+          "name": "pool-tokens",
+          "value": "0",
+          "default": null,
+          "source": "cli"
+        },
+        {
+          "name": "rtx-expert-layers",
+          "value": "auto",
+          "default": "auto",
+          "source": "default"
+        },
+        {
+          "name": "exl3-paired-tp4",
+          "value": "false",
+          "default": "false",
+          "source": "default"
+        },
+        {
+          "name": "concurrency",
+          "value": "16",
+          "default": "16",
+          "source": "cli"
+        },
+        {
+          "name": "http-queue-depth",
+          "value": "16",
+          "default": null,
+          "source": "cli"
+        },
+        {
+          "name": "http-queue-wait-ms",
+          "value": "25000",
+          "default": "25000",
+          "source": "cli"
+        },
+        {
+          "name": "prefix-cache-entries",
+          "value": "20",
+          "default": "20",
+          "source": "cli"
+        },
+        {
+          "name": "host-cache-bytes",
+          "value": "auto",
+          "default": "0",
+          "source": "cli"
+        },
+        {
+          "name": "host-cache-chunk-bytes",
+          "value": "268435456",
+          "default": "268435456",
+          "source": "default"
+        },
+        {
+          "name": "host-cache-store",
+          "value": "on-retain",
+          "default": "on-retain",
+          "source": "default"
+        },
+        {
+          "name": "host-cache-copy-budget-ms",
+          "value": "1000",
+          "default": "1000",
+          "source": "default"
+        },
+        {
+          "name": "host-cache-restore-budget-ms",
+          "value": "500",
+          "default": "500",
+          "source": "default"
+        },
+        {
+          "name": "host-cache-store-pace-ms",
+          "value": "0",
+          "default": "0",
+          "source": "default"
+        },
+        {
+          "name": "host-cache-min-tokens",
+          "value": "512",
+          "default": "512",
+          "source": "default"
+        },
+        {
+          "name": "host-cache-max-tokens",
+          "value": "1048576",
+          "default": "1048576",
+          "source": "default"
+        },
+        {
+          "name": "host-cache-kinds",
+          "value": "prompt,turn",
+          "default": "prompt,turn",
+          "source": "default"
+        },
+        {
+          "name": "dspark",
+          "value": "true",
+          "default": "false",
+          "source": "cli"
+        },
+        {
+          "name": "dspark-draft-limit",
+          "value": "5",
+          "default": "5",
+          "source": "default"
+        },
+        {
+          "name": "dspark-fixed",
+          "value": "false",
+          "default": "false",
+          "source": "default"
+        },
+        {
+          "name": "independent-decode-lanes",
+          "value": "false",
+          "default": "false",
+          "source": "default"
+        },
+        {
+          "name": "console-text",
+          "value": "false",
+          "default": "false",
+          "source": "default"
+        },
+        {
+          "name": "api-key-file",
+          "value": "/run/cuteafd-api-key",
+          "default": null,
+          "source": "cli"
+        },
+        {
+          "name": "enable-bench",
+          "value": "true",
+          "default": "false",
+          "source": "cli"
+        },
+        {
+          "name": "snapshot",
+          "value": "/root/.cache/huggingface/hub/models--nvidia--DeepSeek-V4.1-Flash-NVFP4/snapshots/3431dde3247c13b5957f682b1e3c6fcae2566079",
+          "default": null,
+          "source": "cli"
+        },
+        {
+          "name": "native-lib",
+          "value": "/opt/cuteafd/lib/libcuteafd_native.so",
+          "default": null,
+          "source": "cli"
+        },
+        {
+          "name": "peers",
+          "value": "10.55.0.1:19526,10.55.0.2:19526,10.55.0.3:19526,10.55.0.4:19526",
+          "default": null,
+          "source": "cli"
+        },
+        {
+          "name": "listen",
+          "value": "0.0.0.0:8426",
+          "default": "127.0.0.1:8000",
+          "source": "cli"
+        },
+        {
+          "name": "CUTEAFD_COPY_DRAFTS",
+          "value": "0",
+          "default": "0",
+          "source": "env"
+        },
+        {
+          "name": "CUTEAFD_V41_IMAGE_ADMISSIONS",
+          "value": "2",
+          "default": null,
+          "source": "env"
+        }
+      ]
+    },
+    "readiness_s": 172.410485167,
+    "started": "2026-10-08T22:38:09Z"
+  },
+  "fingerprint": "9968d04232d2cb2f",
+  "baseline": {
+    "fingerprint": "9968d04232d2cb2f",
+    "run_id": "609d8329aa584c2baf14474d11ac60c2",
+    "created": "2026-10-08T22:41:03Z",
+    "card": {
+      "decode": [
+        {
+          "content": "code",
+          "tok_s": 88.14494401403834,
+          "runs": [
+            {
+              "prompt_tokens": 53,
+              "completion_tokens": 320,
+              "cached_tokens": 0,
+              "reasoning_tokens": 0,
+              "ttft_s": 0.143935544,
+              "total_s": 3.763033816,
+              "decode_s": 3.619039113,
+              "reasoning_end_s": null,
+              "finish_reason": "length"
+            }
+          ],
+          "acceptance": null
+        },
+        {
+          "content": "prose",
+          "tok_s": 53.19500218146617,
+          "runs": [
+            {
+              "prompt_tokens": 48,
+              "completion_tokens": 320,
+              "cached_tokens": 0,
+              "reasoning_tokens": 0,
+              "ttft_s": 0.29233254,
+              "total_s": 6.289185018,
+              "decode_s": 5.996803965,
+              "reasoning_end_s": null,
+              "finish_reason": "length"
+            }
+          ],
+          "acceptance": null
+        },
+        {
+          "content": "json",
+          "tok_s": 103.65874002525292,
+          "runs": [
+            {
+              "prompt_tokens": 79,
+              "completion_tokens": 320,
+              "cached_tokens": 0,
+              "reasoning_tokens": 0,
+              "ttft_s": 0.444247693,
+              "total_s": 3.5216730480000003,
+              "decode_s": 3.077405725,
+              "reasoning_end_s": null,
+              "finish_reason": "length"
+            }
+          ],
+          "acceptance": null
+        }
+      ],
+      "concurrent": {
+        "width": 8,
+        "aggregate_tok_s": 276.489862106248,
+        "per_stream_median_tok_s": 39.31129554970332,
+        "decode_s": 9.229994837999998,
+        "runs": [
+          {
+            "sent_s": 0.000105638,
+            "timing": {
+              "prompt_tokens": 54,
+              "completion_tokens": 320,
+              "cached_tokens": 0,
+              "reasoning_tokens": 0,
+              "ttft_s": 0.304616486,
+              "total_s": 9.202526428,
+              "decode_s": 8.897870092,
+              "reasoning_end_s": null,
+              "finish_reason": "length"
+            }
+          },
+          {
+            "sent_s": 0.000138127,
+            "timing": {
+              "prompt_tokens": 55,
+              "completion_tokens": 320,
+              "cached_tokens": 0,
+              "reasoning_tokens": 0,
+              "ttft_s": 0.896405069,
+              "total_s": 9.156391393,
+              "decode_s": 8.259929549,
+              "reasoning_end_s": null,
+              "finish_reason": "length"
+            }
+          },
+          {
+            "sent_s": 0.000163886,
+            "timing": {
+              "prompt_tokens": 53,
+              "completion_tokens": 320,
+              "cached_tokens": 0,
+              "reasoning_tokens": 0,
+              "ttft_s": 0.73926101,
+              "total_s": 8.648668203,
+              "decode_s": 7.909378911000001,
+              "reasoning_end_s": null,
+              "finish_reason": "length"
+            }
+          },
+          {
+            "sent_s": 0.000184136,
+            "timing": {
+              "prompt_tokens": 55,
+              "completion_tokens": 320,
+              "cached_tokens": 0,
+              "reasoning_tokens": 0,
+              "ttft_s": 1.204066048,
+              "total_s": 8.224166998,
+              "decode_s": 7.020053299000001,
+              "reasoning_end_s": null,
+              "finish_reason": "length"
+            }
+          },
+          {
+            "sent_s": 0.000211357,
+            "timing": {
+              "prompt_tokens": 52,
+              "completion_tokens": 320,
+              "cached_tokens": 0,
+              "reasoning_tokens": 0,
+              "ttft_s": 1.041967967,
+              "total_s": 8.553368752,
+              "decode_s": 7.511364,
+              "reasoning_end_s": null,
+              "finish_reason": "length"
+            }
+          },
+          {
+            "sent_s": 0.000191387,
+            "timing": {
+              "prompt_tokens": 55,
+              "completion_tokens": 320,
+              "cached_tokens": 0,
+              "reasoning_tokens": 0,
+              "ttft_s": 0.154118893,
+              "total_s": 8.648615483,
+              "decode_s": 8.49446339,
+              "reasoning_end_s": null,
+              "finish_reason": "length"
+            }
+          },
+          {
+            "sent_s": 0.00022635,
+            "timing": {
+              "prompt_tokens": 52,
+              "completion_tokens": 320,
+              "cached_tokens": 0,
+              "reasoning_tokens": 0,
+              "ttft_s": 0.597471541,
+              "total_s": 8.712218564,
+              "decode_s": 8.114716026,
+              "reasoning_end_s": null,
+              "finish_reason": "length"
+            }
+          },
+          {
+            "sent_s": 0.000232459,
+            "timing": {
+              "prompt_tokens": 52,
+              "completion_tokens": 320,
+              "cached_tokens": 0,
+              "reasoning_tokens": 0,
+              "ttft_s": 0.449885062,
+              "total_s": 9.38411319,
+              "decode_s": 8.934187597,
+              "reasoning_end_s": null,
+              "finish_reason": "length"
+            }
+          }
+        ],
+        "warmup_s": 9.948645839
+      },
+      "prefill": {
+        "prompt_tokens": 8093,
+        "tok_s": 5726.960591805496,
+        "ttft_s": 1.413140508,
+        "runs": [
+          {
+            "prompt_tokens": 8093,
+            "completion_tokens": 1,
+            "cached_tokens": 0,
+            "reasoning_tokens": 0,
+            "ttft_s": 1.413140508,
+            "total_s": 1.413180669,
+            "decode_s": 0.0,
+            "reasoning_end_s": null,
+            "finish_reason": "length"
+          }
+        ]
+      },
+      "warmup_s": 8.609230111,
+      "capacity": {
+        "kv_tokens": 2125824,
+        "kv_pages": 4152,
+        "kv_format": "FP4 compressed (CSA/HCA) + FP8 window",
+        "max_requests": 16,
+        "max_context": 1048576,
+        "max_output": 393216,
+        "host_cache_bytes": 18522046464
+      }
+    },
+    "quality": {
+      "status": "pass",
+      "checks": [
+        {
+          "id": "fidelity",
+          "title": "Logit fidelity",
+          "status": "unsupported",
+          "summary": "no verified published fidelity config for nvidia/DeepSeek-V4.1-Flash-NVFP4",
+          "metrics": {},
+          "seconds": 0.000014642
+        },
+        {
+          "id": "cache_exact",
+          "title": "Prefix-cache restore",
+          "status": "pass",
+          "summary": "prompt end: 1475 restored, 2 rows byte-identical · turn end: 1231 restored, 2 rows byte-identical · cold recompute identical",
+          "metrics": {
+            "prompt_tokens": 1475,
+            "prompt_restored": 1475,
+            "prompt_rows_compared": 2,
+            "turn_tokens": 1231,
+            "turn_restored": 1231,
+            "turn_rows_compared": 2,
+            "turn_prompt_rows_compared": 24,
+            "cold_rows_identical": 1
+          },
+          "seconds": 7.439939582
+        },
+        {
+          "id": "spec_lossless",
+          "title": "Speculation lossless",
+          "status": "info",
+          "summary": "dSpark (≤5 drafts): greedy output diverges at token 90 of 128 (top-two margin 0.628 nats) (81.9 vs 47.8 tok/s); before it 1 of 90 rows byte-identical, top-token log-prob differs by up to 0.313 nats (median 0.0001), first over 0.01 at token 3; drafts off twice: 128 of 128 tokens identical, 128 of 128 rows byte-identical, up to 0.000 nats · not gated: verify rounding (plain decode repeats exactly, drafted rows already differed before the flip)",
+          "metrics": {
+            "tokens": 128,
+            "identical_prefix": 90,
+            "speculator": "dSpark (≤5 drafts)",
+            "decode_tok_s_on": 81.92423984833009,
+            "decode_tok_s_off": 47.80103648869349,
+            "prefix_rows_compared": 90,
+            "prefix_rows_identical": 1,
+            "prefix_noise_max": 0.31276968121528625,
+            "prefix_noise_median": 0.00011375918984413148,
+            "prefix_noise_first_over_0_01": 3,
+            "repeat_identical_prefix": 128,
+            "repeat_rows_identical": 128,
+            "repeat_noise_max": 0.0,
+            "divergence_margin": 0.62774658203125
+          },
+          "seconds": 7.337346579
+        },
+        {
+          "id": "template",
+          "title": "Template round trip",
+          "status": "info",
+          "summary": "tool call parsed · reasoning kept · re-render differs at token 358 of 413",
+          "metrics": {
+            "reasoning_chars": 104,
+            "rendered_prefix": 358,
+            "turn_tokens": 413,
+            "cached_tokens": 333
+          },
+          "seconds": 2.488845638
+        },
+        {
+          "id": "c1_c4",
+          "title": "C1 vs C4 divergence",
+          "status": "info",
+          "summary": "0 of 4 identical to C1; first divergence at tokens 15; before it 5 of 15 rows byte-identical, top-token log-prob differs by up to 0.302 nats (median 0.0015), first over 0.01 at token 5",
+          "metrics": {
+            "prefix_rows_compared": 15,
+            "prefix_rows_identical": 5,
+            "prefix_noise_max": 0.302356481552124,
+            "prefix_noise_median": 0.001549864187836647,
+            "prefix_noise_first_over_0_01": 5,
+            "identical": 0,
+            "first_divergence": 15
+          },
+          "seconds": 3.939212748
+        }
+      ]
+    },
+    "seconds": 105.212122636
+  },
+  "panels": [
+    {
+      "id": "hardware",
+      "title": "Hardware",
+      "status": "done",
+      "passes": [
+        {
+          "hardware": {
+            "host": "raptor",
+            "gpus": [
+              {
+                "index": 0,
+                "name": "NVIDIA RTX PRO 6000 Blackwell Workstation Edition",
+                "uuid": "GPU-fe5b6dd0-a77c-c8fb-6360-e1b9d9918ac0",
+                "memory_mib": 97887,
+                "power_limit_w": 325.0,
+                "power_max_w": 600.0,
+                "sm_count": 188,
+                "compute_cap": "12.0",
+                "pcie": "Gen5 x16",
+                "used": true
+              },
+              {
+                "index": 1,
+                "name": "NVIDIA RTX PRO 6000 Blackwell Workstation Edition",
+                "uuid": "GPU-95f8f212-9131-df99-fd53-7535965197d7",
+                "memory_mib": 97887,
+                "power_limit_w": 325.0,
+                "power_max_w": 600.0,
+                "sm_count": 188,
+                "compute_cap": "12.0",
+                "pcie": "Gen5 x16",
+                "used": true
+              }
+            ],
+            "driver": "595.91.07",
+            "cuda": "13.2",
+            "sparks": [
+              {
+                "address": "10.55.0.1",
+                "name": null,
+                "rank": 0
+              },
+              {
+                "address": "10.55.0.2",
+                "name": null,
+                "rank": 1
+              },
+              {
+                "address": "10.55.0.3",
+                "name": null,
+                "rank": 2
+              },
+              {
+                "address": "10.55.0.4",
+                "name": null,
+                "rank": 3
+              }
+            ],
+            "fabric": [
+              {
+                "device": "mlx5_0",
+                "port": 1,
+                "active": true,
+                "link_gbps": 400.0,
+                "pcie": "32 GT/s x16",
+                "netdev": "enp1s0np0",
+                "subnets": [
+                  "10.55.0.0/24",
+                  "10.55.1.0/24"
+                ]
+              }
+            ],
+            "rails": "fabric: use 2 rail(s) of [mlx5_0@10.55.0.22/24 400G(eff 400G), mlx5_0@10.55.1.22/24 400G(eff 400G)]: 2 subnets share one 400 Gb/s port; each rail is a subnet of the same link"
+          },
+          "readiness_s": 172.410485167,
+          "mapped_tables": [
+            {
+              "name": "engram.1.weight",
+              "backend": "mmap",
+              "accounting": "fuse: mincore (approx)",
+              "interval": {
+                "gathers": 0,
+                "rows": 0,
+                "bytes": 0,
+                "gather_ns": 0,
+                "stall_ns": 0,
+                "minor_faults": 0,
+                "major_faults": 0,
+                "input_blocks": 0,
+                "prefetch_jobs": 0,
+                "prefetch_pages": 0,
+                "prefetch_dropped": 0,
+                "cache_hits": 0,
+                "cache_misses": 0,
+                "miss_histogram": [
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0
+                ],
+                "unclassified_rows": 0,
+                "unclassified_bytes": 0,
+                "unclassified_batches": 0,
+                "unclassified_batch_ns": 0,
+                "unclassified_batch_histogram": [
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0
+                ],
+                "prefetch_miss_histogram": [
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0
+                ],
+                "prefetch_unclassified_rows": 0,
+                "prefetch_unclassified_bytes": 0,
+                "prefetch_unclassified_batches": 0,
+                "prefetch_unclassified_batch_ns": 0,
+                "prefetch_unclassified_batch_histogram": [
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0
+                ],
+                "page_hits": 0,
+                "page_misses": 0,
+                "page_hit_bytes": 0,
+                "miss_request_bytes": 0,
+                "miss_ns": 0,
+                "nowait_ns": 0,
+                "nowait_batches": 0,
+                "residency_ns": 0,
+                "resident_copy_rows": 0,
+                "late_major_faults": 0,
+                "decode_stall_ns": 0,
+                "decode_steps": 0,
+                "device_bytes_estimate": 0,
+                "prefetch_device_bytes_estimate": 0,
+                "consumer_steps": 0,
+                "prefetch_hits": 0,
+                "prefetch_misses": 0,
+                "prefetch_hit_bytes": 0,
+                "prefetch_miss_request_bytes": 0,
+                "prefetch_miss_ns": 0,
+                "prefetch_nowait_ns": 0,
+                "prefetch_nowait_batches": 0,
+                "prefetch_residency_ns": 0,
+                "prefetch_resident_copy_rows": 0,
+                "prefetch_late_major_faults": 0
+              },
+              "lifetime_maxima": {
+                "unclassified_batch_max_ns": 0,
+                "prefetch_unclassified_batch_max_ns": 0,
+                "miss_max_ns": 0,
+                "nowait_max_ns": 0,
+                "prefetch_miss_max_ns": 0,
+                "prefetch_nowait_max_ns": 0
+              },
+              "host_wide_device_reads": []
+            },
+            {
+              "name": "engram.1.scale",
+              "backend": "mmap",
+              "accounting": "fuse: mincore (approx)",
+              "interval": {
+                "gathers": 0,
+                "rows": 0,
+                "bytes": 0,
+                "gather_ns": 0,
+                "stall_ns": 0,
+                "minor_faults": 0,
+                "major_faults": 0,
+                "input_blocks": 0,
+                "prefetch_jobs": 0,
+                "prefetch_pages": 0,
+                "prefetch_dropped": 0,
+                "cache_hits": 0,
+                "cache_misses": 0,
+                "miss_histogram": [
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0
+                ],
+                "unclassified_rows": 0,
+                "unclassified_bytes": 0,
+                "unclassified_batches": 0,
+                "unclassified_batch_ns": 0,
+                "unclassified_batch_histogram": [
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0
+                ],
+                "prefetch_miss_histogram": [
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0
+                ],
+                "prefetch_unclassified_rows": 0,
+                "prefetch_unclassified_bytes": 0,
+                "prefetch_unclassified_batches": 0,
+                "prefetch_unclassified_batch_ns": 0,
+                "prefetch_unclassified_batch_histogram": [
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0
+                ],
+                "page_hits": 0,
+                "page_misses": 0,
+                "page_hit_bytes": 0,
+                "miss_request_bytes": 0,
+                "miss_ns": 0,
+                "nowait_ns": 0,
+                "nowait_batches": 0,
+                "residency_ns": 0,
+                "resident_copy_rows": 0,
+                "late_major_faults": 0,
+                "decode_stall_ns": 0,
+                "decode_steps": 0,
+                "device_bytes_estimate": 0,
+                "prefetch_device_bytes_estimate": 0,
+                "consumer_steps": 0,
+                "prefetch_hits": 0,
+                "prefetch_misses": 0,
+                "prefetch_hit_bytes": 0,
+                "prefetch_miss_request_bytes": 0,
+                "prefetch_miss_ns": 0,
+                "prefetch_nowait_ns": 0,
+                "prefetch_nowait_batches": 0,
+                "prefetch_residency_ns": 0,
+                "prefetch_resident_copy_rows": 0,
+                "prefetch_late_major_faults": 0
+              },
+              "lifetime_maxima": {
+                "unclassified_batch_max_ns": 0,
+                "prefetch_unclassified_batch_max_ns": 0,
+                "miss_max_ns": 0,
+                "nowait_max_ns": 0,
+                "prefetch_miss_max_ns": 0,
+                "prefetch_nowait_max_ns": 0
+              },
+              "host_wide_device_reads": []
+            },
+            {
+              "name": "engram.14.weight",
+              "backend": "mmap",
+              "accounting": "fuse: mincore (approx)",
+              "interval": {
+                "gathers": 0,
+                "rows": 0,
+                "bytes": 0,
+                "gather_ns": 0,
+                "stall_ns": 0,
+                "minor_faults": 0,
+                "major_faults": 0,
+                "input_blocks": 0,
+                "prefetch_jobs": 0,
+                "prefetch_pages": 0,
+                "prefetch_dropped": 0,
+                "cache_hits": 0,
+                "cache_misses": 0,
+                "miss_histogram": [
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0
+                ],
+                "unclassified_rows": 0,
+                "unclassified_bytes": 0,
+                "unclassified_batches": 0,
+                "unclassified_batch_ns": 0,
+                "unclassified_batch_histogram": [
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0
+                ],
+                "prefetch_miss_histogram": [
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0
+                ],
+                "prefetch_unclassified_rows": 0,
+                "prefetch_unclassified_bytes": 0,
+                "prefetch_unclassified_batches": 0,
+                "prefetch_unclassified_batch_ns": 0,
+                "prefetch_unclassified_batch_histogram": [
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0
+                ],
+                "page_hits": 0,
+                "page_misses": 0,
+                "page_hit_bytes": 0,
+                "miss_request_bytes": 0,
+                "miss_ns": 0,
+                "nowait_ns": 0,
+                "nowait_batches": 0,
+                "residency_ns": 0,
+                "resident_copy_rows": 0,
+                "late_major_faults": 0,
+                "decode_stall_ns": 0,
+                "decode_steps": 0,
+                "device_bytes_estimate": 0,
+                "prefetch_device_bytes_estimate": 0,
+                "consumer_steps": 0,
+                "prefetch_hits": 0,
+                "prefetch_misses": 0,
+                "prefetch_hit_bytes": 0,
+                "prefetch_miss_request_bytes": 0,
+                "prefetch_miss_ns": 0,
+                "prefetch_nowait_ns": 0,
+                "prefetch_nowait_batches": 0,
+                "prefetch_residency_ns": 0,
+                "prefetch_resident_copy_rows": 0,
+                "prefetch_late_major_faults": 0
+              },
+              "lifetime_maxima": {
+                "unclassified_batch_max_ns": 0,
+                "prefetch_unclassified_batch_max_ns": 0,
+                "miss_max_ns": 0,
+                "nowait_max_ns": 0,
+                "prefetch_miss_max_ns": 0,
+                "prefetch_nowait_max_ns": 0
+              },
+              "host_wide_device_reads": []
+            },
+            {
+              "name": "engram.14.scale",
+              "backend": "mmap",
+              "accounting": "fuse: mincore (approx)",
+              "interval": {
+                "gathers": 0,
+                "rows": 0,
+                "bytes": 0,
+                "gather_ns": 0,
+                "stall_ns": 0,
+                "minor_faults": 0,
+                "major_faults": 0,
+                "input_blocks": 0,
+                "prefetch_jobs": 0,
+                "prefetch_pages": 0,
+                "prefetch_dropped": 0,
+                "cache_hits": 0,
+                "cache_misses": 0,
+                "miss_histogram": [
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0
+                ],
+                "unclassified_rows": 0,
+                "unclassified_bytes": 0,
+                "unclassified_batches": 0,
+                "unclassified_batch_ns": 0,
+                "unclassified_batch_histogram": [
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0
+                ],
+                "prefetch_miss_histogram": [
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0
+                ],
+                "prefetch_unclassified_rows": 0,
+                "prefetch_unclassified_bytes": 0,
+                "prefetch_unclassified_batches": 0,
+                "prefetch_unclassified_batch_ns": 0,
+                "prefetch_unclassified_batch_histogram": [
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0
+                ],
+                "page_hits": 0,
+                "page_misses": 0,
+                "page_hit_bytes": 0,
+                "miss_request_bytes": 0,
+                "miss_ns": 0,
+                "nowait_ns": 0,
+                "nowait_batches": 0,
+                "residency_ns": 0,
+                "resident_copy_rows": 0,
+                "late_major_faults": 0,
+                "decode_stall_ns": 0,
+                "decode_steps": 0,
+                "device_bytes_estimate": 0,
+                "prefetch_device_bytes_estimate": 0,
+                "consumer_steps": 0,
+                "prefetch_hits": 0,
+                "prefetch_misses": 0,
+                "prefetch_hit_bytes": 0,
+                "prefetch_miss_request_bytes": 0,
+                "prefetch_miss_ns": 0,
+                "prefetch_nowait_ns": 0,
+                "prefetch_nowait_batches": 0,
+                "prefetch_residency_ns": 0,
+                "prefetch_resident_copy_rows": 0,
+                "prefetch_late_major_faults": 0
+              },
+              "lifetime_maxima": {
+                "unclassified_batch_max_ns": 0,
+                "prefetch_unclassified_batch_max_ns": 0,
+                "miss_max_ns": 0,
+                "nowait_max_ns": 0,
+                "prefetch_miss_max_ns": 0,
+                "prefetch_nowait_max_ns": 0
+              },
+              "host_wide_device_reads": []
+            }
+          ],
+          "mapped_tables_scope": "whole panel pass, including panel-internal priming"
+        }
+      ],
+      "started": "2026-10-08T22:42:48Z",
+      "finished": "2026-10-08T22:42:48Z",
+      "seconds": 0.001436648,
+      "error": null,
+      "history": []
+    },
+    {
+      "id": "configuration",
+      "title": "Configuration",
+      "status": "done",
+      "passes": [
+        {
+          "model": "deepseek-ai/DeepSeek-V4.1-Flash",
+          "family": "deepseek_v41",
+          "revision": "3431dde3247c13b5957f682b1e3c6fcae2566079",
+          "configuration": {
+            "snapshot": "/root/.cache/huggingface/hub/models--nvidia--DeepSeek-V4.1-Flash-NVFP4/snapshots/3431dde3247c13b5957f682b1e3c6fcae2566079",
+            "quant": [
+              {
+                "group": "embedding",
+                "formats": [
+                  "bf16"
+                ]
+              },
+              {
+                "group": "lm head",
+                "formats": [
+                  "bf16"
+                ]
+              },
+              {
+                "group": "norm",
+                "formats": [
+                  "bf16"
+                ]
+              },
+              {
+                "group": "attention",
+                "formats": [
+                  "bf16",
+                  "f32",
+                  "fp8-block32x32/ue8m0"
+                ]
+              },
+              {
+                "group": "indexer",
+                "formats": [
+                  "bf16",
+                  "fp8-block32x32/ue8m0"
+                ]
+              },
+              {
+                "group": "compressor",
+                "formats": [
+                  "bf16"
+                ]
+              },
+              {
+                "group": "hyper connection",
+                "formats": [
+                  "f32"
+                ]
+              },
+              {
+                "group": "router",
+                "formats": [
+                  "bf16",
+                  "f32"
+                ]
+              },
+              {
+                "group": "shared expert",
+                "formats": [
+                  "fp8-block32x32/ue8m0"
+                ]
+              },
+              {
+                "group": "routed expert",
+                "formats": [
+                  "nvfp4-g16"
+                ]
+              },
+              {
+                "group": "mapped table",
+                "formats": [
+                  "fp8-block1x32/ue8m0"
+                ]
+              },
+              {
+                "group": "table projection",
+                "formats": [
+                  "bf16",
+                  "fp8-block32x32/ue8m0"
+                ]
+              },
+              {
+                "group": "speculator",
+                "formats": [
+                  "bf16",
+                  "f32",
+                  "fp8-block32x32/ue8m0"
+                ]
+              },
+              {
+                "group": "speculator expert",
+                "formats": [
+                  "mxfp4-g32"
+                ]
+              },
+              {
+                "group": "vision",
+                "formats": [
+                  "bf16"
+                ]
+              }
+            ],
+            "speculator": "dSpark (≤5 drafts)",
+            "layout": "2 RTX · experts TP4 over 4 Sparks",
+            "settings": [
+              {
+                "name": "vision-peers",
+                "value": "10.55.0.1:19626",
+                "default": null,
+                "source": "cli"
+              },
+              {
+                "name": "encoder-plan-hash",
+                "value": "aff7596f148baaad6718e00a1f1e26d2645b977adedbf8d458a0eee487a5c9c9",
+                "default": null,
+                "source": "cli"
+              },
+              {
+                "name": "encoder-revision",
+                "value": "3431dde3247c13b5957f682b1e3c6fcae2566079",
+                "default": null,
+                "source": "cli"
+              },
+              {
+                "name": "embedding-placement",
+                "value": "gpu",
+                "default": null,
+                "source": "cli"
+              },
+              {
+                "name": "rtx-gpus",
+                "value": "2",
+                "default": "1",
+                "source": "cli"
+              },
+              {
+                "name": "placement-directory",
+                "value": "/run/cuteafd-placement",
+                "default": null,
+                "source": "cli"
+              },
+              {
+                "name": "tp2-attention",
+                "value": "false",
+                "default": "false",
+                "source": "default"
+              },
+              {
+                "name": "tp2-query-projection",
+                "value": "false",
+                "default": "false",
+                "source": "default"
+              },
+              {
+                "name": "tp2-output-projection",
+                "value": "false",
+                "default": "false",
+                "source": "default"
+              },
+              {
+                "name": "tp2-dspark-experts",
+                "value": "false",
+                "default": "false",
+                "source": "default"
+              },
+              {
+                "name": "prefill-batch-tokens",
+                "value": "2048",
+                "default": "80",
+                "source": "cli"
+              },
+              {
+                "name": "max-context-tokens",
+                "value": "1048576",
+                "default": "1048576",
+                "source": "cli"
+              },
+              {
+                "name": "max-output-tokens",
+                "value": "393216",
+                "default": "393216",
+                "source": "cli"
+              },
+              {
+                "name": "pool-tokens",
+                "value": "0",
+                "default": null,
+                "source": "cli"
+              },
+              {
+                "name": "rtx-expert-layers",
+                "value": "auto",
+                "default": "auto",
+                "source": "default"
+              },
+              {
+                "name": "exl3-paired-tp4",
+                "value": "false",
+                "default": "false",
+                "source": "default"
+              },
+              {
+                "name": "concurrency",
+                "value": "16",
+                "default": "16",
+                "source": "cli"
+              },
+              {
+                "name": "http-queue-depth",
+                "value": "16",
+                "default": null,
+                "source": "cli"
+              },
+              {
+                "name": "http-queue-wait-ms",
+                "value": "25000",
+                "default": "25000",
+                "source": "cli"
+              },
+              {
+                "name": "prefix-cache-entries",
+                "value": "20",
+                "default": "20",
+                "source": "cli"
+              },
+              {
+                "name": "host-cache-bytes",
+                "value": "auto",
+                "default": "0",
+                "source": "cli"
+              },
+              {
+                "name": "host-cache-chunk-bytes",
+                "value": "268435456",
+                "default": "268435456",
+                "source": "default"
+              },
+              {
+                "name": "host-cache-store",
+                "value": "on-retain",
+                "default": "on-retain",
+                "source": "default"
+              },
+              {
+                "name": "host-cache-copy-budget-ms",
+                "value": "1000",
+                "default": "1000",
+                "source": "default"
+              },
+              {
+                "name": "host-cache-restore-budget-ms",
+                "value": "500",
+                "default": "500",
+                "source": "default"
+              },
+              {
+                "name": "host-cache-store-pace-ms",
+                "value": "0",
+                "default": "0",
+                "source": "default"
+              },
+              {
+                "name": "host-cache-min-tokens",
+                "value": "512",
+                "default": "512",
+                "source": "default"
+              },
+              {
+                "name": "host-cache-max-tokens",
+                "value": "1048576",
+                "default": "1048576",
+                "source": "default"
+              },
+              {
+                "name": "host-cache-kinds",
+                "value": "prompt,turn",
+                "default": "prompt,turn",
+                "source": "default"
+              },
+              {
+                "name": "dspark",
+                "value": "true",
+                "default": "false",
+                "source": "cli"
+              },
+              {
+                "name": "dspark-draft-limit",
+                "value": "5",
+                "default": "5",
+                "source": "default"
+              },
+              {
+                "name": "dspark-fixed",
+                "value": "false",
+                "default": "false",
+                "source": "default"
+              },
+              {
+                "name": "independent-decode-lanes",
+                "value": "false",
+                "default": "false",
+                "source": "default"
+              },
+              {
+                "name": "console-text",
+                "value": "false",
+                "default": "false",
+                "source": "default"
+              },
+              {
+                "name": "api-key-file",
+                "value": "/run/cuteafd-api-key",
+                "default": null,
+                "source": "cli"
+              },
+              {
+                "name": "enable-bench",
+                "value": "true",
+                "default": "false",
+                "source": "cli"
+              },
+              {
+                "name": "snapshot",
+                "value": "/root/.cache/huggingface/hub/models--nvidia--DeepSeek-V4.1-Flash-NVFP4/snapshots/3431dde3247c13b5957f682b1e3c6fcae2566079",
+                "default": null,
+                "source": "cli"
+              },
+              {
+                "name": "native-lib",
+                "value": "/opt/cuteafd/lib/libcuteafd_native.so",
+                "default": null,
+                "source": "cli"
+              },
+              {
+                "name": "peers",
+                "value": "10.55.0.1:19526,10.55.0.2:19526,10.55.0.3:19526,10.55.0.4:19526",
+                "default": null,
+                "source": "cli"
+              },
+              {
+                "name": "listen",
+                "value": "0.0.0.0:8426",
+                "default": "127.0.0.1:8000",
+                "source": "cli"
+              },
+              {
+                "name": "CUTEAFD_COPY_DRAFTS",
+                "value": "0",
+                "default": "0",
+                "source": "env"
+              },
+              {
+                "name": "CUTEAFD_V41_IMAGE_ADMISSIONS",
+                "value": "2",
+                "default": null,
+                "source": "env"
+              }
+            ]
+          },
+          "build": {
+            "version": "0.1.0",
+            "release": "v2.0.0-rc1",
+            "image": "ghcr.io/tpurtell/cuteafd-coordinator:v2.0.0-rc1",
+            "remote": null,
+            "commit": "29bc9e04d2b764ec5a33ebd5f4700bfa5549b335",
+            "dirty": false
+          },
+          "mapped_tables": [
+            {
+              "name": "engram.1.weight",
+              "backend": "mmap",
+              "accounting": "fuse: mincore (approx)",
+              "interval": {
+                "gathers": 0,
+                "rows": 0,
+                "bytes": 0,
+                "gather_ns": 0,
+                "stall_ns": 0,
+                "minor_faults": 0,
+                "major_faults": 0,
+                "input_blocks": 0,
+                "prefetch_jobs": 0,
+                "prefetch_pages": 0,
+                "prefetch_dropped": 0,
+                "cache_hits": 0,
+                "cache_misses": 0,
+                "miss_histogram": [
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0
+                ],
+                "unclassified_rows": 0,
+                "unclassified_bytes": 0,
+                "unclassified_batches": 0,
+                "unclassified_batch_ns": 0,
+                "unclassified_batch_histogram": [
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0
+                ],
+                "prefetch_miss_histogram": [
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0
+                ],
+                "prefetch_unclassified_rows": 0,
+                "prefetch_unclassified_bytes": 0,
+                "prefetch_unclassified_batches": 0,
+                "prefetch_unclassified_batch_ns": 0,
+                "prefetch_unclassified_batch_histogram": [
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0
+                ],
+                "page_hits": 0,
+                "page_misses": 0,
+                "page_hit_bytes": 0,
+                "miss_request_bytes": 0,
+                "miss_ns": 0,
+                "nowait_ns": 0,
+                "nowait_batches": 0,
+                "residency_ns": 0,
+                "resident_copy_rows": 0,
+                "late_major_faults": 0,
+                "decode_stall_ns": 0,
+                "decode_steps": 0,
+                "device_bytes_estimate": 0,
+                "prefetch_device_bytes_estimate": 0,
+                "consumer_steps": 0,
+                "prefetch_hits": 0,
+                "prefetch_misses": 0,
+                "prefetch_hit_bytes": 0,
+                "prefetch_miss_request_bytes": 0,
+                "prefetch_miss_ns": 0,
+                "prefetch_nowait_ns": 0,
+                "prefetch_nowait_batches": 0,
+                "prefetch_residency_ns": 0,
+                "prefetch_resident_copy_rows": 0,
+                "prefetch_late_major_faults": 0
+              },
+              "lifetime_maxima": {
+                "unclassified_batch_max_ns": 0,
+                "prefetch_unclassified_batch_max_ns": 0,
+                "miss_max_ns": 0,
+                "nowait_max_ns": 0,
+                "prefetch_miss_max_ns": 0,
+                "prefetch_nowait_max_ns": 0
+              },
+              "host_wide_device_reads": []
+            },
+            {
+              "name": "engram.1.scale",
+              "backend": "mmap",
+              "accounting": "fuse: mincore (approx)",
+              "interval": {
+                "gathers": 0,
+                "rows": 0,
+                "bytes": 0,
+                "gather_ns": 0,
+                "stall_ns": 0,
+                "minor_faults": 0,
+                "major_faults": 0,
+                "input_blocks": 0,
+                "prefetch_jobs": 0,
+                "prefetch_pages": 0,
+                "prefetch_dropped": 0,
+                "cache_hits": 0,
+                "cache_misses": 0,
+                "miss_histogram": [
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0
+                ],
+                "unclassified_rows": 0,
+                "unclassified_bytes": 0,
+                "unclassified_batches": 0,
+                "unclassified_batch_ns": 0,
+                "unclassified_batch_histogram": [
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0
+                ],
+                "prefetch_miss_histogram": [
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0
+                ],
+                "prefetch_unclassified_rows": 0,
+                "prefetch_unclassified_bytes": 0,
+                "prefetch_unclassified_batches": 0,
+                "prefetch_unclassified_batch_ns": 0,
+                "prefetch_unclassified_batch_histogram": [
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0
+                ],
+                "page_hits": 0,
+                "page_misses": 0,
+                "page_hit_bytes": 0,
+                "miss_request_bytes": 0,
+                "miss_ns": 0,
+                "nowait_ns": 0,
+                "nowait_batches": 0,
+                "residency_ns": 0,
+                "resident_copy_rows": 0,
+                "late_major_faults": 0,
+                "decode_stall_ns": 0,
+                "decode_steps": 0,
+                "device_bytes_estimate": 0,
+                "prefetch_device_bytes_estimate": 0,
+                "consumer_steps": 0,
+                "prefetch_hits": 0,
+                "prefetch_misses": 0,
+                "prefetch_hit_bytes": 0,
+                "prefetch_miss_request_bytes": 0,
+                "prefetch_miss_ns": 0,
+                "prefetch_nowait_ns": 0,
+                "prefetch_nowait_batches": 0,
+                "prefetch_residency_ns": 0,
+                "prefetch_resident_copy_rows": 0,
+                "prefetch_late_major_faults": 0
+              },
+              "lifetime_maxima": {
+                "unclassified_batch_max_ns": 0,
+                "prefetch_unclassified_batch_max_ns": 0,
+                "miss_max_ns": 0,
+                "nowait_max_ns": 0,
+                "prefetch_miss_max_ns": 0,
+                "prefetch_nowait_max_ns": 0
+              },
+              "host_wide_device_reads": []
+            },
+            {
+              "name": "engram.14.weight",
+              "backend": "mmap",
+              "accounting": "fuse: mincore (approx)",
+              "interval": {
+                "gathers": 0,
+                "rows": 0,
+                "bytes": 0,
+                "gather_ns": 0,
+                "stall_ns": 0,
+                "minor_faults": 0,
+                "major_faults": 0,
+                "input_blocks": 0,
+                "prefetch_jobs": 0,
+                "prefetch_pages": 0,
+                "prefetch_dropped": 0,
+                "cache_hits": 0,
+                "cache_misses": 0,
+                "miss_histogram": [
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0
+                ],
+                "unclassified_rows": 0,
+                "unclassified_bytes": 0,
+                "unclassified_batches": 0,
+                "unclassified_batch_ns": 0,
+                "unclassified_batch_histogram": [
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0
+                ],
+                "prefetch_miss_histogram": [
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0
+                ],
+                "prefetch_unclassified_rows": 0,
+                "prefetch_unclassified_bytes": 0,
+                "prefetch_unclassified_batches": 0,
+                "prefetch_unclassified_batch_ns": 0,
+                "prefetch_unclassified_batch_histogram": [
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0
+                ],
+                "page_hits": 0,
+                "page_misses": 0,
+                "page_hit_bytes": 0,
+                "miss_request_bytes": 0,
+                "miss_ns": 0,
+                "nowait_ns": 0,
+                "nowait_batches": 0,
+                "residency_ns": 0,
+                "resident_copy_rows": 0,
+                "late_major_faults": 0,
+                "decode_stall_ns": 0,
+                "decode_steps": 0,
+                "device_bytes_estimate": 0,
+                "prefetch_device_bytes_estimate": 0,
+                "consumer_steps": 0,
+                "prefetch_hits": 0,
+                "prefetch_misses": 0,
+                "prefetch_hit_bytes": 0,
+                "prefetch_miss_request_bytes": 0,
+                "prefetch_miss_ns": 0,
+                "prefetch_nowait_ns": 0,
+                "prefetch_nowait_batches": 0,
+                "prefetch_residency_ns": 0,
+                "prefetch_resident_copy_rows": 0,
+                "prefetch_late_major_faults": 0
+              },
+              "lifetime_maxima": {
+                "unclassified_batch_max_ns": 0,
+                "prefetch_unclassified_batch_max_ns": 0,
+                "miss_max_ns": 0,
+                "nowait_max_ns": 0,
+                "prefetch_miss_max_ns": 0,
+                "prefetch_nowait_max_ns": 0
+              },
+              "host_wide_device_reads": []
+            },
+            {
+              "name": "engram.14.scale",
+              "backend": "mmap",
+              "accounting": "fuse: mincore (approx)",
+              "interval": {
+                "gathers": 0,
+                "rows": 0,
+                "bytes": 0,
+                "gather_ns": 0,
+                "stall_ns": 0,
+                "minor_faults": 0,
+                "major_faults": 0,
+                "input_blocks": 0,
+                "prefetch_jobs": 0,
+                "prefetch_pages": 0,
+                "prefetch_dropped": 0,
+                "cache_hits": 0,
+                "cache_misses": 0,
+                "miss_histogram": [
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0
+                ],
+                "unclassified_rows": 0,
+                "unclassified_bytes": 0,
+                "unclassified_batches": 0,
+                "unclassified_batch_ns": 0,
+                "unclassified_batch_histogram": [
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0
+                ],
+                "prefetch_miss_histogram": [
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0
+                ],
+                "prefetch_unclassified_rows": 0,
+                "prefetch_unclassified_bytes": 0,
+                "prefetch_unclassified_batches": 0,
+                "prefetch_unclassified_batch_ns": 0,
+                "prefetch_unclassified_batch_histogram": [
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0
+                ],
+                "page_hits": 0,
+                "page_misses": 0,
+                "page_hit_bytes": 0,
+                "miss_request_bytes": 0,
+                "miss_ns": 0,
+                "nowait_ns": 0,
+                "nowait_batches": 0,
+                "residency_ns": 0,
+                "resident_copy_rows": 0,
+                "late_major_faults": 0,
+                "decode_stall_ns": 0,
+                "decode_steps": 0,
+                "device_bytes_estimate": 0,
+                "prefetch_device_bytes_estimate": 0,
+                "consumer_steps": 0,
+                "prefetch_hits": 0,
+                "prefetch_misses": 0,
+                "prefetch_hit_bytes": 0,
+                "prefetch_miss_request_bytes": 0,
+                "prefetch_miss_ns": 0,
+                "prefetch_nowait_ns": 0,
+                "prefetch_nowait_batches": 0,
+                "prefetch_residency_ns": 0,
+                "prefetch_resident_copy_rows": 0,
+                "prefetch_late_major_faults": 0
+              },
+              "lifetime_maxima": {
+                "unclassified_batch_max_ns": 0,
+                "prefetch_unclassified_batch_max_ns": 0,
+                "miss_max_ns": 0,
+                "nowait_max_ns": 0,
+                "prefetch_miss_max_ns": 0,
+                "prefetch_nowait_max_ns": 0
+              },
+              "host_wide_device_reads": []
+            }
+          ],
+          "mapped_tables_scope": "whole panel pass, including panel-internal priming"
+        }
+      ],
+      "started": "2026-10-08T22:42:48Z",
+      "finished": "2026-10-08T22:42:48Z",
+      "seconds": 0.001641016,
+      "error": null,
+      "history": []
+    }
+  ],
+  "error": null
+}

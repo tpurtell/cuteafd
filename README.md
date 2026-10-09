@@ -25,6 +25,49 @@ format.
 - Own your intelligence: your weights, your hardware, your rate limits (none),
   agentic coding at full speed on a machine you control, not a shared tenant.
 
+## v2.0.0 changes since v1.0.0
+
+- Bundled image input across shipped vision-capable families, V4.1 vision on Spark rank 0, and qualified MiMo audio enabled by default with its tower included in release images.
+- One SM120 image for RTX PRO 6000 and RTX 5090; runtime SM/grid sizing, GPU/RDMA probing and 32 GB memory admission. The automatic KV target is 2M tokens on PRO cards and 1M on small cards, subject to family admission.
+- Hugh Madden's GLM Flash ports #14-#24: pooled prefix marks and pinned host tier, lane/workspace and graph accounting, plus scoped compact-index, BF16-state and GB10 EXL3 schedule opt-ins. PR #25 is excluded.
+- MiMo V2.6 Flash MOPD, bounded serving graphs, fidelity tiers (quick/standard/full) and published family goldens.
+- Release-smoke cards add C8 aggregate code throughput alongside C1 and cold ~8K prefill. The grid is 5090 | 1x RTX | 2x RTX; Qwen's unsupported two-GPU split is n/a.
+- Concurrent coordinator/Spark release builds, a published pinned toolchain-only dev image, and persistent architecture-specific Cargo/JIT/compiler caches.
+
+The 5090 column is memory-only simulation unless explicitly marked real:
+**simulated 5090: RTX PRO 6000 (188 SMs) capped at 31.8 GiB**.
+SM count (170 vs 188), L2, clocks and power are not emulated; speed is indicative
+and likely optimistic. Real 5090 cards replace current cells; simulations remain
+in history. Planner-only no-fit cells link the reason and contain no performance.
+Release smoke is not a full multimodal or full-context qualification. Family
+Known limits retain unresolved numerical, stall and historical heap caveats.
+Memory fit and executable kernel support are separate: V4.1 NVFP4 fits TP3 by
+memory but requires the launcher's TP4 path (TP3 packages are native-only);
+GLM/GLM Flash checkpoints support 1,048,576 context tokens and Qwen supports
+262,144, while this image's compiled index extent for those families is 131,072.
+Each family's Known limits and affected current-cell captions label the distinction.
+
+These rc1 images and cards measure frozen source `29bc9e04`. Landing in the
+next candidate: Hugh's #25 opt-in 128-row decode/verify, #26 GLM Flash Spark
+transport warm-up and #27 prefix-mark count edge fix; they merged later and
+are not included in rc1. rc1 remains a candidate for Hugh's real 5090 column,
+not the final v2.0.0 target: the agentic context floor is 256K, above this image's
+131,072-token index extent. rc2 with a 1M compiled extent is the v2.0.0 target.
+V4's requested 1M context is retained as launch provenance; its effective runtime
+context is 131,072, and the corrected cards label that manifest-enforced limit.
+
+### Blockers Before v2.0.0
+
+- Generic-family launches default to only 8,192 tokens (`scripts/launch/run-family.sh:279`), despite the planner's checkpoint-full context. Corrected rc1 cards explicitly set checkpoint context where supported; GLM/GLM Flash/Qwen are capped at the image's compiled 131,072-token extent. The later work/p0 fix `437d0a76` clamps the default to the compiled cap and logs it (131K, not 8K); it is not in rc1. rc2 targets a 1M compiled extent to meet the 256K agentic floor; scratch and image-size effects still need measurement. These cards do not qualify rc1's broken user default.
+- MiMo Pro's one-RTX minimum fails automatic-pool admission by 65,484,228 B: the automatic pool fills the 97% ceiling before the 64 MiB Spark intake probe is charged (`rust/crates/cuteafd-daemon/src/families/mimo_v2/admission.rs:460`). The configured minimum uses a 1,048,576-token pool and preserves full context. Fix automatic sizing after reserving max(intake probe, small-card floor) as a startup peak.
+
+The GLM Flash tr3 template needs an explicit vendor-template override for vision;
+V4.1 NVFP4 fidelity is unqualified because its published reference config is
+missing. V4 Pro EXL3 K2 straddles the 0.06 KL gate: minimum 0.0605 fails,
+maximum 0.0596 passes. The minimum card stays FAIL and the threshold is unchanged;
+this is not an established regression. These findings are recorded in family
+Known limits, separately from measured performance and the final-release blockers.
+
 ## v1.0.0 changes since v0.1.0
 
 - MiMo Pro uses the MOPD checkpoint. Single-copy FP8 defaults cover the V4.1
@@ -44,15 +87,19 @@ Basic benchmark profile per family on its natural-minimum (1× RTX + fewest
 Sparks) and maximum (2× RTX + 4 or 6 Sparks) hardware. Other reports:
 [`benchmarks/`](benchmarks/README.md).
 
-All 28 required release-prep smoke cards pass, including Qwen NVFP4 with
-resident local MTP3 on one RTX. The grid contains four refreshed RC2 cards
-and 24 retained RC1 cards. See [qualification and known limits](PLAN.md#v1-regression-follow-up-rc2-2026-10-05)
-and the [release scope](PLAN.md#release-v1-scope-decided-2026-10-04).
+The v2.0.0-rc1 natural-minimum/maximum matrix contains 26 Release-smoke cards:
+23 pass independently checked quick fidelity and exact-cache gates; two V4.1
+NVFP4 cards have unsupported/unqualified fidelity; V4 Pro EXL3 K2 minimum
+fails KL (0.0605 against 0.06). All three required publication spots pass.
+These are C1, warmed C8 aggregate and cold ~8K measurements, not C16,
+full-context or multimodal qualification. Configured context/template/pool
+corrections do not qualify the broken defaults described above. The simulated
+5090 matrix is pending; four planner-only no-fit reports contain no performance.
 
-MiMo V2.6 Flash MOPD replaces the legacy Flash current rows after text-only
-qualification on a task overlay, not a new release cut. Its cards cover 16K
-context / 32K pool; [conditions and limits](docs/models/mimo_v2.md#flash-mopd-qualification-2026-10-05)
-include the separate three-run C1/C4 comparison and reasoning-on completion gate.
+MiMo V2.6 Flash MOPD replaces the legacy Flash current rows. Its historical
+[text-only bring-up qualification](docs/models/mimo_v2.md#flash-mopd-qualification-2026-10-05)
+is separate from these rc1 measurements and retains its original conditions.
+See the [v2 release scope](PLAN.md#release-v2-scope-decided-2026-10-05) and family Known limits.
 
 <!-- results:begin -->
 <table>
