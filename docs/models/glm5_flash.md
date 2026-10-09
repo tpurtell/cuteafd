@@ -50,9 +50,10 @@ Attention (KDA), a minority run MLA + DSA.
   (`--kda-state bf16`, opt-in; BF16 KDA projections on one GPU) stores the
   recurrent state in BF16, rounded after every decode, verify and commit row
   and at each chunked-prefill window end: half the state and prefix-mark bytes.
-- KDA replay records: `GLM5_FLASH_REPLAY_RECORDS=shared` (`--replay-records
-  shared`, opt-in; one GPU whose pool is sized from measured memory) keeps the
-  speculative replay records (321,421,312 B) in the prefill lanes' scratch,
+- KDA replay records: `GLM5_FLASH_REPLAY_RECORDS=auto` selects `shared`
+  (`--replay-records shared`) on one GPU with Spark experts and a pool sized
+  from measured memory; other layouts keep `own`. Shared keeps the speculative
+  replay records (321,421,312 B at 64 rows) in the prefill lanes' scratch,
   which no decode step reads, instead of an allocation of their own. A record
   lives from a speculative verify to its commit, and a commit after a prefill
   fails instead of reading records the prefill overwrote.
@@ -79,9 +80,10 @@ Attention (KDA), a minority run MLA + DSA.
   same bits, with the weight words staged L2 evict-first (the b12x `gb10`
   decode schedule) and, at m80, 64x128 tiles at two CTAs per SM. On a GB10,
   an expert call at 1-80 rows took 1.4-11.2% less time than the default's.
-- 128-row decode and verify steps: `GLM5_FLASH_DECODE_ROWS=128`
-  (`--decode-rows 128`, opt-in, one GPU; a build with the default
-  `CUTEAFD_GLMF_WIDE_DECODE_ROWS=128`) runs steps of 65-128 rows on the
+- 128-row decode and verify steps: `GLM5_FLASH_DECODE_ROWS=auto` selects
+  `128` (`--decode-rows 128`) on one GPU when the selected image has every
+  required m128 program; other layouts keep `64`. Builds with
+  `CUTEAFD_GLMF_WIDE_DECODE_ROWS=128` run steps of 65-128 rows on the
   `*_m128` programs and records 128-row replay records for their commits;
   steps of up to 64 rows keep the `_m64` programs, their bits and speed. A
   verify step schedules up to the GPU's whole sparse MLA waves (127 rows on an
