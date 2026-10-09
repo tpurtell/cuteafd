@@ -46,7 +46,7 @@ pub fn deepseek_v4_peer_exchange_bytes(hidden: u64, prefill_rows: u64, decode_ro
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct V4WorkspaceScratch {
-    /// Largest non-index-topk scratch across the entire loaded manifest.
+    /// Largest non-index-topk scratch of the serving and head-split families.
     pub shared_bytes: u64,
     /// Largest selected family's decode/prefill index-topk scratch.
     pub index_topk_bytes: u64,
@@ -93,12 +93,12 @@ impl V4WorkspaceRank {
     }
 }
 
-/// Uses the exact same scratch selection as the engine. An image that also
-/// carries other families can require a larger shared arena than a V4-only
-/// image; inspecting just the selected family's programs would undercount it.
+/// Uses the runtime's namespace selector. Keep the unsplit family even under
+/// a head split: dSpark target launches still use its full-head programs.
 pub fn deepseek_v4_workspace_scratch(
     manifest: &Value,
     family: &str,
+    split: bool,
     prefill_rows: u64,
     decode_rows: u64,
 ) -> Result<V4WorkspaceScratch, CacheGeometryError> {
@@ -107,18 +107,22 @@ pub fn deepseek_v4_workspace_scratch(
         what: "program manifest lacks concrete V4 scratch geometry",
     };
     let programs = manifest["programs"].as_array().ok_or_else(unsupported)?;
-    let mut shared_bytes = 0;
+    let split_family = format!("{family}2");
+    let selected = cuteafd_core::coordinator_programs::CoordinatorPrograms {
+        family, split_family: split.then_some(split_family.as_str()),
+    };
+    let mut sizes = Vec::new();
     for program in programs {
         let name = program["name"].as_str().ok_or_else(unsupported)?;
-        if name.contains("index_topk") {
-            continue;
-        }
-        if let Some(values) = program["scratch_bytes_at_capacity"].as_object() {
-            for value in values.values() {
-                shared_bytes = shared_bytes.max(value.as_u64().ok_or_else(unsupported)?);
+        if selected.contains(name) {
+            if let Some(values) = program["scratch_bytes_at_capacity"].as_object() {
+                for value in values.values() {
+                    sizes.push((name, value.as_u64().ok_or_else(unsupported)?));
+                }
             }
         }
     }
+    let shared_bytes = selected.shared_scratch(sizes);
     let mut index_topk_bytes = 0;
     for name in [
         format!("{family}_index_topk_prefill_m{prefill_rows}"),
@@ -355,7 +359,31 @@ mod tests {
     }
 
     #[test]
-    fn scratch_matches_global_arena_and_selected_family_topk() {
+    fn runtime_and_planner_scratch_agree_for_every_namespace_and_split() {
+        use cuteafd_core::coordinator_programs::CoordinatorPrograms;
+        for family in ["dsv4f", "dsv4p", "glm", "glmf", "mimo", "mimof", "mimop", "qwen4"] {
+            let split_family = format!("{family}2");
+            let sizes = [(format!("{family}_producer_m4096"), 100),
+                (format!("{split_family}_producer_m4096"), 200),
+                (format!("{family}_index_topk_prefill_m4096"), 300),
+                (format!("{family}_index_topk_decode_m64"), 40),
+                ("unrelated_huge_m4096".to_string(), 99999)];
+            let manifest = serde_json::json!({"programs": sizes.iter().map(|(name, bytes)|
+                serde_json::json!({"name": name, "scratch_bytes_at_capacity": {"scratch": bytes}}))
+                .collect::<Vec<_>>()});
+            for split in [false, true] {
+                let runtime = CoordinatorPrograms { family, split_family: split.then_some(split_family.as_str()) }
+                    .shared_scratch(sizes.iter().map(|(name, bytes)| (name.as_str(), *bytes)));
+                let planned = deepseek_v4_workspace_scratch(&manifest, family, split, 4096, 64).unwrap();
+                assert_eq!(planned.shared_bytes, runtime);
+                assert_eq!(runtime, if split { 200 } else { 100 });
+                assert_eq!(planned.index_topk_bytes, 300);
+            }
+        }
+    }
+
+    #[test]
+    fn scratch_matches_runtime_selector_and_selected_family_topk() {
         let manifest = serde_json::json!({"programs": [
             {"name": "dsv4f_wo", "scratch_bytes_at_capacity": {"scratch": 100}},
             {"name": "glm_wo", "scratch_bytes_at_capacity": {"scratch": 400}},
@@ -364,12 +392,12 @@ mod tests {
             {"name": "dsv4f_index_topk_decode_m64", "scratch_bytes_at_capacity": {"scratch": 50}}
         ]});
         assert_eq!(
-            deepseek_v4_workspace_scratch(&manifest, "dsv4f", 4096, 64).unwrap(),
+            deepseek_v4_workspace_scratch(&manifest, "dsv4f", false, 4096, 64).unwrap(),
             V4WorkspaceScratch {
-                shared_bytes: 400,
+                shared_bytes: 100,
                 index_topk_bytes: 200
             }
         );
-        assert!(deepseek_v4_workspace_scratch(&manifest, "dsv4p", 4096, 64).is_err());
+        assert!(deepseek_v4_workspace_scratch(&manifest, "dsv4p", false, 4096, 64).is_err());
     }
 }
