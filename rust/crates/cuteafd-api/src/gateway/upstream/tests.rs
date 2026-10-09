@@ -311,3 +311,30 @@ async fn nested_model_metadata_resolves_served_model_capabilities() {
     assert!(upstream.map_request(&turn).is_ok());
     task.abort();
 }
+
+#[test]
+fn thinking_tool_loops_echo_reasoning_even_when_empty() {
+    // Live Claude Code run (2026-10-09): the second tool round had no
+    // reasoning, and the thinking-mode upstream rejected the follow-up.
+    let mut turn = turn();
+    turn.items.extend([
+        Item::Reasoning { text: "look first".into(), signature: None },
+        Item::ToolCall { id: "a".into(), name: "Read".into(), arguments: "{}".into() },
+        Item::ToolResult { call_id: "a".into(), content: vec![Part::text("x")], is_error: false },
+        Item::Message { role: Role::Assistant, content: vec![Part::text("editing")] },
+        Item::ToolCall { id: "b".into(), name: "Edit".into(), arguments: "{}".into() },
+        Item::ToolResult { call_id: "b".into(), content: vec![Part::text("ok")], is_error: false },
+    ]);
+    let mut config = UpstreamConfig::new("http://localhost/v1", Flavor::OpenaiChat, "test-model");
+    config.thinking_toggle = true;
+    let upstream = Upstream::new(config).unwrap();
+    let request = upstream.map_request(&turn).unwrap();
+    let assistants: Vec<&serde_json::Value> = request["messages"].as_array().unwrap().iter().filter(|m| m["role"] == "assistant").collect();
+    assert_eq!(assistants[0]["reasoning_content"], "look first");
+    assert_eq!(assistants[1]["reasoning_content"], "");
+    turn.reasoning.enabled = Some(false);
+    let request = upstream.map_request(&turn).unwrap();
+    assert!(request["messages"].as_array().unwrap().iter().all(|m| m.get("reasoning_content").is_none() || m["reasoning_content"] != ""));
+    let plain = backend(Flavor::OpenaiChat).map_request(&turn).unwrap();
+    assert!(plain["messages"].as_array().unwrap().iter().all(|m| m["reasoning_content"] != ""), "off without the switch");
+}

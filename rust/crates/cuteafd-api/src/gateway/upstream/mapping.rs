@@ -80,6 +80,17 @@ fn chat(turn: &TurnRequest, config: &UpstreamConfig) -> Result<Value, GatewayErr
             Item::ServerToolResult { call_id, output, .. } => messages.push(json!({"role":"tool","tool_call_id":call_id,"content":output.to_string()})),
         }
     }
+    let thinking_on = config.thinking_toggle && turn.reasoning.enabled.unwrap_or(true);
+    if thinking_on {
+        // Thinking-mode upstreams reject a tool-call loop whose assistant
+        // messages lack `reasoning_content`, even when the model produced no
+        // reasoning for that step (an empty string is accepted).
+        for message in &mut messages {
+            if message["role"] == "assistant" && message["tool_calls"].is_array() && message.get("reasoning_content").is_none() {
+                message["reasoning_content"] = json!("");
+            }
+        }
+    }
     let mut request = json!({"model":turn.model,"messages":messages,"stream":true,"stream_options":{"include_usage":true}});
     if !turn.tools.is_empty() {
         request["tools"] = json!(turn.tools.iter().map(|tool| {
