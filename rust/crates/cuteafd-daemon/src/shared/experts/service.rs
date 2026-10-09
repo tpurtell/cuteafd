@@ -7,7 +7,7 @@ use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::NativeLibrary;
 use cuteafd_loader::OfficialV41Catalog;
 use cuteafd_transport::expert::{BackboneRequest, SparkTopology};
-use std::{path::PathBuf, sync::mpsc, thread};
+use std::{path::PathBuf, sync::{mpsc, Arc}, thread};
 
 pub(crate) async fn run(args: crate::cli::NativeExpertDaemonArgs) -> Result<()> {
     match cuteafd_transport::fabric::discover() {
@@ -66,6 +66,7 @@ pub(crate) async fn run(args: crate::cli::NativeExpertDaemonArgs) -> Result<()> 
         max_frame_bytes: args.max_frame_bytes,
         topology,
         native_spark_tp2: false,
+        bf16_ingress: false,
         encoder,
         audio_encoder,
     };
@@ -99,6 +100,7 @@ pub(crate) struct NativeExpertServiceConfig {
     /// Native Flash's TP2 kernel uses the Spark shard role with legacy wire
     /// requests. Set only after catalog validation, never from a CLI override.
     native_spark_tp2: bool,
+    bf16_ingress: bool,
 }
 
 fn mem_available(text: &str) -> Result<usize> {
@@ -275,6 +277,7 @@ fn env_usize(name: &str, default: usize) -> Result<usize> {
     }
 }
 
+#[cfg(test)]
 fn align_up(value: usize, alignment: usize) -> Result<usize> {
     ensure!(alignment > 0, "ring alignment must be non-zero");
     value
@@ -292,6 +295,7 @@ fn align_up(value: usize, alignment: usize) -> Result<usize> {
 ///
 /// A request whose wire size exceeds the frame budget would be rejected by the
 /// transport at connect time, so it fails admission here instead.
+#[cfg(test)]
 fn spark_ring_bytes(
     capacity: u32,
     max_frame_bytes: usize,
@@ -300,54 +304,24 @@ fn spark_ring_bytes(
     alignment: usize,
     endpoints: usize,
 ) -> Result<usize> {
-    use cuteafd_transport::protocol_v2::{
-        EXPERT_PROTOCOL_V2_REQUEST_HEADER_LEN, EXPERT_PROTOCOL_V2_RESPONSE_HEADER_LEN,
-        EXPERT_PROTOCOL_V2_ROUTE_ENTRY_LEN, EXPERT_PROTOCOL_V2_ROW_DESCRIPTOR_LEN,
-    };
-    ensure!(
-        (1..=8).contains(&depth),
-        "verbs-host ring depth must be in 1..=8"
-    );
+    spark_ring_bytes_for_ingress(capacity, max_frame_bytes, depth, slot_bytes, alignment, endpoints, false)
+}
+
+fn spark_ring_bytes_for_ingress(capacity: u32, max_frame_bytes: usize, depth: usize,
+    slot_bytes: usize, alignment: usize, endpoints: usize, bf16: bool) -> Result<usize> {
+    ensure!((1..=8).contains(&depth), "verbs-host ring depth must be in 1..=8");
     ensure!(endpoints > 0, "at least one RDMA endpoint is required");
     ensure!(slot_bytes > 0, "RDMA ring slot bytes must be non-zero");
     ensure!(max_frame_bytes > 0, "native frame budget must be non-zero");
-    let rows = capacity as usize;
-    let geometry = cuteafd_core::expert_geometry();
-    let hidden = geometry.hidden as usize;
-    let request_per_row = EXPERT_PROTOCOL_V2_ROW_DESCRIPTOR_LEN
-        .checked_add(geometry.topk as usize * EXPERT_PROTOCOL_V2_ROUTE_ENTRY_LEN)
-        .and_then(|per_row| per_row.checked_add(hidden + hidden / 32))
-        .context("native request row wire size overflow")?;
-    let request_wire = EXPERT_PROTOCOL_V2_REQUEST_HEADER_LEN
-        .checked_add(
-            rows.checked_mul(request_per_row)
-                .context("native request wire size overflow")?,
-        )
-        .context("native request wire size overflow")?;
-    // Ingress FP8 K32 rows carry hidden + hidden/32 bytes; the compact-BF16
-    // rank partial is hidden * 2 bytes and dominates the negotiated response row.
-    let response_wire = EXPERT_PROTOCOL_V2_RESPONSE_HEADER_LEN
-        .checked_add(
-            rows.checked_mul(4 + hidden * 2)
-                .context("native response wire size overflow")?,
-        )
-        .context("native response wire size overflow")?;
+    let (request_wire, response_wire) = cuteafd_transport::protocol_v2::compact_expert_wire_bytes(
+        cuteafd_core::expert_geometry(), capacity, bf16)?;
     ensure!(
         request_wire <= max_frame_bytes && response_wire <= max_frame_bytes,
         "native compact-BF16 wire frames ({request_wire} request / {response_wire} response) \
          exceed the {max_frame_bytes}-byte native frame budget"
     );
-    let per_endpoint = align_up(request_wire.max(slot_bytes).min(max_frame_bytes), alignment)?
-        .checked_add(align_up(
-            response_wire.max(slot_bytes).min(max_frame_bytes),
-            alignment,
-        )?)
-        .context("registered ring span overflow")?
-        .checked_mul(depth)
-        .context("registered ring span overflow")?;
-    per_endpoint
-        .checked_mul(endpoints)
-        .context("registered ring span overflow")
+    cuteafd_core::expert_geometry().compact_ring_bytes(capacity, max_frame_bytes, depth,
+        slot_bytes, alignment, endpoints, bf16).context("registered ring span overflow")
 }
 
 /// The Spark worker always opens exactly two persistent endpoints (decode and
@@ -378,14 +352,37 @@ fn spark_transport_bytes(config: &NativeExpertServiceConfig) -> Result<usize> {
     let requested = std::env::var("CUTEAFD_SPARK_RDMA_ENDPOINTS").ok();
     let endpoints = parse_rdma_endpoints(requested.as_deref())?;
     let alignment = cuteafd_transport::verbs_host_capabilities().preferred_alignment;
-    spark_ring_bytes(
+    let bytes = spark_ring_bytes_for_ingress(
         config.capacity,
         config.max_frame_bytes,
         depth,
         slot_bytes,
         alignment,
         endpoints,
-    )
+        config.bf16_ingress,
+    )?;
+    validate_v41_ring_charge(config, cuteafd_core::expert_geometry(), depth, slot_bytes, bytes)?;
+    Ok(bytes)
+}
+
+fn validate_v41_ring_charge(config: &NativeExpertServiceConfig, geometry: cuteafd_core::ExpertGeometry,
+    depth: usize, slot_bytes: usize, bytes: usize) -> Result<()> {
+    if geometry.family() == Some("v41") {
+        let charge = cuteafd_loader::plan::layout::v41_spark_ring_allowance(
+            "deepseek_v41", config.capacity as u64, 0, config.bf16_ingress);
+        ensure!(bytes as u64 <= charge,
+            "V4.1 CUTEAFD_VERBS_HOST_RING_DEPTH={depth} CUTEAFD_VERBS_HOST_RING_SLOT_BYTES={slot_bytes} \
+             geometry uses {bytes} bytes, exceeding planner charge {charge} bytes");
+    }
+    Ok(())
+}
+
+fn worker_ring_budget(config: &NativeExpertServiceConfig, geometry: cuteafd_core::ExpertGeometry)
+    -> Result<Arc<cuteafd_transport::RingBudget>> {
+    // Topology changes expert ownership, not the two V4.1 transport owners.
+    let limit = if geometry.family() == Some("v41") { spark_transport_bytes(config)? }
+        else { usize::MAX };
+    Ok(cuteafd_transport::RingBudget::new(limit))
 }
 
 /// Optional explicit reserve for allocation granularity, the CUDA context and
@@ -508,6 +505,7 @@ mod tests {
             max_frame_bytes: 64 << 20,
             topology,
             native_spark_tp2: false,
+            bf16_ingress: false,
             encoder: None,
             audio_encoder: None,
         }
@@ -728,6 +726,64 @@ mod tests {
                 HostExpertExchange::bytes_for(capacity).unwrap(),
                 capacity as usize * 6 * 8 + capacity as usize * 10240
             );
+        }
+    }
+
+    #[test]
+    fn standard_v41_planner_allowance_covers_exact_worker_rings() {
+        assert_eq!(cuteafd_transport::protocol_v2::EXPERT_PROTOCOL_V2_REQUEST_HEADER_LEN, 96);
+        assert_eq!(cuteafd_transport::protocol_v2::EXPERT_PROTOCOL_V2_RESPONSE_HEADER_LEN, 96);
+        assert_eq!(cuteafd_transport::protocol_v2::EXPERT_PROTOCOL_V2_ROW_DESCRIPTOR_LEN, 40);
+        assert_eq!(cuteafd_transport::protocol_v2::EXPERT_PROTOCOL_V2_ROUTE_ENTRY_LEN, 12);
+        let allowance = cuteafd_loader::plan::layout::family_costs("deepseek_v41").spark_ring_bytes;
+        for bf16 in [false, true] {
+            for capacity in [1, 16, 80, 256, 1024, 2048, 4096] {
+                let exact = spark_ring_bytes_for_ingress(capacity, 64 << 20, 8, 8 << 20,
+                    cuteafd_transport::verbs_host_capabilities().preferred_alignment, 2, bf16).unwrap();
+                let charged = cuteafd_loader::plan::layout::v41_spark_ring_allowance(
+                    "deepseek_v41", capacity as u64, allowance, bf16);
+                assert!(exact as u64 <= charged, "capacity={capacity} bf16={bf16} rings={exact} charged={charged}");
+                assert_eq!(charged, exact as u64);
+            }
+        }
+    }
+
+    #[test]
+    fn v41_ring_overrides_cannot_exceed_planner_charge() {
+        let geometry = cuteafd_core::ExpertGeometry::DEEPSEEK_V41;
+        let config = config(3, 0, None);
+        let charge = cuteafd_loader::plan::layout::v41_spark_ring_allowance(
+            "deepseek_v41", config.capacity as u64, 0, false) as usize;
+        let smaller = geometry.compact_ring_bytes(config.capacity, 64 << 20, 4, 8 << 20, 4096, 2, false).unwrap();
+        let larger = geometry.compact_ring_bytes(config.capacity, 64 << 20, 8, 64 << 20, 4096, 2, false).unwrap();
+        assert!(validate_v41_ring_charge(&config, geometry, 4, 8 << 20, smaller).is_ok());
+        let error = validate_v41_ring_charge(&config, geometry, 8, 64 << 20, larger)
+            .unwrap_err().to_string();
+        for detail in ["CUTEAFD_VERBS_HOST_RING_DEPTH=8", "CUTEAFD_VERBS_HOST_RING_SLOT_BYTES=67108864",
+            &format!("{larger} bytes"), &format!("planner charge {charge}")] {
+            assert!(error.contains(detail), "{error}");
+        }
+    }
+
+    #[test]
+    fn v41_replacement_sequence_enforces_budget_on_both_topology_paths() {
+        for topology in [None, Some(SparkTopology::new(3, 1).unwrap())] {
+            for bf16 in [false, true] {
+                let mut config = config(3, 0, topology);
+                config.capacity = 1024;
+                config.bf16_ingress = bf16;
+                let budget = worker_ring_budget(&config, cuteafd_core::ExpertGeometry::DEEPSEEK_V41).unwrap();
+                let bytes = spark_ring_bytes_for_ingress(1024, 64 << 20, 8, 8 << 20, 4096, 1, bf16).unwrap();
+                let decode = budget.reserve(bytes).unwrap();
+                let prefill = budget.reserve(bytes).unwrap();
+                assert_eq!(budget.used(), budget.limit());
+                assert!(budget.reserve(bytes).is_err());
+                drop(decode);
+                let replacement = budget.reserve(bytes).unwrap();
+                assert_eq!(budget.peak(), 2 * bytes);
+                drop((replacement, prefill));
+                assert_eq!(budget.used(), 0);
+            }
         }
     }
 
