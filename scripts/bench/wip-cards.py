@@ -726,7 +726,7 @@ def build_scopes(cards):
                 env['CUTEAFD_WIP_' + switch + '_AOT'] = 'ON'
                 scopes.add(tag + ':fp8')
                 if 'exl3' in card['name'] or 'tr3' in card['name']:
-                    scopes.add(tag + ':exl3-k345' if tag in {'glm', 'glmf'} else tag + ':exl3-k45')
+                    scopes.add(tag + (':exl3-k34' if tag == 'glmf' else ':exl3-k45'))
                 if fam == 'mimo_v2':
                     env['CUTEAFD_WIP_MIMO_GEOMETRIES'] = ';'.join(sorted(set(env.get('CUTEAFD_WIP_MIMO_GEOMETRIES', '').split(';')) - {''} | {tag}))
     env.update(CUTEAFD_KACHE_SPARK='1', CUTEAFD_WIP_EXPERT_FAMILIES=';'.join(sorted(scopes)), CUTEAFD_WIP_SPARK_TP_ROLES=';'.join(sorted(roles)), CUTEAFD_WIP_EXPORT_LOCKS='on', CUTEAFD_KACHE=str(Path.home() / '.cache/cuteafd/tools/x86_64/kache'), CARGO_BUILD_JOBS='16', RUST_TEST_THREADS='16', CMAKE_BUILD_PARALLEL_LEVEL='16')
