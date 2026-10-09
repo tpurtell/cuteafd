@@ -74,6 +74,7 @@ LABEL org.opencontainers.image.description="DeepSeek V4.1 Flash inference for on
 LABEL org.opencontainers.image.licenses="MIT"
 LABEL org.opencontainers.image.revision=${CUTEAFD_ENGINE_COMMIT}
 LABEL org.opencontainers.image.version=${CUTEAFD_RELEASE_VERSION}
+LABEL org.cuteafd.console-gate="1"
 LABEL io.cuteafd.role=${CUTEAFD_ROLE}
 LABEL io.cuteafd.cuda_arch=${CUDA_ARCH}
 LABEL io.cuteafd.sparkinfer.revision=${CUTEAFD_SPARKINFER_COMMIT}

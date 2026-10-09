@@ -390,6 +390,7 @@ RELEASE_RTX_GPUS="$1"
 repo_root="$PWD"
 coordinator=coordinator
 snapshot_rel=model
+console_supported=0
 CONSOLE_SECRET_FILE=/fake-console-secret
 USAGE_DIR=/fake-usage
 peers=peer-list

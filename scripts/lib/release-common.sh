@@ -291,6 +291,15 @@ finally:
 print(path)
 PYSECRET
 }
+release_console_supported() {
+  local image="$1" wip_binary="${2:-}"
+  if [[ -n "$wip_binary" ]]; then
+    docker run --rm --network none --mount "type=bind,src=$wip_binary,dst=/opt/cuteafd-console-probe,readonly" \
+      --entrypoint /opt/cuteafd-console-probe "$image" serve-native --help 2>/dev/null | grep -q -- '--console-secret-file'
+  else
+    [[ "$(docker image inspect --format '{{index .Config.Labels "org.cuteafd.console-gate"}}' "$image" 2>/dev/null)" == 1 ]]
+  fi
+}
 release_prepare_console() {
   CONSOLE_SECRET_FILE="$(release_prepare_secret "$HOME/.cache/cuteafd/console" secret)" || release_die "could not provision console secret"
   USAGE_DIR="$HOME/.cache/cuteafd/${1:-default}/usage"

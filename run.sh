@@ -549,7 +549,11 @@ if ((dry_run)); then
   exit 0
 fi
 release_prepare_api_key "${ENABLE_BENCH:-off}" "${INSTANCE:-default}"
-release_prepare_console "${INSTANCE:-default}"
+console_supported=0
+if release_console_supported "$COORDINATOR_DOCKER_INFERENCE" "${wip_layout:+$wip_layout/bin/cuteafd}"; then
+  console_supported=1
+  release_prepare_console "${INSTANCE:-default}"
+fi
 if ((restart)); then
   release_stop_services "$coordinator" "$spark_prefix"
   ((restart_all == 0)) || release_stop_all_worker_containers
@@ -662,8 +666,11 @@ start_coordinator() {
 echo "== starting native RTX coordinator =="
 local -a args=(--vision "$VISION" --audio "$AUDIO" serve-native "${vision_args[@]}" --snapshot "/root/.cache/huggingface/$snapshot_rel" --native-lib /opt/cuteafd/lib/libcuteafd_native.so --peers "$peers" --rtx-gpus "$RELEASE_RTX_GPUS" --embedding-placement "$EMBEDDING" --listen "$ADDR" --prefill-batch-tokens "$PREFILL_BATCH_TOKENS" --concurrency "$CONCURRENCY" --prefix-cache-entries "$PREFIX_CACHE_ENTRIES" --max-context-tokens "$MAX_CONTEXT_TOKENS" --max-output-tokens "$MAX_OUTPUT_TOKENS")
 [[ -z "${COORDINATOR_GPU_BUDGET_GIB:-}" ]] || args+=(--coordinator-gpu-budget-gib "$COORDINATOR_GPU_BUDGET_GIB")
-args+=(--console-secret-file /run/cuteafd-console-secret --usage-dir /root/.cache/cuteafd/usage)
-local -a api_mount_args=(--mount "type=bind,src=$CONSOLE_SECRET_FILE,dst=/run/cuteafd-console-secret,readonly" -v "$USAGE_DIR:/root/.cache/cuteafd/usage")
+local -a api_mount_args=()
+if ((console_supported)); then
+  args+=(--console-secret-file /run/cuteafd-console-secret --usage-dir /root/.cache/cuteafd/usage)
+  api_mount_args+=(--mount "type=bind,src=$CONSOLE_SECRET_FILE,dst=/run/cuteafd-console-secret,readonly" -v "$USAGE_DIR:/root/.cache/cuteafd/usage")
+fi
 if [[ -n "${API_KEY_FILE:-}" ]]; then
   [[ -f "$API_KEY_FILE" && -r "$API_KEY_FILE" ]] || release_die "API_KEY_FILE must name a readable file"
   api_mount_args+=(--mount "type=bind,src=$(readlink -f "$API_KEY_FILE"),dst=/run/cuteafd-api-key,readonly")
@@ -829,7 +836,7 @@ until curl -fsS "$api_url/health" >/dev/null 2>&1 &&
 done
 trap - EXIT
 echo "CUTEAFD native API is ready at $api_url/v1/"
-release_print_console_link "http://$(hostname):${ADDR##*:}"
+if ((console_supported)); then release_print_console_link "http://$(hostname):${ADDR##*:}"; fi
 echo "  API model: $RELEASE_NATIVE_API_MODEL_ID"
 echo "  checkpoint: $RELEASE_MODEL_ID@$RELEASE_MODEL_REVISION"
 echo "  RTX layout: $RELEASE_RTX_GPUS GPU(s), host indices $gpu_index_csv ($gpu_uuid_csv)"
