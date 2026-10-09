@@ -1830,10 +1830,561 @@ TJ: two key items, both urgent right after v2.0.0.
    `builds/v41-nvfp4-wire/SUMMARY.md`.
 2. **Retire ds41rt: V4.1 moves onto shared infrastructure** (below, "First
    after v2"). V4.1's TP2 expert layers and memory placement are inputs to
-   item 1; build the shared versions once, not twice.
+   item 1; build the shared versions once, not twice. Design: "v3: retiring
+   ds41rt" below.
 Gate per family: golden/fidelity, then the quick A/B at the 2M operating
 point on the min and max reference configs. Requalify each family's cards
 as it moves.
+
+## v3: retiring ds41rt (design, 2026-10-09)
+
+Design for v3 item 2. Inputs: four read-only code audits
+(`builds/v3-ds41rt-design/final-{A-serve,B-prefix,C-experts,D-exec}.md`, with
+file-by-file classifications, line counts and interface sketches), the
+work/v41-decode-share closeout, and the parallel placement design (item 1).
+Paths are under `rust/crates/cuteafd-daemon/src/` unless stated; line counts
+are `wc -l` including inline tests.
+
+**Corrections to the outline above, from the code:**
+- "HC-lagged replay" is two separate things, and neither is a generic lagged
+  state.
+  - **mHC lag.** Each sublayer collapses its residual with the *incoming*
+    `pre` and produces the next sublayer's `pre` (`v41_hc.rs`, "the newly
+    generated pre belongs to the NEXT sublayer"). This is model arithmetic
+    and stays in the family.
+  - **CED replay.** Encoder layers 0-19 prefill the whole prompt
+    (`CacheStage::Encoder`, windows 0..20). Then decoder layers 20-39 replay
+    only the last `min(end, 128)` rows from the retained layer-19
+    residual/pre (`EncoderSuffix`, 40,976 B/row, `begin_decoder_replay`).
+    Replay happens once per prompt, not once per encoder wave.
+  - **What is generic.** Only the prefix-cache consequence is generic: a
+    partial hit reuses compressed sources through the even-aligned common
+    prefix (`source_end`), but rebuilds windows from `source_end - 128`
+    (`replay_start`). MiMo's partial SWA replay has the same two-frontier
+    shape.
+- V4.1's two-RTX layout is a **20/20 layer-range split**: layers 0-19 own
+  GPU0 and layers 20-39 own GPU1 (`v41_backbone_cache/placement.rs:16`).
+  - It is not a head split (the head split measured -5..-8%).
+  - Its TP2 experts broadcast canonical routes to the peer and reduce
+    routed and shared outputs separately, rank 0 then rank 1, then add in
+    BF16 (`v41_experts/tp2_ffn.rs:332,364`). They do not join any
+    all-reduce.
+  - In item 1's per-layer ownership terms this is `Whole(0)` x 20 +
+    `Whole(1)` x 20, with TP2 experts combining by their own peer reduce.
+- There is no shared serve loop and no shared speculator trait to move onto.
+  GLM Flash and MiMo each run their own scheduler over shared parts
+  (`PrefillQueue`, sampler, token I/O, draft policy, console, prefix
+  engine). "Ordinary family" here means the same: a family scheduler over
+  shared parts, no private engine machinery. `round_groups` does not exist;
+  the queue has `round` and `round_pairs`.
+- **Shared code already imports V4.1:**
+  - `CudaCopyEngine`: `shared/prefix.rs` and every family serve loop;
+  - `BatchScores`/`VOCAB`: `shared/constraints.rs:1`;
+  - `ExpertLayer`/`ExpertWeights`/`HostExpertExchange` and the EXL3 types:
+    `shared/experts/service*.rs`, `deepseek_v4/local.rs`, GLM Flash's
+    streamed EXL3.
+
+  Retiring ds41rt starts by inverting these dependencies.
+
+### Map: V4.1 subsystems against the shared layer
+
+Class: **same** (a shared counterpart exists; V4.1's copy is a vestige),
+**extend** (generic, but `shared/` lacks it: grow `shared/`, then V4.1 uses
+it), **model** (stays in the family).
+
+| V4.1 subsystem | Files | Lines (tests) | Shared counterpart | Class |
+|---|---|---:|---|---|
+| Serve loop, admission, independent lanes, sampling plan, scores, console, copy drafts, scoring | `v41_native_serve.rs`, `v41_native_serve/{scheduler*,speculative*,copy_drafts,scores,console,distributed,prefill_target,placement}.rs` | 7,938 (2,860) | `shared/prefill_share` (`PrefillQueue`), `shared/sampler` (V4.1's head already re-exports it), `shared/token_io`, `shared/console` (V4.1's console is already a feed into it), `shared/draft_policy`, `shared/probe`, engine `DeferredAdmission`, engine `MediaAdmission` | extend: resumable prefill, lanes, speculator, retained scores. same: console/sampler/media glue. model: CED prefill phases |
+| Prefix cache + host tier | `v41_native_serve/prefix*.rs` | 1,809 (803) | `cuteafd-engine::prefix` (`PrefixCache`, `PrefixFamily`, `RefPagePool`, `MarkStore`, `ReuseRule::V41`), `cuteafd-hostcache`, engine `MediaKeys`, `shared/prefix` | same: radix, banks, image keys, host orchestration. extend: restore plan, snapshot metadata, pending capture |
+| Memory / admission | `v41_native_serve/memory*.rs` | 1,159 (767) | item 1 `cuteafd_loader::placement::solve`, `shared/placement.rs`, `shared/memory_report` | same: replaced by the solver. model: source-pool cost provider |
+| Request leases, Engram history, CED cache phases | `v41_requests*`, `v41_backbone_cache*` | 4,326 (1,942) | engine `RefPagePool` generations (pages only) | model, plus extend: atomic cache+Engram reservation |
+| Compressed KV (CSA2 sources + index keys) | `v41_compressor*` | 3,546 (958) | `RefPagePool` (basic refcounts in `source_cache/ownership.rs` duplicate it) | model; the ownership basics are a vestige |
+| FP8 window rings, dSpark rings | `v41_window*`, `v41_dspark_cache*` | 2,466 (555) | `MarkArena` (positional marks) | model; captured as marks |
+| Expert path: layers, execution, exchange, EXL3, local, TP2, NVFP4, assignment | `v41_experts.rs`, `v41_experts/{coordinator,execution*,exl3*,local*,nvfp4,paired,tp2*}.rs` | 9,091 (2,900) | `shared/experts/service*` (already uses these types), `shared/spark_intake` (`SparkLink`), `shared/peer_split`, `shared/memory/device`; item 1 `shared/experts/rtx.rs` | extend: move out as shared types. same: coordinator receive/reduce. model: catalog/role/format adapters |
+| dSpark drafter | `v41_experts/dspark*` | 5,685 (1,078) | none (GLM Flash/MiMo drafters are family code too) | model; its expert backend moves to shared executors |
+| Shared FFN, router, projection TP2 | `v41_backbone_shared*`, `v41_shared_ffn`, `v41_backbone_router`, `v41_projection_tp2` | 2,135 (954) | `shared/peer_split` | model |
+| Target pass, lanes, execution, block, layer graphs | `v41_target_pass*`, `v41_backbone_lane*`, `v41_backbone_execution*`, `v41_block*`, `v41_layer_graphs` | 10,598 (4,198) | `shared/memory/chain` (`StageChain`, already used), `shared/decode_graph` (bucket policy only, no graph owner) | model: layer program. extend: lane set, ordered two-lane pipeline, graph bank. vestige: single-vs-distributed duplication |
+| Target head, embedding | `v41_target_head*`, `v41_target_embedding*` | 4,075 (2,573) | `shared/sampler`, `shared/token_io::TokenEmbedding` | model: mHC collapse. extend: sharded vocabulary. same: embedding |
+| mHC | `v41_hc`, `v41_backbone_hc` | 425 (0) | none | model |
+| Attention, indexer, sparse attention | `v41_attention_*`, `v41_index_*`, `v41_sparse_attention*` | 4,880 (1,166) | none | model |
+| Engram tables and gates | `v41_engram*` (+ loader `engram_*`) | 981 (112) | loader `MappedTable`, `shared/mapped_table::MappedTableDevice` | model; extend: non-blocking row upload |
+| Vision tower | `v41_vision*` | 1,107 (280) | `shared/vision` (remote path already shared) | model; extend: local encoder job adapter (BF16 patches, merge 3) |
+| Tensors / vocab shard | `v41_tensors*` | 344 (57) | loader catalog | model |
+| **Family total** | 141 files | **60,565 (~21,200)** | | |
+
+Outside the daemon family: native `native/families/deepseek_v41/` (42 files,
+4,234 lines, all kernels: model); loader `families/deepseek_v41/` (~3.3K Rust);
+FFI bindings (~3.4K); `run.sh` V4.1 branch (lines 144-832, 689 lines);
+`NativeServeArgs` (`cli.rs:743-889`).
+
+### What `shared/` must grow
+
+Every item is opt-in for the families that don't use it. Signatures are
+sketches; typed errors inside crates.
+
+1. **Resumable, time-sized prefill** (`shared/prefill_share.rs`). This
+   generalises MiMo's `--prefill-chunk-s`.
+
+   ```rust
+   pub struct ChunkBudget { pub target: Duration, pub row_cap: usize }
+   pub struct PrefillUnit<U> { pub work: U, pub rows: usize, pub estimate: Duration, pub finalizes: bool }
+   pub trait PrefillDriver {
+       type Cursor;            // family prefill state; survives decode steps between units
+       type Unit;              // a legal shape for the family
+       fn plan(&self, cursor: &Self::Cursor, budget: ChunkBudget) -> Result<PrefillUnit<Self::Unit>>;
+       fn execute(&mut self, cursor: &mut Self::Cursor, unit: &PrefillUnit<Self::Unit>) -> Result<Chunk>; // returns drained, committed
+       fn observe(&mut self, unit: &PrefillUnit<Self::Unit>, took: Duration);
+       fn abort_and_drain(&mut self, cursor: &mut Self::Cursor) -> Result<()>;
+   }
+   ```
+
+   - **Shared arguments.** `prefill_chunk_s: Option<f64>` moves into
+     `DecodeShareArgs`. MiMo's `timed_chunk_rows`/`split_timed_chunk`
+     become its `plan`.
+   - **Queue changes.** Add `one_wave_rounds()` and `decode_seconds()` from
+     work/v41-decode-share (cb2aea55).
+   - **V4.1 driver.** `V41Prefill` is a cursor ported from that branch's
+     `PrefillProgress`: Start / Encoder{suffix, next} / Replay{suffix} /
+     Continuation. Its units are:
+     - an encoder group: one or two ordered waves, keeping the two-lane
+       overlap;
+     - the final replay, indivisible and ≤128 rows;
+     - a cached continuation.
+   - **Planning.** `plan` estimates critical-path time, not the sum of the
+     lane times. It keeps legal capacities (`prefill_capacity`: 80, 256,
+     1024, 4096).
+   - **Share 0 adds no per-round work.** Pick the serve-loop variant once
+     at startup (`serve::<F, const SHARED_PREFILL: bool>`). Share 0 calls
+     today's whole-prompt path directly.
+2. **Lanes and ordered two-lane pipelining.**
+   - `shared/serve/lanes.rs`: `LaneSet<L>` / `LaneLease`, with
+     independent mutable lanes over borrowed immutable weights. Lanes are
+     polled with `join!` (never cancel a peer future that owns queued
+     work). `LaneCommit` covers prepare, then target+draft commit, poll
+     both, publish, or `abort_and_drain`.
+   - `shared/prefill_pipeline.rs`: `PipelineOrder` / `ChunkPermit`
+     (`reserve`, `wait_predecessor(stage)`, `publish(stage)`, `commit`,
+     `cancel`). This is V4.1's `encoder_stream.rs` dependency order with the
+     family's stage hooks. The C1 `single_lane_round` fast path stays.
+3. **Speculator interface** (`shared/speculation.rs`).
+   - The trait: `trait Speculator { type Prefix; type CommitInput; type
+     Pending; admit, begin_propose/poll_propose, begin_commit/poll_commit/
+     publish_commit, abort_and_drain, retain_prefix/restore_prefix, release
+     }`.
+   - `DsparkSpeculator` wraps `DraftRuntime`/`DraftChain`. Its three
+     windows, taps, RNG and widths 5/7 stay in the family.
+   - DFlash2 and MTP get immediate-ready adapters later. Proposals carry
+     `DraftSource` (neural/copy), so copied rows never train neural
+     acceptance.
+   - The cost side is a `VerifyCost` trait. `cuteafd-core::dspark_policy`
+     takes a `ResourceGeometry` instead of its hard-coded
+     40 / 384 / top-6 / group-16.
+   - This lines up with the planned shared adaptive-draft policy (Explore
+     list).
+4. **Retained scores** (`shared/token_io.rs`).
+   - `ScoreRows { selected, packed, row_to_pack, vocab }` and
+     `RetainedScores { vocab, raw }` replace V4.1's `BatchScores`/
+     `TokenScores` (fixed 129,280 vocab). `constraints.rs` stops importing
+     the family.
+   - Draws carry an explicit `draw_position`: V4.1 draws at `generated +
+     row`, while the `SelectBatch` callers draw at `start + 1`.
+5. **Prefix engine** (`cuteafd-engine::prefix`).
+   - **Restore plan.**
+
+     ```rust
+     pub struct LaggedState { pub source_end: usize, pub replay_start: usize }
+     pub enum RestoreFidelity { Exact, ApproximateReplay }
+     pub struct RestorePlan { pub snapshot_end: usize, pub target_end: usize, pub lag: LaggedState, pub fidelity: RestoreFidelity }
+     ```
+
+     - `PrefixFamily::plan_restore(&self, RestoreCandidate) ->
+       RestorePlan`.
+     - `restore(mark, placement, &RestorePlan, &RestoreContext { native_tokens, media })`.
+     - Pages fork through `source_end`, not through `replay_start`. Today's
+       single `len` conflates them.
+     - Exact hits stay exact. An approximate hit never replaces an exact
+       frontier.
+     - MiMo partial reuse moves to the same plan.
+   - **Snapshot metadata.**
+     - Add `type SnapshotMeta: Clone`, with `capture_meta`/`restore_meta`
+       and `HostPayload<M> { after, media, family: M }`.
+     - V4.1 keeps window/carry descriptors and Engram history there.
+       Partial restores rebuild Engram history from native token ids.
+     - dSpark rings go into V4.1's combined mark (MiMo precedent). No new
+       engine draft lifecycle; `has_draft: false` is never claimed with
+       draft bytes.
+   - **Pending capture.**
+     - `queue_capture`/`poll_capture`/`abort_capture`, with a typed
+       `CaptureTicket` from the family. Synchronous families complete
+       immediately.
+     - The pending owner keeps pages, marks and source owners until both the
+       target and drafter copies land. On failure, quarantine; never free.
+   - **Other.** `PrefixCache::prefill_hold()` passes through to the host
+     tier. Lazy-tail COW, work-aware eviction and multi-class pages are
+     deferred (open question 4).
+6. **Graph bank** (`shared/decode_graph.rs`).
+   - `GraphBank<K>` over a `GraphOwner` that pins device, weights,
+     buffers, geometry and workspace. It offers `warm`, `enqueue` (missing:
+     a typed eager decision), `retire` and `drain_retired`.
+   - `GraphPolicy::FixedStartup` is V4.1's default: shapes are warmed at
+     readiness, anything else runs eagerly, never captured.
+     `GraphPolicy::Budgeted{bytes}` is GLM Flash's `GraphCache`, moved here.
+   - `CaptureWatch` replaces `graph_capture_watch` and covers every verify
+     path; the sampled-terminal return skips it today.
+   - Exact keys first. V4.1 on `ROW_BUCKETS` waits for a sentinel and
+     route-crossover audit: its `u64` positions and Engram/index/tap masks
+     don't take `MaskedRow`'s -1 sentinels as is.
+7. **Expert types out of the family** (`shared/experts/{layer,execution,exchange,exl3,local,assignment}.rs`).
+   - **Types.**
+     - `ExpertLayer { Backbone { layer, shard }, Draft { stage, shard } }`
+       with `ExpertShard { rank, world, intermediate }`.
+     - `ExpertLoadBudget`, `ExpertExecution`, `HostExpertExchange`,
+       `Exl3Weights`/`Exl3Execution`/`Exl3Worker`.
+     - `ExpertOutputLayout { Fp32Routes, Fp32Tokens, Bf16Routes, Bf16Tokens }`.
+     - `RouteAssignment` (replicated / paired).
+   - **What stays in the family.** Catalog, role ids, the 44-slot native
+     binding and NVFP4 scales.
+   - **Item 1's TP2 layer.** `shared/experts/rtx.rs::RtxExpertLayer` takes
+     `BackboneTp2` as its first implementation. It needs a combine mode:
+     `Tp2Combine::{HeadSplitAllReduce, PeerReduce}`. V4.1 keeps
+     `PeerReduce` with today's rounding order (routed reduce, shared
+     reduce, BF16 add) until a fused path passes fidelity.
+   - **Spark side.** The coordinator's Spark receive/reduce moves onto
+     `SparkLink`/`SparkIntake`.
+8. **Admission through item 1's solver.**
+   - V4.1 implements `cuteafd_loader::placement::FamilyPlacement` in
+     `placement/families/deepseek_v41.rs`, ported from
+     `plan/layout/v41.rs` and `v41_native_serve/memory.rs`.
+   - **KV cost is a per-rank unit cost, not a per-token scalar.** A
+     512-token unit is 5 source pages of 91,136 B (~890 B/token). On top
+     come FP8 window marks (2.72 MB per retained sequence), source
+     replicas and COW tails.
+   - **The dual-RTX minimum routed prefix becomes an explicit
+     `ExpertDemand` floor.** Today it is 20 layers, 1 with an explicit
+     topology.
+   - **Engram as a family-owned resource.** It needs no shared trait: the
+     family keeps its typed owner and declares device rows plus pinned
+     staging as `fixed` demands.
+   - **Handoff.** `v41_native_serve/placement.rs` (nonce, plan, ack,
+     ready) becomes `shared/placement/handoff.rs::PlacementHandoff<P>`.
+   - **Test.** `planner_equals_runtime_deepseek_v41`.
+9. **Smaller extensions.**
+   - `shared/vocabulary.rs::ShardedVocabulary`: the two-GPU head with
+     checked argmax and global offsets.
+   - `shared/mapped_table`: `PendingRows::{poll,cancel}` and
+     `MappedTableDevice::{enqueue_upload,reclaim}` for Engram.
+   - `shared/vision::EncoderJobAdapter`: BF16 patch input and merge 3.
+10. **Launcher.**
+    - `cuteafd plan --deployment` emits a `DeploymentSpec` JSON that
+      `run-family.sh` consumes. It covers:
+      - role/manifest proof (`V41_EXPERT_TP_AOT.json`, `symbols_verified`,
+        native-library hash, the `io.cuteafd.spark_tp_roles` label);
+      - artifact identity and the resolved-config fingerprint;
+      - the topology (`SPARK_TP`/`SPARK_EP`) and the placement handoff;
+      - `KV_POOL_SIZE` and `MEMORY_RESERVATION` as `AdmissionArgs`.
+    - **CLI.** V4.1's arguments are composed from shared clap groups
+      (`RuntimeServeArgs`, `AdmissionArgs`, `TopologyArgs`, `PrefixArgs`,
+      `ConsoleArgs`, `ApiArgs`) plus a family `V41ModelArgs` (TP2_*,
+      dSpark, paired EXL3).
+
+### Staged migration
+
+Each stage is its own branch off work/p0, merges on its own gates, and
+deletes the V4.1 code it replaces. **Order:**
+- Stage 0 first.
+- Stages 1, 2 and 3 touch disjoint files and can run in parallel.
+  Hardware gates are serialized.
+- Stage 4 follows item 1's solver landing for V4.
+- Stage 5 needs stage 4's `DeploymentSpec` inputs.
+- Stage 6 is last.
+
+**Gates for every stage (V4.1 MXFP4, plus NVFP4 where the stage touches
+experts or prefill):**
+1. **CPU tests.** Cargo/script tests, reported as failing ids.
+2. **Fidelity.**
+   - Quick fidelity tier against the official reference: KL and top-1
+     within the cold-run noise envelope of work/p0 measured the same day;
+     tools 30/30.
+   - "Exact cache" is byte-exact: decode after an exact hit equals cold
+     decode for the same restored state.
+   - "Lossless spec" holds.
+3. **Quick A/B at the 2M pool on min (1 RTX + 4) and max (2 RTX + 4).**
+   - The candidate WIP is measured against work/p0 the same day, and also
+     against the v2.0.0 release images, so stage slack cannot accumulate.
+   - It covers C1 and C16 code decode, 8K prefill, readiness time and
+     memory headroom.
+
+**C1 bar (V4.1 is the speed reference):**
+- **Per stage.** C1 must be ≥0.98 against both baselines on both layouts.
+  - Between 0.95 and 0.98: 3 interleaved sessions, pass if the median is
+    ≥0.99.
+  - Below 0.95: fail.
+- **C16 and 8K prefill.** ≥0.97 (decode-share measured ±5% C16 session
+  noise); the same 3-session rule applies at 0.97.
+- **Readiness.** At most +5%.
+- **Stage 6.** It runs the full V4.1 parity gate (3 interleaved sessions)
+  against v2.0.0. The bar is C1 ≥0.99 on min and max, C16 and prefill
+  ≥0.98, and no fidelity regression. A miss blocks the release cut, not
+  earlier merges.
+
+**Stage 0: invert dependencies (M).** Moves only, no behaviour change.
+- `CudaCopyEngine` + `Regions` and their tests move to
+  `shared/prefix/cuda_copy.rs`.
+- Expert layer, execution, exchange and EXL3 types move to
+  `shared/experts/` (map item 7).
+- `ScoreRows`/`RetainedScores` move to `shared/token_io`.
+- `deepseek_v41` gets a golden entry in `commands/family.rs` (it has
+  `None` today), built on the existing scoring probe.
+- **Gate.** Tests; byte-exact golden for V4.1, V4 and GLM Flash streamed
+  EXL3; one quick A/B pair on V4.1 min (expert exchange is a shared hot
+  path).
+- **Leaves the family:** ~3.5-4.5K (relocated).
+
+**Stage 1a: serve loop on shared parts, share 0 (L).** V4.1's scheduler
+keeps its admission and CED phases and adopts:
+- `PrefillQueue` + `V41Prefill`;
+- `LaneSet`/`LaneCommit`;
+- `PipelineOrder`;
+- `Speculator` (dSpark);
+- `ScoreRows`;
+- engine `DeferredAdmission` and `MediaAdmission`, including the lifetime
+  budget fit as a policy hook;
+- the console `Ticket` with an id and a lane.
+
+The default stays share 0 through the static bypass.
+- **Gate.** The standard gates plus an explicit C16 3-session recheck at
+  share 0 (decode-share saw a -5.3% median it could not explain).
+- **Leaves the family:** ~3.5-5K. Net deletion ~1-1.5K.
+
+**Stage 1b: decode share on V4.1 (M).** Time-sized units via
+`--prefill-chunk-s` and `--decode-share 0.2`.
+- **Gate.**
+  - The fidelity envelope: stream KL ≤2x the batch-mix envelope.
+    Decode-share passed at 0.2 and failed at 0.4.
+  - Long-prompt greedy-16 exact.
+  - Decode gaps measured with
+    `scripts/bench/deepseek_v41/bench-prefill-interference.py`, ported from
+    the closed branch.
+- **Default.** Set by TJ from the measured gap/TTFT trade (open question 3).
+
+**Stage 2: prefix cache (L).**
+- The engine grows restore plans, snapshot metadata, pending capture and
+  `prefill_hold` (map item 5).
+- `V41Prefix: PrefixFamily` bundles the five source pages into one 512-token
+  unit. Window/carry/dSpark rings form an arena mark; Engram history goes in
+  `SnapshotMeta`.
+- **Deletes:**
+  - `v41_native_serve/prefix.rs` and `prefix/images.rs` (engine
+    `MediaKeys` replaces them);
+  - the host-cache binding;
+  - `source_cache/ownership.rs` basics;
+  - the duplicate `HostBudget`.
+- **Gate.** The standard gates, plus:
+  - byte-exact exact-prefix for text, image and odd-frontier prompts;
+  - approximate-replay NLL no worse than today;
+  - host-tier restore;
+  - 1-2 short agentic sessions with hit tokens ≥ today's.
+- **Leaves the family:** ~1.5-2.3K. Net ~1-1.6K.
+
+**Stage 3: graphs (M).**
+- `GraphBank` with `FixedStartup` replaces `v41_layer_graphs.rs`
+  (`LayerGraphs`/`RowGraphs`) and the banks in the head, query/output,
+  index and embedding.
+- GLM Flash's `GraphCache` moves in as `Budgeted`.
+- **Gate.** The standard gates plus `CaptureWatch` = 0 steady-state
+  captures over the C16 battery.
+- **Leaves the family:** ~0.6-1.1K. Net ~0.2-0.4K.
+
+**Stage 4: experts, admission, layer ownership (L; three PRs).**
+- **4a.** Coordinator Spark exchange onto `SparkLink`. Local/TP2 onto
+  `shared/experts/{local,rtx}`. The dSpark expert backend onto shared
+  executors.
+- **4b.** Admission via `FamilyPlacement` + `RuntimeInventory`. Deletes
+  `memory.rs`, `memory/distributed.rs` and `placement.rs`.
+- **4c.** Fold the single-RTX and distributed paths into one path driven
+  by the per-layer ownership map, where 1 RTX means every layer is
+  `Whole(0)`. Today `v41_target_pass.rs` vs
+  `v41_target_pass/distributed.rs`, `v41_backbone_execution.rs` vs
+  `v41_backbone_execution/distributed.rs`, and so on duplicate
+  orchestration. C1's single-lane fast path must survive.
+- **Gate.** The standard gates, plus:
+  - `planner_equals_runtime_deepseek_v41`;
+  - KV pool at 2M on min and max, never smaller than today;
+  - MXFP4, NVFP4 and EXL3 (compact TP4) launches.
+- **Leaves the family:** ~5-8K. Net ~2-4K (4c is unaudited, ~1.5-3K of
+  that).
+
+**Stage 5: launcher (M).**
+- V4.1 launches through `run-family.sh` from the `DeploymentSpec`.
+- `run.sh` becomes the dispatcher only.
+- `serve-native` becomes a hidden alias of `serve --family deepseek_v41`
+  for one release.
+- Old keys warn for one release through `key()`. `KV_POOL_TOKENS` aliases
+  `POOL_TOKENS`, `DSPARK` maps to `SPECULATOR=dspark`, and
+  `SPARK_REDUCTION_MIN_ROWS`, `COORDINATOR_GPU_HEADROOM_GIB`,
+  `SPARKINFER_EXL3` and `MODEL_VARIANT` are dropped (accepted but never
+  forwarded today).
+- **Gate.** `--dry-run` resolves the same fingerprint, roles and topology
+  as `run.sh` for the release configs. Script tests. One launch per arm on
+  min and max.
+- **Net:** ~250-400 lines of launcher and ~50-120 of CLI. The 689-line
+  branch is the gross figure.
+
+**Stage 6: delete and rename (M).**
+- **Remaining vestiges go:** the legacy non-topology path if TJ agrees
+  (open question 5) and leftover duplicate glue.
+- **Module names drop the `v41_` prefix inside the family**, as GLM
+  Flash's do.
+- **`v41` stays as the model's tag** in C symbols (`cuteafd_v41_*`, 207
+  identifiers), AOT prefixes and package directories, as `glmf_`/`mimo_`
+  do.
+- **No ds41/ds41rt names remain** in Rust, scripts, configs or docs,
+  except the compatibility readers below. Each is dated and dropped at
+  v4:
+  - the checkpoint `meta.ds41rt`/`ds41rt_*` keys;
+  - the `ds41_json_schema`/`ds41_tool_schema` grammar envelope: rename
+    emitter and reader together and accept the old name;
+  - the `DS41RF01` debug-frame magic: version it;
+  - the `io.cuteafd.v41.spark_tp_roles` fallback read.
+- **Gate.** Full V4.1 parity (above).
+
+### What is left, and how much goes
+
+| | Lines |
+|---|---:|
+| Family today (incl. ~21.2K tests) | 60,565 |
+| Leaves the family, stages 0-6 | ~15-22K |
+| of which net repository deletion | ~5-10K |
+| Family at the end (incl. ~12-14K tests) | **~38-45K** |
+
+- **The family holds:**
+  - attention, indexer and sparse attention (3.7K production);
+  - CSA2 compressed KV and windows (~3.7K);
+  - CED cache phases (~1.3K);
+  - the dSpark drafter model (~4.3K);
+  - router, shared FFN and projection TP2 (1.2K);
+  - mHC, Engram, vision and tensors (~2.2K);
+  - the layer program (~3.5K) and head collapse (~0.9K);
+  - adapters: `PrefillDriver`, `Speculator`, `PrefixFamily`,
+    `FamilyPlacement`, the expert catalog/format (~4K);
+  - a GLM Flash-sized serve loop (~1.5K).
+- **Production code is about 26-30K.** That is about 3x GLM Flash's
+  9.1K, because the model has more distinct mechanisms (CED, CSA2, indexer,
+  mHC, Engram, a 5.7K neural drafter), not because of engine code.
+- **Goal state:** V4.1 is one of six families. Its directory holds no
+  scheduler, prefix cache, graph bank, expert service, admission solver or
+  launcher. It runs through `serve`/`golden`/`run-family.sh` like the
+  others. Features land once in `shared/`. The "GLM Flash-sized" target
+  above is not reachable without deleting model code (open question 1).
+
+### Risks and mitigations
+
+1. **Encoder waves of 400-700 ms and a ~250 ms replay.**
+   - Wave-boundary sharing alone can't bring decode gaps to tens of ms.
+   - **Mitigations:**
+     - Size units by time through the 80/256/1024/4096 capacities.
+       512-row waves are projected at ~120-171 ms and 256-row at ~60-85
+       ms; both are projections, to measure.
+     - Treat a smaller wave as a numerics change: chunk boundaries change
+       row counts and kernel tiles, so fidelity-gate it.
+     - Leave the replay indivisible, so the floor is ~250 ms. Splitting it
+       needs mid-replay decoder-window state and its own fidelity gate;
+       defer that.
+     - Measure separately whether decode can keep one execution lane while
+       a prefill unit holds the other (V4.1 already has independent lanes;
+       SM contention will slow decode).
+2. **Cold prefill is not bit-reproducible.**
+   - Spark slices accumulate prefill with unordered FP32 atomics at
+     capacities ≥256 (`atomic_min_capacity=256` in
+     `python/tools/aot/export_b12x_v41_experts_aot.py`), so byte-exact A/B
+     is impossible for any stage that touches prefill.
+   - **Mitigations:**
+     - Gate prefill stages on KL/top-1/greedy-16 against a cold-alone
+       noise envelope measured the same day (decode-share: alone max KL
+       6.97e-5).
+     - Gate decode byte-exactly after an exact cache restore (small decode
+       rows don't use atomics).
+     - Use the ordered packages (risk 3) for strict proofs.
+3. **The deterministic Spark reduction option.**
+   - Export without `atomic_min_capacity` (ordered FP32 route planes). A
+     private "ordered ABI2" package already built on work/v41-decode-share
+     but never ran its proof.
+   - **Mitigation and plan:**
+     - In stage 1a, make it a selectable package variant
+       (`SPARK_REDUCTION=ordered`).
+     - Measure 8K prefill and C16 on min/max.
+     - Use it for every byte-exact gate in stages 1-2.
+     - Make it the default if 8K prefill costs ≤2% (open question 6).
+4. **Unexplained share-0 C16 -5.3%** (decode-share, 3 pairs).
+   - **Mitigations:** the static share-0 bypass (no queue, clocks or debt
+     calls), and a mandatory 3-session C16 recheck at stage 1a.
+5. **TP2 combine order.**
+   - Fusing routed and shared partials into one exchange reorders BF16/FP32
+     rounding.
+   - **Mitigation:** V4.1 stays on `PeerReduce` with today's order. The
+     fused path is opt-in behind fidelity, in coordination with item 1.
+6. **Async snapshot lifetimes.**
+   - Pending target/draft captures and host restores own device memory
+     across scheduler yields.
+   - **Mitigations:**
+     - fault-injection tests: cancel during capture, partial enqueue, host
+       timeout;
+     - quarantine on terminal CUDA errors;
+     - drain before release (AGENTS lifetime rules).
+7. **Planner/runtime mismatch.**
+   - Today the planner auto-picks V4.1 RTX layers from average layer bytes
+     / 2, a 512 MiB margin and 256 MiB per rank (loader `plan/layout.rs`
+     ~1008). Runtime uses per-layer budgets and AOT scratch.
+   - **Mitigation:** item 1's equality test is the stage 4b gate; no
+     estimate stays labelled Exact.
+8. **Launch safety.**
+   - Moving to `run-family.sh` could drop role/manifest proof or the
+     fingerprint.
+   - **Mitigation:** dry-run equality against `run.sh` for every release
+     config before `run.sh`'s branch is deleted.
+9. **Distributed host-cache pacing.**
+   - Distributed `PrefillTarget` ignores the per-chunk `prefill_hold`
+     (warns once).
+   - **Mitigation:** stage 2 either implements it or keeps it explicit and
+     logged; don't claim it is solved.
+10. **Readiness.**
+    - Moves must keep bounded parallel reads, owner-thread packing and
+      released staging.
+    - **Mitigation:** readiness at most +5% per stage.
+
+### Decisions (TJ, 2026-10-09)
+
+1. **End-state size.** Judge "ordinary" by structure: no engine machinery in
+   the family directory. Model code stays.
+2. **Serve loop.** Not unified in v3. V4.1 gets a family loop over the
+   shared parts, like GLM Flash and MiMo; converge loops after v3.
+3. **Decode/prefill sharing is a cross-model feature.** V4.1 joins the
+   shared machinery in stage 1b like every family. Its default is decided
+   by measurement there (on if within the stage gate), not held off by
+   policy.
+4. **Prefix pages.** Bundle the five source pages into one 512-token unit
+   (455 KB, ~890 B/token; no padded unified pool). The only overhead is one
+   eager tail copy per cached prefix (~455 KB). Add page classes with lazy
+   COW tails only if the agentic bench shows lost hits or pool.
+5. **Legacy non-topology Spark path.** Express TP4 as `SPARK_TP=4`, one
+   quick A/B, delete the legacy path in stage 6 unless a compact layout
+   still has users.
+6. **Deterministic Spark prefill reduction.** Build now as a package option;
+   default if 8K prefill costs <= 2%.
+7. **Two-RTX attention.** Keep V4.1's 20/20 layer split as the default.
+   Per-layer ownership is a general tool for every family (item 1). Never
+   measured on any model: head-splitting only V4.1's compressed (CSA/HCA)
+   layers while keeping sliding-window layers whole. V4.1's earlier head
+   split lost (C1 187 -> 170) because each split projection ended in a
+   host wait, so measure the per-layer mix once item 1's shared exchange
+   primitives exist.
+8. **Naming.** Keep `v41` as the model tag, drop the `v41_` module prefix,
+   dated compatibility readers for the ds41rt strings until v4.
+9. **Copy drafting.** Rejected as a default on V4.1 (C1 0.982, though +34%
+   on a literal-table edit) and MiMo (C1 0.957; copied tokens accepted ~45%
+   vs DFlash ~99.5%). Becomes shared machinery as an acceptance-gated copy
+   inside the shared draft policy (copy only when its span beats the neural
+   draft), with the per-drafter calibration work; opt-in until it wins.
 
 ## First after rc3: per-key draft confidence calibration (TJ, 2026-10-09)
 
@@ -1871,6 +2422,7 @@ calibration gap remains real but is not this regression.
 
 Ideas TJ wants kept for later; not v2 work.
 - **First after v2: retire ds41rt; V4.1 becomes an ordinary family (TJ, 2026-10-09).**
+  Design and stages: "v3: retiring ds41rt" above.
   The goal is to remove ds41rt as a separate engine, not only to move its
   scheduler: V4.1 should be a model the shared engine runs, as GLM Flash and
   MiMo are. It came in as the ds41rt speed floor. Under the old "never slower
