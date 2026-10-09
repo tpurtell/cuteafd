@@ -170,6 +170,10 @@ pub enum StopReason {
     Refusal,
     /// The client or session cancelled the turn.
     Cancelled,
+    /// A long turn paused (Anthropic `pause_turn`, e.g. hosted-tool rounds
+    /// exhausted); the client may continue it by resending. Protocols without
+    /// an equivalent render it as a normal end of turn.
+    PauseTurn,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -182,6 +186,10 @@ pub struct Usage {
     pub reasoning_tokens: u32,
     /// Hosted web searches executed by the gateway for this turn.
     pub web_search_requests: u32,
+    /// Prompt tokens written to a prompt cache (Anthropic
+    /// `cache_creation_input_tokens`); 0 when the backend doesn't report it.
+    #[serde(default)]
+    pub cache_creation_input_tokens: u32,
 }
 
 impl Usage {
@@ -191,6 +199,7 @@ impl Usage {
         self.cached_input_tokens += other.cached_input_tokens;
         self.reasoning_tokens += other.reasoning_tokens;
         self.web_search_requests += other.web_search_requests;
+        self.cache_creation_input_tokens += other.cache_creation_input_tokens;
     }
 }
 
