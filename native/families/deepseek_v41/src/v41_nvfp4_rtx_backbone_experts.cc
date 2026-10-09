@@ -3,6 +3,7 @@
 // hidden rows and publishes BF16 deterministic routes.
 #define CUTEAFD_V41_LOCAL_EXPERTS 1
 #define CUTEAFD_V41_NVFP4_VARIANTS_HEADER "v41_nvfp4_rtx_backbone_variants.h"
+#define cuteafd_expert_shared_input cuteafd_v41_nvfp4_local_expert_shared_input
 #define cuteafd_expert_info cuteafd_v41_nvfp4_local_expert_info
 #define cuteafd_expert_initialize cuteafd_v41_nvfp4_local_expert_initialize
 #define cuteafd_expert_output_kind cuteafd_v41_nvfp4_local_expert_output_kind

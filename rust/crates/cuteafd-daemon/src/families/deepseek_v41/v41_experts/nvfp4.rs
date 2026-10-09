@@ -30,6 +30,59 @@ const SLOT_W3_INPUT_SCALE: usize = 10;
 const SLOT_W2_INPUT_SCALE: usize = 11;
 const HIDDEN: usize = 5120;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum InputScaleMode {
+    SharedMax,
+    Expert,
+}
+
+impl InputScaleMode {
+    fn parse(value: Option<&str>) -> Result<Self> {
+        match value {
+            None | Some("shared_max") => Ok(Self::SharedMax),
+            Some("expert") => Ok(Self::Expert),
+            Some(value) => anyhow::bail!(
+                "V41_NVFP4_INPUT_SCALE={value:?} must be shared_max or expert"
+            ),
+        }
+    }
+
+    fn from_env() -> Result<Self> {
+        match std::env::var("V41_NVFP4_INPUT_SCALE") {
+            Ok(value) => Self::parse(Some(&value)),
+            Err(std::env::VarError::NotPresent) => Self::parse(None),
+            Err(error) => Err(error).context("invalid V41_NVFP4_INPUT_SCALE"),
+        }
+    }
+}
+
+fn fc1_launch_scales(
+    weights: &[f32],
+    inputs: &[f32],
+    mode: InputScaleMode,
+) -> Result<(Vec<f32>, Vec<f32>)> {
+    ensure!(!inputs.is_empty() && inputs.len() == weights.len(),
+        "NVFP4 FC1 scalar vector lengths differ");
+    ensure!(inputs.iter().chain(weights).all(|v| v.is_finite() && *v > 0.0),
+        "NVFP4 FC1 scales must be finite and positive");
+    let shared = inputs.iter().copied().fold(0f32, f32::max);
+    let mut reciprocals = Vec::with_capacity(inputs.len());
+    let mut alphas = Vec::with_capacity(inputs.len());
+    for (&weight, &input) in weights.iter().zip(inputs) {
+        let scale = match mode {
+            InputScaleMode::SharedMax => shared,
+            InputScaleMode::Expert => input,
+        };
+        let reciprocal = 1.0 / scale;
+        let alpha = weight * scale;
+        ensure!(reciprocal.is_finite() && alpha.is_finite() && alpha > 0.0,
+            "NVFP4 FC1 launch scale overflow or underflow");
+        reciprocals.push(reciprocal);
+        alphas.push(alpha);
+    }
+    Ok((reciprocals, alphas))
+}
+
 /// Resident NVFP4 storage for one layer on one rank, embedded in
 /// [`super::ExpertWeights`] so every existing wave, execution and service
 /// path serves W4A4 without a second weights type.
@@ -135,6 +188,17 @@ impl<'a> Nvfp4Side<'a> {
         layer: ExpertLayer,
         available_device_bytes: usize,
     ) -> Result<([DeviceAllocation<'a>; 4], Self)> {
+        let scale_mode = InputScaleMode::from_env()?;
+        if scale_mode == InputScaleMode::Expert {
+            let role = match layer {
+                ExpertLayer::Backbone { .. } => 1,
+                ExpertLayer::BackboneTp2 { .. } => 3,
+                ExpertLayer::BackboneFull { .. } => 2,
+                _ => anyhow::bail!("NVFP4 covers backbone routed experts only"),
+            };
+            ensure!(!library.v41_nvfp4_shared_input(role)?,
+                "V41_NVFP4_INPUT_SCALE=expert requires per-route NVFP4 AOT; rebuild with CUTEAFD_V41_NVFP4_SHARE_INPUT=OFF");
+        }
         let (intermediate, experts) = Self::rank_planes(layer, catalog)?;
         let kernel_intermediate = Self::kernel_intermediate(library, catalog, layer)?;
         let budget = Self::plan(library, catalog, layer)?;
@@ -168,14 +232,11 @@ impl<'a> Nvfp4Side<'a> {
             library,
             raw: library.cuda_stream_create()?,
         };
-        let mut input_scales = vec![0f32; experts];
         let mut down_input_scales = vec![0f32; experts];
-        let mut alpha_values = vec![0f32; experts];
         let mut down_alpha_values = vec![0f32; experts];
-        // Raw FC1 checkpoint scalars, captured per expert so one shared
-        // activation scale can be chosen once every expert is known. Only the
-        // FC1 input is a broadcast token row; each expert produces its own FC2
-        // intermediate, so the FC2 pair is derived inline and stays calibrated.
+        // Retain FC1 checkpoint scalars until the launch-scale mode is applied.
+        // Each expert produces its own FC2 intermediate, so the FC2 pair is
+        // derived inline and stays calibrated in both modes.
         let mut w1_weight_scale_2_raw = vec![0f32; experts];
         let mut w1_input_scale_raw = vec![0f32; experts];
         for expert in 0..EXPERT_READ_LANES.min(experts) {
@@ -323,32 +384,16 @@ impl<'a> Nvfp4Side<'a> {
             }
             unsafe { library.cuda_stream_synchronize(stream.raw)?; }
         }
-        // W4A4 shared-input preparation. The b12x front end can quantize each
-        // token's activation once and fan that row out to every routed expert,
-        // which removes the per-route re-quantization of an identical BF16 row.
-        // That path requires one activation scale to serve the whole rank, and
-        // the kernel reads index 0, so every entry must agree.
-        //
-        // The weight scale stays per-expert in `alpha`, which keeps the
-        // arithmetic exact: the activation is quantized with S, so FC1 must
-        // dequantize with alpha[e] = weight_scale_2[e] * S. The published
-        // checkpoint calibrates a different input scale per expert (measured
-        // spread up to ~6x for FC1), so a shared S is an approximation.
-        //
-        // Maximum is the conservative choice. The block scale is
-        // `max_abs * (1/S) / 6` clamped to the E4M3 maximum, so a larger S
-        // lowers the block scale and buys headroom against saturation; the
-        // per-16 E4M3 block scale then absorbs the range difference for experts
-        // calibrated smaller. The reverse choice can saturate the clamp.
-        let shared_fc1_input_scale = w1_input_scale_raw.iter().copied().fold(0f32, f32::max);
-        ensure!(
-            shared_fc1_input_scale > 0.0 && shared_fc1_input_scale.is_finite(),
-            "NVFP4 layer has no usable shared FC1 activation scale"
-        );
-        for expert in 0..experts {
-            input_scales[expert] = 1.0 / shared_fc1_input_scale;
-            alpha_values[expert] = w1_weight_scale_2_raw[expert] * shared_fc1_input_scale;
-        }
+        // Keep the historical shared maximum until hardware gates. Expert mode
+        // preserves the checkpoint's static FC1 scales; the existing route pack
+        // already indexes these vectors by expert, so no extra pass is needed.
+        let (input_scales, alpha_values) = fc1_launch_scales(
+            &w1_weight_scale_2_raw, &w1_input_scale_raw, scale_mode,
+        )?;
+        let minimum = w1_input_scale_raw.iter().copied().fold(f32::INFINITY, f32::min);
+        let maximum = w1_input_scale_raw.iter().copied().fold(0f32, f32::max);
+        tracing::info!(?layer, ?scale_mode, minimum, maximum, spread = maximum / minimum,
+            "NVFP4 FC1 activation scales");
         // Per-expert vectors are tiny; upload once per layer on the load stream.
         {
             // Each async copy owns a distinct pinned source range until the
@@ -393,4 +438,39 @@ impl<'a> Nvfp4Side<'a> {
         ))
     }
 
+}
+
+#[cfg(test)]
+mod scale_tests {
+    use super::*;
+
+    #[test]
+    fn expert_scales_preserve_modelopt_fc1_pair() {
+        let weights = [0.25, 0.5, 2.0];
+        let inputs = [0.5, 1.0, 4.0];
+        let (reciprocals, alphas) = fc1_launch_scales(&weights, &inputs, InputScaleMode::Expert).unwrap();
+        assert_eq!(reciprocals, vec![2.0, 1.0, 0.25]);
+        assert_eq!(alphas, vec![0.125, 0.5, 8.0]);
+        for expert in 0..inputs.len() {
+            assert_eq!(alphas[expert] * reciprocals[expert], weights[expert]);
+        }
+    }
+
+    #[test]
+    fn shared_max_keeps_historical_numerics() {
+        let (reciprocals, alphas) = fc1_launch_scales(&[0.25, 0.5], &[0.5, 4.0], InputScaleMode::SharedMax).unwrap();
+        assert_eq!(reciprocals, vec![0.25, 0.25]);
+        assert_eq!(alphas, vec![1.0, 2.0]);
+        assert_eq!(InputScaleMode::parse(None).unwrap(), InputScaleMode::SharedMax);
+        assert_eq!(InputScaleMode::parse(Some("expert")).unwrap(), InputScaleMode::Expert);
+        assert!(InputScaleMode::parse(Some("invalid")).is_err());
+    }
+
+    #[test]
+    fn invalid_fc1_vectors_are_rejected() {
+        for inputs in [vec![], vec![0.0], vec![-1.0], vec![f32::NAN], vec![f32::INFINITY]] {
+            assert!(fc1_launch_scales(&[1.0], &inputs, InputScaleMode::Expert).is_err());
+        }
+        assert!(fc1_launch_scales(&[f32::MAX], &[f32::MAX], InputScaleMode::Expert).is_err());
+    }
 }

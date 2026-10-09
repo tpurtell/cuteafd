@@ -49,6 +49,13 @@ static void launch(void** args, int count) {
 extern "C" int32_t cuteafd_initialize_scratch_storage_async(
     void*, uint64_t, uint64_t, uint64_t, uint32_t, void*) {{ return 0; }}
 int main() {{
+#ifdef TEST_NVFP4
+#ifdef CUTEAFD_V41_NVFP4_SHARED_INPUT
+  assert(cuteafd_expert_shared_input() == CUTEAFD_V41_NVFP4_SHARED_INPUT);
+#else
+  assert(cuteafd_expert_shared_input() == -1);
+#endif
+#endif
   void* kernel=nullptr;
   assert(cuteafd_v41_expert_initialize(16, &kernel) == 0);
   cuteafd_expert_launch_t args{{}};
@@ -88,13 +95,15 @@ int main() {{
   assert(launches == before);
 }}
 """)
-            for nvfp4 in (False, True):
-                with self.subTest(nvfp4=nvfp4):
+            for nvfp4, shared in ((False, None), (True, None), (True, 0), (True, 1)):
+                with self.subTest(nvfp4=nvfp4, shared=shared):
                     command = ["c++", "-std=c++17", "-I", str(root), "-I",
                                str(ROOT / "native/shared/include"), str(root / "test.cc"),
                                "-o", str(root / "test")]
                     if nvfp4:
                         command.append("-DTEST_NVFP4")
+                    if shared is not None:
+                        command.append(f"-DCUTEAFD_V41_NVFP4_SHARED_INPUT={shared}")
                     subprocess.run(command, check=True, capture_output=True, text=True)
                     subprocess.run([str(root / "test")], check=True)
 

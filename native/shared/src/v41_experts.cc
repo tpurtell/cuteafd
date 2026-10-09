@@ -134,6 +134,17 @@ extern "C" int32_t cuteafd_expert_initialize_scratch_async(void* kernel,
       variant->info.experts, stream);
 }
 
+#ifdef CUTEAFD_V41_NVFP4_VARIANTS_HEADER
+extern "C" int32_t cuteafd_expert_shared_input() {
+#ifdef CUTEAFD_V41_NVFP4_SHARED_INPUT
+  return CUTEAFD_V41_NVFP4_SHARED_INPUT;
+#else
+  // Old artifacts did not advertise the policy: never claim they are exact.
+  return -1;
+#endif
+}
+#endif
+
 extern "C" int32_t cuteafd_expert_info(int32_t capacity, cuteafd_expert_info_t* out) {
   auto* variant = by_capacity(capacity);
   if (!variant || !out) return cudaErrorInvalidValue;

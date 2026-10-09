@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+import math
+import struct
 
 try:
     import torch
@@ -103,6 +105,38 @@ def unpack_low_first_nibbles_bytes(
     if len(values) < count:
         raise ValueError(f"packed bytes contain {len(values)} nibbles, need {count}")
     return values
+
+
+def nvfp4_quantize_static_bytes(
+    values: Sequence[float], input_scale: float,
+) -> tuple[bytes, bytes]:
+    """CPU ModelOpt oracle: static global scale, dynamic E4M3 K16 blocks.
+
+    FP4 and E4M3 use nearest-even rounding; nibbles are low-first. This
+    models the quantization points, not the kernel's approximate reciprocal.
+    """
+    if not math.isfinite(input_scale) or input_scale <= 0:
+        raise ValueError("input_scale must be finite and positive")
+    if not values or len(values) % 16 or any(not math.isfinite(v) for v in values):
+        raise ValueError("values must be finite, nonempty K16 blocks")
+    f32 = lambda v: struct.unpack("<f", struct.pack("<f", v))[0]
+    scale_values = [f8e4m3_byte_to_float(i) for i in range(127)]
+    reciproc = f32(1.0 / input_scale)
+    payload, scales = bytearray(), bytearray()
+    for start in range(0, len(values), 16):
+        block = values[start:start + 16]
+        target = min(448.0, f32(f32(max(abs(v) for v in block) * reciproc) / 6.0))
+        scale_byte = min(range(127), key=lambda i: (abs(scale_values[i] - target), i % 2))
+        scales.append(scale_byte)
+        effective = f32(scale_values[scale_byte] / reciproc)
+        codes = []
+        for value in block:
+            magnitude = abs(value)
+            code = 0 if effective == 0 else min(range(8), key=lambda i: (
+                abs(magnitude - f32(NVFP4_E2M1_VALUES[i] * effective)), i % 2))
+            codes.append(code | (8 if value < 0 and code != 0 else 0))
+        payload.extend(codes[i] | (codes[i + 1] << 4) for i in range(0, 16, 2))
+    return bytes(payload), bytes(scales)
 
 
 def decode_packed_nvfp4_values(

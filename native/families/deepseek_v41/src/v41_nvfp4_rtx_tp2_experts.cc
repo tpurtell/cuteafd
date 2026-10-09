@@ -4,6 +4,7 @@
 #define CUTEAFD_V41_LOCAL_EXPERTS 1
 #define CUTEAFD_V41_TP2_EXPERTS 1
 #define CUTEAFD_V41_NVFP4_VARIANTS_HEADER "v41_nvfp4_rtx_tp2_variants.h"
+#define cuteafd_expert_shared_input cuteafd_v41_nvfp4_tp2_expert_shared_input
 #define cuteafd_expert_info cuteafd_v41_nvfp4_tp2_expert_info
 #define cuteafd_expert_initialize cuteafd_v41_nvfp4_tp2_expert_initialize
 #define cuteafd_expert_output_kind cuteafd_v41_nvfp4_tp2_expert_output_kind

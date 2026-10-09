@@ -416,6 +416,26 @@ class TestRunShLifecycle:
             "fp", "0", "2", "explicit", "2", "2", "", "", "", "info", "__none__",
         ], payload
 
+    @pytest.mark.parametrize("encoder_rank", [-1, 1])
+    def test_nvfp4_expert_mode_keeps_the_worker_positions(self, tmp_path, encoder_rank):
+        encoder = (
+            f"encoder_rank={encoder_rank}\nencoder_port=19541\n"
+            "encoder_hash=encoder-hash\nRELEASE_MODEL_REVISION=model-revision\n"
+        )
+        result, invocations = self._run(
+            tmp_path, encoder + _slice("expert-launch"),
+            env={"V41_NVFP4_INPUT_SCALE": "expert"},
+        )
+        assert result.returncode == 0, result.stderr
+        payload = _remote_payload(invocations[0])
+        assert payload[13:18] == ["", "", "", "info", "__none__"], payload
+        expected_encoder = (
+            ["1", "19541", "encoder-hash", "model-revision"]
+            if encoder_rank >= 0 else ["-1", "", "", ""]
+        )
+        assert payload[18:22] == expected_encoder, payload
+        assert payload[22:] == ["expert"], payload
+
     def test_empty_optionals_do_not_shift_the_launch_vector(self, tmp_path):
         result, invocations = self._run(
             tmp_path,

@@ -1,6 +1,7 @@
 // NVFP4 (W4A4) Spark TP4 modules. Separate symbol family from the W4A8 and
 // EXL3 variants; consumes BF16 hidden rows over the expert fabric.
 #define CUTEAFD_V41_NVFP4_VARIANTS_HEADER "v41_nvfp4_spark_variants.h"
+#define cuteafd_expert_shared_input cuteafd_v41_nvfp4_expert_shared_input
 #define cuteafd_expert_info cuteafd_v41_nvfp4_expert_info
 #define cuteafd_expert_initialize cuteafd_v41_nvfp4_expert_initialize
 #define cuteafd_expert_output_kind cuteafd_v41_nvfp4_expert_output_kind

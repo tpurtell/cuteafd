@@ -384,6 +384,7 @@ def export(
                 *includes,
                 f"#define CUTEAFD_V41_CC_MINOR {properties.minor}",
                 f"#define CUTEAFD_V41_SMS {properties.multi_processor_count}",
+                f"#define CUTEAFD_V41_NVFP4_SHARED_INPUT {int(share_input)}",
                 "// Deterministic dynamic NVFP4 publishes BF16 per-route rows.",
                 "#define CUTEAFD_V41_OUTPUT_KIND(capacity) 2",
                 "#define CUTEAFD_V41_VARIANTS " + ",".join(entries),

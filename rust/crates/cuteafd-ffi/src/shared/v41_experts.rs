@@ -603,6 +603,28 @@ impl NativeLibrary {
         self.expert_info_for(capacity, 11)
     }
 
+    /// Whether this NVFP4 role uses a shared FC1 activation scale. An old
+    /// artifact without policy metadata must be rebuilt before expert-scale mode.
+    pub fn v41_nvfp4_shared_input(&self, role: u32) -> Result<bool> {
+        let name: &[u8] = match role {
+            1 => b"cuteafd_v41_nvfp4_expert_shared_input",
+            2 => b"cuteafd_v41_nvfp4_local_expert_shared_input",
+            3 => b"cuteafd_v41_nvfp4_tp2_expert_shared_input",
+            _ => anyhow::bail!("unsupported NVFP4 role {role}"),
+        };
+        let name = family_symbol(name)?;
+        type SharedInputFn = unsafe extern "C" fn() -> i32;
+        // Safety: the optional symbol has the documented no-argument C ABI.
+        let function = unsafe { self.lib.get::<SharedInputFn>(&name) }
+            .context("NVFP4 AOT lacks input-scale policy metadata; rebuild the native library")?;
+        // Safety: the query returns a constant and does not access device memory.
+        match unsafe { function() } {
+            0 => Ok(false),
+            1 => Ok(true),
+            _ => anyhow::bail!("NVFP4 AOT input-scale policy is unknown; rebuild the native library"),
+        }
+    }
+
     fn expert_info_for(&self, capacity: u32, interface: u8) -> Result<V41ExpertInfo> {
         // 5..7 select the W4A4 ModelOpt NVFP4 family (RTX TP2, Spark TP4, full
         // RTX); 0..4 select the native W4A8 family; 8/9/11 select the native
