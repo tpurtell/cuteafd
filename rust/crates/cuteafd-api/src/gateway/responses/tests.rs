@@ -924,6 +924,7 @@ async fn codex_catalog_and_lite_additional_tools() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
+    assert!(body.len() < 800 * 1024, "default catalog exceeds 800 KiB");
     let catalog: Value = serde_json::from_str(&body).unwrap();
     let entry = catalog["models"]
         .as_array()

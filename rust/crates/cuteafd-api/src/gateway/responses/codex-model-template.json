@@ -1,4 +1,13 @@
 {
+  "_source": {
+    "project": "OpenAI Codex",
+    "copyright": "Copyright 2025 OpenAI",
+    "tag": "rust-v0.161.0",
+    "commit": "979011409de0a60b52f179721948e65531d26144",
+    "path": "codex-rs/models-manager/models.json",
+    "license": "Apache-2.0",
+    "changes": "Removed account/plan marketing and provider paid tiers; alias/limits replaced at runtime."
+  },
   "slug": "gpt-6.1-sol",
   "prefer_websockets": true,
   "support_verbosity": true,
