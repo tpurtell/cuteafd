@@ -80,9 +80,8 @@ Attention (KDA), a minority run MLA + DSA.
   same bits, with the weight words staged L2 evict-first (the b12x `gb10`
   decode schedule) and, at m80, 64x128 tiles at two CTAs per SM. On a GB10,
   an expert call at 1-80 rows took 1.4-11.2% less time than the default's.
-- 128-row decode and verify steps: `GLM5_FLASH_DECODE_ROWS=auto` selects
-  `128` (`--decode-rows 128`) on one GPU when the selected image has every
-  required m128 program; other layouts keep `64`. Builds with
+- 128-row decode and verify steps: `GLM5_FLASH_DECODE_ROWS=auto` keeps `64`;
+  explicit `128` (`--decode-rows 128`) remains opt-in on one GPU. Builds with
   `CUTEAFD_GLMF_WIDE_DECODE_ROWS=128` run steps of 65-128 rows on the
   `*_m128` programs and records 128-row replay records for their commits;
   steps of up to 64 rows keep the `_m64` programs, their bits and speed. A
@@ -115,11 +114,13 @@ Attention (KDA), a minority run MLA + DSA.
 
 The launcher resolves these after selecting the coordinator split. Explicit
 values always win; selecting the old values restores the old command stream.
-The `serve-glmf` CLI defaults remain unchanged.
+The `serve-glmf` CLI defaults remain unchanged. Rows 128 stay opt-in because
+wider verification costs C16 and post-C16 C1 through the draft cost model;
+rows 64 recover the matched gate while retaining the four other defaults.
 
 | Launcher key | Default | Resolution / old value |
 | --- | --- | --- |
-| `GLM5_FLASH_DECODE_ROWS` | `auto` | `128` on one GPU when the selected image has every required m128 program; otherwise `64`. Missing metadata falls back to `64`. |
+| `GLM5_FLASH_DECODE_ROWS` | `auto` | Resolves to `64`. Explicit `128` remains opt-in on one GPU with the required m128 programs. |
 | `GLM5_FLASH_INDEX_CACHE` | `auto` | `compact` on one GPU, `keys` with a head split. |
 | `GLM5_FLASH_REPLAY_RECORDS` | `auto` | `shared` on one GPU with Spark experts and an automatic pool; otherwise `own`. |
 | `GLM5_FLASH_DRAFT_HEAD` | `tensor` | With an external drafter; `exact` restores the old path. Target verification is unchanged. |
