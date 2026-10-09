@@ -751,7 +751,7 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
                 let timer = Instant::now();
                 let drafts = drafter.draft_device(&seqs.iter().map(|(_, s)| *s).collect::<Vec<_>>(), &engine.embedding,
                     super::dflash::TargetHead::Bf16(&engine.weights.head));
-                cost.observe_draft(timer.elapsed().as_secs_f64() * 1e3);
+                cost.observe_draft(active.len(), timer.elapsed().as_secs_f64() * 1e3);
                 let mut out = vec![None; active.len()];
                 match drafts {
                     Ok(drafts) => {
@@ -930,7 +930,7 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
             drafter.update(&context)?;
         }
         phases[5] += timer.elapsed().as_secs_f64();
-        cost.observe_host(1e3 * (cycle_host + timer.elapsed().as_secs_f64()));
+        cost.observe_host(active.len(), 1e3 * (cycle_host + timer.elapsed().as_secs_f64()));
         for (i, request) in active.iter().enumerate() {
             let proposal = if used_copy[i] { &sequences[i][1..] } else { drafted[i].as_ref().map_or(&[][..], |d| &d.tokens) };
             tally.member(&request.ticket, proposal, sequences[i].len() - 1, &request.history[before[i]..],

@@ -19,6 +19,8 @@
 //! `ms = a + b * table_increment(rows) + c * (sequences - 1)` online
 //! (exponentially forgotten least squares, regularized toward the table), so
 //! it learns both the intercept and how steeply rows cost in the running mix.
+//! Independent fits for 1, 2-4, 5-8 and 9+ sequences prevent a concurrency
+//! sweep from changing a short single-sequence request's cost estimates.
 //! Draft work fits `d * drafting + e * chained steps` the same way.
 //!
 //! Allocation: [`allocate`] admits draft positions across sequences one at a
@@ -253,9 +255,23 @@ pub(crate) struct CycleCost {
     table: Vec<f64>,
     /// Table-scale ms of a row whose routes an identical row already reads.
     duplicate_row_ms: f64,
+    fits: [CostFit; 4],
+}
+
+#[derive(Debug, Clone)]
+struct CostFit {
     verify: Ridge<3>,
     draft: Ridge<2>,
     host_ms: f64,
+}
+
+fn concurrency_bucket(sequences: usize) -> usize {
+    match sequences {
+        0..=1 => 0,
+        2..=4 => 1,
+        5..=8 => 2,
+        _ => 3,
+    }
 }
 
 impl CycleCost {
@@ -273,7 +289,9 @@ impl CycleCost {
         let verify = Ridge::new([table[1], 1.0, 0.0], [PRIOR_WEIGHT, PRIOR_WEIGHT * reach * reach,
             PRIOR_WEIGHT * REFERENCE_SEQUENCES * REFERENCE_SEQUENCES]);
         let draft = Ridge::new([0.0, 0.0], [PRIOR_WEIGHT, PRIOR_WEIGHT * REFERENCE_CHAIN * REFERENCE_CHAIN]);
-        Self { table, duplicate_row_ms: 0.0, verify, draft, host_ms: 0.0 }
+        Self { table, duplicate_row_ms: 0.0, fits: std::array::from_fn(|_| CostFit {
+            verify: verify.clone(), draft: draft.clone(), host_ms: 0.0,
+        }) }
     }
 
     /// Prices duplicate rows (identical sequences' rows beyond the first).
@@ -284,8 +302,10 @@ impl CycleCost {
 
     /// Starting draft ms per drafting cycle, per chained draft step, and host ms per cycle.
     pub fn drafts(mut self, draft_ms: f64, chain_ms: f64, host_ms: f64) -> Self {
-        self.draft = Ridge::new([draft_ms, chain_ms], self.draft.penalty);
-        self.host_ms = host_ms;
+        for fit in &mut self.fits {
+            fit.draft = Ridge::new([draft_ms, chain_ms], fit.draft.penalty);
+            fit.host_ms = host_ms;
+        }
         self
     }
 
@@ -301,59 +321,65 @@ impl CycleCost {
 
     /// Verify-step ms of `shape`.
     pub fn verify_ms(&self, shape: Shape) -> f64 {
-        self.verify.predict(&self.features(shape)).max(0.25 * self.table[1])
+        self.fits[concurrency_bucket(shape.sequences)].verify.predict(&self.features(shape)).max(0.25 * self.table[1])
     }
 
     /// Draft ms of a cycle: the drafting cost when `drafting`, and `chain` chained steps.
-    pub fn draft_ms(&self, drafting: bool, chain: usize) -> f64 {
+    pub fn draft_ms(&self, sequences: usize, drafting: bool, chain: usize) -> f64 {
         if !drafting && chain == 0 {
             return 0.0;
         }
-        self.draft.predict(&[1.0, chain as f64]).max(0.0)
+        self.fits[concurrency_bucket(sequences)].draft.predict(&[1.0, chain as f64]).max(0.0)
     }
 
     /// Cycle ms: verify `shape` after the draft work, plus host time.
     pub fn cycle_ms(&self, shape: Shape, chain: usize, drafting: bool) -> f64 {
-        self.verify_ms(shape) + self.draft_ms(drafting, chain) + self.host_ms
+        self.verify_ms(shape) + self.draft_ms(shape.sequences, drafting, chain)
+            + self.fits[concurrency_bucket(shape.sequences)].host_ms
     }
 
     /// Fitted verify (intercept ms, slope relative to the table, ms per extra
     /// sequence) and draft (ms per drafting cycle, per chained step).
-    pub fn fitted(&self) -> ([f64; 3], [f64; 2]) {
-        (self.verify.theta, self.draft.theta)
+    pub fn fitted(&self, sequences: usize) -> ([f64; 3], [f64; 2]) {
+        let fit = &self.fits[concurrency_bucket(sequences)];
+        (fit.verify.theta, fit.draft.theta)
     }
 
     /// Folds one observed verify step in and refits.
     pub fn observe_verify(&mut self, shape: Shape, ms: f64) {
         if ms.is_finite() && ms > 0.0 {
             let predicted = self.verify_ms(shape);
-            self.verify.observe(&self.features(shape), ms.clamp(0.5 * predicted, 2.0 * predicted));
-            let [a, b, c] = self.verify.theta;
+            let features = self.features(shape);
+            let fit = &mut self.fits[concurrency_bucket(shape.sequences)].verify;
+            fit.observe(&features, ms.clamp(0.5 * predicted, 2.0 * predicted));
+            let [a, b, c] = fit.theta;
             // Rows never get cheaper with more of them; the intercept stays physical.
-            self.verify.theta = [a.max(0.25 * self.table[1]), b.max(0.05), c];
+            fit.theta = [a.max(0.25 * self.table[1]), b.max(0.05), c];
         }
     }
 
     /// Folds one drafting cycle's draft ms in (drafted before planning).
-    pub fn observe_draft(&mut self, ms: f64) {
-        self.observe_chain(0, ms);
+    pub fn observe_draft(&mut self, sequences: usize, ms: f64) {
+        self.observe_chain(sequences, 0, ms);
     }
 
     /// Folds a drafting cycle of `steps` chained draft steps that took `ms` in.
-    pub fn observe_chain(&mut self, steps: usize, ms: f64) {
+    pub fn observe_chain(&mut self, sequences: usize, steps: usize, ms: f64) {
         if ms.is_finite() && ms > 0.0 {
-            let predicted = self.draft_ms(true, steps);
+            let predicted = self.draft_ms(sequences, true, steps);
             let y = if predicted > 0.0 { ms.clamp(0.25 * predicted, 4.0 * predicted) } else { ms };
-            self.draft.observe(&[1.0, steps as f64], y);
-            let [d, e] = self.draft.theta;
-            self.draft.theta = [d.max(0.0), e.max(0.0)];
+            let fit = &mut self.fits[concurrency_bucket(sequences)].draft;
+            fit.observe(&[1.0, steps as f64], y);
+            let [d, e] = fit.theta;
+            fit.theta = [d.max(0.0), e.max(0.0)];
         }
     }
 
     /// Folds one cycle's host time outside the draft and verify steps in.
-    pub fn observe_host(&mut self, ms: f64) {
+    pub fn observe_host(&mut self, sequences: usize, ms: f64) {
         if ms.is_finite() && ms >= 0.0 {
-            self.host_ms += 0.1 * (ms.min(20.0) - self.host_ms);
+            let host_ms = &mut self.fits[concurrency_bucket(sequences)].host_ms;
+            *host_ms += 0.1 * (ms.min(20.0) - *host_ms);
         }
     }
 }
@@ -640,8 +666,48 @@ mod tests {
             assert!((got - expected).abs() < 0.3, "{rows} rows: {got} vs {expected}");
         }
         // A single ratio could not do this: 20 rows at the table's shape would cost 3x 4 rows.
-        let ([_, slope, _], _) = cost.fitted();
+        let ([_, slope, _], _) = cost.fitted(4);
         assert!(slope < 0.6, "{slope}");
+    }
+
+    #[test]
+    fn c16_sweep_does_not_poison_c1_plans() {
+        // GLM Flash table; a wide sweep learns sub-additive expert reads.
+        let table = [(1, 19.1), (2, 26.0), (4, 35.2), (6, 43.5), (8, 51.3), (64, 200.0)];
+        let fresh = CycleCost::new(&table, 128).drafts(5.0, 0.0, 0.3);
+        let mut swept = fresh.clone();
+        for step in 0..200 {
+            let rows = 16 * (4 + step % 5);
+            swept.observe_verify(Shape::plain(rows, 16), 30.0 + 0.6 * rows as f64);
+            swept.observe_draft(16, 12.0);
+            swept.observe_host(16, 3.0);
+        }
+        let groups = [group(0.8, 7, 1)];
+        assert_eq!(allocate(&groups, Base::default(), Drafter::Block, &swept),
+            allocate(&groups, Base::default(), Drafter::Block, &fresh));
+        for rows in 1..=8 {
+            assert_eq!(swept.cycle_ms(Shape::plain(rows, 1), 0, true),
+                fresh.cycle_ms(Shape::plain(rows, 1), 0, true));
+        }
+        // Returning to a previously learned regime preserves its fit too.
+        feed(&mut swept, 20.0, 2.0, 1, 50);
+        let learned = swept.fitted(1);
+        feed(&mut swept, 30.0, 0.5, 16, 100);
+        assert_eq!(swept.fitted(1), learned);
+    }
+
+    #[test]
+    fn concurrency_bucket_boundaries_share_only_their_own_fit() {
+        assert_eq!((0..=17).map(concurrency_bucket).collect::<Vec<_>>(),
+            vec![0, 0, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 3, 3]);
+        let mut cost = CycleCost::new(&TABLE, 128).drafts(5.0, 0.0, 0.3);
+        let prior = cost.fitted(1);
+        feed(&mut cost, 12.0, 0.4, 4, 100);
+        assert_eq!(cost.fitted(2), cost.fitted(4));
+        assert_ne!(cost.fitted(4), prior);
+        for sequences in [1, 5, 8, 9, 16, 32] {
+            assert_eq!(cost.fitted(sequences), prior);
+        }
     }
 
     #[test]
@@ -662,7 +728,7 @@ mod tests {
             cost.observe_verify(Shape::plain(8, 1), 1.2 * 17.0);
         }
         assert!((cost.verify_ms(Shape::plain(8, 1)) - 20.4).abs() < 0.2);
-        let ([a, b, _], _) = cost.fitted();
+        let ([a, b, _], _) = cost.fitted(1);
         assert!(a > 10.0 && b > 1.0, "{a} {b}");
         // Outliers are clipped at twice the prediction.
         let before = cost.verify_ms(Shape::plain(8, 1));
@@ -676,20 +742,20 @@ mod tests {
         let mut cost = CycleCost::new(&TABLE, 64).drafts(0.0, 0.9, 0.0);
         for step in 0..200 {
             let steps = 1 + step % 4;
-            cost.observe_chain(steps, 0.6 + 0.8 * steps as f64);
-            cost.observe_host(0.5);
+            cost.observe_chain(1, steps, 0.6 + 0.8 * steps as f64);
+            cost.observe_host(1, 0.5);
         }
         for steps in 1..=4 {
-            let got = cost.draft_ms(true, steps);
+            let got = cost.draft_ms(1, true, steps);
             assert!((got - 0.6 - 0.8 * steps as f64).abs() < 0.05, "{steps}: {got}");
         }
-        assert_eq!(cost.draft_ms(false, 0), 0.0);
+        assert_eq!(cost.draft_ms(1, false, 0), 0.0);
         let shape = Shape::plain(4, 1);
         assert!((cost.cycle_ms(shape, 0, false) - 13.5).abs() < 0.01);
         // A block drafter pays its draft whatever the plan.
         let mut block = CycleCost::new(&TABLE, 64).drafts(5.0, 0.0, 0.0);
         for _ in 0..200 {
-            block.observe_draft(3.0);
+            block.observe_draft(1, 3.0);
         }
         assert!((block.cycle_ms(shape, 0, true) - 16.0).abs() < 0.05);
     }

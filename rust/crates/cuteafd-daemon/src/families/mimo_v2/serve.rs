@@ -957,7 +957,7 @@ fn schedule_inner(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path
                 let drafts = engine.submit(|| drafter.draft(&seqs.iter().map(|(_, s)| *s).collect::<Vec<_>>(), &engine.embedding,
                     engine.head()));
                 let ms = timer.elapsed().as_secs_f64() * 1e3;
-                cost.observe_draft(ms);
+                cost.observe_draft(active.len(), ms);
                 draft_s += ms / 1e3;
                 let mut out = vec![None; active.len()];
                 match drafts {
@@ -1001,7 +1001,7 @@ fn schedule_inner(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path
                 let timer = Instant::now();
                 let drafts = engine.mtp_draft(&seqs, stages);
                 let ms = timer.elapsed().as_secs_f64() * 1e3;
-                cost.observe_draft(ms);
+                cost.observe_draft(active.len(), ms);
                 draft_s += ms / 1e3;
                 match drafts {
                     Ok(drafts) => {

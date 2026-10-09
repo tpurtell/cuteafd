@@ -1003,7 +1003,7 @@ fn schedule(engine: &Qwen4Engine<'_>, opened: &Opened, snapshot: &std::path::Pat
                         placement: &a.placement, seq: &mut a.mtp, depth }).collect();
                     let proposals = speculate::draft(engine, &mut seqs, &mut timing)?;
                     if depths.iter().any(|&d| d > 0) {
-                        cost.observe_chain(timing.steps - steps, 1e3 * timer.elapsed().as_secs_f64());
+                        cost.observe_chain(active.len(), timing.steps - steps, 1e3 * timer.elapsed().as_secs_f64());
                     }
                     proposals
                 } else {
@@ -1164,7 +1164,7 @@ fn schedule(engine: &Qwen4Engine<'_>, opened: &Opened, snapshot: &std::path::Pat
                 "kept": kept.iter().map(|k| k.map_or(0, |(n, _)| n)).collect::<Vec<_>>(),
                 "verify_ms": 1e3 * elapsed, "draft_steps": timing.steps - steps_before,
                 "draft_ms": 1e3 * (timing.seconds - draft_s_before), "cycle_ms": 1e3 * cycle.elapsed().as_secs_f64(),
-                "predicted_ms": predicted_ms, "fit": cost.fitted(), "rates": rates,
+                "predicted_ms": predicted_ms, "fit": cost.fitted(active.len()), "rates": rates,
                 "calibration": calibration.fitted()}));
         }
         for index in (0..active.len()).rev() {
