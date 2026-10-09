@@ -728,6 +728,9 @@ def build_scopes(cards):
                 if 'exl3' in card['name'] or 'tr3' in card['name']:
                     scopes.add(tag + (':exl3-k34' if tag == 'glmf' else ':exl3-k45'))
                 if fam == 'mimo_v2':
+                    # MiMo places its audio tower unless the card turns audio off.
+                    if values.get('AUDIO', 'auto') != 'off':
+                        env['CUTEAFD_WIP_AUDIO_AOT'] = 'ON'
                     # Two RTX cards run the head-split programs (mimof2/mimop2).
                     wanted = {tag, tag + '2'} if int(values.get('RTX_GPUS', len(card.get('gpus', [0])))) == 2 else {tag}
                     env['CUTEAFD_WIP_MIMO_GEOMETRIES'] = ';'.join(sorted(set(env.get('CUTEAFD_WIP_MIMO_GEOMETRIES', '').split(';')) - {''} | wanted))
