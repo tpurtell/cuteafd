@@ -372,3 +372,32 @@ pub fn exl3_manifest(compact: &Value, projections: &[(String, usize, usize, usiz
 pub fn write_quantize_config(dir: &Path, manifest: &Value) {
     fs::write(dir.join("quantize_config.json"), serde_json::to_vec(manifest).unwrap()).unwrap();
 }
+
+pub fn write_v4_snapshot(path: &Path) {
+    // serve-dsv4 reads inference/config.json when the snapshot has one; so does the plan.
+    let hf = json!({"architectures": ["DeepseekV4ForCausalLM"], "model_type": "deepseek_v4"});
+    let mut ratios = vec![0, 0];
+    ratios.extend([4, 128, 4]);
+    let args = json!({
+        "vocab_size": 64, "dim": 4096, "moe_inter_dim": 2048, "n_layers": 4, "n_hash_layers": 1, "n_heads": 64,
+        "n_routed_experts": 256, "n_shared_experts": 1, "n_activated_experts": 6, "score_func": "sqrtsoftplus",
+        "route_scale": 1.5, "swiglu_limit": 10.0, "q_lora_rank": 1024, "head_dim": 512, "rope_head_dim": 64,
+        "o_groups": 8, "o_lora_rank": 1024, "window_size": 128, "original_seq_len": 65536, "rope_theta": 10000,
+        "rope_factor": 16, "beta_fast": 32, "beta_slow": 1, "index_n_heads": 64, "index_head_dim": 128,
+        "index_topk": 512, "hc_mult": 4, "hc_sinkhorn_iters": 20, "compress_rope_theta": 160000,
+        "compress_ratios": ratios[1..].to_vec()
+    });
+    let mut tensors = vec![t("embed.weight", "BF16", &[64, 4096])];
+    for layer in 0..4 {
+        for expert in 0..256 {
+            for (projection, rows, cols) in [("w1", 2048, 4096), ("w2", 4096, 2048), ("w3", 2048, 4096)] {
+                let name = format!("layers.{layer}.ffn.experts.{expert}.{projection}");
+                tensors.push(t(format!("{name}.weight"), "I8", &[rows, cols / 2]));
+                tensors.push(t(format!("{name}.scale"), "F8_E8M0", &[rows, cols / 32]));
+            }
+        }
+    }
+    write_snapshot(path, &hf, &tensors, None);
+    std::fs::create_dir_all(path.join("inference")).unwrap();
+    std::fs::write(path.join("inference/config.json"), serde_json::to_vec(&args).unwrap()).unwrap();
+}

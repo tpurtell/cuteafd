@@ -790,33 +790,10 @@ fn glm_and_qwen_patterns_follow_their_runtime_readers() {
     assert_eq!(spec.layers[0].rope, Some(spec::RopeSpec { dims: 64, theta: 8e6 }));
 }
 
+
 fn v4_snapshot() -> tempfile::TempDir {
-    // serve-dsv4 reads inference/config.json when the snapshot has one; so does the plan.
-    let hf = json!({"architectures": ["DeepseekV4ForCausalLM"], "model_type": "deepseek_v4"});
-    let mut ratios = vec![0, 0];
-    ratios.extend([4, 128, 4]);
-    let args = json!({
-        "vocab_size": 64, "dim": 4096, "moe_inter_dim": 2048, "n_layers": 4, "n_hash_layers": 1, "n_heads": 64,
-        "n_routed_experts": 256, "n_shared_experts": 1, "n_activated_experts": 6, "score_func": "sqrtsoftplus",
-        "route_scale": 1.5, "swiglu_limit": 10.0, "q_lora_rank": 1024, "head_dim": 512, "rope_head_dim": 64,
-        "o_groups": 8, "o_lora_rank": 1024, "window_size": 128, "original_seq_len": 65536, "rope_theta": 10000,
-        "rope_factor": 16, "beta_fast": 32, "beta_slow": 1, "index_n_heads": 64, "index_head_dim": 128,
-        "index_topk": 512, "hc_mult": 4, "hc_sinkhorn_iters": 20, "compress_rope_theta": 160000,
-        "compress_ratios": ratios[1..].to_vec()
-    });
-    let mut tensors = vec![t("embed.weight", "BF16", &[64, 4096])];
-    for layer in 0..4 {
-        for expert in 0..256 {
-            for (projection, rows, cols) in [("w1", 2048, 4096), ("w2", 4096, 2048), ("w3", 2048, 4096)] {
-                let name = format!("layers.{layer}.ffn.experts.{expert}.{projection}");
-                tensors.push(t(format!("{name}.weight"), "I8", &[rows, cols / 2]));
-                tensors.push(t(format!("{name}.scale"), "F8_E8M0", &[rows, cols / 32]));
-            }
-        }
-    }
-    let dir = snapshot(hf, &tensors);
-    std::fs::create_dir_all(dir.path().join("inference")).unwrap();
-    std::fs::write(dir.path().join("inference/config.json"), serde_json::to_vec(&args).unwrap()).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    write_v4_snapshot(dir.path());
     dir
 }
 
@@ -888,21 +865,23 @@ fn v4_missing_workspace_manifest_keeps_conservative_small_card_reserve() {
 }
 
 #[test]
-fn v4_explicit_pool_reduces_expert_placement_while_auto_preserves_legacy_policy() {
+fn v4_pool_first_defaults_and_explicit_layer_failure() {
     let dir = v4_snapshot();
-    let experts = |pool, local_expert_layers| {
-        let report = plan(dir.path(), &PlanOptions { layout: Some(layout::LayoutOptions {
-            rtx_bytes: vec![24 << 30], pool_tokens: Some(pool), local_expert_layers,
-            ..Default::default()
-        }), ..sparks(2) }).unwrap();
-        report.memory_layout.unwrap().devices[0].items.iter()
-            .filter(|i| i.group == "resident routed layers").map(|i| i.bytes).sum::<u64>()
-    };
-    let legacy = experts(262144, None);
-    assert!(legacy > 0);
-    assert_eq!(experts(0, None), legacy);
-    assert!(experts(16 * 1024 * 1024, None) < legacy);
-    assert_eq!(experts(262144, Some(2)), experts(16 * 1024 * 1024, Some(2)));
+    let solve = |bytes, pool_tokens, local_expert_layers| plan(dir.path(), &PlanOptions {
+        layout: Some(layout::LayoutOptions { rtx_bytes: vec![bytes], pool_tokens,
+            local_expert_layers, ..Default::default() }), ..sparks(2)
+    }).unwrap();
+    let large = solve(96 << 30, None, None);
+    assert_eq!(large.memory_layout.unwrap().pool_tokens, 2 << 20);
+    let small = solve(24 << 30, None, None);
+    assert_eq!(small.memory_layout.unwrap().pool_tokens, 1 << 20);
+    let explicit = solve(24 << 30, Some(262144), Some(2));
+    assert!(explicit.placement_supported);
+    assert_eq!(explicit.memory_layout.unwrap().pool_tokens, 262144);
+    let rejected = solve(16 << 30, Some(2 << 20), Some(4));
+    assert!(!rejected.placement_supported);
+    assert!(rejected.memory_layout.unwrap().notes.iter().any(|n|
+        n.contains("explicit local expert layers do not fit after reserving KV")));
 }
 
 #[test]
