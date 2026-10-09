@@ -1462,7 +1462,6 @@ fn graph_geometries(context: usize, pages: usize, dense: usize) -> Vec<GraphGeom
     let table = (table_pages as usize, table_pools as usize);
     let mut geometries = Vec::new();
     for units in 1..=context.div_ceil(UNIT_ROWS).min(pools) {
-        let (page_stride, pool_stride) = decode_strides(units * UNIT_PAGES, units, (pages, pools), table);
         let capacity = (units * UNIT_ROWS).min(context);
         let mut width = 1;
         while width / 2 * UNIT_ROWS < capacity {
@@ -1470,6 +1469,9 @@ fn graph_geometries(context: usize, pages: usize, dense: usize) -> Vec<GraphGeom
             let high = (width * UNIT_ROWS).min(capacity);
             for long in [false, true] {
                 if (!long && low <= high.min(dense)) || (long && low.max(dense + 1) <= high) {
+                    let live_units = crate::shared::context::decode_allocation_units(units, high, UNIT_ROWS);
+                    let (page_stride, pool_stride) = decode_strides(
+                        live_units * UNIT_PAGES, live_units, (pages, pools), table);
                     let geometry = GraphGeometry::keyed(width.min(pool_stride), page_stride, pool_stride, long);
                     if !geometries.contains(&geometry) { geometries.push(geometry); }
                 }
@@ -2609,9 +2611,11 @@ impl<'a> GlmfEngine<'a> {
         ensure!(rows > 0 && rows <= self.decode_rows && tokens.len() == rows,
             "decode step of {rows} rows (--decode-rows {})", self.decode_rows);
         // Power-of-two strides and widths bound the graphs a growing batch captures.
+        let live_tokens = sequences.iter().map(|(p, count)| p.len + count).max().unwrap_or(1);
+        let allocated = |n, unit| crate::shared::context::decode_allocation_units(n, live_tokens, unit);
         let (page_stride, pool_stride) = decode_strides(
-            sequences.iter().map(|(p, _)| p.pages.len()).max().unwrap_or(1),
-            sequences.iter().map(|(p, _)| p.pool_pages.len()).max().unwrap_or(1),
+            allocated(sequences.iter().map(|(p, _)| p.pages.len()).max().unwrap_or(1), PAGE_ROWS),
+            allocated(sequences.iter().map(|(p, _)| p.pool_pages.len()).max().unwrap_or(1), UNIT_ROWS),
             (self.pages, self.pool_pages), (self.table_pages, self.table_pool_pages));
         let mut tables = StepTables { decode: true, real_rows: rows, eager: eager || media.is_some() || trace.is_some() || on_layer.is_some(),
             page_stride, pool_stride, spec, ..Default::default() };
@@ -4311,6 +4315,36 @@ mod prefill_lane_tests {
         let scoring = glmf_step_workspaces(&cfg, 2, 4096, 64, &full, decode, prefill).device_bytes();
         assert_eq!(scoring - shared, (4096 - 64) * 154_880 * 4);
         assert_eq!(super::workspace_reserve_bytes(scoring, 2, false), scoring + 3 * super::WORKSPACE_RUNTIME_OVERHEAD_BYTES);
+    }
+
+    #[test]
+    fn million_token_graphs_add_only_three_long_geometries() {
+        use super::*;
+        let pages = 2_097_152 / PAGE_ROWS;
+        for (verify, expected) in [(64, 300), (128, 330)] {
+            let buckets = DecodeBuckets::new(verify);
+            let baseline = serving_graph_shapes(131_072, pages, 2051, 16, true, &buckets);
+            let extended = serving_graph_shapes(1_048_576, pages, 2051, 16, true, &buckets);
+            assert_eq!(extended.len(), expected);
+            assert!(baseline.iter().all(|key| extended.contains(key)));
+            for allocated in [131_072usize, 262_144, 524_288, 1_048_576] {
+                for live in [1usize, 8192, 131_072, 131_073, 200_000, 300_000, 600_000] {
+                    if live > allocated { continue; }
+                    let units = crate::shared::context::decode_allocation_units(
+                        allocated.div_ceil(UNIT_ROWS), live, UNIT_ROWS);
+                    let (page_stride, pool_stride) = decode_strides(units * UNIT_PAGES, units,
+                        (pages, pages / UNIT_PAGES), (16384, 4096));
+                    let geometry = GraphGeometry::keyed(live.div_ceil(UNIT_ROWS).next_power_of_two()
+                        .min(pool_stride), page_stride, pool_stride, live > 2051);
+                    for &(rows, spec, _) in &baseline {
+                        assert!(extended.contains(&(rows, spec, geometry)), "{allocated}/{live}/{geometry:?}");
+                    }
+                }
+            }
+            let reserves = serving_graph_reserve(1_048_576, 2_097_152, 2051, 16, true, 45, true, &buckets);
+            let old = serving_graph_reserve(131_072, 2_097_152, 2051, 16, true, 45, true, &buckets);
+            assert!(reserves.iter().zip(old).all(|(new, old)| new - old < (512 << 20)));
+        }
     }
 
     #[test]

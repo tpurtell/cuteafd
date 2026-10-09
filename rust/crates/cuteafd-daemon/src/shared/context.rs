@@ -35,9 +35,30 @@ pub(crate) fn pool_context(family: &str, context: usize, automatic: bool, pool: 
     Ok(supported)
 }
 
+/// Preserve the established short-context allocation buckets, but do not key a
+/// long decode by unused pages reserved beyond its live power-of-two bucket.
+pub(crate) fn decode_allocation_units(allocated: usize, live_tokens: usize, unit: usize) -> usize {
+    allocated.min(live_tokens.max(131_072).div_ceil(unit).next_power_of_two())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn long_decode_allocations_follow_live_geometric_buckets() {
+        for unit in [64, 256] {
+            for tokens in [1usize, 8192, 131072] {
+                for allocation in [1usize, 17, 131072 / unit] {
+                    assert_eq!(decode_allocation_units(allocation, tokens, unit), allocation);
+                }
+            }
+            for (tokens, bucket) in [(131073usize, 262144), (200000, 262144),
+                (300000, 524288), (600000, 1048576)] {
+                assert_eq!(decode_allocation_units(1048576 / unit, tokens, unit), bucket / unit);
+            }
+        }
+    }
 
     #[test]
     fn every_family_zero_resolves_checkpoint_context_and_explicit_wins() {
