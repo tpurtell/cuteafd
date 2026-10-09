@@ -233,18 +233,7 @@ pub(super) fn parse(
                 GatewayError::invalid("reasoning must be an object").with_param("reasoning")
             );
         }
-        turn.reasoning.effort = effort_update
-            .clone()
-            .or(optional_string(reasoning, "effort")?);
-        if let Some(effort) = &turn.reasoning.effort {
-            if !["none", "minimal", "low", "medium", "high", "xhigh", "max"]
-                .contains(&effort.as_str())
-            {
-                return Err(GatewayError::invalid("invalid reasoning effort")
-                    .with_param("reasoning.effort"));
-            }
-            turn.reasoning.enabled = Some(effort != "none");
-        }
+        turn.reasoning.effort = optional_string(reasoning, "effort")?;
         if let Some(s) = optional_string(reasoning, "summary")? {
             if !["auto", "concise", "detailed"].contains(&s.as_str()) {
                 return Err(GatewayError::invalid("invalid reasoning summary")
@@ -252,6 +241,16 @@ pub(super) fn parse(
             }
             summary = true;
         }
+    }
+    turn.reasoning.effort = effort_update.or(turn.reasoning.effort);
+    if let Some(effort) = &turn.reasoning.effort {
+        if !["none", "minimal", "low", "medium", "high", "xhigh", "max"].contains(&effort.as_str())
+        {
+            return Err(
+                GatewayError::invalid("invalid reasoning effort").with_param("reasoning.effort")
+            );
+        }
+        turn.reasoning.enabled = Some(effort != "none");
     }
     if let Some(text) = wire.get("text").filter(|v| !v.is_null()) {
         if !text.is_object() {
