@@ -1098,24 +1098,21 @@ impl Opened {
         if args.expert_input.bf16(true) && !args.expert_input.bf16(false) {
             warmups.push(warm(1, true)?);
         }
-        let warm_stream = self.library.cuda_stream_create()?;
+        // Drained and destroyed on every way out, before the transports drop.
+        let warm_stream = crate::shared::spark_intake::WarmStream::new(&*self.library)?;
         for request in &warmups {
             runtime.block_on(async {
                 let wave = transport.dispatch(request)?;
-                transport.receive(wave, request.header.row_count as usize, warm_stream).await
+                transport.receive(wave, request.header.row_count as usize, warm_stream.raw()).await
             })?;
         }
         for lane in &mut lane_links {
             runtime.block_on(async {
                 let wave = lane.dispatch(&warmups[0])?;
-                lane.receive(wave, warmups[0].header.row_count as usize, warm_stream).await
+                lane.receive(wave, warmups[0].header.row_count as usize, warm_stream.raw()).await
             })?;
         }
-        // SAFETY: the stream was created above; its waits drain before it goes.
-        unsafe {
-            self.library.cuda_stream_synchronize(warm_stream)?;
-            self.library.cuda_stream_destroy(warm_stream)?;
-        }
+        warm_stream.finish()?;
         tracing::info!(ranks = peers.len(), elapsed_ms = started.elapsed().as_millis() as u64, "Spark expert transport warm");
         Ok(Some(engine::Experts::Spark { transport: std::cell::RefCell::new(transport),
             lanes: lane_links.into_iter().map(std::cell::RefCell::new).collect(), runtime }))

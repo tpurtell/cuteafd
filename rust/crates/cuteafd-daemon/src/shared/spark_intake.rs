@@ -620,6 +620,174 @@ fn retain_before_enqueue<T>(held: &std::sync::Mutex<Vec<T>>, item: T,
     enqueue(held.last().expect("item was retained before enqueue"))
 }
 
+/// The stream calls a [`WarmStream`] makes (the native library's; a fake in tests).
+pub(crate) trait StreamLibrary {
+    fn create_stream(&self) -> Result<*mut c_void>;
+    /// # Safety
+    /// `stream` is a live stream this library created.
+    unsafe fn synchronize_stream(&self, stream: *mut c_void) -> Result<()>;
+    /// # Safety
+    /// `stream` is a live stream this library created; it is not used again.
+    unsafe fn destroy_stream(&self, stream: *mut c_void) -> Result<()>;
+}
+
+impl StreamLibrary for NativeLibrary {
+    fn create_stream(&self) -> Result<*mut c_void> {
+        self.cuda_stream_create()
+    }
+    unsafe fn synchronize_stream(&self, stream: *mut c_void) -> Result<()> {
+        // SAFETY: the caller vouches for the stream.
+        unsafe { self.cuda_stream_synchronize(stream) }
+    }
+    unsafe fn destroy_stream(&self, stream: *mut c_void) -> Result<()> {
+        // SAFETY: the caller vouches for the stream.
+        unsafe { self.cuda_stream_destroy(stream) }
+    }
+}
+
+/// The temporary stream a start-up Spark transport warm-up receives its waves on. [`Self::finish`]
+/// drains and destroys it and returns either failure; any other way out (an early return or `?`)
+/// drops it, which drains and destroys it too and logs failures. Declare it after the transports
+/// it serves, so that it drops first and their queued uploads drain while the intakes are alive.
+pub(crate) struct WarmStream<'a, L: StreamLibrary = NativeLibrary> {
+    library: &'a L,
+    raw: *mut c_void,
+}
+
+impl<'a, L: StreamLibrary> WarmStream<'a, L> {
+    pub(crate) fn new(library: &'a L) -> Result<Self> {
+        Ok(Self { library, raw: library.create_stream()? })
+    }
+
+    pub(crate) fn raw(&self) -> *mut c_void {
+        self.raw
+    }
+
+    /// Drains the stream, then destroys it, even when draining fails (that error comes first).
+    pub(crate) fn finish(self) -> Result<()> {
+        let this = std::mem::ManuallyDrop::new(self);
+        // SAFETY: the stream was created in `new`; `ManuallyDrop` keeps `drop` from destroying it again.
+        let drained = unsafe { this.library.synchronize_stream(this.raw) };
+        let destroyed = unsafe { this.library.destroy_stream(this.raw) };
+        drained.and(destroyed)
+    }
+}
+
+impl<L: StreamLibrary> Drop for WarmStream<'_, L> {
+    fn drop(&mut self) {
+        // SAFETY: the stream was created in `new`; `finish`, which destroys it, never drops the guard.
+        if let Err(error) = unsafe { self.library.synchronize_stream(self.raw) } {
+            tracing::error!(%error, "draining a Spark transport warm-up stream");
+        }
+        if let Err(error) = unsafe { self.library.destroy_stream(self.raw) } {
+            tracing::error!(%error, "destroying a Spark transport warm-up stream");
+        }
+    }
+}
+
+#[cfg(test)]
+mod warm_stream_tests {
+    use super::*;
+
+    /// Records every stream call; the calls named in `fail` return an error.
+    #[derive(Default)]
+    struct Fake { calls: RefCell<Vec<String>>, fail: Vec<&'static str> }
+    impl Fake {
+        fn call(&self, name: &'static str, stream: *mut c_void) -> Result<()> {
+            self.calls.borrow_mut().push(format!("{name} {:#x}", stream as usize));
+            ensure!(!self.fail.contains(&name), "injected {name} failure");
+            Ok(())
+        }
+        fn calls(&self) -> Vec<String> {
+            self.calls.borrow().clone()
+        }
+    }
+    impl StreamLibrary for Fake {
+        fn create_stream(&self) -> Result<*mut c_void> {
+            let stream = 0x5000 as *mut c_void;
+            self.call("create", stream)?;
+            Ok(stream)
+        }
+        unsafe fn synchronize_stream(&self, stream: *mut c_void) -> Result<()> {
+            self.call("synchronize", stream)
+        }
+        unsafe fn destroy_stream(&self, stream: *mut c_void) -> Result<()> {
+            self.call("destroy", stream)
+        }
+    }
+
+    /// The warm-ups' shape: create, receive `waves` on the stream (the one at `fail_at` fails), finish.
+    fn warm(library: &Fake, waves: usize, fail_at: Option<usize>) -> Result<()> {
+        let stream = WarmStream::new(library)?;
+        for wave in 0..waves {
+            library.call("receive", stream.raw())?;
+            ensure!(Some(wave) != fail_at, "wave {wave} failed");
+        }
+        stream.finish()
+    }
+
+    const ALL: [&str; 4] = ["create 0x5000", "receive 0x5000", "synchronize 0x5000", "destroy 0x5000"];
+
+    #[test]
+    fn an_early_return_drains_and_destroys_the_warm_up_stream() {
+        let library = Fake::default();
+        assert_eq!(warm(&library, 3, Some(1)).unwrap_err().to_string(), "wave 1 failed");
+        assert_eq!(library.calls(), [ALL[0], ALL[1], ALL[1], ALL[2], ALL[3]]);
+        // A failing call inside the loop (`?`) unwinds the same way.
+        let library = Fake { fail: vec!["receive"], ..Fake::default() };
+        assert_eq!(warm(&library, 3, None).unwrap_err().to_string(), "injected receive failure");
+        assert_eq!(library.calls(), ALL);
+    }
+
+    #[test]
+    fn finishing_drains_then_destroys_the_stream_once() {
+        let library = Fake::default();
+        warm(&library, 2, None).unwrap();
+        assert_eq!(library.calls(), [ALL[0], ALL[1], ALL[1], ALL[2], ALL[3]]);
+    }
+
+    #[test]
+    fn a_failed_drain_or_destroy_is_reported_and_the_stream_still_goes() {
+        for fail in ["synchronize", "destroy"] {
+            let library = Fake { fail: vec![fail], ..Fake::default() };
+            assert_eq!(warm(&library, 1, None).unwrap_err().to_string(), format!("injected {fail} failure"));
+            assert_eq!(library.calls(), ALL, "{fail}");
+        }
+        // Dropped on an early return, the guard logs a failed drain and still destroys the stream.
+        let library = Fake { fail: vec!["synchronize"], ..Fake::default() };
+        assert_eq!(warm(&library, 1, Some(0)).unwrap_err().to_string(), "wave 0 failed");
+        assert_eq!(library.calls(), ALL);
+    }
+
+    #[test]
+    fn a_stream_that_was_not_created_is_not_destroyed() {
+        let library = Fake { fail: vec!["create"], ..Fake::default() };
+        assert_eq!(warm(&library, 1, None).unwrap_err().to_string(), "injected create failure");
+        assert_eq!(library.calls(), [ALL[0]]);
+    }
+
+    /// GLM 5.3 Flash's and MiMo's start-up warm-ups hold their temporary stream in the guard, so
+    /// every way out of them destroys it, and neither handles a raw warm-up stream any more.
+    #[test]
+    fn the_spark_transport_warm_ups_hold_their_stream_in_the_guard() {
+        // The needles are joined here, so that this file's own text does not match them.
+        let created = ["let warm_stream = crate::shared::spark_intake::Warm", "Stream::new(&"].concat();
+        let finished = ["warm_stream.", "finish()?;"].concat();
+        for (family, source) in [("glm5_flash", include_str!("../families/glm5_flash/mod.rs")),
+            ("mimo_v2", include_str!("../families/mimo_v2/mod.rs"))] {
+            assert_eq!((source.matches(&created).count(), source.matches(&finished).count()), (1, 1), "{family}");
+            let (start, end) = (source.find(&created).unwrap(), source.find(&finished).unwrap());
+            assert!(start < end, "{family}");
+            let warm_up = &source[start..end];
+            assert!(warm_up.contains(&["warm_stream.", "raw()"].concat()), "{family}");
+            for raw in ["_create(", "_synchronize(", "_destroy("] {
+                assert!(!warm_up.contains(&["cuda_stream", raw].concat()), "{family}: {raw}");
+            }
+            assert!(!source.contains(&["(warm_", "stream)"].concat()), "{family}: a raw warm-up stream call");
+        }
+    }
+}
+
 #[cfg(test)]
 mod terminal_ownership_tests {
     use super::*;

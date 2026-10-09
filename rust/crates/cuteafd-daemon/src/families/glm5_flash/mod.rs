@@ -1729,18 +1729,15 @@ impl Opened {
         let rings = || cuteafd_ffi::memory_ledger::snapshot().by_scope(cuteafd_ffi::memory_ledger::Space::Pinned, -1)
             .get("transport/rdma-rings").copied().unwrap_or(0);
         let (started, before) = (Instant::now(), rings());
-        let warm_stream = self.library.cuda_stream_create()?;
+        // Drained and destroyed on every way out, before the transports drop.
+        let warm_stream = crate::shared::spark_intake::WarmStream::new(&self.library)?;
         for (index, transport) in transports[..warmed].iter_mut().enumerate() {
             runtime.block_on(async {
                 let wave = transport.dispatch(&warm)?;
-                transport.receive(wave, warm_rows, warm_stream).await
+                transport.receive(wave, warm_rows, warm_stream.raw()).await
             }).with_context(|| format!("warming Spark expert transport {index} with {warm_rows} rows"))?;
         }
-        // SAFETY: the stream was created above; its waits drain before it goes.
-        unsafe {
-            self.library.cuda_stream_synchronize(warm_stream)?;
-            self.library.cuda_stream_destroy(warm_stream)?;
-        }
+        warm_stream.finish()?;
         tracing::info!(transports = warmed, lanes = transports.len(), ranks = peers.len(), rows = warm_rows,
             ring_bytes = rings().saturating_sub(before), elapsed_ms = started.elapsed().as_millis() as u64,
             "Spark expert transports warm");
