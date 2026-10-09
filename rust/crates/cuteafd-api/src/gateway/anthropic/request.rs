@@ -121,7 +121,8 @@ pub(super) fn parse(value: &Value, require_max: bool) -> Result<(TurnRequest, bo
             .as_array()
             .ok_or_else(|| GatewayError::invalid("tools must be an array"))?
         {
-            let kind = tool.get("type").and_then(Value::as_str).unwrap_or("custom");
+            let kind = optional_string(tool, "type")?.unwrap_or_else(|| "custom".into());
+            let kind = kind.as_str();
             if kind.starts_with("web_search_") {
                 if turn.hosted.web_search.is_some() {
                     return Err(GatewayError::invalid(
@@ -144,12 +145,40 @@ pub(super) fn parse(value: &Value, require_max: bool) -> Result<(TurnRequest, bo
                 });
                 continue;
             }
-            let parameters = if kind == "custom" {
+            let mut parameters = if kind == "custom" {
                 object(tool, "input_schema")?
             } else {
                 client_schema(kind).ok_or_else(|| GatewayError::unsupported(format!("Input tag '{kind}': unsupported Anthropic tool type; supply a custom tool with input_schema")))?
             };
-            turn.tools.push(ToolSpec { name: string(tool, "name")?, description: optional_string(tool, "description")?.or_else(|| (kind != "custom").then(|| format!("Anthropic client tool {kind}; execute the requested command on the client."))), parameters, strict: boolean(tool, "strict")?.unwrap_or(false) });
+            let mut description = optional_string(tool, "description")?.or_else(|| (kind != "custom").then(|| format!("Anthropic client tool {kind}; execute the requested command on the client.")));
+            if kind.starts_with("computer_") {
+                let width = number(tool, "display_width_px")?
+                    .filter(|v| *v > 0)
+                    .ok_or_else(|| GatewayError::invalid("display_width_px must be positive"))?;
+                let height = number(tool, "display_height_px")?
+                    .filter(|v| *v > 0)
+                    .ok_or_else(|| GatewayError::invalid("display_height_px must be positive"))?;
+                let display = number(tool, "display_number")?;
+                let zoom = boolean(tool, "enable_zoom")?.unwrap_or(false);
+                if !zoom {
+                    if let Some(actions) = parameters["properties"]["action"]["enum"].as_array_mut()
+                    {
+                        actions.retain(|v| v != "zoom");
+                    }
+                    parameters["properties"]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("region");
+                }
+                let details = format!("Display: {width}x{height} pixels; display_number={display:?}; enable_zoom={zoom}. Coordinates are [x,y] pixels.");
+                description = Some(format!("{} {details}", description.unwrap_or_default()));
+            }
+            turn.tools.push(ToolSpec {
+                name: string(tool, "name")?,
+                description,
+                parameters,
+                strict: boolean(tool, "strict")?.unwrap_or(false),
+            });
         }
     }
     if let Some(choice) = value.get("tool_choice") {
@@ -229,8 +258,11 @@ fn float(v: &Value, key: &str) -> Result<Option<f32>, GatewayError> {
     v.get(key)
         .map(|n| {
             n.as_f64()
+                .filter(|n| (0.0..=1.0).contains(n))
                 .map(|n| n as f32)
-                .ok_or_else(|| GatewayError::invalid(format!("{key} must be a number")))
+                .ok_or_else(|| {
+                    GatewayError::invalid(format!("{key} must be a number between 0 and 1"))
+                })
         })
         .transpose()
 }
@@ -343,6 +375,13 @@ fn part(block: &Value) -> Result<Vec<Part>, GatewayError> {
                 out.extend(parts(content)?);
             }
             out
+        }
+        kind if matches!(kind, "input_audio" | "audio" | "video")
+            || kind.ends_with("tool_result") =>
+        {
+            return Err(GatewayError::unsupported(format!(
+                "content block {kind} is not supported"
+            )));
         }
         // Forward-compatible content such as container_upload/tool_reference is
         // not executable input. Preserve readable text if provided, otherwise skip.

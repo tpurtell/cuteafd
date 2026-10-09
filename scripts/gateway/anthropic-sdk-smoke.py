@@ -36,6 +36,14 @@ def main():
     lhs, rhs = message.model_dump(), nonstream.model_dump()
     lhs.pop("id"); rhs.pop("id")
     assert lhs == rhs, (lhs, rhs)
+    with client.messages.stream(**params) as stream:
+        partial = stream.get_final_message()
+    assert partial.stop_reason == "max_tokens"
+    assert partial.content[0].input == {"nested": {"x": 1}}
+    nonstream = client.messages.create(**params)
+    lhs, rhs = partial.model_dump(), nonstream.model_dump()
+    lhs.pop("id"); rhs.pop("id")
+    assert lhs == rhs, (lhs, rhs)
     assert client.messages.count_tokens(model=params["model"], messages=params["messages"]).input_tokens > 0
     models = client.models.list(limit=1)
     assert models.data[0].type == "model"

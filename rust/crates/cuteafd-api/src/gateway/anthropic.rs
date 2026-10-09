@@ -10,7 +10,7 @@ use axum::{
     routing::post,
     Json, Router,
 };
-use futures::StreamExt;
+use futures::{FutureExt, StreamExt};
 use serde_json::{json, Value};
 
 use super::{record::Tape, Gateway, GatewayError};
@@ -89,22 +89,24 @@ async fn messages(
                 .anthropic_response(),
         );
     }
-    // Starting errors remain HTTP errors. The first actual event is not buffered
-    // beyond this check; subsequent errors are Anthropic SSE error frames.
-    let first = match stream.next().await {
-        Some(Ok(event)) => event,
-        Some(Err(error)) => return with_request_id(error.anthropic_response()),
-        None => {
+    // Catch an immediately available stream rejection without waiting for a
+    // model token: a thinking pause must still receive message_start and pings.
+    // Backend::start owns asynchronous HTTP/preflight failures.
+    let first = match stream.next().now_or_never() {
+        Some(Some(Ok(event))) => Some(event),
+        Some(Some(Err(error))) => return with_request_id(error.anthropic_response()),
+        Some(None) => {
             return with_request_id(
                 GatewayError::upstream("backend stream ended without a stop reason")
                     .anthropic_response(),
             )
         }
+        None => None,
     };
     let frames = async_stream::stream! {
         yield Ok::<_, Infallible>(sse(renderer.start()));
         yield Ok(sse(json!({"type":"ping"})));
-        let mut pending = Some(first);
+        let mut pending = first;
         loop {
             let next = if let Some(event) = pending.take() { Some(Ok(event)) } else {
                 // Keep the same pending read alive when a ping is due, so dropping

@@ -60,7 +60,7 @@ impl Renderer {
         let content: Vec<Value> = self.slots.iter().map(|slot| match &slot.block {
             Block::Thinking { text, signature } => json!({"type":"thinking","thinking":text,"signature":signature}),
             Block::Text(text) => json!({"type":"text","text":text}),
-            Block::Tool { id, name, arguments } => json!({"type":"tool_use","id":id,"name":name,"input":serde_json::from_str::<Value>(arguments).unwrap_or_else(|_| json!({}))}),
+            Block::Tool { id, name, arguments } => json!({"type":"tool_use","id":id,"name":name,"input":tool_input(arguments, matches!(self.stop, Some(StopReason::MaxTokens))).unwrap_or_else(|_| json!({}))}),
             Block::Fixed(value) => value.clone(),
         }).collect();
         let (stop_reason, stop_sequence) = stop(self.stop.as_ref());
@@ -98,11 +98,6 @@ impl Renderer {
                 frames.push(delta(
                     index,
                     json!({"type":"input_json_delta","partial_json":"{}"}),
-                ));
-            }
-            if !serde_json::from_str::<Value>(arguments).is_ok_and(|v| v.is_object()) {
-                return Err(GatewayError::upstream(
-                    "backend tool input must be a valid JSON object",
                 ));
             }
         }
@@ -268,6 +263,13 @@ impl Renderer {
                 for index in 0..self.slots.len() {
                     self.close(index, &mut frames)?;
                 }
+                // ToolCallEnd does not imply complete JSON: a token cap may
+                // truncate the call. Match the official SDK's partial parser.
+                for slot in &self.slots {
+                    if let Block::Tool { arguments, .. } = &slot.block {
+                        tool_input(arguments, matches!(reason, StopReason::MaxTokens))?;
+                    }
+                }
                 let (stop_reason, stop_sequence) = stop(Some(&reason));
                 frames.push(json!({"type":"message_delta","delta":{"stop_reason":stop_reason,"stop_sequence":stop_sequence},"usage":usage(self.usage)}));
                 frames.push(json!({"type":"message_stop"}));
@@ -275,6 +277,35 @@ impl Renderer {
             }
         }
         Ok(frames)
+    }
+}
+pub(super) fn tool_input(arguments: &str, partial: bool) -> Result<Value, GatewayError> {
+    let value = if partial {
+        jiter::JsonValue::parse_with_config(arguments.as_bytes(), false, jiter::PartialMode::On)
+            .map(|v| partial_value(&v))
+            .map_err(|_| ())
+    } else {
+        serde_json::from_str(arguments).map_err(|_| ())
+    };
+    value
+        .ok()
+        .filter(Value::is_object)
+        .ok_or_else(|| GatewayError::upstream("backend tool input must be a valid JSON object"))
+}
+fn partial_value(value: &jiter::JsonValue<'_>) -> Value {
+    use jiter::JsonValue as J;
+    match value {
+        J::Null => Value::Null,
+        J::Bool(v) => json!(v),
+        J::Int(v) => json!(v),
+        J::Float(v) => json!(v),
+        J::Str(v) => json!(v),
+        J::Array(v) => Value::Array(v.iter().map(partial_value).collect()),
+        J::Object(v) => Value::Object(
+            v.iter()
+                .map(|(key, v)| (key.to_string(), partial_value(v)))
+                .collect(),
+        ),
     }
 }
 fn delta(index: usize, delta: Value) -> Value {
@@ -302,7 +333,11 @@ fn stop(reason: Option<&StopReason>) -> (Option<&'static str>, Option<&str>) {
     }
 }
 fn usage(usage: Usage) -> Value {
-    json!({"input_tokens":usage.input_tokens,"output_tokens":usage.output_tokens,
+    let uncached = usage
+        .input_tokens
+        .saturating_sub(usage.cached_input_tokens)
+        .saturating_sub(usage.cache_creation_input_tokens);
+    json!({"input_tokens":uncached,"output_tokens":usage.output_tokens,
         "cache_creation_input_tokens":usage.cache_creation_input_tokens,"cache_read_input_tokens":usage.cached_input_tokens,
         "server_tool_use":{"web_search_requests":usage.web_search_requests},"service_tier":"standard"})
 }

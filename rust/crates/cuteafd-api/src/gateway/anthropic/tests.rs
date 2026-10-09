@@ -118,6 +118,7 @@ async fn text_sse_golden_and_json_equivalence() {
     let mut folded = fold(&events);
     folded["id"] = message["id"].clone();
     assert_eq!(message, folded);
+    assert_eq!(message["usage"]["input_tokens"], 10);
     assert_eq!(message["usage"]["cache_creation_input_tokens"], 3);
     assert_eq!(message["usage"]["cache_read_input_tokens"], 4);
 }
@@ -330,7 +331,7 @@ fn tool_definitions_and_unknown_server_tools() {
         "computer_20251124",
     ] {
         let mut value = prompt(false);
-        value["tools"] = json!([{"type":kind,"name":"client"}]);
+        value["tools"] = json!([{"type":kind,"name":"client","display_width_px":1920,"display_height_px":1080,"display_number":1}]);
         assert!(super::request::parse(&value, true).unwrap().0.tools[0]
             .parameters
             .is_object());
@@ -368,6 +369,89 @@ fn tool_definitions_and_unknown_server_tools() {
         let mut value = prompt(false);
         value["thinking"] = json!({"type":mode});
         assert!(super::request::parse(&value, true).is_ok());
+    }
+}
+
+#[test]
+fn request_bounds_computer_metadata_and_unsupported_content() {
+    for (key, invalid) in [
+        ("temperature", json!(-0.1)),
+        ("temperature", json!(1e100)),
+        ("top_p", json!(1.1)),
+        ("top_k", json!(-1)),
+    ] {
+        let mut value = prompt(false);
+        value[key] = invalid;
+        assert!(super::request::parse(&value, true)
+            .unwrap_err()
+            .message
+            .contains(key));
+    }
+    let mut value = prompt(false);
+    value["max_tokens"] = json!(0);
+    assert!(super::request::parse(&value, true).is_ok());
+    value["tools"] = json!([{"type":"computer_20251124","name":"computer","display_width_px":1920,"display_height_px":1080,"display_number":1}]);
+    for enabled in [false, true] {
+        value["tools"][0]["enable_zoom"] = json!(enabled);
+        let tool = super::request::parse(&value, true)
+            .unwrap()
+            .0
+            .tools
+            .remove(0);
+        assert!(tool.description.unwrap().contains("1920x1080"));
+        assert_eq!(
+            tool.parameters["properties"]["action"]["enum"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("zoom")),
+            enabled
+        );
+    }
+    for kind in ["input_audio", "audio", "code_execution_tool_result"] {
+        let mut value = prompt(false);
+        value["messages"][0]["content"] = json!([{"type":kind,"data":"opaque"}]);
+        assert!(super::request::parse(&value, true)
+            .unwrap_err()
+            .message
+            .contains(kind));
+    }
+}
+
+#[tokio::test]
+async fn truncated_tools_preserve_max_tokens_and_partial_object() {
+    for arguments in [
+        "{\"x\":",
+        "{\"x\":1,\"unfinished\":\"abc",
+        "{\"nested\":{\"x\":1",
+        "{\"items\":[1,2,",
+    ] {
+        let expected = super::render::tool_input(arguments, true).unwrap();
+        let script = vec![
+            TurnEvent::ToolCallStart {
+                index: 0,
+                id: "a".into(),
+                name: "f".into(),
+            },
+            TurnEvent::ToolCallDelta {
+                index: 0,
+                arguments: arguments.into(),
+            },
+            TurnEvent::ToolCallEnd { index: 0 },
+            done(StopReason::MaxTokens),
+        ];
+        let (app, _) = router(vec![script.clone(), script]);
+        let (status, _, body) = wire(app.clone(), request(prompt(false))).await;
+        assert_eq!(status, StatusCode::OK);
+        let message: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(message["stop_reason"], "max_tokens");
+        assert_eq!(message["content"][0]["input"], expected);
+        let (_, _, body) = wire(app, request(prompt(true))).await;
+        let events = frames(&body);
+        assert_eq!(
+            events[events.len() - 2]["delta"]["stop_reason"],
+            "max_tokens"
+        );
+        assert_eq!(events.last().unwrap()["type"], "message_stop");
     }
 }
 
@@ -432,6 +516,108 @@ async fn errors_before_first_event_and_mid_stream() {
     let (app, _) = router(vec![]);
     let (status, _, _) = wire(app, request(prompt(true))).await;
     assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+}
+
+#[tokio::test]
+async fn initial_silence_keeps_stream_live_and_drop_cancels() {
+    use futures::StreamExt;
+    use gateway::backend::{Backend, BackendCapabilities, ModelInfo, TurnStream};
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Mutex,
+    };
+    use std::time::Duration;
+
+    struct Cancel(Arc<AtomicBool>);
+    impl Drop for Cancel {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+    struct Delayed {
+        release: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+        cancelled: Arc<AtomicBool>,
+    }
+    impl Backend for Delayed {
+        fn name(&self) -> &str {
+            "delayed"
+        }
+        fn capabilities(&self) -> BackendCapabilities {
+            BackendCapabilities::default()
+        }
+        fn models(&self) -> Vec<ModelInfo> {
+            Vec::new()
+        }
+        fn start(&self, _: TurnRequest) -> BoxFuture<'static, Result<TurnStream, GatewayError>> {
+            let release = self.release.lock().unwrap().take().unwrap();
+            let cancel = Cancel(self.cancelled.clone());
+            Box::pin(async move {
+                let stream: TurnStream = Box::pin(async_stream::stream! {
+                    let _cancel = cancel;
+                    let _ = release.await;
+                    yield Ok(text("after silence"));
+                    yield Ok(done(StopReason::EndTurn));
+                });
+                Ok(stream)
+            })
+        }
+        fn count_tokens(&self, _: TurnRequest) -> BoxFuture<'static, Result<u32, GatewayError>> {
+            Box::pin(async { Ok(1) })
+        }
+    }
+    for complete in [true, false] {
+        let (release, receiver) = tokio::sync::oneshot::channel();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let backend = Delayed {
+            release: Mutex::new(Some(receiver)),
+            cancelled: cancelled.clone(),
+        };
+        let mut models = ModelMap::single("served-model");
+        models.accept_any = true;
+        let app = gateway::router(Arc::new(Gateway::new(Arc::new(backend), models)));
+        let response =
+            tokio::time::timeout(Duration::from_secs(1), app.oneshot(request(prompt(true))))
+                .await
+                .expect("headers must not wait for a model token")
+                .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let mut body = response.into_body().into_data_stream();
+        for kind in ["message_start", "ping"] {
+            let bytes = tokio::time::timeout(Duration::from_secs(1), body.next())
+                .await
+                .expect("initial frames must not wait for a model token")
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                frames(std::str::from_utf8(&bytes).unwrap())[0]["type"],
+                kind
+            );
+        }
+        if complete {
+            let bytes = tokio::time::timeout(Duration::from_secs(17), body.next())
+                .await
+                .expect("silent backend must receive a keepalive")
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                frames(std::str::from_utf8(&bytes).unwrap())[0]["type"],
+                "ping"
+            );
+            release.send(()).unwrap();
+            let mut remaining = String::new();
+            while let Some(bytes) = body.next().await {
+                remaining.push_str(std::str::from_utf8(&bytes.unwrap()).unwrap());
+            }
+            let events = frames(&remaining);
+            assert_eq!(events[1]["delta"]["text"], "after silence");
+            assert_eq!(events.last().unwrap()["type"], "message_stop");
+        }
+        drop(body);
+        assert!(
+            cancelled.load(Ordering::SeqCst),
+            "dropping the response must cancel the backend"
+        );
+    }
 }
 
 #[tokio::test]
@@ -501,7 +687,20 @@ async fn scripted_sdk_smoke() {
         },
         done(StopReason::ToolUse),
     ];
-    let (app, _) = router(vec![script.clone(), script]);
+    let truncated = vec![
+        TurnEvent::ToolCallStart {
+            index: 0,
+            id: "partial".into(),
+            name: "f".into(),
+        },
+        TurnEvent::ToolCallDelta {
+            index: 0,
+            arguments: "{\"nested\":{\"x\":1},\"unfinished\":\"abc".into(),
+        },
+        TurnEvent::ToolCallEnd { index: 0 },
+        done(StopReason::MaxTokens),
+    ];
+    let (app, _) = router(vec![script.clone(), script, truncated.clone(), truncated]);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let server = tokio::spawn(async { axum::serve(listener, app).await.unwrap() });
