@@ -56,7 +56,22 @@ async def exercise(client, mode, capture_dir, context, cert):
                "tool_result_received": False, "audio_bytes": 0}
     event_id = 0
     response_id = 0
-    session = {"id": "sess_mock", "object": "realtime.session", "type": "realtime", "model": "default"}
+    session = {"id": "sess_mock", "object": "realtime.session", "type": "realtime", "model": "default",
+               "audio": {"input": {"format": {"type": "audio/pcm", "rate": 24000},
+                                   "transcription": None,
+                                   "turn_detection": {"type": "server_vad", "threshold": 0.5,
+                                                      "prefix_padding_ms": 300, "silence_duration_ms": 500,
+                                                      "create_response": True, "interrupt_response": True}}}}
+    capture["automatic_audio_commits"] = 0
+    capture["explicit_audio_commits"] = 0
+
+    def merge_session(target, update):
+        # Omission keeps existing defaults; explicit null disables a setting.
+        for key, value in update.items():
+            if isinstance(value, dict) and isinstance(target.get(key), dict):
+                merge_session(target[key], value)
+            else:
+                target[key] = value
 
     async def handler(ws):
         nonlocal event_id, response_id
@@ -98,7 +113,8 @@ async def exercise(client, mode, capture_dir, context, cert):
                 capture["first_frames"].append(sanitize(frame, credential))
                 capture["first_frames_raw"].append(sanitize(raw, credential))
             if frame["type"] == "session.update":
-                session.update(frame["session"])
+                merge_session(session, frame["session"])
+                capture["effective_session"] = sanitize(session, credential)
                 await emit("session.updated", session=session)
             elif frame["type"] == "conversation.item.create":
                 item = frame["item"]
@@ -108,7 +124,7 @@ async def exercise(client, mode, capture_dir, context, cert):
                     assert item["call_id"] == "call_mock"
                     assert json.loads(item["output"]) == {"time": "2000-01-01T00:00:00Z"}
                     capture["tool_result_received"] = True
-                await emit("conversation.item.added" if client == "pipecat" else "conversation.item.created",
+                await emit("conversation.item.added" if client.startswith("pipecat") else "conversation.item.created",
                            item=item, previous_item_id=None)
             elif frame["type"] == "response.create":
                 if mode == "error":
@@ -151,8 +167,11 @@ async def exercise(client, mode, capture_dir, context, cert):
                 pcm = base64.b64decode(frame["audio"], validate=True)
                 assert pcm == bytes(12000)
                 capture["audio_bytes"] += len(pcm)
+                # This mock accepts only silence. Even with server_vad enabled,
+                # no speech onset/end means no automatic commit or response.
             elif frame["type"] == "input_audio_buffer.commit":
                 assert capture["audio_bytes"] == 12000
+                capture["explicit_audio_commits"] += 1
                 await emit("input_audio_buffer.committed", item_id="audio_mock", previous_item_id=None)
             else:
                 raise AssertionError(f"Unexpected client frame {frame['type']}")
@@ -162,9 +181,11 @@ async def exercise(client, mode, capture_dir, context, cert):
                      subprotocols=["realtime"] if client == "openai-node-native" else None) as server:
         port = server.sockets[0].getsockname()[1]
         url = f"{'wss' if tls else 'ws'}://127.0.0.1:{port}/v1/realtime"
-        if client in ("agents-python", "pipecat"):
-            script = "pipecat-client" if client == "pipecat" else client
+        if client == "agents-python" or client.startswith("pipecat"):
+            script = "pipecat-client" if client.startswith("pipecat") else client
             cmd = [sys.executable, str(HERE / f"{script}.py")]
+            if client == "pipecat-nulls":
+                cmd += ["--preserve-nulls"]
         elif client.startswith("openai-python"):
             cmd = [sys.executable, str(HERE / "openai-python.py")]
             if client.endswith("beta"):
@@ -194,6 +215,19 @@ async def exercise(client, mode, capture_dir, context, cert):
             assert proc.returncode == 0, capture["stderr"]
             assert capture["tool_result_received"]
             assert capture["audio_bytes"] == 12000
+            if client.startswith("pipecat"):
+                first_input = capture["first_frames"][0]["session"]["audio"]["input"]
+                effective = capture["effective_session"]["audio"]["input"]
+                if client == "pipecat":
+                    assert "turn_detection" not in first_input and "transcription" not in first_input
+                    assert "tracing" not in capture["first_frames"][0]["session"]
+                    assert effective["turn_detection"]["type"] == "server_vad"
+                else:
+                    assert first_input["turn_detection"] is None and effective["turn_detection"] is None
+                assert capture["explicit_audio_commits"] == 1
+                assert capture["automatic_audio_commits"] == 0
+                types = capture["frame_types"]
+                assert types.index("input_audio_buffer.commit") < types.index("conversation.item.create")
         else:
             assert proc.returncode != 0, f"{client} accepted {mode}"
         print(f"PASS {client}/{mode}", flush=True)
@@ -216,7 +250,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--capture-dir", required=True)
     parser.add_argument("--clients", nargs="+", default=["openai-python", "openai-python-beta", "openai-node",
-                        "openai-node-native", "agents-js", "agents-python", "pipecat"])
+                        "openai-node-native", "agents-js", "agents-python", "pipecat", "pipecat-nulls"])
     parser.add_argument("--modes", nargs="+", default=["success", "error", "failed-response", "malformed",
                         "disconnect", "missing-tool", "timeout"])
     asyncio.run(main(parser.parse_args()))

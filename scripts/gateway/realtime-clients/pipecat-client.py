@@ -7,8 +7,11 @@ CUTEAFD_GATEWAY_KEY=<local-key> "$SCRATCH/venv/bin/python" pipecat-client.py
 --key names an environment variable. No audio devices or hosted bootstrap.
 A real pipeline/assistant context aggregator executes get_time and feeds its
 result back to the service. Synthetic audio enters as InputAudioRawFrame.
-Pipecat drops None session fields when serializing; the observing subclass
-preserves explicit VAD/transcription/tracing nulls for this manual-input gate.
+Default mode inherits stock Pipecat serialization: VAD/transcription/tracing
+None fields are omitted. --preserve-nulls selects the separate manual-input
+subclass that retains these nulls. Both send silent audio and an explicit commit
+before the text/tool scenario; silence does not trigger server VAD auto-commit.
+Stock mode checks that session.updated retains the server_vad default.
 Its typed tool_choice accepts required, not a named function; only get_time is
 exposed, so required forces that tool. The initial empty context adds one warmup
 response before the scenario. No SDK transport/parser/tool executor is replaced.
@@ -44,17 +47,6 @@ async def run(a):
         return event
 
     class ObservedService(OpenAIRealtimeLLMService):
-        async def send_client_event(self, event):
-            if isinstance(event, events.SessionUpdateEvent):
-                # Pipecat drops explicit None via exclude_none; preserve the
-                # GA nulls needed to disable VAD/transcription for manual audio.
-                payload = event.model_dump(exclude_none=True)
-                payload["session"]["audio"]["input"].update(turn_detection=None, transcription=None)
-                payload["session"]["tracing"] = None
-                await self._ws_send(payload)
-            else:
-                await super().send_client_event(event)
-
         async def _receive_task_handler(self):
             try:
                 await super()._receive_task_handler()
@@ -66,7 +58,19 @@ async def run(a):
         async def push_error(self, *args, **kwargs):
             inbox.fail()
 
-    service = ObservedService(base_url=a.url, api_key=os.environ[a.key_env], start_audio_paused=False,
+    class NullPreservingService(ObservedService):
+        async def send_client_event(self, event):
+            if isinstance(event, events.SessionUpdateEvent):
+                # Opt-in manual-input mode; stock mode inherits the serializer.
+                payload = event.model_dump(exclude_none=True)
+                payload["session"]["audio"]["input"].update(turn_detection=None, transcription=None)
+                payload["session"]["tracing"] = None
+                await self._ws_send(payload)
+            else:
+                await super().send_client_event(event)
+
+    service_type = NullPreservingService if a.preserve_nulls else ObservedService
+    service = service_type(base_url=a.url, api_key=os.environ[a.key_env], start_audio_paused=False,
         settings=OpenAIRealtimeLLMSettings(model=a.model, session_properties=events.SessionProperties(
             output_modalities=["text"], tools=[TOOL], tool_choice="auto",
             audio=events.AudioConfiguration(input=events.AudioInput(
@@ -87,7 +91,10 @@ async def run(a):
     events.parse_server_event = observe
     running = asyncio.create_task(driver.run(task))
     try:
-        await inbox.until("session.updated")
+        updated = await inbox.until("session.updated")
+        input_config = updated["session"].get("audio", {}).get("input", {})
+        if not a.preserve_nulls and input_config.get("turn_detection", {}).get("type") != "server_vad":
+            raise RuntimeError("stock serializer did not retain server VAD default")
         # Empty initial context triggers a response; wait for it before the scenario.
         await task.queue_frame(LLMContextFrame(context))
         await inbox.until("response.done")
@@ -106,7 +113,7 @@ async def run(a):
             await service.process_frame(InputAudioRawFrame(audio=pcm, sample_rate=24000, num_channels=1),
                                         FrameDirection.DOWNSTREAM)
             await service.send_client_event(events.InputAudioBufferCommitEvent())
-        await scenario(send, inbox, a, lambda: executed, audio)
+        await scenario(send, inbox, a, lambda: executed, audio, audio_first=True)
     finally:
         await task.cancel()
         await asyncio.gather(running, return_exceptions=True)
@@ -114,4 +121,4 @@ async def run(a):
 
 
 if __name__ == "__main__":
-    main("pipecat", run)
+    main("pipecat", run, lambda parser: parser.add_argument("--preserve-nulls", action="store_true"))

@@ -11,13 +11,15 @@ TOOL = {"type": "function", "name": "get_time", "description": "Return a fixed t
 TIME = {"time": "2000-01-01T00:00:00Z"}
 
 
-def options():
+def options(configure=None):
     p = argparse.ArgumentParser()
     p.add_argument("--url", required=True)
     p.add_argument("--model", default="default")
     p.add_argument("--key", "--key-env", dest="key_env", default="CUTEAFD_GATEWAY_KEY")
     p.add_argument("--timeout", type=float, default=30)
     p.add_argument("--skip-audio", action="store_true")
+    if configure:
+        configure(p)
     a = p.parse_args()
     u = urlsplit(a.url)
     if (u.scheme not in ("ws", "wss") or not u.hostname or u.username or u.password
@@ -59,11 +61,14 @@ class Inbox:
                 return e
 
 
-async def scenario(send, inbox, a, executed, audio):
+async def scenario(send, inbox, a, executed, audio, *, audio_first=False):
     async def user(text):
         await send({"type": "conversation.item.create", "item": {"type": "message", "role": "user",
                     "content": [{"type": "input_text", "text": text}]}})
 
+    if audio_first and not a.skip_audio:
+        await audio(bytes(12000))
+        await inbox.until("input_audio_buffer.committed")
     await user("Say hello in one short sentence.")
     await send({"type": "response.create", "response": {"tool_choice": "none"}})
     text = await inbox.until("response.done")
@@ -80,13 +85,13 @@ async def scenario(send, inbox, a, executed, audio):
     final = await inbox.until("response.done")
     if executed() != 1 or not any(i.get("type") == "message" for i in final["response"].get("output", [])):
         raise RuntimeError("framework did not execute tool and return text")
-    if not a.skip_audio:
+    if not audio_first and not a.skip_audio:
         await audio(bytes(12000))
         await inbox.until("input_audio_buffer.committed")
 
 
-def main(label, run):
-    a = options()
+def main(label, run, configure=None):
+    a = options(configure)
     try:
         asyncio.run(asyncio.wait_for(run(a), a.timeout))
         print(f"PASS {label}", flush=True)
