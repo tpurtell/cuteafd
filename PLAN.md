@@ -1762,6 +1762,15 @@ TJ: two key items, both urgent right after v2.0.0.
    - **Attention handling.** Use the head split where it pays (measured: V4
      decode -10/-12%, MiMo Pro -41% coordinator-only, GLM 5.3 -9.5%). Add
      Qwen's head split. V4.1's choice is settled by item 2.
+   - **Per-layer GPU ownership (TJ, 2026-10-09).** The layer-range split
+     (an RTX owns a contiguous layer range: attention, KV and that layer's
+     work, one hidden-state hop at the boundary) is a general capability for
+     every family, not V4.1-only; TJ has used it productively for GLM Flash.
+     It composes with the head split per layer: the solver assigns each layer
+     `Whole(gpu)` or `HeadSplit` by attention type and measurement (e.g.
+     head-split full MLA/GQA layers, whole KDA/SWA layers on one GPU). KV
+     follows ownership; layer ownership is a memory-balancing lever alongside
+     TP2 experts.
    - **Memory management.** One admission solver for every family:
      - reserve the KV pool first (2M PRO / 1M <=32 GB);
      - then graphs and workspaces;
