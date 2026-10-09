@@ -140,7 +140,7 @@ pub fn unavailable(model: &str) -> Option<String> {
 fn base_model(model: &str) -> Option<&'static str> {
     // Served IDs may retain the HF namespace or its cache-directory spelling.
     let name = model.rsplit('/').next()?.rsplit("--").next()?;
-    for base in ["Qwen3.8-Flash-Next", "GLM-5.3-Flash", "DeepSeek-V4-Flash-0731", "DeepSeek-V4-Pro-0813", "GLM-5.3"] {
+    for base in ["Qwen3.8-Flash-Next", "GLM-5.3-Flash", "DeepSeek-V4.1-Flash", "DeepSeek-V4-Flash-0731", "DeepSeek-V4-Pro-0813", "GLM-5.3"] {
         if name == base || name.strip_prefix(base).is_some_and(|suffix|
             suffix.starts_with('-') && !(base == "GLM-5.3" && suffix.starts_with("-Flash")) && !suffix.to_ascii_lowercase().contains("speculator")
                 && !suffix.to_ascii_lowercase().contains("dflash")) {
@@ -161,10 +161,10 @@ pub fn default_publication(model: &str) -> Option<(&'static str, &'static str)> 
         Some("DeepSeek-V4-Flash-0731") => return Some((V4FLASH_REVISION, V4FLASH_CONFIG)),
         Some("DeepSeek-V4-Pro-0813") => return Some((V4PRO_REVISION, V4PRO_CONFIG)),
         Some("GLM-5.3") => return Some((GLM_REVISION, GLM_CONFIG)),
+        Some("DeepSeek-V4.1-Flash") => return Some((REVISION, CONFIG)),
         _ => {},
     }
     match model {
-        "deepseek-ai/DeepSeek-V4.1-Flash" => Some((REVISION, CONFIG)),
         "XiaomiMiMo/MiMo-V2.6-Flash-MOPD" => Some((FLASH_REVISION, FLASH_CONFIG)),
         "XiaomiMiMo/MiMo-V2.6-Pro-MOPD" => Some((MIMO_PRO_REVISION, MIMO_PRO_CONFIG)),
         _ => None,
@@ -354,6 +354,14 @@ mod tests {
         assert!(ensure_valid_publication(REPOSITORY, FLASH_REVISION, RETIRED_FLASH_CONFIG).is_err());
         assert!(unavailable("XiaomiMiMo/MiMo-V2.6-Pro-RL").is_some());
         assert!(unavailable("zai-org/GLM-5.3-Flashlight").is_some());
+        for quant in ["deepseek-ai/DeepSeek-V4.1-Flash", "nvidia/DeepSeek-V4.1-Flash-NVFP4",
+            "nvidia--DeepSeek-V4.1-Flash-NVFP4", "wrldsuksgo2mars/DeepSeek-V4.1-Flash-EXL3-K3.25-v1"] {
+            assert_eq!(default_publication(quant), Some((REVISION, CONFIG)), "{quant}");
+        }
+        for other in ["deepseek-ai/DeepSeek-V4.1-Flashlight", "deepseek-ai/DeepSeek-V4.1",
+            "other/DeepSeek-V4.1-Flash-speculator", "other/DeepSeek-V4.1-Flash-DFlash2"] {
+            assert!(unavailable(other).is_some(), "{other}");
+        }
     }
 
     #[test]
