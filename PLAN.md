@@ -1800,6 +1800,7 @@ TJ: two key items, both urgent right after v2.0.0.
        (`v4_workspace.rs` ~99-120) together, keeping the unsplit target
        family for dSpark in split mode; planner-only filtering is unsafe.
        Audit the other families for the same union.
+   - **Design:** "v3 placement: design" below.
    - **Starting point:** work/v4-placement b2f26af9 (pool-first solver,
      planner/runtime equality) and `builds/v4-placement/SUMMARY.md` (V4 TP2
      design and kernel/loader audit). V4 Flash/Pro measured in rc1:
@@ -2385,6 +2386,602 @@ The default stays share 0 through the static bypass.
    vs DFlash ~99.5%). Becomes shared machinery as an acceptance-gated copy
    inside the shared draft policy (copy only when its span beats the neural
    draft), with the per-drafter calibration work; opt-in until it wins.
+
+## v3 placement: design (2026-10-09)
+
+Design for v3 item 1 (and item 4), written before implementation. Nothing here
+ran on hardware. Numbers are CPU `cuteafd plan --layout` runs on origin/work/p0
+3af226db (debug build, sparknest snapshots, default flags, no PROGRAMS.json),
+plus arithmetic over the planner's items. Scripts and JSON:
+`builds/v3-placement-design/` (`sweep.sh`, `project.py`, `sweep/`). The code
+audits behind the tables are Sol reports relayed in this design's branch
+report; file:line citations are at 3af226db..2a758f74.
+
+### What the audits and planner runs found
+- **Head-split engines carry a replicated hidden state.** V4, GLM 5.3, GLM
+  Flash and MiMo sum the two attention partials in the same order on both
+  GPUs, so the post-attention normalized input matches bitwise. Each layer
+  has one FFN exchange slot (`4*lane + 2*(L%2) + 1`, BF16 `[T,H]`). V4, GLM 5.3
+  and GLM Flash already exchange rank 1's shared/dense half there: a rank-1
+  routed half fits into `peer_front` (V4), `peer_attention`/`peer_segment`
+  (GLM 5.3) or `w1.shared` before the push (GLM Flash) with no new hop.
+  **MiMo MoE layers are one-way today** (rank 0 broadcasts the finished
+  routed delta; MiMo has no shared expert), so TP2 adds the rank1 -> rank0
+  direction on the same slot.
+- **Routers are lead-only everywhere** (V4 gate + bias + hash `tid2eid`, GLM
+  `ops[0]`, MiMo BF16 or hi/lo FP32). TP2 must replicate them on GPU1.
+- **V4.1 is a layer-range engine.** It owns layers 0-19 / 20-39 per GPU,
+  with one boundary hop of `[T,4,5120]` BF16 + `[T,4]` FP32 (40,976 B/row).
+  Its TP2 experts broadcast inputs and routes (15,568 B/row), then reduce
+  routed and shared outputs separately in rank order, then add in BF16 on
+  the owner (`tp2_ffn.rs` ~258-364). Measured: its head-split modes lose
+  (C1 187 -> 170).
+- **Kernels.** The half-width math exists almost everywhere; packaging and
+  executors are missing (table under "TP2 RTX experts").
+- **Admission differs by family.**
+  - KV pool targets: the runtime helpers target 2M even on 32 GB cards,
+    while the planner targets 1M there.
+  - Timing: GLM Flash's eager path measures free memory after allocating
+    experts, drafter and workspaces, while MiMo preflights before allocating.
+  - Planner == runtime equality is complete only on work/v4-placement for V4.
+  - Every non-V4.1 Spark worker runs with `RingBudget::new(usize::MAX)` and a
+    hard-coded two endpoints, though GLM 5.3 opens four by default and MiMo
+    Pro three.
+
+Today's planner at the max reference configs (GiB used / capacity):
+
+| config | KV pool | GPU0 | GPU1 |
+|---|---:|---|---|
+| V4 Flash 2 RTX + 4 | 603,648 | 90.3 / 90.3 (20 layers) | 13.1 / 89.3 |
+| V4 Pro EXL3 K2 2 RTX + 6 | 653,056 | 90.7 / 90.7 (7 layers) | 24.5 / 89.3 |
+| GLM 5.3 EXL3 K4 2 RTX + 6 | 1,296,768 | 93.5 / 93.5 | 82.4 / 93.5 (65.1 replicated MLA KV) |
+| MiMo Pro 2 RTX + 6 | 2,097,152 | 49.9 / 93.5 | 42.4 / 93.5 |
+| GLM Flash K3.25 2 RTX + 4 | 2,097,152 | 44.0 / 93.5 | 38.3 / 93.5 |
+
+**Pool first, then TP2 experts, both at a 2M pool:**
+
+| model | RTX expert layers |
+|---|---|
+| V4 Flash | 36 (today 20, with a 603K pool) |
+| V4 Pro | 11 (today 7, with a 653K pool) |
+| MiMo Pro | 12 (today 0; its Spark-bound prefill sheds 12 of its 69 MoE layers from the Sparks) |
+
+These are arithmetic: free bytes over half-layer bytes, at 1.594 / 2.964 /
+3.59 GiB per half-layer for Flash / Pro / MiMo Pro.
+
+### 1. One admission solver
+
+**Module.** The module is `rust/crates/cuteafd-loader/src/placement/`:
+- `mod.rs`: the types;
+- `solve.rs`;
+- `pool.rs`;
+- `families/<family>.rs`;
+- `tests.rs`.
+
+It is CPU-only, with no CUDA. It absorbs `serving_capacity/v4_placement.rs`
+from b2f26af9 (`deepseek_v4_placement`, `deepseek_v4_expert_cost`,
+`deepseek_v4_native_workspace`). The planner (`plan/layout.rs` `layout()`)
+and every family's runtime admission call one function:
+
+```rust
+pub fn solve(request: &PlacementRequest) -> Result<Placement, PlacementError>;
+
+pub struct PlacementRequest {
+    pub inventory: Inventory,
+    pub pool: PoolPolicy,
+    pub layers: Vec<LayerDemand>,   // one per backbone layer, in order
+    pub fixed: Vec<Demand>,         // non-layer items per device or per mode
+    pub movables: Vec<Movable>,     // drafter, vision, audio
+    pub spark: Option<SparkDemand>,
+    pub policy: LayerPolicy,
+}
+pub struct Inventory { pub gpus: Vec<GpuBudget>, pub sparks: Vec<SparkBudget>, pub peer_access: bool }
+pub struct GpuBudget { pub capacity_bytes: u64, pub headroom_bytes: u64, pub baseline: Baseline }
+/// Planned: nothing allocated yet; every demand is charged, runtime context
+/// included. Measured: one sample after CUDA context + program modules and
+/// before any weight; `context_bytes` is what that sample shows in use, and
+/// every named demand is still future (no double counting).
+pub enum Baseline { Planned { context_bytes: u64 }, Measured { free_bytes: u64, context_bytes: u64 } }
+pub struct PoolPolicy { pub requested: Option<u64>, pub target: u64, pub floor: u64, pub unit_rows: u64 }
+pub struct LayerDemand {
+    pub kind: AttentionKind,                 // Mla, Dsa, Csa, Gqa { kv_heads }, Swa { kv_heads }, Kda, Gdn
+    pub colocate: Option<u16>,               // layers sharing index/source state (GLM 5.3 shared indexer, V4.1 source groups)
+    pub weights: ModeBytes,                  // attention + norms + router + shared/dense FFN, per mode and rank
+    pub kv: KvDemand,
+    pub experts: Option<ExpertCost>,         // None: dense layer
+    pub modes: Vec<LayerMode>,               // what this build can execute for the layer
+}
+pub struct ModeBytes { pub whole: u64, pub split: [u64; 2] }
+pub struct KvDemand {
+    pub format: KvRecordFormat,              // the family's record format (Qwen Bf16 | Fp8 lands here)
+    pub unit_bytes_whole: u64,               // per pool unit when one GPU owns the layer
+    pub unit_bytes_split: [u64; 2],          // per pool unit under HeadSplit: halves (GQA/KDA) or full copies (MLA latent)
+    pub sequence_bytes: ModeBytes,           // recurrent/active state per slot
+    pub mark_bytes: ModeBytes,               // prefix mark per slot
+}
+pub struct ExpertCost { pub whole: Bytes3, pub half: [Bytes3; 2], pub tp2: bool, pub spark_ok: bool }
+pub struct Bytes3 { pub resident: u64, pub staging: u64, pub workspace: u64 }
+pub enum LayerMode {
+    HeadSplit,                               // attention heads split, KV partitioned or replicated
+    Whole { gpu: u8, ffn: FfnMode },         // one GPU owns attention and KV
+}
+pub enum FfnMode { Split, Owner }            // Split: TP2 halves + fused all-reduce; Owner: owner-reduce (V4.1)
+pub struct Movable { pub id: MovableId, pub bytes: Bytes3, pub allowed: Vec<DeviceRef>, pub colocate_with: Option<MovableId> }
+pub struct Demand { pub owner: OwnerId, pub category: Category, pub lifetime: Lifetime, pub bytes: PerDevice, pub basis: Basis }
+pub enum Lifetime { Resident, LoadPeak, Growth }   // Growth: graphs, allocator slack
+pub struct SparkDemand { pub ranks: u8, pub slices: Vec<SliceGeometry>, pub endpoints: Vec<Endpoint>, pub capacity_rows: u32, pub workspace: u64, pub host_bytes: u64 }
+pub struct Endpoint { pub role: EndpointRole /* Decode, PrefillLane(n), DeviceExchange */, pub ingress: IngressDtype /* Fp8K32, Bf16 */ }
+
+pub struct Placement {
+    pub pool_tokens: u64,
+    pub layers: Vec<LayerAssignment>,        // { mode: LayerMode, experts: ExpertHome }
+    pub movables: Vec<(MovableId, DeviceRef)>,
+    pub hops: Vec<Hop>,                      // { after_layer, from, to, bytes_per_row }
+    pub sparks: Option<SparkAssignment>,     // slices per rank, endpoints, exact ring bytes
+    pub layout: cuteafd_core::memory_layout::MemoryLayout,
+}
+pub enum ExpertHome { RtxTp2, RtxWhole { gpu: u8 }, Spark }
+```
+
+**Algorithm.** It is deterministic, in TJ's order.
+1. **Layer modes.** Start from `policy` per attention kind (section 3). One
+   GPU, or no peer access, means `Whole{0, Owner}` everywhere. Colocate groups
+   take one mode.
+2. **Fixed demands.** These depend on the modes:
+   - context/modules;
+   - per-layer weights for the chosen mode;
+   - embedding/head;
+   - the graph set;
+   - step workspaces from the family's own program set;
+   - peer exchange slots and hop buffers (`hops` derived from the modes, see
+     section 3);
+   - coordinator Spark intake and rings.
+3. **KV pool.** Each GPU's cost per unit is the sum over layers of the
+   KV it owns, plus state x slots and marks x mark slots. The pool is
+   `min(target, fit)` in whole units across GPUs (today's `size_pool`). An
+   explicit pool is strict: if it doesn't fit, admission fails.
+   - **With Sparks**, the pool is reserved before experts (b2f26af9).
+   - **Spark-free** (every expert must be on RTX), experts are mandatory. The
+     pool takes what is left, down to `floor`; below the floor, the request is
+     Unsupported, naming the shortfall per GPU.
+4. **Movables.** Drafter, vision and audio, largest first, each go to the
+   allowed device with the most free bytes, keeping `colocate_with` (MiMo
+   image + audio share one owner). Because TP2 halves charge both GPUs equally,
+   balancing movables before experts maximizes TP2 layers
+   (`min(free)/half`). Spark encoders are placed after step 5, because RTX
+   layers only shrink Spark slices.
+5. **RTX expert layers.** In layer order from the first MoE layer:
+   - `HeadSplit` and `Whole{ffn: Split}` layers take `RtxTp2` (each half's
+     resident + staging peak);
+   - `Whole{ffn: Owner}` layers take TP2 with the owner reduce (V4.1) or
+     `RtxWhole` where TP2 isn't built.
+
+   Filling stops at the first layer that doesn't fit; the rest are `Spark`.
+   It is one contiguous RTX prefix, as today, so Spark slices stay one range.
+6. **Sparks.** Each rank's slice uses exact bytes: the worker-reported
+   geometry, section 5. Rings are `compact_ring_bytes` x the endpoints at
+   their ingress dtype. Workspaces come from the package. The host footprint
+   is a measured constant per family. Encoders go on the lightest rank (as
+   `encoder_placement` does today).
+7. **Memory lever.** If the pool misses `target`, or a Spark-free layout misses,
+   flip layers to the policy's next mode, kind by kind, taking first the kind
+   that saves the most bytes per layer (replicated MLA KV first). Then re-run
+   from step 2. The candidates are at most one flip per attention kind (≤ 4
+   runs). Keep the first that meets the target, else the largest pool.
+
+**Pool policy.** `PoolPolicy::resolve(card_bytes, context, requested)` has
+one definition:
+- target is 2M above 32 GiB and 1M at 32 GiB or less, never below the
+  compiled context;
+- floor is `max(context, 262_144)` (the agentic floor) for automatic
+  Spark-free layouts, and `context` otherwise.
+
+This replaces the 2M constants in `memory_report.rs` (`measured_pool_tokens`,
+`planned_pool_tokens`) and Qwen's admission.
+
+**KV record format** is a per-family input: `KvDemand.format`, with bytes from
+`FamilyModel::cache_geometry(CacheOptions { .. })`. Qwen FP8 KV (v3 item 5)
+adds `CacheOptions.qwen_kv: Qwen4KvCache::{Bf16, Fp8}` and its bytes formula.
+The solver doesn't change. `FamilyCacheGeometry` gains
+`layers: Vec<LayerCacheGeometry>` (unit bytes and split kind per layer), so
+KV can follow per-layer ownership.
+
+**Where today's code plugs in** (`trait FamilyPlacement`, one impl per
+family in `placement/families/`, building `PlacementRequest` from existing
+code):
+
+| family | weights per mode | KV/state | workspaces/graphs | experts | moves from |
+|---|---|---|---|---|---|
+| deepseek_v4 | `layout/deepseek_v4.rs` `resident_weights` | `serving_capacity/deepseek.rs` | `v4_workspace.rs` (family-scratch 2a758f74) | `deepseek_v4_expert_cost` | `families/deepseek_v4/admission.rs` (b2f26af9) |
+| deepseek_v41 | `layout/v41.rs` `resident_weights` | V4.1 source pages (5 x 91,136 B per 512 tokens, ~890 B/token), 2.7 MB FP8 window marks per sequence, source replicas | native plan APIs | `ExpertLoadBudget` per layer (not the planner's average/2 + 512 MiB) | `v41_native_serve/memory.rs` (ds41rt design's memory stage) |
+| glm5 | `share_of` + `GlmDsaConfig` | `glm5` cache geometry | `glm_decode_graph_allowance` | Spark only | `glm5/mod.rs` planned path |
+| glm5_flash | `load_conversions` + split weights | `glmf` cache geometry (`GlmfIndexCache`) | `glmf_step_workspaces`, `partial_exchange_reserve` | `Fp8Experts::bytes_for`, EXL3 residency | `glm5_flash/mod.rs` `kv_admission`/`measured_admission` |
+| mimo_v2 | `MimoResidentLayout` | `MimoKvCache` geometry | MiMo native contracts (`admission.rs` ~1043), decode-graph count | `Fp8Experts::bytes_for` | `mimo_v2/admission.rs` preflight (CPU parts move to the loader) |
+| qwen4 | `checkpoint_resident_bytes` | `qwen4` geometry | graph-set iteration (`admission.rs` ~42) | `qwen_exl3_arenas`, FP8/NVFP4 package scratch | `qwen4/admission.rs` |
+
+**Runtime side.** `cuteafd-daemon/src/shared/placement.rs` has
+`admit(library, &dyn FamilyPlacement, args) -> Result<Placement>`.
+1. It creates CUDA contexts and loads the family's program modules.
+2. `RuntimeInventory::measure(library, gpus)` takes one sample per GPU
+   (`Baseline::Measured`).
+3. It calls `solve`.
+4. It logs `Placement` once (the same line `cuteafd plan --layout` prints).
+
+Families allocate in any order after that, but never re-sample to size the
+pool. This replaces GLM Flash's two paths and V4.1's synthetic dual sample,
+and makes MiMo's module-delta measurement the context term.
+
+**Encoder-before-experts fix.** `resolve_encoder` runs at layout.rs ~977,
+before V4.1's automatic local layers (~1008), whose Spark slices are then
+rewritten (~1021). V4 instead places its local layers before encoders (~775).
+Steps 4-6 give every family one order:
+1. RTX encoder and drafter reservations, before experts;
+2. Spark encoders, after expert slices are final.
+
+**Estimates replaced by measured or exact items:**
+
+| item today | replacement |
+|---|---|
+| `family_costs.runtime_bytes` (V4 +95.7 MB vs measured) | Runtime: measured `context_bytes`. Planner: per-arch context constant (measured once per driver major and SM, a table in `placement/pool.rs`) + module bytes from PROGRAMS.json (`programs[].module_bytes`, added by the exporter) |
+| `graph_bytes` (Qwen: 512 MiB planned vs a 5.0 GB set; MiMo 664 vs 512 MiB; GLM Flash > 1.5 GiB) | One `GraphSet::startup(shape)`, shared by runtime warm-up and planner, x a measured per-arch bytes-per-executable (Qwen 149,712 B, MiMo 192 KiB) + driver margin. `Lifetime::Growth` items cover lazy captures |
+| `workspace_bytes` allowances | Program-manifest formulas, which V4 and GLM Flash already have; add MiMo, GLM 5.3 and Qwen from their engine's workspace functions |
+| local-expert allowance (V4 -13.6 MB; Qwen NVFP4 omits 1.06 GB package scratch) | `ExpertCost` from the catalog (resident, staging, package scratch from `Fp8MoeInfo`/EXL3 manifests) |
+| external drafter = safetensors bytes + 1300 MiB | The drafter's resident representation (FP8/BF16) + its workspace formula |
+| Spark workspace/ring allowances | Worker-reported admission (section 5) |
+
+**Planner == runtime.** One function, so the test compares inputs:
+- Each family has `planner_equals_runtime_<family>` in
+  `cuteafd-daemon/src/shared/placement/tests.rs`. It builds the planner
+  request from a fixture snapshot (`plan/testing.rs` writers, e.g.
+  `write_v4_snapshot` from b2f26af9) and the runtime request through the
+  family's daemon path, with a `FakeProbe { total, context }`.
+- It asserts equal `Placement`, including identical layout items per
+  (category, group).
+- Configs: 1 RTX, 2 RTX, 2 RTX asymmetric, 32 GB, Spark-free.
+- The hardware ledger check (`scripts/bench/memory-audit.py`) stays the gate:
+  planner vs measured per category within 64 MiB at ready.
+
+### 2. TP2 RTX experts for every family
+
+**Module:** `cuteafd-daemon/src/shared/experts/rtx.rs` plus `rtx/{native,
+fp8moe,exl3,combine,routes}.rs`.
+
+```rust
+pub enum RtxShard { Whole, Tp2 { rank: u8 } }
+pub trait RtxExpertLayer {
+    fn shard(&self) -> RtxShard;
+    fn partial(&self) -> PartialDtype;                 // F32 (native, EXL3) or Bf16 (fp8moe today)
+    fn workspace_bytes(&self, rows: u32) -> u64;       // exact; feeds ExpertCost
+    /// This rank's routed sum for `rows` rows into `out`: no shared add, no
+    /// inter-rank reduce, no finish/copy. Input BF16 x (fp8moe, EXL3) or
+    /// FP8-K32 rows (native), routes = ids + weights [rows, topk].
+    unsafe fn enqueue(&self, stream: &Stream, input: ExpertInput, routes: Routes, out: Partial) -> Result<()>;
+}
+pub enum Combine {
+    /// HeadSplit / Whole{ffn: Split} layers: each rank adds its routed partial
+    /// to its shared/dense half in FP32, then the existing FFN slot exchange
+    /// sums the two in rank order on both GPUs.
+    FusedAllReduce { exchange: ExchangeDtype },        // Bf16 | F32
+    /// Whole{ffn: Owner} layers (V4.1 today): broadcast inputs/routes, reduce
+    /// routed then shared in rank order onto the owner, add in BF16.
+    OwnerReduce { owner: u8 },
+}
+pub enum RouteSource { Replicated, Broadcast }         // Broadcast: rank0 pushes ids+weights (rows*topk*8 B)
+```
+
+Impls, each wrapping existing code:
+
+| impl | wraps | geometries |
+|---|---|---|
+| `NativeTp2` | V4.1 `RankWeights`/`RankWave`/`BackboneTp2` (`v41_experts/tp2.rs`), generalized over `ExpertGeometry` | v41, dsv4f, dsv4p |
+| `V41Nvfp4Tp2` | `v41_nvfp4_tp2_expert_*` | v41 NVFP4 |
+| `Fp8MoeTp2` | `Fp8Experts::load(tp = 2, rank)`, `exact_layout` | FP8, MXFP4 (mimof/mimop), NVFP4 (glm, glmf, qwen4) |
+| `Exl3Tp2` | `residency(sel, 2, rank)` + `launch_layer_into` (raw FP32, no `reducer.finish`) | dsv4f, dsv4p, glm, glmf |
+
+**Combine numerics.** Fused combine computes
+`out = BF16(FP32(p0) + FP32(p1))` with `p_r = round(routed_r + shared_r)`.
+Spark reduction instead sums routed rank planes first and adds shared after,
+so this is a numerics change: it needs its own fidelity gate per format and
+top-k (top-6/8/10).
+- `ExchangeDtype::F32` (4·T·H bytes, as GLM Flash's FP32 KDA partials)
+  rounds once.
+- `Bf16` keeps today's payload.
+
+Measure F32 decode first (see open questions).
+
+**Routes.** GPU1 gets a replica of the router weights: the `Router`
+component becomes `Share::Replicated` under TP2, and V4 also takes `gate.bias`
+or `tid2eid` plus token ids for hash layers. Each rank runs the router on its
+bitwise-identical input. `RouteIdentity::check(engine)` runs at startup
+after graph warm-up, on a fixed 512-row prefill plus one decode step:
+1. Copy ids + weights from both ranks for every MoE layer.
+2. Compare bytes.
+3. On a mismatch, log the first layer and row, then switch the engine to
+   `RouteSource::Broadcast` (V4.1's current method, one DIRECT push per MoE
+   layer).
+
+`CUTEAFD_ROUTE_CHECK=N` re-checks every N steps (off by default).
+
+**Kernels, exports, loaders.** The table extends the v4-placement audit;
+paths are under `python/tools/aot/`, `native/cmake/shared/` and
+`rust/crates/`.
+
+| family / format | SM120 half export | still needed |
+|---|---|---|
+| V4.1 MXFP4 / NVFP4 / EXL3 | exist (`rtx_tp2`, `v41_tp2_experts.cmake`, `v41_nvfp4_experts.cmake`, `rtx-tp2`) | none: reference impls |
+| V4 Flash/Pro official MXFP4 | `export_b12x_slices_aot.py` `role_geometry` gives I/2 = 1024/1536; FFI role-3 geometry and `family_symbol` already work | **S**: `expert_families.cmake` ~44 admits `rtx_tp2` as coordinator and maps it to `cuteafd_{dsv4f,dsv4p}_tp2_expert_*` |
+| V4 Flash/Pro EXL3 | `shard_profiles` emits `rtx-tp2` (Pro k23 package built) | **M**: `deepseek_v4/local.rs` ~332 loads `BackboneFull` and calls `reducer.finish`; switch to `Exl3Tp2` raw partials |
+| GLM Flash EXL3 K3/K3.25/K4 (incl. tr3) | `rtx-tp2` emitted (I = 2048, 8+8 blocks) | **M**: GLM Flash local EXL3 path (`engine.rs` ~3708) drops wire quantization, finish and D2D copy |
+| GLM Flash / GLM 5.3 / MiMo FP8, MXFP4, NVFP4 | coordinator layouts are `tp1` only (`package_fp8_moe_aot.py` ~75 `ROLE_LAYOUTS`, `MXFP4_ROLE_LAYOUTS`, `NVFP4_ROLE_LAYOUTS`); the compiler builds tp2 with `--layouts` | **S/M**: add coordinator `tp2` (exact H128) in those tables and `fp8_moe.cmake` ~64, BF16 input. No new kernel math |
+| GLM 5.3 any format | none (no coordinator local expert backend, `glm.rs` ~563) | **L**: a local backend. Not needed for Spark-free (338-380 GiB of experts never fit); needed only for RTX layers at max. Deferred |
+| Qwen EXL3 / FP8 (I = 640, 5 blocks) | `exl3.cmake` ~158 drops `rtx-tp2` | **M**: unequal 384/256 profiles. Not needed if Qwen uses layer ranges (section 3) |
+| Qwen NVFP4 | padded 320+64 / 320+64 via existing loader | **S**: coordinator `tp2` layout. Same caveat |
+| MiMo V2.6 true FP8 weights | no `GEOMETRIES` entry (`mimof`/`mimop` are MXFP4) | only if an FP8-weight V2.6 checkpoint becomes a target |
+
+Cleanup that pays with TP2: MiMo `moe_front` (`engine.rs` ~2419) builds an
+FP8-K32 wire buffer the BF16 local package never reads (S). Local EXL3 in
+GLM Flash, Qwen and V4 quantizes wire rows, finishes to BF16 and copies
+(M; it changes numerics, so it carries its own gate).
+
+**Drafter under TP2.** The whole drafter is one `Movable` (default GPU1).
+V4.1 already runs dSpark there.
+- **Taps.** Rank 1 holds the replicated residual for every non-terminal
+  layer. Terminal taps need rank 1's final FFN close, which every
+  head-split engine skips today. Enable it when the drafter is on GPU1: one
+  extra exchange per step at the last layer.
+- **Head.** Replicate the FP8 head on GPU1 (0.6-1.2 GiB) when the drafter is
+  there. If memory is short, shard the vocabulary instead, as V4.1 does.
+- **Embedding.** Draft rows read the host-mapped embedding (one pinned copy),
+  so no second device copy.
+- **Prefix state.** DFlash restores cold (`valid_from`), so nothing moves.
+  The arenas that do move to the drafter's GPU: V4 dSpark window marks, MiMo
+  `--mimo-prefix-draft` rings, and Qwen MTP stash (`[T,4,2560]`).
+- **Draft experts.** V4 dSpark stage experts (9.56 GiB Flash, 17.78 GiB Pro)
+  and Qwen MTP experts stay full width with the drafter. DsparkTp2 EXL3 stays
+  unsupported.
+
+### 3. Attention placement: per-layer ownership
+
+**`ResidualHome`.** Ownership composes per layer through one state machine
+in `shared/peer_split.rs`: `ResidualHome::{Replicated, Owned(gpu)}` and
+`fn transition(home, next: LayerMode) -> (Option<Hop>, ResidualHome)`. The
+executor follows `Placement.layers`, and the solver charges the hop buffers.
+
+| from \ next layer | HeadSplit | Whole{g, Split} | Whole{g, Owner} |
+|---|---|---|---|
+| Replicated | attention all-reduce | none in; broadcast g -> peer after attention | none in |
+| Owned(g) | broadcast g -> peer | none | none |
+| Owned(other) | broadcast | boundary hop | boundary hop |
+
+Notes:
+- Hops carry the residual: `[T,H]` BF16, or `[T,4,H]` + FP32 pre-coefficients
+  for mHC families (V4, GLM Flash, Qwen, V4.1).
+- After a Split FFN the residual is Replicated: the FFN all-reduce,
+  bidirectional.
+- An `Owner` FFN leaves it Owned(g).
+- **Layer ranges** are runs of `Whole{g, Owner}`: one hop per boundary.
+- **A single whole layer between split layers** (`Whole{g, Split}`) costs
+  one broadcast plus the FFN all-reduce: the same two exchanges as a
+  head-split layer. The peer idles through the owner's attention.
+
+**KV follows ownership.** Whole layers keep KV, index keys and recurrent
+state on the owner only. HeadSplit layers partition KV heads where the
+format allows: GQA (MiMo 4+4 KV heads), KDA heads (GLM Flash), GDN (Qwen 8/24
+heads, if split). They replicate MLA/DSA/CSA latents (GLM 5.3, GLM Flash
+MLA, V4). Prefix marks and graphs are owned per GPU, as head-split marks are
+today.
+
+**Executor work** (none of the generic engines has it: `attach_peer`
+requires every layer split):
+- a per-layer plan in each engine loop;
+- unsplit programs and weights for Whole layers on both GPUs;
+- per-owner caches;
+- the hop primitive.
+
+V4.1's `BlockTransfer` (`v41_block/transfer.rs`) is the reference for the
+boundary hop: an SM copy in the deferred device chain, otherwise peer DMA plus
+a cooperative wait.
+
+**Policy** (`LayerPolicy`, defaults per family and attention kind, preference
+order; `--layer-modes auto|split|ranges|<kind>=whole,...` and
+`COORDINATOR_SPLIT=auto|heads|ranges|off` in run-family):
+
+| family | kinds | default with Sparks | memory fallback (lever) | evidence |
+|---|---|---|---|---|
+| V4 Flash/Pro | CSA (replicated) | HeadSplit | ranges | decode -10% / -12% (5560ed00); ranges halve the 7.9-11.2 GiB per-GPU KV at 2M |
+| V4.1 | CSA + source groups | ranges (20/20) | none | head split / TP2 attention C1 187 -> 170 (100122a6); ds41rt design keeps it |
+| GLM 5.3 | MLA/DSA (replicated, 53,940 B/token) | HeadSplit | ranges | verify 27.9 -> 25.2 ms, coordinator prefill -28% (7e27a769); at 2M ranges plan 81.0 / 69.9 GiB vs head split capped at a 1.30M pool |
+| GLM Flash | KDA (partitioned) + DSA (replicated) | HeadSplit all | KDA HeadSplit, DSA `Whole{alternating, Split}` | C1 159 -> 168 (9380e8b8) |
+| MiMo | GQA full + SWA (partitioned) | HeadSplit all | ranges | -41% coordinator decode (3a1d428c) |
+| Qwen | GDN + GQA (2 KV heads) | Whole (1 GPU) | ranges on 2 RTX | no split exists; hidden 2560 makes hops relatively costly |
+
+**Rule.** Split attention by default only where a measured C1 A/B on the
+family's min/max shows a win. Whole layers are the memory lever the solver
+uses only when the pool or Spark-free fit requires them. A family adopts a
+non-default mode only through the quick A/B at 2M on min/max.
+
+**GLM Flash compact index cache.** It is single-GPU only today
+(`serving_capacity.rs:395`, `engine.rs:1645`). Under the mixed policy the
+DSA layers are Whole, so each MLA layer's compact index lives on its owner
+with no split variant to build. That saves 11.0 GiB at 2M in total (5.5 per
+GPU). Shared-indexer layers (GLM 5.3) use `colocate`.
+
+### 4. Spark-free layouts as solver outputs
+
+No special cases: `Inventory.sparks` is empty, experts are mandatory, and
+the pool floats down to the floor (section 1, step 3).
+
+The table projects GiB GPU0 / GPU1 at fixed pools from the planner's one-
+and two-GPU items:
+- vision off (it adds 1.79 GiB to the lighter GPU);
+- capacity 93.5 / 93.5, except V4 at 90.0 / 89.3;
+- head split moves the drafter to GPU1;
+- ranges use the best split point (22-24);
+- mixed is GLM Flash's KDA split with its 11 DSA layers Whole and alternating.
+
+| model | pool | head split + TP2 | ranges | mixed |
+|---|---:|---|---|---|
+| GLM Flash K3 | 2M | 94.1 / 94.9 no | 80.4 / 80.4 fits | 85.1 / 81.0 fits |
+| GLM Flash K3 | 1M | 82.6 / 83.4 fits | 74.5 / 74.8 fits | 78.8 / 75.7 fits |
+| GLM Flash K3.25 | 2M | 98.6 / 99.4 no | 85.0 / 84.8 fits | 89.6 / 85.3 fits |
+| GLM Flash K3.25 | 1M | 87.0 / 87.8 fits | 79.1 / 79.1 fits | 83.3 / 80.0 fits |
+| GLM Flash tr3 K4 | 1M | 100.3 / 101.1 no | 92.7 / 92.1 fits | 96.9 / 93.0 no |
+| GLM Flash tr3 K4 | 512K | 94.6 / 95.4 no | 89.7 / 89.3 fits | 93.8 / 90.4 no |
+| GLM Flash NVFP4 | 512K | 103.2 / 103.9 no | 98.5 / 97.7 no | 102.6 / 98.8 no |
+| V4 Flash, dSpark | 2M | 90.1 / 97.6 no | 89.2 / 88.7 fits (tight) | - |
+| V4 Flash, dSpark | 1M | 86.2 / 93.6 no | 87.1 / 86.9 fits | - |
+| V4 Flash, no dSpark | 2M | 90.1 / 87.8 no (GPU0 +0.06) | 85.6 / 82.6 fits | - |
+| V4 Flash, no dSpark | 1M | 86.2 / 83.9 fits | 83.6 / 80.6 fits | - |
+| MiMo Flash | 512K | 89.2 / 92.1 fits | 87.7 / 90.9 fits | - |
+
+Rows that fit nowhere at a higher pool are omitted: tr3 K4 at 2M, NVFP4 at
+1M and 2M, and MiMo Flash at 1M and 2M. MiMo Flash at 1M fits with ranges once
+audio is off or on a Spark (-3.5 GiB on GPU1).
+
+Qwen:
+- 1 RTX: the solver output equals today: 525,568 tokens (EXL3 K4.25) and
+  436,480 (NVFP4).
+- 2 RTX with ranges: ~70.7 GiB per GPU at 2M (from the one-GPU 137.6 GiB plan
+  plus duplicated context/graphs/workspaces), so it fits 2M with no head
+  split.
+- FP8 KV (item 5) raises the 1-RTX pool.
+
+**Reading of the table.**
+- **Layer ranges, not head-split TP2, are what fit Spark-free at 2M.** TP2
+  halves the experts, but the head split replicates MLA/CSA KV and duplicates
+  per-GPU fixed costs. Ranges own KV once.
+- **GLM Flash K3/K3.25 at 2M:** mixed keeps the measured KDA head split.
+- **tr3 K4 needs ranges (1M).** Official NVFP4 and FP8 stay unsupported.
+- **V4 Flash Spark-free:** ranges at 2M, or head split + TP2 at 1M without
+  dSpark.
+
+Caveats:
+- These are arithmetic, not admission.
+- Hop buffers (`[4096,4,H]` BF16 = 128 MiB per lane at H = 4096) are not in
+  them.
+- The rc3 launcher still rejects V4 with zero Sparks, and the planner rejects
+  zero-Spark DeepSeek (`deepseek.rs:432`). The solver's `spark_ok`/`modes`
+  replace both checks.
+
+### 5. Exact Spark admission
+
+**Endpoints and ingress per family.** The coordinator states them; the worker
+enforces them.
+
+| family | endpoints (default) | ingress |
+|---|---|---|
+| deepseek_v4 | 2 (lanes) + optional device exchange | FP8 K32 |
+| deepseek_v41 | 2 + optional device exchange | BF16 (NVFP4), else FP8 K32 |
+| glm5 | lanes + 1 = 4 (1 with one lane) | FP8 K32 |
+| glm5_flash | lanes = 2 (configurable) | FP8 K32 |
+| mimo_v2 | main + lanes - 1 = 2 (Flash) / 3 (Pro) | `--expert-input`: FP8 K32, BF16, or BF16 decode / FP8 prefill per endpoint |
+| qwen4 | 1 | FP8 K32 |
+
+**Protocol.** `FamilyPlacement::spark(ctx)` returns `SparkDemand.endpoints`.
+The coordinator sends a `ModelAdmission` request in the protocol_v2 bootstrap
+carrying:
+- the checkpoint identity;
+- the rank and world;
+- `Vec<Endpoint>`;
+- capacity rows.
+
+The worker computes rings with `spark_ring_bytes_for_ingress` per endpoint
+and builds `RingBudget::new(exact)` for every family. This replaces
+`usize::MAX` (`service.rs:380`) and `parse_rdma_endpoints`' fixed 2
+(`service.rs:331`), and the ingress flag moves from `service/local.rs:41` to
+the endpoint list.
+
+The worker replies with `ModelAdmissionResponse`:
+- resident, workspace, ring and host bytes;
+- slice widths and the EXL3 per-projection tier and geometry it actually
+  loaded (the sliced-checkpoints v3 design).
+
+The coordinator checks that all ranks agree and equal the solver's
+`SparkAssignment` before allocating. Any mismatch fails startup, naming the
+rank and field.
+
+**Shared scratch.** `ProgramSet::for_serving(family, split_family,
+draft_family)` lives in `cuteafd-loader/src/serving_capacity/program_set.rs`.
+- **Users:** the runtime scratch allocators and the planner workspace
+  formulas. V4 already moved to this on work/family-scratch 2a758f74; GLM 5.3,
+  GLM Flash, MiMo and Qwen already select their own programs.
+- **Test:** for each family, planner set == runtime set.
+
+### 6. Migration (ordered PRs, each gateable)
+
+Gates on every PR:
+- cargo/script tests by failing id;
+- golden NLL/greedy on one GPU or loopback;
+- the PR's own measurement;
+- the quick A/B at the 2M operating point on min and max where serving
+  changes.
+
+Full V4.1 parity applies when a shared hot path changes (marked †).
+
+| # | PR | size | gate | notes |
+|---|---|---|---|---|
+| 1 | `placement` module, `PoolPolicy`, `solve` (HeadSplit/Whole modes, no TP2), V4 port of b2f26af9 (pool first, GPU0/GPU1 whole-layer ranges), `planner_equals_runtime_deepseek_v4` | M | equality test; V4 Flash/Pro A/B at 2M: max pool 603K -> 2M must not cost C1 | V4 first: worst pool, empty GPU1, an equality test exists, native TP2 is CMake-only |
+| 2 | Exact items: `RuntimeInventory::measure`, per-arch context table, `GraphSet`, `ProgramSet`, exact expert package scratch; planner uses them for all families | M | ledger compare at ready within 64 MiB: V4 small, Qwen local EXL3/NVFP4, MiMo, GLM Flash | closes the PLAN-listed gaps (Qwen +5.35/6.72 GB, V4 84 MB) |
+| 3 | `ResidualHome`, hop primitive, `LayerMode` in `Placement`; engines assert their mode set | S | unit tests | no behavior change |
+| 4 † | `shared/experts/rtx` (`NativeTp2` from V4.1 `RankWave`, `Combine`, `RouteIdentity`), dsv4 `rtx_tp2` CMake, V4 engine wiring (router replica, `post_split`/`peer_front`) | L | V4 Pro EXL3 K2 quick KL no worse than rc1 (0.0605 min / 0.0596 max) and Flash golden; route check passes; A/B min/max | V4.1 byte-exact through `NativeTp2` before its private copy is retired (PR 12) |
+| 5 | Drafter as a movable: V4 dSpark (with stage experts) on GPU1, terminal close, marks | M | lossless spec check; C1 at max | |
+| 6 | GLM Flash: solver port, coordinator tp2 packages (fp8moe), `Exl3Tp2`/`Fp8MoeTp2` wiring, router replica, DFlash2 on GPU1 | M | golden NLL (2.4054 split baseline); A/B min/max at 2M | |
+| 7 | Per-layer executor for GLM Flash: Whole DSA layers, compact index on owners; Spark-free 2 RTX K3/K3.25 at 2M; tr3 with ranges at 1M | L | fidelity; Spark-free card correctness; A/B min/max | proves the mixed mode |
+| 8 † | MiMo: solver port, bidirectional MoE exchange, `Fp8MoeTp2`, drop unused wire buffer | M | golden; A/B min/max (max should shed 12 Spark layers) | |
+| 9 | GLM 5.3: solver port, ranges vs head split at max (2M vs 1.30M pool) | M | A/B C1/C4 both modes at max; pick by section 3's rule | RTX experts need the local backend (L, deferred) |
+| 10 | Qwen: solver port, layer ranges on 2 RTX (Spark-free 2M), FP8 KV option plugs in (item 5) | M | golden; 1 RTX local + 2 RTX ranges A/B | head split only if later measured |
+| 11 † | Exact Spark admission: `ModelAdmission` request/response, endpoints and ingress, finite `RingBudget` for all, EXL3 worker geometry | M | every family's min/max: ring peak == charge (as work/spark-vision-ring) | |
+| 12 † | V4.1 onto the solver (`FamilyPlacement` impl, `NativeTp2`/`V41Nvfp4Tp2`/`Exl3Tp2` with `OwnerReduce`, `planner_equals_runtime_deepseek_v41`); delete `v41_experts/tp2.rs` `RankWave`/`RankWeights` once shared impls serve it byte-exact | L | V4.1 golden byte-exact, full 3-session parity | the ds41rt design's "expert service + memory" stage consumes these types |
+| 13 | Delete `family_costs` rows and `layout.rs` family branches as each family moves | S | planner fixture tests | |
+
+**V4.1 reuse.** The `NativeTp2`, `V41Nvfp4Tp2` and `Exl3Tp2` impls are
+V4.1's code moved, not rewritten:
+- `RankWeights`/`RankWave`/`BackboneTp2` staging;
+- `load_exl3_pair`;
+- `PeerReduction` as `Combine::OwnerReduce`.
+
+V4.1 keeps 20/20 ranges and its owner reduce. The fused combine is offered to
+it only through its own gate, because fusing changes rounding.
+
+### Risks
+- **Fused-combine numerics.** Changing to BF16 per-rank rounding can move KL.
+  F32 exchange costs 2x payload. Gate per format.
+- **Graphs.** The replicated router and rank-1 routed work add GPU1 graph
+  executables. They belong in `GraphSet`, or admission under-counts again.
+- **Hop bandwidth.** Mixed/ranges prefill hops are 128 MiB per lane per
+  boundary at 4096 rows. Peer bandwidth is ~1.1 ms per 48 MiB (2026-10-01),
+  and saturated host -> GPU0 ingress quadruples small hops. Measure 8K
+  prefill on max.
+- **Measured baseline.** If another process holds GPU memory, the measured
+  sample sees it. That is correct behavior but makes planner != runtime; the
+  test covers only the fake probe.
+- **Readiness.** The route check adds a 512-row prefill per start (~0.1-0.5
+  s), and TP2 loading reads half-slices on both GPUs in parallel. Load speed
+  must not regress.
+- **Scope.** GLM 5.3 RTX experts need a new local backend. Qwen TP2 needs
+  unequal EXL3 profiles. Both are deferred unless their gates call for them.
+
+### Open questions for TJ (with recommendations)
+1. **Fused combine dtype.** Recommend F32 partials for decode/verify (≤128
+   rows, ≤ 6 MiB) and BF16 for prefill, keeping BF16 only where KL matches.
+2. **GLM 5.3 at max.** Head split with a 1.30M pool, or layer ranges with 2M?
+   Recommend measuring both (PR 9). Default to ranges unless the head split
+   wins C1 by more than 2%, since 2M is the agentic operating point.
+3. **Spark-free pool floor.** Recommend auto-shrinking to
+   `max(context, 256K)`, with cards advertised only at ≥ 1M.
+4. **Qwen on 2 RTX.** Recommend layer ranges only (2M fits); no Qwen head
+   split or unequal TP2 unless measured.
+5. **Draft head on GPU1.** Recommend replicating the FP8 head when the solver
+   has room, and the V4.1-style vocabulary shard only under pressure.
+6. **Route mismatch.** Recommend falling back to broadcast routes with a
+   warning, not refusing to start.
+7. **V4 Spark-free.** Recommend ranges at 2M with dSpark, rather than head
+   split + TP2 at 1M without it. Confirm by A/B once PR 7's executor exists for
+   V4.
+8. **GLM Flash with Sparks.** Recommend keeping the head split (measured +5%
+   C1). Ranges only as the memory lever, unless TJ's earlier GLM Flash range
+   numbers show a C1 win (please point to them; the audits found none in
+   git).
 
 ## First after rc3: per-key draft confidence calibration (TJ, 2026-10-09)
 
