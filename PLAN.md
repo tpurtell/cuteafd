@@ -358,9 +358,10 @@ FP4, most other weights BF16/FP8 as released. Design (study 2026-09-30):
   (`nvfp4_scale.cu`, parameterized); no offline repack.
 - Dense NVFP4/per-tensor-FP8 parts dequantize to BF16 at load today;
   item 10 of the v1 plan replaces that with compact consumers.
-- V4.1: its NVFP4 release has exactly the official MXFP4 weights
-  (power-of-two scales) → lossless downcast at load onto the existing W4A8
-  path; the W4A4 44-slot family stays opt-in (ds41rt measured it slower).
+- V4.1: its NVFP4 release uses the native W4A4 44-slot family by default,
+  with BF16 input rows quantized per route to E2M1 + E4M3 K16 on the Sparks.
+  FC1 currently replaces per-expert static input_scale with the layer maximum;
+  FC2 keeps the expert's scale. The earlier W4A8-downcast description was stale.
 - W4A4 prefill (MmaMXF4NVF4Op, in-kernel per-16 quantization) only if it
   measures faster and stays within 0.005 nats KL of W4A16.
 Stages: S0 loader + `plan`; S1 W4A16 experts (GLM 5.3 Flash first, then
@@ -1158,9 +1159,11 @@ Work, in priority order:
     90 KB CTA per SM at 6% occupancy, versus MXFP4's fused-slice kernel at
     2 CTAs per SM. A noncooperative NVFP4 slice kernel (fork
     `work/v41-nvfp4-slice` 3173cc2e) reached 3 CTAs per SM but ran 28–38%
-    slower at 1–16 rows. Untested hypothesis: it re-quantizes BF16 → FP4 per
-    slice × route slot, where MXFP4 takes pre-quantized FP8 wire rows; try a
-    quantize-once input stage or an FP8 wire first. Wide-row M32 tiles lost
+    slower at 1–16 rows. Code audit (2026-10-09): standard cooperative FC1
+    route packing quantizes BF16 to FP4 once per token × route, not per FC1
+    slice. Native MXFP4 takes pre-quantized FP8 wire rows. Fix the shared-max
+    FC1 scale approximation first; then gate FP8 wire rounding and occupancy
+    changes separately in v3. Wide-row M32 tiles lost
     on both GPUs. Official MXFP4 stays the recommended V4.1 checkpoint.
 12. **V4.1 C1 after request history (open, 2026-10-05):** after smoke +
     golden-probe requests, work/p0 decodes C1 ~1.7–2% slower than v1.0.0 on
@@ -1637,16 +1640,16 @@ item-4 bugs and started items 7 and 10; commit messages carry its evidence.
    its runtime reservations before loading (`mimo_v2/admission.rs`). Next:
    startup consumes the same resolved plan for every family.
 8. **NVFP4 follow-ups**: native per-tensor FP8 decode with static scales.
-   **Revisit W4A4 for `nvidia/DeepSeek-V4.1-Flash-NVFP4`** (TJ): V4.1's own
-   NVFP4 path keeps the ds41rt 44-slot W4A4 family opt-in because ds41rt
-   measured it slower, which is implausible for FP4 MMAs on Blackwell and
-   contradicts the checkpoint's declared numerics (W4A4, static input_scale).
-   Honor the checkpoint: profile why ds41rt's W4A4 lost (likely activation
-   quant overhead, tile shapes, or decode rows taking the W4A4 path), port the
-   shared fp8_moe W4A4 route (fused gate/up + SwiGLU + FP4 quant, large-row
-   threshold, W4A16 decode rows) to V4.1 if it wins, and make W4A4 the default
-   for that checkpoint. Gate: V4.1 golden/KL vs the official FP8 reference,
-   8K prefill and C1/C4 vs the current NVFP4 default.
+   **V4.1 NVFP4 fidelity and wire (deferred to v3, 2026-10-09):** the current
+   V4.1 path already uses the 44-slot W4A4 family for every row count; older
+   W4A8/opt-in descriptions were stale. First preserve each expert's static
+   FC1 input_scale instead of the layer maximum (FC2 is already per-expert).
+   Then evaluate BF16 versus FP8 wire plus per-expert FP4 quantization; a
+   shared-scale NVFP4 wire is not checkpoint-exact. The cooperative kernel's
+   low occupancy is the stronger C1 hypothesis, since route packing already
+   quantizes FC1 once per route, not once per FC1 slice. Gate: quick fidelity
+   and golden/KL vs the official reference, 8K prefill and C1/C4/C16 on the
+   natural-min and max layouts. Keep today's default until hardware gates.
    **W4A4 decode/verify rows** (TJ): decode rows (1–16, incl. speculative
    verify) run W4A16 even on W4A4 checkpoints. Measure W4A4 decode with the
    activation quant fused into the GEMV/MMA prologue on one NVFP4 model (C1
