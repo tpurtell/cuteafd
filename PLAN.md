@@ -1775,6 +1775,15 @@ TJ: two key items, both urgent right after v2.0.0.
      design and kernel/loader audit). V4 Flash/Pro measured in rc1:
      KV pool 581K-1.39M tokens because experts are placed first, GPU1
      13-24 of 90 GiB used.
+3. **V4.1 NVFP4 numerics and wire** (deferred by TJ, 2026-10-09). The Spark
+   kernels already run W4A4 (mxf4nvf4), but FC1 uses one layer-max input
+   scale instead of each expert's calibrated `input_scale` (~6x spread), and
+   the coordinator sends BF16 rows (10,240 B) the Spark re-quantizes per
+   route. Per-expert exact scales first, then the wire (BF16 / FP8 / FP4
+   shared-max), gated on real activation captures and fidelity vs the
+   official V4.1 reference. C1's 16% gap to MXFP4 is likely the cooperative
+   kernel's occupancy, a separate item. Input: work/v41-nvfp4-wire,
+   `builds/v41-nvfp4-wire/SUMMARY.md`.
 2. **Retire ds41rt: V4.1 moves onto shared infrastructure** (below, "First
    after v2"). V4.1's TP2 expert layers and memory placement are inputs to
    item 1; build the shared versions once, not twice.
