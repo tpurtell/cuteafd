@@ -131,11 +131,16 @@ pub(super) async fn run(gateway: Arc<Gateway>, mut turn: TurnRequest) -> Result<
     })))
 }
 
-/// Tool calls end only once the turn's stop reason is known: `ToolCallEnd`
-/// events are held until `Done` and released just before it, unless the turn
-/// stopped at `MaxTokens` (or failed), in which case they are dropped. A front
-/// end therefore treats any tool call still open at `Done` as cut off
-/// (incomplete), and never reports a truncated call as complete or runnable.
+/// Tool calls end only once the turn's stop reason is known. `ToolCallEnd`
+/// events are held until `Done` and released just before it when the turn
+/// ended normally (`EndTurn`, `ToolUse`, `StopSequence`, `PauseTurn`). On any
+/// other end (`MaxTokens`, `ContentFilter`, `Refusal`, `Cancelled`, an error
+/// event, or the stream ending without `Done`, which is what a dropped upstream
+/// connection looks like) the held ends are dropped. A front end therefore
+/// treats any tool call still open at the end as cut off (incomplete) and never
+/// reports it as complete or runnable. This is conservative: a call that did
+/// finish earlier in a `MaxTokens` turn is also left open, so the client
+/// re-asks rather than running a call from a turn that was cut short.
 pub(super) fn seal_tool_calls(mut inner: TurnStream) -> TurnStream {
     Box::pin(async_stream::stream! {
         let mut ends = Vec::new();
@@ -143,12 +148,15 @@ pub(super) fn seal_tool_calls(mut inner: TurnStream) -> TurnStream {
             match event {
                 Ok(TurnEvent::ToolCallEnd { index }) => ends.push(index),
                 Ok(TurnEvent::Done { stop }) => {
-                    if stop != StopReason::MaxTokens {
+                    let normal = matches!(stop, StopReason::EndTurn | StopReason::ToolUse
+                        | StopReason::StopSequence { .. } | StopReason::PauseTurn);
+                    if normal {
                         for index in ends.drain(..) { yield Ok(TurnEvent::ToolCallEnd { index }); }
                     }
                     yield Ok(TurnEvent::Done { stop });
                     return;
                 }
+                Err(error) => { yield Err(error); return; }
                 other => yield other,
             }
         }
@@ -178,5 +186,25 @@ mod tests {
         let done = sealed(call(StopReason::ToolUse)).await;
         assert!(matches!(done[done.len() - 2], TurnEvent::ToolCallEnd { index: 0 }));
         assert!(matches!(done[done.len() - 3], TurnEvent::Usage { .. }), "ends move to just before Done");
+        for stop in [StopReason::ContentFilter, StopReason::Refusal, StopReason::Cancelled] {
+            assert!(!sealed(call(stop)).await.iter().any(|e| matches!(e, TurnEvent::ToolCallEnd { .. })));
+        }
+    }
+
+    #[tokio::test]
+    async fn eof_or_error_without_done_leaves_calls_open() {
+        let mut events = vec![
+            TurnEvent::ToolCallStart { index: 0, id: "c".into(), name: "f".into() },
+            TurnEvent::ToolCallDelta { index: 0, arguments: "{}".into() },
+            TurnEvent::ToolCallEnd { index: 0 },
+        ];
+        let eof = sealed(events.clone()).await;
+        assert_eq!(eof.len(), 2, "dropped connection: no end, no Done");
+        events.push(TurnEvent::Done { stop: StopReason::ToolUse });
+        let mut with_error: Vec<Result<TurnEvent, GatewayError>> = events[..3].iter().cloned().map(Ok).collect();
+        with_error.push(Err(GatewayError::upstream("connection reset")));
+        let out: Vec<_> = seal_tool_calls(Box::pin(stream::iter(with_error))).collect().await;
+        assert!(out.iter().all(|e| !matches!(e, Ok(TurnEvent::ToolCallEnd { .. }))));
+        assert!(matches!(out.last(), Some(Err(_))));
     }
 }
