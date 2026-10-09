@@ -223,9 +223,10 @@ pub fn run(client: &Client, info: &ServerInfo, progress: &Progress, run_id: &str
 }
 
 fn fidelity(run: &mut Run<'_>, check: &mut Check) -> Result<()> {
-    if let Some(reason) = crate::fidelity_dataset::unavailable(&run.info.checkpoint()) {
+    if let Err(reason) = crate::fidelity_match::resolve(&run.info.checkpoint(),
+        run.info.configuration.snapshot.as_deref().map(std::path::Path::new)) {
         check.status = CheckStatus::Unsupported;
-        check.summary = reason;
+        check.summary = reason.to_string();
         return Ok(());
     }
     let scored = crate::panels::fidelity::score(run.client, run.info, "quick", "decode", run.progress,
@@ -238,6 +239,12 @@ fn fidelity(run: &mut Run<'_>, check: &mut Check) -> Result<()> {
     check.set("kl_max", verdict.kl_max); check.set("top1_min", verdict.top1_min);
     check.set("confident_top1", json!(f.confident_top1)); check.set("top3_contained", f.top3_contained);
     check.set("dataset", json!(scored.dataset));
+    if let Some(selection) = &scored.reference_selection {
+        check.set("reference_match", selection.reference_match.as_str());
+        check.set("reference_root", selection.reference_root.as_str());
+        check.set("resolved_chain", json!(selection.resolved_chain));
+        check.set("text_checkpoint", json!(selection.text_checkpoint));
+    }
     check.set("quick_subset", "bench-v1:legacy,a00,a04,a08,a20,c00,d00,e00");
     check.set("per_window", json!(crate::panels::fidelity::window_summaries(&scored)));
     check.set("verdict", json!(verdict));

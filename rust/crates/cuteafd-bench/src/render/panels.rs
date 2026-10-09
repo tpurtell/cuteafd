@@ -51,6 +51,26 @@ fn fidelity(doc: &mut Doc, t: &Theme, v: &Value, w: f64) -> f64 {
     doc.text(0.0, 14.0, Font::new(11.0, t.ink2), &super::svg::fit(&identity, 11.0, w));
     doc.end();
     y += 28.0;
+    if let Some(how) = v["reference_match"].as_str() {
+        let label = format!("Reference via {how}: {}", v["reference_root"].as_str().unwrap_or("?"));
+        doc.titled(&label);
+        doc.text(0.0, y + 12.0, Font::new(11.0, t.ink2), &super::svg::fit(&label, 11.0, w));
+        doc.end(); y += 22.0;
+        if let Some(chains) = v["resolved_chain"].as_array() {
+            for chain in chains {
+                let label = chain.as_array().map(|c| c.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(" -> ")).unwrap_or_default();
+                doc.titled(&label);
+                doc.text(0.0, y + 12.0, Font::new(10.0, t.ink2), &super::svg::fit(&label, 10.0, w));
+                doc.end(); y += 20.0;
+            }
+        }
+        if let Some(source) = v["text_checkpoint"].as_str() {
+            let label = format!("Window text from {source}");
+            doc.titled(&label);
+            doc.text(0.0, y + 12.0, Font::new(10.0, t.ink2), &super::svg::fit(&label, 10.0, w));
+            doc.end(); y += 20.0;
+        }
+    }
     for (path, verdict) in [("decode", &v["verdict"]), ("prefill", &v["prefill_verdict"])] {
         if verdict.is_null() { continue; }
         let status = if verdict["pass"] == true { "PASS" } else { "FAIL" };
