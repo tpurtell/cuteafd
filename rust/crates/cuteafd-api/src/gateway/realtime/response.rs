@@ -12,6 +12,8 @@ pub struct Output {
     pub tool_index: Option<usize>,
     pub published: bool,
     pub status: &'static str,
+    pub synced_final: bool,
+    tool_ended: bool,
 }
 pub struct Response {
     pub id: String,
@@ -64,6 +66,8 @@ impl Response {
             tool_index,
             published: false,
             status: "in_progress",
+            synced_final: false,
+            tool_ended: false,
         });
         let mut events = vec![];
         if self.conversation_id.is_some() {
@@ -104,11 +108,11 @@ impl Response {
             Item::ToolCall {
                 arguments,
                 id: call_id,
-                ..
+                name,
             } => events.push(self.event(
                 index,
                 "response.function_call_arguments.done",
-                json!({"call_id":call_id,"arguments":arguments}),
+                json!({"call_id":call_id,"name":name,"arguments":arguments}),
             )),
             _ => {}
         }
@@ -160,14 +164,24 @@ impl Response {
                 index,
                 id: call_id,
                 name,
-            } => events.extend(self.add(
-                Item::ToolCall {
-                    id: call_id,
-                    name,
-                    arguments: String::new(),
-                },
-                Some(index),
-            )),
+            } => {
+                // A later text segment belongs after this call, not in an earlier message.
+                if let Some(i) = self
+                    .output
+                    .iter()
+                    .rposition(|o| o.tool_index.is_none() && !o.finished)
+                {
+                    events.extend(self.finish(i, true));
+                }
+                events.extend(self.add(
+                    Item::ToolCall {
+                        id: call_id,
+                        name,
+                        arguments: String::new(),
+                    },
+                    Some(index),
+                ));
+            }
             TurnEvent::ToolCallDelta { index, arguments } => {
                 if let Some(i) = self.output.iter().position(|o| o.tool_index == Some(index)) {
                     if let Item::ToolCall { arguments: all, .. } = &mut self.output[i].item {
@@ -183,9 +197,11 @@ impl Response {
                     ));
                 }
             }
+            // Upstreams flush ToolCallEnd even for length-truncated calls. Only
+            // the terminal stop reason establishes whether the call is executable.
             TurnEvent::ToolCallEnd { index } => {
-                if let Some(i) = self.output.iter().position(|o| o.tool_index == Some(index)) {
-                    events.extend(self.finish(i, true));
+                if let Some(output) = self.output.iter_mut().find(|o| o.tool_index == Some(index)) {
+                    output.tool_ended = true;
                 }
             }
             TurnEvent::Usage { usage } => self.usage = usage,
@@ -203,10 +219,17 @@ impl Response {
         let completed = error.is_none()
             && !matches!(
                 stop,
-                Some(StopReason::Cancelled | StopReason::MaxTokens | StopReason::Refusal | StopReason::ContentFilter)
+                Some(
+                    StopReason::Cancelled
+                        | StopReason::MaxTokens
+                        | StopReason::Refusal
+                        | StopReason::ContentFilter
+                )
             );
         for i in 0..self.output.len() {
-            events.extend(self.finish(i, completed));
+            let item_completed =
+                completed && (self.output[i].tool_index.is_none() || self.output[i].tool_ended);
+            events.extend(self.finish(i, item_completed));
         }
         let (status, details) = if let Some(e) = error {
             (

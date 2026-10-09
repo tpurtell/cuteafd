@@ -238,11 +238,13 @@ async fn serve(
             Next::Cancel => c.finish(Some(StopReason::Cancelled), None).await,
             Next::Idle => {
                 c.idle = None;
-                let item_id = id("item");
+                let settings =
+                    audio::settings(&c.config, c.beta).expect("validated session audio config");
+                let (item_id, bytes, start, end) = c.audio.drain_idle(&settings);
                 let mut events = vec![
-                    json!({"type":"input_audio_buffer.timeout_triggered","item_id":item_id,"audio_start_ms":0,"audio_end_ms":0}),
+                    json!({"type":"input_audio_buffer.timeout_triggered","item_id":item_id,"audio_start_ms":start,"audio_end_ms":end}),
                 ];
-                match c.commit(item_id, vec![]).await {
+                match c.commit(item_id, bytes).await {
                     Ok(e) => events.extend(e),
                     Err(e) => events.push(protocol::error(e, None, None)),
                 };
@@ -271,7 +273,8 @@ async fn serve(
             break;
         }
     }
-    c.active.take();
+    // Retain the final partial contents for any shared holders before closing.
+    c.finish(Some(StopReason::Cancelled), None).await;
     c.cancel.take();
     c.session.lock().await.running = None;
     c.gateway.sessions.close(&session_id);
@@ -362,8 +365,15 @@ impl Connection {
                 let item_id = string(event, "item_id")?;
                 let session = self.session.lock().await;
                 let index = session.index_of(item_id)?;
+                let live = self
+                    .active
+                    .as_ref()
+                    .and_then(|r| r.output.iter().find(|o| o.id == item_id));
+                let (item, status) = live.map_or((&session.items[index].item, "completed"), |o| {
+                    (&o.item, o.status)
+                });
                 Ok(vec![
-                    json!({"type":"conversation.item.retrieved","item":protocol::wire_item(item_id,&session.items[index].item,"completed",self.beta)}),
+                    json!({"type":"conversation.item.retrieved","item":protocol::wire_item(item_id,item,status,self.beta)}),
                 ])
             }
             "conversation.item.delete" => {
@@ -435,7 +445,11 @@ impl Connection {
             "input_audio_buffer.append" => {
                 let settings = audio::settings(&self.config, self.beta)?;
                 let activities = self.audio.append(string(event, "audio")?, &settings)?;
-                self.idle = None;
+                if self.audio.speaking() || !activities.is_empty() || self.active.is_some() {
+                    self.idle = None;
+                } else if self.idle.is_none() {
+                    self.arm_idle();
+                }
                 let mut events = vec![];
                 for activity in activities {
                     match activity {
@@ -468,6 +482,9 @@ impl Connection {
                             }
                         }
                     }
+                }
+                if !self.audio.speaking() && self.active.is_none() && self.idle.is_none() {
+                    self.arm_idle();
                 }
                 Ok(events)
             }
@@ -652,6 +669,9 @@ impl Connection {
         }
         let mut session = self.session.lock().await;
         for output in &mut active.output {
+            if output.synced_final || (output.published && !output.finished) {
+                continue;
+            }
             let exists = session.items.iter().any(|i| i.id == output.id);
             // A client may delete an announced output item during generation.
             if output.published && !exists {
@@ -676,6 +696,7 @@ impl Connection {
                 tracing::warn!(error=%e,"Realtime history update failed");
             } else {
                 output.published = true;
+                output.synced_final = output.finished;
             }
         }
     }
@@ -684,21 +705,28 @@ impl Connection {
         stop: Option<StopReason>,
         error: Option<GatewayError>,
     ) -> Vec<Value> {
-        self.sync_output().await;
         self.cancel = None;
-        let Some(mut active) = self.active.take() else {
+        let Some(active) = self.active.as_mut() else {
             return vec![];
         };
         let events = active.finish_turn(stop, error);
+        self.sync_output().await;
+        self.active.take();
         let mut session = self.session.lock().await;
         session.running = None;
         drop(session);
-        if let Ok(settings) = audio::settings(&self.config, self.beta) {
-            self.idle = settings
-                .vad
-                .and_then(|v| v.idle_timeout_ms)
-                .map(|ms| tokio::time::Instant::now() + std::time::Duration::from_millis(ms));
-        }
+        self.arm_idle();
         events
+    }
+    fn arm_idle(&mut self) {
+        if self.audio.speaking() || self.active.is_some() {
+            self.idle = None;
+            return;
+        }
+        self.idle = audio::settings(&self.config, self.beta)
+            .ok()
+            .and_then(|s| s.vad)
+            .and_then(|v| v.idle_timeout_ms)
+            .map(|ms| tokio::time::Instant::now() + std::time::Duration::from_millis(ms));
     }
 }

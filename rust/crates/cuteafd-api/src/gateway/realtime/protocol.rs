@@ -447,12 +447,19 @@ pub fn turn(config: &Value, beta: bool, items: Vec<Item>) -> Result<TurnRequest,
     } else {
         "max_output_tokens"
     };
+    let tools = tools(&config["tools"])?;
+    let mut tool_choice = choice(&config["tool_choice"])?;
+    if tool_choice == ToolChoice::Required && tools.len() == 1 {
+        tool_choice = ToolChoice::Named {
+            name: tools[0].name.clone(),
+        };
+    }
     Ok(TurnRequest {
         requested_model: string(config, "model")?.into(),
         system: Some(string(config, "instructions")?.into()),
         items,
-        tools: tools(&config["tools"])?,
-        tool_choice: choice(&config["tool_choice"])?,
+        tools,
+        tool_choice,
         max_output_tokens: config[key].as_u64().map(|n| n as u32),
         sampling: super::super::turn::Sampling {
             temperature: config
