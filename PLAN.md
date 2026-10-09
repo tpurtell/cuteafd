@@ -3039,9 +3039,14 @@ calibration gap remains real but is not this regression.
    drafts per call (baseline 2.9-3.9): 3.27 tokens/step at 46.7-47.1 ms vs
    2.44-3.08 at 34.1-39.7 ms, C1 -9.8% with identical 320 output tokens.
    `CycleCost`'s online fit carries the wide-verify step costs learned at
-   high concurrency into single-sequence decode. Fit per concurrency regime
-   (or forget on a concurrency change), and gate C1 after a C16 run, not
-   only on a fresh server.
+   high concurrency into single-sequence decode. Its forgetting (FORGET 0.98,
+   ~50-step memory: 10% weight left after ~115 steps, ~350 tokens at C1)
+   would settle in steady traffic, but a short request after a load change
+   runs inside the stale window, and the wide plans it chooses keep feeding
+   the fit wide-step costs. Fix: one fit per concurrency bucket (1, 2-4, 5-8,
+   9-16+) sharing the table prior, so a regime switch lands on that regime's
+   learned costs; agentic traffic switches regimes constantly. Then re-gate
+   decode rows 128 at C16 and C1-after-C16 (it was 0.952 C16 in rc3 gating).
 
 ## Explore after v2
 
