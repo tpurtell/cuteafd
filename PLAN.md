@@ -1852,6 +1852,16 @@ TJ: two key items, both urgent right after v2.0.0.
    after v2"). V4.1's TP2 expert layers and memory placement are inputs to
    item 1; build the shared versions once, not twice. Design: "v3: retiring
    ds41rt" below.
+8. **`cuteafd plan --files` follows the effective serving config** (found
+   2026-10-10 in the MiMo sliced-checkpoint check).
+   - The bug: for the serving config, `plan --files` leaves out the MTP files
+     unless `--include-speculator` is given. It always leaves out a bundled
+     DFlash drafter (`dflash/`). A user who slices by the docs gets a
+     checkpoint that can't start the default speculator.
+   - The fix: by default, the file list follows the launcher's effective
+     speculator, drafter snapshot, vision and audio settings.
+   - Gate: for every family's default config, a slice from `plan --files`
+     starts and serves with the default speculator.
 Gate per family: golden/fidelity, then the quick A/B at the 2M operating
 point on the min and max reference configs. Requalify each family's cards
 as it moves.
