@@ -167,6 +167,8 @@ pub enum CacheGeometryError {
     InvalidContext,
     #[error("cache geometry arithmetic overflows: {0}")]
     Overflow(&'static str),
+    #[error("GLM decode rows must be between 1 and 64, got {0}")]
+    InvalidGlmDecodeRows(usize),
     #[error("resident tensor {name}: {what}")]
     ResidentTensor { name: String, what: String },
     #[error("{family} cache geometry unsupported: {what}")]
@@ -214,6 +216,46 @@ fn selected(
         });
     }
     Ok(())
+}
+
+/// Preserve the qualified short-context shapes; only long tables use geometric rows.
+pub const GLM_SHORT_ROW_BUCKETS: [usize; 24] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16,
+    20, 24, 28, 32, 40, 48, 56, 64];
+pub const GLM_LONG_ROW_BUCKETS: [usize; 7] = [1, 2, 4, 8, 16, 32, 64];
+pub const GLM_PAGE_ROWS: usize = 64;
+
+pub fn glm_decode_row_buckets(table_width: usize) -> &'static [usize] {
+    if table_width > 131_072 / GLM_PAGE_ROWS { &GLM_LONG_ROW_BUCKETS } else { &GLM_SHORT_ROW_BUCKETS }
+}
+
+pub fn glm_decode_row_bucket(rows: usize, table_width: usize) -> Result<usize, CacheGeometryError> {
+    if !(1..=64).contains(&rows) { return Err(CacheGeometryError::InvalidGlmDecodeRows(rows)); }
+    glm_decode_row_buckets(table_width).iter().copied().find(|&bucket| bucket >= rows)
+        .ok_or(CacheGeometryError::InvalidGlmDecodeRows(rows))
+}
+
+pub fn glm_decode_table_width(pages: usize, context: usize, pool_pages: usize) -> usize {
+    let cap = context.div_ceil(GLM_PAGE_ROWS).min(pool_pages).max(1);
+    pages.max(16).next_power_of_two().min(cap)
+}
+
+pub fn glm_decode_table_widths(context: usize, pool_pages: usize) -> Vec<usize> {
+    let cap = context.div_ceil(GLM_PAGE_ROWS).min(pool_pages).max(1);
+    let mut widths = vec![glm_decode_table_width(1, context, pool_pages)];
+    while *widths.last().unwrap() < cap {
+        widths.push(widths.last().unwrap().saturating_mul(2).min(cap));
+    }
+    widths
+}
+
+/// Per GPU: a 170 KB/segment calibration plus 10% and 64 MiB bounds the
+/// measured 131K/1M captures on SM120. Keep the qualified 3 GiB floor.
+/// The lead has one head segment in addition to the target's layer segments.
+pub fn glm_decode_graph_allowance(context: usize, layers: usize) -> Result<u64, CacheGeometryError> {
+    let shapes: usize = glm_decode_table_widths(context, context.div_ceil(GLM_PAGE_ROWS)).iter()
+        .map(|&width| glm_decode_row_buckets(width).len()).sum();
+    let bytes = product("GLM decode graphs", &[shapes as u64, layers as u64 + 1, 187_000])?;
+    Ok(sum("GLM decode graph margin", &[bytes, 64 << 20])?.max(3 << 30))
 }
 
 /// GLM keeps the complete latent/index pools on every head-split GPU.
@@ -656,6 +698,43 @@ mod tests {
         glm5_config, glm5_flash_config, mimo_flash_config, mimo_pro_config, qwen4_config,
     };
     use serde_json::json;
+
+    #[test]
+    fn glm_long_graphs_cover_every_row_and_keep_short_keys() {
+        let short = glm_decode_table_widths(131_072, 32_768);
+        assert_eq!(short, vec![16, 32, 64, 128, 256, 512, 1024, 2048]);
+        let long = glm_decode_table_widths(1_048_576, 32_768);
+        assert_eq!(&long[..short.len()], short.as_slice());
+        let shapes: usize = long.iter().map(|&w| glm_decode_row_buckets(w).len()).sum();
+        assert_eq!(shapes, 8 * 24 + 3 * 7);
+        for width in long {
+            for rows in 1..=64 {
+                let bucket = glm_decode_row_bucket(rows, width).unwrap();
+                assert!(bucket >= rows && bucket <= 64);
+                if width <= 2048 {
+                    assert_eq!(bucket, *GLM_SHORT_ROW_BUCKETS.iter().find(|&&b| b >= rows).unwrap());
+                } else {
+                    assert_eq!(bucket, rows.next_power_of_two());
+                }
+            }
+        }
+        assert!(glm_decode_row_bucket(0, 16384).is_err());
+        assert!(glm_decode_row_bucket(65, 16384).is_err());
+        assert_eq!(glm_decode_table_widths(1_048_576, 3000), vec![16, 32, 64, 128, 256, 512, 1024, 2048, 3000]);
+    }
+
+    #[test]
+    fn glm_graph_allowance_bounds_measured_captures_and_scales() {
+        let old = glm_decode_graph_allowance(131_072, 78).unwrap();
+        let new = glm_decode_graph_allowance(1_048_576, 78).unwrap();
+        assert_eq!(old, 3 << 30);
+        assert_eq!(new, 3 << 30);
+        assert!(old >= 2_575_302_656);
+        // Conservative physical bound at 213 shapes (79 lead segments each).
+        assert!(new >= 213 * 79 * 170_000 + (64 << 20));
+        assert!(glm_decode_graph_allowance(1_048_576, 100).unwrap() > new);
+        assert!(glm_decode_graph_allowance(0, 78).unwrap() >= 3 << 30);
+    }
 
     #[test]
     fn real_glm_indexer_schedule_and_replica_cost_are_exact() {

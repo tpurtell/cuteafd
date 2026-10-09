@@ -26,21 +26,22 @@ use cuteafd_ffi::programs::{Programs, Scalar, VocabularyHead, VOCABULARY_HEAD_WO
 use cuteafd_ffi::NativeLibrary;
 use cuteafd_loader::families::glm5::GlmDsaConfig;
 use crate::shared::peer_split::{PeerExchange, RankDevice, DIRECT};
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
+use cuteafd_loader::serving_capacity::{glm_decode_row_bucket, glm_decode_row_buckets,
+    glm_decode_table_width, glm_decode_table_widths, GLM_SHORT_ROW_BUCKETS};
 use std::ffi::c_void;
 
 type Dev<'a> = DeviceAllocation<'a>;
 
 pub(crate) const PAGE_ROWS: usize = 64;
 /// Decode/verify steps run padded to one of these row counts, and their page
-/// tables to a power-of-two width of at least [`MIN_TABLE_WIDTH`] pages (or the
+/// tables to a power-of-two width of at least 16 pages (or the
 /// whole context): a bounded set of decode graph shapes, all captured at
 /// startup ([`GlmEngine::warm_decode_graphs`]), so serving never captures.
 /// Exact up to 16 rows (one sequence's verify step: no padding at C1), then
 /// in steps of 4 / 8 (padding a batched step costs ~1% per row on the GPU).
-pub(crate) const ROW_BUCKETS: [usize; 24] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 20, 24, 28, 32, 40,
-    48, 56, 64];
-const MIN_TABLE_WIDTH: usize = 16;
+pub(crate) const ROW_BUCKETS: [usize; 24] = GLM_SHORT_ROW_BUCKETS;
+
 /// Statuses follow the ids in a decode workspace's `select` buffer at a fixed offset.
 const SELECT_STATUS_OFFSET: usize = DECODE_ROWS * 4;
 pub(crate) const RECORD_BYTES: usize = 656;
@@ -103,6 +104,19 @@ struct StepTables {
     /// Leading rows that are real (the rest pad a decode step to its row
     /// bucket and write only the scratch page): the Spark exchange sends these.
     exchange_rows: usize,
+}
+
+impl StepTables {
+    fn pad_rows(&mut self, pool_pages: usize, bucket: usize) {
+        let scratch = pool_pages as i32;
+        while self.positions.len() < bucket {
+            self.positions.push(0);
+            self.slots.push(i64::from(scratch) * PAGE_ROWS as i64);
+            self.cache_lengths.push(1);
+            self.lengths.push(1);
+            self.page_table.extend(std::iter::repeat_n(scratch, self.table_width));
+        }
+    }
 }
 
 /// A sequence's pages (shared by the latent and index caches) and length.
@@ -275,6 +289,9 @@ pub(crate) struct GlmEngine<'a> {
     /// copying received partials into the pinned staging.
     pub exchange_host: RefCell<[f64; 4]>,
     graphs: RefCell<std::collections::HashMap<GraphKey, GraphExec<'a>>>,
+    graphs_warmed: Cell<bool>,
+    graphs_warming: Cell<bool>,
+    graph_misses: Cell<u64>,
     /// The DFlash2 drafter; every step taps its target layers.
     pub drafter: Option<super::dflash::GlmDrafter<'a>>,
     /// L2 prefetch of the next layer's weights during decode exchanges.
@@ -343,7 +360,7 @@ impl<'a> GlmEngine<'a> {
             prefill_lanes: configured_lanes(),
             lanes: RefCell::new(Vec::new()), full_prefill_logits: false, skip: None, l2: None, profile: RefCell::new([0.0; 3]),
             exchange_host: RefCell::new([0.0; 4]),
-            graphs: RefCell::new(std::collections::HashMap::new()), drafter: None, embedding, prefill_w8a8: true })
+            graphs: RefCell::new(std::collections::HashMap::new()), graphs_warmed: Cell::new(false), graphs_warming: Cell::new(false), graph_misses: Cell::new(0), drafter: None, embedding, prefill_w8a8: true })
     }
 
     /// Every layer's latent record pool (656 B per row, 64-row pages) and, on full-indexer
@@ -716,7 +733,7 @@ impl<'a> GlmEngine<'a> {
                 tables.page_table.extend(std::iter::repeat_n(0, width - pages));
             }
         }
-        let bucket = Self::row_bucket(rows);
+        let bucket = glm_decode_row_bucket(rows, width)?;
         self.pad_rows(&mut tables, bucket);
         let mut padded = tokens.to_vec();
         padded.resize(bucket, 0);
@@ -729,40 +746,22 @@ impl<'a> GlmEngine<'a> {
         Ok(logits)
     }
 
-    /// The row bucket a decode step of `rows` rows runs as.
-    pub(crate) fn row_bucket(rows: usize) -> usize {
-        ROW_BUCKETS.iter().copied().find(|&b| b >= rows).unwrap_or(rows)
-    }
-
     /// The page-table width a decode step whose longest row needs `pages`
-    /// pages runs with: a power of two from [`MIN_TABLE_WIDTH`], capped at the
+    /// pages runs with: a power of two from 16, capped at the
     /// context's pages.
     fn table_width_bucket(&self, pages: usize) -> usize {
-        let cap = self.max_context.div_ceil(PAGE_ROWS).min(self.pages).max(1);
-        pages.max(MIN_TABLE_WIDTH).next_power_of_two().min(cap)
+        glm_decode_table_width(pages, self.max_context, self.pages)
     }
 
     /// Every table width [`Self::table_width_bucket`] returns.
     fn table_width_buckets(&self) -> Vec<usize> {
-        let mut widths: Vec<usize> = (0..usize::BITS).map(|b| 1usize << b)
-            .take_while(|&w| w < 2 * self.max_context.div_ceil(PAGE_ROWS).max(1))
-            .map(|w| self.table_width_bucket(w)).collect();
-        widths.dedup();
-        widths
+        glm_decode_table_widths(self.max_context, self.pages)
     }
 
     /// Pads a decode step's tables to `bucket` rows: position 0 of the scratch
     /// page past the pool (its own records and index keys; no sequence reads them).
     fn pad_rows(&self, tables: &mut StepTables, bucket: usize) {
-        let scratch = self.pages as i32;
-        let width = tables.table_width;
-        while tables.positions.len() < bucket {
-            tables.positions.push(0);
-            tables.slots.push(i64::from(scratch) * PAGE_ROWS as i64);
-            tables.cache_lengths.push(1);
-            tables.lengths.push(1);
-            tables.page_table.extend(std::iter::repeat_n(scratch, width));
-        }
+        tables.pad_rows(self.pages, bucket);
     }
 
     /// Captures every decode graph serving can replay: one padded step per
@@ -772,8 +771,9 @@ impl<'a> GlmEngine<'a> {
         let started = std::time::Instant::now();
         let free = |rank: usize| self.on(rank, || self.library.cuda_memory_info().map(|(free, _)| free as i64));
         let before: Vec<i64> = (0..self.ranks()).map(free).collect::<Result<_>>()?;
+        self.graphs_warming.set(true);
         for width in self.table_width_buckets() {
-            for bucket in ROW_BUCKETS {
+            for &bucket in glm_decode_row_buckets(width) {
                 let mut tables = StepTables { decode: true, positions: Vec::new(), slots: Vec::new(),
                     page_table: Vec::new(), table_width: width, table_stride: width, cache_lengths: Vec::new(),
                     lengths: Vec::new(), exchange_rows: 1 };
@@ -790,7 +790,10 @@ impl<'a> GlmEngine<'a> {
         }
         let graphs = self.graphs.borrow().len() + self.peer.as_ref().map_or(0, |p| p.graphs.borrow().len());
         let bytes: Vec<i64> = (0..self.ranks()).map(|rank| Ok(before[rank] - free(rank)?)).collect::<Result<_>>()?;
+        self.graphs_warming.set(false);
+        self.graphs_warmed.set(true);
         tracing::info!(graphs, ?bytes, widths = ?self.table_width_buckets(), rows = ?ROW_BUCKETS,
+            long_rows = ?cuteafd_loader::serving_capacity::GLM_LONG_ROW_BUCKETS,
             elapsed_ms = started.elapsed().as_millis() as u64, "GLM decode graphs captured at startup");
         Ok(graphs)
     }
@@ -1221,25 +1224,33 @@ impl<'a> GlmEngine<'a> {
             // SAFETY: the graph's pointers are persistent engine buffers of that rank.
             return self.on(rank, || unsafe { self.library.cuda_graph_launch(graph.0, stream) });
         }
+        if self.graphs_warmed.get() {
+            let misses = self.graph_misses.get().saturating_add(1);
+            self.graph_misses.set(misses);
+            tracing::warn!(rank, ?key, graph_misses = misses,
+                "GLM startup graph coverage gap; running segment uncaptured");
+            return segment();
+        }
         // SAFETY: capture records launches on that rank's stream; nothing in the
         // segment synchronizes the host.
         self.on(rank, || unsafe { self.library.cuda_graph_begin_capture(stream) })?;
         let captured = segment();
         let exec = self.on(rank, || unsafe { self.library.cuda_graph_end_capture(stream) });
         captured?;
-        match exec {
-            Ok(exec) => {
-                self.on(rank, || unsafe { self.library.cuda_graph_launch(exec, stream) })?;
-                graphs.borrow_mut().insert(key, GraphExec(exec, self.library));
+        let exec = match exec {
+            Ok(exec) => exec,
+            Err(error) if !self.graphs_warming.get() => {
+                let misses = self.graph_misses.get().saturating_add(1);
+                self.graph_misses.set(misses);
+                tracing::warn!(rank, ?key, graph_misses = misses, %error,
+                    "GLM decode graph capture failed; running segment uncaptured");
+                return segment();
             }
-            // An instantiation that fails (out of memory) runs the segment
-            // uncaptured: the step completes and the peer's exchange stays in
-            // step; the next replay of this shape tries again.
-            Err(error) => {
-                tracing::warn!(rank, ?key, %error, "decode graph capture failed; running the segment uncaptured");
-                segment()?;
-            }
-        }
+            Err(error) => return Err(error),
+        };
+        let graph = GraphExec(exec, self.library);
+        self.on(rank, || unsafe { self.library.cuda_graph_launch(graph.0, stream) })?;
+        graphs.borrow_mut().insert(key, graph);
         Ok(())
     }
 
@@ -1854,4 +1865,43 @@ fn weight(layer: &GlmLayer<'_>, name: &'static str, cap: &str) -> Result<Vec<(&'
     let (fp8, scale, kscale) = super::weights::fp8_operand_names(name);
     let scale = if cap != "m64" && !kscale.is_empty() { kscale } else { scale };
     Ok(vec![(fp8, layer.ptr(fp8)?), (scale, layer.ptr(scale)?)])
+}
+
+#[cfg(test)]
+mod long_graph_tests {
+    use super::*;
+
+    #[test]
+    fn long_padding_resolves_only_to_sized_scratch_records() {
+        let pages = 22_018;
+        for real in 1..=64 {
+            let width = 1_048_576 / PAGE_ROWS;
+            let bucket = glm_decode_row_bucket(real, width).unwrap();
+            let mut tables = StepTables { decode: true, positions: vec![200_000; real],
+                slots: vec![123 * PAGE_ROWS as i64; real], page_table: vec![123; real * width],
+                table_width: width, table_stride: width, cache_lengths: vec![200_001; real],
+                lengths: vec![2048; real], exchange_rows: real };
+            tables.pad_rows(pages, bucket);
+            assert_eq!(tables.exchange_rows, real);
+            assert_eq!(&tables.page_table[..real * width], vec![123; real * width]);
+            assert_eq!(&tables.positions[..real], vec![200_000; real]);
+            assert_eq!(tables.page_table.len(), bucket * width);
+            assert!(bucket * width * 4 <= DECODE_ROWS * pages * 4);
+            assert!(bucket <= DECODE_ROWS);
+            for row in real..bucket {
+                assert_eq!(tables.positions[row], 0);
+                assert_eq!(tables.cache_lengths[row], 1);
+                assert_eq!(tables.lengths[row], 1);
+                let slot = tables.slots[row] as usize;
+                assert_eq!(slot, pages * PAGE_ROWS);
+                assert!(tables.page_table[row * width..(row + 1) * width].iter()
+                    .all(|&page| page as usize == pages));
+                assert!((slot + 1) * RECORD_BYTES <= (pages + 1) * RECORD_PAGE_BYTES);
+                // 128-byte index key plus its 4-byte scale; only position zero is live.
+                assert!((slot + 1) * 132 <= (pages + 1) * INDEX_PAGE_BYTES);
+            }
+        }
+        assert_eq!(glm_decode_row_bucket(33, 16384).unwrap(), DECODE_ROWS);
+        assert_eq!(INDEX_PAGE_BYTES, PAGE_ROWS * 132);
+    }
 }
