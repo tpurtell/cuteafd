@@ -16,18 +16,26 @@ pub(crate) struct ApiArgs {
     /// Set to off to disable all request accounting.
     #[arg(long, default_value = "on", value_parser = ["on", "off"])]
     pub usage: Option<String>,
+    /// File containing the host console secret (never an API credential).
+    #[arg(long)]
+    pub console_secret_file: Option<PathBuf>,
+    /// Always mark the console cookie Secure.
+    #[arg(long)]
+    pub console_cookie_secure: bool,
 }
 pub(crate) struct ApiPolicy {
     key: Option<ApiKey>,
     bench: bool,
     usage: Option<Arc<cuteafd_usage::Store>>,
+    gate: cuteafd_api::console_gate::ConsoleGate,
 }
 impl ApiArgs {
     pub fn load(&self) -> anyhow::Result<ApiPolicy> {
         let key = self.api_key_file.as_deref().map(ApiKey::from_file).transpose()?;
         anyhow::ensure!(!self.enable_bench || key.is_some(), "--enable-bench requires --api-key-file");
         let usage = if self.usage.as_deref() == Some("off") { None } else { Some(cuteafd_usage::Store::open(self.usage_dir.as_deref())?) };
-        Ok(ApiPolicy { key, bench: self.enable_bench, usage })
+        let gate = self.console_secret_file.as_deref().map(|p| cuteafd_api::console_gate::ConsoleGate::from_file(p, self.console_cookie_secure)).transpose()?.unwrap_or_else(cuteafd_api::console_gate::ConsoleGate::locked);
+        Ok(ApiPolicy { key, bench: self.enable_bench, usage, gate })
     }
 }
 impl ApiPolicy {
@@ -43,6 +51,8 @@ impl ApiPolicy {
             });
             (cuteafd_bench::http::mount(router, bench), Some(internal))
         } else { (router, None) };
+        let router = self.gate.mount(router);
+        tracing::info!("console: protected views unlock through the launcher's link");
         let router = router.layer(axum::middleware::from_fn_with_state(Auth { key: self.key, internal },
             cuteafd_api::openai::auth::require_key));
         if let Some(store) = self.usage {
@@ -84,7 +94,7 @@ mod tests {
             .await.unwrap().status(), StatusCode::NOT_FOUND);
         let (tx, rx) = tokio::sync::mpsc::channel(1);
         drop(rx);
-        let app = ApiPolicy { key: Some(ApiKey::new("secret").unwrap()), bench: false, usage: None }.app(
+        let app = ApiPolicy { key: Some(ApiKey::new("secret").unwrap()), bench: false, usage: None, gate: cuteafd_api::console_gate::ConsoleGate::locked() }.app(
             cuteafd_api::openai::router(tx), cuteafd_api::openai::ConsoleHub::disabled());
         assert_eq!(app.clone().oneshot(axum::http::Request::post("/v1/chat/completions")
             .body(Body::from("malformed")).unwrap()).await.unwrap().status(), StatusCode::UNAUTHORIZED);

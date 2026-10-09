@@ -1195,10 +1195,13 @@ api_mount_args=()
 API_KEY_FILE="$(get API_KEY_FILE "${API_KEY_FILE:-}")"
 ENABLE_BENCH="$(get ENABLE_BENCH off)"
 release_prepare_api_key "$ENABLE_BENCH" "${instance:-default}"
+release_prepare_console "${instance:-default}"
+api_mount_args+=(--mount "type=bind,src=$CONSOLE_SECRET_FILE,dst=/run/cuteafd-console-secret,readonly" -v "$USAGE_DIR:/root/.cache/cuteafd/usage")
+family_args+=(--console-secret-file /run/cuteafd-console-secret --usage-dir /root/.cache/cuteafd/usage)
 if [[ -n "$API_KEY_FILE" ]]; then
   [[ -f "$API_KEY_FILE" && -r "$API_KEY_FILE" ]] || { echo "API_KEY_FILE must name a readable file" >&2; exit 2; }
   API_KEY_FILE="$(readlink -f "$API_KEY_FILE")"
-  api_mount_args=(--mount "type=bind,src=$API_KEY_FILE,dst=/run/cuteafd-api-key,readonly")
+  api_mount_args+=(--mount "type=bind,src=$API_KEY_FILE,dst=/run/cuteafd-api-key,readonly")
   family_args+=(--api-key-file /run/cuteafd-api-key)
 fi
 case "$ENABLE_BENCH" in
@@ -1234,3 +1237,5 @@ until curl --max-time 5 -sf "$url/health" >/dev/null; do
   sleep 2
 done
 echo "API ready at $url/v1/ ($(release_api_curl -s "$url/v1/models" | python3 -c 'import json,sys;print(json.load(sys.stdin)["data"][0]["id"])'))"
+
+release_print_console_link "http://$(hostname):${addr##*:}"

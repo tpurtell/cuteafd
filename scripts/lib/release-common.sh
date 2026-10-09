@@ -240,6 +240,69 @@ release_model_list_matches() {
     >/dev/null 2>&1
 }
 
+# Provision a reusable owned 0600 secret without putting its value in argv.
+release_prepare_secret() {
+  python3 - "$1" "$2" "${3:-reuse}" <<'PYSECRET'
+import os
+from pathlib import Path
+import secrets
+import stat
+import sys
+import tempfile
+root = Path(sys.argv[1])
+root.mkdir(mode=0o700, parents=True, exist_ok=True)
+if root.is_symlink() or root.stat().st_uid != os.getuid() or root.stat().st_mode & 0o022:
+    raise SystemExit('secret directory must be owned by this user and not writable by others')
+if sys.argv[2] == 'secret' and stat.S_IMODE(root.stat().st_mode) != 0o700:
+    raise SystemExit('console secret directory must have mode 0700')
+path = root / sys.argv[2]
+if path.exists() or path.is_symlink():
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    with os.fdopen(fd, 'r') as stream:
+        info = os.fstat(stream.fileno())
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != 0o600:
+            raise SystemExit('secret must be an owned regular file with mode 0600')
+        key = stream.read().rstrip('\r\n')
+        if not key or any(not 33 <= ord(c) <= 126 for c in key):
+            raise SystemExit('secret file is invalid')
+        if sys.argv[2] == 'secret' and (len(key) != 64 or any(c not in '0123456789abcdef' for c in key)):
+            raise SystemExit('console secret must be 32 random bytes encoded as hex')
+fd, temporary = tempfile.mkstemp(prefix='.' + sys.argv[2] + '-', dir=root)
+try:
+    with os.fdopen(fd, 'w') as stream:
+        stream.write(secrets.token_hex(32) + '\n')
+        stream.flush()
+        os.fsync(stream.fileno())
+    if sys.argv[3] == 'rotate':
+        # Preserve the inode: a running container's read-only bind mount sees rotation.
+        fd = os.open(path, os.O_WRONLY | os.O_TRUNC | os.O_NOFOLLOW)
+        with os.fdopen(fd, 'w') as stream:
+            stream.write(Path(temporary).read_text())
+            stream.truncate()
+            stream.flush()
+            os.fsync(stream.fileno())
+    else:
+        try:
+            os.link(temporary, path)
+        except FileExistsError:
+            pass
+finally:
+    os.unlink(temporary)
+print(path)
+PYSECRET
+}
+release_prepare_console() {
+  CONSOLE_SECRET_FILE="$(release_prepare_secret "$HOME/.cache/cuteafd/console" secret)" || release_die "could not provision console secret"
+  USAGE_DIR="$HOME/.cache/cuteafd/${1:-default}/usage"
+  mkdir -p "$USAGE_DIR"
+  chmod 700 "$USAGE_DIR"
+}
+release_print_console_link() {
+  # The only intentional disclosure is host stdout, never coordinator logs.
+  local base="${CONSOLE_URL:-$1}"
+  printf 'console unlock: %s/console/unlock?token=%s\n' "${base%/}" "$(tr -d '\r\n' <"$CONSOLE_SECRET_FILE")"
+}
+
 # Benchmark opt-in provisions a reusable key, never exposing it in logs or argv.
 release_prepare_api_key() {
   local enabled="${1:-off}" instance="${2:-default}"
@@ -249,43 +312,7 @@ release_prepare_api_key() {
   esac
   if [[ "$enabled" == on && -z "${API_KEY_FILE:-}" ]]; then
     [[ "$instance" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,40}$ ]] || release_die "invalid API key instance"
-    API_KEY_FILE="$(python3 - "$HOME/.cache/cuteafd/$instance" <<'PYKEY'
-import os
-from pathlib import Path
-import secrets
-import stat
-import sys
-import tempfile
-
-root = Path(sys.argv[1])
-root.mkdir(mode=0o700, parents=True, exist_ok=True)
-if root.is_symlink() or root.stat().st_uid != os.getuid() or root.stat().st_mode & 0o022:
-    raise SystemExit('API key directory must be owned by this user and not writable by others')
-path = root / 'api-key'
-fd, temporary = tempfile.mkstemp(prefix='.api-key-', dir=root)
-try:
-    with os.fdopen(fd, 'w') as stream:
-        stream.write(secrets.token_hex(32) + '\n')
-        stream.flush()
-        os.fsync(stream.fileno())
-    # Publish without replacing a key another concurrent launcher installed.
-    try:
-        os.link(temporary, path)
-    except FileExistsError:
-        pass
-finally:
-    os.unlink(temporary)
-fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
-with os.fdopen(fd, 'r') as stream:
-    info = os.fstat(stream.fileno())
-    if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != 0o600:
-        raise SystemExit('generated API key must be an owned regular file with mode 0600')
-    key = stream.read().rstrip('\r\n')
-    if not key or any(not 33 <= ord(c) <= 126 for c in key):
-        raise SystemExit('generated API key file is invalid')
-print(path)
-PYKEY
-)" || release_die "could not provision benchmark API key"
+    API_KEY_FILE="$(release_prepare_secret "$HOME/.cache/cuteafd/$instance" api-key)" || release_die "could not provision benchmark API key"
     printf 'Benchmark API key file: %s\n' "$API_KEY_FILE" >&2
   fi
   if [[ -n "${API_KEY_FILE:-}" ]]; then

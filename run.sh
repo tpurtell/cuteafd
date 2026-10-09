@@ -112,6 +112,7 @@ while [[ $# -gt 0 ]]; do
     --tp2-dspark-experts) overrides[TP2_DSPARK_EXPERTS]=on; shift ;;
     --no-tp2-dspark-experts) overrides[TP2_DSPARK_EXPERTS]=off; shift ;;
     --wip) wip_slot="${2:?$1 requires SLOT}"; shift 2 ;;
+    --rotate-console-secret) exec "$repo_root/scripts/launch/console-secret.sh" rotate ;;
     --restart) restart=1; shift ;;
     --all) restart_all=1; shift ;;
     --dry-run) dry_run=1; shift ;;
@@ -548,6 +549,7 @@ if ((dry_run)); then
   exit 0
 fi
 release_prepare_api_key "${ENABLE_BENCH:-off}" "${INSTANCE:-default}"
+release_prepare_console "${INSTANCE:-default}"
 if ((restart)); then
   release_stop_services "$coordinator" "$spark_prefix"
   ((restart_all == 0)) || release_stop_all_worker_containers
@@ -660,10 +662,11 @@ start_coordinator() {
 echo "== starting native RTX coordinator =="
 local -a args=(--vision "$VISION" --audio "$AUDIO" serve-native "${vision_args[@]}" --snapshot "/root/.cache/huggingface/$snapshot_rel" --native-lib /opt/cuteafd/lib/libcuteafd_native.so --peers "$peers" --rtx-gpus "$RELEASE_RTX_GPUS" --embedding-placement "$EMBEDDING" --listen "$ADDR" --prefill-batch-tokens "$PREFILL_BATCH_TOKENS" --concurrency "$CONCURRENCY" --prefix-cache-entries "$PREFIX_CACHE_ENTRIES" --max-context-tokens "$MAX_CONTEXT_TOKENS" --max-output-tokens "$MAX_OUTPUT_TOKENS")
 [[ -z "${COORDINATOR_GPU_BUDGET_GIB:-}" ]] || args+=(--coordinator-gpu-budget-gib "$COORDINATOR_GPU_BUDGET_GIB")
-local -a api_mount_args=()
+args+=(--console-secret-file /run/cuteafd-console-secret --usage-dir /root/.cache/cuteafd/usage)
+local -a api_mount_args=(--mount "type=bind,src=$CONSOLE_SECRET_FILE,dst=/run/cuteafd-console-secret,readonly" -v "$USAGE_DIR:/root/.cache/cuteafd/usage")
 if [[ -n "${API_KEY_FILE:-}" ]]; then
   [[ -f "$API_KEY_FILE" && -r "$API_KEY_FILE" ]] || release_die "API_KEY_FILE must name a readable file"
-  api_mount_args=(--mount "type=bind,src=$(readlink -f "$API_KEY_FILE"),dst=/run/cuteafd-api-key,readonly")
+  api_mount_args+=(--mount "type=bind,src=$(readlink -f "$API_KEY_FILE"),dst=/run/cuteafd-api-key,readonly")
   args+=(--api-key-file /run/cuteafd-api-key)
 fi
 case "${ENABLE_BENCH:-off}" in
@@ -826,6 +829,7 @@ until curl -fsS "$api_url/health" >/dev/null 2>&1 &&
 done
 trap - EXIT
 echo "CUTEAFD native API is ready at $api_url/v1/"
+release_print_console_link "http://$(hostname):${ADDR##*:}"
 echo "  API model: $RELEASE_NATIVE_API_MODEL_ID"
 echo "  checkpoint: $RELEASE_MODEL_ID@$RELEASE_MODEL_REVISION"
 echo "  RTX layout: $RELEASE_RTX_GPUS GPU(s), host indices $gpu_index_csv ($gpu_uuid_csv)"

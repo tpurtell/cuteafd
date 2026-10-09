@@ -189,8 +189,7 @@ exec python3 -c "$code" "$@"
     config.write_text(f"MODEL_ID={model}\nSPARK_COUNT=1\nSPARK_0_HOST=h0\nSPARK_0_LANE_A=10.0.0.1\n{keys}")
     env = {**os.environ, "HF_HOME": str(hf), "PATH": f"{bin_dir}:{os.environ['PATH']}",
            "STUB_PROGRAMS": str(tmp_path / "PROGRAMS.json"), **(extra_env or {})}
-    if wip:
-        env["HOME"] = str(tmp_path / "home")
+    env["HOME"] = str(tmp_path / "home")
     if not with_nest:
         # Hide any nest the host has, keeping only the stub directory and the system tools.
         env["PATH"] = f"{bin_dir}:/usr/bin:/bin"
