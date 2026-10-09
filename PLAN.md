@@ -1845,10 +1845,16 @@ and quant, the drafter, and the drafter's numerics, so other combinations are
 miscalibrated. Measured: GLM Flash with the tensor-core head and W8A8 drafter
 kept acceptance (67.1% -> 66.5% median) but the policy chose ~20% shorter
 verify prefixes (tokens/step 2.6 -> 2.1), C1 -12% despite ~7% cheaper steps.
+Option isolation then showed the drafter options alone are not that cause
+(tensor head + W8A8 alone: C1 86.0 vs 84.3, acceptance 69.9%); the
+calibration gap remains real but is not this regression.
 
-1. One fit per (family, drafter) (TJ: avoid per-quant fits): ~32 fixed-K7
-   requests on one representative quant, 6 coefficients shipped beside the
-   drafter config; generic fit plus a log line when absent. The selector
+1. One fit per (family, drafter, drafter numerics) (TJ: avoid per-quant
+   fits). Numerics is a short key such as `bf16-r1` or `fp8-w8a8-r1`; bump the
+   revision on any major change to the drafter's math (head kernel,
+   accumulation order, quantization). ~32 fixed-K7 requests on one
+   representative quant, 6 coefficients shipped beside the drafter config;
+   generic fit plus a log line when the key is absent. The selector
    features are the drafter's own outputs, so target quant mostly shifts the
    acceptance level, which step 2 absorbs.
 2. Online refinement always on: the per-drafter fit is the prior,
