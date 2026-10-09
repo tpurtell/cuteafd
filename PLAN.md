@@ -3428,21 +3428,20 @@ of their own (decode rows 128 stays opt-in until D2's C1-after-C16 card).
   today's quotas and GLM rules; D3 changes the quotas. Keep them separate so
   a regression names its cause.
 
-### Open questions for TJ (with recommendations)
+### Decisions (TJ, 2026-10-09: "The fable plan 6 questions sound good")
 
-1. **First family.** GLM Flash (the measured failure, both drafters, both
-   expert homes) or MiMo (go-to model)? Recommend GLM Flash, MiMo next.
-2. **Always-on layer events.** Accept ~`layers` event records and reads per
-   round on every family, as V4.1 does? Recommend yes, measured in D2.
-3. **One online calibration owner.** Delete the shared affine `Calibration`
-   and v2's online correction in favor of per-(source, position) Platt with
-   pooled shrinkage? Recommend yes; Qwen's per-position caution is handled by
-   the shrinkage threshold, and D4's Qwen card checks it.
-4. **Global row budget.** Replace equal per-request quotas (D3)? Recommend
-   yes, gated separately on C16 heterogeneous prompts.
-5. **Interim buckets.** Skip hardware gating of v2's `CycleCost` buckets and
-   go straight to D2? Recommend yes; merge v2's opt-in `SelectorFit` and
-   `compete_copies` on CPU gates since D2/D3 reuse them.
+1. **First family:** GLM Flash, MiMo next.
+2. **Always-on layer events** on every family, as V4.1 does; cost measured in
+   D2, with every-Nth-round reads as the fallback.
+3. **One online calibration owner:** per-(source, position) Platt with pooled
+   shrinkage; the shared affine `Calibration` and v2's online correction go.
+4. **Global row budget** replaces equal per-request quotas (D3), gated
+   separately on C16 heterogeneous prompts.
+5. **Interim buckets:** no hardware gate for v2's `CycleCost` buckets; merge
+   v2's opt-in `SelectorFit` and `compete_copies` on CPU gates, since D2/D3
+   reuse them.
+6. **Earlier decisions stand:** V4.1's 20/20 split and no unified serve loop
+   (three family loops carry the D1 binding).
 
 ## First after rc3: per-key draft confidence calibration (TJ, 2026-10-09)
 
