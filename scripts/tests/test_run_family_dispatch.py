@@ -1644,7 +1644,7 @@ def test_glmf_auto_defaults_and_encoder_plan_agree(tmp_path, split, fixed, local
     planner = next(line for line in lines if "cuteafd plan" in line)
     serve = next(line for line in lines if "cuteafd serve-glmf" in line)
     for command in (planner, serve):
-        assert ("--decode-rows 128" in command) == (wide and not split), command
+        assert "--decode-rows 128" not in command, command
         assert ("--index-cache compact" in command) == (not split), command
         assert ("--replay-records shared" in command) == (not split and not fixed and not local), command
         assert "--prefix-marks pool" not in command
@@ -1659,7 +1659,7 @@ def test_glmf_auto_defaults_and_encoder_plan_agree(tmp_path, split, fixed, local
     ("compact", "bf16", None), ("compact", "bf16-tile", None),
     ("compact", "f32", "kda_commit_c"),
 ])
-def test_glmf_wide_probe_matches_index_and_state_programs(tmp_path, index, state, missing):
+def test_glmf_auto_rows_keep_64_even_with_wide_programs(tmp_path, index, state, missing):
     config = {**GLMF_VISION, "moe_intermediate_size": 2048, "intermediate_size": 12288}
     stems = ["mhc_post_pre", "mla_producer", "o", "sparse_mla_decode", "index_producer",
              "index_topk_decode", "ffn_i2048", "ffn_i12288"]
@@ -1675,11 +1675,9 @@ def test_glmf_wide_probe_matches_index_and_state_programs(tmp_path, index, state
     assert result.returncode == 0, result.stderr
     for line in result.stderr.splitlines():
         if "cuteafd plan" in line or "cuteafd serve-glmf" in line:
-            assert ("--decode-rows 128" in line) == (missing is None), line
-    rows = 128 if missing is None else 64
-    assert f"GLM5_FLASH_DECODE_ROWS=auto -> {rows} (" in result.stderr
-    if missing:
-        assert "missing manifest or required m128 programs in selected build" in result.stderr
+            assert "--decode-rows 128" not in line, line
+    assert "GLM5_FLASH_DECODE_ROWS=auto -> 64 (" in result.stderr
+    assert "128 rows remain opt-in; C16 and post-C16 C1 draft-cost gate" in result.stderr
 
 
 @pytest.mark.parametrize("fp8", ["auto", "off"])
