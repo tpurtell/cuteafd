@@ -41,6 +41,17 @@ pub trait SearchProvider: Send + Sync + 'static {
     /// `exa`, `searxng`, ...
     fn name(&self) -> &str;
     fn search(&self, query: SearchQuery) -> BoxFuture<'static, Result<Vec<SearchHit>, GatewayError>>;
+    /// Optional recency-aware search. Providers without date filtering return a clear error.
+    fn search_recent_with_tape(&self, query: SearchQuery, recency: Option<u64>, tape: super::record::Tape) -> BoxFuture<'static, Result<Vec<SearchHit>, GatewayError>> {
+        if recency.is_some() {
+            return Box::pin(async { Err(GatewayError::unsupported("this search provider does not support recency")) });
+        }
+        self.search_with_tape(query, tape)
+    }
+    /// Page contents by URL, when the provider supports fetching (no direct gateway fetch).
+    fn fetch_with_tape(&self, _url: String, _tape: super::record::Tape) -> BoxFuture<'static, Result<SearchHit, GatewayError>> {
+        Box::pin(async { Err(GatewayError::unsupported("open not supported by this search provider")) })
+    }
     /// Default keeps existing providers compatible; concrete HTTP providers record raw exchanges.
     fn search_with_tape(&self, query: SearchQuery, tape: super::record::Tape) -> BoxFuture<'static, Result<Vec<SearchHit>, GatewayError>> {
         let provider = self.name().to_string();

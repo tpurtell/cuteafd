@@ -44,11 +44,13 @@ pub struct Gateway {
     pub sessions: SessionStore,
     /// Hosted web search; `None` makes hosted search tools a clear 400.
     pub search: Option<Arc<dyn SearchProvider>>,
+    /// Bounded reference/page cache and accounting for Codex standalone web.run.
+    pub standalone_search: responses::SearchCache,
 }
 
 impl Gateway {
     pub fn new(backend: Arc<dyn Backend>, models: ModelMap) -> Self {
-        Self { backend, models, sessions: SessionStore::default(), search: None }
+        Self { backend, models, sessions: SessionStore::default(), search: None, standalone_search: responses::SearchCache::default() }
     }
 
     pub fn with_search(mut self, provider: Arc<dyn SearchProvider>) -> Self {

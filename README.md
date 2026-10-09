@@ -390,10 +390,20 @@ name = "cuteafd"
 base_url = "http://HOST:PORT/v1"
 wire_api = "responses"
 env_key = "CUTEAFD_API_KEY"    # export CUTEAFD_API_KEY=$(cat FILE)
+supports_standalone_web_search = true
 # Optional: the served model's real context window and output limit, so
 # Codex compacts at the right point instead of using its built-in numbers.
 model_catalog_url = "http://HOST:PORT/v1/codex/models.json"
 ```
+
+Codex's responses-lite mode uses the client-executed `web.run` extension,
+not a hosted Responses tool. `supports_standalone_web_search = true` enables
+its authenticated `POST /v1/alpha/search` calls. Queries work with either search
+provider; Exa also supports page `open`, and `find` searches opened text cached
+for the session. `time` works locally; image search, click, screenshot, finance,
+weather and sports return explicit unsupported tool output. Cached mode uses the
+provider's index rather than promising cache-only access. Reference/page caches
+are bounded and expire after an hour of inactivity; reopen URLs if refs expire.
 
 **Realtime:** any client that accepts a custom URL can connect to
 `ws://HOST:PORT/v1/realtime?model=...`. These run headless against it:

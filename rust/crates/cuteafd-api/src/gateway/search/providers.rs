@@ -16,10 +16,10 @@ fn endpoint(url: &str, suffix: &str) -> Result<String, GatewayError> {
     Ok(format!("{}/{suffix}",url.trim_end_matches('/')))
 }
 #[derive(Clone)]
-pub struct Exa { client: reqwest::Client, key: String, endpoint: String }
+pub struct Exa { client: reqwest::Client, key: String, endpoint: String, contents_endpoint: String }
 impl Exa {
     pub fn new(key: String) -> Result<Self, GatewayError> { Self::with_url(key, "https://api.exa.ai") }
-    pub fn with_url(key: String, url: &str) -> Result<Self, GatewayError> { Ok(Self { client:client()?,key,endpoint:endpoint(url,"search")? }) }
+    pub fn with_url(key: String, url: &str) -> Result<Self, GatewayError> { Ok(Self { client:client()?,key,endpoint:endpoint(url,"search")?,contents_endpoint:endpoint(url,"contents")? }) }
 }
 #[derive(Clone)]
 pub struct Searxng { client: reqwest::Client, endpoint: String }
@@ -74,12 +74,38 @@ impl SearchProvider for Exa {
     fn name(&self) -> &str { "exa" }
     fn search(&self, query: SearchQuery) -> BoxFuture<'static, Result<Vec<SearchHit>,GatewayError>> { self.search_with_tape(query,Tape::default()) }
     fn search_with_tape(&self, query: SearchQuery, tape: Tape) -> BoxFuture<'static, Result<Vec<SearchHit>,GatewayError>> {
+        self.search_recent_with_tape(query, None, tape)
+    }
+    fn search_recent_with_tape(&self, query: SearchQuery, recency: Option<u64>, tape: Tape) -> BoxFuture<'static, Result<Vec<SearchHit>,GatewayError>> {
         let this = self.clone();
         Box::pin(async move {
-            let request = exa_request(&query);
+            let mut request = exa_request(&query);
+            if let Some(days) = recency {
+                if days > 36500 { return Err(GatewayError::invalid("recency exceeds 36500 days")); }
+                let duration = time::Duration::days(days as i64);
+                let start = time::OffsetDateTime::now_utc().checked_sub(duration).ok_or_else(|| GatewayError::invalid("recency too large"))?;
+                request["startPublishedDate"] = json!(start.format(&time::format_description::well_known::Rfc3339).map_err(|_| GatewayError::invalid("recency too large"))?);
+            }
             let result = this.client.post(&this.endpoint).header("x-api-key",&this.key).json(&request).send().await
                 .map_err(|_| GatewayError::upstream("search request transport failure"))?;
             response(result,&query,&tape,"exa",request,true).await
+        })
+    }
+    fn fetch_with_tape(&self, url: String, tape: Tape) -> BoxFuture<'static, Result<SearchHit,GatewayError>> {
+        let this = self.clone();
+        Box::pin(async move {
+            let request = json!({"ids":[url],"text":{"maxCharacters":32768}});
+            let result = this.client.post(&this.contents_endpoint).header("x-api-key",&this.key).json(&request).send().await
+                .map_err(|_| GatewayError::upstream("page contents transport failure"))?;
+            let status = result.status().as_u16();
+            let body = bounded_body(result, 2 * 1024 * 1024).await?;
+            tape.record("search", || json!({"provider":"exa","operation":"contents","request":request,"status":status,"body":String::from_utf8_lossy(&body)}));
+            if !(200..300).contains(&status) { return Err(http_error(status)); }
+            let value: Value = serde_json::from_slice(&body).map_err(|_| GatewayError::upstream("invalid page contents JSON"))?;
+            let hit = value["results"].as_array().and_then(|r| r.first()).ok_or_else(|| GatewayError::upstream("page contents unavailable"))?;
+            let content = hit["text"].as_str().ok_or_else(|| GatewayError::upstream("page text unavailable"))?;
+            Ok(SearchHit { url, title:hit["title"].as_str().unwrap_or_default().chars().take(512).collect(),
+                content:content.chars().take(32768).collect(),published:None })
         })
     }
 }
