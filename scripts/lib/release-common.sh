@@ -307,9 +307,14 @@ release_prepare_console() {
   chmod 700 "$USAGE_DIR"
 }
 release_print_console_link() {
-  # The only intentional disclosure is host stdout, never coordinator logs.
+  # The only intentional disclosure is an interactive terminal, never a
+  # redirected log (bench harnesses and agents capture launcher stdout).
   local base="${CONSOLE_URL:-$1}"
-  printf 'console unlock: %s/console/unlock?token=%s\n' "${base%/}" "$(tr -d '\r\n' <"$CONSOLE_SECRET_FILE")"
+  if [[ -t 1 || "${CUTEAFD_PRINT_CONSOLE_LINK:-}" == 1 ]]; then
+    printf 'console unlock: %s/console/unlock?token=%s\n' "${base%/}" "$(tr -d '\r\n' <"$CONSOLE_SECRET_FILE")"
+  else
+    printf 'console unlock: %s/console/unlock?token=<contents of %s>\n' "${base%/}" "$CONSOLE_SECRET_FILE"
+  fi
 }
 
 # Benchmark opt-in provisions a reusable key, never exposing it in logs or argv.
