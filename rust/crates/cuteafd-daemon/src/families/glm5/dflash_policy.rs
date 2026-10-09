@@ -18,43 +18,10 @@ pub(crate) const START_DRAFTS: usize = 5;
 /// A single sequence keeps five drafts unless the schedule beats it by 2%.
 const REFERENCE_MARGIN: f64 = 1.02;
 
-// glmrt dflash2_confidence.rs (frozen fit 6d34604f...).
-const MEAN: [f64; 6] = [1.0337757155740168, 1.5042334365117003, 4.105818737585014, 0.5404882231666059,
-    0.18709320564567553, 0.36878205711857714];
-const SCALE: [f64; 6] = [0.6869594087005682, 0.8183292270430992, 3.7913657744791154, 0.6412433617632998,
-    0.4768998480274627, 0.23888156204918426];
-const BETA: [f64; 7] = [1.3954686667753908, 0.05344836366609415, -0.3418558408836222, 1.7687177070514315,
-    -0.5006880248156605, -0.21189320574726964, -0.09773211967803144];
-
-/// Calibrated conditional acceptance per position from the history rates
-/// and the selector features; None when a feature is out of range.
+/// Generic fallback retained for the frozen-fit parity test.
+#[cfg(test)]
 pub(crate) fn calibrated_confidence(history: &[f64], features: &[[f32; 4]]) -> Option<Vec<f64>> {
-    if history.is_empty() || history.len() > 7 || features.len() < history.len() {
-        return None;
-    }
-    let logit = |p: f64| {
-        let p = p.clamp(1e-4, 1.0 - 1e-4);
-        (p / (1.0 - p)).ln()
-    };
-    history.iter().zip(features).enumerate().map(|(index, (&prior, &[margin, probability, entropy, rank]))| {
-        let valid = prior.is_finite() && (0.0..=1.0).contains(&prior)
-            && [margin, probability, entropy, rank].iter().all(|x| x.is_finite())
-            && margin >= 0.0 && probability > 0.0 && probability <= 1.0
-            && (-1e-5..=2.80).contains(&entropy) && (0.0..16.0).contains(&rank) && rank.fract() == 0.0;
-        if !valid {
-            return None;
-        }
-        let x = [logit(prior), f64::from(margin).ln_1p(), logit(f64::from(probability)), f64::from(entropy),
-            f64::from(rank).ln_1p(), (index + 1) as f64 / 7.0];
-        let z = (BETA[0] + (0..6).map(|i| BETA[i + 1] * (x[i] - MEAN[i]) / SCALE[i]).sum::<f64>()).clamp(-40.0, 40.0);
-        Some(1.0 / (1.0 + (-z).exp()))
-    }).collect()
-}
-
-/// Conditional acceptance of `history` refined by the draft's selector features.
-pub(crate) fn confidence(history: &DraftHistory, features: &[[f32; 4]]) -> Vec<f64> {
-    let rates = history.conditional(features.len());
-    calibrated_confidence(&rates, features).unwrap_or(rates)
+    crate::shared::draft_confidence::SelectorFit::default().confidence(history, features)
 }
 
 /// Weight of a dSpark confidence head's prediction against the sequence's
@@ -107,6 +74,8 @@ pub(crate) struct PlanInput<'h> {
     pub features: Option<&'h [[f32; 4]]>,
     /// A dSpark draft's confidence head per token (replaces the features).
     pub confidence: Option<&'h [f32]>,
+    /// Keyed selector prior after deployment-local online refinement.
+    pub rates: Option<&'h [f64]>,
     /// Most drafts the sequence may verify this step.
     pub limit: usize,
 }
@@ -137,10 +106,10 @@ pub(crate) fn plan_counts(inputs: &[PlanInput<'_>], fixed: Option<usize>, cost: 
         let input = &inputs[m[0]];
         Group {
             history: input.history,
-            confidence: match input.confidence {
+            confidence: input.rates.map(<[_]>::to_vec).unwrap_or_else(|| match input.confidence {
                 Some(head) => head_confidence(input.history, head),
-                None => confidence(input.history, input.features.unwrap_or(&[])),
-            },
+                None => input.history.conditional(input.features.map_or(0, <[_]>::len)),
+            }),
             room: m.iter().map(|&i| inputs[i].limit).min().unwrap_or(0),
             members: m.len(),
             informed: input.confidence.is_some(),

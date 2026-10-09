@@ -284,6 +284,8 @@ pub(crate) struct MimoDrafter<'a> {
     representation: MimoDraftRepresentation,
     fp8_workspace: Option<Dev<'a>>,
 
+    confidence_directory: std::path::PathBuf,
+    confidence_scales: fp8_linear::Fp8Scales,
 }
 
 /// The block rows' mask id: past every table, so the gather takes the mask row.
@@ -407,6 +409,16 @@ pub(crate) fn mask_embedding(dir: &Path, hidden: usize) -> Result<Option<Vec<u8>
 }
 
 impl<'a> MimoDrafter<'a> {
+    pub fn confidence_policy(&self, head: &str) -> Result<crate::shared::draft_confidence::ConfidencePolicy> {
+        let (storage, rows) = match self.representation {
+            MimoDraftRepresentation::Bf16Only => ("bf16", "bf16-linear"),
+            MimoDraftRepresentation::Fp8Only => ("fp8", "w8a16-chunk64"),
+        };
+        let numerics = format!("{storage}-{rows}-{head}-{:?}-r1", self.confidence_scales).to_ascii_lowercase();
+        crate::shared::draft_confidence::ConfidencePolicy::load(&self.confidence_directory,
+            format!("mimo_v2/dflash/{numerics}"))
+    }
+
     /// Loads the drafter's weights from `file` (its safetensors bytes, see
     /// [`prefetch`]) and allocates `slots` ring contexts; draft steps take up
     /// to `max_sequences` sequences. `mask_row` is the mask token's embedding.
@@ -517,6 +529,8 @@ impl<'a> MimoDrafter<'a> {
             mask_row,
             workspace: RefCell::new(None),
             representation,
+            confidence_directory: dir.into(),
+            confidence_scales: scales,
             fp8_workspace,
             cfg,
         })

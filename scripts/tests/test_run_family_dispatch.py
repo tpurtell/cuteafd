@@ -75,6 +75,27 @@ def test_glm_flash_config_goes_to_run_family(tmp_path: Path) -> None:
     assert result.stdout == f"run-family --config {repo / 'glmf.config'} --family glm5_flash --restart --wip s1\n"
 
 
+@pytest.mark.parametrize("value", [None, "on", "off"])
+def test_shared_draft_policy_switches_are_explicit_and_default_off(tmp_path: Path, value) -> None:
+    names = ["DRAFT_COST_BUCKETS", "DRAFT_CONFIDENCE", "COPY_DRAFT_POLICY"]
+    keys = "".join(f"{name}={value}\n" for name in names) if value else ""
+    result = _family_launch_result(tmp_path, {"model_type": "mimo_v2_flash", "num_hidden_layers": 2,
+                                            "moe_layer_freq": [0, 1]}, "XiaomiMiMo/MiMo-V2-Flash",
+                                  keys + "SPECULATION_TRACE=" + str(tmp_path / "trace.jsonl") + "\n")
+    assert result.returncode == 0, result.stderr
+    for name in names:
+        assert f"CUTEAFD_{name}={int(value == 'on')}" in result.stderr
+    assert "CUTEAFD_SPECULATION_TRACE=" in result.stderr
+
+
+def test_shared_draft_policy_rejects_unknown_switch_value(tmp_path: Path) -> None:
+    result = _family_launch_result(tmp_path, {"model_type": "mimo_v2_flash", "num_hidden_layers": 2,
+                                            "moe_layer_freq": [0, 1]}, "XiaomiMiMo/MiMo-V2-Flash",
+                                  "DRAFT_CONFIDENCE=maybe\n")
+    assert result.returncode != 0
+    assert "DRAFT_CONFIDENCE must be on or off" in result.stderr
+
+
 def test_family_table_names_every_launchable_family() -> None:
     table = ROOT / "scripts" / "lib" / "checkpoint-family.py"
     cases = {

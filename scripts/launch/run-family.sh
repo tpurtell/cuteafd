@@ -518,10 +518,18 @@ fi
 # COORDINATOR_TRACE is its pre-rename key; images older than the rename read
 # the family variables, which are set too for one release.
 trace_args=()
+# Experimental shared policy changes stay off until emitted-throughput gates pass.
+for policy_key in DRAFT_COST_BUCKETS DRAFT_CONFIDENCE COPY_DRAFT_POLICY; do
+  case "$(get "$policy_key" off)" in
+    on) trace_args+=(-e "CUTEAFD_$policy_key=1") ;;
+    off) trace_args+=(-e "CUTEAFD_$policy_key=0") ;;
+    *) echo "$policy_key must be on or off" >&2; exit 2 ;;
+  esac
+done
 trace="$(key SPECULATION_TRACE COORDINATOR_TRACE)"
 if [[ -n "$trace" ]]; then
   mkdir -p "$(dirname "$trace")"
-  trace_args=(-v "$(dirname "$trace"):$(dirname "$trace")" -e "CUTEAFD_SPECULATION_TRACE=$trace"
+  trace_args+=(-v "$(dirname "$trace"):$(dirname "$trace")" -e "CUTEAFD_SPECULATION_TRACE=$trace"
     -e "CUTEAFD_GLM_TRACE=$trace" -e "CUTEAFD_QWEN4_TRACE=$trace")
 fi
 # Qwen serving defaults to qualified startup graphs; preserve explicit overrides.

@@ -272,6 +272,7 @@ struct Active<'a> {
     /// without drafts (a probe draft follows eight).
     mtp: MtpSeq,
     outcomes: DraftHistory,
+    copy_outcomes: DraftHistory,
     idle: usize,
     /// Drafts proposed and accepted, verify cycles.
     proposed: usize,
@@ -591,6 +592,8 @@ fn schedule(engine: &Qwen4Engine<'_>, opened: &Opened, snapshot: &std::path::Pat
     let mtp = matches!(drafts, Drafts::Mtp { .. });
     let mut cost = mtp_policy::cycle_cost(DECODE_ROWS);
     let mut calibration = Calibration::default();
+    let copy_policy = crate::shared::draft_policy::enabled("CUTEAFD_COPY_DRAFT_POLICY");
+    tracing::info!(copy_policy, "shared Qwen copy policy experiment; existing MTP online calibration unchanged");
     let mut trace = Trace::open()?;
     let mut prefills = decode_share.queue::<Prefill<'_>>()?;
     let config = &opened.checkpoint.config;
@@ -915,7 +918,7 @@ fn schedule(engine: &Qwen4Engine<'_>, opened: &Opened, snapshot: &std::path::Pat
                         draft_pause: 0,
                         decoder: cuteafd_loader::streaming_token_decoder(snapshot, false)?,
                         job: p.job, constraint: p.constraint, placement: p.placement, mtp: p.seq,
-                        outcomes: DraftHistory::default(), idle: 0, proposed: 0, accepted: 0, cycles: 0, turn: None,
+                        outcomes: DraftHistory::default(), copy_outcomes: DraftHistory::default(), idle: 0, proposed: 0, accepted: 0, cycles: 0, turn: None,
                         capacity: p.capacity, next: 0, generated: 0, buffered: 0, started: Instant::now(), id: p.id,
                         ticket: p.ticket,
                     };
@@ -959,12 +962,13 @@ fn schedule(engine: &Qwen4Engine<'_>, opened: &Opened, snapshot: &std::path::Pat
         let mut tally = console::Step::begin(0);
         let engine_before = tally.live().then(|| *engine.profile.borrow());
         let mut rates: Vec<Vec<f64>> = Vec::new();
+        let mut neural_confidence: Vec<Vec<f64>> = vec![Vec::new(); active.len()];
         let (steps_before, draft_s_before) = (timing.steps, timing.seconds);
         // Each sequence verifies its next token plus its drafts within the decode programs' rows.
         let room = (DECODE_ROWS / active.len()).max(1) - 1;
         let limits: Vec<usize> = active.iter().map(|a| if probe::no_speculation(&a.job.probe) { 0 } else {
             room.min(a.job.max_tokens - a.generated - 1).min(a.capacity - a.placement.len - 1) }).collect();
-        let proposals: Vec<Vec<u32>> = match drafts {
+        let mut proposals: Vec<Vec<u32>> = match drafts {
             Drafts::None => vec![Vec::new(); active.len()],
             Drafts::Copy => active.iter_mut().zip(&limits).map(|(a, &limit)| {
                 if a.draft_pause > 0 {
@@ -981,6 +985,7 @@ fn schedule(engine: &Qwen4Engine<'_>, opened: &Opened, snapshot: &std::path::Pat
                 let histories: Vec<&DraftHistory> = active.iter().map(|a| &a.outcomes).collect();
                 let confidence;
                 (rates, confidence) = mtp_policy::acceptance(&histories, &limits, &calibration);
+                neural_confidence = confidence.clone();
                 let mut depths = mtp_policy::plan(&confidence, fixed.then_some(depth), &cost);
                 for ((a, d), &limit) in active.iter_mut().zip(depths.iter_mut()).zip(&limits) {
                     // A sequence planned without drafts for a while probes one.
@@ -1003,7 +1008,7 @@ fn schedule(engine: &Qwen4Engine<'_>, opened: &Opened, snapshot: &std::path::Pat
                         placement: &a.placement, seq: &mut a.mtp, depth }).collect();
                     let proposals = speculate::draft(engine, &mut seqs, &mut timing)?;
                     if depths.iter().any(|&d| d > 0) {
-                        cost.observe_chain(timing.steps - steps, 1e3 * timer.elapsed().as_secs_f64());
+                        cost.observe_chain(active.len(), timing.steps - steps, 1e3 * timer.elapsed().as_secs_f64());
                     }
                     proposals
                 } else {
@@ -1011,6 +1016,25 @@ fn schedule(engine: &Qwen4Engine<'_>, opened: &Opened, snapshot: &std::path::Pat
                 }
             }
         };
+        let mut used_copy = vec![matches!(drafts, Drafts::Copy); active.len()];
+        if copy_policy && !matches!(drafts, Drafts::None) {
+            let copies: Vec<_> = if matches!(drafts, Drafts::Copy) { std::mem::take(&mut proposals) }
+                else { active.iter().zip(&limits).map(|(a, &limit)| if a.job.sampling.is_greedy() {
+                    copy_drafts(&a.history, limit.min(COPY_DRAFT))
+                } else { Vec::new() }).collect() };
+            if proposals.is_empty() { proposals = vec![Vec::new(); active.len()]; }
+            let copy_rates: Vec<_> = active.iter().zip(&copies).map(|(a, copy)| a.copy_outcomes.conditional(copy.len())).collect();
+            let inputs: Vec<_> = active.iter().enumerate().map(|(i, a)| crate::shared::draft_policy::CopyInput {
+                key: (a.placement.len, i as u64), neural: &proposals[i], confidence: &neural_confidence[i],
+                copy: &copies[i], copy_confidence: &copy_rates[i],
+            }).collect();
+            let (lengths, used) = crate::shared::draft_policy::compete_copies(&inputs,
+                timing.steps > steps_before, timing.steps - steps_before, &cost);
+            used_copy = used;
+            for i in 0..proposals.len() {
+                if used_copy[i] { proposals[i] = copies[i][..lengths[i]].to_vec(); }
+            }
+        }
         let mut sequences: Vec<Vec<u32>> = active.iter().zip(&proposals).map(|(a, drafted)| {
             let mut rows: Vec<u32> = std::iter::once(a.next).chain(drafted.iter().copied()).collect();
             // Drafts the grammar rejects could never be kept: verify none of them.
@@ -1117,10 +1141,14 @@ fn schedule(engine: &Qwen4Engine<'_>, opened: &Opened, snapshot: &std::path::Pat
             request.cycles += 1;
             request.proposed += drafted;
             request.accepted += accepted;
-            if matches!(drafts, Drafts::Mtp { .. }) {
-                request.outcomes.observe(drafted, accepted);
+            if used_copy[index] {
+                request.copy_outcomes.observe(drafted.min(accepted + usize::from(!finished)), accepted);
+            }
+            if matches!(drafts, Drafts::Mtp { .. }) && !used_copy[index] {
+                let observed = if copy_policy { drafted.min(accepted + usize::from(!finished)) } else { drafted };
+                request.outcomes.observe(observed, accepted);
                 if let Some(rates) = rates.get(index) {
-                    calibration.observe_outcome(rates, drafted, accepted);
+                    calibration.observe_outcome(rates, observed, accepted);
                 }
             } else if drafted > 0 && accepted == 0 {
                 request.draft_limit /= 2;
@@ -1164,7 +1192,7 @@ fn schedule(engine: &Qwen4Engine<'_>, opened: &Opened, snapshot: &std::path::Pat
                 "kept": kept.iter().map(|k| k.map_or(0, |(n, _)| n)).collect::<Vec<_>>(),
                 "verify_ms": 1e3 * elapsed, "draft_steps": timing.steps - steps_before,
                 "draft_ms": 1e3 * (timing.seconds - draft_s_before), "cycle_ms": 1e3 * cycle.elapsed().as_secs_f64(),
-                "predicted_ms": predicted_ms, "fit": cost.fitted(), "rates": rates,
+                "predicted_ms": predicted_ms, "fit": cost.fitted(active.len()), "rates": rates,
                 "calibration": calibration.fitted()}));
         }
         for index in (0..active.len()).rev() {

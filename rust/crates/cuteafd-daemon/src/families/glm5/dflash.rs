@@ -352,6 +352,8 @@ pub(crate) struct GlmDrafter<'a> {
     /// scratch was admitted for.
     fp8_rows: Cell<fp8_linear::Fp8Rows>,
     fp8_admitted: fp8_linear::Fp8Rows,
+    confidence_directory: std::path::PathBuf,
+    confidence_scales: fp8_linear::Fp8Scales,
 }
 
 fn at(dev: &Dev<'_>, bytes: usize) -> *mut c_void {
@@ -474,6 +476,14 @@ fn check_checkpoint_headers(cfg: &DflashConfig, tensors: &HashMap<String, Safete
 }
 
 impl<'a> GlmDrafter<'a> {
+    pub fn confidence_policy(&self, family: &str, fp8_head: bool) -> Result<crate::shared::draft_confidence::ConfidencePolicy> {
+        let head = if fp8_head { "head-fp8-row".into() } else { format!("head-bf16-{:?}", self.head_mode.get()) };
+        let numerics = format!("{}-{:?}-{head}-{:?}-r1", self.representation.name(), self.fp8_rows.get(),
+            self.confidence_scales).to_ascii_lowercase();
+        crate::shared::draft_confidence::ConfidencePolicy::load(&self.confidence_directory,
+            format!("{family}/dflash2/{numerics}"))
+    }
+
     pub fn max_batch_sequences(&self) -> usize { self.max_sequences }
     /// Loads the drafter's weights from `file` (its safetensors bytes, see
     /// [`prefetch`]) and allocates `slots` ring contexts; draft steps take up
@@ -595,6 +605,8 @@ impl<'a> GlmDrafter<'a> {
             mask_row,
             workspace: RefCell::new(None),
             representation,
+            confidence_directory: snapshot.into(),
+            confidence_scales: scales,
             fp8_workspace,
             head_mode: Cell::new(super::DraftHead::Exact),
             fp8_rows: Cell::new(fp8_rows),
