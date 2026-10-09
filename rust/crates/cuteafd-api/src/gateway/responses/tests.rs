@@ -781,6 +781,7 @@ async fn serve_sdk_fixture() {
 
 #[derive(Clone)]
 struct PendingStart {
+    pending_count: bool,
     entered: Arc<tokio::sync::Notify>,
     dropped: Arc<tokio::sync::Notify>,
 }
@@ -815,12 +816,31 @@ impl crate::gateway::Backend for PendingStart {
         &self,
         _: crate::gateway::TurnRequest,
     ) -> BoxFuture<'static, Result<u32, GatewayError>> {
-        Box::pin(async { Ok(0) })
+        let me = self.clone();
+        Box::pin(async move {
+            if me.pending_count {
+                let _guard = SignalOnDrop(me.dropped);
+                me.entered.notify_one();
+                futures::future::pending().await
+            } else {
+                Ok(0)
+            }
+        })
     }
 }
 #[tokio::test]
 async fn websocket_disconnect_cancels_pending_backend_start() {
+    pending_websocket_disconnect(false).await;
+}
+
+#[tokio::test]
+async fn websocket_disconnect_cancels_pending_token_count() {
+    pending_websocket_disconnect(true).await;
+}
+
+async fn pending_websocket_disconnect(pending_count: bool) {
     let backend = PendingStart {
+        pending_count,
         entered: Arc::new(tokio::sync::Notify::new()),
         dropped: Arc::new(tokio::sync::Notify::new()),
     };
@@ -839,7 +859,8 @@ async fn websocket_disconnect_cancels_pending_backend_start() {
         .await
         .unwrap();
     ws.send(tokio_tungstenite::tungstenite::Message::Text(
-        json!({"type":"response.create","model":"test","input":"hi"}).to_string(),
+        json!({"type":"response.create","model":"test","input":"hi","generate":!pending_count})
+            .to_string(),
     ))
     .await
     .unwrap();
@@ -960,6 +981,58 @@ async fn codex_catalog_and_lite_additional_tools() {
     assert_eq!(turn.tools[0].name, "functions.apply_patch");
     assert_eq!(turn.reasoning.effort.as_deref(), Some("high"));
     assert_eq!(turn.items.len(), 2);
+}
+
+#[tokio::test]
+async fn configuration_update_effort_without_top_level_reasoning() {
+    let (app, backend, _) = app(vec![vec![done()], vec![done()]]);
+    for (effort, enabled) in [("high", true), ("none", false)] {
+        let (status, body) = request(
+            &app,
+            "POST",
+            "/v1/responses",
+            json!({"model":"gpt-6.1-sol","input":[{"type":"configuration_update","reasoning":{"effort":effort}},{"role":"user","content":"hi"}]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let turns = backend.turns();
+        let turn = turns.last().unwrap();
+        assert_eq!(turn.reasoning.effort.as_deref(), Some(effort));
+        assert_eq!(turn.reasoning.enabled, Some(enabled));
+        assert_eq!(turn.items.len(), 1);
+    }
+}
+
+#[tokio::test]
+async fn configuration_update_valid_effort_overrides_top_level_reasoning() {
+    let (app, backend, _) = app(vec![vec![done()]]);
+    let (status, body) = request(
+        &app,
+        "POST",
+        "/v1/responses",
+        json!({"model":"gpt-6.1-sol","reasoning":{"effort":"none"},"input":[{"type":"configuration_update","reasoning":{"effort":"high"}}]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(backend.turns()[0].reasoning.effort.as_deref(), Some("high"));
+    assert_eq!(backend.turns()[0].reasoning.enabled, Some(true));
+}
+
+#[tokio::test]
+async fn configuration_update_invalid_effort_without_top_level_reasoning() {
+    let (app, backend, _) = app(vec![]);
+    let (status, body) = request(
+        &app,
+        "POST",
+        "/v1/responses",
+        json!({"model":"gpt-6.1-sol","input":[{"type":"configuration_update","reasoning":{"effort":"invalid"}}]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    let error: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(error["error"]["param"], "reasoning.effort");
+    assert_eq!(error["error"]["type"], "invalid_request_error");
+    assert!(backend.turns().is_empty());
 }
 
 #[tokio::test]

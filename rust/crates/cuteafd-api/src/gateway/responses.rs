@@ -364,28 +364,13 @@ async fn websocket_loop(mut socket: WebSocket, gateway: Arc<Gateway>, tape: Tape
             if socket.send(Message::Text(json!({"type":"error","status":400,"error":{"type":"invalid_request_error","message":"generate must be boolean","code":null,"param":"generate"}}).to_string())).await.is_err() { return; }
             continue;
         }
-        if p.wire["generate"] == false {
-            if let Err(e) = gateway.count_tokens(p.turn.clone()).await {
-                if socket.send(Message::Text(json!({"type":"error","status":e.status(),"error":e.openai_body()["error"]}).to_string())).await.is_err() { return; }
-                continue;
+        let start = async {
+            if p.wire["generate"] == false {
+                gateway.count_tokens(p.turn.clone()).await.map(|_| None)
+            } else {
+                gateway.run(p.turn.clone()).await.map(Some)
             }
-            let mut fold = render::Fold::new(&p);
-            fold.accept(TurnEvent::Done {
-                stop: super::turn::StopReason::EndTurn,
-            })
-            .unwrap();
-            last = Some((
-                fold.response["id"].as_str().unwrap().into(),
-                store(&gateway, &p, &fold),
-            ));
-            for event in fold.events {
-                if socket.send(Message::Text(event.to_string())).await.is_err() {
-                    return;
-                }
-            }
-            continue;
-        }
-        let start = gateway.run(p.turn.clone());
+        };
         tokio::pin!(start);
         let started = loop {
             tokio::select! {
@@ -399,7 +384,24 @@ async fn websocket_loop(mut socket: WebSocket, gateway: Arc<Gateway>, tape: Tape
             }
         };
         let mut stream = match started {
-            Ok(s) => s,
+            Ok(Some(s)) => s,
+            Ok(None) => {
+                let mut fold = render::Fold::new(&p);
+                fold.accept(TurnEvent::Done {
+                    stop: super::turn::StopReason::EndTurn,
+                })
+                .unwrap();
+                last = Some((
+                    fold.response["id"].as_str().unwrap().into(),
+                    store(&gateway, &p, &fold),
+                ));
+                for event in fold.events {
+                    if socket.send(Message::Text(event.to_string())).await.is_err() {
+                        return;
+                    }
+                }
+                continue;
+            }
             Err(e) => {
                 if socket.send(Message::Text(json!({"type":"error","status":e.status(),"error":e.openai_body()["error"]}).to_string())).await.is_err() { break; }
                 continue;
