@@ -101,8 +101,12 @@ fn thinking_quirks_are_opt_in_and_reject_forced_thinking_tools() {
     config.thinking_toggle = true;
     let upstream = Upstream::new(config).unwrap();
     let mut turn = turn();
+    turn.tools.push(ToolSpec { name: "f".into(), description: None, parameters: json!({"type":"object"}), strict: false });
     turn.tool_choice = ToolChoice::Required;
-    assert!(upstream.map_request(&turn).is_err());
+    // Default thinking yields to a forced tool choice (live Realtime run, 2026-10-10).
+    assert_eq!(upstream.map_request(&turn).unwrap()["thinking"]["type"], "disabled");
+    turn.reasoning.enabled = Some(true);
+    assert!(upstream.map_request(&turn).is_err(), "explicit thinking plus forced tool is refused");
     turn.reasoning.enabled = Some(false);
     assert_eq!(upstream.map_request(&turn).unwrap()["thinking"]["type"], "disabled");
 }

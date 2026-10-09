@@ -141,7 +141,8 @@ fn chat(turn: &TurnRequest, config: &UpstreamConfig, names: &WireNames) -> Resul
             Item::ServerToolResult { call_id, output, .. } => messages.push(json!({"role":"tool","tool_call_id":call_id,"content":output.to_string()})),
         }
     }
-    let thinking_on = config.thinking_toggle && turn.reasoning.enabled.unwrap_or(true);
+    let forced = matches!(turn.tool_choice, ToolChoice::Required | ToolChoice::Named { .. }) && !turn.tools.is_empty();
+    let thinking_on = config.thinking_toggle && turn.reasoning.enabled.unwrap_or(!forced);
     if thinking_on {
         // Thinking-mode upstreams reject a tool-call loop whose assistant
         // messages lack `reasoning_content`, even when the model produced no
@@ -164,10 +165,14 @@ fn chat(turn: &TurnRequest, config: &UpstreamConfig, names: &WireNames) -> Resul
             ToolChoice::Required => json!("required"), ToolChoice::Named { name } => json!({"type":"function","function":{"name":names.wire(name)}}) };
         if let Some(parallel) = turn.parallel_tool_calls { request["parallel_tool_calls"] = json!(parallel); }
     }
-    let thinking = turn.reasoning.enabled.unwrap_or(config.thinking_toggle);
+    let forced_tool = matches!(turn.tool_choice, ToolChoice::Required | ToolChoice::Named { .. }) && !turn.tools.is_empty();
+    // Thinking-mode upstreams reject forced tool choice. Default thinking
+    // yields to a forced choice for that turn; an explicit request for both
+    // is a clear error.
+    let thinking = turn.reasoning.enabled.unwrap_or(config.thinking_toggle && !forced_tool);
     if config.thinking_toggle {
         request["thinking"] = json!({"type":if thinking { "enabled" } else { "disabled" }});
-        if thinking && matches!(turn.tool_choice, ToolChoice::Required | ToolChoice::Named { .. }) {
+        if thinking && forced_tool {
             return Err(GatewayError::unsupported("configured thinking mode does not support required or named tool choice; disable thinking"));
         }
     }
