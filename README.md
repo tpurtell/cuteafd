@@ -30,7 +30,11 @@ format.
   map such as `{"worker":["spark0","vision"]}`; omit `--host` with `--json` to list all
   hosts. `--host worker --fetch` copies via SSH; add `--source peer:/snapshot` to
   pull from a peer (MODEL supplies the local index/config). Remote size checks are
-  batched into one SSH session before and after copying. These lists cover the main snapshot;
+  batched into one SSH session before and after copying. `--forward-agent` opts into
+  `ssh -A` for peer-to-target copies (default off). `--source auto` reports whether
+  sparknest serves a sealed local copy or streams; without it, the local snapshot
+  is used. Omit `--host` with `--file-layout --fetch` to copy the whole layout,
+  capped by `--fetch-parallel` (default 2). These lists cover the main snapshot;
   separately configured drafter or encoder snapshots must be inventoried separately.
 - Exact prefix caching for agentic work: the deepest cached snapshot that
   prefixes a request is restored byte-identical, not approximated.
