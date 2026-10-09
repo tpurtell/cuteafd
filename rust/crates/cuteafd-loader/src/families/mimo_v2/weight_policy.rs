@@ -82,7 +82,7 @@ pub(crate) mod tests {
         tensors.sort_by(|a, b| a.meta.name.cmp(&b.meta.name));
         let cfg = MimoV2Config::from_hf(&value["target_config"]).unwrap();
         let checkpoint = Checkpoint { snapshot: snapshot.into(), config: value["target_config"].clone(),
-            quantize_config: None, tensors, missing_shards: Vec::new(), shard_bytes: 0 };
+            quantize_config: None, weight_map: Default::default(), tensors, missing_shards: Vec::new(), shard_bytes: 0 };
         (checkpoint, cfg, value["draft_config"].clone(), metadata("draft_headers"))
     }
 

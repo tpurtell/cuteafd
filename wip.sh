@@ -106,6 +106,14 @@ release_need sha256sum
 release_need install
 release_need nvidia-smi
 
+case "${CUTEAFD_WIP_EXPORT_LOCKS:-off}" in on|off) ;; *) release_die "CUTEAFD_WIP_EXPORT_LOCKS must be on or off" ;; esac
+wip_export_locks=off
+if [[ "${CUTEAFD_WIP_EXPORT_LOCKS:-off}" == on ]]; then
+  wip_export_locks=on
+  [[ "$COORDINATOR_GPU" =~ ^[01]$ ]] || release_die "export locking needs COORDINATOR_GPU=0 or 1"
+  # Only the selected GPU is exposed to the coordinator build container.
+  wip_export_lock="$HOME/.cache/cuteafd/gpu${COORDINATOR_GPU}.lock"
+fi
 mapfile -t wip_hosts < <(release_spark_values HOST)
 ((${#wip_hosts[@]})) || release_die "configuration has no active Spark hosts"
 [[ "${#wip_hosts[@]}" == "$SPARK_COUNT" ]] ||
@@ -434,6 +442,10 @@ ensure_local_container() {
     cuteafd_build_cache_docker_args "$wip_mount_root" /wip/home "$wip_toolchain_hash" dry >/dev/null
     [[ "$(docker inspect -f '{{.State.Running}}' "$coordinator_container")" == true ]] ||
       docker start "$coordinator_container" >/dev/null
+    if [[ "${wip_export_locks:-off}" == on ]]; then
+      [[ "$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/wip-export-gpu.lock"}}{{.Source}}{{end}}{{end}}' "$coordinator_container")" == "$wip_export_lock" ]] ||
+        release_die "export lock mount missing or changed; recreate this task's WIP container"
+    fi
     docker exec "$coordinator_container" mkdir -p /wip/build /wip/output /wip/slots /wip/incoming /wip/run /wip/cache
     return
   fi
@@ -451,6 +463,11 @@ ensure_local_container() {
     -e CUDA_VISIBLE_DEVICES="$RELEASE_COORDINATOR_GPU_UUID"
     -e NVIDIA_VISIBLE_DEVICES="$RELEASE_COORDINATOR_GPU_UUID"
   )
+  if [[ "${wip_export_locks:-off}" == on ]]; then
+    mkdir -p "$(dirname "$wip_export_lock")"
+    touch "$wip_export_lock"
+    args+=(-v "$wip_export_lock:/wip-export-gpu.lock" -e CUTEAFD_WIP_EXPORT_LOCKS=on -e CUTEAFD_WIP_EXPORT_LOCK_FILES=/wip-export-gpu.lock)
+  fi
   local -a cache_args=()
   local cache_plan
   cache_plan="$(cuteafd_build_cache_docker_args "$wip_mount_root" /wip/home "$wip_toolchain_hash")" || release_die "WIP cache plan failed"
@@ -687,6 +704,7 @@ build_coordinator() {
   fi
   docker exec \
     "${cache_env[@]}" \
+    -e "CUTEAFD_WIP_EXPORT_LOCKS=${wip_export_locks:-off}" -e "CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS:-}" -e "RUST_TEST_THREADS=${RUST_TEST_THREADS:-}" -e "CMAKE_BUILD_PARALLEL_LEVEL=${CMAKE_BUILD_PARALLEL_LEVEL:-}" \
     -e "CUTEAFD_WIP_EXL3_AOT=${CUTEAFD_WIP_EXL3_AOT:-ON}" \
     -e "CUTEAFD_WIP_NVFP4_AOT=${CUTEAFD_WIP_NVFP4_AOT:-ON}" \
     -e "CUTEAFD_WIP_AUDIO_AOT=$audio_aot" \
@@ -711,6 +729,11 @@ build_coordinator() {
 
 build_expert() {
   echo "== incrementally building Spark expert slot $slot on $seed_host =="
+  if [[ "${wip_export_locks:-off}" == on ]]; then
+    local spark_lock
+    case "$seed_host" in rhea|moa) spark_lock="$HOME/.cache/cuteafd/$seed_host.lock" ;; *) spark_lock="$HOME/.cache/cuteafd/sparks.lock" ;; esac
+    flock -n "$spark_lock" true || release_die "refusing Spark export on $seed_host: $spark_lock is held (choose an idle seed)"
+  fi
   sync_seed_source
   local image_id
   image_id="$(ssh -o BatchMode=yes "$seed_host" "docker image inspect -f '{{.Id}}' '$SPARK_EXPERT_DOCKER_DEV'")"
@@ -732,7 +755,7 @@ build_expert() {
   # The role list and build-scope opt-ins travel inside a single quoted remote
   # command so a `tp2;tp3` value is never split by the remote shell.
   ssh -o BatchMode=yes "$seed_host" \
-    "docker exec -e 'CUTEAFD_BUILD_CACHES=${CUTEAFD_BUILD_CACHES:-on}' -e 'CUTEAFD_SCCACHE_CUDA=$cuda_cache' -e 'CUTEAFD_KACHE=$cache_wrapper' -e 'CUTEAFD_WIP_SPARK_TP_ROLES=$wip_spark_tp_roles' -e 'CUTEAFD_WIP_EXPERT_FAMILIES=${CUTEAFD_WIP_EXPERT_FAMILIES:-}' -e 'CUTEAFD_WIP_FP8_MOE_BF16_FAMILIES=$bf16_families' -e 'CUTEAFD_WIP_EXL3_AOT=${CUTEAFD_WIP_EXL3_AOT:-ON}' -e 'CUTEAFD_WIP_NVFP4_AOT=${CUTEAFD_WIP_NVFP4_AOT:-ON}' -e 'CUTEAFD_WIP_AUDIO_AOT=$audio_aot' '$spark_container' /wip/source/scripts/build/build-wip-artifacts.sh /wip/source expert 121 /wip/build/expert /wip/output/expert"
+    "docker exec -e 'CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS:-}' -e 'RUST_TEST_THREADS=${RUST_TEST_THREADS:-}' -e 'CMAKE_BUILD_PARALLEL_LEVEL=${CMAKE_BUILD_PARALLEL_LEVEL:-}' -e 'CUTEAFD_BUILD_CACHES=${CUTEAFD_BUILD_CACHES:-on}' -e 'CUTEAFD_SCCACHE_CUDA=$cuda_cache' -e 'CUTEAFD_KACHE=$cache_wrapper' -e 'CUTEAFD_WIP_SPARK_TP_ROLES=$wip_spark_tp_roles' -e 'CUTEAFD_WIP_EXPERT_FAMILIES=${CUTEAFD_WIP_EXPERT_FAMILIES:-}' -e 'CUTEAFD_WIP_FP8_MOE_BF16_FAMILIES=$bf16_families' -e 'CUTEAFD_WIP_EXL3_AOT=${CUTEAFD_WIP_EXL3_AOT:-ON}' -e 'CUTEAFD_WIP_NVFP4_AOT=${CUTEAFD_WIP_NVFP4_AOT:-ON}' -e 'CUTEAFD_WIP_AUDIO_AOT=$audio_aot' '$spark_container' /wip/source/scripts/build/build-wip-artifacts.sh /wip/source expert 121 /wip/build/expert /wip/output/expert"
   ssh -o BatchMode=yes "$seed_host" docker exec "$spark_container" \
     /wip/source/scripts/build/finalize-wip-slot.sh \
     /wip/source spark-expert "$slot" /wip/output/expert \

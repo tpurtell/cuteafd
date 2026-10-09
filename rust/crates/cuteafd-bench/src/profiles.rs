@@ -46,6 +46,18 @@ pub fn builtin() -> Vec<Profile> {
     ]
 }
 
+/// Validate an explicit smoke panel selection before taking locks or launching.
+pub fn validate_selection(profile: &str) -> Result<(), String> {
+    if let Some(ids) = profile.strip_prefix("panels:") {
+        for id in ids.split(',').map(str::trim).filter(|id| !id.is_empty()) {
+            if id != "baseline" && crate::panels::find(id).is_none() {
+                return Err(format!("unknown requested panel: {id}"));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// A profile's display title (custom profiles show their name).
 pub fn title_of(name: &str) -> String {
     builtin().into_iter().find(|p| p.name == name).map(|p| p.title)
@@ -100,6 +112,13 @@ mod tests {
         let (plan, _) = resolve(&profiles[0].panels, &[]);
         assert_eq!(plan.iter().map(|p| p.id.as_str()).collect::<Vec<_>>(), vec!["hardware", "configuration"]);
         assert_eq!(title_of("smoke"), "Release smoke");
+    }
+
+    #[test]
+    fn explicit_smoke_panels_reject_unknown_names() {
+        assert!(validate_selection("panels:decode_content,fidelity").is_ok());
+        assert!(validate_selection("smoke").is_ok());
+        assert_eq!(validate_selection("panels:decode,fidelity").unwrap_err(), "unknown requested panel: decode");
     }
 
     #[test]

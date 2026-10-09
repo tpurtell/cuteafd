@@ -1,3 +1,4 @@
+pub mod coordinator_programs;
 pub mod expert_geometry;
 pub use expert_geometry::{expert_geometry, set_expert_geometry, ExpertGeometry};
 mod dspark_policy;

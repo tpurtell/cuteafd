@@ -166,7 +166,7 @@ mod tests {
             Checkpoint {
                 snapshot: "/unused".into(),
                 config: serde_json::Value::Null,
-                quantize_config: None,
+                quantize_config: None, weight_map: Default::default(),
                 tensors,
                 missing_shards: vec![],
                 shard_bytes: 0,

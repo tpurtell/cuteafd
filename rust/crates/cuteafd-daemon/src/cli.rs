@@ -184,7 +184,7 @@ pub(crate) struct FabricArgs {
     pub(crate) p2p_bytes: Vec<usize>,
 }
 
-#[derive(Debug, Args)]
+#[derive(Debug, Clone, Args)]
 pub(crate) struct PlanArgs {
     #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..=6))]
     pub(crate) vision_replicas: u32,
@@ -217,6 +217,52 @@ pub(crate) struct PlanArgs {
     pub(crate) coordinator_weight_budget_gib: f64,
     #[arg(long, default_value_t = false)]
     pub(crate) json: bool,
+    /// Emit snapshot-relative paths suitable for rsync --files-from.
+    #[arg(long)]
+    pub(crate) files: bool,
+    /// Role whose headers/files to inspect (coordinator, sparkN, vision, audio, drafter).
+    #[arg(long)]
+    pub(crate) role: Option<String>,
+    /// Select a host from --file-layout, or the destination host for --fetch.
+    #[arg(long)]
+    pub(crate) host: Option<String>,
+    /// JSON host-to-role map, e.g. {"worker":["spark0","vision"]}.
+    #[arg(long)]
+    pub(crate) file_layout: Option<PathBuf>,
+    /// Maximum concurrent transfers when fetching the whole host layout.
+    #[arg(long, default_value_t = 2, value_parser = clap::value_parser!(u32).range(1..=16))]
+    pub(crate) fetch_parallel: u32,
+    /// Copy this role's missing files with rdmasync or rsync; never delete.
+    #[arg(long, requires = "destination")]
+    pub(crate) fetch: bool,
+    /// Transfer source: a local snapshot path or HOST:/snapshot. MODEL supplies
+    /// the local index/config used to inventory role requirements.
+    #[arg(long, requires = "fetch")]
+    pub(crate) source: Option<String>,
+    /// Forward the SSH agent to a source peer for peer-to-target copies.
+    #[arg(long, requires = "fetch")]
+    pub(crate) forward_agent: bool,
+    /// Snapshot destination directory. Plain files are valid HF snapshot entries.
+    #[arg(long)]
+    pub(crate) destination: Option<PathBuf>,
+    /// Print the transfer command and bytes without copying.
+    #[arg(long, requires = "fetch")]
+    pub(crate) dry_run: bool,
+    /// Replace matching-size files too.
+    #[arg(long, requires = "fetch")]
+    pub(crate) force: bool,
+    /// Include native MTP/drafter tensors in coordinator file requirements.
+    #[arg(long)]
+    pub(crate) include_speculator: bool,
+    /// Separately configured drafter checkpoint to include in JSON inventory.
+    #[arg(long)]
+    pub(crate) drafter_snapshot: Option<PathBuf>,
+    /// Separately configured vision checkpoint to include in JSON inventory.
+    #[arg(long)]
+    pub(crate) vision_snapshot: Option<PathBuf>,
+    /// Separately configured audio checkpoint to include in JSON inventory.
+    #[arg(long)]
+    pub(crate) audio_snapshot: Option<PathBuf>,
     /// Exit non-zero unless every part is servable.
     #[arg(long, default_value_t = false)]
     pub(crate) require_ready: bool,
@@ -255,6 +301,9 @@ pub(crate) struct PlanArgs {
     /// wide programs on one GPU): its decode workspace, token selector and replay records.
     #[arg(long, default_value_t = 64, value_parser = plan_decode_rows)]
     pub(crate) decode_rows: u64,
+    /// GLM 5.3 Flash's DSA index storage for --layout (compact is single-GPU only).
+    #[arg(long, value_enum, default_value = "keys")]
+    pub(crate) index_cache: crate::families::glm5_flash::engine::IndexCache,
     /// GPU memory (GiB) each coordinator GPU keeps free for runtime growth in --layout (the
     /// engines' --headroom-gib).
     #[arg(long, default_value_t = 2.0)]
@@ -270,6 +319,14 @@ pub(crate) struct PlanArgs {
     /// Concurrent sequences for --layout (0: family default).
     #[arg(long, default_value_t = 0)]
     pub(crate) concurrency: u64,
+    /// The engine's recurrent-state slots for --layout, when they differ from the family's rule
+    /// over --concurrency (GLM 5.3 Flash serves max(--slots, --max-sequences)).
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+    pub(crate) state_slots: Option<u64>,
+    /// GLM 5.3 Flash: the lanes its prefix mark arena counts for --layout (the 2C + 2 floor),
+    /// when they differ from --concurrency (serve-glmf counts min(--max-sequences, 64)).
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+    pub(crate) mark_lanes: Option<u64>,
     /// Prefix mark arena slots (0 disables marks).
     #[arg(long)]
     pub(crate) prefix_slots: Option<u64>,

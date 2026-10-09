@@ -13,7 +13,8 @@ use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
+use std::os::unix::process::CommandExt;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -93,6 +94,86 @@ pub struct Entry {
     /// A profile name, or `panels:a,b` for those panels alone.
     #[serde(default)]
     pub profile: Option<String>,
+    /// Optional argv hooks, run only while smoke owns this card's locks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub precheck: Option<Hook>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observer: Option<Hook>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Hook {
+    pub argv: Vec<String>,
+    pub timeout_s: u64,
+    /// Observer errors are diagnostic unless explicitly required.
+    #[serde(default)]
+    pub required: bool,
+    /// Optional bounded cleanup for external resources (e.g. sampler containers).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cleanup: Option<Vec<String>>,
+}
+
+// Each hook gets a process group so subprocesses cannot survive lock release.
+struct HookChild {
+    child: Child,
+    deadline: Instant,
+    stop: PathBuf,
+    cleanup: Option<Vec<String>>,
+}
+
+impl HookChild {
+    fn spawn(hook: &Hook, url: &str, config: &Path, log: &Path, kind: &str) -> Result<Self> {
+        if hook.argv.is_empty() || hook.timeout_s == 0 || hook.timeout_s > 7200 {
+            bail!("{kind} hook needs argv and timeout_s in 1..=7200");
+        }
+        let stop = log.with_extension(format!("{kind}.stop"));
+        let _ = std::fs::remove_file(&stop);
+        let output = File::create(log.with_extension(format!("{kind}.log")))?;
+        let child = Command::new("timeout").args(["--kill-after=1s", &format!("{}s", hook.timeout_s)])
+            .args(&hook.argv)
+            .env("CUTEAFD_SMOKE_URL", url).env("CUTEAFD_SMOKE_CONFIG", config)
+            .env("CUTEAFD_SMOKE_STOP", &stop)
+            .stdout(output.try_clone()?).stderr(output).process_group(0).spawn()
+            .with_context(|| format!("starting {kind} hook"))?;
+        Ok(Self { child, deadline: Instant::now() + Duration::from_secs(hook.timeout_s), stop, cleanup: hook.cleanup.clone() })
+    }
+
+    fn wait(&mut self) -> Result<()> {
+        loop {
+            if let Some(status) = self.child.try_wait()? {
+                if !status.success() { bail!("hook exited {status}"); }
+                return Ok(());
+            }
+            if Instant::now() >= self.deadline { bail!("hook timed out"); }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    fn finish(&mut self) -> Result<()> {
+        if let Some(status) = self.child.try_wait()? {
+            if !status.success() { bail!("observer exited {status}"); }
+            return Ok(());
+        }
+        if Instant::now() >= self.deadline { bail!("observer timed out"); }
+        std::fs::write(&self.stop, b"stop\n")?;
+        self.deadline = self.deadline.min(Instant::now() + Duration::from_secs(5));
+        self.wait()
+    }
+}
+
+impl Drop for HookChild {
+    fn drop(&mut self) {
+        // Kill the group, including an exited hook's descendants, before locks release.
+        let _ = Command::new("/bin/kill").args(["-KILL", "--", &format!("-{}", self.child.id())])
+            .stdout(Stdio::null()).stderr(Stdio::null()).status();
+        let _ = self.child.wait();
+        if let Some(argv) = &self.cleanup {
+            if !argv.is_empty() {
+                let _ = Command::new("timeout").args(["--kill-after=1s", "10s"]).args(argv)
+                    .stdout(Stdio::null()).stderr(Stdio::null()).status();
+            }
+        }
+    }
 }
 
 impl Entry {
@@ -111,6 +192,8 @@ impl Entry {
             run_timeout_s: self.run_timeout_s.or(defaults.run_timeout_s),
             exclusive: self.exclusive.or(defaults.exclusive),
             profile: self.profile.clone().or_else(|| defaults.profile.clone()),
+            precheck: self.precheck.clone().or_else(|| defaults.precheck.clone()),
+            observer: self.observer.clone().or_else(|| defaults.observer.clone()),
         }
     }
 
@@ -154,6 +237,8 @@ pub struct Outcome {
     #[serde(default)]
     pub total_s: Option<f64>,
     pub finished: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hooks: Option<BTreeMap<String, String>>,
 }
 
 fn expand(path: &str) -> PathBuf {
@@ -178,7 +263,8 @@ fn read_config(path: &Path) -> Result<HashMap<String, String>> {
 fn locks_for(entry: &Entry) -> Vec<&'static str> {
     let gpus = entry.gpus.clone().unwrap_or_else(|| vec![0]);
     let mut locks = Vec::new();
-    if gpus.contains(&0) || !entry.sparks.clone().unwrap_or_default().is_empty() || entry.exclusive() {
+    let pool = entry.sparks.as_ref().is_some_and(|hosts| hosts.iter().any(|h| matches!(h.as_str(), "ostrich" | "dodo" | "emu" | "kiwi")));
+    if gpus.contains(&0) || pool || entry.exclusive() {
         locks.push("sparks.lock");
     }
     if gpus.contains(&0) || entry.exclusive() {
@@ -354,6 +440,8 @@ pub fn run(args: SmokeArgs) -> Result<()> {
         if args.only.as_ref().is_some_and(|only| !only.contains(&entry.name)) {
             continue;
         }
+        crate::profiles::validate_selection(entry.profile.as_deref().or(matrix.profile.as_deref()).unwrap_or("smoke"))
+            .map_err(anyhow::Error::msg)?;
         entries.push(entry);
     }
     let mut state = load_state(&paths.state);
@@ -530,6 +618,8 @@ fn run_entry(entry: &Entry, repo: &Path, out_root: &Path, configs: &Path, logs: 
             return outcome;
         }
     };
+    let mut observer = None;
+    let mut hook_results = BTreeMap::new();
     let result = (|| -> Result<Report> {
         let config_path = write_config(entry, repo, configs, parallel)?;
         let config = read_config(&config_path)?;
@@ -538,9 +628,18 @@ fn run_entry(entry: &Entry, repo: &Path, out_root: &Path, configs: &Path, logs: 
         command.arg("--config").arg(&config_path).arg("--restart").args(entry.run_args.clone().unwrap_or_default())
             .current_dir(repo).stdout(log.try_clone()?).stderr(log.try_clone()?);
         let launch = Instant::now();
+        let url = format!("http://127.0.0.1:{port}");
+        if let Some(hook) = &entry.observer {
+            match HookChild::spawn(hook, &url, &config_path, &log_path, "observer") {
+                Ok(child) => observer = Some(child),
+                Err(error) => {
+                    hook_results.insert("observer".into(), format!("{error:#}"));
+                    if hook.required { return Err(error.context("required observer hook")); }
+                }
+            }
+        }
         let mut child = command.spawn().context("starting ./run.sh")?;
         let timeout = Duration::from_secs(entry.timeout_s.unwrap_or(900));
-        let url = format!("http://127.0.0.1:{port}");
         // run.sh waits for readiness itself; poll /health too in case it returns early.
         loop {
             if let Some(status) = child.try_wait()? {
@@ -558,6 +657,15 @@ fn run_entry(entry: &Entry, repo: &Path, out_root: &Path, configs: &Path, logs: 
             std::thread::sleep(Duration::from_millis(500));
         }
         outcome.launch_s = Some(launch.elapsed().as_secs_f64());
+        if let Some(hook) = &entry.precheck {
+            let checked = (|| -> Result<()> {
+                let mut child = HookChild::spawn(hook, &url, &config_path, &log_path, "precheck")?;
+                child.wait()
+            })();
+            hook_results.insert("precheck".into(), checked.as_ref().map(|_| "pass".into())
+                .unwrap_or_else(|error| format!("{error:#}")));
+            checked.context("precheck hook failed before workload")?;
+        }
         // `panels:a,b` runs those panels instead of a profile.
         let (profile, panels) = match profile.strip_prefix("panels:") {
             Some(list) => (None, Some(list.split(',').map(str::to_string).collect())),
@@ -583,9 +691,31 @@ fn run_entry(entry: &Entry, repo: &Path, out_root: &Path, configs: &Path, logs: 
         outcome.dir = Some(dir.display().to_string());
         Ok(report)
     })();
+    if let Some(mut child) = observer.take() {
+        let observed = child.finish();
+        hook_results.insert("observer".into(), observed.as_ref().map(|_| "pass".into())
+            .unwrap_or_else(|error| format!("{error:#}")));
+        if let Err(error) = observed {
+            if entry.observer.as_ref().is_some_and(|h| h.required) {
+                outcome.error = Some(format!("required observer hook failed: {error:#}"));
+            }
+        }
+    }
+    if !hook_results.is_empty() {
+        outcome.hooks = Some(hook_results);
+        // Failure diagnostics exist even when no benchmark report was produced.
+        let _ = std::fs::write(log_path.with_extension("hooks.json"), serde_json::to_vec_pretty(&outcome.hooks).unwrap_or_default());
+    }
     match result {
         Ok(report) => {
-            outcome.status = "done".into();
+            outcome.status = if outcome.error.is_some() { "failed" } else { "done" }.into();
+            if let (Some(hooks), Some(dir)) = (&outcome.hooks, &outcome.dir) {
+                let path = Path::new(dir).join("report.json");
+                if let Ok(mut value) = serde_json::to_value(&report) {
+                    value["smoke_hooks"] = serde_json::to_value(hooks).unwrap_or_default();
+                    let _ = std::fs::write(path, serde_json::to_vec_pretty(&value).unwrap_or_default());
+                }
+            }
             outcome.readiness_s = report.server.readiness_s;
             if let Some(b) = &report.baseline {
                 outcome.code_tok_s = b.card.decode_of("code").map(|d| d.tok_s);
@@ -613,6 +743,11 @@ fn run_entry(entry: &Entry, repo: &Path, out_root: &Path, configs: &Path, logs: 
                 let _ = log.write_all(&tail.stderr);
             }
         }
+    }
+    if outcome.hooks.is_some() && outcome.dir.is_none() {
+        let failure = serde_json::json!({"entry": entry.name, "status": outcome.status,
+            "error": outcome.error, "smoke_hooks": outcome.hooks});
+        let _ = std::fs::write(log_path.with_extension("report.json"), serde_json::to_vec_pretty(&failure).unwrap_or_default());
     }
     if let Ok(config) = read_config(&configs.join(format!("{}.config", entry.name))) {
         teardown(entry, &config, &mut log);
@@ -650,6 +785,36 @@ mod tests {
     }
 
     #[test]
+    fn absent_hooks_preserve_serialized_keys_and_outputs() {
+        let original = serde_json::json!({"name":"legacy","family":null,"config":null,"set":{},
+            "run_args":null,"gpus":null,"sparks":null,"timeout_s":null,"run_timeout_s":null,
+            "exclusive":null,"profile":null});
+        let entry: Entry = serde_json::from_value(original.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&entry).unwrap(), original);
+        assert_eq!(entry.merged(&Entry::default()), entry);
+        let outcome = Outcome::default();
+        assert!(serde_json::to_value(outcome).unwrap().get("hooks").is_none());
+    }
+
+    #[test]
+    fn hooks_are_bounded_and_fail_clearly() {
+        let root = std::env::temp_dir().join(format!("cuteafd-smoke-hook-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let log = root.join("test.log");
+        let hook = Hook { argv: vec!["false".into()], timeout_s: 2, required: false, cleanup: None };
+        let mut child = HookChild::spawn(&hook, "http://127.0.0.1", &log, &log, "precheck").unwrap();
+        assert!(child.wait().unwrap_err().to_string().contains("exited"));
+        drop(child);
+        let hook = Hook { argv: vec!["sleep".into(), "20".into()], timeout_s: 1, required: false, cleanup: None };
+        let mut child = HookChild::spawn(&hook, "http://127.0.0.1", &log, &log, "observer").unwrap();
+        let started = Instant::now();
+        assert!(child.wait().is_err());
+        drop(child);
+        assert!(started.elapsed() < Duration::from_secs(3));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn disjoint_hardware_runs_together() {
         let base = HashMap::new();
         let a = entry("a", &[0], &["ostrich", "dodo", "emu", "kiwi"], 8000);
@@ -661,10 +826,31 @@ mod tests {
         let v41 = Entry { family: Some("deepseek_v41".into()), ..entry("v", &[1], &[], 8009) };
         assert!(!disjoint(&a, &v41, &base), "V4.1 runs alone");
         assert_eq!(locks_for(&a), vec!["sparks.lock", "gpu0.lock"]);
-        assert_eq!(locks_for(&b), vec!["sparks.lock", "gpu1.lock", "rhea.lock", "moa.lock"]);
+        assert_eq!(locks_for(&b), vec!["gpu1.lock", "rhea.lock", "moa.lock"]);
+        assert!(!locks_for(&a).iter().any(|lock| locks_for(&b).contains(lock)));
+        assert!(!a.sparks.as_ref().unwrap().iter().any(|host| b.sparks.as_ref().unwrap().contains(host)));
         assert_eq!(locks_for(&entry("max", &[0, 1], &["ostrich", "rhea", "moa"], 8003)),
             vec!["sparks.lock", "gpu0.lock", "gpu1.lock", "rhea.lock", "moa.lock"]);
         assert_eq!(locks_for(&c), vec!["gpu1.lock"]);
+    }
+
+    #[test]
+    fn pool_lock_narrowing_changes_only_gpu1_out_of_pool() {
+        for gpus in [vec![0], vec![1], vec![0, 1]] {
+            for hosts in [vec![], vec!["ostrich", "dodo", "emu", "kiwi"], vec!["rhea"], vec!["moa"], vec!["rhea", "moa"], vec!["ostrich", "rhea"]] {
+                for exclusive in [false, true] {
+                    let mut e = entry("test", &gpus, &hosts, 8000);
+                    e.exclusive = Some(exclusive);
+                    let old_pool = gpus.contains(&0) || !hosts.is_empty() || exclusive;
+                    let new_pool = locks_for(&e).contains(&"sparks.lock");
+                    if old_pool != new_pool {
+                        assert_eq!(gpus, vec![1]);
+                        assert!(!exclusive && !hosts.is_empty());
+                        assert!(hosts.iter().all(|h| matches!(*h, "rhea" | "moa")));
+                    }
+                }
+            }
+        }
     }
 
     #[test]

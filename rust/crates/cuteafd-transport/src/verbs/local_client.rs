@@ -12,6 +12,9 @@ pub(crate) struct LocalTp4Client {
     peers: Vec<SocketAddr>,
     config: TcpTransportConfig,
     sessions: Vec<Option<VerbsHostProtocolV2PersistentClientSession>>,
+    retired: Vec<TcpStream>,
+    retirement_error: Option<String>,
+    capacity: Option<u32>,
     pending: Vec<VecDeque<VerbsHostProtocolV2PendingChunkRoundtrip>>,
     chunks: Option<tokio::sync::mpsc::UnboundedReceiver<VerbsHostProtocolV2ResponseChunk>>,
     done: Vec<tokio::sync::oneshot::Receiver<Result<VerbsHostProtocolV2ResponseStreamStats>>>,
@@ -55,6 +58,9 @@ impl LocalTp4Client {
             peers,
             config,
             sessions: (0..world).map(|_| None).collect(),
+            retired: Vec::new(),
+            retirement_error: None,
+            capacity: None,
             pending: (0..world).map(|_| VecDeque::with_capacity(1)).collect(),
             chunks: None,
             done: Vec::with_capacity(world),
@@ -69,6 +75,40 @@ impl LocalTp4Client {
             terminal_released: false,
         }
     }
+    pub(crate) fn set_capacity(&mut self, capacity: u32) { self.capacity = Some(capacity); }
+
+    fn retire_session(&mut self, rank: usize) -> Result<()> {
+        if let Some(session) = self.sessions[rank].take() {
+            let stream = session._stream.try_clone()?;
+            stream.shutdown(std::net::Shutdown::Write)?;
+            drop(session);
+            self.retired.push(stream);
+        }
+        Ok(())
+    }
+
+    fn drain_retired(&mut self) -> Result<()> {
+        self.drain_retired_with_timeout(Duration::from_secs(3))
+    }
+
+    fn drain_retired_with_timeout(&mut self, timeout: Duration) -> Result<()> {
+        if let Some(error) = &self.retirement_error { anyhow::bail!("{error}"); }
+        for stream in &mut self.retired {
+            let result = (|| -> Result<()> {
+                let peer = stream.peer_addr()?;
+                wait_for_ring_release(stream, timeout)
+                    .with_context(|| format!("expert endpoint peer={peer} did not release its rings"))
+            })();
+            if let Err(error) = result {
+                // EOF was not acknowledged: this transport must never re-admit a replacement.
+                self.retirement_error = Some(format!("{error:#}"));
+                return Err(error);
+            }
+        }
+        self.retired.clear();
+        Ok(())
+    }
+
     /// Allocates the shared request buffer (`bytes`, pinned and device-mapped)
     /// and registers it on every session from the next connection on.
     pub(crate) fn enable_egress(&mut self, bytes: usize, stagger: bool) -> Result<CuteafdHostBuffer> {
@@ -120,13 +160,15 @@ impl LocalTp4Client {
         for rank in 0..self.peers.len() {
             anyhow::ensure!(self.write[rank].is_some(), "rank {rank} has no write target");
             if self.sessions[rank].as_ref().map(|s| s.fits(request)).transpose()? == Some(false) {
-                self.sessions[rank] = None;
+                self.retire_session(rank)?;
             }
             if self.sessions[rank].is_none() {
+                self.drain_retired()?;
                 let flow_label = self.flows.label(rank, self.peers[rank])?;
                 self.sessions[rank] = Some(VerbsHostProtocolV2PersistentClientSession::connect_local(
                     self.peers[rank], &self.config, request, None, None, self.write[rank], self.terminal_owner.clone(),
-                    flow_label)?);
+                    flow_label, self.capacity.filter(|_| cuteafd_core::expert_geometry().family() == Some("v41")
+                        && request.header.flags & crate::protocol_v2::EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16 != 0))?);
             }
             let session = self.sessions[rank].as_mut().unwrap();
             anyhow::ensure!(session.write_mode, "rank {rank} session is not in write mode");
@@ -154,8 +196,10 @@ impl LocalTp4Client {
         for pending in &mut self.pending {
             pending.clear();
         }
-        for session in &mut self.sessions {
-            *session = None;
+        for rank in 0..self.sessions.len() {
+            if let Err(error) = self.retire_session(rank) {
+                crate::health::record_failure(format!("expert session teardown failed: {error:#}"));
+            }
         }
         self.deadline = None;
     }
@@ -185,9 +229,10 @@ impl LocalTp4Client {
             {
                 anyhow::ensure!(self.terminal_owner.is_none(),
                     "terminal-owned Spark request exceeds its prewarmed session capacity; reconnect is unsupported");
-                self.sessions[rank] = None;
+                self.retire_session(rank)?;
             }
             if self.sessions[rank].is_none() {
+                self.drain_retired()?;
                 let flow_label = self.flows.label(rank, self.peers[rank])?;
                 self.sessions[rank] = Some(VerbsHostProtocolV2PersistentClientSession::connect_local(
                     self.peers[rank],
@@ -198,6 +243,8 @@ impl LocalTp4Client {
                     self.write[rank],
                     self.terminal_owner.clone(),
                     flow_label,
+                    self.capacity.filter(|_| cuteafd_core::expert_geometry().family() == Some("v41")
+                        && request.header.flags & crate::protocol_v2::EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16 != 0),
                 )?);
             }
             let session = self.sessions[rank].as_mut().unwrap();
@@ -344,6 +391,16 @@ impl Drop for LocalTp4Client {
     }
 }
 
+fn wait_for_ring_release(stream: &mut TcpStream, timeout: Duration) -> Result<()> {
+    stream.set_read_timeout(Some(timeout))?;
+    let mut byte = [0u8; 1];
+    match std::io::Read::read(stream, &mut byte) {
+        Ok(0) => Ok(()),
+        Ok(_) => anyhow::bail!("expert endpoint ring-release acknowledgement contained unexpected data"),
+        Err(error) => Err(error).context("expert endpoint ring-release acknowledgement timed out or failed before reconnect"),
+    }
+}
+
 #[cfg(test)]
 mod terminal_tests {
     use super::*;
@@ -376,6 +433,91 @@ mod terminal_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn replaced_endpoint_releases_rings_before_reconnect() -> Result<()> {
+        let budget = crate::RingBudget::new(302_120_960);
+        let old = budget.reserve(134_217_728)?;
+        let other_lane = budget.reserve(151_060_480)?;
+        assert!(budget.reserve(134_217_728).is_err());
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let mut client = TcpStream::connect(listener.local_addr()?)?;
+        let (mut server, _) = listener.accept()?;
+        let owner = std::thread::spawn(move || -> Result<()> {
+            let mut byte = [0u8; 1];
+            assert_eq!(std::io::Read::read(&mut server, &mut byte)?, 0);
+            // The native endpoint's teardown precedes the reservation and TCP EOF.
+            drop(old);
+            drop(server);
+            Ok(())
+        });
+        client.shutdown(std::net::Shutdown::Write)?;
+        wait_for_ring_release(&mut client, Duration::from_secs(1))?;
+        assert_eq!(budget.used(), 151_060_480);
+        let replacement = budget.reserve(134_217_728)?;
+        assert_eq!(budget.used(), 285_278_208);
+        assert_eq!(budget.peak(), 285_278_208);
+        owner.join().unwrap()?;
+        drop(replacement);
+        drop(other_lane);
+        Ok(())
+    }
+
+    #[test]
+    fn ring_release_wait_is_bounded_and_names_the_endpoint() -> Result<()> {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let mut client = TcpStream::connect(listener.local_addr()?)?;
+        let (_server, _) = listener.accept()?;
+        let error = wait_for_ring_release(&mut client, Duration::from_millis(10)).unwrap_err();
+        assert!(format!("{error:#}").contains("expert endpoint ring-release acknowledgement"));
+        Ok(())
+    }
+
+    #[test]
+    fn retirement_timeout_is_sticky_without_repeated_waits() -> Result<()> {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let client = TcpStream::connect(listener.local_addr()?)?;
+        let (_server, _) = listener.accept()?;
+        let mut transport = LocalTp4Client::new_ranks(Vec::new(), TcpTransportConfig::default());
+        transport.retired.push(client);
+        let first = transport.drain_retired_with_timeout(Duration::from_millis(10)).unwrap_err();
+        let started = Instant::now();
+        let second = transport.drain_retired_with_timeout(Duration::from_secs(3)).unwrap_err();
+        assert!(started.elapsed() < Duration::from_millis(100));
+        assert_eq!(format!("{first:#}"), format!("{second:#}"));
+        assert_eq!(transport.retired.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn bootstrap_rejection_reaches_coordinator_with_budget_numbers() -> Result<()> {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let client = TcpStream::connect(listener.local_addr()?)?;
+        let (mut server, _) = listener.accept()?;
+        write_control(&mut server, &serde_json::json!({
+            "message": "protocol_v2_bootstrap_error",
+            "error": "expert endpoint execution_lane=0: mapped RDMA ring budget exceeded: 419495936 bytes requested in total, limit is 302120960"
+        }))?;
+        let error = read_control_value(&mut BufReader::new(client)).unwrap_err();
+        let error = format!("{error:#}");
+        assert!(error.contains("expert endpoint") && error.contains("419495936") && error.contains("302120960"));
+        assert!(!error.contains("control plane closed"));
+        Ok(())
+    }
+
+    #[test]
+    fn configured_sim_capacity_fits_two_endpoints_on_first_connect() -> Result<()> {
+        let (request, response) = crate::protocol_v2::compact_expert_wire_bytes(
+            cuteafd_core::ExpertGeometry::DEEPSEEK_V41, 1024, false)?;
+        assert_eq!((request, response), (5_521_504, 10_489_952));
+        let alignment = crate::verbs_host_capabilities().preferred_alignment;
+        let request = VerbsHostRdmaRing::new(request.max(8 << 20), alignment, 8)?;
+        let response = VerbsHostRdmaRing::new(response.max(8 << 20), alignment, 8)?;
+        let bytes = request.registered_span_bytes + response.registered_span_bytes;
+        assert_eq!(bytes, 151_060_480);
+        assert_eq!(bytes * 2, 302_120_960);
+        Ok(())
+    }
 
     #[test]
     fn tp2_reset_retains_only_two_actual_peer_slots() -> Result<()> {

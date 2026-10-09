@@ -106,7 +106,27 @@ pub(crate) fn decode_row(library: &NativeLibrary, probe: &ProbeRef, logits: &Dev
     }
 }
 
+fn prompt_token_hash(ids: &[u32]) -> u64 {
+    ids.iter().flat_map(|id| id.to_le_bytes()).fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
+        (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3)
+    })
+}
+
+#[cfg(test)]
+mod matched_prompt_tests {
+    #[test]
+    fn hashes_token_ids_in_order() {
+        assert_eq!(super::prompt_token_hash(&[]), 0xcbf2_9ce4_8422_2325);
+        assert_eq!(super::prompt_token_hash(&[1, 2]), 0xc9c2_8939_c996_68c6);
+        assert_ne!(super::prompt_token_hash(&[1, 2]), super::prompt_token_hash(&[2, 1]));
+    }
+}
+
 pub(crate) fn admitted(probe: &ProbeRef, engine: &str, ids: &[u32], cached: usize) {
+    // Matched-card evidence is opt-in; ordinary serving does no hashing/logging.
+    if std::env::var("CUTEAFD_BENCH_NONCE_SEED").is_ok_and(|seed| !seed.is_empty()) {
+        tracing::info!(engine, prompt_tokens = ids.len(), prompt_token_hash = format_args!("{:016x}", prompt_token_hash(ids)), "matched benchmark prompt");
+    }
     if let Some(probe) = probe {
         probe.admitted(engine, ids, cached);
     }

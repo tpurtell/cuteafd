@@ -140,9 +140,10 @@ pub fn unavailable(model: &str) -> Option<String> {
 fn base_model(model: &str) -> Option<&'static str> {
     // Served IDs may retain the HF namespace or its cache-directory spelling.
     let name = model.rsplit('/').next()?.rsplit("--").next()?;
-    for base in ["Qwen3.8-Flash-Next", "GLM-5.3-Flash", "DeepSeek-V4-Flash-0731", "DeepSeek-V4-Pro-0813", "GLM-5.3"] {
+    for base in ["Qwen3.8-Flash-Next", "GLM-5.3-Flash", "DeepSeek-V4.1-Flash", "DeepSeek-V4-Flash-0731", "DeepSeek-V4-Pro-0813", "GLM-5.3"] {
         if name == base || name.strip_prefix(base).is_some_and(|suffix|
-            suffix.starts_with('-') && !(base == "GLM-5.3" && suffix.starts_with("-Flash")) && !suffix.to_ascii_lowercase().contains("speculator")
+            suffix.starts_with('-') && !suffix.starts_with("-BF16") && !suffix.starts_with("-FP8")
+                && !(base == "GLM-5.3" && suffix.starts_with("-Flash")) && !suffix.to_ascii_lowercase().contains("speculator")
                 && !suffix.to_ascii_lowercase().contains("dflash")) {
             return Some(base);
         }
@@ -151,20 +152,21 @@ fn base_model(model: &str) -> Option<&'static str> {
 }
 
 pub fn same_base_checkpoint(reference: &str, served: &str) -> bool {
-    base_model(reference).is_some_and(|base| base_model(served) == Some(base))
+    default_publication(reference).is_some_and(|p| default_publication(served) == Some(p))
 }
 
 pub fn default_publication(model: &str) -> Option<(&'static str, &'static str)> {
+    if let Some(p) = crate::fidelity_match::official(model) { return Some((p.revision, p.config)); }
     match base_model(model) {
         Some("Qwen3.8-Flash-Next") => return Some((QWEN_REVISION, QWEN_CONFIG)),
         Some("GLM-5.3-Flash") => return Some((GLMF_REVISION, GLMF_CONFIG)),
         Some("DeepSeek-V4-Flash-0731") => return Some((V4FLASH_REVISION, V4FLASH_CONFIG)),
         Some("DeepSeek-V4-Pro-0813") => return Some((V4PRO_REVISION, V4PRO_CONFIG)),
         Some("GLM-5.3") => return Some((GLM_REVISION, GLM_CONFIG)),
+        Some("DeepSeek-V4.1-Flash") => return Some((REVISION, CONFIG)),
         _ => {},
     }
     match model {
-        "deepseek-ai/DeepSeek-V4.1-Flash" => Some((REVISION, CONFIG)),
         "XiaomiMiMo/MiMo-V2.6-Flash-MOPD" => Some((FLASH_REVISION, FLASH_CONFIG)),
         "XiaomiMiMo/MiMo-V2.6-Pro-MOPD" => Some((MIMO_PRO_REVISION, MIMO_PRO_CONFIG)),
         _ => None,
@@ -241,6 +243,12 @@ pub fn download(agent: &ureq::Agent, cache: &Path, repo: &str, commit: &str, con
     }
     let manifest: Value = serde_json::from_slice(&bytes)?;
     ensure!(manifest["config"] == config, "dataset config identity differs");
+    if repo == REPOSITORY {
+        if let Some(p) = crate::fidelity_match::PUBLICATIONS.iter().find(|p| p.revision == commit && p.config == config) {
+            ensure!(manifest["root_checkpoint"]["id"] == p.root,
+                "pinned publication logit root differs from highest official root {}", p.root);
+        }
+    }
     let base = root.join(config);
     for (path, hash) in [("windows.json", "windows_sha256"), ("qualification.json", "qualification_sha256")] {
         fetch(agent, &root, repo, commit, &format!("{config}/{path}"), Some(manifest[hash].as_str().context("dataset checksum")?))?;
@@ -354,6 +362,14 @@ mod tests {
         assert!(ensure_valid_publication(REPOSITORY, FLASH_REVISION, RETIRED_FLASH_CONFIG).is_err());
         assert!(unavailable("XiaomiMiMo/MiMo-V2.6-Pro-RL").is_some());
         assert!(unavailable("zai-org/GLM-5.3-Flashlight").is_some());
+        for quant in ["deepseek-ai/DeepSeek-V4.1-Flash", "nvidia/DeepSeek-V4.1-Flash-NVFP4",
+            "nvidia--DeepSeek-V4.1-Flash-NVFP4", "wrldsuksgo2mars/DeepSeek-V4.1-Flash-EXL3-K3.25-v1"] {
+            assert_eq!(default_publication(quant), Some((REVISION, CONFIG)), "{quant}");
+        }
+        for other in ["deepseek-ai/DeepSeek-V4.1-Flashlight", "deepseek-ai/DeepSeek-V4.1",
+            "other/DeepSeek-V4.1-Flash-speculator", "other/DeepSeek-V4.1-Flash-DFlash2"] {
+            assert!(unavailable(other).is_some(), "{other}");
+        }
     }
 
     #[test]

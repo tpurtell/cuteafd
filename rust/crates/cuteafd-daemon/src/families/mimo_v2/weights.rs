@@ -360,7 +360,7 @@ impl<'a> MimoLoader<'a> {
     }
 
     fn has(&self, name: &str) -> bool {
-        self.checkpoint.tensors.binary_search_by(|t| t.meta.name.as_str().cmp(name)).is_ok()
+        self.checkpoint.contains_tensor(name)
     }
 
     /// The row-concatenation of the FP8 checkpoint weights `names` as their

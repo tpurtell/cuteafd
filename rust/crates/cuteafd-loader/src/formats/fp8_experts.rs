@@ -145,6 +145,17 @@ impl Fp8ExpertTensors {
     /// that each expert tensor present is E4M3 with an FP32 128x128 grid, or
     /// MXFP4 (packed E2M1 U8 with UE8M0 per-32 scales).
     pub fn read(snapshot: &Path, shape: RoutedExpertShape) -> Result<Self> {
+        Self::read_selected(snapshot, shape, None)
+    }
+
+    /// Open only selected layers, using a selected layer's actual headers to
+    /// establish format. MTP-only readers must never probe a backbone shard.
+    pub fn read_layers(snapshot: &Path, shape: RoutedExpertShape, layers: &std::collections::BTreeSet<usize>) -> Result<Self> {
+        ensure!(!layers.is_empty(), "expert role needs at least one layer");
+        Self::read_selected(snapshot, shape, Some(layers))
+    }
+
+    fn read_selected(snapshot: &Path, shape: RoutedExpertShape, layers: Option<&std::collections::BTreeSet<usize>>) -> Result<Self> {
         let index = crate::families::deepseek_v41::v41_exl3::read_json(&snapshot.join("model.safetensors.index.json"), 64 * 1024 * 1024)?;
         let weight_map: BTreeMap<String, String> = serde_json::from_value(
             index.get("weight_map").cloned().context("index has no weight_map")?)?;
@@ -154,14 +165,21 @@ impl Fp8ExpertTensors {
             "model."
         };
         let mtp_layers = weight_map.keys().any(|name| name.starts_with("mtp.layers.") && name.contains(".mlp.experts."));
-        let routed = |name: &str| ((name.starts_with(prefix) && name[prefix.len()..].starts_with("layers."))
-            || (mtp_layers && name.starts_with("mtp.layers."))) && name.contains(".mlp.experts.");
+        let routed = |name: &str| {
+            let layer = name.strip_prefix(prefix).and_then(|n| n.strip_prefix("layers."))
+                .and_then(|n| n.split('.').next()).and_then(|n| n.parse::<usize>().ok())
+                .or_else(|| name.strip_prefix("mtp.layers.").and_then(|n| n.split('.').next())
+                    .and_then(|n| n.parse::<usize>().ok()).and_then(|s| shape.layers.checked_add(s)));
+            name.contains(".mlp.experts.") && layer.is_some_and(|layer| layers.is_none_or(|selected| selected.contains(&layer)))
+        };
         let shards: std::collections::BTreeSet<&String> =
             weight_map.iter().filter(|(name, _)| routed(name)).map(|(_, shard)| shard).collect();
         let mut tensors = HashMap::new();
         for shard in shards {
+            let needed = weight_map.iter().find(|(name, file)| *file == shard && routed(name))
+                .map(|(name, _)| name).context("selected expert shard has no requirement")?;
             for meta in read_safetensors_metadata(&snapshot.join(shard))
-                .with_context(|| format!("reading {shard} headers"))?
+                .with_context(|| format!("expert role needs tensor {needed} in shard {shard} at snapshot {}", snapshot.display()))?
             {
                 if routed(&meta.name) && weight_map.get(&meta.name) == Some(shard) {
                     tensors.insert(meta.name.clone(), Located {
@@ -176,7 +194,8 @@ impl Fp8ExpertTensors {
         }
         let mut catalog = Self { snapshot: snapshot.to_path_buf(), shape, prefix: prefix.to_string(), mtp_layers,
             format: ExpertFormat::Fp8Block128, tensors };
-        let first = catalog.name(shape.first_layer, 0, Fp8Projection::Gate);
+        let first_layer = layers.and_then(|selected| selected.first().copied()).unwrap_or(shape.first_layer);
+        let first = catalog.name(first_layer, 0, Fp8Projection::Gate);
         if matches!(catalog.located(&first)?.dtype, DType::U8 | DType::I8) {
             // E4M3 scales with a second-level FP32 scale: ModelOpt NVFP4; UE8M0 ones: MXFP4.
             let nvfp4 = catalog.tensors.get(&format!("{first}_scale")).is_some_and(|s| s.dtype == DType::F8E4M3)
@@ -185,7 +204,7 @@ impl Fp8ExpertTensors {
         }
         // One expert of the first routed layer fixes the format contract.
         for projection in Fp8Projection::ALL {
-            catalog.check(shape.first_layer, 0, projection)?;
+            catalog.check(first_layer, 0, projection)?;
         }
         Ok(catalog)
     }
@@ -525,6 +544,42 @@ mod tests {
 
     fn ranges(tensors: &Fp8ExpertTensors, tp: usize) -> Vec<(usize, usize)> {
         (0..tp).map(|rank| tensors.rank_range(tp, rank).unwrap()).collect()
+    }
+
+    #[test]
+    fn mtp_only_reads_its_format_and_ignores_missing_or_corrupt_backbone() {
+        use crate::plan::testing::{t, write_safetensors};
+        for nvfp4 in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let shape = RoutedExpertShape { layers: 2, first_layer: 0, experts: 1, topk: 1,
+                hidden: 128, intermediate: 128, draft_stages: 0, draft_experts: 0 };
+            let mut map = BTreeMap::new();
+            let mut tensors = Vec::new();
+            for p in Fp8Projection::ALL {
+                let name = format!("mtp.layers.0.mlp.experts.0.{}.weight", p.stem());
+                if nvfp4 {
+                    tensors.extend([t(&name, "U8", &[128, 64]), t(format!("{name}_scale"), "F8_E4M3", &[128, 8]),
+                        t(format!("{name}_scale_2"), "F32", &[]),
+                        t(format!("{}.input_scale", name.strip_suffix(".weight").unwrap()), "F32", &[])]);
+                } else {
+                    tensors.extend([t(&name, "F8_E4M3", &[128, 128]), t(format!("{name}_scale_inv"), "F32", &[1, 1])]);
+                }
+            }
+            for tensor in &tensors { map.insert(tensor.0.clone(), "mtp.safetensors"); }
+            map.insert("model.language_model.layers.0.mlp.experts.0.gate_proj.weight".into(), "backbone.safetensors");
+            std::fs::write(dir.path().join("model.safetensors.index.json"),
+                serde_json::to_vec(&serde_json::json!({"weight_map": map})).unwrap()).unwrap();
+            write_safetensors(&dir.path().join("mtp.safetensors"), &tensors);
+            let layers = std::collections::BTreeSet::from([2]);
+            let sliced = Fp8ExpertTensors::read_layers(dir.path(), shape, &layers).unwrap();
+            assert_eq!(sliced.format(), if nvfp4 { ExpertFormat::Nvfp4 } else { ExpertFormat::Fp8Block128 });
+            sliced.validate_layer(2).unwrap();
+            std::fs::write(dir.path().join("backbone.safetensors"), b"corrupt").unwrap();
+            Fp8ExpertTensors::read_layers(dir.path(), shape, &layers).unwrap().validate_layer(2).unwrap();
+            std::fs::remove_file(dir.path().join("mtp.safetensors")).unwrap();
+            let error = Fp8ExpertTensors::read_layers(dir.path(), shape, &layers).unwrap_err().to_string();
+            assert!(error.contains("mtp.layers.0") && error.contains("mtp.safetensors"), "{error}");
+        }
     }
 
     #[test]

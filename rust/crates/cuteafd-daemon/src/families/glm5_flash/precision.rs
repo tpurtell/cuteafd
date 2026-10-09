@@ -159,7 +159,7 @@ mod tests {
             }
         }
         tensors.sort_by(|a, b| a.meta.name.cmp(&b.meta.name));
-        (Checkpoint { snapshot: "/no-payload".into(), config: serde_json::Value::Null, quantize_config: None,
+        (Checkpoint { snapshot: "/no-payload".into(), config: serde_json::Value::Null, quantize_config: None, weight_map: Default::default(),
             tensors, missing_shards: vec![], shard_bytes: 0 }, cfg)
     }
 

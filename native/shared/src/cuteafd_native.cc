@@ -499,30 +499,41 @@ void destroy_rdma_rc_endpoint(CuteafdRdmaRcEndpointHandle* endpoint) {
     return;
   }
   if (endpoint->qp != nullptr) {
-    ibv_destroy_qp(endpoint->qp);
+    const int rc = ibv_destroy_qp(endpoint->qp);
+    if (rc != 0) {
+      std::fprintf(stderr, "warning: ibv_destroy_qp qp=%p rc=%d errno=%d\n",
+                   static_cast<void*>(endpoint->qp), rc, errno);
+    }
   }
+  const auto deregister = [](ibv_mr* mr) {
+    const int rc = ibv_dereg_mr(mr);
+    if (rc != 0) {
+      std::fprintf(stderr, "warning: ibv_dereg_mr mr=%p rc=%d errno=%d\n",
+                   static_cast<void*>(mr), rc, errno);
+    }
+  };
   if (endpoint->recv_mr != nullptr) {
-    ibv_dereg_mr(endpoint->recv_mr);
+    deregister(endpoint->recv_mr);
   }
   if (endpoint->landing_mr != nullptr) {
-    ibv_dereg_mr(endpoint->landing_mr);
+    deregister(endpoint->landing_mr);
   }
   if (endpoint->exposed_mr != nullptr) {
-    ibv_dereg_mr(endpoint->exposed_mr);
+    deregister(endpoint->exposed_mr);
   }
   if (endpoint->read_mr != nullptr) {
-    ibv_dereg_mr(endpoint->read_mr);
+    deregister(endpoint->read_mr);
   }
   if (endpoint->flag_source_mr != nullptr) {
-    ibv_dereg_mr(endpoint->flag_source_mr);
+    deregister(endpoint->flag_source_mr);
   }
   std::free(endpoint->flag_source);
   for (ibv_mr* region : endpoint->regions) {
-    ibv_dereg_mr(region);
+    deregister(region);
   }
   endpoint->regions.clear();
   if (endpoint->send_mr != nullptr) {
-    ibv_dereg_mr(endpoint->send_mr);
+    deregister(endpoint->send_mr);
   }
   drain_rdma_rc_cq_events(endpoint->recv_channel);
   drain_rdma_rc_cq_events(endpoint->send_channel);

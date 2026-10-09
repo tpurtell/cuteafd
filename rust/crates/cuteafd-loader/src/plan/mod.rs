@@ -5,6 +5,7 @@ pub mod experts;
 pub mod encoder;
 pub mod families;
 pub mod family;
+pub mod files;
 pub mod format;
 pub mod launch;
 pub mod layout;
@@ -148,6 +149,13 @@ pub enum PlanError {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct RoleReadiness {
+    pub role: String,
+    pub required_shards: Vec<String>,
+    pub unavailable: Vec<Rejection>,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct PlanReport {
     pub vision: MediaMode,
     pub audio: MediaMode,
@@ -175,6 +183,10 @@ pub struct PlanReport {
     pub components: Vec<ComponentPlan>,
     pub unclassified: Vec<String>,
     pub missing_shards: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub role_readiness: Vec<RoleReadiness>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub unneeded_missing_shards: Vec<String>,
     pub bytes_by_owner: BTreeMap<String, u64>,
     pub placement: ExpertPlacement,
     /// Spark ranks of the placement (0: local-only).
@@ -205,6 +217,7 @@ impl PlanReport {
         self.family.is_some()
             && self.config_error.is_none()
             && self.missing_shards.is_empty()
+            && self.role_readiness.iter().all(|role| role.unavailable.is_empty())
             && self.unclassified.is_empty()
             && self.components.iter().all(|c| matches!(c.status, Status::Ready | Status::Unused | Status::Disabled))
             && self.placement_supported
@@ -302,6 +315,8 @@ pub fn plan(snapshot: &Path, options: &PlanOptions) -> Result<PlanReport, PlanEr
         components: Vec::new(),
         unclassified: Vec::new(),
         missing_shards: checkpoint.missing_shards.clone(),
+        role_readiness: Vec::new(),
+        unneeded_missing_shards: Vec::new(),
         bytes_by_owner: BTreeMap::new(),
         placement: options.placement,
         spark_ranks: options.placement.spark_ranks(),
@@ -364,6 +379,34 @@ pub fn plan(snapshot: &Path, options: &PlanOptions) -> Result<PlanReport, PlanEr
         }
     };
     let spec = model.spec();
+    if !checkpoint.missing_shards.is_empty() {
+        let mut requirements: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
+        let ranks = options.placement.spark_ranks();
+        let mut read_roles = vec![files::ReadRole::Coordinator {
+            local_experts: ranks == 0, speculator: false }];
+        read_roles.extend((0..ranks).map(|rank| files::ReadRole::Spark { rank, world: ranks }));
+        if options.vision != MediaMode::Off { read_roles.push(files::ReadRole::Vision); }
+        if report.audio != MediaMode::Off { read_roles.push(files::ReadRole::Audio); }
+        for role in read_roles {
+            let names = files::required_tensors(&checkpoint, role)?;
+            requirements.insert(role.label(), names.into_iter().filter_map(|name| {
+                checkpoint.weight_map.get(&name).cloned().map(|shard| (name, shard))
+            }).collect());
+        }
+        let mut needed = BTreeSet::new();
+        for (role, tensors) in requirements {
+            let shards: BTreeSet<_> = tensors.values().cloned().collect();
+            needed.extend(shards.iter().cloned());
+            let unavailable = tensors.iter().filter(|(name, _)|
+                checkpoint.tensors.binary_search_by(|tensor| tensor.meta.name.as_str().cmp(name.as_str())).is_err())
+                .map(|(tensor, shard)| Rejection { tensor: tensor.clone(), reason:
+                    format!("role {role} lacks header for shard {shard} at snapshot {}", snapshot.display()) }).collect();
+            report.role_readiness.push(RoleReadiness { role, required_shards: shards.into_iter().collect(), unavailable });
+        }
+        report.unneeded_missing_shards = checkpoint.missing_shards.iter()
+            .filter(|shard| !needed.contains(*shard)).cloned().collect();
+        report.missing_shards.retain(|shard| needed.contains(shard));
+    }
     match crate::serving_capacity::cache_requirements(model.as_ref(), &checkpoint.config) {
         Ok(requirements) => report.cache_requirements = requirements,
         Err(error) => report.hints.push(Hint {
@@ -503,8 +546,9 @@ pub fn plan(snapshot: &Path, options: &PlanOptions) -> Result<PlanReport, PlanEr
     }
     if !report.missing_shards.is_empty() {
         report.hints.push(Hint {
-            what: format!("{} checkpoint shards are missing or unreadable", report.missing_shards.len()),
-            how: "Finish the download (hf download) or replicate it (nest replicate hf:ORG/NAME).".into(),
+            what: format!("{} roles lack required checkpoint headers", report.role_readiness.iter().filter(|role| !role.unavailable.is_empty()).count()),
+            how: report.role_readiness.iter().filter_map(|role| role.unavailable.first())
+                .map(|missing| format!("{}: {}", missing.tensor, missing.reason)).collect::<Vec<_>>().join("; "),
         });
     }
     if options.layout.is_none() {
@@ -895,6 +939,16 @@ pub fn render(report: &PlanReport) -> String {
         for name in report.unclassified.iter().take(10) {
             let _ = writeln!(out, "  {name}");
         }
+    }
+    for role in &report.role_readiness {
+        let _ = writeln!(out, "role {}: {} required shards, {} unavailable tensor headers", role.role,
+            role.required_shards.len(), role.unavailable.len());
+        for missing in role.unavailable.iter().take(3) {
+            let _ = writeln!(out, "  {}: {}", missing.tensor, missing.reason);
+        }
+    }
+    if !report.unneeded_missing_shards.is_empty() {
+        let _ = writeln!(out, "absent unneeded shards (info): {:?}", report.unneeded_missing_shards);
     }
     if !report.missing_shards.is_empty() {
         let _ = writeln!(out, "\nmissing shards: {}", report.missing_shards.len());

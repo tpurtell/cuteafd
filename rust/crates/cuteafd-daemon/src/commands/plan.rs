@@ -37,11 +37,14 @@ fn options(args: &PlanArgs) -> Result<PlanOptions, PlanError> {
                 full_prefill_logits: args.full_prefill_logits,
                 prefill_lanes: args.prefill_lanes,
                 glmf_decode_rows: args.decode_rows,
+                glmf_index: args.index_cache.into(),
                 headroom_bytes: budget_bytes("--headroom-gib", args.headroom_gib)?,
                 graph_budget_bytes: args.graph_budget_mib.map(|mib| mib << 20),
                 glmf_pool_marks: args.prefix_marks == crate::families::glm5_flash::prefix::PrefixMarks::Pool,
                 glmf_shared_replay: args.replay_records == crate::families::glm5_flash::engine::ReplayRecords::Shared,
                 concurrency: args.concurrency,
+                state_slots: args.state_slots,
+                glmf_mark_lanes: args.mark_lanes,
                 prefix_slots: args.prefix_slots,
                 mimo_prefix_entries: args.prefix_cache_entries,
                 mimo_prefix_mark_bytes: args.prefix_cache_mark_mib.checked_mul(1 << 20)
@@ -62,7 +65,7 @@ fn options(args: &PlanArgs) -> Result<PlanOptions, PlanError> {
 }
 
 pub(crate) fn run_plan(args: PlanArgs) -> Result<()> {
-    let options = options(&args)?;
+    let mut options = options(&args)?;
     let snapshot = if PathBuf::from(&args.model).is_dir() {
         PathBuf::from(&args.model)
     } else {
@@ -86,6 +89,80 @@ pub(crate) fn run_plan(args: PlanArgs) -> Result<()> {
             .snapshot_path
             .with_context(|| format!("no snapshot of {} under {}", args.model, hf_home.display()))?
     };
+    if let Some(layout) = &mut options.layout {
+        let config = std::fs::File::open(snapshot.join("config.json")).ok()
+            .and_then(|file| serde_json::from_reader::<_, serde_json::Value>(file).ok());
+        if config.as_ref().and_then(|value| value.get("model_type"))
+            .and_then(serde_json::Value::as_str) == Some("deepseek_v41") {
+            // Match run.sh's supported worker capacities without changing other families.
+            layout.spark_capacity_rows = if args.prefill_rows == 0 { 4096 }
+                else if args.prefill_rows <= 80 { 80 }
+                else if args.prefill_rows <= 256 { 256 }
+                else if args.prefill_rows <= 1024 { 1024 }
+                else { 4096 };
+        }
+    }
+    if args.files || args.fetch || args.role.is_some() {
+        use cuteafd_loader::plan::files::{manifest_roles, ReadRole};
+        let parse = |name: &str| ReadRole::parse(name, options.placement, args.include_speculator);
+        let roles = if let Some(layout) = &args.file_layout {
+            anyhow::ensure!(args.role.is_none(), "--role and --file-layout are mutually exclusive");
+            let hosts: std::collections::BTreeMap<String, Vec<String>> =
+                serde_json::from_reader(std::fs::File::open(layout)?)?;
+            if let Some(host) = &args.host {
+                hosts.get(host).with_context(|| format!("host {host} is absent from {}", layout.display()))?
+                    .iter().map(|name| parse(name)).collect::<Result<Vec<_>>>()?
+            } else {
+                let manifests = hosts.iter().map(|(host, names)| {
+                    let roles = names.iter().map(|name| parse(name)).collect::<Result<Vec<_>>>()?;
+                    let mut manifest = manifest_roles(&snapshot, &roles)?;
+                    attach_snapshots(&mut manifest, &roles, &args)?;
+                    Ok((host.clone(), manifest))
+                }).collect::<Result<std::collections::BTreeMap<_, _>>>()?;
+                if args.fetch {
+                    let hosts: Vec<_> = manifests.into_iter().collect();
+                    for chunk in hosts.chunks(args.fetch_parallel as usize) {
+                        std::thread::scope(|scope| -> Result<()> {
+                            let handles: Vec<_> = chunk.iter().map(|(host, manifest)| {
+                                let mut host_args = args.clone();
+                                host_args.host = Some(host.clone());
+                                let snapshot = &snapshot;
+                                scope.spawn(move || transfer(snapshot, manifest, &host_args))
+                            }).collect();
+                            for handle in handles { handle.join().map_err(|_| anyhow::anyhow!("host transfer thread panicked"))??; }
+                            Ok(())
+                        })?;
+                    }
+                    eprintln!("layout: {} host transfers complete", hosts.len());
+                    return Ok(());
+                }
+                anyhow::ensure!(args.json, "all-host inventory needs --json; select --host for a plain file list");
+                println!("{}", serde_json::to_string_pretty(&manifests)?);
+                return Ok(());
+            }
+        } else {
+            anyhow::ensure!(args.host.is_none() || args.fetch, "--host needs --file-layout or --fetch");
+            vec![parse(args.role.as_deref().unwrap_or("coordinator"))?]
+        };
+        let mut manifest = manifest_roles(&snapshot, &roles)?;
+        attach_snapshots(&mut manifest, &roles, &args)?;
+        if args.fetch {
+            transfer(&snapshot, &manifest, &args)?;
+        } else if args.files {
+            if args.json { println!("{}", serde_json::to_string_pretty(&manifest)?); }
+            else {
+                anyhow::ensure!(manifest.additional_snapshots.is_empty(), "multiple snapshot roots need --json; inventory each root separately for a plain rsync list");
+                for file in &manifest.files { println!("{}", file.path); }
+            }
+        } else {
+            let mut headers = 0;
+            for role in &roles { headers += cuteafd_loader::plan::files::open_role(&snapshot, *role)?.tensors.len(); }
+            if args.json { println!("{}", serde_json::to_string_pretty(&manifest)?); }
+            else { println!("role {} HEADERS READY: {headers} tensor headers, {} required files",
+                manifest.role, manifest.files.len()); }
+        }
+        return Ok(());
+    }
     let report = if args.spark_ranks.is_some() { plan(&snapshot, &options)? }
         else { plan_preferred(&snapshot, &options)? };
     if args.json {
@@ -98,6 +175,195 @@ pub(crate) fn run_plan(args: PlanArgs) -> Result<()> {
     }
     if args.require_ready && !report.executable() {
         anyhow::bail!("{} is not servable by this build", args.model);
+    }
+    Ok(())
+}
+
+fn attach_snapshots(manifest: &mut cuteafd_loader::plan::files::FileManifest,
+    roles: &[cuteafd_loader::plan::files::ReadRole], args: &PlanArgs) -> Result<()> {
+    use cuteafd_loader::plan::files::{manifest_standalone, ReadRole};
+    let configured = [
+        ("drafter", &args.drafter_snapshot, roles.iter().any(|r| matches!(r, ReadRole::Drafter | ReadRole::Coordinator { speculator: true, .. }))),
+        ("vision", &args.vision_snapshot, roles.contains(&ReadRole::Vision)),
+        ("audio", &args.audio_snapshot, roles.contains(&ReadRole::Audio)),
+    ];
+    for (role, path, enabled) in configured {
+        if let Some(path) = path.as_ref().filter(|_| enabled) { manifest.additional_snapshots.push(manifest_standalone(path, role)?); }
+    }
+    manifest.total_bytes = manifest.additional_snapshots.iter().fold(manifest.total_bytes, |sum, repo|
+        sum.and_then(|sum| sum.checked_add(repo.total_bytes?)));
+    Ok(())
+}
+
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+/// One SSH session for the entire file inventory, preserving input order.
+fn remote_sizes(host: &str, root: &std::path::Path, files: &[cuteafd_loader::plan::files::RequiredFile]) -> Result<Vec<Option<u64>>> {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    let mut child = Command::new("ssh").args([host,
+        "while IFS= read -r path; do if test -f \"$path\"; then stat -Lc %s -- \"$path\" || exit 1; else printf '%s\\n' '-'; fi; done"])
+        .stdin(Stdio::piped()).stdout(Stdio::piped()).spawn()?;
+    let list = files.iter().map(|file| format!("{}\n", root.join(&file.path).display())).collect::<String>();
+    child.stdin.take().context("SSH size list stdin")?.write_all(list.as_bytes())?;
+    let output = child.wait_with_output()?;
+    anyhow::ensure!(output.status.success(), "host {host}: inspecting file sizes failed");
+    parse_remote_sizes(host, &String::from_utf8(output.stdout)?, files.len())
+}
+
+fn parse_remote_sizes(host: &str, output: &str, count: usize) -> Result<Vec<Option<u64>>> {
+    let sizes = output.lines().map(|line| {
+        if line == "-" { Ok(None) } else { Ok(Some(line.parse::<u64>()?)) }
+    }).collect::<Result<Vec<_>>>()?;
+    anyhow::ensure!(sizes.len() == count, "host {host}: expected {count} size results, got {}", sizes.len());
+    Ok(sizes)
+}
+
+fn source_location(value: Option<&str>, snapshot: &std::path::Path) -> Result<(Option<String>, PathBuf)> {
+    let value = value.map(str::to_owned).unwrap_or_else(|| snapshot.display().to_string());
+    let (host, path) = if let Some((host, path)) = value.split_once(':') {
+        anyhow::ensure!(!host.is_empty() && !host.starts_with('-') && host.bytes().all(|c| c.is_ascii_alphanumeric() || b"._-@".contains(&c)), "invalid source host {host}");
+        (Some(host.to_owned()), PathBuf::from(path))
+    } else { (None, PathBuf::from(value)) };
+    anyhow::ensure!(path.is_absolute() && !path.to_string_lossy().contains(['\n', '\r']), "source needs an absolute snapshot path");
+    Ok((host, path))
+}
+
+fn transfer(snapshot: &std::path::Path, manifest: &cuteafd_loader::plan::files::FileManifest,
+    args: &PlanArgs) -> Result<()> {
+    use anyhow::ensure;
+    use std::io::Write;
+    use std::process::Command;
+    ensure!(manifest.additional_snapshots.is_empty(), "fetch separate snapshot roots individually; additional repos are listed in --files --json");
+    let automatic = args.source.as_deref() == Some("auto");
+    let (source_host, source_path) = source_location(if automatic { None } else { args.source.as_deref() }, snapshot)?;
+    if automatic {
+        use std::process::Command;
+        let local = Command::new("hostname").arg("-s").output().ok()
+            .and_then(|o| String::from_utf8(o.stdout).ok()).map(|s| s.trim().to_owned());
+        let placement = manifest.repo_id.as_ref().and_then(|repo| {
+            let selector = format!("hf:{repo}{}", manifest.revision.as_ref().map(|r| format!("@{r}")).unwrap_or_default());
+            Command::new("nest").args(["where", &selector, "--json"]).output().ok()
+                .filter(|o| o.status.success()).and_then(|o| serde_json::from_slice::<serde_json::Value>(&o.stdout).ok())
+        });
+        let sealed = snapshot.starts_with("/mnt/sparknest") && placement.as_ref()
+            .and_then(|v| v["hosts"].as_array()).is_some_and(|hosts| hosts.iter().any(|host|
+                host["ready"] == true && host["host"].as_str() == local.as_deref()));
+        if sealed { eprintln!("source auto: sealed local sparknest copy at {}", snapshot.display()); }
+        else if snapshot.starts_with("/mnt/sparknest") {
+            eprintln!("source auto: no sealed local copy; streaming from sparknest at {}", snapshot.display());
+        } else { eprintln!("source auto: using local snapshot {} (no sparknest discovery)", snapshot.display()); }
+    }
+    let destination = args.destination.as_ref().context("--fetch needs --destination")?;
+    ensure!(destination.is_absolute(), "destination must be an absolute snapshot directory");
+    let host = args.host.as_deref();
+    if let Some(host) = host {
+        ensure!(!host.starts_with('-') && host.bytes().all(|c| c.is_ascii_alphanumeric() || b"._-@".contains(&c)),
+            "invalid SSH host {host}");
+    }
+    let available = |program: &str| Command::new("sh").args(["-c", &format!("command -v {program} >/dev/null")])
+        .status().is_ok_and(|s| s.success());
+    let installed_remote = |host: &str| Command::new("ssh").args([host, "command -v rdmasync >/dev/null"])
+        .status().is_ok_and(|s| s.success());
+    let remote_rdma = host.is_none_or(installed_remote) && source_host.as_deref().is_none_or(installed_remote);
+    let program = if (host.is_some() || source_host.is_some()) && available("rdmasync") && remote_rdma { "rdmasync" } else {
+        eprintln!("warning: rdmasync unavailable on both ends; using rsync over SSH/local transport");
+        "rsync"
+    };
+    ensure!(!destination.to_string_lossy().contains(['\n', '\r']), "destination contains a line break");
+    for file in &manifest.files {
+        ensure!(!file.path.contains(['\n', '\r']) && !std::path::Path::new(&file.path).is_absolute()
+            && std::path::Path::new(&file.path).components().all(|c| matches!(c, std::path::Component::Normal(_))),
+            "unsafe file-list path {}", file.path);
+    }
+    let source_sizes = if let Some(host) = source_host.as_deref() { remote_sizes(host, &source_path, &manifest.files)? }
+        else { manifest.files.iter().map(|file| source_path.join(&file.path).metadata().ok()
+            .filter(|m| m.is_file()).map(|m| m.len())).collect() };
+    for (file, actual) in manifest.files.iter().zip(&source_sizes) {
+        ensure!(actual.is_some(), "source host {} lacks {}", source_host.as_deref().unwrap_or("local"), file.path);
+        if let Some(expected) = file.bytes { ensure!(*actual == Some(expected), "source {} size {:?}, expected {expected}", file.path, actual); }
+    }
+    let existing_sizes = if let Some(host) = host { remote_sizes(host, destination, &manifest.files)? }
+        else { manifest.files.iter().map(|file| destination.join(&file.path).metadata().ok()
+            .filter(|m| m.is_file()).map(|m| m.len())).collect() };
+    let mut selected = Vec::new();
+    let mut bytes = 0u64;
+    for ((file, existing), source_bytes) in manifest.files.iter().zip(existing_sizes).zip(&source_sizes) {
+        let source_bytes = source_bytes.context("source size missing after validation")?;
+        if args.force || existing != Some(source_bytes) {
+            bytes = bytes.checked_add(source_bytes).context("transfer bytes overflow")?;
+            selected.push(file);
+        }
+    }
+    let list = selected.iter().map(|file| format!("{}\n", file.path)).collect::<String>();
+    let src = if host.is_none() { source_host.as_deref().map_or_else(|| format!("{}/", source_path.display()),
+        |peer| format!("{peer}:{}/", source_path.display())) } else { format!("{}/", source_path.display()) };
+    let dest = host.map_or_else(|| format!("{}/", destination.display()),
+        |host| format!("{host}:{}/", destination.display()));
+    let list_arg = "--files-from=-";
+    let mut command = Command::new(program);
+    // -L materializes HF blob symlinks as ordinary snapshot files accepted by
+    // every loader. Never retain links pointing outside the destination cache.
+    command.args(["-aL", "--info=progress2", "--protect-args", list_arg]);
+    if args.force { command.arg("--ignore-times"); }
+    else { command.arg("--size-only"); }
+    command.args([&src, &dest]);
+    // rsync cannot copy between two remote endpoints. Run it on the source
+    // peer, which pushes to the selected target using its normal SSH access.
+    if let Some(peer) = source_host.as_deref().filter(|_| host.is_some()) {
+        let remote = std::iter::once(program.to_string()).chain(command.get_args().map(|a| shell_quote(&a.to_string_lossy())))
+            .collect::<Vec<_>>().join(" ");
+        command = Command::new("ssh");
+        if args.forward_agent { command.arg("-A"); }
+        command.args([peer, &remote]);
+    }
+    eprintln!("host {}: {} files, {bytes} bytes", host.unwrap_or("local"), selected.len());
+    if args.dry_run {
+        let rendered = std::iter::once(command.get_program().to_string_lossy().into_owned()).chain(command.get_args().map(|a| shell_quote(&a.to_string_lossy())))
+            .collect::<Vec<_>>().join(" ");
+        println!("{rendered}");
+        for file in &selected {
+            let size = manifest.files.iter().position(|entry| entry.path == file.path)
+                .and_then(|index| source_sizes[index]).context("selected source size")?;
+            println!("{size}\t{}", file.path);
+        }
+        return Ok(());
+    }
+    if host.is_none() { std::fs::create_dir_all(destination)?; }
+    if let Some(host) = host {
+        let status = Command::new("ssh").args([host, &format!("mkdir -p -- {}", shell_quote(&destination.display().to_string()))]).status()?;
+        ensure!(status.success(), "host {host}: cannot create snapshot destination");
+    }
+    let mut child = command.stdin(std::process::Stdio::piped()).spawn()
+        .with_context(|| format!("starting {program} for host {}", host.unwrap_or("local")))?;
+    child.stdin.take().context("transfer list stdin")?.write_all(list.as_bytes())?;
+    let status = child.wait()?;
+    ensure!(status.success(), "host {} transfer failed ({status}); files: {:?}", host.unwrap_or("local"),
+        selected.iter().map(|f| &f.path).collect::<Vec<_>>());
+    let actual_sizes = if let Some(host) = host { remote_sizes(host, destination, &manifest.files)? }
+        else { manifest.files.iter().map(|file| destination.join(&file.path).metadata().ok()
+            .filter(|m| m.is_file()).map(|m| m.len())).collect() };
+    for ((file, actual), expected) in manifest.files.iter().zip(actual_sizes).zip(source_sizes) {
+        ensure!(actual == expected && actual.is_some(), "host {}: {} size {actual:?}, expected {expected:?}", host.unwrap_or("local"), file.path);
+    }
+    if destination.parent().and_then(|p| p.file_name()).is_some_and(|name| name == "snapshots") {
+        let refs = destination.parent().and_then(|p| p.parent()).context("HF cache root")?.join("refs");
+        let revision = destination.file_name().context("snapshot revision")?.to_string_lossy();
+        if let Some(host) = host {
+            let reference = shell_quote(&refs.join("main").display().to_string());
+            let script = format!("mkdir -p -- {} && {{ test -e {reference} || (set -C; printf '%s\\n' {} > {reference}); }}",
+                shell_quote(&refs.display().to_string()), shell_quote(&revision));
+            ensure!(Command::new("ssh").args([host, &script]).status()?.success(), "host {host}: cannot create refs/main");
+        } else {
+            std::fs::create_dir_all(&refs)?;
+            match std::fs::OpenOptions::new().write(true).create_new(true).open(refs.join("main")) {
+                Ok(mut file) => writeln!(file, "{revision}")?,
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {},
+                Err(error) => return Err(error.into()),
+            }
+        }
     }
     Ok(())
 }
@@ -121,6 +387,9 @@ mod tests {
             spark_budget_gib: 100.0,
             coordinator_weight_budget_gib: 80.0,
             json: true,
+            files: false, role: None, host: None, file_layout: None, fetch_parallel: 2, fetch: false, destination: None, source: None, forward_agent: false,
+            dry_run: false, force: false, include_speculator: false,
+            drafter_snapshot: None, vision_snapshot: None, audio_snapshot: None,
             require_ready,
             layout: true,
             rtx: 2,
@@ -133,10 +402,13 @@ mod tests {
             full_prefill_logits: false,
             prefill_lanes: 0,
             decode_rows: 64,
+            index_cache: crate::families::glm5_flash::engine::IndexCache::Keys,
             headroom_gib: 2.0,
             graph_budget_mib: None,
             replay_records: crate::families::glm5_flash::engine::ReplayRecords::Own,
             concurrency: 8,
+            state_slots: None,
+            mark_lanes: None,
             prefix_slots: None,
             prefix_cache_entries: 20,
             prefix_cache_mark_mib: 2048,
@@ -148,6 +420,74 @@ mod tests {
             native_mtp_layers: 3,
             workspace_manifest: None,
         }
+    }
+
+    #[test]
+    fn standalone_repos_are_inventory_only_when_the_host_runs_that_role() {
+        use cuteafd_loader::plan::files::{manifest_roles, ReadRole};
+        let main = tempfile::tempdir().unwrap();
+        write_snapshot(main.path(), &mimo_flash_config(), &mimo_flash_tensors(), None);
+        let draft = tempfile::tempdir().unwrap();
+        write_snapshot(draft.path(), &serde_json::json!({"model_type":"external_drafter"}),
+            &[cuteafd_loader::plan::testing::t("draft.weight", "BF16", &[2])], None);
+        let mut args = args(main.path(), 4, false);
+        args.drafter_snapshot = Some(draft.path().into());
+        let spark = ReadRole::Spark { rank: 0, world: 4 };
+        let mut manifest = manifest_roles(main.path(), &[spark]).unwrap();
+        attach_snapshots(&mut manifest, &[spark], &args).unwrap();
+        assert!(manifest.additional_snapshots.is_empty());
+        let coordinator = ReadRole::Coordinator { local_experts: false, speculator: true };
+        let mut manifest = manifest_roles(main.path(), &[coordinator]).unwrap();
+        attach_snapshots(&mut manifest, &[coordinator], &args).unwrap();
+        assert_eq!(manifest.additional_snapshots.len(), 1);
+        assert!(manifest.additional_snapshots[0].files.iter().any(|f| f.path == "model-00001-of-00001.safetensors"));
+    }
+
+    #[test]
+    fn peer_source_paths_are_absolute_and_hosts_cannot_supply_options() {
+        assert_eq!(source_location(Some("worker:/models/snapshot"), std::path::Path::new("/unused")).unwrap(),
+            (Some("worker".into()), PathBuf::from("/models/snapshot")));
+        assert!(source_location(Some("-oProxyCommand=bad:/snapshot"), std::path::Path::new("/unused")).is_err());
+        assert!(source_location(Some("worker:relative"), std::path::Path::new("/unused")).is_err());
+        assert!(source_location(Some("worker:/line\nbreak"), std::path::Path::new("/unused")).is_err());
+    }
+
+    #[test]
+    fn batched_size_results_preserve_order_and_reject_partial_or_invalid_output() {
+        assert_eq!(parse_remote_sizes("peer", "17\n-\n0\n", 3).unwrap(), vec![Some(17), None, Some(0)]);
+        assert!(parse_remote_sizes("peer", "17\n", 2).unwrap_err().to_string().contains("peer"));
+        assert!(parse_remote_sizes("peer", "banner\n17\n", 2).is_err());
+    }
+
+    #[test]
+    fn files_cli_and_local_transfer_skip_matching_sizes_without_deleting() {
+        use clap::Parser;
+        let source = tempfile::tempdir().unwrap();
+        let destination = tempfile::tempdir().unwrap();
+        std::fs::write(source.path().join("config.json"), b"config").unwrap();
+        std::fs::write(destination.path().join("keep.txt"), b"keep").unwrap();
+        let manifest = cuteafd_loader::plan::files::FileManifest {
+            role: "coordinator".into(), snapshot: source.path().display().to_string(),
+            repo_id: None, revision: None, files: vec![cuteafd_loader::plan::files::RequiredFile {
+                path: "config.json".into(), bytes: Some(6) }], total_bytes: Some(6), additional_snapshots: Vec::new() };
+        let mut args = args(source.path(), 4, false);
+        args.fetch = true;
+        args.destination = Some(destination.path().into());
+        if std::process::Command::new("rsync").arg("--version").output().is_ok() {
+            transfer(source.path(), &manifest, &args).unwrap();
+            assert_eq!(std::fs::read(destination.path().join("config.json")).unwrap(), b"config");
+            std::fs::write(destination.path().join("config.json"), b"custom").unwrap();
+            transfer(source.path(), &manifest, &args).unwrap();
+            assert_eq!(std::fs::read(destination.path().join("config.json")).unwrap(), b"custom");
+            args.force = true;
+            transfer(source.path(), &manifest, &args).unwrap();
+            assert_eq!(std::fs::read(destination.path().join("config.json")).unwrap(), b"config");
+            assert_eq!(std::fs::read(destination.path().join("keep.txt")).unwrap(), b"keep");
+        }
+        let cli = crate::cli::Cli::try_parse_from(["cuteafd", "plan", "/not-read", "--files",
+            "--role", "spark0", "--spark-ranks", "4"]).unwrap();
+        let crate::cli::Commands::Plan(args) = cli.command else { unreachable!() };
+        assert!(args.files && args.role.as_deref() == Some("spark0"));
     }
 
     #[test]
@@ -283,6 +623,21 @@ mod tests {
     }
 
     #[test]
+    fn glm_flash_index_cache_reaches_the_layout() {
+        use clap::Parser;
+        use cuteafd_loader::serving_capacity::GlmfIndexCache;
+        let parse = |extra: &[&str]| crate::cli::Cli::try_parse_from(
+            ["cuteafd", "plan", "/not-read", "--layout"].into_iter().chain(extra.iter().copied()));
+        for (extra, index) in [(&[][..], GlmfIndexCache::Keys),
+            (&["--index-cache", "keys"][..], GlmfIndexCache::Keys),
+            (&["--index-cache", "compact"][..], GlmfIndexCache::Compact)] {
+            let crate::cli::Commands::Plan(args) = parse(extra).unwrap().command else { panic!("plan") };
+            assert_eq!(options(&args).unwrap().layout.unwrap().glmf_index, index);
+        }
+        assert!(parse(&["--index-cache", "auto"]).is_err());
+    }
+
+    #[test]
     fn glm_flash_prefix_marks_reach_the_layout() {
         use clap::Parser;
         let parse = |extra: &[&str]| crate::cli::Cli::try_parse_from(
@@ -293,6 +648,84 @@ mod tests {
             assert_eq!(options(&args).unwrap().layout.unwrap().glmf_pool_marks, pool);
         }
         assert!(parse(&["--prefix-marks", "host"]).is_err());
+    }
+
+    /// The flags the launcher's encoder placement plan passes for GLM 5.3 Flash size its layout as
+    /// serve-glmf allocates: its recurrent state holds max(--slots 8, --max-sequences) slots
+    /// (`serve.rs`, `engine_args.slots.max(args.max_sequences)`) and its mark arena counts
+    /// min(--max-sequences, DECODE_ROWS = 64) lanes (`serve.rs`, `prefix.mark_rule(lanes)`), over the
+    /// entries and mark budget it gets. The launcher passes those counts as --state-slots and
+    /// --mark-lanes beside --concurrency; without them the planner derives both from --concurrency.
+    #[test]
+    fn glm_flash_serving_knobs_reach_the_layout() {
+        use clap::Parser;
+        let mut config = cuteafd_loader::plan::testing::glm5_flash_config(45);
+        config["text_config"]["layer_types"] = serde_json::json!((0..45)
+            .map(|l| if l % 4 == 3 { "deepseek_sparse_attention" } else { "linear_attention" }).collect::<Vec<_>>());
+        let cfg = cuteafd_loader::families::glm5_flash::GlmNextConfig::from_hf(&config).unwrap();
+        let rank = cuteafd_loader::serving_capacity::glm_flash_cache_geometry(&cfg, 45).unwrap().ranks[0];
+        // The standard 45-layer FP32-state geometry: a mark and a sequence's state are 147,619,840 B.
+        let (mark, per_sequence) = (rank.retained_mark_bytes, rank.active_state_per_sequence_bytes);
+        assert_eq!((mark, per_sequence), (147_619_840, 147_619_840));
+        let snapshot = tempfile::tempdir().unwrap();
+        write_snapshot(snapshot.path(), &config, &[], None);
+        let model = snapshot.path().display().to_string();
+        let layout = |extra: &[&str]| {
+            let argv = ["cuteafd", "plan", model.as_str(), "--layout", "--spark-ranks", "4", "--rtx", "1",
+                "--rtx-gib", "96", "--pool-tokens", "0"];
+            let cli = crate::cli::Cli::try_parse_from(argv.into_iter().chain(extra.iter().copied())).unwrap();
+            let crate::cli::Commands::Plan(args) = cli.command else { panic!("plan") };
+            options(&args).unwrap()
+        };
+        // (marks, state) bytes on the GPU.
+        let planned = |extra: &[&str]| {
+            let memory = plan(std::path::Path::new(&model), &layout(extra)).unwrap().memory_layout.unwrap();
+            let group = |name: &str| memory.devices[0].items.iter().filter(|i| i.group == name).map(|i| i.bytes)
+                .sum::<u64>();
+            (group("marks"), group("state"))
+        };
+        let state = |slots: u64| rank.fixed_state_bytes + per_sequence * slots + rank.speculative_replay_bytes;
+        // serve-glmf's own counts for `sequences`, `entries` and a mark budget (MiB).
+        let served = |sequences: u64, entries: u64, mib: u64| {
+            let (slots, lanes) = (sequences.max(8), sequences.min(64));
+            (cuteafd_core::prefix::mark_slots_for(lanes, entries, mark, mib << 20) * mark, state(slots))
+        };
+        // The launcher's arguments for CONCURRENCY, PREFIX_CACHE_ENTRIES and PREFIX_CACHE_MARK_MIB.
+        let launcher = |sequences: u64, entries: u64, mib: Option<u64>| {
+            let mut argv = vec!["--concurrency".to_string(), sequences.to_string(), "--state-slots".into(),
+                sequences.max(8).to_string(), "--mark-lanes".into(), sequences.min(64).to_string(),
+                "--prefix-cache-entries".into(), entries.to_string()];
+            if let Some(mib) = mib { argv.extend(["--prefix-cache-mark-mib".into(), mib.to_string()]); }
+            argv
+        };
+        for (sequences, entries, mib) in [(1, 0, None), (1, 20, None), (5, 6, Some(1971)), (8, 20, None),
+            (16, 20, None), (16, 6, Some(1971)), (64, 20, None), (65, 20, None), (128, 20, None), (128, 0, None)] {
+            let argv = launcher(sequences, entries, mib);
+            let argv: Vec<&str> = argv.iter().map(String::as_str).collect();
+            assert_eq!(planned(&argv), served(sequences, entries, mib.unwrap_or(2048)), "{argv:?}");
+        }
+        // Implicit state slots now follow serving's max(8, C), including C1 and C16.
+        // Explicit mark lanes still cap C128 at 64 instead of the planner's uncapped C lanes.
+        assert_eq!(planned(&launcher(1, 0, None).iter().map(String::as_str).collect::<Vec<_>>()), (0, state(8)));
+        assert_eq!(planned(&["--concurrency", "1", "--prefix-cache-entries", "0"]), (0, state(8)));
+        assert_eq!(planned(&launcher(16, 20, None).iter().map(String::as_str).collect::<Vec<_>>()),
+            (34 * mark, state(16)));
+        assert_eq!(planned(&["--concurrency", "16"]), (34 * mark, state(16)));
+        assert_eq!(planned(&launcher(128, 20, None).iter().map(String::as_str).collect::<Vec<_>>()),
+            (130 * mark, state(128)));
+        assert_eq!(planned(&["--concurrency", "128"]).0, 258 * mark);
+        assert_eq!((258 - 130) * mark, 18_895_339_520);
+        // Unset launch keys now plan serving's defaults: 18 marks and 8 state slots.
+        assert_eq!(planned(&[]), (18 * mark, state(8)));
+        // The other knobs serve-glmf gets reach the layout as given.
+        let custom = layout(&["--concurrency", "16", "--state-slots", "16", "--mark-lanes", "16",
+            "--prefix-cache-entries", "6", "--prefix-cache-mark-mib", "1971", "--replay-records", "shared"]);
+        let knobs = custom.layout.as_ref().unwrap();
+        assert_eq!((knobs.concurrency, knobs.state_slots, knobs.glmf_mark_lanes, knobs.mimo_prefix_entries,
+            knobs.mimo_prefix_mark_bytes, knobs.glmf_shared_replay), (16, Some(16), Some(16), 6, 1971 << 20, true));
+        for zero in ["--state-slots", "--mark-lanes"] {
+            assert!(crate::cli::Cli::try_parse_from(["cuteafd", "plan", "/not-read", "--layout", zero, "0"]).is_err());
+        }
     }
 
     #[test]

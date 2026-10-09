@@ -1576,6 +1576,65 @@ SPARK_EXPERT_DOCKER_INFERENCE=registry.example/spark:v9
         return subprocess.run(["bash", "-c", script], cwd=ROOT,
                               text=True, capture_output=True, timeout=20)
 
+    def wip_gate(self, *, roles: list[str], verified: bool = True,
+                 corrupt_hash: bool = False, corrupt_host: bool = False) -> subprocess.CompletedProcess[str]:
+        block = run_sh_block('spark_advertised_roles=""', "\n# Zero-Spark deployments")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for host in ('h0', 'h1', 'h2'):
+                slot = root / host / 'slot' / 'spark-expert'
+                artifacts = slot / 'workspace/.cuteafd-wip'
+                artifacts.mkdir(parents=True)
+                (artifacts / 'libcuteafd_native.so').write_bytes(b'test library')
+                manifest = json.dumps({'schema': 1, 'spark_tp_roles': roles,
+                                      'symbols_verified': verified,
+                                      'native_library_sha256': hashlib.sha256(b'test library').hexdigest()}).encode()
+                (artifacts / 'V41_EXPERT_TP_AOT.json').write_bytes(manifest)
+                meta = json.dumps({'schema': 1, 'slot': 'slot', 'role': 'spark-expert',
+                                   'spark_tp_roles': roles,
+                                   'v41_expert_tp_manifest_sha256': 'bad' if corrupt_hash or (corrupt_host and host == 'h2') else hashlib.sha256(manifest).hexdigest()}).encode()
+                (slot / 'META.json').write_bytes(meta)
+                (slot / 'FINGERPRINT').write_text(hashlib.sha256(meta).hexdigest())
+            # Execute the actual per-host Python guard; Docker and SSH alone are mocked.
+            script = '''set -euo pipefail
+source scripts/lib/release-common.sh
+release_die() { echo "die: $*" >&2; exit 1; }
+release_ssh() {
+  [[ "$1" == -o ]]; shift 2
+  host="$1"; shift
+  [[ "$1" == docker && "$2" == exec && "$3" == -i && "$5" == python3 ]]
+  python3 -c 'import sys; code=sys.stdin.read().replace("/wip/slots",sys.argv[1]); sys.argv=["guard",sys.argv[2]]; exec(compile(code,"guard","exec"))' "$MOCK_SLOTS/$host" "$7"
+}
+hosts=(h0 h1 h2)
+spark_tp=3
+spark_tp_roles_required=tp3
+wip_slot=slot
+wip_spark_container=wip-test
+SPARK_EXPERT_DOCKER_INFERENCE=unused
+''' + block + '\nprintf "advertised=%s\\n" "$spark_advertised_roles"\n'
+            return subprocess.run(['bash', '-c', script], cwd=ROOT, text=True,
+                                  capture_output=True, timeout=20,
+                                  env={**os.environ, 'MOCK_SLOTS': str(root)})
+
+    def test_wip_accepts_verified_tp3_slot(self) -> None:
+        result = self.wip_gate(roles=['tp3', 'tp6'])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('advertised=tp3;tp6', result.stdout)
+
+    def test_wip_rejects_missing_role_or_unverified_symbols(self) -> None:
+        for roles, verified in ((['tp6'], True), (['tp3'], False)):
+            with self.subTest(roles=roles, verified=verified):
+                result = self.wip_gate(roles=roles, verified=verified)
+                self.assertNotEqual(result.returncode, 0)
+
+    def test_wip_rejects_bad_manifest_hash_on_each_host(self) -> None:
+        result = self.wip_gate(roles=['tp3'], corrupt_hash=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('TP manifest hash mismatch', result.stderr)
+        result = self.wip_gate(roles=['tp3'], corrupt_host=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('h2 cannot verify', result.stderr)
+
     def test_universal_label_satisfies_every_required_role(self) -> None:
         for required in ("tp2", "tp3", "tp6"):
             with self.subTest(required=required):

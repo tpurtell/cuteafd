@@ -355,7 +355,7 @@ impl<'a> Engine<'a> {
         let exchange = PeerExchange::new(self.library, [RankDevice { device: self.device, stream: self.stream },
             RankDevice { device, stream }], 4 * PREFILL_LANES, rows * self.cfg.dim * 2)?;
         let peer = exchange.on(1, || -> Result<V4Peer<'a>> {
-            self.programs.load_all()?;
+            self.programs.load_matching(|name| self.selected_programs().contains(name))?;
             let table = |compressed: bool| -> Result<Dev<'a>> {
                 let values = metadata::rope_table(&self.cfg, compressed, self.max_context.max(metadata::WINDOW));
                 let allocation = DeviceAllocation::new(self.library, values.len() * 4)?;
@@ -373,19 +373,19 @@ impl<'a> Engine<'a> {
         Ok(())
     }
 
-    /// Largest scratch of every program in the table (one shared region;
-    /// launches are ordered on one stream).
+    fn selected_programs(&self) -> cuteafd_core::coordinator_programs::CoordinatorPrograms<'_> {
+        cuteafd_core::coordinator_programs::CoordinatorPrograms { family: self.family, split_family: self.split_family }
+    }
+
+    /// One shared region for this server's programs; launches are stream ordered.
     fn scratch_bytes(&self) -> Result<usize> {
-        let mut bytes = 0usize;
-        for name in self.programs.names() {
-            if name.contains("index_topk") {
-                continue;
-            }
+        let mut sizes = Vec::new();
+        for name in self.programs.names().filter(|name| self.selected_programs().contains(name)) {
             for value in self.programs.spec(name)?.scratch.values() {
-                bytes = bytes.max(*value as usize);
+                sizes.push((name, *value));
             }
         }
-        Ok(bytes)
+        Ok(usize::try_from(self.selected_programs().shared_scratch(sizes))?)
     }
 
     fn pool_layer(parts: &EngineParts<'a>, layer: usize) -> Result<LayerCache<'a>> {

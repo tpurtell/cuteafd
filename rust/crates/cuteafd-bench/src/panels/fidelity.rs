@@ -34,6 +34,7 @@ pub fn score(client: &Client, info: &ServerInfo, tier: &str, path: &str, progres
     let mut model_record = client.model_record()?;
     model_record["max_context"] = json!(max_context);
     model_record["full_prefill_logits"] = json!(prefill_unavailable(info).is_none());
+    model_record["snapshot"] = json!(info.configuration.snapshot);
     let checkpoint = info.checkpoint();
     // The checkpoint, not an aliased served name, binds the reference and history.
     run_with(&args, &checkpoint, &model_record, |request| {
@@ -76,6 +77,11 @@ pub fn record(run: &Run, previous: Option<&Run>) -> Value {
         ("prefill", "prefill_verdict", "prefill_per_window")
     } else { ("decode", "verdict", "per_window") };
     let mut value = json!({"tier": run.tier, "dataset": run.dataset, "paired": paired});
+    if let Some(selection) = &run.reference_selection {
+        for (key, field) in serde_json::to_value(selection).unwrap().as_object().unwrap() {
+            value[key] = field.clone();
+        }
+    }
     if run.tier == crate::fidelity_dataset::STANDARD_TIER {
         value["mode"] = run.dataset.as_ref().map(|d| d["standard_subset"]["mode"].clone()).unwrap_or(Value::Null);
     }
@@ -111,7 +117,8 @@ impl Panel for FidelityPanel {
         if info.checkpoint().is_empty() {
             return Some("Discovering server configuration; run the basic card first".into());
         }
-        crate::fidelity_dataset::unavailable(&info.checkpoint())
+        crate::fidelity_match::resolve(&info.checkpoint(), info.configuration.snapshot.as_deref().map(std::path::Path::new))
+            .err().map(|e| e.to_string())
             .or_else(|| if self.full { prefill_unavailable(info) } else { None })
     }
     fn run(&self, ctx: &Ctx<'_>) -> Result<Value> {

@@ -541,6 +541,17 @@ fn placement(name: &str) -> V41TensorPlacement {
 
 /// Header-only inspection: never reads or eagerly allocates checkpoint tensor payloads.
 pub fn read_official_v41_catalog(model_id: &str, snapshot: &Path) -> Result<OfficialV41Catalog> {
+    read_official_v41_catalog_filtered(model_id, snapshot, None)
+}
+
+/// Official-format worker inventory, without opening coordinator-only shards.
+pub fn read_official_v41_spark_catalog(snapshot: &Path, rank: usize, world: usize) -> Result<OfficialV41Catalog> {
+    ensure!(rank < world, "Spark rank {rank} outside TP{world}");
+    read_official_v41_catalog_filtered(crate::OFFICIAL_V41_MODEL_ID, snapshot,
+        Some(format!("spark{rank} (TP{world})")))
+}
+
+fn read_official_v41_catalog_filtered(model_id: &str, snapshot: &Path, spark_role: Option<String>) -> Result<OfficialV41Catalog> {
     let raw_config: serde_json::Value = crate::families::deepseek_v41::v41_exl3::read_json(&snapshot.join("config.json"), 1024 * 1024)?;
     let exl3 = if raw_config["quantization_config"]["quant_method"] == "exl3" {
         Some(crate::read_v41_exl3_manifest(snapshot)?)
@@ -632,10 +643,13 @@ pub fn read_official_v41_catalog(model_id: &str, snapshot: &Path) -> Result<Offi
         "checkpoint requires all {shard_count} shards"
     );
     let mut tensors = Vec::with_capacity(expected.len());
+    let needed = |name: &str| spark_role.is_none() || name.starts_with("layers.") && name.contains(".ffn.experts.");
     for (shard, names) in shards {
+        let Some(first_needed) = names.iter().find(|name| needed(name)) else { continue };
         let path = snapshot.join(&shard);
-        let metadata =
-            read_safetensors_metadata(&path).with_context(|| format!("reading {shard}"))?;
+        let metadata = read_safetensors_metadata(&path).with_context(|| format!(
+            "role {} needs tensor {first_needed} in shard {shard} at snapshot {}",
+            spark_role.as_deref().unwrap_or("full catalog"), snapshot.display()))?;
         ensure!(
             metadata.len() == names.len(),
             "index/header tensor count mismatch in {shard}"
@@ -799,6 +813,24 @@ fn read_glm_dsa_expert_catalog(snapshot: &Path, config: &serde_json::Value) -> R
 /// MTP experts under `mtp.layers.0`. The BF16 release fuses each layer's
 /// experts into `[512, ...]` tensors and NVIDIA's release is NVFP4: neither
 /// has an expert package.
+/// Official-format coordinator-local Qwen MTP experts. EXL3 remains on the
+/// complete catalog path until its per-projection metadata is role-filtered.
+pub fn read_qwen4_mtp_expert_catalog(snapshot: &Path, stages: usize) -> Result<OfficialV41Catalog> {
+    let config = crate::plan::checkpoint::read_json(&snapshot.join("config.json"))?;
+    if config["quantization_config"]["quant_method"] == "exl3" {
+        return read_qwen4_expert_catalog(snapshot, &config);
+    }
+    let cfg = crate::families::qwen4::Qwen4Config::from_hf(&config)?;
+    ensure!(stages > 0 && stages <= cfg.mtp_layers, "Qwen MTP role requests {stages} stages, config provides {}", cfg.mtp_layers);
+    let shape = RoutedExpertShape { layers: cfg.layers, first_layer: 0, experts: cfg.experts,
+        topk: cfg.topk, hidden: cfg.hidden, intermediate: cfg.moe_intermediate, draft_stages: 0, draft_experts: 0 };
+    let layers = (cfg.layers..cfg.layers + stages).collect();
+    let fp8 = crate::formats::fp8_experts::Fp8ExpertTensors::read_layers(snapshot, shape, &layers)?;
+    for layer in layers { fp8.for_layer(layer)?; }
+    Ok(OfficialV41Catalog { config: None, experts: shape, snapshot: snapshot.to_path_buf(), tensors: Vec::new(),
+        exl3: None, nvfp4: None, fp8: Some(fp8) })
+}
+
 fn read_qwen4_expert_catalog(snapshot: &Path, config: &serde_json::Value) -> Result<OfficialV41Catalog> {
     let cfg = crate::families::qwen4::Qwen4Config::from_hf(config)?;
     let shape = RoutedExpertShape {

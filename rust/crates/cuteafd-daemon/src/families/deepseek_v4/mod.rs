@@ -210,9 +210,6 @@ pub(crate) fn with_engine<T>(
     body: impl FnOnce(&engine::Engine<'_>, &mut [SparkLink<'_>], &tokio::runtime::Runtime) -> Result<T>,
 ) -> Result<T> {
     let programs = loaded.library.programs()?.with_manifest(&args.manifest)?;
-    let started = Instant::now();
-    programs.load_all()?;
-    tracing::info!(elapsed_ms = started.elapsed().as_millis() as u64, "DeepSeek V4 programs loaded");
     let caps = &loaded.manifest["capacities"];
     let stream = loaded.library.cuda_stream_create()?;
     // The head split's second GPU and its stream (load kernels, then the engine's).
@@ -227,13 +224,23 @@ pub(crate) fn with_engine<T>(
         None => None,
     };
     let split_device = crate::shared::peer_split::probed_device(&loaded.library, args.device, split_device)?;
+    let split_family = format!("{}2", loaded.family);
+    let selected = cuteafd_core::coordinator_programs::CoordinatorPrograms {
+        family: loaded.family, split_family: split_device.map(|_| split_family.as_str()),
+    };
+    selected.validate_v4(caps["prefill_rows"].as_u64().context("prefill_rows")?,
+        caps["decode_rows"].as_u64().context("decode_rows")?, programs.names())?;
+    let started = Instant::now();
+    let (loaded_count, skipped) = programs.load_matching(|name| selected.contains(name))?;
+    tracing::info!(loaded = loaded_count, skipped, elapsed_ms = started.elapsed().as_millis() as u64,
+        "DeepSeek V4 programs loaded");
     let peer_stream = match split_device {
         Some(device) => {
             ensure!(device != args.device, "--split-device must differ from --device");
             loaded.library.cuda_enable_peer(device)?;
             loaded.library.cuda_set_device(device)?;
             let stream = loaded.library.cuda_enable_peer(args.device)
-                .and_then(|()| programs.load_all())
+                .and_then(|()| programs.load_matching(|name| selected.contains(name)).map(|_| ()))
                 .and_then(|()| loaded.library.cuda_stream_create());
             loaded.library.cuda_set_device(args.device)?;
             Some((device, stream?))
@@ -278,7 +285,7 @@ pub(crate) fn with_engine<T>(
             cuteafd_engine::prefix::MarkArena::slots_for(args.max_sequences, p.prefix_cache_entries,
                 mark as usize, p.prefix_cache_mark_mib << 20));
         let scratch = cuteafd_loader::serving_capacity::deepseek_v4_workspace_scratch(
-            &loaded.manifest, loaded.family, prefill_rows as u64, decode_rows as u64)?;
+            &loaded.manifest, loaded.family, split_device.is_some(), prefill_rows as u64, decode_rows as u64)?;
         let workspace = cuteafd_loader::serving_capacity::deepseek_v4_workspace_geometry(
             &cache_cfg, prefill_rows as u64, decode_rows as u64,
             cuteafd_loader::serving_capacity::compiled_c128_width(&loaded.manifest, loaded.family)? * 128,
@@ -303,8 +310,21 @@ pub(crate) fn with_engine<T>(
         let legacy_state = rank.fixed_state_bytes + rank.active_state_per_sequence_bytes * args.max_sequences as u64
             + rank.context_table_bytes_per_token * max_context as u64;
         let legacy_pool = rank.persistent_unit_bytes * 262_144u64.div_ceil(geometry.logical_unit_rows);
-        let expert_budget = usize::try_from(memory[0].baseline_free_bytes.saturating_sub(
-            legacy_state + legacy_pool + peer + shape.prefix_bytes.iter().sum::<u64>() + shape.reserve_bytes))?;
+        let expert_reserve = if cuteafd_core::serving_capacity::small_card_headroom_bytes(memory[0].total_bytes) > 0 {
+            // Use final admission's exact reservations before selecting experts;
+            // the legacy 10 GiB envelope would discard the small-card savings.
+            let profile = admission::profile(&geometry, &memory, &shape, 0)?;
+            let costs = &profile.devices[0];
+            let fixed = costs.reservations.iter().try_fold(0u64, |sum, r|
+                sum.checked_add(r.bytes).context("V4 expert fixed reserve overflow"))?;
+            fixed.checked_add(costs.pool_unit_bytes.checked_mul(
+                (if args.pool_tokens > 0 { args.pool_tokens as u64 } else { 262_144 })
+                    .div_ceil(geometry.logical_unit_rows)).context("V4 expert pool reserve overflow")?)
+                .context("V4 expert reserve overflow")?
+        } else {
+            legacy_state + legacy_pool + peer + shape.prefix_bytes.iter().sum::<u64>() + shape.reserve_bytes
+        };
+        let expert_budget = usize::try_from(memory[0].baseline_free_bytes.saturating_sub(expert_reserve))?;
         let stages = if args.dspark { cache_stages } else { 0 };
         let local = if args.skip_routed_experts { local::LocalPlan { layers: 0, peak_bytes: 0 } }
             else { local::plan(&loaded.library, &args.native_lib, &loaded.catalog, stages,
@@ -656,4 +676,76 @@ fn token_check(args: &GoldenArgs, loaded: &Loaded, engine: &engine::Engine<'_>, 
     });
     allocator.release(placement);
     result
+}
+
+#[cfg(test)]
+mod program_selection_tests {
+    use cuteafd_core::coordinator_programs::CoordinatorPrograms;
+
+    #[test]
+    fn every_v4_dispatch_template_is_selected_and_required_at_startup() {
+        let sources = [include_str!("engine.rs"), include_str!("engine/dspark.rs"), include_str!("weights.rs")];
+        for family in ["dsv4f", "dsv4p"] {
+            let split_family = format!("{family}2");
+            for split in [false, true] {
+                let selected = CoordinatorPrograms { family, split_family: split.then_some(split_family.as_str()) };
+                let required = selected.v4_required(4096, 64);
+                let mut checked = 0;
+                for source in sources {
+                    for line in source.lines().filter(|line| line.contains("self.run")) {
+                        // The only nonliteral route is run -> run_on forwarding `name`.
+                        let args = line.split("self.run").nth(1).unwrap();
+                        let Some(start) = args.find('"') else {
+                            assert!(args.trim() == "_on(0, false, name, pointers, scalars)",
+                                "unrecognized nonliteral dispatch: {line}");
+                            continue;
+                        };
+                        let template = args[start + 1..].split('"').next().unwrap();
+                        for (mode, cap) in [("decode", "64"), ("prefill", "4096")] {
+                            if template.contains("_decode_") && mode != "decode" { continue; }
+                            for attention in ["win", "c4", "c128"] {
+                                for ratio in ["4", "128"] {
+                                    for program in ["prefill", "continuation"] {
+                                        let suffix = template.replace("{cap}", cap).replace("{mode}", mode)
+                                            .replace("{attention}", attention).replace("{ratio}", ratio)
+                                            .replace("{program}", program);
+                                        let name = format!("{family}_{suffix}");
+                                        assert!(selected.contains(&name), "unselected dispatch {name}");
+                                        assert!(required.contains(&name), "startup misses dispatch {name}");
+                                        if split && (args.starts_with("_on(1, true,") || args.starts_with("_on(rank, split,")
+                                            || args.starts_with("_on(0, weights.split,")) {
+                                            let name = format!("{split_family}_{suffix}");
+                                            assert!(selected.contains(&name) && required.contains(&name),
+                                                "startup misses split dispatch {name}");
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        checked += 1;
+                    }
+                }
+                assert!(checked >= 20, "dispatch parser must cover engine and drafter calls");
+                for source in sources {
+                    for call in source.split("self.programs.program(").skip(1) {
+                        let template = call.split('"').nth(1).unwrap();
+                        if template.contains("block_fp8_scale_prep") {
+                            let name = format!("{family}_block_fp8_scale_prep");
+                            assert!(selected.contains(&name) && required.contains(&name));
+                        } else {
+                            assert!(["{}_{name}", "{family}_{name}"].contains(&template),
+                                "unrecognized direct program dispatch {template}");
+                        }
+                    }
+                }
+                selected.validate_v4(4096, 64, &required).unwrap();
+                for missing in &required {
+                    let incomplete = required.iter().filter(|name| *name != missing);
+                    let error = selected.validate_v4(4096, 64, incomplete).unwrap_err();
+                    assert_eq!(&error.0, missing);
+                    assert!(error.to_string().contains(missing));
+                }
+            }
+        }
+    }
 }

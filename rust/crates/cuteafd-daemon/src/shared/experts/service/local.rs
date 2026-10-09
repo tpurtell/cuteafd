@@ -30,8 +30,15 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
     );
     // The checkpoint fixes the process expert geometry before the native
     // library loads, so its helpers and every wire size agree with it.
-    let catalog = cuteafd_loader::read_expert_catalog(&config.snapshot)?;
+    let inventory = cuteafd_loader::plan::Checkpoint::inventory(&config.snapshot)?;
+    let v41 = cuteafd_loader::plan::family::detect(&inventory).is_some_and(|family| family.id() == "deepseek_v41");
+    let catalog = if v41 && inventory.quantization().is_none_or(|quant| quant["quant_method"] != "exl3") {
+        cuteafd_loader::read_official_v41_spark_catalog(&config.snapshot, config.rank, config.world)?
+    } else {
+        cuteafd_loader::read_expert_catalog(&config.snapshot)?
+    };
     let geometry = catalog.routed_experts().geometry()?;
+    config.bf16_ingress = geometry.family() == Some("v41") && catalog.nvfp4().is_some();
     config.native_spark_tp2 = config.world == 2 && geometry.family() == Some("dsv4f")
         && catalog.exl3().is_none() && catalog.nvfp4().is_none() && catalog.fp8().is_none();
     cuteafd_core::set_expert_geometry(geometry).map_err(|fixed| {
@@ -42,6 +49,14 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
         (minimum_frame..=64 * 1024 * 1024).contains(&config.max_frame_bytes),
         "invalid native frame budget"
     );
+    // The mapped rings each accepted endpoint pins are bounded by the
+    // capacity-sized two-endpoint allowance that admission already reserved and
+    // proved against the device budget and actual free memory. A stale or larger
+    // peer advertisement is rejected at accept instead of overcommitting.
+    let enforced_ring_budget = geometry.family() == Some("v41");
+    let ring_budget = Some(worker_ring_budget(&config, geometry)?);
+    tracing::info!(enforced_ring_budget, bf16_ingress = config.bf16_ingress,
+        ring_budget_bytes = ring_budget.as_ref().unwrap().limit(), "Spark ring admission policy");
     // The vision owner loads in this process/device's primary CUDA context,
     // never beside expertd in a second process. Charge it before expert admission.
     let (_encoder, _audio_encoder, reserved) = crate::shared::vision::worker::start_encoders(
@@ -77,14 +92,6 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
     if skip_compute {
         tracing::warn!("CUTEAFD_EXPERTD_SKIP_COMPUTE=1: answering without running the experts");
     }
-    // The mapped rings each accepted endpoint pins are bounded by the
-    // capacity-sized two-endpoint allowance that admission already reserved and
-    // proved against the device budget and actual free memory. A stale or larger
-    // peer advertisement is rejected at accept instead of overcommitting.
-    let ring_budget = match config.topology {
-        Some(_) => Some(cuteafd_transport::RingBudget::new(spark_transport_bytes(&config)?)),
-        None => None,
-    };
     // Point-in-time ring counters for the main-thread memory milestones. The
     // bootstrap thread keeps its own clone; the atomic peak can be raised by a
     // concurrent admission, so these are sampled observations, not reservations.
@@ -236,6 +243,10 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
                         BackboneRequest::parse_paired(view.frame_bytes(), config.capacity)?,
                     None => BackboneRequest::parse(view.frame_bytes(), config.capacity)?,
                 };
+                if pending_steady_log {
+                    tracing::info!(rank = config.rank, ingress_dtype = ?view.header.hidden_dtype,
+                        capacity = config.capacity, "Spark endpoint ingress geometry");
+                }
                 if skip_compute {
                     if let Some(slot) = mapped.response_slot {
                         let prefix = cuteafd_transport::EXPERT_PROTOCOL_V2_RESPONSE_HEADER_LEN;

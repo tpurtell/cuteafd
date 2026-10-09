@@ -9,7 +9,7 @@ pub use families::deepseek_v41::engram_gather::{
 pub use families::deepseek_v41::engram_staging::{EngramBatchStaging, EngramGatherView};
 pub use families::deepseek_v41::v41_expert_staging::{V41ExpertSelection, V41ExpertStaging};
 pub use families::deepseek_v41::v41_catalog::{
-    read_expert_catalog, read_official_v41_catalog, OfficialV41Catalog, RoutedExpertShape,
+    read_expert_catalog, read_official_v41_catalog, read_official_v41_spark_catalog, read_qwen4_mtp_expert_catalog, OfficialV41Catalog, RoutedExpertShape,
     V41StorageBudget, V41Tensor, V41TensorPlacement, V41CoordinatorTensorReader,
 };
 pub use families::deepseek_v41::v41_exl3_residency::{V41Exl3Layer, V41Exl3Load, V41Exl3Residency, V41Exl3ResidentBuffer};

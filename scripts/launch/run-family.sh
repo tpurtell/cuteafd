@@ -654,11 +654,15 @@ if [[ $family == glm5_flash ]]; then
     partials) ;;
     *) echo "GLM5_FLASH_KDA_SPLIT must be auto or partials" >&2; exit 2 ;;
   esac
-  # GLM5_FLASH_INDEX_CACHE: the DSA index cache, keys (default: every token's BF16 key | gate
+  # GLM5_FLASH_INDEX_CACHE: auto selects compact on one GPU, keys on a split.
+  # keys: every token's BF16 key | gate
   # row beside its latent record, 11,804 B per token) or compact (the pooled keys plus each
   # sequence's open pool, 6,172 B per token, the same pooled keys bit for bit; one GPU only,
   # a head split keeps keys).
-  index_cache="$(get GLM5_FLASH_INDEX_CACHE keys)"
+  index_eligible=0; index_reason="head split keeps token keys"
+  [[ $head_split != 0 ]] || { index_eligible=1; index_reason="one GPU; bit-identical pooled keys"; }
+  index_cache="$(release_glmf_auto GLM5_FLASH_INDEX_CACHE "$(get GLM5_FLASH_INDEX_CACHE auto)" \
+    compact keys "$index_eligible" "$index_reason")"
   case "$index_cache" in
     ""|keys) ;;
     compact) family_args+=(--index-cache compact) ;;
@@ -703,20 +707,24 @@ if [[ $family == glm5_flash ]]; then
     on) family_args+=(--fp8-head true) ;;
     off) family_args+=(--fp8-head false) ;;
   esac
-  # GLM5_FLASH_DRAFT_HEAD: the drafter's vocabulary head over the BF16 head, exact (default: as the
+  # GLM5_FLASH_DRAFT_HEAD: tensor by default with a drafter; exact runs as the
   # target's own head, FP32 products and sums on CUDA cores past 24 rows) or tensor (from two draft
   # blocks of 8 rows, a BF16 tensor-core GEMM with FP32 accumulation that reads the head once).
   # Drafts only: the target verifies every proposal through its own head.
-  draft_head="$(get GLM5_FLASH_DRAFT_HEAD exact)"
+  draft_head_default=exact
+  [[ ${#draft_args[@]} == 0 ]] || draft_head_default=tensor
+  draft_head="$(get GLM5_FLASH_DRAFT_HEAD "$draft_head_default")"
   case "$draft_head" in
     ""|exact) ;;
     tensor) family_args+=(--draft-head tensor) ;;
     *) echo "GLM5_FLASH_DRAFT_HEAD must be exact or tensor" >&2; exit 2 ;;
   esac
-  # GLM5_FLASH_DRAFT_LINEAR: the FP8 drafter's GEMMs, w8a16 (default: the W8A16 GEMV in passes of
+  # GLM5_FLASH_DRAFT_LINEAR: w8a8 with an FP8 drafter; w8a16 runs the W8A16 GEMV in passes of
   # 64 rows), wide (the same bits in passes of 128 rows) or w8a8 (past one draft block, E4M3
   # activations per row and 128-wide K block on FP8 tensor cores). Drafts only.
-  draft_linear="$(get GLM5_FLASH_DRAFT_LINEAR w8a16)"
+  draft_linear_default=w8a16
+  if [[ ${#draft_args[@]} != 0 && "$(key SPECULATOR_FP8 DRAFT_FP8 auto)" != off ]]; then draft_linear_default=w8a8; fi
+  draft_linear="$(get GLM5_FLASH_DRAFT_LINEAR "$draft_linear_default")"
   case "$draft_linear" in
     ""|w8a16) ;;
     wide|w8a8) family_args+=(--draft-linear "$draft_linear") ;;
@@ -804,11 +812,20 @@ if [[ $family == glm5_flash ]]; then
     *) echo "GLM5_FLASH_PREFIX_MARKS must be arena or pool" >&2; exit 2 ;;
   esac
   [[ "$prefix_marks" != pool || -n "$(get HOST_CACHE_BYTES)" ]] || family_args+=(--host-cache-bytes auto)
-  # GLM5_FLASH_REPLAY_RECORDS: where the KDA speculative replay records live, own (default: their
+  # PREFIX_CACHE_MARK_MIB: the device budget of the prefix mark arena, MiB (unset: serve-glmf's
+  # 2048), as for MiMo; the arena still holds at least two marks per sequence plus two.
+  [[ -z "$(get PREFIX_CACHE_MARK_MIB)" ]] || family_args+=(--prefix-cache-mark-mib "$(get PREFIX_CACHE_MARK_MIB)")
+  # GLM5_FLASH_REPLAY_RECORDS: auto shares when eligible; own keeps their
   # own 321 MB, 642 MB with GLM5_FLASH_DECODE_ROWS=128) or shared (the prefill lanes' scratch, which
   # no decode step reads). One GPU whose pool is sized from measured memory (an automatic pool with
   # Spark experts).
-  replay_records="$(get GLM5_FLASH_REPLAY_RECORDS own)"
+  replay_eligible=0
+  if [[ $head_split != 0 ]]; then replay_reason="head split keeps its own records"
+  elif [[ $glmf_pool != 0 ]]; then replay_reason="fixed pool keeps its own records"
+  elif [[ $ranks == 0 ]]; then replay_reason="local experts keep their own records"
+  else replay_eligible=1; replay_reason="one GPU; automatic measured pool with Spark experts"; fi
+  replay_records="$(release_glmf_auto GLM5_FLASH_REPLAY_RECORDS "$(get GLM5_FLASH_REPLAY_RECORDS auto)" \
+    shared own "$replay_eligible" "$replay_reason")"
   case "$replay_records" in
     ""|own) ;;
     shared)
@@ -819,11 +836,22 @@ if [[ $family == glm5_flash ]]; then
       family_args+=(--replay-records shared) ;;
     *) echo "GLM5_FLASH_REPLAY_RECORDS must be own or shared" >&2; exit 2 ;;
   esac
-  # GLM5_FLASH_DECODE_ROWS: the most rows of one decode or verify step, 64 (default) or 128. With
+  # GLM5_FLASH_DECODE_ROWS: auto takes 128 when the selected build and layout allow, else 64. With
   # 128 a step of more than 64 rows runs the wide _m128 programs (a build with
   # CUTEAFD_GLMF_WIDE_DECODE_ROWS=128) and a verify step schedules up to the GPU's whole sparse MLA
   # waves (127 rows on an RTX 5090); fewer rows keep the _m64 programs. One GPU only.
-  decode_rows="$(get GLM5_FLASH_DECODE_ROWS 64)"
+  decode_rows="$(get GLM5_FLASH_DECODE_ROWS auto)"
+  if [[ "$decode_rows" == auto ]]; then
+    wide_eligible=0; wide_reason="head split takes 64 rows"
+    if [[ $head_split == 0 ]]; then
+      wide_reason="missing manifest or required m128 programs in selected build"
+      if release_glmf_wide_decode_available "$root/snapshots/$revision" "$index_cache" "$kda_state" "$kda_fp8" \
+          "$coordinator_image" "${wip_mount_args[@]}"; then
+        wide_eligible=1; wide_reason="one GPU; selected build has required m128 programs"
+      fi
+    fi
+    decode_rows="$(release_glmf_auto GLM5_FLASH_DECODE_ROWS auto 128 64 "$wide_eligible" "$wide_reason")"
+  fi
   case "$decode_rows" in
     ""|64) ;;
     128)
@@ -899,8 +927,26 @@ if { [[ ( "$family" == mimo_v2 || "$family" == qwen4 || "$family" == glm5_flash 
       plan_draft_args+=(--mimo-prefix-draft --context-tokens "$(get MAX_CONTEXT_TOKENS 131072)")
     fi
   fi
+  # GLM 5.3 Flash: the counts serve-glmf allocates for the keys a launch sets (unset keys keep
+  # the planner's defaults, which are serving's). Its recurrent state holds max(--slots, which
+  # is 8, --max-sequences) slots, and its prefix mark arena counts min(--max-sequences,
+  # DECODE_ROWS = 64) lanes, so both go to the plan as such beside the sequences.
+  if [[ "$family" == glm5_flash ]]; then
+    glmf_sequences="$(get CONCURRENCY)"
+    if [[ -n "$glmf_sequences" ]]; then
+      [[ "$glmf_sequences" =~ ^[1-9][0-9]*$ ]] || { echo "CONCURRENCY must be a positive sequence count" >&2; exit 2; }
+      plan_draft_args+=(--concurrency "$glmf_sequences" --state-slots "$((glmf_sequences > 8 ? glmf_sequences : 8))"
+        --mark-lanes "$((glmf_sequences < 64 ? glmf_sequences : 64))")
+    fi
+    [[ -z "$(get PREFIX_CACHE_ENTRIES)" ]] || plan_draft_args+=(--prefix-cache-entries "$(get PREFIX_CACHE_ENTRIES)")
+    [[ -z "$(get PREFIX_CACHE_MARK_MIB)" ]] || plan_draft_args+=(--prefix-cache-mark-mib "$(get PREFIX_CACHE_MARK_MIB)")
+  fi
+  [[ "$family" != glm5_flash || "${index_cache:-keys}" != compact ]] || plan_draft_args+=(--index-cache compact)
   # GLM 5.3 Flash: the server's prefix-mark store, so the plan reserves an arena only when serve-glmf allocates one.
   [[ "$family" != glm5_flash || -z "${prefix_marks:-}" ]] || plan_draft_args+=(--prefix-marks "$prefix_marks")
+  # GLM 5.3 Flash: shared replay records (GLM5_FLASH_REPLAY_RECORDS above) live in the prefill
+  # scratch, so the plan does not charge their own copy either.
+  [[ "$family" != glm5_flash || "${replay_records:-own}" != shared ]] || plan_draft_args+=(--replay-records shared)
   # GLM 5.3 Flash plans the decode rows serving takes (GLM5_FLASH_DECODE_ROWS above): 128 rows
   # charge their wider decode workspace, selector, replay records and expert intake, as serving
   # admits them, before an encoder placement is chosen.
@@ -1169,10 +1215,12 @@ case "$ENABLE_BENCH" in
 esac
 table_env_args=()
 [[ -z "${CUTEAFD_TABLE_ACCOUNTING:-}" ]] || table_env_args+=(-e "CUTEAFD_TABLE_ACCOUNTING=$CUTEAFD_TABLE_ACCOUNTING")
+bench_nonce_env_args=()
+[[ -z "${CUTEAFD_BENCH_NONCE_SEED:-}" ]] || bench_nonce_env_args+=(-e "CUTEAFD_BENCH_NONCE_SEED=$CUTEAFD_BENCH_NONCE_SEED")
 docker run -d --name "$coordinator_name" --restart no --gpus "$gpus" --network host --ipc host \
   --security-opt "seccomp=$repo_root/docker/seccomp-code-bench.json" \
   --ulimit memlock=-1:-1 --device=/dev/infiniband -e RUST_LOG=info -e "CUTEAFD_SPARK_INTAKE=$intake" \
-  -e "CUTEAFD_CONSOLE_TEXT=$([[ $console_text == on ]] && echo true || echo false)" "${bond_args[@]}" "${table_env_args[@]}" \
+  -e "CUTEAFD_CONSOLE_TEXT=$([[ $console_text == on ]] && echo true || echo false)" "${bond_args[@]}" "${table_env_args[@]}" "${bench_nonce_env_args[@]}" \
   -e "CUTEAFD_FP8_EXPERT_PREFILL=$fp8_prefill" -e "CUTEAFD_IMAGE=$coordinator_image" "${wip_mount_args[@]}" "${device_map_args[@]}" \
   -v "$hub:/root/.cache/huggingface/hub:ro" -v "$bench_dir:/root/.cache/cuteafd/bench" \
   "${api_mount_args[@]}" "${chat_template_mounts[@]}" "${trace_args[@]}" "${probe_args[@]}" "$coordinator_image" cuteafd "${coordinator_budget_args[@]}" $serve --snapshot "$snapshot" \

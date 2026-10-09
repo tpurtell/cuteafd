@@ -461,12 +461,48 @@ done
 spark_advertised_roles=""
 if [[ -n "$spark_tp_roles_required" ]]; then
   for host in "${hosts[@]}"; do
-    advertised_roles="$(
-      release_ssh -o ConnectTimeout=10 "$host" \
-        "docker image inspect -f '{{or (index .Config.Labels \"io.cuteafd.spark_tp_roles\") (index .Config.Labels \"io.cuteafd.v41.spark_tp_roles\")}}' '$SPARK_EXPERT_DOCKER_INFERENCE'"
-    )" || release_die "$host cannot report the role label of $SPARK_EXPERT_DOCKER_INFERENCE; is the Spark image present on that host?"
-    [[ ";$advertised_roles;" == *";$spark_tp_roles_required;"* ]] ||
+    if [[ -n "${wip_slot:-}" ]]; then
+      # Slots overlay a toolchain image: its label cannot describe their exports.
+      advertised_roles="$(release_ssh -o ConnectTimeout=10 "$host" \
+        docker exec -i "$wip_spark_container" python3 - "$wip_slot" <<'PY'
+import hashlib
+import json
+import pathlib
+import sys
+
+slot = sys.argv[1]
+root = pathlib.Path('/wip/slots') / slot / 'spark-expert'
+try:
+    meta_bytes = (root / 'META.json').read_bytes()
+    assert hashlib.sha256(meta_bytes).hexdigest() == (root / 'FINGERPRINT').read_text().strip(), 'metadata fingerprint mismatch'
+    meta = json.loads(meta_bytes)
+    assert meta.get('schema') == 1 and meta.get('slot') == slot and meta.get('role') == 'spark-expert', 'wrong slot identity'
+    artifacts = root / 'workspace/.cuteafd-wip'
+    manifest_bytes = (artifacts / 'V41_EXPERT_TP_AOT.json').read_bytes()
+    assert hashlib.sha256(manifest_bytes).hexdigest() == meta.get('v41_expert_tp_manifest_sha256'), 'TP manifest hash mismatch'
+    manifest = json.loads(manifest_bytes)
+    roles = manifest.get('spark_tp_roles')
+    assert manifest.get('schema') == 1 and isinstance(roles, list) and all(role in ('tp2', 'tp3', 'tp6') for role in roles), 'invalid TP roles'
+    assert roles == meta.get('spark_tp_roles'), 'slot and artifact roles differ'
+    assert manifest.get('symbols_verified') is True, 'TP symbols are not verified'
+    assert hashlib.sha256((artifacts / 'libcuteafd_native.so').read_bytes()).hexdigest() == manifest.get('native_library_sha256'), 'native library hash mismatch'
+    print(';'.join(roles))
+except (OSError, ValueError, AssertionError) as error:
+    sys.exit(f'WIP slot {slot}: {error}')
+PY
+      )" || release_die "$host cannot verify the expert roles of WIP slot $wip_slot; rebuild the slot with ./wip.sh"
+    else
+      advertised_roles="$(
+        release_ssh -o ConnectTimeout=10 "$host" \
+          "docker image inspect -f '{{or (index .Config.Labels \"io.cuteafd.spark_tp_roles\") (index .Config.Labels \"io.cuteafd.v41.spark_tp_roles\")}}' '$SPARK_EXPERT_DOCKER_INFERENCE'"
+      )" || release_die "$host cannot report the role label of $SPARK_EXPERT_DOCKER_INFERENCE; is the Spark image present on that host?"
+    fi
+    if [[ ";$advertised_roles;" != *";$spark_tp_roles_required;"* ]]; then
+      if [[ -n "${wip_slot:-}" ]]; then
+        release_die "$host WIP slot $wip_slot does not advertise required expert role $spark_tp_roles_required (advertised: ${advertised_roles:-<none>}); rebuild with CUTEAFD_WIP_SPARK_TP_ROLES=$spark_tp_roles_required"
+      fi
       release_die "$host Spark image does not advertise required expert role $spark_tp_roles_required (advertised: ${advertised_roles:-<none>}); refusing an unbuilt TP$spark_tp topology: use the published universal release pair, or rebuild with CUTEAFD_RELEASE_SPARK_TP_ROLES=$spark_tp_roles_required"
+    fi
     [[ -n "$spark_advertised_roles" ]] || spark_advertised_roles="$advertised_roles"
   done
 fi
@@ -567,6 +603,8 @@ done
 
 table_env_args=()
 [[ -z "${CUTEAFD_TABLE_ACCOUNTING:-}" ]] || table_env_args+=(-e "CUTEAFD_TABLE_ACCOUNTING=$CUTEAFD_TABLE_ACCOUNTING")
+bench_nonce_env_args=()
+[[ -z "${CUTEAFD_BENCH_NONCE_SEED:-}" ]] || bench_nonce_env_args+=(-e "CUTEAFD_BENCH_NONCE_SEED=$CUTEAFD_BENCH_NONCE_SEED")
 
 wip_mount_args=()
 if [[ -n "$wip_layout" ]]; then
@@ -663,7 +701,7 @@ docker run -d --name "$coordinator" --restart no --gpus "$gpu_request" --network
   -e "CUTEAFD_RELEASE_CONFIG_SHA256=$fingerprint" -e "RUST_LOG=${RUST_LOG:-info}" \
   -e "CUTEAFD_COPY_DRAFTS=$([[ ${V41_COPY_DRAFTS:-off} == on ]] && printf 1 || printf 0)" \
   -e "CUTEAFD_V41_IMAGE_ADMISSIONS=${CUTEAFD_V41_IMAGE_ADMISSIONS:-2}" \
-  "${rdma_env_args[@]}" "${table_env_args[@]}" \
+  "${rdma_env_args[@]}" "${table_env_args[@]}" "${bench_nonce_env_args[@]}" \
   "${wip_mount_args[@]}" \
   "${api_mount_args[@]}" -e "CUTEAFD_IMAGE=$COORDINATOR_DOCKER_INFERENCE" -v "$bench_dir:/root/.cache/cuteafd/bench" \
   -v "$(readlink -f "$hf_home/hub"):/root/.cache/huggingface/hub:ro" "$COORDINATOR_DOCKER_INFERENCE" cuteafd "${args[@]}" >/dev/null

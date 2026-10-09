@@ -48,6 +48,21 @@ class NativeReleaseLauncherTest(unittest.TestCase):
                     expected = ['-e', f'CUTEAFD_TABLE_ACCOUNTING={value}'] if value else ['']
                     self.assertEqual(result.stdout.splitlines(), expected)
 
+    def test_matched_nonce_is_opt_in_and_default_argv_is_identical(self) -> None:
+        for launcher in ['run.sh', 'scripts/launch/run-family.sh']:
+            source = (ROOT / launcher).read_text()
+            block = 'bench_nonce_env_args=()\n' + source.split('bench_nonce_env_args=()\n', 1)[1].split('\n', 1)[0]
+            self.assertIn('"${bench_nonce_env_args[@]}"', source)
+            for seed in [None, '', 'pair-123']:
+                environment = dict(os.environ)
+                environment.pop('CUTEAFD_BENCH_NONCE_SEED', None)
+                if seed is not None:
+                    environment['CUTEAFD_BENCH_NONCE_SEED'] = seed
+                result = subprocess.run(['bash', '-c', block + '\nprintf "%s\\0" before "${bench_nonce_env_args[@]}" after'], env=environment, capture_output=True)
+                self.assertEqual(result.returncode, 0)
+                expected = b'before\0after\0' if not seed else b'before\0-e\0CUTEAFD_BENCH_NONCE_SEED=pair-123\0after\0'
+                self.assertEqual(result.stdout, expected)
+
     def test_embedding_placement_registered_and_gpu_default(self) -> None:
         result = subprocess.run(['bash', '-c',
             'source scripts/lib/release-common.sh; release_known_key EMBEDDING; '

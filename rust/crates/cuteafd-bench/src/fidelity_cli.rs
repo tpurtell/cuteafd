@@ -94,13 +94,17 @@ pub struct RunArgs {
     pub api_key: Option<String>,
 }
 
+#[cfg(test)]
 fn dataset_source<'a>(args: &'a RunArgs, model: &str) -> Result<Option<(&'a str, &'a str, &'a str)>> {
+    dataset_source_with(args, crate::fidelity_dataset::default_publication(model))
+}
+
+fn dataset_source_with<'a>(args: &'a RunArgs, publication: Option<(&'a str, &'a str)>) -> Result<Option<(&'a str, &'a str, &'a str)>> {
     let default_full = args.reference.is_none() && args.rows.is_none();
     let repo = args.dataset.as_deref().or(default_full.then_some(crate::fidelity_dataset::REPOSITORY));
     ensure!(args.dataset_revision.is_none() || repo.is_some(),
         "--dataset-revision needs --dataset or the dataset default");
     let Some(repo) = repo else { return Ok(None); };
-    let publication = crate::fidelity_dataset::default_publication(model);
     let config = args.dataset_config.as_deref().or(publication.map(|p| p.1))
         .context("no published family default; use --dataset-config and --dataset-revision, or --reference")?;
     let commit = args.dataset_revision.as_deref().or_else(|| {
@@ -151,6 +155,7 @@ pub fn run(args: &RunArgs) -> Result<Vec<Run>> {
     let model = status["checkpoint"].as_str().unwrap_or(served);
     let mut model_record = models["data"][0].clone();
     model_record["full_prefill_logits"] = status["full_prefill_logits"].clone();
+    model_record["snapshot"] = status["snapshot"].clone();
     let mut runs = vec![run_with(args, model, &model_record, |body| {
         request(&agent, &format!("{base}/v1/bench/probe"), &args.api_key, &body)
     }, |_, _, _| {})?];
@@ -183,7 +188,14 @@ pub fn run_with(args: &RunArgs, model: &str, model_record: &Value,
     ensure!(matches!(args.tier.as_str(), "quick" | "standard" | "full"), "unknown tier");
     ensure!(args.tier != "quick" || args.score_path == "decode", "Quick must be decode-shaped");
     let agent = ureq::AgentBuilder::new().timeout_read(Duration::from_secs(120)).build();
-    let (reference, digest, mut dataset_identity) = if let Some((repo, commit, config)) = dataset_source(args, model)? {
+    let explicit = args.dataset_config.is_some() || args.dataset_revision.is_some() || args.reference.is_some();
+    let snapshot = model_record["snapshot"].as_str().map(std::path::Path::new);
+    let resolved = crate::fidelity_match::resolve(model, snapshot);
+    // Explicit dataset choices override automatic ancestry, including a rejected card.
+    let mut selection = if explicit { resolved.ok() } else { Some(resolved?) };
+    let publication = selection.as_ref().map(|s| (s.revision.as_str(), s.config.as_str()))
+        .or_else(|| explicit.then(|| crate::fidelity_dataset::default_publication(model)).flatten());
+    let (reference, digest, mut dataset_identity) = if let Some((repo, commit, config)) = dataset_source_with(args, publication)? {
         crate::fidelity_dataset::ensure_valid_publication(repo, commit, config)?;
         let cache = args.dataset_cache.clone().unwrap_or_else(|| PathBuf::from(
             std::env::var_os("HOME").unwrap_or_default()).join(".cache/cuteafd/fidelity"));
@@ -195,7 +207,22 @@ pub fn run_with(args: &RunArgs, model: &str, model_record: &Value,
     } else {
         bail!("no reference source; use a published dataset or --reference");
     };
-    validate_served_reference(&reference, model, dataset_identity.is_some())?;
+    let ancestry_match = selection.as_ref().is_some_and(|s|
+        dataset_identity.as_ref().is_some_and(|d| d["repository"] == crate::fidelity_dataset::REPOSITORY
+            && d["config"] == s.config && d["revision"] == s.revision));
+    if !ancestry_match { validate_served_reference(&reference, model, dataset_identity.is_some())?; }
+    if explicit {
+        let root = dataset_identity.as_ref().filter(|d| d["repository"] == crate::fidelity_dataset::REPOSITORY)
+            .and_then(|d| crate::fidelity_match::PUBLICATIONS.iter()
+            .find(|p| d["config"] == p.config && d["revision"] == p.revision))
+            .map(|p| p.root).unwrap_or(&reference.checkpoint).to_owned();
+        selection = Some(crate::fidelity_match::Resolution { reference_match: "explicit".into(),
+            reference_root: root, text_checkpoint: Some(reference.checkpoint.clone()),
+            resolved_chain: selection.map(|s| s.resolved_chain).unwrap_or_default(),
+            revision: dataset_identity.as_ref().and_then(|d| d["revision"].as_str()).unwrap_or("").into(),
+            config: dataset_identity.as_ref().and_then(|d| d["config"].as_str()).unwrap_or("").into() });
+    }
+    if let Some(selection) = &mut selection { selection.text_checkpoint = Some(reference.checkpoint.clone()); }
     let standard = args.tier == "standard";
     let admitted = model_record["full_prefill_logits"] == true;
     let windows = if standard {
@@ -248,7 +275,7 @@ pub fn run_with(args: &RunArgs, model: &str, model_record: &Value,
             reference_sha256: digest.clone(), tier: if standard { crate::fidelity_dataset::STANDARD_TIER.into() } else { args.tier.clone() }, path_shape: shape,
             kl_kind: if dataset_identity.is_some() { "qualified-top1024-plus-tail" }
                 else if rows.is_some() { "full-vocabulary" } else { "top32-plus-tail" }.into(),
-            dataset: dataset_identity.clone(), standard_balance: standard_balance.clone(), verify_rows: args.verify_rows, engine, settings,
+            dataset: dataset_identity.clone(), reference_selection: selection.clone(), standard_balance: standard_balance.clone(), verify_rows: args.verify_rows, engine, settings,
             seconds: started.elapsed().as_secs_f64(), score, floor_top1: reference.expect.top1_min,
             floor_kl: reference.expect.kl_max, tripwire_expect: reference.expect.tripwires.clone() }
     };
@@ -375,6 +402,21 @@ mod tests {
     }
 
     #[test]
+    fn explicit_dataset_overrides_rejected_ancestry_but_defaults_fail_before_network() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("README.md"), "---\nbase_model: [broken\n---\n").unwrap();
+        std::fs::write(temp.path().join("config.json"), "{}").unwrap();
+        let model_record = json!({"snapshot":temp.path()});
+        let args = parse(&[]);
+        let error = run_with(&args, "test/quant", &model_record, |_| panic!("unexpected probe"), |_, _, _| {}).unwrap_err();
+        assert!(error.to_string().contains("malformed model-card YAML"));
+        let args = parse(&["--dataset-config", "explicit", "--dataset-revision", "not-immutable"]);
+        let error = run_with(&args, "test/quant", &model_record, |_| panic!("unexpected probe"), |_, _, _| {}).unwrap_err();
+        assert!(error.to_string().contains("immutable lowercase 40-hex"), "{error}");
+        assert_eq!(dataset_source_with(&args, None).unwrap().unwrap().2, "explicit");
+    }
+
+    #[test]
     fn dump_parent_is_created_without_creating_or_replacing_window_leaves() {
         let temp = tempfile::tempdir().unwrap();
         let dump = temp.path().join("new/arm/dump");
@@ -417,7 +459,7 @@ mod tests {
         let mut run = Run { schema: "cuteafd.fidelity.run/2".into(), arm: "test".into(),
             checkpoint: "test".into(), set_sha256: "set".into(), reference_sha256: "ref".into(),
             tier: "quick".into(), path_shape: "decode-shaped".into(), kl_kind: "top32-plus-tail".into(),
-            verify_rows: None, dataset: None, standard_balance: None, engine: "test".into(), settings: json!({}), seconds: 0.0,
+            verify_rows: None, dataset: None, reference_selection: None, standard_balance: None, engine: "test".into(), settings: json!({}), seconds: 0.0,
             score, floor_top1: 0.9, floor_kl: 0.06, tripwire_expect: None };
         assert!(run_pass(&run));
         run.score.missing = 1; assert!(!run_pass(&run));

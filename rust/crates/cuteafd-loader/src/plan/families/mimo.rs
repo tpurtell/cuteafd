@@ -55,16 +55,15 @@ pub fn spec_from(cfg: &MimoV2Config, checkpoint: &Checkpoint) -> ModelSpec {
         })
         .collect();
     let mtp = checkpoint
-        .tensors
-        .iter()
-        .filter_map(|t| indexed(&t.meta.name, "model.mtp.layers.").map(|(i, _)| i))
+        .tensor_names()
+        .filter_map(|name| indexed(name, "model.mtp.layers.").map(|(i, _)| i))
         .max()
         .map_or(0, |max| max + 1);
     let mut notes = vec![format!(
         "rotary {} of {} dims (theta full {}, SWA {}), attention value scale {}, sinks full {} / SWA {}",
         cfg.rope_dim, cfg.head_dim, cfg.full_rope_theta, cfg.swa_rope_theta, cfg.v_scale, cfg.full_sinks, cfg.swa_sinks
     )];
-    if checkpoint.tensors.iter().any(|t| t.meta.name.ends_with("self_attn.qkv_proj.weight")) {
+    if checkpoint.tensor_names().any(|name| name.ends_with("self_attn.qkv_proj.weight")) {
         let tp = checkpoint_tp(&checkpoint.snapshot).map_or("?".to_string(), |tp| tp.to_string());
         notes.push(format!("fused qkv_proj stored TP{tp}-interleaved ([q|k|v] per row shard, own 128x128 grid per \
             shard); the engine de-interleaves it (FusedQkvLayout)"));
@@ -138,8 +137,12 @@ impl Family for MiMo {
         });
         let checkpoint_tp = checkpoint_tp(&checkpoint.snapshot).map_err(|e| format!("{e:#}"));
         let vision = vision_geometry(&checkpoint.config, cfg.hidden);
-        let audio = crate::media::audio_tower::AudioTowerPlan::from_snapshot(&checkpoint.snapshot,
-            crate::media::audio_tower::AudioStorage::Fp32).map_err(|e| e.to_string());
+        let audio = if checkpoint.tensors.is_empty() {
+            Err("audio headers have not been read for this role".into())
+        } else {
+            crate::media::audio_tower::AudioTowerPlan::from_snapshot(&checkpoint.snapshot,
+                crate::media::audio_tower::AudioStorage::Fp32).map_err(|e| e.to_string())
+        };
         Ok(Box::new(MimoModel { cfg, spec, programs, checkpoint_tp, vision, audio }))
     }
 
