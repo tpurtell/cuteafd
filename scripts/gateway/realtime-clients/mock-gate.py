@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """README: local-only mock gate and sanitized real-client handshake captures.
 
-Use the openai-python runner's scratch venv (openai==3.26.1, websockets==17.2).
+Use the scratch venv (openai==3.26.1, websockets==16.1.1,
+openai-agents[voice]==0.23.1, pipecat-ai[openai]==1.12.0).
 CUTEAFD_RT_NODE_ROOT="$SCRATCH/node" "$SCRATCH/venv/bin/python" mock-gate.py
 --capture-dir "$HOME/.cache/cuteafd/builds/api-gateway/rtclients/captures"
-Runs Python GA+beta, Node GA, and Agents JS against loopback only. Generates an
+Runs Python GA+beta, Node WS/native, Agents JS/Python and Pipecat on loopback.
+Use --clients NAME... / --modes NAME... to select cases. Generates an
 isolated TLS CA with openssl for Node's wss-only SDK; never disables verification.
 Exercises success, explicit error, failed response, malformed event, disconnect,
 missing tool and timeout. This is a client/transport gate, not server conformance.
@@ -106,7 +108,8 @@ async def exercise(client, mode, capture_dir, context, cert):
                     assert item["call_id"] == "call_mock"
                     assert json.loads(item["output"]) == {"time": "2000-01-01T00:00:00Z"}
                     capture["tool_result_received"] = True
-                await emit("conversation.item.created", item=item, previous_item_id=None)
+                await emit("conversation.item.added" if client == "pipecat" else "conversation.item.created",
+                           item=item, previous_item_id=None)
             elif frame["type"] == "response.create":
                 if mode == "error":
                     await emit("error", error={"type": "invalid_request_error", "code": "mock_error",
@@ -114,29 +117,35 @@ async def exercise(client, mode, capture_dir, context, cert):
                     continue
                 response_id += 1
                 rid, iid = f"resp_{response_id}", f"item_{response_id}"
-                response = {"id": rid, "object": "realtime.response", "status": "in_progress", "output": []}
+                response = {"id": rid, "object": "realtime.response", "status": "in_progress", "status_details": None, "output": []}
                 await emit("response.created", response=response)
-                call = isinstance(frame.get("response", {}).get("tool_choice"), dict) and mode != "missing-tool"
+                choice = frame.get("response", {}).get("tool_choice")
+                call = (isinstance(choice, dict) or choice == "required") and mode != "missing-tool"
                 common = {"response_id": rid, "item_id": iid, "output_index": 0}
                 if call:
                     item = {"id": iid, "object": "realtime.item", "type": "function_call", "status": "in_progress",
                             "name": "get_time", "call_id": "call_mock", "arguments": ""}
                     await emit("response.output_item.added", response_id=rid, output_index=0, item=item)
+                    await emit("conversation.item.added", item=item, previous_item_id=None)
                     await emit("response.function_call_arguments.delta", **common, call_id="call_mock", delta="{}")
-                    await emit("response.function_call_arguments.done", **common, call_id="call_mock", arguments="{}")
+                    await emit("response.function_call_arguments.done", **common, call_id="call_mock", name="get_time", arguments="{}")
                     item.update(status="completed", arguments="{}")
                 else:
                     item = {"id": iid, "object": "realtime.item", "type": "message", "status": "in_progress",
                             "role": "assistant", "content": []}
                     await emit("response.output_item.added", response_id=rid, output_index=0, item=item)
+                    await emit("conversation.item.added", item=item, previous_item_id=None)
                     beta = "OpenAI-Beta" in ws.request.headers
                     prefix = "response.text" if beta else "response.output_text"
                     await emit(prefix + ".delta", **common, content_index=0, delta="Hello from the local mock.")
                     await emit(prefix + ".done", **common, content_index=0, text="Hello from the local mock.")
-                    item.update(status="completed", content=[{"type": "text", "text": "Hello from the local mock."}])
+                    item.update(status="completed", content=[{"type": "text" if beta else "output_text", "text": "Hello from the local mock."}])
                 await emit("response.output_item.done", response_id=rid, output_index=0, item=item)
+                await emit("conversation.item.done", item=item, previous_item_id=None)
                 response.update(status="failed" if mode == "failed-response" else "completed", output=[item],
-                                usage={"total_tokens": 2, "input_tokens": 1, "output_tokens": 1})
+                                usage={"total_tokens": 2, "input_tokens": 1, "output_tokens": 1,
+                                       "input_token_details": {"text_tokens": 1, "audio_tokens": 0, "cached_tokens": 0},
+                                       "output_token_details": {"text_tokens": 1, "audio_tokens": 0}})
                 await emit("response.done", response=response)
             elif frame["type"] == "input_audio_buffer.append":
                 pcm = base64.b64decode(frame["audio"], validate=True)
@@ -153,7 +162,10 @@ async def exercise(client, mode, capture_dir, context, cert):
                      subprotocols=["realtime"] if client == "openai-node-native" else None) as server:
         port = server.sockets[0].getsockname()[1]
         url = f"{'wss' if tls else 'ws'}://127.0.0.1:{port}/v1/realtime"
-        if client.startswith("openai-python"):
+        if client in ("agents-python", "pipecat"):
+            script = "pipecat-client" if client == "pipecat" else client
+            cmd = [sys.executable, str(HERE / f"{script}.py")]
+        elif client.startswith("openai-python"):
             cmd = [sys.executable, str(HERE / "openai-python.py")]
             if client.endswith("beta"):
                 cmd += ["--beta"]
@@ -192,8 +204,8 @@ async def main(a):
     directory.mkdir(parents=True, exist_ok=True)
     context, cert = certificate(directory)
     try:
-        for client in ("openai-python", "openai-python-beta", "openai-node", "openai-node-native", "agents-js"):
-            for mode in ("success", "error", "failed-response", "malformed", "disconnect", "missing-tool", "timeout"):
+        for client in a.clients:
+            for mode in a.modes:
                 await exercise(client, mode, directory, context, cert)
     finally:
         (directory / "loopback-key.pem").unlink(missing_ok=True)
@@ -203,4 +215,8 @@ async def main(a):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--capture-dir", required=True)
+    parser.add_argument("--clients", nargs="+", default=["openai-python", "openai-python-beta", "openai-node",
+                        "openai-node-native", "agents-js", "agents-python", "pipecat"])
+    parser.add_argument("--modes", nargs="+", default=["success", "error", "failed-response", "malformed",
+                        "disconnect", "missing-tool", "timeout"])
     asyncio.run(main(parser.parse_args()))
