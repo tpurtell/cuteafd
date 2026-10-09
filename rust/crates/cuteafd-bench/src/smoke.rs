@@ -354,6 +354,8 @@ pub fn run(args: SmokeArgs) -> Result<()> {
         if args.only.as_ref().is_some_and(|only| !only.contains(&entry.name)) {
             continue;
         }
+        crate::profiles::validate_selection(entry.profile.as_deref().or(matrix.profile.as_deref()).unwrap_or("smoke"))
+            .map_err(anyhow::Error::msg)?;
         entries.push(entry);
     }
     let mut state = load_state(&paths.state);
