@@ -81,9 +81,10 @@ compile a 1,048,576-token index extent; Qwen's is checkpoint-clamped to 262,144.
 pool can reduce effective context; cards report it, and values below the 262,144-token agentic
 floor are listed as findings, never hidden by enlarging pools.
 
-The v2.0.0 candidate is **rc3**: serving source `5beb668f`, release images built at `c9dcc9e2`
-(the difference is launcher, test and docs only). **rc2 (`8de2f56a`) and rc1 (`29bc9e04`) are
-superseded**; their tags, images and cards remain available as history.
+**v2.0.0** is rc3 promoted unchanged (same image digests): serving source `5beb668f`, release images
+built at `c9dcc9e2` (the difference is launcher, test and docs only). The rc3, rc2 (`8de2f56a`) and rc1
+(`29bc9e04`) tags, images and cards remain available as history. Hugh Madden's real RTX 5090 cards will
+replace the simulated-5090 cells when they arrive.
 
 ### Remaining Limits
 
@@ -170,7 +171,7 @@ Basic benchmark profile per family on its natural-minimum (1× RTX + fewest
 Sparks) and maximum (2× RTX + 4 or 6 Sparks) hardware. Other reports:
 [`benchmarks/`](benchmarks/README.md).
 
-The rc3 Release-smoke matrix covers 26 natural-minimum/maximum cells: 23 pass every check,
+The v2.0.0 (rc3) Release-smoke matrix covers 26 natural-minimum/maximum cells: 23 pass every check,
 two V4.1 NVFP4 cells fail fidelity (not recommended) and the V4 Pro EXL3 minimum fails
 fidelity at KL 0.0605. All three required spots pass, as do the GLM draft-kernel selftests on
 SM120 and SM121. The simulated-5090 column has nine passing cells, one V4.1 NVFP4 fidelity
@@ -365,8 +366,8 @@ cache layout works.
    V4, V4.1 and Qwen; the engine spelling is `--pool-tokens 0`. V4.1 keeps
    its existing pool policy when this option is omitted.
 3. `./run.sh` launches the release images named in the config,
-   `ghcr.io/tpurtell/cuteafd-coordinator:v1.0.0` on the RTX host and
-   `ghcr.io/tpurtell/cuteafd-spark-expert:v1.0.0` on each Spark; `docker pull`
+   `ghcr.io/tpurtell/cuteafd-coordinator:v2.0.0` on the RTX host and
+   `ghcr.io/tpurtell/cuteafd-spark-expert:v2.0.0` on each Spark; `docker pull`
    them on those hosts first (`./run.sh` does not pull). `./wip.sh --slot S --role both`
    plus `./run.sh --wip S --restart` is the faster loop while iterating.
 
@@ -375,17 +376,6 @@ V4.1 defaults to `CUTEAFD_V41_FP8_HEAD=all`: one E4M3 vocabulary head
 packing. `off` selects BF16; experimental `draft` retains BF16 for the target
 and adds FP8 for dSpark. The accepted target-head quality gate and matched RC2
 controls support the release default.
-
-### Try the release candidate
-
-`latest` and the shipped `cuteafd.config` / `examples/configs/*.config` still name the
-v1.0.0 images until v2.0.0 is released. To run v2.0.0-rc3, set these in your
-`cuteafd.config` and `docker pull` them on the RTX host and each Spark first:
-
-```
-COORDINATOR_DOCKER_INFERENCE=ghcr.io/tpurtell/cuteafd-coordinator:v2.0.0-rc3
-SPARK_EXPERT_DOCKER_INFERENCE=ghcr.io/tpurtell/cuteafd-spark-expert:v2.0.0-rc3
-```
 
 ## Working on it
 
