@@ -179,7 +179,11 @@ fn chat(turn: &TurnRequest, config: &UpstreamConfig, names: &WireNames) -> Resul
     if let Some(seed) = turn.sampling.seed { request["seed"] = json!(seed); }
     if !turn.sampling.stop.is_empty() { request["stop"] = json!(turn.sampling.stop); }
     if let Some(format) = &turn.response_format {
-        request["response_format"] = if format.get("schema").is_some() && format.get("type").is_none() { json!({"type":"json_schema","json_schema":format}) } else { format.clone() };
+        request["response_format"] = if format.get("schema").is_some() && (format.get("type").is_none() || format["type"] == "json_schema") {
+            let mut schema = format.clone();
+            schema.as_object_mut().expect("schema format object").remove("type");
+            json!({"type":"json_schema","json_schema":schema})
+        } else { format.clone() };
     }
     Ok(request)
 }

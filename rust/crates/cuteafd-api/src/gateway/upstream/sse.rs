@@ -48,6 +48,22 @@ fn stop(value: &str, sequence: Option<String>) -> Result<StopReason, GatewayErro
         _ => Err(GatewayError::upstream("unknown upstream finish reason")),
     }
 }
+fn stream_error(value: &Value) -> GatewayError {
+    use crate::gateway::ErrorKind;
+    let error = value.get("error").unwrap_or(value);
+    let status = [error.get("status"),error.get("status_code"),error.get("code"),value.get("status"),value.get("code")]
+        .into_iter().flatten().find_map(|v| v.as_u64().and_then(|n| u16::try_from(n).ok()).or_else(|| v.as_str().and_then(|s| s.parse::<u16>().ok())));
+    let mut mapped = if let Some(status) = status { super::http_error(status) }
+        else { GatewayError::upstream("upstream emitted a stream error") };
+    for field in ["type","code"] {
+        match error[field].as_str().unwrap_or_default() {
+            "overloaded_error"|"overloaded"|"server_overloaded" => mapped.kind = ErrorKind::Overloaded,
+            "rate_limit_error"|"rate_limit_exceeded"|"rate_limited" => mapped.kind = ErrorKind::RateLimited,
+            _ => {},
+        }
+    }
+    mapped
+}
 impl State {
     fn call_events(&mut self, index: usize, force: bool) -> Result<Vec<TurnEvent>, GatewayError> {
         let call = self.calls.get_mut(&index).expect("call exists");
@@ -80,7 +96,7 @@ impl State {
     fn parse(&mut self, frame: &str, flavor: Flavor) -> Result<Vec<TurnEvent>, GatewayError> {
         if frame == "[DONE]" { return self.finish(); }
         let value: Value = serde_json::from_str(frame).map_err(|_| GatewayError::upstream("invalid upstream SSE JSON"))?;
-        if value.get("error").is_some() || value["type"] == "error" { return Err(GatewayError::upstream("upstream emitted a stream error")); }
+        if value.get("error").is_some() || value["type"] == "error" { return Err(stream_error(&value)); }
         let mut events = Vec::new();
         match flavor {
             Flavor::OpenaiChat => {
