@@ -315,6 +315,7 @@ struct Active<'a> {
     /// DFlash2 ring slot and draft outcomes (None without a drafter slot).
     slot: Option<usize>,
     drafts: DraftHistory,
+    copy_drafts: DraftHistory,
     /// Hash of `history` (identical sequences share it).
     digest: u64,
     /// Steps, DFlash2 drafts verified/accepted, copy drafts verified/accepted,
@@ -739,6 +740,10 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
     // `--decode-rows 128`): the table, measured to 64 rows, extends past them and serving refits it.
     let verify_rows = engine.verify_rows;
     let mut cost = dflash_policy::step_cost(&table, verify_rows);
+    let mut confidence = drafter.map(|d| d.confidence_policy(matches!(engine.draft_head(), super::super::glm5::dflash::TargetHead::Launch(_)))).transpose()?;
+    let copy_policy = crate::shared::draft_policy::enabled("CUTEAFD_COPY_DRAFT_POLICY");
+    let refine_confidence = crate::shared::draft_policy::enabled("CUTEAFD_DRAFT_CONFIDENCE");
+    tracing::info!(copy_policy, refine_confidence, "shared draft policy experiments");
     let mut skip = dflash_policy::DraftSkip::default();
     let mut active: Vec<Active<'_>> = Vec::new();
     let (mut requests, mut generated_total) = (0u64, 0u64);
@@ -1070,6 +1075,7 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
                         draft_pause: 0,
                         slot,
                         drafts: DraftHistory::default(),
+                        copy_drafts: DraftHistory::default(),
                         counts: [0; 6],
                         decoder: cuteafd_loader::streaming_token_decoder(snapshot, false)?,
                         job: p.job, constraint: p.constraint, placement: p.placement, draft_from: resume, turn: None,
@@ -1162,10 +1168,20 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
         // Identical sequences (same tokens at the same position) route alike
         // and draft alike: the policy prices and plans them as one group.
         let key = |a: &Active<'_>| (a.placement.len, a.digest);
+        let priors: Vec<Vec<f64>> = active.iter().zip(&drafted).map(|(a, draft)| {
+            if let Some(head) = draft.as_ref().map(|d| d.confidence.as_slice()).filter(|head| !head.is_empty()) {
+                dflash_policy::head_confidence(&a.drafts, head)
+            } else {
+                confidence.as_ref().map_or(Vec::new(), |policy| policy.prior(&a.drafts,
+                    draft.as_ref().map(|d| d.features.as_slice()), draft.as_ref().map_or(0, |d| d.tokens.len())))
+            }
+        }).collect();
+        let rates: Vec<Vec<f64>> = priors.iter().map(|prior| confidence.as_ref()
+            .map_or_else(|| prior.clone(), |policy| policy.apply(prior))).collect();
         let inputs: Vec<dflash_policy::PlanInput<'_>> = active.iter().enumerate().map(|(i, a)| dflash_policy::PlanInput {
             key: key(a), history: &a.drafts, features: drafted[i].as_ref().map(|d| d.features.as_slice()),
             confidence: drafted[i].as_ref().map(|d| d.confidence.as_slice()).filter(|c| !c.is_empty()),
-            limit: limits[i],
+            rates: Some(&rates[i]), limit: limits[i],
         }).collect();
         let plan_timer = Instant::now();
         let planned = dflash_policy::plan_counts(&inputs, policy.fixed, &cost);
@@ -1173,6 +1189,20 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
         skip.after(drafted.iter().any(Option::is_some) && policy.fixed.is_none(), planned.iter().all(|&n| n == 0));
         // Each sequence verifies its next token, then its DFlash2 drafts, or
         // a copy-window draft when it agrees with them and runs longer.
+        let copy_choice = copy_policy.then(|| {
+            let proposals = active.iter().enumerate().map(|(i, a)| {
+            if !a.job.sampling.is_greedy() { return Vec::new(); }
+            copy_drafts(&a.history, limits[i].min(a.draft_limit))
+        }).collect::<Vec<_>>();
+            let copy_rates: Vec<_> = active.iter().zip(&proposals).map(|(a, copy)| a.copy_drafts.conditional(copy.len())).collect();
+            let inputs: Vec<_> = active.iter().enumerate().map(|(i, a)| crate::shared::draft_policy::CopyInput {
+                key: key(a), neural: drafted[i].as_ref().map_or(&[], |d| &d.tokens[..planned[i]]),
+                confidence: &rates[i], copy: &proposals[i], copy_confidence: &copy_rates[i],
+            }).collect();
+            let (lengths, used) = crate::shared::draft_policy::compete_copies(&inputs,
+                drafted.iter().any(Option::is_some), 0, &cost);
+            (proposals, lengths, used)
+        });
         let mut used_copy = vec![false; active.len()];
         let sequences: Vec<Vec<u32>> = active.iter_mut().enumerate().map(|(i, a)| {
             if a.draft_pause > 0 {
@@ -1186,7 +1216,10 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
             // `emit` already appended `next` to the history.
             let copy = copy_drafts(&a.history, limits[i].min(a.draft_limit));
             let agrees = copy.iter().zip(full).take_while(|(c, d)| c == d).count() >= dflash.len();
-            let draft = if copy.len() > dflash.len() && agrees {
+            let draft = if let Some((copies, lengths, used)) = &copy_choice {
+                used_copy[i] = used[i];
+                if used[i] { copies[i][..lengths[i]].to_vec() } else { dflash.to_vec() }
+            } else if copy.len() > dflash.len() && agrees {
                 used_copy[i] = true;
                 copy
             } else {
@@ -1241,6 +1274,7 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
         let mut context = Vec::new();
         let mut commits = Vec::new();
         let mut kept = Vec::new();
+        let draft_list = &drafted;
         let caching = cache.enabled();
         let before: Vec<usize> = active.iter().map(|a| a.history.len()).collect();
         let finished: Vec<bool> = active.iter_mut().zip(&sequences).zip(starts).enumerate()
@@ -1290,14 +1324,19 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
             let (drafted, accepted) = (rows.len() - 1, committed - 1);
             request.counts[0] += 1;
             if used_copy[i] {
+                request.copy_drafts.observe(drafted.min(accepted + usize::from(!finished)), accepted);
                 request.counts[3] += drafted;
                 request.counts[4] += accepted;
             } else {
                 request.counts[1] += drafted;
                 request.counts[2] += accepted;
             }
-            if planned[i] > 0 {
-                request.drafts.observe(planned[i], accepted);
+            if planned[i] > 0 && (!used_copy[i] || (!refine_confidence && !copy_policy)) {
+                if let Some(policy) = confidence.as_mut().filter(|_| !used_copy[i]) {
+                    policy.observe(&request.drafts, draft_list[i].as_ref().filter(|d| d.confidence.is_empty()).map(|d| d.features.as_slice()),
+                        &priors[i], drafted, accepted, finished, request.ticket.id());
+                }
+                request.drafts.observe(if refine_confidence || copy_policy { drafted.min(accepted + usize::from(!finished)) } else { planned[i] }, accepted);
             }
             // Adapt the copy-draft length to how much of it the model reproduced.
             if used_copy[i] || drafter.is_none() {

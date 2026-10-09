@@ -256,6 +256,7 @@ pub(crate) struct CycleCost {
     /// Table-scale ms of a row whose routes an identical row already reads.
     duplicate_row_ms: f64,
     fits: [CostFit; 4],
+    bucketed: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -291,7 +292,15 @@ impl CycleCost {
         let draft = Ridge::new([0.0, 0.0], [PRIOR_WEIGHT, PRIOR_WEIGHT * REFERENCE_CHAIN * REFERENCE_CHAIN]);
         Self { table, duplicate_row_ms: 0.0, fits: std::array::from_fn(|_| CostFit {
             verify: verify.clone(), draft: draft.clone(), host_ms: 0.0,
-        }) }
+        }), bucketed: enabled("CUTEAFD_DRAFT_COST_BUCKETS") }
+    }
+
+    /// Experimental concurrency isolation; legacy shared fitting stays the default until gated.
+    #[cfg(test)]
+    pub fn concurrency_fits(mut self, enabled: bool) -> Self { self.bucketed = enabled; self }
+
+    fn bucket(&self, sequences: usize) -> usize {
+        if self.bucketed { concurrency_bucket(sequences) } else { 0 }
     }
 
     /// Prices duplicate rows (identical sequences' rows beyond the first).
@@ -321,7 +330,7 @@ impl CycleCost {
 
     /// Verify-step ms of `shape`.
     pub fn verify_ms(&self, shape: Shape) -> f64 {
-        self.fits[concurrency_bucket(shape.sequences)].verify.predict(&self.features(shape)).max(0.25 * self.table[1])
+        self.fits[self.bucket(shape.sequences)].verify.predict(&self.features(shape)).max(0.25 * self.table[1])
     }
 
     /// Draft ms of a cycle: the drafting cost when `drafting`, and `chain` chained steps.
@@ -329,19 +338,19 @@ impl CycleCost {
         if !drafting && chain == 0 {
             return 0.0;
         }
-        self.fits[concurrency_bucket(sequences)].draft.predict(&[1.0, chain as f64]).max(0.0)
+        self.fits[self.bucket(sequences)].draft.predict(&[1.0, chain as f64]).max(0.0)
     }
 
     /// Cycle ms: verify `shape` after the draft work, plus host time.
     pub fn cycle_ms(&self, shape: Shape, chain: usize, drafting: bool) -> f64 {
         self.verify_ms(shape) + self.draft_ms(shape.sequences, drafting, chain)
-            + self.fits[concurrency_bucket(shape.sequences)].host_ms
+            + self.fits[self.bucket(shape.sequences)].host_ms
     }
 
     /// Fitted verify (intercept ms, slope relative to the table, ms per extra
     /// sequence) and draft (ms per drafting cycle, per chained step).
     pub fn fitted(&self, sequences: usize) -> ([f64; 3], [f64; 2]) {
-        let fit = &self.fits[concurrency_bucket(sequences)];
+        let fit = &self.fits[self.bucket(sequences)];
         (fit.verify.theta, fit.draft.theta)
     }
 
@@ -350,7 +359,8 @@ impl CycleCost {
         if ms.is_finite() && ms > 0.0 {
             let predicted = self.verify_ms(shape);
             let features = self.features(shape);
-            let fit = &mut self.fits[concurrency_bucket(shape.sequences)].verify;
+            let bucket = self.bucket(shape.sequences);
+            let fit = &mut self.fits[bucket].verify;
             fit.observe(&features, ms.clamp(0.5 * predicted, 2.0 * predicted));
             let [a, b, c] = fit.theta;
             // Rows never get cheaper with more of them; the intercept stays physical.
@@ -368,7 +378,8 @@ impl CycleCost {
         if ms.is_finite() && ms > 0.0 {
             let predicted = self.draft_ms(sequences, true, steps);
             let y = if predicted > 0.0 { ms.clamp(0.25 * predicted, 4.0 * predicted) } else { ms };
-            let fit = &mut self.fits[concurrency_bucket(sequences)].draft;
+            let bucket = self.bucket(sequences);
+            let fit = &mut self.fits[bucket].draft;
             fit.observe(&[1.0, steps as f64], y);
             let [d, e] = fit.theta;
             fit.theta = [d.max(0.0), e.max(0.0)];
@@ -378,7 +389,8 @@ impl CycleCost {
     /// Folds one cycle's host time outside the draft and verify steps in.
     pub fn observe_host(&mut self, sequences: usize, ms: f64) {
         if ms.is_finite() && ms >= 0.0 {
-            let host_ms = &mut self.fits[concurrency_bucket(sequences)].host_ms;
+            let bucket = self.bucket(sequences);
+            let host_ms = &mut self.fits[bucket].host_ms;
             *host_ms += 0.1 * (ms.min(20.0) - *host_ms);
         }
     }
@@ -531,6 +543,60 @@ pub(crate) fn allocate(groups: &[Group], base: Base, drafter: Drafter, cost: &Cy
     best
 }
 
+/// A sequence's already-produced neural prefix and independently calibrated copy.
+pub(crate) struct CopyInput<'a> {
+    pub key: (usize, u64),
+    pub neural: &'a [u32],
+    pub confidence: &'a [f64],
+    pub copy: &'a [u32],
+    pub copy_confidence: &'a [f64],
+}
+
+/// Competes copy prefixes with the already-produced neural plan. Draft work
+/// is sunk for this round: both choices pay it. Identical sequences share
+/// rows only while their selected proposals also match, as in verification.
+pub(crate) fn compete_copies(inputs: &[CopyInput<'_>], drafting: bool, chain: usize, cost: &CycleCost)
+    -> (Vec<usize>, Vec<bool>) {
+    let mut lengths: Vec<_> = inputs.iter().map(|input| input.neural.len()).collect();
+    let mut used = vec![false; inputs.len()];
+    let score = |lengths: &[usize], used: &[bool]| {
+        let mut rows = 0;
+        let mut expected = inputs.len() as f64;
+        let mut distinct = std::collections::HashSet::new();
+        for ((input, &length), &copy) in inputs.iter().zip(lengths).zip(used) {
+            let (tokens, confidence) = if copy { (input.copy, input.copy_confidence) }
+                else { (input.neural, input.confidence) };
+            rows += 1 + length;
+            distinct.insert((input.key, &tokens[..length]));
+            let mut survival = 1.0;
+            for &rate in &confidence[..length] {
+                survival *= rate.clamp(0.0, 1.0);
+                expected += survival;
+            }
+        }
+        let shape = Shape { rows, distinct: distinct.iter().map(|(_, tokens)| 1 + tokens.len()).sum(),
+            sequences: inputs.len() };
+        expected / cost.cycle_ms(shape, chain, drafting)
+    };
+    let mut best = score(&lengths, &used);
+    for (i, input) in inputs.iter().enumerate() {
+        let original_length = lengths[i];
+        let mut winner = None;
+        used[i] = true;
+        for length in 1..=input.copy.len() {
+            lengths[i] = length;
+            let candidate = score(&lengths, &used);
+            if candidate > best * (1.0 + 1e-9) {
+                best = candidate;
+                winner = Some(length);
+            }
+        }
+        used[i] = winner.is_some();
+        lengths[i] = winner.unwrap_or(original_length);
+    }
+    (lengths, used)
+}
+
 /// Longest run of steps without a draft step after plans that verified none.
 const MAX_DRAFT_SKIP: usize = 8;
 
@@ -674,7 +740,7 @@ mod tests {
     fn c16_sweep_does_not_poison_c1_plans() {
         // GLM Flash table; a wide sweep learns sub-additive expert reads.
         let table = [(1, 19.1), (2, 26.0), (4, 35.2), (6, 43.5), (8, 51.3), (64, 200.0)];
-        let fresh = CycleCost::new(&table, 128).drafts(5.0, 0.0, 0.3);
+        let fresh = CycleCost::new(&table, 128).concurrency_fits(true).drafts(5.0, 0.0, 0.3);
         let mut swept = fresh.clone();
         for step in 0..200 {
             let rows = 16 * (4 + step % 5);
@@ -700,7 +766,7 @@ mod tests {
     fn concurrency_bucket_boundaries_share_only_their_own_fit() {
         assert_eq!((0..=17).map(concurrency_bucket).collect::<Vec<_>>(),
             vec![0, 0, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 3, 3]);
-        let mut cost = CycleCost::new(&TABLE, 128).drafts(5.0, 0.0, 0.3);
+        let mut cost = CycleCost::new(&TABLE, 128).concurrency_fits(true).drafts(5.0, 0.0, 0.3);
         let prior = cost.fitted(1);
         feed(&mut cost, 12.0, 0.4, 4, 100);
         assert_eq!(cost.fitted(2), cost.fitted(4));
@@ -824,6 +890,48 @@ mod tests {
     }
 
     #[test]
+    fn copy_prefix_competes_on_emissions_per_cycle_ms() {
+        let cost = CycleCost::new(&TABLE, 64).drafts(5.0, 0.0, 0.3);
+        let neural = [group(0.8, 7, 1)];
+        let (plan, _) = allocate(&neural, Base::default(), Drafter::Block, &cost);
+        let tokens = [1; 7];
+        let run = |rate| compete_copies(&[CopyInput { key: (0, 0), neural: &tokens[..plan[0]],
+            confidence: &neural[0].confidence, copy: &tokens, copy_confidence: &[rate; 7] }], true, 0, &cost);
+        let (bad, used) = run(0.1);
+        assert_eq!(bad, plan);
+        assert_eq!(used, vec![false]);
+        let (good, used) = run(0.98);
+        assert_eq!(used, vec![true]);
+        assert_eq!(good, vec![7]);
+        assert_eq!(run(0.8).1, vec![false]);
+        // Poor copies must also lose when their extra rows tax a busy batch.
+        let batch = vec![group(0.9, 7, 1); 16];
+        let (plan, _) = allocate(&batch, Base::default(), Drafter::Block, &cost);
+        let inputs: Vec<_> = plan.iter().enumerate().map(|(i, &n)| CopyInput {
+            key: (0, i as u64), neural: &tokens[..n], confidence: &[0.9; 7],
+            copy: &tokens, copy_confidence: &[0.1; 7],
+        }).collect();
+        assert!(compete_copies(&inputs, true, 0, &cost).1.iter().all(|used| !used));
+    }
+
+    #[test]
+    fn copy_comparison_deduplicates_only_matching_selected_tokens() {
+        let cost = CycleCost::new(&TABLE, 64).drafts(5.0, 0.0, 0.3);
+        let neural = [1; 7];
+        let different = [2; 7];
+        let compare = |copy: &[u32]| compete_copies(&[
+            CopyInput { key: (17, 23), neural: &neural, confidence: &[0.8; 7],
+                copy, copy_confidence: &[0.81; 7] },
+            CopyInput { key: (17, 23), neural: &neural, confidence: &[0.8; 7],
+                copy: &[], copy_confidence: &[] },
+        ], true, 0, &cost);
+        // A slightly better matching proposal retains shared verify rows.
+        assert_eq!(compare(&neural), (vec![7, 7], vec![true, false]));
+        // Changing its tokens splits the group and costs more than it emits.
+        assert_eq!(compare(&different), (vec![7, 7], vec![false, false]));
+    }
+
+    #[test]
     fn draft_skip_backs_off_and_resets() {
         let mut skip = DraftSkip::default();
         skip.after(true, true);
@@ -856,4 +964,9 @@ pub(crate) fn speculation_trace_path(legacy: &'static str) -> Option<(&'static s
     ["CUTEAFD_SPECULATION_TRACE", legacy]
         .into_iter()
         .find_map(|var| std::env::var(var).ok().filter(|path| !path.is_empty()).map(|path| (var, path)))
+}
+
+/// Candidate policy switches deliberately stay off until throughput gates pass.
+pub(crate) fn enabled(variable: &str) -> bool {
+    std::env::var(variable).is_ok_and(|v| matches!(v.as_str(), "1" | "on" | "true"))
 }
