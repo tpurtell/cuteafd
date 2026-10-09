@@ -136,6 +136,45 @@ mod tests {
             if path.is_dir() { fixture_paths(&path,paths); } else if path.extension().is_some_and(|s| s == "json") { paths.push(path); }
         }
     }
+    fn redacted(value: &Value) -> bool { value.is_null() || value == "[REDACTED]" }
+    fn scan_text(text: &str) {
+        let protocol = regex::Regex::new(r#"openai-insecure-api-key\.([^\s\"\\,;]+)"#).unwrap();
+        for capture in protocol.captures_iter(text) { assert_eq!(&capture[1],"[REDACTED]","unredacted websocket credential"); }
+        if let Ok(inner) = serde_json::from_str::<Value>(text) { if inner.is_object() || inner.is_array() { scan_fields(&inner); } }
+        for line in text.lines() {
+            if let Some(data) = line.strip_prefix("data:") { if let Ok(inner) = serde_json::from_str::<Value>(data.trim()) { scan_fields(&inner); } }
+        }
+        let query = regex::Regex::new(r#"(?:[?&]|^)([^=\s\"\\&]+)=([^&\s\"\\]*)"#).unwrap();
+        for capture in query.captures_iter(text) {
+            let pair = format!("{}={}",&capture[1],&capture[2]);
+            for (name,value) in url::form_urlencoded::parse(pair.as_bytes()) {
+                if super::super::recorder::query_secret_name(&name) { assert_eq!(value,"[REDACTED]","unredacted query credential"); }
+            }
+        }
+    }
+    fn scan_fields(value: &Value) {
+        match value {
+            Value::Object(object) => for (name,value) in object {
+                scan_text(name);
+                if super::super::recorder::secret_name(name) { assert!(redacted(value),"unredacted secret-like field"); }
+                scan_fields(value);
+            },
+            Value::Array(values) => for value in values { scan_fields(value); },
+            Value::String(text) => scan_text(text),
+            _ => {},
+        }
+    }
+    #[test]
+    fn fixture_scan_rejects_nested_handshake_headers_and_query_secrets() {
+        for value in [
+            json!({"sec-websocket-protocol":"realtime, openai-insecure-api-key.opaque-secret"}),
+            json!({"cookie":"session=opaque"}),json!({"set-cookie":"session=opaque"}),
+            json!({"authorization":"Basic opaque"}),json!({"query":"model=test&access_token=opaque"}),
+            json!({"body":"data: {\"authorization\":\"Basic opaque\"}\n\n"}),
+            json!({"nested":"{\"sec-websocket-protocol\":\"realtime, openai-insecure-api-key.opaque-secret\"}"}),
+        ] { assert!(std::panic::catch_unwind(|| scan_fields(&value)).is_err(),"scan accepted unsafe fixture"); }
+        scan_fields(&json!({"authorization":"[REDACTED]","query":"token=%5BREDACTED%5D&model=test"}));
+    }
     #[test]
     fn every_gateway_fixture_is_free_of_secrets_paths_and_emails() {
         let directory = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/gateway");
@@ -144,20 +183,6 @@ mod tests {
         let key = regex::Regex::new(r#"sk-or-v1-[0-9a-f]{20,}|sk-[A-Za-z0-9_-]{20,}"#).unwrap();
         let bearer = regex::Regex::new(r#"(?i:Bearer\s+)([^\s\"\\,;]+)"#).unwrap();
         let email = regex::Regex::new(r#"[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+\.[A-Za-z]{2,}"#).unwrap();
-        fn fields(value:&Value) {
-            match value {
-                Value::Object(object) => for (name,value) in object {
-                    let name = name.to_ascii_lowercase().replace('-',"_");
-                    if name.contains("api_key") || name == "key" || name.ends_with("_key") {
-                        assert!(value.is_null() || value.as_str().is_some_and(|s| s.contains("REDACTED")),"unredacted key-like field");
-                    }
-                    fields(value);
-                },
-                Value::Array(values) => for value in values { fields(value); },
-                Value::String(text) => if let Ok(inner) = serde_json::from_str::<Value>(text) { if inner.is_object() || inner.is_array() { fields(&inner); } },
-                _ => {}
-            }
-        }
         for path in paths {
             let text = std::fs::read_to_string(&path).unwrap();
             assert!(!key.is_match(&text),"key in {}",path.display());
@@ -172,7 +197,7 @@ mod tests {
                     if let Some(host) = url.host_str() { assert!(!text.contains(host),"private host in {}",path.display()); }
                 }
             }
-            fields(&serde_json::from_str::<Value>(&text).unwrap());
+            scan_fields(&serde_json::from_str::<Value>(&text).unwrap());
         }
     }
     #[tokio::test]

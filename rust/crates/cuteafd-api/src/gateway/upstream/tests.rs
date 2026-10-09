@@ -391,3 +391,47 @@ async fn chat_reasoning_alias_streams_without_double_counting() {
     let events = parse("data: {\"choices\":[{\"delta\":{\"reasoning\":\"plan\",\"reasoning_content\":\"plan\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",Flavor::OpenaiChat).await.unwrap();
     assert_eq!(events.iter().filter(|e| matches!(e,TurnEvent::ReasoningDelta { .. })).count(),1);
 }
+
+#[tokio::test]
+async fn responses_frontend_normalizes_flat_schema_for_chat_upstream() {
+    use tower::ServiceExt;
+    let seen = Arc::new(std::sync::Mutex::new(None));
+    let captured = seen.clone();
+    let (url,task) = server(Router::new().route("/chat/completions",post(move |axum::Json(request):axum::Json<Value>| {
+        *captured.lock().unwrap() = Some(request);
+        async { "data: {\"choices\":[{\"delta\":{\"content\":\"{}\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n" }
+    }))).await;
+    let mut config = UpstreamConfig::new(url,Flavor::OpenaiChat,"test");config.capabilities.json_schema=true;
+    let app = crate::gateway::router(Arc::new(crate::gateway::Gateway::new(Arc::new(Upstream::new(config).unwrap()),crate::gateway::ModelMap::single("test"))));
+    let format = json!({"type":"json_schema","name":"shape","schema":{"type":"object","additionalProperties":false},"strict":true});
+    let request = axum::http::Request::builder().method("POST").uri("/v1/responses").header("content-type","application/json")
+        .body(axum::body::Body::from(json!({"model":"test","input":"hello","text":{"format":format}}).to_string())).unwrap();
+    let response = app.oneshot(request).await.unwrap();assert_eq!(response.status(),200);
+    let mapped = seen.lock().unwrap().clone().unwrap();
+    assert_eq!(mapped["response_format"],json!({"type":"json_schema","json_schema":{"name":"shape","schema":{"type":"object","additionalProperties":false},"strict":true}}));
+    task.abort();
+}
+#[tokio::test]
+async fn sse_errors_are_typed_before_and_after_first_output_without_provider_message() {
+    for (flavor,error,kind) in [
+        (Flavor::Anthropic,json!({"type":"error","error":{"type":"overloaded_error","message":"opaque-secret"}}),ErrorKind::Overloaded),
+        (Flavor::Anthropic,json!({"type":"error","error":{"type":"rate_limit_error","message":"opaque-secret"}}),ErrorKind::RateLimited),
+        (Flavor::OpenaiChat,json!({"error":{"code":429,"message":"opaque-secret"}}),ErrorKind::RateLimited),
+        (Flavor::OpenaiChat,json!({"error":{"status":503,"message":"opaque-secret"}}),ErrorKind::Overloaded),
+        (Flavor::OpenaiChat,json!({"error":{"code":"rate_limit_exceeded","message":"opaque-secret"}}),ErrorKind::RateLimited),
+    ] {
+        for output in [false,true] {
+            let prefix = if !output { String::new() } else if flavor == Flavor::OpenaiChat {
+                "data: {\"choices\":[{\"delta\":{\"content\":\"hello\"}}]}\n\n".into()
+            } else { "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hello\"}}\n\n".into() };
+            let body = format!("{prefix}data: {error}\n\n");
+            let (url,task) = server(Router::new().fallback(post(move || { let body=body.clone();async { body } }))).await;
+            let upstream = Upstream::new(UpstreamConfig::new(url,flavor,"test")).unwrap();
+            let error = match upstream.start(turn()).await {
+                Err(error) => { assert!(!output); error },
+                Ok(mut stream) => { assert!(output); assert!(matches!(stream.next().await.unwrap().unwrap(),TurnEvent::TextDelta { .. })); stream.next().await.unwrap().unwrap_err() },
+            };
+            assert_eq!(error.kind,kind);assert!(!error.message.contains("opaque-secret"));task.abort();
+        }
+    }
+}

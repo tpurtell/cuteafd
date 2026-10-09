@@ -54,13 +54,26 @@ fn alias(value: &str) -> Result<(String,String),String> {
     if pattern.is_empty() || target.is_empty() { return Err("alias must have a nonempty pattern and model".into()); }
     Ok((pattern.into(),target.into()))
 }
+fn resolve_base(args: &GatewayArgs, lookup: impl FnOnce(&str) -> Result<String,std::env::VarError>) -> Result<String> {
+    match (&args.upstream_url,&args.upstream_url_env) {
+        (Some(url),_) => Ok(url.clone()),
+        (_,Some(name)) => lookup(name).with_context(|| format!("upstream URL environment variable {name} is not set")),
+        _ => anyhow::bail!("upstream URL is required"),
+    }
+}
+fn endpoint_secrets(base: &str) -> Result<Vec<String>> {
+    let url = url::Url::parse(base).context("invalid upstream URL")?;
+    let mut secrets = vec![base.to_string()];
+    if let Some(host) = url.host_str() { secrets.push(host.into()); }
+    Ok(secrets)
+}
+fn log_ready(flavor: Flavor, model: &str, provider: &str) {
+    tracing::info!(flavor=flavor.name(),upstream="configured",model,search=provider,"gateway ready");
+}
 pub(crate) async fn run(args: GatewayArgs) -> Result<()> {
     let flavor: Flavor = args.upstream_flavor.parse()?;
-    let base = match (&args.upstream_url,&args.upstream_url_env) {
-        (Some(url),_) => url.clone(),
-        (_,Some(name)) => std::env::var(name).with_context(|| format!("upstream URL environment variable {name} is not set"))?,
-        _ => anyhow::bail!("upstream URL is required"),
-    };
+    let base = resolve_base(&args,|name| std::env::var(name))?;
+    let mut secrets = endpoint_secrets(&base)?;
     let mut config = UpstreamConfig::new(base,flavor,args.model.clone());
     config.key = args.upstream_key_env.as_ref().map(|name| std::env::var(name).with_context(|| format!("upstream key environment variable {name} is not set"))).transpose()?;
     config.thinking_toggle = args.upstream_thinking_toggle;
@@ -76,7 +89,7 @@ pub(crate) async fn run(args: GatewayArgs) -> Result<()> {
             _ => unreachable!("validated capability"),
         }
     }
-    let mut secrets:Vec<String> = config.key.iter().cloned().collect();
+    secrets.extend(config.key.iter().cloned());
     if let Some(file) = &args.api_key_file { secrets.push(std::fs::read_to_string(file).context("read gateway API key file")?.trim().to_string()); }
     let api = crate::shared::api::ApiArgs { api_key_file:args.api_key_file,enable_bench:false }.load()?;
     let backend = Arc::new(Upstream::new(config)?.discover().await);
@@ -105,7 +118,7 @@ pub(crate) async fn run(args: GatewayArgs) -> Result<()> {
         let recorder = Recorder::new(directory,Sanitizer::from_env(secrets))?;
         app = app.layer(axum::middleware::from_fn_with_state(recorder,gateway::record::middleware));
     }
-    tracing::info!(flavor=flavor.name(),url=%args.upstream_url.as_deref().unwrap_or("[private env endpoint]"),model=%args.model,search=provider,"gateway ready");
+    log_ready(flavor,&args.model,provider);
     let listener = tokio::net::TcpListener::bind(args.listen).await.context("bind gateway listener")?;
     axum::serve(listener,app).with_graceful_shutdown(async { let _ = tokio::signal::ctrl_c().await; }).await?;
     Ok(())
@@ -114,6 +127,53 @@ pub(crate) async fn run(args: GatewayArgs) -> Result<()> {
 mod tests {
     use super::*;
     use clap::Parser;
+    #[tokio::test]
+    async fn custom_url_env_echo_is_redacted_from_recordings() {
+        use tower::ServiceExt;
+        let cli = crate::cli::Cli::try_parse_from(["cuteafd","gateway","--upstream-url-env","CUSTOM_TEST_ENDPOINT","--model","local"]).unwrap();
+        let crate::cli::Commands::Gateway(args) = cli.command else { panic!("gateway expected") };
+        let base = resolve_base(&args,|name| {
+            assert_eq!(name,"CUSTOM_TEST_ENDPOINT");
+            Ok("https://private-example.invalid/v1".into())
+        }).unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let recorder = Recorder::new(directory.path().into(),Sanitizer::from_env(endpoint_secrets(&base).unwrap())).unwrap();
+        let echo = format!("data: {{\"text\":\"{base} private-example.invalid\"}}\n\n");
+        let original = echo.clone();
+        let app = axum::Router::new().route("/test",axum::routing::get(move |tape:gateway::record::Tape| {
+            let echo = echo.clone();
+            async move {
+                tape.record("upstream",|| serde_json::json!({"body":echo}));
+                echo
+            }
+        })).layer(axum::middleware::from_fn_with_state(recorder,gateway::record::middleware));
+        let response = app.oneshot(axum::http::Request::builder().uri("/test").body(axum::body::Body::empty()).unwrap()).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(),1024).await.unwrap();
+        assert_eq!(&body[..],original.as_bytes(),"client delivery must stay unmodified");
+        let fixture = std::fs::read_dir(directory.path()).unwrap().next().unwrap().unwrap().path();
+        let fixture = std::fs::read_to_string(fixture).unwrap();
+        assert!(!fixture.contains(&base) && !fixture.contains("private-example.invalid"));
+        assert!(fixture.contains("REDACTED"));
+    }
+    #[test]
+    fn direct_upstream_url_is_never_in_startup_log() {
+        use std::io::Write;
+        #[derive(Clone)]
+        struct Capture(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl Write for Capture {
+            fn write(&mut self,bytes:&[u8]) -> std::io::Result<usize> { self.0.lock().unwrap().extend_from_slice(bytes); Ok(bytes.len()) }
+            fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+        }
+        let cli = crate::cli::Cli::try_parse_from(["cuteafd","gateway","--upstream-url","https://private-example.invalid/private-path","--model","local"]).unwrap();
+        let crate::cli::Commands::Gateway(args) = cli.command else { panic!("gateway expected") };
+        let bytes = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let capture = Capture(bytes.clone());
+        let subscriber = tracing_subscriber::fmt().with_ansi(false).without_time().with_writer(move || capture.clone()).finish();
+        tracing::subscriber::with_default(subscriber,|| log_ready(Flavor::OpenaiChat,&args.model,"none"));
+        let log = String::from_utf8(bytes.lock().unwrap().clone()).unwrap();
+        assert!(log.contains("configured") && log.contains("gateway ready"));
+        assert!(!log.contains("private-example") && !log.contains("private-path") && !log.contains("https://"));
+    }
     #[test]
     fn gateway_cli_requires_env_name_not_secret_and_parses_aliases() {
         let cli = crate::cli::Cli::try_parse_from(["cuteafd","gateway","--upstream-url","http://127.0.0.1:8000/v1","--model","local", "--alias","gpt-*=local","--list-model","gpt-test","--upstream-key-env","TEST_KEY"]).unwrap();

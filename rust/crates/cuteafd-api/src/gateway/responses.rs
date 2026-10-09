@@ -327,6 +327,11 @@ async fn websocket(
         .into_response()
 }
 
+async fn recorded_send(socket: &mut WebSocket, tape: &Tape, text: String) -> Result<(),axum::Error> {
+    tape.frame("server",&text);
+    socket.send(Message::Text(text)).await
+}
+
 async fn websocket_loop(mut socket: WebSocket, gateway: Arc<Gateway>, tape: Tape) {
     let mut last: Option<(String, Arc<Snapshot>)> = None;
     while let Some(Ok(message)) = socket.next().await {
@@ -336,6 +341,7 @@ async fn websocket_loop(mut socket: WebSocket, gateway: Arc<Gateway>, tape: Tape
             }
             continue;
         };
+        tape.frame("client",&text);
         let request: Result<Value, GatewayError> = serde_json::from_str(&text)
             .map_err(|_| GatewayError::invalid("invalid websocket JSON"));
         let parsed = request.and_then(|mut v| {
@@ -355,13 +361,13 @@ async fn websocket_loop(mut socket: WebSocket, gateway: Arc<Gateway>, tape: Tape
         let mut p = match parsed {
             Ok(p) => p,
             Err(e) => {
-                if socket.send(Message::Text(json!({"type":"error","status":e.status(),"error":e.openai_body()["error"]}).to_string())).await.is_err() { break; }
+                if recorded_send(&mut socket,&tape,json!({"type":"error","status":e.status(),"error":e.openai_body()["error"]}).to_string()).await.is_err() { break; }
                 continue;
             }
         };
         p.turn.tape = tape.clone();
         if p.wire.get("generate").is_some_and(|v| !v.is_boolean()) {
-            if socket.send(Message::Text(json!({"type":"error","status":400,"error":{"type":"invalid_request_error","message":"generate must be boolean","code":null,"param":"generate"}}).to_string())).await.is_err() { return; }
+            if recorded_send(&mut socket,&tape,json!({"type":"error","status":400,"error":{"type":"invalid_request_error","message":"generate must be boolean","code":null,"param":"generate"}}).to_string()).await.is_err() { return; }
             continue;
         }
         let start = async {
@@ -377,7 +383,7 @@ async fn websocket_loop(mut socket: WebSocket, gateway: Arc<Gateway>, tape: Tape
                 result = &mut start => break result,
                 message = socket.next() => match message {
                     Some(Ok(Message::Ping(bytes))) => { if socket.send(Message::Pong(bytes)).await.is_err() { return; } },
-                    Some(Ok(Message::Text(_))) => { if socket.send(Message::Text(json!({"type":"error","status":400,"error":{"type":"invalid_request_error","code":"response_in_progress","message":"a response is already starting","param":null}}).to_string())).await.is_err() { return; } },
+                    Some(Ok(Message::Text(text))) => { tape.frame("client",&text); if recorded_send(&mut socket,&tape,json!({"type":"error","status":400,"error":{"type":"invalid_request_error","code":"response_in_progress","message":"a response is already starting","param":null}}).to_string()).await.is_err() { return; } },
                     Some(Ok(Message::Close(_))) | None | Some(Err(_)) => return,
                     _ => {},
                 }
@@ -396,21 +402,21 @@ async fn websocket_loop(mut socket: WebSocket, gateway: Arc<Gateway>, tape: Tape
                     store(&gateway, &p, &fold),
                 ));
                 for event in fold.events {
-                    if socket.send(Message::Text(event.to_string())).await.is_err() {
+                    if recorded_send(&mut socket,&tape,event.to_string()).await.is_err() {
                         return;
                     }
                 }
                 continue;
             }
             Err(e) => {
-                if socket.send(Message::Text(json!({"type":"error","status":e.status(),"error":e.openai_body()["error"]}).to_string())).await.is_err() { break; }
+                if recorded_send(&mut socket,&tape,json!({"type":"error","status":e.status(),"error":e.openai_body()["error"]}).to_string()).await.is_err() { break; }
                 continue;
             }
         };
         let mut fold = render::Fold::new(&p);
         loop {
             for event in std::mem::take(&mut fold.events) {
-                if socket.send(Message::Text(event.to_string())).await.is_err() {
+                if recorded_send(&mut socket,&tape,event.to_string()).await.is_err() {
                     return;
                 }
             }
@@ -430,7 +436,7 @@ async fn websocket_loop(mut socket: WebSocket, gateway: Arc<Gateway>, tape: Tape
                 },
                 message = socket.next() => match message {
                     Some(Ok(Message::Ping(bytes))) => { if socket.send(Message::Pong(bytes)).await.is_err() { return; } },
-                    Some(Ok(Message::Text(_))) => { if socket.send(Message::Text(json!({"type":"error","status":400,"error":{"type":"invalid_request_error","code":"response_in_progress","message":"a response is already in progress","param":null}}).to_string())).await.is_err() { return; } },
+                    Some(Ok(Message::Text(text))) => { tape.frame("client",&text); if recorded_send(&mut socket,&tape,json!({"type":"error","status":400,"error":{"type":"invalid_request_error","code":"response_in_progress","message":"a response is already in progress","param":null}}).to_string()).await.is_err() { return; } },
                     Some(Ok(Message::Close(_))) | None | Some(Err(_)) => return,
                     _ => {},
                 }

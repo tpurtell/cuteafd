@@ -9,9 +9,13 @@ const MAX_BODY: usize = 16 * 1024 * 1024;
 fn key_regex() -> &'static Regex { static R: OnceLock<Regex> = OnceLock::new(); R.get_or_init(|| Regex::new(r#"sk-[A-Za-z0-9_-]{20,}|(?i:Bearer\s+)[^\s\"\\,;]+|openai-insecure-api-key\.[^\s\"\\,;]+"#).unwrap()) }
 fn path_regex() -> &'static Regex { static R: OnceLock<Regex> = OnceLock::new(); R.get_or_init(|| Regex::new(r#"/home/[^/\s\"\\]+"#).unwrap()) }
 fn email_regex() -> &'static Regex { static R: OnceLock<Regex> = OnceLock::new(); R.get_or_init(|| Regex::new(r#"[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+"#).unwrap()) }
-fn secret_name(name: &str) -> bool {
+pub(super) fn secret_name(name: &str) -> bool {
     let name = name.to_ascii_lowercase().replace('-',"_");
     matches!(name.as_str(),"authorization"|"cookie"|"set_cookie"|"sec_websocket_protocol") || name.contains("api_key") || name == "key" || name.ends_with("_key")
+}
+pub(super) fn query_secret_name(name: &str) -> bool {
+    let normalized = name.to_ascii_lowercase().replace('-',"_");
+    secret_name(name) || matches!(normalized.as_str(),"apikey"|"token"|"access_token"|"secret"|"password"|"sig"|"signature")
 }
 #[derive(Clone, Default)]
 pub struct Sanitizer { secrets: Vec<String> }
@@ -69,11 +73,32 @@ impl Sanitizer {
                 *text = self.text(text);
             }
             Value::Array(values) => for value in values { self.value(value); },
-            Value::Object(object) => for (name,value) in object {
-                if secret_name(name) { *value = json!("[REDACTED]"); } else { self.value(value); }
+            Value::Object(object) => {
+                let original = std::mem::take(object);
+                for (name,mut value) in original {
+                    if secret_name(&name) { value = json!("[REDACTED]"); } else { self.value(&mut value); }
+                    let clean = self.text(&name);
+                    let mut key = clean.clone();
+                    let mut suffix = 1;
+                    while object.contains_key(&key) {
+                        key = format!("{clean}_{suffix}");
+                        suffix += 1;
+                    }
+                    object.insert(key,value);
+                }
             },
             _ => {}
         }
+    }
+    /// Decode before redacting, then re-encode so percent-escaped credentials cannot leak.
+    pub fn query(&self, query: &str) -> String {
+        let mut out = url::form_urlencoded::Serializer::new(String::new());
+        for (name,value) in url::form_urlencoded::parse(query.as_bytes()) {
+            let sensitive = query_secret_name(&name);
+            let value = if sensitive { "[REDACTED]".into() } else { self.text(&value) };
+            out.append_pair(&self.text(&name),&value);
+        }
+        out.finish()
     }
     pub fn headers(&self, headers: &HeaderMap) -> Value {
         let mut out = serde_json::Map::new();
@@ -132,7 +157,7 @@ pub async fn middleware(State(recorder): State<Recorder>, request: Request, next
         Err(_) => return crate::gateway::GatewayError::new(crate::gateway::ErrorKind::RequestTooLarge,"recorded request exceeds body limit").openai_response(),
     };
     let path = recorder.directory.join(format!("{}.json",uuid::Uuid::new_v4()));
-    let mut fixture = json!({"version":1,"route":parts.uri.path(),"query":parts.uri.query(),"method":parts.method.as_str(),
+    let mut fixture = json!({"version":1,"route":parts.uri.path(),"query":parts.uri.query().map(|query| recorder.sanitizer.query(query)),"method":parts.method.as_str(),
         "request_headers":recorder.sanitizer.headers(&parts.headers),"request_body":String::from_utf8_lossy(&body),
         "entries":[],"response_status":null,"response_headers":{},"response_body":"","complete":false});
     recorder.sanitizer.value(&mut fixture);
@@ -185,6 +210,29 @@ mod tests {
         assert!(!text.contains("sk-or-v1-") && !text.contains("private.invalid"));
     }
     #[test]
+    fn sanitizer_redacts_object_keys_without_losing_collisions() {
+        let sanitizer = Sanitizer::new(["secret-a".into(),"secret-b".into()]);
+        let mut value = json!({"secret-a":1,"secret-b":2,"[REDACTED]":3,"[REDACTED]_1":4,
+            "nested":"{\"secret-a\":\"kept\",\"secret-b\":\"also kept\"}"});
+        sanitizer.value(&mut value);
+        assert!(!value.to_string().contains("secret-a") && !value.to_string().contains("secret-b"));
+        let object = value.as_object().unwrap();
+        assert_eq!(object.len(),5);
+        for expected in [1,2,3,4] { assert!(object.values().any(|v| v == &json!(expected))); }
+        let nested:Value = serde_json::from_str(value["nested"].as_str().unwrap()).unwrap();
+        assert_eq!(nested.as_object().unwrap().len(),2);
+    }
+    #[test]
+    fn query_redacts_named_tokens_and_encoded_registered_values() {
+        let sanitizer = Sanitizer::new(["literal/value".into()]);
+        let query = sanitizer.query("key=a&api_key=b&apikey=c&token=d&access_token=e&secret=f&password=g&sig=h&signature=i&API-KEY=j&safe=literal%2Fvalue&literal%2Fvalue=hidden&model=test&model=second");
+        let pairs:Vec<_> = url::form_urlencoded::parse(query.as_bytes()).collect();
+        assert!(pairs[..11].iter().all(|(_,value)| value == "[REDACTED]"));
+        assert!(!query.contains("literal") && pairs.iter().any(|(name,_)| name == "[REDACTED]"));
+        assert!(pairs.iter().any(|(name,value)| name == "model" && value == "test"));
+        assert!(pairs.iter().any(|(name,value)| name == "model" && value == "second"));
+    }
+    #[test]
     fn sanitizer_preserves_clean_sse_bytes_and_scrubs_key_fields() {
         let sanitizer = Sanitizer::default();
         let clean = "event: test\r\ndata: { \"text\": \"hi\" }\r\n\r\n";
@@ -210,7 +258,7 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let task = tokio::spawn(async move { axum::serve(listener,app).await.unwrap(); });
-        let mut request = format!("ws://{address}/ws").into_client_request().unwrap();
+        let mut request = format!("ws://{address}/ws?access_token=handshake-only&safe=literal%2Dkey&model=test").into_client_request().unwrap();
         request.headers_mut().insert("sec-websocket-protocol","realtime, openai-insecure-api-key.literal-key".parse().unwrap());
         request.headers_mut().insert("authorization","Bearer literal-key".parse().unwrap());
         let (mut socket,_) = tokio_tungstenite::connect_async(request).await.unwrap();
@@ -224,12 +272,48 @@ mod tests {
         }).await.unwrap();
         let path = std::fs::read_dir(directory.path()).unwrap().next().unwrap().unwrap().path();
         let text = std::fs::read_to_string(path).unwrap();
-        assert!(!text.contains("literal-key") && !text.contains("/home/"));
+        assert!(!text.contains("literal-key") && !text.contains("/home/") && !text.contains("handshake-only"));
         let fixture:Value = serde_json::from_str(&text).unwrap();
+        let query:Vec<_> = url::form_urlencoded::parse(fixture["query"].as_str().unwrap().as_bytes()).collect();
+        assert!(query.iter().any(|(name,value)| name == "access_token" && value == "[REDACTED]"));
+        assert!(query.iter().any(|(name,value)| name == "model" && value == "test"));
         assert_eq!(fixture["entries"][0]["entry"]["direction"],"client");
         assert_eq!(fixture["entries"][1]["entry"]["direction"],"server");
         assert_eq!(fixture["request_headers"]["sec-websocket-protocol"],"[REDACTED]");
         task.abort();
+    }
+    #[tokio::test]
+    async fn responses_websocket_records_client_and_every_server_text_frame() {
+        use futures::SinkExt;
+        use crate::gateway::{Gateway,ModelMap,testing::Scripted,turn::{TurnEvent,StopReason}};
+        let directory = tempfile::tempdir().unwrap();
+        let recorder = Recorder::new(directory.path().into(),Sanitizer::default()).unwrap();
+        let backend = Arc::new(Scripted::new(vec![vec![TurnEvent::TextDelta { text:"hello".into() },TurnEvent::Done { stop:StopReason::EndTurn }]]));
+        let app = crate::gateway::router(Arc::new(Gateway::new(backend.clone(),ModelMap::single("served-model"))))
+            .layer(axum::middleware::from_fn_with_state(recorder,middleware));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();let address=listener.local_addr().unwrap();
+        let task=tokio::spawn(async move { axum::serve(listener,app).await.unwrap(); });
+        let (mut socket,_) = tokio_tungstenite::connect_async(format!("ws://{address}/v1/responses")).await.unwrap();
+        let request=json!({"type":"response.create","model":"served-model","input":"hello","store":false}).to_string();
+        socket.send(tokio_tungstenite::tungstenite::Message::Text(request.clone())).await.unwrap();
+        let mut received=Vec::new();
+        loop {
+            let message=tokio::time::timeout(std::time::Duration::from_secs(3),socket.next()).await.unwrap().unwrap().unwrap();
+            let text=message.to_text().unwrap().to_string();let terminal=serde_json::from_str::<Value>(&text).unwrap()["type"] == "response.completed";
+            received.push(text);if terminal { break; }
+        }
+        socket.close(None).await.unwrap();drop(socket);
+        // Scripted retains whole requests, including the connection's Tape.
+        backend.seen.lock().unwrap().clear();
+        tokio::time::timeout(std::time::Duration::from_secs(3),async {
+            while std::fs::read_dir(directory.path()).unwrap().count()==0 { tokio::time::sleep(std::time::Duration::from_millis(10)).await; }
+        }).await.unwrap();
+        let path=std::fs::read_dir(directory.path()).unwrap().next().unwrap().unwrap().path();
+        let fixture:Value=serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        let frames:Vec<_>=fixture["entries"].as_array().unwrap().iter().filter(|e| e["kind"] == "websocket").collect();
+        assert_eq!(frames[0]["entry"]["direction"],"client");assert_eq!(frames[0]["entry"]["text"],request);
+        let recorded:Vec<_>=frames[1..].iter().map(|e| { assert_eq!(e["entry"]["direction"],"server");e["entry"]["text"].as_str().unwrap().to_string() }).collect();
+        assert_eq!(recorded,received);task.abort();
     }
     #[tokio::test]
     async fn recorder_tees_body_and_waits_for_tape_drop() {
@@ -241,11 +325,15 @@ mod tests {
             tape.record("upstream",|| json!({"request":{},"status":200,"body":"data: hello\n\n"}));
             "data: secret\n\ndata: /home/person/file\n\n"
         })).layer(axum::middleware::from_fn_with_state(recorder,middleware));
-        let response = app.oneshot(Request::builder().uri("/test").method("POST").header("authorization","Bearer secret").body(Body::from("hello")).unwrap()).await.unwrap();
+        let response = app.oneshot(Request::builder().uri("/test?password=http-only&safe=%73ecret&model=test").method("POST").header("authorization","Bearer secret").body(Body::from("hello")).unwrap()).await.unwrap();
         let body = to_bytes(response.into_body(),1024).await.unwrap();
         assert!(String::from_utf8_lossy(&body).contains("secret"));
         let path = std::fs::read_dir(directory.path()).unwrap().next().unwrap().unwrap().path();
         let fixture:Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        assert!(!fixture.to_string().contains("http-only"));
+        let query:Vec<_> = url::form_urlencoded::parse(fixture["query"].as_str().unwrap().as_bytes()).collect();
+        assert!(query.iter().any(|(name,value)| name == "password" && value == "[REDACTED]"));
+        assert!(query.iter().any(|(name,value)| name == "model" && value == "test"));
         assert_eq!(fixture["complete"],true);
         assert_eq!(fixture["entries"].as_array().unwrap().len(),2);
         assert!(!fixture.to_string().contains("/home/"));
