@@ -1,5 +1,5 @@
 //! Payload-free request accounting. The final handle emits without blocking.
-use axum::{body::{Body, Bytes}, extract::{Request, State}, http::{HeaderMap, HeaderValue}, middleware::Next, response::Response};
+use axum::{body::{Body, Bytes}, extract::{Request, State}, http::HeaderMap, middleware::Next, response::Response};
 use http_body::{Body as _, Frame, SizeHint};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -132,7 +132,6 @@ pub async fn track(State(state): State<Middleware>, mut request: Request, next: 
         bench: client_kind(headers) == "bench", ..Record::default() }, state.sink.clone());
     request.extensions_mut().insert(scope.clone());
     let mut response = next.run(request).await;
-    response.headers_mut().insert("x-request-id", HeaderValue::from_str(scope.rid()).expect("UUID header"));
     if path == "/v1/stats" && response.status().is_success() {
         let (parts, body) = response.into_parts();
         match axum::body::to_bytes(body, 16 << 20).await {
@@ -171,6 +170,21 @@ mod tests {
         let sink = Arc::new(Sink(std::sync::Mutex::new(vec![]), Counters::default()));
         let scope = UsageScope::new(Record::default(), sink.clone()); let other = scope.clone(); drop(scope);
         assert!(sink.0.lock().unwrap().is_empty()); drop(other); assert_eq!(sink.0.lock().unwrap()[0].outcome, "cancelled");
+    }
+    #[tokio::test]
+    async fn stats_preserves_key_order_and_chat_response() {
+        use tower::ServiceExt;
+        let sink = Arc::new(Sink(std::sync::Mutex::new(vec![]), Counters::default()));
+        let bare = axum::Router::new().route("/v1/stats", axum::routing::get(|| async { "{\"z\":1,\"a\":2}" }))
+            .route("/v1/chat/completions", axum::routing::post(|| async { "chat bytes" }));
+        let app = bare.clone().layer(axum::middleware::from_fn_with_state(Middleware::new(sink), track));
+        let make = || axum::http::Request::post("/v1/chat/completions").body(Body::empty()).unwrap();
+        let baseline = bare.oneshot(make()).await.unwrap(); let result = app.clone().oneshot(make()).await.unwrap();
+        assert_eq!(baseline.headers(), result.headers());
+        assert_eq!(axum::body::to_bytes(baseline.into_body(),4096).await.unwrap(), axum::body::to_bytes(result.into_body(),4096).await.unwrap());
+        let response = app.oneshot(axum::http::Request::get("/v1/stats").body(Body::empty()).unwrap()).await.unwrap();
+        let bytes = axum::body::to_bytes(response.into_body(),4096).await.unwrap();
+        assert!(std::str::from_utf8(&bytes).unwrap().starts_with("{\"z\":1,\"a\":2,\"usage\":"));
     }
     #[test]
     fn labels_and_classifier() { assert_eq!(key_label("secret").len(), 10); let mut h = HeaderMap::new(); h.insert("user-agent", "codex_cli_rs/1".parse().unwrap()); assert_eq!(client_kind(&h), "codex"); }

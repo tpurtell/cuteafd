@@ -91,6 +91,23 @@ mod tests {
         assert_eq!(app.oneshot(axum::http::Request::get("/health").body(Body::empty()).unwrap())
             .await.unwrap().status(), StatusCode::SERVICE_UNAVAILABLE);
     }
+    #[tokio::test]
+    async fn usage_off_preserves_chat_headers_and_body() {
+        use axum::{body::Body, http::Request};
+        use tower::ServiceExt;
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        drop(rx);
+        let original = cuteafd_api::openai::router(tx);
+        let policy = ApiArgs { usage: Some("off".into()), ..Default::default() }.load().unwrap();
+        assert!(policy.usage.is_none());
+        let tracked = policy.app(original.clone(), cuteafd_api::openai::ConsoleHub::disabled());
+        let make = || Request::post("/v1/chat/completions").header("content-type", "application/json").body(Body::from("{}" )).unwrap();
+        let baseline = original.oneshot(make()).await.unwrap();
+        let result = tracked.oneshot(make()).await.unwrap();
+        assert_eq!(baseline.status(), result.status());
+        assert_eq!(baseline.headers(), result.headers());
+        assert_eq!(axum::body::to_bytes(baseline.into_body(), 4096).await.unwrap(), axum::body::to_bytes(result.into_body(), 4096).await.unwrap());
+    }
     #[test]
     fn every_family_accepts_api_policy_options() {
         use clap::Parser;
