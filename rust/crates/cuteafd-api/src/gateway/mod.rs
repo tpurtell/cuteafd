@@ -80,6 +80,8 @@ pub fn router(gateway: Arc<Gateway>) -> Router {
         .merge(responses::routes(gateway.clone()))
         .merge(realtime::routes(gateway.clone()))
         .merge(models_routes(gateway))
+        // Claude Code's connectivity probe; outside /v1, so no key needed.
+        .route("/api/hello", axum::routing::get(|| async { axum::http::StatusCode::OK }))
 }
 
 /// `GET /v1/models` and `GET /v1/models/{id}` in a shape both protocols
