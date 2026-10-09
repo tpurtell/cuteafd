@@ -398,7 +398,7 @@ pub fn plan(snapshot: &Path, options: &PlanOptions) -> Result<PlanReport, PlanEr
             let shards: BTreeSet<_> = tensors.values().cloned().collect();
             needed.extend(shards.iter().cloned());
             let unavailable = tensors.iter().filter(|(name, _)|
-                !checkpoint.tensors.iter().any(|tensor| &tensor.meta.name == *name))
+                checkpoint.tensors.binary_search_by(|tensor| tensor.meta.name.as_str().cmp(name.as_str())).is_err())
                 .map(|(tensor, shard)| Rejection { tensor: tensor.clone(), reason:
                     format!("role {role} lacks header for shard {shard} at snapshot {}", snapshot.display()) }).collect();
             report.role_readiness.push(RoleReadiness { role, required_shards: shards.into_iter().collect(), unavailable });

@@ -130,9 +130,10 @@ impl Checkpoint {
                 }
             };
             if let Some(role) = role {
+                let header_names: BTreeSet<_> = headers.iter().map(|meta| meta.name.as_str()).collect();
                 for (name, file) in &weight_map {
                     if file == shard && needed(name) {
-                        ensure!(headers.iter().any(|meta| &meta.name == name),
+                        ensure!(header_names.contains(name.as_str()),
                             "role {role} needs tensor {name} in shard {shard} at snapshot {}: header is missing",
                             snapshot.display());
                     }

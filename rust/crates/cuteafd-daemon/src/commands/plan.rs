@@ -88,6 +88,45 @@ pub(crate) fn run_plan(args: PlanArgs) -> Result<()> {
             .snapshot_path
             .with_context(|| format!("no snapshot of {} under {}", args.model, hf_home.display()))?
     };
+    if args.files || args.fetch || args.role.is_some() {
+        use cuteafd_loader::plan::files::{manifest_roles, ReadRole};
+        let parse = |name: &str| ReadRole::parse(name, options.placement, args.include_speculator);
+        let roles = if let Some(layout) = &args.file_layout {
+            anyhow::ensure!(args.role.is_none(), "--role and --file-layout are mutually exclusive");
+            let hosts: std::collections::BTreeMap<String, Vec<String>> =
+                serde_json::from_reader(std::fs::File::open(layout)?)?;
+            if let Some(host) = &args.host {
+                hosts.get(host).with_context(|| format!("host {host} is absent from {}", layout.display()))?
+                    .iter().map(|name| parse(name)).collect::<Result<Vec<_>>>()?
+            } else {
+                anyhow::ensure!(!args.fetch, "--file-layout --fetch needs --host");
+                let manifests = hosts.iter().map(|(host, names)| {
+                    let roles = names.iter().map(|name| parse(name)).collect::<Result<Vec<_>>>()?;
+                    Ok((host.clone(), manifest_roles(&snapshot, &roles)?))
+                }).collect::<Result<std::collections::BTreeMap<_, _>>>()?;
+                anyhow::ensure!(args.json, "all-host inventory needs --json; select --host for a plain file list");
+                println!("{}", serde_json::to_string_pretty(&manifests)?);
+                return Ok(());
+            }
+        } else {
+            anyhow::ensure!(args.host.is_none() || args.fetch, "--host needs --file-layout or --fetch");
+            vec![parse(args.role.as_deref().unwrap_or("coordinator"))?]
+        };
+        let manifest = manifest_roles(&snapshot, &roles)?;
+        if args.fetch {
+            transfer(&snapshot, &manifest, &args)?;
+        } else if args.files {
+            if args.json { println!("{}", serde_json::to_string_pretty(&manifest)?); }
+            else { for file in &manifest.files { println!("{}", file.path); } }
+        } else {
+            let mut headers = 0;
+            for role in &roles { headers += cuteafd_loader::plan::files::open_role(&snapshot, *role)?.tensors.len(); }
+            if args.json { println!("{}", serde_json::to_string_pretty(&manifest)?); }
+            else { println!("role {} HEADERS READY: {headers} tensor headers, {} required files",
+                manifest.role, manifest.files.len()); }
+        }
+        return Ok(());
+    }
     let report = if args.spark_ranks.is_some() { plan(&snapshot, &options)? }
         else { plan_preferred(&snapshot, &options)? };
     if args.json {
@@ -100,6 +139,110 @@ pub(crate) fn run_plan(args: PlanArgs) -> Result<()> {
     }
     if args.require_ready && !report.executable() {
         anyhow::bail!("{} is not servable by this build", args.model);
+    }
+    Ok(())
+}
+
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+fn transfer(snapshot: &std::path::Path, manifest: &cuteafd_loader::plan::files::FileManifest,
+    args: &PlanArgs) -> Result<()> {
+    use anyhow::ensure;
+    use std::io::Write;
+    use std::process::Command;
+    let destination = args.destination.as_ref().context("--fetch needs --destination")?;
+    ensure!(destination.is_absolute(), "destination must be an absolute snapshot directory");
+    let host = args.host.as_deref();
+    if let Some(host) = host {
+        ensure!(!host.starts_with('-') && host.bytes().all(|c| c.is_ascii_alphanumeric() || b"._-@".contains(&c)),
+            "invalid SSH host {host}");
+    }
+    let available = |program: &str| Command::new("sh").args(["-c", &format!("command -v {program} >/dev/null")])
+        .status().is_ok_and(|s| s.success());
+    let remote_rdma = host.is_none() || Command::new("ssh").args([
+        host.unwrap_or_default(), "command -v rdmasync >/dev/null"])
+        .status().is_ok_and(|s| s.success());
+    let program = if host.is_some() && available("rdmasync") && remote_rdma { "rdmasync" } else {
+        eprintln!("warning: rdmasync unavailable on both ends; using rsync over SSH/local transport");
+        "rsync"
+    };
+    let mut selected = Vec::new();
+    let mut bytes = 0u64;
+    for file in &manifest.files {
+        ensure!(!file.path.contains(['\n', '\r']) && !std::path::Path::new(&file.path).is_absolute()
+            && std::path::Path::new(&file.path).components().all(|c| matches!(c, std::path::Component::Normal(_))),
+            "unsafe file-list path {}", file.path);
+        let source_bytes = file.bytes.with_context(|| format!("source {} lacks {}", snapshot.display(), file.path))?;
+        let target = destination.join(&file.path);
+        let existing = if let Some(host) = host {
+            let output = Command::new("ssh").args([host, &format!("stat -Lc %s -- {} 2>/dev/null || true",
+                shell_quote(&target.display().to_string()))]).output()?;
+            ensure!(output.status.success(), "host {host}: failed to inspect {}", file.path);
+            String::from_utf8(output.stdout)?.trim().parse::<u64>().ok()
+        } else { target.metadata().ok().filter(|m| m.is_file()).map(|m| m.len()) };
+        if args.force || existing != Some(source_bytes) {
+            bytes = bytes.checked_add(source_bytes).context("transfer bytes overflow")?;
+            selected.push(file);
+        }
+    }
+    let list = selected.iter().map(|file| format!("{}\n", file.path)).collect::<String>();
+    let src = format!("{}/", snapshot.display());
+    let dest = host.map_or_else(|| format!("{}/", destination.display()),
+        |host| format!("{host}:{}/", destination.display()));
+    let list_arg = "--files-from=-";
+    let mut command = Command::new(program);
+    // -L materializes HF blob symlinks as ordinary snapshot files accepted by
+    // every loader. Never retain links pointing outside the destination cache.
+    command.args(["-aL", "--info=progress2", "--protect-args", list_arg]);
+    if args.force { command.arg("--ignore-times"); }
+    else { command.arg("--size-only"); }
+    command.args([&src, &dest]);
+    eprintln!("host {}: {} files, {bytes} bytes", host.unwrap_or("local"), selected.len());
+    if args.dry_run {
+        let rendered = std::iter::once(program.to_string()).chain(command.get_args().map(|a| shell_quote(&a.to_string_lossy())))
+            .collect::<Vec<_>>().join(" ");
+        println!("{rendered}");
+        for file in &selected { println!("{}\t{}", file.bytes.unwrap_or_default(), file.path); }
+        return Ok(());
+    }
+    if host.is_none() { std::fs::create_dir_all(destination)?; }
+    if let Some(host) = host {
+        let status = Command::new("ssh").args([host, &format!("mkdir -p -- {}", shell_quote(&destination.display().to_string()))]).status()?;
+        ensure!(status.success(), "host {host}: cannot create snapshot destination");
+    }
+    let mut child = command.stdin(std::process::Stdio::piped()).spawn()
+        .with_context(|| format!("starting {program} for host {}", host.unwrap_or("local")))?;
+    child.stdin.take().context("transfer list stdin")?.write_all(list.as_bytes())?;
+    let status = child.wait()?;
+    ensure!(status.success(), "host {} transfer failed ({status}); files: {:?}", host.unwrap_or("local"),
+        selected.iter().map(|f| &f.path).collect::<Vec<_>>());
+    for file in &manifest.files {
+        let target = destination.join(&file.path);
+        let actual = if let Some(host) = host {
+            let output = Command::new("ssh").args([host, &format!("stat -Lc %s -- {}", shell_quote(&target.display().to_string()))]).output()?;
+            ensure!(output.status.success(), "host {host}: missing {} after copy", file.path);
+            String::from_utf8(output.stdout)?.trim().parse::<u64>()?
+        } else { target.metadata().with_context(|| format!("local: missing {} after copy", file.path))?.len() };
+        ensure!(Some(actual) == file.bytes, "host {}: {} size {actual}, expected {:?}", host.unwrap_or("local"), file.path, file.bytes);
+    }
+    if destination.parent().and_then(|p| p.file_name()).is_some_and(|name| name == "snapshots") {
+        let refs = destination.parent().and_then(|p| p.parent()).context("HF cache root")?.join("refs");
+        let revision = destination.file_name().context("snapshot revision")?.to_string_lossy();
+        if let Some(host) = host {
+            let reference = shell_quote(&refs.join("main").display().to_string());
+            let script = format!("mkdir -p -- {} && {{ test -e {reference} || (set -C; printf '%s\\n' {} > {reference}); }}",
+                shell_quote(&refs.display().to_string()), shell_quote(&revision));
+            ensure!(Command::new("ssh").args([host, &script]).status()?.success(), "host {host}: cannot create refs/main");
+        } else {
+            std::fs::create_dir_all(&refs)?;
+            match std::fs::OpenOptions::new().write(true).create_new(true).open(refs.join("main")) {
+                Ok(mut file) => writeln!(file, "{revision}")?,
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {},
+                Err(error) => return Err(error.into()),
+            }
+        }
     }
     Ok(())
 }
@@ -123,6 +266,8 @@ mod tests {
             spark_budget_gib: 100.0,
             coordinator_weight_budget_gib: 80.0,
             json: true,
+            files: false, role: None, host: None, file_layout: None, fetch: false, destination: None,
+            dry_run: false, force: false, include_speculator: false,
             require_ready,
             layout: true,
             rtx: 2,
@@ -152,6 +297,37 @@ mod tests {
             native_mtp_layers: 3,
             workspace_manifest: None,
         }
+    }
+
+    #[test]
+    fn files_cli_and_local_transfer_skip_matching_sizes_without_deleting() {
+        use clap::Parser;
+        let source = tempfile::tempdir().unwrap();
+        let destination = tempfile::tempdir().unwrap();
+        std::fs::write(source.path().join("config.json"), b"config").unwrap();
+        std::fs::write(destination.path().join("keep.txt"), b"keep").unwrap();
+        let manifest = cuteafd_loader::plan::files::FileManifest {
+            role: "coordinator".into(), snapshot: source.path().display().to_string(),
+            repo_id: None, revision: None, files: vec![cuteafd_loader::plan::files::RequiredFile {
+                path: "config.json".into(), bytes: Some(6) }], total_bytes: Some(6) };
+        let mut args = args(source.path(), 4, false);
+        args.fetch = true;
+        args.destination = Some(destination.path().into());
+        if std::process::Command::new("rsync").arg("--version").output().is_ok() {
+            transfer(source.path(), &manifest, &args).unwrap();
+            assert_eq!(std::fs::read(destination.path().join("config.json")).unwrap(), b"config");
+            std::fs::write(destination.path().join("config.json"), b"custom").unwrap();
+            transfer(source.path(), &manifest, &args).unwrap();
+            assert_eq!(std::fs::read(destination.path().join("config.json")).unwrap(), b"custom");
+            args.force = true;
+            transfer(source.path(), &manifest, &args).unwrap();
+            assert_eq!(std::fs::read(destination.path().join("config.json")).unwrap(), b"config");
+            assert_eq!(std::fs::read(destination.path().join("keep.txt")).unwrap(), b"keep");
+        }
+        let cli = crate::cli::Cli::try_parse_from(["cuteafd", "plan", "/not-read", "--files",
+            "--role", "spark0", "--spark-ranks", "4"]).unwrap();
+        let crate::cli::Commands::Plan(args) = cli.command else { unreachable!() };
+        assert!(args.files && args.role.as_deref() == Some("spark0"));
     }
 
     #[test]

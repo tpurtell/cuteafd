@@ -79,13 +79,22 @@ pub struct RequiredFile {
 pub struct FileManifest {
     pub role: String,
     pub snapshot: String,
+    pub repo_id: Option<String>,
+    pub revision: Option<String>,
     pub files: Vec<RequiredFile>,
     pub total_bytes: Option<u64>,
 }
 
 pub fn manifest(snapshot: &Path, role: ReadRole) -> Result<FileManifest> {
+    manifest_roles(snapshot, &[role])
+}
+
+/// A host's file list is the union of the processes it runs, never a shard split.
+pub fn manifest_roles(snapshot: &Path, roles: &[ReadRole]) -> Result<FileManifest> {
+    ensure!(!roles.is_empty(), "a file inventory needs at least one role");
     let inventory = Checkpoint::inventory(snapshot)?;
-    let tensors = required_tensors(&inventory, role)?;
+    let mut tensors = BTreeSet::new();
+    for role in roles { tensors.extend(required_tensors(&inventory, *role)?); }
     let mut files: BTreeSet<String> = tensors.iter().filter_map(|name| inventory.weight_map.get(name).cloned()).collect();
     for entry in std::fs::read_dir(snapshot)? {
         let entry = entry?;
@@ -100,7 +109,13 @@ pub fn manifest(snapshot: &Path, role: ReadRole) -> Result<FileManifest> {
         RequiredFile { path, bytes }
     }).collect();
     let total_bytes = files.iter().try_fold(0u64, |total, file| total.checked_add(file.bytes?));
-    Ok(FileManifest { role: role.label(), snapshot: snapshot.display().to_string(), files, total_bytes })
+    let cache_repo = snapshot.parent().filter(|p| p.file_name().is_some_and(|n| n == "snapshots"))
+        .and_then(|p| p.parent());
+    let repo_id = cache_repo.and_then(|p| p.file_name()).and_then(|n| n.to_str())
+        .and_then(|name| name.strip_prefix("models--")).map(|name| name.replace("--", "/"));
+    let revision = cache_repo.and_then(|_| snapshot.file_name()).and_then(|n| n.to_str()).map(str::to_owned);
+    Ok(FileManifest { role: roles.iter().map(|r| r.label()).collect::<Vec<_>>().join(", "),
+        snapshot: snapshot.display().to_string(), repo_id, revision, files, total_bytes })
 }
 
 #[cfg(test)]
@@ -137,8 +152,17 @@ mod tests {
             .unwrap_err().to_string();
         assert!(mtp.contains("model.mtp.layers.0.eh_proj.weight") && mtp.contains("mtp.safetensors"));
         write_safetensors(&dir.path().join("experts.safetensors"), &experts);
-        let spark = open_role(dir.path(), ReadRole::Spark { rank: 0, world: 4 }).unwrap();
+        let spark_role = ReadRole::Spark { rank: 0, world: 4 };
+        let spark = open_role(dir.path(), spark_role).unwrap();
         assert_eq!(spark.tensors.len(), experts.len());
+        let union = manifest_roles(dir.path(), &[role, spark_role]).unwrap();
+        let listed: BTreeSet<_> = union.files.iter().map(|f| f.path.as_str()).collect();
+        assert!(listed.contains("coordinator.safetensors") && listed.contains("experts.safetensors"));
+        assert!(!listed.contains("mtp.safetensors") && !listed.contains("vision.safetensors"));
+        for tensor in opened.tensors.iter().chain(&spark.tensors) {
+            assert!(listed.contains(tensor.shard.as_str()), "loader opened an unlisted shard");
+        }
+        assert!(listed.contains("config.json") && listed.contains("model.safetensors.index.json"));
         std::fs::remove_file(dir.path().join("coordinator.safetensors")).unwrap();
         assert!(open_role(dir.path(), ReadRole::Spark { rank: 3, world: 4 }).is_ok());
         let error = open_role(dir.path(), role).unwrap_err().to_string();
