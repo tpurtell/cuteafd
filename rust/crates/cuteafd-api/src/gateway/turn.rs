@@ -153,6 +153,9 @@ pub struct TurnRequest {
     pub modalities: Modalities,
     /// The session this turn belongs to, when the front end has one.
     pub session: Option<super::session::SessionId>,
+    /// Traffic recording for this turn (front ends copy the request's tape).
+    #[serde(skip)]
+    pub tape: super::record::Tape,
 }
 
 /// Why generation stopped.
