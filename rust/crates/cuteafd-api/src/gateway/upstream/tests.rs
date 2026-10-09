@@ -34,6 +34,21 @@ fn chat_mapping_preserves_reasoning_tools_images_and_controls() {
     assert!(request.get("thinking").is_none());
 }
 #[test]
+fn namespaced_tools_use_legal_wire_names_consistently() {
+    let mut turn = turn();
+    turn.tools.push(ToolSpec { name:"functions.apply_patch".into(),description:None,parameters:json!({"type":"object"}),strict:false });
+    turn.tool_choice = ToolChoice::Named { name:"functions.apply_patch".into() };
+    turn.items.push(Item::ToolCall { id:"call".into(),name:"functions.apply_patch".into(),arguments:"{}".into() });
+    for flavor in [Flavor::OpenaiChat,Flavor::Anthropic] {
+        let request = backend(flavor).map_request(&turn).unwrap();
+        let name = mapping::wire_name("functions.apply_patch");
+        assert!(name.len() <= 64 && !name.contains('.'));
+        let wire = request.to_string();
+        assert!(!wire.contains("functions.apply_patch"));
+        assert!(wire.contains(&name));
+    }
+}
+#[test]
 fn deepseek_quirks_are_opt_in_and_reject_forced_thinking_tools() {
     let mut config = UpstreamConfig::new("http://localhost/v1", Flavor::OpenaiChat,"test-model");
     config.deepseek_thinking = true;
@@ -136,6 +151,49 @@ async fn models_metadata_is_discovered_and_missing_listing_is_nonfatal() {
     assert!(upstream.capabilities().vision);
     assert_eq!(upstream.models()[0].context_tokens,Some(1000));
     task.abort();
+}
+/// Explicit opt-in capture: fixed DeepSeek endpoints, invented prompts loaded only from scratch.
+#[tokio::test]
+#[ignore = "paid DeepSeek capture; requires keys and scratch cases"]
+async fn capture_deepseek_scratch_fixtures() {
+    use crate::gateway::record::{Sanitizer, TapeSink};
+    #[derive(Default)]
+    struct Collector(std::sync::Mutex<Vec<Value>>);
+    impl TapeSink for Collector {
+        fn record(&self, kind:&str, entry:Value) { self.0.lock().unwrap().push(json!({"kind":kind,"entry":entry})); }
+    }
+    fn merge(target:&mut Value, patch:&Value) {
+        if let (Some(target),Some(patch)) = (target.as_object_mut(),patch.as_object()) {
+            for (key,value) in patch { if value.is_object() && target.get(key).is_some_and(Value::is_object) { merge(target.get_mut(key).unwrap(),value); } else { target.insert(key.clone(),value.clone()); } }
+        }
+    }
+    let key = std::env::var("DEEPSEEK_API_KEY").expect("DeepSeek key must be set");
+    let cases:Vec<Value> = serde_json::from_slice(&std::fs::read("/home/tj/.cache/cuteafd/builds/api-gateway/scratch/upstream-cases.json").unwrap()).unwrap();
+    let directory = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/gateway/upstream");
+    std::fs::create_dir_all(&directory).unwrap();
+    let sanitizer = Sanitizer::from_env([]);
+    for case in cases {
+        let flavor:Flavor = case["flavor"].as_str().unwrap().parse().unwrap();
+        let mut value = serde_json::to_value(TurnRequest::default()).unwrap();
+        merge(&mut value,&case["turn"]);
+        let mut turn:TurnRequest = serde_json::from_value(value).unwrap();
+        let collector = Arc::new(Collector::default());
+        turn.tape = Tape(Some(collector.clone()));
+        let mut config = UpstreamConfig::new(match flavor { Flavor::OpenaiChat => "https://api.deepseek.com",Flavor::Anthropic => "https://api.deepseek.com/anthropic" },flavor,turn.model.clone());
+        config.key = Some(key.clone());
+        config.deepseek_thinking = case["thinking"].as_bool().unwrap();
+        let upstream = Upstream::new(config).unwrap();
+        let result = match upstream.start(turn.clone()).await {
+            Ok(stream) => stream.collect::<Vec<_>>().await.into_iter().collect::<Result<Vec<_>,_>>(),
+            Err(error) => Err(error),
+        };
+        let mut fixture = json!({"version":1,"flavor":flavor.name(),"deepseek_thinking":case["thinking"],"turn":turn,
+            "entries":collector.0.lock().unwrap().clone()});
+        match result { Ok(events) => fixture["expected_events"] = json!(events), Err(error) => { fixture["expected_error_status"] = json!(error.status()); } }
+        sanitizer.value(&mut fixture);
+        std::fs::write(directory.join(format!("{}.json",case["name"].as_str().unwrap())),serde_json::to_vec_pretty(&fixture).unwrap()).unwrap();
+        println!("captured {}",case["name"]);
+    }
 }
 #[tokio::test]
 async fn dropping_turn_stream_closes_http_body() {

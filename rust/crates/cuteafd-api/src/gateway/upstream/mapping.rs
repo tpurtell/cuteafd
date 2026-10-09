@@ -6,6 +6,14 @@ pub(super) fn request(turn: &TurnRequest, config: &UpstreamConfig) -> Result<Val
     if turn.modalities.audio_out { return Err(GatewayError::unsupported("upstream audio output is not implemented")); }
     match config.flavor { Flavor::OpenaiChat => chat(turn, config), Flavor::Anthropic => anthropic(turn, config) }
 }
+/// Preserve standard tool names; encode namespace/custom names deterministically without collisions with plain names.
+pub(super) fn wire_name(name: &str) -> String {
+    if !name.is_empty() && name.len() <= 64 && !name.starts_with("cf_")
+        && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-') { return name.to_string(); }
+    use sha2::{Digest, Sha256};
+    let hash = format!("{:x}",Sha256::digest(name.as_bytes()));
+    format!("cf_{}",&hash[..60])
+}
 fn role(role: Role) -> &'static str { match role { Role::User => "user", Role::Assistant => "assistant", Role::System => "system" } }
 fn parts(content: &[Part], flavor: Flavor) -> Result<Value, GatewayError> {
     let mut out = Vec::new();
@@ -45,7 +53,7 @@ fn assistant(messages: &mut Vec<Value>) -> &mut Value {
 fn add_chat_call(messages: &mut Vec<Value>, id: &str, name: &str, arguments: &str) {
     let message = assistant(messages);
     if !message["tool_calls"].is_array() { message["tool_calls"] = json!([]); }
-    message["tool_calls"].as_array_mut().unwrap().push(json!({"id":id,"type":"function","function":{"name":name,"arguments":arguments}}));
+    message["tool_calls"].as_array_mut().unwrap().push(json!({"id":id,"type":"function","function":{"name":wire_name(name),"arguments":arguments}}));
 }
 fn chat(turn: &TurnRequest, config: &UpstreamConfig) -> Result<Value, GatewayError> {
     let mut messages = Vec::new();
@@ -68,13 +76,13 @@ fn chat(turn: &TurnRequest, config: &UpstreamConfig) -> Result<Value, GatewayErr
     let mut request = json!({"model":turn.model,"messages":messages,"stream":true,"stream_options":{"include_usage":true}});
     if !turn.tools.is_empty() {
         request["tools"] = json!(turn.tools.iter().map(|tool| {
-            let mut function = json!({"name":tool.name,"parameters":tool.parameters});
+            let mut function = json!({"name":wire_name(&tool.name),"parameters":tool.parameters});
             if let Some(description) = &tool.description { function["description"] = json!(description); }
             if tool.strict { function["strict"] = json!(true); }
             json!({"type":"function","function":function})
         }).collect::<Vec<_>>());
         request["tool_choice"] = match &turn.tool_choice { ToolChoice::Auto => json!("auto"), ToolChoice::None => json!("none"),
-            ToolChoice::Required => json!("required"), ToolChoice::Named { name } => json!({"type":"function","function":{"name":name}}) };
+            ToolChoice::Required => json!("required"), ToolChoice::Named { name } => json!({"type":"function","function":{"name":wire_name(name)}}) };
         if let Some(parallel) = turn.parallel_tool_calls { request["parallel_tool_calls"] = json!(parallel); }
     }
     let thinking = turn.reasoning.enabled.unwrap_or(config.deepseek_thinking);
@@ -117,19 +125,19 @@ fn anthropic(turn: &TurnRequest, config: &UpstreamConfig) -> Result<Value, Gatew
             }
             Item::ToolCall { id, name, arguments } => {
                 let input: Value = serde_json::from_str(arguments).map_err(|_| GatewayError::invalid("tool call arguments must be JSON"))?;
-                append_block(&mut messages, "assistant", json!({"type":"tool_use","id":id,"name":name,"input":input}));
+                append_block(&mut messages, "assistant", json!({"type":"tool_use","id":id,"name":wire_name(name),"input":input}));
             }
             Item::ToolResult { call_id, content, is_error } => append_block(&mut messages, "user", json!({"type":"tool_result","tool_use_id":call_id,"content":parts(content, Flavor::Anthropic)?,"is_error":is_error})),
-            Item::ServerToolCall { id, name, input } => append_block(&mut messages, "assistant", json!({"type":"tool_use","id":id,"name":name,"input":input})),
+            Item::ServerToolCall { id, name, input } => append_block(&mut messages, "assistant", json!({"type":"tool_use","id":id,"name":wire_name(name),"input":input})),
             Item::ServerToolResult { call_id, output, .. } => append_block(&mut messages, "user", json!({"type":"tool_result","tool_use_id":call_id,"content":output.to_string()})),
         }
     }
     let mut request = json!({"model":turn.model,"messages":messages,"stream":true,"max_tokens":turn.max_output_tokens.unwrap_or(4096)});
     if !system.is_empty() { request["system"] = json!(system); }
     if !turn.tools.is_empty() {
-        request["tools"] = json!(turn.tools.iter().map(|t| json!({"name":t.name,"description":t.description.clone().unwrap_or_default(),"input_schema":t.parameters})).collect::<Vec<_>>());
+        request["tools"] = json!(turn.tools.iter().map(|t| json!({"name":wire_name(&t.name),"description":t.description.clone().unwrap_or_default(),"input_schema":t.parameters})).collect::<Vec<_>>());
         request["tool_choice"] = match &turn.tool_choice { ToolChoice::Auto => json!({"type":"auto"}), ToolChoice::None => json!({"type":"none"}),
-            ToolChoice::Required => json!({"type":"any"}), ToolChoice::Named { name } => json!({"type":"tool","name":name}) };
+            ToolChoice::Required => json!({"type":"any"}), ToolChoice::Named { name } => json!({"type":"tool","name":wire_name(name)}) };
         if let Some(parallel) = turn.parallel_tool_calls { request["tool_choice"]["disable_parallel_tool_use"] = json!(!parallel); }
     }
     if let Some(enabled) = turn.reasoning.enabled {

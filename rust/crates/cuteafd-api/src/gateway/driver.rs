@@ -103,8 +103,8 @@ pub(super) async fn run(gateway: Arc<Gateway>, mut turn: TurnRequest) -> Result<
                     serde_json::json!({"error": "invalid_input"})
                 } else {
                     total.web_search_requests += 1;
-                    match provider.search(SearchQuery { query, allowed_domains: spec.allowed_domains.clone(),
-                        blocked_domains: spec.blocked_domains.clone(), max_results: 5 }).await {
+                    match provider.search_with_tape(SearchQuery { query, allowed_domains: spec.allowed_domains.clone(),
+                        blocked_domains: spec.blocked_domains.clone(), max_results: 5 }, turn.tape.clone()).await {
                         Ok(hits) => serde_json::json!({"results": hits}),
                         Err(error) => {
                             tracing::warn!(provider = provider.name(), %error, "hosted web search failed");

@@ -76,7 +76,7 @@ impl Upstream {
     fn request(&self, method: reqwest::Method, suffix: &str) -> reqwest::RequestBuilder {
         let request = self.client.request(method, self.endpoint(suffix));
         match self.config.flavor {
-            Flavor::OpenaiChat => self.config.key.as_ref().map_or(request.try_clone().expect("empty request"), |key| request.bearer_auth(key)),
+            Flavor::OpenaiChat => if let Some(key) = &self.config.key { request.bearer_auth(key) } else { request },
             Flavor::Anthropic => {
                 let request = request.header("anthropic-version", "2023-06-01");
                 if let Some(key) = &self.config.key { request.header("x-api-key", key) } else { request }
@@ -128,7 +128,15 @@ impl Backend for Upstream {
                 recording.push(&body);
                 return Err(http_error(status));
             }
-            let mut stream = sse::events(response.bytes_stream(), this.config.flavor, recording);
+            let names: std::collections::HashMap<String,String> = turn.tools.iter()
+                .map(|tool| (mapping::wire_name(&tool.name),tool.name.clone())).collect();
+            let mut stream = sse::events(response.bytes_stream(), this.config.flavor, recording).map(move |event| {
+                event.map(|event| match event {
+                    super::turn::TurnEvent::ToolCallStart { index,id,name } => super::turn::TurnEvent::ToolCallStart {
+                        index,id,name:names.get(&name).cloned().unwrap_or(name) },
+                    other => other,
+                })
+            });
             // Await a meaningful event before committing the client HTTP response.
             let first = stream.next().await.transpose()?.ok_or_else(|| GatewayError::upstream("empty upstream stream"))?;
             Ok(Box::pin(futures::stream::once(async { Ok(first) }).chain(stream)) as TurnStream)

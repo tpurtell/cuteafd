@@ -8,6 +8,10 @@ use std::sync::Arc;
 use axum::{extract::FromRequestParts, http::request::Parts};
 use serde_json::Value;
 
+mod recorder;
+pub mod replay;
+pub use recorder::{middleware, Recorder, Sanitizer};
+
 /// Receives sanitized entries for one client exchange.
 pub trait TapeSink: Send + Sync + 'static {
     /// `kind` names the entry (`upstream`, `search`, ...); `entry` must
@@ -20,6 +24,10 @@ pub struct Tape(pub Option<Arc<dyn TapeSink>>);
 
 impl Tape {
     pub fn is_recording(&self) -> bool { self.0.is_some() }
+    /// WebSocket frontend hook; the sink sanitizes frame text before persistence.
+    pub fn frame(&self, direction: &str, text: &str) {
+        self.record("websocket", || serde_json::json!({"direction":direction,"text":text}));
+    }
     pub fn record(&self, kind: &str, entry: impl FnOnce() -> Value) {
         if let Some(sink) = &self.0 { sink.record(kind, entry()); }
     }

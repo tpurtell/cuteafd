@@ -34,10 +34,25 @@ pub struct SearchHit {
     pub published: Option<String>,
 }
 
+mod providers;
+pub use providers::{Exa, Searxng};
+
 pub trait SearchProvider: Send + Sync + 'static {
     /// `exa`, `searxng`, ...
     fn name(&self) -> &str;
     fn search(&self, query: SearchQuery) -> BoxFuture<'static, Result<Vec<SearchHit>, GatewayError>>;
+    /// Default keeps existing providers compatible; concrete HTTP providers record raw exchanges.
+    fn search_with_tape(&self, query: SearchQuery, tape: super::record::Tape) -> BoxFuture<'static, Result<Vec<SearchHit>, GatewayError>> {
+        let provider = self.name().to_string();
+        let request = serde_json::to_value(&query).unwrap_or_default();
+        let future = self.search(query);
+        Box::pin(async move {
+            let result = future.await;
+            tape.record("search", || serde_json::json!({"provider":provider,"query":request,
+                "hits":result.as_ref().ok(),"error":result.as_ref().err().map(|_| "unavailable")}));
+            result
+        })
+    }
 }
 
 /// The function tool the backend sees in place of the client's hosted tool.

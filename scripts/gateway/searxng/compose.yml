@@ -1,0 +1,15 @@
+# Start: docker compose -f scripts/gateway/searxng/compose.yml up -d
+# Stop:  docker compose -f scripts/gateway/searxng/compose.yml down
+# Gateway: --search searxng=http://127.0.0.1:18888
+# First set SEARXNG_SECRET (random >=32 bytes) in your environment.
+services:
+  searxng:
+    image: searxng/searxng@sha256:8c1e68e5b8eee8f5cdc6c4745df364b0c72269024a7a9b2a3ef34ee72b66e75e
+    container_name: cuteafd-gateway-searxng
+    ports:
+      - "127.0.0.1:18888:8080"
+    volumes:
+      - ./settings.yml:/etc/searxng/settings.yml:ro
+    environment:
+      SEARXNG_SECRET: ${SEARXNG_SECRET:?Set a random SEARXNG_SECRET}
+    restart: unless-stopped

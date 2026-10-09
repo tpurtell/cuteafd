@@ -655,6 +655,7 @@ dependencies = [
  "minijinja",
  "minijinja-contrib",
  "percent-encoding",
+ "regex",
  "reqwest",
  "serde",
  "serde_json",
@@ -737,6 +738,7 @@ dependencies = [
  "tower",
  "tracing",
  "tracing-subscriber",
+ "url",
 ]
 
 [[package]]
