@@ -367,6 +367,29 @@ mod tests {
     }
 
     #[test]
+    fn checkpoint_full_graphs_add_only_one_long_geometry() {
+        use super::*;
+        let pages = 2_097_152 / PAGE_ROWS;
+        let old = serving_graph_shapes(131_072, pages, 2051, 16, true);
+        let full = serving_graph_shapes(262_144, pages, 2051, 16, true);
+        assert_eq!(old.len(), 671);
+        assert_eq!(full.len(), 682);
+        assert!(old.iter().all(|key| full.contains(key)));
+        for allocated in [131_072usize, 262_144] {
+            for live in [1usize, 8192, 131_072, 131_073, 200_000, 262_144] {
+                if live > allocated { continue; }
+                let units = crate::shared::context::decode_allocation_units(
+                    allocated.div_ceil(UNIT_ROWS), live, UNIT_ROWS);
+                let pool_stride = units.next_power_of_two();
+                let geometry = GraphGeometry { pool_width: live.div_ceil(UNIT_ROWS).next_power_of_two()
+                    .min(pool_stride), pool_stride, page_stride: (units * UNIT_PAGES).next_power_of_two(),
+                    long: live > 2051 };
+                assert!(full.contains(&(64, true, geometry)), "{allocated}/{live}/{geometry:?}");
+            }
+        }
+    }
+
+    #[test]
     fn startup_geometries_cover_all_reachable_lengths_and_allocations() {
         use super::*;
         for (context, pages) in [(1, 4), (255, 4), (257, 8), (4096, 64), (8192, 128), (32768, 512), (8192, 100)] {
@@ -739,8 +762,6 @@ fn graph_geometries(context: usize, pages: usize, dense: usize) -> Vec<GraphGeom
     let pools = pages / UNIT_PAGES;
     let mut geometries = Vec::new();
     for units in 1..=context.div_ceil(UNIT_ROWS).min(pools) {
-        let pool_stride = units.next_power_of_two().min(pools);
-        let page_stride = (units * UNIT_PAGES).next_power_of_two().min(pages);
         let capacity = (units * UNIT_ROWS).min(context);
         let mut width = 1;
         while width / 2 * UNIT_ROWS < capacity {
@@ -748,6 +769,9 @@ fn graph_geometries(context: usize, pages: usize, dense: usize) -> Vec<GraphGeom
             let high = (width * UNIT_ROWS).min(capacity);
             for long in [false, true] {
                 if (!long && low <= high.min(dense)) || (long && low.max(dense + 1) <= high) {
+                    let live_units = crate::shared::context::decode_allocation_units(units, high, UNIT_ROWS);
+                    let pool_stride = live_units.next_power_of_two().min(pools);
+                    let page_stride = (live_units * UNIT_PAGES).next_power_of_two().min(pages);
                     let geometry = GraphGeometry { pool_width: width.min(pool_stride), page_stride, pool_stride, long };
                     if !geometries.contains(&geometry) { geometries.push(geometry); }
                 }
@@ -1496,10 +1520,12 @@ impl<'a> Qwen4Engine<'a> {
         let rows: usize = sequences.iter().map(|(_, t)| t.len()).sum();
         ensure!(rows > 0 && rows <= DECODE_ROWS, "decode step of {rows} rows");
         let mut tokens: Vec<u32> = sequences.iter().flat_map(|(_, t)| t.iter().copied()).collect();
-        let page_stride = sequences.iter().map(|(p, _)| p.pages.len()).max().unwrap_or(1).next_power_of_two()
-            .min(self.pages);
-        let pool_stride = sequences.iter().map(|(p, _)| p.pool_pages.len()).max().unwrap_or(1).next_power_of_two()
-            .min(self.pool_pages);
+        let live_tokens = sequences.iter().map(|(p, t)| p.len + t.len()).max().unwrap_or(1);
+        let allocated = |n, unit| crate::shared::context::decode_allocation_units(n, live_tokens, unit);
+        let page_stride = allocated(sequences.iter().map(|(p, _)| p.pages.len()).max().unwrap_or(1), PAGE_ROWS)
+            .next_power_of_two().min(self.pages);
+        let pool_stride = allocated(sequences.iter().map(|(p, _)| p.pool_pages.len()).max().unwrap_or(1), UNIT_ROWS)
+            .next_power_of_two().min(self.pool_pages);
         let mut tables = StepTables { decode: true, spec, page_stride, pool_stride, page_width: page_stride,
             ..Default::default() };
         for (placement, tokens) in sequences.iter_mut() {
@@ -1632,10 +1658,14 @@ impl<'a> Qwen4Engine<'a> {
         let mut tables = StepTables { decode, ..Default::default() };
         let mut hidden_rows = Vec::with_capacity(t);
         if decode {
-            let stride = |n: usize, total: usize| n.next_power_of_two().min(total);
-            tables.page_stride = stride(groups.iter().map(|g| g.placement.pages.len()).max().unwrap_or(1), self.pages);
+            let live_tokens = groups.iter().flat_map(|g| g.rows.iter().map(|row| row.position + 1))
+                .max().unwrap_or(1);
+            let stride = |n: usize, unit: usize, total: usize|
+                crate::shared::context::decode_allocation_units(n, live_tokens, unit).next_power_of_two().min(total);
+            tables.page_stride = stride(groups.iter().map(|g| g.placement.pages.len()).max().unwrap_or(1),
+                PAGE_ROWS, self.pages);
             tables.pool_stride = stride(groups.iter().map(|g| g.placement.pool_pages.len()).max().unwrap_or(1),
-                self.pool_pages);
+                UNIT_ROWS, self.pool_pages);
             tables.page_width = tables.page_stride;
         } else {
             ensure!(groups.len() == 1, "a prefill-shaped MTP step takes one sequence");

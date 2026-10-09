@@ -35,9 +35,30 @@ pub(crate) fn pool_context(family: &str, context: usize, automatic: bool, pool: 
     Ok(supported)
 }
 
+/// Preserve the established short-context allocation buckets, but do not key a
+/// long decode by unused pages reserved beyond its live power-of-two bucket.
+pub(crate) fn decode_allocation_units(allocated: usize, live_tokens: usize, unit: usize) -> usize {
+    allocated.min(live_tokens.max(131_072).div_ceil(unit).next_power_of_two())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn long_decode_allocations_follow_live_geometric_buckets() {
+        for unit in [64, 256] {
+            for tokens in [1usize, 8192, 131072] {
+                for allocation in [1usize, 17, 131072 / unit] {
+                    assert_eq!(decode_allocation_units(allocation, tokens, unit), allocation);
+                }
+            }
+            for (tokens, bucket) in [(131073usize, 262144), (200000, 262144),
+                (300000, 524288), (600000, 1048576)] {
+                assert_eq!(decode_allocation_units(1048576 / unit, tokens, unit), bucket / unit);
+            }
+        }
+    }
 
     #[test]
     fn every_family_zero_resolves_checkpoint_context_and_explicit_wins() {
@@ -75,6 +96,27 @@ mod tests {
             let mut bad = value.clone();
             bad["programs"][1]["params"]["indexed_width"] = 128.into();
             assert!(cuteafd_loader::serving_capacity::compiled_c128_width(&bad, family).is_err());
+        }
+    }
+
+    #[test]
+    fn every_indexed_family_clamps_old_exports_and_lifts_with_one_million() {
+        for (family, checkpoint) in [("deepseek_v4", 1048576), ("glm5", 1048576),
+            ("glm5_flash", 1048576), ("qwen4", 262144)] {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join("config.json"), serde_json::json!({
+                "max_position_embeddings": checkpoint }).to_string()).unwrap();
+            let path = dir.path().join("PROGRAMS.json");
+            for extent in [131072, 1048576] {
+                std::fs::write(&path, serde_json::json!({"capacities": {
+                    "max_context": extent }}).to_string()).unwrap();
+                let supported = extent.min(checkpoint);
+                assert_eq!(checkpoint_context(dir.path(), &path, family, 0).unwrap(), supported);
+                assert!(checkpoint_context(dir.path(), &path, family, supported + 1).is_err());
+                let limits = cuteafd_api::native_v41::NativeLimits::new(supported as u32, 1024).unwrap();
+                assert_eq!(limits.context(), supported as u32);
+                assert!(limits.output_for_prompt(supported + 1, 1).is_err());
+            }
         }
     }
 

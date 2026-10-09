@@ -678,6 +678,10 @@ pub fn layout(report: &mut PlanReport, model: &dyn super::FamilyModel, checkpoin
         let graph_allowance = if family == "deepseek_v41" && options.rtx_bytes[index] <= 32 * GIB {
             // Match the qualified fixed-bank envelope reserved by measured_pool_memory.
             2 * GIB
+        } else if family == "glm5" {
+            crate::families::glm5::GlmDsaConfig::from_hf(&checkpoint.config).ok()
+                .and_then(|cfg| crate::serving_capacity::glm_decode_graph_allowance(context_tokens as usize, cfg.layers).ok())
+                .unwrap_or(costs.graph_bytes[role]).max(costs.graph_bytes[role])
         } else { costs.graph_bytes[role] };
         match options.graph_budget_bytes.filter(|&budget| family == "glm5_flash"
             && (glmf_measured || budget > graph_allowance)) {
