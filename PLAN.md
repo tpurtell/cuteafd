@@ -1777,6 +1777,15 @@ TJ: two key items, both urgent right after v2.0.0.
      - then RTX expert layers, TP2 across both GPUs, with non-split items
        (drafter, encoders) moved to balance the two GPUs;
      - the planner equals the runtime admission, with a test per family.
+       Measured gaps to close (rc2 logs, `builds/qwen-vision-floor/`,
+       `builds/v4-small-extent/hardware/admission-comparison.json`): Qwen
+       local over-admits 5.35 GB (EXL3) / 6.72 GB (NVFP4), since the planner
+       charges a 512 MiB graph constant against a 5.0 GB runtime graph set
+       and omits 1.06 GB of NVFP4 package scratch; V4 Flash over-charges
+       ~84 MB (CUDA context/module estimate); MiMo graphs-on bound 664 MiB
+       vs 512 MiB planned; GLM Flash's startup graph set can exceed its
+       1.5 GiB allowance. The planner must share the runtime's graph-set
+       definition and package-scratch formulas instead of constants.
      - Spark ring admission exact per family: endpoint count (GLM Flash
        can open more than 2 prefill transports) and ingress dtype (MiMo's
        BF16 expert-input override, V4.1 NVFP4's BF16 rows) sized from the
