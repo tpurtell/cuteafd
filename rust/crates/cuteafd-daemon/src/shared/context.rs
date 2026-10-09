@@ -25,6 +25,22 @@ pub(crate) fn checkpoint_context(snapshot: &Path, manifest: &Path, family: &str,
     }
 }
 
+/// C128 index rows have the stride baked into the sparse MLA program, not the
+/// (possibly pool-clamped or explicitly smaller) serving context.
+pub(crate) fn compiled_c128_width(manifest: &serde_json::Value, family: &str) -> Result<usize> {
+    let programs = manifest["programs"].as_array().context("program manifest lacks programs")?;
+    let widths = programs.iter().filter(|p| p["family"].as_str() == Some(family)
+        && p["name"].as_str().is_some_and(|n| n.contains("_c128_m")))
+        .map(|p| p["params"]["indexed_width"].as_u64()
+            .context("C128 program lacks indexed_width")
+            .and_then(|n| Ok(usize::try_from(n)?)))
+        .collect::<Result<Vec<_>>>()?;
+    let width = *widths.first().context("program manifest lacks C128 sparse MLA programs")?;
+    ensure!(width > 0 && width % 64 == 0 && widths.iter().all(|&w| w == width),
+        "{family}: inconsistent compiled C128 index strides");
+    Ok(width)
+}
+
 pub(crate) fn pool_context(family: &str, context: usize, automatic: bool, pool: usize, unit: usize) -> Result<usize> {
     if context <= pool { return Ok(context); }
     ensure!(automatic, "{family}: explicit context {context} > admitted pool supports {pool}; set POOL_TOKENS/MAX_CONTEXT_TOKENS to change");
@@ -52,6 +68,29 @@ mod tests {
             assert_eq!(checkpoint_context(dir.path(), &manifest, family, 0).unwrap(), tokens);
             assert_eq!(checkpoint_context(dir.path(), &manifest, family, 32768).unwrap(), 32768);
             assert!(checkpoint_context(dir.path(), &manifest, family, tokens + 1).is_err());
+        }
+    }
+
+    #[test]
+    fn c128_stride_stays_compiled_when_pool_or_explicit_context_is_smaller() {
+        for family in ["dsv4f", "dsv4p"] {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join("config.json"), r#"{"max_position_embeddings":1048576}"#).unwrap();
+            let value = serde_json::json!({"capacities": {"max_context": 131072}, "programs": [
+                {"family": family, "name": format!("{family}_sparse_mla_decode_c128_m64"),
+                 "params": {"indexed_width": 1024}},
+                {"family": family, "name": format!("{family}_sparse_mla_prefill_c128_m4096"),
+                 "params": {"indexed_width": 1024}}
+            ]});
+            let path = dir.path().join("PROGRAMS.json");
+            std::fs::write(&path, value.to_string()).unwrap();
+            let full = checkpoint_context(dir.path(), &path, "deepseek_v4", 0).unwrap();
+            assert_eq!(pool_context("deepseek_v4", full, true, 32768, 256).unwrap(), 32512);
+            assert_eq!(checkpoint_context(dir.path(), &path, "deepseek_v4", 16384).unwrap(), 16384);
+            assert_eq!(compiled_c128_width(&value, family).unwrap(), 1024);
+            let mut bad = value.clone();
+            bad["programs"][1]["params"]["indexed_width"] = 128.into();
+            assert!(compiled_c128_width(&bad, family).is_err());
         }
     }
 
