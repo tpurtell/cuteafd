@@ -65,7 +65,26 @@ async fn messages(
         let (mut turn, streaming) = request::parse(&body(value)?, true)?;
         turn.tape = tape;
         let model = turn.requested_model.clone();
-        let stream = gateway.run(turn).await?;
+        let stream = if turn.max_output_tokens == Some(0) {
+            // Cache-prewarm requests must not send an unsupported zero output
+            // limit upstream. Counting is local/backend-dependent, not generation.
+            turn.max_output_tokens = None;
+            let input_tokens = gateway.count_tokens(turn).await?;
+            let events = vec![
+                Ok(super::turn::TurnEvent::Usage {
+                    usage: super::turn::Usage {
+                        input_tokens,
+                        ..Default::default()
+                    },
+                }),
+                Ok(super::turn::TurnEvent::Done {
+                    stop: super::turn::StopReason::MaxTokens,
+                }),
+            ];
+            Box::pin(futures::stream::iter(events)) as super::backend::TurnStream
+        } else {
+            gateway.run(turn).await?
+        };
         Ok::<_, GatewayError>((model, streaming, stream))
     }
     .await;

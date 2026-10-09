@@ -437,7 +437,13 @@ async fn truncated_tools_preserve_max_tokens_and_partial_object() {
                 index: 0,
                 arguments: arguments.into(),
             },
-            TurnEvent::ToolCallEnd { index: 0 },
+            TurnEvent::Usage {
+                usage: Usage {
+                    input_tokens: 12,
+                    output_tokens: 2,
+                    ..Default::default()
+                },
+            },
             done(StopReason::MaxTokens),
         ];
         let (app, _) = router(vec![script.clone(), script]);
@@ -454,6 +460,29 @@ async fn truncated_tools_preserve_max_tokens_and_partial_object() {
         );
         assert_eq!(events.last().unwrap()["type"], "message_stop");
     }
+}
+
+#[tokio::test]
+async fn zero_output_limit_counts_without_generation() {
+    let (app, backend) = router(vec![]);
+    let mut value = prompt(false);
+    value["max_tokens"] = json!(0);
+    let (status, _, body) = wire(app.clone(), request(value.clone())).await;
+    assert_eq!(status, StatusCode::OK);
+    let message: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(message["content"], json!([]));
+    assert_eq!(message["stop_reason"], "max_tokens");
+    assert_eq!(message["usage"]["output_tokens"], 0);
+    assert!(message["usage"]["input_tokens"].as_u64().unwrap() > 0);
+    value["stream"] = json!(true);
+    let (status, _, body) = wire(app, request(value)).await;
+    assert_eq!(status, StatusCode::OK);
+    let mut folded = fold(&frames(&body));
+    let mut message = message;
+    folded.as_object_mut().unwrap().remove("id");
+    message.as_object_mut().unwrap().remove("id");
+    assert_eq!(folded, message);
+    assert!(backend.requests.lock().unwrap().is_empty());
 }
 
 #[tokio::test]
