@@ -3189,8 +3189,33 @@ and `usage.server_tool_use.web_search_requests` is counted.
 4. Add MiMo audio input under Realtime, plus a `Transcriber` from the same
    encoder.
 
-Phase C covers TTS (a `Synthesizer`), Realtime audio output and the
-Home Assistant bridge.
+### Phase C: voice
+
+1. **TTS:** a `Synthesizer` behind Realtime audio output and
+   `audio/speech`.
+2. **Ephemeral client secrets:**
+   - `POST /v1/realtime/client_secrets` (GA) and `/v1/realtime/sessions`
+     (beta) mint short-lived `ek_` tokens. The server issues them, binds each
+     to the configured API key, and gives it a TTL, an optional pinned
+     session config, and a scope of Realtime only.
+   - The gateway auth accepts the token until it expires.
+   - Phase A returns an explicit unsupported error for both routes.
+3. **WebRTC transport,** or a recorded decision not to support it:
+   - It needs `POST /v1/realtime/calls` (SDP offer/answer), an ICE/DTLS-SRTP
+     stack such as webrtc-rs, Opus encode/decode, and a data channel carrying
+     the same event model.
+   - Together with item 2, it unlocks the official browser apps unmodified:
+     `openai-realtime-console` (WebRTC + `/realtime/calls` +
+     `client_secrets`) and `openai-realtime-agents` (Agents WebRTC +
+     `/realtime/sessions`). It also unlocks Agents JS's browser WebRTC
+     transport.
+   - Every headless client already works over WebSocket: openai-python,
+     openai-node, Agents JS/Python, Pipecat and LiveKit.
+4. **Home Assistant bridge:**
+   - Wyoming satellites → Realtime.
+   - HA `openai_stt_ha` speaks `?intent=transcription` and needs a real
+     `Transcriber`.
+   - `ha-openai-realtime` (Pipecat) needs its base URL exposed.
 
 ## First after rc3: per-key draft confidence calibration (TJ, 2026-10-09)
 
