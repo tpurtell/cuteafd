@@ -166,8 +166,11 @@ pub enum StopReason {
     MaxTokens,
     ToolUse,
     StopSequence { sequence: Option<String> },
-    /// The backend refused or filtered the content.
+    /// The model refused (Anthropic `refusal`).
     Refusal,
+    /// Output was stopped by a content filter (chat `finish_reason:
+    /// content_filter`, Responses `incomplete_details.reason: content_filter`).
+    ContentFilter,
     /// The client or session cancelled the turn.
     Cancelled,
     /// A long turn paused (Anthropic `pause_turn`, e.g. hosted-tool rounds

@@ -203,7 +203,7 @@ impl Response {
         let completed = error.is_none()
             && !matches!(
                 stop,
-                Some(StopReason::Cancelled | StopReason::MaxTokens | StopReason::Refusal)
+                Some(StopReason::Cancelled | StopReason::MaxTokens | StopReason::Refusal | StopReason::ContentFilter)
             );
         for i in 0..self.output.len() {
             events.extend(self.finish(i, completed));
@@ -223,7 +223,7 @@ impl Response {
                     "incomplete",
                     json!({"type":"incomplete","reason":"max_output_tokens"}),
                 ),
-                Some(StopReason::Refusal) => (
+                Some(StopReason::Refusal | StopReason::ContentFilter) => (
                     "incomplete",
                     json!({"type":"incomplete","reason":"content_filter"}),
                 ),
