@@ -86,28 +86,54 @@ pub fn router(gateway: Arc<Gateway>) -> Router {
 /// accept: OpenAI fields (`object`, `owned_by`, `created`) and Anthropic
 /// fields (`type`, `display_name`, `created_at`, paging) side by side.
 fn models_routes(gateway: Arc<Gateway>) -> Router {
-    use axum::{extract::{Path, State}, routing::get, Json};
+    use axum::{extract::{Path, Query, State}, http::HeaderMap, response::{IntoResponse, Response}, routing::get, Json};
+    #[derive(serde::Deserialize, Default)]
+    struct Page { limit: Option<usize>, before_id: Option<String>, after_id: Option<String> }
+    fn error_response(error: GatewayError, headers: &HeaderMap) -> Response {
+        anthropic::with_request_id(if headers.contains_key("anthropic-version") || headers.contains_key("x-api-key") {
+            error.anthropic_response()
+        } else { error.openai_response() })
+    }
     use serde_json::{json, Value};
     fn entry(model: &ModelInfo) -> Value {
         json!({"id": model.id, "object": "model", "type": "model", "display_name": model.id,
             "created": 0, "created_at": "1970-01-01T00:00:00Z", "owned_by": model.owned_by,
-            "context_window": model.context_tokens, "max_output_tokens": model.max_output_tokens})
+            "context_window": model.context_tokens, "max_output_tokens": model.max_output_tokens,
+            "max_input_tokens": model.context_tokens, "max_tokens": model.max_output_tokens,
+            "capabilities": null, "lifecycle": "active", "deprecated_at": null, "retires_at": null, "line": null})
     }
-    async fn list(State(gateway): State<Arc<Gateway>>) -> Json<Value> {
+    async fn list(State(gateway): State<Arc<Gateway>>, headers: HeaderMap, page: Result<Query<Page>, axum::extract::rejection::QueryRejection>) -> Response {
+        let page = match page { Ok(Query(page)) => page, Err(_) => return error_response(GatewayError::invalid("invalid model pagination parameters"), &headers) };
+        let limit = page.limit.unwrap_or(20);
+        if !(1..=1000).contains(&limit) || (page.before_id.is_some() && page.after_id.is_some()) {
+            return error_response(GatewayError::invalid("limit must be 1..1000; use before_id or after_id, not both"), &headers);
+        }
         let models = gateway.models.listing(&gateway.backend.models());
-        let data: Vec<Value> = models.iter().map(entry).collect();
-        Json(json!({"object": "list", "data": data, "has_more": false,
-            "first_id": models.first().map(|m| m.id.clone()), "last_id": models.last().map(|m| m.id.clone())}))
+        let (mut start, mut end) = (0, models.len());
+        if let Some(cursor) = page.after_id {
+            let Some(i) = models.iter().position(|m| m.id == cursor) else { return error_response(GatewayError::invalid("unknown after_id cursor"), &headers) };
+            start = i + 1;
+        }
+        let before = page.before_id.is_some();
+        if let Some(cursor) = page.before_id {
+            let Some(i) = models.iter().position(|m| m.id == cursor) else { return error_response(GatewayError::invalid("unknown before_id cursor"), &headers) };
+            end = i;
+        }
+        let has_more = end - start > limit;
+        if before { start = end.saturating_sub(limit).max(start); } else { end = (start + limit).min(end); }
+        let page = &models[start..end];
+        let data: Vec<Value> = page.iter().map(entry).collect();
+        anthropic::with_request_id(Json(json!({"object": "list", "data": data, "has_more": has_more,
+            "first_id": page.first().map(|m| m.id.clone()), "last_id": page.last().map(|m| m.id.clone())})).into_response())
     }
-    async fn one(State(gateway): State<Arc<Gateway>>, Path(id): Path<String>) -> axum::response::Response {
-        use axum::response::IntoResponse;
+    async fn one(State(gateway): State<Arc<Gateway>>, Path(id): Path<String>, headers: HeaderMap) -> Response {
         match gateway.models.resolve(&id) {
             Ok(served) => {
                 let listing = gateway.models.listing(&gateway.backend.models());
                 let base = listing.iter().find(|m| m.id == served).cloned().unwrap_or_else(|| listing[0].clone());
-                Json(entry(&ModelInfo { id, ..base })).into_response()
+                anthropic::with_request_id(Json(entry(&ModelInfo { id, ..base })).into_response())
             }
-            Err(error) => error.openai_response(),
+            Err(error) => error_response(error, &headers),
         }
     }
     Router::new()

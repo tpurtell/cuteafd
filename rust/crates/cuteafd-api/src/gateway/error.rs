@@ -124,7 +124,13 @@ impl GatewayError {
     }
     pub fn anthropic_response(&self) -> axum::response::Response {
         use axum::response::IntoResponse;
-        (status_code(self.status()), axum::Json(self.anthropic_body())).into_response()
+        let request_id = format!("req_{}", uuid::Uuid::new_v4().simple());
+        let mut body = self.anthropic_body();
+        body["request_id"] = serde_json::Value::String(request_id.clone());
+        let status = if self.kind == ErrorKind::Overloaded { 529 } else { self.status() };
+        let mut response = (status_code(status), axum::Json(body)).into_response();
+        response.headers_mut().insert("request-id", request_id.parse().unwrap());
+        response
     }
     pub fn openai_response(&self) -> axum::response::Response {
         use axum::response::IntoResponse;
