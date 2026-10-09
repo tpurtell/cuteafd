@@ -2352,50 +2352,39 @@ The default stays share 0 through the static bypass.
       released staging.
     - **Mitigation:** readiness at most +5% per stage.
 
-### Open questions for TJ
+### Decisions (TJ, 2026-10-09)
 
-1. **End-state size.** A GLM Flash-sized module (~14K) would mean deleting
-   model code. The realistic end is ~38-45K with tests (~26-30K
-   production).
-   *Recommend:* judge "ordinary" by the absence of engine machinery in the
-   family directory, not by lines.
-2. **One serve loop for all families?**
-   *Recommend:* not in v3. Build the shared parts (`PrefillDriver`,
-   `LaneSet`, `Speculator`, `ScoreRows`, `GraphBank`) and give V4.1 a
-   family loop like GLM Flash's and MiMo's. Converge the loops after v3,
-   once three families use those parts.
-3. **V4.1 decode share default.** The 250 ms replay sets the gap floor.
-   *Recommend:* keep 0 by default through stage 1a. Set 0.2 with
-   `--prefill-chunk-s` 0.5 if stage 1b shows C1/C16 within the bar and the
-   fidelity envelope holds; otherwise opt-in.
+1. **End-state size.** Judge "ordinary" by structure: no engine machinery in
+   the family directory. Model code stays.
+2. **Serve loop.** Not unified in v3. V4.1 gets a family loop over the
+   shared parts, like GLM Flash and MiMo; converge loops after v3.
+3. **Decode/prefill sharing is a cross-model feature.** V4.1 joins the
+   shared machinery in stage 1b like every family. Its default is decided
+   by measurement there (on if within the stage gate), not held off by
+   policy.
 4. **Prefix pages.** Bundle the five source pages into one 512-token unit
-   with eager tail copies (as V4 bundles C4/C128), or add independent page
-   classes with lazy COW?
-   *Recommend:* bundle first. It needs no engine page-class or host-slab
-   change, and a tail copy is ~455 KB. Add classes only if the agentic
-   bench shows lost hits or pool.
-5. **Legacy non-topology Spark path.** That is 2-4 peers without
-   `SPARK_TP`, plus the compact EXL3 2/3-peer layouts and the legacy TP4
-   role 1.
-   *Recommend:* express the qualified TP4 default as `SPARK_TP=4`. Run one
-   quick A/B. Then delete the legacy role/transport path in stage 6, unless
-   a compact layout still has users.
-6. **Deterministic Spark prefill reduction.**
-   *Recommend:* build it now as a package option and use it for gating.
-   Make it the default if 8K prefill costs ≤2%; otherwise keep it opt-in.
-7. **V4.1 two-RTX attention.**
-   *Recommend:* keep the 20/20 layer-range split. In item 1's terms that is
-   `Whole(0)`/`Whole(1)` per layer, with experts on `PeerReduce`. Don't
-   re-measure V4.1's head split unless the solver proposes it.
-8. **Naming.**
-   *Recommend:* keep `v41` as the model tag (C ABI, AOT, packages) and drop
-   the `v41_` module prefix. Keep dated compatibility readers for
-   `meta.ds41rt`, the grammar envelope, the frame magic and the old image
-   label, and remove them at v4.
-9. **Copy drafts.** V4.1 (latest 8-gram, opt-in), MiMo (longest backward,
-   greedy-only, opt-in) and GLM (agreeing extension) each have their own.
-   *Recommend:* a shared `CopyDraft` with selectable policies after stage
-   1a. Defaults unchanged.
+   (455 KB, ~890 B/token; no padded unified pool). The only overhead is one
+   eager tail copy per cached prefix (~455 KB). Add page classes with lazy
+   COW tails only if the agentic bench shows lost hits or pool.
+5. **Legacy non-topology Spark path.** Express TP4 as `SPARK_TP=4`, one
+   quick A/B, delete the legacy path in stage 6 unless a compact layout
+   still has users.
+6. **Deterministic Spark prefill reduction.** Build now as a package option;
+   default if 8K prefill costs <= 2%.
+7. **Two-RTX attention.** Keep V4.1's 20/20 layer split as the default.
+   Per-layer ownership is a general tool for every family (item 1). Never
+   measured on any model: head-splitting only V4.1's compressed (CSA/HCA)
+   layers while keeping sliding-window layers whole. V4.1's earlier head
+   split lost (C1 187 -> 170) because each split projection ended in a
+   host wait, so measure the per-layer mix once item 1's shared exchange
+   primitives exist.
+8. **Naming.** Keep `v41` as the model tag, drop the `v41_` module prefix,
+   dated compatibility readers for the ds41rt strings until v4.
+9. **Copy drafting.** Rejected as a default on V4.1 (C1 0.982, though +34%
+   on a literal-table edit) and MiMo (C1 0.957; copied tokens accepted ~45%
+   vs DFlash ~99.5%). Becomes shared machinery as an acceptance-gated copy
+   inside the shared draft policy (copy only when its span beats the neural
+   draft), with the per-drafter calibration work; opt-in until it wins.
 
 ## First after rc3: per-key draft confidence calibration (TJ, 2026-10-09)
 
