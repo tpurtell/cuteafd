@@ -9,8 +9,9 @@ change is checked against its parity numbers before merging.
   coordinator weights (E4M3 + UE8M0 scales), native MXFP4 routed experts
   (E2M1 + UE8M0 per 32).
 - EXL3 K2–K4 routed-expert quants of the same checkpoint.
-- NVIDIA ModelOpt NVFP4 release: lossless downcast onto the existing W4A8
-  expert path (the official MXFP4 weights already use power-of-two scales).
+- NVIDIA ModelOpt NVFP4 release: native W4A4 routed experts (E2M1 weights
+  and activations with E4M3 group-16 scales). The coordinator sends BF16
+  hidden rows; Sparks quantize each routed row to FP4 before the MMA.
 
 ## Engineering summary
 
@@ -55,8 +56,10 @@ change is checked against its parity numbers before merging.
   between encoder and replay shapes, so warmed requests can recapture graphs.
 - Device-driven exchange remains opt-in (`CUTEAFD_V41_DEVICE=1`); write mode
   (`CUTEAFD_SPARK_WRITE=1`) can stall on written flags and is unqualified.
-- Native NVFP4 W4A4 prefill and W4A4 decode/verify remain follow-ups; the
-  supported NVFP4 release uses the existing W4A8 expert path.
+- NVFP4 uses W4A4 for prefill, decode and speculative verification. FC1
+  currently substitutes the layer's maximum static `input_scale` for each
+  expert's calibration; FC2 retains per-expert scales. Checkpoint-exact FC1
+  calibration, smaller wire rows and decode-kernel occupancy remain follow-ups.
 - One-RTX startup still waits on slow Spark layer reads after the
   coordinator-first placement handoff; further load-speed work is open.
 
