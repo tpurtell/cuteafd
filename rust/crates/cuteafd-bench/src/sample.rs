@@ -202,7 +202,7 @@ pub fn full_report() -> Report {
     let mut fidelity_run = crate::fidelity::Run { schema: "cuteafd.fidelity.run/2".into(), arm: "synthetic".into(),
         checkpoint: "synthetic".into(), set_sha256: "synthetic".into(), reference_sha256: "synthetic".into(),
         tier: "standard".into(), path_shape: "decode-shaped".into(), kl_kind: "full-vocabulary".into(),
-        verify_rows: None, standard_balance: None, dataset: Some(json!({"config": "synthetic-long-config-for-responsive-layout",
+        verify_rows: None, reference_selection: None, standard_balance: None, dataset: Some(json!({"config": "synthetic-long-config-for-responsive-layout",
             "revision": "a".repeat(40)})), engine: "synthetic".into(), settings: json!({}), seconds: 346.0,
         score: fidelity_score, floor_top1: 0.985, floor_kl: 0.06, tripwire_expect: None };
     let full_score = fidelity_run.score.clone();

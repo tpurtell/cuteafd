@@ -142,7 +142,8 @@ fn base_model(model: &str) -> Option<&'static str> {
     let name = model.rsplit('/').next()?.rsplit("--").next()?;
     for base in ["Qwen3.8-Flash-Next", "GLM-5.3-Flash", "DeepSeek-V4.1-Flash", "DeepSeek-V4-Flash-0731", "DeepSeek-V4-Pro-0813", "GLM-5.3"] {
         if name == base || name.strip_prefix(base).is_some_and(|suffix|
-            suffix.starts_with('-') && !(base == "GLM-5.3" && suffix.starts_with("-Flash")) && !suffix.to_ascii_lowercase().contains("speculator")
+            suffix.starts_with('-') && !suffix.starts_with("-BF16") && !suffix.starts_with("-FP8")
+                && !(base == "GLM-5.3" && suffix.starts_with("-Flash")) && !suffix.to_ascii_lowercase().contains("speculator")
                 && !suffix.to_ascii_lowercase().contains("dflash")) {
             return Some(base);
         }
@@ -151,10 +152,11 @@ fn base_model(model: &str) -> Option<&'static str> {
 }
 
 pub fn same_base_checkpoint(reference: &str, served: &str) -> bool {
-    base_model(reference).is_some_and(|base| base_model(served) == Some(base))
+    default_publication(reference).is_some_and(|p| default_publication(served) == Some(p))
 }
 
 pub fn default_publication(model: &str) -> Option<(&'static str, &'static str)> {
+    if let Some(p) = crate::fidelity_match::official(model) { return Some((p.revision, p.config)); }
     match base_model(model) {
         Some("Qwen3.8-Flash-Next") => return Some((QWEN_REVISION, QWEN_CONFIG)),
         Some("GLM-5.3-Flash") => return Some((GLMF_REVISION, GLMF_CONFIG)),
@@ -241,6 +243,12 @@ pub fn download(agent: &ureq::Agent, cache: &Path, repo: &str, commit: &str, con
     }
     let manifest: Value = serde_json::from_slice(&bytes)?;
     ensure!(manifest["config"] == config, "dataset config identity differs");
+    if repo == REPOSITORY {
+        if let Some(p) = crate::fidelity_match::PUBLICATIONS.iter().find(|p| p.revision == commit && p.config == config) {
+            ensure!(manifest["root_checkpoint"]["id"] == p.root,
+                "pinned publication logit root differs from highest official root {}", p.root);
+        }
+    }
     let base = root.join(config);
     for (path, hash) in [("windows.json", "windows_sha256"), ("qualification.json", "qualification_sha256")] {
         fetch(agent, &root, repo, commit, &format!("{config}/{path}"), Some(manifest[hash].as_str().context("dataset checksum")?))?;

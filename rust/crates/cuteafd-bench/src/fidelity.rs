@@ -19,6 +19,8 @@ pub struct Run {
     pub verify_rows: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dataset: Option<serde_json::Value>,
+    #[serde(default, flatten)]
+    pub reference_selection: Option<crate::fidelity_match::Resolution>,
     /// Informational split balance, separate from the comparison-stable dataset identity.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub standard_balance: Option<serde_json::Value>,
@@ -395,7 +397,7 @@ mod tests {
         })).collect();
         Run { schema: "cuteafd.fidelity.run/2".into(), arm: "test".into(), checkpoint: "checkpoint".into(),
             set_sha256: "set".into(), reference_sha256: "reference".into(), tier: "full".into(),
-            path_shape: "decode-shaped".into(), kl_kind: "full-vocabulary".into(), verify_rows: Some(8), dataset: None, standard_balance: None,
+            path_shape: "decode-shaped".into(), kl_kind: "full-vocabulary".into(), verify_rows: Some(8), dataset: None, reference_selection: None, standard_balance: None,
             engine: "test".into(), settings: serde_json::json!({}), seconds: 0.0,
             score: Fidelity::from_records(records), floor_top1: 0.9, floor_kl: 0.06, tripwire_expect: None }
     }
