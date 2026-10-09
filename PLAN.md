@@ -1773,6 +1773,15 @@ TJ: two key items, both urgent right after v2.0.0.
        BF16 expert-input override, V4.1 NVFP4's BF16 rows) sized from the
        real geometry, enforced on every worker path. rc3 enforces it for
        V4.1 only (work/spark-vision-ring) and logs the rest.
+     - Shared scratch sized from the programs the family launches, not every
+       program name in the image (V4 `engine.rs` ~378-388 scans all names;
+       dispatch uses only self.family/split_family ~295-309). On the release
+       image a V4 Flash server reserves 2 x 782 MB for GLM Flash's
+       `glmf_kda_w8_m4096`; selecting its own programs frees 1.07 GB on a
+       32 GB card. Change the runtime allocator and the loader helper
+       (`v4_workspace.rs` ~99-120) together, keeping the unsplit target
+       family for dSpark in split mode; planner-only filtering is unsafe.
+       Audit the other families for the same union.
    - **Starting point:** work/v4-placement b2f26af9 (pool-first solver,
      planner/runtime equality) and `builds/v4-placement/SUMMARY.md` (V4 TP2
      design and kernel/loader audit). V4 Flash/Pro measured in rc1:
