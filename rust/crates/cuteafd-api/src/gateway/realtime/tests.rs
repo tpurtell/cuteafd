@@ -404,7 +404,11 @@ async fn busy_cancel_and_disconnect_drop_backend() {
         dropped: dropped.clone(),
     }))
     .await;
-    let mut c = connect(&s, false).await;
+    let (mut c, _) = connect_async(&s.url).await.unwrap();
+    let created = recv(&mut c).await;
+    let session_id =
+        super::super::session::SessionId(created["session"]["id"].as_str().unwrap().into());
+    let session = s.gateway.sessions.get(&session_id).unwrap();
     emit(&mut c, json!({"type":"response.create"})).await;
     let first = recv(&mut c).await;
     assert_eq!(first["type"], "response.created");
@@ -436,14 +440,24 @@ async fn busy_cancel_and_disconnect_drop_backend() {
     dropped.store(false, std::sync::atomic::Ordering::SeqCst);
     emit(&mut c, json!({"type":"response.create"})).await;
     recv(&mut c).await;
+    until(&mut c, "response.output_text.delta").await;
     c.close(None).await.unwrap();
     tokio::time::timeout(std::time::Duration::from_secs(2), async {
         while !dropped.load(std::sync::atomic::Ordering::SeqCst) {
             tokio::task::yield_now().await;
         }
+        while s.gateway.sessions.get(&session_id).is_some() {
+            tokio::task::yield_now().await;
+        }
     })
     .await
     .unwrap();
+    let session = session.lock().await;
+    assert!(session.running.is_none());
+    assert_eq!(session.revision, 5); // Two append/final edits and the explicit cancel operation.
+    assert!(
+        matches!(&session.items[1].item,Item::Message {content,..} if content==&vec![Part::text("partial")])
+    );
 }
 
 #[tokio::test]
@@ -702,4 +716,328 @@ async fn official_sdk_captured_first_frames_replay() {
         let events = until(&mut c, "response.done").await;
         assert_eq!(events.last().unwrap()["response"]["status"], "failed");
     }
+}
+
+#[tokio::test]
+async fn incomplete_tools_never_publish_completed_calls() {
+    let stops = vec![
+        StopReason::MaxTokens,
+        StopReason::ContentFilter,
+        StopReason::Refusal,
+        StopReason::Cancelled,
+    ];
+    for stop in stops {
+        let expected = if stop == StopReason::Cancelled {
+            "cancelled"
+        } else {
+            "incomplete"
+        };
+        let backend = Scripted::new(vec![vec![
+            TurnEvent::ToolCallStart {
+                index: 0,
+                id: "cut".into(),
+                name: "get_time".into(),
+            },
+            TurnEvent::ToolCallDelta {
+                index: 0,
+                arguments: "{\"partial\":".into(),
+            },
+            TurnEvent::ToolCallEnd { index: 0 },
+            TurnEvent::Done { stop: stop.clone() },
+        ]]);
+        let s = server(Arc::new(backend)).await;
+        let mut c = connect(&s, false).await;
+        emit(&mut c, json!({"type":"response.create"})).await;
+        let events = until(&mut c, "response.done").await;
+        assert_eq!(events.last().unwrap()["response"]["status"], expected);
+        assert_eq!(
+            events.last().unwrap()["response"]["output"][0]["status"],
+            "incomplete"
+        );
+        assert!(!events.iter().any(
+            |e| e["type"] == "response.output_item.done" && e["item"]["status"] == "completed"
+        ));
+        if stop == StopReason::MaxTokens {
+            assert_eq!(
+                events.last().unwrap()["response"]["status_details"]["reason"],
+                "max_output_tokens"
+            );
+        }
+    }
+    for eof in [false, true] {
+        let backend = Scripted::default();
+        let mut script = vec![
+            Ok(TurnEvent::ToolCallStart {
+                index: 0,
+                id: "cut".into(),
+                name: "get_time".into(),
+            }),
+            Ok(TurnEvent::ToolCallDelta {
+                index: 0,
+                arguments: "{".into(),
+            }),
+            Ok(TurnEvent::ToolCallEnd { index: 0 }),
+        ];
+        if !eof {
+            script.push(Err(GatewayError::upstream("test upstream failure")));
+        }
+        backend.scripts.lock().unwrap().push(script);
+        let s = server(Arc::new(backend)).await;
+        let mut c = connect(&s, false).await;
+        emit(&mut c, json!({"type":"response.create"})).await;
+        let events = until(&mut c, "response.done").await;
+        assert_eq!(events.last().unwrap()["response"]["status"], "failed");
+        assert_eq!(
+            events.last().unwrap()["response"]["output"][0]["status"],
+            "incomplete"
+        );
+    }
+}
+
+#[tokio::test]
+async fn text_tool_text_order_and_agents_pipecat_wire_fields() {
+    let backend = Scripted::new(vec![vec![
+        TurnEvent::TextDelta {
+            text: "before".into(),
+        },
+        TurnEvent::ToolCallStart {
+            index: 0,
+            id: "call_time".into(),
+            name: "get_time".into(),
+        },
+        TurnEvent::ToolCallDelta {
+            index: 0,
+            arguments: "{}".into(),
+        },
+        TurnEvent::ToolCallEnd { index: 0 },
+        TurnEvent::TextDelta {
+            text: "after".into(),
+        },
+        TurnEvent::Done {
+            stop: StopReason::EndTurn,
+        },
+    ]]);
+    let s = server(Arc::new(backend.clone())).await;
+    let (mut c, _) = connect_async(&s.url).await.unwrap();
+    let initial = recv(&mut c).await;
+    let sid = super::super::session::SessionId(initial["session"]["id"].as_str().unwrap().into());
+    emit(&mut c,json!({"type":"session.update","session":{"tools":[{"type":"function","name":"get_time","parameters":{"type":"object","required":[]}}]}})).await;
+    recv(&mut c).await;
+    emit(
+        &mut c,
+        json!({"type":"response.create","response":{"tool_choice":"required"}}),
+    )
+    .await;
+    let events = until(&mut c, "response.done").await;
+    assert_eq!(
+        backend.turns()[0].tool_choice,
+        super::super::turn::ToolChoice::Named {
+            name: "get_time".into()
+        }
+    );
+    assert!(!events
+        .iter()
+        .any(|e| e["type"] == "conversation.item.created" || e["type"] == "response.text.delta"));
+    let added = events
+        .iter()
+        .position(|e| {
+            e["type"] == "conversation.item.added" && e["item"]["type"] == "function_call"
+        })
+        .unwrap();
+    let args_done = events
+        .iter()
+        .position(|e| e["type"] == "response.function_call_arguments.done")
+        .unwrap();
+    assert!(added < args_done);
+    assert_eq!(events[args_done]["name"], "get_time");
+    let done = &events.last().unwrap()["response"];
+    assert!(done.get("status_details").is_some());
+    assert!(done["usage"]["input_token_details"].is_object());
+    assert!(done["usage"]["output_token_details"].is_object());
+    let output = done["output"].as_array().unwrap();
+    assert_eq!(output.len(), 3);
+    assert_eq!(output[0]["content"][0]["text"], "before");
+    assert_eq!(output[0]["content"][0]["type"], "output_text");
+    assert_eq!(output[1]["type"], "function_call");
+    assert_eq!(output[2]["content"][0]["text"], "after");
+    let session = s.gateway.sessions.get(&sid).unwrap();
+    let session = session.lock().await;
+    assert!(
+        matches!(&session.items[0].item,Item::Message {content,..} if content==&vec![Part::text("before")])
+    );
+    assert!(matches!(&session.items[1].item, Item::ToolCall { .. }));
+    assert!(
+        matches!(&session.items[2].item,Item::Message {content,..} if content==&vec![Part::text("after")])
+    );
+}
+
+#[tokio::test]
+async fn streaming_history_revision_is_constant_not_per_delta() {
+    let backend = Scripted::new(vec![[
+        (0..2048)
+            .map(|_| TurnEvent::TextDelta { text: "x".into() })
+            .collect::<Vec<_>>(),
+        vec![TurnEvent::Done {
+            stop: StopReason::EndTurn,
+        }],
+    ]
+    .concat()]);
+    let s = server(Arc::new(backend)).await;
+    let (mut c, _) = connect_async(&s.url).await.unwrap();
+    let initial = recv(&mut c).await;
+    let sid = super::super::session::SessionId(initial["session"]["id"].as_str().unwrap().into());
+    emit(&mut c, json!({"type":"response.create"})).await;
+    loop {
+        if recv(&mut c).await["type"] == "response.done" {
+            break;
+        }
+    }
+    let session = s.gateway.sessions.get(&sid).unwrap();
+    let session = session.lock().await;
+    assert_eq!(
+        session.revision, 2,
+        "one append and one final edit, independent of delta count"
+    );
+    assert!(
+        matches!(&session.items[0].item,Item::Message {content,..} if content==&vec![Part::text("x".repeat(2048))])
+    );
+}
+
+#[tokio::test]
+async fn idle_preserves_deadline_for_silence_and_drains_buffer() {
+    let gateway = Arc::new(Gateway::new(
+        Arc::new(Scripted::default()),
+        ModelMap::single("served-model"),
+    ));
+    let session = gateway.sessions.create("sess");
+    let mut config = protocol::defaults("served-model", false, false);
+    config["audio"]["input"]["turn_detection"]["idle_timeout_ms"] = json!(6000);
+    let mut c = Connection {
+        gateway,
+        session,
+        config,
+        beta: false,
+        transcription: false,
+        conversation_id: "conv_test".into(),
+        tape: Default::default(),
+        audio: Default::default(),
+        active: None,
+        cancel: None,
+        idle: None,
+    };
+    c.arm_idle();
+    let deadline = c.idle.unwrap();
+    let silence = vec![0u8; 4800];
+    for _ in 0..10 {
+        c.client(&json!({"type":"input_audio_buffer.append","audio":STANDARD.encode(&silence)}))
+            .await
+            .unwrap();
+        assert_eq!(c.idle, Some(deadline));
+    }
+    let settings = audio::settings(&c.config, false).unwrap();
+    let (item_id, audio, start, end) = c.audio.drain_idle(&settings);
+    assert!(!audio.is_empty());
+    assert_eq!((start, end), (700, 1000));
+    let expected = audio.len();
+    c.commit(item_id, audio).await.unwrap();
+    assert!(c.audio.is_empty());
+    let guard = c.session.lock().await;
+    let Item::Message { content, .. } = &guard.items[0].item else {
+        panic!()
+    };
+    let Part::Audio { data, .. } = &content[0] else {
+        panic!()
+    };
+    assert_eq!(STANDARD.decode(data).unwrap().len(), expected);
+    drop(guard);
+    c.client(&json!({"type":"input_audio_buffer.append","audio":STANDARD.encode(vec![0xff,0x7f].repeat(240))})).await.unwrap();
+    assert!(c.idle.is_none(), "speech clears the idle deadline");
+    c.arm_idle();
+    assert!(
+        c.idle.is_none(),
+        "response completion cannot arm idle during speech"
+    );
+}
+
+#[tokio::test]
+async fn idle_timeout_survives_silent_websocket_frames_and_commits_audio() {
+    let s = server(Arc::new(Scripted::default())).await;
+    let (mut c, _) = connect_async(&s.url).await.unwrap();
+    let initial = recv(&mut c).await;
+    let sid = super::super::session::SessionId(initial["session"]["id"].as_str().unwrap().into());
+    emit(&mut c,json!({"type":"session.update","session":{"audio":{"input":{"turn_detection":{"idle_timeout_ms":6000,"create_response":false}}}}})).await;
+    assert_eq!(recv(&mut c).await["type"], "session.updated");
+    for _ in 0..64 {
+        emit(
+            &mut c,
+            json!({"type":"input_audio_buffer.append","audio":STANDARD.encode(vec![0u8;4800])}),
+        )
+        .await;
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    let timeout = recv(&mut c).await;
+    assert_eq!(timeout["type"], "input_audio_buffer.timeout_triggered");
+    assert!(
+        timeout["audio_end_ms"].as_u64().unwrap() > timeout["audio_start_ms"].as_u64().unwrap()
+    );
+    assert_eq!(recv(&mut c).await["type"], "input_audio_buffer.committed");
+    assert_eq!(recv(&mut c).await["type"], "conversation.item.added");
+    assert_eq!(recv(&mut c).await["type"], "conversation.item.done");
+    let session = s.gateway.sessions.get(&sid).unwrap();
+    let session = session.lock().await;
+    let Item::Message { content, .. } = &session.items[0].item else {
+        panic!()
+    };
+    let Part::Audio { data, .. } = &content[0] else {
+        panic!()
+    };
+    assert_eq!(STANDARD.decode(data).unwrap(), vec![0u8; 14400]);
+}
+
+#[tokio::test]
+async fn pipecat_default_vad_silence_manual_commit_and_empty_warmup() {
+    let mut backend = Scripted::new(vec![
+        vec![TurnEvent::Done {
+            stop: StopReason::EndTurn,
+        }],
+        vec![
+            TurnEvent::TextDelta {
+                text: "hello".into(),
+            },
+            TurnEvent::Done {
+                stop: StopReason::EndTurn,
+            },
+        ],
+    ]);
+    backend.capabilities.audio_in = true;
+    let s = server(Arc::new(backend.clone())).await;
+    let mut c = connect(&s, false).await;
+    emit(&mut c,json!({"type":"session.update","session":{"output_modalities":["text"],"instructions":"Pipecat synthetic test"}})).await;
+    let updated = recv(&mut c).await;
+    assert_eq!(
+        updated["session"]["audio"]["input"]["turn_detection"]["type"],
+        "server_vad"
+    );
+    assert!(updated["session"]["audio"]["input"]["transcription"].is_null());
+    emit(&mut c, json!({"type":"response.create"})).await;
+    let warmup = until(&mut c, "response.done").await;
+    assert_eq!(warmup.last().unwrap()["response"]["status"], "completed");
+    assert!(backend.turns()[0].items.is_empty());
+    emit(
+        &mut c,
+        json!({"type":"input_audio_buffer.append","audio":STANDARD.encode(vec![0u8;4800])}),
+    )
+    .await;
+    emit(&mut c, json!({"type":"input_audio_buffer.commit"})).await;
+    // Any auto speech/response events would appear ahead of this explicit commit.
+    assert_eq!(recv(&mut c).await["type"], "input_audio_buffer.committed");
+    let added = recv(&mut c).await;
+    assert_eq!(added["type"], "conversation.item.added");
+    assert_eq!(added["item"]["content"][0]["type"], "input_audio");
+    assert_eq!(recv(&mut c).await["type"], "conversation.item.done");
+    create(&mut c, user("pipecat_text", "hello"), Value::Null, false).await;
+    emit(&mut c, json!({"type":"response.create"})).await;
+    let response = until(&mut c, "response.done").await;
+    assert_eq!(response.last().unwrap()["response"]["status"], "completed");
+    assert_eq!(backend.turns().len(), 2);
 }

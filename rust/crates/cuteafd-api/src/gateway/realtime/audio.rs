@@ -191,6 +191,19 @@ impl Buffer {
     pub fn is_empty(&self) -> bool {
         self.bytes.is_empty() && self.pending.is_empty()
     }
+    pub fn speaking(&self) -> bool {
+        self.speech.is_some()
+    }
+    /// Idle commits may contain less than the manual commit's 100ms minimum.
+    pub fn drain_idle(&mut self, settings: &Settings) -> (String, Vec<u8>, u64, u64) {
+        let end = self.timeline_ms + (self.pending.len() / settings.bytes_per_ms()) as u64;
+        self.bytes.append(&mut self.pending);
+        let start = end.saturating_sub((self.bytes.len() / settings.bytes_per_ms()) as u64);
+        self.timeline_ms = end;
+        let item_id = self.speech.take().unwrap_or_else(|| id("item"));
+        self.silence_ms = 0;
+        (item_id, std::mem::take(&mut self.bytes), start, end)
+    }
     pub fn clear(&mut self) {
         self.bytes.clear();
         self.pending.clear();
