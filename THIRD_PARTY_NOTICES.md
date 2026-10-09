@@ -665,3 +665,22 @@ and test name in a comment. Numeric test vectors and schema golden cases are
 facts from the referenced revisions. Neither Apache-2.0 nor MIT requires
 notice preservation for this manner of use; this entry is provided for
 provenance clarity.
+
+## OpenAI Codex model catalog
+
+The public Codex model metadata and instruction templates in
+`rust/crates/cuteafd-api/src/gateway/responses/codex-model-template.json`
+are adapted from OpenAI Codex, tag `rust-v0.161.0`, commit
+`979011409de0a60b52f179721948e65531d26144`,
+`codex-rs/models-manager/models.json`: <https://github.com/openai/codex>.
+Account/plan marketing and provider paid tiers are removed; runtime alias names
+and backend context/output limits replace the provider's values.
+
+OpenAI Codex
+Copyright 2025 OpenAI
+
+SPDX-License-Identifier: Apache-2.0
+
+Codex is distributed under the Apache License, Version 2.0. You may obtain
+the license at <https://www.apache.org/licenses/LICENSE-2.0>. The copied
+metadata contains no Ratatui-derived code.

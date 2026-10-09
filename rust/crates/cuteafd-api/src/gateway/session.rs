@@ -297,7 +297,7 @@ pub struct SessionStore {
 
 struct StoreInner {
     sessions: HashMap<SessionId, Arc<tokio::sync::Mutex<Session>>>,
-    responses: HashMap<String, Arc<Snapshot>>,
+    responses: HashMap<String, (Arc<Snapshot>, Option<serde_json::Value>)>,
     response_order: VecDeque<String>,
     max_responses: usize,
 }
@@ -341,8 +341,12 @@ impl SessionStore {
 
     /// Store a finished response's snapshot under `response_id`.
     pub fn put_response(&self, response_id: String, snapshot: Arc<Snapshot>) {
+        self.put_response_entry(response_id, snapshot, None);
+    }
+
+    fn put_response_entry(&self, response_id: String, snapshot: Arc<Snapshot>, document: Option<serde_json::Value>) {
         let mut inner = self.inner.lock().unwrap();
-        if inner.responses.insert(response_id.clone(), snapshot).is_none() {
+        if inner.responses.insert(response_id.clone(), (snapshot, document)).is_none() {
             inner.response_order.push_back(response_id);
         }
         while inner.response_order.len() > inner.max_responses {
@@ -351,13 +355,24 @@ impl SessionStore {
     }
 
     pub fn response(&self, response_id: &str) -> Option<Arc<Snapshot>> {
-        self.inner.lock().unwrap().responses.get(response_id).cloned()
+        self.inner.lock().unwrap().responses.get(response_id).map(|entry| entry.0.clone())
     }
 
     pub fn delete_response(&self, response_id: &str) -> bool {
         let mut inner = self.inner.lock().unwrap();
         inner.response_order.retain(|id| id != response_id);
         inner.responses.remove(response_id).is_some()
+    }
+}
+
+impl SessionStore {
+    /// Store the protocol document atomically with its history and eviction slot.
+    pub fn put_response_document(&self, id: String, snapshot: Arc<Snapshot>, document: serde_json::Value) {
+        self.put_response_entry(id, snapshot, Some(document));
+    }
+
+    pub fn response_document(&self, id: &str) -> Option<serde_json::Value> {
+        self.inner.lock().unwrap().responses.get(id).and_then(|entry| entry.1.clone())
     }
 }
 
