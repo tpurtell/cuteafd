@@ -3050,6 +3050,13 @@ calibration gap remains real but is not this regression.
 
 ## Explore after v2
 
+- **Transient Spark expert-wait spikes in prefill (2026-10-09).** GLM Flash
+  EXL3 max, old defaults, three warmed identical 8,192-token prefills: TTFT
+  1.153 / 1.818 / 1.159 s with expert wait 331 / 990 / 332 ms and GPU wait
+  flat (462-463 ms). One spike made a single-card 8K look like a 0.845
+  regression. Find the cause (Spark page cache, RoCE contention, worker
+  scheduling) and log per-rank expert time per step so cards can flag it.
+
 Ideas TJ wants kept for later; not v2 work.
 - **First after v2: retire ds41rt; V4.1 becomes an ordinary family (TJ, 2026-10-09).**
   Design and stages: "v3: retiring ds41rt" above.
