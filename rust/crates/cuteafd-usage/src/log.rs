@@ -91,6 +91,7 @@ fn capped(bytes: &[u8], cap: usize) -> Result<Vec<u8>> {
     Ok(serde_json::to_vec(&json!({"truncated":true,"original_bytes":bytes.len(),"prefix":prefix}))?)
 }
 fn reference(mime: &str, bytes: &[u8]) -> Value { json!({"type":"image_url","ref":{"mime":mime,"bytes":bytes.len(),"sha256":format!("{:x}",Sha256::digest(bytes))}}) }
+fn credential(name: &str) -> bool { matches!(name.to_ascii_lowercase().as_str(), "headers"|"authorization"|"x-api-key"|"api_key"|"api-key"|"cookie"|"set-cookie"|"proxy-authorization"|"x-goog-api-key") }
 fn redact(value: &mut Value) {
     match value {
         Value::String(s) if s.starts_with("data:") => {
@@ -99,10 +100,23 @@ fn redact(value: &mut Value) {
             let bytes = if meta.ends_with(";base64") { use base64::Engine; base64::engine::general_purpose::STANDARD.decode(body).unwrap_or_default() } else { body.as_bytes().to_vec() };
             *value = reference(mime, &bytes);
         },
-        Value::Array(a) => for v in a { redact(v); },
+        Value::String(s) if s.len() > 65536 && s.bytes().filter(|b| b.is_ascii_alphanumeric() || matches!(b,b'+'|b'/'|b'='|b'-'|b'_')).count() * 100 / s.len() >= 95 => {
+            use base64::Engine; let bytes = base64::engine::general_purpose::STANDARD.decode(&*s).unwrap_or_else(|_| s.as_bytes().to_vec());
+            *value = reference("application/octet-stream", &bytes);
+        },
+        Value::Array(a) => {
+            a.retain(|v| !v.as_array().and_then(|a|a.first()).and_then(Value::as_str).is_some_and(credential));
+            for v in a { redact(v); }
+        },
         Value::Object(o) => {
             // Some clients wrap a body with headers; never retain this wrapper.
-            for name in ["headers", "authorization", "x-api-key", "api_key", "api-key"] { o.remove(name); }
+            o.retain(|key,_| !credential(key));
+            let event = o.get("type").and_then(Value::as_str).unwrap_or("").to_owned();
+            if event == "input_audio_buffer.append" || event.contains("audio.delta") {
+                for field in ["audio", "delta"] {
+                    if let Some(Value::String(data)) = o.remove(field) { use base64::Engine; let bytes=base64::engine::general_purpose::STANDARD.decode(data).unwrap_or_default();o.insert(field.into(),reference("audio/unknown",&bytes)); }
+                }
+            }
             if let Some(audio) = o.get("input_audio").and_then(Value::as_object) {
                 use base64::Engine;
                 let bytes = audio.get("data").and_then(Value::as_str).and_then(|s| base64::engine::general_purpose::STANDARD.decode(s).ok()).unwrap_or_default();
@@ -164,7 +178,13 @@ mod tests {
         store.record(cuteafd_api::usage::Record { rid:"kept".into(), ts_ms:store.clock.now_ms(), ..Default::default() }); store.flush().unwrap(); store.prune().unwrap();
         let log = &store.log;
         log.record_log(record("redact",store.clock.now_ms(),json!({"headers":{"Authorization":"RAW_KEY_SENTINEL"},"api_key":"RAW_KEY_SENTINEL","image":"data:image/png;base64,aGVsbG8=","input_audio":{"data":"aGVsbG8=","format":"wav"}})));
-        log.record_log(record("huge",store.clock.now_ms(),json!({"text":"x".repeat(RECORD_CAP*2)}))); log.flush().unwrap();
+        log.record_log(record("cases",store.clock.now_ms(),json!({"Authorization":"RAW_KEY_SENTINEL","X-Api-Key":"RAW_KEY_SENTINEL","Api-Key":"RAW_KEY_SENTINEL","COOKIE":"RAW_KEY_SENTINEL","Set-Cookie":"RAW_KEY_SENTINEL","Proxy-Authorization":"RAW_KEY_SENTINEL","x-goog-api-key":"RAW_KEY_SENTINEL","pairs":[["AUTHORIZATION","RAW_KEY_SENTINEL"]]})));
+        log.record_log(record("audio",store.clock.now_ms(),json!({"type":"input_audio_buffer.append","audio":"aGVsbG8="})));
+        log.record_log(record("unknown",store.clock.now_ms(),json!({"unknown_media":"YQ==".repeat(20000)})));
+        log.record_log(record("huge",store.clock.now_ms(),json!({"text":"text with spaces ".repeat(RECORD_CAP/4)}))); log.flush().unwrap();
+        assert!(log.get("audio").unwrap().unwrap()["request"]["audio"]["ref"].is_object());
+        assert!(log.get("unknown").unwrap().unwrap()["request"]["unknown_media"]["ref"].is_object());
+        assert_eq!(log.get("cases").unwrap().unwrap()["request"]["pairs"],json!([]));
         let row = log.get("redact").unwrap().unwrap(); assert!(row["request"]["image"]["ref"]["sha256"].is_string()); assert_eq!(row["request"]["image"]["ref"]["bytes"],5);
         assert!(log.get("huge").unwrap().unwrap()["truncated"].as_bool().unwrap());
         let mut s = store.settings(); s.log_enabled=false; store.update_settings(s).unwrap(); store.flush().unwrap();
