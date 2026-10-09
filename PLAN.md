@@ -1765,6 +1765,11 @@ TJ: two key items, both urgent right after v2.0.0.
      - then RTX expert layers, TP2 across both GPUs, with non-split items
        (drafter, encoders) moved to balance the two GPUs;
      - the planner equals the runtime admission, with a test per family.
+     - Spark ring admission exact per family: endpoint count (GLM Flash
+       can open more than 2 prefill transports) and ingress dtype (MiMo's
+       BF16 expert-input override, V4.1 NVFP4's BF16 rows) sized from the
+       real geometry, enforced on every worker path. rc3 enforces it for
+       V4.1 only (work/spark-vision-ring) and logs the rest.
    - **Starting point:** work/v4-placement b2f26af9 (pool-first solver,
      planner/runtime equality) and `builds/v4-placement/SUMMARY.md` (V4 TP2
      design and kernel/loader audit). V4 Flash/Pro measured in rc1:
