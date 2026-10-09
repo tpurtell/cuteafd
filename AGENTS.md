@@ -187,7 +187,10 @@ before → after tables with conditions.
   and can crawl while the WAN is busy; it is slow, not stuck.
 - Iterate with `./wip.sh --slot S` then `./run.sh --wip S --restart`; A/B two
   checkouts with `scripts/bench/bench-ab.py`. `cuteafd plan MODEL` (any HF id or
-  snapshot dir) says what a checkpoint needs before any kernel work;
+  snapshot dir) says what a checkpoint needs before any kernel work.
+  `--coordinator-gpu-budget-gib` is the logical per-GPU ceiling for plan,
+  serve and golden; plan defaults to 95.5 GiB. Its distinct weights-only
+  cap is `--coordinator-weight-budget-gib` (default 80 GiB);
   `cuteafd fabric` shows ports, link/PCIe rates, subnets and the rail plan
   (services log the same line at startup).
 

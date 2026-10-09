@@ -16,14 +16,16 @@ fn options(args: &PlanArgs) -> Result<PlanOptions, PlanError> {
         audio: args.audio,
         placement: ExpertPlacement::from_spark_ranks(args.spark_ranks.unwrap_or(4)),
         spark_budget_bytes: budget_bytes("--spark-budget-gib", args.spark_budget_gib)?,
-        coordinator_budget_bytes: budget_bytes("--coordinator-budget-gib", args.coordinator_budget_gib)?
-            .min(if args.layout { budget_bytes("--rtx-budget-gib", args.rtx_gib)? } else { u64::MAX }),
+        coordinator_budget_bytes: budget_bytes("--coordinator-weight-budget-gib", args.coordinator_weight_budget_gib)?
+            .min(if args.layout || args.coordinator_gpu_budget_gib.is_some() {
+                budget_bytes("--coordinator-gpu-budget-gib", args.coordinator_gpu_budget_gib.unwrap_or(95.5))?
+            } else { u64::MAX }),
         layout: args.layout.then(|| -> Result<_, PlanError> {
             if !(1..=2).contains(&args.rtx) {
                 return Err(PlanError::InvalidOption { option: "--rtx", reason: "1 or 2 coordinator GPUs".into() });
             }
             Ok(cuteafd_loader::plan::layout::LayoutOptions {
-                rtx_bytes: vec![budget_bytes("--rtx-budget-gib", args.rtx_gib)?; args.rtx],
+                rtx_bytes: vec![budget_bytes("--coordinator-gpu-budget-gib", args.coordinator_gpu_budget_gib.unwrap_or(95.5))?; args.rtx],
                 spark_allocation_budget_bytes: Some(budget_bytes("--spark-budget-gib", args.spark_budget_gib)?),
                 pool_tokens: args.pool_tokens,
                 vision_replicas: args.vision_replicas as usize,
@@ -117,12 +119,12 @@ mod tests {
             hf_home: None,
             spark_ranks: Some(spark_ranks),
             spark_budget_gib: 100.0,
-            coordinator_budget_gib: 80.0,
+            coordinator_weight_budget_gib: 80.0,
             json: true,
             require_ready,
             layout: true,
             rtx: 2,
-            rtx_gib: 95.5,
+            coordinator_gpu_budget_gib: None,
             pool_tokens: None,
             drafter_gib: 0.0,
             local_expert_layers: None,
@@ -205,10 +207,11 @@ mod tests {
     #[test]
     fn rtx_budget_flag_and_legacy_alias_bound_every_layout_gpu() {
         use clap::Parser;
-        for flag in ["--rtx-budget-gib", "--rtx-gib"] {
+        for flag in ["--coordinator-gpu-budget-gib", "--rtx-budget-gib", "--rtx-gib"] {
             let cli = crate::cli::Cli::try_parse_from(["cuteafd", "plan", "/not-read", "--layout", "--rtx", "2", flag, "32"])
                 .unwrap();
-            let crate::cli::Commands::Plan(args) = cli.command else { panic!("plan") };
+            let crate::cli::Commands::Plan(mut args) = cli.command else { panic!("plan") };
+            args.coordinator_gpu_budget_gib = cli.coordinator_gpu_budget_gib;
             let options = options(&args).unwrap();
             assert_eq!(options.layout.unwrap().rtx_bytes, vec![32 << 30; 2]);
             assert_eq!(options.coordinator_budget_bytes, 32 << 30);
@@ -218,9 +221,56 @@ mod tests {
         assert!(options(&plan_args).unwrap().layout.is_none());
         for gib in [0.0, -1.0, f64::NAN, f64::INFINITY] {
             let dir = tempfile::tempdir().unwrap();
-            let error = options(&PlanArgs { rtx_gib: gib, ..args(dir.path(), 4, false) }).unwrap_err();
-            assert!(matches!(error, PlanError::InvalidOption { option: "--rtx-budget-gib", .. }));
+            let error = options(&PlanArgs { coordinator_gpu_budget_gib: Some(gib), ..args(dir.path(), 4, false) }).unwrap_err();
+            assert!(matches!(error, PlanError::InvalidOption { option: "--coordinator-gpu-budget-gib", .. }));
         }
+    }
+
+    #[test]
+    fn unified_budget_matches_aliases_and_serving_capacity() {
+        use clap::Parser;
+        let parse = |flag: &str, before: bool| {
+            let argv = if before {
+                vec!["cuteafd", flag, "31.8", "plan", "/not-read", "--layout"]
+            } else {
+                vec!["cuteafd", "plan", "/not-read", "--layout", flag, "31.8"]
+            };
+            let cli = crate::cli::Cli::try_parse_from(argv).unwrap();
+            let crate::cli::Commands::Plan(mut args) = cli.command else { panic!("plan") };
+            args.coordinator_gpu_budget_gib = cli.coordinator_gpu_budget_gib;
+            options(&args).unwrap()
+        };
+        let expected = parse("--coordinator-gpu-budget-gib", false);
+        let snapshot = tempfile::tempdir().unwrap();
+        write_snapshot(snapshot.path(), &mimo_flash_config(), &mimo_flash_tensors(), Some(1));
+        let expected_report = serde_json::to_value(plan(snapshot.path(), &expected).unwrap()).unwrap();
+        for flag in ["--coordinator-gpu-budget-gib", "--rtx-budget-gib", "--rtx-gib"] {
+            for before in [false, true] {
+                let actual = parse(flag, before);
+                assert_eq!(serde_json::to_value(plan(snapshot.path(), &actual).unwrap()).unwrap(), expected_report);
+                assert_eq!(actual.layout.unwrap().rtx_bytes, expected.layout.as_ref().unwrap().rtx_bytes);
+                assert_eq!(actual.coordinator_budget_bytes, expected.coordinator_budget_bytes);
+            }
+        }
+        let serving = cuteafd_core::serving_capacity::GpuMemoryBudget::from_gib(31.8).unwrap();
+        assert_eq!(expected.layout.unwrap().rtx_bytes, vec![serving.0]);
+        assert_eq!(crate::cli::deprecated_budget_flags(["--rtx-gib=31.8", "--rtx-budget-gib", "31.8"]),
+            vec!["--coordinator-gpu-budget-gib"]);
+        assert!(crate::cli::deprecated_budget_flags(["--coordinator-gpu-budget-gib", "31.8"]).is_empty());
+    }
+
+    #[test]
+    fn weight_budget_remains_a_distinct_cap_with_deprecated_alias() {
+        use clap::Parser;
+        for flag in ["--coordinator-weight-budget-gib", "--coordinator-budget-gib"] {
+            let cli = crate::cli::Cli::try_parse_from(["cuteafd", "plan", "/not-read", "--layout", flag, "10"]).unwrap();
+            let crate::cli::Commands::Plan(args) = cli.command else { panic!("plan") };
+            let options = options(&args).unwrap();
+            assert_eq!(options.coordinator_budget_bytes, 10 << 30);
+            assert_eq!(options.layout.unwrap().rtx_bytes, vec![budget_bytes("budget", 95.5).unwrap()]);
+        }
+        assert_eq!(crate::cli::deprecated_budget_flags(["--coordinator-budget-gib", "10"]),
+            vec!["--coordinator-weight-budget-gib"]);
     }
 
     #[test]
@@ -261,7 +311,7 @@ mod tests {
     fn layout_refuses_full_storage_shortfall_even_when_weights_fit() {
         let snapshot = tempfile::tempdir().unwrap();
         write_snapshot(snapshot.path(), &mimo_flash_config(), &mimo_flash_tensors(), Some(1));
-        let tiny = PlanArgs { rtx_gib: 2.0, ..args(snapshot.path(), 4, true) };
+        let tiny = PlanArgs { coordinator_gpu_budget_gib: Some(2.0), ..args(snapshot.path(), 4, true) };
         let mut weight_only = options(&tiny).unwrap();
         weight_only.layout = None;
         assert!(plan(snapshot.path(), &weight_only).unwrap().executable(), "weight inventory fits");

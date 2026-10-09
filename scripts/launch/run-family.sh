@@ -188,7 +188,7 @@ if [[ "$qwen_exl3" == 1 && "$backend" == auto && "$ranks" != 0 ]]; then
       # Older images that do not qualify auto placement keep the Spark fallback.
       preferred="$(docker run --rm --network none -v "$hub:/root/.cache/huggingface/hub:ro" "${wip_mount_args[@]}" \
         "$coordinator_image" cuteafd plan "$snapshot" --vision "$vision" --audio "$audio" --json --layout \
-        --rtx 1 --rtx-gib "$free_gib" --coordinator-budget-gib "$free_gib" --pool-tokens "$pool" \
+        --rtx 1 --coordinator-gpu-budget-gib "$free_gib" --coordinator-weight-budget-gib "$free_gib" --pool-tokens "$pool" \
         | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["spark_ranks"])' 2>/dev/null || true)"
       if [[ "$preferred" == 0 ]]; then
         echo "note: Qwen EXL3 auto selected resident local experts on GPU $selected; EXPERT_BACKEND=spark forces Spark ranks" >&2
@@ -891,7 +891,7 @@ if { [[ ( "$family" == mimo_v2 || "$family" == qwen4 || "$family" == glm5_flash 
   plan_json="$(docker run --rm --network none -v "$hub:/root/.cache/huggingface/hub:ro" "${wip_mount_args[@]}" \
     "$coordinator_image" cuteafd plan "$snapshot" --vision "$vision" --audio "$audio" --json --layout \
     --spark-ranks "$ranks" --spark-budget-gib "$(python3 -c 'import sys;print(int(sys.argv[1])/2**30)' "$budget")" \
-    --rtx "$plan_rtx" --rtx-gib "$plan_gib" --pool-tokens "$plan_pool" --vision-replicas "$vision_replicas" "${plan_draft_args[@]}")"
+    --rtx "$plan_rtx" --coordinator-gpu-budget-gib "$plan_gib" --pool-tokens "$plan_pool" --vision-replicas "$vision_replicas" "${plan_draft_args[@]}")"
   selected="$(python3 -c '
 import json,sys
 p=json.load(sys.stdin); e=p.get("encoder")

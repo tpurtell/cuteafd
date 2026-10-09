@@ -4,6 +4,22 @@ use std::path::PathBuf;
 
 pub(crate) const DEFAULT_REAL_FULL_MAX_CONTEXT_TOKENS: usize = 128 * 1024;
 
+/// Inspect original argv: clap normalizes aliases before exposing matches.
+pub(crate) fn deprecated_budget_flags(args: impl IntoIterator<Item = impl AsRef<str>>) -> Vec<&'static str> {
+    let mut replacements = Vec::new();
+    for arg in args {
+        let replacement = match arg.as_ref().split('=').next().unwrap_or("") {
+            "--rtx-budget-gib" | "--rtx-gib" => Some("--coordinator-gpu-budget-gib"),
+            "--coordinator-budget-gib" => Some("--coordinator-weight-budget-gib"),
+            _ => None,
+        };
+        if let Some(replacement) = replacement {
+            if !replacements.contains(&replacement) { replacements.push(replacement); }
+        }
+    }
+    replacements
+}
+
 #[derive(Debug, Parser)]
 #[command(name = "cuteafd", about = "CUTEAFD phase0 runtime CLI")]
 pub(crate) struct Cli {
@@ -22,7 +38,7 @@ pub(crate) struct Cli {
     pub(crate) image_url_fetch: Option<cuteafd_api::openai::media::ImageUrlFetch>,
     /// Logical GiB ceiling per coordinator GPU (weights, KV, workspaces,
     /// graphs and drafts); leaves physical GPU capacity/SM/L2 unchanged.
-    #[arg(long, global = true)]
+    #[arg(long, global = true, aliases = ["rtx-budget-gib", "rtx-gib"])]
     pub(crate) coordinator_gpu_budget_gib: Option<f64>,
     #[command(subcommand)]
     pub(crate) command: Commands,
@@ -197,8 +213,8 @@ pub(crate) struct PlanArgs {
     pub(crate) spark_budget_gib: f64,
     /// Weight budget of the coordinator GPU, GiB (its own tensors, plus every
     /// routed expert with --spark-ranks 0).
-    #[arg(long, default_value_t = 80.0)]
-    pub(crate) coordinator_budget_gib: f64,
+    #[arg(long, alias = "coordinator-budget-gib", default_value_t = 80.0)]
+    pub(crate) coordinator_weight_budget_gib: f64,
     #[arg(long, default_value_t = false)]
     pub(crate) json: bool,
     /// Exit non-zero unless every part is servable.
@@ -211,9 +227,9 @@ pub(crate) struct PlanArgs {
     /// Coordinator GPUs for --layout (1 or 2; Qwen currently uses only the first).
     #[arg(long, default_value_t = 1)]
     pub(crate) rtx: usize,
-    /// Usable GiB per coordinator GPU for --layout.
-    #[arg(long = "rtx-budget-gib", alias = "rtx-gib", default_value_t = 95.5, requires = "layout")]
-    pub(crate) rtx_gib: f64,
+    /// Resolved global logical GPU ceiling; PRO defaults to 95.5 GiB.
+    #[arg(skip)]
+    pub(crate) coordinator_gpu_budget_gib: Option<f64>,
     /// Explicit KV pool tokens for --layout (0 or omitted: automatic).
     #[arg(long)]
     pub(crate) pool_tokens: Option<u64>,

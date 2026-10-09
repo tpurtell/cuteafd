@@ -1185,7 +1185,7 @@ def test_coordinator_gpu_budget_is_forwarded_only_to_the_coordinator(tmp_path, f
     result = _family_launch_result(tmp_path, family_config, model,
                                   "COORDINATOR_GPU_BUDGET_GIB=32.5\n")
     assert result.returncode == 0, result.stderr
-    launch = next(line for line in result.stderr.splitlines() if "--coordinator-gpu-budget-gib" in line)
+    launch = next(line for line in result.stderr.splitlines() if "--coordinator-gpu-budget-gib" in line and "serve-" in line)
     assert "cuteafd --coordinator-gpu-budget-gib 32.5 serve-" in launch
     for line in result.stderr.splitlines():
         if "expertd-native" in line:
@@ -1208,7 +1208,7 @@ def test_qwen_backend_preflight_charges_physical_usage_against_the_ceiling(tmp_p
         gpu_free_mib=90 * 1024, gpu_total_mib=96 * 1024)
     assert result.returncode == 0, result.stderr
     preflight = next(line for line in result.stderr.splitlines() if "cuteafd plan" in line)
-    assert "--rtx-gib 26.0" in preflight and "--coordinator-budget-gib 26.0" in preflight
+    assert "--coordinator-gpu-budget-gib 26.0" in preflight and "--coordinator-weight-budget-gib 26.0" in preflight
     launch = next(line for line in result.stderr.splitlines() if "serve-qwen4" in line)
     assert "--coordinator-gpu-budget-gib 32" in launch and "--peers" in launch
 
@@ -1363,7 +1363,7 @@ def test_qwen_restart_admission_credits_only_its_own_gpu_memory(tmp_path: Path, 
                                   gpu_allocations=((123, 84000), (456, 2000)))
     assert result.returncode == 0, result.stderr
     preflight = next(line for line in result.stderr.splitlines() if "cuteafd plan" in line)
-    assert f"--rtx-gib {admitted_gib}" in preflight
+    assert f"--coordinator-gpu-budget-gib {admitted_gib}" in preflight
 
 
 def test_qwen_other_formats_skip_the_local_qualification_preflight(tmp_path: Path) -> None:
