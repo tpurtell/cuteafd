@@ -122,14 +122,14 @@ mod tests {
     use super::*;
     #[test]
     fn exact_prefix_and_any() {
-        let mut map = ModelMap::single("deepseek-v4-flash");
+        let mut map = ModelMap::single("served-model");
         assert!(map.resolve("claude-sonnet-4-5").is_err());
-        map.aliases.push(("claude-*".into(), "deepseek-v4-flash".into()));
-        assert_eq!(map.resolve("claude-sonnet-4-5").unwrap(), "deepseek-v4-flash");
+        map.aliases.push(("claude-*".into(), "served-model".into()));
+        assert_eq!(map.resolve("claude-sonnet-4-5").unwrap(), "served-model");
         assert!(map.resolve("gpt-5.1-codex").is_err());
         map.accept_any = true;
-        assert_eq!(map.resolve("gpt-5.1-codex").unwrap(), "deepseek-v4-flash");
-        assert_eq!(map.resolve("").unwrap(), "deepseek-v4-flash");
+        assert_eq!(map.resolve("gpt-5.1-codex").unwrap(), "served-model");
+        assert_eq!(map.resolve("").unwrap(), "served-model");
     }
     #[test]
     fn official_names_list_claude_ids_for_discovery() {

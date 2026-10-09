@@ -3055,9 +3055,13 @@ the session hooks. Phase C adds Realtime audio (transcription and TTS).
 - **`trait Backend`** has four methods: `start(turn) -> stream`,
   `count_tokens`, `models` and `capabilities`. Dropping the stream cancels the
   turn.
-  - **`Upstream`** speaks to any OpenAI chat-completions or
-    Anthropic-compatible service: DeepSeek for testing, or cuteafd's own
-    `/v1/chat/completions` on another host.
+  - **`Upstream`** is a test/dev seam, not a shipped way to run cuteafd. It
+    is one generic OpenAI-chat or Anthropic-compatible client, configured by
+    base URL, key env var, model, flavor and an explicit capability set. It
+    has no provider names or capability tables in product code. Provider
+    choices (DeepSeek for text and tools, OpenRouter MiMo for image and
+    audio, a structured-output model) live in test tooling under
+    `scripts/gateway/`.
   - **`Engine`** (phase B) feeds the scheduler directly. It replaces today's
     chat handler internals without changing that route's behaviour.
 - `/v1/chat/completions` stays the engine's existing path, byte-identical,
@@ -3167,6 +3171,10 @@ SearXNG (no key). Results return in each protocol's own server-tool shapes,
 and `usage.server_tool_use.web_search_requests` is counted.
 
 ### Testing without GPUs
+
+Upstream providers exist only to test the gateway without GPUs. User docs
+describe the front ends, aliasing, official names, search and client setup,
+not upstreams.
 
 - `cuteafd gateway --upstream-url ... --model ...` serves every front end over
   an upstream.
