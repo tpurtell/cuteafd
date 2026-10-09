@@ -20,6 +20,12 @@ pub(crate) struct GatewayArgs {
     model: String,
     #[arg(long)]
     accept_any_model: bool,
+    /// Advertise official client model ids and accept any requested model alias.
+    #[arg(long)]
+    official_model_names: bool,
+    /// Refresh/replace advertised names from a text or JSON file; implies --official-model-names.
+    #[arg(long)]
+    official_model_names_file: Option<PathBuf>,
     #[arg(long = "alias", value_parser = alias)]
     aliases: Vec<(String,String)>,
     #[arg(long = "list-model")]
@@ -48,7 +54,15 @@ pub(crate) async fn run(args: GatewayArgs) -> Result<()> {
     if let Some(file) = &args.api_key_file { secrets.push(std::fs::read_to_string(file).context("read gateway API key file")?.trim().to_string()); }
     let api = crate::shared::api::ApiArgs { api_key_file:args.api_key_file,enable_bench:false }.load()?;
     let backend = Arc::new(Upstream::new(config)?.discover().await);
-    let models = ModelMap { served:args.model.clone(),accept_any:args.accept_any_model,aliases:args.aliases,listed:args.listed };
+    let mut models = if args.official_model_names || args.official_model_names_file.is_some() {
+        ModelMap::official_names(args.model.clone())
+    } else { ModelMap::single(args.model.clone()) };
+    if let Some(file) = args.official_model_names_file {
+        models.apply_names_file(&std::fs::read_to_string(file).context("read official model names file")?).map_err(anyhow::Error::msg)?;
+    }
+    models.accept_any |= args.accept_any_model;
+    models.aliases.extend(args.aliases);
+    models.listed.extend(args.listed);
     let mut gateway = Gateway::new(backend,models);
     let provider = if args.search == "none" { "none" }
         else if args.search == "exa" {

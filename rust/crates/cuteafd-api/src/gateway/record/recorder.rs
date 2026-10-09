@@ -36,9 +36,12 @@ impl Sanitizer {
             for line in text.split_inclusive('\n') {
                 if let Some(data) = line.strip_prefix("data:") {
                     if let Ok(mut value) = serde_json::from_str::<Value>(data.trim()) {
+                        let original = value.clone();
                         self.value(&mut value);
-                        lines.push(format!("data: {}{}",value,if line.ends_with('\n') { "\n" } else { "" }));
-                        continue;
+                        if value != original {
+                            lines.push(format!("data: {}{}",value,if line.ends_with('\n') { "\n" } else { "" }));
+                            continue;
+                        }
                     }
                 }
                 lines.push(line.to_string());
@@ -52,7 +55,12 @@ impl Sanitizer {
             Value::String(text) => {
                 // Bodies and WebSocket frames often contain JSON encoded inside strings.
                 if let Ok(mut inner) = serde_json::from_str::<Value>(text) {
-                    if inner.is_object() || inner.is_array() { self.value(&mut inner); *text = inner.to_string(); return; }
+                    if inner.is_object() || inner.is_array() {
+                        let original = inner.clone();
+                        self.value(&mut inner);
+                        if inner != original { *text = inner.to_string(); }
+                        return;
+                    }
                 }
                 *text = self.text(text);
             }
@@ -164,6 +172,53 @@ mod tests {
         sanitizer.value(&mut value);
         let text = value.to_string();
         for bad in ["literal-secret","anything","other-secret","/home/","person@example","token123","sk-abc","key.another"] { assert!(!text.contains(bad),"failed scrub {bad}"); }
+    }
+    #[test]
+    fn sanitizer_preserves_clean_sse_bytes_and_scrubs_key_fields() {
+        let sanitizer = Sanitizer::default();
+        let clean = "event: test\r\ndata: { \"text\": \"hi\" }\r\n\r\n";
+        assert_eq!(sanitizer.text(clean),clean);
+        assert!(!sanitizer.text("data: {\"api_key\":\"unknown\"}\n\n").contains("unknown"));
+    }
+    #[tokio::test]
+    async fn websocket_fixture_lifetime_headers_and_frame_order() {
+        use axum::extract::ws::{Message,WebSocketUpgrade};
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+        use futures::SinkExt;
+        let directory = tempfile::tempdir().unwrap();
+        let recorder = Recorder::new(directory.path().into(),Sanitizer::new(["literal-key".into()])).unwrap();
+        let app = axum::Router::new().route("/ws",axum::routing::get(|upgrade:WebSocketUpgrade,tape:Tape| async {
+            upgrade.protocols(["realtime"]).on_upgrade(move |mut socket| async move {
+                while let Some(Ok(Message::Text(text))) = socket.next().await {
+                    tape.frame("client",&text);
+                    tape.frame("server",&text);
+                    if socket.send(Message::Text(text)).await.is_err() { break; }
+                }
+            })
+        })).layer(axum::middleware::from_fn_with_state(recorder,middleware));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move { axum::serve(listener,app).await.unwrap(); });
+        let mut request = format!("ws://{address}/ws").into_client_request().unwrap();
+        request.headers_mut().insert("sec-websocket-protocol","realtime, openai-insecure-api-key.literal-key".parse().unwrap());
+        request.headers_mut().insert("authorization","Bearer literal-key".parse().unwrap());
+        let (mut socket,_) = tokio_tungstenite::connect_async(request).await.unwrap();
+        socket.send(tokio_tungstenite::tungstenite::Message::Text("{\"api_key\":\"literal-key\",\"text\":\"/home/person/path\"}".into())).await.unwrap();
+        socket.next().await.unwrap().unwrap();
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(),0,"live websocket must keep tape open");
+        socket.close(None).await.unwrap();
+        drop(socket);
+        tokio::time::timeout(std::time::Duration::from_secs(3),async {
+            while std::fs::read_dir(directory.path()).unwrap().count() == 0 { tokio::time::sleep(std::time::Duration::from_millis(10)).await; }
+        }).await.unwrap();
+        let path = std::fs::read_dir(directory.path()).unwrap().next().unwrap().unwrap().path();
+        let text = std::fs::read_to_string(path).unwrap();
+        assert!(!text.contains("literal-key") && !text.contains("/home/"));
+        let fixture:Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(fixture["entries"][0]["entry"]["direction"],"client");
+        assert_eq!(fixture["entries"][1]["entry"]["direction"],"server");
+        assert_eq!(fixture["request_headers"]["sec-websocket-protocol"],"[REDACTED]");
+        task.abort();
     }
     #[tokio::test]
     async fn recorder_tees_body_and_waits_for_tape_drop() {

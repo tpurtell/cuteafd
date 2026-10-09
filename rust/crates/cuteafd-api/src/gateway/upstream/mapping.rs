@@ -119,6 +119,10 @@ fn anthropic(turn: &TurnRequest, config: &UpstreamConfig) -> Result<Value, Gatew
             }
             Item::Message { role, content } => for block in parts(content, Flavor::Anthropic)?.as_array().unwrap() { append_block(&mut messages, self::role(*role), block.clone()); },
             Item::Reasoning { text, signature } => {
+                if let Some(data) = signature.as_ref().and_then(|s| s.strip_prefix("redacted:")) {
+                    append_block(&mut messages,"assistant",json!({"type":"redacted_thinking","data":data}));
+                    continue;
+                }
                 let mut block = json!({"type":"thinking","thinking":text});
                 if let Some(signature) = signature { block["signature"] = json!(signature); }
                 append_block(&mut messages, "assistant", block);

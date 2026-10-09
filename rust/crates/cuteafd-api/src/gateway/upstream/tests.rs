@@ -193,6 +193,35 @@ async fn capture_deepseek_scratch_fixtures() {
         sanitizer.value(&mut fixture);
         std::fs::write(directory.join(format!("{}.json",case["name"].as_str().unwrap())),serde_json::to_vec_pretty(&fixture).unwrap()).unwrap();
         println!("captured {}",case["name"]);
+        if case["followup"].as_bool() == Some(true) {
+            let mut reasoning = String::new();
+            let mut text = String::new();
+            let mut signature = None;
+            let mut calls:std::collections::BTreeMap<usize,(String,String,String)> = Default::default();
+            for event in fixture["expected_events"].as_array().expect("thinking tool turn must succeed") {
+                let event:TurnEvent = serde_json::from_value(event.clone()).unwrap();
+                match event {
+                    TurnEvent::ReasoningDelta { text:t } => reasoning.push_str(&t),
+                    TurnEvent::ReasoningSignature { signature:s } => signature=Some(s),
+                    TurnEvent::TextDelta { text:t } => text.push_str(&t),
+                    TurnEvent::ToolCallStart { index,id,name } => { calls.insert(index,(id,name,String::new())); },
+                    TurnEvent::ToolCallDelta { index,arguments } => calls.get_mut(&index).unwrap().2.push_str(&arguments),
+                    _ => {}
+                }
+            }
+            assert!(!calls.is_empty(),"thinking tool turn must call a tool");
+            if !reasoning.is_empty() { turn.items.push(Item::Reasoning { text:reasoning,signature }); }
+            if !text.is_empty() { turn.items.push(Item::Message { role:Role::Assistant,content:vec![Part::text(text)] }); }
+            for (id,name,arguments) in calls.values() { turn.items.push(Item::ToolCall { id:id.clone(),name:name.clone(),arguments:arguments.clone() }); }
+            for (id,_,_) in calls.values() { turn.items.push(Item::ToolResult { call_id:id.clone(),content:vec![Part::text("Cloudvale: sunny, 20 C")],is_error:false }); }
+            collector.0.lock().unwrap().clear();
+            let events:Result<Vec<_>,_> = upstream.start(turn.clone()).await.unwrap().collect::<Vec<_>>().await.into_iter().collect();
+            let mut followup = json!({"version":1,"flavor":flavor.name(),"deepseek_thinking":case["thinking"],"turn":turn,
+                "entries":collector.0.lock().unwrap().clone(),"expected_events":events.unwrap()});
+            sanitizer.value(&mut followup);
+            std::fs::write(directory.join(format!("{}-followup.json",case["name"].as_str().unwrap())),serde_json::to_vec_pretty(&followup).unwrap()).unwrap();
+            println!("captured {} followup",case["name"]);
+        }
     }
 }
 #[tokio::test]

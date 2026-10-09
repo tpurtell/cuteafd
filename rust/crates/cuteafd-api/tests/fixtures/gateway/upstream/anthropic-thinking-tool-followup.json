@@ -1,0 +1,449 @@
+{
+  "version": 1,
+  "flavor": "anthropic",
+  "deepseek_thinking": true,
+  "turn": {
+    "requested_model": "",
+    "model": "deepseek-flash",
+    "system": null,
+    "items": [
+      {
+        "item": "message",
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "Use the get_weather tool for the fictional city Cloudvale."
+          }
+        ]
+      },
+      {
+        "item": "reasoning",
+        "text": "The user wants me to use the get_weather tool for a fictional city called Cloudvale. Let me do that.",
+        "signature": "c0a970bf-fa7e-4a20-a546-42c2691c0757"
+      },
+      {
+        "item": "tool_call",
+        "id": "call_00_ydmAigaIXRLimd1X7lOQ8515",
+        "name": "get_weather",
+        "arguments": "{\"city\": \"Cloudvale\"}"
+      },
+      {
+        "item": "tool_result",
+        "call_id": "call_00_ydmAigaIXRLimd1X7lOQ8515",
+        "content": [
+          {
+            "type": "text",
+            "text": "Cloudvale: sunny, 20 C"
+          }
+        ],
+        "is_error": false
+      }
+    ],
+    "tools": [
+      {
+        "name": "get_weather",
+        "description": null,
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "city": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "city"
+          ]
+        },
+        "strict": false
+      }
+    ],
+    "tool_choice": {
+      "mode": "auto"
+    },
+    "parallel_tool_calls": null,
+    "max_output_tokens": 256,
+    "sampling": {
+      "temperature": null,
+      "top_p": null,
+      "top_k": null,
+      "stop": [],
+      "seed": null
+    },
+    "reasoning": {
+      "enabled": true,
+      "effort": "low",
+      "budget_tokens": null,
+      "return_text": false
+    },
+    "response_format": null,
+    "hosted": {
+      "web_search": null
+    },
+    "modalities": {
+      "audio_out": false
+    },
+    "session": null
+  },
+  "entries": [
+    {
+      "kind": "upstream",
+      "entry": {
+        "flavor": "anthropic",
+        "request": {
+          "model": "deepseek-flash",
+          "messages": [
+            {
+              "role": "user",
+              "content": [
+                {
+                  "type": "text",
+                  "text": "Use the get_weather tool for the fictional city Cloudvale."
+                }
+              ]
+            },
+            {
+              "role": "assistant",
+              "content": [
+                {
+                  "type": "thinking",
+                  "thinking": "The user wants me to use the get_weather tool for a fictional city called Cloudvale. Let me do that.",
+                  "signature": "c0a970bf-fa7e-4a20-a546-42c2691c0757"
+                },
+                {
+                  "type": "tool_use",
+                  "id": "call_00_ydmAigaIXRLimd1X7lOQ8515",
+                  "name": "get_weather",
+                  "input": {
+                    "city": "Cloudvale"
+                  }
+                }
+              ]
+            },
+            {
+              "role": "user",
+              "content": [
+                {
+                  "type": "tool_result",
+                  "tool_use_id": "call_00_ydmAigaIXRLimd1X7lOQ8515",
+                  "content": [
+                    {
+                      "type": "text",
+                      "text": "Cloudvale: sunny, 20 C"
+                    }
+                  ],
+                  "is_error": false
+                }
+              ]
+            }
+          ],
+          "stream": true,
+          "max_tokens": 256,
+          "tools": [
+            {
+              "name": "get_weather",
+              "description": "",
+              "input_schema": {
+                "type": "object",
+                "properties": {
+                  "city": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "city"
+                ]
+              }
+            }
+          ],
+          "tool_choice": {
+            "type": "auto"
+          },
+          "thinking": {
+            "type": "enabled",
+            "budget_tokens": 1024
+          },
+          "output_config": {
+            "effort": "low"
+          }
+        },
+        "status": 200,
+        "body": "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"510f5e5c-e116-4daa-96c2-bed688548f4a\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"deepseek-flash\",\"content\":[],\"stop_reason\":null,\"stop_sequence\":null,\"usage\":{\"input_tokens\":251,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":128,\"output_tokens\":0,\"service_tier\":\"standard\"}}}\n\nevent: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\",\"signature\":\"\"}}\n\nevent: ping\ndata: {\"type\":\"ping\"}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"signature_delta\",\"signature\":\"510f5e5c-e116-4daa-96c2-bed688548f4a\"}}\n\nevent: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\nevent: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"Here\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"'s\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\" the\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\" weather\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\" for\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\" **\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"Cloud\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"vale\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"**\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\":\\n\\n\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"-\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\" **\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"Conditions\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\":**\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\" Sunny\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\" ☀\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"️\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"\\n\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"-\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\" **\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"Temperature\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\":**\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\" \"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"20\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\" °\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"C\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\" (\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"68\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\" °\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"F\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\")\\n\\n\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"A\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\" pleasant\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\",\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\" mild\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\" day\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\" —\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\" perfect\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\" weather\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\" for\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\" being\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\" outdoors\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"!\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\" Let\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\" me\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\" know\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\" if\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\" you\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"'d\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\" like\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\" the\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\" forecast\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\" for\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\" any\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\" other\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\" cities\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\".\"}}\n\nevent: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":1}\n\nevent: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\",\"stop_sequence\":null},\"usage\":{\"input_tokens\":251,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":128,\"output_tokens\":59,\"service_tier\":\"standard\"}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+        "truncated": false
+      }
+    }
+  ],
+  "expected_events": [
+    {
+      "event": "usage",
+      "usage": {
+        "input_tokens": 379,
+        "output_tokens": 0,
+        "cached_input_tokens": 128,
+        "reasoning_tokens": 0,
+        "web_search_requests": 0,
+        "cache_creation_input_tokens": 0
+      }
+    },
+    {
+      "event": "reasoning_signature",
+      "signature": "510f5e5c-e116-4daa-96c2-bed688548f4a"
+    },
+    {
+      "event": "text_delta",
+      "text": "Here"
+    },
+    {
+      "event": "text_delta",
+      "text": "'s"
+    },
+    {
+      "event": "text_delta",
+      "text": " the"
+    },
+    {
+      "event": "text_delta",
+      "text": " weather"
+    },
+    {
+      "event": "text_delta",
+      "text": " for"
+    },
+    {
+      "event": "text_delta",
+      "text": " **"
+    },
+    {
+      "event": "text_delta",
+      "text": "Cloud"
+    },
+    {
+      "event": "text_delta",
+      "text": "vale"
+    },
+    {
+      "event": "text_delta",
+      "text": "**"
+    },
+    {
+      "event": "text_delta",
+      "text": ":\n\n"
+    },
+    {
+      "event": "text_delta",
+      "text": "-"
+    },
+    {
+      "event": "text_delta",
+      "text": " **"
+    },
+    {
+      "event": "text_delta",
+      "text": "Conditions"
+    },
+    {
+      "event": "text_delta",
+      "text": ":**"
+    },
+    {
+      "event": "text_delta",
+      "text": " Sunny"
+    },
+    {
+      "event": "text_delta",
+      "text": " ☀"
+    },
+    {
+      "event": "text_delta",
+      "text": "️"
+    },
+    {
+      "event": "text_delta",
+      "text": "\n"
+    },
+    {
+      "event": "text_delta",
+      "text": "-"
+    },
+    {
+      "event": "text_delta",
+      "text": " **"
+    },
+    {
+      "event": "text_delta",
+      "text": "Temperature"
+    },
+    {
+      "event": "text_delta",
+      "text": ":**"
+    },
+    {
+      "event": "text_delta",
+      "text": " "
+    },
+    {
+      "event": "text_delta",
+      "text": "20"
+    },
+    {
+      "event": "text_delta",
+      "text": " °"
+    },
+    {
+      "event": "text_delta",
+      "text": "C"
+    },
+    {
+      "event": "text_delta",
+      "text": " ("
+    },
+    {
+      "event": "text_delta",
+      "text": "68"
+    },
+    {
+      "event": "text_delta",
+      "text": " °"
+    },
+    {
+      "event": "text_delta",
+      "text": "F"
+    },
+    {
+      "event": "text_delta",
+      "text": ")\n\n"
+    },
+    {
+      "event": "text_delta",
+      "text": "A"
+    },
+    {
+      "event": "text_delta",
+      "text": " pleasant"
+    },
+    {
+      "event": "text_delta",
+      "text": ","
+    },
+    {
+      "event": "text_delta",
+      "text": " mild"
+    },
+    {
+      "event": "text_delta",
+      "text": " day"
+    },
+    {
+      "event": "text_delta",
+      "text": " —"
+    },
+    {
+      "event": "text_delta",
+      "text": " perfect"
+    },
+    {
+      "event": "text_delta",
+      "text": " weather"
+    },
+    {
+      "event": "text_delta",
+      "text": " for"
+    },
+    {
+      "event": "text_delta",
+      "text": " being"
+    },
+    {
+      "event": "text_delta",
+      "text": " outdoors"
+    },
+    {
+      "event": "text_delta",
+      "text": "!"
+    },
+    {
+      "event": "text_delta",
+      "text": " Let"
+    },
+    {
+      "event": "text_delta",
+      "text": " me"
+    },
+    {
+      "event": "text_delta",
+      "text": " know"
+    },
+    {
+      "event": "text_delta",
+      "text": " if"
+    },
+    {
+      "event": "text_delta",
+      "text": " you"
+    },
+    {
+      "event": "text_delta",
+      "text": "'d"
+    },
+    {
+      "event": "text_delta",
+      "text": " like"
+    },
+    {
+      "event": "text_delta",
+      "text": " the"
+    },
+    {
+      "event": "text_delta",
+      "text": " forecast"
+    },
+    {
+      "event": "text_delta",
+      "text": " for"
+    },
+    {
+      "event": "text_delta",
+      "text": " any"
+    },
+    {
+      "event": "text_delta",
+      "text": " other"
+    },
+    {
+      "event": "text_delta",
+      "text": " cities"
+    },
+    {
+      "event": "text_delta",
+      "text": "."
+    },
+    {
+      "event": "usage",
+      "usage": {
+        "input_tokens": 379,
+        "output_tokens": 59,
+        "cached_input_tokens": 128,
+        "reasoning_tokens": 0,
+        "web_search_requests": 0,
+        "cache_creation_input_tokens": 0
+      }
+    },
+    {
+      "event": "usage",
+      "usage": {
+        "input_tokens": 379,
+        "output_tokens": 59,
+        "cached_input_tokens": 128,
+        "reasoning_tokens": 0,
+        "web_search_requests": 0,
+        "cache_creation_input_tokens": 0
+      }
+    },
+    {
+      "event": "done",
+      "stop": {
+        "reason": "end_turn"
+      }
+    }
+  ]
+}
