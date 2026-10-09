@@ -160,7 +160,9 @@ fn chat(turn: &TurnRequest, config: &UpstreamConfig, names: &WireNames) -> Resul
     // response over an empty conversation carries instructions only).
     if !messages.iter().any(|m| m["role"] != "system") { messages.push(json!({"role":"user","content":EMPTY_TURN})); }
     let mut request = json!({"model":turn.model,"messages":messages,"stream":true,"stream_options":{"include_usage":true}});
-    if !turn.tools.is_empty() {
+    // tool_choice "none" is sent as no tools at all: same meaning, and some
+    // chat upstreams reject a "none" choice (live MiMo run, 2026-10-10).
+    if !turn.tools.is_empty() && turn.tool_choice != ToolChoice::None {
         request["tools"] = json!(turn.tools.iter().map(|tool| {
             let mut function = json!({"name":names.wire(&tool.name),"parameters":tool.parameters});
             if let Some(description) = &tool.description { function["description"] = json!(description); }

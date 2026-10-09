@@ -456,3 +456,14 @@ fn empty_conversation_gets_a_stand_in_user_turn() {
     let normal = backend(Flavor::OpenaiChat).map_request(&self::turn()).unwrap();
     assert_eq!(normal["messages"].as_array().unwrap().len(), 1, "real turns are untouched");
 }
+
+#[test]
+fn chat_tool_choice_none_omits_tools() {
+    let mut turn = turn();
+    turn.tools.push(ToolSpec { name: "f".into(), description: None, parameters: json!({"type":"object"}), strict: false });
+    turn.tool_choice = ToolChoice::None;
+    let chat = backend(Flavor::OpenaiChat).map_request(&turn).unwrap();
+    assert!(chat.get("tools").is_none() && chat.get("tool_choice").is_none());
+    turn.tool_choice = ToolChoice::Auto;
+    assert_eq!(backend(Flavor::OpenaiChat).map_request(&turn).unwrap()["tools"].as_array().unwrap().len(), 1);
+}
