@@ -111,7 +111,25 @@ pub(super) fn parse(
     }
     let mut new_items = Vec::new();
     let mut new_stored = Vec::new();
+    let mut additional_tools = Vec::new();
+    let mut effort_update = None;
     for entry in &input {
+        if entry["type"] == "additional_tools" {
+            additional_tools.extend(
+                entry["tools"]
+                    .as_array()
+                    .ok_or_else(|| {
+                        GatewayError::invalid("additional_tools.tools must be an array")
+                            .with_param("input")
+                    })?
+                    .clone(),
+            );
+            continue;
+        }
+        if entry["type"] == "configuration_update" {
+            effort_update = optional_string(&entry["reasoning"], "effort")?;
+            continue;
+        }
         let id = string(entry, "id")?;
         let parsed = if entry["type"] == "item_reference" {
             let matches: Vec<Item> = history
@@ -215,7 +233,9 @@ pub(super) fn parse(
                 GatewayError::invalid("reasoning must be an object").with_param("reasoning")
             );
         }
-        turn.reasoning.effort = optional_string(reasoning, "effort")?;
+        turn.reasoning.effort = effort_update
+            .clone()
+            .or(optional_string(reasoning, "effort")?);
         if let Some(effort) = &turn.reasoning.effort {
             if !["none", "minimal", "low", "medium", "high", "xhigh", "max"]
                 .contains(&effort.as_str())
@@ -285,11 +305,12 @@ pub(super) fn parse(
     turn.reasoning.return_text = summary || encrypted;
     let mut kinds = HashMap::new();
     let mut names = HashMap::new();
-    let tools = match wire.get("tools") {
+    let mut tools = match wire.get("tools") {
         None | Some(Value::Null) => Vec::new(),
         Some(Value::Array(a)) => a.clone(),
         _ => return Err(GatewayError::invalid("tools must be an array").with_param("tools")),
     };
+    tools.extend(additional_tools);
     let mut flattened = Vec::new();
     for tool in tools {
         if tool["type"] == "namespace" {

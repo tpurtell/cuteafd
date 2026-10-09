@@ -303,7 +303,10 @@ impl Fold {
                     let kind = self.response["output"][i]["type"].as_str().unwrap();
                     if matches!(
                         stop,
-                        StopReason::MaxTokens | StopReason::Cancelled | StopReason::ContentFilter
+                        StopReason::MaxTokens
+                            | StopReason::Cancelled
+                            | StopReason::ContentFilter
+                            | StopReason::Refusal
                     ) && !self.finished.contains(&i)
                         && matches!(
                             kind,
@@ -446,6 +449,11 @@ impl Fold {
     }
 
     pub fn fail(&mut self, error: &GatewayError) {
+        for i in 0..self.response["output"].as_array().unwrap().len() {
+            if !self.finished.contains(&i) {
+                self.response["output"][i]["status"] = json!("incomplete");
+            }
+        }
         self.response["status"] = json!("failed");
         self.response["error"] = json!({"code":error.openai_body()["error"]["code"].as_str().unwrap_or("server_error"),"message":error.message});
         self.emit("error", json!({"code":self.response["error"]["code"],"message":error.message,"param":error.param}));

@@ -906,3 +906,81 @@ async fn open_function_cutoff_and_ordinary_refusal() {
         "completed"
     );
 }
+
+#[tokio::test]
+async fn codex_catalog_and_lite_additional_tools() {
+    let backend = Scripted::new(vec![vec![done()]]);
+    let gateway = Arc::new(Gateway::new(
+        Arc::new(backend.clone()),
+        ModelMap::official_names("served-model"),
+    ));
+    let app = crate::gateway::router(gateway.clone());
+    let (status, body) = request(
+        &app,
+        "GET",
+        "/v1/codex/models.json?client_version=0.161.0&deployment=ignored",
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let catalog: Value = serde_json::from_str(&body).unwrap();
+    let entry = catalog["models"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|v| v["slug"] == "gpt-6.1-sol")
+        .unwrap();
+    let sample: Value = serde_json::from_str(include_str!("codex-model-template.json")).unwrap();
+    for key in [
+        "shell_type",
+        "apply_patch_tool_type",
+        "supported_reasoning_levels",
+        "default_reasoning_level",
+        "supports_reasoning_summary_parameter",
+        "use_responses_lite",
+        "tool_mode",
+        "experimental_supported_tools",
+    ] {
+        assert_eq!(entry[key], sample[key], "{key}");
+    }
+    assert_eq!(entry["context_window"], 131072);
+    assert_eq!(entry["max_output_tokens"], 32768);
+    assert_eq!(entry["auto_compact_token_limit"], 98304);
+    assert_eq!(entry["effective_context_window_percent"], 75);
+    assert!(!catalog["models"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|v| v["slug"].as_str().unwrap().starts_with("claude-")));
+    let (status,body)=request(&app,"POST","/v1/responses",json!({"model":"gpt-6.1-sol","reasoning":{"effort":"low"},"input":[{"type":"additional_tools","id":"at_tools","role":"developer","tools":[{"type":"namespace","name":"functions","description":"","tools":[{"type":"custom","name":"apply_patch","format":{"type":"grammar","syntax":"lark","definition":"start: /.+/"}}]}]},{"type":"configuration_update","reasoning":{"effort":"high"}},{"role":"developer","content":"rules"},{"role":"user","content":"task"}]})).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let turn = &backend.turns()[0];
+    assert_eq!(turn.tools[0].name, "functions.apply_patch");
+    assert_eq!(turn.reasoning.effort.as_deref(), Some("high"));
+    assert_eq!(turn.items.len(), 2);
+}
+
+#[tokio::test]
+async fn failed_response_marks_open_calls_incomplete() {
+    let (app, backend, _) = app(vec![vec![]]);
+    backend.scripts.lock().unwrap()[0] = vec![
+        Ok(call(0, "c", "f")),
+        Ok(delta(0, "{")),
+        Err(GatewayError::upstream("interrupted")),
+    ];
+    let (_, body) = request(
+        &app,
+        "POST",
+        "/v1/responses",
+        json!({"model":"gpt-6.1-sol","stream":true}),
+    )
+    .await;
+    let ev = events(&body);
+    assert_eq!(
+        ev.last().unwrap()["response"]["output"][0]["status"],
+        "incomplete"
+    );
+    assert!(!ev
+        .iter()
+        .any(|v| v["type"] == "response.function_call_arguments.done"));
+}

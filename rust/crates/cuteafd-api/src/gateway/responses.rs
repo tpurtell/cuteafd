@@ -24,6 +24,7 @@ use super::{
     Gateway, GatewayError,
 };
 
+mod catalog;
 mod parse;
 mod render;
 #[cfg(test)]
@@ -31,6 +32,7 @@ mod tests;
 
 pub fn routes(gateway: Arc<Gateway>) -> Router {
     Router::new()
+        .route("/v1/codex/models.json", get(catalog::get))
         .route("/v1/responses", post(create).get(websocket))
         .route("/v1/responses/compact", post(compact))
         .route("/v1/responses/input_tokens", post(input_tokens))
