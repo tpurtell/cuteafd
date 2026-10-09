@@ -7,7 +7,7 @@ use crate::{
 use rusqlite::{params, types::Value as SqlValue, Connection};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
-type GroupKey = (String, String, String, String);
+type GroupKey = (String, String, String, String, bool);
 pub(crate) fn roll(
     c: &Connection,
     settings: &Settings,
@@ -35,15 +35,16 @@ pub(crate) fn roll(
                 r.protocol.clone(),
                 r.client_kind.clone(),
                 r.model_served.clone().unwrap_or_default(),
+                r.bench,
             ))
             .or_default()
             .push(r);
     }
-    for ((day, protocol, client, model), rows) in groups {
+    for ((day, protocol, client, model, bench), rows) in groups {
         let mut ttft = histogram(rows.iter().filter_map(|r| r.t_ttft_ms));
         let mut decode = histogram(rows.iter().filter_map(|r| r.decode_tps));
         use rusqlite::OptionalExtension;
-        let old:Option<(String,String)>=c.query_row("SELECT ttft_hist,decode_hist FROM daily WHERE day=?1 AND protocol=?2 AND client_kind=?3 AND model=?4",params![day,protocol,client,model],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
+        let old:Option<(String,String)>=c.query_row("SELECT ttft_hist,decode_hist,bench FROM daily WHERE day=?1 AND protocol=?2 AND client_kind=?3 AND model=?4 AND bench=?5",params![day,protocol,client,model,bench],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
         if let Some((a, b)) = old {
             let a: [u64; 24] = serde_json::from_str(&a)?;
             let b: [u64; 24] = serde_json::from_str(&b)?;
@@ -55,11 +56,11 @@ pub(crate) fn roll(
         let sum = |get: fn(&cuteafd_api::usage::Record) -> Option<u64>| {
             rows.iter().filter_map(get).sum::<u64>()
         };
-        c.execute("INSERT INTO daily VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)
-ON CONFLICT(day,protocol,client_kind,model) DO UPDATE SET requests=requests+excluded.requests,errors=errors+excluded.errors,
+        c.execute("INSERT INTO daily VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)
+ON CONFLICT(day,protocol,client_kind,model,bench) DO UPDATE SET requests=requests+excluded.requests,errors=errors+excluded.errors,
 tokens_in=tokens_in+excluded.tokens_in,tokens_cached=tokens_cached+excluded.tokens_cached,tokens_out=tokens_out+excluded.tokens_out,
 draft_proposed=draft_proposed+excluded.draft_proposed,draft_accepted=draft_accepted+excluded.draft_accepted,ttft_hist=excluded.ttft_hist,decode_hist=excluded.decode_hist",
-            params![day,protocol,client,model,rows.len() as u64,rows.iter().filter(|r|r.outcome!="ok").count() as u64,sum(|r|r.tokens_in),sum(|r|r.tokens_cached),sum(|r|r.tokens_out),sum(|r|r.draft_proposed),sum(|r|r.draft_accepted),serde_json::to_string(&ttft)?,serde_json::to_string(&decode)?])?;
+            params![day,protocol,client,model,rows.len() as u64,rows.iter().filter(|r|r.outcome!="ok").count() as u64,sum(|r|r.tokens_in),sum(|r|r.tokens_cached),sum(|r|r.tokens_out),sum(|r|r.draft_proposed),sum(|r|r.draft_accepted),serde_json::to_string(&ttft)?,serde_json::to_string(&decode)?,bench])?;
     }
     Ok(())
 }
@@ -77,7 +78,7 @@ pub(crate) fn expire(c: &Connection, s: &Settings, now: i64) -> Result<()> {
 impl Store {
     pub fn daily(&self, f: &Filter) -> Result<Vec<Value>> {
         let (from, to) = f.bounds(self.clock.now_ms())?;
-        let mut sql="SELECT day,protocol,client_kind,model,requests,errors,tokens_in,tokens_cached,tokens_out,draft_proposed,draft_accepted,ttft_hist,decode_hist FROM daily WHERE day>=date(?/1000,'unixepoch') AND day<=date(?/1000,'unixepoch')".to_string();
+        let mut sql="SELECT day,protocol,client_kind,model,requests,errors,tokens_in,tokens_cached,tokens_out,draft_proposed,draft_accepted,ttft_hist,decode_hist,bench FROM daily WHERE day>=date(?/1000,'unixepoch') AND day<=date(?/1000,'unixepoch')".to_string();
         let mut args = vec![SqlValue::Integer(from), SqlValue::Integer(to)];
         for (column, value) in [
             ("protocol", &f.protocol),
@@ -89,10 +90,13 @@ impl Store {
                 args.push(SqlValue::Text(v.clone()));
             }
         }
-        sql.push_str(" ORDER BY day,protocol,client_kind,model");
+        if !f.bench.unwrap_or(false) {
+            sql.push_str(" AND bench=0");
+        }
+        sql.push_str(" ORDER BY day,protocol,client_kind,model,bench");
         let c = self.reader.lock().map_err(|_| Error::Stopped)?;
         let mut stmt = c.prepare(&sql)?;
-        let rows=stmt.query_map(rusqlite::params_from_iter(args),|r|Ok(json!({"day":r.get::<_,String>(0)?,"protocol":r.get::<_,String>(1)?,"client":r.get::<_,String>(2)?,"model":r.get::<_,String>(3)?,"requests":r.get::<_,u64>(4)?,"errors":r.get::<_,u64>(5)?,"tokens_in":r.get::<_,u64>(6)?,"tokens_cached":r.get::<_,u64>(7)?,"tokens_out":r.get::<_,u64>(8)?,"draft_proposed":r.get::<_,u64>(9)?,"draft_accepted":r.get::<_,u64>(10)?,"ttft_hist":serde_json::from_str::<Value>(&r.get::<_,String>(11)?).unwrap_or(Value::Null),"decode_hist":serde_json::from_str::<Value>(&r.get::<_,String>(12)?).unwrap_or(Value::Null)})))?;
+        let rows=stmt.query_map(rusqlite::params_from_iter(args),|r|Ok(json!({"day":r.get::<_,String>(0)?,"protocol":r.get::<_,String>(1)?,"client":r.get::<_,String>(2)?,"model":r.get::<_,String>(3)?,"requests":r.get::<_,u64>(4)?,"errors":r.get::<_,u64>(5)?,"tokens_in":r.get::<_,u64>(6)?,"tokens_cached":r.get::<_,u64>(7)?,"tokens_out":r.get::<_,u64>(8)?,"draft_proposed":r.get::<_,u64>(9)?,"draft_accepted":r.get::<_,u64>(10)?,"ttft_hist":serde_json::from_str::<Value>(&r.get::<_,String>(11)?).unwrap_or(Value::Null),"decode_hist":serde_json::from_str::<Value>(&r.get::<_,String>(12)?).unwrap_or(Value::Null),"bench":r.get::<_,bool>(13)?})))?;
         rows.map(|r| r.map_err(Error::from)).collect()
     }
 }
@@ -129,6 +133,16 @@ mod tests {
                 ..Default::default()
             });
         }
+        store.record(Record {
+            rid: "bench".into(),
+            ts_ms: 86400000,
+            protocol: "chat".into(),
+            client_kind: "codex".into(),
+            bench: true,
+            tokens_in: Some(100),
+            outcome: "ok".into(),
+            ..Default::default()
+        });
         store.flush().unwrap();
         store.prune().unwrap();
         assert!(store.rows().unwrap().is_empty());
@@ -149,6 +163,12 @@ mod tests {
         let summary = store.query("summary", &f, None).unwrap();
         assert_eq!(summary["requests"], 100);
         assert_eq!(summary["resolution"], "daily");
+        let mut include = f.clone();
+        include.bench = Some(true);
+        assert_eq!(store.daily(&include).unwrap().len(), 2);
+        let both = store.query("summary", &include, None).unwrap();
+        assert_eq!(both["requests"], 101);
+        assert_eq!(both["tokens_in"], 1100);
         clock.0.store(101 * 86400000, Relaxed);
         store.prune().unwrap();
         assert!(store.daily(&f).unwrap().is_empty());

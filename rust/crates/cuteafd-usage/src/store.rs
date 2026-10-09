@@ -226,8 +226,21 @@ CREATE TABLE IF NOT EXISTS sessions (session_id TEXT PRIMARY KEY, source TEXT, c
 first_ms INTEGER, last_ms INTEGER, turns INTEGER, tokens_in INTEGER, tokens_cached INTEGER, tokens_out INTEGER, errors INTEGER);
 CREATE TABLE IF NOT EXISTS daily (day TEXT, protocol TEXT, client_kind TEXT, model TEXT, requests INTEGER, errors INTEGER,
 tokens_in INTEGER, tokens_cached INTEGER, tokens_out INTEGER, draft_proposed INTEGER, draft_accepted INTEGER,
-ttft_hist TEXT, decode_hist TEXT, PRIMARY KEY(day,protocol,client_kind,model));
+ttft_hist TEXT, decode_hist TEXT, bench INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(day,protocol,client_kind,model,bench));
 CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY,value TEXT NOT NULL);")?;
+    let has_bench = c
+        .prepare("PRAGMA table_info(daily)")?
+        .query_map([], |r| r.get::<_, String>(1))?
+        .collect::<std::result::Result<Vec<_>, _>>()?
+        .iter()
+        .any(|name| name == "bench");
+    if !has_bench {
+        c.execute_batch("BEGIN; ALTER TABLE daily RENAME TO daily_old;
+CREATE TABLE daily(day TEXT,protocol TEXT,client_kind TEXT,model TEXT,requests INTEGER,errors INTEGER,
+tokens_in INTEGER,tokens_cached INTEGER,tokens_out INTEGER,draft_proposed INTEGER,draft_accepted INTEGER,
+ttft_hist TEXT,decode_hist TEXT,bench INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(day,protocol,client_kind,model,bench));
+INSERT INTO daily SELECT *,0 FROM daily_old; DROP TABLE daily_old; COMMIT;")?;
+    }
     Ok(())
 }
 fn writer(
