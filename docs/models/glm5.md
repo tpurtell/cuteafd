@@ -76,7 +76,8 @@ GLM 5.3 EXL3 K4, 1 RTX + 4 Sparks. `SPECULATOR_FP8=off` keeps the BF16 drafter.
   for these small-row shapes is deferred). Spark input arrives as FP8 K32 wire
   rows, so W4A4 activations are quantized twice (FP8, then FP4). FC1 quantizes
   with the gate projection's `input_scale` and dequantizes the up half with the
-  up projection's; ModelOpt sets them equal, but the loader does not yet check.
+  up projection's. They are bit-identical for every expert in
+  `nvidia/GLM-5.3-NVFP4`, but the loader does not yet check.
 
 ## Changelog
 
