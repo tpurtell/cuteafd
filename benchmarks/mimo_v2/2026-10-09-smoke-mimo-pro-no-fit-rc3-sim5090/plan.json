@@ -1,0 +1,1835 @@
+{
+  "vision": "auto",
+  "audio": "auto",
+  "disabled_media_bytes": 0,
+  "encoder": {
+    "kind": {
+      "kind": "spark",
+      "rank": 4
+    },
+    "weights": 1479142464,
+    "scratch": 981765120,
+    "replicas": [],
+    "reason": "Spark: lightest expert slice, then most free memory; tower + scratch + 1 GiB admitted",
+    "shortfall": 0
+  },
+  "audio_encoder": {
+    "kind": {
+      "kind": "spark",
+      "rank": 5
+    },
+    "weights": 2428784640,
+    "scratch": 1497697024,
+    "replicas": [],
+    "reason": "Spark: lightest expert slice, then most free memory; tower + scratch + 1 GiB admitted",
+    "shortfall": 0
+  },
+  "encoder_plan_hash": "220f82fcd371819874c464e203a6935f96880bc66799fcf98c2a2c742f86e7ff",
+  "snapshot": "/root/.cache/huggingface/hub/models--XiaomiMiMo--MiMo-V2.6-Pro-MOPD/snapshots/adea8e2c5373181e5a973fa1ecb343cb31af214b",
+  "family": "mimo_v2",
+  "architectures": [
+    "MiMoV2ForCausalLM"
+  ],
+  "quantization": null,
+  "runtime": "serving",
+  "config_error": null,
+  "spec": {
+    "family": "mimo_v2",
+    "architecture": "MiMoV2ForCausalLM",
+    "hidden": 6144,
+    "vocab": 152576,
+    "layers": [
+      {
+        "attention": {
+          "kind": "gqa",
+          "heads": 128,
+          "kv_heads": 8,
+          "head_dim": 192
+        },
+        "ffn": {
+          "kind": "dense",
+          "intermediate": 16384
+        },
+        "rope": {
+          "dims": 64,
+          "theta": 10000000.0
+        }
+      },
+      {
+        "attention": {
+          "kind": "sliding_gqa",
+          "heads": 128,
+          "kv_heads": 8,
+          "head_dim": 192,
+          "window": 128,
+          "sinks": true
+        },
+        "ffn": {
+          "kind": "moe"
+        },
+        "rope": {
+          "dims": 64,
+          "theta": 10000.0
+        }
+      },
+      {
+        "attention": {
+          "kind": "sliding_gqa",
+          "heads": 128,
+          "kv_heads": 8,
+          "head_dim": 192,
+          "window": 128,
+          "sinks": true
+        },
+        "ffn": {
+          "kind": "moe"
+        },
+        "rope": {
+          "dims": 64,
+          "theta": 10000.0
+        }
+      },
+      {
+        "attention": {
+          "kind": "sliding_gqa",
+          "heads": 128,
+          "kv_heads": 8,
+          "head_dim": 192,
+          "window": 128,
+          "sinks": true
+        },
+        "ffn": {
+          "kind": "moe"
+        },
+        "rope": {
+          "dims": 64,
+          "theta": 10000.0
+        }
+      },
+      {
+        "attention": {
+          "kind": "sliding_gqa",
+          "heads": 128,
+          "kv_heads": 8,
+          "head_dim": 192,
+          "window": 128,
+          "sinks": true
+        },
+        "ffn": {
+          "kind": "moe"
+        },
+        "rope": {
+          "dims": 64,
+          "theta": 10000.0
+        }
+      },
+      {
+        "attention": {
+          "kind": "sliding_gqa",
+          "heads": 128,
+          "kv_heads": 8,
+          "head_dim": 192,
+          "window": 128,
+          "sinks": true
+        },
+        "ffn": {
+          "kind": "moe"
+        },
+        "rope": {
+          "dims": 64,
+          "theta": 10000.0
+        }
+      },
+      {
+        "attention": {
+          "kind": "sliding_gqa",
+          "heads": 128,
+          "kv_heads": 8,
+          "head_dim": 192,
+          "window": 128,
+          "sinks": true
+        },
+        "ffn": {
+          "kind": "moe"
+        },
+        "rope": {
+          "dims": 64,
+          "theta": 10000.0
+        }
+      },
+      {
+        "attention": {
+          "kind": "gqa",
+          "heads": 128,
+          "kv_heads": 8,
+          "head_dim": 192
+        },
+        "ffn": {
+          "kind": "moe"
+        },
+        "rope": {
+          "dims": 64,
+          "theta": 10000000.0
+        }
+      },
+      {
+        "attention": {
+          "kind": "sliding_gqa",
+          "heads": 128,
+          "kv_heads": 8,
+          "head_dim": 192,
+          "window": 128,
+          "sinks": true
+        },
+        "ffn": {
+          "kind": "moe"
+        },
+        "rope": {
+          "dims": 64,
+          "theta": 10000.0
+        }
+      },
+      {
+        "attention": {
+          "kind": "sliding_gqa",
+          "heads": 128,
+          "kv_heads": 8,
+          "head_dim": 192,
+          "window": 128,
+          "sinks": true
+        },
+        "ffn": {
+          "kind": "moe"
+        },
+        "rope": {
+          "dims": 64,
+          "theta": 10000.0
+        }
+      },
+      {
+        "attention": {
+          "kind": "sliding_gqa",
+          "heads": 128,
+          "kv_heads": 8,
+          "head_dim": 192,
+          "window": 128,
+          "sinks": true
+        },
+        "ffn": {
+          "kind": "moe"
+        },
+        "rope": {
+          "dims": 64,
+          "theta": 10000.0
+        }
+      },
+      {
+        "attention": {
+          "kind": "sliding_gqa",
+          "heads": 128,
+          "kv_heads": 8,
+          "head_dim": 192,
+          "window": 128,
+          "sinks": true
+        },
+        "ffn": {
+          "kind": "moe"
+        },
+        "rope": {
+          "dims": 64,
+          "theta": 10000.0
+        }
+      },
+      {
+        "attention": {
+          "kind": "sliding_gqa",
+          "heads": 128,
+          "kv_heads": 8,
+          "head_dim": 192,
+          "window": 128,
+          "sinks": true
+        },
+        "ffn": {
+          "kind": "moe"
+        },
+        "rope": {
+          "dims": 64,
+          "theta": 10000.0
+        }
+      },
+      {
+        "attention": {
+          "kind": "sliding_gqa",
+          "heads": 128,
+          "kv_heads": 8,
+          "head_dim": 192,
+          "window": 128,
+          "sinks": true
+        },
+        "ffn": {
+          "kind": "moe"
+        },
+        "rope": {
+          "dims": 64,
+          "theta": 10000.0
+        }
+      },
+      {
+        "attention": {
+          "kind": "sliding_gqa",
+          "heads": 128,
+          "kv_heads": 8,
+          "head_dim": 192,
+          "window": 128,
+          "sinks": true
+        },
+        "ffn": {
+          "kind": "moe"
+        },
+        "rope": {
+          "dims": 64,
+          "theta": 10000.0
+        }
+      },
+      {
+        "attention": {
+          "kind": "gqa",
+          "heads": 128,
+          "kv_heads": 8,
+          "head_dim": 192
+        },
+        "ffn": {
+          "kind": "moe"
+        },
+        "rope": {
+          "dims": 64,
+          "theta": 10000000.0
+        }
+      },
+      {
+        "attention": {
+          "kind": "sliding_gqa",
+          "heads": 128,
+          "kv_heads": 8,
+          "head_dim": 192,
+          "window": 128,
+          "sinks": true
+        },
+        "ffn": {
+          "kind": "moe"
+        },
+        "rope": {
+          "dims": 64,
+          "theta": 10000.0
+        }
+      },
+      {
+        "attention": {
+          "kind": "sliding_gqa",
+          "heads": 128,
+          "kv_heads": 8,
+          "head_dim": 192,
+          "window": 128,
+          "sinks": true
+        },
+        "ffn": {
+          "kind": "moe"
+        },
+        "rope": {
+          "dims": 64,
+          "theta": 10000.0
+        }
+      },
+      {
+        "attention": {
+          "kind": "sliding_gqa",
+          "heads": 128,
+          "kv_heads": 8,
+          "head_dim": 192,
+          "window": 128,
+          "sinks": true
+        },
+        "ffn": {
+          "kind": "moe"
+        },
+        "rope": {
+          "dims": 64,
+          "theta": 10000.0
+        }
+      },
+      {
+        "attention": {
+          "kind": "sliding_gqa",
+          "heads": 128,
+          "kv_heads": 8,
+          "head_dim": 192,
+          "window": 128,
+          "sinks": true
+        },
+        "ffn": {
+          "kind": "moe"
+        },
+        "rope": {
+          "dims": 64,
+          "theta": 10000.0
+        }
+      },
+      {
+        "attention": {
+          "kind": "sliding_gqa",
+          "heads": 128,
+          "kv_heads": 8,
+          "head_dim": 192,
+          "window": 128,
+          "sinks": true
+        },
+        "ffn": {
+          "kind": "moe"
+        },
+        "rope": {
+          "dims": 64,
+          "theta": 10000.0
+        }
+      },
+      {
+        "attention": {
+          "kind": "sliding_gqa",
+          "heads": 128,
+          "kv_heads": 8,
+          "head_dim": 192,
+          "window": 128,
+          "sinks": true
+        },
+        "ffn": {
+          "kind": "moe"
+        },
+        "rope": {
+          "dims": 64,
+          "theta": 10000.0
+        }
+      },
+      {
+        "attention": {
+          "kind": "sliding_gqa",
+          "heads": 128,
+          "kv_heads": 8,
+          "head_dim": 192,
+          "window": 128,
+          "sinks": true
+        },
+        "ffn": {
+          "kind": "moe"
+        },
+        "rope": {
+          "dims": 64,
+          "theta": 10000.0
+        }
+      },
+      {
+        "attention": {
+          "kind": "gqa",
+          "heads": 128,
+          "kv_heads": 8,
+          "head_dim": 192
+        },
+        "ffn": {
+          "kind": "moe"
+        },
+        "rope": {
+          "dims": 64,
+          "theta": 10000000.0
+        }
+      },
+      {
+        "attention": {
+          "kind": "sliding_gqa",
+          "heads": 128,
+          "kv_heads": 8,
+          "head_dim": 192,
+          "window": 128,
+          "sinks": true
+        },
+        "ffn": {
+          "kind": "moe"
+        },
+        "rope": {
+          "dims": 64,
+          "theta": 10000.0
+        }
+      },
+      {
+        "attention": {
+          "kind": "sliding_gqa",
+          "heads": 128,
+          "kv_heads": 8,
+          "head_dim": 192,
+          "window": 128,
+          "sinks": true
+        },
+        "ffn": {
+          "kind": "moe"
+        },
+        "rope": {
+          "dims": 64,
+          "theta": 10000.0
+        }
+      },
+      {
+        "attention": {
+          "kind": "sliding_gqa",
+          "heads": 128,
+          "kv_heads": 8,
+          "head_dim": 192,
+          "window": 128,
+          "sinks": true
+        },
+        "ffn": {
+          "kind": "moe"
+        },
+        "rope": {
+          "dims": 64,
+          "theta": 10000.0
+        }
+      },
+      {
+        "attention": {
+          "kind": "sliding_gqa",
+          "heads": 128,
+          "kv_heads": 8,
+          "head_dim": 192,
+          "window": 128,
+          "sinks": true
+        },
+        "ffn": {
+          "kind": "moe"
+        },
+        "rope": {
+          "dims": 64,
+          "theta": 10000.0
+        }
+      },
+      {
+        "attention": {
+          "kind": "sliding_gqa",
+          "heads": 128,
+          "kv_heads": 8,
+          "head_dim": 192,
+          "window": 128,
+          "sinks": true
+        },
+        "ffn": {
+          "kind": "moe"
+        },
+        "rope": {
+          "dims": 64,
+          "theta": 10000.0
+        }
+      },
+      {
+        "attention": {
+          "kind": "sliding_gqa",
+          "heads": 128,
+          "kv_heads": 8,
+          "head_dim": 192,
+          "window": 128,
+          "sinks": true
+        },
+        "ffn": {
+          "kind": "moe"
+        },
+        "rope": {
+          "dims": 64,
+          "theta": 10000.0
+        }
+      },
+      {
+        "attention": {
+          "kind": "sliding_gqa",
+          "heads": 128,
+          "kv_heads": 8,
+          "head_dim": 192,
+          "window": 128,
+          "sinks": true
+        },
+        "ffn": {
+          "kind": "moe"
+        },
+        "rope": {
+          "dims": 64,
+          "theta": 10000.0
+        }
+      },
+      {
+        "attention": {
+          "kind": "gqa",
+          "heads": 128,
+          "kv_heads": 8,
+          "head_dim": 192
+        },
+        "ffn": {
+          "kind": "moe"
+        },
+        "rope": {
+          "dims": 64,
+          "theta": 10000000.0
+        }
+      },
+      {
+        "attention": {
+          "kind": "sliding_gqa",
+          "heads": 128,
+          "kv_heads": 8,
+          "head_dim": 192,
+          "window": 128,
+          "sinks": true
+        },
+        "ffn": {
+          "kind": "moe"
+        },
+        "rope": {
+          "dims": 64,
+          "theta": 10000.0
+        }
+      },
+      {
+        "attention": {
+          "kind": "sliding_gqa",
+          "heads": 128,
+          "kv_heads": 8,
+          "head_dim": 192,
+          "window": 128,
+          "sinks": true
+        },
+        "ffn": {
+          "kind": "moe"
+        },
+        "rope": {
+          "dims": 64,
+          "theta": 10000.0
+        }
+      },
+      {
+        "attention": {
+          "kind": "sliding_gqa",
+          "heads": 128,
+          "kv_heads": 8,
+          "head_dim": 192,
+          "window": 128,
+          "sinks": true
+        },
+        "ffn": {
+          "kind": "moe"
+        },
+        "rope": {
+          "dims": 64,
+          "theta": 10000.0
+        }
+      },
+      {
+        "attention": {
+          "kind": "sliding_gqa",
+          "heads": 128,
+          "kv_heads": 8,
+          "head_dim": 192,
+          "window": 128,
+          "sinks": true
+        },
+        "ffn": {
+          "kind": "moe"
+        },
+        "rope": {
+          "dims": 64,
+          "theta": 10000.0
+        }
+      },
+      {
+        "attention": {
+          "kind": "sliding_gqa",
+          "heads": 128,
+          "kv_heads": 8,
+          "head_dim": 192,
+          "window": 128,
+          "sinks": true
+        },
+        "ffn": {
+          "kind": "moe"
+        },
+        "rope": {
+          "dims": 64,
+          "theta": 10000.0
+        }
+      },
+      {
+        "attention": {
+          "kind": "sliding_gqa",
+          "heads": 128,
+          "kv_heads": 8,
+          "head_dim": 192,
+          "window": 128,
+          "sinks": true
+        },
+        "ffn": {
+          "kind": "moe"
+        },
+        "rope": {
+          "dims": 64,
+          "theta": 10000.0
+        }
+      },
+      {
+        "attention": {
+          "kind": "sliding_gqa",
+          "heads": 128,
+          "kv_heads": 8,
+          "head_dim": 192,
+          "window": 128,
+          "sinks": true
+        },
+        "ffn": {
+          "kind": "moe"
+        },
+        "rope": {
+          "dims": 64,
+          "theta": 10000.0
+        }
+      },
+      {
+        "attention": {
+          "kind": "gqa",
+          "heads": 128,
+          "kv_heads": 8,
+          "head_dim": 192
+        },
+        "ffn": {
+          "kind": "moe"
+        },
+        "rope": {
+          "dims": 64,
+          "theta": 10000000.0
+        }
+      },
+      {
+        "attention": {
+          "kind": "sliding_gqa",
+          "heads": 128,
+          "kv_heads": 8,
+          "head_dim": 192,
+          "window": 128,
+          "sinks": true
+        },
+        "ffn": {
+          "kind": "moe"
+        },
+        "rope": {
+          "dims": 64,
+          "theta": 10000.0
+        }
+      },
+      {
+        "attention": {
+          "kind": "sliding_gqa",
+          "heads": 128,
+          "kv_heads": 8,
+          "head_dim": 192,
+          "window": 128,
+          "sinks": true
+        },
+        "ffn": {
+          "kind": "moe"
+        },
+        "rope": {
+          "dims": 64,
+          "theta": 10000.0
+        }
+      },
+      {
+        "attention": {
+          "kind": "sliding_gqa",
+          "heads": 128,
+          "kv_heads": 8,
+          "head_dim": 192,
+          "window": 128,
+          "sinks": true
+        },
+        "ffn": {
+          "kind": "moe"
+        },
+        "rope": {
+          "dims": 64,
+          "theta": 10000.0
+        }
+      },
+      {
+        "attention": {
+          "kind": "sliding_gqa",
+          "heads": 128,
+          "kv_heads": 8,
+          "head_dim": 192,
+          "window": 128,
+          "sinks": true
+        },
+        "ffn": {
+          "kind": "moe"
+        },
+        "rope": {
+          "dims": 64,
+          "theta": 10000.0
+        }
+      },
+      {
+        "attention": {
+          "kind": "sliding_gqa",
+          "heads": 128,
+          "kv_heads": 8,
+          "head_dim": 192,
+          "window": 128,
+          "sinks": true
+        },
+        "ffn": {
+          "kind": "moe"
+        },
+        "rope": {
+          "dims": 64,
+          "theta": 10000.0
+        }
+      },
+      {
+        "attention": {
+          "kind": "sliding_gqa",
+          "heads": 128,
+          "kv_heads": 8,
+          "head_dim": 192,
+          "window": 128,
+          "sinks": true
+        },
+        "ffn": {
+          "kind": "moe"
+        },
+        "rope": {
+          "dims": 64,
+          "theta": 10000.0
+        }
+      },
+      {
+        "attention": {
+          "kind": "sliding_gqa",
+          "heads": 128,
+          "kv_heads": 8,
+          "head_dim": 192,
+          "window": 128,
+          "sinks": true
+        },
+        "ffn": {
+          "kind": "moe"
+        },
+        "rope": {
+          "dims": 64,
+          "theta": 10000.0
+        }
+      },
+      {
+        "attention": {
+          "kind": "gqa",
+          "heads": 128,
+          "kv_heads": 8,
+          "head_dim": 192
+        },
+        "ffn": {
+          "kind": "moe"
+        },
+        "rope": {
+          "dims": 64,
+          "theta": 10000000.0
+        }
+      },
+      {
+        "attention": {
+          "kind": "sliding_gqa",
+          "heads": 128,
+          "kv_heads": 8,
+          "head_dim": 192,
+          "window": 128,
+          "sinks": true
+        },
+        "ffn": {
+          "kind": "moe"
+        },
+        "rope": {
+          "dims": 64,
+          "theta": 10000.0
+        }
+      },
+      {
+        "attention": {
+          "kind": "sliding_gqa",
+          "heads": 128,
+          "kv_heads": 8,
+          "head_dim": 192,
+          "window": 128,
+          "sinks": true
+        },
+        "ffn": {
+          "kind": "moe"
+        },
+        "rope": {
+          "dims": 64,
+          "theta": 10000.0
+        }
+      },
+      {
+        "attention": {
+          "kind": "sliding_gqa",
+          "heads": 128,
+          "kv_heads": 8,
+          "head_dim": 192,
+          "window": 128,
+          "sinks": true
+        },
+        "ffn": {
+          "kind": "moe"
+        },
+        "rope": {
+          "dims": 64,
+          "theta": 10000.0
+        }
+      },
+      {
+        "attention": {
+          "kind": "sliding_gqa",
+          "heads": 128,
+          "kv_heads": 8,
+          "head_dim": 192,
+          "window": 128,
+          "sinks": true
+        },
+        "ffn": {
+          "kind": "moe"
+        },
+        "rope": {
+          "dims": 64,
+          "theta": 10000.0
+        }
+      },
+      {
+        "attention": {
+          "kind": "sliding_gqa",
+          "heads": 128,
+          "kv_heads": 8,
+          "head_dim": 192,
+          "window": 128,
+          "sinks": true
+        },
+        "ffn": {
+          "kind": "moe"
+        },
+        "rope": {
+          "dims": 64,
+          "theta": 10000.0
+        }
+      },
+      {
+        "attention": {
+          "kind": "sliding_gqa",
+          "heads": 128,
+          "kv_heads": 8,
+          "head_dim": 192,
+          "window": 128,
+          "sinks": true
+        },
+        "ffn": {
+          "kind": "moe"
+        },
+        "rope": {
+          "dims": 64,
+          "theta": 10000.0
+        }
+      },
+      {
+        "attention": {
+          "kind": "sliding_gqa",
+          "heads": 128,
+          "kv_heads": 8,
+          "head_dim": 192,
+          "window": 128,
+          "sinks": true
+        },
+        "ffn": {
+          "kind": "moe"
+        },
+        "rope": {
+          "dims": 64,
+          "theta": 10000.0
+        }
+      },
+      {
+        "attention": {
+          "kind": "gqa",
+          "heads": 128,
+          "kv_heads": 8,
+          "head_dim": 192
+        },
+        "ffn": {
+          "kind": "moe"
+        },
+        "rope": {
+          "dims": 64,
+          "theta": 10000000.0
+        }
+      },
+      {
+        "attention": {
+          "kind": "sliding_gqa",
+          "heads": 128,
+          "kv_heads": 8,
+          "head_dim": 192,
+          "window": 128,
+          "sinks": true
+        },
+        "ffn": {
+          "kind": "moe"
+        },
+        "rope": {
+          "dims": 64,
+          "theta": 10000.0
+        }
+      },
+      {
+        "attention": {
+          "kind": "sliding_gqa",
+          "heads": 128,
+          "kv_heads": 8,
+          "head_dim": 192,
+          "window": 128,
+          "sinks": true
+        },
+        "ffn": {
+          "kind": "moe"
+        },
+        "rope": {
+          "dims": 64,
+          "theta": 10000.0
+        }
+      },
+      {
+        "attention": {
+          "kind": "sliding_gqa",
+          "heads": 128,
+          "kv_heads": 8,
+          "head_dim": 192,
+          "window": 128,
+          "sinks": true
+        },
+        "ffn": {
+          "kind": "moe"
+        },
+        "rope": {
+          "dims": 64,
+          "theta": 10000.0
+        }
+      },
+      {
+        "attention": {
+          "kind": "sliding_gqa",
+          "heads": 128,
+          "kv_heads": 8,
+          "head_dim": 192,
+          "window": 128,
+          "sinks": true
+        },
+        "ffn": {
+          "kind": "moe"
+        },
+        "rope": {
+          "dims": 64,
+          "theta": 10000.0
+        }
+      },
+      {
+        "attention": {
+          "kind": "sliding_gqa",
+          "heads": 128,
+          "kv_heads": 8,
+          "head_dim": 192,
+          "window": 128,
+          "sinks": true
+        },
+        "ffn": {
+          "kind": "moe"
+        },
+        "rope": {
+          "dims": 64,
+          "theta": 10000.0
+        }
+      },
+      {
+        "attention": {
+          "kind": "sliding_gqa",
+          "heads": 128,
+          "kv_heads": 8,
+          "head_dim": 192,
+          "window": 128,
+          "sinks": true
+        },
+        "ffn": {
+          "kind": "moe"
+        },
+        "rope": {
+          "dims": 64,
+          "theta": 10000.0
+        }
+      },
+      {
+        "attention": {
+          "kind": "gqa",
+          "heads": 128,
+          "kv_heads": 8,
+          "head_dim": 192
+        },
+        "ffn": {
+          "kind": "moe"
+        },
+        "rope": {
+          "dims": 64,
+          "theta": 10000000.0
+        }
+      },
+      {
+        "attention": {
+          "kind": "sliding_gqa",
+          "heads": 128,
+          "kv_heads": 8,
+          "head_dim": 192,
+          "window": 128,
+          "sinks": true
+        },
+        "ffn": {
+          "kind": "moe"
+        },
+        "rope": {
+          "dims": 64,
+          "theta": 10000.0
+        }
+      },
+      {
+        "attention": {
+          "kind": "sliding_gqa",
+          "heads": 128,
+          "kv_heads": 8,
+          "head_dim": 192,
+          "window": 128,
+          "sinks": true
+        },
+        "ffn": {
+          "kind": "moe"
+        },
+        "rope": {
+          "dims": 64,
+          "theta": 10000.0
+        }
+      },
+      {
+        "attention": {
+          "kind": "sliding_gqa",
+          "heads": 128,
+          "kv_heads": 8,
+          "head_dim": 192,
+          "window": 128,
+          "sinks": true
+        },
+        "ffn": {
+          "kind": "moe"
+        },
+        "rope": {
+          "dims": 64,
+          "theta": 10000.0
+        }
+      },
+      {
+        "attention": {
+          "kind": "sliding_gqa",
+          "heads": 128,
+          "kv_heads": 8,
+          "head_dim": 192,
+          "window": 128,
+          "sinks": true
+        },
+        "ffn": {
+          "kind": "moe"
+        },
+        "rope": {
+          "dims": 64,
+          "theta": 10000.0
+        }
+      },
+      {
+        "attention": {
+          "kind": "sliding_gqa",
+          "heads": 128,
+          "kv_heads": 8,
+          "head_dim": 192,
+          "window": 128,
+          "sinks": true
+        },
+        "ffn": {
+          "kind": "moe"
+        },
+        "rope": {
+          "dims": 64,
+          "theta": 10000.0
+        }
+      },
+      {
+        "attention": {
+          "kind": "sliding_gqa",
+          "heads": 128,
+          "kv_heads": 8,
+          "head_dim": 192,
+          "window": 128,
+          "sinks": true
+        },
+        "ffn": {
+          "kind": "moe"
+        },
+        "rope": {
+          "dims": 64,
+          "theta": 10000.0
+        }
+      },
+      {
+        "attention": {
+          "kind": "gqa",
+          "heads": 128,
+          "kv_heads": 8,
+          "head_dim": 192
+        },
+        "ffn": {
+          "kind": "moe"
+        },
+        "rope": {
+          "dims": 64,
+          "theta": 10000000.0
+        }
+      }
+    ],
+    "moe": {
+      "experts": 384,
+      "top_k": 8,
+      "intermediate": 2048,
+      "shared_experts": 0,
+      "shared_intermediate": 0,
+      "scoring": "sigmoid",
+      "routed_scaling": 1.0,
+      "groups": null
+    },
+    "speculator": {
+      "kind": "native_mtp",
+      "layers": 3
+    },
+    "tables": [],
+    "vision": true,
+    "notes": [
+      "rotary 64 of 192 dims (theta full 10000000, SWA 10000), attention value scale 0.612, sinks full false / SWA true",
+      "fused qkv_proj stored TP8-interleaved ([q|k|v] per row shard, own 128x128 grid per shard); the engine de-interleaves it (FusedQkvLayout)",
+      "router weight Bf16",
+      "dflash/: DFlash block drafter (serve-mimo --draft; not planned: its own qwen3-style config)",
+      "coordinator programs: family mimop (CUTEAFD_ENABLE_MIMO_AOT, CUTEAFD_MIMO_GEOMETRIES=mimop)",
+      "measured MiMo default: single-copy FP8 target head/O and DFlash drafter; native QKV/FFN unchanged. --weight-policy checkpoint keeps source formats; explicit per-weight flags override.",
+      "default target head/O across coordinator ranks: checkpoint source 15967715328 B (14.871 GiB), selected FP8 resident 8453554176 B (7.873 GiB), maximum drained packing source 33554432 B (0.031 GiB); these costs use the runtime projection descriptor and exclude other weights, optional DFlash and runtime state",
+      "component bytes, owner totals and weight-only placement budgets below describe checkpoint source storage; they are not complete resident-memory admission. Runtime admission counts selected representations, loading phases, optional DFlash, caches and workspaces separately"
+    ]
+  },
+  "cache_requirements": {
+    "checkpoint_max_context_tokens": 1048576,
+    "compiled_index_extent_required": false,
+    "requested_kv_floor_tokens": 2097152,
+    "concurrency": 16,
+    "state_slots": 20,
+    "target_only_layouts": [
+      {
+        "logical_unit_rows": 64,
+        "placement": "single_device",
+        "ranks": [
+          {
+            "persistent_unit_bytes": 1843200,
+            "pool_metadata_unit_bytes": 0,
+            "active_state_per_sequence_bytes": 78643200,
+            "retained_mark_bytes": 39321600,
+            "speculative_replay_bytes": 0,
+            "fixed_state_bytes": 0,
+            "context_table_bytes_per_token": 512
+          }
+        ]
+      },
+      {
+        "logical_unit_rows": 64,
+        "placement": "partitioned_heads",
+        "ranks": [
+          {
+            "persistent_unit_bytes": 921600,
+            "pool_metadata_unit_bytes": 0,
+            "active_state_per_sequence_bytes": 39321600,
+            "retained_mark_bytes": 19660800,
+            "speculative_replay_bytes": 0,
+            "fixed_state_bytes": 0,
+            "context_table_bytes_per_token": 512
+          },
+          {
+            "persistent_unit_bytes": 921600,
+            "pool_metadata_unit_bytes": 0,
+            "active_state_per_sequence_bytes": 39321600,
+            "retained_mark_bytes": 19660800,
+            "speculative_replay_bytes": 0,
+            "fixed_state_bytes": 0,
+            "context_table_bytes_per_token": 512
+          }
+        ]
+      }
+    ],
+    "unavailable_layouts": []
+  },
+  "components": [
+    {
+      "component": "embedding",
+      "owner": "rtx",
+      "tensors": 1,
+      "bytes": 1874853888,
+      "formats": {
+        "bf16": 1
+      },
+      "status": "ready",
+      "rejected": 0,
+      "rejections": []
+    },
+    {
+      "component": "lm_head",
+      "owner": "rtx",
+      "tensors": 1,
+      "bytes": 1874853888,
+      "formats": {
+        "bf16": 1
+      },
+      "status": "ready",
+      "rejected": 0,
+      "rejections": []
+    },
+    {
+      "component": "norm",
+      "owner": "rtx",
+      "tensors": 141,
+      "bytes": 1732608,
+      "formats": {
+        "bf16": 141
+      },
+      "status": "ready",
+      "rejected": 0,
+      "rejections": []
+    },
+    {
+      "component": "attention",
+      "owner": "rtx",
+      "tensors": 270,
+      "bytes": 25766430720,
+      "formats": {
+        "bf16": 130,
+        "fp8-block128x128/f32-segmented8": 70
+      },
+      "status": "ready",
+      "rejected": 0,
+      "rejections": []
+    },
+    {
+      "component": "router",
+      "owner": "rtx",
+      "tensors": 138,
+      "bytes": 325688832,
+      "formats": {
+        "bf16": 69,
+        "f32": 69
+      },
+      "status": "ready",
+      "rejected": 0,
+      "rejections": []
+    },
+    {
+      "component": "routed_expert",
+      "owner": "spark_sliced",
+      "tensors": 158976,
+      "bytes": 531351207936,
+      "formats": {
+        "mxfp4-g32": 79488
+      },
+      "status": "ready",
+      "rejected": 0,
+      "rejections": []
+    },
+    {
+      "component": "dense_ffn",
+      "owner": "rtx",
+      "tensors": 6,
+      "bytes": 302063616,
+      "formats": {
+        "fp8-block128x128/f32": 3
+      },
+      "status": "ready",
+      "rejected": 0,
+      "rejections": []
+    },
+    {
+      "component": "speculator",
+      "owner": "rtx",
+      "tensors": 48,
+      "bytes": 2463635712,
+      "formats": {
+        "bf16": 24,
+        "fp8-block128x128/f32": 9,
+        "fp8-block128x128/f32-segmented8": 3
+      },
+      "status": "ready",
+      "rejected": 0,
+      "rejections": []
+    },
+    {
+      "component": "vision",
+      "owner": "rtx",
+      "tensors": 364,
+      "bytes": 1478160384,
+      "formats": {
+        "bf16": 224
+      },
+      "status": "ready",
+      "rejected": 0,
+      "rejections": []
+    },
+    {
+      "component": "audio",
+      "owner": "rtx",
+      "tensors": 95,
+      "bytes": 589363200,
+      "formats": {
+        "bf16": 77
+      },
+      "status": "ready",
+      "rejected": 0,
+      "rejections": []
+    }
+  ],
+  "unclassified": [],
+  "missing_shards": [],
+  "bytes_by_owner": {
+    "rtx": 32609259264,
+    "spark x6": 531351207936,
+    "spark4 vision": 2460907584,
+    "spark5 audio": 3926481664
+  },
+  "placement": {
+    "kind": "sparks",
+    "ranks": 6
+  },
+  "spark_ranks": 6,
+  "experts": {
+    "package": "mimop:fp8 (MXFP4)",
+    "block": 32,
+    "spark_worlds": [
+      2,
+      6
+    ],
+    "local": {
+      "Ok": "serve-mimo --local-experts (fp8-mimop tp1)"
+    }
+  },
+  "placement_supported": true,
+  "min_spark_ranks": 6,
+  "spark_rank_share": 0.1875,
+  "fits": false,
+  "launch": {
+    "family": "mimo_v2",
+    "model_type": "mimo_v2",
+    "first_expert_layer": 1,
+    "last_expert_layer": null
+  },
+  "expert_storage": null,
+  "hints": [
+    {
+      "what": "rtx0 full memory layout needs 33511016304 bytes, budget 31031138713 bytes, shortfall 2479877591 bytes",
+      "how": "Weights, KV, workspaces, graphs and drafts must fit together; reduce the pool/placement or raise the device budget."
+    }
+  ],
+  "memory_layout": {
+    "devices": [
+      {
+        "kind": "rtx",
+        "index": 0,
+        "capacity_bytes": 31031138713,
+        "items": [
+          {
+            "category": "weights",
+            "group": "attention",
+            "format": "fp8",
+            "bytes": 18937282560,
+            "basis": "exact"
+          },
+          {
+            "category": "weights",
+            "group": "attention",
+            "format": "fp8-scale",
+            "bytes": 1183580160,
+            "basis": "exact"
+          },
+          {
+            "category": "weights",
+            "group": "attention",
+            "format": "native",
+            "bytes": 15360,
+            "basis": "exact"
+          },
+          {
+            "category": "weights",
+            "group": "dense_ffn",
+            "format": "fp8",
+            "bytes": 301989888,
+            "basis": "exact"
+          },
+          {
+            "category": "weights",
+            "group": "dense_ffn",
+            "format": "fp8-scale",
+            "bytes": 18874368,
+            "basis": "exact"
+          },
+          {
+            "category": "weights",
+            "group": "lm_head",
+            "format": "fp8",
+            "bytes": 937426944,
+            "basis": "exact"
+          },
+          {
+            "category": "weights",
+            "group": "lm_head",
+            "format": "fp8-scale",
+            "bytes": 29294592,
+            "basis": "exact"
+          },
+          {
+            "category": "weights",
+            "group": "norm",
+            "format": "native",
+            "bytes": 1732608,
+            "basis": "exact"
+          },
+          {
+            "category": "weights",
+            "group": "router",
+            "format": "native",
+            "bytes": 325688832,
+            "basis": "exact"
+          },
+          {
+            "category": "drafter",
+            "group": "drafter",
+            "format": "",
+            "bytes": 3446711255,
+            "basis": "calibrated"
+          },
+          {
+            "category": "runtime",
+            "group": "context+modules",
+            "format": "",
+            "bytes": 1073741824,
+            "basis": "calibrated"
+          },
+          {
+            "category": "runtime",
+            "group": "graph allowance",
+            "format": "",
+            "bytes": 536870912,
+            "basis": "calibrated"
+          },
+          {
+            "category": "workspace",
+            "group": "steps",
+            "format": "",
+            "bytes": 3113851289,
+            "basis": "calibrated"
+          },
+          {
+            "category": "kv",
+            "group": "state",
+            "format": "",
+            "bytes": 1952448512,
+            "basis": "formula"
+          },
+          {
+            "category": "prefix",
+            "group": "marks",
+            "format": "",
+            "bytes": 1651507200,
+            "basis": "formula"
+          },
+          {
+            "category": "kv",
+            "group": "records",
+            "format": "",
+            "bytes": 0,
+            "basis": "formula"
+          }
+        ],
+        "kv_tokens": 0
+      },
+      {
+        "kind": "spark",
+        "index": 0,
+        "capacity_bytes": 115964116992,
+        "items": [
+          {
+            "category": "experts",
+            "group": "routed_expert",
+            "format": "mxfp4-g32",
+            "bytes": 99628351488,
+            "basis": "exact"
+          },
+          {
+            "category": "workspace",
+            "group": "expert waves",
+            "format": "",
+            "bytes": 547608330,
+            "basis": "calibrated"
+          },
+          {
+            "category": "transport",
+            "group": "rdma rings",
+            "format": "",
+            "bytes": 1256277934,
+            "basis": "calibrated"
+          },
+          {
+            "category": "runtime",
+            "group": "context+modules",
+            "format": "",
+            "bytes": 536870912,
+            "basis": "calibrated"
+          }
+        ],
+        "kv_tokens": 0
+      },
+      {
+        "kind": "spark",
+        "index": 1,
+        "capacity_bytes": 115964116992,
+        "items": [
+          {
+            "category": "experts",
+            "group": "routed_expert",
+            "format": "mxfp4-g32",
+            "bytes": 99628351488,
+            "basis": "exact"
+          },
+          {
+            "category": "workspace",
+            "group": "expert waves",
+            "format": "",
+            "bytes": 547608330,
+            "basis": "calibrated"
+          },
+          {
+            "category": "transport",
+            "group": "rdma rings",
+            "format": "",
+            "bytes": 1256277934,
+            "basis": "calibrated"
+          },
+          {
+            "category": "runtime",
+            "group": "context+modules",
+            "format": "",
+            "bytes": 536870912,
+            "basis": "calibrated"
+          }
+        ],
+        "kv_tokens": 0
+      },
+      {
+        "kind": "spark",
+        "index": 2,
+        "capacity_bytes": 115964116992,
+        "items": [
+          {
+            "category": "experts",
+            "group": "routed_expert",
+            "format": "mxfp4-g32",
+            "bytes": 99628351488,
+            "basis": "exact"
+          },
+          {
+            "category": "workspace",
+            "group": "expert waves",
+            "format": "",
+            "bytes": 547608330,
+            "basis": "calibrated"
+          },
+          {
+            "category": "transport",
+            "group": "rdma rings",
+            "format": "",
+            "bytes": 1256277934,
+            "basis": "calibrated"
+          },
+          {
+            "category": "runtime",
+            "group": "context+modules",
+            "format": "",
+            "bytes": 536870912,
+            "basis": "calibrated"
+          }
+        ],
+        "kv_tokens": 0
+      },
+      {
+        "kind": "spark",
+        "index": 3,
+        "capacity_bytes": 115964116992,
+        "items": [
+          {
+            "category": "experts",
+            "group": "routed_expert",
+            "format": "mxfp4-g32",
+            "bytes": 99628351488,
+            "basis": "exact"
+          },
+          {
+            "category": "workspace",
+            "group": "expert waves",
+            "format": "",
+            "bytes": 547608330,
+            "basis": "calibrated"
+          },
+          {
+            "category": "transport",
+            "group": "rdma rings",
+            "format": "",
+            "bytes": 1256277934,
+            "basis": "calibrated"
+          },
+          {
+            "category": "runtime",
+            "group": "context+modules",
+            "format": "",
+            "bytes": 536870912,
+            "basis": "calibrated"
+          }
+        ],
+        "kv_tokens": 0
+      },
+      {
+        "kind": "spark",
+        "index": 4,
+        "capacity_bytes": 115964116992,
+        "items": [
+          {
+            "category": "experts",
+            "group": "routed_expert",
+            "format": "mxfp4-g32",
+            "bytes": 66418900992,
+            "basis": "exact"
+          },
+          {
+            "category": "workspace",
+            "group": "expert waves",
+            "format": "",
+            "bytes": 547608330,
+            "basis": "calibrated"
+          },
+          {
+            "category": "transport",
+            "group": "rdma rings",
+            "format": "",
+            "bytes": 1256277934,
+            "basis": "calibrated"
+          },
+          {
+            "category": "runtime",
+            "group": "context+modules",
+            "format": "",
+            "bytes": 536870912,
+            "basis": "calibrated"
+          },
+          {
+            "category": "weights",
+            "group": "vision tower",
+            "format": "BF16 + FP32 vectors",
+            "bytes": 1479142464,
+            "basis": "formula"
+          },
+          {
+            "category": "workspace",
+            "group": "vision scratch",
+            "format": "resident",
+            "bytes": 981765120,
+            "basis": "formula"
+          }
+        ],
+        "kv_tokens": 0
+      },
+      {
+        "kind": "spark",
+        "index": 5,
+        "capacity_bytes": 115964116992,
+        "items": [
+          {
+            "category": "experts",
+            "group": "routed_expert",
+            "format": "mxfp4-g32",
+            "bytes": 66418900992,
+            "basis": "exact"
+          },
+          {
+            "category": "workspace",
+            "group": "expert waves",
+            "format": "",
+            "bytes": 547608330,
+            "basis": "calibrated"
+          },
+          {
+            "category": "transport",
+            "group": "rdma rings",
+            "format": "",
+            "bytes": 1256277934,
+            "basis": "calibrated"
+          },
+          {
+            "category": "runtime",
+            "group": "context+modules",
+            "format": "",
+            "bytes": 536870912,
+            "basis": "calibrated"
+          },
+          {
+            "category": "weights",
+            "group": "audio tower",
+            "format": "FP32 native",
+            "bytes": 2428784640,
+            "basis": "formula"
+          },
+          {
+            "category": "workspace",
+            "group": "audio scratch",
+            "format": "resident BLAS/FFT included",
+            "bytes": 1497697024,
+            "basis": "formula"
+          }
+        ],
+        "kv_tokens": 0
+      }
+    ],
+    "pool_tokens": 0,
+    "waste": [],
+    "notes": [
+      "resolved context 1048576 tokens (checkpoint 1048576)",
+      "embedding placement: host (single pinned mapped copy, 1874853888 bytes backing, 1874853888 device bytes freed)",
+      "vision Spark { rank: 4 }: Spark: lightest expert slice, then most free memory; tower + scratch + 1 GiB admitted; 2460907584 bytes admitted; shortfall 0 bytes",
+      "audio Spark { rank: 5 }: Spark: lightest expert slice, then most free memory; tower + scratch + 1 GiB admitted; 3926481664 bytes admitted; shortfall 0 bytes",
+      "full-context admission shortfall: context 1048576 tokens, pool 0 tokens, shortfall 1048576 tokens",
+      "rtx0: requested KV pool exceeds the device budget"
+    ]
+  }
+}
