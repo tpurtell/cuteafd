@@ -71,8 +71,12 @@ GLM 5.3 EXL3 K4, 1 RTX + 4 Sparks. `SPECULATOR_FP8=off` keeps the BF16 drafter.
   establish byte-identical speculative output or batch invariance.
 - Prefill remains Spark-bound at both reference layouts; additional RTX
   head-split capacity does not remove the expert-wave bottleneck.
-- NVFP4 decode/verify uses W4A16; native W4A4 for these small-row shapes is
-  deferred.
+- NVFP4 prefill chunks above 1,024 rows run W4A4 with each expert's own
+  `input_scale` and `weight_scale_2`; decode and verify run W4A16 (native W4A4
+  for these small-row shapes is deferred). Spark input arrives as FP8 K32 wire
+  rows, so W4A4 activations are quantized twice (FP8, then FP4). FC1 quantizes
+  with the gate projection's `input_scale` and dequantizes the up half with the
+  up projection's; ModelOpt sets them equal, but the loader does not yet check.
 
 ## Changelog
 
