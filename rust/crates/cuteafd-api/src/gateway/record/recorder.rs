@@ -283,6 +283,39 @@ mod tests {
         task.abort();
     }
     #[tokio::test]
+    async fn responses_websocket_records_client_and_every_server_text_frame() {
+        use futures::SinkExt;
+        use crate::gateway::{Gateway,ModelMap,testing::Scripted,turn::{TurnEvent,StopReason}};
+        let directory = tempfile::tempdir().unwrap();
+        let recorder = Recorder::new(directory.path().into(),Sanitizer::default()).unwrap();
+        let backend = Arc::new(Scripted::new(vec![vec![TurnEvent::TextDelta { text:"hello".into() },TurnEvent::Done { stop:StopReason::EndTurn }]]));
+        let app = crate::gateway::router(Arc::new(Gateway::new(backend.clone(),ModelMap::single("served-model"))))
+            .layer(axum::middleware::from_fn_with_state(recorder,middleware));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();let address=listener.local_addr().unwrap();
+        let task=tokio::spawn(async move { axum::serve(listener,app).await.unwrap(); });
+        let (mut socket,_) = tokio_tungstenite::connect_async(format!("ws://{address}/v1/responses")).await.unwrap();
+        let request=json!({"type":"response.create","model":"served-model","input":"hello","store":false}).to_string();
+        socket.send(tokio_tungstenite::tungstenite::Message::Text(request.clone())).await.unwrap();
+        let mut received=Vec::new();
+        loop {
+            let message=tokio::time::timeout(std::time::Duration::from_secs(3),socket.next()).await.unwrap().unwrap().unwrap();
+            let text=message.to_text().unwrap().to_string();let terminal=serde_json::from_str::<Value>(&text).unwrap()["type"] == "response.completed";
+            received.push(text);if terminal { break; }
+        }
+        socket.close(None).await.unwrap();drop(socket);
+        // Scripted retains whole requests, including the connection's Tape.
+        backend.seen.lock().unwrap().clear();
+        tokio::time::timeout(std::time::Duration::from_secs(3),async {
+            while std::fs::read_dir(directory.path()).unwrap().count()==0 { tokio::time::sleep(std::time::Duration::from_millis(10)).await; }
+        }).await.unwrap();
+        let path=std::fs::read_dir(directory.path()).unwrap().next().unwrap().unwrap().path();
+        let fixture:Value=serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        let frames:Vec<_>=fixture["entries"].as_array().unwrap().iter().filter(|e| e["kind"] == "websocket").collect();
+        assert_eq!(frames[0]["entry"]["direction"],"client");assert_eq!(frames[0]["entry"]["text"],request);
+        let recorded:Vec<_>=frames[1..].iter().map(|e| { assert_eq!(e["entry"]["direction"],"server");e["entry"]["text"].as_str().unwrap().to_string() }).collect();
+        assert_eq!(recorded,received);task.abort();
+    }
+    #[tokio::test]
     async fn recorder_tees_body_and_waits_for_tape_drop() {
         use tower::ServiceExt;
         let directory = tempfile::tempdir().unwrap();
