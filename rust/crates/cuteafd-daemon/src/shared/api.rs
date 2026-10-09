@@ -23,6 +23,9 @@ impl ApiArgs {
     }
 }
 impl ApiPolicy {
+    pub(crate) fn gateway_auth(&self) -> cuteafd_api::gateway::auth::GatewayAuth {
+        cuteafd_api::gateway::auth::GatewayAuth { key: self.key.clone() }
+    }
     pub fn app(self, router: axum::Router, hub: Arc<cuteafd_api::openai::ConsoleHub>) -> axum::Router {
         let (router, internal) = if self.bench {
             let bench = cuteafd_bench::Bench::global();

@@ -46,6 +46,8 @@ pub(crate) struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub(crate) enum Commands {
+    /// Serve Anthropic Messages, OpenAI Responses and Realtime through an HTTP upstream (no GPUs).
+    Gateway(crate::commands::gateway::GatewayArgs),
     Doctor(DoctorArgs),
     /// Describe a checkpoint: family, placement, formats, and what this build lacks.
     Plan(PlanArgs),

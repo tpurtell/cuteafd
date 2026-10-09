@@ -31,6 +31,7 @@ tracing.workspace = true
 uuid.workspace = true
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "json", "http2"] }
 bytes.workspace = true
+regex = "1"
 
 [dev-dependencies]
 tokio-tungstenite = "0.24"

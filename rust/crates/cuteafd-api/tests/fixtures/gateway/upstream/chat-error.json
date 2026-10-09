@@ -1,0 +1,78 @@
+{
+  "version": 1,
+  "flavor": "openai-chat",
+  "deepseek_thinking": true,
+  "turn": {
+    "requested_model": "",
+    "model": "invented-model-that-does-not-exist",
+    "system": null,
+    "items": [
+      {
+        "item": "message",
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "Say hello."
+          }
+        ]
+      }
+    ],
+    "tools": [],
+    "tool_choice": {
+      "mode": "auto"
+    },
+    "parallel_tool_calls": null,
+    "max_output_tokens": 32,
+    "sampling": {
+      "temperature": null,
+      "top_p": null,
+      "top_k": null,
+      "stop": [],
+      "seed": null
+    },
+    "reasoning": {
+      "enabled": false,
+      "effort": null,
+      "budget_tokens": null,
+      "return_text": false
+    },
+    "response_format": null,
+    "hosted": {
+      "web_search": null
+    },
+    "modalities": {
+      "audio_out": false
+    },
+    "session": null
+  },
+  "entries": [
+    {
+      "kind": "upstream",
+      "entry": {
+        "flavor": "openai-chat",
+        "request": {
+          "model": "invented-model-that-does-not-exist",
+          "messages": [
+            {
+              "role": "user",
+              "content": "Say hello."
+            }
+          ],
+          "stream": true,
+          "stream_options": {
+            "include_usage": true
+          },
+          "thinking": {
+            "type": "disabled"
+          },
+          "max_tokens": 32
+        },
+        "status": 400,
+        "body": "{\"error\":{\"message\":\"The supported API model names are deepseek-flash, deepseek-v4-pro, but you passed invented-model-that-does-not-exist. (request_id: 45885703-0f74-4e7e-bd86-358365de90ca)\",\"type\":\"invalid_request_error\",\"param\":null,\"code\":\"invalid_request_error\"}}",
+        "truncated": false
+      }
+    }
+  ],
+  "expected_error_status": 400
+}

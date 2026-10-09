@@ -1,0 +1,210 @@
+{
+  "version": 1,
+  "flavor": "openai-chat",
+  "deepseek_thinking": true,
+  "turn": {
+    "requested_model": "",
+    "model": "deepseek-flash",
+    "system": null,
+    "items": [
+      {
+        "item": "message",
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "Use the get_weather tool for the fictional city Cloudvale."
+          }
+        ]
+      }
+    ],
+    "tools": [
+      {
+        "name": "get_weather",
+        "description": null,
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "city": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "city"
+          ]
+        },
+        "strict": false
+      }
+    ],
+    "tool_choice": {
+      "mode": "named",
+      "name": "get_weather"
+    },
+    "parallel_tool_calls": null,
+    "max_output_tokens": 128,
+    "sampling": {
+      "temperature": null,
+      "top_p": null,
+      "top_k": null,
+      "stop": [],
+      "seed": null
+    },
+    "reasoning": {
+      "enabled": false,
+      "effort": null,
+      "budget_tokens": null,
+      "return_text": false
+    },
+    "response_format": null,
+    "hosted": {
+      "web_search": null
+    },
+    "modalities": {
+      "audio_out": false
+    },
+    "session": null
+  },
+  "entries": [
+    {
+      "kind": "upstream",
+      "entry": {
+        "flavor": "openai-chat",
+        "request": {
+          "model": "deepseek-flash",
+          "messages": [
+            {
+              "role": "user",
+              "content": "Use the get_weather tool for the fictional city Cloudvale."
+            }
+          ],
+          "stream": true,
+          "stream_options": {
+            "include_usage": true
+          },
+          "tools": [
+            {
+              "type": "function",
+              "function": {
+                "name": "get_weather",
+                "parameters": {
+                  "type": "object",
+                  "properties": {
+                    "city": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "city"
+                  ]
+                }
+              }
+            }
+          ],
+          "tool_choice": {
+            "type": "function",
+            "function": {
+              "name": "get_weather"
+            }
+          },
+          "thinking": {
+            "type": "disabled"
+          },
+          "max_tokens": 128
+        },
+        "status": 200,
+        "body": "data: {\"id\":\"b7e9119b-31f2-4a8c-8ecc-ef2ee9098f19\",\"object\":\"chat.completion.chunk\",\"created\":1791554666,\"model\":\"deepseek-flash\",\"system_fingerprint\":\"aeb56401ca74e127821c4f9126dcb669\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"\"},\"logprobs\":null,\"finish_reason\":null}],\"usage\":null}\n\ndata: {\"id\":\"b7e9119b-31f2-4a8c-8ecc-ef2ee9098f19\",\"object\":\"chat.completion.chunk\",\"created\":1791554666,\"model\":\"deepseek-flash\",\"system_fingerprint\":\"aeb56401ca74e127821c4f9126dcb669\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_00_caEp6n0bvEBHFJeqDDB86498\",\"type\":\"function\",\"function\":{\"name\":\"get_weather\",\"arguments\":\"\"}}]},\"logprobs\":null,\"finish_reason\":null}],\"usage\":null}\n\ndata: {\"id\":\"b7e9119b-31f2-4a8c-8ecc-ef2ee9098f19\",\"object\":\"chat.completion.chunk\",\"created\":1791554666,\"model\":\"deepseek-flash\",\"system_fingerprint\":\"aeb56401ca74e127821c4f9126dcb669\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{\"}}]},\"logprobs\":null,\"finish_reason\":null}],\"usage\":null}\n\ndata: {\"id\":\"b7e9119b-31f2-4a8c-8ecc-ef2ee9098f19\",\"object\":\"chat.completion.chunk\",\"created\":1791554666,\"model\":\"deepseek-flash\",\"system_fingerprint\":\"aeb56401ca74e127821c4f9126dcb669\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"\\\"\"}}]},\"logprobs\":null,\"finish_reason\":null}],\"usage\":null}\n\ndata: {\"id\":\"b7e9119b-31f2-4a8c-8ecc-ef2ee9098f19\",\"object\":\"chat.completion.chunk\",\"created\":1791554666,\"model\":\"deepseek-flash\",\"system_fingerprint\":\"aeb56401ca74e127821c4f9126dcb669\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"city\"}}]},\"logprobs\":null,\"finish_reason\":null}],\"usage\":null}\n\ndata: {\"id\":\"b7e9119b-31f2-4a8c-8ecc-ef2ee9098f19\",\"object\":\"chat.completion.chunk\",\"created\":1791554666,\"model\":\"deepseek-flash\",\"system_fingerprint\":\"aeb56401ca74e127821c4f9126dcb669\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"\\\"\"}}]},\"logprobs\":null,\"finish_reason\":null}],\"usage\":null}\n\ndata: {\"id\":\"b7e9119b-31f2-4a8c-8ecc-ef2ee9098f19\",\"object\":\"chat.completion.chunk\",\"created\":1791554666,\"model\":\"deepseek-flash\",\"system_fingerprint\":\"aeb56401ca74e127821c4f9126dcb669\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\": \"}}]},\"logprobs\":null,\"finish_reason\":null}],\"usage\":null}\n\ndata: {\"id\":\"b7e9119b-31f2-4a8c-8ecc-ef2ee9098f19\",\"object\":\"chat.completion.chunk\",\"created\":1791554666,\"model\":\"deepseek-flash\",\"system_fingerprint\":\"aeb56401ca74e127821c4f9126dcb669\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"\\\"\"}}]},\"logprobs\":null,\"finish_reason\":null}],\"usage\":null}\n\ndata: {\"id\":\"b7e9119b-31f2-4a8c-8ecc-ef2ee9098f19\",\"object\":\"chat.completion.chunk\",\"created\":1791554666,\"model\":\"deepseek-flash\",\"system_fingerprint\":\"aeb56401ca74e127821c4f9126dcb669\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"Cloud\"}}]},\"logprobs\":null,\"finish_reason\":null}],\"usage\":null}\n\ndata: {\"id\":\"b7e9119b-31f2-4a8c-8ecc-ef2ee9098f19\",\"object\":\"chat.completion.chunk\",\"created\":1791554666,\"model\":\"deepseek-flash\",\"system_fingerprint\":\"aeb56401ca74e127821c4f9126dcb669\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"vale\"}}]},\"logprobs\":null,\"finish_reason\":null}],\"usage\":null}\n\ndata: {\"id\":\"b7e9119b-31f2-4a8c-8ecc-ef2ee9098f19\",\"object\":\"chat.completion.chunk\",\"created\":1791554666,\"model\":\"deepseek-flash\",\"system_fingerprint\":\"aeb56401ca74e127821c4f9126dcb669\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"\\\"\"}}]},\"logprobs\":null,\"finish_reason\":null}],\"usage\":null}\n\ndata: {\"id\":\"b7e9119b-31f2-4a8c-8ecc-ef2ee9098f19\",\"object\":\"chat.completion.chunk\",\"created\":1791554666,\"model\":\"deepseek-flash\",\"system_fingerprint\":\"aeb56401ca74e127821c4f9126dcb669\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"}\"}}]},\"logprobs\":null,\"finish_reason\":null}],\"usage\":null}\n\ndata: {\"id\":\"b7e9119b-31f2-4a8c-8ecc-ef2ee9098f19\",\"object\":\"chat.completion.chunk\",\"created\":1791554666,\"model\":\"deepseek-flash\",\"system_fingerprint\":\"aeb56401ca74e127821c4f9126dcb669\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"\"},\"logprobs\":null,\"finish_reason\":\"tool_calls\"}],\"usage\":{\"prompt_tokens\":276,\"completion_tokens\":34,\"total_tokens\":310,\"prompt_tokens_details\":{\"cached_tokens\":0},\"prompt_cache_hit_tokens\":0,\"prompt_cache_miss_tokens\":276}}\n\ndata: [DONE]\n\n",
+        "truncated": false
+      }
+    }
+  ],
+  "expected_events": [
+    {
+      "event": "tool_call_start",
+      "index": 0,
+      "id": "call_00_caEp6n0bvEBHFJeqDDB86498",
+      "name": "get_weather"
+    },
+    {
+      "event": "tool_call_delta",
+      "index": 0,
+      "arguments": "{"
+    },
+    {
+      "event": "tool_call_delta",
+      "index": 0,
+      "arguments": "\""
+    },
+    {
+      "event": "tool_call_delta",
+      "index": 0,
+      "arguments": "city"
+    },
+    {
+      "event": "tool_call_delta",
+      "index": 0,
+      "arguments": "\""
+    },
+    {
+      "event": "tool_call_delta",
+      "index": 0,
+      "arguments": ": "
+    },
+    {
+      "event": "tool_call_delta",
+      "index": 0,
+      "arguments": "\""
+    },
+    {
+      "event": "tool_call_delta",
+      "index": 0,
+      "arguments": "Cloud"
+    },
+    {
+      "event": "tool_call_delta",
+      "index": 0,
+      "arguments": "vale"
+    },
+    {
+      "event": "tool_call_delta",
+      "index": 0,
+      "arguments": "\""
+    },
+    {
+      "event": "tool_call_delta",
+      "index": 0,
+      "arguments": "}"
+    },
+    {
+      "event": "usage",
+      "usage": {
+        "input_tokens": 276,
+        "output_tokens": 34,
+        "cached_input_tokens": 0,
+        "reasoning_tokens": 0,
+        "web_search_requests": 0,
+        "cache_creation_input_tokens": 0
+      }
+    },
+    {
+      "event": "tool_call_end",
+      "index": 0
+    },
+    {
+      "event": "usage",
+      "usage": {
+        "input_tokens": 276,
+        "output_tokens": 34,
+        "cached_input_tokens": 0,
+        "reasoning_tokens": 0,
+        "web_search_requests": 0,
+        "cache_creation_input_tokens": 0
+      }
+    },
+    {
+      "event": "done",
+      "stop": {
+        "reason": "tool_use"
+      }
+    }
+  ]
+}

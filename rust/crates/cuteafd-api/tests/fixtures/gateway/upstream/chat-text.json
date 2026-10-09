@@ -1,0 +1,115 @@
+{
+  "version": 1,
+  "flavor": "openai-chat",
+  "deepseek_thinking": true,
+  "turn": {
+    "requested_model": "",
+    "model": "deepseek-flash",
+    "system": null,
+    "items": [
+      {
+        "item": "message",
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "Say hello in exactly two words."
+          }
+        ]
+      }
+    ],
+    "tools": [],
+    "tool_choice": {
+      "mode": "auto"
+    },
+    "parallel_tool_calls": null,
+    "max_output_tokens": 64,
+    "sampling": {
+      "temperature": null,
+      "top_p": null,
+      "top_k": null,
+      "stop": [],
+      "seed": null
+    },
+    "reasoning": {
+      "enabled": false,
+      "effort": null,
+      "budget_tokens": null,
+      "return_text": false
+    },
+    "response_format": null,
+    "hosted": {
+      "web_search": null
+    },
+    "modalities": {
+      "audio_out": false
+    },
+    "session": null
+  },
+  "entries": [
+    {
+      "kind": "upstream",
+      "entry": {
+        "flavor": "openai-chat",
+        "request": {
+          "model": "deepseek-flash",
+          "messages": [
+            {
+              "role": "user",
+              "content": "Say hello in exactly two words."
+            }
+          ],
+          "stream": true,
+          "stream_options": {
+            "include_usage": true
+          },
+          "thinking": {
+            "type": "disabled"
+          },
+          "max_tokens": 64
+        },
+        "status": 200,
+        "body": "data: {\"id\":\"1150f006-35f8-492c-ab1e-7975bd3b98b8\",\"object\":\"chat.completion.chunk\",\"created\":1791554665,\"model\":\"deepseek-flash\",\"system_fingerprint\":\"aeb56401ca74e127821c4f9126dcb669\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"\"},\"logprobs\":null,\"finish_reason\":null}],\"usage\":null}\n\ndata: {\"id\":\"1150f006-35f8-492c-ab1e-7975bd3b98b8\",\"object\":\"chat.completion.chunk\",\"created\":1791554665,\"model\":\"deepseek-flash\",\"system_fingerprint\":\"aeb56401ca74e127821c4f9126dcb669\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hello\"},\"logprobs\":null,\"finish_reason\":null}],\"usage\":null}\n\ndata: {\"id\":\"1150f006-35f8-492c-ab1e-7975bd3b98b8\",\"object\":\"chat.completion.chunk\",\"created\":1791554665,\"model\":\"deepseek-flash\",\"system_fingerprint\":\"aeb56401ca74e127821c4f9126dcb669\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\" there\"},\"logprobs\":null,\"finish_reason\":null}],\"usage\":null}\n\ndata: {\"id\":\"1150f006-35f8-492c-ab1e-7975bd3b98b8\",\"object\":\"chat.completion.chunk\",\"created\":1791554665,\"model\":\"deepseek-flash\",\"system_fingerprint\":\"aeb56401ca74e127821c4f9126dcb669\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"\"},\"logprobs\":null,\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":11,\"completion_tokens\":2,\"total_tokens\":13,\"prompt_tokens_details\":{\"cached_tokens\":0},\"prompt_cache_hit_tokens\":0,\"prompt_cache_miss_tokens\":11}}\n\ndata: [DONE]\n\n",
+        "truncated": false
+      }
+    }
+  ],
+  "expected_events": [
+    {
+      "event": "text_delta",
+      "text": "Hello"
+    },
+    {
+      "event": "text_delta",
+      "text": " there"
+    },
+    {
+      "event": "usage",
+      "usage": {
+        "input_tokens": 11,
+        "output_tokens": 2,
+        "cached_input_tokens": 0,
+        "reasoning_tokens": 0,
+        "web_search_requests": 0,
+        "cache_creation_input_tokens": 0
+      }
+    },
+    {
+      "event": "usage",
+      "usage": {
+        "input_tokens": 11,
+        "output_tokens": 2,
+        "cached_input_tokens": 0,
+        "reasoning_tokens": 0,
+        "web_search_requests": 0,
+        "cache_creation_input_tokens": 0
+      }
+    },
+    {
+      "event": "done",
+      "stop": {
+        "reason": "end_turn"
+      }
+    }
+  ]
+}
