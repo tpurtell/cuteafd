@@ -1873,6 +1873,22 @@ TJ: two key items, both urgent right after v2.0.0.
    - The fix: add `examples/configs/<family>-<quant>.config` for each
      release card, with no host details. Make the launcher's bare defaults
      match them, and link each one from the family doc.
+10. **NVFP4 W4A4 guards and wire for GLM, GLM Flash and Qwen** (found
+    2026-10-10). These families already use each expert's own
+    `input_scale` and `weight_scale_2`, unlike V4.1 (item 3).
+    - **Latent bug:** FC1 quantizes activations with the gate projection's
+      `input_scale` but dequantizes the up half with the up projection's
+      (`_nvfp4_moe_a4.py` `StreamNvfp4GateUpA4`). Every expert in the four
+      NVIDIA NVFP4 checkpoints has bit-identical gate/up scales, so output
+      is unaffected today.
+    - **Fix:** a load-time error when they differ.
+    - **Wire:** Spark W4A4 prefill quantizes twice (BF16 → FP8 K32 wire →
+      FP4). Measure fidelity and 8K prefill with BF16 wire rows for the
+      W4A4 steps.
+    - **Fidelity blind spot:** quick fidelity scores decode-shaped steps
+      (≤ 8 rows), which run W4A16, so W4A4 prefill (> 1,024 rows on GB10)
+      is only seen by the full tier's prefill-shaped pass. Give NVFP4
+      release cards a prefill-shaped check.
 Gate per family: golden/fidelity, then the quick A/B at the 2M operating
 point on the min and max reference configs. Requalify each family's cards
 as it moves.
