@@ -94,6 +94,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2a4385e2e34eb35d6b3efe798b9eb88096925d87726c0798709bf56d9ed84af3"
 
 [[package]]
+name = "arc-swap"
+version = "1.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "51d03449bb8ca2cc2ef70869af31463d1ae5ccc8fa3e334b307203fbf815207e"
+dependencies = [
+ "rustversion",
+]
+
+[[package]]
 name = "arrayref"
 version = "0.3.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -638,6 +647,7 @@ dependencies = [
  "deepseek-recipe-core",
  "deepseek-recipe-encoding",
  "futures",
+ "http-body",
  "jsonschema",
  "minijinja",
  "minijinja-contrib",
@@ -713,6 +723,7 @@ dependencies = [
  "cuteafd-hostcache",
  "cuteafd-loader",
  "cuteafd-transport",
+ "cuteafd-usage",
  "io-uring",
  "libc",
  "serde",
@@ -802,6 +813,26 @@ dependencies = [
  "thiserror 1.0.69",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "cuteafd-usage"
+version = "0.1.0"
+dependencies = [
+ "arc-swap",
+ "axum",
+ "bytes",
+ "cuteafd-api",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "tower",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]

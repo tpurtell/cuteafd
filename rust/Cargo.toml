@@ -3,6 +3,7 @@ resolver = "2"
 members = [
   "crates/cuteafd-api",
   "crates/cuteafd-bench",
+  "crates/cuteafd-usage",
   "crates/cuteafd-core",
   "crates/cuteafd-daemon",
   "crates/cuteafd-ffi",

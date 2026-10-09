@@ -10,16 +10,24 @@ pub(crate) struct ApiArgs {
     /// Mount benchmark controls and lockout; requires --api-key-file.
     #[arg(long, env = "CUTEAFD_ENABLE_BENCH")]
     pub enable_bench: bool,
+    /// Usage history directory; absent uses an in-memory store.
+    #[arg(long, env = "CUTEAFD_USAGE_DIR")]
+    pub usage_dir: Option<PathBuf>,
+    /// Set to off to disable all request accounting.
+    #[arg(long, default_value = "on", value_parser = ["on", "off"])]
+    pub usage: Option<String>,
 }
 pub(crate) struct ApiPolicy {
     key: Option<ApiKey>,
     bench: bool,
+    usage: Option<Arc<cuteafd_usage::Store>>,
 }
 impl ApiArgs {
     pub fn load(&self) -> anyhow::Result<ApiPolicy> {
         let key = self.api_key_file.as_deref().map(ApiKey::from_file).transpose()?;
         anyhow::ensure!(!self.enable_bench || key.is_some(), "--enable-bench requires --api-key-file");
-        Ok(ApiPolicy { key, bench: self.enable_bench })
+        let usage = if self.usage.as_deref() == Some("off") { None } else { Some(cuteafd_usage::Store::open(self.usage_dir.as_deref())?) };
+        Ok(ApiPolicy { key, bench: self.enable_bench, usage })
     }
 }
 impl ApiPolicy {
@@ -35,8 +43,11 @@ impl ApiPolicy {
             });
             (cuteafd_bench::http::mount(router, bench), Some(internal))
         } else { (router, None) };
-        router.layer(axum::middleware::from_fn_with_state(Auth { key: self.key, internal },
-            cuteafd_api::openai::auth::require_key))
+        let router = router.layer(axum::middleware::from_fn_with_state(Auth { key: self.key, internal },
+            cuteafd_api::openai::auth::require_key));
+        if let Some(store) = self.usage {
+            router.layer(axum::middleware::from_fn_with_state(cuteafd_api::usage::Middleware::new(store), cuteafd_api::usage::track))
+        } else { router }
     }
 }
 pub(crate) fn catch_scheduler_panic(work: impl FnOnce() -> anyhow::Result<()>) -> anyhow::Result<()> {
@@ -73,7 +84,7 @@ mod tests {
             .await.unwrap().status(), StatusCode::NOT_FOUND);
         let (tx, rx) = tokio::sync::mpsc::channel(1);
         drop(rx);
-        let app = ApiPolicy { key: Some(ApiKey::new("secret").unwrap()), bench: false }.app(
+        let app = ApiPolicy { key: Some(ApiKey::new("secret").unwrap()), bench: false, usage: None }.app(
             cuteafd_api::openai::router(tx), cuteafd_api::openai::ConsoleHub::disabled());
         assert_eq!(app.clone().oneshot(axum::http::Request::post("/v1/chat/completions")
             .body(Body::from("malformed")).unwrap()).await.unwrap().status(), StatusCode::UNAUTHORIZED);
@@ -111,7 +122,7 @@ mod tests {
     }
     #[test]
     fn benchmark_controls_require_a_key() {
-        assert!(ApiArgs { enable_bench: true, api_key_file: None }.load().is_err());
+        assert!(ApiArgs { enable_bench: true, api_key_file: None, ..Default::default() }.load().is_err());
         assert!(ApiArgs::default().load().is_ok());
     }
 }

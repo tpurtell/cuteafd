@@ -1,3 +1,4 @@
+pub mod usage;
 pub mod gateway;
 pub mod openai;
 // Old module path, kept for one release (naming pass).
