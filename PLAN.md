@@ -1846,14 +1846,18 @@ miscalibrated. Measured: GLM Flash with the tensor-core head and W8A8 drafter
 kept acceptance (67.1% -> 66.5% median) but the policy chose ~20% shorter
 verify prefixes (tokens/step 2.6 -> 2.1), C1 -12% despite ~7% cheaper steps.
 
-1. Calibrate per key (target model, target quant, drafter, drafter precision
-   options): ~32 fixed-K7 requests, fit the 6 coefficients, ship them as a
-   small file beside the drafter config; fall back to the generic fit with a
-   log line. Recalibrate whenever a key changes (new quant, drafter option or
-   drafter); make it a standard step of adding one.
-2. Online refinement: the frozen fit is the prior, coefficients updated from
-   verified outcomes with forgetting and clamped slopes (as Qwen's
-   `Calibration`), so numerics drift self-corrects.
+1. One fit per (family, drafter) (TJ: avoid per-quant fits): ~32 fixed-K7
+   requests on one representative quant, 6 coefficients shipped beside the
+   drafter config; generic fit plus a log line when absent. The selector
+   features are the drafter's own outputs, so target quant mostly shifts the
+   acceptance level, which step 2 absorbs.
+2. Online refinement always on: the per-drafter fit is the prior,
+   coefficients updated from verified outcomes with forgetting and clamped
+   slopes (as Qwen's `Calibration`), absorbing target quant and drafter
+   numerics (tensor head, W8A8) per deployment.
+   Check once: fit on one quant, measure log loss and C1 on another quant and
+   with the drafter options on; add a narrower fit only where online
+   refinement does not close the gap within a few hundred drafts.
 3. Gate: emitted tok/s at C1/C4/C16 on min/max per family, then re-enable the
    GLM Flash drafter options if they win with their own calibration.
 
