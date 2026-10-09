@@ -3328,13 +3328,10 @@ not upstreams.
 
 1. **TTS:** a `Synthesizer` behind Realtime audio output and
    `audio/speech`.
-2. **Ephemeral client secrets:**
-   - `POST /v1/realtime/client_secrets` (GA) and `/v1/realtime/sessions`
-     (beta) mint short-lived `ek_` tokens. The server issues them, binds each
-     to the configured API key, and gives it a TTL, an optional pinned
-     session config, and a scope of Realtime only.
-   - The gateway auth accepts the token until it expires.
-   - Phase A returns an explicit unsupported error for both routes.
+2. **Ephemeral client secrets: not needed for now** (TJ, 2026-10-10). The
+   agent workspace is DSH embedded in our own dashboard, not a third-party
+   browser app holding a key. `/v1/realtime/client_secrets` and
+   `/v1/realtime/sessions` keep answering unsupported.
 3. **WebRTC: not in v3** (TJ, 2026-10-10: "For v3 I think we will skip
    webrtc"). Realtime is WebSocket only. Every headless client works over it:
    openai-python, openai-node, Agents JS/Python, Pipecat and LiveKit.
