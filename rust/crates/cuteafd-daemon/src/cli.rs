@@ -301,6 +301,9 @@ pub(crate) struct PlanArgs {
     /// wide programs on one GPU): its decode workspace, token selector and replay records.
     #[arg(long, default_value_t = 64, value_parser = plan_decode_rows)]
     pub(crate) decode_rows: u64,
+    /// GLM 5.3 Flash's DSA index storage for --layout (compact is single-GPU only).
+    #[arg(long, value_enum, default_value = "keys")]
+    pub(crate) index_cache: crate::families::glm5_flash::engine::IndexCache,
     /// GPU memory (GiB) each coordinator GPU keeps free for runtime growth in --layout (the
     /// engines' --headroom-gib).
     #[arg(long, default_value_t = 2.0)]

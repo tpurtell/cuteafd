@@ -1127,7 +1127,7 @@ fn glm5_flash_layout_charges_the_wide_decode_rows() {
         let geometry = glm_flash_rank_cache_geometry_rows(&cfg, 2, 1, GlmfIndexCache::Keys, 4, rows).unwrap();
         let rank = &geometry.ranks[0];
         assert_eq!(item(report, "state").map(|(_, bytes, _)| bytes), Some(rank.fixed_state_bytes
-            + rank.active_state_per_sequence_bytes * (8 + 2) + rank.speculative_replay_bytes));
+            + rank.active_state_per_sequence_bytes * 8 + rank.speculative_replay_bytes));
     }
     // 128 rows: +64,606,464 B of decode workspace, the wide selector, one KDA layer's 64 more record rows.
     let steps = |report| item(report, "steps").unwrap().1;
@@ -1159,6 +1159,25 @@ fn glm5_flash_layout_charges_the_wide_decode_rows() {
         assert_eq!(state(report) - state(shared), records, "{rows} rows");
         assert_eq!(steps(shared), steps(report), "{rows} rows");
     }
+    // Compact producers carry their key|gate rows in scratch: planning must use
+    // the same program union as runtime, not only the smaller cache geometry.
+    for rows in [64, 128] {
+        let mut programs = [base.clone(), wide.to_vec()].concat();
+        programs.extend([("glmf_index_producer_c_m64", 16 << 20),
+            ("glmf_index_producer_c_m128", 32 << 20), ("glmf_index_producer_c_m4096", 64 << 20)]);
+        let (path, compact_manifest) = write("compact.json", &programs);
+        let mut compact = options(rows, &path, 1);
+        compact.layout.as_mut().unwrap().glmf_index = GlmfIndexCache::Compact;
+        let report = plan(dir.path(), &compact).unwrap();
+        let lookup = glmf_manifest_scratch(&compact_manifest);
+        let scratch_options = crate::serving_capacity::GlmfScratchOptions {
+            index_compact: true, ..Default::default()
+        };
+        let engine = glmf_step_workspaces(&cfg, 2, 4096, rows, &shape,
+            glmf_step_scratch(&lookup, &cfg, scratch_options, rows, true).unwrap(),
+            glmf_step_scratch(&lookup, &cfg, scratch_options, 4096, false).unwrap()).device_bytes();
+        assert_eq!(item(&report, "steps"), Some((Category::Workspace, engine + intake, Basis::Formula)));
+    }
     // A prefill lane narrower than a verify step (`--prefill-rows 64 --decode-rows 128`): every lane's
     // intake planes hold the widest step's rows, as the engine's Spark transports do; lanes of 4,096
     // rows keep theirs.
@@ -1178,6 +1197,62 @@ fn glm5_flash_layout_charges_the_wide_decode_rows() {
     }
     // 128 rows past a 64-row lane: the wide decode workspace and 64 more intake rows per lane and Spark.
     assert_eq!(steps(&lane(64, 128)) - steps(&lane(64, 64)), 64_606_464 + 2 * 4 * 64 * 4096 * 2);
+}
+
+#[test]
+fn glm5_flash_index_layout_pool_matches_runtime_geometry() {
+    use crate::families::glm5_flash::GlmNextConfig;
+    use crate::serving_capacity::{glm_flash_rank_cache_geometry_rows, GlmfIndexCache};
+    use cuteafd_core::memory_layout::Category;
+    let config = glm5_flash_config(2);
+    let dir = snapshot(config.clone(), &[t("model.language_model.layers.0.self_attn.A_log", "F32", &[64])]);
+    let cfg = GlmNextConfig::from_hf(&config).unwrap();
+    for gpus in [1, 2] {
+        for index in [GlmfIndexCache::Keys, GlmfIndexCache::Compact] {
+            for rows in if gpus == 1 { vec![64, 128] } else { vec![64] } {
+                for pool_marks in [false, true] {
+                    for shared in [false, true] {
+                        let options = PlanOptions { layout: Some(layout::LayoutOptions {
+                            rtx_bytes: vec![24 << 30; gpus], context_tokens: 131_072,
+                            target_pool_tokens: 16_777_216, glmf_index: index, glmf_decode_rows: rows, glmf_pool_marks: pool_marks,
+                            glmf_shared_replay: shared, state_slots: Some(8), ..Default::default()
+                        }), ..sparks(2) };
+                        let report = plan(dir.path(), &options).unwrap();
+                        let memory = report.memory_layout.unwrap();
+                        let served_index = if gpus == 2 { GlmfIndexCache::Keys } else { index };
+                        let geometry = glm_flash_rank_cache_geometry_rows(&cfg, cfg.layers, gpus,
+                            served_index, 4, rows).unwrap();
+                        let unit = geometry.logical_unit_rows;
+                        let mut served_pool = 16_777_216;
+                        for (device, rank) in memory.devices.iter().filter(|d| d.kind == cuteafd_core::memory_layout::DeviceKind::Rtx)
+                            .zip(&geometry.ranks) {
+                            let records = device.items.iter().find(|i| i.category == Category::Kv && i.group == "records")
+                                .unwrap().bytes;
+                            let bytes = rank.persistent_unit_bytes + rank.pool_metadata_unit_bytes;
+                            assert_eq!(records, memory.pool_tokens.div_ceil(unit) * bytes);
+                            let available = (device.free_bytes() + records as i64).max(0) as u64;
+                            served_pool = served_pool.min(available / bytes.div_ceil(unit) / unit * unit);
+                            let state = device.items.iter().find(|i| i.category == Category::Kv && i.group == "state")
+                                .unwrap().bytes;
+                            let replay = if shared && gpus == 1 {
+                                crate::serving_capacity::glm_flash_kda_replay_bytes_rows(&cfg, cfg.layers, 1, rows).unwrap()
+                            } else { 0 };
+                            assert_eq!(state, rank.fixed_state_bytes + rank.active_state_per_sequence_bytes * 8
+                                + rank.speculative_replay_bytes - replay);
+                            if pool_marks {
+                                let reserve = device.items.iter().find(|i| i.group == "reserved units").unwrap().bytes;
+                                assert_eq!(reserve, bytes * crate::serving_capacity::GLMF_POOL_MARK_RESERVED_UNITS);
+                            }
+                        }
+                        assert!(served_pool > 0,
+                            "{index:?} gpus={gpus} rows={rows} pool_marks={pool_marks} shared={shared}: {memory:?}");
+                        assert_eq!(memory.pool_tokens, served_pool,
+                            "{index:?} gpus={gpus} rows={rows} pool_marks={pool_marks} shared={shared}");
+                    }
+                }
+            }
+        }
+    }
 }
 
 #[test]
@@ -1910,12 +1985,12 @@ fn glm5_flash_layout_reserves_the_mark_arena_its_server_allocates() {
     let rank = crate::serving_capacity::glm_flash_cache_geometry(&cfg, 45).unwrap().ranks[0];
     assert_eq!((rank.retained_mark_bytes, rank.speculative_replay_bytes), (147_619_840, 321_421_312));
     let dir = snapshot(config, &[]);
-    for (concurrency, slots) in [(8, 18), (16, 34)] {
+    for (concurrency, slots) in [(1, 14), (8, 18), (16, 34)] {
         let memory = plan(dir.path(), &layout(96 << 30, concurrency)).unwrap().memory_layout.unwrap();
         assert_eq!(cuteafd_core::prefix::mark_slots_for(concurrency, 20, rank.retained_mark_bytes, 2 << 30), slots);
         assert_eq!(marks(&memory), slots * rank.retained_mark_bytes);
         let state = memory.devices[0].items.iter().find(|i| i.group == "state").unwrap().bytes;
-        assert_eq!(state, rank.fixed_state_bytes + rank.active_state_per_sequence_bytes * (concurrency + 2)
+        assert_eq!(state, rank.fixed_state_bytes + rank.active_state_per_sequence_bytes * concurrency.max(8)
             + rank.speculative_replay_bytes);
     }
     // An explicit arena (0: none) is taken as given.

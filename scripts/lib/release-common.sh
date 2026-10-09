@@ -445,6 +445,51 @@ release_config_family() {
   printf '%s\n' "${described%% *}"
 }
 
+# Resolve launcher-only GLM Flash defaults; explicit old values keep the old argv.
+release_glmf_auto() {
+  local key="$1" value="$2" preferred="$3" fallback="$4" eligible="$5" reason="$6"
+  if [[ "$value" == auto ]]; then
+    value="$fallback"
+    [[ "$eligible" != 1 ]] || value="$preferred"
+    printf '%s=auto -> %s (%s)\n' "$key" "$value" "$reason" >&2
+  fi
+  printf '%s' "$value"
+}
+
+# Inspect the selected image's program metadata without exposing GPUs. A missing
+# manifest or incomplete set must keep the old 64-row path, not break auto.
+release_glmf_wide_decode_available() {
+  local snapshot="$1" index="$2" state="$3" kda="$4" image="$5"
+  shift 5
+  local geometry
+  geometry="$(python3 - "$snapshot/config.json" <<'PY'
+import json, sys
+try:
+    c = json.load(open(sys.argv[1]))
+    c = c.get("text_config", c)
+    print(c["moe_intermediate_size"], c["intermediate_size"])
+except (OSError, ValueError, KeyError, TypeError):
+    sys.exit(1)
+PY
+)" || return 1
+  docker run --rm --network none "$@" --entrypoint python3 "$image" -c '
+import json, sys
+try:
+    programs = {p["name"] for p in json.load(open("/opt/cuteafd/share/PROGRAMS.json"))["programs"]}
+    moe, dense = sys.argv[4].split()
+    names = ["mhc_post_pre", "mla_producer", "o", "sparse_mla_decode",
+             "index_producer", "index_topk_decode", "ffn_i"+moe, "ffn_i"+dense]
+    names += ["kda" if sys.argv[2] == "f32" else "kda_s16"]
+    if sys.argv[3] != "off": names += ["kda_w8"]
+    compact = sys.argv[1] == "compact"
+    if compact: names += ["index_producer_c"]
+    names += ["kda_commit" + ("_c" if compact else "") + ("_s16" if sys.argv[2] != "f32" else "")]
+    sys.exit(0 if all("glmf_"+n+"_m128" in programs for n in names) else 1)
+except (OSError, ValueError, KeyError, TypeError):
+    sys.exit(1)
+' "$index" "$state" "$kda" "$geometry" >/dev/null 2>&1
+}
+
 # Header-only eligibility; the Rust planner validates the complete tower contract.
 release_resolve_audio_mode() {
   local mode="$1" snapshot="$2"

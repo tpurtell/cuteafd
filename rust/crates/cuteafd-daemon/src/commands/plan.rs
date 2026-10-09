@@ -37,6 +37,7 @@ fn options(args: &PlanArgs) -> Result<PlanOptions, PlanError> {
                 full_prefill_logits: args.full_prefill_logits,
                 prefill_lanes: args.prefill_lanes,
                 glmf_decode_rows: args.decode_rows,
+                glmf_index: args.index_cache.into(),
                 headroom_bytes: budget_bytes("--headroom-gib", args.headroom_gib)?,
                 graph_budget_bytes: args.graph_budget_mib.map(|mib| mib << 20),
                 glmf_pool_marks: args.prefix_marks == crate::families::glm5_flash::prefix::PrefixMarks::Pool,
@@ -401,6 +402,7 @@ mod tests {
             full_prefill_logits: false,
             prefill_lanes: 0,
             decode_rows: 64,
+            index_cache: crate::families::glm5_flash::engine::IndexCache::Keys,
             headroom_gib: 2.0,
             graph_budget_mib: None,
             replay_records: crate::families::glm5_flash::engine::ReplayRecords::Own,
@@ -621,6 +623,21 @@ mod tests {
     }
 
     #[test]
+    fn glm_flash_index_cache_reaches_the_layout() {
+        use clap::Parser;
+        use cuteafd_loader::serving_capacity::GlmfIndexCache;
+        let parse = |extra: &[&str]| crate::cli::Cli::try_parse_from(
+            ["cuteafd", "plan", "/not-read", "--layout"].into_iter().chain(extra.iter().copied()));
+        for (extra, index) in [(&[][..], GlmfIndexCache::Keys),
+            (&["--index-cache", "keys"][..], GlmfIndexCache::Keys),
+            (&["--index-cache", "compact"][..], GlmfIndexCache::Compact)] {
+            let crate::cli::Commands::Plan(args) = parse(extra).unwrap().command else { panic!("plan") };
+            assert_eq!(options(&args).unwrap().layout.unwrap().glmf_index, index);
+        }
+        assert!(parse(&["--index-cache", "auto"]).is_err());
+    }
+
+    #[test]
     fn glm_flash_prefix_marks_reach_the_layout() {
         use clap::Parser;
         let parse = |extra: &[&str]| crate::cli::Cli::try_parse_from(
@@ -687,23 +704,19 @@ mod tests {
             let argv: Vec<&str> = argv.iter().map(String::as_str).collect();
             assert_eq!(planned(&argv), served(sequences, entries, mib.unwrap_or(2048)), "{argv:?}");
         }
-        // The boundaries, against the planner's own rule over --concurrency alone (C + 2 state slots,
-        // C lanes): C1 without entries took 3 slots where serve-glmf keeps 8 (738,099,200 B short), C16
-        // took 18 for 16 (295,239,680 B over), and C128 took 258 marks for 130 (18,895,339,520 B over).
+        // Implicit state slots now follow serving's max(8, C), including C1 and C16.
+        // Explicit mark lanes still cap C128 at 64 instead of the planner's uncapped C lanes.
         assert_eq!(planned(&launcher(1, 0, None).iter().map(String::as_str).collect::<Vec<_>>()), (0, state(8)));
-        assert_eq!(planned(&["--concurrency", "1", "--prefix-cache-entries", "0"]), (0, state(3)));
-        assert_eq!(state(8) - state(3), 738_099_200);
+        assert_eq!(planned(&["--concurrency", "1", "--prefix-cache-entries", "0"]), (0, state(8)));
         assert_eq!(planned(&launcher(16, 20, None).iter().map(String::as_str).collect::<Vec<_>>()),
             (34 * mark, state(16)));
-        assert_eq!(planned(&["--concurrency", "16"]), (34 * mark, state(18)));
-        assert_eq!(state(18) - state(16), 295_239_680);
+        assert_eq!(planned(&["--concurrency", "16"]), (34 * mark, state(16)));
         assert_eq!(planned(&launcher(128, 20, None).iter().map(String::as_str).collect::<Vec<_>>()),
             (130 * mark, state(128)));
         assert_eq!(planned(&["--concurrency", "128"]).0, 258 * mark);
         assert_eq!((258 - 130) * mark, 18_895_339_520);
-        // With no keys set the launcher passes none of them: the planner's defaults (8 sequences,
-        // 20 entries, 2,048 MiB) give serve-glmf's 18 marks, and work/p0's C + 2 = 10 state slots.
-        assert_eq!(planned(&[]), (18 * mark, state(10)));
+        // Unset launch keys now plan serving's defaults: 18 marks and 8 state slots.
+        assert_eq!(planned(&[]), (18 * mark, state(8)));
         // The other knobs serve-glmf gets reach the layout as given.
         let custom = layout(&["--concurrency", "16", "--state-slots", "16", "--mark-lanes", "16",
             "--prefix-cache-entries", "6", "--prefix-cache-mark-mib", "1971", "--replay-records", "shared"]);
