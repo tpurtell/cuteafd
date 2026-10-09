@@ -1,0 +1,62 @@
+//! Hosted web search: the gateway runs the search when the model calls the
+//! `web_search` tool, so CLIs that expect a server-side search tool
+//! (Anthropic `web_search_*`, Responses `web_search`) get one.
+use futures::future::BoxFuture;
+use serde::{Deserialize, Serialize};
+
+use super::error::GatewayError;
+use super::turn::{ToolSpec, WebSearchSpec};
+
+/// The function-tool name the backend model sees for hosted search.
+pub const TOOL_NAME: &str = "web_search";
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SearchQuery {
+    pub query: String,
+    #[serde(default)]
+    pub allowed_domains: Vec<String>,
+    #[serde(default)]
+    pub blocked_domains: Vec<String>,
+    #[serde(default = "default_results")]
+    pub max_results: usize,
+}
+
+fn default_results() -> usize { 5 }
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SearchHit {
+    pub url: String,
+    pub title: String,
+    /// Extracted page text or snippet, bounded by the provider.
+    pub content: String,
+    /// ISO date or provider's age string, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub published: Option<String>,
+}
+
+pub trait SearchProvider: Send + Sync + 'static {
+    /// `exa`, `searxng`, ...
+    fn name(&self) -> &str;
+    fn search(&self, query: SearchQuery) -> BoxFuture<'static, Result<Vec<SearchHit>, GatewayError>>;
+}
+
+/// The function tool the backend sees in place of the client's hosted tool.
+pub fn tool_spec(spec: &WebSearchSpec) -> ToolSpec {
+    let mut description = String::from(
+        "Search the web for current information. Returns result titles, URLs and page text. \
+         Use it for facts that may be newer than your training data, and cite the URLs you use.");
+    if !spec.allowed_domains.is_empty() {
+        description.push_str(&format!(" Results are limited to: {}.", spec.allowed_domains.join(", ")));
+    }
+    ToolSpec {
+        name: TOOL_NAME.into(),
+        description: Some(description),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {"query": {"type": "string", "description": "The search query"}},
+            "required": ["query"],
+            "additionalProperties": false,
+        }),
+        strict: false,
+    }
+}
