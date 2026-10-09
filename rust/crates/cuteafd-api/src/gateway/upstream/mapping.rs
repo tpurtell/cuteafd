@@ -11,15 +11,75 @@ pub(super) fn request(turn: &TurnRequest, config: &UpstreamConfig) -> Result<Val
     if !config.capabilities.strict_tools && turn.tools.iter().any(|tool| tool.strict) {
         return Err(GatewayError::unsupported("strict function tools are not supported by this upstream backend").with_param("tools"));
     }
-    match config.flavor { Flavor::OpenaiChat => chat(turn, config), Flavor::Anthropic => anthropic(turn, config) }
+    let names = WireNames::new(turn);
+    match config.flavor { Flavor::OpenaiChat => chat(turn, config, &names), Flavor::Anthropic => anthropic(turn, config, &names) }
 }
-/// Preserve standard tool names; encode namespace/custom names deterministically without collisions with plain names.
-pub(super) fn wire_name(name: &str) -> String {
-    if !name.is_empty() && name.len() <= 64 && !name.starts_with("cf_")
-        && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-') { return name.to_string(); }
+/// Per-turn tool names on the wire. Upstream models see readable names: a
+/// namespaced tool (`functions.exec`) goes out under its local name (`exec`)
+/// when that is unique and doesn't clash with another tool, because client
+/// prompts (Codex) tell the model to call the local name. Otherwise it is
+/// sanitized to `functions__exec`, and only names that still aren't legal
+/// (or collide) are hashed. `original` maps every name the model might use
+/// back: the wire name, the full name, or a unique local name.
+#[derive(Debug, Default)]
+pub(super) struct WireNames { to_wire: std::collections::HashMap<String, String>, to_original: std::collections::HashMap<String, String> }
+
+fn legal(name: &str) -> bool {
+    !name.is_empty() && name.len() <= 64 && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+}
+fn hashed(name: &str) -> String {
     use sha2::{Digest, Sha256};
-    let hash = format!("{:x}",Sha256::digest(name.as_bytes()));
-    format!("cf_{}",&hash[..60])
+    format!("cf_{}", &format!("{:x}", Sha256::digest(name.as_bytes()))[..60])
+}
+
+impl WireNames {
+    pub(super) fn new(turn: &TurnRequest) -> Self {
+        let mut names: Vec<&str> = turn.tools.iter().map(|t| t.name.as_str()).collect();
+        for item in &turn.items {
+            if let Item::ToolCall { name, .. } | Item::ServerToolCall { name, .. } = item { names.push(name); }
+        }
+        if let ToolChoice::Named { name } = &turn.tool_choice { names.push(name); }
+        names.sort_unstable(); names.dedup();
+        let local = |n: &str| n.rsplit('.').next().unwrap_or(n).to_string();
+        let mut local_count: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        for n in &names { *local_count.entry(local(n)).or_default() += 1; }
+        let mut out = Self::default();
+        let mut taken: std::collections::HashSet<String> = std::collections::HashSet::new();
+        // Plain legal names keep themselves.
+        for n in names.iter().filter(|n| legal(n) && !n.starts_with("cf_")) {
+            out.to_wire.insert(n.to_string(), n.to_string());
+            taken.insert(n.to_string());
+        }
+        let pending: Vec<&str> = names.iter().copied().filter(|n| !out.to_wire.contains_key(*n)).collect();
+        for n in pending {
+            let short = local(n);
+            let sanitized: String = n.chars().map(|c| if c.is_ascii_alphanumeric() || c == '_' || c == '-' { c } else { '_' }).collect::<String>();
+            let dotted = n.replace('.', "__");
+            let wire = [ (local_count[&short] == 1).then(|| short.clone()), Some(dotted), Some(sanitized) ]
+                .into_iter().flatten().find(|w| legal(w) && !w.starts_with("cf_") && !taken.contains(w))
+                .unwrap_or_else(|| hashed(n));
+            taken.insert(wire.clone());
+            out.to_wire.insert(n.to_string(), wire);
+        }
+        for (original, wire) in &out.to_wire {
+            out.to_original.insert(wire.clone(), original.clone());
+            out.to_original.entry(original.clone()).or_insert_with(|| original.clone());
+            let short = local(original);
+            if local_count[&short] == 1 { out.to_original.entry(short).or_insert_with(|| original.clone()); }
+        }
+        out
+    }
+    pub(super) fn wire(&self, name: &str) -> String {
+        self.to_wire.get(name).cloned().unwrap_or_else(|| if legal(name) { name.to_string() } else { hashed(name) })
+    }
+    pub(super) fn original(&self, name: &str) -> String {
+        self.to_original.get(name).cloned().unwrap_or_else(|| name.to_string())
+    }
+}
+
+/// Stateless wire name for a lone tool name (tests, single-name callers).
+pub(super) fn wire_name(name: &str) -> String {
+    if legal(name) && !name.starts_with("cf_") { name.to_string() } else { hashed(name) }
 }
 fn role(role: Role) -> &'static str { match role { Role::User => "user", Role::Assistant => "assistant", Role::System => "system" } }
 fn parts(content: &[Part], flavor: Flavor) -> Result<Value, GatewayError> {
@@ -58,11 +118,12 @@ fn assistant(messages: &mut Vec<Value>) -> &mut Value {
     messages.last_mut().expect("assistant exists")
 }
 fn add_chat_call(messages: &mut Vec<Value>, id: &str, name: &str, arguments: &str) {
+    // `name` is already the wire name.
     let message = assistant(messages);
     if !message["tool_calls"].is_array() { message["tool_calls"] = json!([]); }
-    message["tool_calls"].as_array_mut().unwrap().push(json!({"id":id,"type":"function","function":{"name":wire_name(name),"arguments":arguments}}));
+    message["tool_calls"].as_array_mut().unwrap().push(json!({"id":id,"type":"function","function":{"name":name,"arguments":arguments}}));
 }
-fn chat(turn: &TurnRequest, config: &UpstreamConfig) -> Result<Value, GatewayError> {
+fn chat(turn: &TurnRequest, config: &UpstreamConfig, names: &WireNames) -> Result<Value, GatewayError> {
     let mut messages = Vec::new();
     if let Some(system) = &turn.system { messages.push(json!({"role":"system","content":system})); }
     for item in &turn.items {
@@ -74,9 +135,9 @@ fn chat(turn: &TurnRequest, config: &UpstreamConfig) -> Result<Value, GatewayErr
                 } else { messages.push(json!({"role":role(*r),"content":content})); }
             }
             Item::Reasoning { text, .. } => { assistant(&mut messages)["reasoning_content"] = json!(text); }
-            Item::ToolCall { id, name, arguments } => add_chat_call(&mut messages, id, name, arguments),
+            Item::ToolCall { id, name, arguments } => add_chat_call(&mut messages, id, &names.wire(name), arguments),
             Item::ToolResult { call_id, content, .. } => messages.push(json!({"role":"tool","tool_call_id":call_id,"content":chat_content(content)?})),
-            Item::ServerToolCall { id, name, input } => add_chat_call(&mut messages, id, name, &input.to_string()),
+            Item::ServerToolCall { id, name, input } => add_chat_call(&mut messages, id, &names.wire(name), &input.to_string()),
             Item::ServerToolResult { call_id, output, .. } => messages.push(json!({"role":"tool","tool_call_id":call_id,"content":output.to_string()})),
         }
     }
@@ -94,13 +155,13 @@ fn chat(turn: &TurnRequest, config: &UpstreamConfig) -> Result<Value, GatewayErr
     let mut request = json!({"model":turn.model,"messages":messages,"stream":true,"stream_options":{"include_usage":true}});
     if !turn.tools.is_empty() {
         request["tools"] = json!(turn.tools.iter().map(|tool| {
-            let mut function = json!({"name":wire_name(&tool.name),"parameters":tool.parameters});
+            let mut function = json!({"name":names.wire(&tool.name),"parameters":tool.parameters});
             if let Some(description) = &tool.description { function["description"] = json!(description); }
             if tool.strict { function["strict"] = json!(true); }
             json!({"type":"function","function":function})
         }).collect::<Vec<_>>());
         request["tool_choice"] = match &turn.tool_choice { ToolChoice::Auto => json!("auto"), ToolChoice::None => json!("none"),
-            ToolChoice::Required => json!("required"), ToolChoice::Named { name } => json!({"type":"function","function":{"name":wire_name(name)}}) };
+            ToolChoice::Required => json!("required"), ToolChoice::Named { name } => json!({"type":"function","function":{"name":names.wire(name)}}) };
         if let Some(parallel) = turn.parallel_tool_calls { request["parallel_tool_calls"] = json!(parallel); }
     }
     let thinking = turn.reasoning.enabled.unwrap_or(config.thinking_toggle);
@@ -126,7 +187,7 @@ fn append_block(messages: &mut Vec<Value>, role: &str, block: Value) {
     if messages.last().is_none_or(|m| m["role"] != role) { messages.push(json!({"role":role,"content":[]})); }
     messages.last_mut().unwrap()["content"].as_array_mut().unwrap().push(block);
 }
-fn anthropic(turn: &TurnRequest, config: &UpstreamConfig) -> Result<Value, GatewayError> {
+fn anthropic(turn: &TurnRequest, config: &UpstreamConfig, names: &WireNames) -> Result<Value, GatewayError> {
     let mut messages = Vec::new();
     let mut system = turn.system.clone().unwrap_or_default();
     for item in &turn.items {
@@ -147,10 +208,10 @@ fn anthropic(turn: &TurnRequest, config: &UpstreamConfig) -> Result<Value, Gatew
             }
             Item::ToolCall { id, name, arguments } => {
                 let input: Value = serde_json::from_str(arguments).map_err(|_| GatewayError::invalid("tool call arguments must be JSON"))?;
-                append_block(&mut messages, "assistant", json!({"type":"tool_use","id":id,"name":wire_name(name),"input":input}));
+                append_block(&mut messages, "assistant", json!({"type":"tool_use","id":id,"name":names.wire(name),"input":input}));
             }
             Item::ToolResult { call_id, content, is_error } => append_block(&mut messages, "user", json!({"type":"tool_result","tool_use_id":call_id,"content":parts(content, Flavor::Anthropic)?,"is_error":is_error})),
-            Item::ServerToolCall { id, name, input } => append_block(&mut messages, "assistant", json!({"type":"tool_use","id":id,"name":wire_name(name),"input":input})),
+            Item::ServerToolCall { id, name, input } => append_block(&mut messages, "assistant", json!({"type":"tool_use","id":id,"name":names.wire(name),"input":input})),
             Item::ServerToolResult { call_id, output, .. } => append_block(&mut messages, "user", json!({"type":"tool_result","tool_use_id":call_id,"content":output.to_string()})),
         }
     }
@@ -158,12 +219,12 @@ fn anthropic(turn: &TurnRequest, config: &UpstreamConfig) -> Result<Value, Gatew
     if !system.is_empty() { request["system"] = json!(system); }
     if !turn.tools.is_empty() {
         request["tools"] = json!(turn.tools.iter().map(|t| {
-            let mut tool = json!({"name":wire_name(&t.name),"description":t.description.clone().unwrap_or_default(),"input_schema":t.parameters});
+            let mut tool = json!({"name":names.wire(&t.name),"description":t.description.clone().unwrap_or_default(),"input_schema":t.parameters});
             if t.strict { tool["strict"] = json!(true); }
             tool
         }).collect::<Vec<_>>());
         request["tool_choice"] = match &turn.tool_choice { ToolChoice::Auto => json!({"type":"auto"}), ToolChoice::None => json!({"type":"none"}),
-            ToolChoice::Required => json!({"type":"any"}), ToolChoice::Named { name } => json!({"type":"tool","name":wire_name(name)}) };
+            ToolChoice::Required => json!({"type":"any"}), ToolChoice::Named { name } => json!({"type":"tool","name":names.wire(name)}) };
         if let Some(parallel) = turn.parallel_tool_calls { request["tool_choice"]["disable_parallel_tool_use"] = json!(!parallel); }
     }
     if let Some(enabled) = turn.reasoning.enabled {

@@ -142,6 +142,7 @@ impl Backend for Upstream {
         let this = self.clone();
         Box::pin(async move {
             let request = this.map_request(&turn)?;
+            let names = mapping::WireNames::new(&turn);
             let suffix = match this.config.flavor { Flavor::OpenaiChat => "chat/completions", Flavor::Anthropic => "v1/messages" };
             let response = this.completion_request(&turn, suffix).json(&request).send().await
                 .map_err(|_| GatewayError::upstream("upstream request transport failure"))?;
@@ -152,12 +153,10 @@ impl Backend for Upstream {
                 recording.push(&body);
                 return Err(http_error(status));
             }
-            let names: std::collections::HashMap<String,String> = turn.tools.iter()
-                .map(|tool| (mapping::wire_name(&tool.name),tool.name.clone())).collect();
             let mut stream = sse::events(response.bytes_stream(), this.config.flavor, recording).map(move |event| {
                 event.map(|event| match event {
                     super::turn::TurnEvent::ToolCallStart { index,id,name } => super::turn::TurnEvent::ToolCallStart {
-                        index,id,name:names.get(&name).cloned().unwrap_or(name) },
+                        index,id,name:names.original(&name) },
                     other => other,
                 })
             });

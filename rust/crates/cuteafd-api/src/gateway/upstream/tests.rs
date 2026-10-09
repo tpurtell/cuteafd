@@ -64,14 +64,37 @@ fn namespaced_tools_use_legal_wire_names_consistently() {
     turn.tool_choice = ToolChoice::Named { name:"functions.apply_patch".into() };
     turn.items.push(Item::ToolCall { id:"call".into(),name:"functions.apply_patch".into(),arguments:"{}".into() });
     for flavor in [Flavor::OpenaiChat,Flavor::Anthropic] {
-        let request = backend(flavor).map_request(&turn).unwrap();
-        let name = mapping::wire_name("functions.apply_patch");
-        assert!(name.len() <= 64 && !name.contains('.'));
-        let wire = request.to_string();
+        let wire = backend(flavor).map_request(&turn).unwrap().to_string();
         assert!(!wire.contains("functions.apply_patch"));
-        assert!(wire.contains(&name));
+        assert!(wire.contains("\"apply_patch\""), "unique local name goes on the wire: {wire}");
     }
 }
+
+/// Live Codex run (2026-10-09): Codex declares `functions.exec` (a custom
+/// tool) and its prompt says "call exec". A hashed wire name made the model
+/// call the undeclared `exec`, which then rendered as a plain function call
+/// and Codex aborted with "incompatible payload".
+#[test]
+fn codex_namespaced_tools_round_trip_by_local_name() {
+    let mut turn = turn();
+    for name in ["functions.exec", "functions.wait", "collaboration.wait_agent", "clock.sleep", "web.wait"] {
+        turn.tools.push(ToolSpec { name: name.into(), description: None, parameters: json!({"type":"object"}), strict: false });
+    }
+    let names = mapping::WireNames::new(&turn);
+    assert_eq!(names.wire("functions.exec"), "exec");
+    assert_eq!(names.wire("clock.sleep"), "sleep");
+    assert_eq!(names.wire("functions.wait"), "functions__wait", "ambiguous local names stay qualified");
+    assert_eq!(names.wire("web.wait"), "web__wait");
+    for (sent, original) in [("exec", "functions.exec"), ("functions.exec", "functions.exec"), ("functions__wait", "functions.wait"),
+        ("sleep", "clock.sleep"), ("wait_agent", "collaboration.wait_agent")] {
+        assert_eq!(names.original(sent), original, "{sent}");
+    }
+    assert_eq!(names.original("wait"), "wait", "ambiguous local name is not guessed");
+    let request = backend(Flavor::OpenaiChat).map_request(&turn).unwrap();
+    let declared: Vec<&str> = request["tools"].as_array().unwrap().iter().map(|t| t["function"]["name"].as_str().unwrap()).collect();
+    assert!(declared.contains(&"exec") && declared.iter().all(|n| !n.starts_with("cf_")));
+}
+
 #[test]
 fn thinking_quirks_are_opt_in_and_reject_forced_thinking_tools() {
     let mut config = UpstreamConfig::new("http://localhost/v1", Flavor::OpenaiChat,"test-model");
