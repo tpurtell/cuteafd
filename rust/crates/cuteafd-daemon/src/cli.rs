@@ -4,6 +4,22 @@ use std::path::PathBuf;
 
 pub(crate) const DEFAULT_REAL_FULL_MAX_CONTEXT_TOKENS: usize = 128 * 1024;
 
+/// Inspect original argv: clap normalizes aliases before exposing matches.
+pub(crate) fn deprecated_budget_flags(args: impl IntoIterator<Item = impl AsRef<str>>) -> Vec<&'static str> {
+    let mut replacements = Vec::new();
+    for arg in args {
+        let replacement = match arg.as_ref().split('=').next().unwrap_or("") {
+            "--rtx-budget-gib" | "--rtx-gib" => Some("--coordinator-gpu-budget-gib"),
+            "--coordinator-budget-gib" => Some("--coordinator-weight-budget-gib"),
+            _ => None,
+        };
+        if let Some(replacement) = replacement {
+            if !replacements.contains(&replacement) { replacements.push(replacement); }
+        }
+    }
+    replacements
+}
+
 #[derive(Debug, Parser)]
 #[command(name = "cuteafd", about = "CUTEAFD phase0 runtime CLI")]
 pub(crate) struct Cli {
@@ -22,7 +38,7 @@ pub(crate) struct Cli {
     pub(crate) image_url_fetch: Option<cuteafd_api::openai::media::ImageUrlFetch>,
     /// Logical GiB ceiling per coordinator GPU (weights, KV, workspaces,
     /// graphs and drafts); leaves physical GPU capacity/SM/L2 unchanged.
-    #[arg(long, global = true)]
+    #[arg(long, global = true, aliases = ["rtx-budget-gib", "rtx-gib"])]
     pub(crate) coordinator_gpu_budget_gib: Option<f64>,
     #[command(subcommand)]
     pub(crate) command: Commands,
@@ -197,8 +213,8 @@ pub(crate) struct PlanArgs {
     pub(crate) spark_budget_gib: f64,
     /// Weight budget of the coordinator GPU, GiB (its own tensors, plus every
     /// routed expert with --spark-ranks 0).
-    #[arg(long, default_value_t = 80.0)]
-    pub(crate) coordinator_budget_gib: f64,
+    #[arg(long, alias = "coordinator-budget-gib", default_value_t = 80.0)]
+    pub(crate) coordinator_weight_budget_gib: f64,
     #[arg(long, default_value_t = false)]
     pub(crate) json: bool,
     /// Exit non-zero unless every part is servable.
@@ -211,9 +227,9 @@ pub(crate) struct PlanArgs {
     /// Coordinator GPUs for --layout (1 or 2; Qwen currently uses only the first).
     #[arg(long, default_value_t = 1)]
     pub(crate) rtx: usize,
-    /// Usable GiB per coordinator GPU for --layout.
-    #[arg(long = "rtx-budget-gib", alias = "rtx-gib", default_value_t = 95.5, requires = "layout")]
-    pub(crate) rtx_gib: f64,
+    /// Resolved global logical GPU ceiling; PRO defaults to 95.5 GiB.
+    #[arg(skip)]
+    pub(crate) coordinator_gpu_budget_gib: Option<f64>,
     /// Explicit KV pool tokens for --layout (0 or omitted: automatic).
     #[arg(long)]
     pub(crate) pool_tokens: Option<u64>,
@@ -235,6 +251,10 @@ pub(crate) struct PlanArgs {
     /// Prefill lanes for --layout (GLM 5.3 Flash; 0: the family default).
     #[arg(long, default_value_t = 0)]
     pub(crate) prefill_lanes: u64,
+    /// Decode and verify step rows for --layout (GLM 5.3 Flash's --decode-rows: 64, or 128 with the
+    /// wide programs on one GPU): its decode workspace, token selector and replay records.
+    #[arg(long, default_value_t = 64, value_parser = plan_decode_rows)]
+    pub(crate) decode_rows: u64,
     /// GPU memory (GiB) each coordinator GPU keeps free for runtime growth in --layout (the
     /// engines' --headroom-gib).
     #[arg(long, default_value_t = 2.0)]
@@ -253,10 +273,10 @@ pub(crate) struct PlanArgs {
     /// Prefix mark arena slots (0 disables marks).
     #[arg(long)]
     pub(crate) prefix_slots: Option<u64>,
-    /// MiMo retained snapshots per bank for --layout (matches serving).
+    /// MiMo and GLM 5.3 Flash retained snapshots per bank for --layout (matches serving).
     #[arg(long, default_value_t = 20)]
     pub(crate) prefix_cache_entries: u64,
-    /// MiMo device positional-mark budget for --layout, MiB.
+    /// MiMo and GLM 5.3 Flash device positional-mark budget for --layout, MiB.
     #[arg(long, default_value_t = 2048)]
     pub(crate) prefix_cache_mark_mib: u64,
     /// MiMo warm DFlash prefix context marks (off until qualified).
@@ -826,6 +846,15 @@ fn parse_spark_tp(value: &str) -> Result<u8, String> {
         _ => Err(format!(
             "unsupported Spark TP degree {value}; expected 2, 3, 4 or 6"
         )),
+    }
+}
+
+/// `cuteafd plan --decode-rows`: GLM 5.3 Flash's decode programs' 64 rows, or the wide programs' 128.
+fn plan_decode_rows(value: &str) -> Result<u64, String> {
+    match value {
+        "64" => Ok(64),
+        "128" => Ok(128),
+        _ => Err("64 or 128".to_string()),
     }
 }
 

@@ -16,6 +16,9 @@ use crate::families::glm5_flash::GlmNextConfig;
 
 /// Rows of the decode-route programs (`_m64`).
 pub const GLMF_DECODE_ROWS: u64 = 64;
+/// Rows of the wide decode-route programs (`_m128`): with `--decode-rows 128` a decode or verify
+/// step of more than [`GLMF_DECODE_ROWS`] rows runs them; fewer rows keep the `_m64` programs.
+pub const GLMF_WIDE_DECODE_ROWS: u64 = 128;
 /// Selected-slot row width of the sparse MLA programs (2048 + 3, padded to 64).
 pub const GLMF_SPARSE_TOPK: u64 = 2112;
 /// The vocabulary head's cuBLAS workspace (`cuteafd_ffi::programs::VOCABULARY_HEAD_WORKSPACE`).
@@ -117,12 +120,28 @@ impl std::fmt::Display for GlmfMissingProgram {
 
 impl std::error::Error for GlmfMissingProgram {}
 
-/// The scratch of steps of up to `rows` rows (`decode`: the `_m64` programs, else
-/// the `_m4096` ones). `lookup(name)` is None when the build lacks program
-/// `name`, else its scratch bytes at capacity (0 without scratch).
+/// The scratch of steps of up to `rows` rows (`decode`: the `_m64` programs, and past
+/// [`GLMF_DECODE_ROWS`] rows the wide `_m128` ones too, which run over the same decode workspace;
+/// else the `_m4096` ones). `lookup(name)` is None when the build lacks program `name`, else its
+/// scratch bytes at capacity (0 without scratch).
 pub fn glmf_step_scratch(lookup: impl Fn(&str) -> Option<u64>, cfg: &GlmNextConfig, options: GlmfScratchOptions,
     rows: u64, decode: bool) -> Result<GlmfScratch, GlmfMissingProgram> {
-    let (cap, mode) = if decode { ("m64", "decode") } else { ("m4096", "prefill") };
+    if !decode {
+        return glmf_cap_scratch(&lookup, cfg, options, rows, "m4096", "prefill");
+    }
+    let narrow = glmf_cap_scratch(&lookup, cfg, options, rows, "m64", "decode")?;
+    if rows <= GLMF_DECODE_ROWS {
+        return Ok(narrow);
+    }
+    let wide = glmf_cap_scratch(&lookup, cfg, options, rows, &format!("m{GLMF_WIDE_DECODE_ROWS}"), "decode")?;
+    Ok(GlmfScratch { programs: narrow.programs.max(wide.programs), topk: narrow.topk.max(wide.topk) })
+}
+
+/// [`glmf_step_scratch`] of the programs of one capacity `cap` (`m64`, `m128`, `m4096`) and route
+/// `mode` (`decode`, `prefill`).
+fn glmf_cap_scratch(lookup: &impl Fn(&str) -> Option<u64>, cfg: &GlmNextConfig, options: GlmfScratchOptions,
+    rows: u64, cap: &str, mode: &str) -> Result<GlmfScratch, GlmfMissingProgram> {
+    let decode = mode == "decode";
     let required = |name: String| lookup(&name).ok_or(GlmfMissingProgram(name));
     let mut scratch = 0;
     for name in [format!("mhc_post_pre_{cap}"), options.kda_state.program(cap), format!("mla_producer_{cap}"),
@@ -321,11 +340,35 @@ impl GlmfStepWorkspaces {
     }
 }
 
-/// The step workspaces of `lanes` prefill lanes of `lane_rows` rows and the
-/// decode workspace, over the scratch of each step shape.
-pub fn glmf_step_workspaces(cfg: &GlmNextConfig, lanes: usize, lane_rows: u64, shape: &GlmfStepShape,
-    decode_scratch: GlmfScratch, prefill_scratch: GlmfScratch) -> GlmfStepWorkspaces {
-    let rows = GLMF_DECODE_ROWS;
+/// The token selector of decode steps of up to `rows` rows (the daemon's `TokenSelector`): its
+/// greedy outputs (ids, statuses and log-probabilities, 12 B a row) and the GPU sampler the
+/// start-up reserves for up to 128 of them (`TargetSamplingWave::device_bytes`: per row 64 B of
+/// parameters and 64 B of scratch, two vocabulary bit masks, a 2,048-bucket histogram, 256
+/// rank-ordered ids with their 8-byte staging, and 32 B of row outputs).
+pub fn glmf_selector_bytes(rows: u64, vocab: u64) -> u64 {
+    let capacity = rows.clamp(1, 128);
+    let mask = capacity * vocab.div_ceil(32) * 4;
+    rows * 12 + capacity * (64 + 64 + 2048 * 4 + 256 * (4 + 8) + 32) + 2 * mask
+}
+
+/// The rows every routed-expert resource of a GLM 5.3 Flash engine holds: the widest step it runs,
+/// a prefill lane of `prefill_rows` rows or a decode or verify step of `decode_rows` rows. The dense
+/// NVFP4 package, local FP8 or EXL3 experts and the Spark transports and intake planes take them.
+pub fn glmf_expert_rows(prefill_rows: u64, decode_rows: u64) -> u64 {
+    prefill_rows.max(decode_rows)
+}
+
+/// Device bytes of GLM 5.3 Flash's Spark intake planes: one transport per prefill lane (decode
+/// reuses lane zero's), each with a plane of `rows` BF16 partial rows of `hidden` per Spark rank.
+pub fn glmf_spark_intake_bytes(lanes: u64, ranks: u64, rows: u64, hidden: u64) -> u64 {
+    lanes * ranks * rows * hidden * 2
+}
+
+/// The step workspaces of `lanes` prefill lanes of `lane_rows` rows and the decode workspace of
+/// `decode_rows` rows (the engine's `--decode-rows`), over the scratch of each step shape.
+pub fn glmf_step_workspaces(cfg: &GlmNextConfig, lanes: usize, lane_rows: u64, decode_rows: u64,
+    shape: &GlmfStepShape, decode_scratch: GlmfScratch, prefill_scratch: GlmfScratch) -> GlmfStepWorkspaces {
+    let rows = decode_rows;
     GlmfStepWorkspaces {
         decode: glmf_lane_bytes(cfg, rows, true, shape).device_bytes()
             + glmf_temporary_bytes(cfg, rows, true, shape, decode_scratch).device_bytes(),
@@ -419,7 +462,7 @@ mod tests {
     fn prefill_lanes_share_one_set_of_temporaries() {
         let cfg = glm53_flash();
         let shape = spark_shape();
-        let workspaces = |lanes: usize, rows: u64| glmf_step_workspaces(&cfg, lanes, rows, &shape,
+        let workspaces = |lanes: usize, rows: u64| glmf_step_workspaces(&cfg, lanes, rows, GLMF_DECODE_ROWS, &shape,
             scratch(&cfg, 64, true), scratch(&cfg, rows, false));
         let two = workspaces(2, 4096);
         assert_eq!((two.decode, two.lane, two.prefill_temporaries), (94_955_520, 391_914_540, 1_993_850_880));
@@ -516,5 +559,75 @@ mod tests {
         assert_eq!((temps.logits, temps.head_workspace), (0, 0));
         // Decode tables hold a padded row per step row; prefill tables one shared row.
         assert_eq!((lead.page_table, lane.page_table), (64 * 1852 * 4, 1852 * 4));
+    }
+
+    /// The wide decode programs' scratch at capacity in the offline SM 12.0 export of SparkInfer
+    /// 1ce62d27 at 170 SMs (the sparse MLA with `full_launch_splits=1`), and the same export's
+    /// BF16-state and compact-index decode programs of 64 rows.
+    const WIDE_SCRATCH: [(&str, u64); 14] = [
+        ("glmf_index_producer_m128", 1_122_304), ("glmf_index_producer_c_m128", 1_187_840),
+        ("glmf_index_topk_decode_m128", 17_304_576), ("glmf_mhc_post_pre_m128", 819_200),
+        ("glmf_kda_m128", 21_053_440), ("glmf_kda_w8_m128", 21_053_440), ("glmf_kda_s16_m128", 21_053_440),
+        ("glmf_mla_producer_m128", 4_718_592), ("glmf_o_m128", 4_194_304),
+        ("glmf_sparse_mla_decode_m128", 16_809_984), ("glmf_ffn_i2048_m128", 1_572_864),
+        ("glmf_ffn_i12288_m128", 9_437_184), ("glmf_kda_s16_m64", 10_526_720), ("glmf_index_producer_c_m64", 593_920),
+    ];
+
+    fn wide_lookup(name: &str) -> Option<u64> {
+        WIDE_SCRATCH.iter().find(|(n, _)| *n == name).map(|&(_, bytes)| bytes).or_else(|| lookup(name))
+    }
+
+    /// A step of more than 64 rows runs the `_m128` programs over the decode workspace that also
+    /// runs the `_m64` ones: its scratch is the larger of each program set's, and its top-k scratch
+    /// the wide top-k's. Up to 64 rows the wide programs are not consulted.
+    #[test]
+    fn a_wide_decode_step_runs_both_program_sets() {
+        let cfg = glm53_flash();
+        let wide = |rows| glmf_step_scratch(wide_lookup, &cfg, GlmfScratchOptions::default(), rows, true);
+        // mhc_pre's 26,214,400 B stays the largest program scratch (the one-split sparse MLA is
+        // 16,809,984 B); the wide top-k's 17,304,576 B replaces the 64-row one's 8,653,824 B.
+        assert_eq!(wide(128).unwrap(), GlmfScratch { programs: 26_214_400, topk: 17_304_576 });
+        assert_eq!(wide(64).unwrap(), scratch(&cfg, 64, true));
+        assert_eq!(glmf_step_scratch(lookup, &cfg, GlmfScratchOptions::default(), 64, true).unwrap(),
+            scratch(&cfg, 64, true));
+        // A build without the wide programs cannot take a step past 64 rows, and names the first it lacks.
+        assert_eq!(glmf_step_scratch(lookup, &cfg, GlmfScratchOptions::default(), 128, true).unwrap_err(),
+            GlmfMissingProgram("glmf_mhc_post_pre_m128".into()));
+        // The state and index cache select their wide programs as they select the 64-row ones.
+        let compact = GlmfScratchOptions { index_compact: true, kda_state: GlmfKdaState::Bf16, kda_w8: true,
+            ..Default::default() };
+        assert_eq!(glmf_step_scratch(wide_lookup, &cfg, compact, 128, true).unwrap(),
+            GlmfScratch { programs: 26_214_400, topk: 17_304_576 });
+        let without = |name: &str| wide_lookup(name).filter(|_| name != "glmf_index_producer_c_m128");
+        assert_eq!(glmf_step_scratch(without, &cfg, compact, 128, true).unwrap_err(),
+            GlmfMissingProgram("glmf_index_producer_c_m128".into()));
+        // The 33-split sparse MLA a planner without `full_launch_splits` gives at 170 SMs would be the
+        // step's largest scratch.
+        let split = |name: &str| if name == "glmf_sparse_mla_decode_m128" { Some(554_729_472) } else { wide_lookup(name) };
+        assert_eq!(glmf_step_scratch(split, &cfg, GlmfScratchOptions::default(), 128, true).unwrap().programs,
+            554_729_472);
+    }
+
+    /// The decode workspace of 128 rows against 64, on one RTX with Spark experts at 131,072 tokens
+    /// (2,048 + 512 table columns a step row): the lane buffers and temporaries double with the rows,
+    /// the top-k scratch is the wide top-k's, the program scratch stays mhc_pre's. The prefill lanes
+    /// do not move. The selector and sampler of 128 rows add 3,209,984 B.
+    #[test]
+    fn a_wide_decode_workspace_doubles_its_rows() {
+        let cfg = glm53_flash();
+        let shape = GlmfStepShape { table_pages: 2048, table_pool_pages: 512, ..spark_shape() };
+        let wide = |rows| glmf_step_scratch(wide_lookup, &cfg, GlmfScratchOptions::default(), rows, true).unwrap();
+        let at = |decode_rows: u64| glmf_step_workspaces(&cfg, 2, 4096, decode_rows, &shape, wide(decode_rows),
+            scratch(&cfg, 4096, false));
+        let (narrow, broad) = (at(GLMF_DECODE_ROWS), at(GLMF_WIDE_DECODE_ROWS));
+        assert_eq!((broad.lane, broad.lanes, broad.prefill_temporaries), (narrow.lane, narrow.lanes, narrow.prefill_temporaries));
+        let rows = |decode_rows| glmf_lane_bytes(&cfg, decode_rows, true, &shape).device_bytes()
+            + glmf_temporary_bytes(&cfg, decode_rows, true, &shape, GlmfScratch { programs: 0, topk: 0 }).device_bytes()
+            - 2 * FLOOR;
+        assert_eq!(rows(128) - rows(64), 55_955_712);
+        assert_eq!(broad.decode - narrow.decode, 55_955_712 + (17_304_576 - 8_653_824));
+        assert_eq!(broad.device_bytes() - narrow.device_bytes(), 64_606_464);
+        assert_eq!(glmf_selector_bytes(64, 154_880), 3_209_984);
+        assert_eq!(glmf_selector_bytes(128, 154_880) - glmf_selector_bytes(64, 154_880), 3_209_984);
     }
 }

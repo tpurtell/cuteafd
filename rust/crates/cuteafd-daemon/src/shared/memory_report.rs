@@ -313,7 +313,8 @@ pub(crate) fn planned_pool_tokens_with_extra(library: &cuteafd_ffi::NativeLibrar
     glmf_index: cuteafd_loader::serving_capacity::GlmfIndexCache) -> anyhow::Result<usize> {
     let reserves = vec![RankReserve { extra_bytes: extra_reserve_bytes, workspace_bytes: None }; devices.len()];
     planned_pool_tokens_with_reserves(library, snapshot, devices, drafter, prefill_rows, slots, mark_slots,
-        requested, future_expert_bytes, &reserves, glmf_index, 4)
+        requested, future_expert_bytes, &reserves, glmf_index, 4,
+        cuteafd_loader::serving_capacity::GLMF_DECODE_ROWS)
 }
 
 #[derive(Clone, Copy, Default)]
@@ -329,15 +330,18 @@ pub(crate) fn lead_reserves(ranks: usize, lead_bytes: u64) -> Vec<RankReserve> {
     }).collect()
 }
 
-/// As `planned_pool_tokens_with_extra`, with each GPU's own reserve (`reserves`, lead first) and
-/// `kda_state_bytes` per GLM Flash KDA recurrent-state element (4 FP32, 2 BF16 with `--kda-state`).
+/// As `planned_pool_tokens_with_extra`, with each GPU's own reserve (`reserves`, lead first),
+/// `kda_state_bytes` per GLM Flash KDA recurrent-state element (4 FP32, 2 BF16 with `--kda-state`) and
+/// GLM Flash's `glmf_decode_rows` (`--decode-rows`), the rows its replay records and commit tables
+/// hold (charged in full, as the runtime allocates them).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn planned_pool_tokens_with_reserves(library: &cuteafd_ffi::NativeLibrary, snapshot: &std::path::Path,
     devices: &[i32], drafter: Option<&std::path::Path>, prefill_rows: usize, slots: usize, mark_slots: u64,
     requested: Option<u64>, future_expert_bytes: u64, reserves: &[RankReserve],
-    glmf_index: cuteafd_loader::serving_capacity::GlmfIndexCache, kda_state_bytes: u64)
+    glmf_index: cuteafd_loader::serving_capacity::GlmfIndexCache, kda_state_bytes: u64, glmf_decode_rows: u64)
     -> anyhow::Result<usize> {
     use anyhow::Context;
+    use cuteafd_loader::serving_capacity::CacheOptions;
     anyhow::ensure!(reserves.len() == devices.len(), "reserve must cover every admitted GPU");
     let checkpoint = cuteafd_loader::plan::Checkpoint::open(snapshot)?;
     let family = cuteafd_loader::plan::family::detect(&checkpoint).context("no family for this checkpoint")?;
@@ -346,11 +350,19 @@ pub(crate) fn planned_pool_tokens_with_reserves(library: &cuteafd_ffi::NativeLib
     // Its implemented split replicates MLA and divides KDA heads per GPU.
     let glmf = family.id() == "glm5_flash";
     let cache_ranks = if glmf { 1 } else { devices.len() };
-    let geometry = model.cache_geometry(cuteafd_loader::serving_capacity::CacheOptions {
-        coordinator_ranks: cache_ranks, glmf_index, kda_state_bytes, ..Default::default() })?
+    let geometry = model.cache_geometry(CacheOptions {
+        coordinator_ranks: cache_ranks, glmf_index, kda_state_bytes, glmf_decode_rows, ..Default::default() })?
         .with_context(|| format!("{} has no cache geometry for {} GPUs", family.id(), devices.len()))?;
+    let mut costs = cuteafd_loader::plan::layout::family_costs(family.id());
+    if family.id() == "glm5" {
+        let cfg = cuteafd_loader::families::glm5::GlmDsaConfig::from_hf(&checkpoint.config)?;
+        let context = cuteafd_loader::serving_capacity::checkpoint_context_limit(&checkpoint.config)?
+            .context("GLM checkpoint has no context limit")?;
+        let graph_bytes = cuteafd_loader::serving_capacity::glm_decode_graph_allowance(context as usize, cfg.layers)?;
+        costs.graph_bytes = costs.graph_bytes.map(|bytes| bytes.max(graph_bytes));
+    }
     let reserve = Reserve {
-        costs: cuteafd_loader::plan::layout::family_costs(family.id()),
+        costs,
         headroom: cuteafd_loader::plan::layout::LayoutOptions::default().headroom_bytes,
         draft: drafter.map_or(0, |d| safetensors_bytes(d) + (1300 << 20)),
         prefill_rows, slots, mark_slots, future_experts: future_expert_bytes,

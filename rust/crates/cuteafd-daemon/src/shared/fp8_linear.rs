@@ -35,6 +35,33 @@ impl Fp8Scales {
     }
 }
 
+/// How [`Fp8Weight::apply_rows`] runs (`cuteafd_fp8_linear`'s modes; GLM 5.3 Flash's
+/// `--draft-linear`). Ordered by the scratch each needs: a scratch admitted for one mode serves
+/// the modes before it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, clap::ValueEnum)]
+pub(crate) enum Fp8Rows {
+    /// W8A16 in passes of 64 rows ([`Fp8Weight::apply`]).
+    #[default]
+    W8a16,
+    /// The same bits in passes of 128 rows: one pass over the weight up to 128 rows, and one
+    /// launch chain where passes of 64 take two.
+    Wide,
+    /// W8A16 up to 8 rows (one draft block: the same bits); past them E4M3 activations per row
+    /// and 128-wide K block (amax / 448) on FP8 tensor cores, in passes of 128 rows.
+    W8a8,
+}
+
+impl Fp8Rows {
+    /// The native mode code.
+    pub fn code(self) -> i32 {
+        match self {
+            Fp8Rows::W8a16 => 0,
+            Fp8Rows::Wide => 1,
+            Fp8Rows::W8a8 => 2,
+        }
+    }
+}
+
 /// An E4M3 copy of a `[n, k]` BF16 weight in the GEMV's fragment order.
 pub(crate) struct Fp8Weight<'a> {
     packed: DeviceAllocation<'a>,
@@ -108,6 +135,31 @@ impl<'a> Fp8Weight<'a> {
         unsafe { library.fp8_w8a16_linear(x, packed, scale, out, out_f32, rows, self.k, n, scratch.buffer.ptr,
             scratch.buffer.bytes, stream) }
     }
+
+    /// [`Self::apply`] in `mode` ([`Fp8Rows::W8a16`] is [`Self::apply`]).
+    ///
+    /// # Safety
+    /// As [`Self::apply`], with `scratch` sized by [`scratch_rows`] for `mode` (or a later one).
+    // The GLM drafters call it; test crates that include this file alone do not.
+    #[cfg_attr(test, allow(dead_code))]
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn apply_rows(&self, library: &NativeLibrary, x: *const c_void, out: *mut c_void, out_f32: bool,
+        rows: usize, first: usize, n: usize, scratch: &DeviceAllocation<'_>, stream: *mut c_void, mode: Fp8Rows)
+        -> Result<()> {
+        if mode == Fp8Rows::W8a16 {
+            // SAFETY: the caller's contract.
+            return unsafe { self.apply(library, x, out, out_f32, rows, first, n, scratch, stream) };
+        }
+        ensure!(first % 16 == 0 && first + n <= self.n, "FP8 rows {first}..{} of {}", first + n, self.n);
+        // SAFETY: the offsets stay inside the packed copy (16-row tiles are contiguous) and its scales.
+        let (packed, scale) = unsafe {
+            (self.packed.buffer.ptr.cast::<u8>().add(first * self.k).cast::<c_void>(),
+                self.scale.buffer.ptr.cast::<u8>().add(first * self.k / 128 * 4).cast::<c_void>())
+        };
+        // SAFETY: the caller's contract.
+        unsafe { library.fp8_linear(x, packed, scale, out, out_f32, rows, self.k, n, mode.code(), scratch.buffer.ptr,
+            scratch.buffer.bytes, stream) }
+    }
 }
 
 /// GEMV scratch for up to `rows` rows of every `(k, n)` shape.
@@ -117,4 +169,31 @@ pub(crate) fn scratch<'a>(library: &'a NativeLibrary, rows: usize, shapes: &[(us
     let bytes = shapes.iter().map(|&(k, n)| library.fp8_w8a16_workspace(rows, k, n))
         .collect::<Result<Vec<_>>>()?.into_iter().max().unwrap_or(0);
     DeviceAllocation::new(library, bytes.max(256))
+}
+
+/// [`scratch`] for `mode` ([`Fp8Rows::W8a16`] is [`scratch`]).
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) fn scratch_rows<'a>(library: &'a NativeLibrary, rows: usize, shapes: &[(usize, usize)], mode: Fp8Rows)
+    -> Result<DeviceAllocation<'a>> {
+    if mode == Fp8Rows::W8a16 {
+        return scratch(library, rows, shapes);
+    }
+    let _memory_scope = cuteafd_ffi::memory_ledger::scope("workspace/fp8-linear");
+    let bytes = shapes.iter().map(|&(k, n)| library.fp8_linear_workspace(rows, k, n, mode.code()))
+        .collect::<Result<Vec<_>>>()?.into_iter().max().unwrap_or(0);
+    DeviceAllocation::new(library, bytes.max(256))
+}
+
+#[cfg(test)]
+mod rows_tests {
+    use super::*;
+
+    /// The native codes, and the order a scratch admitted for one mode serves the earlier ones
+    /// in (passes of 64 rows, then 128, then 128 with the W8A8 scales).
+    #[test]
+    fn modes_map_to_native_codes_in_scratch_order() {
+        assert_eq!([Fp8Rows::W8a16, Fp8Rows::Wide, Fp8Rows::W8a8].map(Fp8Rows::code), [0, 1, 2]);
+        assert!(Fp8Rows::W8a16 < Fp8Rows::Wide && Fp8Rows::Wide < Fp8Rows::W8a8);
+        assert_eq!(Fp8Rows::default(), Fp8Rows::W8a16);
+    }
 }

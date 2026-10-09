@@ -62,15 +62,31 @@ pub(crate) enum Toggle {
     Off,
 }
 
+/// The device mark arena's knobs for `lanes` decoding sequences ([`PrefixArgs::mark_rule`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MarkRule {
+    pub lanes: usize,
+    pub entries: usize,
+    /// `--prefix-cache-mark-mib`, in bytes.
+    pub budget_bytes: u64,
+}
+
+impl MarkRule {
+    /// Slots of the arena for marks of `mark_bytes` (every rank's part): what the runtime
+    /// allocates (`MarkArena::slots_for`) and what its planner reserves
+    /// ([`cuteafd_core::prefix::mark_slots_for`]). The budget holds whole marks, so the count
+    /// depends on the exact mark bytes: size both sides from the same mark.
+    pub fn slots(self, mark_bytes: usize) -> usize {
+        cuteafd_core::prefix::mark_slots_for(self.lanes as u64, self.entries as u64, mark_bytes as u64,
+            self.budget_bytes) as usize
+    }
+}
+
 impl PrefixArgs {
-    /// Slots of the device mark arena for marks of `mark_bytes` (every rank's part) and `lanes`
-    /// decoding sequences: what the runtime allocates (`MarkArena::slots_for`) and what its planner
-    /// reserves ([`cuteafd_core::prefix::mark_slots_for`]).
-    pub fn mark_slots(&self, lanes: usize, mark_bytes: usize) -> usize {
-        let budget = (self.prefix_cache_mark_mib as u64).saturating_mul(1 << 20);
-        let slots = cuteafd_core::prefix::mark_slots_for(lanes as u64, self.prefix_cache_entries as u64,
-            mark_bytes as u64, budget);
-        slots as usize
+    /// The device mark arena's knobs for `lanes` decoding sequences.
+    pub fn mark_rule(&self, lanes: usize) -> MarkRule {
+        MarkRule { lanes, entries: self.prefix_cache_entries,
+            budget_bytes: (self.prefix_cache_mark_mib as u64).saturating_mul(1 << 20) }
     }
 
     pub fn points(&self) -> PointPolicy {

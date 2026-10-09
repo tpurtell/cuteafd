@@ -13,7 +13,9 @@ pub const REPORT_WIDTH: f64 = 1000.0;
 /// then every panel that ran.
 pub fn shown(report: &Report) -> Vec<String> {
     let mut ids: Vec<String> = ALWAYS.iter().map(|s| s.to_string()).collect();
-    ids.push("baseline".into());
+    if report.no_fit_reason().is_none() {
+        ids.push("baseline".into());
+    }
     for panel in &report.panels {
         if !ids.contains(&panel.id) && !panel.passes.is_empty() {
             ids.push(panel.id.clone());
@@ -63,7 +65,7 @@ pub fn report_svg(report: &Report) -> String {
     let rows = super::layout::pack(&ids, w - 40.0, gap);
     let heights: Vec<f64> = rows.iter().map(|row| row.iter()
         .map(|cell| view.framed_height(cell.width, &cell.id)).fold(0.0, f64::max)).collect();
-    let banner = if t.scary { 52.0 } else { 0.0 };
+    let banner = if t.scary || report.no_fit_reason().is_some() { 52.0 } else { 0.0 };
     let header = 124.0;
     let footer = 64.0;
     let total = header + banner + heights.iter().map(|h| h + gap).sum::<f64>() + footer;
@@ -79,7 +81,7 @@ pub fn report_svg(report: &Report) -> String {
     let x = 24.0;
     bodies::title(&mut doc, &t, x, 88.0, 22.0, &r.server.checkpoint(), w - 360.0);
     let profile = crate::profiles::title_of(&r.profile);
-    let sub = format!("{profile} · {} · {}", super::date(&r.created), r.server.hardware.line());
+    let sub = format!("{profile} · {} · {}", super::date(&r.created), r.server.hardware_line());
     doc.text(x, 108.0, Font::new(11.5, t.ink2), &fit(&sub, 11.5, w - 300.0));
     if let Some(baseline) = &r.baseline {
         let badge = baseline.quality.badge();
@@ -92,7 +94,12 @@ pub fn report_svg(report: &Report) -> String {
     doc.text(w - 24.0, 108.0, Font::new(10.5, t.muted).anchor(Anchor::End),
         &format!("fingerprint {}", r.fingerprint));
     let mut y = header;
-    if t.scary {
+    if let Some(reason) = r.no_fit_reason() {
+        doc.rect(20.0, y, w - 40.0, 44.0, 8.0, t.panel2);
+        doc.text(34.0, y + 27.0, Font::new(13.0, t.ink).weight(600),
+            &fit(&format!("Doesn't fit: {reason}"), 13.0, w - 68.0));
+        y += 52.0;
+    } else if t.scary {
         let detail = r.baseline.as_ref().map(bodies::quality_line).unwrap_or_default();
         y += bodies::failure_banner(&mut doc, &t, 20.0, y, w - 40.0, &detail);
     }

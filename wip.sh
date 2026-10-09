@@ -349,8 +349,9 @@ remove_wip_containers() {
 
 # Refuse root-owned trees before removing containers: normal builds never repair
 # permissions, and legacy slots remain runnable via run.sh --wip unchanged.
-if [[ ! -w "$state_dir" ]] || find "$state_dir" -maxdepth 2 ! -user "$(id -u)" -print -quit | grep -q .; then
-  release_die "WIP root $state_dir has files owned by another uid; choose a fresh WIP_ROOT with --recreate (no automatic chown or deletion)"
+bad_owner="$(find "$state_dir" -maxdepth 2 ! -user "$(id -u)" -print -quit)"
+if [[ ! -w "$state_dir" || -n "$bad_owner" ]]; then
+  release_die "WIP path ${bad_owner:-$state_dir} is not owned/writable by host uid $(id -u); choose a fresh WIP instance with --recreate, or have the user run agent-sudo chown -R $(id -u):$(id -g) -- '${bad_owner:-$state_dir}' (no automatic chown or deletion)"
 fi
 if ((recreate)); then
   # Refuse before removing any container or payload, including remote uid-1001
@@ -362,8 +363,10 @@ root="$1"
 instance="$2"
 [[ "$instance" != __none__ ]] || instance=
 [[ "$root" != __default__ ]] || root="$HOME/.cache/cuteafd/builds/wip${instance:+-$instance}"
-if [[ -e "$root" ]] && { [[ ! -w "$root" ]] || find "$root" -maxdepth 2 ! -user "$(id -u)" -print -quit | grep -q .; }; then
-  echo "WIP root $root has files owned by another uid; choose a fresh WIP_ROOT with --recreate (no automatic chown or deletion)" >&2
+bad_owner=
+[[ ! -e "$root" ]] || bad_owner="$(find "$root" -maxdepth 2 ! -user "$(id -u)" -print -quit)"
+if [[ -e "$root" && ( ! -w "$root" || -n "$bad_owner" ) ]]; then
+  echo "WIP path ${bad_owner:-$root} is not owned/writable by host uid $(id -u); choose a fresh WIP instance with --recreate, or have the user run agent-sudo chown -R $(id -u):$(id -g) -- '${bad_owner:-$root}' (no automatic chown or deletion)" >&2
   exit 2
 fi
 CHECK_ROOT
@@ -524,8 +527,9 @@ if docker container inspect "$container" >/dev/null 2>&1; then
   docker exec "$container" mkdir -p /wip/build /wip/output /wip/slots /wip/incoming /wip/run /wip/cache
   exit 0
 fi
-if [[ ! -w "$root" ]] || find "$root" -maxdepth 2 ! -user "$(id -u)" -print -quit | grep -q .; then
-  echo "WIP root $root has files owned by another uid; choose a fresh WIP_ROOT with --recreate (no automatic chown or deletion)" >&2
+bad_owner="$(find "$root" -maxdepth 2 ! -user "$(id -u)" -print -quit)"
+if [[ ! -w "$root" || -n "$bad_owner" ]]; then
+  echo "WIP path ${bad_owner:-$root} is not owned/writable by host uid $(id -u); choose a fresh WIP instance with --recreate, or have the user run agent-sudo chown -R $(id -u):$(id -g) -- '${bad_owner:-$root}' (no automatic chown or deletion)" >&2
   exit 2
 fi
 mkdir -p "$root/home"
@@ -686,11 +690,13 @@ build_coordinator() {
     -e "CUTEAFD_WIP_EXL3_AOT=${CUTEAFD_WIP_EXL3_AOT:-ON}" \
     -e "CUTEAFD_WIP_NVFP4_AOT=${CUTEAFD_WIP_NVFP4_AOT:-ON}" \
     -e "CUTEAFD_WIP_AUDIO_AOT=$audio_aot" \
+    -e "CUTEAFD_WIP_DSV4_MAX_CONTEXT=${CUTEAFD_WIP_DSV4_MAX_CONTEXT:-1048576}" \
     -e "CUTEAFD_WIP_DSV4_AOT=${CUTEAFD_WIP_DSV4_AOT:-OFF}" \
     -e "CUTEAFD_WIP_GLM_AOT=${CUTEAFD_WIP_GLM_AOT:-OFF}" \
     -e "CUTEAFD_WIP_MIMO_AOT=${CUTEAFD_WIP_MIMO_AOT:-OFF}" \
     -e "CUTEAFD_WIP_MIMO_GEOMETRIES=${CUTEAFD_WIP_MIMO_GEOMETRIES:-mimo}" \
     -e "CUTEAFD_WIP_GLMF_AOT=${CUTEAFD_WIP_GLMF_AOT:-OFF}" \
+    -e "CUTEAFD_WIP_GLMF_WIDE_DECODE_ROWS=${CUTEAFD_WIP_GLMF_WIDE_DECODE_ROWS:-128}" \
     -e "CUTEAFD_WIP_QWEN4_AOT=${CUTEAFD_WIP_QWEN4_AOT:-OFF}" \
     -e "CUTEAFD_WIP_EXPERT_FAMILIES=${CUTEAFD_WIP_EXPERT_FAMILIES:-}" \
     -e "CUTEAFD_WIP_FP8_MOE_BF16_FAMILIES=$bf16_families" \

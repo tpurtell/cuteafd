@@ -423,6 +423,46 @@ GLMF_TWO_LAYER = {"model_type": "glm5_next", "num_hidden_layers": 2, "mlp_layer_
                   "layer_types": ["linear_attention", "deepseek_sparse_attention"]}
 
 
+@pytest.mark.parametrize("keys,tensor", [("", False), ("GLM5_FLASH_DRAFT_HEAD=exact\n", False),
+                                        ("GLM5_FLASH_DRAFT_HEAD=tensor\n", True)])
+def test_glmf_draft_head_is_forwarded_only_when_tensor(tmp_path, keys, tensor):
+    result = _family_launch_result(tmp_path, GLMF_TWO_LAYER, "test/glmf",
+                                  "GLM5_FLASH_FP8_MODEL_ID=off\nRTX_GPUS=1\n" + keys)
+    assert result.returncode == 0, result.stderr
+    launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-glmf" in line)
+    assert ("--draft-head tensor" in launch) == tensor, launch
+    assert ("--draft-head" in launch) == tensor, launch
+
+
+def test_glmf_draft_head_rejects_unknown_values_before_launch(tmp_path):
+    result = _family_launch_result(tmp_path, GLMF_TWO_LAYER, "test/glmf",
+                                  "GLM5_FLASH_FP8_MODEL_ID=off\nGLM5_FLASH_DRAFT_HEAD=fp8\n")
+    assert result.returncode == 2 and "GLM5_FLASH_DRAFT_HEAD must be exact or tensor" in result.stderr, result.stderr
+    assert not any(line.startswith(("docker ", "ssh ", "nest ")) for line in result.stderr.splitlines())
+
+
+@pytest.mark.parametrize("keys,forwarded", [("", None), ("GLM5_FLASH_DRAFT_LINEAR=w8a16\n", None),
+                                           ("GLM5_FLASH_DRAFT_LINEAR=wide\n", "wide"),
+                                           ("GLM5_FLASH_DRAFT_LINEAR=w8a8\n", "w8a8")])
+def test_glmf_draft_linear_is_forwarded_only_past_w8a16(tmp_path, keys, forwarded):
+    result = _family_launch_result(tmp_path, GLMF_TWO_LAYER, "test/glmf",
+                                  "GLM5_FLASH_FP8_MODEL_ID=off\nRTX_GPUS=1\n" + keys)
+    assert result.returncode == 0, result.stderr
+    launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-glmf" in line)
+    if forwarded is None:
+        assert "--draft-linear" not in launch, launch
+    else:
+        assert f"--draft-linear {forwarded}" in launch and launch.count("--draft-linear") == 1, launch
+
+
+def test_glmf_draft_linear_rejects_unknown_values_before_launch(tmp_path):
+    result = _family_launch_result(tmp_path, GLMF_TWO_LAYER, "test/glmf",
+                                  "GLM5_FLASH_FP8_MODEL_ID=off\nGLM5_FLASH_DRAFT_LINEAR=w4a16\n")
+    assert result.returncode == 2 and "GLM5_FLASH_DRAFT_LINEAR must be w8a16, wide or w8a8" in result.stderr, \
+        result.stderr
+    assert not any(line.startswith(("docker ", "ssh ", "nest ")) for line in result.stderr.splitlines())
+
+
 @pytest.mark.parametrize("keys,env", [
     ("", []),
     ("GLM5_FLASH_EXL3_WORKER_PATH=async\n", []),
@@ -646,6 +686,42 @@ def test_glmf_replay_records_are_forwarded_only_when_shared(tmp_path, keys, shar
     ("RTX_GPUS=1\nGLM5_FLASH_REPLAY_RECORDS=host\n", "GLM5_FLASH_REPLAY_RECORDS must be own or shared"),
 ])
 def test_glmf_replay_records_reject_unsupported_layouts_before_launch(tmp_path, keys, message):
+    result = _family_launch_result(tmp_path, SPLIT_CONFIGS["glm5_flash"], "test/glmf",
+                                  "GLM5_FLASH_FP8_MODEL_ID=off\n" + keys)
+    assert result.returncode == 2 and message in result.stderr, result.stderr
+    assert not any(line.startswith(("docker ", "ssh ", "nest ")) for line in result.stderr.splitlines())
+
+
+@pytest.mark.parametrize("keys,forwarded", [("", False), ("GLM5_FLASH_DECODE_ROWS=64\n", False),
+                                             ("GLM5_FLASH_DECODE_ROWS=128\n", True)])
+def test_glmf_decode_rows_are_forwarded_only_at_128(tmp_path, keys, forwarded):
+    """GLM5_FLASH_DECODE_ROWS=128 reaches the coordinator as --decode-rows 128 (the wide decode
+    programs); 64, the default, passes nothing; no Spark worker sees it."""
+    result = _family_launch_result(tmp_path, SPLIT_CONFIGS["glm5_flash"], "test/glmf",
+                                  "GLM5_FLASH_FP8_MODEL_ID=off\nRTX_GPUS=1\n" + keys)
+    assert result.returncode == 0, result.stderr
+    lines = result.stderr.splitlines()
+    launch = next(line for line in lines if "cuteafd serve-glmf" in line)
+    assert ("--decode-rows 128" in launch) == forwarded and launch.count("--decode-rows") == int(forwarded)
+    assert not any("--decode-rows" in line for line in lines if "cuteafd expertd-native" in line)
+
+
+def test_glmf_wide_decode_rows_take_shared_replay_records(tmp_path):
+    """128-row steps keep their records in the prefill scratch too: both keys reach the coordinator."""
+    result = _family_launch_result(tmp_path, SPLIT_CONFIGS["glm5_flash"], "test/glmf",
+                                  "GLM5_FLASH_FP8_MODEL_ID=off\nRTX_GPUS=1\nGLM5_FLASH_DECODE_ROWS=128\n"
+                                  "GLM5_FLASH_REPLAY_RECORDS=shared\n")
+    assert result.returncode == 0, result.stderr
+    launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-glmf" in line)
+    assert "--decode-rows 128" in launch and "--replay-records shared" in launch, launch
+
+
+@pytest.mark.parametrize("keys,message", [
+    ("RTX_GPUS=2\nGLM5_FLASH_DECODE_ROWS=128\n", "a head split takes 64"),
+    ("RTX_GPUS=1\nGLM5_FLASH_DECODE_ROWS=127\n", "GLM5_FLASH_DECODE_ROWS must be 64 or 128"),
+    ("RTX_GPUS=1\nGLM5_FLASH_DECODE_ROWS=wide\n", "GLM5_FLASH_DECODE_ROWS must be 64 or 128"),
+])
+def test_glmf_decode_rows_reject_unsupported_layouts_before_launch(tmp_path, keys, message):
     result = _family_launch_result(tmp_path, SPLIT_CONFIGS["glm5_flash"], "test/glmf",
                                   "GLM5_FLASH_FP8_MODEL_ID=off\n" + keys)
     assert result.returncode == 2 and message in result.stderr, result.stderr
@@ -1149,7 +1225,7 @@ def test_coordinator_gpu_budget_is_forwarded_only_to_the_coordinator(tmp_path, f
     result = _family_launch_result(tmp_path, family_config, model,
                                   "COORDINATOR_GPU_BUDGET_GIB=32.5\n")
     assert result.returncode == 0, result.stderr
-    launch = next(line for line in result.stderr.splitlines() if "--coordinator-gpu-budget-gib" in line)
+    launch = next(line for line in result.stderr.splitlines() if "--coordinator-gpu-budget-gib" in line and "serve-" in line)
     assert "cuteafd --coordinator-gpu-budget-gib 32.5 serve-" in launch
     for line in result.stderr.splitlines():
         if "expertd-native" in line:
@@ -1172,7 +1248,7 @@ def test_qwen_backend_preflight_charges_physical_usage_against_the_ceiling(tmp_p
         gpu_free_mib=90 * 1024, gpu_total_mib=96 * 1024)
     assert result.returncode == 0, result.stderr
     preflight = next(line for line in result.stderr.splitlines() if "cuteafd plan" in line)
-    assert "--rtx-gib 26.0" in preflight and "--coordinator-budget-gib 26.0" in preflight
+    assert "--coordinator-gpu-budget-gib 26.0" in preflight and "--coordinator-weight-budget-gib 26.0" in preflight
     launch = next(line for line in result.stderr.splitlines() if "serve-qwen4" in line)
     assert "--coordinator-gpu-budget-gib 32" in launch and "--peers" in launch
 
@@ -1327,7 +1403,7 @@ def test_qwen_restart_admission_credits_only_its_own_gpu_memory(tmp_path: Path, 
                                   gpu_allocations=((123, 84000), (456, 2000)))
     assert result.returncode == 0, result.stderr
     preflight = next(line for line in result.stderr.splitlines() if "cuteafd plan" in line)
-    assert f"--rtx-gib {admitted_gib}" in preflight
+    assert f"--coordinator-gpu-budget-gib {admitted_gib}" in preflight
 
 
 def test_qwen_other_formats_skip_the_local_qualification_preflight(tmp_path: Path) -> None:
@@ -1455,6 +1531,28 @@ def test_glmf_encoder_defaults_auto_and_forwards_remote_identity(tmp_path, mode,
     if kind != "off":
         preflight = next(line for line in result.stderr.splitlines() if "cuteafd plan" in line)
         assert f"--vision {mode or 'auto'}" in preflight
+
+
+@pytest.mark.parametrize("keys,forwarded", [("", False), ("GLM5_FLASH_DECODE_ROWS=64\n", False),
+                                             ("GLM5_FLASH_DECODE_ROWS=128\n", True)])
+def test_glmf_encoder_placement_plans_the_decode_rows_serving_takes(tmp_path, keys, forwarded):
+    """The encoder placement plan charges what serving admits: GLM5_FLASH_DECODE_ROWS=128 reaches
+    `cuteafd plan --layout` as --decode-rows 128 beside the coordinator's, with a fixed near-fit pool
+    and the vision tower on the RTX; 64, the default, passes it to neither."""
+    config = {"model_type": "glm5_next", "num_hidden_layers": 2, "mlp_layer_types": ["sparse"] * 2,
+              "layer_types": ["linear_attention", "deepseek_sparse_attention"], "vision_config": {"depth": 24}}
+    plan = {"placement_supported": True, "fits": True, "spark_ranks": 1,
+            "encoder_plan_hash": "ab" * 32, "encoder": {"kind": {"kind": "rtx", "gpu": 0}, "replicas": []}}
+    result = _family_launch_result(tmp_path, config, "zai-org/GLM-5.3-Flash",
+                                   "RTX_GPUS=1\nSPECULATOR=off\nVISION=rtx\nPOOL_TOKENS=262144\n" + keys,
+                                   encoder_plan=plan)
+    assert result.returncode == 0, result.stderr
+    lines = result.stderr.splitlines()
+    planner = next(line for line in lines if "cuteafd plan" in line and "--layout" in line)
+    launch = next(line for line in lines if "cuteafd serve-glmf" in line)
+    assert "--vision rtx" in planner and "--pool-tokens 262144" in planner, planner
+    for command in [planner, launch]:
+        assert ("--decode-rows 128" in command) == forwarded and command.count("--decode-rows") == int(forwarded), command
 
 
 @pytest.mark.parametrize("family_config,serve", [
@@ -1680,3 +1778,16 @@ def test_explicit_audio_without_tower_refuses(tmp_path, mode):
     result = _family_launch_result(tmp_path, config, "test/mimo", f"VISION=off\nAUDIO={mode}\nRTX_GPUS=1\nSPECULATOR=off\n")
     assert result.returncode != 0
     assert "cuteafd serve-mimo" not in result.stderr
+
+
+@pytest.mark.parametrize("family", ["glm5", "glm5_flash", "qwen4", "mimo_flash", "mimo_pro", "deepseek_v4"])
+@pytest.mark.parametrize("context", [None, 65536])
+def test_generic_family_checkpoint_context_default_and_override(tmp_path, family, context):
+    config = SPLIT_CONFIGS.get(family, {"model_type": "glm_moe_dsa" if family == "glm5" else "deepseek_v4", "num_hidden_layers": 2, "first_k_dense_replace": 1})
+    keys = "SPECULATOR=off\nVISION=off\nAUDIO=off\nGLM5_FLASH_FP8_MODEL_ID=test/model\n"
+    if context is not None:
+        keys += f"MAX_CONTEXT_TOKENS={context}\n"
+    result = _family_launch_result(tmp_path, config, "test/model", keys)
+    assert result.returncode == 0, result.stderr
+    launch = next(line for line in result.stderr.splitlines() if " --snapshot " in line and "serve-" in line)
+    assert f"--max-context {context or 0}" in launch

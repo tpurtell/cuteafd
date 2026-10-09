@@ -126,7 +126,7 @@ mod tests {
             let readme = crate::publish::results(&[placed]);
             assert!(readme.contains("Concurrent code (aggregate)"));
             assert!(readme.contains(&format!("C{width}: 960")));
-            assert!(readme.contains("<th>Model · quant</th><th>Minimum hardware</th><th>Maximum hardware</th>"));
+            assert!(readme.contains("<th>Model · quant</th><th>5090</th><th>1× RTX</th><th>2× RTX</th>"));
         }
     }
 

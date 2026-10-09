@@ -174,15 +174,23 @@ fn read_config(path: &Path) -> Result<HashMap<String, String>> {
     }).collect())
 }
 
-/// The shared lock files: GPU0 and every Spark take sparks.lock, GPU1 gpu1.lock.
+/// Lock order: Spark pool, GPU0, GPU1, then the two out-of-pool hosts.
 fn locks_for(entry: &Entry) -> Vec<&'static str> {
     let gpus = entry.gpus.clone().unwrap_or_else(|| vec![0]);
     let mut locks = Vec::new();
     if gpus.contains(&0) || !entry.sparks.clone().unwrap_or_default().is_empty() || entry.exclusive() {
         locks.push("sparks.lock");
     }
+    if gpus.contains(&0) || entry.exclusive() {
+        locks.push("gpu0.lock");
+    }
     if gpus.contains(&1) || entry.exclusive() {
         locks.push("gpu1.lock");
+    }
+    for (host, lock) in [("rhea", "rhea.lock"), ("moa", "moa.lock")] {
+        if entry.sparks.as_ref().is_some_and(|hosts| hosts.iter().any(|h| h == host)) {
+            locks.push(lock);
+        }
     }
     locks
 }
@@ -211,15 +219,25 @@ impl Locks {
         }
         let dir = expand("~/.cache/cuteafd");
         std::fs::create_dir_all(&dir)?;
-        // sparks.lock before gpu1.lock, the order locked2.sh takes them.
         let mut ordered: Vec<&'static str> = names.to_vec();
-        ordered.sort_by_key(|n| if *n == "sparks.lock" { 0 } else { 1 });
+        ordered.sort_by_key(|n| match *n {
+            "sparks.lock" => 0, "gpu0.lock" => 1, "gpu1.lock" => 2,
+            "rhea.lock" => 3, "moa.lock" => 4, _ => 5,
+        });
+        let deadline = Instant::now() + Duration::from_secs(1800);
         for name in ordered {
             if self.held.contains_key(name) {
                 continue;
             }
             let file = File::options().create(true).append(true).open(dir.join(name))?;
-            file.lock()?;
+            loop {
+                match file.try_lock() {
+                    Ok(()) => break,
+                    Err(std::fs::TryLockError::WouldBlock) if Instant::now() < deadline =>
+                        std::thread::sleep(Duration::from_millis(500)),
+                    Err(error) => bail!("timed out or failed waiting for {name}: {error}"),
+                }
+            }
             self.held.insert(name, (file, 0));
         }
         for name in names {
@@ -448,6 +466,9 @@ fn write_config(entry: &Entry, repo: &Path, configs: &Path, parallel: bool) -> R
         set.entry("INSTANCE".into()).or_insert_with(|| entry.name.clone());
     }
     for (key, value) in &set {
+        if matches!(key.as_str(), "BENCH_SIMULATED" | "BENCH_HARDWARE_CLASS") {
+            continue;
+        }
         text.push_str(&format!("{key}={value}\n"));
     }
     let path = configs.join(format!("{}.config", entry.name));
@@ -480,7 +501,15 @@ fn teardown(entry: &Entry, config: &HashMap<String, String>, log: &mut File) {
     let count: usize = config.get("SPARK_COUNT").and_then(|v| v.parse().ok()).unwrap_or(0);
     for rank in 0..count {
         let Some(host) = config.get(&format!("SPARK_{rank}_HOST")) else { continue };
-        let script = format!("ids=$(docker ps -aq --filter name=^cuteafd-spark-expert-{host}-{port}$); \
+        let worker = format!("cuteafd-spark-expert-{host}-{port}");
+        if let Ok(path) = log_path(log) {
+            if let Ok(file) = File::create(path.with_extension(format!("{host}.log"))) {
+                let _ = Command::new("ssh").args(["-o", "BatchMode=yes", host, "docker", "logs", &worker])
+                    .stdout(file.try_clone().map(Stdio::from).unwrap_or(Stdio::null()))
+                    .stderr(Stdio::from(file)).status();
+            }
+        }
+        let script = format!("ids=$(docker ps -aq --filter name=^{worker}$); \
             [ -z \"$ids\" ] || docker rm -f $ids >/dev/null 2>&1 || true");
         let _ = Command::new("ssh").args(["-o", "BatchMode=yes", host, &script]).status();
     }
@@ -539,7 +568,18 @@ fn run_entry(entry: &Entry, repo: &Path, out_root: &Path, configs: &Path, logs: 
             root: out_root.to_path_buf(),
             api_key: std::env::var("CUTEAFD_API_KEY").ok(), quiet: true,
             deadline: Some(Duration::from_secs(entry.run_timeout_s.unwrap_or(900))) };
-        let (report, dir) = crate::cli::run(&options)?;
+        let (mut report, dir) = crate::cli::run(&options)?;
+        // Publication markers are runner metadata, not serving defaults. This
+        // also works against images built before these markers existed.
+        for (key, name) in [("BENCH_SIMULATED", "simulated"), ("BENCH_HARDWARE_CLASS", "hardware.class")] {
+            if let Some(value) = entry.set.get(key).filter(|v| !v.is_empty()) {
+                report.server.configuration.settings.retain(|s| s.name != name);
+                report.server.configuration.settings.push(crate::report::Setting {
+                    name: name.into(), value: Some(value.clone()), default: None, source: "publication".into(),
+                });
+            }
+        }
+        crate::cli::write_exports(&report, &dir, &options.export)?;
         outcome.dir = Some(dir.display().to_string());
         Ok(report)
     })();
@@ -620,8 +660,10 @@ mod tests {
         assert!(!disjoint(&b, &entry("d", &[1], &[], 8002), &base), "same GPU");
         let v41 = Entry { family: Some("deepseek_v41".into()), ..entry("v", &[1], &[], 8009) };
         assert!(!disjoint(&a, &v41, &base), "V4.1 runs alone");
-        assert_eq!(locks_for(&a), vec!["sparks.lock"]);
-        assert_eq!(locks_for(&b), vec!["sparks.lock", "gpu1.lock"]);
+        assert_eq!(locks_for(&a), vec!["sparks.lock", "gpu0.lock"]);
+        assert_eq!(locks_for(&b), vec!["sparks.lock", "gpu1.lock", "rhea.lock", "moa.lock"]);
+        assert_eq!(locks_for(&entry("max", &[0, 1], &["ostrich", "rhea", "moa"], 8003)),
+            vec!["sparks.lock", "gpu0.lock", "gpu1.lock", "rhea.lock", "moa.lock"]);
         assert_eq!(locks_for(&c), vec!["gpu1.lock"]);
     }
 
@@ -642,11 +684,15 @@ mod tests {
     fn configs_append_overrides() {
         let repo = tempfile::tempdir().unwrap();
         std::fs::write(repo.path().join("cuteafd.config"), "MODEL_ID=a/b\nADDR=0.0.0.0:8000\n").unwrap();
-        let e = entry("one", &[1], &[], 8123);
+        let mut e = entry("one", &[1], &[], 8123);
+        e.set.insert("BENCH_SIMULATED".into(), "5090".into());
+        e.set.insert("BENCH_HARDWARE_CLASS".into(), "5090".into());
         let path = write_config(&e, repo.path(), repo.path(), true).unwrap();
         let config = read_config(&path).unwrap();
         assert_eq!(config.get("ADDR").map(String::as_str), Some("0.0.0.0:8123"));
         assert_eq!(config.get("INSTANCE").map(String::as_str), Some("one"));
+        assert!(!config.contains_key("BENCH_SIMULATED"));
+        assert!(!config.contains_key("BENCH_HARDWARE_CLASS"));
         assert_eq!(config.get("MODEL_ID").map(String::as_str), Some("a/b"));
     }
 }

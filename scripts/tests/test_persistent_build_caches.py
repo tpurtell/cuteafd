@@ -19,6 +19,18 @@ def fixture(tmp_path, kind="ext4", device="nvme0n1p2"):
         "lsblk": '#!/bin/sh\nprintf "%s\\n" "' + device + '"\n',
         "docker": '#!/usr/bin/env python3\nimport json,os,sys\n'
                   'with open(os.environ["DOCKER_LOG"],"a") as f: f.write(json.dumps(sys.argv[1:])+"\\n")\n'
+                  'if sys.argv[1:2] == ["run"]:\n'
+                  '    from pathlib import Path\n'
+                  '    mounts=[dict(part.split("=",1) for part in sys.argv[i+1].split(",") if "=" in part) for i,arg in enumerate(sys.argv[:-1]) if arg=="--mount"]\n'
+                  '    for mount in mounts:\n'
+                  '        source=Path(mount["src"]); assert source.exists(), source\n'
+                  '        assert source.stat().st_uid == os.getuid(), source\n'
+                  '        for parent in mounts:\n'
+                  '            dst=Path(mount["dst"]); home=Path(parent["dst"])\n'
+                  '            if dst != home and dst.is_relative_to(home):\n'
+                  '                target=Path(parent["src"])/dst.relative_to(home)\n'
+                  '                assert target.is_dir(), target\n'
+                  '                assert target.stat().st_uid == os.getuid(), target\n'
                   'if sys.argv[1:3] == ["container","inspect"]: sys.exit(1)\n'
                   'if "inspect" in sys.argv: print("image-id")\n',
         "nvidia-smi": '#!/bin/sh\nexit 0\n',
@@ -205,3 +217,55 @@ def test_cargo_offline_probe_and_locked_builds(tmp_path):
     assert result.stdout.endswith('unset')
     for name in ('build-release-artifacts.sh', 'build-wip-artifacts.sh'):
         assert 'cargo build \\\n  --locked' in (ROOT/'scripts/build'/name).read_text()
+
+
+@pytest.mark.parametrize("arch", ["x86_64", "aarch64"])
+@pytest.mark.parametrize("enabled", [True, False])
+def test_every_planned_directory_and_nested_target_precreated(tmp_path, arch, enabled):
+    env = fixture(tmp_path)
+    env["CUTEAFD_BUILD_CACHES"] = "on" if enabled else "off"
+    result = plan(tmp_path, env, arch)
+    assert result.returncode == 0, result.stderr
+    mounts = [dict(part.split("=", 1) for part in value.split(",") if "=" in part)
+              for value in pairs(result.stdout.splitlines(), "--mount")]
+    host_home = tmp_path / "build/container-home"
+    for mount in mounts:
+        source = Path(mount["src"])
+        assert source.is_dir() and source.stat().st_uid == os.getuid()
+        destination = Path(mount["dst"])
+        if destination.is_relative_to("/container/home"):
+            target = host_home / destination.relative_to("/container/home")
+            assert target.is_dir() and target.stat().st_uid == os.getuid()
+
+
+def test_foreign_owned_nested_target_names_path_and_manual_fix(tmp_path):
+    import importlib.util
+    from unittest.mock import patch
+
+    spec = importlib.util.spec_from_file_location("cache_plan_owner", PLAN)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    env = fixture(tmp_path)
+    target = tmp_path / "build/container-home/cargo/git"
+    target.mkdir(parents=True)
+    real_stat = Path.stat
+
+    def stat(path, *args, **kwargs):
+        result = real_stat(path, *args, **kwargs)
+        if path == target:
+            values = list(result)
+            values[4] = os.getuid() + 1
+            return os.stat_result(values)
+        return result
+
+    with patch.dict(os.environ, env, clear=True), patch.object(Path, "stat", stat), patch.object(
+        module, "nvme_cache"
+    ), patch.object(module.filesystem, "check_path"), patch.object(
+        __import__("sys"), "argv", [str(PLAN), "--build-root", str(tmp_path / "build"),
+                                  "--container-home", "/container/home", "--toolchain", "abcd"]
+    ):
+        with pytest.raises(ValueError) as error:
+            module.main()
+    assert str(target) in str(error.value)
+    assert "fresh WIP instance" in str(error.value)
+    assert "agent-sudo chown" in str(error.value)

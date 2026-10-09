@@ -23,7 +23,7 @@
 //! at its last chunk; a decode whose client left is not retained.
 //! `prompt_cache_hit_tokens` reports the restored rows; `/v1/stats` carries
 //! the cache's counters.
-use super::engine::{GlmfEngine, GlmfPlacement, DECODE_ROWS};
+use super::engine::{GlmfEngine, GlmfPlacement, DECODE_ROWS, WIDE_DECODE_ROWS};
 use super::prefix::{GlmfPrefix, PrefixMarks};
 use cuteafd_engine::media::{EmbeddingCache, MediaAdmission, MediaPoll, MediaReady, MediaWaiter, RequestMedia, MediaKeys};
 use crate::families::deepseek_v41::v41_native_serve::prefix::CudaCopyEngine;
@@ -123,7 +123,6 @@ pub(crate) fn model_id(snapshot: &std::path::Path) -> Option<String> {
 pub(crate) async fn run_serve(args: ServeArgs) -> Result<()> {
     let api = args.api.load()?;
     let snapshot: PathBuf = args.engine.snapshot.clone();
-    let limits = NativeLimits::new(args.engine.max_context as u32, args.max_output)?;
     let encoding = if super::media::vision_config(args.vision, &snapshot)?.is_none() {
         GlmEncoding::from_snapshot(&snapshot)?
     } else {
@@ -152,7 +151,9 @@ pub(crate) async fn run_serve(args: ServeArgs) -> Result<()> {
     let media_cache_bytes = args.media_cache_bytes;
     let worker = tokio::task::spawn_blocking(move ||
         serve_loop(engine_args, receive, ready_tx, worker_stats, max_sequences, policy, decode_share, prefix, vision, media_cache_bytes, remote));
-    if let Some((preparer, health)) = ready_rx.await.context("engine failed before it was ready")?? {
+    let (max_context, media) = ready_rx.await.context("engine failed before it was ready")??;
+    let limits = NativeLimits::new(u32::try_from(max_context)?, args.max_output)?;
+    if let Some((preparer, health)) = media {
         profile = profile.with_loaded_vision(preparer);
         profile.vision_health = health;
     }
@@ -208,21 +209,24 @@ type VisionReady = Option<(Arc<cuteafd_api::openai::media::MediaPreparer>, Optio
 
 #[allow(clippy::too_many_arguments)]
 fn serve_loop(mut args: super::EngineArgs, mut receive: mpsc::Receiver<NativeRequest>,
-    ready: tokio::sync::oneshot::Sender<Result<VisionReady>>, stats: Arc<Mutex<serde_json::Value>>, max_sequences: usize,
+    ready: tokio::sync::oneshot::Sender<Result<(usize, VisionReady)>>, stats: Arc<Mutex<serde_json::Value>>, max_sequences: usize,
     policy: Policy, decode_share: DecodeShareArgs, prefix: PrefixArgs,
     vision: cuteafd_loader::plan::MediaMode, media_cache_bytes: Option<u64>, remote: Option<super::media::RemoteVision>) -> Result<()> {
     args.serving_graph_policy = Some((max_sequences.min(DECODE_ROWS), args.draft.is_some() || policy.copy > 0));
     let lanes = max_sequences.min(DECODE_ROWS);
-    // Either KV admission reserves the mark arena `prefix_cache` will allocate (none: marks in pool units).
-    let opened = match open(&args).and_then(|opened| {
-        let layers = args.layers.unwrap_or(opened.cfg.layers).min(opened.cfg.layers);
-        args.planner_mark_slots = match args.prefix_marks {
-            PrefixMarks::Arena => arena_mark_slots(&prefix, &opened.cfg, layers, lanes, args.index_cache,
-                args.kda_state)?,
-            PrefixMarks::Pool => 0,
-        };
-        Ok(opened)
-    }) {
+    // Without entries no mark is taken: pool marks keep no unit back and need no room in the pool.
+    let marks = args.prefix_marks.with_entries(prefix.prefix_cache_entries);
+    if marks != args.prefix_marks {
+        tracing::info!("GLM 5.3 Flash prefix cache off (no entries): no prefix marks, no reserved unit");
+        args.prefix_marks = marks;
+    }
+    // Either KV admission reserves the mark arena `prefix_cache` will allocate (none: marks in pool units),
+    // counted once the engine's layout is known (`with_engine`).
+    args.mark_arena = match args.prefix_marks {
+        PrefixMarks::Arena => super::prefix::ArenaMarks::Rule(prefix.mark_rule(lanes)),
+        PrefixMarks::Pool => super::prefix::ArenaMarks::None,
+    };
+    let opened = match open(&args) {
         Ok(opened) => opened,
         Err(error) => {
             let _ = ready.send(Err(anyhow::anyhow!("{error:#}")));
@@ -248,18 +252,18 @@ fn serve_loop(mut args: super::EngineArgs, mut receive: mpsc::Receiver<NativeReq
         let spark = matches!(engine.experts(), Some(super::engine::Experts::Spark { .. }));
         console::layer_classes(engine.weights.layers.iter().map(|l| console::layer_class(l.dense, spark)).collect());
         schedule(engine, &opened, &args.snapshot, &mut receive, &stats, lanes, policy, ranks, decode_share, &prefix,
-            (args.prefix_marks, args.planner_mark_slots), args.token_io.token_select, &mut media, preparer.as_deref(),
+            (args.prefix_marks, args.mark_arena), args.token_io.token_select, &mut media, preparer.as_deref(),
             || {
                 // Ready once the prefix cache and the token selector exist: the ledger then lists
                 // every start-up allocation.
                 crate::shared::memory_report::log("glm5_flash ready");
                 if let Some(ready) = ready.take() {
-                    let _ = ready.send(Ok(preparer.clone().map(|p| (p, health.clone()))));
+                    let _ = ready.send(Ok((engine.max_context, preparer.clone().map(|p| (p, health.clone())))));
                 }
             })
     });
     if let Some(ready) = ready.take() {
-        let _ = ready.send(result.as_ref().map(|_| preparer.map(|p| (p, health))).map_err(|e| anyhow::anyhow!("{e:#}")));
+        let _ = ready.send(result.as_ref().map(|_| (args.max_context, preparer.map(|p| (p, health)))).map_err(|e| anyhow::anyhow!("{e:#}")));
     }
     result
 }
@@ -503,27 +507,16 @@ pub(crate) fn copy_drafts(history: &[u32], limit: usize) -> Vec<u32> {
     Vec::new()
 }
 
-/// The mark arena slots [`prefix_cache`] allocates for `lanes` decoding sequences over the
-/// first `layers` layers with this DSA index cache and KDA state, from the checkpoint alone:
-/// either KV admission reserves them before the pool.
-pub(crate) fn arena_mark_slots(args: &PrefixArgs, cfg: &cuteafd_loader::families::glm5_flash::GlmNextConfig,
-    layers: usize, lanes: usize, index_cache: super::engine::IndexCache, kda_state: super::engine::KdaState)
-    -> Result<usize> {
-    let geometry = cuteafd_loader::serving_capacity::glm_flash_rank_cache_geometry(cfg, layers, 1, index_cache.into(),
-        kda_state.bytes() as u64)?;
-    Ok(args.mark_slots(lanes, usize::try_from(geometry.ranks[0].retained_mark_bytes)?))
-}
-
 /// The prefix cache over `engine` (always present: with zero entries it is the page allocator),
-/// its marks in pool units or in a mark arena sized for `lanes` decoding sequences: the
-/// `planned` slots the KV admission reserved ([`arena_mark_slots`]).
-fn prefix_cache<'e, 'a>(engine: &'e GlmfEngine<'a>, args: &PrefixArgs, lanes: usize,
-    (marks, planned): (PrefixMarks, usize)) -> Result<(GlmfPrefix<'e, 'a>, PrefixCache<CudaCopyEngine<'a>>)> {
+/// its marks in pool units or in the mark arena `arena`, sized by its rule over the engine's own
+/// marks: the `engine.mark_slots` the KV admission reserved ([`super::prefix::ArenaMarks::slots_on`]).
+fn prefix_cache<'e, 'a>(engine: &'e GlmfEngine<'a>, args: &PrefixArgs, (marks, arena): (PrefixMarks,
+    super::prefix::ArenaMarks)) -> Result<(GlmfPrefix<'e, 'a>, PrefixCache<CudaCopyEngine<'a>>)> {
     let entries = args.prefix_cache_entries;
     anyhow::ensure!(args.prefix_partial == Toggle::Off, "GLM 5.3 Flash restores exact snapshots only (KDA state)");
-    let family = GlmfPrefix::new(engine, marks, |mark| args.mark_slots(lanes, mark))?;
-    anyhow::ensure!(family.slots() == planned, "the prefix mark arena holds {} marks of {} B, the KV admission \
-        reserved {planned}", family.slots(), family.mark_bytes());
+    let family = GlmfPrefix::new(engine, marks, |mark| arena.slots(mark))?;
+    anyhow::ensure!(family.slots() == engine.mark_slots, "the prefix mark arena holds {} marks of {} B, the KV \
+        admission reserved {}", family.slots(), family.mark_bytes(), engine.mark_slots);
     let template = engine.paged_buffers().first().map(|b| b.records).context("GLM 5.3 Flash has no MLA layer")?;
     // The pinned host tier copies through one GPU's copy engine; a head split keeps its pages
     // and marks on both GPUs, so it keeps device-resident snapshots only.
@@ -604,15 +597,16 @@ struct VerifyBucket {
     verify_ms_max: f64,
 }
 
+/// Verify steps by real rows and by the rows they ran (their bucket), up to the wide programs' 128.
 struct VerifyStats {
-    real: [VerifyBucket; DECODE_ROWS + 1],
-    bucket: [VerifyBucket; DECODE_ROWS + 1],
+    real: [VerifyBucket; WIDE_DECODE_ROWS + 1],
+    bucket: [VerifyBucket; WIDE_DECODE_ROWS + 1],
 }
 
 impl Default for VerifyStats {
     fn default() -> Self {
-        Self { real: [VerifyBucket::default(); DECODE_ROWS + 1],
-            bucket: [VerifyBucket::default(); DECODE_ROWS + 1] }
+        Self { real: [VerifyBucket::default(); WIDE_DECODE_ROWS + 1],
+            bucket: [VerifyBucket::default(); WIDE_DECODE_ROWS + 1] }
     }
 }
 
@@ -714,15 +708,15 @@ pub(crate) const MESSAGE_STARTS: [&str; 4] = ["<|system|>", "<|user|>", "<|assis
 fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path,
     receive: &mut mpsc::Receiver<NativeRequest>, stats: &Mutex<serde_json::Value>, max_sequences: usize,
     policy: Policy, ranks: Option<usize>, decode_share: DecodeShareArgs, prefix: &PrefixArgs,
-    marks: (PrefixMarks, usize), select: SelectPlacement,
+    marks: (PrefixMarks, super::prefix::ArenaMarks), select: SelectPlacement,
     media: &mut MediaAdmission<super::media::Prompt, super::media::Encoder>,
     preparer: Option<&cuteafd_api::openai::media::MediaPreparer>, ready: impl FnOnce())
     -> Result<()> {
-    let (family, mut cache) = prefix_cache(engine, prefix, max_sequences, marks)?;
+    let (family, mut cache) = prefix_cache(engine, prefix, marks)?;
     // Made before the KV pool when start-up admitted it from measured memory.
     let mut selector = match engine.take_selector() {
         Some(selector) => selector,
-        None => TokenSelector::new(&opened.library, select, engine.cfg.vocab_size, DECODE_ROWS)?,
+        None => TokenSelector::new(&opened.library, select, engine.cfg.vocab_size, engine.decode_rows)?,
     };
     let markers = crate::shared::prefix::marker_ids(snapshot, &MESSAGE_STARTS)?;
     let mut free_kda: Vec<i32> = (0..engine.slots as i32).rev().collect();
@@ -741,7 +735,10 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
             dflash_policy::widest_slice(engine.cfg.moe_intermediate, ranks)),
         _ => GLMF_TP2_STEP_MS.to_vec(),
     };
-    let mut cost = dflash_policy::step_cost(&table, DECODE_ROWS);
+    // A verify step schedules up to `verify_rows` rows (64, or the GPU's whole sparse MLA waves with
+    // `--decode-rows 128`): the table, measured to 64 rows, extends past them and serving refits it.
+    let verify_rows = engine.verify_rows;
+    let mut cost = dflash_policy::step_cost(&table, verify_rows);
     let mut skip = dflash_policy::DraftSkip::default();
     let mut active: Vec<Active<'_>> = Vec::new();
     let (mut requests, mut generated_total) = (0u64, 0u64);
@@ -1119,10 +1116,19 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
         let mut tally = console::Step::begin(0);
         let (draft0, verify0, emit0) = (draft_s, verify_s, emit_s);
         let engine_before = tally.live().then(|| *engine.profile.borrow());
-        // Rows each sequence may add after its next token.
-        let room = (DECODE_ROWS / active.len()).max(1) - 1;
-        let limits: Vec<usize> = active.iter().map(|a| if probe::no_speculation(&a.job.probe) { 0 } else {
+        // Rows each sequence may add after its next token: an even share of the verify budget.
+        let room = (verify_rows / active.len()).max(1) - 1;
+        let mut limits: Vec<usize> = active.iter().map(|a| if probe::no_speculation(&a.job.probe) { 0 } else {
             room.min(a.job.max_tokens - a.generated - 1).min(a.capacity - a.placement.len - 1) }).collect();
+        // With the wide programs the rows the even share leaves over go to the first sequences that can
+        // draft once more (127 rows at 16 sequences: 15 draft 7, one 6); 64 rows keep the even share.
+        if engine.decode_rows > DECODE_ROWS {
+            super::engine::hand_out_remainder(&mut limits, room, verify_rows, |i| {
+                let a = &active[i];
+                !probe::no_speculation(&a.job.probe)
+                    && room < (a.job.max_tokens - a.generated - 1).min(a.capacity - a.placement.len - 1)
+            });
+        }
         // DFlash2 drafts after every next token, then the policy's counts.
         let timer = Instant::now();
         let drafted: Vec<Option<Draft>> = match drafter {

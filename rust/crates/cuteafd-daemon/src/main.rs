@@ -94,6 +94,9 @@ async fn main() -> Result<()> {
         }
     };
     let (command, matches, initial_budget, initial_vision, initial_audio, initial_image_cap, initial_fetch, initial_table_backend) = parse(Cli::command().get_matches());
+    for replacement in cli::deprecated_budget_flags(std::env::args()) {
+        eprintln!("warning: deprecated coordinator budget flag; use {replacement}");
+    }
     // `serve` and `golden` pick the family and stand for its own command.
     let (mut command, matches, family_budget, family_vision, family_audio, family_image_cap, family_fetch, family_table_backend) = match command {
         Commands::Serve(args) => match commands::family::argv(commands::family::Kind::Serve, args)? {
@@ -141,12 +144,14 @@ async fn main() -> Result<()> {
         family_image_cap.or(initial_image_cap).unwrap_or(4096) as usize,
         family_fetch.or(initial_fetch).unwrap_or(cuteafd_api::openai::media::ImageUrlFetch::Public))?;
     let coordinator_budget_gib = family_budget.or(initial_budget);
-    if let Some(gib) = coordinator_budget_gib {
+    if let Commands::Plan(args) = &mut command {
+        args.coordinator_gpu_budget_gib = coordinator_budget_gib;
+    } else if let Some(gib) = coordinator_budget_gib {
         anyhow::ensure!(matches!(&command, Commands::ServeNative(_) | Commands::ServeMimo(_)
             | Commands::ServeQwen4(_) | Commands::ServeGlmf(_) | Commands::ServeGlm(_)
             | Commands::ServeDsv4(_) | Commands::Dsv4Golden(_) | Commands::GlmGolden(_)
             | Commands::MimoGolden(_) | Commands::GlmfGolden(_) | Commands::Qwen4Golden(_)),
-            "--coordinator-gpu-budget-gib applies only to coordinator serve/golden commands; plan uses --layout --rtx-budget-gib");
+            "--coordinator-gpu-budget-gib applies only to coordinator serve/golden and plan commands");
         let budget = cuteafd_core::serving_capacity::GpuMemoryBudget::from_gib(gib)?;
         cuteafd_ffi::set_coordinator_gpu_budget(budget.0)?;
         tracing::info!(gib, bytes = budget.0, "installed per-GPU coordinator memory budget; SM count and L2 unchanged");

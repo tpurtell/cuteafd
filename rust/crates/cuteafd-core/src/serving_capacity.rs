@@ -266,6 +266,17 @@ pub fn resolve_capacity(
     profile: &CapacityProfile,
     hardware: &[DeviceMemory],
 ) -> Result<ResolvedCapacity, CapacityError> {
+    resolve_capacity_with_startup_peaks(policy, profile, hardware, &[])
+}
+
+/// Reserve each device's maximum temporary startup allocation before sizing KV.
+/// Temporaries reuse the small-card floor, but must also fit the occupancy ceiling.
+pub fn resolve_capacity_with_startup_peaks(
+    policy: CapacityPolicy,
+    profile: &CapacityProfile,
+    hardware: &[DeviceMemory],
+    startup_peaks: &[(u32, u64)],
+) -> Result<ResolvedCapacity, CapacityError> {
     if policy.concurrency == 0 || policy.target_pool_tokens == 0 {
         return Err(CapacityError::Invalid(
             "concurrency and pool target must be positive",
@@ -337,8 +348,19 @@ pub fn resolve_capacity(
                 "missing or duplicate physical GPU cost profile",
             ))?;
         let floor = if policy.small_card_headroom { small_card_headroom_bytes(memory.total_bytes) } else { 0 };
-        let admitted = admit_device_reservations_with_headroom(
-            policy.gpu_occupancy_percent, memory, &costs.reservations, floor)?;
+        let peak = startup_peaks.iter().filter(|(device, _)| *device == costs.device)
+            .map(|(_, bytes)| *bytes).max().unwrap_or(0);
+        let mut peak_costs = costs.reservations.clone();
+        if peak > 0 {
+            peak_costs.push(MemoryReservation { name: "startup.temporary_peak".into(), bytes: peak });
+        }
+        let mut admitted = admit_device_reservations_with_headroom(
+            policy.gpu_occupancy_percent, memory, &peak_costs, floor.saturating_sub(peak))?;
+        // Keep the temporary out of the permanent contract, while preserving
+        // its unavailable pool budget. It is released before serving.
+        admitted.reservations = costs.reservations.clone();
+        admitted.reserved_bytes -= peak;
+        admitted.engine_budget_bytes -= peak;
         if costs.pool_unit_bytes > 0 {
             has_kv = true;
             feasible_units =
@@ -476,6 +498,36 @@ mod tests {
             - new.devices[0].reserved_bytes - new.devices[0].pool_bytes >= SMALL_CARD_HEADROOM_BYTES);
         assert!(matches!(resolve_capacity(CapacityPolicy { pool_tokens: Some(1_048_576), ..policy },
             &profile, &[memory]), Err(CapacityError::PoolExceeded { .. })));
+    }
+
+    #[test]
+    fn mimo_pro_auto_pool_reserves_intake_peak_and_explicit_overask_stays_strict() {
+        let memory = DeviceMemory { device: 0, total_bytes: 101_973_491_712,
+            baseline_free_bytes: 101_973_491_712 - 586_416_128 };
+        let budget = 98_327_870_832;
+        let probe = 64 << 20;
+        // Freeze rc1's combined fixed reservation and pool-metadata overhead.
+        let fixed = 98_393_355_060 - 1_981_376 * 28_804 - probe;
+        let profile = CapacityProfile { context: ContextLimits { checkpoint_max_tokens: 1 << 20,
+            compiled_index_max_tokens: None }, pool_unit_rows: 64,
+            devices: vec![DeviceCosts { device: 0, reservations: vec![MemoryReservation {
+                name: "steady.fixed".into(), bytes: fixed }], pool_unit_bytes: 64 * 28_804 }],
+            host_prefix_bytes: 0 };
+        let policy = CapacityPolicy { small_card_headroom: true, ..Default::default() };
+        let old = resolve_capacity(policy, &profile, &[memory]).unwrap();
+        assert_eq!(old.devices[0].engine_budget_bytes, budget);
+        assert_eq!(old.allocated_gpu_kv_tokens, 1_981_376);
+        assert_eq!(fixed + old.devices[0].pool_bytes + probe, 98_393_355_060);
+        assert_eq!(fixed + old.devices[0].pool_bytes + probe - budget, 65_484_228);
+        let new = resolve_capacity_with_startup_peaks(policy, &profile, &[memory], &[(0, probe)]).unwrap();
+        assert_eq!(new.allocated_gpu_kv_tokens, 1_979_072);
+        assert!(fixed + new.devices[0].pool_bytes + probe <= budget);
+        assert!(new.devices[0].reservations.iter().all(|r| !r.name.starts_with("startup.")));
+        assert!(matches!(resolve_capacity_with_startup_peaks(CapacityPolicy {
+            pool_tokens: Some(1_981_376), ..policy }, &profile, &[memory], &[(0, probe)]),
+            Err(CapacityError::PoolExceeded { .. })));
+        assert!(resolve_capacity_with_startup_peaks(CapacityPolicy { pool_tokens: Some(1_979_072),
+            ..policy }, &profile, &[memory], &[(0, probe)]).is_ok());
     }
 
     #[test]

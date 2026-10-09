@@ -54,18 +54,24 @@ pub fn scan(root: &Path) -> Result<Vec<Placed>> {
     Ok(placed)
 }
 
-fn coordinator_budget(report: &Report) -> Option<u64> {
-    report.server.configuration.settings.iter()
-        .find(|s| s.name == "coordinator-gpu-budget-gib")
-        .and_then(|s| s.value.as_deref())
-        .and_then(|v| v.parse().ok())
+fn coordinator_budget(report: &Report) -> Option<f64> {
+    report.server.coordinator_budget()
 }
 
 fn short_hardware(report: &Report) -> String {
     let hw = &report.server.hardware;
-    let mut out = format!("{}× RTX", hw.used_gpus());
-    if let Some(gib) = coordinator_budget(report) {
-        out.push_str(&format!(" ({gib} GiB budget)"));
+    if report.server.simulated_5090() {
+        return report.server.hardware_line();
+    }
+    let mut out = if report.server.column_5090() {
+        "RTX 5090".into()
+    } else {
+        format!("{}× RTX", hw.used_gpus())
+    };
+    if !report.server.simulated_5090() {
+        if let Some(gib) = coordinator_budget(report) {
+            out.push_str(&format!(" ({gib} GiB budget)"));
+        }
     }
     if !hw.sparks.is_empty() {
         out.push_str(&format!(" + {}× Spark", hw.sparks.len()));
@@ -90,7 +96,7 @@ fn link(dir: &Path, file: &str) -> String {
 const FAMILIES: [&str; 6] = ["deepseek_v41", "deepseek_v4", "glm5", "glm5_flash", "mimo_v2", "qwen4"];
 
 /// The newest basic-profile report per family, checkpoint and reference hardware, in
-/// family order, then checkpoint, minimum before maximum.
+/// family order, then checkpoint, 5090, one RTX, then two RTX.
 fn reference_rows(placed: &[Placed]) -> Vec<(String, String, u8, &Placed)> {
     // The newest basic-profile report per family, checkpoint and hardware (`placed`
     // is newest first), on the reference layouts (one or two RTX, Sparks or none).
@@ -107,7 +113,8 @@ fn reference_rows(placed: &[Placed]) -> Vec<(String, String, u8, &Placed)> {
     let mut newest: BTreeMap<(usize, String, String, String), &Placed> = BTreeMap::new();
     for p in placed {
         let r = &p.report;
-        if r.baseline.is_none() || !matches!(r.profile.as_str(), "smoke" | "share")
+        if (r.baseline.is_none() && !(r.no_fit_reason().is_some() && r.server.column_5090()))
+            || !matches!(r.profile.as_str(), "smoke" | "share")
             || !(1..=2).contains(&r.server.hardware.used_gpus()) {
             continue;
         }
@@ -116,41 +123,51 @@ fn reference_rows(placed: &[Placed]) -> Vec<(String, String, u8, &Placed)> {
         }
         let family = r.server.family.clone().unwrap_or_else(|| "unknown".into());
         let order = FAMILIES.iter().position(|f| *f == family).unwrap_or(FAMILIES.len());
-        let mut hardware = r.server.hardware.slug();
+        let mut hardware = format!("{}-{}", if r.server.simulated_5090() { "sim5090" }
+            else if r.server.column_5090() { "5090" } else { "pro" }, r.server.hardware.slug());
         if let Some(gib) = coordinator_budget(r) {
             hardware.push_str(&format!("-budget{gib}"));
         }
         newest.entry((order, family, checkpoint(r), hardware)).or_insert(p);
     }
-    // Per checkpoint: the smallest layout is its minimum, the largest its maximum
-    // (a family without a two-RTX split has its maximum on one RTX).
     let mut groups: BTreeMap<(usize, String, String), Vec<&Placed>> = BTreeMap::new();
     for ((order, family, name, _), p) in newest {
         groups.entry((order, family, name)).or_default().push(p);
     }
     let size = |p: &Placed| (p.report.server.hardware.used_gpus(), p.report.server.hardware.sparks.len());
     let mut rows = Vec::new();
-    for ((_, family, name), mut reports) in groups {
-        // Qwen's small RTX + one Spark is the minimum; the larger RTX with
-        // resident experts is its maximum, regardless of Spark count.
-        let budget_min = (family == "qwen4").then(|| reports.iter().find(|p|
-            size(p) == (1, 1) && coordinator_budget(&p.report) == Some(32))).flatten().copied();
-        if let Some(minimum) = budget_min {
-            rows.push((family.clone(), name.clone(), 0, minimum));
-            if let Some(maximum) = reports.iter().find(|p|
-                size(p) == (1, 0) && coordinator_budget(&p.report).is_none()) {
-                rows.push((family, name, 1, *maximum));
-            }
-            continue;
+    for ((_, family, name), reports) in groups {
+        // Real measurements always replace memory-only simulations, even older ones.
+        fn newest_of(items: Vec<&Placed>) -> Option<&Placed> {
+            items.into_iter().max_by(|a, b|
+                a.report.created.cmp(&b.report.created).then(a.dir.cmp(&b.dir)))
         }
-        reports.sort_by_key(|p| size(p));
-        let (first, last) = (reports[0], reports[reports.len() - 1]);
-        rows.push((family.clone(), name.clone(), 0, first));
-        if size(last) != size(first) {
-            rows.push((family, name, 1, last));
+        let real = newest_of(reports.iter().copied().filter(|p|
+            p.report.server.column_5090() && !p.report.server.simulated_5090()).collect());
+        let simulated = newest_of(reports.iter().copied().filter(|p|
+            p.report.server.simulated_5090()).collect());
+        if let Some(p) = real.or(simulated) {
+            rows.push((family.clone(), name.clone(), 0, p));
+        }
+        let pro: Vec<_> = reports.into_iter().filter(|p| !p.report.server.column_5090()).collect();
+        let one: Vec<_> = pro.iter().copied().filter(|p| size(p).0 == 1).collect();
+        let minimum = one.iter().map(|p| size(p).1).min().and_then(|count|
+            newest_of(one.iter().copied().filter(|p| size(p).1 == count).collect()));
+        if let Some(p) = minimum {
+            rows.push((family.clone(), name.clone(), 1, p));
+        }
+        let two: Vec<_> = pro.iter().copied().filter(|p| size(p).0 == 2).collect();
+        let maximum = two.iter().map(|p| size(p).1).max().and_then(|count|
+            newest_of(two.iter().copied().filter(|p| size(p).1 == count).collect()));
+        if let Some(p) = maximum {
+            rows.push((family, name, 2, p));
         }
     }
     rows
+}
+
+fn column_name(class: u8) -> &'static str {
+    match class { 0 => "5090", 1 => "1× RTX", _ => "2× RTX" }
 }
 
 fn quality_cell(b: &crate::report::Baseline) -> String {
@@ -162,7 +179,7 @@ fn quality_cell(b: &crate::report::Baseline) -> String {
 }
 
 /// The root README's results: one row per checkpoint (model and quant linking to
-/// its family page, then its minimum and maximum share cards, each linking to the
+/// its family page, then its three reference-column cards, each linking to the
 /// card SVG), then the same rows as a compact table.
 pub fn results(placed: &[Placed]) -> String {
     let rows = reference_rows(placed);
@@ -170,40 +187,53 @@ pub fn results(placed: &[Placed]) -> String {
         return "_Pending the first published run._\n".into();
     }
     // One row per checkpoint: the model and quant (linking to its family page),
-    // then its minimum and maximum cards, each linking to the card itself.
-    let mut out = String::from("<table>\n<tr><th>Model · quant</th><th>Minimum hardware</th><th>Maximum hardware</th></tr>\n");
+    // then the 5090, one-RTX and two-RTX cards, each linking to the card itself.
+    let mut out = String::from("<table>\n<tr><th>Model · quant</th><th>5090</th><th>1× RTX</th><th>2× RTX</th></tr>\n");
     let mut i = 0;
     while i < rows.len() {
         let (family, name, _, first) = &rows[i];
-        let mut cells = [None, None];
+        let mut cells = [None, None, None];
         while i < rows.len() && rows[i].0 == *family && rows[i].1 == *name {
             cells[rows[i].2 as usize] = Some(rows[i].3);
             i += 1;
         }
-        let card = |p: Option<&Placed>| p.map_or("<td width=\"40%\" align=\"center\">—</td>".to_string(), |p| {
+        let card = |p: Option<&Placed>, column: u8| p.map_or(format!("<td width=\"27%\" align=\"center\">{}</td>",
+            if column == 0 { "pending Hugh (TJ-T-3)" }
+            else if column == 2 && family == "qwen4" { "n/a: fits one RTX (no two-GPU split for Qwen)" }
+            else { "—" }), |p| {
+            if let Some(reason) = p.report.no_fit_reason() {
+                return format!("<td width=\"27%\" valign=\"top\"><a href=\"{}\">doesn't fit 1× 5090 (32 GB) + {} Sparks</a>\
+                    <br><sub>{}</sub></td>", link(&p.dir, "report.json"), p.report.server.hardware.sparks.len(),
+                    crate::render::svg::escape(reason));
+            }
             let svg = link(&p.dir, "card.svg");
-            format!("<td width=\"40%\" valign=\"top\"><a href=\"{svg}\"><img src=\"{svg}\" alt=\"{} on {}\"></a>\
-                <br><sub>{}</sub></td>", p.report.server.checkpoint(), p.report.server.hardware.line(),
+            format!("<td width=\"27%\" valign=\"top\"><a href=\"{svg}\"><img src=\"{svg}\" alt=\"{} on {}\"></a>\
+                <br><sub>{}</sub></td>", p.report.server.checkpoint(), p.report.server.hardware_line(),
                 short_hardware(&p.report))
         });
-        out.push_str(&format!("<tr>\n<td width=\"20%\" valign=\"top\"><a href=\"docs/models/{family}.md\"><b>{}</b></a>\
-            <br><sub>{}</sub><br><sub>{}</sub></td>\n{}\n{}\n</tr>\n", family_title(family),
+        out.push_str(&format!("<tr>\n<td width=\"19%\" valign=\"top\"><a href=\"docs/models/{family}.md\"><b>{}</b></a>\
+            <br><sub>{}</sub><br><sub>{}</sub></td>\n{}\n{}\n{}\n</tr>\n", family_title(family),
             first.report.server.checkpoint(),
             name.rsplit_once(" (").map_or("", |(_, quant)| quant.trim_end_matches(')')),
-            card(cells[0]), card(cells[1])));
+            card(cells[0], 0), card(cells[1], 1), card(cells[2], 2)));
     }
     out.push_str("</table>\n\n");
     out.push_str("| Family | Checkpoint | Hardware | KV / req | C1 code | Concurrent code (aggregate) | prose | JSON | 8K prefill | TTFT | Quality | Report |\n");
     out.push_str("| --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- |\n");
     for (family, name, class, p) in &rows {
         let r = &p.report;
+        if let Some(reason) = r.no_fit_reason() {
+            out.push_str(&format!("| [{}](docs/models/{family}.md) | {name} | {} ({}) | — | — | — | — | — | — | — | doesn't fit: {} | [planner report]({}) |\n",
+                family_title(family), short_hardware(r), column_name(*class), reason.replace('|', "\\|"), link(&p.dir, "report.json")));
+            continue;
+        }
         let b = r.baseline.as_ref().expect("filtered");
         let decode = |content: &str| b.card.decode_of(content).map_or("—".into(), |d| rate(d.tok_s));
         let concurrent = b.card.concurrent.as_ref().map_or("—".into(),
             |c| format!("C{}: {}", c.width, rate(c.aggregate_tok_s)));
         let (prefill, ttft) = b.card.prefill.as_ref()
             .map_or(("—".into(), "—".into()), |p| (rate(p.tok_s), seconds(p.ttft_s)));
-        let hardware = format!("{} ({})", short_hardware(r), if *class == 0 { "min" } else { "max" });
+        let hardware = format!("{} ({})", short_hardware(r), column_name(*class));
         out.push_str(&format!("| [{}](docs/models/{family}.md) | {name} | {hardware} | {} | {} | {concurrent} | {} | {} | {prefill} | {ttft} | {} | \
             [{} · {}]({}) |\n", family_title(family), r.capacity().compact(), decode("code"), decode("prose"),
             decode("json"), quality_cell(b), crate::render::date(&r.created), r.server.build.label(),
@@ -211,7 +241,8 @@ pub fn results(placed: &[Placed]) -> String {
     }
     out.push_str("\ntok/s; C1 decode and concurrent code aggregate with thinking off (up to C8, clamped to server admission), \
         8K prefill cold. Quality: logit fidelity against the family golden \
-        reference, prefix-cache restore exactness, lossless speculation.\n");
+        reference, prefix-cache restore exactness, lossless speculation. Simulated 5090 reports cap RTX PRO 6000 memory only; \
+        SM count (188 vs 170), L2, clocks and power are not emulated. Their speed is indicative and likely optimistic.\n");
     out
 }
 
@@ -219,7 +250,7 @@ pub fn results(placed: &[Placed]) -> String {
 pub fn family_cards(placed: &[Placed], family: &str) -> String {
     reference_rows(placed).into_iter().filter(|(f, ..)| f == family).map(|(_, name, class, p)| {
         format!("<a href=\"../../{}\"><img src=\"../../{}\" width=\"360\" alt=\"{name} ({})\"></a>",
-            link(&p.dir, "report.svg"), link(&p.dir, "card.svg"), if class == 0 { "min" } else { "max" })
+            link(&p.dir, "report.svg"), link(&p.dir, "card.svg"), column_name(class))
     }).collect::<Vec<_>>().join(" ")
 }
 
@@ -237,8 +268,10 @@ pub fn index(placed: &[Placed]) -> String {
             let relative = p.dir.strip_prefix("benchmarks").unwrap_or(&p.dir);
             let mut line = format!("- {} · {} · {} · {} · build {} · [report]({})",
                 crate::render::date(&r.created), crate::profiles::title_of(&r.profile), r.server.checkpoint(),
-                r.server.hardware.line(), r.server.build.label(), link(relative, "report.svg"));
-            if r.quality_failed() {
+                r.server.hardware_line(), r.server.build.label(), link(relative, "report.svg"));
+            if let Some(reason) = r.no_fit_reason() {
+                line.push_str(&format!(" · doesn't fit: {reason}"));
+            } else if r.quality_failed() {
                 line.push_str(" · ⚠ quality gate failed");
             }
             out.push_str(&line);
@@ -340,7 +373,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn qwen_budget_minimum_replaces_legacy_spark_reference_ordering() {
+    fn qwen_local_minimum_is_not_displaced_by_legacy_budget_or_simulation() {
         let placed = |id: &str, sparks: usize, budget: Option<&str>| {
             let mut report = crate::sample::report(false);
             report.id = id.into();
@@ -361,21 +394,117 @@ mod tests {
         let maximum = placed("maximum", 0, None);
         let unbudgeted = placed("unbudgeted", 1, None);
         let minimum = placed("minimum", 1, Some("32"));
+        let mut simulated = placed("simulated", 1, Some("31.8"));
+        simulated.report.server.configuration.settings.push(crate::report::Setting {
+            name: "simulated".into(), value: Some("5090".into()), default: None, source: "publication".into(),
+        });
         let reports = vec![unbudgeted, minimum, maximum, legacy];
+        let with_simulation = [vec![simulated], reports.clone()].concat();
+        assert_eq!(reference_rows(&with_simulation)[1].3.report.id, "maximum");
         let rows = reference_rows(&reports);
-        assert_eq!(rows.len(), 2);
-        assert_eq!((rows[0].2, rows[0].3.report.id.as_str()), (0, "minimum"));
-        assert_eq!((rows[1].2, rows[1].3.report.id.as_str()), (1, "maximum"));
-        assert!(short_hardware(&rows[0].3.report).contains("32 GiB budget"));
-        assert!(crate::render::card::card_svg(&rows[0].3.report).contains("32 GiB budget"));
+        assert_eq!(rows.len(), 1);
+        assert_eq!((rows[0].2, rows[0].3.report.id.as_str()), (1, "maximum"));
+        assert!(short_hardware(&reports[1].report).contains("32 GiB budget"));
+        assert!(crate::render::card::card_svg(&reports[1].report).contains("32 GiB budget"));
         let html = results(&reports);
-        assert!(html.contains("benchmarks/qwen4/minimum/card.svg"));
+        assert!(!html.contains("benchmarks/qwen4/minimum/card.svg"));
         assert!(html.contains("benchmarks/qwen4/maximum/card.svg"));
+        assert!(html.contains("n/a: fits one RTX (no two-GPU split for Qwen)"));
+        let v2 = vec![with_simulation[0].clone(), reports[2].clone()];
+        let rows = reference_rows(&v2);
+        assert_eq!(rows.iter().map(|r| (r.2, r.3.report.id.as_str())).collect::<Vec<_>>(),
+            vec![(0, "simulated"), (1, "maximum")]);
         assert!(!html.contains("benchmarks/qwen4/legacy/card.svg"));
-        // Before a budgeted minimum is published, preserve the previous rows.
+        // Historical one-GPU layouts never become a two-GPU maximum.
         let legacy_rows = reference_rows(&reports[2..]);
-        assert_eq!((legacy_rows[0].2, legacy_rows[0].3.report.id.as_str()), (0, "maximum"));
-        assert_eq!((legacy_rows[1].2, legacy_rows[1].3.report.id.as_str()), (1, "legacy"));
+        assert_eq!((legacy_rows[0].2, legacy_rows[0].3.report.id.as_str()), (1, "maximum"));
+        assert_eq!(legacy_rows.len(), 1, "one-RTX legacy layouts do not populate the two-RTX column");
+    }
+
+    fn marked(id: &str, gpus: usize, marker: Option<(&str, &str)>) -> Placed {
+        let mut report = crate::sample::report(false);
+        report.id = id.into();
+        let gpu = report.server.hardware.gpus[0].clone();
+        report.server.hardware.gpus = (0..gpus).map(|i| {
+            let mut g = gpu.clone(); g.index = i as u32; g.used = true; g
+        }).collect();
+        if let Some((name, value)) = marker {
+            report.server.configuration.settings.push(crate::report::Setting {
+                name: name.into(), value: Some(value.into()), default: None, source: "publication".into(),
+            });
+        }
+        Placed { dir: PathBuf::from(format!("benchmarks/deepseek_v41/{id}")), report }
+    }
+
+    #[test]
+    fn fractional_budget_and_simulation_labels() {
+        let mut p = marked("sim5090", 1, Some(("simulated", "5090")));
+        p.report.server.hardware.gpus[0].sm_count = Some(188);
+        p.report.server.configuration.settings.push(crate::report::Setting {
+            name: "coordinator-gpu-budget-gib".into(), value: Some("31.8".into()),
+            default: None, source: "cli".into(),
+        });
+        assert_eq!(coordinator_budget(&p.report), Some(31.8));
+        assert!(short_hardware(&p.report).contains("simulated 5090: RTX PRO 6000 (188 SMs) capped at 31.8 GiB"));
+        assert!(p.report.server.hardware_line().contains("RTX PRO 6000 (188 SMs) capped at 31.8 GiB"));
+        assert!(crate::render::card::card_svg(&p.report).contains("simulated 5090"));
+        p.report.server.configuration.settings.last_mut().unwrap().value = Some("NaN".into());
+        assert_eq!(coordinator_budget(&p.report), None);
+    }
+
+    #[test]
+    fn three_columns_use_markers_not_memory_layout() {
+        let reports = vec![marked("sim", 1, Some(("simulated", "5090"))),
+            marked("one", 1, None), marked("two", 2, None)];
+        let rows = reference_rows(&reports);
+        assert_eq!(rows.iter().map(|r| (r.2, r.3.report.id.as_str())).collect::<Vec<_>>(),
+            vec![(0, "sim"), (1, "one"), (2, "two")]);
+        let html = results(&reports);
+        assert!(html.contains("<th>5090</th><th>1× RTX</th><th>2× RTX</th>"));
+        assert_eq!(html.matches("<img src=").count(), 3);
+        assert!(results(&reports[1..]).contains("pending Hugh (TJ-T-3)"));
+    }
+
+    #[test]
+    fn real_5090_supersedes_even_newer_simulation_but_history_remains() {
+        let mut sim = marked("sim", 1, Some(("simulated", "5090")));
+        sim.report.created = "2026-10-09T00:00:00Z".into();
+        let mut real = marked("real", 1, Some(("hardware.class", "5090")));
+        real.report.created = "2026-10-08T00:00:00Z".into();
+        let reports = vec![sim, real, marked("one", 1, None)];
+        assert_eq!(reference_rows(&reports)[0].3.report.id, "real");
+        assert!(!results(&reports).contains("/sim/card.svg"));
+        assert!(index(&reports).contains("/sim/report.svg"));
+    }
+
+    #[test]
+    fn no_fit_has_no_performance_and_real_5090_replaces_it() {
+        let mut rejection = marked("no-fit-sim5090", 1, Some(("simulated", "5090")));
+        rejection.report.status = crate::report::RunStatus::Failed;
+        rejection.report.baseline = None;
+        rejection.report.server.configuration.settings.push(crate::report::Setting {
+            name: "qualification.no-fit".into(), value: Some("rtx0 weights < layout | over budget".into()),
+            default: None, source: "planner".into(),
+        });
+        let html = results(&[rejection.clone()]);
+        assert!(html.contains("doesn't fit 1× 5090 (32 GB) + 4 Sparks"));
+        assert!(html.contains("weights &lt; layout"));
+        assert!(html.contains("layout \\| over budget"));
+        assert!(html.contains("no-fit-sim5090/report.json"));
+        let card = crate::render::card::card_svg(&rejection.report);
+        assert!(card.contains("Doesn&#39;t fit"));
+        assert!(!card.contains("tok/s"));
+        let report = crate::render::report::report_svg(&rejection.report);
+        assert!(report.contains("Doesn&#39;t fit"));
+        assert!(!crate::render::report::shown(&rejection.report).contains(&"baseline".into()));
+        let mut real = marked("real", 1, Some(("hardware.class", "5090")));
+        real.report.created = "2026-10-01T00:00:00Z".into();
+        let reports = vec![rejection, real];
+        assert_eq!(reference_rows(&reports)[0].3.report.id, "real");
+        assert!(index(&reports).contains("no-fit-sim5090/report.svg"));
+        let mut unmarked = reports[0].clone();
+        unmarked.report.status = crate::report::RunStatus::Done;
+        assert!(reference_rows(&[unmarked]).is_empty());
     }
 
     #[test]

@@ -88,7 +88,6 @@ fn model_id(snapshot: &std::path::Path) -> Option<String> {
 pub(crate) async fn run_serve(args: ServeArgs) -> Result<()> {
     let api = args.api.load()?;
     let snapshot: PathBuf = args.engine.snapshot.clone();
-    let limits = NativeLimits::new(args.engine.max_context as u32, args.max_output)?;
     let encoding = GlmEncoding::from_snapshot(&snapshot)?.with_thinking_off(args.thinking_off);
     let profile = ModelProfile::new(
         args.model_id.clone().or_else(|| model_id(&snapshot)).context("model id")?,
@@ -109,7 +108,8 @@ pub(crate) async fn run_serve(args: ServeArgs) -> Result<()> {
     let hub = console::hub(args.console.console_text, || Ok(console_layout(&args, &profile.id)));
     let worker = tokio::task::spawn_blocking(move ||
         serve_loop(engine_args, receive, ready_tx, worker_stats, max_sequences, policy, prefix));
-    ready_rx.await.context("engine failed before it was ready")??;
+    let max_context = ready_rx.await.context("engine failed before it was ready")??;
+    let limits = NativeLimits::new(u32::try_from(max_context)?, args.max_output)?;
     cuteafd_bench::context::phase("engine loaded");
     let router = cuteafd_api::openai::router_for_model(queue, limits, stats, Duration::from_secs(25),
         hub.clone(), crate::shared::api::profile(profile.clone()));
@@ -165,7 +165,7 @@ struct Policy {
 }
 
 fn serve_loop(args: super::EngineArgs, mut receive: mpsc::Receiver<NativeRequest>,
-    ready: tokio::sync::oneshot::Sender<Result<()>>, stats: Arc<Mutex<serde_json::Value>>, max_sequences: usize,
+    ready: tokio::sync::oneshot::Sender<Result<usize>>, stats: Arc<Mutex<serde_json::Value>>, max_sequences: usize,
     policy: Policy, prefix: PrefixArgs) -> Result<()> {
     let opened = match open(&args) {
         Ok(opened) => opened,
@@ -178,7 +178,7 @@ fn serve_loop(args: super::EngineArgs, mut receive: mpsc::Receiver<NativeRequest
     let result = opened.with_engine(&args, |engine, transport, runtime| {
         anyhow::ensure!(transport.is_some() || engine.skip_routed(), "serve-glm needs --peers for the routed experts");
         if let Some(ready) = ready.take() {
-            let _ = ready.send(Ok(()));
+            let _ = ready.send(Ok(engine.max_context));
         }
         let ranks = args.peers.as_deref().map_or(4, |peers| peers.split(',').count());
         let spark = transport.is_some();
@@ -187,7 +187,7 @@ fn serve_loop(args: super::EngineArgs, mut receive: mpsc::Receiver<NativeRequest
             ranks, &prefix, args.token_io.token_select)
     });
     if let Some(ready) = ready.take() {
-        let _ = ready.send(result.as_ref().map(|_| ()).map_err(|e| anyhow::anyhow!("{e:#}")));
+        let _ = ready.send(result.as_ref().map(|_| args.max_context).map_err(|e| anyhow::anyhow!("{e:#}")));
     }
     result
 }

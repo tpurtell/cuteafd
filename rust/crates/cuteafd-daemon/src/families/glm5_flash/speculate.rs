@@ -3,7 +3,7 @@
 //! verify-by-replay against serial steps, and the verify-step cost by rows.
 use super::engine::{Allocator, GlmfEngine, GlmfPlacement};
 use super::{bf16s, similarity, GoldenArgs, Opened};
-use crate::families::glm5::dflash::{ContextRow, DraftSeq, TAP_ROWS};
+use crate::families::glm5::dflash::{ContextRow, DraftSeq, RING, TAP_ROWS};
 use anyhow::{ensure, Context, Result};
 use std::time::Instant;
 
@@ -153,6 +153,165 @@ pub(super) fn draft_replay(args: &GoldenArgs, opened: &Opened, engine: &GlmfEngi
             (--fp8-head) has no BF16 copy to replay against")?.buffer.ptr, start)
 }
 
+/// A drafter setting: (--draft-head, --draft-linear).
+type DraftMode = (crate::families::glm5::DraftHead, crate::shared::fp8_linear::Fp8Rows);
+
+/// The setting [`draft_modes`] compares against and builds every context under: the defaults.
+const REFERENCE_MODE: DraftMode =
+    (crate::families::glm5::DraftHead::Exact, crate::shared::fp8_linear::Fp8Rows::W8a16);
+
+/// The settings [`draft_modes`] compares: both heads under every linear mode an FP8 drafter's
+/// scratch admits (`admitted`, its load's mode, and the modes before it), the head alone for a
+/// BF16 drafter. The first is [`REFERENCE_MODE`].
+fn draft_mode_settings(fp8: bool, admitted: crate::shared::fp8_linear::Fp8Rows) -> Vec<DraftMode> {
+    use crate::families::glm5::DraftHead;
+    use crate::shared::fp8_linear::Fp8Rows;
+    [Fp8Rows::W8a16, Fp8Rows::Wide, Fp8Rows::W8a8].into_iter()
+        .filter(|&linear| linear == Fp8Rows::W8a16 || (fp8 && linear <= admitted))
+        .flat_map(|linear| [DraftHead::Exact, DraftHead::Tensor].map(|head| (head, linear)))
+        .collect()
+}
+
+/// What [`draft_mode_schedule`] drives: the target and drafter on a GPU, a recorder in tests.
+trait DraftModeSteps {
+    /// Selects the drafter's head and linear modes for the calls that follow.
+    fn set_mode(&mut self, mode: DraftMode) -> Result<()>;
+    /// Prefills `tokens` from position 0, projecting their tapped tail into the ring.
+    fn prefill(&mut self, tokens: &[u32]) -> Result<()>;
+    /// One teacher-forced target step of `tokens` from position `first`, projecting every row
+    /// into the ring.
+    fn advance(&mut self, first: usize, tokens: &[u32]) -> Result<()>;
+    /// One draft step of `sequences`; their drafted tokens.
+    fn draft(&mut self, sequences: &[DraftSeq]) -> Result<Vec<Vec<u32>>>;
+}
+
+/// [`draft_mode_schedule`]'s counts. Per setting: drafts kept, identical to the first setting's,
+/// identical to the anchors' own, and the step seconds.
+struct DraftModeTally {
+    anchors: usize,
+    alone_kept: usize,
+    settings: Vec<(usize, usize, usize, Vec<f64>)>,
+}
+
+/// [`draft_modes`]' schedule. Every context the ring holds is projected under
+/// [`REFERENCE_MODE`]: the mode is set before the prefill and before every run of context
+/// updates, so the anchors alone and every setting draft from the same ring, whichever setting
+/// drafted last. Before each window of `sequences` anchors (positions p..p + N, up to `end`)
+/// the anchors draft alone under the reference, then together under each setting in turn.
+fn draft_mode_schedule(steps: &mut impl DraftModeSteps, tokens: &[u32], prefill: usize, end: usize,
+    sequences: usize, step_rows: usize, settings: &[DraftMode]) -> Result<DraftModeTally> {
+    ensure!(settings.first() == Some(&REFERENCE_MODE), "--draft-modes compares against {REFERENCE_MODE:?} first");
+    let kept = |draft: &[u32], position: usize| draft.iter().zip(&tokens[position + 1..]).take_while(|(d, t)| d == t).count();
+    let mut tally = DraftModeTally { anchors: 0, alone_kept: 0,
+        settings: vec![(0usize, 0usize, 0usize, Vec::new()); settings.len()] };
+    steps.set_mode(REFERENCE_MODE)?;
+    steps.prefill(&tokens[..prefill])?;
+    let (mut done, mut p) = (prefill, prefill);
+    while p + sequences <= end {
+        // The context of anchors p..p + N ends at p + N - 2; the last setting may still be set.
+        steps.set_mode(REFERENCE_MODE)?;
+        while done + 1 < p + sequences {
+            let rows = (p + sequences - 1 - done).min(step_rows);
+            steps.advance(done, &tokens[done..done + rows])?;
+            done += rows;
+        }
+        let seqs: Vec<DraftSeq> = (p..p + sequences)
+            .map(|q| DraftSeq { slot: 0, anchor: tokens[q], position: q, valid_from: 0 }).collect();
+        let alone = seqs.iter().map(|seq| Ok(steps.draft(std::slice::from_ref(seq))?.remove(0)))
+            .collect::<Result<Vec<_>>>()?;
+        tally.alone_kept += alone.iter().enumerate().map(|(j, d)| kept(d, p + j)).sum::<usize>();
+        let mut first: Option<Vec<Vec<u32>>> = None;
+        for (&mode, total) in settings.iter().zip(&mut tally.settings) {
+            steps.set_mode(mode)?;
+            let timer = Instant::now();
+            let wide = steps.draft(&seqs)?;
+            total.3.push(timer.elapsed().as_secs_f64());
+            total.0 += wide.iter().enumerate().map(|(j, d)| kept(d, p + j)).sum::<usize>();
+            total.1 += wide.iter().zip(first.get_or_insert_with(|| wide.clone()).iter()).filter(|(a, b)| a == b).count();
+            total.2 += wide.iter().zip(&alone).filter(|(a, b)| a == b).count();
+        }
+        tally.anchors += sequences;
+        p += sequences;
+    }
+    Ok(tally)
+}
+
+/// [`DraftModeSteps`] on the target and its drafter (ring slot 0).
+struct EngineDraftModes<'a, 'e> {
+    engine: &'a GlmfEngine<'e>,
+    drafter: &'a super::dspark::Drafter<'e>,
+    placement: GlmfPlacement,
+}
+
+impl DraftModeSteps for EngineDraftModes<'_, '_> {
+    fn set_mode(&mut self, (head, linear): DraftMode) -> Result<()> {
+        self.drafter.set_draft_head(head);
+        self.drafter.set_draft_linear(linear)
+    }
+
+    fn prefill(&mut self, tokens: &[u32]) -> Result<()> {
+        prefill_with_taps(self.engine, &mut self.placement, tokens, 0).map(drop)
+    }
+
+    fn advance(&mut self, first: usize, tokens: &[u32]) -> Result<()> {
+        let rows = tokens.len();
+        self.engine.verify(&mut [(&mut self.placement, rows)], tokens, None)?
+            .context("--draft-modes needs every layer")?;
+        self.drafter.update(&(0..rows).map(|r| ContextRow { tap_row: r, slot: 0, position: first + r }).collect::<Vec<_>>())
+    }
+
+    fn draft(&mut self, sequences: &[DraftSeq]) -> Result<Vec<Vec<u32>>> {
+        Ok(self.drafter.draft_device(sequences, &self.engine.embedding, self.engine.draft_head())?
+            .into_iter().map(|d| d.tokens).collect())
+    }
+}
+
+/// Draft-kernel A/B (`--draft-modes N`): after the --prefill tokens (default 1024), the golden
+/// tokens go through the target in teacher-forced steps that tap the drafter's ring slot 0, and
+/// before each window of N anchors (positions p..p + N) the window drafts in one step of N
+/// sequences (8N rows; each anchor at its own position on the one ring) under every --draft-head
+/// and --draft-linear setting the drafter admits, and each anchor alone (8 rows, the same bits
+/// under every setting). The ring's context is projected under the default setting (exact head,
+/// W8A16) throughout, so every setting drafts from the same context ([`draft_mode_schedule`]).
+/// A window's context ends at p + N - 2 and an anchor at q reads only positions before q; windows
+/// stop at the ring's length, so no entry an anchor reads has been overwritten. Prints, per
+/// setting, the drafts kept as a prefix of the text, the share of drafts identical to the first
+/// setting's and to the anchors' own, and the median step time.
+pub(super) fn draft_modes(args: &GoldenArgs, engine: &GlmfEngine<'_>, sequences: usize) -> Result<()> {
+    let drafter = engine.drafter.as_ref().context("--draft-modes needs --draft")?;
+    ensure!((1..=drafter.max_batch_sequences()).contains(&sequences),
+        "--draft-modes takes 1 to {} sequences (--draft-sequences)", drafter.max_batch_sequences());
+    let tokens = tokens(args)?;
+    let drafts = drafter.drafts();
+    let prefill = args.prefill.unwrap_or(1024);
+    // The last window's context ends at the ring's last position; its drafts score `drafts` tokens.
+    let end = (RING + 1).min(tokens.len().saturating_sub(drafts));
+    ensure!(prefill >= 1 && prefill + sequences <= end, "--draft-modes needs --prefill + {sequences} <= {end} \
+        (the ring holds {RING} positions; tokens.bin has {} tokens)", tokens.len());
+    let fp8 = drafter.replay().resident_modes().iter().any(|mode| mode.name == "FP8");
+    let settings = draft_mode_settings(fp8, args.engine.draft_linear);
+    let placement = Allocator::new(engine.pages, engine.slots).admit(end + 1)?;
+    let mut steps = EngineDraftModes { engine, drafter, placement };
+    let tally = draft_mode_schedule(&mut steps, &tokens, prefill, end, sequences, super::engine::DECODE_ROWS,
+        &settings);
+    // The load's settings again, whether or not the schedule finished.
+    steps.set_mode((args.engine.draft_head, args.engine.draft_linear))?;
+    let DraftModeTally { anchors, alone_kept, settings: mut totals } = tally?;
+    let n = anchors.max(1) as f64;
+    println!("draft modes ({} drafter, {}): {anchors} anchors from {prefill} in steps of {sequences} sequences \
+        ({} rows), every context under the first setting; drafts kept as a prefix of the text, of {drafts}:",
+        drafter.name(), if fp8 { "FP8" } else { "BF16" }, sequences * drafter.block());
+    println!("  each anchor alone ({} rows): kept {:.3}", drafter.block(), alone_kept as f64 / n);
+    for (&(head, linear), (kept, same, same_alone, times)) in settings.iter().zip(&mut totals) {
+        times.sort_by(f64::total_cmp);
+        println!("  head {head:?}, linear {linear:?}: kept {:.3}, identical to the first setting {:.2}%, to the \
+            anchors' own {:.2}%, step median {:.3} ms (p10 {:.3}, p90 {:.3})", *kept as f64 / n,
+            100.0 * *same as f64 / n, 100.0 * *same_alone as f64 / n, 1e3 * times[times.len() / 2],
+            1e3 * times[times.len() / 10], 1e3 * times[times.len() * 9 / 10]);
+    }
+    Ok(())
+}
+
 /// Prefills the golden prompt's first --prefill tokens, then decodes one row
 /// per step (teacher-forced on tokens.bin, or greedy with --generate),
 /// drafting with DFlash2 before every step; reports the accepted prefix per
@@ -236,9 +395,11 @@ fn state_delta(a: &[u8], b: &[u8], recurrent_bytes: usize, element: usize) -> (u
     (differ, worst)
 }
 
-fn replay_bounds(tokens: usize, rows: usize, prefill: Option<usize>) -> Result<usize> {
-    ensure!(rows > 0 && rows <= super::engine::DECODE_ROWS && rows < tokens,
-        "--replay-check needs 1..={} rows and at least one prefill token", super::engine::DECODE_ROWS);
+/// The prefill before a `rows`-row check of `tokens` golden tokens on an engine of `decode_rows`
+/// decode rows (`--decode-rows`: up to 128 with the wide programs).
+fn replay_bounds(tokens: usize, rows: usize, prefill: Option<usize>, decode_rows: usize) -> Result<usize> {
+    ensure!(rows > 0 && rows <= decode_rows && rows < tokens,
+        "--replay-check needs 1..={decode_rows} rows (--decode-rows) and at least one prefill token");
     let prefill = prefill.unwrap_or(64).min(tokens - rows);
     ensure!(prefill > 0, "--replay-check needs at least one prefill token");
     Ok(prefill)
@@ -272,7 +433,7 @@ pub(super) fn geometry_trace(args: &GoldenArgs, engine: &GlmfEngine<'_>, dir: &s
     let sequence = tokens(args)?;
     let rows = args.step_rows;
     ensure!(rows > 1, "--geometry-trace needs --step-rows > 1");
-    let prefill = replay_bounds(sequence.len(), rows, args.prefill)?;
+    let prefill = replay_bounds(sequence.len(), rows, args.prefill, engine.decode_rows)?;
     let mut allocator = Allocator::new(engine.pages, engine.slots);
     let mut serial = allocator.admit(prefill + rows)?;
     let mut wide = allocator.admit(prefill + rows)?;
@@ -302,7 +463,7 @@ pub(super) fn geometry_trace(args: &GoldenArgs, engine: &GlmfEngine<'_>, dir: &s
 /// See `GoldenArgs::replay_check`.
 pub(super) fn replay_check(args: &GoldenArgs, engine: &GlmfEngine<'_>, rows: usize) -> Result<()> {
     let sequence = tokens(args)?;
-    let prefill = replay_bounds(sequence.len(), rows, args.prefill)?;
+    let prefill = replay_bounds(sequence.len(), rows, args.prefill, engine.decode_rows)?;
     ensure!(engine.slots >= 4, "--replay-check needs --slots >= 4");
     let embed = &sequence[prefill..prefill + rows];
     let family = super::prefix::GlmfPrefix::new(engine, super::prefix::PrefixMarks::Arena, |_| 0)?;
@@ -439,13 +600,17 @@ pub(super) fn replay_check(args: &GoldenArgs, engine: &GlmfEngine<'_>, rows: usi
 mod tests {
     #[test]
     fn replay_check_rejects_invalid_bounds_before_subtracting() {
-        assert!(super::replay_bounds(10, 11, None).is_err());
-        assert!(super::replay_bounds(0, 0, None).is_err());
-        assert!(super::replay_bounds(10, 0, None).is_err());
-        assert!(super::replay_bounds(10, 10, None).is_err());
-        assert!(super::replay_bounds(100, super::super::engine::DECODE_ROWS + 1, None).is_err());
-        assert!(super::replay_bounds(10, 4, Some(0)).is_err());
-        assert_eq!(super::replay_bounds(10, 4, Some(20)).unwrap(), 6);
+        use super::super::engine::{DECODE_ROWS, WIDE_DECODE_ROWS};
+        assert!(super::replay_bounds(10, 11, None, DECODE_ROWS).is_err());
+        assert!(super::replay_bounds(0, 0, None, DECODE_ROWS).is_err());
+        assert!(super::replay_bounds(10, 0, None, DECODE_ROWS).is_err());
+        assert!(super::replay_bounds(10, 10, None, DECODE_ROWS).is_err());
+        assert!(super::replay_bounds(200, DECODE_ROWS + 1, None, DECODE_ROWS).is_err());
+        assert!(super::replay_bounds(10, 4, Some(0), DECODE_ROWS).is_err());
+        assert_eq!(super::replay_bounds(10, 4, Some(20), DECODE_ROWS).unwrap(), 6);
+        // --decode-rows 128: up to 128 rows (`--replay-check 128`), with the 64-row default prefill.
+        assert_eq!(super::replay_bounds(400, WIDE_DECODE_ROWS, None, WIDE_DECODE_ROWS).unwrap(), 64);
+        assert!(super::replay_bounds(400, WIDE_DECODE_ROWS + 1, None, WIDE_DECODE_ROWS).is_err());
     }
 
     #[test]
@@ -478,18 +643,27 @@ pub(super) fn bench_verify(args: &GoldenArgs, engine: &GlmfEngine<'_>, max_rows:
     }).collect::<Result<Vec<_>>>()?;
     let starts: Vec<usize> = placements.iter().map(|p| p.len).collect();
     println!("verify cost, {count} distinct sequence(s) after {prefill} tokens (speculative steps, median of 7):");
-    for rows in 1..=max_rows {
-        if count * rows > super::engine::DECODE_ROWS {
-            break;
-        }
-        let tokens: Vec<u32> = (0..count).flat_map(|i| sequence[i + prefill..i + prefill + rows].iter().copied()).collect();
+    // Rows per sequence of every timed step: 1..=max_rows each while the step fits --decode-rows, and with
+    // the wide programs the verify budget's own step where it is not a multiple of the sequences (the
+    // remainder's rows go to the first sequences: 15 x 8 + 7 rows at 16 sequences on an RTX 5090).
+    let mut shapes: Vec<Vec<usize>> = (1..=max_rows).take_while(|&rows| count * rows <= engine.decode_rows)
+        .map(|rows| vec![rows; count]).collect();
+    let budget = engine.verify_rows;
+    if budget > super::engine::DECODE_ROWS && budget % count != 0 && budget / count < max_rows {
+        shapes.push((0..count).map(|i| budget / count + usize::from(i < budget % count)).collect());
+    }
+    for shape in shapes {
+        let total: usize = shape.iter().sum();
+        let tokens: Vec<u32> = shape.iter().enumerate()
+            .flat_map(|(i, &rows)| sequence[i + prefill..i + prefill + rows].iter().copied()).collect();
         let mut times = Vec::new();
         *engine.profile.borrow_mut() = [0.0; 3];
         for round in 0..9 {
             for (placement, &start) in placements.iter_mut().zip(&starts) {
                 placement.len = start;
             }
-            let mut step: Vec<(&mut GlmfPlacement, usize)> = placements.iter_mut().map(|p| (p, rows)).collect();
+            let mut step: Vec<(&mut GlmfPlacement, usize)> = placements.iter_mut().zip(&shape)
+                .map(|(p, &rows)| (p, rows)).collect();
             let timer = Instant::now();
             engine.verify_spec(&mut step, &tokens)?;
             if round >= 2 {
@@ -501,9 +675,100 @@ pub(super) fn bench_verify(args: &GoldenArgs, engine: &GlmfEngine<'_>, max_rows:
         times.sort_by(f64::total_cmp);
         let phases = std::mem::take(&mut *engine.profile.borrow_mut());
         let n = times.len() as f64;
-        println!("  {rows} rows/sequence ({} rows): {:.2} ms (min {:.2}); GPU until exchanges {:.2} ms, Spark exchanges \
-            {:.2} ms, head {:.2} ms", count * rows, 1e3 * times[times.len() / 2], 1e3 * times[0], 1e3 * phases[0] / n,
+        let per_sequence = if shape.iter().all(|&rows| rows == shape[0]) { shape[0].to_string() }
+            else { format!("{}..{}", shape[count - 1], shape[0]) };
+        println!("  {per_sequence} rows/sequence ({total} rows): {:.2} ms (min {:.2}); GPU until exchanges {:.2} ms, \
+            Spark exchanges {:.2} ms, head {:.2} ms", 1e3 * times[times.len() / 2], 1e3 * times[0], 1e3 * phases[0] / n,
             1e3 * phases[1] / n, 1e3 * phases[2] / n);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod draft_mode_tests {
+    use super::*;
+    use crate::families::glm5::DraftHead;
+    use crate::shared::fp8_linear::Fp8Rows;
+
+    #[test]
+    fn draft_modes_compare_both_heads_under_every_admitted_linear_mode() {
+        let all = draft_mode_settings(true, Fp8Rows::W8a8);
+        assert_eq!(all, [(DraftHead::Exact, Fp8Rows::W8a16), (DraftHead::Tensor, Fp8Rows::W8a16),
+            (DraftHead::Exact, Fp8Rows::Wide), (DraftHead::Tensor, Fp8Rows::Wide),
+            (DraftHead::Exact, Fp8Rows::W8a8), (DraftHead::Tensor, Fp8Rows::W8a8)]);
+        assert_eq!(draft_mode_settings(true, Fp8Rows::Wide).len(), 4);
+        assert_eq!(draft_mode_settings(true, Fp8Rows::W8a16), [(DraftHead::Exact, Fp8Rows::W8a16),
+            (DraftHead::Tensor, Fp8Rows::W8a16)]);
+        // A BF16 drafter has no FP8 GEMMs: the head alone.
+        assert_eq!(draft_mode_settings(false, Fp8Rows::W8a8), draft_mode_settings(true, Fp8Rows::W8a16));
+    }
+
+    /// A phase of [`draft_mode_schedule`] and the drafter mode it ran under.
+    #[derive(Debug, Clone, PartialEq)]
+    enum Phase {
+        Prefill { tokens: usize },
+        Advance { first: usize, rows: usize },
+        Draft { sequences: usize },
+    }
+
+    /// Records the mode active at every phase; drafts are the anchor repeated, so tallies count.
+    struct Recorder {
+        mode: DraftMode,
+        log: Vec<(Phase, DraftMode)>,
+    }
+
+    impl DraftModeSteps for Recorder {
+        fn set_mode(&mut self, mode: DraftMode) -> Result<()> {
+            self.mode = mode;
+            Ok(())
+        }
+        fn prefill(&mut self, tokens: &[u32]) -> Result<()> {
+            self.log.push((Phase::Prefill { tokens: tokens.len() }, self.mode));
+            Ok(())
+        }
+        fn advance(&mut self, first: usize, tokens: &[u32]) -> Result<()> {
+            self.log.push((Phase::Advance { first, rows: tokens.len() }, self.mode));
+            Ok(())
+        }
+        fn draft(&mut self, sequences: &[DraftSeq]) -> Result<Vec<Vec<u32>>> {
+            self.log.push((Phase::Draft { sequences: sequences.len() }, self.mode));
+            Ok(sequences.iter().map(|s| vec![s.anchor; 7]).collect())
+        }
+    }
+
+    /// The ring is filled under the reference (exact head, W8A16) only: before the first window
+    /// the drafter is in its load's mode (here tensor / W8A8), and after each window's settings
+    /// the last one (tensor / W8A8) would otherwise project the next window's context.
+    #[test]
+    fn draft_modes_build_every_context_under_the_reference_mode() {
+        let settings = draft_mode_settings(true, Fp8Rows::W8a8);
+        let mut steps = Recorder { mode: (DraftHead::Tensor, Fp8Rows::W8a8), log: Vec::new() };
+        let tokens: Vec<u32> = (0..64).collect();
+        // Prefill 10, windows of 3 anchors from 10 to 22, target steps of at most 2 rows.
+        let tally = draft_mode_schedule(&mut steps, &tokens, 10, 22, 3, 2, &settings).unwrap();
+        assert_eq!(tally.anchors, 12);
+        assert_eq!(tally.settings.len(), settings.len());
+        let mut log = steps.log.iter();
+        assert_eq!(log.next(), Some(&(Phase::Prefill { tokens: 10 }, REFERENCE_MODE)));
+        let mut done = 10;
+        for p in (10..22).step_by(3) {
+            // Context up to p + 1 (the window's last anchor reads up to p + 1), in steps of 2.
+            while done + 1 < p + 3 {
+                let rows = (p + 2 - done).min(2);
+                assert_eq!(log.next(), Some(&(Phase::Advance { first: done, rows }, REFERENCE_MODE)), "window {p}");
+                done += rows;
+            }
+            for _ in 0..3 {
+                assert_eq!(log.next(), Some(&(Phase::Draft { sequences: 1 }, REFERENCE_MODE)), "window {p}");
+            }
+            for &mode in &settings {
+                assert_eq!(log.next(), Some(&(Phase::Draft { sequences: 3 }, mode)), "window {p}");
+            }
+        }
+        assert_eq!(log.next(), None);
+        // Every phase that writes the ring ran under the reference.
+        assert!(steps.log.iter().all(|(phase, mode)| matches!(phase, Phase::Draft { .. }) || *mode == REFERENCE_MODE));
+        // A schedule whose first setting is not the reference is refused.
+        assert!(draft_mode_schedule(&mut steps, &tokens, 10, 22, 3, 2, &settings[1..]).is_err());
+    }
 }

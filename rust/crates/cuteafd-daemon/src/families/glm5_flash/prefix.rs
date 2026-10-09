@@ -41,9 +41,10 @@
 //! replicated MLA projection and indexer write them) and each its own KDA heads' state: page
 //! copies run on each GPU's stream, a mark holds both GPUs' halves (an arena per GPU, or each
 //! GPU's copy of the mark's units), and the host tier is off.
-use super::engine::{GlmfEngine, GlmfPlacement, PagedLayer, KEY_BYTES, KPOOL, PAGE_ROWS, RECORD_BYTES, UNIT_PAGES,
-    UNIT_ROWS};
+use super::engine::{GlmfEngine, GlmfPlacement, IndexCache, KdaState, PagedLayer, KEY_BYTES, KPOOL, PAGE_ROWS,
+    RECORD_BYTES, UNIT_PAGES, UNIT_ROWS};
 use crate::shared::memory::DeviceAllocation;
+use crate::shared::prefix::MarkRule;
 use crate::shared::prefix::view;
 use anyhow::{ensure, Context, Result};
 use cuteafd_engine::prefix::{BoxError, FamilyLayout, MarkSlot, MarkStore, PrefixFamily, ReuseRule, TailCopy};
@@ -66,6 +67,54 @@ pub(crate) enum PrefixMarks {
     Arena,
     /// Units of the KV pool, taken at capture and evicted like any snapshot's rows.
     Pool,
+}
+
+impl PrefixMarks {
+    /// Where marks live with `entries` retained snapshots per bank. Without entries no mark is
+    /// ever taken, so there is no store: pool marks keep no unit back and need no room in the
+    /// pool, as an arena of no entries holds no mark.
+    pub fn with_entries(self, entries: usize) -> Self {
+        if entries == 0 { Self::Arena } else { self }
+    }
+}
+
+/// The prefix mark arena a command allocates on every GPU (a head split's GPUs each their part
+/// of every mark), which either KV admission reserves before the pool.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum ArenaMarks {
+    /// No arena: pool marks, or no prefix cache.
+    #[default]
+    None,
+    /// A fixed count (`glmf-golden --resume-at` takes two).
+    Slots(usize),
+    /// serve-glmf's prefix cache: the arena rule with its knobs, over one mark.
+    Rule(MarkRule),
+}
+
+impl ArenaMarks {
+    /// Slots for marks of `mark_bytes` (every rank's part of one mark). `prefix_cache` sizes the
+    /// arena with this from the engine's own slot regions.
+    pub fn slots(self, mark_bytes: usize) -> usize {
+        match self {
+            Self::None => 0,
+            Self::Slots(slots) => slots,
+            Self::Rule(rule) => rule.slots(mark_bytes),
+        }
+    }
+
+    /// Slots on the layout an engine serves, from the checkpoint alone, before the engine
+    /// exists: either KV admission reserves this count. `index_cache` must be the cache the
+    /// engine builds, not the one requested (a head split keeps the token keys, whose marks are
+    /// smaller than compact ones, so a byte budget can hold one mark more): its marks are then
+    /// the engine's slot regions, and this count is the arena `prefix_cache` allocates.
+    pub fn slots_on(self, cfg: &cuteafd_loader::families::glm5_flash::GlmNextConfig, layers: usize,
+        index_cache: IndexCache, kda_state: KdaState) -> Result<usize> {
+        let Self::Rule(_) = self else { return Ok(self.slots(0)) };
+        let geometry = cuteafd_loader::serving_capacity::glm_flash_rank_cache_geometry(cfg, layers, 1,
+            index_cache.into(), kda_state.bytes() as u64)?;
+        let mark = geometry.ranks.first().context("GLM 5.3 Flash cache geometry without a rank")?.retained_mark_bytes;
+        Ok(self.slots(usize::try_from(mark)?))
+    }
 }
 
 pub(crate) struct GlmfPrefix<'e, 'a> {
@@ -755,7 +804,7 @@ mod tests {
     /// are the `prefix` ledger scopes a 32 GB card measured at 8 and 16 sequences.
     #[test]
     fn the_planner_reserves_the_marks_and_replay_records_the_engine_allocates() {
-        use super::super::engine::{kda_layer_bytes, IndexCache, KdaState, KEY_BYTES, TAIL_BYTES};
+        use super::super::engine::{kda_layer_bytes, IndexCache, KdaState, DECODE_ROWS, KEY_BYTES, TAIL_BYTES};
         use crate::shared::prefix::PrefixArgs;
         use clap::Parser;
         use cuteafd_loader::families::glm5_flash::GlmNextAttention;
@@ -771,7 +820,7 @@ mod tests {
         for (ranks, state) in [(1, KdaState::F32), (2, KdaState::F32), (1, KdaState::Bf16)] {
             let geometry = glm_flash_rank_cache_geometry(&cfg, cfg.layers, ranks, GlmfIndexCache::Keys,
                 state.bytes() as u64).unwrap();
-            let (state, conv, replay) = kda_layer_bytes(&cfg, cfg.kda_heads / ranks, state);
+            let (state, conv, replay) = kda_layer_bytes(&cfg, cfg.kda_heads / ranks, state, DECODE_ROWS);
             let rank = &geometry.ranks[0];
             assert_eq!((rank.retained_mark_bytes, rank.active_state_per_sequence_bytes),
                 ((kda * (state + conv)) as u64, (kda * (state + conv)) as u64));
@@ -782,15 +831,15 @@ mod tests {
         for state in [KdaState::F32, KdaState::Bf16] {
             let compact = glm_flash_rank_cache_geometry(&cfg, cfg.layers, 1, GlmfIndexCache::Compact,
                 state.bytes() as u64).unwrap();
-            let (state, conv, replay) = kda_layer_bytes(&cfg, cfg.kda_heads, state);
+            let (state, conv, replay) = kda_layer_bytes(&cfg, cfg.kda_heads, state, DECODE_ROWS);
             let rank = &compact.ranks[0];
             let slot = kda * (state + conv) + mla * TAIL_BYTES;
             assert_eq!((rank.retained_mark_bytes, rank.active_state_per_sequence_bytes), (slot as u64, slot as u64));
             assert_eq!(rank.speculative_replay_bytes, (kda * replay + mla * 64 * KEY_BYTES) as u64);
         }
-        let (state, conv, replay) = kda_layer_bytes(&cfg, cfg.kda_heads, KdaState::F32);
+        let (state, conv, replay) = kda_layer_bytes(&cfg, cfg.kda_heads, KdaState::F32, DECODE_ROWS);
         let mark = kda * (state + conv);
-        let bf16 = kda * (kda_layer_bytes(&cfg, cfg.kda_heads, KdaState::Bf16).0 + conv);
+        let bf16 = kda * (kda_layer_bytes(&cfg, cfg.kda_heads, KdaState::Bf16, DECODE_ROWS).0 + conv);
         assert_eq!((mark, bf16, kda * replay, mla * 64 * KEY_BYTES), (147_619_840, 76_316_672, 321_421_312, 360_448));
         let prefix = Cli::parse_from(["serve"]).prefix;
         for (lanes, f32_slots, bf16_slots) in [(4, 14, 28), (8, 18, 28), (16, 34, 34), (64, 130, 130)] {
@@ -798,7 +847,7 @@ mod tests {
                 (IndexCache::Compact, KdaState::F32, mark + mla * TAIL_BYTES, f32_slots),
                 (IndexCache::Keys, KdaState::Bf16, bf16, bf16_slots),
                 (IndexCache::Compact, KdaState::Bf16, bf16 + mla * TAIL_BYTES, bf16_slots)] {
-                let planned = super::super::serve::arena_mark_slots(&prefix, &cfg, cfg.layers, lanes, index, state)
+                let planned = super::ArenaMarks::Rule(prefix.mark_rule(lanes)).slots_on(&cfg, cfg.layers, index, state)
                     .unwrap();
                 let allocated = cuteafd_engine::prefix::MarkArena::slots_for(lanes, prefix.prefix_cache_entries, mark,
                     prefix.prefix_cache_mark_mib << 20);
@@ -811,7 +860,7 @@ mod tests {
         let arena = |lanes, index: IndexCache, state: KdaState| {
             let mark = glm_flash_rank_cache_geometry(&cfg, cfg.layers, 1, index.into(), state.bytes() as u64).unwrap()
                 .ranks[0].retained_mark_bytes as usize;
-            super::super::serve::arena_mark_slots(&prefix, &cfg, cfg.layers, lanes, index, state).unwrap() * mark
+            super::ArenaMarks::Rule(prefix.mark_rule(lanes)).slots_on(&cfg, cfg.layers, index, state).unwrap() * mark
         };
         assert_eq!(arena(8, IndexCache::Keys, KdaState::F32), 2_657_157_120);
         assert_eq!(arena(16, IndexCache::Keys, KdaState::F32), 5_019_074_560);
@@ -820,8 +869,117 @@ mod tests {
         assert_eq!(arena(16, IndexCache::Keys, KdaState::Bf16), 2_594_766_848);
         assert_eq!(arena(16, IndexCache::Keys, KdaState::F32) - 18 * mark, 2_361_917_440);
         let off = PrefixArgs { prefix_cache_entries: 0, ..prefix };
-        assert_eq!(super::super::serve::arena_mark_slots(&off, &cfg, cfg.layers, 16, IndexCache::Keys, KdaState::F32)
-            .unwrap(), 0);
+        assert_eq!(super::ArenaMarks::Rule(off.mark_rule(16))
+            .slots_on(&cfg, cfg.layers, IndexCache::Keys, KdaState::F32).unwrap(), 0);
+    }
+
+    /// The engine's own mark (`slot_regions_on` summed over its GPUs, as `GlmfPrefix::new` sums
+    /// them): every KDA layer's state and conv window over each GPU's heads, and with the compact
+    /// index cache (one GPU) every MLA layer's index tail.
+    fn engine_mark(cfg: &cuteafd_loader::families::glm5_flash::GlmNextConfig, ranks: usize,
+        index: super::IndexCache, state: super::KdaState) -> (Vec<usize>, usize) {
+        use cuteafd_loader::families::glm5_flash::GlmNextAttention;
+        let kda = cfg.attention.iter().filter(|&&a| a == GlmNextAttention::Kda).count();
+        let mla = cfg.attention.iter().filter(|&&a| a == GlmNextAttention::Mla).count();
+        let (state, conv, _) = super::super::engine::kda_layer_bytes(cfg, cfg.kda_heads / ranks, state, super::super::engine::DECODE_ROWS);
+        let tails = if index == super::IndexCache::Compact { mla * super::super::engine::TAIL_BYTES } else { 0 };
+        let parts = vec![kda * (state + conv) + tails; ranks];
+        let mark = parts.iter().sum();
+        (parts, mark)
+    }
+
+    /// The prefix mark arena under a head split with `--index-cache compact`: the engine keeps
+    /// the token keys (`served_index_cache`), so its marks have no index tails and are 17,072 B
+    /// smaller. With a 1,971 MiB budget, at most 5 lanes and at least 6 entries, the budget holds
+    /// 14 of them but only 13 compact marks: the admission counted on the requested cache
+    /// reserved 13 and `prefix_cache` refused its 14 after allocation. Counted on the layout the
+    /// engine serves, both sides are 14, and each GPU reserves its half of every mark.
+    #[test]
+    fn a_head_split_counts_its_mark_arena_on_the_token_keys_it_serves() {
+        use super::super::engine::{IndexCache, KdaState};
+        use super::super::served_index_cache;
+        use cuteafd_loader::serving_capacity::glm_flash_rank_cache_geometry;
+        let cfg = glm53_flash();
+        let served = served_index_cache(IndexCache::Compact, true);
+        assert_eq!((served, served_index_cache(IndexCache::Compact, false)), (IndexCache::Keys, IndexCache::Compact));
+        let (parts, mark) = engine_mark(&cfg, 2, served, KdaState::F32);
+        let compact = engine_mark(&cfg, 1, IndexCache::Compact, KdaState::F32).1;
+        assert_eq!((parts[0], mark, compact), (73_809_920, 147_619_840, 147_636_912));
+        let budget = 1971u64 << 20;
+        assert!(14 * mark as u64 <= budget && 14 * compact as u64 > budget);
+        for lanes in 1..=5 {
+            for entries in [6, 7, 20, 64] {
+                let arena = super::ArenaMarks::Rule(crate::shared::prefix::MarkRule { lanes, entries,
+                    budget_bytes: budget });
+                let planned = arena.slots_on(&cfg, cfg.layers, served, KdaState::F32).unwrap();
+                assert_eq!((planned, arena.slots(mark)), (14, 14), "{lanes} lanes, {entries} entries");
+                // The count on the cache requested: one short of the arena allocated.
+                assert_eq!(arena.slots_on(&cfg, cfg.layers, IndexCache::Compact, KdaState::F32).unwrap(), 13);
+                // Each GPU's planned reserve is its part of every mark: the arena it allocates.
+                let split = glm_flash_rank_cache_geometry(&cfg, cfg.layers, 2, served.into(), 4).unwrap();
+                for (rank, part) in split.ranks.iter().zip(&parts) {
+                    assert_eq!(planned as u64 * rank.retained_mark_bytes, (14 * part) as u64);
+                }
+            }
+        }
+    }
+
+    /// Either KV admission's arena count (on the checkpoint's geometry of the layout the engine
+    /// serves) is the count `prefix_cache` sizes over the engine's own marks, and its bytes on
+    /// every GPU the arena's, for a head split or one GPU, either index cache requested, FP32 and
+    /// BF16 state, and budgets that do and do not bind.
+    #[test]
+    fn planned_mark_arena_is_the_runtime_arena_on_every_layout() {
+        use super::super::engine::{IndexCache, KdaState};
+        use cuteafd_loader::serving_capacity::glm_flash_rank_cache_geometry;
+        let cfg = glm53_flash();
+        let mut binding = 0;
+        for split in [false, true] {
+            for requested in [IndexCache::Keys, IndexCache::Compact] {
+                let served = super::super::served_index_cache(requested, split);
+                let ranks = if split { 2 } else { 1 };
+                for state in [KdaState::F32, KdaState::Bf16] {
+                    let (parts, mark) = engine_mark(&cfg, ranks, served, state);
+                    let geometry = glm_flash_rank_cache_geometry(&cfg, cfg.layers, ranks, served.into(),
+                        state.bytes() as u64).unwrap();
+                    for mib in [0, 1000, 1971, 2048, 4096] {
+                        for lanes in [1, 4, 5, 8, 16, 64] {
+                            for entries in [0, 6, 20] {
+                                let rule = crate::shared::prefix::MarkRule { lanes, entries, budget_bytes: mib << 20 };
+                                let arena = super::ArenaMarks::Rule(rule);
+                                let planned = arena.slots_on(&cfg, cfg.layers, served, state).unwrap();
+                                let allocated = arena.slots(mark);
+                                assert_eq!(planned, allocated, "split {split}, {requested:?}, {state:?}, {mib} MiB, \
+                                    {lanes} lanes, {entries} entries");
+                                for (rank, part) in geometry.ranks.iter().zip(&parts) {
+                                    assert_eq!(planned as u64 * rank.retained_mark_bytes, (allocated * part) as u64);
+                                }
+                                binding += usize::from(entries > 0 && planned < 2 * entries + 2
+                                    && planned > 2 * lanes + 2);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // Budgets that bind between the lane floor and the entries' wish (the rounding at stake).
+        assert!(binding > 0);
+        // A fixed count, or none, stands on any layout.
+        assert_eq!(super::ArenaMarks::Slots(2).slots_on(&cfg, cfg.layers, IndexCache::Compact, KdaState::F32)
+            .unwrap(), 2);
+        assert_eq!(super::ArenaMarks::None.slots_on(&cfg, cfg.layers, IndexCache::Keys, KdaState::F32).unwrap(), 0);
+    }
+
+    /// Without entries no mark is taken: pool marks need no room in the pool and keep no unit
+    /// back, and the arena rule sizes no arena.
+    #[test]
+    fn no_entries_take_no_prefix_marks() {
+        use super::PrefixMarks;
+        assert_eq!(PrefixMarks::Pool.with_entries(0), PrefixMarks::Arena);
+        assert_eq!(PrefixMarks::Pool.with_entries(1), PrefixMarks::Pool);
+        assert_eq!(PrefixMarks::Arena.with_entries(0), PrefixMarks::Arena);
+        let rule = crate::shared::prefix::MarkRule { lanes: 16, entries: 0, budget_bytes: 2 << 30 };
+        assert_eq!(super::ArenaMarks::Rule(rule).slots(147_619_840), 0);
     }
 
     /// Pool marks off the GPU: a mark laid out buffer by buffer over its units round trips

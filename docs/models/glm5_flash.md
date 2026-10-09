@@ -80,6 +80,25 @@ Attention (KDA), a minority run MLA + DSA.
   same bits, with the weight words staged L2 evict-first (the b12x `gb10`
   decode schedule) and, at m80, 64x128 tiles at two CTAs per SM. On a GB10,
   an expert call at 1-80 rows took 1.4-11.2% less time than the default's.
+- 128-row decode and verify steps: `GLM5_FLASH_DECODE_ROWS=128`
+  (`--decode-rows 128`, opt-in, one GPU; a build with the default
+  `CUTEAFD_GLMF_WIDE_DECODE_ROWS=128`) runs steps of 65-128 rows on the
+  `*_m128` programs and records 128-row replay records for their commits;
+  steps of up to 64 rows keep the `_m64` programs, their bits and speed. A
+  verify step schedules up to the GPU's whole sparse MLA waves (127 rows on an
+  RTX 5090, 128 on 188 SMs), so 16 sequences verify 6-7 drafts each instead of
+  3; the speculative startup graph set ends at that budget. The decode
+  workspace, token selector and replay records hold 128 rows (321 MB more
+  records on one GPU, charged by every KV admission and `cuteafd plan
+  --layout --decode-rows 128`). With `GLM5_FLASH_REPLAY_RECORDS=shared` the
+  KDA records of 128 rows (642,842,624 B) still fit the 782,236,672-byte
+  prefill scratch, so they take no memory of their own. Start-up loads the
+  `*_m128` programs only with 128 rows. Every routed-expert resource (the
+  dense NVFP4 package, local FP8 or EXL3 experts, the Spark transports and
+  their intake planes) holds the widest step, `max(--prefill-rows,
+  --decode-rows)`, so prefill lanes narrower than 128 rows still take a
+  127-row verify step through the experts. The launcher passes the decode
+  rows to the encoder placement plan as well as to serving.
 - Prefix cache: merged — 256-row units (4 MLA pages plus the pool page) and
   a KDA recurrent-state mark at the commit point (`kda_len`). Marks live in a
   device arena of 2C + 2 marks (147.6 MB each with an FP32 state), which both

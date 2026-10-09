@@ -1,0 +1,136 @@
+//! Resolve checkpoint-full context before constructing API or engine limits.
+use anyhow::{ensure, Context, Result};
+use std::path::Path;
+
+pub(crate) fn checkpoint_context(snapshot: &Path, manifest: &Path, family: &str, requested: usize) -> Result<usize> {
+    let config = serde_json::from_slice(&std::fs::read(snapshot.join("config.json"))?)?;
+    let checkpoint: usize = cuteafd_loader::serving_capacity::checkpoint_context_limit(&config)?
+        .with_context(|| format!("{family} checkpoint lacks max_position_embeddings"))?.try_into()?;
+    let compiled = if family == "mimo_v2" { None } else {
+        let value: serde_json::Value = serde_json::from_slice(&std::fs::read(manifest)?)?;
+        Some(usize::try_from(value["capacities"]["max_context"].as_u64()
+            .filter(|&n| n > 0).context("program manifest lacks positive capacities.max_context")?)?)
+    };
+    let supported = compiled.map_or(checkpoint, |n| n.min(checkpoint));
+    if requested == 0 {
+        if supported < checkpoint {
+            tracing::warn!(family, checkpoint_context = checkpoint, compiled_context = supported,
+                "checkpoint context exceeds compiled support; serving the compiled context extent");
+        }
+        Ok(supported)
+    } else {
+        ensure!(requested <= supported,
+            "{family}: requested context {requested} exceeds checkpoint/compiled support {supported} (checkpoint {checkpoint}); lower MAX_CONTEXT_TOKENS or export wider programs");
+        Ok(requested)
+    }
+}
+
+pub(crate) fn pool_context(family: &str, context: usize, automatic: bool, pool: usize, unit: usize) -> Result<usize> {
+    if context <= pool { return Ok(context); }
+    ensure!(automatic, "{family}: explicit context {context} > admitted pool supports {pool}; set POOL_TOKENS/MAX_CONTEXT_TOKENS to change");
+    let supported = pool.saturating_sub(unit.max(64));
+    ensure!(supported > 0, "{family}: admitted pool {pool} cannot hold one request plus its safety margin");
+    tracing::warn!(family, checkpoint_context = context, admitted_pool = pool, max_context = supported,
+        "checkpoint context exceeds admitted pool; serving reduced max_context; set POOL_TOKENS/MAX_CONTEXT_TOKENS to change");
+    Ok(supported)
+}
+
+/// Preserve the established short-context allocation buckets, but do not key a
+/// long decode by unused pages reserved beyond its live power-of-two bucket.
+pub(crate) fn decode_allocation_units(allocated: usize, live_tokens: usize, unit: usize) -> usize {
+    allocated.min(live_tokens.max(131_072).div_ceil(unit).next_power_of_two())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn long_decode_allocations_follow_live_geometric_buckets() {
+        for unit in [64, 256] {
+            for tokens in [1usize, 8192, 131072] {
+                for allocation in [1usize, 17, 131072 / unit] {
+                    assert_eq!(decode_allocation_units(allocation, tokens, unit), allocation);
+                }
+            }
+            for (tokens, bucket) in [(131073usize, 262144), (200000, 262144),
+                (300000, 524288), (600000, 1048576)] {
+                assert_eq!(decode_allocation_units(1048576 / unit, tokens, unit), bucket / unit);
+            }
+        }
+    }
+
+    #[test]
+    fn every_family_zero_resolves_checkpoint_context_and_explicit_wins() {
+        for (family, model_type, tokens) in [("glm5", "glm_moe_dsa", 202752),
+            ("glm5_flash", "glm_moe_dsa", 131072), ("qwen4", "qwen3_next", 262144),
+            ("deepseek_v4", "deepseek_v4", 1048576), ("mimo_v2", "mimo_v2", 1048576)] {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join("config.json"), serde_json::json!({
+                "model_type": model_type, "max_position_embeddings": tokens }).to_string()).unwrap();
+            let manifest = dir.path().join("PROGRAMS.json");
+            std::fs::write(&manifest, r#"{"capacities":{"max_context":2097152}}"#).unwrap();
+            assert_eq!(checkpoint_context(dir.path(), &manifest, family, 0).unwrap(), tokens);
+            assert_eq!(checkpoint_context(dir.path(), &manifest, family, 32768).unwrap(), 32768);
+            assert!(checkpoint_context(dir.path(), &manifest, family, tokens + 1).is_err());
+        }
+    }
+
+    #[test]
+    fn c128_stride_stays_compiled_when_pool_or_explicit_context_is_smaller() {
+        for family in ["dsv4f", "dsv4p"] {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join("config.json"), r#"{"max_position_embeddings":1048576}"#).unwrap();
+            let value = serde_json::json!({"capacities": {"max_context": 131072}, "programs": [
+                {"family": family, "name": format!("{family}_sparse_mla_decode_c128_m64"),
+                 "params": {"indexed_width": 1024}},
+                {"family": family, "name": format!("{family}_sparse_mla_prefill_c128_m4096"),
+                 "params": {"indexed_width": 1024}}
+            ]});
+            let path = dir.path().join("PROGRAMS.json");
+            std::fs::write(&path, value.to_string()).unwrap();
+            let full = checkpoint_context(dir.path(), &path, "deepseek_v4", 0).unwrap();
+            assert_eq!(pool_context("deepseek_v4", full, true, 32768, 256).unwrap(), 32512);
+            assert_eq!(checkpoint_context(dir.path(), &path, "deepseek_v4", 16384).unwrap(), 16384);
+            assert_eq!(cuteafd_loader::serving_capacity::compiled_c128_width(&value, family).unwrap(), 1024);
+            let mut bad = value.clone();
+            bad["programs"][1]["params"]["indexed_width"] = 128.into();
+            assert!(cuteafd_loader::serving_capacity::compiled_c128_width(&bad, family).is_err());
+        }
+    }
+
+    #[test]
+    fn every_indexed_family_clamps_old_exports_and_lifts_with_one_million() {
+        for (family, checkpoint) in [("deepseek_v4", 1048576), ("glm5", 1048576),
+            ("glm5_flash", 1048576), ("qwen4", 262144)] {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join("config.json"), serde_json::json!({
+                "max_position_embeddings": checkpoint }).to_string()).unwrap();
+            let path = dir.path().join("PROGRAMS.json");
+            for extent in [131072, 1048576] {
+                std::fs::write(&path, serde_json::json!({"capacities": {
+                    "max_context": extent }}).to_string()).unwrap();
+                let supported = extent.min(checkpoint);
+                assert_eq!(checkpoint_context(dir.path(), &path, family, 0).unwrap(), supported);
+                assert!(checkpoint_context(dir.path(), &path, family, supported + 1).is_err());
+                let limits = cuteafd_api::native_v41::NativeLimits::new(supported as u32, 1024).unwrap();
+                assert_eq!(limits.context(), supported as u32);
+                assert!(limits.output_for_prompt(supported + 1, 1).is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn defaults_clamp_to_compiled_support_and_pool_with_margin_but_explicit_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("config.json"), r#"{"text_config":{"max_position_embeddings":1048576}}"#).unwrap();
+        let manifest = dir.path().join("PROGRAMS.json");
+        std::fs::write(&manifest, r#"{"capacities":{"max_context":131072}}"#).unwrap();
+        assert_eq!(checkpoint_context(dir.path(), &manifest, "qwen4", 0).unwrap(), 131072);
+        assert!(checkpoint_context(dir.path(), &manifest, "qwen4", 131073).is_err());
+        assert_eq!(pool_context("mimo_v2", 1048576, true, 962560, 64).unwrap(), 962496);
+        assert!(pool_context("mimo_v2", 1048576, false, 962560, 64).is_err());
+        assert_eq!(pool_context("glm5", 32768, false, 65536, 256).unwrap(), 32768);
+        assert!(pool_context("glm5", 131072, true, 64, 256).is_err());
+    }
+}

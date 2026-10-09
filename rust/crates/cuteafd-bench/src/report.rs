@@ -48,6 +48,14 @@ pub struct Report {
 }
 
 impl Report {
+    /// A planner-only rejection has no measured baseline or performance values.
+    pub fn no_fit_reason(&self) -> Option<&str> {
+        (self.baseline.is_none() && self.status == RunStatus::Failed)
+            .then(|| self.server.setting("qualification.no-fit"))
+            .flatten()
+            .filter(|reason| !reason.is_empty())
+    }
+
     /// True when the baseline's quality gate failed: every view and export of
     /// this report carries the warning.
     pub fn quality_failed(&self) -> bool {
@@ -102,6 +110,45 @@ pub struct ServerInfo {
     /// RFC 3339 UTC of the server's start.
     #[serde(default)]
     pub started: Option<String>,
+}
+
+impl ServerInfo {
+    pub fn setting(&self, name: &str) -> Option<&str> {
+        self.configuration.settings.iter().find(|s| s.name == name)
+            .and_then(|s| s.value.as_deref())
+    }
+
+    pub fn coordinator_budget(&self) -> Option<f64> {
+        self.setting("coordinator-gpu-budget-gib")?.parse::<f64>().ok()
+            .filter(|gib| gib.is_finite() && *gib > 0.0)
+    }
+
+    pub fn simulated_5090(&self) -> bool {
+        self.setting("simulated") == Some("5090")
+    }
+
+    pub fn column_5090(&self) -> bool {
+        self.simulated_5090() || self.setting("hardware.class") == Some("5090")
+    }
+
+    pub fn hardware_line(&self) -> String {
+        if self.simulated_5090() {
+            let sms = self.hardware.gpus.iter().find(|g| g.used)
+                .or_else(|| self.hardware.gpus.first()).and_then(|g| g.sm_count);
+            let sms = sms.map(|v| format!(" ({v} SMs)")).unwrap_or_default();
+            let cap = self.coordinator_budget().map(|g| format!(" capped at {g} GiB"))
+                .unwrap_or_else(|| " (memory cap unknown)".into());
+            let sparks = if self.hardware.sparks.is_empty() { String::new() }
+                else { format!(" + {} Spark", self.hardware.sparks.len()) };
+            format!("simulated 5090: RTX PRO 6000{sms}{cap}{sparks}")
+        } else {
+            let mut line = self.hardware.line();
+            if let Some(gib) = self.coordinator_budget() {
+                line.push_str(&format!(" · {gib} GiB budget"));
+            }
+            line
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]

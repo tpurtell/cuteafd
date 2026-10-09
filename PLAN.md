@@ -1744,6 +1744,39 @@ item-4 bugs and started items 7 and 10; commit messages carry its evidence.
 12. **Housekeeping**: prune agent test images on raptor; delete
     `~/.cache/cuteafd/builds/{n10-rel,bisect-rel}` on ostrich (root).
 
+## Release v3 scope (decided 2026-10-09)
+
+TJ: two key items, both urgent right after v2.0.0.
+1. **Multi-GPU coordinator placement and memory management for every family.**
+   One shared design replaces today's per-family patchwork:
+   - **TP2 RTX expert layers.** With two RTX, each RTX-resident routed-expert
+     layer runs as two halves, one per GPU (split on the intermediate
+     dimension). Each half is added into the per-layer all-reduce the head
+     split already does, so it costs no extra peer hops. Today only V4.1 has
+     TP2 RTX experts, in its own code; MiMo, GLM 5.3, GLM Flash and V4 keep
+     routed experts on GPU0 or the Sparks, leaving GPU1 mostly empty
+     (MiMo Pro 2 RTX + 6 uses 15 of 95 GiB on GPU1).
+   - **Attention handling.** Use the head split where it pays (measured: V4
+     decode -10/-12%, MiMo Pro -41% coordinator-only, GLM 5.3 -9.5%). Add
+     Qwen's head split. V4.1's choice is settled by item 2.
+   - **Memory management.** One admission solver for every family:
+     - reserve the KV pool first (2M PRO / 1M <=32 GB);
+     - then graphs and workspaces;
+     - then RTX expert layers, TP2 across both GPUs, with non-split items
+       (drafter, encoders) moved to balance the two GPUs;
+     - the planner equals the runtime admission, with a test per family.
+   - **Starting point:** work/v4-placement b2f26af9 (pool-first solver,
+     planner/runtime equality) and `builds/v4-placement/SUMMARY.md` (V4 TP2
+     design and kernel/loader audit). V4 Flash/Pro measured in rc1:
+     KV pool 581K-1.39M tokens because experts are placed first, GPU1
+     13-24 of 90 GiB used.
+2. **Retire ds41rt: V4.1 moves onto shared infrastructure** (below, "First
+   after v2"). V4.1's TP2 expert layers and memory placement are inputs to
+   item 1; build the shared versions once, not twice.
+Gate per family: golden/fidelity, then the quick A/B at the 2M operating
+point on the min and max reference configs. Requalify each family's cards
+as it moves.
+
 ## Explore after v2
 
 Ideas TJ wants kept for later; not v2 work.

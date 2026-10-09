@@ -37,8 +37,8 @@ pub(crate) struct EngineArgs {
     /// Run only the first N layers (dense layers need no experts).
     #[arg(long)]
     pub layers: Option<usize>,
-    /// Longest sequence (the RoPE table and page tables).
-    #[arg(long, default_value_t = 32768)]
+    /// Longest sequence; 0 selects checkpoint full, bounded by compiled support and the admitted pool.
+    #[arg(long, default_value_t = 0)]
     pub max_context: usize,
     /// Tokens the shared latent/index cache pool holds across sequences; 0
     /// sizes it from what every GPU has left after weights and the planner's
@@ -250,6 +250,11 @@ impl Opened {
     pub fn with_engine<T>(&self, args: &EngineArgs,
         body: impl FnOnce(&engine::GlmEngine<'_>, Option<&mut SparkLink<'_>>, &tokio::runtime::Runtime) -> Result<T>)
         -> Result<T> {
+        let automatic_context = args.max_context == 0;
+        let mut context_args = args.clone();
+        context_args.max_context = crate::shared::context::checkpoint_context(
+            &args.snapshot, &args.manifest, "glm5", args.max_context)?;
+        let args = &context_args;
         let programs = self.library.programs()?.with_manifest(&args.manifest)?;
         programs.capacities().require_context("glm5", args.max_context)?;
         programs.load_all()?;
@@ -301,13 +306,14 @@ impl Opened {
                     if args.full_prefill_logits { cuteafd_loader::plan::layout::full_prefill_logits_bytes_with_lanes(
                         "glm5", args.prefill_rows as u64, self.cfg.vocab_size as u64,
                         if args.peers.is_some() { engine::configured_lanes() } else { 1 }) } else { 0 }),
-                Default::default(), 4)?
+                Default::default(), 4, cuteafd_loader::serving_capacity::GLMF_DECODE_ROWS)?
         } else {
             args.pool_tokens
         };
+        let max_context = crate::shared::context::pool_context("glm5", args.max_context, automatic_context, pool_tokens, 256)?;
         let pages = pool_tokens.div_ceil(engine::PAGE_ROWS);
         let mut engine = engine::GlmEngine::new(&self.library, &programs, self.cfg.clone(), model, stream,
-            args.max_context, args.prefill_rows, pages, embedding)?;
+            max_context, args.prefill_rows, pages, embedding)?;
         engine.full_prefill_logits = args.full_prefill_logits;
         if let Some((device, stream)) = peer_stream {
             engine.attach_peer(device, stream, shares.pop().context("head-split shares")?)?;
@@ -328,7 +334,7 @@ impl Opened {
                 ::from_fp8_option(args.draft_fp8);
             let drafter = dflash::GlmDrafter::load(&self.library, snapshot, file, stream,
                 args.draft_context_slots.unwrap_or(20.max(args.draft_sequences)), args.draft_sequences,
-                mask, false, representation, args.fp8_scales)?;
+                mask, false, representation, args.fp8_scales, crate::shared::fp8_linear::Fp8Rows::W8a16)?;
             engine.drafter = Some(drafter);
             tracing::info!(elapsed_ms = started.elapsed().as_millis() as u64, "DFlash2 drafter resident");
         }
@@ -426,7 +432,7 @@ impl Opened {
     }
 }
 
-/// Vocabulary head of `rows` rows: 2..=16 rows on the few-row FP32 kernel
+/// Vocabulary head of `rows` rows: 2..=24 rows on the few-row FP32 kernel
 /// (one read of the head per 8 rows), others on the pedantic cuBLAS head;
 /// CUTEAFD_GLM_HEAD=cublas keeps every row count on cuBLAS.
 ///
@@ -440,12 +446,108 @@ pub(crate) unsafe fn launch_head(library: &NativeLibrary, head: &cuteafd_ffi::pr
     stream: *mut c_void) -> Result<()> {
     static CUBLAS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let cublas = *CUBLAS.get_or_init(|| std::env::var("CUTEAFD_GLM_HEAD").is_ok_and(|v| v == "cublas"));
-    if !cublas && (2..=cuteafd_ffi::VOCAB_HEAD_ROWS_MAX).contains(&rows) {
+    if head_route(DraftHead::Exact, rows, cublas) == HeadRoute::FewRows {
         // SAFETY: the caller's contract.
         return unsafe { library.vocab_head_rows(x, weight, logits, rows, width, vocab, stream) };
     }
     // SAFETY: the caller's contract.
     unsafe { head.launch(x.cast(), weight.cast(), logits, rows as u32, stream) }
+}
+
+/// How a drafter's vocabulary head runs over the target's BF16 head (GLM 5.3 Flash's
+/// `--draft-head`). Drafts only steer speculation: the target verifies every proposal.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum)]
+pub(crate) enum DraftHead {
+    /// As the target's head ([`launch_head`]): the few-row FP32 kernel for 2..=24 rows, one read
+    /// of the head per 8 rows, and the pedantic FP32 cuBLAS GEMM (CUDA cores) past them.
+    #[default]
+    Exact,
+    /// The few-row FP32 kernel for one draft block (up to 8 rows, one read of the head), and from
+    /// [`DRAFT_HEAD_TENSOR_ROWS`] rows a BF16 tensor-core GEMM with FP32 accumulation that reads
+    /// the head once for every row count.
+    Tensor,
+}
+
+/// Rows from which [`DraftHead::Tensor`] takes tensor cores: past one pass of the few-row kernel
+/// (two draft blocks and more; DFlash2 and dSpark blocks are 8 rows).
+pub(crate) const DRAFT_HEAD_TENSOR_ROWS: usize = cuteafd_ffi::VOCAB_HEAD_ROWS_PASS + 1;
+
+/// The kernel a vocabulary head of `rows` rows runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HeadRoute {
+    /// `vocab_head_rows`: FP32 products and accumulation, one read of the head per 8 rows.
+    FewRows,
+    /// cuBLAS with pedantic FP32 accumulation on CUDA cores.
+    Pedantic,
+    /// cuBLAS BF16 tensor cores with FP32 accumulation.
+    TensorCores,
+}
+
+/// The route [`launch_head`] (`mode` [`DraftHead::Exact`]) or [`launch_draft_head`] takes for
+/// `rows` rows (`cublas`: CUTEAFD_GLM_HEAD=cublas, every exact row count on cuBLAS).
+pub(crate) fn head_route(mode: DraftHead, rows: usize, cublas: bool) -> HeadRoute {
+    if mode == DraftHead::Tensor && rows >= DRAFT_HEAD_TENSOR_ROWS {
+        HeadRoute::TensorCores
+    } else if !cublas && (2..=cuteafd_ffi::VOCAB_HEAD_ROWS_MAX).contains(&rows) {
+        HeadRoute::FewRows
+    } else {
+        HeadRoute::Pedantic
+    }
+}
+
+/// A drafter's vocabulary head of `rows` rows under `mode` ([`DraftHead`]); [`DraftHead::Exact`]
+/// is [`launch_head`].
+///
+/// # Safety
+/// As [`launch_head`].
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn launch_draft_head(library: &NativeLibrary, head: &cuteafd_ffi::programs::VocabularyHead<'_>,
+    x: *const c_void, weight: *const c_void, logits: *mut f32, rows: usize, width: usize, vocab: usize,
+    stream: *mut c_void, mode: DraftHead) -> Result<()> {
+    if head_route(mode, rows, false) == HeadRoute::TensorCores {
+        // SAFETY: the caller's contract.
+        return unsafe { head.launch_tensor_op(x.cast(), weight.cast(), logits, rows as u32, stream) };
+    }
+    // SAFETY: the caller's contract.
+    unsafe { launch_head(library, head, x, weight, logits, rows, width, vocab, stream) }
+}
+
+#[cfg(test)]
+mod draft_head_tests {
+    use super::*;
+
+    /// The exact route is the target's: one row and past 24 rows on pedantic cuBLAS, 2..=24 on
+    /// the few-row kernel, everything on cuBLAS under CUTEAFD_GLM_HEAD=cublas.
+    #[test]
+    fn the_exact_route_is_the_target_heads() {
+        for rows in [2, 8, 9, 16, 24] {
+            assert_eq!(head_route(DraftHead::Exact, rows, false), HeadRoute::FewRows, "{rows}");
+        }
+        for rows in [1, 25, 64, 127, 128] {
+            assert_eq!(head_route(DraftHead::Exact, rows, false), HeadRoute::Pedantic, "{rows}");
+        }
+        for rows in [1, 8, 24, 128] {
+            assert_eq!(head_route(DraftHead::Exact, rows, true), HeadRoute::Pedantic, "{rows}");
+        }
+    }
+
+    /// One draft block keeps the exact route (C1 drafts do not change); two blocks and more take
+    /// tensor cores, which read the head once for every row count.
+    #[test]
+    fn tensor_drafts_take_tensor_cores_from_two_draft_blocks() {
+        assert_eq!(DRAFT_HEAD_TENSOR_ROWS, 9);
+        for rows in 1..DRAFT_HEAD_TENSOR_ROWS {
+            for cublas in [false, true] {
+                assert_eq!(head_route(DraftHead::Tensor, rows, cublas), head_route(DraftHead::Exact, rows, cublas));
+            }
+        }
+        assert_eq!(head_route(DraftHead::Tensor, 8, false), HeadRoute::FewRows);
+        for rows in [9, 16, 24, 25, 32, 64, 127, 128] {
+            for cublas in [false, true] {
+                assert_eq!(head_route(DraftHead::Tensor, rows, cublas), HeadRoute::TensorCores, "{rows}");
+            }
+        }
+    }
 }
 
 impl Opened {

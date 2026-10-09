@@ -57,16 +57,22 @@ pub fn card_svg(report: &Report) -> String {
         doc.text(x + width + 14.0, 352.0, Font::new(24.0, t.ink2), "tok/s");
         doc.text(x, 386.0, Font::new(sub_size, t.ink2), &fit(sub, sub_size, column_width));
     };
-    huge(&mut doc, pad, "C1 CODE DECODE", &rate(code), "thinking off · one request", t.series[0]);
-    if let Some(c) = concurrent {
-        huge(&mut doc, pad + column_width + gap, &format!("C{} CODE DECODE", c.width), &rate(c.aggregate_tok_s),
-            &format!("aggregate · {} tok/s per stream", rate(c.per_stream_median_tok_s)), t.concurrent);
-    }
-    let prefill_x = if concurrent.is_some() { pad + 2.0 * (column_width + gap) } else { 610.0 };
-    match prefill {
-        Some(p) => huge(&mut doc, prefill_x, "8K PREFILL", &rate(p.tok_s),
-            &format!("TTFT {} for {} tokens", seconds(p.ttft_s), grouped(p.prompt_tokens as f64)), t.series[3]),
-        None => huge(&mut doc, prefill_x, "8K PREFILL", "—", "not measured", t.series[3]),
+    if let Some(reason) = r.no_fit_reason() {
+        doc.text(pad, 280.0, Font::new(42.0, t.ink).bold(), "Doesn't fit");
+        doc.text(pad, 330.0, Font::new(18.0, t.ink2), &fit(reason, 18.0, WIDTH - 2.0 * pad));
+        doc.text(pad, 386.0, Font::new(15.0, t.muted), "Planner-only qualification; no performance measured");
+    } else {
+        huge(&mut doc, pad, "C1 CODE DECODE", &rate(code), "thinking off · one request", t.series[0]);
+        if let Some(c) = concurrent {
+            huge(&mut doc, pad + column_width + gap, &format!("C{} CODE DECODE", c.width), &rate(c.aggregate_tok_s),
+                &format!("aggregate · {} tok/s per stream", rate(c.per_stream_median_tok_s)), t.concurrent);
+        }
+        let prefill_x = if concurrent.is_some() { pad + 2.0 * (column_width + gap) } else { 610.0 };
+        match prefill {
+            Some(p) => huge(&mut doc, prefill_x, "8K PREFILL", &rate(p.tok_s),
+                &format!("TTFT {} for {} tokens", seconds(p.ttft_s), grouped(p.prompt_tokens as f64)), t.series[3]),
+            None => huge(&mut doc, prefill_x, "8K PREFILL", "—", "not measured", t.series[3]),
+        }
     }
     // Three content bars.
     let (bx, by, bw) = (pad, 424.0, WIDTH - 2.0 * pad);
@@ -86,11 +92,7 @@ pub fn card_svg(report: &Report) -> String {
     }
     // Hardware, options, build and badge.
     let hw = &r.server.hardware;
-    let mut hardware = hw.line();
-    if let Some(budget) = c.settings.iter().find(|s| s.name == "coordinator-gpu-budget-gib")
-        .and_then(|s| s.value.as_deref()) {
-        hardware.push_str(&format!(" · {budget} GiB budget"));
-    }
+    let mut hardware = r.server.hardware_line();
     let links: Vec<f64> = hw.fabric.iter().filter(|p| p.active).map(|p| p.link_gbps).collect();
     if !hw.sparks.is_empty() && !links.is_empty() {
         hardware.push_str(&format!(" · RoCE {:.0} Gb/s", links.iter().cloned().fold(0.0, f64::max)));

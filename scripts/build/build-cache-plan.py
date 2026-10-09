@@ -57,6 +57,29 @@ def main() -> int:
     container_home = Path(args.container_home)
     argv = ["-e", f"CUTEAFD_BUILD_CACHES={'on' if enabled else 'off'}"]
 
+    host_home = Path(args.build_root) / "container-home"
+
+    def directory(path: Path) -> None:
+        filesystem.check_path(str(path))
+        if path.exists() and (path.stat().st_uid != os.getuid() or not os.access(path, os.W_OK)):
+            raise ValueError(
+                f"directory not owned/writable by host uid {os.getuid()}: {path}; "
+                "choose a fresh WIP instance, or have the user run agent-sudo chown "
+                f"-R {os.getuid()}:{os.getgid()} -- {path} (no automatic chown)"
+            )
+        if args.mode == "prepare":
+            path.mkdir(parents=True, exist_ok=True)
+        else:
+            print(f"pre-create before docker run (host uid {os.getuid()}): mkdir -p -- {path}", file=sys.stderr)
+
+    def bind_directory(source: Path, destination: Path) -> None:
+        directory(source)
+        # Nested mount targets live inside the host bind of container_home.
+        # Docker otherwise creates these directories as root in that host tree.
+        if destination != container_home and destination.is_relative_to(container_home):
+            directory(host_home / destination.relative_to(container_home))
+        argv.extend(["--mount", f"type=bind,src={source.resolve()},dst={destination}"])
+
     def leaf(name: str, persistent: Path, destination: Path, env: str | None = None) -> None:
         source = persistent if enabled else fallback / name
         if enabled:
@@ -72,23 +95,14 @@ def main() -> int:
         filesystem.check_path(str(source))
         warm = source.is_dir() and any(source.iterdir())
         print(f"build cache {name}: {'warm' if warm else 'cold'} {source} -> {destination}", file=sys.stderr)
-        if args.mode == "prepare":
-            source.mkdir(parents=True, exist_ok=True)
-            if not os.access(source, os.W_OK):
-                raise ValueError(f"cache is not writable by host uid {os.getuid()}: {source}")
-        argv.extend(["--mount", f"type=bind,src={source.resolve()},dst={destination}"])
+        bind_directory(source, destination)
         if env:
             argv.extend(["-e", f"{env}={destination}"])
 
     # Docker creates missing mount parents as root. Bind a host-owned home first
     # so Cargo can write its lock/config alongside the separately mounted inputs.
-    host_home = Path(args.build_root) / "container-home"
-    filesystem.check_path(str(host_home))
-    if args.mode == "prepare":
-        (host_home / "cargo").mkdir(parents=True, exist_ok=True)
-        if host_home.stat().st_uid != os.getuid() or not os.access(host_home, os.W_OK):
-            raise ValueError(f"container home not owned/writable by host uid {os.getuid()}: {host_home}")
-    argv.extend(["--mount", f"type=bind,src={host_home.resolve()},dst={container_home}"])
+    bind_directory(host_home, container_home)
+    directory(host_home / "cargo")
     # Cargo binaries remain image-owned; only its downloadable inputs are shared.
     argv.extend(["-e", f"CARGO_HOME={container_home / 'cargo'}"])
     for name in ("registry", "git"):

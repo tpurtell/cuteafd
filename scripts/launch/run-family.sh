@@ -188,7 +188,7 @@ if [[ "$qwen_exl3" == 1 && "$backend" == auto && "$ranks" != 0 ]]; then
       # Older images that do not qualify auto placement keep the Spark fallback.
       preferred="$(docker run --rm --network none -v "$hub:/root/.cache/huggingface/hub:ro" "${wip_mount_args[@]}" \
         "$coordinator_image" cuteafd plan "$snapshot" --vision "$vision" --audio "$audio" --json --layout \
-        --rtx 1 --rtx-gib "$free_gib" --coordinator-budget-gib "$free_gib" --pool-tokens "$pool" \
+        --rtx 1 --coordinator-gpu-budget-gib "$free_gib" --coordinator-weight-budget-gib "$free_gib" --pool-tokens "$pool" \
         | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["spark_ranks"])' 2>/dev/null || true)"
       if [[ "$preferred" == 0 ]]; then
         echo "note: Qwen EXL3 auto selected resident local experts on GPU $selected; EXPERT_BACKEND=spark forces Spark ranks" >&2
@@ -276,10 +276,9 @@ case "$family:$speculator" in
 esac
 draft_args=()
 embedding="$(get EMBEDDING gpu)"
-default_context=8192
+default_context=0
 default_concurrency=8
 if [[ "$family" == mimo_v2 ]]; then
-  default_context=0
   profile_gpu="$(get COORDINATOR_GPUS "$(get COORDINATOR_GPU 0)")"; profile_gpu="${profile_gpu%%,*}"
   profile_mib="$(nvidia-smi -i "$profile_gpu" --query-gpu=memory.total --format=csv,noheader,nounits)"
   profile_gib="$(python3 -c 'import sys; print(min(float(sys.argv[1])/1024, float(sys.argv[2]) if sys.argv[2] else float("inf")))' "$profile_mib" "$coordinator_budget")"
@@ -704,6 +703,25 @@ if [[ $family == glm5_flash ]]; then
     on) family_args+=(--fp8-head true) ;;
     off) family_args+=(--fp8-head false) ;;
   esac
+  # GLM5_FLASH_DRAFT_HEAD: the drafter's vocabulary head over the BF16 head, exact (default: as the
+  # target's own head, FP32 products and sums on CUDA cores past 24 rows) or tensor (from two draft
+  # blocks of 8 rows, a BF16 tensor-core GEMM with FP32 accumulation that reads the head once).
+  # Drafts only: the target verifies every proposal through its own head.
+  draft_head="$(get GLM5_FLASH_DRAFT_HEAD exact)"
+  case "$draft_head" in
+    ""|exact) ;;
+    tensor) family_args+=(--draft-head tensor) ;;
+    *) echo "GLM5_FLASH_DRAFT_HEAD must be exact or tensor" >&2; exit 2 ;;
+  esac
+  # GLM5_FLASH_DRAFT_LINEAR: the FP8 drafter's GEMMs, w8a16 (default: the W8A16 GEMV in passes of
+  # 64 rows), wide (the same bits in passes of 128 rows) or w8a8 (past one draft block, E4M3
+  # activations per row and 128-wide K block on FP8 tensor cores). Drafts only.
+  draft_linear="$(get GLM5_FLASH_DRAFT_LINEAR w8a16)"
+  case "$draft_linear" in
+    ""|w8a16) ;;
+    wide|w8a8) family_args+=(--draft-linear "$draft_linear") ;;
+    *) echo "GLM5_FLASH_DRAFT_LINEAR must be w8a16, wide or w8a8" >&2; exit 2 ;;
+  esac
   fp8_prefill="$(key GLM5_FLASH_FP8_PREFILL GLMF_FP8_PREFILL)"
   if [[ " ${family_args[*]} " == *" --kda-output-shard "* ]]; then
     case ",$fp8_prefill," in
@@ -787,8 +805,9 @@ if [[ $family == glm5_flash ]]; then
   esac
   [[ "$prefix_marks" != pool || -n "$(get HOST_CACHE_BYTES)" ]] || family_args+=(--host-cache-bytes auto)
   # GLM5_FLASH_REPLAY_RECORDS: where the KDA speculative replay records live, own (default: their
-  # own 321 MB) or shared (the prefill lanes' scratch, which no decode step reads). One GPU whose
-  # pool is sized from measured memory (an automatic pool with Spark experts).
+  # own 321 MB, 642 MB with GLM5_FLASH_DECODE_ROWS=128) or shared (the prefill lanes' scratch, which
+  # no decode step reads). One GPU whose pool is sized from measured memory (an automatic pool with
+  # Spark experts).
   replay_records="$(get GLM5_FLASH_REPLAY_RECORDS own)"
   case "$replay_records" in
     ""|own) ;;
@@ -799,6 +818,19 @@ if [[ $family == glm5_flash ]]; then
       fi
       family_args+=(--replay-records shared) ;;
     *) echo "GLM5_FLASH_REPLAY_RECORDS must be own or shared" >&2; exit 2 ;;
+  esac
+  # GLM5_FLASH_DECODE_ROWS: the most rows of one decode or verify step, 64 (default) or 128. With
+  # 128 a step of more than 64 rows runs the wide _m128 programs (a build with
+  # CUTEAFD_GLMF_WIDE_DECODE_ROWS=128) and a verify step schedules up to the GPU's whole sparse MLA
+  # waves (127 rows on an RTX 5090); fewer rows keep the _m64 programs. One GPU only.
+  decode_rows="$(get GLM5_FLASH_DECODE_ROWS 64)"
+  case "$decode_rows" in
+    ""|64) ;;
+    128)
+      [[ $head_split == 0 ]] ||
+        { echo "GLM5_FLASH_DECODE_ROWS=128 runs the wide decode programs on one GPU; a head split takes 64" >&2; exit 2; }
+      family_args+=(--decode-rows 128) ;;
+    *) echo "GLM5_FLASH_DECODE_ROWS must be 64 or 128" >&2; exit 2 ;;
   esac
 fi
 # INSTANCE names a launch that runs beside others on disjoint hardware
@@ -869,10 +901,16 @@ if { [[ ( "$family" == mimo_v2 || "$family" == qwen4 || "$family" == glm5_flash 
   fi
   # GLM 5.3 Flash: the server's prefix-mark store, so the plan reserves an arena only when serve-glmf allocates one.
   [[ "$family" != glm5_flash || -z "${prefix_marks:-}" ]] || plan_draft_args+=(--prefix-marks "$prefix_marks")
+  # GLM 5.3 Flash plans the decode rows serving takes (GLM5_FLASH_DECODE_ROWS above): 128 rows
+  # charge their wider decode workspace, selector, replay records and expert intake, as serving
+  # admits them, before an encoder placement is chosen.
+  if [[ "$family" == glm5_flash && "${decode_rows:-64}" == 128 ]]; then
+    plan_draft_args+=(--decode-rows 128)
+  fi
   plan_json="$(docker run --rm --network none -v "$hub:/root/.cache/huggingface/hub:ro" "${wip_mount_args[@]}" \
     "$coordinator_image" cuteafd plan "$snapshot" --vision "$vision" --audio "$audio" --json --layout \
     --spark-ranks "$ranks" --spark-budget-gib "$(python3 -c 'import sys;print(int(sys.argv[1])/2**30)' "$budget")" \
-    --rtx "$plan_rtx" --rtx-gib "$plan_gib" --pool-tokens "$plan_pool" --vision-replicas "$vision_replicas" "${plan_draft_args[@]}")"
+    --rtx "$plan_rtx" --coordinator-gpu-budget-gib "$plan_gib" --pool-tokens "$plan_pool" --vision-replicas "$vision_replicas" "${plan_draft_args[@]}")"
   selected="$(python3 -c '
 import json,sys
 p=json.load(sys.stdin); e=p.get("encoder")
