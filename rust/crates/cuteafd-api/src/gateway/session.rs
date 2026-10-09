@@ -270,6 +270,10 @@ pub struct Snapshot {
     pub parent: Option<Arc<Snapshot>>,
     pub system: Option<String>,
     pub items: Vec<StoredItem>,
+    /// The response id at the root of this chain (this response's own id
+    /// when it has no parent): the session id usage tracking groups a
+    /// `previous_response_id` conversation under.
+    pub root_response_id: String,
 }
 
 impl Snapshot {
@@ -386,12 +390,12 @@ mod tests {
     #[tokio::test]
     async fn snapshots_chain_and_evict() {
         let store = SessionStore::new(2);
-        let first = Arc::new(Snapshot { parent: None, system: None, items: vec![StoredItem { id: "1".into(), item: user("a") }] });
-        let second = Arc::new(Snapshot { parent: Some(first.clone()), system: None, items: vec![StoredItem { id: "2".into(), item: assistant("b") }] });
+        let first = Arc::new(Snapshot { parent: None, system: None, items: vec![StoredItem { id: "1".into(), item: user("a") }], root_response_id: "r1".into() });
+        let second = Arc::new(Snapshot { parent: Some(first.clone()), system: None, items: vec![StoredItem { id: "2".into(), item: assistant("b") }], root_response_id: "r1".into() });
         store.put_response("r1".into(), first);
         store.put_response("r2".into(), second);
         assert_eq!(store.response("r2").unwrap().history().len(), 2);
-        store.put_response("r3".into(), Arc::new(Snapshot { parent: None, system: None, items: vec![] }));
+        store.put_response("r3".into(), Arc::new(Snapshot { parent: None, system: None, items: vec![], root_response_id: "r3".into() }));
         assert!(store.response("r1").is_none());
         assert_eq!(store.response("r2").unwrap().history().len(), 2, "children keep evicted parents alive");
         let parent = store.create("sess");

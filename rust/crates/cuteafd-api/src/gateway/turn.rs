@@ -156,6 +156,25 @@ pub struct TurnRequest {
     /// Traffic recording for this turn (front ends copy the request's tape).
     #[serde(skip)]
     pub tape: super::record::Tape,
+    /// Usage accounting for this turn (PLAN "API usage tracker"); filled by
+    /// the usage middleware once work/api-usage lands, `None` until then.
+    #[serde(skip)]
+    pub usage: Option<UsageHandle>,
+}
+
+/// Placeholder for the usage tracker's per-request handle (an `Arc` of
+/// atomics in `cuteafd_api::usage`, work/api-usage). Replaced by that type;
+/// kept opaque so nothing depends on its contents yet.
+#[derive(Clone, Default)]
+pub struct UsageHandle(pub std::sync::Arc<()>);
+
+impl std::fmt::Debug for UsageHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str("UsageHandle") }
+}
+
+/// Handles never affect equality of the turns that carry them.
+impl PartialEq for UsageHandle {
+    fn eq(&self, _: &Self) -> bool { true }
 }
 
 /// Why generation stopped.
