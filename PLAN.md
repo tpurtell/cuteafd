@@ -1862,6 +1862,17 @@ TJ: two key items, both urgent right after v2.0.0.
      speculator, drafter snapshot, vision and audio settings.
    - Gate: for every family's default config, a slice from `plan --files`
      starts and serves with the default speculator.
+9. **Ship a starting config per family** (found 2026-10-10). The repo
+   tracks `cuteafd.config` (V4.1) and `examples/configs/` (V4.1 TP/EP
+   layouts) only.
+   - The problem: the GLM 5.3, GLM Flash, MiMo, Qwen and V4 configs the
+     release cards use exist only in the release kit. A user starting from
+     the README gets no drafter for GLM 5.3, because the launcher's bare
+     default is off while the release configs set
+     `SPECULATOR=dflash2` / `incoai/GLM-5.3-DFlash2`.
+   - The fix: add `examples/configs/<family>-<quant>.config` for each
+     release card, with no host details. Make the launcher's bare defaults
+     match them, and link each one from the family doc.
 Gate per family: golden/fidelity, then the quick A/B at the 2M operating
 point on the min and max reference configs. Requalify each family's cards
 as it moves.
