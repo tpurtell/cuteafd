@@ -239,6 +239,7 @@ async fn stop_reasons_and_last_usage_win() {
         (StopReason::ToolUse, "tool_use", None),
         (StopReason::PauseTurn, "pause_turn", None),
         (StopReason::Refusal, "refusal", None),
+        (StopReason::ContentFilter, "refusal", None),
         (
             StopReason::StopSequence {
                 sequence: Some("STOP".into()),

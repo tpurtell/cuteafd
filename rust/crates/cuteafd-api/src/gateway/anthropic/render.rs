@@ -328,7 +328,7 @@ fn stop(reason: Option<&StopReason>) -> (Option<&'static str>, Option<&str>) {
         Some(StopReason::MaxTokens) => (Some("max_tokens"), None),
         Some(StopReason::ToolUse) => (Some("tool_use"), None),
         Some(StopReason::PauseTurn) => (Some("pause_turn"), None),
-        Some(StopReason::Refusal) => (Some("refusal"), None),
+        Some(StopReason::Refusal | StopReason::ContentFilter) => (Some("refusal"), None),
         Some(StopReason::StopSequence { sequence }) => (Some("stop_sequence"), sequence.as_deref()),
     }
 }
