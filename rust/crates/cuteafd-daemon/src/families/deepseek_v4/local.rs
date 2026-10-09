@@ -79,6 +79,33 @@ fn require_exl3_manifest(directory: &Path) -> Result<()> {
     Ok(())
 }
 
+pub(crate) fn workspace_bytes(library: &NativeLibrary, native_lib: &Path, catalog: &OfficialV41Catalog,
+    max_rows: usize) -> Result<Option<usize>> {
+    let shape = *catalog.routed_experts();
+    let capacities: Vec<u32> = CAPACITIES.iter().copied().filter(|&c| c as usize <= max_rows.max(1))
+        .chain(CAPACITIES.iter().copied().find(|&c| c as usize >= max_rows)).collect();
+    let workspace = if let Some(manifest) = catalog.exl3() {
+        let directory = aot_layout_directory(native_lib, manifest.decoder_tiers(), "rtx-tp1");
+        let directories: Vec<_> = capacities.iter().map(|c| directory.join(format!("m{c}"))).collect();
+        for directory in &directories { require_exl3_manifest(directory)?; }
+        Exl3Workspace::plan(&directories, Exl3InputFormat::Fp8K32)? + max_rows * shape.hidden * 2
+    } else {
+        let mut scratch = 0;
+        for capacity in capacities {
+            let Ok(kernel) = library.v41_local_expert_kernel(capacity) else { return Ok(None); };
+            scratch = scratch.max(usize::try_from(kernel.info().scratch_bytes)?);
+        }
+        let measured = scratch + max_rows * (shape.hidden * 2 + shape.topk * 8);
+        let planned = cuteafd_loader::serving_capacity::deepseek_v4_native_workspace(shape.hidden as u64,
+            shape.intermediate as u64, shape.experts as u64, shape.topk as u64, max_rows as u64)?;
+        ensure!(measured as u64 == planned,
+            "V4 local expert scratch differs from the standard export: native {measured}, planned {planned}");
+        measured
+    };
+    Ok(Some(workspace))
+}
+
+// Shared legacy planner for GLM Flash and Qwen lazy expert windows.
 pub(crate) fn plan(library: &NativeLibrary, native_lib: &Path, catalog: &OfficialV41Catalog,
     draft_stages: usize, max_layers: usize, max_rows: usize, budget: usize) -> Result<LocalPlan> {
     let shape = *catalog.routed_experts();

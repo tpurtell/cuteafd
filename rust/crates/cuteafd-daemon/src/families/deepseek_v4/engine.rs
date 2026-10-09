@@ -70,6 +70,12 @@ pub(crate) struct Engine<'a> {
     /// The head split's second GPU and the exchange between the two.
     peer: Option<V4Peer<'a>>,
     exchange: Option<PeerExchange<'a>>,
+    expert_exchange: Option<PeerExchange<'a>>,
+    expert_pack: Option<Dev<'a>>,
+    peer_local: RefCell<Option<super::local::LocalExperts<'a>>>,
+    peer_local_first: usize,
+    wire_checks: Vec<Dev<'a>>,
+    capture_only: std::cell::Cell<bool>,
 }
 
 /// The second GPU of a two-GPU head split (rank 1): its share of every
@@ -219,6 +225,7 @@ struct Lane<'a> {
     /// Shared-expert output of the lane's current layer (its post reads it
     /// after the other lane's shared expert ran).
     shared: Dev<'a>,
+    peer_wire: Dev<'a>,
     tables: StepBuffers<'a>,
     /// dSpark target taps of the lane's last TAP_ROWS rows, BF16
     /// [TAP_ROWS, taps * dim] (empty without a drafter).
@@ -354,6 +361,13 @@ impl<'a> Engine<'a> {
         let rows = self.prefill_rows.max(self.decode_rows);
         let exchange = PeerExchange::new(self.library, [RankDevice { device: self.device, stream: self.stream },
             RankDevice { device, stream }], 4 * PREFILL_LANES, rows * self.cfg.dim * 2)?;
+        let expert_exchange = PeerExchange::new(self.library,
+            [RankDevice { device: self.device, stream: self.stream }, RankDevice { device, stream }],
+            2 * PREFILL_LANES, rows * (self.cfg.dim * 2 + self.cfg.n_activated_experts * 8))?;
+        self.expert_pack = Some(self.alloc(rows * (self.cfg.dim * 2 + self.cfg.n_activated_experts * 8))?);
+        self.wire_checks = (0..2).map(|rank| exchange.on(rank, || self.alloc(self.cfg.dim + self.cfg.dim / 32)))
+            .collect::<Result<Vec<_>>>()?;
+        self.expert_exchange = Some(expert_exchange);
         let peer = exchange.on(1, || -> Result<V4Peer<'a>> {
             self.programs.load_all()?;
             let table = |compressed: bool| -> Result<Dev<'a>> {
@@ -450,6 +464,12 @@ impl<'a> Engine<'a> {
             split_family,
             peer: None,
             exchange: None,
+            expert_exchange: None,
+            expert_pack: None,
+            peer_local: RefCell::new(None),
+            peer_local_first: 0,
+            wire_checks: Vec::new(),
+            capture_only: std::cell::Cell::new(false),
             rope_window: table(false)?,
             rope_compressed: table(true)?,
             pools,
@@ -515,6 +535,7 @@ impl<'a> Engine<'a> {
         }
         let lane = || -> Result<Lane<'a>> {
             Ok(Lane {
+                peer_wire: self.alloc(if rank == 1 { t * (h + h / 32) } else { 256 })?,
                 stream_a: self.alloc(t * 4 * h * 2)?,
                 stream_b: self.alloc(t * 4 * h * 2)?,
                 post: self.alloc(t * 4 * 4)?,
@@ -865,6 +886,7 @@ impl<'a> Engine<'a> {
         // lane's next attention (rank 1 runs a unit ahead of the host's rank-0 work).
         let peer_next = |(layer, lane): (usize, usize)| -> Result<()> {
             let Some(w1) = w1 else { return Ok(()) };
+            self.peer_experts(layer, lane, w1, lanes[lane].tables.rows, false)?;
             self.peer_post(layer, &w1.lanes[lane], lane, w1, rows_of(lane))?;
             if layer + 1 < self.weights.layers.len() {
                 self.peer_front(layer + 1, lanes[lane].tables, &w1.lanes[lane], lane, w1, rows_of(lane), cap)?;
@@ -938,6 +960,7 @@ impl<'a> Engine<'a> {
                     if layer == 0 {
                         self.peer_segment(0, tables, w1, t, cap)?;
                     }
+                    self.peer_experts(layer, 0, w1, t, true)?;
                     if layer + 1 < self.weights.layers.len() {
                         self.peer_segment(layer + 1, tables, w1, t, cap)?;
                     }
@@ -998,7 +1021,7 @@ impl<'a> Engine<'a> {
                         peer_next(unit)?;
                         post(unit, SKIPPED_EXPERTS)?;
                     } else if layer < local_layers {
-                        self.local_experts(layer, t, w, &w.lanes[lane], cap)?;
+                        self.local_experts(layer, t, w, &w.lanes[lane], cap, lane)?;
                         peer_next(unit)?;
                         post(unit, LOCAL_EXPERTS)?;
                     } else {
@@ -1113,6 +1136,7 @@ impl<'a> Engine<'a> {
         };
         let stream = self.stream_of(rank);
         if let Some(graph) = graphs.borrow().get(&key) {
+            if self.capture_only.get() { return Ok(()); }
             // SAFETY: the graph's pointers are persistent engine buffers of that rank.
             return self.on(rank, || unsafe { self.library.cuda_graph_launch(graph.0, stream) });
         }
@@ -1123,7 +1147,7 @@ impl<'a> Engine<'a> {
         let exec = self.on(rank, || unsafe { self.library.cuda_graph_end_capture(stream) });
         captured?;
         let exec = exec?;
-        self.on(rank, || unsafe { self.library.cuda_graph_launch(exec, stream) })?;
+        if !self.capture_only.get() { self.on(rank, || unsafe { self.library.cuda_graph_launch(exec, stream) })?; }
         graphs.borrow_mut().insert(key, GraphExec(exec, self.library));
         Ok(())
     }
@@ -1156,7 +1180,7 @@ impl<'a> Engine<'a> {
             ], &[rows]);
         }
         if ranks == LOCAL_EXPERTS {
-            let output = self.local.borrow().as_ref().context("local experts")?.output.buffer.ptr;
+            let output = self.local_output(layer, 0)?;
             return self.run("mhc_post", &[
                 ("x", output), ("residual", lane.stream_b.buffer.ptr), ("prev_post", lane.post.buffer.ptr),
                 ("prev_comb", lane.comb.buffer.ptr), ("out", lane.stream_a.buffer.ptr),
@@ -1200,7 +1224,7 @@ impl<'a> Engine<'a> {
         let Scalar::I32(count) = rows else { unreachable!() };
         let base = match ranks {
             SKIPPED_EXPERTS => lane.shared.buffer.ptr,
-            LOCAL_EXPERTS => self.local.borrow().as_ref().context("local experts")?.output.buffer.ptr,
+            LOCAL_EXPERTS => self.local_output(layer, index)?,
             _ => {
                 let reducer = self.library.v41_compact_reducer()?;
                 // SAFETY: as in `post`.
@@ -1245,7 +1269,48 @@ impl<'a> Engine<'a> {
             ("scratch", w.scratch.buffer.ptr),
         ], &[rows]).with_context(|| format!("layer {layer} shared expert (rank 1)"))?;
         let Scalar::I32(t) = rows else { unreachable!() };
+        if self.peer_local_layer(layer) && cap != self.decode_rows {
+            self.quantize_to(1, w, &lane.peer_wire, t as usize)?;
+            if layer == self.peer_local_first { self.save_wire_check(1, &lane.peer_wire)?; }
+        }
         exchange.push(1, slot(layer, true, index), lane.shared.buffer.ptr, t as usize * self.cfg.dim * 2)
+    }
+
+    fn peer_experts(&self, layer: usize, index: usize, w: &Workspace<'_>, t: usize, decode: bool) -> Result<()> {
+        let run = || -> Result<()> {
+            if self.peer_local_layer(layer) {
+                if decode {
+                    self.quantize_to(1, w, &w.lanes[index].peer_wire, t)?;
+                    if layer == self.peer_local_first { self.save_wire_check(1, &w.lanes[index].peer_wire)?; }
+                }
+                let experts = self.expert_exchange.as_ref().context("expert exchange")?;
+                let slot = 2 * index + layer % 2;
+                experts.wait(1, slot)?;
+                let packed = experts.recv(1, slot)?;
+                let route_bytes = t * self.cfg.n_activated_experts * 4;
+                // SAFETY: packed holds consecutive canonical ids, weights and shared rows;
+                // the release/acquire above makes every input visible on the peer stream.
+                let (weights, shared) = unsafe { (packed.cast::<u8>().add(route_bytes).cast(),
+                    packed.cast::<u8>().add(route_bytes * 2).cast()) };
+                self.on(1, || {
+                    let mut local = self.peer_local.borrow_mut();
+                    let local = local.as_mut().context("peer local experts")?;
+                    // SAFETY: all inputs are resident and complete on this rank's stream.
+                    unsafe { local.run(super::local::LocalLayer::Backbone(layer), t, w.lanes[index].peer_wire.buffer.ptr,
+                        packed, weights, shared, self.stream_of(1))?; }
+                    experts.push(1, slot, local.output.buffer.ptr, t * self.cfg.dim * 2)
+                })?;
+            }
+            Ok(())
+        };
+        if decode && self.peer_local_layer(layer) {
+            self.replay_on(1, Self::expert_key(layer, t, index), run)
+        } else { run() }
+    }
+
+    fn expert_key(layer: usize, rows: usize, index: usize) -> GraphKey {
+        GraphKey { layer, rows, chunked: false, attention: "local-experts",
+            table_width: 0, table_stride: 0, previous: index }
     }
 
     /// Rank 1's FFN close of `layer` (not after the last layer): rank 0's routed +
@@ -1395,13 +1460,22 @@ impl<'a> Engine<'a> {
                 w.route_ids.buffer.ptr, w.route_weights.buffer.ptr, t as usize, self.cfg.n_routed_experts,
                 self.cfg.n_activated_experts, self.cfg.route_scale as f32, self.stream)?;
         }
-        let grid = self.quantize_grid.blocks(t as usize, h);
-        self.run("expert_input_quant", &[
-            ("source_ptr", w.y.buffer.ptr), ("values_ptr", w.wire.buffer.ptr),
-            // SAFETY: the scale rows follow the payload inside each wire row.
-            ("scale_rows_ptr", unsafe { w.wire.buffer.ptr.cast::<u8>().add(h) }.cast()),
+        self.quantize_input(0, w, t as usize)
+    }
+
+    fn quantize_input(&self, rank: usize, w: &Workspace<'_>, t: usize) -> Result<()> {
+        self.quantize_to(rank, w, &w.wire, t)
+    }
+
+    fn quantize_to(&self, rank: usize, w: &Workspace<'_>, wire: &Dev<'_>, t: usize) -> Result<()> {
+        let h = self.cfg.dim;
+        let grid = self.quantize_grid.blocks(t, h);
+        self.run_on(rank, false, "expert_input_quant", &[
+            ("source_ptr", w.y.buffer.ptr), ("values_ptr", wire.buffer.ptr),
+            // SAFETY: scale rows follow the payload inside each wire row.
+            ("scale_rows_ptr", unsafe { wire.buffer.ptr.cast::<u8>().add(h) }.cast()),
             ("scale_mma_ptr", w.dummy.buffer.ptr),
-        ], &[rows, Scalar::I32(grid as i32)])
+        ], &[Scalar::I32(t as i32), Scalar::I32(grid as i32)])
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1550,6 +1624,24 @@ impl<'a> Engine<'a> {
 
     pub(crate) fn local_layers(&self) -> usize {
         self.local.borrow().as_ref().map_or(0, |l| l.layers())
+            + self.peer_local.borrow().as_ref().map_or(0, |l| l.layers())
+    }
+
+    pub fn install_local(&mut self, rank: usize, first: usize, local: Option<super::local::LocalExperts<'a>>) -> Result<()> {
+        if rank == 0 { *self.local.borrow_mut() = local; }
+        else { self.peer()?; self.peer_local_first = first; *self.peer_local.borrow_mut() = local; }
+        Ok(())
+    }
+
+    fn peer_local_layer(&self, layer: usize) -> bool {
+        let count = self.peer_local.borrow().as_ref().map_or(0, |l| l.layers());
+        (self.peer_local_first..self.peer_local_first + count).contains(&layer)
+    }
+
+    fn local_output(&self, layer: usize, index: usize) -> Result<*mut c_void> {
+        if self.peer_local_layer(layer) {
+            Ok(self.expert_exchange.as_ref().context("expert exchange")?.recv(0, 2 * index + layer % 2)?)
+        } else { Ok(self.local.borrow().as_ref().context("local experts")?.output.buffer.ptr) }
     }
 
     /// The shared expert on the unit's FFN input `y` into the lane's `shared`.
@@ -1565,17 +1657,103 @@ impl<'a> Engine<'a> {
 
     /// Shared and routed experts of a coordinator-resident layer: routes,
     /// wire rows and results stay on the device, the host only enqueues.
-    fn local_experts(&self, layer: usize, t: usize, w: &Workspace<'_>, lane: &Lane<'_>, cap: usize) -> Result<()> {
-        self.shared_ffn(layer, w, lane, Scalar::I32(t as i32), cap, &self.weights.layers[layer])?;
+    fn local_experts(&self, layer: usize, t: usize, w: &Workspace<'_>, lane: &Lane<'_>, cap: usize, index: usize) -> Result<()> {
         let timer = Instant::now();
-        let mut local = self.local.borrow_mut();
-        let local = local.as_mut().context("local experts")?;
-        // SAFETY: wire, routes and shared rows are complete in stream order.
-        unsafe {
-            local.run(super::local::LocalLayer::Backbone(layer), t, w.wire.buffer.ptr, w.route_ids.buffer.ptr, w.route_weights.buffer.ptr,
-                lane.shared.buffer.ptr, self.stream)?
+        let run = || -> Result<()> {
+            self.shared_ffn(layer, w, lane, Scalar::I32(t as i32), cap, &self.weights.layers[layer])?;
+            if self.peer_local_layer(layer) {
+                if layer == self.peer_local_first { self.save_wire_check(0, &w.wire)?; }
+                let experts = self.expert_exchange.as_ref().context("expert exchange")?;
+                let pack = self.expert_pack.as_ref().context("expert pack")?;
+                let route_bytes = t * self.cfg.n_activated_experts * 4;
+                let copy = |offset: usize, source: &Dev<'_>, bytes: usize| -> Result<()> {
+                    // SAFETY: the persistent packing buffer has ids, weights and shared sections.
+                    let target = cuteafd_ffi::CuteafdDeviceBuffer { ptr: unsafe {
+                        pack.buffer.ptr.cast::<u8>().add(offset).cast() }, bytes, ..pack.buffer };
+                    // SAFETY: source and target are on GPU0 and live until its stream drains.
+                    unsafe { self.library.copy_d2d_async(target, source.buffer, bytes, self.stream) }
+                };
+                copy(0, &w.route_ids, route_bytes)?;
+                copy(route_bytes, &w.route_weights, route_bytes)?;
+                copy(2 * route_bytes, &lane.shared, t * self.cfg.dim * 2)?;
+                let slot = 2 * index + layer % 2;
+                experts.push(0, slot, pack.buffer.ptr, 2 * route_bytes + t * self.cfg.dim * 2)?;
+                experts.wait(0, slot)?;
+            } else {
+                let mut local = self.local.borrow_mut();
+                let local = local.as_mut().context("local experts")?;
+                // SAFETY: wire, routes and shared rows are complete in stream order.
+                unsafe { local.run(super::local::LocalLayer::Backbone(layer), t, w.wire.buffer.ptr,
+                    w.route_ids.buffer.ptr, w.route_weights.buffer.ptr, lane.shared.buffer.ptr, self.stream)?; }
+            }
+            Ok(())
         };
+        if cap == self.decode_rows {
+            self.replay(Self::expert_key(layer, t, index), run)?;
+        } else { run()?; }
         self.profile.borrow_mut().add(Phase::Experts, timer);
+        Ok(())
+    }
+
+    /// Every local-expert row shape is captured at startup, without executing
+    /// uninitialized routes or unmatched peer waits. Pointer ownership is fixed.
+    pub fn warm_local_graphs(&self) -> Result<()> {
+        if self.local_layers() == 0 { return Ok(()); }
+        if self.decode_workspace.borrow().is_none() {
+            *self.decode_workspace.borrow_mut() = Some(self.workspace(self.decode_rows, 1)?);
+        }
+        if let Some(peer) = &self.peer {
+            if peer.decode_workspace.borrow().is_none() {
+                *peer.decode_workspace.borrow_mut() = Some(self.workspace_on(1, self.decode_rows, 1)?);
+            }
+        }
+        self.capture_only.set(true);
+        let result = (|| {
+            let work = self.decode_workspace.borrow();
+            let w = work.as_ref().context("decode workspace")?;
+            for t in 1..=self.decode_rows {
+                for layer in 0..self.local_layers() {
+                    self.local_experts(layer, t, w, &w.lanes[0], self.decode_rows, 0)?;
+                    if self.peer_local_layer(layer) {
+                        let work = self.peer()?.decode_workspace.borrow();
+                        self.peer_experts(layer, 0, work.as_ref().context("peer decode workspace")?, t, true)?;
+                    }
+                }
+            }
+            Ok(())
+        })();
+        self.capture_only.set(false);
+        result
+    }
+
+    fn save_wire_check(&self, rank: usize, wire: &Dev<'_>) -> Result<()> {
+        self.on(rank, || {
+            let check = &self.wire_checks[rank];
+            // SAFETY: one quantized row is complete; the persistent check buffer stays alive for graphs.
+            unsafe { self.library.copy_d2d_async(check.buffer, wire.buffer, check.buffer.bytes, self.stream_of(rank)) }
+        })
+    }
+
+    /// Warm a real layer path before readiness, then byte-check both ranks'
+    /// quantizer inputs at the first GPU1-local layer. Captured copies retain
+    /// these engine-owned buffers, avoiding capture-dependent pointer changes.
+    pub fn check_peer_wire(&self, transports: &mut [SparkLink<'_>], runtime: &tokio::runtime::Runtime) -> Result<()> {
+        if self.peer_local.borrow().is_none() { return Ok(()); }
+        let mut allocator = super::pool::PoolAllocator::new(self.shape);
+        let mut placement = allocator.admit(1)?;
+        self.prefill(&mut placement, &[0], transports, runtime, 1, None)?;
+        let bytes = self.cfg.dim + self.cfg.dim / 32;
+        let mut copies = [vec![0; bytes], vec![0; bytes]];
+        for rank in 0..2 {
+            self.on(rank, || {
+                // SAFETY: every exchange in the startup step has its paired push queued.
+                unsafe { self.library.cuda_stream_synchronize(self.stream_of(rank))?; }
+                self.library.copy_d2h(&mut copies[rank], self.wire_checks[rank].buffer)
+            })?;
+        }
+        ensure!(copies[0] == copies[1], "V4 head-split hidden state/quantized expert input differs at layer {}", self.peer_local_first);
+        allocator.release(placement);
+        tracing::info!(layer = self.peer_local_first, bytes, "V4 peer expert input byte-check passed");
         Ok(())
     }
 
@@ -1649,7 +1827,7 @@ impl<'a> Engine<'a> {
             return Ok(SKIPPED_EXPERTS);
         }
         if layer < self.local_layers() {
-            self.local_experts(layer, t, w, lane, cap)?;
+            self.local_experts(layer, t, w, lane, cap, 0)?;
             return Ok(LOCAL_EXPERTS);
         }
         let transport = transport.context("no transport")?;

@@ -38,8 +38,8 @@ pub(crate) struct EngineArgs {
     /// Split every backbone layer's attention heads (w_q rows, sinks, wo
     /// groups) and shared expert over --device and this second GPU; mHC, the
     /// latent projection, compressors, indexer and caches are replicated, the
-    /// partial sums meet over peer memory. Router, routed experts, head and
-    /// drafter stay on --device.
+    /// partial sums meet over peer memory. Router, head and drafter stay on --device; whole routed-expert
+    /// layers fill both GPUs after reserving their KV pools.
     #[arg(long)]
     pub split_device: Option<i32>,
     /// Optional expert-input quantizer SM ceiling (default: this device's SM count).
@@ -53,7 +53,7 @@ pub(crate) struct EngineArgs {
     pub full_prefill_logits: bool,
     /// Total tokens the compressed-cache pools hold across sequences; 0 uses
     /// planner admission from measured free memory before cache allocation.
-    #[arg(long, default_value_t = 262_144)]
+    #[arg(long, default_value_t = 0)]
     pub pool_tokens: usize,
     /// Routed-expert layers to keep on the coordinator GPU (from layer 0);
     /// they fill free memory by default. 0 sends every layer to the Sparks.
@@ -254,9 +254,8 @@ pub(crate) fn with_engine<T>(
         &args.snapshot, &args.manifest, "deepseek_v4", args.max_context)?;
     let prefill_rows = caps["prefill_rows"].as_u64().context("prefill_rows")? as usize;
     let decode_rows = caps["decode_rows"].as_u64().context("decode_rows")? as usize;
-    // The default pool and local-expert placement retain the existing path.
-    // Auto resolves every GPU before any cache, workspace or expert allocation.
-    let auto = if args.pool_tokens == 0 || cuteafd_ffi::coordinator_gpu_budget().is_some() {
+    // Reserve KV on every GPU before whole-layer expert placement.
+    let placement = {
         ensure!(args.max_sequences > 0, "--max-sequences must be positive");
         let devices: Vec<_> = std::iter::once(args.device).chain(split_device).collect();
         let memory = devices.iter().map(|&device| crate::shared::peer_split::on_device(
@@ -295,38 +294,53 @@ pub(crate) fn with_engine<T>(
             reserve_bytes: (args.reserve_gib as u64) << 30,
             prefix_bytes: geometry.ranks.iter().map(|r| r.retained_mark_bytes * slots as u64).collect(),
             workspace_bytes: Some(workspace.iter().enumerate().map(|(rank, r)|
-                r.fixed_device_bytes + if rank == 0 { intake } else { 0 }).collect()), peer_bytes: peer };
-        // Preserve the pre-existing placement policy: caches and peer slots
-        // are live before local loading, while the single reserve covers its
-        // future workspace and runtime. Full admission follows this selection.
-        let rank = &geometry.ranks[0];
-        let legacy_state = rank.fixed_state_bytes + rank.active_state_per_sequence_bytes * args.max_sequences as u64
-            + rank.context_table_bytes_per_token * max_context as u64;
-        let legacy_pool = rank.persistent_unit_bytes * 262_144u64.div_ceil(geometry.logical_unit_rows);
-        let expert_budget = usize::try_from(memory[0].baseline_free_bytes.saturating_sub(
-            legacy_state + legacy_pool + peer + shape.prefix_bytes.iter().sum::<u64>() + shape.reserve_bytes))?;
-        let stages = if args.dspark { cache_stages } else { 0 };
-        let local = if args.skip_routed_experts { local::LocalPlan { layers: 0, peak_bytes: 0 } }
-            else { local::plan(&loaded.library, &args.native_lib, &loaded.catalog, stages,
-                args.local_expert_layers.unwrap_or(usize::MAX), prefill_rows.max(decode_rows), expert_budget)? };
-        if let Some(requested) = args.local_expert_layers.filter(|_| !args.skip_routed_experts) {
-            let routed = loaded.catalog.routed_experts();
-            ensure!(local.layers == requested.min(routed.layers).saturating_sub(routed.first_layer),
-                "V4 automatic admission cannot fit the requested RTX expert layers; lower --local-expert-layers");
-        }
-        let profile = admission::profile(&geometry, &memory, &shape, local.peak_bytes as u64)?;
-        let capacity = admission::resolve_pool(&profile, &memory, args.max_sequences,
-            (args.pool_tokens > 0).then_some(args.pool_tokens as u64))?;
-        tracing::info!(pool_tokens = capacity.allocated_gpu_kv_tokens, local_layers = local.layers,
-            local_peak_bytes = local.peak_bytes, devices = ?capacity.devices, "DeepSeek V4 planner admission");
-        Some((usize::try_from(capacity.allocated_gpu_kv_tokens)?, local))
-    } else { None };
+                r.fixed_device_bytes + if rank == 0 { intake } else { 0 }
+                    + if devices.len() == 2 { cuteafd_loader::serving_capacity::deepseek_v4_expert_exchange_bytes(
+                        loaded.cfg.dim as u64, loaded.cfg.n_activated_experts as u64,
+                        prefill_rows as u64, decode_rows as u64, rank).unwrap() } else { 0 }).collect()), peer_bytes: peer };
+        let profile = admission::profile(&geometry, &memory, &shape, &[])?;
+        let available: Vec<_> = profile.devices.iter().zip(&memory).map(|(cost, sample)|
+            sample.baseline_free_bytes.saturating_sub(cost.reservations.iter().map(|r| r.bytes).sum())).collect();
+        let stages = if args.dspark && !args.skip_routed_experts { cache_stages } else { 0 };
+        let routed = loaded.catalog.routed_experts();
+        let mut weights = if args.skip_routed_experts { Vec::new() } else {
+            (routed.first_layer..routed.layers).map(|layer|
+                cuteafd_loader::serving_capacity::deepseek_v4_expert_cost(&loaded.catalog, layer, false))
+                .collect::<Result<Vec<_>>>()?
+        };
+        let draft = (0..stages).map(|stage|
+            cuteafd_loader::serving_capacity::deepseek_v4_expert_cost(&loaded.catalog, stage, true))
+            .collect::<Result<Vec<_>>>()?;
+        let workspace = if args.skip_routed_experts || (args.local_expert_layers == Some(0) && stages == 0) { 0 }
+            else { match local::workspace_bytes(&loaded.library, &args.native_lib, &loaded.catalog,
+                prefill_rows.max(decode_rows))? {
+                Some(bytes) => bytes as u64,
+                None => {
+                    ensure!(stages == 0 && args.local_expert_layers.is_none(),
+                        "V4 local expert kernels are missing: export the matching rtx_backbone package for explicit local layers/dSpark");
+                    tracing::warn!("V4 local expert kernels unavailable; routing all backbone layers to Sparks");
+                    weights.clear();
+                    0
+                }
+            } };
+        let placement = cuteafd_loader::serving_capacity::deepseek_v4_placement(&available,
+            &memory.iter().map(|m| m.total_bytes).collect::<Vec<_>>(),
+            &profile.devices.iter().map(|d| d.pool_unit_bytes).collect::<Vec<_>>(), geometry.logical_unit_rows,
+            (args.pool_tokens > 0).then_some(args.pool_tokens as u64), None, routed.first_layer,
+            &weights, &draft, workspace, if args.skip_routed_experts { Some(0) } else { args.local_expert_layers })?;
+        let profile = admission::profile(&geometry, &memory, &shape,
+            &placement.ranks.iter().map(|r| r.peak_bytes).collect::<Vec<_>>())?;
+        admission::resolve_pool(&profile, &memory, args.max_sequences, Some(placement.pool_tokens))?;
+        tracing::info!(pool_tokens = placement.pool_tokens, local_per_gpu = ?placement.ranks,
+            "DeepSeek V4 pool-first admission");
+        placement
+    };
     max_context = crate::shared::context::pool_context("deepseek_v4", max_context, args.max_context == 0,
-        auto.as_ref().map_or(args.pool_tokens, |a| a.0), 256)?;
+        usize::try_from(placement.pool_tokens)?, 256)?;
     let shape = pool::PoolShape::new(
         args.max_sequences,
         caps["prefill_rows"].as_u64().context("prefill_rows")? as usize,
-        pool::PoolShape::units_for(auto.as_ref().map_or(args.pool_tokens, |a| a.0), args.max_sequences),
+        pool::PoolShape::units_for(usize::try_from(placement.pool_tokens)?, args.max_sequences),
     );
     let skip = args.skip_routed_experts;
     let peers = args.peers.split(',').filter(|p| !p.is_empty()).map(str::parse)
@@ -357,21 +371,22 @@ pub(crate) fn with_engine<T>(
         engine.attach_peer(device, stream, shares.pop().context("head-split shares")?, engine::PeerParts { shape })?;
     }
     let held = held(&engine)?;
-    let (free, _) = loaded.library.cuda_memory_info()?;
-    let budget = free.saturating_sub(args.reserve_gib << 30).saturating_sub(held);
+    let _ = held; // Prefix bytes were reserved before placement.
     let started = Instant::now();
     let stages = if args.dspark { engine.weights.dspark.as_ref().map_or(0, |d| d.stages.len()) } else { 0 };
-    let (max_layers, budget) = auto.as_ref().map_or((args.local_expert_layers.unwrap_or(usize::MAX), budget),
-        |(_, plan)| (loaded.catalog.routed_experts().first_layer + plan.layers, plan.peak_bytes));
-    let local = if skip { None } else { local::LocalExperts::load(&loaded.library, &args.native_lib, &loaded.catalog, stages,
-        max_layers, engine.decode_rows.max(engine.prefill_rows), budget, stream)? };
-    if let Some((_, plan)) = &auto {
-        ensure!(local.as_ref().map_or(0, |l| l.layers()) == plan.layers,
-            "DeepSeek V4 local expert allocation differs from admitted placement");
+    for (rank, range) in placement.ranks.iter().enumerate() {
+        let device = if rank == 0 { args.device } else { split_device.context("expert peer device")? };
+        let stream = if rank == 0 { stream } else { peer_stream.context("expert peer stream")?.1 };
+        let local = if skip { None } else { crate::shared::peer_split::on_device(&loaded.library, device,
+            args.device, || local::LocalExperts::load_range(&loaded.library, &args.native_lib, &loaded.catalog,
+                if rank == 0 { stages } else { 0 }, range.first..range.first + range.layers,
+                engine.decode_rows.max(engine.prefill_rows), usize::try_from(range.peak_bytes)?, stream))? };
+        ensure!(local.as_ref().map_or(0, |l| l.layers()) == range.layers,
+            "DeepSeek V4 GPU{rank} local expert allocation differs from admitted placement");
+        engine.install_local(rank, range.first, local)?;
     }
-    tracing::info!(layers = local.as_ref().map_or(0, |l| l.layers()), elapsed_ms = started.elapsed().as_millis() as u64,
-        "DeepSeek V4 expert layers resident on the coordinator");
-    *engine.local.borrow_mut() = local;
+    tracing::info!(local_per_gpu = ?placement.ranks, elapsed_ms = started.elapsed().as_millis() as u64,
+        "DeepSeek V4 expert layers resident on coordinator GPUs");
     // Implicit Spark worlds: TP4 executors 1..=4, TP2 5..=6, TP3 7..=9, TP6 27..=32.
     let executors = (0..peers.len())
         .map(|rank| cuteafd_transport::expert::v41_spark_executor_id(peers.len(), rank))
@@ -398,6 +413,8 @@ pub(crate) fn with_engine<T>(
         tracing::info!(elapsed_ms = started.elapsed().as_millis() as u64, "decode and verify waves use the device exchange");
     }
     if args.full_prefill_logits { engine.prepare_scoring_prefill()?; }
+    engine.warm_local_graphs()?;
+    engine.check_peer_wire(&mut transports, &runtime)?;
     let result = body(&engine, &mut transports, &runtime);
     if let Err(error) = &result {
         // Teardown may fail after a device fault and would otherwise hide this.

@@ -32,6 +32,17 @@ pub fn deepseek_v4_peer_exchange_bytes(hidden: u64, prefill_rows: u64, decode_ro
     sum("V4 peer exchange", &[product("V4 peer slots", &[8, prefill_rows.max(decode_rows), hidden, 2])?, 256])
 }
 
+/// Additional expert slots and the lead's packing buffer. Per-lane/parity
+/// slots carry route IDs, route weights and the lead shared-expert half.
+pub fn deepseek_v4_expert_exchange_bytes(hidden: u64, topk: u64, prefill: u64, decode: u64, rank: usize)
+    -> Result<u64, CacheGeometryError> {
+    let payload = product("V4 expert payload", &[prefill.max(decode), hidden * 2 + topk * 8])?;
+    sum("V4 expert exchange", &[product("V4 expert slots", &[4, payload])?,
+        256, if rank == 0 { payload.max(256) } else { 0 },
+        (hidden + hidden / 32).max(256),
+        if rank == 1 { product("V4 peer wire", &[2 * prefill + decode, hidden + hidden / 32])? } else { 3 * 256 }])
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct V4WorkspaceScratch {
     /// Largest non-index-topk scratch across the entire loaded manifest.
@@ -257,6 +268,24 @@ fn step(
         mul(&[rows, lanes, 4])?,
         lead(mul(&[rows, topk * 8 + h + h / 32])?).max(256),
     ))
+}
+
+#[cfg(test)]
+mod expert_exchange_tests {
+    use super::*;
+    #[test]
+    fn reservation_matches_persistent_slots_lanes_and_checks() {
+        for h in [4096, 7168] {
+            for (prefill, decode) in [(4096, 64), (16, 64)] {
+                let payload = prefill.max(decode) * (h * 2 + 6 * 8);
+                let check = h + h / 32;
+                let lead = 4 * payload + 256 + payload + check + 3 * 256;
+                let peer = 4 * payload + 256 + check + (2 * prefill + decode) * check;
+                assert_eq!(deepseek_v4_expert_exchange_bytes(h, 6, prefill, decode, 0).unwrap(), lead);
+                assert_eq!(deepseek_v4_expert_exchange_bytes(h, 6, prefill, decode, 1).unwrap(), peer);
+            }
+        }
+    }
 }
 
 #[cfg(test)]
