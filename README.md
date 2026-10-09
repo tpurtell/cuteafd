@@ -20,6 +20,8 @@ format.
   the experts, exchanging activations over RoCE with GPU-direct landing.
 - Robust quant support: official FP8/MXFP4, NVIDIA ModelOpt NVFP4, and EXL3,
   loaded from the checkpoint's own `config.json` and tensor headers.
+- Sliced HF snapshots need no annotation: MiMo, GLM Flash and Qwen coordinators
+  need only their role's shards; official V4.1 Spark workers need only expert shards.
 - Exact prefix caching for agentic work: the deepest cached snapshot that
   prefixes a request is restored byte-identical, not approximated.
 - Own your intelligence: your weights, your hardware, your rate limits (none),

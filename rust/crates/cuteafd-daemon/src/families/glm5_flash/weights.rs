@@ -871,7 +871,7 @@ mod tests {
         }
         std::fs::write(dir.path().join("weights.bin"), &bytes).unwrap();
         let checkpoint = Checkpoint { snapshot: dir.path().into(), config: serde_json::json!({}),
-            quantize_config: None, missing_shards: vec![], shard_bytes: bytes.len() as u64,
+            quantize_config: None, weight_map: Default::default(), missing_shards: vec![], shard_bytes: bytes.len() as u64,
             tensors: vec![CheckpointTensor { shard: "weights.bin".into(), meta: SafetensorsTensorMetadata {
                 name: "projection.weight".into(), dtype: cuteafd_core::DType::Bf16, shape: vec![256, 256],
                 byte_offset: 0, byte_length: bytes.len() as u64 } }] };

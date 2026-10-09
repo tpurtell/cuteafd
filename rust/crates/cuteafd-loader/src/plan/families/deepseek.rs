@@ -188,9 +188,8 @@ fn dedup(values: &[usize]) -> Vec<usize> {
 /// one while every V4 checkpoint ships three.
 fn dspark_stages(checkpoint: &Checkpoint) -> usize {
     checkpoint
-        .tensors
-        .iter()
-        .filter_map(|t| indexed_tail(&t.meta.name, "mtp.").map(|(index, _)| index))
+        .tensor_names()
+        .filter_map(|name| indexed_tail(name, "mtp.").map(|(index, _)| index))
         .max()
         .map_or(0, |max| max + 1)
 }
@@ -264,7 +263,7 @@ fn v41_spec(checkpoint: &Checkpoint) -> Result<ModelSpec> {
     // the owners explicitly.
     let has_indexer = |layer: usize| {
         let prefix = format!("layers.{layer}.attn.indexer.");
-        checkpoint.tensors.iter().any(|t| t.meta.name.starts_with(&prefix)) || index_sources.contains(&layer)
+        checkpoint.tensor_names().any(|name| name.starts_with(&prefix)) || index_sources.contains(&layer)
     };
     let layer_specs = (0..layers)
         .map(|layer| LayerSpec {

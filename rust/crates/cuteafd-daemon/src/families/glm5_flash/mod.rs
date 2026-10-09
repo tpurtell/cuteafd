@@ -1174,13 +1174,10 @@ impl Opened {
 
 pub(crate) fn open(args: &EngineArgs) -> Result<Opened> {
     check_options(args)?;
-    let checkpoint = Checkpoint::open(&args.snapshot)?;
-    ensure!(checkpoint.missing_shards.is_empty(), "checkpoint shards missing: {:?}", checkpoint.missing_shards);
+    let checkpoint = Checkpoint::coordinator(&args.snapshot, args.local_experts, false)?;
     let cfg = GlmNextConfig::read(&args.snapshot)?;
-    let fp8_checkpoint = args.fp8_snapshot.as_deref().map(Checkpoint::open).transpose()?;
-    if let Some(checkpoint) = &fp8_checkpoint {
-        ensure!(checkpoint.missing_shards.is_empty(), "FP8 checkpoint shards missing: {:?}", checkpoint.missing_shards);
-    }
+    let fp8_checkpoint = args.fp8_snapshot.as_deref()
+        .map(|snapshot| Checkpoint::coordinator(snapshot, false, false)).transpose()?;
     header::check_kda_inputs(&checkpoint, &cfg, args.layers.unwrap_or(cfg.layers))?;
     precision::check_projection_inputs(&checkpoint, fp8_checkpoint.as_ref(), &cfg,
         args.layers.unwrap_or(cfg.layers))?;
