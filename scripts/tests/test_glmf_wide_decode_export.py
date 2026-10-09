@@ -51,6 +51,48 @@ def exporter(monkeypatch):
     return module
 
 
+@pytest.mark.parametrize("geometry,checkpoint,limit", [
+    ("flash", "deepseek-ai/DeepSeek-V4-Flash-0731", 1048576),
+    ("pro", "deepseek-ai/DeepSeek-V4-Pro-0813", 1048576),
+    ("glm", "zai-org/GLM-5.3", 1048576),
+    ("glmf", "zai-org/GLM-5.3-Flash", 1048576),
+    ("qwen4", "Qwen/Qwen3.8-Flash-Next", 262144),
+])
+def test_checkpoint_extent_table_and_head_splits(exporter, geometry, checkpoint, limit):
+    assert exporter.CHECKPOINT_CONTEXTS[geometry] == (checkpoint, limit)
+    for name in (geometry, geometry + "2") if geometry != "qwen4" else (geometry,):
+        assert exporter.geometry_context(name, 131072) == 131072
+        assert exporter.geometry_context(name, 1048576) == limit
+        assert exporter.geometry_context(name, 2097152) == limit
+    with pytest.raises(ValueError, match="positive"):
+        exporter.geometry_context(geometry, 0)
+
+
+def test_wide_index_uses_clamped_extent(exporter):
+    extent = exporter.geometry_context("glmf", 2097152)
+    base = exporter.glmf_programs(GEOMETRY, 64, 4096, extent)
+    wide = exporter.glmf_wide_decode_programs(GEOMETRY, 64, 128, extent)
+    for _, op, params, thunk in base + wide:
+        if op == "index_topk":
+            assert params["max_pages"] == 4096
+            assert thunk()[3]["max_pages"] == 4096
+
+
+def test_builds_pass_the_extent_explicitly(exporter):
+    cmake = (ROOT / "native/CMakeLists.txt").read_text()
+    assert 'set(CUTEAFD_DSV4_MAX_CONTEXT "1048576" CACHE STRING' in cmake
+    assert exporter.DEFAULT_MAX_CONTEXT == 1048576
+    for mode, entry in (("RELEASE", "build.sh"), ("WIP", "wip.sh")):
+        variable = f'CUTEAFD_{mode}_DSV4_MAX_CONTEXT'
+        assert f'-DCUTEAFD_DSV4_MAX_CONTEXT="${{{variable}:-1048576}}"' in (
+            ROOT / f'scripts/build/build-{mode.lower()}-artifacts.sh').read_text()
+        assert f'-e "{variable}=${{{variable}:-1048576}}"' in (ROOT / entry).read_text()
+    source = EXPORTER.read_text()
+    assert '"max_context": args.max_context' in source
+    assert 'manifest["family_capacities"][family] = {"max_context": extent}' in source
+    assert 'make(g, args.decode_rows, args.prefill_rows, extent)' in source
+
+
 def test_the_wide_programs_are_new_m128_stems(exporter):
     base = exporter.glmf_programs(GEOMETRY, 64, 4096, 131072)
     wide = exporter.glmf_wide_decode_programs(GEOMETRY, 64, 128, 131072)

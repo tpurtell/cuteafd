@@ -79,6 +79,27 @@ mod tests {
     }
 
     #[test]
+    fn every_indexed_family_clamps_old_exports_and_lifts_with_one_million() {
+        for (family, checkpoint) in [("deepseek_v4", 1048576), ("glm5", 1048576),
+            ("glm5_flash", 1048576), ("qwen4", 262144)] {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join("config.json"), serde_json::json!({
+                "max_position_embeddings": checkpoint }).to_string()).unwrap();
+            let path = dir.path().join("PROGRAMS.json");
+            for extent in [131072, 1048576] {
+                std::fs::write(&path, serde_json::json!({"capacities": {
+                    "max_context": extent }}).to_string()).unwrap();
+                let supported = extent.min(checkpoint);
+                assert_eq!(checkpoint_context(dir.path(), &path, family, 0).unwrap(), supported);
+                assert!(checkpoint_context(dir.path(), &path, family, supported + 1).is_err());
+                let limits = cuteafd_api::native_v41::NativeLimits::new(supported as u32, 1024).unwrap();
+                assert_eq!(limits.context(), supported as u32);
+                assert!(limits.output_for_prompt(supported + 1, 1).is_err());
+            }
+        }
+    }
+
+    #[test]
     fn defaults_clamp_to_compiled_support_and_pool_with_margin_but_explicit_fails() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("config.json"), r#"{"text_config":{"max_position_embeddings":1048576}}"#).unwrap();

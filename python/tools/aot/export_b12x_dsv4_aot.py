@@ -34,6 +34,24 @@ import _pinned_sparkinfer
 
 SCALAR_KINDS = {"int32": "i", "int64": "l", "float32": "f"}
 PAGE_ROWS = 64
+DEFAULT_MAX_CONTEXT = 1048576
+# max_position_embeddings from these checkpoints' config.json. Head splits
+# retain the same context geometry. MiMo has no compiled index extent.
+CHECKPOINT_CONTEXTS = {
+    "flash": ("deepseek-ai/DeepSeek-V4-Flash-0731", 1048576),
+    "pro": ("deepseek-ai/DeepSeek-V4-Pro-0813", 1048576),
+    "glm": ("zai-org/GLM-5.3", 1048576),
+    "glmf": ("zai-org/GLM-5.3-Flash", 1048576),
+    "qwen4": ("Qwen/Qwen3.8-Flash-Next", 262144),
+}
+
+
+def geometry_context(name: str, requested: int) -> int:
+    if requested <= 0:
+        raise ValueError("max_context must be positive")
+    base = name[:-1] if name.endswith("2") else name
+    checkpoint = CHECKPOINT_CONTEXTS.get(base)
+    return min(requested, checkpoint[1]) if checkpoint else requested
 
 
 def validate_table_residency(stem: str, geometry: dict, *, diagnostic: bool = False) -> None:
@@ -503,7 +521,7 @@ def main() -> None:
                         help="with glmf: also the decode and verify programs at this many rows (serve "
                              "--decode-rows 128), new stems after every other program; 0 exports none")
     parser.add_argument("--prefill-rows", type=int, default=4096)
-    parser.add_argument("--max-context", type=int, default=131072)
+    parser.add_argument("--max-context", type=int, default=DEFAULT_MAX_CONTEXT)
     parser.add_argument("--only", help="comma-separated stem suffixes (diagnostics)")
     args = parser.parse_args()
 
@@ -527,6 +545,7 @@ def main() -> None:
     manifest = {
         "schema": 1,
         "families": {},
+        "family_capacities": {},
         "capacities": {"decode_rows": args.decode_rows, "prefill_rows": args.prefill_rows,
                        "max_context": args.max_context},
         "sparkinfer_revision": _pinned_sparkinfer.REVISION,
@@ -570,17 +589,19 @@ def main() -> None:
         family = {"flash": "dsv4f", "flash2": "dsv4f2", "pro": "dsv4p", "pro2": "dsv4p2", "glm": "glm", "glm2": "glm2", "mimo": "mimo", "mimop": "mimop",
                   "mimo2": "mimo2", "mimop2": "mimop2", "mimof": "mimof", "mimof2": "mimof2", "glmf": "glmf", "glmf2": "glmf2", "qwen4": "qwen4"}[name]
         manifest["families"][family] = {k: v for k, v in vars(g).items()}
+        extent = geometry_context(name, args.max_context)
+        manifest["family_capacities"][family] = {"max_context": extent}
         make = {"flash2": head_split_programs, "pro2": head_split_programs, "glm": glm_programs,
                 "glm2": glm_head_split_programs, "mimo": mimo_programs, "mimop": mimo_programs,
                 "mimo2": mimo_head_split_programs, "mimop2": mimo_head_split_programs,
                 "mimof": mimo_programs, "mimof2": mimo_head_split_programs,
                 "glmf": glmf_programs, "glmf2": glmf_head_split_programs,
                 "qwen4": qwen4_programs}.get(name, programs)
-        work += [(family, *item) for item in make(g, args.decode_rows, args.prefill_rows, args.max_context)]
+        work += [(family, *item) for item in make(g, args.decode_rows, args.prefill_rows, extent)]
     if "glmf" in geometries:
         # Last, so every program above compiles exactly as before.
         work += [("glmf", *item) for item in glmf_wide_decode_programs(GLM53_FLASH, args.decode_rows,
-                                                                       args.glmf_wide_decode_rows, args.max_context)]
+                                                                       args.glmf_wide_decode_rows, geometry_context("glmf", args.max_context))]
     for family, suffix, op, params, thunk in work:
         if selected is not None and suffix not in selected:
             continue
