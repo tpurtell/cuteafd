@@ -3368,6 +3368,364 @@ not upstreams.
      `Transcriber`.
    - `ha-openai-realtime` (Pipecat) needs its base URL exposed.
 
+## v3 agent workspace: DSH embedded in the dashboard (research, 2026-10-10)
+
+TJ: the workspace is DeepSeek Harness (DSH, MIT) embedded in the dashboard.
+It uses the local model by default, and other models can still be registered
+normally. Configuration lives in a mounted folder. The main connection is a
+session-oriented WebSocket. All execution runs over SSH, with keys and hosts
+registered in the UI and folder picking on those hosts. The early features
+are editing any message (including replies and thinking) and steering while
+a prefill or decode runs.
+
+Read at `deepseek-harness` d7432673 (0.2.1-alpha.2; npm `latest` is
+0.2.0-rc.2), `dsh-desktop` 03dcfa1, `awesome-dsh-plugin` dc8396d and
+`@earendil-works/pi-ai` 1.1.0 (dist only). Clones are in
+`~/.cache/cuteafd/builds/dsh-research/src/`. Paths below are relative to
+`deepseek-harness/` unless marked `pi-ai:` or `ours:` (this repo).
+
+### What DSH is
+
+- **Runtime.** A Node host (Node `^22.19 || >=24`) composed of Cordis plugins
+  from ordered YAML patches, plus a React SPA. Everything is a plugin,
+  including the agent loop (`docs/architecture.md:9-13`). The SPA calls
+  `POST /api/<ns>/<method>` and streams over one WebSocket,
+  `/api/remote.mux` (`packages/api/gateway/src/stream-protocol.ts:7`). The
+  Electron desktop and `dsh-desktop` (a community shell) are both this same
+  host plus a window; `dsh-desktop` pins upstream commits and adds only
+  plugins (`dsh-desktop/upstream.json`).
+- **Agent loop.** A step is one model request plus the tools it calls. Each
+  attempt derives the whole model history from the session log, freezes it,
+  and streams it through one adapter call (`packages/core/agent-loop/src/agent.ts:688`).
+  The loop's rule is "**model-visible means logged**": every request must be
+  reconstructable from the append-only log (`docs/architecture.md:124`). DSH
+  owns its transcript.
+- **Models.** `llm-pi-ai` routes are pure config: `api`
+  (`openai-completions`, `openai-responses` or `anthropic-messages`),
+  `baseURL`, `models` and a credential reference (`packages/llm/llm-pi-ai/src/provider.ts:47`,
+  `config.ts:91-160`). The Models settings page can add a custom provider,
+  and settings persist into the profile's `cordis.patch.yml`
+  (`packages/settings/settings/src/index.ts:377`).
+- **Tools.** They run through the `ctx.fs`, `ctx.subprocess` and
+  `ctx.sandbox` seams. The SSH family (`packages/ssh/*`) implements all three
+  on one remote host.
+- **State.** Everything lives under `$DSH_HOME` (default `~/.dsh`,
+  `packages/util/home-paths/src/index.ts:124`): profiles and plugins,
+  `.credentials.yaml`, `sessions/`, `storages/` and `attachments/`. Agent
+  instructions use `$DSH_AGENTS_HOME` (default `~/.agents`).
+- **Stability.** Upstream declares its public APIs pre-stable
+  (`AGENTS.md:7`). Our plugins will break on bumps, so we pin an exact
+  version.
+
+### Findings per requirement
+
+**a. Local model as default: config only, no code.** Add a `cuteafd`
+pi-ai route and set `agent-default-model` to it. The base bundle ships
+`deepseek-official/deepseek-flash` (`packages/bundle/base/cordis.patch.yml:85-89`,
+`packages/core/agent-default-model/src/index.ts:24`). Other providers stay
+registrable; only a duplicate route name fails. Two caveats:
+- The route must carry a credential reference. Otherwise the post-login
+  `initializeDefaultModel` can switch the default to `deepseek-account`
+  (`packages/api/session-controller/src/index.ts:300`), and pi-ai's
+  OpenAI-compatible client insists on a key anyway. Give the route our
+  gateway key.
+- **Today only `/v1/chat/completions` reaches the engine.** Messages,
+  Responses and Realtime still run on the upstream test backend until
+  phase B step 1 (ours: `README.md:346-348`). Stage 1 therefore uses
+  `api: openai-completions`, which carries `reasoning_content`
+  (pi-ai: `api/openai-completions.js:400`). Switch to `anthropic-messages`
+  or the adapter in stage 6 once the Engine backend lands.
+
+**b. Session-oriented main connection: the central question.** These are the
+facts that decide it:
+1. **DSH must keep the transcript.** The adapter seam is
+   `stream(GenerateOptions) -> AsyncIterable<StreamChunk>`, carrying the
+   full frozen `messages`, a `sessionId` and an `AbortSignal`. It ends in one
+   terminal `finish` with "nothing afterward"
+   (`packages/llm/llm/src/index.ts:208`, `types.ts:444-462,546`).
+   - Retries re-derive the same step and must not duplicate items
+     (`agent.ts:406,505`).
+   - Compaction replaces history ranges (`packages/compaction/compaction-basic/src/region.ts:507`).
+   - The system prompt is a logged node that can be replaced or cleared
+     (`agent.ts:416`).
+   - Any replacement starts a new request series (`agent.ts:631`).
+
+   A server that owns the history and edits it can't push those edits back:
+   DSH's next request would contradict them. **So our server holds a cache of
+   DSH's history, never the truth.**
+2. **Realtime as-is clashes.** The adapter would have to mirror the log into
+   Realtime items. Each step it would diff the frozen messages against the
+   server's item list, then issue `conversation.item.create`/`delete` and
+   `session.update` (instructions) before `response.create`, mapping DSH
+   message ids to item ids. That is workable, but it is the most code for
+   the least gain:
+   - Realtime has no reasoning events (ours: `gateway/realtime/response.rs:208`),
+     so thinking would be lost.
+   - Sessions expire after 1 h (ours: `gateway/realtime.rs:158`).
+   - Every compaction, edit or retry becomes delete/insert churn.
+
+   Realtime stays the voice API.
+3. **Responses with `previous_response_id` fits as-is.** pi-ai already
+   implements exactly this, for Codex only, as transport `websocket-cached`.
+   It keeps one socket per session, and when the new input extends the last
+   request plus its output, it sends `previous_response_id` and only the
+   delta. Otherwise it sends everything (pi-ai:
+   `api/openai-codex-responses.js:1131-1158,1175`). Snapshots are immutable,
+   so retries and forks are free.
+   - Our gateway already serves a Responses WebSocket with snapshot
+     continuation (ours: `gateway/responses.rs:39,338`).
+   - pi-ai refuses Codex transport on hand-declared routes
+     (`packages/llm/llm-pi-ai/src/provider.ts:37-41`), and its plain
+     `openai-responses` path is HTTP only. Reaching it needs our own adapter
+     plugin, `dsh-llm-cuteafd` (about 300 lines: the same delta rule plus
+     our events).
+4. **Plain HTTP already reuses KV.** The engine prefix cache keeps the
+   finished turn and matches the next full-history prompt by tokens. That
+   holds only if each family's template re-renders earlier turns
+   byte-identically. Templates that drop older reasoning break the match at
+   the first assistant turn. Measure the per-step hit rate in the spike.
+
+**Decision (recommended).** The main connection is a per-session WebSocket:
+the Responses WebSocket with `previous_response_id` deltas, plus cuteafd
+extension events on the same socket (`cuteafd.steer.inject`, later KV
+hints). It is session oriented in the sense that matters: one socket per
+DSH session, the server keeps the live sequence, input is delta-only on the
+happy path, and the channel stays open mid-stream for steering. The history
+contract stays DSH's. Edits need no `SessionOp`s on the wire: a non-matching
+prefix sends the full input, and the prefix cache recomputes from the first
+differing token, which is the same `RecomputeFrom` effect.
+
+**c. Execution over SSH: seams exist, Web integration does not.**
+- **What exists.** `dsh-ssh` launches the system `ssh` with an OpenSSH host
+  alias that carries its own user, key and known-host settings. It sets
+  `BatchMode=yes`, `StrictHostKeyChecking=yes` and `ForwardAgent=no`, and
+  discards stderr (`packages/ssh/ssh/src/index.ts:33,299-309`).
+  - It needs a pre-installed helper with a pinned hash.
+  - Linux arm64 and x64 (glibc 2.28) helper builds embed Node, so Sparks
+    need no Node (`packages/ssh/ssh-helper-runtime/README.md:40-41`).
+  - There is one host per `SshConnection`. Per-host agent presets with
+    `isolate` realms look feasible but are not a shipped feature.
+- **What is missing** (upstream: "Web workspace views … need separate
+  integration", `docs/subsystems/ssh.md:27`):
+  - The folder picker reads the host's own disk through `node:fs` from
+    `homedir()` (`packages/host/directory-picker-browse/src/index.ts:12,217`).
+    It needs an SSH-backed `ctx.directoryPicker` provider; the seam is
+    replaceable.
+  - Workspace creation calls `stat`/`realpath` on the host
+    (`packages/workspace/workspace/src/index.ts:237`). This needs a
+    host-aware `WorkspaceRegistry` replacement, which is the main fork risk.
+  - `@file` completion is local (`file-reference-local`).
+  - `fs-ssh` has no `watch`, so live file-change views fail.
+  - There is no key or host registration UI.
+- **Verdict.** Plugins plus a probable small upstream PR for workspace
+  identity. The `dsh-ssh-ops` plugin in the catalog is a separate ssh tool
+  set, not an executor. Ignore it.
+
+**d. Persistent config in one mounted folder: yes, with three extra
+variables.** Set `DSH_HOME=/data/dsh`, `DSH_AGENTS_HOME=/data/agents` and
+`HOME=/data/home`. `HOME` matters because OpenSSH reads
+`~/.ssh/config`/`known_hosts`, which hold the generated host aliases.
+`.credentials.yaml` is plaintext YAML at 0600 in a 0700 directory
+(`packages/credentials/credentials-local/src/index.ts:702`).
+
+**e. Edit any message: plugin, no fork.**
+- **DSH side.** Committed events are frozen. A plugin-owned event with a
+  registered message projection (`packages/core/session/src/index.ts:1066`,
+  `docs/subsystems/session.md:363`) replaces a message's content in place,
+  including reasoning blocks, and keeps its identity. The loop then starts a
+  new request series. Restore and fork need the same plugin loaded.
+- **UI.**
+  - The visible transcript reads append-origin events, not the projected
+    surface (`docs/subsystems/session.md:358`). The edit UI must therefore
+    render the projected text through a keyed `conversation.chat.node`
+    renderer.
+  - Upstream has an assistant-actions slot (`packages/client/ui-chat/src/client/contract/slots.ts:414`)
+    but no user-actions slot. `dsh-webchatlike` patches one in and does
+    edit-as-fork; its fork model is the prior art for "edit then branch".
+- **Signatures.** pi-ai replay checks only the block count and type, so
+  edited thinking would replay a stale signature
+  (`packages/llm/llm-pi-ai/src/replay.ts:187`). The plugin must drop replay
+  metadata on edited messages.
+  - Real Anthropic and OpenAI upstreams then see unsigned or plain
+    reasoning. Anthropic rejects modified signed thinking, so edits to an
+    upstream model's thinking go out as unsigned or omitted thinking; say so
+    in the UI.
+  - Our engine has no constraint. Anthropic signatures are synthesized
+    opaque values, accepted unverified on input (ours:
+    `gateway/anthropic/render.rs:86`, `request.rs:78`).
+  - **One gateway fix:** on Responses input, the text inside a cuteafd
+    `encrypted_content` token wins over the visible reasoning text (ours:
+    `gateway/responses/parse.rs:554-560`). A client that edits the summary
+    and replays the old token silently gets the old thought. Prefer the
+    visible text when both are present and differ, or reject the mismatch.
+- **Our session layer** needs nothing new for edits over full-history
+  requests (see b).
+
+**f. Steering mid-prefill or mid-decode.**
+- **What DSH does today.** `steer()` queues next-step input
+  (`agent.ts:166`) that is claimed only after the current request and its
+  tools finish (`agent.ts:361`). The composer already has busy-Enter
+  steering (`packages/client/ui-conversation/src/submission-settings.ts:12`).
+  The adapter has no injection concept. That is fine for agent turns, but
+  it is not mid-generation.
+- **Cheap version, no engine work.** Make steer cancel with `keepInbox`.
+  DSH commits the delivered prefix as an `interrupted` assistant message
+  (`agent.ts:465`), then the steer message starts the next request.
+  - What it costs: recomputing the decoded tail. The prefix cache parks a
+    cancelled prefill but does not keep a cancelled decode (ours:
+    `rust/crates/cuteafd-engine/src/prefix/cache.rs:14`).
+  - Engine fix: park a decode cancelled at a step boundary as a `Prompt`
+    snapshot. This is small, and the same fix serves Realtime barge-in.
+- **True version (phase B step 3, `Steer::Inject`, ours:
+  `gateway/session.rs:60`, stubbed at `:190`).** The adapter sends
+  `cuteafd.steer.inject` on the session socket. The engine appends the
+  injected tokens at the next decode step or prefill chunk and acks with the
+  split point.
+  - The adapter then ends its stream at the split with a normal `finish`.
+    DSH commits part 1, claims the steer as next-step input, and the next
+    request matches the server's live sequence, so the server attaches to the
+    already-running continuation instead of starting over.
+  - The engine's token sequence must equal what the template renders for
+    `…assistant(part 1) + user(steer)` as a closed assistant turn. That is a
+    golden gate. Inject only at safe points: never inside a tool-call
+    argument or before the first visible token.
+  - Phase B's listed primitive covers the engine half. The missing half is
+    the wire event, the split-and-adopt rule, and the byte-identity gate.
+
+### Embedding as a styled facet
+
+- **Where it runs: a sidecar container** on the coordinator host, from a
+  pinned `@deepseek-ai/dsh` image. It binds 127.0.0.1:PORT, and the volume
+  above is its only mount.
+  - It never goes in the engine image (Node toolchain, separate lifecycle
+    and crashes) and never in the browser alone (the browser-only WebWorker
+    preview is not a supported launcher, `docs/architecture.md:45`).
+  - `run.sh --agent` (or a separate `scripts/launch/agent.sh`) starts it.
+- **Mount: a same-origin sub-path, framed.**
+  - The coordinator reverse-proxies `/agent/app/*`, including the
+    `api/remote.mux` WebSocket upgrade, to the sidecar with the prefix
+    stripped. DSH supports this: relative Vite base, `--public-url …/ui/
+    --trusted-host` (`packages/bundle/web-app/src/startup.ts:77`,
+    `apps/web/vite.config.ts:168`).
+  - The dashboard page `/agent` is our header plus a full-height
+    same-origin iframe of `/agent/app/`.
+  - The iframe isolates our global CSS (`header`, `*` and `body` rules in
+    `cuteafd-ui.css`) from DSH's CSS modules and back. DSH sets no
+    `X-Frame-Options`, and same origin passes its Origin fence. A direct
+    mount would need a fork-sized CSS audit for no gain.
+  - Add `{id:'agent', href:'/agent', label:'AGENT'}` to `PAGES` (ours:
+    `assets/cuteafd-ui.js:53`).
+- **Theme: a plugin, no fork.** A client plugin (`@cuteafd/dsh-facet`)
+  calls `ctx.theme.register({id:'cuteafd', colorScheme:'dark', tokens})`,
+  mapping our `--bg/--panel/--ink/--line` and accents onto `--dsw-*`
+  (`packages/client/ui-theme/src/client/index.ts:311,344`). It replaces
+  `ui-brand-official` with our mark and sets the preference at boot, because
+  custom theme ids don't persist. The dashboard is dark only (ours:
+  `cuteafd-ui.css:5`), so lock DSH to dark.
+- **Bundle.** `dsh-web-frontend` is 5.7 MB unpacked (npm 0.2.0-rc.2,
+  132 files), plus the per-plugin client bundles. The sidecar serves it, not
+  our binary, so the console stays self-contained. There are no runtime CDN
+  fetches (fonts are local). The cost is paid only on `/agent`.
+- **Auth.** Rule kept: the console cookie never grants API access, and no
+  exception is needed.
+  1. The coordinator gates `/agent` and `/agent/app/*` with `ConsoleGate`.
+     DSH does not authenticate its static assets itself.
+  2. DSH has its own auth: a process-random launch `?token=` buys an HMAC
+     cookie (`HttpOnly; SameSite=Strict; Path=/`, the name hashed per
+     authority). See `packages/client/connection/src/browser-auth.ts:52,129,250`.
+     - Our sidecar plugin disables `printUrl` (`packages/bundle/web-app/src/index.ts:67,279`)
+       so the token never reaches `docker logs`. It writes the
+       authenticated URL to a 0600 file on a tmpfs shared with the
+       coordinator.
+     - On an unlocked visit without a DSH cookie, the coordinator performs
+       the token exchange server-side and relays the `Set-Cookie`, so the
+       token never reaches the browser.
+  3. The DSH host calls the gateway with its own key, stored in
+     `.credentials.yaml` and resolved as the route's `apiKeyEnv` reference.
+     The browser never calls `/v1`.
+  4. Recommended: a second gateway key, `agent`, so the usage tracker
+     attributes this traffic. `require_key` takes one key today (ours:
+     `openai/auth.rs:76`).
+
+### Security
+
+- **SSH private keys.** `/data/home/.ssh/keys/<alias>`, 0600, inside a 0700
+  tree owned by the sidecar uid. Pin `known_hosts` at registration, with
+  the fingerprint shown and confirmed in the UI. The generated `ssh_config`
+  sets `IdentitiesOnly yes`. Keys never enter git, images, settings YAML or
+  logs; `dsh-ssh` already discards ssh stderr.
+- **Readable by the model?** Not through normal tools when every execution
+  seam is SSH: `fs-ssh` has no local fallback. Three holes need closing:
+  - `plugin_manager` installs host code after one approval, and the
+    standard preset includes it (`packages/bundle/web-app/presets/standard.patch.yml:135`).
+    Disable it and the `cordis` creator preset.
+  - Mount no local shell, fs or ptc rows.
+  - Any trusted host plugin can read `.credentials.yaml`. File modes don't
+    stop same-uid code, which is why only our pinned plugins run.
+- **What reaches a remote provider.** The full transcript on every request:
+  prompts, tool outputs, remote file contents, paths and host names. The
+  same goes for title and compaction side calls (`purpose`,
+  `packages/llm/llm/src/types.ts:552`), which go to the default model. That
+  is acceptable per TJ for LAN details. Never keys: they don't reach tools,
+  agent forwarding is off, and secrets stay out of tool output.
+- **Telemetry.** DSH's feedback telemetry posts to `deepseeksvc.com` by
+  default (`packages/bundle/base/cordis.patch.yml:200-220`), and its
+  redaction ships no rules. Set `DSH_TELEMETRY_DISABLED=1` in the sidecar.
+
+### Staged steps and gates
+
+| # | Step | Size | Needs phase B | Gate |
+|---|------|------|---------------|------|
+| 0 | Spike: sidecar plus `/agent/app/` proxy, `openai-completions` route to the engine's chat path, default model, telemetry off, volume layout | S | no | A coding task completes through the dashboard on the local model; the WebSocket survives the proxy; per-step prefix-cache hit rate and bundle size measured; `docker logs` holds no token or key; the console cookie gets 401 on `/v1/*` |
+| 1 | Facet: nav entry, iframe page, server-side DSH cookie bootstrap, `@cuteafd/dsh-facet` theme and brand, lock-down patch (plugin manager, creator preset and telemetry off) | S | no | Visual check; locked console means locked agent; no DSH token in browser history |
+| 2 | Remote execution: `@cuteafd/dsh-remote` with a host and key settings card (alias, user, port, key paste, `known_hosts` confirm), helper install and hash, one preset per host (ssh realm), SSH directory picker, host-aware workspace registry | M | no | On one Spark, bash, read, edit and terminal run remotely; the picker browses the Spark; tools that try every path to the key fail; a second host works in a second session at once |
+| 3 | Edit any message: projection event, edit UI on user and assistant nodes (reasoning included), signature drop, gateway fix for Responses reasoning precedence | S | no | Edited reasoning appears in the next request (recorder tape); recompute starts at the edit, not at 0; restore and fork of an edited session work |
+| 4 | Steer by interrupt: busy-Enter cancels with `keepInbox` and resends; engine parks a cancelled decode as a `Prompt` snapshot | S | engine change only | Steer-to-first-token latency before → after; no recompute of the kept prefix |
+| 5 | `dsh-llm-cuteafd` adapter: Responses WebSocket per session, `previous_response_id` deltas, full resend on mismatch | M | step 1 (Engine backend) | Server-side requests byte-identical to the HTTP path on recorded sessions with retry, compaction and edit; bytes per step before → after; no C1 regression |
+| 6 | True mid-generation steer: `cuteafd.steer.inject`, split-and-adopt in the adapter | L | step 3 (inject) | Injected tokens prefilled only; the logged history re-renders the engine's exact token sequence (golden); emitted tok/s under steering |
+
+**Spike unknowns** (step 0, about a day):
+- whether the proxy needs header rewriting beyond `trustedHosts`;
+- the template prefix-stability hit rate per family;
+- whether the sidecar's pnpm plugin install works offline from the volume.
+
+**Unknowns for step 2:**
+- whether a `WorkspaceRegistry` replacement is enough, or an upstream PR is
+  needed;
+- whether per-host realms isolate the terminal, LSP and jobs cleanly.
+
+**Hooks for later (not designed):**
+- **Server-side auto-compaction:** replace `compaction-basic` with a plugin
+  that requests a summarize op.
+- **History manipulation and KV splicing:** projection events.
+- **Virtual forking:** DSH fork at a sequence number maps to a
+  `previous_response_id` parent, which shares KV pages.
+- **Model introspection ("j space"):** a sidebar panel slot fed by extension
+  events.
+
+### Open questions for TJ (with recommendations)
+
+1. **Main connection.** Realtime as-is, or the Responses WebSocket plus
+   cuteafd events? *Responses WebSocket.* Realtime fights DSH's transcript
+   and drops reasoning; it stays for voice.
+2. **Where DSH runs.** Sidecar container, or inside the coordinator image?
+   *Sidecar.*
+3. **Facet form.** Same-origin iframe, or a direct mount? *Iframe.*
+4. **A separate `agent` API key** for usage attribution? *Yes*; gateway auth
+   gains a small multi-key file.
+5. **Volume location.** *A host-local `~/.local/share/cuteafd/agent` (0700),*
+   never sparknest or the repo, because it holds SSH keys.
+6. **Which hosts the agent may target.** *Any registered host,* with the
+   cluster hosts tagged "serving" and a confirm when a model is up there.
+7. **DSH version.** Stable 0.2.0-rc.2 or alpha 0.2.1-alpha.2? *Pin exact,
+   start on the alpha that `dsh-desktop` beta tracks,* and bump deliberately,
+   because the APIs are pre-stable.
+8. **Upstream PRs** (user-actions slot, remote-aware Web workspace) or
+   local patches? *Upstream PRs first,* with our plugin carrying a shim
+   until they land.
+9. **Single operator.** DSH has one operator identity, so the workspace is
+   single-operator. *Accept.*
+
 ## API usage tracker and console access (design, 2026-10-09)
 
 TJ: "add to the dashboard an API tracker that keeps some request log data,
