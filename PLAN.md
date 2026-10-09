@@ -3335,17 +3335,15 @@ not upstreams.
      session config, and a scope of Realtime only.
    - The gateway auth accepts the token until it expires.
    - Phase A returns an explicit unsupported error for both routes.
-3. **WebRTC transport,** or a recorded decision not to support it:
-   - It needs `POST /v1/realtime/calls` (SDP offer/answer), an ICE/DTLS-SRTP
-     stack such as webrtc-rs, Opus encode/decode, and a data channel carrying
-     the same event model.
-   - Together with item 2, it unlocks the official browser apps unmodified:
-     `openai-realtime-console` (WebRTC + `/realtime/calls` +
-     `client_secrets`) and `openai-realtime-agents` (Agents WebRTC +
-     `/realtime/sessions`). It also unlocks Agents JS's browser WebRTC
-     transport.
-   - Every headless client already works over WebSocket: openai-python,
-     openai-node, Agents JS/Python, Pipecat and LiveKit.
+3. **WebRTC: not in v3** (TJ, 2026-10-10: "For v3 I think we will skip
+   webrtc"). Realtime is WebSocket only. Every headless client works over it:
+   openai-python, openai-node, Agents JS/Python, Pipecat and LiveKit.
+   `POST /v1/realtime/calls` keeps answering unsupported. The cost of
+   skipping: the official browser apps (`openai-realtime-console`,
+   `openai-realtime-agents`) and Agents JS's browser WebRTC transport don't
+   run unmodified. Adding it later needs an ICE/DTLS-SRTP stack (e.g.
+   webrtc-rs), Opus encode/decode, and a data channel carrying the same event
+   model.
 4. **Home Assistant bridge:**
    - Wyoming satellites → Realtime.
    - HA `openai_stt_ha` speaks `?intent=transcription` and needs a real
