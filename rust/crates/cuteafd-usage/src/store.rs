@@ -150,9 +150,12 @@ fn sql_value(v: &serde_json::Value) -> SqlValue { match v {
     serde_json::Value::String(s) => SqlValue::Text(s.clone()), _ => SqlValue::Null,
 } }
 pub(crate) fn read_records(c: &Connection) -> Result<Vec<Record>> {
-    let mut stmt = c.prepare("SELECT * FROM requests ORDER BY ts_ms,id")?;
+    read_records_query(c, "SELECT * FROM requests ORDER BY ts_ms,id", vec![])
+}
+pub(crate) fn read_records_query(c: &Connection, sql: &str, args: Vec<SqlValue>) -> Result<Vec<Record>> {
+    let mut stmt = c.prepare(sql)?;
     let columns = stmt.column_names().iter().map(|s| s.to_string()).collect::<Vec<_>>();
-    let rows = stmt.query_map([], |row| {
+    let rows = stmt.query_map(rusqlite::params_from_iter(args), |row| {
         let mut object = serde_json::Map::new();
         for (i, name) in columns.iter().enumerate().skip(1) {
             let v: SqlValue = row.get(i)?;

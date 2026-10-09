@@ -51,6 +51,7 @@ impl ApiPolicy {
             });
             (cuteafd_bench::http::mount(router, bench), Some(internal))
         } else { (router, None) };
+        let router = if let Some(store) = &self.usage { cuteafd_usage::http::mount(router, store.clone(), self.gate.clone()) } else { router };
         let router = self.gate.mount(router);
         tracing::info!("console: protected views unlock through the launcher's link");
         let router = router.layer(axum::middleware::from_fn_with_state(Auth { key: self.key, internal },
