@@ -204,6 +204,33 @@ impl Session {
     }
 }
 
+impl Session {
+    /// Realtime uses client-chosen ids and announces output ids before completion.
+    /// Validate first, then retain the normal operation's effects and revision.
+    pub fn apply_with_item_id(&mut self, op: SessionOp, id: String) -> Result<OpOutcome, GatewayError> {
+        if id.is_empty() || id.len() > 128 || !id.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_' || c == b'-') {
+            return Err(GatewayError::invalid("item id must be 1-128 alphanumeric, underscore or hyphen characters").with_param("item.id"));
+        }
+        if self.items.iter().any(|item| item.id == id) {
+            return Err(GatewayError::invalid("item id already exists").with_param("item.id"));
+        }
+        let creates_one = match &op {
+            SessionOp::Insert { .. } => true,
+            SessionOp::Append { items } => items.len() == 1,
+            _ => false,
+        };
+        if !creates_one {
+            return Err(GatewayError::invalid("apply_with_item_id requires insert or single-item append"));
+        }
+        let mut outcome = self.apply(op)?;
+        let generated = outcome.created[0].clone();
+        let index = self.index_of(&generated)?;
+        self.items[index].id = id.clone();
+        outcome.created = vec![id];
+        Ok(outcome)
+    }
+}
+
 fn recompute(index: usize, len: usize) -> EngineEffect {
     if index >= len { EngineEffect::PrefixKept } else { EngineEffect::RecomputeFrom { index } }
 }
