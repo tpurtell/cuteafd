@@ -82,6 +82,10 @@ fn gateway(provider: Option<Arc<dyn SearchProvider>>) -> Arc<Gateway> {
         ModelMap::single("served-model"),
     );
     gateway.search = provider;
+    gateway
+        .standalone_search
+        .next_turn
+        .store(0, Ordering::Relaxed);
     Arc::new(gateway)
 }
 fn app(gateway: Arc<Gateway>) -> Router {
@@ -360,4 +364,88 @@ async fn exa_contents_and_recency_wire_are_bounded() {
     assert_eq!(requests[1]["ids"], json!(["https://example.org"]));
     assert_eq!(requests[1]["text"]["maxCharacters"], 32768);
     task.abort();
+}
+
+#[tokio::test]
+async fn stale_references_do_not_alias_after_expiry_or_eviction() {
+    let gateway = gateway(Some(Arc::new(Fake::default())));
+    let app = app(gateway.clone());
+    let (_, first) = post(&app, request(json!({"search_query":[{"q":"first"}]})), true).await;
+    let old = first["results"][0]["ref_id"].as_str().unwrap();
+    gateway
+        .standalone_search
+        .sessions
+        .lock()
+        .unwrap()
+        .get_mut("search-session")
+        .unwrap()
+        .0 = Instant::now() - SESSION_TTL - Duration::from_secs(1);
+    let (_, second) = post(
+        &app,
+        request(json!({"search_query":[{"q":"second"}]})),
+        true,
+    )
+    .await;
+    assert_ne!(second["results"][0]["ref_id"], old);
+    let (_, response) = post(&app, request(json!({"open":[{"ref_id":old}]})), true).await;
+    assert!(response["output"]
+        .as_str()
+        .unwrap()
+        .contains("unknown reference"));
+    let stale = second["results"][0]["ref_id"].as_str().unwrap();
+    for i in 0..MAX_SESSIONS {
+        gateway
+            .standalone_search
+            .session(&format!("other-{i}"))
+            .unwrap();
+    }
+    let (_, third) = post(&app, request(json!({"search_query":[{"q":"third"}]})), true).await;
+    assert_ne!(third["results"][0]["ref_id"], stale);
+    let (_, response) = post(&app, request(json!({"open":[{"ref_id":stale}]})), true).await;
+    assert!(response["output"]
+        .as_str()
+        .unwrap()
+        .contains("unknown reference"));
+    assert_ne!(
+        SearchCache::default().next_turn.load(Ordering::Relaxed),
+        SearchCache::default().next_turn.load(Ordering::Relaxed),
+        "gateway generations should not reuse refs"
+    );
+}
+
+#[tokio::test]
+async fn cached_mode_never_fetches_unopened_pages() {
+    let provider = Arc::new(Fake::default());
+    let app = app(gateway(Some(provider.clone())));
+    for mode in [json!(false), json!("cached")] {
+        let mut wire = request(json!({"open":[{"ref_id":"https://example.org"}]}));
+        wire["settings"] = json!({"external_web_access":mode});
+        let (status, response) = post(&app, wire, true).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(response["output"]
+            .as_str()
+            .unwrap()
+            .contains("external fetch disabled"));
+    }
+    assert_eq!(provider.fetches.load(Ordering::Relaxed), 0);
+    post(
+        &app,
+        request(json!({"open":[{"ref_id":"https://example.org"}]})),
+        true,
+    )
+    .await;
+    let mut wire = request(
+        json!({"open":[{"ref_id":"https://example.org"}],"find":[{"ref_id":"https://example.org","pattern":"needle"}]}),
+    );
+    wire["settings"] = json!({"external_web_access":false});
+    let (_, response) = post(&app, wire, true).await;
+    assert!(response["output"]
+        .as_str()
+        .unwrap()
+        .contains("find needle here"));
+    assert_eq!(
+        provider.fetches.load(Ordering::Relaxed),
+        1,
+        "cached open reuses the already-opened page"
+    );
 }

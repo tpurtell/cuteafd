@@ -27,10 +27,23 @@ const MAX_PAGE_CHARS: usize = 32768;
 const MAX_SESSION_BYTES: usize = 1024 * 1024;
 const SESSION_TTL: Duration = Duration::from_secs(3600);
 
-#[derive(Default)]
 pub struct SearchCache {
     sessions: Mutex<HashMap<String, (Instant, Arc<tokio::sync::Mutex<Session>>)>>,
     searches: AtomicU64,
+    next_turn: AtomicU64,
+}
+impl Default for SearchCache {
+    fn default() -> Self {
+        Self {
+            sessions: Mutex::default(),
+            searches: AtomicU64::new(0),
+            // A boot-random counter seed also prevents refs aliasing after gateway restart.
+            next_turn: AtomicU64::new(
+                u64::from_le_bytes(uuid::Uuid::new_v4().as_bytes()[..8].try_into().unwrap())
+                    & 0x7fff_ffff_ffff_ffff,
+            ),
+        }
+    }
 }
 impl SearchCache {
     pub fn search_requests(&self) -> u64 {
@@ -68,7 +81,6 @@ impl SearchCache {
 }
 #[derive(Default)]
 struct Session {
-    turn: u64,
     refs: HashMap<String, Page>,
     order: VecDeque<String>,
 }
@@ -356,19 +368,21 @@ async fn execute(gateway: &Gateway, request: Request, tape: Tape) -> Result<Valu
         ));
     }
     let session = gateway.standalone_search.session(&request.id)?;
-    // Serialize a session's operations so concurrent batches cannot reuse reference IDs.
+    // Serialize page updates; global IDs cannot alias stale refs after session eviction.
     let mut session = session.lock().await;
-    let turn = session.turn;
-    session.turn = session.turn.saturating_add(1);
+    let turn = gateway
+        .standalone_search
+        .next_turn
+        .fetch_add(1, Ordering::Relaxed);
     let mut output = String::new();
     let mut results = Vec::new();
     let filters = &request.settings.filters;
-    if request
+    let cached = request
         .settings
         .external_web_access
         .as_ref()
-        .is_some_and(|v| v == &json!(false) || v == "cached")
-    {
+        .is_some_and(|v| v == &json!(false) || v == "cached");
+    if cached {
         output.push_str("Cached mode requested: searches use the configured provider's index; cache-only access is not guaranteed.\n");
     }
     let max_results = match request.settings.search_context_size.as_deref() {
@@ -473,6 +487,13 @@ async fn execute(gateway: &Gateway, request: Request, tape: Tape) -> Result<Valu
         let page = if let Some(page) = prior.filter(|p| p.opened) {
             page
         } else {
+            if cached {
+                output.push_str(&format!(
+                    "Open {}: page not in session cache; external fetch disabled in cached mode.\n",
+                    open.ref_id
+                ));
+                continue;
+            }
             let Some(provider) = provider else {
                 output.push_str("Open not supported: no search provider configured.\n");
                 continue;

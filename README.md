@@ -401,8 +401,9 @@ not a hosted Responses tool. `supports_standalone_web_search = true` enables
 its authenticated `POST /v1/alpha/search` calls. Queries work with either search
 provider; Exa also supports page `open`, and `find` searches opened text cached
 for the session. `time` works locally; image search, click, screenshot, finance,
-weather and sports return explicit unsupported tool output. Cached mode uses the
-provider's index rather than promising cache-only access. Reference/page caches
+weather and sports return explicit unsupported tool output. Cached-mode searches
+use the provider's index; page opens only reuse already-opened session pages,
+never fetching uncached pages. Reference/page caches
 are bounded and expire after an hour of inactivity; reopen URLs if refs expire.
 
 **Realtime:** any client that accepts a custom URL can connect to
