@@ -27,11 +27,14 @@ use super::{
 mod catalog;
 mod parse;
 mod render;
+mod search_endpoint;
+pub use search_endpoint::SearchCache;
 #[cfg(test)]
 mod tests;
 
 pub fn routes(gateway: Arc<Gateway>) -> Router {
     Router::new()
+        .route("/v1/alpha/search", post(search_endpoint::create))
         .route("/v1/codex/models.json", get(catalog::get))
         .route("/v1/responses", post(create).get(websocket))
         .route("/v1/responses/compact", post(compact))
