@@ -34,6 +34,7 @@ pub struct SystemClock;
 impl Clock for SystemClock { fn now_ms(&self) -> i64 { SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as i64 } }
 enum Command { Record(Record), Flush(mpsc::Sender<Result<()>>), Settings(Settings, mpsc::Sender<Result<()>>), Prune(mpsc::Sender<Result<()>>), Clear(mpsc::Sender<Result<()>>) }
 pub struct Store {
+    pub log: Arc<crate::log::LogStore>,
     tx: SyncSender<Command>, pub(crate) settings: Arc<ArcSwap<Settings>>, pub(crate) counters: Arc<Counters>,
     pub(crate) reader: Mutex<Connection>, pub(crate) clock: Arc<dyn Clock>, pub(crate) path: Option<PathBuf>,
 }
@@ -51,7 +52,8 @@ impl Store {
         let reader = if path.is_some() { Connection::open_with_flags(&uri, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)? } else { Connection::open(&uri)? };
         reader.busy_timeout(Duration::from_millis(2000))?;
         let counters = Arc::new(Counters::default()); let (tx, rx) = mpsc::sync_channel(capacity);
-        let store = Arc::new(Self { tx, settings: settings.clone(), counters: counters.clone(), reader: Mutex::new(reader), clock: clock.clone(), path: path.clone() });
+        let log = crate::log::LogStore::open(directory, settings.clone(), counters.clone(), clock.clone())?;
+        let store = Arc::new(Self { log, tx, settings: settings.clone(), counters: counters.clone(), reader: Mutex::new(reader), clock: clock.clone(), path: path.clone() });
         std::thread::Builder::new().name("usage-writer".into()).spawn(move || writer(connection, rx, settings, counters, clock, path))?;
         Ok(store)
     }
@@ -62,7 +64,7 @@ impl Store {
     pub fn prune(&self) -> Result<()> { self.command(Command::Prune) }
     pub fn clear(&self) -> Result<()> { self.command(Command::Clear) }
     pub fn settings(&self) -> Settings { (**self.settings.load()).clone() }
-    pub fn update_settings(&self, settings: Settings) -> Result<()> { settings.validate()?; self.command(|tx| Command::Settings(settings, tx)) }
+    pub fn update_settings(&self, settings: Settings) -> Result<()> { settings.validate()?; let enabled = settings.log_enabled && settings.log_hours > 0; self.command(|tx| Command::Settings(settings, tx))?; self.log.enabled.store(enabled, Relaxed); Ok(()) }
     pub fn rows(&self) -> Result<Vec<Record>> { read_records(&*self.reader.lock().map_err(|_| Error::Stopped)?) }
 }
 use rusqlite::OptionalExtension;
