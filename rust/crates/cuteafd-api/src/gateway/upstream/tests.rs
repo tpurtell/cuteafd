@@ -467,3 +467,23 @@ fn chat_tool_choice_none_omits_tools() {
     turn.tool_choice = ToolChoice::Auto;
     assert_eq!(backend(Flavor::OpenaiChat).map_request(&turn).unwrap()["tools"].as_array().unwrap().len(), 1);
 }
+
+#[test]
+fn no_forced_tool_choice_sends_the_named_tool_alone_with_auto() {
+    let mut config = UpstreamConfig::new("http://localhost/v1", Flavor::OpenaiChat, "test-model");
+    config.no_forced_tool_choice = true;
+    let upstream = Upstream::new(config).unwrap();
+    let mut turn = turn();
+    for name in ["get_time", "other"] {
+        turn.tools.push(ToolSpec { name: name.into(), description: None, parameters: json!({"type":"object"}), strict: false });
+    }
+    turn.tool_choice = ToolChoice::Named { name: "get_time".into() };
+    let request = upstream.map_request(&turn).unwrap();
+    assert_eq!(request["tool_choice"], "auto");
+    let names: Vec<&str> = request["tools"].as_array().unwrap().iter().map(|t| t["function"]["name"].as_str().unwrap()).collect();
+    assert_eq!(names, ["get_time"]);
+    turn.tool_choice = ToolChoice::Required;
+    let request = upstream.map_request(&turn).unwrap();
+    assert_eq!(request["tool_choice"], "auto");
+    assert_eq!(request["tools"].as_array().unwrap().len(), 2);
+}

@@ -21,7 +21,8 @@ case "$provider" in
     openrouter-mimo)
         export CUTEAFD_TEST_URL=https://openrouter.ai/api/v1
         key_env=OPENROUTER_API_KEY; model=${model:-xiaomi/mimo-v2.6-pro}
-        flags=(--upstream-capabilities vision,audio_in,reasoning)
+        # Guardrail-allowed MiMo endpoints reject forced tool choice.
+        flags=(--upstream-capabilities vision,audio_in,reasoning --upstream-no-forced-tool-choice)
         ;;
     litellm)
         export CUTEAFD_TEST_URL="${LITELLM_BASE_URL:?private base URL required}/v1"

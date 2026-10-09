@@ -163,13 +163,17 @@ fn chat(turn: &TurnRequest, config: &UpstreamConfig, names: &WireNames) -> Resul
     // tool_choice "none" is sent as no tools at all: same meaning, and some
     // chat upstreams reject a "none" choice (live MiMo run, 2026-10-10).
     if !turn.tools.is_empty() && turn.tool_choice != ToolChoice::None {
-        request["tools"] = json!(turn.tools.iter().map(|tool| {
+        let only = match (&turn.tool_choice, config.no_forced_tool_choice) {
+            (ToolChoice::Named { name }, true) => Some(name.as_str()),
+            _ => None,
+        };
+        request["tools"] = json!(turn.tools.iter().filter(|tool| only.is_none_or(|n| n == tool.name)).map(|tool| {
             let mut function = json!({"name":names.wire(&tool.name),"parameters":tool.parameters});
             if let Some(description) = &tool.description { function["description"] = json!(description); }
             if tool.strict { function["strict"] = json!(true); }
             json!({"type":"function","function":function})
         }).collect::<Vec<_>>());
-        request["tool_choice"] = match &turn.tool_choice { ToolChoice::Auto => json!("auto"), ToolChoice::None => json!("none"),
+        request["tool_choice"] = match &turn.tool_choice { _ if config.no_forced_tool_choice => json!("auto"), ToolChoice::Auto => json!("auto"), ToolChoice::None => json!("none"),
             ToolChoice::Required => json!("required"), ToolChoice::Named { name } => json!({"type":"function","function":{"name":names.wire(name)}}) };
         if let Some(parallel) = turn.parallel_tool_calls { request["parallel_tool_calls"] = json!(parallel); }
     }

@@ -19,6 +19,9 @@ pub(crate) struct GatewayArgs {
     /// Emit a thinking enabled/disabled object; reject forced tools and omit temperature while thinking.
     #[arg(long)]
     upstream_thinking_toggle: bool,
+    /// The upstream rejects forced tool choice; send a named choice as that one tool with auto.
+    #[arg(long)]
+    upstream_no_forced_tool_choice: bool,
     /// Optional absolute endpoint path for strict Chat tools, with no fallback on errors.
     #[arg(long)]
     upstream_strict_tools_path: Option<String>,
@@ -77,6 +80,7 @@ pub(crate) async fn run(args: GatewayArgs) -> Result<()> {
     let mut config = UpstreamConfig::new(base,flavor,args.model.clone());
     config.key = args.upstream_key_env.as_ref().map(|name| std::env::var(name).with_context(|| format!("upstream key environment variable {name} is not set"))).transpose()?;
     config.thinking_toggle = args.upstream_thinking_toggle;
+    config.no_forced_tool_choice = args.upstream_no_forced_tool_choice;
     config.strict_tools_path = args.upstream_strict_tools_path;
     config.capabilities = Default::default();
     for capability in &args.upstream_capabilities {

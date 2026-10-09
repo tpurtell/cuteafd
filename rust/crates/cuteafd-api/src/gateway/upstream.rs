@@ -34,6 +34,9 @@ pub struct UpstreamConfig {
     pub context_tokens: Option<u32>,
     pub max_output_tokens: Option<u32>,
     pub thinking_toggle: bool,
+    /// The upstream rejects forced tool choice: a named choice is sent as
+    /// that one tool with `auto`, and `required` as `auto`.
+    pub no_forced_tool_choice: bool,
     /// Optional absolute path for strict Chat requests; never downgrade on rejection.
     pub strict_tools_path: Option<String>,
     /// Anthropic-compatible providers do not necessarily implement this endpoint.
@@ -43,7 +46,7 @@ impl UpstreamConfig {
     pub fn new(url: impl Into<String>, flavor: Flavor, model: impl Into<String>) -> Self {
         Self { url: url.into(), flavor, model: model.into(), key: None,
             capabilities: BackendCapabilities { reasoning: true, ..Default::default() },
-            context_tokens: None, max_output_tokens: None, thinking_toggle: false, strict_tools_path: None,
+            context_tokens: None, max_output_tokens: None, thinking_toggle: false, no_forced_tool_choice: false, strict_tools_path: None,
             anthropic_count_tokens: false }
     }
 }
