@@ -1823,6 +1823,16 @@ TJ: two key items, both urgent right after v2.0.0.
    per-concurrency buckets on `work/draft-policy-v2` are interim. Design:
    Fable, together with a review of the ds41rt retirement and placement
    designs into one v3 roadmap.
+7. **API gateway and sessions (TJ, 2026-10-09; building now on
+   `work/api-gateway`).** Complete, spec-faithful Anthropic Messages and
+   OpenAI Responses so Claude Code and Codex CLI use cuteafd directly (no
+   LiteLLM), model aliasing and listing, server-side web search (Exa plus a
+   no-key option), and the OpenAI Realtime API (crucial; text first, audio in
+   through an audio-capable backend, TTS seam), all on one session layer with
+   an upstream backend for GPU-free testing. Later: steer/compact/history
+   mutation/fork/splice as engine operations, "J space" model-introspection
+   extensions over Realtime, and an agent dashboard derived from DSH with
+   plugins.
 5. **Qwen FP8 KV cache (TJ, 2026-10-09).** Qwen stores BF16 K/V records
    (2,048 B per row) and BF16 index keys, the most KV bytes per token of any
    family; Qwen NVFP4 min plans 217,856 tokens, below the 256K agentic
