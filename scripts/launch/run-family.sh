@@ -865,6 +865,31 @@ if [[ $family == glm5_flash ]]; then
       family_args+=(--decode-rows 128) ;;
     *) echo "GLM5_FLASH_DECODE_ROWS must be 64 or 128" >&2; exit 2 ;;
   esac
+  # GLM5_FLASH_PREFILL_BATCH: off (default: one prefill pass per prompt) or on (the prompts that
+  # wait together prefill in one pass, each sequence's own programs over its rows, one Spark wave
+  # per MoE layer for all of them).
+  prefill_batch="$(get GLM5_FLASH_PREFILL_BATCH off)"
+  case "$prefill_batch" in
+    ""|off) ;;
+    on) family_args+=(--prefill-batch) ;;
+    *) echo "GLM5_FLASH_PREFILL_BATCH must be on or off" >&2; exit 2 ;;
+  esac
+  # GLM5_FLASH_VERIFY_POLICY: which drafts a speculative step verifies under the verify budget (64
+  # rows, or the GPU's whole sparse MLA waves with GLM5_FLASH_DECODE_ROWS=128), cost (default: the
+  # same room for every sequence, the cost model's depth within it) or chain (each sequence's
+  # drafts cut at GLM5_FLASH_SPEC_TAU, default 0.7, of cumulative draft probability, then the least
+  # likely drafts across sequences dropped first).
+  verify_policy="$(get GLM5_FLASH_VERIFY_POLICY cost)"
+  case "$verify_policy" in
+    ""|cost) ;;
+    chain) family_args+=(--verify-policy chain) ;;
+    *) echo "GLM5_FLASH_VERIFY_POLICY must be cost or chain" >&2; exit 2 ;;
+  esac
+  spec_tau="$(get GLM5_FLASH_SPEC_TAU)"
+  if [[ -n "$spec_tau" ]]; then
+    [[ "$spec_tau" =~ ^(0?[.][0-9]*[1-9][0-9]*|1([.]0*)?)$ ]] || { echo "GLM5_FLASH_SPEC_TAU must be in (0, 1]" >&2; exit 2; }
+    family_args+=(--spec-tau "$spec_tau")
+  fi
 fi
 # INSTANCE names a launch that runs beside others on disjoint hardware
 # (`cuteafd bench smoke` sets it): its coordinator container is

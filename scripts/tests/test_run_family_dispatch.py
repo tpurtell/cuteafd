@@ -604,6 +604,53 @@ def test_glmf_invalid_lanes_or_headroom_fail_before_workers_launch(tmp_path, key
     assert not any(line.startswith(("docker ", "ssh ", "nest ")) for line in result.stderr.splitlines())
 
 
+GLMF_CONFIG = {"model_type": "glm5_next", "num_hidden_layers": 2, "mlp_layer_types": ["sparse"] * 2,
+               "layer_types": ["linear_attention", "deepseek_sparse_attention"]}
+
+
+def test_glmf_default_launch_passes_no_admission_or_verify_option(tmp_path):
+    """Packed admission prefill and the chain verify policy are opt-in: a launch without their
+    keys passes none of their options (one prefill pass per prompt, the cost verify policy)."""
+    result = _family_launch_result(tmp_path, GLMF_CONFIG, "test/glmf", "GLM5_FLASH_FP8_MODEL_ID=off\n")
+    assert result.returncode == 0, result.stderr
+    launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-glmf" in line)
+    for option in ("--prefill-batch", "--verify-policy", "--spec-tau"):
+        assert option not in launch, (option, launch)
+
+
+@pytest.mark.parametrize("keys,expected,absent", [
+    ("GLM5_FLASH_PREFILL_BATCH=off\n", (), ("--prefill-batch",)),
+    ("GLM5_FLASH_PREFILL_BATCH=on\n", ("--prefill-batch",), ()),
+    ("GLM5_FLASH_VERIFY_POLICY=cost\n", (), ("--verify-policy",)),
+    ("GLM5_FLASH_VERIFY_POLICY=chain\n", ("--verify-policy chain",), ("--spec-tau",)),
+    ("GLM5_FLASH_VERIFY_POLICY=chain\nGLM5_FLASH_SPEC_TAU=0.5\n", ("--verify-policy chain", "--spec-tau 0.5"), ()),
+    ("GLM5_FLASH_SPEC_TAU=1\n", ("--spec-tau 1",), ("--verify-policy",)),
+    ("GLM5_FLASH_PREFILL_BATCH=on\nGLM5_FLASH_VERIFY_POLICY=chain\n", ("--prefill-batch", "--verify-policy chain"), ()),
+])
+def test_glmf_admission_and_verify_keys_are_forwarded(tmp_path, keys, expected, absent):
+    result = _family_launch_result(tmp_path, GLMF_CONFIG, "test/glmf", f"GLM5_FLASH_FP8_MODEL_ID=off\n{keys}")
+    assert result.returncode == 0, result.stderr
+    launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-glmf" in line)
+    for option in expected:
+        assert option in launch, (option, launch)
+    for option in absent:
+        assert option not in launch, (option, launch)
+
+
+@pytest.mark.parametrize("keys,message", [
+    ("GLM5_FLASH_PREFILL_BATCH=yes\n", "GLM5_FLASH_PREFILL_BATCH must be"),
+    ("GLM5_FLASH_VERIFY_POLICY=greedy\n", "GLM5_FLASH_VERIFY_POLICY must be"),
+    ("GLM5_FLASH_SPEC_TAU=0\n", "GLM5_FLASH_SPEC_TAU must be"),
+    ("GLM5_FLASH_SPEC_TAU=0.0\n", "GLM5_FLASH_SPEC_TAU must be"),
+    ("GLM5_FLASH_SPEC_TAU=1.5\n", "GLM5_FLASH_SPEC_TAU must be"),
+    ("GLM5_FLASH_SPEC_TAU=abc\n", "GLM5_FLASH_SPEC_TAU must be"),
+])
+def test_glmf_admission_and_verify_keys_reject_bad_values_before_launch(tmp_path, keys, message):
+    result = _family_launch_result(tmp_path, GLMF_CONFIG, "test/glmf", f"GLM5_FLASH_FP8_MODEL_ID=off\n{keys}")
+    assert result.returncode == 2 and message in result.stderr, result.stderr
+    assert not any(line.startswith(("docker ", "ssh ", "nest ")) for line in result.stderr.splitlines())
+
+
 @pytest.mark.parametrize("keys,forwarded", [("", None), ("GLM5_FLASH_KDA_STATE=f32\n", None),
                                              ("GLM5_FLASH_KDA_STATE=bf16\n", "bf16"),
                                              ("GLM5_FLASH_KDA_STATE=bf16-tile\n", "bf16-tile")])

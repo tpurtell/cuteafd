@@ -9,7 +9,7 @@ use anyhow::{ensure, Context, Result};
 
 /// Every paged byte of `placement`'s units, unit by unit, buffer by buffer (each paged buffer
 /// holds one equal slice per allocation unit).
-fn unit_bytes(engine: &GlmfEngine<'_>, placement: &GlmfPlacement) -> Result<Vec<u8>> {
+pub(crate) fn unit_bytes(engine: &GlmfEngine<'_>, placement: &GlmfPlacement) -> Result<Vec<u8>> {
     engine.synchronize()?;
     let mut out = Vec::new();
     for layer in engine.paged_buffers() {

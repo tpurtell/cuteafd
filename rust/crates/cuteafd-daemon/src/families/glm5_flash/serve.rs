@@ -25,6 +25,8 @@
 //! the cache's counters.
 use super::engine::{GlmfEngine, GlmfPlacement, DECODE_ROWS, WIDE_DECODE_ROWS};
 use super::prefix::{GlmfPrefix, PrefixMarks};
+use super::verify::{self, VerifyPolicy};
+use super::packing;
 use cuteafd_engine::media::{EmbeddingCache, MediaAdmission, MediaPoll, MediaReady, MediaWaiter, RequestMedia, MediaKeys};
 use crate::families::deepseek_v41::v41_native_serve::prefix::CudaCopyEngine;
 use crate::shared::prefix::{PrefixArgs, Toggle};
@@ -76,6 +78,22 @@ pub(crate) struct ServeArgs {
     /// (within the rows) instead of the adaptive policy.
     #[arg(long)]
     pub draft_fixed: Option<usize>,
+    /// Which drafts a speculative step verifies under the verify budget (64 rows, or the GPU's
+    /// whole sparse MLA waves with --decode-rows 128): `cost` (every sequence the same room,
+    /// budget / sequences - 1 drafts, the cost model's depth within it) or `chain` (each
+    /// sequence's drafts cut where the product of the drafter's probabilities falls below
+    /// --spec-tau, then the least likely drafts across sequences dropped first).
+    #[arg(long, value_enum, env = "CUTEAFD_GLMF_VERIFY_POLICY", default_value = "cost")]
+    pub verify_policy: VerifyPolicy,
+    /// The chain cut of --verify-policy chain (0 < tau <= 1).
+    #[arg(long, env = "CUTEAFD_GLMF_SPEC_TAU", default_value_t = verify::DEFAULT_TAU)]
+    pub spec_tau: f64,
+    /// Prefill the prompts that wait together in one pass: each prompt's next chunk, up to the first
+    /// prefill lane's rows, every per-sequence program over its own rows and one Spark wave per MoE
+    /// layer for all of them. Off: one pass per prompt.
+    #[arg(long, env = "CUTEAFD_GLMF_PREFILL_BATCH", default_value_t = false, num_args = 0..=1,
+        default_missing_value = "true", action = clap::ArgAction::Set)]
+    pub prefill_batch: bool,
     #[command(flatten)]
     pub decode_share: DecodeShareArgs,
     #[command(flatten)]
@@ -104,12 +122,16 @@ pub(crate) struct ServeArgs {
     pub api: crate::shared::api::ApiArgs,
 }
 
-/// Speculation settings: copy-window draft cap (0 disables) and a fixed
-/// DFlash2 draft count replacing the adaptive policy.
+/// Speculation and admission settings: copy-window draft cap (0 disables), a fixed DFlash2 draft
+/// count replacing the adaptive policy, the verify-row policy and its chain cut, and packed
+/// admission prefill.
 #[derive(Debug, Clone, Copy)]
 struct Policy {
     copy: usize,
     fixed: Option<usize>,
+    verify: VerifyPolicy,
+    tau: f64,
+    batch: bool,
 }
 
 pub(crate) fn model_id(snapshot: &std::path::Path) -> Option<String> {
@@ -143,7 +165,9 @@ pub(crate) async fn run_serve(args: ServeArgs) -> Result<()> {
     (engine_args.draft_context_slots, engine_args.draft_sequences) = draft_capacity(args.max_sequences,
         engine_args.draft_sequences, engine_args.draft_context_slots);
     let (worker_stats, max_sequences, decode_share) = (stats.clone(), args.max_sequences, args.decode_share);
-    let policy = Policy { copy: if args.no_copy_drafts { 0 } else { COPY_DRAFT }, fixed: args.draft_fixed };
+    anyhow::ensure!(args.spec_tau > 0.0 && args.spec_tau <= 1.0, "--spec-tau must be in (0, 1], got {}", args.spec_tau);
+    let policy = Policy { copy: if args.no_copy_drafts { 0 } else { COPY_DRAFT }, fixed: args.draft_fixed,
+        verify: args.verify_policy, tau: args.spec_tau, batch: args.prefill_batch };
     let prefix = args.prefix.clone();
     let hub = console::hub(args.console.console_text, || console_layout(&args, &profile.id));
     let vision = args.vision;
@@ -181,7 +205,11 @@ fn console_layout(args: &ServeArgs, model: &str) -> Result<console::Layout> {
     layout.split = args.engine.split_device.map(|_| "head split".into());
     layout.concurrency = args.max_sequences.min(DECODE_ROWS);
     let copy = if args.no_copy_drafts { "" } else { " · copy windows" };
-    let policy = args.draft_fixed.map_or_else(|| "adaptive".to_string(), |n| format!("fixed {n}"));
+    let policy = match (args.draft_fixed, args.verify_policy) {
+        (Some(n), _) => format!("fixed {n}"),
+        (None, VerifyPolicy::Chain) => format!("chain tau {}", args.spec_tau),
+        (None, VerifyPolicy::Cost) => "adaptive".to_string(),
+    };
     let drafter = args.engine.draft.as_deref()
         .map(|snapshot| super::dspark::is_dspark(snapshot).map(|dspark| if dspark { "dSpark" } else { "DFlash2" }))
         .transpose()?;
@@ -296,9 +324,12 @@ struct Prefill<'a> {
     first: Option<u32>,
     prompt_row: Option<Vec<f32>>,
     started: Instant,
-    /// Seconds in this prompt's chunks, and their engine phases.
+    /// Seconds in this prompt's chunks, and their engine phases (a packed pass's split among its
+    /// prompts by their rows, as their own passes' would compare).
     busy: f64,
     phases: [f64; 3],
+    /// Chunks prefilled in packed passes (`--prefill-batch`).
+    packed: usize,
     ticket: console::Ticket,
 }
 
@@ -347,6 +378,22 @@ fn take(constraint: Option<&mut crate::shared::constraints::State<'_>>, selected
         state.accept(token)?;
     }
     Ok(token)
+}
+
+/// A sequence's verify rows in order (its next token, then its drafts): `emit(j)` emits row `j`'s
+/// selection (the token, and whether the request is done), and row `j + 1` stands only while its
+/// draft is that token, so the policy that chose the drafts never chooses a token. Returns the
+/// rows committed and whether the request finished (an `emit` error finishes it too).
+fn accept_rows(rows: &[u32], mut emit: impl FnMut(usize) -> Result<(u32, bool)>) -> (usize, Result<bool>) {
+    for j in 0..rows.len() {
+        match emit(j) {
+            Ok((token, done)) => if done || rows.get(j + 1) != Some(&token) {
+                return (j + 1, Ok(done));
+            },
+            Err(error) => return (j + 1, Err(error)),
+        }
+    }
+    (rows.len(), Ok(false))
 }
 
 /// Selects (and commits) a token from host logits: a whole-prompt prefix hit's retained row.
@@ -412,6 +459,16 @@ const DIGEST_SEED: u64 = 0xcbf2_9ce4_8422_2325;
 
 fn digest(state: u64, token: u32) -> u64 {
     (state ^ u64::from(token)).wrapping_mul(0x0100_0000_01b3)
+}
+
+/// The drafter's probability of each of a draft's tokens: a dSpark confidence head's predicted
+/// acceptance, else the DFlash2 selector's probability of the chosen candidate.
+fn draft_probs(draft: &Draft) -> Vec<f32> {
+    if draft.confidence.is_empty() {
+        draft.features.iter().map(|f| f[1]).collect()
+    } else {
+        draft.confidence.clone()
+    }
 }
 
 fn media_digest(tokens: &[u32], spans: &[cuteafd_loader::media::MediaSpan]) -> u64 {
@@ -937,79 +994,25 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
             let plan = cold_replay_plan(&job.probe, plan, logits.is_some());
             prefills.push(Prefill { job, constraint, tokens, keys, media: request_media, done: resume, resume, plan, chunks: 0, cancelled: false,
                 placement: admitted.placement, capacity, slot, logits, first: None, prompt_row: None,
-                started: Instant::now(), busy: 0.0, phases: [0.0; 3], ticket });
+                started: Instant::now(), busy: 0.0, phases: [0.0; 3], packed: 0, ticket });
         }
         if prefills.due(!active.is_empty()) {
             let caching = cache.enabled();
-            // One chunk (a lane wave) of each waiting prompt (whole prompts with --decode-share 0).
-            let finished = prefills.round(|p| {
-                if p.done == p.tokens.len() {
-                    return Ok(Chunk::Done);
-                }
-                if p.job.events.is_closed() {
-                    p.cancelled = true;
-                    anyhow::bail!("client went away");
-                }
-                let timer = Instant::now();
-                let end = p.plan.chunks.get(p.chunks).copied().unwrap_or(p.tokens.len());
-                let chunk = &p.tokens[p.done..end];
-                // One sample around the first text and first media prefill only;
-                // no extra synchronization and no steady-state decode sampling.
-                let media_index = usize::from(!p.media.spans().is_empty());
-                let memory_before = first_prefill_sample(&first_prefill_seen, media_index != 0, prefill_memory_sample);
-                let (result, phases) = isolated_phases(&engine.profile, || -> Result<()> {
-                    let start = p.placement.len;
-                    let logits = if cold_replay_decode(&p.job.probe, p.chunks) {
-                        engine.verify_media_device(&mut [(&mut p.placement, chunk.len())], chunk, &p.media)?
+            // One chunk (a lane wave) of each waiting prompt (whole prompts with --decode-share 0); with
+            // --prefill-batch, adjacent prompts whose chunks fit one pass prefill together.
+            let cx = PrefillCx { engine, library: &opened.library, family: &family, caching,
+                first_prefill_seen: &first_prefill_seen, memory_boundaries: &memory_boundaries };
+            let finished = if policy.batch && engine.packs_prefill() {
+                let limits = engine.packed_limits();
+                prefills.round_groups(DECODE_ROWS, |group, next| packable(group, next, &limits),
+                    |group| if group.len() == 1 {
+                        vec![prefill_chunk(&cx, &mut selector, &mut cache, &mut group[0])]
                     } else {
-                        engine.prefill_media_device(&mut p.placement, chunk, &p.media)?
-                    };
-                    if end == p.tokens.len() {
-                        // The first token, while this prompt's logits are the workspace's.
-                        let logits = logits.context("prefill produced no logits")?;
-                        if caching && !probe::cold(&p.job.probe) && p.resume < p.tokens.len() {
-                            p.prompt_row = Some(logits.row_host(&opened.library, 0)?);
-                        }
-                        if probe::wants_first(&p.job.probe) {
-                            probe::device_rows(&opened.library, &p.job.probe, &logits, 0, 1, p.tokens.len())?;
-                        }
-                        let mut batch = SelectBatch::default();
-                        batch.push_next(p.job.sampling, p.constraint.as_mut(), p.placement.len as u64)?;
-                        let selected = selector.select(&logits, &batch)?;
-                        p.first = Some(take(p.constraint.as_mut(), &selected[0])?);
-                    }
-                    // The chunk's tapped tail becomes drafter context before the next step.
-                    if let (Some(drafter), Some(slot)) = (drafter, p.slot) {
-                        let n = chunk.len().min(TAP_ROWS);
-                        let first = start + chunk.len() - n;
-                        drafter.update(&(0..n).map(|r| ContextRow { tap_row: r, slot, position: first + r })
-                            .collect::<Vec<_>>())?;
-                    }
-                    Ok(())
-                });
-                if let Some(before) = memory_before {
-                    let boundary = serde_json::json!({"kind": if media_index == 0 { "first-text-prefill" } else { "first-media-prefill" },
-                        "rows": chunk.len(), "success": result.is_ok(), "before": before,
-                        "after": prefill_memory_sample(),
-                        "scope": "first prefill engine/selection/drafter work on serving thread; no extra synchronization; media encoder preparation precedes this boundary"});
-                    tracing::info!(report = %boundary, "GLM Flash first prefill memory boundary");
-                    memory_boundaries.borrow_mut().push(boundary);
-                }
-                p.done += chunk.len();
-                add_phases(&mut p.phases, phases);
-                p.busy += timer.elapsed().as_secs_f64();
-                p.ticket.prefill(chunk.len(), p.chunks, p.plan.chunks.len(), timer);
-                result?;
-                // Intermediate snapshot points this chunk ends at (off unless configured).
-                for &(_, point) in p.plan.points.iter().filter(|&&(chunk, _)| chunk == p.chunks && !probe::cold(&p.job.probe)) {
-                    if let Err(error) = cache.capture_media(&family, SnapshotKind::Prompt, &p.keys.tokens()[..point], p.keys.spans(), &p.placement,
-                        After::default()) {
-                        tracing::warn!("snapshot point {point} not retained: {error:#}");
-                    }
-                }
-                p.chunks += 1;
-                Ok(if p.done == p.tokens.len() { Chunk::Done } else { Chunk::More })
-            });
+                        prefill_group(&cx, &mut selector, &mut cache, group)
+                    })
+            } else {
+                prefills.round(|p| prefill_chunk(&cx, &mut selector, &mut cache, p))
+            };
             for (mut p, prefilled) in finished {
                 let (slot, placement, resume) = (p.slot, p.placement.clone(), p.resume);
                 if let Err(error) = &prefilled {
@@ -1052,7 +1055,8 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
                     tracing::info!(tokens = p.tokens.len(), cached = resume,
                         elapsed_ms = p.started.elapsed().as_millis() as u64, busy_ms = (1e3 * p.busy) as u64,
                         tok_s = (p.tokens.len() - resume) as f64 / p.busy, gpu_wait_ms = (1e3 * p.phases[0]) as u64,
-                        experts_ms = (1e3 * p.phases[1]) as u64, head_ms = (1e3 * p.phases[2]) as u64, "prefill");
+                        experts_ms = (1e3 * p.phases[1]) as u64, head_ms = (1e3 * p.phases[2]) as u64,
+                        packed_chunks = p.packed, "prefill");
                 }
                 // The prompt snapshot, taken once the first token is out (it only enqueues copies).
                 let prompt = (resume < p.tokens.len() && !probe::cold(&p.job.probe)).then(|| p.keys.tokens().to_vec());
@@ -1123,13 +1127,15 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
         let mut tally = console::Step::begin(0);
         let (draft0, verify0, emit0) = (draft_s, verify_s, emit_s);
         let engine_before = tally.live().then(|| *engine.profile.borrow());
-        // Rows each sequence may add after its next token: an even share of the verify budget.
-        let room = (verify_rows / active.len()).max(1) - 1;
+        // Rows each sequence may add after its next token: an even share of the verify budget (cost),
+        // or the whole budget, the step's rows budgeted after drafting (chain).
+        let room = policy.verify.room(verify_rows, active.len());
         let mut limits: Vec<usize> = active.iter().map(|a| if probe::no_speculation(&a.job.probe) { 0 } else {
             room.min(a.job.max_tokens - a.generated - 1).min(a.capacity - a.placement.len - 1) }).collect();
         // With the wide programs the rows the even share leaves over go to the first sequences that can
         // draft once more (127 rows at 16 sequences: 15 draft 7, one 6); 64 rows keep the even share.
-        if engine.decode_rows > DECODE_ROWS {
+        // Under chain the room is the whole budget: nothing is left over.
+        if policy.verify == VerifyPolicy::Cost && engine.decode_rows > DECODE_ROWS {
             super::engine::hand_out_remainder(&mut limits, room, verify_rows, |i| {
                 let a = &active[i];
                 !probe::no_speculation(&a.job.probe)
@@ -1185,7 +1191,12 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
             rates: Some(&rates[i]), limit: limits[i],
         }).collect();
         let plan_timer = Instant::now();
-        let planned = dflash_policy::plan_counts(&inputs, policy.fixed, &cost);
+        let mut planned = match (policy.verify, policy.fixed) {
+            // The chain cut on the drafter's own probabilities.
+            (VerifyPolicy::Chain, None) => drafted.iter().zip(&limits).map(|(draft, &limit)| draft.as_ref()
+                .map_or(0, |d| verify::chain_length(&draft_probs(d), limit, policy.tau))).collect(),
+            _ => dflash_policy::plan_counts(&inputs, policy.fixed, &cost),
+        };
         drop(inputs);
         skip.after(drafted.iter().any(Option::is_some) && policy.fixed.is_none(), planned.iter().all(|&n| n == 0));
         // Each sequence verifies its next token, then its DFlash2 drafts, or
@@ -1205,7 +1216,7 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
             (proposals, lengths, used)
         });
         let mut used_copy = vec![false; active.len()];
-        let sequences: Vec<Vec<u32>> = active.iter_mut().enumerate().map(|(i, a)| {
+        let mut sequences: Vec<Vec<u32>> = active.iter_mut().enumerate().map(|(i, a)| {
             if a.draft_pause > 0 {
                 a.draft_pause -= 1;
                 if a.draft_pause == 0 {
@@ -1233,6 +1244,25 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
             }
             Ok(rows)
         }).collect::<Result<_>>()?;
+        if policy.verify == VerifyPolicy::Chain {
+            // The step under the verify budget: the least likely drafts across sequences go first (a
+            // copy-window token the drafter also proposed keeps the drafter's probability).
+            let probs: Vec<Vec<f32>> = sequences.iter().zip(&drafted).zip(&used_copy).map(|((rows, draft), &copy)| {
+                let probs = draft.as_ref().map(draft_probs).unwrap_or_default();
+                if copy {
+                    verify::copy_probs(&rows[1..], draft.as_ref().map_or(&[][..], |d| &d.tokens), &probs)
+                } else {
+                    probs
+                }
+            }).collect();
+            let drafts: Vec<usize> = sequences.iter().map(|rows| rows.len() - 1).collect();
+            for (i, kept) in verify::budget(&probs, &drafts, verify_rows).into_iter().enumerate() {
+                sequences[i].truncate(kept + 1);
+                if !used_copy[i] {
+                    planned[i] = planned[i].min(kept);
+                }
+            }
+        }
         let mut poisoned: Vec<Option<String>> = vec![None; sequences.len()];
         let plan_us = console::us(plan_timer);
         let starts: Vec<usize> = active.iter().map(|a| a.placement.len).collect();
@@ -1285,31 +1315,24 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
                 offset += rows.len();
                 return true;
             }
-            let mut finished = false;
-            for j in 0..rows.len() {
+            let (_, outcome) = accept_rows(rows, |j| {
                 // Rows 0..=j are committed; the token row j produces is next.
                 request.placement.len = start + j + 1;
                 probe::decode_row(&opened.library, &request.job.probe, &logits, offset + j, request.generated,
                     request.history.len());
-                match take(request.constraint.as_mut(), &selected[offset + j]).and_then(|t| Ok((t, request.emit(t)?))) {
-                    Ok((token, done)) => {
-                        finished = done;
-                        if done && caching && !probe::cold(&request.job.probe) {
-                            // A normal finish (the client took the last chunk): the row that
-                            // produced the last token follows the turn snapshot.
-                            request.turn = logits.row_host(&opened.library, offset + j).ok();
-                        }
-                        if done || rows.get(j + 1) != Some(&token) {
-                            break;
-                        }
-                    }
-                    Err(error) => {
-                        let _ = request.job.events.send(Err(NativeFailure::Worker(format!("{error:#}"))));
-                        finished = true;
-                        break;
-                    }
+                let token = take(request.constraint.as_mut(), &selected[offset + j])?;
+                let done = request.emit(token)?;
+                if done && caching && !probe::cold(&request.job.probe) {
+                    // A normal finish (the client took the last chunk): the row that
+                    // produced the last token follows the turn snapshot.
+                    request.turn = logits.row_host(&opened.library, offset + j).ok();
                 }
-            }
+                Ok((token, done))
+            });
+            let finished = outcome.unwrap_or_else(|error| {
+                let _ = request.job.events.send(Err(NativeFailure::Worker(format!("{error:#}"))));
+                true
+            });
             let committed = request.placement.len - start;
             // A turn snapshot captures the KDA state at the kept length: commit it too.
             if !finished || request.turn.is_some() {
@@ -1414,6 +1437,236 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
     }
 }
 
+/// What a prefill round's chunks share: the engine, the prefix family, whether the cache retains
+/// snapshots, and the first-prefill memory boundaries.
+#[derive(Clone, Copy)]
+struct PrefillCx<'r, 'e, 'a> {
+    engine: &'e GlmfEngine<'a>,
+    library: &'r cuteafd_ffi::NativeLibrary,
+    family: &'r GlmfPrefix<'e, 'a>,
+    caching: bool,
+    first_prefill_seen: &'r std::cell::Cell<[bool; 2]>,
+    memory_boundaries: &'r std::cell::RefCell<Vec<serde_json::Value>>,
+}
+
+/// One chunk of prompt `p` through its own pass (a lane wave where Spark prefill runs in lanes):
+/// the first token after its last chunk, the chunk's drafter context, its snapshot points.
+fn prefill_chunk<'a>(cx: &PrefillCx<'_, '_, 'a>, selector: &mut TokenSelector<'_>,
+    cache: &mut PrefixCache<CudaCopyEngine<'a>>, p: &mut Prefill<'_>) -> Result<Chunk> {
+    let PrefillCx { engine, library, family, caching, first_prefill_seen, memory_boundaries } = *cx;
+    let drafter = engine.drafter.as_ref();
+    if p.done == p.tokens.len() {
+        return Ok(Chunk::Done);
+    }
+    if p.job.events.is_closed() {
+        p.cancelled = true;
+        anyhow::bail!("client went away");
+    }
+    let timer = Instant::now();
+    let end = chunk_end(p);
+    let chunk = &p.tokens[p.done..end];
+    // One sample around the first text and first media prefill only;
+    // no extra synchronization and no steady-state decode sampling.
+    let media_index = usize::from(!p.media.spans().is_empty());
+    let memory_before = first_prefill_sample(&first_prefill_seen, media_index != 0, prefill_memory_sample);
+    let (result, phases) = isolated_phases(&engine.profile, || -> Result<()> {
+        let start = p.placement.len;
+        let logits = if cold_replay_decode(&p.job.probe, p.chunks) {
+            engine.verify_media_device(&mut [(&mut p.placement, chunk.len())], chunk, &p.media)?
+        } else {
+            engine.prefill_media_device(&mut p.placement, chunk, &p.media)?
+        };
+        if end == p.tokens.len() {
+            // The first token, while this prompt's logits are the workspace's.
+            let logits = logits.context("prefill produced no logits")?;
+            if caching && !probe::cold(&p.job.probe) && p.resume < p.tokens.len() {
+                p.prompt_row = Some(logits.row_host(library, 0)?);
+            }
+            if probe::wants_first(&p.job.probe) {
+                probe::device_rows(library, &p.job.probe, &logits, 0, 1, p.tokens.len())?;
+            }
+            let mut batch = SelectBatch::default();
+            batch.push_next(p.job.sampling, p.constraint.as_mut(), p.placement.len as u64)?;
+            let selected = selector.select(&logits, &batch)?;
+            p.first = Some(take(p.constraint.as_mut(), &selected[0])?);
+        }
+        // The chunk's tapped tail becomes drafter context before the next step.
+        if let (Some(drafter), Some(slot)) = (drafter, p.slot) {
+            let n = chunk.len().min(TAP_ROWS);
+            let first = start + chunk.len() - n;
+            drafter.update(&(0..n).map(|r| ContextRow { tap_row: r, slot, position: first + r })
+                .collect::<Vec<_>>())?;
+        }
+        Ok(())
+    });
+    if let Some(before) = memory_before {
+        let boundary = serde_json::json!({"kind": if media_index == 0 { "first-text-prefill" } else { "first-media-prefill" },
+            "rows": chunk.len(), "success": result.is_ok(), "before": before,
+            "after": prefill_memory_sample(),
+            "scope": "first prefill engine/selection/drafter work on serving thread; no extra synchronization; media encoder preparation precedes this boundary"});
+        tracing::info!(report = %boundary, "GLM Flash first prefill memory boundary");
+        memory_boundaries.borrow_mut().push(boundary);
+    }
+    p.done += chunk.len();
+    add_phases(&mut p.phases, phases);
+    p.busy += timer.elapsed().as_secs_f64();
+    p.ticket.prefill(chunk.len(), p.chunks, p.plan.chunks.len(), timer);
+    result?;
+    capture_points(family, cache, p);
+    p.chunks += 1;
+    Ok(if p.done == p.tokens.len() { Chunk::Done } else { Chunk::More })
+}
+
+/// Intermediate snapshot points prompt `p`'s current chunk ends at (off unless configured).
+fn capture_points<'a>(family: &GlmfPrefix<'_, 'a>, cache: &mut PrefixCache<CudaCopyEngine<'a>>, p: &Prefill<'_>) {
+    for &(_, point) in p.plan.points.iter().filter(|&&(chunk, _)| chunk == p.chunks && !probe::cold(&p.job.probe)) {
+        if let Err(error) = cache.capture_media(family, SnapshotKind::Prompt, &p.keys.tokens()[..point],
+            p.keys.spans(), &p.placement, After::default()) {
+            tracing::warn!("snapshot point {point} not retained: {error:#}");
+        }
+    }
+}
+
+/// Whether prompt `p`'s next chunk may run in a packed pass (`--prefill-batch`): still prefilling
+/// with its client there, no media (its rows' embeddings are injected by its own pass), and not a
+/// cold probe's replayed decode step.
+fn packs(p: &Prefill<'_>) -> bool {
+    packs_chunk(!p.job.events.is_closed(), p.tokens.len() - p.done, p.logits.is_some(), !p.media.spans().is_empty(),
+        cold_replay_decode(&p.job.probe, p.chunks))
+}
+
+/// [`packs`] from a prompt's state: its client is there, rows are left, no whole-prompt hit's
+/// retained logits, no media, and its next chunk is not a cold probe's replayed decode step.
+fn packs_chunk(client: bool, left: usize, retained: bool, media: bool, replay_decode: bool) -> bool {
+    client && left > 0 && !retained && !media && !replay_decode
+}
+
+/// Whether prompt `next` may join `group` in one packed pass (`--prefill-batch`): every member
+/// [`packs`], and every member's next chunk fits the pass.
+fn packable(group: &[Prefill<'_>], next: &Prefill<'_>, limits: &packing::Limits) -> bool {
+    let chunk = |p: &Prefill<'_>| (p.placement.len, chunk_end(p) - p.done);
+    packs(next) && group.iter().all(packs)
+        && packing::fits(&group.iter().chain([next]).map(chunk).collect::<Vec<_>>(), limits)
+}
+
+/// One past the last token of prompt `p`'s next chunk.
+fn chunk_end(p: &Prefill<'_>) -> usize {
+    p.plan.chunks.get(p.chunks).copied().unwrap_or(p.tokens.len())
+}
+
+/// The next chunk of every prompt of `group` in one packed pass (`--prefill-batch`,
+/// `GlmfEngine::prefill_packed`): each prompt's first token, prompt row, drafter context and
+/// snapshot points as its own chunk takes them. A group that no longer packs (a client left, a
+/// prompt is done) goes through the one-prompt path, so cleanup stays per prompt.
+fn prefill_group<'a>(cx: &PrefillCx<'_, '_, 'a>, selector: &mut TokenSelector<'_>,
+    cache: &mut PrefixCache<CudaCopyEngine<'a>>, group: &mut [Prefill<'_>]) -> Vec<Result<Chunk>> {
+    if !group.iter().all(packs) {
+        return group.iter_mut().map(|p| prefill_chunk(cx, selector, cache, p)).collect();
+    }
+    let engine = cx.engine;
+    let timer = Instant::now();
+    let ends: Vec<usize> = group.iter().map(chunk_end).collect();
+    let rows: usize = group.iter().zip(&ends).map(|(p, &end)| end - p.done).sum();
+    let memory_before = first_prefill_sample(cx.first_prefill_seen, false, prefill_memory_sample);
+    let (result, phases) = isolated_phases(&engine.profile, || -> Result<Vec<Result<()>>> {
+        let mut sequences = Vec::with_capacity(group.len());
+        let mut firsts = Vec::with_capacity(group.len());
+        for (p, &end) in group.iter_mut().zip(&ends) {
+            let Prefill { job, constraint, tokens, done, resume, placement, first, prompt_row, .. } = p;
+            let len = tokens.len();
+            sequences.push((placement, &tokens[*done..end]));
+            firsts.push((&*job, constraint, first, prompt_row, *resume, len, end));
+        }
+        let (segments, outcomes) = engine.prefill_packed(&mut sequences, &mut |i, logits| {
+            let (job, constraint, first, prompt_row, resume, len, end) = &mut firsts[i];
+            if *end < *len {
+                return Ok(Ok(()));
+            }
+            // The first token, while this prompt's logits are the workspace's. The device work
+            // (the row download, the selection) is the pass's: its failure fails every member.
+            // The prompt's probe, grammar mask and token are its own: they fail it alone.
+            if cx.caching && !probe::cold(&job.probe) && *resume < *len {
+                **prompt_row = Some(logits.row_host(cx.library, 0)?);
+            }
+            if probe::wants_first(&job.probe) {
+                if let Err(error) = probe::device_rows(cx.library, &job.probe, &logits, 0, 1, *len) {
+                    return Ok(Err(error));
+                }
+            }
+            let mut batch = SelectBatch::default();
+            if let Err(error) = batch.push_next(job.sampling, constraint.as_mut(), *end as u64) {
+                return Ok(Err(error));
+            }
+            let selected = selector.select(&logits, &batch)?;
+            Ok(take(constraint.as_mut(), &selected[0]).map(|token| **first = Some(token)))
+        })?;
+        drop((sequences, firsts));
+        // Each healthy prompt's tapped tail becomes its drafter context before the next step (a
+        // failed prompt's slot is released with its placement).
+        if let Some(drafter) = engine.drafter.as_ref() {
+            for (((p, segment), &end), outcome) in group.iter().zip(&segments).zip(&ends).zip(&outcomes) {
+                if let (Some(slot), true) = (p.slot, outcome.is_ok()) {
+                    let n = segment.tap_rows;
+                    drafter.update(&(0..n).map(|r| ContextRow { tap_row: segment.tap_offset + r, slot,
+                        position: end - n + r }).collect::<Vec<_>>())?;
+                }
+            }
+        }
+        Ok(outcomes)
+    });
+    if let Some(before) = memory_before {
+        // The first text prefill's boundary, around the packed pass.
+        let boundary = serde_json::json!({"kind": "first-text-prefill", "rows": rows, "packed_prompts": group.len(),
+            "success": result.as_ref().is_ok_and(|outcomes| outcomes.iter().all(Result::is_ok)),
+            "before": before, "after": prefill_memory_sample(),
+            "scope": "first prefill engine/selection/drafter work on serving thread; no extra synchronization; media encoder preparation precedes this boundary"});
+        tracing::info!(report = %boundary, "GLM Flash first prefill memory boundary");
+        cx.memory_boundaries.borrow_mut().push(boundary);
+    }
+    // One pass for the group: its time and phases split among the prompts by their rows.
+    let elapsed = timer.elapsed().as_secs_f64();
+    let shares = row_shares(&group.iter().zip(&ends).map(|(p, &end)| end - p.done).collect::<Vec<_>>());
+    for ((p, &end), share) in group.iter_mut().zip(&ends).zip(shares) {
+        let rows = end - p.done;
+        p.done = end;
+        add_phases(&mut p.phases, phases.map(|seconds| seconds * share));
+        p.busy += elapsed * share;
+        p.packed += 1;
+        p.ticket.prefill(rows, p.chunks, p.plan.chunks.len(), timer);
+    }
+    let outcomes = member_outcomes(group.len(), result);
+    group.iter_mut().zip(outcomes).map(|(p, outcome)| {
+        outcome?;
+        capture_points(cx.family, cache, p);
+        p.chunks += 1;
+        Ok(if p.done == p.tokens.len() { Chunk::Done } else { Chunk::More })
+    }).collect()
+}
+
+/// Each member's outcome of a packed pass ([`prefill_group`]): a failure the pass shares (the
+/// engine's step or head, a selection, the drafter's context) fails every member; otherwise each
+/// member has its own, so one prompt's grammar or sampling failure leaves the others' first
+/// tokens, drafter context and snapshot points as their own passes would.
+fn member_outcomes(members: usize, pass: Result<Vec<Result<()>>>) -> Vec<Result<()>> {
+    match pass {
+        Ok(outcomes) => {
+            let mut outcomes = outcomes.into_iter();
+            (0..members).map(|_| outcomes.next()
+                .unwrap_or_else(|| Err(anyhow::anyhow!("a packed prefill gave no outcome")))).collect()
+        }
+        Err(error) => {
+            let message = format!("packed prefill of {members} prompts: {error:#}");
+            (0..members).map(|_| Err(anyhow::anyhow!("{message}"))).collect()
+        }
+    }
+}
+
+/// Each member's share of a packed pass's time: its rows over the pass's (even when no rows).
+fn row_shares(rows: &[usize]) -> Vec<f64> {
+    let total: usize = rows.iter().sum();
+    rows.iter().map(|&r| if total == 0 { 1.0 / rows.len() as f64 } else { r as f64 / total as f64 }).collect()
+}
+
 /// Coordinator share of `GLMF_TP2_STEP_MS` at one row (GPU 6.7 ms of 18.8).
 const GLMF_TP2_GPU_MS: f64 = 6.7;
 /// GLM 5.3 Flash, 1 RTX PRO 6000 (325 W) + Spark TP2 (rhea, moa), recommended
@@ -1450,5 +1703,223 @@ mod ring_tests {
         assert_eq!(misses, 1);
         assert_eq!(take_ring(&mut free, false, &mut misses), None);
         assert_eq!(misses, 1);
+    }
+}
+
+#[cfg(test)]
+mod serve_cli_tests {
+    use super::*;
+    use clap::Parser;
+
+    #[derive(Parser)]
+    struct Parse {
+        #[command(flatten)]
+        serve: ServeArgs,
+    }
+
+    fn parse(extra: &[&str]) -> Result<ServeArgs, clap::Error> {
+        Parse::try_parse_from(["test", "--snapshot", "/checkpoint", "--native-lib", "/native"].into_iter()
+            .chain(extra.iter().copied())).map(|p| p.serve)
+    }
+
+    #[test]
+    fn only_plain_prompt_chunks_join_a_packed_pass() {
+        assert!(packs_chunk(true, 1, false, false, false));
+        // A client that left, nothing left, a whole-prompt hit, media rows (their embeddings are
+        // injected by the prompt's own pass) or a cold probe's replayed decode step: its own path.
+        assert!(!packs_chunk(false, 1, false, false, false));
+        assert!(!packs_chunk(true, 0, false, false, false));
+        assert!(!packs_chunk(true, 1, true, false, false));
+        assert!(!packs_chunk(true, 1, false, true, false));
+        assert!(!packs_chunk(true, 1, false, false, true));
+    }
+
+    #[test]
+    fn admission_and_verify_rows_default_to_todays_policies() {
+        let defaults = parse(&[]).unwrap();
+        assert_eq!((defaults.verify_policy, defaults.spec_tau, defaults.prefill_batch),
+            (VerifyPolicy::Cost, verify::DEFAULT_TAU, false));
+        let chain = parse(&["--verify-policy", "chain", "--spec-tau", "0.5", "--prefill-batch"]).unwrap();
+        assert_eq!((chain.verify_policy, chain.spec_tau, chain.prefill_batch), (VerifyPolicy::Chain, 0.5, true));
+        assert!(parse(&["--prefill-batch", "true"]).unwrap().prefill_batch);
+        assert!(!parse(&["--prefill-batch", "false"]).unwrap().prefill_batch);
+        assert!(parse(&["--prefill-batch", "sometimes"]).is_err());
+        assert!(parse(&["--verify-policy", "greedy"]).is_err());
+    }
+
+    #[test]
+    fn draft_probabilities_come_from_the_selector_or_the_confidence_head() {
+        let dflash = Draft { tokens: vec![1, 2], features: vec![[0.5, 0.9, 0.1, 0.0], [0.2, 0.6, 0.3, 1.0]],
+            confidence: Vec::new() };
+        assert_eq!(draft_probs(&dflash), vec![0.9, 0.6]);
+        let dspark = Draft { tokens: vec![1, 2], features: vec![[0.0; 4]; 2], confidence: vec![0.8, 0.4] };
+        assert_eq!(draft_probs(&dspark), vec![0.8, 0.4]);
+    }
+}
+
+#[cfg(test)]
+mod packed_member_tests {
+    use super::*;
+    use crate::shared::prefill_share::PrefillQueue;
+    use crate::shared::token_io::Selected;
+
+    /// A packed member's first token (`take` over its selected row): `token`, or an empty grammar.
+    fn first_token(token: Option<u32>) -> Result<()> {
+        let row: RowResult = token.map(|token| Selected { token, logprob: None })
+            .ok_or(cuteafd_core::TargetSamplingError::EmptyCandidates);
+        take(None, &row).map(drop)
+    }
+
+    #[test]
+    fn a_packed_member_whose_grammar_allows_no_token_fails_alone() {
+        // Two healthy prompts around one whose grammar allows no token, in one packed pass.
+        let mut queue = PrefillQueue::new(0.2);
+        for id in 0..3usize {
+            queue.push(id);
+        }
+        let finished = queue.round_groups(3, |_, _| true, |group| {
+            let pass = Ok(group.iter().map(|&id| first_token((id != 1).then_some(9))).collect());
+            member_outcomes(group.len(), pass).into_iter().map(|outcome| outcome.map(|()| Chunk::Done)).collect()
+        });
+        let outcomes: Vec<(usize, Option<String>)> = finished.into_iter()
+            .map(|(id, outcome)| (id, outcome.err().map(|e| format!("{e:#}")))).collect();
+        assert_eq!(outcomes, [(0, None), (1, Some("sampling: EmptyCandidates".into())), (2, None)]);
+    }
+
+    #[test]
+    fn a_shared_failure_fails_every_member_and_a_short_outcome_list_the_rest() {
+        let all = member_outcomes(3, Err(anyhow::anyhow!("head failed")));
+        assert_eq!(all.iter().map(|o| o.as_ref().unwrap_err().to_string()).collect::<Vec<_>>(),
+            vec!["packed prefill of 3 prompts: head failed"; 3]);
+        let short = member_outcomes(3, Ok(vec![Ok(())]));
+        assert_eq!(short.iter().map(Result::is_ok).collect::<Vec<_>>(), [true, false, false]);
+    }
+
+    #[test]
+    fn a_packed_pass_is_timed_by_each_members_rows() {
+        assert_eq!(row_shares(&[30, 10]), [0.75, 0.25]);
+        assert_eq!(row_shares(&[1, 1, 2]), [0.25, 0.25, 0.5]);
+        assert_eq!(row_shares(&[0, 0]), [0.5, 0.5]);
+    }
+}
+
+#[cfg(test)]
+mod verify_policy_tests {
+    use super::*;
+
+    const VOCAB: u32 = 16;
+
+    fn mix(mut x: u64) -> u64 {
+        x ^= x >> 33;
+        x = x.wrapping_mul(0xff51_afd7_ed55_8ccd);
+        x ^= x >> 33;
+        x = x.wrapping_mul(0xc4ce_b9fe_1a85_ec53);
+        x ^ (x >> 33)
+    }
+
+    fn digest(context: &[u32]) -> u64 {
+        context.iter().fold(0x9e37_79b9_7f4a_7c15, |h, &t| mix(h ^ u64::from(t)))
+    }
+
+    /// The target's logits for the row after `context`: the same for both policies.
+    fn target_logits(context: &[u32]) -> Vec<f32> {
+        let h = digest(context);
+        (0..VOCAB).map(|t| (mix(h ^ u64::from(t)) % 1000) as f32 / 100.0).collect()
+    }
+
+    /// The served greedy selection of a row.
+    fn greedy(context: &[u32]) -> u32 {
+        cuteafd_core::TargetSamplingParams::greedy().select_token(&target_logits(context), None, context.len() as u64)
+            .unwrap() as u32
+    }
+
+    /// Seven drafts after `context` and the drafter's probability of each: the target's own
+    /// tokens, but a wrong one where the drafter guesses, with likelihoods that vary by row.
+    fn drafts(context: &[u32]) -> (Vec<u32>, Vec<f32>) {
+        let mut ctx = context.to_vec();
+        let (mut tokens, mut probs) = (Vec::new(), Vec::new());
+        for _ in 0..7 {
+            let h = mix(digest(&ctx) ^ 0x5eed);
+            let wrong = h % 5 == 0;
+            let token = if wrong { (greedy(&ctx) + 1) % VOCAB } else { greedy(&ctx) };
+            probs.push(if wrong { 0.4 } else { 0.6 + (h % 40) as f32 / 100.0 });
+            tokens.push(token);
+            ctx.push(token);
+        }
+        (tokens, probs)
+    }
+
+    /// `streams` sequences decoded by speculative steps under `policy` and a 64-row budget until
+    /// each has `tokens` tokens: the emitted tokens (rows from [`accept_rows`], every row's
+    /// selection the target's greedy token) and the rows verified.
+    fn decode(policy: VerifyPolicy, streams: usize, tokens: usize) -> (Vec<Vec<u32>>, usize) {
+        let mut history: Vec<Vec<u32>> = (0..streams as u32).map(|s| vec![s, s * 7 % VOCAB]).collect();
+        // The prefill's first token, then every step's.
+        let mut next: Vec<u32> = history.iter().map(|h| greedy(h)).collect();
+        let mut out: Vec<Vec<u32>> = next.iter().map(|&n| vec![n]).collect();
+        let mut verified = 0;
+        while out.iter().any(|o| o.len() < tokens) {
+            for (h, &n) in history.iter_mut().zip(&next) {
+                h.push(n);
+            }
+            let proposals: Vec<(Vec<u32>, Vec<f32>)> = history.iter().map(|h| drafts(h)).collect();
+            let room = policy.room(64, streams);
+            let mut ks: Vec<usize> = proposals.iter().map(|(_, probs)| match policy {
+                VerifyPolicy::Cost => room.min(7),
+                VerifyPolicy::Chain => verify::chain_length(probs, room, verify::DEFAULT_TAU),
+            }).collect();
+            if policy == VerifyPolicy::Chain {
+                ks = verify::budget(&proposals.iter().map(|(_, p)| p.clone()).collect::<Vec<_>>(), &ks, 64);
+            }
+            for (i, ((tokens_i, _), &k)) in proposals.iter().zip(&ks).enumerate() {
+                let rows: Vec<u32> = std::iter::once(next[i]).chain(tokens_i[..k].iter().copied()).collect();
+                verified += rows.len();
+                let start = history[i].clone();
+                let (committed, finished) = accept_rows(&rows, |j| {
+                    let token = greedy(&[start.as_slice(), &rows[1..=j]].concat());
+                    out[i].push(token);
+                    Ok((token, false))
+                });
+                assert!(!finished.unwrap() && committed >= 1);
+                history[i].extend_from_slice(&rows[1..committed]);
+                next[i] = *out[i].last().unwrap();
+            }
+        }
+        (out.into_iter().map(|mut o| { o.truncate(tokens); o }).collect(), verified)
+    }
+
+    #[test]
+    fn cost_and_chain_emit_identical_tokens_from_identical_target_logits() {
+        let (cost, cost_rows) = decode(VerifyPolicy::Cost, 16, 48);
+        let (chain, chain_rows) = decode(VerifyPolicy::Chain, 16, 48);
+        // The policies verify different rows (the test would prove nothing otherwise) ...
+        assert_ne!(cost_rows, chain_rows);
+        // ... and emit the same tokens: the target's own greedy decode, row by row.
+        assert_eq!(cost, chain);
+        for (s, emitted) in cost.iter().enumerate() {
+            let mut context = vec![s as u32, s as u32 * 7 % VOCAB];
+            for &token in emitted {
+                assert_eq!(token, greedy(&context), "stream {s}");
+                context.push(token);
+            }
+        }
+    }
+
+    #[test]
+    fn a_draft_stands_only_while_it_is_the_rows_selection() {
+        // Rows: next, then drafts 5, 6, 7; the selections are 5, 6, 8: the third draft goes and
+        // the step emits 5, 6 and the correction 8.
+        let selections = [5, 6, 8, 9];
+        let mut emitted = Vec::new();
+        let (committed, finished) = accept_rows(&[4, 5, 6, 7], |j| {
+            emitted.push(selections[j]);
+            Ok((selections[j], false))
+        });
+        assert_eq!((committed, finished.unwrap(), emitted), (3, false, vec![5, 6, 8]));
+        // A finished request stops at its row; an error finishes it there.
+        assert_eq!(accept_rows(&[4, 5, 6], |_| Ok((5, true))).0, 1);
+        let (committed, error) = accept_rows(&[4, 5, 6],
+            |j| if j == 1 { anyhow::bail!("grammar") } else { Ok((5, false)) });
+        assert_eq!((committed, error.unwrap_err().to_string()), (2, "grammar".to_string()));
     }
 }

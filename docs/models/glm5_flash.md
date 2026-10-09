@@ -109,6 +109,19 @@ Attention (KDA), a minority run MLA + DSA.
   candidates, and a mark's bytes there would turn decode rows into NaN. Pool
   marks turn the pinned host tier on (`HOST_CACHE_BYTES=auto` unless set; 0
   keeps it off), so the snapshots the pool evicts move to RAM.
+- Admission and verify rows (opt-in until measured): `GLM5_FLASH_PREFILL_BATCH=on`
+  (`--prefill-batch`) prefills the prompts that wait together in one pass, up to the first
+  prefill lane's rows: each prompt's mHC sites, router scores, KDA layers, DSA indexer and LM head
+  run over its own rows as its own pass would, the rest over all rows, with one Spark wave per
+  MoE layer for the burst (`glmf-golden --packed-check N` compares each sequence with its own
+  pass). `GLM5_FLASH_VERIFY_POLICY=chain` (`--verify-policy chain`, `GLM5_FLASH_SPEC_TAU`,
+  default 0.7) cuts each sequence's drafts at that cumulative draft probability and drops the
+  least likely drafts across sequences when a step exceeds the verify budget (64 rows, or the
+  GPU's whole sparse MLA waves with `GLM5_FLASH_DECODE_ROWS=128`), in place of the same room for
+  every sequence. A packed prompt whose own grammar or sampling fails fails alone; the others
+  keep their first tokens. `chain` need not be output-identical to `cost`: a different verify
+  shape can round a near-tie the other way, while every emitted greedy token remains the target
+  argmax of its own verified row.
 
 ## Launcher defaults
 

@@ -10,9 +10,12 @@ mod speculate;
 mod expert_rows;
 mod graphs;
 mod lane_check;
+mod packed_check;
+pub(crate) mod packing;
 mod header;
 pub(crate) mod head;
 mod precision;
+pub(crate) mod verify;
 pub(crate) mod weights;
 
 use anyhow::{ensure, Context, Result};
@@ -1010,6 +1013,12 @@ pub(crate) struct GoldenArgs {
     /// logits, the KDA state and every paged byte must be identical. Needs Spark --peers.
     #[arg(long)]
     pub lane_check: bool,
+    /// Packed prefill against each sequence's own pass: N (2 to 10) sequences of mixed lengths cut
+    /// from the golden prompt (the last resumed past the dense context) in one packed pass and
+    /// each in its own pass; every sequence's last-row logits, KDA state and paged bytes must be
+    /// identical. One GPU, every layer.
+    #[arg(long)]
+    pub packed_check: Option<usize>,
     /// Token I/O gate after the golden prompt (--prefill N truncates it), then
     /// stop: the resident embedding table against the shard, device against
     /// host greedy selection over this many decode steps, and device against
@@ -1862,6 +1871,11 @@ fn golden_run(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmfEngine<'_
             .chunks_exact(4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).collect();
         let n = args.prefill.unwrap_or(tokens.len()).min(tokens.len());
         return lane_check::lane_check(engine, &tokens[..n]);
+    }
+    if let Some(sequences) = args.packed_check {
+        let tokens: Vec<u32> = std::fs::read(args.golden.join("tokens.bin"))?
+            .chunks_exact(4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).collect();
+        return packed_check::packed_check(engine, &tokens, sequences);
     }
     if engine.drafter.is_some() {
         return speculate::draft_run(args, opened, engine);

@@ -167,6 +167,42 @@ impl<P> PrefillQueue<P> {
         out
     }
 
+    /// Opt-in groups of adjacent prompts, [`Self::round_pairs`] for up to `most`: the oldest
+    /// prompt always runs; each next one joins while `eligible(group, next)` accepts it. `chunk`
+    /// receives the group and returns one outcome per member (a member without one fails). No
+    /// prompt is pulled past an ineligible one. A group consumes one elapsed-time budget, with
+    /// one chunk per member; with share 0 unfinished members go back to the front.
+    pub fn round_groups(&mut self, most: usize, eligible: impl Fn(&[P], &P) -> bool,
+        mut chunk: impl FnMut(&mut [P]) -> Vec<Result<Chunk>>) -> Vec<(P, Result<()>)> {
+        let started = Instant::now();
+        let whole = self.share == 0.0;
+        let mut out = Vec::new();
+        let mut ran = VecDeque::new();
+        let mut steps = 0;
+        while !self.waiting.is_empty() {
+            if !whole && steps > 0 && started.elapsed().as_secs_f64() >= self.round_s { break; }
+            let mut group = vec![self.waiting.pop_front().expect("nonempty prefill queue")];
+            while group.len() < most && self.waiting.front().is_some_and(|next| eligible(&group, next)) {
+                group.push(self.waiting.pop_front().expect("eligible adjacent prompt"));
+            }
+            let mut outcomes = chunk(&mut group).into_iter();
+            let mut unfinished = Vec::new();
+            for prompt in group {
+                match outcomes.next().unwrap_or_else(|| Err(anyhow::anyhow!("a prefill group gave no outcome"))) {
+                    Ok(Chunk::Done) => out.push((prompt, Ok(()))),
+                    Ok(Chunk::More) if whole => unfinished.push(prompt),
+                    Ok(Chunk::More) => ran.push_back(prompt),
+                    Err(error) => out.push((prompt, Err(error))),
+                }
+            }
+            for prompt in unfinished.into_iter().rev() { self.waiting.push_front(prompt); }
+            steps += 1;
+        }
+        self.waiting.extend(ran);
+        self.last_round = started.elapsed().as_secs_f64();
+        out
+    }
+
     /// After a round: the running requests are owed their share of its time
     /// while prompts still wait.
     pub fn settle(&mut self, decoding: bool) {
@@ -357,6 +393,95 @@ mod tests {
         assert_eq!(log, [vec![0, 1], vec![0, 1], vec![2]]);
         assert_eq!(finished.len(), 3);
         assert!(queue.is_empty());
+    }
+
+    fn group_step(group: &mut [Prompt], log: &mut Vec<Vec<usize>>) -> Vec<Result<Chunk>> {
+        log.push(group.iter().map(|p| p.id).collect());
+        group.iter_mut().map(|p| {
+            p.left -= 1;
+            Ok(if p.left == 0 { Chunk::Done } else { Chunk::More })
+        }).collect()
+    }
+
+    #[test]
+    fn groups_take_adjacent_eligible_prompts_up_to_the_most() {
+        let mut queue = PrefillQueue::new(0.2);
+        for id in 0..7 { queue.push(Prompt { id, left: 1 }); }
+        let mut log = Vec::new();
+        // Prompt 3 never joins a group (it still runs, alone, as the oldest); groups hold three.
+        let finished = queue.round_groups(3, |group, next| next.id != 3 && group.iter().all(|p| p.id != 3),
+            |group| group_step(group, &mut log));
+        assert_eq!(log, [vec![0, 1, 2], vec![3], vec![4, 5, 6]]);
+        assert_eq!(finished.into_iter().map(|(p, result)| { result.unwrap(); p.id }).collect::<Vec<_>>(),
+            [0, 1, 2, 3, 4, 5, 6]);
+        assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn a_group_sees_its_members_so_far() {
+        // A row budget of 5 across the group: 2 + 2 fit, a third 2 does not.
+        let mut queue = PrefillQueue::new(0.2);
+        for id in 0..4 { queue.push(Prompt { id, left: 2 }); }
+        let mut log = Vec::new();
+        let rows = |group: &[Prompt], next: &Prompt| group.iter().map(|p| p.left).sum::<usize>() + next.left <= 5;
+        queue.round_s = 0.0;
+        assert!(queue.round_groups(8, rows, |group| group_step(group, &mut log)).is_empty());
+        assert_eq!(log, [vec![0, 1]]);
+        // The unfinished members rotate behind the prompts that did not run.
+        assert_eq!(queue.waiting.iter().map(|p| p.id).collect::<Vec<_>>(), [2, 3, 0, 1]);
+    }
+
+    #[test]
+    fn a_failed_member_leaves_its_group_healthy_and_a_short_outcome_list_fails_the_rest() {
+        let mut queue = PrefillQueue::new(0.2);
+        for id in 0..3 { queue.push(Prompt { id, left: 2 }); }
+        let mut log = Vec::new();
+        queue.round_s = 0.0;
+        let finished = queue.round_groups(3, |_, _| true, |group| {
+            let mut out = group_step(group, &mut log);
+            out[1] = Err(anyhow::anyhow!("client cancelled"));
+            out.pop();
+            out
+        });
+        assert_eq!(finished.iter().map(|(p, r)| (p.id, r.is_ok())).collect::<Vec<_>>(), [(1, false), (2, false)]);
+        assert_eq!(queue.waiting.iter().map(|p| (p.id, p.left)).collect::<Vec<_>>(), [(0, 1)]);
+    }
+
+    #[test]
+    fn zero_share_finishes_the_oldest_group_before_later_prompts() {
+        let mut queue = PrefillQueue::new(0.0);
+        for id in 0..3 { queue.push(Prompt { id, left: if id == 2 { 1 } else { 2 } }); }
+        let mut log = Vec::new();
+        let finished = queue.round_groups(2, |_, _| true, |group| group_step(group, &mut log));
+        assert_eq!(log, [vec![0, 1], vec![0, 1], vec![2]]);
+        assert_eq!(finished.len(), 3);
+        assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn ineligible_groups_match_original_singleton_rounds() {
+        for share in [0.0, 0.2] {
+            let mut serial = PrefillQueue::new(share);
+            let mut grouped = PrefillQueue::new(share);
+            serial.round_s = 0.0;
+            grouped.round_s = 0.0;
+            for id in 0..4 {
+                serial.push(Prompt { id, left: id + 1 });
+                grouped.push(Prompt { id, left: id + 1 });
+            }
+            while !serial.is_empty() {
+                let mut serial_log = Vec::new();
+                let serial_done = run(&mut serial, &mut serial_log, 0);
+                let mut group_log = Vec::new();
+                let group_done = grouped.round_groups(4, |_, _| false, |group| group_step(group, &mut group_log))
+                    .into_iter().map(|(p, result)| { result.unwrap(); p.id }).collect::<Vec<_>>();
+                assert_eq!(group_log.into_iter().flatten().collect::<Vec<_>>(), serial_log);
+                assert_eq!(group_done, serial_done);
+                assert_eq!(grouped.waiting.iter().map(|p| (p.id, p.left)).collect::<Vec<_>>(),
+                    serial.waiting.iter().map(|p| (p.id, p.left)).collect::<Vec<_>>());
+            }
+            assert!(grouped.is_empty());
+        }
     }
 
     #[test]
