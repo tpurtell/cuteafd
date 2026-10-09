@@ -103,7 +103,7 @@ impl SparkExperts {
         executors: &[u64],
         capacity: u32,
         config: &TcpTransportConfig,
-        clients: LocalTp4Client,
+        mut clients: LocalTp4Client,
         topology: Option<SparkTopology>,
     ) -> Result<Self> {
         ensure!(peers.len() == executors.len() && matches!(peers.len(), 1 | 2 | 3 | 4 | 6),
@@ -137,6 +137,7 @@ impl SparkExperts {
                 "native TP endpoints must be distinct"
             );
         }
+        clients.set_capacity(capacity);
         Ok(Self {
             clients,
             executors: executors.to_vec(),

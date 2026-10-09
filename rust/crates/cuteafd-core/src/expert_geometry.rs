@@ -38,6 +38,26 @@ impl ExpertGeometry {
         self.hidden * 2
     }
 
+    /// FP8 K32 request and row-indexed compact BF16 response frame upper bounds.
+    pub fn compact_wire_bytes(&self, capacity: u32, bf16: bool) -> Option<(usize, usize)> {
+        let rows = capacity as usize;
+        let hidden = self.hidden as usize;
+        let request = rows.checked_mul(40 + self.topk as usize * 12 + if bf16 { hidden * 2 } else { hidden + hidden / 32 })?.checked_add(96)?;
+        let response = rows.checked_mul(4 + hidden * 2)?.checked_add(96)?;
+        Some((request, response))
+    }
+
+    /// Persistent request/response mapped rings, shared by admission and planning.
+    pub fn compact_ring_bytes(&self, capacity: u32, max_frame: usize, depth: usize,
+        slot: usize, alignment: usize, endpoints: usize, bf16: bool) -> Option<usize> {
+        if !(1..=8).contains(&depth) || slot == 0 || alignment == 0 || endpoints == 0 { return None; }
+        let (request, response) = self.compact_wire_bytes(capacity, bf16)?;
+        if request > max_frame || response > max_frame { return None; }
+        let align = |bytes: usize| bytes.max(slot).min(max_frame).checked_add(alignment - 1)
+            .map(|bytes| bytes / alignment * alignment);
+        align(request)?.checked_add(align(response)?)?.checked_mul(depth)?.checked_mul(endpoints)
+    }
+
     /// Per-rank intermediate slice for tensor parallelism of degree `tp`.
     pub fn slice(&self, tp: u32) -> Option<u32> {
         (tp > 0 && self.intermediate % tp == 0).then(|| self.intermediate / tp)

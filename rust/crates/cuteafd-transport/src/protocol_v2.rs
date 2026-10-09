@@ -3,6 +3,12 @@ use bytes::Bytes;
 use cuteafd_ffi::CuteafdDeviceBuffer;
 use sha2::{Digest, Sha256};
 
+/// Maximum FP8 K32 ingress and compact BF16 partial frames for a configured lane.
+/// Shared by worker admission and the coordinator's first-connect negotiation.
+pub fn compact_expert_wire_bytes(geometry: cuteafd_core::ExpertGeometry, capacity: u32, bf16: bool) -> Result<(usize, usize)> {
+    geometry.compact_wire_bytes(capacity, bf16).context("expert wire size overflow")
+}
+
 const MAGIC: &[u8; 8] = b"CUTEAFD3";
 const VERSION: u16 = 3;
 const REQUEST_KIND: u16 = 1;

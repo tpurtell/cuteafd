@@ -248,6 +248,16 @@ pub struct FamilyCosts {
 }
 
 
+/// Exact V4.1 worker rings; other families retain their qualified allowances.
+pub fn v41_spark_ring_allowance(family: &str, capacity: u64, calibrated: u64, bf16: bool) -> u64 {
+    if family != "deepseek_v41" { return calibrated; }
+    let exact = u32::try_from(capacity).ok().and_then(|capacity|
+        cuteafd_core::ExpertGeometry::DEEPSEEK_V41.compact_ring_bytes(
+            capacity, 64 << 20, 8, 8 << 20, 4096, 2, bf16));
+    exact.map_or(u64::MAX, |bytes| bytes as u64)
+}
+
+
 const fn gib(hundredths: u64) -> u64 {
     hundredths * GIB / 100
 }
@@ -837,10 +847,12 @@ pub fn layout(report: &mut PlanReport, model: &dyn super::FamilyModel, checkpoin
             }
             let format = report.components.iter().find(|c| c.owner == Owner::SparkSliced)
                 .map(|c| c.formats.keys().cloned().collect::<Vec<_>>().join("+")).unwrap_or_default();
+            let bf16_ingress = format.contains("NVFP4") || format.contains("nvfp4");
             device.items.push(Item::new(Category::Experts, "routed_expert", format, stored, Basis::Exact));
             let workspace = costs.spark_workspace_bytes * options.spark_capacity_rows / 4096;
             device.items.push(Item::new(Category::Workspace, "expert waves", "", workspace, allowance_basis));
-            device.items.push(Item::new(Category::Transport, "rdma rings", "", costs.spark_ring_bytes, allowance_basis));
+            device.items.push(Item::new(Category::Transport, "rdma rings", "", v41_spark_ring_allowance(family, options.spark_capacity_rows, costs.spark_ring_bytes, bf16_ingress),
+                if family == "deepseek_v41" { Basis::Formula } else { allowance_basis }));
             device.items.push(Item::new(Category::Runtime, "context+modules", "", 512 * MIB, allowance_basis));
             spark_devices.push(device);
         }

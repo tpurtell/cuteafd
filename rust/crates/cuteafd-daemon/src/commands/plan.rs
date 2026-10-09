@@ -64,7 +64,7 @@ fn options(args: &PlanArgs) -> Result<PlanOptions, PlanError> {
 }
 
 pub(crate) fn run_plan(args: PlanArgs) -> Result<()> {
-    let options = options(&args)?;
+    let mut options = options(&args)?;
     let snapshot = if PathBuf::from(&args.model).is_dir() {
         PathBuf::from(&args.model)
     } else {
@@ -88,6 +88,19 @@ pub(crate) fn run_plan(args: PlanArgs) -> Result<()> {
             .snapshot_path
             .with_context(|| format!("no snapshot of {} under {}", args.model, hf_home.display()))?
     };
+    if let Some(layout) = &mut options.layout {
+        let config = std::fs::File::open(snapshot.join("config.json")).ok()
+            .and_then(|file| serde_json::from_reader::<_, serde_json::Value>(file).ok());
+        if config.as_ref().and_then(|value| value.get("model_type"))
+            .and_then(serde_json::Value::as_str) == Some("deepseek_v41") {
+            // Match run.sh's supported worker capacities without changing other families.
+            layout.spark_capacity_rows = if args.prefill_rows == 0 { 4096 }
+                else if args.prefill_rows <= 80 { 80 }
+                else if args.prefill_rows <= 256 { 256 }
+                else if args.prefill_rows <= 1024 { 1024 }
+                else { 4096 };
+        }
+    }
     let report = if args.spark_ranks.is_some() { plan(&snapshot, &options)? }
         else { plan_preferred(&snapshot, &options)? };
     if args.json {

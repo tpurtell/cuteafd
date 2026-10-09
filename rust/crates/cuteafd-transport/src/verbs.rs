@@ -2038,7 +2038,7 @@ impl VerbsHostProtocolV2PersistentClientSession {
         execution_lane: u32,
         cq_harvester: Option<Arc<VerbsHostProtocolV2CqHarvester>>,
     ) -> Result<Self> {
-        Self::connect_impl(addr, config, request, execution_lane, cq_harvester, false, None, false, None, None, 0)
+        Self::connect_impl(addr, config, request, execution_lane, cq_harvester, false, None, false, None, None, 0, None)
     }
 
     /// `flow_label`: both QPs' RoCE v2 flow label (0: the kernel's own).
@@ -2046,9 +2046,9 @@ impl VerbsHostProtocolV2PersistentClientSession {
     fn connect_local(addr: SocketAddr, config: &TcpTransportConfig,
                      request: &ExpertProtocolV2Request, landing: Option<DeviceLanding>,
                      egress: Option<&Arc<egress::EgressBuffer>>, write: Option<DeviceWriteTarget>,
-                     terminal_owner: Option<Arc<AtomicBool>>, flow_label: u32) -> Result<Self> {
+                     terminal_owner: Option<Arc<AtomicBool>>, flow_label: u32, capacity: Option<u32>) -> Result<Self> {
         let mut session = Self::connect_impl(addr, config, request, 0, None, true, landing, egress.is_some(), write,
-            terminal_owner, flow_label)?;
+            terminal_owner, flow_label, capacity)?;
         if let Some(buffer) = egress {
             let host = buffer.host();
             // SAFETY: the buffer is pinned host memory kept alive by the Arc
@@ -2068,7 +2068,7 @@ impl VerbsHostProtocolV2PersistentClientSession {
                     cq_harvester: Option<Arc<VerbsHostProtocolV2CqHarvester>>,
                     retain_final_response: bool, landing: Option<DeviceLanding>, gathered_sends: bool,
                     write: Option<DeviceWriteTarget>, terminal_owner: Option<Arc<AtomicBool>>,
-                    flow_label: u32)
+                    flow_label: u32, capacity: Option<u32>)
                     -> Result<Self> {
         verbs_host_preflight()?;
         let native_path = verbs_host_native_library_path().context(
@@ -2077,6 +2077,14 @@ impl VerbsHostProtocolV2PersistentClientSession {
         let library = Arc::new(unsafe { NativeLibrary::load(&native_path) }?);
         let request_wire_bytes = request.wire_stats().wire_bytes;
         let expected_response_wire_bytes = verbs_host_expected_response_wire_bytes(request)?;
+        let (request_wire_bytes, expected_response_wire_bytes) = match capacity {
+            Some(rows) => {
+                let (max_request, max_response) = crate::protocol_v2::compact_expert_wire_bytes(
+                    cuteafd_core::expert_geometry(), rows, request.header.hidden_dtype == ExpertV2Dtype::Bf16)?;
+                (request_wire_bytes.max(max_request), expected_response_wire_bytes.max(max_response))
+            }
+            None => (request_wire_bytes, expected_response_wire_bytes),
+        };
         let (request_ring, response_ring) =
             verbs_host_persistent_rings(config, request_wire_bytes, expected_response_wire_bytes)?;
         let request_capacity_wire_bytes = request_ring.slot_capacity_bytes;
@@ -4348,17 +4356,12 @@ fn configure_control_stream(stream: &TcpStream, timeout: Duration) -> Result<()>
 }
 
 fn verbs_host_control_plane_closed(stream: &TcpStream) -> Result<bool> {
-    let prior_timeout = stream
-        .read_timeout()
-        .context("reading verbs-host control-plane timeout")?;
-    stream
-        .set_read_timeout(Some(Duration::from_millis(1)))
-        .context("setting verbs-host control-plane liveness timeout")?;
+    stream.set_nonblocking(true)
+        .context("setting verbs-host control-plane nonblocking peek")?;
     let mut byte = [0_u8; 1];
     let peek_result = stream.peek(&mut byte);
-    stream
-        .set_read_timeout(prior_timeout)
-        .context("restoring verbs-host control-plane timeout")?;
+    stream.set_nonblocking(false)
+        .context("restoring verbs-host control-plane blocking mode")?;
     match peek_result {
         Ok(0) => Ok(true),
         Ok(_) => Ok(false),
@@ -4404,7 +4407,12 @@ fn read_control_value(reader: &mut BufReader<TcpStream>) -> Result<serde_json::V
     if bytes == 0 {
         bail!("verbs-host ProtocolV2 control plane closed");
     }
-    Ok(serde_json::from_str(line.trim_end())?)
+    let value: serde_json::Value = serde_json::from_str(line.trim_end())?;
+    if value.get("message").and_then(serde_json::Value::as_str) == Some("protocol_v2_bootstrap_error") {
+        bail!("verbs-host ProtocolV2 bootstrap rejected: {}",
+            value.get("error").and_then(serde_json::Value::as_str).unwrap_or("unspecified peer error"));
+    }
+    Ok(value)
 }
 
 fn control_message(value: &serde_json::Value) -> Result<&str> {

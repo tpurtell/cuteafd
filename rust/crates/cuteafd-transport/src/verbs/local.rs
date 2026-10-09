@@ -96,7 +96,6 @@ impl Drop for RingReservation {
 }
 
 pub struct LocalVerbsExpertConnection {
-    stream: TcpStream,
     library: Arc<NativeLibrary>,
     endpoint: NativeRdmaEndpoint,
     start: VerbsHostProtocolV2PersistentStart,
@@ -109,14 +108,16 @@ pub struct LocalVerbsExpertConnection {
     response_send_sequence: usize,
     response_send_in_flight: usize,
     response_copy_stream: Option<VerbsHostCudaStream>,
-    last_activity: Instant,
-    last_liveness: Instant,
+    next_liveness: Instant,
+    liveness_polls: u8,
     /// Startup-resolved diagnostics flag; see `protocol_v2_timing_from_env`.
     timing: bool,
     /// Mapped-ring reservation held until this connection is dropped. Declared
-    /// last so the endpoint's registered memory is destroyed before the budget
+    /// after the endpoint so its registered memory is destroyed before the budget
     /// credit is returned to the shared budget.
     ring_reservation: Option<RingReservation>,
+    // EOF acknowledges teardown only after native rings and their credit are released.
+    stream: TcpStream,
 }
 // No operation can race: polling requires &mut self, and all registered views
 // remain owned by the endpoint. Like VerbsHostMappedRdmaRing, a session may move
@@ -156,7 +157,20 @@ impl LocalVerbsExpertConnection {
             .registered_span_bytes
             .checked_add(response_ring.registered_span_bytes)
             .context("mapped RDMA ring reservation byte count overflow")?;
-        let reservation = budget.reserve(bytes)?;
+        let reservation = match budget.reserve(bytes) {
+            Ok(reservation) => reservation,
+            Err(error) => {
+                let error = error.context(format!(
+                    "expert endpoint execution_lane={} request_capacity={} response_capacity={} ring_bytes={} budget_used={} budget_limit={}",
+                    start.execution_lane, start.request_capacity_wire_bytes,
+                    start.response_capacity_wire_bytes, bytes, budget.used(), budget.limit()));
+                let mut stream = stream;
+                write_control(&mut stream, &serde_json::json!({
+                    "message": "protocol_v2_bootstrap_error", "error": format!("{error:#}")
+                }))?;
+                return Err(error);
+            }
+        };
         eprintln!(
             "protocol_v2_verbs_persistent_server_ring_budget execution_lane={} request_capacity={} request_span={} response_capacity={} response_span={} depth={} reserved_bytes={} budget_limit={} budget_used={} budget_peak={}",
             start.execution_lane,
@@ -377,8 +391,8 @@ impl LocalVerbsExpertConnection {
             response_send_sequence: 0,
             response_send_in_flight: 0,
             response_copy_stream: None,
-            last_activity: Instant::now(),
-            last_liveness: Instant::now(),
+            next_liveness: Instant::now(),
+            liveness_polls: 0,
             timing,
             ring_reservation: None,
         })
@@ -399,6 +413,11 @@ impl LocalVerbsExpertConnection {
             &mut dyn FnMut(ProtocolV2ExecutorResponseRef<'_>) -> Result<()>,
         ) -> Result<()>,
     {
+        // Clock/peek checks are amortized while the owner spins on completions.
+        if self.liveness_polls == 0 || wait.is_some() {
+            check_peer_liveness(&self.stream, &mut self.next_liveness)?;
+        }
+        self.liveness_polls = self.liveness_polls.wrapping_add(1);
         let timing_enabled = self.timing;
         let total_started = timing_enabled.then(Instant::now);
         let poll_recv_started = timing_enabled.then(Instant::now);
@@ -416,18 +435,13 @@ impl LocalVerbsExpertConnection {
             None => self.endpoint.try_poll(0, 1)?,
         };
         if stats.recv_completions == 0 {
-            if self.last_activity.elapsed() >= Duration::from_secs(1)
-                && self.last_liveness.elapsed() >= Duration::from_secs(1)
-            {
-                self.last_liveness = Instant::now();
-                anyhow::ensure!(
-                    !verbs_host_control_plane_closed(&self.stream)?,
-                    "native RoCE peer closed"
-                );
+            if wait.is_some() {
+                check_peer_liveness(&self.stream, &mut self.next_liveness)?;
             }
             return Ok(false);
         }
-        self.last_activity = Instant::now();
+        // Execution can take much longer than a poll; check promptly when it returns.
+        self.liveness_polls = 0;
         let endpoint = &self.endpoint;
         let library = &self.library;
         let start = &self.start;
@@ -707,9 +721,60 @@ fn written_flag(request_id: u64, unwritable: bool) -> u64 {
     (request_id & !VERBS_HOST_WRITE_FLAG_ERROR) | if unwritable { VERBS_HOST_WRITE_FLAG_ERROR } else { 0 }
 }
 
+fn check_peer_liveness(stream: &TcpStream, next: &mut Instant) -> Result<()> {
+    let now = Instant::now();
+    if now >= *next {
+        ensure_peer_open(stream)?;
+        *next = now + Duration::from_millis(1);
+    }
+    Ok(())
+}
+
+fn ensure_peer_open(stream: &TcpStream) -> Result<()> {
+    anyhow::ensure!(!verbs_host_control_plane_closed(stream)?, "native RoCE peer closed");
+    Ok(())
+}
+
 #[cfg(test)]
 mod budget_tests {
     use super::*;
+
+    #[test]
+    fn busy_peer_eof_releases_rings_without_an_idle_window() -> Result<()> {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let mut client = TcpStream::connect(listener.local_addr()?)?;
+        let (server, _) = listener.accept()?;
+        let budget = RingBudget::new(100);
+        let credit = budget.reserve(100)?;
+        let (ready, busy) = std::sync::mpsc::channel();
+        let owner = std::thread::spawn(move || -> Result<()> {
+            let mut next = Instant::now();
+            check_peer_liveness(&server, &mut next)?;
+            ready.send(())?;
+            let started = Instant::now();
+            // Simulate continuous completions; there is never a one-second idle window.
+            let mut polls = 0u8;
+            loop {
+                if polls == 0 && check_peer_liveness(&server, &mut next).is_err() { break; }
+                polls = polls.wrapping_add(1);
+                anyhow::ensure!(started.elapsed() < Duration::from_millis(500), "peer EOF not observed promptly");
+                std::thread::yield_now();
+            }
+            drop(credit);
+            drop(server);
+            Ok(())
+        });
+        busy.recv_timeout(Duration::from_secs(1))?;
+        let started = Instant::now();
+        client.shutdown(std::net::Shutdown::Write)?;
+        client.set_read_timeout(Some(Duration::from_millis(500)))?;
+        let mut byte = [0u8; 1];
+        assert_eq!(std::io::Read::read(&mut client, &mut byte)?, 0);
+        owner.join().unwrap()?;
+        assert!(started.elapsed() < Duration::from_millis(500));
+        assert_eq!(budget.used(), 0);
+        Ok(())
+    }
 
     #[test]
     fn ring_budget_reserves_releases_and_tracks_peak() -> Result<()> {
