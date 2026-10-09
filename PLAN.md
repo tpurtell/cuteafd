@@ -1821,8 +1821,7 @@ TJ: two key items, both urgent right after v2.0.0.
    every speculative family, with per-layer timing and committed-route
    plumbing added to each engine. Replaces `CycleCost`'s row table; the
    per-concurrency buckets on `work/draft-policy-v2` are interim. Design:
-   Fable, together with a review of the ds41rt retirement and placement
-   designs into one v3 roadmap.
+   "v3 draft policy: resource-priced, shared" below; order: "v3 roadmap".
 7. **API gateway and sessions (TJ, 2026-10-09; building now on
    `work/api-gateway`).** Complete, spec-faithful Anthropic Messages and
    OpenAI Responses so Claude Code and Codex CLI use cuteafd directly (no
@@ -1856,6 +1855,92 @@ TJ: two key items, both urgent right after v2.0.0.
 Gate per family: golden/fidelity, then the quick A/B at the 2M operating
 point on the min and max reference configs. Requalify each family's cards
 as it moves.
+
+## v3 roadmap (2026-10-09)
+
+One ordered plan across the three v3 designs below: placement (item 1),
+retiring ds41rt (item 2) and the shared draft policy (item 6). Steps are
+named by their design (`P` placement PRs, `S` ds41rt stages, `D` draft-policy
+steps) so the sections below stay the reference for each step's content.
+Sizes: S under two days, M under a week, L more. Three lanes run in
+parallel; hardware gates are serialized on the cluster and ordered here by
+value (the measured GLM Flash regression and V4's 603K pool first).
+
+**Merged, so built once:**
+- `S4a` + `S4b` (V4.1 experts and admission onto shared) **is** `P12`. One
+  branch, one gate.
+- `S1a`'s `Speculator` trait and `VerifyCost` are gone; V4.1's policy *is*
+  the shared one (`D0`, `D1`), and `S1a` consumes the shared binding.
+- `S0`'s expert type moves are `P4`'s prerequisite (`NativeTp2` is V4.1's
+  `RankWave` over shared `ExpertLayer`/`ExpertShard`).
+- `P2`'s `GraphSet` (shapes and bytes, planner-visible) is the warm list
+  `S3`'s `GraphBank` consumes; define it once in `P2`.
+- The ds41rt design's `ShardedVocabulary` (its "what `shared/` must grow"
+  item 9) is the placement design's head shard ("shard the vocabulary,
+  solver-chosen ratio"); it lands with `P5`.
+- `P13` (delete `family_costs` rows) is folded into each family's solver port.
+- `P3`'s hop primitive is `S4c`'s; `S4c` follows `P7` (the first generic
+  per-layer executor) rather than inventing a second one.
+- `Fp8Layer::bytes_for` and the EXL3 manifest residency are the one source of
+  per-rank expert bytes for both `ExpertCost` (`P1`) and `slice_bytes` (`D2`).
+- v3 item 5 (Qwen FP8 KV) is `P10`'s `KvDemand.format` input. Item 3 (V4.1
+  NVFP4) stays deferred and off this roadmap.
+
+| # | step | lane | size | after | gate |
+|---|---|---|---|---|---|
+| 1 | `D0` geometry-parameterized core (`dspark_policy` -> `draft_policy`), V4.1 binding passes its geometry | D | S | - | identical decisions on recorded observations; V4.1 golden; one A/B pair V4.1 min |
+| 2 | `S0` invert dependencies: `CudaCopyEngine`, expert types, `ScoreRows`, V4.1 golden entry | S | M | - | tests; byte-exact golden V4.1 / V4 / GLM Flash EXL3; one A/B pair V4.1 min |
+| 3 | `P1` placement module, `PoolPolicy`, `solve`, V4 port, `planner_equals_runtime_deepseek_v4` | P | M | - | equality test; V4 Flash/Pro A/B at 2M (603K -> 2M pool must not cost C1) |
+| 4 | `D1` shared plumbing: `LayerClock`, `RoundRoutes`, `RoundClock`, `Evidence`/`DraftSource`, observation builder; V4.1 binding onto them | D | M | 1 | tests; V4.1 golden; A/B min |
+| 5 | `P3` `ResidualHome`, hop primitive, `LayerMode` in `Placement` | P | S | 3 | unit tests, no behavior change |
+| 6 | `D2` GLM Flash onto the shared policy (events, routes, geometry, selector prior, Platt) | D | L | 4 | matched-prompts card: fresh C1, **C1 after a C16 sweep**, C4, C16, emitted tok/s, min and max, EXL3 and FP8 |
+| 7 | `P2` exact items: `RuntimeInventory::measure`, context table, `GraphSet`, `ProgramSet`, package scratch | P | M | 3 | ledger within 64 MiB at ready: V4 small, Qwen local, MiMo, GLM Flash |
+| 8 | `S1a` V4.1 serve loop on shared parts at share 0 (`PrefillQueue`, lanes, shared draft binding, `ScoreRows`, admission hooks) | S | L | 2, 4 | standard V4.1 stage gates + 3-session C16 recheck at share 0 |
+| 9 | `S2` V4.1 prefix cache onto the engine (restore plan, snapshot meta, pending capture) | S | L | 2 | byte-exact exact-prefix text/image/odd frontier; approximate replay NLL; host tier; agentic hit tokens |
+| 10 | `S3` `GraphBank` (`FixedStartup`), GLM Flash `GraphCache` as `Budgeted`, V4.1 banks onto it | S | M | 7 | `CaptureWatch` = 0 steady-state captures over C16 |
+| 11 | `P4` `shared/experts/rtx` (`NativeTp2` from V4.1 `RankWave`, `Combine`, `RouteIdentity`), dsv4 `rtx_tp2` CMake, V4 wiring | P | L | 2, 3 | V4 Pro EXL3 K2 KL no worse than rc1; route check; A/B min/max; V4.1 byte-exact through `NativeTp2` |
+| 12 | `D3` global row budget and copy competition on GLM Flash | D | M | 6 | same card; C16 heterogeneous prompts is the metric; C1 unchanged |
+| 13 | `S1b` decode share on V4.1 (`--prefill-chunk-s`, `--decode-share`) | S | M | 8 | stream KL <= 2x batch envelope; long-prompt greedy-16 exact; decode gaps |
+| 14 | `P5` V4 drafter as a `Movable` on GPU1, terminal close, marks, `ShardedVocabulary` | P | M | 11 | lossless spec; C1 at max |
+| 15 | `P6` GLM Flash solver port, coordinator tp2 packages, `Fp8MoeTp2`/`Exl3Tp2`, router replica, DFlash2 on GPU1 | P | M | 11 | golden NLL 2.4054; A/B min/max at 2M |
+| 16 | `D4` MiMo, GLM 5.3, Qwen (chain depth as the pre-draft action), V4 (fixed-width binding) onto the shared policy | D | M, S, M, S | 6 | the D2 card per family on its min/max |
+| 17 | `P8` MiMo solver port, bidirectional MoE exchange, `Fp8MoeTp2`, drop the unused wire buffer | P | M | 11 | golden; A/B min/max (max sheds 12 Spark layers) |
+| 18 | `P7` GLM Flash per-layer executor: Whole DSA layers, compact index on owners, Spark-free 2 RTX at 2M, tr3 at 1M | P | L | 5, 15 | fidelity; Spark-free card; A/B min/max |
+| 19 | `P11` exact Spark admission for every family (`ModelAdmission`, endpoints, ingress, finite `RingBudget`) | P | M | 7 | every family's min/max: ring peak == charge |
+| 20 | `S4` (= `P12`) V4.1 experts, admission and handoff onto shared: coordinator exchange on `SparkLink`, local/TP2 on `shared/experts/{local,rtx}` with `OwnerReduce`, `FamilyPlacement`, `PlacementHandoff`; delete `memory*.rs`, `placement.rs`, `v41_experts/tp2.rs` staging | S/P | L | 8, 11 | `planner_equals_runtime_deepseek_v41`; KV pool at 2M on min/max never smaller; MXFP4/NVFP4/EXL3 launches; V4.1 golden byte-exact |
+| 21 | `S4c` fold V4.1 single-RTX and distributed paths onto the per-layer ownership map (`P3` hop) | S | L | 18, 20 | standard V4.1 gates; C1 single-lane fast path survives |
+| 22 | `P9` GLM 5.3 solver port, ranges vs head split at max; `P10` Qwen solver port, ranges on 2 RTX, FP8 KV option | P | M, M | 18 | A/B both modes at max (GLM 5.3); golden + 1 RTX local and 2 RTX ranges A/B (Qwen) |
+| 23 | `S5` launcher: `cuteafd plan --deployment` -> `DeploymentSpec`, `run-family.sh` serves V4.1, `run.sh` dispatches only | S | M | 19, 20 | `--dry-run` equality with `run.sh` for release configs; script tests; one launch per arm |
+| 24 | `D5` delete `CycleCost`, `Calibration`, `allocate`, v2 buckets, `glm5/dflash_policy.rs` planning, per-family copy loops | D | S | 16 | tests; failing ids unchanged |
+| 25 | `S6` delete and rename: legacy non-topology path, `v41_` module prefix, dated compatibility readers | S | M | 21, 23 | full V4.1 parity (3 interleaved sessions) against v2.0.0 |
+
+**Release cuts.** Full V4.1 parity and the agentic bench run at cuts, not per
+step: a cut after step 11 (placement for V4, draft policy for GLM Flash,
+V4.1 byte-exact on shared types), one after step 20, and v3.0.0 after 25.
+
+**Dropped or flagged (review 2026-10-09):**
+- Dropped: the `Speculator` lifecycle trait and `VerifyCost` (one
+  implementor each under decision 2); `P13` as its own PR; `CycleCost`
+  concurrency buckets as a gated step (interim only, see the draft design).
+- Under-specified, to fix in the step that owns it: hop buffers
+  (`[4096,4,H]` BF16 = 128 MiB per lane per boundary) are not in the
+  placement tables and must be `fixed` demands in `P3`; `GraphSet`'s
+  bytes-per-executable is a per-arch measured constant that `P2` must record
+  with its driver version; `S4c` is unaudited (~1.5-3K lines) and sized from
+  file counts; `group_rows` for fp8moe/EXL3/NVFP4 kernels is assumed 16 until
+  the AOT manifests record the tile (`D2`); `S2`'s distributed `prefill_hold`
+  is either implemented or logged, never claimed.
+- Questions for TJ, not changed: decision 7 (keep V4.1's 20/20 split) is
+  consistent with `P7`'s per-layer mix being measured later; decision 2 (no
+  unified loop in v3) is what makes dropping `Speculator` safe, and it means
+  three family loops carry the shared draft binding by hand (one `D1` helper,
+  three call sites).
+
+**What this changes in the sections below** (edited in place, marked
+"revised 2026-10-09"): ds41rt map item 3 and stage 1a drop `Speculator`/
+`VerifyCost`; stage 3 consumes `P2`'s `GraphSet`; stage 4a+4b is `P12`; stage
+4c follows `P7`; placement `P13` is folded; the placement design's head shard
+is the ds41rt design's `ShardedVocabulary`.
 
 ## v3: retiring ds41rt (design, 2026-10-09)
 
@@ -1923,6 +2008,7 @@ it), **model** (stays in the family).
 | FP8 window rings, dSpark rings | `v41_window*`, `v41_dspark_cache*` | 2,466 (555) | `MarkArena` (positional marks) | model; captured as marks |
 | Expert path: layers, execution, exchange, EXL3, local, TP2, NVFP4, assignment | `v41_experts.rs`, `v41_experts/{coordinator,execution*,exl3*,local*,nvfp4,paired,tp2*}.rs` | 9,091 (2,900) | `shared/experts/service*` (already uses these types), `shared/spark_intake` (`SparkLink`), `shared/peer_split`, `shared/memory/device`; item 1 `shared/experts/rtx.rs` | extend: move out as shared types. same: coordinator receive/reduce. model: catalog/role/format adapters |
 | dSpark drafter | `v41_experts/dspark*` | 5,685 (1,078) | none (GLM Flash/MiMo drafters are family code too) | model; its expert backend moves to shared executors |
+| dSpark policy binding, copy drafts | `v41_native_serve/speculative/policy.rs`, `copy_drafts.rs` | 633 (240) | `cuteafd-core::dspark_policy` is already shared code; it becomes the shared policy (v3 item 6) | same: the binding becomes the shared `shared/draft` binding; the copy *search* moves to `shared/speculation/copy.rs` (revised 2026-10-09) |
 | Shared FFN, router, projection TP2 | `v41_backbone_shared*`, `v41_shared_ffn`, `v41_backbone_router`, `v41_projection_tp2` | 2,135 (954) | `shared/peer_split` | model |
 | Target pass, lanes, execution, block, layer graphs | `v41_target_pass*`, `v41_backbone_lane*`, `v41_backbone_execution*`, `v41_block*`, `v41_layer_graphs` | 10,598 (4,198) | `shared/memory/chain` (`StageChain`, already used), `shared/decode_graph` (bucket policy only, no graph owner) | model: layer program. extend: lane set, ordered two-lane pipeline, graph bank. vestige: single-vs-distributed duplication |
 | Target head, embedding | `v41_target_head*`, `v41_target_embedding*` | 4,075 (2,573) | `shared/sampler`, `shared/token_io::TokenEmbedding` | model: mHC collapse. extend: sharded vocabulary. same: embedding |
@@ -1987,21 +2073,26 @@ sketches; typed errors inside crates.
      (`reserve`, `wait_predecessor(stage)`, `publish(stage)`, `commit`,
      `cancel`). This is V4.1's `encoder_stream.rs` dependency order with the
      family's stage hooks. The C1 `single_lane_round` fast path stays.
-3. **Speculator interface** (`shared/speculation.rs`).
-   - The trait: `trait Speculator { type Prefix; type CommitInput; type
-     Pending; admit, begin_propose/poll_propose, begin_commit/poll_commit/
-     publish_commit, abort_and_drain, retain_prefix/restore_prefix, release
-     }`.
-   - `DsparkSpeculator` wraps `DraftRuntime`/`DraftChain`. Its three
-     windows, taps, RNG and widths 5/7 stay in the family.
-   - DFlash2 and MTP get immediate-ready adapters later. Proposals carry
-     `DraftSource` (neural/copy), so copied rows never train neural
-     acceptance.
-   - The cost side is a `VerifyCost` trait. `cuteafd-core::dspark_policy`
-     takes a `ResourceGeometry` instead of its hard-coded
-     40 / 384 / top-6 / group-16.
-   - This lines up with the planned shared adaptive-draft policy (Explore
-     list).
+3. **Draft policy and copy drafts** (revised 2026-10-09; design: "v3 draft
+   policy: resource-priced, shared").
+   - The shared policy *is* V4.1's: `cuteafd-core::dspark_policy` becomes
+     `cuteafd-core::draft_policy` with the geometry (layers, experts, top-k,
+     group rows, slice bytes, resource class per layer) as an input, and
+     V4.1's `speculative/policy.rs` is its first binding (roadmap step 1,
+     decision-identical). Nothing in this stage designs a `VerifyCost` trait
+     or a second cost model.
+   - **No `Speculator` lifecycle trait in v3.** With decision 2 (family
+     loops over shared parts, no unified loop) it would have one
+     implementor. `DraftRuntime`/`DraftChain`, the three windows, taps, RNG
+     and widths 5/7 stay family code. What is shared is the policy's
+     observation contract: proposals and observed rows carry `DraftSource`
+     (neural / copy), so copied rows never train neural evidence (the
+     binding already does this). Converge drafter lifecycles after v3 with
+     the loops.
+   - `copy_drafts.rs`'s indexed 8-gram match becomes the shared
+     `shared/speculation/copy.rs` helper (MiMo's longest-backward match is
+     its second policy); whether a copy span is *used* is the shared policy's
+     acceptance-gated decision (decision 9), not a per-family override.
 4. **Retained scores** (`shared/token_io.rs`).
    - `ScoreRows { selected, packed, row_to_pack, vocab }` and
      `RetainedScores { vocab, raw }` replace V4.1's `BatchScores`/
@@ -2112,12 +2203,14 @@ sketches; typed errors inside crates.
 
 Each stage is its own branch off work/p0, merges on its own gates, and
 deletes the V4.1 code it replaces. **Order:**
-- Stage 0 first.
+- Stage 0 first (with the draft policy's `D0`/`D1`, which stage 1a consumes).
 - Stages 1, 2 and 3 touch disjoint files and can run in parallel.
   Hardware gates are serialized.
-- Stage 4 follows item 1's solver landing for V4.
-- Stage 5 needs stage 4's `DeploymentSpec` inputs.
+- Stage 4 (= placement PR 12) follows item 1's solver landing for V4 (P1,
+  P4) and stage 1a; 4c follows P7.
+- Stage 5 needs stage 4's `DeploymentSpec` inputs and P11's Spark admission.
 - Stage 6 is last.
+The cross-design order with sizes and gates is the "v3 roadmap" above.
 
 **Gates for every stage (V4.1 MXFP4, plus NVFP4 where the stage touches
 experts or prefill):**
@@ -2166,7 +2259,11 @@ keeps its admission and CED phases and adopts:
 - `PrefillQueue` + `V41Prefill`;
 - `LaneSet`/`LaneCommit`;
 - `PipelineOrder`;
-- `Speculator` (dSpark);
+- the shared draft binding (`shared/draft/*`, roadmap `D1`): `LayerClock`,
+  `RoundRoutes`, `RoundClock` and the `Evidence`/`DraftSource` observation
+  builder replace `speculative/policy.rs`'s hand-built observation; the
+  dSpark drafter itself stays family code (revised 2026-10-09, no
+  `Speculator` trait);
 - `ScoreRows`;
 - engine `DeferredAdmission` and `MediaAdmission`, including the lifetime
   budget fit as a policy hook;
@@ -2212,22 +2309,35 @@ The default stays share 0 through the static bypass.
   (`LayerGraphs`/`RowGraphs`) and the banks in the head, query/output,
   index and embedding.
 - GLM Flash's `GraphCache` moves in as `Budgeted`.
+- The warm list is placement `P2`'s `GraphSet::startup(shape)` (revised
+  2026-10-09): one definition of the startup shapes and their bytes, read by
+  the planner for admission and by the bank for warm-up, so admission cannot
+  under-count GPU1's new router/TP2 executables.
 - **Gate.** The standard gates plus `CaptureWatch` = 0 steady-state
   captures over the C16 battery.
 - **Leaves the family:** ~0.6-1.1K. Net ~0.2-0.4K.
 
-**Stage 4: experts, admission, layer ownership (L; three PRs).**
-- **4a.** Coordinator Spark exchange onto `SparkLink`. Local/TP2 onto
-  `shared/experts/{local,rtx}`. The dSpark expert backend onto shared
-  executors.
-- **4b.** Admission via `FamilyPlacement` + `RuntimeInventory`. Deletes
-  `memory.rs`, `memory/distributed.rs` and `placement.rs`.
+**Stage 4: experts, admission, layer ownership (L; two PRs; revised
+2026-10-09).**
+- **4a+4b is placement PR 12**, one branch and one gate: coordinator Spark
+  exchange onto `SparkLink`; local/TP2 onto `shared/experts/{local,rtx}`
+  with `Combine::OwnerReduce`; the dSpark expert backend onto shared
+  executors; admission via `FamilyPlacement` + `RuntimeInventory`;
+  `v41_native_serve/placement.rs` becomes `PlacementHandoff`. Deletes
+  `memory.rs`, `memory/distributed.rs`, `placement.rs` and the
+  `RankWeights`/`RankWave` staging in `v41_experts/tp2.rs` once `NativeTp2`
+  serves V4.1 byte-exact (P4 proves that first on V4). Splitting experts from
+  admission bought nothing: both change the same startup path and both need
+  the same V4.1 launch matrix.
 - **4c.** Fold the single-RTX and distributed paths into one path driven
   by the per-layer ownership map, where 1 RTX means every layer is
   `Whole(0)`. Today `v41_target_pass.rs` vs
   `v41_target_pass/distributed.rs`, `v41_backbone_execution.rs` vs
   `v41_backbone_execution/distributed.rs`, and so on duplicate
-  orchestration. C1's single-lane fast path must survive.
+  orchestration. C1's single-lane fast path must survive. It follows
+  placement `P7` (the first generic per-layer executor, on GLM Flash) and
+  uses `P3`'s hop primitive, which is `BlockTransfer` moved; V4.1 does not
+  grow a second one.
 - **Gate.** The standard gates, plus:
   - `planner_equals_runtime_deepseek_v41`;
   - KV pool at 2M on min and max, never smaller than today;
@@ -2963,15 +3073,15 @@ Full V4.1 parity applies when a shared hot path changes (marked †).
 | 2 | Exact items: `RuntimeInventory::measure`, per-arch context table, `GraphSet`, `ProgramSet`, exact expert package scratch; planner uses them for all families | M | ledger compare at ready within 64 MiB: V4 small, Qwen local EXL3/NVFP4, MiMo, GLM Flash | closes the PLAN-listed gaps (Qwen +5.35/6.72 GB, V4 84 MB) |
 | 3 | `ResidualHome`, hop primitive, `LayerMode` in `Placement`; engines assert their mode set | S | unit tests | no behavior change |
 | 4 † | `shared/experts/rtx` (`NativeTp2` from V4.1 `RankWave`, `Combine`, `RouteIdentity`), dsv4 `rtx_tp2` CMake, V4 engine wiring (router replica, `post_split`/`peer_front`) | L | V4 Pro EXL3 K2 quick KL no worse than rc1 (0.0605 min / 0.0596 max) and Flash golden; route check passes; A/B min/max | V4.1 byte-exact through `NativeTp2` before its private copy is retired (PR 12) |
-| 5 | Drafter as a movable: V4 dSpark (with stage experts) on GPU1, terminal close, marks | M | lossless spec check; C1 at max | |
+| 5 | Drafter as a movable: V4 dSpark (with stage experts) on GPU1, terminal close, marks; `shared/vocabulary::ShardedVocabulary` (the ds41rt design's item 9, V4.1's two-GPU head moved) for the head shard | M | lossless spec check; C1 at max | one sharded head for both designs (revised 2026-10-09) |
 | 6 | GLM Flash: solver port, coordinator tp2 packages (fp8moe), `Exl3Tp2`/`Fp8MoeTp2` wiring, router replica, DFlash2 on GPU1 | M | golden NLL (2.4054 split baseline); A/B min/max at 2M | |
 | 7 | Per-layer executor for GLM Flash: Whole DSA layers, compact index on owners; Spark-free 2 RTX K3/K3.25 at 2M; tr3 with ranges at 1M | L | fidelity; Spark-free card correctness; A/B min/max | proves the mixed mode |
 | 8 † | MiMo: solver port, bidirectional MoE exchange, `Fp8MoeTp2`, drop unused wire buffer | M | golden; A/B min/max (max should shed 12 Spark layers) | |
 | 9 | GLM 5.3: solver port, ranges vs head split at max (2M vs 1.30M pool) | M | A/B C1/C4 both modes at max; pick by section 3's rule | RTX experts need the local backend (L, deferred) |
 | 10 | Qwen: solver port, layer ranges on 2 RTX (Spark-free 2M), FP8 KV option plugs in (item 5) | M | golden; 1 RTX local + 2 RTX ranges A/B | head split only if later measured |
 | 11 † | Exact Spark admission: `ModelAdmission` request/response, endpoints and ingress, finite `RingBudget` for all, EXL3 worker geometry | M | every family's min/max: ring peak == charge (as work/spark-vision-ring) | |
-| 12 † | V4.1 onto the solver (`FamilyPlacement` impl, `NativeTp2`/`V41Nvfp4Tp2`/`Exl3Tp2` with `OwnerReduce`, `planner_equals_runtime_deepseek_v41`); delete `v41_experts/tp2.rs` `RankWave`/`RankWeights` once shared impls serve it byte-exact | L | V4.1 golden byte-exact, full 3-session parity | the ds41rt design's "expert service + memory" stage consumes these types |
-| 13 | Delete `family_costs` rows and `layout.rs` family branches as each family moves | S | planner fixture tests | |
+| 12 † | **= ds41rt stage 4a+4b.** V4.1 onto the solver (`FamilyPlacement` impl, `NativeTp2`/`V41Nvfp4Tp2`/`Exl3Tp2` with `OwnerReduce`, `PlacementHandoff`, coordinator exchange on `SparkLink`, `planner_equals_runtime_deepseek_v41`); delete `memory*.rs`, `placement.rs` and `v41_experts/tp2.rs` `RankWave`/`RankWeights` once shared impls serve it byte-exact | L | V4.1 golden byte-exact; the stage's standard gates; full 3-session parity at the release cut | one branch for both designs (revised 2026-10-09) |
+| 13 | Delete `family_costs` rows and `layout.rs` family branches | S | planner fixture tests | folded into each family's solver port (PRs 1, 6, 8, 9, 10, 12), not a PR of its own (revised 2026-10-09) |
 
 **V4.1 reuse.** The `NativeTp2`, `V41Nvfp4Tp2` and `Exl3Tp2` impls are
 V4.1's code moved, not rewritten:
@@ -3023,7 +3133,330 @@ it only through its own gate, because fusing changes rounding.
    numbers show a C1 win (please point to them; the audits found none in
    git).
 
+## v3 draft policy: resource-priced, shared (design, 2026-10-09)
+
+Design for v3 item 6. Inputs: `cuteafd-core::dspark_policy` (1,214 lines) and
+its V4.1 binding (`v41_native_serve/speculative/policy.rs`), today's
+`shared/draft_policy.rs` (`CycleCost`, `allocate`, `DraftHistory`,
+`Calibration`), work/draft-policy-v2 (5b99895e: concurrency buckets, keyed
+`SelectorFit`/`ConfidencePolicy`, `compete_copies`; parked), the Astra review
+(`builds/draft-policy-review/REPORT.md`), the glmf-defaults-on evidence and
+three read-only engine audits (GLM 5.3/Flash, MiMo/Qwen, V4.1) relayed in
+this design's branch report. Nothing here ran on hardware.
+
+**Why V4.1's model transfers across concurrency and `CycleCost` does not.**
+`CycleCost` fits `a + b*table(rows) + c*(sequences-1)`. At C16 the verify step
+is sub-additive in rows (identical and similar requests share expert reads),
+so the fitted row slope `b` is small; a C1 request arriving inside the ~50-step
+forgetting window is then priced with that slope and buys ~5.4 drafts where
+3.2 pay (C1 -9.8%, glmf-defaults-on). The sub-additivity is a property of the
+*traffic*, not of the row count, and V4.1's model prices it where it lives:
+per layer `alpha + beta*rows + bytes/bandwidth`, with bytes forecast from the
+union of the step's routes. `beta` and `1/bandwidth` are physical and the same
+at C1 and C16; a C16 step costs less per row because its route union has fewer
+new expert groups per row, not because rows got cheaper. The per-concurrency
+buckets on work/draft-policy-v2 patch the symptom (one fit per regime); the
+resource-priced model removes the cause. No buckets in the target design; if
+the C1-after-C16 gate still fails for a family, add buckets to the *round
+residual* only, never to the layer fits.
+
+### 1. The shared core
+
+`cuteafd-core::dspark_policy` moves to `cuteafd-core::draft_policy` and takes
+its geometry as a value. It is CPU-only and does no device work, as today.
+Everything below is the existing algorithm with constants turned into inputs;
+the first binding (V4.1) must make byte-identical decisions on recorded
+observations.
+
+```rust
+pub struct PolicyGeometry {
+    pub layers: Vec<LayerResource>,       // every backbone layer, in order
+    pub experts: u16,                     // routed experts per layer (<= 65_535; routes are u16)
+    pub topk: u8,
+    pub max_requests: usize,              // the lane's row budget in requests (V4.1 16, GLM Flash DECODE_ROWS)
+    pub max_positions: usize,             // drafts per request (V4.1 7, DFlash block-1, MTP depth)
+    pub widths: Vec<usize>,               // draft widths the drafter can switch between; one = fixed
+    pub classes: Vec<ResourceClass>,      // fitted separately; usually [LocalRtx, Spark]
+    pub regimes: usize,                   // lane regimes (V4.1 solo/shared = 2; single-lane loops 1)
+}
+pub struct LayerResource {
+    pub class: Option<u8>,                // None: dense or untimed layer (no routed traffic)
+    pub slice_bytes: f64,                 // bytes one device reads for one expert's gate+up+down slice, this format and TP
+    pub group_rows: u8,                   // rows per weight-read group of the installed kernel (V4.1 slice kernels 16)
+    pub timed: bool,                      // has a preceding boundary event; layer 0 is false (its time is in the residual)
+}
+pub struct ResourceClass { pub label: &'static str, pub prior_us_per_mb: f64 }  // weak physical prior only
+```
+
+- **Cost model (unchanged).** Per timed layer `alpha_c + beta_c*rows +
+  MB/bandwidth_c` for its class `c`; per round `A + B*rows + C*requests`; per
+  draft pass `D + E*requests + wide*(F + G*requests)`; Huber-weighted,
+  exponentially forgotten, nonnegative least squares with weak priors; a mean
+  residual bias per regime. Traffic of a layer is `slice_bytes * sum_e
+  ceil(routes_e / group_rows)` over the step's route multiset.
+- **Route history and forecast (unchanged).** 24 committed tokens per request,
+  four shifted stand-in windows, novelty rate for short histories. Storage is
+  `Vec<u16>` of `layers * topk` per token, so Qwen's 512 experts fit; the
+  `& 511` decode moves into the binding.
+- **What stays V4.1-only inside the core:** nothing. The `(5, 7)` widths, the
+  "native block" boundary (`widths[0]`) for request-local outcomes, 40 layers,
+  384 experts, top-6 and group 16 are the V4.1 `PolicyGeometry`.
+- **What stays family code:** the dSpark drafter and its three windows, taps
+  and RNG; the DFlash2 selector kernel; MTP stage execution; the copy-window
+  *search* (indexed 8-gram, longest-backward); Engram, CED replay and mHC
+  (prefill and model arithmetic, not round pricing).
+
+### 2. Engine plumbing, every family
+
+Three signals per round, all taken where the engine already has the data.
+
+**Per-layer time: CUDA events between graph launches, not host marks.** Every
+generic engine already calls `console::layer_mark(index)` once per layer
+(GLM 5.3 `engine.rs:913,1166`, GLM Flash `:3008,3134`, MiMo `:1506,1639`,
+Qwen `:1951,2116`, V4 `:949`). Those are host clocks, armed only while a
+console viewer is connected, and on a local-expert layout they measure launch
+enqueue, not GPU time. V4.1 instead records one timing event per layer on the
+FFN stream after each layer's FFN finish (`v41_backbone_lane.rs:923,1017`),
+outside the stage graphs, and reads 39 `cudaEventElapsedTime` pairs once per
+round after the round's own drain (`independent.rs:262`). The shared version:
+- `shared/draft/clock.rs::LayerClock`: `layers + 1` timing events allocated
+  once per lane/rank; `mark(layer)` records on the engine stream at the
+  existing `layer_mark` site (which keeps feeding the console); `read()` after
+  the round's existing completion sync returns `Vec<Option<f64>>` µs.
+  Recording between graph replays does not touch capture: GLM 5.3 and GLM
+  Flash run one graph segment per layer (`glm5/engine.rs:1043`, `glm5_flash/
+  engine.rs:3030`), so the marks fall between segments exactly as V4.1's do.
+  Where a graph spans several layers the engine records the event inside the
+  capture (legal; the event object must outlive the graph), and `read()` is
+  still one pass after the step.
+- Boundary semantics are "whatever the engine's segment boundary is": GLM's
+  segment `l` reduces layer `l-1`'s experts and runs layer `l`'s attention,
+  router and exchange; the fit attributes layer `l`'s traffic to the interval
+  that contains its exchange. The residual absorbs the small shift. V4.1's
+  distributed exception (a layer after a GPU handoff is timed from input
+  arrival, omitting the hop) stays as is; the hop is in the residual.
+- Cost: ~`layers` event records and elapsed queries per round, no added
+  synchronization. V4.1 pays this today at C1 187 tok/s. The step's A/B
+  measures it on each family; if it shows, read every Nth round.
+
+**Routes: copy ids where they are already on the host; one async D2H ring
+where they are not.**
+- Spark layers: GLM 5.3, GLM Flash, MiMo and Qwen already stage `u32 ids +
+  f32 weights [rows, topk]` to pinned host memory per MoE layer to build the
+  `ExpertProtocolV2Request` (`glm5/engine.rs:1366`, `glm5_flash/engine.rs:
+  3753`). `RoundRoutes::push(layer, ids)` copies the ids (`rows*topk*2` B as
+  u16) into a per-round host buffer before the staging is reused. Zero D2H,
+  as V4.1 (`v41_backbone_lane.rs:423`).
+- Local RTX layers (GLM Flash `Experts::Local`/`LocalExl3` `engine.rs:3708`,
+  MiMo local, Qwen local, V4 local, V4.1 local/TP2): the router's ids never
+  leave the device. Add V4.1's mechanism (`v41_backbone_router.rs:680`): a
+  24-48 B/row D2H of the ids per MoE layer, queued on the engine stream right
+  after the router into a per-layer pinned host ring, decoded after the
+  round's existing sync. No per-layer host wait. Where the router runs inside
+  a multi-layer graph, the router kernel writes a layer-indexed ids slot and
+  one D2H after the step moves the whole `[layers, rows, topk]` array.
+- Committed routes: after acceptance, keep each request's accepted-input
+  prefix only (`offset..offset+accepted`, then `offset += rows`), as the V4.1
+  binding does; the newly emitted bonus token's routes enter history when it
+  is verified as the next anchor. Transport descriptors use step row indices,
+  so the binding maps rows to requests through the scheduler's sequence spans,
+  not `source_request_id`. Target and draft passes stay distinct; MTP draft
+  stages that route through experts (Qwen) are not backbone traffic.
+
+**Round clocks: one shared definition.** `RoundClock { round_start,
+draft_start, draft_end, observe }` on the host `Instant`, with `total_us =
+observe - round_start` and `draft_us = draft_end - draft_start` bracketing
+the draft call alone (sequence collection, copy lookup and length selection
+are round work, not draft work). This normalizes V4.1's two boundaries (the
+serial path times copy lookup and selection inside `draft_us`, `scheduler.rs:
+1346`; the independent path does not, `speculative.rs:465`) and the GLM
+difference (GLM 5.3's verify bracket includes `selector.select`, GLM Flash's
+also includes grammar setup). Verify time is not a separate observation: it is
+the layer sum plus the residual.
+
+**Per family, where each signal comes from today:**
+
+| family | layer events | remote routes | local routes | draft clock | round clock | notes |
+|---|---|---|---|---|---|---|
+| V4.1 | has them (events, `layer_us`) | has them | has them (ring) | has (two boundaries) | has | binding moves onto the shared types; decisions unchanged |
+| GLM Flash | add at `layer_mark` sites; one segment per layer | staged per layer (`spark_dispatch`) | add the ring (fp8moe and EXL3 local) | `serve.rs:1133` (bracket narrows) | add | DFlash2 and dSpark drafters; `observe_host` never called today |
+| GLM 5.3 | same structure as Flash | staged per layer (`moe_stage`) | none (all routed layers remote) | `serve.rs:751` | add | shares `glm5/dflash_policy.rs` with Flash |
+| MiMo | add at `layer_mark` sites; one segment per layer, routed experts between segments (`engine.rs:1581`) | staged per layer (`stage_routes`/`spark_send`, `engine.rs:2515,2594`) | add the ring (fp8moe local) | `serve.rs:956` (DFlash), `:1000` (MTP, all stages in one bracket) | add | priced by the GLM adapter with the Pro TP6 table today (`serve.rs:528`); DFlash selector features computed and ignored; MTP stages are dense SWA blocks, ids only |
+| Qwen | add at `layer_mark` sites; per-layer segments, `moe_front` outside the graph in bucket mode (`engine.rs:2035`) | staged per layer (`spark_moe`, `engine.rs:2382`) | add the ring (FP8/EXL3 local) | `DraftTiming` steps around `speculate::draft` (`serve.rs:997`) | has `cycle_ms` in its trace | chained MTP, depth chosen before drafting; MTP experts route at index `cfg.layers`, coordinator-local even with a Spark backbone |
+| V4 | add at `layer_mark` site | staged | add the ring | `StepShape.draft_us` | add | fixed dSpark block today; first a fixed-width binding, adaptive is its own gate |
+
+**Geometry per family** comes from the loader, not constants: `slice_bytes`
+from `Fp8Layer::bytes_for` per rank (`shared/experts/fp8.rs:169`: FP8
+`3HS + 3*ceil(H/128)*ceil(S/128)*4`, MXFP4 `3HS/2 + 3HS/32`, NVFP4 `3HS/2 +
+3HS/16 + 24`, with `S` the rank's *actual* stored width: TP6 exact slices are
+384/384/384/384/256/256, not `I/6`; MiMo MXFP4 is 12.75 MiB per expert at
+TP1 Flash, 19.125 MiB Pro, 3.19 / 4.78 MiB at TP4), from the EXL3 manifest's
+per-projection
+tiers (`v41_exl3_residency.rs:151`: `H*S*(Kg+Ku+Kd)/8` payload plus the
+rotations actually read, not the arena size), and from V4.1's
+`expert_slice_bytes` as today. The class per layer follows the placement
+(`ExpertHome::{RtxTp2, RtxWhole, Spark}` from the v3 solver once it lands;
+until then the family's `Experts` enum or `has_local_layer`). `group_rows` is
+the installed kernel's row tile: 16 for the CuTe grouped slice kernels, read
+from the AOT manifest where it records one; a wrong constant is partly absorbed
+by the fitted bandwidth, and the per-family step's A/B is the check.
+
+### 3. Calibration and drafters: one chain, one online owner
+
+Every drafted position carries one piece of **evidence** and the policy turns
+it into a conditional acceptance probability in three fixed stages. The chain
+is the same for every family; only the first stage differs by drafter.
+
+1. **Evidence (family).** `Evidence::Head(p)`: a trained confidence head's
+   sigmoid (dSpark on V4.1 and GLM Flash: one logit per position from
+   `confidence_head.proj`, `v41_dspark.cu:38`). `Evidence::Selector([margin,
+   p_top, entropy, rank])`: DFlash2's 16-candidate selector features
+   (`glm_dflash.cu:438`), no probability of its own; MiMo's DFlash already
+   computes them (`mimo_v2/dflash.rs:804`) and discards them, so MiMo gets a
+   selector prior under its own key once fitted. `Evidence::History`: MTP
+   (Qwen; MiMo native MTP returns ids only), nothing but the request's past
+   outcomes.
+   `Evidence::Copy { match_len }`: a copy span.
+2. **Prior (shipped per (family, drafter, numerics) key).** Maps evidence to
+   `p0` per position. For `Head` it is the identity on the logit. For
+   `Selector` it is the keyed logistic fit over `[history_logit, log1p
+   margin, logit p_top, entropy, log1p rank, position/7]` from work/draft-
+   policy-v2's `SelectorFit` (`shared/draft_confidence.rs`), today's frozen
+   glmrt fit as the `generic` key. For `History` it is `DraftHistory::pooled`
+   (3-in-4 prior, pooled trials capped at 8). For `Copy`, a per-match-length
+   table with its own history. This is PLAN "First after rc3" items 1-2: the
+   key selects the file, the fit is the prior, and `CUTEAFD_DRAFT_CONFIDENCE_
+   KEY`/the launcher spelling stay as v2 defined them.
+3. **Online calibration (shared, one owner).** V4.1's per-position Platt
+   scaling on the prior's logit (`logit' = a*logit + b`, Newton step on a
+   decayed Fisher matrix, slope clamped to `[0, 3]`, memory ~500 reached
+   samples; `dspark_policy.rs:232`), one `Platt` per (source, position), per
+   deployment, never persisted. It absorbs target quant, drafter numerics and
+   content mix. The shared affine `Calibration` (Qwen) and v2's
+   `ConfidencePolicy::apply` correction are deleted: two online corrections on
+   one signal double-count. Positions reached fewer than 32 times use the
+   pooled Platt of their source (Qwen's trace: per-position with 16-outcome
+   histories was worse than pooled; the shrinkage is what makes per-position
+   safe).
+4. **Request-local outcomes past the trained block** (V4.1 `outcomes`,
+   decay 0.7, prior weight 2): applied to `Head` evidence only, beyond
+   `widths[0]`, where the head saturates. For `Selector`/`History` the
+   request's history is already the evidence.
+
+**Censoring is explicit.** Only positions whose predecessors were all
+accepted carry evidence; grammar truncation, EOS, output limit and
+cancellation are censor reasons, not misses. GLM Flash and MiMo record
+`(planned, accepted)` after grammar truncation today (`glm5_flash/serve.rs:
+1232`, `mimo_v2/serve.rs:1013`), which books a miss the verifier never saw;
+the shared observation takes `executed` and `accepted` and a reason. Copied
+rows train costs and route history, never neural evidence (today's binding,
+`policy.rs:44`).
+
+**Rules kept as adapter data until measured away:** GLM's cold five drafts
+for four cycles and the lone-request five-draft reference (`dflash_policy.rs:
+204`; 8c800f8f lost 144.6 -> 132.0 tok/s when the head blend changed), GLM
+Flash's dSpark head/history blend at 0.75, Qwen's one-draft probe after
+prolonged zero plans, `DraftSkip`. Each is removed only by its own A/B.
+
+### 4. Allocation
+
+`select_core` (forward growth over every request's next row, best expected
+committed tokens per predicted µs, continuing through temporary losses; exact
+for one request, `dspark_policy.rs:647`) is the allocator. Changes:
+- **One global row budget replaces equal quotas.** GLM Flash, MiMo and Qwen
+  reserve `DECODE_ROWS / active - 1` drafts per request before allocating
+  (`glm5_flash/serve.rs:1061`, `mimo_v2/serve.rs:810`, `qwen4/serve.rs:956`),
+  so a confident request cannot use rows a hopeless one leaves. The allocator
+  gets one anchor per request plus `max_rows` and the per-request
+  remaining-output cap. This is a behavior change with its own gate (C16 on
+  heterogeneous prompts), separate from the cost-model swap.
+- **Identical sequences need no duplicate-row price.** Two requests with the
+  same tokens at the same position have the same routes, so the route union
+  adds no traffic for the second; only `beta*rows` remains. `Group.members`
+  and `duplicate_row_ms` go; GLM's `(position, digest)` grouping stays as the
+  way the binding tells the forecast two requests share history.
+- **Pre-draft action, one function.** `choose_action` generalizes
+  `choose_width`: dSpark picks a width in `widths`, a block drafter picks
+  draft-or-skip (`DraftSkip`), a chained drafter (Qwen MTP) picks the depth
+  cap, scoring each candidate with `select_core` under that candidate's draft
+  cost (today's `allocate` loop over caps for `Drafter::Chain`). Width
+  exploration (a width unused for 64 rounds runs once) applies to every
+  multi-valued action.
+- **Copies compete inside the plan.** A request with a copy span is two
+  candidates, `(Neural, confidence)` and `(Copy, copy confidence)`; the
+  allocator grows whichever has the better marginal and never mixes them in
+  one request. v2's `compete_copies` sequential competition is the search;
+  the price is the resource model, not `CycleCost`. Copy use is therefore
+  acceptance-gated by construction (decision 9) and opt-in until it wins.
+- **Expected tokens per predicted time stays the objective.** The long-run
+  `E - R*T` experiment lost 2-6% on Qwen (f32e22e3); not revived.
+
+### 5. Migration
+
+| step | what | size | gate |
+|---|---|---|---|
+| D0 | `dspark_policy` -> `draft_policy` with `PolicyGeometry`; V4.1 binding passes its geometry; `u16` routes, `max_requests`, `max_positions`, `widths`, `regimes` as inputs | S | unit: identical decisions and fits on recorded V4.1 observations (replay the existing tests through the geometry); V4.1 golden byte-exact; one quick A/B pair on V4.1 min |
+| D1 | `shared/draft/{clock,routes,evidence,binding}.rs`: `LayerClock`, `RoundRoutes`, `RoundClock`, `Evidence`/`DraftSource`, the observation builder with censor reasons; V4.1 binding moves onto them (its serial path adopts the independent `draft_us` boundary) | M | tests; V4.1 golden; A/B min (shared hot path: full 3-session parity is the release-cut gate, not this step's) |
+| D2 | **GLM Flash onto the shared policy** (first family: the failure was measured here, it has per-layer segments, both drafter kinds and both expert homes). Events at `layer_mark`, remote routes from staging, local ring, geometry from `Fp8Layer::bytes_for`/EXL3 manifest, `Selector` prior from v2's `SelectorFit`, Platt online, same quotas as today | L | matched prompts (`wip-cards.py --interleave --matched-prompts`): C1 on a fresh server, **C1 after a C16 sweep** (the glmf-defaults-on failure case, decode rows 128 and 64), C4, C16, emitted tok/s, on min and max, EXL3 and FP8; C1 >= 0.99 and C1-after-C16 >= 0.99 of fresh C1 |
+| D3 | Global row budget and copy competition on GLM Flash (behavior change) | M | same card; C16 heterogeneous prompts is the metric; C1 unchanged |
+| D4 | MiMo (DFlash + MTP block), then GLM 5.3 (shares the GLM binding), then Qwen (chain depth as the pre-draft action), then V4 (fixed-width binding first) | M, S, M, S | per family: the D2 card on its min/max |
+| D5 | Delete `CycleCost`, `Calibration`, `allocate`, the v2 buckets, `glm5/dflash_policy.rs` planning, per-family copy-length loops; `shared/draft_policy.rs` keeps `DraftHistory` and the trace path only | S | tests; failing ids unchanged |
+
+**V4.1 moves byte-exactly** because D0 and D1 change types, not decisions: the
+geometry reproduces its constants, the clock reproduces the independent
+path's boundaries, and the binding's copy handling is unchanged. The serial
+single-lane path's `draft_us` boundary narrows (D1); that changes a fit input,
+not an output token, and the quick A/B on min covers it.
+
+**Interim.** work/draft-policy-v2's keyed `SelectorFit` and
+`compete_copies` are reused by D2/D3 as the prior and the copy search; its
+`CycleCost` concurrency buckets are superseded by D2 and need no hardware gate
+of their own (decode rows 128 stays opt-in until D2's C1-after-C16 card).
+
+### Risks
+
+- **Event cost at C1.** ~45 records and reads per round on GLM Flash. V4.1
+  pays it; D2's card measures it. Fallback: read every Nth round.
+- **Local-route ring.** One small D2H per MoE layer on the engine stream. If
+  a family's graph covers several layers, the layer-indexed slot variant is
+  required before adoption; a per-layer host wait is never acceptable.
+- **Identifiability.** Rows and MB are correlated; the weak priors resolve
+  the near-null direction and predictions stay stable even when individual
+  coefficients wander (the Astra review's point). Judge by prediction error
+  per shape and the card, not coefficients.
+- **Warm-up.** Until the fits are warm (12 rounds, 120 layer samples per
+  class) every available draft is verified, as on V4.1. For DFlash's 7 drafts
+  on a short C1 request that is the first ~12 rounds; D2's card includes
+  short requests.
+- **Kernel tiles.** `group_rows` for fp8moe/EXL3/NVFP4 kernels may not be 16;
+  a wrong tile biases the fitted bandwidth, not the decisions' ordering.
+  Record the tile in the AOT manifest where missing.
+- **Determinism.** Adaptive lengths change verify arithmetic (WP-9). This
+  design keeps adaptivity; a deterministic cohort mode is after v3.
+- **Behavior drift masked as a model swap.** D2 swaps the cost model under
+  today's quotas and GLM rules; D3 changes the quotas. Keep them separate so
+  a regression names its cause.
+
+### Decisions (TJ, 2026-10-09: "The fable plan 6 questions sound good")
+
+1. **First family:** GLM Flash, MiMo next.
+2. **Always-on layer events** on every family, as V4.1 does; cost measured in
+   D2, with every-Nth-round reads as the fallback.
+3. **One online calibration owner:** per-(source, position) Platt with pooled
+   shrinkage; the shared affine `Calibration` and v2's online correction go.
+4. **Global row budget** replaces equal per-request quotas (D3), gated
+   separately on C16 heterogeneous prompts.
+5. **Interim buckets:** no hardware gate for v2's `CycleCost` buckets; merge
+   v2's opt-in `SelectorFit` and `compete_copies` on CPU gates, since D2/D3
+   reuse them.
+6. **Earlier decisions stand:** V4.1's 20/20 split and no unified serve loop
+   (three family loops carry the D1 binding).
+
 ## First after rc3: per-key draft confidence calibration (TJ, 2026-10-09)
+
+Items 1-2 are the prior stage of the v3 draft policy's calibration chain
+(section 3 above) and are built on work/draft-policy-v2 (`SelectorFit`,
+`ConfidencePolicy`); item 4's buckets are superseded by that design's `D2`.
 
 The shared draft policy refines acceptance with one frozen logistic fit over
 the selector features (margin, top probability, entropy, rank), fit in glmrt
@@ -3156,10 +3589,10 @@ Ideas TJ wants kept for later; not v2 work.
   iterations, install features then prefill, release on cancel/failure).
   `EncoderClient` already has the bounded queue/poll/cancel; the work is the
   scheduler restructure.
-- One shared adaptive-draft policy for every family (TJ, 2026-10-08): a
-  CPU-only core with per-family topology/traffic/shape adapters, replacing
-  V4.1's own dSpark policy and the separate GLM/Qwen/generic ones. Design
-  review under way (Astra); decide after discussing it.
+- One shared adaptive-draft policy for every family (TJ, 2026-10-08): now v3
+  item 6, "v3 draft policy: resource-priced, shared". The Astra review
+  (`builds/draft-policy-review/REPORT.md`) is an input; its deterministic
+  cohort mode and cross-lane contention pricing stay here, after v3.
 
 ## Backlog (lowest priority: only when nothing planned is left)
 
