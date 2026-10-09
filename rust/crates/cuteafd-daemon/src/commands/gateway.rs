@@ -91,7 +91,7 @@ pub(crate) async fn run(args: GatewayArgs) -> Result<()> {
     }
     secrets.extend(config.key.iter().cloned());
     if let Some(file) = &args.api_key_file { secrets.push(std::fs::read_to_string(file).context("read gateway API key file")?.trim().to_string()); }
-    let api = crate::shared::api::ApiArgs { api_key_file:args.api_key_file,enable_bench:false }.load()?;
+    let api = crate::shared::api::ApiArgs { api_key_file:args.api_key_file,enable_bench:false,usage:Some("off".into()),..Default::default() }.load()?;
     let backend = Arc::new(Upstream::new(config)?.discover().await);
     let mut models = if args.official_model_names || args.official_model_names_file.is_some() {
         ModelMap::official_names(args.model.clone())

@@ -3233,6 +3233,470 @@ not upstreams.
      `Transcriber`.
    - `ha-openai-realtime` (Pipecat) needs its base URL exposed.
 
+## API usage tracker and console access (design, 2026-10-09)
+
+TJ: "add to the dashboard an API tracker that keeps some request log data,
+token use, which APIs etc.; to avoid bloating space not retaining payload data
+or long term data; async store into sqlite inside the coordinator container;
+7 days default retention; interesting analytics about performance; aggregate
+on sessions where possible with the better APIs." Then: "can keep 1 day full
+log too, probably won't be too big; let those be configured on that dash";
+"the cookie can be persisted locally where the launch script can reuse it, so
+you don't have to keep reauthing"; "having cool and useful visualizations of
+it will be great".
+
+Three deliverables on top of the gateway branch: a **metadata tier** (7 days,
+never payloads), a **full-log tier** (1 day, payloads, separate file,
+switchable), and a **console unlock cookie** that gates token text, the usage
+dashboard and its settings. Design branch `work/api-usage-design`; the code
+lands on `work/api-gateway` after the gateway's front ends exist, since the
+record is built from their `TurnRequest`/`TurnEvent`s.
+
+### Where the record comes from
+
+One `UsageScope` per HTTP request, created by a middleware and put in the
+request extensions (the same seam as `gateway::record::Tape`). Handlers fill
+what they know; the engine fills what only it knows; the record is emitted
+when the **last reference drops**, so cancellations, disconnects and errors
+all produce a row without any handler-side bookkeeping.
+
+```text
+ HTTP layer (cuteafd-api)                       engine side (cuteafd-daemon)
+ ┌──────────────────────────────────────┐       ┌──────────────────────────────────┐
+ │ middleware: t_arrival, route, method,│       │ console::Ticket (one per admitted│
+ │   UA → client_kind, key label,       │       │   request): admit/first/retire   │
+ │   status, bytes in/out               │  Arc  │   already timed; add per-round   │
+ │ handler: protocol, models, session,  │◄─────►│   drafted/accepted/rounds        │
+ │   stream, item/tool/media counts,    │ handle│   counters (3 relaxed adds per   │
+ │   usage chunk, stop reason, TTFT     │       │   decode round, zero per token)  │
+ └──────────────┬───────────────────────┘       └──────────────────────────────────┘
+                │ last Arc drop → try_send(Record)           (never blocks)
+                ▼
+     bounded channel (4096) ──► usage writer thread ──► usage.sqlite (WAL)
+     bounded channel (1024, 64 MiB) ──► log writer thread ──► usage-log.sqlite
+```
+
+- `cuteafd_api::usage` holds `Record`, `UsageScope` (an `Arc` of atomics and
+  `OnceLock`s, no mutex on the hot path), the `UsageSink` trait and the
+  middleware; no SQLite there. A new `cuteafd-usage` crate (mirroring
+  `cuteafd-bench`'s `store.rs` + `http.rs` split, rusqlite bundled) holds the
+  writers, schema, pruning, settings, queries and the `/console/usage/*`
+  routes. The daemon wires both, as it wires the bench.
+- `NativeRequest` gains `usage: Option<UsageHandle>`; `TurnRequest` gains the
+  same beside `tape`. The generic families pass it to `console::admit`, which
+  stores it in the `Ticket`; `Ticket::retire` and `Step::member` write the
+  engine figures into the handle. V4.1's own console module gets the same
+  two calls (it is the parity engine; S).
+- Realtime: one record per `response.create` turn (protocol `realtime`,
+  session = the connection's `SessionId`), plus audio seconds in/out as
+  counts. The connection itself is one `realtime_session` row.
+- Requests refused before admission (auth, 400, 429, bench lockout) are
+  recorded with their outcome and no engine fields. Unauthenticated callers
+  can therefore write rows; the size cap bounds that, and the row is ~300 B.
+
+### Metadata tier: what is recorded (never payloads)
+
+Per request: `rid` (also returned as `x-request-id` and used as the
+response id where the protocol has one), arrival time, protocol (`chat`,
+`completions`, `messages`, `count_tokens`, `responses`, `realtime`, `models`,
+`other`), route and method, `client_kind` and a 120-char user agent,
+`key_label`, optional client IP, requested and served model, session id and
+how it was found, turn index in the session, stream flag, counts of items,
+tools, images and audio parts, tokens (input, cached, output, reasoning,
+draft proposed and accepted, decode rounds), timings (HTTP queue, engine
+admission wait, TTFT, total), derived prefill and decode tok/s, concurrency
+at admission (HTTP in-flight count at arrival, engine active count at
+admit), HTTP status, outcome class (`ok`, `client_error`, `auth`,
+`overloaded`, `cancelled`, `engine_error`, `bench_locked`), stop reason,
+error class, and request/response byte sizes. No prompt, completion,
+reasoning, tool argument, search query, image or audio bytes: the privacy
+test writes a request whose payload contains a sentinel and asserts the
+sentinel never appears in the metadata file's bytes.
+
+- **Client identification.** `client_kind` from headers: Claude Code
+  (`user-agent: claude-cli/…`, `x-app: cli`), Codex (`user-agent:
+  codex_cli_rs/…`, `originator`), OpenAI and Anthropic SDKs, curl, browser
+  (console pages), `bench` (the bench runner's token or probe header), else
+  `other`. The exact header set is confirmed from the gateway's `--record`
+  captures; the classifier is a table in one file.
+- **PII stance.** The API key is stored as `key_label =
+  "k:" + hex(sha256(key))[..8]`, never the key; ephemeral `ek_` tokens
+  (phase C) label as the key that minted them. Client IP is off by default
+  (`CUTEAFD_USAGE_CLIENT_IP=1` stores the peer address; the server sits on a
+  private network, so no truncation when on). Auth headers never reach a
+  record: the scope reads only the normalized key through `auth::presented`
+  to hash it.
+- **Session inference**, recorded as `session_source`:
+  - `explicit`: Realtime connection id; Responses `previous_response_id`
+    (the session is the chain's root response id, stored on the snapshot);
+    a client-provided `x-session-id` header on any route.
+  - `cache_key`: Responses `prompt_cache_key` (Codex sets it per
+    conversation while sending `store:false` and full history, so chains do
+    not exist for it); Anthropic `metadata.user_id` (Claude Code encodes its
+    session id there; hashed to 16 hex, never stored raw); OpenAI `user`.
+  - `prefix`: the engine restored this prompt from a prefix-cache entry that
+    an earlier request created; the session id is inherited from that
+    request. Each cache entry carries the creating `rid`; the restore reports
+    it on the handle. Lower confidence, shown dimmed on the dashboard.
+  - `none`.
+  Turn index counts requests with the same session id in arrival order.
+
+### Storage
+
+- **Location.** Both files live in `/root/.cache/cuteafd/usage/` in the
+  coordinator container, a bind mount of
+  `~/.cache/cuteafd/<instance>/usage/` on the host (beside the instance's
+  `api-key`, which `release_prepare_api_key` already creates under
+  `~/.cache/cuteafd/<instance>/`; `run.sh` uses `default`). The bench does
+  the same with `~/.cache/cuteafd/bench`. A restart, `--restart`, a WIP slot
+  or a new image all mount the same directory, so history survives all of
+  them; `--usage off` disables recording; no directory (tests, `cuteafd
+  gateway` without one) means an in-memory store.
+- **Two files**, so pruning, disabling or deleting the full log never locks or
+  touches the metadata, and the big file's vacuum never stalls the small one:
+  `usage.sqlite` (requests, sessions, daily, settings) and
+  `usage-log.sqlite` (log). Both: `journal_mode=WAL`, `synchronous=NORMAL`,
+  `auto_vacuum=INCREMENTAL`, `busy_timeout=2000`; one writer connection per
+  file on its own thread; readers (dashboard queries) use a small pool of
+  read-only connections on the tokio blocking pool.
+- **Schema (metadata).**
+
+  ```sql
+  CREATE TABLE requests (
+    id INTEGER PRIMARY KEY, rid TEXT NOT NULL UNIQUE, ts_ms INTEGER NOT NULL,
+    protocol TEXT NOT NULL, route TEXT NOT NULL, method TEXT NOT NULL,
+    client_kind TEXT NOT NULL, client_ua TEXT, key_label TEXT, client_ip TEXT,
+    model_requested TEXT, model_served TEXT,
+    session_id TEXT, session_source TEXT, turn_index INTEGER,
+    stream INTEGER NOT NULL, n_items INTEGER, n_tools INTEGER, n_images INTEGER, n_audio INTEGER,
+    tokens_in INTEGER, tokens_cached INTEGER, tokens_out INTEGER, tokens_reasoning INTEGER,
+    draft_proposed INTEGER, draft_accepted INTEGER, rounds INTEGER,
+    t_queue_ms REAL, t_admit_ms REAL, t_ttft_ms REAL, t_total_ms REAL,
+    prefill_tps REAL, decode_tps REAL, concurrency_http INTEGER, concurrency_engine INTEGER,
+    status INTEGER NOT NULL, outcome TEXT NOT NULL, stop_reason TEXT, error_class TEXT,
+    bytes_in INTEGER, bytes_out INTEGER, bench INTEGER NOT NULL DEFAULT 0);
+  CREATE INDEX requests_ts ON requests(ts_ms);
+  CREATE INDEX requests_session ON requests(session_id, ts_ms) WHERE session_id IS NOT NULL;
+  CREATE INDEX requests_model ON requests(model_served, ts_ms);
+  CREATE INDEX requests_client ON requests(client_kind, ts_ms);
+  CREATE TABLE sessions (                       -- writer-maintained upsert, same transaction
+    session_id TEXT PRIMARY KEY, source TEXT, client_kind TEXT, model TEXT,
+    first_ms INTEGER, last_ms INTEGER, turns INTEGER, tokens_in INTEGER, tokens_cached INTEGER,
+    tokens_out INTEGER, errors INTEGER);
+  CREATE TABLE daily (                          -- the only data older than the retention
+    day TEXT, protocol TEXT, client_kind TEXT, model TEXT, requests INTEGER, errors INTEGER,
+    tokens_in INTEGER, tokens_cached INTEGER, tokens_out INTEGER, draft_proposed INTEGER,
+    draft_accepted INTEGER, ttft_hist TEXT, decode_hist TEXT, PRIMARY KEY (day, protocol, client_kind, model));
+  CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+  ```
+
+  A row is ~300 B; a busy agentic day (20k requests) is ~6 MiB, a week ~40
+  MiB. `ttft_hist`/`decode_hist` are 24 log-spaced bucket counts as JSON.
+- **Writer.** A `std::sync::mpsc::sync_channel(4096)` of `Record`s and a
+  dedicated thread owning the connection (rusqlite is synchronous). The
+  thread drains up to 256 records or 50 ms into one transaction (one
+  `INSERT` per request plus the `sessions` upsert). `try_send` on the serving
+  side; a full channel drops the record and bumps `usage_dropped`, exported
+  in `/v1/stats` (`usage: {recorded, dropped, log_recorded, log_dropped,
+  db_bytes, log_bytes}`) and shown on the dashboard. The channel bounds
+  memory at 4096 × ~400 B.
+- **Retention and caps.** Settings (in `settings`, editable from the
+  dashboard, applied without restart through an `ArcSwap<Settings>` the
+  writers and pruner read): `metadata_days` 7, `metadata_cap_mb` 256,
+  `log_enabled` on, `log_hours` 24, `log_cap_mb` 1024, `daily_days` 90,
+  `client_ip` off, `record_bench` on. The writer thread prunes every 60 s:
+  roll the oldest expiring day into `daily`, `DELETE … WHERE ts_ms < cutoff`
+  (index scan), then while `page_count × page_size` exceeds the cap delete
+  the oldest 10% of rows, then `PRAGMA incremental_vacuum` so the file
+  shrinks. `0` for a retention means off (no rows kept; the full log tier
+  also stops recording). Tests inject the clock.
+- **No long-term raw retention.** Only `daily` outlives the metadata
+  retention: per-day counts, token sums and latency histograms by
+  (protocol, client, model), 90 days by default, no ids, sessions or
+  timings per request. Stated on the settings panel.
+
+### Full-log tier (payloads, 1 day, separate file)
+
+- **What.** `log(rid TEXT PRIMARY KEY, ts_ms INTEGER, protocol TEXT,
+  request BLOB, response BLOB, bytes INTEGER, truncated INTEGER)`, index on
+  `ts_ms`. `request` is the client body after redaction; `response` is the
+  final response object (non-streaming shape): for streams the handler folds
+  the deltas it already emits into text, reasoning, tool calls and usage, so
+  the stored object is what a non-streaming call would have returned.
+  Realtime stores the turn's input items and output items, not the audio
+  frames.
+- **Redaction, always.** Auth headers never enter the scope (the log stores
+  no headers at all except `user-agent`). Media are stored as references:
+  `data:` URIs and `input_audio` blobs become `{"type":"image_url",
+  "ref":{"mime":…,"bytes":…,"sha256":…}}` (no bytes; TJ's images are
+  re-sendable, and 8 MiB images × a day would dwarf the text). Tool calls,
+  tool results, search queries and reasoning are payload and are kept. A
+  record above `log_record_cap` (1 MiB) is truncated with a marker.
+- **Async, bigger channel.** Its own `sync_channel(1024)` and its own writer
+  thread, so a payload burst never competes with metadata. Admission is by
+  count and by bytes (64 MiB in flight); over either, drop and count
+  `log_dropped`. On the serving path the cost is one `Bytes` clone of the
+  already-buffered request body (a refcount), and for streams a
+  `push_str` per delta into a pre-reserved `String` behind one
+  `AtomicBool` (`log_enabled`); redaction, folding and serialization run on
+  the writer thread. Off means no clone and no push.
+- **Retention.** `log_hours` (24) and `log_cap_mb` (1024), pruned by the log
+  writer on the same 60 s tick; `log_enabled` off stops writes and leaves
+  existing rows to expire, or the user clears them.
+- **Clear now.** The dashboard's "Clear full log" (`POST
+  /console/usage/log/clear`, cookie) makes the log writer `DELETE FROM log`
+  + `incremental_vacuum` within one tick; with the server stopped, `rm
+  ~/.cache/cuteafd/<instance>/usage/usage-log.sqlite*` is equivalent.
+  "Clear everything" does both files.
+- **Security.** Readable only through `/console/usage/log/:rid` behind the
+  cookie; no `/v1/*` route reads it; an API key does not unlock it. README
+  and the settings panel say: **with the full log on, user prompts and model
+  outputs are stored in plain text for the retention period**; the
+  coordinator logs one line at startup saying the full log is on and for how
+  long.
+- The metadata tier's guarantee is unchanged: payloads exist only in
+  `usage-log.sqlite`.
+
+### Overhead bound (the C1 proof)
+
+On the serving path, per request: four `Instant::now()` (arrival, admit,
+first token, end; admit and first exist today in `Ticket`), filling a ~400 B
+struct from values the handler already holds, one `try_send`, and in the
+engine three relaxed atomic adds per decode round inside `Step::member`,
+which already runs per round for the console. No SQLite call, no
+serialization, no allocation beyond the scope, and no lock on the request
+path. The CUDA thread touches only the `Ticket` counters. With the full log
+on: one `Bytes` refcount bump and one amortized `push_str` per delta. The
+gate is an identical-config A/B, tracker on vs `--usage off`, C1 code decode
+and 8K prefill on matched prompts, three interleaved runs: emitted tok/s and
+TTFT within noise. The bench's own requests are recorded (`bench=1`) and
+hidden by default on the dashboard.
+
+### Analytics: queries, not rollups
+
+Everything on the dashboard except the live tiles is a SQL query over the
+retained rows at request time; with the `ts_ms` index a 7-day range of tens
+of thousands of rows aggregates in milliseconds, and the queries cache for
+5 s. Percentiles come from Rust over the fetched column (SQLite has none).
+The only rollup is `daily`. Routes (all cookie-gated, JSON, `range=1h|6h|24h|7d`
+or `from,to`, filters `client,protocol,model,key,session,bench`):
+
+| Route | Serves |
+|---|---|
+| `GET /console/usage/summary` | the KPI tiles: counts, token sums, error rate, cache hit, acceptance, p50/p95 TTFT and decode tok/s, with per-bucket sparklines |
+| `GET /console/usage/series?bucket=1m` | time series by protocol, client or model: requests, tokens in/cached/out per bucket, concurrency max/mean, error count |
+| `GET /console/usage/latency` | TTFT and decode tok/s histograms with p50/p95/p99, faceted by prompt length and cached fraction; prefill tok/s |
+| `GET /console/usage/flow` | client → protocol → model matrix (requests and tokens) |
+| `GET /console/usage/sessions` | session list with per-turn token strips; `/:id` a session's turns |
+| `GET /console/usage/cache` | hit rate and tokens saved per bucket; TTFT by cached-fraction bucket |
+| `GET /console/usage/speculation` | acceptance and tokens per round per bucket, by model and client |
+| `GET /console/usage/errors` | outcomes and stop reasons per bucket; a (class, route, client) table with last seen |
+| `GET /console/usage/requests?cursor` | the drill-down list; `/:rid` one record |
+| `GET /console/usage/log/:rid` | the full-log record, when retained |
+| `GET/PUT /console/usage/settings` | the tiers' settings and the files' sizes and drop counters |
+| `POST /console/usage/log/clear`, `/clear` | clear the log, or both files |
+
+### The usage dashboard (`/usage`)
+
+Same shell as the console: `cuteafd-ui.css`/`.js` (`CuteUI.header` with a
+third nav entry `USAGE`), `.tile`/`.panel`/`.track` styles, the palette
+tokens, inline SVG only, no library and no CDN (the existing
+`page_is_self_contained` test extends to it). `cuteafd-ui.js` gains five
+primitives beside `sparkline`/`columns`/`timeline`/`meter`: `area` (stacked
+series with crosshair and brush), `histogram` (log-x columns with percentile
+ticks and a ghost overlay), `ribbons` (three-column flow with bezier
+ribbons), `strip` (per-turn token blocks), and `heat` (hour × day grid).
+Series colours by protocol: chat `--target`, messages `--prefill`,
+responses `--accepted`, realtime `--grammar`, completions `--restore`;
+cached tokens are always the series colour at 38% (as the KV meter does
+today).
+
+Page layout, top to bottom; every chart is a filter: clicking a series, bar,
+node or row narrows the page's filter chips, and the drill-down list at the
+bottom follows.
+
+1. **Header row.** Range (1h / 6h / 24h / 7d / custom), split control
+   (protocol | client | model), filter chips, `exclude bench` toggle, the
+   unlock state, and `recorded N · dropped M` from `/v1/stats`.
+2. **KPI tiles** (eight `.tile`s with sparklines): requests, tokens in /
+   cached / out, error rate, TTFT p50 · p95, decode tok/s p50, cache hit %,
+   acceptance %, concurrency now (live from the console feed).
+3. **Flow over time** (full width `area`): stacked tokens/s (prefill, cached,
+   output) coloured by the split, a request-rate line, and a concurrency
+   band beneath (max/mean per bucket). Crosshair tooltip lists the bucket;
+   brushing zooms and sets the range for the whole page.
+4. **Latency** (two `histogram`s side by side): TTFT (log ms) and decode
+   tok/s, p50/p95/p99 ticks, the previous period as a ghost outline; a row
+   of small multiples by prompt length (<1K, 1–8K, 8–32K, 32K+). Hover: bin
+   count; click: the requests in that bin.
+5. **Prefix cache** (two panels): hit rate and tokens saved over time; and
+   "what the cache buys": TTFT columns by cached fraction (0, <50%, ≥50%),
+   median with p95 tick (the `columns` primitive with `median`).
+6. **Speculation**: acceptance over time by model; tokens-per-round
+   histogram; the same by client, since agentic clients accept differently.
+7. **Clients → protocols → models** (`ribbons`): width by requests or tokens;
+   a node click filters.
+8. **Sessions**: a table sorted by last activity (client, model, turns,
+   tokens, cache reuse %, span) with a `strip` per row: one block per turn,
+   width ∝ input tokens, the cached part shaded, output in `--target`.
+   Clicking a session opens its detail: the `timeline` primitive with turns
+   on a time axis, TTFT and decode tok/s per turn as small columns, cache
+   reuse per turn as a line, and the turn list; inferred (`prefix`) sessions
+   are dimmed and labelled.
+9. **Errors and stops**: stacked columns of outcomes over time; a `meter`
+   of stop reasons; a table by (class, route, client) with counts and last
+   seen, each row a filter.
+10. **Requests** (drill-down): a cursor-paged table of metadata; expanding a
+    row shows all fields; a `FULL LOG` tab renders the request and response
+    (messages as text, tool calls as JSON, media as references) when the row
+    is within log retention, else "expired"; locked viewers see the unlock
+    prompt here.
+11. **Settings** (cookie): per tier retention and cap, the full-log switch,
+    client IP, record bench, with the file sizes and drop counters; the
+    plain-text warning; "Clear full log" and "Clear everything" with
+    confirmation. The panel is the only place these change.
+
+Locked viewers see panels 1–9 and the metadata table; the full-log tab and
+settings show "open the link from the run script's log to unlock". Live
+tiles subscribe to `/v1/console/events`; the SQL panels poll their routes
+every 10 s while visible. Sizing: primitives ~250 lines, page ~1,100 lines
+of HTML/JS; L.
+
+### Console access: the unlock cookie
+
+- **Secret.** One per user per host: `~/.cache/cuteafd/console-secret`, 32
+  random bytes hex, 0600, created by `release_prepare_secret` (the
+  generalized `release_prepare_api_key`: mkstemp, owner and mode checks) the
+  first time a launcher runs and reused forever after. Both launchers mount
+  it read-only at `/run/cuteafd-console-secret` and pass
+  `--console-secret-file`. Per host rather than per instance because
+  browsers scope cookies by host, not port: two instances on raptor share
+  the cookie jar whatever we do, so separate secrets would only mean
+  re-unlocking; different hosts have different cookie domains and the file
+  can be copied if wanted. Release and WIP launches behave the same.
+- **Cookie.** `cuteafd_console=v1.<issued_unix>.<hex(hmac_sha256(secret,
+  "console|" + issued))>`; `HttpOnly; SameSite=Lax; Path=/;
+  Max-Age=31536000`, plus `Secure` when the request arrived over TLS or
+  with `x-forwarded-proto: https` (the tailnet `tailscale serve` endpoint)
+  or `--console-cookie-secure`. Verified with constant-time comparison
+  (`auth::constant_time_eq`) and re-issued on any protected request when
+  older than 30 days, so a browser that visits at all never re-authenticates.
+  The cookie never holds the secret; `hmac` (RustCrypto, beside the existing
+  `sha2`) is the one new crate.
+- **Unlock.** `GET /console/unlock?token=<secret>` compares in constant
+  time, sets the cookie and answers `303 /` with `Referrer-Policy:
+  no-referrer` and `Cache-Control: no-store`. The handler never logs its
+  query; there is no request-URI access log in the server today and the
+  design adds none; the usage tracker records `/console/*` requests with the
+  path only, never the query string. The launchers print
+  `console unlock: http://<host>:<port>/console/unlock?token=…` once at
+  ready time (host stdout, where `API ready at …` is printed; `CONSOLE_URL`
+  overrides the base, e.g. the tailnet https name). The coordinator logs
+  only `console: protected views unlock through the launcher's link`; the
+  secret never appears in container logs, access logs or either database.
+- **Rotation.** `scripts/launch/console-secret.sh rotate` (also `run.sh
+  --rotate-console-secret`) rewrites the file; the coordinator re-reads it
+  when its mtime changes (checked at most every 10 s), so old cookies fail
+  within 10 s with no restart. A restart does not rotate.
+- **Gate.** `ConsoleGate` middleware state (secret, mtime, verify) on
+  `/usage`'s data routes, `/console/usage/*`, and any future admin route;
+  pages themselves stay public and show the prompt when their data answers
+  401 `{"error":{"type":"console_locked"}}`. The gate reads only the cookie:
+  an API key does not unlock the console, and the cookie is never read by
+  `require_key` (it reads `Authorization`, `x-api-key` and the WebSocket
+  subprotocol only), so the cookie grants nothing under `/v1/*`.
+- **Token text.** `ConsoleHub::text_enabled()` keeps its meaning (the
+  server's switch or a bench run), but text now reaches only unlocked
+  viewers: when text is on and viewers exist, the worker publishes each
+  frame twice (with and without `text` pieces) and the hub's socket and SSE
+  handlers pick the variant by the connection's unlock state, checked once
+  at connect. The snapshot's `text` becomes `"on" | "locked" | "off"`; the
+  TEXT button reads `TEXT (unlock)` when locked and links to the prompt. The
+  bench exception stays: while a run holds the server, the only text is
+  the bench's synthetic prompts, so `set_bench_active(true)` makes text
+  public as today. `CONSOLE_TEXT=on` therefore no longer exposes sessions to
+  anyone on the port; its warning in `run-family.sh` goes, and it can
+  default to on (viewer-count gating keeps the cost zero while nobody
+  watches).
+- **Public without a cookie**: `/`, the console's time view, `/bench` as
+  today (its controls keep the API-key rule), `/health`, `/v1/*` under their
+  own key.
+
+### Implementation steps
+
+1. **Metadata tier core (S).** `cuteafd_api::usage` (record, scope,
+   middleware, sink), `cuteafd-usage` (schema, writer thread, settings,
+   pruning, `/v1/stats` counters). Gates: unit tests for pruning by age, the
+   size cap and `incremental_vacuum` with an injected clock; overflow drops
+   and counts; the privacy test (sentinel payload never in the metadata file
+   bytes); the settings round-trip.
+2. **Chat path hooks (S).** `openai.rs` fills the scope; `NativeRequest`
+   carries the handle; `Ticket` and `Step::member` write admit, first,
+   retire and round counters; V4.1's console module does the same. Gate:
+   the C1 overhead A/B above, and a test that a cancelled stream still
+   yields a row with `outcome=cancelled`.
+3. **Gateway hooks (M).** `TurnRequest` carries the handle; Messages,
+   Responses and Realtime front ends set protocol, models, session and
+   counts; the driver fills usage and stop reason; `prompt_cache_key`,
+   `metadata.user_id` and `previous_response_id` session inference; the
+   prefix-chain fallback through the handle. Gates: replay fixtures produce
+   the expected rows per protocol; session-inference unit tests per source.
+4. **Console secret and gate (S).** `release_prepare_secret`, mounts and
+   flags in both launchers, `/console/unlock`, `ConsoleGate`, rotation
+   script and mtime reload, the printed link. Gates: auth tests: constant
+   time, wrong and stale tokens refused, cookie set with the right
+   attributes and `Secure` behind `x-forwarded-proto`, renewal after 30
+   days, rotation invalidates, an API key does not unlock, a cookie does
+   not authorize `/v1/*`, the unlock query never appears in logs (a tracing
+   capture) or in the usage DB.
+5. **Per-viewer token text (M).** Dual frames, unlock state per connection,
+   snapshot `text` tri-state, page changes. Gates: worker tests for the two
+   variants; a locked SSE client never receives a `text` piece while an
+   unlocked one does; the bench exception test in `cuteafd-bench` still
+   passes.
+6. **Full-log tier (M).** Log channel, writer, redaction, stream folding,
+   retention hours, cap, clear, startup line, README warning. Gates:
+   privacy tests (auth headers and the raw key never in the log file;
+   `data:` URIs replaced by references; a record above the cap is
+   truncated); retention by hours and cap; `log_enabled=false` leaves
+   `usage.sqlite` untouched (file hash before and after); clear empties the
+   log within one tick and the metadata row survives.
+7. **Dashboard queries and routes (M).** The table of routes above, with
+   percentiles and histograms in Rust, 5 s cache, cursor paging. Gates:
+   query tests on a synthetic 7-day DB (known percentiles, buckets, session
+   aggregates); every route 401 without the cookie.
+8. **Dashboard page (L).** The five primitives and the eleven panels. Gates:
+   `page_is_self_contained` for `/usage`; a headless render smoke test
+   against the synthetic DB; the locked and unlocked states.
+9. **Daily rollups (S).** Roll before prune, the 90-day cap, the
+   long-range view switching to `daily` beyond the retention. Gate: a rolled
+   day's sums equal the rows it replaced.
+10. **Docs and launch polish (S).** README section (what is stored, where,
+    how long, the plain-text warning, how to clear and rotate), the
+    launcher's ready block prints the unlock link, `cuteafd usage
+    {clear,clear-log,export-csv}` for use without a browser.
+
+Order: 1, 2 and 4 are independent and start first; 3 after the gateway
+front ends land; 5 after 4; 6 after 1; 7 and 8 after 1 and 4; 9 and 10 last.
+
+### Open questions for TJ, each with a recommendation
+
+1. Full log on by default (1 day) or off until switched on? Recommend on,
+   with the startup line and the panel warning; it is what was asked for and
+   the box is single-user.
+2. One console secret per user per host (recommended, see above) versus per
+   instance.
+3. `CONSOLE_TEXT` default on once text is cookie-gated? Recommend on.
+4. Client IP: off by default (recommended); when on, the full address.
+5. Keep 90-day `daily` aggregates (recommended; a few KB per day, no ids),
+   or keep nothing past 7 days?
+6. Media in the full log as references (recommended), or bytes under a
+   separate small cap?
+7. Record the bench's requests (recommended, flagged and hidden by default)
+   or skip them?
+8. The unlock link lands in browser history as a GET; accepted, with
+   rotation as the remedy. A POST form would need a page before the cookie.
+
 ## First after rc3: per-key draft confidence calibration (TJ, 2026-10-09)
 
 The shared draft policy refines acceptance with one frozen logistic fit over

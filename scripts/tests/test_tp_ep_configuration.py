@@ -377,6 +377,7 @@ class LauncherTopologyTest(unittest.TestCase):
             env = dict(
                 os.environ,
                 PATH=str(root) + os.pathsep + os.environ["PATH"],
+                HOME=str(root / "home"),
                 EVENTS=str(root / "events"),
                 PLAN=str(root / "plan"),
                 **(extra_env or {}),
@@ -389,6 +390,9 @@ RELEASE_RTX_GPUS="$1"
 repo_root="$PWD"
 coordinator=coordinator
 snapshot_rel=model
+console_supported=0
+CONSOLE_SECRET_FILE=/fake-console-secret
+USAGE_DIR=/fake-usage
 peers=peer-list
 ADDR=127.0.0.1:8000
 PREFILL_BATCH_TOKENS=2048
