@@ -313,6 +313,19 @@ def test_explicit_nonce_overrides_auto_and_inherited(entry, tmp_path, monkeypatc
     assert cards.main() == 0
     jobs = json.loads((state / 'plan.json').read_text())['jobs']
     assert all(job['nonce_seed'] == 'explicit seed' for job in jobs)
+    assert all('observer' in job['entry'] and 'console' in job['probes'] for job in jobs)
+    for job in jobs:
+        dest = Path(job['state'])
+        report = dest / 'reports' / 'one' / 'report.json'
+        report.parent.mkdir(parents=True)
+        report.write_text(json.dumps({'baseline': {'quality': {'checks': [], 'status': 'pass'}}}))
+        logs = dest / 'smoke' / 'logs'
+        logs.mkdir(parents=True)
+        (logs / 'one.coordinator.log').write_text('prompt_token_hash=0123456789abcdef')
+        (dest / 'console-frames.jsonl').write_text(json.dumps({'ev': [{'e': 'round', 't0': 0, 't1': 10, 'req': [[1, 4, 4, 2, 3, 0, 0]]}]}) + '\n')
+        row = cards.summarize_job(job, 0)
+        assert row['status'] == 'pass' and row['first_prompt_token_hash'] == '0123456789abcdef'
+        assert row['requests'][0]['steps'] == 1
     output = capsys.readouterr().out
     assert "CUTEAFD_BENCH_NONCE_SEED='explicit seed'" in output
     assert 'inherited' not in output
@@ -380,3 +393,15 @@ def test_runtime_seed_is_explicit_only(entry, tmp_path, monkeypatch, seed):
     monkeypatch.setattr(cards, 'write_summary', lambda *args: None)
     assert cards.main() == 0
     assert seen[0].get('CUTEAFD_BENCH_NONCE_SEED') == seed
+
+
+@pytest.mark.parametrize('status', ['pass', 'failed'])
+def test_summary_extracts_exact_cache_check(entry, tmp_path, status):
+    job = make(entry, tmp_path)
+    report = Path(job['state']) / 'reports' / 'one' / 'report.json'
+    report.parent.mkdir(parents=True)
+    check = {'id': 'cache_exact', 'status': status, 'summary': 'byte-exact restore'}
+    report.write_text(json.dumps({'baseline': {'quality': {'checks': [check], 'status': status}}}))
+    row = cards.summarize_job(job, 0)
+    assert row['cache'] == check
+    assert row['status'] == ('failed' if status == 'failed' else 'pass')

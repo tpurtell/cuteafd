@@ -493,7 +493,7 @@ def summarize_job(job, exit_code):
         quality = baseline.get('quality') or {}
         checks = quality.get('checks', [])
         fidelity = next((c for c in checks if c['id'] == 'fidelity'), {})
-        row.update(C1=next((d['tok_s'] for d in card.get('decode', []) if d['content'] == 'code'), None), C8=(card.get('concurrent') or {}).get('aggregate_tok_s'), **{'8K': (card.get('prefill') or {}).get('tok_s')}, kl=fidelity.get('metrics', {}).get('kl'), top1=fidelity.get('metrics', {}).get('top1'), cache=next((c for c in checks if c['id'] == 'cache'), None), spec=next((c for c in checks if 'spec' in c['id']), None), pool=(card.get('capacity') or {}).get('kv_tokens'), readiness_s=report.get('server', {}).get('readiness_s'), report=str(reports[0]), quality=quality.get('status'))
+        row.update(C1=next((d['tok_s'] for d in card.get('decode', []) if d['content'] == 'code'), None), C8=(card.get('concurrent') or {}).get('aggregate_tok_s'), **{'8K': (card.get('prefill') or {}).get('tok_s')}, kl=fidelity.get('metrics', {}).get('kl'), top1=fidelity.get('metrics', {}).get('top1'), cache=next((c for c in checks if c['id'] in ('cache_exact', 'cache')), None), spec=next((c for c in checks if 'spec' in c['id']), None), pool=(card.get('capacity') or {}).get('kv_tokens'), readiness_s=report.get('server', {}).get('readiness_s'), report=str(reports[0]), quality=quality.get('status'))
         if report.get('status') == 'failed' or quality.get('status') == 'failed' or any(c.get('status') == 'failed' for c in checks):
             row['status'] = 'failed'
     if job.get('correctness_parallel'):
@@ -899,9 +899,9 @@ def main():
     if (set(overrides) | set(probes) | set(expected)) - set(args.cards):
         raise ValueError('override/probe names must be selected cards')
     for card in cards:
-        if args.matched_prompts:
+        if args.matched_prompts or args.nonce_seed is not None:
             probes[card['name']].add('console')
-            if 'image' in probes[card['name']]:
+            if args.matched_prompts and 'image' in probes[card['name']]:
                 raise ValueError('--matched-prompts cannot precede its first benchmark request with an image probe')
         requested_panels(card.get('profile', 'smoke'))
         card['set'].update(overrides.get(card['name'], {}))
