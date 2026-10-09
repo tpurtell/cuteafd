@@ -22,6 +22,14 @@ format.
   loaded from the checkpoint's own `config.json` and tensor headers.
 - Sliced HF snapshots need no annotation: MiMo, GLM Flash and Qwen coordinators
   need only their role's shards; official V4.1 Spark workers need only expert shards.
+  `cuteafd plan MODEL --files --role coordinator --spark-ranks 4` emits an rsync
+  file list; add `--fetch --destination /path/to/snapshot --dry-run` to preview a
+  role-only copy (omit `--dry-run` to copy). Transfers materialize HF blob symlinks
+  as plain snapshot files; matching sizes are skipped and nothing is deleted.
+  For host unions, `--file-layout layout.json --host worker` accepts a JSON host-to-role
+  map such as `{"worker":["spark0","vision"]}`; omit `--host` with `--json` to list all
+  hosts. `--host worker --fetch` copies via SSH. These lists cover the main snapshot;
+  separately configured drafter or encoder snapshots must be inventoried separately.
 - Exact prefix caching for agentic work: the deepest cached snapshot that
   prefixes a request is restored byte-identical, not approximated.
 - Own your intelligence: your weights, your hardware, your rate limits (none),

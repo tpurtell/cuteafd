@@ -217,6 +217,33 @@ pub(crate) struct PlanArgs {
     pub(crate) coordinator_weight_budget_gib: f64,
     #[arg(long, default_value_t = false)]
     pub(crate) json: bool,
+    /// Emit snapshot-relative paths suitable for rsync --files-from.
+    #[arg(long)]
+    pub(crate) files: bool,
+    /// Role whose headers/files to inspect (coordinator, sparkN, vision, audio, drafter).
+    #[arg(long)]
+    pub(crate) role: Option<String>,
+    /// Select a host from --file-layout, or the destination host for --fetch.
+    #[arg(long)]
+    pub(crate) host: Option<String>,
+    /// JSON host-to-role map, e.g. {"worker":["spark0","vision"]}.
+    #[arg(long)]
+    pub(crate) file_layout: Option<PathBuf>,
+    /// Copy this role's missing files with rdmasync or rsync; never delete.
+    #[arg(long, requires = "destination")]
+    pub(crate) fetch: bool,
+    /// Snapshot destination directory. Plain files are valid HF snapshot entries.
+    #[arg(long)]
+    pub(crate) destination: Option<PathBuf>,
+    /// Print the transfer command and bytes without copying.
+    #[arg(long, requires = "fetch")]
+    pub(crate) dry_run: bool,
+    /// Replace matching-size files too.
+    #[arg(long, requires = "fetch")]
+    pub(crate) force: bool,
+    /// Include native MTP/drafter tensors in coordinator file requirements.
+    #[arg(long)]
+    pub(crate) include_speculator: bool,
     /// Exit non-zero unless every part is servable.
     #[arg(long, default_value_t = false)]
     pub(crate) require_ready: bool,
