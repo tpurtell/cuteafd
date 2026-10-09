@@ -942,3 +942,20 @@ async fn models_pagination_retrieve_and_errors() {
         );
     }
 }
+
+#[tokio::test]
+async fn models_default_page_openai_all_anthropic_twenty() {
+    let mut models = ModelMap::official_names("served-model");
+    models.listed.extend((0..30).map(|i| format!("claude-extra-{i}")));
+    let total = models.listing(&[]).len();
+    assert!(total > 20);
+    let app = gateway::router(Arc::new(Gateway::new(Arc::new(Scripted::default()), models)));
+    for (anthropic, expected) in [(false, total), (true, 20)] {
+        let mut req = Request::get("/v1/models");
+        if anthropic { req = req.header("anthropic-version", "2023-06-01"); }
+        let (status, _, body) = wire(app.clone(), req.body(Body::empty()).unwrap()).await;
+        assert_eq!(status, StatusCode::OK);
+        let result: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(result["data"].as_array().unwrap().len(), expected, "anthropic={anthropic}");
+    }
+}

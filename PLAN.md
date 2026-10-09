@@ -3188,6 +3188,10 @@ and `usage.server_tool_use.web_search_requests` is counted.
 3. Add steer-inject between decode steps, then mid-prefill injection.
 4. Add MiMo audio input under Realtime, plus a `Transcriber` from the same
    encoder.
+5. Make `max_tokens=0` a real cache prewarm on the Engine backend: a
+   prefill-only turn that publishes the prefix to the prefix cache and
+   returns empty output. The Upstream backend keeps today's local empty
+   answer.
 
 ### Phase C: voice
 

@@ -104,7 +104,10 @@ fn models_routes(gateway: Arc<Gateway>) -> Router {
     }
     async fn list(State(gateway): State<Arc<Gateway>>, headers: HeaderMap, page: Result<Query<Page>, axum::extract::rejection::QueryRejection>) -> Response {
         let page = match page { Ok(Query(page)) => page, Err(_) => return error_response(GatewayError::invalid("invalid model pagination parameters"), &headers) };
-        let limit = page.limit.unwrap_or(20);
+        // Anthropic pages (default 20); OpenAI's listing has no paging, so its
+        // clients (Codex, SDKs, Home Assistant) get every model.
+        let anthropic = headers.contains_key("anthropic-version");
+        let limit = page.limit.unwrap_or(if anthropic { 20 } else { 1000 });
         if !(1..=1000).contains(&limit) || (page.before_id.is_some() && page.after_id.is_some()) {
             return error_response(GatewayError::invalid("limit must be 1..1000; use before_id or after_id, not both"), &headers);
         }
