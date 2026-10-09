@@ -56,6 +56,29 @@ mod tests {
     }
 
     #[test]
+    fn c128_stride_stays_compiled_when_pool_or_explicit_context_is_smaller() {
+        for family in ["dsv4f", "dsv4p"] {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join("config.json"), r#"{"max_position_embeddings":1048576}"#).unwrap();
+            let value = serde_json::json!({"capacities": {"max_context": 131072}, "programs": [
+                {"family": family, "name": format!("{family}_sparse_mla_decode_c128_m64"),
+                 "params": {"indexed_width": 1024}},
+                {"family": family, "name": format!("{family}_sparse_mla_prefill_c128_m4096"),
+                 "params": {"indexed_width": 1024}}
+            ]});
+            let path = dir.path().join("PROGRAMS.json");
+            std::fs::write(&path, value.to_string()).unwrap();
+            let full = checkpoint_context(dir.path(), &path, "deepseek_v4", 0).unwrap();
+            assert_eq!(pool_context("deepseek_v4", full, true, 32768, 256).unwrap(), 32512);
+            assert_eq!(checkpoint_context(dir.path(), &path, "deepseek_v4", 16384).unwrap(), 16384);
+            assert_eq!(cuteafd_loader::serving_capacity::compiled_c128_width(&value, family).unwrap(), 1024);
+            let mut bad = value.clone();
+            bad["programs"][1]["params"]["indexed_width"] = 128.into();
+            assert!(cuteafd_loader::serving_capacity::compiled_c128_width(&bad, family).is_err());
+        }
+    }
+
+    #[test]
     fn defaults_clamp_to_compiled_support_and_pool_with_margin_but_explicit_fails() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("config.json"), r#"{"text_config":{"max_position_embeddings":1048576}}"#).unwrap();

@@ -835,6 +835,37 @@ fn deepseek_v4_plan_reads_the_runtime_config_source() {
 }
 
 #[test]
+fn v4_workspace_plan_matches_runtime_below_compiled_context() {
+    use crate::serving_capacity::{compiled_c128_width, deepseek_v4_workspace_geometry,
+        deepseek_v4_workspace_scratch};
+    use cuteafd_core::memory_layout::Basis;
+    let dir = v4_snapshot();
+    let manifest = json!({"capacities": {"decode_rows": 64, "prefill_rows": 4096, "max_context": 131072},
+        "programs": [
+            {"family": "dsv4f", "name": "dsv4f_sparse_mla_decode_c128_m64", "params": {"indexed_width": 1024}},
+            {"family": "dsv4f", "name": "dsv4f_sparse_mla_prefill_c128_m4096", "params": {"indexed_width": 1024}},
+            {"name": "dsv4f_index_topk_decode_m64", "scratch_bytes_at_capacity": {"scratch": 8653824}},
+            {"name": "dsv4f_index_topk_prefill_m4096", "scratch_bytes_at_capacity": {"scratch": 558007296}}
+        ]});
+    let path = dir.path().join("PROGRAMS.json");
+    std::fs::write(&path, manifest.to_string()).unwrap();
+    let cfg = crate::families::deepseek_v4::DeepseekV4Config::read(dir.path(), 0).unwrap();
+    let scratch = deepseek_v4_workspace_scratch(&manifest, "dsv4f", 4096, 64).unwrap();
+    let runtime = deepseek_v4_workspace_geometry(&cfg, 4096, 64,
+        compiled_c128_width(&manifest, "dsv4f").unwrap() * 128, 1, scratch).unwrap();
+    for context in [16384, 32512, 131072] {
+        let report = plan(dir.path(), &PlanOptions { layout: Some(layout::LayoutOptions {
+            rtx_bytes: vec![96 << 30], context_tokens: context, pool_tokens: Some(32768),
+            workspace_manifest: Some(path.clone()), ..Default::default()
+        }), ..sparks(2) }).unwrap();
+        let steps = report.memory_layout.unwrap().devices[0].items.iter()
+            .find(|i| i.group == "steps").unwrap().clone();
+        let intake = 2 * 2 * 4096 * cfg.dim as u64 * 2;
+        assert_eq!((steps.bytes, steps.basis), (runtime[0].fixed_device_bytes + intake, Basis::Formula));
+    }
+}
+
+#[test]
 fn v4_explicit_pool_reduces_expert_placement_while_auto_preserves_legacy_policy() {
     let dir = v4_snapshot();
     let experts = |pool, local_expert_layers| {
