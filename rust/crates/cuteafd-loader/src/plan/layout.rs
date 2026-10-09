@@ -622,7 +622,8 @@ pub fn layout(report: &mut PlanReport, model: &dyn super::FamilyModel, checkpoin
             let id = if cfg.dim == 4096 { "dsv4f" } else { "dsv4p" };
             let scratch = crate::serving_capacity::deepseek_v4_workspace_scratch(manifest, id, prefill_rows, decode_rows).ok()?;
             crate::serving_capacity::deepseek_v4_workspace_geometry(&cfg, prefill_rows, decode_rows,
-                context_tokens, active_gpus, scratch).ok()
+                crate::serving_capacity::compiled_c128_width(manifest, id).ok()?.checked_mul(128)?,
+                active_gpus, scratch).ok()
         })()
     } else { None };
     if family == "deepseek_v4" && v4_workspace.is_none() {

@@ -6,6 +6,26 @@ use crate::families::deepseek_v4::DeepseekV4Config;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+/// C128 rows use the stride baked into the exported sparse MLA program,
+/// independently of the explicit or pool-clamped serving context.
+pub fn compiled_c128_width(manifest: &Value, family: &str) -> Result<u64, CacheGeometryError> {
+    let unsupported = || CacheGeometryError::Unsupported {
+        family: "deepseek_v4",
+        what: "program manifest lacks consistent compiled C128 index strides",
+    };
+    let programs = manifest["programs"].as_array().ok_or_else(unsupported)?;
+    let mut width = None;
+    for program in programs.iter().filter(|p| p["family"].as_str() == Some(family)
+        && p["name"].as_str().is_some_and(|n| n.contains("_c128_m"))) {
+        let value = program["params"]["indexed_width"].as_u64().ok_or_else(unsupported)?;
+        if value == 0 || value % 64 != 0 || width.is_some_and(|w| w != value) {
+            return Err(unsupported());
+        }
+        width = Some(value);
+    }
+    width.ok_or_else(unsupported)
+}
+
 /// Four peer slots per each of the two prefill lanes, plus release flags.
 pub fn deepseek_v4_peer_exchange_bytes(hidden: u64, prefill_rows: u64, decode_rows: u64)
     -> Result<u64, CacheGeometryError> {

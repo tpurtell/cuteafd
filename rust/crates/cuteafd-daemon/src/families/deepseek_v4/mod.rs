@@ -281,7 +281,7 @@ pub(crate) fn with_engine<T>(
             &loaded.manifest, loaded.family, prefill_rows as u64, decode_rows as u64)?;
         let workspace = cuteafd_loader::serving_capacity::deepseek_v4_workspace_geometry(
             &cache_cfg, prefill_rows as u64, decode_rows as u64,
-            (crate::shared::context::compiled_c128_width(&loaded.manifest, loaded.family)? as u64) * 128,
+            cuteafd_loader::serving_capacity::compiled_c128_width(&loaded.manifest, loaded.family)? * 128,
             devices.len(), scratch)?;
         let peer = if devices.len() == 2 {
             cuteafd_loader::serving_capacity::deepseek_v4_peer_exchange_bytes(
@@ -345,7 +345,7 @@ pub(crate) fn with_engine<T>(
         family: loaded.family,
         decode_rows: caps["decode_rows"].as_u64().context("decode_rows")? as usize,
         prefill_rows: caps["prefill_rows"].as_u64().context("prefill_rows")? as usize,
-        c128_width: crate::shared::context::compiled_c128_width(&loaded.manifest, loaded.family)?,
+        c128_width: usize::try_from(cuteafd_loader::serving_capacity::compiled_c128_width(&loaded.manifest, loaded.family)?)?,
         max_context,
         stream,
         sms: args.sms,
