@@ -1041,3 +1041,64 @@ async fn pipecat_default_vad_silence_manual_commit_and_empty_warmup() {
     assert_eq!(response.last().unwrap()["response"]["status"], "completed");
     assert_eq!(backend.turns().len(), 2);
 }
+
+#[tokio::test]
+async fn session_update_cancels_old_idle_deadline_without_committing() {
+    for turn_detection in [json!({"idle_timeout_ms":null}), Value::Null] {
+        let s = server(Arc::new(Scripted::default())).await;
+        let mut c = connect(&s, false).await;
+        emit(&mut c,json!({"type":"session.update","session":{"audio":{"input":{"turn_detection":{"idle_timeout_ms":6000,"create_response":false}}}}})).await;
+        assert_eq!(recv(&mut c).await["type"], "session.updated");
+        emit(
+            &mut c,
+            json!({"type":"input_audio_buffer.append","audio":STANDARD.encode(vec![0u8;4800])}),
+        )
+        .await;
+        emit(&mut c,json!({"type":"session.update","session":{"audio":{"input":{"turn_detection":turn_detection}}}})).await;
+        assert_eq!(recv(&mut c).await["type"], "session.updated");
+        tokio::time::sleep(std::time::Duration::from_millis(6200)).await;
+        // A stale timeout would precede this explicit commit and consume the buffer.
+        emit(&mut c, json!({"type":"input_audio_buffer.commit"})).await;
+        assert_eq!(recv(&mut c).await["type"], "input_audio_buffer.committed");
+        let added = recv(&mut c).await;
+        assert_eq!(added["type"], "conversation.item.added");
+        assert_eq!(
+            STANDARD
+                .decode(added["item"]["content"][0]["audio"].as_str().unwrap())
+                .unwrap()
+                .len(),
+            4800
+        );
+        assert_eq!(recv(&mut c).await["type"], "conversation.item.done");
+    }
+}
+
+#[tokio::test]
+async fn session_update_rearms_changed_idle_timeout() {
+    let gateway = Arc::new(Gateway::new(
+        Arc::new(Scripted::default()),
+        ModelMap::single("served-model"),
+    ));
+    let session = gateway.sessions.create("sess");
+    let mut c = Connection {
+        gateway,
+        session,
+        config: protocol::defaults("served-model", false, false),
+        beta: false,
+        transcription: false,
+        conversation_id: "conv_test".into(),
+        tape: Default::default(),
+        audio: Default::default(),
+        active: None,
+        cancel: None,
+        idle: None,
+    };
+    for ms in [6000, 30000, 6000] {
+        let before = tokio::time::Instant::now();
+        c.client(&json!({"type":"session.update","session":{"audio":{"input":{"turn_detection":{"idle_timeout_ms":ms}}}}})).await.unwrap();
+        let after = tokio::time::Instant::now();
+        let deadline = c.idle.unwrap();
+        assert!(deadline >= before + std::time::Duration::from_millis(ms));
+        assert!(deadline <= after + std::time::Duration::from_millis(ms));
+    }
+}

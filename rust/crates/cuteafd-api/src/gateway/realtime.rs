@@ -312,6 +312,8 @@ impl Connection {
                     ));
                 }
                 self.config = config;
+                self.idle = None;
+                self.arm_idle();
                 self.session.lock().await.system =
                     self.config["instructions"].as_str().map(str::to_owned);
                 Ok(vec![
