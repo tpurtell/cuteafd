@@ -28,7 +28,9 @@ format.
   as plain snapshot files; matching sizes are skipped and nothing is deleted.
   For host unions, `--file-layout layout.json --host worker` accepts a JSON host-to-role
   map such as `{"worker":["spark0","vision"]}`; omit `--host` with `--json` to list all
-  hosts. `--host worker --fetch` copies via SSH. These lists cover the main snapshot;
+  hosts. `--host worker --fetch` copies via SSH; add `--source peer:/snapshot` to
+  pull from a peer (MODEL supplies the local index/config). Remote size checks are
+  batched into one SSH session before and after copying. These lists cover the main snapshot;
   separately configured drafter or encoder snapshots must be inventoried separately.
 - Exact prefix caching for agentic work: the deepest cached snapshot that
   prefixes a request is restored byte-identical, not approximated.

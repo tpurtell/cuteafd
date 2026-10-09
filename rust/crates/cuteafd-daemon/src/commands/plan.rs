@@ -147,11 +147,44 @@ fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
+/// One SSH session for the entire file inventory, preserving input order.
+fn remote_sizes(host: &str, root: &std::path::Path, files: &[cuteafd_loader::plan::files::RequiredFile]) -> Result<Vec<Option<u64>>> {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    let mut child = Command::new("ssh").args([host,
+        "while IFS= read -r path; do if test -f \"$path\"; then stat -Lc %s -- \"$path\" || exit 1; else printf '%s\\n' '-'; fi; done"])
+        .stdin(Stdio::piped()).stdout(Stdio::piped()).spawn()?;
+    let list = files.iter().map(|file| format!("{}\n", root.join(&file.path).display())).collect::<String>();
+    child.stdin.take().context("SSH size list stdin")?.write_all(list.as_bytes())?;
+    let output = child.wait_with_output()?;
+    anyhow::ensure!(output.status.success(), "host {host}: inspecting file sizes failed");
+    parse_remote_sizes(host, &String::from_utf8(output.stdout)?, files.len())
+}
+
+fn parse_remote_sizes(host: &str, output: &str, count: usize) -> Result<Vec<Option<u64>>> {
+    let sizes = output.lines().map(|line| {
+        if line == "-" { Ok(None) } else { Ok(Some(line.parse::<u64>()?)) }
+    }).collect::<Result<Vec<_>>>()?;
+    anyhow::ensure!(sizes.len() == count, "host {host}: expected {count} size results, got {}", sizes.len());
+    Ok(sizes)
+}
+
+fn source_location(value: Option<&str>, snapshot: &std::path::Path) -> Result<(Option<String>, PathBuf)> {
+    let value = value.map(str::to_owned).unwrap_or_else(|| snapshot.display().to_string());
+    let (host, path) = if let Some((host, path)) = value.split_once(':') {
+        anyhow::ensure!(!host.is_empty() && !host.starts_with('-') && host.bytes().all(|c| c.is_ascii_alphanumeric() || b"._-@".contains(&c)), "invalid source host {host}");
+        (Some(host.to_owned()), PathBuf::from(path))
+    } else { (None, PathBuf::from(value)) };
+    anyhow::ensure!(path.is_absolute() && !path.to_string_lossy().contains(['\n', '\r']), "source needs an absolute snapshot path");
+    Ok((host, path))
+}
+
 fn transfer(snapshot: &std::path::Path, manifest: &cuteafd_loader::plan::files::FileManifest,
     args: &PlanArgs) -> Result<()> {
     use anyhow::ensure;
     use std::io::Write;
     use std::process::Command;
+    let (source_host, source_path) = source_location(args.source.as_deref(), snapshot)?;
     let destination = args.destination.as_ref().context("--fetch needs --destination")?;
     ensure!(destination.is_absolute(), "destination must be an absolute snapshot directory");
     let host = args.host.as_deref();
@@ -161,34 +194,41 @@ fn transfer(snapshot: &std::path::Path, manifest: &cuteafd_loader::plan::files::
     }
     let available = |program: &str| Command::new("sh").args(["-c", &format!("command -v {program} >/dev/null")])
         .status().is_ok_and(|s| s.success());
-    let remote_rdma = host.is_none() || Command::new("ssh").args([
-        host.unwrap_or_default(), "command -v rdmasync >/dev/null"])
+    let installed_remote = |host: &str| Command::new("ssh").args([host, "command -v rdmasync >/dev/null"])
         .status().is_ok_and(|s| s.success());
-    let program = if host.is_some() && available("rdmasync") && remote_rdma { "rdmasync" } else {
+    let remote_rdma = host.is_none_or(installed_remote) && source_host.as_deref().is_none_or(installed_remote);
+    let program = if (host.is_some() || source_host.is_some()) && available("rdmasync") && remote_rdma { "rdmasync" } else {
         eprintln!("warning: rdmasync unavailable on both ends; using rsync over SSH/local transport");
         "rsync"
     };
-    let mut selected = Vec::new();
-    let mut bytes = 0u64;
+    ensure!(!destination.to_string_lossy().contains(['\n', '\r']), "destination contains a line break");
     for file in &manifest.files {
         ensure!(!file.path.contains(['\n', '\r']) && !std::path::Path::new(&file.path).is_absolute()
             && std::path::Path::new(&file.path).components().all(|c| matches!(c, std::path::Component::Normal(_))),
             "unsafe file-list path {}", file.path);
-        let source_bytes = file.bytes.with_context(|| format!("source {} lacks {}", snapshot.display(), file.path))?;
-        let target = destination.join(&file.path);
-        let existing = if let Some(host) = host {
-            let output = Command::new("ssh").args([host, &format!("stat -Lc %s -- {} 2>/dev/null || true",
-                shell_quote(&target.display().to_string()))]).output()?;
-            ensure!(output.status.success(), "host {host}: failed to inspect {}", file.path);
-            String::from_utf8(output.stdout)?.trim().parse::<u64>().ok()
-        } else { target.metadata().ok().filter(|m| m.is_file()).map(|m| m.len()) };
+    }
+    let source_sizes = if let Some(host) = source_host.as_deref() { remote_sizes(host, &source_path, &manifest.files)? }
+        else { manifest.files.iter().map(|file| source_path.join(&file.path).metadata().ok()
+            .filter(|m| m.is_file()).map(|m| m.len())).collect() };
+    for (file, actual) in manifest.files.iter().zip(&source_sizes) {
+        ensure!(actual.is_some(), "source host {} lacks {}", source_host.as_deref().unwrap_or("local"), file.path);
+        if let Some(expected) = file.bytes { ensure!(*actual == Some(expected), "source {} size {:?}, expected {expected}", file.path, actual); }
+    }
+    let existing_sizes = if let Some(host) = host { remote_sizes(host, destination, &manifest.files)? }
+        else { manifest.files.iter().map(|file| destination.join(&file.path).metadata().ok()
+            .filter(|m| m.is_file()).map(|m| m.len())).collect() };
+    let mut selected = Vec::new();
+    let mut bytes = 0u64;
+    for ((file, existing), source_bytes) in manifest.files.iter().zip(existing_sizes).zip(&source_sizes) {
+        let source_bytes = source_bytes.context("source size missing after validation")?;
         if args.force || existing != Some(source_bytes) {
             bytes = bytes.checked_add(source_bytes).context("transfer bytes overflow")?;
             selected.push(file);
         }
     }
     let list = selected.iter().map(|file| format!("{}\n", file.path)).collect::<String>();
-    let src = format!("{}/", snapshot.display());
+    let src = if host.is_none() { source_host.as_deref().map_or_else(|| format!("{}/", source_path.display()),
+        |peer| format!("{peer}:{}/", source_path.display())) } else { format!("{}/", source_path.display()) };
     let dest = host.map_or_else(|| format!("{}/", destination.display()),
         |host| format!("{host}:{}/", destination.display()));
     let list_arg = "--files-from=-";
@@ -199,9 +239,17 @@ fn transfer(snapshot: &std::path::Path, manifest: &cuteafd_loader::plan::files::
     if args.force { command.arg("--ignore-times"); }
     else { command.arg("--size-only"); }
     command.args([&src, &dest]);
+    // rsync cannot copy between two remote endpoints. Run it on the source
+    // peer, which pushes to the selected target using its normal SSH access.
+    if let Some(peer) = source_host.as_deref().filter(|_| host.is_some()) {
+        let remote = std::iter::once(program.to_string()).chain(command.get_args().map(|a| shell_quote(&a.to_string_lossy())))
+            .collect::<Vec<_>>().join(" ");
+        command = Command::new("ssh");
+        command.args([peer, &remote]);
+    }
     eprintln!("host {}: {} files, {bytes} bytes", host.unwrap_or("local"), selected.len());
     if args.dry_run {
-        let rendered = std::iter::once(program.to_string()).chain(command.get_args().map(|a| shell_quote(&a.to_string_lossy())))
+        let rendered = std::iter::once(command.get_program().to_string_lossy().into_owned()).chain(command.get_args().map(|a| shell_quote(&a.to_string_lossy())))
             .collect::<Vec<_>>().join(" ");
         println!("{rendered}");
         for file in &selected { println!("{}\t{}", file.bytes.unwrap_or_default(), file.path); }
@@ -218,14 +266,11 @@ fn transfer(snapshot: &std::path::Path, manifest: &cuteafd_loader::plan::files::
     let status = child.wait()?;
     ensure!(status.success(), "host {} transfer failed ({status}); files: {:?}", host.unwrap_or("local"),
         selected.iter().map(|f| &f.path).collect::<Vec<_>>());
-    for file in &manifest.files {
-        let target = destination.join(&file.path);
-        let actual = if let Some(host) = host {
-            let output = Command::new("ssh").args([host, &format!("stat -Lc %s -- {}", shell_quote(&target.display().to_string()))]).output()?;
-            ensure!(output.status.success(), "host {host}: missing {} after copy", file.path);
-            String::from_utf8(output.stdout)?.trim().parse::<u64>()?
-        } else { target.metadata().with_context(|| format!("local: missing {} after copy", file.path))?.len() };
-        ensure!(Some(actual) == file.bytes, "host {}: {} size {actual}, expected {:?}", host.unwrap_or("local"), file.path, file.bytes);
+    let actual_sizes = if let Some(host) = host { remote_sizes(host, destination, &manifest.files)? }
+        else { manifest.files.iter().map(|file| destination.join(&file.path).metadata().ok()
+            .filter(|m| m.is_file()).map(|m| m.len())).collect() };
+    for ((file, actual), expected) in manifest.files.iter().zip(actual_sizes).zip(source_sizes) {
+        ensure!(actual == expected && actual.is_some(), "host {}: {} size {actual:?}, expected {expected:?}", host.unwrap_or("local"), file.path);
     }
     if destination.parent().and_then(|p| p.file_name()).is_some_and(|name| name == "snapshots") {
         let refs = destination.parent().and_then(|p| p.parent()).context("HF cache root")?.join("refs");
@@ -266,7 +311,7 @@ mod tests {
             spark_budget_gib: 100.0,
             coordinator_weight_budget_gib: 80.0,
             json: true,
-            files: false, role: None, host: None, file_layout: None, fetch: false, destination: None,
+            files: false, role: None, host: None, file_layout: None, fetch: false, destination: None, source: None,
             dry_run: false, force: false, include_speculator: false,
             require_ready,
             layout: true,
@@ -297,6 +342,22 @@ mod tests {
             native_mtp_layers: 3,
             workspace_manifest: None,
         }
+    }
+
+    #[test]
+    fn peer_source_paths_are_absolute_and_hosts_cannot_supply_options() {
+        assert_eq!(source_location(Some("worker:/models/snapshot"), std::path::Path::new("/unused")).unwrap(),
+            (Some("worker".into()), PathBuf::from("/models/snapshot")));
+        assert!(source_location(Some("-oProxyCommand=bad:/snapshot"), std::path::Path::new("/unused")).is_err());
+        assert!(source_location(Some("worker:relative"), std::path::Path::new("/unused")).is_err());
+        assert!(source_location(Some("worker:/line\nbreak"), std::path::Path::new("/unused")).is_err());
+    }
+
+    #[test]
+    fn batched_size_results_preserve_order_and_reject_partial_or_invalid_output() {
+        assert_eq!(parse_remote_sizes("peer", "17\n-\n0\n", 3).unwrap(), vec![Some(17), None, Some(0)]);
+        assert!(parse_remote_sizes("peer", "17\n", 2).unwrap_err().to_string().contains("peer"));
+        assert!(parse_remote_sizes("peer", "banner\n17\n", 2).is_err());
     }
 
     #[test]

@@ -232,6 +232,10 @@ pub(crate) struct PlanArgs {
     /// Copy this role's missing files with rdmasync or rsync; never delete.
     #[arg(long, requires = "destination")]
     pub(crate) fetch: bool,
+    /// Transfer source: a local snapshot path or HOST:/snapshot. MODEL supplies
+    /// the local index/config used to inventory role requirements.
+    #[arg(long, requires = "fetch")]
+    pub(crate) source: Option<String>,
     /// Snapshot destination directory. Plain files are valid HF snapshot entries.
     #[arg(long)]
     pub(crate) destination: Option<PathBuf>,
