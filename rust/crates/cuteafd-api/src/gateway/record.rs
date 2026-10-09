@@ -40,11 +40,6 @@ impl std::fmt::Debug for Tape {
 }
 
 /// Tapes never affect equality of the turns that carry them.
-// Replaced by the upstream recorder component when integrated.
-impl Tape {
-    pub fn frame(&self, _direction: &str, _text: &str) {}
-}
-
 impl PartialEq for Tape {
     fn eq(&self, _: &Self) -> bool { true }
 }

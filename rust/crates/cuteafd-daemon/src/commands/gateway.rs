@@ -1,4 +1,4 @@
-//! CPU-only protocol gateway over an HTTP upstream.
+//! CPU-only development/test harness over a generic HTTP upstream.
 use std::{net::SocketAddr, path::PathBuf, sync::Arc};
 use anyhow::{Context, Result};
 use clap::Args;
@@ -9,10 +9,22 @@ pub(crate) struct GatewayArgs {
     #[arg(long, default_value = "127.0.0.1:8080")]
     listen: SocketAddr,
     /// Base URL containing any protocol prefix (e.g. /v1 for Chat, /anthropic for DeepSeek Messages).
-    #[arg(long)]
-    upstream_url: String,
+    #[arg(long, required_unless_present = "upstream_url_env")]
+    upstream_url: Option<String>,
     #[arg(long, default_value = "openai-chat", value_parser = ["openai-chat", "anthropic"])]
     upstream_flavor: String,
+    /// Comma-separated served-model capabilities, supplemented by generic /models metadata.
+    #[arg(long, value_delimiter = ',', value_parser = ["vision","audio_in","reasoning","json_schema","strict_tools"])]
+    upstream_capabilities: Vec<String>,
+    /// Emit a thinking enabled/disabled object; reject forced tools and omit temperature while thinking.
+    #[arg(long)]
+    upstream_thinking_toggle: bool,
+    /// Optional absolute endpoint path for strict Chat tools, with no fallback on errors.
+    #[arg(long)]
+    upstream_strict_tools_path: Option<String>,
+    /// Environment variable holding the base URL (for private test endpoints).
+    #[arg(long, conflicts_with = "upstream_url")]
+    upstream_url_env: Option<String>,
     /// Environment variable name; the credential itself must never be a CLI argument.
     #[arg(long)]
     upstream_key_env: Option<String>,
@@ -44,12 +56,26 @@ fn alias(value: &str) -> Result<(String,String),String> {
 }
 pub(crate) async fn run(args: GatewayArgs) -> Result<()> {
     let flavor: Flavor = args.upstream_flavor.parse()?;
-    let url = url::Url::parse(&args.upstream_url).context("invalid upstream URL")?;
-    let deepseek = url.host_str() == Some("api.deepseek.com");
-    let mut config = UpstreamConfig::new(args.upstream_url.clone(),flavor,args.model.clone());
+    let base = match (&args.upstream_url,&args.upstream_url_env) {
+        (Some(url),_) => url.clone(),
+        (_,Some(name)) => std::env::var(name).with_context(|| format!("upstream URL environment variable {name} is not set"))?,
+        _ => anyhow::bail!("upstream URL is required"),
+    };
+    let mut config = UpstreamConfig::new(base,flavor,args.model.clone());
     config.key = args.upstream_key_env.as_ref().map(|name| std::env::var(name).with_context(|| format!("upstream key environment variable {name} is not set"))).transpose()?;
-    config.deepseek_thinking = deepseek;
-    config.capabilities.vision = deepseek && args.model == "deepseek-flash";
+    config.thinking_toggle = args.upstream_thinking_toggle;
+    config.strict_tools_path = args.upstream_strict_tools_path;
+    config.capabilities = Default::default();
+    for capability in &args.upstream_capabilities {
+        match capability.as_str() {
+            "vision" => config.capabilities.vision = true,
+            "audio_in" => config.capabilities.audio_in = true,
+            "reasoning" => config.capabilities.reasoning = true,
+            "json_schema" => config.capabilities.json_schema = true,
+            "strict_tools" => config.capabilities.strict_tools = true,
+            _ => unreachable!("validated capability"),
+        }
+    }
     let mut secrets:Vec<String> = config.key.iter().cloned().collect();
     if let Some(file) = &args.api_key_file { secrets.push(std::fs::read_to_string(file).context("read gateway API key file")?.trim().to_string()); }
     let api = crate::shared::api::ApiArgs { api_key_file:args.api_key_file,enable_bench:false }.load()?;
@@ -79,7 +105,7 @@ pub(crate) async fn run(args: GatewayArgs) -> Result<()> {
         let recorder = Recorder::new(directory,Sanitizer::from_env(secrets))?;
         app = app.layer(axum::middleware::from_fn_with_state(recorder,gateway::record::middleware));
     }
-    tracing::info!(flavor=flavor.name(),url=%args.upstream_url,model=%args.model,search=provider,"gateway ready");
+    tracing::info!(flavor=flavor.name(),url=%args.upstream_url.as_deref().unwrap_or("[private env endpoint]"),model=%args.model,search=provider,"gateway ready");
     let listener = tokio::net::TcpListener::bind(args.listen).await.context("bind gateway listener")?;
     axum::serve(listener,app).with_graceful_shutdown(async { let _ = tokio::signal::ctrl_c().await; }).await?;
     Ok(())

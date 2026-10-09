@@ -3057,11 +3057,15 @@ the session hooks. Phase C adds Realtime audio (transcription and TTS).
   turn.
   - **`Upstream`** is a test/dev seam, not a shipped way to run cuteafd. It
     is one generic OpenAI-chat or Anthropic-compatible client, configured by
-    base URL, key env var, model, flavor and an explicit capability set. It
-    has no provider names or capability tables in product code. Provider
-    choices (DeepSeek for text and tools, OpenRouter MiMo for image and
-    audio, a structured-output model) live in test tooling under
-    `scripts/gateway/`.
+    base URL, key env var, model, flavor and an explicit capability set.
+    Generic `/models` metadata supplements served-model capabilities. Product
+    code has no provider names or capability tables; choices live in test
+    tooling under `scripts/gateway/`. `json_schema` and `strict_tools` pass
+    through when enabled, otherwise return typed Unsupported naming the field.
+    Strict Chat tools may use an explicitly configured absolute endpoint path;
+    rejection is propagated, never retried without strictness. PCM16 realtime
+    input is wrapped as mono 24 kHz WAV for Chat `input_audio`. These are
+    backend capabilities, not frontend restrictions.
   - **`Engine`** (phase B) feeds the scheduler directly. It replaces today's
     chat handler internals without changing that route's behaviour.
 - `/v1/chat/completions` stays the engine's existing path, byte-identical,

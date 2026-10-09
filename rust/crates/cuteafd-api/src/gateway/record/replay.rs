@@ -87,7 +87,9 @@ pub async fn replay_backend(fixture: &Value) -> Result<Vec<TurnEvent>,GatewayErr
     let flavor: Flavor = fixture["flavor"].as_str().unwrap_or("openai-chat").parse()?;
     let turn: TurnRequest = serde_json::from_value(fixture["turn"].clone()).map_err(|_| GatewayError::invalid("fixture turn missing"))?;
     let mut config = UpstreamConfig::new(server.url.clone(),flavor,turn.model.clone());
-    config.deepseek_thinking = fixture["deepseek_thinking"].as_bool().unwrap_or(false);
+    config.thinking_toggle = fixture["deepseek_thinking"].as_bool().unwrap_or(false);
+    config.capabilities.strict_tools = fixture["strict_tools"].as_bool().unwrap_or(false);
+    config.capabilities.json_schema = fixture["json_schema"].as_bool().unwrap_or(false);
     let backend = Upstream::new(config)?;
     let events: Result<Vec<_>,_> = backend.start(turn).await?.collect::<Vec<_>>().await.into_iter().collect();
     server.assert_consumed()?;
@@ -139,7 +141,7 @@ mod tests {
         let directory = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/gateway");
         let mut paths = Vec::new(); fixture_paths(&directory,&mut paths);
         assert!(!paths.is_empty(),"fixture suite must not be empty");
-        let key = regex::Regex::new(r#"sk-[A-Za-z0-9]{20,}"#).unwrap();
+        let key = regex::Regex::new(r#"sk-or-v1-[0-9a-f]{20,}|sk-[A-Za-z0-9_-]{20,}"#).unwrap();
         let bearer = regex::Regex::new(r#"(?i:Bearer\s+)([^\s\"\\,;]+)"#).unwrap();
         let email = regex::Regex::new(r#"[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+\.[A-Za-z]{2,}"#).unwrap();
         fn fields(value:&Value) {
@@ -162,8 +164,13 @@ mod tests {
             assert!(!text.contains("/home/"),"home path in {}",path.display());
             assert!(!email.is_match(&text),"email in {}",path.display());
             for capture in bearer.captures_iter(&text) { assert!(capture[1].contains("REDACTED"),"Bearer token in {}",path.display()); }
-            for name in ["DEEPSEEK_API_KEY","EXA_API_KEY"] {
+            for name in ["DEEPSEEK_API_KEY","EXA_API_KEY","OPENROUTER_API_KEY","LITELLM_API_KEY","LITELLM_BASE_URL"] {
                 if let Ok(secret) = std::env::var(name) { assert!(secret.is_empty() || !text.contains(&secret),"literal credential in {}",path.display()); }
+            }
+            if let Ok(url) = std::env::var("LITELLM_BASE_URL") {
+                if let Ok(url) = reqwest::Url::parse(&url) {
+                    if let Some(host) = url.host_str() { assert!(!text.contains(host),"private host in {}",path.display()); }
+                }
             }
             fields(&serde_json::from_str::<Value>(&text).unwrap());
         }

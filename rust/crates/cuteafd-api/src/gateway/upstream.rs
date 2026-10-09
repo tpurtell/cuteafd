@@ -33,7 +33,9 @@ pub struct UpstreamConfig {
     pub capabilities: BackendCapabilities,
     pub context_tokens: Option<u32>,
     pub max_output_tokens: Option<u32>,
-    pub deepseek_thinking: bool,
+    pub thinking_toggle: bool,
+    /// Optional absolute path for strict Chat requests; never downgrade on rejection.
+    pub strict_tools_path: Option<String>,
     /// Anthropic-compatible providers do not necessarily implement this endpoint.
     pub anthropic_count_tokens: bool,
 }
@@ -41,7 +43,7 @@ impl UpstreamConfig {
     pub fn new(url: impl Into<String>, flavor: Flavor, model: impl Into<String>) -> Self {
         Self { url: url.into(), flavor, model: model.into(), key: None,
             capabilities: BackendCapabilities { reasoning: true, ..Default::default() },
-            context_tokens: None, max_output_tokens: None, deepseek_thinking: false,
+            context_tokens: None, max_output_tokens: None, thinking_toggle: false, strict_tools_path: None,
             anthropic_count_tokens: false }
     }
 }
@@ -59,6 +61,9 @@ impl Upstream {
         if !matches!(url.scheme(), "http" | "https") || !url.username().is_empty() || url.password().is_some()
             || url.query().is_some() || url.fragment().is_some() {
             return Err(GatewayError::invalid("upstream URL must be HTTP(S), without credentials, query or fragment"));
+        }
+        if config.strict_tools_path.as_ref().is_some_and(|path| !path.starts_with('/') || path.starts_with("//") || path.contains(['?', '#'])) {
+            return Err(GatewayError::invalid("strict tools path must be an absolute URL path"));
         }
         let client = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none())
             .connect_timeout(Duration::from_secs(20)).read_timeout(Duration::from_secs(120))
@@ -92,20 +97,39 @@ impl Upstream {
             if !response.status().is_success() { return Err(http_error(response.status().as_u16())); }
             let value = bounded_json(response).await?;
             if let Some(model) = value["data"].as_array().and_then(|models| models.iter().find(|m| m["id"] == self.model.id)) {
-                self.model.context_tokens = number(model, "context_window").or(self.model.context_tokens);
-                self.model.max_output_tokens = number(model, "max_output_tokens").or(self.model.max_output_tokens);
+                self.model.context_tokens = number(model, "context_window").or_else(|| number(model,"context_length")).or(self.model.context_tokens);
+                self.model.max_output_tokens = number(model, "max_output_tokens").or_else(|| number(&model["top_provider"],"max_completion_tokens")).or(self.model.max_output_tokens);
                 if let Some(owner) = model["owned_by"].as_str() { self.model.owned_by = owner.chars().take(128).collect(); }
-                if let Some(modalities) = model["input_modalities"].as_array() {
+                if let Some(modalities) = model.get("input_modalities").or_else(|| model["architecture"].get("input_modalities")).and_then(Value::as_array) {
                     self.capabilities.vision = modalities.iter().any(|m| m == "image");
-                    self.capabilities.audio_in = !self.config.deepseek_thinking && modalities.iter().any(|m| m == "audio");
+                    self.capabilities.audio_in = modalities.iter().any(|m| m == "audio");
                 }
             }
+            if let Some(model) = value["data"].as_array().and_then(|models| models.iter().find(|m| m["id"] == self.model.id)) {
+                if let Some(parameters) = model["supported_parameters"].as_array() {
+                    self.capabilities.json_schema |= parameters.iter().any(|p| p == "structured_outputs");
+                    self.capabilities.strict_tools |= parameters.iter().any(|p| p == "strict_tools");
+                    self.capabilities.reasoning |= parameters.iter().any(|p| p == "reasoning");
+                }
+            }
+            Arc::make_mut(&mut self.config).capabilities = self.capabilities;
             Ok::<_, GatewayError>(())
         }.await;
         if let Err(error) = result { tracing::warn!(status = error.upstream_status, "upstream model discovery failed; using configured metadata"); }
         self
     }
 
+    fn completion_request(&self, turn: &TurnRequest, suffix: &str) -> reqwest::RequestBuilder {
+        if self.config.flavor == Flavor::OpenaiChat && turn.tools.iter().any(|tool| tool.strict) {
+            if let Some(path) = &self.config.strict_tools_path {
+                let mut url = reqwest::Url::parse(&self.config.url).expect("validated upstream URL");
+                url.set_path(path);
+                let request = self.client.post(url);
+                return if let Some(key) = &self.config.key { request.bearer_auth(key) } else { request };
+            }
+        }
+        self.request(reqwest::Method::POST,suffix)
+    }
     pub fn map_request(&self, turn: &TurnRequest) -> Result<Value, GatewayError> {
         mapping::request(turn, &self.config)
     }
@@ -119,7 +143,7 @@ impl Backend for Upstream {
         Box::pin(async move {
             let request = this.map_request(&turn)?;
             let suffix = match this.config.flavor { Flavor::OpenaiChat => "chat/completions", Flavor::Anthropic => "v1/messages" };
-            let response = this.request(reqwest::Method::POST, suffix).json(&request).send().await
+            let response = this.completion_request(&turn, suffix).json(&request).send().await
                 .map_err(|_| GatewayError::upstream("upstream request transport failure"))?;
             let status = response.status().as_u16();
             let mut recording = Exchange::new(turn.tape, this.config.flavor, request, status);

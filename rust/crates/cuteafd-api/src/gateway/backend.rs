@@ -20,6 +20,9 @@ pub struct BackendCapabilities {
     /// Spoken output. No backend has it yet (the TTS seam, phase C).
     pub audio_out: bool,
     pub reasoning: bool,
+    /// Structured output and strict function schemas for the configured served model.
+    pub json_schema: bool,
+    pub strict_tools: bool,
     /// Exact prompt token counts (`count_tokens`); otherwise an estimate.
     pub exact_token_count: bool,
     /// Engine KV operations (pin/evict/mark, prefix forks). Phase B.

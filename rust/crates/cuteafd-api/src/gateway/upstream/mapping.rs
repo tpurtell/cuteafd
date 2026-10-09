@@ -4,6 +4,13 @@ use crate::gateway::{turn::*, GatewayError};
 
 pub(super) fn request(turn: &TurnRequest, config: &UpstreamConfig) -> Result<Value, GatewayError> {
     if turn.modalities.audio_out { return Err(GatewayError::unsupported("upstream audio output is not implemented")); }
+    if !config.capabilities.json_schema && turn.response_format.as_ref().is_some_and(|format| format["type"] == "json_schema" || format.get("schema").is_some()) {
+        return Err(GatewayError::unsupported("response_format: json_schema is not supported by this upstream backend; json_object is supported")
+            .with_param("response_format"));
+    }
+    if !config.capabilities.strict_tools && turn.tools.iter().any(|tool| tool.strict) {
+        return Err(GatewayError::unsupported("strict function tools are not supported by this upstream backend").with_param("tools"));
+    }
     match config.flavor { Flavor::OpenaiChat => chat(turn, config), Flavor::Anthropic => anthropic(turn, config) }
 }
 /// Preserve standard tool names; encode namespace/custom names deterministically without collisions with plain names.
@@ -31,7 +38,7 @@ fn parts(content: &[Part], flavor: Flavor) -> Result<Value, GatewayError> {
                     ImageSource::Url { url } => json!({"type":"url", "url":url}),
                     ImageSource::Base64 { media_type, data } => json!({"type":"base64", "media_type":media_type,"data":data}) }}),
             },
-            Part::Audio { format, data } if flavor == Flavor::OpenaiChat => json!({"type":"input_audio", "input_audio":{"format":format,"data":data}}),
+            Part::Audio { format, data } if flavor == Flavor::OpenaiChat => chat_audio(format,data)?,
             Part::Audio { .. } => return Err(GatewayError::unsupported("Anthropic upstream audio input is not supported")),
             Part::File { .. } => return Err(GatewayError::unsupported("upstream file input requires a frontend text conversion")),
         });
@@ -85,17 +92,17 @@ fn chat(turn: &TurnRequest, config: &UpstreamConfig) -> Result<Value, GatewayErr
             ToolChoice::Required => json!("required"), ToolChoice::Named { name } => json!({"type":"function","function":{"name":wire_name(name)}}) };
         if let Some(parallel) = turn.parallel_tool_calls { request["parallel_tool_calls"] = json!(parallel); }
     }
-    let thinking = turn.reasoning.enabled.unwrap_or(config.deepseek_thinking);
-    if config.deepseek_thinking {
+    let thinking = turn.reasoning.enabled.unwrap_or(config.thinking_toggle);
+    if config.thinking_toggle {
         request["thinking"] = json!({"type":if thinking { "enabled" } else { "disabled" }});
         if thinking && matches!(turn.tool_choice, ToolChoice::Required | ToolChoice::Named { .. }) {
-            return Err(GatewayError::unsupported("DeepSeek thinking mode does not support required or named tool choice; disable thinking"));
+            return Err(GatewayError::unsupported("configured thinking mode does not support required or named tool choice; disable thinking"));
         }
     }
     if let Some(effort) = &turn.reasoning.effort { request["reasoning_effort"] = json!(effort); }
-    else if !config.deepseek_thinking && turn.reasoning.enabled == Some(false) { request["reasoning_effort"] = json!("none"); }
+    else if !config.thinking_toggle && turn.reasoning.enabled == Some(false) { request["reasoning_effort"] = json!("none"); }
     if let Some(max) = turn.max_output_tokens { request["max_tokens"] = json!(max); }
-    if !(config.deepseek_thinking && thinking) { if let Some(t) = turn.sampling.temperature { request["temperature"] = json!(t); } }
+    if !(config.thinking_toggle && thinking) { if let Some(t) = turn.sampling.temperature { request["temperature"] = json!(t); } }
     if let Some(p) = turn.sampling.top_p { request["top_p"] = json!(p); }
     if let Some(seed) = turn.sampling.seed { request["seed"] = json!(seed); }
     if !turn.sampling.stop.is_empty() { request["stop"] = json!(turn.sampling.stop); }
@@ -139,7 +146,11 @@ fn anthropic(turn: &TurnRequest, config: &UpstreamConfig) -> Result<Value, Gatew
     let mut request = json!({"model":turn.model,"messages":messages,"stream":true,"max_tokens":turn.max_output_tokens.unwrap_or(4096)});
     if !system.is_empty() { request["system"] = json!(system); }
     if !turn.tools.is_empty() {
-        request["tools"] = json!(turn.tools.iter().map(|t| json!({"name":wire_name(&t.name),"description":t.description.clone().unwrap_or_default(),"input_schema":t.parameters})).collect::<Vec<_>>());
+        request["tools"] = json!(turn.tools.iter().map(|t| {
+            let mut tool = json!({"name":wire_name(&t.name),"description":t.description.clone().unwrap_or_default(),"input_schema":t.parameters});
+            if t.strict { tool["strict"] = json!(true); }
+            tool
+        }).collect::<Vec<_>>());
         request["tool_choice"] = match &turn.tool_choice { ToolChoice::Auto => json!({"type":"auto"}), ToolChoice::None => json!({"type":"none"}),
             ToolChoice::Required => json!({"type":"any"}), ToolChoice::Named { name } => json!({"type":"tool","name":wire_name(name)}) };
         if let Some(parallel) = turn.parallel_tool_calls { request["tool_choice"]["disable_parallel_tool_use"] = json!(!parallel); }
@@ -148,13 +159,29 @@ fn anthropic(turn: &TurnRequest, config: &UpstreamConfig) -> Result<Value, Gatew
         request["thinking"] = if enabled { json!({"type":"enabled","budget_tokens":turn.reasoning.budget_tokens.unwrap_or(1024)}) } else { json!({"type":"disabled"}) };
     }
     if let Some(effort) = &turn.reasoning.effort { request["output_config"]["effort"] = json!(effort); }
-    if !(config.deepseek_thinking && turn.reasoning.enabled != Some(false)) { if let Some(t) = turn.sampling.temperature { request["temperature"] = json!(t); } }
+    if !(config.thinking_toggle && turn.reasoning.enabled != Some(false)) { if let Some(t) = turn.sampling.temperature { request["temperature"] = json!(t); } }
     if let Some(p) = turn.sampling.top_p { request["top_p"] = json!(p); }
     if let Some(k) = turn.sampling.top_k { request["top_k"] = json!(k); }
     if !turn.sampling.stop.is_empty() { request["stop_sequences"] = json!(turn.sampling.stop); }
     if let Some(format) = &turn.response_format {
-        if let Some(schema) = format.get("schema") { request["output_config"]["format"] = json!({"type":"json_schema","schema":schema}); }
+        if let Some(schema) = format.get("schema").or_else(|| format["json_schema"].get("schema")) { request["output_config"]["format"] = json!({"type":"json_schema","schema":schema}); }
         else { return Err(GatewayError::unsupported("Anthropic upstream requires a JSON schema for structured output")); }
     }
     Ok(request)
+}
+
+/// Realtime commits base64 PCM16 mono at 24 kHz. Chat audio inputs use a WAV container.
+fn chat_audio(format: &str, data: &str) -> Result<Value, GatewayError> {
+    if format != "pcm16" { return Ok(json!({"type":"input_audio","input_audio":{"format":format,"data":data}})); }
+    use base64::{Engine, engine::general_purpose::STANDARD};
+    let pcm = STANDARD.decode(data).map_err(|_| GatewayError::invalid("invalid PCM16 audio base64").with_param("audio"))?;
+    if pcm.len() % 2 != 0 { return Err(GatewayError::invalid("PCM16 audio must contain whole samples").with_param("audio")); }
+    let len = u32::try_from(pcm.len()).ok().filter(|n| *n <= u32::MAX - 36).ok_or_else(|| GatewayError::invalid("PCM16 audio exceeds WAV size limit"))?;
+    let mut wav = Vec::with_capacity(pcm.len()+44);
+    wav.extend_from_slice(b"RIFF"); wav.extend_from_slice(&(len+36).to_le_bytes()); wav.extend_from_slice(b"WAVEfmt ");
+    wav.extend_from_slice(&16u32.to_le_bytes()); wav.extend_from_slice(&1u16.to_le_bytes()); wav.extend_from_slice(&1u16.to_le_bytes());
+    wav.extend_from_slice(&24000u32.to_le_bytes()); wav.extend_from_slice(&48000u32.to_le_bytes());
+    wav.extend_from_slice(&2u16.to_le_bytes()); wav.extend_from_slice(&16u16.to_le_bytes());
+    wav.extend_from_slice(b"data"); wav.extend_from_slice(&len.to_le_bytes()); wav.extend_from_slice(&pcm);
+    Ok(json!({"type":"input_audio","input_audio":{"format":"wav","data":STANDARD.encode(wav)}}))
 }

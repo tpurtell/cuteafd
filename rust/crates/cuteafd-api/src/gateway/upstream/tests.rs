@@ -4,7 +4,10 @@ use axum::{routing::{get, post}, Router, response::IntoResponse};
 use futures::StreamExt;
 
 fn backend(flavor: Flavor) -> Upstream {
-    Upstream::new(UpstreamConfig::new("http://localhost/v1", flavor, "test-model")).unwrap()
+    let mut config = UpstreamConfig::new("http://localhost/v1",flavor,"test-model");
+    config.capabilities.json_schema = true;
+    config.capabilities.strict_tools = true;
+    Upstream::new(config).unwrap()
 }
 fn turn() -> TurnRequest { TurnRequest { model: "test-model".into(), items: vec![Item::Message { role: Role::User, content: vec![Part::text("hello")] }], ..Default::default() } }
 #[test]
@@ -33,6 +36,27 @@ fn chat_mapping_preserves_reasoning_tools_images_and_controls() {
     assert_eq!(request["response_format"]["type"], "json_schema");
     assert!(request.get("thinking").is_none());
 }
+#[tokio::test]
+async fn strict_tools_use_configured_endpoint_without_silent_downgrade() {
+    let (url,task) = server(Router::new().route("/beta/chat/completions",post(|| async {
+        ([("content-type","text/event-stream")],"data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n")
+    }))).await;
+    let mut config = UpstreamConfig::new(url,Flavor::OpenaiChat,"test");
+    config.thinking_toggle = true;
+    config.capabilities.strict_tools = true;
+    config.strict_tools_path = Some("/beta/chat/completions".into());
+    let upstream = Upstream::new(config).unwrap();
+    let mut turn = turn();
+    turn.tools.push(ToolSpec { name:"check".into(),description:None,parameters:json!({"type":"object"}),strict:true });
+    assert!(upstream.start(turn.clone()).await.is_ok());
+    turn.response_format = Some(json!({"type":"json_schema","json_schema":{"schema":{"type":"object"}}}));
+    let error = upstream.map_request(&turn).unwrap_err();
+    assert_eq!(error.kind,ErrorKind::Unsupported);
+    assert_eq!(error.param.as_deref(),Some("response_format"));
+    turn.response_format = Some(json!({"type":"json_object"}));
+    assert_eq!(upstream.map_request(&turn).unwrap()["response_format"]["type"],"json_object");
+    task.abort();
+}
 #[test]
 fn namespaced_tools_use_legal_wire_names_consistently() {
     let mut turn = turn();
@@ -49,9 +73,9 @@ fn namespaced_tools_use_legal_wire_names_consistently() {
     }
 }
 #[test]
-fn deepseek_quirks_are_opt_in_and_reject_forced_thinking_tools() {
+fn thinking_quirks_are_opt_in_and_reject_forced_thinking_tools() {
     let mut config = UpstreamConfig::new("http://localhost/v1", Flavor::OpenaiChat,"test-model");
-    config.deepseek_thinking = true;
+    config.thinking_toggle = true;
     let upstream = Upstream::new(config).unwrap();
     let mut turn = turn();
     turn.tool_choice = ToolChoice::Required;
@@ -181,7 +205,9 @@ async fn capture_deepseek_scratch_fixtures() {
         turn.tape = Tape(Some(collector.clone()));
         let mut config = UpstreamConfig::new(match flavor { Flavor::OpenaiChat => "https://api.deepseek.com",Flavor::Anthropic => "https://api.deepseek.com/anthropic" },flavor,turn.model.clone());
         config.key = Some(key.clone());
-        config.deepseek_thinking = case["thinking"].as_bool().unwrap();
+        config.thinking_toggle = case["thinking"].as_bool().unwrap();
+        config.capabilities.strict_tools = case["strict_tools"].as_bool().unwrap_or(false);
+        config.strict_tools_path = case["strict_path"].as_str().map(str::to_string);
         let upstream = Upstream::new(config).unwrap();
         let result = match upstream.start(turn.clone()).await {
             Ok(stream) => stream.collect::<Vec<_>>().await.into_iter().collect::<Result<Vec<_>,_>>(),
@@ -246,5 +272,42 @@ async fn dropping_turn_stream_closes_http_body() {
     let stream = upstream.start(turn()).await.unwrap();
     drop(stream);
     tokio::time::timeout(Duration::from_secs(3),async { while !dropped.load(Ordering::SeqCst) { tokio::time::sleep(Duration::from_millis(10)).await; } }).await.unwrap();
+    task.abort();
+}
+
+#[test]
+fn structured_capabilities_are_opt_in_and_pcm16_is_wrapped_as_wav() {
+    use base64::{Engine, engine::general_purpose::STANDARD};
+    let upstream = Upstream::new(UpstreamConfig::new("http://localhost",Flavor::OpenaiChat,"test")).unwrap();
+    let mut turn = turn();
+    turn.tools.push(ToolSpec { name:"f".into(),description:None,parameters:json!({"type":"object"}),strict:true });
+    assert_eq!(upstream.map_request(&turn).unwrap_err().param.as_deref(),Some("tools"));
+    turn.tools.clear();
+    turn.items.push(Item::Message { role:Role::User,content:vec![Part::Audio { format:"pcm16".into(),data:STANDARD.encode([1,0,2,0]) }] });
+    let request = upstream.map_request(&turn).unwrap();
+    let audio = &request["messages"][1]["content"][0]["input_audio"];
+    assert_eq!(audio["format"],"wav");
+    let wav = STANDARD.decode(audio["data"].as_str().unwrap()).unwrap();
+    assert_eq!(&wav[..4],b"RIFF");
+    assert_eq!(&wav[8..16],b"WAVEfmt ");
+    assert_eq!(u32::from_le_bytes(wav[24..28].try_into().unwrap()),24000);
+    assert_eq!(&wav[44..],&[1,0,2,0]);
+    turn.items.push(Item::Message { role:Role::User,content:vec![Part::Audio { format:"pcm16".into(),data:STANDARD.encode([1]) }] });
+    assert_eq!(upstream.map_request(&turn).unwrap_err().param.as_deref(),Some("audio"));
+}
+#[tokio::test]
+async fn nested_model_metadata_resolves_served_model_capabilities() {
+    let (url,task) = server(Router::new().route("/models",get(|| async { axum::Json(json!({"data":[
+        {"id":"other","architecture":{"input_modalities":["text"]}},
+        {"id":"test","context_length":1050000,"top_provider":{"max_completion_tokens":131072},
+         "architecture":{"input_modalities":["text","image","audio"]},"supported_parameters":["structured_outputs","tools","reasoning"]}
+    ]})) }))).await;
+    let upstream = Upstream::new(UpstreamConfig::new(url,Flavor::OpenaiChat,"test")).unwrap().discover().await;
+    let caps = upstream.capabilities();
+    assert!(caps.vision && caps.audio_in && caps.json_schema);
+    assert!(!caps.strict_tools,"tools metadata alone is not a strict schema guarantee");
+    assert_eq!(upstream.models()[0].context_tokens,Some(1050000));
+    let mut turn = turn();turn.response_format=Some(json!({"type":"json_schema","json_schema":{"name":"test","schema":{"type":"object"},"strict":true}}));
+    assert!(upstream.map_request(&turn).is_ok());
     task.abort();
 }

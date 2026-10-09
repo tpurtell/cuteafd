@@ -22,7 +22,11 @@ impl Sanitizer {
         Self { secrets }
     }
     pub fn from_env(extra: impl IntoIterator<Item = String>) -> Self {
-        Self::new(extra.into_iter().chain(["DEEPSEEK_API_KEY","EXA_API_KEY"].into_iter().filter_map(|name| std::env::var(name).ok())))
+        let mut secrets:Vec<String> = extra.into_iter().chain(["DEEPSEEK_API_KEY","EXA_API_KEY","OPENROUTER_API_KEY","LITELLM_API_KEY","LITELLM_BASE_URL"].into_iter().filter_map(|name| std::env::var(name).ok())).collect();
+        if let Ok(url) = std::env::var("LITELLM_BASE_URL") {
+            if let Ok(url) = reqwest::Url::parse(&url) { if let Some(host) = url.host_str() { secrets.push(host.into()); } }
+        }
+        Self::new(secrets)
     }
     pub fn text(&self, text: &str) -> String {
         let mut text = text.to_string();
