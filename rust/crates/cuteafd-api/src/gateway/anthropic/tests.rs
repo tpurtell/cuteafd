@@ -514,7 +514,7 @@ async fn zero_output_limit_counts_without_generation() {
     folded.as_object_mut().unwrap().remove("id");
     message.as_object_mut().unwrap().remove("id");
     assert_eq!(folded, message);
-    assert!(backend.requests.lock().unwrap().is_empty());
+    assert!(backend.turns().is_empty());
 }
 
 #[tokio::test]
