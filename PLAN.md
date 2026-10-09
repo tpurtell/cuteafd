@@ -1787,6 +1787,12 @@ TJ: two key items, both urgent right after v2.0.0.
      design and kernel/loader audit). V4 Flash/Pro measured in rc1:
      KV pool 581K-1.39M tokens because experts are placed first, GPU1
      13-24 of 90 GiB used.
+4. **Spark-free layouts as first-class options (TJ, 2026-10-09).** Any layout
+   with no Sparks that fits is supported: GLM 5.3 Flash and V4 Flash on 2 RTX
+   at a reduced KV pool, using item 1's TP2 RTX experts and attention
+   placement (today's head split leaves every routed expert on GPU0). Qwen on
+   1 RTX already serves (525,568-token plan for EXL3 K4.25). Input:
+   `builds/no-spark-layouts/` (per-GPU expert bytes, pools at 2M/1M/262K).
 3. **V4.1 NVFP4 numerics and wire** (deferred by TJ, 2026-10-09). The Spark
    kernels already run W4A4 (mxf4nvf4), but FC1 uses one layer-max input
    scale instead of each expert's calibrated `input_scale` (~6x spread), and
