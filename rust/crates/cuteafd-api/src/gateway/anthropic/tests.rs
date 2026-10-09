@@ -463,6 +463,38 @@ async fn truncated_tools_preserve_max_tokens_and_partial_object() {
 }
 
 #[tokio::test]
+async fn refused_or_cancelled_open_tools_are_not_runnable() {
+    for (stop, expected) in [
+        (StopReason::Refusal, "refusal"),
+        (StopReason::ContentFilter, "refusal"),
+        (StopReason::Cancelled, "max_tokens"),
+    ] {
+        let script = vec![
+            TurnEvent::ToolCallStart {
+                index: 0,
+                id: "a".into(),
+                name: "f".into(),
+            },
+            TurnEvent::ToolCallDelta {
+                index: 0,
+                arguments: "{\"x\":1,\"cut\":".into(),
+            },
+            done(stop),
+        ];
+        let (app, _) = router(vec![script.clone(), script]);
+        let (status, _, body) = wire(app.clone(), request(prompt(false))).await;
+        assert_eq!(status, StatusCode::OK);
+        let message: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(message["stop_reason"], expected);
+        assert_eq!(message["content"][0]["input"], json!({"x":1}));
+        let (_, _, body) = wire(app, request(prompt(true))).await;
+        let events = frames(&body);
+        assert!(kinds(&events).contains(&"content_block_stop"));
+        assert_eq!(events[events.len() - 2]["delta"]["stop_reason"], expected);
+    }
+}
+
+#[tokio::test]
 async fn zero_output_limit_counts_without_generation() {
     let (app, backend) = router(vec![]);
     let mut value = prompt(false);

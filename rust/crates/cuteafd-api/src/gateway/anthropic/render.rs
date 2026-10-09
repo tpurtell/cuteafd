@@ -60,7 +60,7 @@ impl Renderer {
         let content: Vec<Value> = self.slots.iter().map(|slot| match &slot.block {
             Block::Thinking { text, signature } => json!({"type":"thinking","thinking":text,"signature":signature}),
             Block::Text(text) => json!({"type":"text","text":text}),
-            Block::Tool { id, name, arguments } => json!({"type":"tool_use","id":id,"name":name,"input":tool_input(arguments, matches!(self.stop, Some(StopReason::MaxTokens))).unwrap_or_else(|_| json!({}))}),
+            Block::Tool { id, name, arguments } => json!({"type":"tool_use","id":id,"name":name,"input":tool_input(arguments, self.stop.as_ref().is_some_and(truncated)).unwrap_or_else(|_| json!({}))}),
             Block::Fixed(value) => value.clone(),
         }).collect();
         let (stop_reason, stop_sequence) = stop(self.stop.as_ref());
@@ -258,7 +258,15 @@ impl Renderer {
                 self.close(i, &mut frames)?;
             }
             TurnEvent::Usage { usage } => self.usage = usage,
-            TurnEvent::Done { stop: reason } => {
+            TurnEvent::Done { stop: mut reason } => {
+                if matches!(reason, StopReason::Cancelled)
+                    && self
+                        .slots
+                        .iter()
+                        .any(|slot| !slot.closed && matches!(slot.block, Block::Tool { .. }))
+                {
+                    reason = StopReason::MaxTokens;
+                }
                 self.close_active(&mut frames)?;
                 for index in 0..self.slots.len() {
                     self.close(index, &mut frames)?;
@@ -267,7 +275,7 @@ impl Renderer {
                 // truncate the call. Match the official SDK's partial parser.
                 for slot in &self.slots {
                     if let Block::Tool { arguments, .. } = &slot.block {
-                        tool_input(arguments, matches!(reason, StopReason::MaxTokens))?;
+                        tool_input(arguments, truncated(&reason))?;
                     }
                 }
                 let (stop_reason, stop_sequence) = stop(Some(&reason));
@@ -278,6 +286,15 @@ impl Renderer {
         }
         Ok(frames)
     }
+}
+fn truncated(reason: &StopReason) -> bool {
+    matches!(
+        reason,
+        StopReason::MaxTokens
+            | StopReason::Refusal
+            | StopReason::ContentFilter
+            | StopReason::Cancelled
+    )
 }
 pub(super) fn tool_input(arguments: &str, partial: bool) -> Result<Value, GatewayError> {
     let value = if partial {
