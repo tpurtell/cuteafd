@@ -254,6 +254,15 @@ pub(crate) struct PlanArgs {
     /// Include native MTP/drafter tensors in coordinator file requirements.
     #[arg(long)]
     pub(crate) include_speculator: bool,
+    /// Separately configured drafter checkpoint to include in JSON inventory.
+    #[arg(long)]
+    pub(crate) drafter_snapshot: Option<PathBuf>,
+    /// Separately configured vision checkpoint to include in JSON inventory.
+    #[arg(long)]
+    pub(crate) vision_snapshot: Option<PathBuf>,
+    /// Separately configured audio checkpoint to include in JSON inventory.
+    #[arg(long)]
+    pub(crate) audio_snapshot: Option<PathBuf>,
     /// Exit non-zero unless every part is servable.
     #[arg(long, default_value_t = false)]
     pub(crate) require_ready: bool,

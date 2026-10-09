@@ -83,6 +83,8 @@ pub struct FileManifest {
     pub revision: Option<String>,
     pub files: Vec<RequiredFile>,
     pub total_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub additional_snapshots: Vec<FileManifest>,
 }
 
 pub fn manifest(snapshot: &Path, role: ReadRole) -> Result<FileManifest> {
@@ -95,7 +97,18 @@ pub fn manifest_roles(snapshot: &Path, roles: &[ReadRole]) -> Result<FileManifes
     let inventory = Checkpoint::inventory(snapshot)?;
     let mut tensors = BTreeSet::new();
     for role in roles { tensors.extend(required_tensors(&inventory, *role)?); }
-    let mut files: BTreeSet<String> = tensors.iter().filter_map(|name| inventory.weight_map.get(name).cloned()).collect();
+    let files: BTreeSet<String> = tensors.iter().filter_map(|name| inventory.weight_map.get(name).cloned()).collect();
+    manifest_from_files(snapshot, roles.iter().map(|r| r.label()).collect::<Vec<_>>().join(", "), files)
+}
+
+/// Standalone drafters/encoders have their own config and naming convention;
+/// their complete index is required, without pretending they are text families.
+pub fn manifest_standalone(snapshot: &Path, role: &str) -> Result<FileManifest> {
+    let inventory = Checkpoint::inventory(snapshot)?;
+    manifest_from_files(snapshot, role.into(), inventory.weight_map.values().cloned().collect())
+}
+
+fn manifest_from_files(snapshot: &Path, role: String, mut files: BTreeSet<String>) -> Result<FileManifest> {
     for entry in std::fs::read_dir(snapshot)? {
         let entry = entry?;
         let name = entry.file_name().to_string_lossy().into_owned();
@@ -114,8 +127,8 @@ pub fn manifest_roles(snapshot: &Path, roles: &[ReadRole]) -> Result<FileManifes
     let repo_id = cache_repo.and_then(|p| p.file_name()).and_then(|n| n.to_str())
         .and_then(|name| name.strip_prefix("models--")).map(|name| name.replace("--", "/"));
     let revision = cache_repo.and_then(|_| snapshot.file_name()).and_then(|n| n.to_str()).map(str::to_owned);
-    Ok(FileManifest { role: roles.iter().map(|r| r.label()).collect::<Vec<_>>().join(", "),
-        snapshot: snapshot.display().to_string(), repo_id, revision, files, total_bytes })
+    Ok(FileManifest { role, snapshot: snapshot.display().to_string(), repo_id, revision, files, total_bytes,
+        additional_snapshots: Vec::new() })
 }
 
 #[cfg(test)]

@@ -101,7 +101,9 @@ pub(crate) fn run_plan(args: PlanArgs) -> Result<()> {
             } else {
                 let manifests = hosts.iter().map(|(host, names)| {
                     let roles = names.iter().map(|name| parse(name)).collect::<Result<Vec<_>>>()?;
-                    Ok((host.clone(), manifest_roles(&snapshot, &roles)?))
+                    let mut manifest = manifest_roles(&snapshot, &roles)?;
+                    attach_snapshots(&mut manifest, &roles, &args)?;
+                    Ok((host.clone(), manifest))
                 }).collect::<Result<std::collections::BTreeMap<_, _>>>()?;
                 if args.fetch {
                     let hosts: Vec<_> = manifests.into_iter().collect();
@@ -128,12 +130,16 @@ pub(crate) fn run_plan(args: PlanArgs) -> Result<()> {
             anyhow::ensure!(args.host.is_none() || args.fetch, "--host needs --file-layout or --fetch");
             vec![parse(args.role.as_deref().unwrap_or("coordinator"))?]
         };
-        let manifest = manifest_roles(&snapshot, &roles)?;
+        let mut manifest = manifest_roles(&snapshot, &roles)?;
+        attach_snapshots(&mut manifest, &roles, &args)?;
         if args.fetch {
             transfer(&snapshot, &manifest, &args)?;
         } else if args.files {
             if args.json { println!("{}", serde_json::to_string_pretty(&manifest)?); }
-            else { for file in &manifest.files { println!("{}", file.path); } }
+            else {
+                anyhow::ensure!(manifest.additional_snapshots.is_empty(), "multiple snapshot roots need --json; inventory each root separately for a plain rsync list");
+                for file in &manifest.files { println!("{}", file.path); }
+            }
         } else {
             let mut headers = 0;
             for role in &roles { headers += cuteafd_loader::plan::files::open_role(&snapshot, *role)?.tensors.len(); }
@@ -156,6 +162,22 @@ pub(crate) fn run_plan(args: PlanArgs) -> Result<()> {
     if args.require_ready && !report.executable() {
         anyhow::bail!("{} is not servable by this build", args.model);
     }
+    Ok(())
+}
+
+fn attach_snapshots(manifest: &mut cuteafd_loader::plan::files::FileManifest,
+    roles: &[cuteafd_loader::plan::files::ReadRole], args: &PlanArgs) -> Result<()> {
+    use cuteafd_loader::plan::files::{manifest_standalone, ReadRole};
+    let configured = [
+        ("drafter", &args.drafter_snapshot, roles.iter().any(|r| matches!(r, ReadRole::Drafter | ReadRole::Coordinator { speculator: true, .. }))),
+        ("vision", &args.vision_snapshot, roles.contains(&ReadRole::Vision)),
+        ("audio", &args.audio_snapshot, roles.contains(&ReadRole::Audio)),
+    ];
+    for (role, path, enabled) in configured {
+        if let Some(path) = path.as_ref().filter(|_| enabled) { manifest.additional_snapshots.push(manifest_standalone(path, role)?); }
+    }
+    manifest.total_bytes = manifest.additional_snapshots.iter().fold(manifest.total_bytes, |sum, repo|
+        sum.and_then(|sum| sum.checked_add(repo.total_bytes?)));
     Ok(())
 }
 
@@ -200,6 +222,7 @@ fn transfer(snapshot: &std::path::Path, manifest: &cuteafd_loader::plan::files::
     use anyhow::ensure;
     use std::io::Write;
     use std::process::Command;
+    ensure!(manifest.additional_snapshots.is_empty(), "fetch separate snapshot roots individually; additional repos are listed in --files --json");
     let automatic = args.source.as_deref() == Some("auto");
     let (source_host, source_path) = source_location(if automatic { None } else { args.source.as_deref() }, snapshot)?;
     if automatic {
@@ -352,6 +375,7 @@ mod tests {
             json: true,
             files: false, role: None, host: None, file_layout: None, fetch_parallel: 2, fetch: false, destination: None, source: None, forward_agent: false,
             dry_run: false, force: false, include_speculator: false,
+            drafter_snapshot: None, vision_snapshot: None, audio_snapshot: None,
             require_ready,
             layout: true,
             rtx: 2,
@@ -384,6 +408,27 @@ mod tests {
     }
 
     #[test]
+    fn standalone_repos_are_inventory_only_when_the_host_runs_that_role() {
+        use cuteafd_loader::plan::files::{manifest_roles, ReadRole};
+        let main = tempfile::tempdir().unwrap();
+        write_snapshot(main.path(), &mimo_flash_config(), &mimo_flash_tensors(), None);
+        let draft = tempfile::tempdir().unwrap();
+        write_snapshot(draft.path(), &serde_json::json!({"model_type":"external_drafter"}),
+            &[cuteafd_loader::plan::testing::t("draft.weight", "BF16", &[2])], None);
+        let mut args = args(main.path(), 4, false);
+        args.drafter_snapshot = Some(draft.path().into());
+        let spark = ReadRole::Spark { rank: 0, world: 4 };
+        let mut manifest = manifest_roles(main.path(), &[spark]).unwrap();
+        attach_snapshots(&mut manifest, &[spark], &args).unwrap();
+        assert!(manifest.additional_snapshots.is_empty());
+        let coordinator = ReadRole::Coordinator { local_experts: false, speculator: true };
+        let mut manifest = manifest_roles(main.path(), &[coordinator]).unwrap();
+        attach_snapshots(&mut manifest, &[coordinator], &args).unwrap();
+        assert_eq!(manifest.additional_snapshots.len(), 1);
+        assert!(manifest.additional_snapshots[0].files.iter().any(|f| f.path == "model-00001-of-00001.safetensors"));
+    }
+
+    #[test]
     fn peer_source_paths_are_absolute_and_hosts_cannot_supply_options() {
         assert_eq!(source_location(Some("worker:/models/snapshot"), std::path::Path::new("/unused")).unwrap(),
             (Some("worker".into()), PathBuf::from("/models/snapshot")));
@@ -409,7 +454,7 @@ mod tests {
         let manifest = cuteafd_loader::plan::files::FileManifest {
             role: "coordinator".into(), snapshot: source.path().display().to_string(),
             repo_id: None, revision: None, files: vec![cuteafd_loader::plan::files::RequiredFile {
-                path: "config.json".into(), bytes: Some(6) }], total_bytes: Some(6) };
+                path: "config.json".into(), bytes: Some(6) }], total_bytes: Some(6), additional_snapshots: Vec::new() };
         let mut args = args(source.path(), 4, false);
         args.fetch = true;
         args.destination = Some(destination.path().into());
