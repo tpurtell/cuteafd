@@ -34,8 +34,9 @@ format.
   `ssh -A` for peer-to-target copies (default off). `--source auto` reports whether
   sparknest serves a sealed local copy or streams; without it, the local snapshot
   is used. Omit `--host` with `--file-layout --fetch` to copy the whole layout,
-  capped by `--fetch-parallel` (default 2). These lists cover the main snapshot;
-  separately configured drafter or encoder snapshots must be inventoried separately.
+  capped by `--fetch-parallel` (default 2). Add `--drafter-snapshot`, `--vision-snapshot`
+  or `--audio-snapshot` with `--json` to include separate repos for the selected
+  host's enabled roles; fetch those snapshot roots individually.
 - Exact prefix caching for agentic work: the deepest cached snapshot that
   prefixes a request is restored byte-identical, not approximated.
 - Own your intelligence: your weights, your hardware, your rate limits (none),
