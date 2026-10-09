@@ -160,6 +160,15 @@ pub struct TurnRequest {
     /// the usage middleware once work/api-usage lands, `None` until then.
     #[serde(skip)]
     pub usage: Option<UsageHandle>,
+    /// Stable client cache affinity hint, independent of response storage.
+    #[serde(default)]
+    pub prompt_cache_key: Option<String>,
+    /// Requested Responses text verbosity.
+    #[serde(default)]
+    pub text_verbosity: Option<String>,
+    /// Requested provider scheduling tier.
+    #[serde(default)]
+    pub service_tier: Option<String>,
 }
 
 /// Placeholder for the usage tracker's per-request handle (an `Arc` of
@@ -175,7 +184,7 @@ impl std::fmt::Debug for UsageHandle {
 /// Handles never affect equality of the turns that carry them.
 impl PartialEq for UsageHandle {
     fn eq(&self, _: &Self) -> bool { true }
-}
+
 
 /// Why generation stopped.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
