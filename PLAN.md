@@ -1812,6 +1812,17 @@ TJ: two key items, both urgent right after v2.0.0.
    placement (today's head split leaves every routed expert on GPU0). Qwen on
    1 RTX already serves (525,568-token plan for EXL3 K4.25). Input:
    `builds/no-spark-layouts/` (per-GPU expert bytes, pools at 2M/1M/262K).
+6. **Shared resource-priced draft policy from V4.1 (TJ, 2026-10-09, priority).**
+   AFD is an MoE technique and Spark expert traffic dominates step time, so
+   adopt V4.1's dSpark cost model (`cuteafd_core::dspark_policy`: per-layer
+   `alpha + beta*rows + bytes/bandwidth` from route-history traffic
+   forecasts, separate RTX/Spark resource classes, Huber fits with
+   forgetting, online per-position calibration) as the shared policy for
+   every speculative family, with per-layer timing and committed-route
+   plumbing added to each engine. Replaces `CycleCost`'s row table; the
+   per-concurrency buckets on `work/draft-policy-v2` are interim. Design:
+   Fable, together with a review of the ds41rt retirement and placement
+   designs into one v3 roadmap.
 5. **Qwen FP8 KV cache (TJ, 2026-10-09).** Qwen stores BF16 K/V records
    (2,048 B per row) and BF16 index keys, the most KV bytes per token of any
    family; Qwen NVFP4 min plans 217,856 tokens, below the 256K agentic
