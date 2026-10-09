@@ -80,7 +80,7 @@ impl Response {
         }
         events.push(self.event(index,"response.output_item.added",json!({"item":wire_item(&self.output[index].id,&self.output[index].item ,"in_progress",self.beta)})));
         if tool_index.is_none() {
-            events.push(self.event(index,"response.content_part.added",json!({"content_index":0,"part":{"type":if self.beta {"text"} else {"output_text"},"text":""}})));
+            events.push(self.event(index,"response.content_part.added",json!({"content_index":0,"part":{"type":"text","text":""}})));
         }
         events
     }
@@ -103,7 +103,7 @@ impl Response {
                     },
                     json!({"content_index":0,"text":text}),
                 ));
-                events.push(self.event(index,"response.content_part.done",json!({"content_index":0,"part":{"type":if self.beta {"text"} else {"output_text"},"text":text}})));
+                events.push(self.event(index,"response.content_part.done",json!({"content_index":0,"part":{"type":"text","text":text}})));
             }
             Item::ToolCall {
                 arguments,

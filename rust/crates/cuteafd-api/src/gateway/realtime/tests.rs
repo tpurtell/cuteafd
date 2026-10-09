@@ -205,6 +205,12 @@ async fn ga_history_text_tools_and_out_of_band() {
             "response.done"
         ]
     );
+    // GA content-part events use "text"/"audio" (openai-python
+    // RealtimeServerEvent types); item content uses "output_text". Agents
+    // Python rejected "output_text" here in a live run (2026-10-10).
+    for event in events.iter().filter(|v| v["type"].as_str().is_some_and(|t| t.starts_with("response.content_part."))) {
+        assert_eq!(event["part"]["type"], "text", "{event}");
+    }
     let done = &events.last().unwrap()["response"];
     assert_eq!(done["status"], "completed");
     assert_eq!(done["usage"]["total_tokens"], 13);
