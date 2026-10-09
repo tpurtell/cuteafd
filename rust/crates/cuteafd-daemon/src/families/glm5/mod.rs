@@ -328,6 +328,7 @@ impl Opened {
             ensure!(cfg.hidden == self.cfg.hidden && cfg.vocab == self.cfg.vocab_size
                 && cfg.taps.iter().all(|&l| l < self.cfg.layers), "the DFlash2 drafter does not fit this target");
             let mask = engine.embedding.host_rows(&[cfg.mask_token])?;
+            tracing::info!(mask_source = "target mask_token row", mask_token = cfg.mask_token, "drafter mask source");
             let file = draft_file.context("drafter prefetch")?.join()
                 .map_err(|_| anyhow::anyhow!("drafter prefetch panicked"))??;
             let representation = cuteafd_loader::families::glm5::draft_representation::GlmDraftRepresentation

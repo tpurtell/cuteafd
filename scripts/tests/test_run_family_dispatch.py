@@ -88,6 +88,15 @@ def test_shared_draft_policy_switches_are_explicit_and_default_off(tmp_path: Pat
     assert "CUTEAFD_SPECULATION_TRACE=" in result.stderr
 
 
+def test_glm53_bare_default_uses_release_dflash2(tmp_path: Path) -> None:
+    result = _family_launch_result(tmp_path, {
+        "model_type": "glm_moe_dsa", "num_hidden_layers": 4, "first_k_dense_replace": 3,
+    }, "zai-org/GLM-5.3", "")
+    assert result.returncode == 0, result.stderr
+    assert "GLM 5.3 drafts with DFlash2" in result.stderr
+    assert "models--incoai--GLM-5.3-DFlash2/snapshots/abc" in result.stderr
+
+
 def test_shared_draft_policy_rejects_unknown_switch_value(tmp_path: Path) -> None:
     result = _family_launch_result(tmp_path, {"model_type": "mimo_v2_flash", "num_hidden_layers": 2,
                                             "moe_layer_freq": [0, 1]}, "XiaomiMiMo/MiMo-V2-Flash",
@@ -156,6 +165,8 @@ def _family_launch_result(tmp_path: Path, family_config: dict, model: str, keys:
         (repo / "scripts" / "build" / "verify-sparkinfer-source.py").write_text("print('test-pin')\n")
     hf = tmp_path / "hf"
     _snapshot(hf, model, family_config)
+    if family_config.get("model_type") == "glm_moe_dsa":
+        _snapshot(hf, "incoai/GLM-5.3-DFlash2", {"architectures": ["DFlash2DraftModel"]})
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     for tool in ("docker", "ssh", "nest") if with_nest else ("docker", "ssh"):

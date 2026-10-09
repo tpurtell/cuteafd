@@ -64,7 +64,13 @@ fn options(args: &PlanArgs) -> Result<PlanOptions, PlanError> {
     Ok(options)
 }
 
-pub(crate) fn run_plan(args: PlanArgs) -> Result<()> {
+pub(crate) fn run_plan(mut args: PlanArgs) -> Result<()> {
+    if args.files || args.fetch || args.role.is_some() {
+        let cfg = launch_config(args.config.as_deref())?;
+        if args.revision.is_none() && !PathBuf::from(&args.model).is_dir() {
+            args.revision = cfg.get("MODEL_REVISION").filter(|v| !v.is_empty()).cloned();
+        }
+    }
     let mut options = options(&args)?;
     let snapshot = if PathBuf::from(&args.model).is_dir() {
         PathBuf::from(&args.model)
@@ -104,7 +110,20 @@ pub(crate) fn run_plan(args: PlanArgs) -> Result<()> {
     }
     if args.files || args.fetch || args.role.is_some() {
         use cuteafd_loader::plan::files::{manifest_roles, ReadRole};
-        let parse = |name: &str| ReadRole::parse(name, options.placement, args.include_speculator);
+        let args = file_args(args, &snapshot)?;
+        let placement = ExpertPlacement::from_spark_ranks(args.spark_ranks.unwrap_or(4));
+        let parse = |name: &str| {
+            anyhow::ensure!(!(args.no_speculator && name == "drafter"), "--no-speculator conflicts with drafter role");
+            ReadRole::parse(name, placement,
+                args.include_speculator || matches!(args.speculator.as_str(), "mtp" | "dspark"))
+        };
+        let complete_roles = |mut roles: Vec<ReadRole>| {
+            if roles.iter().any(|r| matches!(r, ReadRole::Coordinator { .. })) {
+                if args.vision != cuteafd_loader::plan::MediaMode::Off { roles.push(ReadRole::Vision); }
+                if args.audio != cuteafd_loader::plan::MediaMode::Off { roles.push(ReadRole::Audio); }
+            }
+            roles
+        };
         let roles = if let Some(layout) = &args.file_layout {
             anyhow::ensure!(args.role.is_none(), "--role and --file-layout are mutually exclusive");
             let hosts: std::collections::BTreeMap<String, Vec<String>> =
@@ -114,7 +133,7 @@ pub(crate) fn run_plan(args: PlanArgs) -> Result<()> {
                     .iter().map(|name| parse(name)).collect::<Result<Vec<_>>>()?
             } else {
                 let manifests = hosts.iter().map(|(host, names)| {
-                    let roles = names.iter().map(|name| parse(name)).collect::<Result<Vec<_>>>()?;
+                    let roles = complete_roles(names.iter().map(|name| parse(name)).collect::<Result<Vec<_>>>()?);
                     let mut manifest = manifest_roles(&snapshot, &roles)?;
                     attach_snapshots(&mut manifest, &roles, &args)?;
                     Ok((host.clone(), manifest))
@@ -144,6 +163,7 @@ pub(crate) fn run_plan(args: PlanArgs) -> Result<()> {
             anyhow::ensure!(args.host.is_none() || args.fetch, "--host needs --file-layout or --fetch");
             vec![parse(args.role.as_deref().unwrap_or("coordinator"))?]
         };
+        let roles = complete_roles(roles);
         let mut manifest = manifest_roles(&snapshot, &roles)?;
         attach_snapshots(&mut manifest, &roles, &args)?;
         if args.fetch {
@@ -179,16 +199,139 @@ pub(crate) fn run_plan(args: PlanArgs) -> Result<()> {
     Ok(())
 }
 
+fn launch_config(path: Option<&std::path::Path>) -> Result<std::collections::BTreeMap<String, String>> {
+    let Some(path) = path else { return Ok(Default::default()) };
+    let text = std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    Ok(text.lines().filter_map(|line| {
+        let (key, value) = line.split_once('=')?;
+        (!key.is_empty() && key.bytes().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == b'_'))
+            .then(|| (key.to_owned(), value.to_owned()))
+    }).collect())
+}
+
+/// Resolve the release defaults or the launcher's plain KEY=VALUE config.
+/// Never execute a shell configuration while constructing a file inventory.
+fn file_args(mut args: PlanArgs, snapshot: &std::path::Path) -> Result<PlanArgs> {
+    use cuteafd_loader::plan::MediaMode;
+    let inventory = cuteafd_loader::plan::checkpoint::Checkpoint::inventory(snapshot)?;
+    let family = cuteafd_loader::plan::family::detect(&inventory).context("unsupported checkpoint family")?.id();
+    let cfg = launch_config(args.config.as_deref())?;
+    if let Some(model) = cfg.get("MODEL_ID") {
+        if !PathBuf::from(&args.model).is_dir() {
+            anyhow::ensure!(model == &args.model, "--config MODEL_ID={model} differs from {}", args.model);
+        }
+    }
+    if args.spark_ranks.is_none() {
+        if cfg.get("EXPERT_BACKEND").is_some_and(|v| v == "local") { args.spark_ranks = Some(0); }
+        else if let Some(ranks) = cfg.get("SPARK_COUNT") { args.spark_ranks = Some(ranks.parse().context("SPARK_COUNT")?); }
+    }
+    let default = match family {
+        "glm5" | "glm5_flash" => "dflash2",
+        "mimo_v2" if snapshot.join("dflash").is_dir() => "dflash2",
+        "mimo_v2" | "qwen4" => "mtp",
+        "deepseek_v4" | "deepseek_v41" => "dspark",
+        _ => "off",
+    };
+    if args.speculator == "auto" {
+        args.speculator = cfg.get("SPECULATOR").cloned().unwrap_or_else(|| {
+            if cfg.get("DFLASH").is_some_and(|v| v == "on") || cfg.get("DRAFT_MODEL_ID").is_some_and(|v| !v.is_empty()) { "dflash2".into() }
+            else if let Some(depth) = cfg.get("MTP") { if depth == "0" { "off" } else { "mtp" }.into() }
+            else if let Some(mode) = cfg.get("DSPARK") { if mode == "on" { "dspark" } else { "off" }.into() }
+            else if family == "mimo_v2" && cfg.get("DFLASH").is_some_and(|v| v == "off") { "off".into() }
+            else { default.into() }
+        });
+    }
+    if args.speculator == "auto" { args.speculator = default.into(); }
+    anyhow::ensure!(["off", "mtp", "dspark", "dflash2"].contains(&args.speculator.as_str()), "unknown SPECULATOR={}", args.speculator);
+    anyhow::ensure!(!(args.no_speculator && args.include_speculator), "--no-speculator conflicts with --include-speculator");
+    if args.no_speculator {
+        anyhow::ensure!(args.drafter_snapshot.is_none() && args.role.as_deref() != Some("drafter"), "--no-speculator conflicts with drafter inputs/role");
+        args.speculator = "off".into();
+    } else if (args.include_speculator || args.drafter_snapshot.is_some()) && args.speculator == "off" {
+        args.speculator = default.into();
+        anyhow::ensure!(args.speculator != "off", "this family has no default speculator");
+    }
+    let enabled = match (family, args.speculator.as_str()) {
+        (_, "off") | ("glm5", "dflash2") | ("glm5_flash", "dflash2" | "dspark")
+        | ("mimo_v2", "dflash2" | "mtp") | ("qwen4", "mtp")
+        | ("deepseek_v4" | "deepseek_v41", "dspark") => true,
+        _ => false,
+    };
+    anyhow::ensure!(enabled, "SPECULATOR={} does not apply to {family}", args.speculator);
+    let needs_drafter = if let Some(layout) = &args.file_layout {
+        let hosts: std::collections::BTreeMap<String, Vec<String>> =
+            serde_json::from_reader(std::fs::File::open(layout)?)?;
+        let roles = if let Some(host) = &args.host {
+            hosts.get(host).with_context(|| format!("host {host} is absent from {}", layout.display()))?.clone()
+        } else { hosts.into_values().flatten().collect() };
+        roles.iter().any(|r| matches!(r.as_str(), "coordinator" | "rtx0" | "rtx1" | "drafter"))
+    } else {
+        args.role.as_deref().is_none_or(|r| matches!(r, "coordinator" | "rtx0" | "rtx1" | "drafter"))
+    };
+    if needs_drafter && args.drafter_snapshot.is_none() && matches!(args.speculator.as_str(), "dflash2" | "dspark") {
+        let model = cfg.get("SPECULATOR_MODEL_ID").or_else(|| cfg.get("DRAFT_MODEL_ID"))
+            .filter(|v| !v.is_empty()).map(String::as_str).or(match (family, args.speculator.as_str()) {
+                ("glm5", "dflash2") => Some("incoai/GLM-5.3-DFlash2"),
+                ("glm5_flash", "dflash2") => Some("incoai/GLM-5.3-Flash-DFlash2"),
+                ("glm5_flash", "dspark") => Some("RedHatAI/GLM-5.3-Flash-speculator.dspark-preview"),
+                _ => None,
+            });
+        if let Some(model) = model {
+            let hf_home = args.hf_home.clone().unwrap_or_else(default_hf_home);
+            let revision = cfg.get("SPECULATOR_MODEL_REVISION").or_else(|| cfg.get("DRAFT_MODEL_REVISION"))
+                .filter(|v| !v.is_empty()).map(String::as_str);
+            args.drafter_snapshot = Some(resolve_snapshot_at_revision(model, Some(&hf_home), revision)?
+                .snapshot_path.with_context(|| format!("required speculator {model} is not downloaded; use --no-speculator only when serving without it"))?);
+        }
+    }
+    if let Some(mode) = cfg.get("VISION") { args.vision = mode.parse().map_err(anyhow::Error::msg)?; }
+    else if !matches!(family, "mimo_v2" | "glm5_flash" | "qwen4") && args.vision == MediaMode::Auto {
+        args.vision = MediaMode::Off;
+    }
+    if let Some(mode) = cfg.get("AUDIO") { args.audio = mode.parse().map_err(anyhow::Error::msg)?; }
+    args.audio = cuteafd_loader::plan::resolve_audio(args.audio, snapshot)?;
+    Ok(args)
+}
+
 fn attach_snapshots(manifest: &mut cuteafd_loader::plan::files::FileManifest,
     roles: &[cuteafd_loader::plan::files::ReadRole], args: &PlanArgs) -> Result<()> {
     use cuteafd_loader::plan::files::{manifest_standalone, ReadRole};
+    let coordinator = roles.iter().any(|r| matches!(r, ReadRole::Coordinator { .. }));
+    if (coordinator || roles.contains(&ReadRole::Drafter)) && args.speculator == "dflash2"
+        && args.drafter_snapshot.is_none() {
+        let root = PathBuf::from(&manifest.snapshot);
+        cuteafd_loader::plan::files::include_directory(manifest, &root, "dflash")?;
+    }
     let configured = [
-        ("drafter", &args.drafter_snapshot, roles.iter().any(|r| matches!(r, ReadRole::Drafter | ReadRole::Coordinator { speculator: true, .. }))),
+        ("drafter", &args.drafter_snapshot, coordinator && args.speculator != "off"
+            || roles.iter().any(|r| matches!(r, ReadRole::Drafter | ReadRole::Coordinator { speculator: true, .. }))),
         ("vision", &args.vision_snapshot, roles.contains(&ReadRole::Vision)),
         ("audio", &args.audio_snapshot, roles.contains(&ReadRole::Audio)),
     ];
     for (role, path, enabled) in configured {
         if let Some(path) = path.as_ref().filter(|_| enabled) { manifest.additional_snapshots.push(manifest_standalone(path, role)?); }
+    }
+    if coordinator {
+        let root = PathBuf::from(&manifest.snapshot);
+        let inventory = cuteafd_loader::plan::checkpoint::Checkpoint::inventory(&root)?;
+        if cuteafd_loader::plan::family::detect(&inventory).is_some_and(|f| f.id() == "glm5_flash") {
+            let cfg = launch_config(args.config.as_deref())?;
+            let model = cfg.get("GLM5_FLASH_FP8_MODEL_ID").or_else(|| cfg.get("GLMF_FP8_MODEL_ID"))
+                .filter(|v| !v.is_empty()).map(String::as_str).unwrap_or("zai-org/GLM-5.3-Flash");
+            if model != "off" {
+                let hf_home = args.hf_home.clone().unwrap_or_else(default_hf_home);
+                let revision = cfg.get("GLM5_FLASH_FP8_MODEL_REVISION").or_else(|| cfg.get("GLMF_FP8_MODEL_REVISION"))
+                    .filter(|v| !v.is_empty()).map(String::as_str);
+                let source = resolve_snapshot_at_revision(model, Some(&hf_home), revision)?.snapshot_path
+                    .with_context(|| format!("required GLM Flash FP8 source {model} is not downloaded"))?;
+                if source != root {
+                    let mut fp8 = cuteafd_loader::plan::files::manifest(&source,
+                        ReadRole::Coordinator { local_experts: false, speculator: false })?;
+                    fp8.role = "fp8 projections".into();
+                    manifest.additional_snapshots.push(fp8);
+                }
+            }
+        }
     }
     manifest.total_bytes = manifest.additional_snapshots.iter().fold(manifest.total_bytes, |sum, repo|
         sum.and_then(|sum| sum.checked_add(repo.total_bytes?)));
@@ -389,6 +532,7 @@ mod tests {
             json: true,
             files: false, role: None, host: None, file_layout: None, fetch_parallel: 2, fetch: false, destination: None, source: None, forward_agent: false,
             dry_run: false, force: false, include_speculator: false,
+            config: None, speculator: "auto".into(), no_speculator: false,
             drafter_snapshot: None, vision_snapshot: None, audio_snapshot: None,
             require_ready,
             layout: true,
@@ -441,6 +585,147 @@ mod tests {
         attach_snapshots(&mut manifest, &[coordinator], &args).unwrap();
         assert_eq!(manifest.additional_snapshots.len(), 1);
         assert!(manifest.additional_snapshots[0].files.iter().any(|f| f.path == "model-00001-of-00001.safetensors"));
+    }
+
+    #[test]
+    fn auto_speculators_equal_the_sanitized_release_configs() {
+        use cuteafd_loader::plan::testing::*;
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../scripts/fixtures/release-configs");
+        let v41 = serde_json::from_str(include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../cuteafd-loader/src/families/deepseek_v41/official-v41-config.json"))).unwrap();
+        let v4 = serde_json::json!({"architectures": ["DeepseekV4ForCausalLM"], "model_type": "deepseek_v4"});
+        for (name, config, expected) in [
+            ("glm53-exl3", glm5_config(), "dflash2"),
+            ("glm53f-exl3", glm5_flash_config(2), "dflash2"),
+            ("mimo26-flash", mimo_flash_mopd_config(), "dflash2"),
+            ("qwen38-exl3", qwen4_config(4), "mtp"),
+            ("v4-flash", v4, "dspark"), ("v41-flash", v41, "dspark"),
+        ] {
+            let target = tempfile::tempdir().unwrap();
+            write_snapshot(target.path(), &config, &[t("unused.weight", "BF16", &[2])], None);
+            if name == "mimo26-flash" { std::fs::create_dir(target.path().join("dflash")).unwrap(); }
+            let draft = tempfile::tempdir().unwrap();
+            let mut auto = args(target.path(), 4, false);
+            // Resolve policy independently of the machine's HF cache.
+            if name.starts_with("glm") { auto.drafter_snapshot = Some(draft.path().into()); }
+            let automatic = file_args(auto.clone(), target.path()).unwrap();
+            auto.config = Some(root.join(format!("{name}.config")));
+            let configured = file_args(auto, target.path()).unwrap();
+            assert_eq!(automatic.speculator, expected, "{name}");
+            assert_eq!(automatic.speculator, configured.speculator, "{name}");
+            assert_eq!(automatic.drafter_snapshot, configured.drafter_snapshot);
+        }
+    }
+
+    #[test]
+    fn glm_flash_includes_the_configured_fp8_projection_source() {
+        use cuteafd_loader::plan::testing::*;
+        let hf = tempfile::tempdir().unwrap();
+        let source = hf.path().join("hub/models--fixture--fp8/snapshots/pinned");
+        std::fs::create_dir_all(&source).unwrap();
+        write_snapshot(&source, &glm5_flash_config(2), &[t("lm_head.weight", "BF16", &[2])], None);
+        let target = tempfile::tempdir().unwrap();
+        write_snapshot(target.path(), &glm5_flash_config(2), &[t("lm_head.weight", "BF16", &[2])], None);
+        let config = target.path().join("launch.config");
+        std::fs::write(&config, "SPECULATOR=off\nGLM5_FLASH_FP8_MODEL_ID=fixture/fp8\nGLM5_FLASH_FP8_MODEL_REVISION=pinned\n").unwrap();
+        let mut input = args(target.path(), 4, false);
+        input.config = Some(config);
+        input.hf_home = Some(hf.path().into());
+        let effective = file_args(input, target.path()).unwrap();
+        let roles = [cuteafd_loader::plan::files::ReadRole::Coordinator { local_experts: false, speculator: false }];
+        let mut manifest = cuteafd_loader::plan::files::manifest_roles(target.path(), &roles).unwrap();
+        attach_snapshots(&mut manifest, &roles, &effective).unwrap();
+        assert_eq!(manifest.additional_snapshots.len(), 1);
+        assert_eq!(manifest.additional_snapshots[0].snapshot, source.display().to_string());
+        assert_eq!(manifest.additional_snapshots[0].role, "fp8 projections");
+    }
+
+    #[test]
+    fn configured_off_is_explicit_but_include_speculator_cannot_be_silenced() {
+        let target = tempfile::tempdir().unwrap();
+        write_snapshot(target.path(), &mimo_flash_config(), &mimo_flash_tensors(), None);
+        let config = target.path().join("serving.config");
+        std::fs::write(&config, "SPECULATOR=off\nVISION=off\nAUDIO=off\n").unwrap();
+        let mut input = args(target.path(), 4, false);
+        input.config = Some(config);
+        let off = file_args(input.clone(), target.path()).unwrap();
+        assert_eq!(off.speculator, "off");
+        input.include_speculator = true;
+        assert_eq!(file_args(input.clone(), target.path()).unwrap().speculator, "mtp");
+        input.no_speculator = true;
+        assert!(file_args(input, target.path()).is_err());
+        std::fs::create_dir(target.path().join("dflash")).unwrap();
+        let legacy = target.path().join("legacy.config");
+        std::fs::write(&legacy, "DFLASH=off\n").unwrap();
+        let mut input = args(target.path(), 4, false);
+        input.config = Some(legacy);
+        assert_eq!(file_args(input, target.path()).unwrap().speculator, "off");
+    }
+
+    #[test]
+    fn config_local_experts_and_spark_only_layout_match_launcher_requirements() {
+        use cuteafd_loader::plan::testing::*;
+        let target = tempfile::tempdir().unwrap();
+        write_snapshot(target.path(), &mimo_flash_config(), &mimo_flash_tensors(), None);
+        let config = target.path().join("launch.config");
+        std::fs::write(&config, "EXPERT_BACKEND=local\nSPARK_COUNT=4\nSPECULATOR=off\n").unwrap();
+        let mut input = args(target.path(), 4, false);
+        input.spark_ranks = None;
+        input.config = Some(config);
+        let effective = file_args(input, target.path()).unwrap();
+        assert_eq!(effective.spark_ranks, Some(0));
+        let role = cuteafd_loader::plan::files::ReadRole::parse("coordinator",
+            ExpertPlacement::from_spark_ranks(effective.spark_ranks.unwrap()), false).unwrap();
+        let manifest = cuteafd_loader::plan::files::manifest(target.path(), role).unwrap();
+        assert!(manifest.files.iter().any(|f| f.path.ends_with(".safetensors")));
+
+        let glm = tempfile::tempdir().unwrap();
+        write_snapshot(glm.path(), &glm5_config(), &[t("unused.weight", "BF16", &[2])], None);
+        let layout = glm.path().join("layout.json");
+        std::fs::write(&layout, r#"{"spark0":["spark0"],"head":["coordinator"]}"#).unwrap();
+        let mut input = args(glm.path(), 4, false);
+        input.file_layout = Some(layout);
+        input.host = Some("spark0".into());
+        let empty_cache = tempfile::tempdir().unwrap();
+        input.hf_home = Some(empty_cache.path().into());
+        assert!(file_args(input, glm.path()).unwrap().drafter_snapshot.is_none());
+    }
+
+    #[test]
+    fn no_speculator_rejects_drafter_in_a_file_layout() {
+        let target = tempfile::tempdir().unwrap();
+        write_snapshot(target.path(), &mimo_flash_config(), &mimo_flash_tensors(), None);
+        let layout = target.path().join("layout.json");
+        std::fs::write(&layout, r#"{"worker":["drafter"]}"#).unwrap();
+        let mut input = args(target.path(), 4, false);
+        input.files = true;
+        input.no_speculator = true;
+        input.file_layout = Some(layout);
+        assert!(run_plan(input).unwrap_err().to_string().contains("conflicts with drafter role"));
+    }
+
+    #[test]
+    fn bundled_inventory_contains_every_drafter_input_and_off_excludes_it() {
+        let target = tempfile::tempdir().unwrap();
+        write_snapshot(target.path(), &mimo_flash_config(), &mimo_flash_tensors(), None);
+        let draft = target.path().join("dflash");
+        std::fs::create_dir(&draft).unwrap();
+        for name in ["config.json", "mask_embedding.pt", "model.safetensors.index.json", "dflash_draft_model.safetensors", "dflash.py"] {
+            std::fs::write(draft.join(name), b"fixture").unwrap();
+        }
+        let automatic = file_args(args(target.path(), 4, false), target.path()).unwrap();
+        let roles = [cuteafd_loader::plan::files::ReadRole::Coordinator { local_experts: false, speculator: false }];
+        let mut manifest = cuteafd_loader::plan::files::manifest_roles(target.path(), &roles).unwrap();
+        attach_snapshots(&mut manifest, &roles, &automatic).unwrap();
+        for entry in std::fs::read_dir(&draft).unwrap() {
+            let relative = format!("dflash/{}", entry.unwrap().file_name().to_str().unwrap());
+            assert!(manifest.files.iter().any(|f| f.path == relative), "loader input missing: {relative}");
+        }
+        let mut input = args(target.path(), 4, false);
+        input.no_speculator = true;
+        let off = file_args(input, target.path()).unwrap();
+        let mut manifest = cuteafd_loader::plan::files::manifest_roles(target.path(), &roles).unwrap();
+        attach_snapshots(&mut manifest, &roles, &off).unwrap();
+        assert!(!manifest.files.iter().any(|f| f.path.starts_with("dflash/")));
     }
 
     #[test]

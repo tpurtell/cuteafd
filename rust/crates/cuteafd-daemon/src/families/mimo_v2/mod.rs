@@ -935,10 +935,7 @@ impl Opened {
                 let cfg = dflash::DflashConfig::read(dir)?;
                 ensure!(cfg.hidden == self.cfg.hidden && cfg.vocab == self.cfg.vocab_size
                     && cfg.taps.iter().all(|&l| l < self.cfg.layers), "the DFlash drafter does not fit this target");
-                let mask = match dflash::mask_embedding(dir, cfg.hidden)? {
-                    Some(row) => row,
-                    None => engine.embedding.host_rows(&[cfg.mask_token])?,
-                };
+                let mask = dflash::mask_embedding(dir, cfg.hidden)?;
                 let file = draft_file.context("drafter prefetch")?.join()
                     .map_err(|_| anyhow::anyhow!("drafter prefetch panicked"))??;
                 let capacity = args.draft_capacity(cfg.block)?;
