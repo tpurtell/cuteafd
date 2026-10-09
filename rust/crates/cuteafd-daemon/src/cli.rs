@@ -184,7 +184,7 @@ pub(crate) struct FabricArgs {
     pub(crate) p2p_bytes: Vec<usize>,
 }
 
-#[derive(Debug, Args)]
+#[derive(Debug, Clone, Args)]
 pub(crate) struct PlanArgs {
     #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..=6))]
     pub(crate) vision_replicas: u32,
@@ -229,6 +229,9 @@ pub(crate) struct PlanArgs {
     /// JSON host-to-role map, e.g. {"worker":["spark0","vision"]}.
     #[arg(long)]
     pub(crate) file_layout: Option<PathBuf>,
+    /// Maximum concurrent transfers when fetching the whole host layout.
+    #[arg(long, default_value_t = 2, value_parser = clap::value_parser!(u32).range(1..=16))]
+    pub(crate) fetch_parallel: u32,
     /// Copy this role's missing files with rdmasync or rsync; never delete.
     #[arg(long, requires = "destination")]
     pub(crate) fetch: bool,
@@ -236,6 +239,9 @@ pub(crate) struct PlanArgs {
     /// the local index/config used to inventory role requirements.
     #[arg(long, requires = "fetch")]
     pub(crate) source: Option<String>,
+    /// Forward the SSH agent to a source peer for peer-to-target copies.
+    #[arg(long, requires = "fetch")]
+    pub(crate) forward_agent: bool,
     /// Snapshot destination directory. Plain files are valid HF snapshot entries.
     #[arg(long)]
     pub(crate) destination: Option<PathBuf>,

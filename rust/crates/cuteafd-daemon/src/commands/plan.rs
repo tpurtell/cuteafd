@@ -99,11 +99,27 @@ pub(crate) fn run_plan(args: PlanArgs) -> Result<()> {
                 hosts.get(host).with_context(|| format!("host {host} is absent from {}", layout.display()))?
                     .iter().map(|name| parse(name)).collect::<Result<Vec<_>>>()?
             } else {
-                anyhow::ensure!(!args.fetch, "--file-layout --fetch needs --host");
                 let manifests = hosts.iter().map(|(host, names)| {
                     let roles = names.iter().map(|name| parse(name)).collect::<Result<Vec<_>>>()?;
                     Ok((host.clone(), manifest_roles(&snapshot, &roles)?))
                 }).collect::<Result<std::collections::BTreeMap<_, _>>>()?;
+                if args.fetch {
+                    let hosts: Vec<_> = manifests.into_iter().collect();
+                    for chunk in hosts.chunks(args.fetch_parallel as usize) {
+                        std::thread::scope(|scope| -> Result<()> {
+                            let handles: Vec<_> = chunk.iter().map(|(host, manifest)| {
+                                let mut host_args = args.clone();
+                                host_args.host = Some(host.clone());
+                                let snapshot = &snapshot;
+                                scope.spawn(move || transfer(snapshot, manifest, &host_args))
+                            }).collect();
+                            for handle in handles { handle.join().map_err(|_| anyhow::anyhow!("host transfer thread panicked"))??; }
+                            Ok(())
+                        })?;
+                    }
+                    eprintln!("layout: {} host transfers complete", hosts.len());
+                    return Ok(());
+                }
                 anyhow::ensure!(args.json, "all-host inventory needs --json; select --host for a plain file list");
                 println!("{}", serde_json::to_string_pretty(&manifests)?);
                 return Ok(());
@@ -184,7 +200,25 @@ fn transfer(snapshot: &std::path::Path, manifest: &cuteafd_loader::plan::files::
     use anyhow::ensure;
     use std::io::Write;
     use std::process::Command;
-    let (source_host, source_path) = source_location(args.source.as_deref(), snapshot)?;
+    let automatic = args.source.as_deref() == Some("auto");
+    let (source_host, source_path) = source_location(if automatic { None } else { args.source.as_deref() }, snapshot)?;
+    if automatic {
+        use std::process::Command;
+        let local = Command::new("hostname").arg("-s").output().ok()
+            .and_then(|o| String::from_utf8(o.stdout).ok()).map(|s| s.trim().to_owned());
+        let placement = manifest.repo_id.as_ref().and_then(|repo| {
+            let selector = format!("hf:{repo}{}", manifest.revision.as_ref().map(|r| format!("@{r}")).unwrap_or_default());
+            Command::new("nest").args(["where", &selector, "--json"]).output().ok()
+                .filter(|o| o.status.success()).and_then(|o| serde_json::from_slice::<serde_json::Value>(&o.stdout).ok())
+        });
+        let sealed = snapshot.starts_with("/mnt/sparknest") && placement.as_ref()
+            .and_then(|v| v["hosts"].as_array()).is_some_and(|hosts| hosts.iter().any(|host|
+                host["ready"] == true && host["host"].as_str() == local.as_deref()));
+        if sealed { eprintln!("source auto: sealed local sparknest copy at {}", snapshot.display()); }
+        else if snapshot.starts_with("/mnt/sparknest") {
+            eprintln!("source auto: no sealed local copy; streaming from sparknest at {}", snapshot.display());
+        } else { eprintln!("source auto: using local snapshot {} (no sparknest discovery)", snapshot.display()); }
+    }
     let destination = args.destination.as_ref().context("--fetch needs --destination")?;
     ensure!(destination.is_absolute(), "destination must be an absolute snapshot directory");
     let host = args.host.as_deref();
@@ -245,6 +279,7 @@ fn transfer(snapshot: &std::path::Path, manifest: &cuteafd_loader::plan::files::
         let remote = std::iter::once(program.to_string()).chain(command.get_args().map(|a| shell_quote(&a.to_string_lossy())))
             .collect::<Vec<_>>().join(" ");
         command = Command::new("ssh");
+        if args.forward_agent { command.arg("-A"); }
         command.args([peer, &remote]);
     }
     eprintln!("host {}: {} files, {bytes} bytes", host.unwrap_or("local"), selected.len());
@@ -252,7 +287,11 @@ fn transfer(snapshot: &std::path::Path, manifest: &cuteafd_loader::plan::files::
         let rendered = std::iter::once(command.get_program().to_string_lossy().into_owned()).chain(command.get_args().map(|a| shell_quote(&a.to_string_lossy())))
             .collect::<Vec<_>>().join(" ");
         println!("{rendered}");
-        for file in &selected { println!("{}\t{}", file.bytes.unwrap_or_default(), file.path); }
+        for file in &selected {
+            let size = manifest.files.iter().position(|entry| entry.path == file.path)
+                .and_then(|index| source_sizes[index]).context("selected source size")?;
+            println!("{size}\t{}", file.path);
+        }
         return Ok(());
     }
     if host.is_none() { std::fs::create_dir_all(destination)?; }
@@ -311,7 +350,7 @@ mod tests {
             spark_budget_gib: 100.0,
             coordinator_weight_budget_gib: 80.0,
             json: true,
-            files: false, role: None, host: None, file_layout: None, fetch: false, destination: None, source: None,
+            files: false, role: None, host: None, file_layout: None, fetch_parallel: 2, fetch: false, destination: None, source: None, forward_agent: false,
             dry_run: false, force: false, include_speculator: false,
             require_ready,
             layout: true,
