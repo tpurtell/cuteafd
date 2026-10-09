@@ -11,8 +11,8 @@ use serde_json::{json, Value};
 
 use crate::gateway::{Gateway, GatewayError};
 
-// Public rust-v0.161.0 gpt-6.1-sol metadata, without prompts, account/plan
-// marketing or paid provider tiers. Tool/protocol flags remain unchanged.
+// Public rust-v0.161.0 gpt-6.1-sol metadata and required instruction template,
+// without account/plan marketing or paid provider tiers.
 const TEMPLATE: &str = include_str!("codex-model-template.json");
 
 pub(super) fn document(gateway: &Gateway) -> Result<Value, GatewayError> {
@@ -50,7 +50,13 @@ pub(super) fn document(gateway: &Gateway) -> Result<Value, GatewayError> {
         });
         models.push(entry);
     }
-    Ok(json!({"models":models}))
+    let document = json!({"models":models});
+    if serde_json::to_vec(&document).unwrap().len() > 1024 * 1024 {
+        return Err(GatewayError::unsupported(
+            "Codex catalog exceeds its 1 MiB limit; advertise fewer model aliases",
+        ));
+    }
+    Ok(document)
 }
 
 pub(super) async fn get(State(gateway): State<Arc<Gateway>>) -> Response {

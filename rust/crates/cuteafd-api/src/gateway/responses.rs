@@ -116,6 +116,11 @@ fn snapshot(p: &parse::Parsed, fold: &render::Fold) -> Arc<Snapshot> {
         }
     }
     Arc::new(Snapshot {
+        root_response_id: p
+            .parent
+            .as_ref()
+            .map(|s| s.root_response_id.clone())
+            .unwrap_or_else(|| fold.response["id"].as_str().unwrap().into()),
         parent: p.parent.clone(),
         system: p.turn.system.clone(),
         items,

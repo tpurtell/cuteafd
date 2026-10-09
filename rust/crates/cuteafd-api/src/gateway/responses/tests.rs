@@ -633,6 +633,7 @@ fn response_document_eviction_is_atomic() {
     let sessions = crate::gateway::SessionStore::new(1);
     let snap = || {
         Arc::new(Snapshot {
+            root_response_id: "root".into(),
             parent: None,
             system: None,
             items: vec![],
@@ -983,4 +984,38 @@ async fn failed_response_marks_open_calls_incomplete() {
     assert!(!ev
         .iter()
         .any(|v| v["type"] == "response.function_call_arguments.done"));
+}
+
+#[tokio::test]
+async fn generated_input_id_reference_and_root_lineage() {
+    let (app, backend, gateway) = app(vec![vec![text("first"), done()], vec![done()]]);
+    let (_, body) = request(
+        &app,
+        "POST",
+        "/v1/responses",
+        json!({"model":"gpt-6.1-sol","input":"hello"}),
+    )
+    .await;
+    let response: Value = serde_json::from_str(&body).unwrap();
+    let id = response["id"].as_str().unwrap();
+    let (_, body) = request(
+        &app,
+        "GET",
+        &format!("/v1/responses/{id}/input_items"),
+        Value::Null,
+    )
+    .await;
+    let listing: Value = serde_json::from_str(&body).unwrap();
+    let (status,body)=request(&app,"POST","/v1/responses",json!({"model":"gpt-6.1-sol","previous_response_id":id,"input":[{"type":"item_reference","id":listing["data"][0]["id"]}]})).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(backend.turns()[1].items.len(), 3);
+    let next: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(
+        gateway
+            .sessions
+            .response(next["id"].as_str().unwrap())
+            .unwrap()
+            .root_response_id,
+        id
+    );
 }

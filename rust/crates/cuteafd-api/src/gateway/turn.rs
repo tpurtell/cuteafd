@@ -184,6 +184,7 @@ impl std::fmt::Debug for UsageHandle {
 /// Handles never affect equality of the turns that carry them.
 impl PartialEq for UsageHandle {
     fn eq(&self, _: &Self) -> bool { true }
+}
 
 
 /// Why generation stopped.
