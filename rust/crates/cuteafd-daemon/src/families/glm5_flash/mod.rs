@@ -217,6 +217,23 @@ pub(crate) struct EngineArgs {
     /// Unset/true: E4M3 single copy (measured faster); false keeps checkpoint BF16.
     #[arg(long, action = clap::ArgAction::Set)]
     pub draft_fp8: Option<bool>,
+    /// The drafter's vocabulary head over the target's BF16 head (DFlash2 and dSpark): `exact`
+    /// (default) as the target's own head: the few-row FP32 kernel up to 24 rows (one read of the
+    /// head per 8 rows), the pedantic FP32 cuBLAS GEMM on CUDA cores past them (128 rows at 16
+    /// sequences: 4.5 ms on an RTX 5090). `tensor`: one draft block (8 rows) as `exact`, two and
+    /// more as a BF16 tensor-core GEMM with FP32 accumulation, one read of the head. Drafts only:
+    /// the target verifies every proposal through its own head, which this leaves as it is. The
+    /// FP8 head (--fp8-head) runs its own program either way.
+    #[arg(long, value_enum, env = "CUTEAFD_GLMF_DRAFT_HEAD", default_value = "exact")]
+    pub draft_head: crate::families::glm5::DraftHead,
+    /// The FP8 drafter's GEMMs (DFlash2 and dSpark): `w8a16` (default: BF16 activations, exact
+    /// in f16, on the W8A16 GEMV in passes of 64 rows), `wide` (the same bits in passes of 128
+    /// rows: one read of the weights at 16 sequences), or `w8a8`: one draft block (8 rows) as
+    /// `w8a16`, more as E4M3 activations per row and 128-wide K block (amax / 448) on FP8 tensor
+    /// cores, half the MMAs, in passes of 128 rows. Drafts only: the target verifies every
+    /// proposal. The BF16 drafter (--draft-fp8 false) ignores it.
+    #[arg(long, value_enum, env = "CUTEAFD_GLMF_DRAFT_LINEAR", default_value = "w8a16")]
+    pub draft_linear: crate::shared::fp8_linear::Fp8Rows,
     /// Scale rule of the FP8 copies made from BF16 weights at load (KDA
     /// projections, LM head, drafter): amax / 448, the smallest power of two
     /// >= it (pow2), or per block whichever of the two leaves the smaller
@@ -351,6 +368,29 @@ mod draft_cli_tests {
     fn parse(extra: &[&str]) -> EngineArgs {
         Parse::try_parse_from(["test", "--snapshot", "/checkpoint", "--native-lib", "/native"].into_iter()
             .chain(extra.iter().copied())).unwrap().engine
+    }
+
+    /// `--draft-linear`: w8a16 by default (today's W8A16 GEMV), wide or w8a8 on request.
+    #[test]
+    fn draft_linear_defaults_to_w8a16_and_takes_wide_and_w8a8() {
+        use crate::shared::fp8_linear::Fp8Rows;
+        assert_eq!(parse(&[]).draft_linear, Fp8Rows::W8a16);
+        for (value, mode) in [("w8a16", Fp8Rows::W8a16), ("wide", Fp8Rows::Wide), ("w8a8", Fp8Rows::W8a8)] {
+            assert_eq!(parse(&["--draft-linear", value]).draft_linear, mode);
+        }
+        assert!(Parse::try_parse_from(["test", "--snapshot", "/checkpoint", "--native-lib", "/native",
+            "--draft-linear", "w4a16"]).is_err());
+    }
+
+    /// `--draft-head`: exact by default (the target's own head route), tensor on request.
+    #[test]
+    fn draft_head_defaults_to_exact_and_takes_tensor() {
+        use crate::families::glm5::DraftHead;
+        assert_eq!(parse(&[]).draft_head, DraftHead::Exact);
+        assert_eq!(parse(&["--draft-head", "exact"]).draft_head, DraftHead::Exact);
+        assert_eq!(parse(&["--draft-head", "tensor"]).draft_head, DraftHead::Tensor);
+        assert!(Parse::try_parse_from(["test", "--snapshot", "/checkpoint", "--native-lib", "/native",
+            "--draft-head", "fp8"]).is_err());
     }
 
     #[test]
@@ -905,6 +945,14 @@ pub(crate) struct GoldenArgs {
     /// reproduced (0: teacher-forced on tokens.bin, scoring against it).
     #[arg(long)]
     pub generate: Option<usize>,
+    /// With --draft: the draft-kernel A/B. After --prefill tokens (default 1024), windows of N
+    /// consecutive anchors draft in one step of N sequences (8N rows) under every --draft-head
+    /// and --draft-linear setting the drafter admits (load it with --draft-linear w8a8 for all
+    /// three linear modes), and each anchor alone, on the same teacher-forced contexts; prints the
+    /// drafts kept as a prefix of the text, identical drafts and step times per setting. Anchors
+    /// end at position 2048 (the ring's length).
+    #[arg(long)]
+    pub draft_modes: Option<usize>,
     /// Verify-by-replay check: after --prefill tokens, for every kept count k
     /// in 1..=N, require identical kept logits, KDA state, MLA rows and next
     /// decode when only the rejected suffix of the same N-row verify changes.
@@ -1600,8 +1648,11 @@ impl Opened {
             ::from_fp8_option(args.draft_fp8);
         let drafter = dspark::Drafter::load(&self.library, snapshot, stream,
             args.draft_context_slots.unwrap_or(20.max(args.draft_sequences)), args.draft_sequences,
-            embedding, self.cfg.hidden, self.cfg.vocab_size, self.cfg.layers, representation, args.fp8_scales)?;
-        tracing::info!(elapsed_ms = started.elapsed().as_millis() as u64, "{} drafter resident", drafter.name());
+            embedding, self.cfg.hidden, self.cfg.vocab_size, self.cfg.layers, representation, args.fp8_scales,
+            args.draft_linear)?;
+        drafter.set_draft_head(args.draft_head);
+        tracing::info!(elapsed_ms = started.elapsed().as_millis() as u64, draft_head = ?args.draft_head,
+            draft_linear = ?args.draft_linear, "{} drafter resident", drafter.name());
         Ok(Some(drafter))
     }
 
@@ -1782,6 +1833,9 @@ fn golden_run(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmfEngine<'_
         anyhow::ensure!(bytes.len() % 4 == 0, "padding check token bytes must be u32-aligned");
         let tokens: Vec<u32> = bytes.chunks_exact(4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).collect();
         return engine.check_decode_padding(&tokens);
+    }
+    if let Some(sequences) = args.draft_modes {
+        return speculate::draft_modes(args, engine, sequences);
     }
     if let Some(dir) = &args.draft_oracle {
         return speculate::draft_oracle(args, opened, engine, dir);

@@ -35,7 +35,7 @@ use cuteafd_loader::{read_safetensors_metadata, SafetensorsTensorMetadata};
 use cuteafd_loader::families::glm5::draft_representation::{
     GlmDraftCapacity, GlmDraftGeometry, GlmDraftRepresentation, GlmDraftRuntimeLayout,
 };
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::path::Path;
@@ -345,6 +345,13 @@ pub(crate) struct GlmDrafter<'a> {
     workspace: RefCell<Option<Workspace<'a>>>,
     representation: GlmDraftRepresentation,
     fp8_workspace: Option<Dev<'a>>,
+    /// How the borrowed BF16 head runs past one draft block ([`super::DraftHead`]; GLM 5.3
+    /// Flash's --draft-head). [`super::DraftHead::Exact`] unless the target sets it.
+    head_mode: Cell<super::DraftHead>,
+    /// How the FP8 GEMMs run (GLM 5.3 Flash's --draft-linear), and the latest mode the FP8
+    /// scratch was admitted for.
+    fp8_rows: Cell<fp8_linear::Fp8Rows>,
+    fp8_admitted: fp8_linear::Fp8Rows,
 }
 
 fn at(dev: &Dev<'_>, bytes: usize) -> *mut c_void {
@@ -471,11 +478,12 @@ impl<'a> GlmDrafter<'a> {
     /// Loads the drafter's weights from `file` (its safetensors bytes, see
     /// [`prefetch`]) and allocates `slots` ring contexts; draft steps take up
     /// to `max_sequences` sequences. `mask_row` is the target embedding of
-    /// the mask token.
+    /// the mask token. `fp8_rows` is how the FP8 GEMMs run (their scratch serves
+    /// it and the modes before it, see [`Self::set_draft_linear`]).
     #[allow(clippy::too_many_arguments)]
     pub fn load(library: &'a NativeLibrary, snapshot: &Path, file: Vec<u8>, stream: *mut c_void, slots: usize,
         max_sequences: usize, mask_row: Vec<u8>, row_window: bool, representation: GlmDraftRepresentation,
-        scales: fp8_linear::Fp8Scales) -> Result<Self> {
+        scales: fp8_linear::Fp8Scales, fp8_rows: fp8_linear::Fp8Rows) -> Result<Self> {
         let _memory_scope = cuteafd_ffi::memory_ledger::scope("drafter");
         let cfg = DflashConfig { row_window, ..DflashConfig::read(snapshot)? };
         let capacity = GlmDraftCapacity::new(slots, max_sequences, cfg.block)?;
@@ -501,7 +509,7 @@ impl<'a> GlmDrafter<'a> {
         let fp8_workspace = layout.fp8_scratch.as_ref().map(|scratch| {
             let shapes: Vec<_> = scratch.shapes.iter().map(|shape|
                 Ok((usize::try_from(shape.k)?, usize::try_from(shape.n)?))).collect::<Result<_>>()?;
-            fp8_linear::scratch(library, scratch.rows, &shapes)
+            fp8_linear::scratch_rows(library, scratch.rows, &shapes, fp8_rows)
         }).transpose()?;
         let tensor = |name: &str, shape: &[usize]| checkpoint.bytes(name, shape).and_then(upload);
         let concat = |parts: &[(&str, usize)], cols: usize| -> Result<Dev<'a>> {
@@ -588,8 +596,26 @@ impl<'a> GlmDrafter<'a> {
             workspace: RefCell::new(None),
             representation,
             fp8_workspace,
+            head_mode: Cell::new(super::DraftHead::Exact),
+            fp8_rows: Cell::new(fp8_rows),
+            fp8_admitted: fp8_rows,
             cfg,
         })
+    }
+
+    /// How the FP8 GEMMs run from now on: the load's mode or one before it (whose scratch the
+    /// load's covers). A BF16 drafter ignores it.
+    pub fn set_draft_linear(&self, mode: fp8_linear::Fp8Rows) -> Result<()> {
+        ensure!(mode <= self.fp8_admitted, "the DFlash2 FP8 scratch was admitted for {:?}, not {mode:?}",
+            self.fp8_admitted);
+        self.fp8_rows.set(mode);
+        Ok(())
+    }
+
+    /// How draft steps run the borrowed BF16 head from now on (a target's FP8 head launcher
+    /// ignores it).
+    pub fn set_draft_head(&self, mode: super::DraftHead) {
+        self.head_mode.set(mode);
     }
 
     /// `out` [rows,n] = `x` [rows,k] @ selected weight rows. This loaded
@@ -609,8 +635,10 @@ impl<'a> GlmDrafter<'a> {
             DraftWeight::Fp8(w) => {
                 let scratch = self.fp8_workspace.as_ref().context("FP8 DFlash scratch was not admitted")?;
                 // SAFETY: scratch covers every selected matrix and up to
-                // max(TAP_ROWS, max_batch_sequences*block) input rows.
-                unsafe { w.apply(self.library, x, out, false, rows, first, n, scratch, self.stream) }
+                // max(TAP_ROWS, max_batch_sequences*block) input rows in this
+                // mode (set_draft_linear keeps it within the admitted one).
+                unsafe { w.apply_rows(self.library, x, out, false, rows, first, n, scratch, self.stream,
+                    self.fp8_rows.get()) }
             }
         }
     }
@@ -866,8 +894,8 @@ impl<'a> GlmDrafter<'a> {
                     w.h.buffer.ptr, next, w.h.buffer.ptr, w.n.buffer.ptr, rows, block, h, group, eps, s)?;
             }
             match &head {
-                HeadCall::Bf16(weight) => super::launch_head(l, &w.head, w.n.buffer.ptr, *weight,
-                    w.logits.buffer.ptr.cast(), rows, h, c.vocab, s)?,
+                HeadCall::Bf16(weight) => super::launch_draft_head(l, &w.head, w.n.buffer.ptr, *weight,
+                    w.logits.buffer.ptr.cast(), rows, h, c.vocab, s, self.head_mode.get())?,
                 HeadCall::Launch(launch) => launch(w.n.buffer.ptr.cast_const(), w.logits.buffer.ptr.cast(), rows, s)?,
             }
             l.glm_dflash_topk(w.logits.buffer.ptr, w.unary.buffer.ptr, w.candidates.buffer.ptr,

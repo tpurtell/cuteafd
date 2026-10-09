@@ -338,12 +338,17 @@ mod tests {
     }
 }
 
+type HeadLaunchFn = unsafe extern "C" fn(*mut c_void, *const u16, *const u16, *mut f32, i32, *mut c_void) -> i32;
+
 /// cuBLAS vocabulary head at the model width with pedantic FP32 accumulation
-/// (the reference promotes the projection to FP32).
+/// (the reference promotes the projection to FP32); logits that need not
+/// follow it may take the tensor-op launch ([`VocabularyHead::launch_tensor_op`]).
 pub struct VocabularyHead<'a> {
     library: &'a NativeLibrary,
     handle: *mut c_void,
-    launch: unsafe extern "C" fn(*mut c_void, *const u16, *const u16, *mut f32, i32, *mut c_void) -> i32,
+    launch: HeadLaunchFn,
+    /// `cuteafd_vocabulary_head_launch_tensor_op`, when the native library has it.
+    launch_tensor_op: Option<HeadLaunchFn>,
 }
 
 /// Bytes of caller-owned cuBLAS workspace the head needs.
@@ -357,12 +362,13 @@ impl NativeLibrary {
         type Create = unsafe extern "C" fn(*mut c_void, u64, i32, i32, *mut *mut c_void) -> i32;
         let create = *unsafe { self.lib.get::<Create>(b"cuteafd_vocabulary_head_create") }?;
         let launch = *unsafe { self.lib.get(b"cuteafd_vocabulary_head_launch_width") }?;
+        let launch_tensor_op = unsafe { self.lib.get(b"cuteafd_vocabulary_head_launch_tensor_op") }.ok().map(|f| *f);
         let mut handle = std::ptr::null_mut();
         let status = unsafe {
             create(workspace, VOCABULARY_HEAD_WORKSPACE as u64, i32::try_from(width)?, i32::try_from(max_rows)?, &mut handle)
         };
         ensure!(status == 0, "vocabulary head creation failed with {status}");
-        Ok(VocabularyHead { library: self, handle, launch })
+        Ok(VocabularyHead { library: self, handle, launch, launch_tensor_op })
     }
 }
 
@@ -575,13 +581,14 @@ impl NativeLibrary {
         type Create = unsafe extern "C" fn(*mut c_void, u64, i32, i32, i32, *mut *mut c_void) -> i32;
         let create = *unsafe { self.lib.get::<Create>(b"cuteafd_vocabulary_head_create_vocab") }?;
         let launch = *unsafe { self.lib.get(b"cuteafd_vocabulary_head_launch_width") }?;
+        let launch_tensor_op = unsafe { self.lib.get(b"cuteafd_vocabulary_head_launch_tensor_op") }.ok().map(|f| *f);
         let mut handle = std::ptr::null_mut();
         let status = unsafe {
             create(workspace, VOCABULARY_HEAD_WORKSPACE as u64, i32::try_from(width)?, i32::try_from(max_rows)?,
                 i32::try_from(vocab)?, &mut handle)
         };
         ensure!(status == 0, "vocabulary head creation failed with {status}");
-        Ok(VocabularyHead { library: self, handle, launch })
+        Ok(VocabularyHead { library: self, handle, launch, launch_tensor_op })
     }
 }
 
@@ -593,6 +600,22 @@ impl VocabularyHead<'_> {
         stream: *mut c_void) -> Result<()> {
         let status = unsafe { (self.launch)(self.handle, input, weight, logits, i32::try_from(rows)?, stream) };
         ensure!(status == 0, "vocabulary head launch failed with {status}");
+        Ok(())
+    }
+
+    /// [`Self::launch`] as a BF16 tensor-core GEMM with FP32 accumulation and
+    /// FP32 logits, reading the head once for every row count. For logits that
+    /// need not follow the reference's FP32 promotion, such as a drafter's,
+    /// whose proposals the target verifies; the caller chooses.
+    ///
+    /// # Safety
+    /// As [`Self::launch`].
+    pub unsafe fn launch_tensor_op(&self, input: *const u16, weight: *const u16, logits: *mut f32, rows: u32,
+        stream: *mut c_void) -> Result<()> {
+        let launch = self.launch_tensor_op.context(
+            "this native library has no cuteafd_vocabulary_head_launch_tensor_op (rebuild it with this checkout)")?;
+        let status = unsafe { launch(self.handle, input, weight, logits, i32::try_from(rows)?, stream) };
+        ensure!(status == 0, "tensor-op vocabulary head launch of {rows} rows failed with {status}");
         Ok(())
     }
 }

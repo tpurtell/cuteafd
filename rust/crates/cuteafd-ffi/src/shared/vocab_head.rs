@@ -8,6 +8,10 @@ use std::ffi::c_void;
 /// wider heads stay on cuBLAS.
 pub const VOCAB_HEAD_ROWS_MAX: usize = 24;
 
+/// Rows one pass of [`NativeLibrary::vocab_head_rows`] takes (one read of the
+/// head; `kMaxRows` in `vocab_head_rows.cu`).
+pub const VOCAB_HEAD_ROWS_PASS: usize = 8;
+
 impl NativeLibrary {
     /// `logits` [rows, vocab] FP32 = `x` [rows, width] BF16 times `weight`
     /// [vocab, width]^T BF16, FP32 products and accumulation, in passes of 8
