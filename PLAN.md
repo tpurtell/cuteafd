@@ -2729,8 +2729,18 @@ V4.1 already runs dSpark there.
   layer. Terminal taps need rank 1's final FFN close, which every
   head-split engine skips today. Enable it when the drafter is on GPU1: one
   extra exchange per step at the last layer.
-- **Head.** Replicate the FP8 head on GPU1 (0.6-1.2 GiB) when the drafter is
-  there. If memory is short, shard the vocabulary instead, as V4.1 does.
+- **Head and embedding are solver-placed `Movable`s (TJ, 2026-10-09).**
+  Sizes (vocab x hidden, untied everywhere): head FP8 0.49-0.89 GiB,
+  embedding BF16 0.99-1.77 GiB (V4 Flash 129,280 x 4,096 ... GLM 5.3
+  154,880 x 6,144). Rules:
+  - Layer ranges, or GPU1 owning the last layers: the head lives on the
+    last-layer GPU with the drafter, the embedding on the first-layer GPU (or
+    host-mapped). No copy; at most one 4-6 KB hidden-row hop per step (~3 us)
+    when the final layer is on the other GPU.
+  - Head split on the final layers: shard the vocabulary across both GPUs,
+    ratio chosen by the solver (V4.1's uneven split for a cache target is
+    the precedent), one small argmax exchange.
+  - Never replicate the head unless both of the above lose on measured C1.
 - **Embedding.** Draft rows read the host-mapped embedding (one pinned copy),
   so no second device copy.
 - **Prefix state.** DFlash restores cold (`valid_from`), so nothing moves.
@@ -2971,8 +2981,9 @@ it only through its own gate, because fusing changes rounding.
    `max(context, 256K)`, with cards advertised only at ≥ 1M.
 4. **Qwen on 2 RTX.** Recommend layer ranges only (2M fits); no Qwen head
    split or unequal TP2 unless measured.
-5. **Draft head on GPU1.** Recommend replicating the FP8 head when the solver
-   has room, and the V4.1-style vocabulary shard only under pressure.
+5. **Draft head on GPU1.** Decided (TJ): no replica. The head goes with the
+   last layer and the drafter, the embedding with the first layer; shard the
+   vocabulary (solver-chosen ratio) under the head split.
 6. **Route mismatch.** Recommend falling back to broadcast routes with a
    warning, not refusing to start.
 7. **V4 Spark-free.** Recommend ranges at 2M with dSpark, rather than head
