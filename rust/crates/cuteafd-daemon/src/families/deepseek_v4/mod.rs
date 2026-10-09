@@ -303,8 +303,21 @@ pub(crate) fn with_engine<T>(
         let legacy_state = rank.fixed_state_bytes + rank.active_state_per_sequence_bytes * args.max_sequences as u64
             + rank.context_table_bytes_per_token * max_context as u64;
         let legacy_pool = rank.persistent_unit_bytes * 262_144u64.div_ceil(geometry.logical_unit_rows);
-        let expert_budget = usize::try_from(memory[0].baseline_free_bytes.saturating_sub(
-            legacy_state + legacy_pool + peer + shape.prefix_bytes.iter().sum::<u64>() + shape.reserve_bytes))?;
+        let expert_reserve = if cuteafd_core::serving_capacity::small_card_headroom_bytes(memory[0].total_bytes) > 0 {
+            // Use final admission's exact reservations before selecting experts;
+            // the legacy 10 GiB envelope would discard the small-card savings.
+            let profile = admission::profile(&geometry, &memory, &shape, 0)?;
+            let costs = &profile.devices[0];
+            let fixed = costs.reservations.iter().try_fold(0u64, |sum, r|
+                sum.checked_add(r.bytes).context("V4 expert fixed reserve overflow"))?;
+            fixed.checked_add(costs.pool_unit_bytes.checked_mul(
+                (if args.pool_tokens > 0 { args.pool_tokens as u64 } else { 262_144 })
+                    .div_ceil(geometry.logical_unit_rows)).context("V4 expert pool reserve overflow")?)
+                .context("V4 expert reserve overflow")?
+        } else {
+            legacy_state + legacy_pool + peer + shape.prefix_bytes.iter().sum::<u64>() + shape.reserve_bytes
+        };
+        let expert_budget = usize::try_from(memory[0].baseline_free_bytes.saturating_sub(expert_reserve))?;
         let stages = if args.dspark { cache_stages } else { 0 };
         let local = if args.skip_routed_experts { local::LocalPlan { layers: 0, peak_bytes: 0 } }
             else { local::plan(&loaded.library, &args.native_lib, &loaded.catalog, stages,

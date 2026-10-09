@@ -853,16 +853,38 @@ fn v4_workspace_plan_matches_runtime_below_compiled_context() {
     let scratch = deepseek_v4_workspace_scratch(&manifest, "dsv4f", 4096, 64).unwrap();
     let runtime = deepseek_v4_workspace_geometry(&cfg, 4096, 64,
         compiled_c128_width(&manifest, "dsv4f").unwrap() * 128, 1, scratch).unwrap();
-    for context in [16384, 32512, 131072] {
-        let report = plan(dir.path(), &PlanOptions { layout: Some(layout::LayoutOptions {
-            rtx_bytes: vec![96 << 30], context_tokens: context, pool_tokens: Some(32768),
-            workspace_manifest: Some(path.clone()), ..Default::default()
-        }), ..sparks(2) }).unwrap();
-        let steps = report.memory_layout.unwrap().devices[0].items.iter()
-            .find(|i| i.group == "steps").unwrap().clone();
-        let intake = 2 * 2 * 4096 * cfg.dim as u64 * 2;
-        assert_eq!((steps.bytes, steps.basis), (runtime[0].fixed_device_bytes + intake, Basis::Formula));
+    for gib in [31.8, 95.5] {
+        let total = cuteafd_core::serving_capacity::GpuMemoryBudget::from_gib(gib).unwrap().0;
+        for context in [16384, 32512, 131072] {
+            let report = plan(dir.path(), &PlanOptions { layout: Some(layout::LayoutOptions {
+                rtx_bytes: vec![total], context_tokens: context, pool_tokens: Some(32768),
+                workspace_manifest: Some(path.clone()), ..Default::default()
+            }), ..sparks(2) }).unwrap();
+            let device = report.memory_layout.unwrap().devices.remove(0);
+            let steps = device.items.iter().find(|i| i.group == "steps").unwrap();
+            let intake = 2 * 2 * 4096 * cfg.dim as u64 * 2;
+            assert_eq!((steps.bytes, steps.basis), (runtime[0].fixed_device_bytes + intake, Basis::Formula));
+            let graph = layout::family_costs("deepseek_v4").graph_bytes[0];
+            assert_eq!(total - device.capacity_bytes, crate::serving_capacity::deepseek_v4_headroom_bytes(
+                total, 10 << 30, steps.bytes, graph));
+        }
     }
+}
+
+#[test]
+fn v4_missing_workspace_manifest_keeps_conservative_small_card_reserve() {
+    use cuteafd_core::serving_capacity::GpuMemoryBudget;
+    let dir = v4_snapshot();
+    let total = GpuMemoryBudget::from_gib(31.8).unwrap().0;
+    let report = plan(dir.path(), &PlanOptions { layout: Some(layout::LayoutOptions {
+        rtx_bytes: vec![total], workspace_manifest: Some(dir.path().join("absent.json")),
+        ..Default::default()
+    }), ..sparks(2) }).unwrap();
+    let device = report.memory_layout.unwrap().devices.remove(0);
+    let workspace = device.items.iter().find(|i| i.group == "steps").unwrap().bytes;
+    let graph = layout::family_costs("deepseek_v4").graph_bytes[0];
+    assert_eq!(total - device.capacity_bytes,
+        (10u64 << 30).saturating_sub(workspace + graph).max(3 << 30));
 }
 
 #[test]

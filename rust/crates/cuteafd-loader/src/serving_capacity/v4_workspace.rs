@@ -6,6 +6,18 @@ use crate::families::deepseek_v4::DeepseekV4Config;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+/// Small cards reserve workspaces and graphs explicitly, with the shared
+/// free-memory floor. PRO cards retain the historical total reserve envelope.
+pub fn deepseek_v4_headroom_bytes(total_bytes: u64, reserve_bytes: u64, workspace_bytes: u64,
+    graph_bytes: u64) -> u64 {
+    let small = cuteafd_core::serving_capacity::small_card_headroom_bytes(total_bytes);
+    let remainder = reserve_bytes.saturating_sub(workspace_bytes.saturating_add(graph_bytes));
+    if small > 0 {
+        // Preserve larger caller-requested envelopes; only the default shrinks.
+        if reserve_bytes > 10 << 30 { small.max(remainder) } else { small }
+    } else { remainder.max(3 << 30) }
+}
+
 /// C128 rows use the stride baked into the exported sparse MLA program,
 /// independently of the explicit or pool-clamped serving context.
 pub fn compiled_c128_width(manifest: &Value, family: &str) -> Result<u64, CacheGeometryError> {
@@ -281,6 +293,25 @@ mod tests {
             0,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn small_card_headroom_keeps_exact_workspaces_and_pro_envelope() {
+        use cuteafd_core::serving_capacity::{GpuMemoryBudget, SMALL_CARD_HEADROOM_BYTES};
+        let reserve = 10 << 30;
+        let workspace = 4 << 30;
+        let graph = 400 << 20;
+        for gib in [31.8, 32.0] {
+            let total = GpuMemoryBudget::from_gib(gib).unwrap().0;
+            assert_eq!(deepseek_v4_headroom_bytes(total, reserve, workspace, graph),
+                SMALL_CARD_HEADROOM_BYTES);
+            assert_eq!(deepseek_v4_headroom_bytes(total, 20 << 30, workspace, graph),
+                (20 << 30) - workspace - graph);
+        }
+        let pro = GpuMemoryBudget::from_gib(95.5).unwrap().0;
+        assert_eq!(deepseek_v4_headroom_bytes(pro, reserve, workspace, graph),
+            reserve - workspace - graph);
+        assert_eq!(deepseek_v4_headroom_bytes(pro, reserve, 9 << 30, graph), 3 << 30);
     }
 
     #[test]
