@@ -813,6 +813,24 @@ fn read_glm_dsa_expert_catalog(snapshot: &Path, config: &serde_json::Value) -> R
 /// MTP experts under `mtp.layers.0`. The BF16 release fuses each layer's
 /// experts into `[512, ...]` tensors and NVIDIA's release is NVFP4: neither
 /// has an expert package.
+/// Official-format coordinator-local Qwen MTP experts. EXL3 remains on the
+/// complete catalog path until its per-projection metadata is role-filtered.
+pub fn read_qwen4_mtp_expert_catalog(snapshot: &Path, stages: usize) -> Result<OfficialV41Catalog> {
+    let config = crate::plan::checkpoint::read_json(&snapshot.join("config.json"))?;
+    if config["quantization_config"]["quant_method"] == "exl3" {
+        return read_qwen4_expert_catalog(snapshot, &config);
+    }
+    let cfg = crate::families::qwen4::Qwen4Config::from_hf(&config)?;
+    ensure!(stages > 0 && stages <= cfg.mtp_layers, "Qwen MTP role requests {stages} stages, config provides {}", cfg.mtp_layers);
+    let shape = RoutedExpertShape { layers: cfg.layers, first_layer: 0, experts: cfg.experts,
+        topk: cfg.topk, hidden: cfg.hidden, intermediate: cfg.moe_intermediate, draft_stages: 0, draft_experts: 0 };
+    let layers = (cfg.layers..cfg.layers + stages).collect();
+    let fp8 = crate::formats::fp8_experts::Fp8ExpertTensors::read_layers(snapshot, shape, &layers)?;
+    for layer in layers { fp8.for_layer(layer)?; }
+    Ok(OfficialV41Catalog { config: None, experts: shape, snapshot: snapshot.to_path_buf(), tensors: Vec::new(),
+        exl3: None, nvfp4: None, fp8: Some(fp8) })
+}
+
 fn read_qwen4_expert_catalog(snapshot: &Path, config: &serde_json::Value) -> Result<OfficialV41Catalog> {
     let cfg = crate::families::qwen4::Qwen4Config::from_hf(config)?;
     let shape = RoutedExpertShape {
