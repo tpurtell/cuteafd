@@ -88,10 +88,12 @@ struct RawConfig {
 }
 
 /// Whether `snapshot` holds a Speculators dSpark checkpoint.
-pub(crate) fn is_dspark(snapshot: &Path) -> bool {
-    std::fs::read(snapshot.join("config.json")).ok()
-        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
-        .is_some_and(|config| config["speculators_model_type"] == "dspark")
+pub(crate) fn is_dspark(snapshot: &Path) -> Result<bool> {
+    let path = snapshot.join("config.json");
+    let config: serde_json::Value = serde_json::from_slice(&std::fs::read(&path)
+        .with_context(|| format!("reading drafter {}", path.display()))?)
+        .with_context(|| format!("parsing drafter {}", path.display()))?;
+    Ok(config["speculators_model_type"] == "dspark")
 }
 
 /// The drafter geometry the kernels are written for, read from `config.json`.
@@ -792,11 +794,12 @@ impl<'a> Drafter<'a> {
         embedding: &TokenEmbedding<'_>, hidden: usize, vocab: usize, layers: usize,
         representation: GlmDraftRepresentation, scales: fp8_linear::Fp8Scales, fp8_rows: fp8_linear::Fp8Rows)
         -> Result<Self> {
-        if is_dspark(snapshot) {
+        if is_dspark(snapshot)? {
             let cfg = DsparkConfig::read(snapshot)?;
             ensure!(cfg.hidden == hidden && cfg.vocab == vocab && cfg.taps.iter().all(|&l| l < layers),
                 "the dSpark drafter does not fit this target");
             let mask = embedding.host_rows(&[cfg.mask_token])?;
+            tracing::info!(mask_source = "target mask_token row", mask_token = cfg.mask_token, "drafter mask source");
             let tensors = prefetch(snapshot).join().map_err(|_| anyhow::anyhow!("drafter read panicked"))??;
             return Ok(Self::Dspark(DsparkDrafter::load(library, snapshot, tensors, stream, slots,
                 sequences.min(MAX_SEQUENCES), mask, representation, scales, fp8_rows)?));
@@ -805,6 +808,7 @@ impl<'a> Drafter<'a> {
         ensure!(cfg.hidden == hidden && cfg.vocab == vocab && cfg.taps.iter().all(|&l| l < layers),
             "the DFlash2 drafter does not fit this target");
         let mask = embedding.host_rows(&[cfg.mask_token])?;
+        tracing::info!(mask_source = "target mask_token row", mask_token = cfg.mask_token, "drafter mask source");
         let file = crate::families::glm5::dflash::prefetch(snapshot).join()
             .map_err(|_| anyhow::anyhow!("drafter read panicked"))??;
         Ok(Self::Dflash2(crate::families::glm5::dflash::GlmDrafter::load(library, snapshot, file, stream, slots,
@@ -936,6 +940,14 @@ mod tests {
     use super::*;
 
     #[test]
+    fn drafter_detection_reports_missing_and_corrupt_config() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(is_dspark(dir.path()).unwrap_err().to_string().contains("config.json"));
+        std::fs::write(dir.path().join("config.json"), b"bad").unwrap();
+        assert!(is_dspark(dir.path()).unwrap_err().to_string().contains("parsing drafter"));
+    }
+
+    #[test]
     fn reads_the_redhat_config() {
         let dir = std::env::temp_dir().join(format!("cuteafd-dspark-config-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -950,7 +962,7 @@ mod tests {
             "num_hidden_layers": 5, "num_key_value_heads": 64, "rms_norm_eps": 1e-05,
             "rope_parameters": {"rope_theta": 10000.0, "rope_type": "default"}, "sliding_window": 2048,
             "vocab_size": 154880}}"#).unwrap();
-        assert!(is_dspark(&dir));
+        assert!(is_dspark(&dir).unwrap());
         let cfg = DsparkConfig::read(&dir).unwrap();
         std::fs::remove_dir_all(&dir).ok();
         assert_eq!(cfg.taps, vec![19, 27, 31, 35, 39, 43]);

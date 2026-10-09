@@ -379,9 +379,17 @@ pub(crate) fn prefetch(dir: &Path) -> std::thread::JoinHandle<std::io::Result<Ve
 /// The trained mask embedding (`mask_embedding.pt`: a torch zip whose
 /// `*/data/0` entry holds `hidden` BF16 values, stored uncompressed), found
 /// through the zip's central directory.
-pub(crate) fn mask_embedding(dir: &Path, hidden: usize) -> Result<Option<Vec<u8>>> {
+#[derive(Debug, thiserror::Error)]
+#[error("{path}: the drafter's trained mask_embedding.pt is required: {source}")]
+pub(crate) struct MaskEmbeddingReadError {
+    pub path: std::path::PathBuf,
+    #[source]
+    pub source: std::io::Error,
+}
+
+pub(crate) fn mask_embedding(dir: &Path, hidden: usize) -> Result<Vec<u8>> {
     let path = dir.join("mask_embedding.pt");
-    let Ok(bytes) = std::fs::read(&path) else { return Ok(None) };
+    let bytes = std::fs::read(&path).map_err(|source| MaskEmbeddingReadError { path: path.clone(), source })?;
     let u16_at = |o: usize| -> Result<usize> {
         Ok(usize::from(u16::from_le_bytes(bytes.get(o..o + 2).context("truncated zip")?.try_into().unwrap())))
     };
@@ -401,11 +409,75 @@ pub(crate) fn mask_embedding(dir: &Path, hidden: usize) -> Result<Option<Vec<u8>
             let data = local + 30 + u16_at(local + 26)? + u16_at(local + 28)?;
             ensure!(method == 0 && size == hidden * 2 && data + size <= bytes.len(),
                 "{}: expected {} stored bytes in {name}, found method {method} size {size}", path.display(), hidden * 2);
-            return Ok(Some(bytes[data..data + size].to_vec()));
+            tracing::info!(path = %path.display(), mask_source = "trained mask_embedding.pt", "drafter mask source");
+            return Ok(bytes[data..data + size].to_vec());
         }
         at += 46 + name_len + extra_len + comment_len;
     }
     anyhow::bail!("{}: no data/0 entry", path.display())
+}
+
+#[cfg(test)]
+mod mask_tests {
+    use super::*;
+    use std::io::Write;
+    use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn trained_mask_missing_is_typed_and_corrupt_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let error = mask_embedding(dir.path(), 2).unwrap_err();
+        let typed = error.downcast_ref::<MaskEmbeddingReadError>().unwrap();
+        assert_eq!(typed.path, dir.path().join("mask_embedding.pt"));
+        assert_eq!(typed.source.kind(), std::io::ErrorKind::NotFound);
+        assert!(error.to_string().contains("trained mask_embedding.pt is required"));
+        std::fs::write(&typed.path, b"corrupt").unwrap();
+        assert!(mask_embedding(dir.path(), 2).unwrap_err().to_string().contains("not a zip"));
+    }
+
+    #[derive(Clone)]
+    struct LogWriter(Arc<Mutex<Vec<u8>>>);
+    impl Write for LogWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+    }
+
+    #[test]
+    fn trained_mask_loads_and_logs_its_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let name = b"mask_embedding/data/0";
+        let data = [0u8, 0x3f, 0u8, 0x40];
+        let mut bytes = vec![0u8; 30];
+        bytes[..4].copy_from_slice(&0x0403_4b50u32.to_le_bytes());
+        bytes[26..28].copy_from_slice(&(name.len() as u16).to_le_bytes());
+        bytes.extend_from_slice(name);
+        bytes.extend_from_slice(&data);
+        let central = bytes.len() as u32;
+        let mut header = vec![0u8; 46];
+        header[..4].copy_from_slice(&0x0201_4b50u32.to_le_bytes());
+        header[20..24].copy_from_slice(&(data.len() as u32).to_le_bytes());
+        header[28..30].copy_from_slice(&(name.len() as u16).to_le_bytes());
+        bytes.extend_from_slice(&header);
+        bytes.extend_from_slice(name);
+        let mut end = vec![0u8; 22];
+        end[..4].copy_from_slice(&0x0605_4b50u32.to_le_bytes());
+        end[10..12].copy_from_slice(&1u16.to_le_bytes());
+        end[16..20].copy_from_slice(&central.to_le_bytes());
+        bytes.extend_from_slice(&end);
+        std::fs::write(dir.path().join("mask_embedding.pt"), bytes).unwrap();
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let sink = log.clone();
+        let subscriber = tracing_subscriber::fmt().without_time().with_ansi(false)
+            .with_writer(move || LogWriter(sink.clone())).finish();
+        tracing::subscriber::with_default(subscriber, || {
+            assert_eq!(mask_embedding(dir.path(), 2).unwrap(), data);
+        });
+        let log = String::from_utf8(log.lock().unwrap().clone()).unwrap();
+        assert!(log.contains("trained mask_embedding.pt") && log.contains("drafter mask source"), "{log}");
+    }
 }
 
 impl<'a> MimoDrafter<'a> {

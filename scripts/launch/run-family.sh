@@ -247,6 +247,10 @@ if [[ -z "$speculator" ]]; then
   elif [[ $family == deepseek_v4 && "$(get DSPARK off)" == on ]]; then speculator=dspark
   else speculator=off; fi
   [[ $speculator == off ]] || echo "warning: DRAFT_MODEL_ID/DFLASH/MTP/DSPARK are deprecated; use SPECULATOR=$speculator" >&2
+  if [[ $speculator == off && $family == glm5 && -z ${cfg[SPECULATOR]+set} ]]; then
+    speculator=dflash2 default_drafter=incoai/GLM-5.3-DFlash2
+    echo "note: GLM 5.3 drafts with DFlash2 ($default_drafter); SPECULATOR=off disables it" >&2
+  fi
   if [[ $speculator == off && $family == glm5_flash ]]; then
     read -r speculator default_drafter <<<"$(glm5_flash_speculator "$model")"
     if [[ -d "$hub/models--${default_drafter//\//--}" ]]; then

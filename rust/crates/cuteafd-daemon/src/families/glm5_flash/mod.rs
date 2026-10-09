@@ -1186,7 +1186,7 @@ pub(crate) fn open(args: &EngineArgs) -> Result<Opened> {
             .context("DFlash target has no lm_head.weight")?;
         // The drafter borrows the target's one head: BF16, or the FP8 head made from it.
         crate::families::glm5::dflash::check_target_head_source(&head.meta, cfg.hidden, cfg.vocab_size)?;
-        if dspark::is_dspark(snapshot) {
+        if dspark::is_dspark(snapshot)? {
             dspark::check_checkpoint(snapshot, cfg.hidden, cfg.vocab_size, cfg.layers)?;
         } else {
             crate::families::glm5::dflash::check_checkpoint(snapshot, args.draft_fp8,

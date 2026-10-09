@@ -145,7 +145,7 @@ pub(crate) async fn run_serve(args: ServeArgs) -> Result<()> {
     let (worker_stats, max_sequences, decode_share) = (stats.clone(), args.max_sequences, args.decode_share);
     let policy = Policy { copy: if args.no_copy_drafts { 0 } else { COPY_DRAFT }, fixed: args.draft_fixed };
     let prefix = args.prefix.clone();
-    let hub = console::hub(args.console.console_text, || Ok(console_layout(&args, &profile.id)));
+    let hub = console::hub(args.console.console_text, || console_layout(&args, &profile.id));
     let vision = args.vision;
     let remote = super::media::RemoteVision::from_args(&args)?;
     let media_cache_bytes = args.media_cache_bytes;
@@ -172,7 +172,7 @@ pub(crate) async fn run_serve(args: ServeArgs) -> Result<()> {
 }
 
 /// What the live console shows for GLM 5.3 Flash.
-fn console_layout(args: &ServeArgs, model: &str) -> console::Layout {
+fn console_layout(args: &ServeArgs, model: &str) -> Result<console::Layout> {
     use console::{Color::*, StepGroup};
     let mut layout = console::Layout::new("glm5_flash", model.into(), args.engine.snapshot.clone());
     let sparks = args.engine.peers.as_deref().map_or(0, |peers| peers.split(',').count());
@@ -183,7 +183,8 @@ fn console_layout(args: &ServeArgs, model: &str) -> console::Layout {
     let copy = if args.no_copy_drafts { "" } else { " · copy windows" };
     let policy = args.draft_fixed.map_or_else(|| "adaptive".to_string(), |n| format!("fixed {n}"));
     let drafter = args.engine.draft.as_deref()
-        .map(|snapshot| if super::dspark::is_dspark(snapshot) { "dSpark" } else { "DFlash2" });
+        .map(|snapshot| super::dspark::is_dspark(snapshot).map(|dspark| if dspark { "dSpark" } else { "DFlash2" }))
+        .transpose()?;
     layout.speculator = match (drafter, args.no_copy_drafts) {
         (Some(name), _) => Some(console::Speculator { name: name.into(), positions: 8, policy: policy + copy }),
         (None, false) => Some(console::Speculator { name: "Copy window".into(), positions: COPY_DRAFT,
@@ -202,7 +203,7 @@ fn console_layout(args: &ServeArgs, model: &str) -> console::Layout {
         StepGroup::admission(false),
     ];
     layout.layers = Some(console::Layers::host_clock());
-    layout
+    Ok(layout)
 }
 
 type VisionReady = Option<(Arc<cuteafd_api::openai::media::MediaPreparer>, Option<Arc<std::sync::atomic::AtomicBool>>)>;

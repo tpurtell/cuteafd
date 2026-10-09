@@ -97,25 +97,61 @@ pub fn manifest_roles(snapshot: &Path, roles: &[ReadRole]) -> Result<FileManifes
     let inventory = Checkpoint::inventory(snapshot)?;
     let mut tensors = BTreeSet::new();
     for role in roles { tensors.extend(required_tensors(&inventory, *role)?); }
-    let files: BTreeSet<String> = tensors.iter().filter_map(|name| inventory.weight_map.get(name).cloned()).collect();
+    let mut files: BTreeSet<String> = tensors.iter().filter_map(|name| inventory.weight_map.get(name).cloned()).collect();
+    if roles.iter().any(|r| matches!(r, ReadRole::Drafter | ReadRole::Coordinator { speculator: true, .. })) {
+        // Native speculators read calibrated confidence files by numerical key.
+        for entry in std::fs::read_dir(snapshot)? {
+            let entry = entry?;
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if entry.path().is_file() && name.starts_with("draft-confidence.") && name.ends_with(".json") {
+                files.insert(name);
+            }
+        }
+    }
+    if roles.contains(&ReadRole::Audio) && snapshot.join("audio_tokenizer").is_dir() {
+        collect_directory(snapshot, &snapshot.join("audio_tokenizer"), &mut files)?;
+    }
     manifest_from_files(snapshot, roles.iter().map(|r| r.label()).collect::<Vec<_>>().join(", "), files)
 }
 
 /// Standalone drafters/encoders have their own config and naming convention;
 /// their complete index is required, without pretending they are text families.
 pub fn manifest_standalone(snapshot: &Path, role: &str) -> Result<FileManifest> {
-    let inventory = Checkpoint::inventory(snapshot)?;
-    manifest_from_files(snapshot, role.into(), inventory.weight_map.values().cloned().collect())
+    // A standalone model's own loaders may open trained vectors or other
+    // auxiliary payloads, not just entries in a safetensors weight map.
+    let mut files = BTreeSet::new();
+    collect_directory(snapshot, snapshot, &mut files)?;
+    manifest_from_files(snapshot, role.into(), files)
+}
+
+pub fn include_directory(manifest: &mut FileManifest, snapshot: &Path, directory: &str) -> Result<()> {
+    let mut files = manifest.files.iter().map(|f| f.path.clone()).collect();
+    collect_directory(snapshot, &snapshot.join(directory), &mut files)?;
+    *manifest = manifest_from_files(snapshot, manifest.role.clone(), files)?;
+    Ok(())
+}
+
+fn collect_directory(root: &Path, directory: &Path, files: &mut BTreeSet<String>) -> Result<()> {
+    for entry in std::fs::read_dir(directory).with_context(|| format!("inventory {}", directory.display()))? {
+        let path = entry?.path();
+        if path.is_dir() { collect_directory(root, &path, files)?; }
+        else if path.is_file() {
+            files.insert(path.strip_prefix(root)?.to_str().context("non-UTF8 inventory path")?.to_owned());
+        }
+    }
+    Ok(())
 }
 
 fn manifest_from_files(snapshot: &Path, role: String, mut files: BTreeSet<String>) -> Result<FileManifest> {
-    for entry in std::fs::read_dir(snapshot)? {
-        let entry = entry?;
-        let name = entry.file_name().to_string_lossy().into_owned();
-        if entry.path().is_file() && (name.ends_with(".json") || name.ends_with(".jinja")
-            || name.ends_with(".model") || name == "merges.txt" || name == "vocab.txt") {
-            files.insert(name);
-        }
+    // Named inputs opened by checkpoint, tokenizer, template and processor
+    // loaders. Weight shards remain role-filtered by the checkpoint index.
+    for name in ["config.json", "model.safetensors.index.json", "generation_config.json",
+        "quantize_config.json", "quantization_config.json", "hf_quant_config.json",
+        "tokenizer.json", "tokenizer_config.json", "special_tokens_map.json", "added_tokens.json",
+        "tokenizer.model", "spiece.model", "merges.txt", "vocab.txt", "vocab.json",
+        "chat_template.jinja", "preprocessor_config.json", "processor_config.json",
+        "chat_template.json", "inference/config.json"] {
+        if snapshot.join(name).is_file() { files.insert(name.into()); }
     }
     let files: Vec<_> = files.into_iter().map(|path| {
         let bytes = std::fs::metadata(snapshot.join(&path)).ok().filter(|m| m.is_file()).map(|m| m.len());
@@ -135,6 +171,64 @@ fn manifest_from_files(snapshot: &Path, role: String, mut files: BTreeSet<String
 mod tests {
     use super::*;
     use crate::plan::testing::{mimo_flash_config, mimo_flash_tensors, write_safetensors};
+
+    #[test]
+    fn all_family_loader_inputs_are_in_the_role_inventory() {
+        use crate::plan::testing::*;
+        let v41: serde_json::Value = serde_json::from_str(include_str!("../families/deepseek_v41/official-v41-config.json")).unwrap();
+        let mut v4 = v41.clone();
+        v4["architectures"] = serde_json::json!(["DeepseekV4ForCausalLM"]);
+        v4["model_type"] = serde_json::json!("deepseek_v4");
+        // Use real family geometry fixtures; each role's filtered loader must
+        // open only shards the manifest lists, including native speculation.
+        for config in [mimo_flash_config(), glm5_config(), glm5_flash_config(2), qwen4_config(4), v41, v4] {
+            let dir = tempfile::tempdir().unwrap();
+            write_snapshot(dir.path(), &config, &[t("lm_head.weight", "BF16", &[2]), t("norm.weight", "BF16", &[2])], None);
+            if config["model_type"] == "deepseek_v4" {
+                std::fs::create_dir(dir.path().join("inference")).unwrap();
+                std::fs::write(dir.path().join("inference/config.json"), serde_json::json!({
+                    "vocab_size": 64, "dim": 128, "moe_inter_dim": 128, "n_layers": 2,
+                    "n_heads": 2, "n_routed_experts": 4, "n_shared_experts": 1,
+                    "n_activated_experts": 2, "score_func": "sqrtsoftplus", "route_scale": 1.5,
+                    "swiglu_limit": 10.0, "q_lora_rank": 128, "head_dim": 128, "rope_head_dim": 64,
+                    "o_groups": 1, "o_lora_rank": 128, "window_size": 128, "compress_ratios": [0,4],
+                    "compress_rope_theta": 160000, "original_seq_len": 65536, "rope_theta": 10000,
+                    "rope_factor": 16, "beta_fast": 32, "beta_slow": 1,
+                    "index_n_heads": 2, "index_head_dim": 128, "index_topk": 512,
+                    "hc_mult": 4, "hc_sinkhorn_iters": 20
+                }).to_string()).unwrap();
+            }
+            for name in ["tokenizer.json", "tokenizer_config.json", "chat_template.jinja", "preprocessor_config.json", "generation_config.json"] {
+                std::fs::write(dir.path().join(name), b"{}").unwrap();
+            }
+            let roles = [ReadRole::Coordinator { local_experts: true, speculator: true }, ReadRole::Vision, ReadRole::Audio];
+            let manifest = manifest_roles(dir.path(), &roles).unwrap();
+            let listed: BTreeSet<_> = manifest.files.iter().map(|f| f.path.as_str()).collect();
+            for role in roles {
+                for tensor in open_role(dir.path(), role).unwrap().tensors {
+                    assert!(listed.contains(tensor.shard.as_str()), "loader input missing: {}", tensor.shard);
+                }
+            }
+            for name in ["config.json", "model.safetensors.index.json", "tokenizer.json", "tokenizer_config.json", "chat_template.jinja", "preprocessor_config.json", "generation_config.json"] {
+                assert!(listed.contains(name), "loader input missing: {name}");
+            }
+        }
+    }
+
+    #[test]
+    fn standalone_glm_and_glmf_include_all_auxiliary_inputs() {
+        for architecture in ["DFlash2DraftModel", "DSparkDraftModel"] {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join("config.json"), serde_json::json!({"architectures":[architecture]}).to_string()).unwrap();
+            std::fs::write(dir.path().join("model.safetensors"), b"fixture").unwrap();
+            std::fs::write(dir.path().join("draft-confidence.fp8-w8a16-r1.json"), b"{}").unwrap();
+            let manifest = manifest_standalone(dir.path(), "drafter").unwrap();
+            for entry in std::fs::read_dir(dir.path()).unwrap() {
+                let name = entry.unwrap().file_name().to_string_lossy().into_owned();
+                assert!(manifest.files.iter().any(|f| f.path == name), "loader input missing: {name}");
+            }
+        }
+    }
 
     #[test]
     fn mimo_coordinator_ignores_expert_and_disabled_tower_shards() {

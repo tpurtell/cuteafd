@@ -253,9 +253,18 @@ pub(crate) struct PlanArgs {
     /// Replace matching-size files too.
     #[arg(long, requires = "fetch")]
     pub(crate) force: bool,
-    /// Include native MTP/drafter tensors in coordinator file requirements.
+    /// Serving KEY=VALUE config whose speculator and media settings to inventory.
     #[arg(long)]
+    pub(crate) config: Option<PathBuf>,
+    /// Speculator to inventory (auto selects the family's release default).
+    #[arg(long, default_value = "auto", value_parser = ["auto", "off", "mtp", "dflash2", "dspark"])]
+    pub(crate) speculator: String,
+    /// Explicitly include speculator inputs, even when the config disables them.
+    #[arg(long, conflicts_with = "no_speculator")]
     pub(crate) include_speculator: bool,
+    /// Inventory a slice served with speculation disabled.
+    #[arg(long, conflicts_with_all = ["include_speculator", "drafter_snapshot"])]
+    pub(crate) no_speculator: bool,
     /// Separately configured drafter checkpoint to include in JSON inventory.
     #[arg(long)]
     pub(crate) drafter_snapshot: Option<PathBuf>,
