@@ -303,7 +303,7 @@ impl Fold {
                     let kind = self.response["output"][i]["type"].as_str().unwrap();
                     if matches!(
                         stop,
-                        StopReason::MaxTokens | StopReason::Cancelled | StopReason::Refusal
+                        StopReason::MaxTokens | StopReason::Cancelled | StopReason::ContentFilter
                     ) && !self.finished.contains(&i)
                         && matches!(
                             kind,
@@ -322,7 +322,7 @@ impl Fold {
                 }
                 let (status, reason) = match stop {
                     StopReason::MaxTokens => ("incomplete", Some("max_output_tokens")),
-                    StopReason::Refusal => ("incomplete", Some("content_filter")),
+                    StopReason::ContentFilter => ("incomplete", Some("content_filter")),
                     StopReason::Cancelled => ("incomplete", Some("steered")),
                     _ => ("completed", None),
                 };

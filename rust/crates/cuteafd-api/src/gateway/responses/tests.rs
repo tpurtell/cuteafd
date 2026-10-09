@@ -460,12 +460,16 @@ async fn count_and_compaction_roundtrip() {
         &app,
         "POST",
         "/v1/responses/compact",
-        json!({"model":"gpt-5","input":"task"}),
+        json!({"model":"gpt-5","input":"task","tools":[{"type":"function","name":"f","parameters":{}}],"tool_choice":{"type":"function","name":"f"}}),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
     let v: Value = serde_json::from_str(&body).unwrap();
     assert_eq!(v["object"], "response.compaction");
+    assert_eq!(
+        backend.turns()[0].tool_choice,
+        crate::gateway::turn::ToolChoice::None
+    );
     let (status, _) = request(
         &app,
         "POST",
@@ -544,10 +548,10 @@ async fn hosted_search_events_and_stored_result() {
         &app,
         "POST",
         "/v1/responses",
-        json!({"model":"gpt-6.1-sol","previous_response_id":response["id"],"input":"continue"}),
+        json!({"model":"gpt-6.1-sol","previous_response_id":response["id"],"input":[{"type":"item_reference","id":response["output"][0]["id"]}]}),
     )
     .await;
-    assert!(backend.turns()[2].items.iter().any(|i| matches!(i,Item::ServerToolResult { output,.. } if output["results"][0]["content"] == "fact")));
+    assert_eq!(backend.turns()[2].items.iter().filter(|i| matches!(i,Item::ServerToolResult { output,.. } if output["results"][0]["content"] == "fact")).count(),2);
 }
 
 #[tokio::test]
@@ -666,7 +670,7 @@ async fn truncated_calls_content_filter_and_typed_error() {
         vec![
             text("filtered"),
             TurnEvent::Done {
-                stop: StopReason::Refusal,
+                stop: StopReason::ContentFilter,
             },
         ],
         vec![],
@@ -852,4 +856,53 @@ async fn websocket_disconnect_cancels_pending_backend_start() {
     .await
     .unwrap();
     server.abort();
+}
+
+#[tokio::test]
+async fn open_function_cutoff_and_ordinary_refusal() {
+    let (app, _, _) = app(vec![
+        vec![
+            call(0, "c", "f"),
+            delta(0, r#"{"x":1}"#),
+            TurnEvent::Usage {
+                usage: Default::default(),
+            },
+            TurnEvent::Done {
+                stop: StopReason::MaxTokens,
+            },
+        ],
+        vec![
+            text("I cannot do that"),
+            TurnEvent::Done {
+                stop: StopReason::Refusal,
+            },
+        ],
+    ]);
+    let (_, body) = request(
+        &app,
+        "POST",
+        "/v1/responses",
+        json!({"model":"gpt-6.1-sol","stream":true}),
+    )
+    .await;
+    let ev = events(&body);
+    assert_eq!(ev.last().unwrap()["type"], "response.incomplete");
+    assert_eq!(
+        ev.last().unwrap()["response"]["output"][0]["status"],
+        "incomplete"
+    );
+    assert!(!ev
+        .iter()
+        .any(|v| v["type"] == "response.function_call_arguments.done"));
+    let (_, body) = request(
+        &app,
+        "POST",
+        "/v1/responses",
+        json!({"model":"gpt-6.1-sol"}),
+    )
+    .await;
+    assert_eq!(
+        serde_json::from_str::<Value>(&body).unwrap()["status"],
+        "completed"
+    );
 }
