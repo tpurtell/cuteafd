@@ -7,11 +7,13 @@ use futures::StreamExt;
 use super::backend::TurnStream;
 use super::error::GatewayError;
 use super::search::{self, SearchQuery};
-use super::turn::{Item, Part, Role, StopReason, TurnEvent, TurnRequest, Usage};
+use super::turn::{Item, Part, Role, StopReason, ToolChoice, TurnEvent, TurnRequest, Usage};
 use super::Gateway;
 
-/// Hosted-search rounds per turn when the client sets no `max_uses`.
+/// Hosted searches per turn when the client sets no `max_uses`.
 const DEFAULT_SEARCH_ROUNDS: u32 = 5;
+/// Backend rounds per turn in the hosted-tool loop, whatever the model does.
+const MAX_HOSTED_ROUNDS: u32 = 16;
 
 struct PendingCall { id: String, name: String, arguments: String, hosted: bool, out_index: Option<usize> }
 
@@ -97,7 +99,7 @@ pub(super) async fn run(gateway: Arc<Gateway>, mut turn: TurnRequest) -> Result<
                     .unwrap_or_else(|_| serde_json::json!({"query": call.arguments}));
                 let query = input.get("query").and_then(|q| q.as_str()).unwrap_or_default().to_string();
                 yield Ok(TurnEvent::ServerToolCall { id: call.id.clone(), name: call.name.clone(), input: input.clone() });
-                let output = if rounds >= max_rounds {
+                let output = if total.web_search_requests >= max_rounds {
                     serde_json::json!({"error": "max_uses_exceeded"})
                 } else if query.trim().is_empty() {
                     serde_json::json!({"error": "invalid_input"})
@@ -117,6 +119,22 @@ pub(super) async fn run(gateway: Arc<Gateway>, mut turn: TurnRequest) -> Result<
                 turn.items.push(Item::ServerToolResult { call_id: call.id.clone(), name: call.name.clone(), output });
             }
             rounds += 1;
+            // A forced tool choice applies to the first call only (as with
+            // Anthropic's server tools); continuations let the model answer.
+            // Once searches are exhausted, stop offering the tool so the
+            // model must answer from what it has.
+            if matches!(turn.tool_choice, ToolChoice::Required | ToolChoice::Named { .. }) {
+                turn.tool_choice = ToolChoice::Auto;
+            }
+            if total.web_search_requests >= max_rounds || rounds >= MAX_HOSTED_ROUNDS {
+                turn.tools.retain(|tool| tool.name != search::TOOL_NAME);
+                if turn.tools.is_empty() { turn.tool_choice = ToolChoice::Auto; }
+            }
+            if rounds > MAX_HOSTED_ROUNDS {
+                yield Ok(TurnEvent::Usage { usage: total });
+                yield Ok(TurnEvent::Done { stop: StopReason::PauseTurn });
+                return;
+            }
             if client_calls {
                 // The client must run its own calls before the model continues.
                 yield Ok(TurnEvent::Usage { usage: total });
@@ -206,5 +224,51 @@ mod tests {
         let out: Vec<_> = seal_tool_calls(Box::pin(stream::iter(with_error))).collect().await;
         assert!(out.iter().all(|e| !matches!(e, Ok(TurnEvent::ToolCallEnd { .. }))));
         assert!(matches!(out.last(), Some(Err(_))));
+    }
+}
+
+#[cfg(test)]
+mod hosted_tests {
+    use super::*;
+    use crate::gateway::{models::ModelMap, search::{SearchHit, SearchProvider, SearchQuery}, testing::Scripted, turn::WebSearchSpec, Gateway};
+    use futures::future::BoxFuture;
+
+    struct Fixed;
+    impl SearchProvider for Fixed {
+        fn name(&self) -> &str { "fixed" }
+        fn search(&self, _: SearchQuery) -> BoxFuture<'static, Result<Vec<SearchHit>, GatewayError>> {
+            Box::pin(async { Ok(vec![SearchHit { url: "https://example.org".into(), title: "t".into(), content: "c".into(), published: None }]) })
+        }
+    }
+
+    fn search_round(id: &str) -> Vec<TurnEvent> {
+        vec![TurnEvent::ToolCallStart { index: 0, id: id.into(), name: search::TOOL_NAME.into() },
+            TurnEvent::ToolCallDelta { index: 0, arguments: "{\"query\":\"q\"}".into() },
+            TurnEvent::ToolCallEnd { index: 0 }, TurnEvent::Done { stop: StopReason::ToolUse }]
+    }
+
+    /// Live Claude Code run (2026-10-09): its WebSearch subagent forces the
+    /// search tool; repeating the forced choice on every continuation looped
+    /// for ~300 rounds. Forcing applies to the first call; `max_uses` bounds
+    /// searches; the tool is withdrawn once they're spent.
+    #[tokio::test]
+    async fn forced_search_relaxes_and_max_uses_withdraws_the_tool() {
+        let mut scripts: Vec<Vec<TurnEvent>> = (0..3).map(|i| search_round(&format!("s{i}"))).collect();
+        scripts.push(vec![TurnEvent::TextDelta { text: "answer".into() }, TurnEvent::Done { stop: StopReason::EndTurn }]);
+        let backend = Scripted::new(scripts);
+        let gateway = Arc::new(Gateway::new(Arc::new(backend.clone()), ModelMap::single("served-model")).with_search(Arc::new(Fixed)));
+        let turn = TurnRequest { requested_model: "served-model".into(), tool_choice: ToolChoice::Named { name: search::TOOL_NAME.into() },
+            hosted: crate::gateway::turn::HostedTools { web_search: Some(WebSearchSpec { name: "web_search".into(), max_uses: Some(2), ..Default::default() }) },
+            ..Default::default() };
+        let events: Vec<TurnEvent> = gateway.run(turn).await.unwrap().map(Result::unwrap).collect().await;
+        assert!(matches!(events.last(), Some(TurnEvent::Done { stop: StopReason::EndTurn })));
+        let seen = backend.turns();
+        assert_eq!(seen.len(), 4);
+        assert!(matches!(seen[0].tool_choice, ToolChoice::Named { .. }));
+        assert!(seen[1..].iter().all(|t| t.tool_choice == ToolChoice::Auto), "forcing applies to the first call only");
+        assert!(seen[1].tools.iter().any(|t| t.name == search::TOOL_NAME));
+        assert!(seen[3].tools.iter().all(|t| t.name != search::TOOL_NAME), "tool withdrawn after max_uses");
+        let usage = events.iter().rev().find_map(|e| if let TurnEvent::Usage { usage } = e { Some(*usage) } else { None }).unwrap();
+        assert_eq!(usage.web_search_requests, 2, "third search answered max_uses_exceeded, not executed");
     }
 }
