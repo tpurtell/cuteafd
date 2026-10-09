@@ -95,9 +95,20 @@ fn link(dir: &Path, file: &str) -> String {
 /// Family display order.
 const FAMILIES: [&str; 6] = ["deepseek_v41", "deepseek_v4", "glm5", "glm5_flash", "mimo_v2", "qwen4"];
 
-/// The newest basic-profile report per family, checkpoint and reference hardware, in
-/// family order, then checkpoint, 5090, one RTX, then two RTX.
-fn reference_rows(placed: &[Placed]) -> Vec<(String, String, u8, &Placed)> {
+fn layout_label(p: &Placed) -> Option<&str> {
+    p.dir.file_name()?.to_str()?.rsplit_once(&p.report.server.hardware.slug())
+        .map(|(_, label)| label.trim_start_matches('-')).filter(|label| !label.is_empty())
+}
+
+// Smoke matrix entry names are appended by cli::labeled_dir, not stored in report.id.
+fn reference_layout(p: &Placed) -> Option<u8> {
+    let name = p.dir.file_name()?.to_str()?;
+    if name.ends_with("-min") { Some(1) }
+    else if name.ends_with("-max") { Some(2) }
+    else { None }
+}
+
+fn basic_groups(placed: &[Placed]) -> BTreeMap<(usize, String, String), Vec<&Placed>> {
     // The newest basic-profile report per family, checkpoint and hardware (`placed`
     // is newest first), on the reference layouts (one or two RTX, Sparks or none).
     // A qualified replacement can retire a checkpoint from current cards without
@@ -128,15 +139,25 @@ fn reference_rows(placed: &[Placed]) -> Vec<(String, String, u8, &Placed)> {
         if let Some(gib) = coordinator_budget(r) {
             hardware.push_str(&format!("-budget{gib}"));
         }
+        // Keep labelled extra layouts even when they use the reference hardware.
+        if let Some(label) = layout_label(p) {
+            hardware.push('-');
+            hardware.push_str(label);
+        }
         newest.entry((order, family, checkpoint(r), hardware)).or_insert(p);
     }
     let mut groups: BTreeMap<(usize, String, String), Vec<&Placed>> = BTreeMap::new();
     for ((order, family, name, _), p) in newest {
         groups.entry((order, family, name)).or_default().push(p);
     }
+    groups
+}
+
+/// The newest basic-profile report per family, checkpoint and reference hardware.
+fn reference_rows(placed: &[Placed]) -> Vec<(String, String, u8, &Placed)> {
     let size = |p: &Placed| (p.report.server.hardware.used_gpus(), p.report.server.hardware.sparks.len());
     let mut rows = Vec::new();
-    for ((_, family, name), reports) in groups {
+    for ((_, family, name), reports) in basic_groups(placed) {
         // Real measurements always replace memory-only simulations, even older ones.
         fn newest_of(items: Vec<&Placed>) -> Option<&Placed> {
             items.into_iter().max_by(|a, b|
@@ -151,14 +172,22 @@ fn reference_rows(placed: &[Placed]) -> Vec<(String, String, u8, &Placed)> {
         }
         let pro: Vec<_> = reports.into_iter().filter(|p| !p.report.server.column_5090()).collect();
         let one: Vec<_> = pro.iter().copied().filter(|p| size(p).0 == 1).collect();
-        let minimum = one.iter().map(|p| size(p).1).min().and_then(|count|
-            newest_of(one.iter().copied().filter(|p| size(p).1 == count).collect()));
+        let minimum = if one.iter().any(|p| reference_layout(p) == Some(1)) {
+            newest_of(one.iter().copied().filter(|p| reference_layout(p) == Some(1)).collect())
+        } else {
+            one.iter().map(|p| size(p).1).min().and_then(|count|
+                newest_of(one.iter().copied().filter(|p| size(p).1 == count).collect()))
+        };
         if let Some(p) = minimum {
             rows.push((family.clone(), name.clone(), 1, p));
         }
         let two: Vec<_> = pro.iter().copied().filter(|p| size(p).0 == 2).collect();
-        let maximum = two.iter().map(|p| size(p).1).max().and_then(|count|
-            newest_of(two.iter().copied().filter(|p| size(p).1 == count).collect()));
+        let maximum = if two.iter().any(|p| reference_layout(p) == Some(2)) {
+            newest_of(two.iter().copied().filter(|p| reference_layout(p) == Some(2)).collect())
+        } else {
+            two.iter().map(|p| size(p).1).max().and_then(|count|
+                newest_of(two.iter().copied().filter(|p| size(p).1 == count).collect()))
+        };
         if let Some(p) = maximum {
             rows.push((family, name, 2, p));
         }
@@ -220,8 +249,18 @@ pub fn results(placed: &[Placed]) -> String {
     out.push_str("</table>\n\n");
     out.push_str("| Family | Checkpoint | Hardware | KV / req | C1 code | Concurrent code (aggregate) | prose | JSON | 8K prefill | TTFT | Quality | Report |\n");
     out.push_str("| --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- |\n");
-    for (family, name, class, p) in &rows {
+    let mut table_rows = rows.clone();
+    for ((_, family, name), reports) in basic_groups(placed) {
+        for p in reports {
+            if !p.report.server.column_5090() && !rows.iter().any(|row| row.3.dir == p.dir) {
+                table_rows.push((family.clone(), name.clone(), 3, p));
+            }
+        }
+    }
+    for (family, name, class, p) in &table_rows {
         let r = &p.report;
+        let label = if *class == 3 { layout_label(p).unwrap_or("extra layout") }
+            else { column_name(*class) };
         if let Some(reason) = r.no_fit_reason() {
             out.push_str(&format!("| [{}](docs/models/{family}.md) | {name} | {} ({}) | — | — | — | — | — | — | — | doesn't fit: {} | [planner report]({}) |\n",
                 family_title(family), short_hardware(r), column_name(*class), reason.replace('|', "\\|"), link(&p.dir, "report.json")));
@@ -233,7 +272,7 @@ pub fn results(placed: &[Placed]) -> String {
             |c| format!("C{}: {}", c.width, rate(c.aggregate_tok_s)));
         let (prefill, ttft) = b.card.prefill.as_ref()
             .map_or(("—".into(), "—".into()), |p| (rate(p.tok_s), seconds(p.ttft_s)));
-        let hardware = format!("{} ({})", short_hardware(r), column_name(*class));
+        let hardware = format!("{} ({label})", short_hardware(r));
         out.push_str(&format!("| [{}](docs/models/{family}.md) | {name} | {hardware} | {} | {} | {concurrent} | {} | {} | {prefill} | {ttft} | {} | \
             [{} · {}]({}) |\n", family_title(family), r.capacity().compact(), decode("code"), decode("prose"),
             decode("json"), quality_cell(b), crate::render::date(&r.created), r.server.build.label(),
@@ -291,42 +330,68 @@ pub fn splice(text: &str, begin: &str, end: &str, body: &str) -> Result<String> 
     Ok(format!("{}\n{}\n\n{}", &text[..start], body.trim_end_matches('\n'), &text[stop..]))
 }
 
-/// The release whose changelog row (`| v0 | ... | Basic eval |`) gets the cards
-/// (`CUTEAFD_RELEASE_ROW`, default `v0`).
-fn release_row() -> String {
-    std::env::var("CUTEAFD_RELEASE_ROW").unwrap_or_else(|_| "v0".into())
+/// Release tags (v2.0.0-rc3) share a major-version changelog row (v2).
+fn release_row(tag: &str) -> Option<String> {
+    let major = tag.strip_prefix('v').unwrap_or(tag).split(['.', '-']).next()?;
+    if major.is_empty() || !major.bytes().all(|c| c.is_ascii_digit()) { return None; }
+    Some(format!("v{major}"))
 }
 
-/// Fills the Basic eval cell of each `docs/models/<family>.md` changelog row of
-/// this release with the family's Release smoke cards.
-fn family_pages(root: &Path, placed: &[Placed]) -> Result<()> {
-    let row = format!("| {} |", release_row());
+fn report_release(p: &Placed) -> Option<String> {
+    p.report.server.build.release.as_deref().and_then(release_row)
+}
+
+fn changelog_cards(text: &str, release: &str, date: &str, cards: &str) -> Result<String> {
+    let row = format!("| {release} |");
+    let mut lines: Vec<String> = text.split_inclusive('\n').map(str::to_string).collect();
+    if let Some(line) = lines.iter_mut().find(|line| line.starts_with(&row)) {
+        let cells: Vec<&str> = line.trim_end().trim_end_matches('|').split('|').collect();
+        if cells.len() < 5 { bail!("malformed {release} changelog row"); }
+        let newline = if line.ends_with("\r\n") { "\r\n" } else if line.ends_with('\n') { "\n" } else { "" };
+        *line = format!("{}| {cards} |{newline}", cells[..cells.len() - 1].join("|"));
+    } else {
+        // Insert after the newest existing row; never borrow another release's cell.
+        let newest = lines.iter().position(|line| {
+            line.split('|').nth(1).is_some_and(|cell| {
+                let cell = cell.trim();
+                cell.starts_with('v') && release_row(cell).is_some()
+            })
+        });
+        let after = newest.or_else(|| lines.iter().position(|line| line.starts_with("| ---")))
+            .context("changelog table missing")?;
+        if !lines[after].ends_with('\n') { lines[after].push('\n'); }
+        lines.insert(after + 1, format!("| {release} | {date} | Published benchmarks | {cards} |\n"));
+    }
+    Ok(lines.concat())
+}
+
+/// Only the published release's cards update the family changelogs.
+/// CUTEAFD_RELEASE_ROW remains an explicit override for manually placed reports.
+fn family_pages(root: &Path, placed: &[Placed], release: Option<&str>) -> Result<()> {
+    let override_row = std::env::var("CUTEAFD_RELEASE_ROW").ok();
+    family_pages_with_row(root, placed, release, override_row.as_deref())
+}
+
+fn family_pages_with_row(root: &Path, placed: &[Placed], release: Option<&str>, override_row: Option<&str>) -> Result<()> {
+    let Some(row) = override_row.or(release) else { return Ok(()) };
+    let normalized_row = release_row(row);
+    let selected = release.or(normalized_row.as_deref());
+    let current: Vec<_> = placed.iter().filter(|p| {
+        selected.is_some() && report_release(p).as_deref() == selected
+            || (override_row.is_some() && report_release(p).is_none())
+    }).cloned().collect();
     for family in FAMILIES {
         let path = root.join("docs/models").join(format!("{family}.md"));
         let Ok(text) = std::fs::read_to_string(&path) else { continue };
-        let cards = family_cards(placed, family);
-        if cards.is_empty() {
-            continue;
-        }
-        let mut changed = false;
-        let lines: Vec<String> = text.lines().map(|line| {
-            if !line.starts_with(&row) {
-                return line.to_string();
-            }
-            let cells: Vec<&str> = line.trim_end().trim_end_matches('|').split('|').collect();
-            if cells.len() < 3 {
-                return line.to_string();
-            }
-            changed = true;
-            format!("{}| {cards} |", cells[..cells.len() - 1].join("|"))
-        }).collect();
-        if changed {
-            let mut out = lines.join("\n");
-            if text.ends_with('\n') {
-                out.push('\n');
-            }
-            crate::cli::write_if_changed(&path, &out)?;
-        }
+        let newest = current.iter().filter(|p| p.report.server.family.as_deref() == Some(family)
+            && matches!(p.report.profile.as_str(), "smoke" | "share")
+            && (p.report.baseline.is_some() || p.report.no_fit_reason().is_some()))
+            .max_by(|a, b| a.report.created.cmp(&b.report.created).then(a.dir.cmp(&b.dir)));
+        let Some(newest) = newest else { continue };
+        let cards = family_cards(&current, family);
+        if cards.is_empty() { continue; }
+        let out = changelog_cards(&text, row, &crate::render::date(&newest.report.created), &cards)?;
+        crate::cli::write_if_changed(&path, &out)?;
     }
     Ok(())
 }
@@ -337,6 +402,7 @@ const INDEX_HEADER: &str = "# Benchmarks\n\nReports from `cuteafd bench` (profil
 
 /// Checks `dirs` are placed for publication and rebuilds both documents.
 pub fn publish(root: &Path, dirs: &[PathBuf]) -> Result<(PathBuf, PathBuf, usize)> {
+    let mut releases = std::collections::BTreeSet::new();
     for dir in dirs {
         let absolute = if dir.is_absolute() { dir.clone() } else { std::env::current_dir()?.join(dir) };
         let base = root.canonicalize()?.join("benchmarks");
@@ -349,13 +415,22 @@ pub fn publish(root: &Path, dirs: &[PathBuf]) -> Result<(PathBuf, PathBuf, usize
             bail!("{} must be benchmarks/<family>/<date>-<profile>-<hardware>/ with a report.json", dir.display());
         }
         let report: Report = serde_json::from_str(&std::fs::read_to_string(canonical.join("report.json"))?)?;
+        if let Some(release) = report.server.build.release.as_deref().and_then(release_row) {
+            releases.insert(release);
+        }
         let family = report.server.family.clone().unwrap_or_else(|| "unknown".into());
         let parent = relative.components().next().and_then(|c| c.as_os_str().to_str()).unwrap_or_default();
         if parent != family {
             bail!("{} holds a {family} report; move it under benchmarks/{family}/", dir.display());
         }
     }
+    if releases.len() > 1 && std::env::var("CUTEAFD_RELEASE_ROW").is_err() {
+        bail!("publish reports from one release at a time, or set CUTEAFD_RELEASE_ROW");
+    }
     let placed = scan(root)?;
+    let release = releases.into_iter().next().or_else(|| {
+        dirs.is_empty().then(|| placed.iter().find_map(report_release)).flatten()
+    });
     let readme = root.join("README.md");
     let text = std::fs::read_to_string(&readme).with_context(|| format!("{}", readme.display()))?;
     crate::cli::write_if_changed(&readme, &splice(&text, RESULTS_BEGIN, RESULTS_END, &results(&placed))?)?;
@@ -364,7 +439,7 @@ pub fn publish(root: &Path, dirs: &[PathBuf]) -> Result<(PathBuf, PathBuf, usize
     let current = std::fs::read_to_string(&index_path)
         .unwrap_or_else(|_| format!("{INDEX_HEADER}{INDEX_BEGIN}\n{INDEX_END}\n"));
     crate::cli::write_if_changed(&index_path, &splice(&current, INDEX_BEGIN, INDEX_END, &index(&placed))?)?;
-    family_pages(root, &placed)?;
+    family_pages(root, &placed, release.as_deref())?;
     Ok((readme, index_path, placed.len()))
 }
 
@@ -545,6 +620,142 @@ mod tests {
     }
 
     #[test]
+    fn matrix_minimum_beats_extra_layout_and_extras_keep_labelled_rows() {
+        let mut minimum = marked("uuid-min", 1, None);
+        minimum.report.server.family = Some("qwen4".into());
+        minimum.report.server.hardware.sparks.truncate(2);
+        minimum.dir = crate::cli::labeled_dir(Path::new("."), &minimum.report, Some("qwen38-exl3-min"));
+        let mut extra = minimum.clone();
+        extra.report.id = "uuid-extra".into();
+        extra.report.created = "2026-10-10T00:00:00Z".into();
+        extra.report.server.hardware.sparks.clear();
+        extra.dir = crate::cli::labeled_dir(Path::new("."), &extra.report, Some("qwen38-exl3-nospark-vision"));
+        let mut max = marked("uuid-max", 2, None);
+        max.report.server.family = Some("qwen4".into());
+        max.dir = crate::cli::labeled_dir(Path::new("."), &max.report, Some("qwen38-exl3-max"));
+        let mut extra_two = max.clone();
+        extra_two.report.server.hardware.sparks.push(extra_two.report.server.hardware.sparks[0].clone());
+        extra_two.dir = crate::cli::labeled_dir(Path::new("."), &extra_two.report, Some("qwen38-exl3-extra"));
+        let reports = vec![extra.clone(), minimum.clone(), extra_two.clone(), max.clone()];
+        let rows = reference_rows(&reports);
+        assert_eq!(rows.iter().map(|r| r.3.report.id.as_str()).collect::<Vec<_>>(), vec!["uuid-min", "uuid-max"]);
+        let html = results(&reports);
+        let (grid, table) = html.split_once("</table>").unwrap();
+        assert!(grid.contains(&link(&minimum.dir, "card.svg")));
+        assert!(grid.contains(&link(&max.dir, "card.svg")));
+        assert!(!grid.contains(&link(&extra.dir, "card.svg")));
+        assert!(!grid.contains(&link(&extra_two.dir, "card.svg")));
+        assert!(table.contains("(qwen38-exl3-nospark-vision)"));
+        assert!(table.contains(&link(&extra.dir, "report.svg")));
+        assert!(table.contains(&link(&extra_two.dir, "report.svg")));
+        let cards = family_cards(&reports, "qwen4");
+        assert!(cards.contains(&link(&minimum.dir, "card.svg")));
+        assert!(!cards.contains(&link(&extra.dir, "card.svg")));
+
+        // An extra on identical hardware must not deduplicate away the reference.
+        let mut same_hw = minimum.clone();
+        same_hw.report.id = "uuid-same-hw".into();
+        same_hw.dir = crate::cli::labeled_dir(Path::new("."), &same_hw.report, Some("qwen38-exl3-vision"));
+        let html = results(&[same_hw.clone(), minimum]);
+        assert!(html.contains("(qwen38-exl3-vision)"));
+        assert!(html.contains(&link(&same_hw.dir, "report.svg")));
+    }
+
+    #[test]
+    fn reference_marker_fallback_is_per_gpu_column() {
+        let mut one = marked("one", 1, None);
+        let mut two = marked("two", 2, None);
+        one.dir = crate::cli::labeled_dir(Path::new("."), &one.report, Some("model-min"));
+        two.dir = crate::cli::labeled_dir(Path::new("."), &two.report, Some("model-rc2"));
+        let check = |reports: &[Placed]| {
+            assert_eq!(reference_rows(reports).iter().map(|r| (r.2, r.3.report.id.as_str()))
+                .collect::<Vec<_>>(), vec![(1, "one"), (2, "two")]);
+            assert_eq!(results(reports).matches("<img src=").count(), 2);
+        };
+        check(&[one.clone(), two.clone()]);
+        one.dir = crate::cli::labeled_dir(Path::new("."), &one.report, Some("model-rc2"));
+        two.dir = crate::cli::labeled_dir(Path::new("."), &two.report, Some("model-max"));
+        check(&[one.clone(), two]);
+        // Historical Qwen maxima used one GPU; they remain in the one-RTX column.
+        one.dir = crate::cli::labeled_dir(Path::new("."), &one.report, Some("model-max"));
+        assert_eq!(reference_rows(&[one])[0].2, 1);
+    }
+
+    #[test]
+    fn publish_v2_preserves_previous_rows_and_adds_a_missing_row() {
+        assert_eq!(release_row("v2.0.0-rc3"), Some("v2".into()));
+        assert_eq!(release_row("2.0.0"), Some("v2".into()));
+        assert_eq!(release_row("work/p0"), None);
+        assert_eq!(release_row("v"), None);
+        for existing in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            std::fs::create_dir_all(root.path().join("docs/models")).unwrap();
+            let page_path = root.path().join("docs/models/deepseek_v41.md");
+            let v0 = "| v0 | 2026-10-02 | First release | <a href=\"v0.svg\">original v0</a> |\n";
+            let v1 = "| v1 | 2026-10-05 | Second release | original v1 |\n";
+            let v2 = if existing { "| v2 | 2026-10-10 | Third release | pending |\n" } else { "" };
+            std::fs::write(&page_path, format!("## Changelog\n\n| Version | Date | Change | Basic eval |\n| --- | --- | --- | --- |\n{v2}{v1}{v0}\nOther prose\n")).unwrap();
+            std::fs::write(root.path().join("README.md"), format!("{RESULTS_BEGIN}\n{RESULTS_END}\n")).unwrap();
+            let mut old = marked("old", 2, None).report;
+            old.server.build.release = Some("v1.0.0".into());
+            old.created = "2026-10-05T00:00:00Z".into();
+            crate::cli::write_exports(&old, &crate::cli::labeled_dir(root.path(), &old, Some("old-max")), &["json".into()]).unwrap();
+            let mut new = marked("new", 1, None).report;
+            new.server.build.release = Some("v2.0.0-rc3".into());
+            new.created = "2026-10-10T00:00:00Z".into();
+            let dir = crate::cli::labeled_dir(root.path(), &new, Some("new-min"));
+            crate::cli::write_exports(&new, &dir, &["json".into()]).unwrap();
+            publish(root.path(), &[dir]).unwrap();
+            let page = std::fs::read_to_string(&page_path).unwrap();
+            assert!(page.contains(v0), "{page}");
+            assert!(page.contains(v1), "{page}");
+            let row = page.lines().find(|line| line.starts_with("| v2 |")).unwrap();
+            assert!(row.contains("new-min/card.svg"), "{row}");
+            assert!(!row.contains("old-max"), "{row}");
+            assert_eq!(page.matches("| v2 |").count(), 1);
+            if !existing { assert!(page.find(v1).unwrap() < page.find(row).unwrap()); }
+            publish(root.path(), &[]).unwrap();
+            assert_eq!(std::fs::read_to_string(page_path).unwrap(), page);
+        }
+    }
+
+    #[test]
+    fn release_override_selects_destination_not_report_tag() {
+        for row in ["v2-bringup", "v2.0.0-rc3", "custom-row"] {
+            let root = tempfile::tempdir().unwrap();
+            std::fs::create_dir_all(root.path().join("docs/models")).unwrap();
+            let path = root.path().join("docs/models/deepseek_v41.md");
+            let old_row = "| v1 | date | change | old cards |\n";
+            std::fs::write(&path, format!("| Version | Date | Change | Basic eval |\n| --- | --- | --- | --- |\n| {row} | date | change | pending |\n{old_row}")).unwrap();
+            let mut current = marked("current-min", 1, None);
+            current.report.server.build.release = Some("v2.0.0-rc3".into());
+            let mut old = marked("old-max", 2, None);
+            old.report.server.build.release = Some("v1.0.0".into());
+            let reports = [current, old];
+            family_pages_with_row(root.path(), &reports, Some("v2"), Some(row)).unwrap();
+            let page = std::fs::read_to_string(&path).unwrap();
+            let target = page.lines().find(|line| line.starts_with(&format!("| {row} |"))).unwrap();
+            assert!(target.contains("current-min/card.svg"), "{target}");
+            assert!(!target.contains("old-max"), "{target}");
+            assert!(page.contains(old_row));
+            if row != "custom-row" {
+                family_pages_with_row(root.path(), &reports, None, Some(row)).unwrap();
+                assert_eq!(std::fs::read_to_string(&path).unwrap(), page);
+            }
+        }
+    }
+
+    #[test]
+    fn changelog_insertion_works_without_previous_releases() {
+        let page = "## Changelog\n\n| Version | Date | Change | Basic eval |\n| --- | --- | --- | --- |\n\nTail\n";
+        let out = changelog_cards(page, "v2", "2026-10-10", "new cards").unwrap();
+        assert!(out.contains("| --- | --- | --- | --- |\n| v2 | 2026-10-10 | Published benchmarks | new cards |\n\nTail\n"));
+        let crlf = "| v1 | old | old | old |\r\n| v2 | date | change | pending |\r\n";
+        let out = changelog_cards(crlf, "v2", "date", "cards").unwrap();
+        assert_eq!(out, "| v1 | old | old | old |\r\n| v2 | date | change | cards |\r\n");
+    }
+
+    #[test]
     fn publish_rebuilds_the_table_and_index() {
         let root = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(root.path().join("docs/models")).unwrap();
@@ -554,6 +765,7 @@ mod tests {
             format!("# x\n\n{RESULTS_BEGIN}\n_Pending._\n{RESULTS_END}\n\nrest\n")).unwrap();
         let mut ok = crate::sample::report(false);
         ok.created = "2026-10-02T10:00:00Z".into();
+        ok.server.build.release = Some("v0.1.0".into());
         let mut older = crate::sample::report(true);
         older.created = "2026-10-01T10:00:00Z".into();
         older.id = "older".into();
