@@ -32,10 +32,10 @@ pub(super) async fn run(gateway: Arc<Gateway>, mut turn: TurnRequest) -> Result<
     }
     let backend = gateway.backend.clone();
     let first = backend.start(turn.clone()).await?;
-    let Some(provider) = provider else { return Ok(first) };
+    let Some(provider) = provider else { return Ok(seal_tool_calls(first)) };
     let spec = hosted.expect("provider implies hosted spec");
     let max_rounds = spec.max_uses.unwrap_or(DEFAULT_SEARCH_ROUNDS);
-    Ok(Box::pin(async_stream::stream! {
+    Ok(seal_tool_calls(Box::pin(async_stream::stream! {
         let mut stream = first;
         let mut total = Usage::default();
         let mut rounds = 0u32;
@@ -128,5 +128,55 @@ pub(super) async fn run(gateway: Arc<Gateway>, mut turn: TurnRequest) -> Result<
                 Err(error) => { yield Err(error); return; }
             };
         }
-    }))
+    })))
+}
+
+/// Tool calls end only once the turn's stop reason is known: `ToolCallEnd`
+/// events are held until `Done` and released just before it, unless the turn
+/// stopped at `MaxTokens` (or failed), in which case they are dropped. A front
+/// end therefore treats any tool call still open at `Done` as cut off
+/// (incomplete), and never reports a truncated call as complete or runnable.
+pub(super) fn seal_tool_calls(mut inner: TurnStream) -> TurnStream {
+    Box::pin(async_stream::stream! {
+        let mut ends = Vec::new();
+        while let Some(event) = inner.next().await {
+            match event {
+                Ok(TurnEvent::ToolCallEnd { index }) => ends.push(index),
+                Ok(TurnEvent::Done { stop }) => {
+                    if stop != StopReason::MaxTokens {
+                        for index in ends.drain(..) { yield Ok(TurnEvent::ToolCallEnd { index }); }
+                    }
+                    yield Ok(TurnEvent::Done { stop });
+                    return;
+                }
+                other => yield other,
+            }
+        }
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures::stream;
+
+    async fn sealed(events: Vec<TurnEvent>) -> Vec<TurnEvent> {
+        seal_tool_calls(Box::pin(stream::iter(events.into_iter().map(Ok)))).map(Result::unwrap).collect().await
+    }
+
+    #[tokio::test]
+    async fn tool_call_ends_wait_for_the_stop_reason() {
+        let call = |stop| vec![
+            TurnEvent::ToolCallStart { index: 0, id: "c".into(), name: "f".into() },
+            TurnEvent::ToolCallDelta { index: 0, arguments: "{\"a\":".into() },
+            TurnEvent::ToolCallEnd { index: 0 },
+            TurnEvent::Usage { usage: Usage::default() },
+            TurnEvent::Done { stop },
+        ];
+        let cut = sealed(call(StopReason::MaxTokens)).await;
+        assert!(!cut.iter().any(|e| matches!(e, TurnEvent::ToolCallEnd { .. })), "truncated call stays open");
+        let done = sealed(call(StopReason::ToolUse)).await;
+        assert!(matches!(done[done.len() - 2], TurnEvent::ToolCallEnd { index: 0 }));
+        assert!(matches!(done[done.len() - 3], TurnEvent::Usage { .. }), "ends move to just before Done");
+    }
 }
