@@ -1,0 +1,184 @@
+{
+  "schema": "cuteafd.bench.report/1",
+  "id": "b7fd5ead6126ffd7c1a5a4e4998134cd",
+  "created": "2026-10-09T14:39:00Z",
+  "finished": "2026-10-09T14:39:00Z",
+  "status": "failed",
+  "profile": "smoke",
+  "plan": [],
+  "server": {
+    "model": "XiaomiMiMo/MiMo-V2.6-Pro-MOPD",
+    "family": "mimo_v2",
+    "revision": "adea8e2c5373181e5a973fa1ecb343cb31af214b",
+    "build": {
+      "version": "0.1.0",
+      "release": "v2.0.0-rc3",
+      "image": "ghcr.io/tpurtell/cuteafd-coordinator:v2.0.0-rc3",
+      "remote": null,
+      "commit": "c9dcc9e27320cf367fe84988a06548ea561cf0c7",
+      "dirty": false
+    },
+    "hardware": {
+      "host": "raptor (planner-only, hardware not launched)",
+      "gpus": [
+        {
+          "index": 0,
+          "name": "RTX PRO 6000 (memory-only qualification)",
+          "uuid": null,
+          "memory_mib": 97887,
+          "power_limit_w": null,
+          "power_max_w": null,
+          "sm_count": 188,
+          "compute_cap": null,
+          "pcie": null,
+          "used": true
+        }
+      ],
+      "driver": null,
+      "cuda": null,
+      "sparks": [
+        {
+          "address": "10.55.0.1",
+          "name": "ostrich",
+          "rank": 0
+        },
+        {
+          "address": "10.55.0.2",
+          "name": "dodo",
+          "rank": 1
+        },
+        {
+          "address": "10.55.0.3",
+          "name": "emu",
+          "rank": 2
+        },
+        {
+          "address": "10.55.0.4",
+          "name": "kiwi",
+          "rank": 3
+        },
+        {
+          "address": "10.55.0.5",
+          "name": "rhea",
+          "rank": 4
+        },
+        {
+          "address": "10.55.0.6",
+          "name": "moa",
+          "rank": 5
+        }
+      ],
+      "fabric": [],
+      "rails": null
+    },
+    "configuration": {
+      "snapshot": "/root/.cache/huggingface/hub/models--XiaomiMiMo--MiMo-V2.6-Pro-MOPD/snapshots/adea8e2c5373181e5a973fa1ecb343cb31af214b",
+      "quant": [
+        {
+          "group": "embedding",
+          "formats": [
+            "bf16"
+          ]
+        },
+        {
+          "group": "lm head",
+          "formats": [
+            "bf16"
+          ]
+        },
+        {
+          "group": "norm",
+          "formats": [
+            "bf16"
+          ]
+        },
+        {
+          "group": "attention",
+          "formats": [
+            "bf16",
+            "fp8-block128x128/f32-segmented8"
+          ]
+        },
+        {
+          "group": "router",
+          "formats": [
+            "bf16",
+            "f32"
+          ]
+        },
+        {
+          "group": "routed expert",
+          "formats": [
+            "mxfp4-g32"
+          ]
+        },
+        {
+          "group": "dense ffn",
+          "formats": [
+            "fp8-block128x128/f32"
+          ]
+        },
+        {
+          "group": "speculator",
+          "formats": [
+            "bf16",
+            "fp8-block128x128/f32",
+            "fp8-block128x128/f32-segmented8"
+          ]
+        },
+        {
+          "group": "vision",
+          "formats": [
+            "bf16"
+          ]
+        },
+        {
+          "group": "audio",
+          "formats": [
+            "bf16"
+          ]
+        }
+      ],
+      "speculator": null,
+      "layout": "planner-only: 1 capped coordinator + 6 Sparks",
+      "settings": [
+        {
+          "name": "qualification.no-fit",
+          "value": "rtx0 full memory layout needs 33511016304 bytes, budget 31031138713 bytes, shortfall 2479877591 bytes",
+          "default": null,
+          "source": "planner"
+        },
+        {
+          "name": "qualification.plan",
+          "value": "plan.json",
+          "default": null,
+          "source": "planner"
+        },
+        {
+          "name": "qualification.method",
+          "value": "CPU checkpoint headers and rc3 memory planner; no server launched",
+          "default": null,
+          "source": "planner"
+        },
+        {
+          "name": "simulated",
+          "value": "5090",
+          "default": null,
+          "source": "planner"
+        },
+        {
+          "name": "coordinator-gpu-budget-gib",
+          "value": "31.8",
+          "default": null,
+          "source": "planner"
+        }
+      ]
+    },
+    "readiness_s": null,
+    "started": null
+  },
+  "fingerprint": "b7fd5ead6126ffd7",
+  "baseline": null,
+  "panels": [],
+  "error": "rtx0 full memory layout needs 33511016304 bytes, budget 31031138713 bytes, shortfall 2479877591 bytes"
+}

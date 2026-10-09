@@ -1,0 +1,1340 @@
+{
+  "vision": "auto",
+  "audio": "off",
+  "disabled_media_bytes": 0,
+  "encoder": {
+    "kind": {
+      "kind": "off"
+    },
+    "weights": 0,
+    "scratch": 0,
+    "replicas": [],
+    "reason": "disabled or no checkpoint tower",
+    "shortfall": 0
+  },
+  "audio_encoder": null,
+  "encoder_plan_hash": "44a62325fcbefe87b8a097ff6493fe693d27e03200c26304e187c48e8f40a582",
+  "snapshot": "/root/.cache/huggingface/hub/models--deepseek-ai--DeepSeek-V4-Flash-0731/snapshots/9e165c30e2704aec5d9d593cce3eebd58bbef1cb",
+  "family": "deepseek_v4",
+  "architectures": [
+    "DeepseekV4ForCausalLM"
+  ],
+  "quantization": null,
+  "runtime": "serving",
+  "config_error": null,
+  "spec": {
+    "family": "deepseek_v4",
+    "architecture": "DeepseekV4ForCausalLM",
+    "hidden": 4096,
+    "vocab": 129280,
+    "layers": [
+      {
+        "attention": {
+          "kind": "compressed_mla",
+          "ratio": 0,
+          "indexer": false
+        },
+        "ffn": {
+          "kind": "moe"
+        },
+        "rope": {
+          "dims": 64,
+          "theta": 10000.0
+        }
+      },
+      {
+        "attention": {
+          "kind": "compressed_mla",
+          "ratio": 0,
+          "indexer": false
+        },
+        "ffn": {
+          "kind": "moe"
+        },
+        "rope": {
+          "dims": 64,
+          "theta": 10000.0
+        }
+      },
+      {
+        "attention": {
+          "kind": "compressed_mla",
+          "ratio": 4,
+          "indexer": true
+        },
+        "ffn": {
+          "kind": "moe"
+        },
+        "rope": {
+          "dims": 64,
+          "theta": 160000.0
+        }
+      },
+      {
+        "attention": {
+          "kind": "compressed_mla",
+          "ratio": 128,
+          "indexer": false
+        },
+        "ffn": {
+          "kind": "moe"
+        },
+        "rope": {
+          "dims": 64,
+          "theta": 160000.0
+        }
+      },
+      {
+        "attention": {
+          "kind": "compressed_mla",
+          "ratio": 4,
+          "indexer": true
+        },
+        "ffn": {
+          "kind": "moe"
+        },
+        "rope": {
+          "dims": 64,
+          "theta": 160000.0
+        }
+      },
+      {
+        "attention": {
+          "kind": "compressed_mla",
+          "ratio": 128,
+          "indexer": false
+        },
+        "ffn": {
+          "kind": "moe"
+        },
+        "rope": {
+          "dims": 64,
+          "theta": 160000.0
+        }
+      },
+      {
+        "attention": {
+          "kind": "compressed_mla",
+          "ratio": 4,
+          "indexer": true
+        },
+        "ffn": {
+          "kind": "moe"
+        },
+        "rope": {
+          "dims": 64,
+          "theta": 160000.0
+        }
+      },
+      {
+        "attention": {
+          "kind": "compressed_mla",
+          "ratio": 128,
+          "indexer": false
+        },
+        "ffn": {
+          "kind": "moe"
+        },
+        "rope": {
+          "dims": 64,
+          "theta": 160000.0
+        }
+      },
+      {
+        "attention": {
+          "kind": "compressed_mla",
+          "ratio": 4,
+          "indexer": true
+        },
+        "ffn": {
+          "kind": "moe"
+        },
+        "rope": {
+          "dims": 64,
+          "theta": 160000.0
+        }
+      },
+      {
+        "attention": {
+          "kind": "compressed_mla",
+          "ratio": 128,
+          "indexer": false
+        },
+        "ffn": {
+          "kind": "moe"
+        },
+        "rope": {
+          "dims": 64,
+          "theta": 160000.0
+        }
+      },
+      {
+        "attention": {
+          "kind": "compressed_mla",
+          "ratio": 4,
+          "indexer": true
+        },
+        "ffn": {
+          "kind": "moe"
+        },
+        "rope": {
+          "dims": 64,
+          "theta": 160000.0
+        }
+      },
+      {
+        "attention": {
+          "kind": "compressed_mla",
+          "ratio": 128,
+          "indexer": false
+        },
+        "ffn": {
+          "kind": "moe"
+        },
+        "rope": {
+          "dims": 64,
+          "theta": 160000.0
+        }
+      },
+      {
+        "attention": {
+          "kind": "compressed_mla",
+          "ratio": 4,
+          "indexer": true
+        },
+        "ffn": {
+          "kind": "moe"
+        },
+        "rope": {
+          "dims": 64,
+          "theta": 160000.0
+        }
+      },
+      {
+        "attention": {
+          "kind": "compressed_mla",
+          "ratio": 128,
+          "indexer": false
+        },
+        "ffn": {
+          "kind": "moe"
+        },
+        "rope": {
+          "dims": 64,
+          "theta": 160000.0
+        }
+      },
+      {
+        "attention": {
+          "kind": "compressed_mla",
+          "ratio": 4,
+          "indexer": true
+        },
+        "ffn": {
+          "kind": "moe"
+        },
+        "rope": {
+          "dims": 64,
+          "theta": 160000.0
+        }
+      },
+      {
+        "attention": {
+          "kind": "compressed_mla",
+          "ratio": 128,
+          "indexer": false
+        },
+        "ffn": {
+          "kind": "moe"
+        },
+        "rope": {
+          "dims": 64,
+          "theta": 160000.0
+        }
+      },
+      {
+        "attention": {
+          "kind": "compressed_mla",
+          "ratio": 4,
+          "indexer": true
+        },
+        "ffn": {
+          "kind": "moe"
+        },
+        "rope": {
+          "dims": 64,
+          "theta": 160000.0
+        }
+      },
+      {
+        "attention": {
+          "kind": "compressed_mla",
+          "ratio": 128,
+          "indexer": false
+        },
+        "ffn": {
+          "kind": "moe"
+        },
+        "rope": {
+          "dims": 64,
+          "theta": 160000.0
+        }
+      },
+      {
+        "attention": {
+          "kind": "compressed_mla",
+          "ratio": 4,
+          "indexer": true
+        },
+        "ffn": {
+          "kind": "moe"
+        },
+        "rope": {
+          "dims": 64,
+          "theta": 160000.0
+        }
+      },
+      {
+        "attention": {
+          "kind": "compressed_mla",
+          "ratio": 128,
+          "indexer": false
+        },
+        "ffn": {
+          "kind": "moe"
+        },
+        "rope": {
+          "dims": 64,
+          "theta": 160000.0
+        }
+      },
+      {
+        "attention": {
+          "kind": "compressed_mla",
+          "ratio": 4,
+          "indexer": true
+        },
+        "ffn": {
+          "kind": "moe"
+        },
+        "rope": {
+          "dims": 64,
+          "theta": 160000.0
+        }
+      },
+      {
+        "attention": {
+          "kind": "compressed_mla",
+          "ratio": 128,
+          "indexer": false
+        },
+        "ffn": {
+          "kind": "moe"
+        },
+        "rope": {
+          "dims": 64,
+          "theta": 160000.0
+        }
+      },
+      {
+        "attention": {
+          "kind": "compressed_mla",
+          "ratio": 4,
+          "indexer": true
+        },
+        "ffn": {
+          "kind": "moe"
+        },
+        "rope": {
+          "dims": 64,
+          "theta": 160000.0
+        }
+      },
+      {
+        "attention": {
+          "kind": "compressed_mla",
+          "ratio": 128,
+          "indexer": false
+        },
+        "ffn": {
+          "kind": "moe"
+        },
+        "rope": {
+          "dims": 64,
+          "theta": 160000.0
+        }
+      },
+      {
+        "attention": {
+          "kind": "compressed_mla",
+          "ratio": 4,
+          "indexer": true
+        },
+        "ffn": {
+          "kind": "moe"
+        },
+        "rope": {
+          "dims": 64,
+          "theta": 160000.0
+        }
+      },
+      {
+        "attention": {
+          "kind": "compressed_mla",
+          "ratio": 128,
+          "indexer": false
+        },
+        "ffn": {
+          "kind": "moe"
+        },
+        "rope": {
+          "dims": 64,
+          "theta": 160000.0
+        }
+      },
+      {
+        "attention": {
+          "kind": "compressed_mla",
+          "ratio": 4,
+          "indexer": true
+        },
+        "ffn": {
+          "kind": "moe"
+        },
+        "rope": {
+          "dims": 64,
+          "theta": 160000.0
+        }
+      },
+      {
+        "attention": {
+          "kind": "compressed_mla",
+          "ratio": 128,
+          "indexer": false
+        },
+        "ffn": {
+          "kind": "moe"
+        },
+        "rope": {
+          "dims": 64,
+          "theta": 160000.0
+        }
+      },
+      {
+        "attention": {
+          "kind": "compressed_mla",
+          "ratio": 4,
+          "indexer": true
+        },
+        "ffn": {
+          "kind": "moe"
+        },
+        "rope": {
+          "dims": 64,
+          "theta": 160000.0
+        }
+      },
+      {
+        "attention": {
+          "kind": "compressed_mla",
+          "ratio": 128,
+          "indexer": false
+        },
+        "ffn": {
+          "kind": "moe"
+        },
+        "rope": {
+          "dims": 64,
+          "theta": 160000.0
+        }
+      },
+      {
+        "attention": {
+          "kind": "compressed_mla",
+          "ratio": 4,
+          "indexer": true
+        },
+        "ffn": {
+          "kind": "moe"
+        },
+        "rope": {
+          "dims": 64,
+          "theta": 160000.0
+        }
+      },
+      {
+        "attention": {
+          "kind": "compressed_mla",
+          "ratio": 128,
+          "indexer": false
+        },
+        "ffn": {
+          "kind": "moe"
+        },
+        "rope": {
+          "dims": 64,
+          "theta": 160000.0
+        }
+      },
+      {
+        "attention": {
+          "kind": "compressed_mla",
+          "ratio": 4,
+          "indexer": true
+        },
+        "ffn": {
+          "kind": "moe"
+        },
+        "rope": {
+          "dims": 64,
+          "theta": 160000.0
+        }
+      },
+      {
+        "attention": {
+          "kind": "compressed_mla",
+          "ratio": 128,
+          "indexer": false
+        },
+        "ffn": {
+          "kind": "moe"
+        },
+        "rope": {
+          "dims": 64,
+          "theta": 160000.0
+        }
+      },
+      {
+        "attention": {
+          "kind": "compressed_mla",
+          "ratio": 4,
+          "indexer": true
+        },
+        "ffn": {
+          "kind": "moe"
+        },
+        "rope": {
+          "dims": 64,
+          "theta": 160000.0
+        }
+      },
+      {
+        "attention": {
+          "kind": "compressed_mla",
+          "ratio": 128,
+          "indexer": false
+        },
+        "ffn": {
+          "kind": "moe"
+        },
+        "rope": {
+          "dims": 64,
+          "theta": 160000.0
+        }
+      },
+      {
+        "attention": {
+          "kind": "compressed_mla",
+          "ratio": 4,
+          "indexer": true
+        },
+        "ffn": {
+          "kind": "moe"
+        },
+        "rope": {
+          "dims": 64,
+          "theta": 160000.0
+        }
+      },
+      {
+        "attention": {
+          "kind": "compressed_mla",
+          "ratio": 128,
+          "indexer": false
+        },
+        "ffn": {
+          "kind": "moe"
+        },
+        "rope": {
+          "dims": 64,
+          "theta": 160000.0
+        }
+      },
+      {
+        "attention": {
+          "kind": "compressed_mla",
+          "ratio": 4,
+          "indexer": true
+        },
+        "ffn": {
+          "kind": "moe"
+        },
+        "rope": {
+          "dims": 64,
+          "theta": 160000.0
+        }
+      },
+      {
+        "attention": {
+          "kind": "compressed_mla",
+          "ratio": 128,
+          "indexer": false
+        },
+        "ffn": {
+          "kind": "moe"
+        },
+        "rope": {
+          "dims": 64,
+          "theta": 160000.0
+        }
+      },
+      {
+        "attention": {
+          "kind": "compressed_mla",
+          "ratio": 4,
+          "indexer": true
+        },
+        "ffn": {
+          "kind": "moe"
+        },
+        "rope": {
+          "dims": 64,
+          "theta": 160000.0
+        }
+      },
+      {
+        "attention": {
+          "kind": "compressed_mla",
+          "ratio": 128,
+          "indexer": false
+        },
+        "ffn": {
+          "kind": "moe"
+        },
+        "rope": {
+          "dims": 64,
+          "theta": 160000.0
+        }
+      },
+      {
+        "attention": {
+          "kind": "compressed_mla",
+          "ratio": 4,
+          "indexer": true
+        },
+        "ffn": {
+          "kind": "moe"
+        },
+        "rope": {
+          "dims": 64,
+          "theta": 160000.0
+        }
+      }
+    ],
+    "moe": {
+      "experts": 256,
+      "top_k": 6,
+      "intermediate": 2048,
+      "shared_experts": 1,
+      "shared_intermediate": 2048,
+      "scoring": "sqrtsoftplus",
+      "routed_scaling": 1.5,
+      "groups": null
+    },
+    "speculator": {
+      "kind": "dspark",
+      "stages": 3,
+      "experts": 256,
+      "top_k": 6,
+      "target_layers": [
+        40,
+        41,
+        42
+      ]
+    },
+    "tables": [],
+    "vision": false,
+    "notes": [
+      "compress ratios [0, 4, 128]",
+      "mHC width 4",
+      "hash-routed layers 0..3 (ffn.gate.tid2eid)",
+      "configuration from inference/config.json (the runtime's reader)"
+    ]
+  },
+  "cache_requirements": {
+    "checkpoint_max_context_tokens": 1048576,
+    "compiled_index_extent_required": true,
+    "requested_kv_floor_tokens": 2097152,
+    "concurrency": 16,
+    "state_slots": 20,
+    "target_only_layouts": [
+      {
+        "logical_unit_rows": 256,
+        "placement": "single_device",
+        "ranks": [
+          {
+            "persistent_unit_bytes": 998208,
+            "pool_metadata_unit_bytes": 0,
+            "active_state_per_sequence_bytes": 134884928,
+            "retained_mark_bytes": 27626496,
+            "speculative_replay_bytes": 0,
+            "fixed_state_bytes": 0,
+            "context_table_bytes_per_token": 512
+          }
+        ]
+      },
+      {
+        "logical_unit_rows": 256,
+        "placement": "replicated",
+        "ranks": [
+          {
+            "persistent_unit_bytes": 998208,
+            "pool_metadata_unit_bytes": 0,
+            "active_state_per_sequence_bytes": 134884928,
+            "retained_mark_bytes": 27626496,
+            "speculative_replay_bytes": 0,
+            "fixed_state_bytes": 0,
+            "context_table_bytes_per_token": 512
+          },
+          {
+            "persistent_unit_bytes": 998208,
+            "pool_metadata_unit_bytes": 0,
+            "active_state_per_sequence_bytes": 134884928,
+            "retained_mark_bytes": 27626496,
+            "speculative_replay_bytes": 0,
+            "fixed_state_bytes": 0,
+            "context_table_bytes_per_token": 512
+          }
+        ]
+      }
+    ],
+    "unavailable_layouts": []
+  },
+  "components": [
+    {
+      "component": "embedding",
+      "owner": "rtx",
+      "tensors": 1,
+      "bytes": 1059061760,
+      "formats": {
+        "bf16": 1
+      },
+      "status": "ready",
+      "rejected": 0,
+      "rejections": []
+    },
+    {
+      "component": "lm_head",
+      "owner": "rtx",
+      "tensors": 1,
+      "bytes": 1059061760,
+      "formats": {
+        "bf16": 1
+      },
+      "status": "ready",
+      "rejected": 0,
+      "rejections": []
+    },
+    {
+      "component": "norm",
+      "owner": "rtx",
+      "tensors": 87,
+      "bytes": 712704,
+      "formats": {
+        "bf16": 87
+      },
+      "status": "ready",
+      "rejected": 0,
+      "rejections": []
+    },
+    {
+      "component": "attention",
+      "owner": "rtx",
+      "tensors": 559,
+      "bytes": 4599478144,
+      "formats": {
+        "bf16": 86,
+        "f32": 43,
+        "fp8-block128x128/ue8m0": 215
+      },
+      "status": "ready",
+      "rejected": 0,
+      "rejections": []
+    },
+    {
+      "component": "indexer",
+      "owner": "rtx",
+      "tensors": 63,
+      "bytes": 187181568,
+      "formats": {
+        "bf16": 21,
+        "fp8-block128x128/ue8m0": 21
+      },
+      "status": "ready",
+      "rejected": 0,
+      "rejections": []
+    },
+    {
+      "component": "compressor",
+      "owner": "rtx",
+      "tensors": 248,
+      "bytes": 613894400,
+      "formats": {
+        "bf16": 186,
+        "f32": 62
+      },
+      "status": "ready",
+      "rejected": 0,
+      "rejections": []
+    },
+    {
+      "component": "hyper_connection",
+      "owner": "rtx",
+      "tensors": 261,
+      "bytes": 135537756,
+      "formats": {
+        "f32": 261
+      },
+      "status": "ready",
+      "rejected": 0,
+      "rejections": []
+    },
+    {
+      "component": "router",
+      "owner": "rtx",
+      "tensors": 86,
+      "bytes": 108834816,
+      "formats": {
+        "bf16": 43,
+        "int": 3
+      },
+      "status": "ready",
+      "rejected": 0,
+      "rejections": []
+    },
+    {
+      "component": "shared_expert",
+      "owner": "rtx",
+      "tensors": 258,
+      "bytes": 1082196480,
+      "formats": {
+        "fp8-block128x128/ue8m0": 129
+      },
+      "status": "ready",
+      "rejected": 0,
+      "rejections": []
+    },
+    {
+      "component": "routed_expert",
+      "owner": "spark_sliced",
+      "tensors": 66048,
+      "bytes": 147169738752,
+      "formats": {
+        "mxfp4-g32": 33024
+      },
+      "status": "ready",
+      "rejected": 0,
+      "rejections": []
+    },
+    {
+      "component": "speculator",
+      "owner": "rtx",
+      "tensors": 97,
+      "bytes": 595182108,
+      "formats": {
+        "bf16": 20,
+        "f32": 24,
+        "fp8-block128x128/ue8m0": 25
+      },
+      "status": "unused",
+      "rejected": 69,
+      "rejections": [
+        {
+          "tensor": "mtp.0.attn.attn_sink",
+          "reason": "serve-dsv4 does not run the dSpark drafter"
+        },
+        {
+          "tensor": "mtp.0.attn.kv_norm",
+          "reason": "serve-dsv4 does not run the dSpark drafter"
+        },
+        {
+          "tensor": "mtp.0.attn.q_norm",
+          "reason": "serve-dsv4 does not run the dSpark drafter"
+        },
+        {
+          "tensor": "mtp.0.attn.wkv",
+          "reason": "serve-dsv4 does not run the dSpark drafter"
+        },
+        {
+          "tensor": "mtp.0.attn.wo_a",
+          "reason": "serve-dsv4 does not run the dSpark drafter"
+        },
+        {
+          "tensor": "mtp.0.attn.wo_b",
+          "reason": "serve-dsv4 does not run the dSpark drafter"
+        },
+        {
+          "tensor": "mtp.0.attn.wq_a",
+          "reason": "serve-dsv4 does not run the dSpark drafter"
+        },
+        {
+          "tensor": "mtp.0.attn.wq_b",
+          "reason": "serve-dsv4 does not run the dSpark drafter"
+        }
+      ]
+    },
+    {
+      "component": "speculator_expert",
+      "owner": "rtx",
+      "tensors": 4608,
+      "bytes": 10267656192,
+      "formats": {
+        "mxfp4-g32": 2304
+      },
+      "status": "unused",
+      "rejected": 2304,
+      "rejections": [
+        {
+          "tensor": "mtp.0.ffn.experts.0.w1",
+          "reason": "serve-dsv4 does not run the dSpark drafter"
+        },
+        {
+          "tensor": "mtp.0.ffn.experts.0.w2",
+          "reason": "serve-dsv4 does not run the dSpark drafter"
+        },
+        {
+          "tensor": "mtp.0.ffn.experts.0.w3",
+          "reason": "serve-dsv4 does not run the dSpark drafter"
+        },
+        {
+          "tensor": "mtp.0.ffn.experts.1.w1",
+          "reason": "serve-dsv4 does not run the dSpark drafter"
+        },
+        {
+          "tensor": "mtp.0.ffn.experts.1.w2",
+          "reason": "serve-dsv4 does not run the dSpark drafter"
+        },
+        {
+          "tensor": "mtp.0.ffn.experts.1.w3",
+          "reason": "serve-dsv4 does not run the dSpark drafter"
+        },
+        {
+          "tensor": "mtp.0.ffn.experts.10.w1",
+          "reason": "serve-dsv4 does not run the dSpark drafter"
+        },
+        {
+          "tensor": "mtp.0.ffn.experts.10.w2",
+          "reason": "serve-dsv4 does not run the dSpark drafter"
+        }
+      ]
+    }
+  ],
+  "unclassified": [],
+  "missing_shards": [],
+  "bytes_by_owner": {
+    "rtx": 19708797688,
+    "spark x3": 147169738752
+  },
+  "placement": {
+    "kind": "sparks",
+    "ranks": 3
+  },
+  "spark_ranks": 3,
+  "experts": {
+    "package": "dsv4f:mxfp4 (expertd-native)",
+    "block": 128,
+    "spark_worlds": [
+      2,
+      3,
+      4,
+      6
+    ],
+    "local": {
+      "Err": "serve-dsv4 runs routed experts on 2, 3, 4 or 6 Spark ranks (its local expert layers supplement them)"
+    }
+  },
+  "placement_supported": true,
+  "min_spark_ranks": 2,
+  "spark_rank_share": 0.375,
+  "fits": false,
+  "launch": {
+    "family": "deepseek_v4",
+    "model_type": "deepseek_v4",
+    "first_expert_layer": 0,
+    "last_expert_layer": null
+  },
+  "expert_storage": null,
+  "hints": [
+    {
+      "what": "rtx0 full memory layout needs 28600404903 bytes, budget 28400687945 bytes, shortfall 199716958 bytes",
+      "how": "Weights, KV, workspaces, graphs and drafts must fit together; reduce the pool/placement or raise the device budget."
+    }
+  ],
+  "memory_layout": {
+    "devices": [
+      {
+        "kind": "rtx",
+        "index": 0,
+        "capacity_bytes": 28400687945,
+        "items": [
+          {
+            "category": "weights",
+            "group": "attention",
+            "format": "bf16",
+            "bytes": 132096,
+            "basis": "exact"
+          },
+          {
+            "category": "weights",
+            "group": "attention",
+            "format": "f32",
+            "bytes": 11008,
+            "basis": "exact"
+          },
+          {
+            "category": "weights",
+            "group": "attention",
+            "format": "f8e4m3",
+            "bytes": 4599054336,
+            "basis": "exact"
+          },
+          {
+            "category": "weights",
+            "group": "attention",
+            "format": "fp8-mma-scale",
+            "bytes": 143720448,
+            "basis": "exact"
+          },
+          {
+            "category": "weights",
+            "group": "compressor",
+            "format": "bf16",
+            "bytes": 608221440,
+            "basis": "exact"
+          },
+          {
+            "category": "weights",
+            "group": "compressor",
+            "format": "f32",
+            "bytes": 5672960,
+            "basis": "exact"
+          },
+          {
+            "category": "embedding",
+            "group": "embedding",
+            "format": "bf16",
+            "bytes": 1059061760,
+            "basis": "exact"
+          },
+          {
+            "category": "weights",
+            "group": "hyper_connection",
+            "format": "f32",
+            "bytes": 135537756,
+            "basis": "exact"
+          },
+          {
+            "category": "weights",
+            "group": "indexer",
+            "format": "bf16",
+            "bytes": 11010048,
+            "basis": "exact"
+          },
+          {
+            "category": "weights",
+            "group": "indexer",
+            "format": "f8e4m3",
+            "bytes": 176160768,
+            "basis": "exact"
+          },
+          {
+            "category": "weights",
+            "group": "indexer",
+            "format": "fp8-mma-scale",
+            "bytes": 5505024,
+            "basis": "exact"
+          },
+          {
+            "category": "weights",
+            "group": "lm_head",
+            "format": "bf16",
+            "bytes": 1059061760,
+            "basis": "exact"
+          },
+          {
+            "category": "weights",
+            "group": "norm",
+            "format": "bf16",
+            "bytes": 712704,
+            "basis": "exact"
+          },
+          {
+            "category": "weights",
+            "group": "router",
+            "format": "bf16",
+            "bytes": 90177536,
+            "basis": "exact"
+          },
+          {
+            "category": "weights",
+            "group": "router",
+            "format": "f32",
+            "bytes": 40960,
+            "basis": "exact"
+          },
+          {
+            "category": "weights",
+            "group": "router",
+            "format": "i32",
+            "bytes": 9308160,
+            "basis": "exact"
+          },
+          {
+            "category": "weights",
+            "group": "shared_expert",
+            "format": "f8e4m3",
+            "bytes": 1082130432,
+            "basis": "exact"
+          },
+          {
+            "category": "weights",
+            "group": "shared_expert",
+            "format": "fp8-mma-scale",
+            "bytes": 33816576,
+            "basis": "exact"
+          },
+          {
+            "category": "drafter",
+            "group": "speculator",
+            "format": "bf16",
+            "bytes": 138757632,
+            "basis": "exact"
+          },
+          {
+            "category": "drafter",
+            "group": "speculator",
+            "format": "f32",
+            "bytes": 9703836,
+            "basis": "exact"
+          },
+          {
+            "category": "drafter",
+            "group": "speculator",
+            "format": "f8e4m3",
+            "bytes": 446693376,
+            "basis": "exact"
+          },
+          {
+            "category": "drafter",
+            "group": "speculator",
+            "format": "f8e8m0",
+            "bytes": 3072,
+            "basis": "exact"
+          },
+          {
+            "category": "drafter",
+            "group": "speculator",
+            "format": "fp8-mma-scale",
+            "bytes": 12386304,
+            "basis": "exact"
+          },
+          {
+            "category": "runtime",
+            "group": "context+modules",
+            "format": "",
+            "bytes": 697932185,
+            "basis": "estimated"
+          },
+          {
+            "category": "runtime",
+            "group": "graph allowance",
+            "format": "",
+            "bytes": 375809638,
+            "basis": "estimated"
+          },
+          {
+            "category": "workspace",
+            "group": "steps",
+            "format": "",
+            "bytes": 4617306544,
+            "basis": "formula"
+          },
+          {
+            "category": "experts",
+            "group": "dSpark stage experts",
+            "format": "native",
+            "bytes": 10267656192,
+            "basis": "exact"
+          },
+          {
+            "category": "experts",
+            "group": "local expert workspace",
+            "format": "",
+            "bytes": 167772160,
+            "basis": "estimated"
+          },
+          {
+            "category": "kv",
+            "group": "state",
+            "format": "",
+            "bytes": 1677316608,
+            "basis": "formula"
+          },
+          {
+            "category": "prefix",
+            "group": "marks",
+            "format": "",
+            "bytes": 1169731584,
+            "basis": "formula"
+          },
+          {
+            "category": "kv",
+            "group": "records",
+            "format": "",
+            "bytes": 0,
+            "basis": "formula"
+          }
+        ],
+        "kv_tokens": 0
+      },
+      {
+        "kind": "spark",
+        "index": 0,
+        "capacity_bytes": 129922760704,
+        "items": [
+          {
+            "category": "reserved",
+            "group": "host OS+sparknestd",
+            "format": "",
+            "bytes": 13958643712,
+            "basis": "estimated"
+          },
+          {
+            "category": "experts",
+            "group": "routed_expert",
+            "format": "mxfp4-g32",
+            "bytes": 55188652032,
+            "basis": "exact"
+          },
+          {
+            "category": "workspace",
+            "group": "expert waves",
+            "format": "",
+            "bytes": 375809638,
+            "basis": "estimated"
+          },
+          {
+            "category": "transport",
+            "group": "rdma rings",
+            "format": "",
+            "bytes": 558345748,
+            "basis": "estimated"
+          },
+          {
+            "category": "runtime",
+            "group": "context+modules",
+            "format": "",
+            "bytes": 536870912,
+            "basis": "estimated"
+          }
+        ],
+        "kv_tokens": 0
+      },
+      {
+        "kind": "spark",
+        "index": 1,
+        "capacity_bytes": 129922760704,
+        "items": [
+          {
+            "category": "reserved",
+            "group": "host OS+sparknestd",
+            "format": "",
+            "bytes": 13958643712,
+            "basis": "estimated"
+          },
+          {
+            "category": "experts",
+            "group": "routed_expert",
+            "format": "mxfp4-g32",
+            "bytes": 45990543360,
+            "basis": "exact"
+          },
+          {
+            "category": "workspace",
+            "group": "expert waves",
+            "format": "",
+            "bytes": 375809638,
+            "basis": "estimated"
+          },
+          {
+            "category": "transport",
+            "group": "rdma rings",
+            "format": "",
+            "bytes": 558345748,
+            "basis": "estimated"
+          },
+          {
+            "category": "runtime",
+            "group": "context+modules",
+            "format": "",
+            "bytes": 536870912,
+            "basis": "estimated"
+          }
+        ],
+        "kv_tokens": 0
+      },
+      {
+        "kind": "spark",
+        "index": 2,
+        "capacity_bytes": 129922760704,
+        "items": [
+          {
+            "category": "reserved",
+            "group": "host OS+sparknestd",
+            "format": "",
+            "bytes": 13958643712,
+            "basis": "estimated"
+          },
+          {
+            "category": "experts",
+            "group": "routed_expert",
+            "format": "mxfp4-g32",
+            "bytes": 45990543360,
+            "basis": "exact"
+          },
+          {
+            "category": "workspace",
+            "group": "expert waves",
+            "format": "",
+            "bytes": 375809638,
+            "basis": "estimated"
+          },
+          {
+            "category": "transport",
+            "group": "rdma rings",
+            "format": "",
+            "bytes": 558345748,
+            "basis": "estimated"
+          },
+          {
+            "category": "runtime",
+            "group": "context+modules",
+            "format": "",
+            "bytes": 536870912,
+            "basis": "estimated"
+          }
+        ],
+        "kv_tokens": 0
+      }
+    ],
+    "pool_tokens": 0,
+    "waste": [],
+    "notes": [
+      "resolved context 1048576 tokens (checkpoint 1048576)",
+      "deepseek_v4: workspace/runtime/Spark allowances are unqualified; validate against the allocation ledger before using this layout for admission",
+      "vision Off: disabled or no checkpoint tower; 0 bytes admitted; shortfall 0 bytes",
+      "full-context admission shortfall: context 1048576 tokens, pool 0 tokens, shortfall 1048576 tokens",
+      "rtx0: requested KV pool exceeds the device budget"
+    ]
+  }
+}

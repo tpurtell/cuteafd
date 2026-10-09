@@ -1,0 +1,17 @@
+{
+  "run_id": "9f962b35712e4e129d83ee79d2801663",
+  "status": "failed",
+  "performance_measured": false,
+  "worker": "ostrich",
+  "timestamp": "2026-10-09T04:34:44.488233Z",
+  "existing_ring_bytes": [
+    134217728,
+    151060480
+  ],
+  "reconnect_ring_bytes": 134217728,
+  "requested_total_bytes": 419495936,
+  "budget_limit_bytes": 302120960,
+  "error": "mapped RDMA ring budget exceeded: 419495936 bytes requested in total, limit is 302120960",
+  "diagnosis": "startup expert-session reconnect overlaps the old endpoint; vision uses plain TCP",
+  "fix_status": "targeted rc3; not shipped or validated in rc2"
+}

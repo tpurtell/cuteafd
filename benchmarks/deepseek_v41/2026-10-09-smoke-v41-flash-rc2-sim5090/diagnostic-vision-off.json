@@ -1,0 +1,469 @@
+{
+  "schema": "cuteafd.bench.report/1",
+  "id": "3c4b3c16c2f5445a96cfdc6b715cd8c7",
+  "created": "2026-10-09T05:18:18Z",
+  "finished": "2026-10-09T05:18:20Z",
+  "status": "failed",
+  "profile": "smoke",
+  "plan": [
+    {
+      "id": "hardware",
+      "passes": 1
+    },
+    {
+      "id": "configuration",
+      "passes": 1
+    }
+  ],
+  "server": {
+    "model": "deepseek-ai/DeepSeek-V4.1-Flash",
+    "family": "deepseek_v41",
+    "revision": "dba1be0a40aa45a94ad051997016db3960a90277",
+    "build": {
+      "version": "0.1.0",
+      "release": "v2.0.0-rc2",
+      "image": "ghcr.io/tpurtell/cuteafd-coordinator:v2.0.0-rc2",
+      "remote": null,
+      "commit": "8de2f56adae63c20771b1c8b9f72e2e1bbd0424c",
+      "dirty": false
+    },
+    "hardware": {
+      "host": "raptor",
+      "gpus": [
+        {
+          "index": 0,
+          "name": "NVIDIA RTX PRO 6000 Blackwell Workstation Edition",
+          "uuid": "GPU-fe5b6dd0-a77c-c8fb-6360-e1b9d9918ac0",
+          "memory_mib": 97887,
+          "power_limit_w": 325.0,
+          "power_max_w": 600.0,
+          "sm_count": 188,
+          "compute_cap": "12.0",
+          "pcie": "Gen5 x16",
+          "used": true
+        }
+      ],
+      "driver": "595.91.07",
+      "cuda": "13.2",
+      "sparks": [
+        {
+          "address": "10.55.0.1",
+          "name": null,
+          "rank": 0
+        },
+        {
+          "address": "10.55.0.2",
+          "name": null,
+          "rank": 1
+        },
+        {
+          "address": "10.55.0.3",
+          "name": null,
+          "rank": 2
+        }
+      ],
+      "fabric": [
+        {
+          "device": "mlx5_0",
+          "port": 1,
+          "active": true,
+          "link_gbps": 400.0,
+          "pcie": "32 GT/s x16",
+          "netdev": "enp1s0np0",
+          "subnets": [
+            "10.55.0.0/24",
+            "10.55.1.0/24"
+          ]
+        }
+      ],
+      "rails": "fabric: use 2 rail(s) of [mlx5_0@10.55.0.22/24 400G(eff 400G), mlx5_0@10.55.1.22/24 400G(eff 400G)]: 2 subnets share one 400 Gb/s port; each rail is a subnet of the same link"
+    },
+    "configuration": {
+      "snapshot": "/root/.cache/huggingface/hub/models--deepseek-ai--DeepSeek-V4.1-Flash/snapshots/dba1be0a40aa45a94ad051997016db3960a90277",
+      "quant": [
+        {
+          "group": "embedding",
+          "formats": [
+            "bf16"
+          ]
+        },
+        {
+          "group": "lm head",
+          "formats": [
+            "bf16"
+          ]
+        },
+        {
+          "group": "norm",
+          "formats": [
+            "bf16"
+          ]
+        },
+        {
+          "group": "attention",
+          "formats": [
+            "bf16",
+            "f32",
+            "fp8-block32x32/ue8m0"
+          ]
+        },
+        {
+          "group": "indexer",
+          "formats": [
+            "bf16",
+            "fp8-block32x32/ue8m0"
+          ]
+        },
+        {
+          "group": "compressor",
+          "formats": [
+            "bf16"
+          ]
+        },
+        {
+          "group": "hyper connection",
+          "formats": [
+            "f32"
+          ]
+        },
+        {
+          "group": "router",
+          "formats": [
+            "bf16",
+            "f32"
+          ]
+        },
+        {
+          "group": "shared expert",
+          "formats": [
+            "fp8-block32x32/ue8m0"
+          ]
+        },
+        {
+          "group": "routed expert",
+          "formats": [
+            "mxfp4-g32"
+          ]
+        },
+        {
+          "group": "mapped table",
+          "formats": [
+            "fp8-block1x32/ue8m0"
+          ]
+        },
+        {
+          "group": "table projection",
+          "formats": [
+            "bf16",
+            "fp8-block32x32/ue8m0"
+          ]
+        },
+        {
+          "group": "speculator",
+          "formats": [
+            "bf16",
+            "f32",
+            "fp8-block32x32/ue8m0"
+          ]
+        },
+        {
+          "group": "speculator expert",
+          "formats": [
+            "mxfp4-g32"
+          ]
+        },
+        {
+          "group": "vision",
+          "formats": [
+            "bf16"
+          ]
+        }
+      ],
+      "speculator": "dSpark (\u22645 drafts)",
+      "layout": "1 RTX \u00b7 experts TP3\u00d7EP1 over 3 Sparks",
+      "settings": [
+        {
+          "name": "embedding-placement",
+          "value": "host",
+          "default": null,
+          "source": "cli"
+        },
+        {
+          "name": "rtx-gpus",
+          "value": "1",
+          "default": "1",
+          "source": "cli"
+        },
+        {
+          "name": "tp2-attention",
+          "value": "false",
+          "default": "false",
+          "source": "default"
+        },
+        {
+          "name": "tp2-query-projection",
+          "value": "false",
+          "default": "false",
+          "source": "default"
+        },
+        {
+          "name": "tp2-output-projection",
+          "value": "false",
+          "default": "false",
+          "source": "default"
+        },
+        {
+          "name": "tp2-dspark-experts",
+          "value": "false",
+          "default": "false",
+          "source": "default"
+        },
+        {
+          "name": "prefill-batch-tokens",
+          "value": "1024",
+          "default": "80",
+          "source": "cli"
+        },
+        {
+          "name": "max-context-tokens",
+          "value": "1048576",
+          "default": "1048576",
+          "source": "cli"
+        },
+        {
+          "name": "max-output-tokens",
+          "value": "393216",
+          "default": "393216",
+          "source": "cli"
+        },
+        {
+          "name": "pool-tokens",
+          "value": "0",
+          "default": null,
+          "source": "cli"
+        },
+        {
+          "name": "memory-reservation",
+          "value": "97%",
+          "default": null,
+          "source": "cli"
+        },
+        {
+          "name": "rtx-expert-layers",
+          "value": "0",
+          "default": "auto",
+          "source": "cli"
+        },
+        {
+          "name": "exl3-paired-tp4",
+          "value": "false",
+          "default": "false",
+          "source": "default"
+        },
+        {
+          "name": "concurrency",
+          "value": "16",
+          "default": "16",
+          "source": "cli"
+        },
+        {
+          "name": "http-queue-depth",
+          "value": "16",
+          "default": null,
+          "source": "cli"
+        },
+        {
+          "name": "http-queue-wait-ms",
+          "value": "25000",
+          "default": "25000",
+          "source": "cli"
+        },
+        {
+          "name": "prefix-cache-entries",
+          "value": "20",
+          "default": "20",
+          "source": "cli"
+        },
+        {
+          "name": "host-cache-bytes",
+          "value": "auto",
+          "default": "0",
+          "source": "cli"
+        },
+        {
+          "name": "host-cache-chunk-bytes",
+          "value": "268435456",
+          "default": "268435456",
+          "source": "default"
+        },
+        {
+          "name": "host-cache-store",
+          "value": "on-retain",
+          "default": "on-retain",
+          "source": "default"
+        },
+        {
+          "name": "host-cache-copy-budget-ms",
+          "value": "1000",
+          "default": "1000",
+          "source": "default"
+        },
+        {
+          "name": "host-cache-restore-budget-ms",
+          "value": "500",
+          "default": "500",
+          "source": "default"
+        },
+        {
+          "name": "host-cache-store-pace-ms",
+          "value": "0",
+          "default": "0",
+          "source": "default"
+        },
+        {
+          "name": "host-cache-min-tokens",
+          "value": "512",
+          "default": "512",
+          "source": "default"
+        },
+        {
+          "name": "host-cache-max-tokens",
+          "value": "1048576",
+          "default": "1048576",
+          "source": "default"
+        },
+        {
+          "name": "host-cache-kinds",
+          "value": "prompt,turn",
+          "default": "prompt,turn",
+          "source": "default"
+        },
+        {
+          "name": "dspark",
+          "value": "true",
+          "default": "false",
+          "source": "cli"
+        },
+        {
+          "name": "dspark-draft-limit",
+          "value": "5",
+          "default": "5",
+          "source": "default"
+        },
+        {
+          "name": "dspark-fixed",
+          "value": "false",
+          "default": "false",
+          "source": "default"
+        },
+        {
+          "name": "independent-decode-lanes",
+          "value": "false",
+          "default": "false",
+          "source": "default"
+        },
+        {
+          "name": "console-text",
+          "value": "false",
+          "default": "false",
+          "source": "default"
+        },
+        {
+          "name": "api-key-file",
+          "value": "/run/cuteafd-api-key",
+          "default": null,
+          "source": "cli"
+        },
+        {
+          "name": "enable-bench",
+          "value": "true",
+          "default": "false",
+          "source": "cli"
+        },
+        {
+          "name": "snapshot",
+          "value": "/root/.cache/huggingface/hub/models--deepseek-ai--DeepSeek-V4.1-Flash/snapshots/dba1be0a40aa45a94ad051997016db3960a90277",
+          "default": null,
+          "source": "cli"
+        },
+        {
+          "name": "native-lib",
+          "value": "/opt/cuteafd/lib/libcuteafd_native.so",
+          "default": null,
+          "source": "cli"
+        },
+        {
+          "name": "peers",
+          "value": "10.55.0.1:19602,10.55.0.2:19602,10.55.0.3:19602",
+          "default": null,
+          "source": "cli"
+        },
+        {
+          "name": "listen",
+          "value": "0.0.0.0:8502",
+          "default": "127.0.0.1:8000",
+          "source": "cli"
+        },
+        {
+          "name": "spark-tp",
+          "value": "3",
+          "default": null,
+          "source": "cli"
+        },
+        {
+          "name": "spark-ep",
+          "value": "1",
+          "default": null,
+          "source": "cli"
+        },
+        {
+          "name": "coordinator-gpu-budget-gib",
+          "value": "31.8",
+          "default": null,
+          "source": "cli"
+        },
+        {
+          "name": "CUTEAFD_COPY_DRAFTS",
+          "value": "0",
+          "default": "0",
+          "source": "env"
+        },
+        {
+          "name": "CUTEAFD_V41_IMAGE_ADMISSIONS",
+          "value": "2",
+          "default": null,
+          "source": "env"
+        }
+      ]
+    },
+    "readiness_s": 9.173919816,
+    "started": "2026-10-09T05:18:08Z"
+  },
+  "fingerprint": "40d7690f470a9821",
+  "baseline": null,
+  "panels": [
+    {
+      "id": "hardware",
+      "title": "Hardware",
+      "status": "cancelled",
+      "passes": [],
+      "started": null,
+      "finished": null,
+      "seconds": 0.0,
+      "error": null,
+      "history": []
+    },
+    {
+      "id": "configuration",
+      "title": "Configuration",
+      "status": "cancelled",
+      "passes": [],
+      "started": null,
+      "finished": null,
+      "seconds": 0.0,
+      "error": null,
+      "history": []
+    }
+  ],
+  "error": "warm-up request: stream error: {\"message\":\"verbs-host ProtocolV2 control plane closed\",\"type\":\"native_v41_error\"}"
+}

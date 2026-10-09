@@ -1,0 +1,1699 @@
+{
+  "vision": "auto",
+  "audio": "off",
+  "disabled_media_bytes": 0,
+  "encoder": {
+    "kind": {
+      "kind": "off"
+    },
+    "weights": 0,
+    "scratch": 0,
+    "replicas": [],
+    "reason": "disabled or no checkpoint tower",
+    "shortfall": 0
+  },
+  "audio_encoder": null,
+  "encoder_plan_hash": "fbd8e4141f585bb994752040b5b3fe0135baa1384856cd68158903051f9392b5",
+  "snapshot": "/root/.cache/huggingface/hub/models--wrldsuksgo2mars--GLM-5.3-EXL3-K4-v1/snapshots/47af23347db743b4666d952e2eb48f2b01c3fede",
+  "family": "glm5",
+  "architectures": [
+    "GlmMoeDsaForCausalLM"
+  ],
+  "quantization": null,
+  "runtime": "serving",
+  "config_error": null,
+  "spec": {
+    "family": "glm5",
+    "architecture": "GlmMoeDsaForCausalLM",
+    "hidden": 6144,
+    "vocab": 154880,
+    "layers": [
+      {
+        "attention": {
+          "kind": "mla_dsa",
+          "indexer": true
+        },
+        "ffn": {
+          "kind": "dense",
+          "intermediate": 12288
+        },
+        "rope": {
+          "dims": 64,
+          "theta": 8000000.0
+        }
+      },
+      {
+        "attention": {
+          "kind": "mla_dsa",
+          "indexer": true
+        },
+        "ffn": {
+          "kind": "dense",
+          "intermediate": 12288
+        },
+        "rope": {
+          "dims": 64,
+          "theta": 8000000.0
+        }
+      },
+      {
+        "attention": {
+          "kind": "mla_dsa",
+          "indexer": true
+        },
+        "ffn": {
+          "kind": "dense",
+          "intermediate": 12288
+        },
+        "rope": {
+          "dims": 64,
+          "theta": 8000000.0
+        }
+      },
+      {
+        "attention": {
+          "kind": "mla_dsa",
+          "indexer": false
+        },
+        "ffn": {
+          "kind": "moe"
+        },
+        "rope": {
+          "dims": 64,
+          "theta": 8000000.0
+        }
+      },
+      {
+        "attention": {
+          "kind": "mla_dsa",
+          "indexer": false
+        },
+        "ffn": {
+          "kind": "moe"
+        },
+        "rope": {
+          "dims": 64,
+          "theta": 8000000.0
+        }
+      },
+      {
+        "attention": {
+          "kind": "mla_dsa",
+          "indexer": false
+        },
+        "ffn": {
+          "kind": "moe"
+        },
+        "rope": {
+          "dims": 64,
+          "theta": 8000000.0
+        }
+      },
+      {
+        "attention": {
+          "kind": "mla_dsa",
+          "indexer": true
+        },
+        "ffn": {
+          "kind": "moe"
+        },
+        "rope": {
+          "dims": 64,
+          "theta": 8000000.0
+        }
+      },
+      {
+        "attention": {
+          "kind": "mla_dsa",
+          "indexer": false
+        },
+        "ffn": {
+          "kind": "moe"
+        },
+        "rope": {
+          "dims": 64,
+          "theta": 8000000.0
+        }
+      },
+      {
+        "attention": {
+          "kind": "mla_dsa",
+          "indexer": false
+        },
+        "ffn": {
+          "kind": "moe"
+        },
+        "rope": {
+          "dims": 64,
+          "theta": 8000000.0
+        }
+      },
+      {
+        "attention": {
+          "kind": "mla_dsa",
+          "indexer": false
+        },
+        "ffn": {
+          "kind": "moe"
+        },
+        "rope": {
+          "dims": 64,
+          "theta": 8000000.0
+        }
+      },
+      {
+        "attention": {
+          "kind": "mla_dsa",
+          "indexer": true
+        },
+        "ffn": {
+          "kind": "moe"
+        },
+        "rope": {
+          "dims": 64,
+          "theta": 8000000.0
+        }
+      },
+      {
+        "attention": {
+          "kind": "mla_dsa",
+          "indexer": false
+        },
+        "ffn": {
+          "kind": "moe"
+        },
+        "rope": {
+          "dims": 64,
+          "theta": 8000000.0
+        }
+      },
+      {
+        "attention": {
+          "kind": "mla_dsa",
+          "indexer": false
+        },
+        "ffn": {
+          "kind": "moe"
+        },
+        "rope": {
+          "dims": 64,
+          "theta": 8000000.0
+        }
+      },
+      {
+        "attention": {
+          "kind": "mla_dsa",
+          "indexer": false
+        },
+        "ffn": {
+          "kind": "moe"
+        },
+        "rope": {
+          "dims": 64,
+          "theta": 8000000.0
+        }
+      },
+      {
+        "attention": {
+          "kind": "mla_dsa",
+          "indexer": true
+        },
+        "ffn": {
+          "kind": "moe"
+        },
+        "rope": {
+          "dims": 64,
+          "theta": 8000000.0
+        }
+      },
+      {
+        "attention": {
+          "kind": "mla_dsa",
+          "indexer": false
+        },
+        "ffn": {
+          "kind": "moe"
+        },
+        "rope": {
+          "dims": 64,
+          "theta": 8000000.0
+        }
+      },
+      {
+        "attention": {
+          "kind": "mla_dsa",
+          "indexer": false
+        },
+        "ffn": {
+          "kind": "moe"
+        },
+        "rope": {
+          "dims": 64,
+          "theta": 8000000.0
+        }
+      },
+      {
+        "attention": {
+          "kind": "mla_dsa",
+          "indexer": false
+        },
+        "ffn": {
+          "kind": "moe"
+        },
+        "rope": {
+          "dims": 64,
+          "theta": 8000000.0
+        }
+      },
+      {
+        "attention": {
+          "kind": "mla_dsa",
+          "indexer": true
+        },
+        "ffn": {
+          "kind": "moe"
+        },
+        "rope": {
+          "dims": 64,
+          "theta": 8000000.0
+        }
+      },
+      {
+        "attention": {
+          "kind": "mla_dsa",
+          "indexer": false
+        },
+        "ffn": {
+          "kind": "moe"
+        },
+        "rope": {
+          "dims": 64,
+          "theta": 8000000.0
+        }
+      },
+      {
+        "attention": {
+          "kind": "mla_dsa",
+          "indexer": false
+        },
+        "ffn": {
+          "kind": "moe"
+        },
+        "rope": {
+          "dims": 64,
+          "theta": 8000000.0
+        }
+      },
+      {
+        "attention": {
+          "kind": "mla_dsa",
+          "indexer": false
+        },
+        "ffn": {
+          "kind": "moe"
+        },
+        "rope": {
+          "dims": 64,
+          "theta": 8000000.0
+        }
+      },
+      {
+        "attention": {
+          "kind": "mla_dsa",
+          "indexer": true
+        },
+        "ffn": {
+          "kind": "moe"
+        },
+        "rope": {
+          "dims": 64,
+          "theta": 8000000.0
+        }
+      },
+      {
+        "attention": {
+          "kind": "mla_dsa",
+          "indexer": false
+        },
+        "ffn": {
+          "kind": "moe"
+        },
+        "rope": {
+          "dims": 64,
+          "theta": 8000000.0
+        }
+      },
+      {
+        "attention": {
+          "kind": "mla_dsa",
+          "indexer": false
+        },
+        "ffn": {
+          "kind": "moe"
+        },
+        "rope": {
+          "dims": 64,
+          "theta": 8000000.0
+        }
+      },
+      {
+        "attention": {
+          "kind": "mla_dsa",
+          "indexer": false
+        },
+        "ffn": {
+          "kind": "moe"
+        },
+        "rope": {
+          "dims": 64,
+          "theta": 8000000.0
+        }
+      },
+      {
+        "attention": {
+          "kind": "mla_dsa",
+          "indexer": true
+        },
+        "ffn": {
+          "kind": "moe"
+        },
+        "rope": {
+          "dims": 64,
+          "theta": 8000000.0
+        }
+      },
+      {
+        "attention": {
+          "kind": "mla_dsa",
+          "indexer": false
+        },
+        "ffn": {
+          "kind": "moe"
+        },
+        "rope": {
+          "dims": 64,
+          "theta": 8000000.0
+        }
+      },
+      {
+        "attention": {
+          "kind": "mla_dsa",
+          "indexer": false
+        },
+        "ffn": {
+          "kind": "moe"
+        },
+        "rope": {
+          "dims": 64,
+          "theta": 8000000.0
+        }
+      },
+      {
+        "attention": {
+          "kind": "mla_dsa",
+          "indexer": false
+        },
+        "ffn": {
+          "kind": "moe"
+        },
+        "rope": {
+          "dims": 64,
+          "theta": 8000000.0
+        }
+      },
+      {
+        "attention": {
+          "kind": "mla_dsa",
+          "indexer": true
+        },
+        "ffn": {
+          "kind": "moe"
+        },
+        "rope": {
+          "dims": 64,
+          "theta": 8000000.0
+        }
+      },
+      {
+        "attention": {
+          "kind": "mla_dsa",
+          "indexer": false
+        },
+        "ffn": {
+          "kind": "moe"
+        },
+        "rope": {
+          "dims": 64,
+          "theta": 8000000.0
+        }
+      },
+      {
+        "attention": {
+          "kind": "mla_dsa",
+          "indexer": false
+        },
+        "ffn": {
+          "kind": "moe"
+        },
+        "rope": {
+          "dims": 64,
+          "theta": 8000000.0
+        }
+      },
+      {
+        "attention": {
+          "kind": "mla_dsa",
+          "indexer": false
+        },
+        "ffn": {
+          "kind": "moe"
+        },
+        "rope": {
+          "dims": 64,
+          "theta": 8000000.0
+        }
+      },
+      {
+        "attention": {
+          "kind": "mla_dsa",
+          "indexer": true
+        },
+        "ffn": {
+          "kind": "moe"
+        },
+        "rope": {
+          "dims": 64,
+          "theta": 8000000.0
+        }
+      },
+      {
+        "attention": {
+          "kind": "mla_dsa",
+          "indexer": false
+        },
+        "ffn": {
+          "kind": "moe"
+        },
+        "rope": {
+          "dims": 64,
+          "theta": 8000000.0
+        }
+      },
+      {
+        "attention": {
+          "kind": "mla_dsa",
+          "indexer": false
+        },
+        "ffn": {
+          "kind": "moe"
+        },
+        "rope": {
+          "dims": 64,
+          "theta": 8000000.0
+        }
+      },
+      {
+        "attention": {
+          "kind": "mla_dsa",
+          "indexer": false
+        },
+        "ffn": {
+          "kind": "moe"
+        },
+        "rope": {
+          "dims": 64,
+          "theta": 8000000.0
+        }
+      },
+      {
+        "attention": {
+          "kind": "mla_dsa",
+          "indexer": true
+        },
+        "ffn": {
+          "kind": "moe"
+        },
+        "rope": {
+          "dims": 64,
+          "theta": 8000000.0
+        }
+      },
+      {
+        "attention": {
+          "kind": "mla_dsa",
+          "indexer": false
+        },
+        "ffn": {
+          "kind": "moe"
+        },
+        "rope": {
+          "dims": 64,
+          "theta": 8000000.0
+        }
+      },
+      {
+        "attention": {
+          "kind": "mla_dsa",
+          "indexer": false
+        },
+        "ffn": {
+          "kind": "moe"
+        },
+        "rope": {
+          "dims": 64,
+          "theta": 8000000.0
+        }
+      },
+      {
+        "attention": {
+          "kind": "mla_dsa",
+          "indexer": false
+        },
+        "ffn": {
+          "kind": "moe"
+        },
+        "rope": {
+          "dims": 64,
+          "theta": 8000000.0
+        }
+      },
+      {
+        "attention": {
+          "kind": "mla_dsa",
+          "indexer": true
+        },
+        "ffn": {
+          "kind": "moe"
+        },
+        "rope": {
+          "dims": 64,
+          "theta": 8000000.0
+        }
+      },
+      {
+        "attention": {
+          "kind": "mla_dsa",
+          "indexer": false
+        },
+        "ffn": {
+          "kind": "moe"
+        },
+        "rope": {
+          "dims": 64,
+          "theta": 8000000.0
+        }
+      },
+      {
+        "attention": {
+          "kind": "mla_dsa",
+          "indexer": false
+        },
+        "ffn": {
+          "kind": "moe"
+        },
+        "rope": {
+          "dims": 64,
+          "theta": 8000000.0
+        }
+      },
+      {
+        "attention": {
+          "kind": "mla_dsa",
+          "indexer": false
+        },
+        "ffn": {
+          "kind": "moe"
+        },
+        "rope": {
+          "dims": 64,
+          "theta": 8000000.0
+        }
+      },
+      {
+        "attention": {
+          "kind": "mla_dsa",
+          "indexer": true
+        },
+        "ffn": {
+          "kind": "moe"
+        },
+        "rope": {
+          "dims": 64,
+          "theta": 8000000.0
+        }
+      },
+      {
+        "attention": {
+          "kind": "mla_dsa",
+          "indexer": false
+        },
+        "ffn": {
+          "kind": "moe"
+        },
+        "rope": {
+          "dims": 64,
+          "theta": 8000000.0
+        }
+      },
+      {
+        "attention": {
+          "kind": "mla_dsa",
+          "indexer": false
+        },
+        "ffn": {
+          "kind": "moe"
+        },
+        "rope": {
+          "dims": 64,
+          "theta": 8000000.0
+        }
+      },
+      {
+        "attention": {
+          "kind": "mla_dsa",
+          "indexer": false
+        },
+        "ffn": {
+          "kind": "moe"
+        },
+        "rope": {
+          "dims": 64,
+          "theta": 8000000.0
+        }
+      },
+      {
+        "attention": {
+          "kind": "mla_dsa",
+          "indexer": true
+        },
+        "ffn": {
+          "kind": "moe"
+        },
+        "rope": {
+          "dims": 64,
+          "theta": 8000000.0
+        }
+      },
+      {
+        "attention": {
+          "kind": "mla_dsa",
+          "indexer": false
+        },
+        "ffn": {
+          "kind": "moe"
+        },
+        "rope": {
+          "dims": 64,
+          "theta": 8000000.0
+        }
+      },
+      {
+        "attention": {
+          "kind": "mla_dsa",
+          "indexer": false
+        },
+        "ffn": {
+          "kind": "moe"
+        },
+        "rope": {
+          "dims": 64,
+          "theta": 8000000.0
+        }
+      },
+      {
+        "attention": {
+          "kind": "mla_dsa",
+          "indexer": false
+        },
+        "ffn": {
+          "kind": "moe"
+        },
+        "rope": {
+          "dims": 64,
+          "theta": 8000000.0
+        }
+      },
+      {
+        "attention": {
+          "kind": "mla_dsa",
+          "indexer": true
+        },
+        "ffn": {
+          "kind": "moe"
+        },
+        "rope": {
+          "dims": 64,
+          "theta": 8000000.0
+        }
+      },
+      {
+        "attention": {
+          "kind": "mla_dsa",
+          "indexer": false
+        },
+        "ffn": {
+          "kind": "moe"
+        },
+        "rope": {
+          "dims": 64,
+          "theta": 8000000.0
+        }
+      },
+      {
+        "attention": {
+          "kind": "mla_dsa",
+          "indexer": false
+        },
+        "ffn": {
+          "kind": "moe"
+        },
+        "rope": {
+          "dims": 64,
+          "theta": 8000000.0
+        }
+      },
+      {
+        "attention": {
+          "kind": "mla_dsa",
+          "indexer": false
+        },
+        "ffn": {
+          "kind": "moe"
+        },
+        "rope": {
+          "dims": 64,
+          "theta": 8000000.0
+        }
+      },
+      {
+        "attention": {
+          "kind": "mla_dsa",
+          "indexer": true
+        },
+        "ffn": {
+          "kind": "moe"
+        },
+        "rope": {
+          "dims": 64,
+          "theta": 8000000.0
+        }
+      },
+      {
+        "attention": {
+          "kind": "mla_dsa",
+          "indexer": false
+        },
+        "ffn": {
+          "kind": "moe"
+        },
+        "rope": {
+          "dims": 64,
+          "theta": 8000000.0
+        }
+      },
+      {
+        "attention": {
+          "kind": "mla_dsa",
+          "indexer": false
+        },
+        "ffn": {
+          "kind": "moe"
+        },
+        "rope": {
+          "dims": 64,
+          "theta": 8000000.0
+        }
+      },
+      {
+        "attention": {
+          "kind": "mla_dsa",
+          "indexer": false
+        },
+        "ffn": {
+          "kind": "moe"
+        },
+        "rope": {
+          "dims": 64,
+          "theta": 8000000.0
+        }
+      },
+      {
+        "attention": {
+          "kind": "mla_dsa",
+          "indexer": true
+        },
+        "ffn": {
+          "kind": "moe"
+        },
+        "rope": {
+          "dims": 64,
+          "theta": 8000000.0
+        }
+      },
+      {
+        "attention": {
+          "kind": "mla_dsa",
+          "indexer": false
+        },
+        "ffn": {
+          "kind": "moe"
+        },
+        "rope": {
+          "dims": 64,
+          "theta": 8000000.0
+        }
+      },
+      {
+        "attention": {
+          "kind": "mla_dsa",
+          "indexer": false
+        },
+        "ffn": {
+          "kind": "moe"
+        },
+        "rope": {
+          "dims": 64,
+          "theta": 8000000.0
+        }
+      },
+      {
+        "attention": {
+          "kind": "mla_dsa",
+          "indexer": false
+        },
+        "ffn": {
+          "kind": "moe"
+        },
+        "rope": {
+          "dims": 64,
+          "theta": 8000000.0
+        }
+      },
+      {
+        "attention": {
+          "kind": "mla_dsa",
+          "indexer": true
+        },
+        "ffn": {
+          "kind": "moe"
+        },
+        "rope": {
+          "dims": 64,
+          "theta": 8000000.0
+        }
+      },
+      {
+        "attention": {
+          "kind": "mla_dsa",
+          "indexer": false
+        },
+        "ffn": {
+          "kind": "moe"
+        },
+        "rope": {
+          "dims": 64,
+          "theta": 8000000.0
+        }
+      },
+      {
+        "attention": {
+          "kind": "mla_dsa",
+          "indexer": false
+        },
+        "ffn": {
+          "kind": "moe"
+        },
+        "rope": {
+          "dims": 64,
+          "theta": 8000000.0
+        }
+      },
+      {
+        "attention": {
+          "kind": "mla_dsa",
+          "indexer": false
+        },
+        "ffn": {
+          "kind": "moe"
+        },
+        "rope": {
+          "dims": 64,
+          "theta": 8000000.0
+        }
+      },
+      {
+        "attention": {
+          "kind": "mla_dsa",
+          "indexer": true
+        },
+        "ffn": {
+          "kind": "moe"
+        },
+        "rope": {
+          "dims": 64,
+          "theta": 8000000.0
+        }
+      },
+      {
+        "attention": {
+          "kind": "mla_dsa",
+          "indexer": false
+        },
+        "ffn": {
+          "kind": "moe"
+        },
+        "rope": {
+          "dims": 64,
+          "theta": 8000000.0
+        }
+      },
+      {
+        "attention": {
+          "kind": "mla_dsa",
+          "indexer": false
+        },
+        "ffn": {
+          "kind": "moe"
+        },
+        "rope": {
+          "dims": 64,
+          "theta": 8000000.0
+        }
+      },
+      {
+        "attention": {
+          "kind": "mla_dsa",
+          "indexer": false
+        },
+        "ffn": {
+          "kind": "moe"
+        },
+        "rope": {
+          "dims": 64,
+          "theta": 8000000.0
+        }
+      },
+      {
+        "attention": {
+          "kind": "mla_dsa",
+          "indexer": true
+        },
+        "ffn": {
+          "kind": "moe"
+        },
+        "rope": {
+          "dims": 64,
+          "theta": 8000000.0
+        }
+      },
+      {
+        "attention": {
+          "kind": "mla_dsa",
+          "indexer": false
+        },
+        "ffn": {
+          "kind": "moe"
+        },
+        "rope": {
+          "dims": 64,
+          "theta": 8000000.0
+        }
+      },
+      {
+        "attention": {
+          "kind": "mla_dsa",
+          "indexer": false
+        },
+        "ffn": {
+          "kind": "moe"
+        },
+        "rope": {
+          "dims": 64,
+          "theta": 8000000.0
+        }
+      },
+      {
+        "attention": {
+          "kind": "mla_dsa",
+          "indexer": false
+        },
+        "ffn": {
+          "kind": "moe"
+        },
+        "rope": {
+          "dims": 64,
+          "theta": 8000000.0
+        }
+      }
+    ],
+    "moe": {
+      "experts": 256,
+      "top_k": 8,
+      "intermediate": 2048,
+      "shared_experts": 1,
+      "shared_intermediate": 2048,
+      "scoring": "sigmoid",
+      "routed_scaling": 2.5,
+      "groups": null
+    },
+    "speculator": {
+      "kind": "native_mtp",
+      "layers": 1
+    },
+    "tables": [],
+    "vision": false,
+    "notes": [
+      "MLA q_lora 2048 kv_lora 512 rope 64, qk nope 192 v 256 (absorbed query 576; FP8 latent record 656 B: E4M3 + 4 FP32 group scales + BF16 RoPE)",
+      "DSA index top-k 2048"
+    ]
+  },
+  "cache_requirements": {
+    "checkpoint_max_context_tokens": 1048576,
+    "compiled_index_extent_required": true,
+    "requested_kv_floor_tokens": 2097152,
+    "concurrency": 16,
+    "state_slots": 20,
+    "target_only_layouts": [
+      {
+        "logical_unit_rows": 64,
+        "placement": "single_device",
+        "ranks": [
+          {
+            "persistent_unit_bytes": 3452160,
+            "pool_metadata_unit_bytes": 0,
+            "active_state_per_sequence_bytes": 0,
+            "retained_mark_bytes": 0,
+            "speculative_replay_bytes": 0,
+            "fixed_state_bytes": 0,
+            "context_table_bytes_per_token": 256
+          }
+        ]
+      },
+      {
+        "logical_unit_rows": 64,
+        "placement": "replicated",
+        "ranks": [
+          {
+            "persistent_unit_bytes": 3452160,
+            "pool_metadata_unit_bytes": 0,
+            "active_state_per_sequence_bytes": 0,
+            "retained_mark_bytes": 0,
+            "speculative_replay_bytes": 0,
+            "fixed_state_bytes": 0,
+            "context_table_bytes_per_token": 256
+          },
+          {
+            "persistent_unit_bytes": 3452160,
+            "pool_metadata_unit_bytes": 0,
+            "active_state_per_sequence_bytes": 0,
+            "retained_mark_bytes": 0,
+            "speculative_replay_bytes": 0,
+            "fixed_state_bytes": 0,
+            "context_table_bytes_per_token": 256
+          }
+        ]
+      }
+    ],
+    "unavailable_layouts": []
+  },
+  "components": [
+    {
+      "component": "embedding",
+      "owner": "rtx",
+      "tensors": 1,
+      "bytes": 1903165440,
+      "formats": {
+        "bf16": 1
+      },
+      "status": "ready",
+      "rejected": 0,
+      "rejections": []
+    },
+    {
+      "component": "lm_head",
+      "owner": "rtx",
+      "tensors": 1,
+      "bytes": 1903165440,
+      "formats": {
+        "bf16": 1
+      },
+      "status": "ready",
+      "rejected": 0,
+      "rejections": []
+    },
+    {
+      "component": "norm",
+      "owner": "rtx",
+      "tensors": 157,
+      "bytes": 1929216,
+      "formats": {
+        "bf16": 157
+      },
+      "status": "ready",
+      "rejected": 0,
+      "rejections": []
+    },
+    {
+      "component": "attention",
+      "owner": "rtx",
+      "tensors": 936,
+      "bytes": 12875081856,
+      "formats": {
+        "bf16": 156,
+        "fp8-block128x128/f32": 390
+      },
+      "status": "ready",
+      "rejected": 0,
+      "rejections": []
+    },
+    {
+      "component": "indexer",
+      "owner": "rtx",
+      "tensors": 147,
+      "bytes": 200991168,
+      "formats": {
+        "bf16": 42,
+        "fp8-block128x128/f32": 42
+      },
+      "status": "ready",
+      "rejected": 0,
+      "rejections": []
+    },
+    {
+      "component": "router",
+      "owner": "rtx",
+      "tensors": 150,
+      "bytes": 236006400,
+      "formats": {
+        "bf16": 75,
+        "f32": 75
+      },
+      "status": "ready",
+      "rejected": 0,
+      "rejections": []
+    },
+    {
+      "component": "shared_expert",
+      "owner": "rtx",
+      "tensors": 450,
+      "bytes": 2831846400,
+      "formats": {
+        "fp8-block128x128/f32": 225
+      },
+      "status": "ready",
+      "rejected": 0,
+      "rejections": []
+    },
+    {
+      "component": "routed_expert",
+      "owner": "spark_sliced",
+      "tensors": 230400,
+      "bytes": 363331814400,
+      "formats": {
+        "exl3-k4": 57600
+      },
+      "status": "ready",
+      "rejected": 0,
+      "rejections": []
+    },
+    {
+      "component": "dense_ffn",
+      "owner": "rtx",
+      "tensors": 18,
+      "bytes": 679643136,
+      "formats": {
+        "fp8-block128x128/f32": 9
+      },
+      "status": "ready",
+      "rejected": 0,
+      "rejections": []
+    },
+    {
+      "component": "speculator",
+      "owner": "rtx",
+      "tensors": 33,
+      "bytes": 366597248,
+      "formats": {
+        "bf16": 11,
+        "f32": 1,
+        "fp8-block128x128/f32": 10
+      },
+      "status": "unused",
+      "rejected": 22,
+      "rejections": [
+        {
+          "tensor": "model.layers.78.eh_proj",
+          "reason": "the native MTP layer is not run (speculation uses a DFlash2 drafter)"
+        },
+        {
+          "tensor": "model.layers.78.enorm",
+          "reason": "the native MTP layer is not run (speculation uses a DFlash2 drafter)"
+        },
+        {
+          "tensor": "model.layers.78.hnorm",
+          "reason": "the native MTP layer is not run (speculation uses a DFlash2 drafter)"
+        },
+        {
+          "tensor": "model.layers.78.input_layernorm",
+          "reason": "the native MTP layer is not run (speculation uses a DFlash2 drafter)"
+        },
+        {
+          "tensor": "model.layers.78.mlp.gate",
+          "reason": "the native MTP layer is not run (speculation uses a DFlash2 drafter)"
+        },
+        {
+          "tensor": "model.layers.78.mlp.gate.e_score_correction_bias",
+          "reason": "the native MTP layer is not run (speculation uses a DFlash2 drafter)"
+        },
+        {
+          "tensor": "model.layers.78.mlp.shared_experts.down_proj",
+          "reason": "the native MTP layer is not run (speculation uses a DFlash2 drafter)"
+        },
+        {
+          "tensor": "model.layers.78.mlp.shared_experts.gate_proj",
+          "reason": "the native MTP layer is not run (speculation uses a DFlash2 drafter)"
+        }
+      ]
+    },
+    {
+      "component": "speculator_expert",
+      "owner": "rtx",
+      "tensors": 1536,
+      "bytes": 9666035712,
+      "formats": {
+        "fp8-block128x128/f32": 768
+      },
+      "status": "unused",
+      "rejected": 768,
+      "rejections": [
+        {
+          "tensor": "model.layers.78.mlp.experts.0.down_proj",
+          "reason": "the native MTP layer is not run (speculation uses a DFlash2 drafter)"
+        },
+        {
+          "tensor": "model.layers.78.mlp.experts.0.gate_proj",
+          "reason": "the native MTP layer is not run (speculation uses a DFlash2 drafter)"
+        },
+        {
+          "tensor": "model.layers.78.mlp.experts.0.up_proj",
+          "reason": "the native MTP layer is not run (speculation uses a DFlash2 drafter)"
+        },
+        {
+          "tensor": "model.layers.78.mlp.experts.1.down_proj",
+          "reason": "the native MTP layer is not run (speculation uses a DFlash2 drafter)"
+        },
+        {
+          "tensor": "model.layers.78.mlp.experts.1.gate_proj",
+          "reason": "the native MTP layer is not run (speculation uses a DFlash2 drafter)"
+        },
+        {
+          "tensor": "model.layers.78.mlp.experts.1.up_proj",
+          "reason": "the native MTP layer is not run (speculation uses a DFlash2 drafter)"
+        },
+        {
+          "tensor": "model.layers.78.mlp.experts.10.down_proj",
+          "reason": "the native MTP layer is not run (speculation uses a DFlash2 drafter)"
+        },
+        {
+          "tensor": "model.layers.78.mlp.experts.10.gate_proj",
+          "reason": "the native MTP layer is not run (speculation uses a DFlash2 drafter)"
+        }
+      ]
+    }
+  ],
+  "unclassified": [],
+  "missing_shards": [],
+  "bytes_by_owner": {
+    "rtx": 30664462016,
+    "spark x6": 363331814400
+  },
+  "placement": {
+    "kind": "sparks",
+    "ranks": 6
+  },
+  "spark_ranks": 6,
+  "experts": {
+    "package": "glm:exl3-k45",
+    "block": 128,
+    "spark_worlds": [
+      2,
+      3,
+      4,
+      6
+    ],
+    "local": {
+      "Err": "serve-glm has no local expert path (no --local-experts)"
+    }
+  },
+  "placement_supported": true,
+  "min_spark_ranks": 4,
+  "spark_rank_share": 0.1875,
+  "fits": false,
+  "launch": {
+    "family": "glm5",
+    "model_type": "glm_moe_dsa",
+    "first_expert_layer": 3,
+    "last_expert_layer": null
+  },
+  "expert_storage": "gptq_model",
+  "hints": [
+    {
+      "what": "rtx0 full memory layout needs 38219720132 bytes, budget 31997506355 bytes, shortfall 6222213777 bytes",
+      "how": "Weights, KV, workspaces, graphs and drafts must fit together; reduce the pool/placement or raise the device budget."
+    }
+  ],
+  "memory_layout": {
+    "devices": [
+      {
+        "kind": "rtx",
+        "index": 0,
+        "capacity_bytes": 31997506355,
+        "items": [
+          {
+            "category": "embedding",
+            "group": "embedding",
+            "format": "bf16",
+            "bytes": 1903165440,
+            "basis": "exact"
+          },
+          {
+            "category": "weights",
+            "group": "lm_head",
+            "format": "bf16",
+            "bytes": 1903165440,
+            "basis": "exact"
+          },
+          {
+            "category": "weights",
+            "group": "norm",
+            "format": "bf16",
+            "bytes": 1929216,
+            "basis": "exact"
+          },
+          {
+            "category": "weights",
+            "group": "attention",
+            "format": "bf16+fp8-block128x128/f32",
+            "bytes": 12875081856,
+            "basis": "exact"
+          },
+          {
+            "category": "weights",
+            "group": "indexer",
+            "format": "bf16+fp8-block128x128/f32",
+            "bytes": 200991168,
+            "basis": "exact"
+          },
+          {
+            "category": "weights",
+            "group": "router",
+            "format": "bf16+f32",
+            "bytes": 236006400,
+            "basis": "exact"
+          },
+          {
+            "category": "weights",
+            "group": "shared_expert",
+            "format": "fp8-block128x128/f32",
+            "bytes": 2831846400,
+            "basis": "exact"
+          },
+          {
+            "category": "weights",
+            "group": "dense_ffn",
+            "format": "fp8-block128x128/f32",
+            "bytes": 679643136,
+            "basis": "exact"
+          },
+          {
+            "category": "drafter",
+            "group": "drafter",
+            "format": "",
+            "bytes": 6313601925,
+            "basis": "calibrated"
+          },
+          {
+            "category": "runtime",
+            "group": "context+modules",
+            "format": "",
+            "bytes": 794568949,
+            "basis": "calibrated"
+          },
+          {
+            "category": "runtime",
+            "group": "graph allowance",
+            "format": "",
+            "bytes": 3221225472,
+            "basis": "calibrated"
+          },
+          {
+            "category": "workspace",
+            "group": "steps",
+            "format": "",
+            "bytes": 6990059274,
+            "basis": "calibrated"
+          },
+          {
+            "category": "kv",
+            "group": "state",
+            "format": "",
+            "bytes": 268435456,
+            "basis": "formula"
+          },
+          {
+            "category": "kv",
+            "group": "records",
+            "format": "",
+            "bytes": 0,
+            "basis": "formula"
+          }
+        ],
+        "kv_tokens": 0
+      },
+      {
+        "kind": "spark",
+        "index": 0,
+        "capacity_bytes": 115964116992,
+        "items": [
+          {
+            "category": "experts",
+            "group": "routed_expert",
+            "format": "exl3-k4",
+            "bytes": 68124715200,
+            "basis": "exact"
+          },
+          {
+            "category": "workspace",
+            "group": "expert waves",
+            "format": "",
+            "bytes": 2040109465,
+            "basis": "calibrated"
+          },
+          {
+            "category": "transport",
+            "group": "rdma rings",
+            "format": "",
+            "bytes": 2480343613,
+            "basis": "calibrated"
+          },
+          {
+            "category": "runtime",
+            "group": "context+modules",
+            "format": "",
+            "bytes": 536870912,
+            "basis": "calibrated"
+          }
+        ],
+        "kv_tokens": 0
+      },
+      {
+        "kind": "spark",
+        "index": 1,
+        "capacity_bytes": 115964116992,
+        "items": [
+          {
+            "category": "experts",
+            "group": "routed_expert",
+            "format": "exl3-k4",
+            "bytes": 68124715200,
+            "basis": "exact"
+          },
+          {
+            "category": "workspace",
+            "group": "expert waves",
+            "format": "",
+            "bytes": 2040109465,
+            "basis": "calibrated"
+          },
+          {
+            "category": "transport",
+            "group": "rdma rings",
+            "format": "",
+            "bytes": 2480343613,
+            "basis": "calibrated"
+          },
+          {
+            "category": "runtime",
+            "group": "context+modules",
+            "format": "",
+            "bytes": 536870912,
+            "basis": "calibrated"
+          }
+        ],
+        "kv_tokens": 0
+      },
+      {
+        "kind": "spark",
+        "index": 2,
+        "capacity_bytes": 115964116992,
+        "items": [
+          {
+            "category": "experts",
+            "group": "routed_expert",
+            "format": "exl3-k4",
+            "bytes": 68124715200,
+            "basis": "exact"
+          },
+          {
+            "category": "workspace",
+            "group": "expert waves",
+            "format": "",
+            "bytes": 2040109465,
+            "basis": "calibrated"
+          },
+          {
+            "category": "transport",
+            "group": "rdma rings",
+            "format": "",
+            "bytes": 2480343613,
+            "basis": "calibrated"
+          },
+          {
+            "category": "runtime",
+            "group": "context+modules",
+            "format": "",
+            "bytes": 536870912,
+            "basis": "calibrated"
+          }
+        ],
+        "kv_tokens": 0
+      },
+      {
+        "kind": "spark",
+        "index": 3,
+        "capacity_bytes": 115964116992,
+        "items": [
+          {
+            "category": "experts",
+            "group": "routed_expert",
+            "format": "exl3-k4",
+            "bytes": 68124715200,
+            "basis": "exact"
+          },
+          {
+            "category": "workspace",
+            "group": "expert waves",
+            "format": "",
+            "bytes": 2040109465,
+            "basis": "calibrated"
+          },
+          {
+            "category": "transport",
+            "group": "rdma rings",
+            "format": "",
+            "bytes": 2480343613,
+            "basis": "calibrated"
+          },
+          {
+            "category": "runtime",
+            "group": "context+modules",
+            "format": "",
+            "bytes": 536870912,
+            "basis": "calibrated"
+          }
+        ],
+        "kv_tokens": 0
+      },
+      {
+        "kind": "spark",
+        "index": 4,
+        "capacity_bytes": 115964116992,
+        "items": [
+          {
+            "category": "experts",
+            "group": "routed_expert",
+            "format": "exl3-k4",
+            "bytes": 45416476800,
+            "basis": "exact"
+          },
+          {
+            "category": "workspace",
+            "group": "expert waves",
+            "format": "",
+            "bytes": 2040109465,
+            "basis": "calibrated"
+          },
+          {
+            "category": "transport",
+            "group": "rdma rings",
+            "format": "",
+            "bytes": 2480343613,
+            "basis": "calibrated"
+          },
+          {
+            "category": "runtime",
+            "group": "context+modules",
+            "format": "",
+            "bytes": 536870912,
+            "basis": "calibrated"
+          }
+        ],
+        "kv_tokens": 0
+      },
+      {
+        "kind": "spark",
+        "index": 5,
+        "capacity_bytes": 115964116992,
+        "items": [
+          {
+            "category": "experts",
+            "group": "routed_expert",
+            "format": "exl3-k4",
+            "bytes": 45416476800,
+            "basis": "exact"
+          },
+          {
+            "category": "workspace",
+            "group": "expert waves",
+            "format": "",
+            "bytes": 2040109465,
+            "basis": "calibrated"
+          },
+          {
+            "category": "transport",
+            "group": "rdma rings",
+            "format": "",
+            "bytes": 2480343613,
+            "basis": "calibrated"
+          },
+          {
+            "category": "runtime",
+            "group": "context+modules",
+            "format": "",
+            "bytes": 536870912,
+            "basis": "calibrated"
+          }
+        ],
+        "kv_tokens": 0
+      }
+    ],
+    "pool_tokens": 0,
+    "waste": [],
+    "notes": [
+      "resolved context 1048576 tokens (checkpoint 1048576)",
+      "vision Off: disabled or no checkpoint tower; 0 bytes admitted; shortfall 0 bytes",
+      "full-context admission shortfall: context 1048576 tokens, pool 0 tokens, shortfall 1048576 tokens",
+      "rtx0: requested KV pool exceeds the device budget"
+    ]
+  }
+}
