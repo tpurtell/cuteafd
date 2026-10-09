@@ -1829,10 +1829,9 @@ TJ: two key items, both urgent right after v2.0.0.
    LiteLLM), model aliasing and listing, server-side web search (Exa plus a
    no-key option), and the OpenAI Realtime API (crucial; text first, audio in
    through an audio-capable backend, TTS seam), all on one session layer with
-   an upstream backend for GPU-free testing. Later: steer/compact/history
-   mutation/fork/splice as engine operations, "J space" model-introspection
-   extensions over Realtime, and an agent dashboard derived from DSH with
-   plugins.
+   an upstream backend for GPU-free testing. The APIs are the payload; later
+   session operations (steer/compact/history mutation/fork/splice) build on
+   the same session layer.
 5. **Qwen FP8 KV cache (TJ, 2026-10-09).** Qwen stores BF16 K/V records
    (2,048 B per row) and BF16 index keys, the most KV bytes per token of any
    family; Qwen NVFP4 min plans 217,856 tokens, below the 256K agentic
