@@ -133,7 +133,7 @@ if [[ -n "$wip_slot" ]]; then
   wip_mount_args=(-v "$wip_layout/bin:/opt/cuteafd/bin:ro" -v "$wip_layout/lib:/opt/cuteafd/lib:ro"
     -v "$wip_layout/share:/opt/cuteafd/share:ro"
     -v "$wip_layout/source:/source:ro" -e PYTHONPATH=/source/third_party/sparkinfer
-    -e HOME=/tmp/cuteafd-home -e USER=tj -e LOGNAME=tj
+    -e HOME=/tmp/cuteafd-home -e HF_HOME=/root/.cache/huggingface -e USER=tj -e LOGNAME=tj
     -e TORCH_EXTENSIONS_DIR=/tmp/cuteafd-home/torch-extensions
     -e XDG_CACHE_HOME=/tmp/cuteafd-home/.cache -e TRITON_CACHE_DIR=/tmp/cuteafd-home/triton
     -e TORCHINDUCTOR_CACHE_DIR=/tmp/cuteafd-home/torchinductor
@@ -144,7 +144,7 @@ if [[ -n "$wip_slot" ]]; then
     -v \$HOME/.cache/cuteafd/wip-run/$WIP_LAYOUT_SLOT/lib:/opt/cuteafd/lib:ro \
     -v \$HOME/.cache/cuteafd/wip-run/$WIP_LAYOUT_SLOT/share:/opt/cuteafd/share:ro \
     -v \$HOME/.cache/cuteafd/wip-run/$WIP_LAYOUT_SLOT/source:/source:ro \
-    -e PYTHONPATH=/source/third_party/sparkinfer -e HOME=/tmp/cuteafd-home -e USER=tj -e LOGNAME=tj \
+    -e PYTHONPATH=/source/third_party/sparkinfer -e HOME=/tmp/cuteafd-home -e HF_HOME=/root/.cache/huggingface -e USER=tj -e LOGNAME=tj \
     -e TORCH_EXTENSIONS_DIR=/tmp/cuteafd-home/torch-extensions -e XDG_CACHE_HOME=/tmp/cuteafd-home/.cache \
     -e TRITON_CACHE_DIR=/tmp/cuteafd-home/triton -e TORCHINDUCTOR_CACHE_DIR=/tmp/cuteafd-home/torchinductor \
     -e PATH=/opt/cuteafd/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \

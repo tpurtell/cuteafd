@@ -619,7 +619,7 @@ if [[ -n "$wip_layout" ]]; then
     -v "$wip_layout/share:/opt/cuteafd/share:ro"
     -v "$wip_layout/source:/source:ro"
     -e PYTHONPATH=/source/third_party/sparkinfer
-    -e HOME=/tmp/cuteafd-home -e USER=tj -e LOGNAME=tj
+    -e HOME=/tmp/cuteafd-home -e HF_HOME=/root/.cache/huggingface -e USER=tj -e LOGNAME=tj
     -e TORCH_EXTENSIONS_DIR=/tmp/cuteafd-home/torch-extensions
     -e XDG_CACHE_HOME=/tmp/cuteafd-home/.cache
     -e TRITON_CACHE_DIR=/tmp/cuteafd-home/triton
@@ -779,7 +779,7 @@ if [[ "$wip_slot" != __none__ ]]; then
   wip_args=(-v "$layout/bin:/opt/cuteafd/bin:ro" -v "$layout/lib:/opt/cuteafd/lib:ro"
     -v "$layout/share:/opt/cuteafd/share:ro"
     -v "$layout/source:/source:ro" -e PYTHONPATH=/source/third_party/sparkinfer
-    -e HOME=/tmp/cuteafd-home -e USER=tj -e LOGNAME=tj
+    -e HOME=/tmp/cuteafd-home -e HF_HOME=/root/.cache/huggingface -e USER=tj -e LOGNAME=tj
     -e TORCH_EXTENSIONS_DIR=/tmp/cuteafd-home/torch-extensions
     -e XDG_CACHE_HOME=/tmp/cuteafd-home/.cache
     -e TRITON_CACHE_DIR=/tmp/cuteafd-home/triton
