@@ -297,3 +297,86 @@ def test_native_export_lock_only_after_cargo(tmp_path):
     subprocess.run(['bash', '-c', phase], env={**env, 'CUTEAFD_WIP_EXPORT_LOCKS': 'off'}, check=True)
     assert trace.read_text() == 'export\n'
     assert text.index('cargo build') < start
+
+
+@pytest.mark.parametrize('matched', [False, True])
+def test_explicit_nonce_overrides_auto_and_inherited(entry, tmp_path, monkeypatch, capsys, matched):
+    kit = tmp_path / 'kit'
+    kit.mkdir()
+    (kit / 'matrix-main.json').write_text(json.dumps(dict(entries=[entry])))
+    state = tmp_path / 'state'
+    args = ['wip-cards', '--kit', str(kit), '--cards', 'v41-min', '--arm', 'base=b:s',
+            '--state', str(state), '--nonce-seed', 'explicit seed', '--dry-run']
+    args += ['--interleave', '--matched-prompts', '--arm', 'candidate=c:s'] if matched else ['--matrix']
+    monkeypatch.setenv('CUTEAFD_BENCH_NONCE_SEED', 'inherited')
+    monkeypatch.setattr(sys, 'argv', args)
+    assert cards.main() == 0
+    jobs = json.loads((state / 'plan.json').read_text())['jobs']
+    assert all(job['nonce_seed'] == 'explicit seed' for job in jobs)
+    output = capsys.readouterr().out
+    assert "CUTEAFD_BENCH_NONCE_SEED='explicit seed'" in output
+    assert 'inherited' not in output
+    assert all(json.loads((Path(job['state']) / 'job.json').read_text())['nonce_seed'] == 'explicit seed' for job in jobs)
+
+
+def test_arm_overrides_only_selected_arm_and_card(entry, tmp_path, monkeypatch, capsys):
+    kit = tmp_path / 'kit'
+    kit.mkdir()
+    other = {**entry, 'name': 'other'}
+    (kit / 'matrix-main.json').write_text(json.dumps(dict(entries=[entry, other])))
+    state = tmp_path / 'state'
+    monkeypatch.setattr(sys, 'argv', ['wip-cards', '--kit', str(kit), '--cards', 'v41-min', 'other',
+        '--interleave', '--repeats', '1', '--arm', 'off=b:s', '--arm', 'on=c:s', '--state', str(state),
+        '--set', 'v41-min:GLM5_FLASH_PREFILL_BATCH=off', '--set', 'v41-min:GLM5_FLASH_VERIFY_POLICY=cost',
+        '--arm-set', 'on:v41-min:GLM5_FLASH_PREFILL_BATCH=on',
+        '--arm-set', 'on:v41-min:GLM5_FLASH_VERIFY_POLICY=chain', '--dry-run'])
+    assert cards.main() == 0
+    jobs = json.loads((state / 'plan.json').read_text())['jobs']
+    for job in jobs:
+        settings = job['entry']['set']
+        base = cards.config(Path(job['state']) / 'base.config')
+        if job['card'] == 'other':
+            assert 'GLM5_FLASH_PREFILL_BATCH' not in settings
+        else:
+            enabled = job['arm'] == 'on'
+            assert settings['GLM5_FLASH_PREFILL_BATCH'] == ('on' if enabled else 'off')
+            assert settings['GLM5_FLASH_VERIFY_POLICY'] == ('chain' if enabled else 'cost')
+            assert base['GLM5_FLASH_VERIFY_POLICY'] == settings['GLM5_FLASH_VERIFY_POLICY']
+    assert '"GLM5_FLASH_VERIFY_POLICY": "chain"' in capsys.readouterr().out
+
+
+@pytest.mark.parametrize('override,match', [('foreign:v41-min:MODEL_ID=x', 'unknown override arm'),
+    ('base:foreign:MODEL_ID=x', 'selected cards'), ('base:v41-min:API_KEY_FILE=x', 'driver owns')])
+def test_arm_override_validation(entry, tmp_path, monkeypatch, override, match):
+    kit = tmp_path / 'kit'
+    kit.mkdir()
+    (kit / 'matrix-main.json').write_text(json.dumps(dict(entries=[entry])))
+    monkeypatch.setattr(sys, 'argv', ['wip-cards', '--kit', str(kit), '--cards', 'v41-min', '--matrix',
+        '--arm', 'base=b:s', '--state', str(tmp_path / 'state'), '--arm-set', override, '--dry-run'])
+    with pytest.raises(ValueError, match=match):
+        cards.main()
+
+
+@pytest.mark.parametrize('seed', [None, 'explicit'])
+def test_runtime_seed_is_explicit_only(entry, tmp_path, monkeypatch, seed):
+    kit = tmp_path / 'kit'
+    kit.mkdir()
+    (kit / 'matrix-main.json').write_text(json.dumps(dict(entries=[entry])))
+    state = tmp_path / 'state'
+    args = ['wip-cards', '--kit', str(kit), '--cards', 'v41-min', '--matrix', '--arm', 'base=b:s', '--state', str(state)]
+    if seed is not None:
+        args += ['--nonce-seed', seed]
+    monkeypatch.setattr(sys, 'argv', args)
+    monkeypatch.setenv('CUTEAFD_BENCH_NONCE_SEED', 'inherited')
+    monkeypatch.setattr(cards, 'assert_absent', lambda job: None)
+    monkeypatch.setattr(cards, 'slot_check', lambda arm, host: None)
+    seen = []
+    def detached(cmd, log, exit_file, env):
+        seen.append(env)
+        exit_file.write_text('0\n')
+        return SimpleNamespace(wait=lambda: 0)
+    monkeypatch.setattr(cards, 'detached', detached)
+    monkeypatch.setattr(cards, 'summarize_job', lambda job, code: dict(card=job['card'], arm=job['arm'], repeat=1, simulated=True, status='pass'))
+    monkeypatch.setattr(cards, 'write_summary', lambda *args: None)
+    assert cards.main() == 0
+    assert seen[0].get('CUTEAFD_BENCH_NONCE_SEED') == seed

@@ -830,12 +830,14 @@ def main():
     mode.add_argument('--matrix', action='store_true')
     parser.add_argument('--repeats', type=int, default=3)
     parser.add_argument('--matched-prompts', action='store_true', help='interleave with one shared nonce sequence per pair and verified prompt token hashes')
+    parser.add_argument('--nonce-seed', help='explicit shared nonce seed for every job, overriding matched-prompts auto-seeds')
     parser.add_argument('--parallel', type=int, default=1)
     parser.add_argument('--task', default='cards-' + time.strftime('%Y%m%d-%H%M%S'))
     parser.add_argument('--state', type=Path)
     parser.add_argument('--repo', type=Path, default=REPO)
     parser.add_argument('--binary', default='cuteafd')
     parser.add_argument('--set', action='append', default=[], metavar='CARD:KEY=VALUE')
+    parser.add_argument('--arm-set', action='append', default=[], metavar='ARM:CARD:KEY=VALUE', help='arm-specific setting, overriding --set')
     parser.add_argument('--probe', action='append', default=[], metavar='CARD:image,memory,console')
     parser.add_argument('--expect-pool', action='append', default=[], metavar='CARD=N')
     parser.add_argument('--build', action='append', default=[], metavar='ARM=REV')
@@ -851,6 +853,8 @@ def main():
     if not NAME.fullmatch(args.task) or args.parallel < 1 or args.repeats < 1:
         parser.error('invalid task, repeats or parallelism')
     arms = arms_from(args.arm)
+    if args.nonce_seed is not None and (not args.nonce_seed or '\n' in args.nonce_seed or '\r' in args.nonce_seed):
+        parser.error('--nonce-seed must be non-empty and single-line')
     if not arms:
         parser.error('at least one --arm is required')
     if args.matched_prompts and not args.interleave:
@@ -872,6 +876,16 @@ def main():
         parser.error('--cards and --matrix or --interleave required')
     cards = load_cards(args.kit.expanduser().resolve(), args.cards)
     overrides = overrides_from(args.set)
+    arm_overrides = {}
+    for item in args.arm_set:
+        name, setting = item.split(':', 1)
+        if name not in arms:
+            raise ValueError('unknown override arm: ' + name)
+        parsed = overrides_from([setting])
+        if set(parsed) - set(args.cards):
+            raise ValueError('arm override names must be selected cards')
+        for card, values in parsed.items():
+            arm_overrides.setdefault(name, {}).setdefault(card, {}).update(values)
     probes = {card['name']: set(card.get('probes', [])) for card in cards}
     expected = {card['name']: card.get('expected_pool') for card in cards}
     for item in args.probe:
@@ -896,7 +910,18 @@ def main():
         if not 0 <= count <= len(HOSTS):
             raise ValueError('invalid Spark count')
         card['sparks'] = [values.get(f'SPARK_{i}_HOST', card.get('sparks', [])[i] if i < len(card.get('sparks', [])) else HOSTS[i]) for i in range(count)]
-    build_arms(args.build, arms, cards, state, args.task, args.dry_run)
+    # Build and stage every arm's layout, even when only one arm requests it.
+    build_cards = []
+    for name in arms:
+        for card in cards:
+            variant = {**card, 'set': {**card['set'], **arm_overrides.get(name, {}).get(card['name'], {})}}
+            values = {**config(variant['config']), **variant['set']}
+            count = int(values.get('SPARK_COUNT', len(variant['sparks'])))
+            if not 0 <= count <= len(HOSTS):
+                raise ValueError('invalid Spark count')
+            variant['sparks'] = [values.get(f'SPARK_{i}_HOST', card['sparks'][i] if i < len(card['sparks']) else HOSTS[i]) for i in range(count)]
+            build_cards.append(variant)
+    build_arms(args.build, arms, build_cards, state, args.task, args.dry_run)
     key_file = state / 'api-key'
     if not key_file.exists():
         fd = os.open(key_file, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
@@ -907,11 +932,11 @@ def main():
     bindings = dict(item.split('=', 1) for item in args.card_arm)
     if bindings and (args.interleave or set(bindings) - set(args.cards) or set(bindings.values()) - set(arms)):
         raise ValueError('--card-arm needs selected cards/arms in matrix mode')
-    jobs = [generate(card, name, arm, state, key_file, overrides.get(card['name'], {}), probes[card['name']], expected[card['name']], repeat) for card, name, arm, repeat in schedule(cards, arms, args.repeats if args.interleave else 1, args.interleave) if card['name'] not in bindings or bindings[card['name']] == name]
+    jobs = [generate(card, name, arm, state, key_file, {**overrides.get(card['name'], {}), **arm_overrides.get(name, {}).get(card['name'], {})}, probes[card['name']], expected[card['name']], repeat) for card, name, arm, repeat in schedule(cards, arms, args.repeats if args.interleave else 1, args.interleave) if card['name'] not in bindings or bindings[card['name']] == name]
     parallel_safe(jobs, args.parallel)
     for job in jobs:
-        if args.matched_prompts:
-            job['nonce_seed'] = hashlib.sha256(f"{args.task}:{job['card']}:{job['repeat']}".encode()).hexdigest()[:16]
+        if args.nonce_seed is not None or args.matched_prompts:
+            job['nonce_seed'] = args.nonce_seed if args.nonce_seed is not None else hashlib.sha256(f"{args.task}:{job['card']}:{job['repeat']}".encode()).hexdigest()[:16]
             save(Path(job['state']) / 'job.json', {**job, 'probes': sorted(job['probes'])})
         job['correctness_parallel'] = args.parallel > 1
         if args.parallel > 1:
@@ -932,11 +957,13 @@ def main():
         if groups and len(groups[0]) > 1:
             cmd = smoke_command(args.binary, args.repo, dict(state=str(state / 'parallel-smoke')))
             cmd[-1] = str(args.parallel)
-            print('setsid ' + shlex.join(cmd) + ' # grouped smoke scheduler; numeric exits per card')
+            prefix = ('CUTEAFD_BENCH_NONCE_SEED=' + shlex.quote(args.nonce_seed) + ' ') if args.nonce_seed is not None else ''
+            print(prefix + 'setsid ' + shlex.join(cmd) + ' # grouped smoke scheduler; numeric exits per card')
             return 0
         for job in jobs:
             cmd = smoke_command(args.binary, args.repo, job)
-            prefix = ('CUTEAFD_BENCH_NONCE_SEED=' + job['nonce_seed'] + ' ') if job.get('nonce_seed') else ''
+            prefix = ('CUTEAFD_BENCH_NONCE_SEED=' + shlex.quote(job['nonce_seed']) + ' ') if job.get('nonce_seed') else ''
+            print('# settings ' + job['arm'] + '/' + job['card'] + ': ' + json.dumps(job['entry']['set'], sort_keys=True))
             print(prefix + 'setsid ' + shlex.join(cmd) + ' # numeric exit -> ' + job['state'] + '/exit')
             for kind in ('observer', 'precheck'):
                 if kind in job['entry']:
@@ -944,6 +971,8 @@ def main():
         return 0
     env = {**os.environ, 'CUTEAFD_API_KEY': key_file.read_text().strip()}
     env.pop('CUTEAFD_BENCH_NONCE_SEED', None)
+    if args.nonce_seed is not None:
+        env['CUTEAFD_BENCH_NONCE_SEED'] = args.nonce_seed
     def execute(job):
         dest = Path(job['state'])
         try:
