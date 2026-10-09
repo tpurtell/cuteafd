@@ -2702,6 +2702,15 @@ after graph warm-up, on a fixed 512-row prefill plus one decode step:
 
 `CUTEAFD_ROUTE_CHECK=N` re-checks every N steps (off by default).
 
+**Route source follows the layer mode (TJ, 2026-10-09).**
+- `HeadSplit` layers: both GPUs already hold the post-attention hidden state,
+  so replicate the router (0.1-0.7 GiB total; per MoE layer 2-11 MB); a
+  route broadcast would add a 3-5 us hop per MoE layer (~0.5-1.5% of a C1
+  step) that nothing else needs.
+- `Whole{gpu}` layers with TP2 experts: the owner must push the hidden rows
+  (8-14 KB/row) to the peer anyway, so broadcast the routes (48-80 B/row) in
+  that same push; no router replica, no extra hop (V4.1 today).
+
 **Kernels, exports, loaders.** The table extends the v4-placement audit;
 paths are under `python/tools/aot/`, `native/cmake/shared/` and
 `rust/crates/`.
