@@ -115,6 +115,12 @@ cuteafd_compiler_cache_setup "$build_dir"
 # kache restores hardlinks; plain and cached Cargo must not share outputs.
 export CARGO_TARGET_DIR="$build_dir/cargo-target$( [[ "${CUTEAFD_KACHE_MODE:-disabled}" != enabled ]] || printf -- '-kache' )"
 cuteafd_build_cache_cargo_offline "$source_dir/rust/Cargo.toml"
+if [[ "${CUTEAFD_WIP_EXPORT_LOCKS:-off}" == on ]] && ! cuteafd_compiler_cache_check_cmake_compilers "$build_dir/native"; then
+  # Copied configure metadata can name a different compiler shim. Objects and
+  # AOT outputs remain reusable; only the stale configure identity is discarded.
+  rm -f "$build_dir/native/CMakeCache.txt"
+  rm -rf "$build_dir/native/CMakeFiles"
+fi
 cuteafd_compiler_cache_check_cmake_compilers "$build_dir/native"
 compiler_cache_cmake_args=()
 mapfile -t compiler_cache_cmake_args < <(cuteafd_compiler_cache_cmake_args "$build_dir/native")
@@ -143,6 +149,13 @@ if [[ -z "$wip_previous_fingerprint" || "$wip_previous_native" != "$wip_native_f
 fi
 wip_current_fingerprint="$wip_rust_fingerprint $wip_native_fingerprint"
 
+if [[ -n "${CARGO_BUILD_JOBS:-}" ]]; then
+  renice -n 19 -p "$$" >/dev/null
+else
+  unset CARGO_BUILD_JOBS
+fi
+[[ -n "${RUST_TEST_THREADS:-}" ]] || unset RUST_TEST_THREADS
+[[ -n "${CMAKE_BUILD_PARALLEL_LEVEL:-}" ]] || unset CMAKE_BUILD_PARALLEL_LEVEL
 cargo build \
   --locked \
   --quiet \
@@ -150,6 +163,17 @@ cargo build \
   -p cuteafd-daemon \
   --release
 
+# Cargo is complete before GPU admission. Locks are host files individually
+# bind-mounted by wip.sh; ordinary WIP builds do not acquire hardware locks.
+export_lock_fds=()
+if [[ "${CUTEAFD_WIP_EXPORT_LOCKS:-off}" == on ]]; then
+  for export_lock in ${CUTEAFD_WIP_EXPORT_LOCK_FILES:?missing export lock files}; do
+    echo "WIP AOT/export waiting for $export_lock (timeout 1800s)"
+    exec {export_lock_fd}>"$export_lock"
+    flock -w 1800 "$export_lock_fd" || { echo "timed out waiting for $export_lock" >&2; exit 2; }
+    export_lock_fds+=("$export_lock_fd")
+  done
+fi
 cmake \
   "${compiler_cache_cmake_args[@]}" \
   -S "$source_dir/native" \
@@ -190,6 +214,10 @@ cmake \
   -DPython3_EXECUTABLE="$(command -v python3)" \
   -DCUTEAFD_CUDA_ARCHITECTURES="$cuda_arch"
 cmake --build "$build_dir/native"
+for export_lock_fd in "${export_lock_fds[@]}"; do
+  flock -u "$export_lock_fd"
+  exec {export_lock_fd}>&-
+done
 printf '%s' "$wip_current_fingerprint" >"$wip_fingerprint_marker"
 
 install -m 0755 "$CARGO_TARGET_DIR/release/cuteafd" "$output_dir/cuteafd"

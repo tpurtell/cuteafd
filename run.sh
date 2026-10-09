@@ -603,6 +603,8 @@ done
 
 table_env_args=()
 [[ -z "${CUTEAFD_TABLE_ACCOUNTING:-}" ]] || table_env_args+=(-e "CUTEAFD_TABLE_ACCOUNTING=$CUTEAFD_TABLE_ACCOUNTING")
+bench_nonce_env_args=()
+[[ -z "${CUTEAFD_BENCH_NONCE_SEED:-}" ]] || bench_nonce_env_args+=(-e "CUTEAFD_BENCH_NONCE_SEED=$CUTEAFD_BENCH_NONCE_SEED")
 
 wip_mount_args=()
 if [[ -n "$wip_layout" ]]; then
@@ -699,7 +701,7 @@ docker run -d --name "$coordinator" --restart no --gpus "$gpu_request" --network
   -e "CUTEAFD_RELEASE_CONFIG_SHA256=$fingerprint" -e "RUST_LOG=${RUST_LOG:-info}" \
   -e "CUTEAFD_COPY_DRAFTS=$([[ ${V41_COPY_DRAFTS:-off} == on ]] && printf 1 || printf 0)" \
   -e "CUTEAFD_V41_IMAGE_ADMISSIONS=${CUTEAFD_V41_IMAGE_ADMISSIONS:-2}" \
-  "${rdma_env_args[@]}" "${table_env_args[@]}" \
+  "${rdma_env_args[@]}" "${table_env_args[@]}" "${bench_nonce_env_args[@]}" \
   "${wip_mount_args[@]}" \
   "${api_mount_args[@]}" -e "CUTEAFD_IMAGE=$COORDINATOR_DOCKER_INFERENCE" -v "$bench_dir:/root/.cache/cuteafd/bench" \
   -v "$(readlink -f "$hf_home/hub"):/root/.cache/huggingface/hub:ro" "$COORDINATOR_DOCKER_INFERENCE" cuteafd "${args[@]}" >/dev/null
