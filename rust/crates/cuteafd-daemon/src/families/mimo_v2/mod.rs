@@ -336,7 +336,7 @@ mod source_format_tests {
         }
         tensors.sort_by(|a,b| a.meta.name.cmp(&b.meta.name));
         let checkpoint = Checkpoint { snapshot:"/missing".into(), config:serde_json::json!({}),
-            quantize_config:None, tensors, missing_shards:Vec::new(), shard_bytes:0 };
+            quantize_config:None, weight_map: Default::default(), tensors, missing_shards:Vec::new(), shard_bytes:0 };
         (args, checkpoint, cfg)
     }
 
@@ -367,7 +367,7 @@ mod source_format_tests {
         tensors.sort_by(|a,b| a.meta.name.cmp(&b.meta.name));
         let cfg = MimoV2Config::from_hf(&value["target_config"]).unwrap();
         let checkpoint = Checkpoint { snapshot:directory.path().into(), config:value["target_config"].clone(),
-            quantize_config:None, tensors, missing_shards:Vec::new(), shard_bytes:0 };
+            quantize_config:None, weight_map: Default::default(), tensors, missing_shards:Vec::new(), shard_bytes:0 };
         (directory, args, checkpoint, cfg)
     }
 
@@ -715,7 +715,7 @@ fn resolve_weight_formats(args: &EngineArgs, checkpoint: &Checkpoint, cfg: &Mimo
 }
 
 pub(crate) struct Opened {
-    pub catalog: cuteafd_loader::OfficialV41Catalog,
+    pub catalog: Option<cuteafd_loader::OfficialV41Catalog>,
     pub checkpoint: Checkpoint,
     pub cfg: MimoV2Config,
     pub library: std::sync::Arc<NativeLibrary>,
@@ -730,9 +730,9 @@ fn open_checked(args: &EngineArgs, bf16_replay: bool) -> Result<Opened> {
     // Validate immutable representation, capacity and kernel alignment before
     // the native module or any device allocation is admitted.
     args.draft_storage()?;
-    let checkpoint = Checkpoint::open(&args.snapshot)?;
-    ensure!(checkpoint.missing_shards.is_empty(), "checkpoint shards missing: {:?}", checkpoint.missing_shards);
     let cfg = MimoV2Config::read(&args.snapshot)?;
+    let checkpoint = Checkpoint::coordinator(&args.snapshot,
+        args.local_experts && !args.skip_experts, args.mtp > 0)?;
     let weight_formats = resolve_weight_formats(args, &checkpoint, &cfg)?;
     validate_resolved_replay(&weight_formats, bf16_replay)?;
     if let Some(path) = &args.draft {
@@ -747,8 +747,13 @@ fn open_checked(args: &EngineArgs, bf16_replay: bool) -> Result<Opened> {
         "selected resident weight formats");
     // The expert geometry is process-wide and must be fixed before the native
     // library loads (its expert helpers size rows from it).
-    let catalog = cuteafd_loader::read_expert_catalog(&args.snapshot)?;
-    cuteafd_core::set_expert_geometry(catalog.routed_experts().geometry()?)
+    let catalog = (args.local_experts && !args.skip_experts)
+        .then(|| cuteafd_loader::read_expert_catalog(&args.snapshot)).transpose()?;
+    let first_layer = cfg.dense.iter().position(|dense| !dense).unwrap_or(cfg.layers);
+    let shape = cuteafd_loader::RoutedExpertShape { layers: cfg.layers, first_layer,
+        experts: cfg.experts, topk: cfg.topk, hidden: cfg.hidden, intermediate: cfg.moe_intermediate,
+        draft_stages: 0, draft_experts: 0 };
+    cuteafd_core::set_expert_geometry(shape.geometry()?)
         .map_err(|g| anyhow::anyhow!("expert geometry already {g:?}"))?;
     // SAFETY: the library is the cuteafd native shim built for this engine.
     let library = std::sync::Arc::new(unsafe { NativeLibrary::load(&args.native_lib) }?);
@@ -866,8 +871,8 @@ impl Opened {
             args.token_io.embed_placement.context("MiMo embedding placement must resolve before admission")?, || { let _memory_scope = cuteafd_ffi::memory_ledger::scope("weights"); loader.model(&self.cfg, layers) })?;
         let mtp = if args.mtp > 0 {
             let started = Instant::now();
-            let available = self.checkpoint.tensors.iter()
-                .filter(|t| t.meta.name.starts_with("model.mtp.layers.") && t.meta.name.ends_with(".eh_proj.weight"))
+            let available = self.checkpoint.tensor_names()
+                .filter(|name| name.starts_with("model.mtp.layers.") && name.ends_with(".eh_proj.weight"))
                 .count();
             ensure!(args.mtp <= available, "--mtp {} but the checkpoint has {available} MTP layers", args.mtp);
             let zeroed = |bytes: usize| -> Result<crate::shared::memory::DeviceAllocation<'_>> {
@@ -1033,7 +1038,8 @@ impl Opened {
             return Ok(Some(engine::Experts::Skip));
         }
         if args.local_experts {
-            let tensors = self.catalog.fp8().context("MiMo experts are the checkpoint's FP8 tensors")?;
+            let tensors = self.catalog.as_ref().context("MiMo local expert catalog was not admitted")?
+                .fp8().context("MiMo experts are the checkpoint's FP8 tensors")?;
             let directory = args.fp8_package.clone()
                 .unwrap_or_else(|| crate::shared::experts::fp8::package_directory(&args.native_lib, 1, tensors.format()));
             if let Some(window) = args.expert_window {

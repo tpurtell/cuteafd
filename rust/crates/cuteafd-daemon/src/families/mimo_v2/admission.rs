@@ -723,6 +723,8 @@ fn local_expert_reservations(
     }
     let tensors = opened
         .catalog
+        .as_ref()
+        .context("MiMo local expert catalog was not admitted")?
         .fp8()
         .context("MiMo local experts need native FP8/MXFP4 tensors")?;
     let directory = args.fp8_package.clone().unwrap_or_else(|| {

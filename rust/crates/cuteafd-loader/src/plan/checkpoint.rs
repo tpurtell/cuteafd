@@ -24,7 +24,9 @@ pub struct Checkpoint {
     pub config: Value,
     /// A separate `quantize_config.json` / `quantization_config.json`, when present.
     pub quantize_config: Option<Value>,
-    /// Tensors in index order (sorted by name).
+    /// Authoritative inventory, including tensors whose shards are not local.
+    pub weight_map: BTreeMap<String, String>,
+    /// Headers read for this role, sorted by name.
     pub tensors: Vec<CheckpointTensor>,
     /// Shards named by the index that are not readable (absent or incomplete).
     pub missing_shards: Vec<String>,
@@ -50,6 +52,27 @@ impl Checkpoint {
     /// every shard header. Missing shards are recorded rather than fatal so a
     /// partially downloaded checkpoint can still be planned.
     pub fn open(snapshot: &Path) -> Result<Self> {
+        Self::open_filtered(snapshot, None, |_| true)
+    }
+
+    /// Coordinator ownership uses the planner's family classification, not
+    /// whichever headers happen to be readable on this host.
+    pub fn coordinator(snapshot: &Path, local_experts: bool, speculator: bool) -> Result<Self> {
+        super::files::open_role(snapshot, super::files::ReadRole::Coordinator { local_experts, speculator })
+    }
+
+    /// Reads only the index and configuration. Presence never depends on headers.
+    pub fn inventory(snapshot: &Path) -> Result<Self> {
+        Self::open_filtered(snapshot, None, |_| false)
+    }
+
+    /// A runtime role declares the tensors it reads before any shard is opened.
+    /// Every selected index entry must have a readable, matching header.
+    pub fn open_for_role(snapshot: &Path, role: &str, needed: impl Fn(&str) -> bool) -> Result<Self> {
+        Self::open_filtered(snapshot, Some(role), needed)
+    }
+
+    fn open_filtered(snapshot: &Path, role: Option<&str>, needed: impl Fn(&str) -> bool) -> Result<Self> {
         let config = read_json(&snapshot.join("config.json"))?;
         let quantize_config = ["quantize_config.json", "quantization_config.json"]
             .iter()
@@ -79,29 +102,45 @@ impl Checkpoint {
                 .map(|meta| (meta.name, "model.safetensors".to_owned()))
                 .collect()
         };
-        let shards: BTreeSet<&String> = weight_map.values().collect();
+        let shards: BTreeSet<&String> = weight_map.iter()
+            .filter(|(name, _)| needed(name)).map(|(_, shard)| shard).collect();
         let mut tensors = Vec::with_capacity(weight_map.len());
         let mut missing_shards = Vec::new();
         let mut shard_bytes = 0u64;
         for shard in shards {
             let path = snapshot.join(shard);
+            let tensor = weight_map.iter().find(|(name, file)| *file == shard && needed(name))
+                .map(|(name, _)| name.as_str()).context("selected shard has no tensor")?;
+            let requirement = || format!("role {} needs tensor {tensor} in shard {shard} at snapshot {}",
+                role.unwrap_or("planner"), snapshot.display());
             let metadata = match path.metadata() {
                 Ok(metadata) if metadata.is_file() => metadata,
                 _ => {
+                    ensure!(role.is_none(), "{}: absent or unreadable", requirement());
                     missing_shards.push(shard.clone());
                     continue;
                 }
             };
             let headers = match read_safetensors_metadata(&path) {
                 Ok(headers) => headers,
-                Err(_) => {
+                Err(error) => {
+                    ensure!(role.is_none(), "{}: {error:#}", requirement());
                     missing_shards.push(shard.clone());
                     continue;
                 }
             };
+            if let Some(role) = role {
+                for (name, file) in &weight_map {
+                    if file == shard && needed(name) {
+                        ensure!(headers.iter().any(|meta| &meta.name == name),
+                            "role {role} needs tensor {name} in shard {shard} at snapshot {}: header is missing",
+                            snapshot.display());
+                    }
+                }
+            }
             shard_bytes += metadata.len();
             for meta in headers {
-                if weight_map.get(&meta.name) == Some(shard) {
+                if weight_map.get(&meta.name) == Some(shard) && needed(&meta.name) {
                     tensors.push(CheckpointTensor {
                         shard: shard.clone(),
                         meta,
@@ -114,10 +153,33 @@ impl Checkpoint {
             snapshot: snapshot.to_path_buf(),
             config,
             quantize_config,
+            weight_map,
             tensors,
             missing_shards,
             shard_bytes,
         })
+    }
+
+    pub fn tensor_names(&self) -> impl Iterator<Item = &str> {
+        // In-memory fixtures predating the HF index use their complete headers.
+        let from_headers = self.weight_map.is_empty();
+        self.weight_map.keys().map(String::as_str)
+            .chain(self.tensors.iter().filter(move |_| from_headers).map(|t| t.meta.name.as_str()))
+    }
+
+    pub fn contains_tensor(&self, name: &str) -> bool {
+        if !self.weight_map.is_empty() { return self.weight_map.contains_key(name); }
+        self.tensors.binary_search_by(|tensor| tensor.meta.name.as_str().cmp(name)).is_ok()
+    }
+
+    /// Explicit requirements also reject tensors absent from the index itself.
+    pub fn open_required(snapshot: &Path, role: &str, names: &BTreeSet<String>) -> Result<Self> {
+        let inventory = Self::inventory(snapshot)?;
+        for name in names {
+            ensure!(inventory.contains_tensor(name),
+                "role {role} needs tensor {name} at snapshot {}: absent from weight_map", snapshot.display());
+        }
+        Self::open_for_role(snapshot, role, |name| names.contains(name))
     }
 
     /// The text model configuration: `text_config` when present, else the root.
@@ -193,6 +255,60 @@ pub fn opt_usize_field(config: &Value, key: &str) -> Option<usize> {
 }
 
 #[cfg(test)]
+mod sliced_tests {
+    use super::*;
+    use crate::plan::testing::{t, write_safetensors};
+    use serde_json::json;
+
+    #[test]
+    fn role_headers_and_index_presence_are_independent() {
+        let dir = tempfile::tempdir().unwrap();
+        let names = ["lm_head.weight", "model.layers.1.mlp.experts.7.gate_proj.weight",
+            "model.mtp.layers.0.eh_proj.weight", "model.visual.weight"];
+        std::fs::write(dir.path().join("config.json"), "{}").unwrap();
+        let map: BTreeMap<_, _> = names.iter().enumerate().map(|(i, name)|
+            (name.to_string(), format!("shard{i}.safetensors"))).collect();
+        std::fs::write(dir.path().join("model.safetensors.index.json"),
+            serde_json::to_vec(&json!({"weight_map": map})).unwrap()).unwrap();
+        for (i, name) in names.iter().enumerate() {
+            write_safetensors(&dir.path().join(format!("shard{i}.safetensors")), &[t(*name, "BF16", &[2])]);
+        }
+        let full = Checkpoint::open(dir.path()).unwrap();
+        std::fs::remove_file(dir.path().join("shard1.safetensors")).unwrap();
+        std::fs::write(dir.path().join("shard3.safetensors"), b"corrupt").unwrap();
+        let local = |name: &str| name == names[0] || name == names[2];
+        let sliced = Checkpoint::open_for_role(dir.path(), "coordinator", local).unwrap();
+        assert_eq!(full.tensor_names().collect::<Vec<_>>(), sliced.tensor_names().collect::<Vec<_>>());
+        assert_eq!(full.tensors.iter().filter(|t| local(&t.meta.name)).map(|t| &t.meta).collect::<Vec<_>>(),
+            sliced.tensors.iter().map(|t| &t.meta).collect::<Vec<_>>());
+        assert!(sliced.contains_tensor(names[1]));
+        assert!(sliced.contains_tensor(names[3]));
+        let error = Checkpoint::open_for_role(dir.path(), "spark0", |name| name == names[1]).unwrap_err().to_string();
+        for expected in ["spark0", names[1], "shard1.safetensors", dir.path().to_str().unwrap()] {
+            assert!(error.contains(expected), "{error}");
+        }
+        assert!(Checkpoint::open_for_role(dir.path(), "vision", |name| name == names[3]).is_err());
+        std::fs::remove_file(dir.path().join("shard0.safetensors")).unwrap();
+        let error = Checkpoint::open_for_role(dir.path(), "coordinator", local).unwrap_err().to_string();
+        assert!(error.contains(names[0]) && error.contains("shard0.safetensors"));
+    }
+
+    #[test]
+    fn selected_tensor_missing_from_header_is_named() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("config.json"), "{}").unwrap();
+        std::fs::write(dir.path().join("model.safetensors.index.json"),
+            r#"{"weight_map":{"head.weight":"head.safetensors"}}"#).unwrap();
+        write_safetensors(&dir.path().join("head.safetensors"), &[t("other.weight", "BF16", &[2])]);
+        let error = Checkpoint::open_for_role(dir.path(), "coordinator", |_| true).unwrap_err().to_string();
+        assert!(error.contains("head.weight") && error.contains("head.safetensors"));
+        let required = BTreeSet::from(["absent.weight".to_string()]);
+        assert!(Checkpoint::open_required(dir.path(), "coordinator", &required).unwrap_err()
+            .to_string().contains("absent from weight_map"));
+    }
+}
+
+#[cfg(test)]
 mod embedding_tests {
     use super::*;
     use crate::SafetensorsTensorMetadata;
@@ -203,7 +319,7 @@ mod embedding_tests {
             meta: SafetensorsTensorMetadata { name: name.into(), dtype: DType::Bf16,
                 shape: vec![64, 128], byte_offset: offset, byte_length: 16384 } };
         Checkpoint { snapshot: Default::default(), config: serde_json::json!({"tie_word_embeddings":false}),
-            quantize_config: None, missing_shards: vec![], shard_bytes: 0,
+            quantize_config: None, weight_map: Default::default(), missing_shards: vec![], shard_bytes: 0,
             tensors: vec![t("model.embed_tokens.weight", 0), t("lm_head.weight", 16384)] }
     }
 

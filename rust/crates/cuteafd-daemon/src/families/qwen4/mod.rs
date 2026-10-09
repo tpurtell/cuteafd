@@ -259,8 +259,7 @@ mod weight_representation_tests {
 }
 
 pub(crate) fn open(args: &EngineArgs) -> Result<Opened> {
-    let checkpoint = Checkpoint::open(&args.snapshot)?;
-    ensure!(checkpoint.missing_shards.is_empty(), "checkpoint shards missing: {:?}", checkpoint.missing_shards);
+    let checkpoint = Checkpoint::coordinator(&args.snapshot, args.local_experts, args.mtp > 0)?;
     let cfg = Qwen4Config::read(&args.snapshot)?;
     cfg.check_programs()?;
     // The expert geometry is process-wide and must be fixed before the native

@@ -171,7 +171,7 @@ mod tests {
             },
         };
         let checkpoint = Checkpoint {
-            snapshot: Default::default(), quantize_config: None, missing_shards: vec![], shard_bytes: 0,
+            snapshot: Default::default(), quantize_config: None, weight_map: Default::default(), missing_shards: vec![], shard_bytes: 0,
             config: serde_json::json!({"num_hidden_layers":40,"hidden_size":5120}),
             tensors: vec![tensor("embed.weight", DType::Bf16, 100, 200),
                 tensor("head.weight", DType::Bf16, 100, 200),

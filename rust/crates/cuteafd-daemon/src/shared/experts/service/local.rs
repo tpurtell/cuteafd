@@ -30,7 +30,13 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
     );
     // The checkpoint fixes the process expert geometry before the native
     // library loads, so its helpers and every wire size agree with it.
-    let catalog = cuteafd_loader::read_expert_catalog(&config.snapshot)?;
+    let inventory = cuteafd_loader::plan::Checkpoint::inventory(&config.snapshot)?;
+    let v41 = cuteafd_loader::plan::family::detect(&inventory).is_some_and(|family| family.id() == "deepseek_v41");
+    let catalog = if v41 && inventory.quantization().is_none_or(|quant| quant["quant_method"] != "exl3") {
+        cuteafd_loader::read_official_v41_spark_catalog(&config.snapshot, config.rank, config.world)?
+    } else {
+        cuteafd_loader::read_expert_catalog(&config.snapshot)?
+    };
     let geometry = catalog.routed_experts().geometry()?;
     config.native_spark_tp2 = config.world == 2 && geometry.family() == Some("dsv4f")
         && catalog.exl3().is_none() && catalog.nvfp4().is_none() && catalog.fp8().is_none();

@@ -118,7 +118,7 @@ fn check_kind(snapshot: &Path) -> Result<()> {
     let path = snapshot.join("config.json");
     if !path.exists() { return Ok(()); }
     let checkpoint = Checkpoint { snapshot: snapshot.into(), config: read_json(&path)?,
-        quantize_config: None, tensors: Vec::new(), missing_shards: Vec::new(), shard_bytes: 0 };
+        quantize_config: None, weight_map: Default::default(), tensors: Vec::new(), missing_shards: Vec::new(), shard_bytes: 0 };
     ensure!(!family::registry().iter().any(|f| matches!(f.id(), "dflash2" | "dspark") && f.detect(&checkpoint)),
         "drafter checkpoint");
     Ok(())

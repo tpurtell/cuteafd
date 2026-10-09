@@ -541,6 +541,17 @@ fn placement(name: &str) -> V41TensorPlacement {
 
 /// Header-only inspection: never reads or eagerly allocates checkpoint tensor payloads.
 pub fn read_official_v41_catalog(model_id: &str, snapshot: &Path) -> Result<OfficialV41Catalog> {
+    read_official_v41_catalog_filtered(model_id, snapshot, None)
+}
+
+/// Official-format worker inventory, without opening coordinator-only shards.
+pub fn read_official_v41_spark_catalog(snapshot: &Path, rank: usize, world: usize) -> Result<OfficialV41Catalog> {
+    ensure!(rank < world, "Spark rank {rank} outside TP{world}");
+    read_official_v41_catalog_filtered(crate::OFFICIAL_V41_MODEL_ID, snapshot,
+        Some(format!("spark{rank} (TP{world})")))
+}
+
+fn read_official_v41_catalog_filtered(model_id: &str, snapshot: &Path, spark_role: Option<String>) -> Result<OfficialV41Catalog> {
     let raw_config: serde_json::Value = crate::families::deepseek_v41::v41_exl3::read_json(&snapshot.join("config.json"), 1024 * 1024)?;
     let exl3 = if raw_config["quantization_config"]["quant_method"] == "exl3" {
         Some(crate::read_v41_exl3_manifest(snapshot)?)
@@ -632,10 +643,13 @@ pub fn read_official_v41_catalog(model_id: &str, snapshot: &Path) -> Result<Offi
         "checkpoint requires all {shard_count} shards"
     );
     let mut tensors = Vec::with_capacity(expected.len());
+    let needed = |name: &str| spark_role.is_none() || name.starts_with("layers.") && name.contains(".ffn.experts.");
     for (shard, names) in shards {
+        let Some(first_needed) = names.iter().find(|name| needed(name)) else { continue };
         let path = snapshot.join(&shard);
-        let metadata =
-            read_safetensors_metadata(&path).with_context(|| format!("reading {shard}"))?;
+        let metadata = read_safetensors_metadata(&path).with_context(|| format!(
+            "role {} needs tensor {first_needed} in shard {shard} at snapshot {}",
+            spark_role.as_deref().unwrap_or("full catalog"), snapshot.display()))?;
         ensure!(
             metadata.len() == names.len(),
             "index/header tensor count mismatch in {shard}"
