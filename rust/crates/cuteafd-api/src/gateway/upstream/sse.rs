@@ -95,7 +95,7 @@ impl State {
                     for choice in choices {
                         if choice["index"].as_u64().unwrap_or(0) != 0 { continue; }
                         let delta = &choice["delta"];
-                        if let Some(t) = delta["reasoning_content"].as_str().filter(|s| !s.is_empty()) { events.push(TurnEvent::ReasoningDelta { text: t.into() }); }
+                        if let Some(t) = delta.get("reasoning_content").or_else(|| delta.get("reasoning")).and_then(Value::as_str).filter(|s| !s.is_empty()) { events.push(TurnEvent::ReasoningDelta { text: t.into() }); }
                         if let Some(t) = delta["content"].as_str().filter(|s| !s.is_empty()) { events.push(TurnEvent::TextDelta { text: t.into() }); }
                         if let Some(calls) = delta["tool_calls"].as_array() {
                             for update in calls {

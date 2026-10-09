@@ -1,0 +1,201 @@
+{
+  "version": 1,
+  "flavor": "openai-chat",
+  "deepseek_thinking": null,
+  "strict_tools": null,
+  "json_schema": null,
+  "turn": {
+    "requested_model": "",
+    "model": "xiaomi/mimo-v2.6-flash",
+    "system": null,
+    "items": [
+      {
+        "item": "message",
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "What color is this square? Answer one word."
+          },
+          {
+            "type": "image",
+            "source": {
+              "kind": "base64",
+              "media_type": "image/png",
+              "data": "iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAIAAAD8GO2jAAAAKElEQVR4nO3NsQ0AAAzCMP5/un0CNkuZ41wybXsHAAAAAAAAAAAAxR4yw/wuPL6QkAAAAABJRU5ErkJggg=="
+            }
+          }
+        ]
+      }
+    ],
+    "tools": [],
+    "tool_choice": {
+      "mode": "auto"
+    },
+    "parallel_tool_calls": null,
+    "max_output_tokens": 128,
+    "sampling": {
+      "temperature": null,
+      "top_p": null,
+      "top_k": null,
+      "stop": [],
+      "seed": null
+    },
+    "reasoning": {
+      "enabled": null,
+      "effort": null,
+      "budget_tokens": null,
+      "return_text": false
+    },
+    "response_format": null,
+    "hosted": {
+      "web_search": null
+    },
+    "modalities": {
+      "audio_out": false
+    },
+    "session": null
+  },
+  "entries": [
+    {
+      "kind": "upstream",
+      "entry": {
+        "flavor": "openai-chat",
+        "request": {
+          "model": "xiaomi/mimo-v2.6-flash",
+          "messages": [
+            {
+              "role": "user",
+              "content": [
+                {
+                  "type": "text",
+                  "text": "What color is this square? Answer one word."
+                },
+                {
+                  "type": "image_url",
+                  "image_url": {
+                    "url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAIAAAD8GO2jAAAAKElEQVR4nO3NsQ0AAAzCMP5/un0CNkuZ41wybXsHAAAAAAAAAAAAxR4yw/wuPL6QkAAAAABJRU5ErkJggg=="
+                  }
+                }
+              ]
+            }
+          ],
+          "stream": true,
+          "stream_options": {
+            "include_usage": true
+          },
+          "max_tokens": 128
+        },
+        "status": 200,
+        "body": "data: {\"id\":\"gen-1791556757-xVWlgQsBsqrQfDRet8Nj\",\"object\":\"chat.completion.chunk\",\"created\":1791556757,\"model\":\"xiaomi/mimo-v2.6-flash\",\"provider\":\"Xiaomi\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"\",\"role\":\"assistant\",\"reasoning\":\"\u7528\u6237\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\"\u7528\u6237\",\"format\":\"unknown\",\"index\":0}]},\"finish_reason\":null,\"native_finish_reason\":null}]}\n\ndata: {\"id\":\"gen-1791556757-xVWlgQsBsqrQfDRet8Nj\",\"object\":\"chat.completion.chunk\",\"created\":1791556757,\"model\":\"xiaomi/mimo-v2.6-flash\",\"provider\":\"Xiaomi\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"\",\"role\":\"assistant\",\"reasoning\":\"\u73b0\u5728\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\"\u73b0\u5728\",\"format\":\"unknown\",\"index\":0}]},\"finish_reason\":null,\"native_finish_reason\":null}]}\n\ndata: {\"id\":\"gen-1791556757-xVWlgQsBsqrQfDRet8Nj\",\"object\":\"chat.completion.chunk\",\"created\":1791556757,\"model\":\"xiaomi/mimo-v2.6-flash\",\"provider\":\"Xiaomi\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"\",\"role\":\"assistant\",\"reasoning\":\"\u9700\u8981\u56de\u7b54\u8fd9\u4e2a\u6b63\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\"\u9700\u8981\u56de\u7b54\u8fd9\u4e2a\u6b63\",\"format\":\"unknown\",\"index\":0}]},\"finish_reason\":null,\"native_finish_reason\":null}]}\n\ndata: {\"id\":\"gen-1791556757-xVWlgQsBsqrQfDRet8Nj\",\"object\":\"chat.completion.chunk\",\"created\":1791556757,\"model\":\"xiaomi/mimo-v2.6-flash\",\"provider\":\"Xiaomi\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"\",\"role\":\"assistant\",\"reasoning\":\"\u65b9\u5f62\u7684\u989c\u8272\uff0c\u4e00\u4e2a\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\"\u65b9\u5f62\u7684\u989c\u8272\uff0c\u4e00\u4e2a\",\"format\":\"unknown\",\"index\":0}]},\"finish_reason\":null,\"native_finish_reason\":null}]}\n\ndata: {\"id\":\"gen-1791556757-xVWlgQsBsqrQfDRet8Nj\",\"object\":\"chat.completion.chunk\",\"created\":1791556757,\"model\":\"xiaomi/mimo-v2.6-flash\",\"provider\":\"Xiaomi\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"\",\"role\":\"assistant\",\"reasoning\":\"\u8bcd\u3002\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\"\u8bcd\u3002\",\"format\":\"unknown\",\"index\":0}]},\"finish_reason\":null,\"native_finish_reason\":null}]}\n\ndata: {\"id\":\"gen-1791556757-xVWlgQsBsqrQfDRet8Nj\",\"object\":\"chat.completion.chunk\",\"created\":1791556757,\"model\":\"xiaomi/mimo-v2.6-flash\",\"provider\":\"Xiaomi\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"\",\"role\":\"assistant\",\"reasoning\":\"\u770b\u56fe\u7247\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\"\u770b\u56fe\u7247\",\"format\":\"unknown\",\"index\":0}]},\"finish_reason\":null,\"native_finish_reason\":null}]}\n\ndata: {\"id\":\"gen-1791556757-xVWlgQsBsqrQfDRet8Nj\",\"object\":\"chat.completion.chunk\",\"created\":1791556757,\"model\":\"xiaomi/mimo-v2.6-flash\",\"provider\":\"Xiaomi\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"\",\"role\":\"assistant\",\"reasoning\":\"\uff0c\u6b63\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\"\uff0c\u6b63\",\"format\":\"unknown\",\"index\":0}]},\"finish_reason\":null,\"native_finish_reason\":null}]}\n\ndata: {\"id\":\"gen-1791556757-xVWlgQsBsqrQfDRet8Nj\",\"object\":\"chat.completion.chunk\",\"created\":1791556757,\"model\":\"xiaomi/mimo-v2.6-flash\",\"provider\":\"Xiaomi\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"\",\"role\":\"assistant\",\"reasoning\":\"\u65b9\u5f62\u662f\u7ea2\u8272\uff0c\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\"\u65b9\u5f62\u662f\u7ea2\u8272\uff0c\",\"format\":\"unknown\",\"index\":0}]},\"finish_reason\":null,\"native_finish_reason\":null}]}\n\ndata: {\"id\":\"gen-1791556757-xVWlgQsBsqrQfDRet8Nj\",\"object\":\"chat.completion.chunk\",\"created\":1791556757,\"model\":\"xiaomi/mimo-v2.6-flash\",\"provider\":\"Xiaomi\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"\",\"role\":\"assistant\",\"reasoning\":\"\u6240\u4ee5\u586b\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\"\u6240\u4ee5\u586b\",\"format\":\"unknown\",\"index\":0}]},\"finish_reason\":null,\"native_finish_reason\":null}]}\n\ndata: {\"id\":\"gen-1791556757-xVWlgQsBsqrQfDRet8Nj\",\"object\":\"chat.completion.chunk\",\"created\":1791556757,\"model\":\"xiaomi/mimo-v2.6-flash\",\"provider\":\"Xiaomi\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"\",\"role\":\"assistant\",\"reasoning\":\"Red\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\"Red\",\"format\":\"unknown\",\"index\":0}]},\"finish_reason\":null,\"native_finish_reason\":null}]}\n\ndata: {\"id\":\"gen-1791556757-xVWlgQsBsqrQfDRet8Nj\",\"object\":\"chat.completion.chunk\",\"created\":1791556757,\"model\":\"xiaomi/mimo-v2.6-flash\",\"provider\":\"Xiaomi\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"\",\"role\":\"assistant\",\"reasoning\":\"\u3002\u786e\u8ba4\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\"\u3002\u786e\u8ba4\",\"format\":\"unknown\",\"index\":0}]},\"finish_reason\":null,\"native_finish_reason\":null}]}\n\ndata: {\"id\":\"gen-1791556757-xVWlgQsBsqrQfDRet8Nj\",\"object\":\"chat.completion.chunk\",\"created\":1791556757,\"model\":\"xiaomi/mimo-v2.6-flash\",\"provider\":\"Xiaomi\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"\",\"role\":\"assistant\",\"reasoning\":\"\u4e00\u4e0b\uff0c\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\"\u4e00\u4e0b\uff0c\",\"format\":\"unknown\",\"index\":0}]},\"finish_reason\":null,\"native_finish_reason\":null}]}\n\ndata: {\"id\":\"gen-1791556757-xVWlgQsBsqrQfDRet8Nj\",\"object\":\"chat.completion.chunk\",\"created\":1791556757,\"model\":\"xiaomi/mimo-v2.6-flash\",\"provider\":\"Xiaomi\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"\",\"role\":\"assistant\",\"reasoning\":\"\u9898\u76ee\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\"\u9898\u76ee\",\"format\":\"unknown\",\"index\":0}]},\"finish_reason\":null,\"native_finish_reason\":null}]}\n\ndata: {\"id\":\"gen-1791556757-xVWlgQsBsqrQfDRet8Nj\",\"object\":\"chat.completion.chunk\",\"created\":1791556757,\"model\":\"xiaomi/mimo-v2.6-flash\",\"provider\":\"Xiaomi\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"\",\"role\":\"assistant\",\"reasoning\":\"\u8981\u6c42\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\"\u8981\u6c42\",\"format\":\"unknown\",\"index\":0}]},\"finish_reason\":null,\"native_finish_reason\":null}]}\n\ndata: {\"id\":\"gen-1791556757-xVWlgQsBsqrQfDRet8Nj\",\"object\":\"chat.completion.chunk\",\"created\":1791556757,\"model\":\"xiaomi/mimo-v2.6-flash\",\"provider\":\"Xiaomi\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"\",\"role\":\"assistant\",\"reasoning\":\"Answer one\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\"Answer one\",\"format\":\"unknown\",\"index\":0}]},\"finish_reason\":null,\"native_finish_reason\":null}]}\n\ndata: {\"id\":\"gen-1791556757-xVWlgQsBsqrQfDRet8Nj\",\"object\":\"chat.completion.chunk\",\"created\":1791556757,\"model\":\"xiaomi/mimo-v2.6-flash\",\"provider\":\"Xiaomi\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"\",\"role\":\"assistant\",\"reasoning\":\" word\uff0c\u6240\u4ee5\u76f4\u63a5\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" word\uff0c\u6240\u4ee5\u76f4\u63a5\",\"format\":\"unknown\",\"index\":0}]},\"finish_reason\":null,\"native_finish_reason\":null}]}\n\ndata: {\"id\":\"gen-1791556757-xVWlgQsBsqrQfDRet8Nj\",\"object\":\"chat.completion.chunk\",\"created\":1791556757,\"model\":\"xiaomi/mimo-v2.6-flash\",\"provider\":\"Xiaomi\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"\",\"role\":\"assistant\",\"reasoning\":\"Red\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\"Red\",\"format\":\"unknown\",\"index\":0}]},\"finish_reason\":null,\"native_finish_reason\":null}]}\n\ndata: {\"id\":\"gen-1791556757-xVWlgQsBsqrQfDRet8Nj\",\"object\":\"chat.completion.chunk\",\"created\":1791556757,\"model\":\"xiaomi/mimo-v2.6-flash\",\"provider\":\"Xiaomi\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"\",\"role\":\"assistant\",\"reasoning\":\"\u3002\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\"\u3002\",\"format\":\"unknown\",\"index\":0}]},\"finish_reason\":null,\"native_finish_reason\":null}]}\n\ndata: {\"id\":\"gen-1791556757-xVWlgQsBsqrQfDRet8Nj\",\"object\":\"chat.completion.chunk\",\"created\":1791556757,\"model\":\"xiaomi/mimo-v2.6-flash\",\"provider\":\"Xiaomi\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Red\",\"role\":\"assistant\"},\"finish_reason\":null,\"native_finish_reason\":null}]}\n\ndata: {\"id\":\"gen-1791556757-xVWlgQsBsqrQfDRet8Nj\",\"object\":\"chat.completion.chunk\",\"created\":1791556757,\"model\":\"xiaomi/mimo-v2.6-flash\",\"provider\":\"Xiaomi\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"\",\"role\":\"assistant\",\"reasoning\":null},\"finish_reason\":\"stop\",\"native_finish_reason\":\"stop\"}]}\n\ndata: {\"id\":\"gen-1791556757-xVWlgQsBsqrQfDRet8Nj\",\"object\":\"chat.completion.chunk\",\"created\":1791556757,\"model\":\"xiaomi/mimo-v2.6-flash\",\"provider\":\"Xiaomi\",\"service_tier\":null,\"choices\":[{\"index\":0,\"delta\":{\"content\":\"\",\"role\":\"assistant\"},\"finish_reason\":\"stop\",\"native_finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":28,\"completion_tokens\":41,\"total_tokens\":69,\"cost\":0.0000154,\"is_byok\":false,\"prompt_tokens_details\":{\"cached_tokens\":0,\"cache_write_tokens\":0,\"audio_tokens\":0,\"video_tokens\":0},\"cost_details\":{\"upstream_inference_cost\":0.0000154,\"upstream_inference_prompt_cost\":0.00000392,\"upstream_inference_completions_cost\":0.00001148},\"completion_tokens_details\":{\"reasoning_tokens\":38,\"image_tokens\":0,\"audio_tokens\":0}}}\n\ndata: [DONE]\n\n",
+        "truncated": false
+      }
+    }
+  ],
+  "expected_events": [
+    {
+      "event": "reasoning_delta",
+      "text": "\u7528\u6237"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": "\u73b0\u5728"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": "\u9700\u8981\u56de\u7b54\u8fd9\u4e2a\u6b63"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": "\u65b9\u5f62\u7684\u989c\u8272\uff0c\u4e00\u4e2a"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": "\u8bcd\u3002"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": "\u770b\u56fe\u7247"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": "\uff0c\u6b63"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": "\u65b9\u5f62\u662f\u7ea2\u8272\uff0c"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": "\u6240\u4ee5\u586b"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": "Red"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": "\u3002\u786e\u8ba4"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": "\u4e00\u4e0b\uff0c"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": "\u9898\u76ee"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": "\u8981\u6c42"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": "Answer one"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " word\uff0c\u6240\u4ee5\u76f4\u63a5"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": "Red"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": "\u3002"
+    },
+    {
+      "event": "text_delta",
+      "text": "Red"
+    },
+    {
+      "event": "usage",
+      "usage": {
+        "input_tokens": 28,
+        "output_tokens": 41,
+        "cached_input_tokens": 0,
+        "reasoning_tokens": 38,
+        "web_search_requests": 0,
+        "cache_creation_input_tokens": 0
+      }
+    },
+    {
+      "event": "usage",
+      "usage": {
+        "input_tokens": 28,
+        "output_tokens": 41,
+        "cached_input_tokens": 0,
+        "reasoning_tokens": 38,
+        "web_search_requests": 0,
+        "cache_creation_input_tokens": 0
+      }
+    },
+    {
+      "event": "done",
+      "stop": {
+        "reason": "end_turn"
+      }
+    }
+  ]
+}
