@@ -207,7 +207,7 @@ RUN_STATEMENTS = {
         'REMOTE\n)"',
     ),
     "role-label-preflight": (
-        'release_ssh -o ConnectTimeout=10 "$host" \\\n        "docker image inspect',
+        'release_ssh -o ConnectTimeout=10 "$host" \\\n          "docker image inspect',
         '$SPARK_EXPERT_DOCKER_INFERENCE\'"\n',
     ),
     "container-conflict-check": (
