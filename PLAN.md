@@ -1793,6 +1793,14 @@ TJ: two key items, both urgent right after v2.0.0.
    placement (today's head split leaves every routed expert on GPU0). Qwen on
    1 RTX already serves (525,568-token plan for EXL3 K4.25). Input:
    `builds/no-spark-layouts/` (per-GPU expert bytes, pools at 2M/1M/262K).
+5. **Qwen FP8 KV cache (TJ, 2026-10-09).** Qwen stores BF16 K/V records
+   (2,048 B per row) and BF16 index keys, the most KV bytes per token of any
+   family; Qwen NVFP4 min plans 217,856 tokens, below the 256K agentic
+   floor. Add an FP8 K/V record option (E4M3 with per-group scales, as GLM's
+   latents and MiMo's int8 records already do), planner charge included,
+   gated on golden/fidelity and the quick A/B on 1 RTX local and min/max.
+   FP8 or NVFP4 options for the MLA/DSA families (GLM, GLM Flash, V4) are
+   skipped for now (TJ).
 3. **V4.1 NVFP4 numerics and wire** (deferred by TJ, 2026-10-09). The Spark
    kernels already run W4A4 (mxf4nvf4), but FC1 uses one layer-max input
    scale instead of each expert's calibrated `input_scale` (~6x spread), and
