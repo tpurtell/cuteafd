@@ -1,0 +1,11 @@
+{
+  "label": "diagnostic: vision off; not a qualified cell or performance measurement",
+  "status": "failed",
+  "error": "same startup expert-session reconnect ring budget defect",
+  "requested_bytes": 419495936,
+  "budget_bytes": 302120960,
+  "original_run": "9f962b35712e4e129d83ee79d2801663",
+  "diagnostic_run": "3c4b3c16c2f5445a96cfdc6b715cd8c7",
+  "launch_s": 67.508892367,
+  "total_s": 79.089804323
+}
