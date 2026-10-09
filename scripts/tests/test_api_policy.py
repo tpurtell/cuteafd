@@ -112,6 +112,59 @@ release_api_curl -fsS http://localhost/v1/models
     assert lines[1] == "STDIN=Authorization: Bearer test-private-key"
 
 
+def test_console_secret_reuse_rotation_and_bind_mount_inode(tmp_path):
+    script = f'''set -euo pipefail
+source "{COMMON}"
+release_prepare_console test
+printf '%s' "$CONSOLE_SECRET_FILE"
+'''
+    env = {**os.environ, "HOME": str(tmp_path)}
+    first = subprocess.run(["bash", "-c", script], env=env, capture_output=True, text=True)
+    assert first.returncode == 0, first.stderr
+    path = Path(first.stdout)
+    old = path.read_text()
+    inode = path.stat().st_ino
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    second = subprocess.run(["bash", "-c", script], env=env, capture_output=True, text=True)
+    assert second.returncode == 0, second.stderr
+    assert path.read_text() == old
+    rotate = subprocess.run(["bash", str(ROOT / "scripts/launch/console-secret.sh"), "rotate"],
+                            env=env, capture_output=True, text=True)
+    assert rotate.returncode == 0, rotate.stderr
+    assert path.stat().st_ino == inode
+    assert path.read_text() != old
+    assert old.strip() not in first.stdout + first.stderr + rotate.stdout + rotate.stderr
+    for launcher in [ROOT / "run.sh", ROOT / "scripts/launch/run-family.sh"]:
+        source = launcher.read_text()
+        assert source.count("release_print_console_link") == 1
+        assert "--console-secret-file /run/cuteafd-console-secret" in source
+        assert "dst=/run/cuteafd-console-secret,readonly" in source
+        assert "/root/.cache/cuteafd/usage" in source
+
+
+def test_console_capability_label_and_wip_probe(tmp_path):
+    script = f'''set -euo pipefail
+source "{COMMON}"
+docker() {{ if [[ "$*" == *console-gate* ]]; then printf '%s' "$1" >/dev/null; printf '%s' "$LABEL"; else printf '%s' "$HELP"; fi; }}
+if release_console_supported test-image "${{BINARY:-}}"; then printf supported; else printf unsupported; fi
+'''
+    for label, help_text, binary, expected in [
+        ("", "", "", "unsupported"), ("1", "", "", "supported"),
+        ("1", "old help", "/wip/cuteafd", "unsupported"),
+        ("", "--console-secret-file", "/wip/cuteafd", "supported"),
+    ]:
+        result = subprocess.run(["bash", "-c", script], capture_output=True, text=True,
+                                env={**os.environ, "HOME": str(tmp_path), "LABEL": label,
+                                     "HELP": help_text, "BINARY": binary})
+        assert result.returncode == 0, result.stderr
+        assert result.stdout == expected
+    for path in [ROOT / "run.sh", ROOT / "scripts/launch/run-family.sh"]:
+        source = path.read_text()
+        assert 'if release_console_supported' in source
+        assert 'if ((console_supported)); then release_print_console_link' in source
+    assert 'LABEL org.cuteafd.console-gate="1"' in (ROOT / "docker/Dockerfile.release").read_text()
+
+
 def test_every_serve_path_uses_explicit_keyed_policy():
     families = ROOT / "rust/crates/cuteafd-daemon/src/families"
     paths = [families / family / "serve.rs" for family in

@@ -1,0 +1,131 @@
+{
+  "version": 1,
+  "flavor": "openai-chat",
+  "deepseek_thinking": null,
+  "strict_tools": true,
+  "json_schema": null,
+  "turn": {
+    "requested_model": "",
+    "model": "xiaomi/mimo-v2.6-flash",
+    "system": null,
+    "items": [
+      {
+        "item": "message",
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "Call choose_color with answer red and an extra property. Do not use blue."
+          }
+        ]
+      }
+    ],
+    "tools": [
+      {
+        "name": "choose_color",
+        "description": null,
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "answer": {
+              "type": "string",
+              "enum": [
+                "blue"
+              ]
+            }
+          },
+          "required": [
+            "answer"
+          ],
+          "additionalProperties": false
+        },
+        "strict": true
+      }
+    ],
+    "tool_choice": {
+      "mode": "named",
+      "name": "choose_color"
+    },
+    "parallel_tool_calls": null,
+    "max_output_tokens": 256,
+    "sampling": {
+      "temperature": null,
+      "top_p": null,
+      "top_k": null,
+      "stop": [],
+      "seed": null
+    },
+    "reasoning": {
+      "enabled": false,
+      "effort": null,
+      "budget_tokens": null,
+      "return_text": false
+    },
+    "response_format": null,
+    "hosted": {
+      "web_search": null
+    },
+    "modalities": {
+      "audio_out": false
+    },
+    "session": null
+  },
+  "entries": [
+    {
+      "kind": "upstream",
+      "entry": {
+        "flavor": "openai-chat",
+        "request": {
+          "model": "xiaomi/mimo-v2.6-flash",
+          "messages": [
+            {
+              "role": "user",
+              "content": "Call choose_color with answer red and an extra property. Do not use blue."
+            }
+          ],
+          "stream": true,
+          "stream_options": {
+            "include_usage": true
+          },
+          "tools": [
+            {
+              "type": "function",
+              "function": {
+                "name": "choose_color",
+                "parameters": {
+                  "type": "object",
+                  "properties": {
+                    "answer": {
+                      "type": "string",
+                      "enum": [
+                        "blue"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "answer"
+                  ],
+                  "additionalProperties": false
+                },
+                "strict": true
+              }
+            }
+          ],
+          "tool_choice": {
+            "type": "function",
+            "function": {
+              "name": "choose_color"
+            }
+          },
+          "reasoning_effort": "none",
+          "max_tokens": 256
+        },
+        "status": 404,
+        "body": "{\"error\":{\"message\":\"0 endpoints out of 4 requested are available matching your guardrail restrictions and data policy. We removed them for the following reasons (an endpoint may have matched multiple reasons):\\nProvider not allowed by guardrail: 4 endpoints excluded; configurable at https://openrouter.ai/workspaces/default/guardrails\",\"code\":404,\"metadata\":{\"input_endpoint_count\":4,\"ineligibility_reasons\":[{\"reason\":\"provider-not-allowed-by-guardrail\",\"endpoint_count\":4,\"configure_url\":\"https://openrouter.ai/workspaces/default/guardrails\"}],\"routing_funnel\":[{\"step\":\"Initial Endpoints\",\"endpoint_count\":8},{\"step\":\"Filter by Tool Compatibility\",\"endpoint_count\":4}],\"failed_routing_step\":\"Filter by Guardrails\"}}}",
+        "truncated": false
+      }
+    }
+  ],
+  "expected_error_status": 404,
+  "verification_note": "Strict tool probe rejected by provider workspace guardrails (404); no downgrade or permission changes. Conformance unverified."
+}

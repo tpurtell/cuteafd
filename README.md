@@ -5,6 +5,33 @@
   </picture>
 </p>
 
+## Usage History And Console Access
+
+Supported coordinator images keep usage metadata in
+`~/.cache/cuteafd/<instance>/usage/usage.sqlite` on the launch host (7 days,
+256 MiB by default). Metadata never contains prompts or completions. The
+separate full-log tier defaults to 24 hours and 1 GiB in `usage-log.sqlite`.
+**With the full log on, user prompts and model outputs are stored in plain
+text for the retention period.** Media are replaced by MIME/size/SHA-256
+references; credentials and headers are not logged. Serving/gateway payload
+capture hooks are a separate rollout; storage alone does not capture bodies.
+
+The launcher prints a console unlock link once on host stdout. The persistent
+secret lives at `~/.cache/cuteafd/console/secret` (0600 in an owned 0700
+directory). Console cookies do not authorize API calls, and an API key does
+not unlock console data. Rotate with `scripts/launch/console-secret.sh rotate`
+or `run.sh --rotate-console-secret`; running coordinators reload within 10
+seconds. New flags are omitted for older images and older WIP binaries.
+
+Cookie-protected `/console/usage/settings` controls retention, caps, full-log
+recording, client IP (off by default), and benchmark recording. Clear the full
+log with `POST /console/usage/log/clear`, or both tiers with
+`POST /console/usage/clear`. With the coordinator stopped, deleting
+`~/.cache/cuteafd/<instance>/usage/usage-log.sqlite*` clears only payloads.
+`--usage off` removes request accounting entirely; absent `--usage-dir`, tests
+and standalone APIs use an in-memory store. Only daily aggregates may outlive
+metadata retention (90 days by default), without request or session IDs.
+
 CuteAFD brings frontier-scale open-weights models into the home lab at
 data-center speed. It disaggregates attention from the routed experts: one or
 two consumer-Blackwell RTX PRO 6000 cards run attention, the dense
@@ -291,6 +318,101 @@ V4.1 defaults to `CUTEAFD_V41_FP8_HEAD=all`: one E4M3 vocabulary head
 packing. `off` selects BF16; experimental `draft` retains BF16 for the target
 and adds FP8 for dSpark. The accepted target-head quality gate and matched RC2
 controls support the release default.
+
+## Client APIs: Claude Code, Codex and Realtime
+
+Besides OpenAI Chat Completions (`/v1/chat/completions`), cuteafd serves the
+APIs that the Claude Code and Codex CLIs and Realtime voice clients speak, so
+they can run against your own model with no proxy in between.
+
+- **Anthropic Messages:**
+  - `POST /v1/messages`, streaming and non-streaming, with tools, thinking,
+    images and stop reasons;
+  - `POST /v1/messages/count_tokens`;
+  - the Anthropic model listing.
+- **OpenAI Responses:**
+  - `POST /v1/responses`, over SSE or WebSocket;
+  - `GET`/`DELETE /v1/responses/{id}` and `input_items`;
+  - `previous_response_id`;
+  - function, custom (freeform) and `local_shell` tools;
+  - `/v1/responses/compact` and `input_tokens`;
+  - a Codex model catalog at `/v1/codex/models.json`.
+- **OpenAI Realtime:** a `GET /v1/realtime` WebSocket, with GA and beta event
+  names.
+  - Text and function calling work. Audio input works on audio-capable models.
+  - Speech output and transcription are not available yet. Requests for them
+    get an explicit error.
+
+The Messages, Responses and Realtime routes are built and tested against an
+upstream test backend today. Wiring them to the engine's own serve path is
+the next step (PLAN.md, "v3 API gateway and sessions").
+
+**Keys.** Start the server with `--api-key-file FILE`. Clients send that key
+the way they would to the real service:
+- `x-api-key` or `Authorization: Bearer` for Messages;
+- Bearer for Responses;
+- Bearer or the `openai-insecure-api-key.<key>` WebSocket subprotocol for
+  Realtime.
+
+**Model names.** `--official-model-names` accepts any requested model id and
+runs the served model. It also advertises the ids the CLIs look for: Claude
+Code's model discovery lists only `claude-*` ids, and Codex has a fixed set of
+slugs. To refresh those lists without a rebuild, generate a file with
+`scripts/gateway/official-model-names.py` and pass it as
+`--official-model-names-file`.
+
+**Web search.** Claude Code's WebSearch and Codex's web search run on the
+server: `--search exa` (needs `EXA_API_KEY`) or `--search searxng=URL` (no
+key; `scripts/gateway/searxng/` runs a local SearXNG).
+
+**Claude Code:**
+
+```sh
+export ANTHROPIC_BASE_URL=http://HOST:PORT
+export ANTHROPIC_API_KEY=$(cat FILE)
+export CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1   # optional: /model picker
+claude
+```
+
+All of its model slots (`ANTHROPIC_MODEL`,
+`ANTHROPIC_DEFAULT_{OPUS,SONNET,HAIKU}_MODEL`, `CLAUDE_CODE_SUBAGENT_MODEL`)
+map to the served model.
+
+**Codex CLI,** in `~/.codex/config.toml`:
+
+```toml
+model = "gpt-6.1-sol"          # a slug Codex knows, so it keeps its full tool set
+model_provider = "cuteafd"
+web_search = "live"            # optional: server-side web search
+
+[model_providers.cuteafd]
+name = "cuteafd"
+base_url = "http://HOST:PORT/v1"
+wire_api = "responses"
+env_key = "CUTEAFD_API_KEY"    # export CUTEAFD_API_KEY=$(cat FILE)
+supports_standalone_web_search = true
+# Optional: the served model's real context window and output limit, so
+# Codex compacts at the right point instead of using its built-in numbers.
+model_catalog_url = "http://HOST:PORT/v1/codex/models.json"
+```
+
+Codex's responses-lite mode uses the client-executed `web.run` extension,
+not a hosted Responses tool. `supports_standalone_web_search = true` enables
+its authenticated `POST /v1/alpha/search` calls. Queries work with either search
+provider; Exa also supports page `open`, and `find` searches opened text cached
+for the session. `time` works locally; image search, click, screenshot, finance,
+weather and sports return explicit unsupported tool output. Cached-mode searches
+use the provider's index; page opens only reuse already-opened session pages,
+never fetching uncached pages. Reference/page caches
+are bounded and expire after an hour of inactivity; reopen URLs if refs expire.
+
+**Realtime:** any client that accepts a custom URL can connect to
+`ws://HOST:PORT/v1/realtime?model=...`. These run headless against it:
+- the openai-python and openai-node SDKs (Node requires `wss://`);
+- Agents JS/Python;
+- Pipecat.
+
+Runners are in `scripts/gateway/realtime-clients/`.
 
 ## Working on it
 

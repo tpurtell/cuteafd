@@ -25,10 +25,19 @@ cuteafd-loader = { path = "../cuteafd-loader" }
 sha2.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+jiter = { version = "=0.17.0", default-features = false }
 tokio.workspace = true
 tracing.workspace = true
 uuid.workspace = true
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "json", "http2"] }
+bytes.workspace = true
+regex = "1"
+http-body = "1"
+hmac = "=0.12.1"
+time = { version = "=0.3.55", features = ["formatting", "parsing"] }
 
 [dev-dependencies]
+tracing-subscriber.workspace = true
+tokio-tungstenite = "0.24"
 tempfile.workspace = true
 tower.workspace = true

@@ -1,0 +1,35 @@
+use_default_settings:
+  engines:
+    keep_only:
+      - wikipedia
+      - wikidata
+      - openalex
+      - arxiv
+      - crossref
+      - pubmed
+      - semantic scholar
+engines:
+  - name: wikipedia
+    categories: [general]
+    disabled: false
+  - name: arxiv
+    categories: [general, science]
+    disabled: false
+  - name: crossref
+    categories: [general, science]
+    disabled: false
+  - name: openalex
+    categories: [general, science]
+    disabled: false
+# These are official public APIs; do not default to scraping general search engines.
+server:
+  limiter: false
+  image_proxy: false
+  bind_address: 0.0.0.0
+  port: 8080
+search:
+  formats:
+    - html
+    - json
+general:
+  instance_name: CuteAFD local search

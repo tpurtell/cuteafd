@@ -1,0 +1,332 @@
+{
+  "version": 1,
+  "flavor": "anthropic",
+  "deepseek_thinking": true,
+  "turn": {
+    "requested_model": "",
+    "model": "deepseek-flash",
+    "system": null,
+    "items": [
+      {
+        "item": "message",
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "In a fictional garden there are two rows of three flowers. How many flowers?"
+          }
+        ]
+      }
+    ],
+    "tools": [],
+    "tool_choice": {
+      "mode": "auto"
+    },
+    "parallel_tool_calls": null,
+    "max_output_tokens": 256,
+    "sampling": {
+      "temperature": null,
+      "top_p": null,
+      "top_k": null,
+      "stop": [],
+      "seed": null
+    },
+    "reasoning": {
+      "enabled": true,
+      "effort": "low",
+      "budget_tokens": null,
+      "return_text": false
+    },
+    "response_format": null,
+    "hosted": {
+      "web_search": null
+    },
+    "modalities": {
+      "audio_out": false
+    },
+    "session": null
+  },
+  "entries": [
+    {
+      "kind": "upstream",
+      "entry": {
+        "flavor": "anthropic",
+        "request": {
+          "model": "deepseek-flash",
+          "messages": [
+            {
+              "role": "user",
+              "content": [
+                {
+                  "type": "text",
+                  "text": "In a fictional garden there are two rows of three flowers. How many flowers?"
+                }
+              ]
+            }
+          ],
+          "stream": true,
+          "max_tokens": 256,
+          "thinking": {
+            "type": "enabled",
+            "budget_tokens": 1024
+          },
+          "output_config": {
+            "effort": "low"
+          }
+        },
+        "status": 200,
+        "body": "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"19a1babb-b2c9-4e7e-8acf-a38d0e2f9c71\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"deepseek-flash\",\"content\":[],\"stop_reason\":null,\"stop_sequence\":null,\"usage\":{\"input_tokens\":46,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"output_tokens\":0,\"service_tier\":\"standard\"}}}\n\nevent: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\",\"signature\":\"\"}}\n\nevent: ping\ndata: {\"type\":\"ping\"}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"We\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\" need\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\" answer\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\".\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\" Need\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\" parse\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\".\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\" \\\"\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"two\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\" rows\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\" of\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\" three\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\" flowers\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"\\\"\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\" =\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\" \"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"2\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"*\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"3\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\" =\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"6\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\".\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\" Simple\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\".\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\" Need\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\" maybe\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\" mention\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\" if\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\" rows\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\" overlap\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"?\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\" fictional\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\" garden\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\".\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\" Answer\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\" \"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"6\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\" flowers\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\".\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\" Ensure\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\" concise\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\".\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"signature_delta\",\"signature\":\"19a1babb-b2c9-4e7e-8acf-a38d0e2f9c71\"}}\n\nevent: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\nevent: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"There\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\" are\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\" **\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"6\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\" flowers\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"**\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\" in\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\" total\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\".\"}}\n\nevent: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":1}\n\nevent: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\",\"stop_sequence\":null},\"usage\":{\"input_tokens\":46,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"output_tokens\":52,\"service_tier\":\"standard\"}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+        "truncated": false
+      }
+    }
+  ],
+  "expected_events": [
+    {
+      "event": "usage",
+      "usage": {
+        "input_tokens": 46,
+        "output_tokens": 0,
+        "cached_input_tokens": 0,
+        "reasoning_tokens": 0,
+        "web_search_requests": 0,
+        "cache_creation_input_tokens": 0
+      }
+    },
+    {
+      "event": "reasoning_delta",
+      "text": "We"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " need"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " answer"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": "."
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " Need"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " parse"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": "."
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " \""
+    },
+    {
+      "event": "reasoning_delta",
+      "text": "two"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " rows"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " of"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " three"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " flowers"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": "\""
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " ="
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " "
+    },
+    {
+      "event": "reasoning_delta",
+      "text": "2"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": "*"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": "3"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " ="
+    },
+    {
+      "event": "reasoning_delta",
+      "text": "6"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": "."
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " Simple"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": "."
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " Need"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " maybe"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " mention"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " if"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " rows"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " overlap"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": "?"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " fictional"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " garden"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": "."
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " Answer"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " "
+    },
+    {
+      "event": "reasoning_delta",
+      "text": "6"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " flowers"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": "."
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " Ensure"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " concise"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": "."
+    },
+    {
+      "event": "reasoning_signature",
+      "signature": "19a1babb-b2c9-4e7e-8acf-a38d0e2f9c71"
+    },
+    {
+      "event": "text_delta",
+      "text": "There"
+    },
+    {
+      "event": "text_delta",
+      "text": " are"
+    },
+    {
+      "event": "text_delta",
+      "text": " **"
+    },
+    {
+      "event": "text_delta",
+      "text": "6"
+    },
+    {
+      "event": "text_delta",
+      "text": " flowers"
+    },
+    {
+      "event": "text_delta",
+      "text": "**"
+    },
+    {
+      "event": "text_delta",
+      "text": " in"
+    },
+    {
+      "event": "text_delta",
+      "text": " total"
+    },
+    {
+      "event": "text_delta",
+      "text": "."
+    },
+    {
+      "event": "usage",
+      "usage": {
+        "input_tokens": 46,
+        "output_tokens": 52,
+        "cached_input_tokens": 0,
+        "reasoning_tokens": 0,
+        "web_search_requests": 0,
+        "cache_creation_input_tokens": 0
+      }
+    },
+    {
+      "event": "usage",
+      "usage": {
+        "input_tokens": 46,
+        "output_tokens": 52,
+        "cached_input_tokens": 0,
+        "reasoning_tokens": 0,
+        "web_search_requests": 0,
+        "cache_creation_input_tokens": 0
+      }
+    },
+    {
+      "event": "done",
+      "stop": {
+        "reason": "end_turn"
+      }
+    }
+  ]
+}

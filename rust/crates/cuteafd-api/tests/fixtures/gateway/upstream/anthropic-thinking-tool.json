@@ -1,0 +1,321 @@
+{
+  "version": 1,
+  "flavor": "anthropic",
+  "deepseek_thinking": true,
+  "turn": {
+    "requested_model": "",
+    "model": "deepseek-flash",
+    "system": null,
+    "items": [
+      {
+        "item": "message",
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "Use the get_weather tool for the fictional city Cloudvale."
+          }
+        ]
+      }
+    ],
+    "tools": [
+      {
+        "name": "get_weather",
+        "description": null,
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "city": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "city"
+          ]
+        },
+        "strict": false
+      }
+    ],
+    "tool_choice": {
+      "mode": "auto"
+    },
+    "parallel_tool_calls": null,
+    "max_output_tokens": 256,
+    "sampling": {
+      "temperature": null,
+      "top_p": null,
+      "top_k": null,
+      "stop": [],
+      "seed": null
+    },
+    "reasoning": {
+      "enabled": true,
+      "effort": "low",
+      "budget_tokens": null,
+      "return_text": false
+    },
+    "response_format": null,
+    "hosted": {
+      "web_search": null
+    },
+    "modalities": {
+      "audio_out": false
+    },
+    "session": null
+  },
+  "entries": [
+    {
+      "kind": "upstream",
+      "entry": {
+        "flavor": "anthropic",
+        "request": {
+          "model": "deepseek-flash",
+          "messages": [
+            {
+              "role": "user",
+              "content": [
+                {
+                  "type": "text",
+                  "text": "Use the get_weather tool for the fictional city Cloudvale."
+                }
+              ]
+            }
+          ],
+          "stream": true,
+          "max_tokens": 256,
+          "tools": [
+            {
+              "name": "get_weather",
+              "description": "",
+              "input_schema": {
+                "type": "object",
+                "properties": {
+                  "city": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "city"
+                ]
+              }
+            }
+          ],
+          "tool_choice": {
+            "type": "auto"
+          },
+          "thinking": {
+            "type": "enabled",
+            "budget_tokens": 1024
+          },
+          "output_config": {
+            "effort": "low"
+          }
+        },
+        "status": 200,
+        "body": "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"c0a970bf-fa7e-4a20-a546-42c2691c0757\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"deepseek-flash\",\"content\":[],\"stop_reason\":null,\"stop_sequence\":null,\"usage\":{\"input_tokens\":167,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":128,\"output_tokens\":0,\"service_tier\":\"standard\"}}}\n\nevent: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\",\"signature\":\"\"}}\n\nevent: ping\ndata: {\"type\":\"ping\"}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"The\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\" user\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\" wants\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\" me\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\" to\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\" use\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\" the\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\" get\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"_\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"weather\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\" tool\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\" for\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\" a\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\" fictional\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\" city\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\" called\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\" Cloud\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"vale\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\".\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\" Let\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\" me\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\" do\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\" that\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\".\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"signature_delta\",\"signature\":\"c0a970bf-fa7e-4a20-a546-42c2691c0757\"}}\n\nevent: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\nevent: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"call_00_ydmAigaIXRLimd1X7lOQ8515\",\"name\":\"get_weather\",\"input\":{}}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"\\\"\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"city\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"\\\"\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\": \"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"\\\"\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"Cloud\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"vale\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"\\\"\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"}\"}}\n\nevent: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":1}\n\nevent: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\",\"stop_sequence\":null},\"usage\":{\"input_tokens\":167,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":128,\"output_tokens\":64,\"service_tier\":\"standard\"}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+        "truncated": false
+      }
+    }
+  ],
+  "expected_events": [
+    {
+      "event": "usage",
+      "usage": {
+        "input_tokens": 295,
+        "output_tokens": 0,
+        "cached_input_tokens": 128,
+        "reasoning_tokens": 0,
+        "web_search_requests": 0,
+        "cache_creation_input_tokens": 0
+      }
+    },
+    {
+      "event": "reasoning_delta",
+      "text": "The"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " user"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " wants"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " me"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " to"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " use"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " the"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " get"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": "_"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": "weather"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " tool"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " for"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " a"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " fictional"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " city"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " called"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " Cloud"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": "vale"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": "."
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " Let"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " me"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " do"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " that"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": "."
+    },
+    {
+      "event": "reasoning_signature",
+      "signature": "c0a970bf-fa7e-4a20-a546-42c2691c0757"
+    },
+    {
+      "event": "tool_call_start",
+      "index": 1,
+      "id": "call_00_ydmAigaIXRLimd1X7lOQ8515",
+      "name": "get_weather"
+    },
+    {
+      "event": "tool_call_delta",
+      "index": 1,
+      "arguments": "{"
+    },
+    {
+      "event": "tool_call_delta",
+      "index": 1,
+      "arguments": "\""
+    },
+    {
+      "event": "tool_call_delta",
+      "index": 1,
+      "arguments": "city"
+    },
+    {
+      "event": "tool_call_delta",
+      "index": 1,
+      "arguments": "\""
+    },
+    {
+      "event": "tool_call_delta",
+      "index": 1,
+      "arguments": ": "
+    },
+    {
+      "event": "tool_call_delta",
+      "index": 1,
+      "arguments": "\""
+    },
+    {
+      "event": "tool_call_delta",
+      "index": 1,
+      "arguments": "Cloud"
+    },
+    {
+      "event": "tool_call_delta",
+      "index": 1,
+      "arguments": "vale"
+    },
+    {
+      "event": "tool_call_delta",
+      "index": 1,
+      "arguments": "\""
+    },
+    {
+      "event": "tool_call_delta",
+      "index": 1,
+      "arguments": "}"
+    },
+    {
+      "event": "tool_call_end",
+      "index": 1
+    },
+    {
+      "event": "usage",
+      "usage": {
+        "input_tokens": 295,
+        "output_tokens": 64,
+        "cached_input_tokens": 128,
+        "reasoning_tokens": 0,
+        "web_search_requests": 0,
+        "cache_creation_input_tokens": 0
+      }
+    },
+    {
+      "event": "usage",
+      "usage": {
+        "input_tokens": 295,
+        "output_tokens": 64,
+        "cached_input_tokens": 128,
+        "reasoning_tokens": 0,
+        "web_search_requests": 0,
+        "cache_creation_input_tokens": 0
+      }
+    },
+    {
+      "event": "done",
+      "stop": {
+        "reason": "tool_use"
+      }
+    }
+  ]
+}
