@@ -178,6 +178,13 @@ mod tests {
         for bad in ["literal-secret","anything","other-secret","/home/","person@example","token123","sk-abc","key.another"] { assert!(!text.contains(bad),"failed scrub {bad}"); }
     }
     #[test]
+    fn sanitizer_scrubs_router_credentials_and_private_endpoint_literals() {
+        let key = format!("sk-or-v1-{}","a".repeat(64));
+        let sanitizer = Sanitizer::new(["https://private.invalid/v1".into(),"private.invalid".into()]);
+        let text = sanitizer.text(&format!("{key} https://private.invalid/v1 private.invalid"));
+        assert!(!text.contains("sk-or-v1-") && !text.contains("private.invalid"));
+    }
+    #[test]
     fn sanitizer_preserves_clean_sse_bytes_and_scrubs_key_fields() {
         let sanitizer = Sanitizer::default();
         let clean = "event: test\r\ndata: { \"text\": \"hi\" }\r\n\r\n";

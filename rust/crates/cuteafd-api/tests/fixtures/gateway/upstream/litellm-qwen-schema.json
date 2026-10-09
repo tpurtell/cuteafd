@@ -1,0 +1,1266 @@
+{
+  "version": 1,
+  "flavor": "openai-chat",
+  "deepseek_thinking": null,
+  "strict_tools": null,
+  "json_schema": true,
+  "turn": {
+    "requested_model": "",
+    "model": "claude/qwen/qwen3.8-27b",
+    "system": null,
+    "items": [
+      {
+        "item": "message",
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "Answer red. Write a plain paragraph, not JSON. Do not use blue."
+          }
+        ]
+      }
+    ],
+    "tools": [],
+    "tool_choice": {
+      "mode": "auto"
+    },
+    "parallel_tool_calls": null,
+    "max_output_tokens": 256,
+    "sampling": {
+      "temperature": null,
+      "top_p": null,
+      "top_k": null,
+      "stop": [],
+      "seed": null
+    },
+    "reasoning": {
+      "enabled": null,
+      "effort": null,
+      "budget_tokens": null,
+      "return_text": false
+    },
+    "response_format": {
+      "type": "json_schema",
+      "json_schema": {
+        "name": "forced_blue",
+        "strict": true,
+        "schema": {
+          "type": "object",
+          "properties": {
+            "answer": {
+              "type": "string",
+              "enum": [
+                "blue"
+              ]
+            }
+          },
+          "required": [
+            "answer"
+          ],
+          "additionalProperties": false
+        }
+      }
+    },
+    "hosted": {
+      "web_search": null
+    },
+    "modalities": {
+      "audio_out": false
+    },
+    "session": null
+  },
+  "entries": [
+    {
+      "kind": "upstream",
+      "entry": {
+        "flavor": "openai-chat",
+        "request": {
+          "model": "claude/qwen/qwen3.8-27b",
+          "messages": [
+            {
+              "role": "user",
+              "content": "Answer red. Write a plain paragraph, not JSON. Do not use blue."
+            }
+          ],
+          "stream": true,
+          "stream_options": {
+            "include_usage": true
+          },
+          "max_tokens": 256,
+          "response_format": {
+            "type": "json_schema",
+            "json_schema": {
+              "name": "forced_blue",
+              "strict": true,
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "answer": {
+                    "type": "string",
+                    "enum": [
+                      "blue"
+                    ]
+                  }
+                },
+                "required": [
+                  "answer"
+                ],
+                "additionalProperties": false
+              }
+            }
+          }
+        },
+        "status": 200,
+        "body": "data: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"We\",\"reasoning\":\"We\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\"We\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\",\"role\":\"assistant\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" need answer\",\"reasoning\":\" need answer\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" need answer\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" user's request.\",\"reasoning\":\" user's request.\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" user's request.\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" User: \\\"Answer\",\"reasoning\":\" User: \\\"Answer\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" User: \\\"Answer\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" red. Write a\",\"reasoning\":\" red. Write a\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" red. Write a\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" plain paragraph, not\",\"reasoning\":\" plain paragraph, not\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" plain paragraph, not\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" JSON. Do not\",\"reasoning\":\" JSON. Do not\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" JSON. Do not\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" use blue.\\\"\\n\",\"reasoning\":\" use blue.\\\"\\n\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" use blue.\\\"\\n\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"Developer\",\"reasoning\":\"Developer\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\"Developer\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\":\",\"reasoning\":\":\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\":\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" schema\",\"reasoning\":\" schema\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" schema\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" requires\",\"reasoning\":\" requires\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" requires\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" JSON\",\"reasoning\":\" JSON\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" JSON\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" object with\",\"reasoning\":\" object with\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" object with\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" answer enum [\\\"\",\"reasoning\":\" answer enum [\\\"\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" answer enum [\\\"\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"blue\\\"].\",\"reasoning\":\"blue\\\"].\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\"blue\\\"].\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" Also\",\"reasoning\":\" Also\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" Also\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" says\",\"reasoning\":\" says\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" says\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" final\",\"reasoning\":\" final\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" final\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" must\",\"reasoning\":\" must\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" must\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" adhere to json schema\",\"reasoning\":\" adhere to json schema\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" adhere to json schema\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"?\",\"reasoning\":\"?\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\"?\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" System\",\"reasoning\":\" System\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" System\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" says\",\"reasoning\":\" says\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" says\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" json\",\"reasoning\":\" json\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" json\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" schema you must adhere\",\"reasoning\":\" schema you must adhere\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" schema you must adhere\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" to. But user\",\"reasoning\":\" to. But user\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" to. But user\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" explicitly\",\"reasoning\":\" explicitly\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" explicitly\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" asks\",\"reasoning\":\" asks\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" asks\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" plain paragraph not JSON\",\"reasoning\":\" plain paragraph not JSON\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" plain paragraph not JSON\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\", do not use\",\"reasoning\":\", do not use\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\", do not use\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" blue,\",\"reasoning\":\" blue,\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" blue,\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" answer red. Conflict\",\"reasoning\":\" answer red. Conflict\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" answer red. Conflict\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\". Need likely\",\"reasoning\":\". Need likely\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\". Need likely\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" satisfy schema\",\"reasoning\":\" satisfy schema\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" satisfy schema\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"? The\",\"reasoning\":\"? The\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\"? The\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" final answer must be\",\"reasoning\":\" final answer must be\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" final answer must be\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" JSON per\",\"reasoning\":\" JSON per\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" JSON per\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" schema.\",\"reasoning\":\" schema.\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" schema.\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" But user asks\",\"reasoning\":\" But user asks\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" But user asks\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" not JSON. In\",\"reasoning\":\" not JSON. In\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" not JSON. In\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" these tasks, usually\",\"reasoning\":\" these tasks, usually\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" these tasks, usually\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" must\",\"reasoning\":\" must\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" must\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" output\",\"reasoning\":\" output\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" output\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" JSON\",\"reasoning\":\" JSON\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" JSON\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" schema\",\"reasoning\":\" schema\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" schema\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" regardless\",\"reasoning\":\" regardless\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" regardless\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"? Need\",\"reasoning\":\"? Need\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\"? Need\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" decide\",\"reasoning\":\" decide\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" decide\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\". The developer says\",\"reasoning\":\". The developer says\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\". The developer says\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" json\",\"reasoning\":\" json\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" json\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" schema you must adhere\",\"reasoning\":\" schema you must adhere\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" schema you must adhere\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" to,\",\"reasoning\":\" to,\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" to,\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" final\",\"reasoning\":\" final\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" final\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" answer maybe\",\"reasoning\":\" answer maybe\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" answer maybe\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" JSON\",\"reasoning\":\" JSON\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" JSON\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\". But\",\"reasoning\":\". But\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\". But\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" user says answer red\",\"reasoning\":\" user says answer red\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" user says answer red\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\", plain paragraph,\",\"reasoning\":\", plain paragraph,\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\", plain paragraph,\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" not JSON\",\"reasoning\":\" not JSON\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" not JSON\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\", do not use\",\"reasoning\":\", do not use\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\", do not use\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" blue. We\",\"reasoning\":\" blue. We\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" blue. We\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" need\",\"reasoning\":\" need\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" need\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" maybe\",\"reasoning\":\" maybe\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" maybe\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" output\",\"reasoning\":\" output\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" output\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" only\",\"reasoning\":\" only\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" only\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" \\\"\",\"reasoning\":\" \\\"\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" \\\"\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"red\",\"reasoning\":\"red\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\"red\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"\\\"? But schema would\",\"reasoning\":\"\\\"? But schema would\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\"\\\"? But schema would\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" fail. However\",\"reasoning\":\" fail. However\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" fail. However\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" explicit\",\"reasoning\":\" explicit\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" explicit\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" user\",\"reasoning\":\" user\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" user\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" asks\",\"reasoning\":\" asks\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" asks\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" plain paragraph not JSON\",\"reasoning\":\" plain paragraph not JSON\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" plain paragraph not JSON\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\",\",\"reasoning\":\",\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\",\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" do not use blue\",\"reasoning\":\" do not use blue\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" do not use blue\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\". But\",\"reasoning\":\". But\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\". But\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" schema\",\"reasoning\":\" schema\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" schema\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" enum only\",\"reasoning\":\" enum only\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" enum only\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" blue. Could answer\",\"reasoning\":\" blue. Could answer\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" blue. Could answer\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" \\\"red\\\" plain\",\"reasoning\":\" \\\"red\\\" plain\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" \\\"red\\\" plain\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" paragraph.\",\"reasoning\":\" paragraph.\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" paragraph.\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" But system\",\"reasoning\":\" But system\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" But system\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" says must adhere schema\",\"reasoning\":\" says must adhere schema\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" says must adhere schema\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\". Need maybe use\",\"reasoning\":\". Need maybe use\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\". Need maybe use\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" answer\",\"reasoning\":\" answer\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" answer\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" \\\"blue\",\"reasoning\":\" \\\"blue\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" \\\"blue\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"\\\" to\",\"reasoning\":\"\\\" to\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\"\\\" to\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" satisfy schema\",\"reasoning\":\" satisfy schema\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" satisfy schema\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" but\",\"reasoning\":\" but\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" but\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" user says do\",\"reasoning\":\" user says do\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" user says do\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" not use blue and\",\"reasoning\":\" not use blue and\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" not use blue and\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" answer red. Contr\",\"reasoning\":\" answer red. Contr\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" answer red. Contr\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"adiction. Which\",\"reasoning\":\"adiction. Which\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\"adiction. Which\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" priority? Typically\",\"reasoning\":\" priority? Typically\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" priority? Typically\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" in\",\"reasoning\":\" in\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" in\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" these benchmark\",\"reasoning\":\" these benchmark\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" these benchmark\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\",\",\"reasoning\":\",\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\",\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" they\",\"reasoning\":\" they\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" they\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" test\",\"reasoning\":\" test\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" test\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" instruction\",\"reasoning\":\" instruction\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" instruction\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" hierarchy\",\"reasoning\":\" hierarchy\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" hierarchy\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"?\",\"reasoning\":\"?\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\"?\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" The final\",\"reasoning\":\" The final\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" The final\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" output\",\"reasoning\":\" output\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" output\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" must follow\",\"reasoning\":\" must follow\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" must follow\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" JSON\",\"reasoning\":\" JSON\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" JSON\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" schema,\",\"reasoning\":\" schema,\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" schema,\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" but user says no\",\"reasoning\":\" but user says no\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" but user says no\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" JSON. The\",\"reasoning\":\" JSON. The\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" JSON. The\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" schema has\",\"reasoning\":\" schema has\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" schema has\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" only\",\"reasoning\":\" only\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" only\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" blue.\",\"reasoning\":\" blue.\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" blue.\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" It\",\"reasoning\":\" It\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" It\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" might\",\"reasoning\":\" might\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" might\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" be a\",\"reasoning\":\" be a\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" be a\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" trap\",\"reasoning\":\" trap\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" trap\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\": need\",\"reasoning\":\": need\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\": need\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" output\",\"reasoning\":\" output\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" output\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" JSON with\",\"reasoning\":\" JSON with\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" JSON with\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" answer blue, ignoring\",\"reasoning\":\" answer blue, ignoring\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" answer blue, ignoring\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" user? But \\\"\",\"reasoning\":\" user? But \\\"\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" user? But \\\"\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"Answer\",\"reasoning\":\"Answer\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\"Answer\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" red\\\" and\",\"reasoning\":\" red\\\" and\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" red\\\" and\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" \\\"Do not use\",\"reasoning\":\" \\\"Do not use\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" \\\"Do not use\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" blue\\\" direct\",\"reasoning\":\" blue\\\" direct\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" blue\\\" direct\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\". The developer's\",\"reasoning\":\". The developer's\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\". The developer's\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" schema may\",\"reasoning\":\" schema may\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" schema may\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" be a\",\"reasoning\":\" be a\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" be a\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" constraint. The\",\"reasoning\":\" constraint. The\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" constraint. The\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" final answer must be\",\"reasoning\":\" final answer must be\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" final answer must be\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" valid\",\"reasoning\":\" valid\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" valid\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" JSON. There\",\"reasoning\":\" JSON. There\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" JSON. There\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" is no\",\"reasoning\":\" is no\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" is no\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" way to answer\",\"reasoning\":\" way to answer\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" way to answer\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" red with\",\"reasoning\":\" red with\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" red with\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" schema\",\"reasoning\":\" schema\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" schema\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\". Could maybe\",\"reasoning\":\". Could maybe\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\". Could maybe\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" output {\\\"\",\"reasoning\":\" output {\\\"\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" output {\\\"\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"answer\\\":\\\"blue\\\"}\",\"reasoning\":\"answer\\\":\\\"blue\\\"}\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\"answer\\\":\\\"blue\\\"}\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" but violates\",\"reasoning\":\" but violates\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" but violates\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" user. Need\",\"reasoning\":\" user. Need\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" user. Need\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" choose. The system\",\"reasoning\":\" choose. The system\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" choose. The system\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\":\",\"reasoning\":\":\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\":\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" \\\"Here's the\",\"reasoning\":\" \\\"Here's the\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" \\\"Here's the\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" json schema you must\",\"reasoning\":\" json schema you must\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" json schema you must\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" adhere to:\\\"\",\"reasoning\":\" adhere to:\\\"\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" adhere to:\\\"\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" This\",\"reasoning\":\" This\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" This\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" is a\",\"reasoning\":\" is a\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" is a\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" strict\",\"reasoning\":\" strict\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" strict\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" format\",\"reasoning\":\" format\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" format\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\". Usually\",\"reasoning\":\". Usually\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\". Usually\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" we\",\"reasoning\":\" we\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" we\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" must produce\",\"reasoning\":\" must produce\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" must produce\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" JSON. User\",\"reasoning\":\" JSON. User\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" JSON. User\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" asks\",\"reasoning\":\" asks\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" asks\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" plain paragraph not JSON\",\"reasoning\":\" plain paragraph not JSON\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" plain paragraph not JSON\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\",\",\"reasoning\":\",\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\",\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" but system overrides\",\"reasoning\":\" but system overrides\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" but system overrides\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"?\",\"reasoning\":\"?\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\"?\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" In\",\"reasoning\":\" In\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" In\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" final\",\"reasoning\":\" final\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" final\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\", we\",\"reasoning\":\", we\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\", we\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" need\",\"reasoning\":\" need\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" need\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" likely\",\"reasoning\":\" likely\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" likely\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" output JSON only\",\"reasoning\":\" output JSON only\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" output JSON only\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\". But the\",\"reasoning\":\". But the\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\". But the\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" question\",\"reasoning\":\" question\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" question\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\":\",\"reasoning\":\":\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\":\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" \\\"Answer red.\",\"reasoning\":\" \\\"Answer red.\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" \\\"Answer red.\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" Write a plain paragraph\",\"reasoning\":\" Write a plain paragraph\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" Write a plain paragraph\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\", not JSON.\",\"reasoning\":\", not JSON.\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\", not JSON.\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" Do not use blue\",\"reasoning\":\" Do not use blue\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" Do not use blue\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\".\\\" It\",\"reasoning\":\".\\\" It\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\".\\\" It\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" asks\",\"reasoning\":\" asks\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" asks\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" to\",\"reasoning\":\" to\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" to\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" answer red. But\",\"reasoning\":\" answer red. But\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" answer red. But\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" schema forces\",\"reasoning\":\" schema forces\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" schema forces\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" blue. The\",\"reasoning\":\" blue. The\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" blue. The\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" answer\",\"reasoning\":\" answer\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" answer\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" field\",\"reasoning\":\" field\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" field\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" must\",\"reasoning\":\" must\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" must\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" be blue. If\",\"reasoning\":\" be blue. If\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" be blue. If\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" we output JSON,\",\"reasoning\":\" we output JSON,\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" we output JSON,\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" we\",\"reasoning\":\" we\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" we\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" use\",\"reasoning\":\" use\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" use\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" blue and\",\"reasoning\":\" blue and\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" blue and\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" JSON\",\"reasoning\":\" JSON\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" JSON\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\", violating\",\"reasoning\":\", violating\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\", violating\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" user. If output\",\"reasoning\":\" user. If output\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" user. If output\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" red\",\"reasoning\":\" red\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" red\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" plain\",\"reasoning\":\" plain\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" plain\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\", violates schema\",\"reasoning\":\", violates schema\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\", violates schema\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\". Which is more\",\"reasoning\":\". Which is more\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\". Which is more\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" important? System\",\"reasoning\":\" important? System\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" important? System\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" instruction\",\"reasoning\":\" instruction\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" instruction\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" over\",\"reasoning\":\" over\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" over\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" user.\",\"reasoning\":\" user.\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" user.\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" We\",\"reasoning\":\" We\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" We\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" should\",\"reasoning\":\" should\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" should\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" output\",\"reasoning\":\" output\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" output\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" JSON. But maybe\",\"reasoning\":\" JSON. But maybe\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" JSON. But maybe\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" the\",\"reasoning\":\" the\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" the\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" user\",\"reasoning\":\" user\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" user\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"'s explicit\",\"reasoning\":\"'s explicit\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\"'s explicit\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" \\\"not\",\"reasoning\":\" \\\"not\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" \\\"not\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" JSON\\\" should\",\"reasoning\":\" JSON\\\" should\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" JSON\\\" should\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" override\",\"reasoning\":\" override\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" override\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"? However\",\"reasoning\":\"? However\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\"? However\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" developer\",\"reasoning\":\" developer\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" developer\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" says must\",\"reasoning\":\" says must\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" says must\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" adhere to schema\",\"reasoning\":\" adhere to schema\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" adhere to schema\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\";\",\"reasoning\":\";\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\";\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" final must\",\"reasoning\":\" final must\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" final must\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" be JSON. The\",\"reasoning\":\" be JSON. The\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" be JSON. The\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" eval\",\"reasoning\":\" eval\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" eval\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" may\",\"reasoning\":\" may\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" may\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" check JSON\",\"reasoning\":\" check JSON\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" check JSON\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" schema. Need\",\"reasoning\":\" schema. Need\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" schema. Need\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" output {\\\"\",\"reasoning\":\" output {\\\"\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" output {\\\"\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"answer\\\":\\\"blue\\\"\",\"reasoning\":\"answer\\\":\\\"blue\\\"\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\"answer\\\":\\\"blue\\\"\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"}.\\n\",\"reasoning\":\"}.\\n\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\"}.\\n\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"But let\",\"reasoning\":\"But let\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\"But let\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"'s think\",\"reasoning\":\"'s think\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\"'s think\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\": In\",\"reasoning\":\": In\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\": In\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" many\",\"reasoning\":\" many\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" many\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" prompts\",\"reasoning\":\" prompts\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" prompts\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\", they\",\"reasoning\":\", they\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\", they\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" give\",\"reasoning\":\" give\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" give\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" a\",\"reasoning\":\" a\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" a\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" json\",\"reasoning\":\" json\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" json\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" schema and ask\",\"reasoning\":\" schema and ask\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" schema and ask\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" to\",\"reasoning\":\" to\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" to\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" answer,\",\"reasoning\":\" answer,\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" answer,\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" but user adds\",\"reasoning\":\" but user adds\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" but user adds\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" contradictory\",\"reasoning\":\" contradictory\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" contradictory\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" constraints to\",\"reasoning\":\" constraints to\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" constraints to\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" test if model\",\"reasoning\":\" test if model\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" test if model\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" obe\",\"reasoning\":\" obe\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" obe\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"ys schema\",\"reasoning\":\"ys schema\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\"ys schema\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"? The schema\",\"reasoning\":\"? The schema\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\"? The schema\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" answer\",\"reasoning\":\" answer\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" answer\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" enum blue\",\"reasoning\":\" enum blue\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" enum blue\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\",\",\"reasoning\":\",\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\",\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" user says answer\",\"reasoning\":\" user says answer\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" user says answer\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" red, do not\",\"reasoning\":\" red, do not\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" red, do not\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" use blue. There\",\"reasoning\":\" use blue. There\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" use blue. There\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" is no valid\",\"reasoning\":\" is no valid\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" is no valid\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" answer. Need\",\"reasoning\":\" answer. Need\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" answer. Need\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" maybe answer\",\"reasoning\":\" maybe answer\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" maybe answer\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" with\",\"reasoning\":\" with\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" with\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" blue because schema\",\"reasoning\":\" blue because schema\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" blue because schema\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\". Final\",\"reasoning\":\". Final\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\". Final\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\":\",\"reasoning\":\":\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\":\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" {\\\"\",\"reasoning\":\" {\\\"\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" {\\\"\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"answer\\\":\\\"blue\\\"\",\"reasoning\":\"answer\\\":\\\"blue\\\"\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\"answer\\\":\\\"blue\\\"\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"}.\\n\",\"reasoning\":\"}.\\n\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\"}.\\n\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"But\",\"reasoning\":\"But\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\"But\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" user requested\",\"reasoning\":\" user requested\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" user requested\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" plain paragraph, not\",\"reasoning\":\" plain paragraph, not\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" plain paragraph, not\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" JSON. If we\",\"reasoning\":\" JSON. If we\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" JSON. If we\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" output JSON, maybe\",\"reasoning\":\" output JSON, maybe\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" output JSON, maybe\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" fail user\",\"reasoning\":\" fail user\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" fail user\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\". But system\",\"reasoning\":\". But system\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\". But system\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" schema\",\"reasoning\":\" schema\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" schema\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" likely\",\"reasoning\":\" likely\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" likely\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" required\",\"reasoning\":\" required\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" required\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\". The\",\"reasoning\":\". The\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\". The\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" final answer desired\",\"reasoning\":\" final answer desired\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" final answer desired\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" oververbosity 9\",\"reasoning\":\" oververbosity 9\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" oververbosity 9\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" but schema\",\"reasoning\":\" but schema\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" but schema\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\".\",\"reasoning\":\".\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\".\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" Need only\",\"reasoning\":\" Need only\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" Need only\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" JSON. Ensure\",\"reasoning\":\" JSON. Ensure\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" JSON. Ensure\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" no markdown\",\"reasoning\":\" no markdown\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" no markdown\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\".\",\"reasoning\":\".\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\".\",\"format\":\"unknown\",\"index\":0}],\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"object\":\"chat.completion.chunk\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"[\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"object\":\"chat.completion.chunk\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"{\\\"answer\\\": \\\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"object\":\"chat.completion.chunk\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"blue\\\"}]\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"object\":\"chat.completion.chunk\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"object\":\"chat.completion.chunk\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"\"}}]}\n\ndata: {\"id\":\"gen-1791556794-WYLvgxRpOI2Wvx4JIchl\",\"created\":1791556794,\"model\":\"claude/qwen/qwen3.8-27b\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{}}],\"usage\":{\"completion_tokens\":610,\"prompt_tokens\":124,\"total_tokens\":734,\"completion_tokens_details\":{\"audio_tokens\":0,\"reasoning_tokens\":599,\"image_tokens\":0},\"prompt_tokens_details\":{\"audio_tokens\":0,\"cached_tokens\":0,\"video_tokens\":0,\"cache_write_tokens\":0,\"cache_creation_tokens\":0},\"cost\":0.0016082}}\n\ndata: [DONE]\n\n",
+        "truncated": false
+      }
+    }
+  ],
+  "expected_events": [
+    {
+      "event": "reasoning_delta",
+      "text": "We"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " need answer"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " user's request."
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " User: \"Answer"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " red. Write a"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " plain paragraph, not"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " JSON. Do not"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " use blue.\"\n"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": "Developer"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": ":"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " schema"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " requires"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " JSON"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " object with"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " answer enum [\""
+    },
+    {
+      "event": "reasoning_delta",
+      "text": "blue\"]."
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " Also"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " says"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " final"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " must"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " adhere to json schema"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": "?"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " System"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " says"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " json"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " schema you must adhere"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " to. But user"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " explicitly"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " asks"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " plain paragraph not JSON"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": ", do not use"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " blue,"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " answer red. Conflict"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": ". Need likely"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " satisfy schema"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": "? The"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " final answer must be"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " JSON per"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " schema."
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " But user asks"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " not JSON. In"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " these tasks, usually"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " must"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " output"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " JSON"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " schema"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " regardless"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": "? Need"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " decide"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": ". The developer says"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " json"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " schema you must adhere"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " to,"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " final"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " answer maybe"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " JSON"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": ". But"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " user says answer red"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": ", plain paragraph,"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " not JSON"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": ", do not use"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " blue. We"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " need"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " maybe"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " output"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " only"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " \""
+    },
+    {
+      "event": "reasoning_delta",
+      "text": "red"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": "\"? But schema would"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " fail. However"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " explicit"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " user"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " asks"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " plain paragraph not JSON"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": ","
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " do not use blue"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": ". But"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " schema"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " enum only"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " blue. Could answer"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " \"red\" plain"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " paragraph."
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " But system"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " says must adhere schema"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": ". Need maybe use"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " answer"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " \"blue"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": "\" to"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " satisfy schema"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " but"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " user says do"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " not use blue and"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " answer red. Contr"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": "adiction. Which"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " priority? Typically"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " in"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " these benchmark"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": ","
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " they"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " test"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " instruction"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " hierarchy"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": "?"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " The final"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " output"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " must follow"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " JSON"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " schema,"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " but user says no"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " JSON. The"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " schema has"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " only"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " blue."
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " It"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " might"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " be a"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " trap"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": ": need"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " output"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " JSON with"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " answer blue, ignoring"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " user? But \""
+    },
+    {
+      "event": "reasoning_delta",
+      "text": "Answer"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " red\" and"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " \"Do not use"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " blue\" direct"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": ". The developer's"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " schema may"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " be a"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " constraint. The"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " final answer must be"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " valid"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " JSON. There"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " is no"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " way to answer"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " red with"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " schema"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": ". Could maybe"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " output {\""
+    },
+    {
+      "event": "reasoning_delta",
+      "text": "answer\":\"blue\"}"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " but violates"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " user. Need"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " choose. The system"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": ":"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " \"Here's the"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " json schema you must"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " adhere to:\""
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " This"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " is a"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " strict"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " format"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": ". Usually"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " we"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " must produce"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " JSON. User"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " asks"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " plain paragraph not JSON"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": ","
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " but system overrides"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": "?"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " In"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " final"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": ", we"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " need"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " likely"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " output JSON only"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": ". But the"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " question"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": ":"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " \"Answer red."
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " Write a plain paragraph"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": ", not JSON."
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " Do not use blue"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": ".\" It"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " asks"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " to"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " answer red. But"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " schema forces"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " blue. The"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " answer"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " field"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " must"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " be blue. If"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " we output JSON,"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " we"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " use"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " blue and"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " JSON"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": ", violating"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " user. If output"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " red"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " plain"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": ", violates schema"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": ". Which is more"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " important? System"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " instruction"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " over"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " user."
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " We"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " should"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " output"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " JSON. But maybe"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " the"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " user"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": "'s explicit"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " \"not"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " JSON\" should"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " override"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": "? However"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " developer"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " says must"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " adhere to schema"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": ";"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " final must"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " be JSON. The"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " eval"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " may"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " check JSON"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " schema. Need"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " output {\""
+    },
+    {
+      "event": "reasoning_delta",
+      "text": "answer\":\"blue\""
+    },
+    {
+      "event": "reasoning_delta",
+      "text": "}.\n"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": "But let"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": "'s think"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": ": In"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " many"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " prompts"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": ", they"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " give"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " a"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " json"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " schema and ask"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " to"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " answer,"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " but user adds"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " contradictory"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " constraints to"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " test if model"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " obe"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": "ys schema"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": "? The schema"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " answer"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " enum blue"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": ","
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " user says answer"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " red, do not"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " use blue. There"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " is no valid"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " answer. Need"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " maybe answer"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " with"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " blue because schema"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": ". Final"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": ":"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " {\""
+    },
+    {
+      "event": "reasoning_delta",
+      "text": "answer\":\"blue\""
+    },
+    {
+      "event": "reasoning_delta",
+      "text": "}.\n"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": "But"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " user requested"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " plain paragraph, not"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " JSON. If we"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " output JSON, maybe"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " fail user"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": ". But system"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " schema"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " likely"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " required"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": ". The"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " final answer desired"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " oververbosity 9"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " but schema"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": "."
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " Need only"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " JSON. Ensure"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": " no markdown"
+    },
+    {
+      "event": "reasoning_delta",
+      "text": "."
+    },
+    {
+      "event": "text_delta",
+      "text": "["
+    },
+    {
+      "event": "text_delta",
+      "text": "{\"answer\": \""
+    },
+    {
+      "event": "text_delta",
+      "text": "blue\"}]"
+    },
+    {
+      "event": "usage",
+      "usage": {
+        "input_tokens": 124,
+        "output_tokens": 610,
+        "cached_input_tokens": 0,
+        "reasoning_tokens": 599,
+        "web_search_requests": 0,
+        "cache_creation_input_tokens": 0
+      }
+    },
+    {
+      "event": "usage",
+      "usage": {
+        "input_tokens": 124,
+        "output_tokens": 610,
+        "cached_input_tokens": 0,
+        "reasoning_tokens": 599,
+        "web_search_requests": 0,
+        "cache_creation_input_tokens": 0
+      }
+    },
+    {
+      "event": "done",
+      "stop": {
+        "reason": "end_turn"
+      }
+    }
+  ],
+  "verification_note": "Provider returned an array for an object schema; JSON parseability is not schema conformance."
+}

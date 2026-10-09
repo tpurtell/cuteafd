@@ -176,10 +176,10 @@ async fn models_metadata_is_discovered_and_missing_listing_is_nonfatal() {
     assert_eq!(upstream.models()[0].context_tokens,Some(1000));
     task.abort();
 }
-/// Explicit opt-in capture: fixed DeepSeek endpoints, invented prompts loaded only from scratch.
+/// Explicit opt-in test capture: allowlisted endpoints/models, invented scratch prompts only.
 #[tokio::test]
-#[ignore = "paid DeepSeek capture; requires keys and scratch cases"]
-async fn capture_deepseek_scratch_fixtures() {
+#[ignore = "paid provider capture; requires keys and scratch cases"]
+async fn capture_scratch_fixtures() {
     use crate::gateway::record::{Sanitizer, TapeSink};
     #[derive(Default)]
     struct Collector(std::sync::Mutex<Vec<Value>>);
@@ -191,7 +191,6 @@ async fn capture_deepseek_scratch_fixtures() {
             for (key,value) in patch { if value.is_object() && target.get(key).is_some_and(Value::is_object) { merge(target.get_mut(key).unwrap(),value); } else { target.insert(key.clone(),value.clone()); } }
         }
     }
-    let key = std::env::var("DEEPSEEK_API_KEY").expect("DeepSeek key must be set");
     let cases:Vec<Value> = serde_json::from_slice(&std::fs::read("/home/tj/.cache/cuteafd/builds/api-gateway/scratch/upstream-cases.json").unwrap()).unwrap();
     let directory = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/gateway/upstream");
     std::fs::create_dir_all(&directory).unwrap();
@@ -203,22 +202,47 @@ async fn capture_deepseek_scratch_fixtures() {
         let mut turn:TurnRequest = serde_json::from_value(value).unwrap();
         let collector = Arc::new(Collector::default());
         turn.tape = Tape(Some(collector.clone()));
-        let mut config = UpstreamConfig::new(match flavor { Flavor::OpenaiChat => "https://api.deepseek.com",Flavor::Anthropic => "https://api.deepseek.com/anthropic" },flavor,turn.model.clone());
-        config.key = Some(key.clone());
-        config.thinking_toggle = case["thinking"].as_bool().unwrap();
+        let provider = case["provider"].as_str().unwrap_or("deepseek");
+        let (base,key_env) = match provider {
+            "deepseek" => (match flavor { Flavor::OpenaiChat => "https://api.deepseek.com",Flavor::Anthropic => "https://api.deepseek.com/anthropic" }.to_string(),"DEEPSEEK_API_KEY"),
+            "openrouter" => {
+                assert!(turn.model.starts_with("xiaomi/") || turn.model.starts_with("qwen/"));
+                ("https://openrouter.ai/api/v1".into(),"OPENROUTER_API_KEY")
+            }
+            "litellm" => {
+                assert!(["claude/xiaomi/","claude/qwen/","claude/z-ai/","claude/moonshotai/","claude/deepseek/"].iter().any(|prefix| turn.model.starts_with(prefix)));
+                (format!("{}/v1",std::env::var("LITELLM_BASE_URL").expect("private endpoint env required").trim_end_matches('/')),"LITELLM_API_KEY")
+            }
+            _ => panic!("provider not allowed by capture test"),
+        };
+        let mut config = UpstreamConfig::new(base,flavor,turn.model.clone());
+        config.key = Some(std::env::var(key_env).expect("provider key must be set"));
+        config.thinking_toggle = case["thinking"].as_bool().unwrap_or(false);
         config.capabilities.strict_tools = case["strict_tools"].as_bool().unwrap_or(false);
+        config.capabilities.json_schema = case["json_schema"].as_bool().unwrap_or(false);
         config.strict_tools_path = case["strict_path"].as_str().map(str::to_string);
         let upstream = Upstream::new(config).unwrap();
         let result = match upstream.start(turn.clone()).await {
             Ok(stream) => stream.collect::<Vec<_>>().await.into_iter().collect::<Result<Vec<_>,_>>(),
             Err(error) => Err(error),
         };
-        let mut fixture = json!({"version":1,"flavor":flavor.name(),"deepseek_thinking":case["thinking"],"turn":turn,
+        let mut fixture = json!({"version":1,"flavor":flavor.name(),"deepseek_thinking":case["thinking"],"strict_tools":case["strict_tools"],"json_schema":case["json_schema"],"turn":turn,
             "entries":collector.0.lock().unwrap().clone()});
         match result { Ok(events) => fixture["expected_events"] = json!(events), Err(error) => { fixture["expected_error_status"] = json!(error.status()); } }
         sanitizer.value(&mut fixture);
         std::fs::write(directory.join(format!("{}.json",case["name"].as_str().unwrap())),serde_json::to_vec_pretty(&fixture).unwrap()).unwrap();
         println!("captured {}",case["name"]);
+        if case["expect_success"].as_bool() == Some(true) { assert!(fixture["expected_events"].is_array(),"provider probe failed; sanitized error fixture recorded"); }
+        if let Some(expected) = case.get("expected_json") {
+            let text = fixture["expected_events"].as_array().unwrap().iter().filter_map(|event| if event["event"] == "text_delta" { event["text"].as_str() } else { None }).collect::<String>();
+            let actual = serde_json::from_str::<Value>(&text).unwrap();
+            if case["expect_schema_violation"].as_bool() == Some(true) { assert_ne!(actual,*expected,"expected provider schema violation changed"); }
+            else { assert_eq!(actual,*expected,"schema was not honored"); }
+        }
+        if let Some(expected) = case.get("expected_tool_arguments") {
+            let arguments = fixture["expected_events"].as_array().unwrap().iter().filter_map(|event| if event["event"] == "tool_call_delta" { event["arguments"].as_str() } else { None }).collect::<String>();
+            assert_eq!(serde_json::from_str::<Value>(&arguments).unwrap(),*expected,"strict tool schema was not honored");
+        }
         if case["followup"].as_bool() == Some(true) {
             let mut reasoning = String::new();
             let mut text = String::new();
@@ -242,7 +266,7 @@ async fn capture_deepseek_scratch_fixtures() {
             for (id,_,_) in calls.values() { turn.items.push(Item::ToolResult { call_id:id.clone(),content:vec![Part::text("Cloudvale: sunny, 20 C")],is_error:false }); }
             collector.0.lock().unwrap().clear();
             let events:Result<Vec<_>,_> = upstream.start(turn.clone()).await.unwrap().collect::<Vec<_>>().await.into_iter().collect();
-            let mut followup = json!({"version":1,"flavor":flavor.name(),"deepseek_thinking":case["thinking"],"turn":turn,
+            let mut followup = json!({"version":1,"flavor":flavor.name(),"deepseek_thinking":case["thinking"],"strict_tools":case["strict_tools"],"json_schema":case["json_schema"],"turn":turn,
                 "entries":collector.0.lock().unwrap().clone(),"expected_events":events.unwrap()});
             sanitizer.value(&mut followup);
             std::fs::write(directory.join(format!("{}-followup.json",case["name"].as_str().unwrap())),serde_json::to_vec_pretty(&followup).unwrap()).unwrap();
@@ -337,4 +361,10 @@ fn thinking_tool_loops_echo_reasoning_even_when_empty() {
     assert!(request["messages"].as_array().unwrap().iter().all(|m| m.get("reasoning_content").is_none() || m["reasoning_content"] != ""));
     let plain = backend(Flavor::OpenaiChat).map_request(&turn).unwrap();
     assert!(plain["messages"].as_array().unwrap().iter().all(|m| m["reasoning_content"] != ""), "off without the switch");
+}
+
+#[tokio::test]
+async fn chat_reasoning_alias_streams_without_double_counting() {
+    let events = parse("data: {\"choices\":[{\"delta\":{\"reasoning\":\"plan\",\"reasoning_content\":\"plan\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",Flavor::OpenaiChat).await.unwrap();
+    assert_eq!(events.iter().filter(|e| matches!(e,TurnEvent::ReasoningDelta { .. })).count(),1);
 }
