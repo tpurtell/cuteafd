@@ -130,15 +130,16 @@ pub(super) async fn run(gateway: Arc<Gateway>, mut turn: TurnRequest) -> Result<
                 turn.tools.retain(|tool| tool.name != search::TOOL_NAME);
                 if turn.tools.is_empty() { turn.tool_choice = ToolChoice::Auto; }
             }
+            if client_calls {
+                // The client must run its own calls before the model continues
+                // (checked first: runnable calls must end with tool_use).
+                yield Ok(TurnEvent::Usage { usage: total });
+                yield Ok(TurnEvent::Done { stop: StopReason::ToolUse });
+                return;
+            }
             if rounds >= MAX_HOSTED_ROUNDS {
                 yield Ok(TurnEvent::Usage { usage: total });
                 yield Ok(TurnEvent::Done { stop: StopReason::PauseTurn });
-                return;
-            }
-            if client_calls {
-                // The client must run its own calls before the model continues.
-                yield Ok(TurnEvent::Usage { usage: total });
-                yield Ok(TurnEvent::Done { stop: StopReason::ToolUse });
                 return;
             }
             stream = match backend.start(turn.clone()).await {
