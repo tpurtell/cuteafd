@@ -349,7 +349,14 @@ impl Connection {
                 let index = session.index_of(&item_id)?;
                 let previous = index.checked_sub(1).map(|i| session.items[i].id.clone());
                 drop(session);
-                Ok(self.item_events(&item_id, &item, previous))
+                let mut events = self.item_events(&item_id, &item, previous);
+                if matches!(&item,Item::Message {content,..} if content.iter().any(|p|matches!(p,Part::Audio {..})))
+                    && (self.transcription
+                        || audio::settings(&self.config, self.beta)?.transcription)
+                {
+                    events.push(json!({"type":"conversation.item.input_audio_transcription.failed","item_id":item_id,"content_index":0,"error":{"type":"server_error","code":"transcription_not_configured","message":"No Transcriber configured for audio input"}}));
+                }
+                Ok(events)
             }
             "conversation.item.retrieve" => {
                 let item_id = string(event, "item_id")?;

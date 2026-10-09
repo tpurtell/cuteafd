@@ -326,6 +326,13 @@ async fn manual_audio_vad_and_transcription_fail_honestly() {
             .unwrap()
             .contains("audio_in")
     );
+    create(&mut c,json!({"type":"message","id":"direct_audio","role":"user","content":[{"type":"input_audio","audio":STANDARD.encode(vec![0u8;4800])}]}),Value::Null,false).await;
+    let failure = recv(&mut c).await;
+    assert_eq!(
+        failure["type"],
+        "conversation.item.input_audio_transcription.failed"
+    );
+    assert_eq!(failure["item_id"], "direct_audio");
     emit(&mut c,json!({"type":"session.update","session":{"audio":{"input":{"turn_detection":{"type":"server_vad","threshold":0.1,"prefix_padding_ms":20,"silence_duration_ms":30}}}}})).await;
     recv(&mut c).await;
     let bytes = [vec![0xff, 0x7f].repeat(2400), vec![0u8; 1440]].concat();
