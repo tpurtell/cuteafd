@@ -4,7 +4,9 @@ Anthropic Messages and OpenAI Responses against a served cuteafd model.
 
 Greedy (temperature 0), thinking off and on, a plain turn, a tool-call turn
 (the reply must call the tool) and an image turn when the model has vision.
-Per case it compares, across the three protocols:
+Each case first sends an untimed one-token warm-up, so the three protocols
+decode from the same prefix-cache restore. Per case it compares, across the
+three protocols:
 - the prompt token hash and length the engine admitted (the server's
   `matched benchmark prompt` log lines; needs CUTEAFD_BENCH_NONCE_SEED set
   in the server and `--log` pointing at its log);
@@ -153,7 +155,8 @@ def normalize_responses(response):
             "input_tokens": usage["input_tokens"]}
 
 
-HASH = re.compile(r"prompt_tokens=(\d+) prompt_token_hash=([0-9a-f]{16}) matched benchmark prompt")
+HASH = re.compile(r"matched benchmark prompt.*?prompt_tokens=(\d+) prompt_token_hash=([0-9a-f]{16})")
+ANSI = re.compile(r"\x1b\[[0-9;]*m")
 
 
 def admitted(log, since):
@@ -161,7 +164,7 @@ def admitted(log, since):
         return []
     with open(log, errors="replace") as f:
         f.seek(since)
-        return HASH.findall(f.read())
+        return HASH.findall(ANSI.sub("", f.read()))
 
 
 def log_size(log):
@@ -190,6 +193,11 @@ def main():
         for thinking in (False, True):
             row = {"case": name, "thinking": thinking}
             outputs, hashes = {}, {}
+            # Untimed warm-up: every protocol then restores the same prompt
+            # from the prefix cache, so all three decode under one engine
+            # condition (a cold prefill is not bit-identical to a restore).
+            warm = chat_body(model, turns, tools, case_image, thinking, 1)
+            post(args.url, key, "/v1/chat/completions", warm)
             for protocol, path, build, norm, headers in [
                 ("chat", "/v1/chat/completions", lambda: chat_body(model, turns, tools, case_image, thinking, args.max_tokens), normalize_chat, None),
                 ("messages", "/v1/messages", lambda: messages_body(turns, tools, case_image, thinking, args.max_tokens), normalize_messages,

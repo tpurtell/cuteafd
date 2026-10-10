@@ -594,3 +594,50 @@ async fn engine_failure_answers_each_protocol_in_its_own_shape() {
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{text}");
     assert!(worker.prompts.lock().unwrap().is_empty());
 }
+
+#[tokio::test]
+async fn system_items_follow_each_template_placement_rule() {
+    // Claude Code interleaves `role: system` reminders; Codex sends several
+    // leading developer items after `instructions`. Qwen's template takes one
+    // leading system message: leading ones merge with a blank line, later ones
+    // become user turns (the DeepSeek recipe's normalization). GLM and MiMo
+    // render system messages anywhere and get them unchanged.
+    for family in families() {
+        let placement = system_placement(&family.profile);
+        let id = family.profile.id.clone();
+        let messages = json!({"model":"m","max_tokens":8,"stream":false,"thinking":{"type":"disabled"},"system":"base",
+            "messages":[{"role":"user","content":"q"},{"role":"system","content":"<system-reminder>r</system-reminder>"},
+                {"role":"assistant","content":"a"},{"role":"user","content":"again"}]});
+        let responses = json!({"model":"m","stream":false,"store":false,"reasoning":{"effort":"none"},"instructions":"base",
+            "input":[{"type":"message","role":"developer","content":[{"type":"input_text","text":"dev one"}]},
+                {"type":"message","role":"developer","content":[{"type":"input_text","text":"dev two"}]},
+                {"type":"message","role":"user","content":[{"type":"input_text","text":"q"}]}]});
+        let (chat_cc, chat_cx) = match placement {
+            SystemPlacement::FirstOnly => (
+                json!([{"role":"system","content":"base"},{"role":"user","content":"q"},{"role":"user","content":"<system-reminder>r</system-reminder>"},
+                    {"role":"assistant","content":"a"},{"role":"user","content":"again"}]),
+                json!([{"role":"system","content":"base\n\ndev one\n\ndev two"},{"role":"user","content":"q"}])),
+            SystemPlacement::Anywhere => (
+                json!([{"role":"system","content":"base"},{"role":"user","content":"q"},{"role":"system","content":"<system-reminder>r</system-reminder>"},
+                    {"role":"assistant","content":"a"},{"role":"user","content":"again"}]),
+                json!([{"role":"system","content":"base"},{"role":"system","content":"dev one"},{"role":"system","content":"dev two"},{"role":"user","content":"q"}])),
+        };
+        if matches!(family.profile.encoding, ModelEncoding::Qwen(_)) && family.name.starts_with("qwen") {
+            assert_eq!(placement, SystemPlacement::FirstOnly, "{}", family.name);
+        }
+        if matches!(family.profile.encoding, ModelEncoding::Glm(_)) { assert_eq!(placement, SystemPlacement::Anywhere, "{}", family.name); }
+        let (app, worker) = serve(family.profile.clone(), family.snapshot.clone(), vec![], false);
+        for (path, body) in [("/v1/messages", messages), ("/v1/responses", responses)] {
+            let (status, text) = post(&app, path, body).await;
+            assert_eq!(status, StatusCode::OK, "{} {path}: {text}", family.name);
+        }
+        for chat in [chat_cc, chat_cx] {
+            let (status, text) = post(&app, "/v1/chat/completions", json!({"model":id,"stream":false,"max_tokens":8,
+                "thinking":{"type":"disabled"},"messages":chat})).await;
+            assert_eq!(status, StatusCode::OK, "{} chat: {text}", family.name);
+        }
+        let prompts = worker.prompts.lock().unwrap().clone();
+        assert_eq!(prompts[0], prompts[2], "{} Claude Code reminders ({placement:?})", family.name);
+        assert_eq!(prompts[1], prompts[3], "{} Codex developer items ({placement:?})", family.name);
+    }
+}

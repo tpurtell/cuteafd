@@ -68,12 +68,39 @@ pub struct Engine {
     state: NativeState,
     snapshot: Option<std::path::PathBuf>,
     options: EngineOptions,
+    systems: SystemPlacement,
+}
+
+/// Where a family's template accepts system messages.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SystemPlacement {
+    /// Anywhere (GLM, MiMo); the DeepSeek recipe normalizes on its own.
+    Anywhere,
+    /// Only one, first (Qwen 3.8 raises otherwise). Leading system items
+    /// merge into it with a blank line and later ones become user turns:
+    /// the DeepSeek recipe's own normalization (`normalize_messages`).
+    FirstOnly,
+}
+
+/// Probe the checkpoint template once: does it render a second system message?
+pub(crate) fn system_placement(profile: &ModelProfile) -> SystemPlacement {
+    let body = json!({"messages":[{"role":"system","content":"a"},{"role":"user","content":"b"},
+        {"role":"system","content":"c"},{"role":"user","content":"d"}]});
+    let rejects = match &profile.encoding {
+        ModelEncoding::Qwen(encoding) => encoding.render(&body, &super::qwen4::QwenPromptOptions { thinking: false,
+            tool_names: Vec::new(), tool_choice: super::qwen4::prompt::QwenToolChoice::Auto, response_format: None }).is_err(),
+        ModelEncoding::Glm(encoding) => encoding.render(&body, &super::glm5::GlmPromptOptions { thinking: false,
+            reasoning_effort: None, tool_names: Vec::new(), tool_choice: super::glm5::GlmToolChoice::Auto, response_format: None }).is_err(),
+        ModelEncoding::DeepseekV4 | ModelEncoding::DeepseekV41 => false,
+    };
+    if rejects { SystemPlacement::FirstOnly } else { SystemPlacement::Anywhere }
 }
 
 impl Engine {
     /// `snapshot` holds the tokenizer used for exact `count_tokens`.
     pub(crate) fn new(state: NativeState, snapshot: Option<std::path::PathBuf>, options: EngineOptions) -> Self {
-        Self { state, snapshot, options }
+        let systems = system_placement(&state.profile);
+        Self { state, snapshot, options, systems }
     }
     fn profile(&self) -> &ModelProfile { &self.state.profile }
     fn submitter(&self) -> Submitter { self.state.submitter() }
@@ -81,7 +108,7 @@ impl Engine {
 
     /// The Chat Completions body for `turn`, as `/v1/chat/completions` would receive it.
     pub fn chat_body(&self, turn: &TurnRequest) -> Result<Value, GatewayError> {
-        chat_body(turn, self.profile())
+        chat_body_with(turn, self.profile(), &ToolNames::new(turn), self.systems)
     }
 }
 
@@ -149,6 +176,45 @@ fn pcm16_wav(data: &str) -> Result<String, GatewayError> {
     Ok(STANDARD.encode(wav))
 }
 
+/// For a template that takes one leading system message: leading system
+/// messages merge with a blank line, later ones become user turns (Claude
+/// Code's mid-conversation `<system-reminder>` messages, Codex's developer
+/// items), as the DeepSeek recipe normalizes for its own template.
+fn first_system_only(messages: Vec<Value>) -> Vec<Value> {
+    let mut out: Vec<Value> = Vec::with_capacity(messages.len());
+    for mut message in messages {
+        if message["role"] != "system" { out.push(message); continue; }
+        let leading = out.iter().all(|m| m["role"] == "system");
+        match out.last_mut().filter(|_| leading) {
+            Some(head) => {
+                let mut parts = parts_of(head["content"].take());
+                parts.push(json!({"type":"text","text":"\n\n"}));
+                parts.extend(parts_of(message["content"].take()));
+                head["content"] = joined(parts);
+            }
+            None if leading => out.push(message),
+            None => { message["role"] = json!("user"); out.push(message); }
+        }
+    }
+    out
+}
+
+/// Content parts of a chat content value (a string is one text part).
+fn parts_of(value: Value) -> Vec<Value> {
+    match value {
+        Value::String(text) => vec![json!({"type":"text","text":text})],
+        Value::Array(parts) => parts,
+        _ => Vec::new(),
+    }
+}
+
+/// Text-only parts as one string (system content is text in every template).
+fn joined(parts: Vec<Value>) -> Value {
+    if parts.iter().all(|p| p["type"] == "text") {
+        Value::String(parts.iter().map(|p| p["text"].as_str().unwrap_or_default()).collect())
+    } else { Value::Array(parts) }
+}
+
 /// Tool names the chat path accepts: 1-128 ASCII letters, digits, `_`, `-`.
 /// Namespaced Responses tools (`functions.exec`) and other names are mapped
 /// to a legal, unique wire name per turn and back.
@@ -198,10 +264,10 @@ impl ToolNames {
 
 /// Map `turn` onto a Chat Completions request body for `profile`.
 pub(crate) fn chat_body(turn: &TurnRequest, profile: &ModelProfile) -> Result<Value, GatewayError> {
-    chat_body_with(turn, profile, &ToolNames::new(turn))
+    chat_body_with(turn, profile, &ToolNames::new(turn), system_placement(profile))
 }
 
-fn chat_body_with(turn: &TurnRequest, profile: &ModelProfile, names: &ToolNames) -> Result<Value, GatewayError> {
+fn chat_body_with(turn: &TurnRequest, profile: &ModelProfile, names: &ToolNames, systems: SystemPlacement) -> Result<Value, GatewayError> {
     if turn.modalities.audio_out {
         return Err(GatewayError::unsupported("audio output needs a speech synthesizer; this server has none").with_param("modalities"));
     }
@@ -226,14 +292,6 @@ fn chat_body_with(turn: &TurnRequest, profile: &ModelProfile, names: &ToolNames)
         let calls = message.entry("tool_calls").or_insert_with(|| json!([]));
         if !calls.is_array() { *calls = json!([]); }
         calls.as_array_mut().unwrap().push(json!({"id":id,"type":"function","function":{"name":name,"arguments":arguments}}));
-    }
-    /// Content parts of a chat content value (a string is one text part).
-    fn parts_of(value: Value) -> Vec<Value> {
-        match value {
-            Value::String(text) => vec![json!({"type":"text","text":text})],
-            Value::Array(parts) => parts,
-            _ => Vec::new(),
-        }
     }
     for item in &turn.items {
         match item {
@@ -293,6 +351,7 @@ fn chat_body_with(turn: &TurnRequest, profile: &ModelProfile, names: &ToolNames)
             message["content"] = json!("");
         }
     }
+    if systems == SystemPlacement::FirstOnly { messages = first_system_only(messages); }
     // A forced choice needs a tool to force, as on /v1/chat/completions.
     match &turn.tool_choice {
         ToolChoice::Required if turn.tools.is_empty() =>
@@ -379,7 +438,7 @@ impl Engine {
 
     fn built(&self, turn: &TurnRequest, names: &ToolNames) -> Result<super::Built, GatewayError> {
         self.check(turn)?;
-        let body = chat_body_with(turn, self.profile(), names)?;
+        let body = chat_body_with(turn, self.profile(), names, self.systems)?;
         super::build(self.profile(), self.limits(), &HeaderMap::new(), body).map_err(rejection)
     }
 }
