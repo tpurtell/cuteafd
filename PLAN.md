@@ -4755,12 +4755,31 @@ for one request, `dspark_policy.rs:647`) is the allocator. Changes:
   cost (today's `allocate` loop over caps for `Drafter::Chain`). Width
   exploration (a width unused for 64 rounds runs once) applies to every
   multi-valued action.
-- **Copies compete inside the plan.** A request with a copy span is two
-  candidates, `(Neural, confidence)` and `(Copy, copy confidence)`; the
-  allocator grows whichever has the better marginal and never mixes them in
-  one request. v2's `compete_copies` sequential competition is the search;
-  the price is the resource model, not `CycleCost`. Copy use is therefore
-  acceptance-gated by construction (decision 9) and opt-in until it wins.
+- **Copies extend the neural draft; they don't compete with it** (TJ,
+  2026-10-10; replaces the earlier two-candidate design).
+  - **The problem with competition:** a per-match-length acceptance table
+    can't be compared meaningfully with a calibrated neural confidence.
+  - **Agreement:** the neural drafter proposes its window as usual. A copy
+    span qualifies only if its start agrees with the neural draft over the
+    whole window. That agreement is the confidence: the target model's own
+    drafter independently predicts the copied tokens, so no separate copy
+    table is needed, and short coincidental matches drop out.
+  - **Extension:** on agreement, the copy's continuation is appended past
+    the drafter's horizon (DFlash2 7, dSpark 8, MTP 3), and the target
+    verifies the whole sequence in one round. Inside a long copy stride
+    (file rewrites, echoed diffs, quoted code), a round can verify 16-64
+    tokens instead of 7-8.
+  - **Tail confidence:** positions beyond the drafter use a per-position
+    decay owned by the online calibration (Platt on "agreed copy, position
+    k beyond the drafter"), seeded from this request's earlier copy
+    outcomes.
+  - **Length:** the resource model prices the extra rows, so the extension
+    length is the policy's usual expected-tokens-per-time decision. A
+    higher per-row cost (the head split on max) shortens it.
+  - **Later, measured:** relaxing agreement to a prefix of the window;
+    suffix-index drafting over the session history (v3.x).
+  - **Replaces** v2's `compete_copies` and `Evidence::Copy`'s per-length
+    table.
 - **Expected tokens per predicted time stays the objective.** The long-run
   `E - R*T` experiment lost 2-6% on Qwen (f32e22e3); not revived.
 
