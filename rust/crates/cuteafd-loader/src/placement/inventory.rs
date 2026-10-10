@@ -40,20 +40,22 @@ pub struct ArchContext {
 }
 
 /// Per-arch context table (placement design section 1, "Estimates replaced").
-/// Measured on driver 595.91.07 / CUDA 13.2 (2026-10-10, release-v2-rc3 image):
-/// `context_bytes` is CUDA's used bytes minus the allocation ledger at the
-/// first ledger report before any program module loads (MiMo `non_engine`
-/// samples 586,416,128 / 596,901,888 B on GPU0/GPU1 with no other process).
+/// `context_bytes` is the CUDA context plus a cuBLAS handle with its first GEMM
+/// workspace, on an otherwise empty device (`scripts/bench/cuda-context-probe.cu`,
+/// 2026-10-10): SM120 PRO 586,416,128 B context + 71,303,168 B cuBLAS =
+/// 657,719,296 B (rc3 MiMo `non_engine` samples agree: 586,416,128 /
+/// 596,901,888 B); GB10 by MemAvailable deltas (unified memory) 189-257 MiB
+/// context + 150-160 MiB cuBLAS, recorded at the larger sample.
 pub const ARCH_CONTEXTS: &[ArchContext] = &[
-    ArchContext { arch: "sm_120", max_total_bytes: 34 << 30, sms: 170, context_bytes: 576 * MIB,
+    ArchContext { arch: "sm_120", max_total_bytes: 34 << 30, sms: 170, context_bytes: 657_719_296,
         graph_executable_bytes: 149_712, driver: "595.91.07",
-        source: "RTX 5090 class: SM120 PRO measurement (same driver); SM count from the 5090 spec" },
-    ArchContext { arch: "sm_120", max_total_bytes: u64::MAX, sms: 188, context_bytes: 576 * MIB,
+        source: "RTX 5090 class: SM120 PRO probe on the same driver/CUDA 13.2; SM count from the 5090 spec" },
+    ArchContext { arch: "sm_120", max_total_bytes: u64::MAX, sms: 188, context_bytes: 657_719_296,
         graph_executable_bytes: 149_712, driver: "595.91.07",
-        source: "RTX PRO 6000 Blackwell: rc3 MiMo non_engine 586-597 MB; Qwen 12,397 graphs = 1,855,979,520 B" },
-    ArchContext { arch: "sm_121", max_total_bytes: u64::MAX, sms: 48, context_bytes: 576 * MIB,
+        source: "RTX PRO 6000 Blackwell probe (CUDA 13.2); Qwen 12,397 graphs = 1,855,979,520 B" },
+    ArchContext { arch: "sm_121", max_total_bytes: u64::MAX, sms: 48, context_bytes: 420 << 20,
         graph_executable_bytes: 149_712, driver: "580.178.04",
-        source: "GB10 (unified memory): SM120 value pending a direct SM121 sample" },
+        source: "GB10 probe (CUDA 13.0, MemAvailable deltas): context 189-257 MiB + cuBLAS 150-160 MiB; graph bytes from SM120" },
 ];
 
 impl ArchContext {
