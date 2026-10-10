@@ -4487,20 +4487,23 @@ persistent config, UI consistency, plugins that users add and configure, an
 recompute, steering, server-owned sessions, repack, KV hooks, Realtime).
 The "Staged steps" table below is the long-term list; v3 runs W0-W3 here.
 
-**Adoptability is the rule.** We never patch or fork DSH.
-- Upstream is pinned in one place: the sidecar image's build argument,
-  `dsh-v0.2.1-alpha.2` today.
-- Everything of ours ships as one out-of-tree bundle, `@cuteafd/dsh-bundle`,
-  installed into the profile at first start. It is built only on DSH's
-  documented seams:
-  - the LLM adapter (`stream(GenerateOptions)`);
-  - `ctx.theme` alias-token overrides;
-  - settings namespaces;
-  - profile patches.
-- When a feature needs a seam DSH lacks, we drop the feature or open an
-  upstream PR. We never carry a patch.
-- A bump is: change the pin, run `scripts/agent/dsh-smoke.sh`, and if it
-  fails, fix our bundle.
+**Our own fork, patched where that is the better design (TJ, 2026-10-11).**
+TJ: patching DSH in our own GitHub repo is fine; no upstreaming, and nothing
+done a worse way just to stay plugin-only.
+- The fork is `deepseek-harness` under our GitHub account, pinned in this
+  repo like SparkInfer: a submodule at `third_party/deepseek-harness` plus a
+  tree lock. The sidecar image builds from that source (`pnpm install`,
+  `pnpm run build`), not from npm.
+- Our work is a `cuteafd` branch on top of an upstream release tag
+  (`dsh-v0.2.1-alpha.2` first). Our own packages live in-tree under
+  `packages/cuteafd/*`.
+- Seams stay the first choice where they fit cleanly: the LLM adapter,
+  `ctx.theme`, settings, profile patches. Where a seam is missing or
+  awkward, we patch core directly. Examples: the user-actions slot, the
+  remote-aware workspace registry, the folder picker. Each patch is its own
+  small commit, so a rebase shows exactly what conflicts.
+- Adopting a new upstream version: rebase `cuteafd` onto the new tag, run
+  `scripts/agent/dsh-smoke.sh`, then bump the pin and lock here.
 
 | # | Step | Size | Gate |
 |---|------|------|------|
@@ -4509,12 +4512,11 @@ The "Staged steps" table below is the long-term list; v3 runs W0-W3 here.
 | W2 | `dsh-llm-cuteafd` adapter plugin: Responses WebSocket per DSH session, `previous_response_id` plus delta input when the new input extends the last request and its output, full input otherwise (pi-ai's rule, which it offers only for Codex OAuth routes); reconnect sends the full input. Selectable per route (`transport: websocket`), default for the cuteafd route | M | Requests the engine sees are byte-identical to the HTTP path on recorded sessions with retry, compaction and edit; bytes per step before -> after; prefix-cache hit tokens per step; no C1 regression |
 | W3 | Plugins and version bumps: DSH's **Plugins** page stays on so the operator can add, enable and configure bundles (npm, git, path); the agent's `plugin_manager` tool and the creator preset stay off, so the model cannot install code. `dsh-smoke.sh` starts the pinned image, runs one task with a tool call, checks the theme and our bundle loading, and exits | S | A third-party bundle installs from the Plugins page and survives restart; the smoke passes on the pin and on the newest upstream release at the time |
 
-**Execution in v3** (open question below): tools run inside the sidecar
-against a workspace directory on the mounted folder. SSH hosts (step 2 in the
-long-term table) need DSH's missing Web workspace integration, so they wait.
-Because local tools can read the mounted folder, v3 stores no SSH keys there.
-The only secret is the `agent` gateway key, which can only reach our own
-engine.
+**Execution over SSH is back in reach** (W4, after W0-W3). It was deferred only
+because the Web workspace lacked remote support. With patching allowed, the
+fork makes the workspace registry and folder picker host-aware directly
+(long-term step 2). Until W4 lands, tools run inside the sidecar against a
+workspace on the mounted folder, and the folder holds no SSH keys.
 
 ### Staged steps and gates
 
