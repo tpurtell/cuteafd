@@ -181,17 +181,11 @@ pub(crate) fn read_group(catalog: &OfficialV41Catalog, plans: &[Vec<Projection>]
     for (plan, host) in plans.iter().zip(hosts) {
         jobs.extend(projection_slots(plan, host.bytes_mut())?);
     }
-    // A full EXL3 projection is larger than a legacy rank slice: submit all
-    // three trellises per staged expert together rather than leave a second
-    // half-full wave behind 32 workers. Native retains the old pair depth.
-    let workers = projection_workers(&jobs);
+    // Match the old two-rank storage queue depth without duplicate reads or
+    // extra staging. Large trellis jobs go first; rotations fill tail capacity.
     jobs.sort_unstable_by_key(|(job, _)| job.bytes);
-    read_jobs(jobs, workers, |(job, destination)| job.read(catalog, destination))
-}
-
-fn projection_workers(jobs: &[(&Projection, &mut [u8])]) -> usize {
-    jobs.iter().filter(|(job, _)| job.name.ends_with(".trellis")).count()
-        .clamp(super::layer::EXPERT_READ_LANES * 2, super::layer::EXPERT_READ_LANES * 3)
+    read_jobs(jobs, super::layer::EXPERT_READ_LANES * 2,
+        |(job, destination)| job.read(catalog, destination))
 }
 
 #[cfg(test)]
@@ -210,36 +204,17 @@ mod tests {
     #[test]
     fn projection_queue_restores_two_rank_depth_and_reads_each_job_once() -> Result<()> {
         use std::sync::{Barrier, atomic::{AtomicUsize, Ordering}};
-        for workers in [32, 48] {
-            let barrier = Barrier::new(workers);
-            let counts: Vec<_> = (0..144).map(|_| AtomicUsize::new(0)).collect();
-            let started = AtomicUsize::new(0);
-            let bytes = read_jobs((0..144).collect(), workers, |job| {
-                if started.fetch_add(1, Ordering::SeqCst) < workers { barrier.wait(); }
-                counts[job].fetch_add(1, Ordering::SeqCst);
-                Ok(job + 1)
-            })?;
-            assert_eq!(bytes, (1usize..=144).sum::<usize>());
-            assert!(counts.iter().all(|count| count.load(Ordering::SeqCst) == 1));
-        }
+        let barrier = Barrier::new(32);
+        let counts: Vec<_> = (0..144).map(|_| AtomicUsize::new(0)).collect();
+        let started = AtomicUsize::new(0);
+        let bytes = read_jobs((0..144).collect(), 32, |job| {
+            if started.fetch_add(1, Ordering::SeqCst) < 32 { barrier.wait(); }
+            counts[job].fetch_add(1, Ordering::SeqCst);
+            Ok(job + 1)
+        })?;
+        assert_eq!(bytes, (1usize..=144).sum::<usize>());
+        assert!(counts.iter().all(|count| count.load(Ordering::SeqCst) == 1));
         Ok(())
-    }
-
-    #[test]
-    fn projection_worker_depth_is_bounded_and_format_specific() {
-        let slice = V41Exl3TensorSlice { rows: 1, source_row_bytes: 1,
-            column_start_bytes: 0, selected_row_bytes: 1 };
-        for (trellis, count, expected) in [(false, 48, 32), (true, 3, 32),
-            (true, 48, 48), (true, 96, 48)] {
-            let plans: Vec<_> = (0..count).map(|_| Projection {
-                name: if trellis { "w.trellis".into() } else { "w.weight".into() },
-                offset: 0, bytes: 1, slices: [slice; 2],
-            }).collect();
-            let mut buffers = vec![[0u8; 1]; count];
-            let jobs: Vec<_> = plans.iter().zip(buffers.iter_mut())
-                .map(|(job, buffer)| (job, buffer.as_mut_slice())).collect();
-            assert_eq!(projection_workers(&jobs), expected);
-        }
     }
 
     #[test]
