@@ -109,7 +109,7 @@ fn run_case(label: &str, captured: bool, lanes: usize, injected: u32, serving: b
         use cuteafd_hostcache::pool::PinnedMemory;
         use crate::shared::token_io::{DeviceLogits, RowSelect, SelectBatch, SelectPlacement, TokenSelector};
         let family = super::super::prefix::MimoPrefix::terminal_fixture(&engine)?;
-        let mut copy = crate::families::deepseek_v41::v41_native_serve::prefix::CudaCopyEngine::registered_owned(
+        let mut copy = crate::shared::prefix::CudaCopyEngine::registered_owned(
             &library, family.host_owners())?;
         copy.allocate_chunk(65536)?;
         for (index, (device, stream)) in copy.terminal_fixture_streams().into_iter().enumerate() {

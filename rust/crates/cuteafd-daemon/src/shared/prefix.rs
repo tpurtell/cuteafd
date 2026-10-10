@@ -1,6 +1,5 @@
 //! The prefix cache's serving knobs and host tier setup, shared by every generic family
 //! (`cuteafd_engine::prefix` does the work; each family implements `PrefixFamily`).
-use crate::families::deepseek_v41::v41_native_serve::prefix::CudaCopyEngine;
 use anyhow::Result;
 use cuteafd_engine::prefix::{FamilyLayout, PointPolicy};
 use cuteafd_ffi::{CuteafdDeviceBuffer, NativeLibrary};
@@ -8,6 +7,8 @@ use cuteafd_ffi::{CuteafdDeviceBuffer, NativeLibrary};
 #[path = "prefix/budget.rs"]
 mod budget;
 pub(crate) use budget::HostBudget;
+pub(crate) mod cuda_copy;
+pub(crate) use cuda_copy::CudaCopyEngine;
 
 /// The prefix cache's knobs.
 #[derive(Debug, Clone, clap::Args)]

@@ -5,7 +5,7 @@ use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::CuteafdDeviceBuffer;
 use cuteafd_hostcache::{copy::DeviceRange, pool::HostRange};
 
-pub(super) struct Regions {
+pub(crate) struct Regions {
     buffers: Vec<CuteafdDeviceBuffer>,
     pub devices: Vec<i32>,
 }

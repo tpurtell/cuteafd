@@ -1,6 +1,6 @@
 //! Callback-local GPU owners must retire before the enclosing engine closes.
 use super::{engine::MimoEngine, prefix::MimoPrefix};
-use crate::families::deepseek_v41::v41_native_serve::prefix::CudaCopyEngine;
+use crate::shared::prefix::CudaCopyEngine;
 use crate::shared::token_io::TokenSelector;
 use anyhow::Result;
 use cuteafd_engine::prefix::{PrefixCache, PrefixFamily};

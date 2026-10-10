@@ -10,8 +10,6 @@ use images::ImageKeySpace;
 pub(super) use cuteafd_core::prefix::{Retention, SnapshotKind};
 mod host_cache;
 pub(super) use host_cache::HostCacheBinding;
-/// The CUDA copy engine the generic families' host tier uses too.
-pub(crate) use host_cache::CudaCopyEngine;
 struct Saved<'a> {
     session: Option<String>,
     _images: ImageKeys,

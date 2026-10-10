@@ -13,7 +13,7 @@
 use super::pool::Placement;
 use super::prefix::Dsv4Prefix;
 use super::{with_engine, EngineArgs};
-use crate::families::deepseek_v41::v41_native_serve::prefix::CudaCopyEngine;
+use crate::shared::prefix::CudaCopyEngine;
 use crate::shared::prefix::{PrefixArgs, Toggle};
 use crate::shared::probe;
 use crate::shared::console;
