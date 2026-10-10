@@ -106,6 +106,12 @@ struct Located {
     shape: Vec<usize>,
 }
 
+/// An NVFP4 projection's `input_scale` tensor name from its weight name
+/// (`....gate_proj.weight` -> `....gate_proj.input_scale`).
+fn input_scale_name(weight: &str) -> String {
+    format!("{}.input_scale", weight.strip_suffix(".weight").unwrap_or(weight))
+}
+
 /// Where every routed FP8 expert tensor lives in the snapshot.
 #[derive(Debug, Clone)]
 pub struct Fp8ExpertTensors {
@@ -257,8 +263,7 @@ impl Fp8ExpertTensors {
             for projection in Fp8Projection::ALL {
                 self.check(layer, expert, projection)?;
                 if self.format == ExpertFormat::Nvfp4 {
-                    let weight = self.name(layer, expert, projection);
-                    let name = format!("{}.input_scale", weight.strip_suffix(".weight").unwrap_or(&weight));
+                    let name = input_scale_name(&self.name(layer, expert, projection));
                     let scale = self.located(&name)?;
                     ensure!(scale.dtype == DType::F32 && scale.bytes == 4,
                         "{name}: expected one FP32 input scale, found {:?} {:?}", scale.dtype, scale.shape);
@@ -408,23 +413,45 @@ impl Fp8ExpertTensors {
     /// An NVFP4 projection's static activation scale (`input_scale`, the W4A4
     /// recipe's); 1 for the other formats.
     pub fn read_input_scale(&self, layer: usize, expert: usize, projection: Fp8Projection) -> Result<f32> {
-        let weight = self.name(layer, expert, projection);
-        self.read_scalar(&format!("{}.input_scale", weight.strip_suffix(".weight").unwrap_or(&weight)))
+        self.read_scalar(&input_scale_name(&self.name(layer, expert, projection)))
+    }
+
+    /// The W4A4 FC1 kernel quantizes a step's activations once, with the gate
+    /// projection's `input_scale`, and dequantizes the up half with the up
+    /// projection's `input_scale`: the two must be bit-identical or one half is
+    /// silently scaled. The shipped NVFP4 checkpoints (GLM 5.3, GLM 5.3 Flash,
+    /// Qwen 3.8 Flash Next) are; a repack that is not fails load here, naming
+    /// the layer, the expert and both values. `gate` and `up` are the experts'
+    /// little-endian FP32 `input_scale` bytes as the loader already read them,
+    /// so the check costs no extra reads.
+    pub fn check_input_scales(layer: usize, gate: &[u8], up: &[u8]) -> Result<()> {
+        ensure!(gate.len() == up.len() && gate.len() % 4 == 0, "NVFP4 layer {layer}: input_scale regions differ in size");
+        for (expert, (gate, up)) in gate.chunks_exact(4).zip(up.chunks_exact(4)).enumerate() {
+            ensure!(gate == up,
+                "NVFP4 layer {layer} expert {expert}: gate input_scale {} and up input_scale {} differ; \
+                 the W4A4 FC1 kernel needs them bit-identical",
+                f32::from_le_bytes(gate.try_into().unwrap()), f32::from_le_bytes(up.try_into().unwrap()));
+        }
+        Ok(())
     }
 
     fn read_scalar(&self, name: &str) -> Result<f32> {
         if self.format != ExpertFormat::Nvfp4 {
             return Ok(1.0);
         }
-        let name = name.to_owned();
-        let located = self.located(&name)?;
+        let value = f32::from_le_bytes(self.read_scalar_bytes(name)?);
+        ensure!(value.is_finite() && value > 0.0, "{name}: {value} is not a positive finite scale");
+        Ok(value)
+    }
+
+    /// The raw bytes of one FP32 scalar tensor, so a comparison is bit-exact.
+    fn read_scalar_bytes(&self, name: &str) -> Result<[u8; 4]> {
+        let located = self.located(name)?;
         ensure!(located.dtype == DType::F32 && located.bytes == 4, "{name}: expected one FP32 value");
         let mut bytes = [0u8; 4];
         std::fs::File::open(self.snapshot.join(&located.shard))?.read_exact_at(&mut bytes, located.offset)
             .with_context(|| format!("reading {name}"))?;
-        let value = f32::from_le_bytes(bytes);
-        ensure!(value.is_finite() && value > 0.0, "{name}: {value} is not a positive finite scale");
-        Ok(value)
+        Ok(bytes)
     }
 
     /// `read_slice` for packed FP4 (MXFP4, NVFP4): rank rows `[first, first +
@@ -665,6 +692,78 @@ mod tests {
         assert_eq!(ranges(&qwen, 3), [(0, 224), (224, 208), (432, 208)]);
         assert_eq!(qwen.slice(3).unwrap(), 256);
         assert_eq!(qwen.slice(2).unwrap(), 384);
+    }
+
+    /// Every expert's gate and up `input_scale` bytes, read the way the loader
+    /// packs them, handed to `check`.
+    fn input_scales<T>(tensors: &Fp8ExpertTensors, check: impl Fn(&[Vec<u8>; 2]) -> T) -> T {
+        let read = |projection| (0..tensors.shape().experts)
+            .flat_map(|expert| tensors.read_input_scale(0, expert, projection).unwrap().to_le_bytes()).collect();
+        check(&[read(Fp8Projection::Gate), read(Fp8Projection::Up)])
+    }
+
+    /// A one-layer, `experts`-expert NVFP4 snapshot (`hidden` = `intermediate`
+    /// = 128), on disk so the guard reads real `input_scale` bytes.
+    fn nvfp4_snapshot(dir: &Path, experts: usize) -> Fp8ExpertTensors {
+        use crate::plan::testing::{t, write_snapshot};
+        let (hidden, intermediate) = (128usize, 128usize);
+        let mut tensors = Vec::new();
+        for expert in 0..experts {
+            for projection in Fp8Projection::ALL {
+                let name = format!("model.layers.0.mlp.experts.{expert}.{}.weight", projection.stem());
+                tensors.extend([
+                    t(&name, "U8", &[intermediate, hidden / 2]),
+                    t(format!("{name}_scale"), "F8_E4M3", &[intermediate, hidden / 16]),
+                    t(format!("{name}_scale_2"), "F32", &[]),
+                    t(input_scale_name(&name), "F32", &[]),
+                ]);
+            }
+        }
+        write_snapshot(dir, &serde_json::json!({}), &tensors, None);
+        let shape = RoutedExpertShape { layers: 1, first_layer: 0, experts, topk: 1, hidden, intermediate,
+            draft_stages: 0, draft_experts: 0 };
+        Fp8ExpertTensors::read(dir, shape).unwrap()
+    }
+
+    /// Overwrites every expert's gate/up `input_scale` in the snapshot's shard.
+    fn write_input_scales(tensors: &Fp8ExpertTensors, scales: impl Fn(usize, Fp8Projection) -> f32) {
+        let shard = tensors.tensors.values().next().unwrap().shard.clone();
+        let path = tensors.snapshot.join(&shard);
+        let metas = read_safetensors_metadata(&path).unwrap();
+        let file = std::fs::File::options().write(true).open(&path).unwrap();
+        for expert in 0..tensors.shape.experts {
+            for projection in [Fp8Projection::Gate, Fp8Projection::Up] {
+                let name = input_scale_name(&tensors.name(0, expert, projection));
+                let at = metas.iter().find(|m| m.name == name).unwrap().byte_offset;
+                file.write_all_at(&scales(expert, projection).to_le_bytes(), at).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn nvfp4_gate_up_input_scales_that_agree_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let tensors = nvfp4_snapshot(dir.path(), 2);
+        assert_eq!(tensors.format(), ExpertFormat::Nvfp4);
+        // Distinct per expert, gate == up in each: the guard accepts the layer.
+        write_input_scales(&tensors, |expert, _| if expert == 0 { 0.25 } else { 1.5 });
+        input_scales(&tensors, |t| Fp8ExpertTensors::check_input_scales(0, &t[0], &t[1])).unwrap();
+        tensors.validate_layer(0).unwrap();
+    }
+
+    #[test]
+    fn nvfp4_asymmetric_gate_up_input_scales_fail_the_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let tensors = nvfp4_snapshot(dir.path(), 2);
+        // Expert 0 agrees; expert 1's up half is calibrated at half the gate's.
+        write_input_scales(&tensors, |expert, projection| match (expert, projection) {
+            (1, Fp8Projection::Up) => 0.5,
+            _ => 1.0,
+        });
+        let error = input_scales(&tensors, |t| Fp8ExpertTensors::check_input_scales(0, &t[0], &t[1])).unwrap_err().to_string();
+        assert!(error.contains("layer 0") && error.contains("expert 1"), "{error}");
+        assert!(error.contains("gate input_scale 1") && error.contains("up input_scale 0.5"), "{error}");
+        assert!(!error.contains("expert 0"), "{error}");
     }
 
     #[test]
