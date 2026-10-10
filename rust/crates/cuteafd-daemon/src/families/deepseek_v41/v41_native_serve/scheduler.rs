@@ -1347,6 +1347,7 @@ fn single_lane_round<'w, 'a>(lib: &'a NativeLibrary, runtime: &tokio::runtime::R
     transport: &mut NativeTp4Wave<'a>, active: &mut [Option<Active<'a>>],
     members: &[usize], mut draft: Option<&mut DraftRuntime<'_, 'a>>, retain_enabled: bool,
 ) -> Result<()> {
+    let _capture_watch = crate::shared::decode_graph::CaptureWatch::round();
     let started = Instant::now();
     ensure!(!members.is_empty() && members.len() <= 8, "invalid single decode lane");
     let speculative = draft.is_some();
@@ -1466,7 +1467,6 @@ fn single_lane_round<'w, 'a>(lib: &'a NativeLibrary, runtime: &tokio::runtime::R
         tracing::debug!(target: "cuteafd::cost_model", batch=batch_id, lane,
             requests=members.len(), rows=inputs.iter().map(Vec::len).sum::<usize>(),
             prepared_us, verify_us=executed_us-prepared_us, "verification round cost");
-            graph_capture_watch();
         let (accepted, emitted, emissions, accepted_inputs) = commit_lane(lib, lane, pass, requests,
             active, members, &inputs, &mut batch, &next, draft.as_deref_mut(),
             executed_us-prepared_us, None, retain_enabled)?;
@@ -2704,25 +2704,3 @@ mod sampling_tests {
     }
 }
 
-/// Every 512 verification rounds: CUDA graph captures begun since the last
-/// report (a warm server should capture none; AGENTS.md).
-pub(super) fn graph_capture_watch() {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static ROUNDS: AtomicU64 = AtomicU64::new(0);
-    static LAST: AtomicU64 = AtomicU64::new(0);
-    let rounds = ROUNDS.fetch_add(1, Ordering::Relaxed) + 1;
-    let interval = if tracing::enabled!(target: "cuteafd::graph_capture", tracing::Level::DEBUG) { 32 } else { 512 };
-    if rounds % interval == 0 {
-        let captures = cuteafd_ffi::graph_captures();
-        let previous = LAST.swap(captures, Ordering::Relaxed);
-        static SITES: std::sync::Mutex<Vec<(String, u64)>> = std::sync::Mutex::new(Vec::new());
-        let now = cuteafd_ffi::graph_capture_sites();
-        let mut before = SITES.lock().unwrap_or_else(|p| p.into_inner());
-        let mut delta: Vec<_> = now.iter().map(|(site, n)| (site.rsplit('/').next().unwrap_or(site).to_string(),
-            n - before.iter().find(|(s, _)| s == site).map_or(0, |(_, m)| *m))).filter(|(_, n)| *n > 0).collect();
-        delta.sort_by(|a, b| b.1.cmp(&a.1));
-        *before = now;
-        tracing::info!(rounds, interval, captures = captures - previous, sites = ?delta,
-            "graph captures in recent verification rounds");
-    }
-}

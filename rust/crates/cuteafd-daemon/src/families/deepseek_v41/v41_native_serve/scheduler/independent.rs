@@ -55,6 +55,7 @@ async fn lane<'a, P: VerificationTarget<'a>, C: DraftChain<'a>>(lane: usize, lib
             };
             if members.is_empty() { return Ok(()); }
             ensure!(members.len() <= 8, "independent lane exceeds eight requests");
+            let _capture_watch = crate::shared::decode_graph::CaptureWatch::round();
             let started = Instant::now();
             // Reserve target capacity and snapshot this lane's seeds, then release
             // all bank borrows before waiting on this lane's draft workspace.
@@ -174,7 +175,6 @@ async fn lane<'a, P: VerificationTarget<'a>, C: DraftChain<'a>>(lane: usize, lib
                 tracing::debug!(target: "cuteafd::cost_model", batch=batch_id, lane, round_id,
                     requests=members.len(), rows=selected.len(), prepared_us, verify_us,
                     "verification round cost");
-                super::graph_capture_watch();
                 let retain_enabled = prefixes.borrow().turn_bank_enabled();
                 let mut decision = prepare_commit_lane(lane, &requests.borrow(),
                     &active.borrow(), &members, &inputs, &next, draft.borrow().as_deref(),
