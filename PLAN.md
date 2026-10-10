@@ -4478,6 +4478,44 @@ variables.** Set `DSH_HOME=/data/dsh`, `DSH_AGENTS_HOME=/data/agents` and
   default (`packages/bundle/base/cordis.patch.yml:200-220`), and its
   redaction ships no rules. Set `DSH_TELEMETRY_DISABLED=1` in the sidecar.
 
+### v3 scope: an experimental workspace, plugins only (TJ, 2026-10-11)
+
+TJ narrowed v3 to a base for later experiments, possibly thrown away, that
+lets Hugh try it soon. **In:** DSH from a container, the Responses WebSocket,
+persistent config, UI consistency, plugins that users add and configure, an
+"Experimental" tab. **Out for v3:** every custom engine feature (edits with
+recompute, steering, server-owned sessions, repack, KV hooks, Realtime).
+The "Staged steps" table below is the long-term list; v3 runs W0-W3 here.
+
+**Adoptability is the rule.** We never patch or fork DSH.
+- Upstream is pinned in one place: the sidecar image's build argument,
+  `dsh-v0.2.1-alpha.2` today.
+- Everything of ours ships as one out-of-tree bundle, `@cuteafd/dsh-bundle`,
+  installed into the profile at first start. It is built only on DSH's
+  documented seams:
+  - the LLM adapter (`stream(GenerateOptions)`);
+  - `ctx.theme` alias-token overrides;
+  - settings namespaces;
+  - profile patches.
+- When a feature needs a seam DSH lacks, we drop the feature or open an
+  upstream PR. We never carry a patch.
+- A bump is: change the pin, run `scripts/agent/dsh-smoke.sh`, and if it
+  fails, fix our bundle.
+
+| # | Step | Size | Gate |
+|---|------|------|------|
+| W0 | Sidecar image from the pinned npm release (`@deepseek-ai/dsh` + web frontend), `scripts/launch/agent.sh` (also `run.sh --agent`), one mounted folder `~/.local/share/cuteafd/agent` (0700) with `DSH_HOME`, `DSH_AGENTS_HOME`, `HOME` under it, telemetry off, bound to 127.0.0.1. Default route: our gateway via pi-ai `openai-responses` (HTTP; the Engine backend serves it since B1) with a dedicated `agent` key, set as `agent-default-model`; other providers registrable as usual | S | A coding task completes on the local model; config, sessions and installed plugins survive a container restart; `docker logs` holds no token or key |
+| W1 | Facet: an **Experimental** nav tab, `/agent` page with our header and a same-origin iframe of `/agent/app/` (reverse proxy incl. the `api/remote.mux` WebSocket), server-side DSH cookie bootstrap behind the console lock; theme plugin mapping our `--bg/--panel/--ink/--line` and accents onto DSH's `--dsw-*` alias tokens via `ctx.theme`, both light and dark | S | Visual check in both themes at desktop and phone width; locked console means locked agent; no DSH token in browser history |
+| W2 | `dsh-llm-cuteafd` adapter plugin: Responses WebSocket per DSH session, `previous_response_id` plus delta input when the new input extends the last request and its output, full input otherwise (pi-ai's rule, which it offers only for Codex OAuth routes); reconnect sends the full input. Selectable per route (`transport: websocket`), default for the cuteafd route | M | Requests the engine sees are byte-identical to the HTTP path on recorded sessions with retry, compaction and edit; bytes per step before -> after; prefix-cache hit tokens per step; no C1 regression |
+| W3 | Plugins and version bumps: DSH's **Plugins** page stays on so the operator can add, enable and configure bundles (npm, git, path); the agent's `plugin_manager` tool and the creator preset stay off, so the model cannot install code. `dsh-smoke.sh` starts the pinned image, runs one task with a tool call, checks the theme and our bundle loading, and exits | S | A third-party bundle installs from the Plugins page and survives restart; the smoke passes on the pin and on the newest upstream release at the time |
+
+**Execution in v3** (open question below): tools run inside the sidecar
+against a workspace directory on the mounted folder. SSH hosts (step 2 in the
+long-term table) need DSH's missing Web workspace integration, so they wait.
+Because local tools can read the mounted folder, v3 stores no SSH keys there.
+The only secret is the `agent` gateway key, which can only reach our own
+engine.
+
 ### Staged steps and gates
 
 | # | Step | Size | Needs phase B | Gate |
