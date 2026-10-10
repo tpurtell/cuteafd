@@ -232,7 +232,11 @@ before → after tables with conditions.
   sessions, the full bench runs at release.
 - Unsupported is a result, not a crash: `cuteafd plan` names the tensors,
   formats, shapes and the exporter or kernel to add.
-- Load speed is a feature; do not regress readiness time.
+- Load speed is a feature; do not regress readiness through wasted load
+  work (redundant reads, repacking, re-tiling, serial loads). Readiness may
+  grow in proportion to work that pays at runtime, e.g. more resident expert
+  bytes or startup graph capture. Judge such changes by load efficiency
+  (seconds per resident GB, per phase) against the baseline, not wall time.
 - Preserve graph pointer/shape/workspace lifetimes; drain queued work before
   publishing or releasing storage; weight and workspace admission precede
   allocation; zero steady-state graph captures per request.
