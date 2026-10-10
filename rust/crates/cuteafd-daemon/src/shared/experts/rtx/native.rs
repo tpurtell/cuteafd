@@ -177,8 +177,8 @@ impl<'a> NativeTp2<'a> {
         Ok(workspace)
     }
 
-    /// Load paired layers concurrently, keeping the two checkpoint reads adjacent.
-    /// Both rank budgets are admitted before either rank opens payloads.
+    /// Load each projection once into shared pinned banks, then pack each half
+    /// on its owning GPU. Both rank budgets precede allocation and payload reads.
     pub(crate) fn load_pair(
         devices: [Device<'a>; 2],
         catalog: &cuteafd_loader::OfficialV41Catalog,
@@ -190,28 +190,27 @@ impl<'a> NativeTp2<'a> {
             "invalid native TP2 device pair");
         let workspaces = [Self::admit(devices[0], catalog, 0, &layers, max_rows, budgets[0])?,
             Self::admit(devices[1], catalog, 1, &layers, max_rows, budgets[1])?];
-        let mut remaining = [budgets[0] - workspaces[0], budgets[1] - workspaces[1]];
-        let mut weights = [devices[0].own(|| Ok(Vec::with_capacity(layers.len())))?,
-            devices[1].own(|| Ok(Vec::with_capacity(layers.len())))?];
-        for layer in layers.clone() {
-            let started = std::time::Instant::now();
-            // SAFETY: each fresh DeviceOwner holds only new weights; load drains
-            // its stream before return/unwind, and owner Drop selects its GPU.
-            let pair = unsafe { cuteafd_ffi::synchronized_load::load_pair(|rank| devices[rank].own(|| {
-                Ok(vec![ExpertWeights::load(devices[rank].library, catalog,
-                    ExpertLayer::BackboneTp2 { layer, rank }, remaining[rank])?])
-            })) }?;
-            for (rank, mut weight) in pair.into_iter().enumerate() {
-                remaining[rank] -= weight[0].budget().resident_bytes;
-                // Consume on the owning GPU; no executor or aliases cross threads.
-                devices[rank].run(|| {
-                    weights[rank].append(weight.get_mut());
-                    Ok(())
-                })?;
+        let available = [budgets[0] - workspaces[0], budgets[1] - workspaces[1]];
+        // Diagnostic A/B arm retains the previous loader with real I/O counters.
+        let weights = if std::env::var("CUTEAFD_TP2_SHARED_READ").as_deref() == Ok("0") {
+            let mut remaining = available;
+            let mut weights = [devices[0].own(|| Ok(Vec::new()))?, devices[1].own(|| Ok(Vec::new()))?];
+            for layer in layers.clone() {
+                // SAFETY: fresh, unaliased GPU owners only; both workers drain
+                // before returning and DeviceOwner destroys on its owning GPU.
+                let pair = unsafe { cuteafd_ffi::synchronized_load::load_pair(|rank| devices[rank].own(|| {
+                    Ok(vec![ExpertWeights::load(devices[rank].library, catalog,
+                        ExpertLayer::BackboneTp2 { layer, rank }, remaining[rank])?])
+                })) }?;
+                for (rank, mut loaded) in pair.into_iter().enumerate() {
+                    remaining[rank] -= loaded[0].budget().resident_bytes;
+                    devices[rank].run(|| { weights[rank].append(loaded.get_mut()); Ok(()) })?;
+                }
             }
-            tracing::info!(layer, elapsed_seconds = started.elapsed().as_secs_f64(),
-                "native TP2 paired layer load timeline");
-        }
+            weights
+        } else {
+            ExpertWeights::load_tp2_pair(devices, catalog, layers.clone(), available)?
+        };
         let [left, right] = weights;
         Ok([Self::finish_load(devices[0], 0, layers.clone(), max_rows, workspaces[0], left)?,
             Self::finish_load(devices[1], 1, layers, max_rows, workspaces[1], right)?])

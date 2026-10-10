@@ -154,28 +154,36 @@ impl<'a> Exl3Tp2<'a> {
                 output: None,
             },
         ];
-        let remaining = std::cell::RefCell::new(remaining);
-        let mut ranks = load_layer_pairs(ranks, layers.clone(), |layer| {
-            let remaining = *remaining.borrow();
-            let started = std::time::Instant::now();
-            // SAFETY: only fresh weight allocations cross threads, never Rc or
-            // execution state. The loader drains all uploads; DeviceOwner frees
-            // the allocation on its own GPU on either success or partial failure.
-            let pair = unsafe { cuteafd_ffi::synchronized_load::load_pair(|rank| devices[rank].own(|| {
-                Ok(vec![Exl3Weights::load(devices[rank].library, catalog,
-                    ExpertLayer::BackboneTp2 { layer, rank }, remaining[rank])?])
-            })) }?;
-            tracing::info!(layer, elapsed_seconds = started.elapsed().as_secs_f64(),
-                "EXL3 TP2 paired layer load timeline");
-            Ok(pair)
-        }, |owner, mut weight, rank| {
-            remaining.borrow_mut()[rank] -= weight[0].budget.resident_bytes;
-            devices[rank].run(|| {
-                Rc::get_mut(owner.weights.get_mut())
-                    .expect("unpublished EXL3 rank").append(weight.get_mut());
-                Ok(())
-            })
-        })?;
+        let mut ranks = if std::env::var("CUTEAFD_TP2_SHARED_READ").as_deref() == Ok("0") {
+            let remaining = std::cell::RefCell::new(remaining);
+            load_layer_pairs(ranks, layers.clone(), |layer| {
+                let available = *remaining.borrow();
+                // SAFETY: fresh GPU owners only; load drains all uploads and
+                // DeviceOwner drops on the owning GPU, including partial errors.
+                unsafe { cuteafd_ffi::synchronized_load::load_pair(|rank| devices[rank].own(|| {
+                    Ok(vec![Exl3Weights::load(devices[rank].library, catalog,
+                        ExpertLayer::BackboneTp2 { layer, rank }, available[rank])?])
+                })) }
+            }, |owner, mut loaded, rank| {
+                remaining.borrow_mut()[rank] -= loaded[0].budget.resident_bytes;
+                devices[rank].run(|| {
+                    Rc::get_mut(owner.weights.get_mut()).expect("unpublished EXL3 rank")
+                        .append(loaded.get_mut());
+                    Ok(())
+                })
+            })?
+        } else {
+            let pair = Exl3Weights::load_tp2_pair(devices, catalog, layers.clone(), remaining)?;
+            let mut ranks = ranks;
+            for (rank, mut loaded) in pair.into_iter().enumerate() {
+                devices[rank].run(|| {
+                    Rc::get_mut(ranks[rank].weights.get_mut())
+                        .expect("unpublished EXL3 rank").append(loaded.get_mut());
+                    Ok(())
+                })?;
+            }
+            ranks
+        };
         let paths = directories(package, max_rows)?;
         for rank in &mut ranks {
             rank.executions = Some(rank.device.own(|| {

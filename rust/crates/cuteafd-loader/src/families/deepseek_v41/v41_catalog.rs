@@ -13,6 +13,17 @@ use std::{
     path::{Path, PathBuf},
 };
 
+thread_local! {
+    static PROJECTION_READ_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+pub(crate) fn projection_read(file: &File, destination: &mut [u8], offset: u64) -> std::io::Result<()> {
+    use std::os::unix::fs::FileExt;
+    file.read_exact_at(destination, offset)?;
+    PROJECTION_READ_BYTES.with(|counter| counter.set(counter.get().saturating_add(destination.len())));
+    Ok(())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum V41TensorPlacement {
     CoordinatorRtx,
@@ -185,6 +196,55 @@ impl OfficialV41Catalog {
         Ok(&self.tensors[index])
     }
 
+    /// Count bytes delivered by positioned projection reads on this thread.
+    /// This measures requested storage I/O even when the OS serves a cached page,
+    /// not block-device traffic. Reader threads must each enter their own scope.
+    pub fn count_storage_reads<T>(read: impl FnOnce() -> Result<T>) -> Result<(T, usize)> {
+        struct Restore(usize);
+        impl Drop for Restore {
+            fn drop(&mut self) { PROJECTION_READ_BYTES.with(|counter| counter.set(self.0)); }
+        }
+        let _restore = Restore(PROJECTION_READ_BYTES.with(|counter| counter.replace(0)));
+        let value = read()?;
+        Ok((value, PROJECTION_READ_BYTES.with(|counter| counter.get())))
+    }
+
+    /// One complete physical projection read, counted at the I/O boundary.
+    /// TP2 callers validate that the union of their slices covers this extent.
+    pub fn read_projection_once(&self, name: &str, destination: &mut [u8]) -> Result<usize> {
+        use std::os::unix::fs::FileExt;
+        let tensor = self.tensor(name)?;
+        let bytes = usize::try_from(tensor.metadata.byte_length)?;
+        ensure!(destination.len() == bytes, "projection staging size mismatch for {name}");
+        projection_read(&File::open(self.snapshot.join(&tensor.shard))?, destination, tensor.metadata.byte_offset)
+            .with_context(|| format!("shared TP2 projection read {name}"))?;
+        Ok(bytes)
+    }
+
+    /// Shape of one native TP2 slice, suitable for a pitched H2D copy from a
+    /// complete physical projection without a second host-side packed copy.
+    pub fn backbone_tp2_slice(&self, name: &str, rank: usize) -> Result<crate::V41Exl3TensorSlice> {
+        let tensor = self.tensor(name)?;
+        ensure!(rank < 2, "invalid TP2 rank");
+        let V41TensorPlacement::BackboneExpertTp4 { axis, .. } = tensor.placement else {
+            anyhow::bail!("TP2 slice requires a native backbone projection");
+        };
+        let bytes = usize::try_from(tensor.metadata.byte_length)?;
+        ensure!(bytes % 2 == 0, "uneven TP2 projection bytes");
+        let slice = if axis == 0 {
+            crate::V41Exl3TensorSlice { rows: 1, source_row_bytes: bytes,
+                column_start_bytes: rank * (bytes / 2), selected_row_bytes: bytes / 2 }
+        } else {
+            ensure!(axis == 1 && tensor.metadata.shape.len() == 2, "invalid TP2 projection axis");
+            let rows = tensor.metadata.shape[0];
+            ensure!(rows > 0 && bytes % rows == 0 && (bytes / rows) % 2 == 0,
+                "uneven TP2 projection rows");
+            crate::V41Exl3TensorSlice { rows, source_row_bytes: bytes / rows,
+                column_start_bytes: rank * (bytes / rows / 2), selected_row_bytes: bytes / rows / 2 }
+        };
+        Ok(slice)
+    }
+
     pub fn device_tensor_bytes(&self, name: &str, spark_rank: Option<usize>) -> Result<u64> {
         let tensor = self.tensor(name)?;
         match tensor.placement {
@@ -294,7 +354,7 @@ impl OfficialV41Catalog {
                             .context("TP row offset overflow")?,
                     )
                     .context("TP file offset overflow")?;
-                file.read_exact_at(&mut dst[..bytes], offset)?;
+                projection_read(&file, &mut dst[..bytes], offset)?;
             }
             Some(1) => {
                 let rows = metadata.shape[0];
@@ -316,7 +376,7 @@ impl OfficialV41Catalog {
                                 .context("TP column row offset overflow")?,
                         )
                         .context("TP column file offset overflow")?;
-                    file.read_exact_at(&mut scratch[..count * row_bytes], offset)?;
+                    projection_read(&file, &mut scratch[..count * row_bytes], offset)?;
                     for row in 0..count {
                         dst[(start + row) * shard_bytes..(start + row + 1) * shard_bytes].copy_from_slice(
                             &scratch[row * row_bytes + column..row * row_bytes + column + shard_bytes],
@@ -325,7 +385,7 @@ impl OfficialV41Catalog {
                 }
             }
             None => {
-                file.read_exact_at(&mut dst[..bytes], metadata.byte_offset)?
+                projection_read(&file, &mut dst[..bytes], metadata.byte_offset)?
             }
             _ => anyhow::bail!("unsupported device tensor placement"),
         }
@@ -1380,6 +1440,26 @@ mod tests {
             .read_device_tensor_into(name, Some(3), &mut out, &mut [])
             .unwrap();
         assert_eq!(out, [24, 25, 26, 27, 28, 29, 30, 31]);
+        for axis in 0..2 {
+            catalog.tensors[0].placement = V41TensorPlacement::BackboneExpertTp4 { layer: 0, expert: 0, axis };
+            let pair = [catalog.backbone_tp2_slice(name, 0).unwrap(), catalog.backbone_tp2_slice(name, 1).unwrap()];
+            crate::V41Exl3TensorSlice::validate_pair(pair, 32).unwrap();
+            let mut shared = [0; 32];
+            let (bytes, storage) = OfficialV41Catalog::count_storage_reads(||
+                catalog.read_projection_once(name, &mut shared)).unwrap();
+            assert_eq!((bytes, storage), (32, 32));
+            for (rank, slice) in pair.into_iter().enumerate() {
+                let mut legacy = [0; 16];
+                let (_, storage) = OfficialV41Catalog::count_storage_reads(||
+                    catalog.read_backbone_tp2_into(name, rank, &mut legacy, &mut [0; 16])).unwrap();
+                assert_eq!(storage, if axis == 0 { 16 } else { 32 });
+                let pitched: Vec<_> = (0..slice.rows).flat_map(|row| {
+                    let start = row * slice.source_row_bytes + slice.column_start_bytes;
+                    shared[start..start + slice.selected_row_bytes].iter().copied()
+                }).collect();
+                assert_eq!(pitched, legacy);
+            }
+        }
         catalog.tensors[0].placement = V41TensorPlacement::CoordinatorRtx;
         for axis in 0..2 {
             for rank in 0..2 {
