@@ -232,9 +232,13 @@ impl<'a> Exl3Weights<'a> {
             let experts = weights[0][index].layout.experts;
             let mut storage_bytes_read = 0;
             let mut read_seconds = 0.;
+            let mut bank_wait_seconds = 0.;
+            let mut upload_submit_seconds = 0.;
             for first in (0..experts).step_by(EXPERT_READ_LANES) {
                 let bank = group % BANKS;
+                let wait_started = std::time::Instant::now();
                 fences.reuse(bank)?;
+                bank_wait_seconds += wait_started.elapsed().as_secs_f64();
                 let count = EXPERT_READ_LANES.min(experts - first);
                 let plans = (first..first + count).map(|expert| {
                     let mut offset = 0;
@@ -248,9 +252,11 @@ impl<'a> Exl3Weights<'a> {
                         Ok(projection)
                     }).collect::<Result<Vec<_>>>()
                 }).collect::<Result<Vec<_>>>()?;
+                paired_load::trace_overlap(&streams, "read_start", layer, first)?;
                 let read_started = std::time::Instant::now();
                 storage_bytes_read += paired_load::read_group(catalog, &plans, &mut hosts[bank])?;
                 read_seconds += read_started.elapsed().as_secs_f64();
+                let upload_started = std::time::Instant::now();
                 for rank in 0..2 {
                     for (lane, jobs) in plans.iter().enumerate() {
                         for (slot, projection) in jobs.iter().enumerate() {
@@ -270,10 +276,12 @@ impl<'a> Exl3Weights<'a> {
                         }
                     }
                 }
+                upload_submit_seconds += upload_started.elapsed().as_secs_f64();
                 fences.record(bank, &streams)?;
+                paired_load::trace_overlap(&streams, "both_submitted", layer, first)?;
                 group += 1;
             }
-            tracing::info!(layer, storage_bytes_read, read_seconds,
+            tracing::info!(layer, storage_bytes_read, read_seconds, bank_wait_seconds, upload_submit_seconds,
                 elapsed_seconds = layer_started.elapsed().as_secs_f64(), "EXL3 TP2 shared-read layer timeline");
         }
         paired_load::drain(&streams)?;

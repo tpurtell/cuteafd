@@ -501,9 +501,13 @@ impl<'a> ExpertWeights<'a> {
             let experts = weights[0][index].experts;
             let mut storage_bytes_read = 0;
             let mut read_seconds = 0.;
+            let mut bank_wait_seconds = 0.;
+            let mut upload_submit_seconds = 0.;
             for first in (0..experts).step_by(lanes) {
                 let bank = group % 2;
+                let wait_started = std::time::Instant::now();
                 fences.reuse(bank)?;
+                bank_wait_seconds += wait_started.elapsed().as_secs_f64();
                 let count = lanes.min(experts - first);
                 let full_plans = (first..first + count).map(|expert|
                     catalog.expert_staging(V41ExpertSelection::BackboneFull { layer, expert }))
@@ -515,9 +519,11 @@ impl<'a> ExpertWeights<'a> {
                     Projection::new(catalog, name.clone(), plan.tensor_ranges()[slot].start,
                         [catalog.backbone_tp2_slice(name, 0)?, catalog.backbone_tp2_slice(name, 1)?])
                 }).collect::<Result<Vec<_>>>()).collect::<Result<Vec<_>>>()?;
+                paired_load::trace_overlap(&streams, "read_start", layer, first)?;
                 let read_started = std::time::Instant::now();
                 storage_bytes_read += paired_load::read_group(catalog, &plans, &mut hosts[bank])?;
                 read_seconds += read_started.elapsed().as_secs_f64();
+                let upload_started = std::time::Instant::now();
                 for rank in 0..2 {
                     devices[rank].run(|| {
                         let weight = &weights[rank][index];
@@ -545,10 +551,12 @@ impl<'a> ExpertWeights<'a> {
                         Ok(())
                     })?;
                 }
+                upload_submit_seconds += upload_started.elapsed().as_secs_f64();
                 fences.record(bank, &streams)?;
+                paired_load::trace_overlap(&streams, "both_submitted", layer, first)?;
                 group += 1;
             }
-            tracing::info!(layer, storage_bytes_read, read_seconds,
+            tracing::info!(layer, storage_bytes_read, read_seconds, bank_wait_seconds, upload_submit_seconds,
                 elapsed_seconds = layer_started.elapsed().as_secs_f64(),
                 "native TP2 shared-read layer timeline");
         }
