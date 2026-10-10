@@ -1955,6 +1955,27 @@ value (the measured GLM Flash regression and V4's 603K pool first).
 step: a cut after step 11 (placement for V4, draft policy for GLM Flash,
 V4.1 byte-exact on shared types), one after step 20, and v3.0.0 after 25.
 
+**v3 reference cards (TJ, 2026-10-10).** Besides each family's min/max, these
+cards are in the regular test set for the unification steps and are v3
+release cards:
+- **GLM 5.3 Flash EXL3 K3.25, 2× RTX, no Sparks.** Every routed expert is on
+  the RTX cards. This is the far edge case for the adaptive draft policy (no
+  Spark traffic to price) and for TP2 placement (`P6`, `P7`), and the
+  Spark-free card from v3 item 4.
+- **GLM 5.3 Flash, no experts onboarded.** Every routed expert is on the
+  Sparks. The opposite edge case for the draft policy's resource classes.
+- **GLM 5.3 Flash, about half the expert layers onboarded,** bought with a
+  larger KV pool and concurrency limit. The mixed case where the solver
+  trades experts against KV, and the draft policy prices both resource
+  classes at once.
+- **V4.1 Flash, 1× RTX + 4 Sparks, and 2× RTX + 6 Sparks.** The unification
+  reference for every ds41rt stage (`S0`–`S6`) and for `P12`, beside the
+  shipped min (1× RTX + 3) and max (2× RTX + 4) cards.
+
+The draft-policy steps (`D2`, `D3`, `D4`) gate on the three GLM Flash edge
+cards as well as min/max. The placement steps (`P1`–`P12`) and ds41rt stages
+gate on the cards their family touches.
+
 **Dropped or flagged (review 2026-10-09):**
 - Dropped: the `Speculator` lifecycle trait and `VerifyCost` (one
   implementor each under decision 2); `P13` as its own PR; `CycleCost`
