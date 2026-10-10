@@ -637,6 +637,7 @@ fn response_document_eviction_is_atomic() {
             parent: None,
             system: None,
             items: vec![],
+            additional_tools: vec![],
         })
     };
     sessions.put_response_document("a".into(), snap(), json!({"id":"a"}));
@@ -1205,4 +1206,85 @@ async fn usage_rows_messages_responses_and_root_chain() {
         assert_eq!(row.outcome,"ok");
         assert_eq!(row.stop_reason.as_deref(),Some("end_turn"));
     }
+}
+
+/// A benchmark that starts while a Responses socket is open refuses that
+/// socket's next turn with a busy error, and admits it again afterwards.
+#[tokio::test]
+async fn turn_gate_refuses_turns_on_an_open_socket() {
+    let backend = Scripted::new(vec![vec![text("after"), done()]]);
+    let locked = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag = locked.clone();
+    let mut gateway = Gateway::new(Arc::new(backend.clone()), ModelMap { accept_any: true, ..ModelMap::single("served-model") });
+    gateway.gate = Some(Arc::new(move || flag.load(std::sync::atomic::Ordering::SeqCst).then_some(30)));
+    let app = crate::gateway::router(Arc::new(gateway));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
+    let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/v1/responses")).await.unwrap();
+    for (lock, expect) in [(true, "error"), (false, "response.completed")] {
+        locked.store(lock, std::sync::atomic::Ordering::SeqCst);
+        ws.send(tokio_tungstenite::tungstenite::Message::Text(
+            json!({"type":"response.create","model":"gpt-6.1-sol","input":"hi","store":false}).to_string())).await.unwrap();
+        loop {
+            let message = tokio::time::timeout(std::time::Duration::from_secs(5), ws.next()).await.unwrap().unwrap().unwrap();
+            let v: Value = serde_json::from_str(message.to_text().unwrap()).unwrap();
+            if v["type"] == "error" || v["type"] == "response.completed" || v["type"] == "response.failed" {
+                assert_eq!(v["type"], expect, "{v}");
+                if lock { assert!(v.to_string().contains("benchmark"), "{v}"); }
+                break;
+            }
+        }
+    }
+    assert_eq!(backend.turns().len(), 1, "the refused turn never reached the backend");
+    ws.close(None).await.unwrap();
+    server.abort();
+}
+
+#[tokio::test]
+async fn turn_gate_refuses_compact() {
+    let backend = Scripted::new(vec![]);
+    let mut gateway = Gateway::new(Arc::new(backend.clone()), ModelMap { accept_any: true, ..ModelMap::single("served-model") });
+    gateway.gate = Some(Arc::new(|| Some(30)));
+    let app = crate::gateway::router(Arc::new(gateway));
+    let (status, text) = request(&app, "POST", "/v1/responses/compact", json!({"model":"gpt-6.1-sol","input":"hi"})).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{text}");
+    assert!(text.contains("benchmark"), "{text}");
+    assert!(backend.turns().is_empty());
+}
+
+/// Codex over WebSocket declares its tools in an `additional_tools` input item
+/// on the first turn only; continuations by `previous_response_id` keep them
+/// (live Codex 0.161 run: the second turn had no tools, so the model could
+/// only describe the edit it meant to make).
+#[tokio::test]
+async fn websocket_continuation_keeps_additional_tools() {
+    let (app, backend, _) = app(vec![vec![text("first"), done()], vec![text("second"), done()]]);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
+    let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/v1/responses")).await.unwrap();
+    let tools = json!({"type":"additional_tools","role":"developer","tools":[{"type":"namespace","name":"functions","description":"",
+        "tools":[{"type":"custom","name":"exec","description":"Run a command."}]}]});
+    let mut last = String::new();
+    for i in 0..2 {
+        let mut req = json!({"type":"response.create","model":"gpt-6.1-sol","store":false,
+            "input":[{"type":"message","role":"user","content":[{"type":"input_text","text":format!("turn {i}")}]}]});
+        if i == 0 { req["input"].as_array_mut().unwrap().insert(0, tools.clone()); }
+        else { req["previous_response_id"] = json!(last); }
+        ws.send(tokio_tungstenite::tungstenite::Message::Text(req.to_string())).await.unwrap();
+        loop {
+            let message = tokio::time::timeout(std::time::Duration::from_secs(5), ws.next()).await.unwrap().unwrap().unwrap();
+            let v: Value = serde_json::from_str(message.to_text().unwrap()).unwrap();
+            assert_ne!(v["type"], "error", "{v}");
+            if v["type"] == "response.completed" { last = v["response"]["id"].as_str().unwrap().into(); break; }
+        }
+    }
+    let turns = backend.turns();
+    assert_eq!(turns.len(), 2);
+    for turn in &turns {
+        assert_eq!(turn.tools.iter().map(|t| t.name.as_str()).collect::<Vec<_>>(), vec!["functions.exec"], "tools on every turn");
+    }
+    ws.close(None).await.unwrap();
+    server.abort();
 }

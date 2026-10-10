@@ -94,6 +94,29 @@ pub struct ModelProfile {
     /// Token ids that end generation. Requests carry these (plus any
     /// family turn markers) in `NativeRequest::stop_token_ids`.
     pub eos_token_ids: Vec<u32>,
+    /// Mount the API gateway (Messages, Responses, Realtime) over this engine.
+    pub gateway: Option<Arc<GatewayMount>>,
+}
+
+/// How the serving router mounts the gateway front ends over its engine.
+pub struct GatewayMount {
+    pub models: crate::gateway::ModelMap,
+    /// Tokenizer snapshot for exact `count_tokens`.
+    pub snapshot: Option<std::path::PathBuf>,
+    pub options: engine::EngineOptions,
+    pub search: Option<Arc<dyn crate::gateway::SearchProvider>>,
+    /// Refuses gateway turns while the in-server benchmark owns the engine.
+    pub gate: Option<crate::gateway::TurnGate>,
+    /// Which browser origins may open Responses/Realtime sockets.
+    pub origins: crate::gateway::OriginPolicy,
+}
+
+impl std::fmt::Debug for GatewayMount {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GatewayMount").field("models", &self.models).field("snapshot", &self.snapshot)
+            .field("options", &self.options).field("search", &self.search.as_ref().map(|s| s.name().to_owned()))
+            .field("gate", &self.gate.is_some()).finish()
+    }
 }
 
 impl ModelProfile {
@@ -102,7 +125,7 @@ impl ModelProfile {
         let eos_token_ids = encoding.eos_token_ids();
         let capabilities = MediaCapabilities { vision: matches!(encoding, ModelEncoding::DeepseekV41), audio: false };
         Self { id: id.into(), encoding, eos_token_ids, capabilities, engine_health: None, media_preparer: None, vision_health: None,
-            audio_preparer: None, audio_health: None }
+            audio_preparer: None, audio_health: None, gateway: None }
     }
 
     /// Install only after the matching encoder is loaded and ready. A processor
@@ -158,6 +181,7 @@ pub mod media;
 pub mod console;
 pub use console::ConsoleHub;
 pub mod probe;
+pub mod engine;
 #[cfg(test)]
 mod unicode_tests;
 pub use limits::{NativeLimits, MAX_CONTEXT_TOKENS, MAX_OUTPUT_TOKENS};
@@ -207,7 +231,7 @@ pub struct NativeRequest {
 /// Serving statistics the CUDA owner publishes (a JSON object; `null` until the first publish).
 pub type SharedStats = Arc<Mutex<Value>>;
 #[derive(Clone)]
-struct NativeState {
+pub(crate) struct NativeState {
     queue: mpsc::Sender<NativeRequest>,
     limits: NativeLimits,
     images: images::ImageDecoder,
@@ -215,6 +239,11 @@ struct NativeState {
     tables: cuteafd_loader::MappedTableStatsReader,
     admission: admission::Admission,
     profile: Arc<ModelProfile>,
+}
+impl NativeState {
+    pub(crate) fn submitter(&self) -> Submitter {
+        Submitter { queue: self.queue.clone(), admission: self.admission.clone(), images: self.images.clone() }
+    }
 }
 pub fn router(queue: mpsc::Sender<NativeRequest>) -> Router {
     router_with_limits(queue, NativeLimits::default())
@@ -263,15 +292,40 @@ pub fn router_for_model(queue: mpsc::Sender<NativeRequest>, limits: NativeLimits
         .route("/assets/cuteafd-logo.svg", get(console::logo))
         .route("/assets/cuteafd-mark.svg", get(console::mark))
         .with_state(console);
-    Router::new()
+    let body_limit = axum::extract::DefaultBodyLimit::max(if profile.media_preparer.is_some() || profile.audio_preparer.is_some() { 256 << 20 } else { images::BODY_BYTES });
+    let mount = profile.gateway.clone();
+    let state = NativeState { queue, limits, images, stats, tables, admission, profile: Arc::new(profile) };
+    let mut routes = Router::new()
         .route("/health", get(health))
-        .route("/v1/models", get(models))
         .route("/v1/stats", get(stats_route))
-        .route("/v1/chat/completions", post(chat))
-        .layer(axum::extract::DefaultBodyLimit::max(if profile.media_preparer.is_some() || profile.audio_preparer.is_some() { 256 << 20 } else { images::BODY_BYTES }))
-        .with_state(NativeState { queue, limits, images, stats, tables, admission, profile: Arc::new(profile) })
-        .merge(console_routes)
-        .layer(axum::middleware::from_fn_with_state(middleware_health, health::require_ready))
+        .route("/v1/chat/completions", post(chat));
+    // With the gateway mounted, its listing (OpenAI and Anthropic fields,
+    // official aliases) owns /v1/models; the served model's entry keeps the
+    // chat route's fields, so existing readers see the same record first.
+    if mount.is_none() { routes = routes.route("/v1/models", get(models)); }
+    let mut router = routes.layer(body_limit).with_state(state.clone()).merge(console_routes);
+    if let Some(mount) = mount {
+        let backend = engine::backend(state.clone(), mount.snapshot.clone(), mount.options);
+        let mut gateway = crate::gateway::Gateway::new(backend, mount.models.clone());
+        if let Some(search) = &mount.search { gateway = gateway.with_search(search.clone()); }
+        gateway.gate = mount.gate.clone();
+        gateway.origins = mount.origins.clone();
+        router = router.merge(crate::gateway::router(Arc::new(gateway)).layer(body_limit));
+    }
+    router.layer(axum::middleware::from_fn_with_state(middleware_health, health::require_ready))
+}
+
+/// The chat route's `/v1/models` record for the served model.
+pub(crate) fn model_record(state: &NativeState) -> Value {
+    let owner = state.profile.id.split_once('/').map_or("cuteafd", |(owner, _)| owner);
+    let mut model = json!({"id":state.profile.id,"object":"model","owned_by":owner,
+        "capabilities":state.profile.capabilities,"max_context_tokens":state.limits.context(),"max_output_tokens":state.limits.output()});
+    if let ModelEncoding::Glm(encoding) = &state.profile.encoding {
+        if let Some(provenance) = encoding.template_provenance() {
+            model["chat_template"] = json!(provenance);
+        }
+    }
+    model
 }
 async fn stats_route(State(state): State<NativeState>) -> Json<Value> {
     let mut value = state.stats.lock().map(|stats| stats.clone()).unwrap_or(Value::Null);
@@ -301,15 +355,7 @@ fn refresh_mapped_tables(value: &mut Value, reader: &cuteafd_loader::MappedTable
 }
 
 async fn models(State(state): State<NativeState>) -> Json<Value> {
-    let owner = state.profile.id.split_once('/').map_or("cuteafd", |(owner, _)| owner);
-    let mut model = json!({"id":state.profile.id,"object":"model","owned_by":owner,
-        "capabilities":state.profile.capabilities,"max_context_tokens":state.limits.context(),"max_output_tokens":state.limits.output()});
-    if let ModelEncoding::Glm(encoding) = &state.profile.encoding {
-        if let Some(provenance) = encoding.template_provenance() {
-            model["chat_template"] = json!(provenance);
-        }
-    }
-    Json(json!({"object":"list","data":[model]}))
+    Json(json!({"object":"list","data":[model_record(&state)]}))
 }
 async fn health(State(state): State<NativeState>) -> Response {
     if let Some(reason) = state.profile.engine_health.as_ref().and_then(health::HealthWitness::reason) {
@@ -406,8 +452,9 @@ fn request_target_sampling(body: &Value) -> Result<TargetSamplingParams, String>
     TargetSamplingParams::new(temperature, top_p, top_k, min_p, seed)
         .map_err(|error| error.to_string())
 }
-type ChatGenerator = <<ChatCompletionRequest as ProtocolRequest>::Response as ProtocolResponse>::ChunkGenerator;
-type ChatChunk = <ChatGenerator as deepseek_recipe::stream::ChunkGenerator>::Chunk;
+type PlainGenerator = <<ChatCompletionRequest as ProtocolRequest>::Response as ProtocolResponse>::ChunkGenerator;
+type ChatGenerator = Tapped<PlainGenerator>;
+pub(crate) type ChatChunk = <PlainGenerator as deepseek_recipe::stream::ChunkGenerator>::Chunk;
 type ChatChunks = std::pin::Pin<Box<dyn futures::Stream<Item = Result<ChatChunk, deepseek_recipe::stream::StreamError>> + Send>>;
 
 /// A family whose prompt is the checkpoint's own chat template.
@@ -445,73 +492,122 @@ impl OutputProcessor {
     }
 }
 
-async fn chat(State(state): State<NativeState>, headers: axum::http::HeaderMap,
-    usage: Option<crate::usage::UsageHandle>, Json(mut body): Json<Value>) -> Response {
-    if let Some(usage) = &usage {
-        usage.details(crate::usage::Details {
-            model_requested: body["model"].as_str().map(str::to_owned),
-            model_served: Some(state.profile.id.clone()),
-            stream: body["stream"].as_bool().unwrap_or(false),
-            n_items: body["messages"].as_array().map(|v| v.len() as u64),
-            n_tools: body["tools"].as_array().map(|v| v.len() as u64),
-            n_images: Some(count_parts(&body["messages"], "image_url")),
-            n_audio: Some(count_parts(&body["messages"], "input_audio")),
-            ..Default::default()
-        });
-        if let Some(key) = body["prompt_cache_key"].as_str().or_else(|| body["user"].as_str()) {
-            usage.cache_session(key);
+/// A request failure before the first engine chunk: HTTP status and message.
+/// The chat route renders it as its own error body; the gateway backend maps
+/// it onto a `GatewayError`.
+#[derive(Debug)]
+pub(crate) struct Rejection {
+    pub status: StatusCode,
+    pub message: String,
+    /// Clients may retry after a second (queue full, engine busy).
+    retry: bool,
+    /// The OpenAI strict-schema rejection keeps its own response shape.
+    response: Option<Response>,
+}
+
+impl Rejection {
+    fn new(status: StatusCode, message: impl ToString) -> Self {
+        Self { status, message: message.to_string(), retry: false, response: None }
+    }
+    fn retry(mut self) -> Self { self.retry = true; self }
+    fn bad(message: impl ToString) -> Self { Self::new(StatusCode::BAD_REQUEST, message) }
+    fn unavailable(message: impl ToString) -> Self { Self::new(StatusCode::SERVICE_UNAVAILABLE, message) }
+    fn into_response(self) -> Response {
+        if let Some(response) = self.response { return response; }
+        let mut response = error(self.status, &self.message);
+        if self.retry {
+            response.headers_mut().insert(axum::http::header::RETRY_AFTER, axum::http::HeaderValue::from_static("1"));
         }
+        response
     }
-    if let Err(message) = images::guard_content(&body, state.profile.capabilities) {
-        return error(StatusCode::BAD_REQUEST, message);
+}
+
+/// Sources a request needs prepared before it reaches the engine.
+struct MediaWork {
+    /// V4.1 images rendered by the recipe encoder.
+    images: Vec<deepseek_recipe_core::multimodal::ImageSource>,
+    /// Generic-family images, in template order.
+    media: Vec<media::MediaSource>,
+    audio: Vec<(String, cuteafd_loader::media::audio::AudioFormat)>,
+}
+
+/// A chat request after protocol conversion and prompt rendering: everything
+/// the engine needs, before admission. Built only by [`build`], shared by the
+/// chat route and the gateway engine backend.
+pub(crate) struct Built {
+    prompt: String,
+    constraint: Option<NativeConstraint>,
+    max_tokens: usize,
+    sampling: TargetSamplingParams,
+    stop_token_ids: Vec<u32>,
+    processor: OutputProcessor,
+    validator: tools::CompletionValidator,
+    work: MediaWork,
+    probe: Option<Arc<probe::Probe>>,
+    streaming: bool,
+    include_usage: bool,
+    id: String,
+    model: String,
+    /// Client stop strings (the parser ends on them; the gateway reports which).
+    pub(crate) stop_sequences: Vec<String>,
+    tap: Arc<Mutex<Tap>>,
+}
+
+impl Built {
+    /// The rendered prompt text (before media placeholder expansion).
+    pub(crate) fn prompt(&self) -> &str { &self.prompt }
+    /// Whether any image or audio source must be prepared.
+    pub(crate) fn has_media(&self) -> bool {
+        !self.work.images.is_empty() || !self.work.media.is_empty() || !self.work.audio.is_empty()
     }
+}
+
+/// Validate and render one chat request body for `profile`. Synchronous and
+/// free of side effects except claiming a benchmark probe.
+pub(crate) fn build(profile: &ModelProfile, limits: NativeLimits, headers: &axum::http::HeaderMap, mut body: Value)
+    -> Result<Built, Rejection> {
+    images::guard_content(&body, profile.capabilities).map_err(Rejection::bad)?;
     let probe = headers.get(probe::HEADER).and_then(|v| v.to_str().ok()).and_then(|id| probe::registry().claim(id));
     if let Some(p) = &probe {
         if let Err(message) = p.spec.validate_media() {
             p.fail(format!("{message:#}"));
-            return error(StatusCode::BAD_REQUEST, message);
+            return Err(Rejection::bad(message));
         }
-        if !p.spec.media.is_empty() && (!state.profile.capabilities.vision || state.profile.media_preparer.is_none()
-            || matches!(state.profile.encoding, ModelEncoding::DeepseekV41)) {
+        if !p.spec.media.is_empty() && (!profile.capabilities.vision || profile.media_preparer.is_none()
+            || matches!(profile.encoding, ModelEncoding::DeepseekV41)) {
             p.fail("probe media requires a loaded encoder");
-            return error(StatusCode::BAD_REQUEST, "probe media requires a loaded encoder");
+            return Err(Rejection::bad("probe media requires a loaded encoder"));
         }
-        if !p.spec.audio.is_empty() && (!state.profile.capabilities.audio || state.profile.audio_preparer.is_none()) {
+        if !p.spec.audio.is_empty() && (!profile.capabilities.audio || profile.audio_preparer.is_none()) {
             p.fail("probe audio requires a loaded encoder");
-            return error(StatusCode::BAD_REQUEST, "probe audio requires a loaded encoder");
+            return Err(Rejection::bad("probe audio requires a loaded encoder"));
         }
     }
-    let audio_sources = if state.profile.capabilities.audio {
-        if state.profile.audio_preparer.is_none() { return error(StatusCode::SERVICE_UNAVAILABLE, "audio processor unavailable"); }
-        match media::audio::take_audio_sources(&mut body) {
-            Ok(sources) => sources,
-            Err(message) => return error(StatusCode::BAD_REQUEST, message),
-        }
+    let audio_sources = if profile.capabilities.audio {
+        if profile.audio_preparer.is_none() { return Err(Rejection::unavailable("audio processor unavailable")); }
+        media::audio::take_audio_sources(&mut body).map_err(Rejection::bad)?
     } else { Vec::new() };
     if probe.as_ref().is_some_and(|p| !p.spec.audio.is_empty() && p.spec.audio.len() != audio_sources.len()) {
-        return error(StatusCode::BAD_REQUEST, "probe audio count differs from input_audio sources");
+        return Err(Rejection::bad("probe audio count differs from input_audio sources"));
     }
-    if !audio_sources.is_empty() && state.profile.audio_health.as_ref().is_none_or(|h| !h.load(Ordering::Acquire)) {
-        return error(StatusCode::SERVICE_UNAVAILABLE, "audio encoder unavailable");
+    if !audio_sources.is_empty() && profile.audio_health.as_ref().is_none_or(|h| !h.load(Ordering::Acquire)) {
+        return Err(Rejection::unavailable("audio encoder unavailable"));
     }
-    let media_sources = match &state.profile.media_preparer {
-        Some(preparer) => match media::extract_image_sources(&body, preparer.limits.images) {
-            Ok(sources) => sources,
-            Err(message) => return error(StatusCode::BAD_REQUEST, message),
-        },
+    let media_sources = match &profile.media_preparer {
+        Some(preparer) => media::extract_image_sources(&body, preparer.limits.images).map_err(Rejection::bad)?,
         None => Vec::new(),
     };
     if (!media_sources.is_empty() || probe.as_ref().is_some_and(|p| !p.spec.media.is_empty()))
-        && state.profile.vision_health.as_ref().is_some_and(|h| !h.load(Ordering::Acquire)) {
-        return error(StatusCode::SERVICE_UNAVAILABLE, "vision encoder unavailable");
+        && profile.vision_health.as_ref().is_some_and(|h| !h.load(Ordering::Acquire)) {
+        return Err(Rejection::unavailable("vision encoder unavailable"));
     }
-    if !matches!(state.profile.encoding, ModelEncoding::DeepseekV41) && state.profile.capabilities.vision
-        && state.profile.media_preparer.is_none() {
-        return error(StatusCode::SERVICE_UNAVAILABLE, "vision image processor unavailable");
+    if !matches!(profile.encoding, ModelEncoding::DeepseekV41) && profile.capabilities.vision
+        && profile.media_preparer.is_none() {
+        return Err(Rejection::unavailable("vision image processor unavailable"));
     }
     let media_sources = if let Some(p) = probe.as_ref().filter(|p| !p.spec.media.is_empty()) {
         if !media_sources.is_empty() {
-            return error(StatusCode::BAD_REQUEST, "probe media sources must not also appear in chat content");
+            return Err(Rejection::bad("probe media sources must not also appear in chat content"));
         }
         p.spec.media.iter().map(|span| {
             let source = span.image_url.as_ref().expect("validated probe source");
@@ -519,7 +615,7 @@ async fn chat(State(state): State<NativeState>, headers: axum::http::HeaderMap,
         }).collect()
     } else { media_sources };
     // Families rendered from the checkpoint's own chat template.
-    let glm = match &state.profile.encoding {
+    let glm = match &profile.encoding {
         ModelEncoding::Glm(encoding) => Some(Templated::Glm(encoding.clone())),
         ModelEncoding::Qwen(encoding) => Some(Templated::Qwen(encoding.clone())),
         ModelEncoding::DeepseekV4 | ModelEncoding::DeepseekV41 => None,
@@ -528,7 +624,7 @@ async fn chat(State(state): State<NativeState>, headers: axum::http::HeaderMap,
         // glmrt constrained GLM tool calls only when strict or required.
         None | Some(Value::Null) => glm.is_none(),
         Some(Value::Bool(value)) => *value,
-        _ => return error(StatusCode::BAD_REQUEST, "tool_decoding_assistance must be boolean"),
+        _ => return Err(Rejection::bad("tool_decoding_assistance must be boolean")),
     };
     let response_format = body.get("response_format").cloned().filter(|v| !v.is_null());
     // The adapter crate deserializes `response_format.json_schema` into a
@@ -542,10 +638,7 @@ async fn chat(State(state): State<NativeState>, headers: axum::http::HeaderMap,
                 let strict = match definition.get("strict") {
                     None | Some(Value::Null) => false,
                     Some(Value::Bool(strict)) => *strict,
-                    _ => return error(
-                        StatusCode::BAD_REQUEST,
-                        "response_format.json_schema.strict must be boolean",
-                    ),
+                    _ => return Err(Rejection::bad("response_format.json_schema.strict must be boolean")),
                 };
                 if strict {
                     if let Some(schema) = definition.get("schema") {
@@ -553,7 +646,8 @@ async fn chat(State(state): State<NativeState>, headers: axum::http::HeaderMap,
                             schema,
                             "response_format.json_schema.schema",
                         ) {
-                            return rejection.into_response();
+                            let message = rejection.message.clone();
+                            return Err(Rejection { status: rejection.status, message, retry: false, response: Some(rejection.into_response()) });
                         }
                     }
                 }
@@ -565,16 +659,10 @@ async fn chat(State(state): State<NativeState>, headers: axum::http::HeaderMap,
     if response_format.as_ref().and_then(|v| v.get("type")).and_then(Value::as_str) == Some("regex") {
         body["response_format"] = json!({"type":"text"});
     }
-    let sampling = match request_target_sampling(&body) {
-        Ok(sampling) => sampling,
-        Err(message) => return error(StatusCode::BAD_REQUEST, message),
-    };
+    let sampling = request_target_sampling(&body).map_err(Rejection::bad)?;
     // V4.1's checkpoint encoder also takes a numeric budget (1-100), which the
     // adapter's enum cannot parse: take it out here and apply it after rendering.
-    let v41_budget = match v41_numeric_effort(&mut body, &state.profile.encoding) {
-        Ok(budget) => budget,
-        Err(message) => return error(StatusCode::BAD_REQUEST, message),
-    };
+    let v41_budget = v41_numeric_effort(&mut body, &profile.encoding).map_err(Rejection::bad)?;
     // The adapter's `seed` field is `u64`; cuteafd keeps the signed convention,
     // so drop it after resolution to keep a negative seed from failing serde.
     if let Some(object) = body.as_object_mut() {
@@ -585,7 +673,7 @@ async fn chat(State(state): State<NativeState>, headers: axum::http::HeaderMap,
     let glm_request = match glm.map(|encoding| (encoding.thinking(&body), encoding)) {
         None => None,
         Some((Ok(thinking), encoding)) => Some((encoding, body.clone(), thinking)),
-        Some((Err(message), _)) => return error(StatusCode::BAD_REQUEST, message),
+        Some((Err(message), _)) => return Err(Rejection::bad(message)),
     };
     // Clients written for vLLM/SGLang send `enable_thinking` (top level or in
     // `chat_template_kwargs`) instead of `thinking.type`; honour it for every
@@ -596,30 +684,23 @@ async fn chat(State(state): State<NativeState>, headers: axum::http::HeaderMap,
                 || body.get("chat_template_kwargs").and_then(|v| v.get("enable_thinking")).filter(|v| !v.is_null()).is_some()
                 => Some(thinking),
             Ok(_) => None,
-            Err(message) => return error(StatusCode::BAD_REQUEST, message),
+            Err(message) => return Err(Rejection::bad(message)),
         },
         _ => None,
     };
     if !audio_sources.is_empty() {
-        if glm_request.is_none() { return error(StatusCode::BAD_REQUEST, "audio requires a checkpoint chat template"); }
+        if glm_request.is_none() { return Err(Rejection::bad("audio requires a checkpoint chat template")); }
         media::audio::strip_adapter_audio(&mut body);
     }
-    let mut parsed: ChatCompletionRequest = match serde_json::from_value(body) {
-        Ok(r) => r,
-        Err(e) => return error(StatusCode::BAD_REQUEST, e),
-    };
+    let mut parsed: ChatCompletionRequest = serde_json::from_value(body).map_err(Rejection::bad)?;
     let include_usage = parsed.include_usage();
     let parallel = parsed.parallel_tool_calls.unwrap_or(true);
     let selection = tools::Selection::extract(&mut parsed);
     // Native serving defaults to thinking at the adapter's high effort. Explicit
     // thinking/effort settings retain the official conversion precedence.
-    let mut converted = match parsed.convert(ConversionOptions::default().with_default_thinking_mode(true)) {
-        Ok(r) => r,
-        Err(e) => return error(StatusCode::BAD_REQUEST, e),
-    };
-    if let Err(e) = selection.apply(&mut converted.conversation.tools) {
-        return error(StatusCode::BAD_REQUEST, e);
-    }
+    let mut converted = parsed.convert(ConversionOptions::default().with_default_thinking_mode(true))
+        .map_err(Rejection::bad)?;
+    selection.apply(&mut converted.conversation.tools).map_err(Rejection::bad)?;
     if let Some((_, _, thinking)) = &glm_request {
         converted.conversation.thinking_mode = thinking.enabled;
     }
@@ -631,41 +712,37 @@ async fn chat(State(state): State<NativeState>, headers: axum::http::HeaderMap,
     // answer's leading text as reasoning_content.
     converted.parsing_options.reasoning_initial_stage = converted.conversation.thinking_mode
         .then_some(deepseek_recipe::stream::state_machine::ReasoningStage::Start);
-    let model = state.profile.id.clone();
-    if converted.model.as_deref() != Some(model.as_str()) {
-        return error(StatusCode::BAD_REQUEST, format!("model must be {model}"));
-    }
-    let max_tokens = match state.limits.requested_output(converted.inference_options.max_tokens) {
-        Ok(limit) => limit,
-        Err(e) => return error(StatusCode::BAD_REQUEST, e),
+    // The served id, or (with the gateway mounted) any id its model map
+    // lists or accepts, so every id /v1/models advertises also works here.
+    // Responses echo the id the client sent, as the gateway's do.
+    let requested = converted.model.clone().unwrap_or_default();
+    let model = if requested == profile.id { requested } else {
+        match profile.gateway.as_ref().filter(|_| !requested.is_empty()).map(|mount| mount.models.resolve(&requested)) {
+            Some(Ok(served)) if served == profile.id => requested,
+            _ => return Err(Rejection::bad(format!("model must be {}", profile.id))),
+        }
     };
-    let response_validator = match constraints::response_validator(response_format.as_ref()) {
-        Ok(validator) => validator,
-        Err(e) => return error(StatusCode::BAD_REQUEST, e),
-    };
+    let max_tokens = limits.requested_output(converted.inference_options.max_tokens).map_err(Rejection::bad)?;
+    let response_validator = constraints::response_validator(response_format.as_ref()).map_err(Rejection::bad)?;
     let syntax = match &glm_request {
         Some((Templated::Glm(_), _, _)) => tools::ToolSyntax::GlmXml,
         Some((Templated::Qwen(_), _, _)) => tools::ToolSyntax::QwenXml,
         None => tools::ToolSyntax::Dsml,
     };
-    let tool_constraints = match tools::ToolConstraints::new(&converted.conversation.tools,
+    let tool_constraints = tools::ToolConstraints::new(&converted.conversation.tools,
         converted.conversation.tool_choice, selection.required, parallel,
-        assistance || response_format.as_ref().is_some_and(|v| v["type"] != "text"), syntax) {
-        Ok(tools) => tools,
-        Err(e) => return error(StatusCode::BAD_REQUEST, e),
-    };
-    let constraint = match constraints::response_constraint(response_format.clone(), converted.conversation.thinking_mode,
-        tool_constraints.as_ref(), state.profile.encoding.think_close_token_id()) {
-        Ok(constraint) => constraint,
-        Err(e) => return error(StatusCode::BAD_REQUEST, e),
-    };
-    let mut validator = tools::CompletionValidator::new(response_validator, tool_constraints);
+        assistance || response_format.as_ref().is_some_and(|v| v["type"] != "text"), syntax).map_err(Rejection::bad)?;
+    let constraint = constraints::response_constraint(response_format.clone(), converted.conversation.thinking_mode,
+        tool_constraints.as_ref(), profile.encoding.think_close_token_id()).map_err(Rejection::bad)?;
+    let validator = tools::CompletionValidator::new(response_validator, tool_constraints);
     let tools_declared = !converted.conversation.tools.is_empty();
-    let stop_token_ids = state.profile.stop_token_ids(tools_declared);
+    let stop_token_ids = profile.stop_token_ids(tools_declared);
     let streaming = converted.stream;
+    let stop_sequences = converted.parsing_options.stop_sequences.clone();
     let id = format!("chatcmpl-{}", uuid::Uuid::new_v4());
-    let generator = ChatCompletionRequest::chunk_generator(&converted, id.clone(), model.clone())
-        .with_include_usage(!streaming || include_usage);
+    let tap = Arc::new(Mutex::new(Tap::default()));
+    let generator = Tapped { inner: ChatCompletionRequest::chunk_generator(&converted, id.clone(), model.clone())
+        .with_include_usage(!streaming || include_usage), tap: tap.clone() };
     let expanded_media_probe = probe.as_ref().is_some_and(|p| !p.spec.media.is_empty() || !p.spec.audio.is_empty());
     let (prompt, image_sources, processor) = match glm_request {
         Some((Templated::Glm(encoding), raw, thinking)) => {
@@ -679,10 +756,7 @@ async fn chat(State(state): State<NativeState>, headers: axum::http::HeaderMap,
                 tool_choice, response_format };
             // Native probe ids already contain image rows, irrespective of chat template.
             let prompt = if expanded_media_probe { String::new() } else {
-                match encoding.render(&raw, &options) {
-                    Ok(prompt) => prompt,
-                    Err(message) => return error(StatusCode::BAD_REQUEST, message),
-                }
+                encoding.render(&raw, &options).map_err(Rejection::bad)?
             };
             let parser = glm5::GlmOutputParser::new(glm5::GlmParserOptions { thinking: thinking.enabled,
                 tools: tools_declared.then(|| converted.conversation.tools.clone()),
@@ -700,10 +774,7 @@ async fn chat(State(state): State<NativeState>, headers: axum::http::HeaderMap,
                 tool_choice, response_format };
             // Native probe ids already contain image rows, irrespective of chat template.
             let prompt = if expanded_media_probe { String::new() } else {
-                match encoding.render(&raw, &options) {
-                    Ok(prompt) => prompt,
-                    Err(message) => return error(StatusCode::BAD_REQUEST, message),
-                }
+                encoding.render(&raw, &options).map_err(Rejection::bad)?
             };
             let parser = qwen4::QwenOutputParser::new(qwen4::QwenParserOptions { thinking: thinking.enabled,
                 tools: tools_declared.then(|| converted.conversation.tools.clone()),
@@ -715,7 +786,7 @@ async fn chat(State(state): State<NativeState>, headers: axum::http::HeaderMap,
                 // Supplied native ids already contain image rows; do not render another prompt.
                 (String::new(), Vec::new(), OutputProcessor::Deepseek(glm5::GlmStreamProcessor::new(generator, deepseek::parser::DeepseekOutputParser::new(converted.parsing_options))))
             } else {
-            let rendered = if matches!(state.profile.encoding, ModelEncoding::DeepseekV4) {
+            let rendered = if matches!(profile.encoding, ModelEncoding::DeepseekV4) {
                 DeepseekV4Encoding::new().render_conversation(&converted.conversation)
             } else {
                 let mut rendered = DeepseekV41Encoding::new().render_conversation(&converted.conversation);
@@ -733,161 +804,297 @@ async fn chat(State(state): State<NativeState>, headers: axum::http::HeaderMap,
     // Rendered sources own the image payloads needed by preprocessing. Do not
     // retain another copy of their data URLs throughout the generated response.
     drop(converted.conversation);
-    if !image_sources.is_empty() && state.profile.vision_health.as_ref().is_some_and(|h| !h.load(Ordering::Acquire)) {
-        return error(StatusCode::SERVICE_UNAVAILABLE, "vision encoder unavailable");
+    if !image_sources.is_empty() && profile.vision_health.as_ref().is_some_and(|h| !h.load(Ordering::Acquire)) {
+        return Err(Rejection::unavailable("vision encoder unavailable"));
     }
     if image_sources.len() > cuteafd_loader::V41_MAX_IMAGES {
-        return error(StatusCode::BAD_REQUEST, "at most 16 images are supported");
+        return Err(Rejection::bad("at most 16 images are supported"));
     }
-    let queue_started = std::time::Instant::now();
-    let permit = match state.admission.reserve(state.queue.clone()).await {
-        Ok(permit) => permit,
-        Err(admission::Rejected::Closed) => return error(StatusCode::SERVICE_UNAVAILABLE, "worker queue is closed"),
-        Err(admission::Rejected::Overloaded) => {
-            let mut response = error(StatusCode::TOO_MANY_REQUESTS, "request queue is full or its wait budget expired");
-            response.headers_mut().insert(axum::http::header::RETRY_AFTER, axum::http::HeaderValue::from_static("1"));
-            return response;
-        }
-    };
-    if let Some(scope) = &usage { scope.queued(queue_started.elapsed().as_secs_f64() * 1000.); }
-    let prepared = if image_sources.is_empty() { Vec::new() } else {
-        // The queue permit bounds waiters while up to four decoders run. A C16
-        // burst should wait here instead of imposing a hidden C4 image limit.
-        let slot = match state.images.slots.clone().acquire_owned().await {
-            Ok(slot) => slot,
-            Err(_) => return error(StatusCode::SERVICE_UNAVAILABLE, "image preparation is closed"),
-        };
-        let decoder = state.images.clone();
-        let result = tokio::task::spawn_blocking(move || {
+    Ok(Built { prompt, constraint, max_tokens, sampling, stop_token_ids, processor, validator,
+        work: MediaWork { images: image_sources, media: media_sources, audio: audio_sources },
+        probe, streaming, include_usage, id, model, stop_sequences, tap })
+}
+
+/// Prepared media for one request (decoded on blocking threads).
+struct Prepared {
+    images: Vec<cuteafd_loader::V41Image>,
+    media: Vec<Arc<cuteafd_loader::media::PreparedImage>>,
+    audio: Vec<Arc<cuteafd_loader::media::audio::PreparedAudio>>,
+}
+
+impl Prepared {
+    fn image_tokens(&self) -> usize { self.media.iter().map(|image| image.tokens).sum() }
+    fn audio_tokens(&self) -> usize { self.audio.iter().map(|clip| clip.geometry.tokens).sum() }
+}
+
+/// Decode and encode the request's image and audio sources. The queue permit
+/// (when held) bounds waiters while the decoders run.
+async fn prepare_media(profile: &ModelProfile, decoder: &images::ImageDecoder, work: MediaWork,
+    probe: Option<&Arc<probe::Probe>>) -> Result<Prepared, Rejection> {
+    let MediaWork { images: image_sources, media: media_sources, audio: audio_sources } = work;
+    let images = if image_sources.is_empty() { Vec::new() } else {
+        // A C16 burst should wait here instead of imposing a hidden C4 image limit.
+        let slot = decoder.slots.clone().acquire_owned().await
+            .map_err(|_| Rejection::unavailable("image preparation is closed"))?;
+        let decoder = decoder.clone();
+        match tokio::task::spawn_blocking(move || {
             let _slot = slot;
             decoder.decode(image_sources)
-        }).await;
-        match result {
+        }).await {
             Ok(Ok(images)) => images,
-            Ok(Err(e)) => return error(StatusCode::BAD_REQUEST, format!("{e:#}")),
-            Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, e),
+            Ok(Err(e)) => return Err(Rejection::bad(format!("{e:#}"))),
+            Err(e) => return Err(Rejection::new(StatusCode::INTERNAL_SERVER_ERROR, e)),
         }
     };
     let media = if media_sources.is_empty() { Vec::new() } else {
-        let preparer = state.profile.media_preparer.as_ref().expect("sources require preparer").clone();
-        let slot = match preparer.slots.clone().acquire_owned().await {
-            Ok(slot) => slot,
-            Err(_) => return error(StatusCode::SERVICE_UNAVAILABLE, "image preparation is closed"),
-        };
-        let hashes = probe.as_ref().map(|p| p.spec.media.iter()
+        let preparer = profile.media_preparer.as_ref().expect("sources require preparer").clone();
+        let slot = preparer.slots.clone().acquire_owned().await
+            .map_err(|_| Rejection::unavailable("image preparation is closed"))?;
+        let hashes = probe.map(|p| p.spec.media.iter()
             .map(|span| span.fixture.as_ref().map(|f| f.sha256.clone())).collect::<Vec<_>>()).unwrap_or_default();
         match tokio::task::spawn_blocking(move || {
             let _slot = slot;
             preparer.prepare_verified(&media_sources, &hashes)
         }).await {
             Ok(Ok(prepared)) => prepared.images,
-            Ok(Err(message)) => return error(StatusCode::BAD_REQUEST, message),
-            Err(message) => return error(StatusCode::INTERNAL_SERVER_ERROR, message),
+            Ok(Err(message)) => return Err(Rejection::bad(message)),
+            Err(message) => return Err(Rejection::new(StatusCode::INTERNAL_SERVER_ERROR, message)),
         }
     };
     let audio = if audio_sources.is_empty() { Vec::new() } else {
-        let preparer = state.profile.audio_preparer.as_ref().expect("sources require audio preparer").clone();
-        let slot = match preparer.slots.clone().acquire_owned().await {
-            Ok(slot) => slot,
-            Err(_) => return error(StatusCode::SERVICE_UNAVAILABLE, "media preparation is closed"),
-        };
+        let preparer = profile.audio_preparer.as_ref().expect("sources require audio preparer").clone();
+        let slot = preparer.slots.clone().acquire_owned().await
+            .map_err(|_| Rejection::unavailable("media preparation is closed"))?;
         match tokio::task::spawn_blocking(move || {
             let _slot = slot;
             let sources = audio_sources.iter().map(|(data, format)| media::audio::AudioSource { data, format: *format }).collect::<Vec<_>>();
             preparer.prepare(&sources)
         }).await {
             Ok(Ok(prepared)) => prepared.clips,
-            Ok(Err(message)) => return error(StatusCode::BAD_REQUEST, message),
-            Err(message) => return error(StatusCode::INTERNAL_SERVER_ERROR, message),
+            Ok(Err(message)) => return Err(Rejection::bad(message)),
+            Err(message) => return Err(Rejection::new(StatusCode::INTERNAL_SERVER_ERROR, message)),
         }
     };
-    let image_tokens: usize = media.iter().map(|image| image.tokens).sum();
-    let audio_tokens: usize = audio.iter().map(|clip| clip.geometry.tokens).sum();
-    // Unbounded on purpose: inference threads send without ever blocking, so a
-    // client that stops reading cannot stall the shared scheduler. A request's
-    // backlog is bounded by its own max_tokens.
-    let (events, mut receive) = mpsc::unbounded_channel();
-    // Recipe 0.1.0 uses a protocol placeholder; the pinned model tokenizer
-    // spells token 129264 differently. Preserve the text-only prompt verbatim.
-    let prompt = if prepared.is_empty() { prompt }
-        else { prompt.replace("<｜image｜>", "<｜deepseek_image｜>") };
-    let job = NativeRequest {
-        audio,
-        media,
-        prompt,
-        constraint,
-        images: prepared,
-        max_tokens,
-        sampling,
-        stop_token_ids,
-        events,
-        probe,
-        usage: usage.clone(),
-    };
-    permit.send(job);
-    // Admission errors must retain their cause and HTTP status, including for
-    // SSE, before a protocol processor can turn early EOF into a finish chunk.
-    let first = match receive.recv().await {
-        Some(Ok(chunk)) => chunk,
-        Some(Err(NativeFailure::BadRequest(message))) => return error(StatusCode::BAD_REQUEST, message),
-        Some(Err(NativeFailure::Unavailable(message))) => {
-            let mut response = error(StatusCode::SERVICE_UNAVAILABLE, message);
-            response.headers_mut().insert(axum::http::header::RETRY_AFTER, axum::http::HeaderValue::from_static("1"));
-            return response;
+    Ok(Prepared { images, media, audio })
+}
+
+/// Shared engine-facing state the chat route and the gateway backend submit through.
+#[derive(Clone)]
+pub(crate) struct Submitter {
+    queue: mpsc::Sender<NativeRequest>,
+    admission: admission::Admission,
+    images: images::ImageDecoder,
+}
+
+/// A request the engine accepted: its protocol chunk stream plus what the
+/// response renderers need around it.
+pub(crate) struct Running {
+    pub(crate) chunks: std::pin::Pin<Box<dyn futures::Stream<Item = anyhow::Result<ChatChunk>> + Send>>,
+    /// Set when the engine failed or disconnected; checked before success frames.
+    pub(crate) failure: Arc<Mutex<Option<String>>>,
+    pub(crate) image_tokens: usize,
+    pub(crate) audio_tokens: usize,
+    /// The prompt usage and matched client stop string, observed as the
+    /// generator sees them.
+    pub(crate) tap: Arc<Mutex<Tap>>,
+    streaming: bool,
+    include_usage: bool,
+    id: String,
+    model: String,
+}
+
+/// What the gateway reads from the chunk generator's input that the chat
+/// chunk itself does not carry.
+#[derive(Debug, Default, Clone)]
+pub(crate) struct Tap {
+    pub prompt: PromptUsage,
+    /// The client stop string the parser ended on.
+    pub stop_sequence: Option<String>,
+}
+
+/// Wraps the chat chunk generator to observe prompt usage and the stop sequence.
+pub(crate) struct Tapped<G> { inner: G, tap: Arc<Mutex<Tap>> }
+
+impl<G: deepseek_recipe::stream::ChunkGenerator> deepseek_recipe::stream::ChunkGenerator for Tapped<G> where G::Chunk: Send {
+    type Chunk = G::Chunk;
+    async fn generate(&mut self, chunk: deepseek_recipe::stream::OutputChunk) -> Vec<Self::Chunk> {
+        use deepseek_recipe::stream::OutputChunk;
+        match &chunk {
+            OutputChunk::Start { usage, .. } => self.tap.lock().unwrap().prompt = *usage,
+            OutputChunk::Finish { stop_sequence, .. } => self.tap.lock().unwrap().stop_sequence = stop_sequence.clone(),
+            _ => {}
         }
-        Some(Err(message)) => return error(StatusCode::INTERNAL_SERVER_ERROR, message),
-        None => return error(StatusCode::INTERNAL_SERVER_ERROR, "native worker ended without completion"),
-    };
-    // Never let a failed/disconnected backend be converted to a successful EOF.
-    let failure = Arc::new(Mutex::new(None::<String>));
-    let input_failure = failure.clone();
-    let input_usage = usage.clone();
-    let input = async_stream::stream! {
-        account_chunk(&input_usage, &first);
-        let mut finished = matches!(first, InferenceChunk::Finish { .. });
-        yield first;
-        while !finished {
-            let Some(event) = receive.recv().await else { break; };
-            match event {
-                Ok(chunk) => {
-                    account_chunk(&input_usage, &chunk);
-                    finished = matches!(chunk,InferenceChunk::Finish { .. });
-                    yield chunk;
-                    if finished { break; }
-                }
-                Err(message) => { if let Some(scope) = &input_usage { scope.engine_error("worker"); } *input_failure.lock().unwrap() = Some(message.to_string()); break; }
-            }
-        }
-        if !finished {
-            if let Some(scope) = &input_usage { scope.engine_error("unexpected_eof"); }
-            input_failure.lock().unwrap().get_or_insert_with(|| "native worker ended without completion".into());
-        }
-    };
-    let chunks = processor.process(input);
-    let output_usage = usage.clone();
-    let chunks = async_stream::stream! {
-        futures::pin_mut!(chunks);
-        while let Some(chunk) = chunks.next().await {
-            match chunk {
-                Ok(chunk) => {
-                    if let Some(scope) = &output_usage {
-                        account_output(scope, &chunk);
+        self.inner.generate(chunk).await
+    }
+}
+
+impl Submitter {
+    /// Admit, prepare media, hand the job to the engine and wait for its first
+    /// chunk, so admission and engine failures keep their HTTP status.
+    /// `chat_accounting` records chat-protocol tokens and stop reasons on the
+    /// handle; the gateway accounts its own turns from their events instead.
+    pub(crate) async fn submit(&self, profile: &ModelProfile, built: Built, usage: Option<crate::usage::UsageHandle>,
+        chat_accounting: bool) -> Result<Running, Rejection> {
+        let Built { prompt, constraint, max_tokens, sampling, stop_token_ids, processor, mut validator, work, probe,
+            streaming, include_usage, id, model, tap, .. } = built;
+        let queue_started = std::time::Instant::now();
+        let permit = match self.admission.reserve(self.queue.clone()).await {
+            Ok(permit) => permit,
+            Err(admission::Rejected::Closed) => return Err(Rejection::new(StatusCode::SERVICE_UNAVAILABLE, "worker queue is closed")),
+            Err(admission::Rejected::Overloaded) =>
+                return Err(Rejection::new(StatusCode::TOO_MANY_REQUESTS, "request queue is full or its wait budget expired").retry()),
+        };
+        if let Some(scope) = &usage { scope.queued(queue_started.elapsed().as_secs_f64() * 1000.); }
+        let prepared = prepare_media(profile, &self.images, work, probe.as_ref()).await?;
+        let (image_tokens, audio_tokens) = (prepared.image_tokens(), prepared.audio_tokens());
+        // Unbounded on purpose: inference threads send without ever blocking, so a
+        // client that stops reading cannot stall the shared scheduler. A request's
+        // backlog is bounded by its own max_tokens.
+        let (events, mut receive) = mpsc::unbounded_channel();
+        // Recipe 0.1.0 uses a protocol placeholder; the pinned model tokenizer
+        // spells token 129264 differently. Preserve the text-only prompt verbatim.
+        let prompt = if prepared.images.is_empty() { prompt }
+            else { prompt.replace("<｜image｜>", "<｜deepseek_image｜>") };
+        let job = NativeRequest {
+            audio: prepared.audio,
+            media: prepared.media,
+            prompt,
+            constraint,
+            images: prepared.images,
+            max_tokens,
+            sampling,
+            stop_token_ids,
+            events,
+            probe,
+            usage: usage.clone(),
+        };
+        permit.send(job);
+        // Admission errors must retain their cause and HTTP status, including for
+        // SSE, before a protocol processor can turn early EOF into a finish chunk.
+        let first = match receive.recv().await {
+            Some(Ok(chunk)) => chunk,
+            Some(Err(NativeFailure::BadRequest(message))) => return Err(Rejection::bad(message)),
+            Some(Err(NativeFailure::Unavailable(message))) => return Err(Rejection::new(StatusCode::SERVICE_UNAVAILABLE, message).retry()),
+            Some(Err(message)) => return Err(Rejection::new(StatusCode::INTERNAL_SERVER_ERROR, message)),
+            None => return Err(Rejection::new(StatusCode::INTERNAL_SERVER_ERROR, "native worker ended without completion")),
+        };
+        // Never let a failed/disconnected backend be converted to a successful EOF.
+        let failure = Arc::new(Mutex::new(None::<String>));
+        let input_failure = failure.clone();
+        let input_usage = usage.clone().filter(|_| chat_accounting);
+        let input = async_stream::stream! {
+            account_chunk(&input_usage, &first);
+            let mut finished = matches!(first, InferenceChunk::Finish { .. });
+            yield first;
+            while !finished {
+                let Some(event) = receive.recv().await else { break; };
+                match event {
+                    Ok(chunk) => {
+                        account_chunk(&input_usage, &chunk);
+                        finished = matches!(chunk,InferenceChunk::Finish { .. });
+                        yield chunk;
+                        if finished { break; }
                     }
-                    if validator.enabled() {
-                        if let Err(e) = validator.observe(&serde_json::to_value(&chunk).unwrap()) {
-                            if let Some(scope) = &output_usage { scope.engine_error("output_validation"); }
-                            yield Err(e); return;
+                    Err(message) => { if let Some(scope) = &input_usage { scope.engine_error("worker"); } *input_failure.lock().unwrap() = Some(message.to_string()); break; }
+                }
+            }
+            if !finished {
+                if let Some(scope) = &input_usage { scope.engine_error("unexpected_eof"); }
+                input_failure.lock().unwrap().get_or_insert_with(|| "native worker ended without completion".into());
+            }
+        };
+        let chunks = processor.process(input);
+        let output_usage = usage.filter(|_| chat_accounting);
+        let chunks = async_stream::stream! {
+            futures::pin_mut!(chunks);
+            while let Some(chunk) = chunks.next().await {
+                match chunk {
+                    Ok(chunk) => {
+                        if let Some(scope) = &output_usage {
+                            account_output(scope, &chunk);
                         }
+                        if validator.enabled() {
+                            if let Err(e) = validator.observe(&serde_json::to_value(&chunk).unwrap()) {
+                                if let Some(scope) = &output_usage { scope.engine_error("output_validation"); }
+                                yield Err(e); return;
+                            }
+                        }
+                        yield Ok(chunk);
                     }
-                    yield Ok(chunk);
+                    Err(e) => { if let Some(scope) = &output_usage { scope.engine_error("output_parser"); } yield Err(anyhow::anyhow!(e.to_string())); return; }
                 }
-                Err(e) => { if let Some(scope) = &output_usage { scope.engine_error("output_parser"); } yield Err(anyhow::anyhow!(e.to_string())); return; }
             }
+        };
+        Ok(Running { chunks: Box::pin(chunks), failure, image_tokens, audio_tokens, tap, streaming, include_usage, id, model })
+    }
+}
+
+/// Exact prompt tokens the engine will admit for `built`: the tokenized
+/// prompt plus each image's expanded rows, as V4.1 native admission counts
+/// them. Families whose media expand past the API
+/// (encoder-prepared images and audio) refuse rather than undercount.
+pub(crate) async fn count_prompt(state: &NativeState, built: Built, snapshot: std::path::PathBuf) -> Result<u32, Rejection> {
+    let Built { prompt, work, .. } = built;
+    if !work.media.is_empty() || !work.audio.is_empty() {
+        return Err(Rejection::bad("count_tokens with image or audio input is not supported for this model yet (its media rows are counted by the encoder)"));
+    }
+    let images = if work.images.is_empty() { Vec::new() } else {
+        let slot = state.images.slots.clone().acquire_owned().await
+            .map_err(|_| Rejection::unavailable("image preparation is closed"))?;
+        let decoder = state.images.clone();
+        match tokio::task::spawn_blocking(move || { let _slot = slot; decoder.decode(work.images) }).await {
+            Ok(Ok(images)) => images,
+            Ok(Err(e)) => return Err(Rejection::bad(format!("{e:#}"))),
+            Err(e) => return Err(Rejection::new(StatusCode::INTERNAL_SERVER_ERROR, e)),
         }
     };
+    // The same spelling the job carries (see `Submitter::submit`).
+    let prompt = if images.is_empty() { prompt } else { prompt.replace("<｜image｜>", "<｜deepseek_image｜>") };
+    let ids = tokio::task::spawn_blocking(move || cuteafd_loader::encode_tokenizer_text(&snapshot, &prompt, false))
+        .await.map_err(|e| Rejection::new(StatusCode::INTERNAL_SERVER_ERROR, e))?
+        .map_err(|e| Rejection::new(StatusCode::INTERNAL_SERVER_ERROR, format!("token counting failed: {e:#}")))?
+        .token_ids;
+    // Each placeholder becomes the image's full span (`V41VisionPrompt::expand`).
+    let placeholders = ids.iter().filter(|&&id| id == cuteafd_loader::V41_IMAGE_TOKEN_ID).count();
+    if placeholders != images.len() { return Err(Rejection::bad("image placeholder count differs from supplied images")); }
+    let count = ids.len() + images.iter().map(|image| image.grid().tokens() - 1).sum::<usize>();
+    u32::try_from(count).map_err(|_| Rejection::bad("prompt too long"))
+}
+
+async fn chat(State(state): State<NativeState>, headers: axum::http::HeaderMap,
+    usage: Option<crate::usage::UsageHandle>, Json(body): Json<Value>) -> Response {
+    if let Some(usage) = &usage {
+        usage.details(crate::usage::Details {
+            model_requested: body["model"].as_str().map(str::to_owned),
+            model_served: Some(state.profile.id.clone()),
+            stream: body["stream"].as_bool().unwrap_or(false),
+            n_items: body["messages"].as_array().map(|v| v.len() as u64),
+            n_tools: body["tools"].as_array().map(|v| v.len() as u64),
+            n_images: Some(count_parts(&body["messages"], "image_url")),
+            n_audio: Some(count_parts(&body["messages"], "input_audio")),
+            ..Default::default()
+        });
+        if let Some(key) = body["prompt_cache_key"].as_str().or_else(|| body["user"].as_str()) {
+            usage.cache_session(key);
+        }
+    }
+    let built = match build(&state.profile, state.limits, &headers, body) {
+        Ok(built) => built,
+        Err(rejection) => return rejection.into_response(),
+    };
+    let running = match state.submitter().submit(&state.profile, built, usage, true).await {
+        Ok(running) => running,
+        Err(rejection) => return rejection.into_response(),
+    };
+    respond(running).await
+}
+
+/// Render an accepted request as Chat Completions SSE or JSON.
+async fn respond(running: Running) -> Response {
+    let Running { chunks, failure, image_tokens, audio_tokens, streaming, include_usage, id, model, .. } = running;
     if streaming {
         let stream = async_stream::stream! {
-            futures::pin_mut!(chunks);
+            let mut chunks = chunks;
             let mut usage_chunk = None;
             loop {
                 // A comment line keeps proxies and clients from timing out while
@@ -945,7 +1152,7 @@ async fn chat(State(state): State<NativeState>, headers: axum::http::HeaderMap,
         .unwrap_or_default()
         .as_secs();
     let mut response = ChatResponse::new(id, model, created, 0, 0);
-    futures::pin_mut!(chunks);
+    let mut chunks = chunks;
     while let Some(chunk) = chunks.next().await {
         match chunk {
             Ok(chunk) => response.append(chunk),

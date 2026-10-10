@@ -76,8 +76,14 @@ pub struct Auth {
 pub async fn require_key(axum::extract::State(auth): axum::extract::State<Auth>,
     request: Request, next: Next) -> Response {
     let path = request.uri().path();
+    // Every credential form the official clients send (Bearer, Claude Code's
+    // `x-api-key`, the Realtime websocket subprotocol) carries the same key.
     if (path == "/v1" || path.starts_with("/v1/")) && auth.key.as_ref().is_some_and(|key|
-        !key.accepts(request.headers()) && !auth.internal.as_ref().is_some_and(|check| check(path, request.headers()))) {
+        !crate::gateway::auth::accepts(key, request.headers()) && !auth.internal.as_ref().is_some_and(|check| check(path, request.headers()))) {
+        if path.starts_with("/v1/messages") {
+            return crate::gateway::GatewayError::new(crate::gateway::ErrorKind::Authentication,
+                "invalid x-api-key or Authorization bearer key").anthropic_response();
+        }
         return (StatusCode::UNAUTHORIZED, Json(json!({"error": {
             "message": "send a valid Authorization: Bearer API key", "type": "invalid_request_error",
             "code": "invalid_api_key"}}))).into_response();

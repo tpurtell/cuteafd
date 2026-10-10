@@ -37,6 +37,11 @@ pub use search::SearchProvider;
 pub use session::SessionStore;
 pub use turn::{TurnEvent, TurnRequest};
 
+/// Admission check consulted before every gateway turn, including turns on
+/// already-open Responses and Realtime sockets: `Some(retry_s)` refuses the
+/// turn as busy. Serving installs the in-server benchmark's lockout here.
+pub type TurnGate = Arc<dyn Fn() -> Option<u64> + Send + Sync>;
+
 /// Everything a front end needs.
 pub struct Gateway {
     pub backend: Arc<dyn Backend>,
@@ -46,11 +51,54 @@ pub struct Gateway {
     pub search: Option<Arc<dyn SearchProvider>>,
     /// Bounded reference/page cache and accounting for Codex standalone web.run.
     pub standalone_search: responses::SearchCache,
+    /// Refuses turns while something else owns the engine (a benchmark run).
+    pub gate: Option<TurnGate>,
+    /// Cross-site WebSocket protection: see [`websocket_origin`].
+    pub origins: OriginPolicy,
+}
+
+/// Which browser origins may open Responses and Realtime sockets. Browsers
+/// send no CORS preflight for WebSockets, so without this any page a user
+/// visits could drive the model on a keyless server.
+#[derive(Clone, Default)]
+pub struct OriginPolicy {
+    /// The server's API key; a cross-origin upgrade that presents it is allowed.
+    pub key: Option<crate::openai::auth::ApiKey>,
+    /// Exact origins allowed without a key (`--gateway-allow-origin`).
+    pub allowed: Vec<String>,
+}
+
+impl OriginPolicy {
+    /// No `Origin` (CLIs, SDKs), a same-origin page, a listed origin, or a
+    /// request carrying the server key.
+    pub fn admits(&self, headers: &axum::http::HeaderMap) -> bool {
+        let Some(origin) = headers.get(axum::http::header::ORIGIN).and_then(|v| v.to_str().ok()) else {
+            return headers.get(axum::http::header::ORIGIN).is_none();
+        };
+        let host = headers.get(axum::http::header::HOST).and_then(|v| v.to_str().ok());
+        let origin_host = origin.split_once("://").map(|(_, rest)| rest.trim_end_matches('/'));
+        (host.is_some() && origin_host == host)
+            || self.allowed.iter().any(|allowed| allowed.trim_end_matches('/') == origin)
+            || self.key.as_ref().is_some_and(|key| auth::accepts(key, headers))
+    }
+}
+
+/// Refuse cross-origin Responses/Realtime upgrades the [`OriginPolicy`] does not admit.
+async fn websocket_origin(axum::extract::State(gateway): axum::extract::State<Arc<Gateway>>,
+    request: axum::extract::Request, next: axum::middleware::Next) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let upgrade = request.headers().contains_key(axum::http::header::UPGRADE);
+    if upgrade && !gateway.origins.admits(request.headers()) {
+        return GatewayError::new(ErrorKind::PermissionDenied,
+            "cross-origin WebSocket refused: send the API key or start the server with --gateway-allow-origin")
+            .openai_response().into_response();
+    }
+    next.run(request).await
 }
 
 impl Gateway {
     pub fn new(backend: Arc<dyn Backend>, models: ModelMap) -> Self {
-        Self { backend, models, sessions: SessionStore::default(), search: None, standalone_search: responses::SearchCache::default() }
+        Self { backend, models, sessions: SessionStore::default(), search: None, standalone_search: responses::SearchCache::default(), gate: None, origins: OriginPolicy::default() }
     }
 
     pub fn with_search(mut self, provider: Arc<dyn SearchProvider>) -> Self {
@@ -61,6 +109,10 @@ impl Gateway {
     /// Resolve the requested model and run one turn, executing hosted tools.
     /// `turn.requested_model` must be set; `turn.model` is filled here.
     pub async fn run(self: &Arc<Self>, mut turn: TurnRequest) -> Result<TurnStream, GatewayError> {
+        if let Some(retry) = self.gate.as_ref().and_then(|gate| gate()) {
+            return Err(GatewayError::new(ErrorKind::Overloaded,
+                format!("a benchmark is running on this server; retry in about {retry} s")));
+        }
         turn.model = self.models.resolve(&turn.requested_model)?;
         let usage = turn.usage.clone();
         if let Some(usage) = &usage { usage.served_model(&turn.model); }
@@ -84,10 +136,13 @@ impl Gateway {
 /// the shared model listing. Merge it beside the chat-completions router, or
 /// serve it alone with an upstream backend (`cuteafd gateway`).
 pub fn router(gateway: Arc<Gateway>) -> Router {
-    Router::new()
-        .merge(anthropic::routes(gateway.clone()))
+    let sockets = Router::new()
         .merge(responses::routes(gateway.clone()))
         .merge(realtime::routes(gateway.clone()))
+        .layer(axum::middleware::from_fn_with_state(gateway.clone(), websocket_origin));
+    Router::new()
+        .merge(anthropic::routes(gateway.clone()))
+        .merge(sockets)
         .merge(models_routes(gateway))
         // Claude Code's connectivity probe; outside /v1, so no key needed.
         .route("/api/hello", axum::routing::get(|| async { axum::http::StatusCode::OK }))
@@ -106,12 +161,17 @@ fn models_routes(gateway: Arc<Gateway>) -> Router {
         } else { error.openai_response() })
     }
     use serde_json::{json, Value};
-    fn entry(model: &ModelInfo) -> Value {
-        json!({"id": model.id, "object": "model", "type": "model", "display_name": model.id,
+    fn entry(model: &ModelInfo, metadata: Option<&Value>) -> Value {
+        let mut entry = json!({"id": model.id, "object": "model", "type": "model", "display_name": model.id,
             "created": 0, "created_at": "1970-01-01T00:00:00Z", "owned_by": model.owned_by,
             "context_window": model.context_tokens, "max_output_tokens": model.max_output_tokens,
             "max_input_tokens": model.context_tokens, "max_tokens": model.max_output_tokens,
-            "capabilities": null, "lifecycle": "active", "deprecated_at": null, "retires_at": null, "line": null})
+            "capabilities": null, "lifecycle": "active", "deprecated_at": null, "retires_at": null, "line": null});
+        // Engine metadata (chat-route fields) for every id that runs the served model.
+        if let (Some(entry), Some(Value::Object(extra))) = (entry.as_object_mut(), metadata) {
+            for (key, value) in extra { if key != "id" { entry.insert(key.clone(), value.clone()); } }
+        }
+        entry
     }
     async fn list(State(gateway): State<Arc<Gateway>>, headers: HeaderMap, page: Result<Query<Page>, axum::extract::rejection::QueryRejection>) -> Response {
         let page = match page { Ok(Query(page)) => page, Err(_) => return error_response(GatewayError::invalid("invalid model pagination parameters"), &headers) };
@@ -136,7 +196,8 @@ fn models_routes(gateway: Arc<Gateway>) -> Router {
         let has_more = end - start > limit;
         if before { start = end.saturating_sub(limit).max(start); } else { end = (start + limit).min(end); }
         let page = &models[start..end];
-        let data: Vec<Value> = page.iter().map(entry).collect();
+        let metadata = gateway.backend.model_metadata();
+        let data: Vec<Value> = page.iter().map(|model| entry(model, metadata.as_ref())).collect();
         anthropic::with_request_id(Json(json!({"object": "list", "data": data, "has_more": has_more,
             "first_id": page.first().map(|m| m.id.clone()), "last_id": page.last().map(|m| m.id.clone())})).into_response())
     }
@@ -145,7 +206,7 @@ fn models_routes(gateway: Arc<Gateway>) -> Router {
             Ok(served) => {
                 let listing = gateway.models.listing(&gateway.backend.models());
                 let base = listing.iter().find(|m| m.id == served).cloned().unwrap_or_else(|| listing[0].clone());
-                anthropic::with_request_id(Json(entry(&ModelInfo { id, ..base })).into_response())
+                anthropic::with_request_id(Json(entry(&ModelInfo { id, ..base }, gateway.backend.model_metadata().as_ref())).into_response())
             }
             Err(error) => error_response(error, &headers),
         }

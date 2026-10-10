@@ -95,7 +95,7 @@ pub(crate) async fn run(args: GatewayArgs) -> Result<()> {
     }
     secrets.extend(config.key.iter().cloned());
     if let Some(file) = &args.api_key_file { secrets.push(std::fs::read_to_string(file).context("read gateway API key file")?.trim().to_string()); }
-    let api = crate::shared::api::ApiArgs { api_key_file:args.api_key_file,enable_bench:false,usage:Some("off".into()),..Default::default() }.load()?;
+    let api = crate::shared::api::ApiArgs { api_key_file:args.api_key_file,enable_bench:false,usage:Some("off".into()),gateway:"off".into(),..Default::default() }.load()?;
     let backend = Arc::new(Upstream::new(config)?.discover().await);
     let mut models = if args.official_model_names || args.official_model_names_file.is_some() {
         ModelMap::official_names(args.model.clone())
@@ -107,6 +107,7 @@ pub(crate) async fn run(args: GatewayArgs) -> Result<()> {
     models.aliases.extend(args.aliases);
     models.listed.extend(args.listed);
     let mut gateway = Gateway::new(backend,models);
+    gateway.origins = gateway::OriginPolicy { key: api.gateway_auth().key, allowed: Vec::new() };
     let provider = if args.search == "none" { "none" }
         else if args.search == "exa" {
             let key = std::env::var("EXA_API_KEY").context("EXA_API_KEY is not set")?;

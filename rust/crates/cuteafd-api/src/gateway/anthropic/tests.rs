@@ -991,3 +991,15 @@ fn foreign_thinking_signature_is_kept() {
         Item::Reasoning { text: "edited".into(), signature: Some("EqQBCkYIBRgCKkA".into()) }
     );
 }
+
+#[test]
+fn claude_code_billing_header_is_not_part_of_the_system_prompt() {
+    let (turn, _) = super::request::parse(&json!({"model":"m","max_tokens":8,"messages":[{"role":"user","content":"hi"}],
+        "system":[{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.289.a4d; cc_entrypoint=sdk-cli;"},
+            {"type":"text","text":"You are a coding agent."}]}), true).unwrap();
+    assert_eq!(turn.system.as_deref(), Some("You are a coding agent."));
+    let (turn, _) = super::request::parse(&json!({"model":"m","max_tokens":8,"messages":[{"role":"user","content":"hi"}],
+        "system":[{"type":"text","text":"x-anthropic-billing-header: cc_version=1; cc_entrypoint=cli;\nKeep answers short."},
+            {"type":"text","text":"Use tools."}]}), true).unwrap();
+    assert_eq!(turn.system.as_deref(), Some("Keep answers short.\nUse tools."), "instructions after the header line stay");
+}

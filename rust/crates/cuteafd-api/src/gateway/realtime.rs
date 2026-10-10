@@ -634,6 +634,7 @@ impl Connection {
         } else {
             let gateway = self.gateway.clone();
             let stream = async_stream::try_stream! {
+                tracing::info!(protocol = "realtime", transport = "websocket", items = turn.items.len(), "gateway turn");
                 let mut upstream=gateway.run(turn).await?;
                 while let Some(event)=upstream.next().await {yield event?;}
             };

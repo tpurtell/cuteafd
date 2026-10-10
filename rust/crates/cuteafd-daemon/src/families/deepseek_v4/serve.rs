@@ -93,7 +93,7 @@ pub(crate) async fn run_serve(args: ServeArgs) -> Result<()> {
     let limits = NativeLimits::new(u32::try_from(max_context)?, args.max_output)?;
     cuteafd_bench::context::phase("engine loaded");
     let router = cuteafd_api::openai::router_for_model(queue, limits, stats, Duration::from_secs(25),
-        hub.clone(), crate::shared::api::profile(profile.clone()));
+        hub.clone(), api.serve(profile.clone(), &args.engine.snapshot)?);
     let listener = tokio::net::TcpListener::bind(&args.listen).await?;
     cuteafd_bench::ready(&listener);
     tracing::info!(listen = %args.listen, model = %profile.id, "DeepSeek V4 API is ready");

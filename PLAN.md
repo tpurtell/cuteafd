@@ -3453,6 +3453,32 @@ work/p0:
    (reusing each family's chat template and tool syntax) and submits
    `NativeRequest`. Gate it on golden NLL / byte-exact replies against the
    chat path.
+   **Done (work/api-b1, 2026-10-10):**
+   - `openai/engine.rs` maps a turn onto the chat body, which runs through
+     the chat route's own build/submit pipeline. Each source assistant turn
+     becomes one chat assistant message.
+   - System items follow each template's placement rule, probed at startup.
+     For Qwen 3.8, leading system items merge and later ones become user
+     turns.
+   - Every serving family mounts the gateway by default (`--gateway off`
+     drops it). Official model names are on by default.
+   - Gates on Qwen 3.8 EXL3 1 RTX passed:
+     - identical prompt hashes and outputs across Chat, Messages and
+       Responses (plain, tool, image; thinking off and on);
+     - Claude Code and Codex (Responses WebSocket) complete a read, edit
+       and test task.
+   - Follow-ups from the final review:
+     - Fold choices: reasoning blocks of one turn concatenate with no
+       separator, and text after a call is rendered before it (chat has no
+       slot after calls).
+     - Strict function tools are refused until the structured-output probe
+       passes; the Agents SDK defaults to strict, so it needs the probe or a
+       non-strict opt-out.
+     - Images inside a `tool_result` on text-only models fail on the chat
+       path's media guard instead of degrading to text.
+     - The review's test gaps: Realtime turns through the engine backend,
+       MiMo audio over Realtime, hosted search rounds end to end on
+       hardware, and `count_tokens` for encoder-prepared media.
 2. Add session-aware prefix-cache hooks: fork through `PrefixCache` marks,
    pin and evict by session, and `RecomputeFrom` mapped to token positions.
 3. Add steer-inject between decode steps, then mid-prefill injection.
