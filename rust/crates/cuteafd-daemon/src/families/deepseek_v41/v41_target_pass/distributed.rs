@@ -478,9 +478,7 @@ impl<'w, 'a> DistributedTargetPass<'w, 'a> {
         }
         for layer in stage.windows() {
             if let Some(flow) = &flow {
-                if let Some(previous) = flow.predecessor {
-                    previous[layer].notified().await;
-                }
+                flow.permit.wait_predecessor(layer).await;
                 ensure!((flow.keep_running)(), "client disconnected");
             }
             let gpu = self.map.attention(layer)?;
@@ -716,8 +714,8 @@ impl<'w, 'a> DistributedTargetPass<'w, 'a> {
                     self.publish_encoder_layer(requests, guard.batch, layer)
                         .await?;
                 }
-                if let Some(next) = flow.as_ref().and_then(|flow| flow.successor) {
-                    next[layer].notify_one();
+                if let Some(flow) = &flow {
+                    flow.permit.publish(layer);
                 }
             }
         }
@@ -725,9 +723,7 @@ impl<'w, 'a> DistributedTargetPass<'w, 'a> {
             let gpu = self.map.attention(19)?;
             let device = self.lanes[gpu].device;
             if let Some(flow) = &flow {
-                if let Some(previous) = flow.previous_commit {
-                    previous.notified().await;
-                }
+                flow.permit.wait_commit_turn().await;
                 ensure!((flow.keep_running)(), "client disconnected");
                 let mut suffix = flow.suffix.borrow_mut();
                 ensure!(suffix.device.id == device.id, "encoder suffix GPU differs");

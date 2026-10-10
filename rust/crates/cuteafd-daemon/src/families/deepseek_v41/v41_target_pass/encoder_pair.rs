@@ -1,6 +1,6 @@
 use super::*;
+use crate::shared::prefill_pipeline::{ChunkPermit, PipelineOrder};
 use std::cell::RefCell;
-use tokio::sync::Notify;
 
 struct EncoderGuard<'r, 'a, const N: usize> {
     requests: &'r mut Requests<'a>,
@@ -32,7 +32,7 @@ impl<'w, 'a> TargetPass<'w, 'a> {
         unsafe { guard.requests.begin_input(batch, &mut self.embedding, &mut self.lane)?; }
         {
             let requests = RefCell::new(&mut *guard.requests);
-            unsafe { self.execute_encoder_chunk(&requests, batch, transport, None, None).await?; }
+            unsafe { self.execute_encoder_chunk(&requests, batch, transport, None).await?; }
         }
         suffix.capture(&self.lane.output()?)?;
         self.lane.advance()?;
@@ -69,11 +69,13 @@ impl<'w, 'a> TargetPass<'w, 'a> {
             // These futures are polled on the CUDA owner. Cache borrows are
             // synchronous and never retained through an await or an FFN.
             let requests = RefCell::new(&mut *guard.requests);
-            let published: [Notify; 20] = std::array::from_fn(|_| Notify::new());
+            let order = PipelineOrder::new(2, 20);
+            let first_permit = order.chunk(0);
+            let second_permit = order.chunk(1);
             tokio::try_join!(
                 biased;
-                unsafe { self.execute_encoder_chunk(&requests, first, transport0, None, Some(&published)) },
-                unsafe { other.execute_encoder_chunk(&requests, second, transport1, Some(&published), None) },
+                unsafe { self.execute_encoder_chunk(&requests, first, transport0, Some(&first_permit)) },
+                unsafe { other.execute_encoder_chunk(&requests, second, transport1, Some(&second_permit)) },
             )?;
         }
         for (pass, batch) in [(&mut *self, &mut **first), (&mut *other, &mut **second)] {
@@ -94,17 +96,16 @@ impl<'w, 'a> TargetPass<'w, 'a> {
     /// their lane output until the caller captures and commits them in order.
     pub(super) async unsafe fn execute_encoder_chunk(&mut self,
         requests: &RefCell<&mut Requests<'a>>, batch: &mut RequestBatch,
-        transport: &mut NativeTp4Wave<'a>, predecessor: Option<&[Notify; 20]>,
-        successor: Option<&[Notify; 20]>,
+        transport: &mut NativeTp4Wave<'a>, permit: Option<&ChunkPermit<'_>>,
     ) -> Result<()> {
         for layer in 0..20 {
-            if let Some(published) = predecessor { published[layer].notified().await; }
+            if let Some(permit) = permit { permit.wait_predecessor(layer).await; }
             unsafe { self.prepare_encoder_query(requests, batch, layer).await?; }
             let prepared = unsafe { requests.borrow_mut().prepare_encoder_layer(batch,
                 &mut self.execution, &mut self.lane, &mut self.index)? };
             // prepare_encoder_layer finishes the attention readers and publishes
             // this layer's window/source before releasing the cache borrow.
-            if let Some(published) = successor { published[layer].notify_one(); }
+            if let Some(permit) = permit { permit.publish(layer); }
             let done = unsafe { prepared.execute(transport, 0, batch.image_mask()).await? };
             unsafe { self.execution.complete_layer(batch.cache()?, &mut self.lane, done)?; }
         }

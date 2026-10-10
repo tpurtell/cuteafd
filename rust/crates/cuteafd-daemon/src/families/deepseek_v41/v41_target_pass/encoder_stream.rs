@@ -2,9 +2,9 @@
 use super::*;
 use crate::families::deepseek_v41::v41_backbone_cache::CacheLease;
 use crate::families::deepseek_v41::v41_requests::RequestTokens;
+use crate::shared::prefill_pipeline::PipelineOrder;
 use cuteafd_transport::ExpertV2SourceKind;
 use std::cell::RefCell;
-use tokio::sync::Notify;
 
 struct ChunkGuard<'r, 'q, 'w, 'a> {
     pass: &'r mut TargetPass<'w, 'a>,
@@ -55,17 +55,14 @@ impl<'w, 'a> TargetPass<'w, 'a> {
         ensure!(!chunks.is_empty(), "empty encoder stream");
         let requests = RefCell::new(requests);
         let suffix = RefCell::new(suffix);
-        let published: Vec<[Notify; 20]> = (0..chunks.len())
-            .map(|_| std::array::from_fn(|_| Notify::new())).collect();
-        let reserved: Vec<Notify> = (0..chunks.len()).map(|_| Notify::new()).collect();
-        let committed: Vec<Notify> = (0..chunks.len()).map(|_| Notify::new()).collect();
+        let order = PipelineOrder::new(chunks.len(), 20);
         let [first, second] = transports;
         tokio::try_join!(
             biased;
             unsafe { self.encoder_stream_lane(0, &requests, lease, chunks, first, &suffix,
-                &published, &reserved, &committed, keep_running, before_chunk) },
+                &order, keep_running, before_chunk) },
             unsafe { other.encoder_stream_lane(1, &requests, lease, chunks, second, &suffix,
-                &published, &reserved, &committed, keep_running, before_chunk) },
+                &order, keep_running, before_chunk) },
         )?;
         Ok(())
     }
@@ -73,19 +70,19 @@ impl<'w, 'a> TargetPass<'w, 'a> {
     async unsafe fn encoder_stream_lane(&mut self, parity: usize,
         requests: &RefCell<&mut Requests<'a>>, lease: CacheLease, chunks: &[&[u32]],
         transport: &mut NativeTp4Wave<'a>, suffix: &RefCell<&mut EncoderSuffix<'a>>,
-        published: &[[Notify; 20]], reserved: &[Notify], committed: &[Notify],
+        order: &PipelineOrder,
         keep_running: &dyn Fn() -> bool, before_chunk: &dyn Fn() -> Result<()>,
     ) -> Result<()> {
         for index in (parity..chunks.len()).step_by(2) {
-            if index != 0 { reserved[index - 1].notified().await; }
+            let permit = order.wait_reserve_turn(index).await;
             ensure!(keep_running(), "client disconnected");
             before_chunk()?;
-            let chunk = chunks[index];
+            let chunk = chunks[permit.index()];
             let batch = requests.borrow_mut().reserve_encoder(&[RequestTokens {
                 lease, tokens: chunk, image_mask: None, kind: ExpertV2SourceKind::Prefill,
             }])?;
             let mut guard = ChunkGuard { pass: self, requests, batch, complete: false };
-            reserved[index].notify_one();
+            permit.mark_reserved();
             let started = Instant::now();
             let pass = &mut *guard.pass;
             let batch = &mut guard.batch;
@@ -94,11 +91,10 @@ impl<'w, 'a> TargetPass<'w, 'a> {
             pass.lane.restart()?; pass.index.restart()?; pass.taps.reset();
             unsafe { requests.borrow_mut().begin_input(batch, &mut pass.embedding, &mut pass.lane)?; }
             unsafe { pass.execute_encoder_chunk(requests, batch, transport,
-                index.checked_sub(1).map(|i| &published[i]),
-                (index + 1 < chunks.len()).then_some(&published[index])).await?; }
+                Some(&permit)).await?; }
             // A following chunk may finish first. Retain its output until its
             // predecessor's suffix, source-20 boundary and histories are committed.
-            if index != 0 { committed[index - 1].notified().await; }
+            permit.wait_commit_turn().await;
             ensure!(keep_running(), "client disconnected");
             suffix.borrow_mut().capture(&pass.lane.output()?)?;
             pass.lane.advance()?;
@@ -109,7 +105,7 @@ impl<'w, 'a> TargetPass<'w, 'a> {
             pass.state = State::Encoded(batch.cache()?.identity());
             pass.commit(&mut requests.borrow_mut(), batch, &[chunk.len() as u32])?;
             guard.complete = true;
-            committed[index].notify_one();
+            permit.commit();
             crate::families::deepseek_v41::v41_native_serve::console::totals::prefill(chunk.len());
             crate::families::deepseek_v41::v41_native_serve::console::Prefill::done(crate::families::deepseek_v41::v41_native_serve::console::PrefillKind::Chunk,
                 parity, index, chunks.len(), chunk.len(), started);
