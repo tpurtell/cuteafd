@@ -218,7 +218,9 @@ def test_publish_dry_run_names_only_approved_tags(tmp_path):
 
 def test_label_mismatch_never_pushes(tmp_path):
     repo, env, log = fixture_repo(tmp_path)
-    result = launch(repo, {**env, 'LABEL_HASH': 'wrong'}, '--publish')
+    # Sequential: the coordinator leg reports the mismatch before the expert leg can
+    # win the failure race with its generic leg-failed message.
+    result = launch(repo, {**env, 'LABEL_HASH': 'wrong', 'CUTEAFD_DEV_IMAGE_SEQUENTIAL': '1'}, '--publish')
     assert result.returncode != 0 and 'toolchain label mismatch' in result.stderr
     assert 'docker push' not in log.read_text()
 
