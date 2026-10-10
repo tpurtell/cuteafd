@@ -64,6 +64,14 @@ impl RoundRoutes {
         self.filled[layer] = true;
         Ok(())
     }
+    /// A dense (unrouted) layer this round: its ids stay zero and the policy
+    /// never prices it (its geometry class is `None`).
+    #[allow(dead_code, reason = "D2: GLM Flash's leading dense layers")]
+    pub fn dense(&mut self, layer: usize) -> Result<(), RouteError> {
+        if layer >= self.layers { return Err(RouteError::Layer(layer)); }
+        self.filled[layer] = true;
+        Ok(())
+    }
     /// Replace the round with a whole `[layer][row][slot]` capture of `rows`
     /// rows; every layer must be present with exactly `rows` rows.
     pub fn fill<const K: usize>(&mut self, capture: &[Vec<[u32; K]>], rows: usize, mask: u32)
@@ -111,6 +119,14 @@ mod tests {
         let mut whole = RoundRoutes::new(2, 3);
         whole.fill(&[vec![[7, 8, 9], [10, 11, 12]], vec![[1, 2, 3], [4, 5, 6]]], 2, 511).unwrap();
         assert_eq!(whole.flat(), routes.flat());
+        // A dense layer completes the round with zero ids.
+        let mut dense = RoundRoutes::new(2, 3);
+        dense.begin(2);
+        dense.dense(0).unwrap();
+        dense.push(1, &[1, 2, 3, 4, 5, 6], 511).unwrap();
+        dense.complete().unwrap();
+        assert_eq!(dense.flat()[..6], [0; 6]);
+        assert_eq!(dense.dense(2), Err(RouteError::Layer(2)));
         // A new round clears every layer.
         routes.begin(1);
         assert_eq!((routes.complete(), routes.flat().len()), (Err(RouteError::Missing(0)), 6));
