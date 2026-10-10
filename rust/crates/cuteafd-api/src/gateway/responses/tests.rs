@@ -1286,6 +1286,8 @@ async fn websocket_continuation_keeps_additional_tools() {
         assert_eq!(turn.tools.iter().map(|t| t.name.as_str()).collect::<Vec<_>>(), vec!["functions.exec"], "tools on every turn");
     }
     ws.close(None).await.unwrap();
+    server.abort();
+}
 
 /// Full-log capture through the Messages and Responses front ends (HTTP and WebSocket).
 #[tokio::test]
@@ -1329,12 +1331,12 @@ async fn full_log_captures_messages_responses_and_websocket_turns() {
         }
     }).await.unwrap();
     let logs = tape.0.lock().unwrap().clone();
-    let turns = logs.iter().filter(|l| l.meta.protocol == "responses" && l.meta.route == "/v1/responses" && matches!(l.response, crate::usage_log::ResponsePayload::Object(_))).count();
+    let turns = logs.iter().filter(|l| l.meta.protocol == "responses" && l.meta.route == "/v1/responses" && matches!(l.response, crate::usage_log::ResponsePayload::Value(_))).count();
     assert_eq!(turns, 2, "one log record per WebSocket turn");
     for (i, l) in logs.iter().enumerate().skip(2) {
         assert_eq!(tape.request(i)["type"], "response.create");
-        let crate::usage_log::ResponsePayload::Object(b) = &l.response else { panic!("turn response") };
-        assert_eq!(serde_json::from_slice::<Value>(b).unwrap()["status"], "completed");
+        let crate::usage_log::ResponsePayload::Value(v) = &l.response else { panic!("turn response") };
+        assert_eq!(v["status"], "completed");
     }
     server.abort();
 }

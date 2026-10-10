@@ -49,6 +49,7 @@ pub struct LogStore {
     reader: Mutex<Connection>,
     dir: Option<PathBuf>,
     clock: Arc<dyn Clock>,
+    secrets: Arc<ArcSwap<Vec<String>>>,
 }
 
 pub(crate) fn on(s: &Settings) -> bool {
@@ -65,9 +66,9 @@ CREATE TABLE IF NOT EXISTS entries(
   items BLOB NOT NULL, response BLOB, response_id TEXT,
   client TEXT, model TEXT, session_id TEXT, session_source TEXT, bench INTEGER NOT NULL DEFAULT 0,
   status INTEGER, outcome TEXT, title TEXT, meta BLOB NOT NULL,
-  bytes INTEGER NOT NULL, truncated INTEGER NOT NULL);
+  bytes INTEGER NOT NULL, truncated INTEGER NOT NULL, scope TEXT NOT NULL DEFAULT '');
 CREATE INDEX IF NOT EXISTS entries_ts ON entries(ts_ms);
-CREATE INDEX IF NOT EXISTS entries_chain ON entries(chain);
+CREATE INDEX IF NOT EXISTS entries_chain ON entries(chain, scope);
 CREATE INDEX IF NOT EXISTS entries_parent ON entries(parent_rid) WHERE parent_rid IS NOT NULL;
 CREATE INDEX IF NOT EXISTS entries_vsid ON entries(vsid, ts_ms);
 CREATE INDEX IF NOT EXISTS entries_session ON entries(session_id, ts_ms) WHERE session_id IS NOT NULL;
@@ -92,7 +93,17 @@ impl LogStore {
             .unwrap_or_else(|| format!("file:usage-log-{}?mode=memory&cache=shared", uuid::Uuid::new_v4()));
         let c = Connection::open(&uri)?;
         c.busy_timeout(Duration::from_millis(2000))?;
+        c.execute_batch("PRAGMA secure_delete=ON;")?;
+        // Entries from an earlier layout lack the chain scope; they cannot be matched safely.
+        let scoped = c.prepare("PRAGMA table_info(entries)")?.query_map([], |r| r.get::<_, String>(1))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        if !scoped.is_empty() && !scoped.iter().any(|n| n == "scope") {
+            c.execute_batch("DROP TABLE entries; DROP TABLE IF EXISTS entry_media;")?;
+        }
         c.execute_batch(SCHEMA)?;
+        if let Some(dir) = directory {
+            crate::store::private_files(dir, "usage-log.sqlite");
+        }
         let reader = if path.is_some() {
             Connection::open_with_flags(&uri, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?
         } else {
@@ -103,6 +114,7 @@ impl LogStore {
         let bytes = Arc::new(AtomicUsize::new(0));
         let enabled = Arc::new(AtomicBool::new(on(&settings.load())));
         let dir = directory.map(Path::to_path_buf);
+        let secrets = Arc::new(ArcSwap::from_pointee(Vec::new()));
         let store = Arc::new(Self {
             tx,
             bytes: bytes.clone(),
@@ -112,6 +124,7 @@ impl LogStore {
             reader: Mutex::new(reader),
             dir: dir.clone(),
             clock: clock.clone(),
+            secrets: secrets.clone(),
         });
         let s = settings.load();
         if on(&s) {
@@ -124,7 +137,7 @@ impl LogStore {
         } else {
             tracing::info!("usage full log off");
         }
-        let mut writer = Writer { c, dir, settings, counters, clock };
+        let mut writer = Writer { c, dir, settings, counters, clock, secrets };
         writer.update_bytes();
         std::thread::Builder::new()
             .name("usage-log-writer".into())
@@ -138,6 +151,10 @@ impl LogStore {
     }
     pub fn flush(&self) -> Result<()> {
         self.command(Command::Flush)
+    }
+    /// Server secrets (the API key, the console secret) scrubbed from every payload.
+    pub fn set_secrets(&self, secrets: Vec<String>) {
+        self.secrets.store(Arc::new(secrets));
     }
     pub fn clear(&self) -> Result<()> {
         self.command(Command::Clear)
@@ -216,6 +233,7 @@ struct Writer {
     settings: Arc<ArcSwap<Settings>>,
     counters: Arc<Counters>,
     clock: Arc<dyn Clock>,
+    secrets: Arc<ArcSwap<Vec<String>>>,
 }
 
 /// The stored shape of one entry, before insert.
@@ -296,41 +314,78 @@ impl Writer {
         Ok(Some(h))
     }
 
-    /// Stores media bytes once per hash; returns nothing, the entry links by hash.
-    fn store_media(&self, media: &[redact::Media], keep_bytes: bool) -> Result<()> {
+    /// Records media rows inside the entry's transaction; returns the blobs whose
+    /// files must be written once that transaction commits.
+    fn record_media<'m>(&self, media: &'m [redact::Media], keep_bytes: bool) -> Result<Vec<&'m redact::Media>> {
+        let keep = keep_bytes && self.dir.is_some();
+        let mut pending = vec![];
         for m in media {
             let ext = redact::extension(&m.mime);
-            let exists: Option<i64> = self
+            let exists: Option<bool> = self
                 .c
                 .query_row("SELECT stored FROM media WHERE sha256=?1", [&m.sha256], |r| r.get(0))
                 .optional()?;
-            if exists == Some(1) || (exists == Some(0) && !keep_bytes) {
+            if exists == Some(true) || (exists == Some(false) && !keep) {
                 continue;
-            }
-            let mut stored = false;
-            if keep_bytes {
-                if let Some(dir) = &self.dir {
-                    let path = media_path(dir, &m.sha256, ext);
-                    let written = (|| -> std::io::Result<()> {
-                        let parent = path.parent().expect("media file has a parent");
-                        std::fs::create_dir_all(parent)?;
-                        if !path.exists() {
-                            let tmp = parent.join(format!(".{}.tmp", m.sha256));
-                            std::fs::write(&tmp, &m.bytes)?;
-                            std::fs::rename(&tmp, &path)?;
-                        }
-                        Ok(())
-                    })();
-                    match written {
-                        Ok(()) => stored = true,
-                        Err(e) => tracing::error!(error = %e, "usage media write failed; keeping a reference only"),
-                    }
-                }
             }
             self.c.execute(
                 "INSERT INTO media VALUES(?1,?2,?3,?4,?5) ON CONFLICT(sha256) DO UPDATE SET stored=excluded.stored, ext=excluded.ext",
-                params![m.sha256, m.mime, ext, m.bytes.len() as i64, stored],
+                params![m.sha256, m.mime, ext, m.bytes.len() as i64, keep],
             )?;
+            if keep {
+                pending.push(m);
+            }
+        }
+        Ok(pending)
+    }
+
+    /// Writes committed media files (0600 in 0700 directories); a failed write
+    /// downgrades the row to a reference.
+    fn write_media(&self, pending: &[&redact::Media]) {
+        let Some(dir) = &self.dir else { return };
+        for m in pending {
+            let path = media_path(dir, &m.sha256, redact::extension(&m.mime));
+            let written = (|| -> std::io::Result<()> {
+                use std::io::Write;
+                use std::os::unix::fs::OpenOptionsExt;
+                let parent = path.parent().expect("media file has a parent");
+                crate::store::private_dir(&dir.join("media"))?;
+                crate::store::private_dir(parent)?;
+                if !path.exists() {
+                    let tmp = parent.join(format!(".{}.tmp", m.sha256));
+                    let mut f = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&tmp)?;
+                    f.write_all(&m.bytes)?;
+                    f.sync_data()?;
+                    std::fs::rename(&tmp, &path)?;
+                }
+                Ok(())
+            })();
+            if let Err(e) = written {
+                tracing::error!(error = %e, "usage media write failed; keeping a reference only");
+                let _ = self.c.execute("UPDATE media SET stored=0 WHERE sha256=?1", [&m.sha256]);
+            }
+        }
+    }
+
+    /// Deletes files under `media/` that no stored row accounts for (a crash
+    /// between commit and write, or files from a cleared store).
+    fn sweep_media(&self) -> Result<()> {
+        let Some(dir) = &self.dir else { return Ok(()) };
+        let Ok(top) = std::fs::read_dir(dir.join("media")) else { return Ok(()) };
+        for sub in top.flatten() {
+            let Ok(files) = std::fs::read_dir(sub.path()) else { continue };
+            for f in files.flatten() {
+                let name = f.file_name().to_string_lossy().into_owned();
+                let sha = name.split('.').next().unwrap_or("");
+                let tracked: Option<String> = self
+                    .c
+                    .query_row("SELECT ext FROM media WHERE sha256=?1 AND stored=1", [sha], |r| r.get(0))
+                    .optional()?;
+                if tracked.is_none_or(|ext| name != format!("{sha}.{ext}")) {
+                    let _ = std::fs::remove_file(f.path());
+                }
+            }
+            let _ = std::fs::remove_dir(sub.path());
         }
         Ok(())
     }
@@ -338,10 +393,11 @@ impl Writer {
     fn write(&mut self, r: &LogRecord) -> Result<bool> {
         let meta = &r.meta;
         let protocol = meta.protocol.as_str();
-        let request_bytes: Vec<u8> = r.request.iter().flat_map(|b| b.iter().copied()).collect();
-        let mut redactor = redact::Redactor::new();
-        let mut request = fold::parse(&request_bytes);
-        drop(request_bytes);
+        let mut redactor = redact::Redactor::with_secrets(&self.secrets.load());
+        let mut request = match &r.request_value {
+            Some(v) => v.clone(),
+            None => fold::parse(&r.request.iter().flat_map(|b| b.iter().copied()).collect::<Vec<u8>>()),
+        };
         redactor.redact(&mut request);
         let mut response = fold::fold(protocol, &r.response);
         redactor.redact(&mut response);
@@ -351,7 +407,15 @@ impl Writer {
         let chain = chain_hash(&hashes);
         let settings = self.settings.load();
 
-        let entry = self.place(meta, protocol, &split, &hashes)?;
+        // A request too large to store whole starts its own chain position.
+        let oversized = split.items.iter().map(|v| v.to_string().len()).sum::<usize>() > ENTRY_CAP
+            || split.items.iter().any(has_long_string);
+        let entry = if oversized {
+            Placement::Entry(Entry { kind: "base", vsid: meta.rid.clone(), parent: None, parent_count: None,
+                divergence: None, diverged_from: None, title: None, stored_items: split.items.clone() })
+        } else {
+            self.place(meta, protocol, &split, &hashes)?
+        };
         let (entry, full_hashes) = match entry {
             Placement::Chained { parent, parent_full, vsid, title } => {
                 let all = [parent_full.as_slice(), hashes.as_slice()].concat();
@@ -390,9 +454,9 @@ impl Writer {
         let bytes = items.len() + response_bytes.as_ref().map_or(0, Vec::len) + meta_bytes.len();
         let hash_blob = full_hashes.iter().flatten().copied().collect::<Vec<u8>>();
         let tx = self.c.unchecked_transaction()?;
-        self.store_media(&redactor.media, settings.log_media)?;
+        let pending = self.record_media(&redactor.media, settings.log_media)?;
         tx.execute(
-            "INSERT OR REPLACE INTO entries VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27,?28,?29)",
+            "INSERT OR REPLACE INTO entries VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27,?28,?29,?30)",
             params![
                 meta.rid, meta.ts_ms, protocol, entry.vsid, entry.kind, entry.parent,
                 entry.parent_count.map(|n| n as i64), entry.divergence.map(|n| n as i64), entry.diverged_from,
@@ -400,7 +464,7 @@ impl Writer {
                 items, response_bytes, normalize::response_id(protocol, &response),
                 meta.client_kind, meta.model_served.as_ref().or(meta.model_requested.as_ref()),
                 meta.session_id, meta.session_source, meta.bench, meta.status, meta.outcome, title,
-                meta_bytes, bytes as i64, truncated
+                meta_bytes, bytes as i64, truncated, scope_of(meta)
             ],
         )?;
         let mut refs = vec![];
@@ -412,6 +476,7 @@ impl Writer {
             }
         }
         tx.commit()?;
+        self.write_media(&pending);
         Ok(true)
     }
 
@@ -423,17 +488,16 @@ impl Writer {
         split: &Split,
         hashes: &[[u8; 8]],
     ) -> Result<Placement> {
-        let same_session = |other: &Option<String>| match (&meta.session_id, other) {
-            (Some(a), Some(b)) => a == b,
-            _ => true,
-        };
+        // Chains never cross clients, API keys or sessions (no session matches only no session),
+        // and never extend a truncated entry, whose elided items cannot be rebuilt.
+        let scope = scope_of(meta);
         // 1. Responses `previous_response_id`: the parent's history plus its output.
         if let Some(previous) = &split.previous {
             let row = self
                 .c
                 .query_row(
-                    "SELECT rid, vsid, title, response FROM entries WHERE response_id=?1 ORDER BY ts_ms DESC LIMIT 1",
-                    [previous],
+                    "SELECT rid, vsid, title, response FROM entries WHERE response_id=?1 AND scope=?2 AND truncated=0 ORDER BY ts_ms DESC LIMIT 1",
+                    [previous, &scope],
                     |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, Option<String>>(2)?, r.get::<_, Option<Vec<u8>>>(3)?)),
                 )
                 .optional()?;
@@ -455,17 +519,14 @@ impl Writer {
         for chunk in prefixes.chunks(400) {
             let marks = vec!["?"; chunk.len()].join(",");
             let mut stmt = self.c.prepare_cached(&format!(
-                "SELECT rid, vsid, n_items, session_id, title FROM entries WHERE protocol=? AND chain IN ({marks}) ORDER BY ts_ms DESC"
+                "SELECT rid, vsid, n_items, session_id, title FROM entries WHERE protocol=? AND scope=? AND truncated=0 AND chain IN ({marks}) ORDER BY ts_ms DESC"
             ))?;
-            let args = std::iter::once(protocol.to_owned()).chain(chunk.iter().cloned());
+            let args = [protocol.to_owned(), scope.clone()].into_iter().chain(chunk.iter().cloned());
             let rows = stmt.query_map(params_from_iter(args), |r| {
                 Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)? as usize, r.get::<_, Option<String>>(3)?, r.get::<_, Option<String>>(4)?))
             })?;
             for row in rows {
-                let (rid, vsid, n, session, title) = row?;
-                if !same_session(&session) {
-                    continue;
-                }
+                let (rid, vsid, n, _session, title) = row?;
                 let better = match &best {
                     None => true,
                     Some((m, ..)) => n > *m,
@@ -513,10 +574,7 @@ impl Writer {
             }));
         }
         // 3. Edited, truncated or spliced history: the closest recent entry by common prefix.
-        let (sql, arg) = match &meta.session_id {
-            Some(s) => ("SELECT rid, vsid, hashes, title FROM entries WHERE protocol=?1 AND session_id=?2 ORDER BY ts_ms DESC LIMIT 64", s.clone()),
-            None => ("SELECT rid, vsid, hashes, title FROM entries WHERE protocol=?1 AND client=?2 AND session_id IS NULL ORDER BY ts_ms DESC LIMIT 64", meta.client_kind.clone()),
-        };
+        let (sql, arg) = ("SELECT rid, vsid, hashes, title FROM entries WHERE protocol=?1 AND scope=?2 ORDER BY ts_ms DESC LIMIT 64", scope.clone());
         let need = if meta.session_id.is_some() { 1 } else { 2 };
         let mut stmt = self.c.prepare_cached(sql)?;
         let mut close: Option<(usize, String, String, Option<String>)> = None;
@@ -624,6 +682,7 @@ impl Writer {
             }
             self.c.execute("DELETE FROM media WHERE sha256=?1", [&sha])?;
         }
+        self.sweep_media()?;
         self.c.execute(
             "DELETE FROM blobs WHERE h NOT IN (SELECT system_h FROM entries WHERE system_h IS NOT NULL
              UNION SELECT tools_h FROM entries WHERE tools_h IS NOT NULL UNION SELECT settings_h FROM entries WHERE settings_h IS NOT NULL)",
@@ -666,6 +725,20 @@ impl Writer {
 enum Placement {
     Chained { parent: String, parent_full: Vec<[u8; 8]>, vsid: String, title: Option<String> },
     Entry(Entry),
+}
+
+/// Client kind, API key label and session: entries chain only within one scope.
+fn scope_of(meta: &cuteafd_api::usage::Record) -> String {
+    normalize::content_hash(&json!([meta.client_kind, meta.key_label, meta.session_id]))
+}
+
+fn has_long_string(v: &Value) -> bool {
+    match v {
+        Value::String(s) => s.len() > STRING_CAP,
+        Value::Array(a) => a.iter().any(has_long_string),
+        Value::Object(o) => o.values().any(has_long_string),
+        _ => false,
+    }
 }
 
 fn common_prefix(blob: &[u8], hashes: &[[u8; 8]]) -> usize {

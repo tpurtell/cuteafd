@@ -18,10 +18,14 @@ use std::{
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
+/// The engine's active request count, read from the live console without subscribing to it.
+pub type LiveCount = Arc<dyn Fn() -> Option<u64> + Send + Sync>;
+
 #[derive(Clone)]
 struct Http {
     store: Arc<Store>,
     cache: Arc<Mutex<HashMap<String, (Instant, Value)>>>,
+    live: Option<LiveCount>,
 }
 /// The usage dashboard, compiled in (`/usage`; the page itself is public, its data needs the cookie).
 pub const PAGE: &str = include_str!("../assets/usage.html");
@@ -36,12 +40,18 @@ async fn page() -> Response {
 }
 
 pub fn mount(router: Router, store: Arc<Store>, gate: ConsoleGate) -> Router {
+    mount_with_live(router, store, gate, None)
+}
+
+pub fn mount_with_live(router: Router, store: Arc<Store>, gate: ConsoleGate, live: Option<LiveCount>) -> Router {
     let state = Http {
         store,
         cache: Arc::new(Mutex::new(HashMap::new())),
+        live,
     };
     let routes = Router::new()
         .route("/console/usage/summary", get(summary))
+        .route("/console/usage/live", get(live_count))
         .route("/console/usage/series", get(series))
         .route("/console/usage/latency", get(latency))
         .route("/console/usage/flow", get(flow))
@@ -63,9 +73,27 @@ pub fn mount(router: Router, store: Arc<Store>, gate: ConsoleGate) -> Router {
         .route("/console/usage/log/clear", post(clear_log))
         .route("/console/usage/clear", post(clear))
         .with_state(state)
+        .layer(axum::middleware::from_fn(same_origin))
         .layer(axum::middleware::from_fn_with_state(gate, require_console));
     router.merge(routes).route("/usage", get(page))
 }
+/// Mutations need proof they come from the page itself, not a cross-site form:
+/// `Sec-Fetch-Site: same-origin`, an `Origin` matching `Host`, or the page's header.
+async fn same_origin(request: axum::extract::Request, next: axum::middleware::Next) -> Response {
+    let h = request.headers();
+    let mutating = !matches!(*request.method(), axum::http::Method::GET | axum::http::Method::HEAD);
+    let same = h.get("sec-fetch-site").is_some_and(|v| v == "same-origin")
+        || h.get("x-cuteafd-console").is_some_and(|v| v == "1")
+        || match (h.get("origin").and_then(|v| v.to_str().ok()), h.get("host").and_then(|v| v.to_str().ok())) {
+            (Some(origin), Some(host)) => origin.split_once("://").is_some_and(|(_, o)| o == host),
+            _ => false,
+        };
+    if mutating && !same {
+        return (StatusCode::FORBIDDEN, Json(json!({"error":{"type":"cross_origin","message":"console changes must come from the console page"}}))).into_response();
+    }
+    next.run(request).await
+}
+
 fn error(e: Error) -> Response {
     let status = if matches!(e, Error::Settings(_)) {
         StatusCode::BAD_REQUEST
@@ -201,6 +229,9 @@ async fn media(State(s): State<Http>, Path(sha256): Path<String>) -> Response {
         Err(_) => (StatusCode::NOT_FOUND, Json(json!({"error":{"type":"not_retained"}}))).into_response(),
     }
 }
+async fn live_count(State(s): State<Http>) -> Json<Value> {
+    Json(json!({"active": s.live.as_ref().and_then(|f| f())}))
+}
 fn settings_body(s: &Http) -> Value {
     json!({"settings":s.store.settings(),"usage":s.store.counters.snapshot(),"warning":"With the full log on, user prompts and model outputs (and, with media on, images and audio) are stored in plain text on this host for the retention period."})
 }
@@ -269,6 +300,30 @@ mod tests {
         }
     }
     #[tokio::test]
+    async fn mutations_refuse_cross_site_requests_and_data_is_never_cached() {
+        let f = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(f.path(), "d".repeat(64)).unwrap();
+        let gate = ConsoleGate::from_file(f.path(), false).unwrap();
+        let app = gate.mount(mount(Router::new(), Store::open(None).unwrap(), gate.clone()));
+        let r = app.clone().oneshot(Request::get(format!("/console/unlock?token={}", "d".repeat(64))).body(Body::empty()).unwrap()).await.unwrap();
+        let cookie = r.headers()["set-cookie"].to_str().unwrap().split(';').next().unwrap().to_owned();
+        let post = |extra: Option<(&'static str, &'static str)>| {
+            let mut r = Request::post("/console/usage/log/clear").header("cookie", &cookie).header("host", "box:8000");
+            if let Some((k, v)) = extra { r = r.header(k, v); }
+            app.clone().oneshot(r.body(Body::empty()).unwrap())
+        };
+        assert_eq!(post(None).await.unwrap().status(), StatusCode::FORBIDDEN);
+        assert_eq!(post(Some(("sec-fetch-site", "cross-site"))).await.unwrap().status(), StatusCode::FORBIDDEN);
+        assert_eq!(post(Some(("origin", "http://evil.example"))).await.unwrap().status(), StatusCode::FORBIDDEN);
+        assert_eq!(post(Some(("sec-fetch-site", "same-origin"))).await.unwrap().status(), StatusCode::OK);
+        assert_eq!(post(Some(("origin", "http://box:8000"))).await.unwrap().status(), StatusCode::OK);
+        assert_eq!(post(Some(("x-cuteafd-console", "1"))).await.unwrap().status(), StatusCode::OK);
+        for path in ["log", "log/rid", "settings"] {
+            let r = app.clone().oneshot(Request::get(format!("/console/usage/{path}")).header("cookie", &cookie).body(Body::empty()).unwrap()).await.unwrap();
+            assert_eq!(r.headers()["cache-control"], "no-store", "{path}");
+        }
+    }
+    #[tokio::test]
     async fn usage_page_is_public_and_settings_round_trip() {
         let f = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(f.path(), "c".repeat(64)).unwrap();
@@ -280,7 +335,7 @@ mod tests {
         let r = app.clone().oneshot(Request::get(format!("/console/unlock?token={}", "c".repeat(64))).body(Body::empty()).unwrap()).await.unwrap();
         let cookie = r.headers()["set-cookie"].to_str().unwrap().split(';').next().unwrap().to_owned();
         let call = |method: &str, body: String| {
-            app.clone().oneshot(Request::builder().method(method).uri("/console/usage/settings").header("cookie", &cookie)
+            app.clone().oneshot(Request::builder().method(method).uri("/console/usage/settings").header("cookie", &cookie).header("sec-fetch-site", "same-origin")
                 .header("content-type", "application/json").body(Body::from(body)).unwrap())
         };
         let read = |r: Response| async { serde_json::from_slice::<Value>(&axum::body::to_bytes(r.into_body(), 65536).await.unwrap()).unwrap() };
@@ -312,6 +367,7 @@ mod tests {
         let media = format!("media/{}", "a".repeat(64));
         for (method, path) in [
             ("GET", "summary"),
+            ("GET", "live"),
             ("GET", "series"),
             ("GET", "latency"),
             ("GET", "flow"),
@@ -394,6 +450,7 @@ mod tests {
             app.oneshot(
                 Request::post("/console/usage/clear")
                     .header("cookie", cookie)
+                    .header("x-cuteafd-console", "1")
                     .body(Body::empty())
                     .unwrap()
             )

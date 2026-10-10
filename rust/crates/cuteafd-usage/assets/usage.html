@@ -71,7 +71,8 @@ function params(extra = {}) {
   return new URLSearchParams(Object.entries(p).filter(([, v]) => v != null)).toString();
 }
 async function api(route, options = {}, query = true) {
-  const response = await fetch('/console/usage/' + route + (query ? '?' + params(options.query || {}) : ''), { credentials: 'same-origin', ...options });
+  const headers = { ...(options.headers || {}), 'x-cuteafd-console': '1' };
+  const response = await fetch('/console/usage/' + route + (query ? '?' + params(options.query || {}) : ''), { credentials: 'same-origin', ...options, headers });
   let body; try { body = await response.json(); } catch (_) { body = null; }
   if (!response.ok) { const error = new Error(body?.error?.message || (response.status === 401 ? LOCK : response.status === 404 ? 'Expired / not retained' : 'Usage route unavailable (' + response.status + ')')); error.status = response.status; throw error; }
   return body;
@@ -141,7 +142,8 @@ function renderOverview() {
   renderCounters(d.usage);
 }
 function renderCounters(d) { if (d) $('record-count').textContent = 'recorded ' + F.n0(d.recorded) + ' / dropped ' + F.n0(d.dropped); }
-async function stats() { try { const r = await fetch('/v1/stats'); if (r.ok) renderCounters((await r.json()).usage); } catch (_) {} }
+// Counters come from the cookie-gated settings route; /v1/stats needs the API key.
+async function stats() { try { const r = await fetch('/console/usage/settings', { credentials: 'same-origin' }); if (r.ok) renderCounters((await r.json()).usage); } catch (_) {} }
 function aggregate(rows) {
   const groups = new Map();
   for (const r of rows || []) { const a = groups.get(r.ts_ms) || { ts_ms: r.ts_ms, requests: 0, errors: 0, tokens_in: 0, tokens_cached: 0, tokens_out: 0, concurrency_max: 0, concurrency_sum: 0, weight: 0 };
@@ -446,7 +448,9 @@ $('requests-show-more').onclick = () => { S.requestRows += 10; renderRequests();
 $('requests-more').onclick = () => loadRequests(S.generation, true); $('log-more').onclick = () => loadLogs(S.generation, true);
 let resizeTimer; window.addEventListener('resize', () => { clearTimeout(resizeTimer); resizeTimer = setTimeout(() => { renderOverview(); renderSeries(); renderLatency(); renderCache(); renderSpec(); renderFlow(); renderSessions(); renderErrors(); }, 150); });
 let liveFeed;
-try { liveFeed = new EventSource('/v1/console/events'); const update = (e) => { try { const d = JSON.parse(e.data); if (d.g?.active != null) { S.live = d.g.active; $('k-concurrency').textContent = F.n0(S.live); } } catch (_) {} }; liveFeed.onmessage = update; liveFeed.addEventListener('snapshot', update); liveFeed.addEventListener('frame', update); liveFeed.onerror = () => { liveFeed.close(); }; } catch (_) {}
+// Live concurrency without subscribing to the console feed (a subscriber makes the engine build frames).
+async function liveCount() { try { const r = await fetch('/console/usage/live', { credentials: 'same-origin' }); if (r.ok) { const d = await r.json(); S.live = d.active; $('k-concurrency').textContent = d.active == null ? '-' : F.n0(d.active); } } catch (_) {} }
+liveCount(); setInterval(() => { if (!document.hidden) liveCount(); }, 5000);
 $('from').value = localDate(Date.now() - 86400000); $('to').value = localDate(Date.now());
 refresh(); setInterval(() => { if (!document.hidden && !S.loading) refresh(); }, 10000);
 })();

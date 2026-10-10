@@ -17,6 +17,8 @@ pub enum ResponsePayload {
     Object(Bytes),
     /// Body frames in order; `sse` when the content type was an event stream.
     Frames { frames: Vec<Bytes>, sse: bool, truncated: bool },
+    /// An owned structure (WebSocket turns); serialized on the log writer.
+    Value(serde_json::Value),
 }
 
 /// One request's payloads plus the metadata record it was emitted with.
@@ -24,6 +26,8 @@ pub enum ResponsePayload {
 pub struct LogRecord {
     pub meta: crate::usage::Record,
     pub request: Vec<Bytes>,
+    /// The request as an owned structure (WebSocket turns), when `request` is empty.
+    pub request_value: Option<serde_json::Value>,
     pub request_truncated: bool,
     pub response: ResponsePayload,
 }
@@ -35,7 +39,10 @@ impl LogRecord {
                 ResponsePayload::None => 0,
                 ResponsePayload::Object(b) => b.len(),
                 ResponsePayload::Frames { frames, .. } => frames.iter().map(Bytes::len).sum(),
+                // Owned structures are bounded by the turn; count a nominal size for admission.
+                ResponsePayload::Value(_) => 4096,
             }
+            + if self.request_value.is_some() { 4096 } else { 0 }
     }
 }
 

@@ -57,9 +57,10 @@ pub(crate) fn live() -> Option<Live> {
 }
 
 impl Live {
-    /// Whether token ids should be captured for the text view.
+    /// Whether token ids should be captured for the text view: only while a
+    /// viewer that may receive text (cookie-unlocked, or a bench run) is connected.
     #[inline]
-    pub fn text(self) -> bool { self.0.hub.text_enabled() }
+    pub fn text(self) -> bool { self.0.hub.text_wanted() }
     #[inline]
     pub fn push(self, event: Event) { let _ = self.0.events.try_send(event); }
     /// True at most every 250 ms; the caller then pushes a [`Gauges`] event.

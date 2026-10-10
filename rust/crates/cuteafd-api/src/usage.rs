@@ -119,6 +119,7 @@ struct Inner {
     /// The full-log store, passed to WebSocket turn children.
     log_sink: Option<Arc<dyn LogSink>>,
     log_request: OnceLock<(Vec<Bytes>, bool)>,
+    log_request_value: OnceLock<serde_json::Value>,
     log_response: OnceLock<ResponsePayload>,
     start: Instant,
     details: OnceLock<Details>,
@@ -162,6 +163,7 @@ impl UsageHandle {
             log,
             log_sink,
             log_request: OnceLock::new(),
+            log_request_value: OnceLock::new(),
             log_response: OnceLock::new(),
             start: Instant::now(),
             details: OnceLock::new(),
@@ -193,16 +195,23 @@ impl UsageHandle {
     pub fn logging(&self) -> bool {
         self.0.log.is_some()
     }
-    /// The turn's request as one JSON document (WebSocket front ends).
-    pub fn log_request(&self, body: impl FnOnce() -> Bytes) {
+    /// The turn's request as an owned structure (WebSocket front ends); the log
+    /// writer serializes it. The closure runs only while the log is on.
+    pub fn log_request(&self, body: impl FnOnce() -> serde_json::Value) {
+        if self.0.log.is_some() {
+            let _ = self.0.log_request_value.set(body());
+        }
+    }
+    /// The turn's request exactly as the client sent it (one refcounted frame).
+    pub fn log_request_bytes(&self, body: impl FnOnce() -> Bytes) {
         if self.0.log.is_some() {
             let _ = self.0.log_request.set((vec![body()], false));
         }
     }
-    /// The turn's final response object (WebSocket front ends).
-    pub fn log_response(&self, body: impl FnOnce() -> Bytes) {
+    /// The turn's final response object (WebSocket front ends), serialized on the writer.
+    pub fn log_response(&self, body: impl FnOnce() -> serde_json::Value) {
         if self.0.log.is_some() {
-            let _ = self.0.log_response.set(ResponsePayload::Object(body()));
+            let _ = self.0.log_response.set(ResponsePayload::Value(body()));
         }
     }
     pub fn details(&self, details: Details) {
@@ -372,11 +381,13 @@ impl Drop for Inner {
         .into();
         if let Some(log) = self.log.take() {
             let (request, request_truncated) = self.log_request.take().unwrap_or_default();
+            let request_value = self.log_request_value.take();
             let unauthenticated = matches!(r.status, 401 | 403);
-            if !request.is_empty() && !unauthenticated {
+            if (!request.is_empty() || request_value.is_some()) && !unauthenticated {
                 log.record_log(LogRecord {
                     meta: r.clone(),
                     request,
+                    request_value,
                     request_truncated,
                     response: self.log_response.take().unwrap_or_default(),
                 });
@@ -411,6 +422,7 @@ pub fn client_kind(headers: &HeaderMap) -> &'static str {
         .unwrap_or("")
         .to_ascii_lowercase();
     if headers.contains_key("x-cuteafd-bench") {
+        // A label only; `Record::bench` (the recording exemption) needs a verified token.
         "bench"
     } else if ua.starts_with("claude-cli/") || headers.get("x-app").is_some_and(|v| v == "cli") {
         "claude_code"
@@ -432,13 +444,25 @@ pub fn client_kind(headers: &HeaderMap) -> &'static str {
 pub struct Middleware {
     pub sink: Arc<dyn UsageSink>,
     pub inflight: Arc<AtomicUsize>,
+    /// Verifies a benchmark run's token. Only a verified token marks a request
+    /// as bench (and so exempt from recording by default); the header alone does not.
+    pub bench_token: Option<Arc<dyn Fn(&str) -> bool + Send + Sync>>,
 }
 impl Middleware {
     pub fn new(sink: Arc<dyn UsageSink>) -> Self {
         Self {
             sink,
             inflight: Arc::new(AtomicUsize::new(0)),
+            bench_token: None,
         }
+    }
+    pub fn with_bench(mut self, verify: Arc<dyn Fn(&str) -> bool + Send + Sync>) -> Self {
+        self.bench_token = Some(verify);
+        self
+    }
+    fn bench(&self, headers: &HeaderMap) -> bool {
+        let Some(verify) = &self.bench_token else { return false };
+        headers.get("x-cuteafd-bench").and_then(|v| v.to_str().ok()).is_some_and(|t| verify(t))
     }
 }
 /// The dashboards' own polling and static assets: recording them would make
@@ -501,7 +525,7 @@ pub async fn track(State(state): State<Middleware>, mut request: Request, next: 
                 .get("content-length")
                 .and_then(|v| v.to_str().ok())
                 .and_then(|s| s.parse().ok()),
-            bench: client_kind(headers) == "bench",
+            bench: state.bench(headers),
             ..Record::default()
         },
         state.sink.clone(),
@@ -677,6 +701,7 @@ pub(crate) mod tests {
     impl LogTape {
         pub fn request(&self, i: usize) -> serde_json::Value {
             let r = &self.0.lock().unwrap()[i];
+            if let Some(v) = &r.request_value { return v.clone(); }
             let bytes: Vec<u8> = r.request.iter().flat_map(|b| b.iter().copied()).collect();
             serde_json::from_slice(&bytes).unwrap()
         }
@@ -684,6 +709,7 @@ pub(crate) mod tests {
             match &self.0.lock().unwrap()[i].response {
                 ResponsePayload::Object(b) => String::from_utf8_lossy(b).into_owned(),
                 ResponsePayload::Frames { frames, .. } => frames.iter().map(|f| String::from_utf8_lossy(f).into_owned()).collect(),
+                ResponsePayload::Value(v) => v.to_string(),
                 ResponsePayload::None => String::new(),
             }
         }
@@ -745,7 +771,20 @@ pub(crate) mod tests {
         let r = app.oneshot(axum::http::Request::post("/v1/chat/completions").header("x-cuteafd-bench", "t")
             .body(Body::from("{}")).unwrap()).await.unwrap();
         axum::body::to_bytes(r.into_body(), 1024).await.unwrap();
-        assert!(tape.0.lock().unwrap().is_empty());
+        assert_eq!(tape.0.lock().unwrap().len(), 1, "an unverified bench header is ordinary traffic");
+        assert!(!sink.0.lock().unwrap()[0].bench);
+        let (sink, tape) = logging_sink();
+        let verified = Middleware::new(sink.clone()).with_bench(Arc::new(|t: &str| t == "run-token"));
+        let app = axum::Router::new().route("/v1/chat/completions", axum::routing::post(|_: Bytes| async { "{}" }))
+            .layer(axum::middleware::from_fn_with_state(verified, track));
+        for token in ["run-token", "guess"] {
+            let r = app.clone().oneshot(axum::http::Request::post("/v1/chat/completions").header("x-cuteafd-bench", token)
+                .body(Body::from("{}")).unwrap()).await.unwrap();
+            axum::body::to_bytes(r.into_body(), 1024).await.unwrap();
+        }
+        let rows = sink.0.lock().unwrap();
+        assert_eq!((rows[0].bench, rows[1].bench), (true, false));
+        assert_eq!(tape.0.lock().unwrap().len(), 1, "only the verified bench request skips the log");
     }
     #[test]
     fn last_reference_and_cancelled() {

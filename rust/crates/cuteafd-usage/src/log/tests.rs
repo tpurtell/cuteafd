@@ -36,7 +36,7 @@ fn send(log: &LogStore, meta: Record, request: Value, response: Value) {
     log.record_log(LogRecord {
         meta,
         request: vec![Bytes::from(serde_json::to_vec(&request).unwrap())],
-        request_truncated: false,
+        request_value: None, request_truncated: false,
         response: ResponsePayload::Object(Bytes::from(serde_json::to_vec(&response).unwrap())),
     });
 }
@@ -397,4 +397,119 @@ fn claude_code_respelled_history_still_appends() {
     assert_eq!(log.sessions(&crate::query::Filter::default()).unwrap()["sessions"][0]["title"], "Fix calc.py");
     // The stored delta rebuilds to what the client sent (its own spelling of new items).
     assert_eq!(log.get("c2").unwrap().unwrap()["request"]["messages"][3], second[3]);
+}
+
+/// M1: a turn with a huge tool result is stored truncated and never becomes a
+/// parent, so every later turn still rebuilds exactly.
+#[test]
+fn truncated_entries_never_become_parents() {
+    let (store, clock) = store(None);
+    let log = &store.log;
+    let t = clock.now_ms() - 100;
+    let s = Some("big");
+    let mut h = vec![user("start")];
+    send(log, meta("t1", t, "messages", s), messages(&h), reply("ok"));
+    h.push(assistant("ok"));
+    h.push(json!({"role":"user","content":[{"type":"tool_result","tool_use_id":"x","content":"z".repeat(STRING_CAP + 10)}]}));
+    send(log, meta("t2", t + 1, "messages", s), messages(&h), reply("read it"));
+    h.push(assistant("read it"));
+    h.push(user("next"));
+    send(log, meta("t3", t + 2, "messages", s), messages(&h), reply("done"));
+    log.flush().unwrap();
+    // A short turn in the same session after the big one.
+    send(log, meta("t4", t + 3, "messages", s), messages(&[user("start"), assistant("ok"), user("fresh")]), reply("y"));
+    log.flush().unwrap();
+    let c = log.reader.lock().unwrap();
+    for rid in ["t2", "t3"] {
+        let (kind, parent, ..) = entry(&c, rid);
+        assert_eq!((kind.as_str(), parent), ("base", None), "{rid}: an oversized request is self-contained");
+    }
+    let parents: Vec<String> = c.prepare("SELECT parent_rid FROM entries WHERE parent_rid IS NOT NULL").unwrap()
+        .query_map([], |r| r.get::<_, String>(0)).unwrap().map(|r| r.unwrap()).collect();
+    assert!(!parents.iter().any(|p| p == "t2" || p == "t3"), "nothing chains onto a truncated entry");
+    drop(c);
+    // Every retained entry rebuilds to what the client sent, except the elided strings it marks.
+    for (rid, sent) in [("t1", messages(&h[..1])), ("t4", messages(&[user("start"), assistant("ok"), user("fresh")]))] {
+        assert_eq!(log.get(rid).unwrap().unwrap()["request"], sent, "{rid}");
+    }
+    let v = log.get("t3").unwrap().unwrap();
+    assert_eq!(v["truncated"], true);
+    assert_eq!(v["request"]["messages"].as_array().unwrap().len(), h.len(), "no items lost, only the long string elided");
+    let session = log.session(v["vsid"].as_str().unwrap()).unwrap().unwrap();
+    assert_eq!(session["entries"][0]["truncated"], true, "the viewer shows truncation");
+}
+
+/// L3: chains stay within one client, API key and session.
+#[test]
+fn chains_never_cross_clients_keys_or_sessions() {
+    let (store, clock) = store(None);
+    let log = &store.log;
+    let t = clock.now_ms() - 100;
+    let h1 = vec![user("same opening")];
+    let h2 = [h1.clone(), vec![assistant("one"), user("more")]].concat();
+    send(log, meta("s1", t, "messages", Some("a")), messages(&h1), reply("one"));
+    send(log, meta("n1", t + 1, "messages", None), messages(&h2), reply("x"));
+    let mut other_key = meta("k1", t + 2, "messages", Some("a"));
+    other_key.key_label = Some("k:other".into());
+    send(log, other_key, messages(&h2), reply("x"));
+    let mut other_client = meta("c1", t + 3, "messages", Some("a"));
+    other_client.client_kind = "codex".into();
+    send(log, other_client, messages(&h2), reply("x"));
+    send(log, meta("s2", t + 4, "messages", Some("a")), messages(&h2), reply("x"));
+    log.flush().unwrap();
+    let c = log.reader.lock().unwrap();
+    for rid in ["n1", "k1", "c1"] {
+        assert_eq!(entry(&c, rid).0, "base", "{rid}");
+    }
+    assert_eq!(entry(&c, "s2").1.as_deref(), Some("s1"));
+}
+
+/// M2: cleared and expired payloads leave no plaintext in the db or WAL.
+#[test]
+fn clear_and_expiry_leave_no_plaintext() {
+    let dir = tempfile::tempdir().unwrap();
+    let (store, clock) = store(Some(dir.path()));
+    let log = &store.log;
+    for i in 0..50 {
+        send(log, meta(&format!("x{i}"), clock.now_ms(), "chat", None),
+            json!({"model":"m","messages":[user(&format!("PLAINTEXT_SENTINEL_{i} {}", "pad ".repeat(200)))]}), json!({"choices":[]}));
+    }
+    log.flush().unwrap();
+    let found = || walk(dir.path()).iter().any(|p| String::from_utf8_lossy(&std::fs::read(p).unwrap()).contains("PLAINTEXT_SENTINEL"));
+    assert!(found(), "the sentinel is stored before clearing");
+    log.clear().unwrap();
+    assert!(!found(), "clear leaves no plaintext in any file");
+    send(log, meta("old", clock.now_ms(), "chat", None), json!({"messages":[user("EXPIRY_SENTINEL")]}), json!({}));
+    log.flush().unwrap();
+    clock.0.store(clock.now_ms() + 25 * HOUR, Relaxed);
+    log.prune().unwrap();
+    for p in walk(dir.path()) {
+        assert!(!String::from_utf8_lossy(&std::fs::read(&p).unwrap()).contains("EXPIRY_SENTINEL"), "{}", p.display());
+    }
+}
+
+/// L2 and L10: private modes; media written only after commit, untracked files swept.
+#[test]
+fn private_modes_and_untracked_media_swept() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let usage = dir.path().join("usage");
+    let (store, clock) = store(Some(&usage));
+    send(&store.log, meta("m", clock.now_ms(), "chat", None), image_request(&[png(5)]), json!({}));
+    store.log.flush().unwrap();
+    let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode(&usage), 0o700);
+    assert_eq!(mode(&usage.join("usage-log.sqlite")), 0o600);
+    assert_eq!(mode(&usage.join("usage.sqlite")), 0o600);
+    let files = media_files(&usage);
+    assert_eq!(files.len(), 1);
+    assert_eq!(mode(&files[0]), 0o600);
+    assert_eq!(mode(files[0].parent().unwrap()), 0o700);
+    // A file no committed row accounts for (e.g. a crash after write) is swept on prune.
+    let stray = usage.join("media").join("ab").join(format!("{}.png", "ab".repeat(32)));
+    std::fs::create_dir_all(stray.parent().unwrap()).unwrap();
+    std::fs::write(&stray, b"x").unwrap();
+    store.log.prune().unwrap();
+    assert!(!stray.exists());
+    assert_eq!(media_files(&usage).len(), 1, "tracked media stays");
 }

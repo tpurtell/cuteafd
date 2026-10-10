@@ -26,8 +26,9 @@ pub enum Error {
     Settings(&'static str),
 }
 pub type Result<T> = std::result::Result<T, Error>;
+/// Unknown fields are ignored, so an older build starts on settings a newer one saved.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 pub struct Settings {
     pub metadata_days: u32,
     pub metadata_cap_mb: u32,
@@ -106,7 +107,7 @@ impl Store {
     ) -> Result<Arc<Self>> {
         let path = directory.map(|p| p.join("usage.sqlite"));
         if let Some(dir) = directory {
-            std::fs::create_dir_all(dir)?;
+            private_dir(dir)?;
         }
         let uri = path
             .as_ref()
@@ -119,6 +120,9 @@ impl Store {
             });
         let connection = Connection::open(&uri)?;
         schema(&connection)?;
+        if let Some(dir) = directory {
+            private_files(dir, "usage.sqlite");
+        }
         let saved: Option<String> = connection
             .query_row("SELECT value FROM settings WHERE key='settings'", [], |r| {
                 r.get(0)
@@ -213,7 +217,7 @@ impl UsageSink for Store {
 }
 fn schema(c: &Connection) -> Result<()> {
     c.busy_timeout(Duration::from_millis(2000))?;
-    c.execute_batch("PRAGMA auto_vacuum=INCREMENTAL; PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;
+    c.execute_batch("PRAGMA secure_delete=ON; PRAGMA auto_vacuum=INCREMENTAL; PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;
 CREATE TABLE IF NOT EXISTS requests (
 id INTEGER PRIMARY KEY, rid TEXT NOT NULL UNIQUE, ts_ms INTEGER NOT NULL,
 protocol TEXT NOT NULL, route TEXT NOT NULL, method TEXT NOT NULL, client_kind TEXT NOT NULL,
@@ -336,7 +340,7 @@ fn writer(
                 let _ = reply.send(result);
             }
             Command::Clear(reply) => {
-                let result = c.execute_batch("BEGIN; DELETE FROM requests; DELETE FROM sessions; DELETE FROM daily; COMMIT; PRAGMA incremental_vacuum;").map_err(Error::from);
+                let result = c.execute_batch("BEGIN; DELETE FROM requests; DELETE FROM sessions; DELETE FROM daily; COMMIT;").map_err(Error::from).and_then(|()| vacuum(&c));
                 let _ = reply.send(result);
             }
         }
@@ -470,8 +474,24 @@ pub(crate) fn vacuum(c: &Connection) -> Result<()> {
             break;
         }
     }
-    c.execute_batch("PRAGMA wal_checkpoint(PASSIVE);")?;
+    // Deleted rows must not linger in the WAL (secure_delete zeroes the db pages).
+    c.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
     Ok(())
+}
+
+/// The usage directory and everything in it are private to the owner.
+pub(crate) fn private_dir(dir: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    std::fs::DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+}
+
+/// SQLite creates its files with the process umask; tighten them after open.
+pub(crate) fn private_files(dir: &Path, stem: &str) {
+    use std::os::unix::fs::PermissionsExt;
+    for suffix in ["", "-wal", "-shm"] {
+        let _ = std::fs::set_permissions(dir.join(format!("{stem}{suffix}")), std::fs::Permissions::from_mode(0o600));
+    }
 }
 fn update_bytes(c: &Connection, counters: &Counters, path: Option<&Path>) {
     let bytes = path
@@ -525,6 +545,10 @@ mod tests {
         store.update_settings(s.clone()).unwrap();
         let other = Store::open(Some(dir.path())).unwrap();
         assert_eq!(other.settings(), s);
+        // L9: settings saved by a newer build (unknown fields) still load.
+        let newer: Settings = serde_json::from_str(r#"{"metadata_days":3,"future_field":true}"#).unwrap();
+        assert_eq!(newer.metadata_days, 3);
+        assert_eq!(newer.log_hours, Settings::default().log_hours);
     }
     #[test]
     fn overflow_drops_without_blocking() {

@@ -622,8 +622,8 @@ impl Connection {
         super::driver::account_request(&mut turn, usage.clone(), overrides, true);
         if let Some(scope) = &usage {
             // The turn as the backend sees it: the realtime log has no single wire request.
-            scope.log_request(|| serde_json::to_vec(&json!({"type":"realtime.turn","conversation_id":self.conversation_id,
-                "model":turn.requested_model,"instructions":turn.system,"tools":turn.tools,"items":turn.items})).unwrap_or_default().into());
+            scope.log_request(|| json!({"type":"realtime.turn","conversation_id":self.conversation_id,
+                "model":turn.requested_model,"instructions":turn.system,"tools":turn.tools,"items":turn.items}));
         }
         self.turn_usage = usage;
         drop(session);
@@ -750,7 +750,7 @@ impl Connection {
         let events = active.finish_turn(stop, error);
         if let Some(usage) = usage {
             if let Some(done) = events.iter().rev().find(|e| e["type"] == "response.done") {
-                usage.log_response(|| serde_json::to_vec(&done["response"]).unwrap_or_default().into());
+                usage.log_response(|| done["response"].clone());
             }
         }
         self.sync_output().await;

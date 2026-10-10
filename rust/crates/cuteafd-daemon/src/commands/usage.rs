@@ -170,7 +170,7 @@ fn synthesize(store: &cuteafd_usage::Store) {
             meta: Record { rid: rid.into(), ts_ms: ts, protocol: protocol.into(), client_kind: if protocol == "messages" { "claude_code" } else { "codex" }.into(),
                 model_served: Some("GLM-5.3-Flash".into()), session_id: Some(session.into()), session_source: Some("cache_key".into()),
                 status: 200, outcome: "ok".into(), ..Default::default() },
-            request: vec![serde_json::to_vec(&request).expect("json").into()], request_truncated: false,
+            request: vec![serde_json::to_vec(&request).expect("json").into()], request_value: None, request_truncated: false,
             response: ResponsePayload::Object(serde_json::to_vec(&response).expect("json").into()),
         });
     };

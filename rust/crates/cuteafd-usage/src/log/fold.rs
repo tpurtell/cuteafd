@@ -43,6 +43,7 @@ pub(crate) fn fold(protocol: &str, payload: &ResponsePayload) -> Value {
     match payload {
         ResponsePayload::None => Value::Null,
         ResponsePayload::Object(b) => parse(b),
+        ResponsePayload::Value(v) => v.clone(),
         ResponsePayload::Frames { frames, sse, truncated } => {
             let bytes = concat(frames);
             let mut v = if *sse {
