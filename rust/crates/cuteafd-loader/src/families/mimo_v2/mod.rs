@@ -11,3 +11,5 @@ pub mod workspace;
 pub use config::{MimoAttention, MimoKvCache, MimoV2Config};
 pub use qkv::{checkpoint_tp, FusedQkvLayout, QkvSegment};
 pub use workspace::{MimoAttentionWorkspace, MimoPrefillOutput, MimoWorkspaceLayout, MimoWorkspaceOptions};
+pub mod draft_config;
+pub mod admission;

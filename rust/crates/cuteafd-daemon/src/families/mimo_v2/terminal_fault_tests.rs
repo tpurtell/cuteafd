@@ -97,7 +97,7 @@ fn run_case(label: &str, captured: bool, lanes: usize, injected: u32, serving: b
     // No target layer executes. Attach actual persistent peer slots/flags and
     // streams using the production constructor, with an empty peer layer list.
     engine.split_family = Some("mimo2");
-    engine.attach_peer(1, peer.raw, vec![])?;
+    engine.attach_peer(1, peer.raw, vec![], false)?;
     engine.mtp_staging.borrow_mut().0.bytes_mut()[..256].fill(0x97);
     let exchange = engine.exchange()?;
     let control_bytes = exchange.fault_fixture_control(0)?.len();
