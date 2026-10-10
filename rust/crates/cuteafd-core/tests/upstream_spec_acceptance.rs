@@ -4,7 +4,7 @@
 //! equivalent (unconditional→conditional rate conversion, per-request
 //! acceptance metrics accumulator, async-scheduling backup-token indexing) is
 //! reimplemented here as clearly-marked upstream ports; every group also
-//! anchors the invariant against product code (`dspark_expected_tokens`,
+//! anchors the invariant against product code (`draft_expected_tokens`,
 //! `verify_dspark_greedy`).
 //!
 //! Upstream sources:
@@ -21,7 +21,7 @@
 // from product regression coverage (review MAJOR 4/6, 2026-09-15).
 
 use cuteafd_core::{
-    dspark_expected_tokens, verify_dspark_greedy,
+    draft_expected_tokens, verify_dspark_greedy,
 };
 
 // ---------------------------------------------------------------------------
@@ -65,13 +65,13 @@ fn upstream_acceptance_length_to_rates(length: f64, n: usize) -> Vec<f64> {
 // (vLLM test_synthetic_rejection_sampler_utils.py)
 // ---------------------------------------------------------------------------
 
-/// Product anchor: cuteafd's `dspark_expected_tokens` (the policy objective) computes
+/// Product anchor: cuteafd's `draft_expected_tokens` (the policy objective) computes
 /// expected_tokens = 1 + sum(cumulative products of the conditional rates),
 /// i.e. exactly 1 + sum(unconditional rates). This is the semantic contract
 /// tying cuteafd's "conditional draft confidence" input to vLLM's
 /// unconditional acceptance-rate convention.
 fn expected_tokens_for_conditional(confidence: &[f64]) -> f64 {
-    dspark_expected_tokens(confidence)
+    draft_expected_tokens(confidence)
 }
 
 #[test]
@@ -84,8 +84,8 @@ fn upstream_spec_unconditional_to_conditional_rates_basic() {
     assert!((expected_tokens_for_conditional(&conditional) - 2.6).abs() < 1e-12);
     // Products of conditionals reproduce the unconditional sequence: the
     // expected tokens of each prefix add exactly its unconditional rate.
-    assert!((dspark_expected_tokens(&conditional[..2]) - 2.4).abs() < 1e-12);
-    assert!((dspark_expected_tokens(&conditional[..1]) - 1.9).abs() < 1e-12);
+    assert!((draft_expected_tokens(&conditional[..2]) - 2.4).abs() < 1e-12);
+    assert!((draft_expected_tokens(&conditional[..1]) - 1.9).abs() < 1e-12);
 }
 
 #[test]

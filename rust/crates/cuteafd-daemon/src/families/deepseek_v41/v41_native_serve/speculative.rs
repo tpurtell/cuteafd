@@ -25,7 +25,7 @@ pub(crate) struct DraftRuntime<'w, 'a, C = DsparkChain<'w, 'a>> {
     /// Verify every available draft instead of selecting lengths.
     fixed: bool,
     /// Online bandwidth-balance length policy, bound to the installed placement.
-    policy: Option<cuteafd_core::DsparkPolicy>,
+    policy: Option<cuteafd_core::DraftPolicy>,
     /// The policy's predicted round time per lane, awaiting its observation.
     predicted: [Option<f64>; 2],
     published: Option<Instant>,
@@ -128,28 +128,25 @@ impl<'w, 'a, C: DraftChain<'a>> DraftRuntime<'w, 'a, C> {
     pub fn set_fixed(&mut self, fixed: bool) {
         self.fixed = fixed;
         if let Some(policy) = &mut self.policy {
-            *policy = cuteafd_core::DsparkPolicy::new(policy.placement().clone(), fixed);
+            *policy = policy.restarted(fixed);
         }
     }
     /// Bind the length policy to the installed expert placement before serving.
     pub fn configure_policy(&mut self, transport: &NativeTp4Wave<'_>, nvfp4: bool) -> Result<()> {
-        let placement = policy::placement(transport, nvfp4)?;
-        let local = (0..cuteafd_core::DSPARK_LAYERS)
-            .filter(|&l| placement.class(l) == cuteafd_core::DsparkLayerClass::Local).count();
-        tracing::info!(fixed=self.fixed, draft_limit=self.draft_limit, local_layers=local,
-            remote_expert_bytes=placement.expert_bytes(cuteafd_core::DSPARK_LAYERS - 1),
+        let geometry = policy::placement(transport, nvfp4, self.draft_width)?;
+        tracing::info!(fixed=self.fixed, draft_limit=self.draft_limit, local_layers=policy::local_layers(&geometry),
+            remote_expert_bytes=policy::remote_expert_bytes(&geometry),
             "dSpark bandwidth-balance length policy bound");
-        self.bind_policy(placement);
-        Ok(())
+        self.bind_policy(geometry)
     }
-    pub(crate) fn bind_policy(&mut self, placement: cuteafd_core::DsparkPlacement) {
-        let mut policy = cuteafd_core::DsparkPolicy::new(placement, self.fixed);
-        // Width 5 is the drafter's trained block; a width-7 load can also
-        // draft 5 each round, chosen by the policy.
-        policy.set_widths(5.min(self.draft_width), self.draft_width)
-            .expect("loaded draft width is five or seven");
+    /// Bind the policy to a V4.1 geometry. Width 5 is the drafter's trained
+    /// block; a width-7 load can also draft 5 each round, chosen by the policy.
+    pub(crate) fn bind_policy(&mut self, geometry: cuteafd_core::PolicyGeometry) -> Result<()> {
+        ensure!(geometry.widths.last() == Some(&self.draft_width), "policy widths differ from the loaded draft width");
+        let policy = cuteafd_core::DraftPolicy::new(geometry, self.fixed)?;
         policy::publish(&policy, self.draft_limit);
         self.policy = Some(policy);
+        Ok(())
     }
     /// Routes and layer timings feed the policy on every verification round.
     pub fn capture_routes(&self) -> bool { self.policy.is_some() }
@@ -176,9 +173,9 @@ impl<'w, 'a, C: DraftChain<'a>> DraftRuntime<'w, 'a, C> {
             Ok(logits[..maximum].iter().map(|&x| policy::sigmoid(x)).collect::<Vec<_>>())
         }).collect::<Result<Vec<_>>>()?;
         let candidates: Vec<_> = requests.iter().zip(&probabilities)
-            .map(|(&(id, _), confidence)| cuteafd_core::DsparkCandidate { id, confidence }).collect();
+            .map(|(&(id, _), confidence)| cuteafd_core::DraftCandidate { id, confidence }).collect();
         let started = Instant::now();
-        let selection = policy.select(shared, &candidates, width).map_err(anyhow::Error::msg)?;
+        let selection = policy.select(shared, &candidates, width)?;
         Ok(match selection {
             Some(selection) => {
                 tracing::debug!(target: "cuteafd::draft_policy", lane, shared,
@@ -207,7 +204,7 @@ impl<'w, 'a, C: DraftChain<'a>> DraftRuntime<'w, 'a, C> {
         let Some(policy) = &mut self.policy else { return };
         if let Err(error) = policy::observe(policy, &self.confidence_trace, shared, routes, layer_us,
             requests, total_us, draft_us, width, predicted) {
-            tracing::warn!(error, lane, "dSpark policy round observation skipped");
+            tracing::warn!(%error, lane, "dSpark policy round observation skipped");
         }
         tracing::debug!(target: "cuteafd::draft_policy", lane, shared, predicted_us=predicted, total_us,
             rows=requests.iter().map(|r| r.1).sum::<usize>(), "native length policy observation");
