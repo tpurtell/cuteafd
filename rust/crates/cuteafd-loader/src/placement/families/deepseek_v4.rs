@@ -227,6 +227,22 @@ pub fn default_onboard(dim: usize, gpus: usize) -> Onboard {
     else { Onboard::ExpertsFirst { pool_floor: crate::placement::EXPERTS_FIRST_POOL_FLOOR } }
 }
 
+#[cfg(test)]
+mod default_tests {
+    use super::*;
+
+    #[test]
+    fn default_onboard_preserves_single_rtx_and_uses_tp2_pool_first() {
+        assert_eq!(default_onboard(4096, 1), Onboard::Auto);
+        assert_eq!(default_onboard(7168, 1), Onboard::ExpertsFirst {
+            pool_floor: crate::placement::EXPERTS_FIRST_POOL_FLOOR,
+        });
+        for dim in [4096, 7168] {
+            assert_eq!(default_onboard(dim, 2), Onboard::Auto);
+        }
+    }
+}
+
 /// Exact TP2 halves in backbone order, CPU only.
 pub fn expert_half_costs(catalog: &crate::OfficialV41Catalog) -> anyhow::Result<Vec<[V4ExpertCost; 2]>> {
     let routed = catalog.routed_experts();

@@ -127,14 +127,6 @@ fn assert_equal(case: &Case<'_>, label: &str) -> Placement {
     let notes = runtime.expert_ranges.iter().enumerate().map(|(gpu, r)|
         format!("rtx{gpu}: {} local expert layers ({}..{})", r.layers, r.first, r.first + r.layers)).collect::<Vec<_>>();
     for note in notes { assert!(layout.notes.contains(&note), "{label}: planner lacks {note}"); }
-    if let Some(t) = runtime.tp2 {
-        assert!(runtime.expert_ranges.iter().all(|r| r.layers == 0));
-        assert!(layout.notes.contains(&format!("rtx0/rtx1: {} TP2 expert layer halves ({}..{})", t.layers, t.first, t.first + t.layers)));
-        for gpu in 0..2 {
-            let bytes: u64 = layout.devices[gpu].items.iter().filter(|i| i.format == "tp2").map(|i| i.bytes).sum();
-            assert_eq!(bytes, t.peak_bytes[gpu], "{label}: rtx{gpu} TP2 arena");
-        }
-    }
     // Per-layer ownership: today's V4 is all head split (2 RTX) or all GPU0,
     // the residual replicated after layer 0 under the split, no charged hop,
     // and the engine accepts the placement.
@@ -395,6 +387,35 @@ fn planner_equals_runtime_deepseek_v4_measured() {
         let slack = (64 * MIB).div_ceil(unit.max(1)) * 256;
         assert!(layout.pool_tokens.abs_diff(runtime.pool_tokens) <= slack, "{label}: pool {} planned vs {} measured",
             layout.pool_tokens, runtime.pool_tokens);
+        if fixture.rtx == 2 {
+            assert!(runtime.expert_ranges.iter().all(|r| r.layers == 0));
+            assert_eq!(runtime.tp2.unwrap().layers, fixture.onboard_layers);
+            // Re-solve the same measured pre-allocation inventory for every
+            // retained onboard policy; no deleted two-RTX TP1 placement.
+            for onboard in [None, Some(Onboard::Auto),
+                Some(Onboard::ExpertsFirst { pool_floor: 262_144 }),
+                Some(Onboard::Layers(2)), Some(Onboard::Fraction(0.03))] {
+                let variant = Case { onboard, ..case };
+                let (layout, supported, hints) = planned(&variant);
+                assert!(supported, "{label} {onboard:?}: {hints:?}");
+                let runtime = runtime_measured(&variant, &fixture).unwrap();
+                let tp2 = runtime.tp2.unwrap();
+                assert!(runtime.expert_ranges.iter().all(|r| r.layers == 0));
+                assert!(layout.notes.contains(&format!(
+                    "rtx0/rtx1: {} TP2 expert layer halves ({}..{})",
+                    tp2.layers, tp2.first, tp2.first + tp2.layers)), "{label} {onboard:?}");
+                assert!(layout.pool_tokens.abs_diff(runtime.pool_tokens) <= slack,
+                    "{label} {onboard:?}: pool {} planned vs {} measured",
+                    layout.pool_tokens, runtime.pool_tokens);
+                if onboard.is_none() || onboard == Some(Onboard::Auto) {
+                    assert_eq!(runtime.pool_tokens, 2 << 20);
+                }
+                if let Some(Onboard::Layers(n)) = onboard {
+                    assert_eq!(runtime.onboard_layers, n);
+                }
+                eprintln!("{label} {onboard:?}: TP2 {} layers pool {}", tp2.layers, runtime.pool_tokens);
+            }
+        }
         checked += 1;
     }
     eprintln!("planner_equals_runtime_deepseek_v4_measured: {checked} fixtures");
