@@ -174,7 +174,7 @@ def test_every_serve_path_uses_explicit_keyed_policy():
         source = path.read_text()
         assert "args.api.load()?" in source, path
         assert "api.app(router," in source, path
-        assert "crate::shared::api::profile(" in source, path
+        assert "api.serve(profile" in source, path  # shared health + gateway mount
         assert "cuteafd_bench::app(" not in source, path
     for path in [ROOT / "run.sh", ROOT / "scripts/launch/run-family.sh"]:
         source = path.read_text()

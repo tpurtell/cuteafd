@@ -1270,6 +1270,9 @@ case "$ENABLE_BENCH" in
   off) ;;
   *) echo "ENABLE_BENCH must be on or off" >&2; exit 2 ;;
 esac
+# GATEWAY=off drops the Messages/Responses/Realtime routes; unset keeps the binary default (on).
+gateway="$(get GATEWAY "")"
+case "$gateway" in on|off) family_args+=(--gateway "$gateway") ;; "") ;; *) echo "GATEWAY must be on or off" >&2; exit 2 ;; esac
 table_env_args=()
 [[ -z "${CUTEAFD_TABLE_ACCOUNTING:-}" ]] || table_env_args+=(-e "CUTEAFD_TABLE_ACCOUNTING=$CUTEAFD_TABLE_ACCOUNTING")
 bench_nonce_env_args=()

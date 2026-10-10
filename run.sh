@@ -684,6 +684,8 @@ case "${ENABLE_BENCH:-off}" in
   off) ;;
   *) release_die "ENABLE_BENCH must be on or off" ;;
 esac
+# GATEWAY=off drops the Messages/Responses/Realtime routes; unset keeps the binary default (on).
+case "${GATEWAY:-}" in on|off) args+=(--gateway "$GATEWAY") ;; "") ;; *) release_die "GATEWAY must be on or off" ;; esac
 args+=(--table-backend "$TABLE_BACKEND")
 args+=(--http-queue-depth "${HTTP_QUEUE_DEPTH:-$CONCURRENCY}" --http-queue-wait-ms "$HTTP_QUEUE_WAIT_MS")
 [[ "$RTX_EXPERT_LAYERS" == auto ]] || args+=(--rtx-expert-layers "$RTX_EXPERT_LAYERS")

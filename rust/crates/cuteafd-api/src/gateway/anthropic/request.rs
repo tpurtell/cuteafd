@@ -23,6 +23,10 @@ pub(super) fn parse(value: &Value, require_max: bool) -> Result<(TurnRequest, bo
             parts(system)?
                 .into_iter()
                 .filter_map(|p| match p {
+                    // Claude Code's per-request billing metadata (its hash
+                    // changes within a session) is not an instruction; at the
+                    // head of the prompt it would defeat prefix caching.
+                    Part::Text { text } if text.starts_with("x-anthropic-billing-header:") => None,
                     Part::Text { text } => Some(text),
                     _ => None,
                 })

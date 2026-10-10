@@ -106,12 +106,17 @@ fn models_routes(gateway: Arc<Gateway>) -> Router {
         } else { error.openai_response() })
     }
     use serde_json::{json, Value};
-    fn entry(model: &ModelInfo) -> Value {
-        json!({"id": model.id, "object": "model", "type": "model", "display_name": model.id,
+    fn entry(model: &ModelInfo, metadata: Option<&Value>) -> Value {
+        let mut entry = json!({"id": model.id, "object": "model", "type": "model", "display_name": model.id,
             "created": 0, "created_at": "1970-01-01T00:00:00Z", "owned_by": model.owned_by,
             "context_window": model.context_tokens, "max_output_tokens": model.max_output_tokens,
             "max_input_tokens": model.context_tokens, "max_tokens": model.max_output_tokens,
-            "capabilities": null, "lifecycle": "active", "deprecated_at": null, "retires_at": null, "line": null})
+            "capabilities": null, "lifecycle": "active", "deprecated_at": null, "retires_at": null, "line": null});
+        // Engine metadata (chat-route fields) for every id that runs the served model.
+        if let (Some(entry), Some(Value::Object(extra))) = (entry.as_object_mut(), metadata) {
+            for (key, value) in extra { if key != "id" { entry.insert(key.clone(), value.clone()); } }
+        }
+        entry
     }
     async fn list(State(gateway): State<Arc<Gateway>>, headers: HeaderMap, page: Result<Query<Page>, axum::extract::rejection::QueryRejection>) -> Response {
         let page = match page { Ok(Query(page)) => page, Err(_) => return error_response(GatewayError::invalid("invalid model pagination parameters"), &headers) };
@@ -136,7 +141,8 @@ fn models_routes(gateway: Arc<Gateway>) -> Router {
         let has_more = end - start > limit;
         if before { start = end.saturating_sub(limit).max(start); } else { end = (start + limit).min(end); }
         let page = &models[start..end];
-        let data: Vec<Value> = page.iter().map(entry).collect();
+        let metadata = gateway.backend.model_metadata();
+        let data: Vec<Value> = page.iter().map(|model| entry(model, metadata.as_ref())).collect();
         anthropic::with_request_id(Json(json!({"object": "list", "data": data, "has_more": has_more,
             "first_id": page.first().map(|m| m.id.clone()), "last_id": page.last().map(|m| m.id.clone())})).into_response())
     }
@@ -145,7 +151,7 @@ fn models_routes(gateway: Arc<Gateway>) -> Router {
             Ok(served) => {
                 let listing = gateway.models.listing(&gateway.backend.models());
                 let base = listing.iter().find(|m| m.id == served).cloned().unwrap_or_else(|| listing[0].clone());
-                anthropic::with_request_id(Json(entry(&ModelInfo { id, ..base })).into_response())
+                anthropic::with_request_id(Json(entry(&ModelInfo { id, ..base }, gateway.backend.model_metadata().as_ref())).into_response())
             }
             Err(error) => error_response(error, &headers),
         }

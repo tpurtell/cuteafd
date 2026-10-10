@@ -40,7 +40,7 @@ use tokio::sync::{mpsc, oneshot};
 
 pub(crate) async fn run(args: crate::cli::NativeServeArgs) -> Result<()> {
     let Started { send, readiness, worker_thread, stats, http } = start(args, true)?;
-    let Http { api, listen, limits, http_queue_wait, console_hub } = http.expect("serving start loads the API");
+    let Http { api, listen, snapshot, limits, http_queue_wait, console_hub } = http.expect("serving start loads the API");
     let vision_health = readiness
         .await
         .context("native target startup stopped")?
@@ -52,7 +52,7 @@ pub(crate) async fn run(args: crate::cli::NativeServeArgs) -> Result<()> {
     let mut profile = cuteafd_api::openai::ModelProfile::default();
     profile.vision_health = vision_health;
     let router = cuteafd_api::openai::router_for_model(send, limits, stats, http_queue_wait, console_hub.clone(),
-        crate::shared::api::profile(profile));
+        api.serve(profile, &snapshot)?);
     axum::serve(listener, api.app(router, console_hub).into_make_service_with_connect_info::<std::net::SocketAddr>())
         .with_graceful_shutdown(async {
             let mut term =
@@ -74,6 +74,8 @@ type Stats = std::sync::Arc<std::sync::Mutex<serde_json::Value>>;
 struct Http {
     api: crate::shared::api::ApiPolicy,
     listen: String,
+    /// Tokenizer snapshot for the gateway's exact `count_tokens`.
+    snapshot: std::path::PathBuf,
     limits: cuteafd_api::openai::NativeLimits,
     http_queue_wait: Duration,
     console_hub: std::sync::Arc<cuteafd_api::openai::ConsoleHub>,
@@ -150,6 +152,7 @@ fn start(mut args: crate::cli::NativeServeArgs, http: bool) -> Result<Started> {
     // The golden runs the worker without the API, so it loads no keyed policy.
     let api = if http { Some(args.api.load()?) } else { None };
     let listen = args.listen.clone();
+    let snapshot = args.snapshot.clone();
     let limits = cuteafd_api::openai::NativeLimits::new(args.max_context_tokens, args.max_output_tokens)?;
     let (send, receive) = mpsc::channel(args.http_queue_depth.unwrap_or(args.concurrency) as usize);
     let http_queue_wait = Duration::from_millis(args.http_queue_wait_ms);
@@ -160,7 +163,7 @@ fn start(mut args: crate::cli::NativeServeArgs, http: bool) -> Result<Started> {
         Some(api) => {
             let console_hub = cuteafd_api::openai::ConsoleHub::new(args.console_text);
             console::install(console_hub.clone(), console::layout(&args))?;
-            Some(Http { api, listen, limits, http_queue_wait, console_hub })
+            Some(Http { api, listen, snapshot, limits, http_queue_wait, console_hub })
         }
         None => None,
     };

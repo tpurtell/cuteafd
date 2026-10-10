@@ -38,7 +38,9 @@ impl HealthWitness {
 /// A failed expert wire is terminal: reject new inference without queueing it.
 pub async fn require_ready(State(health): State<HealthWitness>, request: Request, next: Next) -> Response {
     let path = request.uri().path();
-    if request.method() == axum::http::Method::POST && matches!(path, "/v1/chat/completions" | "/v1/completions") {
+    // Gateway turns (Messages, Responses) run on the same engine.
+    if request.method() == axum::http::Method::POST && matches!(path, "/v1/chat/completions" | "/v1/completions"
+        | "/v1/messages" | "/v1/responses") {
         if let Some(reason) = health.reason() {
             return unavailable(reason);
         }

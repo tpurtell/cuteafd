@@ -50,6 +50,9 @@ pub trait Backend: Send + Sync + 'static {
     fn start(&self, turn: TurnRequest) -> BoxFuture<'static, Result<TurnStream, GatewayError>>;
     /// Prompt tokens `turn` would consume, without generating.
     fn count_tokens(&self, turn: TurnRequest) -> BoxFuture<'static, Result<u32, GatewayError>>;
+    /// Extra fields for the served model's `/v1/models` entry (the engine's
+    /// chat-route record: capabilities, context limits, template provenance).
+    fn model_metadata(&self) -> Option<serde_json::Value> { None }
 }
 
 /// Rough token estimate (bytes / 4 over the serialized turn) for backends
