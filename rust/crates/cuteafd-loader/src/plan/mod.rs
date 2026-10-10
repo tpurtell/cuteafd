@@ -157,6 +157,7 @@ pub struct RoleReadiness {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct PlanReport {
+    pub attention_placement: crate::placement::AttentionPlacement,
     pub vision: MediaMode,
     pub audio: MediaMode,
     pub disabled_media_bytes: u64,
@@ -227,6 +228,7 @@ impl PlanReport {
 
 #[derive(Debug, Clone)]
 pub struct PlanOptions {
+    pub attention_placement: Option<crate::placement::AttentionPlacement>,
     pub vision: MediaMode,
     pub audio: MediaMode,
     pub placement: ExpertPlacement,
@@ -242,6 +244,7 @@ pub struct PlanOptions {
 impl Default for PlanOptions {
     fn default() -> Self {
         Self {
+            attention_placement: None,
             vision: MediaMode::Auto,
             audio: MediaMode::Auto,
             placement: ExpertPlacement::Sparks { ranks: 4 },
@@ -297,6 +300,7 @@ pub fn plan(snapshot: &Path, options: &PlanOptions) -> Result<PlanReport, PlanEr
     let checkpoint = Checkpoint::open(snapshot)
         .map_err(|error| error.context(format!("reading checkpoint at {}", snapshot.display())))?;
     let mut report = PlanReport {
+        attention_placement: options.attention_placement.unwrap_or_default(),
         vision: options.vision,
         audio: resolve_audio(options.audio, snapshot)?,
         disabled_media_bytes: 0,
@@ -361,6 +365,19 @@ pub fn plan(snapshot: &Path, options: &PlanOptions) -> Result<PlanReport, PlanEr
         return Ok(report);
     };
     report.family = Some(family.id().into());
+    if let Some(executor) = crate::placement::families::executor(family.id()) {
+        let gpus = options.layout.as_ref().map_or(1, |layout| layout.rtx_bytes.len());
+        let peer = options.layout.as_ref().is_some_and(|layout| layout.head_split);
+        match executor.check_attention(options.attention_placement, gpus, peer) {
+            Ok(mode) => report.attention_placement = mode,
+            Err(error) => {
+                report.config_error = Some(error.to_string());
+                report.hints.push(Hint { what: error.to_string(),
+                    how: format!("Implement the {} attention executor before enabling this placement; use --attention-placement heads today.", family.id()) });
+                return Ok(report);
+            }
+        }
+    }
     if family.id() == "qwen4" && checkpoint.config.get("vision_config").is_some() {
         report.max_image_tokens = Some(crate::media::QWEN_MAX_IMAGE_TOKENS);
     }

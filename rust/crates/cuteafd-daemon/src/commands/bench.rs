@@ -133,11 +133,11 @@ fn family_of(command: &str) -> Option<&'static str> {
 
 /// Records a serve command's resolved options (value, default, source) for
 /// the benchmark; other commands record nothing.
-pub(crate) fn capture(matches: &ArgMatches, coordinator_budget_gib: Option<f64>) {
-    let Some((name, sub)) = matches.subcommand() else { return };
-    let Some(family) = family_of(name) else { return };
+pub(crate) fn capture(matches: &ArgMatches, coordinator_budget_gib: Option<f64>) -> Result<()> {
+    let Some((name, sub)) = matches.subcommand() else { return Ok(()) };
+    let Some(family) = family_of(name) else { return Ok(()) };
     let command = crate::cli::Cli::command();
-    let Some(definition) = command.find_subcommand(name) else { return };
+    let Some(definition) = command.find_subcommand(name) else { return Ok(()) };
     let mut settings: Vec<Setting> = Vec::new();
     let mut snapshot = None;
     for arg in definition.get_arguments() {
@@ -179,9 +179,17 @@ pub(crate) fn capture(matches: &ArgMatches, coordinator_budget_gib: Option<f64>)
         settings.push(Setting { name: "coordinator-gpu-budget-gib".into(), value: Some(gib.to_string()),
             default: None, source: "cli".into() });
     }
+    let requested = std::env::var("CUTEAFD_ATTENTION_PLACEMENT").unwrap_or_else(|_| "auto".into());
+    let requested = cuteafd_loader::placement::attention::parse(&requested).map_err(anyhow::Error::msg)?;
+    let executor = cuteafd_loader::placement::families::executor(family).expect("serve family executor");
+    // K0 has no new executor: reject before loading CUDA or starting workers.
+    let mode = executor.check_attention(requested, 2, true)?;
+    settings.push(Setting { name: "attention-placement".into(), value: Some(mode.to_string()),
+        default: Some(executor.attention_default().to_string()), source: "resolved".into() });
     settings.extend(cuteafd_bench::context::env_settings());
     cuteafd_bench::context::set(cuteafd_bench::context::ServerContext { command: name.to_string(),
         family: Some(family.to_string()), snapshot, settings });
+    Ok(())
 }
 
 #[cfg(test)]
@@ -195,7 +203,7 @@ mod tests {
             "/opt/lib.so", "--max-sequences", "2"];
         let matches = crate::cli::Cli::command().try_get_matches_from(argv).unwrap();
         let cli = crate::cli::Cli::from_arg_matches(&matches).unwrap();
-        capture(&matches, cli.coordinator_gpu_budget_gib);
+        capture(&matches, cli.coordinator_gpu_budget_gib).unwrap();
         let context = cuteafd_bench::context::get();
         assert_eq!(context.family.as_deref(), Some("qwen4"));
         assert_eq!(context.snapshot.as_deref(), Some(std::path::Path::new("/hub/models--Qwen--Q/snapshots/abc")));

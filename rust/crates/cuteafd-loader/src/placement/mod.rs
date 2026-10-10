@@ -20,6 +20,7 @@ use thiserror::Error;
 pub mod families;
 pub mod inventory;
 mod pool;
+pub mod attention;
 mod residual;
 mod solve;
 #[cfg(test)]
@@ -29,12 +30,18 @@ pub use inventory::{loaded_code, ArchContext, GraphRank, GraphSet, Lifetime, Loa
 pub use pool::PoolPolicy;
 pub use residual::{hop_buffer_bytes, plan_hops, Hop, HopKind, HopPoint, HopSpec, ResidualHome, Transition, HOP_SLOTS};
 pub use solve::solve;
+pub use attention::{AttentionPlacement, ContextBuffers, KvDemand};
 
 /// What a request asks of the hardware, built by a family from its own
 /// geometry; see `families::<family>`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PlacementRequest {
     pub inventory: Inventory,
+    /// None selects the family default and permits memory-driven mode flips.
+    pub attention_placement: Option<AttentionPlacement>,
+    pub context_buffers: ContextBuffers,
+    /// Owner of the first colocate group under layers (then alternating).
+    pub layers_first_gpu: u8,
     pub pool: PoolPolicy,
     /// One per backbone layer, in order.
     pub layers: Vec<LayerDemand>,
@@ -122,7 +129,13 @@ pub struct LayerDemand {
     pub weights: ModeBytes,
     /// Pool bytes per unit: whole on the owner, or per rank under a split
     /// (halves for partitioned heads, full copies for replicated latents).
-    pub kv_unit: ModeBytes,
+    pub kv_unit: KvDemand,
+    /// Active state and prefix marks: replicated under context, owned under layers.
+    pub fixed_bytes: ModeBytes,
+    /// Whether this context layer exchanges a new candidate list.
+    pub context_indexer: bool,
+    /// Layers sharing an indexer/source must keep the same whole-layer owner.
+    pub colocate: Option<u16>,
     /// Routed experts; `None` for a dense layer.
     pub experts: Option<ExpertCost>,
     /// The modes this build can execute for the layer, in preference order.
@@ -162,6 +175,8 @@ pub struct ExpertCost {
 pub enum LayerMode {
     /// Attention heads split over both GPUs; the residual is replicated.
     HeadSplit,
+    /// Head-split projections with page-partitioned KV; residual replicated.
+    ContextSplit,
     /// One GPU owns attention, KV and the layer's work.
     Whole { gpu: u8, ffn: FfnMode },
 }
@@ -326,6 +341,9 @@ impl std::str::FromStr for Onboard {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Placement {
     pub pool_tokens: u64,
+    pub attention_placement: AttentionPlacement,
+    /// Context exchange bytes per row, each way (existing all-reduces excluded).
+    pub peer_row_bytes: u64,
     /// The onboard this placement resolved: RTX-resident routed layers.
     pub onboard_layers: usize,
     pub layers: Vec<LayerAssignment>,
@@ -393,7 +411,7 @@ impl Placement {
             .collect::<Vec<_>>().join(", ");
         let hops = self.hops.iter().filter(|h| h.charged()).count();
         let hops = if hops == 0 { String::new() } else { format!("; {hops} residual hops") };
-        format!("pool {} tokens; onboard {} RTX expert layers: {ranges}{hops}", self.pool_tokens, self.onboard_layers)
+        format!("attention {}; pool {} tokens; onboard {} RTX expert layers: {ranges}{hops}", self.attention_placement, self.pool_tokens, self.onboard_layers)
     }
 }
 
@@ -417,6 +435,8 @@ pub enum PlacementError {
     UnsupportedMode { family: &'static str, layer: usize, mode: LayerMode },
     #[error("{family} cannot run the residual hop {hop:?}")]
     UnsupportedHop { family: &'static str, hop: Hop },
+    #[error("{family} cannot run attention placement {mode}: {reason}")]
+    AttentionPlacement { family: &'static str, mode: AttentionPlacement, reason: &'static str },
     #[error("placement arithmetic overflows: {0}")]
     Overflow(&'static str),
 }

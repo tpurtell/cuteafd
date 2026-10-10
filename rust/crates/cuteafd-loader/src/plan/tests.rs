@@ -2076,3 +2076,28 @@ fn glm_flash_pool_marks_charge_their_reserved_unit_beside_the_pool() {
     assert_eq!(pool.devices[0].free_bytes() - arena.devices[0].free_bytes(),
         (34 * rank.retained_mark_bytes - GLMF_POOL_MARK_RESERVED_UNITS * unit) as i64 - more);
 }
+
+
+#[test]
+fn attention_placement_heads_preserves_default_layout_and_modes_refuse_at_plan_time() {
+    use crate::placement::AttentionPlacement;
+    let snapshots = [v4_snapshot(), qwen_snapshot(4), snapshot(v41_config(), &[])];
+    for dir in snapshots {
+        for gpus in [1, 2] {
+            let options = PlanOptions { layout: Some(layout::LayoutOptions {
+                rtx_bytes: vec![crate::placement::inventory::PRO_TOTAL_BYTES; gpus], ..Default::default()
+            }), ..sparks(4) };
+            let auto = plan(dir.path(), &options).unwrap();
+            let heads = plan(dir.path(), &PlanOptions { attention_placement: Some(AttentionPlacement::Heads), ..options.clone() }).unwrap();
+            assert_eq!(auto.memory_layout, heads.memory_layout);
+            assert_eq!(auto.config_error, heads.config_error);
+            for mode in [AttentionPlacement::Context, AttentionPlacement::Layers] {
+                let unsupported = plan(dir.path(), &PlanOptions { attention_placement: Some(mode), ..options.clone() }).unwrap();
+                assert!(!unsupported.executable());
+                let reason = unsupported.config_error.unwrap();
+                assert!(reason.contains(auto.family.as_deref().unwrap()) && reason.contains(&mode.to_string()), "{reason}");
+                assert!(unsupported.memory_layout.is_none());
+            }
+        }
+    }
+}

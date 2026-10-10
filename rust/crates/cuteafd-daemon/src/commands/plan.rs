@@ -20,6 +20,8 @@ fn options(args: &PlanArgs) -> Result<PlanOptions, PlanError> {
         return Err(PlanError::InvalidOption { option: "--vision-replicas", reason: "requires --layout to describe replica inventory".into() });
     }
     let options = PlanOptions {
+        attention_placement: cuteafd_loader::placement::attention::parse(&args.attention_placement)
+            .map_err(|reason| PlanError::InvalidOption { option: "--attention-placement", reason })?,
         vision: args.vision,
         audio: args.audio,
         placement: ExpertPlacement::from_spark_ranks(args.spark_ranks.unwrap_or(4)),
@@ -560,6 +562,7 @@ mod tests {
             rtx_expert_layers: None,
             deprecated_peer_expert_ranges: false,
             exchange_f32: false,
+            attention_placement: "auto".into(),
             context_tokens: 262144,
             prefill_rows: 4096,
             full_prefill_logits: false,
