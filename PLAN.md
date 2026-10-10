@@ -3054,6 +3054,16 @@ after graph warm-up, on a fixed 512-row prefill plus one decode step:
 
 `CUTEAFD_ROUTE_CHECK=N` re-checks every N steps (off by default).
 
+**TP2 lane payload sizing (P4 follow-up, 2026-10-10).** The persistent
+per-lane TP2 payload is sized for FP32 (4 B per element), so the BF16 and
+FP32 exchange share one buffer and both dtypes can be warmed. Once BF16
+becomes the default, that over-reserves 64.5 MiB per rank on V4 Flash and
+112.9 MiB per rank on Pro (at 4096 prefill / 64 decode rows). Size the
+payload to the exchange dtype actually in use, through the geometry,
+layout and admission APIs and their tests, as its own small PR after P4. On
+Pro that is about 225 MiB across both GPUs, part of the margin toward its
+11th TP2 layer.
+
 **EXL3 TP2 input (P4, 2026-10-10).** `Exl3Tp2` takes FP8 K32 wire rows, as
 V4.1's rank sequence does, so V4.1 stays byte-exact through the shared impl.
 Each rank quantizes its own copy of the post-split hidden state. Follow-up,
