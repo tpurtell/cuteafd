@@ -343,6 +343,50 @@ impl<'a> Engine<'a> {
         (self.graph_captures.get(), self.expert_graph_captures.get())
     }
 
+    pub(super) fn warm_tp2_routers(&self) -> Result<()> {
+        let Some(tp2) = &self.tp2 else { return Ok(()) };
+        for rank in 0..2 {
+            let workspace = if rank == 0 { self.decode_workspace.borrow() }
+                else { self.peer()?.decode_workspace.borrow() };
+            let w = workspace.as_ref().context("router warm-up workspace")?;
+            let lane = &w.lanes[0];
+            let layers = if rank == 0 { &self.weights.layers } else { &self.peer()?.layers };
+            self.on(rank, || {
+                // CUDA runtime kernels load lazily, which may synchronize the device.
+                // Load both router branches and combine dtypes before any unmatched wait.
+                for allocation in [&w.y, &lane.tokens, &lane.shared] {
+                    self.library.cuda_zero_bytes(allocation.buffer, allocation.buffer.bytes)?;
+                }
+                for hash in [true, false] {
+                    let Some(weights) = layers.iter().find(|w| w.hash == hash) else { continue };
+                    self.run_on(rank, false, "router_scores", &[
+                        ("x", w.y.buffer.ptr), ("w", weights.ptr("gate")?), ("logits", w.logits.buffer.ptr),
+                    ], &[Scalar::I32(1)])?;
+                    let (bias, table) = if hash { (std::ptr::null_mut(), weights.ptr("gate.tid2eid")?) }
+                        else { (weights.ptr("gate.bias")?, std::ptr::null_mut()) };
+                    // SAFETY: initialized persistent rows and rank-local route buffers, no peer work queued.
+                    unsafe { self.library.dsv4_router_select(w.logits.buffer.ptr, bias, table, lane.tokens.buffer.ptr,
+                        w.route_ids.buffer.ptr, w.route_weights.buffer.ptr, 1, self.cfg.n_routed_experts,
+                        self.cfg.n_activated_experts, self.cfg.route_scale as f32, self.stream_of(rank))?; }
+                }
+                self.quantize_input(rank, w, 1)?;
+                let payload = lane.payload.as_ref().context("combine warm-up payload")?;
+                for combine in &tp2.combine {
+                    // SAFETY: zero shared rows, persistent payload and disjoint output, all on this rank.
+                    unsafe {
+                        combine.partial(std::ptr::null(), lane.shared.buffer.ptr.cast(), payload.buffer.ptr,
+                            1, self.cfg.dim, self.stream_of(rank))?;
+                        combine.sum(payload.buffer.ptr, payload.buffer.ptr, w.sum.buffer.ptr.cast(),
+                            1, self.cfg.dim, self.stream_of(rank))?;
+                    }
+                }
+                // SAFETY: startup-only independent work; neither stream has a peer wait yet.
+                unsafe { self.library.cuda_stream_synchronize(self.stream_of(rank)) }
+            })?;
+        }
+        Ok(())
+    }
+
     fn warm_broadcast_graphs(&self) -> Result<()> {
         let Some(tp2) = &self.tp2 else { return Ok(()) };
         let source = tp2.source.replace(RouteSource::Broadcast);

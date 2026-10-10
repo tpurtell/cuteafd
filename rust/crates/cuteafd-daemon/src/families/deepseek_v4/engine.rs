@@ -1700,6 +1700,7 @@ impl<'a> Engine<'a> {
                 *peer.decode_workspace.borrow_mut() = Some(self.workspace_on(1, self.decode_rows, 1)?);
             }
         }
+        self.warm_tp2_routers()?;
         self.capture_only.set(true);
         let result = (|| {
             let work = self.decode_workspace.borrow();
