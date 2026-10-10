@@ -326,21 +326,25 @@ def _family_launch_lines(tmp_path: Path, family_config: dict, model: str, keys: 
     return _family_launch_result(tmp_path, family_config, model, keys).stderr
 
 
-@pytest.mark.parametrize("value", [None, "auto", "0", "5"])
+@pytest.mark.parametrize("value", [None, "auto", "0", "5", "50%", "all"])
 def test_deepseek_v4_honors_explicit_local_expert_limit(tmp_path, value):
     keys = "" if value is None else f"RTX_EXPERT_LAYERS={value}\n"
     result = _family_launch_result(tmp_path, {"model_type": "deepseek_v4"}, "test/dsv4", keys)
     assert result.returncode == 0, result.stderr
     launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-dsv4" in line)
     if value in (None, "auto"):
-        assert "--local-expert-layers" not in launch
-    else:
+        assert "--local-expert-layers" not in launch and "--rtx-expert-layers" not in launch
+    elif value.isdigit():
+        # Whole layer counts keep the flag older images accept.
         assert f"--local-expert-layers {value}" in launch
+    else:
+        assert f"--rtx-expert-layers {value}" in launch
 
 
-def test_deepseek_v4_rejects_invalid_local_limit_before_launch(tmp_path):
+@pytest.mark.parametrize("value", ["-1", "101%", "half", "5x"])
+def test_deepseek_v4_rejects_invalid_local_limit_before_launch(tmp_path, value):
     result = _family_launch_result(tmp_path, {"model_type": "deepseek_v4"}, "test/dsv4",
-                                  "RTX_EXPERT_LAYERS=-1\n")
+                                  f"RTX_EXPERT_LAYERS={value}\n")
     assert result.returncode == 2 and "RTX_EXPERT_LAYERS must be" in result.stderr
     assert "docker run" not in result.stderr and "nest drop-caches" not in result.stderr
 

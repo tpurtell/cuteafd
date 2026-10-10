@@ -111,7 +111,7 @@ fn console_layout(args: &ServeArgs, model: &str) -> console::Layout {
     let mut layout = console::Layout::new("deepseek_v4", model.into(), args.engine.snapshot.clone());
     let sparks = args.engine.peers.split(',').filter(|peer| !peer.is_empty()).count();
     layout.hardware = console::hardware(1 + usize::from(args.engine.split_device.is_some()), sparks,
-        args.engine.local_expert_layers.is_some());
+        args.engine.fixed_onboard());
     layout.split = args.engine.split_device.map(|_| "head split".into());
     layout.concurrency = args.engine.max_sequences;
     layout.eos = eos_token(&args.engine.snapshot).ok().into_iter().collect();

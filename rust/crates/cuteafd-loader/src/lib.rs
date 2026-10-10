@@ -38,6 +38,7 @@ mod snapshot;
 mod tensors;
 mod tokenizer;
 pub mod plan;
+pub mod placement;
 pub mod page_cache;
 
 pub use formats::attention_format::{

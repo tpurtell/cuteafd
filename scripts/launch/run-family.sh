@@ -474,13 +474,22 @@ fi
 # prefill (the engine's default 0.2; 0 prefills whole prompts before the next
 # step). Keys left unset pass nothing (images older than the options run).
 [[ -z "$(get DECODE_SHARE)" ]] || family_args+=(--decode-share "$(get DECODE_SHARE)")
-# DeepSeek V4 keeps complete expert layers local while memory permits. Honor
-# an explicit limit; zero leaves the backbone experts on the Sparks.
+# RTX_EXPERT_LAYERS (DeepSeek V4, the shared placement solver): auto reserves
+# the KV pool (2M PRO / 1M <=32 GB) first and fills what is left with whole
+# routed-expert layers; N, N% or all fix the RTX-resident layers and the KV
+# pool takes every remaining byte (refused below the compiled context). 0
+# leaves the backbone experts on the Sparks.
 if [[ $serve == serve-dsv4 ]]; then
   local_layers="$(get RTX_EXPERT_LAYERS auto)"
   case "$local_layers" in
     ""|auto) ;;
-    *[!0-9]*) echo "RTX_EXPERT_LAYERS must be auto or a nonnegative integer" >&2; exit 2 ;;
+    all) family_args+=(--rtx-expert-layers all) ;;
+    *%)
+      percent="${local_layers%\%}"
+      [[ "$percent" =~ ^[0-9]+([.][0-9]+)?$ ]] && awk -v p="$percent" 'BEGIN { exit !(p <= 100) }' ||
+        { echo "RTX_EXPERT_LAYERS must be auto, all, N or N% (0..100%)" >&2; exit 2; }
+      family_args+=(--rtx-expert-layers "$local_layers") ;;
+    *[!0-9]*) echo "RTX_EXPERT_LAYERS must be auto, all, N or N% (0..100%)" >&2; exit 2 ;;
     *) family_args+=(--local-expert-layers "$local_layers") ;;
   esac
 fi

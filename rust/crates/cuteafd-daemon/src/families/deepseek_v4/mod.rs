@@ -1,6 +1,8 @@
 //! DeepSeek V4 (Flash / Pro) coordinator engine over the exported b12x programs.
 pub(crate) mod engine;
-mod admission;
+pub(crate) mod admission;
+#[cfg(test)]
+mod placement_tests;
 pub(crate) mod local;
 pub(crate) mod metadata;
 pub(crate) mod pool;
@@ -55,8 +57,13 @@ pub(crate) struct EngineArgs {
     /// planner admission from measured free memory before cache allocation.
     #[arg(long, default_value_t = 0)]
     pub pool_tokens: usize,
-    /// Routed-expert layers to keep on the coordinator GPU (from layer 0);
-    /// they fill free memory by default. 0 sends every layer to the Sparks.
+    /// Routed-expert layers to keep on the coordinator GPUs (from layer 0):
+    /// `auto` reserves the KV pool first and fills what is left; `N`, `N%`
+    /// or `all` fix the RTX layers and the KV pool takes every remaining
+    /// byte. 0 sends every layer to the Sparks.
+    #[arg(long, value_parser = parse_onboard, conflicts_with = "local_expert_layers")]
+    pub rtx_expert_layers: Option<cuteafd_loader::placement::Onboard>,
+    /// Alias of `--rtx-expert-layers N`.
     #[arg(long)]
     pub local_expert_layers: Option<usize>,
     /// Keep the dSpark drafter's stage experts on the coordinator GPU (before
@@ -138,6 +145,26 @@ pub(crate) struct GoldenArgs {
     /// up to twice the prefill rows per chunk); layer streams are then not compared.
     #[arg(long)]
     pub resume_lanes: bool,
+}
+
+fn parse_onboard(text: &str) -> std::result::Result<cuteafd_loader::placement::Onboard, String> {
+    text.parse()
+}
+
+impl EngineArgs {
+    /// The resolved `--rtx-expert-layers` / `--local-expert-layers`.
+    pub(crate) fn onboard(&self) -> Result<cuteafd_loader::placement::Onboard> {
+        use cuteafd_loader::placement::Onboard;
+        Ok(match (self.rtx_expert_layers, self.local_expert_layers) {
+            (Some(onboard), _) => onboard,
+            (None, Some(layers)) => Onboard::Layers(layers),
+            (None, None) => Onboard::Auto,
+        })
+    }
+
+    pub(crate) fn fixed_onboard(&self) -> bool {
+        !matches!(self.onboard(), Ok(cuteafd_loader::placement::Onboard::Auto))
+    }
 }
 
 fn f32s(bytes: &[u8]) -> Vec<f32> {
@@ -261,85 +288,36 @@ pub(crate) fn with_engine<T>(
         &args.snapshot, &args.manifest, "deepseek_v4", args.max_context)?;
     let prefill_rows = caps["prefill_rows"].as_u64().context("prefill_rows")? as usize;
     let decode_rows = caps["decode_rows"].as_u64().context("decode_rows")? as usize;
-    // Reserve KV on every GPU before whole-layer expert placement.
+    // One shared admission solve (`cuteafd_loader::placement`), the same
+    // request `cuteafd plan --layout` resolves, over one measured sample per
+    // GPU taken after weights and modules and before any cache or expert.
     let placement = {
+        use cuteafd_loader::placement::{Baseline, Onboard};
         ensure!(args.max_sequences > 0, "--max-sequences must be positive");
         let devices: Vec<_> = std::iter::once(args.device).chain(split_device).collect();
-        let memory = devices.iter().map(|&device| crate::shared::peer_split::on_device(
+        let gpus = devices.iter().map(|&device| crate::shared::peer_split::on_device(
             &loaded.library, device, args.device, || {
                 let (free, total) = loaded.library.cuda_memory_info()?;
-                Ok(cuteafd_core::serving_capacity::DeviceMemory { device: u32::try_from(device)?,
-                    total_bytes: total as u64, baseline_free_bytes: free as u64 })
+                Ok((total as u64, Baseline::Measured { free_bytes: free as u64 }))
             })).collect::<Result<Vec<_>>>()?;
         let cache_stages = model.dspark.as_ref().map_or(0, |d| d.stages.len());
-        // The loader's legacy config requests one nextn stage, but a dSpark
-        // checkpoint loads all three concrete stages. Describe those actual
-        // cache owners rather than the caller's nextn configuration.
-        let mut cache_cfg = loaded.cfg.clone();
-        cache_cfg.n_mtp_layers = cache_stages;
-        let geometry = cuteafd_loader::serving_capacity::deepseek_v4_cache_geometry(
-            &cache_cfg, devices.len(), prefill_rows as u64, cache_stages)?;
-        let mark = geometry.ranks.iter().map(|r| r.retained_mark_bytes).sum::<u64>();
-        let slots = prefix.filter(|p| p.prefix_cache_entries > 0).map_or(0, |p|
-            cuteafd_engine::prefix::MarkArena::slots_for(args.max_sequences, p.prefix_cache_entries,
-                mark as usize, p.prefix_cache_mark_mib << 20));
-        let scratch = cuteafd_loader::serving_capacity::deepseek_v4_workspace_scratch(
-            &loaded.manifest, loaded.family, split_device.is_some(), prefill_rows as u64, decode_rows as u64)?;
-        let workspace = cuteafd_loader::serving_capacity::deepseek_v4_workspace_geometry(
-            &cache_cfg, prefill_rows as u64, decode_rows as u64,
-            cuteafd_loader::serving_capacity::compiled_c128_width(&loaded.manifest, loaded.family)? * 128,
-            devices.len(), scratch)?;
-        let peer = if devices.len() == 2 {
-            cuteafd_loader::serving_capacity::deepseek_v4_peer_exchange_bytes(
-                loaded.cfg.dim as u64, prefill_rows as u64, decode_rows as u64)?
-        } else { 0 };
-        let intake = if args.skip_routed_experts { 0 } else {
-            engine::PREFILL_LANES as u64 * args.peers.split(',').filter(|p| !p.is_empty()).count() as u64
-                * 4096 * loaded.cfg.dim as u64 * 2
-        };
-        let shape = admission::Shape { sequences: args.max_sequences, prefill_rows, decode_rows, max_context,
-            reserve_bytes: (args.reserve_gib as u64) << 30,
-            prefix_bytes: geometry.ranks.iter().map(|r| r.retained_mark_bytes * slots as u64).collect(),
-            workspace_bytes: Some(workspace.iter().enumerate().map(|(rank, r)|
-                r.fixed_device_bytes + if rank == 0 { intake } else { 0 }
-                    + if devices.len() == 2 { cuteafd_loader::serving_capacity::deepseek_v4_expert_exchange_bytes(
-                        loaded.cfg.dim as u64, loaded.cfg.n_activated_experts as u64,
-                        prefill_rows as u64, decode_rows as u64, rank).unwrap() } else { 0 }).collect()), peer_bytes: peer };
-        let profile = admission::profile(&geometry, &memory, &shape, &[])?;
-        let available: Vec<_> = profile.devices.iter().zip(&memory).map(|(cost, sample)|
-            sample.baseline_free_bytes.saturating_sub(cost.reservations.iter().map(|r| r.bytes).sum())).collect();
+        let onboard = args.onboard()?;
         let stages = if args.dspark && !args.skip_routed_experts { cache_stages } else { 0 };
-        let routed = loaded.catalog.routed_experts();
-        let mut weights = if args.skip_routed_experts { Vec::new() } else {
-            (routed.first_layer..routed.layers).map(|layer|
-                cuteafd_loader::serving_capacity::deepseek_v4_expert_cost(&loaded.catalog, layer, false))
-                .collect::<Result<Vec<_>>>()?
-        };
-        let draft = (0..stages).map(|stage|
-            cuteafd_loader::serving_capacity::deepseek_v4_expert_cost(&loaded.catalog, stage, true))
-            .collect::<Result<Vec<_>>>()?;
-        let workspace = if args.skip_routed_experts || (args.local_expert_layers == Some(0) && stages == 0) { 0 }
-            else { match local::workspace_bytes(&loaded.library, &args.native_lib, &loaded.catalog,
-                prefill_rows.max(decode_rows))? {
-                Some(bytes) => bytes as u64,
-                None => {
-                    ensure!(stages == 0 && args.local_expert_layers.is_none(),
-                        "V4 local expert kernels are missing: export the matching rtx_backbone package for explicit local layers/dSpark");
-                    tracing::warn!("V4 local expert kernels unavailable; routing all backbone layers to Sparks");
-                    weights.clear();
-                    0
-                }
-            } };
-        let placement = cuteafd_loader::serving_capacity::deepseek_v4_placement(&available,
-            &memory.iter().map(|m| m.total_bytes).collect::<Vec<_>>(),
-            &profile.devices.iter().map(|d| d.pool_unit_bytes).collect::<Vec<_>>(), geometry.logical_unit_rows,
-            (args.pool_tokens > 0).then_some(args.pool_tokens as u64), None, routed.first_layer,
-            &weights, &draft, workspace, if args.skip_routed_experts { Some(0) } else { args.local_expert_layers })?;
-        let profile = admission::profile(&geometry, &memory, &shape,
-            &placement.ranks.iter().map(|r| r.peak_bytes).collect::<Vec<_>>())?;
-        admission::resolve_pool(&profile, &memory, args.max_sequences, Some(placement.pool_tokens))?;
-        tracing::info!(pool_tokens = placement.pool_tokens, local_per_gpu = ?placement.ranks,
-            "DeepSeek V4 pool-first admission");
+        let expert_workspace = if args.skip_routed_experts || (onboard == Onboard::Layers(0) && stages == 0) { Some(0) }
+            else { local::workspace_bytes(&loaded.library, &args.native_lib, &loaded.catalog,
+                prefill_rows.max(decode_rows))?.map(|bytes| bytes as u64) };
+        let inputs = admission::Inputs { cfg: &loaded.cfg, catalog: &loaded.catalog, manifest: &loaded.manifest,
+            family: loaded.family, gpus, cache_stages, prefill_rows, decode_rows, max_context, prefix,
+            expert_workspace };
+        let request = admission::request(args, &inputs)?;
+        let placement = cuteafd_loader::placement::solve(&request)
+            .map_err(|error| anyhow::anyhow!("DeepSeek V4 admission: {error}"))?;
+        tracing::info!(pool_tokens = placement.pool_tokens, onboard = %onboard, onboard_layers = placement.onboard_layers,
+            local_per_gpu = ?placement.expert_ranges, "DeepSeek V4 placement: {}", placement.summary());
+        cuteafd_bench::context::set_resolved("rtx-expert-layers", &placement.onboard_layers.to_string());
+        cuteafd_bench::context::set_resolved("rtx-expert-ranges", &placement.expert_ranges.iter()
+            .map(|r| format!("{}..{}", r.first, r.first + r.layers)).collect::<Vec<_>>().join(","));
+        cuteafd_bench::context::set_resolved("pool-tokens", &placement.pool_tokens.to_string());
         placement
     };
     max_context = crate::shared::context::pool_context("deepseek_v4", max_context, args.max_context == 0,
@@ -381,7 +359,7 @@ pub(crate) fn with_engine<T>(
     let _ = held; // Prefix bytes were reserved before placement.
     let started = Instant::now();
     let stages = if args.dspark { engine.weights.dspark.as_ref().map_or(0, |d| d.stages.len()) } else { 0 };
-    for (rank, range) in placement.ranks.iter().enumerate() {
+    for (rank, range) in placement.expert_ranges.iter().enumerate() {
         let device = if rank == 0 { args.device } else { split_device.context("expert peer device")? };
         let stream = if rank == 0 { stream } else { peer_stream.context("expert peer stream")?.1 };
         let local = if skip { None } else { crate::shared::peer_split::on_device(&loaded.library, device,
@@ -392,7 +370,7 @@ pub(crate) fn with_engine<T>(
             "DeepSeek V4 GPU{rank} local expert allocation differs from admitted placement");
         engine.install_local(rank, range.first, local)?;
     }
-    tracing::info!(local_per_gpu = ?placement.ranks, elapsed_ms = started.elapsed().as_millis() as u64,
+    tracing::info!(local_per_gpu = ?placement.expert_ranges, elapsed_ms = started.elapsed().as_millis() as u64,
         "DeepSeek V4 expert layers resident on coordinator GPUs");
     // Implicit Spark worlds: TP4 executors 1..=4, TP2 5..=6, TP3 7..=9, TP6 27..=32.
     let executors = (0..peers.len())

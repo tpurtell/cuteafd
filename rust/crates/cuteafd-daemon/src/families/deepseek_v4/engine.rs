@@ -1444,7 +1444,6 @@ impl<'a> Engine<'a> {
             return Ok(());
         }
         let Scalar::I32(t) = rows else { unreachable!() };
-        let h = self.cfg.dim;
         self.run("router_scores", &[
             ("x", w.y.buffer.ptr), ("w", weights.ptr("gate")?), ("logits", w.logits.buffer.ptr),
         ], &[rows])?;

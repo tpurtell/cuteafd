@@ -300,6 +300,11 @@ pub(crate) struct PlanArgs {
     /// Routed backbone expert layers resident on RTX (DeepSeek).
     #[arg(long)]
     pub(crate) local_expert_layers: Option<usize>,
+    /// Families on the shared placement solver (V4): RTX-resident routed
+    /// layers, `auto` (pool first), `N`, `N%` or `all` (the KV pool is then
+    /// the output). Overrides --local-expert-layers.
+    #[arg(long, value_parser = |text: &str| text.parse::<cuteafd_loader::placement::Onboard>())]
+    pub(crate) rtx_expert_layers: Option<cuteafd_loader::placement::Onboard>,
     /// Compiled maximum context for table and workspace reservations (0: family/image default).
     #[arg(long, default_value_t = 0)]
     pub(crate) context_tokens: u64,

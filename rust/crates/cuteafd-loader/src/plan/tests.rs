@@ -878,10 +878,18 @@ fn v4_pool_first_defaults_and_explicit_layer_failure() {
     let explicit = solve(24 << 30, Some(262144), Some(2));
     assert!(explicit.placement_supported);
     assert_eq!(explicit.memory_layout.unwrap().pool_tokens, 262144);
+    // Explicit layers that do not fit beside the fixed demands are refused,
+    // naming how many would.
     let rejected = solve(16 << 30, Some(2 << 20), Some(4));
     assert!(!rejected.placement_supported);
-    assert!(rejected.memory_layout.unwrap().notes.iter().any(|n|
-        n.contains("explicit local expert layers do not fit after reserving KV")));
+    assert!(rejected.memory_layout.as_ref().unwrap().notes.iter().any(|n|
+        n.contains("4 RTX expert layers do not fit beside the fixed demands")),
+        "{:?}", rejected.memory_layout.as_ref().unwrap().notes);
+    // A fixed onboard alone makes the pool the output: above the 1M target here.
+    let fixed = plan(dir.path(), &PlanOptions { layout: Some(layout::LayoutOptions { rtx_bytes: vec![24 << 30],
+        onboard: crate::placement::Onboard::Layers(1), ..Default::default() }), ..sparks(2) }).unwrap();
+    assert!(fixed.placement_supported);
+    assert!(fixed.memory_layout.unwrap().pool_tokens > 1 << 20);
 }
 
 #[test]
