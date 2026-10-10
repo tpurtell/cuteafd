@@ -2794,6 +2794,30 @@ and the GPU1 EXL3 ranges (`RTX_EXPERT_PEER=on`) are opt-in. The way to get
 both the 2M pool and the RTX experts is TP2 on two RTX (`P4`), not a
 different single-GPU split.
 
+**Decision (TJ, 2026-10-10): KV planning is the default rule; TP2 is the only
+dual-RTX expert mode.**
+- **The default is the pool-first rule** (`Onboard::Auto`). The C1 cost P1
+  measured comes from unfinished work, not from the rule:
+  - on 2 RTX, TP2 is missing (`P4`);
+  - on 1 RTX, the planner's constant over-reservations (`P2`) cost the
+    layers.
+
+  `ExpertsFirst` is an interim fallback only. It is deleted, and `auto`
+  becomes the V4 default, in the same steps that recover the layers: `P4`
+  for 2 RTX and `P2` for 1 RTX. Both land before the first v3 cut.
+- **In a 2-RTX configuration, routed experts on the RTX cards are always TP2
+  halves**, folded into the head split's existing all-reduce. `P4` deletes:
+  - TP1 routed experts on one GPU (today's V4 default leaves GPU1 nearly
+    empty);
+  - the GPU1 whole-layer expert ranges (`RTX_EXPERT_PEER`, a hidden-state
+    hop each way per layer, and the path with the two-lane deadlock).
+
+  Neither can beat TP2 on PCIe.
+- **Single-RTX layouts are TP1 by nature.** Per-layer GPU ownership
+  (`Whole{gpu}`: attention, KV and that layer's work on one GPU) stays a
+  general capability, and its FFN uses TP2 split or V4.1's owner-reduce per
+  `FfnMode`.
+
 Two latent bugs from b2f26af9's GPU1 ranges are inputs to `P3`/`P4`:
 - native `rtx_backbone` expert variants bind to the first CUDA device
   (`cudaErrorInvalidDevice` on GPU1);
