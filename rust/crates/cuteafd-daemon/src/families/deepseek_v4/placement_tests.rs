@@ -146,6 +146,14 @@ fn assert_equal(case: &Case<'_>, label: &str) -> Placement {
     assert!(runtime.items.iter().flatten().all(|i| i.group != "residual hops"), "{label}: hop buffers");
     super::check_modes(&runtime, case.rtx == 2).unwrap_or_else(|e| panic!("{label}: {e:#}"));
     assert!(super::check_modes(&runtime, case.rtx != 2).is_err(), "{label}: the other engine shape is refused");
+    if let Some(t) = runtime.tp2 {
+        assert!(runtime.expert_ranges.iter().all(|r| r.layers == 0));
+        assert!(layout.notes.contains(&format!("rtx0/rtx1: {} TP2 expert layer halves ({}..{})", t.layers, t.first, t.first + t.layers)));
+        for gpu in 0..2 {
+            let bytes: u64 = layout.devices[gpu].items.iter().filter(|i| i.format == "tp2").map(|i| i.bytes).sum();
+            assert_eq!(bytes, t.peak_bytes[gpu], "{label}: rtx{gpu} TP2 arena");
+        }
+    }
     runtime
 }
 

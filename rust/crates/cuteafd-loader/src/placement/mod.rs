@@ -9,14 +9,10 @@
 //! movables (drafter stage experts) are charged before the pool too, so an
 //! automatic pool can never crowd them out.
 //!
-//! Placement PR 1 added `HeadSplit` and `Whole` layer modes and contiguous
-//! whole-layer expert ranges (GPU0, then GPU1). PR 3 adds per-layer
-//! ownership: the residual's home at every layer boundary ([`ResidualHome`]),
-//! the [`Hop`]s the modes imply (their receive buffers charged as fixed
-//! demands) and the executor's mode set ([`ExecutorModes`]), refused at plan
-//! time when a layer would need a mode the family cannot run.
-//! Peer-accessible two-GPU builds use a contiguous TP2 expert prefix; TP1
-//! arena-sharing movables retain a separate arena and workspace.
+//! Per-layer residual homes and hops are validated against the executor's
+//! mode set; hop receive buffers are fixed demands. Peer-accessible two-GPU
+//! builds use a contiguous TP2 expert prefix with no additional residual hop;
+//! TP1 arena-sharing movables retain a separate arena and workspace.
 use cuteafd_core::memory_layout::{Basis, Category, Item};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
