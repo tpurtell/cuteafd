@@ -297,7 +297,7 @@ fn solve_once(request: &PlacementRequest, flips: &[(AttentionClass, AttentionPla
         }
         units / 2 * 2
     } else { units };
-    if units == 0 || units.saturating_mul(request.pool.unit_rows) < request.pool.floor {
+    if context && (units == 0 || units.saturating_mul(request.pool.unit_rows) < request.pool.floor) {
         let pool = units.saturating_mul(request.pool.unit_rows);
         return Err(PlacementError::BelowFloor { pool, floor: request.pool.floor, layers: 0,
             short: request.pool.floor.saturating_sub(pool) });
