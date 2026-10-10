@@ -4512,11 +4512,46 @@ done a worse way just to stay plugin-only.
 | W2 | `dsh-llm-cuteafd` adapter plugin: Responses WebSocket per DSH session, `previous_response_id` plus delta input when the new input extends the last request and its output, full input otherwise (pi-ai's rule, which it offers only for Codex OAuth routes); reconnect sends the full input. Selectable per route (`transport: websocket`), default for the cuteafd route | M | Requests the engine sees are byte-identical to the HTTP path on recorded sessions with retry, compaction and edit; bytes per step before -> after; prefix-cache hit tokens per step; no C1 regression |
 | W3 | Plugins and version bumps: DSH's **Plugins** page stays on so the operator can add, enable and configure bundles (npm, git, path); the agent's `plugin_manager` tool and the creator preset stay off, so the model cannot install code. `dsh-smoke.sh` starts the pinned image, runs one task with a tool call, checks the theme and our bundle loading, and exits | S | A third-party bundle installs from the Plugins page and survives restart; the smoke passes on the pin and on the newest upstream release at the time |
 
-**Execution over SSH is back in reach** (W4, after W0-W3). It was deferred only
-because the Web workspace lacked remote support. With patching allowed, the
-fork makes the workspace registry and folder picker host-aware directly
-(long-term step 2). Until W4 lands, tools run inside the sidecar against a
-workspace on the mounted folder, and the folder holds no SSH keys.
+**Every session works on a remote host over SSH (TJ, 2026-10-11).** A
+session's workspace is a folder on an SSH host chosen when the session starts.
+Every tool runs there: shell, files, terminal, search, LSP, jobs. Nothing runs
+inside the container; it holds only the UI, the agent loop, config and
+credentials. Our fork makes this the only execution mode.
+- **Session binding.** New session: pick a registered host, then a folder on
+  it with the SSH-backed picker. The session stores `(host alias, path)`, and
+  every `ctx.fs`, `ctx.subprocess`, `ctx.sandbox` and terminal call for it
+  routes to that host through `dsh-ssh` (`fs-ssh`, ssh subprocess, the ssh
+  realm). The shell is the remote user's login shell with the remote
+  environment; nothing is copied from the container.
+- **Local execution is removed, not just hidden.** The local fs, shell, ptc
+  and sandbox rows are unmounted. A session with no reachable host fails
+  with a clear error; it never falls back to the container.
+- **Fork patches** (the seams are missing or local-only):
+  - a host-aware `WorkspaceRegistry` keyed by `(host, path)`;
+  - the SSH directory picker;
+  - remote `@file` completion;
+  - polling `watch` for `fs-ssh`;
+  - session-to-host binding in the session record;
+  - restoring a session reconnects to its host.
+- **Hosts and keys.** A settings card registers hosts: alias, hostname, user,
+  port, key paste or generate, and a `known_hosts` confirm showing the
+  fingerprint.
+  - Keys stay at 0600 under `/data/home/.ssh/keys/`. The generated
+    `ssh_config` uses `IdentitiesOnly`, `BatchMode`,
+    `StrictHostKeyChecking=yes` and `ForwardAgent=no`.
+  - Because no tool runs in the container, the model has no path to read
+    the key files. Plugin install stays operator-only, as in W3.
+  - The pinned `dsh-ssh` helper is installed on first connect. The arm64
+    and x64 builds embed Node, so Sparks need nothing preinstalled.
+- **Cluster hosts.** The cluster's hosts can be registered like any other
+  host. A session on a host currently serving a model shows a warning.
+
+This makes W4 part of the first usable version: W0 ships with a minimal host
+picker and the remote binding, so no container execution path ever exists.
+
+| # | Step | Size | Gate |
+|---|------|------|------|
+| W4 | Remote-only execution: host and key settings card, SSH picker, host-aware workspace registry, session to host binding, remote `@file`, `fs-ssh` watch, local execution rows unmounted. Lands with W0 for the first usable build | M | On one Spark: bash, read, edit, search, terminal and file watch run remotely with the remote user's shell and environment; nothing executes in the container (process audit while a session works); two sessions on two hosts at once; restart then restore reconnects; the model cannot read the key file through any tool |
 
 ### Staged steps and gates
 
