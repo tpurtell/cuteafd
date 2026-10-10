@@ -4693,6 +4693,51 @@ for one request, `dspark_policy.rs:647`) is the allocator. Changes:
 | D4 | MiMo (DFlash + MTP block), then GLM 5.3 (shares the GLM binding), then Qwen (chain depth as the pre-draft action), then V4 (fixed-width binding first) | M, S, M, S | per family: the D2 card on its min/max |
 | D5 | Delete `CycleCost`, `Calibration`, `allocate`, the v2 buckets, `glm5/dflash_policy.rs` planning, per-family copy-length loops; `shared/draft_policy.rs` keeps `DraftHistory` and the trace path only | S | tests; failing ids unchanged |
 
+**D2 outcome (2026-10-10, work/v3-d2; opt-in `GLM5_FLASH_DRAFT_POLICY=shared`).**
+GLM Flash's geometry: 45 layers, 3 dense (`class: None`), 42 MoE layers
+`remote` (Spark) or `local` (coordinator FP8/EXL3), `slice_bytes` from
+`Fp8Layer::bytes_for` (widest rank / experts) or the EXL3 manifest's
+per-projection tiers (payload + rotations over the widest rank's slice),
+`group_rows` 16, one regime, the drafter's block as the single width, the
+step's row budget as `max_requests`. Layer events at the `layer_mark` sites,
+Spark ids from the staging, local ids through a pinned D2H ring behind the
+router (checked on hardware against the staged ids: 48,426 layers, 0
+mismatched), DFlash2 through the keyed `SelectorFit`, dSpark through its head
+blend, Platt in the core, executed rows with EOS/output-limit censoring, the
+draft bracket around the draft call. The cold-five and lone-five DFlash2 rules
+stay as adapter data. Planning costs 36-45 µs per round (max 2.2 ms at C16);
+the events and ring do not move the verify step.
+
+Matched-prompt pairs on one sealed build (`--arm-wip`, `cycle` vs `shared`),
+rc3 kit cards at C16 admission; the C1-after-C16 point is the code request of
+the `decode_content` panel run right after the C1..C16 sweep. Paired medians
+shared/cycle:
+
+| card | pairs | fresh C1 | sweep C1 | C1 after C16 | C4 | C16 | emitted |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| EXL3 min, rows 64 | 1 | 1.041 | 1.020 | 1.114 | 1.003 | 1.019 | 1.017 |
+| EXL3 min, rows 128 | 3 | 0.961 | 1.019 | **1.313** | 0.979 | 1.057 | 1.039 |
+| FP8 min, rows 64 | 3 | 0.954 | 1.042 | 1.017 | 0.958 | 0.982 | 1.039 |
+| EXL3 max, rows 64 | 3 | 0.996 | 0.956 | 1.021 | 1.008 | 0.983 | 1.059 |
+| FP8 max, rows 64 | 3 | 1.057 | 1.153 | 1.046 | 1.027 | 1.004 | 1.078 |
+
+The glmf-defaults-on failure reproduces on `cycle` (EXL3 min rows 128: C1
+after C16 / sweep C1 0.712, 0.901, 0.701) and `shared` removes it (0.975,
+0.979, 0.935). "Fresh C1" is the server's first 320-token code request, ~14
+rounds after start, while the shared fits are barely warm; single-request
+points swing ±6-10% between same-arm repeats. C4 is one 4-wide wave whose
+aggregate follows its slowest member (±7% same-arm); per-request C4 is
+1.02 median. On max the fitted per-layer row slope is twice min's (11.0 vs
+5.7 µs/row/layer: the head split adds attention and exchange per row), and
+shared verifies slightly shorter C1 prefixes there (sweep C1 0.956).
+FP8 post-sweep decode drops on both arms alike (server state, not policy).
+Fidelity, cache and speculation checks pass or report near-ties identically
+on both arms. Default stays `cycle` for now: fresh C1 on the min cards (first
+cold request) and sweep C1 on EXL3 max sit at 0.95-0.96, under the 0.99 bar.
+The no-Spark (2 RTX) and mixed-placement edge cards need P6/P7 and gate D3/D4;
+GLM Flash experts (115.6 GiB at K3.25) do not fit one RTX.
+
+
 **V4.1 moves byte-exactly** because D0 and D1 change types, not decisions: the
 geometry reproduces its constants, the clock reproduces the independent
 path's boundaries, and the binding's copy handling is unchanged. The serial
