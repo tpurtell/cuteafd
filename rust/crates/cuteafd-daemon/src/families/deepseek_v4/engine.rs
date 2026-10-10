@@ -28,7 +28,8 @@ use std::time::Instant;
 
 mod dspark;
 mod tp2;
-use tp2::{ExchangePolicy, Tp2State};
+pub(crate) use tp2::ExchangePolicy;
+use tp2::Tp2State;
 pub(crate) use dspark::DraftRequest;
 
 type Dev<'a> = DeviceAllocation<'a>;
@@ -75,6 +76,8 @@ pub(crate) struct Engine<'a> {
     tp2: Option<Tp2State<'a>>,
     exchange_policy: ExchangePolicy,
     capture_only: std::cell::Cell<bool>,
+    graph_captures: std::cell::Cell<usize>,
+    expert_graph_captures: std::cell::Cell<usize>,
 }
 
 /// The second GPU of a two-GPU head split (rank 1): its share of every
@@ -134,6 +137,8 @@ struct GraphKey {
     table_width: usize,
     table_stride: usize,
     previous: usize,
+    tp2_broadcast: bool,
+    exchange_f32: bool,
 }
 
 /// The decode step's tail (last post, taps, drafter KV, head) as a graph key layer.
@@ -464,6 +469,8 @@ impl<'a> Engine<'a> {
             tp2: None,
             exchange_policy: ExchangePolicy::from_env()?,
             capture_only: std::cell::Cell::new(false),
+            graph_captures: std::cell::Cell::new(0),
+            expert_graph_captures: std::cell::Cell::new(0),
             rope_window: table(false)?,
             rope_compressed: table(true)?,
             pools,
@@ -506,8 +513,8 @@ impl<'a> Engine<'a> {
         self.workspace_on(0, t, lanes)
     }
 
-    /// Rank `rank`'s workspace (rank 1 has no router, expert, drafter or head
-    /// buffers), allocated on that rank's GPU.
+    /// Rank `rank`'s workspace (rank 1 has router replicas but no drafter or
+    /// vocabulary head buffers), allocated on that rank's GPU.
     fn workspace_on(&self, rank: usize, t: usize, lanes: usize) -> Result<Workspace<'a>> {
         self.on(rank, || self.workspace_here(rank, t, lanes))
     }
@@ -875,6 +882,7 @@ impl<'a> Engine<'a> {
             }
             if !decode {
                 for (index, (step, lane)) in lanes.iter().zip(&w.lanes).enumerate() {
+                    self.record_peer(0, "entry", DIRECT, true, 0, index);
                     self.exchange()?.push_to(0, DIRECT, lane.stream_a.buffer.ptr, w1.lanes[index].stream_a.buffer.ptr,
                         step.tables.rows * 4 * h * 2)?;
                 }
@@ -921,6 +929,7 @@ impl<'a> Engine<'a> {
                         self.gather_streams(lane, t)?;
                     }
                     if let (0, Some(w1)) = (layer, w1) {
+                        self.record_peer(0, "entry", DIRECT, true, 0, 0);
                         self.exchange()?.push_to(0, DIRECT, lane.stream_a.buffer.ptr, w1.lanes[0].stream_a.buffer.ptr,
                             t * 4 * h * 2)?;
                     }
@@ -948,6 +957,7 @@ impl<'a> Engine<'a> {
                     table_width: tables.c4_table_width,
                     table_stride: tables.c4_table_stride,
                     previous,
+                    tp2_broadcast: false, exchange_f32: false,
                 };
                 if let Some(link) = device.filter(|_| layer >= local_layers) {
                     // Announced before the replay can publish it: the proxy spins for it.
@@ -974,7 +984,7 @@ impl<'a> Engine<'a> {
             // The tail: the last post, its taps and the drafter's KV, then the head.
             let last = self.weights.layers.len() - 1;
             let key = GraphKey { layer: TAIL_SEGMENT, rows: t, chunked: false, attention: "tail", table_width: 0,
-                table_stride: 0, previous: ranks };
+                table_stride: 0, previous: ranks, tp2_broadcast: false, exchange_f32: false };
             self.replay(key, || -> Result<()> {
                 if ranks > 0 {
                     self.post_layer(w, lane, 0, ranks, decode_planes, rows, last)?;
@@ -1133,6 +1143,11 @@ impl<'a> Engine<'a> {
 
     /// [`Self::replay`] on rank `rank`'s stream (its own graphs).
     fn replay_on(&self, rank: usize, key: GraphKey, segment: impl FnOnce() -> Result<()>) -> Result<()> {
+        let mut key = key;
+        if let Some(tp2) = &self.tp2 {
+            key.tp2_broadcast = tp2.broadcast();
+            key.exchange_f32 = self.exchange_policy.is_f32(key.rows, self.decode_rows);
+        }
         // Diagnostic copies must never become permanent graph nodes.
         if self.tp2.as_ref().is_some_and(|t| t.checking.get()) && !self.capture_only.get() {
             return segment();
@@ -1155,6 +1170,10 @@ impl<'a> Engine<'a> {
         captured?;
         let exec = exec?;
         if !self.capture_only.get() { self.on(rank, || unsafe { self.library.cuda_graph_launch(exec, stream) })?; }
+        self.graph_captures.set(self.graph_captures.get() + 1);
+        if key.attention.starts_with("tp2-") {
+            self.expert_graph_captures.set(self.expert_graph_captures.get() + 1);
+        }
         graphs.borrow_mut().insert(key, GraphExec(exec, self.library));
         Ok(())
     }
@@ -1172,7 +1191,7 @@ impl<'a> Engine<'a> {
         };
         let key = GraphKey { layer, rows: t, chunked: tables.chunked,
             attention: self.attention_kind(self.peer()?.layers[layer].ratio, tables),
-            table_width: tables.c4_table_width, table_stride: tables.c4_table_stride, previous: usize::from(layer > 0) };
+            table_width: tables.c4_table_width, table_stride: tables.c4_table_stride, previous: usize::from(layer > 0), tp2_broadcast: false, exchange_f32: false };
         self.replay_on(1, key, segment)
     }
 
@@ -1248,8 +1267,10 @@ impl<'a> Engine<'a> {
         };
         let (exchange, ffn) = (self.exchange()?, slot(layer, true, index));
         if layer + 1 < self.cfg.n_layers {
+            self.record_peer(0, "ffn", ffn, true, layer, index);
             exchange.push(0, ffn, base, count as usize * self.cfg.dim * 2)?;
         }
+        self.record_peer(0, "ffn", ffn, false, layer, index);
         exchange.wait(0, ffn)?;
         self.add(0, base, exchange.recv(0, ffn)?, w.sum.buffer.ptr, count as usize)?;
         self.run("mhc_post", &[
@@ -1268,6 +1289,7 @@ impl<'a> Engine<'a> {
         let weights = &peer.layers[layer];
         let exchange = self.exchange()?;
         if layer == 0 {
+            self.record_peer(1, "entry", DIRECT, false, 0, index);
             exchange.wait(1, DIRECT)?;
         }
         self.attention_front(1, layer, weights, tables, lane, w, rows, cap)?;
@@ -1285,6 +1307,7 @@ impl<'a> Engine<'a> {
             }
             Ok(())
         } else {
+            self.record_peer(1, "ffn", slot(layer, true, index), true, layer, index);
             exchange.push(1, slot(layer, true, index), lane.shared.buffer.ptr, t as usize * self.cfg.dim * 2)
         }
     }
@@ -1297,7 +1320,7 @@ impl<'a> Engine<'a> {
 
     fn expert_key(layer: usize, rows: usize, index: usize) -> GraphKey {
         GraphKey { layer, rows, chunked: false, attention: "local-experts",
-            table_width: 0, table_stride: 0, previous: index }
+            table_width: 0, table_stride: 0, previous: index, tp2_broadcast: false, exchange_f32: false }
     }
 
     /// Rank 1's FFN close of `layer` (not after the last layer): rank 0's routed +
@@ -1312,6 +1335,7 @@ impl<'a> Engine<'a> {
             return self.tp2_post(1, layer, index, w, lane, count as usize);
         }
         let (exchange, ffn) = (self.exchange()?, slot(layer, true, index));
+        self.record_peer(1, "ffn", ffn, false, layer, index);
         exchange.wait(1, ffn)?;
         self.add(1, exchange.recv(1, ffn)?, lane.shared.buffer.ptr, w.sum.buffer.ptr, count as usize)?;
         self.run_on(1, false, "mhc_post", &[
@@ -1354,7 +1378,9 @@ impl<'a> Engine<'a> {
         let Scalar::I32(t) = rows else { unreachable!() };
         let (exchange, at) = (self.exchange()?, slot(layer, false, lane));
         let bytes = t as usize * self.cfg.dim * 2;
+        self.record_peer(rank, "attention", at, true, layer, lane);
         exchange.push(rank, at, w.delta.buffer.ptr, bytes)?;
+        self.record_peer(rank, "attention", at, false, layer, lane);
         exchange.wait(rank, at)?;
         self.add(rank, w.delta.buffer.ptr, exchange.recv(rank, at)?, w.sum.buffer.ptr, t as usize)
     }
@@ -1639,6 +1665,7 @@ impl<'a> Engine<'a> {
     /// wire rows and results stay on the device, the host only enqueues.
     fn local_experts(&self, layer: usize, t: usize, w: &Workspace<'_>, lane: &Lane<'_>, cap: usize, index: usize) -> Result<()> {
         let timer = Instant::now();
+        self.count_route_fallback(layer);
         let run = || -> Result<()> {
             self.shared_ffn(layer, w, lane, Scalar::I32(t as i32), cap, &self.weights.layers[layer])?;
             if self.tp2_layer(layer) {

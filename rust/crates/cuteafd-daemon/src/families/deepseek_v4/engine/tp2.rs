@@ -6,12 +6,13 @@ use crate::shared::experts::rtx::{Combine, ExchangeDtype, ExpertInput, FusedComb
 use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::ops::Range;
+use crate::shared::peer_split::order::{self, Schedule};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum ExchangePolicy { Auto, Bf16, F32 }
+pub(crate) enum ExchangePolicy { Auto, Bf16, F32 }
 
 impl ExchangePolicy {
-    pub(super) fn from_env() -> Result<Self> {
+    pub(crate) fn from_env() -> Result<Self> {
         Self::parse(std::env::var("CUTEAFD_TP2_EXCHANGE").ok().as_deref().unwrap_or("auto"))
     }
 
@@ -22,6 +23,10 @@ impl ExchangePolicy {
             "f32" => Self::F32,
             other => anyhow::bail!("CUTEAFD_TP2_EXCHANGE must be auto, bf16 or f32, got {other:?}"),
         })
+    }
+
+    pub(super) fn is_f32(self, rows: usize, decode_rows: usize) -> bool {
+        self.dtype(rows, decode_rows) == ExchangeDtype::F32
     }
 
     fn dtype(self, rows: usize, decode_rows: usize) -> ExchangeDtype {
@@ -55,11 +60,17 @@ pub(super) struct Tp2State<'a> {
     source: Cell<RouteSource>,
     pub(super) checking: Cell<bool>,
     checks: RefCell<BTreeMap<(usize, usize), PendingCheck<'a>>>,
+    schedule: RefCell<Option<Schedule>>,
+    identity: RefCell<RouteIdentity>,
     interval: usize,
     steps: Cell<usize>,
     fallbacks: Cell<u64>,
     streams: [*mut c_void; 2],
     output_pending: [Cell<bool>; 2],
+}
+
+impl Tp2State<'_> {
+    pub(super) fn broadcast(&self) -> bool { self.source.get() == RouteSource::Broadcast }
 }
 
 impl<'a> Engine<'a> {
@@ -90,6 +101,7 @@ impl<'a> Engine<'a> {
             FusedCombine::new(self.library, ExchangeDtype::F32)?];
         self.tp2 = Some(Tp2State { layers: layers.clone(), ranks: ranks.map(RefCell::new), combine, routes,
             source: Cell::new(RouteSource::Replicated), checking: Cell::new(false), checks: RefCell::new(BTreeMap::new()),
+            schedule: RefCell::new(None), identity: RefCell::new(RouteIdentity::default()),
             interval, steps: Cell::new(0), fallbacks: Cell::new(0),
             streams: [self.stream, peer.stream], output_pending: [Cell::new(false), Cell::new(false)] });
         tracing::info!(layers = ?layers, "V4 RTX TP2 expert halves resident on both GPUs");
@@ -147,9 +159,10 @@ impl<'a> Engine<'a> {
                             ptr: w.logits.buffer.ptr.cast::<u8>().add(weights_at).cast(), ..w.logits.buffer
                         }, w.route_weights.buffer, bytes, stream)?;
                     }
+                    self.record_peer(0, "routes", slot, true, layer, index);
                     tp2.routes.push(0, slot, w.logits.buffer.ptr, weights_at + bytes)?;
-                    if !self.capture_only.get() { tp2.fallbacks.set(tp2.fallbacks.get() + 1); }
                 } else {
+                    self.record_peer(1, "routes", slot, false, layer, index);
                     tp2.routes.wait(1, slot)?;
                     let packed = tp2.routes.recv(1, slot)?;
                     // SAFETY: the received slot contains ids then aligned weights, published by rank 0.
@@ -169,6 +182,7 @@ impl<'a> Engine<'a> {
             tp2.output_pending[rank].set(false);
             // Publish before either stream queues its matching wait; no wait in the local expert path.
             if rank == 1 || layer + 1 < self.cfg.n_layers {
+                self.record_peer(rank, "ffn", slot(layer, true, index), true, layer, index);
                 self.exchange()?.push(rank, slot(layer, true, index), payload.buffer.ptr,
                     combine.payload_bytes(rows, self.cfg.dim))?;
             }
@@ -180,6 +194,7 @@ impl<'a> Engine<'a> {
         -> Result<()> {
         let exchange = self.exchange()?;
         let at = slot(layer, true, index);
+        self.record_peer(rank, "ffn", at, false, layer, index);
         exchange.wait(rank, at)?;
         let received = exchange.recv(rank, at)?;
         let payload = lane.payload.as_ref().context("TP2 lane payload")?;
@@ -232,6 +247,24 @@ impl<'a> Engine<'a> {
         })
     }
 
+    pub(super) fn record_peer(&self, rank: usize, exchange: &'static str, slot: usize,
+        push: bool, layer: usize, lane: usize) {
+        let Some(tp2) = &self.tp2 else { return };
+        let mut schedule = tp2.schedule.borrow_mut();
+        let Some(schedule) = schedule.as_mut() else { return };
+        let label = format!("gpu{rank} {exchange} {} L{layer} lane{lane}", if push { "push" } else { "wait" });
+        if push { schedule.push(rank, exchange, slot, label); }
+        else { schedule.wait(rank, exchange, slot, label); }
+    }
+
+    pub(super) fn count_route_fallback(&self, layer: usize) {
+        if let Some(tp2) = self.tp2.as_ref().filter(|t| t.layers.contains(&layer)
+            && t.source.get() == RouteSource::Broadcast && !self.capture_only.get()) {
+            // Count host-enqueued units, including graph replays (not graph construction).
+            tp2.fallbacks.set(tp2.fallbacks.get() + 1);
+        }
+    }
+
     pub(super) fn begin_route_step(&self) {
         if let Some(tp2) = &self.tp2 {
             let step = tp2.steps.get() + 1;
@@ -242,6 +275,7 @@ impl<'a> Engine<'a> {
 
     pub(super) fn finish_route_step(&self) -> Result<()> {
         let Some(tp2) = &self.tp2 else { return Ok(()) };
+        self.publish_route_source();
         if !tp2.checking.replace(false) { return Ok(()); }
         for rank in 0..2 {
             self.on(rank, || {
@@ -260,22 +294,43 @@ impl<'a> Engine<'a> {
         tracing::info!(layers_checked = identity.layers_checked, rows_checked = identity.rows_checked,
             first_mismatch = ?identity.first_mismatch, source = ?tp2.source.get(), fallbacks = tp2.fallbacks.get(),
             "V4 TP2 route identity");
+        let mut aggregate = tp2.identity.borrow_mut();
+        aggregate.layers_checked += identity.layers_checked;
+        aggregate.rows_checked += identity.rows_checked;
+        if aggregate.first_mismatch.is_none() { aggregate.first_mismatch = identity.first_mismatch; }
         cuteafd_bench::context::set_resolved("route-identity", &format!("layers={} rows={} mismatch={:?}",
-            identity.layers_checked, identity.rows_checked, identity.first_mismatch));
-        cuteafd_bench::context::set_resolved("route-source", if tp2.source.get() == RouteSource::Replicated { "replicated" } else { "broadcast" });
-        cuteafd_bench::context::set_resolved("route-fallbacks", &tp2.fallbacks.get().to_string());
+            aggregate.layers_checked, aggregate.rows_checked, aggregate.first_mismatch));
+        drop(aggregate);
+        self.publish_route_source();
+        if let Some(schedule) = tp2.schedule.borrow_mut().take() {
+            order::check(&schedule).map_err(|e| anyhow::anyhow!("V4 TP2 recorded schedule: {e}"))?;
+            tracing::info!(ops = schedule.streams.iter().map(Vec::len).sum::<usize>(),
+                "V4 TP2 recorded push/wait schedule drains");
+        }
         Ok(())
+    }
+
+    fn publish_route_source(&self) {
+        cuteafd_bench::context::set_resolved("v4-graph-captures", &self.graph_captures.get().to_string());
+        cuteafd_bench::context::set_resolved("tp2-expert-graph-captures", &self.expert_graph_captures.get().to_string());
+        if let Some(tp2) = &self.tp2 {
+            cuteafd_bench::context::set_resolved("route-source",
+                if tp2.source.get() == RouteSource::Replicated { "replicated" } else { "broadcast" });
+            cuteafd_bench::context::set_resolved("route-fallbacks", &tp2.fallbacks.get().to_string());
+        }
     }
 
     pub fn check_routes(&self, transports: &mut [SparkLink<'_>], runtime: &tokio::runtime::Runtime) -> Result<()> {
         let Some(tp2) = &self.tp2 else { return Ok(()) };
         let mut allocator = super::super::pool::PoolAllocator::new(self.shape);
         let mut placement = allocator.admit(1)?;
-        // One lane is intentional: check all 512 rows of each layer, not the final lane only.
+        // Both 256-row lanes are checked independently before their route buffers are reused.
         let tokens: Vec<u32> = (0..512).map(|i| (i % self.cfg.vocab_size) as u32).collect();
         tp2.checking.set(true);
+        *tp2.schedule.borrow_mut() = Some(Schedule::default());
         self.prefill(&mut placement, &tokens, transports, runtime, 0, None)?;
         tp2.checking.set(true);
+        *tp2.schedule.borrow_mut() = Some(Schedule::default());
         self.decode(&mut [(&mut placement, 1)], transports.first_mut(), runtime)?;
         allocator.release(placement);
         // Cache/state writes were to scratch placement; released slots are overwritten on admission.
@@ -295,6 +350,67 @@ impl<'a> Engine<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn schedule(layers: usize, local: usize, lanes: usize, decode: bool, broadcast: bool) -> Schedule {
+        let mut s = Schedule::default();
+        let attention = |s: &mut Schedule, rank, layer, lane| {
+            s.push(rank, "attention", slot(layer, false, lane), "attention partial");
+            s.wait(rank, "attention", slot(layer, false, lane), "attention sum");
+        };
+        let experts = |s: &mut Schedule, rank, layer, lane| {
+            if broadcast && layer < local {
+                let at = 2 * lane + layer % 2;
+                if rank == 0 { s.push(0, "routes", at, "canonical routes"); }
+                else { s.wait(1, "routes", at, "canonical routes"); }
+            }
+            if rank == 1 || layer + 1 < layers {
+                s.push(rank, "ffn", slot(layer, true, lane), "fused payload");
+            }
+        };
+        let front = |s: &mut Schedule, layer, lane| {
+            if layer == 0 { s.wait(1, "entry", DIRECT, "peer residual"); }
+            attention(s, 1, layer, lane);
+            if !decode || layer >= local { experts(s, 1, layer, lane); }
+        };
+        for lane in 0..lanes { s.push(0, "entry", DIRECT, "residual"); }
+        if !decode { for lane in 0..lanes { front(&mut s, 0, lane); } }
+        for layer in 0..layers {
+            for lane in 0..lanes {
+                attention(&mut s, 0, layer, lane);
+                if decode {
+                    if layer == 0 { front(&mut s, 0, lane); }
+                    if layer < local { experts(&mut s, 1, layer, lane); }
+                    if layer + 1 < layers {
+                        s.wait(1, "ffn", slot(layer, true, lane), "peer FFN sum");
+                        front(&mut s, layer + 1, lane);
+                    }
+                }
+                experts(&mut s, 0, layer, lane);
+                if !decode && layer + 1 < layers {
+                    s.wait(1, "ffn", slot(layer, true, lane), "peer FFN sum");
+                    front(&mut s, layer + 1, lane);
+                }
+                s.wait(0, "ffn", slot(layer, true, lane), "FFN sum");
+            }
+        }
+        s
+    }
+
+    #[test]
+    fn tp2_two_lane_and_decode_push_wait_schedules_drain() {
+        // Runtime startup also records the engine's actual calls and checks them,
+        // so this CPU mirror cannot silently qualify a different enqueue order.
+        for layers in [1, 2, 6] {
+            for local in 1..=layers {
+                for broadcast in [false, true] {
+                    for lanes in [1, 2] {
+                        assert_eq!(order::check(&schedule(layers, local, lanes, false, broadcast)), Ok(()));
+                    }
+                    assert_eq!(order::check(&schedule(layers, local, 1, true, broadcast)), Ok(()));
+                }
+            }
+        }
+    }
 
     #[test]
     fn exchange_policy_matches_admission_and_auto_switches_by_rows() {

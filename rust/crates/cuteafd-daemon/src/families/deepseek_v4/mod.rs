@@ -311,7 +311,7 @@ pub(crate) fn with_engine<T>(
     // request `cuteafd plan --layout` resolves, over one measured sample per
     // GPU taken after weights and modules and before any cache or expert.
     let placement = {
-        use cuteafd_loader::placement::{Baseline, Onboard};
+        use cuteafd_loader::placement::Baseline;
         ensure!(args.max_sequences > 0, "--max-sequences must be positive");
         let devices: Vec<_> = std::iter::once(args.device).chain(split_device).collect();
         let gpus = devices.iter().map(|&device| crate::shared::peer_split::on_device(
@@ -322,15 +322,37 @@ pub(crate) fn with_engine<T>(
         let cache_stages = model.dspark.as_ref().map_or(0, |d| d.stages.len());
         let onboard = args.onboard()?;
         let stages = if args.dspark && !args.skip_routed_experts { cache_stages } else { 0 };
-        let expert_workspace = if args.skip_routed_experts || (onboard == Onboard::Layers(0) && stages == 0) { Some(0) }
+        let max_rows = prefill_rows.max(decode_rows);
+        let expert_workspace = if args.skip_routed_experts
+            || (stages == 0 && (split_device.is_some() || onboard.layers(loaded.cfg.n_layers) == Some(0))) { Some(0) }
             else { local::workspace_bytes(&loaded.library, &args.native_lib, &loaded.catalog,
-                prefill_rows.max(decode_rows))?.map(|bytes| bytes as u64) };
+                max_rows)?.map(|bytes| bytes as u64) };
+        let tp2_workspace = if split_device.is_some() && !args.skip_routed_experts
+            && onboard.layers(loaded.cfg.n_layers) != Some(0) {
+            use crate::shared::experts::rtx::{native::NativeTp2, exl3::Exl3Tp2};
+            let measured = if let Some(manifest) = loaded.catalog.exl3() {
+                let package = crate::shared::experts::exl3::aot_layout_directory(&args.native_lib,
+                    manifest.decoder_tiers(), "rtx-tp2");
+                Exl3Tp2::workspace_bytes_for(&package, loaded.cfg.dim, max_rows)
+            } else { NativeTp2::workspace_bytes_for(&loaded.library, max_rows) };
+            match measured {
+                Ok(bytes) => {
+                    let planned = cuteafd_loader::serving_capacity::deepseek_v4_tp2_workspace(
+                        &loaded.catalog, Some(&args.manifest), max_rows as u64)?;
+                    ensure!(bytes as u64 == planned,
+                        "V4 TP2 workspace differs from planner: runtime {bytes}, planned {planned}");
+                    Some([bytes as u64; 2])
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "V4 TP2 expert package unavailable; auto may keep routed layers on Sparks");
+                    None
+                }
+            }
+        } else { None };
+        let exchange_f32 = engine::ExchangePolicy::from_env()? == engine::ExchangePolicy::F32;
         let inputs = admission::Inputs { cfg: &loaded.cfg, catalog: &loaded.catalog, manifest: &loaded.manifest,
             family: loaded.family, gpus, cache_stages, prefill_rows, decode_rows, max_context, prefix,
-            expert_workspace, tp2_workspace: if split_device.is_some() && !args.skip_routed_experts && onboard.layers(loaded.cfg.n_layers) != Some(0) {
-                cuteafd_loader::serving_capacity::deepseek_v4_tp2_workspace(&loaded.catalog, Some(&args.manifest),
-                    prefill_rows.max(decode_rows) as u64).ok().map(|bytes| [bytes; 2])
-            } else { None }, exchange_f32: false };
+            expert_workspace, tp2_workspace, exchange_f32 };
         let request = admission::request(args, &inputs)?;
         let placement = cuteafd_loader::placement::solve(&request)
             .map_err(|error| anyhow::anyhow!("DeepSeek V4 admission: {error}"))?;
