@@ -152,8 +152,8 @@ fn planner_equals_runtime_deepseek_v4_fixture() {
                 let case = Case { snapshot: dir.path(), manifest: &manifest, rtx, sparks: 2, context, budget,
                     onboard, dspark: false, peer: false };
                 let placement = assert_equal(&case, &format!("fixture rtx{rtx} {context} {onboard:?}"));
-                // The default: pool first on one RTX, experts first on two (`default_onboard`).
-                let effective = onboard.unwrap_or(cuteafd_loader::placement::families::deepseek_v4::default_onboard(rtx));
+                // The default: pool first for Flash on one RTX, experts first on two (`default_onboard`).
+                let effective = onboard.unwrap_or(cuteafd_loader::placement::families::deepseek_v4::default_onboard(4096, rtx));
                 match effective {
                     Onboard::ExpertsFirst { .. } => assert!(placement.pool_tokens >= 262_144, "experts first keeps a 262K pool"),
                     Onboard::Auto => assert_eq!(placement.pool_tokens, 1 << 20, "24 GiB cards target 1M"),
@@ -210,7 +210,8 @@ fn planner_equals_runtime_deepseek_v4() {
             // pool between 262K and the target).
             let default = assert_equal(&Case { onboard: None, peer: false, ..case }, &format!("{model} rtx{rtx} {context} default"));
             assert!(default.expert_ranges.get(1).is_none_or(|r| r.layers == 0));
-            if matches!(cuteafd_loader::placement::families::deepseek_v4::default_onboard(rtx), Onboard::Auto) {
+            let dim = if model == "flash" { 4096 } else { 7168 };
+            if matches!(cuteafd_loader::placement::families::deepseek_v4::default_onboard(dim, rtx), Onboard::Auto) {
                 assert_eq!(default.pool_tokens, 2 << 20, "{model}: a pool-first default reaches 2M");
             } else { assert!((262_144..=2 << 20).contains(&default.pool_tokens)); }
             auto.insert((model, rtx, context), placement);

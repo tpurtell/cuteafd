@@ -1449,7 +1449,7 @@ fn deepseek_v4_placement(report: &PlanReport, checkpoint: &super::Checkpoint,
     let onboard = match (options.onboard, options.local_expert_layers) {
         (Some(onboard), _) => onboard,
         (None, Some(n)) => Onboard::Layers(n.saturating_sub(routed.first_layer)),
-        (None, None) => v4::default_onboard(devices.len()),
+        (None, None) => v4::default_onboard(cfg.dim, devices.len()),
     };
     let inputs = v4::V4Inputs { cfg: &cfg, cache_stages: shape.cache_native_layers, gpus, headroom_floor: options.headroom_bytes,
         spark_ranks, sequences: shape.concurrency, prefill_rows: shape.prefill_rows, decode_rows: shape.decode_rows,

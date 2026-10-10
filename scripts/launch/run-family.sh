@@ -475,7 +475,7 @@ fi
 # step). Keys left unset pass nothing (images older than the options run).
 [[ -z "$(get DECODE_SHARE)" ]] || family_args+=(--decode-share "$(get DECODE_SHARE)")
 # RTX_EXPERT_LAYERS (DeepSeek V4, the shared placement solver): unset is auto
-# on one RTX and max on two; max places the most whole routed-expert layers
+# for Flash on one RTX and max otherwise (Pro, two RTX); max places the most whole routed-expert layers
 # that still leave a 262K pool (v2's experts-first policy), the pool taking the
 # rest up to its target; auto reserves the KV pool (2M PRO / 1M <=32 GB) first
 # and fills what is left; N, N% or all fix the RTX-resident layers and the KV pool takes

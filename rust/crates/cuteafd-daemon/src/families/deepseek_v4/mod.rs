@@ -158,13 +158,14 @@ fn parse_onboard(text: &str) -> std::result::Result<cuteafd_loader::placement::O
 
 impl EngineArgs {
     /// The resolved `--rtx-expert-layers` / `--local-expert-layers`.
-    /// The RTX expert policy on `gpus` serving GPUs (the head split as resolved, not as requested).
-    pub(crate) fn onboard(&self, gpus: usize) -> Result<cuteafd_loader::placement::Onboard> {
+    /// The RTX expert policy for a model of hidden size `dim` on `gpus` serving GPUs (the head split
+    /// as resolved, not as requested).
+    pub(crate) fn onboard(&self, dim: usize, gpus: usize) -> Result<cuteafd_loader::placement::Onboard> {
         use cuteafd_loader::placement::Onboard;
         Ok(match (self.rtx_expert_layers, self.local_expert_layers) {
             (Some(onboard), _) => onboard,
             (None, Some(layers)) => Onboard::Layers(layers),
-            (None, None) => cuteafd_loader::placement::families::deepseek_v4::default_onboard(gpus),
+            (None, None) => cuteafd_loader::placement::families::deepseek_v4::default_onboard(dim, gpus),
         })
     }
 
@@ -333,7 +334,7 @@ pub(crate) fn with_engine<T>(
             })
         }).collect::<Result<Vec<_>>>()?;
         let cache_stages = model.dspark.as_ref().map_or(0, |d| d.stages.len());
-        let onboard = args.onboard(devices.len())?;
+        let onboard = args.onboard(loaded.cfg.dim, devices.len())?;
         let stages = if args.dspark && !args.skip_routed_experts { cache_stages } else { 0 };
         let expert_workspace = if args.skip_routed_experts || (onboard == Onboard::Layers(0) && stages == 0) { Some(0) }
             else { local::workspace_bytes(&loaded.library, &args.native_lib, &loaded.catalog,
