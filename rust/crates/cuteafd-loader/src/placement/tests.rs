@@ -30,6 +30,16 @@ fn request(gpus: usize, free: u64, layers: usize, sparks: usize, onboard: Onboar
 }
 
 #[test]
+fn v4_single_rtx_defaults_to_pool_first_for_flash_and_pro() {
+    for dim in [4096, 7168] {
+        assert_eq!(families::deepseek_v4::default_onboard(dim, 1), Onboard::Auto);
+        // P4 owns the dual-RTX default; explicit max remains supported everywhere.
+        assert_eq!(families::deepseek_v4::default_onboard(dim, 2), families::deepseek_v4::DEFAULT_ONBOARD);
+    }
+    assert_eq!("max".parse::<Onboard>(), Ok(Onboard::ExpertsFirst { pool_floor: EXPERTS_FIRST_POOL_FLOOR }));
+}
+
+#[test]
 fn pool_precedes_contiguous_layers_on_both_gpus() {
     // 2M tokens = 8192 units x 4 MiB = 32 GiB per GPU.
     let placement = solve(&request(2, 44 * GIB, 60, 4, Onboard::Auto)).unwrap();
