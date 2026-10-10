@@ -20,12 +20,14 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 pub mod families;
+pub mod inventory;
 mod pool;
 mod residual;
 mod solve;
 #[cfg(test)]
 mod tests;
 
+pub use inventory::{ArchContext, GraphRank, GraphSet, Lifetime, ProgramSet, RuntimeSample, ARCH_CONTEXTS};
 pub use pool::PoolPolicy;
 pub use residual::{hop_buffer_bytes, plan_hops, Hop, HopKind, HopPoint, HopSpec, ResidualHome, Transition, HOP_SLOTS};
 pub use solve::solve;
