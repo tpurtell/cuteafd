@@ -1090,6 +1090,7 @@ fn program_families(family: &str, model: &dyn super::FamilyModel, split: bool) -
         "deepseek_v4" => if model.spec().hidden == 4096 { "dsv4f" } else { "dsv4p" },
         "qwen4" => "qwen4",
         "glm5_flash" => "glmf",
+        "glm5" => "glm",
         _ => return None,
     };
     Some(std::iter::once(base.to_string()).chain((split && family != "qwen4").then(|| format!("{base}2"))).collect())
