@@ -1977,10 +1977,10 @@ as well as min/max.
 - GLM Flash today runs all-local or all-Spark experts per process
   (`--peers` conflicts with `--local-experts`).
   - The **all-Spark** card: min/max as shipped.
-  - The **all-local** card: one RTX with `--local-experts`, K3.25 at a
-    reduced pool.
-
-  Both run now and gate `D2`.
+  - The all-Spark card runs now and gates `D2`. There is no one-RTX
+    all-local card: the K3.25 routed experts are 115.6 GiB (K3 106.7 GiB),
+    over one 95.6 GiB RTX, so all-local GLM Flash is the 2× RTX no-Spark
+    card below.
 - The **mixed, about half onboarded** card needs a per-layer expert backend
   (local fp8moe/EXL3 layers plus Spark layers in one process). That is
   `P6`/`P7` placement work, and it gates `D3`/`D4` once it lands.
