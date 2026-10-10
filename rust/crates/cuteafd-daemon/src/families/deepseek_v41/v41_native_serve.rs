@@ -380,9 +380,9 @@ fn worker(
     let small_card = device_total <= 32usize << 30;
     if small_card {
         let explicit = std::env::var("CUTEAFD_V41_FIXED_GRAPH_ROWS").ok();
-        if let Some(shapes) = super::v41_layer_graphs::profile_fixed_shapes(device_total, explicit.as_deref())? {
+        if let Some(shapes) = super::graph_policy::profile_fixed_shapes(device_total, explicit.as_deref())? {
             tracing::info!(?shapes, "V4.1 small-card fixed exact graph set; other rows execute eagerly");
-            super::v41_layer_graphs::set_fixed_shapes(shapes)?;
+            super::graph_policy::set_fixed_shapes(shapes)?;
         }
     }
     if small_card && !legacy_compact(None, args.peers.len()) {
