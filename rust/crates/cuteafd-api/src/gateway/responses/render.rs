@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 
 use serde_json::{json, Value};
 
-use super::parse::{encode, Parsed, ToolKind};
+use super::parse::{encode_reasoning, Parsed, ToolKind};
 use crate::gateway::{turn::*, GatewayError};
 
 pub(super) fn id(prefix: &str) -> String {
@@ -377,8 +377,10 @@ impl Fold {
                     self.emit("response.reasoning_summary_part.done", e);
                 }
                 if self.encrypted {
+                    let text = &self.arguments[&i];
+                    let shown = if self.summary { text.as_str() } else { "" };
                     self.response["output"][i]["encrypted_content"] =
-                        json!(encode("reasoning", &self.arguments[&i]));
+                        json!(encode_reasoning(text, shown));
                 }
             }
             "function_call" => {

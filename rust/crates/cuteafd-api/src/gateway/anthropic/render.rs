@@ -82,10 +82,7 @@ impl Renderer {
         }
         if let Block::Thinking { text, signature } = &mut slot.block {
             if signature.is_empty() {
-                *signature = STANDARD.encode(format!(
-                    "cuteafd-thinking-v1:{}",
-                    hex_digest(text.as_bytes())
-                ));
+                *signature = thinking_signature(text);
                 frames.push(delta(
                     index,
                     json!({"type":"signature_delta","signature":signature}),
@@ -328,6 +325,15 @@ fn partial_value(value: &jiter::JsonValue<'_>) -> Value {
 fn delta(index: usize, delta: Value) -> Value {
     json!({"type":"content_block_delta","index":index,"delta":delta})
 }
+/// Signature synthesized for a thinking block this gateway produced: a digest
+/// of the exact thinking text, so an edited block can be recognized on input.
+pub(super) fn thinking_signature(text: &str) -> String {
+    STANDARD.encode(format!(
+        "{THINKING_SIGNATURE_PREFIX}{}",
+        hex_digest(text.as_bytes())
+    ))
+}
+pub(super) const THINKING_SIGNATURE_PREFIX: &str = "cuteafd-thinking-v1:";
 fn hex_digest(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }

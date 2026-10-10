@@ -1093,3 +1093,74 @@ async fn generated_input_id_reference_and_root_lineage() {
         id
     );
 }
+
+fn reasoning_of(item: Value) -> String {
+    match parse::parse_item(&item).unwrap().as_slice() {
+        [Item::Reasoning { text, signature: None }] => text.clone(),
+        other => panic!("expected one reasoning item, got {other:?}"),
+    }
+}
+
+fn summary(text: &str) -> Value {
+    json!([{"type":"summary_text","text":text}])
+}
+
+#[tokio::test]
+async fn reasoning_unedited_round_trip_keeps_token_text() {
+    for summary_mode in [json!("auto"), Value::Null] {
+        let (app, _, _) = app(vec![vec![
+            TurnEvent::ReasoningDelta { text: "full trace".into() },
+            text("answer"),
+            done(),
+        ]]);
+        let (_, body) = request(&app,"POST","/v1/responses",json!({"model":"gpt-5","input":"hi","store":false,"reasoning":{"summary":summary_mode},"include":["reasoning.encrypted_content"]})).await;
+        let item = serde_json::from_str::<Value>(&body).unwrap()["output"][0].clone();
+        assert_eq!(item["type"], "reasoning");
+        assert_eq!(reasoning_of(item), "full trace", "summary={summary_mode}");
+    }
+    // A summary shorter than the trace still recovers the full trace.
+    let token = parse::encode_reasoning("full trace", "short");
+    assert_eq!(
+        reasoning_of(json!({"type":"reasoning","summary":summary("short"),"encrypted_content":token})),
+        "full trace"
+    );
+}
+
+#[test]
+fn reasoning_edited_summary_wins_over_token() {
+    let token = parse::encode_reasoning("full trace", "full trace");
+    assert_eq!(
+        reasoning_of(json!({"type":"reasoning","summary":summary("edited"),"encrypted_content":token})),
+        "edited"
+    );
+    // Visible text added where none was shown is an edit too.
+    let hidden = parse::encode_reasoning("full trace", "");
+    assert_eq!(
+        reasoning_of(json!({"type":"reasoning","content":[{"type":"reasoning_text","text":"added"}],"encrypted_content":hidden})),
+        "added"
+    );
+}
+
+#[test]
+fn reasoning_without_visible_text_uses_token() {
+    let token = parse::encode_reasoning("full trace", "full trace");
+    for item in [
+        json!({"type":"reasoning","encrypted_content":token}),
+        json!({"type":"reasoning","summary":[],"encrypted_content":token}),
+    ] {
+        assert_eq!(reasoning_of(item), "full trace");
+    }
+}
+
+#[test]
+fn reasoning_old_token_keeps_token_text() {
+    let old = parse::encode("reasoning", "old trace");
+    assert_eq!(
+        reasoning_of(json!({"type":"reasoning","summary":summary("edited"),"encrypted_content":old})),
+        "old trace"
+    );
+    assert_eq!(
+        reasoning_of(json!({"type":"reasoning","encrypted_content":old})),
+        "old trace"
+    );
+}
