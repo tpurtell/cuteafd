@@ -550,8 +550,8 @@ pub fn layout(report: &mut PlanReport, model: &dyn super::FamilyModel, checkpoin
             for (group, format, bytes) in rank {
                 let category = match group.as_str() {
                     "embedding" => Category::Embedding,
-                    // Qwen's native MTP layer loads with the target (ledger scope `weights`).
-                    "speculator" if family == "qwen4" => Category::Weights,
+                    // Qwen's native MTP layer and V4's dSpark stages load with the target (ledger scope `weights`).
+                    "speculator" if matches!(family, "qwen4" | "deepseek_v4") => Category::Weights,
                     "speculator" | "speculator_expert" => Category::Drafter,
                     "table_projection" => Category::Tables,
                     _ => Category::Weights,
