@@ -980,7 +980,7 @@ if { [[ ( "$family" == mimo_v2 || "$family" == qwen4 || "$family" == glm5_flash 
    [[ "$family" == mimo_v2 && "$audio" != off ]]; then
   plan_rtx=1; ((head_split == 0)) || plan_rtx=2
   plan_pool="$(get POOL_TOKENS auto)"; [[ "$plan_pool" != auto ]] || plan_pool=0
-  plan_gib="${coordinator_budget:-95.5}"
+  plan_gib="${coordinator_budget:-94.97}"
   plan_draft_args=()
   if [[ "$family" == mimo_v2 ]]; then
     plan_draft_args+=(--concurrency "$(get CONCURRENCY "$default_concurrency")"
