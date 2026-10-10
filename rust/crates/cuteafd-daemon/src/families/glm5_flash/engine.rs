@@ -1288,6 +1288,11 @@ pub(crate) struct GlmfEngine<'a> {
     split_audit: bool,
     /// Recorded after a layer's routes and wire rows reach the host staging.
     routes_ready: *mut c_void,
+    /// The shared draft policy's per-step signals (layer events, routes), armed by
+    /// `serve-glmf` under the shared policy and active only around its verify steps.
+    draft_probe: RefCell<Option<super::draft_probe::RoundProbe<'a>>>,
+    /// A decode segment is being captured: host-side probe work stays out of the graph.
+    capturing: std::cell::Cell<bool>,
     ops: Option<RefCell<OpTimes>>,
     /// Prefill projections that run block-FP8 GEMMs (the layers need FP8 copies).
     pub fp8_prefill: Fp8Prefill,
@@ -1746,6 +1751,7 @@ impl<'a> GlmfEngine<'a> {
             subset_lanes: lane_setting().1,
             split_audit: std::env::var("CUTEAFD_GLMF_SPLIT_AUDIT").is_ok_and(|v| v == "1"),
             full_prefill_logits: false, routes_ready: library.cuda_event_create_ordering()?,
+            draft_probe: RefCell::new(None), capturing: std::cell::Cell::new(false),
             ops: std::env::var("CUTEAFD_GLMF_PROFILE_OPS").is_ok_and(|v| v == "1").then(RefCell::default),
             fp8_prefill: Fp8Prefill::default(), kda_fp32_partials: false,
             kda_output_shard: false, mark_slots: 0,
@@ -3155,6 +3161,7 @@ impl<'a> GlmfEngine<'a> {
                 }
             }
             crate::shared::console::layer_mark(index);
+            self.probe_mark(index);
         }
         if layers.len() < self.cfg.layers {
             self.synchronize()?;
@@ -3294,11 +3301,14 @@ impl<'a> GlmfEngine<'a> {
                         }
                     })?;
                 } else {
+                    // The router ran inside this layer's segment: its ids are still in place.
+                    self.probe_ring(index, w, t, matches!(self.experts, Some(Experts::Spark { .. })))?;
                     self.moe_experts(w, index, &layers[index], t, rows, cap, true)?;
                 }
             }
             if index < layers.len() {
                 crate::shared::console::layer_mark(index);
+                self.probe_mark(index);
             }
         }
         if layers.len() < self.cfg.layers {
@@ -3379,7 +3389,9 @@ impl<'a> GlmfEngine<'a> {
         // SAFETY: capture records this stream's launches; nothing in a segment
         // synchronizes the host or allocates.
         self.on(rank, || unsafe { self.library.cuda_graph_begin_capture(stream) })?;
+        self.capturing.set(true);
         let captured = segment();
+        self.capturing.set(false);
         // SAFETY: ends the capture begun above on the same stream.
         let exec = self.on(rank, || unsafe { self.library.cuda_graph_end_capture(stream) });
         captured?;
@@ -3847,6 +3859,7 @@ impl<'a> GlmfEngine<'a> {
                     self.cfg.routed_scale as f32, true, self.stream)
             }
         })?;
+        self.probe_ring(index, w, t, matches!(experts, Experts::Spark { .. }))?;
         if !matches!(experts, Experts::Local(_)) {
             let grid = self.quantize_grid.blocks(t, h);
             self.run("expert_input_quant", &[("source_ptr", w.x.buffer.ptr), ("values_ptr", w.wire.buffer.ptr),
@@ -3982,6 +3995,62 @@ impl<'a> GlmfEngine<'a> {
         self.run("add", &[("a", w.routed_ptr()?), ("b", w.shared.buffer.ptr), ("out", w.delta.buffer.ptr)], &[rows])
     }
 
+    /// The draft probe's layer mark: the end of `index` on the engine stream.
+    fn probe_mark(&self, index: usize) {
+        if let Some(probe) = self.draft_probe.borrow_mut().as_mut() {
+            // SAFETY: the engine's own stream, live for the engine's lifetime.
+            unsafe { probe.mark(index, self.stream) };
+        }
+    }
+
+    /// Queue layer `index`'s router ids into the draft probe's ring right
+    /// behind the router (`spark`: the layer's ids are also staged).
+    fn probe_ring(&self, index: usize, w: &Workspace<'_>, t: usize, spark: bool) -> Result<()> {
+        if self.capturing.get() { return Ok(()); }
+        let mut probe = self.draft_probe.borrow_mut();
+        let Some(probe) = probe.as_mut().filter(|p| p.wants_ring(spark)) else { return Ok(()) };
+        // SAFETY: the router just wrote `t` rows of ids into `route_ids` on this stream; the ring
+        // is read after the step's sync.
+        unsafe { probe.ring(self.library, index, w.route_ids.buffer, t, self.stream) }
+    }
+
+    /// Arm the shared draft policy's per-step signals for verify steps of up
+    /// to `rows` rows (`serve-glmf` under the shared policy only).
+    pub(crate) fn arm_draft_probe(&self, rows: usize) -> Result<()> {
+        let dense = self.weights.layers.iter().map(|layer| layer.dense).collect();
+        *self.draft_probe.borrow_mut() = Some(super::draft_probe::RoundProbe::new(self.library, dense,
+            self.cfg.topk, rows)?);
+        Ok(())
+    }
+
+    /// Start recording a verify step of `rows` rows (with the draft probe armed).
+    pub(crate) fn probe_begin(&self, rows: usize) {
+        if let Some(probe) = self.draft_probe.borrow_mut().as_mut() { probe.begin(rows); }
+    }
+
+    /// Stop recording after the step and its token selection (which drains the
+    /// engine stream); a failed step's signals are dropped.
+    pub(crate) fn probe_end(&self, ok: bool) {
+        if let Some(probe) = self.draft_probe.borrow_mut().as_mut() {
+            probe.end();
+            if !ok { let _ = probe.finish(); }
+        }
+    }
+
+    /// The probed step's routes and layer µs, once its stream drained, handed
+    /// to `observe` (nothing when the step's signals are incomplete).
+    pub(crate) fn probe_finish<T>(&self, observe: impl FnOnce(&crate::shared::draft::routes::RoundRoutes,
+        &[Option<f64>]) -> T) -> Option<T> {
+        let mut probe = self.draft_probe.borrow_mut();
+        let (routes, layer_us) = probe.as_mut()?.finish()?;
+        Some(observe(routes, &layer_us))
+    }
+
+    /// Ring and staged-id agreement under `CUTEAFD_GLMF_ROUTE_RING_CHECK`.
+    pub(crate) fn probe_ring_check(&self) -> Option<super::draft_probe::RingCheck> {
+        self.draft_probe.borrow().as_ref().map(|probe| probe.ring_check)
+    }
+
     /// Routes and wire rows down and one request to every Spark rank; the
     /// shared expert (`shared`) queues behind the copies and runs while the
     /// ranks compute. Complete with [`Self::spark_land`].
@@ -4014,6 +4083,9 @@ impl<'a> GlmfEngine<'a> {
         unsafe { self.library.cuda_event_synchronize(self.routes_ready)? };
         self.profile.borrow_mut()[0] += timer.elapsed().as_secs_f64();
         let staged = staging.bytes();
+        if let Some(probe) = self.draft_probe.borrow_mut().as_mut().filter(|p| p.active()) {
+            probe.staged(index, &staged[..route_bytes]);
+        }
         let word = |offset: usize, i: usize| u32::from_le_bytes(staged[offset + i * 4..][..4].try_into().unwrap());
         let routes = (0..t * topk).map(|i| ExpertProtocolV2RouteEntry {
             row_index: (i / topk) as u32, expert_id: word(0, i), gate_weight: f32::from_bits(word(route_bytes, i)),

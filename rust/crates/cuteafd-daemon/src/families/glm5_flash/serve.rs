@@ -34,6 +34,7 @@ use crate::shared::probe;
 use crate::shared::console;
 use cuteafd_engine::prefix::{After, PointPlan, PointPolicy, PrefixCache, PrefixConfig, PrefixFamily, SnapshotKind};
 use crate::families::glm5::dflash::{ContextRow, Draft, DraftSeq, TAP_ROWS};
+use crate::shared::draft::evidence::{Censor, DraftSource};
 use crate::families::glm5::dflash_policy::{self, DraftHistory, Shape};
 use super::{open, Opened};
 use crate::shared::token_io::{RowResult, SelectBatch, SelectPlacement, TokenSelector};
@@ -369,6 +370,88 @@ struct Active<'a> {
     buffered: usize,
     started: Instant,
     ticket: console::Ticket,
+}
+
+/// The shared draft policy and its per-round plumbing (`CUTEAFD_GLMF_DRAFT_POLICY=shared`).
+struct SharedPolicy {
+    policy: cuteafd_core::DraftPolicy,
+    prior: super::draft_binding::Prior,
+    observed: u64,
+    skipped: u64,
+}
+
+impl SharedPolicy {
+    fn new(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path, drafter: &super::dspark::Drafter<'_>,
+        ranks: Option<usize>) -> Result<Self> {
+        let source = opened.experts.as_ref();
+        let homes = super::draft_binding::homes(&engine.cfg.dense[..engine.weights.layers.len()], source, snapshot,
+            ranks)?;
+        let geometry = super::draft_binding::geometry(&homes, engine.cfg.experts, engine.cfg.topk, engine.verify_rows,
+            drafter.drafts())?;
+        let classes: Vec<_> = homes.iter().map(|home| match home {
+            super::draft_binding::LayerHome::Dense => "dense",
+            super::draft_binding::LayerHome::Local { .. } => "local",
+            super::draft_binding::LayerHome::Remote { .. } => "remote",
+        }).collect();
+        let slice = homes.iter().find_map(|home| match home {
+            super::draft_binding::LayerHome::Local { slice_bytes } | super::draft_binding::LayerHome::Remote { slice_bytes } =>
+                Some(*slice_bytes),
+            super::draft_binding::LayerHome::Dense => None,
+        });
+        tracing::info!(layers = homes.len(), dense = classes.iter().filter(|c| **c == "dense").count(),
+            local = classes.iter().filter(|c| **c == "local").count(), remote = classes.iter().filter(|c| **c == "remote").count(),
+            first_slice_bytes = slice, rows = geometry.max_requests, width = ?geometry.widths, ranks,
+            "GLM Flash shared draft policy geometry");
+        let policy = cuteafd_core::DraftPolicy::new(geometry, false)?;
+        engine.arm_draft_probe(engine.decode_rows)?;
+        let fp8_head = matches!(engine.draft_head(), super::super::glm5::dflash::TargetHead::Launch(_));
+        Ok(Self { policy, prior: drafter.draft_prior(fp8_head)?, observed: 0, skipped: 0 })
+    }
+
+    fn prior(&self, history: &DraftHistory, draft: &Draft) -> Vec<f64> {
+        let evidence = if draft.confidence.is_empty() {
+            super::draft_binding::DraftEvidence::Selector(&draft.features)
+        } else {
+            super::draft_binding::DraftEvidence::Head(&draft.confidence)
+        };
+        super::draft_binding::prior(&self.prior, history, &evidence)
+    }
+
+    /// The completed round, once the verify step's stream drained.
+    fn observe(&mut self, engine: &GlmfEngine<'_>, requests: &[super::draft_binding::Verified<'_>],
+        times: crate::shared::draft::clock::RoundTimes, width: usize, predicted: Option<f64>) {
+        let policy = &mut self.policy;
+        let outcome = engine.probe_finish(|routes, layer_us|
+            super::draft_binding::observe(policy, requests, routes, layer_us, times, width, predicted));
+        match outcome {
+            Some(Ok(())) => self.observed += 1,
+            Some(Err(error)) => {
+                self.skipped += 1;
+                tracing::debug!(%error, "draft policy round not observed");
+            }
+            None => self.skipped += 1,
+        }
+        tracing::debug!(target: "cuteafd::draft_policy", requests = requests.len(),
+            rows = requests.iter().map(|r| r.rows).sum::<usize>(), predicted_us = ?predicted, total_us = times.total_us,
+            draft_us = ?times.draft_us, observed = matches!(outcome, Some(Ok(()))), "GLM Flash draft round");
+        if (self.observed + self.skipped) % 32 == 1 {
+            let ring = engine.probe_ring_check().filter(|c| c.layers > 0).map(|c| (c.layers, c.mismatched));
+            if let Some((layers, mismatched)) = ring {
+                tracing::info!(layers, mismatched, "GLM Flash route ring check against staged Spark ids");
+            }
+            super::draft_binding::publish(&self.policy, self.observed, self.skipped, ring);
+        }
+    }
+}
+
+/// Why a finished request's verification stopped short of a miss: it emitted
+/// its stop token or reached its output limit on a row whose next draft (if
+/// any) the target agreed with. A row that disagreed with its draft is a miss.
+fn finish_censor(finished: bool, committed: usize, rows: &[u32], last: Option<u32>, stops: &[u32]) -> Option<Censor> {
+    if !finished { return None; }
+    let next_draft = rows.get(committed);
+    if next_draft.is_some() && next_draft != last.as_ref() { return None; }
+    Some(if last.is_some_and(|token| stops.contains(&token)) { Censor::Eos } else { Censor::OutputLimit })
 }
 
 /// Commits a selected token to the request's grammar.
@@ -739,7 +822,7 @@ fn publish(stats: &Mutex<serde_json::Value>, requests: u64, generated: u64, acti
     if let Ok(mut stats) = stats.lock() {
         *stats = serde_json::json!({"requests": requests, "generated_tokens": generated, "active": active,
             "prefilling": prefilling, "draft_ring_misses": ring_misses, "prefix_cache": cache.stats(),
-            "verify": verify.snapshot(),
+            "verify": verify.snapshot(), "draft_policy": super::draft_binding::snapshot(),
             "media": media.stats(cache.stats().media_key_collisions, preparer.map_or(0, |p| p.memo_hits()))});
         crate::shared::probe::graph_capture_stats(&mut stats);
         // Idle checkpoints only: never sample the process ledger on the decode hot path.
@@ -803,6 +886,14 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
     let refine_confidence = crate::shared::draft_policy::enabled("CUTEAFD_DRAFT_CONFIDENCE");
     tracing::info!(copy_policy, refine_confidence, "shared draft policy experiments");
     let mut skip = dflash_policy::DraftSkip::default();
+    // CUTEAFD_GLMF_DRAFT_POLICY=shared: the resource-priced shared policy (v3 D2); cycle (default until
+    // its gate) keeps the CycleCost table fit above. Fixed and chain verify policies keep their own counts.
+    let mut shared = match (drafter, super::draft_binding::PolicyKind::from_env()?) {
+        (Some(drafter), super::draft_binding::PolicyKind::Shared) if policy.fixed.is_none()
+            && policy.verify == VerifyPolicy::Cost => Some(SharedPolicy::new(engine, opened, snapshot, drafter, ranks)?),
+        _ => None,
+    };
+    tracing::info!(draft_policy = if shared.is_some() { "shared" } else { "cycle" }, "GLM Flash draft policy");
     let mut active: Vec<Active<'_>> = Vec::new();
     let (mut requests, mut generated_total) = (0u64, 0u64);
     let mut verify_stats = VerifyStats::default();
@@ -1130,6 +1221,8 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
             continue;
         }
         let cycle = Instant::now();
+        let mut round_clock = crate::shared::draft::clock::RoundClock::at(cycle);
+        let mut drafted_width = 0usize;
         let mut tally = console::Step::begin(0);
         let (draft0, verify0, emit0) = (draft_s, verify_s, emit_s);
         let engine_before = tally.live().then(|| *engine.profile.borrow());
@@ -1160,8 +1253,10 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
                 for &(i, _) in &seqs {
                     active[i].counts[5] += 1;
                 }
-                let drafts = drafter.draft_device(&seqs.iter().map(|(_, s)| *s).collect::<Vec<_>>(), &engine.embedding,
-                    engine.draft_head());
+                let draft_seqs: Vec<DraftSeq> = seqs.iter().map(|(_, s)| *s).collect();
+                let drafts = round_clock.draft(|| drafter.draft_device(&draft_seqs, &engine.embedding,
+                    engine.draft_head()));
+                drafted_width = drafter.drafts();
                 cost.observe_draft(active.len(), timer.elapsed().as_secs_f64() * 1e3);
                 let mut out = vec![None; active.len()];
                 match drafts {
@@ -1197,10 +1292,28 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
             rates: Some(&rates[i]), limit: limits[i],
         }).collect();
         let plan_timer = Instant::now();
-        let mut planned = match (policy.verify, policy.fixed) {
+        // The shared policy's per-request `p0` (its own prior; Platt runs inside the policy).
+        let shared_priors: Vec<Vec<f64>> = match &shared {
+            Some(shared) => active.iter().zip(&drafted).map(|(a, draft)| draft.as_ref().map_or(Vec::new(), |d|
+                shared.prior(&a.drafts, d))).collect(),
+            None => Vec::new(),
+        };
+        let mut predicted = None;
+        let mut planned = match (policy.verify, policy.fixed, shared.as_mut()) {
             // The chain cut on the drafter's own probabilities.
-            (VerifyPolicy::Chain, None) => drafted.iter().zip(&limits).map(|(draft, &limit)| draft.as_ref()
+            (VerifyPolicy::Chain, None, _) => drafted.iter().zip(&limits).map(|(draft, &limit)| draft.as_ref()
                 .map_or(0, |d| verify::chain_length(&draft_probs(d), limit, policy.tau))).collect(),
+            // No draft pass ran: every sequence verifies its next token alone.
+            (_, None, Some(_)) if drafted_width == 0 => vec![0; active.len()],
+            (_, None, Some(shared)) => {
+                let candidates: Vec<_> = active.iter().zip(&shared_priors).zip(&limits).zip(&drafted)
+                    .map(|(((a, prior), &limit), draft)| super::draft_binding::Candidate { id: a.ticket.id(), prior,
+                        limit, selector: draft.as_ref().is_some_and(|d| d.confidence.is_empty()), cold: a.drafts.cold() })
+                    .collect();
+                let selection = super::draft_binding::select(&mut shared.policy, &candidates, drafted_width);
+                predicted = selection.predicted;
+                selection.lengths
+            }
             _ => dflash_policy::plan_counts(&inputs, policy.fixed, &cost),
         };
         drop(inputs);
@@ -1281,6 +1394,7 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
             .map(|(a, s)| (&mut a.placement, s.len())).collect();
         steps += 1;
         let timer = Instant::now();
+        engine.probe_begin(tokens.len());
         let step = engine.verify_device(&mut rows, &tokens, spec).and_then(|logits| logits.context("decode needs every layer"))
             .and_then(|logits| {
                 // Each row draws at the position after it, masked along its sequence's drafts.
@@ -1291,6 +1405,8 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
                 }
                 Ok((selector.select(&logits, &batch)?, logits))
             });
+        // Selection drained the stream; the probe stops recording either way.
+        engine.probe_end(step.is_ok());
         let step_ms = timer.elapsed().as_secs_f64() * 1e3;
         verify_stats.record(tokens.len(), engine.serving_decode_rows(tokens.len(), spec), spec, step_ms);
         verify_s += step_ms / 1e3;
@@ -1313,11 +1429,16 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
         let mut kept = Vec::new();
         let draft_list = &drafted;
         let caching = cache.enabled();
+        let shared_active = shared.is_some();
         let before: Vec<usize> = active.iter().map(|a| a.history.len()).collect();
+        // Per request: rows executed, accepted inputs and why verification stopped short of a miss.
+        let mut verified: Vec<(usize, usize, Option<crate::shared::draft::evidence::Censor>)> =
+            vec![(0, 0, None); active.len()];
         let finished: Vec<bool> = active.iter_mut().zip(&sequences).zip(starts).enumerate()
             .map(|(i, ((request, rows), start))| {
             if let Some(error) = poisoned[i].take() {
                 let _ = request.job.events.send(Err(NativeFailure::Worker(error)));
+                verified[i] = (rows.len(), 1, Some(crate::shared::draft::evidence::Censor::Cancelled));
                 offset += rows.len();
                 return true;
             }
@@ -1340,6 +1461,8 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
                 true
             });
             let committed = request.placement.len - start;
+            verified[i] = (rows.len(), committed, finish_censor(finished, committed, rows,
+                request.history.last().copied(), &request.job.stop_token_ids));
             // A turn snapshot captures the KDA state at the kept length: commit it too.
             if !finished || request.turn.is_some() {
                 commits.push((request.placement.slot, offset, committed));
@@ -1366,7 +1489,7 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
                     policy.observe(&request.drafts, draft_list[i].as_ref().filter(|d| d.confidence.is_empty()).map(|d| d.features.as_slice()),
                         &priors[i], drafted, accepted, finished, request.ticket.id());
                 }
-                request.drafts.observe(if refine_confidence || copy_policy { drafted.min(accepted + usize::from(!finished)) } else { planned[i] }, accepted);
+                request.drafts.observe(if refine_confidence || copy_policy || shared_active { drafted.min(accepted + usize::from(!finished)) } else { planned[i] }, accepted);
             }
             // Adapt the copy-draft length to how much of it the model reproduced.
             if used_copy[i] || drafter.is_none() {
@@ -1393,6 +1516,18 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
             drafter.update(&context)?;
         }
         verify_s += timer.elapsed().as_secs_f64();
+        if let Some(shared) = shared.as_mut() {
+            let requests: Vec<_> = active.iter().enumerate().map(|(i, a)| {
+                let (rows, accepted, censor) = verified[i];
+                let draft = drafted[i].as_ref().filter(|_| !used_copy[i] && rows > 1);
+                super::draft_binding::Verified { id: a.ticket.id(), rows, accepted: accepted.max(1),
+                    source: if used_copy[i] { DraftSource::Copy } else if draft.is_some() { DraftSource::Neural }
+                        else { DraftSource::Undrafted },
+                    prior: draft.map(|_| shared_priors[i].as_slice()),
+                    features: draft.filter(|d| d.confidence.is_empty()).map(|d| d.features.as_slice()), censor }
+            }).collect();
+            shared.observe(engine, &requests, round_clock.observe(), drafted_width, predicted);
+        }
         for (i, request) in active.iter().enumerate() {
             let proposal = if used_copy[i] { &sequences[i][1..] } else { drafted[i].as_ref().map_or(&[][..], |d| &d.tokens) };
             tally.member(&request.ticket, proposal, sequences[i].len() - 1, &request.history[before[i]..],
@@ -1410,6 +1545,7 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
                 continue;
             }
             let mut request = active.remove(index);
+            if let Some(shared) = shared.as_mut() { shared.policy.release(request.ticket.id()); }
             request.ticket.done(request.generated);
             requests += 1;
             generated_total += request.generated as u64;
@@ -1808,6 +1944,26 @@ mod packed_member_tests {
         assert_eq!(row_shares(&[30, 10]), [0.75, 0.25]);
         assert_eq!(row_shares(&[1, 1, 2]), [0.25, 0.25, 0.5]);
         assert_eq!(row_shares(&[0, 0]), [0.5, 0.5]);
+    }
+}
+
+#[cfg(test)]
+mod censor_tests {
+    use super::*;
+
+    #[test]
+    fn a_finish_censors_only_where_no_draft_was_rejected() {
+        let stops = [9];
+        // Running: no censor.
+        assert_eq!(finish_censor(false, 2, &[1, 5, 6], Some(6), &stops), None);
+        // EOS emitted at row 1; the next draft (row 2) was the stop token itself: censored.
+        assert_eq!(finish_censor(true, 2, &[1, 5, 9, 4], Some(9), &stops), Some(Censor::Eos));
+        // EOS where the next draft proposed something else: the draft was rejected, a miss.
+        assert_eq!(finish_censor(true, 2, &[1, 5, 7, 4], Some(9), &stops), None);
+        // Every row accepted, then the output limit: censored.
+        assert_eq!(finish_censor(true, 3, &[1, 5, 6], Some(8), &stops), Some(Censor::OutputLimit));
+        // Output limit mid-draft on an agreeing token.
+        assert_eq!(finish_censor(true, 1, &[1, 5, 6], Some(5), &stops), Some(Censor::OutputLimit));
     }
 }
 

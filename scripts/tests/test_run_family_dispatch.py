@@ -664,6 +664,33 @@ def test_glmf_admission_and_verify_keys_reject_bad_values_before_launch(tmp_path
     assert not any(line.startswith(("docker ", "ssh ", "nest ")) for line in result.stderr.splitlines())
 
 
+@pytest.mark.parametrize("keys,expected,absent", [
+    ("", ("CUTEAFD_GLMF_DRAFT_POLICY=cycle",), ("CUTEAFD_GLMF_ROUTE_RING_CHECK",)),
+    ("GLM5_FLASH_DRAFT_POLICY=shared\n", ("CUTEAFD_GLMF_DRAFT_POLICY=shared",), ("CUTEAFD_GLMF_ROUTE_RING_CHECK",)),
+    ("GLM5_FLASH_DRAFT_POLICY=shared\nGLM5_FLASH_ROUTE_RING_CHECK=on\n",
+     ("CUTEAFD_GLMF_DRAFT_POLICY=shared", "CUTEAFD_GLMF_ROUTE_RING_CHECK=1"), ()),
+])
+def test_glmf_draft_policy_keys_reach_the_coordinator(tmp_path, keys, expected, absent):
+    """The shared draft policy is opt-in (cycle by default) and the route ring check is diagnostic."""
+    result = _family_launch_result(tmp_path, GLMF_CONFIG, "test/glmf", f"GLM5_FLASH_FP8_MODEL_ID=off\n{keys}")
+    assert result.returncode == 0, result.stderr
+    launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-glmf" in line)
+    for option in expected:
+        assert option in launch, (option, launch)
+    for option in absent:
+        assert option not in launch, (option, launch)
+
+
+@pytest.mark.parametrize("keys,message", [
+    ("GLM5_FLASH_DRAFT_POLICY=buckets\n", "GLM5_FLASH_DRAFT_POLICY must be"),
+    ("GLM5_FLASH_ROUTE_RING_CHECK=yes\n", "GLM5_FLASH_ROUTE_RING_CHECK must be"),
+])
+def test_glmf_draft_policy_keys_reject_bad_values_before_launch(tmp_path, keys, message):
+    result = _family_launch_result(tmp_path, GLMF_CONFIG, "test/glmf", f"GLM5_FLASH_FP8_MODEL_ID=off\n{keys}")
+    assert result.returncode == 2 and message in result.stderr, result.stderr
+    assert not any(line.startswith(("docker ", "ssh ", "nest ")) for line in result.stderr.splitlines())
+
+
 @pytest.mark.parametrize("keys,forwarded", [("", None), ("GLM5_FLASH_KDA_STATE=f32\n", None),
                                              ("GLM5_FLASH_KDA_STATE=bf16\n", "bf16"),
                                              ("GLM5_FLASH_KDA_STATE=bf16-tile\n", "bf16-tile")])

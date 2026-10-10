@@ -477,11 +477,22 @@ fn check_checkpoint_headers(cfg: &DflashConfig, tensors: &HashMap<String, Safete
 
 impl<'a> GlmDrafter<'a> {
     pub fn confidence_policy(&self, family: &str, fp8_head: bool) -> Result<crate::shared::draft_confidence::ConfidencePolicy> {
+        crate::shared::draft_confidence::ConfidencePolicy::load(&self.confidence_directory,
+            self.confidence_key(family, fp8_head))
+    }
+
+    /// The keyed selector prior (`family/dflash2/numerics`), or the generic
+    /// GLM-5.3 fit when the drafter ships none for this key.
+    pub fn selector_fit(&self, family: &str, fp8_head: bool) -> Result<crate::shared::draft_confidence::SelectorFit> {
+        crate::shared::draft_confidence::SelectorFit::load(&self.confidence_directory,
+            &self.confidence_key(family, fp8_head))
+    }
+
+    fn confidence_key(&self, family: &str, fp8_head: bool) -> String {
         let head = if fp8_head { "head-fp8-row".into() } else { format!("head-bf16-{:?}", self.head_mode.get()) };
         let numerics = format!("{}-{:?}-{head}-{:?}-r1", self.representation.name(), self.fp8_rows.get(),
             self.confidence_scales).to_ascii_lowercase();
-        crate::shared::draft_confidence::ConfidencePolicy::load(&self.confidence_directory,
-            format!("{family}/dflash2/{numerics}"))
+        format!("{family}/dflash2/{numerics}")
     }
 
     pub fn max_batch_sequences(&self) -> usize { self.max_sequences }

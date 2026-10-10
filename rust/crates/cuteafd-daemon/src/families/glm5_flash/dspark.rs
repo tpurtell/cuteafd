@@ -786,6 +786,15 @@ impl<'a> Drafter<'a> {
         }
     }
 
+    /// The shared draft policy's prior: DFlash2's keyed selector fit, or the
+    /// dSpark confidence head blended with the history rate.
+    pub fn draft_prior(&self, fp8_head: bool) -> Result<super::draft_binding::Prior> {
+        Ok(match self {
+            Self::Dflash2(d) => super::draft_binding::Prior::Selector(d.selector_fit("glm5_flash", fp8_head)?),
+            Self::Dspark(_) => super::draft_binding::Prior::Head,
+        })
+    }
+
     /// Loads the drafter `snapshot` names (dSpark when its config says so,
     /// else DFlash2) for a target of `hidden` x `vocab` with `layers` layers:
     /// `slots` ring contexts, draft steps of up to `sequences` sequences.
