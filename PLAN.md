@@ -1889,6 +1889,41 @@ TJ: two key items, both urgent right after v2.0.0.
       (≤ 8 rows), which run W4A16, so W4A4 prefill (> 1,024 rows on GB10)
       is only seen by the full tier's prefill-shaped pass. Give NVFP4
       release cards a prefill-shaped check.
+11. **Replicated-latent KV under the head split (TJ, 2026-10-10).** Under the
+    head split, MLA/DSA/CSA latents are stored in full on both GPUs, because
+    every head reads the whole latent.
+    - **Cost:** GLM 5.3 max spends 65 GiB of GPU1 on the copy and caps at a
+      1.30M pool. V4 Flash/Pro lose 4-5.6 GiB per GPU, about 1-2 TP2 layers.
+      GLM Flash's DSA layers are affected too.
+    - **Two attention placements, both offered, chosen per layout:**
+      - **Token-split latent** (`attention=context`; **default**). Each GPU
+        holds half the tokens, page-interleaved. Projections stay head-split
+        and the query is replicated, which is tiny at decode. Each GPU runs
+        all heads over its token shard, and the partials merge by
+        log-sum-exp.
+        - KV is halved, and each GPU reads half the latent per decode step,
+          so it is optimized for C1.
+        - DSA: indexer scores are token-sharded, with a global top-k by
+          exchanging candidate (score, index) pairs; ties break on token
+          index, for determinism.
+        - The merge changes summation order, so it needs its own fidelity
+          gate.
+        - Prefill merge traffic needs overlap, or the head split for short
+          contexts.
+      - **Layer ownership** (`attention=layers`). Each attention layer's KV
+        lives on one GPU, alternating. Two lanes run one layer apart, so
+        both GPUs stay busy. There is no merge and no duplicate, so it is
+        optimized for C > 1.
+        - It uses P3's `Whole{gpu}` and hops, and P7's per-layer executor.
+    - **Launcher:** `ATTENTION_PLACEMENT=context|layers|heads` (`heads` is
+      today's replicated head split, kept for A/B). The solver charges each
+      exactly, and a card records the choice.
+    - **Order:** design first; then GLM 5.3 (the biggest win, and P9's
+      ranges-vs-split choice becomes these options), then V4 Flash/Pro, then
+      GLM Flash's DSA layers. V4.1 keeps its 20/20 ranges unless measured.
+    - **Gate:** the family golden and quick fidelity (merge numerics); the 2M
+      pool at max; C1 for `context` at least head-split C1; C8/C16 measured
+      for both options.
 Gate per family: golden/fidelity, then the quick A/B at the 2M operating
 point on the min and max reference configs. Requalify each family's cards
 as it moves.
