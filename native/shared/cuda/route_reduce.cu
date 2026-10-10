@@ -1,5 +1,6 @@
 #include "cuteafd_experts.h"
 #include "expert_hidden.cuh"
+#include <algorithm>
 #include <atomic>
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
@@ -498,6 +499,35 @@ extern "C" int32_t cuteafd_finish_local_experts_async(const float* routed,
 }
 
 namespace {
+__global__ void sum_rtx_tp2_routes(const float* routes, float* sums,
+    uint64_t count, uint32_t hidden, uint32_t topk) {
+  for (uint64_t i = uint64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+       i < count; i += uint64_t(gridDim.x) * blockDim.x) {
+    const uint64_t base = (i / hidden) * topk * hidden + i % hidden;
+    float value = routes[base];
+    for (uint32_t route = 1; route < topk; ++route)
+      value = __fadd_rn(value, routes[base + uint64_t(route) * hidden]);
+    sums[i] = value;
+  }
+}
+}
+extern "C" int32_t cuteafd_sum_rtx_tp2_routes_async(const float* routes, float* sums,
+    uint32_t rows, uint32_t hidden, uint32_t topk, void* stream) {
+  if (!rows || rows > 4096 || !hidden || hidden > 16384 || !topk || topk > 256 ||
+      !routes || !sums || reinterpret_cast<uintptr_t>(routes) % 4 ||
+      reinterpret_cast<uintptr_t>(sums) % 4) return cudaErrorInvalidValue;
+  const uint64_t count = uint64_t(rows) * hidden;
+  const uint64_t input_bytes = count * topk * 4, output_bytes = count * 4;
+  if (reinterpret_cast<uintptr_t>(routes) > UINTPTR_MAX - input_bytes ||
+      reinterpret_cast<uintptr_t>(sums) > UINTPTR_MAX - output_bytes ||
+      overlaps(routes, input_bytes, sums, output_bytes)) return cudaErrorInvalidValue;
+  const auto blocks = static_cast<unsigned>(std::min<uint64_t>((count + 255) / 256, 4096));
+  sum_rtx_tp2_routes<<<blocks, 256, 0, static_cast<cudaStream_t>(stream)>>>(
+      routes, sums, count, hidden, topk);
+  return cudaGetLastError();
+}
+
+namespace {
 // TP2 RTX fused combine (PLAN "v3 placement", section 2): one rank's payload
 // p = dtype(FP32(routed) + FP32(shared)) for the head split's FFN exchange,
 // and the rank-ordered BF16(FP32(p0) + FP32(p1)) both GPUs compute.
@@ -533,6 +563,9 @@ extern "C" int32_t cuteafd_rtx_tp2_partial_async(const float* routed, const uint
   if (!count || count > uint64_t(4096) * 16384 || dtype > 1 || !out ||
       (routed && reinterpret_cast<uintptr_t>(routed) % 4) || (shared && reinterpret_cast<uintptr_t>(shared) % 2) ||
       reinterpret_cast<uintptr_t>(out) % element ||
+      reinterpret_cast<uintptr_t>(out) > UINTPTR_MAX - count * element ||
+      (routed && reinterpret_cast<uintptr_t>(routed) > UINTPTR_MAX - count * 4) ||
+      (shared && reinterpret_cast<uintptr_t>(shared) > UINTPTR_MAX - count * 2) ||
       (routed && overlaps(routed, count * 4, out, count * element)) ||
       (shared && overlaps(shared, count * 2, out, count * element)))
     return cudaErrorInvalidValue;
@@ -553,6 +586,9 @@ extern "C" int32_t cuteafd_rtx_tp2_sum_async(const void* rank0, const void* rank
   if (!count || count > uint64_t(4096) * 16384 || dtype > 1 || !rank0 || !rank1 || !out ||
       reinterpret_cast<uintptr_t>(rank0) % element || reinterpret_cast<uintptr_t>(rank1) % element ||
       reinterpret_cast<uintptr_t>(out) % 2 ||
+      reinterpret_cast<uintptr_t>(out) > UINTPTR_MAX - count * 2 ||
+      reinterpret_cast<uintptr_t>(rank0) > UINTPTR_MAX - count * element ||
+      reinterpret_cast<uintptr_t>(rank1) > UINTPTR_MAX - count * element ||
       overlaps(rank0, count * element, out, count * 2) || overlaps(rank1, count * element, out, count * 2))
     return cudaErrorInvalidValue;
   auto cuda_stream = static_cast<cudaStream_t>(stream);

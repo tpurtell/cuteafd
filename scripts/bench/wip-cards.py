@@ -741,6 +741,8 @@ def build_scopes(cards):
         if family == 'deepseek_v4':
             tag = 'dsv4p' if 'pro' in card['name'] else 'dsv4f'
             scopes.update({tag + ':rtx_backbone', tag + (':spark_tp2' if count == 2 else ':spark')})
+            if int(values.get('RTX_GPUS', len(card.get('gpus', [0])))) == 2:
+                scopes.add(tag + ':rtx_tp2')
             env['CUTEAFD_WIP_DSV4_AOT'] = 'ON'
             if 'exl3' in card['name']:
                 scopes.add(tag + ':exl3-k23')

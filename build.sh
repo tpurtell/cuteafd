@@ -98,7 +98,7 @@ FP8, MiMo V2.6 Pro MXFP4 (tp1 coordinator, tp6/tp2 Spark), Qwen 3.8 Flash Next
 EXL3 K4.25):
     CUTEAFD_RELEASE_GLM_AOT=ON CUTEAFD_RELEASE_GLMF_AOT=ON CUTEAFD_RELEASE_MIMO_AOT=ON
     CUTEAFD_RELEASE_QWEN4_AOT=ON CUTEAFD_RELEASE_MIMO_GEOMETRIES=mimo,mimo2,mimop,mimop2
-    CUTEAFD_RELEASE_EXPERT_FAMILIES='dsv4p:exl3-k23;glm:exl3-k45;glm:fp8;mimo:fp8;mimop:fp8;qwen4:exl3-k45'
+    CUTEAFD_RELEASE_EXPERT_FAMILIES='dsv4f:rtx_backbone;dsv4f:rtx_tp2;dsv4p:rtx_backbone;dsv4p:rtx_tp2;dsv4p:exl3-k23;glm:exl3-k45;glm:fp8;mimo:fp8;mimop:fp8;qwen4:exl3-k45'
 (p6 was the same without QWEN4, mimop, mimop:fp8 and qwen4:exl3-k45.)
 
 Images are labelled with the checkout's Git revision (HEAD), even when the

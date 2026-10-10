@@ -45,6 +45,9 @@
 #ifndef CUTEAFD_V41_OUTPUT_KIND
 #define CUTEAFD_V41_OUTPUT_KIND(capacity) 0
 #endif
+#if defined(CUTEAFD_V41_TP2_EXPERTS) && !defined(CUTEAFD_EXPERT_PER_DEVICE_HANDLES)
+#define CUTEAFD_EXPERT_PER_DEVICE_HANDLES 1
+#endif
 
 static_assert(sizeof(cuteafd_expert_info_t) == 64);
 static_assert(sizeof(cuteafd_expert_launch_t) == 392);
@@ -68,15 +71,16 @@ struct Variant {
   ~Variant() { if (library) cudaLibraryUnload(library); }
 };
 Variant variants[] = {CUTEAFD_V41_VARIANTS};
-#ifdef CUTEAFD_V41_TP2_EXPERTS
+#ifdef CUTEAFD_EXPERT_PER_DEVICE_HANDLES
 // The dual coordinator exposes exactly two selected GPUs as CUDA devices 0/1.
-// Each owns a separate loaded module and immutable handle per capacity.
+// Each owns an immutable handle per capacity; generated launch symbols share
+// one library configured on both devices.
 Variant peer_variants[] = {CUTEAFD_V41_VARIANTS};
 #endif
 std::mutex initialization_mutex;
 Variant* by_handle(void* handle) {
   for (auto& variant : variants) if (&variant == handle) return &variant;
-#ifdef CUTEAFD_V41_TP2_EXPERTS
+#ifdef CUTEAFD_EXPERT_PER_DEVICE_HANDLES
   for (auto& variant : peer_variants) if (&variant == handle) return &variant;
 #endif
   return nullptr;
@@ -87,7 +91,7 @@ bool valid_scratch(Variant* variant, void* storage, uint64_t bytes) {
     reinterpret_cast<uintptr_t>(storage) <= UINTPTR_MAX - variant->info.scratch_bytes;
 }
 Variant* by_capacity(int32_t capacity) {
-#ifdef CUTEAFD_V41_TP2_EXPERTS
+#ifdef CUTEAFD_EXPERT_PER_DEVICE_HANDLES
   int device = -1;
   if (cudaGetDevice(&device) != cudaSuccess || device < 0 || device > 1) return nullptr;
   if (device == 1) {
@@ -109,7 +113,7 @@ extern "C" int32_t cuteafd_expert_bind_scratch(void* kernel, void* storage,
     uint64_t bytes, void* tensors[CUTEAFD_V41_EXPERT_POINTERS]) {
   auto* variant = by_handle(kernel);
   if (!valid_scratch(variant, storage, bytes) || !tensors) return cudaErrorInvalidValue;
-#ifdef CUTEAFD_V41_TP2_EXPERTS
+#ifdef CUTEAFD_EXPERT_PER_DEVICE_HANDLES
   int device = -1;
   const auto status = cudaGetDevice(&device);
   if (status != cudaSuccess) return status;
@@ -183,7 +187,7 @@ extern "C" int32_t cuteafd_expert_initialize(int32_t capacity, void** out) {
   }
   variant->device_sms = sms;
   auto* module_owner = variant;
-#ifdef CUTEAFD_V41_TP2_EXPERTS
+#ifdef CUTEAFD_EXPERT_PER_DEVICE_HANDLES
   // Generated launch symbols are shared process-wide. Keep one library per
   // exported variant and configure it on both devices; handles remain distinct.
   for (auto& entry : variants)

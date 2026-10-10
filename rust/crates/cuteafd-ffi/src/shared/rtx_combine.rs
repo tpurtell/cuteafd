@@ -52,7 +52,7 @@ impl NativeLibrary {
 
 impl RtxTp2Combine<'_> {
     /// `out[i] = dtype(FP32(routed[i]) + FP32(shared[i]))` over `count`
-    /// elements; `shared` may be null (routed alone).
+    /// elements; either input may be null (zero contribution).
     /// # Safety
     /// `routed` FP32 [count], `shared` BF16 [count] and `out` [count] of
     /// `dtype` are live on the current device, disjoint, and ordered on `stream`.

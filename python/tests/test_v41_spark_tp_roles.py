@@ -83,6 +83,24 @@ def test_existing_tp4_and_rtx_roles_are_unchanged() -> None:
     assert geometry["dspark_tp2"] == (128, 1152, 1152, 3)
 
 
+def test_dsv4_coordinator_roles_share_per_device_handles_and_tp2_symbols() -> None:
+    family = (ROOT / 'native/cmake/shared/expert_families.cmake').read_text()
+    assert '(dsv4f|dsv4p):(spark|spark_tp2|rtx_backbone|rtx_tp2)' in family
+    assert 'if(role MATCHES "^rtx_")' in family
+    assert '#define CUTEAFD_EXPERT_PER_DEVICE_HANDLES 1' in family
+    assert 'set(symbol "cuteafd_${family}_tp2")' in family
+    assert 'set(symbol "cuteafd_${family}_local")' in family
+    assert '--geometry "${family}" --role "${role}"' in family
+    source = (ROOT / 'native/shared/src/v41_experts.cc').read_text()
+    assert '#if defined(CUTEAFD_V41_TP2_EXPERTS) && !defined(CUTEAFD_EXPERT_PER_DEVICE_HANDLES)' in source
+    assert 'Variant peer_variants[] = {CUTEAFD_V41_VARIANTS};' in source
+    assert 'auto* library_ptr = &module_owner->library;' in source
+    # Generated roles omit the canonical input quantizer; that existing
+    # quantizer already has two device handles backed by one library.
+    assert '!defined(CUTEAFD_EXPERT_VARIANTS_HEADER)' in source
+    assert '} input_quant, peer_input_quant;' in source
+
+
 def test_ordinary_exporter_routes_new_roles_only_through_fp8_slices() -> None:
     tables = _literal_assignments(EXPERTS, {"SPARK_ROLES", "SPARK_TP_DEGREES"})
     roles = tables["SPARK_ROLES"]
