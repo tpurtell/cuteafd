@@ -5,6 +5,9 @@
 //! reading the same FP8 K32 wire rows and device routes the Sparks would get,
 //! and the local reducer adds the shared expert. EXL3 checkpoints run the
 //! coordinator's `exl3-<family>-k<tiers>/rtx-tp1` package instead.
+#[cfg(test)]
+#[path = "local/shared_tp2_tests.rs"]
+mod shared_tp2_tests;
 use crate::shared::experts::exl3::{
     aot_layout_directory,
     execution::{Exl3Execution, Exl3InputFormat, Exl3RowPolicy, Exl3Workspace},
