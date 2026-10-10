@@ -58,8 +58,8 @@ pub(crate) struct EngineArgs {
     #[arg(long, default_value_t = 0)]
     pub pool_tokens: usize,
     /// Routed-expert layers to keep on the coordinator GPUs (from layer 0):
-    /// `max` (the default) places the most layers that still leave a 262K
-    /// pool (v2's policy); `auto` reserves the 2M KV pool first and fills
+    /// `max` (the one-RTX default) places the most layers that still leave a 262K
+    /// pool (v2's policy); `auto` (two-RTX default) reserves the 2M KV pool first and fills
     /// what is left; `N`, `N%` or `all` fix the RTX layers and the KV pool
     /// takes every remaining byte. 0 sends every layer to the Sparks.
     #[arg(long, value_parser = parse_onboard, conflicts_with = "local_expert_layers")]
@@ -67,10 +67,9 @@ pub(crate) struct EngineArgs {
     /// Alias of `--rtx-expert-layers N`.
     #[arg(long)]
     pub local_expert_layers: Option<usize>,
-    /// Let EXL3 routed-expert layers fill GPU1 too under --split-device
-    /// (opt-in: its two-lane prefill exchange is not yet qualified).
-    #[arg(long)]
-    pub peer_expert_ranges: bool,
+    /// Removed GPU1 whole-layer placement flag.
+    #[arg(long = "peer-expert-ranges", hide = true, value_parser = crate::cli::reject_peer_expert_ranges)]
+    pub deprecated_peer_expert_ranges: bool,
     /// Keep the dSpark drafter's stage experts on the coordinator GPU (before
     /// backbone layers) so the engine can draft.
     #[arg(long)]
@@ -163,7 +162,7 @@ impl EngineArgs {
         Ok(match (self.rtx_expert_layers, self.local_expert_layers) {
             (Some(onboard), _) => onboard,
             (None, Some(layers)) => Onboard::Layers(layers),
-            (None, None) => cuteafd_loader::placement::families::deepseek_v4::DEFAULT_ONBOARD,
+            (None, None) => cuteafd_loader::placement::families::deepseek_v4::default_onboard(if self.split_device.is_some() { 2 } else { 1 }),
         })
     }
 
@@ -313,7 +312,10 @@ pub(crate) fn with_engine<T>(
                 prefill_rows.max(decode_rows))?.map(|bytes| bytes as u64) };
         let inputs = admission::Inputs { cfg: &loaded.cfg, catalog: &loaded.catalog, manifest: &loaded.manifest,
             family: loaded.family, gpus, cache_stages, prefill_rows, decode_rows, max_context, prefix,
-            expert_workspace };
+            expert_workspace, tp2_workspace: if split_device.is_some() && !args.skip_routed_experts && onboard.layers(loaded.cfg.n_layers) != Some(0) {
+                cuteafd_loader::serving_capacity::deepseek_v4_tp2_workspace(&loaded.catalog, Some(&args.manifest),
+                    prefill_rows.max(decode_rows) as u64).ok().map(|bytes| [bytes; 2])
+            } else { None }, exchange_f32: false };
         let request = admission::request(args, &inputs)?;
         let placement = cuteafd_loader::placement::solve(&request)
             .map_err(|error| anyhow::anyhow!("DeepSeek V4 admission: {error}"))?;

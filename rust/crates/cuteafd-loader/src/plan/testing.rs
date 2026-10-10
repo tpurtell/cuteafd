@@ -374,6 +374,10 @@ pub fn write_quantize_config(dir: &Path, manifest: &Value) {
 }
 
 pub fn write_v4_snapshot(path: &Path) {
+    write_v4_snapshot_with_dspark(path, 0);
+}
+
+pub fn write_v4_snapshot_with_dspark(path: &Path, stages: usize) {
     // serve-dsv4 reads inference/config.json when the snapshot has one; so does the plan.
     let hf = json!({"architectures": ["DeepseekV4ForCausalLM"], "model_type": "deepseek_v4"});
     let mut ratios = vec![0, 0];
@@ -392,6 +396,15 @@ pub fn write_v4_snapshot(path: &Path) {
         for expert in 0..256 {
             for (projection, rows, cols) in [("w1", 2048, 4096), ("w2", 4096, 2048), ("w3", 2048, 4096)] {
                 let name = format!("layers.{layer}.ffn.experts.{expert}.{projection}");
+                tensors.push(t(format!("{name}.weight"), "I8", &[rows, cols / 2]));
+                tensors.push(t(format!("{name}.scale"), "F8_E8M0", &[rows, cols / 32]));
+            }
+        }
+    }
+    for stage in 0..stages {
+        for expert in 0..256 {
+            for (projection, rows, cols) in [("w1", 2048, 4096), ("w2", 4096, 2048), ("w3", 2048, 4096)] {
+                let name = format!("mtp.{stage}.ffn.experts.{expert}.{projection}");
                 tensors.push(t(format!("{name}.weight"), "I8", &[rows, cols / 2]));
                 tensors.push(t(format!("{name}.scale"), "F8_E8M0", &[rows, cols / 32]));
             }

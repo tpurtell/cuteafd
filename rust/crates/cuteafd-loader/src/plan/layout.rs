@@ -103,8 +103,8 @@ pub struct LayoutOptions {
     /// makes the KV pool the output. `None` takes the family default (V4:
     /// `max`); `local_expert_layers` maps onto `Layers(n)` when unset.
     pub onboard: Option<crate::placement::Onboard>,
-    /// V4: let EXL3 routed layers fill GPU1 too (`--peer-expert-ranges`).
-    pub peer_expert_ranges: bool,
+    /// V4: force FP32 FFN exchange payloads for prefill as well as TP2 decode.
+    pub exchange_f32: bool,
     /// Matching image's PROGRAMS.json for exact V4 workspace geometry.
     pub workspace_manifest: Option<std::path::PathBuf>,
 }
@@ -147,7 +147,7 @@ impl Default for LayoutOptions {
             native_mtp_layers: 3,
             local_expert_layers: None,
             onboard: None,
-            peer_expert_ranges: false,
+            exchange_f32: false,
             workspace_manifest: None,
         }
     }
@@ -765,7 +765,7 @@ pub fn layout(report: &mut PlanReport, model: &dyn super::FamilyModel, checkpoin
         }
         if split {
             let exact_peer = if family == "deepseek_v4" {
-                crate::serving_capacity::deepseek_v4_peer_exchange_bytes(model.spec().hidden as u64, prefill_rows, decode_rows).ok()
+                crate::serving_capacity::deepseek_v4_peer_exchange_bytes(model.spec().hidden as u64, prefill_rows, decode_rows, true, options.exchange_f32).ok()
             } else { None };
             device.items.push(Item::new(Category::Transport, "peer exchange", "", exact_peer.unwrap_or(costs.exchange_bytes),
                 if exact_peer.is_some() { Basis::Formula } else { allowance_basis }));
@@ -871,7 +871,11 @@ pub fn layout(report: &mut PlanReport, model: &dyn super::FamilyModel, checkpoin
                 }
                 notes.push(format!("placement: {}", placement.summary()));
                 local_layers = placement.onboard_layers;
-                local_bytes = placement.expert_ranges.iter().map(|r| r.peak_bytes).sum();
+                if let Some(t) = placement.tp2 {
+                    notes.push(format!("rtx0/rtx1: {} TP2 expert layer halves ({}..{})", t.layers, t.first, t.first + t.layers));
+                }
+                local_bytes = placement.expert_ranges.iter().map(|r| r.peak_bytes).sum::<u64>()
+                    + placement.tp2.map_or(0, |t| t.peak_bytes.iter().sum());
                 pool_tokens = placement.pool_tokens;
                 if pool_tokens < context_tokens {
                     notes.push(format!("full-context admission shortfall: context {context_tokens} tokens, pool {pool_tokens} tokens, shortfall {} tokens", context_tokens - pool_tokens));
@@ -1116,13 +1120,22 @@ fn deepseek_v4_placement(report: &PlanReport, checkpoint: &super::Checkpoint,
     let onboard = match (options.onboard, options.local_expert_layers) {
         (Some(onboard), _) => onboard,
         (None, Some(n)) => Onboard::Layers(n.saturating_sub(routed.first_layer)),
-        (None, None) => v4::DEFAULT_ONBOARD,
+        (None, None) => v4::default_onboard(devices.len()),
     };
+    let tp2_workspace = if devices.len() == 2 && onboard.layers(routed.layers - routed.first_layer) != Some(0) {
+        crate::serving_capacity::deepseek_v4_tp2_workspace(&catalog, options.workspace_manifest.as_deref(),
+            shape.prefill_rows.max(shape.decode_rows)).ok()
+    } else { None };
+    if devices.len() == 2 && tp2_workspace.is_none() && onboard != Onboard::Auto && onboard.layers(routed.layers - routed.first_layer) != Some(0) {
+        anyhow::bail!("V4 TP2 expert kernels are missing: export the matching rtx-tp2 package for explicit local layers");
+    }
     let inputs = v4::V4Inputs { cfg: &cfg, cache_stages: shape.cache_native_layers, gpus, headroom_floor: options.headroom_bytes,
         spark_ranks, sequences: shape.concurrency, prefill_rows: shape.prefill_rows, decode_rows: shape.decode_rows,
         max_context: shape.context_tokens, reserve_bytes: v4::RESERVE_BYTES, mark_slots, workspace: shape.workspace,
         experts, draft, expert_workspace, first_routed: routed.first_layer,
-        peer_experts: v4::peer_experts(&catalog, options.peer_expert_ranges),
+        experts_half: if tp2_workspace.is_some() { v4::expert_half_costs(&catalog)? } else { Vec::new() },
+        tp2_workspace: tp2_workspace.map_or([0; 2], |bytes| [bytes; 2]),
+        exchange_f32: options.exchange_f32,
         requested_pool: options.pool_tokens.filter(|&n| n > 0), onboard,
         full_prefill_logits: 0 };
     let request = v4::request(&inputs)?;

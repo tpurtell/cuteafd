@@ -142,7 +142,9 @@ mod tp2_tests {
             for rank in 0..2 {
                 let cost = deepseek_v4_tp2_expert_cost(&catalog, catalog.routed_experts().first_layer, rank).unwrap();
                 assert_eq!((cost.resident_bytes, cost.staging_bytes), (resident, staging));
+                if catalog.exl3().is_some() && !manifest.is_file() { continue; }
                 let workspace = deepseek_v4_tp2_workspace(&catalog, Some(&manifest), 4096).unwrap();
+                assert_eq!(workspace, if family == "flash" { 161453088 } else { 1343287468 });
                 eprintln!("TP2 {family} rank{rank}: resident={} staging={} workspace={workspace}", cost.resident_bytes, cost.staging_bytes);
             }
         }
