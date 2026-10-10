@@ -4523,9 +4523,11 @@ variables.** Set `DSH_HOME=/data/dsh`, `DSH_AGENTS_HOME=/data/agents` and
    never sparknest or the repo, because it holds SSH keys.
 6. **Which hosts the agent may target.** *Any registered host,* with the
    cluster hosts tagged "serving" and a confirm when a model is up there.
-7. **DSH version.** Stable 0.2.0-rc.2 or alpha 0.2.1-alpha.2? *Pin exact,
-   start on the alpha that `dsh-desktop` beta tracks,* and bump deliberately,
-   because the APIs are pre-stable.
+7. **DSH version.** Decided (TJ, 2026-10-11): start on upstream's newest
+   web release, not on what `dsh-desktop` tracks. That is `dsh-v0.2.1-alpha.2`
+   (`d7432673`, npm `alpha` tag, upstream master tip as of 2026-10-11) for
+   both `@deepseek-ai/dsh` and `@deepseek-ai/dsh-web-frontend`. Pin it exactly
+   and bump deliberately, because the APIs are pre-stable.
 8. **Upstream PRs** (user-actions slot, remote-aware Web workspace) or
    local patches? *Upstream PRs first,* with our plugin carrying a shim
    until they land.
