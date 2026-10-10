@@ -38,7 +38,78 @@ use speculative::DraftRuntime;
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot};
 
-pub(crate) async fn run(mut args: crate::cli::NativeServeArgs) -> Result<()> {
+pub(crate) async fn run(args: crate::cli::NativeServeArgs) -> Result<()> {
+    let Started { send, readiness, worker_thread, stats, http } = start(args, true)?;
+    let Http { api, listen, limits, http_queue_wait, console_hub } = http.expect("serving start loads the API");
+    let vision_health = readiness
+        .await
+        .context("native target startup stopped")?
+        .map_err(anyhow::Error::msg)?;
+    cuteafd_bench::context::phase("engine loaded");
+    let listener = tokio::net::TcpListener::bind(&listen).await?;
+    cuteafd_bench::ready(&listener);
+    tracing::info!(%listen,"native V4.1 target API ready");
+    let mut profile = cuteafd_api::openai::ModelProfile::default();
+    profile.vision_health = vision_health;
+    let router = cuteafd_api::openai::router_for_model(send, limits, stats, http_queue_wait, console_hub.clone(),
+        crate::shared::api::profile(profile));
+    axum::serve(listener, api.app(router, console_hub).into_make_service_with_connect_info::<std::net::SocketAddr>())
+        .with_graceful_shutdown(async {
+            let mut term =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                    .expect("install SIGTERM handler");
+            tokio::select! { _ = tokio::signal::ctrl_c() => {}, _ = term.recv() => {} }
+        })
+        .await?;
+    tokio::task::spawn_blocking(move || worker_thread.join())
+        .await?
+        .map_err(|_| anyhow::anyhow!("native CUDA worker panicked during shutdown"))?;
+    Ok(())
+}
+
+type Readiness = std::result::Result<Option<std::sync::Arc<std::sync::atomic::AtomicBool>>, String>;
+type Stats = std::sync::Arc<std::sync::Mutex<serde_json::Value>>;
+
+/// What the HTTP API needs, loaded in the launch's original order.
+struct Http {
+    api: crate::shared::api::ApiPolicy,
+    listen: String,
+    limits: cuteafd_api::openai::NativeLimits,
+    http_queue_wait: Duration,
+    console_hub: std::sync::Arc<cuteafd_api::openai::ConsoleHub>,
+}
+
+/// The CUDA worker thread, its request queue and its startup readiness.
+struct Started {
+    send: mpsc::Sender<NativeRequest>,
+    readiness: oneshot::Receiver<Readiness>,
+    worker_thread: std::thread::JoinHandle<()>,
+    stats: Stats,
+    http: Option<Http>,
+}
+
+/// A worker serving requests from a queue, without the HTTP API (the golden).
+/// Dropping the sender drains the scheduler; `join` waits for it to stop.
+pub(crate) struct WorkerHandle {
+    worker_thread: std::thread::JoinHandle<()>,
+}
+impl WorkerHandle {
+    pub(crate) fn join(self) -> Result<()> {
+        self.worker_thread.join().map_err(|_| anyhow::anyhow!("native CUDA worker panicked"))
+    }
+}
+
+/// Start the worker without the API and wait until it takes requests.
+pub(crate) fn start_worker(args: crate::cli::NativeServeArgs)
+    -> Result<(mpsc::Sender<NativeRequest>, WorkerHandle)> {
+    let Started { send, readiness, worker_thread, .. } = start(args, false)?;
+    readiness.blocking_recv().context("native target startup stopped")?.map_err(anyhow::Error::msg)?;
+    Ok((send, WorkerHandle { worker_thread }))
+}
+
+/// Validate and normalize the launch, then spawn the CUDA worker thread.
+/// With `http`, the API and live console load where `serve-native` always loaded them.
+fn start(mut args: crate::cli::NativeServeArgs, http: bool) -> Result<Started> {
     match cuteafd_transport::fabric::discover() {
         Ok(report) => tracing::info!(target: "cuteafd::fabric", rails = report.rails.use_rails, "{}", report.summary()),
         Err(error) => tracing::warn!(target: "cuteafd::fabric", "fabric discovery failed: {error:#}"),
@@ -76,7 +147,8 @@ pub(crate) async fn run(mut args: crate::cli::NativeServeArgs) -> Result<()> {
         args.memory_reservation = Some("97%".parse()?);
     }
     args.host_cache_config()?;
-    let api = args.api.load()?;
+    // The golden runs the worker without the API, so it loads no keyed policy.
+    let api = if http { Some(args.api.load()?) } else { None };
     let listen = args.listen.clone();
     let limits = cuteafd_api::openai::NativeLimits::new(args.max_context_tokens, args.max_output_tokens)?;
     let (send, receive) = mpsc::channel(args.http_queue_depth.unwrap_or(args.concurrency) as usize);
@@ -84,8 +156,14 @@ pub(crate) async fn run(mut args: crate::cli::NativeServeArgs) -> Result<()> {
     let (ready, readiness) = oneshot::channel();
     let stats = std::sync::Arc::new(std::sync::Mutex::new(serde_json::Value::Null));
     let worker_stats = stats.clone();
-    let console_hub = cuteafd_api::openai::ConsoleHub::new(args.console_text);
-    console::install(console_hub.clone(), console::layout(&args))?;
+    let http = match api {
+        Some(api) => {
+            let console_hub = cuteafd_api::openai::ConsoleHub::new(args.console_text);
+            console::install(console_hub.clone(), console::layout(&args))?;
+            Some(Http { api, listen, limits, http_queue_wait, console_hub })
+        }
+        None => None,
+    };
     let worker_thread = std::thread::Builder::new()
         .name("v41-target-cuda".into())
         .spawn(move || {
@@ -103,30 +181,7 @@ pub(crate) async fn run(mut args: crate::cli::NativeServeArgs) -> Result<()> {
             tracing::error!(%reason, "native target worker stopped");
             cuteafd_transport::health::record_failure(reason);
         })?;
-    let vision_health = readiness
-        .await
-        .context("native target startup stopped")?
-        .map_err(anyhow::Error::msg)?;
-    cuteafd_bench::context::phase("engine loaded");
-    let listener = tokio::net::TcpListener::bind(&listen).await?;
-    cuteafd_bench::ready(&listener);
-    tracing::info!(%listen,"native V4.1 target API ready");
-    let mut profile = cuteafd_api::openai::ModelProfile::default();
-    profile.vision_health = vision_health;
-    let router = cuteafd_api::openai::router_for_model(send, limits, stats, http_queue_wait, console_hub.clone(),
-        crate::shared::api::profile(profile));
-    axum::serve(listener, api.app(router, console_hub).into_make_service_with_connect_info::<std::net::SocketAddr>())
-        .with_graceful_shutdown(async {
-            let mut term =
-                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-                    .expect("install SIGTERM handler");
-            tokio::select! { _ = tokio::signal::ctrl_c() => {}, _ = term.recv() => {} }
-        })
-        .await?;
-    tokio::task::spawn_blocking(move || worker_thread.join())
-        .await?
-        .map_err(|_| anyhow::anyhow!("native CUDA worker panicked during shutdown"))?;
-    Ok(())
+    Ok(Started { send, readiness, worker_thread, stats, http })
 }
 // Reserve a supported AOT capacity once; live prefill chunks retain the user's
 // requested size. All backbone/draft workspaces and transport share this bound.

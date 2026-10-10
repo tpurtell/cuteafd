@@ -62,6 +62,10 @@ pub(crate) enum Commands {
     /// Compare a family's coordinator layer by layer with its golden reference
     /// outputs (python/reference/families/<id>); --family or --snapshot picks it.
     Golden(crate::commands::family::FamilyArgs),
+    /// Score a DeepSeek V4.1 golden prompt teacher-forced through the serving
+    /// worker's scoring probe and compare its logits with golden.py's.
+    #[command(hide = true)]
+    V41Golden(crate::families::deepseek_v41::v41_golden::GoldenArgs),
     /// Prefill a DeepSeek V4 golden prompt and compare layers and logits.
     #[command(hide = true)]
     Dsv4Golden(crate::families::deepseek_v4::GoldenArgs),
