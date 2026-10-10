@@ -24,6 +24,9 @@ pub(crate) struct Inputs<'a> {
     /// The local expert arena's workspace; `None` when this build lacks the
     /// coordinator expert kernels.
     pub expert_workspace: Option<u64>,
+    /// Actual per-rank TP2 expert workspace probe; None means no TP2 package.
+    pub tp2_workspace: Option<[u64; 2]>,
+    pub exchange_f32: bool,
 }
 
 pub(crate) fn request(args: &EngineArgs, inputs: &Inputs<'_>) -> Result<PlacementRequest> {
@@ -50,6 +53,8 @@ pub(crate) fn request(args: &EngineArgs, inputs: &Inputs<'_>) -> Result<Placemen
         else { v4::expert_costs(inputs.catalog, stages)? };
     let expert_workspace = match inputs.expert_workspace {
         Some(bytes) => bytes,
+        // TP2 backbone executors do not need the TP1/dSpark package.
+        None if gpus == 2 && stages == 0 => 0,
         None => {
             ensure!(stages == 0 && !args.fixed_onboard(),
                 "V4 local expert kernels are missing: export the matching rtx_backbone package for explicit local layers/dSpark");
@@ -58,13 +63,23 @@ pub(crate) fn request(args: &EngineArgs, inputs: &Inputs<'_>) -> Result<Placemen
             0
         }
     };
+    let (experts_half, tp2_workspace) = if gpus == 2 && !args.skip_routed_experts {
+        match inputs.tp2_workspace {
+            Some(workspace) => (v4::expert_half_costs(inputs.catalog)?, workspace),
+            None => {
+                ensure!(onboard == Onboard::Auto || onboard.layers(routed.layers - routed.first_layer) == Some(0), "V4 TP2 expert kernels are missing: export the matching rtx_tp2 package for explicit local layers");
+                tracing::warn!("V4 TP2 expert kernels unavailable; routing all backbone layers to Sparks");
+                (Vec::new(), [0; 2])
+            }
+        }
+    } else { (Vec::new(), [0; 2]) };
     let spark_ranks = if args.skip_routed_experts { 0 } else { args.peers.split(',').filter(|p| !p.is_empty()).count() };
     let request = v4::request(&v4::V4Inputs { cfg: &cache_cfg, cache_stages: inputs.cache_stages,
         gpus: inputs.gpus.clone(), headroom_floor: 0, spark_ranks,
         sequences: args.max_sequences as u64, prefill_rows: prefill, decode_rows: decode,
         max_context: inputs.max_context as u64, reserve_bytes: (args.reserve_gib as u64) << 30, mark_slots,
         workspace: Some(workspace), experts, draft, expert_workspace, first_routed: routed.first_layer,
-        peer_experts: v4::peer_experts(inputs.catalog, args.peer_expert_ranges),
+        experts_half, tp2_workspace, exchange_f32: inputs.exchange_f32,
         requested_pool: (args.pool_tokens > 0).then_some(args.pool_tokens as u64),
         onboard: if args.skip_routed_experts { Onboard::Auto } else { onboard },
         full_prefill_logits: 0 })?;

@@ -306,9 +306,12 @@ pub(crate) struct PlanArgs {
     /// --local-expert-layers.
     #[arg(long, value_parser = |text: &str| text.parse::<cuteafd_loader::placement::Onboard>())]
     pub(crate) rtx_expert_layers: Option<cuteafd_loader::placement::Onboard>,
-    /// V4: let EXL3 routed layers fill GPU1 too (serve-dsv4 --peer-expert-ranges).
+    /// Removed whole-layer GPU1 placement flag.
+    #[arg(long = "peer-expert-ranges", hide = true, value_parser = reject_peer_expert_ranges)]
+    pub(crate) deprecated_peer_expert_ranges: bool,
+    /// V4: force FP32 FFN exchange for prefill as well as decode.
     #[arg(long)]
-    pub(crate) peer_expert_ranges: bool,
+    pub(crate) exchange_f32: bool,
     /// Compiled maximum context for table and workspace reservations (0: family/image default).
     #[arg(long, default_value_t = 0)]
     pub(crate) context_tokens: u64,
@@ -981,4 +984,10 @@ impl NativeServeArgs {
         config.validate()?;
         Ok(config)
     }
+}
+
+/// Retain a diagnostic for old launch configurations, never the old path.
+pub(crate) fn reject_peer_expert_ranges(text: &str) -> Result<bool, String> {
+    if text == "false" { return Ok(false); }
+    Err("GPU1 whole-layer expert ranges were replaced by TP2 halves (v3 P4); drop --peer-expert-ranges".into())
 }
