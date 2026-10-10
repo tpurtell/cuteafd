@@ -1250,7 +1250,7 @@ api_mount_args=()
 API_KEY_FILE="$(get API_KEY_FILE "${API_KEY_FILE:-}")"
 ENABLE_BENCH="$(get ENABLE_BENCH off)"
 release_prepare_api_key "$ENABLE_BENCH" "${instance:-default}"
-usage="$(get USAGE off)"
+usage="$(get USAGE on)"
 case "$usage" in on|off) ;; *) echo "USAGE must be on or off" >&2; exit 2 ;; esac
 console_supported=0
 if release_console_supported "$coordinator_image" "${wip_layout:+$wip_layout/bin/cuteafd}"; then

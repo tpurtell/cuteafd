@@ -43,7 +43,7 @@ impl Default for Settings {
         Self {
             metadata_days: 7,
             metadata_cap_mb: 256,
-            log_enabled: true,
+            log_enabled: false,
             log_hours: 24,
             log_cap_mb: 1024,
             daily_days: 90,

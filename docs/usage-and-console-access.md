@@ -1,10 +1,11 @@
 # Usage history and console access
 
-Request accounting is off by default (`--usage on` enables it) until its
-serving-path overhead is measured. When on, coordinators keep usage metadata in
+Request accounting is on by default (`--usage off` or `USAGE=off` turns it
+off); it measured no C1 decode cost. Coordinators keep usage metadata in
 `~/.cache/cuteafd/<instance>/usage/usage.sqlite` on the launch host (7 days,
 256 MiB by default). Metadata never contains prompts or completions. The
-separate full-log tier defaults to 24 hours and 1 GiB in `usage-log.sqlite`.
+separate full-log tier is off by default; when switched on it keeps 24 hours
+and 1 GiB in `usage-log.sqlite`.
 **With the full log on, user prompts and model outputs are stored in plain
 text for the retention period.** Media are replaced by MIME/size/SHA-256
 references; credentials and headers are not logged. Serving/gateway payload

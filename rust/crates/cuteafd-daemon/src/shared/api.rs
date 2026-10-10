@@ -13,8 +13,8 @@ pub(crate) struct ApiArgs {
     /// Usage history directory; absent uses an in-memory store.
     #[arg(long, env = "CUTEAFD_USAGE_DIR")]
     pub usage_dir: Option<PathBuf>,
-    /// Request accounting; off until its serving-path overhead is measured.
-    #[arg(long, default_value = "off", value_parser = ["on", "off"])]
+    /// Request accounting (metadata only; measured at no C1 cost).
+    #[arg(long, default_value = "on", value_parser = ["on", "off"])]
     pub usage: Option<String>,
     /// File containing the host console secret (never an API credential).
     #[arg(long)]
@@ -33,7 +33,7 @@ impl ApiArgs {
     pub fn load(&self) -> anyhow::Result<ApiPolicy> {
         let key = self.api_key_file.as_deref().map(ApiKey::from_file).transpose()?;
         anyhow::ensure!(!self.enable_bench || key.is_some(), "--enable-bench requires --api-key-file");
-        let usage = if self.usage.as_deref() != Some("on") { None } else { Some(cuteafd_usage::Store::open(self.usage_dir.as_deref())?) };
+        let usage = if self.usage.as_deref() == Some("off") { None } else { Some(cuteafd_usage::Store::open(self.usage_dir.as_deref())?) };
         let gate = self.console_secret_file.as_deref().map(|p| cuteafd_api::console_gate::ConsoleGate::from_file(p, self.console_cookie_secure)).transpose()?.unwrap_or_else(cuteafd_api::console_gate::ConsoleGate::locked);
         Ok(ApiPolicy { key, bench: self.enable_bench, usage, gate })
     }
@@ -123,9 +123,9 @@ mod tests {
         assert_eq!(axum::body::to_bytes(baseline.into_body(), 4096).await.unwrap(), axum::body::to_bytes(result.into_body(), 4096).await.unwrap());
     }
     #[test]
-    fn usage_is_off_unless_requested() {
-        assert!(ApiArgs::default().load().unwrap().usage.is_none());
-        assert!(ApiArgs { usage: Some("on".into()), ..Default::default() }.load().unwrap().usage.is_some());
+    fn usage_is_on_unless_turned_off() {
+        assert!(ApiArgs::default().load().unwrap().usage.is_some());
+        assert!(ApiArgs { usage: Some("off".into()), ..Default::default() }.load().unwrap().usage.is_none());
     }
     #[test]
     fn every_family_accepts_api_policy_options() {

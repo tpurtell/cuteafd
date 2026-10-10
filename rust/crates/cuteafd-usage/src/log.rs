@@ -455,6 +455,7 @@ mod tests {
     fn redaction_truncation_disable_and_clear_isolated() {
         let dir = tempfile::tempdir().unwrap();
         let store = crate::Store::open(Some(dir.path())).unwrap();
+        enable_log(&store);
         store.record(cuteafd_api::usage::Record {
             rid: "kept".into(),
             ts_ms: store.clock.now_ms(),
@@ -538,6 +539,12 @@ mod tests {
         );
         assert_eq!(v["usage"]["completion_tokens"], 2);
     }
+    /// The full log is off by default; these tests exercise it switched on.
+    fn enable_log(store: &crate::Store) {
+        let mut s = store.settings();
+        s.log_enabled = true;
+        store.update_settings(s).unwrap();
+    }
     #[test]
     fn hours_and_size_cap() {
         struct Fixed;
@@ -547,6 +554,7 @@ mod tests {
             }
         }
         let store = crate::Store::open_with(None, Arc::new(Fixed), 4096).unwrap();
+        enable_log(&store);
         let log = &store.log;
         log.record_log(record("old", 0, json!({"text":"old"})));
         log.record_log(record("new", 100 * 3600000, json!({"text":"new"})));
