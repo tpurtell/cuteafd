@@ -4509,6 +4509,42 @@ variables.** Set `DSH_HOME=/data/dsh`, `DSH_AGENTS_HOME=/data/agents` and
 - **Model introspection ("j space"):** a sidebar panel slot fed by extension
   events.
 
+### Option under discussion: the engine owns the session (2026-10-11)
+
+TJ wants to consider a server-owned conversation, like Realtime: the engine
+can repack history and tell the client, and it gives disk-persisted KV a
+natural owner. How it would work:
+
+- **Traffic is incremental both ways.** Client to server: item ops (append,
+  update, delete, truncate). Server to client: item events plus a new
+  `cuteafd.conversation.repacked` (range, replacement items, reason,
+  revision). DSH still derives each step's history from its own log, so the
+  adapter keeps the two in step:
+  - Each step it hashes DSH's messages, finds the longest common prefix with
+    the server's items, and sends delete/insert ops for the rest. That is
+    O(n) hashing and a few ops.
+  - It writes each server repack into DSH's log as a plugin-owned projection
+    event (the edit mechanism in e), so "model-visible means logged" holds.
+    DSH's own compaction is turned off; the server compacts.
+  - Every server event carries a revision. A step whose history hash
+    disagrees with the server's falls back to a full resync. The sync then
+    heals itself instead of needing to be perfect.
+- **Realtime as the wire, plus extensions.** Realtime has the item ops and
+  live events, but lacks five things we would add as `cuteafd.*`: reasoning
+  items and deltas, `item.update`, no 60-minute expiry, `session.resume` with
+  the last applied revision (the official protocol has no resume: clients
+  replay their own buffer), and fork/steer/KV ops. Our `Session`/`SessionOp`
+  is already server-owned; `Compact`, `Splice`, `Steer` and `Kv` are stubs.
+- **Responses + Conversations instead.** OpenAI's documented server-owned
+  text state is the Conversations API: a durable `conv_` id, item list/add/
+  delete, and `conversation` on Responses. Reasoning, tools and resume (the
+  id is durable) come built in; only server pushes (repack) and item update
+  are extensions. We don't serve `/v1/conversations` yet.
+- **New work either way:** durable session store (items, revisions, op log)
+  surviving restart; resume; engine-side compaction behind `Compact`/
+  `Splice`; disk tier for prefix snapshots keyed to sessions (S2 reports what
+  that needs); the DSH adapter grows to roughly 1-1.5K lines.
+
 ### Open questions for TJ (with recommendations)
 
 1. **Main connection.** Realtime as-is, or the Responses WebSocket plus
