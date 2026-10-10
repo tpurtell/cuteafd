@@ -2835,6 +2835,13 @@ and the GPU1 EXL3 ranges (`RTX_EXPERT_PEER=on`) are opt-in. The way to get
 both the 2M pool and the RTX experts is TP2 on two RTX (`P4`), not a
 different single-GPU split.
 
+**Decision (TJ, 2026-10-11): pool first is the uniform default, with no
+C1 gate.** `auto` (pool first) is the default on every layout and family.
+A C1 gap against experts-first is a performance bug to fix, not a reason to
+keep experts-first as the default. `max` (experts first) stays a supported
+mode everywhere. This corrects P2, which had kept 1-RTX V4 Pro on
+experts-first after one pair.
+
 **Decision (TJ, 2026-10-10): KV planning is the default rule; TP2 is the only
 dual-RTX expert mode.**
 - **The default is the pool-first rule** (`Onboard::Auto`). The C1 cost P1
