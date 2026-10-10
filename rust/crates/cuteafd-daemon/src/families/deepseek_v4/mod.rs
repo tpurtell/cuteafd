@@ -358,7 +358,7 @@ pub(crate) fn with_engine<T>(
         skip_routed: skip,
     })?;
     if let Some((device, stream)) = peer_stream {
-        engine.attach_peer(device, stream, shares.pop().context("head-split shares")?, engine::PeerParts { shape })?;
+        engine.attach_peer(device, stream, shares.pop().context("head-split shares")?, engine::PeerParts { shape, tp2: placement.tp2.as_ref().is_some_and(|t| t.layers > 0) })?;
     }
     let held = held(&engine)?;
     let _ = held; // Prefix bytes were reserved before placement.

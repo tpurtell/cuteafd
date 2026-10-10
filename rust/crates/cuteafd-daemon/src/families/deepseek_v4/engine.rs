@@ -180,6 +180,7 @@ impl Profile {
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct PeerParts {
     pub shape: PoolShape,
+    pub tp2: bool,
 }
 
 /// Everything an [`Engine`] needs besides its pools and workspaces.
@@ -359,9 +360,11 @@ impl<'a> Engine<'a> {
         let _memory_scope = cuteafd_ffi::memory_ledger::scope("peer-split");
         ensure!(self.split_family.is_some() && layers.len() == self.cfg.n_layers && layers.iter().all(|l| l.split),
             "attach_peer needs the head-split shares of every backbone layer");
-        let rows = self.prefill_rows.max(self.decode_rows);
+        let slot_bytes = if parts.tp2 || self.exchange_policy == ExchangePolicy::F32 {
+            self.exchange_policy.slot_bytes(self.prefill_rows, self.decode_rows, self.cfg.dim)
+        } else { self.prefill_rows.max(self.decode_rows) * self.cfg.dim * 2 };
         let exchange = PeerExchange::new(self.library, [RankDevice { device: self.device, stream: self.stream },
-            RankDevice { device, stream }], 4 * PREFILL_LANES, self.exchange_policy.slot_bytes(self.prefill_rows, self.decode_rows, self.cfg.dim))?;
+            RankDevice { device, stream }], 4 * PREFILL_LANES, slot_bytes)?;
         let peer = exchange.on(1, || -> Result<V4Peer<'a>> {
             self.programs.load_matching(|name| self.selected_programs().contains(name))?;
             let table = |compressed: bool| -> Result<Dev<'a>> {
