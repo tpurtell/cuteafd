@@ -95,10 +95,32 @@ but bounded engineering still goes to Sol.
 ## Writing a brief
 
 Hardware-card briefs use `scripts/bench/wip-cards.py`; see
-[WIP hardware cards](README.md#wip-hardware-cards) for the shared kit, arm,
-probe, build and cleanup contract. Do not copy an RC driver or take outer
-serving locks: `cuteafd bench smoke` takes its own locks. CPU builds/tests
-run at nice 19 with 16 jobs (`CARGO_BUILD_JOBS=16`, `RUST_TEST_THREADS=16`).
+[WIP hardware cards](docs/wip-cards.md) for the shared kit, arm, probe,
+build and cleanup contract. Do not copy an RC driver or take outer serving
+locks: `cuteafd bench smoke` takes its own locks. CPU builds/tests run at
+nice 19 with 16 jobs (`CARGO_BUILD_JOBS=16`, `RUST_TEST_THREADS=16`).
+
+**A/B rules learned in v3 (2026-10-10):**
+- **Same launcher in both arms.** A candidate whose `run.sh` changed runs
+  both arms on the candidate's launcher. A baseline-launcher candidate arm
+  produced a false V4.1 max C8 loss (0.88-0.95) that reversed (1.09) once
+  both arms matched.
+- **Adaptive draft C8 swings ±10-18% between launches** on V4.1 max. One
+  matched pair cannot decide C8 there. Use 3 interleaved pairs with
+  alternating order, plus a fixed-policy control (`DSPARK_DRAFT_POLICY=full`).
+  A shared-build toggle (`--arm-wip`) isolates a flag from the build.
+- **Judge on the paired median**, not on the ratio of arm medians, and report
+  the raw pairs and their order.
+- **Builds:** `--build` arms seed on rhea or moa (`--seed-host`). Both serve
+  cards too, so wait for an idle one without holding locks; never wrap
+  `wip.sh` in a Spark lock yourself.
+- **Page cache:** GB10 doesn't reclaim it, and a full one OOMs expert
+  packing. `agent-sudo -n` can't drop it (that needs TJ's live approval).
+  Evict unprivileged with `posix_fadvise(DONTNEED)` on the checkpoint files
+  and their local sparknest objects, then gate on `MemAvailable`.
+- **Briefs:** point at `scripts/agents/codex-preamble.md` in an up-to-date
+  checkout. The main checkout can lag; a stale copy cost one agent a v1-era
+  rule set.
 
 The same brief works for every model. One bounded task with everything the
 agent needs to finish without asking:
