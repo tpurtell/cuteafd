@@ -926,15 +926,13 @@ if [[ $family == glm5_flash ]]; then
     chain) family_args+=(--verify-policy chain) ;;
     *) echo "GLM5_FLASH_VERIFY_POLICY must be cost or chain" >&2; exit 2 ;;
   esac
-  # GLM5_FLASH_DRAFT_POLICY: the verify-length policy under the cost verify policy: shared (default:
-  # the resource-priced shared draft policy) or cycle (the legacy CycleCost table fit).
-  # GLM5_FLASH_ROUTE_RING_CHECK=on (diagnostic, shared only) also copies Spark layers' router ids
-  # through the local route ring and counts disagreements with the staged ids.
-  glmf_draft_policy="$(get GLM5_FLASH_DRAFT_POLICY shared)"
-  case "$glmf_draft_policy" in
-    ""|cycle|shared) trace_args+=(-e "CUTEAFD_GLMF_DRAFT_POLICY=${glmf_draft_policy:-shared}") ;;
-    *) echo "GLM5_FLASH_DRAFT_POLICY must be cycle or shared" >&2; exit 2 ;;
-  esac
+  # GLM Flash always runs the resource-priced shared draft policy (v3 D3); the D2 switch is gone.
+  if [[ -n "$(get GLM5_FLASH_DRAFT_POLICY)" ]]; then
+    echo "GLM5_FLASH_DRAFT_POLICY was removed in v3 D3: GLM Flash always runs the shared draft policy; delete the key" >&2
+    exit 2
+  fi
+  # GLM5_FLASH_ROUTE_RING_CHECK=on (diagnostic) also copies Spark layers' router ids through the local
+  # route ring and counts disagreements with the staged ids.
   case "$(get GLM5_FLASH_ROUTE_RING_CHECK off)" in
     off) ;;
     on) trace_args+=(-e "CUTEAFD_GLMF_ROUTE_RING_CHECK=1") ;;

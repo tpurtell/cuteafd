@@ -85,25 +85,6 @@ fn spark_class() -> ResourceClass {
 /// beats them by this ratio.
 const REFERENCE_MARGIN: f64 = 1.02;
 
-/// Which verify-length policy GLM Flash runs (`CUTEAFD_GLMF_DRAFT_POLICY`):
-/// `cycle` keeps the `CycleCost` table fit; `shared` is the resource-priced
-/// core with this binding.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum PolicyKind { Cycle, Shared }
-
-impl PolicyKind {
-    pub fn from_env() -> Result<Self> {
-        Self::parse(std::env::var("CUTEAFD_GLMF_DRAFT_POLICY").ok().as_deref())
-    }
-    fn parse(value: Option<&str>) -> Result<Self> {
-        match value.map(str::trim) {
-            None | Some("" | "shared") => Ok(Self::Shared),
-            Some("cycle") => Ok(Self::Cycle),
-            Some(other) => anyhow::bail!("CUTEAFD_GLMF_DRAFT_POLICY must be cycle or shared, got {other:?}"),
-        }
-    }
-}
-
 /// Where a layer's routed experts run and what one device reads per expert.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) enum LayerHome {
@@ -472,15 +453,6 @@ mod tests {
             _ if spark => LayerHome::Remote { slice_bytes: 4_000_000. },
             _ => LayerHome::Local { slice_bytes: 9_000_000. },
         }).collect()
-    }
-
-    #[test]
-    fn policy_kind_defaults_to_shared_and_rejects_unknown_values() {
-        assert_eq!(PolicyKind::parse(None).unwrap(), PolicyKind::Shared);
-        assert_eq!(PolicyKind::parse(Some("")).unwrap(), PolicyKind::Shared);
-        assert_eq!(PolicyKind::parse(Some("cycle")).unwrap(), PolicyKind::Cycle);
-        assert_eq!(PolicyKind::parse(Some("shared")).unwrap(), PolicyKind::Shared);
-        assert!(PolicyKind::parse(Some("buckets")).is_err());
     }
 
     #[test]
