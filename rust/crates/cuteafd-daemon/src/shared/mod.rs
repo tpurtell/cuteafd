@@ -18,6 +18,7 @@ pub(crate) mod memory;
 pub(crate) mod memory_report;
 pub(crate) mod peer_probe;
 pub(crate) mod peer_split;
+pub(crate) mod prefill_pipeline;
 pub(crate) mod prefill_share;
 pub(crate) mod prefix;
 pub(crate) mod probe;
