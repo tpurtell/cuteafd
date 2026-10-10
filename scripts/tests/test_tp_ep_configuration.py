@@ -284,8 +284,11 @@ class ExampleConfigTest(unittest.TestCase):
             "tp3ep1-native.config": ("3", "3", "1"),
             "exl3-compact-tp3.config": ("3", "", ""),
         }
+        # The per-family starting configs (<model>-<quant>-<min|max>.config) are
+        # covered by test_example_configs.py; this set is the V4.1 TP x EP layouts.
         self.assertEqual(
-            sorted(path.name for path in EXAMPLES.glob("*.config")),
+            sorted(path.name for path in EXAMPLES.glob("*.config")
+                   if not path.name.endswith(("-min.config", "-max.config"))),
             sorted(expected),
         )
         for name, geometry in expected.items():

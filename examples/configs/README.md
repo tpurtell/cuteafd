@@ -1,15 +1,58 @@
 # CUTEAFD example configurations
 
 These files are **opt-in, standalone `--config` files**. They overlay the
-launcher defaults in `scripts/lib/release-common.sh`; every key they do not name
-keeps its default. They are never selected automatically and they do not change
-`cuteafd.config`, the release images or the default serving selection.
+launcher defaults in `scripts/lib/release-common.sh` (DeepSeek V4.1) and
+`scripts/launch/run-family.sh` (every other family); every key they do not
+name keeps its default. They are never selected automatically and they do not
+change `cuteafd.config`, the release images or the default serving selection.
 
 Select one explicitly:
 
 ```bash
-./run.sh --config examples/configs/tp2ep2-native.config --dry-run
+./run.sh --config examples/configs/glm53-exl3-min.config --dry-run
 ```
+
+## Starting configs per family
+
+One file per v2.0.0 release card: `<model>-<quant>-<min|max>.config`, on the
+natural minimum (1 RTX + the fewest Sparks it fits) and the maximum
+(2 RTX + 4 or 6 Sparks). Each names the checkpoint revision, speculator,
+drafter, KV pool, media and expert placement the card ran with, so starting
+from one reproduces the published card. Replace the `REPLACE-ME-spark-N` hosts
+and the `192.0.2.N` (RFC 5737 documentation) RoCE addresses with your own,
+download the checkpoint and its drafter, then `--dry-run` and `--restart`.
+Cards and quality findings are in the main README and each family doc.
+
+| Model · quant | Min | Max | Speculator | `POOL_TOKENS` |
+| --- | --- | --- | --- | --- |
+| [DeepSeek V4.1 Flash · MXFP4](../../docs/models/deepseek_v41.md) | [1 RTX + 3 Spark (TP3)](deepseek-v41-mxfp4-min.config) | [2 RTX + 4 Spark](deepseek-v41-mxfp4-max.config) | `DSPARK=on` | `auto` (exception, below) |
+| [DeepSeek V4.1 Flash · NVFP4 ⚠](../../docs/models/deepseek_v41.md) | [1 RTX + 4 Spark](deepseek-v41-nvfp4-min.config) | [2 RTX + 4 Spark](deepseek-v41-nvfp4-max.config) | `DSPARK=on` | `auto` (exception, below) |
+| [DeepSeek V4 Flash · MXFP4](../../docs/models/deepseek_v4.md) | [1 RTX + 2 Spark](deepseek-v4-flash-mxfp4-min.config) | [2 RTX + 4 Spark](deepseek-v4-flash-mxfp4-max.config) | `dspark` | `auto` |
+| [DeepSeek V4 Pro · EXL3 K2](../../docs/models/deepseek_v4.md) | [1 RTX + 4 Spark](deepseek-v4-pro-exl3-min.config) | [2 RTX + 6 Spark](deepseek-v4-pro-exl3-max.config) | `dspark` | `auto` |
+| [GLM 5.3 · EXL3 K4](../../docs/models/glm5.md) | [1 RTX + 4 Spark](glm53-exl3-min.config) | [2 RTX + 6 Spark](glm53-exl3-max.config) | `dflash2` `incoai/GLM-5.3-DFlash2` | `auto` |
+| [GLM 5.3 · NVFP4](../../docs/models/glm5.md) | [1 RTX + 4 Spark](glm53-nvfp4-min.config) | [2 RTX + 6 Spark](glm53-nvfp4-max.config) | `dflash2` `incoai/GLM-5.3-DFlash2` | `auto` |
+| [GLM 5.3 Flash · FP8](../../docs/models/glm5_flash.md) | [1 RTX + 4 Spark](glm53-flash-fp8-min.config) | [2 RTX + 4 Spark](glm53-flash-fp8-max.config) | `dflash2` `incoai/GLM-5.3-Flash-DFlash2` | `auto` |
+| [GLM 5.3 Flash · EXL3 K3.25](../../docs/models/glm5_flash.md) | [1 RTX + 2 Spark](glm53-flash-exl3-min.config) | [2 RTX + 4 Spark](glm53-flash-exl3-max.config) | `dflash2` `incoai/GLM-5.3-Flash-DFlash2` | `auto` |
+| [GLM 5.3 Flash · NVFP4](../../docs/models/glm5_flash.md) | [1 RTX + 2 Spark](glm53-flash-nvfp4-min.config) | [2 RTX + 4 Spark](glm53-flash-nvfp4-max.config) | `dflash2` `incoai/GLM-5.3-Flash-DFlash2` | `auto` |
+| [GLM 5.3 Flash · tr3 4bpw](../../docs/models/glm5_flash.md) | [1 RTX + 2 Spark](glm53-flash-tr3-min.config) | [2 RTX + 4 Spark](glm53-flash-tr3-max.config) | `dflash2` `incoai/GLM-5.3-Flash-DFlash2` | `auto` |
+| [MiMo V2.6 Flash MOPD · MXFP4](../../docs/models/mimo_v2.md) | [1 RTX + 2 Spark](mimo-v26-flash-mxfp4-min.config) | [2 RTX + 4 Spark](mimo-v26-flash-mxfp4-max.config) | `dflash2` (bundled `dflash/`) | `auto` |
+| [MiMo V2.6 Pro MOPD · MXFP4](../../docs/models/mimo_v2.md) | [1 RTX + 6 Spark](mimo-v26-pro-mxfp4-min.config) | [2 RTX + 6 Spark](mimo-v26-pro-mxfp4-max.config) | `dflash2` (bundled `dflash/`) | `auto` |
+| [Qwen 3.8 Flash Next · EXL3 K4.25](../../docs/models/qwen4.md) | [1 RTX, local experts](qwen38-exl3-min.config) | n/a (fits one RTX) | `mtp`, depth 3 | `auto` |
+| [Qwen 3.8 Flash Next · NVFP4](../../docs/models/qwen4.md) | [1 RTX, local experts](qwen38-nvfp4-min.config) | n/a (fits one RTX) | `mtp`, depth 3 | `auto` |
+
+⚠ The NVFP4 V4.1 cards fail the calibrated confident-top-1 fidelity check;
+prefer the official MXFP4 release.
+
+The speculator and pool keys repeat the launcher's bare defaults for the
+family: dropping them gives the same launch, and
+`scripts/tests/test_example_configs.py` keeps the two in step. The one named
+exception is V4.1's `POOL_TOKENS=auto`: its cards ran with it, while `run.sh`
+keeps V4.1's own pool policy when the key is absent. Roadmap step S5 moves
+V4.1 onto `run-family.sh` and unifies that default.
+
+## TP x EP layout examples (DeepSeek V4.1)
+
+The remaining files are V4.1 Spark topology experiments.
 
 ## Topology keys
 

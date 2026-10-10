@@ -14,6 +14,9 @@ A core CuteAFD reference family. Releases are checked against this engine's own 
   **Not recommended**: fails the confident-top-1 fidelity check (see Known
   limits); use the official MXFP4 release.
 
+**Starting configs** (v2.0.0 release cards, natural minimum and maximum; replace the
+placeholder Spark hosts and addresses): Official MXFP4 [min](../../examples/configs/deepseek-v41-mxfp4-min.config) · [max](../../examples/configs/deepseek-v41-mxfp4-max.config); NVFP4 (not recommended) [min](../../examples/configs/deepseek-v41-nvfp4-min.config) · [max](../../examples/configs/deepseek-v41-nvfp4-max.config).
+
 ## Engineering summary
 
 - Attention: compressed MLA with a per-layer compression ratio schedule and

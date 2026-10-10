@@ -14,6 +14,9 @@ a top-8 sigmoid router, and a DFlash2 draft speculator.
   group-16; dense parts run through the FP8-block/W8A8 paths described
   below.
 
+**Starting configs** (v2.0.0 release cards, natural minimum and maximum; replace the
+placeholder Spark hosts and addresses): EXL3 K4 [min](../../examples/configs/glm53-exl3-min.config) · [max](../../examples/configs/glm53-exl3-max.config); NVFP4 [min](../../examples/configs/glm53-nvfp4-min.config) · [max](../../examples/configs/glm53-nvfp4-max.config).
+
 ## Engineering summary
 
 - Attention: MLA with a DSA indexer selecting top-k tokens; pool-gated
