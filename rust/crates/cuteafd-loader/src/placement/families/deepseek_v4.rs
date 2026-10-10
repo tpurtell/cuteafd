@@ -214,11 +214,13 @@ pub fn code_bytes(dim: usize, gpus: usize) -> Vec<u64> {
 /// V4's experts-first policy (v2's default; `RTX_EXPERT_LAYERS=max`).
 pub const DEFAULT_ONBOARD: Onboard = Onboard::ExpertsFirst { pool_floor: crate::placement::EXPERTS_FIRST_POOL_FLOOR };
 
-/// V4's default onboard on `gpus` coordinator GPUs: experts first until the
-/// 1-RTX pool-first A/B lands. `RTX_EXPERT_LAYERS=max` selects experts-first
-/// on any layout.
-pub fn default_onboard(_gpus: usize) -> Onboard {
-    DEFAULT_ONBOARD
+/// V4's default onboard on `gpus` coordinator GPUs. One RTX: pool first
+/// (`auto`, the KV planning rule); at measured inventory it holds C1 within
+/// 2% of experts-first (v3-p2 A/B: Flash min 17 vs 18 layers, C1 149.2 vs
+/// 149.6). Two RTX keep experts-first until TP2 experts (P4).
+/// `RTX_EXPERT_LAYERS=max` selects experts-first on any layout.
+pub fn default_onboard(gpus: usize) -> Onboard {
+    if gpus == 1 { Onboard::Auto } else { DEFAULT_ONBOARD }
 }
 
 /// Whether routed layers may also live on GPU1: opted in, and only for EXL3
