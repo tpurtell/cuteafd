@@ -421,18 +421,16 @@ impl Fp8ExpertTensors {
     /// projection's `input_scale`: the two must be bit-identical or one half is
     /// silently scaled. The shipped NVFP4 checkpoints (GLM 5.3, GLM 5.3 Flash,
     /// Qwen 3.8 Flash Next) are; a repack that is not fails load here, naming
-    /// the layer, the expert and both values. A no-op for the other formats.
-    pub fn validate_input_scales(&self, layer: usize) -> Result<()> {
-        if self.format != ExpertFormat::Nvfp4 {
-            return Ok(());
-        }
-        for expert in 0..self.shape.experts {
-            let gate = self.read_scalar_bytes(&input_scale_name(&self.name(layer, expert, Fp8Projection::Gate)))?;
-            let up = self.read_scalar_bytes(&input_scale_name(&self.name(layer, expert, Fp8Projection::Up)))?;
+    /// the layer, the expert and both values. `gate` and `up` are the experts'
+    /// little-endian FP32 `input_scale` bytes as the loader already read them,
+    /// so the check costs no extra reads.
+    pub fn check_input_scales(layer: usize, gate: &[u8], up: &[u8]) -> Result<()> {
+        ensure!(gate.len() == up.len() && gate.len() % 4 == 0, "NVFP4 layer {layer}: input_scale regions differ in size");
+        for (expert, (gate, up)) in gate.chunks_exact(4).zip(up.chunks_exact(4)).enumerate() {
             ensure!(gate == up,
                 "NVFP4 layer {layer} expert {expert}: gate input_scale {} and up input_scale {} differ; \
                  the W4A4 FC1 kernel needs them bit-identical",
-                f32::from_le_bytes(gate), f32::from_le_bytes(up));
+                f32::from_le_bytes(gate.try_into().unwrap()), f32::from_le_bytes(up.try_into().unwrap()));
         }
         Ok(())
     }
@@ -696,6 +694,14 @@ mod tests {
         assert_eq!(qwen.slice(2).unwrap(), 384);
     }
 
+    /// Every expert's gate and up `input_scale` bytes, read the way the loader
+    /// packs them, handed to `check`.
+    fn input_scales<T>(tensors: &Fp8ExpertTensors, check: impl Fn(&[Vec<u8>; 2]) -> T) -> T {
+        let read = |projection| (0..tensors.shape().experts)
+            .flat_map(|expert| tensors.read_input_scale(0, expert, projection).unwrap().to_le_bytes()).collect();
+        check(&[read(Fp8Projection::Gate), read(Fp8Projection::Up)])
+    }
+
     /// A one-layer, `experts`-expert NVFP4 snapshot (`hidden` = `intermediate`
     /// = 128), on disk so the guard reads real `input_scale` bytes.
     fn nvfp4_snapshot(dir: &Path, experts: usize) -> Fp8ExpertTensors {
@@ -741,7 +747,7 @@ mod tests {
         assert_eq!(tensors.format(), ExpertFormat::Nvfp4);
         // Distinct per expert, gate == up in each: the guard accepts the layer.
         write_input_scales(&tensors, |expert, _| if expert == 0 { 0.25 } else { 1.5 });
-        tensors.validate_input_scales(0).unwrap();
+        input_scales(&tensors, |t| Fp8ExpertTensors::check_input_scales(0, &t[0], &t[1])).unwrap();
         tensors.validate_layer(0).unwrap();
     }
 
@@ -754,7 +760,7 @@ mod tests {
             (1, Fp8Projection::Up) => 0.5,
             _ => 1.0,
         });
-        let error = tensors.validate_input_scales(0).unwrap_err().to_string();
+        let error = input_scales(&tensors, |t| Fp8ExpertTensors::check_input_scales(0, &t[0], &t[1])).unwrap_err().to_string();
         assert!(error.contains("layer 0") && error.contains("expert 1"), "{error}");
         assert!(error.contains("gate input_scale 1") && error.contains("up input_scale 0.5"), "{error}");
         assert!(!error.contains("expert 0"), "{error}");

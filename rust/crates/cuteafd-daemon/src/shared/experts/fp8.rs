@@ -190,13 +190,10 @@ impl<'a> Fp8Layer<'a> {
         slicing: Slicing) -> Result<Self> {
         let _memory_scope = cuteafd_ffi::memory_ledger::scope("experts/weights");
         ensure!(tensors.has_layer(layer), "layer {layer} has no routed FP8 experts");
-        // The W4A4 FC1 kernel quantizes with the gate projection's input_scale
-        // and dequantizes the up half with the up projection's; refuse a load
-        // whose two differ. Every NVFP4 expert-package load (routed, Spark,
-        // windowed) passes through here.
-        tensors.validate_input_scales(layer)?;
         let experts = tensors.shape().experts;
         let mut regions = Vec::with_capacity(6);
+        // NVFP4 gate and up input scales, checked once both are read.
+        let mut gate_inputs = Vec::new();
         for projection in Fp8Projection::ALL {
             let (w_bytes, s_bytes) = tensors.slice_bytes_with(projection, tp, rank, slicing)?;
             let mut weights = vec![0u8; experts * w_bytes];
@@ -229,6 +226,18 @@ impl<'a> Fp8Layer<'a> {
                 }
                 Ok(())
             })?;
+            if nvfp4 {
+                // The W4A4 FC1 kernel quantizes with the gate projection's
+                // input_scale and dequantizes the up half with the up
+                // projection's; refuse a load whose two differ. Every NVFP4
+                // expert-package load (routed, Spark, windowed) passes here.
+                let inputs = &scales[scales.len() - experts * 4..];
+                match projection {
+                    Fp8Projection::Gate => gate_inputs = inputs.to_vec(),
+                    Fp8Projection::Up => Fp8ExpertTensors::check_input_scales(layer, &gate_inputs, inputs)?,
+                    Fp8Projection::Down => {}
+                }
+            }
             for bytes in [&weights, &scales] {
                 let region = DeviceAllocation::new(library, bytes.len())?;
                 library.copy_h2d(region.buffer, bytes)?;
