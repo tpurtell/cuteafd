@@ -153,6 +153,8 @@ pub const LOADED_CODE: &[LoadedCode] = &[
         source: "v4-pro-exl3-max p0 rtx0 (v3-p4 A/B pair 1) 853,949,884 - 27,262,976 sampling offset" },
     LoadedCode { family: "dsv4", experts: "exl3", split: true, rank: 1, bytes: 632_161_264,
         source: "v4-pro-exl3-max p0 rtx1 (v3-p4 A/B pair 1) 661,521,392 - 29,360,128 sampling offset" },
+    LoadedCode { family: "dsv4", experts: "exl3", split: false, rank: 0, bytes: 724_349_124,
+        source: "v4-pro-exl3-min (1 RTX + 4 Sparks, 3 EXL3 layers): untracked 1,310,765,252 - context 586,416,128" },
     LoadedCode { family: "dsv4", experts: "*", split: true, rank: 0, bytes: 560_200_800,
         source: "v4-flash-max p0 rtx0 (19 layers): untracked 1,146,616,928 - context 586,416,128" },
     LoadedCode { family: "dsv4", experts: "*", split: true, rank: 1, bytes: 260_349_424,
@@ -178,7 +180,8 @@ pub fn loaded_code_family(program_family: &str) -> &str {
 pub fn loaded_code(program_family: &str, experts: &str, split: bool, rank: u8) -> Option<&'static LoadedCode> {
     let family = loaded_code_family(program_family);
     let at = |c: &&LoadedCode| c.family == family && c.split == split && c.rank == rank;
-    LOADED_CODE.iter().filter(at).find(|c| c.experts == experts || c.experts == "*")
+    LOADED_CODE.iter().filter(at).find(|c| c.experts == experts)
+        .or_else(|| LOADED_CODE.iter().filter(at).find(|c| c.experts == "*"))
         .or_else(|| LOADED_CODE.iter().find(at))
 }
 
@@ -430,6 +433,10 @@ mod tests {
         // An unmeasured package falls back to the family's rank entry.
         assert!(loaded_code("qwen4", "none", false, 0).is_some());
         assert_eq!(loaded_code("dsv4p2", "fp8", true, 1).unwrap().bytes, 260_349_424);
+        // An exact package row wins over the family's any-package row, wherever it sits in the table.
+        assert_eq!(loaded_code("dsv4p", "exl3", false, 0).unwrap().bytes, 724_349_124);
+        assert_eq!(loaded_code("dsv4f", "*", false, 0).unwrap().bytes, 322_050_368);
+        assert_eq!(loaded_code("dsv4p", "exl3", true, 1).unwrap().bytes, 632_161_264);
         assert_eq!(loaded_code("mimop", "none", true, 0).unwrap().bytes, 365_259_264);
         assert!(loaded_code("glm", "fp8", false, 0).is_none());
         let code = loaded_code("glmf", "exl3", false, 0).unwrap();
