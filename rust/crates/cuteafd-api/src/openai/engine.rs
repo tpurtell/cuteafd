@@ -205,19 +205,29 @@ fn chat_body_with(turn: &TurnRequest, profile: &ModelProfile, names: &ToolNames)
     if let Some(system) = turn.system.as_ref().filter(|s| !s.is_empty()) {
         messages.push(json!({"role":"system","content":system}));
     }
-    // The open assistant message that reasoning, text and calls fold into.
-    fn assistant(messages: &mut Vec<Value>) -> &mut Map<String, Value> {
-        let open = messages.last().is_some_and(|m| m["role"] == "assistant" && m.get("tool_calls").is_none_or(|c| c.is_null()));
+    // Assistant items fold into one chat assistant message in the order its
+    // template renders them: reasoning_content, content, tool_calls. An item
+    // that would break that order (reasoning after text or calls, text after
+    // calls) starts the next assistant message, as a chat client would send it.
+    fn current<'a>(messages: &'a mut Vec<Value>, accepts: impl Fn(&Map<String, Value>) -> bool) -> &'a mut Map<String, Value> {
+        let open = messages.last().and_then(Value::as_object).is_some_and(|m| m["role"] == "assistant" && accepts(m));
         if !open { messages.push(json!({"role":"assistant","content":null})); }
         messages.last_mut().and_then(Value::as_object_mut).expect("assistant message")
     }
-    fn push_call(messages: &mut Vec<Value>, id: &str, name: String, arguments: String) {
-        let open = messages.last().is_some_and(|m| m["role"] == "assistant");
-        if !open { messages.push(json!({"role":"assistant","content":null})); }
-        let message = messages.last_mut().and_then(Value::as_object_mut).expect("assistant message");
+    let has_calls = |m: &Map<String, Value>| m.get("tool_calls").is_some_and(|c| !c.is_null());
+    let has_content = |m: &Map<String, Value>| m.get("content").is_some_and(|c| !c.is_null());
+    fn push_call(message: &mut Map<String, Value>, id: &str, name: String, arguments: String) {
         let calls = message.entry("tool_calls").or_insert_with(|| json!([]));
         if !calls.is_array() { *calls = json!([]); }
         calls.as_array_mut().unwrap().push(json!({"id":id,"type":"function","function":{"name":name,"arguments":arguments}}));
+    }
+    /// Content parts of a chat content value (a string is one text part).
+    fn parts_of(value: Value) -> Vec<Value> {
+        match value {
+            Value::String(text) => vec![json!({"type":"text","text":text})],
+            Value::Array(parts) => parts,
+            _ => Vec::new(),
+        }
     }
     for item in &turn.items {
         match item {
@@ -228,19 +238,19 @@ fn chat_body_with(turn: &TurnRequest, profile: &ModelProfile, names: &ToolNames)
                 messages.push(json!({"role":"user","content":content(parts, "user")?}));
             }
             Item::Message { role: Role::Assistant, content: parts } => {
-                let text = content(parts, "assistant")?;
-                let message = assistant(&mut messages);
-                match message.get_mut("content") {
-                    Some(Value::String(existing)) => existing.push_str(text.as_str().unwrap_or_default()),
-                    _ => { message.insert("content".into(), text); }
-                }
+                let added = content(parts, "assistant")?;
+                let message = current(&mut messages, |m| !has_calls(m));
+                let merged = match (message.remove("content").filter(|c| !c.is_null()), added) {
+                    (None, added) => added,
+                    (Some(Value::String(mut text)), Value::String(more)) => { text.push_str(&more); Value::String(text) }
+                    // Media on either side: keep every part, in order. The chat
+                    // path decides whether the family can carry assistant media.
+                    (Some(existing), added) => { let mut all = parts_of(existing); all.extend(parts_of(added)); Value::Array(all) }
+                };
+                message.insert("content".into(), merged);
             }
             Item::Reasoning { text, .. } => {
-                // Reasoning opens the assistant message it belongs to.
-                let open = messages.last().is_some_and(|m| m["role"] == "assistant"
-                    && m["content"].is_null() && m.get("tool_calls").is_none() && m.get("reasoning_content").is_none());
-                if !open { messages.push(json!({"role":"assistant","content":null})); }
-                let message = messages.last_mut().and_then(Value::as_object_mut).unwrap();
+                let message = current(&mut messages, |m| !has_calls(m) && !has_content(m));
                 match message.get_mut("reasoning_content") {
                     Some(Value::String(existing)) => existing.push_str(text),
                     _ => { message.insert("reasoning_content".into(), json!(text)); }
@@ -248,9 +258,10 @@ fn chat_body_with(turn: &TurnRequest, profile: &ModelProfile, names: &ToolNames)
             }
             Item::ToolCall { id, name, arguments } => {
                 let arguments = if arguments.trim().is_empty() { "{}".to_owned() } else { arguments.clone() };
-                push_call(&mut messages, id, names.wire(name), arguments);
+                push_call(current(&mut messages, |_| true), id, names.wire(name), arguments);
             }
-            Item::ServerToolCall { id, name, input } => push_call(&mut messages, id, names.wire(name), input.to_string()),
+            Item::ServerToolCall { id, name, input } =>
+                push_call(current(&mut messages, |_| true), id, names.wire(name), input.to_string()),
             Item::ToolResult { call_id, content: parts, is_error } => {
                 let mut body = content(parts, "tool")?;
                 if *is_error {
@@ -268,6 +279,14 @@ fn chat_body_with(turn: &TurnRequest, profile: &ModelProfile, names: &ToolNames)
         if message["role"] == "assistant" && message["content"].is_null() && message.get("tool_calls").is_none() {
             message["content"] = json!("");
         }
+    }
+    // A forced choice needs a tool to force, as on /v1/chat/completions.
+    match &turn.tool_choice {
+        ToolChoice::Required if turn.tools.is_empty() =>
+            return Err(GatewayError::invalid("required tool_choice needs at least one tool").with_param("tool_choice")),
+        ToolChoice::Named { name } if !turn.tools.iter().any(|t| &t.name == name) =>
+            return Err(GatewayError::invalid(format!("tool_choice: no tool named '{name}' was specified")).with_param("tool_choice")),
+        _ => {}
     }
     let mut body = json!({"model": profile.id, "messages": messages, "stream": true,
         "stream_options": {"include_usage": true}});

@@ -345,3 +345,108 @@ fn item_mapping_folds_assistant_parts_and_maps_server_tools() {
     assert_eq!(m[4]["tool_calls"][0]["function"]["name"], "exec", "namespaced name maps to its local name");
     assert_eq!(m[5]["content"], "Error: out");
 }
+
+/// Send `chat` to /v1/chat/completions and `messages` to /v1/messages on one
+/// server; return both statuses and the prompts the engine received.
+async fn chat_vs_messages(profile: ModelProfile, chat: Value, messages: Value) -> (StatusCode, StatusCode, Vec<String>, String) {
+    let (app, worker) = serve(profile, None, vec![], false);
+    let (chat_status, _) = post(&app, "/v1/chat/completions", chat).await;
+    let (messages_status, text) = post(&app, "/v1/messages", messages).await;
+    let prompts = worker.prompts.lock().unwrap().clone();
+    (chat_status, messages_status, prompts, text)
+}
+
+#[tokio::test]
+async fn consecutive_reasoning_blocks_are_one_reasoning_content() {
+    // Anthropic sends interleaved-thinking turns as several thinking blocks;
+    // they are one assistant turn, as the chat client sends it.
+    for profile in [ModelProfile::new("test-qwen", ModelEncoding::Qwen(Arc::new(qwen4::fixtures::encoding()))),
+        ModelProfile::new("test-glm", ModelEncoding::Glm(Arc::new(glm5::fixtures::encoding())))] {
+        let id = profile.id.clone();
+        let chat = json!({"model":id,"stream":false,"max_tokens":8,"thinking":{"type":"enabled"},"messages":[
+            {"role":"user","content":"q"},
+            {"role":"assistant","content":"a","reasoning_content":"first.second."},
+            {"role":"user","content":"again"}]});
+        let messages = json!({"model":"m","max_tokens":8,"stream":false,"thinking":{"type":"enabled"},"messages":[
+            {"role":"user","content":"q"},
+            {"role":"assistant","content":[{"type":"thinking","thinking":"first.","signature":"s1"},
+                {"type":"thinking","thinking":"second.","signature":"s2"},{"type":"text","text":"a"}]},
+            {"role":"user","content":"again"}]});
+        let (a, b, prompts, text) = chat_vs_messages(profile, chat, messages).await;
+        assert_eq!((a, b), (StatusCode::OK, StatusCode::OK), "{id}: {text}");
+        assert_eq!(prompts[0], prompts[1], "{id}");
+    }
+}
+
+#[tokio::test]
+async fn assistant_text_then_tool_then_text_matches_the_chat_split() {
+    // Text after a call is the next assistant turn; reasoning after text too.
+    let profile = ModelProfile::new("test-qwen", ModelEncoding::Qwen(Arc::new(qwen4::fixtures::encoding())));
+    let schema = json!({"type":"object","properties":{"p":{"type":"string"}}});
+    let chat = json!({"model":"test-qwen","stream":false,"max_tokens":8,"thinking":{"type":"disabled"},
+        "tools":[{"type":"function","function":{"name":"f","parameters":schema}}],"messages":[
+        {"role":"user","content":"q"},
+        {"role":"assistant","content":"one","tool_calls":[{"id":"c1","type":"function","function":{"name":"f","arguments":"{\"p\":\"x\"}"}}]},
+        {"role":"tool","tool_call_id":"c1","content":"r"},
+        {"role":"assistant","content":"two"},
+        {"role":"user","content":"again"}]});
+    let messages = json!({"model":"m","max_tokens":8,"stream":false,"thinking":{"type":"disabled"},
+        "tools":[{"name":"f","input_schema":schema}],"messages":[
+        {"role":"user","content":"q"},
+        {"role":"assistant","content":[{"type":"text","text":"one"},{"type":"tool_use","id":"c1","name":"f","input":{"p":"x"}}]},
+        {"role":"user","content":[{"type":"tool_result","tool_use_id":"c1","content":"r"}]},
+        {"role":"assistant","content":"two"},
+        {"role":"user","content":"again"}]});
+    let (a, b, prompts, text) = chat_vs_messages(profile, chat, messages).await;
+    assert_eq!((a, b), (StatusCode::OK, StatusCode::OK), "{text}");
+    assert_eq!(prompts[0], prompts[1]);
+}
+
+#[tokio::test]
+async fn assistant_media_is_never_dropped() {
+    // Adjacent assistant text and image parts merge into one part list; the
+    // chat path then decides (V4.1's adapter refuses assistant images, so both
+    // routes refuse with 400 instead of silently losing the image).
+    let profile = ModelProfile::new("deepseek-ai/DeepSeek-V4.1-Flash", ModelEncoding::DeepseekV41);
+    let image = format!("data:image/png;base64,{}", png_b64());
+    let turn = TurnRequest { items: vec![
+        Item::Message { role: Role::User, content: vec![crate::gateway::turn::Part::text("q")] },
+        Item::Message { role: Role::Assistant, content: vec![crate::gateway::turn::Part::text("see ")] },
+        Item::Message { role: Role::Assistant, content: vec![crate::gateway::turn::Part::text("this"),
+            crate::gateway::turn::Part::Image { source: crate::gateway::turn::ImageSource::Url { url: image.clone() }, detail: None }]},
+    ], ..Default::default() };
+    let body = chat_body(&turn, &profile).unwrap();
+    assert_eq!(body["messages"][1]["content"], json!([{"type":"text","text":"see "},{"type":"text","text":"this"},
+        {"type":"image_url","image_url":{"url":image}}]), "every part kept, in order");
+    let chat = json!({"model":profile.id,"stream":false,"max_tokens":8,"messages":body["messages"]});
+    let messages = json!({"model":"m","max_tokens":8,"stream":false,"messages":[
+        {"role":"user","content":"q"},
+        {"role":"assistant","content":[{"type":"text","text":"see "},{"type":"text","text":"this"},
+            {"type":"image","source":{"type":"base64","media_type":"image/png","data":png_b64()}}]}]});
+    let (a, b, prompts, text) = chat_vs_messages(profile, chat, messages).await;
+    assert_eq!(a, StatusCode::BAD_REQUEST);
+    assert_eq!(b, StatusCode::BAD_REQUEST, "{text}");
+    assert!(prompts.is_empty());
+}
+
+#[tokio::test]
+async fn forced_tool_choice_without_its_tool_is_refused_like_chat() {
+    let profile = ModelProfile::new("test-qwen", ModelEncoding::Qwen(Arc::new(qwen4::fixtures::encoding())));
+    let (app, worker) = serve(profile, None, vec![], false);
+    for (chat_choice, anthropic_choice, responses_choice) in [
+        (json!("required"), json!({"type":"any"}), json!("required")),
+        (json!({"type":"function","function":{"name":"missing"}}), json!({"type":"tool","name":"missing"}), json!({"type":"function","name":"missing"})),
+    ] {
+        let (status, _) = post(&app, "/v1/chat/completions", json!({"model":"test-qwen","stream":false,"max_tokens":8,
+            "messages":[{"role":"user","content":"q"}],"tool_choice":chat_choice})).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let (status, text) = post(&app, "/v1/messages", json!({"model":"m","max_tokens":8,"stream":false,
+            "messages":[{"role":"user","content":"q"}],"tool_choice":anthropic_choice})).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{text}");
+        assert_eq!(serde_json::from_str::<Value>(&text).unwrap()["error"]["type"], "invalid_request_error");
+        let (status, text) = post(&app, "/v1/responses", json!({"model":"m","input":"q","stream":false,"store":false,
+            "tool_choice":responses_choice})).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{text}");
+    }
+    assert!(worker.prompts.lock().unwrap().is_empty(), "nothing reached the engine");
+}
