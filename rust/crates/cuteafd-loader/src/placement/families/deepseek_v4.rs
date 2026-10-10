@@ -220,15 +220,13 @@ pub fn code_bytes(dim: usize, experts: &str, gpus: usize) -> Vec<u64> {
 /// V4's experts-first policy (v2's default; `RTX_EXPERT_LAYERS=max`).
 pub const DEFAULT_ONBOARD: Onboard = Onboard::ExpertsFirst { pool_floor: crate::placement::EXPERTS_FIRST_POOL_FLOOR };
 
-/// V4's default onboard for a model of hidden size `dim` on `gpus`
-/// coordinator GPUs. Flash on one RTX: pool first (`auto`, the KV planning
-/// rule), which at measured inventory gives up one RTX layer (17 vs 18) for
-/// the 2M pool and holds C1 (v3-p2 matched A/B: 149.2 vs 149.6). Pro on one
-/// RTX keeps experts first: its one layer is 12.4 GiB and pool first costs
-/// C1 (3 vs 4 layers, 65.5 vs 74.8). Two RTX keep experts first until TP2
-/// experts (P4). `RTX_EXPERT_LAYERS=max` / `auto` select either on any layout.
-pub fn default_onboard(dim: usize, gpus: usize) -> Onboard {
-    if gpus == 1 && dim == 4096 { Onboard::Auto } else { DEFAULT_ONBOARD }
+/// V4's default onboard on `gpus` coordinator GPUs. Both Flash and Pro on
+/// one RTX reserve the KV pool first (`auto`); placement throughput costs
+/// are performance bugs, not reasons to change the pool-first policy.
+/// Two RTX keep experts first until TP2 experts (P4).
+/// `RTX_EXPERT_LAYERS=max` / `auto` select either on any layout.
+pub fn default_onboard(_dim: usize, gpus: usize) -> Onboard {
+    if gpus == 1 { Onboard::Auto } else { DEFAULT_ONBOARD }
 }
 
 /// Whether routed layers may also live on GPU1: opted in, and only for EXL3
