@@ -2864,6 +2864,34 @@ dual-RTX expert mode.**
   general capability, and its FFN uses TP2 split or V4.1's owner-reduce per
   `FfnMode`.
 
+**P2 outcome (2026-10-11): planner == runtime at ready on measured inventory.**
+Both sides now read one inventory (`placement::inventory`): `ArchContext` per
+arch (SM120 PRO 188 SMs / 101,973,491,712 B CUDA total, SM120 5090-class
+170, SM121 GB10 48; context, cuBLAS, driver), the family's `ProgramSet`,
+`GraphSet` (startup sets counted at ready, lazy captures as growth), exact
+package scratch, and `LOADED_CODE`: the native code each family holds at ready
+(lazily loaded functions, cuBLAS, package modules), measured per family,
+package, split and rank. The planner charges context + loaded code; serve
+reserves what has not arrived at its admission sample. The ready ledger is one
+tagged report serve logs at readiness, before any request.
+
+| card (ready ledger, worst GPU) | before (p0 planner) | after |
+|---|---|---|
+| Qwen EXL3 / NVFP4 min | +247 / n/a MiB | -16 / +10 |
+| GLM Flash EXL3 min / max | +5469 / n/a | -3 / +0 |
+| MiMo Flash min / max | +346 / n/a | +3 / +3 |
+| V4 Flash 32 GB / max | refused / -102 | -15 / +17 |
+| V4 Pro EXL3 min | n/a | +0 |
+
+P1's V4 Flash max gap (1.45M planned, 1.18M served) was the planner's 95.5 GiB
+card against CUDA's 94.97 GiB plus the NVML sampler's 550 MiB per GPU; at the
+true total both sides now say 1,323,264 tokens and 19 layers.
+
+Default: pool first (`auto`) for V4 Flash on one RTX (17 vs 18 layers, 2.10M
+vs 1.51M pool, C1 1.07x over two matched pairs). V4 Pro on one RTX keeps
+experts first: one Pro layer is 12.4 GiB, and pool first cost C1 12%
+(3 vs 4 layers). Two RTX stay experts first until `P4`.
+
 Two latent bugs from b2f26af9's GPU1 ranges are inputs to `P3`/`P4`:
 - native `rtx_backbone` expert variants bind to the first CUDA device
   (`cudaErrorInvalidDevice` on GPU1);
