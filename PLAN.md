@@ -2988,6 +2988,12 @@ after graph warm-up, on a fixed 512-row prefill plus one decode step:
 
 `CUTEAFD_ROUTE_CHECK=N` re-checks every N steps (off by default).
 
+**EXL3 TP2 input (P4, 2026-10-10).** `Exl3Tp2` takes FP8 K32 wire rows, as
+V4.1's rank sequence does, so V4.1 stays byte-exact through the shared impl.
+Each rank quantizes its own copy of the post-split hidden state. Follow-up,
+measured on its own: native BF16 input for EXL3 TP2, which drops the FP8
+quantize and the per-capacity wire-decode workspace.
+
 **Route source follows the layer mode (TJ, 2026-10-09).**
 - `HeadSplit` layers: both GPUs already hold the post-attention hidden state,
   so replicate the router (0.1-0.7 GiB total; per MoE layer 2-11 MB); a
