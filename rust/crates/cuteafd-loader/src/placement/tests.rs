@@ -22,6 +22,7 @@ fn request(gpus: usize, free: u64, layers: usize, sparks: usize, onboard: Onboar
         movables: Vec::new(),
         expert_workspace: GIB / 4,
         onboard,
+        expert_gpus: gpus,
         policy: LayerPolicy { default: vec![LayerMode::HeadSplit], by_kind: Vec::new() },
     }
 }
@@ -95,6 +96,21 @@ fn explicit_pool_is_strict_and_movables_share_the_arena() {
     // A movable that cannot fit at all is a refusal naming its GPU.
     req.movables[0].parts = vec![Bytes2 { resident: 50 * GIB, staging: 0 }];
     assert!(matches!(solve(&req), Err(PlacementError::Mandatory { gpu: 0, .. })));
+}
+
+#[test]
+fn experts_stay_on_gpu0_when_the_peer_cannot_run_them() {
+    let mut req = request(2, 44 * GIB, 60, 4, Onboard::Auto);
+    req.expert_gpus = 1;
+    let placement = solve(&req).unwrap();
+    assert_eq!(placement.pool_tokens, 2 << 20);
+    assert_eq!((placement.expert_ranges[0].layers, placement.expert_ranges[1].layers), (11, 0));
+    req.onboard = Onboard::Layers(5);
+    let fixed = solve(&req).unwrap();
+    assert_eq!((fixed.expert_ranges[0].layers, fixed.expert_ranges[1].layers), (5, 0));
+    // Without a pool reserved first GPU0 alone holds 43, never GPU1.
+    req.onboard = Onboard::Layers(50);
+    assert!(matches!(solve(&req), Err(PlacementError::ExpertLayers { requested: 50, placed: 43 })));
 }
 
 #[test]

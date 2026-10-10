@@ -44,6 +44,8 @@ pub struct PlacementRequest {
     pub expert_workspace: u64,
     /// Which fixes the plan: the pool (`Auto`) or the RTX expert layers.
     pub onboard: Onboard,
+    /// GPUs (from GPU0) whose executors can hold whole routed layers.
+    pub expert_gpus: usize,
     pub policy: LayerPolicy,
 }
 

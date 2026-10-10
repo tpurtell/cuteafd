@@ -1118,6 +1118,7 @@ fn deepseek_v4_placement(report: &PlanReport, checkpoint: &super::Checkpoint,
         spark_ranks, sequences: shape.concurrency, prefill_rows: shape.prefill_rows, decode_rows: shape.decode_rows,
         max_context: shape.context_tokens, reserve_bytes: v4::RESERVE_BYTES, mark_slots, workspace: shape.workspace,
         experts, draft, expert_workspace, first_routed: routed.first_layer,
+        peer_experts: v4::peer_experts(&catalog),
         requested_pool: options.pool_tokens.filter(|&n| n > 0), onboard,
         full_prefill_logits: 0 };
     let request = v4::request(&inputs)?;

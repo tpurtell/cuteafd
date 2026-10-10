@@ -110,6 +110,18 @@ const SKIPPED_EXPERTS: usize = usize::MAX - 1;
 /// Lanes a long prefill chunk splits into, and the fewest rows per lane worth
 /// a second Spark exchange per layer.
 pub(crate) const PREFILL_LANES: usize = 2;
+
+/// Bytes the packed expert payload may grow by when every section starts
+/// 16-byte aligned (EXL3 launches require aligned route weights).
+pub(crate) const PACK_ALIGN_SLACK: usize = 32;
+
+/// Offsets of the route weights and shared rows in the packed peer-expert
+/// payload: ids at 0, then each section 16-byte aligned.
+fn pack_offsets(rows: usize, topk: usize) -> (usize, usize) {
+    let route = rows * topk * 4;
+    let weights = route.next_multiple_of(16);
+    (weights, (weights + route).next_multiple_of(16))
+}
 const MIN_LANE_ROWS: usize = 256;
 /// Vocabulary logits rows a workspace holds (every decode/verify row; a prefill
 /// lands at most this many rows at once and downloads longer spans in chunks).
@@ -363,8 +375,8 @@ impl<'a> Engine<'a> {
             RankDevice { device, stream }], 4 * PREFILL_LANES, rows * self.cfg.dim * 2)?;
         let expert_exchange = PeerExchange::new(self.library,
             [RankDevice { device: self.device, stream: self.stream }, RankDevice { device, stream }],
-            2 * PREFILL_LANES, rows * (self.cfg.dim * 2 + self.cfg.n_activated_experts * 8))?;
-        self.expert_pack = Some(self.alloc(rows * (self.cfg.dim * 2 + self.cfg.n_activated_experts * 8))?);
+            2 * PREFILL_LANES, rows * (self.cfg.dim * 2 + self.cfg.n_activated_experts * 8) + PACK_ALIGN_SLACK)?;
+        self.expert_pack = Some(self.alloc(rows * (self.cfg.dim * 2 + self.cfg.n_activated_experts * 8) + PACK_ALIGN_SLACK)?);
         self.wire_checks = (0..2).map(|rank| exchange.on(rank, || self.alloc(self.cfg.dim + self.cfg.dim / 32)))
             .collect::<Result<Vec<_>>>()?;
         self.expert_exchange = Some(expert_exchange);
@@ -1287,11 +1299,11 @@ impl<'a> Engine<'a> {
                 let slot = 2 * index + layer % 2;
                 experts.wait(1, slot)?;
                 let packed = experts.recv(1, slot)?;
-                let route_bytes = t * self.cfg.n_activated_experts * 4;
-                // SAFETY: packed holds consecutive canonical ids, weights and shared rows;
+                let (weights_at, shared_at) = pack_offsets(t, self.cfg.n_activated_experts);
+                // SAFETY: packed holds 16-byte-aligned canonical ids, weights and shared rows;
                 // the release/acquire above makes every input visible on the peer stream.
-                let (weights, shared) = unsafe { (packed.cast::<u8>().add(route_bytes).cast(),
-                    packed.cast::<u8>().add(route_bytes * 2).cast()) };
+                let (weights, shared) = unsafe { (packed.cast::<u8>().add(weights_at).cast(),
+                    packed.cast::<u8>().add(shared_at).cast()) };
                 self.on(1, || {
                     let mut local = self.peer_local.borrow_mut();
                     let local = local.as_mut().context("peer local experts")?;
@@ -1672,11 +1684,12 @@ impl<'a> Engine<'a> {
                     // SAFETY: source and target are on GPU0 and live until its stream drains.
                     unsafe { self.library.copy_d2d_async(target, source.buffer, bytes, self.stream) }
                 };
+                let (weights_at, shared_at) = pack_offsets(t, self.cfg.n_activated_experts);
                 copy(0, &w.route_ids, route_bytes)?;
-                copy(route_bytes, &w.route_weights, route_bytes)?;
-                copy(2 * route_bytes, &lane.shared, t * self.cfg.dim * 2)?;
+                copy(weights_at, &w.route_weights, route_bytes)?;
+                copy(shared_at, &lane.shared, t * self.cfg.dim * 2)?;
                 let slot = 2 * index + layer % 2;
-                experts.push(0, slot, pack.buffer.ptr, 2 * route_bytes + t * self.cfg.dim * 2)?;
+                experts.push(0, slot, pack.buffer.ptr, shared_at + t * self.cfg.dim * 2)?;
                 experts.wait(0, slot)?;
             } else {
                 let mut local = self.local.borrow_mut();
@@ -1887,6 +1900,20 @@ impl Logits {
         match self {
             Logits::Device(Some(logits)) => Ok(logits),
             _ => anyhow::bail!("the step left no device logits"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod pack_tests {
+    #[test]
+    fn packed_sections_are_aligned_and_fit_the_slack() {
+        for rows in [1, 2, 3, 7, 64, 4096] {
+            for topk in [6, 8] {
+                let (weights, shared) = super::pack_offsets(rows, topk);
+                assert_eq!((weights % 16, shared % 16), (0, 0));
+                assert!(shared + rows * 4096 * 2 <= rows * (4096 * 2 + topk * 8) + super::PACK_ALIGN_SLACK);
+            }
         }
     }
 }

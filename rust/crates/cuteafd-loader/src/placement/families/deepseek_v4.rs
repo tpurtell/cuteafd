@@ -59,6 +59,11 @@ pub struct V4Inputs<'a> {
     pub experts: Vec<V4ExpertCost>,
     /// dSpark stage experts loaded into GPU0's arena (`--dspark`).
     pub draft: Vec<V4ExpertCost>,
+    /// Routed layers may also live on GPU1. EXL3 executions are per device;
+    /// the native `rtx_backbone` variant table binds each capacity to the
+    /// first device that initializes it (native/shared/src/v41_experts.cc),
+    /// so native MXFP4 layers stay on GPU0 until TP2 experts (placement P4).
+    pub peer_experts: bool,
     /// The local expert arena's workspace.
     pub expert_workspace: u64,
     pub first_routed: usize,
@@ -180,9 +185,16 @@ pub fn request(inputs: &V4Inputs<'_>) -> Result<PlacementRequest, PlacementError
         movables,
         expert_workspace: inputs.expert_workspace,
         onboard: inputs.onboard,
+        expert_gpus: if inputs.peer_experts { gpus } else { 1 },
         policy: LayerPolicy { default: vec![LayerMode::HeadSplit, LayerMode::Whole { gpu: 0, ffn: FfnMode::Owner }],
             by_kind: Vec::new() },
     })
+}
+
+/// Whether this checkpoint's coordinator expert package runs on both GPUs of
+/// one process (EXL3) or only on the first (native `rtx_backbone`).
+pub fn peer_experts(catalog: &crate::OfficialV41Catalog) -> bool {
+    catalog.exl3().is_some()
 }
 
 /// Whole-layer residency of every routed backbone layer and `stages` dSpark

@@ -64,6 +64,7 @@ pub(crate) fn request(args: &EngineArgs, inputs: &Inputs<'_>) -> Result<Placemen
         sequences: args.max_sequences as u64, prefill_rows: prefill, decode_rows: decode,
         max_context: inputs.max_context as u64, reserve_bytes: (args.reserve_gib as u64) << 30, mark_slots,
         workspace: Some(workspace), experts, draft, expert_workspace, first_routed: routed.first_layer,
+        peer_experts: v4::peer_experts(inputs.catalog),
         requested_pool: (args.pool_tokens > 0).then_some(args.pool_tokens as u64),
         onboard: if args.skip_routed_experts { Onboard::Auto } else { onboard },
         full_prefill_logits: 0 })?;

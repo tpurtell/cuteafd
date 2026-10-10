@@ -48,7 +48,8 @@ pub fn deepseek_v4_peer_exchange_bytes(hidden: u64, prefill_rows: u64, decode_ro
 /// slots carry route IDs, route weights and the lead shared-expert half.
 pub fn deepseek_v4_expert_exchange_bytes(hidden: u64, topk: u64, prefill: u64, decode: u64, rank: usize)
     -> Result<u64, CacheGeometryError> {
-    let payload = product("V4 expert payload", &[prefill.max(decode), hidden * 2 + topk * 8])?;
+    // Each section of the packed payload starts 16-byte aligned (+32 B).
+    let payload = sum("V4 expert payload", &[product("V4 expert rows", &[prefill.max(decode), hidden * 2 + topk * 8])?, 32])?;
     sum("V4 expert exchange", &[product("V4 expert slots", &[4, payload])?,
         256, if rank == 0 { payload.max(256) } else { 0 },
         (hidden + hidden / 32).max(256),
@@ -293,7 +294,7 @@ mod expert_exchange_tests {
     fn reservation_matches_persistent_slots_lanes_and_checks() {
         for h in [4096, 7168] {
             for (prefill, decode) in [(4096, 64), (16, 64)] {
-                let payload = prefill.max(decode) * (h * 2 + 6 * 8);
+                let payload = prefill.max(decode) * (h * 2 + 6 * 8) + 32;
                 let check = h + h / 32;
                 let lead = 4 * payload + 256 + payload + check + 3 * 256;
                 let peer = 4 * payload + 256 + check + (2 * prefill + decode) * check;

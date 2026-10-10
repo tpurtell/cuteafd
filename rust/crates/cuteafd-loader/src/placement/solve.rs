@@ -97,8 +97,9 @@ pub fn solve(request: &PlacementRequest) -> Result<Placement, PlacementError> {
             let fit = pool_fit(&available, &used, &arenas, &unit_bytes);
             let units = pool_units(request, fit)?;
             let used = with_pool(&used, &unit_bytes, units)?;
+            let caps = [usize::MAX, if request.expert_gpus > 1 { usize::MAX } else { 0 }];
             let (ranges, homes, _) = place_experts(request, &available, &used, &mut arenas, first_moe,
-                request.layers.len(), &[usize::MAX; 2])?;
+                request.layers.len(), &caps)?;
             (units, ranges, homes)
         }
         // Fixed onboard: exactly `n` routed layers (the contiguous prefix the
@@ -107,11 +108,11 @@ pub fn solve(request: &PlacementRequest) -> Result<Placement, PlacementError> {
         Some(n) => {
             let end = nth_moe_end(request, first_moe, n);
             let mut best: Option<(u64, Vec<ExpertRange>, Vec<ExpertHome>, Vec<Arena>)> = None;
-            let splits: Vec<usize> = if gpus == 1 { vec![n] } else { (0..=n).rev().collect() };
+            let splits: Vec<usize> = if gpus == 1 || request.expert_gpus < 2 { vec![n] } else { (0..=n).rev().collect() };
             let mut most = 0;
             for on_first in splits {
                 let mut trial = arenas.clone();
-                let caps = [on_first, n - on_first];
+                let caps = [on_first, if gpus == 2 { n - on_first } else { 0 }];
                 let (ranges, homes, next) = place_experts(request, &available, &used, &mut trial, first_moe, end, &caps)?;
                 let placed = homes.iter().filter(|h| matches!(h, ExpertHome::RtxWhole { .. })).count();
                 most = most.max(placed);

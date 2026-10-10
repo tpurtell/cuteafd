@@ -193,7 +193,8 @@ fn planner_equals_runtime_deepseek_v4() {
                 dspark: true };
             let placement = assert_equal(&case, &format!("{model} rtx{rtx} {context}"));
             assert_eq!(placement.pool_tokens, 2 << 20, "{model} rtx{rtx}: pool first reaches 2M");
-            if rtx == 2 { assert!(placement.expert_ranges[1].layers > 0, "{model}: GPU1 holds routed layers"); }
+            // EXL3 runs on both GPUs; native rtx_backbone binds to GPU0 (until P4).
+            if rtx == 2 { assert_eq!(placement.expert_ranges[1].layers > 0, model == "pro", "{model}: GPU1 routed layers"); }
             auto.insert((model, rtx, context), placement);
         }
     }
@@ -203,16 +204,23 @@ fn planner_equals_runtime_deepseek_v4() {
             assert_eq!(auto[&(model, rtx, 131_072)].expert_ranges, auto[&(model, rtx, 1_048_576)].expert_ranges);
         }
     }
-    // Fixed onboard: half of Flash's 43 routed layers on max; the pool is the output.
+    // Fixed onboard: the pool is the output.
     for context in [131_072u64, 1_048_576] {
         let manifest = inputs.join(format!("flash-2-{context}/PROGRAMS.json"));
-        let half = Onboard::Layers(21);
-        let case = Case { snapshot: &flash, manifest: &manifest, rtx: 2, sparks: 4, context, budget, onboard: half,
-            dspark: true };
-        let placement = assert_equal(&case, &format!("flash max {context} onboard 21"));
-        assert_eq!(placement.onboard_layers, 21);
+        let case = Case { snapshot: &flash, manifest: &manifest, rtx: 2, sparks: 4, context, budget,
+            onboard: Onboard::Auto, dspark: true };
+        // Native MXFP4 layers stay on GPU0: 15 fit beside a fixed onboard's
+        // minimum pool; Pro EXL3 max splits half of its 61 over both GPUs.
+        let placement = assert_equal(&Case { onboard: Onboard::Layers(12), ..case }, &format!("flash max {context} onboard 12"));
+        assert_eq!((placement.onboard_layers, placement.expert_ranges[1].layers), (12, 0));
         assert!(placement.pool_tokens > 2 << 20, "fewer layers than auto leave a pool above the target");
-        let percent = Case { onboard: Onboard::Fraction(0.5), ..case };
-        assert_eq!(assert_equal(&percent, "flash max 50%").onboard_layers, 22);
+        let manifest = inputs.join(format!("pro-2-{context}/PROGRAMS.json"));
+        let pro_case = Case { snapshot: &pro, manifest: &manifest, rtx: 2, sparks: 6, context, budget,
+            onboard: Onboard::Layers(6), dspark: true };
+        let pro_fixed = assert_equal(&pro_case, &format!("pro max {context} onboard 6"));
+        assert_eq!(pro_fixed.onboard_layers, 6);
+        assert!(pro_fixed.expert_ranges[1].layers > 0 && pro_fixed.pool_tokens > 2 << 20);
+        let percent = Case { onboard: Onboard::Fraction(0.1), ..pro_case };
+        assert_eq!(assert_equal(&percent, "pro max 10%").onboard_layers, 6);
     }
 }
