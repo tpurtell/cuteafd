@@ -2828,6 +2828,33 @@ Two latent bugs from b2f26af9's GPU1 ranges are inputs to `P3`/`P4`:
   (`cudaErrorInvalidDevice` on GPU1);
 - under two-lane prefill, the Pro EXL3 GPU1 ranges deadlock on `peer_wait`.
 
+**P3 landed (2026-10-10): per-layer ownership in the solver, no default
+change.**
+- **Types.** `placement::residual` has `ResidualHome`, the section-3
+  transitions, `plan_hops` and `hop_buffer_bytes`. `Placement.residual` gives
+  the home at every layer boundary, and `Placement.hops` the moves.
+- **Hop buffers.** Their receive buffers are `residual hops` Transport fixed
+  demands: lanes × min(hops in, 2) × rows × row bytes, so 128 MiB per lane
+  slot for a `[4096,4,4096]` BF16 mHC hop.
+- **Executor modes.** `ExecutorModes` per family: the solver only picks what
+  the executor runs (`NoMode`, `UnsupportedHop` at plan time), and the
+  engine re-checks. V4 runs all `HeadSplit` or all `Whole{0}`, with the
+  entry hop only.
+- **The hop primitive.** `shared::peer_split::hop::HopLink` splits send from
+  land, so the executor places each wait.
+- **Ordering checker.** `shared::peer_split::order::check` proves a recorded
+  two-stream push/wait schedule deadlock-free on the CPU.
+  - Its fixture is the bug above: rank 0 waits for GPU1's expert result
+    inside the unit while rank 1 waits in the next lane's attention.
+  - Moving the wait to the post alone does not drain it. It drains when the
+    post also follows the next lane's attention, which is the order the
+    Spark-pipelined path already uses.
+- **What the next steps take from P3.**
+  - `P7` and `S4c` record their schedules per lane interleaving and assert
+    `order::check`.
+  - `P4`'s TP2 halves ride the existing FFN slot, so they add no hop.
+  - `P4` deletes the GPU1 ranges path, so the bug is not fixed there.
+
 **Two ways to fix the plan (TJ, 2026-10-10).** By default the KV pool is the
 fixed definition: reserve the pool target, then place expert layers in what
 is left. The solver also takes the inverse, for comparison benchmarking and
