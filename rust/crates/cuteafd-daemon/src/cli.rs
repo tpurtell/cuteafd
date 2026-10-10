@@ -439,8 +439,8 @@ pub(crate) struct NativeExpertDaemonArgs {
     /// EXL3 decode schedule: default, or gb10 for the GLM 5.3 Flash TP4 decode exports
     /// (m1-gb10, m80-gb10): the same bits, with weight words staged L2 evict-first and, at
     /// m80, 64x128 tiles at two CTAs per SM.
-    #[arg(long, value_enum, default_value_t = crate::families::deepseek_v41::v41_experts::exl3::execution::Exl3Schedule::Default)]
-    pub(crate) exl3_schedule: crate::families::deepseek_v41::v41_experts::exl3::execution::Exl3Schedule,
+    #[arg(long, value_enum, default_value_t = crate::shared::experts::exl3::execution::Exl3Schedule::Default)]
+    pub(crate) exl3_schedule: crate::shared::experts::exl3::execution::Exl3Schedule,
     /// Override the FP8 expert package layout directory (`fp8-<family>/tp<world>`).
     #[arg(long)]
     pub(crate) fp8_package: Option<PathBuf>,

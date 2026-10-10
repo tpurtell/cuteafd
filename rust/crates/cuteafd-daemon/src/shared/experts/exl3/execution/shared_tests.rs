@@ -1,5 +1,5 @@
 use super::*;
-use crate::families::deepseek_v41::v41_experts::ExpertLayer;
+use crate::shared::experts::layer::ExpertLayer;
 use crate::shared::memory::LoadStream;
 
 struct Graph<'a> { library: &'a NativeLibrary, exec: *mut c_void, stream: *mut c_void }

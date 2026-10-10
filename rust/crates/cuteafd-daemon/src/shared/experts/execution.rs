@@ -1,5 +1,6 @@
 //! Per-wave stable expert I/O, scratch, stream and graph ownership.
-use super::{DeviceAllocation, ExpertWeights, LoadStream};
+use super::layer::{ExpertLayer, ExpertWeights};
+use crate::shared::memory::{DeviceAllocation, LoadStream};
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::{
     CuteafdDeviceBuffer, NativeLibrary, V41CompactReducer, V41ExpertKernel, V41ExpertLaunchArgs,
@@ -8,7 +9,6 @@ use cuteafd_ffi::{
 use std::ffi::c_void;
 mod timing;
 use timing::ExpertTiming;
-use super::ExpertLayer;
 
 /// Native roles that publish token-major FP32 routed partials and therefore
 /// need the compact output buffer plus the compact reducer: legacy grouped
@@ -58,16 +58,16 @@ struct DecodeExecution<'library> {
 /// Upstream producers and transport must obey this owner's stream/lifetime contract.
 pub(crate) struct ExpertExecution<'weights, 'library> {
     // Destroy stream before allocations; Drop drains and destroys the graph first.
-    stream: LoadStream<'library>,
-    _weights: &'weights ExpertWeights<'library>,
+    pub(crate) stream: LoadStream<'library>,
+    pub(crate) _weights: &'weights ExpertWeights<'library>,
     library: &'library NativeLibrary,
-    kernel: V41ExpertKernel<'library>,
+    pub(crate) kernel: V41ExpertKernel<'library>,
     decode: Option<DecodeExecution<'library>>,
     small: Option<DecodeExecution<'library>>,
     reducer: V41RouteReducer<'library>,
     timing: Option<ExpertTiming<'library>>,
     scratch: DeviceAllocation<'library>,
-    hidden: DeviceAllocation<'library>,
+    pub(crate) hidden: DeviceAllocation<'library>,
     ids: DeviceAllocation<'library>,
     routing: DeviceAllocation<'library>,
     /// Pinned route ids then weights, uploaded asynchronously per request. The
@@ -77,7 +77,7 @@ pub(crate) struct ExpertExecution<'weights, 'library> {
     compact_reducer: Option<V41CompactReducer<'library>>,
     compact_output: Option<DeviceAllocation<'library>>,
     output: Option<DeviceAllocation<'library>>,
-    shared: Option<DeviceAllocation<'library>>,
+    pub(crate) shared: Option<DeviceAllocation<'library>>,
     slots: [*mut c_void; 44],
     graph: Option<(*mut c_void, u32, bool)>,
     /// Replicated-group index this worker owns; set once at startup for an
@@ -361,109 +361,6 @@ impl<'weights, 'library> ExpertExecution<'weights, 'library> {
         unsafe { self.library.cuda_stream_synchronize(self.stream.raw) }
     }
 
-    /// Run routing, shared FFN and the three routed experts on one wave stream.
-    /// The existing reducer adds shared BF16 output after expert accumulation.
-    /// # Safety
-    /// Hidden states must be finite and initialized with producer writes ordered
-    /// on this stream; serialize wave use and finish external readers before reuse.
-    pub unsafe fn ffn_draft(
-        &mut self,
-        router: &mut super::dspark::DsparkRouter<'_, '_>,
-        shared: &mut super::dspark::DsparkSharedFfn<'_, '_>,
-        rows: u32,
-    ) -> Result<()> {
-        let launched = unsafe { self.enqueue_draft_ffn(router, shared, rows) };
-        let drained = self.synchronize();
-        launched.and(drained)
-    }
-
-    /// Caller must drain this wave's stream before releasing router/shared scratch.
-    pub(super) unsafe fn enqueue_draft_ffn(
-        &mut self,
-        router: &mut super::dspark::DsparkRouter<'_, '_>,
-        shared: &mut super::dspark::DsparkSharedFfn<'_, '_>,
-        rows: u32,
-    ) -> Result<()> {
-        unsafe { self.enqueue_draft_ffn_on(router, shared, rows, self.stream.raw) }
-    }
-    /// Containing owner must drain the supplied stream before releasing scratch.
-    pub(super) unsafe fn enqueue_draft_ffn_on(
-        &mut self,
-        router: &mut super::dspark::DsparkRouter<'_, '_>,
-        shared: &mut super::dspark::DsparkSharedFfn<'_, '_>,
-        rows: u32,
-        stream: *mut c_void,
-    ) -> Result<()> {
-        ensure!(
-            router.matches(self._weights) && shared.matches(self._weights),
-            "dSpark FFN stage owners differ"
-        );
-        ensure!(
-            rows > 0 && rows <= self.kernel.info().capacity_rows,
-            "invalid dSpark FFN rows"
-        );
-        let output = self
-            .shared
-            .as_ref()
-            .context("dSpark FFN requires coordinator output")?
-            .buffer;
-        unsafe {
-            router.enqueue(self.inputs(), rows as usize, stream)?;
-            shared.enqueue(self.hidden.buffer, output, rows, stream)?;
-            self.launch_on(rows, true, stream)
-        }
-    }
-
-    /// Compute the dSpark shared expert directly into this wave's shared output.
-    /// # Safety
-    /// Hidden states must be finite and initialized, with producer writes ordered
-    /// on this stream; external consumers must finish before output reuse.
-    pub unsafe fn shared_draft(
-        &mut self,
-        shared: &mut super::dspark::DsparkSharedFfn<'_, '_>,
-        rows: u32,
-    ) -> Result<()> {
-        ensure!(
-            shared.matches(self._weights),
-            "shared FFN and expert stage weights differ"
-        );
-        ensure!(
-            rows > 0 && rows <= self.kernel.info().capacity_rows,
-            "invalid shared FFN rows"
-        );
-        let output = self
-            .shared
-            .as_ref()
-            .context("shared FFN requires coordinator output")?
-            .buffer;
-        let launched = unsafe { shared.enqueue(self.hidden.buffer, output, rows, self.stream.raw) };
-        let drained = self.synchronize();
-        launched.and(drained)
-    }
-
-    /// Route the current hidden states through this exact dSpark stage's gate.
-    /// Drains the stream before returning so the router scratch can be reused.
-    /// # Safety
-    /// Hidden states must be initialized with finite router logits on this device;
-    /// external producers/readers must finish or be ordered on this stream.
-    pub unsafe fn route_draft(
-        &mut self,
-        router: &mut super::dspark::DsparkRouter<'_, '_>,
-        rows: u32,
-    ) -> Result<()> {
-        ensure!(
-            router.matches(self._weights),
-            "router and expert stage weights differ"
-        );
-        ensure!(
-            rows > 0 && rows <= self.kernel.info().capacity_rows,
-            "invalid router rows"
-        );
-        let launched = unsafe { router.enqueue(self.inputs(), rows as usize, self.stream.raw) };
-        let drained = self.synchronize();
-        launched.and(drained)
-    }
-
     /// # Safety
     /// Initialize hidden in the kernel-advertised input format, in-range I32
     /// expert IDs and finite nonnegative
@@ -473,7 +370,7 @@ impl<'weights, 'library> ExpertExecution<'weights, 'library> {
     pub unsafe fn launch(&mut self, rows: u32, include_shared: bool) -> Result<()> {
         unsafe { self.launch_on(rows, include_shared, self.stream.raw) }
     }
-    unsafe fn launch_on(
+    pub(crate) unsafe fn launch_on(
         &mut self,
         rows: u32,
         include_shared: bool,
@@ -676,8 +573,8 @@ impl ExpertExecution<'_, '_> {
         hidden_view: Option<CuteafdDeviceBuffer>,
     ) -> Result<()> {
         let layer = match self._weights.layer {
-            super::ExpertLayer::Backbone { layer, .. }
-            | super::ExpertLayer::BackboneReplicatedTp { layer, .. } => layer,
+            ExpertLayer::Backbone { layer, .. }
+            | ExpertLayer::BackboneReplicatedTp { layer, .. } => layer,
             _ => anyhow::bail!("backbone requests cannot execute on RTX dSpark weights"),
         };
         ensure!(

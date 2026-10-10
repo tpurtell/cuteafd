@@ -928,7 +928,7 @@ mod tests {
         assert!(parse(invalid).native_layout().is_err());
     }
 
-    use crate::families::deepseek_v41::v41_experts::ExpertLayer;
+    use crate::shared::experts::layer::ExpertLayer;
     use crate::shared::memory::LoadStream;
 
     struct Fixture<'a> {
