@@ -235,6 +235,7 @@ pub(crate) mod totals {
         INPUT.fetch_add(prompt as u64, Relaxed);
         CACHED.fetch_add(cached as u64, Relaxed);
     }
+    pub fn active() -> u64 { ADMITTED.load(Relaxed).saturating_sub(RETIRED.load(Relaxed)) }
     pub fn retired() { RETIRED.fetch_add(1, Relaxed); }
     pub fn prefill(rows: usize) { PREFILL.fetch_add(rows as u64, Relaxed); }
     pub fn output(tokens: usize) { OUTPUT.fetch_add(tokens as u64, Relaxed); }
@@ -307,13 +308,18 @@ pub(crate) struct Ticket {
     done: bool,
     /// The request sent its finish (EOS, stop or length) to the client.
     finished: bool,
+    usage: Option<cuteafd_api::usage::UsageHandle>,
 }
 
 /// Admit a request: always counted, announced while a console is installed.
 /// `cached` prompt rows came from the prefix cache in the admission that began
 /// at `admit_started` (shown as a restore step when nonzero).
 pub(crate) fn admit(prompt: usize, cached: usize, max: usize, grammar: bool, images: usize,
-    admit_started: Instant) -> Ticket {
+    admit_started: Instant, usage: Option<cuteafd_api::usage::UsageHandle>) -> Ticket {
+    if let Some(usage) = &usage {
+        usage.admitted(totals::active() as u64 + 1);
+        usage.prompt_tokens(prompt as u64, cached as u64);
+    }
     let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
     totals::admitted(prompt, cached);
     let at = Instant::now();
@@ -325,11 +331,12 @@ pub(crate) fn admit(prompt: usize, cached: usize, max: usize, grammar: bool, ima
                 rows: cached as u32, started: admit_started, finished: at }));
         }
     }
-    Ticket { id, done: false, finished: false }
+    Ticket { id, done: false, finished: false, usage }
 }
 
 impl Ticket {
     pub fn id(&self) -> u64 { self.id }
+    pub fn session(&self) -> Option<String> { self.usage.as_ref().map(|u| u.session_id().to_owned()) }
 
     /// A prefill chunk of `rows` prompt rows that began at `started` just finished.
     #[inline]
@@ -344,6 +351,7 @@ impl Ticket {
 
     /// The first generated token was emitted.
     pub fn first(&self, token: u32) {
+        if let Some(usage) = &self.usage { usage.first_token(); }
         totals::output(1);
         lifecycle(Event::First { id: self.id, at: Instant::now(), token });
     }
@@ -362,6 +370,7 @@ impl Ticket {
 
     fn retire(&mut self, reason: &'static str, generated: usize) {
         if std::mem::replace(&mut self.done, true) { return; }
+        if let Some(usage) = &self.usage { usage.retired(generated as u64, reason); }
         totals::retired();
         lifecycle(Event::Retire { id: self.id, at: Instant::now(), reason, generated: generated as u32 });
     }
@@ -430,6 +439,7 @@ impl Step {
     pub fn member(&mut self, ticket: &Ticket, proposal: &[u32], verified: usize, emitted: &[u32], masked: bool,
         finished: bool) {
         let accepted = emitted.len().saturating_sub(1).min(verified);
+        if let Some(usage) = &ticket.usage { usage.round(proposal.len().max(verified) as u64, accepted as u64); }
         self.tally[0] += proposal.len().max(verified) as u64;
         self.tally[1] += verified as u64;
         self.tally[2] += accepted as u64;
@@ -499,7 +509,7 @@ mod tests {
 
     #[test]
     fn step_counts_members_without_a_viewer() {
-        let ticket = Ticket { id: 7, done: true, finished: false };
+        let ticket = Ticket { id: 7, done: true, finished: false, usage: None };
         let mut step = Step { started: Instant::now(), lane: 0, live: None, text: false, requests: Vec::new(),
             tally: [0; 4] };
         // 5 drafted, 3 verified, 2 accepted (3 emitted); then a plain decode row.
@@ -547,7 +557,7 @@ mod tests {
             while requests.len() < 6 {
                 let started = Instant::now();
                 std::thread::sleep(std::time::Duration::from_millis(3));
-                let ticket = admit(1500 + random(500), 1300, 300, random(3) == 0, 0, started);
+                let ticket = admit(1500 + random(500), 1300, 300, random(3) == 0, 0, started, None);
                 let chunk = Instant::now();
                 std::thread::sleep(std::time::Duration::from_millis(20));
                 ticket.prefill(200 + random(100), 0, 1, chunk);

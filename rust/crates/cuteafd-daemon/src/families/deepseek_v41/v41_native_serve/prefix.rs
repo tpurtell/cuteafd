@@ -13,6 +13,7 @@ pub(super) use host_cache::HostCacheBinding;
 /// The CUDA copy engine the generic families' host tier uses too.
 pub(crate) use host_cache::CudaCopyEngine;
 struct Saved<'a> {
+    session: Option<String>,
     _images: ImageKeys,
     target: RequestPrefix<'a>,
     draft: Option<DraftPrefix<'a>>,
@@ -27,8 +28,11 @@ pub(super) struct PrefixCache<'a> {
     host: Option<HostCacheBinding<'a>>,
     /// Failed copy release barriers retain their source allocations here.
     quarantined: Vec<Saved<'a>>,
+    capture_session: Option<String>,
+    restored_session: Option<String>,
 }
 struct PendingRetention {
+    session: Option<String>,
     kind: SnapshotKind,
     keys: Vec<u32>,
     images: ImageKeys,
@@ -58,8 +62,12 @@ impl<'a> PrefixCache<'a> {
             pending: [None, None],
             host: None,
             quarantined: Vec::new(),
+            capture_session: None,
+            restored_session: None,
         }
     }
+    pub fn capture_session(&mut self, session: Option<String>) { self.capture_session = session; }
+    pub fn restored_session(&self) -> Option<&str> { self.restored_session.as_deref() }
     /// Attach the host snapshot cache (`None` keeps every path exactly as before).
     pub fn with_host_cache(mut self, host: Option<HostCacheBinding<'a>>) -> Self {
         self.host = host;
@@ -222,6 +230,7 @@ impl<'a> PrefixCache<'a> {
         let target = requests.retain_prefix(lease, BackbonePrefix::device_bytes())?;
         let draft = draft.map(|d| d.retain_prefix(id, end)).transpose()?;
         let saved = Saved {
+            session: self.capture_session.clone(),
             _images: images.through(end as usize),
             target,
             draft,
@@ -250,7 +259,7 @@ impl<'a> PrefixCache<'a> {
                 return Err(error);
             }
         }
-        self.pending[lane] = Some(PendingRetention { kind, keys: keys.into_owned(), images: images.through(end as usize),
+        self.pending[lane] = Some(PendingRetention { session: self.capture_session.clone(), kind, keys: keys.into_owned(), images: images.through(end as usize),
             next: next.clone(), id, lease, draft: draft.is_some() });
         Ok(true)
     }
@@ -267,7 +276,7 @@ impl<'a> PrefixCache<'a> {
         let pending = self.pending[lane].take().unwrap();
         // Another lane may have inserted while these copies ran. Radix insertion
         // enforces the bank limit again; two extra arena slots cover both pending copies.
-        let saved = Saved { _images: pending.images, target, draft: saved_draft, next: pending.next, ticket: None };
+        let saved = Saved { session: pending.session, _images: pending.images, target, draft: saved_draft, next: pending.next, ticket: None };
         self.insert_saved(pending.kind, &pending.keys, saved, requests);
         Ok(true)
     }
@@ -287,6 +296,7 @@ impl<'a> PrefixCache<'a> {
         requests: &mut Requests<'a>,
         draft: Option<&mut DraftRuntime<'_, 'a, C>>,
     ) -> Result<Option<(usize, Option<TokenScores>)>> {
+        self.restored_session = None;
         let keys = images.encode(tokens)?;
         if self.retained.lookup_reusable(&keys).is_none() {
             self.host_restore(&keys, lease, requests, draft.as_deref())?;
@@ -297,6 +307,7 @@ impl<'a> PrefixCache<'a> {
         let Some((end, frontier, saved)) = self.retained.lookup_reusable(&keys) else {
             return Ok(None);
         };
+        self.restored_session = saved.session.clone();
         ensure!(
             saved.target.end() == frontier as u64 && saved.draft.is_some() == draft.is_some(),
             "retained execution mode or token frontier differs"

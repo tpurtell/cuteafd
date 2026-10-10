@@ -736,7 +736,10 @@ fn schedule_inner(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path
                 continue;
             }
             let ticket = console::admit(tokens.len(), resume, job.max_tokens, constraint.is_some(), job.media.len(),
-                admit_started);
+                admit_started, job.usage.clone());
+            if let (Some(usage), Some(session)) = (&job.usage, admitted.source.as_ref().and_then(|s| s.session.as_ref())) {
+                usage.session(session.clone(), "prefix");
+            }
             if let Some(source) = admitted.source {
                 tracing::info!(tokens = tokens.len(), resume, kind = ?source.kind, frontier = source.frontier,
                     host = source.host, partial = source.partial, "prefix cache hit");
@@ -815,6 +818,7 @@ fn schedule_inner(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path
                         p.ticket.cancel();
                         // The client left during the prefill: keep what it computed for a retry.
                         if placement.len > resume && !probe::cold(&p.job.probe) {
+                            cache.capture_session(p.ticket.session());
                             if let Err(error) = cache.park_media(family, &p.keys.tokens()[..placement.len], p.keys.spans(), &placement) {
                                 tracing::warn!("parking a cancelled prefill: {error:#}");
                             }
@@ -842,9 +846,11 @@ fn schedule_inner(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path
                 // The prompt snapshot, taken once the first token is out (it only enqueues copies).
                 let prompt = (resume < p.tokens.len() && !probe::cold(&p.job.probe)).then(|| p.keys.tokens().to_vec());
                 let spans = p.keys.spans().to_vec();
+                let session = p.ticket.session();
                 let retain_prompt = |cache: &mut PrefixCache<CudaCopyEngine<'_>>, placement: &MimoPlacement| {
                     if let Some(prompt) = &prompt {
                         let after = logits.as_deref().map_or_else(After::default, |l| After::from_logits(l, true));
+                        cache.capture_session(session.clone());
                         if let Err(error) = cache.capture_media(family, SnapshotKind::Prompt, prompt, &spans, placement, after) {
                             tracing::warn!("prompt snapshot not retained: {error:#}");
                         }
@@ -1231,6 +1237,7 @@ fn schedule_inner(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path
             if let Some(row) = request.turn.as_ref().filter(|_| !probe::cold(&request.job.probe)) {
                 // The conversation so far: every committed row (the last token is not in it).
                 let rows = &request.keyed_history[..request.placement.len];
+                cache.capture_session(request.ticket.session());
                 if let Err(error) = cache.capture_media(family, SnapshotKind::Turn, rows, request.media.spans(), &request.placement,
                     After::from_logits(row, true)) {
                     tracing::warn!("turn snapshot not retained: {error:#}");
@@ -1475,6 +1482,7 @@ fn complete_prefill_chunk(family: &MimoPrefix<'_, '_>, cache: &mut PrefixCache<C
     p: &mut Prefill<'_>) -> Result<Chunk> {
     // Intermediate snapshot points this chunk reaches (off unless configured).
     for &(_, point) in p.plan.points.iter().filter(|&&(chunk, _)| chunk == p.chunks && !probe::cold(&p.job.probe)) {
+        cache.capture_session(p.ticket.session());
         if let Err(error) = cache.capture_media(family, SnapshotKind::Prompt, &p.keys.tokens()[..point], p.keys.spans(), &p.placement,
             After::default()) {
             tracing::warn!("snapshot point {point} not retained: {error:#}");

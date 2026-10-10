@@ -15,6 +15,58 @@ const DEFAULT_SEARCH_ROUNDS: u32 = 5;
 /// Backend rounds per turn in the hosted-tool loop, whatever the model does.
 const MAX_HOSTED_ROUNDS: u32 = 16;
 
+pub(super) fn account_request(turn: &mut TurnRequest, scope: Option<crate::usage::UsageHandle>, raw: &serde_json::Value, stream: bool) {
+    let Some(scope) = scope else { return };
+    let parts = turn.items.iter().filter_map(|item| match item {
+        Item::Message { content, .. } | Item::ToolResult { content, .. } => Some(content),
+        _ => None,
+    }).flatten();
+    let (mut images, mut audio) = (0, 0);
+    for part in parts {
+        images += u64::from(matches!(part, Part::Image { .. }));
+        audio += u64::from(matches!(part, Part::Audio { .. }));
+    }
+    scope.details(crate::usage::Details {
+        model_requested: Some(turn.requested_model.clone()), stream,
+        n_items: Some(turn.items.len() as u64), n_tools: Some(turn.tools.len() as u64),
+        n_images: Some(images), n_audio: Some(audio), ..Default::default()
+    });
+    if let Some(session) = &turn.session { scope.session(session.0.clone(), "explicit"); }
+    else if let Some(key) = raw["prompt_cache_key"].as_str()
+        .or_else(|| raw["metadata"]["user_id"].as_str()).or_else(|| raw["user"].as_str()) {
+        scope.cache_session(key);
+    }
+    turn.usage = Some(scope);
+}
+
+pub(super) fn account_stream(mut stream: TurnStream, usage: Option<crate::usage::UsageHandle>, child: bool) -> TurnStream {
+    let Some(usage) = usage else { return stream };
+    Box::pin(async_stream::stream! {
+        while let Some(event) = stream.next().await {
+            match &event {
+                Ok(TurnEvent::TextDelta { .. } | TurnEvent::ReasoningDelta { .. } | TurnEvent::ToolCallStart { .. }) => usage.first_token(),
+                Ok(TurnEvent::Usage { usage: u }) => usage.tokens(u.input_tokens.into(), u.cached_input_tokens.into(), u.output_tokens.into(), u.reasoning_tokens.into()),
+                Ok(TurnEvent::Done { stop }) => {
+                    usage.stop(match stop {
+                        StopReason::EndTurn => "end_turn", StopReason::MaxTokens => "max_tokens",
+                        StopReason::ToolUse => "tool_use", StopReason::StopSequence { .. } => "stop_sequence",
+                        StopReason::Refusal => "refusal", StopReason::ContentFilter => "content_filter",
+                        StopReason::Cancelled => "cancelled", StopReason::PauseTurn => "pause_turn",
+                    });
+                    if child { usage.finished(200); }
+                }
+                Err(error) => { usage.engine_error(error.anthropic_type()); if child { usage.finished(500); } }
+                _ => (),
+            }
+            let terminal = matches!(event, Ok(TurnEvent::Done { .. }) | Err(_));
+            yield event;
+            if terminal { return; }
+        }
+        usage.engine_error("unexpected_eof");
+        if child { usage.finished(500); }
+    })
+}
+
 struct PendingCall { id: String, name: String, arguments: String, hosted: bool, out_index: Option<usize> }
 
 pub(super) async fn run(gateway: Arc<Gateway>, mut turn: TurnRequest) -> Result<TurnStream, GatewayError> {

@@ -382,7 +382,7 @@ def test_runtime_seed_is_explicit_only(entry, tmp_path, monkeypatch, seed):
     monkeypatch.setattr(sys, 'argv', args)
     monkeypatch.setenv('CUTEAFD_BENCH_NONCE_SEED', 'inherited')
     monkeypatch.setattr(cards, 'assert_absent', lambda job: None)
-    monkeypatch.setattr(cards, 'slot_check', lambda arm, host: None)
+    monkeypatch.setattr(cards, 'slot_check', lambda arm, host: json.dumps(dict(slot=arm['slot'], seal_sha256='seal', artifact_manifest_sha256='artifacts')))
     seen = []
     def detached(cmd, log, exit_file, env):
         seen.append(env)
@@ -405,3 +405,22 @@ def test_summary_extracts_exact_cache_check(entry, tmp_path, status):
     row = cards.summarize_job(job, 0)
     assert row['cache'] == check
     assert row['status'] == ('failed' if status == 'failed' else 'pass')
+
+
+def test_shared_wip_same_slot_and_distinct_serving_instances(entry, tmp_path):
+    arms = cards.arms_from(['off=usage-off:s', 'on=usage-on:s'])
+    cards.shared_wip(arms,['off=usage-build','on=usage-build'],[],1)
+    jobs = [cards.generate(entry,n,a,tmp_path,tmp_path/'api-key',{},set(),None,1) for n,a in arms.items()]
+    assert {j['entry']['set']['WIP_INSTANCE'] for j in jobs} == {'usage-build'}
+    assert len({j['entry']['set']['INSTANCE'] for j in jobs}) == 2
+    arms['on']['slot'] = 'different'
+    with pytest.raises(ValueError,match='identical slots'):
+        cards.shared_wip(arms,[],[],1)
+    for builds,parallel in [(['off=HEAD'],1),([],2)]:
+        with pytest.raises(ValueError,match='refuses'):
+            cards.shared_wip(cards.arms_from(['off=off:s']),['off=shared'],builds,parallel)
+
+
+def test_shared_external_wip_cleanup_never_deletes_build(monkeypatch):
+    monkeypatch.setattr(cards,'cleanup_script',lambda *a: pytest.fail('external build cleanup'))
+    cards.cleanup({'off':{'instance':'off','slot':'s','wip_instance':'shared'},'on':{'instance':'on','slot':'s','wip_instance':'shared'}},'task',False)

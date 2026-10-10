@@ -54,6 +54,7 @@ async fn upgrade(
     Query(query): Query<Connect>,
     headers: HeaderMap,
     tape: Tape,
+    usage: Option<crate::usage::UsageHandle>,
     ws: WebSocketUpgrade,
 ) -> HttpResponse {
     let transcription = match query.intent.as_deref() {
@@ -85,7 +86,7 @@ async fn upgrade(
             .any(|v| v.trim() == "openai-beta.realtime-v1");
     ws.protocols(["realtime"])
         .max_message_size(32 * 1024 * 1024)
-        .on_upgrade(move |socket| serve(socket, gateway, model, beta, transcription, tape))
+        .on_upgrade(move |socket| serve(socket, gateway, model, beta, transcription, tape, usage))
         .into_response()
 }
 struct Connection {
@@ -100,6 +101,8 @@ struct Connection {
     active: Option<response::Response>,
     cancel: Option<tokio::sync::watch::Receiver<bool>>,
     idle: Option<tokio::time::Instant>,
+    usage: Option<crate::usage::UsageHandle>,
+    turn_usage: Option<crate::usage::UsageHandle>,
 }
 async fn send(socket: &mut WebSocket, tape: &Tape, mut event: Value) -> bool {
     event["event_id"] = json!(id("event"));
@@ -114,6 +117,7 @@ async fn serve(
     beta: bool,
     transcription: bool,
     tape: Tape,
+    usage: Option<crate::usage::UsageHandle>,
 ) {
     let session = gateway.sessions.create("sess");
     let session_id = session.lock().await.id.clone();
@@ -131,7 +135,14 @@ async fn serve(
         active: None,
         cancel: None,
         idle: None,
+        usage,
+        turn_usage: None,
     };
+    if let Some(usage) = &c.usage {
+        usage.session(session_id.0.clone(), "explicit");
+        usage.details(crate::usage::Details { model_requested: Some(model.clone()), stream: true, ..Default::default() });
+        usage.served_model(&c.gateway.models.resolve(&model).unwrap_or(model));
+    }
     let initial = if beta && transcription {
         "transcription_session.created"
     } else {
@@ -565,6 +576,15 @@ impl Connection {
         Ok(events)
     }
     async fn start(&mut self, overrides: &Value) -> Result<Vec<Value>, GatewayError> {
+        let usage = self.usage.as_ref().map(|u| u.child("realtime"));
+        if let Some(scope) = &usage {
+            scope.session(self.session.lock().await.id.0.clone(), "explicit");
+        }
+        let result = self.start_accounted(overrides, usage.clone()).await;
+        if let (Err(error), Some(scope)) = (&result, usage) { scope.finished(error.status()); }
+        result
+    }
+    async fn start_accounted(&mut self, overrides: &Value, usage: Option<crate::usage::UsageHandle>) -> Result<Vec<Value>, GatewayError> {
         if self.active.is_some() {
             return Err(invalid(
                 "response",
@@ -599,6 +619,8 @@ impl Connection {
         let mut turn = protocol::turn(&config, self.beta, items)?;
         turn.session = Some(session.id.clone());
         turn.tape = self.tape.clone();
+        super::driver::account_request(&mut turn, usage.clone(), overrides, true);
+        self.turn_usage = usage;
         drop(session);
         let has_audio=turn.items.iter().any(|i|matches!(i,Item::Message {content,..} if content.iter().any(|p|matches!(p,Part::Audio {..}))));
         let has_image=turn.items.iter().any(|i|matches!(i,Item::Message {content,..} if content.iter().any(|p|matches!(p,Part::Image {..}))));
@@ -711,6 +733,13 @@ impl Connection {
         let Some(active) = self.active.as_mut() else {
             return vec![];
         };
+        if let Some(usage) = self.turn_usage.take() {
+            usage.tokens(active.usage.input_tokens.into(), active.usage.cached_input_tokens.into(),
+                active.usage.output_tokens.into(), active.usage.reasoning_tokens.into());
+            if matches!(stop, Some(StopReason::Cancelled)) { usage.stop("cancelled"); }
+            if let Some(error) = &error { usage.engine_error(error.anthropic_type()); }
+            usage.finished(if error.is_some() { 500 } else { 200 });
+        }
         let events = active.finish_turn(stop, error);
         self.sync_output().await;
         self.active.take();

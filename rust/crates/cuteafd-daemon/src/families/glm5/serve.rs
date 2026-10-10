@@ -567,7 +567,10 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
                 continue;
             }
             let ticket = console::admit(tokens.len(), resume, job.max_tokens, constraint.is_some(), job.images.len(),
-                admit_started);
+                admit_started, job.usage.clone());
+            if let (Some(usage), Some(session)) = (&job.usage, admitted.source.as_ref().and_then(|s| s.session.as_ref())) {
+                usage.session(session.clone(), "prefix");
+            }
             if let Some(source) = admitted.source {
                 tracing::info!(tokens = tokens.len(), resume, kind = ?source.kind, frontier = source.frontier,
                     host = source.host, partial = source.partial, "prefix cache hit");
@@ -631,6 +634,7 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
                 p.ticket.prefill(chunk.len(), p.chunks, p.plan.chunks.len(), timer);
                 // Intermediate snapshot points this chunk ends at (off unless configured).
                 for &(_, point) in p.plan.points.iter().filter(|&&(chunk, _)| chunk == p.chunks && !probe::cold(&p.job.probe)) {
+                    cache.capture_session(p.ticket.session());
                     if let Err(error) = cache.capture(&family, SnapshotKind::Prompt, &p.tokens[..point], &p.placement,
                         After::default()) {
                         tracing::warn!("snapshot point {point} not retained: {error:#}");
@@ -646,6 +650,7 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
                         p.ticket.cancel();
                         // The client left during the prefill: keep what it computed for a retry.
                         if placement.len > resume && !probe::cold(&p.job.probe) {
+                            cache.capture_session(p.ticket.session());
                             if let Err(error) = cache.park(&family, &p.tokens[..placement.len], &placement) {
                                 tracing::warn!("parking a cancelled prefill: {error:#}");
                             }
@@ -669,8 +674,10 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
                 }
                 // The prompt snapshot, taken once the first token is out (it only enqueues copies).
                 let prompt = (resume < p.tokens.len()).then(|| p.tokens.clone());
+                let session = p.ticket.session();
                 let retain_prompt = |cache: &mut PrefixCache<CudaCopyEngine<'_>>, placement: &GlmPlacement| {
                     if let (Some(prompt), Some(logits)) = (&prompt, &logits) {
+                        cache.capture_session(session.clone());
                         if let Err(error) = cache.capture(&family, SnapshotKind::Prompt, prompt, placement,
                             After::from_logits(logits, true)) {
                             tracing::warn!("prompt snapshot not retained: {error:#}");
@@ -1003,6 +1010,7 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
             if let Some(row) = &request.turn {
                 // The conversation so far: every committed row (the last token is not in it).
                 let rows = &request.history[..request.placement.len];
+                cache.capture_session(request.ticket.session());
                 if let Err(error) = cache.capture(&family, SnapshotKind::Turn, rows, &request.placement,
                     After::from_logits(row, true)) {
                     tracing::warn!("turn snapshot not retained: {error:#}");

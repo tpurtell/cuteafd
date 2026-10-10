@@ -42,10 +42,13 @@ fn body(value: Result<Json<Value>, JsonRejection>) -> Result<Value, GatewayError
 async fn count_tokens(
     State(gateway): State<Arc<Gateway>>,
     tape: Tape,
+    usage: Option<crate::usage::UsageHandle>,
     value: Result<Json<Value>, JsonRejection>,
 ) -> Response {
     let result = async {
-        let (mut turn, _) = request::parse(&body(value)?, false)?;
+        let raw = body(value)?;
+        let (mut turn, _) = request::parse(&raw, false)?;
+        super::driver::account_request(&mut turn, usage, &raw, false);
         turn.tape = tape;
         gateway.count_tokens(turn).await
     }
@@ -59,10 +62,13 @@ async fn count_tokens(
 async fn messages(
     State(gateway): State<Arc<Gateway>>,
     tape: Tape,
+    usage: Option<crate::usage::UsageHandle>,
     value: Result<Json<Value>, JsonRejection>,
 ) -> Response {
     let result = async {
-        let (mut turn, streaming) = request::parse(&body(value)?, true)?;
+        let raw = body(value)?;
+        let (mut turn, streaming) = request::parse(&raw, true)?;
+        super::driver::account_request(&mut turn, usage.clone(), &raw, streaming);
         turn.tape = tape;
         let model = turn.requested_model.clone();
         let stream = if turn.max_output_tokens == Some(0) {
@@ -81,7 +87,7 @@ async fn messages(
                     stop: super::turn::StopReason::MaxTokens,
                 }),
             ];
-            Box::pin(futures::stream::iter(events)) as super::backend::TurnStream
+            super::driver::account_stream(Box::pin(futures::stream::iter(events)), usage, false)
         } else {
             gateway.run(turn).await?
         };

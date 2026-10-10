@@ -23,13 +23,17 @@ impl Drop for Server {
     }
 }
 async fn server(backend: Arc<dyn Backend>) -> Server {
+    server_with_usage(backend, None).await
+}
+async fn server_with_usage(backend: Arc<dyn Backend>, sink: Option<Arc<crate::usage::tests::Sink>>) -> Server {
     let gateway = Arc::new(Gateway::new(backend, ModelMap::single("served-model")));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!(
         "ws://{}/v1/realtime?model=served-model",
         listener.local_addr().unwrap()
     );
-    let router = super::super::router(gateway.clone());
+    let mut router = super::super::router(gateway.clone());
+    if let Some(sink) = sink { router = router.layer(axum::middleware::from_fn_with_state(crate::usage::Middleware::new(sink), crate::usage::track)); }
     let task = tokio::spawn(async move {
         axum::serve(listener, router).await.unwrap();
     });
@@ -930,6 +934,7 @@ async fn idle_preserves_deadline_for_silence_and_drains_buffer() {
         active: None,
         cancel: None,
         idle: None,
+        usage: None, turn_usage: None,
     };
     c.arm_idle();
     let deadline = c.idle.unwrap();
@@ -1098,6 +1103,7 @@ async fn session_update_rearms_changed_idle_timeout() {
         active: None,
         cancel: None,
         idle: None,
+        usage: None, turn_usage: None,
     };
     for ms in [6000, 30000, 6000] {
         let before = tokio::time::Instant::now();
@@ -1107,4 +1113,33 @@ async fn session_update_rearms_changed_idle_timeout() {
         assert!(deadline >= before + std::time::Duration::from_millis(ms));
         assert!(deadline <= after + std::time::Duration::from_millis(ms));
     }
+}
+
+#[tokio::test]
+async fn usage_connection_and_turn_rows_are_independent() {
+    let backend = Scripted::new(vec![vec![TurnEvent::TextDelta {text:"hello".into()},
+        TurnEvent::Usage {usage: Usage {input_tokens:7,output_tokens:2,..Default::default()}},
+        TurnEvent::Done {stop:StopReason::EndTurn}]]);
+    let sink = Arc::new(crate::usage::tests::Sink::default());
+    let s = server_with_usage(Arc::new(backend.clone()),Some(sink.clone())).await;
+    let mut c = connect(&s,false).await;
+    create(&mut c,user("u","hello"),Value::Null,false).await;
+    emit(&mut c,json!({"type":"response.create"})).await;
+    until(&mut c,"response.done").await;
+    backend.seen.lock().unwrap().clear();
+    tokio::time::timeout(std::time::Duration::from_secs(2),async {
+        loop {
+            if sink.0.lock().unwrap().iter().any(|r| r.protocol == "realtime") {break;}
+            tokio::task::yield_now().await;
+        }
+    }).await.unwrap();
+    let rows = sink.0.lock().unwrap();
+    let row = rows.iter().find(|r| r.protocol == "realtime").unwrap();
+    assert_eq!(row.tokens_in,Some(7));
+    assert_eq!(row.tokens_out,Some(2));
+    assert_eq!(row.outcome,"ok");
+    assert_eq!(row.session_source.as_deref(),Some("explicit"));
+    assert_eq!(row.stop_reason.as_deref(),Some("end_turn"));
+    drop(rows);
+    c.close(None).await.unwrap();
 }

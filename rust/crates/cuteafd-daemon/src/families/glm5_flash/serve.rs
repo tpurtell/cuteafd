@@ -975,7 +975,10 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
                 continue;
             }
             let ticket = console::admit(tokens.len(), resume, job.max_tokens, constraint.is_some(), job.media.len(),
-                admit_started);
+                admit_started, job.usage.clone());
+            if let (Some(usage), Some(session)) = (&job.usage, admitted.source.as_ref().and_then(|s| s.session.as_ref())) {
+                usage.session(session.clone(), "prefix");
+            }
             if let Some(source) = admitted.source {
                 tracing::info!(tokens = tokens.len(), resume, kind = ?source.kind, frontier = source.frontier,
                     host = source.host, "prefix cache hit");
@@ -1020,6 +1023,7 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
                         p.ticket.cancel();
                         // The client left during the prefill: keep what it computed for a retry.
                         if placement.len > resume && !probe::cold(&p.job.probe) {
+                            cache.capture_session(p.ticket.session());
                             if let Err(error) = cache.park_media(&family, &p.keys.tokens()[..placement.len], p.keys.spans(), &placement) {
                                 tracing::warn!("parking a cancelled prefill: {error:#}");
                             }
@@ -1061,8 +1065,10 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
                 // The prompt snapshot, taken once the first token is out (it only enqueues copies).
                 let prompt = (resume < p.tokens.len() && !probe::cold(&p.job.probe)).then(|| p.keys.tokens().to_vec());
                 let spans = p.keys.spans().to_vec();
+                let session = p.ticket.session();
                 let retain_prompt = |cache: &mut PrefixCache<CudaCopyEngine<'_>>, placement: &GlmfPlacement| {
                     if let (Some(prompt), Some(logits)) = (&prompt, &logits) {
+                        cache.capture_session(session.clone());
                         if let Err(error) = cache.capture_media(&family, SnapshotKind::Prompt, prompt, &spans, placement,
                             After::from_logits(logits, true)) {
                             tracing::warn!("prompt snapshot not retained: {error:#}");
@@ -1422,6 +1428,7 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
                 // The conversation so far: every committed row (the last token is not in it).
                 let keys = MediaKeys::new(&request.history, engine.cfg.vocab_size as u32, request.keys.spans())?;
                 let rows = &keys.tokens()[..request.placement.len];
+                cache.capture_session(request.ticket.session());
                 if let Err(error) = cache.capture_media(&family, SnapshotKind::Turn, rows, request.keys.spans(), &request.placement,
                     After::from_logits(row, true)) {
                     tracing::warn!("turn snapshot not retained: {error:#}");
@@ -1520,6 +1527,7 @@ fn prefill_chunk<'a>(cx: &PrefillCx<'_, '_, 'a>, selector: &mut TokenSelector<'_
 /// Intermediate snapshot points prompt `p`'s current chunk ends at (off unless configured).
 fn capture_points<'a>(family: &GlmfPrefix<'_, 'a>, cache: &mut PrefixCache<CudaCopyEngine<'a>>, p: &Prefill<'_>) {
     for &(_, point) in p.plan.points.iter().filter(|&&(chunk, _)| chunk == p.chunks && !probe::cold(&p.job.probe)) {
+        cache.capture_session(p.ticket.session());
         if let Err(error) = cache.capture_media(family, SnapshotKind::Prompt, &p.keys.tokens()[..point],
             p.keys.spans(), &p.placement, After::default()) {
             tracing::warn!("snapshot point {point} not retained: {error:#}");

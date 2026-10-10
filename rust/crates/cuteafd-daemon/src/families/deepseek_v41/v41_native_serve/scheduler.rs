@@ -28,7 +28,7 @@ pub(crate) fn exercise_distributed_decode<'t, 'd, 'a: 'd>(lib: &'a NativeLibrary
     let mut prefixes = PrefixCache::new(2);
     let image_keys = prefixes.prepare_key(tokens, &[])?;
     let mut request = Active { constraint: None, id, lease,
-        job: NativeRequest { prompt: String::new(), constraint: None, images: Vec::new(), media: Vec::new(), audio: Vec::new(), max_tokens: 4, sampling: Default::default(), stop_token_ids: Vec::new(), events, probe: None },
+        job: NativeRequest { prompt: String::new(), constraint: None, images: Vec::new(), media: Vec::new(), audio: Vec::new(), max_tokens: 4, sampling: Default::default(), stop_token_ids: Vec::new(), events, usage: None, probe: None },
         decoder: cuteafd_loader::streaming_token_decoder(snapshot, false)?, anchor,
         generated: 0, buffered: 0, lane: 0, finished: false, cacheable: false, failed: false,
         tokens: tokens.to_vec(), image_keys, next_after_commit: None, copy: None };
@@ -86,6 +86,7 @@ impl Active<'_> {
         if self.cacheable { "finished" } else if self.failed { "failed" } else { "cancelled" }
     }
     fn console_retire(&self) {
+        if let Some(usage) = &self.job.usage { usage.retired(self.generated as u64, self.console_reason()); }
         console::totals::retired();
         console::lifecycle(console::Event::Retire { id: self.id, at: Instant::now(),
             reason: self.console_reason(), generated: self.generated as u32 });
@@ -143,6 +144,7 @@ fn retire_request<'a, C: DraftChain<'a>>(request: Active<'a>, requests: &mut Req
     // scheduler correctly skipped that transfer.
     if request.cacheable && prefixes.turn_bank_enabled()
         && requests.cache().request_id(request.lease).is_ok() {
+        prefixes.capture_session(request.job.usage.as_ref().map(|u| u.session_id().to_owned()));
         let retained = request.next_after_commit.as_ref().context("finished request has no retained logits")
             .and_then(|next| prefixes.retain(SnapshotKind::Turn, &request.tokens, &request.image_keys,
                 next, request.id, request.lease, requests, draft.as_deref_mut()));
@@ -427,6 +429,13 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
                     prompt_usage: PromptUsage { prompt_tokens: prompt.len(), prompt_cache_hit_tokens: cached },
                 }))?;
                 crate::shared::probe::admitted(&job.probe, "deepseek_v41", &prompt, cached);
+                if let Some(usage) = &job.usage {
+                    if cached > 0 {
+                        if let Some(session) = prefixes.restored_session() { usage.session(session.to_owned(), "prefix"); }
+                    }
+                    usage.admitted(console::totals::active() + 1);
+                    usage.prompt_tokens(prompt.len() as u64, cached as u64);
+                }
                 console::totals::admitted(prompt.len(), cached);
                 counted = true;
                 if let Some(from) = crate::shared::probe::scoring(&job.probe) {
@@ -453,6 +462,7 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
                     crate::shared::probe::host_row(&job.probe, prompt.len(), &scores.logits()?);
                 }
                 if cached != prompt.len() && !crate::shared::probe::cold(&job.probe) {
+                  prefixes.capture_session(job.usage.as_ref().map(|u| u.session_id().to_owned()));
                   if let Err(error) = prefixes.retain(SnapshotKind::Prompt, &prompt, &image_keys, &scores, id, lease, requests, draft.as_deref_mut()) {
                     tracing::warn!(%error, "prompt prefix was not retained");
                   }
@@ -467,6 +477,7 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
             })();
             match result {
                 Ok(mut request) => {
+                    if let Some(usage) = &request.job.usage { usage.first_token(); }
                     console::totals::output(1);
                     console::lifecycle(console::Event::First { id: request.id, at: Instant::now(), token: request.anchor });
                     if let Err(error) = request.emit(&[request.anchor]) {
@@ -1415,6 +1426,7 @@ fn single_lane_round<'w, 'a>(lib: &'a NativeLibrary, runtime: &tokio::runtime::R
         finish_copies(active, members, &copied, &inputs, &accepted_inputs);
         let live = console::live();
         let tally = console::Tally::new(proposal, &inputs, &accepted_inputs, &emissions, live);
+        tally.usage(members.iter().map(|&slot| active[slot].as_ref().and_then(|r| r.job.usage.as_ref())));
         for (&slot, tokens) in members.iter().zip(emissions) {
             let request = active[slot].as_mut().unwrap();
             if let Err(error) = request.emit(&tokens) {
@@ -1457,6 +1469,7 @@ fn single_lane_round<'w, 'a>(lib: &'a NativeLibrary, runtime: &tokio::runtime::R
         finish_copies(active, members, &copied, &inputs, &accepted_inputs);
         let live = console::live();
         let tally = console::Tally::new(proposal, &inputs, &accepted_inputs, &emissions, live);
+        tally.usage(members.iter().map(|&slot| active[slot].as_ref().and_then(|r| r.job.usage.as_ref())));
         for (&slot, tokens) in members.iter().zip(emissions) {
             let request = active[slot].as_mut().unwrap();
             if let Err(error) = request.emit(&tokens) {

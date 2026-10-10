@@ -37,7 +37,7 @@ pub(super) struct Fold {
 
 impl Fold {
     pub fn new(p: &Parsed) -> Self {
-        let mut response = json!({"id":id("resp"),"object":"response","created_at":now(),"completed_at":null,
+        let mut response = json!({"id":p.response_id,"object":"response","created_at":now(),"completed_at":null,
             "status":"in_progress","error":null,"incomplete_details":null,"model":p.turn.requested_model,
             "output":[],"usage":null,"instructions":null,"tools":[],"tool_choice":"auto","parallel_tool_calls":true,
             "reasoning":{"effort":null,"summary":null},"text":{"format":{"type":"text"}},"store":p.store,

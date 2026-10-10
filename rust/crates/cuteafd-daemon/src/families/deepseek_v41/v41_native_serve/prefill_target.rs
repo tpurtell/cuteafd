@@ -15,7 +15,7 @@ pub(crate) fn exercise_prefill<'a, P: PrefillTarget<'a>, C: DraftChain<'a>>(
     tokens: &[u32], chunk_rows: usize, draft: Option<&mut DraftRuntime<'_, 'a, C>>,
 ) -> Result<u32> {
     let (events, _receive) = mpsc::unbounded_channel();
-    let job = NativeRequest { prompt: String::new(), constraint: None, images: Vec::new(), media: Vec::new(), audio: Vec::new(), max_tokens: 16, sampling: Default::default(), stop_token_ids: Vec::new(), events, probe: None };
+    let job = NativeRequest { prompt: String::new(), constraint: None, images: Vec::new(), media: Vec::new(), audio: Vec::new(), max_tokens: 16, sampling: Default::default(), stop_token_ids: Vec::new(), events, usage: None, probe: None };
     let [first_transport, second_transport] = transports;
     super::prefill(lib, runtime, pass, other, requests, first_transport, second_transport,
         lease, tokens, chunk_rows, &job, draft, &mut || Ok(()))?.select(None)

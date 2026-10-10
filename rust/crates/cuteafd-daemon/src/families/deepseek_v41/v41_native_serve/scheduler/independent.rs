@@ -233,6 +233,8 @@ async fn lane<'a, P: VerificationTarget<'a>, C: DraftChain<'a>>(lane: usize, lib
                 finish_copies(&mut active.borrow_mut(), &members, &copied, &inputs, &accepted_inputs);
                 let live = console::live();
                 let tally = console::Tally::new(proposal, &inputs, &accepted_inputs, &emissions, live);
+                { let active = active.borrow();
+                    tally.usage(members.iter().map(|&slot| active[slot].as_ref().and_then(|r| r.job.usage.as_ref()))); }
                 tracing::debug!(target: "cuteafd::lane_schedule", lane, round_id,
                     "independent verifier committed");
                 for (&slot, tokens) in members.iter().zip(emissions) {
@@ -307,6 +309,7 @@ async fn retire<'a, C: DraftChain<'a>>(lane: usize, request: Active<'a>, request
     if cacheable {
         let retained: Result<()> = async {
             let next = request.next_after_commit.as_ref().context("finished request has no retained logits")?;
+            prefixes.borrow_mut().capture_session(request.job.usage.as_ref().map(|u| u.session_id().to_owned()));
             let queued = prefixes.borrow_mut().queue_retain(lane, SnapshotKind::Turn, &request.tokens,
                 &request.image_keys, next, request.id, request.lease, &mut requests.borrow_mut(),
                 draft.borrow_mut().as_deref_mut())?;

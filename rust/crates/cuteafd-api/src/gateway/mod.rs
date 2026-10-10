@@ -62,14 +62,21 @@ impl Gateway {
     /// `turn.requested_model` must be set; `turn.model` is filled here.
     pub async fn run(self: &Arc<Self>, mut turn: TurnRequest) -> Result<TurnStream, GatewayError> {
         turn.model = self.models.resolve(&turn.requested_model)?;
-        driver::run(self.clone(), turn).await
+        let usage = turn.usage.clone();
+        if let Some(usage) = &usage { usage.served_model(&turn.model); }
+        let stream = driver::run(self.clone(), turn).await?;
+        Ok(driver::account_stream(stream, usage, false))
     }
 
     /// Prompt tokens for `turn` (exact when the backend can count).
     pub async fn count_tokens(self: &Arc<Self>, mut turn: TurnRequest) -> Result<u32, GatewayError> {
         turn.model = self.models.resolve(&turn.requested_model)?;
         if let Some(spec) = turn.hosted.web_search.take() { turn.tools.push(search::tool_spec(&spec)); }
-        self.backend.count_tokens(turn).await
+        let usage = turn.usage.clone();
+        if let Some(usage) = &usage { usage.served_model(&turn.model); }
+        let tokens = self.backend.count_tokens(turn).await?;
+        if let Some(usage) = usage { usage.tokens(tokens.into(), 0, 0, 0); }
+        Ok(tokens)
     }
 }
 

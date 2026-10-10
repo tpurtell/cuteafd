@@ -79,8 +79,9 @@ pub struct Hit {
 }
 
 /// Where a restored request came from.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Source {
+    pub session: Option<String>,
     pub kind: SnapshotKind,
     pub frontier: usize,
     /// Promoted from the host tier by this admission.
@@ -101,6 +102,7 @@ pub struct Admitted<P> {
 
 /// What travels with a host snapshot besides its device bytes.
 pub struct HostPayload {
+    pub session: Option<String>,
     pub after: After,
     pub media: Vec<MediaSpan>,
 }
@@ -158,6 +160,7 @@ pub struct PrefixCache<E: CopyEngine> {
     next_id: EntryId,
     /// Family copies were enqueued since the family last drained.
     dirty: bool,
+    capture_session: Option<String>,
     stats: PrefixStats,
 }
 
@@ -190,11 +193,15 @@ impl<E: CopyEngine> PrefixCache<E> {
             clock: 0,
             next_id: 0,
             dirty: false,
+            capture_session: None,
             stats: PrefixStats::default(),
             layout,
             config,
         })
     }
+
+    /// Set only immediately before a capture; provenance never retains request handles.
+    pub fn capture_session(&mut self, session: Option<String>) { self.capture_session = session; }
 
     pub fn enabled(&self) -> bool {
         self.config.entries > 0
@@ -409,7 +416,7 @@ impl<E: CopyEngine> PrefixCache<E> {
             placement,
             resume: hit.resume,
             after,
-            source: Some(Source { kind: hit.kind, frontier: hit.frontier, host: promoted, partial }),
+            source: Some(Source { session: self.entries[&hit.id].session.clone(), kind: hit.kind, frontier: hit.frontier, host: promoted, partial }),
         }))
     }
 
@@ -508,7 +515,7 @@ impl<E: CopyEngine> PrefixCache<E> {
         self.clock += 1;
         let id = self.next_id;
         self.next_id += 1;
-        self.entries.insert(id, Entry { tokens: tokens.to_vec(), media: snapshot_media(tokens.len(), media), kind, pages: fork.pages, mark, after,
+        self.entries.insert(id, Entry { session: self.capture_session.clone(), tokens: tokens.to_vec(), media: snapshot_media(tokens.len(), media), kind, pages: fork.pages, mark, after,
             last_use: self.clock, ticket: None });
         if let Some(evicted) = self.retained.bank_mut(kind).insert(tokens, id) {
             self.evict(family, evicted)?;
@@ -713,7 +720,7 @@ impl<E: CopyEngine> PrefixCache<E> {
             draft: None,
             scores: Vec::new(),
         };
-        let payload = HostPayload { after: entry.after.clone(), media: entry.media.clone() };
+        let payload = HostPayload { session: entry.session.clone(), after: entry.after.clone(), media: entry.media.clone() };
         let host = self.host.as_mut().expect("checked");
         let ticket = match host.store(&snapshot, payload) {
             StoreOutcome::Issued(ticket) | StoreOutcome::Deferred(ticket) => Some(ticket),
@@ -748,6 +755,7 @@ impl<E: CopyEngine> PrefixCache<E> {
         let snapshot_tokens = snapshot_tokens.to_vec();
         let after = payload.after.clone();
         let saved_media = payload.media.clone();
+        let session = payload.session.clone();
         let (resume, collision) = media_resume(self.layout.rule, tokens, media, &snapshot_tokens,
             &saved_media, &after, sampled);
         if resume == 0 {
@@ -823,7 +831,7 @@ impl<E: CopyEngine> PrefixCache<E> {
         self.clock += 1;
         let id = self.next_id;
         self.next_id += 1;
-        self.entries.insert(id, Entry { tokens: snapshot_tokens.clone(), media: saved_media, kind: hit.kind, pages, mark, after,
+        self.entries.insert(id, Entry { session, tokens: snapshot_tokens.clone(), media: saved_media, kind: hit.kind, pages, mark, after,
             last_use: self.clock, ticket: None });
         if let Some(evicted) = self.retained.bank_mut(hit.kind).insert(&snapshot_tokens, id) {
             self.evict(family, evicted)?;
