@@ -838,6 +838,7 @@ impl<'a> Engine<'a> {
                 self.gather_streams(lane, step.tables.rows)?;
             }
         }
+        self.prepare_route_checks(&lanes.iter().map(|l| l.tables.rows).collect::<Vec<_>>())?;
         let cap = if decode { self.decode_rows } else { self.prefill_rows };
         let rows_of = |lane: usize| Scalar::I32(lanes[lane].tables.rows as i32);
         // The head split's second GPU: its workspace of the same shape, the same tables,

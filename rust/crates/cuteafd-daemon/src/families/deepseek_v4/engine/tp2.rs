@@ -194,12 +194,33 @@ impl<'a> Engine<'a> {
         ], &[Scalar::I32(rows as i32)])
     }
 
+    pub(super) fn prepare_route_checks(&self, rows: &[usize]) -> Result<()> {
+        let Some(tp2) = &self.tp2 else { return Ok(()) };
+        if !tp2.checking.get() { return Ok(()); }
+        // cudaHostAlloc may synchronize. Allocate before queuing any peer waits,
+        // never from a layer whose matching push has not been enqueued yet.
+        let mut checks = tp2.checks.borrow_mut();
+        ensure!(checks.is_empty(), "previous route diagnostics did not drain");
+        for layer in tp2.layers.clone() {
+            for (lane, &rows) in rows.iter().enumerate() {
+                let bytes = rows * self.cfg.n_activated_experts * 8;
+                let ranks = [Some(self.on(0, || HostAllocation::new(self.library, bytes))?),
+                    Some(self.on(1, || HostAllocation::new(self.library, bytes))?)];
+                checks.insert((layer, lane), PendingCheck { rows, ranks });
+            }
+        }
+        Ok(())
+    }
+
     fn collect_routes(&self, rank: usize, layer: usize, lane: usize, rows: usize, w: &Workspace<'_>) -> Result<()> {
         let tp2 = self.tp2.as_ref().context("TP2 experts")?;
         if !tp2.checking.get() || self.capture_only.get() { return Ok(()); }
         self.on(rank, || {
             let bytes = rows * self.cfg.n_activated_experts * 4;
-            let host = HostAllocation::new(self.library, 2 * bytes)?;
+            let checks = tp2.checks.borrow();
+            let check = checks.get(&(layer, lane)).context("route diagnostic storage not prepared")?;
+            ensure!(check.rows == rows, "route-check rows changed");
+            let host = check.ranks[rank].as_ref().context("route diagnostic rank buffer")?;
             // SAFETY: pinned host storage is retained until both streams drain in finish_route_step.
             unsafe {
                 self.library.copy_d2h_host_buffer_async(host.buffer, w.route_ids.buffer, bytes, self.stream_of(rank))?;
@@ -207,10 +228,6 @@ impl<'a> Engine<'a> {
                     ptr: host.buffer.ptr.cast::<u8>().add(bytes).cast(), bytes, ..host.buffer
                 }, w.route_weights.buffer, bytes, self.stream_of(rank))?;
             }
-            let mut checks = tp2.checks.borrow_mut();
-            let check = checks.entry((layer, lane)).or_insert_with(|| PendingCheck { rows, ranks: [None, None] });
-            ensure!(check.rows == rows && check.ranks[rank].is_none(), "duplicate or inconsistent route-check unit");
-            check.ranks[rank] = Some(host);
             Ok(())
         })
     }
