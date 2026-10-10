@@ -1,9 +1,7 @@
 //! Select expert storage and execution from the checkpoint format at startup.
 use super::*;
-use crate::families::deepseek_v41::v41_experts::{
-    exl3::{worker::Exl3Worker, Exl3Weights},
-    ExpertExecution,
-};
+use crate::shared::experts::execution::ExpertExecution;
+use crate::shared::experts::exl3::{worker::Exl3Worker, Exl3Weights};
 use crate::shared::experts::fp8::{worker::Fp8Worker, Fp8Experts};
 use cuteafd_ffi::CuteafdDeviceBuffer;
 use cuteafd_loader::OfficialV41Catalog;

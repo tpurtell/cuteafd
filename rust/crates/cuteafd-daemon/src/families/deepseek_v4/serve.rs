@@ -13,7 +13,7 @@
 use super::pool::Placement;
 use super::prefix::Dsv4Prefix;
 use super::{with_engine, EngineArgs};
-use crate::families::deepseek_v41::v41_native_serve::prefix::CudaCopyEngine;
+use crate::shared::prefix::CudaCopyEngine;
 use crate::shared::prefix::{PrefixArgs, Toggle};
 use crate::shared::probe;
 use crate::shared::console;
@@ -502,7 +502,7 @@ fn schedule(
     let markers = crate::shared::prefix::marker_ids(&loaded.snapshot, &MESSAGE_STARTS)?;
     let mut states: Vec<usize> = (0..engine.shape.sequences).rev().collect();
     let mut grammars = crate::shared::constraints::Compiler::new(
-        &loaded.library, loaded.snapshot.join("tokenizer.json"));
+        &loaded.library, loaded.snapshot.join("tokenizer.json"), engine.cfg.vocab_size);
     let mut active: Vec<Active<'_>> = Vec::new();
     let (mut requests, mut generated_total) = (0u64, 0u64);
     let chunk_limit = engine.prefill_capacity().min(engine.max_context);

@@ -9,7 +9,7 @@ use std::path::Path;
 
 /// Family id, its serve command and its golden comparison (if any).
 pub(crate) const FAMILIES: &[(&str, &str, Option<&str>)] = &[
-    ("deepseek_v41", "serve-native", None),
+    ("deepseek_v41", "serve-native", Some("v41-golden")),
     ("deepseek_v4", "serve-dsv4", Some("dsv4-golden")),
     ("glm5", "serve-glm", Some("glm-golden")),
     ("glm5_flash", "serve-glmf", Some("glmf-golden")),
@@ -111,7 +111,7 @@ mod tests {
         assert_eq!(argv, ["cuteafd", "serve-glmf", "--snapshot", "/m", "--port", "9"]);
         let argv = argv_golden("qwen4");
         assert_eq!(argv[1], "qwen4-golden");
-        assert!(super::argv(Kind::Golden, args(Some("deepseek_v41"), &["--snapshot", "/m"])).is_err());
+        assert_eq!(argv_golden("deepseek_v41")[1], "v41-golden");
         assert!(super::argv(Kind::Serve, args(Some("nope"), &[])).is_err());
     }
 

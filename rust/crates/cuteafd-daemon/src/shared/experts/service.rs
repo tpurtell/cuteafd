@@ -2,7 +2,8 @@
 mod local;
 mod backend;
 
-use crate::families::deepseek_v41::v41_experts::{ExpertLayer, ExpertWeights, HostExpertExchange};
+use crate::shared::experts::execution::HostExpertExchange;
+use crate::shared::experts::layer::{ExpertLayer, ExpertWeights};
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::NativeLibrary;
 use cuteafd_loader::OfficialV41Catalog;
@@ -82,7 +83,7 @@ pub(crate) struct NativeExpertServiceConfig {
     pub exl3_aot_dir: Option<PathBuf>,
     /// Decode schedule of the EXL3 exports (`m<capacity>` or, for GB10,
     /// the GLM 5.3 Flash `m<capacity>-gb10` siblings; the same bits).
-    pub exl3_schedule: crate::families::deepseek_v41::v41_experts::exl3::execution::Exl3Schedule,
+    pub exl3_schedule: crate::shared::experts::exl3::execution::Exl3Schedule,
     /// FP8 package layout directory (default `<libdir>/fp8/fp8-<family>/tp<world>`).
     pub fp8_package: Option<PathBuf>,
     pub snapshot: PathBuf,
@@ -929,7 +930,7 @@ impl NativeExpertServiceConfig {
     /// location as fallback. An explicit --exl3-aot-dir is used verbatim.
     fn exl3_directory_for(&self, tiers: &[usize]) -> PathBuf {
         self.exl3_aot_dir.clone().unwrap_or_else(|| {
-            crate::families::deepseek_v41::v41_experts::exl3::aot_layout_directory(
+            crate::shared::experts::exl3::aot_layout_directory(
                 &self.library,
                 tiers,
                 &format!("tp{}-rank{}", self.world, self.rank),

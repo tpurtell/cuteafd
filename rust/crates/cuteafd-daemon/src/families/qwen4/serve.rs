@@ -27,7 +27,7 @@ use super::mtp_policy;
 use super::prefix::Qwen4Prefix;
 use super::speculate::{self, DraftSeq, DraftTiming, MtpSeq, Verified};
 use super::{open, Opened};
-use crate::families::deepseek_v41::v41_native_serve::prefix::CudaCopyEngine;
+use crate::shared::prefix::CudaCopyEngine;
 pub(crate) use crate::shared::prefix::{PrefixArgs, Toggle};
 use cuteafd_engine::media::{EmbeddingCache, MediaAdmission, MediaPoll, MediaReady, MediaWaiter};
 use crate::shared::probe;

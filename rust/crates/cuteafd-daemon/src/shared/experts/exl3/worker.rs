@@ -4,7 +4,7 @@ use super::{
     execution::{Exl3Execution, Exl3InputFormat, Exl3RowPolicy, Exl3Schedule, Exl3Workspace},
     Exl3Weights,
 };
-use crate::families::deepseek_v41::v41_experts::HostExpertExchange;
+use crate::shared::experts::execution::HostExpertExchange;
 use crate::shared::memory::{DeviceAllocation, HostAllocation, LoadStream};
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::{CuteafdDeviceBuffer, CuteafdHostBuffer, NativeLibrary};

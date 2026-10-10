@@ -18,7 +18,7 @@ use super::dflash::{ContextRow, DraftSeq, TAP_ROWS};
 use super::dflash_policy::{self, DraftHistory, Shape};
 use super::engine::{GlmEngine, GlmPlacement, DECODE_ROWS};
 use super::prefix::GlmPrefix;
-use crate::families::deepseek_v41::v41_native_serve::prefix::CudaCopyEngine;
+use crate::shared::prefix::CudaCopyEngine;
 use crate::shared::prefix::{PrefixArgs, Toggle};
 use crate::shared::probe;
 use cuteafd_engine::prefix::{After, PointPlan, PointPolicy, PrefixCache, PrefixConfig, PrefixFamily, SnapshotKind};

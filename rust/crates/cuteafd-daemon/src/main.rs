@@ -149,7 +149,7 @@ async fn main() -> Result<()> {
     } else if let Some(gib) = coordinator_budget_gib {
         anyhow::ensure!(matches!(&command, Commands::ServeNative(_) | Commands::ServeMimo(_)
             | Commands::ServeQwen4(_) | Commands::ServeGlmf(_) | Commands::ServeGlm(_)
-            | Commands::ServeDsv4(_) | Commands::Dsv4Golden(_) | Commands::GlmGolden(_)
+            | Commands::ServeDsv4(_) | Commands::V41Golden(_) | Commands::Dsv4Golden(_) | Commands::GlmGolden(_)
             | Commands::MimoGolden(_) | Commands::GlmfGolden(_) | Commands::Qwen4Golden(_)),
             "--coordinator-gpu-budget-gib applies only to coordinator serve/golden and plan commands");
         let budget = cuteafd_core::serving_capacity::GpuMemoryBudget::from_gib(gib)?;
@@ -172,6 +172,7 @@ async fn main() -> Result<()> {
         Commands::Doctor(args) => run_doctor(args),
         Commands::Plan(args) => run_plan(args),
         Commands::ExpertProbe(args) => run_expert_probe(args).await,
+        Commands::V41Golden(args) => families::deepseek_v41::v41_golden::run_golden(args).await,
         Commands::Dsv4Golden(args) => families::deepseek_v4::run_golden(args).await,
         Commands::GlmGolden(args) => families::glm5::run_golden(args).await,
         Commands::MimoGolden(args) => families::mimo_v2::run_golden(args).await,
