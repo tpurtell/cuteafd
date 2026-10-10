@@ -40,8 +40,9 @@ pub(crate) struct EngineArgs {
     /// Split every backbone layer's attention heads (w_q rows, sinks, wo
     /// groups) and shared expert over --device and this second GPU; mHC, the
     /// latent projection, compressors, indexer and caches are replicated, the
-    /// partial sums meet over peer memory. Router, head and drafter stay on --device; whole routed-expert
-    /// layers fill both GPUs after reserving their KV pools.
+    /// partial sums meet over peer memory. Routers are replicated; head and
+    /// drafter stay on --device. Routed-expert TP2 halves fill both GPUs after
+    /// reserving their KV pools.
     #[arg(long)]
     pub split_device: Option<i32>,
     /// Optional expert-input quantizer SM ceiling (default: this device's SM count).
@@ -484,13 +485,25 @@ pub(crate) fn with_engine<T>(
 }
 
 fn golden(args: GoldenArgs) -> Result<()> {
+    let started = Instant::now();
     let loaded = load(&args.engine)?;
     let cfg = loaded.cfg.clone();
-    with_engine(&loaded, &args.engine, None, |_| Ok(0), |engine, transports, runtime| match args.token_check {
-        Some(steps) => token_check(&args, &loaded, engine, transports, runtime, steps),
-        None if !args.resume_at.is_empty() => resume(&args, engine, transports, runtime),
-        None if args.nll => nll_run(&args, &cfg, engine, transports, runtime),
-        None => golden_run(&args, &cfg, engine, transports, runtime),
+    with_engine(&loaded, &args.engine, None, |_| Ok(0), |engine, transports, runtime| {
+        let before = engine.graph_capture_counts();
+        println!("golden ready: {:.3} s | graph captures {} | TP2 expert graph captures {}",
+            started.elapsed().as_secs_f64(), before.0, before.1);
+        let result = match args.token_check {
+            Some(steps) => token_check(&args, &loaded, engine, transports, runtime, steps),
+            None if !args.resume_at.is_empty() => resume(&args, engine, transports, runtime),
+            None if args.nll => nll_run(&args, &cfg, engine, transports, runtime),
+            None => golden_run(&args, &cfg, engine, transports, runtime),
+        };
+        let after = engine.graph_capture_counts();
+        println!("golden post-ready captures: all {} | TP2 experts {}", after.0 - before.0, after.1 - before.1);
+        for setting in cuteafd_bench::context::get().settings.into_iter().filter(|s| s.name.starts_with("route-")) {
+            println!("golden {}: {}", setting.name, setting.value.unwrap_or_default());
+        }
+        result
     })
 }
 
