@@ -1972,8 +1972,20 @@ release cards:
   reference for every ds41rt stage (`S0`–`S6`) and for `P12`, beside the
   shipped min (1× RTX + 3) and max (2× RTX + 4) cards.
 
-The draft-policy steps (`D2`, `D3`, `D4`) gate on the three GLM Flash edge
-cards as well as min/max. The placement steps (`P1`–`P12`) and ds41rt stages
+The draft-policy steps (`D2`, `D3`, `D4`) gate on the GLM Flash edge cards
+as well as min/max.
+- GLM Flash today runs all-local or all-Spark experts per process
+  (`--peers` conflicts with `--local-experts`).
+  - The **all-Spark** card: min/max as shipped.
+  - The **all-local** card: one RTX with `--local-experts`, K3.25 at a
+    reduced pool.
+
+  Both run now and gate `D2`.
+- The **mixed, about half onboarded** card needs a per-layer expert backend
+  (local fp8moe/EXL3 layers plus Spark layers in one process). That is
+  `P6`/`P7` placement work, and it gates `D3`/`D4` once it lands.
+- The **2× RTX no-Spark** card needs TP2 RTX experts (`P6`). It joins the
+  set then. The placement steps (`P1`–`P12`) and ds41rt stages
 gate on the cards their family touches.
 
 **Dropped or flagged (review 2026-10-09):**
