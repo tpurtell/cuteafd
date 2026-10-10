@@ -2767,6 +2767,37 @@ one definition:
 This replaces the 2M constants in `memory_report.rs` (`measured_pool_tokens`,
 `planned_pool_tokens`) and Qwen's admission.
 
+**Two ways to fix the plan (TJ, 2026-10-10).** By default the KV pool is the
+fixed definition: reserve the pool target, then place expert layers in what
+is left. The solver also takes the inverse, for comparison benchmarking and
+the edge cards:
+- `PlacementRequest.onboard: Onboard::{Auto, Layers(n), Fraction(f)}`
+  (`RTX_EXPERT_LAYERS=auto|N|N%`, `--rtx-expert-layers`). `Auto` is today's
+  pool-first rule.
+- `Layers(n)`/`Fraction(f)` fixes how many routed-expert layers are
+  resident on the RTX cards. TP2 halves count as one layer. The solver then
+  fills every remaining byte with KV, so the pool is the output, not the
+  input.
+  - The pool is still clamped to the compiled extent and rounded to
+    `unit_rows`.
+  - Below the floor it is a refusal that names the shortfall, the same as
+    any no-fit.
+  - Concurrency follows the admitted pool unless pinned.
+- Which layers go local is the solver's choice: by `ExpertCost` per byte of
+  Spark traffic saved, ties going to the deepest layers. Pin them explicitly
+  with `RTX_EXPERT_LAYER_LIST` when a benchmark needs the exact set.
+- `0` means every expert on the Sparks; `all` (or `100%`) means Spark-free
+  where it fits.
+- The planner (`cuteafd plan --layout --rtx-expert-layers N`) and the runtime
+  resolve the same request. The equality test covers a fixed-onboard case for
+  each family that has local experts.
+- Cards record the resolved `onboard` and pool in their configuration panel,
+  so two benchmarks at different onboard points compare like for like.
+- One launcher key replaces today's V4-only `RTX_EXPERT_LAYERS`. It lands with
+  `P1` for V4 and with each family's solver port (`P6` GLM Flash, `P8` MiMo,
+  `P10` Qwen, `P12` V4.1). The GLM Flash edge cards need it at `D2`, so `P6`
+  or a minimal GLM Flash `Layers(n)` path lands first.
+
 **KV record format** is a per-family input: `KvDemand.format`, with bytes from
 `FamilyModel::cache_geometry(CacheOptions { .. })`. Qwen FP8 KV (v3 item 5)
 adds `CacheOptions.qwen_kv: Qwen4KvCache::{Bf16, Fp8}` and its bytes formula.
