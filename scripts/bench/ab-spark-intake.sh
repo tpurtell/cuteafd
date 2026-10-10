@@ -39,7 +39,7 @@ python3 "$repo/scripts/build/assert-build-filesystem.py" "$OUT"
 # Release coordinator families (p7's set; see build.sh --help).
 export CUTEAFD_RELEASE_DSV4_AOT=ON CUTEAFD_RELEASE_GLM_AOT=ON CUTEAFD_RELEASE_GLMF_AOT=ON
 export CUTEAFD_RELEASE_MIMO_AOT=ON CUTEAFD_RELEASE_QWEN4_AOT=ON CUTEAFD_RELEASE_MIMO_GEOMETRIES=mimo,mimo2,mimop,mimop2
-export CUTEAFD_RELEASE_EXPERT_FAMILIES="${CUTEAFD_RELEASE_EXPERT_FAMILIES:-dsv4f:spark;dsv4f:rtx_backbone;dsv4p:exl3-k23;glm:exl3-k45;glm:fp8;glmf:exl3-k34;mimo:fp8;mimop:fp8;qwen4:exl3-k45}"
+export CUTEAFD_RELEASE_EXPERT_FAMILIES="${CUTEAFD_RELEASE_EXPERT_FAMILIES:-dsv4f:spark;dsv4f:rtx_backbone;dsv4f:rtx_tp2;dsv4p:rtx_tp2;dsv4p:exl3-k23;glm:exl3-k45;glm:fp8;glmf:exl3-k34;mimo:fp8;mimop:fp8;qwen4:exl3-k45}"
 
 clone() { # clone NAME REV: standalone clone (build containers cannot see worktree gitdirs)
   local dir="$OUT/src-$1" rev="$2" sub name

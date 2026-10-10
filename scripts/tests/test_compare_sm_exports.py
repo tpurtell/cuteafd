@@ -172,6 +172,12 @@ def test_catalog_includes_all_geometries_and_fused_suspects():
     assert all("--only" in args for _, _, args in compare_sm.jobs("suspects"))
     expert_args = next(args for name, _, args in jobs if name == "v41-experts")
     assert expert_args[expert_args.index("--input-format") + 1] == "bf16"
+    for family in ("dsv4f", "dsv4p"):
+        for suffix, role in (("", "rtx_backbone"), ("-rtx_tp2", "rtx_tp2")):
+            args = next(args for name, _, args in jobs if name == f"{family}-slices{suffix}")
+            assert args[args.index("--geometry") + 1] == family
+            assert args[args.index("--role") + 1] == role
+            assert args[args.index("--atomic-min-capacity") + 1] == "256"
 
 
 def test_offline_exporters_do_not_initialize_or_allocate_cuda():

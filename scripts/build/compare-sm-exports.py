@@ -61,10 +61,12 @@ def jobs(scope):
     result.extend((geometry, "export_b12x_dsv4_aot.py", ["--geometry", geometry])
                   for geometry in GEOMETRIES)
     for family in ("dsv4f", "dsv4p"):
-        result.append((f"{family}-slices", "export_b12x_slices_aot.py",
-                       ["--geometry", family, "--role", "rtx_backbone", "--rows", CAPACITIES,
-                        "--width", "1:64,16:128,80:128,256:128,1024:128,4096:128",
-                        "--atomic-min-capacity", "256", "--standard-names"]))
+        for role in ("rtx_backbone", "rtx_tp2"):
+            name = f"{family}-slices" + ("-rtx_tp2" if role == "rtx_tp2" else "")
+            result.append((name, "export_b12x_slices_aot.py",
+                           ["--geometry", family, "--role", role, "--rows", CAPACITIES,
+                            "--width", "1:64,16:128,80:128,256:128,1024:128,4096:128",
+                            "--atomic-min-capacity", "256", "--standard-names"]))
     result.extend([
         ("v41-fp8", "export_b12x_v41_fp8_aot.py", ["--rows", CAPACITIES]),
         ("v41-experts", "export_b12x_v41_experts_aot.py",
