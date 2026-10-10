@@ -4,7 +4,7 @@ pub use expert_geometry::{expert_geometry, set_expert_geometry, ExpertGeometry};
 mod draft_policy;
 pub use draft_policy::{
     draft_expected_tokens, DraftCandidate, DraftCostSnapshot, DraftPolicy, DraftPolicyError, DraftPolicyStats,
-    DraftRoundObservation, DraftSelection, LayerResource, ObservedDraftRequest, PolicyGeometry, ResourceClass,
+    DraftRoundObservation, DraftSelection, LayerResource, ObservedDraftRequest, PolicyGeometry, PolicySeed, ResourceClass,
     MAX_RESOURCE_CLASSES,
 };
 mod dspark_rng;

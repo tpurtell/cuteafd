@@ -42,11 +42,13 @@ pub(crate) fn code_batch(client: &crate::client::Client, width: usize, tokens: u
 
 pub struct DecodeContent;
 pub struct Concurrency;
+pub struct DraftMix;
 pub struct Prefill;
 pub struct Retained;
 pub struct PrefixCache;
 pub static DECODE_CONTENT: DecodeContent = DecodeContent;
 pub static CONCURRENCY: Concurrency = Concurrency;
+pub static DRAFT_MIX: DraftMix = DraftMix;
 pub static PREFILL: Prefill = Prefill;
 pub static RETAINED: Retained = Retained;
 pub static PREFIX_CACHE: PrefixCache = PrefixCache;
@@ -122,6 +124,68 @@ impl Panel for Concurrency {
             p["per_request_tok_s"].clone(), json!(p["ttft_s"].as_f64().unwrap_or(0.0) * 1e3), p["errors"].clone()]).collect();
         Ok(json!({"points": points, "table": table(&["concurrency", "aggregate tok/s", "per request tok/s", "TTFT ms",
             "errors"], rows)}))
+    }
+}
+
+/// The fixture module a copy-heavy request rewrites.
+const REWRITE_SOURCE: &str = "ledger/money.py";
+const MIX_TOKENS: u64 = 256;
+
+/// Server totals of verification rounds and output tokens (cumulative).
+fn round_counters(client: &crate::client::Client) -> Option<(f64, f64)> {
+    let stats = client.stats().ok()?;
+    let t = &stats["totals"];
+    Some((t["verification_rounds"].as_f64()?, t["output_tokens"].as_f64()?))
+}
+
+impl Panel for DraftMix {
+    fn id(&self) -> &'static str { "draft_mix" }
+    fn title(&self) -> &'static str { "Draft mix" }
+    fn description(&self) -> &'static str {
+        "C16 aggregate decode tok/s on heterogeneous prompts (the eight content kinds, two waves), and C1 decode \
+         tok/s and tokens per verification round rewriting a fixture module (copy-heavy), thinking off."
+    }
+    fn estimate_s(&self, rates: &Rates, _info: &ServerInfo) -> f64 {
+        2.0 * rates.seconds(120.0 * 16.0, MIX_TOKENS as f64) * 2.3 + 2.0 * rates.seconds(1500.0, 1200.0)
+    }
+    fn run(&self, ctx: &Ctx<'_>) -> Result<Value> {
+        let width = common::concurrency(ctx.info).clamp(1, 16);
+        let mut waves = Vec::new();
+        for wave_index in 0..2 {
+            ctx.progress.step(0.4 * wave_index as f64, format!("C{width} mixed, wave {}", wave_index + 1));
+            let bodies = (0..width).map(|i| plain(&format!("[{}] {}", nonce(), CONTENT[(i + wave_index) % CONTENT.len()].1),
+                MIX_TOKENS)).collect();
+            let results = wave(ctx.client, bodies);
+            let errors = results.iter().filter(|r| r.is_err()).count();
+            let ok: Vec<_> = results.into_iter().filter_map(Result::ok).collect();
+            let mut per: Vec<f64> = ok.iter().map(|r| r.chat.timing.decode_tok_s()).collect();
+            waves.push(json!({"c": width, "aggregate_tok_s": aggregate(&ok), "per_request_tok_s": common::median(&mut per),
+                "errors": errors}));
+            ctx.progress.partial(json!({"waves": waves}));
+        }
+        let source = crate::panels::agentic::fixture(REWRITE_SOURCE).context("rewrite fixture missing")?;
+        let mut rewrites = Vec::new();
+        for pass in 0..2 {
+            ctx.progress.step(0.8 + 0.1 * pass as f64, format!("rewrite {}", pass + 1));
+            let prompt = format!("[{}] Rewrite this Python module exactly as it is, adding a one-line comment \
+                `# reviewed` at the very top and changing nothing else. Output only the code.\n\n```python\n{source}```",
+                nonce());
+            let before = round_counters(ctx.client);
+            let drafts = common::draft_counters(ctx.client);
+            let chat = ctx.client.chat(plain(&prompt, 1600u64.min(ctx.max_output)), None).context("rewrite decode")?;
+            let after = round_counters(ctx.client);
+            let per_round = before.zip(after).and_then(|((r0, t0), (r1, t1))| (r1 > r0).then(|| (t1 - t0) / (r1 - r0)));
+            rewrites.push(json!({"tok_s": chat.timing.decode_tok_s(), "tokens": chat.timing.completion_tokens,
+                "tokens_per_round": per_round,
+                "acceptance": common::acceptance(drafts, common::draft_counters(ctx.client))}));
+            ctx.progress.partial(json!({"waves": waves, "rewrite": rewrites}));
+        }
+        let mut rows: Vec<Vec<Value>> = waves.iter().enumerate().map(|(i, w)| vec![json!(format!("C{} mixed {}", w["c"], i + 1)),
+            w["aggregate_tok_s"].clone(), w["per_request_tok_s"].clone(), Value::Null]).collect();
+        rows.extend(rewrites.iter().enumerate().map(|(i, r)| vec![json!(format!("C1 rewrite {}", i + 1)), r["tok_s"].clone(),
+            r["tok_s"].clone(), r["tokens_per_round"].clone()]));
+        Ok(json!({"waves": waves, "rewrite": rewrites,
+            "table": table(&["workload", "aggregate tok/s", "per request tok/s", "tokens/round"], rows)}))
     }
 }
 
