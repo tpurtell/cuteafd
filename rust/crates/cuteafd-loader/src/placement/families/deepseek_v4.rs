@@ -220,11 +220,10 @@ pub fn code_bytes(dim: usize, experts: &str, gpus: usize) -> Vec<u64> {
         .collect()
 }
 
-/// Resolve V4's default: pool first on two RTX and on single-RTX Flash.
-/// Single-RTX Pro keeps experts first; explicit onboard modes remain supported.
-pub fn default_onboard(dim: usize, gpus: usize) -> Onboard {
-    if gpus == 2 || dim == 4096 { Onboard::Auto }
-    else { Onboard::ExpertsFirst { pool_floor: crate::placement::EXPERTS_FIRST_POOL_FLOOR } }
+/// V4 defaults uniformly to pool-first placement. Explicit `max` remains
+/// supported; on two RTX every resident backbone expert is a TP2 half.
+pub fn default_onboard() -> Onboard {
+    Onboard::Auto
 }
 
 #[cfg(test)]
@@ -232,14 +231,8 @@ mod default_tests {
     use super::*;
 
     #[test]
-    fn default_onboard_preserves_single_rtx_and_uses_tp2_pool_first() {
-        assert_eq!(default_onboard(4096, 1), Onboard::Auto);
-        assert_eq!(default_onboard(7168, 1), Onboard::ExpertsFirst {
-            pool_floor: crate::placement::EXPERTS_FIRST_POOL_FLOOR,
-        });
-        for dim in [4096, 7168] {
-            assert_eq!(default_onboard(dim, 2), Onboard::Auto);
-        }
+    fn default_onboard_is_pool_first_for_every_v4_layout() {
+        assert_eq!(default_onboard(), Onboard::Auto);
     }
 }
 

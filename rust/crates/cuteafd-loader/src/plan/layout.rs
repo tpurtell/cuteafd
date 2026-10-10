@@ -1453,7 +1453,7 @@ fn deepseek_v4_placement(report: &PlanReport, checkpoint: &super::Checkpoint,
     let onboard = match (options.onboard, options.local_expert_layers) {
         (Some(onboard), _) => onboard,
         (None, Some(n)) => Onboard::Layers(n.saturating_sub(routed.first_layer)),
-        (None, None) => v4::default_onboard(cfg.dim, devices.len()),
+        (None, None) => v4::default_onboard(),
     };
     let tp2_workspace = if devices.len() == 2 && onboard.layers(routed.layers - routed.first_layer) != Some(0) {
         crate::serving_capacity::deepseek_v4_tp2_workspace(&catalog, options.workspace_manifest.as_deref(),

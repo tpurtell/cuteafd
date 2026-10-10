@@ -32,6 +32,12 @@ fn request(gpus: usize, free: u64, layers: usize, sparks: usize, onboard: Onboar
 }
 
 #[test]
+fn v4_defaults_to_pool_first_and_retains_explicit_max() {
+    assert_eq!(families::deepseek_v4::default_onboard(), Onboard::Auto);
+    assert_eq!("max".parse::<Onboard>(), Ok(Onboard::ExpertsFirst { pool_floor: EXPERTS_FIRST_POOL_FLOOR }));
+}
+
+#[test]
 fn pool_precedes_contiguous_layers_on_both_gpus() {
     // 2M tokens = 8192 units x 4 MiB = 32 GiB per GPU.
     let placement = solve(&request(2, 44 * GIB, 60, 4, Onboard::Auto)).unwrap();
