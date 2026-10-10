@@ -116,11 +116,26 @@ pub fn solve(request: &PlacementRequest) -> Result<Placement, PlacementError> {
                 solve(&trial).is_ok()
             };
             let (mut lo, mut hi) = (0usize, routed);
-            if !fits(0) { return Err(match request.pool.requested {
-                Some(requested) => PlacementError::PoolDoesNotFit { requested, fit: 0 },
-                None => PlacementError::Mandatory { gpu: 0,
-                    what: format!("a {floor}-token pool beside {}", describe(&request.fixed, 0, &movables)) },
-            }); }
+            if !fits(0) {
+                // With Sparks an automatic pool may fall short of the context: no RTX layers and
+                // the largest pool above v2's floor, the serving context clamped to it (v2 served
+                // a 31.8 GiB V4 Flash card at 905K tokens).
+                let fallback = request.pool.requested.is_none() && !spark_free && pool_floor < floor && {
+                    let mut trial = request.clone();
+                    trial.onboard = Onboard::Layers(0);
+                    trial.pool.floor = pool_floor;
+                    solve(&trial).is_ok()
+                };
+                if !fallback { return Err(match request.pool.requested {
+                    Some(requested) => PlacementError::PoolDoesNotFit { requested, fit: 0 },
+                    None => PlacementError::Mandatory { gpu: 0,
+                        what: format!("a {floor}-token pool beside {}", describe(&request.fixed, 0, &movables)) },
+                }); }
+                let mut trial = request.clone();
+                trial.onboard = Onboard::Layers(0);
+                trial.pool.floor = pool_floor;
+                return solve(&trial);
+            }
             while lo < hi {
                 let mid = (lo + hi + 1) / 2;
                 if fits(mid) { lo = mid } else { hi = mid - 1 }

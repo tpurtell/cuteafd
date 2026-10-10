@@ -13,10 +13,8 @@ pub struct PoolPolicy {
     pub requested: Option<u64>,
     /// Automatic pools stop here.
     pub target: u64,
-    /// The smallest pool admission accepts. Spark-free layouts need the
-    /// compiled context and the agentic floor; automatic pools with Sparks
-    /// only the agentic floor (or less context), the serving context then
-    /// clamped to the pool (v2: a 31.8 GiB V4 Flash served a 905K pool).
+    /// Spark-free layouts fail below this; pools with Sparks may go lower
+    /// (the serving context is then clamped to the pool).
     pub floor: u64,
     /// The largest pool the build can index; a fixed onboard fills up to it.
     pub ceiling: u64,
@@ -36,7 +34,7 @@ impl PoolPolicy {
         let floor = match requested.filter(|&n| n > 0) {
             Some(n) => n,
             None if spark_free => context.max(AGENTIC_FLOOR_TOKENS),
-            None => context.min(AGENTIC_FLOOR_TOKENS),
+            None => context,
         };
         Self { requested: requested.filter(|&n| n > 0), target, floor, ceiling: u64::MAX, unit_rows }
     }
@@ -64,8 +62,6 @@ mod tests {
         assert_eq!((explicit.requested, explicit.floor), (Some(32_768), 32_768));
         assert_eq!(PoolPolicy::resolve(&[96 * gib], 131_072, Some(0), 256, true).floor, AGENTIC_FLOOR_TOKENS);
         assert_eq!(PoolPolicy::resolve(&[96 * gib], 131_072, Some(0), 256, true).requested, None);
-        // With Sparks an automatic pool may fall short of the context (which serving clamps to it).
-        assert_eq!(PoolPolicy::resolve(&[32 * gib], 1 << 20, None, 256, false).floor, AGENTIC_FLOOR_TOKENS);
-        assert_eq!(PoolPolicy::resolve(&[96 * gib], 131_072, None, 256, false).floor, 131_072);
+
     }
 }

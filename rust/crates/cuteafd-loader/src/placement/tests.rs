@@ -283,3 +283,21 @@ fn executors_refuse_modes_they_cannot_run_at_plan_time() {
     assert!(families::DEEPSEEK_V41.runs(W1) && !families::QWEN4.runs(LayerMode::HeadSplit));
     assert_eq!(families::executor("glm5_flash").map(|e| e.hops), Some(false));
 }
+
+#[test]
+fn experts_first_falls_back_to_a_spark_pool_below_the_context() {
+    // A card that cannot hold the 1M context's pool even without RTX layers: v2 served it with no
+    // RTX layers and the largest pool above 262K (the context clamped to it).
+    let mut small = request(1, 8 * GIB, 60, 2, Onboard::ExpertsFirst { pool_floor: EXPERTS_FIRST_POOL_FLOOR });
+    small.pool = PoolPolicy::resolve(&[32 * GIB], 1 << 20, None, 256, false);
+    let placement = solve(&small).unwrap();
+    assert_eq!(placement.onboard_layers, 0);
+    assert!((EXPERTS_FIRST_POOL_FLOOR..1 << 20).contains(&placement.pool_tokens), "{}", placement.pool_tokens);
+    // Below v2's floor it is still a refusal.
+    small.inventory.gpus[0].baseline = Baseline::Measured { free_bytes: 3 * GIB };
+    assert!(solve(&small).is_err());
+    // Spark-free layouts never fall back.
+    let mut spark_free = request(1, 8 * GIB, 60, 0, Onboard::ExpertsFirst { pool_floor: EXPERTS_FIRST_POOL_FLOOR });
+    spark_free.pool = PoolPolicy::resolve(&[32 * GIB], 1 << 20, None, 256, true);
+    assert!(solve(&spark_free).is_err());
+}
