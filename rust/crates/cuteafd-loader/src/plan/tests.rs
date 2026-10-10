@@ -1466,7 +1466,11 @@ fn mimo_concurrency_default_is_small_card_only_and_overridable() {
         let overridden = plan(dir.path(), &options).unwrap().memory_layout.unwrap();
         let state = |layout: &cuteafd_core::memory_layout::MemoryLayout| layout.devices[0].items.iter()
             .find(|item| item.group == "state").unwrap().bytes;
-        assert_ne!(state(&automatic), state(&overridden));
+        // Both concurrency limits fit the same sixteen physical target rings.
+        assert_eq!(state(&automatic), state(&overridden));
+        options.layout.as_mut().unwrap().mimo_rings = 32;
+        let more_rings = plan(dir.path(), &options).unwrap().memory_layout.unwrap();
+        assert!(state(&more_rings) > state(&automatic));
     }
 }
 
@@ -1813,7 +1817,7 @@ fn encoder_plan_g9_charges_before_pool_and_hashes_off() {
     let memory = local.memory_layout.as_ref().unwrap();
     let tower = memory.devices[0].items.iter().position(|i| i.group == "vision tower").unwrap();
     let pool = memory.devices[0].items.iter().position(|i| i.group == "records").unwrap();
-    assert!(tower < pool);
+    assert!(tower < pool, "{:?}", memory.devices[0].items);
     let off = plan(dir.path(), &PlanOptions { vision: MediaMode::Off, ..options }).unwrap();
     assert_eq!(off.encoder.as_ref().unwrap().admitted_bytes(),0);
     assert_eq!(off.components.iter().find(|c| c.component == Component::Vision).unwrap().bytes,0);

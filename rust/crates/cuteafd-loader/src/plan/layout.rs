@@ -13,6 +13,7 @@ use cuteafd_core::memory_layout::{size_pool, Basis, Category, DeviceKind, Device
 
 mod deepseek_v4;
 mod v41;
+mod mimo;
 
 const GIB: u64 = 1 << 30;
 const MIB: u64 = 1 << 20;
@@ -92,6 +93,14 @@ pub struct LayoutOptions {
     pub draft_sequences: u64,
     /// Explicit MiMo DFlash context arena; does not widen its draft batch.
     pub draft_context_slots: Option<u64>,
+    /// MiMo segmented decode graphs (runtime default: off).
+    pub mimo_decode_graphs: bool,
+    /// Physical SM count for scratch when simulating a smaller memory budget.
+    pub physical_sms: Option<u32>,
+    /// MiMo bundled drafter representation; launch cards select single-copy FP8.
+    pub mimo_draft_bf16: bool,
+    /// Native local expert package manifest, required to qualify its scratch.
+    pub mimo_expert_manifest: Option<std::path::PathBuf>,
     /// Compiled context extent (RoPE and index workspaces).
     pub context_tokens: u64,
     /// Resident native drafter stages (zero disables optional native MTP).
@@ -143,6 +152,10 @@ impl Default for LayoutOptions {
             mimo_rings: 16,
             draft_sequences: 4,
             draft_context_slots: None,
+            mimo_decode_graphs: false,
+            physical_sms: None,
+            mimo_draft_bf16: false,
+            mimo_expert_manifest: None,
             context_tokens: 0,
             native_mtp_layers: 3,
             local_expert_layers: None,
@@ -305,13 +318,14 @@ pub fn family_costs(family: &str) -> FamilyCosts {
             spark_ring_bytes: gib(231),
             ..generic
         },
-        // MiMo V2.6 Pro + embedded DFlash (qualified FP8 bundle); MTP unused.
+        // Coordinator inventory comes from MiMo's shared admission contract.
+        // Spark-side allowances remain separate from this coordinator port.
         "mimo_v2" => FamilyCosts {
-            runtime_bytes: [gib(100), gib(111), gib(100)],
-            graph_bytes: [gib(50), gib(50), gib(50)],
-            workspace_bytes: [gib(290), gib(249), gib(120)],
-            exchange_bytes: gib(38),
-            drafter_bytes: gib(321),
+            runtime_bytes: [0; 3],
+            graph_bytes: [0; 3],
+            workspace_bytes: [0; 3],
+            exchange_bytes: 0,
+            drafter_bytes: 0,
             mark_slots: 42,
             mtp_resident: false,
             spark_workspace_bytes: gib(51),
@@ -640,7 +654,7 @@ pub fn layout(report: &mut PlanReport, model: &dyn super::FamilyModel, checkpoin
     }
     // The drafter lives on the lead GPU (taps and head are there under a head split).
     let drafter = if options.drafter_bytes > 0 { options.drafter_bytes } else { costs.drafter_bytes };
-    if drafter > 0 {
+    if drafter > 0 && family != "mimo_v2" {
         devices[0].items.push(Item::new(Category::Drafter, "drafter", "", drafter, allowance_basis));
     }
 
@@ -703,7 +717,7 @@ pub fn layout(report: &mut PlanReport, model: &dyn super::FamilyModel, checkpoin
     let gpus_now = active_gpus;
     for (index, device) in devices.iter_mut().take(active_gpus).enumerate() {
         let role = if gpus_now == 1 { 0 } else if index == 0 { 1 } else { 2 };
-        device.items.push(match program_families(family, model, split) {
+        device.items.push(match program_families(family, model, split, checkpoint) {
             // Measured inventory: the arch's CUDA context and cuBLAS (`placement::ArchContext`), plus the
             // modules of the programs this family launches (`ProgramSet`), what the runtime's sample sees
             // before its first weight.
@@ -714,7 +728,7 @@ pub fn layout(report: &mut PlanReport, model: &dyn super::FamilyModel, checkpoin
         // V4's graphs, workspaces, exchange slots, reserve, KV and experts come
         // from the shared placement solver below; Qwen's from its shared
         // admission (`serving_capacity::qwen_graphs::qwen_admission`).
-        if family == "deepseek_v4" || family == "qwen4" { continue; }
+        if matches!(family, "deepseek_v4" | "qwen4" | "mimo_v2") { continue; }
         let graph_allowance = if family == "deepseek_v41" && options.rtx_bytes[index] <= 32 * GIB {
             // Match the qualified fixed-bank envelope reserved by measured_pool_memory.
             2 * GIB
@@ -924,7 +938,7 @@ pub fn layout(report: &mut PlanReport, model: &dyn super::FamilyModel, checkpoin
         }
     }
     // KV pool: per-device bytes per logical token from the family geometry.
-    let geometry = if matches!(family, "deepseek_v4" | "qwen4") { Ok(None) } else { model.cache_geometry(CacheOptions { coordinator_ranks: active_gpus,
+    let geometry = if matches!(family, "deepseek_v4" | "qwen4" | "mimo_v2") { Ok(None) } else { model.cache_geometry(CacheOptions { coordinator_ranks: active_gpus,
         native_mtp_layers: if family == "deepseek_v4" || family == "qwen4" { cache_native_layers } else { 0 },
         prefill_rows: prefill_rows, glmf_decode_rows,
         glmf_index: if split { crate::serving_capacity::GlmfIndexCache::Keys } else { options.glmf_index },
@@ -1049,9 +1063,38 @@ pub fn layout(report: &mut PlanReport, model: &dyn super::FamilyModel, checkpoin
                     bytes: per_token.get(1).copied().unwrap_or(0) * pool_tokens });
             }
         }
-        Ok(None) if matches!(family, "deepseek_v4" | "qwen4") => {}
+        Ok(None) if matches!(family, "deepseek_v4" | "qwen4" | "mimo_v2") => {}
         Ok(None) => notes.push(format!("{family}: no cache geometry in the planner yet (engine sizes its own pool)")),
         Err(error) => notes.push(format!("{family}: cache geometry: {error}")),
+    }
+
+    if family == "mimo_v2" {
+        let spark_ranks = match report.placement { ExpertPlacement::Sparks { ranks } => ranks, _ => 0 };
+        if report.encoder.is_none() {
+            let kv = mimo::profile(checkpoint, options, active_gpus, spark_ranks,
+                prefill_rows, concurrency, context_tokens, workspace_manifest.as_ref()).ok()
+                .map(|profile| profile.steady.devices.iter().map(|rank| rank.pool_unit_bytes
+                    * options.pool_tokens.filter(|&tokens| tokens > 0).unwrap_or(target_pool_tokens)
+                        .div_ceil(profile.steady.pool_unit_rows)).collect::<Vec<_>>())
+                .unwrap_or_else(|| vec![0; gpus]);
+            resolve_encoder(checkpoint, report, model, &mut devices, &mut spark_devices, &kv, options, &mut notes);
+        }
+        match mimo::apply(checkpoint, options, &mut devices[..active_gpus], spark_ranks,
+            prefill_rows, concurrency, context_tokens, workspace_manifest.as_ref()) {
+            Ok(tokens) => pool_tokens = tokens,
+            Err(error) => { report.placement_supported = false; notes.push(format!("MiMo allocation contract: {error:#}")); }
+        }
+        if workspace_manifest.is_none() { notes.push("MiMo native scratch needs --workspace-manifest; tensor allocations are exact but native scratch is not qualified".into()); }
+        if spark_ranks == 0 && options.mimo_expert_manifest.is_none()
+            && !devices[0].items.iter().any(|item| item.group == "experts.local_scratch") {
+            notes.push("MiMo local expert scratch package was not found; use --mimo-expert-manifest to qualify local admission".into());
+        }
+        if checkpoint.snapshot.join("dflash/config.json").is_file() {
+            let rings = options.mimo_rings.max(concurrency);
+            let slots = crate::families::mimo_v2::draft_representation::mimo_draft_context_slots(
+                options.draft_sequences.max(concurrency), rings, options.draft_context_slots);
+            notes.push(format!("MiMo DFlash context slots {slots}; valid-floor transfer uses {rings} target rings"));
+        }
     }
 
     if family == "deepseek_v41" && options.local_expert_layers.is_none() && layer_bytes > 0 {
@@ -1085,9 +1128,13 @@ pub fn layout(report: &mut PlanReport, model: &dyn super::FamilyModel, checkpoin
 
 /// Program families (manifest name prefixes) a family's coordinator loads on one GPU of this layout,
 /// or `None` where the family still loads every program in the image (its context stays the allowance).
-fn program_families(family: &str, model: &dyn super::FamilyModel, split: bool) -> Option<Vec<String>> {
+fn program_families(family: &str, model: &dyn super::FamilyModel, split: bool, checkpoint: &super::Checkpoint) -> Option<Vec<String>> {
     let base = match family {
         "deepseek_v4" => if model.spec().hidden == 4096 { "dsv4f" } else { "dsv4p" },
+        "mimo_v2" => {
+            let cfg = crate::families::mimo_v2::MimoV2Config::from_hf(&checkpoint.config).ok()?;
+            cfg.program_family().ok()?
+        },
         "qwen4" => "qwen4",
         "glm5_flash" => "glmf",
         "glm5" => "glm",
