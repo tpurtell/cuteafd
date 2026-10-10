@@ -114,6 +114,10 @@ nice 19 with 16 jobs (`CARGO_BUILD_JOBS=16`, `RUST_TEST_THREADS=16`).
 - **Adaptive draft C8 swings ±10-18% between launches** on V4.1 max. One
   matched pair cannot decide C8 there. Use 3 interleaved pairs with
   alternating order, plus a fixed-policy control (`DSPARK_DRAFT_POLICY=full`).
+  That control exists **only on V4.1**. V4's dSpark drafts a fixed block, and
+  the key is ignored there. On V4 (and other fixed-width drafters), isolate
+  speculation with a `SPECULATOR=off` pair, and check prompt dependence with
+  a second nonce seed.
   A shared-build toggle (`--arm-wip`) isolates a flag from the build.
 - **Judge on the paired median**, not on the ratio of arm medians, and report
   the raw pairs and their order.
