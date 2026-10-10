@@ -17,6 +17,11 @@ const SYSTEM: &str = include_str!("../../assets/agentic-system.txt");
 const MAX_TURNS: usize = 12;
 const MAX_READ_LINES: usize = 400;
 
+/// A fixture repository file's text (for workloads that quote it).
+pub(crate) fn fixture(path: &str) -> Option<&'static str> {
+    AGENTIC_REPO.iter().find(|(name, _)| *name == path).map(|(_, text)| *text)
+}
+
 pub struct Agentic;
 pub static AGENTIC: Agentic = Agentic;
 
