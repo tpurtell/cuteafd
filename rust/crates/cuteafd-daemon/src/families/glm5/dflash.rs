@@ -498,6 +498,10 @@ impl<'a> GlmDrafter<'a> {
         let cfg = DflashConfig { row_window, ..DflashConfig::read(snapshot)? };
         let capacity = GlmDraftCapacity::new(slots, max_sequences, cfg.block)?;
         let layout = cfg.runtime_layout(representation, capacity)?;
+        let config = serde_json::from_slice(&std::fs::read(snapshot.join("config.json"))?)?;
+        let (resident_bytes, scratch_bytes) = cuteafd_loader::families::glm5::draft_representation::draft_resident_bytes_with_mode(
+            &config, slots, max_sequences, library.sm_count()? as u64, representation, fp8_rows.code() as u8)?;
+        tracing::info!(resident_bytes, scratch_bytes, "DFlash shared readiness inventory");
         ensure!(mask_row.len() == cfg.hidden * 2, "DFlash BF16 mask row has wrong hidden width");
         let path = snapshot.join("model.safetensors");
         let checkpoint = Checkpoint {

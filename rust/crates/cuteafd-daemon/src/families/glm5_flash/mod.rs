@@ -1363,6 +1363,21 @@ impl Opened {
         let resident: usize = model.layers.iter().map(weights::GlmfLayer::bytes).sum();
         let peer_resident: usize = shares.iter().flatten().map(weights::GlmfLayer::bytes).sum();
         let single = model.check_single_residency(args.kda_fp8, args.fp8_head)?;
+        // Header-only resident inventory uses the actual loader flags, not launcher defaults.
+        if args.kda_nvfp4_gate.is_none() {
+            let headers = cuteafd_loader::plan::Checkpoint::coordinator(&args.snapshot, false, false)?;
+            let expected = cuteafd_loader::families::glm5_flash::resident::resident_weights(
+                &headers, &self.cfg, layers, 1 + usize::from(peer_stream.is_some()),
+                cuteafd_loader::families::glm5_flash::resident::GlmfRepresentation {
+                    kda_fp8: args.kda_fp8 != fp8::KdaFp8::Off, fp8_head: args.fp8_head,
+                    output_shard: args.kda_output_shard,
+                }).map_err(anyhow::Error::msg)?;
+            let actual = resident + model.norm.buffer.bytes + model.head.bytes();
+            tracing::info!(planned_lead_bytes = expected[0].weights, resident_lead_bytes = actual,
+                planned_peer_bytes = expected.get(1).map_or(0, |r| r.weights), resident_peer_bytes = peer_resident,
+                "GLM Flash shared resident inventory versus uploaded operands");
+        }
+
         let mib = |bytes: usize| bytes as f64 / (1u64 << 20) as f64;
         tracing::info!(layers, gib = resident as f64 / (1u64 << 30) as f64,
             split_gib = peer_resident as f64 / (1u64 << 30) as f64,
@@ -1414,16 +1429,17 @@ impl Opened {
             tracing::info!(graph_budget_mib = ?args.graph_budget_mib,
                 "GLM Flash decode graphs captured lazily within the graph budget, not at startup");
         }
-        let startup_reserve = if startup_graphs {
+        let initial_pool = if args.pool_tokens == 0 {
+            cuteafd_core::serving_capacity::DEFAULT_GPU_KV_TOKENS as usize
+        } else { args.pool_tokens };
+        let buckets = engine::DecodeBuckets::new(engine::verify_budget(args.decode_rows, self.library.sm_count()?));
+        let graph_reserve_at = |pool: usize| {
             let (sequences, speculation) = args.serving_graph_policy.unwrap_or((16, true));
-            // An automatic pool can only shrink this geometry, never exceed the 2M cap.
-            let pool = if args.pool_tokens == 0 { cuteafd_core::serving_capacity::DEFAULT_GPU_KV_TOKENS as usize }
-                else { args.pool_tokens };
-            // The engine's bucket sets: with the wide programs its verify budget, from this GPU's SMs.
-            let buckets = engine::DecodeBuckets::new(engine::verify_budget(args.decode_rows, self.library.sm_count()?));
-            Some(engine::serving_graph_reserve(args.max_context, pool, self.cfg.dense_context(),
+            let context = cuteafd_loader::serving_capacity::glmf_graphs::admitted_graph_context(
+                args.max_context, pool, automatic_context);
+            startup_graphs.then(|| engine::serving_graph_reserve(context, pool, self.cfg.dense_context(),
                 sequences, speculation, layers, peer_stream.is_some(), &buckets))
-        } else { None };
+        };
         // Eager admission (an automatic or budgeted pool on one GPU, its experts on Sparks or
         // admitted under the budget): the drafter, the Spark transports and intake, the dense
         // package, the token selector and every step workspace exist before the pool is sized, so
@@ -1481,12 +1497,14 @@ impl Opened {
             // Graphs: the startup set's reserve, or the lazy graphs' budget (else the planner's allowance),
             // which they keep too when the startup set leaves no room for a pool (`measured_admission`).
             let (headroom, later) = (args.headroom_bytes()?, state + marks + future_expert_bytes + reserved_bytes);
-            let startup = startup_reserve.as_ref().and_then(|reserve| reserve.first().copied());
-            let admitted = measured_admission(args, startup, |graphs| {
+            let admitted = cuteafd_loader::serving_capacity::glmf_graphs::solve_graph_pool(initial_pool, |pool| {
+                let startup = graph_reserve_at(pool).and_then(|reserve| reserve.first().copied());
+                measured_admission(args, startup, |graphs| {
                 let reserve = crate::shared::memory_report::MeasuredReserve { headroom, graphs, later };
                 crate::shared::memory_report::measured_pool_tokens(&self.library, args.device,
                     (rank.persistent_unit_bytes + rank.pool_metadata_unit_bytes).div_ceil(unit), unit, reserve,
                     (args.pool_tokens > 0).then_some(args.pool_tokens as u64))
+                })
             })?;
             records = if shared_records > 0 {
                 tracing::info!(records_bytes = shared_records, later_bytes = later,
@@ -1505,16 +1523,6 @@ impl Opened {
                 std::iter::once(args.device)
                     .chain(peer_stream.map(|(d, _)| d)).collect()
             };
-            // The head split's partials and the pool marks' reserved units (on every GPU).
-            let extra = if args.kda_output_shard {
-                engine::output_shard_reserve(args.prefill_lanes, args.prefill_rows, self.cfg.hidden)
-            } else if args.full_prefill_logits {
-                engine::partial_exchange_reserve(args.prefill_lanes, args.prefill_rows, self.cfg.hidden,
-                    if args.kda_fp32_partials { 4 } else { 2 })
-            } else {
-                engine::partial_reserve(args.prefill_lanes, args.prefill_rows, self.cfg.hidden,
-                    if args.kda_fp32_partials { 4 } else { 2 })
-            } + reserved_bytes;
             // The step workspaces this engine makes before readiness (`workspace_reserve`, per rank: the
             // decode workspace, the prefill lanes over their shared temporaries, and the measured runtime
             // allowance per workspace), past the planner's workspace allowance; with all-row prefill
@@ -1526,22 +1534,22 @@ impl Opened {
             let workspace_reserve = engine::workspace_reserve(&plan, args.prefill_rows, lanes, peer_stream.is_some(),
                 args.draft.is_some())?;
             let costs = cuteafd_loader::plan::layout::family_costs("glm5_flash");
-            let workspace_allowance = costs.workspace_bytes[0] * args.prefill_rows.max(1) as u64 / 4096;
-            let workspace_extra = workspace_reserve.iter().copied().max().unwrap_or(0).saturating_sub(workspace_allowance);
-            tracing::info!(lanes, workspace_reserve_bytes = ?workspace_reserve, planner_allowance_bytes = workspace_allowance,
-                extra_reserve_bytes = workspace_extra, "GLM Flash derived workspace reserve before KV admission");
-            // The startup set or the graph budget above the planner's graph allowance, on every GPU.
+            tracing::info!(lanes, workspace_reserve_bytes = ?workspace_reserve,
+                "GLM Flash exact workspace union before KV admission");
             let allowance = costs.graph_bytes[0];
-            if startup_graphs || args.graph_budget_mib.is_some() {
-                tracing::info!(allowance_bytes = allowance, graph_budget_mib = ?args.graph_budget_mib,
-                    extra_reserve_bytes = planned_graph_extra(args, startup_reserve.as_deref(), allowance),
-                    "GLM Flash graph reserve above planner allowance");
-            }
-            // If the startup set leaves no room for a pool, decode graphs are captured lazily instead,
-            // keeping the graph budget or the allowance (`admit_beside_decode_graphs`).
             let lazy_extra = planned_graph_extra(args, None, allowance);
-            let startup = startup_reserve.as_deref().map(|reserve| engine::StartupGraphReserve {
-                reserve: reserve.iter().copied().max().unwrap_or(0), allowance });
+            let draft_bytes = args.draft.as_ref().map(|path| -> Result<u64> {
+                let config = serde_json::from_slice(&std::fs::read(path.join("config.json"))?)?;
+                let draft_slots = args.draft_context_slots.unwrap_or(20.max(args.draft_sequences));
+                let (resident, scratch) = cuteafd_loader::families::glm5::draft_representation::draft_resident_bytes_with_mode(
+                    &config, draft_slots, args.draft_sequences.min(draft_slots), self.library.sm_count()? as u64,
+                    cuteafd_loader::families::glm5::draft_representation::GlmDraftRepresentation::from_fp8_option(args.draft_fp8),
+                    args.draft_linear.code() as u8)?;
+                Ok(resident + scratch)
+            }).transpose()?.unwrap_or(0);
+            let exchange = cuteafd_loader::serving_capacity::glmf_graphs::peer_exchange_bytes(
+                lanes as u64, args.prefill_rows as u64, self.cfg.hidden as u64,
+                if args.kda_fp32_partials { 4 } else { 2 }, args.kda_output_shard);
             // Every GPU keeps the prefix mark arena the caller allocates (its part of `mark_slots`
             // marks, whatever the KDA state) and the speculative replay records free, as the runtime
             // allocates them.
@@ -1555,19 +1563,26 @@ impl Opened {
                     self.cfg.hidden),
                 _ => 0,
             };
-            engine::admit_beside_decode_graphs(startup, |graphs| {
+            cuteafd_loader::serving_capacity::glmf_graphs::solve_graph_pool(initial_pool, |pool| {
+                let startup_reserve = graph_reserve_at(pool);
+                let startup = startup_reserve.as_deref().map(|reserve| engine::StartupGraphReserve {
+                    reserve: reserve.iter().copied().max().unwrap_or(0), allowance });
+                engine::admit_beside_decode_graphs(startup, |graphs| {
                 // The startup set's bytes above the allowance (none when captured lazily), or the budget's.
                 let graph_extra = graphs.map_or(0, |bytes| bytes.saturating_sub(allowance)).max(lazy_extra);
                 let reserves: Vec<_> = workspace_reserve.iter().enumerate().map(|(rank, &workspace)|
                     crate::shared::memory_report::RankReserve {
-                        extra_bytes: extra + graph_extra + if args.full_prefill_logits { 0 } else { workspace_extra }
+                        extra_bytes: reserved_bytes + graph_extra
                             + if rank == 0 { selector + intake } else { 0 },
-                        workspace_bytes: args.full_prefill_logits.then_some(workspace),
+                        workspace_bytes: Some(workspace),
+                        transport_bytes: Some(if peer_stream.is_some() { exchange } else { 0 }),
+                        draft_bytes: Some(if rank == 0 { draft_bytes } else { 0 }),
                     }).collect();
                 crate::shared::memory_report::planned_pool_tokens_with_reserves(&self.library, &args.snapshot, &devices,
                     args.draft.as_deref(), args.prefill_rows, args.slots, mark_slots as u64,
                     (args.pool_tokens > 0).then_some(args.pool_tokens as u64), future_expert_bytes, &reserves,
                     index_cache.into(), args.kda_state.bytes() as u64, args.decode_rows as u64)
+                })
             })?
         } else {
             (args.pool_tokens, startup_graphs)

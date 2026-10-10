@@ -1047,7 +1047,7 @@ fn glm5_flash_layout_charges_the_engine_step_workspaces_and_headroom() {
     let gpu = plan(dir.path(), &budgeted).unwrap().memory_layout.unwrap().devices.remove(0);
     let graphs: Vec<_> = gpu.items.iter().filter(|i| i.group.starts_with("graph")).map(|i| (i.group.as_str(), i.bytes))
         .collect();
-    assert_eq!(graphs, [("graph budget", 512 << 20)]);
+    assert_eq!(graphs, [("graph growth", 512 << 20)]);
 }
 
 /// `--decode-rows 128` in the planner charges what the engine allocates for it: the decode workspace of
@@ -1316,8 +1316,8 @@ fn glm5_flash_layout_keeps_the_graph_budget_as_the_admission_does() {
         memory.devices.iter().filter(|d| d.kind == DeviceKind::Rtx).flat_map(|d| d.items.iter()
             .filter(|i| i.group.starts_with("graph")).map(|i| (i.group.clone(), i.bytes))).collect()
     };
-    let budget = |mib: u64| ("graph budget".to_string(), mib << 20);
-    let kept = ("graph allowance".to_string(), allowance[0]);
+    let budget = |mib: u64| ("graph growth".to_string(), mib << 20);
+    let kept = ("graph growth".to_string(), allowance[0]);
     // Measured: the budget itself, below the allowance or above it.
     assert_eq!(graphs(1, None, 4, 512), [budget(512)]);
     assert_eq!(graphs(1, None, 4, 4096), [budget(4096)]);
@@ -1327,6 +1327,25 @@ fn glm5_flash_layout_keeps_the_graph_budget_as_the_admission_does() {
         assert_eq!(graphs(gpus, pool, ranks, 1536), vec![kept.clone(); gpus], "{gpus} {pool:?} {ranks}");
         assert_eq!(graphs(gpus, pool, ranks, 4096), vec![budget(4096); gpus], "{gpus} {pool:?} {ranks}");
     }
+}
+
+#[test]
+fn glm5_flash_disabled_draft_omits_arenas_and_speculative_graphs() {
+    use cuteafd_core::memory_layout::Category;
+    let dir = snapshot(glm5_flash_config(2), &[t("model.language_model.layers.0.self_attn.A_log", "F32", &[64])]);
+    let options = |disabled| PlanOptions { layout: Some(layout::LayoutOptions {
+        glmf_drafter_disabled: disabled, context_tokens: 131_072, ..Default::default() }), ..sparks(4) };
+    let enabled = plan(dir.path(), &options(false)).unwrap().memory_layout.unwrap();
+    let disabled = plan(dir.path(), &options(true)).unwrap().memory_layout.unwrap();
+    assert!(enabled.devices[0].items.iter().any(|i| i.category == Category::Drafter));
+    assert!(!disabled.devices[0].items.iter().any(|i| i.category == Category::Drafter));
+    let graphs = |layout: &cuteafd_core::memory_layout::MemoryLayout| layout.devices[0].items.iter()
+        .find(|i| i.group == "graphs").unwrap().bytes;
+    assert!(graphs(&disabled) < graphs(&enabled), "disabled={} enabled={}", graphs(&disabled), graphs(&enabled));
+    let overhead = |layout: &cuteafd_core::memory_layout::MemoryLayout| layout.devices[0].items.iter()
+        .find(|i| i.group == "workspace runtime overhead").unwrap().bytes;
+    assert_eq!(overhead(&enabled), crate::serving_capacity::glmf_graphs::workspace_runtime_overhead(2, true));
+    assert_eq!(overhead(&disabled), crate::serving_capacity::glmf_graphs::workspace_runtime_overhead(2, false));
 }
 
 #[test]

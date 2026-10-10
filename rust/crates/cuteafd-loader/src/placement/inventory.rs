@@ -39,6 +39,9 @@ pub struct ArchContext {
     /// runtime's inventory sample, so both sides charge it as a known future
     /// item (planner: inside "context+modules"; runtime: beside the sample).
     pub cublas_bytes: u64,
+    /// Additional peer mapping/context residency. TODO: measure independently of
+    /// graph executables on SM120 PRO / driver 595.91.07; rc3 split ledgers mix both.
+    pub peer_context_bytes: u64,
     /// Device bytes one captured decode-graph executable holds (measured).
     pub graph_executable_bytes: u64,
     /// The driver these numbers were measured on.
@@ -57,15 +60,15 @@ pub struct ArchContext {
 pub const ARCH_CONTEXTS: &[ArchContext] = &[
     ArchContext { arch: "sm_120", max_total_bytes: 34 << 30, total_bytes: 0, sms: 170, context_bytes: 586_416_128,
         cublas_bytes: 71_303_168,
-        graph_executable_bytes: 149_712, driver: "595.91.07",
+        peer_context_bytes: 0, graph_executable_bytes: 149_712, driver: "595.91.07",
         source: "RTX 5090 class: SM120 PRO probe on the same driver/CUDA 13.2; SM count from the 5090 spec" },
     ArchContext { arch: "sm_120", max_total_bytes: u64::MAX, total_bytes: 101_973_491_712, sms: 188,
         context_bytes: 586_416_128, cublas_bytes: 71_303_168,
-        graph_executable_bytes: 149_712, driver: "595.91.07",
+        peer_context_bytes: 0, graph_executable_bytes: 149_712, driver: "595.91.07",
         source: "RTX PRO 6000 Blackwell probe (CUDA 13.2); Qwen 12,397 graphs = 1,855,979,520 B" },
     ArchContext { arch: "sm_121", max_total_bytes: u64::MAX, total_bytes: 130_594_156_544, sms: 48,
         context_bytes: 257 << 20, cublas_bytes: 160 << 20,
-        graph_executable_bytes: 149_712, driver: "580.178.04",
+        peer_context_bytes: 0, graph_executable_bytes: 149_712, driver: "580.178.04",
         source: "GB10 probe (CUDA 13.0, MemAvailable deltas): context 189-257 MiB + cuBLAS 150-160 MiB; graph bytes from SM120" },
 ];
 
@@ -249,6 +252,21 @@ pub fn fp8moe_package_scratch(lib: &std::path::Path, family: &str,
         .unwrap_or_else(|| format!("fp8-{family}{}", format.package_suffix()));
     let manifest: Value = serde_json::from_slice(&std::fs::read(lib.join("fp8").join(&name).join("manifest.json")).ok()?).ok()?;
     Some((name, fp8moe_scratch_bytes(&manifest, "tp1", rows)?))
+}
+
+/// Dense NVFP4 package selection shared with the coordinator loader. A4 is
+/// preferred only when its tp1 package exists; A16 selects the NVFP4 package.
+pub fn dense_package_directory(lib: &std::path::Path, geometry: &str, a4: bool) -> std::path::PathBuf {
+    let root = lib.join("fp8");
+    let preferred = root.join(format!("fp8-{geometry}-nvfp4a4")).join("tp1");
+    if a4 && preferred.is_dir() { preferred }
+    else { root.join(format!("fp8-{geometry}-nvfp4")).join("tp1") }
+}
+
+pub fn dense_package_scratch(lib: &std::path::Path, geometry: &str, rows: u64, a4: bool) -> Option<u64> {
+    let directory = dense_package_directory(lib, geometry, a4);
+    let manifest: Value = serde_json::from_slice(&std::fs::read(directory.parent()?.join("manifest.json")).ok()?).ok()?;
+    fp8moe_scratch_bytes(&manifest, "tp1", rows)
 }
 
 /// The image's `lib/` directory next to a `share/PROGRAMS.json` manifest

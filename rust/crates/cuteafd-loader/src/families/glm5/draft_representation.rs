@@ -177,6 +177,137 @@ impl GlmDraftRuntimeLayout {
     }
 }
 
+/// Native fp8_gemv.cu scratch contract; SM count affects the split partial arena.
+pub fn draft_fp8_scratch_bytes(rows: u64, k: u64, n: u64, sms: u64, mode: u8) -> u64 {
+    let align = |bytes: u64| bytes.div_ceil(256) * 256;
+    if n < 16 || k < 128 || sms == 0 || mode > 2 { return 0; }
+    let tiles = n / 16;
+    let blocks = k / 128;
+    let wanted = (sms * 16).div_ceil(tiles).clamp(1, blocks);
+    let splits = blocks.div_ceil(blocks.div_ceil(wanted));
+    let capacity = if mode == 0 { 64 } else { 128 };
+    align(2 * capacity * 4) + align(k * capacity * 2)
+        + if mode == 2 { align(k / 128 * capacity * 4) } else { 0 }
+        + if splits > 1 { align(splits * rows.min(capacity) * n * 4) } else { 0 }
+}
+
+/// Owned draft arenas at readiness. The target head and its mask row are borrowed.
+pub fn draft_workspace_bytes(g: GlmDraftGeometry, capacity: GlmDraftCapacity, block: u64,
+    fp8: bool, sms: u64, mode: u8) -> Result<(u64, u64), GlmDraftStorageError> {
+    // Validate before arithmetic, including hostile config.json values. Native kernels and
+    // allocation indices are signed32; the additional bound keeps all arena products in u64.
+    if [g.hidden, g.intermediate, g.layers, g.heads, g.kv_heads, g.head_dim, g.taps, g.vocab,
+        g.conv_group, g.selector_rank, block].iter().any(|&n| n == 0 || n > 1_000_000)
+        || g.layers > 1024 || g.heads > 4096 || g.kv_heads > 4096 || g.taps > 1024
+        || capacity.max_batch_sequences > 32 || block > 128 || mode > 2 || sms == 0 || sms > 4096 {
+        return Err(GlmDraftStorageError::Unsupported("draft geometry exceeds native arena limits"));
+    }
+    GlmDraftRuntimeLayout::new(g, if fp8 { GlmDraftRepresentation::Fp8Only } else { GlmDraftRepresentation::Bf16Only }, capacity, 2048)?;
+    let allocation = |n: u64| n.max(256);
+    let sequences = capacity.max_batch_sequences as u64;
+    let rows = sequences * block;
+    let drafted = sequences * (block - 1);
+    let kv = g.kv_heads * g.head_dim;
+    let attention = g.heads * g.head_dim;
+    let conv = mul(4, g.hidden)? / g.conv_group;
+    let owned = add(mul(mul(mul(mul(4,g.layers)?,capacity.context_slots as u64)?,2048)?,kv)?,
+        mul(2048,sum([mul(mul(g.taps,g.hidden)?,2)?,mul(g.hidden,4)?,mul(kv,4)?,12])?)?)?;
+    let workspace = [4 << 20, rows * g.hidden * 2, rows * g.hidden * 2, rows * g.hidden * 2,
+        rows * conv * 2, rows * (attention + 2 * kv) * 2, rows * attention * 2,
+        rows * kv * 2, rows * kv * 2, rows * attention * 2, rows * g.hidden * 2,
+        rows * 2 * g.intermediate * 2, rows * g.intermediate * 2, rows * g.vocab * 4,
+        drafted * 16 * 4, drafted * 16 * 4, rows * g.selector_rank * 2, sequences * 4,
+        rows * 4, drafted * 4, drafted * 16, rows * 8, 3 * sequences * 4,
+        sequences * g.kv_heads * (2048 + block).div_ceil(128) * 64 * 130 * 4,
+        drafted * 64 * 16 * 8].into_iter().map(allocation).sum::<u64>();
+    let scratch = if fp8 {
+        let layout = GlmDraftRuntimeLayout::new(g, GlmDraftRepresentation::Fp8Only, capacity, 2048)?;
+        layout.fp8_scratch.unwrap().shapes.iter().map(|s|
+            draft_fp8_scratch_bytes(2048.max(rows), s.k, s.n, sms, mode)).max().unwrap_or(256)
+    } else { 0 };
+    // fp8_linear scratch has its own workspace ledger scope, unlike draft activations.
+    Ok((add(owned, workspace)?, scratch))
+}
+
+pub fn draft_geometry(config: &serde_json::Value) -> Result<(GlmDraftGeometry, u64), GlmDraftStorageError> {
+    let int = |value: &serde_json::Value, name: &str| value[name].as_u64()
+        .ok_or(GlmDraftStorageError::Unsupported("missing draft geometry"));
+    let d = &config["dflash_config"];
+    Ok((GlmDraftGeometry {
+        hidden: int(config, "hidden_size")?, intermediate: int(config, "intermediate_size")?,
+        layers: int(config, "num_hidden_layers")?, heads: int(config, "num_attention_heads")?,
+        kv_heads: int(config, "num_key_value_heads")?, head_dim: int(config, "head_dim")?,
+        taps: d["target_layer_ids"].as_array().ok_or(GlmDraftStorageError::Unsupported("missing draft taps"))?.len() as u64,
+        vocab: int(config, "vocab_size")?, conv_group: int(d, "conv_group_size")?,
+        selector_rank: int(d, "selector_rank")?,
+    }, int(d, "block_size")?))
+}
+
+pub fn draft_resident_bytes(config: &serde_json::Value, slots: usize, sequences: usize, sms: u64)
+    -> Result<(u64, u64), GlmDraftStorageError> {
+    draft_resident_bytes_with_mode(config, slots, sequences, sms, GlmDraftRepresentation::Fp8Only, 2)
+}
+
+pub fn draft_resident_bytes_with_mode(config: &serde_json::Value, slots: usize, sequences: usize, sms: u64,
+    representation: GlmDraftRepresentation, mode: u8) -> Result<(u64, u64), GlmDraftStorageError> {
+    if mode > 2 || sms == 0 || sms > 4096 { return Err(GlmDraftStorageError::Unsupported("invalid draft scratch mode or SM count")); }
+    if config["speculators_model_type"] == "dspark" {
+        return dspark_resident_bytes(config, slots, sequences.min(32), sms, representation, mode);
+    }
+    let (g, block) = draft_geometry(config)?;
+    let capacity = GlmDraftCapacity::new(slots, sequences, usize::try_from(block).map_err(|_| GlmDraftStorageError::Overflow)?)?;
+    let layout = GlmDraftRuntimeLayout::new(g, representation, capacity, 2048)?;
+    let (workspace, scratch) = draft_workspace_bytes(g, capacity, block,
+        representation == GlmDraftRepresentation::Fp8Only, sms, mode)?;
+    Ok((add(layout.weights.resident_bytes()?, workspace)?, scratch))
+}
+
+fn dspark_resident_bytes(config: &serde_json::Value, slots: usize, sequences: usize, sms: u64,
+    representation: GlmDraftRepresentation, mode: u8) -> Result<(u64, u64), GlmDraftStorageError> {
+    let t = &config["transformer_layer_config"];
+    let field = |name: &str| t[name].as_u64().filter(|&v| v > 0)
+        .ok_or(GlmDraftStorageError::Unsupported("missing dSpark geometry"));
+    let (h, inter, layers, heads, kvh, dim, vocab) = (field("hidden_size")?, field("intermediate_size")?,
+        field("num_hidden_layers")?, field("num_attention_heads")?, field("num_key_value_heads")?,
+        field("head_dim")?, field("vocab_size")?);
+    let taps = config["aux_hidden_state_layer_ids"].as_array()
+        .ok_or(GlmDraftStorageError::Unsupported("missing dSpark taps"))?.len() as u64;
+    let block = config["block_size"].as_u64().filter(|&v| v > 0)
+        .ok_or(GlmDraftStorageError::Unsupported("missing dSpark block"))?;
+    if [h,inter,layers,heads,kvh,vocab,block,taps].iter().any(|&n| n > 1_000_000)
+        || layers > 1024 || heads > 4096 || kvh > 4096 || taps > 1024 || block > 128
+        || dim != 64 || heads % kvh != 0 || heads / kvh * block > 32 || taps == 0
+        || config["markov_rank"] != 256 || sequences == 0 || sequences > slots {
+        return Err(GlmDraftStorageError::Unsupported("invalid dSpark geometry or capacity"));
+    }
+    let q = mul(heads, dim)?;
+    let kv = mul(kvh, dim)?;
+    let shapes = [(mul(taps,h)?, h), (h, add(q,mul(2,kv)?)?), (q,h), (h,mul(2,inter)?), (inter,h)];
+    let values = add(mul(shapes[0].0, shapes[0].1)?, mul(layers,
+        sum(shapes[1..].iter().map(|&(k,n)| mul(k,n)).collect::<Result<Vec<_>,_>>()?)?)?)?;
+    let fp8 = representation == GlmDraftRepresentation::Fp8Only;
+    if fp8 && shapes.iter().any(|&(k,n)| k % 128 != 0 || n % 16 != 0) {
+        return Err(GlmDraftStorageError::Unsupported("dSpark FP8 matrix alignment"));
+    }
+    let weights = sum([mul(values, if fp8 { 1 } else { 2 })?, if fp8 { mul(values / 128,4)? } else { 0 },
+        mul(2,add(mul(2,h)?,mul(layers,add(mul(2,h)?,mul(2,dim)?)?)?)?)?,
+        mul(4,mul(vocab,256)?)?, mul(vocab,4)?, mul(add(h,256)?,2)?.max(256),256])?;
+    let rows = mul(sequences as u64,block)?;
+    let owned = sum([mul(mul(mul(mul(4,layers)?,slots as u64)?,2048)?,kv)?,
+        mul(2048,sum([mul(mul(taps,h)?,2)?,mul(h,4)?,mul(kv,4)?,12])?)?])?;
+    let terms = [(rows,h,2),(rows,h,2),(rows,add(q,mul(2,kv)?)?,2),(rows,q,2),(rows,kv,2),
+        (rows,kv,2),(rows,q,2),(rows,h,2),(rows,mul(2,inter)?,2),(rows,inter,2),(rows,vocab,4),
+        (sequences as u64,1,4),(rows,1,4),(rows,1,4),(rows,1,4),(rows,1,8),(sequences as u64,3,4)];
+    let mut workspace = 4 << 20;
+    for (a,b,c) in terms { workspace = add(workspace,mul(mul(a,b)?,c)?.max(256))?; }
+    workspace = add(workspace,mul(mul(mul(sequences as u64,kvh)?,add(2048,block)?.div_ceil(128))?,32*66*4)?.max(256))?;
+    workspace = add(workspace,add(mul(sequences as u64,296*8)?,mul(rows,4)?)?.max(256))?;
+    let mut scratch_shapes = shapes.to_vec(); scratch_shapes.push((h,mul(2,kv)?));
+    let scratch = if fp8 { scratch_shapes.iter().map(|&(k,n)|
+        draft_fp8_scratch_bytes(rows.max(2048),k,n,sms,mode)).max().unwrap_or(256) } else { 0 };
+    Ok((sum([weights,owned,workspace])?,scratch))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -188,6 +319,18 @@ mod tests {
             kv_heads: 8, head_dim: 128, taps: if flash { 5 } else { 6 }, vocab: 154880,
             conv_group: 16, selector_rank: 256,
         }
+    }
+
+    #[test]
+    fn flash_draft_ready_inventory_matches_rc3_without_borrowed_head() {
+        let g = geometry(true);
+        let capacity = GlmDraftCapacity::new(8,8,8).unwrap();
+        let layout = GlmDraftRuntimeLayout::new(g,GlmDraftRepresentation::Fp8Only,capacity,2048).unwrap();
+        let (arenas,scratch) = draft_workspace_bytes(g,capacity,8,true,188,2).unwrap();
+        assert_eq!(layout.weights.resident_bytes().unwrap() + arenas, 1_835_700_096);
+        assert_eq!(scratch,30_491_648);
+        let mut invalid = g; invalid.conv_group = 0;
+        assert!(draft_workspace_bytes(invalid,capacity,8,true,188,2).is_err());
     }
 
     #[test]
