@@ -1266,7 +1266,8 @@ def test_deepseek_v4_launches_with_the_prefix_cache_keys(tmp_path: Path) -> None
     default = _family_launch_lines(tmp_path / "b", config, "deepseek-ai/DeepSeek-V4-Flash-0731", "")
     launch = [l for l in default.splitlines() if "cuteafd serve-dsv4" in l]
     assert "--prefix-cache-entries 20" in launch[0]
-    assert "--host-cache-bytes" not in launch[0] and "--pool-tokens" not in launch[0]
+    # The pool defaults to auto (planner admission), as the release cards ran.
+    assert "--host-cache-bytes" not in launch[0] and "--pool-tokens 0" in launch[0]
 
 
 def test_glm_flash_drafts_with_its_default_speculator(tmp_path: Path) -> None:
@@ -1798,12 +1799,14 @@ def test_glmf_encoder_placement_refuses_a_bad_sequence_count(tmp_path, value):
     ({"model_type": "deepseek_v4"}, "serve-dsv4"),
     ({"model_type": "glm_moe_dsa", "num_hidden_layers": 4, "first_k_dense_replace": 3}, "serve-glm"),
 ])
-def test_other_generic_families_keep_vision_off_by_default(tmp_path, family_config, serve):
-    model = "zai-org/GLM-5.3-Flash" if serve == "serve-glmf" else "test/model"
-    result = _family_launch_result(tmp_path, family_config, model, "SPECULATOR=off\n")
+def test_towerless_families_default_to_auto_and_start_no_tower(tmp_path, family_config, serve):
+    # VISION defaults to auto for every family, as the release configs set it. DeepSeek V4
+    # and GLM 5.3 have no tower: no encoder plan runs and nothing is placed.
+    result = _family_launch_result(tmp_path, family_config, "test/model", "SPECULATOR=off\n")
     assert result.returncode == 0, result.stderr
     launch = next(line for line in result.stderr.splitlines() if f"cuteafd {serve}" in line)
-    assert "--vision off" in launch
+    assert "--vision auto" in launch
+    assert "cuteafd plan" not in result.stderr
     assert "--encoder-listen" not in result.stderr and "--vision-peers" not in launch
 
 
