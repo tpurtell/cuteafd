@@ -1198,6 +1198,176 @@ mod tests {
         assert!(wide >= 400 / WIDTH_EXPLORE_ROUNDS - 1 && wide < 40, "{:?}", policy.stats().width_rounds);
     }
 
+    /// FNV-1a over a replay transcript: every decision, prediction and fit
+    /// the policy produced, bit for bit.
+    struct Transcript { hash: u64, records: u64, dump: Option<String> }
+    impl Transcript {
+        fn new() -> Self {
+            Self { hash: 0xcbf2_9ce4_8422_2325, records: 0,
+                dump: std::env::var_os("CUTEAFD_POLICY_REPLAY_DUMP").map(|_| String::new()) }
+        }
+        fn word(&mut self, tag: &str, value: u64) {
+            for byte in tag.bytes().chain(value.to_le_bytes()) {
+                self.hash = (self.hash ^ u64::from(byte)).wrapping_mul(0x100_0000_01b3);
+            }
+            self.records += 1;
+            if let Some(dump) = &mut self.dump { dump.push_str(&format!("{tag} {value:#x}\n")); }
+        }
+        fn real(&mut self, tag: &str, value: f64) { self.word(tag, value.to_bits()); }
+    }
+
+    struct Mix(u64);
+    impl Mix {
+        fn next(&mut self) -> u64 {
+            self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+            z ^ (z >> 31)
+        }
+        fn unit(&mut self) -> f64 { (self.next() >> 11) as f64 / (1u64 << 53) as f64 }
+        fn below(&mut self, n: u64) -> u64 { self.next() % n }
+    }
+
+    /// Replay of V4.1-shaped rounds through every public entry point: mixed
+    /// local/TP2/Spark placements, MXFP4 and NVFP4 slices, both regimes, one
+    /// to four requests with admission and release, both widths, warm-up,
+    /// selection, prediction, stalls, missing layer timings, undrafted and
+    /// unconfident (copied) requests, router flag bits and a rejected round.
+    fn replay(transcript: &mut Transcript) {
+        let mut mix = Mix(0x5eed);
+        // (local layers, TP2 layers, remote slice bytes, wide width, fixed)
+        let scenarios = [(0, 0, 4_700_160., 7, false), (20, 0, 4_700_160., 7, false),
+            (40, 40, 9_400_320., 5, false), (8, 3, 4_976_640., 7, false), (0, 0, 4_700_160., 7, true)];
+        for (scenario, &(local, tp2, remote, wide, fixed)) in scenarios.iter().enumerate() {
+            let class = std::array::from_fn(|l| if l < local { DsparkLayerClass::Local } else { DsparkLayerClass::Remote });
+            let bytes = std::array::from_fn(|l| if l < tp2 { 9_400_320. } else if l < local { 18_800_640. } else { remote });
+            let mut policy = DsparkPolicy::new(DsparkPlacement::new(class, bytes).unwrap(), fixed);
+            policy.set_widths(5, wide).unwrap();
+            let mut live: Vec<(u64, u64, u32, f64)> = Vec::new(); // (id, next token, pool, quality)
+            let mut next_id = 1 + 1000 * scenario as u64;
+            for round in 0..320u64 {
+                let shared = round % 5 >= 3;
+                if live.is_empty() || (live.len() < 4 && mix.unit() < 0.12) {
+                    let code = mix.unit() < 0.5;
+                    live.push((next_id, next_id * 100_000, if code { 12 } else { 40 }, if code { 0.93 } else { 0.62 }));
+                    next_id += 1;
+                }
+                if live.len() > 1 && mix.unit() < 0.06 {
+                    let gone = live.remove(mix.below(live.len() as u64) as usize);
+                    policy.release(gone.0);
+                }
+                let requests: Vec<(u64, usize)> = live.iter()
+                    .map(|r| (r.0, 1 + mix.below(wide as u64) as usize)).collect();
+                let width = policy.choose_width(shared, &requests);
+                transcript.word("width", width as u64);
+                let confidence: Vec<Vec<f64>> = requests.iter().zip(&live).map(|(&(_, available), r)|
+                    (0..width.min(available)).map(|p| (r.3 + 0.06 * mix.unit() - 0.02 * p as f64).clamp(0., 1.))
+                        .collect()).collect();
+                let candidates: Vec<_> = live.iter().zip(&confidence)
+                    .map(|(r, c)| DsparkCandidate { id: r.0, confidence: c }).collect();
+                let ids: Vec<u64> = live.iter().map(|r| r.0).collect();
+                let lengths = match policy.select(shared, &candidates, width).unwrap() {
+                    Some(selection) => {
+                        for &length in &selection.lengths { transcript.word("length", length as u64); }
+                        transcript.real("expected", selection.expected_tokens);
+                        transcript.real("selected_us", selection.predicted_us);
+                        transcript.word("evaluated", selection.evaluated as u64);
+                        selection.lengths
+                    }
+                    None => {
+                        transcript.word("unselected", 0);
+                        confidence.iter().map(Vec::len).collect()
+                    }
+                };
+                let predicted = policy.predict(shared, &ids, &lengths, width);
+                transcript.real("predicted", predicted.unwrap_or(-1.));
+                // Execute the round against a synthetic truth.
+                let mut rows_routes: Vec<Vec<[u32; 6]>> = Vec::new();
+                let mut accepted = Vec::new();
+                for ((r, &length), c) in live.iter().zip(&lengths).zip(&confidence) {
+                    let hits = c[..length].iter().take_while(|&&p| mix.unit() < p * 0.97).count();
+                    accepted.push(1 + hits);
+                    for row in 0..=length { rows_routes.push(token_routes(r.1 + row as u64, r.2)); }
+                }
+                let rows = rows_routes.len();
+                let mut routes: Vec<Vec<[u32; 6]>> = (0..40).map(|l| rows_routes.iter().map(|t| t[l]).collect()).collect();
+                // Router flag bits above the expert index are ignored.
+                if round % 7 == 0 { routes[3][0][2] |= 512; }
+                let regime = if shared { 1.3 } else { 1. };
+                let mut layer_us = [None; 40];
+                let mut total = (9000. + 250. * rows as f64 + 150. * ids.len() as f64) * regime;
+                for layer in 1..40 {
+                    let c = policy.placement().class(layer) as usize;
+                    let mb = route_groups(&routes[layer]) * policy.placement().expert_bytes(layer) / 1e6;
+                    let t = ([600., 700.][c] + [8., 12.][c] * rows as f64 + [0.9, 7.5][c] * mb)
+                        * regime * (0.95 + 0.1 * mix.unit());
+                    layer_us[layer] = Some(t);
+                    total += t;
+                }
+                if round % 23 == 11 { layer_us[1 + mix.below(39) as usize] = None; }
+                if round % 31 == 5 { total += 25_000.; }
+                let drafted = round % 13 != 6;
+                let draft_us = if drafted { (2500. + 120. * ids.len() as f64) * if width > 5 { 1.3 } else { 1. } } else { f64::NAN };
+                if drafted { total += draft_us; }
+                let copied: Vec<bool> = live.iter().map(|_| mix.unit() < 0.1).collect();
+                let observed: Vec<_> = live.iter().zip(&lengths).zip(&accepted).zip(&confidence).zip(&copied)
+                    .map(|((((r, &length), &accepted), c), &copied)| DsparkObservedRequest {
+                        id: r.0, rows: length + 1, accepted, confidence: if copied { None } else { Some(&c[..]) } })
+                    .collect();
+                let result = policy.observe(DsparkRoundObservation { shared, requests: &observed, routes: &routes,
+                    layer_us: &layer_us, total_us: total, draft_us, wide: drafted && width > policy.widths().0,
+                    predicted_us: predicted });
+                transcript.word("observed", u64::from(result.is_ok()));
+                for (r, &a) in live.iter_mut().zip(&accepted) { r.1 += a as u64; }
+                if round % 97 == 50 {
+                    // A route outside the model is rejected after earlier
+                    // requests' histories were extended.
+                    let mut bad = routes.clone();
+                    bad[5][rows - 1][0] = 400;
+                    let result = policy.observe(DsparkRoundObservation { shared, requests: &observed, routes: &bad,
+                        layer_us: &layer_us, total_us: total, draft_us, wide: false, predicted_us: None });
+                    transcript.word("rejected", u64::from(result.is_err()));
+                }
+                if round % 16 == 15 { record_state(transcript, &policy); }
+            }
+            record_state(transcript, &policy);
+        }
+    }
+
+    fn record_state(transcript: &mut Transcript, policy: &DsparkPolicy) {
+        for shared in [false, true] {
+            transcript.word("warm", u64::from(policy.warm(shared)));
+            let snapshot = policy.cost_snapshot(shared);
+            for value in snapshot.layers.iter().flatten().chain(&snapshot.round).chain(&snapshot.draft) {
+                transcript.real("fit", *value);
+            }
+        }
+        for (slope, offset) in policy.calibration() { transcript.real("slope", slope); transcript.real("offset", offset); }
+        for bias in policy.time_bias() { transcript.real("bias", bias); }
+        let stats = policy.stats();
+        for value in [stats.rounds, stats.selected_rounds, stats.verified_rows, stats.verified_drafts,
+            stats.accepted_drafts, stats.emitted_requests, stats.predicted_rounds] { transcript.word("stat", value); }
+        for &value in stats.draft_rows.iter().chain(&stats.position_reached).chain(&stats.position_accepted)
+            .chain(&stats.width_rounds) { transcript.word("count", value); }
+        for &value in stats.position_confidence.iter().chain(&stats.position_raw_confidence)
+            .chain([&stats.prediction_error_us, &stats.prediction_abs_error_us, &stats.observed_us]) {
+            transcript.real("sum", value);
+        }
+    }
+
+    /// Decisions and fits recorded from the pre-geometry `dspark_policy` (work/p0
+    /// e55eeaeb) on the replay above. A change here is a decision change.
+    #[test]
+    fn replay_reproduces_recorded_decisions_and_fits() {
+        let mut transcript = Transcript::new();
+        replay(&mut transcript);
+        if let (Some(dump), Some(path)) = (&transcript.dump, std::env::var_os("CUTEAFD_POLICY_REPLAY_DUMP")) {
+            std::fs::write(path, dump).unwrap();
+        }
+        assert_eq!((transcript.records, transcript.hash), (23_994, 2_848_516_388_929_143_687));
+    }
+
     #[test]
     fn rejects_invalid_inputs() {
         let mut policy = DsparkPolicy::new(placement(5), false);
