@@ -1,10 +1,11 @@
 pub mod coordinator_programs;
 pub mod expert_geometry;
 pub use expert_geometry::{expert_geometry, set_expert_geometry, ExpertGeometry};
-mod dspark_policy;
-pub use dspark_policy::{
-    dspark_expected_tokens, DsparkCandidate, DsparkCostSnapshot, DsparkLayerClass, DsparkObservedRequest,
-    DsparkPlacement, DsparkPolicy, DsparkPolicyStats, DsparkRoundObservation, DsparkSelection, DSPARK_LAYERS,
+mod draft_policy;
+pub use draft_policy::{
+    draft_expected_tokens, DraftCandidate, DraftCostSnapshot, DraftPolicy, DraftPolicyError, DraftPolicyStats,
+    DraftRoundObservation, DraftSelection, LayerResource, ObservedDraftRequest, PolicyGeometry, ResourceClass,
+    MAX_RESOURCE_CLASSES,
 };
 mod dspark_rng;
 pub use dspark_rng::{DsparkRng, DsparkRngReservation};

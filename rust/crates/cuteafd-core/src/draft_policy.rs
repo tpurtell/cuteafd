@@ -1,4 +1,7 @@
-//! Online dSpark verification-length policy.
+//! Online draft verification-length policy, shared by every speculating
+//! family. A family binds it with a [`PolicyGeometry`]: its layers and their
+//! expert resources, the router's expert count and top-k, the lane's row
+//! budget, the drafter's widths and the lane regimes.
 //!
 //! Each round, a lane verifies an anchor row plus a chosen number of draft
 //! rows per request. The policy chooses those lengths to maximize expected
@@ -9,13 +12,15 @@
 //!
 //! Time is priced from the resources that are actually consumed:
 //!
-//! * per layer `l >= 1`, `alpha + beta * rows + (1 / bandwidth) * megabytes`,
+//! * per timed layer, `alpha + beta * rows + (1 / bandwidth) * megabytes`,
 //!   where megabytes is the routed-expert weight traffic of that layer. The
-//!   traffic is `expert_bytes(l) * sum_e ceil(routes_e / 16)`: the grouped
-//!   slice kernels read each expert's slice once per 16-row group. Local RTX
-//!   layers and remote Spark layers are separate resource classes;
+//!   traffic is `slice_bytes * sum_e ceil(routes_e / group_rows)`: grouped
+//!   slice kernels read each expert's slice once per row group. Each layer
+//!   belongs to one resource class (for example coordinator RTX or Spark),
+//!   fitted separately;
 //! * per round, a residual `A + B * rows + C * requests` for everything else
-//!   (draft, embedding and layer 0, vocabulary head, sampling, commit).
+//!   (embedding and untimed layers, vocabulary head, sampling, commit);
+//! * per draft pass, `D + E * requests + wide * (F + G * requests)`.
 //!
 //! Every coefficient is fitted online from the lane's own timings, with
 //! exponential forgetting and Huber-weighted residuals, around weak physical
@@ -31,10 +36,6 @@
 //! This module performs no device work.
 use std::collections::{BTreeMap, VecDeque};
 
-pub const DSPARK_LAYERS: usize = 40;
-const EXPERTS: usize = 384;
-const TOPK: usize = 6;
-const GROUP_ROWS: u8 = 16;
 /// Committed tokens retained per request.
 const HISTORY: usize = 24;
 /// Shifted windows averaged by the forecast.
@@ -62,51 +63,141 @@ const OUTCOME_DECAY: f64 = 0.7;
 /// Prior weight, in reached samples, of the global calibrated rate when
 /// blending a request's own outcomes past the native block.
 const OUTCOME_PRIOR: f64 = 2.;
+/// Weight of one sample that the physical priors are worth: they only resolve
+/// directions the data cannot, such as the intercept/row split while every
+/// round has the same shape. Rows and expert traffic are strongly correlated,
+/// so any stronger prior biases the fitted bandwidth along that near-null
+/// direction.
+const PRIOR_SAMPLES: f64 = 0.01;
+/// Resource classes a geometry may name.
+pub const MAX_RESOURCE_CLASSES: usize = 4;
 
-/// Execution resource of one layer's routed experts.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum DsparkLayerClass {
-    /// Coordinator RTX (TP1 or TP2).
-    Local = 0,
-    /// Spark expert ranks behind the network boundary.
-    Remote = 1,
+/// Policy failures. Each is a caller or binding error; none is fatal to
+/// serving, which falls back to verifying every draft.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum DraftPolicyError {
+    #[error("invalid draft policy geometry: {0}")]
+    Geometry(&'static str),
+    #[error("policy requires one to {0} requests")]
+    Requests(usize),
+    #[error("invalid conditional draft confidence")]
+    Confidence,
+    #[error("route capture does not match the verified rows")]
+    RouteShape,
+    #[error("invalid verified request extent")]
+    RequestExtent,
+    #[error("route expert exceeds the model")]
+    RouteExpert,
 }
 
-impl DsparkLayerClass {
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Local => "local",
-            Self::Remote => "remote",
-        }
-    }
-}
-
-/// Installed placement: resource class and per-device slice bytes of one
-/// expert, for every layer.
+/// What one family's lane looks like to the policy. The policy holds no
+/// family constants; a binding passes its own geometry.
 #[derive(Clone, Debug, PartialEq)]
-pub struct DsparkPlacement {
-    class: [DsparkLayerClass; DSPARK_LAYERS],
-    expert_bytes: [f64; DSPARK_LAYERS],
+pub struct PolicyGeometry {
+    /// Every backbone layer, in order.
+    pub layers: Vec<LayerResource>,
+    /// Routed experts per layer; route ids are `u16`.
+    pub experts: u16,
+    /// Routes per token and layer.
+    pub topk: u8,
+    /// The lane's row budget in requests.
+    pub max_requests: usize,
+    /// Draft positions per request.
+    pub max_positions: usize,
+    /// Draft widths the drafter can switch between, ascending: one entry is a
+    /// fixed width, two let the policy choose per round. The first is the
+    /// drafter's native block, past which a request's own outcomes are blended
+    /// into its confidence.
+    pub widths: Vec<usize>,
+    /// Resource classes, fitted separately; [`LayerResource::class`] indexes them.
+    pub classes: Vec<ResourceClass>,
+    /// Lane regimes, fitted separately: 1 for a single-lane loop, 2 when a
+    /// lane may run beside an active peer lane (`shared`).
+    pub regimes: usize,
 }
 
-impl DsparkPlacement {
-    pub fn new(
-        class: [DsparkLayerClass; DSPARK_LAYERS],
-        expert_bytes: [f64; DSPARK_LAYERS],
-    ) -> Result<Self, &'static str> {
-        if expert_bytes.iter().any(|b| !b.is_finite() || *b <= 0.) {
-            return Err("expert slice bytes must be finite and positive");
+/// One backbone layer's routed-expert resource.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct LayerResource {
+    /// Resource class of the layer's routed experts; `None` for a dense layer.
+    pub class: Option<u8>,
+    /// Bytes one device reads for one expert's gate, up and down slices in
+    /// this format and tensor-parallel width.
+    pub slice_bytes: f64,
+    /// Rows per weight-read group of the installed expert kernel.
+    pub group_rows: u8,
+    /// The layer has its own timing sample. An untimed layer's time and
+    /// traffic belong to the round residual.
+    pub timed: bool,
+}
+
+/// One resource class: a monitoring label and its weak physical prior.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ResourceClass {
+    pub label: &'static str,
+    /// Prior per-layer intercept µs, µs per row and µs per MB.
+    pub prior: [f64; 3],
+    /// Precision of each prior coefficient, in samples per squared unit.
+    pub prior_precision: [f64; 3],
+}
+
+impl ResourceClass {
+    /// Coordinator RTX PRO 6000 slices at ~1.2 TB/s effective.
+    pub fn rtx() -> Self {
+        Self { label: "local", prior: [700., 15., 0.8],
+            prior_precision: [PRIOR_SAMPLES, PRIOR_SAMPLES * 36., PRIOR_SAMPLES * 300f64.powi(2)] }
+    }
+    /// GB10 Spark expert ranks behind the network at ~175 GB/s effective.
+    pub fn spark() -> Self {
+        Self { label: "remote", prior: [900., 15., 5.7],
+            prior_precision: [PRIOR_SAMPLES, PRIOR_SAMPLES * 36., PRIOR_SAMPLES * 100f64.powi(2)] }
+    }
+}
+
+/// A timed layer with routed experts: the unit the layer fits price.
+#[derive(Clone, Copy, Debug)]
+struct Priced {
+    layer: usize,
+    class: usize,
+    slice_bytes: f64,
+    group_rows: u8,
+}
+
+impl PolicyGeometry {
+    fn validate(&self) -> Result<(), DraftPolicyError> {
+        let invalid = |reason| Err(DraftPolicyError::Geometry(reason));
+        if self.layers.is_empty() { return invalid("no layers"); }
+        if self.experts == 0 || self.topk == 0 { return invalid("no routed experts"); }
+        if self.max_requests == 0 { return invalid("zero request budget"); }
+        if self.max_positions == 0 { return invalid("zero draft positions"); }
+        if self.classes.is_empty() || self.classes.len() > MAX_RESOURCE_CLASSES {
+            return invalid("one to four resource classes");
         }
-        Ok(Self { class, expert_bytes })
+        if !(1..=2).contains(&self.regimes) { return invalid("one or two lane regimes"); }
+        // The draft-cost fit prices one wide width beside the native one.
+        if self.widths.is_empty() || self.widths.len() > 2 { return invalid("one or two draft widths"); }
+        if self.widths[0] == 0 || self.widths.windows(2).any(|w| w[0] >= w[1])
+            || self.widths.iter().any(|&w| w > self.max_positions) {
+            return invalid("draft widths must ascend within the draft positions");
+        }
+        for layer in &self.layers {
+            let Some(class) = layer.class else { continue };
+            if usize::from(class) >= self.classes.len() { return invalid("layer names an unknown resource class"); }
+            if !layer.slice_bytes.is_finite() || layer.slice_bytes <= 0. {
+                return invalid("expert slice bytes must be finite and positive");
+            }
+            if layer.group_rows == 0 { return invalid("zero rows per weight-read group"); }
+        }
+        Ok(())
     }
-    pub fn class(&self, layer: usize) -> DsparkLayerClass {
-        self.class[layer]
+    fn priced(&self) -> Vec<Priced> {
+        self.layers.iter().enumerate().filter(|(_, l)| l.timed).filter_map(|(layer, l)| l.class.map(|class|
+            Priced { layer, class: usize::from(class), slice_bytes: l.slice_bytes, group_rows: l.group_rows }))
+            .collect()
     }
-    pub fn expert_bytes(&self, layer: usize) -> f64 {
-        self.expert_bytes[layer]
-    }
-    fn layers_in(&self, class: DsparkLayerClass) -> usize {
-        (1..DSPARK_LAYERS).filter(|&l| self.class[l] == class).count()
+    /// Narrow (native) and wide draft widths; equal for a fixed width.
+    fn narrow_wide(&self) -> (usize, usize) {
+        (self.widths[0], self.widths[self.widths.len() - 1])
     }
 }
 
@@ -272,9 +363,9 @@ impl Platt {
 
 /// Fitted coefficients for one regime, exported for monitoring.
 #[derive(Clone, Debug, PartialEq)]
-pub struct DsparkCostSnapshot {
+pub struct DraftCostSnapshot {
     /// Per class: intercept µs, µs per row, µs per MB, samples, residual scale µs.
-    pub layers: [[f64; 5]; 2],
+    pub layers: Vec<[f64; 5]>,
     /// Round residual: intercept µs, µs per row, µs per request, samples, scale.
     pub round: [f64; 5],
     /// Draft pass: intercept µs, µs per request, wide extra µs, wide extra µs
@@ -282,62 +373,56 @@ pub struct DsparkCostSnapshot {
     pub draft: [f64; 6],
 }
 
+/// Megabytes of expert traffic per resource class.
+type ClassBytes = [f64; MAX_RESOURCE_CLASSES];
+
 #[derive(Clone, Debug)]
 struct CostModel {
     /// [regime][class], x = [1, rows, MB].
-    layer: [[Estimator<3>; 2]; 2],
+    layer: Vec<Vec<Estimator<3>>>,
     /// [regime], x = [1, rows, requests]; excludes the draft pass.
-    round: [Estimator<3>; 2],
+    round: Vec<Estimator<3>>,
     /// [regime] draft pass, x = [1, requests, wide, wide * requests].
-    draft: [Estimator<4>; 2],
+    draft: Vec<Estimator<4>>,
     /// [regime][narrow, wide] draft passes observed.
-    draft_samples: [[u64; 2]; 2],
-    layers_in: [usize; 2],
+    draft_samples: Vec<[u64; 2]>,
+    /// Priced layers per class.
+    layers_in: Vec<usize>,
 }
 
 impl CostModel {
-    fn new(placement: &DsparkPlacement) -> Self {
-        // Physical priors (RTX PRO 6000 local slices at ~1.2 TB/s effective,
-        // GB10 Spark slices at ~175 GB/s effective) worth a hundredth of one
-        // sample: they only resolve directions the data cannot, such as the
-        // intercept/row split while every round has the same shape. Rows and
-        // expert traffic are strongly correlated, so any stronger prior biases
-        // the fitted bandwidth along that near-null direction.
-        let n0 = 0.01;
-        let local = Estimator::new(0.998, [700., 15., 0.8], [n0, n0 * 36., n0 * 300f64.powi(2)]);
-        let remote = Estimator::new(0.998, [900., 15., 5.7], [n0, n0 * 36., n0 * 100f64.powi(2)]);
+    fn new(geometry: &PolicyGeometry, priced: &[Priced]) -> Self {
+        let n0 = PRIOR_SAMPLES;
+        let layer: Vec<_> = geometry.classes.iter()
+            .map(|class| Estimator::new(0.998, class.prior, class.prior_precision)).collect();
         let round = Estimator::new(0.98, [5000., 300., 200.], [n0, n0 * 36., n0]);
         let draft = Estimator::new(0.98, [2500., 100., 400., 50.], [n0, n0 * 16., n0, n0 * 16.]);
         Self {
-            layer: [[local.clone(), remote.clone()], [local, remote]],
-            round: [round.clone(), round],
-            draft: [draft.clone(), draft],
-            draft_samples: [[0; 2]; 2],
-            layers_in: [
-                placement.layers_in(DsparkLayerClass::Local),
-                placement.layers_in(DsparkLayerClass::Remote),
-            ],
+            layer: vec![layer; geometry.regimes],
+            round: vec![round; geometry.regimes],
+            draft: vec![draft; geometry.regimes],
+            draft_samples: vec![[0; 2]; geometry.regimes],
+            layers_in: (0..geometry.classes.len()).map(|c| priced.iter().filter(|p| p.class == c).count()).collect(),
         }
     }
     fn warm(&self, regime: usize) -> bool {
         self.round[regime].samples >= WARM_ROUND_SAMPLES
-            && (0..2).all(|c| self.layers_in[c] == 0 || self.layer[regime][c].samples >= WARM_LAYER_SAMPLES)
+            && (0..self.layers_in.len()).all(|c| self.layers_in[c] == 0 || self.layer[regime][c].samples >= WARM_LAYER_SAMPLES)
     }
-    /// The regime's own fit once warm, else the other regime's warm fit.
-    fn usable_regime(&self, shared: bool) -> Option<usize> {
-        let own = usize::from(shared);
-        if self.warm(own) { Some(own) } else if self.warm(1 - own) { Some(1 - own) } else { None }
+    /// The regime's own fit once warm, else another regime's warm fit.
+    fn usable_regime(&self, regime: usize) -> Option<usize> {
+        std::iter::once(regime).chain((0..self.round.len()).filter(|&r| r != regime)).find(|&r| self.warm(r))
     }
-    fn predict(&self, regime: usize, rows: f64, requests: f64, megabytes: [f64; 2]) -> f64 {
+    fn predict(&self, regime: usize, rows: f64, requests: f64, megabytes: ClassBytes) -> f64 {
         let mut total = self.round[regime].predict(&[1., rows, requests]);
-        for class in 0..2 {
+        for class in 0..self.layers_in.len() {
             let theta = &self.layer[regime][class].theta;
             let layers = self.layers_in[class] as f64;
             total += layers * (theta[0] + theta[1] * rows) + theta[2] * megabytes[class];
         }
         total
     }
-    /// Marginal µs of one more row plus `megabytes` of new weight traffic.
+    /// Predicted µs of the draft pass.
     fn draft_us(&self, regime: usize, requests: f64, wide: bool) -> f64 {
         let wide = f64::from(u8::from(wide));
         self.draft[regime].predict(&[1., requests, wide, wide * requests])
@@ -345,37 +430,36 @@ impl CostModel {
     fn widths_warm(&self, regime: usize) -> bool {
         self.draft_samples[regime].iter().all(|&n| n >= WARM_WIDTH_SAMPLES)
     }
-    fn marginal(&self, regime: usize, megabytes: [f64; 2]) -> f64 {
+    /// Marginal µs of one more row plus `megabytes` of new weight traffic.
+    fn marginal(&self, regime: usize, megabytes: ClassBytes) -> f64 {
         let mut total = self.round[regime].theta[1];
-        for class in 0..2 {
+        for class in 0..self.layers_in.len() {
             let theta = &self.layer[regime][class].theta;
             total += self.layers_in[class] as f64 * theta[1] + theta[2] * megabytes[class];
         }
         total
     }
-    fn snapshot(&self, regime: usize) -> DsparkCostSnapshot {
+    fn snapshot(&self, regime: usize) -> DraftCostSnapshot {
         let pack = |e: &Estimator<3>| [e.theta[0], e.theta[1], e.theta[2], e.samples as f64, e.scale];
         let draft = &self.draft[regime];
-        DsparkCostSnapshot {
-            layers: [pack(&self.layer[regime][0]), pack(&self.layer[regime][1])],
+        DraftCostSnapshot {
+            layers: self.layer[regime].iter().map(pack).collect(),
             round: pack(&self.round[regime]),
             draft: [draft.theta[0], draft.theta[1], draft.theta[2], draft.theta[3], draft.samples as f64, draft.scale],
         }
     }
 }
 
-type TokenRoutes = [[u16; TOPK]; DSPARK_LAYERS];
-
 /// One request's candidate: conditional acceptance probability of each
 /// available draft position, in order (sigmoid of the draft confidence).
 #[derive(Clone, Copy, Debug)]
-pub struct DsparkCandidate<'a> {
+pub struct DraftCandidate<'a> {
     pub id: u64,
     pub confidence: &'a [f64],
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct DsparkSelection {
+pub struct DraftSelection {
     /// Draft rows retained per request, excluding the anchor.
     pub lengths: Vec<usize>,
     pub expected_tokens: f64,
@@ -386,7 +470,7 @@ pub struct DsparkSelection {
 
 /// One verified request of a completed round.
 #[derive(Clone, Copy, Debug)]
-pub struct DsparkObservedRequest<'a> {
+pub struct ObservedDraftRequest<'a> {
     pub id: u64,
     /// Verifier rows of this request, including its anchor.
     pub rows: usize,
@@ -398,15 +482,16 @@ pub struct DsparkObservedRequest<'a> {
 
 /// Timing and routes of one completed lane round.
 #[derive(Clone, Copy, Debug)]
-pub struct DsparkRoundObservation<'a> {
+pub struct DraftRoundObservation<'a> {
     /// Another lane had active requests during this round.
     pub shared: bool,
-    pub requests: &'a [DsparkObservedRequest<'a>],
-    /// Routes per layer, one entry per lane row in request order.
-    pub routes: &'a [Vec<[u32; TOPK]>],
-    /// Wall µs of layers 1..40 (index 0 unused), each from the previous
-    /// layer's FFN completion to its own.
-    pub layer_us: &'a [Option<f64>; DSPARK_LAYERS],
+    pub requests: &'a [ObservedDraftRequest<'a>],
+    /// Expert ids, layer-major `[layer][row][slot]` over every layer of the
+    /// geometry and every lane row in request order.
+    pub routes: &'a [u16],
+    /// Wall µs of each timed layer, by layer index (missing entries are
+    /// `None`), each from the previous layer's FFN completion to its own.
+    pub layer_us: &'a [Option<f64>],
     /// Round wall µs from draft start to commit completion.
     pub total_us: f64,
     /// Wall µs of the draft pass (NaN if none ran), and whether it used the
@@ -418,24 +503,24 @@ pub struct DsparkRoundObservation<'a> {
 }
 
 /// Cumulative serving statistics.
-#[derive(Clone, Debug, Default, PartialEq)]
-pub struct DsparkPolicyStats {
+#[derive(Clone, Debug, PartialEq)]
+pub struct DraftPolicyStats {
     pub rounds: u64,
     pub selected_rounds: u64,
     pub verified_rows: u64,
     pub verified_drafts: u64,
     pub accepted_drafts: u64,
     pub emitted_requests: u64,
-    /// Requests verified with k draft rows, k = 0..=7.
-    pub draft_rows: [u64; 8],
+    /// Requests verified with k draft rows, k = 0..=max_positions.
+    pub draft_rows: Vec<u64>,
     /// Per draft position: times reached with all earlier drafts accepted,
     /// summed conditional confidence there, and acceptances there.
-    pub position_reached: [u64; 7],
+    pub position_reached: Vec<u64>,
     /// Summed calibrated confidence where reached (what the policy used).
-    pub position_confidence: [f64; 7],
+    pub position_confidence: Vec<f64>,
     /// Summed raw drafter confidence where reached.
-    pub position_raw_confidence: [f64; 7],
-    pub position_accepted: [u64; 7],
+    pub position_raw_confidence: Vec<f64>,
+    pub position_accepted: Vec<u64>,
     /// Draft passes at the narrow and wide width.
     pub width_rounds: [u64; 2],
     pub predicted_rounds: u64,
@@ -444,104 +529,124 @@ pub struct DsparkPolicyStats {
     pub observed_us: f64,
 }
 
+impl DraftPolicyStats {
+    fn new(positions: usize) -> Self {
+        Self { rounds: 0, selected_rounds: 0, verified_rows: 0, verified_drafts: 0, accepted_drafts: 0,
+            emitted_requests: 0, draft_rows: vec![0; positions + 1], position_reached: vec![0; positions],
+            position_confidence: vec![0.; positions], position_raw_confidence: vec![0.; positions],
+            position_accepted: vec![0; positions], width_rounds: [0; 2], predicted_rounds: 0,
+            prediction_error_us: 0., prediction_abs_error_us: 0., observed_us: 0. }
+    }
+}
+
 /// Whole-policy state: route history, cost fit, and statistics.
 #[derive(Clone, Debug)]
-pub struct DsparkPolicy {
-    placement: DsparkPlacement,
+pub struct DraftPolicy {
+    geometry: PolicyGeometry,
+    priced: Vec<Priced>,
     fixed: bool,
     cost: CostModel,
-    history: BTreeMap<u64, VecDeque<TokenRoutes>>,
+    /// Per request, the routes of recent committed tokens, newest first, each
+    /// `layers * topk` expert ids.
+    history: BTreeMap<u64, VecDeque<Box<[u16]>>>,
     /// Expected new expert groups per layer contributed by a token whose routes
     /// are not yet known (short histories), from observed novelty.
-    novelty: [f64; DSPARK_LAYERS],
+    novelty: Vec<f64>,
     /// Per-position Platt calibration of the drafter's confidence. Confidence
     /// is conditional on earlier positions being accepted, and its reliability
-    /// varies by position: past the drafter's native five-token block it
-    /// saturates near 0.99 whatever the content, so a slope as well as an
-    /// offset is needed. Each position is refitted online from the outcomes
-    /// of the rounds that reached it.
-    calibration: [Platt; crate::MAX_DSPARK_PROPOSALS],
+    /// varies by position: past the drafter's native block it saturates near
+    /// 0.99 whatever the content, so a slope as well as an offset is needed.
+    /// Each position is refitted online from the outcomes of the rounds that
+    /// reached it.
+    calibration: Vec<Platt>,
     /// Mean residual of the predicted round time per regime. The robust fit
     /// tracks typical rounds, while throughput depends on mean time including
     /// stalls; this constant restores the mean without moving the marginals.
-    bias: [f64; 2],
-    /// Draft widths the chain supports (narrow, wide); equal disables choice.
-    widths: (usize, usize),
+    bias: Vec<f64>,
     /// Per request, short-memory calibrated confidence per drafted position.
-    recent: BTreeMap<u64, [Option<f64>; crate::MAX_DSPARK_PROPOSALS]>,
+    recent: BTreeMap<u64, Vec<Option<f64>>>,
     /// Per request, decayed (accepted, reached) counts per position. Past the
     /// drafter's native block its confidence carries no content signal, so a
     /// request's own recent outcomes there (long accepted runs in code, short
     /// ones in prose) are the only request-specific evidence.
-    outcomes: BTreeMap<u64, [(f64, f64); crate::MAX_DSPARK_PROPOSALS]>,
+    outcomes: BTreeMap<u64, Vec<(f64, f64)>>,
     /// Long-memory mean raw confidence per position, for requests without
     /// recent evidence at that position.
-    raw_mean: [f64; crate::MAX_DSPARK_PROPOSALS],
+    raw_mean: Vec<f64>,
     /// Draft passes since each width (narrow, wide) last ran.
     since_width: [u64; 2],
-    stats: DsparkPolicyStats,
-    counts: Vec<[[u8; EXPERTS]; DSPARK_LAYERS]>,
+    stats: DraftPolicyStats,
+    /// Routes per (window, layer, expert) in the shape being evaluated.
+    counts: Vec<u8>,
+    /// Routes per expert of one observed layer.
+    scratch: Vec<u16>,
 }
 
-impl DsparkPolicy {
+impl DraftPolicy {
     /// `fixed` verifies every available draft but still fits and reports.
-    pub fn new(placement: DsparkPlacement, fixed: bool) -> Self {
+    pub fn new(geometry: PolicyGeometry, fixed: bool) -> Result<Self, DraftPolicyError> {
+        geometry.validate()?;
+        Ok(Self::build(geometry, fixed))
+    }
+    fn build(geometry: PolicyGeometry, fixed: bool) -> Self {
+        let priced = geometry.priced();
+        let positions = geometry.max_positions;
         Self {
-            cost: CostModel::new(&placement),
-            placement,
+            cost: CostModel::new(&geometry, &priced),
+            priced,
             fixed,
             history: BTreeMap::new(),
-            novelty: [2.5; DSPARK_LAYERS],
-            calibration: [Platt::new(); crate::MAX_DSPARK_PROPOSALS],
-            bias: [0.; 2],
-            widths: (5, 7),
+            novelty: vec![2.5; geometry.layers.len()],
+            calibration: vec![Platt::new(); positions],
+            bias: vec![0.; geometry.regimes],
             recent: BTreeMap::new(),
             outcomes: BTreeMap::new(),
-            raw_mean: [0.9; crate::MAX_DSPARK_PROPOSALS],
+            raw_mean: vec![0.9; positions],
             since_width: [0; 2],
-            stats: DsparkPolicyStats::default(),
-            counts: vec![[[0; EXPERTS]; DSPARK_LAYERS]; WINDOWS],
+            stats: DraftPolicyStats::new(positions),
+            counts: vec![0; WINDOWS * geometry.layers.len() * usize::from(geometry.experts)],
+            scratch: vec![0; usize::from(geometry.experts)],
+            geometry,
         }
+    }
+    /// A fresh policy over the same geometry.
+    pub fn restarted(&self, fixed: bool) -> Self {
+        Self::build(self.geometry.clone(), fixed)
     }
     pub fn fixed(&self) -> bool {
         self.fixed
     }
-    pub fn placement(&self) -> &DsparkPlacement {
-        &self.placement
+    pub fn geometry(&self) -> &PolicyGeometry {
+        &self.geometry
     }
-    pub fn stats(&self) -> &DsparkPolicyStats {
+    pub fn stats(&self) -> &DraftPolicyStats {
         &self.stats
     }
-    pub fn cost_snapshot(&self, shared: bool) -> DsparkCostSnapshot {
-        self.cost.snapshot(usize::from(shared))
+    fn regime(&self, shared: bool) -> usize {
+        usize::from(shared).min(self.geometry.regimes - 1)
+    }
+    pub fn cost_snapshot(&self, shared: bool) -> DraftCostSnapshot {
+        self.cost.snapshot(self.regime(shared))
     }
     pub fn warm(&self, shared: bool) -> bool {
-        self.cost.warm(usize::from(shared))
+        self.cost.warm(self.regime(shared))
     }
     pub fn release(&mut self, id: u64) {
         self.history.remove(&id);
         self.recent.remove(&id);
         self.outcomes.remove(&id);
     }
-    /// Draft widths the chain can switch between; `narrow == wide` disables
-    /// width choice.
-    pub fn set_widths(&mut self, narrow: usize, wide: usize) -> Result<(), &'static str> {
-        if narrow == 0 || narrow > wide || wide > crate::MAX_DSPARK_PROPOSALS {
-            return Err("invalid draft widths");
-        }
-        self.widths = (narrow, wide);
-        Ok(())
-    }
-    pub fn widths(&self) -> (usize, usize) {
-        self.widths
+    /// Draft widths the drafter can switch between.
+    pub fn widths(&self) -> &[usize] {
+        &self.geometry.widths
     }
     /// Learned (slope, offset) on the raw logit, per draft position.
-    pub fn calibration(&self) -> [(f64, f64); crate::MAX_DSPARK_PROPOSALS] {
-        self.calibration.map(|platt| (platt.theta[0], platt.theta[1]))
+    pub fn calibration(&self) -> Vec<(f64, f64)> {
+        self.calibration.iter().map(|platt| (platt.theta[0], platt.theta[1])).collect()
     }
     /// Mean prediction-residual correction per regime (solo, shared), µs.
-    pub fn time_bias(&self) -> [f64; 2] {
-        self.bias
+    pub fn time_bias(&self) -> &[f64] {
+        &self.bias
     }
     fn calibrated(&self, position: usize, probability: f64) -> f64 {
         self.calibration[position].apply(probability)
@@ -550,7 +655,7 @@ impl DsparkPolicy {
     /// confidence inside the native block, and past it the request's own
     /// recent outcomes shrunk toward that calibrated rate.
     fn request_probability(&self, id: u64, position: usize, calibrated: f64) -> f64 {
-        if position < self.widths.0 { return calibrated; }
+        if position < self.geometry.widths[0] { return calibrated; }
         let (hits, trials) = self.outcomes.get(&id).map_or((0., 0.), |o| o[position]);
         (hits + OUTCOME_PRIOR * calibrated) / (trials + OUTCOME_PRIOR)
     }
@@ -558,39 +663,37 @@ impl DsparkPolicy {
     /// Predicted lane µs for explicit lengths after a draft of `width`, if the
     /// fit is usable.
     pub fn predict(&mut self, shared: bool, ids: &[u64], lengths: &[usize], width: usize) -> Option<f64> {
-        let regime = self.cost.usable_regime(shared)?;
+        let regime = self.cost.usable_regime(self.regime(shared))?;
         self.clear_counts();
-        let mut megabytes = [0.; 2];
+        let mut megabytes = [0.; MAX_RESOURCE_CLASSES];
         for (index, (&id, &length)) in ids.iter().zip(lengths).enumerate() {
             for row in 0..=length {
-                let delta = self.add_row(id, row, index);
-                megabytes[0] += delta[0];
-                megabytes[1] += delta[1];
+                add_bytes(&mut megabytes, self.add_row(id, row, index));
             }
         }
         let rows = ids.len() + lengths.iter().sum::<usize>();
-        let draft = self.cost.draft_us(regime, ids.len() as f64, width > self.widths.0);
+        let draft = self.cost.draft_us(regime, ids.len() as f64, width > self.geometry.widths[0]);
         Some(self.cost.predict(regime, rows as f64, ids.len() as f64, megabytes) + draft + self.bias[regime])
     }
 
     /// Choose draft lengths for one lane after a draft of `width`. Returns
     /// `None` while the fit is still warming up or in fixed mode; the caller
     /// then verifies every draft.
-    pub fn select(&mut self, shared: bool, candidates: &[DsparkCandidate<'_>], width: usize)
-        -> Result<Option<DsparkSelection>, &'static str> {
-        if candidates.is_empty() || candidates.len() > 16 {
-            return Err("policy requires one to sixteen requests");
+    pub fn select(&mut self, shared: bool, candidates: &[DraftCandidate<'_>], width: usize)
+        -> Result<Option<DraftSelection>, DraftPolicyError> {
+        if candidates.is_empty() || candidates.len() > self.geometry.max_requests {
+            return Err(DraftPolicyError::Requests(self.geometry.max_requests));
         }
         for candidate in candidates {
-            if candidate.confidence.len() > crate::MAX_DSPARK_PROPOSALS
+            if candidate.confidence.len() > self.geometry.max_positions
                 || candidate.confidence.iter().any(|p| !p.is_finite() || !(0.0..=1.0).contains(p)) {
-                return Err("invalid conditional draft confidence");
+                return Err(DraftPolicyError::Confidence);
             }
         }
         if self.fixed {
             return Ok(None);
         }
-        let Some(regime) = self.cost.usable_regime(shared) else { return Ok(None) };
+        let Some(regime) = self.cost.usable_regime(self.regime(shared)) else { return Ok(None) };
         // Survival of row k: the product of calibrated conditional acceptance
         // probabilities of positions 1..=k.
         let cumulative: Vec<Vec<f64>> = candidates.iter().map(|c| {
@@ -601,7 +704,7 @@ impl DsparkPolicy {
             }).collect()
         }).collect();
         let ids: Vec<_> = candidates.iter().map(|c| c.id).collect();
-        let draft = self.cost.draft_us(regime, ids.len() as f64, width > self.widths.0);
+        let draft = self.cost.draft_us(regime, ids.len() as f64, width > self.geometry.widths[0]);
         Ok(Some(self.select_core(regime, &ids, &cumulative, draft)))
     }
 
@@ -611,10 +714,10 @@ impl DsparkPolicy {
     /// each charged its own predicted draft pass; the better expected ratio
     /// wins, ties going to the narrow width.
     pub fn choose_width(&mut self, shared: bool, requests: &[(u64, usize)]) -> usize {
-        let (narrow, wide) = self.widths;
+        let (narrow, wide) = self.geometry.narrow_wide();
         if narrow == wide || requests.is_empty() { return narrow; }
         if self.fixed { return wide; }
-        let regime = self.cost.usable_regime(shared);
+        let regime = self.cost.usable_regime(self.regime(shared));
         let Some(regime) = regime.filter(|&r| self.cost.widths_warm(r)) else {
             // Warm up both draft-cost fits by alternating widths.
             return if self.stats.width_rounds[0] <= self.stats.width_rounds[1] { narrow } else { wide };
@@ -645,20 +748,18 @@ impl DsparkPolicy {
     /// Forward-growth length selection over survival products, with the round's
     /// draft pass priced in.
     fn select_core(&mut self, regime: usize, ids: &[u64], cumulative: &[Vec<f64>], draft_us: f64)
-        -> DsparkSelection {
+        -> DraftSelection {
         self.clear_counts();
-        let mut megabytes = [0.; 2];
+        let mut megabytes = [0.; MAX_RESOURCE_CLASSES];
         for (index, &id) in ids.iter().enumerate() {
-            let delta = self.add_row(id, 0, index);
-            megabytes[0] += delta[0];
-            megabytes[1] += delta[1];
+            add_bytes(&mut megabytes, self.add_row(id, 0, index));
         }
         let requests = ids.len() as f64;
         let mut rows = ids.len();
         let mut lengths = vec![0usize; ids.len()];
         let mut expected = requests;
         let mut time = self.cost.predict(regime, rows as f64, requests, megabytes) + draft_us + self.bias[regime];
-        let mut best = DsparkSelection {
+        let mut best = DraftSelection {
             lengths: lengths.clone(), expected_tokens: expected, predicted_us: time, evaluated: 1,
         };
         let mut evaluated = 1;
@@ -698,69 +799,90 @@ impl DsparkPolicy {
     }
 
     fn clear_counts(&mut self) {
-        for window in &mut self.counts {
-            for layer in window.iter_mut() { layer.fill(0); }
-        }
+        self.counts.fill(0);
     }
 
-    /// Route set standing in for row `row` of request `id` in window `window`.
-    fn stand_in(&self, id: u64, row: usize, window: usize) -> Option<&TokenRoutes> {
-        self.history.get(&id)?.get(window + row)
+    fn count_index(&self, window: usize, layer: usize, expert: u16) -> usize {
+        (window * self.geometry.layers.len() + layer) * usize::from(self.geometry.experts) + usize::from(expert)
+    }
+
+    /// Routes of `layer` in the token standing in for row `row` of request
+    /// `id` in window `window`.
+    fn stand_in(&self, id: u64, row: usize, window: usize) -> Option<&[u16]> {
+        self.history.get(&id)?.get(window + row).map(|token| &token[..])
     }
 
     /// Megabytes of new weight traffic per class if row `row` of `id` joined
     /// the current shape, averaged over the forecast windows.
-    fn peek_row(&self, id: u64, row: usize) -> [f64; 2] {
-        let mut total = [0.; 2];
+    fn peek_row(&self, id: u64, row: usize) -> ClassBytes {
+        let topk = usize::from(self.geometry.topk);
+        let mut total = [0.; MAX_RESOURCE_CLASSES];
         for window in 0..WINDOWS {
             let routes = self.stand_in(id, row, window);
-            for layer in 1..DSPARK_LAYERS {
+            for priced in &self.priced {
                 let groups = match routes {
-                    Some(routes) => routes[layer].iter()
-                        .filter(|&&e| self.counts[window][layer][e as usize] % GROUP_ROWS == 0).count() as f64,
-                    None if row == 0 => TOPK as f64,
-                    None => self.novelty[layer],
+                    Some(routes) => routes[priced.layer * topk..][..topk].iter()
+                        .filter(|&&e| self.counts[self.count_index(window, priced.layer, e)] % priced.group_rows == 0)
+                        .count() as f64,
+                    None if row == 0 => topk as f64,
+                    None => self.novelty[priced.layer],
                 };
-                total[self.placement.class[layer] as usize] += groups * self.placement.expert_bytes[layer];
+                total[priced.class] += groups * priced.slice_bytes;
             }
         }
         total.map(|bytes| bytes / WINDOWS as f64 / 1e6)
     }
 
-    fn add_row(&mut self, id: u64, row: usize, _request: usize) -> [f64; 2] {
+    fn add_row(&mut self, id: u64, row: usize, _request: usize) -> ClassBytes {
         let delta = self.peek_row(id, row);
+        let topk = usize::from(self.geometry.topk);
         for window in 0..WINDOWS {
-            let Some(routes) = self.history.get(&id).and_then(|h| h.get(window + row)).copied() else { continue };
-            for layer in 1..DSPARK_LAYERS {
-                for &expert in &routes[layer] {
-                    let count = &mut self.counts[window][layer][expert as usize];
-                    *count = count.saturating_add(1);
+            let Some(token) = self.history.get(&id).and_then(|h| h.get(window + row)) else { continue };
+            for priced in &self.priced {
+                for &expert in &token[priced.layer * topk..][..topk] {
+                    let index = (window * self.geometry.layers.len() + priced.layer)
+                        * usize::from(self.geometry.experts) + usize::from(expert);
+                    self.counts[index] = self.counts[index].saturating_add(1);
                 }
             }
         }
         delta
     }
 
+    /// Weight-read groups of one layer of an observed round: each expert's
+    /// slice is read once per `group_rows` routed rows.
+    fn route_groups(&mut self, routes: &[u16], group_rows: u8) -> f64 {
+        self.scratch.fill(0);
+        for &expert in routes {
+            if let Some(count) = self.scratch.get_mut(usize::from(expert)) { *count += 1; }
+        }
+        self.scratch.iter().map(|&c| u32::from(c.div_ceil(u16::from(group_rows)))).sum::<u32>() as f64
+    }
+
     /// Record a completed round: timings update the cost fit, accepted rows'
     /// routes extend each request's history, acceptance updates statistics.
-    pub fn observe(&mut self, round: DsparkRoundObservation<'_>) -> Result<(), &'static str> {
+    pub fn observe(&mut self, round: DraftRoundObservation<'_>) -> Result<(), DraftPolicyError> {
+        let layers = self.geometry.layers.len();
+        let topk = usize::from(self.geometry.topk);
+        let positions = self.geometry.max_positions;
         let rows: usize = round.requests.iter().map(|r| r.rows).sum();
-        if round.routes.len() != DSPARK_LAYERS || round.routes.iter().any(|r| r.len() != rows) {
-            return Err("route capture does not match the verified rows");
+        if round.routes.len() != layers * rows * topk {
+            return Err(DraftPolicyError::RouteShape);
         }
         if round.requests.iter().any(|r| r.rows == 0 || r.accepted == 0 || r.accepted > r.rows) {
-            return Err("invalid verified request extent");
+            return Err(DraftPolicyError::RequestExtent);
         }
-        let regime = usize::from(round.shared);
+        let regime = self.regime(round.shared);
         let requests = round.requests.len() as f64;
+        let layer_routes = |layer: usize| &round.routes[layer * rows * topk..][..rows * topk];
         let mut layer_sum = 0.;
         let mut complete = true;
-        for layer in 1..DSPARK_LAYERS {
-            let Some(elapsed) = round.layer_us[layer] else { complete = false; continue };
+        for index in 0..self.priced.len() {
+            let priced = self.priced[index];
+            let Some(elapsed) = round.layer_us.get(priced.layer).copied().flatten() else { complete = false; continue };
             layer_sum += elapsed;
-            let megabytes = route_groups(&round.routes[layer]) * self.placement.expert_bytes[layer] / 1e6;
-            let class = self.placement.class[layer] as usize;
-            self.cost.layer[regime][class].observe([1., rows as f64, megabytes], elapsed);
+            let megabytes = self.route_groups(layer_routes(priced.layer), priced.group_rows) * priced.slice_bytes / 1e6;
+            self.cost.layer[regime][priced.class].observe([1., rows as f64, megabytes], elapsed);
         }
         let drafted = round.draft_us.is_finite();
         let draft_us = if drafted { round.draft_us } else { 0. };
@@ -781,18 +903,20 @@ impl DsparkPolicy {
         for request in round.requests {
             let history = self.history.entry(request.id).or_default();
             for row in offset..offset + request.accepted {
-                let mut token = [[0u16; TOPK]; DSPARK_LAYERS];
-                for layer in 0..DSPARK_LAYERS {
-                    for (slot, &expert) in round.routes[layer][row].iter().enumerate() {
-                        let expert = expert & 511;
-                        if expert as usize >= EXPERTS { return Err("route expert exceeds the model"); }
-                        token[layer][slot] = expert as u16;
+                let mut token = vec![0u16; layers * topk].into_boxed_slice();
+                for layer in 0..layers {
+                    let routes = &layer_routes(layer)[row * topk..][..topk];
+                    if routes.iter().any(|&expert| expert >= self.geometry.experts) {
+                        return Err(DraftPolicyError::RouteExpert);
                     }
+                    token[layer * topk..][..topk].copy_from_slice(routes);
                 }
                 if history.len() >= 3 {
-                    for layer in 1..DSPARK_LAYERS {
-                        let novel = token[layer].iter()
-                            .filter(|e| !history.iter().take(3).any(|t| t[layer].contains(e))).count();
+                    for priced in &self.priced {
+                        let layer = priced.layer;
+                        let novel = token[layer * topk..][..topk].iter()
+                            .filter(|e| !history.iter().take(3).any(|t| t[layer * topk..][..topk].contains(e)))
+                            .count();
                         self.novelty[layer] = 0.995 * self.novelty[layer] + 0.005 * novel as f64;
                     }
                 }
@@ -805,13 +929,13 @@ impl DsparkPolicy {
             self.stats.verified_drafts += drafts as u64;
             self.stats.accepted_drafts += accepted as u64;
             self.stats.emitted_requests += 1;
-            self.stats.draft_rows[drafts.min(7)] += 1;
+            self.stats.draft_rows[drafts.min(positions)] += 1;
             if let Some(confidence) = request.confidence {
                 // Every drafted position's calibrated confidence feeds the
                 // request's short-memory estimate used to choose the next
                 // round's width, whether or not the position was verified.
-                let recent = self.recent.entry(request.id).or_insert([None; crate::MAX_DSPARK_PROPOSALS]);
-                for (position, &raw) in confidence.iter().enumerate().take(crate::MAX_DSPARK_PROPOSALS) {
+                let recent = self.recent.entry(request.id).or_insert_with(|| vec![None; positions]);
+                for (position, &raw) in confidence.iter().enumerate().take(positions) {
                     let calibrated = self.calibration[position].apply(raw);
                     recent[position] = Some(match recent[position] {
                         Some(previous) => previous + RECENT_RATE * (calibrated - previous),
@@ -821,7 +945,8 @@ impl DsparkPolicy {
                 }
                 // Only positions whose predecessors were all accepted carry
                 // evidence about the conditional acceptance probability.
-                for position in 0..drafts.min(confidence.len()).min(accepted + 1) {
+                let reached = drafts.min(confidence.len()).min(accepted + 1).min(positions);
+                for position in 0..reached {
                     let outcome = f64::from(u8::from(position < accepted));
                     let calibrated = self.calibrated(position, confidence[position]);
                     self.stats.position_reached[position] += 1;
@@ -830,10 +955,9 @@ impl DsparkPolicy {
                     self.stats.position_accepted[position] += u64::from(position < accepted);
                     self.calibration[position].observe(confidence[position], outcome);
                 }
-                let counts = self.outcomes.entry(request.id)
-                    .or_insert([(0., 0.); crate::MAX_DSPARK_PROPOSALS]);
+                let counts = self.outcomes.entry(request.id).or_insert_with(|| vec![(0., 0.); positions]);
                 for count in counts.iter_mut() { count.0 *= OUTCOME_DECAY; count.1 *= OUTCOME_DECAY; }
-                for position in 0..drafts.min(confidence.len()).min(accepted + 1) {
+                for position in 0..reached {
                     counts[position].0 += f64::from(u8::from(position < accepted));
                     counts[position].1 += 1.;
                 }
@@ -857,21 +981,13 @@ impl DsparkPolicy {
     }
 }
 
-/// Weight-read groups of one layer: each expert's slice is read once per
-/// sixteen routed rows.
-fn route_groups(rows: &[[u32; TOPK]]) -> f64 {
-    let mut counts = [0u16; EXPERTS];
-    for route in rows {
-        for &expert in route {
-            if let Some(count) = counts.get_mut((expert & 511) as usize) { *count += 1; }
-        }
-    }
-    counts.iter().map(|&c| c.div_ceil(u16::from(GROUP_ROWS))).sum::<u16>() as f64
+fn add_bytes(total: &mut ClassBytes, delta: ClassBytes) {
+    for (total, delta) in total.iter_mut().zip(delta) { *total += delta; }
 }
 
 /// Expected committed tokens for conditional confidences: the mandatory
 /// anchor/bonus plus the cumulative acceptance probability of each draft.
-pub fn dspark_expected_tokens(confidence: &[f64]) -> f64 {
+pub fn draft_expected_tokens(confidence: &[f64]) -> f64 {
     let mut product = 1.;
     1. + confidence.iter().map(|p| { product *= p; product }).sum::<f64>()
 }
@@ -880,10 +996,38 @@ pub fn dspark_expected_tokens(confidence: &[f64]) -> f64 {
 mod tests {
     use super::*;
 
-    fn placement(local: usize) -> DsparkPlacement {
-        let class = std::array::from_fn(|l| if l < local { DsparkLayerClass::Local } else { DsparkLayerClass::Remote });
-        let bytes = std::array::from_fn(|l| if l < local { 18_800_640. } else { 4_700_160. });
-        DsparkPlacement::new(class, bytes).unwrap()
+    /// The V4.1 geometry as its binding builds it: 40 layers of 384 experts,
+    /// top-6, 16-row slice kernels, layer 0 untimed, 16 requests, 7 draft
+    /// positions, two regimes, RTX (0) and Spark (1) classes.
+    fn v41(local: impl Fn(usize) -> bool, bytes: impl Fn(usize) -> f64, widths: Vec<usize>) -> PolicyGeometry {
+        PolicyGeometry {
+            layers: (0..40).map(|l| LayerResource { class: Some(u8::from(!local(l))), slice_bytes: bytes(l),
+                group_rows: 16, timed: l > 0 }).collect(),
+            experts: 384, topk: 6, max_requests: 16, max_positions: 7, widths,
+            classes: vec![ResourceClass::rtx(), ResourceClass::spark()], regimes: 2,
+        }
+    }
+
+    fn placement(local: usize) -> PolicyGeometry {
+        v41(|l| l < local, |l| if l < local { 18_800_640. } else { 4_700_160. }, vec![5, 7])
+    }
+
+    /// Routes as V4.1 captures them (`[layer][row]`, router flag bits above
+    /// the expert index), flattened as its binding passes them.
+    fn flat(routes: &[Vec<[u32; 6]>]) -> Vec<u16> {
+        routes.iter().flatten().flatten().map(|&e| (e & 511) as u16).collect()
+    }
+
+    /// Weight-read groups of one layer by sixteen-row tiles, as the old core
+    /// counted them.
+    fn groups(rows: &[[u32; 6]]) -> f64 {
+        let mut counts = [0u16; 384];
+        for route in rows {
+            for &expert in route {
+                if let Some(count) = counts.get_mut((expert & 511) as usize) { *count += 1; }
+            }
+        }
+        counts.iter().map(|&c| c.div_ceil(16)).sum::<u16>() as f64
     }
 
     /// Deterministic synthetic router: each token draws six experts from a
@@ -909,21 +1053,21 @@ mod tests {
     /// Synthetic ground truth used to train the estimator.
     struct Truth { alpha: [f64; 2], beta: [f64; 2], us_per_mb: [f64; 2], round: [f64; 3] }
 
-    fn run_round(policy: &mut DsparkPolicy, truth: &Truth, token: &mut u64, rows: usize, accepted: usize,
+    fn run_round(policy: &mut DraftPolicy, truth: &Truth, token: &mut u64, rows: usize, accepted: usize,
         predicted: Option<f64>) -> f64 {
         let token_rows: Vec<_> = (0..rows).map(|r| token_routes(*token + r as u64, 24)).collect();
         let routes: Vec<Vec<[u32; 6]>> = (0..40).map(|l| token_rows.iter().map(|t| t[l]).collect()).collect();
         let mut layer_us = [None; 40];
         let mut total = truth.round[0] + truth.round[1] * rows as f64 + truth.round[2];
         for layer in 1..40 {
-            let class = policy.placement.class(layer) as usize;
-            let mb = route_groups(&routes[layer]) * policy.placement.expert_bytes(layer) / 1e6;
+            let class = policy.geometry.layers[layer].class.unwrap() as usize;
+            let mb = groups(&routes[layer]) * policy.geometry.layers[layer].slice_bytes / 1e6;
             let t = truth.alpha[class] + truth.beta[class] * rows as f64 + truth.us_per_mb[class] * mb;
             layer_us[layer] = Some(t);
             total += t;
         }
-        let requests = [DsparkObservedRequest { id: 1, rows, accepted, confidence: None }];
-        policy.observe(DsparkRoundObservation { shared: false, requests: &requests, routes: &routes,
+        let requests = [ObservedDraftRequest { id: 1, rows, accepted, confidence: None }];
+        policy.observe(DraftRoundObservation { shared: false, requests: &requests, routes: &flat(&routes),
             layer_us: &layer_us, total_us: total, predicted_us: predicted, draft_us: f64::NAN, wide: false }).unwrap();
         *token += accepted as u64;
         total
@@ -935,7 +1079,7 @@ mod tests {
 
     #[test]
     fn estimator_recovers_coefficients_and_predicts_rounds() {
-        let mut policy = DsparkPolicy::new(placement(5), false);
+        let mut policy = DraftPolicy::new(placement(5), false).unwrap();
         let truth = truth();
         let mut token = 0;
         for round in 0..400 {
@@ -979,34 +1123,34 @@ mod tests {
 
     #[test]
     fn certain_drafts_are_always_verified_and_hopeless_ones_trimmed() {
-        let mut policy = DsparkPolicy::new(placement(5), false);
+        let mut policy = DraftPolicy::new(placement(5), false).unwrap();
         let truth = truth();
         let mut token = 0;
         for round in 0..300 { run_round(&mut policy, &truth, &mut token, 1 + round % 6, 1 + round % 6, None); }
         let certain = [1.; 5];
-        let selection = policy.select(false, &[DsparkCandidate { id: 1, confidence: &certain }], 5).unwrap().unwrap();
+        let selection = policy.select(false, &[DraftCandidate { id: 1, confidence: &certain }], 5).unwrap().unwrap();
         assert_eq!(selection.lengths, [5]);
         assert!((selection.expected_tokens - 6.).abs() < 1e-4);
         let hopeless = [0.02; 5];
-        let selection = policy.select(false, &[DsparkCandidate { id: 1, confidence: &hopeless }], 5).unwrap().unwrap();
+        let selection = policy.select(false, &[DraftCandidate { id: 1, confidence: &hopeless }], 5).unwrap().unwrap();
         assert_eq!(selection.lengths, [0]);
         // A falling confidence curve is cut where cumulative acceptance no longer
         // pays for the next row's new expert traffic.
         let falling = [0.95, 0.9, 0.5, 0.3, 0.2];
-        let selection = policy.select(false, &[DsparkCandidate { id: 1, confidence: &falling }], 5).unwrap().unwrap();
+        let selection = policy.select(false, &[DraftCandidate { id: 1, confidence: &falling }], 5).unwrap().unwrap();
         assert!((1..5).contains(&selection.lengths[0]), "{selection:?}");
     }
 
     #[test]
     fn selection_matches_exhaustive_search_for_one_request() {
-        let mut policy = DsparkPolicy::new(placement(5), false);
+        let mut policy = DraftPolicy::new(placement(5), false).unwrap();
         let truth = truth();
         let mut token = 0;
         for round in 0..300 { run_round(&mut policy, &truth, &mut token, 1 + round % 6, 1 + round % 6, None); }
         for confidence in [[0.9, 0.8, 0.7, 0.6, 0.5], [0.6, 0.9, 0.9, 0.9, 0.9], [0.99, 0.2, 0.9, 0.9, 0.9]] {
-            let selection = policy.select(false, &[DsparkCandidate { id: 1, confidence: &confidence }], 5).unwrap().unwrap();
+            let selection = policy.select(false, &[DraftCandidate { id: 1, confidence: &confidence }], 5).unwrap().unwrap();
             let best = (0..=5).max_by(|&a, &b| {
-                let ratio = |k: usize| dspark_expected_tokens(&confidence[..k]) / policy.clone().predict(false, &[1], &[k], 5).unwrap();
+                let ratio = |k: usize| draft_expected_tokens(&confidence[..k]) / policy.clone().predict(false, &[1], &[k], 5).unwrap();
                 ratio(a).total_cmp(&ratio(b))
             }).unwrap();
             assert_eq!(selection.lengths, [best], "{confidence:?}");
@@ -1015,27 +1159,27 @@ mod tests {
 
     #[test]
     fn warmup_and_fixed_mode_verify_everything() {
-        let mut policy = DsparkPolicy::new(placement(5), false);
-        assert_eq!(policy.select(false, &[DsparkCandidate { id: 1, confidence: &[0.1; 5] }], 5), Ok(None));
-        let mut fixed = DsparkPolicy::new(placement(5), true);
+        let mut policy = DraftPolicy::new(placement(5), false).unwrap();
+        assert_eq!(policy.select(false, &[DraftCandidate { id: 1, confidence: &[0.1; 5] }], 5), Ok(None));
+        let mut fixed = DraftPolicy::new(placement(5), true).unwrap();
         let truth = truth();
         let mut token = 0;
         for _ in 0..300 { run_round(&mut fixed, &truth, &mut token, 6, 3, None); }
         assert!(fixed.warm(false));
-        assert_eq!(fixed.select(false, &[DsparkCandidate { id: 1, confidence: &[0.1; 5] }], 5), Ok(None));
+        assert_eq!(fixed.select(false, &[DraftCandidate { id: 1, confidence: &[0.1; 5] }], 5), Ok(None));
         assert_eq!(fixed.stats().draft_rows[5], 300);
         assert_eq!(fixed.stats().accepted_drafts, 600);
     }
 
     #[test]
     fn shared_experts_across_requests_are_charged_once() {
-        let mut policy = DsparkPolicy::new(placement(0), false);
+        let mut policy = DraftPolicy::new(placement(0), false).unwrap();
         let routes: Vec<Vec<[u32; 6]>> = (0..40).map(|_| vec![[1, 2, 3, 4, 5, 6]]).collect();
         let layer_us = [None; 40];
         for id in [1, 2] {
             for _ in 0..4 {
-                let requests = [DsparkObservedRequest { id, rows: 1, accepted: 1, confidence: None }];
-                policy.observe(DsparkRoundObservation { shared: false, requests: &requests, routes: &routes,
+                let requests = [ObservedDraftRequest { id, rows: 1, accepted: 1, confidence: None }];
+                policy.observe(DraftRoundObservation { shared: false, requests: &requests, routes: &flat(&routes),
                     layer_us: &layer_us, total_us: f64::NAN, predicted_us: None, draft_us: f64::NAN, wide: false }).unwrap();
             }
         }
@@ -1047,19 +1191,21 @@ mod tests {
     }
 
     #[test]
-    fn groups_follow_the_sixteen_row_kernel_tiles() {
-        let rows = vec![[1, 2, 3, 4, 5, 6]; 17];
-        assert_eq!(route_groups(&rows), 12.);
-        assert_eq!(route_groups(&rows[..16]), 6.);
+    fn groups_follow_the_kernel_row_tiles() {
+        let mut policy = DraftPolicy::new(placement(5), false).unwrap();
+        let rows: Vec<u16> = [1, 2, 3, 4, 5, 6].repeat(17);
+        assert_eq!(policy.route_groups(&rows, 16), 12.);
+        assert_eq!(policy.route_groups(&rows[..96], 16), 6.);
+        assert_eq!(policy.route_groups(&rows, 8), 18.);
     }
 
     #[test]
     fn confidence_reliability_counts_only_reached_positions() {
-        let mut policy = DsparkPolicy::new(placement(5), false);
+        let mut policy = DraftPolicy::new(placement(5), false).unwrap();
         let routes: Vec<Vec<[u32; 6]>> = (0..40).map(|_| vec![[1, 2, 3, 4, 5, 6]; 5]).collect();
         let confidence = [0.9, 0.8, 0.7, 0.6];
-        let requests = [DsparkObservedRequest { id: 1, rows: 5, accepted: 2, confidence: Some(&confidence) }];
-        policy.observe(DsparkRoundObservation { shared: false, requests: &requests, routes: &routes,
+        let requests = [ObservedDraftRequest { id: 1, rows: 5, accepted: 2, confidence: Some(&confidence) }];
+        policy.observe(DraftRoundObservation { shared: false, requests: &requests, routes: &flat(&routes),
             layer_us: &[None; 40], total_us: f64::NAN, predicted_us: None, draft_us: f64::NAN, wide: false }).unwrap();
         let stats = policy.stats();
         assert_eq!(stats.position_reached, [1, 1, 0, 0, 0, 0, 0]);
@@ -1069,7 +1215,7 @@ mod tests {
 
     #[test]
     fn overconfident_positions_are_recalibrated_from_reached_outcomes() {
-        let mut policy = DsparkPolicy::new(placement(5), false);
+        let mut policy = DraftPolicy::new(placement(5), false).unwrap();
         let routes: Vec<Vec<[u32; 6]>> = (0..40).map(|_| vec![[1, 2, 3, 4, 5, 6]; 8]).collect();
         // The drafter reports 0.95 at every position; position 1 is truly 0.95,
         // position 6 only 0.8.
@@ -1085,8 +1231,8 @@ mod tests {
             }
             let truth = [0.95, 0.95, 0.95, 0.95, 0.95, 0.8, 0.8];
             let accepted = truth.iter().take_while(|&&p| uniform() < p).count();
-            let requests = [DsparkObservedRequest { id: 1, rows: 8, accepted: accepted + 1, confidence: Some(&confidence) }];
-            policy.observe(DsparkRoundObservation { shared: false, requests: &requests, routes: &routes,
+            let requests = [ObservedDraftRequest { id: 1, rows: 8, accepted: accepted + 1, confidence: Some(&confidence) }];
+            policy.observe(DraftRoundObservation { shared: false, requests: &requests, routes: &flat(&routes),
                 layer_us: &[None; 40], total_us: f64::NAN, predicted_us: None, draft_us: f64::NAN, wide: false }).unwrap();
         }
         assert!((policy.calibrated(0, 0.95) - 0.95).abs() < 0.02, "{:?}", policy.calibration());
@@ -1123,7 +1269,7 @@ mod tests {
 
     #[test]
     fn mean_time_bias_absorbs_skewed_stalls() {
-        let mut policy = DsparkPolicy::new(placement(5), false);
+        let mut policy = DraftPolicy::new(placement(5), false).unwrap();
         let truth = truth();
         let mut token = 0;
         for round in 0..300 { run_round(&mut policy, &truth, &mut token, 1 + round % 6, 1 + round % 6, None); }
@@ -1132,8 +1278,8 @@ mod tests {
             let predicted = policy.predict(false, &[1], &[0], 5).unwrap();
             // Every tenth round stalls by 10 ms: mean excess 1 ms.
             let total = predicted - policy.time_bias()[0] + if round % 10 == 0 { 10_000. } else { 0. };
-            let requests = [DsparkObservedRequest { id: 1, rows: 1, accepted: 1, confidence: None }];
-            policy.observe(DsparkRoundObservation { shared: false, requests: &requests, routes: &routes,
+            let requests = [ObservedDraftRequest { id: 1, rows: 1, accepted: 1, confidence: None }];
+            policy.observe(DraftRoundObservation { shared: false, requests: &requests, routes: &flat(&routes),
                 layer_us: &[None; 40], total_us: total, predicted_us: Some(predicted), draft_us: f64::NAN, wide: false }).unwrap();
         }
         assert!((policy.time_bias()[0] - 1000.).abs() < 250., "{:?}", policy.time_bias());
@@ -1141,7 +1287,7 @@ mod tests {
 
     /// One solo round of request `id` with `rows` verified rows after a draft
     /// of `width`, timed by the synthetic truth plus the draft pass.
-    fn width_round(policy: &mut DsparkPolicy, token: &mut u64, id: u64, width: usize, rows: usize,
+    fn width_round(policy: &mut DraftPolicy, token: &mut u64, id: u64, width: usize, rows: usize,
         accepted: usize, confidence: &[f64]) {
         let truth = truth();
         let token_rows: Vec<_> = (0..rows).map(|r| token_routes(*token + r as u64, 24)).collect();
@@ -1150,21 +1296,21 @@ mod tests {
         let draft_us = if width > 5 { 3300. } else { 2500. };
         let mut total = truth.round[0] + truth.round[1] * rows as f64 + truth.round[2] + draft_us;
         for layer in 1..40 {
-            let class = policy.placement.class(layer) as usize;
-            let mb = route_groups(&routes[layer]) * policy.placement.expert_bytes(layer) / 1e6;
+            let class = policy.geometry.layers[layer].class.unwrap() as usize;
+            let mb = groups(&routes[layer]) * policy.geometry.layers[layer].slice_bytes / 1e6;
             let t = truth.alpha[class] + truth.beta[class] * rows as f64 + truth.us_per_mb[class] * mb;
             layer_us[layer] = Some(t);
             total += t;
         }
-        let requests = [DsparkObservedRequest { id, rows, accepted, confidence: Some(confidence) }];
-        policy.observe(DsparkRoundObservation { shared: false, requests: &requests, routes: &routes,
+        let requests = [ObservedDraftRequest { id, rows, accepted, confidence: Some(confidence) }];
+        policy.observe(DraftRoundObservation { shared: false, requests: &requests, routes: &flat(&routes),
             layer_us: &layer_us, total_us: total, predicted_us: None, draft_us, wide: width > 5 }).unwrap();
         *token += accepted as u64;
     }
 
     #[test]
     fn width_follows_each_requests_recent_runs() {
-        let mut policy = DsparkPolicy::new(placement(5), false);
+        let mut policy = DraftPolicy::new(placement(5), false).unwrap();
         let mut token = 0;
         // Warmup alternates widths so both draft-cost fits are identified.
         let mut chosen = Vec::new();
@@ -1187,7 +1333,7 @@ mod tests {
 
     #[test]
     fn unused_width_is_revisited() {
-        let mut policy = DsparkPolicy::new(placement(5), false);
+        let mut policy = DraftPolicy::new(placement(5), false).unwrap();
         let mut token = 0;
         for _ in 0..400 {
             let width = policy.choose_width(false, &[(2, 7)]);
@@ -1240,10 +1386,9 @@ mod tests {
         let scenarios = [(0, 0, 4_700_160., 7, false), (20, 0, 4_700_160., 7, false),
             (40, 40, 9_400_320., 5, false), (8, 3, 4_976_640., 7, false), (0, 0, 4_700_160., 7, true)];
         for (scenario, &(local, tp2, remote, wide, fixed)) in scenarios.iter().enumerate() {
-            let class = std::array::from_fn(|l| if l < local { DsparkLayerClass::Local } else { DsparkLayerClass::Remote });
-            let bytes = std::array::from_fn(|l| if l < tp2 { 9_400_320. } else if l < local { 18_800_640. } else { remote });
-            let mut policy = DsparkPolicy::new(DsparkPlacement::new(class, bytes).unwrap(), fixed);
-            policy.set_widths(5, wide).unwrap();
+            let geometry = v41(|l| l < local, |l| if l < tp2 { 9_400_320. } else if l < local { 18_800_640. } else { remote },
+                if wide > 5 { vec![5, wide] } else { vec![5] });
+            let mut policy = DraftPolicy::new(geometry, fixed).unwrap();
             let mut live: Vec<(u64, u64, u32, f64)> = Vec::new(); // (id, next token, pool, quality)
             let mut next_id = 1 + 1000 * scenario as u64;
             for round in 0..320u64 {
@@ -1265,7 +1410,7 @@ mod tests {
                     (0..width.min(available)).map(|p| (r.3 + 0.06 * mix.unit() - 0.02 * p as f64).clamp(0., 1.))
                         .collect()).collect();
                 let candidates: Vec<_> = live.iter().zip(&confidence)
-                    .map(|(r, c)| DsparkCandidate { id: r.0, confidence: c }).collect();
+                    .map(|(r, c)| DraftCandidate { id: r.0, confidence: c }).collect();
                 let ids: Vec<u64> = live.iter().map(|r| r.0).collect();
                 let lengths = match policy.select(shared, &candidates, width).unwrap() {
                     Some(selection) => {
@@ -1298,8 +1443,8 @@ mod tests {
                 let mut layer_us = [None; 40];
                 let mut total = (9000. + 250. * rows as f64 + 150. * ids.len() as f64) * regime;
                 for layer in 1..40 {
-                    let c = policy.placement().class(layer) as usize;
-                    let mb = route_groups(&routes[layer]) * policy.placement().expert_bytes(layer) / 1e6;
+                    let c = policy.geometry().layers[layer].class.unwrap() as usize;
+                    let mb = groups(&routes[layer]) * policy.geometry().layers[layer].slice_bytes / 1e6;
                     let t = ([600., 700.][c] + [8., 12.][c] * rows as f64 + [0.9, 7.5][c] * mb)
                         * regime * (0.95 + 0.1 * mix.unit());
                     layer_us[layer] = Some(t);
@@ -1312,11 +1457,11 @@ mod tests {
                 if drafted { total += draft_us; }
                 let copied: Vec<bool> = live.iter().map(|_| mix.unit() < 0.1).collect();
                 let observed: Vec<_> = live.iter().zip(&lengths).zip(&accepted).zip(&confidence).zip(&copied)
-                    .map(|((((r, &length), &accepted), c), &copied)| DsparkObservedRequest {
+                    .map(|((((r, &length), &accepted), c), &copied)| ObservedDraftRequest {
                         id: r.0, rows: length + 1, accepted, confidence: if copied { None } else { Some(&c[..]) } })
                     .collect();
-                let result = policy.observe(DsparkRoundObservation { shared, requests: &observed, routes: &routes,
-                    layer_us: &layer_us, total_us: total, draft_us, wide: drafted && width > policy.widths().0,
+                let result = policy.observe(DraftRoundObservation { shared, requests: &observed, routes: &flat(&routes),
+                    layer_us: &layer_us, total_us: total, draft_us, wide: drafted && width > policy.widths()[0],
                     predicted_us: predicted });
                 transcript.word("observed", u64::from(result.is_ok()));
                 for (r, &a) in live.iter_mut().zip(&accepted) { r.1 += a as u64; }
@@ -1325,7 +1470,7 @@ mod tests {
                     // requests' histories were extended.
                     let mut bad = routes.clone();
                     bad[5][rows - 1][0] = 400;
-                    let result = policy.observe(DsparkRoundObservation { shared, requests: &observed, routes: &bad,
+                    let result = policy.observe(DraftRoundObservation { shared, requests: &observed, routes: &flat(&bad),
                         layer_us: &layer_us, total_us: total, draft_us, wide: false, predicted_us: None });
                     transcript.word("rejected", u64::from(result.is_err()));
                 }
@@ -1335,7 +1480,7 @@ mod tests {
         }
     }
 
-    fn record_state(transcript: &mut Transcript, policy: &DsparkPolicy) {
+    fn record_state(transcript: &mut Transcript, policy: &DraftPolicy) {
         for shared in [false, true] {
             transcript.word("warm", u64::from(policy.warm(shared)));
             let snapshot = policy.cost_snapshot(shared);
@@ -1344,7 +1489,7 @@ mod tests {
             }
         }
         for (slope, offset) in policy.calibration() { transcript.real("slope", slope); transcript.real("offset", offset); }
-        for bias in policy.time_bias() { transcript.real("bias", bias); }
+        for &bias in policy.time_bias() { transcript.real("bias", bias); }
         let stats = policy.stats();
         for value in [stats.rounds, stats.selected_rounds, stats.verified_rows, stats.verified_drafts,
             stats.accepted_drafts, stats.emitted_requests, stats.predicted_rounds] { transcript.word("stat", value); }
@@ -1370,15 +1515,17 @@ mod tests {
 
     #[test]
     fn rejects_invalid_inputs() {
-        let mut policy = DsparkPolicy::new(placement(5), false);
+        let mut policy = DraftPolicy::new(placement(5), false).unwrap();
         assert!(policy.select(false, &[], 5).is_err());
-        assert!(policy.select(false, &[DsparkCandidate { id: 1, confidence: &[f64::NAN] }], 5).is_err());
-        assert!(policy.select(false, &[DsparkCandidate { id: 1, confidence: &[1.1] }], 5).is_err());
-        assert!(policy.select(false, &[DsparkCandidate { id: 1, confidence: &[0.5; 8] }], 5).is_err());
-        let requests = [DsparkObservedRequest { id: 1, rows: 2, accepted: 1, confidence: None }];
+        assert!(policy.select(false, &[DraftCandidate { id: 1, confidence: &[f64::NAN] }], 5).is_err());
+        assert!(policy.select(false, &[DraftCandidate { id: 1, confidence: &[1.1] }], 5).is_err());
+        assert!(policy.select(false, &[DraftCandidate { id: 1, confidence: &[0.5; 8] }], 5).is_err());
+        let requests = [ObservedDraftRequest { id: 1, rows: 2, accepted: 1, confidence: None }];
         let routes: Vec<Vec<[u32; 6]>> = (0..40).map(|_| vec![[1, 2, 3, 4, 5, 6]]).collect();
-        assert!(policy.observe(DsparkRoundObservation { shared: false, requests: &requests, routes: &routes,
+        assert!(policy.observe(DraftRoundObservation { shared: false, requests: &requests, routes: &flat(&routes),
             layer_us: &[None; 40], total_us: 1., predicted_us: None, draft_us: f64::NAN, wide: false }).is_err());
-        assert!(DsparkPlacement::new([DsparkLayerClass::Remote; 40], [0.; 40]).is_err());
+        assert!(policy.observe(DraftRoundObservation { shared: false, requests: &requests[..0], routes: &[1],
+            layer_us: &[], total_us: 1., predicted_us: None, draft_us: f64::NAN, wide: false }).is_err());
+        assert!(DraftPolicy::new(v41(|_| false, |_| 0., vec![5, 7]), false).is_err());
     }
 }

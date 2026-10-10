@@ -78,9 +78,8 @@ mod tests {
             [&shards[0], &shards[1]], 80, 16)?;
         let mut reference = devices[1].own(|| DraftRuntime::with_requests(&lib, &weights, &embedding, &full, 80, 16))?;
         devices[1].run(|| {
-            let placement = cuteafd_core::DsparkPlacement::new(
-                [cuteafd_core::DsparkLayerClass::Remote; 40], [4_700_160.; 40]).map_err(anyhow::Error::msg)?;
-            actual.bind_policy(placement.clone()); reference.bind_policy(placement);
+            let geometry = policy::remote_geometry(5);
+            actual.bind_policy(geometry.clone())?; reference.bind_policy(geometry)?;
             actual.reserve_prefixes(4)?; reference.reserve_prefixes(4)?;
             for id in 1000..1016 { actual.admit(id)?; reference.admit(id)?; }
             Ok(())
