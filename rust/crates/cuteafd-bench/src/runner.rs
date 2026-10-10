@@ -130,6 +130,15 @@ pub struct Bench {
     console: OnceLock<Arc<ConsoleHub>>,
     /// Benchmark controls always require the configured API key.
     pub api_key: OnceLock<cuteafd_api::openai::auth::ApiKey>,
+    /// Whether benchmark requests are kept in the usage history (attached at mount).
+    pub(crate) usage: OnceLock<UsageToggle>,
+}
+
+/// The usage store's `record_bench` setting, as the bench page toggles it.
+#[derive(Clone)]
+pub struct UsageToggle {
+    pub get: Arc<dyn Fn() -> bool + Send + Sync>,
+    pub set: Arc<dyn Fn(bool) -> Result<(), String> + Send + Sync>,
 }
 
 impl Bench {
@@ -144,6 +153,7 @@ impl Bench {
             events,
             console: OnceLock::new(),
             api_key: OnceLock::new(),
+            usage: OnceLock::new(),
         })
     }
 
@@ -154,6 +164,11 @@ impl Bench {
     pub fn accepts_internal(&self, token: &str) -> bool {
         self.active().is_some_and(|active|
             cuteafd_api::openai::auth::constant_time_eq(active.token.as_bytes(), token.as_bytes()))
+    }
+
+    /// The usage history's benchmark switch; called once when the bench is mounted.
+    pub fn set_usage(&self, toggle: UsageToggle) {
+        let _ = self.usage.set(toggle);
     }
 
     /// The server's live console; called once when the bench is mounted.

@@ -57,9 +57,10 @@ pub(crate) fn live() -> Option<Live> {
 }
 
 impl Live {
-    /// Whether token ids should be captured for the text view.
+    /// Whether token ids should be captured for the text view: only while a
+    /// viewer that may receive text (cookie-unlocked, or a bench run) is connected.
     #[inline]
-    pub fn text(self) -> bool { self.0.hub.text_enabled() }
+    pub fn text(self) -> bool { self.0.hub.text_wanted() }
     #[inline]
     pub fn push(self, event: Event) { let _ = self.0.events.try_send(event); }
     /// True at most every 250 ms; the caller then pushes a [`Gauges`] event.
@@ -292,9 +293,9 @@ pub(crate) fn hub(text: bool, layout: impl FnOnce() -> anyhow::Result<Layout>) -
 /// The console switch every serve command takes.
 #[derive(Debug, Clone, Copy, clap::Args)]
 pub(crate) struct ConsoleArgs {
-    /// Let the live console at `/` show generated token text. Anyone who can
-    /// reach the API port can then read every session's output as it streams.
-    #[arg(long, env = "CUTEAFD_CONSOLE_TEXT", num_args = 0..=1, default_value = "false",
+    /// Let the live console at `/` show generated token text. Only viewers
+    /// holding the console unlock cookie receive it (bench runs excepted).
+    #[arg(long, env = "CUTEAFD_CONSOLE_TEXT", num_args = 0..=1, default_value = "true",
         default_missing_value = "true", value_parser = clap::builder::BoolishValueParser::new())]
     pub console_text: bool,
 }

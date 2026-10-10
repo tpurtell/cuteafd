@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import shlex
 import subprocess
+import time
 
 import pytest
 
@@ -96,6 +97,16 @@ def process_running(pid: int) -> bool:
         return False
 
 
+def process_stops(pid: int, within: float = 2.0) -> bool:
+    """True if `pid` is still running after `within` seconds. A KILLed child
+    can outlive its group leader's return for a few milliseconds before the
+    kernel tears it down."""
+    deadline = time.monotonic() + within
+    while process_running(pid) and time.monotonic() < deadline:
+        time.sleep(0.01)
+    return process_running(pid)
+
+
 @pytest.mark.parametrize("failing", ["coord", "spark"])
 @pytest.mark.parametrize("immediate", [False, True])
 def test_either_failure_names_leg_stops_other_group_and_skips_tail(tmp_path, failing, immediate):
@@ -124,7 +135,7 @@ build_spark_release() (
     assert not (tmp_path / "tail").exists()
     assert (tmp_path / "cleanup").read_text().strip() == "remote-cancel"
     if (tmp_path / "child.pid").exists():
-        assert not process_running(int((tmp_path / "child.pid").read_text()))
+        assert not process_stops(int((tmp_path / "child.pid").read_text()))
     assert not (tmp_path / "completions").exists()
 
 

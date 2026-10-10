@@ -56,6 +56,10 @@ pub(crate) struct ApiPolicy {
     usage: Option<Arc<cuteafd_usage::Store>>,
     gate: cuteafd_api::console_gate::ConsoleGate,
     gateway: Option<GatewayPolicy>,
+    /// Verifies a running benchmark's token for usage's bench exemption.
+    bench_token: Option<Arc<dyn Fn(&str) -> bool + Send + Sync>>,
+    /// The engine's active count for /usage (read from the console snapshot).
+    live: Option<cuteafd_usage::http::LiveCount>,
 }
 /// The serving gateway's model names and hosted search.
 #[derive(Clone)]
@@ -86,7 +90,15 @@ impl ApiArgs {
             Some(GatewayPolicy { official: self.official_model_names == "on" || names_file.is_some(), names_file, search,
                 allowed_origins: self.gateway_allow_origins.clone() })
         } else { None };
-        Ok(ApiPolicy { key, bench: self.enable_bench, usage, gate, gateway })
+        if let Some(store) = &usage {
+            // The server's own secrets never reach the full log, wherever a client pastes them.
+            let mut secrets = vec![];
+            for file in [&self.api_key_file, &self.console_secret_file].into_iter().flatten() {
+                if let Ok(text) = std::fs::read_to_string(file) { secrets.push(text.trim().to_owned()); }
+            }
+            store.log.set_secrets(secrets);
+        }
+        Ok(ApiPolicy { key, bench: self.enable_bench, usage, gate, gateway, bench_token: None, live: None })
     }
 }
 impl ApiPolicy {
@@ -112,25 +124,64 @@ impl ApiPolicy {
         cuteafd_api::gateway::auth::GatewayAuth { key: self.key.clone() }
     }
     pub fn app(self, router: axum::Router, hub: Arc<cuteafd_api::openai::ConsoleHub>) -> axum::Router {
-        let (router, internal) = if self.bench {
+        // Token text reaches only viewers holding the console cookie.
+        hub.set_gate(self.gate.clone());
+        let snapshot_hub = hub.clone();
+        let mut this = self;
+        this.live = Some(Arc::new(move || {
+            serde_json::from_str::<serde_json::Value>(&snapshot_hub.snapshot()).ok()?["g"]["active"].as_u64()
+        }));
+        let self_ = this;
+        let (router, internal) = if self_.bench {
             let bench = cuteafd_bench::Bench::global();
             bench.set_console(hub);
-            bench.set_api_key(self.key.clone().expect("validated benchmark key"));
+            if let Some(store) = &self_.usage { bench.set_usage(usage_toggle(store.clone())); }
+            bench.set_api_key(self_.key.clone().expect("validated benchmark key"));
             let witness = bench.clone();
             let internal: Arc<dyn Fn(&str, &axum::http::HeaderMap) -> bool + Send + Sync> = Arc::new(move |path, headers| {
                 matches!(path, "/v1/chat/completions" | "/v1/completions" | "/v1/models" | "/v1/stats")
                     && cuteafd_api::openai::auth::bearer(headers).is_some_and(|token| witness.accepts_internal(token))
             });
-            (cuteafd_bench::http::mount(router, bench), Some(internal))
+            let verify = bench.clone();
+            (cuteafd_bench::http::mount(router, bench), Some((internal, verify)))
         } else { (router, None) };
-        let router = if let Some(store) = &self.usage { cuteafd_usage::http::mount(router, store.clone(), self.gate.clone()) } else { router };
-        let router = self.gate.mount(router);
-        tracing::info!("console: protected views unlock through the launcher's link");
-        let router = router.layer(axum::middleware::from_fn_with_state(Auth { key: self.key, internal },
+        let mut policy = self_;
+        let internal = internal.map(|(internal, verify)| {
+            policy.bench_token = Some(Arc::new(move |token: &str| verify.accepts_internal(token)));
+            internal
+        });
+        let router = policy.mount_console(router);
+        let router = router.layer(axum::middleware::from_fn_with_state(Auth { key: policy.key.clone(), internal },
             cuteafd_api::openai::auth::require_key));
+        policy.track(router)
+    }
+    /// The cookie-gated usage routes, `/usage` and `/console/unlock`.
+    pub(crate) fn mount_console(&self, router: axum::Router) -> axum::Router {
+        let router = if let Some(store) = &self.usage {
+            cuteafd_usage::http::mount_with_live(router, store.clone(), self.gate.clone(), self.live.clone())
+        } else { router };
+        tracing::info!("console: protected views unlock through the launcher's link");
+        self.gate.mount(router)
+    }
+    /// The outermost layer: request accounting and full-log capture.
+    pub(crate) fn track(self, router: axum::Router) -> axum::Router {
         if let Some(store) = self.usage {
-            router.layer(axum::middleware::from_fn_with_state(cuteafd_api::usage::Middleware::new(store), cuteafd_api::usage::track))
+            let mut middleware = cuteafd_api::usage::Middleware::new(store);
+            if let Some(verify) = self.bench_token { middleware = middleware.with_bench(verify); }
+            router.layer(axum::middleware::from_fn_with_state(middleware, cuteafd_api::usage::track))
         } else { router }
+    }
+}
+/// The bench page's include/skip switch for benchmark requests in usage history.
+fn usage_toggle(store: Arc<cuteafd_usage::Store>) -> cuteafd_bench::UsageToggle {
+    let read = store.clone();
+    cuteafd_bench::UsageToggle {
+        get: Arc::new(move || read.settings().record_bench),
+        set: Arc::new(move |record| {
+            let mut settings = store.settings();
+            settings.record_bench = record;
+            store.update_settings(settings).map_err(|e| e.to_string())
+        }),
     }
 }
 pub(crate) fn catch_scheduler_panic(work: impl FnOnce() -> anyhow::Result<()>) -> anyhow::Result<()> {
@@ -167,7 +218,7 @@ mod tests {
             .await.unwrap().status(), StatusCode::NOT_FOUND);
         let (tx, rx) = tokio::sync::mpsc::channel(1);
         drop(rx);
-        let app = ApiPolicy { key: Some(ApiKey::new("secret").unwrap()), bench: false, usage: None, gate: cuteafd_api::console_gate::ConsoleGate::locked(), gateway: None }.app(
+        let app = ApiPolicy { key: Some(ApiKey::new("secret").unwrap()), bench: false, usage: None, gate: cuteafd_api::console_gate::ConsoleGate::locked(), gateway: None, bench_token: None, live: None }.app(
             cuteafd_api::openai::router(tx), cuteafd_api::openai::ConsoleHub::disabled());
         assert_eq!(app.clone().oneshot(axum::http::Request::post("/v1/chat/completions")
             .body(Body::from("malformed")).unwrap()).await.unwrap().status(), StatusCode::UNAUTHORIZED);
@@ -190,6 +241,34 @@ mod tests {
         assert_eq!(baseline.status(), result.status());
         assert_eq!(baseline.headers(), result.headers());
         assert_eq!(axum::body::to_bytes(baseline.into_body(), 4096).await.unwrap(), axum::body::to_bytes(result.into_body(), 4096).await.unwrap());
+    }
+    /// The server's API key and console secret are scrubbed from logged payloads.
+    #[tokio::test]
+    async fn server_secrets_never_reach_the_full_log() {
+        use axum::{body::Body, http::Request};
+        use tower::ServiceExt;
+        let dir = tempfile::tempdir().unwrap();
+        let key = dir.path().join("key");
+        std::fs::write(&key, "sk-local-SERVER-KEY-777\n").unwrap();
+        let secret = dir.path().join("secret");
+        std::fs::write(&secret, "e".repeat(64)).unwrap();
+        let usage = dir.path().join("usage");
+        let policy = ApiArgs { api_key_file: Some(key), console_secret_file: Some(secret), usage_dir: Some(usage.clone()), ..Default::default() }.load().unwrap();
+        let store = policy.usage.clone().unwrap();
+        let router = axum::Router::new().route("/v1/chat/completions", axum::routing::post(|_: axum::body::Bytes| async { "{}" }));
+        let app = policy.app(router, cuteafd_api::openai::ConsoleHub::disabled());
+        let body = format!(r#"{{"messages":[{{"role":"user","content":"my key is sk-local-SERVER-KEY-777 and {}"}}]}}"#, "e".repeat(64));
+        let r = app.oneshot(Request::post("/v1/chat/completions").header("Authorization", "Bearer sk-local-SERVER-KEY-777")
+            .body(Body::from(body)).unwrap()).await.unwrap();
+        axum::body::to_bytes(r.into_body(), 4096).await.unwrap();
+        store.log.flush().unwrap();
+        store.flush().unwrap();
+        let full = store.log.get(&store.rows().unwrap()[0].rid).unwrap().unwrap();
+        assert!(full["request"]["messages"][0]["content"].as_str().unwrap().contains("[REDACTED]"));
+        for entry in std::fs::read_dir(&usage).unwrap() {
+            let text = String::from_utf8_lossy(&std::fs::read(entry.unwrap().path()).unwrap()).into_owned();
+            assert!(!text.contains("SERVER-KEY-777") && !text.contains(&"e".repeat(64)));
+        }
     }
     #[test]
     fn usage_is_on_unless_turned_off() {

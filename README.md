@@ -278,7 +278,10 @@ controls support the release default.
 working on CuteAFD. [`PLAN.md`](PLAN.md) is the roadmap.
 [WIP hardware cards](docs/wip-cards.md) runs candidate builds through the
 release card matrix. [Usage history and console access](docs/usage-and-console-access.md)
-covers request accounting and the console unlock secret.
+covers request accounting, the `/usage` dashboard and the console unlock secret.
+**The full request log is on by default: prompts, model outputs and media are
+stored in plain text on the serving host for 24 hours** (turn it off on
+`/usage` settings or with `USAGE=off`).
 
 ## Building from source
 

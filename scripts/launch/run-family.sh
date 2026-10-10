@@ -1258,10 +1258,10 @@ mkdir -p "$bench_dir"
 # or host; see rust/crates/cuteafd-daemon/src/shared/spark_intake.rs).
 intake="$(get SPARK_INTAKE auto)"
 case "$intake" in auto|gpu|pinned|host) ;; *) echo "SPARK_INTAKE must be auto, gpu, pinned or host" >&2; exit 2 ;; esac
-# CONSOLE_TEXT=on lets the live console at / stream generated token text (anyone who
-# can reach the API port can then read every session's output).
+# CONSOLE_TEXT=on (default) lets the live console at / stream generated token text to
+# viewers holding the console unlock cookie; CONSOLE_TEXT=off disables it for everyone.
 family_args+=(--table-backend "$table_backend")
-console_text="$(get CONSOLE_TEXT off)"
+console_text="$(get CONSOLE_TEXT on)"
 case "$console_text" in on|off) ;; *) echo "CONSOLE_TEXT must be on or off" >&2; exit 2 ;; esac
 api_mount_args=()
 API_KEY_FILE="$(get API_KEY_FILE "${API_KEY_FILE:-}")"

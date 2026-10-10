@@ -48,6 +48,8 @@ pub(crate) struct Cli {
 pub(crate) enum Commands {
     /// Serve Anthropic Messages, OpenAI Responses and Realtime through an HTTP upstream (no GPUs).
     Gateway(crate::commands::gateway::GatewayArgs),
+    /// Usage history: clear either tier, export metadata as CSV, or serve a synthetic demo.
+    Usage(crate::commands::usage::UsageArgs),
     Doctor(DoctorArgs),
     /// Describe a checkpoint: family, placement, formats, and what this build lacks.
     Plan(PlanArgs),
@@ -898,9 +900,9 @@ pub(crate) struct NativeServeArgs {
     /// Compatibility spelling: decode lanes always advance independently.
     #[arg(long, hide = true)]
     pub independent_decode_lanes: bool,
-    /// Let the live console at `/` show generated token text. Anyone who can
-    /// reach the API port can then read every session's output as it streams.
-    #[arg(long, env = "CUTEAFD_CONSOLE_TEXT", num_args = 0..=1, default_value = "false",
+    /// Let the live console at `/` show generated token text. Only viewers
+    /// holding the console unlock cookie receive it (bench runs excepted).
+    #[arg(long, env = "CUTEAFD_CONSOLE_TEXT", num_args = 0..=1, default_value = "true",
         default_missing_value = "true", value_parser = clap::builder::BoolishValueParser::new())]
     pub console_text: bool,
     #[command(flatten)]

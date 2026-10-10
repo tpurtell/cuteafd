@@ -131,7 +131,7 @@ const top = CuteUI.header($('#top'), { page: 'console', subtitle: 'Engine consol
 top.status.replaceWith($('#status-tpl').content.cloneNode(true));
 top.extra.replaceWith($('#keys-tpl').content.cloneNode(true));
 const S = {
-  config: {}, textAllowed: false, disabled: false, starting: false,
+  config: {}, textAllowed: false, textState: 'off', disabled: false, starting: false,
   requests: new Map(), recent: [], gauges: {}, totals: [], prefill: [], rounds: [],
   series: { out: [], acc: [], drf: [], pre: [], conc: [], inp: [] },
   offsets: [], offset: null, lastFrame: 0, lastNow: null, socket: null, connected: false,
@@ -184,10 +184,13 @@ function onSnapshot(m) {
   if (S.lastNow != null && m.now + 1000 < S.lastNow) resetHistory();   // the engine restarted
   S.lastNow = m.now;
   S.offsets = []; clock(m.now);
-  S.config = m.config || {}; S.textAllowed = !!m.text;
-  $('#v-text').disabled = !S.textAllowed;
-  $('#v-text').textContent = S.textAllowed ? 'TEXT' : 'TEXT (off)';
-  $('#v-text').title = S.textAllowed ? 'Show generated text' : 'Start the server with --console-text (CUTEAFD_CONSOLE_TEXT=1) to stream token text';
+  S.config = m.config || {};
+  const state = m.text ?? S.config.text;
+  S.textState = state === true || state === 'on' ? 'on' : state === 'locked' ? 'locked' : 'off';
+  S.textAllowed = S.textState === 'on';
+  $('#v-text').disabled = S.textState === 'off';
+  $('#v-text').textContent = S.textState === 'locked' ? 'TEXT (unlock)' : S.textAllowed ? 'TEXT' : 'TEXT (off)';
+  $('#v-text').title = S.textState === 'locked' ? 'open the console unlock link the run script printed' : S.textAllowed ? 'Show generated text' : 'Start the server with --console-text (CUTEAFD_CONSOLE_TEXT=1) to stream token text';
   if (!S.textAllowed && S.mode === 'text') setMode('time');
   const live = new Set();
   for (const x of m.requests || []) { live.add(x.id); fromSnapshotRequest(x); }
@@ -336,7 +339,7 @@ function header() {
   CuteUI.facts(top.meta, [
     ['model', esc((c.model || '').split('/').pop()), c.model], ['checkpoint', esc(c.checkpoint || '–'), c.family],
     ['layout', esc(c.layout || '–') + split], ['draft', spec ? `${esc(spec.name)} · ${esc(spec.policy)}` : 'off'],
-    ['build', CuteUI.build(c.build)], ['text', c.text ? 'on' : 'off'], ['up', '<span id="uptime">–</span>'],
+    ['build', CuteUI.build(c.build)], ['text', S.textState], ['up', '<span id="uptime">–</span>'],
   ]);
   $('#c-limit').textContent = c.concurrency ?? 16;
   layoutChanged();
@@ -668,13 +671,17 @@ function setMode(m) {
 function setZoom(z) { S.pxPerS = z; for (const b of document.querySelectorAll('#zoom button')) b.setAttribute('aria-pressed', +b.dataset.z === z); }
 function setPaused(p) { S.paused = p; S.frozenAt = p ? displayNow() : null; $('#pause').setAttribute('aria-pressed', p); $('#pause').textContent = p ? 'RESUME' : 'PAUSE'; }
 $('#v-time').onclick = () => setMode('time');
-$('#v-text').onclick = () => S.textAllowed && setMode('text');
+function showText() {
+  if (S.textState === 'locked') $('#ticker-note').textContent = 'open the console unlock link the run script printed';
+  else if (S.textAllowed) setMode('text');
+}
+$('#v-text').onclick = showText;
 for (const b of document.querySelectorAll('#zoom button')) b.onclick = () => setZoom(+b.dataset.z);
 $('#pause').onclick = () => setPaused(!S.paused);
 addEventListener('keydown', (e) => {
   if (e.target.closest('input,select,textarea')) return;
   if (e.key === ' ') { e.preventDefault(); setPaused(!S.paused); }
-  else if (e.key === 't') { if (S.textAllowed) setMode(S.mode === 'time' ? 'text' : 'time'); }
+  else if (e.key === 't') { if (S.textAllowed && S.mode === 'text') setMode('time'); else showText(); }
   else if (e.key === '+' || e.key === '=') setZoom(Math.min(1200, S.pxPerS * 2));
   else if (e.key === '-') setZoom(Math.max(150, S.pxPerS / 2));
 });

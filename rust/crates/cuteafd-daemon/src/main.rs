@@ -169,6 +169,7 @@ async fn main() -> Result<()> {
     match command {
         Commands::Serve(_) | Commands::Golden(_) => unreachable!("resolved to a family command above"),
         Commands::Gateway(args) => commands::gateway::run(args).await,
+        Commands::Usage(args) => commands::usage::run(args).await,
         Commands::Doctor(args) => run_doctor(args),
         Commands::Plan(args) => run_plan(args),
         Commands::ExpertProbe(args) => run_expert_probe(args).await,

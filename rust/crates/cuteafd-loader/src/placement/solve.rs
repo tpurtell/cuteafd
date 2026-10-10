@@ -18,13 +18,19 @@ pub fn solve(request: &PlacementRequest) -> Result<Placement, PlacementError> {
     let split = gpus == 2 && request.inventory.peer_access;
     let tp2 = split && request.layers.iter().any(|l| l.experts.is_some_and(|c| c.tp2));
 
-    // 1. Layer modes: the policy's first mode this build executes.
-    let modes = request.layers.iter().map(|layer| {
+    // 1. Layer modes: the policy's first mode this build and its executor run.
+    let executor = &request.executor;
+    let modes = request.layers.iter().enumerate().map(|(index, layer)| {
         let wanted = request.policy.preference(layer.kind);
         wanted.iter().copied().chain(layer.modes.iter().copied())
-            .find(|mode| layer.modes.contains(mode) && executable(*mode, gpus, split))
-            .unwrap_or(LayerMode::Whole { gpu: 0, ffn: FfnMode::Owner })
-    }).collect::<Vec<_>>();
+            .find(|mode| layer.modes.contains(mode) && executable(*mode, gpus, split) && executor.runs(*mode))
+            .ok_or_else(|| PlacementError::NoMode { layer: index, allowed: layer.modes.clone() })
+    }).collect::<Result<Vec<_>, _>>()?;
+    // Residual homes and the hops the modes imply (one GPU never hops).
+    let (residual, hops) = residual_plan(&modes, &request.hops, gpus);
+    if let Some(hop) = hops.iter().find(|h| h.at != HopPoint::Entry).filter(|_| !executor.hops) {
+        return Err(PlacementError::UnsupportedHop { family: executor.family, hop: *hop });
+    }
 
     // 2. Fixed demands, including mode-dependent layer weights.
     let mut items: Vec<Vec<Item>> = vec![Vec::new(); gpus];
@@ -49,6 +55,11 @@ pub fn solve(request: &PlacementRequest) -> Result<Placement, PlacementError> {
     }
     for (gpu, &bytes) in layer_weights.iter().enumerate() {
         if bytes > 0 { charge(&mut items, &mut used, gpu, Item::new(Category::Weights, "layers", "", bytes, Basis::Exact))?; }
+    }
+    // Hop receive buffers are fixed demands of the modes (charged before the pool).
+    let hop_bytes = hop_buffer_bytes(&hops, &request.hops, gpus).ok_or(Overflow("hop buffers"))?;
+    for (gpu, &bytes) in hop_bytes.iter().enumerate() {
+        if bytes > 0 { charge(&mut items, &mut used, gpu, Item::new(Category::Transport, "residual hops", "", bytes, Basis::Formula))?; }
     }
     let available = request.inventory.gpus.iter().map(GpuBudget::available).collect::<Vec<_>>();
 
@@ -199,9 +210,25 @@ pub fn solve(request: &PlacementRequest) -> Result<Placement, PlacementError> {
         layers: modes.into_iter().zip(homes).map(|(mode, experts)| LayerAssignment { mode, experts }).collect(),
         movables,
         expert_ranges: ranges,
+        residual,
+        hops,
         tp2: tp2_range,
         items,
     })
+}
+
+/// The residual's home at every layer boundary (`[0]`: the embedding's GPU,
+/// `[i + 1]`: after layer `i`) and the hops between them.
+fn residual_plan(modes: &[LayerMode], spec: &HopSpec, gpus: usize) -> (Vec<ResidualHome>, Vec<Hop>) {
+    let entry = if gpus == 2 { spec.entry_gpu } else { 0 };
+    let mut homes = Vec::with_capacity(modes.len() + 1);
+    homes.push(ResidualHome::Owned(entry));
+    for &mode in modes {
+        let home = *homes.last().expect("seeded");
+        homes.push(home.transition(mode).home);
+    }
+    let hops = if gpus == 2 { plan_hops(modes, spec) } else { Vec::new() };
+    (homes, hops)
 }
 
 /// Whole units every KV-owning GPU holds beside what is charged and its arena.
@@ -275,10 +302,13 @@ fn place_experts(request: &PlacementRequest, available: &[u64], used: &[u64], ar
     Ok((ranges, homes, next, None))
 }
 
+/// Whether the inventory can run `mode`: a head split, a split FFN or any
+/// layer on GPU1 needs two GPUs with peer access.
 fn executable(mode: LayerMode, gpus: usize, split: bool) -> bool {
     match mode {
-        LayerMode::HeadSplit => split,
-        LayerMode::Whole { gpu, .. } => usize::from(gpu) < gpus,
+        LayerMode::HeadSplit | LayerMode::Whole { ffn: FfnMode::Split, .. } => split,
+        LayerMode::Whole { gpu: 0, ffn: FfnMode::Owner } => true,
+        LayerMode::Whole { gpu, .. } => usize::from(gpu) < gpus && split,
     }
 }
 

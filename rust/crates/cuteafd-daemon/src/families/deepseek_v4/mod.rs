@@ -171,6 +171,21 @@ impl EngineArgs {
     }
 }
 
+/// The engine runs one shape: every layer head-split under `--split-device`,
+/// every layer whole on GPU0 otherwise, and no hop but the step-start
+/// streams push. Anything else the solver hands it is refused before any
+/// cache or expert is allocated.
+fn check_modes(placement: &cuteafd_loader::placement::Placement, split: bool) -> Result<()> {
+    use cuteafd_loader::placement::{families::DEEPSEEK_V4, FfnMode, LayerMode};
+    DEEPSEEK_V4.check(placement).map_err(|error| anyhow::anyhow!("DeepSeek V4 placement: {error}"))?;
+    let engine = if split { LayerMode::HeadSplit } else { LayerMode::Whole { gpu: 0, ffn: FfnMode::Owner } };
+    if let Some((layer, assignment)) = placement.layers.iter().enumerate().find(|(_, a)| a.mode != engine) {
+        anyhow::bail!("DeepSeek V4 runs every layer as {engine:?}; the placement has layer {layer} as {:?}",
+            assignment.mode);
+    }
+    Ok(())
+}
+
 fn f32s(bytes: &[u8]) -> Vec<f32> {
     bytes.chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect()
 }
@@ -319,6 +334,7 @@ pub(crate) fn with_engine<T>(
         let request = admission::request(args, &inputs)?;
         let placement = cuteafd_loader::placement::solve(&request)
             .map_err(|error| anyhow::anyhow!("DeepSeek V4 admission: {error}"))?;
+        check_modes(&placement, split_device.is_some())?;
         tracing::info!(pool_tokens = placement.pool_tokens, onboard = %onboard, onboard_layers = placement.onboard_layers,
             local_per_gpu = ?placement.expert_ranges, "DeepSeek V4 placement: {}", placement.summary());
         cuteafd_bench::context::set_resolved("rtx-expert-layers", &placement.onboard_layers.to_string());

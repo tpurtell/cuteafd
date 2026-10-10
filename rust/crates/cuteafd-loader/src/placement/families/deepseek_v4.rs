@@ -191,6 +191,11 @@ pub fn request(inputs: &V4Inputs<'_>) -> Result<PlacementRequest, PlacementError
         expert_gpus: if gpus == 2 && inputs.experts_half.is_empty() { 0 } else { 1 },
         policy: LayerPolicy { default: vec![LayerMode::HeadSplit, LayerMode::Whole { gpu: 0, ffn: FfnMode::Owner }],
             by_kind: Vec::new() },
+        // The mHC streams `[T,4,H]` BF16; V4's only hop is the entry
+        // broadcast of the embedding rows into GPU1's step input.
+        hops: HopSpec { row_bytes: 4 * inputs.cfg.dim as u64 * 2, rows: inputs.prefill_rows.max(inputs.decode_rows),
+            lanes: PREFILL_LANES, entry_gpu: 0, head_gpu: 0 },
+        executor: super::DEEPSEEK_V4,
     })
 }
 

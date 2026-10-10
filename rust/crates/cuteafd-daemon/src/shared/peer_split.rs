@@ -13,6 +13,9 @@
 //! (`DIRECT`) serves pushes into buffers outside the slots.
 use crate::shared::memory::DeviceAllocation;
 use anyhow::{ensure, Context, Result};
+
+pub(crate) mod hop;
+pub(crate) mod order;
 use cuteafd_ffi::NativeLibrary;
 use std::cell::Cell;
 use std::ffi::c_void;

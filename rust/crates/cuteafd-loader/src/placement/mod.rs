@@ -9,6 +9,12 @@
 //! movables (drafter stage experts) are charged before the pool too, so an
 //! automatic pool can never crowd them out.
 //!
+//! Placement PR 1 added `HeadSplit` and `Whole` layer modes and contiguous
+//! whole-layer expert ranges (GPU0, then GPU1). PR 3 adds per-layer
+//! ownership: the residual's home at every layer boundary ([`ResidualHome`]),
+//! the [`Hop`]s the modes imply (their receive buffers charged as fixed
+//! demands) and the executor's mode set ([`ExecutorModes`]), refused at plan
+//! time when a layer would need a mode the family cannot run.
 //! Peer-accessible two-GPU builds use a contiguous TP2 expert prefix; TP1
 //! arena-sharing movables retain a separate arena and workspace.
 use cuteafd_core::memory_layout::{Basis, Category, Item};
@@ -17,11 +23,13 @@ use thiserror::Error;
 
 pub mod families;
 mod pool;
+mod residual;
 mod solve;
 #[cfg(test)]
 mod tests;
 
 pub use pool::PoolPolicy;
+pub use residual::{hop_buffer_bytes, plan_hops, Hop, HopKind, HopPoint, HopSpec, ResidualHome, Transition, HOP_SLOTS};
 pub use solve::solve;
 
 /// What a request asks of the hardware, built by a family from its own
@@ -49,6 +57,11 @@ pub struct PlacementRequest {
     /// GPUs (from GPU0) whose executors can hold whole routed layers.
     pub expert_gpus: usize,
     pub policy: LayerPolicy,
+    /// What one residual hop moves, for the hops the chosen modes imply.
+    pub hops: HopSpec,
+    /// The modes and hops the family's executor runs; anything else is
+    /// refused at plan time.
+    pub executor: ExecutorModes,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -162,6 +175,37 @@ pub enum FfnMode {
     Split,
     /// The owner reduces (V4.1).
     Owner,
+}
+
+/// What a family's executor can run. The solver refuses a placement whose
+/// layers would need another mode, and engines check the placement they are
+/// handed against the same set before allocating.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExecutorModes {
+    pub family: &'static str,
+    /// Every mode the executor runs, on any layer.
+    pub modes: &'static [LayerMode],
+    /// Whether it runs hop points beyond the entry broadcast (ownership
+    /// boundaries, split-FFN broadcasts, the exit hop to the head's GPU).
+    pub hops: bool,
+}
+
+impl ExecutorModes {
+    pub fn runs(&self, mode: LayerMode) -> bool {
+        self.modes.contains(&mode)
+    }
+
+    /// Refuses `placement` unless every layer's mode and every hop is one
+    /// this executor runs.
+    pub fn check(&self, placement: &Placement) -> Result<(), PlacementError> {
+        if let Some((layer, assignment)) = placement.layers.iter().enumerate().find(|(_, a)| !self.runs(a.mode)) {
+            return Err(PlacementError::UnsupportedMode { family: self.family, layer, mode: assignment.mode });
+        }
+        match placement.hops.iter().find(|h| h.at != HopPoint::Entry) {
+            Some(hop) if !self.hops => Err(PlacementError::UnsupportedHop { family: self.family, hop: *hop }),
+            _ => Ok(()),
+        }
+    }
 }
 
 /// Mode preference by attention class; classes absent use `default`.
@@ -288,6 +332,11 @@ pub struct Placement {
     /// Contiguous whole-layer RTX expert range per GPU (`layers == 0`: none).
     /// Under TP2 every GPU's range is empty and [`Placement::tp2`] holds the layers.
     pub expert_ranges: Vec<ExpertRange>,
+    /// The residual's home at each layer boundary: before layer `i` at `i`,
+    /// after the last layer at `layers.len()`.
+    pub residual: Vec<ResidualHome>,
+    /// Every residual move the layer modes imply, in execution order.
+    pub hops: Vec<Hop>,
     /// TP2 RTX expert halves (placement PR 4): one contiguous range of routed
     /// layers whose halves live on both GPUs, with each GPU's arena peak.
     pub tp2: Option<Tp2Range>,
@@ -341,7 +390,9 @@ impl Placement {
         let ranges = self.expert_ranges.iter().enumerate()
             .map(|(gpu, r)| format!("rtx{gpu} {}..{} ({} B)", r.first, r.first + r.layers, r.peak_bytes))
             .collect::<Vec<_>>().join(", ");
-        format!("pool {} tokens; onboard {} RTX expert layers: {ranges}", self.pool_tokens, self.onboard_layers)
+        let hops = self.hops.iter().filter(|h| h.charged()).count();
+        let hops = if hops == 0 { String::new() } else { format!("; {hops} residual hops") };
+        format!("pool {} tokens; onboard {} RTX expert layers: {ranges}{hops}", self.pool_tokens, self.onboard_layers)
     }
 }
 
@@ -359,6 +410,12 @@ pub enum PlacementError {
     BelowFloor { pool: u64, floor: u64, layers: usize, short: u64 },
     #[error("Spark-free layout needs every routed layer on RTX: {placed} of {layers} fit")]
     SparkFree { layers: usize, placed: usize },
+    #[error("layer {layer} has no mode this build executes (allowed {allowed:?})")]
+    NoMode { layer: usize, allowed: Vec<LayerMode> },
+    #[error("{family} cannot run layer {layer} as {mode:?}")]
+    UnsupportedMode { family: &'static str, layer: usize, mode: LayerMode },
+    #[error("{family} cannot run the residual hop {hop:?}")]
+    UnsupportedHop { family: &'static str, hop: Hop },
     #[error("placement arithmetic overflows: {0}")]
     Overflow(&'static str),
 }
