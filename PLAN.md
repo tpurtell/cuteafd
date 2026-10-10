@@ -3825,6 +3825,18 @@ its 20/20 ranges. Each family's default comes from its own decision gate.
   - `layers` with two lanes changes the lane count, not the per-row price.
 
 ### 9. Open questions for TJ (with recommendations)
+
+**Decided (TJ, 2026-10-11): all eight as recommended.**
+- prefill is gather only;
+- BF16 partials on the wire;
+- V4 splits its C4 layers only;
+- `layers` is single-lane first;
+- the selection check is off in serving and on in the gates;
+- the host tier is on under `context`;
+- a GLM Flash tie goes to `context` after 6 sessions;
+- add a 256K GLM 5.3 C1 card.
+
+K1 starts now; K0 starts after P2 merges.
 1. **Prefill route.** Recommend gather only: byte-exact with `heads`, no new
    prefill kernel, exact cache independent of chunk boundaries. It costs
    GLM 5.3 about 0.2 s per chunk past 771K tokens of history.
