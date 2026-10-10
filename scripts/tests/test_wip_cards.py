@@ -156,6 +156,10 @@ def test_build_stages_union_identical_scopes_and_no_outer_gpu_lock(entry, tmp_pa
     scopes = cards.build_scopes([entry])
     assert scopes['CUTEAFD_WIP_SPARK_TP_ROLES'] == 'tp3'
     assert scopes['CUTEAFD_WIP_EXPORT_LOCKS'] == 'on'
+    # Qwen has no Spark FP8 layout: its scope is the NVFP4 family (CMake adds the coordinator FP8 sibling).
+    qwen = {**entry, 'name': 'qwen38-nvfp4-min', 'family': 'qwen4', 'sparks': [], 'set': {'SPARK_COUNT': '0'}}
+    families = cards.build_scopes([qwen, other])['CUTEAFD_WIP_EXPERT_FAMILIES'].split(';')
+    assert 'qwen4:nvfp4' in families and 'qwen4:fp8' not in families and 'glmf:fp8' in families
 
 
 @pytest.mark.parametrize('name,tag', [('v4-flash-min', 'dsv4f'), ('v4-pro-exl3-max', 'dsv4p')])

@@ -35,6 +35,12 @@ enhanced build.
 
 ## Choosing a model
 
+**Balance (TJ, 2026-10-10):** with Claude budget getting tighter, bias bounded,
+less judgment-heavy work toward Sol 6.1 high/xhigh on the primary
+subscription: parity and A/B runs, per-family ports that follow an existing
+template, card definitions, fixtures and test gaps, docs. Opus stays on design,
+integration leads and hard calls.
+
 Budget drives the split. Claude is the scarcest: eight parallel Opus agents
 once used ~60% of a week's capacity in under a day. Codex Sol has had ample
 budget (under 1% of a weekly subscription after a full day of work). With a

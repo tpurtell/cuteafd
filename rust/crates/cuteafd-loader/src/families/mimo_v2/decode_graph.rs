@@ -66,6 +66,14 @@ impl MimoDecodeGraphPlan {
         })
     }
 
+    pub fn graph_set(&self, bytes_per_exec: u64, driver_margin: u64) -> crate::placement::inventory::GraphSet {
+        use crate::placement::inventory::{GraphRank, GraphSet, Lifetime};
+        GraphSet { ranks: self.executables_per_rank.iter().map(|&count| GraphRank {
+            executables: count as u64, margin: if count == 0 { 0 } else { driver_margin },
+            bytes: if count == 0 { 0 } else { (count as u64).saturating_mul(bytes_per_exec).saturating_add(driver_margin) },
+        }).collect(), lifetime: Lifetime::Startup, shapes: self.row_shapes as u64 }
+    }
+
     /// A measured 64-shape Pro capture consumed 616/566 MiB on lead/peer.
     /// Its largest shape increment was 12 MiB per 70/71 executables. 192 KiB
     /// per executable exceeds that observed increment; the separate 64 MiB

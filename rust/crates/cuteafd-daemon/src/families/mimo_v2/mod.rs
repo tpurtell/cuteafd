@@ -68,9 +68,8 @@ pub(crate) struct EngineArgs {
     /// Admit every prefill row's logits at startup for fidelity probes.
     #[arg(long)]
     pub full_prefill_logits: bool,
-    /// Provisional per-GPU bound for CUDA modules, libraries and constraints
-    /// bookkeeping beyond named tensor/workspace reservations. This is an
-    /// explicit startup bound, not a measured allocation footprint.
+    /// Sanity cap for measured selected-module loading before admission.
+    /// Modules belong to the measured baseline; this cap is not reserved storage.
     #[arg(long, default_value_t = 1024)]
     pub runtime_reserve_mib: usize,
     /// Calibrated conservative storage envelope per retained decode graph.
@@ -825,25 +824,31 @@ impl Opened {
             }
         }
         let prefix_draft = serving.is_some_and(|(prefix, _)| prefix.mimo_prefix_draft);
-        let preflight = admission::preflight(self, args, &programs, split_device, serving, prefill_output, prefix_draft, automatic_context)?;
-        resolved.max_context = usize::try_from(preflight.capacity.effective_max_context_tokens)?;
-        let args = &resolved;
-        // Module allocation is checked against its provisional bound before
-        // tensors. It does not qualify later capture or constraint demand.
-        for sample in &preflight.memory {
-            crate::shared::peer_split::on_device(&self.library, sample.device as i32, args.device, || {
+        // Load only selected modules, then measure the admission baseline before tensors.
+        // The configured bound remains a sanity cap, not a reserved GiB.
+        let module_bound = cuteafd_loader::families::mimo_v2::admission::tensor_bytes("MiMo module sanity bound", &[args.runtime_reserve_mib, 1 << 20])?;
+        for device in std::iter::once(args.device).chain(split_device) {
+            crate::shared::peer_split::on_device(&self.library, device, args.device, || {
                 let before = self.library.cuda_memory_info()?.0;
-                programs.load_all()?;
+                let family = self.cfg.program_family()?;
+                let split_cfg = self.cfg.head_split(if split_device.is_some() { 2 } else { 1 })?;
+                let selected = cuteafd_core::coordinator_programs::CoordinatorPrograms {
+                    family, split_family: Some(split_cfg.program_family()?),
+                };
+                programs.load_matching(|name| selected.contains(name))?;
                 let after = self.library.cuda_memory_info()?.0;
                 let module_bytes = before.saturating_sub(after) as u64;
-                ensure!(module_bytes <= preflight.runtime_bound_bytes,
-                    "MiMo GPU {} module load used {} B, exceeding the provisional runtime bound {} B before weights",
-                    sample.device, module_bytes, preflight.runtime_bound_bytes);
-                tracing::info!(device = sample.device, module_bytes, bound_bytes = preflight.runtime_bound_bytes,
+                ensure!(module_bytes <= module_bound,
+                    "MiMo GPU {} module load used {} B, exceeding the module sanity bound {} B before weights",
+                    device, module_bytes, module_bound);
+                tracing::info!(device, module_bytes, bound_bytes = module_bound,
                     "MiMo measured module allocation; capture/constraint bound remains unqualified");
                 Ok(())
             })?;
         }
+        let preflight = admission::preflight(self, args, &programs, split_device, serving, prefill_output, prefix_draft, automatic_context)?;
+        resolved.max_context = usize::try_from(preflight.capacity.effective_max_context_tokens)?;
+        let args = &resolved;
         let draft_dir = args.draft.as_deref().map(dflash::drafter_dir);
         let draft_file = draft_dir.as_deref().map(dflash::prefetch);
         let stream = self.library.cuda_stream_create()?;
@@ -927,7 +932,9 @@ impl Opened {
                     ring_mib_per_sequence = format!("{:.2}", ring_bytes as f64 / (1u64 << 20) as f64), "MiMo KV records");
             }
             if let Some((device, stream)) = peer_stream {
-                engine.attach_peer(device, stream, shares.pop().context("head-split shares")?)?;
+                engine.attach_peer(device, stream, shares.pop().context("head-split shares")?,
+                    !args.skip_experts && !args.local_experts && args.peers.is_some()
+                        && self.cfg.dense.iter().take(layers).any(|&dense| !dense))?;
             }
             engine.mtp = mtp;
             if let Some(dir) = &draft_dir {

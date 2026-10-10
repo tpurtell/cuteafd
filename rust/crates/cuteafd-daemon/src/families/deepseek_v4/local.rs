@@ -23,8 +23,12 @@ use cuteafd_ffi::{
 use cuteafd_loader::OfficialV41Catalog;
 use std::{ffi::c_void, path::Path, rc::Rc};
 
-/// Capacities the exporter compiles (rows per launch).
-const CAPACITIES: [u32; 6] = [1, 16, 80, 256, 1024, 4096];
+/// The exported capacities (rows per launch) a layer runs for at most
+/// `max_rows` live rows: each once, up to the first at or above `max_rows`
+/// (`placement::inventory::exl3_capacities`, shared with the planner).
+fn capacities(max_rows: usize) -> Vec<u32> {
+    cuteafd_loader::placement::inventory::exl3_capacities(max_rows as u64).into_iter().map(|c| c as u32).collect()
+}
 
 struct State<'a> {
     kernel: V41ExpertKernel<'a>,
@@ -85,8 +89,7 @@ fn require_exl3_manifest(directory: &Path) -> Result<()> {
 pub(crate) fn workspace_bytes(library: &NativeLibrary, native_lib: &Path, catalog: &OfficialV41Catalog,
     max_rows: usize) -> Result<Option<usize>> {
     let shape = *catalog.routed_experts();
-    let capacities: Vec<u32> = CAPACITIES.iter().copied().filter(|&c| c as usize <= max_rows.max(1))
-        .chain(CAPACITIES.iter().copied().find(|&c| c as usize >= max_rows)).collect();
+    let capacities = capacities(max_rows);
     let workspace = if let Some(manifest) = catalog.exl3() {
         let directory = aot_layout_directory(native_lib, manifest.decoder_tiers(), "rtx-tp1");
         let directories: Vec<_> = capacities.iter().map(|c| directory.join(format!("m{c}"))).collect();
@@ -114,8 +117,7 @@ pub(crate) fn plan(library: &NativeLibrary, native_lib: &Path, catalog: &Officia
     let shape = *catalog.routed_experts();
     let empty = || LocalPlan { layers: 0, peak_bytes: 0 };
     if max_layers <= shape.first_layer && draft_stages == 0 { return Ok(empty()); }
-    let capacities: Vec<u32> = CAPACITIES.iter().copied().filter(|&c| c as usize <= max_rows.max(1))
-        .chain(CAPACITIES.iter().copied().find(|&c| c as usize >= max_rows)).collect();
+    let capacities = capacities(max_rows);
     let workspace = if let Some(manifest) = catalog.exl3() {
         let directory = aot_layout_directory(native_lib, manifest.decoder_tiers(), "rtx-tp1");
         let directories: Vec<_> = capacities.iter().map(|c| directory.join(format!("m{c}"))).collect();
@@ -193,8 +195,7 @@ impl<'a> LocalExperts<'a> {
         if backbone.is_empty() && draft_stages == 0 {
             return Ok(None);
         }
-        let capacities: Vec<u32> = CAPACITIES.iter().copied().filter(|&c| c as usize <= max_rows.max(1))
-            .chain(CAPACITIES.iter().copied().find(|&c| c as usize >= max_rows)).collect();
+        let capacities = capacities(max_rows);
         if let Some(manifest) = catalog.exl3() {
             let directory = aot_layout_directory(native_lib, manifest.decoder_tiers(), "rtx-tp1");
             let row_policy = Exl3RowPolicy::active();

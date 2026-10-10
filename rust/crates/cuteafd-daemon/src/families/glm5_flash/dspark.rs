@@ -350,6 +350,10 @@ impl<'a> DsparkDrafter<'a> {
         scales: fp8_linear::Fp8Scales, fp8_rows: fp8_linear::Fp8Rows) -> Result<Self> {
         let _memory_scope = cuteafd_ffi::memory_ledger::scope("drafter");
         let cfg = DsparkConfig::read(snapshot)?;
+        let config = serde_json::from_slice(&std::fs::read(snapshot.join("config.json"))?)?;
+        let (resident_bytes, scratch_bytes) = cuteafd_loader::families::glm5::draft_representation::draft_resident_bytes_with_mode(
+            &config, slots, max_sequences, library.sm_count()? as u64, representation, fp8_rows.code() as u8)?;
+        tracing::info!(resident_bytes, scratch_bytes, "dSpark shared readiness inventory");
         ensure!((1..=MAX_SEQUENCES).contains(&max_sequences), "dSpark drafts take 1..={MAX_SEQUENCES} sequences");
         let path = snapshot.join("model.safetensors");
         let shapes: HashMap<String, Vec<usize>> = read_safetensors_metadata(&path)?.into_iter()
@@ -566,6 +570,7 @@ impl<'a> DsparkDrafter<'a> {
     }
 
     fn workspace(&self, sequences: usize) -> Result<Workspace<'a>> {
+        let _memory_scope = cuteafd_ffi::memory_ledger::scope("drafter/workspace");
         let c = &self.cfg;
         let rows = sequences * c.block;
         let alloc = |bytes: usize| DeviceAllocation::new(self.library, bytes.max(256));
@@ -784,6 +789,15 @@ impl<'a> Drafter<'a> {
             Self::Dflash2(d) => d.confidence_policy("glm5_flash", fp8_head),
             Self::Dspark(d) => d.confidence_policy("glm5_flash", fp8_head),
         }
+    }
+
+    /// The shared draft policy's prior: DFlash2's keyed selector fit, or the
+    /// dSpark confidence head blended with the history rate.
+    pub fn draft_prior(&self, fp8_head: bool) -> Result<super::draft_binding::Prior> {
+        Ok(match self {
+            Self::Dflash2(d) => super::draft_binding::Prior::Selector(d.selector_fit("glm5_flash", fp8_head)?),
+            Self::Dspark(_) => super::draft_binding::Prior::Head,
+        })
     }
 
     /// Loads the drafter `snapshot` names (dSpark when its config says so,

@@ -158,12 +158,14 @@ fn parse_onboard(text: &str) -> std::result::Result<cuteafd_loader::placement::O
 
 impl EngineArgs {
     /// The resolved `--rtx-expert-layers` / `--local-expert-layers`.
-    pub(crate) fn onboard(&self) -> Result<cuteafd_loader::placement::Onboard> {
+    /// The RTX expert policy for a model of hidden size `dim` on `gpus` serving GPUs (the head split
+    /// as resolved, not as requested).
+    pub(crate) fn onboard(&self, dim: usize, gpus: usize) -> Result<cuteafd_loader::placement::Onboard> {
         use cuteafd_loader::placement::Onboard;
         Ok(match (self.rtx_expert_layers, self.local_expert_layers) {
             (Some(onboard), _) => onboard,
             (None, Some(layers)) => Onboard::Layers(layers),
-            (None, None) => cuteafd_loader::placement::families::deepseek_v4::default_onboard(if self.split_device.is_some() { 2 } else { 1 }),
+            (None, None) => cuteafd_loader::placement::families::deepseek_v4::default_onboard(dim, gpus),
         })
     }
 
@@ -278,20 +280,25 @@ pub(crate) fn with_engine<T>(
     selected.validate_v4(caps["prefill_rows"].as_u64().context("prefill_rows")?,
         caps["decode_rows"].as_u64().context("decode_rows")?, programs.names())?;
     let started = Instant::now();
-    let (loaded_count, skipped) = programs.load_matching(|name| selected.contains(name))?;
-    tracing::info!(loaded = loaded_count, skipped, elapsed_ms = started.elapsed().as_millis() as u64,
-        "DeepSeek V4 programs loaded");
+    if let Some(device) = split_device {
+        ensure!(device != args.device, "--split-device must differ from --device");
+        loaded.library.cuda_enable_peer(device)?;
+        crate::shared::peer_split::on_device(&loaded.library, device, args.device,
+            || loaded.library.cuda_enable_peer(args.device))?;
+    }
+    // One inventory sample per GPU around the family's own program modules
+    // (placement PR 2): the context and module bytes the planner charges as
+    // `ArchContext` + `ProgramSet`.
+    let devices: Vec<i32> = std::iter::once(args.device).chain(split_device).collect();
+    let inventory = crate::shared::inventory::RuntimeInventory::measure(&loaded.library, &devices, |_| {
+        let (loaded_count, skipped) = programs.load_matching(|name| selected.contains(name))?;
+        tracing::info!(loaded = loaded_count, skipped, elapsed_ms = started.elapsed().as_millis() as u64,
+            "DeepSeek V4 programs loaded");
+        Ok(())
+    })?;
     let peer_stream = match split_device {
-        Some(device) => {
-            ensure!(device != args.device, "--split-device must differ from --device");
-            loaded.library.cuda_enable_peer(device)?;
-            loaded.library.cuda_set_device(device)?;
-            let stream = loaded.library.cuda_enable_peer(args.device)
-                .and_then(|()| programs.load_matching(|name| selected.contains(name)).map(|_| ()))
-                .and_then(|()| loaded.library.cuda_stream_create());
-            loaded.library.cuda_set_device(args.device)?;
-            Some((device, stream?))
-        }
+        Some(device) => Some((device, crate::shared::peer_split::on_device(&loaded.library, device, args.device,
+            || loaded.library.cuda_stream_create())?)),
         None => None,
     };
     let started = Instant::now();
@@ -315,13 +322,19 @@ pub(crate) fn with_engine<T>(
         use cuteafd_loader::placement::Baseline;
         ensure!(args.max_sequences > 0, "--max-sequences must be positive");
         let devices: Vec<_> = std::iter::once(args.device).chain(split_device).collect();
-        let gpus = devices.iter().map(|&device| crate::shared::peer_split::on_device(
-            &loaded.library, device, args.device, || {
+        // Each GPU's free bytes less the measured code still to load before ready (lazily loaded
+        // functions, cuBLAS: `placement::inventory::LOADED_CODE`), which the planner charges in its
+        // baseline.
+        let gpus = devices.iter().enumerate().map(|(rank, &device)| {
+            let pending = crate::shared::inventory::pending_code(&loaded.library, device, rank, devices.len() == 2,
+                loaded.family, cuteafd_loader::placement::families::deepseek_v4::code_experts(&loaded.catalog))?;
+            crate::shared::peer_split::on_device(&loaded.library, device, args.device, || {
                 let (free, total) = loaded.library.cuda_memory_info()?;
-                Ok((total as u64, Baseline::Measured { free_bytes: free as u64 }))
-            })).collect::<Result<Vec<_>>>()?;
+                Ok((total as u64, Baseline::Measured { free_bytes: (free as u64).saturating_sub(pending) }))
+            })
+        }).collect::<Result<Vec<_>>>()?;
         let cache_stages = model.dspark.as_ref().map_or(0, |d| d.stages.len());
-        let onboard = args.onboard()?;
+        let onboard = args.onboard(loaded.cfg.dim, devices.len())?;
         let stages = if args.dspark && !args.skip_routed_experts { cache_stages } else { 0 };
         let max_rows = prefill_rows.max(decode_rows);
         let expert_workspace = if args.skip_routed_experts
@@ -354,6 +367,8 @@ pub(crate) fn with_engine<T>(
         let inputs = admission::Inputs { cfg: &loaded.cfg, catalog: &loaded.catalog, manifest: &loaded.manifest,
             family: loaded.family, gpus, cache_stages, prefill_rows, decode_rows, max_context, prefix,
             expert_workspace, tp2_workspace, exchange_f32 };
+        inventory.record(loaded.family, &inputs.gpus.iter().map(|(_, b)| match b {
+            Baseline::Measured { free_bytes } => *free_bytes, Baseline::Planned { .. } => 0 }).collect::<Vec<_>>());
         let request = admission::request(args, &inputs)?;
         let placement = cuteafd_loader::placement::solve(&request)
             .map_err(|error| anyhow::anyhow!("DeepSeek V4 admission: {error}"))?;

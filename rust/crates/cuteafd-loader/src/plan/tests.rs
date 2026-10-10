@@ -844,8 +844,10 @@ fn v4_workspace_plan_matches_runtime_below_compiled_context() {
             let intake = 2 * 2 * 4096 * cfg.dim as u64 * 2;
             assert_eq!((steps.bytes, steps.basis), (runtime[0].fixed_device_bytes + intake, Basis::Formula));
             let graph = layout::family_costs("deepseek_v4").graph_bytes[0];
+            // The PRO envelope covers the measured loaded code as well (`V4Inputs::code_bytes`).
+            let code = crate::placement::loaded_code("dsv4f", "*", false, 0).unwrap().bytes;
             assert_eq!(total - device.capacity_bytes, crate::serving_capacity::deepseek_v4_headroom_bytes(
-                total, 10 << 30, steps.bytes, graph));
+                total, 10 << 30, steps.bytes + code, graph));
         }
     }
 }
@@ -1047,7 +1049,7 @@ fn glm5_flash_layout_charges_the_engine_step_workspaces_and_headroom() {
     let gpu = plan(dir.path(), &budgeted).unwrap().memory_layout.unwrap().devices.remove(0);
     let graphs: Vec<_> = gpu.items.iter().filter(|i| i.group.starts_with("graph")).map(|i| (i.group.as_str(), i.bytes))
         .collect();
-    assert_eq!(graphs, [("graph budget", 512 << 20)]);
+    assert_eq!(graphs, [("graph growth", 512 << 20)]);
 }
 
 /// `--decode-rows 128` in the planner charges what the engine allocates for it: the decode workspace of
@@ -1316,8 +1318,8 @@ fn glm5_flash_layout_keeps_the_graph_budget_as_the_admission_does() {
         memory.devices.iter().filter(|d| d.kind == DeviceKind::Rtx).flat_map(|d| d.items.iter()
             .filter(|i| i.group.starts_with("graph")).map(|i| (i.group.clone(), i.bytes))).collect()
     };
-    let budget = |mib: u64| ("graph budget".to_string(), mib << 20);
-    let kept = ("graph allowance".to_string(), allowance[0]);
+    let budget = |mib: u64| ("graph growth".to_string(), mib << 20);
+    let kept = ("graph growth".to_string(), allowance[0]);
     // Measured: the budget itself, below the allowance or above it.
     assert_eq!(graphs(1, None, 4, 512), [budget(512)]);
     assert_eq!(graphs(1, None, 4, 4096), [budget(4096)]);
@@ -1326,6 +1328,30 @@ fn glm5_flash_layout_keeps_the_graph_budget_as_the_admission_does() {
         assert_eq!(graphs(gpus, pool, ranks, 512), vec![kept.clone(); gpus], "{gpus} {pool:?} {ranks}");
         assert_eq!(graphs(gpus, pool, ranks, 1536), vec![kept.clone(); gpus], "{gpus} {pool:?} {ranks}");
         assert_eq!(graphs(gpus, pool, ranks, 4096), vec![budget(4096); gpus], "{gpus} {pool:?} {ranks}");
+    }
+}
+
+#[test]
+fn glm5_flash_disabled_draft_omits_arenas_and_speculative_graphs() {
+    use cuteafd_core::memory_layout::Category;
+    let dir = snapshot(glm5_flash_config(2), &[t("model.language_model.layers.0.self_attn.A_log", "F32", &[64])]);
+    let options = |disabled| PlanOptions { layout: Some(layout::LayoutOptions {
+        glmf_drafter_disabled: disabled, context_tokens: 131_072, ..Default::default() }), ..sparks(4) };
+    let enabled = plan(dir.path(), &options(false)).unwrap().memory_layout.unwrap();
+    let disabled = plan(dir.path(), &options(true)).unwrap().memory_layout.unwrap();
+    assert!(enabled.devices[0].items.iter().any(|i| i.category == Category::Drafter));
+    assert!(!disabled.devices[0].items.iter().any(|i| i.category == Category::Drafter));
+    let graphs = |layout: &cuteafd_core::memory_layout::MemoryLayout| layout.devices[0].items.iter()
+        .find(|i| i.group == "graphs").unwrap().bytes;
+    assert!(graphs(&disabled) < graphs(&enabled), "disabled={} enabled={}", graphs(&disabled), graphs(&enabled));
+    // The measured loaded code (`placement::inventory::LOADED_CODE`) replaces the per-workspace
+    // runtime allowance: it already holds the workspaces' and the drafter's untracked memory.
+    let code = crate::placement::loaded_code("glmf", "*", false, 0).unwrap().bytes;
+    for layout in [&enabled, &disabled] {
+        assert!(!layout.devices[0].items.iter().any(|i| i.group == "workspace runtime overhead"));
+        let context = layout.devices[0].items.iter().find(|i| i.group == "context+modules").unwrap().bytes;
+        assert_eq!(context, crate::placement::ArchContext::coordinator(crate::placement::inventory::PRO_TOTAL_BYTES,
+            None).context_bytes + code);
     }
 }
 
@@ -1466,7 +1492,11 @@ fn mimo_concurrency_default_is_small_card_only_and_overridable() {
         let overridden = plan(dir.path(), &options).unwrap().memory_layout.unwrap();
         let state = |layout: &cuteafd_core::memory_layout::MemoryLayout| layout.devices[0].items.iter()
             .find(|item| item.group == "state").unwrap().bytes;
-        assert_ne!(state(&automatic), state(&overridden));
+        // Both concurrency limits fit the same sixteen physical target rings.
+        assert_eq!(state(&automatic), state(&overridden));
+        options.layout.as_mut().unwrap().mimo_rings = 32;
+        let more_rings = plan(dir.path(), &options).unwrap().memory_layout.unwrap();
+        assert!(state(&more_rings) > state(&automatic));
     }
 }
 
@@ -1813,7 +1843,7 @@ fn encoder_plan_g9_charges_before_pool_and_hashes_off() {
     let memory = local.memory_layout.as_ref().unwrap();
     let tower = memory.devices[0].items.iter().position(|i| i.group == "vision tower").unwrap();
     let pool = memory.devices[0].items.iter().position(|i| i.group == "records").unwrap();
-    assert!(tower < pool);
+    assert!(tower < pool, "{:?}", memory.devices[0].items);
     let off = plan(dir.path(), &PlanOptions { vision: MediaMode::Off, ..options }).unwrap();
     assert_eq!(off.encoder.as_ref().unwrap().admitted_bytes(),0);
     assert_eq!(off.components.iter().find(|c| c.component == Component::Vision).unwrap().bytes,0);

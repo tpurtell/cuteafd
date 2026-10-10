@@ -44,8 +44,7 @@ type Dev<'a> = DeviceAllocation<'a>;
 pub(crate) const PAGE_ROWS: usize = 64;
 /// Rows of the decode-shaped programs (`_m64`).
 pub(crate) const DECODE_ROWS: usize = 64;
-const PLAIN_BUCKETS: &[usize] = &[1, 4, 8, 16];
-const SPEC_BUCKETS: &[usize] = &[2, 4, 8, 16, 24, 32, 64];
+use cuteafd_loader::serving_capacity::qwen_graphs::{QWEN_PLAIN_BUCKETS as PLAIN_BUCKETS, QWEN_SPEC_BUCKETS as SPEC_BUCKETS};
 // Keep this registry aligned with the pinned fork; script contracts check its source thresholds.
 const GLM_BF16_SKINNY_ROWS: usize = 8;
 const QWEN_WIDE_SKINNY_ROWS: usize = 24;
@@ -72,8 +71,7 @@ pub(super) fn startup_graphs_enabled(graphs: Option<&str>, startup: Option<&str>
 }
 
 fn decode_bucket(rows: usize, spec: bool) -> usize {
-    let buckets = if spec { SPEC_BUCKETS } else { PLAIN_BUCKETS };
-    buckets.iter().copied().find(|&bucket| rows <= bucket).unwrap_or(rows)
+    cuteafd_loader::serving_capacity::qwen_graphs::qwen_decode_bucket(rows, spec)
 }
 
 pub(crate) fn copy_row_limit(rows: usize, sequences: usize) -> usize {
@@ -750,41 +748,15 @@ pub(crate) struct Qwen4Engine<'a> {
     mtp_drafts: Dev<'a>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-struct GraphGeometry {
-    pool_width: usize,
-    page_stride: usize,
-    pool_stride: usize,
-    long: bool,
-}
+type GraphGeometry = cuteafd_loader::serving_capacity::qwen_graphs::QwenGraphGeometry;
 
 fn graph_geometries(context: usize, pages: usize, dense: usize) -> Vec<GraphGeometry> {
-    let pools = pages / UNIT_PAGES;
-    let mut geometries = Vec::new();
-    for units in 1..=context.div_ceil(UNIT_ROWS).min(pools) {
-        let capacity = (units * UNIT_ROWS).min(context);
-        let mut width = 1;
-        while width / 2 * UNIT_ROWS < capacity {
-            let low = if width == 1 { 1 } else { width / 2 * UNIT_ROWS + 1 };
-            let high = (width * UNIT_ROWS).min(capacity);
-            for long in [false, true] {
-                if (!long && low <= high.min(dense)) || (long && low.max(dense + 1) <= high) {
-                    let live_units = crate::shared::context::decode_allocation_units(units, high, UNIT_ROWS);
-                    let pool_stride = live_units.next_power_of_two().min(pools);
-                    let page_stride = (live_units * UNIT_PAGES).next_power_of_two().min(pages);
-                    let geometry = GraphGeometry { pool_width: width.min(pool_stride), page_stride, pool_stride, long };
-                    if !geometries.contains(&geometry) { geometries.push(geometry); }
-                }
-            }
-            width *= 2;
-        }
-    }
-    geometries
+    cuteafd_loader::serving_capacity::qwen_graphs::qwen_graph_geometries(context, pages, dense)
 }
 
 pub(super) fn serving_graph_count(context: usize, pool_tokens: usize, dense: usize,
     sequences: usize, speculation: bool, layers: usize) -> Result<usize> {
-    let pages = pool_tokens.div_ceil(UNIT_ROWS).checked_mul(UNIT_PAGES)
+    let pages = cuteafd_loader::serving_capacity::qwen_graphs::qwen_pool_pages(pool_tokens)
         .context("Qwen graph page count overflow")?;
     serving_graph_shapes(context, pages, dense, sequences, speculation).len()
         .checked_mul(layers.checked_add(1).context("Qwen graph segment count overflow")?)
@@ -793,11 +765,7 @@ pub(super) fn serving_graph_count(context: usize, pool_tokens: usize, dense: usi
 
 fn serving_graph_shapes(context: usize, pages: usize, dense: usize, sequences: usize, speculation: bool)
     -> Vec<(usize, bool, GraphGeometry)> {
-    let plain = decode_bucket(sequences.min(DECODE_ROWS), false);
-    graph_geometries(context, pages, dense).into_iter().flat_map(|geometry| {
-        PLAIN_BUCKETS.iter().copied().filter(move |&rows| rows <= plain).map(move |rows| (rows, false, geometry))
-            .chain(SPEC_BUCKETS.iter().copied().filter(move |_| speculation).map(move |rows| (rows, true, geometry)))
-    }).collect()
+    cuteafd_loader::serving_capacity::qwen_graphs::qwen_serving_graph_shapes(context, pages, dense, sequences, speculation)
 }
 
 fn pad_decode_tables(tables: &mut StepTables, tokens: &mut Vec<u32>, bucket: usize, ple_rows: usize) {

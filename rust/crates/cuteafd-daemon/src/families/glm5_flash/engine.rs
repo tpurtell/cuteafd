@@ -125,10 +125,7 @@ const SPARSE_MLA_HEAD_BLOCKS: usize = 4;
 /// sparse MLA plans its 128-row bucket at one split (`full_launch_splits=1` at export; at 188 SMs
 /// the planner's own plan), so an object exported on either card keeps 4 CTAs a row.
 pub(crate) fn verify_budget(decode_rows: usize, sms: usize) -> usize {
-    if decode_rows <= DECODE_ROWS {
-        return decode_rows;
-    }
-    (SPARSE_MLA_WAVES * sms / SPARSE_MLA_HEAD_BLOCKS).clamp(DECODE_ROWS, decode_rows)
+    cuteafd_loader::serving_capacity::glmf_graphs::verify_budget(decode_rows, sms)
 }
 
 /// Hands the rows an even share of `verify_rows` leaves over to the first sequences, one each.
@@ -1288,6 +1285,11 @@ pub(crate) struct GlmfEngine<'a> {
     split_audit: bool,
     /// Recorded after a layer's routes and wire rows reach the host staging.
     routes_ready: *mut c_void,
+    /// The shared draft policy's per-step signals (layer events, routes), armed by
+    /// `serve-glmf` under the shared policy and active only around its verify steps.
+    draft_probe: RefCell<Option<super::draft_probe::RoundProbe<'a>>>,
+    /// A decode segment is being captured: host-side probe work stays out of the graph.
+    capturing: std::cell::Cell<bool>,
     ops: Option<RefCell<OpTimes>>,
     /// Prefill projections that run block-FP8 GEMMs (the layers need FP8 copies).
     pub fp8_prefill: Fp8Prefill,
@@ -1318,8 +1320,9 @@ pub(crate) struct Fp8Prefill {
 // and do not enlarge the startup graph set. Counters still count every capture.
 use crate::shared::decode_graph::{check_bucket_thresholds, masked_row, ProjectionThreshold};
 
-const PLAIN_DECODE_BUCKETS: [usize; 6] = [1, 4, 8, 16, 32, 64];
-const SPEC_DECODE_BUCKETS: [usize; 6] = [2, 4, 8, 16, 32, 64];
+pub(crate) use cuteafd_loader::serving_capacity::glmf_graphs::{DecodeBuckets, GraphGeometry, decode_strides, serving_graph_shapes, serving_graph_reserve};
+#[allow(unused_imports)]
+use cuteafd_loader::serving_capacity::glmf_graphs::{graph_geometries, graph_reserve_bytes, MIN_PAGE_STRIDE, PLAIN_DECODE_BUCKETS, SPEC_DECODE_BUCKETS};
 // Inclusive arithmetic crossovers audited against the pinned AOT exporter.
 // Full/half-head shapes share these thresholds; MoE projections use real rows.
 const DECODE_PROJECTION_THRESHOLDS: &[ProjectionThreshold] = &[
@@ -1345,33 +1348,6 @@ const WIDE_DECODE_THRESHOLDS: &[ProjectionThreshold] = &[
     ProjectionThreshold { name: "glmf.decode_capacity[m64|m128]", skinny_rows: DECODE_ROWS },
 ];
 
-/// The row buckets padded decode steps run at (startup graphs): the plain buckets (a plain step has
-/// one row per sequence, at most 64) and the speculative ones, which with the wide programs end at
-/// the verify budget: `[2, 4, 8, 16, 32, 64, 127]` on an RTX 5090, `[.., 64, 128]` on 188 SMs,
-/// `[.., 64, 99]` on 132. A budget of 64 keeps the 64-row sets.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct DecodeBuckets {
-    pub plain: Vec<usize>,
-    pub spec: Vec<usize>,
-}
-
-impl DecodeBuckets {
-    /// The sets of a verify budget of `verify_rows` rows ([`verify_budget`]).
-    pub(crate) fn new(verify_rows: usize) -> Self {
-        let mut spec = SPEC_DECODE_BUCKETS.to_vec();
-        if verify_rows > DECODE_ROWS {
-            spec.push(verify_rows);
-        }
-        Self { plain: PLAIN_DECODE_BUCKETS.to_vec(), spec }
-    }
-
-    /// The bucket a step of `rows` rows pads to (the rows themselves past the largest).
-    pub(crate) fn bucket(&self, rows: usize, spec: bool) -> usize {
-        let set = if spec { &self.spec } else { &self.plain };
-        set.iter().copied().find(|&bucket| bucket >= rows).unwrap_or(rows)
-    }
-}
-
 /// Refuses bucket sets that would pad a step across an audited arithmetic crossover: the plain
 /// buckets serving `sequences` reaches and, with `speculation`, the speculative ones.
 fn check_decode_thresholds(buckets: &DecodeBuckets, sequences: usize, speculation: bool) -> Result<()> {
@@ -1383,18 +1359,11 @@ fn check_decode_thresholds(buckets: &DecodeBuckets, sequences: usize, speculatio
     if speculation { check_bucket_thresholds(&buckets.spec, &thresholds)?; }
     Ok(())
 }
-// WP9 official-startup-dflash2-20261006-v1, SM120 RTX PRO 6000, 2026-10-06:
-// 11,040 TP1 graphs, 1,616,904,192 physical bytes after fixed workspaces
-// (146,458.713 B/graph).
-// Remeasure for another GPU target or graph implementation; round up here.
-const MEASURED_GRAPH_BYTES: u64 = 146_459;
-const GRAPH_MARGIN_PERCENT: u64 = 20;
-const GRAPH_RANK_MARGIN_BYTES: u64 = 64 << 20;
-
 // WP9 2026-10-07, RTX PRO 6000 SM120, runtime99c: each new LM lane
 // adds 71,942,144 B beyond tracked buffers; drafter adds 68,269,888 B. This
 // measured/calibrated allowance is not exact cuBLAS allocator ownership.
-const WORKSPACE_RUNTIME_OVERHEAD_BYTES: u64 = 72 << 20;
+#[allow(unused_imports)]
+use cuteafd_loader::serving_capacity::glmf_graphs::WORKSPACE_RUNTIME_OVERHEAD_BYTES;
 
 /// Per rank, the device bytes its step workspaces take before the KV pool, for an admission that
 /// sizes the pool before they exist: the decode workspace and `lanes` prefill lanes of `prefill_rows`
@@ -1413,7 +1382,7 @@ pub(crate) fn workspace_reserve(plan: &StepPlan<'_, '_>, prefill_rows: usize, la
 /// A rank's `tracked` workspace bytes with the untracked runtime memory of its decode workspace,
 /// `lanes` prefill lanes and (`drafter`) the drafter's.
 fn workspace_reserve_bytes(tracked: u64, lanes: usize, drafter: bool) -> u64 {
-    tracked + WORKSPACE_RUNTIME_OVERHEAD_BYTES * (1 + lanes + usize::from(drafter)) as u64
+    tracked + cuteafd_loader::serving_capacity::glmf_graphs::workspace_runtime_overhead(lanes, drafter)
 }
 
 /// The prefill lanes a serving engine creates before readiness: `lanes` (`--prefill-lanes`) when
@@ -1434,139 +1403,20 @@ pub(crate) fn startup_graphs_enabled() -> bool {
         std::env::var("CUTEAFD_GLMF_STARTUP_GRAPHS").ok().as_deref())
 }
 
-/// The startup decode graph set's bytes on its largest rank (`serving_graph_reserve`), and the
-/// planner's graph allowance, which lazily captured graphs keep.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct StartupGraphReserve {
-    pub reserve: u64,
-    pub allowance: u64,
-}
+pub(crate) use cuteafd_loader::serving_capacity::glmf_graphs::StartupGraphReserve;
 
-/// Admits the KV pool beside the startup decode graphs (`startup`), falling back to lazily captured
-/// graphs only on a real shortfall: the admission keeping the startup set's bytes, more than the
-/// allowance, is refused for want of memory (`memory_report::kv_shortfall`), and the same admission
-/// with lazily captured graphs, which keep only the allowance, admits a pool. `admit(Some(bytes))` is
-/// the admission keeping the startup set's `bytes` free, `admit(None)` the one keeping what lazily
-/// captured graphs keep; each admission charges them its own way (a planned one the bytes above the
-/// planner's allowance on every GPU, a measured one the bytes themselves). Returns the pool and
-/// whether decode graphs are captured at startup. Every other refusal stands: the first admission's
-/// own error when it is not a shortfall; the startup refusal when the retry is short of memory too;
-/// and the retry's own error, with the startup refusal as context, when the retry fails for another
-/// reason (its memory sample, an overflow, a CUDA query, a checkpoint read).
+/// Admission policy lives in the loader; CUDA error classification stays at the edge.
 pub(crate) fn admit_beside_decode_graphs(startup: Option<StartupGraphReserve>,
-    mut admit: impl FnMut(Option<u64>) -> Result<usize>) -> Result<(usize, bool)> {
-    use crate::shared::memory_report::kv_shortfall;
-    let Some(graphs) = startup else { return Ok((admit(None)?, false)) };
-    let extra = graphs.reserve.saturating_sub(graphs.allowance);
-    let refused = match admit(Some(graphs.reserve)) {
-        Ok(tokens) => return Ok((tokens, true)),
-        Err(error) if extra > 0 && kv_shortfall(&error) => error,
-        Err(error) => return Err(error),
-    };
-    let tokens = match admit(None) {
-        Ok(tokens) => tokens,
-        // No room either way: the startup set is not what leaves the pool out, so its refusal stands.
-        Err(retry) if kv_shortfall(&retry) => return Err(refused),
-        // The retry failed for another reason: that failure is the diagnostic.
-        Err(retry) => return Err(retry.context(format!("admitting the GLM Flash KV pool with lazily captured \
-            decode graphs, after the startup set's admission was refused ({refused:#})"))),
-    };
-    tracing::warn!(startup_graph_bytes = graphs.reserve, graph_allowance_bytes = graphs.allowance,
-        startup_extra_bytes = extra, lazy_pool_tokens = tokens, startup_admission = %format!("{refused:#}"),
-        "GLM Flash startup decode graphs leave no room for a KV pool: capturing decode graphs lazily within the \
-        graph allowance instead (CUTEAFD_GLMF_STARTUP_GRAPHS=0 chooses this outright)");
-    Ok((tokens, false))
-}
-
-pub(crate) fn graph_reserve_bytes(graphs: usize) -> u64 {
-    let measured = graphs as u64 * MEASURED_GRAPH_BYTES;
-    measured + (measured * GRAPH_MARGIN_PERCENT).div_ceil(100) + GRAPH_RANK_MARGIN_BYTES
-}
-
-/// The startup decode graph set's bytes per rank: `buckets` (the engine's sets) over every geometry.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn serving_graph_reserve(context: usize, pool_tokens: usize, dense: usize,
-    sequences: usize, speculation: bool, layers: usize, peer: bool, buckets: &DecodeBuckets) -> Vec<u64> {
-    let shapes = serving_graph_shapes(context, pool_tokens.div_ceil(PAGE_ROWS), dense, sequences, speculation,
-        buckets).len();
-    let graphs = std::iter::once(shapes * (layers + 1))
-        .chain(peer.then_some(shapes * layers)).collect::<Vec<_>>();
-    let bytes: Vec<_> = graphs.iter().map(|&count| graph_reserve_bytes(count)).collect();
-    tracing::info!(?graphs, ?bytes, shapes, pool_tokens, spec_rows = ?buckets.spec,
-        measured_bytes_per_graph = MEASURED_GRAPH_BYTES, margin_percent = GRAPH_MARGIN_PERCENT,
-        rank_margin_bytes = GRAPH_RANK_MARGIN_BYTES, "GLM Flash graph reserve before KV admission");
-    bytes
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-struct GraphGeometry {
-    pool_width: usize,
-    page_stride: usize,
-    pool_stride: usize,
-    long: bool,
-}
-
-impl GraphGeometry {
-    /// The table geometry a decode step's graphs are keyed by. The pool top-k (`index_topk`, which
-    /// runs only when a row is long) is the only launch that reads the pool table's width and
-    /// stride, so a short step keys neither: short steps that differ only there launch the same
-    /// programs with the same pointers and scalars, and share their graphs.
-    fn keyed(pool_width: usize, page_stride: usize, pool_stride: usize, long: bool) -> Self {
-        if long { Self { pool_width, page_stride, pool_stride, long } }
-        else { Self { pool_width: 0, page_stride, pool_stride: 0, long } }
+    admit: impl FnMut(Option<u64>) -> Result<usize>) -> Result<(usize, bool)> {
+    let result = cuteafd_loader::serving_capacity::glmf_graphs::admit_beside_decode_graphs(
+        startup, admit, crate::shared::memory_report::kv_shortfall,
+        |retry, refused| retry.context(format!("admitting the GLM Flash KV pool with lazily captured \
+            decode graphs, after the startup set's admission was refused ({refused:#})")));
+    if let (Some(graphs), Ok((tokens, false))) = (startup, &result) {
+        tracing::warn!(startup_graph_bytes = graphs.reserve, graph_allowance_bytes = graphs.allowance,
+            lazy_pool_tokens = tokens, "GLM Flash startup decode graphs refused: capturing lazily within the graph allowance");
     }
-}
-
-/// The narrowest decode page-table stride, in MLA pages (4,096 tokens): sequences up to that size
-/// share one table shape, and so their decode graphs. The index expansion reads only a row's own
-/// pages, so a wider row changes nothing but its upload. A long step (a row past the 2,051-token
-/// dense context) already has at least 36 pages, so the floor never moves its stride.
-const MIN_PAGE_STRIDE: usize = 64;
-
-/// A decode step's (page-table, pool-table) strides for sequences of at most `pages` and
-/// `pool_pages` pages: powers of two (they bound the graphs a growing batch captures), the page
-/// stride from its floor, both at most the pool's pages and a table row's columns (a sequence
-/// holds at most `max_context` tokens' pages). Only a long step keys the pool stride.
-fn decode_strides(pages: usize, pool_pages: usize, pool: (usize, usize), table: (usize, usize)) -> (usize, usize) {
-    (pages.max(1).next_power_of_two().max(MIN_PAGE_STRIDE).min(pool.0).min(table.0),
-        pool_pages.max(1).next_power_of_two().min(pool.1).min(table.1))
-}
-
-fn graph_geometries(context: usize, pages: usize, dense: usize) -> Vec<GraphGeometry> {
-    let pools = pages / UNIT_PAGES;
-    let (table_pages, table_pools) = glmf_table_pages(context as u64);
-    let table = (table_pages as usize, table_pools as usize);
-    let mut geometries = Vec::new();
-    for units in 1..=context.div_ceil(UNIT_ROWS).min(pools) {
-        let capacity = (units * UNIT_ROWS).min(context);
-        let mut width = 1;
-        while width / 2 * UNIT_ROWS < capacity {
-            let low = if width == 1 { 1 } else { width / 2 * UNIT_ROWS + 1 };
-            let high = (width * UNIT_ROWS).min(capacity);
-            for long in [false, true] {
-                if (!long && low <= high.min(dense)) || (long && low.max(dense + 1) <= high) {
-                    let live_units = crate::shared::context::decode_allocation_units(units, high, UNIT_ROWS);
-                    let (page_stride, pool_stride) = decode_strides(
-                        live_units * UNIT_PAGES, live_units, (pages, pools), table);
-                    let geometry = GraphGeometry::keyed(width.min(pool_stride), page_stride, pool_stride, long);
-                    if !geometries.contains(&geometry) { geometries.push(geometry); }
-                }
-            }
-            width *= 2;
-        }
-    }
-    geometries
-}
-
-fn serving_graph_shapes(context: usize, pages: usize, dense: usize, sequences: usize, speculation: bool,
-    buckets: &DecodeBuckets) -> Vec<(usize, bool, GraphGeometry)> {
-    let plain = buckets.bucket(sequences.clamp(16, DECODE_ROWS), false);
-    graph_geometries(context, pages, dense).into_iter().flat_map(|geometry| {
-        buckets.plain.iter().copied().filter(move |&rows| rows <= plain)
-            .map(move |rows| (rows, false, geometry))
-            .chain(buckets.spec.iter().copied().filter(move |_| speculation)
-                .map(move |rows| (rows, true, geometry)))
-    }).collect()
+    result
 }
 
 /// A startup capture's tables: `rows` masked rows over `geometry`.
@@ -1746,6 +1596,7 @@ impl<'a> GlmfEngine<'a> {
             subset_lanes: lane_setting().1,
             split_audit: std::env::var("CUTEAFD_GLMF_SPLIT_AUDIT").is_ok_and(|v| v == "1"),
             full_prefill_logits: false, routes_ready: library.cuda_event_create_ordering()?,
+            draft_probe: RefCell::new(None), capturing: std::cell::Cell::new(false),
             ops: std::env::var("CUTEAFD_GLMF_PROFILE_OPS").is_ok_and(|v| v == "1").then(RefCell::default),
             fp8_prefill: Fp8Prefill::default(), kda_fp32_partials: false,
             kda_output_shard: false, mark_slots: 0,
@@ -1936,6 +1787,7 @@ impl<'a> GlmfEngine<'a> {
         let peer = exchange.on(1, || -> Result<GlmfPeer<'a>> {
             // Its own and the shares' programs.
             self.programs.load_matching(|name| super::glmf_startup_program(name, true, self.decode_rows > DECODE_ROWS))?;
+            let _memory_scope = cuteafd_ffi::memory_ledger::scope("kv");
             let caches = Caches::new(self.library, &self.cfg, &layers, self.pages, self.pool_pages, self.slots,
                 self.caches.kda_heads, self.index_cache, self.kda_state, self.decode_rows, None)?;
             Ok(GlmfPeer { device, stream, layers, caches,
@@ -3155,6 +3007,7 @@ impl<'a> GlmfEngine<'a> {
                 }
             }
             crate::shared::console::layer_mark(index);
+            self.probe_mark(index);
         }
         if layers.len() < self.cfg.layers {
             self.synchronize()?;
@@ -3294,11 +3147,14 @@ impl<'a> GlmfEngine<'a> {
                         }
                     })?;
                 } else {
+                    // The router ran inside this layer's segment: its ids are still in place.
+                    self.probe_ring(index, w, t, matches!(self.experts, Some(Experts::Spark { .. })))?;
                     self.moe_experts(w, index, &layers[index], t, rows, cap, true)?;
                 }
             }
             if index < layers.len() {
                 crate::shared::console::layer_mark(index);
+                self.probe_mark(index);
             }
         }
         if layers.len() < self.cfg.layers {
@@ -3379,7 +3235,9 @@ impl<'a> GlmfEngine<'a> {
         // SAFETY: capture records this stream's launches; nothing in a segment
         // synchronizes the host or allocates.
         self.on(rank, || unsafe { self.library.cuda_graph_begin_capture(stream) })?;
+        self.capturing.set(true);
         let captured = segment();
+        self.capturing.set(false);
         // SAFETY: ends the capture begun above on the same stream.
         let exec = self.on(rank, || unsafe { self.library.cuda_graph_end_capture(stream) });
         captured?;
@@ -3847,6 +3705,7 @@ impl<'a> GlmfEngine<'a> {
                     self.cfg.routed_scale as f32, true, self.stream)
             }
         })?;
+        self.probe_ring(index, w, t, matches!(experts, Experts::Spark { .. }))?;
         if !matches!(experts, Experts::Local(_)) {
             let grid = self.quantize_grid.blocks(t, h);
             self.run("expert_input_quant", &[("source_ptr", w.x.buffer.ptr), ("values_ptr", w.wire.buffer.ptr),
@@ -3982,6 +3841,62 @@ impl<'a> GlmfEngine<'a> {
         self.run("add", &[("a", w.routed_ptr()?), ("b", w.shared.buffer.ptr), ("out", w.delta.buffer.ptr)], &[rows])
     }
 
+    /// The draft probe's layer mark: the end of `index` on the engine stream.
+    fn probe_mark(&self, index: usize) {
+        if let Some(probe) = self.draft_probe.borrow_mut().as_mut() {
+            // SAFETY: the engine's own stream, live for the engine's lifetime.
+            unsafe { probe.mark(index, self.stream) };
+        }
+    }
+
+    /// Queue layer `index`'s router ids into the draft probe's ring right
+    /// behind the router (`spark`: the layer's ids are also staged).
+    fn probe_ring(&self, index: usize, w: &Workspace<'_>, t: usize, spark: bool) -> Result<()> {
+        if self.capturing.get() { return Ok(()); }
+        let mut probe = self.draft_probe.borrow_mut();
+        let Some(probe) = probe.as_mut().filter(|p| p.wants_ring(spark)) else { return Ok(()) };
+        // SAFETY: the router just wrote `t` rows of ids into `route_ids` on this stream; the ring
+        // is read after the step's sync.
+        unsafe { probe.ring(self.library, index, w.route_ids.buffer, t, self.stream) }
+    }
+
+    /// Arm the shared draft policy's per-step signals for verify steps of up
+    /// to `rows` rows (`serve-glmf` under the shared policy only).
+    pub(crate) fn arm_draft_probe(&self, rows: usize) -> Result<()> {
+        let dense = self.weights.layers.iter().map(|layer| layer.dense).collect();
+        *self.draft_probe.borrow_mut() = Some(super::draft_probe::RoundProbe::new(self.library, dense,
+            self.cfg.topk, rows)?);
+        Ok(())
+    }
+
+    /// Start recording a verify step of `rows` rows (with the draft probe armed).
+    pub(crate) fn probe_begin(&self, rows: usize) {
+        if let Some(probe) = self.draft_probe.borrow_mut().as_mut() { probe.begin(rows); }
+    }
+
+    /// Stop recording after the step and its token selection (which drains the
+    /// engine stream); a failed step's signals are dropped.
+    pub(crate) fn probe_end(&self, ok: bool) {
+        if let Some(probe) = self.draft_probe.borrow_mut().as_mut() {
+            probe.end();
+            if !ok { let _ = probe.finish(); }
+        }
+    }
+
+    /// The probed step's routes and layer µs, once its stream drained, handed
+    /// to `observe` (nothing when the step's signals are incomplete).
+    pub(crate) fn probe_finish<T>(&self, observe: impl FnOnce(&crate::shared::draft::routes::RoundRoutes,
+        &[Option<f64>]) -> T) -> Option<T> {
+        let mut probe = self.draft_probe.borrow_mut();
+        let (routes, layer_us) = probe.as_mut()?.finish()?;
+        Some(observe(routes, &layer_us))
+    }
+
+    /// Ring and staged-id agreement under `CUTEAFD_GLMF_ROUTE_RING_CHECK`.
+    pub(crate) fn probe_ring_check(&self) -> Option<super::draft_probe::RingCheck> {
+        self.draft_probe.borrow().as_ref().map(|probe| probe.ring_check)
+    }
+
     /// Routes and wire rows down and one request to every Spark rank; the
     /// shared expert (`shared`) queues behind the copies and runs while the
     /// ranks compute. Complete with [`Self::spark_land`].
@@ -4014,6 +3929,9 @@ impl<'a> GlmfEngine<'a> {
         unsafe { self.library.cuda_event_synchronize(self.routes_ready)? };
         self.profile.borrow_mut()[0] += timer.elapsed().as_secs_f64();
         let staged = staging.bytes();
+        if let Some(probe) = self.draft_probe.borrow_mut().as_mut().filter(|p| p.active()) {
+            probe.staged(index, &staged[..route_bytes]);
+        }
         let word = |offset: usize, i: usize| u32::from_le_bytes(staged[offset + i * 4..][..4].try_into().unwrap());
         let routes = (0..t * topk).map(|i| ExpertProtocolV2RouteEntry {
             row_index: (i / topk) as u32, expert_id: word(0, i), gate_weight: f32::from_bits(word(route_bytes, i)),

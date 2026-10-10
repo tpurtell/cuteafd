@@ -163,10 +163,8 @@ fn independent_prefill_rows(capacity: usize, lanes: bool, output: MimoPrefillOut
 /// unsplit target layer, so shrink it only when every target layer is split.
 pub(super) fn attention_workspace_geometry(rank: usize, ranks: usize, decode: bool,
     all_target_layers_split: bool) -> MimoAttentionWorkspace {
-    match (rank, ranks, decode, all_target_layers_split) {
-        (1, 2, _, _) | (0, 2, false, true) => MimoAttentionWorkspace::PartitionedHeads { ranks: 2 },
-        _ => MimoAttentionWorkspace::Global,
-    }
+    cuteafd_loader::families::mimo_v2::admission::attention_workspace_geometry(
+        rank, ranks, decode, all_target_layers_split)
 }
 
 /// Most rows the FP8 LM head program takes (MmaFp8Gemv's M tile).
@@ -614,14 +612,15 @@ impl<'a> MimoEngine<'a> {
     /// `layers` (every layer's rank-1 share, see `MimoLoader::model`). Enables
     /// peer access both ways, loads the programs there, and allocates its KV
     /// records, RoPE tables and both ends of the exchange.
-    pub fn attach_peer(&mut self, device: i32, stream: *mut c_void, layers: Vec<MimoLayer<'a>>) -> Result<()> {
-        let _memory_scope = cuteafd_ffi::memory_ledger::scope("peer-split");
+    pub fn attach_peer(&mut self, device: i32, stream: *mut c_void, layers: Vec<MimoLayer<'a>>, spark: bool) -> Result<()> {
+        let _memory_scope = cuteafd_ffi::memory_ledger::scope("transport/peer-split");
         ensure!(self.split_family.is_some() && layers.len() == self.weights.layers.len()
             && layers.iter().all(|l| l.split), "attach_peer needs the head-split shares of every loaded layer");
         let library = self.library;
         let rows = self.prefill_rows.max(DECODE_ROWS);
         let exchange = PeerExchange::new_abortable(library, [RankDevice { device: self.device, stream: self.stream },
-            RankDevice { device, stream }], 4 * super::admission::transport_lanes(true, &self.cfg)?.max(2),
+            RankDevice { device, stream }], cuteafd_loader::families::mimo_v2::admission::peer_slots(super::admission::transport_lanes(
+                spark, &self.cfg)?),
             rows * self.cfg.hidden * 2)?;
         let zeroed = |bytes: usize| -> Result<Rc<Allocation<'a>>> {
             let allocation = Rc::new(Allocation::new(Device { library, id: device }, bytes.max(256))?);
@@ -629,7 +628,11 @@ impl<'a> MimoEngine<'a> {
             Ok(allocation)
         };
         let peer = exchange.on(1, || -> Result<Peer<'a>> {
-            self.programs.load_all()?;
+            let selected = cuteafd_core::coordinator_programs::CoordinatorPrograms {
+                family: self.family, split_family: self.split_family,
+            };
+            self.programs.load_matching(|name| selected.contains(name))?;
+            let _kv_scope = cuteafd_ffi::memory_ledger::scope("kv/peer");
             let kv = layers.iter().map(|layer| {
                 let record = self.record_bytes(layer);
                 zeroed(match layer.attention {
@@ -846,6 +849,10 @@ impl<'a> MimoEngine<'a> {
     fn run_on(&self, rank: usize, split: bool, name: &str, pointers: &[(&str, *mut c_void)], scalars: &[Scalar])
         -> Result<()> {
         let name = &self.program_name(name, split);
+        let selected = cuteafd_core::coordinator_programs::CoordinatorPrograms {
+            family: self.family, split_family: self.split_family,
+        };
+        ensure!(selected.contains(name), "MiMo program {name} is outside its preloaded family set");
         let names: Vec<&str> = pointers.iter().map(|(n, _)| *n).collect();
         let program = self.programs.program(name, &names)?;
         let raw: Vec<*mut c_void> = pointers.iter().map(|(_, p)| *p).collect();

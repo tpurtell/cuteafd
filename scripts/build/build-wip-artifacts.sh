@@ -278,6 +278,9 @@ for wip_family in "${wip_fp8_list[@]}"; do
       wip_packages+=("${wip_package}-bf16")
   fi
   [[ "$wip_family" == *:nvfp4 ]] && wip_packages+=("${wip_package}a4")
+  # Local Qwen NVFP4 keeps its MTP experts in FP8: CMake builds the TP1 FP8 sibling on the
+  # coordinator (fp8_moe.cmake); stage it as release images do.
+  [[ "$role" == coordinator && "$wip_family" == qwen4:nvfp4* ]] && wip_packages+=("fp8-qwen4")
   for wip_package in "${wip_packages[@]}"; do
     rm -rf "$output_dir/fp8/$wip_package"
     cp -a "$build_dir/native/fp8/$wip_package" "$output_dir/fp8/$wip_package"

@@ -477,11 +477,22 @@ fn check_checkpoint_headers(cfg: &DflashConfig, tensors: &HashMap<String, Safete
 
 impl<'a> GlmDrafter<'a> {
     pub fn confidence_policy(&self, family: &str, fp8_head: bool) -> Result<crate::shared::draft_confidence::ConfidencePolicy> {
+        crate::shared::draft_confidence::ConfidencePolicy::load(&self.confidence_directory,
+            self.confidence_key(family, fp8_head))
+    }
+
+    /// The keyed selector prior (`family/dflash2/numerics`), or the generic
+    /// GLM-5.3 fit when the drafter ships none for this key.
+    pub fn selector_fit(&self, family: &str, fp8_head: bool) -> Result<crate::shared::draft_confidence::SelectorFit> {
+        crate::shared::draft_confidence::SelectorFit::load(&self.confidence_directory,
+            &self.confidence_key(family, fp8_head))
+    }
+
+    fn confidence_key(&self, family: &str, fp8_head: bool) -> String {
         let head = if fp8_head { "head-fp8-row".into() } else { format!("head-bf16-{:?}", self.head_mode.get()) };
         let numerics = format!("{}-{:?}-{head}-{:?}-r1", self.representation.name(), self.fp8_rows.get(),
             self.confidence_scales).to_ascii_lowercase();
-        crate::shared::draft_confidence::ConfidencePolicy::load(&self.confidence_directory,
-            format!("{family}/dflash2/{numerics}"))
+        format!("{family}/dflash2/{numerics}")
     }
 
     pub fn max_batch_sequences(&self) -> usize { self.max_sequences }
@@ -498,6 +509,10 @@ impl<'a> GlmDrafter<'a> {
         let cfg = DflashConfig { row_window, ..DflashConfig::read(snapshot)? };
         let capacity = GlmDraftCapacity::new(slots, max_sequences, cfg.block)?;
         let layout = cfg.runtime_layout(representation, capacity)?;
+        let config = serde_json::from_slice(&std::fs::read(snapshot.join("config.json"))?)?;
+        let (resident_bytes, scratch_bytes) = cuteafd_loader::families::glm5::draft_representation::draft_resident_bytes_with_mode(
+            &config, slots, max_sequences, library.sm_count()? as u64, representation, fp8_rows.code() as u8)?;
+        tracing::info!(resident_bytes, scratch_bytes, "DFlash shared readiness inventory");
         ensure!(mask_row.len() == cfg.hidden * 2, "DFlash BF16 mask row has wrong hidden width");
         let path = snapshot.join("model.safetensors");
         let checkpoint = Checkpoint {

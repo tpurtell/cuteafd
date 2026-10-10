@@ -1889,6 +1889,47 @@ TJ: two key items, both urgent right after v2.0.0.
       (≤ 8 rows), which run W4A16, so W4A4 prefill (> 1,024 rows on GB10)
       is only seen by the full tier's prefill-shaped pass. Give NVFP4
       release cards a prefill-shaped check.
+11. **Replicated-latent KV under the head split (TJ, 2026-10-10).** Under the
+    head split, MLA/DSA/CSA latents are stored in full on both GPUs, because
+    every head reads the whole latent.
+    - **Cost:** GLM 5.3 max spends 65 GiB of GPU1 on the copy and caps at a
+      1.30M pool. V4 Flash/Pro lose 4-5.6 GiB per GPU, about 1-2 TP2 layers.
+      GLM Flash's DSA layers are affected too.
+    - **Two attention placements, both offered, chosen per layout:**
+      - **Token-split latent** (`attention=context`; **default**). Each GPU
+        holds half the tokens, page-interleaved. Projections stay head-split
+        and the query is replicated, which is tiny at decode. Each GPU runs
+        all heads over its token shard, and the partials merge by
+        log-sum-exp.
+        - KV is halved, and each GPU reads half the latent per decode step,
+          so it is optimized for C1.
+        - DSA: indexer scores are token-sharded, with a global top-k by
+          exchanging candidate (score, index) pairs; ties break on token
+          index, for determinism.
+        - The merge changes summation order, so it needs its own fidelity
+          gate.
+        - Prefill merge traffic needs overlap, or the head split for short
+          contexts.
+      - **Layer ownership** (`attention=layers`). Each attention layer's KV
+        lives on one GPU, alternating. Two lanes run one layer apart, so
+        both GPUs stay busy. There is no merge and no duplicate, so it is
+        optimized for C > 1.
+        - It uses P3's `Whole{gpu}` and hops, and P7's per-layer executor.
+    - **Launcher:** `ATTENTION_PLACEMENT=context|layers|heads` (`heads` is
+      today's replicated head split, kept for A/B). The solver charges each
+      exactly, and a card records the choice.
+    - **Per-family default (TJ, 2026-10-10):** `context` wherever its
+      measured C1 is at least `layers`' C1 at the 2M pool on the family's max.
+      Otherwise that family defaults to `layers`. The quick A/B decides, and
+      the family's doc records the choice and its numbers.
+    - **Order:** design first; then GLM 5.3 (the biggest win, and P9's
+      ranges-vs-split choice becomes these options), then V4 Flash/Pro, then
+      GLM Flash's DSA layers. V4.1 keeps its 20/20 ranges unless measured.
+    - **Design:** "v3 attention placement without latent replication"
+      below (PRs `K0`-`K7`, decision gates `D-GLM`, `D-V4`, `D-GLMF`).
+    - **Gate:** the family golden and quick fidelity (merge numerics); the 2M
+      pool at max; C1 for `context` at least head-split C1; C8/C16 measured
+      for both options.
 Gate per family: golden/fidelity, then the quick A/B at the 2M operating
 point on the min and max reference configs. Requalify each family's cards
 as it moves.
@@ -2823,6 +2864,34 @@ dual-RTX expert mode.**
   general capability, and its FFN uses TP2 split or V4.1's owner-reduce per
   `FfnMode`.
 
+**P2 outcome (2026-10-11): planner == runtime at ready on measured inventory.**
+Both sides now read one inventory (`placement::inventory`): `ArchContext` per
+arch (SM120 PRO 188 SMs / 101,973,491,712 B CUDA total, SM120 5090-class
+170, SM121 GB10 48; context, cuBLAS, driver), the family's `ProgramSet`,
+`GraphSet` (startup sets counted at ready, lazy captures as growth), exact
+package scratch, and `LOADED_CODE`: the native code each family holds at ready
+(lazily loaded functions, cuBLAS, package modules), measured per family,
+package, split and rank. The planner charges context + loaded code; serve
+reserves what has not arrived at its admission sample. The ready ledger is one
+tagged report serve logs at readiness, before any request.
+
+| card (ready ledger, worst GPU) | before (p0 planner) | after |
+|---|---|---|
+| Qwen EXL3 / NVFP4 min | +247 / n/a MiB | -16 / +10 |
+| GLM Flash EXL3 min / max | +5469 / n/a | -3 / +0 |
+| MiMo Flash min / max | +346 / n/a | +3 / +3 |
+| V4 Flash 32 GB / max | refused / -102 | -15 / +17 |
+| V4 Pro EXL3 min | n/a | +0 |
+
+P1's V4 Flash max gap (1.45M planned, 1.18M served) was the planner's 95.5 GiB
+card against CUDA's 94.97 GiB plus the NVML sampler's 550 MiB per GPU; at the
+true total both sides now say 1,323,264 tokens and 19 layers.
+
+Default: pool first (`auto`) for V4 Flash on one RTX (17 vs 18 layers, 2.10M
+vs 1.51M pool, C1 1.07x over two matched pairs). V4 Pro on one RTX keeps
+experts first: one Pro layer is 12.4 GiB, and pool first cost C1 12%
+(3 vs 4 layers). Two RTX stay experts first until `P4`.
+
 Two latent bugs from b2f26af9's GPU1 ranges are inputs to `P3`/`P4`:
 - native `rtx_backbone` expert variants bind to the first CUDA device
   (`cudaErrorInvalidDevice` on GPU1);
@@ -3014,6 +3083,16 @@ after graph warm-up, on a fixed 512-row prefill plus one decode step:
    layer).
 
 `CUTEAFD_ROUTE_CHECK=N` re-checks every N steps (off by default).
+
+**TP2 lane payload sizing (P4 follow-up, 2026-10-10).** The persistent
+per-lane TP2 payload is sized for FP32 (4 B per element), so the BF16 and
+FP32 exchange share one buffer and both dtypes can be warmed. Once BF16
+becomes the default, that over-reserves 64.5 MiB per rank on V4 Flash and
+112.9 MiB per rank on Pro (at 4096 prefill / 64 decode rows). Size the
+payload to the exchange dtype actually in use, through the geometry,
+layout and admission APIs and their tests, as its own small PR after P4. On
+Pro that is about 225 MiB across both GPUs, part of the margin toward its
+11th TP2 layer.
 
 **EXL3 TP2 input (P4, 2026-10-10).** `Exl3Tp2` takes FP8 K32 wire rows, as
 V4.1's rank sequence does, so V4.1 stays byte-exact through the shared impl.
@@ -3321,6 +3400,511 @@ it only through its own gate, because fusing changes rounding.
    C1). Ranges only as the memory lever, unless TJ's earlier GLM Flash range
    numbers show a C1 win (please point to them; the audits found none in
    git).
+
+## v3 attention placement without latent replication (design, 2026-10-10)
+
+Design for v3 item 11. Nothing here ran on hardware. Inputs:
+- memory: CPU `cuteafd plan --layout` from the P2 branch (work/v3-p2 0fcd554e,
+  94.97 GiB CUDA total, 92.97 GiB capacity after headroom), and V4 TP2
+  numbers from P4's 461e7db1 commit table (95.5 GiB card, 0.53 GiB per card
+  taken off);
+- cost: the measured head-split gains below, the 2026-10-01 peer probe
+  (two-way 3.4 / 4.8 / 25 us for 12 KiB / 96 KiB / 1 MiB, so about
+  3.4 us + bytes / 42 GB/s), and byte arithmetic;
+- schedules: a Python port of P3's `order::check`.
+
+Scripts, plans and output are in `builds/v3-kv-context-design/`
+(`plans.sh`, `model.py` -> `model.out`, `order_check.py`).
+
+Three placements for MLA/DSA/CSA layers, chosen per layout
+(`ATTENTION_PLACEMENT=context|layers|heads`):
+- `heads`: today's head split, with the latent replicated on both GPUs.
+- `context`: the latent is token-split. A new `LayerMode::ContextSplit`:
+  projections stay head-split, KV is partitioned by page, and the residual is
+  replicated after the layer, exactly as under `HeadSplit`.
+- `layers`: P3's `Whole{gpu, Split}`, alternating by colocate group. KV
+  lives on the owner, and the FFN stays split as today.
+
+### 1. Token-split decode and verify
+
+**Reuse.** Every decode kernel involved already splits KV and merges the
+pieces by LSE. GLM's `glm_sparse_mla` decode route writes "normalized BF16
+partials + LSE" per split, then runs `SparseMLASplitDecodeMergeKernel`.
+V4's decode route does the same, ending in the sink merge. `context` makes
+the peer's token shard one more split. The prefill MG kernels already write
+a base-2 LSE.
+
+**Dataflow, GLM 5.3 (78 MLA layers, 21 full-indexer and 57 shared-indexer).**
+Per layer, on both GPUs, in queue order:
+1. **Input norm.** Replicated, as today.
+2. **`glm2_producer`.**
+   - `w_qkv_a` and the latent are replicated.
+   - `w_q_b` and `w_uk` stay head-split, so each GPU produces the absorbed
+     576-wide query of its own 32 heads.
+   - Each row's 656-byte record is written only by the owner of the row's
+     page. On the other GPU the row's slot points at a per-GPU scratch row,
+     the mechanism `StepTables::pad_rows` already uses, so the producer is
+     unchanged.
+3. **Push q** (own heads) to the peer: 36,864 B per row.
+4. **Indexer (full-indexer layers only).**
+   - The index producer stays replicated. Only the page owner writes the
+     index keys.
+   - Each GPU runs the index top-k over its own pages only, through a
+     compacted half-width page table.
+   - The scored variant emits up to 2,048 candidates per row as
+     (FP32 score, global logical index): 16,384 B per row. Push them.
+5. **Merge candidates** (full-indexer layers only).
+   - Wait for the peer's list. Both GPUs merge the two lists into the global
+     top-2048 by (score desc, logical index asc).
+   - That is the deterministic kernel's own tie key (`_tie_key = ~gidx`:
+     the lower logical index wins).
+   - Each GPU keeps the picks that fall on its own pages, as physical slots
+     with a length (an ascending compacted list).
+   - Shared-indexer layers reuse that local list with no exchange: all
+     layers share page ids, so ownership is the same in every layer of a
+     colocate group.
+6. **Attention.** Wait for the peer's q. Sparse MLA then runs over all 64
+   heads on the local selection.
+   - It does the peer's 32 heads first and pushes that normalized partial
+     plus its LSE: 32 × 512 × 2 + 32 × 4 = 32,896 B per row, with `has_sink`
+     off.
+   - Then it computes its own heads, which hides the push.
+7. **Combine.** Wait for the peer's partial of this GPU's heads, then run
+   `lse_combine2` (GPU0's partial first, then GPU1's) into the BF16
+   `[T,32,512]` attention output.
+8. **`glm_o`.** `W_UV` and `o_proj` stay head-split, followed by today's
+   attention all-reduce (12,288 B per row) and post-norm.
+
+**The scores are exact.** A token's index score is computed by the same
+per-token arithmetic wherever its page lives, and the tie key is a total
+order. So the merged selection equals today's selection bit for bit. A
+check mode (`CUTEAFD_CONTEXT_CHECK=N`) compares it against a full
+single-GPU top-k. Only the attention summation changes.
+
+**V4 Flash/Pro (CSA).** `ContextSplit` applies to the C4 layers only:
+21 / 30 layers, holding 96% of V4's record bytes.
+- **What stays head-split and replicated:** C128 layers (1,728 B per
+  256 tokens; 0.26 / 0.41 GiB per GPU at 2M for Flash / Pro), window-only layers, the window rings
+  and the compressor carry (per-sequence state).
+- **Records:** the compressor runs replicated. Only the owner of a
+  256-token unit writes that unit's C4 compressed rows and index keys.
+- **Top-k:** the global top-k merges `index_topk` (512 / 1,024) candidates of
+  (score, global compressed-row index): 4,096 / 8,192 B per row.
+- **Window:** in a context layer, the window part of the union is attended by
+  one GPU, alternating by layer parity. The other passes
+  `swa_lengths = 0`.
+- **Query:** 32,768 B per row (Flash) / 65,536 (Pro).
+- **Output:** `wo_a`/`wo_b` stay group-split.
+
+**GLM Flash DSA (11 MLA layers; the 34 KDA layers stay `HeadSplit` with
+their partitioned state).**
+- **Interleave:** by 256-token unit, so a 4-token pool never straddles
+  owners.
+- **Top-k:** over pooled keys, 512 candidates per row (4,096 B), then
+  `index_expand` on each GPU over its own pools.
+- **Open tail pool:** `index_kpool_always_select_tail` selects it; it is
+  attended by the owner of its unit.
+- **Index cache:** `context` requires `--index-cache compact`. Each
+  sequence's tails (at most 3 rows per MLA layer) are per-sequence state,
+  computed replicated, so pooled keys never need a peer's token keys. This
+  also makes the compact cache available on two GPUs, which the head split
+  refuses today.
+- **Query:** 32,768 B per row (absorbed 512).
+- **Page 0:** each GPU keeps its reserved zero page, because masked
+  candidates read slot 0.
+
+**Merge payload per layer per row, each way** (new exchanges, on a second
+`PeerExchange` with q / candidate / partial flags per parity and lane, sized
+at decode rows):
+
+| family | q | partial + LSE | candidates (indexer layers) | today's all-reduce (kept) | context layers |
+|---|---:|---:|---:|---:|---|
+| GLM 5.3 | 36,864 | 32,896 | 16,384 (21) | 12,288 | 78 |
+| V4 Flash | 32,768 | 32,896 | 4,096 (21) | 8,192 | 21 C4 |
+| V4 Pro | 65,536 | 65,792 | 8,192 (30) | 14,336 | 30 C4 |
+| GLM Flash | 32,768 | 32,896 | 4,096 (11) | 8,192 | 11 MLA |
+
+**Why the merge doesn't fuse into the existing all-reduce.** The merge can
+fold into the o_proj all-reduce by exchanging only the LSEs (256 B per row).
+Each GPU would then scale its own all-head partial and run `W_UV + o_proj`
+for all 64 heads. That replicates `o_proj` and `W_UV`: GLM 5.3 reads about
+55 MiB more per layer per GPU, roughly 2.7 ms per step and +4.2 GiB per GPU.
+The 33 KB partial push costs about 1 us. **Rejected.**
+
+**Sink and normalisation.**
+- **Partials:** each GPU's partial is normalized over its own tokens, with its
+  base-2 LSE, as the split kernels already produce.
+- **Combine:** `out = (2^{l0-m} o0 + 2^{l1-m} o1) / (2^{l0-m} + 2^{l1-m}
+  [+ 2^{sink-m}])`.
+- **V4's per-head sink** enters only in the final combine, so it counts
+  exactly once. Both partials run with `has_sink` false. GLM 5.3 and GLM
+  Flash have no sink.
+- **Empty shard:** a GPU with no selected token for a row (the first page
+  sits on GPU0) must emit `lse = -inf` and `out = 0`, never NaN. This is a
+  kernel test.
+
+**Ordering.** The decode schedule keeps rank 1 queued one unit ahead and adds
+three matched push/wait pairs per indexer layer and two per shared layer. It
+drains under the `order::check` port for all 78 GLM 5.3 layers, both with
+rank 1 one unit ahead and in lockstep. The engine PR records it as a P3
+fixture.
+
+### 2. Prefill
+
+**Exchanging is the wrong shape for prefill.** The decode route's traffic for
+a 4,096-row chunk:
+
+| family | q + partials + candidates per chunk | at 42 GB/s |
+|---|---:|---:|
+| GLM 5.3 | 23.7 GB | 0.56 s |
+| V4 Flash (C4 layers) | 6.0 GB | 0.14 s |
+| V4 Pro | 17.1 GB | 0.41 s |
+| GLM Flash | 3.1 GB | 0.07 s |
+
+That is a third of GLM 5.3's whole chunk time. It also competes with Spark
+ingress on GPU0's PCIe root, which the probe showed quadruples small hops.
+
+**Gather route (prefill default).** Each GPU assembles a contiguous
+full-context view of the layer and runs today's head-split prefill kernels on
+it unchanged. The arithmetic is identical to `heads`.
+1. The producer and index producer write all chunk rows into the staging view
+   at their logical positions, since the latent projection is replicated.
+   A local copy then commits the owned rows to pool pages (2,048 × 788 B).
+2. History: the own shard is a local D2D copy. The peer's shard is peer DMA,
+   prefetched one layer ahead into the other parity slot.
+3. Staging is two parity slots × the compiled extent × that layer's bytes per
+   token. It is a fixed solver demand:
+
+| family | bytes per token per layer | staging |
+|---|---:|---:|
+| GLM 5.3 (latent + index keys) | 788 | 1.54 GiB |
+| V4 (C4 records + keys) | 179 | 0.35 GiB |
+| GLM Flash (latent + pool keys, compact) | 561 | 1.10 GiB |
+
+**Gather traffic per chunk** grows with history (all layers, peer half):
+
+| family | at 128K | at 1M |
+|---|---:|---:|
+| GLM 5.3 | 4.0 GB (96 ms) | 32 GB (0.77 s) |
+| V4 Flash | 0.25 GB | 2.0 GB |
+| V4 Pro | 0.35 GB | 2.8 GB |
+| GLM Flash | 0.4 GB | 3.2 GB |
+
+It overlaps compute: a 1M-history GLM 5.3 chunk computes for several seconds.
+
+**Crossover with the exchange route:** GLM 5.3 771K, GLM Flash 1.02M,
+V4 Flash 3.2M, V4 Pro 6.4M tokens of history. Only GLM 5.3 past 771K would
+prefer exchanging, at about 0.2 s per chunk.
+
+**Recommendation: gather only.**
+- It keeps prefill byte-exact with `heads`: goldens and exact-cache restores
+  don't depend on where a chunk boundary falls.
+- Prefill needs no new kernel.
+
+**Short contexts.** There is no separate fallback: the gather route *is* the
+head split on a gathered view. Decode/verify always exchange. A 6-row
+verify would gather more cheaply only below about 1.1K tokens (GLM 5.3),
+which is not worth a second decode route.
+
+### 3. Paging and the prefix cache
+
+**Interleave, not blocks.** The owner of a page is a function of its logical
+page index alone: page j of every sequence lives on GPU (j mod 2).
+- **Pages per family:** GLM 5.3 uses 64-token pages, V4 and GLM Flash
+  256-token units.
+- **Why interleave:**
+  - Every row's selection spreads over both GPUs, so both work in every
+    decode step at any context length.
+  - Blocks would leave short sequences on GPU0 and make C1 single-GPU.
+  - A prefill chunk splits 32/32 pages.
+- **Why by logical index:** prefix sharing keeps positions, so a forked page
+  or a tail copy stays at its index and therefore on its owner. That only
+  works if ownership follows the logical index, not the sequence.
+
+**Pool.**
+- **Pages:** `RefPagePool` becomes two half pools under one id space: owner =
+  `id & 1`, local index = `id >> 1`. `alloc_for(positions)` hands page j a
+  free id of parity j. Admission checks both free counts.
+- **Balance:** a sequence of n pages takes ⌈n/2⌉ pages on GPU0, so imbalance
+  is at most one page per live sequence or retained snapshot. At 2M, GLM 5.3
+  has 32,768 pages and V4 8,192 units; 16 sequences cost 16 pages.
+- **Per-step work balance:** this depends on where DSA's picks land. Each
+  step logs the split of selected counts, and the gate reports p50/p99.
+
+**Prefix marks and snapshots.**
+- **GLM 5.3** has no marks: pages are the whole state.
+- **V4 and GLM Flash** keep marks per GPU, as under the head split today.
+  V4's window rings and carry stay replicated. GLM Flash's KDA state is
+  head-partitioned, and its compact tails are replicated.
+- **Fork and restore** are unchanged:
+  - full pages are shared by reference;
+  - `copy_rows` runs on the owner's stream (the tail page keeps its index);
+  - the length is set on both GPUs.
+
+**Host tier (currently off under the head split) can come on.**
+- **What changes:** each page lives once, so a snapshot is stored once.
+- **Interface:** `PrefixFamily` gains `page_device(page)` and per-device
+  segments. Replicated segments (V4's C128 pages and marks) are stored from
+  GPU0 and restored to both GPUs, and the copy engine batches per device.
+
+**Exact-cache byte-exactness.**
+- **Prefill:** restored and fresh prefill both use the gather route, so they
+  match byte for byte, as `heads` does today.
+- **Decode:** after a restore, decode uses the same pages, the same selection
+  and a fixed combine order (GPU0's partial, then GPU1's). Per-GPU split
+  counts depend only on the row bucket.
+- **The gate:** compares `context` against itself (fresh vs restored, odd
+  frontier, host tier), as the existing check does. `context` is not
+  byte-equal to `heads` in decode.
+
+### 4. Numerics
+
+What changes, and what doesn't:
+- **The DSA selection doesn't change** (section 1).
+- **Prefill doesn't change** (gather route).
+- **The decode/verify attention output changes.** Each head was a merge of
+  the kernel's contiguous splits of the selected list. It becomes a merge of
+  two owner-partitioned shards, each merged from its own splits, with one
+  more BF16 rounding of the partial on the wire.
+  - This is the same rounding class as today's in-kernel BF16 split partials.
+  - FP32 partials (`fp32_partials` exists in the AOT) double the payload to
+    65,664 B per row.
+- **V4's sink** moves from the split merge into the final combine.
+
+**Fidelity gate per family:**
+
+| family | golden (prefill-scored) | decode-shaped quick tier at max | other |
+|---|---|---|---|
+| GLM 5.3 EXL3 K4 | NLL byte-exact vs `heads` (split golden 2.4686) | KL / top-1 within `heads`' run-to-run envelope | `CUTEAFD_CONTEXT_CHECK` selection equal on the golden's decode steps; verify-by-replay exact |
+| V4 Flash, Pro EXL3 K2 | Flash golden byte-exact vs `heads` | Pro quick KL no worse than `heads` (0.0596 max) | as GLM 5.3 |
+| GLM Flash EXL3 K3.25 | NLL vs `heads` + compact: byte-exact when `heads` also runs compact on one GPU | teacher-forced decode KL ≤ `heads` + 0.002 | as GLM 5.3 |
+
+Measure BF16 partials first, and FP32 only if the quick tier misses.
+
+### 5. Layer ownership (`attention=layers`, for C > 1)
+
+**Modes.**
+- **Mode:** P3's `Whole{gpu, Split}` on every MLA/DSA/CSA layer. Ownership
+  alternates by colocate group:
+  - GLM 5.3: groups `{0}`, `{1}`, then the four-layer indexer groups,
+    21 groups in all;
+  - V4: per layer;
+  - GLM Flash: its 11 DSA layers (P7's "mixed" plan).
+- **Transition:** each layer's transition is section 3's single whole layer
+  between split layers:
+  - the owner's attention (unsplit `glm_*` / `dsv4f_*` programs);
+  - an `AfterAttention` broadcast of the residual (12,288 B per row for
+    GLM 5.3, `[4,H]` + FP32 for mHC families);
+  - then today's split FFN all-reduce.
+
+  Spark exchange, the router and the TP2 halves stay where they are (GPU0,
+  P4's fused combine).
+- **Why not `Owner` FFN:** it would move the Spark exchange to GPU1 on odd
+  groups (a second NIC intake). Not planned.
+- **KV and weights:** KV lives on the owner. The replicated attention
+  operands and indexer weights exist once.
+
+**Lanes.**
+- At C1 there is one lane, and the peer idles through each owned attention.
+  So `layers` gives up the attention share of the measured head-split gain.
+- At C > 1 the decode batch splits into two lanes offset by one group: lane
+  A's attention on GPU(k mod 2) runs while lane B's group k−1 runs on the
+  other GPU, then both lanes' FFN all-reduces.
+- This is a two-lane decode executor (P7-style, beside the prefill lanes).
+  It also pipelines Spark waves between lanes.
+
+**Ordering, checked.** Owner-FFN groups with two lanes drain under the
+`order::check` port. With Split FFN, the schedule drains only when both GPUs
+queue the two lanes' FFN all-reduces in the same lane order per time slot.
+Swapping them on GPU1 deadlocks (gpu0 at lane A group 1, gpu1 at lane B
+group 0). The executor records every lane interleaving and asserts
+`order::check`.
+
+**When `layers` beats `context`.**
+- `layers` adds no per-row peer bytes; `context` adds about 70 KB per row
+  per layer (GLM 5.3).
+- By arithmetic they cost the same at about 15-19 verify rows, roughly C3.
+  Above that, `layers` wins **if** the two-lane executor exists.
+- `layers` also frees slightly more memory: no staging, and V4's window state
+  is not replicated.
+- `context` wins C1 and long contexts: it halves the replicated indexer scan
+  per GPU, which `layers` doesn't.
+
+### 6. Memory per family at max
+
+**Basis.**
+- P2 planner at 94.97 GiB (92.97 capacity), 2M pool unless noted.
+- `context` charges staging and the context exchange.
+- `layers` charges P3 hop slots (4 lanes × 2 × 4,096 rows) and drops the
+  replicated operands.
+- The caveats are P2's:
+  - graphs and workspaces are partly calibrated, and the 64 MiB ledger gate
+    has not run on these items;
+  - staging and exchange are new demands, so no runtime ledger covers them
+    yet;
+  - the V4 rows come from P4's 95.5 GiB table, adjusted.
+
+| family (max) | `heads` (today) | `context` | `layers` | extra RTX TP2 layers (`heads` → `context` / `layers`) |
+|---|---|---|---|---|
+| GLM 5.3 EXL3 K4, 2 RTX + 6 | pool 1.29M (2M needs 105.4 GiB latent per GPU); 93.0 / 82.0 GiB, 64.9 GiB latent per GPU | 2M: 82.3 / 71.3 GiB (52.7 latent + 1.5 staging per GPU; frees 52.7 GiB per GPU against `heads` at 2M); max pool 2.52M | 2M: 77.8 / 72.1 GiB (25,592 / 28,348 B per token; the latent exists once); max 2.73M | none: no local GLM 5.3 expert backend (with one: 4 / 6 half-layer pairs) |
+| GLM 5.3 NVFP4, 2 RTX + 6 | pool 1.13M; 93.0 / 82.0 | 2M: 90.4 / 79.4; max 2.20M | 2M: 85.9 / 80.2; max 2.40M | none (1 / 2) |
+| V4 Flash, 2 RTX + 4, P4 TP2 | 2M, 36 TP2 pairs, 7.87 GiB records per GPU, GPU0 slack 0.07 | frees 3.68 (C4) − 0.35 staging | frees 4.96 − 0.50 hop slots | 36 → 38 / 38 |
+| V4 Pro EXL3 K2, 2 RTX + 6, P4 TP2 | 2M, 10 pairs, 11.16 GiB per GPU | frees 5.25 − 0.35 | frees 6.83 − 0.88 | 10 → 11 / 12 |
+| GLM Flash K3.25, 2 RTX + 4 | 2M: 41.8 / 37.8, 23.05 GiB MLA records + keys per GPU | compact, half the units: frees 15.9 per GPU | compact on owners: frees 17.1 / 16.0 | P6 TP2: 37 of 42 → 42 / 42 |
+| GLM Flash K3.25, 2 RTX, Spark-free | 2M with TP2: 98.6 / 99.4, no fit | 82.7 / 83.5, fits | 89.6 / 85.3 (section 4's mixed), fits | all experts on RTX |
+
+### 7. Cost against today's head split
+
+**C1 (verify rounds of 4-6 rows, short context ≤ 32K).**
+- **`context`'s exposed cost:**
+  - the q push on non-indexer layers (on indexer layers it hides under the
+    replicated indexer);
+  - per-layer exchange latency and the combine (about 3 us);
+  - the candidate merge;
+  - minus the extra TP2 pairs, at V4.1's measured remote 789 us vs local
+    TP2 450 us per layer.
+- **`layers`' cost:**
+  - the attention share (about 80%) of each family's measured head-split
+    gain;
+  - plus the broadcasts;
+  - minus the extra pairs.
+
+| family | C1 round under `heads` | Δ round (Δ C1), `context` | Δ round (Δ C1), `layers` | measured head-split gain |
+|---|---|---:|---:|---|
+| GLM 5.3 | ~50 ms (4-row verify 50.6) | +1.2 ms (−2.4%) | +3.0 ms (−5.9%) | verify 1 / 4 / 16 rows −2.6 / −3.2 / −3.2 ms (7e27a769) |
+| V4 Flash | 13.2 ms | −0.4 ms (+3.0%) | +1.1 ms (−8.1%) | 14.6 → 13.2 ms (5560ed00) |
+| V4 Pro | 28.7 ms | −0.3 ms (+0.9%) | +3.6 ms (−12.6%) | 32.5 → 28.7 ms |
+| GLM Flash | ~13 ms | +0.15 ms (−1.1%) | +0.25 ms (−1.9%) | C1 159 → 168 (9380e8b8) |
+
+**C8 (about 40 verify rows).**
+- **`context`:**
+  - added cost: GLM 5.3 +3.7 ms (hidden) to +6.4 ms (unhidden), V4 Flash
+    +0.3 to +1.7, Pro +0.6 to +4.4, GLM Flash +0.2 to +0.9;
+  - against per-stream rounds of roughly 150 / 40 / 90 / 70 ms (rc3 C8
+    per-stream rates × ~2.5 tokens per round), that is about −1 to −5%;
+  - before V4's +2 pairs.
+- **`layers` on one lane:** gives up about the same milliseconds as at C1,
+  since the head-split gain barely grows with rows (GLM 5.3: 2.6 / 3.2 /
+  3.2 ms at 1 / 4 / 16 rows). That is about −2 to −4%.
+- **`layers` on two lanes:** about equal to `heads` or better: no
+  per-row exchange, and both GPUs busy.
+
+**Long context.**
+- **Indexer:** under `heads` and `layers`, one GPU scans every key for every
+  index layer. `context` halves the scan per GPU. Measured: 83 us per full
+  layer at 32K for 1 row (315b8212). If that scales linearly, GLM 5.3 at
+  256K spends about 14 ms per decode step on the scan (21 layers) under
+  `heads`, against about 7 ms under `context`.
+- **Prefill:** 8K is byte-identical to `heads` plus the gather (a few MB per
+  layer). At 128K the gather adds about 96 ms per GLM 5.3 chunk, overlapped
+  with compute.
+
+**Expected per-family default** (TJ's rule: `context` wherever its C1 ≥
+`layers`' C1 at 2M on max):
+
+| family | expected default | basis |
+|---|---|---|
+| GLM 5.3 | `context` | about 3.5 points ahead of `layers` at short context, more at long |
+| V4 Flash/Pro | `context` | 11-14 points ahead |
+| GLM Flash | `context`, borderline | 0.8 points ahead, within noise |
+
+`layers` is expected to win C8/C16 only once two-lane decode exists.
+
+**Uncertain:**
+- Peer bandwidth while Spark replies saturate GPU0's ingress: the probe saw
+  4x on small hops. This is the largest risk to `context`'s C1.
+- How much the q and partial pushes hide behind the indexer and the
+  peer-heads-first order.
+- Selection balance between the GPUs.
+- The indexer's scaling with context.
+- GLM Flash's value of a local TP2 layer (P6 hasn't measured it).
+- P2 and P4 numbers are from unmerged branches.
+
+### 8. Migration
+
+**Ordered PRs.** GLM 5.3 first, then V4, then GLM Flash DSA. V4.1 stays on
+its 20/20 ranges. Each family's default comes from its own decision gate.
+
+| # | PR | size | after | gate |
+|---|---|---|---|---|
+| K0 | Solver and launcher. `AttentionPlacement::{Heads, Context, Layers}` in `PlacementRequest`; `LayerMode::ContextSplit` (residual transitions as `HeadSplit`); `KvDemand.unit_bytes_context`; staging and context-exchange fixed demands; `ExecutorModes` stays plan-only. `cuteafd plan --attention-placement`, `ATTENTION_PLACEMENT=auto\|context\|layers\|heads` in run-family (`auto` = the family's recorded default, `heads` until decided). The card records the choice. | S | P3, P2 | planner fixtures reproduce section 6 per family; cargo/script tests by failing id |
+| K1 | Fork kernels (sparkinfer-glmrt master, then pin): scored index top-k (GLM, GLM Flash pools, V4 C4); `dsa_candidate_merge` (2k → k by (score, logical), emits the compacted local slot list); sparse MLA decode `partial` route (head range, partial + LSE, no sink) for 656 / 528 / 584 records (V4's "584" is a planar 576 B payload row plus an 8 B per-row footer, in 576-aligned padded pages: C4 37,440 B, SWA 149,760 B; indexer keys keep planar scales); `lse_combine2` (optional sink); paged → contiguous staging gather of whole pages, footers and padding included, byte-exact | M | — | SM120 + SM121 tests vs an FP64 reference: merged selection bit-equal to single-GPU top-k on random and all-ties inputs; empty shard gives −inf / 0; combine matches the 2-split merge |
+| K2 | Shared parts: `shared/peer_split/context.rs` (`ContextExchange`, page owner map), `RefPagePool` parity half-pools, `PrefixFamily::page_device`, per-device host-tier copies; `order::check` fixtures for the context decode and the two-lane `layers` schedules | M | K0 | prefix-cache tests (fork, tail copy on owner, eviction balance, host round trip); order fixtures |
+| K3 | GLM 5.3 `context` (needs P9's solver port, pulled ahead of P7: it depends only on P1/P3): attention path of section 1, gather prefill, single-owner prefix pages, host tier on | L | K1, K2, P9a | section 4's GLM 5.3 row; exact-prefix byte-exact incl. host tier; planner == runtime; the 2M pool admits at max; quick A/B at max: C1 ≥ `heads` C1 (at its 1.29M pool), C8, 8K prefill within 3%; one 256K-context C1 decode for the indexer claim |
+| K4 | GLM 5.3 `layers`: per-layer executor (`Whole{g, Split}` by indexer group, `AfterAttention` hops via `HopLink`), two-lane decode/verify | L | K2, P9a | quick fidelity; order fixtures per interleaving; A/B at max at 2M |
+| D-GLM | **Decision:** C1 `context` vs `layers` at 2M on max (3 interleaved sessions; 6 if within 1%), plus C8/C16 for both. Default per TJ's rule, recorded in `docs/models/glm5.md` with the numbers. | — | K3, K4 | — |
+| K5 | V4 Flash/Pro `context` on C4 layers (C128 and window layers stay `HeadSplit`), sink in the combine, with P4 TP2 (+2 / +1 pairs) | M | K3, P4 | section 4's V4 rows; exact cache; A/B at max at 2M |
+| K6 | V4 `layers` (`Whole{g, Split}` alternating, P4's fused combine on split FFNs) on S4c/P7's per-layer executor | M | K5, P7 | as K4 |
+| D-V4 | **Decision**, as D-GLM | — | K5, K6 | — |
+| K7 | GLM Flash DSA `context` (11 MLA layers, compact cache on two GPUs); `layers` is P7's mixed mode | M | K3, P7 | section 4's GLM Flash row; D-GLMF on the EXL3 K3.25 max card and the Spark-free card |
+
+**Fork DCP audit (K1, 2026-10-11).** The fork's `b12x/comm/pcie` decode
+context parallel stack covers less than it seemed:
+- **`pcie_dcp_topk`** only transports rank-major score/index planes. It
+  has no selection and no tie policy, so `dsa_candidate_merge` stays a K1
+  kernel.
+- **`pcie_dcp_a2a`** fuses an exchange with an LSE reduce-scatter over
+  heads. It handles BF16/FP16 normalized partials, but has no sink, sums
+  the local rank first and then the peers cyclically (not a fixed
+  GPU0→GPU1 order), and needs 64 fully resident SMs. K2 may use it for
+  no-sink paths if its numerics pass, and if graph/IPC lifetime and
+  occupancy measure well next to decode.
+- **`all_gather_heads` / `all_gather_pair`** move heads and pairs, not
+  paged KV, so the K1 gather stays.
+- **The sparse MLA split merge** already does base-2 LSE with the sink
+  added once, and K1's partial route reuses it.
+- Choice per piece is by exactness first, then measured speed and SM
+  occupancy (TJ: reuse is not a goal).
+
+**Interactions.**
+- **P4 TP2.** The solver's pool step charges `context`/`layers` KV, and the
+  freed bytes go to TP2 pairs in step 5. Both modes leave the residual
+  replicated before the FFN, so TP2 halves stay in the existing FFN slot.
+- **Memory lever (solver step 7).** It may flip `heads` → `context` →
+  `layers` per kind, but only under `auto`. An explicit
+  `ATTENTION_PLACEMENT` is strict.
+- **Draft policy.** `context` adds peer bytes per verify row: about 5.4 MB
+  per row per step for GLM 5.3 (q + partial over 78 layers).
+  - `Placement` exports `peer_row_bytes`, and D4's bindings add it as a
+    `Peer` resource class (`bytes/bandwidth`, its own Huber fit). Otherwise
+    the allocator underprices wide verifies.
+  - `layers` with two lanes changes the lane count, not the per-row price.
+
+### 9. Open questions for TJ (with recommendations)
+
+**Decided (TJ, 2026-10-11): all eight as recommended.**
+- prefill is gather only;
+- BF16 partials on the wire;
+- V4 splits its C4 layers only;
+- `layers` is single-lane first;
+- the selection check is off in serving and on in the gates;
+- the host tier is on under `context`;
+- a GLM Flash tie goes to `context` after 6 sessions;
+- add a 256K GLM 5.3 C1 card.
+
+K1 starts now; K0 starts after P2 merges.
+1. **Prefill route.** Recommend gather only: byte-exact with `heads`, no new
+   prefill kernel, exact cache independent of chunk boundaries. It costs
+   GLM 5.3 about 0.2 s per chunk past 771K tokens of history.
+2. **Partial dtype on the wire.** Recommend BF16, the in-kernel split
+   partials' own class. FP32 (2x payload) only if the quick tier misses.
+3. **V4 scope.** Recommend `context` on C4 layers only: C128 and window
+   layers stay head-split and replicated, 0.26 GiB per GPU at 2M.
+4. **Two-lane decode for `layers`.** TJ's default rule is C1-only, so
+   recommend building `layers` single-lane first (enough for the decision),
+   then two-lane decode gated on C8/C16. It also pipelines Spark waves for
+   every mode.
+5. **Selection check.** Recommend `CUTEAFD_CONTEXT_CHECK` off in serving and
+   on in K3/K5/K7's gates (exact equality with a full single-GPU top-k).
+6. **Host tier under `context`.** Recommend turning it on with the
+   exact-cache host gate. Pages live once, so it is cheaper than the replicas
+   `heads` would need.
+7. **GLM Flash tie.** The arithmetic puts the two options within 1%.
+   Recommend 6 interleaved sessions if within 1%, and `context` on a tie (the
+   ≥ in TJ's rule).
+8. **Long-context card.** Recommend adding one 256K-context C1 decode to
+   GLM 5.3's card set: it is where `context` differs most from both
+   alternatives, and the agentic floor sits there.
 
 ## v3 API gateway and sessions (design, 2026-10-09)
 
@@ -4706,12 +5290,31 @@ for one request, `dspark_policy.rs:647`) is the allocator. Changes:
   cost (today's `allocate` loop over caps for `Drafter::Chain`). Width
   exploration (a width unused for 64 rounds runs once) applies to every
   multi-valued action.
-- **Copies compete inside the plan.** A request with a copy span is two
-  candidates, `(Neural, confidence)` and `(Copy, copy confidence)`; the
-  allocator grows whichever has the better marginal and never mixes them in
-  one request. v2's `compete_copies` sequential competition is the search;
-  the price is the resource model, not `CycleCost`. Copy use is therefore
-  acceptance-gated by construction (decision 9) and opt-in until it wins.
+- **Copies extend the neural draft; they don't compete with it** (TJ,
+  2026-10-10; replaces the earlier two-candidate design).
+  - **The problem with competition:** a per-match-length acceptance table
+    can't be compared meaningfully with a calibrated neural confidence.
+  - **Agreement:** the neural drafter proposes its window as usual. A copy
+    span qualifies only if its start agrees with the neural draft over the
+    whole window. That agreement is the confidence: the target model's own
+    drafter independently predicts the copied tokens, so no separate copy
+    table is needed, and short coincidental matches drop out.
+  - **Extension:** on agreement, the copy's continuation is appended past
+    the drafter's horizon (DFlash2 7, dSpark 8, MTP 3), and the target
+    verifies the whole sequence in one round. Inside a long copy stride
+    (file rewrites, echoed diffs, quoted code), a round can verify 16-64
+    tokens instead of 7-8.
+  - **Tail confidence:** positions beyond the drafter use a per-position
+    decay owned by the online calibration (Platt on "agreed copy, position
+    k beyond the drafter"), seeded from this request's earlier copy
+    outcomes.
+  - **Length:** the resource model prices the extra rows, so the extension
+    length is the policy's usual expected-tokens-per-time decision. A
+    higher per-row cost (the head split on max) shortens it.
+  - **Later, measured:** relaxing agreement to a prefix of the window;
+    suffix-index drafting over the session history (v3.x).
+  - **Replaces** v2's `compete_copies` and `Evidence::Copy`'s per-length
+    table.
 - **Expected tokens per predicted time stays the objective.** The long-run
   `E - R*T` experiment lost 2-6% on Qwen (f32e22e3); not revived.
 
@@ -4725,6 +5328,61 @@ for one request, `dspark_policy.rs:647`) is the allocator. Changes:
 | D3 | Global row budget and copy competition on GLM Flash (behavior change) | M | same card; C16 heterogeneous prompts is the metric; C1 unchanged |
 | D4 | MiMo (DFlash + MTP block), then GLM 5.3 (shares the GLM binding), then Qwen (chain depth as the pre-draft action), then V4 (fixed-width binding first) | M, S, M, S | per family: the D2 card on its min/max |
 | D5 | Delete `CycleCost`, `Calibration`, `allocate`, the v2 buckets, `glm5/dflash_policy.rs` planning, per-family copy-length loops; `shared/draft_policy.rs` keeps `DraftHistory` and the trace path only | S | tests; failing ids unchanged |
+
+**Delete as you go (TJ, 2026-10-10).** The old per-family policies are ad
+hoc code, so they don't survive behind a switch:
+- **D3 / D4:** each family's port deletes that family's old policy path in
+  the same PR that makes `shared` its default, and the launcher rejects the
+  old key. No fallback onto `CycleCost` anywhere, including cold start:
+  priors are seeded from the geometry and resource classes.
+- **D5:** only removes what is left once no family uses it: `CycleCost`,
+  `Calibration`, `allocate` and the v2 buckets.
+- **The D2 `GLM5_FLASH_DRAFT_POLICY` switch** is temporary; it goes in D3.
+
+**D2 outcome (2026-10-10, work/v3-d2; opt-in `GLM5_FLASH_DRAFT_POLICY=shared`).**
+GLM Flash's geometry: 45 layers, 3 dense (`class: None`), 42 MoE layers
+`remote` (Spark) or `local` (coordinator FP8/EXL3), `slice_bytes` from
+`Fp8Layer::bytes_for` (widest rank / experts) or the EXL3 manifest's
+per-projection tiers (payload + rotations over the widest rank's slice),
+`group_rows` 16, one regime, the drafter's block as the single width, the
+step's row budget as `max_requests`. Layer events at the `layer_mark` sites,
+Spark ids from the staging, local ids through a pinned D2H ring behind the
+router (checked on hardware against the staged ids: 48,426 layers, 0
+mismatched), DFlash2 through the keyed `SelectorFit`, dSpark through its head
+blend, Platt in the core, executed rows with EOS/output-limit censoring, the
+draft bracket around the draft call. The cold-five and lone-five DFlash2 rules
+stay as adapter data. Planning costs 36-45 µs per round (max 2.2 ms at C16);
+the events and ring do not move the verify step.
+
+Matched-prompt pairs on one sealed build (`--arm-wip`, `cycle` vs `shared`),
+rc3 kit cards at C16 admission; the C1-after-C16 point is the code request of
+the `decode_content` panel run right after the C1..C16 sweep. Paired medians
+shared/cycle:
+
+| card | pairs | fresh C1 | sweep C1 | C1 after C16 | C4 | C16 | emitted |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| EXL3 min, rows 64 | 1 | 1.041 | 1.020 | 1.114 | 1.003 | 1.019 | 1.017 |
+| EXL3 min, rows 128 | 3 | 0.961 | 1.019 | **1.313** | 0.979 | 1.057 | 1.039 |
+| FP8 min, rows 64 | 3 | 0.954 | 1.042 | 1.017 | 0.958 | 0.982 | 1.039 |
+| EXL3 max, rows 64 | 3 | 0.996 | 0.956 | 1.021 | 1.008 | 0.983 | 1.059 |
+| FP8 max, rows 64 | 3 | 1.057 | 1.153 | 1.046 | 1.027 | 1.004 | 1.078 |
+
+The glmf-defaults-on failure reproduces on `cycle` (EXL3 min rows 128: C1
+after C16 / sweep C1 0.712, 0.901, 0.701) and `shared` removes it (0.975,
+0.979, 0.935). "Fresh C1" is the server's first 320-token code request, ~14
+rounds after start, while the shared fits are barely warm; single-request
+points swing ±6-10% between same-arm repeats. C4 is one 4-wide wave whose
+aggregate follows its slowest member (±7% same-arm); per-request C4 is
+1.02 median. On max the fitted per-layer row slope is twice min's (11.0 vs
+5.7 µs/row/layer: the head split adds attention and exchange per row), and
+shared verifies slightly shorter C1 prefixes there (sweep C1 0.956).
+FP8 post-sweep decode drops on both arms alike (server state, not policy).
+Fidelity, cache and speculation checks pass or report near-ties identically
+on both arms. Default stays `cycle` for now: fresh C1 on the min cards (first
+cold request) and sweep C1 on EXL3 max sit at 0.95-0.96, under the 0.99 bar.
+The no-Spark (2 RTX) and mixed-placement edge cards need P6/P7 and gate D3/D4;
+GLM Flash experts (115.6 GiB at K3.25) do not fit one RTX.
+
 
 **V4.1 moves byte-exactly** because D0 and D1 change types, not decisions: the
 geometry reproduces its constants, the clock reproduces the independent

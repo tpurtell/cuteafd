@@ -372,6 +372,8 @@ impl<'a> Engine<'a> {
             RankDevice { device, stream }], 4 * PREFILL_LANES, slot_bytes)?;
         let peer = exchange.on(1, || -> Result<V4Peer<'a>> {
             self.programs.load_matching(|name| self.selected_programs().contains(name))?;
+            // The peer's caches and RoPE tables are KV, not exchange storage.
+            let _memory_scope = cuteafd_ffi::memory_ledger::scope("kv");
             let table = |compressed: bool| -> Result<Dev<'a>> {
                 let values = metadata::rope_table(&self.cfg, compressed, self.max_context.max(metadata::WINDOW));
                 let allocation = DeviceAllocation::new(self.library, values.len() * 4)?;

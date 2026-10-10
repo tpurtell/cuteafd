@@ -474,11 +474,11 @@ fi
 # prefill (the engine's default 0.2; 0 prefills whole prompts before the next
 # step). Keys left unset pass nothing (images older than the options run).
 [[ -z "$(get DECODE_SHARE)" ]] || family_args+=(--decode-share "$(get DECODE_SHARE)")
-# RTX_EXPERT_LAYERS (DeepSeek V4, the shared placement solver): unset or max
-# places the most whole routed-expert layers that still leave a 262K pool
-# (v2's experts-first policy), the pool taking the rest up to its target;
-# auto reserves the KV pool (2M PRO / 1M <=32 GB) first and fills what is left
-# (opt-in); N, N% or all fix the RTX-resident layers and the KV pool takes
+# RTX_EXPERT_LAYERS (DeepSeek V4, the shared placement solver): unset is auto
+# for Flash on one RTX and max otherwise (Pro, two RTX); max places the most whole routed-expert layers
+# that still leave a 262K pool (v2's experts-first policy), the pool taking the
+# rest up to its target; auto reserves the KV pool (2M PRO / 1M <=32 GB) first
+# and fills what is left; N, N% or all fix the RTX-resident layers and the KV pool takes
 # every remaining byte (refused below the compiled context). 0 leaves the
 # backbone experts on the Sparks. With two RTX every onboard mode uses TP2
 # halves; GPU1 whole-layer expert ranges are no longer supported.
@@ -920,6 +920,20 @@ if [[ $family == glm5_flash ]]; then
     chain) family_args+=(--verify-policy chain) ;;
     *) echo "GLM5_FLASH_VERIFY_POLICY must be cost or chain" >&2; exit 2 ;;
   esac
+  # GLM5_FLASH_DRAFT_POLICY: the verify-length policy under the cost verify policy: cycle (default:
+  # the CycleCost table fit) or shared (the resource-priced shared draft policy, v3 D2).
+  # GLM5_FLASH_ROUTE_RING_CHECK=on (diagnostic, shared only) also copies Spark layers' router ids
+  # through the local route ring and counts disagreements with the staged ids.
+  glmf_draft_policy="$(get GLM5_FLASH_DRAFT_POLICY cycle)"
+  case "$glmf_draft_policy" in
+    ""|cycle|shared) trace_args+=(-e "CUTEAFD_GLMF_DRAFT_POLICY=${glmf_draft_policy:-cycle}") ;;
+    *) echo "GLM5_FLASH_DRAFT_POLICY must be cycle or shared" >&2; exit 2 ;;
+  esac
+  case "$(get GLM5_FLASH_ROUTE_RING_CHECK off)" in
+    off) ;;
+    on) trace_args+=(-e "CUTEAFD_GLMF_ROUTE_RING_CHECK=1") ;;
+    *) echo "GLM5_FLASH_ROUTE_RING_CHECK must be on or off" >&2; exit 2 ;;
+  esac
   spec_tau="$(get GLM5_FLASH_SPEC_TAU)"
   if [[ -n "$spec_tau" ]]; then
     [[ "$spec_tau" =~ ^(0?[.][0-9]*[1-9][0-9]*|1([.]0*)?)$ ]] || { echo "GLM5_FLASH_SPEC_TAU must be in (0, 1]" >&2; exit 2; }
@@ -980,7 +994,7 @@ if { [[ ( "$family" == mimo_v2 || "$family" == qwen4 || "$family" == glm5_flash 
    [[ "$family" == mimo_v2 && "$audio" != off ]]; then
   plan_rtx=1; ((head_split == 0)) || plan_rtx=2
   plan_pool="$(get POOL_TOKENS auto)"; [[ "$plan_pool" != auto ]] || plan_pool=0
-  plan_gib="${coordinator_budget:-95.5}"
+  plan_gib="${coordinator_budget:-94.97}"
   plan_draft_args=()
   if [[ "$family" == mimo_v2 ]]; then
     plan_draft_args+=(--concurrency "$(get CONCURRENCY "$default_concurrency")"

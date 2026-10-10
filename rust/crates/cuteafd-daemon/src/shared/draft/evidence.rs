@@ -31,15 +31,16 @@ pub(crate) struct SelectorFeatures {
 }
 
 /// What the drafter reported per drafted position, verified or not.
-#[allow(dead_code, reason = "D2/D4 bind the selector, MTP and copy evidence")]
+#[allow(dead_code, reason = "D3/D4 bind the MTP and copy evidence")]
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) enum Evidence<'a> {
     /// A trained confidence head's sigmoid per position (dSpark on V4.1 and
     /// GLM Flash). Its prior is the identity.
     Head(&'a [f64]),
-    /// DFlash2's selector features per position; the keyed `SelectorFit`
-    /// prior (D2) maps them to probabilities.
-    Selector(&'a [SelectorFeatures]),
+    /// DFlash2's selector features per position and the keyed `SelectorFit`
+    /// prior's probabilities of them. The binding evaluates the prior, since
+    /// its first feature is the request's own history rate.
+    Selector { features: &'a [SelectorFeatures], prior: &'a [f64] },
     /// Nothing but the request's past outcomes (MTP).
     History,
     /// A copy span of `match_len` matched tokens.
@@ -48,21 +49,20 @@ pub(crate) enum Evidence<'a> {
 
 impl<'a> Evidence<'a> {
     /// The prior's per-position probability `p0`, where this evidence has a
-    /// prior today. `Selector`, `History` and `Copy` priors arrive with their
-    /// first binding (D2/D3); until then they carry no neural evidence.
+    /// prior today: a head's sigmoid, or the selector fit's output. `History`
+    /// and `Copy` priors arrive with their first bindings (D3/D4); until then
+    /// they carry no neural evidence.
     pub fn prior(self) -> Option<&'a [f64]> {
         match self {
-            Self::Head(probabilities) => Some(probabilities),
-            Self::Selector(_) | Self::History | Self::Copy { .. } => None,
+            Self::Head(probabilities) | Self::Selector { prior: probabilities, .. } => Some(probabilities),
+            Self::History | Self::Copy { .. } => None,
         }
     }
 }
 
 /// Why a request's verification stopped before a miss could be observed.
 /// V4.1 truncates by grammar and budget before verification and books stops
-/// as before; D2 (GLM Flash and MiMo, which record planned rows today) is the
-/// first binding to censor.
-#[allow(dead_code, reason = "D2 is the first binding to censor")]
+/// as before; GLM Flash (D2) censors stops on accepted drafts.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Censor {
     /// The request emitted its stop token on an accepted draft.
@@ -84,11 +84,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn only_head_evidence_has_a_prior_today() {
+    fn head_and_selector_evidence_have_priors() {
         let p = [0.9, 0.5];
         assert_eq!(Evidence::Head(&p).prior(), Some(&p[..]));
         let features = [SelectorFeatures { margin: 1., p_top: 0.8, entropy: 0.3, rank: 0. }];
-        assert_eq!(Evidence::Selector(&features).prior(), None);
+        let fitted = [0.7];
+        assert_eq!(Evidence::Selector { features: &features, prior: &fitted }.prior(), Some(&fitted[..]));
         assert_eq!(Evidence::History.prior(), None);
         assert_eq!(Evidence::Copy { match_len: 8 }.prior(), None);
         assert_eq!((sigmoid(0.), sigmoid(40.), sigmoid(-40.) > 0.), (0.5, 1., true));

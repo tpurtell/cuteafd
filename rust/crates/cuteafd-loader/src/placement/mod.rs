@@ -18,12 +18,14 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 pub mod families;
+pub mod inventory;
 mod pool;
 mod residual;
 mod solve;
 #[cfg(test)]
 mod tests;
 
+pub use inventory::{loaded_code, ArchContext, GraphRank, GraphSet, Lifetime, LoadedCode, ProgramSet, RuntimeSample, ARCH_CONTEXTS};
 pub use pool::PoolPolicy;
 pub use residual::{hop_buffer_bytes, plan_hops, Hop, HopKind, HopPoint, HopSpec, ResidualHome, Transition, HOP_SLOTS};
 pub use solve::solve;
@@ -230,6 +232,9 @@ impl Demand {
     pub fn new(gpu: u8, category: Category, group: impl Into<String>, bytes: u64, basis: Basis) -> Self {
         Self { gpu, category, group: group.into(), bytes, basis }
     }
+
+    /// This demand on `gpu`.
+    pub fn on(self, gpu: u8) -> Self { Self { gpu, ..self } }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]

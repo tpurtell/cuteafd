@@ -290,7 +290,7 @@ pub(crate) struct PlanArgs {
     /// Coordinator GPUs for --layout (1 or 2; Qwen currently uses only the first).
     #[arg(long, default_value_t = 1)]
     pub(crate) rtx: usize,
-    /// Resolved global logical GPU ceiling; PRO defaults to 95.5 GiB.
+    /// Resolved global logical GPU ceiling; PRO defaults to its CUDA total (94.97 GiB).
     #[arg(skip)]
     pub(crate) coordinator_gpu_budget_gib: Option<f64>,
     /// Explicit KV pool tokens for --layout (0 or omitted: automatic).
@@ -377,6 +377,18 @@ pub(crate) struct PlanArgs {
     /// Explicit MiMo drafter context arena for --layout.
     #[arg(long)]
     pub(crate) draft_context_slots: Option<u64>,
+    /// MiMo segmented decode graph storage (off by default).
+    #[arg(long)]
+    pub(crate) mimo_decode_graphs: bool,
+    /// Physical coordinator SM count for memory-budget simulations.
+    #[arg(long)]
+    pub(crate) physical_sms: Option<u32>,
+    /// Plan the bundled MiMo drafter without FP8 conversion.
+    #[arg(long)]
+    pub(crate) mimo_draft_bf16: bool,
+    /// MiMo native local expert package manifest.json for exact scratch.
+    #[arg(long)]
+    pub(crate) mimo_expert_manifest: Option<PathBuf>,
     /// GLM 5.3 Flash's prefix marks for --layout (`pool`: in pool units, no arena, one reserved
     /// unit beside the pool).
     #[arg(long, value_enum, default_value = "arena")]

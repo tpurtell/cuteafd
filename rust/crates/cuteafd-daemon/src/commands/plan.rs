@@ -6,6 +6,14 @@ use std::path::PathBuf;
 
 use crate::cli::PlanArgs;
 
+/// The coordinator GPU budget: `--coordinator-gpu-budget-gib`, else the RTX PRO
+/// 6000's CUDA-reported total (`placement::inventory::PRO_TOTAL_BYTES`), what the
+/// runtime's own sample sees.
+fn coordinator_bytes(gib: Option<f64>) -> Result<u64, PlanError> {
+    gib.map_or(Ok(cuteafd_loader::placement::inventory::PRO_TOTAL_BYTES),
+        |gib| budget_bytes("--coordinator-gpu-budget-gib", gib))
+}
+
 /// The planning options `args` name, validated before any checkpoint is read.
 fn options(args: &PlanArgs) -> Result<PlanOptions, PlanError> {
     if !args.layout && args.vision_replicas != 1 {
@@ -18,14 +26,14 @@ fn options(args: &PlanArgs) -> Result<PlanOptions, PlanError> {
         spark_budget_bytes: budget_bytes("--spark-budget-gib", args.spark_budget_gib)?,
         coordinator_budget_bytes: budget_bytes("--coordinator-weight-budget-gib", args.coordinator_weight_budget_gib)?
             .min(if args.layout || args.coordinator_gpu_budget_gib.is_some() {
-                budget_bytes("--coordinator-gpu-budget-gib", args.coordinator_gpu_budget_gib.unwrap_or(95.5))?
+                coordinator_bytes(args.coordinator_gpu_budget_gib)?
             } else { u64::MAX }),
         layout: args.layout.then(|| -> Result<_, PlanError> {
             if !(1..=2).contains(&args.rtx) {
                 return Err(PlanError::InvalidOption { option: "--rtx", reason: "1 or 2 coordinator GPUs".into() });
             }
             Ok(cuteafd_loader::plan::layout::LayoutOptions {
-                rtx_bytes: vec![budget_bytes("--coordinator-gpu-budget-gib", args.coordinator_gpu_budget_gib.unwrap_or(95.5))?; args.rtx],
+                rtx_bytes: vec![coordinator_bytes(args.coordinator_gpu_budget_gib)?; args.rtx],
                 spark_allocation_budget_bytes: Some(budget_bytes("--spark-budget-gib", args.spark_budget_gib)?),
                 pool_tokens: args.pool_tokens,
                 vision_replicas: args.vision_replicas as usize,
@@ -55,8 +63,14 @@ fn options(args: &PlanArgs) -> Result<PlanOptions, PlanError> {
                 mimo_rings: args.mimo_rings,
                 draft_sequences: args.draft_sequences,
                 draft_context_slots: args.draft_context_slots,
+                mimo_decode_graphs: args.mimo_decode_graphs,
+                physical_sms: args.physical_sms,
+                mimo_draft_bf16: args.mimo_draft_bf16,
+                mimo_expert_manifest: args.mimo_expert_manifest.clone(),
                 native_mtp_layers: args.native_mtp_layers,
                 workspace_manifest: args.workspace_manifest.clone(),
+                glmf_drafter_disabled: args.no_speculator || args.speculator == "off",
+                glmf_drafter_snapshot: args.drafter_snapshot.clone(),
                 drafter_bytes: if args.drafter_gib > 0.0 { budget_bytes("--drafter-gib", args.drafter_gib)? } else { 0 },
                 ..Default::default()
             })
@@ -565,6 +579,10 @@ mod tests {
             mimo_rings: 16,
             draft_sequences: 4,
             draft_context_slots: None,
+            mimo_decode_graphs: false,
+            physical_sms: None,
+            mimo_draft_bf16: false,
+            mimo_expert_manifest: None,
             prefix_marks: crate::families::glm5_flash::prefix::PrefixMarks::Arena,
             native_mtp_layers: 3,
             workspace_manifest: None,
@@ -897,7 +915,7 @@ mod tests {
             let crate::cli::Commands::Plan(args) = cli.command else { panic!("plan") };
             let options = options(&args).unwrap();
             assert_eq!(options.coordinator_budget_bytes, 10 << 30);
-            assert_eq!(options.layout.unwrap().rtx_bytes, vec![budget_bytes("budget", 95.5).unwrap()]);
+            assert_eq!(options.layout.unwrap().rtx_bytes, vec![cuteafd_loader::placement::inventory::PRO_TOTAL_BYTES]);
         }
         assert_eq!(crate::cli::deprecated_budget_flags(["--coordinator-budget-gib", "10"]),
             vec!["--coordinator-weight-budget-gib"]);

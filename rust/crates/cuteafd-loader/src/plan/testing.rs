@@ -92,7 +92,8 @@ pub fn exl3(name: &str, n: usize, k: usize, bits: usize) -> Vec<Tensor> {
 pub fn mimo_flash_config() -> Value {
     let mut config = json!({
         "architectures": ["MiMoV2FlashForCausalLM"], "model_type": "mimo_v2_flash", "vocab_size": 64,
-        "hidden_size": 4096, "num_hidden_layers": 2, "num_attention_heads": 64, "num_key_value_heads": 4,
+        "hidden_size": 4096, "num_hidden_layers": 2, "max_position_embeddings": 1048576,
+        "num_attention_heads": 64, "num_key_value_heads": 4,
         "head_dim": 192, "v_head_dim": 128, "swa_num_attention_heads": 64, "swa_num_key_value_heads": 8,
         "swa_head_dim": 192, "swa_v_head_dim": 128, "partial_rotary_factor": 0.334, "rope_theta": 5000000,
         "swa_rope_theta": 10000, "sliding_window": 128, "sliding_window_size": 128,
@@ -180,7 +181,8 @@ pub fn mimo_flash_mopd_tensors() -> Vec<Tensor> {
 pub fn mimo_pro_config() -> Value {
     let mut config = json!({
         "architectures": ["MiMoV2ForCausalLM"], "model_type": "mimo_v2", "vocab_size": 64, "hidden_size": 6144,
-        "num_hidden_layers": 2, "num_attention_heads": 128, "num_key_value_heads": 8, "head_dim": 192,
+        "num_hidden_layers": 2, "max_position_embeddings": 1048576,
+        "num_attention_heads": 128, "num_key_value_heads": 8, "head_dim": 192,
         "v_head_dim": 128, "swa_num_attention_heads": 128, "swa_num_key_value_heads": 8, "swa_head_dim": 192,
         "swa_v_head_dim": 128, "partial_rotary_factor": 0.334, "rope_theta": 10000000, "swa_rope_theta": 10000,
         "sliding_window": 128, "sliding_window_size": 128, "hybrid_layer_pattern": [0, 1], "moe_layer_freq": [0, 1],

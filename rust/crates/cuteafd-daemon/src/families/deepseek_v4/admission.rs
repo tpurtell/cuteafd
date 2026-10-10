@@ -46,7 +46,7 @@ pub(crate) fn request(args: &EngineArgs, inputs: &Inputs<'_>) -> Result<Placemen
         inputs.manifest, inputs.family, gpus == 2, prefill, decode)?;
     let workspace = cuteafd_loader::serving_capacity::deepseek_v4_workspace_geometry(&cache_cfg, prefill, decode,
         cuteafd_loader::serving_capacity::compiled_c128_width(inputs.manifest, inputs.family)? * 128, gpus, scratch)?;
-    let onboard = args.onboard()?;
+    let onboard = args.onboard(inputs.cfg.dim, gpus)?;
     let stages = if args.dspark && !args.skip_routed_experts { inputs.cache_stages } else { 0 };
     let routed = *inputs.catalog.routed_experts();
     let (mut experts, draft) = if args.skip_routed_experts { (Vec::new(), Vec::new()) }
@@ -82,6 +82,6 @@ pub(crate) fn request(args: &EngineArgs, inputs: &Inputs<'_>) -> Result<Placemen
         experts_half, tp2_workspace, exchange_f32: inputs.exchange_f32,
         requested_pool: (args.pool_tokens > 0).then_some(args.pool_tokens as u64),
         onboard: if args.skip_routed_experts { Onboard::Auto } else { onboard },
-        full_prefill_logits: 0 })?;
+        full_prefill_logits: 0, code_bytes: v4::code_bytes(inputs.cfg.dim, v4::code_experts(inputs.catalog), gpus) })?;
     Ok(request)
 }

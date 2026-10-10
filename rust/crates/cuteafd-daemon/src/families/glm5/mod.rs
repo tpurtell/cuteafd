@@ -257,7 +257,16 @@ impl Opened {
         let args = &context_args;
         let programs = self.library.programs()?.with_manifest(&args.manifest)?;
         programs.capacities().require_context("glm5", args.max_context)?;
-        programs.load_all()?;
+        // GLM 5.3's own programs (`glm_*`, and the head split's `glm2_*`), sampled as the runtime
+        // inventory; the image's other families are never launched here.
+        let selected = cuteafd_core::coordinator_programs::CoordinatorPrograms { family: "glm",
+            split_family: args.split_device.map(|_| "glm2") };
+        let device = self.library.cuda_get_device()?;
+        crate::shared::inventory::RuntimeInventory::measure(&self.library, &[device], |_| {
+            let (loaded, skipped) = programs.load_matching(|name| selected.contains(name))?;
+            tracing::info!(loaded, skipped, "GLM programs loaded");
+            Ok(())
+        })?;
         let stream = self.library.cuda_stream_create()?;
         // The head split's second GPU and its stream (load kernels, then the engine's).
         // A head split needs its share's programs (`glm2`) in this build.
