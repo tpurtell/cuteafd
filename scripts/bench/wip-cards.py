@@ -747,7 +747,10 @@ def build_scopes(cards):
         for fam, tag, switch in [('glm5', 'glm', 'GLM'), ('glm5_flash', 'glmf', 'GLMF'), ('mimo_v2', 'mimop' if 'pro' in card['name'] else 'mimof', 'MIMO'), ('qwen4', 'qwen4', 'QWEN4')]:
             if family == fam:
                 env['CUTEAFD_WIP_' + switch + '_AOT'] = 'ON'
-                scopes.add(tag + ':fp8')
+                # Qwen's FP8 package has no Spark TP layout (intermediate 640): request the NVFP4 family,
+                # which CMake expands to nvfp4, nvfp4a4 and, on the coordinator only, the FP8 MTP sibling
+                # (fp8_moe.cmake), as the release image ships them.
+                scopes.add(tag + (':nvfp4' if tag == 'qwen4' else ':fp8'))
                 if 'exl3' in card['name'] or 'tr3' in card['name']:
                     scopes.add(tag + (':exl3-k34' if tag == 'glmf' else ':exl3-k45'))
                 if fam == 'mimo_v2':
