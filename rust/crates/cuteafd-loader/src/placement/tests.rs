@@ -516,6 +516,11 @@ fn section_6_glm_memory_uses_one_latent_and_charges_every_exchange_slot() {
         req.attention_placement = Some(AttentionPlacement::Context);
         let context = solve(&req).unwrap();
         print_attention_fixture(if nvfp4 { "GLM 5.3 NVFP4" } else { "GLM 5.3 EXL3" }, AttentionPlacement::Context, &context);
+        let mut max_req = req.clone();
+        max_req.onboard = Onboard::Layers(0);
+        let max_pool = solve(&max_req).unwrap().pool_tokens;
+        assert!((max_pool as f64 / 1e6 - if nvfp4 { 2.20 } else { 2.52 }).abs() < 0.005);
+        eprintln!("K0 GLM context max_pool={max_pool}");
         assert_eq!(context.pool_tokens, 2 << 20);
         assert_eq!(context.peer_row_bytes, 78 * (36_864 + 32_896) + 21 * 16_384);
         let used = context.items.iter().map(|items| items.iter().map(|i| i.bytes).sum::<u64>() as f64 / GIB as f64).collect::<Vec<_>>();
@@ -527,6 +532,11 @@ fn section_6_glm_memory_uses_one_latent_and_charges_every_exchange_slot() {
         for d in &mut req.fixed { d.bytes -= (1_287_508_185 + 200_991_168) / 2; }
         let layers = solve(&req).unwrap();
         print_attention_fixture(if nvfp4 { "GLM 5.3 NVFP4" } else { "GLM 5.3 EXL3" }, AttentionPlacement::Layers, &layers);
+        let mut max_req = req.clone();
+        max_req.onboard = Onboard::Layers(0);
+        let max_pool = solve(&max_req).unwrap().pool_tokens;
+        assert!((max_pool as f64 / 1e6 - if nvfp4 { 2.22 } else { 2.54 }).abs() < 0.005);
+        eprintln!("K0 GLM layers max_pool={max_pool}");
         let records = layers.items.iter().map(|items| items.iter().find(|i| i.group == "records").unwrap().bytes / (2 << 20)).collect::<Vec<_>>();
         let k = layers.layers.iter().position(|l| l.mode == S0).unwrap();
         eprintln!("K0 GLM layers switch={k} hops={}", layers.hops.len());
@@ -639,6 +649,7 @@ fn section_6_tp2_counts_use_exact_pages_and_real_layer_ownership() {
     }
     req.fixed = [20_100_569_073, 15_815_582_073].into_iter().enumerate().map(|(gpu, bytes)|
         Demand::new(gpu as u8, Category::Workspace, "P2 fixed", bytes, Basis::Estimated)).collect();
+    let spark_req = req.clone();
     for (mode, layers) in [(AttentionPlacement::Heads, 37), (AttentionPlacement::Context, 42), (AttentionPlacement::Layers, 42)] {
         req.attention_placement = Some(mode);
         let p = solve(&req).unwrap();
@@ -651,6 +662,15 @@ fn section_6_tp2_counts_use_exact_pages_and_real_layer_ownership() {
             let k = p.layers.iter().position(|l| l.mode == S0).unwrap();
             eprintln!("K0 GLM Flash layers switch={k}");
         }
+    }
+    let mut free_req = spark_req;
+    free_req.inventory.spark_ranks = 0;
+    for mode in [AttentionPlacement::Context, AttentionPlacement::Layers] {
+        free_req.attention_placement = Some(mode);
+        let p = solve(&free_req).unwrap();
+        assert_eq!(p.onboard_layers, 42);
+        assert!(p.pool_tokens >= 2 << 20);
+        print_attention_fixture("GLM Flash Spark-free", mode, &p);
     }
 }
 

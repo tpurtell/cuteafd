@@ -3764,8 +3764,8 @@ group 0). The executor records every lane interleaving and asserts
 
 | family (max) | `heads` (today) | `context` | `layers` | extra RTX TP2 layers (`heads` → `context` / `layers`) |
 |---|---|---|---|---|
-| GLM 5.3 EXL3 K4, 2 RTX + 6 | pool 1.29M (2M needs 105.4 GiB latent per GPU); 93.0 / 82.0 GiB, 64.9 GiB latent per GPU | 2M: 82.3 / 71.3 GiB (52.7 latent + 1.5 staging per GPU; frees 52.7 GiB per GPU against `heads` at 2M); max pool 2.52M | 2M: 81.6 / 68.3 GiB (27,560 / 26,380 B per token; contiguous ownership, latent exists once); max 2.54M | none: no local GLM 5.3 expert backend (with one: 4 / 6 half-layer pairs) |
-| GLM 5.3 NVFP4, 2 RTX + 6 | pool 1.13M; 93.0 / 82.0 | 2M: 90.4 / 79.4; max 2.20M | 2M: 89.7 / 76.4; max 2.22M | none (1 / 2) |
+| GLM 5.3 EXL3 K4, 2 RTX + 6 | pool 1.29M (2M needs 105.4 GiB latent per GPU); 93.0 / 82.0 GiB, 64.9 GiB latent per GPU | 2M: 82.3 / 71.3 GiB (52.7 latent + 1.5 staging per GPU; frees 52.7 GiB per GPU against `heads` at 2M); max pool 2.52M | 2M: 81.6 / 68.3 GiB (27,560 / 26,380 B per token; contiguous ownership, latent exists once); max 2.54M | none: no local GLM 5.3 expert backend (with one: 4 / 5 half-layer pairs) |
+| GLM 5.3 NVFP4, 2 RTX + 6 | pool 1.13M; 93.0 / 82.0 | 2M: 90.4 / 79.4; max 2.20M | 2M: 89.7 / 76.4; max 2.22M | none (1 / 1) |
 | V4 Flash, 2 RTX + 4, P4 TP2 | 2M, 36 TP2 pairs, 7.616 GiB records per GPU, GPU0 slack 0.07 | frees 3.676 (C4) − 0.350 staging − 0.017 exchange = 3.309 per GPU | frees 4.483 / 4.180 after 0.500 hop slots | 36 → 38 / 38 |
 | V4 Pro EXL3 K2, 2 RTX + 6, P4 TP2 | 2M, 10 pairs, 10.912 GiB records per GPU | frees 5.251 − 0.350 − 0.033 = 4.868 per GPU | frees 5.797 / 5.851 after 0.875 hop slots | 10 → 11 / 12 |
 | GLM Flash K3.25, 2 RTX + 4 | 2M: 41.8 / 37.8, 23.05 GiB MLA records + keys per GPU | compact, half the units: frees 15.9 per GPU | compact on owners: frees 17.1 / 16.0 | P6 TP2: 37 of 42 → 42 / 42 |
