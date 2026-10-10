@@ -3999,6 +3999,42 @@ sentinel never appears in the metadata file's bytes.
 - The metadata tier's guarantee is unchanged: payloads exist only in
   `usage-log.sqlite`.
 
+- **Virtual sessions and delta entries (TJ, 2026-10-10).** Agent clients
+  resend the whole conversation every turn, so a day of one session stores
+  the same history hundreds of times. The log stores each turn as a delta
+  against the earlier entry it extends:
+  - **Matching.** Requests chain to the earlier request whose rendered
+    prompt they extend. Two signals give the chain:
+    - the engine's prefix-cache hit, whose snapshot already carries the
+      session it was captured under (usage hooks, c8040142);
+    - the handler's own sources: `previous_response_id`, `prompt_cache_key`,
+      `metadata.user_id`, Realtime session ids.
+
+    The full log keeps its own matcher on the redacted request's message
+    list, not on tokens. That way a prefix-cache eviction or a server restart
+    doesn't break the chain.
+  - **Entry shape.**
+    - When a turn's messages extend the parent entry's messages exactly, the
+      entry stores `parent_rid`, the parent's message count, and only the new
+      items (plus the response).
+    - When the history was edited, truncated or spliced (a prefix mismatch),
+      the entry stores the full message list and starts a new chain
+      position. The divergence point is recorded, so the viewer can show what
+      changed.
+    - Tools, system prompt and settings are stored again only when they
+      change.
+  - **Viewer.** `/console/usage/log` groups entries by virtual session and
+    shows a conversation view (each turn's new items and response in
+    order), with edits marked where a chain restarted.
+    `/console/usage/log/:rid` rebuilds the full request by walking parents.
+  - **Retention.** Pruning never orphans a child. An entry whose parent
+    expires is rewritten with its full history at prune time, or the chain
+    is pruned as a unit. Pick whichever keeps the cap honest; the size cap
+    counts stored bytes.
+  - **Cost.** Matching runs on the log writer thread, keyed by a hash of each
+    message prefix, so the serving path is unchanged. The full log stays off
+    by default.
+
 ### Overhead bound (the C1 proof)
 
 On the serving path, per request: four `Instant::now()` (arrival, admit,
