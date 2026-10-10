@@ -150,7 +150,7 @@ fn planner_equals_runtime_deepseek_v4_fixture() {
                         assert_eq!(placement.onboard_layers, n);
                         assert!(placement.pool_tokens >= 1 << 20, "a fixed onboard fills the pool past the target");
                     }
-                    Onboard::Fraction(_) => unreachable!(),
+                    Onboard::Fraction(_) | Onboard::ExpertsFirst { .. } => unreachable!(),
                 }
             }
         }
@@ -203,6 +203,15 @@ fn planner_equals_runtime_deepseek_v4() {
         for rtx in [1, 2] {
             assert_eq!(auto[&(model, rtx, 131_072)].expert_ranges, auto[&(model, rtx, 1_048_576)].expert_ranges);
         }
+    }
+    // Experts first (v2's policy): more layers than auto, a pool above 262K.
+    for (model, snapshot, sparks) in [("flash", &flash, 2), ("pro", &pro, 4)] {
+        let manifest = inputs.join(format!("{model}-1-1048576/PROGRAMS.json"));
+        let case = Case { snapshot, manifest: &manifest, rtx: 1, sparks, context: 1_048_576, budget,
+            onboard: Onboard::ExpertsFirst { pool_floor: 262_144 }, dspark: true };
+        let placement = assert_equal(&case, &format!("{model} min max"));
+        assert!(placement.onboard_layers > auto[&(model, 1, 1_048_576)].onboard_layers);
+        assert!((262_144..2 << 20).contains(&placement.pool_tokens));
     }
     // Fixed onboard: the pool is the output.
     for context in [131_072u64, 1_048_576] {
