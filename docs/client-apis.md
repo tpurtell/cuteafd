@@ -30,6 +30,11 @@ them off with `--gateway off` (launchers: `GATEWAY=off`). Structured output
 passed; `json_object` works. `count_tokens` is exact (the checkpoint's
 tokenizer) for text turns.
 
+**Browser sockets.** A Responses or Realtime WebSocket opened from a web
+page of another origin is refused unless it carries the key or the origin is
+listed with `--gateway-allow-origin URL`; CLIs and SDKs send no Origin and
+are unaffected.
+
 **Keys.** Start the server with `--api-key-file FILE`. Clients send that key
 the way they would to the real service:
 - `x-api-key` or `Authorization: Bearer` for Messages;

@@ -216,6 +216,10 @@ pub(super) fn parse(value: &Value, require_max: bool) -> Result<(TurnRequest, bo
         turn.reasoning.budget_tokens = number(thinking, "budget_tokens")?;
         turn.reasoning.return_text =
             thinking.get("display").and_then(Value::as_str) != Some("omitted");
+    } else {
+        // Anthropic's default is no extended thinking: a request without the
+        // field (Claude Code's title and quota calls) must not reason.
+        turn.reasoning.enabled = Some(false);
     }
     let output = value.get("output_config");
     turn.reasoning.effort = output

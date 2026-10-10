@@ -107,6 +107,8 @@ pub struct GatewayMount {
     pub search: Option<Arc<dyn crate::gateway::SearchProvider>>,
     /// Refuses gateway turns while the in-server benchmark owns the engine.
     pub gate: Option<crate::gateway::TurnGate>,
+    /// Which browser origins may open Responses/Realtime sockets.
+    pub origins: crate::gateway::OriginPolicy,
 }
 
 impl std::fmt::Debug for GatewayMount {
@@ -307,6 +309,7 @@ pub fn router_for_model(queue: mpsc::Sender<NativeRequest>, limits: NativeLimits
         let mut gateway = crate::gateway::Gateway::new(backend, mount.models.clone());
         if let Some(search) = &mount.search { gateway = gateway.with_search(search.clone()); }
         gateway.gate = mount.gate.clone();
+        gateway.origins = mount.origins.clone();
         router = router.merge(crate::gateway::router(Arc::new(gateway)).layer(body_limit));
     }
     router.layer(axum::middleware::from_fn_with_state(middleware_health, health::require_ready))
@@ -709,10 +712,16 @@ pub(crate) fn build(profile: &ModelProfile, limits: NativeLimits, headers: &axum
     // answer's leading text as reasoning_content.
     converted.parsing_options.reasoning_initial_stage = converted.conversation.thinking_mode
         .then_some(deepseek_recipe::stream::state_machine::ReasoningStage::Start);
-    let model = profile.id.clone();
-    if converted.model.as_deref() != Some(model.as_str()) {
-        return Err(Rejection::bad(format!("model must be {model}")));
-    }
+    // The served id, or (with the gateway mounted) any id its model map
+    // lists or accepts, so every id /v1/models advertises also works here.
+    // Responses echo the id the client sent, as the gateway's do.
+    let requested = converted.model.clone().unwrap_or_default();
+    let model = if requested == profile.id { requested } else {
+        match profile.gateway.as_ref().filter(|_| !requested.is_empty()).map(|mount| mount.models.resolve(&requested)) {
+            Some(Ok(served)) if served == profile.id => requested,
+            _ => return Err(Rejection::bad(format!("model must be {}", profile.id))),
+        }
+    };
     let max_tokens = limits.requested_output(converted.inference_options.max_tokens).map_err(Rejection::bad)?;
     let response_validator = constraints::response_validator(response_format.as_ref()).map_err(Rejection::bad)?;
     let syntax = match &glm_request {

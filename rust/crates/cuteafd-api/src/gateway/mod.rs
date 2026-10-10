@@ -53,11 +53,52 @@ pub struct Gateway {
     pub standalone_search: responses::SearchCache,
     /// Refuses turns while something else owns the engine (a benchmark run).
     pub gate: Option<TurnGate>,
+    /// Cross-site WebSocket protection: see [`websocket_origin`].
+    pub origins: OriginPolicy,
+}
+
+/// Which browser origins may open Responses and Realtime sockets. Browsers
+/// send no CORS preflight for WebSockets, so without this any page a user
+/// visits could drive the model on a keyless server.
+#[derive(Clone, Default)]
+pub struct OriginPolicy {
+    /// The server's API key; a cross-origin upgrade that presents it is allowed.
+    pub key: Option<crate::openai::auth::ApiKey>,
+    /// Exact origins allowed without a key (`--gateway-allow-origin`).
+    pub allowed: Vec<String>,
+}
+
+impl OriginPolicy {
+    /// No `Origin` (CLIs, SDKs), a same-origin page, a listed origin, or a
+    /// request carrying the server key.
+    pub fn admits(&self, headers: &axum::http::HeaderMap) -> bool {
+        let Some(origin) = headers.get(axum::http::header::ORIGIN).and_then(|v| v.to_str().ok()) else {
+            return headers.get(axum::http::header::ORIGIN).is_none();
+        };
+        let host = headers.get(axum::http::header::HOST).and_then(|v| v.to_str().ok());
+        let origin_host = origin.split_once("://").map(|(_, rest)| rest.trim_end_matches('/'));
+        (host.is_some() && origin_host == host)
+            || self.allowed.iter().any(|allowed| allowed.trim_end_matches('/') == origin)
+            || self.key.as_ref().is_some_and(|key| auth::accepts(key, headers))
+    }
+}
+
+/// Refuse cross-origin Responses/Realtime upgrades the [`OriginPolicy`] does not admit.
+async fn websocket_origin(axum::extract::State(gateway): axum::extract::State<Arc<Gateway>>,
+    request: axum::extract::Request, next: axum::middleware::Next) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let upgrade = request.headers().contains_key(axum::http::header::UPGRADE);
+    if upgrade && !gateway.origins.admits(request.headers()) {
+        return GatewayError::new(ErrorKind::PermissionDenied,
+            "cross-origin WebSocket refused: send the API key or start the server with --gateway-allow-origin")
+            .openai_response().into_response();
+    }
+    next.run(request).await
 }
 
 impl Gateway {
     pub fn new(backend: Arc<dyn Backend>, models: ModelMap) -> Self {
-        Self { backend, models, sessions: SessionStore::default(), search: None, standalone_search: responses::SearchCache::default(), gate: None }
+        Self { backend, models, sessions: SessionStore::default(), search: None, standalone_search: responses::SearchCache::default(), gate: None, origins: OriginPolicy::default() }
     }
 
     pub fn with_search(mut self, provider: Arc<dyn SearchProvider>) -> Self {
@@ -95,10 +136,13 @@ impl Gateway {
 /// the shared model listing. Merge it beside the chat-completions router, or
 /// serve it alone with an upstream backend (`cuteafd gateway`).
 pub fn router(gateway: Arc<Gateway>) -> Router {
-    Router::new()
-        .merge(anthropic::routes(gateway.clone()))
+    let sockets = Router::new()
         .merge(responses::routes(gateway.clone()))
         .merge(realtime::routes(gateway.clone()))
+        .layer(axum::middleware::from_fn_with_state(gateway.clone(), websocket_origin));
+    Router::new()
+        .merge(anthropic::routes(gateway.clone()))
+        .merge(sockets)
         .merge(models_routes(gateway))
         // Claude Code's connectivity probe; outside /v1, so no key needed.
         .route("/api/hello", axum::routing::get(|| async { axum::http::StatusCode::OK }))

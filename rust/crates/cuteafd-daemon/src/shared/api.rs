@@ -37,12 +37,17 @@ pub(crate) struct ApiArgs {
     /// Hosted web search for the gateway: none, exa (EXA_API_KEY), or searxng=URL.
     #[arg(long, default_value = "none")]
     pub gateway_search: String,
+    /// Browser origin (scheme://host[:port]) allowed to open Responses and
+    /// Realtime sockets without the API key; repeatable. Same-origin pages,
+    /// keyed requests and clients that send no Origin are always allowed.
+    #[arg(long = "gateway-allow-origin")]
+    pub gateway_allow_origins: Vec<String>,
 }
 impl Default for ApiArgs {
     fn default() -> Self {
         Self { api_key_file: None, enable_bench: false, usage_dir: None, usage: Some("on".into()), console_secret_file: None,
             console_cookie_secure: false, gateway: "on".into(), official_model_names: "on".into(),
-            official_model_names_file: None, gateway_search: "none".into() }
+            official_model_names_file: None, gateway_search: "none".into(), gateway_allow_origins: Vec::new() }
     }
 }
 pub(crate) struct ApiPolicy {
@@ -56,6 +61,7 @@ pub(crate) struct ApiPolicy {
 #[derive(Clone)]
 struct GatewayPolicy {
     official: bool,
+    allowed_origins: Vec<String>,
     names_file: Option<String>,
     search: Option<Arc<dyn cuteafd_api::gateway::SearchProvider>>,
 }
@@ -77,7 +83,8 @@ impl ApiArgs {
                     None => anyhow::bail!("--gateway-search must be none, exa, or searxng=URL"),
                 },
             };
-            Some(GatewayPolicy { official: self.official_model_names == "on" || names_file.is_some(), names_file, search })
+            Some(GatewayPolicy { official: self.official_model_names == "on" || names_file.is_some(), names_file, search,
+                allowed_origins: self.gateway_allow_origins.clone() })
         } else { None };
         Ok(ApiPolicy { key, bench: self.enable_bench, usage, gate, gateway })
     }
@@ -96,7 +103,8 @@ impl ApiPolicy {
                 options: cuteafd_api::openai::engine::EngineOptions {
                     json_schema: cuteafd_api::openai::engine::probe_json_schema(&profile) },
                 search: policy.search.clone(),
-                gate: self.bench.then(|| cuteafd_bench::http::gate(cuteafd_bench::Bench::global())) }));
+                gate: self.bench.then(|| cuteafd_bench::http::gate(cuteafd_bench::Bench::global())),
+                origins: cuteafd_api::gateway::OriginPolicy { key: self.key.clone(), allowed: policy.allowed_origins.clone() } }));
         }
         Ok(profile)
     }

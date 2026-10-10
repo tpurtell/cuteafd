@@ -107,6 +107,7 @@ pub(crate) async fn run(args: GatewayArgs) -> Result<()> {
     models.aliases.extend(args.aliases);
     models.listed.extend(args.listed);
     let mut gateway = Gateway::new(backend,models);
+    gateway.origins = gateway::OriginPolicy { key: api.gateway_auth().key, allowed: Vec::new() };
     let provider = if args.search == "none" { "none" }
         else if args.search == "exa" {
             let key = std::env::var("EXA_API_KEY").context("EXA_API_KEY is not set")?;

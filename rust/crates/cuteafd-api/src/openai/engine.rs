@@ -176,6 +176,27 @@ fn pcm16_wav(data: &str) -> Result<String, GatewayError> {
     Ok(STANDARD.encode(wav))
 }
 
+/// A hosted call resent without its result (Responses `web_search_call`
+/// input items carry the action and status, never the sources) gets a
+/// synthetic tool message right after its call message: chat requires every
+/// call's result to follow it, and the search already ran on an earlier turn.
+fn answer_server_calls(messages: &mut Vec<Value>, calls: &[(String, Value)]) {
+    for (id, input) in calls {
+        let Some(at) = messages.iter().position(|m| m["role"] == "assistant"
+            && m["tool_calls"].as_array().is_some_and(|c| c.iter().any(|c| c["id"] == id.as_str()))) else { continue };
+        let mut end = at + 1;
+        while messages.get(end).is_some_and(|m| m["role"] == "tool") {
+            if messages[end]["tool_call_id"] == id.as_str() { end = usize::MAX; break; }
+            end += 1;
+        }
+        if end == usize::MAX { continue; }
+        let query = input["query"].as_str().or_else(|| input["queries"][0].as_str()).unwrap_or_default();
+        let summary = if query.is_empty() { "Search completed on an earlier turn; its results are not repeated here.".to_owned() }
+            else { format!("Search for {query:?} completed on an earlier turn; its results are not repeated here.") };
+        messages.insert(end, json!({"role":"tool","tool_call_id":id,"content":summary}));
+    }
+}
+
 /// For a template that takes one leading system message: leading system
 /// messages merge with a blank line, later ones become user turns (Claude
 /// Code's mid-conversation `<system-reminder>` messages, Codex's developer
@@ -293,6 +314,9 @@ fn chat_body_with(turn: &TurnRequest, profile: &ModelProfile, names: &ToolNames,
         if !calls.is_array() { *calls = json!([]); }
         calls.as_array_mut().unwrap().push(json!({"id":id,"type":"function","function":{"name":name,"arguments":arguments}}));
     }
+    // Hosted (server) tool calls, to answer any whose result the client
+    // did not resend.
+    let mut server_calls: Vec<(String, Value)> = Vec::new();
     for item in &turn.items {
         match item {
             Item::Message { role: Role::System, content: parts } => {
@@ -323,8 +347,10 @@ fn chat_body_with(turn: &TurnRequest, profile: &ModelProfile, names: &ToolNames,
                 let arguments = if arguments.trim().is_empty() { "{}".to_owned() } else { arguments.clone() };
                 push_call(current(&mut messages), id, names.wire(name), arguments);
             }
-            Item::ServerToolCall { id, name, input } =>
-                push_call(current(&mut messages), id, names.wire(name), input.to_string()),
+            Item::ServerToolCall { id, name, input } => {
+                push_call(current(&mut messages), id, names.wire(name), input.to_string());
+                server_calls.push((id.clone(), input.clone()));
+            }
             Item::ToolResult { call_id, content: parts, is_error } => {
                 let mut body = content(parts, "tool")?;
                 // Chat has no error flag on tool results; the text says so.
@@ -351,6 +377,7 @@ fn chat_body_with(turn: &TurnRequest, profile: &ModelProfile, names: &ToolNames,
             message["content"] = json!("");
         }
     }
+    answer_server_calls(&mut messages, &server_calls);
     if systems == SystemPlacement::FirstOnly { messages = first_system_only(messages); }
     // A forced choice needs a tool to force, as on /v1/chat/completions.
     match &turn.tool_choice {

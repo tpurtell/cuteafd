@@ -63,7 +63,7 @@ struct Worker { prompts: Arc<Mutex<Vec<String>>>, closed: Arc<Mutex<Vec<bool>>> 
 fn serve(mut profile: ModelProfile, snapshot: Option<std::path::PathBuf>, replies: Vec<&'static str>, hold: bool)
     -> (axum::Router, Worker) {
     profile.gateway = Some(Arc::new(GatewayMount { models: crate::gateway::ModelMap::official_names(profile.id.clone()),
-        snapshot, options: EngineOptions::default(), search: None, gate: None }));
+        snapshot, options: EngineOptions::default(), search: None, gate: None, origins: Default::default() }));
     let (tx, mut rx) = mpsc::channel::<NativeRequest>(4);
     let worker = Worker::default();
     let seen = worker.clone();
@@ -640,4 +640,113 @@ async fn system_items_follow_each_template_placement_rule() {
         assert_eq!(prompts[0], prompts[2], "{} Claude Code reminders ({placement:?})", family.name);
         assert_eq!(prompts[1], prompts[3], "{} Codex developer items ({placement:?})", family.name);
     }
+}
+
+#[tokio::test]
+async fn resent_web_search_call_without_results_keeps_the_session_valid() {
+    // Codex over HTTP (store:false) resends its hosted web_search_call items
+    // by value: action and status, never the sources. Every later turn must
+    // still render (chat requires each call's result to follow it).
+    for family in families() {
+        let (app, worker) = serve(family.profile.clone(), family.snapshot.clone(), vec![], false);
+        let body = json!({"model":"gpt-6.1-sol","stream":false,"store":false,"reasoning":{"effort":"none"},"input":[
+            {"type":"message","role":"user","content":[{"type":"input_text","text":"latest rust release?"}]},
+            {"type":"web_search_call","id":"ws_1","status":"completed","action":{"type":"search","query":"rust release"}},
+            {"type":"message","role":"assistant","content":[{"type":"output_text","text":"Rust 2.0 shipped."}]},
+            {"type":"message","role":"user","content":[{"type":"input_text","text":"thanks; and before that?"}]}]});
+        let (status, text) = post(&app, "/v1/responses", body).await;
+        assert_eq!(status, StatusCode::OK, "{}: {text}", family.name);
+        let prompt = worker.prompts.lock().unwrap()[0].clone();
+        assert!(prompt.contains("rust release") && prompt.contains("completed on an earlier turn"), "{}: {prompt}", family.name);
+    }
+}
+
+#[tokio::test]
+async fn chat_accepts_listed_aliases_only_with_the_gateway_mounted() {
+    let profile = ModelProfile::new("test-qwen", ModelEncoding::Qwen(Arc::new(qwen4::fixtures::encoding())));
+    let body = |model: &str| json!({"model":model,"stream":false,"max_tokens":8,"thinking":{"type":"disabled"},
+        "messages":[{"role":"user","content":"hi"}]});
+    let (app, worker) = serve(profile.clone(), None, vec!["ok"; 4], false);
+    for model in ["test-qwen", "claude-sonnet-5", "gpt-6.1-sol"] {
+        let (status, text) = post(&app, "/v1/chat/completions", body(model)).await;
+        assert_eq!(status, StatusCode::OK, "{model}: {text}");
+        assert_eq!(serde_json::from_str::<Value>(&text).unwrap()["model"], model, "the requested id is echoed");
+    }
+    assert_eq!(worker.prompts.lock().unwrap().len(), 3);
+    // With official names off (single model map) and with no gateway, only
+    // the served id is accepted, as before.
+    let mut single = profile.clone();
+    single.gateway = None;
+    let (tx, _rx) = mpsc::channel::<NativeRequest>(1);
+    let plain = router_for_model(tx, NativeLimits::default(), Arc::new(Mutex::new(Value::Null)),
+        std::time::Duration::from_secs(1), ConsoleHub::disabled(), single);
+    let (status, text) = post(&plain, "/v1/chat/completions", body("claude-sonnet-5")).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{text}");
+    let mut strict = profile.clone();
+    strict.gateway = Some(Arc::new(GatewayMount { models: crate::gateway::ModelMap::single("test-qwen"), snapshot: None,
+        options: EngineOptions::default(), search: None, gate: None, origins: Default::default() }));
+    let (tx, _rx) = mpsc::channel::<NativeRequest>(1);
+    let strict = router_for_model(tx, NativeLimits::default(), Arc::new(Mutex::new(Value::Null)),
+        std::time::Duration::from_secs(1), ConsoleHub::disabled(), strict);
+    let (status, text) = post(&strict, "/v1/chat/completions", body("claude-sonnet-5")).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "official names off: {text}");
+    let (status, _) = post(&strict, "/v1/chat/completions", body("")).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "an empty model id stays refused");
+}
+
+#[tokio::test]
+async fn messages_without_thinking_do_not_reason_while_responses_and_chat_keep_defaults() {
+    let profile = ModelProfile::new("test-qwen", ModelEncoding::Qwen(Arc::new(qwen4::fixtures::encoding())));
+    let (app, worker) = serve(profile, None, vec![], false);
+    // Claude Code's title/quota calls: no thinking field.
+    post(&app, "/v1/messages", json!({"model":"claude-haiku-4-5","max_tokens":1,"messages":[{"role":"user","content":"quota"}]})).await;
+    post(&app, "/v1/messages", json!({"model":"m","max_tokens":8,"thinking":{"type":"enabled","budget_tokens":1024},
+        "messages":[{"role":"user","content":"quota"}]})).await;
+    post(&app, "/v1/responses", json!({"model":"m","input":"quota","store":false})).await;
+    post(&app, "/v1/chat/completions", json!({"model":"test-qwen","max_tokens":8,"messages":[{"role":"user","content":"quota"}]})).await;
+    let prompts = worker.prompts.lock().unwrap().clone();
+    let thinks = |p: &str| !p.trim_end().ends_with("</think>");
+    assert!(!thinks(&prompts[0]), "Messages default: no thinking: {}", prompts[0]);
+    assert!(thinks(&prompts[1]), "Messages thinking enabled");
+    assert!(thinks(&prompts[2]), "Responses keeps the server default");
+    assert!(thinks(&prompts[3]), "chat keeps the server default");
+}
+
+#[tokio::test]
+async fn cross_origin_sockets_need_the_key_or_an_allowed_origin() {
+    use crate::gateway::OriginPolicy;
+    use axum::http::HeaderMap;
+    let headers = |pairs: &[(&'static str, &str)]| {
+        let mut h = HeaderMap::new();
+        for (k, v) in pairs { h.insert(*k, v.parse().unwrap()); }
+        h
+    };
+    let keyless = OriginPolicy::default();
+    assert!(keyless.admits(&headers(&[("host", "box:8000")])), "CLIs and SDKs send no Origin");
+    assert!(keyless.admits(&headers(&[("host", "box:8000"), ("origin", "http://box:8000")])), "same origin");
+    assert!(!keyless.admits(&headers(&[("host", "box:8000"), ("origin", "https://evil.example")])));
+    let allowed = OriginPolicy { key: None, allowed: vec!["https://ui.lan".into()] };
+    assert!(allowed.admits(&headers(&[("host", "box:8000"), ("origin", "https://ui.lan")])));
+    assert!(!allowed.admits(&headers(&[("host", "box:8000"), ("origin", "https://other.lan")])));
+    let keyed = OriginPolicy { key: Some(crate::openai::auth::ApiKey::new("sk-local").unwrap()), allowed: vec![] };
+    assert!(keyed.admits(&headers(&[("host", "box:8000"), ("origin", "https://ui.lan"),
+        ("sec-websocket-protocol", "realtime, openai-insecure-api-key.sk-local")])), "a keyed browser client");
+    assert!(!keyed.admits(&headers(&[("host", "box:8000"), ("origin", "https://ui.lan")])));
+    // Through the served router: a cross-origin upgrade is refused before the socket opens.
+    let profile = ModelProfile::new("test-qwen", ModelEncoding::Qwen(Arc::new(qwen4::fixtures::encoding())));
+    let (app, _) = serve(profile, None, vec![], false);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
+    for path in ["/v1/responses", "/v1/realtime?model=m"] {
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+        let mut request = format!("ws://{addr}{path}").into_client_request().unwrap();
+        request.headers_mut().insert("origin", "https://evil.example".parse().unwrap());
+        assert!(tokio_tungstenite::connect_async(request).await.is_err(), "{path}: cross-origin refused");
+        let mut request = format!("ws://{addr}{path}").into_client_request().unwrap();
+        request.headers_mut().insert("origin", format!("http://{addr}").parse().unwrap());
+        assert!(tokio_tungstenite::connect_async(request).await.is_ok(), "{path}: same origin admitted");
+        assert!(tokio_tungstenite::connect_async(format!("ws://{addr}{path}")).await.is_ok(), "{path}: no Origin admitted");
+    }
+    server.abort();
 }
