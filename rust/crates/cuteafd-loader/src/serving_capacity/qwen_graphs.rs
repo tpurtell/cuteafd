@@ -13,9 +13,10 @@ pub const QWEN_SPEC_BUCKETS: &[usize] = &[2, 4, 8, 16, 24, 32, 64];
 /// Tokens per allocation unit (four 64-row record pages) and pages per unit.
 pub const QWEN_UNIT_ROWS: usize = 256;
 pub const QWEN_UNIT_PAGES: usize = 4;
-/// 2026-10-07 TP4 SM120: 1,855,979,520 physical bytes / 12,397 graphs,
-/// rounded up; the margin also covers the earlier 21,560-graph measurement.
-pub const QWEN_GRAPH_BYTES_PER_GRAPH: u64 = 149_712;
+/// SM120 PRO, driver 595.91.07: 4,569,694,208 B / 30,380 startup graphs at the
+/// 1-RTX qualified layout (v3-p2 ready ledgers, EXL3 and NVFP4 alike,
+/// 2026-10-10), rounded up; 2026-10-07 TP4 measured 149,712 (12,397 graphs).
+pub const QWEN_GRAPH_BYTES_PER_GRAPH: u64 = 150_418;
 pub const QWEN_GRAPH_MARGIN_PERCENT: u64 = 10;
 pub const QWEN_GRAPH_MARGIN_BYTES: u64 = 256 << 20;
 

@@ -47,6 +47,17 @@ impl DecodeBuckets {
     }
 }
 
+/// Measured bytes per startup executable by role (v3-p2 ready ledgers, RTX PRO 6000 SM120, driver
+/// 595.91.07, EXL3 K3.25, 64 decode rows, 2026-10-10): one GPU 1,946,157,056 B / 13,800 graphs;
+/// head-split lead 2,231,369,728 B / 13,800; peer 2,283,798,528 B / 13,500 (the split graphs carry
+/// the peer exchange's waits and copies).
+pub const MEASURED_GRAPH_BYTES_BY_ROLE: [u64; 3] = [141_027, 161_694, 169_171];
+
+/// Measured bytes of `graphs` startup executables on `role` (0: one GPU, 1: split lead, 2: peer).
+pub fn measured_graph_bytes(graphs: u64, role: usize) -> u64 {
+    graphs * MEASURED_GRAPH_BYTES_BY_ROLE[role.min(2)]
+}
+
 pub fn graph_reserve_bytes(graphs: usize) -> u64 {
     let measured = graphs as u64 * MEASURED_GRAPH_BYTES;
     measured + (measured * GRAPH_MARGIN_PERCENT).div_ceil(100) + GRAPH_RANK_MARGIN_BYTES

@@ -775,9 +775,18 @@ pub fn layout(report: &mut PlanReport, model: &dyn super::FamilyModel, checkpoin
             // Measured inventory: the arch's CUDA context and cuBLAS (`placement::ArchContext`), plus the
             // modules of the programs this family launches (`ProgramSet`), what the runtime's sample sees
             // before its first weight.
-            Some(families) => Item::new(Category::Runtime, "context+modules", "", planned_context(
-                workspace_manifest.as_ref(), &families, options.rtx_bytes[index])
-                + if split { crate::placement::ArchContext::for_device("sm_120", options.rtx_bytes[index]).peer_context_bytes } else { 0 }, Basis::Formula),
+            // Where the family's ready ledger is measured (`placement::inventory::LOADED_CODE`), the
+            // context plus every byte of code it holds at ready (lazily loaded functions, packages,
+            // cuBLAS) instead: serve reserves what has not arrived by its admission sample.
+            Some(families) => match crate::placement::loaded_code(&families[0], local_package(report),
+                split, index as u8) {
+                Some(code) => Item::new(Category::Runtime, "context+modules", "",
+                    crate::placement::ArchContext::coordinator(options.rtx_bytes[index], None).context_bytes + code.bytes,
+                    Basis::Calibrated),
+                None => Item::new(Category::Runtime, "context+modules", "", planned_context(
+                    workspace_manifest.as_ref(), &families, options.rtx_bytes[index])
+                    + if split { crate::placement::ArchContext::for_device("sm_120", options.rtx_bytes[index]).peer_context_bytes } else { 0 }, Basis::Formula),
+            },
             None => Item::new(Category::Runtime, "context+modules", "", costs.runtime_bytes[role], allowance_basis),
         });
         // V4's graphs, workspaces, exchange slots, reserve, KV and experts come
@@ -796,9 +805,12 @@ pub fn layout(report: &mut PlanReport, model: &dyn super::FamilyModel, checkpoin
             let lanes = if matches!(report.placement, ExpertPlacement::Sparks { .. }) {
                 glmf_lanes as usize
             } else { 1 };
-            device.items.push(Item::new(Category::Runtime, "workspace runtime overhead", "",
-                crate::serving_capacity::glmf_graphs::workspace_runtime_overhead(lanes, index == 0 && drafter > 0),
-                Basis::Formula));
+            // The measured loaded code (`context+modules`) holds the workspaces' untracked runtime memory.
+            if crate::placement::loaded_code("glmf", "*", split, index as u8).is_none() {
+                device.items.push(Item::new(Category::Runtime, "workspace runtime overhead", "",
+                    crate::serving_capacity::glmf_graphs::workspace_runtime_overhead(lanes, index == 0 && drafter > 0),
+                    Basis::Formula));
+            }
             if let Some(budget) = options.graph_budget_bytes {
                 device.items.push(Item::new(Category::Runtime, "graph growth", "",
                     if glmf_measured { budget } else { budget.max(graph_allowance) }, Basis::Formula));
@@ -954,8 +966,18 @@ pub fn layout(report: &mut PlanReport, model: &dyn super::FamilyModel, checkpoin
                 for (device, reserve) in devices.iter_mut().zip(&reserves) {
                     device.capacity_bytes = options.rtx_bytes[device.index as usize].saturating_sub(*reserve);
                 }
+                // Admission charges RoPE tables for the full context; with a smaller pool serve then
+                // allocates them for the context it serves (`pool_context`: the pool less one unit),
+                // which is what the ready ledger holds.
+                let served = if placement.pool_tokens < context_tokens && options.context_tokens == 0 {
+                    placement.pool_tokens.saturating_sub(256) } else { context_tokens };
                 for (device, items) in devices.iter_mut().zip(&placement.items) {
-                    device.items.extend(items.iter().cloned());
+                    device.items.extend(items.iter().cloned().map(|mut item| {
+                        if item.group == "RoPE context tables" && context_tokens > 0 {
+                            item.bytes = item.bytes / context_tokens * served;
+                        }
+                        item
+                    }));
                     if device.items.iter().any(|i| i.group == "records") { device.kv_tokens = placement.pool_tokens; }
                 }
                 for (gpu, range) in placement.expert_ranges.iter().enumerate() {
@@ -1127,7 +1149,11 @@ pub fn layout(report: &mut PlanReport, model: &dyn super::FamilyModel, checkpoin
                         admit_beside_decode_graphs(Some(StartupGraphReserve { reserve, allowance: costs.graph_bytes[0] }), |startup| {
                             for (rank, device) in devices.iter_mut().take(active_gpus).enumerate() {
                                 device.items.retain(|i| i.group != "graph allowance" && i.group != "graphs" && i.group != "graph growth");
-                                let measured = counts[rank] * crate::serving_capacity::glmf_graphs::MEASURED_GRAPH_BYTES;
+                                // The captured set at ready (per-role measured bytes); the reserve's margin is
+                                // growth.
+                                let role = if !split { 0 } else { 1 + rank };
+                                let measured = crate::serving_capacity::glmf_graphs::measured_graph_bytes(counts[rank], role)
+                                    .min(crate::serving_capacity::glmf_graphs::graph_reserve_bytes(counts[rank] as usize));
                                 if startup.is_some() {
                                     device.items.push(Item::new(Category::Runtime, "graphs", "", measured, Basis::Calibrated));
                                 }
@@ -1258,6 +1284,14 @@ fn program_families(family: &str, model: &dyn super::FamilyModel, split: bool, c
         _ => return None,
     };
     Some(std::iter::once(base.to_string()).chain((split && family != "qwen4").then(|| format!("{base}2"))).collect())
+}
+
+/// The local expert package kind a coordinator GPU loads (`LoadedCode::experts`): `exl3`, `fp8`
+/// (fp8moe/NVFP4 packages) or `none` (Spark experts).
+fn local_package(report: &PlanReport) -> &'static str {
+    let package = report.experts.as_ref().map(|e| e.package.as_str()).unwrap_or("");
+    if report.placement != ExpertPlacement::Local { "none" }
+    else if package.contains("exl3") { "exl3" } else { "fp8" }
 }
 
 /// The planner's runtime baseline on a GPU of `total_bytes`: arch context + the selected modules.
@@ -1413,7 +1447,7 @@ fn deepseek_v4_placement(report: &PlanReport, checkpoint: &super::Checkpoint,
     let onboard = match (options.onboard, options.local_expert_layers) {
         (Some(onboard), _) => onboard,
         (None, Some(n)) => Onboard::Layers(n.saturating_sub(routed.first_layer)),
-        (None, None) => v4::DEFAULT_ONBOARD,
+        (None, None) => v4::default_onboard(devices.len()),
     };
     let inputs = v4::V4Inputs { cfg: &cfg, cache_stages: shape.cache_native_layers, gpus, headroom_floor: options.headroom_bytes,
         spark_ranks, sequences: shape.concurrency, prefill_rows: shape.prefill_rows, decode_rows: shape.decode_rows,
@@ -1421,7 +1455,7 @@ fn deepseek_v4_placement(report: &PlanReport, checkpoint: &super::Checkpoint,
         experts, draft, expert_workspace, first_routed: routed.first_layer,
         peer_experts: v4::peer_experts(&catalog, options.peer_expert_ranges),
         requested_pool: options.pool_tokens.filter(|&n| n > 0), onboard,
-        full_prefill_logits: 0 };
+        full_prefill_logits: 0, code_bytes: v4::code_bytes(cfg.dim, devices.len()) };
     let request = v4::request(&inputs)?;
     let reserves = request.inventory.gpus.iter().map(|g| g.headroom_bytes).collect();
     Ok((crate::placement::solve(&request)?, reserves))

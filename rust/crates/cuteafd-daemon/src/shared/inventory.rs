@@ -75,3 +75,28 @@ impl RuntimeInventory {
             .collect()
     }
 }
+
+/// Native code still to arrive on `device` (coordinator `rank` of a `split`
+/// layout) before ready ([`cuteafd_loader::placement::LoadedCode::pending`]):
+/// the measured loaded code of `program_family` with `experts` less what the
+/// device already holds beyond the arch context and this process's tracked
+/// allocations. Samples the device now: call it at the admission sample. 0 for
+/// a family the table does not measure (it keeps its module formula).
+pub(crate) fn pending_code(library: &NativeLibrary, device: i32, rank: usize, split: bool, program_family: &str,
+    experts: &str) -> Result<u64> {
+    let Some(code) = cuteafd_loader::placement::loaded_code(program_family, experts, split, rank as u8)
+        else { return Ok(0) };
+    let current = library.cuda_get_device()?;
+    library.cuda_set_device(device)?;
+    let sample = (|| -> Result<_> { Ok((library.cuda_memory_info()?, library.cuda_device_info(device)?)) })();
+    library.cuda_set_device(current)?;
+    let ((free, total), info) = sample?;
+    let tracked = cuteafd_ffi::memory_ledger::snapshot().total(cuteafd_ffi::memory_ledger::Space::Device, device);
+    let untracked = (total.saturating_sub(free) as u64).saturating_sub(tracked as u64);
+    let arch = format!("sm_{}{}", info.compute_capability_major, info.compute_capability_minor);
+    let context = cuteafd_loader::placement::ArchContext::for_device(&arch, total as u64).context_bytes;
+    let pending = code.pending(untracked, context);
+    tracing::info!(device, family = program_family, experts, loaded_code_bytes = code.bytes, untracked_bytes = untracked,
+        pending_bytes = pending, "loaded code reserved beside admission (placement::inventory::LOADED_CODE)");
+    Ok(pending)
+}

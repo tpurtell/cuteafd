@@ -844,8 +844,10 @@ fn v4_workspace_plan_matches_runtime_below_compiled_context() {
             let intake = 2 * 2 * 4096 * cfg.dim as u64 * 2;
             assert_eq!((steps.bytes, steps.basis), (runtime[0].fixed_device_bytes + intake, Basis::Formula));
             let graph = layout::family_costs("deepseek_v4").graph_bytes[0];
+            // The PRO envelope covers the measured loaded code as well (`V4Inputs::code_bytes`).
+            let code = crate::placement::loaded_code("dsv4f", "*", false, 0).unwrap().bytes;
             assert_eq!(total - device.capacity_bytes, crate::serving_capacity::deepseek_v4_headroom_bytes(
-                total, 10 << 30, steps.bytes, graph));
+                total, 10 << 30, steps.bytes + code, graph));
         }
     }
 }
@@ -1342,10 +1344,15 @@ fn glm5_flash_disabled_draft_omits_arenas_and_speculative_graphs() {
     let graphs = |layout: &cuteafd_core::memory_layout::MemoryLayout| layout.devices[0].items.iter()
         .find(|i| i.group == "graphs").unwrap().bytes;
     assert!(graphs(&disabled) < graphs(&enabled), "disabled={} enabled={}", graphs(&disabled), graphs(&enabled));
-    let overhead = |layout: &cuteafd_core::memory_layout::MemoryLayout| layout.devices[0].items.iter()
-        .find(|i| i.group == "workspace runtime overhead").unwrap().bytes;
-    assert_eq!(overhead(&enabled), crate::serving_capacity::glmf_graphs::workspace_runtime_overhead(2, true));
-    assert_eq!(overhead(&disabled), crate::serving_capacity::glmf_graphs::workspace_runtime_overhead(2, false));
+    // The measured loaded code (`placement::inventory::LOADED_CODE`) replaces the per-workspace
+    // runtime allowance: it already holds the workspaces' and the drafter's untracked memory.
+    let code = crate::placement::loaded_code("glmf", "*", false, 0).unwrap().bytes;
+    for layout in [&enabled, &disabled] {
+        assert!(!layout.devices[0].items.iter().any(|i| i.group == "workspace runtime overhead"));
+        let context = layout.devices[0].items.iter().find(|i| i.group == "context+modules").unwrap().bytes;
+        assert_eq!(context, crate::placement::ArchContext::coordinator(crate::placement::inventory::PRO_TOTAL_BYTES,
+            None).context_bytes + code);
+    }
 }
 
 #[test]

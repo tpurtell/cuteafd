@@ -147,14 +147,17 @@ fn planner_equals_runtime_deepseek_v4_fixture() {
     let manifest = synthetic(dir.path());
     for (rtx, budget) in [(1, 24u64 << 30), (2, 24 << 30)] {
         for context in [131_072, 1_048_576] {
-            for onboard in [None, Some(Onboard::Auto), Some(Onboard::Layers(2)), Some(Onboard::Layers(0))] {
+            let max = Onboard::ExpertsFirst { pool_floor: 262_144 };
+            for onboard in [None, Some(Onboard::Auto), Some(max), Some(Onboard::Layers(2)), Some(Onboard::Layers(0))] {
                 let case = Case { snapshot: dir.path(), manifest: &manifest, rtx, sparks: 2, context, budget,
                     onboard, dspark: false, peer: false };
                 let placement = assert_equal(&case, &format!("fixture rtx{rtx} {context} {onboard:?}"));
-                match onboard {
-                    None => assert!(placement.pool_tokens >= 262_144, "experts first keeps a 262K pool"),
-                    Some(Onboard::Auto) => assert_eq!(placement.pool_tokens, 1 << 20, "24 GiB cards target 1M"),
-                    Some(Onboard::Layers(n)) => {
+                // The default: pool first on one RTX, experts first on two (`default_onboard`).
+                let effective = onboard.unwrap_or(cuteafd_loader::placement::families::deepseek_v4::default_onboard(rtx));
+                match effective {
+                    Onboard::ExpertsFirst { .. } => assert!(placement.pool_tokens >= 262_144, "experts first keeps a 262K pool"),
+                    Onboard::Auto => assert_eq!(placement.pool_tokens, 1 << 20, "24 GiB cards target 1M"),
+                    Onboard::Layers(n) => {
                         assert_eq!(placement.onboard_layers, n);
                         assert!(placement.pool_tokens >= 1 << 20, "a fixed onboard fills the pool past the target");
                     }
@@ -203,10 +206,13 @@ fn planner_equals_runtime_deepseek_v4() {
             let placement = assert_equal(&case, &format!("{model} rtx{rtx} {context}"));
             assert_eq!(placement.pool_tokens, 2 << 20, "{model} rtx{rtx}: pool first reaches 2M");
             if rtx == 2 { assert_eq!(placement.expert_ranges[1].layers > 0, model == "pro", "{model}: GPU1 routed layers"); }
-            // The default: experts first, GPU0 only, a pool between 262K and the target.
+            // The default: pool first on one RTX (the 2M pool), experts first on two (GPU0 only, a
+            // pool between 262K and the target).
             let default = assert_equal(&Case { onboard: None, peer: false, ..case }, &format!("{model} rtx{rtx} {context} default"));
             assert!(default.expert_ranges.get(1).is_none_or(|r| r.layers == 0));
-            assert!((262_144..=2 << 20).contains(&default.pool_tokens));
+            if matches!(cuteafd_loader::placement::families::deepseek_v4::default_onboard(rtx), Onboard::Auto) {
+                assert_eq!(default.pool_tokens, 2 << 20, "{model}: a pool-first default reaches 2M");
+            } else { assert!((262_144..=2 << 20).contains(&default.pool_tokens)); }
             auto.insert((model, rtx, context), placement);
         }
     }

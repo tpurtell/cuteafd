@@ -27,7 +27,7 @@ mod solve;
 #[cfg(test)]
 mod tests;
 
-pub use inventory::{ArchContext, GraphRank, GraphSet, Lifetime, ProgramSet, RuntimeSample, ARCH_CONTEXTS};
+pub use inventory::{loaded_code, ArchContext, GraphRank, GraphSet, Lifetime, LoadedCode, ProgramSet, RuntimeSample, ARCH_CONTEXTS};
 pub use pool::PoolPolicy;
 pub use residual::{hop_buffer_bytes, plan_hops, Hop, HopKind, HopPoint, HopSpec, ResidualHome, Transition, HOP_SLOTS};
 pub use solve::solve;

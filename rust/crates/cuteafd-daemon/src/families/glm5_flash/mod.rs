@@ -1498,7 +1498,10 @@ impl Opened {
                 mark_bytes = marks, "KV admission reserves recurrent state, replay records and prefix marks");
             // Graphs: the startup set's reserve, or the lazy graphs' budget (else the planner's allowance),
             // which they keep too when the startup set leaves no room for a pool (`measured_admission`).
-            let (headroom, later) = (args.headroom_bytes()?, state + marks + future_expert_bytes + reserved_bytes);
+            // The measured code still to load before ready (`placement::inventory::LOADED_CODE`; the
+            // workspaces' untracked runtime memory is part of it).
+            let code = crate::shared::inventory::pending_code(&self.library, args.device, 0, false, "glmf", "*")?;
+            let (headroom, later) = (args.headroom_bytes()?, state + marks + future_expert_bytes + reserved_bytes + code);
             let admitted = cuteafd_loader::serving_capacity::glmf_graphs::solve_graph_pool(initial_pool, |pool| {
                 let startup = graph_reserve_at(pool).and_then(|reserve| reserve.first().copied());
                 measured_admission(args, startup, |graphs| {
@@ -1533,8 +1536,18 @@ impl Opened {
             let plan = engine::StepPlan::new(&self.library, &programs, &self.cfg, &model.layers, None,
                 step_settings(args, index_cache)).with_experts(!args.skip_experts && self.fp8().is_some(), spark);
             let lanes = engine::configured_prefill_lanes(spark, layers == self.cfg.layers, args.prefill_lanes);
-            let workspace_reserve = engine::workspace_reserve(&plan, args.prefill_rows, lanes, peer_stream.is_some(),
-                args.draft.is_some())?;
+            // Each rank's exact workspaces plus the measured code still to load before ready
+            // (`placement::inventory::LOADED_CODE`, which holds the workspaces' untracked runtime
+            // memory); without a measured entry, the per-workspace runtime allowance.
+            let split = devices.len() == 2;
+            let workspace_reserve = match cuteafd_loader::placement::loaded_code("glmf", "*", split, 0) {
+                Some(_) => devices.iter().enumerate().map(|(rank, &device)| Ok(
+                    plan.workspace_bytes(rank, args.prefill_rows, lanes)?
+                        + crate::shared::inventory::pending_code(&self.library, device, rank, split, "glmf", "*")?))
+                    .collect::<Result<Vec<_>>>()?,
+                None => engine::workspace_reserve(&plan, args.prefill_rows, lanes, peer_stream.is_some(),
+                    args.draft.is_some())?,
+            };
             let costs = cuteafd_loader::plan::layout::family_costs("glm5_flash");
             tracing::info!(lanes, workspace_reserve_bytes = ?workspace_reserve,
                 "GLM Flash exact workspace union before KV admission");

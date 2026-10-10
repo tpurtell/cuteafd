@@ -75,6 +75,10 @@ pub struct V4Inputs<'a> {
     pub onboard: Onboard,
     /// Probe-only all-row logits on the lead GPU.
     pub full_prefill_logits: u64,
+    /// Per GPU, the measured code it holds at ready (`placement::inventory::loaded_code`, 0 without an
+    /// entry). Part of the baseline on both sides; on a PRO card the reserve envelope covers it
+    /// (it always did: the code loads after the runtime's sample), so it does not shrink the pool twice.
+    pub code_bytes: Vec<u64>,
 }
 
 /// Prefix mark slots of the V4 arena (`MarkArena::slots_for` over every
@@ -117,8 +121,8 @@ pub fn fixed_demands(inputs: &V4Inputs<'_>) -> Result<(Vec<Demand>, Vec<u64>, Ve
         let workspace = inputs.workspace.as_ref().and_then(|w| w.get(rank)).map(|w| w.fixed_device_bytes)
             .unwrap_or(WORKSPACE_BYTES[role] * inputs.prefill_rows / 4096) + intake;
         let headroom = if inputs.workspace.is_some() {
-            deepseek_v4_headroom_bytes(inputs.gpus[rank].0, inputs.reserve_bytes, workspace + exchange,
-                GRAPH_BYTES[role])
+            deepseek_v4_headroom_bytes(inputs.gpus[rank].0, inputs.reserve_bytes,
+                workspace + exchange + inputs.code_bytes.get(rank).copied().unwrap_or(0), GRAPH_BYTES[role])
         } else {
             inputs.reserve_bytes.saturating_sub(workspace + exchange + GRAPH_BYTES[role]).max(3 << 30)
         }.max(inputs.headroom_floor);
@@ -199,10 +203,23 @@ pub fn request(inputs: &V4Inputs<'_>) -> Result<PlacementRequest, PlacementError
     })
 }
 
-/// V4's default onboard until TP2 experts (P4): v2's experts-first policy.
-/// Pool first (`auto`) is opt-in: on the 1-RTX minimum configs it trades two
-/// RTX expert layers for the 2M pool, -5..6% C1 (v3-p1 A/B).
+/// Each coordinator GPU's measured loaded code (`placement::inventory::LOADED_CODE`) for a V4
+/// model of hidden size `dim` on `gpus` GPUs.
+pub fn code_bytes(dim: usize, gpus: usize) -> Vec<u64> {
+    let family = if dim == 4096 { "dsv4f" } else { "dsv4p" };
+    (0..gpus).map(|rank| crate::placement::loaded_code(family, "*", gpus == 2, rank as u8).map_or(0, |c| c.bytes))
+        .collect()
+}
+
+/// V4's experts-first policy (v2's default; `RTX_EXPERT_LAYERS=max`).
 pub const DEFAULT_ONBOARD: Onboard = Onboard::ExpertsFirst { pool_floor: crate::placement::EXPERTS_FIRST_POOL_FLOOR };
+
+/// V4's default onboard on `gpus` coordinator GPUs: experts first until the
+/// 1-RTX pool-first A/B lands. `RTX_EXPERT_LAYERS=max` selects experts-first
+/// on any layout.
+pub fn default_onboard(_gpus: usize) -> Onboard {
+    DEFAULT_ONBOARD
+}
 
 /// Whether routed layers may also live on GPU1: opted in, and only for EXL3
 /// packages (per-device executions). Native `rtx_backbone` binds each capacity

@@ -94,6 +94,90 @@ impl ArchContext {
     }
 }
 
+/// Native code a family's serving process holds on a coordinator GPU at ready,
+/// beyond [`ArchContext::context_bytes`] and outside its tracked allocations
+/// and captured startup graphs: the selected program modules
+/// (`CUDA_MODULE_LOADING=LAZY` loads each function's code on first launch),
+/// the cuBLAS handle, expert-package modules (fp8moe/EXL3 libraries), the
+/// transport's device mappings and the runtime's per-stream bookkeeping.
+/// Measured per serving configuration from the ready ledger as
+/// `untracked - startup graphs - context` (v3-p2 cards, RTX PRO 6000 SM120,
+/// driver 595.91.07, CUDA 13.2, 2026-10-10).
+///
+/// The planner charges `bytes` (with the context) as the GPU's runtime
+/// baseline. The runtime's admission sample already holds part of it (the
+/// modules, an expert package, cuBLAS when a weight load ran a GEMM), so serve
+/// reserves only what is still missing at its sample ([`LoadedCode::pending`]).
+/// Both sides then reach the same ready ledger.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct LoadedCode {
+    /// Program family: `qwen4`, `mimo` (all MiMo sizes), `dsv4` (Flash and
+    /// Pro), `glmf`.
+    pub family: &'static str,
+    /// Local expert package on this GPU: `exl3`, `fp8` (fp8moe/NVFP4), `none`
+    /// (Spark experts), or `*` (measured not to depend on it).
+    pub experts: &'static str,
+    /// Head-split layout (two coordinator GPUs).
+    pub split: bool,
+    /// 0: lead GPU, 1: the head-split peer.
+    pub rank: u8,
+    pub bytes: u64,
+    pub source: &'static str,
+}
+
+/// The measured table ([`loaded_code`]).
+pub const LOADED_CODE: &[LoadedCode] = &[
+    LoadedCode { family: "qwen4", experts: "exl3", split: false, rank: 0, bytes: 780_221_844,
+        source: "qwen38-exl3-min: untracked 5,936,332,180 - graphs 4,569,694,208 - context 586,416,128" },
+    LoadedCode { family: "qwen4", experts: "fp8", split: false, rank: 0, bytes: 1_089_736_388,
+        source: "qwen38-nvfp4-min: untracked 6,245,846,724 - graphs 4,569,694,208 - context 586,416,128" },
+    LoadedCode { family: "mimo", experts: "*", split: false, rank: 0, bytes: 261_483_520,
+        source: "mimo26-flash-min: untracked 847,899,648 - context 586,416,128" },
+    LoadedCode { family: "mimo", experts: "*", split: true, rank: 0, bytes: 365_259_264,
+        source: "mimo26-flash-max rtx0: untracked 951,675,392 - context 586,416,128" },
+    LoadedCode { family: "mimo", experts: "*", split: true, rank: 1, bytes: 165_460_992,
+        source: "mimo26-flash-max rtx1: untracked 751,877,120 - context 586,416,128" },
+    LoadedCode { family: "dsv4", experts: "*", split: false, rank: 0, bytes: 322_050_368,
+        source: "v4-flash-sim5090 (0 RTX layers): untracked 908,466,496 - context 586,416,128; \
+            v4-flash-min p0 (18 FP8 layers) 309,476,320" },
+    LoadedCode { family: "dsv4", experts: "*", split: true, rank: 0, bytes: 560_200_800,
+        source: "v4-flash-max p0 rtx0 (19 layers): untracked 1,146,616,928 - context 586,416,128" },
+    LoadedCode { family: "dsv4", experts: "*", split: true, rank: 1, bytes: 260_349_424,
+        source: "v4-flash-max p0 rtx1: untracked 846,765,552 - context 586,416,128" },
+    LoadedCode { family: "glmf", experts: "*", split: false, rank: 0, bytes: 436_389_024,
+        source: "glm53f-exl3-min: untracked 2,968,962,208 - graphs 1,946,157,056 - context 586,416,128" },
+    LoadedCode { family: "glmf", experts: "*", split: true, rank: 0, bytes: 500_143_488,
+        source: "glm53f-exl3-max rtx0: untracked 3,317,929,344 - graphs 2,231,369,728 - context 586,416,128" },
+    LoadedCode { family: "glmf", experts: "*", split: true, rank: 1, bytes: 215_091_456,
+        source: "glm53f-exl3-max rtx1: untracked 3,085,306,112 - graphs 2,283,798,528 - context 586,416,128" },
+];
+
+/// The table's family key of a program family (`dsv4f`, `mimop2`, ...).
+pub fn loaded_code_family(program_family: &str) -> &str {
+    let base = program_family.trim_end_matches('2');
+    if base.starts_with("mimo") { "mimo" } else if base.starts_with("dsv4") { "dsv4" } else { base }
+}
+
+/// The measured loaded code of `program_family` with `experts` on coordinator
+/// `rank` of a (`split`) layout: the exact entry, else the family's entry for
+/// any experts on that rank; `None` for a family the table does not measure
+/// (the caller keeps its module formula).
+pub fn loaded_code(program_family: &str, experts: &str, split: bool, rank: u8) -> Option<&'static LoadedCode> {
+    let family = loaded_code_family(program_family);
+    let at = |c: &&LoadedCode| c.family == family && c.split == split && c.rank == rank;
+    LOADED_CODE.iter().filter(at).find(|c| c.experts == experts || c.experts == "*")
+        .or_else(|| LOADED_CODE.iter().find(at))
+}
+
+impl LoadedCode {
+    /// The part serve still reserves at an admission sample whose used bytes
+    /// beyond this process's tracked allocations are `untracked_at_sample`
+    /// (`total - free - tracked`; the CUDA context included).
+    pub fn pending(&self, untracked_at_sample: u64, context_bytes: u64) -> u64 {
+        self.bytes.saturating_sub(untracked_at_sample.saturating_sub(context_bytes))
+    }
+}
+
 /// One GPU's measured inventory: one sample after the CUDA context, cuBLAS and
 /// the family's program modules, before any weight.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -288,6 +372,20 @@ pub fn exl3_capacities(rows: u64) -> Vec<u64> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn loaded_code_keys_family_split_rank_and_experts() {
+        assert_eq!(loaded_code("qwen4", "fp8", false, 0).unwrap().bytes, 1_089_736_388);
+        assert_eq!(loaded_code("qwen4", "exl3", false, 0).unwrap().bytes, 780_221_844);
+        // An unmeasured package falls back to the family's rank entry.
+        assert!(loaded_code("qwen4", "none", false, 0).is_some());
+        assert_eq!(loaded_code("dsv4p2", "fp8", true, 1).unwrap().bytes, 260_349_424);
+        assert_eq!(loaded_code("mimop", "none", true, 0).unwrap().bytes, 365_259_264);
+        assert!(loaded_code("glm", "fp8", false, 0).is_none());
+        let code = loaded_code("glmf", "exl3", false, 0).unwrap();
+        assert_eq!(code.pending(586_416_128 + 100, 586_416_128), code.bytes - 100);
+        assert_eq!(code.pending(586_416_128 + (1 << 40), 586_416_128), 0);
+    }
 
     #[test]
     fn exl3_capacities_list_4096_once() {

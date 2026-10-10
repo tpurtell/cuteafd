@@ -158,12 +158,13 @@ fn parse_onboard(text: &str) -> std::result::Result<cuteafd_loader::placement::O
 
 impl EngineArgs {
     /// The resolved `--rtx-expert-layers` / `--local-expert-layers`.
-    pub(crate) fn onboard(&self) -> Result<cuteafd_loader::placement::Onboard> {
+    /// The RTX expert policy on `gpus` serving GPUs (the head split as resolved, not as requested).
+    pub(crate) fn onboard(&self, gpus: usize) -> Result<cuteafd_loader::placement::Onboard> {
         use cuteafd_loader::placement::Onboard;
         Ok(match (self.rtx_expert_layers, self.local_expert_layers) {
             (Some(onboard), _) => onboard,
             (None, Some(layers)) => Onboard::Layers(layers),
-            (None, None) => cuteafd_loader::placement::families::deepseek_v4::DEFAULT_ONBOARD,
+            (None, None) => cuteafd_loader::placement::families::deepseek_v4::default_onboard(gpus),
         })
     }
 
@@ -320,13 +321,19 @@ pub(crate) fn with_engine<T>(
         use cuteafd_loader::placement::{Baseline, Onboard};
         ensure!(args.max_sequences > 0, "--max-sequences must be positive");
         let devices: Vec<_> = std::iter::once(args.device).chain(split_device).collect();
-        let gpus = devices.iter().map(|&device| crate::shared::peer_split::on_device(
-            &loaded.library, device, args.device, || {
+        // Each GPU's free bytes less the measured code still to load before ready (lazily loaded
+        // functions, cuBLAS: `placement::inventory::LOADED_CODE`), which the planner charges in its
+        // baseline.
+        let gpus = devices.iter().enumerate().map(|(rank, &device)| {
+            let pending = crate::shared::inventory::pending_code(&loaded.library, device, rank, devices.len() == 2,
+                loaded.family, "*")?;
+            crate::shared::peer_split::on_device(&loaded.library, device, args.device, || {
                 let (free, total) = loaded.library.cuda_memory_info()?;
-                Ok((total as u64, Baseline::Measured { free_bytes: free as u64 }))
-            })).collect::<Result<Vec<_>>>()?;
+                Ok((total as u64, Baseline::Measured { free_bytes: (free as u64).saturating_sub(pending) }))
+            })
+        }).collect::<Result<Vec<_>>>()?;
         let cache_stages = model.dspark.as_ref().map_or(0, |d| d.stages.len());
-        let onboard = args.onboard()?;
+        let onboard = args.onboard(devices.len())?;
         let stages = if args.dspark && !args.skip_routed_experts { cache_stages } else { 0 };
         let expert_workspace = if args.skip_routed_experts || (onboard == Onboard::Layers(0) && stages == 0) { Some(0) }
             else { local::workspace_bytes(&loaded.library, &args.native_lib, &loaded.catalog,

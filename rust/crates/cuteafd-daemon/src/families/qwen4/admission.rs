@@ -26,7 +26,12 @@ pub(super) fn inputs<'a>(args: &EngineArgs, cfg: &'a Qwen4Config, layers: usize,
 /// the shared admission's fixed items and, with startup graphs, the largest pool whose own graph set
 /// fits beside them.
 pub(super) fn pool_tokens(library: &NativeLibrary, args: &EngineArgs, inputs: &QwenAdmissionInputs<'_>) -> Result<usize> {
-    let admission = qwen_admission(inputs)?;
+    let mut admission = qwen_admission(inputs)?;
+    // The measured code still to load before ready (lazily loaded functions, cuBLAS, the expert
+    // package's modules: `placement::inventory::LOADED_CODE`), which the planner charges in its baseline.
+    let experts = if args.peers.is_some() { "none" } else if inputs.future_expert_bytes > 0 { "exl3" } else { "fp8" };
+    let pending = crate::shared::inventory::pending_code(library, args.device, 0, false, "qwen4", experts)?;
+    if pending > 0 { admission.items.push((cuteafd_core::memory_layout::Category::Runtime, "loaded code", pending)); }
     let target = cuteafd_core::serving_capacity::DEFAULT_GPU_KV_TOKENS;
     let requested = (args.pool_tokens > 0).then_some(args.pool_tokens as u64);
     let enabled = super::engine::startup_graphs_enabled(
