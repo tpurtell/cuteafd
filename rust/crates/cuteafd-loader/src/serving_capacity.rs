@@ -12,6 +12,7 @@ use thiserror::Error;
 mod deepseek;
 mod exl3_workspace;
 pub use exl3_workspace::exl3_workspace_bytes;
+pub mod glmf_graphs;
 mod glmf_workspace;
 pub use glmf_workspace::{glmf_expert_rows, glmf_lane_bytes, glmf_manifest_scratch, glmf_selector_bytes,
     glmf_spark_intake_bytes, glmf_step_scratch,
