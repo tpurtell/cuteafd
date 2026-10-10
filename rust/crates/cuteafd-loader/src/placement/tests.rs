@@ -127,6 +127,11 @@ fn experts_first_fills_layers_above_the_pool_floor() {
     assert!(single.pool_tokens >= 262_144);
     let auto = solve(&request(1, 44 * GIB, 60, 4, Onboard::Auto)).unwrap();
     assert!(auto.onboard_layers < single.onboard_layers && auto.pool_tokens > single.pool_tokens);
+    // An explicit pool is exact: the most layers that still leave it.
+    one.pool.requested = Some(1 << 20);
+    let explicit = solve(&one).unwrap();
+    assert_eq!(explicit.pool_tokens, 1 << 20);
+    assert_eq!(explicit.onboard_layers, 27);
 }
 
 #[test]

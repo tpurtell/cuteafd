@@ -837,8 +837,10 @@ fn v4_workspace_plan_matches_runtime_below_compiled_context() {
                 rtx_bytes: vec![total], context_tokens: context, pool_tokens: Some(32768),
                 workspace_manifest: Some(path.clone()), ..Default::default()
             }), ..sparks(2) }).unwrap();
-            let device = report.memory_layout.unwrap().devices.remove(0);
-            let steps = device.items.iter().find(|i| i.group == "steps").unwrap();
+            let mut layout = report.memory_layout.unwrap();
+            let notes = layout.notes.clone();
+            let device = layout.devices.remove(0);
+            let steps = device.items.iter().find(|i| i.group == "steps").unwrap_or_else(|| panic!("{gib} {context}: {notes:?}"));
             let intake = 2 * 2 * 4096 * cfg.dim as u64 * 2;
             assert_eq!((steps.bytes, steps.basis), (runtime[0].fixed_device_bytes + intake, Basis::Formula));
             let graph = layout::family_costs("deepseek_v4").graph_bytes[0];
@@ -868,8 +870,9 @@ fn v4_missing_workspace_manifest_keeps_conservative_small_card_reserve() {
 fn v4_pool_first_defaults_and_explicit_layer_failure() {
     let dir = v4_snapshot();
     let solve = |bytes, pool_tokens, local_expert_layers| plan(dir.path(), &PlanOptions {
-        layout: Some(layout::LayoutOptions { rtx_bytes: vec![bytes], pool_tokens,
-            local_expert_layers, ..Default::default() }), ..sparks(2)
+        layout: Some(layout::LayoutOptions { rtx_bytes: vec![bytes], pool_tokens, local_expert_layers,
+            onboard: local_expert_layers.is_none().then_some(crate::placement::Onboard::Auto), ..Default::default() }),
+        ..sparks(2)
     }).unwrap();
     let large = solve(96 << 30, None, None);
     assert_eq!(large.memory_layout.unwrap().pool_tokens, 2 << 20);
@@ -887,7 +890,7 @@ fn v4_pool_first_defaults_and_explicit_layer_failure() {
         "{:?}", rejected.memory_layout.as_ref().unwrap().notes);
     // A fixed onboard alone makes the pool the output: above the 1M target here.
     let fixed = plan(dir.path(), &PlanOptions { layout: Some(layout::LayoutOptions { rtx_bytes: vec![24 << 30],
-        onboard: crate::placement::Onboard::Layers(1), ..Default::default() }), ..sparks(2) }).unwrap();
+        onboard: Some(crate::placement::Onboard::Layers(1)), ..Default::default() }), ..sparks(2) }).unwrap();
     assert!(fixed.placement_supported);
     assert!(fixed.memory_layout.unwrap().pool_tokens > 1 << 20);
 }

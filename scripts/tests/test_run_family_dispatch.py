@@ -332,13 +332,22 @@ def test_deepseek_v4_honors_explicit_local_expert_limit(tmp_path, value):
     result = _family_launch_result(tmp_path, {"model_type": "deepseek_v4"}, "test/dsv4", keys)
     assert result.returncode == 0, result.stderr
     launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-dsv4" in line)
-    if value in (None, "auto"):
+    if value is None:
         assert "--local-expert-layers" not in launch and "--rtx-expert-layers" not in launch
     elif value.isdigit():
         # Whole layer counts keep the flag older images accept.
         assert f"--local-expert-layers {value}" in launch
     else:
         assert f"--rtx-expert-layers {value}" in launch
+
+
+@pytest.mark.parametrize("value,flag", [(None, False), ("off", False), ("on", True)])
+def test_deepseek_v4_peer_expert_ranges_are_opt_in(tmp_path, value, flag):
+    keys = "" if value is None else f"RTX_EXPERT_PEER={value}\n"
+    result = _family_launch_result(tmp_path, {"model_type": "deepseek_v4"}, "test/dsv4", keys)
+    assert result.returncode == 0, result.stderr
+    launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-dsv4" in line)
+    assert ("--peer-expert-ranges" in launch) == flag
 
 
 @pytest.mark.parametrize("value", ["-1", "101%", "half", "5x"])

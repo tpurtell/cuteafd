@@ -191,10 +191,17 @@ pub fn request(inputs: &V4Inputs<'_>) -> Result<PlacementRequest, PlacementError
     })
 }
 
-/// Whether this checkpoint's coordinator expert package runs on both GPUs of
-/// one process (EXL3) or only on the first (native `rtx_backbone`).
-pub fn peer_experts(catalog: &crate::OfficialV41Catalog) -> bool {
-    catalog.exl3().is_some()
+/// V4's default onboard until TP2 experts (P4): v2's experts-first policy.
+/// Pool first (`auto`) is opt-in: on the 1-RTX minimum configs it trades two
+/// RTX expert layers for the 2M pool, -5..6% C1 (v3-p1 A/B).
+pub const DEFAULT_ONBOARD: Onboard = Onboard::ExpertsFirst { pool_floor: crate::placement::EXPERTS_FIRST_POOL_FLOOR };
+
+/// Whether routed layers may also live on GPU1: opted in, and only for EXL3
+/// packages (per-device executions). Native `rtx_backbone` binds each capacity
+/// to the first device that initializes it; the GPU1 EXL3 range executor
+/// deadlocks two-lane prefill (peer_wait), so it stays opt-in until P3/P4.
+pub fn peer_experts(catalog: &crate::OfficialV41Catalog, opt_in: bool) -> bool {
+    opt_in && catalog.exl3().is_some()
 }
 
 /// Whole-layer residency of every routed backbone layer and `stages` dSpark

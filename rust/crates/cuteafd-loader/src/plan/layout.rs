@@ -99,10 +99,12 @@ pub struct LayoutOptions {
     /// Whole routed backbone layers resident on the coordinator.
     pub local_expert_layers: Option<usize>,
     /// Families on the shared solver (V4): how many routed layers are
-    /// RTX-resident (`--rtx-expert-layers auto|N|N%|all`); a fixed onboard
-    /// makes the KV pool the output. `local_expert_layers` maps onto
-    /// `Layers(n)` when this is `Auto`.
-    pub onboard: crate::placement::Onboard,
+    /// RTX-resident (`--rtx-expert-layers auto|max|N|N%|all`); a fixed onboard
+    /// makes the KV pool the output. `None` takes the family default (V4:
+    /// `max`); `local_expert_layers` maps onto `Layers(n)` when unset.
+    pub onboard: Option<crate::placement::Onboard>,
+    /// V4: let EXL3 routed layers fill GPU1 too (`--peer-expert-ranges`).
+    pub peer_expert_ranges: bool,
     /// Matching image's PROGRAMS.json for exact V4 workspace geometry.
     pub workspace_manifest: Option<std::path::PathBuf>,
 }
@@ -144,7 +146,8 @@ impl Default for LayoutOptions {
             context_tokens: 0,
             native_mtp_layers: 3,
             local_expert_layers: None,
-            onboard: crate::placement::Onboard::Auto,
+            onboard: None,
+            peer_expert_ranges: false,
             workspace_manifest: None,
         }
     }
@@ -1111,14 +1114,15 @@ fn deepseek_v4_placement(report: &PlanReport, checkpoint: &super::Checkpoint,
         shape.cache_native_layers, shape.concurrency, options.mimo_prefix_entries, options.mimo_prefix_mark_bytes),
         Ok)?;
     let onboard = match (options.onboard, options.local_expert_layers) {
-        (Onboard::Auto, Some(n)) => Onboard::Layers(n.saturating_sub(routed.first_layer)),
-        (onboard, _) => onboard,
+        (Some(onboard), _) => onboard,
+        (None, Some(n)) => Onboard::Layers(n.saturating_sub(routed.first_layer)),
+        (None, None) => v4::DEFAULT_ONBOARD,
     };
     let inputs = v4::V4Inputs { cfg: &cfg, cache_stages: shape.cache_native_layers, gpus, headroom_floor: options.headroom_bytes,
         spark_ranks, sequences: shape.concurrency, prefill_rows: shape.prefill_rows, decode_rows: shape.decode_rows,
         max_context: shape.context_tokens, reserve_bytes: v4::RESERVE_BYTES, mark_slots, workspace: shape.workspace,
         experts, draft, expert_workspace, first_routed: routed.first_layer,
-        peer_experts: v4::peer_experts(&catalog),
+        peer_experts: v4::peer_experts(&catalog, options.peer_expert_ranges),
         requested_pool: options.pool_tokens.filter(|&n| n > 0), onboard,
         full_prefill_logits: 0 };
     let request = v4::request(&inputs)?;

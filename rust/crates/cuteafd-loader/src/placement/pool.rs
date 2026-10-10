@@ -28,8 +28,14 @@ impl PoolPolicy {
         spark_free: bool) -> Self {
         let small = card_bytes.iter().any(|&bytes| bytes <= SMALL_CARD_BYTES);
         let target = if small { SMALL_CARD_POOL_TOKENS } else { DEFAULT_GPU_KV_TOKENS }.max(context);
-        let floor = if spark_free && requested.is_none_or(|n| n == 0) { context.max(AGENTIC_FLOOR_TOKENS) }
-            else { context };
+        // An explicit pool is its own floor (the serving context is clamped to
+        // it later); automatic pools keep the compiled context, and Spark-free
+        // ones the agentic floor too.
+        let floor = match requested.filter(|&n| n > 0) {
+            Some(n) => n,
+            None if spark_free => context.max(AGENTIC_FLOOR_TOKENS),
+            None => context,
+        };
         Self { requested: requested.filter(|&n| n > 0), target, floor, ceiling: u64::MAX, unit_rows }
     }
 
@@ -52,8 +58,8 @@ mod tests {
         assert_eq!(PoolPolicy::resolve(&[96 * gib], 131_072, None, 256, false).target, 2 << 20);
         assert_eq!(PoolPolicy::resolve(&[96 * gib, 32 * gib], 131_072, None, 256, false).target, 1 << 20);
         assert_eq!(PoolPolicy::resolve(&[32 * gib], 1 << 21, None, 256, false).target, 1 << 21);
-        let explicit = PoolPolicy::resolve(&[96 * gib], 131_072, Some(262_144), 256, true);
-        assert_eq!((explicit.requested, explicit.floor), (Some(262_144), 131_072));
+        let explicit = PoolPolicy::resolve(&[96 * gib], 131_072, Some(32_768), 256, true);
+        assert_eq!((explicit.requested, explicit.floor), (Some(32_768), 32_768));
         assert_eq!(PoolPolicy::resolve(&[96 * gib], 131_072, Some(0), 256, true).floor, AGENTIC_FLOOR_TOKENS);
         assert_eq!(PoolPolicy::resolve(&[96 * gib], 131_072, Some(0), 256, true).requested, None);
     }

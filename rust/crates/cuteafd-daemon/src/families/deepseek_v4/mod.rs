@@ -58,15 +58,19 @@ pub(crate) struct EngineArgs {
     #[arg(long, default_value_t = 0)]
     pub pool_tokens: usize,
     /// Routed-expert layers to keep on the coordinator GPUs (from layer 0):
-    /// `auto` reserves the KV pool first and fills what is left; `max` places
-    /// the most layers that still leave a 262K pool (v2's policy); `N`, `N%`
-    /// or `all` fix the RTX layers and the KV pool takes every remaining
-    /// byte. 0 sends every layer to the Sparks.
+    /// `max` (the default) places the most layers that still leave a 262K
+    /// pool (v2's policy); `auto` reserves the 2M KV pool first and fills
+    /// what is left; `N`, `N%` or `all` fix the RTX layers and the KV pool
+    /// takes every remaining byte. 0 sends every layer to the Sparks.
     #[arg(long, value_parser = parse_onboard, conflicts_with = "local_expert_layers")]
     pub rtx_expert_layers: Option<cuteafd_loader::placement::Onboard>,
     /// Alias of `--rtx-expert-layers N`.
     #[arg(long)]
     pub local_expert_layers: Option<usize>,
+    /// Let EXL3 routed-expert layers fill GPU1 too under --split-device
+    /// (opt-in: its two-lane prefill exchange is not yet qualified).
+    #[arg(long)]
+    pub peer_expert_ranges: bool,
     /// Keep the dSpark drafter's stage experts on the coordinator GPU (before
     /// backbone layers) so the engine can draft.
     #[arg(long)]
@@ -159,12 +163,12 @@ impl EngineArgs {
         Ok(match (self.rtx_expert_layers, self.local_expert_layers) {
             (Some(onboard), _) => onboard,
             (None, Some(layers)) => Onboard::Layers(layers),
-            (None, None) => Onboard::Auto,
+            (None, None) => cuteafd_loader::placement::families::deepseek_v4::DEFAULT_ONBOARD,
         })
     }
 
     pub(crate) fn fixed_onboard(&self) -> bool {
-        !matches!(self.onboard(), Ok(cuteafd_loader::placement::Onboard::Auto))
+        self.rtx_expert_layers.is_some() || self.local_expert_layers.is_some()
     }
 }
 

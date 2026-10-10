@@ -27,14 +27,16 @@ struct Case<'a> {
     sparks: usize,
     context: u64,
     budget: u64,
-    onboard: Onboard,
+    /// `None`: the family default (no flag on either side).
+    onboard: Option<Onboard>,
     dspark: bool,
+    peer: bool,
 }
 
 fn planned(case: &Case<'_>) -> (MemoryLayout, bool, Vec<String>) {
     let report = plan(case.snapshot, &PlanOptions { placement: ExpertPlacement::from_spark_ranks(case.sparks),
         layout: Some(LayoutOptions { rtx_bytes: vec![case.budget; case.rtx], context_tokens: case.context,
-            workspace_manifest: Some(case.manifest.to_path_buf()), onboard: case.onboard,
+            workspace_manifest: Some(case.manifest.to_path_buf()), onboard: case.onboard, peer_expert_ranges: case.peer,
             native_mtp_layers: if case.dspark { 3 } else { 0 }, headroom_bytes: 0, ..Default::default() }),
         ..Default::default() }).unwrap();
     let hints = report.hints.iter().map(|h| h.what.clone()).collect();
@@ -48,10 +50,10 @@ fn runtime(case: &Case<'_>, layout: &MemoryLayout) -> anyhow::Result<Placement> 
     let cfg = cuteafd_loader::families::deepseek_v4::DeepseekV4Config::read(case.snapshot, 1)?;
     let family = if cfg.dim == 4096 { "dsv4f" } else { "dsv4p" };
     let peers = (0..case.sparks).map(|r| format!("10.0.0.{}:1970{r}", r + 1)).collect::<Vec<_>>().join(",");
-    let onboard = case.onboard.to_string();
     let mut argv = vec!["serve".to_string(), "--snapshot".into(), case.snapshot.display().to_string(),
-        "--native-lib".into(), "/nonexistent/libcuteafd.so".into(), "--peers".into(), peers,
-        "--rtx-expert-layers".into(), onboard];
+        "--native-lib".into(), "/nonexistent/libcuteafd.so".into(), "--peers".into(), peers];
+    if let Some(onboard) = case.onboard { argv.extend(["--rtx-expert-layers".into(), onboard.to_string()]); }
+    if case.peer { argv.push("--peer-expert-ranges".into()); }
     if case.rtx == 2 { argv.extend(["--split-device".into(), "1".into()]); }
     if case.dspark { argv.push("--dspark".into()); }
     let cli = Cli::try_parse_from(argv)?;
@@ -140,17 +142,18 @@ fn planner_equals_runtime_deepseek_v4_fixture() {
     let manifest = synthetic(dir.path());
     for (rtx, budget) in [(1, 24u64 << 30), (2, 24 << 30)] {
         for context in [131_072, 1_048_576] {
-            for onboard in [Onboard::Auto, Onboard::Layers(2), Onboard::Layers(0)] {
+            for onboard in [None, Some(Onboard::Auto), Some(Onboard::Layers(2)), Some(Onboard::Layers(0))] {
                 let case = Case { snapshot: dir.path(), manifest: &manifest, rtx, sparks: 2, context, budget,
-                    onboard, dspark: false };
-                let placement = assert_equal(&case, &format!("fixture rtx{rtx} {context} {onboard}"));
+                    onboard, dspark: false, peer: false };
+                let placement = assert_equal(&case, &format!("fixture rtx{rtx} {context} {onboard:?}"));
                 match onboard {
-                    Onboard::Auto => assert_eq!(placement.pool_tokens, 1 << 20, "24 GiB cards target 1M"),
-                    Onboard::Layers(n) => {
+                    None => assert!(placement.pool_tokens >= 262_144, "experts first keeps a 262K pool"),
+                    Some(Onboard::Auto) => assert_eq!(placement.pool_tokens, 1 << 20, "24 GiB cards target 1M"),
+                    Some(Onboard::Layers(n)) => {
                         assert_eq!(placement.onboard_layers, n);
                         assert!(placement.pool_tokens >= 1 << 20, "a fixed onboard fills the pool past the target");
                     }
-                    Onboard::Fraction(_) | Onboard::ExpertsFirst { .. } => unreachable!(),
+                    _ => unreachable!(),
                 }
             }
         }
@@ -189,12 +192,16 @@ fn planner_equals_runtime_deepseek_v4() {
         for (model, snapshot, rtx, sparks) in [("flash", &flash, 1, 2), ("flash", &flash, 2, 4),
             ("pro", &pro, 1, 4), ("pro", &pro, 2, 6)] {
             let manifest = inputs.join(format!("{model}-{rtx}-{context}/PROGRAMS.json"));
-            let case = Case { snapshot, manifest: &manifest, rtx, sparks, context, budget, onboard: Onboard::Auto,
-                dspark: true };
+            // Pool first with GPU1 ranges opted in (EXL3 only; native binds to GPU0).
+            let case = Case { snapshot, manifest: &manifest, rtx, sparks, context, budget,
+                onboard: Some(Onboard::Auto), dspark: true, peer: true };
             let placement = assert_equal(&case, &format!("{model} rtx{rtx} {context}"));
             assert_eq!(placement.pool_tokens, 2 << 20, "{model} rtx{rtx}: pool first reaches 2M");
-            // EXL3 runs on both GPUs; native rtx_backbone binds to GPU0 (until P4).
             if rtx == 2 { assert_eq!(placement.expert_ranges[1].layers > 0, model == "pro", "{model}: GPU1 routed layers"); }
+            // The default: experts first, GPU0 only, a pool between 262K and the target.
+            let default = assert_equal(&Case { onboard: None, peer: false, ..case }, &format!("{model} rtx{rtx} {context} default"));
+            assert!(default.expert_ranges.get(1).is_none_or(|r| r.layers == 0));
+            assert!((262_144..=2 << 20).contains(&default.pool_tokens));
             auto.insert((model, rtx, context), placement);
         }
     }
@@ -208,7 +215,7 @@ fn planner_equals_runtime_deepseek_v4() {
     for (model, snapshot, sparks) in [("flash", &flash, 2), ("pro", &pro, 4)] {
         let manifest = inputs.join(format!("{model}-1-1048576/PROGRAMS.json"));
         let case = Case { snapshot, manifest: &manifest, rtx: 1, sparks, context: 1_048_576, budget,
-            onboard: Onboard::ExpertsFirst { pool_floor: 262_144 }, dspark: true };
+            onboard: Some(Onboard::ExpertsFirst { pool_floor: 262_144 }), dspark: true, peer: false };
         let placement = assert_equal(&case, &format!("{model} min max"));
         assert!(placement.onboard_layers > auto[&(model, 1, 1_048_576)].onboard_layers);
         assert!((262_144..2 << 20).contains(&placement.pool_tokens));
@@ -217,19 +224,19 @@ fn planner_equals_runtime_deepseek_v4() {
     for context in [131_072u64, 1_048_576] {
         let manifest = inputs.join(format!("flash-2-{context}/PROGRAMS.json"));
         let case = Case { snapshot: &flash, manifest: &manifest, rtx: 2, sparks: 4, context, budget,
-            onboard: Onboard::Auto, dspark: true };
+            onboard: Some(Onboard::Auto), dspark: true, peer: true };
         // Native MXFP4 layers stay on GPU0: 15 fit beside a fixed onboard's
         // minimum pool; Pro EXL3 max splits half of its 61 over both GPUs.
-        let placement = assert_equal(&Case { onboard: Onboard::Layers(12), ..case }, &format!("flash max {context} onboard 12"));
+        let placement = assert_equal(&Case { onboard: Some(Onboard::Layers(12)), ..case }, &format!("flash max {context} onboard 12"));
         assert_eq!((placement.onboard_layers, placement.expert_ranges[1].layers), (12, 0));
         assert!(placement.pool_tokens > 2 << 20, "fewer layers than auto leave a pool above the target");
         let manifest = inputs.join(format!("pro-2-{context}/PROGRAMS.json"));
         let pro_case = Case { snapshot: &pro, manifest: &manifest, rtx: 2, sparks: 6, context, budget,
-            onboard: Onboard::Layers(6), dspark: true };
+            onboard: Some(Onboard::Layers(6)), dspark: true, peer: true };
         let pro_fixed = assert_equal(&pro_case, &format!("pro max {context} onboard 6"));
         assert_eq!(pro_fixed.onboard_layers, 6);
         assert!(pro_fixed.expert_ranges[1].layers > 0 && pro_fixed.pool_tokens > 2 << 20);
-        let percent = Case { onboard: Onboard::Fraction(0.1), ..pro_case };
+        let percent = Case { onboard: Some(Onboard::Fraction(0.1)), ..pro_case };
         assert_eq!(assert_equal(&percent, "pro max 10%").onboard_layers, 6);
     }
 }

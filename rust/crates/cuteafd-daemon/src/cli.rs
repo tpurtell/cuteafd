@@ -306,6 +306,9 @@ pub(crate) struct PlanArgs {
     /// --local-expert-layers.
     #[arg(long, value_parser = |text: &str| text.parse::<cuteafd_loader::placement::Onboard>())]
     pub(crate) rtx_expert_layers: Option<cuteafd_loader::placement::Onboard>,
+    /// V4: let EXL3 routed layers fill GPU1 too (serve-dsv4 --peer-expert-ranges).
+    #[arg(long)]
+    pub(crate) peer_expert_ranges: bool,
     /// Compiled maximum context for table and workspace reservations (0: family/image default).
     #[arg(long, default_value_t = 0)]
     pub(crate) context_tokens: u64,

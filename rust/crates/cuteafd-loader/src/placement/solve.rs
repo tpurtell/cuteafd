@@ -95,16 +95,21 @@ pub fn solve(request: &PlacementRequest) -> Result<Placement, PlacementError> {
     // floor (pool output is monotone in the layer count, so bisect).
     let fixed_layers = match (fixed_layers, request.onboard) {
         (None, Onboard::ExpertsFirst { pool_floor }) => {
+            // An explicit pool is the floor the layers must leave (and then the pool).
+            let floor = request.pool.requested.unwrap_or(pool_floor).max(request.pool.floor);
             let fits = |n: usize| -> bool {
                 let mut trial = request.clone();
                 trial.onboard = Onboard::Layers(n);
                 trial.pool.requested = None;
-                trial.pool.floor = pool_floor.max(request.pool.floor);
+                trial.pool.floor = floor;
                 solve(&trial).is_ok()
             };
             let (mut lo, mut hi) = (0usize, routed);
-            if !fits(0) { return Err(PlacementError::Mandatory { gpu: 0,
-                what: format!("a {pool_floor}-token pool beside {}", describe(&request.fixed, 0, &movables)) }); }
+            if !fits(0) { return Err(match request.pool.requested {
+                Some(requested) => PlacementError::PoolDoesNotFit { requested, fit: 0 },
+                None => PlacementError::Mandatory { gpu: 0,
+                    what: format!("a {floor}-token pool beside {}", describe(&request.fixed, 0, &movables)) },
+            }); }
             while lo < hi {
                 let mid = (lo + hi + 1) / 2;
                 if fits(mid) { lo = mid } else { hi = mid - 1 }
