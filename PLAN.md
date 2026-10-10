@@ -3701,13 +3701,13 @@ Measure BF16 partials first, and FP32 only if the quick tier misses.
 
 **Modes.**
 - **Mode:** P3's `Whole{gpu, Split}` on every MLA/DSA/CSA layer. Ownership
-  balances KV bytes within each attention kind/geometry, greedily assigning
-  colocate groups together; equal-byte choices minimize owner transitions:
-  - GLM 5.3: groups `{0}`, `{1}`, then the four-layer indexer groups,
-    21 groups in all;
-  - V4: alternate within C4, C128 and window kinds, not raw layer index.
-    Every C4 index is even; raw-index alternation puts them all on GPU0;
-  - GLM Flash: its 11 DSA layers (P7's "mixed" plan).
+  is contiguous with one switch point `k`: GPU `layers_first_gpu` owns
+  `[0,k)`, its peer `[k,n)`. Choose `k` to minimize the larger owned KV
+  plus fixed-state bytes at the requested pool; break ties by the larger
+  admissible pool, then smaller `k`. Colocate/indexer groups never straddle
+  the switch. GLM Flash's KDA layers stay split; only its 11 MLA layers
+  participate in ownership. This replaces per-kind alternation; retain it
+  only as a possible future two-lane experiment, not an implemented policy.
 - **Transition:** each layer's transition is section 3's single whole layer
   between split layers:
   - the owner's attention (unsplit `glm_*` / `dsv4f_*` programs);
@@ -3764,9 +3764,9 @@ group 0). The executor records every lane interleaving and asserts
 
 | family (max) | `heads` (today) | `context` | `layers` | extra RTX TP2 layers (`heads` → `context` / `layers`) |
 |---|---|---|---|---|
-| GLM 5.3 EXL3 K4, 2 RTX + 6 | pool 1.29M (2M needs 105.4 GiB latent per GPU); 93.0 / 82.0 GiB, 64.9 GiB latent per GPU | 2M: 82.3 / 71.3 GiB (52.7 latent + 1.5 staging per GPU; frees 52.7 GiB per GPU against `heads` at 2M); max pool 2.52M | 2M: 77.8 / 72.1 GiB (25,592 / 28,348 B per token; the latent exists once); max 2.73M | none: no local GLM 5.3 expert backend (with one: 4 / 6 half-layer pairs) |
-| GLM 5.3 NVFP4, 2 RTX + 6 | pool 1.13M; 93.0 / 82.0 | 2M: 90.4 / 79.4; max 2.20M | 2M: 85.9 / 80.2; max 2.40M | none (1 / 2) |
-| V4 Flash, 2 RTX + 4, P4 TP2 | 2M, 36 TP2 pairs, 7.616 GiB records per GPU, GPU0 slack 0.07 | frees 3.676 (C4) − 0.350 staging − 0.017 exchange = 3.309 per GPU | frees 4.530 / 4.133 after 0.500 hop slots | 36 → 38 / 38 |
+| GLM 5.3 EXL3 K4, 2 RTX + 6 | pool 1.29M (2M needs 105.4 GiB latent per GPU); 93.0 / 82.0 GiB, 64.9 GiB latent per GPU | 2M: 82.3 / 71.3 GiB (52.7 latent + 1.5 staging per GPU; frees 52.7 GiB per GPU against `heads` at 2M); max pool 2.52M | 2M: 81.6 / 68.3 GiB (27,560 / 26,380 B per token; contiguous ownership, latent exists once); max 2.54M | none: no local GLM 5.3 expert backend (with one: 4 / 6 half-layer pairs) |
+| GLM 5.3 NVFP4, 2 RTX + 6 | pool 1.13M; 93.0 / 82.0 | 2M: 90.4 / 79.4; max 2.20M | 2M: 89.7 / 76.4; max 2.22M | none (1 / 2) |
+| V4 Flash, 2 RTX + 4, P4 TP2 | 2M, 36 TP2 pairs, 7.616 GiB records per GPU, GPU0 slack 0.07 | frees 3.676 (C4) − 0.350 staging − 0.017 exchange = 3.309 per GPU | frees 4.483 / 4.180 after 0.500 hop slots | 36 → 38 / 38 |
 | V4 Pro EXL3 K2, 2 RTX + 6, P4 TP2 | 2M, 10 pairs, 10.912 GiB records per GPU | frees 5.251 − 0.350 − 0.033 = 4.868 per GPU | frees 5.797 / 5.851 after 0.875 hop slots | 10 → 11 / 12 |
 | GLM Flash K3.25, 2 RTX + 4 | 2M: 41.8 / 37.8, 23.05 GiB MLA records + keys per GPU | compact, half the units: frees 15.9 per GPU | compact on owners: frees 17.1 / 16.0 | P6 TP2: 37 of 42 → 42 / 42 |
 | GLM Flash K3.25, 2 RTX, Spark-free | 2M with TP2: 98.6 / 99.4, no fit | 82.7 / 83.5, fits | 89.6 / 85.3 (section 4's mixed), fits | all experts on RTX |
@@ -3777,9 +3777,13 @@ K0 CPU fixtures use exact physical V4 pages: Flash
 Context staging is `2 × 4096 × 45888 = 375914496 B` per GPU;
 exchange is parity × 2 lanes × 64 rows × (query + partial + candidates):
 17.03125 MiB for Flash/GLM Flash, 34.0625 MiB for Pro, 21.03125 MiB
-for GLM 5.3. The latter's displayed totals/max pools keep their rounding.
-Balanced V4 layer ownership yields records of 3900702720 / 4276617216 B
-(Flash) and 5865209856 / 5851054080 B (Pro). Fewer owner transitions do
+for GLM 5.3. GLM context totals/max pools keep their rounding; contiguous layer ownership
+changes GLM layers to 81.6/68.3 GiB (EXL3), 89.7/76.4 (NVFP4).
+Contiguous V4 ownership at k=22/31 yields records of 3900702720 /
+4276617216 B (Flash) and 5865209856 / 5851054080 B (Pro), matching the
+earlier per-kind-alternating records but with one ownership transition.
+GLM contiguous records are 27560/26380 B per token versus alternating
+25592/28348. GLM Flash contiguous compact records keep 5/6 MLA owners. Fewer owner transitions do
 not remove Split-FFN broadcasts: there remain 43 / 61 AfterAttention hops.
 The extra TP2 counts are calibrated admission fixtures, not executor gates;
 all production attention-placement defaults remain `heads`.

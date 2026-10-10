@@ -378,6 +378,8 @@ pub(crate) fn with_engine<T>(
         cuteafd_bench::context::set_resolved("rtx-expert-ranges", &placement.expert_ranges.iter()
             .map(|r| format!("{}..{}", r.first, r.first + r.layers)).collect::<Vec<_>>().join(","));
         cuteafd_bench::context::set_resolved("pool-tokens", &placement.pool_tokens.to_string());
+        cuteafd_bench::context::set_resolved("attention-placement", &placement.attention_summary());
+        cuteafd_bench::context::set_resolved("attention-by-kind", &serde_json::to_string(&placement.attention_by_kind)?);
         placement
     };
     max_context = crate::shared::context::pool_context("deepseek_v4", max_context, args.max_context == 0,

@@ -40,7 +40,7 @@ pub struct PlacementRequest {
     /// None selects the family default and permits memory-driven mode flips.
     pub attention_placement: Option<AttentionPlacement>,
     pub context_buffers: ContextBuffers,
-    /// Tie-break owner of the first group under byte-balanced layer ownership.
+    /// Owner of the prefix before the contiguous layer switch point.
     pub layers_first_gpu: u8,
     pub pool: PoolPolicy,
     /// One per backbone layer, in order.
@@ -342,6 +342,8 @@ impl std::str::FromStr for Onboard {
 pub struct Placement {
     pub pool_tokens: u64,
     pub attention_placement: AttentionPlacement,
+    /// Resolved modes by attention kind, including mixed step-seven flips.
+    pub attention_by_kind: Vec<(AttentionClass, AttentionPlacement)>,
     /// Context exchange bytes per row, each way (existing all-reduces excluded).
     pub peer_row_bytes: u64,
     /// The onboard this placement resolved: RTX-resident routed layers.
@@ -400,9 +402,16 @@ pub struct Tp2Range {
 
 impl Placement {
     /// The `cuteafd plan --layout` line runtimes log once at admission.
+    pub fn attention_summary(&self) -> String {
+        if self.attention_by_kind.iter().any(|(_, mode)| *mode != self.attention_placement) {
+            format!("mixed ({})", self.attention_by_kind.iter().map(|(kind, mode)| format!("{kind:?}={mode}")).collect::<Vec<_>>().join(", "))
+        } else { self.attention_placement.to_string() }
+    }
+
     pub fn summary(&self) -> String {
+        let attention = self.attention_summary();
         if let Some(t) = self.tp2 {
-            return format!("pool {} tokens; onboard {} RTX expert layers: rtx0/rtx1: {} TP2 expert layer halves ({}..{}); arenas [{}, {}] B; TP1 dSpark {} B",
+            return format!("attention {attention}; pool {} tokens; onboard {} RTX expert layers: rtx0/rtx1: {} TP2 expert layer halves ({}..{}); arenas [{}, {}] B; TP1 dSpark {} B",
                 self.pool_tokens, self.onboard_layers, t.layers, t.first, t.first + t.layers,
                 t.peak_bytes[0], t.peak_bytes[1], self.expert_ranges[0].peak_bytes);
         }
@@ -411,7 +420,7 @@ impl Placement {
             .collect::<Vec<_>>().join(", ");
         let hops = self.hops.iter().filter(|h| h.charged()).count();
         let hops = if hops == 0 { String::new() } else { format!("; {hops} residual hops") };
-        format!("attention {}; pool {} tokens; onboard {} RTX expert layers: {ranges}{hops}", self.attention_placement, self.pool_tokens, self.onboard_layers)
+        format!("attention {attention}; pool {} tokens; onboard {} RTX expert layers: {ranges}{hops}", self.pool_tokens, self.onboard_layers)
     }
 }
 

@@ -528,9 +528,13 @@ fn section_6_glm_memory_uses_one_latent_and_charges_every_exchange_slot() {
         let layers = solve(&req).unwrap();
         print_attention_fixture(if nvfp4 { "GLM 5.3 NVFP4" } else { "GLM 5.3 EXL3" }, AttentionPlacement::Layers, &layers);
         let records = layers.items.iter().map(|items| items.iter().find(|i| i.group == "records").unwrap().bytes / (2 << 20)).collect::<Vec<_>>();
-        assert_eq!(records, [25_592, 28_348]);
+        let k = layers.layers.iter().position(|l| l.mode == S0).unwrap();
+        eprintln!("K0 GLM layers switch={k} hops={}", layers.hops.len());
+        assert!(layers.layers[..k].iter().all(|l| l.mode == S1));
+        assert!(layers.layers[k..].iter().all(|l| l.mode == S0));
+        eprintln!("K0 GLM layers records={records:?}");
         let used = layers.items.iter().map(|items| items.iter().map(|i| i.bytes).sum::<u64>() as f64 / GIB as f64).collect::<Vec<_>>();
-        let expected = if nvfp4 { [85.9, 80.2] } else { [77.8, 72.1] };
+        let expected = if nvfp4 { [89.7, 76.4] } else { [81.6, 68.3] };
         for gpu in 0..2 { assert!((used[gpu] - expected[gpu]).abs() < 0.07, "NVFP4={nvfp4} layers GPU{gpu}: {}", used[gpu]); }
     }
 }
@@ -606,9 +610,10 @@ fn section_6_tp2_counts_use_exact_pages_and_real_layer_ownership() {
             let kv = p.items.iter().map(|items| items.iter().filter(|i| i.group == "records").map(|i| i.bytes).sum::<u64>()).collect::<Vec<_>>();
             eprintln!("K0 {name} {mode}: kv={kv:?} hops={}", p.hops.len());
             if mode == AttentionPlacement::Layers {
-                let owners = p.layers.iter().enumerate().filter(|(i, _)| *i >= 2 && *i % 2 == 0)
-                    .map(|(_, l)| l.mode).collect::<Vec<_>>();
-                assert!(owners.windows(2).all(|pair| pair[0] != pair[1]));
+                let k = p.layers.iter().position(|l| l.mode == S1).unwrap_or(p.layers.len());
+                eprintln!("K0 {name} layers switch={k}");
+                assert!(p.layers[..k].iter().all(|l| l.mode == S0));
+                assert!(p.layers[k..].iter().all(|l| l.mode == S1));
             }
         }
     }
@@ -642,6 +647,10 @@ fn section_6_tp2_counts_use_exact_pages_and_real_layer_ownership() {
         eprintln!("K0 GLM Flash {mode}: kv={kv:?} hops={}", p.hops.len());
         assert_eq!(p.pool_tokens, 2 << 20);
         assert_eq!(p.onboard_layers, layers);
+        if mode == AttentionPlacement::Layers {
+            let k = p.layers.iter().position(|l| l.mode == S0).unwrap();
+            eprintln!("K0 GLM Flash layers switch={k}");
+        }
     }
 }
 
@@ -663,4 +672,67 @@ fn context_pool_rounding_never_crosses_floor_and_explicit_units_are_even() {
     req.pool.floor = 1;
     req.pool.requested = Some(3);
     assert!(matches!(solve(&req), Err(PlacementError::Inventory(_))));
+}
+
+
+#[test]
+fn auto_cannot_flip_to_an_unqualified_executor_mode() {
+    for executor in families::EXECUTORS {
+        let mut req = request(2, 20 * GIB, 2, 4, Onboard::Auto);
+        req.executor = executor;
+        for layer in &mut req.layers {
+            layer.modes = vec![LayerMode::HeadSplit, LayerMode::ContextSplit, S0, S1, W0, W1];
+            layer.kv_unit = KvDemand { unit_bytes_whole: UNIT, unit_bytes_split: [UNIT; 2], unit_bytes_context: Some([UNIT / 2; 2]) };
+        }
+        req.pool_overhead = vec![0; 2];
+        let auto = solve(&req).unwrap();
+        req.attention_placement = Some(AttentionPlacement::Heads);
+        assert_eq!(auto, solve(&req).unwrap(), "{}", executor.family);
+        assert!(auto.layers.iter().all(|l| executor.runs(l.mode)));
+    }
+}
+
+#[test]
+fn mixed_memory_flips_are_explicit_in_plan_and_summary() {
+    let mut req = request(2, 7 * UNIT / 2, 3, 4, Onboard::Auto);
+    req.pool_overhead = vec![0; 2];
+    req.executor = CONTEXT;
+    req.layers[0].kind = AttentionClass::Mla;
+    req.layers[0].kv_unit = KvDemand { unit_bytes_whole: UNIT, unit_bytes_split: [UNIT; 2], unit_bytes_context: Some([UNIT / 2; 2]) };
+    req.layers[0].modes = vec![LayerMode::HeadSplit, LayerMode::ContextSplit];
+    req.layers[1].kind = AttentionClass::Dsa;
+    req.layers[1].kv_unit = KvDemand { unit_bytes_whole: UNIT / 4, unit_bytes_split: [UNIT / 4; 2], unit_bytes_context: None };
+    req.layers[1].modes = vec![LayerMode::HeadSplit, S0, S1];
+    req.layers[2] = req.layers[1].clone();
+    req.pool.target = 1024;
+    req.pool.floor = 1;
+    for layer in &mut req.layers { layer.experts = None; }
+    let mixed = solve(&req).unwrap();
+    assert_eq!(mixed.pool_tokens, 1024);
+    assert_eq!(mixed.attention_by_kind, [(AttentionClass::Mla, AttentionPlacement::Context), (AttentionClass::Dsa, AttentionPlacement::Layers)]);
+    assert!(mixed.summary().contains("mixed (Mla=context, Dsa=layers)"));
+}
+
+
+#[test]
+fn contiguous_layer_switch_keeps_groups_and_breaks_equal_bytes_by_pool() {
+    let mut req = request(2, 32 * GIB, 4, 4, Onboard::Auto);
+    req.executor = CONTEXT;
+    req.attention_placement = Some(AttentionPlacement::Layers);
+    req.pool_overhead = vec![0; 2];
+    for layer in &mut req.layers {
+        layer.experts = None;
+        layer.modes = vec![LayerMode::HeadSplit, S0, S1];
+        layer.kv_unit = ModeBytes::replicated(UNIT / 4).into();
+    }
+    req.layers[1].colocate = Some(7);
+    req.layers[2].colocate = Some(7);
+    // k=1 and k=3 have equal largest owned bytes; the asymmetric fixed
+    // demand makes GPU1's larger suffix worse, so choose k=3.
+    req.fixed = vec![Demand::new(1, Category::Workspace, "rank1 fixed", 8 * GIB, Basis::Exact)];
+    let p = solve(&req).unwrap();
+    assert_eq!(p.layers.iter().map(|l| l.mode).collect::<Vec<_>>(), [S0, S0, S0, S1]);
+    req.fixed.clear();
+    let p = solve(&req).unwrap();
+    assert_eq!(p.layers.iter().map(|l| l.mode).collect::<Vec<_>>(), [S0, S1, S1, S1]);
 }

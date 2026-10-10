@@ -26,14 +26,23 @@ pub fn solve(request: &PlacementRequest) -> Result<Placement, PlacementError> {
     kinds.sort_by_key(|&(kind, saving)| (std::cmp::Reverse(saving), kind));
     let mut flips = Vec::new();
     for (kind, _) in kinds {
+        let prior_flips = flips.clone();
+        let mut kind_best = best.as_ref().map(|p| p.pool_tokens).unwrap_or(0);
+        let mut selected_flips = prior_flips.clone();
         for mode in [AttentionPlacement::Context, AttentionPlacement::Layers] {
+            if mode == AttentionPlacement::Context && !request.layers.iter().any(|l| l.kind == kind && l.kv_unit.unit_bytes_context.is_some()) { continue; }
             if request.executor.check_attention(Some(mode), 2, true).is_err() { continue; }
+            flips = prior_flips.clone();
             flips.retain(|(k, _)| *k != kind);
             flips.push((kind, mode));
             let trial = solve_once(request, &flips);
             if trial.as_ref().is_ok_and(|p| p.pool_tokens >= request.pool.target) { return trial; }
+            if let Ok(p) = &trial {
+                if p.pool_tokens > kind_best { kind_best = p.pool_tokens; selected_flips = flips.clone(); }
+            }
             if trial.as_ref().is_ok_and(|p| best.as_ref().map_or(true, |b| p.pool_tokens > b.pool_tokens)) { best = trial; }
         }
+        flips = selected_flips;
     }
     best
 }
@@ -55,17 +64,10 @@ fn solve_once(request: &PlacementRequest, flips: &[(AttentionClass, AttentionPla
     // 1. Explicit attention placement is strict. Auto retains the existing
     // policy until a qualified memory lever is needed.
     let executor = &request.executor;
-    let mut groups = std::collections::BTreeMap::new();
-    let mut loads = std::collections::BTreeMap::<(AttentionClass, u64), [u64; 2]>::new();
-    let mut last_kind = std::collections::BTreeMap::new();
-    let mut previous = request.layers_first_gpu;
-    let mut group_bytes = std::collections::BTreeMap::<u16, u64>::new();
-    for layer in &request.layers {
-        if let Some(group) = layer.colocate {
-            let total = group_bytes.entry(group).or_default();
-            *total = total.checked_add(layer.kv_unit.unit_bytes_whole).ok_or(Overflow("colocate KV bytes"))?;
-        }
-    }
+    let layer_selected = |layer: &LayerDemand| flips.iter().find(|(kind, _)| *kind == layer.kind).map(|(_, m)| *m)
+        .or(request.attention_placement).unwrap_or_else(|| executor.attention_default()) == AttentionPlacement::Layers
+        && matches!(layer.kind, AttentionClass::Csa | AttentionClass::Mla | AttentionClass::Dsa);
+    let switch = if request.layers.iter().any(&layer_selected) { layer_switch(request, &layer_selected)? } else { 0 };
     let modes = request.layers.iter().enumerate().map(|(index, layer)| {
         let selected = flips.iter().find(|(kind, _)| *kind == layer.kind).map(|(_, m)| *m)
             .or(request.attention_placement)
@@ -74,22 +76,7 @@ fn solve_once(request: &PlacementRequest, flips: &[(AttentionClass, AttentionPla
             Some(AttentionPlacement::Context) if layer.kv_unit.unit_bytes_context.is_some() => Some(LayerMode::ContextSplit),
             Some(AttentionPlacement::Context) => Some(LayerMode::HeadSplit),
             Some(AttentionPlacement::Layers) if matches!(layer.kind, AttentionClass::Csa | AttentionClass::Mla | AttentionClass::Dsa) => {
-                // Distinct KV geometries are separate balancing kinds (V4 C4,
-                // C128, window). Never alternate raw indices: all C4 are even.
-                let key = (layer.kind, if layer.kind == AttentionClass::Csa { layer.kv_unit.unit_bytes_whole } else { 0 });
-                let existing = layer.colocate.and_then(|group| groups.get(&group).copied());
-                let owner = if let Some(owner) = existing { owner } else {
-                    let load = loads.entry(key).or_default();
-                    let owner = if load[0] < load[1] { 0 } else if load[1] < load[0] { 1 }
-                        else if let Some(last) = last_kind.get(&key) { 1 - *last }
-                        else { previous };
-                    let bytes = layer.colocate.map(|g| group_bytes[&g]).unwrap_or(layer.kv_unit.unit_bytes_whole).max(1);
-                    load[usize::from(owner)] = load[usize::from(owner)].checked_add(bytes).ok_or(Overflow("owned KV bytes"))?;
-                    last_kind.insert(key, owner);
-                    if let Some(group) = layer.colocate { groups.insert(group, owner); }
-                    owner
-                };
-                previous = owner;
+                let owner = if index < switch { request.layers_first_gpu } else { 1 - request.layers_first_gpu };
                 Some(LayerMode::Whole { gpu: owner, ffn: FfnMode::Split })
             }
             Some(AttentionPlacement::Layers) => Some(LayerMode::HeadSplit),
@@ -330,6 +317,11 @@ fn solve_once(request: &PlacementRequest, flips: &[(AttentionClass, AttentionPla
             else if request.attention_placement == Some(AttentionPlacement::Layers) || flips.iter().any(|(_, m)| *m == AttentionPlacement::Layers) {
                 AttentionPlacement::Layers
             } else { AttentionPlacement::Heads },
+        attention_by_kind: request.layers.iter().map(|layer| {
+            let mode = flips.iter().find(|(kind, _)| *kind == layer.kind).map(|(_, mode)| *mode)
+                .or(request.attention_placement).unwrap_or_else(|| executor.attention_default());
+            (layer.kind, mode)
+        }).collect::<std::collections::BTreeMap<_, _>>().into_iter().collect(),
         peer_row_bytes: if context {
             request.layers.iter().zip(&modes).filter(|(_, m)| **m == LayerMode::ContextSplit).try_fold(0u64, |sum, (layer, _)|
                 request.context_buffers.query_row_bytes.checked_add(request.context_buffers.partial_row_bytes)
@@ -345,6 +337,47 @@ fn solve_once(request: &PlacementRequest, flips: &[(AttentionClass, AttentionPla
         tp2: tp2_range,
         items,
     })
+}
+
+/// One ownership boundary, never inside an indexer/colocate group. Compare
+/// persistent bytes at the requested pool, then the pool left by fixed state.
+fn layer_switch(request: &PlacementRequest, selected: &impl Fn(&LayerDemand) -> bool) -> Result<usize, PlacementError> {
+    let mut best = None;
+    for k in 0..=request.layers.len() {
+        if request.layers.iter().enumerate().any(|(i, layer)| selected(layer) && layer.colocate.is_some_and(|group|
+            request.layers.iter().enumerate().any(|(j, other)| selected(other) && other.colocate == Some(group) && (i < k) != (j < k)))) { continue; }
+        let mut kv = [0u64; 2];
+        let mut fixed = [0u64; 2];
+        for (i, layer) in request.layers.iter().enumerate().filter(|(_, l)| selected(l)) {
+            let gpu = usize::from(if i < k { request.layers_first_gpu } else { 1 - request.layers_first_gpu });
+            kv[gpu] = kv[gpu].checked_add(layer.kv_unit.unit_bytes_whole).ok_or(PlacementError::Overflow("owned KV bytes"))?;
+            fixed[gpu] = fixed[gpu].checked_add(layer.fixed_bytes.whole).ok_or(PlacementError::Overflow("owned state"))?;
+        }
+        let mut owned = [0u64; 2];
+        for gpu in 0..2 { owned[gpu] = kv[gpu].checked_mul(request.pool.wanted_units()).and_then(|b| b.checked_add(fixed[gpu]))
+            .ok_or(PlacementError::Overflow("owned pool bytes"))?; }
+        let mut pool_bytes = request.pool_overhead.clone();
+        let mut base = [0u64; 2];
+        for demand in &request.fixed {
+            let g = usize::from(demand.gpu);
+            base[g] = base[g].checked_add(demand.bytes).ok_or(PlacementError::Overflow("ownership fixed"))?;
+        }
+        for (i, layer) in request.layers.iter().enumerate() {
+            for g in 0..request.inventory.gpus.len() {
+                let owner = usize::from(if i < k { request.layers_first_gpu } else { 1 - request.layers_first_gpu });
+                let (bytes, state, weights) = if selected(layer) {
+                    if g == owner { (layer.kv_unit.unit_bytes_whole, layer.fixed_bytes.whole, layer.weights.whole) } else { (0, 0, 0) }
+                } else { (layer.kv_unit.unit_bytes_split[g], layer.fixed_bytes.split[g], layer.weights.split[g]) };
+                pool_bytes[g] = pool_bytes[g].checked_add(bytes).ok_or(PlacementError::Overflow("ownership pool"))?;
+                base[g] = base[g].checked_add(state).and_then(|n| n.checked_add(weights)).ok_or(PlacementError::Overflow("ownership fixed"))?;
+            }
+        }
+        let fit = (0..request.inventory.gpus.len()).filter(|&g| pool_bytes[g] > 0).map(|g|
+            request.inventory.gpus[g].available().saturating_sub(base[g]) / pool_bytes[g]).min().unwrap_or(u64::MAX);
+        let score = (owned[0].max(owned[1]), std::cmp::Reverse(fit), k);
+        if best.as_ref().is_none_or(|(old, _)| score < *old) { best = Some((score, k)); }
+    }
+    best.map(|(_, k)| k).ok_or(PlacementError::Inventory("no legal layer ownership boundary"))
 }
 
 /// The residual's home at every layer boundary (`[0]`: the embedding's GPU,

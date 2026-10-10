@@ -174,7 +174,7 @@ pub fn request(inputs: &V4Inputs<'_>) -> Result<PlacementRequest, PlacementError
             // Coordinator weights load before admission (inside the baseline).
             weights: ModeBytes::default(),
             kv_unit: KvDemand { unit_bytes_whole: unit, unit_bytes_split: [unit; 2],
-                unit_bytes_context: (inputs.cfg.compress_ratios[layer] == 4).then_some([unit / 2; 2]) },
+                unit_bytes_context: (inputs.cfg.compress_ratios[layer] == 4).then_some([unit.div_ceil(2), unit / 2]) },
             colocate: None, fixed_bytes: ModeBytes::default(),
             context_indexer: inputs.cfg.compress_ratios[layer] == 4,
             experts,
