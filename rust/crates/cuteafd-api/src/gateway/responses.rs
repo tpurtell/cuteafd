@@ -140,6 +140,7 @@ fn snapshot(p: &parse::Parsed, fold: &render::Fold) -> Arc<Snapshot> {
         parent: p.parent.clone(),
         system: p.turn.system.clone(),
         items,
+        additional_tools: p.additional_tools.clone(),
     })
 }
 

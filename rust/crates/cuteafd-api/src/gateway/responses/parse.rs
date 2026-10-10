@@ -24,6 +24,8 @@ pub(super) struct Parsed {
     pub new_items: Vec<Item>,
     pub new_stored: Vec<crate::gateway::session::StoredItem>,
     pub input: Vec<Value>,
+    /// The `additional_tools` declarations in effect (new or inherited).
+    pub additional_tools: Vec<Value>,
     pub store: bool,
     pub encrypted: bool,
     pub summary: bool,
@@ -114,9 +116,11 @@ pub(super) fn parse(
     let mut new_items = Vec::new();
     let mut new_stored = Vec::new();
     let mut additional_tools = Vec::new();
+    let mut declared_tools = false;
     let mut effort_update = None;
     for entry in &input {
         if entry["type"] == "additional_tools" {
+            declared_tools = true;
             additional_tools.extend(
                 entry["tools"]
                     .as_array()
@@ -157,6 +161,12 @@ pub(super) fn parse(
             new_items.push(item);
         }
     }
+    // `additional_tools` are conversation input: a continuation that declares
+    // none keeps its parent's (Codex over WebSocket sends them once).
+    if !declared_tools {
+        if let Some(parent) = &parent { additional_tools = parent.additional_tools.clone(); }
+    }
+    let effective_additional_tools = additional_tools.clone();
     let mut turn = TurnRequest {
         requested_model: model,
         system: optional_string(&wire, "instructions")?,
@@ -486,6 +496,7 @@ pub(super) fn parse(
         new_items,
         new_stored,
         input,
+        additional_tools: effective_additional_tools,
         store,
         encrypted,
         summary,
