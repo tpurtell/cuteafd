@@ -1371,22 +1371,23 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
             }
             let full: &[u32] = drafted[i].as_ref().map_or(&[], |d| &d.tokens);
             let dflash: &[u32] = &full[..planned[i].min(full.len())];
-            // `emit` already appended `next` to the history.
-            let copy = copy_drafts(&a.history, limits[i].min(a.draft_limit));
-            let agrees = copy.iter().zip(full).take_while(|(c, d)| c == d).count() >= dflash.len();
             let draft = if shared_active_plan {
                 // The drafter's window, then the agreed copy's continuation the selection kept.
                 let extended = planned[i].saturating_sub(full.len());
-                full[..planned[i].min(full.len())].iter().chain(&extensions[i][..extended.min(extensions[i].len())])
-                    .copied().collect()
+                dflash.iter().chain(&extensions[i][..extended.min(extensions[i].len())]).copied().collect()
             } else if let Some((copies, lengths, used)) = &copy_choice {
                 used_copy[i] = used[i];
                 if used[i] { copies[i][..lengths[i]].to_vec() } else { dflash.to_vec() }
-            } else if copy.len() > dflash.len() && agrees {
-                used_copy[i] = true;
-                copy
             } else {
-                dflash.to_vec()
+                // `emit` already appended `next` to the history.
+                let copy = copy_drafts(&a.history, limits[i].min(a.draft_limit));
+                let agrees = copy.iter().zip(full).take_while(|(c, d)| c == d).count() >= dflash.len();
+                if copy.len() > dflash.len() && agrees {
+                    used_copy[i] = true;
+                    copy
+                } else {
+                    dflash.to_vec()
+                }
             };
             let mut rows: Vec<u32> = std::iter::once(a.next).chain(draft).collect();
             // Drafts the grammar rejects could never be kept: verify none of them.
