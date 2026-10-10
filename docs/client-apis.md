@@ -22,9 +22,13 @@ they can run against your own model with no proxy in between.
   - Speech output and transcription are not available yet. Requests for them
     get an explicit error.
 
-The Messages, Responses and Realtime routes are built and tested against an
-upstream test backend today. Wiring them to the engine's own serve path is
-the next step (PLAN.md, "v3 API gateway and sessions").
+Every serving family mounts these routes beside `/v1/chat/completions`, over
+the same engine: a Messages or Responses turn renders through the model's own
+chat template, tool syntax and grammar, exactly as the chat route would. Turn
+them off with `--gateway off` (launchers: `GATEWAY=off`). Structured output
+(`json_schema`, strict tools) answers unsupported until a per-model probe has
+passed; `json_object` works. `count_tokens` is exact (the checkpoint's
+tokenizer) for text turns.
 
 **Keys.** Start the server with `--api-key-file FILE`. Clients send that key
 the way they would to the real service:
@@ -33,15 +37,16 @@ the way they would to the real service:
 - Bearer or the `openai-insecure-api-key.<key>` WebSocket subprotocol for
   Realtime.
 
-**Model names.** `--official-model-names` accepts any requested model id and
-runs the served model. It also advertises the ids the CLIs look for: Claude
+**Model names.** `--official-model-names` (on by default when serving)
+accepts any requested model id and runs the served model. It also advertises the ids the CLIs look for: Claude
 Code's model discovery lists only `claude-*` ids, and Codex has a fixed set of
 slugs. To refresh those lists without a rebuild, generate a file with
 `scripts/gateway/official-model-names.py` and pass it as
 `--official-model-names-file`.
 
 **Web search.** Claude Code's WebSearch and Codex's web search run on the
-server: `--search exa` (needs `EXA_API_KEY`) or `--search searxng=URL` (no
+server: `--gateway-search exa` (needs `EXA_API_KEY`; `--search` on the
+`cuteafd gateway` test harness) or `--gateway-search searxng=URL` (no
 key; `scripts/gateway/searxng/` runs a local SearXNG).
 
 **Claude Code:**
