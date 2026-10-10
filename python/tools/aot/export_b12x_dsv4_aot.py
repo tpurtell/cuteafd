@@ -506,6 +506,45 @@ def qwen4_programs(g, decode_rows: int, prefill_rows: int, max_context: int):
     return out
 
 
+def context_split_programs(g, decode_rows: int, max_context: int):
+    """Opt-in K1 primitives only; never change a serving table by default."""
+    from b12x.integration.cuteafd import context_split as split
+
+    v4 = hasattr(g, "o_groups")
+    pooled = v4 or hasattr(g, "index_kpool")
+    k = g.index_topk // getattr(g, "index_kpool", 1)
+    pages = -(-max_context // (4 if pooled else 1) // PAGE_ROWS)
+    out = [
+        (f"scored_index_topk_decode_m{decode_rows}", "scored_index_topk",
+         {"max_rows": decode_rows, "max_pages": pages, "mode": "decode"},
+         lambda: split.compile_scored_index_topk_aot(g, max_rows=decode_rows, max_pages=pages)),
+        ("dsa_candidate_merge", "dsa_candidate_merge", {"topk": k},
+         lambda: split.compile_dsa_candidate_merge_aot(topk=k)),
+        ("lse_combine2", "lse_combine2", {"heads": g.heads // 2, "has_sink": v4},
+         lambda: split.compile_lse_combine2_aot(heads=g.heads // 2, has_sink=v4)),
+    ]
+    # Both SM120 products share the same table; select its explicit split
+    # variant once at load, not whichever GPU happened to run the exporter.
+    device_plans = {sms: split.sparse_mla_partial_split_plan(
+        g, max_rows=decode_rows, head_count=g.heads // 2, sm_count=sms) for sms in (170, 188)}
+    for begin in (0, g.heads // 2):
+        for splits in sorted(set(device_plans.values())):
+            out.append((f"sparse_mla_partial_h{begin}_s{splits}_m{decode_rows}", "sparse_mla_partial",
+                        {"max_rows": decode_rows, "head_begin": begin, "head_count": g.heads // 2,
+                         "num_splits": splits, "device_sm_counts": [sm for sm, s in device_plans.items() if s == splits]},
+                        lambda begin=begin, splits=splits: split.compile_sparse_mla_partial_aot(
+                            g, max_rows=decode_rows, head_begin=begin, head_count=g.heads // 2, num_splits=splits)))
+    layouts = [("index", 128, 64, 8448)]
+    layouts += ([("swa", 584, 256, 149760), ("c4", 584, 64, 37440)] if v4 else
+                [("kv", g.record_bytes, g.page_rows, g.kv_page_bytes)])
+    for kind, row_bytes, page_rows, page_bytes in layouts:
+        out.append((f"paged_staging_gather_{kind}", "paged_staging_gather",
+                    {"row_bytes": row_bytes, "page_rows": page_rows, "page_bytes": page_bytes},
+                    lambda rb=row_bytes, pr=page_rows, pb=page_bytes:
+                        split.compile_paged_staging_gather_aot(row_bytes=rb, page_rows=pr, page_bytes=pb)))
+    return out
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output-dir", type=Path, required=True)
@@ -523,6 +562,8 @@ def main() -> None:
     parser.add_argument("--prefill-rows", type=int, default=4096)
     parser.add_argument("--max-context", type=int, default=DEFAULT_MAX_CONTEXT)
     parser.add_argument("--only", help="comma-separated stem suffixes (diagnostics)")
+    parser.add_argument("--context-split-only", action="store_true",
+                        help="export K1 primitives for flash/pro/glm/glmf, no engine wiring")
     args = parser.parse_args()
 
     import torch
@@ -536,9 +577,11 @@ def main() -> None:
                                           "mimop2", "mimof", "mimof2", "glmf", "glmf2", "qwen4") for name in geometries):
         raise SystemExit("--geometry takes flash, flash2, pro, pro2, glm, glm2, mimo, mimo2, mimop, mimop2, mimof, mimof2, "
                          "glmf, glmf2 and/or qwen4")
+    if args.context_split_only and any(name not in ("flash", "pro", "glm", "glmf") for name in geometries):
+        raise SystemExit("--context-split-only takes flash, pro, glm and/or glmf")
     props = torch.cuda.get_device_properties(0)
-    if (props.major, props.minor) != (12, 0):
-        raise SystemExit("coordinator programs export on SM120")
+    if (props.major, props.minor) not in ((12, 0), (12, 1)) or (props.minor != 0 and not args.context_split_only):
+        raise SystemExit("coordinator programs export on SM120 (K1 primitives also on SM121)")
     output = args.output_dir
     output.mkdir(parents=True, exist_ok=True)
     selected = set(args.only.split(",")) if args.only else None
@@ -597,8 +640,10 @@ def main() -> None:
                 "mimof": mimo_programs, "mimof2": mimo_head_split_programs,
                 "glmf": glmf_programs, "glmf2": glmf_head_split_programs,
                 "qwen4": qwen4_programs}.get(name, programs)
-        work += [(family, *item) for item in make(g, args.decode_rows, args.prefill_rows, extent)]
-    if "glmf" in geometries:
+        family_work = (context_split_programs(g, args.decode_rows, extent) if args.context_split_only else
+                       make(g, args.decode_rows, args.prefill_rows, extent))
+        work += [(family, *item) for item in family_work]
+    if "glmf" in geometries and not args.context_split_only:
         # Last, so every program above compiles exactly as before.
         work += [("glmf", *item) for item in glmf_wide_decode_programs(GLM53_FLASH, args.decode_rows,
                                                                        args.glmf_wide_decode_rows, geometry_context("glmf", args.max_context))]

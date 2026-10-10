@@ -37,11 +37,12 @@ def exporter(monkeypatch):
         monkeypatch.setenv(name, "1")
     monkeypatch.setitem(sys.modules, "_pinned_sparkinfer", types.SimpleNamespace(REVISION="test"))
     package = types.ModuleType("b12x.integration.cuteafd")
-    for name in ("glmf", "dsv4_mhc", "glm_sparse_mla"):
+    for name in ("glmf", "dsv4_mhc", "glm_sparse_mla", "context_split"):
         module = _Compilers(f"b12x.integration.cuteafd.{name}")
         setattr(package, name, module)
         monkeypatch.setitem(sys.modules, module.__name__, module)
     package.glmf.mhc_geometry = lambda g: ("mhc geometry", g)
+    package.context_split.sparse_mla_partial_split_plan = lambda g, **kw: 1 if kw["sm_count"] == 170 else 4
     monkeypatch.setitem(sys.modules, "b12x", types.ModuleType("b12x"))
     monkeypatch.setitem(sys.modules, "b12x.integration", types.ModuleType("b12x.integration"))
     monkeypatch.setitem(sys.modules, "b12x.integration.cuteafd", package)
@@ -158,3 +159,34 @@ def test_builds_export_the_wide_programs_unless_switched_off():
     assert '"CUTEAFD_WIP_GLMF_WIDE_DECODE_ROWS=${CUTEAFD_WIP_GLMF_WIDE_DECODE_ROWS:-128}"' in (ROOT / "wip.sh").read_text()
     exporter = EXPORTER.read_text()
     assert 'parser.add_argument("--glmf-wide-decode-rows", type=int, default=128,' in exporter
+
+
+@pytest.mark.parametrize("family,heads,index_topk,pool,record_bytes", [
+    ("glm", 64, 2048, 1, 656), ("glmf", 64, 2048, 4, 528),
+    ("flash", 64, 512, 4, 584), ("pro", 128, 1024, 4, 584),
+])
+def test_context_split_opt_in_geometry(exporter, family, heads, index_topk, pool, record_bytes):
+    g = types.SimpleNamespace(heads=heads, index_topk=index_topk, record_bytes=record_bytes,
+                              page_rows=64, kv_page_bytes=record_bytes*64)
+    if family == "glmf":
+        g.index_kpool = pool
+    if family in ("flash", "pro"):
+        g.o_groups = 8
+    work = exporter.context_split_programs(g, 64, 1048576)
+    calls = {stem: (params, thunk()) for stem, _, params, thunk in work}
+    assert len(calls) == len(work)
+    assert calls["dsa_candidate_merge"][1][3]["topk"] == (index_topk//pool if family=="glmf" else index_topk)
+    assert calls["lse_combine2"][1][3] == {"heads":heads//2,"has_sink":family in ("flash","pro")}
+    assert calls["scored_index_topk_decode_m64"][1][3]["max_pages"] == 1048576//pool//64
+    for begin in (0,heads//2):
+        for splits, sms in ((1,170),(4,188)):
+            params, call = calls[f"sparse_mla_partial_h{begin}_s{splits}_m64"]
+            assert call[3] == {"max_rows":64,"head_begin":begin,"head_count":heads//2,"num_splits":splits}
+            assert params["device_sm_counts"] == [sms]
+    layouts = {stem: call[3]["page_bytes"] for stem, (_, call) in calls.items() if "gather" in stem}
+    assert layouts["paged_staging_gather_index"] == 8448
+    if family in ("flash","pro"):
+        assert layouts["paged_staging_gather_c4"] == 37440
+        assert layouts["paged_staging_gather_swa"] == 149760
+    else:
+        assert layouts["paged_staging_gather_kv"] == record_bytes*64
