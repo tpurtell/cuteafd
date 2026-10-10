@@ -11,12 +11,12 @@ use axum::{
         ws::{Message, WebSocket, WebSocketUpgrade},
         State,
     },
-    http::header,
+    http::{header, HeaderMap},
     response::{Html, IntoResponse, Response},
 };
 use std::sync::{
     atomic::{AtomicBool, AtomicUsize, Ordering},
-    Arc, Mutex,
+    Arc, Mutex, OnceLock,
 };
 use tokio::sync::broadcast;
 
@@ -35,15 +35,57 @@ pub const MARK: &str = include_str!("../../../../../assets/brand/cuteafd-mark-co
 const DISABLED: &str = r#"{"type":"snapshot","disabled":true}"#;
 const STARTING: &str = r#"{"type":"snapshot","starting":true}"#;
 
+/// One published frame: the full variant, and the variant without token text
+/// for locked viewers when the two differ.
+#[derive(Clone)]
+struct Frame {
+    full: Arc<str>,
+    plain: Option<Arc<str>>,
+}
+impl Frame {
+    fn new(full: String, plain: Option<String>) -> Self {
+        Self { full: Arc::from(full), plain: plain.map(Arc::from) }
+    }
+    fn for_viewer(&self, unlocked: bool) -> Arc<str> {
+        match (&self.plain, unlocked) {
+            (Some(plain), false) => plain.clone(),
+            _ => self.full.clone(),
+        }
+    }
+}
+
 pub struct ConsoleHub {
     viewers: AtomicUsize,
+    /// Viewers whose connection may receive token text (unlocked at connect).
+    text_viewers: AtomicUsize,
     text: bool,
     /// Token text is allowed while a benchmark run holds the server: its own
     /// synthetic prompts are the only requests the bench lockout admits.
     bench_text: AtomicBool,
     enabled: bool,
-    frames: broadcast::Sender<Arc<str>>,
-    snapshot: Mutex<Arc<str>>,
+    frames: broadcast::Sender<Frame>,
+    snapshot: Mutex<Frame>,
+    /// Token text reaches only viewers this gate unlocks (the console cookie).
+    gate: OnceLock<crate::console_gate::ConsoleGate>,
+}
+
+/// What a viewer may see of token text.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TextAccess {
+    /// Text streams to this viewer.
+    On,
+    /// The server streams text, but only to unlocked viewers.
+    Locked,
+    Off,
+}
+impl TextAccess {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::On => "on",
+            Self::Locked => "locked",
+            Self::Off => "off",
+        }
+    }
 }
 
 impl ConsoleHub {
@@ -59,12 +101,38 @@ impl ConsoleHub {
         let (frames, _) = broadcast::channel(256);
         Arc::new(Self {
             viewers: AtomicUsize::new(0),
+            text_viewers: AtomicUsize::new(0),
             text,
             bench_text: AtomicBool::new(false),
             enabled,
             frames,
-            snapshot: Mutex::new(Arc::from(snapshot)),
+            snapshot: Mutex::new(Frame::new(snapshot.into(), None)),
+            gate: OnceLock::new(),
         })
+    }
+    /// Token text then reaches only viewers holding the console cookie.
+    pub fn set_gate(&self, gate: crate::console_gate::ConsoleGate) {
+        let _ = self.gate.set(gate);
+    }
+    /// The bench's synthetic prompts are public; otherwise text needs the cookie.
+    pub fn bench_text_active(&self) -> bool {
+        self.bench_text.load(Ordering::Relaxed)
+    }
+    /// What a connection with these headers may see, decided once at connect.
+    pub fn text_access(&self, headers: &HeaderMap) -> TextAccess {
+        if !self.text_enabled() {
+            TextAccess::Off
+        } else if self.bench_text_active() || self.gate.get().is_some_and(|g| g.unlocked(headers)) {
+            TextAccess::On
+        } else {
+            TextAccess::Locked
+        }
+    }
+    /// The producer builds token text only while some viewer can receive it.
+    #[inline]
+    pub fn text_wanted(&self) -> bool {
+        self.text_enabled() && self.viewers() > 0
+            && (self.bench_text_active() || self.text_viewers.load(Ordering::Relaxed) > 0)
     }
     /// Connected console sockets. Producers skip all per-round work at zero.
     #[inline]
@@ -82,26 +150,48 @@ impl ConsoleHub {
         self.bench_text.store(active, Ordering::Relaxed);
     }
     pub fn publish(&self, frame: String) {
+        self.publish_pair(frame, None);
+    }
+    /// `plain` is the frame without token text, for viewers without the cookie.
+    pub fn publish_pair(&self, full: String, plain: Option<String>) {
         // No receivers is the normal idle case, not an error.
-        let _ = self.frames.send(Arc::from(frame));
+        let _ = self.frames.send(Frame::new(full, plain));
     }
     pub fn set_snapshot(&self, snapshot: String) {
+        self.set_snapshot_pair(snapshot, None);
+    }
+    pub fn set_snapshot_pair(&self, full: String, plain: Option<String>) {
         if let Ok(mut slot) = self.snapshot.lock() {
-            *slot = Arc::from(snapshot);
+            *slot = Frame::new(full, plain);
         }
     }
+    /// The snapshot a locked viewer sees (the public one).
     pub fn snapshot(&self) -> Arc<str> {
+        self.snapshot_for(false)
+    }
+    pub fn snapshot_for(&self, unlocked: bool) -> Arc<str> {
         self.snapshot
             .lock()
-            .map(|slot| slot.clone())
+            .map(|slot| slot.for_viewer(unlocked))
             .unwrap_or_else(|_| Arc::from("{}"))
+    }
+    fn viewer(self: &Arc<Self>, headers: &HeaderMap) -> (Option<Viewer>, bool) {
+        let text = self.text_access(headers) == TextAccess::On;
+        let unlocked = self.gate.get().is_some_and(|g| g.unlocked(headers));
+        let viewer = self.enabled.then(|| {
+            self.viewers.fetch_add(1, Ordering::Relaxed);
+            if text { self.text_viewers.fetch_add(1, Ordering::Relaxed); }
+            Viewer(self.clone(), text)
+        });
+        (viewer, unlocked)
     }
 }
 
-struct Viewer(Arc<ConsoleHub>);
+struct Viewer(Arc<ConsoleHub>, bool);
 impl Drop for Viewer {
     fn drop(&mut self) {
         self.0.viewers.fetch_sub(1, Ordering::Relaxed);
+        if self.1 { self.0.text_viewers.fetch_sub(1, Ordering::Relaxed); }
     }
 }
 
@@ -140,6 +230,16 @@ pub(super) async fn ui_js() -> Response {
     asset("cuteafd-ui.js", UI_JS, "text/javascript; charset=utf-8").await
 }
 
+/// The shared UI assets alone, for servers without the live console (the CPU gateway).
+pub fn asset_routes() -> axum::Router {
+    use axum::routing::get;
+    axum::Router::new()
+        .route("/assets/cuteafd-ui.css", get(ui_css))
+        .route("/assets/cuteafd-ui.js", get(ui_js))
+        .route("/assets/cuteafd-logo.svg", get(logo))
+        .route("/assets/cuteafd-mark.svg", get(mark))
+}
+
 pub(super) async fn logo() -> Response {
     asset("cuteafd-logo.svg", LOGO, "image/svg+xml").await
 }
@@ -148,32 +248,30 @@ pub(super) async fn mark() -> Response {
     asset("cuteafd-mark.svg", MARK, "image/svg+xml").await
 }
 
-pub(super) async fn snapshot(State(hub): State<Arc<ConsoleHub>>) -> Response {
+pub(super) async fn snapshot(State(hub): State<Arc<ConsoleHub>>, headers: HeaderMap) -> Response {
+    let unlocked = hub.gate.get().is_some_and(|g| g.unlocked(&headers));
     (
         [
             (header::CONTENT_TYPE, "application/json"),
             (header::CACHE_CONTROL, "no-cache"),
         ],
-        hub.snapshot().to_string(),
+        hub.snapshot_for(unlocked).to_string(),
     )
         .into_response()
 }
 
 /// Browsers cannot send bearer headers on WebSocket handshakes; offer the same
 /// authenticated feed over fetch/SSE without putting credentials in a URL.
-pub(super) async fn events(State(hub): State<Arc<ConsoleHub>>) -> Response {
+pub(super) async fn events(State(hub): State<Arc<ConsoleHub>>, headers: HeaderMap) -> Response {
     let mut frames = hub.frames.subscribe();
-    let viewer = hub.enabled.then(|| {
-        hub.viewers.fetch_add(1, Ordering::Relaxed);
-        Viewer(hub.clone())
-    });
+    let (viewer, unlocked) = hub.viewer(&headers);
     let stream = async_stream::stream! {
         let _viewer = viewer;
-        yield Ok::<_, std::convert::Infallible>(format!("data: {}\n\n", hub.snapshot()));
+        yield Ok::<_, std::convert::Infallible>(format!("data: {}\n\n", hub.snapshot_for(unlocked)));
         loop {
             match tokio::time::timeout(std::time::Duration::from_secs(15), frames.recv()).await {
-                Ok(Ok(frame)) => yield Ok(format!("data: {frame}\n\n")),
-                Ok(Err(broadcast::error::RecvError::Lagged(_))) => yield Ok(format!("data: {}\n\n", hub.snapshot())),
+                Ok(Ok(frame)) => yield Ok(format!("data: {}\n\n", frame.for_viewer(unlocked))),
+                Ok(Err(broadcast::error::RecvError::Lagged(_))) => yield Ok(format!("data: {}\n\n", hub.snapshot_for(unlocked))),
                 Ok(Err(broadcast::error::RecvError::Closed)) => break,
                 Err(_) => yield Ok(": keepalive\n\n".to_string()),
             }
@@ -182,27 +280,24 @@ pub(super) async fn events(State(hub): State<Arc<ConsoleHub>>) -> Response {
     ([(header::CONTENT_TYPE, "text/event-stream"), (header::CACHE_CONTROL, "no-cache")],
         axum::body::Body::from_stream(stream)).into_response()
 }
-pub(super) async fn socket(State(hub): State<Arc<ConsoleHub>>, upgrade: WebSocketUpgrade) -> Response {
-    upgrade.on_upgrade(move |socket| serve(hub, socket))
+pub(super) async fn socket(State(hub): State<Arc<ConsoleHub>>, headers: HeaderMap, upgrade: WebSocketUpgrade) -> Response {
+    upgrade.on_upgrade(move |socket| serve(hub, headers, socket))
 }
 
-async fn serve(hub: Arc<ConsoleHub>, mut socket: WebSocket) {
+async fn serve(hub: Arc<ConsoleHub>, headers: HeaderMap, mut socket: WebSocket) {
     // Subscribe before counting the viewer so no frame published after the
     // producer sees this viewer can be missed.
     let mut frames = hub.frames.subscribe();
-    let _viewer = hub.enabled.then(|| {
-        hub.viewers.fetch_add(1, Ordering::Relaxed);
-        Viewer(hub.clone())
-    });
-    if socket.send(Message::Text(hub.snapshot().to_string())).await.is_err() {
+    let (_viewer, unlocked) = hub.viewer(&headers);
+    if socket.send(Message::Text(hub.snapshot_for(unlocked).to_string())).await.is_err() {
         return;
     }
     loop {
         tokio::select! {
             frame = frames.recv() => {
                 let text = match frame {
-                    Ok(frame) => frame.to_string(),
-                    Err(broadcast::error::RecvError::Lagged(_)) => hub.snapshot().to_string(),
+                    Ok(frame) => frame.for_viewer(unlocked).to_string(),
+                    Err(broadcast::error::RecvError::Lagged(_)) => hub.snapshot_for(unlocked).to_string(),
                     Err(broadcast::error::RecvError::Closed) => break,
                 };
                 if socket.send(Message::Text(text)).await.is_err() { break; }
@@ -260,13 +355,53 @@ mod tests {
         assert_eq!(hub.viewers(), 0);
         let viewer = {
             hub.viewers.fetch_add(1, Ordering::Relaxed);
-            Viewer(hub.clone())
+            Viewer(hub.clone(), false)
         };
         assert_eq!(hub.viewers(), 1);
         drop(viewer);
         assert_eq!(hub.viewers(), 0);
         let mut frames = hub.frames.subscribe();
         hub.publish("{\"type\":\"frame\"}".into());
-        assert_eq!(&*frames.recv().await.unwrap(), "{\"type\":\"frame\"}");
+        assert_eq!(&*frames.recv().await.unwrap().full, "{\"type\":\"frame\"}");
+    }
+
+    /// A locked SSE client never receives a text piece while an unlocked one does.
+    #[tokio::test]
+    async fn token_text_reaches_only_unlocked_viewers() {
+        use futures::StreamExt;
+        let f = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(f.path(), "b".repeat(64)).unwrap();
+        let gate = crate::console_gate::ConsoleGate::from_file(f.path(), false).unwrap();
+        let hub = ConsoleHub::new(true);
+        hub.set_gate(gate.clone());
+        let app = gate.mount(axum::Router::new().route("/v1/console/events", axum::routing::get(events)).with_state(hub.clone()));
+        use tower::ServiceExt;
+        let unlock = app.clone().oneshot(axum::http::Request::get(format!("/console/unlock?token={}", "b".repeat(64)))
+            .body(axum::body::Body::empty()).unwrap()).await.unwrap();
+        let cookie = unlock.headers()["set-cookie"].to_str().unwrap().split(';').next().unwrap().to_owned();
+        assert!(!hub.text_wanted(), "no viewer, no text work");
+        let open = |cookie: Option<String>| {
+            let app = app.clone();
+            async move {
+                let mut request = axum::http::Request::get("/v1/console/events");
+                if let Some(c) = cookie { request = request.header("cookie", c); }
+                app.oneshot(request.body(axum::body::Body::empty()).unwrap()).await.unwrap().into_body().into_data_stream()
+            }
+        };
+        let mut locked = open(None).await;
+        locked.next().await.unwrap().unwrap();
+        assert_eq!(hub.text_access(&HeaderMap::new()), TextAccess::Locked);
+        assert!(!hub.text_wanted(), "only locked viewers: the producer skips text");
+        let mut unlocked = open(Some(cookie)).await;
+        unlocked.next().await.unwrap().unwrap();
+        assert!(hub.text_wanted());
+        hub.publish_pair(r#"{"text":"SECRET"}"#.into(), Some(r#"{"text":null}"#.into()));
+        let a = locked.next().await.unwrap().unwrap();
+        let b = unlocked.next().await.unwrap().unwrap();
+        assert!(!String::from_utf8_lossy(&a).contains("SECRET"));
+        assert!(String::from_utf8_lossy(&b).contains("SECRET"));
+        // A bench run makes its synthetic prompts public.
+        hub.set_bench_active(true);
+        assert_eq!(hub.text_access(&HeaderMap::new()), TextAccess::On);
     }
 }

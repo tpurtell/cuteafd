@@ -29,7 +29,7 @@ pub mod smoke;
 pub mod store;
 pub mod text;
 
-pub use runner::Bench;
+pub use runner::{Bench, UsageToggle};
 
 /// Compatibility entry point: no benchmark routes or lockout by default.
 /// Serving explicitly mounts `http::mount` only after validating its key.

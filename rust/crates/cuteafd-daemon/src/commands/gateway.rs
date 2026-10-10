@@ -51,6 +51,15 @@ pub(crate) struct GatewayArgs {
     search: String,
     #[arg(long)]
     record: Option<PathBuf>,
+    /// Usage history directory (metadata and the full log); enables usage recording.
+    #[arg(long)]
+    usage_dir: Option<PathBuf>,
+    /// Request accounting; defaults to on when --usage-dir is given (in memory otherwise).
+    #[arg(long, value_parser = ["on", "off"])]
+    usage: Option<String>,
+    /// File containing the host console secret; unlocks /usage and its data routes.
+    #[arg(long)]
+    console_secret_file: Option<PathBuf>,
 }
 fn alias(value: &str) -> Result<(String,String),String> {
     let (pattern,target) = value.split_once('=').ok_or("alias must be PATTERN=MODEL")?;
@@ -95,7 +104,9 @@ pub(crate) async fn run(args: GatewayArgs) -> Result<()> {
     }
     secrets.extend(config.key.iter().cloned());
     if let Some(file) = &args.api_key_file { secrets.push(std::fs::read_to_string(file).context("read gateway API key file")?.trim().to_string()); }
-    let api = crate::shared::api::ApiArgs { api_key_file:args.api_key_file,enable_bench:false,usage:Some("off".into()),gateway:"off".into(),..Default::default() }.load()?;
+    let usage = args.usage.clone().unwrap_or_else(|| if args.usage_dir.is_some() { "on".into() } else { "off".into() });
+    let api = crate::shared::api::ApiArgs { api_key_file:args.api_key_file,enable_bench:false,usage:Some(usage),gateway:"off".into(),
+        usage_dir:args.usage_dir,console_secret_file:args.console_secret_file,..Default::default() }.load()?;
     let backend = Arc::new(Upstream::new(config)?.discover().await);
     let mut models = if args.official_model_names || args.official_model_names_file.is_some() {
         ModelMap::official_names(args.model.clone())
@@ -116,9 +127,11 @@ pub(crate) async fn run(args: GatewayArgs) -> Result<()> {
         } else if let Some(url) = args.search.strip_prefix("searxng=") {
             gateway = gateway.with_search(Arc::new(Searxng::new(url)?)); "searxng"
         } else { anyhow::bail!("--search must be none, exa, or searxng=URL"); };
-    let mut app = gateway::router(Arc::new(gateway))
+    let app = gateway::router(Arc::new(gateway))
         .route("/health",axum::routing::get(|| async { axum::Json(serde_json::json!({"status":"ok"})) }))
-        .layer(axum::middleware::from_fn_with_state(api.gateway_auth(),gateway::auth::require_key));
+        .merge(cuteafd_api::openai::console::asset_routes());
+    let app = api.mount_console(app).layer(axum::middleware::from_fn_with_state(api.gateway_auth(),gateway::auth::require_key));
+    let mut app = api.track(app);
     if let Some(directory) = args.record {
         let recorder = Recorder::new(directory,Sanitizer::from_env(secrets))?;
         app = app.layer(axum::middleware::from_fn_with_state(recorder,gateway::record::middleware));

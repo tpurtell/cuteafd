@@ -52,6 +52,7 @@ const fmt = {
 // opts: {page: 'console' | 'bench', subtitle}.
 const PAGES = [
   { id: 'console', href: '/', label: 'LIVE CONSOLE' },
+  { id: 'usage', href: '/usage', label: 'USAGE' },
   { id: 'bench', href: '/bench', label: 'BENCHMARK', primary: true },
 ];
 function header(el, opts = {}) {
@@ -158,5 +159,171 @@ function meter(segments, total) {
   return `<div class="track">${segments.map((s) => `<span style="background:${color(s.color)};width:${(100 * Math.max(0, s.value) / Math.max(1e-9, total)).toFixed(2)}%"></span>`).join('')}</div>`;
 }
 
-window.CuteUI = { token, color, fmt, header, facts, build, svg: { sparkline, columns, timeline, meter } };
+// Usage charts share a tooltip and a keyboard/hover/click layer. Callers supply
+// numeric data; labels always pass through escaping or textContent.
+let chartTip;
+function tooltip(text, event, target) {
+  chartTip ||= Object.assign(document.body.appendChild(document.createElement('div')), { className: 'tip chart-tip', hidden: true });
+  chartTip.textContent = text; chartTip.hidden = false;
+  const box = target.getBoundingClientRect();
+  chartTip.style.left = Math.max(8, Math.min(innerWidth - chartTip.offsetWidth - 8, event.clientX || box.left)) + 'px';
+  chartTip.style.top = Math.max(8, Math.min(innerHeight - chartTip.offsetHeight - 8, (event.clientY || box.top) + 16)) + 'px';
+}
+function marks(svg, data, describe, click) {
+  svg.setAttribute('role', 'group');
+  svg.querySelectorAll('[data-i]').forEach((node) => {
+    const i = Number(node.dataset.i), item = data[i];
+    node.setAttribute('tabindex', '0'); node.setAttribute('role', click ? 'button' : 'img');
+    node.setAttribute('aria-label', describe(item, i));
+    const show = (e) => tooltip(describe(item, i), e, node);
+    node.onpointermove = show; node.onfocus = show;
+    node.onpointerleave = node.onblur = () => { if (chartTip) chartTip.hidden = true; };
+    node.onclick = () => click?.(item, i);
+    node.onkeydown = (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); click?.(item, i); } };
+  });
+}
+function chartText(x, y, text, anchor = 'start') {
+  return `<text x="${x}" y="${y}" text-anchor="${anchor}" fill="${token('ink-2')}" font-size="10" font-family="${fmt.esc(token('mono'))}">${fmt.esc(text)}</text>`;
+}
+function emptyChart(svg, h) { svg.innerHTML = chartText(8, h / 2, 'No retained data in this range'); }
+// series = [{name, color, values: [number]}], times = epoch-ms positions.
+// A brush calls onBrush([from,to]); clicking a series calls onClick(series,index).
+function area(el, series, opts = {}) {
+  const { svg, w, h } = svgIn(el, 'usage-area', opts.height ?? 160);
+  const times = opts.times || series[0]?.values.map((_, i) => i) || [];
+  if (!times.length || !series.length) { emptyChart(svg, h); return; }
+  const left = 42, right = Math.max(left + 1, w - 8), top = 10, bottom = h - 23;
+  const span = Math.max(1, times.at(-1) - times[0]), X = (t) => left + (right - left) * (t - times[0]) / span;
+  const sums = times.map((_, i) => series.reduce((n, s) => n + Math.max(0, s.values[i] || 0), 0));
+  const max = opts.max ?? Math.max(1, ...(opts.stacked === false ? series.flatMap((s) => s.values.filter(Number.isFinite)) : sums)), Y = (v) => bottom - v / max * (bottom - top);
+  let out = [0, .5, 1].map((f) => `<path d="M${left},${Y(f * max)}H${right}" stroke="${token('line')}"/>` + chartText(left - 5, Y(f * max) + 3, fmt.compact(f * max), 'end')).join('');
+  const floors = times.map(() => 0);
+  series.forEach((s, j) => {
+    const lower = floors.slice(), upper = floors.map((n, i) => n + Math.max(0, s.values[i] || 0));
+    const path = opts.columns ? upper.map((n, i) => { const bw = (right - left) / times.length, x = left + i * bw, width = Math.max(1, bw - 2); return `M${x},${Y(n)}h${width}V${Y(lower[i])}H${x}Z`; }).join('') : upper.map((n, i) => `${i ? 'L' : 'M'}${X(times[i])},${Y(n)}`).join('') + lower.map((n, i) => [X(times[i]), Y(n)]).reverse().map(([x, y]) => `L${x},${y}`).join('') + 'Z';
+    if (opts.stacked === false) {
+      const line = s.values.map((v, i) => `${i ? 'L' : 'M'}${X(times[i])},${Y(v || 0)}`).join('');
+      out += `<path d="${line}" fill="none" stroke="${fmt.esc(color(s.color))}" stroke-width="2" stroke-dasharray="${s.dash || (j % 2 ? '5 3' : '')}"/><path data-i="${j}" d="${line}" fill="none" stroke="transparent" stroke-width="14"/>`;
+    } else {
+      out += `<path data-i="${j}" d="${path}" fill="${fmt.esc(color(s.color))}" fill-opacity="${s.opacity ?? .7}" stroke="${token('panel')}" stroke-width="2"/>`;
+      upper.forEach((n, i) => { floors[i] = n; });
+    }
+  });
+  const label = opts.label || ((t) => new Date(t).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }));
+  out += chartText(left, h - 4, label(times[0])) + chartText(right, h - 4, label(times.at(-1)), 'end');
+  out += `<rect class="chart-brush" x="0" y="${top}" width="0" height="${bottom - top}" fill="${token('ink')}" opacity=".1" pointer-events="none"/><path class="chart-crosshair" d="" stroke="${token('ink-2')}" stroke-dasharray="3 3" pointer-events="none"/>`;
+  svg.innerHTML = out;
+  marks(svg, series, (s) => s.name, (s, i) => opts.onClick?.(s, i));
+  const nearest = (e) => {
+    const rect = svg.getBoundingClientRect(), x = Math.max(left, Math.min(right, (e.clientX - rect.left) * w / rect.width));
+    if (opts.columns) return Math.min(times.length - 1, Math.floor((x - left) / (right - left) * times.length));
+    const t = times[0] + (x - left) / (right - left) * span;
+    return times.reduce((best, v, i) => Math.abs(v - t) < Math.abs(times[best] - t) ? i : best, 0);
+  };
+  let start = null, moved = false;
+  svg.onpointermove = (e) => {
+    const i = nearest(e), x = X(times[i]);
+    svg.querySelector('.chart-crosshair').setAttribute('d', `M${x},${top}V${bottom}`);
+    tooltip(`${label(times[i])}\n${series.map((s) => `${fmt.n1(s.values[i] || 0)}  ${s.name}`).join('\n')}`, e, svg);
+    if (start != null) {
+      moved ||= Math.abs(i - start) > 0;
+      const brush = svg.querySelector('.chart-brush');
+      brush.setAttribute('x', Math.min(x, X(times[start]))); brush.setAttribute('width', Math.abs(x - X(times[start])));
+    }
+  };
+  svg.onpointerdown = (e) => { if (!opts.onBrush) return; start = nearest(e); moved = false; svg.setPointerCapture(e.pointerId); };
+  svg.onpointerup = (e) => {
+    if (start != null && moved) { const end = nearest(e); opts.onBrush?.([times[Math.min(start, end)], times[Math.max(start, end)]]); }
+    start = null; svg.querySelector('.chart-brush')?.setAttribute('width', 0);
+  };
+  svg.onpointercancel = () => { start = null; };
+  svg.onpointerleave = () => { if (chartTip) chartTip.hidden = true; svg.querySelector('.chart-crosshair').setAttribute('d', ''); };
+  svg.addEventListener('click', (e) => { if (moved) { e.stopPropagation(); moved = false; } }, { capture: true });
+}
+// Backend bins are floor(log2(value)): bin 0 includes zero; bin 23 is open-ended.
+function histogram(el, bins, opts = {}) {
+  const { svg, w, h } = svgIn(el, 'usage-histogram', opts.height ?? 130);
+  if (!bins?.length || !bins.some((n) => n > 0)) { emptyChart(svg, h); return; }
+  const last = Math.max(1, ...bins.map((n, i) => n || opts.ghost?.[i] ? i : 0));
+  const count = last + 1, left = 32, top = 22, bottom = h - 23, bw = Math.max(1, (w - left - 4) / count);
+  const max = Math.max(1, ...bins, ...(opts.ghost || [])), Y = (n) => bottom - n / max * (bottom - top);
+  let out = chartText(0, top, fmt.compact(max));
+  bins.slice(0, count).forEach((n, i) => {
+    const x = left + i * bw, ghost = opts.ghost?.[i];
+    if (ghost) out += `<rect x="${x + 1}" y="${Y(ghost)}" width="${Math.max(1, bw - 2)}" height="${bottom - Y(ghost)}" fill="none" stroke="${token('ink-2')}" stroke-dasharray="3 2"/>`;
+    out += `<rect data-i="${i}" x="${x + 1}" y="${Y(n)}" width="${Math.max(1, bw - 2)}" height="${Math.max(1, bottom - Y(n))}" rx="3" fill="${fmt.esc(color(opts.color || 'target'))}"/>`;
+    if (i % Math.max(1, Math.ceil(count / 5)) === 0) out += chartText(x + bw / 2, h - 5, fmt.compact(2 ** i), 'middle');
+  });
+  [['p50', opts.p50], ['p95', opts.p95], ['p99', opts.p99]].forEach(([name, v], i) => {
+    if (!Number.isFinite(v)) return;
+    const x = Math.max(left, Math.min(w - 4, left + (Math.log2(Math.max(1, v)) + .5) * bw));
+    out += `<path d="M${x},${top}V${bottom}" stroke="${token('ink-2')}" stroke-dasharray="2 3"/>`;
+    out += chartText(left + i * (w - left) / 3, 12, `${name} ${fmt.n1(v)}`);
+  });
+  svg.innerHTML = out;
+  marks(svg, bins, (n, i) => `${fmt.n0(n)} requests\n${i === 0 ? '0' : 2 ** i} - ${i === 23 ? 'infinity' : 2 ** (i + 1)} ${opts.unit || ''}`, (_, i) => opts.onClick?.({ from: i === 0 ? 0 : 2 ** i, to: i === 23 ? Infinity : 2 ** (i + 1), index: i }));
+}
+// rows = [{client, protocol, model, requests, tokens}]. Node widths and links
+// share one normalization so incoming and outgoing ribbon mass is conserved.
+function ribbons(el, rows, opts = {}) {
+  const h = opts.height ?? 220, { svg, w } = svgIn(el, 'usage-ribbons', h);
+  if (!rows?.length) { emptyChart(svg, h); return; }
+  const fields = ['client', 'protocol', 'model'], metric = opts.metric || 'requests';
+  const nodes = fields.map((field) => [...new Set(rows.map((r) => r[field] || 'unknown'))].sort().map((name) => ({ name, field, value: rows.filter((r) => (r[field] || 'unknown') === name).reduce((n, r) => n + (r[metric] || 0), 0) })));
+  const total = Math.max(1, nodes[0].reduce((n, r) => n + r.value, 0)), maxN = Math.max(...nodes.map((n) => n.length));
+  const scale = Math.max(1, h - 45 - maxN * 9) / total, xs = [8, w / 2 - 6, w - 20];
+  nodes.forEach((list) => { let y = 30; list.forEach((n) => { n.y = y; n.h = n.value * scale; n.offset = 0; y += n.h + 9; }); });
+  let out = fields.map((field, i) => chartText(xs[i], 12, field, i === 2 ? 'end' : 'start')).join('');
+  for (let col = 0; col < 2; col++) {
+    nodes[col].forEach((n) => { n.offset = 0; }); nodes[col + 1].forEach((n) => { n.offset = 0; });
+    const links = new Map();
+    rows.forEach((r) => { const a = r[fields[col]] || 'unknown', b = r[fields[col + 1]] || 'unknown', k = JSON.stringify([a, b, r.protocol]); const link = links.get(k) || { a, b, protocol: r.protocol, value: 0 }; link.value += r[metric] || 0; links.set(k, link); });
+    for (const link of links.values()) {
+      const a = nodes[col].find((n) => n.name === link.a), b = nodes[col + 1].find((n) => n.name === link.b), thick = link.value * scale;
+      const y0 = a.y + a.offset, y1 = b.y + b.offset, x0 = xs[col] + 12, x1 = xs[col + 1], mid = (x0 + x1) / 2;
+      out += `<path d="M${x0},${y0}C${mid},${y0} ${mid},${y1} ${x1},${y1}L${x1},${y1 + thick}C${mid},${y1 + thick} ${mid},${y0 + thick} ${x0},${y0 + thick}Z" fill="${fmt.esc(color(opts.color?.(link.protocol) || 'target'))}" opacity=".3" stroke="${token('panel')}" stroke-width="2"><title>${fmt.esc(`${link.a} -> ${link.b}: ${fmt.n0(link.value)} ${metric}`)}</title></path>`;
+      a.offset += thick; b.offset += thick;
+    }
+  }
+  const flat = nodes.flat();
+  flat.forEach((n, i) => {
+    const col = fields.indexOf(n.field), x = xs[col];
+    out += `<rect data-i="${i}" x="${x}" y="${n.y}" width="12" height="${Math.max(4, n.h)}" rx="2" fill="${fmt.esc(color(n.field === 'protocol' ? opts.color?.(n.name) || 'target' : 'ink-2'))}"/>`;
+    out += chartText(col === 2 ? x - 5 : x + 17, n.y + Math.max(10, n.h / 2 + 3), n.name.length > 22 ? n.name.slice(0, 21) + '...' : n.name, col === 2 ? 'end' : 'start');
+  });
+  svg.innerHTML = out; marks(svg, flat, (n) => `${n.name}: ${fmt.n0(n.value)} ${metric}`, (n) => opts.onClick?.(n.field, n.name));
+}
+// turns = [{tokens_in,tokens_cached,tokens_out,rid}]. Cached input uses exactly
+// 38% of the series color; outputs remain target-colored regardless of split.
+function strip(el, turns, opts = {}) {
+  const { svg, w, h } = svgIn(el, 'usage-strip', opts.height ?? 24);
+  if (!turns?.length) { emptyChart(svg, h); return; }
+  const total = Math.max(1, turns.reduce((n, t) => n + (t.tokens_in || 0), 0)), gap = 2;
+  const usable = Math.max(1, w - gap * turns.length), c = fmt.esc(color(opts.color || 'target'));
+  let x = 0, out = '';
+  turns.forEach((t, i) => {
+    const bw = usable * (t.tokens_in || 0) / total, cached = Math.min(1, (t.tokens_cached || 0) / Math.max(1, t.tokens_in || 0));
+    out += `<g data-i="${i}"><rect x="${x}" y="1" width="${bw}" height="${h - 7}" rx="2" fill="${c}"/><rect x="${x}" y="1" width="${bw * cached}" height="${h - 7}" fill="${token('well')}"/><rect x="${x}" y="1" width="${bw * cached}" height="${h - 7}" fill="${c}" opacity=".38"/><rect x="${x}" y="${h - 4}" width="${bw * Math.min(1, (t.tokens_out || 0) / Math.max(1, t.tokens_in || 0))}" height="3" fill="${token('target')}"/></g>`;
+    x += bw + gap;
+  });
+  svg.innerHTML = out; marks(svg, turns, (t, i) => `Turn ${i + 1}\n${fmt.n0(t.tokens_in)} input / ${fmt.n0(t.tokens_cached)} cached / ${fmt.n0(t.tokens_out)} output`, (t, i) => opts.onClick?.(t, i));
+}
+// cells = [{day: 'YYYY-MM-DD', hour: 0..23, value}]. One sequential hue.
+function heat(el, cells, opts = {}) {
+  const days = [...new Set((cells || []).map((c) => c.day))].sort();
+  const { svg, w, h } = svgIn(el, 'usage-heat', Math.max(50, days.length * 20 + 25));
+  if (!days.length) { emptyChart(svg, h); return; }
+  const left = Math.min(90, w / 3), cw = Math.max(1, (w - left) / 24), max = Math.max(1, ...cells.map((c) => c.value));
+  let out = days.map((d, i) => chartText(0, 36 + i * 20, d)).join('');
+  for (let hour = 0; hour < 24; hour += 4) out += chartText(left + hour * cw, 12, String(hour).padStart(2, '0'));
+  days.forEach((day, row) => {
+    for (let hour = 0; hour < 24; hour++) {
+      const index = cells.findIndex((c) => c.day === day && c.hour === hour), value = cells[index]?.value || 0;
+      out += `<rect${index >= 0 ? ` data-i="${index}"` : ''} x="${left + hour * cw}" y="${22 + row * 20}" width="${Math.max(1, cw - 2)}" height="18" rx="2" fill="${fmt.esc(color(opts.color || 'target'))}" opacity="${.08 + .92 * value / max}"/>`;
+    }
+  });
+  svg.innerHTML = out; marks(svg, cells, (c) => `${c.day} ${String(c.hour).padStart(2, '0')}:00\n${fmt.n0(c.value)} ${opts.unit || 'requests'}`, (c) => opts.onClick?.(c));
+}
+
+window.CuteUI = { token, color, fmt, header, facts, build, area, histogram, ribbons, strip, heat, svg: { sparkline, columns, timeline, meter, area, histogram, ribbons, strip, heat } };
 })();

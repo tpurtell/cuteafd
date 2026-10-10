@@ -1,0 +1,459 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CUTEAFD Usage</title>
+<link rel="stylesheet" href="/assets/cuteafd-ui.css">
+</head>
+<body>
+<main class="app usage-app" id="usage-app">
+  <header id="header"></header>
+  <section class="panel">
+    <div class="usage-controls">
+      <label>Range <select id="range"><option>1h</option><option>6h</option><option selected>24h</option><option>7d</option><option value="custom">Custom</option></select></label>
+      <label>Split <select id="split"><option>protocol</option><option>client</option><option>model</option></select></label>
+      <label><input type="checkbox" id="exclude-bench" checked> Exclude bench</label>
+      <span class="chart-note" id="unlock-state">Checking access...</span>
+      <span class="spacer"></span><span class="chart-note" id="record-count">recorded - / dropped -</span>
+      <button class="btn" id="refresh">REFRESH</button>
+    </div>
+    <div class="usage-controls" id="custom-range" hidden><label>From <input type="datetime-local" id="from"></label><label>To <input type="datetime-local" id="to"></label><button class="btn" id="apply-range">APPLY</button></div>
+    <div class="usage-controls"><label>Filter <select id="filter-field"><option>client</option><option>protocol</option><option>model</option><option>key</option><option>session</option><option>route</option><option>outcome</option><option>stop</option><option>error</option><option>prompt</option><option>cached</option></select></label><input id="filter-value" aria-label="Filter value" placeholder="Exact value"><button class="btn" id="add-filter">ADD</button><div class="filter-chips" id="chips"></div></div>
+    <div class="note">Charts filter the page. Drag the time chart to zoom. Histogram, cache, stop and error selections narrow all metadata panels and the paged request table.</div>
+    <div id="page-notice" class="load-error" role="status"></div>
+  </section>
+  <section class="kpis" id="kpis" aria-label="Usage overview"></section>
+  <div class="usage-grid">
+    <section class="panel usage-full" id="time-panel">
+      <div class="panel-head"><h2>Flow over time</h2><span class="hint">token rates / drag to select a range</span></div>
+      <div class="legend" id="time-legend"></div><div id="tokens-chart" class="usage-chart"></div>
+      <div class="small-multiples"><div><p class="chart-title">Request rate / s</p><div id="request-rate" class="usage-chart"></div></div><div><p class="chart-title">Concurrency / blue = mean, shade = max - mean</p><div id="concurrency-chart" class="usage-chart"></div></div></div>
+      <details><summary>Time series data</summary><div id="series-table" class="chart-data"></div></details>
+      <details><summary>Activity by UTC hour</summary><div id="activity-heat" class="usage-chart"></div></details>
+    </section>
+    <section class="panel usage-full" id="latency-panel">
+      <div class="panel-head"><h2>Latency</h2><span class="hint">log2 bins / dashed outline = previous period</span></div>
+      <div class="small-multiples"><div><p class="chart-title">Time to first token / ms</p><div id="ttft-chart" class="usage-chart"></div></div><div><p class="chart-title">Decode / tokens per second</p><div id="decode-chart" class="usage-chart"></div></div></div>
+      <div class="chart-note" id="prefill-note"></div><div id="latency-facets" class="small-multiples"></div>
+      <details><summary>Latency distribution data</summary><div id="latency-table" class="chart-data"></div></details>
+    </section>
+    <section class="panel" id="cache-panel"><div class="panel-head"><h2>Prefix cache</h2><span class="hint">hit rate and tokens saved</span></div><div class="chart-note" id="cache-note"></div><p class="chart-title">Cached input / %</p><div id="cache-rate" class="usage-chart"></div><p class="chart-title">Tokens saved per bucket</p><div id="cache-saved" class="usage-chart"></div><div class="legend" id="cache-legend"></div><details><summary>Cache data</summary><div id="cache-table" class="chart-data"></div></details></section>
+    <section class="panel" id="cache-benefit-panel"><div class="panel-head"><h2>What the cache buys</h2><span class="hint">median TTFT / p95 tick</span></div><div id="cache-benefit" class="usage-chart"></div><div class="chart-note">blue column = median / shade and tick = p95</div><div id="cache-facets-table" class="chart-data"></div></section>
+    <section class="panel usage-full" id="spec-panel"><div class="panel-head"><h2>Speculation</h2><span class="hint">acceptance by model and client</span></div><div class="legend" id="spec-legend"></div><div id="acceptance-chart" class="usage-chart"></div><div id="spec-models" class="small-multiples"></div><p class="chart-title">Acceptance by client / %</p><div id="client-acceptance-chart" class="usage-chart"></div><div class="legend" id="client-acceptance-legend"></div><div id="spec-clients" class="chart-data"></div><details><summary>Acceptance series data</summary><div id="spec-table" class="chart-data"></div></details></section>
+    <section class="panel usage-full" id="flow-panel"><div class="panel-head"><h2>Clients / protocols / models</h2><span class="hint">click a node to filter</span><label class="ctl">Width <select id="flow-metric"><option>requests</option><option>tokens</option></select></label></div><div class="legend" id="flow-legend"></div><div id="flow-chart" class="usage-chart"></div><details><summary>Flow data</summary><div id="flow-table" class="chart-data"></div></details></section>
+    <section class="panel usage-full" id="sessions-panel"><div class="panel-head"><h2>Sessions</h2><span class="hint">newest activity first / dimmed = prefix inferred</span></div><div class="chart-note">Strip: input width, cached input at 38%, output in target blue.</div><div id="sessions-table" class="tablewrap"></div><button id="sessions-show-more" class="btn" hidden>SHOW MORE SESSIONS</button><div id="session-detail" hidden></div></section>
+    <section class="panel usage-full" id="log-panel"><div class="panel-head"><h2>Full log</h2><span class="hint">virtual conversations / deltas and edited history</span></div><div id="log-notice" class="lock-note"></div><div class="log-layout" id="log-layout"><div><div id="log-list" class="log-list"></div><button id="log-more" class="btn" hidden>MORE CONVERSATIONS</button></div><div id="conversation" class="conversation"><div class="empty">Select a conversation to read its turns.</div></div></div></section>
+    <section class="panel usage-full" id="errors-panel"><div class="panel-head"><h2>Errors and stops</h2><span class="hint">error buckets and stop reasons</span></div><div class="legend" id="errors-legend"></div><div id="errors-chart" class="usage-chart"></div><div id="stops-meter"></div><div id="stops-legend" class="legend"></div><div id="errors-table" class="tablewrap"></div><details><summary>Error series data</summary><div id="errors-series-table" class="chart-data"></div></details></section>
+    <section class="panel usage-full" id="requests-panel"><div class="panel-head"><h2>Requests</h2><span class="hint" id="request-note">cursor-paged retained metadata</span></div><div id="requests-table" class="tablewrap"></div><button id="requests-show-more" class="btn" hidden>SHOW MORE REQUESTS</button><button id="requests-more" class="btn" hidden>LOAD MORE</button><div id="request-detail" class="request-detail" hidden></div></section>
+    <section class="panel usage-full" id="settings-panel"><div class="panel-head"><h2>Settings</h2><span class="hint">retention / recording / storage</span></div><div id="settings-locked" class="lock-note" hidden></div><form id="settings-form"><div class="settings-grid" id="settings-fields"></div><p class="settings-warning" id="settings-warning">With the full log on, user prompts and model outputs are stored in plain text for the retention period.</p><p class="note">Only daily aggregates outlive metadata retention. They retain counts, token sums and histograms, not request IDs, sessions or payloads. A zero retention or cap disables its tier.</p><div id="storage-facts" class="chart-note"></div><div class="settings-actions"><button class="btn" type="submit">SAVE SETTINGS</button><button class="btn danger" type="button" id="clear-log">CLEAR FULL LOG</button><button class="btn danger" type="button" id="clear-all">CLEAR EVERYTHING</button><span id="settings-message" class="load-error" role="status"></span></div></form></section>
+  </div>
+</main>
+<script src="/assets/cuteafd-ui.js"></script>
+<script>
+(() => {
+'use strict';
+const UI = window.CuteUI, F = UI.fmt, $ = (id) => document.getElementById(id), esc = F.esc;
+const shell = UI.header($('header'), { page: 'usage', subtitle: 'Usage' });
+const LOCK = "open the link from the run script's log to unlock";
+const protocolColors = { chat: 'target', messages: 'prefill', responses: 'accepted', realtime: 'grammar', completions: 'restore' };
+const S = { data: {}, filters: {}, sorts: { sessions: { sort: 'time', order: 'desc' }, requests: { sort: 'time', order: 'desc' } }, sessionRows: 10, requestRows: 10, locked: false, generation: 0, loading: false, requests: [], requestCursor: null, logs: [], logCursor: null, vsid: null, rid: null, session: null, settings: null, settingsDirty: false, live: null, flowMetric: 'requests' };
+const pct = (n) => Number.isFinite(n) ? (100 * n).toFixed(1) + '%' : '-';
+const time = (n) => Number.isFinite(n) ? new Date(n).toLocaleString() : '-';
+const compact = (n) => Number.isFinite(n) ? F.compact(n) : '-';
+const colorFor = (name, split = $('split').value) => split === 'protocol' ? protocolColors[name] || 'ink-2' : 'target';
+const stableDash = (name) => { let hash = 0; for (const c of String(name)) hash = (hash * 31 + c.charCodeAt(0)) >>> 0; return ['none', '5 3', '2 3', '8 3 2 3'][hash % 4]; };
+const bucket = () => $('range').value === '1h' ? '1m' : $('range').value === '6h' ? '5m' : '1h';
+const bucketMs = () => ({ '1m': 60000, '5m': 300000, '1h': 3600000 })[bucket()];
+function params(extra = {}) {
+  const p = { range: $('range').value === 'custom' ? '24h' : $('range').value, split: $('split').value, bucket: bucket(), bench: !$('exclude-bench').checked, ...S.filters, ...extra };
+  if ($('range').value === 'custom') { p.from = new Date($('from').value).getTime(); p.to = new Date($('to').value).getTime(); }
+  return new URLSearchParams(Object.entries(p).filter(([, v]) => v != null)).toString();
+}
+async function api(route, options = {}, query = true) {
+  const headers = { ...(options.headers || {}), 'x-cuteafd-console': '1' };
+  const response = await fetch('/console/usage/' + route + (query ? '?' + params(options.query || {}) : ''), { credentials: 'same-origin', ...options, headers });
+  let body; try { body = await response.json(); } catch (_) { body = null; }
+  if (!response.ok) { const error = new Error(body?.error?.message || (response.status === 401 ? LOCK : response.status === 404 ? 'Expired / not retained' : 'Usage route unavailable (' + response.status + ')')); error.status = response.status; throw error; }
+  return body;
+}
+function table(headers, rows) {
+  return '<table><thead><tr>' + headers.map((h) => '<th>' + esc(h) + '</th>').join('') + '</tr></thead><tbody>' + (rows.length ? rows.map((r) => '<tr>' + r.map((v) => '<td>' + esc(v) + '</td>').join('') + '</tr>').join('') : '<tr><td colspan="' + headers.length + '" class="empty">No retained data in this range</td></tr>') + '</tbody></table>';
+}
+function legend(el, names, split = $('split').value) {
+  el.innerHTML = names.map((name) => '<button type="button" data-name="' + esc(name) + '"><i style="background:' + esc(UI.color(colorFor(name, split))) + '"></i>' + esc(name || 'unknown') + (split === 'protocol' ? '' : ' / ' + ({ none: 'solid', '5 3': 'dash', '2 3': 'dot', '8 3 2 3': 'dash-dot' })[stableDash(name)]) + '</button>').join('');
+  el.querySelectorAll('button').forEach((b) => { b.onclick = () => addFilter(split, b.dataset.name); });
+}
+function applyFilters(values) {
+  Object.assign(S.filters, values); S.session = null; S.rid = null; S.vsid = null;
+  S.sessionRows = 10; S.requestRows = 10; renderChips(); refresh();
+}
+function addFilter(field, value) { applyFilters({ [field]: value }); }
+function metricFilter(metric, bin, filters = {}) {
+  delete S.filters.min; delete S.filters.max;
+  applyFilters({ ...filters, metric, min: Number.isFinite(bin.from) ? bin.from : null, max: Number.isFinite(bin.to) ? bin.to : null });
+}
+function renderChips() {
+  $('chips').replaceChildren();
+  for (const [key, value] of Object.entries(S.filters)) {
+    if (value == null || key === 'min' || key === 'max') continue;
+    const b = document.createElement('button'); b.className = 'chip'; b.type = 'button';
+    b.textContent = key === 'metric' ? value + ' [' + (S.filters.min ?? '-inf') + ', ' + (S.filters.max ?? '+inf') + ') x' : key + '=' + value + ' x';
+    b.onclick = () => { delete S.filters[key]; if (key === 'metric') { delete S.filters.min; delete S.filters.max; } S.session = null; S.rid = null; S.vsid = null; S.sessionRows = 10; S.requestRows = 10; renderChips(); refresh(); }; $('chips').appendChild(b);
+  }
+}
+function routeNotice(panel, error) {
+  const node = $(panel); let n = node.querySelector('.route-error');
+  if (!n) { n = document.createElement('div'); n.className = 'route-error load-error'; node.appendChild(n); }
+  n.textContent = error ? error.message : '';
+}
+const routes = [['summary', 'time-panel'], ['series', 'time-panel'], ['latency', 'latency-panel'], ['cache', 'cache-panel'], ['speculation', 'spec-panel'], ['flow', 'flow-panel'], ['sessions', 'sessions-panel'], ['errors', 'errors-panel']];
+async function refresh() {
+  const generation = ++S.generation; S.loading = true;
+  $('usage-app').classList.add('refreshing');
+  const results = await Promise.all(routes.map(async ([route, panel]) => {
+    try {
+      if (route === 'speculation') { const [data, clients] = await Promise.all([api(route, { query: { split: 'model' } }), api(route, { query: { split: 'client' } })]); return { route, panel, data: { ...data, client_series: clients.series } }; }
+      return { route, panel, data: await api(route, { query: route === 'sessions' ? S.sorts.sessions : {} }) };
+    } catch (error) { return { route, panel, error }; }
+  }));
+  if (generation !== S.generation) return;
+  S.locked = results.some((r) => r.error?.status === 401);
+  for (const { route, panel, data, error } of results) { S.data[route] = error ? null : data; routeNotice(panel, error); }
+  if (S.locked) { S.rid = null; S.vsid = null; S.session = null; $('request-detail').replaceChildren(); $('request-detail').hidden = true; $('session-detail').replaceChildren(); $('session-detail').hidden = true; }
+  $('unlock-state').textContent = S.locked ? 'LOCKED / ' + LOCK : 'UNLOCKED / cookie access';
+  shell.status.innerHTML = '<span class="status ' + (S.locked ? '' : 'live') + '"><i></i>' + (S.locked ? 'LOCKED' : 'RETAINED USAGE') + '</span>';
+  $('page-notice').textContent = S.data.summary?.resolution === 'daily' ? 'Daily aggregates included. Latency and sessions describe retained rows only.' : '';
+  renderOverview(); renderSeries(); renderLatency(); renderCache(); renderSpec(); renderFlow(); renderSessions(); renderErrors();
+  await Promise.all([loadRequests(generation), loadLogs(generation), loadSettings(generation), previousLatency(generation), stats()]);
+  if (generation !== S.generation) return;
+  S.loading = false; $('usage-app').classList.remove('refreshing'); document.body.dataset.usageReady = 'true';
+}
+const tileDefs = [['requests', 'Requests', 'target'], ['tokens', 'Tokens in / cached / out', 'prefill'], ['errors', 'Error rate', 'rejected'], ['ttft', 'TTFT p50 / p95', 'target'], ['decode', 'Decode p50 / tok/s', 'target'], ['cache', 'Cache hit', 'accepted'], ['acceptance', 'Acceptance', 'accepted'], ['concurrency', 'Concurrency now', 'grammar']];
+$('kpis').innerHTML = tileDefs.map(([key, label, color]) => '<div class="tile" style="--c:var(--' + color + ')"><div class="label">' + label + '</div><div class="v" id="k-' + key + '">-</div><div class="sub" id="ks-' + key + '"></div><svg class="spark" id="spark-' + key + '"></svg></div>').join('');
+function renderOverview() {
+  const d = S.data.summary || {}, latency = d.latency || {};
+  const values = { requests: [compact(d.requests), 'retained requests'], tokens: [compact(d.tokens_in), compact(d.tokens_cached) + ' cached / ' + compact(d.tokens_out) + ' out'], errors: [pct(d.error_rate), compact(d.errors) + ' errors'], ttft: [F.ms(latency.ttft?.p50), 'p95 ' + F.ms(latency.ttft?.p95)], decode: [F.n1(latency.decode?.p50), 'p95 ' + F.n1(latency.decode?.p95)], cache: [pct(d.cache_hit), 'cached input fraction'], acceptance: [pct(d.acceptance), 'accepted / proposed'], concurrency: [S.live == null ? '-' : F.n0(S.live), 'live / max ' + compact(d.concurrency_max)] };
+  for (const [key, , color] of tileDefs) { $('k-' + key).textContent = values[key][0]; $('ks-' + key).textContent = values[key][1];
+    const field = { tokens: 'tokens_in', errors: 'error_rate', cache: 'cache_hit', concurrency: 'concurrency_mean' }[key] || key;
+    const rows = Array.isArray(d.series) ? aggregate(d.series) : [];
+    UI.svg.sparkline($('spark-' + key), rows.map((r) => key === 'ttft' ? r.latency?.ttft?.p50 : key === 'decode' ? r.latency?.decode?.p50 : r[field]), { color, points: Math.max(2, rows.length) });
+  }
+  renderCounters(d.usage);
+}
+function renderCounters(d) { if (d) $('record-count').textContent = 'recorded ' + F.n0(d.recorded) + ' / dropped ' + F.n0(d.dropped); }
+// Counters come from the cookie-gated settings route; /v1/stats needs the API key.
+async function stats() { try { const r = await fetch('/console/usage/settings', { credentials: 'same-origin' }); if (r.ok) renderCounters((await r.json()).usage); } catch (_) {} }
+function aggregate(rows) {
+  const groups = new Map();
+  for (const r of rows || []) { const a = groups.get(r.ts_ms) || { ts_ms: r.ts_ms, requests: 0, errors: 0, tokens_in: 0, tokens_cached: 0, tokens_out: 0, concurrency_max: 0, concurrency_sum: 0, weight: 0 };
+    for (const k of ['requests', 'errors', 'tokens_in', 'tokens_cached', 'tokens_out']) a[k] += r[k] || 0;
+    a.concurrency_max = Math.max(a.concurrency_max, r.concurrency_max || 0); a.concurrency_sum += (r.concurrency_mean || 0) * (r.requests || 0); a.weight += r.requests || 0;
+    // Percentiles cannot be averaged across groups; retain only single-group values.
+    a.latency = groups.has(r.ts_ms) ? null : r.latency; a.acceptance = groups.has(r.ts_ms) ? null : r.acceptance;
+    groups.set(r.ts_ms, a);
+  }
+  return [...groups.values()].sort((a, b) => a.ts_ms - b.ts_ms).map((a) => ({ ...a, cache_hit: a.tokens_in ? a.tokens_cached / a.tokens_in : null, error_rate: a.requests ? a.errors / a.requests : null, concurrency_mean: a.weight ? a.concurrency_sum / a.weight : 0 }));
+}
+function rawSeries(value) {
+  if (Array.isArray(value)) return value;
+  if (value?.resolution === 'daily') {
+    const retained = value.retained || [], groups = new Map(), split = $('split').value;
+    for (const r of value.daily || []) {
+      const ts = r.day_ms ?? r.ts_ms ?? Date.parse(r.day + 'T00:00:00Z'), name = r[split] || 'unknown', key = JSON.stringify([ts, name]);
+      const a = groups.get(key) || { ts_ms: ts, split: name, daily: true, requests: 0, errors: 0, tokens_in: 0, tokens_cached: 0, tokens_out: 0 };
+      for (const field of ['requests', 'errors', 'tokens_in', 'tokens_cached', 'tokens_out']) a[field] += r[field] || 0;
+      groups.set(key, a);
+    }
+    return [...retained, ...groups.values()].filter((r) => Number.isFinite(r.ts_ms));
+  }
+  return [];
+}
+function zoom(bounds) { $('range').value = 'custom'; $('custom-range').hidden = false; $('from').value = localDate(bounds[0]); $('to').value = localDate(bounds[1]); refresh(); }
+function localDate(ms) { const d = new Date(ms); return new Date(ms - d.getTimezoneOffset() * 60000).toISOString().slice(0, 16); }
+function seriesTimes(rows) {
+  const times = [...new Set(rows.map((r) => r.ts_ms))].sort((a, b) => a - b);
+  if (!times.length || rows.some((r) => r.daily)) return times;
+  const step = bucketMs(), slots = Math.round((times.at(-1) - times[0]) / step) + 1;
+  return slots <= 10000 ? Array.from({ length: slots }, (_, i) => times[0] + i * step) : times;
+}
+function seriesChart(id, rows, field, opts = {}) {
+  const times = seriesTimes(rows), names = [...new Set(rows.map((r) => r.split))].sort();
+  const series = names.map((name) => ({ name: name || 'unknown', color: colorFor(name, opts.split), dash: stableDash(name), values: times.map((t) => { const r = rows.find((r) => r.ts_ms === t && r.split === name); return opts.value ? opts.value(r) : r?.[field] || 0; }) }));
+  UI.area($(id), series, { times, height: opts.height || 160, max: opts.max, stacked: opts.stacked, columns: opts.columns, onBrush: zoom, onClick: (s) => addFilter(opts.split || $('split').value, s.name) });
+  return names;
+}
+function renderSeries() {
+  const rows = rawSeries(S.data.series), sums = aggregate(rows), rate = bucketMs() / 1000;
+  const tokenNames = [...new Set(rows.map((r) => r.split))].sort(), tokenTimes = seriesTimes(rows);
+  const tokenSeries = tokenNames.flatMap((name) => [['prefill', 0.7], ['cached', 0.38], ['output', 1]].map(([kind, opacity]) => ({ name: (name || 'unknown') + ' / ' + kind, split: name, color: colorFor(name), opacity, values: tokenTimes.map((t) => { const r = rows.find((r) => r.ts_ms === t && r.split === name); const tokens = kind === 'cached' ? r?.tokens_cached || 0 : kind === 'output' ? r?.tokens_out || 0 : Math.max(0, (r?.tokens_in || 0) - (r?.tokens_cached || 0)); return tokens / (r?.daily ? 86400 : rate); }) })));
+  UI.area($('tokens-chart'), tokenSeries, { times: tokenTimes, height: 180, onBrush: zoom, onClick: (s) => addFilter($('split').value, s.split) });
+  legend($('time-legend'), tokenNames);
+  $('time-legend').insertAdjacentHTML('beforeend', '<span>fill = prefill / 38% = cached / solid = output</span>');
+  const times = sums.map((r) => r.ts_ms);
+  UI.area($('request-rate'), [{ name: 'requests / s', color: 'ink-2', values: sums.map((r) => r.requests / (rows.some((v) => v.daily && v.ts_ms === r.ts_ms) ? 86400 : rate)) }], { times, height: 90, stacked: false, onBrush: zoom });
+  UI.area($('concurrency-chart'), [{ name: 'mean', color: 'target', values: sums.map((r) => r.concurrency_mean) }, { name: 'max - mean', color: 'ink-2', values: sums.map((r) => Math.max(0, r.concurrency_max - r.concurrency_mean)) }], { times, height: 90, onBrush: zoom });
+  $('series-table').innerHTML = table(['Time', 'Split', 'Requests', 'Input', 'Cached', 'Output', 'Concurrency mean / max'], rows.map((r) => [time(r.ts_ms), r.split, r.requests, r.tokens_in, r.tokens_cached, r.tokens_out, F.n1(r.concurrency_mean) + ' / ' + compact(r.concurrency_max)]));
+  const cells = new Map();
+  for (const r of rows) { const d = new Date(r.ts_ms), day = d.toISOString().slice(0, 10), hour = d.getUTCHours(), k = day + ':' + hour; const c = cells.get(k) || { day, hour, value: 0 }; c.value += r.requests; cells.set(k, c); }
+  UI.heat($('activity-heat'), [...cells.values()], { onClick: (c) => { const from = Date.parse(c.day + 'T' + String(c.hour).padStart(2, '0') + ':00:00Z'); zoom([from, from + 3600000]); } });
+}
+function renderLatency(previous = null) {
+  const d = S.data.latency || {};
+  for (const [name, color, unit, field] of [['ttft', 'target', 'ms', 't_ttft_ms'], ['decode', 'accepted', 'tok/s', 'decode_tps']]) {
+    const m = d[name] || {};
+    UI.histogram($(name + '-chart'), m.histogram || [], { ...m, color, unit, ghost: previous?.[name]?.histogram, onClick: (bin) => metricFilter(field, bin) });
+  }
+  $('prefill-note').textContent = 'Prefill tok/s p50 ' + F.n1(d.prefill?.p50) + ' / p95 ' + F.n1(d.prefill?.p95);
+  $('latency-facets').innerHTML = (d.prompt_facets || []).map((f, i) => '<div><button class="btn" data-prompt="' + esc(f.prompt) + '">' + esc(f.prompt) + ' input</button><div id="facet-' + i + '" class="usage-chart"></div></div>').join('');
+  for (const [i, f] of (d.prompt_facets || []).entries()) UI.histogram($('facet-' + i), f.latency?.ttft?.histogram || [], { ...f.latency?.ttft, color: 'target', unit: 'ms', height: 95, onClick: (bin) => { metricFilter('t_ttft_ms', bin, { prompt: f.prompt }); } });
+  $('latency-facets').querySelectorAll('button').forEach((b) => { b.onclick = () => addFilter('prompt', b.dataset.prompt); });
+  const rows = [];
+  for (const metric of ['ttft', 'decode', 'prefill']) (d[metric]?.histogram || []).forEach((n, i) => { if (n) rows.push([metric, i === 0 ? '0..2' : i === 23 ? '8388608+' : 2 ** i + '..' + 2 ** (i + 1), n]); });
+  $('latency-table').innerHTML = table(['Metric', 'Bin', 'Requests'], rows);
+}
+async function previousLatency(generation) {
+  if (S.locked || !S.data.latency) return;
+  const p = new URLSearchParams(params()), to = Number(p.get('to')) || Date.now(), durations = { '1h': 3600000, '6h': 21600000, '24h': 86400000, '7d': 604800000 }, from = Number(p.get('from')) || to - durations[p.get('range')];
+  try { const prev = await api('latency', { query: { from: from - (to - from), to: from - 1 } }); if (generation === S.generation) renderLatency(prev); } catch (_) {}
+}
+function renderCache() {
+  const d = S.data.cache || {}, rows = rawSeries(d.series);
+  $('cache-note').textContent = pct(d.hit_rate) + ' cached input / ' + compact(d.tokens_saved) + ' tokens saved';
+  seriesChart('cache-rate', rows, 'cache_hit', { value: (r) => (r?.cache_hit || 0) * 100, height: 100, max: 100, stacked: false });
+  legend($('cache-legend'), seriesChart('cache-saved', rows, 'tokens_cached', { height: 100 }));
+  $('cache-table').innerHTML = table(['Time', 'Split', 'Hit %', 'Tokens saved'], rows.map((r) => [time(r.ts_ms), r.split, pct(r.cache_hit), r.tokens_cached]));
+  const facets = d.facets || [];
+  UI.svg.columns($('cache-benefit'), facets.map((f) => f.latency?.ttft?.p50), { median: facets.map((f) => f.latency?.ttft?.p95), label: (i) => facets[i].fraction, height: 160 });
+  // Existing columns remains unchanged; add p95 ticks and focus/click targets here.
+  const svg = $('cache-benefit').querySelector('svg');
+  if (svg && facets.length) {
+    const w = svg.viewBox.baseVal.width, h = 160, bw = w / facets.length, max = Math.max(1, ...facets.flatMap((f) => [f.latency?.ttft?.p50 || 0, f.latency?.ttft?.p95 || 0]));
+    facets.forEach((f, i) => { const g = document.createElementNS('http://www.w3.org/2000/svg', 'g'); g.innerHTML = '<path d="M' + (i * bw + bw * .2) + ',' + (h - 13 - (h - 25) * (f.latency?.ttft?.p95 || 0) / max) + 'h' + bw * .6 + '" stroke="' + UI.token('ink-2') + '" stroke-width="2"/><rect x="' + i * bw + '" y="0" width="' + bw + '" height="160" fill="transparent"/>'; g.setAttribute('tabindex', '0'); g.setAttribute('role', 'button'); g.setAttribute('aria-label', f.fraction + ' cached / p50 ' + F.ms(f.latency?.ttft?.p50) + ' / p95 ' + F.ms(f.latency?.ttft?.p95)); const title = document.createElementNS('http://www.w3.org/2000/svg', 'title'); title.textContent = g.getAttribute('aria-label'); g.appendChild(title); g.onclick = () => addFilter('cached', f.fraction); g.onkeydown = (e) => { if (e.key === 'Enter') g.onclick(); }; svg.appendChild(g); });
+  }
+  $('cache-facets-table').innerHTML = table(['Cached fraction', 'Requests', 'TTFT p50', 'TTFT p95'], facets.map((f) => [f.fraction, f.requests, F.ms(f.latency?.ttft?.p50), F.ms(f.latency?.ttft?.p95)]));
+}
+function renderSpec() {
+  const d = S.data.speculation || {}, rows = rawSeries(d.series);
+  const names = seriesChart('acceptance-chart', rows, 'acceptance', { value: (r) => (r?.acceptance || 0) * 100, height: 120, max: 100, split: 'model', stacked: false }); legend($('spec-legend'), names, 'model');
+  $('spec-models').innerHTML = (d.by_model || []).map((m, i) => '<div><button class="btn" data-model="' + esc(m.model) + '">' + esc(m.model || 'unknown') + '</button><p class="chart-note">' + pct(m.summary?.acceptance) + ' acceptance / ' + F.n1(m.tokens_per_round) + ' tokens per round</p><div id="rounds-' + i + '" class="usage-chart"></div></div>').join('');
+  (d.by_model || []).forEach((m, i) => UI.histogram($('rounds-' + i), m.histogram || [], { color: 'accepted', unit: 'tok/round', height: 100, onClick: (bin) => { metricFilter('tokens_per_round', bin, { model: m.model }); } }));
+  $('spec-models').querySelectorAll('button').forEach((b) => { b.onclick = () => addFilter('model', b.dataset.model); });
+  legend($('client-acceptance-legend'), seriesChart('client-acceptance-chart', rawSeries(d.client_series), 'acceptance', { value: (r) => (r?.acceptance || 0) * 100, height: 100, max: 100, split: 'client', stacked: false }), 'client');
+  $('spec-clients').innerHTML = table(['Client', 'Requests', 'Acceptance'], (d.by_client || []).map((c) => [c.client, c.summary?.requests, pct(c.summary?.acceptance)]));
+  $('spec-clients').querySelectorAll('tbody tr').forEach((tr, i) => { if (d.by_client?.[i]) { tr.tabIndex = 0; tr.onclick = () => addFilter('client', d.by_client[i].client); tr.onkeydown = (e) => { if (e.key === 'Enter') tr.onclick(); }; } });
+  $('spec-table').innerHTML = table(['Time', 'Split', 'Acceptance'], rows.map((r) => [time(r.ts_ms), r.split, pct(r.acceptance)]));
+}
+function renderFlow() {
+  const rows = S.data.flow || [];
+  UI.ribbons($('flow-chart'), rows, { metric: S.flowMetric, color: (p) => protocolColors[p], onClick: addFilter, height: Math.max(220, Math.max(0, ...['client', 'protocol', 'model'].map((k) => new Set(rows.map((r) => r[k])).size)) * 36) });
+  legend($('flow-legend'), [...new Set(rows.map((r) => r.protocol))], 'protocol');
+  $('flow-table').innerHTML = table(['Client', 'Protocol', 'Model', 'Requests', 'Tokens'], rows.map((r) => [r.client, r.protocol, r.model, r.requests, r.tokens]));
+}
+function sortHeading(scope, field, label) {
+  const state = S.sorts[scope], active = state.sort === field;
+  return '<th aria-sort="' + (active ? state.order === 'asc' ? 'ascending' : 'descending' : 'none') + '"><button type="button" class="btn" data-sort="' + field + '" title="Sort by ' + esc(label) + '">' + esc(label) + (active ? state.order === 'asc' ? ' / ASC' : ' / DESC' : '') + '</button></th>';
+}
+function bindSort(scope) {
+  $(scope + '-table').querySelectorAll('[data-sort]').forEach((b) => { b.onclick = () => {
+    const state = S.sorts[scope], sort = b.dataset.sort;
+    S.sorts[scope] = { sort, order: state.sort === sort && state.order === 'desc' ? 'asc' : 'desc' };
+    S[scope === 'sessions' ? 'sessionRows' : 'requestRows'] = 10;
+    if (scope === 'requests') S.requestCursor = null;
+    refresh();
+  }; });
+}
+const ratePair = (p) => F.n1(p?.total_tps) + ' total / ' + F.n1(p?.median_tps) + ' median';
+function timeSplit(times = {}) {
+  const phases = [['queue', 'ink-2'], ['prefill', 'prefill'], ['decode', 'target']];
+  const total = phases.reduce((n, [name]) => n + (Number.isFinite(times?.[name]) ? Math.max(0, times[name]) : 0), 0);
+  let x = 0;
+  const marks = phases.map(([name, color]) => {
+    const value = times?.[name], width = total && Number.isFinite(value) ? Math.max(0, value) / total * 200 : 0;
+    const path = '<rect x="' + x + '" y="1" width="' + width + '" height="10" fill="' + UI.color(color) + '" stroke="' + UI.token('panel') + '" stroke-width="2"><title>' + name + ': ' + esc(F.ms(value)) + '</title></rect>'; x += width; return path;
+  }).join('');
+  const text = phases.map(([name]) => name + ' ' + F.ms(times?.[name])).join(' / ');
+  return '<div class="perf-time"><svg viewBox="0 0 200 12" role="img" tabindex="0" aria-label="' + esc(text) + '" style="display:block;width:100%;min-width:100px;height:12px"><title>' + esc(text) + '</title>' + marks + '</svg><span class="chart-note">' + esc(text) + '</span></div>';
+}
+function perfBlock(perf) {
+  const p = perf || {};
+  return '<div class="performance"><p class="chart-title">Performance / tok/s / total = token sum over time sum</p><div class="small-multiples"><div class="chart-note">Prefill ' + esc(ratePair(p.prefill)) + '<br>' + compact(p.prefill?.computed_tokens) + ' computed / ' + compact(p.prefill?.cached_tokens) + ' cached tokens</div><div class="chart-note">Decode ' + esc(ratePair(p.decode)) + '<br>' + compact(p.decode?.tokens) + ' tokens after first token</div><div class="chart-note">Cache hit ' + pct(p.cache_hit) + '</div></div>' + timeSplit(p.time_ms) + '</div>';
+}
+function requestTimes(r) {
+  const diff = (end, start) => Number.isFinite(end) && Number.isFinite(start) ? Math.max(0, end - start) : null;
+  return { queue: r.t_admit_ms ?? r.t_queue_ms, prefill: diff(r.t_ttft_ms, r.t_admit_ms), decode: diff(r.t_retire_ms ?? r.t_total_ms, r.t_ttft_ms) };
+}
+function renderSessions() {
+  const all = S.data.sessions || [], rows = all.slice(0, S.sessionRows);
+  $('sessions-show-more').hidden = rows.length >= all.length;
+  $('sessions-table').innerHTML = '<table><thead><tr><th>Client / session</th><th>Model</th><th>Turns</th>' + sortHeading('sessions', 'time', 'Last activity') + sortHeading('sessions', 'prefill_tps', 'Prefill tok/s') + sortHeading('sessions', 'decode_tps', 'Decode tok/s') + '<th>Cache hit</th><th>Time split / ms</th><th>Per-turn tokens</th></tr></thead><tbody>' + (rows.length ? rows.map((r, i) => '<tr data-session="' + esc(r.session_id) + '" tabindex="0" class="' + (r.source === 'prefix' ? 'inferred' : '') + '"><td class="wrap">' + esc(r.client) + '<br>' + esc(r.session_id) + (r.source === 'prefix' ? ' / prefix inferred' : '') + '</td><td class="wrap">' + esc(r.model) + '</td><td>' + compact(r.summary?.requests) + '</td><td>' + esc(time(r.last_ms)) + '</td><td class="wrap">' + esc(ratePair(r.perf?.prefill)) + '<br>' + compact(r.perf?.prefill?.computed_tokens) + ' computed tokens</td><td class="wrap">' + esc(ratePair(r.perf?.decode)) + '</td><td>' + pct(r.perf?.cache_hit) + '</td><td class="wrap">' + timeSplit(r.perf?.time_ms) + '</td><td><div class="session-strip" id="session-strip-' + i + '"></div></td></tr>').join('') : '<tr><td colspan="9" class="empty">No retained sessions</td></tr>') + '</tbody></table>';
+  bindSort('sessions');
+  rows.forEach((r, i) => UI.strip($('session-strip-' + i), r.turns || [], { color: 'prefill', onClick: (turn) => { openSession(r.session_id); openRequest(turn.rid); } }));
+  $('sessions-table').querySelectorAll('[data-session]').forEach((tr) => { tr.onclick = (e) => { if (!e.target.closest('svg')) openSession(tr.dataset.session); }; tr.onkeydown = (e) => { if (e.key === 'Enter' && e.target === tr) openSession(tr.dataset.session); }; });
+  if (!S.session) $('session-detail').hidden = true;
+}
+async function openSession(id) {
+  S.session = id; S.filters.session = id; renderChips(); refresh();
+  const detail = $('session-detail'); detail.hidden = false; detail.textContent = 'Loading session...';
+  try {
+    const d = await api('sessions/' + encodeURIComponent(id)); if (S.session !== id) return;
+    const turns = d.turns || [], first = turns[0]?.ts_ms || 0, last = turns.at(-1)?.ts_ms || first;
+    detail.innerHTML = '<h3 class="chart-title">' + esc(id) + ' / turn timeline</h3>' + perfBlock(d.perf) + '<div id="session-timeline" class="usage-chart"></div><div class="small-multiples"><div><p class="chart-title">TTFT / ms</p><div id="session-ttft"></div></div><div><p class="chart-title">Decode / tok/s</p><div id="session-decode"></div></div><div><p class="chart-title">Cache reuse / %</p><div id="session-cache"></div></div></div><div id="session-turns" class="tablewrap"></div>';
+    UI.svg.timeline($('session-timeline'), [{ label: 'turns', segments: turns.map((r, i) => ({ t0: r.ts_ms, t1: Math.min(last + 1000, r.ts_ms + Math.max(500, r.t_retire_ms ?? r.t_total_ms ?? 0)), color: i % 2 ? 'prefill' : 'target', title: r.rid })) }], { t0: first, t1: last + 1000, gutter: 60 });
+    UI.svg.columns($('session-ttft'), turns.map((r) => r.t_ttft_ms), { label: (i) => i + 1 }); UI.svg.columns($('session-decode'), turns.map((r) => r.decode_tps), { label: (i) => i + 1 });
+    UI.area($('session-cache'), [{ name: 'cache reuse %', color: 'accepted', values: turns.map((r) => 100 * (r.tokens_cached || 0) / Math.max(1, r.tokens_in || 0)) }], { times: turns.map((r) => r.ts_ms), max: 100, height: 80, stacked: false });
+    $('session-turns').innerHTML = table(['Request', 'Time', 'Input', 'Cached', 'Output', 'TTFT', 'Prefill tok/s', 'Decode tok/s'], turns.map((r) => [r.rid, time(r.ts_ms), r.tokens_in, r.tokens_cached, r.tokens_out, F.ms(r.t_ttft_ms), F.n1(r.prefill_tps), F.n1(r.decode_tps)]));
+    $('session-turns').querySelectorAll('tbody tr').forEach((tr, i) => { if (turns[i]) { tr.tabIndex = 0; tr.onclick = () => openRequest(turns[i].rid); tr.onkeydown = (e) => { if (e.key === 'Enter') tr.onclick(); }; } });
+  } catch (e) { detail.textContent = e.message; }
+}
+function renderErrors() {
+  const d = S.data.errors || {}, rows = d.outcomes || [];
+  const times = seriesTimes(rows), names = [...new Set(rows.flatMap((r) => Object.keys(r.counts || {})))].sort();
+  const colors = { ok: 'ink-2', engine_error: 'rejected', error: 'rejected', cancelled: 'restore', client_error: 'prefill', timeout: 'grammar' };
+  const fallback = ['target', 'accepted', 'prefill', 'grammar', 'restore', 'rejected'];
+  const outcomeColor = (name) => { let hash = 0; for (const c of name) hash = (hash * 31 + c.charCodeAt(0)) >>> 0; return colors[name] || fallback[hash % fallback.length]; };
+  const series = names.map((name) => ({ name, color: outcomeColor(name), opacity: name === 'ok' ? .16 : 1, values: times.map((t) => rows.find((r) => r.ts_ms === t)?.counts?.[name] || 0) }));
+  UI.area($('errors-chart'), series, { times, height: 120, columns: true, onBrush: zoom, onClick: (s) => addFilter('outcome', s.name) });
+  $('errors-legend').innerHTML = names.map((name) => '<button type="button" data-outcome="' + esc(name) + '"><i style="background:' + esc(UI.color(outcomeColor(name))) + ';opacity:' + (name === 'ok' ? '.3' : '1') + '"></i>' + esc(name) + (name === 'ok' ? ' / muted' : '') + '</button>').join('');
+  $('errors-legend').querySelectorAll('button').forEach((b) => { b.onclick = () => addFilter('outcome', b.dataset.outcome); });
+  const stops = d.stops || [], total = stops.reduce((n, s) => n + s.count, 0);
+  $('stops-meter').innerHTML = UI.svg.meter(stops.map((s) => ({ value: s.count, color: 'ink-2' })), total);
+  $('stops-legend').innerHTML = stops.map((s) => '<button class="chip" data-stop="' + esc(s.reason) + '">' + esc(s.reason || 'unspecified') + ' / ' + F.n0(s.count) + '</button>').join('');
+  $('stops-legend').querySelectorAll('button').forEach((b) => { b.onclick = () => addFilter('stop', b.dataset.stop); });
+  $('errors-table').innerHTML = table(['Class / route / client', 'Count', 'Last seen'], (d.classes || []).map((c) => [c.class_route_client, c.count, time(c.last_ms)]));
+  $('errors-table').querySelectorAll('tbody tr').forEach((tr, i) => { const c = d.classes?.[i]; if (!c) return; tr.dataset.error = c.class_route_client; tr.tabIndex = 0; tr.onclick = () => { const [error, route, client] = c.class_route_client.split('|'); applyFilters({ error, route, client }); }; tr.onkeydown = (e) => { if (e.key === 'Enter') tr.onclick(); }; });
+  $('errors-series-table').innerHTML = table(['Time', ...names], rows.map((r) => [time(r.ts_ms), ...names.map((name) => r.counts?.[name] || 0)]));
+}
+async function loadRequests(generation, more = false) {
+  const button = $('requests-more'); if (more && button.disabled) return; button.disabled = true;
+  try { const d = await api('requests', { query: { ...S.sorts.requests, limit: 50, cursor: more ? S.requestCursor : null } }); if (generation !== S.generation) return; S.requests = more ? [...S.requests, ...d.requests || []] : d.requests || []; if (more) S.requestRows += 50; S.requestCursor = d.next_cursor; routeNotice('requests-panel', null); }
+  catch (e) { if (generation !== S.generation) return; if (!more) { S.requests = []; S.requestCursor = null; } routeNotice('requests-panel', e); }
+  finally { button.disabled = false; }
+  renderRequests();
+}
+function renderRequests() {
+  const rows = S.requests.slice(0, S.requestRows);
+  $('requests-show-more').hidden = rows.length >= S.requests.length;
+  $('request-note').textContent = rows.length + ' shown / ' + S.requests.length + ' fetched' + ' / cursor-paged retained metadata';
+  $('requests-table').innerHTML = '<table><thead><tr>' + sortHeading('requests', 'time', 'Request / time') + '<th>Client / protocol</th><th>Model</th><th>Output</th><th>TTFT</th>' + sortHeading('requests', 'prefill_tps', 'Prefill tok/s') + sortHeading('requests', 'decode_tps', 'Decode tok/s') + '<th>Outcome</th></tr></thead><tbody>' + (rows.length ? rows.map((r) => '<tr data-rid="' + esc(r.rid) + '" tabindex="0"><td>' + esc(r.rid) + '<br>' + esc(time(r.ts_ms)) + '</td><td>' + esc(r.client_kind) + ' / ' + esc(r.protocol) + '</td><td class="wrap">' + esc(r.model_served || r.model_requested) + '</td><td>' + compact(r.tokens_out) + '</td><td>' + F.ms(r.t_ttft_ms) + '</td><td class="wrap">' + F.n1(r.prefill_tps) + ' tok/s<br>' + compact(r.tokens_cached) + ' of ' + compact(r.tokens_in) + ' cached</td><td>' + F.n1(r.decode_tps) + ' tok/s</td><td>' + esc(r.outcome) + ' / ' + esc(r.status) + '</td></tr>').join('') : '<tr><td colspan="8" class="empty">No matching retained requests</td></tr>') + '</tbody></table>';
+  bindSort('requests');
+  $('requests-table').querySelectorAll('[data-rid]').forEach((tr) => { tr.onclick = () => openRequest(tr.dataset.rid); tr.onkeydown = (e) => { if (e.key === 'Enter') tr.onclick(); }; });
+  $('requests-more').hidden = !S.requestCursor;
+  if (!S.rid) $('request-detail').hidden = true;
+}
+async function openRequest(rid) {
+  S.rid = rid; const el = $('request-detail'); el.hidden = false; el.textContent = 'Loading ' + rid + '...';
+  if (S.locked) { el.textContent = LOCK; return; }
+  try {
+    const r = await api('requests/' + encodeURIComponent(rid), {}, false); if (S.rid !== rid) return;
+    el.innerHTML = '<div class="panel-head"><h3 class="chart-title">' + esc(rid) + '</h3><div class="seg"><button id="metadata-tab" aria-pressed="true">METADATA</button><button id="full-log-tab" aria-pressed="false">FULL LOG</button></div><button class="btn" id="close-request">CLOSE</button></div><div id="metadata-fields" class="request-fields">' + timeSplit(requestTimes(r)) + '</div><div id="request-log" hidden></div>';
+    for (const [key, value] of Object.entries(r)) { const div = document.createElement('div'), label = document.createElement('span'); label.textContent = key + ': '; div.appendChild(label); div.appendChild(document.createTextNode(typeof value === 'object' ? JSON.stringify(value) : String(value))); $('metadata-fields').appendChild(div); }
+    $('close-request').onclick = () => { S.rid = null; el.hidden = true; };
+    $('metadata-tab').onclick = () => { $('metadata-fields').hidden = false; $('request-log').hidden = true; $('metadata-tab').setAttribute('aria-pressed', true); $('full-log-tab').setAttribute('aria-pressed', false); };
+    $('full-log-tab').onclick = async () => {
+      $('metadata-fields').hidden = true; $('request-log').hidden = false; $('metadata-tab').setAttribute('aria-pressed', false); $('full-log-tab').setAttribute('aria-pressed', true);
+      if (S.locked) { $('request-log').textContent = LOCK; return; }
+      $('request-log').textContent = 'Loading full log...';
+      try { const log = await api('log/' + encodeURIComponent(rid), {}, false); if (S.rid !== rid) return;
+        $('request-log').replaceChildren(); const display = log.display || log; appendItems($('request-log'), display.items || [], 'Request'); appendItems($('request-log'), display.response || [], 'Response');
+        const details = document.createElement('details'), summary = document.createElement('summary'), pre = document.createElement('pre'); summary.textContent = 'Rebuilt request / response JSON'; pre.textContent = JSON.stringify({ request: log.request, response: log.response }, null, 2); details.append(summary, pre); $('request-log').appendChild(details);
+      } catch (e) { if (S.rid === rid) $('request-log').textContent = e.status === 401 ? LOCK : e.message; }
+    };
+  } catch (e) { if (S.rid === rid) el.textContent = e.message; }
+}
+async function loadLogs(generation, more = false) {
+  if (S.locked) { S.logs = []; S.logCursor = null; renderLogs(); return; }
+  const button = $('log-more'); if (more && button.disabled) return; button.disabled = true;
+  try { const d = await api('log', { query: { limit: 30, cursor: more ? S.logCursor : null } }); if (generation !== S.generation) return; S.logs = more ? [...S.logs, ...d.sessions || []] : d.sessions || []; S.logCursor = d.next_cursor; $('log-notice').textContent = ''; }
+  catch (e) { if (generation !== S.generation) return; if (!more) { S.logs = []; S.logCursor = null; } $('log-notice').textContent = e.message; }
+  finally { button.disabled = false; }
+  renderLogs();
+}
+function renderLogs() {
+  $('log-layout').hidden = S.locked;
+  if (S.locked) { $('log-notice').textContent = LOCK; $('conversation').replaceChildren(); return; }
+  $('log-list').innerHTML = S.logs.map((s) => '<button class="btn log-session" data-vsid="' + esc(s.vsid) + '" aria-pressed="' + (S.vsid === s.vsid) + '"><span>' + esc(s.title || 'Untitled conversation') + '</span><small>' + esc(s.client) + ' / ' + esc(s.model || 'unknown') + '</small><small>' + esc(time(s.last_ms)) + ' / ' + F.n0(s.entries) + ' entries / ' + F.n0(s.edits) + ' edits / ' + F.bytes(s.bytes) + '</small></button>').join('') || '<div class="empty">No retained conversations</div>';
+  $('log-list').querySelectorAll('button').forEach((b) => { b.onclick = () => openConversation(b.dataset.vsid); });
+  $('log-more').hidden = !S.logCursor;
+  if (!S.vsid) $('conversation').innerHTML = '<div class="empty">Select a conversation to read its turns.</div>';
+}
+function appendItems(container, items, heading) {
+  if (heading && items.length) { const h = document.createElement('p'); h.className = 'chart-title'; h.textContent = heading; container.appendChild(h); }
+  for (const item of items) {
+    const node = document.createElement(item.echo ? 'details' : 'div'); node.className = 'display-item' + (item.echo ? ' echo' : ''); node.dataset.role = item.role || 'other';
+    const label = document.createElement(item.echo ? 'summary' : 'div'); label.className = 'item-label'; label.textContent = [item.role, item.kind, item.name, item.echo ? 'echo / previous response' : ''].filter(Boolean).join(' / '); node.appendChild(label);
+    const text = document.createElement('div'); text.className = 'item-text'; text.textContent = item.text || ''; if (item.text) node.appendChild(text);
+    if (item.arguments) { const pre = document.createElement('pre'); try { pre.textContent = JSON.stringify(JSON.parse(item.arguments), null, 2); } catch (_) { pre.textContent = item.arguments; } node.appendChild(pre); }
+    if (item.call_id) { const id = document.createElement('div'); id.className = 'chart-note'; id.textContent = 'call ' + item.call_id; node.appendChild(id); }
+    for (const media of item.media || []) {
+      const chip = document.createElement('span'); chip.className = 'media-ref'; chip.textContent = media.mime + ' / ' + F.bytes(media.bytes) + ' / ' + String(media.sha256).slice(0, 12) + (media.stored ? '' : ' / reference only'); node.appendChild(chip);
+      // Never embed arbitrary URLs from a payload; only the gated hash route.
+      const safe = media.stored && /^\/console\/usage\/media\/[a-f0-9]{64}$/.test(media.url || '');
+      if (safe && (media.mime || '').startsWith('image/')) { const img = document.createElement('img'); img.src = media.url; img.alt = 'Stored ' + media.mime; img.loading = 'lazy'; node.appendChild(img); }
+      else if (safe && (media.mime || '').startsWith('audio/')) { const audio = document.createElement('audio'); audio.src = media.url; audio.controls = true; audio.preload = 'none'; node.appendChild(audio); }
+    }
+    container.appendChild(node);
+  }
+}
+function changeChip(container, label, body) { const details = document.createElement('details'), summary = document.createElement('summary'), pre = document.createElement('pre'); details.className = 'display-item'; summary.textContent = label; pre.textContent = body; details.append(summary, pre); container.appendChild(details); }
+async function openConversation(vsid) {
+  S.vsid = vsid; renderLogs(); const el = $('conversation'); el.textContent = 'Loading conversation...';
+  try { const d = await api('log/sessions/' + encodeURIComponent(vsid), {}, false); if (S.vsid !== vsid) return;
+    el.innerHTML = '<h3 class="chart-title">Conversation performance</h3>' + perfBlock(d.perf);
+    for (const entry of d.entries || []) {
+      const section = document.createElement('section'); section.className = 'log-entry';
+      const head = document.createElement('div'); head.className = 'entry-head'; const kind = document.createElement('span'); kind.className = 'kind'; kind.textContent = entry.kind; const facts = document.createElement('span'); facts.textContent = time(entry.ts_ms) + ' / ' + entry.protocol + ' / ' + entry.rid + ' / ' + (entry.usage ? compact(entry.usage.input_tokens) + ' in / ' + compact(entry.usage.cached_tokens) + ' cached / ' + compact(entry.usage.output_tokens) + ' out' : 'usage unavailable') + (entry.stop ? ' / ' + entry.stop : ''); head.append(kind, facts); section.appendChild(head);
+      if (entry.kind === 'edit' || entry.kind === 'rebased') { const marker = document.createElement('div'); marker.className = 'edit-marker'; marker.textContent = entry.kind === 'edit' ? 'history edited at item ' + entry.divergence + ' (diverged from ' + (entry.diverged_from || entry.parent_rid || 'unknown') + ')' : 'rebased (parent expired)'; section.appendChild(marker); }
+      if (entry.system?.changed) changeChip(section, 'System prompt changed', entry.system.text || '(cleared)');
+      if (entry.tools?.changed) changeChip(section, 'Tools changed / ' + entry.tools.count, (entry.tools.names || []).join('\n') || '(cleared)');
+      appendItems(section, entry.items || [], entry.kind === 'append' || entry.kind === 'chained' ? 'New items' : 'Request history'); appendItems(section, entry.response || [], 'Response');
+      if (entry.truncated) { const n = document.createElement('div'); n.className = 'edit-marker'; n.textContent = 'Truncated at record size cap'; section.appendChild(n); }
+      el.appendChild(section);
+    }
+    if (!d.entries?.length) el.textContent = 'No retained entries';
+    document.body.dataset.conversationReady = 'true';
+  } catch (e) { if (S.vsid === vsid) el.textContent = e.message; }
+}
+const settingFields = [['metadata_days', 'Metadata retention / days', false], ['metadata_cap_mb', 'Metadata cap / MB', false], ['daily_days', 'Daily aggregates / days', false], ['log_enabled', 'Record full log', true], ['log_hours', 'Full-log retention / hours', false], ['log_cap_mb', 'Full-log cap / MB', false], ['log_media', 'Store image and audio media', true], ['client_ip', 'Record client IP', true], ['record_bench', 'Record bench requests', true]];
+$('settings-fields').innerHTML = settingFields.map(([key, label, bool]) => '<label>' + label + '<input name="' + key + '" type="' + (bool ? 'checkbox' : 'number') + '"' + (bool ? '' : ' min="0" step="1" required') + '></label>').join('');
+$('settings-form').oninput = () => { S.settingsDirty = true; };
+async function loadSettings(generation) {
+  if (S.locked) { $('settings-form').hidden = true; $('settings-locked').hidden = false; $('settings-locked').textContent = LOCK; return; }
+  try { const d = await api('settings', {}, false); if (generation !== S.generation) return; S.settings = d.settings;
+    $('settings-form').hidden = false; $('settings-locked').hidden = true;
+    if (!S.settingsDirty) for (const [key, , bool] of settingFields) { const input = $('settings-form').elements.namedItem(key); if (bool) input.checked = !!d.settings[key]; else input.value = d.settings[key]; }
+    $('settings-warning').textContent = d.warning || 'With the full log on, user prompts and model outputs are stored in plain text for the retention period.';
+    const u = d.usage || {}; $('storage-facts').textContent = 'Metadata ' + F.bytes(u.db_bytes) + ' / full log ' + F.bytes(u.log_bytes) + ' / media ' + F.bytes(u.media_bytes) + ' (' + compact(u.media_files) + ' files) / metadata drops ' + compact(u.dropped) + ' / log drops ' + compact(u.log_dropped);
+  } catch (e) { $('settings-message').textContent = e.message; }
+}
+$('settings-form').onsubmit = async (e) => { e.preventDefault(); const settings = { ...S.settings };
+  for (const [key, , bool] of settingFields) { const input = e.target.elements.namedItem(key); settings[key] = bool ? input.checked : Number(input.value); }
+  const submit = e.target.querySelector('[type=submit]'); submit.disabled = true;
+  try { const d = await api('settings', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(settings) }, false); S.settings = d.settings; S.settingsDirty = false; $('settings-message').textContent = 'Saved'; await loadSettings(S.generation); }
+  catch (error) { $('settings-message').textContent = error.message; } finally { submit.disabled = false; }
+};
+async function clear(all) {
+  if (!confirm(all ? 'Clear all retained metadata, full logs and media? This cannot be undone.' : 'Clear all retained full logs and media? Metadata remains. This cannot be undone.')) return;
+  try { await api(all ? 'clear' : 'log/clear', { method: 'POST' }, false); S.vsid = null; S.rid = null; $('settings-message').textContent = 'Cleared'; refresh(); } catch (e) { $('settings-message').textContent = e.message; }
+}
+$('clear-log').onclick = () => clear(false); $('clear-all').onclick = () => clear(true);
+$('range').onchange = () => { $('custom-range').hidden = $('range').value !== 'custom'; if ($('range').value !== 'custom') refresh(); };
+$('split').onchange = refresh; $('exclude-bench').onchange = refresh; $('refresh').onclick = refresh;
+$('apply-range').onclick = () => { const from = new Date($('from').value).getTime(), to = new Date($('to').value).getTime(); if (!Number.isFinite(from) || !Number.isFinite(to) || from > to) { $('page-notice').textContent = 'Choose a valid range with from before to.'; return; } refresh(); };
+$('add-filter').onclick = () => { const value = $('filter-value').value.trim(); if (value) { addFilter($('filter-field').value, value); $('filter-value').value = ''; } };
+$('filter-value').onkeydown = (e) => { if (e.key === 'Enter') $('add-filter').click(); };
+$('flow-metric').onchange = () => { S.flowMetric = $('flow-metric').value; renderFlow(); };
+$('sessions-show-more').onclick = () => { S.sessionRows += 10; renderSessions(); };
+$('requests-show-more').onclick = () => { S.requestRows += 10; renderRequests(); };
+$('requests-more').onclick = () => loadRequests(S.generation, true); $('log-more').onclick = () => loadLogs(S.generation, true);
+let resizeTimer; window.addEventListener('resize', () => { clearTimeout(resizeTimer); resizeTimer = setTimeout(() => { renderOverview(); renderSeries(); renderLatency(); renderCache(); renderSpec(); renderFlow(); renderSessions(); renderErrors(); }, 150); });
+let liveFeed;
+// Live concurrency without subscribing to the console feed (a subscriber makes the engine build frames).
+async function liveCount() { try { const r = await fetch('/console/usage/live', { credentials: 'same-origin' }); if (r.ok) { const d = await r.json(); S.live = d.active; $('k-concurrency').textContent = d.active == null ? '-' : F.n0(d.active); } } catch (_) {} }
+liveCount(); setInterval(() => { if (!document.hidden) liveCount(); }, 5000);
+$('from').value = localDate(Date.now() - 86400000); $('to').value = localDate(Date.now());
+refresh(); setInterval(() => { if (!document.hidden && !S.loading) refresh(); }, 10000);
+})();
+</script>
+</body>
+</html>

@@ -1143,3 +1143,28 @@ async fn usage_connection_and_turn_rows_are_independent() {
     drop(rows);
     c.close(None).await.unwrap();
 }
+
+#[tokio::test]
+async fn full_log_records_each_realtime_turn() {
+    let backend = Scripted::new(vec![vec![TurnEvent::TextDelta {text:"hello".into()}, TurnEvent::Done {stop:StopReason::EndTurn}]]);
+    let (sink, tape) = crate::usage::tests::logging_sink();
+    let s = server_with_usage(Arc::new(backend.clone()), Some(sink)).await;
+    let mut c = connect(&s, false).await;
+    create(&mut c, user("u", "what time is it"), Value::Null, false).await;
+    emit(&mut c, json!({"type":"response.create"})).await;
+    until(&mut c, "response.done").await;
+    backend.seen.lock().unwrap().clear();
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            backend.seen.lock().unwrap().clear();
+            if !tape.0.lock().unwrap().is_empty() { break; }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    }).await.unwrap();
+    let request = tape.request(0);
+    assert_eq!(request["type"], "realtime.turn");
+    assert!(request["items"].to_string().contains("what time is it"));
+    assert!(tape.response_text(0).contains("hello"));
+    assert_eq!(tape.0.lock().unwrap()[0].meta.protocol, "realtime");
+    c.close(None).await.unwrap();
+}
