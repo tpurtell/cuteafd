@@ -4288,7 +4288,32 @@ of HTML/JS; L.
 Order: 1, 2 and 4 are independent and start first; 3 after the gateway
 front ends land; 5 after 4; 6 after 1; 7 and 8 after 1 and 4; 9 and 10 last.
 
-### Open questions for TJ, each with a recommendation
+### Decisions (TJ, 2026-10-10)
+
+- **Full log is on by default.** Users with a heavy workload turn it off, or
+  set its retention or cap to zero.
+- **Media are stored in full** behind a flag (`log_media`, default on), not
+  only as references. Each image and audio blob is written once as a file in
+  the persistent store, under a content-addressed layout:
+  `usage/media/<sha256[0:2]>/<sha256>.<ext>`, deduplicated by hash. Log
+  entries reference it by hash. Pruning deletes a file when no retained entry
+  references it. Media bytes count toward the log's size cap, and a cap of
+  zero (or the flag off) stores references only.
+- **Bench requests:** the benchmark dashboard has an option to include or
+  skip them. Default is skip.
+- **Expired parents:** when a chain's base expires, the oldest retained
+  entry is rewritten with its full history and becomes the new base.
+- **Edited turns:** the entry stores the full history, marked at the point
+  where it diverged.
+- **Console secret:** one per host. The box has one user.
+- **Not raised by TJ, so the recommendations stand:**
+  - `CONSOLE_TEXT` defaults on once text is cookie-gated;
+  - client IP off;
+  - 90-day daily aggregates;
+  - the unlock link in browser history is accepted, with rotation as the
+    remedy.
+
+### Open questions for TJ, each with a recommendation (answered above)
 
 1. Full log on by default (1 day) or off until switched on? Recommend on,
    with the startup line and the panel warning; it is what was asked for and
