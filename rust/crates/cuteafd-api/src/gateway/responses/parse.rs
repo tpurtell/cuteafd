@@ -2,6 +2,7 @@ use std::{collections::HashMap, sync::Arc};
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 
 use crate::gateway::{session::Snapshot, turn::*, Gateway, GatewayError};
 
@@ -551,14 +552,25 @@ pub(super) fn parse_item(v: &Value) -> Result<Vec<Item>, GatewayError> {
             }]
         }
         "reasoning" => {
-            let signature = optional_string(v, "encrypted_content")?;
-            let text = if let Some(token) = &signature {
-                decode(token, "reasoning")?["text"]
-                    .as_str()
-                    .ok_or_else(|| GatewayError::invalid("invalid reasoning token"))?
-                    .to_owned()
-            } else {
-                reasoning_text(v)?
+            let visible = reasoning_text(v)?;
+            let text = match optional_string(v, "encrypted_content")? {
+                Some(token) => {
+                    let token = decode(&token, "reasoning")?;
+                    // The token carries the full trace plus a digest of what was
+                    // shown beside it. Visible text that no longer matches that
+                    // digest was edited by the client, and the edit wins. Tokens
+                    // without the digest predate it and keep their own text.
+                    let edited = !visible.is_empty()
+                        && token["shown_sha256"]
+                            .as_str()
+                            .is_some_and(|shown| shown != sha256_hex(&visible));
+                    if edited {
+                        visible
+                    } else {
+                        token["text"].as_str().unwrap().to_owned()
+                    }
+                }
+                None => visible,
             };
             vec![Item::Reasoning {
                 text,
@@ -683,10 +695,22 @@ fn parts(v: &Value) -> Result<Vec<Part>, GatewayError> {
 }
 
 pub(super) fn encode(kind: &str, text: &str) -> String {
-    format!(
-        "cuteafd.v1.{}",
-        URL_SAFE_NO_PAD.encode(json!({"kind":kind,"text":text}).to_string())
-    )
+    token(json!({"kind":kind,"text":text}))
+}
+
+/// A reasoning token: the full trace, and a digest of the visible text the
+/// client received beside it (as [`reasoning_text`] reads it back), so an
+/// edited summary can be told apart from an echoed one.
+pub(super) fn encode_reasoning(text: &str, shown: &str) -> String {
+    token(json!({"kind":"reasoning","text":text,"shown_sha256":sha256_hex(shown)}))
+}
+
+fn token(v: Value) -> String {
+    format!("cuteafd.v1.{}", URL_SAFE_NO_PAD.encode(v.to_string()))
+}
+
+fn sha256_hex(s: &str) -> String {
+    format!("{:x}", Sha256::digest(s.as_bytes()))
 }
 
 fn decode(token: &str, kind: &str) -> Result<Value, GatewayError> {

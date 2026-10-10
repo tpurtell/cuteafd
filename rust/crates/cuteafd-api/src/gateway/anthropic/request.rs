@@ -75,10 +75,12 @@ pub(super) fn parse(value: &Value, require_max: bool) -> Result<(TurnRequest, bo
                         .unwrap_or_default(),
                     is_error: boolean(block, "is_error")?.unwrap_or(false),
                 }),
-                "thinking" => Some(Item::Reasoning {
-                    text: string(block, "thinking")?,
-                    signature: optional_string(block, "signature")?,
-                }),
+                "thinking" => {
+                    let text = string(block, "thinking")?;
+                    let signature = optional_string(block, "signature")?
+                        .filter(|signature| !edited_own_thinking(&text, signature));
+                    Some(Item::Reasoning { text, signature })
+                }
                 // Preserve opaque replay material without treating it as readable reasoning.
                 "redacted_thinking" => Some(Item::Reasoning {
                     text: String::new(),
@@ -474,4 +476,14 @@ fn client_schema(kind: &str) -> Option<Value> {
         },"required":["action"],"additionalProperties":false}));
     }
     None
+}
+
+/// A signature this gateway synthesized that no longer matches its thinking
+/// text: the client edited the block, so the stale signature is dropped and the
+/// edit goes on unsigned. Foreign signatures are left for their issuer to check.
+fn edited_own_thinking(text: &str, signature: &str) -> bool {
+    let own = STANDARD
+        .decode(signature)
+        .is_ok_and(|raw| raw.starts_with(super::render::THINKING_SIGNATURE_PREFIX.as_bytes()));
+    own && signature != super::render::thinking_signature(text)
 }

@@ -959,3 +959,35 @@ async fn models_default_page_openai_all_anthropic_twenty() {
         assert_eq!(result["data"].as_array().unwrap().len(), expected, "anthropic={anthropic}");
     }
 }
+
+fn replayed_thinking(thinking: &str, signature: &str) -> Item {
+    let replay = json!({"model":"m","max_tokens":1,"messages":[{"role":"assistant","content":[
+        {"type":"thinking","thinking":thinking,"signature":signature}]}]});
+    super::request::parse(&replay, true).unwrap().0.items.remove(0)
+}
+
+#[test]
+fn unedited_thinking_keeps_own_signature() {
+    let signature = super::render::thinking_signature("reason");
+    assert_eq!(
+        replayed_thinking("reason", &signature),
+        Item::Reasoning { text: "reason".into(), signature: Some(signature) }
+    );
+}
+
+#[test]
+fn edited_thinking_drops_own_signature() {
+    let signature = super::render::thinking_signature("reason");
+    assert_eq!(
+        replayed_thinking("edited", &signature),
+        Item::Reasoning { text: "edited".into(), signature: None }
+    );
+}
+
+#[test]
+fn foreign_thinking_signature_is_kept() {
+    assert_eq!(
+        replayed_thinking("edited", "EqQBCkYIBRgCKkA"),
+        Item::Reasoning { text: "edited".into(), signature: Some("EqQBCkYIBRgCKkA".into()) }
+    );
+}
