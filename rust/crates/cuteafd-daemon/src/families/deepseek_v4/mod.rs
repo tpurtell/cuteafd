@@ -428,8 +428,8 @@ pub(crate) fn with_engine<T>(
             Exl3Tp2::load_pair(devices, &loaded.catalog, &package, layers.clone(), max_rows, budgets)?
                 .map(|rank| Box::new(rank) as Box<dyn RtxExpertLayer>)
         } else {
-            [Box::new(NativeTp2::load(devices[0], &loaded.catalog, 0, layers.clone(), max_rows, budgets[0])?),
-             Box::new(NativeTp2::load(devices[1], &loaded.catalog, 1, layers.clone(), max_rows, budgets[1])?)]
+            NativeTp2::load_pair(devices, &loaded.catalog, layers.clone(), max_rows, budgets)?
+                .map(|rank| Box::new(rank) as Box<dyn RtxExpertLayer>)
         };
         ensure!(ranks.iter().all(|r| r.layers() == layers), "TP2 loaded layers differ from admitted placement");
         engine.install_tp2(ranks)?;

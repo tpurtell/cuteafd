@@ -157,6 +157,66 @@ impl<'a> NativeTp2<'a> {
             .context("TP2 workspace overflow")
     }
 
+    fn admit(
+        device: Device<'a>,
+        catalog: &cuteafd_loader::OfficialV41Catalog,
+        rank: u8,
+        layers: &Range<usize>,
+        max_rows: usize,
+        budget: usize,
+    ) -> Result<usize> {
+        validate_layers(layers, rank)?;
+        let workspace = Self::workspace_bytes_for(device.library, max_rows)?;
+        let mut resident = workspace;
+        for layer in layers.clone() {
+            let plan = Self::plan_layer(device.library, catalog, layer, rank)?;
+            resident = resident.checked_add(plan.resident_bytes).context("TP2 resident overflow")?;
+            ensure!(resident.checked_add(plan.device_staging_bytes).context("TP2 peak overflow")? <= budget,
+                "TP2 weights + workspace + staging exceed budget {budget}");
+        }
+        Ok(workspace)
+    }
+
+    /// Load paired layers concurrently, keeping the two checkpoint reads adjacent.
+    /// Both rank budgets are admitted before either rank opens payloads.
+    pub(crate) fn load_pair(
+        devices: [Device<'a>; 2],
+        catalog: &cuteafd_loader::OfficialV41Catalog,
+        layers: Range<usize>,
+        max_rows: usize,
+        budgets: [usize; 2],
+    ) -> Result<[Self; 2]> {
+        ensure!(devices[0].id != devices[1].id && std::ptr::eq(devices[0].library, devices[1].library),
+            "invalid native TP2 device pair");
+        let workspaces = [Self::admit(devices[0], catalog, 0, &layers, max_rows, budgets[0])?,
+            Self::admit(devices[1], catalog, 1, &layers, max_rows, budgets[1])?];
+        let mut remaining = [budgets[0] - workspaces[0], budgets[1] - workspaces[1]];
+        let mut weights = [devices[0].own(|| Ok(Vec::with_capacity(layers.len())))?,
+            devices[1].own(|| Ok(Vec::with_capacity(layers.len())))?];
+        for layer in layers.clone() {
+            let started = std::time::Instant::now();
+            // SAFETY: each fresh DeviceOwner holds only new weights; load drains
+            // its stream before return/unwind, and owner Drop selects its GPU.
+            let pair = unsafe { cuteafd_ffi::synchronized_load::load_pair(|rank| devices[rank].own(|| {
+                Ok(vec![ExpertWeights::load(devices[rank].library, catalog,
+                    ExpertLayer::BackboneTp2 { layer, rank }, remaining[rank])?])
+            })) }?;
+            for (rank, mut weight) in pair.into_iter().enumerate() {
+                remaining[rank] -= weight[0].budget().resident_bytes;
+                // Consume on the owning GPU; no executor or aliases cross threads.
+                devices[rank].run(|| {
+                    weights[rank].append(weight.get_mut());
+                    Ok(())
+                })?;
+            }
+            tracing::info!(layer, elapsed_seconds = started.elapsed().as_secs_f64(),
+                "native TP2 paired layer load timeline");
+        }
+        let [left, right] = weights;
+        Ok([Self::finish_load(devices[0], 0, layers.clone(), max_rows, workspaces[0], left)?,
+            Self::finish_load(devices[1], 1, layers, max_rows, workspaces[1], right)?])
+    }
+
     pub(crate) fn load(
         device: Device<'a>,
         catalog: &cuteafd_loader::OfficialV41Catalog,
@@ -165,23 +225,7 @@ impl<'a> NativeTp2<'a> {
         max_rows: usize,
         budget: usize,
     ) -> Result<Self> {
-        validate_layers(&layers, rank)?;
-        let geometry = expert_geometry();
-        let workspace_bytes = Self::workspace_bytes_for(device.library, max_rows)?;
-        let mut resident = workspace_bytes;
-        for layer in layers.clone() {
-            let plan = Self::plan_layer(device.library, catalog, layer, rank)?;
-            resident = resident
-                .checked_add(plan.resident_bytes)
-                .context("TP2 resident overflow")?;
-            ensure!(
-                resident
-                    .checked_add(plan.device_staging_bytes)
-                    .context("TP2 peak overflow")?
-                    <= budget,
-                "TP2 weights + workspace + staging exceed budget {budget}"
-            );
-        }
+        let workspace_bytes = Self::admit(device, catalog, rank, &layers, max_rows, budget)?;
         let weights = device.own(|| {
             let mut loaded = Vec::with_capacity(layers.len());
             let mut remaining = budget - workspace_bytes;
@@ -200,6 +244,18 @@ impl<'a> NativeTp2<'a> {
             }
             Ok(loaded)
         })?;
+        Self::finish_load(device, rank, layers, max_rows, workspace_bytes, weights)
+    }
+
+    fn finish_load(
+        device: Device<'a>,
+        rank: u8,
+        layers: Range<usize>,
+        max_rows: usize,
+        workspace_bytes: usize,
+        weights: DeviceOwner<'a, Vec<ExpertWeights<'a>>>,
+    ) -> Result<Self> {
+        let geometry = expert_geometry();
         let kernels = device.run(|| {
             kernel_capacities(max_rows)?
                 .into_iter()

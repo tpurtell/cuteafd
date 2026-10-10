@@ -33,14 +33,16 @@ pub(crate) struct Exl3Tp2<'a> {
     output: Option<Allocation<'a>>,
 }
 
-fn load_layer_pairs<T>(
+fn load_layer_pairs<T, W>(
     mut ranks: [T; 2],
     layers: Range<usize>,
-    mut load: impl FnMut(&mut T, usize, usize) -> Result<()>,
+    mut load: impl FnMut(usize) -> Result<[W; 2]>,
+    mut publish: impl FnMut(&mut T, W, usize) -> Result<()>,
 ) -> Result<[T; 2]> {
     for layer in layers {
-        for (rank, owner) in ranks.iter_mut().enumerate() {
-            load(owner, layer, rank)?;
+        let pair = load(layer)?;
+        for (rank, weight) in pair.into_iter().enumerate() {
+            publish(&mut ranks[rank], weight, rank)?;
         }
     }
     Ok(ranks)
@@ -89,8 +91,8 @@ impl<'a> Exl3Tp2<'a> {
             .context("EXL3 TP2 workspace overflow")
     }
 
-    /// Loads each layer's rank0 and rank1 slices consecutively. All rank owners
-    /// exist before loading, so a partial failure frees storage on its device.
+    /// Loads each layer's two slices concurrently before advancing to the next
+    /// layer. Published Rc/executor owners never leave the parent thread.
     pub(crate) fn load_pair(
         devices: [Device<'a>; 2],
         catalog: &cuteafd_loader::OfficialV41Catalog,
@@ -152,18 +154,25 @@ impl<'a> Exl3Tp2<'a> {
                 output: None,
             },
         ];
-        let mut ranks = load_layer_pairs(ranks, layers.clone(), |owner, layer, rank| {
+        let remaining = std::cell::RefCell::new(remaining);
+        let mut ranks = load_layer_pairs(ranks, layers.clone(), |layer| {
+            let remaining = *remaining.borrow();
+            let started = std::time::Instant::now();
+            // SAFETY: only fresh weight allocations cross threads, never Rc or
+            // execution state. The loader drains all uploads; DeviceOwner frees
+            // the allocation on its own GPU on either success or partial failure.
+            let pair = unsafe { cuteafd_ffi::synchronized_load::load_pair(|rank| devices[rank].own(|| {
+                Ok(vec![Exl3Weights::load(devices[rank].library, catalog,
+                    ExpertLayer::BackboneTp2 { layer, rank }, remaining[rank])?])
+            })) }?;
+            tracing::info!(layer, elapsed_seconds = started.elapsed().as_secs_f64(),
+                "EXL3 TP2 paired layer load timeline");
+            Ok(pair)
+        }, |owner, mut weight, rank| {
+            remaining.borrow_mut()[rank] -= weight[0].budget.resident_bytes;
             devices[rank].run(|| {
-                let weight = Exl3Weights::load(
-                    devices[rank].library,
-                    catalog,
-                    ExpertLayer::BackboneTp2 { layer, rank },
-                    remaining[rank],
-                )?;
-                remaining[rank] -= weight.budget.resident_bytes;
                 Rc::get_mut(owner.weights.get_mut())
-                    .expect("unpublished EXL3 rank")
-                    .push(weight);
+                    .expect("unpublished EXL3 rank").append(weight.get_mut());
                 Ok(())
             })
         })?;
@@ -306,21 +315,21 @@ mod tests {
         let released = Rc::new(RefCell::new(Vec::new()));
         let mut order = Vec::new();
         let ranks = [Vec::new(), Vec::new()];
-        let result = load_layer_pairs(ranks, 0..3, |owner, layer, rank| {
-            order.push((layer, rank));
-            live.set(live.get() + 1);
-            owner.push(ProbeAllocation {
-                rank,
-                live: live.clone(),
-                released: released.clone(),
+        let result = load_layer_pairs(ranks, 0..3, |layer| {
+            let pair = std::array::from_fn(|rank| {
+                order.push((layer, rank));
+                live.set(live.get() + 1);
+                ProbeAllocation { rank, live: live.clone(), released: released.clone() }
             });
-            ensure!((layer, rank) != (1, 1), "injected rank1 mid-load failure");
-            Ok(())
-        });
+            ensure!(layer != 1, "injected rank1 mid-load failure");
+            Ok(pair)
+        }, |owner, weight, _| { owner.push(weight); Ok(()) });
         assert!(result.is_err());
         assert_eq!(order, [(0, 0), (0, 1), (1, 0), (1, 1)]);
         assert_eq!(live.get(), 0);
-        assert_eq!(*released.borrow(), [0, 0, 1, 1]);
+        let mut freed = released.borrow().clone();
+        freed.sort();
+        assert_eq!(freed, [0, 0, 1, 1]);
     }
 
     #[test]
