@@ -326,7 +326,7 @@ pub(crate) fn with_engine<T>(
         // baseline.
         let gpus = devices.iter().enumerate().map(|(rank, &device)| {
             let pending = crate::shared::inventory::pending_code(&loaded.library, device, rank, devices.len() == 2,
-                loaded.family, "*")?;
+                loaded.family, cuteafd_loader::placement::families::deepseek_v4::code_experts(&loaded.catalog))?;
             crate::shared::peer_split::on_device(&loaded.library, device, args.device, || {
                 let (free, total) = loaded.library.cuda_memory_info()?;
                 Ok((total as u64, Baseline::Measured { free_bytes: (free as u64).saturating_sub(pending) }))

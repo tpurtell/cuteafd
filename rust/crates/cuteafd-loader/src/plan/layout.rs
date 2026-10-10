@@ -778,8 +778,10 @@ pub fn layout(report: &mut PlanReport, model: &dyn super::FamilyModel, checkpoin
             // Where the family's ready ledger is measured (`placement::inventory::LOADED_CODE`), the
             // context plus every byte of code it holds at ready (lazily loaded functions, packages,
             // cuBLAS) instead: serve reserves what has not arrived by its admission sample.
-            Some(families) => match crate::placement::loaded_code(&families[0], local_package(report),
-                split, index as u8) {
+            Some(families) => match crate::placement::loaded_code(&families[0], if family == "deepseek_v4" {
+                // V4's coordinator always holds dSpark (and any RTX layers) in the catalog's package.
+                if report.experts.as_ref().is_some_and(|e| e.package.contains("exl3")) { "exl3" } else { "*" }
+            } else { local_package(report) }, split, index as u8) {
                 Some(code) => Item::new(Category::Runtime, "context+modules", "",
                     crate::placement::ArchContext::coordinator(options.rtx_bytes[index], None).context_bytes + code.bytes,
                     Basis::Calibrated),
@@ -1455,7 +1457,7 @@ fn deepseek_v4_placement(report: &PlanReport, checkpoint: &super::Checkpoint,
         experts, draft, expert_workspace, first_routed: routed.first_layer,
         peer_experts: v4::peer_experts(&catalog, options.peer_expert_ranges),
         requested_pool: options.pool_tokens.filter(|&n| n > 0), onboard,
-        full_prefill_logits: 0, code_bytes: v4::code_bytes(cfg.dim, devices.len()) };
+        full_prefill_logits: 0, code_bytes: v4::code_bytes(cfg.dim, v4::code_experts(&catalog), devices.len()) };
     let request = v4::request(&inputs)?;
     let reserves = request.inventory.gpus.iter().map(|g| g.headroom_bytes).collect();
     Ok((crate::placement::solve(&request)?, reserves))

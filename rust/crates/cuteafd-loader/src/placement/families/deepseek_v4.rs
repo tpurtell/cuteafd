@@ -203,11 +203,17 @@ pub fn request(inputs: &V4Inputs<'_>) -> Result<PlacementRequest, PlacementError
     })
 }
 
+/// The `LoadedCode::experts` key of a V4 catalog: EXL3 packages load their own modules (the
+/// coordinator holds dSpark and any RTX layers in them), native MXFP4 does not.
+pub fn code_experts(catalog: &crate::OfficialV41Catalog) -> &'static str {
+    if catalog.exl3().is_some() { "exl3" } else { "*" }
+}
+
 /// Each coordinator GPU's measured loaded code (`placement::inventory::LOADED_CODE`) for a V4
-/// model of hidden size `dim` on `gpus` GPUs.
-pub fn code_bytes(dim: usize, gpus: usize) -> Vec<u64> {
+/// model of hidden size `dim` with `experts` (`code_experts`) on `gpus` GPUs.
+pub fn code_bytes(dim: usize, experts: &str, gpus: usize) -> Vec<u64> {
     let family = if dim == 4096 { "dsv4f" } else { "dsv4p" };
-    (0..gpus).map(|rank| crate::placement::loaded_code(family, "*", gpus == 2, rank as u8).map_or(0, |c| c.bytes))
+    (0..gpus).map(|rank| crate::placement::loaded_code(family, experts, gpus == 2, rank as u8).map_or(0, |c| c.bytes))
         .collect()
 }
 

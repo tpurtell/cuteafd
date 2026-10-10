@@ -100,9 +100,15 @@ impl ArchContext {
 /// (`CUDA_MODULE_LOADING=LAZY` loads each function's code on first launch),
 /// the cuBLAS handle, expert-package modules (fp8moe/EXL3 libraries), the
 /// transport's device mappings and the runtime's per-stream bookkeeping.
-/// Measured per serving configuration from the ready ledger as
-/// `untracked - startup graphs - context` (v3-p2 cards, RTX PRO 6000 SM120,
-/// driver 595.91.07, CUDA 13.2, 2026-10-10).
+/// One definition for both sides: the ready ledger (the `stage: "ready"`
+/// report serve logs at readiness, before any request) splits its untracked
+/// bytes as `context + loaded code + GraphSet::at_ready`, so
+/// `loaded code = untracked at ready - startup graphs - context`. Lazily
+/// captured graphs (V4's attention graphs, any `Lifetime::Growth` set) come
+/// after ready: never in this number, always charged as "graph growth".
+/// Measured per serving configuration (v3-p2 cards, RTX PRO 6000 SM120,
+/// driver 595.91.07, CUDA 13.2, 2026-10-10). The two-RTX `dsv4` entries are
+/// TP1 (head split, experts on GPU0) measurements; TP2 (P4) replaces them.
 ///
 /// The planner charges `bytes` (with the context) as the GPU's runtime
 /// baseline. The runtime's admission sample already holds part of it (the
@@ -140,6 +146,13 @@ pub const LOADED_CODE: &[LoadedCode] = &[
     LoadedCode { family: "dsv4", experts: "*", split: false, rank: 0, bytes: 322_050_368,
         source: "v4-flash-sim5090 (0 RTX layers): untracked 908,466,496 - context 586,416,128; \
             v4-flash-min p0 (18 FP8 layers) 309,476,320" },
+    // EXL3 packages add their modules: Pro EXL3 max p0 (6 TP1 layers), v3-p4 first-post-ready sample
+    // 853,949,884 / 661,521,392 B less that method's early-request offset on Flash max p0
+    // (27,262,976 / 29,360,128 B against this table's sample of the same card).
+    LoadedCode { family: "dsv4", experts: "exl3", split: true, rank: 0, bytes: 826_686_908,
+        source: "v4-pro-exl3-max p0 rtx0 (v3-p4 A/B pair 1) 853,949,884 - 27,262,976 sampling offset" },
+    LoadedCode { family: "dsv4", experts: "exl3", split: true, rank: 1, bytes: 632_161_264,
+        source: "v4-pro-exl3-max p0 rtx1 (v3-p4 A/B pair 1) 661,521,392 - 29,360,128 sampling offset" },
     LoadedCode { family: "dsv4", experts: "*", split: true, rank: 0, bytes: 560_200_800,
         source: "v4-flash-max p0 rtx0 (19 layers): untracked 1,146,616,928 - context 586,416,128" },
     LoadedCode { family: "dsv4", experts: "*", split: true, rank: 1, bytes: 260_349_424,
@@ -295,6 +308,23 @@ impl GraphSet {
         self.ranks.get(rank).map_or(0, |r| r.bytes)
     }
 
+    /// The graph bytes `rank`'s ready ledger holds: the captured estimate of a
+    /// startup set, nothing of a growth set (lazy captures happen after ready).
+    /// With the context and [`LoadedCode`] this is the ready ledger's untracked
+    /// total: `untracked = context + loaded code + at_ready`.
+    pub fn at_ready(&self, rank: usize) -> u64 {
+        match (self.lifetime, self.ranks.get(rank)) {
+            (Lifetime::Startup, Some(r)) => r.bytes - r.margin,
+            _ => 0,
+        }
+    }
+
+    /// Reserved past ready on `rank`: a startup set's margin, a growth set's
+    /// whole budget. `at_ready + growth == bytes`.
+    pub fn growth(&self, rank: usize) -> u64 {
+        self.bytes(rank) - self.at_ready(rank)
+    }
+
     /// The solver demand for this set on `rank` (Runtime "graphs"; growth sets
     /// are labelled so the ledger compare can leave them out).
     pub fn demand(&self, rank: usize) -> super::Demand {
@@ -306,9 +336,8 @@ impl GraphSet {
     /// and the margin (or a lazy set's budget) as "graph growth".
     pub fn items(&self, rank: usize) -> Vec<cuteafd_core::memory_layout::Item> {
         use cuteafd_core::memory_layout::Item;
-        let Some(r) = self.ranks.get(rank) else { return Vec::new() };
-        let captured = match self.lifetime { Lifetime::Startup => r.bytes - r.margin, Lifetime::Growth => 0 };
-        [("graphs", captured), (GRAPH_GROWTH, r.bytes - captured)].into_iter().filter(|(_, b)| *b > 0)
+        if rank >= self.ranks.len() { return Vec::new() }
+        [("graphs", self.at_ready(rank)), (GRAPH_GROWTH, self.growth(rank))].into_iter().filter(|(_, b)| *b > 0)
             .map(|(group, bytes)| Item::new(Category::Runtime, group, "", bytes, Basis::Formula)).collect()
     }
 }
@@ -372,6 +401,27 @@ pub fn exl3_capacities(rows: u64) -> Vec<u64> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn ready_untracked_is_context_plus_code_plus_startup_graphs() {
+        // Qwen EXL3 1 RTX, v3-p2 ready ledger: untracked 5,936,332,180 B with 30,380 startup graphs
+        // of 4,569,694,208 B. Startup graphs count at ready, their margin is growth; a lazy set
+        // counts nothing at ready and its whole budget is growth.
+        let startup = GraphSet::new(&[30_380], 150_418, 10, 256 << 20, 620, Lifetime::Startup);
+        let lazy = GraphSet::budget(&[400 << 20]);
+        for set in [&startup, &lazy] {
+            assert_eq!(set.at_ready(0) + set.growth(0), set.bytes(0));
+            let items = set.items(0);
+            let sum = |group: &str| items.iter().filter(|i| i.group == group).map(|i| i.bytes).sum::<u64>();
+            assert_eq!((sum("graphs"), sum(GRAPH_GROWTH)), (set.at_ready(0), set.growth(0)));
+        }
+        assert_eq!(lazy.at_ready(0), 0);
+        let code = loaded_code("qwen4", "exl3", false, 0).unwrap().bytes;
+        let context = ARCH_CONTEXTS[1].context_bytes;
+        let untracked = 5_936_332_180u64;
+        let planned = context + code + startup.at_ready(0);
+        assert!(planned.abs_diff(untracked) < 4 << 20, "planned {planned} vs ledger {untracked}");
+    }
 
     #[test]
     fn loaded_code_keys_family_split_rank_and_experts() {

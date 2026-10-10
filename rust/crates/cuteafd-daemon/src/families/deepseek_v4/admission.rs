@@ -67,6 +67,6 @@ pub(crate) fn request(args: &EngineArgs, inputs: &Inputs<'_>) -> Result<Placemen
         peer_experts: v4::peer_experts(inputs.catalog, args.peer_expert_ranges),
         requested_pool: (args.pool_tokens > 0).then_some(args.pool_tokens as u64),
         onboard: if args.skip_routed_experts { Onboard::Auto } else { onboard },
-        full_prefill_logits: 0, code_bytes: v4::code_bytes(inputs.cfg.dim, gpus) })?;
+        full_prefill_logits: 0, code_bytes: v4::code_bytes(inputs.cfg.dim, v4::code_experts(inputs.catalog), gpus) })?;
     Ok(request)
 }

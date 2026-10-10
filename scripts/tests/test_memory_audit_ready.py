@@ -56,3 +56,19 @@ def test_ready_gate_ignores_growth_items_and_enforces_tolerance(tmp_path):
     assert run(log, plan) == 0
     log, plan = write(tmp_path, fit[:-1] + [item("kv", "state", 100)])
     assert run(log, plan) == 1
+
+
+def test_the_tagged_ready_report_wins_over_a_later_periodic_one(tmp_path):
+    def tagged(used, tracked, scopes, stage):
+        line = report(used, tracked, scopes)
+        return line.replace('"stage": "coordinator"', '"stage": "%s"' % stage)
+    log = tmp_path / "coordinator.log"
+    log.write_text(
+        report(1100 * MIB, 1000 * MIB, {"weights": 1000 * MIB})
+        # Serve logs the ready ledger before the API line; a periodic report lands after traffic.
+        + tagged(1600 * MIB, 1500 * MIB, {"weights": 1000 * MIB, "kv": 500 * MIB}, "ready")
+        + "2026-10-10T00:00:01Z INFO serve: DeepSeek V4 API is ready listen=0.0.0.0:1\n"
+        + report(2000 * MIB, 1500 * MIB, {"weights": 1000 * MIB, "kv": 500 * MIB}))
+    first, last = memory_audit.ready_reports(str(log))
+    assert first["stage"] == "ready" and first["devices"][0]["untracked"] == 100 * MIB
+    assert last["devices"][0]["untracked"] == 500 * MIB

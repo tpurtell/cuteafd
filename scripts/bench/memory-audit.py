@@ -144,8 +144,10 @@ READY = re.compile(r"API is ready|is ready listen=")
 
 
 def ready_reports(path):
-    """(first report at or after the API is ready, last report) of one log."""
-    ready_seen, first, last = False, None, None
+    """(the at-ready report, last report) of one log. The at-ready report is the one serve logs at
+    readiness (stage "ready", before any request captures lazy graphs or loads more code); older logs
+    without it fall back to the first periodic report after the API is ready."""
+    ready_seen, first, tagged, last = False, None, None, None
     with open(path, errors="replace") as handle:
         for line in handle:
             line = ANSI.sub("", line)
@@ -158,10 +160,13 @@ def ready_reports(path):
                 value, _ = json.JSONDecoder().raw_decode(line[start + len("report="):])
             except json.JSONDecodeError:
                 continue
+            if value.get("stage") == "ready" and tagged is None:
+                tagged = value
+                continue
             if ready_seen and first is None:
                 first = value
             last = value
-    return first, last
+    return tagged or first, last
 
 
 def ready_ledger(path):
