@@ -56,6 +56,17 @@ impl RuntimeInventory {
         Ok(Self { gpus })
     }
 
+    /// Logs one recordable JSON line (`placement inventory`) with each GPU's
+    /// inventory sample and the admission's measured free bytes, as the
+    /// equality tests' hardware fixtures are recorded
+    /// (`shared/placement_fixtures/*.json`).
+    pub fn record(&self, family: &str, admission_free: &[u64]) {
+        let gpus: Vec<_> = self.gpus.iter().zip(admission_free.iter().copied().chain(std::iter::repeat(0)))
+            .map(|(g, free)| serde_json::json!({"sample": g, "admission_free_bytes": free})).collect();
+        tracing::info!(target: "cuteafd::placement", record = %serde_json::json!({"family": family, "gpus": gpus}),
+            "placement inventory");
+    }
+
     /// The solver's per-GPU `(total, Measured)` pairs, less `loaded` bytes the
     /// family allocated between this sample and admission.
     pub fn baselines(&self, loaded: &[u64]) -> Vec<(u64, Baseline)> {

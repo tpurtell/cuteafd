@@ -187,6 +187,9 @@ impl Demand {
     pub fn new(gpu: u8, category: Category, group: impl Into<String>, bytes: u64, basis: Basis) -> Self {
         Self { gpu, category, group: group.into(), bytes, basis }
     }
+
+    /// This demand on `gpu`.
+    pub fn on(self, gpu: u8) -> Self { Self { gpu, ..self } }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]

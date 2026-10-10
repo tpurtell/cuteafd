@@ -139,6 +139,79 @@ def render(path, summary):
         print(f"DUAL device {dual['device']}: {dual['tensor']} resident as {', '.join(dual['formats'])}")
 
 
+GROWTH_GROUPS = {"graph growth"}
+READY = re.compile(r"API is ready|is ready listen=")
+
+
+def ready_reports(path):
+    """(first report at or after the API is ready, last report) of one log."""
+    ready_seen, first, last = False, None, None
+    with open(path, errors="replace") as handle:
+        for line in handle:
+            line = ANSI.sub("", line)
+            if "memory ledger" not in line:
+                if READY.search(line):
+                    ready_seen = True
+                continue
+            start = line.find("report=")
+            try:
+                value, _ = json.JSONDecoder().raw_decode(line[start + len("report="):])
+            except json.JSONDecodeError:
+                continue
+            if ready_seen and first is None:
+                first = value
+            last = value
+    return first, last
+
+
+def ready_ledger(path):
+    """Per ledger device: categories at ready (tracked from the last report; runtime from the at-ready
+    report's untracked bytes, before lazy graph captures grow it)."""
+    first, last = ready_reports(path)
+    if last is None:
+        return {}
+    at_ready = {str(d["device"]): d for d in summarize(first or last)["devices"]}
+    out = {}
+    for dev in summarize(last)["devices"]:
+        cats = dict(dev["categories"])
+        cats["runtime"] = cats.get("runtime", 0) - max(dev.get("untracked", 0), 0) + max(
+            at_ready.get(str(dev["device"]), dev).get("untracked", 0), 0)
+        out[str(dev["device"])] = cats
+    return out
+
+
+def ready_gate(args):
+    plan = json.load(open(args.compare))["memory_layout"] if args.compare else None
+    if plan is None:
+        print("--ready needs --compare PLAN", file=sys.stderr)
+        return 2
+    names = {("rtx" if d["kind"] == "rtx" else "spark") + str(d["index"]): d for d in plan["devices"]}
+    mapping = dict(pair.split("=") for pair in args.device_map.split(","))
+    worst = 0.0
+    for path in args.logs:
+        ledger = ready_ledger(path)
+        for planned, ledger_id in mapping.items():
+            if planned not in names or ledger_id not in ledger:
+                continue
+            predicted, growth = defaultdict(int), 0
+            for item in names[planned]["items"]:
+                if item["group"] in GROWTH_GROUPS:
+                    growth += item["bytes"]
+                else:
+                    predicted[item["category"]] += item["bytes"]
+            measured = ledger[ledger_id]
+            total_p, total_m = sum(predicted.values()), sum(measured.values())
+            diff = (total_p - total_m) / (1 << 20)
+            worst = max(worst, abs(diff))
+            print(f"== {path} {planned} (ledger device {ledger_id}) at ready: planned {total_p / (1 << 20):.0f} MiB, "
+                  f"ledger {total_m / (1 << 20):.0f} MiB, diff {diff:+.0f} MiB (growth items {growth / (1 << 20):.0f} MiB)")
+            for cat in sorted(set(predicted) | set(measured)):
+                p_, m_ = predicted.get(cat, 0), measured.get(cat, 0)
+                print(f"   {cat:<12} {p_ / (1 << 20):9.0f} {m_ / (1 << 20):9.0f} {(p_ - m_) / (1 << 20):+8.0f}")
+    print(f"worst device difference {worst:.0f} MiB (tolerance {args.tolerance_mib:.0f})")
+    return 0 if worst <= args.tolerance_mib else 1
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("logs", nargs="+")
@@ -147,7 +220,14 @@ def main():
     parser.add_argument("--compare", help="`cuteafd plan --layout --json` output to compare against")
     parser.add_argument("--device-map", default="rtx0=0,rtx1=1",
                         help="planner device=ledger device pairs for the logs given (e.g. spark0=0)")
+    parser.add_argument("--ready", action="store_true",
+                        help="placement gate: the ledger at ready (tracked bytes from the last report, untracked from "
+                             "the first report at or after the API is ready) vs the plan without its growth items; "
+                             "exit 1 when a device differs by more than --tolerance-mib")
+    parser.add_argument("--tolerance-mib", type=float, default=64.0)
     args = parser.parse_args()
+    if args.ready:
+        sys.exit(ready_gate(args))
     results = {}
     for path in args.logs:
         found = list(reports(path))

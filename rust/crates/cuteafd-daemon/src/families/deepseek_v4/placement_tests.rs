@@ -88,11 +88,8 @@ fn layout_expert_workspace(case: &Case<'_>, catalog: &cuteafd_loader::OfficialV4
             let tiers = exl3.decoder_tiers().iter().map(usize::to_string).collect::<String>();
             let family = if shape.hidden == 4096 { "dsv4f" } else { "dsv4p" };
             let root = case.manifest.parent().unwrap().join("exl3").join(format!("exl3-{family}-k{tiers}/rtx-tp1"));
-            // As local::workspace_bytes: every capacity up to the rows, then the
-            // first at or above them (4096 twice at 4096 rows).
-            const CAPACITIES: [u64; 6] = [1, 16, 80, 256, 1024, 4096];
-            let manifests = CAPACITIES.into_iter().filter(|&n| n <= rows)
-                .chain(CAPACITIES.into_iter().find(|&n| n >= rows))
+            // As local::workspace_bytes: every capacity up to the first at or above the rows, once.
+            let manifests = cuteafd_loader::placement::inventory::exl3_capacities(rows).into_iter()
                 .map(|n| -> anyhow::Result<serde_json::Value> {
                     Ok(serde_json::from_slice(&std::fs::read(root.join(format!("m{n}/v41_exl3.json")))?)?)
                 }).collect::<anyhow::Result<Vec<_>>>()?;
@@ -239,4 +236,118 @@ fn planner_equals_runtime_deepseek_v4() {
         let percent = Case { onboard: Some(Onboard::Fraction(0.1)), ..pro_case };
         assert_eq!(assert_equal(&percent, "pro max 10%").onboard_layers, 6);
     }
+}
+
+/// A hardware inventory fixture (`shared/placement_fixtures/<card>.json`),
+/// recorded from serve-dsv4's `placement inventory` line on a real launch:
+/// each GPU's CUDA total and the free bytes its admission sampled after
+/// context, modules and weights.
+#[derive(serde::Deserialize)]
+struct Fixture {
+    model: String,
+    rtx: usize,
+    sparks: usize,
+    context: u64,
+    /// `RTX_EXPERT_LAYERS` of the launch (`None`: the default).
+    onboard: Option<String>,
+    manifest: String,
+    driver: String,
+    gpus: Vec<FixtureGpu>,
+    /// The launch's admitted pool and RTX expert layers (the runtime's answer).
+    pool_tokens: u64,
+    onboard_layers: usize,
+}
+
+#[derive(serde::Deserialize)]
+struct FixtureGpu {
+    total_bytes: u64,
+    admission_free_bytes: u64,
+}
+
+const MIB: u64 = 1 << 20;
+
+/// `planner_equals_runtime_deepseek_v4` against measured inventories: the
+/// runtime side solves from the free bytes a real launch sampled (not the
+/// planner's own loaded bytes), and the planner, at the same CUDA total, must
+/// predict that sample within 64 MiB per GPU and resolve the same placement
+/// (P1 could not see its 1.45M vs 1.18M Flash max gap: it fed the planner's
+/// numbers back in). Skips fixtures whose snapshot or manifest is absent.
+#[test]
+fn planner_equals_runtime_deepseek_v4_measured() {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/shared/placement_fixtures");
+    let mut checked = 0;
+    for entry in std::fs::read_dir(&dir).unwrap().flatten() {
+        let path = entry.path();
+        if !path.file_name().unwrap().to_string_lossy().starts_with("v4-") { continue; }
+        let fixture: Fixture = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let label = path.file_stem().unwrap().to_string_lossy().into_owned();
+        let manifest = PathBuf::from(shellexpand(&fixture.manifest));
+        let (Some(snapshot), true) = (snapshot(&fixture.model), manifest.is_file()) else {
+            eprintln!("{label}: snapshot or manifest absent; skipped");
+            continue;
+        };
+        let budget = fixture.gpus[0].total_bytes;
+        assert!(fixture.gpus.iter().all(|g| g.total_bytes.abs_diff(budget) < 8 * MIB), "{label}: unequal GPUs");
+        let onboard = fixture.onboard.as_deref().map(|o| o.parse::<Onboard>().unwrap());
+        let case = Case { snapshot: &snapshot, manifest: &manifest, rtx: fixture.rtx, sparks: fixture.sparks,
+            context: fixture.context, budget, onboard, dspark: true, peer: false };
+        let (layout, supported, hints) = planned(&case);
+        assert!(supported, "{label}: planner refused: {:?} {:?}", layout.notes, hints);
+        // The planner's view of the sample: everything loaded before admission.
+        for (gpu, measured) in fixture.gpus.iter().enumerate() {
+            let device = &layout.devices[gpu];
+            let planned_loaded: u64 = device.items.iter().filter(|i| matches!(i.category,
+                Category::Weights | Category::Embedding | Category::Drafter) || i.group == "context+modules")
+                .map(|i| i.bytes).sum();
+            let measured_loaded = measured.total_bytes - measured.admission_free_bytes;
+            let diff = planned_loaded as i64 - measured_loaded as i64;
+            eprintln!("{label} rtx{gpu}: planned loaded {planned_loaded} measured {measured_loaded} diff {diff} \
+                (driver {})", fixture.driver);
+            assert!(diff.unsigned_abs() <= 64 * MIB, "{label} rtx{gpu}: planner baseline {diff:+} B from the \
+                measured inventory");
+        }
+        // The runtime's admission over the measured sample.
+        let runtime = runtime_measured(&case, &fixture).unwrap_or_else(|e| panic!("{label}: runtime: {e:#}"));
+        assert_eq!(runtime.pool_tokens, fixture.pool_tokens, "{label}: fixture pool vs this build's runtime");
+        assert_eq!(runtime.onboard_layers, fixture.onboard_layers, "{label}: fixture layers vs this build's runtime");
+        // The planner resolves the same layers and a pool within the baseline difference.
+        let notes = runtime.expert_ranges.iter().enumerate().map(|(gpu, r)|
+            format!("rtx{gpu}: {} local expert layers ({}..{})", r.layers, r.first, r.first + r.layers));
+        for note in notes { assert!(layout.notes.contains(&note), "{label}: planner lacks {note}"); }
+        let unit: u64 = layout.devices[0].items.iter().filter(|i| i.group == "records").map(|i| i.bytes).sum::<u64>()
+            / (layout.pool_tokens / 256).max(1);
+        let slack = (64 * MIB).div_ceil(unit.max(1)) * 256;
+        assert!(layout.pool_tokens.abs_diff(runtime.pool_tokens) <= slack, "{label}: pool {} planned vs {} measured",
+            layout.pool_tokens, runtime.pool_tokens);
+        checked += 1;
+    }
+    eprintln!("planner_equals_runtime_deepseek_v4_measured: {checked} fixtures");
+}
+
+fn shellexpand(path: &str) -> String {
+    path.replace("~", &std::env::var("HOME").unwrap_or_default())
+}
+
+/// serve-dsv4's admission over a fixture's measured free bytes.
+fn runtime_measured(case: &Case<'_>, fixture: &Fixture) -> anyhow::Result<Placement> {
+    let manifest: serde_json::Value = serde_json::from_slice(&std::fs::read(case.manifest)?)?;
+    let catalog = cuteafd_loader::read_expert_catalog(case.snapshot)?;
+    let cfg = cuteafd_loader::families::deepseek_v4::DeepseekV4Config::read(case.snapshot, 1)?;
+    let family = if cfg.dim == 4096 { "dsv4f" } else { "dsv4p" };
+    let peers = (0..case.sparks).map(|r| format!("10.0.0.{}:1970{r}", r + 1)).collect::<Vec<_>>().join(",");
+    let mut argv = vec!["serve".to_string(), "--snapshot".into(), case.snapshot.display().to_string(),
+        "--native-lib".into(), "/nonexistent/libcuteafd.so".into(), "--peers".into(), peers, "--dspark".into()];
+    if let Some(onboard) = &fixture.onboard { argv.extend(["--rtx-expert-layers".into(), onboard.clone()]); }
+    if case.rtx == 2 { argv.extend(["--split-device".into(), "1".into()]); }
+    let cli = Cli::try_parse_from(argv)?;
+    let stages = (0..).take_while(|stage| catalog.tensors().iter()
+        .any(|t| t.metadata.name.starts_with(&format!("mtp.{stage}.")))).count();
+    let gpus = fixture.gpus.iter().map(|g| (g.total_bytes, Baseline::Measured { free_bytes: g.admission_free_bytes }))
+        .collect();
+    let expert_workspace = layout_expert_workspace(case, &catalog)?;
+    let inputs = admission::Inputs { cfg: &cfg, catalog: &catalog, manifest: &manifest, family, gpus,
+        cache_stages: stages, prefill_rows: manifest["capacities"]["prefill_rows"].as_u64().unwrap() as usize,
+        decode_rows: manifest["capacities"]["decode_rows"].as_u64().unwrap() as usize,
+        max_context: case.context as usize, prefix: Some(&cli.prefix), expert_workspace: Some(expert_workspace) };
+    Ok(solve(&admission::request(&cli.engine, &inputs)?)?)
 }
