@@ -207,6 +207,7 @@ pub fn solve(request: &PlacementRequest) -> Result<Placement, PlacementError> {
         expert_ranges: ranges,
         residual,
         hops,
+        tp2: None,
         items,
     })
 }
