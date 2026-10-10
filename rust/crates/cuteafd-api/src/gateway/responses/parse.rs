@@ -14,6 +14,7 @@ pub(super) enum ToolKind {
 }
 
 pub(super) struct Parsed {
+    pub response_id: String,
     pub wire: Value,
     pub turn: TurnRequest,
     pub kinds: HashMap<String, ToolKind>,
@@ -475,6 +476,7 @@ pub(super) fn parse(
         }
     }
     Ok(Parsed {
+        response_id: super::render::id("resp"),
         wire,
         turn,
         kinds,

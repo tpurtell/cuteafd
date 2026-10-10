@@ -202,6 +202,7 @@ pub struct NativeRequest {
     pub events: mpsc::UnboundedSender<Result<InferenceChunk, NativeFailure>>,
     /// Benchmark diagnostics for this request (`probe::HEADER`); `None` for every ordinary client.
     pub probe: Option<Arc<probe::Probe>>,
+    pub usage: Option<crate::usage::UsageHandle>,
 }
 /// Serving statistics the CUDA owner publishes (a JSON object; `null` until the first publish).
 pub type SharedStats = Arc<Mutex<Value>>;
@@ -444,7 +445,23 @@ impl OutputProcessor {
     }
 }
 
-async fn chat(State(state): State<NativeState>, headers: axum::http::HeaderMap, Json(mut body): Json<Value>) -> Response {
+async fn chat(State(state): State<NativeState>, headers: axum::http::HeaderMap,
+    usage: Option<crate::usage::UsageHandle>, Json(mut body): Json<Value>) -> Response {
+    if let Some(usage) = &usage {
+        usage.details(crate::usage::Details {
+            model_requested: body["model"].as_str().map(str::to_owned),
+            model_served: Some(state.profile.id.clone()),
+            stream: body["stream"].as_bool().unwrap_or(false),
+            n_items: body["messages"].as_array().map(|v| v.len() as u64),
+            n_tools: body["tools"].as_array().map(|v| v.len() as u64),
+            n_images: Some(count_parts(&body["messages"], "image_url")),
+            n_audio: Some(count_parts(&body["messages"], "input_audio")),
+            ..Default::default()
+        });
+        if let Some(key) = body["prompt_cache_key"].as_str().or_else(|| body["user"].as_str()) {
+            usage.cache_session(key);
+        }
+    }
     if let Err(message) = images::guard_content(&body, state.profile.capabilities) {
         return error(StatusCode::BAD_REQUEST, message);
     }
@@ -722,6 +739,7 @@ async fn chat(State(state): State<NativeState>, headers: axum::http::HeaderMap, 
     if image_sources.len() > cuteafd_loader::V41_MAX_IMAGES {
         return error(StatusCode::BAD_REQUEST, "at most 16 images are supported");
     }
+    let queue_started = std::time::Instant::now();
     let permit = match state.admission.reserve(state.queue.clone()).await {
         Ok(permit) => permit,
         Err(admission::Rejected::Closed) => return error(StatusCode::SERVICE_UNAVAILABLE, "worker queue is closed"),
@@ -731,6 +749,7 @@ async fn chat(State(state): State<NativeState>, headers: axum::http::HeaderMap, 
             return response;
         }
     };
+    if let Some(scope) = &usage { scope.queued(queue_started.elapsed().as_secs_f64() * 1000.); }
     let prepared = if image_sources.is_empty() { Vec::new() } else {
         // The queue permit bounds waiters while up to four decoders run. A C16
         // burst should wait here instead of imposing a hidden C4 image limit.
@@ -803,6 +822,7 @@ async fn chat(State(state): State<NativeState>, headers: axum::http::HeaderMap, 
         stop_token_ids,
         events,
         probe,
+        usage: usage.clone(),
     };
     permit.send(job);
     // Admission errors must retain their cause and HTTP status, including for
@@ -821,38 +841,47 @@ async fn chat(State(state): State<NativeState>, headers: axum::http::HeaderMap, 
     // Never let a failed/disconnected backend be converted to a successful EOF.
     let failure = Arc::new(Mutex::new(None::<String>));
     let input_failure = failure.clone();
+    let input_usage = usage.clone();
     let input = async_stream::stream! {
+        account_chunk(&input_usage, &first);
         let mut finished = matches!(first, InferenceChunk::Finish { .. });
         yield first;
         while !finished {
             let Some(event) = receive.recv().await else { break; };
             match event {
                 Ok(chunk) => {
+                    account_chunk(&input_usage, &chunk);
                     finished = matches!(chunk,InferenceChunk::Finish { .. });
                     yield chunk;
                     if finished { break; }
                 }
-                Err(message) => { *input_failure.lock().unwrap() = Some(message.to_string()); break; }
+                Err(message) => { if let Some(scope) = &input_usage { scope.engine_error("worker"); } *input_failure.lock().unwrap() = Some(message.to_string()); break; }
             }
         }
         if !finished {
+            if let Some(scope) = &input_usage { scope.engine_error("unexpected_eof"); }
             input_failure.lock().unwrap().get_or_insert_with(|| "native worker ended without completion".into());
         }
     };
     let chunks = processor.process(input);
+    let output_usage = usage.clone();
     let chunks = async_stream::stream! {
         futures::pin_mut!(chunks);
         while let Some(chunk) = chunks.next().await {
             match chunk {
                 Ok(chunk) => {
+                    if let Some(scope) = &output_usage {
+                        account_output(scope, &chunk);
+                    }
                     if validator.enabled() {
                         if let Err(e) = validator.observe(&serde_json::to_value(&chunk).unwrap()) {
+                            if let Some(scope) = &output_usage { scope.engine_error("output_validation"); }
                             yield Err(e); return;
                         }
                     }
                     yield Ok(chunk);
                 }
-                Err(e) => { yield Err(anyhow::anyhow!(e.to_string())); return; }
+                Err(e) => { if let Some(scope) = &output_usage { scope.engine_error("output_parser"); } yield Err(anyhow::anyhow!(e.to_string())); return; }
             }
         }
     };
@@ -933,6 +962,32 @@ async fn chat(State(state): State<NativeState>, headers: axum::http::HeaderMap, 
     let mut value = serde_json::to_value(response).expect("chat response serializes");
     add_media_usage(&mut value, image_tokens, audio_tokens);
     Json(value).into_response()
+}
+
+fn count_parts(items: &Value, kind: &str) -> u64 {
+    items.as_array().into_iter().flatten().filter_map(|v| v["content"].as_array())
+        .flatten().filter(|p| p["type"] == kind).count() as u64
+}
+fn account_chunk(usage: &Option<crate::usage::UsageHandle>, chunk: &InferenceChunk) {
+    let Some(usage) = usage else { return };
+    match chunk {
+        InferenceChunk::Ready { prompt_usage, .. } => usage.prompt_tokens(
+            prompt_usage.prompt_tokens as u64, prompt_usage.prompt_cache_hit_tokens as u64),
+        _ => (),
+    }
+}
+fn account_output(scope: &crate::usage::UsageHandle, chunk: &ChatChunk) {
+    use deepseek_recipe::openai::chat_completion::response::ChatCompletionFinishReason as Finish;
+    if let Some(Some(u)) = &chunk.usage {
+        scope.tokens(u.prompt_tokens as u64, u.prompt_tokens_details.cached_tokens as u64,
+            u.completion_tokens as u64,
+            u.completion_tokens_details.as_ref().map_or(0, |d| d.reasoning_tokens as u64));
+    }
+    if let Some(reason) = chunk.choices.first().and_then(|c| c.finish_reason) {
+        scope.stop(match reason { Finish::Stop => "stop", Finish::Length => "length",
+            Finish::ContentFilter => "content_filter", Finish::ToolCalls => "tool_calls",
+            Finish::InsufficientSystemResource => "insufficient_system_resource", Finish::Aborted => "cancelled" });
+    }
 }
 
 fn add_media_usage(response: &mut Value, image_tokens: usize, audio_tokens: usize) {

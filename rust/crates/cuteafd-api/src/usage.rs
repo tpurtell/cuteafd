@@ -119,6 +119,12 @@ struct Inner {
     admit: OnceLock<(f64, u64)>,
     first: OnceLock<f64>,
     queue: OnceLock<f64>,
+    served: OnceLock<String>,
+    session: OnceLock<(String, String)>,
+    stop: OnceLock<String>,
+    error: OnceLock<String>,
+    terminal: AtomicU64,
+    retired: OnceLock<f64>,
 }
 /// Opaque, cloneable handle usable by gateway and engine admission tickets.
 #[derive(Clone)]
@@ -144,6 +150,12 @@ impl UsageHandle {
             admit: OnceLock::new(),
             first: OnceLock::new(),
             queue: OnceLock::new(),
+            served: OnceLock::new(),
+            session: OnceLock::new(),
+            stop: OnceLock::new(),
+            error: OnceLock::new(),
+            terminal: AtomicU64::new(0),
+            retired: OnceLock::new(),
         }))
     }
     pub fn rid(&self) -> &str {
@@ -151,6 +163,54 @@ impl UsageHandle {
     }
     pub fn details(&self, details: Details) {
         let _ = self.0.details.set(details);
+    }
+    pub fn served_model(&self, model: &str) {
+        let _ = self.0.served.set(model.to_owned());
+    }
+    /// Higher-confidence handler sessions win over the prefix fallback.
+    pub fn session(&self, id: String, source: &str) {
+        if self.0.record.session_id.is_none() {
+            let _ = self.0.session.set((id, source.to_owned()));
+        }
+    }
+    pub fn session_id(&self) -> &str {
+        self.0.record.session_id.as_deref()
+            .or_else(|| self.0.session.get().map(|s| s.0.as_str()))
+            .or_else(|| self.0.details.get().and_then(|d| d.session_id.as_deref()))
+            .unwrap_or_else(|| self.rid())
+    }
+    pub fn cache_session(&self, key: &str) {
+        self.session(session_hash(key), "cache_key");
+    }
+    pub fn stop(&self, reason: &str) {
+        let _ = self.0.stop.set(reason.to_owned());
+        if reason == "cancelled" { self.0.terminal.store(1, Relaxed); }
+    }
+    pub fn engine_error(&self, class: &str) {
+        let _ = self.0.error.set(class.to_owned());
+        self.0.terminal.store(2, Relaxed);
+    }
+    pub fn prompt_tokens(&self, input: u64, cached: u64) {
+        self.0.tokens_in.store(input, Relaxed);
+        self.0.tokens_cached.store(cached, Relaxed);
+    }
+    pub fn retired(&self, output: u64, reason: &str) {
+        // API usage can include reasoning that the engine cannot classify.
+        let _ = self.0.tokens_out.compare_exchange(u64::MAX, output, Relaxed, Relaxed);
+        let _ = self.0.retired.set(self.0.start.elapsed().as_secs_f64() * 1000.);
+        if reason == "cancelled" { self.stop(reason); }
+        if reason == "failed" { self.engine_error("worker"); }
+    }
+    /// A websocket turn owns a distinct row and never retains the connection scope.
+    pub fn child(&self, protocol: &str) -> Self {
+        let mut record = self.0.record.clone();
+        record.rid = uuid::Uuid::new_v4().to_string();
+        record.ts_ms = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as i64;
+        record.protocol = protocol.into();
+        record.bytes_in = None;
+        let child = Self::new(record, self.0.sink.clone());
+        child.0.status.store(200, Relaxed);
+        child
     }
     pub fn admitted(&self, active: u64) {
         let _ = self
@@ -193,8 +253,10 @@ impl Drop for Inner {
         if let Some(d) = self.details.get() {
             r.model_requested = d.model_requested.clone();
             r.model_served = d.model_served.clone();
-            r.session_id = d.session_id.clone();
-            r.session_source = d.session_source.clone();
+            if r.session_id.is_none() {
+                r.session_id = d.session_id.clone();
+                r.session_source = d.session_source.clone();
+            }
             r.stream = d.stream;
             r.n_items = d.n_items;
             r.n_tools = d.n_tools;
@@ -203,6 +265,15 @@ impl Drop for Inner {
             r.stop_reason = d.stop_reason.clone();
             r.error_class = d.error_class.clone();
         }
+        if let Some(model) = self.served.get() { r.model_served = Some(model.clone()); }
+        if r.session_id.is_none() {
+            if let Some((id, source)) = self.session.get() {
+                r.session_id = Some(id.clone());
+                r.session_source = Some(source.clone());
+            }
+        }
+        if let Some(stop) = self.stop.get() { r.stop_reason = Some(stop.clone()); }
+        if let Some(error) = self.error.get() { r.error_class = Some(error.clone()); }
         let optional = |v: &AtomicU64| {
             let n = v.load(Relaxed);
             (n != u64::MAX).then_some(n)
@@ -233,13 +304,16 @@ impl Drop for Inner {
         }
         if let (Some(first), Some(total), Some(output)) = (r.t_ttft_ms, r.t_total_ms, r.tokens_out)
         {
-            if total > first {
-                r.decode_tps = Some(output.saturating_sub(1) as f64 * 1000. / (total - first));
+            let end = self.retired.get().copied().unwrap_or(total);
+            if end > first {
+                r.decode_tps = Some(output.saturating_sub(1) as f64 * 1000. / (end - first));
             }
         }
         r.status = self.status.load(Relaxed) as u16;
         r.bytes_out = Some(self.bytes_out.load(Relaxed));
-        r.outcome = if self.complete.load(Relaxed) == 0 {
+        r.outcome = if self.terminal.load(Relaxed) == 2 {
+            "engine_error"
+        } else if self.terminal.load(Relaxed) == 1 || self.complete.load(Relaxed) == 0 {
             "cancelled"
         } else {
             match r.status {
@@ -253,6 +327,22 @@ impl Drop for Inner {
         .into();
         self.sink.record(r);
     }
+}
+impl std::fmt::Debug for UsageHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str("UsageHandle") }
+}
+impl PartialEq for UsageHandle {
+    fn eq(&self, _: &Self) -> bool { true }
+}
+#[axum::async_trait]
+impl<S: Send + Sync> axum::extract::FromRequestParts<S> for UsageHandle {
+    type Rejection = axum::http::StatusCode;
+    async fn from_request_parts(parts: &mut axum::http::request::Parts, _: &S) -> Result<Self, Self::Rejection> {
+        parts.extensions.get::<Self>().cloned().ok_or(axum::http::StatusCode::INTERNAL_SERVER_ERROR)
+    }
+}
+pub fn session_hash(key: &str) -> String {
+    format!("{:x}", Sha256::digest(key.as_bytes()))[..16].into()
 }
 pub fn key_label(key: &str) -> String {
     format!("k:{:x}", Sha256::digest(key.as_bytes()))[..10].into()
@@ -315,7 +405,7 @@ pub async fn track(State(state): State<Middleware>, mut request: Request, next: 
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_millis() as i64,
-            protocol: protocol.into(),
+            protocol: if protocol == "realtime" { "realtime_session" } else { protocol }.into(),
             route: path.clone(),
             method: request.method().to_string(),
             client_kind: client_kind(headers).into(),
@@ -427,9 +517,10 @@ impl Drop for TrackedBody {
     }
 }
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
-    struct Sink(std::sync::Mutex<Vec<Record>>, Counters);
+    #[derive(Default)]
+    pub(crate) struct Sink(pub std::sync::Mutex<Vec<Record>>, Counters);
     impl UsageSink for Sink {
         fn record(&self, r: Record) {
             self.0.lock().unwrap().push(r);
@@ -495,6 +586,73 @@ mod tests {
         assert!(std::str::from_utf8(&bytes)
             .unwrap()
             .starts_with("{\"z\":1,\"a\":2,\"usage\":"));
+    }
+    #[test]
+    fn sessions_preserve_confidence_and_hash_payload_free_keys() {
+        for (record, choices, expected, source) in [
+            (Record {session_id: Some("header".into()), session_source: Some("explicit".into()), ..Default::default()}, vec![("root", "explicit"),("prefix", "prefix")], "header".to_string(), "explicit"),
+            (Record::default(), vec![("root", "explicit"),("prefix", "prefix")], "root".to_string(), "explicit"),
+            (Record::default(), vec![("prefix", "prefix")], "prefix".to_string(), "prefix"),
+        ] {
+            let sink = Arc::new(Sink::default());
+            let scope = UsageHandle::new(record, sink.clone());
+            for (id, source) in choices { scope.session(id.into(), source); }
+            scope.details(Details::default());
+            scope.finished(200);
+            drop(scope);
+            let rows = sink.0.lock().unwrap();
+            assert_eq!(rows[0].session_id.as_deref(), Some(expected.as_str()));
+            assert_eq!(rows[0].session_source.as_deref(), Some(source));
+        }
+        assert_eq!(session_hash("private-user").len(), 16);
+        assert_ne!(session_hash("private-user"), "private-user");
+    }
+    #[test]
+    fn engine_retirement_rounds_and_child_lifetimes() {
+        let sink = Arc::new(Sink::default());
+        let scope = UsageHandle::new(Record {rid:"root-rid".into(), ..Default::default()}, sink.clone());
+        let child = scope.child("realtime");
+        child.admitted(2);
+        child.prompt_tokens(12, 4);
+        child.first_token();
+        child.round(4, 3);
+        child.retired(5, "cancelled");
+        child.finished(200);
+        drop(child);
+        let rows = sink.0.lock().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_ne!(rows[0].rid, scope.rid());
+        assert_eq!(rows[0].outcome, "cancelled");
+        assert_eq!(rows[0].tokens_out, Some(5));
+        assert_eq!(rows[0].tokens_cached, Some(4));
+        assert_eq!(rows[0].concurrency_engine, Some(2));
+        assert_eq!(rows[0].rounds, Some(1));
+        assert_eq!(rows[0].draft_accepted, Some(3));
+        drop(rows);
+        scope.engine_error("worker");
+        drop(scope);
+        assert_eq!(sink.0.lock().unwrap()[1].outcome, "engine_error");
+    }
+    #[tokio::test]
+    async fn disconnected_http_stream_emits_cancelled_row() {
+        use tower::ServiceExt;
+        let sink = Arc::new(Sink::default());
+        let app = axum::Router::new().route("/v1/chat/completions", axum::routing::post(|| async {
+            Body::from_stream(futures::stream::pending::<Result<Bytes, std::convert::Infallible>>())
+        })).layer(axum::middleware::from_fn_with_state(Middleware::new(sink.clone()), track));
+        let response = app.oneshot(axum::http::Request::post("/v1/chat/completions").body(Body::empty()).unwrap()).await.unwrap();
+        drop(response);
+        assert_eq!(sink.0.lock().unwrap()[0].outcome, "cancelled");
+    }
+    #[tokio::test]
+    async fn optional_extractor_keeps_usage_off_valid() {
+        use tower::ServiceExt;
+        let app = axum::Router::new().route("/", axum::routing::get(|scope: Option<UsageHandle>| async move {
+            assert!(scope.is_none());
+            "ok"
+        }));
+        let response = app.oneshot(axum::http::Request::get("/").body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(response.status(), 200);
     }
     #[test]
     fn labels_and_classifier() {

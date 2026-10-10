@@ -1164,3 +1164,45 @@ fn reasoning_old_token_keeps_token_text() {
         "old trace"
     );
 }
+#[tokio::test]
+async fn usage_rows_messages_responses_and_root_chain() {
+    use crate::usage::{tests::Sink, Middleware, track, session_hash};
+    let u = Usage { input_tokens: 12, cached_input_tokens: 4, output_tokens: 5, reasoning_tokens: 2, ..Default::default() };
+    let script = || vec![text("answer"), TurnEvent::Usage {usage:u}, done()];
+    let (router, backend, _) = app(vec![script(),script(),script(),script(),script()]);
+    let sink = Arc::new(Sink::default());
+    let router = router.layer(axum::middleware::from_fn_with_state(Middleware::new(sink.clone()), track));
+    let (status, body) = request(&router,"POST","/v1/responses",json!({"model":"alias","input":"hello"})).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let root: Value = serde_json::from_str(&body).unwrap();
+    let (status, _) = request(&router,"POST","/v1/responses",json!({"model":"alias","input":"next","previous_response_id":root["id"]})).await;
+    assert_eq!(status,StatusCode::OK);
+    let (status, _) = request(&router,"POST","/v1/responses",json!({"model":"alias","input":"hello","store":false,"stream":true,"prompt_cache_key":"codex-secret"})).await;
+    assert_eq!(status,StatusCode::OK);
+    for stream in [false,true] {
+        let (status, body) = request(&router,"POST","/v1/messages",json!({"model":"alias","max_tokens":10,"stream":stream,"metadata":{"user_id":"claude-secret"},"messages":[{"role":"user","content":"hello"}]})).await;
+        assert_eq!(status,StatusCode::OK,"{body}");
+    }
+    // Scripted retains requests for assertions; release those engine references.
+    backend.seen.lock().unwrap().clear();
+    let rows = sink.0.lock().unwrap();
+    assert_eq!(rows.len(),5);
+    assert_eq!(rows[0].session_id.as_deref(),root["id"].as_str());
+    assert_eq!(rows[1].session_id,rows[0].session_id);
+    assert_eq!(rows[1].session_source.as_deref(),Some("explicit"));
+    assert_eq!(rows[2].session_id,Some(session_hash("codex-secret")));
+    assert_eq!(rows[2].session_source.as_deref(),Some("cache_key"));
+    for row in &rows[3..] {
+        assert_eq!(row.protocol,"messages");
+        assert_eq!(row.session_id,Some(session_hash("claude-secret")));
+    }
+    for row in rows.iter() {
+        assert_eq!(row.model_requested.as_deref(),Some("alias"));
+        assert_eq!(row.model_served.as_deref(),Some("served-model"));
+        assert_eq!(row.tokens_in,Some(12));
+        assert_eq!(row.tokens_out,Some(5));
+        assert_eq!(row.tokens_reasoning,Some(2));
+        assert_eq!(row.outcome,"ok");
+        assert_eq!(row.stop_reason.as_deref(),Some("end_turn"));
+    }
+}

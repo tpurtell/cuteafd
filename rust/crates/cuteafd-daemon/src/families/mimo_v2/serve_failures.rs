@@ -46,7 +46,7 @@ mod tests {
     fn job(events: mpsc::UnboundedSender<Event>) -> NativeRequest {
         NativeRequest {
             prompt: "queued".into(), constraint: None, images: vec![], media: Vec::new(), audio: Vec::new(), max_tokens: 1,
-            sampling: Default::default(), stop_token_ids: vec![], events, probe: None,
+            sampling: Default::default(), stop_token_ids: vec![], events, usage: None, probe: None,
         }
     }
 

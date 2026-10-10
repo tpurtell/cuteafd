@@ -52,6 +52,7 @@ fn body(body: Result<Json<Value>, JsonRejection>) -> Result<Value, GatewayError>
 
 async fn create(
     State(gateway): State<Arc<Gateway>>,
+    usage: Option<crate::usage::UsageHandle>,
     tape: Tape,
     request: Result<Json<Value>, JsonRejection>,
 ) -> Response {
@@ -60,11 +61,12 @@ async fn create(
         Err(e) => return e.openai_response(),
     };
     p.turn.tape = tape;
+    let streaming = p.wire["stream"].as_bool().unwrap_or(false);
+    account(&mut p, usage, streaming);
     let stream = match gateway.run(p.turn.clone()).await {
         Ok(s) => s,
         Err(e) => return e.openai_response(),
     };
-    let streaming = p.wire["stream"].as_bool().unwrap_or(false);
     if streaming {
         let events = run(gateway, p, stream);
         let sse = events.map(|v| {
@@ -98,6 +100,16 @@ async fn create(
         fold.fail(&e);
         store(&gateway, &p, &fold);
         e.openai_response()
+    }
+}
+
+fn account(p: &mut parse::Parsed, usage: Option<crate::usage::UsageHandle>, streaming: bool) {
+    if let (Some(scope), Some(parent)) = (&usage, &p.parent) {
+        scope.session(parent.root_response_id.clone(), "explicit");
+    }
+    super::driver::account_request(&mut p.turn, usage.clone(), &p.wire, streaming);
+    if p.store {
+        if let Some(scope) = usage { scope.session(p.response_id.clone(), "explicit"); }
     }
 }
 
@@ -261,6 +273,7 @@ async fn input_items(
 
 async fn input_tokens(
     State(gateway): State<Arc<Gateway>>,
+    usage: Option<crate::usage::UsageHandle>,
     tape: Tape,
     request: Result<Json<Value>, JsonRejection>,
 ) -> Response {
@@ -269,6 +282,7 @@ async fn input_tokens(
         Err(e) => return e.openai_response(),
     };
     p.turn.tape = tape;
+    account(&mut p, usage, false);
     match gateway.count_tokens(p.turn).await {
         Ok(n) => Json(json!({"object":"response.input_tokens","input_tokens":n})).into_response(),
         Err(e) => e.openai_response(),
@@ -277,6 +291,7 @@ async fn input_tokens(
 
 async fn compact(
     State(gateway): State<Arc<Gateway>>,
+    usage: Option<crate::usage::UsageHandle>,
     tape: Tape,
     request: Result<Json<Value>, JsonRejection>,
 ) -> Response {
@@ -285,6 +300,7 @@ async fn compact(
         Err(e) => return e.openai_response(),
     };
     p.turn.tape = tape;
+    account(&mut p, usage, false);
     p.turn.tools.clear();
     p.turn.tool_choice = super::turn::ToolChoice::None;
     p.turn.hosted = Default::default();
@@ -323,10 +339,11 @@ async fn compact(
 
 async fn websocket(
     State(gateway): State<Arc<Gateway>>,
+    usage: Option<crate::usage::UsageHandle>,
     tape: Tape,
     ws: WebSocketUpgrade,
 ) -> Response {
-    ws.on_upgrade(move |socket| websocket_loop(socket, gateway, tape))
+    ws.on_upgrade(move |socket| websocket_loop(socket, gateway, tape, usage))
         .into_response()
 }
 
@@ -335,7 +352,7 @@ async fn recorded_send(socket: &mut WebSocket, tape: &Tape, text: String) -> Res
     socket.send(Message::Text(text)).await
 }
 
-async fn websocket_loop(mut socket: WebSocket, gateway: Arc<Gateway>, tape: Tape) {
+async fn websocket_loop(mut socket: WebSocket, gateway: Arc<Gateway>, tape: Tape, usage: Option<crate::usage::UsageHandle>) {
     let mut last: Option<(String, Arc<Snapshot>)> = None;
     while let Some(Ok(message)) = socket.next().await {
         let Message::Text(text) = message else {
@@ -345,6 +362,7 @@ async fn websocket_loop(mut socket: WebSocket, gateway: Arc<Gateway>, tape: Tape
             continue;
         };
         tape.frame("client",&text);
+        let turn_usage = usage.as_ref().map(|s| s.child("responses"));
         let request: Result<Value, GatewayError> = serde_json::from_str(&text)
             .map_err(|_| GatewayError::invalid("invalid websocket JSON"));
         let parsed = request.and_then(|mut v| {
@@ -364,12 +382,15 @@ async fn websocket_loop(mut socket: WebSocket, gateway: Arc<Gateway>, tape: Tape
         let mut p = match parsed {
             Ok(p) => p,
             Err(e) => {
+                if let Some(scope) = &turn_usage { scope.finished(e.status()); }
                 if recorded_send(&mut socket,&tape,json!({"type":"error","status":e.status(),"error":e.openai_body()["error"]}).to_string()).await.is_err() { break; }
                 continue;
             }
         };
+        account(&mut p, turn_usage.clone(), true);
         p.turn.tape = tape.clone();
         if p.wire.get("generate").is_some_and(|v| !v.is_boolean()) {
+            if let Some(scope) = &turn_usage { scope.finished(400); }
             if recorded_send(&mut socket,&tape,json!({"type":"error","status":400,"error":{"type":"invalid_request_error","message":"generate must be boolean","code":null,"param":"generate"}}).to_string()).await.is_err() { return; }
             continue;
         }
@@ -409,9 +430,11 @@ async fn websocket_loop(mut socket: WebSocket, gateway: Arc<Gateway>, tape: Tape
                         return;
                     }
                 }
+                if let Some(scope) = &turn_usage { scope.stop("end_turn"); scope.finished(200); }
                 continue;
             }
             Err(e) => {
+                if let Some(scope) = &turn_usage { scope.finished(e.status()); }
                 if recorded_send(&mut socket,&tape,json!({"type":"error","status":e.status(),"error":e.openai_body()["error"]}).to_string()).await.is_err() { break; }
                 continue;
             }
@@ -424,6 +447,7 @@ async fn websocket_loop(mut socket: WebSocket, gateway: Arc<Gateway>, tape: Tape
                 }
             }
             if fold.terminal {
+                if let Some(scope) = &turn_usage { scope.finished(if fold.response["status"] == "failed" {500} else {200}); }
                 break;
             }
             tokio::select! {

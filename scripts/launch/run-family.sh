@@ -1232,12 +1232,14 @@ api_mount_args=()
 API_KEY_FILE="$(get API_KEY_FILE "${API_KEY_FILE:-}")"
 ENABLE_BENCH="$(get ENABLE_BENCH off)"
 release_prepare_api_key "$ENABLE_BENCH" "${instance:-default}"
+usage="$(get USAGE off)"
+case "$usage" in on|off) ;; *) echo "USAGE must be on or off" >&2; exit 2 ;; esac
 console_supported=0
 if release_console_supported "$coordinator_image" "${wip_layout:+$wip_layout/bin/cuteafd}"; then
   console_supported=1
   release_prepare_console "${instance:-default}"
   api_mount_args+=(--mount "type=bind,src=$CONSOLE_SECRET_FILE,dst=/run/cuteafd-console-secret,readonly" -v "$USAGE_DIR:/root/.cache/cuteafd/usage")
-  family_args+=(--console-secret-file /run/cuteafd-console-secret --usage-dir /root/.cache/cuteafd/usage)
+  family_args+=(--console-secret-file /run/cuteafd-console-secret --usage-dir /root/.cache/cuteafd/usage --usage "$usage")
 fi
 if [[ -n "$API_KEY_FILE" ]]; then
   [[ -f "$API_KEY_FILE" && -r "$API_KEY_FILE" ]] || { echo "API_KEY_FILE must name a readable file" >&2; exit 2; }

@@ -449,7 +449,7 @@ mod tests {
         for text in [arithmetic.as_str(), "Write a Python function that adds two numbers.", arithmetic.as_str()] {
             let (events, output) = mpsc::unbounded_channel();
             send.blocking_send(NativeRequest { prompt: format!("<｜begin▁of▁sentence｜><｜User｜>{text}<｜Assistant｜></think>"),
-                constraint: None, images: Vec::new(), media: Vec::new(), audio: Vec::new(), max_tokens: 8, sampling: Default::default(), stop_token_ids: vec![cuteafd_api::openai::DEEPSEEK_EOS_TOKEN_ID], events, probe: None })?;
+                constraint: None, images: Vec::new(), media: Vec::new(), audio: Vec::new(), max_tokens: 8, sampling: Default::default(), stop_token_ids: vec![cuteafd_api::openai::DEEPSEEK_EOS_TOKEN_ID], events, usage: None, probe: None })?;
             outputs.push(output);
         }
         drop(send);

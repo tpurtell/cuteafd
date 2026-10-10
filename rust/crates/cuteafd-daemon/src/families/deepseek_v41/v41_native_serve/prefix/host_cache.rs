@@ -33,6 +33,7 @@ use std::time::{Duration, Instant};
 /// The engine-side descriptors of a snapshot: everything in a `Saved` that is not device bytes.
 /// `images` pins the snapshot's image key ids for as long as the host copy can be looked up.
 pub(super) struct HostSaved {
+    session: Option<String>,
     images: ImageKeys,
     history: EngramHistory,
     next: TokenScores,
@@ -683,6 +684,7 @@ impl<'a> HostCacheBinding<'a> {
             scores: vec![],
         };
         let payload = HostSaved {
+            session: saved.session.clone(),
             images: saved._images.through(end as usize),
             history: history.fork()?,
             next: saved.next.clone(),
@@ -753,7 +755,7 @@ impl<'a> HostCacheBinding<'a> {
         draft: Option<&DraftRuntime<'_, 'a, C>>,
     ) -> Result<Option<Saved<'a>>> {
         // Take what the rebuilt `Saved` needs out of the payload before the mutable restore call.
-        let (owner, end, windows, source_parts, draft_parts, history, next, images) = {
+        let (owner, end, windows, source_parts, draft_parts, history, next, images, session) = {
             let payload = self
                 .cache
                 .payload(hit.key)
@@ -767,6 +769,7 @@ impl<'a> HostCacheBinding<'a> {
                 payload.history.fork()?,
                 payload.next.clone(),
                 payload.images.through(payload.end as usize),
+                payload.session.clone(),
             )
         };
         let backbone = requests.cache();
@@ -857,6 +860,7 @@ impl<'a> HostCacheBinding<'a> {
             _ => None,
         };
         Ok(Some(Saved {
+            session,
             _images: images,
             target: target_prefix,
             draft,

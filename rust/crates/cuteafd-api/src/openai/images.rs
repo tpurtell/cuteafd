@@ -283,7 +283,7 @@ mod tests {
         };
         let copied = state.clone();
         let slow = body(url);
-        let handler = tokio::spawn(async move { chat(State(copied), Default::default(), Json(slow)).await });
+        let handler = tokio::spawn(async move { chat(State(copied), Default::default(), None, Json(slow)).await });
         tokio::time::timeout(Duration::from_secs(5), waiting)
             .await
             .unwrap()
@@ -294,7 +294,7 @@ mod tests {
         assert_eq!(state.images.slots.available_permits(), 0);
         let immediate = body(format!("data:image/png;base64,{}", STANDARD.encode(PNG)));
         let copied = state.clone();
-        let queued = tokio::spawn(async move { chat(State(copied), Default::default(), Json(immediate)).await });
+        let queued = tokio::spawn(async move { chat(State(copied), Default::default(), None, Json(immediate)).await });
         tokio::task::yield_now().await;
         assert_eq!(state.queue.capacity(), 0);
         assert!(!queued.is_finished());

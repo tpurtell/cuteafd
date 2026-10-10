@@ -81,6 +81,24 @@ def arms_from(values):
     return arms
 
 
+def shared_wip(arms, mappings, builds, parallel):
+    if mappings and (builds or parallel != 1):
+        raise ValueError('--arm-wip refuses --build and parallel runs')
+    for value in mappings:
+        name, instance = value.split('=', 1)
+        if name not in arms or not NAME.fullmatch(instance) or len(instance) > 41:
+            raise ValueError('invalid --arm-wip mapping')
+        if 'wip_instance' in arms[name]:
+            raise ValueError('duplicate --arm-wip mapping')
+        arms[name]['wip_instance'] = instance
+    slots = {}
+    for arm in arms.values():
+        instance = arm.get('wip_instance', arm['instance'])
+        if instance in slots and slots[instance] != arm['slot']:
+            raise ValueError('shared WIP instance requires identical slots')
+        slots[instance] = arm['slot']
+
+
 def load_cards(kit, names):
     cards = {}
     for matrix in sorted(kit.glob('matrix-*.json')):
@@ -151,7 +169,7 @@ def generate(entry, arm_name, arm, state, key_file, overrides, probes, expected_
     for i, host in enumerate(hosts):
         index = HOSTS.index(host) + 1
         values.update({f'SPARK_{i}_HOST': host, f'SPARK_{i}_LANE_A': f'10.55.0.{index}', f'SPARK_{i}_LANE_B': f'10.55.1.{index}'})
-    values.update(API_KEY_FILE=str(key_file), ENABLE_BENCH='on', WIP_INSTANCE=arm['instance'], INSTANCE=arm['instance'], SPARK_COUNT=str(count), RTX_GPUS=str(len(gpus)), COORDINATOR_GPU=str(gpus[0]))
+    values.update(API_KEY_FILE=str(key_file), ENABLE_BENCH='on', WIP_INSTANCE=arm.get('wip_instance', arm['instance']), INSTANCE=arm['instance'], SPARK_COUNT=str(count), RTX_GPUS=str(len(gpus)), COORDINATOR_GPU=str(gpus[0]))
     if arm.get('root'):
         values['WIP_ROOT'] = arm['root']
     card = entry['name']
@@ -477,6 +495,7 @@ def summarize_job(job, exit_code):
     dest = Path(job['state'])
     row = {k: job[k] for k in ('card', 'arm', 'repeat', 'simulated')}
     row.update(exit_code=exit_code, status='failed' if exit_code else 'pass')
+    if 'artifacts' in job: row['artifacts'] = job['artifacts']
     reports = list((dest / 'reports').glob('**/report.json'))
     if job.get('grouped'):
         reports = [path for path in reports if path.parent.name.endswith('-' + job['entry']['name'])]
@@ -625,7 +644,8 @@ def assert_absent(job):
 
 
 def slot_check(arm, host):
-    container = ('cuteafd-coordinator-wip-' if host == 'raptor' else 'cuteafd-spark-expert-wip-') + arm['instance']
+    instance = arm.get('wip_instance', arm['instance'])
+    container = ('cuteafd-coordinator-wip-' if host == 'raptor' else 'cuteafd-spark-expert-wip-') + instance
     role = 'coordinator' if host == 'raptor' else 'spark-expert'
     program = '''import hashlib,json,pathlib,sys
 p=pathlib.Path('/wip/slots')/sys.argv[1]/sys.argv[2]
@@ -635,9 +655,10 @@ m=json.loads(meta)
 assert m['slot']==sys.argv[1] and m['role']==sys.argv[2] and m['wip_instance']==sys.argv[3], 'slot identity mismatch'
 for relative,key in [('SOURCE_SHA256SUMS','source_manifest_sha256'),('workspace/.cuteafd-wip/ARTIFACT_SHA256SUMS','artifact_manifest_sha256')]:
     assert hashlib.sha256((p/relative).read_bytes()).hexdigest()==m[key], relative+' seal mismatch'
+m['seal_sha256']=hashlib.sha256(meta).hexdigest()
 print(json.dumps(m))
 '''
-    cmd = ['docker', 'exec', container, 'python3', '-c', program, arm['slot'], role, arm['instance']]
+    cmd = ['docker', 'exec', container, 'python3', '-c', program, arm['slot'], role, instance]
     try:
         return run(cmd if host == 'raptor' else ['ssh', '-o', 'BatchMode=yes', host, shlex.join(cmd)]).stdout
     except subprocess.SubprocessError as error:
@@ -699,6 +720,8 @@ print('verified absent', root, overlay)
 
 def cleanup(arms, task, dry):
     for arm in arms.values():
+        if 'wip_instance' in arm:
+            continue  # External sealed builds are never owned by this card task.
         script = cleanup_script(arm, task)
         for host in ('raptor', *HOSTS):
             cmd = ['python3', '-c', script] if host == 'raptor' else ['ssh', '-o', 'BatchMode=yes', host, shlex.join(['python3', '-c', script])]
@@ -824,6 +847,7 @@ def main():
     parser.add_argument('--kit', type=Path, default=Path.home() / '.cache/cuteafd/builds/release-v2-rc2/kit')
     parser.add_argument('--cards', nargs='+', default=[])
     parser.add_argument('--arm', action='append', default=[], metavar='NAME=INSTANCE:SLOT')
+    parser.add_argument('--arm-wip', action='append', default=[], metavar='NAME=WIP_INSTANCE', help='reuse an external sealed WIP build; serving instances stay distinct')
     parser.add_argument('--card-arm', action='append', default=[], metavar='CARD=ARM', help='matrix mode: bind a card to one arm (useful for disjoint correctness pairs)')
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument('--interleave', action='store_true')
@@ -853,6 +877,7 @@ def main():
     if not NAME.fullmatch(args.task) or args.parallel < 1 or args.repeats < 1:
         parser.error('invalid task, repeats or parallelism')
     arms = arms_from(args.arm)
+    shared_wip(arms, args.arm_wip, args.build, args.parallel)
     if args.nonce_seed is not None and (not args.nonce_seed or '\n' in args.nonce_seed or '\r' in args.nonce_seed):
         parser.error('--nonce-seed must be non-empty and single-line')
     if not arms:
@@ -977,8 +1002,11 @@ def main():
         dest = Path(job['state'])
         try:
             assert_absent(job)
+            job['artifacts'] = {}
             for host in ('raptor', *job['entry']['sparks']):
-                slot_check(arms[job['arm']], host)
+                meta = json.loads(slot_check(arms[job['arm']], host))
+                job['artifacts'][host] = {k: meta[k] for k in ('slot', 'seal_sha256', 'artifact_manifest_sha256')}
+            save(dest / 'job.json', {**job, 'probes': sorted(job['probes'])})
         except (ValueError, subprocess.SubprocessError) as error:
             row = {k: job[k] for k in ('card', 'arm', 'repeat', 'simulated')}
             row.update(status='failed', exit_code=82, error=str(error))

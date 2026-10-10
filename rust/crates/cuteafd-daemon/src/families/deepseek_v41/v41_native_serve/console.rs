@@ -54,6 +54,11 @@ impl Tally {
         if live.is_some_and(Live::text) { tally.emissions = emissions.to_vec(); }
         tally
     }
+    pub fn usage<'a>(&self, handles: impl Iterator<Item = Option<&'a cuteafd_api::usage::UsageHandle>>) {
+        for (index, handle) in handles.enumerate().take(8) {
+            if let Some(handle) = handle { handle.round(self.drafted[index].into(), self.accepted[index].into()); }
+        }
+    }
     /// Build the round event; `members` gives each member's id, grammar mask
     /// state and whether it finished this round.
     #[allow(clippy::too_many_arguments)]

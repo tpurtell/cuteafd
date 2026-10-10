@@ -768,7 +768,7 @@ mod http_503_mapping {
             sampling: Default::default(),
             stop_token_ids: Vec::new(),
             events,
-            probe: None,
+            usage: None, probe: None,
         }
     }
 

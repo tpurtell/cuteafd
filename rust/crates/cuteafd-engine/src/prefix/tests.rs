@@ -1026,3 +1026,25 @@ fn pool_page_layouts_are_checked() {
     let arena = Fake::new(4, 1, 3);
     assert_eq!(PrefixCache::<Shared>::new(arena.layout(), config(2, 3), None).unwrap().arena().slots(), 3);
 }
+
+#[test]
+fn usage_provenance_survives_device_and_host_restore() {
+    let fake = Fake::new(24,4,8);
+    let mut cache = cache(&fake,8,1 << 20);
+    let prompt = seq(100,26);
+    cache.capture_session(Some("creating-request".into()));
+    let (_,_,p) = serve(&mut cache,&fake,0,&prompt,&[],40);
+    fake.mem.borrow_mut().advance(10_000_000);
+    cache.tick();
+    cache.release(&fake,&p.pages).unwrap();
+    cache.capture_session(Some("unrelated-request".into()));
+    let mut next = prompt.clone(); next.extend(seq(200,5));
+    for host in [false,true] {
+        if host { cache.clear(&fake).unwrap(); }
+        let admitted = cache.admit(&fake,&next,40,false,|pages| Placement {pages,ring:1,len:0,ring_from:0}).unwrap();
+        let source = admitted.source.unwrap();
+        assert_eq!(source.session.as_deref(),Some("creating-request"));
+        assert_eq!(source.host,host);
+        cache.release(&fake,&admitted.placement.pages).unwrap();
+    }
+}
