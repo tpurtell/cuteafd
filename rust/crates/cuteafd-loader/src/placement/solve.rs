@@ -38,7 +38,7 @@ pub fn solve(request: &PlacementRequest) -> Result<Placement, PlacementError> {
             let trial = solve_once(request, &flips);
             if trial.as_ref().is_ok_and(|p| p.pool_tokens >= request.pool.target) { return trial; }
             if let Ok(p) = &trial {
-                if p.pool_tokens > kind_best { kind_best = p.pool_tokens; selected_flips = flips.clone(); }
+                if p.pool_tokens >= kind_best { kind_best = p.pool_tokens; selected_flips = flips.clone(); }
             }
             if trial.as_ref().is_ok_and(|p| best.as_ref().map_or(true, |b| p.pool_tokens > b.pool_tokens)) { best = trial; }
         }
