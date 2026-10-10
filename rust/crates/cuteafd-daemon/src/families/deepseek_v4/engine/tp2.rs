@@ -29,12 +29,11 @@ impl ExchangePolicy {
         self.dtype(rows, decode_rows) == ExchangeDtype::F32
     }
 
-    fn dtype(self, rows: usize, decode_rows: usize) -> ExchangeDtype {
+    fn dtype(self, _rows: usize, _decode_rows: usize) -> ExchangeDtype {
         match self {
             Self::F32 => ExchangeDtype::F32,
-            Self::Bf16 => ExchangeDtype::Bf16,
-            Self::Auto if rows <= decode_rows => ExchangeDtype::F32,
-            Self::Auto => ExchangeDtype::Bf16,
+            // Flash: BF16 stays near the atomic self-KL floor; F32 adds KL without a decode win.
+            Self::Auto | Self::Bf16 => ExchangeDtype::Bf16,
         }
     }
 
@@ -520,13 +519,15 @@ mod tests {
     }
 
     #[test]
-    fn exchange_policy_matches_admission_and_auto_switches_by_rows() {
+    fn exchange_policy_matches_admission_and_auto_uses_qualified_bf16() {
         assert_eq!(ExchangePolicy::Auto.slot_bytes(4096, 80, 4096), 4096 * 4096 * 2);
         assert_eq!(ExchangePolicy::F32.slot_bytes(4096, 80, 4096), 4096 * 4096 * 4);
         assert_eq!(ExchangePolicy::Auto.slot_bytes(16, 80, 4096), 80 * 4096 * 4);
-        assert_eq!(ExchangePolicy::Auto.dtype(80, 80), ExchangeDtype::F32);
-        assert_eq!(ExchangePolicy::Auto.dtype(81, 80), ExchangeDtype::Bf16);
-        assert_eq!(ExchangePolicy::Bf16.dtype(1, 80), ExchangeDtype::Bf16);
+        for rows in [1, 16, 64, 80, 81, 256, 4096] {
+            assert_eq!(ExchangePolicy::Auto.dtype(rows, 80), ExchangeDtype::Bf16);
+            assert_eq!(ExchangePolicy::Bf16.dtype(rows, 80), ExchangeDtype::Bf16);
+            assert_eq!(ExchangePolicy::F32.dtype(rows, 80), ExchangeDtype::F32);
+        }
         assert!(ExchangePolicy::parse("fp8").is_err());
     }
 }
