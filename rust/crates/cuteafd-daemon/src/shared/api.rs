@@ -40,7 +40,7 @@ pub(crate) struct ApiArgs {
 }
 impl Default for ApiArgs {
     fn default() -> Self {
-        Self { api_key_file: None, enable_bench: false, usage_dir: None, usage: Some("off".into()), console_secret_file: None,
+        Self { api_key_file: None, enable_bench: false, usage_dir: None, usage: Some("on".into()), console_secret_file: None,
             console_cookie_secure: false, gateway: "on".into(), official_model_names: "on".into(),
             official_model_names_file: None, gateway_search: "none".into() }
     }
