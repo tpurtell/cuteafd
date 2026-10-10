@@ -121,9 +121,12 @@ nice 19 with 16 jobs (`CARGO_BUILD_JOBS=16`, `RUST_TEST_THREADS=16`).
   cards too, so wait for an idle one without holding locks; never wrap
   `wip.sh` in a Spark lock yourself.
 - **Page cache:** GB10 doesn't reclaim it, and a full one OOMs expert
-  packing. `agent-sudo -n` can't drop it (that needs TJ's live approval).
-  Evict unprivileged with `posix_fadvise(DONTNEED)` on the checkpoint files
-  and their local sparknest objects, then gate on `MemAvailable`.
+  packing. The launchers already drop Spark caches through `nest
+  drop-caches` (SparkNest's installed setuid helper, no approval needed), so
+  stock card runs need nothing extra. When an agent must evict outside the
+  launcher, `agent-sudo -n` can't (that needs TJ's live approval). Use
+  unprivileged `posix_fadvise(DONTNEED)` on the checkpoint files and their
+  local sparknest objects, then gate on `MemAvailable`.
 - **Briefs:** point at `scripts/agents/codex-preamble.md` in an up-to-date
   checkout. The main checkout can lag; a stale copy cost one agent a v1-era
   rule set.
