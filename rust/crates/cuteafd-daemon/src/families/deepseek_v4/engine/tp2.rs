@@ -52,6 +52,22 @@ struct PendingCheck<'a> {
     ranks: [Option<HostAllocation<'a>>; 2],
 }
 
+#[derive(Debug, Clone, Copy)]
+struct PackedRoutes {
+    section_bytes: usize,
+    weights_at: usize,
+    push_bytes: usize,
+}
+
+impl PackedRoutes {
+    fn new(rows: usize, topk: usize) -> Self {
+        let section_bytes = rows * topk * 4;
+        let weights_at = section_bytes.next_multiple_of(16);
+        let push_bytes = (weights_at + section_bytes).next_multiple_of(16);
+        Self { section_bytes, weights_at, push_bytes }
+    }
+}
+
 pub(super) struct Tp2State<'a> {
     pub(super) layers: Range<usize>,
     ranks: [RefCell<Box<dyn RtxExpertLayer + 'a>>; 2],
@@ -147,26 +163,27 @@ impl<'a> Engine<'a> {
             let mut routes = Routes { ids: w.route_ids.buffer.ptr, weights: w.route_weights.buffer.ptr };
             if tp2.source.get() == RouteSource::Broadcast {
                 let slot = 2 * index + layer % 2;
-                let bytes = rows * self.cfg.n_activated_experts * 4;
-                let weights_at = bytes.next_multiple_of(16);
+                let packed = PackedRoutes::new(rows, self.cfg.n_activated_experts);
                 if rank == 0 {
                     // The scores are consumed: their larger buffer doubles as route packing scratch.
-                    ensure!(weights_at + bytes <= w.logits.buffer.bytes, "router scratch cannot hold canonical routes");
-                    // SAFETY: both sections fit the rank's logits allocation; copies precede the push.
+                    ensure!(packed.push_bytes <= w.logits.buffer.bytes, "router scratch cannot hold canonical routes");
+                    // SAFETY: both sections fit the rank's logits allocation; zero padding and copies precede the push.
                     unsafe {
-                        self.library.copy_d2d_async(w.logits.buffer, w.route_ids.buffer, bytes, stream)?;
+                        self.library.cuda_zero_bytes_async(w.logits.buffer, packed.push_bytes, stream)?;
+                        self.library.copy_d2d_async(w.logits.buffer, w.route_ids.buffer, packed.section_bytes, stream)?;
                         self.library.copy_d2d_async(cuteafd_ffi::CuteafdDeviceBuffer {
-                            ptr: w.logits.buffer.ptr.cast::<u8>().add(weights_at).cast(), ..w.logits.buffer
-                        }, w.route_weights.buffer, bytes, stream)?;
+                            ptr: w.logits.buffer.ptr.cast::<u8>().add(packed.weights_at).cast(),
+                            bytes: w.logits.buffer.bytes - packed.weights_at, ..w.logits.buffer
+                        }, w.route_weights.buffer, packed.section_bytes, stream)?;
                     }
                     self.record_peer(0, "routes", slot, true, layer, index);
-                    tp2.routes.push(0, slot, w.logits.buffer.ptr, weights_at + bytes)?;
+                    tp2.routes.push(0, slot, w.logits.buffer.ptr, packed.push_bytes)?;
                 } else {
                     self.record_peer(1, "routes", slot, false, layer, index);
                     tp2.routes.wait(1, slot)?;
-                    let packed = tp2.routes.recv(1, slot)?;
+                    let received = tp2.routes.recv(1, slot)?;
                     // SAFETY: the received slot contains ids then aligned weights, published by rank 0.
-                    routes = Routes { ids: packed, weights: unsafe { packed.cast::<u8>().add(weights_at).cast() } };
+                    routes = Routes { ids: received, weights: unsafe { received.cast::<u8>().add(packed.weights_at).cast() } };
                 }
             }
             let combine = self.combine(rows)?;
@@ -458,6 +475,35 @@ mod tests {
                     assert_eq!(order::check(&schedule(layers, local, 1, true, broadcast)), Ok(()));
                 }
             }
+        }
+    }
+
+    #[test]
+    fn packed_routes_align_every_row_shape_within_admission() {
+        for topk in [6, 8] {
+            for rows in 1..=4096 {
+                let packed = PackedRoutes::new(rows, topk);
+                assert_eq!(packed.weights_at % 16, 0);
+                assert_eq!(packed.push_bytes % 16, 0);
+                assert!(packed.weights_at >= packed.section_bytes);
+                assert!(packed.weights_at + packed.section_bytes <= packed.push_bytes);
+                assert!(packed.push_bytes <= rows * topk * 8 + 16);
+            }
+        }
+        assert_eq!(PackedRoutes::new(1, 6).push_bytes, 64);
+    }
+
+    #[test]
+    fn startup_route_identity_prefill_then_decode_schedule_drains() {
+        // Prewarm and capture-only graphs precede the first peer wait and queue
+        // no peer operations. Hardware also checks the actual identity steps.
+        for broadcast in [false, true] {
+            let mut startup = schedule(43, 8, 2, false, broadcast);
+            let decode = schedule(43, 8, 1, true, broadcast);
+            for (prefill, decode) in startup.streams.iter_mut().zip(decode.streams) {
+                prefill.extend(decode);
+            }
+            assert_eq!(order::check(&startup), Ok(()));
         }
     }
 
