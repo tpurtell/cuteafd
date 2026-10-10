@@ -94,11 +94,11 @@ enum Phase {
 // Keep this bank before the allocations referenced by its graphs.
 struct Tp2FfnGraphs<'w,'a> {
     device: Device<'a>,
-    bank: crate::families::deepseek_v41::v41_layer_graphs::LayerGraphs<'w,'a,BackboneHcWeights<'a>>,
+    bank: crate::shared::decode_graph::LayerGraphs<'w,'a,BackboneHcWeights<'a>>,
 }
 impl<'w,'a> Tp2FfnGraphs<'w,'a> {
     fn new(device:Device<'a>)->Self {
-        let mut bank=crate::families::deepseek_v41::v41_layer_graphs::LayerGraphs::new(device.library);
+        let mut bank=crate::shared::decode_graph::LayerGraphs::new(device.library, 8 * (cuteafd_core::MAX_DSPARK_PROPOSALS as u32 + 1));
         bank.enable_small_shapes();Self {device,bank}
     }
     unsafe fn capture_ready(&mut self,block:&mut BackboneBlockWave<'w,'a>,

@@ -1,8 +1,5 @@
 //! Captured shapes per backbone layer, sharing the containing lane's buffers.
 use anyhow::{ensure, Result};
-use cuteafd_ffi::NativeLibrary;
-use std::ffi::c_void;
-use std::collections::BTreeMap;
 
 const MAX_DECODE_ROWS: u32 = 8 * (cuteafd_core::MAX_DSPARK_PROPOSALS as u32 + 1);
 
@@ -41,164 +38,12 @@ pub(super) fn fixed_binding_limit() -> Option<usize> {
     FIXED_SHAPES.get().map(|shapes| shapes.len() * 4)
 }
 
-struct Entry<'w, W> {
-    weights: &'w W,
-    graph: *mut c_void,
-    rows: u32,
-}
-
-/// The containing owner drains graph launches before replacement or destruction.
-/// References retain every captured weight owner until its graph is destroyed.
-pub(crate) struct LayerGraphs<'w, 'a, W> {
-    library: &'a NativeLibrary,
-    entries: [Option<Entry<'w, W>>; 40],
-    retained: [BTreeMap<u32, Entry<'w, W>>; 40],
-    retain_small: bool,
-}
-impl<'w, 'a, W> LayerGraphs<'w, 'a, W> {
-    pub fn new(library: &'a NativeLibrary) -> Self {
-        Self {
-            library,
-            entries: std::array::from_fn(|_| None),
-            retained: std::array::from_fn(|_| BTreeMap::new()),
-            retain_small: false,
-        }
-    }
-    pub fn get(&self, layer: usize, weights: &W) -> Option<(*mut c_void, u32)> {
-        let entry = self.entries.get(layer)?.as_ref()?;
-        std::ptr::eq(entry.weights, weights).then_some((entry.graph, entry.rows))
-    }
-    /// A decode lane contains at most eight requests with eight rows each.
-    /// Retain those shapes plus at most one current large-prefill graph.
-    pub fn enable_small_shapes(&mut self) { self.retain_small = true; }
-    pub fn get_shape(&self, layer: usize, weights: &W, rows: u32) -> Option<(*mut c_void, u32)> {
-        if let Some(graph) = self.get(layer, weights).filter(|(_, n)| *n == rows) { return Some(graph); }
-        let entry = self.retained.get(layer)?.get(&rows)?;
-        std::ptr::eq(entry.weights, weights).then_some((entry.graph, entry.rows))
-    }
-    /// # Safety
-    /// All uses of the replaced graph are complete. On success this cache owns
-    /// graph, captured for exactly these weights/rows and this lane's buffers.
-    /// On failure the caller still owns graph.
-    pub unsafe fn insert(
-        &mut self,
-        layer: usize,
-        weights: &'w W,
-        rows: u32,
-        graph: *mut c_void,
-    ) -> Result<()> {
-        ensure!(
-            layer < 40 && rows > 0 && rows <= 4096 && !graph.is_null(),
-            "invalid layer graph binding"
-        );
-        let different_owner = self.entries[layer].as_ref().is_some_and(|e| !std::ptr::eq(e.weights, weights))
-            || self.retained[layer].values().any(|e| !std::ptr::eq(e.weights, weights));
-        if !self.retain_small || different_owner {
-            unsafe { self.remove(layer)?; }
-        } else {
-            if let Some(old) = self.retained[layer].remove(&rows) {
-                unsafe { self.library.cuda_graph_exec_destroy(old.graph)?; }
-            }
-            if let Some(old) = self.entries[layer].take() {
-                if (old.rows <= MAX_DECODE_ROWS || FIXED_SHAPES.get().is_some()) && old.rows != rows {
-                    if let Some(replaced) = self.retained[layer].insert(old.rows, old) {
-                        unsafe { self.library.cuda_graph_exec_destroy(replaced.graph)?; }
-                    }
-                } else {
-                    unsafe { self.library.cuda_graph_exec_destroy(old.graph)?; }
-                }
-            }
-        }
-        self.entries[layer] = Some(Entry {
-            weights,
-            graph,
-            rows,
-        });
-        tracing::debug!(target: "cuteafd::graph_capture", layer, rows, retain=self.retain_small,
-            bank=self as *const Self as usize,
-            owner=std::any::type_name::<W>(), retained=self.retained[layer].len()+1,
-            "native layer graph captured");
-        Ok(())
-    }
-    /// # Safety
-    /// All launches using the layer's graph have completed.
-    pub unsafe fn remove(&mut self, layer: usize) -> Result<()> {
-        ensure!(layer < 40, "invalid layer graph index");
-        let mut error = None;
-        for entry in self.entries[layer].take().into_iter()
-            .chain(std::mem::take(&mut self.retained[layer]).into_values()) {
-            if let Err(e) = unsafe { self.library.cuda_graph_exec_destroy(entry.graph) } { error.get_or_insert(e); }
-        }
-        error.map_or(Ok(()), Err)
-    }
-    /// # Safety
-    /// All launches using any retained graph have completed.
-    pub unsafe fn clear(&mut self) -> Result<()> {
-        let mut first_error = None;
-        for layer in 0..40 {
-            if let Err(error) = unsafe { self.remove(layer) } {
-                first_error.get_or_insert(error);
-            }
-        }
-        first_error.map_or(Ok(()), Err)
-    }
-}
-// Destruction is explicit in the containing wave after its stream drains.
-
-/// Fixed-weight owners retain the finite decode row set and one large shape.
-/// The containing wave keeps all captured buffers alive and drains before insert/clear.
-pub(crate) struct RowGraphs<'a> {
-    library: &'a NativeLibrary,
-    small: [Option<*mut c_void>; MAX_DECODE_ROWS as usize],
-    large: Option<(*mut c_void, usize)>,
-    site: &'static str,
-}
-impl<'a> RowGraphs<'a> {
-    pub fn new(library: &'a NativeLibrary, site: &'static str) -> Self {
-        Self { library, small: [None; MAX_DECODE_ROWS as usize], large: None, site }
-    }
-    pub fn get(&self, rows: usize) -> Option<*mut c_void> {
-        if (1..=MAX_DECODE_ROWS as usize).contains(&rows) { self.small[rows - 1] }
-        else { self.large.filter(|(_, count)| *count == rows).map(|(graph, _)| graph) }
-    }
-    /// # Safety
-    /// All launches on this owner's buffers have drained. On success the bank
-    /// owns graph; it captures only the containing wave's fixed weights/storage.
-    pub unsafe fn insert(&mut self, rows: usize, graph: *mut c_void) -> Result<()> {
-        ensure!((1..=4096).contains(&rows) && !graph.is_null(), "invalid row graph binding");
-        let old = if rows <= MAX_DECODE_ROWS as usize {
-            self.small[rows - 1].take()
-        } else { self.large.take().map(|(graph, _)| graph) };
-        if let Some(old) = old {
-            // SAFETY: the containing wave drained every launch before replacement.
-            unsafe { self.library.cuda_graph_exec_destroy(old)?; }
-        }
-        if rows <= MAX_DECODE_ROWS as usize { self.small[rows - 1] = Some(graph); }
-        else { self.large = Some((graph, rows)); }
-        tracing::debug!(target: "cuteafd::graph_capture", site=self.site, rows,
-            bank=self as *const Self as usize,
-            retained=self.small.iter().flatten().count()+usize::from(self.large.is_some()),
-            "native row graph captured");
-        Ok(())
-    }
-    /// # Safety
-    /// The containing wave drained every queued use before releasing graphs/storage.
-    pub unsafe fn clear(&mut self) -> Result<()> {
-        let mut failure = None;
-        for graph in self.small.iter_mut().filter_map(Option::take)
-            .chain(self.large.take().map(|(graph, _)| graph)) {
-            // SAFETY: every queued use completed before the containing wave called clear.
-            if let Err(error) = unsafe { self.library.cuda_graph_exec_destroy(graph) } {
-                failure.get_or_insert(error);
-            }
-        }
-        failure.map_or(Ok(()), Err)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::shared::decode_graph::{LayerGraphs, RowGraphs};
+    use cuteafd_ffi::NativeLibrary;
+    use std::collections::BTreeMap;
     use crate::shared::memory::{DeviceAllocation, LoadStream};
 
     #[test]
@@ -232,7 +77,7 @@ mod tests {
         let input = DeviceAllocation::new(&library, 128 * 4)?;
         let output = DeviceAllocation::new(&library, 128 * 4)?;
         let stream = LoadStream { library: &library, raw: library.cuda_stream_create()? };
-        let mut bank = RowGraphs::new(&library, "fixture");
+        let mut bank = RowGraphs::new(&library, "fixture", MAX_DECODE_ROWS as usize);
         let mut handles = BTreeMap::new();
         for (cycle, rows) in (1..=MAX_DECODE_ROWS as usize)
             .chain([80, 128, 2, 6, 3, 48, 64, 56, 63, 64]).enumerate() {
@@ -263,10 +108,10 @@ mod tests {
         }
         assert!(bank.get(80).is_none());
         assert!(bank.get(128).is_some());
-        assert_eq!(bank.small.iter().flatten().count(), MAX_DECODE_ROWS as usize);
+        assert_eq!(bank.len(), MAX_DECODE_ROWS as usize + 1);
         // SAFETY: every fixture launch was synchronized before destruction.
         unsafe { bank.clear()?; bank.clear()?; }
-        assert!(bank.small.iter().all(Option::is_none) && bank.large.is_none());
+        assert_eq!(bank.len(), 0);
         Ok(())
     }
 
@@ -281,7 +126,7 @@ mod tests {
         let other = DeviceAllocation::new(&library, 128 * 4)?;
         let output = DeviceAllocation::new(&library, 128 * 4)?;
         let stream = LoadStream { library: &library, raw: library.cuda_stream_create()? };
-        let mut bank = LayerGraphs::new(&library);
+        let mut bank = LayerGraphs::new(&library, MAX_DECODE_ROWS);
         bank.enable_small_shapes();
         let mut handles = BTreeMap::new();
         for (cycle, rows) in (1..=MAX_DECODE_ROWS).chain([80, 128, 2, 6, 3, 2, 6, 48, 64, 56, 63, 64]).enumerate() {
@@ -309,7 +154,7 @@ mod tests {
             view.bytes = actual.len();
             library.copy_d2h(&mut actual, view)?;
             assert_eq!(actual, expected[..actual.len()]);
-            assert!(bank.retained[0].len() + usize::from(bank.entries[0].is_some()) <= MAX_DECODE_ROWS as usize + 1);
+            assert!(bank.len() <= MAX_DECODE_ROWS as usize + 1);
         }
         assert!(bank.get_shape(0, &weights, 80).is_none());
         assert!(bank.get_shape(0, &weights, 128).is_some());
@@ -323,8 +168,8 @@ mod tests {
         assert!(bank.get_shape(0, &weights, 6).is_none());
         assert!(bank.get_shape(0, &other, 2).is_some());
         unsafe { bank.clear()?; }
-        assert!(bank.entries.iter().all(Option::is_none));
-        assert!(bank.retained.iter().all(BTreeMap::is_empty));
+        assert_eq!(bank.len(), 0);
+        assert_eq!(bank.len(), 0);
         Ok(())
     }
 
@@ -351,7 +196,7 @@ mod tests {
         let outputs = (0..2)
             .map(|_| DeviceAllocation::new(&library, 4096 * 4))
             .collect::<Result<Vec<_>>>()?;
-        let mut banks = [LayerGraphs::new(&library), LayerGraphs::new(&library)];
+        let mut banks = [LayerGraphs::new(&library, MAX_DECODE_ROWS), LayerGraphs::new(&library, MAX_DECODE_ROWS)];
         let mut captures = 0;
         let mut replays = 0;
         for rows in [1u32, 80, 4096] {
@@ -407,7 +252,7 @@ mod tests {
                 }
                 assert!(banks
                     .iter()
-                    .all(|bank| bank.entries.iter().flatten().count() == 40));
+                    .all(|bank| bank.len() == 40));
             }
         }
         assert_eq!(captures, 240);
@@ -443,7 +288,7 @@ mod tests {
             unsafe {
                 bank.clear()?;
             }
-            assert!(bank.entries.iter().all(Option::is_none));
+            assert_eq!(bank.len(), 0);
             unsafe {
                 bank.clear()?;
             }

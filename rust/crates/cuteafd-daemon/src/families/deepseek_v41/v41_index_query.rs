@@ -1,7 +1,7 @@
 //! Learned index-query projections and fused rotary/FP4 preparation on the RTX.
 use crate::families::deepseek_v41::v41_attention_binding::QueryBinding;
 use crate::families::deepseek_v41::v41_attention_query::AttentionQueryOutput;
-use crate::families::deepseek_v41::v41_layer_graphs::LayerGraphs;
+use crate::shared::decode_graph::LayerGraphs;
 use crate::shared::memory::{DeviceAllocation, LoadStream};
 use crate::families::deepseek_v41::v41_tensors::NativeRtxTensors;
 use anyhow::{ensure, Context, Result};
@@ -111,7 +111,7 @@ impl<'a> IndexQueryWeights<'a> {
             scales: DeviceAllocation::new(self.library, rows * 128)?,
             head_weights: DeviceAllocation::new(self.library, rows * 64)?,
             capacity,
-            graphs: LayerGraphs::new(self.library),
+            graphs: LayerGraphs::new(self.library, 8 * (cuteafd_core::MAX_DSPARK_PROPOSALS as u32 + 1)),
             ready: None,
             pending: None,
             origin: None,
@@ -364,7 +364,7 @@ impl IndexQueryWave<'_, '_> {
             self.stream.library.copy_d2d(dst, src, src.bytes)?;
         }
         let rows = query.rows as u32;
-        if !super::v41_layer_graphs::captures_shape(rows) {
+        if !super::graph_policy::captures_shape(rows) {
             unsafe { self.execute(rows)?; }
             self.origin = Some(binding);
             self.tokens.extend_from_slice(tokens);
@@ -398,7 +398,7 @@ impl IndexQueryWave<'_, '_> {
         self.tokens.extend_from_slice(tokens);
         let rows = query.rows as u32;
         let graph = self.graphs.get_shape(self.weights.layer, self.weights, rows);
-        self.pending = Some((rows, binding, graph.is_none() && super::v41_layer_graphs::captures_shape(rows)));
+        self.pending = Some((rows, binding, graph.is_none() && super::graph_policy::captures_shape(rows)));
         let result = (|| -> Result<()> { unsafe {
             crate::shared::memory::chain::join(self.stream.library, self.stream.raw)?;
             for (dst, src) in [(self.qr.buffer, query.normalized_rank),

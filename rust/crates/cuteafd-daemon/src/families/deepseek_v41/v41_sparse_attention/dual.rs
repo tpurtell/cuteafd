@@ -12,7 +12,7 @@ pub(crate) struct DualAttentionWave<'a> {
     peer_sink: Allocation<'a>,
     capacity: usize,
     pending: Option<OwnedSubmission>,
-    tails: [VecDeque<(*mut c_void, Vec<usize>)>; 40],
+    tails: GraphBank<(usize, Vec<usize>), GraphOwner<'a, ()>>,
 }
 struct OwnedSubmission { cold:[bool;2],rows:usize,layer:usize }
 impl<'a> DualAttentionWave<'a> {
@@ -40,7 +40,7 @@ impl<'a> DualAttentionWave<'a> {
             inputs: PeerAttentionInputs::new(devices[0],devices[1],capacity,PeerAttentionInputs::device_bytes(capacity)?)?,
             peer_sink: Allocation::new(devices[1],128)?,
             pending: None,
-            tails: std::array::from_fn(|_| VecDeque::new()),
+            tails: GraphBank::new(None),
         })
     }
     pub fn reserve_decode_rows(&mut self, rows: usize) -> Result<()> {
@@ -93,11 +93,7 @@ impl<'a> DualAttentionWave<'a> {
         let (layer,rows)=(plan.layer,plan.rows);
         let mut key=tail.identity();
         key.extend([rows,self.output.buffer.ptr as usize]);
-        let cached=self.tails[layer].iter().position(|(_,identity)| identity==&key);
-        let graph=cached.map(|index| {
-            let entry=self.tails[layer].remove(index).unwrap();
-            let graph=entry.0;self.tails[layer].push_back(entry);graph
-        });
+        let graph=self.tails.launch(&(layer,key.clone())).map(|graph|graph.raw);
         let library=self.halves[0].device.library;
         let (attention,stream)=unsafe { self.complete_owned_then(|attention,stream| {
             tail.prepare(stream)?;
@@ -125,13 +121,18 @@ impl<'a> DualAttentionWave<'a> {
             };
             // Match the attention owner's bounded shape retention policy.
             let limit=wave.halves[0].graph_limit;
-            if wave.tails[layer].len()>=limit {
-                let (old,_)=wave.tails[layer].pop_front().unwrap();
-                if let Err(error)=library.cuda_graph_exec_destroy(old) {
-                    library.cuda_graph_exec_destroy(graph)?;return Err(error);
-                }
+            if wave.tails.count(|(site,_)| *site==layer)>=limit {
+                wave.tails.retire_oldest(|(site,_)| *site==layer);
+                // The cold continuation above completed the entire owner chain.
+                drop(wave.tails.drain_retired(||Ok(()))?);
             }
-            wave.tails[layer].push_back((graph,key));
+            // SAFETY: the enclosing lane retains tail weights and storage and
+            // drains this owner before releasing them.
+            let exec=GraphOwner::new(library,owner.id,graph,())?;
+            tracing::debug!(target:"cuteafd::graph_capture",site="dual_attention_tail",
+                layer,rows,device=owner.id,key=?key,bank=?(&wave.tails as *const _),
+                "captured graph binding");
+            wave.tails.insert((layer,key),exec,None);
             library.cuda_graph_launch(graph,stream)
         })?;
         owner.future(wave.halves[0].wait_chain()).await?;
@@ -260,12 +261,9 @@ impl Drop for DualAttentionWave<'_> {
     fn drop(&mut self) {
         if let Err(error) = self.drain() { tracing::error!(%error,"draining dual attention owner"); }
         let owner=self.halves[0].device;
-        for entries in &mut self.tails {
-            for (graph,_) in entries.drain(..) {
-                if let Err(error)=owner.run(||unsafe { owner.library.cuda_graph_exec_destroy(graph) }) {
-                    tracing::error!(%error,"destroying dual attention continuation graph");
-                }
-            }
+        self.tails.retire_all();
+        if let Err(error)=owner.run(||self.tails.drain_retired(||Ok(())).map(drop)) {
+            tracing::error!(%error,"destroying dual attention continuation graph");
         }
     }
 }

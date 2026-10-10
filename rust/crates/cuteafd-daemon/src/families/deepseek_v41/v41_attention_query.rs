@@ -1,6 +1,6 @@
 //! Real backbone low-rank query projection, normalization and rotary graphs.
 use crate::families::deepseek_v41::v41_attention_binding::QueryBinding;
-use crate::families::deepseek_v41::v41_layer_graphs::LayerGraphs;
+use crate::shared::decode_graph::LayerGraphs;
 use crate::shared::memory::{DeviceAllocation, HostAllocation, LoadStream};
 use crate::families::deepseek_v41::v41_tensors::NativeRtxTensors;
 use anyhow::{ensure, Context, Result};
@@ -128,8 +128,8 @@ impl<'a> AttentionQueryWeights<'a> {
             position_staging: HostAllocation::new(self.library, capacity as usize * 8)?,
             weights: self,
             capacity,
-            graphs: LayerGraphs::new(self.library),
-            tp2_prefix_graphs: LayerGraphs::new(self.library),
+            graphs: LayerGraphs::new(self.library, 8 * (cuteafd_core::MAX_DSPARK_PROPOSALS as u32 + 1)),
+            tp2_prefix_graphs: LayerGraphs::new(self.library, 8 * (cuteafd_core::MAX_DSPARK_PROPOSALS as u32 + 1)),
             ready: None,
             binding: None,
             tokens: Vec::new(),
@@ -431,7 +431,7 @@ impl AttentionQueryWave<'_, '_> {
             // The normalized input is complete here; cache producers fork from it.
             unsafe { crate::shared::memory::chain::mark_fork(self.stream.library, self.stream.raw)?; }
             let rows = tokens.len() as u32;
-            if !super::v41_layer_graphs::captures_shape(rows) {
+            if !super::graph_policy::captures_shape(rows) {
                 unsafe { self.execute(rows)?; }
                 return Ok(());
             }
@@ -491,7 +491,7 @@ impl AttentionQueryWave<'_, '_> {
         if graph.is_none() {
             // Eager output is complete; capture only records the next execution.
             // Replaying now would duplicate work whenever a shape was evicted.
-            if super::v41_layer_graphs::captures_shape(rows) {
+            if super::graph_policy::captures_shape(rows) {
                 unsafe { self.capture_ready(rows)?; }
             }
         }
@@ -547,7 +547,7 @@ impl AttentionQueryWave<'_, '_> {
                 self.norm.rope(self.b(3),self.b(6),self.b(3),rows,64,false,stream)
             }).await?;
         }
-        if graph.is_none() && super::v41_layer_graphs::captures_shape(rows) {
+        if graph.is_none() && super::graph_policy::captures_shape(rows) {
             unsafe { self.stream.library.cuda_graph_begin_capture(self.stream.raw)?; }
             let queued=unsafe { self.enqueue_rank(rows) };
             let captured=unsafe { self.stream.library.cuda_graph_end_capture(self.stream.raw) };

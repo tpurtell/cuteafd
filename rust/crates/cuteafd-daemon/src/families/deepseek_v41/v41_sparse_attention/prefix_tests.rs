@@ -243,7 +243,7 @@ fn compact_wave_batch_graph_consumes_local_buffers() -> Result<()> {
             unsafe { wave.enqueue(plan.sink,&plan.launches,None,plan.batch.as_ref())?; }
             wave.synchronize()?;
             let graph=unsafe { wave.capture_plan(&plan,&mut None)? };
-            wave.graphs[0].push_back((graph,vec![]));
+            wave.insert_graph(0,vec![],graph)?;
             for replay in 0..2 {
                 if replay==1 { lib.copy_h2d(values.buffer,&vec![0;values.buffer.bytes])?; }
                 unsafe { lib.cuda_graph_launch(graph,wave.stream.raw)?; }

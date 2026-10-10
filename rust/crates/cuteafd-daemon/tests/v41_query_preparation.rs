@@ -7,7 +7,7 @@ mod families {
         pub(crate) mod v41_attention_query;
         pub(crate) mod v41_projection_tp2;
         pub(crate) mod v41_hc;
-        pub(crate) mod v41_layer_graphs;
+        pub(crate) mod graph_policy;
         pub(crate) mod v41_tensors;
     }
 }

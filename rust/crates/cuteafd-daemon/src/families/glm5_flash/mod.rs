@@ -10,7 +10,6 @@ pub(crate) mod serve;
 mod media;
 mod speculate;
 mod expert_rows;
-mod graphs;
 mod lane_check;
 mod packed_check;
 pub(crate) mod packing;

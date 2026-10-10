@@ -18,7 +18,7 @@ pub(crate) mod v41_hc;
 pub(crate) mod v41_index_lane;
 pub(crate) mod v41_index_query;
 pub(crate) mod v41_index_selection;
-pub(crate) mod v41_layer_graphs;
+pub(crate) mod graph_policy;
 pub(crate) mod v41_native_serve;
 pub(crate) mod v41_golden;
 pub(crate) mod v41_projection_tp2;

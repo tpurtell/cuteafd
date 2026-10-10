@@ -12,7 +12,7 @@ struct Rank<'w, 'a> {
     candidates: DeviceAllocation<'a>,
     weights: &'w VocabularyShard<'a>,
     capacity: usize,
-    graphs: [[Option<*mut c_void>; 128]; 2],
+    graphs: [crate::shared::decode_graph::RowGraphs<'a>; 2],
     /// Scratch of the shard's FP8 copy when this wave projects through it.
     fp8_scratch: Option<DeviceAllocation<'a>>,
     /// Device-ordered passes: SM peer reads of the other GPU's normalized rows.
@@ -33,7 +33,7 @@ impl<'w, 'a> Rank<'w, 'a> {
             projection, _workspace: workspace, input,
             logits: DeviceAllocation::new(library, capacity * weights.tokens().len() * 4)?,
             candidates: DeviceAllocation::new(library, capacity * 8)?,
-            weights, capacity, graphs: [[None; 128]; 2], fp8_scratch: None,
+            weights, capacity, graphs: std::array::from_fn(|mode| crate::shared::decode_graph::RowGraphs::new(library, if mode == 0 { "vocabulary_logits" } else { "vocabulary_greedy" }, capacity)), fp8_scratch: None,
             sm: crate::shared::memory::chain::device_enabled().then(|| library.v41_peer_copy()).transpose()?,
         })
     }
@@ -67,19 +67,27 @@ impl<'w, 'a> Rank<'w, 'a> {
             } else {
                 lib.copy_peer_async(self.input.buffer, input, rows * 10240, self.stream.raw)?;
             }
-            if let Some(graph) = self.graphs[mode][rows - 1] { lib.cuda_graph_launch(graph, self.stream.raw) }
+            if let Some(graph) = self.graphs[mode].get(rows) { lib.cuda_graph_launch(graph, self.stream.raw) }
             else { self.enqueue(rows, greedy) }
         }
     }
     unsafe fn capture_ready(&mut self, rows: usize, greedy: bool) -> Result<()> {
         let mode = usize::from(greedy);
-        if self.graphs[mode][rows - 1].is_none() {
+        if self.graphs[mode].get(rows).is_none() {
             let lib = self.stream.library;
             unsafe { lib.cuda_graph_begin_capture(self.stream.raw)?; }
             let queued = unsafe { self.enqueue(rows, greedy) };
             let captured = unsafe { lib.cuda_graph_end_capture(self.stream.raw) };
             match (queued, captured) {
-                (Ok(()), Ok(graph)) => self.graphs[mode][rows - 1] = Some(graph),
+                (Ok(()), Ok(graph)) => {
+                    // SAFETY: rank storage is stable and the eager projection drained.
+                    unsafe {
+                        if let Err(error) = self.graphs[mode].insert(rows, graph) {
+                            lib.cuda_graph_exec_destroy(graph)?;
+                            return Err(error);
+                        }
+                    }
+                },
                 (Err(error), Ok(graph)) => { unsafe { lib.cuda_graph_exec_destroy(graph)?; } return Err(error); }
                 (Err(error), Err(_)) | (Ok(()), Err(error)) => return Err(error),
             }
@@ -102,8 +110,9 @@ impl Drop for Rank<'_, '_> {
         if let Err(error) = unsafe { lib.cuda_stream_synchronize(self.stream.raw) } {
             tracing::error!(%error, "draining vocabulary rank");
         }
-        for graph in self.graphs.iter_mut().flatten().filter_map(Option::take) {
-            if let Err(error) = unsafe { lib.cuda_graph_exec_destroy(graph) } {
+        for graphs in &mut self.graphs {
+            // SAFETY: the rank drained its stream before releasing captured pointers.
+            if let Err(error) = unsafe { graphs.clear() } {
                 tracing::error!(%error, "destroying vocabulary rank graph");
             }
         }
@@ -221,7 +230,7 @@ impl<'w, 'a> DistributedVocabularyWave<'w, 'a> {
 
     /// Whether both ranks replay captured greedy projections of `rows` rows.
     pub fn warm_greedy(&self, rows: usize) -> bool {
-        (1..=self.capacity).contains(&rows) && self.ranks.iter().all(|rank| rank.graphs[1][rows - 1].is_some())
+        (1..=self.capacity).contains(&rows) && self.ranks.iter().all(|rank| rank.graphs[1].get(rows).is_some())
     }
     /// The greedy projection queued in a device-ordered pass (warm shapes, see
     /// [`Self::warm_greedy`]): both ranks follow the chain head (`normalized`,

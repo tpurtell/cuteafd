@@ -1,7 +1,7 @@
 //! Output-channel FP8 projection shards with lane-owned exchange storage.
 use crate::shared::memory::{HostAllocation, device::{Allocation, Device, Event, Stream}};
 use anyhow::{ensure, Context, Result};
-use crate::families::deepseek_v41::v41_layer_graphs::LayerGraphs;
+use crate::shared::decode_graph::LayerGraphs;
 use cuteafd_ffi::{CuteafdDeviceBuffer, V41Fp8Plan, V41PeerCopy};
 use cuteafd_loader::OfficialV41Catalog;
 
@@ -83,7 +83,7 @@ impl<'w,'a> Rank<'w,'a> {
         let alpha=Allocation::new(device,16)?;
         let initialized=device.run(||unsafe { plan.initialize_scratch(scratch.buffer,alpha.buffer,stream.raw) });
         let drained=stream.drain();initialized.and(drained)?;
-        let mut graphs=LayerGraphs::new(device.library);graphs.enable_small_shapes();
+        let mut graphs=LayerGraphs::new(device.library, 8 * (cuteafd_core::MAX_DSPARK_PROPOSALS as u32 + 1));graphs.enable_small_shapes();
         Ok(Self { graphs,weights,stream,plan,copy:device.run(||device.library.v41_peer_copy())?,
             input:Allocation::new(device,capacity as usize*k*2)?,
             output:Allocation::new(device,capacity as usize*n)?,scratch,alpha })
@@ -99,7 +99,7 @@ impl<'w,'a> Rank<'w,'a> {
     // the peer rank. Capture records the next invocation without repeating work.
     fn capture_ready(&mut self,layer:usize,rows:u32)->Result<()> {
         let weights=self.weights.iter().find(|w|w.layer==layer).context("projection layer absent")?;
-        if !super::v41_layer_graphs::captures_shape(rows)
+        if !super::graph_policy::captures_shape(rows)
             || self.graphs.get_shape(layer,weights,rows).is_some() { return Ok(()); }
         let device=self.stream.device;
         device.run(||unsafe {
@@ -170,7 +170,7 @@ impl<'w,'a> Wave<'w,'a> {
             device.run(||device.library.cuda_enable_peer(peer.id))?;
         }
         let devices=[a.device,b.device];let (_,n)=a.kind.geometry();
-        let mut gather_graphs=LayerGraphs::new(a.device.library);gather_graphs.enable_small_shapes();
+        let mut gather_graphs=LayerGraphs::new(a.device.library, 8 * (cuteafd_core::MAX_DSPARK_PROPOSALS as u32 + 1));gather_graphs.enable_small_shapes();
         Ok(Self { gather_graphs,ranks:[Rank::new(weights[0],capacity)?,Rank::new(weights[1],capacity)?],
             output:Allocation::new(devices[owner],capacity as usize*n*2)?,
             peer_done:Event::new(devices[1-owner])?,
@@ -188,7 +188,7 @@ impl<'w,'a> Wave<'w,'a> {
     fn capture_gather_ready(&mut self,rows:u32)->Result<()> {
         // The gather uses only this wave's fixed storage, independent of layer.
         let weights=&self.ranks[self.owner].weights[0];
-        if !super::v41_layer_graphs::captures_shape(rows)
+        if !super::graph_policy::captures_shape(rows)
             || self.gather_graphs.get_shape(0,weights,rows).is_some() { return Ok(()); }
         let stream=self.ranks[self.owner].stream.raw;let device=self.output.device;
         device.run(||unsafe {

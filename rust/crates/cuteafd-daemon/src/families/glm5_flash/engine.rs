@@ -39,7 +39,7 @@
 //! other's and adds the two (the same bits in either order), so both residual streams stay
 //! identical. Router, routed experts, LM head and drafter stay on rank 0; rank 1 is queued a
 //! layer ahead of rank 0's expert exchange.
-use super::graphs::{GraphCache, GraphStats};
+use crate::shared::decode_graph::{GraphBank, GraphOwner, GraphStats};
 use super::packing;
 use super::weights::{GlmfLayer, GlmfWeights};
 use crate::shared::peer_split::{PeerExchange, RankDevice, DIRECT};
@@ -1166,7 +1166,7 @@ pub(crate) struct GlmfPeer<'a> {
     decode_workspace: RefCell<Option<Workspace<'a>>>,
     /// Its prefill lanes (a serial prefill runs in the first).
     lane_workspaces: RefCell<Vec<Workspace<'a>>>,
-    graphs: RefCell<GraphCache<GraphKey, GraphExec<'a>>>,
+    graphs: RefCell<GraphBank<GraphKey, GraphExec<'a>>>,
     /// L2 prefetch of its next layer's weights while it waits for rank 0's expert exchange.
     l2: Option<crate::shared::l2_prefetch::L2Prefetch>,
 }
@@ -1266,10 +1266,9 @@ pub(crate) struct GlmfEngine<'a> {
     pub full_prefill_logits: bool,
     /// Captured decode segments (CUTEAFD_GLMF_GRAPHS=0 runs decode eagerly), within the graph
     /// budget when one is set.
-    graphs: RefCell<GraphCache<GraphKey, GraphExec<'a>>>,
+    graphs: RefCell<GraphBank<GraphKey, GraphExec<'a>>>,
     /// Executables evicted from either rank's cache (rank, executable): destroyed at the next
     /// decode step, once every rank's stream has drained.
-    retired: RefCell<Vec<(usize, GraphExec<'a>)>>,
     use_graphs: bool,
     /// Every serving decode graph captured at startup (`CUTEAFD_GLMF_STARTUP_GRAPHS`, on unless 0);
     /// a graph budget (`--graph-budget-mib`) captures lazily within it instead.
@@ -1473,14 +1472,7 @@ pub(crate) struct GraphCounts {
     pub bytes: u64,
 }
 
-struct GraphExec<'a>(*mut c_void, &'a NativeLibrary);
-
-impl Drop for GraphExec<'_> {
-    fn drop(&mut self) {
-        // SAFETY: the executable graph is owned here and no longer launched.
-        let _ = unsafe { self.1.cuda_graph_exec_destroy(self.0) };
-    }
-}
+type GraphExec<'a> = GraphOwner<'a, ()>;
 
 fn bytes_of<T: Copy>(values: &[T]) -> &[u8] {
     // SAFETY: plain-old-data slices viewed as bytes for host->device copies.
@@ -1587,8 +1579,8 @@ impl<'a> GlmfEngine<'a> {
             device, peer: None, exchange: None, drafter: None, pool_logical_host: RefCell::new(vec![0; pool_pages]), pool_pages,
             table_pages, table_pool_pages, decode_workspace: RefCell::new(None),
             lane_workspaces: RefCell::new(Vec::new()),
-            experts: None, dense_nvfp4: None, profile: RefCell::new([0.0; 3]), graphs: RefCell::new(GraphCache::new(None)),
-            retired: RefCell::new(Vec::new()),
+            experts: None, dense_nvfp4: None, profile: RefCell::new([0.0; 3]), graphs: RefCell::new(GraphBank::new(None)),
+
             use_graphs: std::env::var("CUTEAFD_GLMF_GRAPHS").map_or(true, |v| v != "0"),
             startup_graphs: startup_graphs_enabled(),
             warming_graphs: std::cell::Cell::new(false), logged_graph_shapes: RefCell::new(std::collections::HashSet::new()),
@@ -1657,6 +1649,14 @@ impl<'a> GlmfEngine<'a> {
         captured?;
         let graphs = self.graphs.borrow().len() + self.peer.as_ref().map_or(0, |p| p.graphs.borrow().len());
         ensure!(graphs == expected, "startup captured {graphs} graphs, expected {expected}");
+        for rank in 0..self.ranks() {
+            let end = if rank == 0 { segments } else { segments - 1 };
+            let keys: Vec<_> = shapes.iter().flat_map(|&(rows, spec, geometry)| {
+                let tables = startup_tables(rows, spec, geometry);
+                (0..end).map(move |segment| GraphKey::new(segment, rows, &tables))
+            }).collect();
+            self.graphs_of(rank).borrow_mut().seal_startup(&keys)?;
+        }
         for &(rows, spec, geometry) in &shapes {
             let tables = startup_tables(rows, spec, geometry);
             for rank in 0..self.ranks() {
@@ -1792,7 +1792,7 @@ impl<'a> GlmfEngine<'a> {
                 self.caches.kda_heads, self.index_cache, self.kda_state, self.decode_rows, None)?;
             Ok(GlmfPeer { device, stream, layers, caches,
                 decode_workspace: RefCell::new(None), lane_workspaces: RefCell::new(Vec::new()),
-                graphs: RefCell::new(GraphCache::new(self.graphs.borrow().budget())), l2: None })
+                graphs: RefCell::new(GraphBank::new(self.graphs.borrow().budget())), l2: None })
         })?;
         self.peer = Some(peer);
         self.exchange = Some(exchange);
@@ -3216,7 +3216,7 @@ impl<'a> GlmfEngine<'a> {
     fn replay_on(&self, rank: usize, key: GraphKey, segment: impl FnOnce() -> Result<()>) -> Result<()> {
         let graphs = self.graphs_of(rank);
         let stream = self.stream_of(rank);
-        let cached = graphs.borrow_mut().launch(&key).map(|graph| graph.0);
+        let cached = graphs.borrow_mut().launch(&key).map(|graph| graph.raw);
         if let Some(exec) = cached {
             // SAFETY: the graph's pointers are persistent engine buffers of that rank.
             return self.on(rank, || unsafe { self.library.cuda_graph_launch(exec, stream) });
@@ -3241,18 +3241,20 @@ impl<'a> GlmfEngine<'a> {
         // SAFETY: ends the capture begun above on the same stream.
         let exec = self.on(rank, || unsafe { self.library.cuda_graph_end_capture(stream) });
         captured?;
-        let exec = GraphExec(exec?, self.library);
+        // SAFETY: persistent engine storage is drained before bank destruction.
+        let exec = unsafe { GraphOwner::new(self.library, if rank == 1 { self.peer()?.device } else { self.device }, exec?, ())? };
         let measured = match before {
             Some(before) => Some(before.saturating_sub(free()?) as u64),
             None => None,
         };
         // SAFETY: the new graph reads and writes persistent engine buffers.
-        self.on(rank, || unsafe { self.library.cuda_graph_launch(exec.0, stream) })?;
+        self.on(rank, || unsafe { self.library.cuda_graph_launch(exec.raw, stream) })?;
         let (recaptured, evicted, held, stats) = {
             let mut graphs = graphs.borrow_mut();
             let recaptured = graphs.seen(&key);
-            let evicted = graphs.insert(key, exec, measured);
-            (recaptured, evicted, graphs.bytes(), graphs.stats())
+            let retired = graphs.retired_len();
+            graphs.insert(key, exec, measured);
+            (recaptured, graphs.retired_len() - retired, graphs.bytes(), graphs.stats())
         };
         if recaptured {
             tracing::debug!(rank, ?key, recaptures = stats.recaptures, "decode graph recaptured");
@@ -3261,17 +3263,16 @@ impl<'a> GlmfEngine<'a> {
             tracing::info!(rank, executables = stats.captures, each_bytes = graphs.borrow().each(),
                 budget = ?graphs.borrow().budget(), "decode graph size calibrated at the first eviction");
         }
-        if !evicted.is_empty() {
-            tracing::info!(rank, evicted = evicted.len(), held = graphs.borrow().len(), held_bytes = held,
+        if evicted > 0 {
+            tracing::info!(rank, evicted, held = graphs.borrow().len(), held_bytes = held,
                 budget = ?graphs.borrow().budget(),
                 captures = stats.captures, recaptures = stats.recaptures, evictions = stats.evictions,
                 "decode graphs past the budget retire");
-            self.retired.borrow_mut().extend(evicted.into_iter().map(|exec| (rank, exec)));
         }
         Ok(())
     }
 
-    fn graphs_of(&self, rank: usize) -> &RefCell<GraphCache<GraphKey, GraphExec<'a>>> {
+    fn graphs_of(&self, rank: usize) -> &RefCell<GraphBank<GraphKey, GraphExec<'a>>> {
         match (rank, &self.peer) {
             (1, Some(peer)) => &peer.graphs,
             _ => &self.graphs,
@@ -3282,15 +3283,13 @@ impl<'a> GlmfEngine<'a> {
     /// in flight). Called between decode steps: a sync inside one could wait on a peer push the
     /// host has not queued yet.
     fn release_retired_graphs(&self) -> Result<()> {
-        if self.retired.borrow().is_empty() {
+        if (0..self.ranks()).all(|rank| self.graphs_of(rank).borrow().retired_len() == 0) {
             return Ok(());
         }
         self.synchronize()?;
-        for (rank, exec) in self.retired.borrow_mut().drain(..) {
-            self.on(rank, || {
-                drop(exec);
-                Ok(())
-            })?;
+        for rank in 0..self.ranks() {
+            let retired = self.graphs_of(rank).borrow_mut().drain_retired(|| Ok(()))?;
+            self.on(rank, || { drop(retired); Ok(()) })?;
         }
         Ok(())
     }

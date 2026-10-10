@@ -1,6 +1,6 @@
 //! Backbone inverse rotary, grouped FP8 wo_a and native FP8 wo_b.
 use crate::families::deepseek_v41::v41_attention_binding::QueryBinding;
-use crate::families::deepseek_v41::v41_layer_graphs::LayerGraphs;
+use crate::shared::decode_graph::LayerGraphs;
 use crate::shared::memory::{DeviceAllocation, HostAllocation, LoadStream};
 use crate::families::deepseek_v41::v41_sparse_attention::SparseAttentionOutput;
 use crate::families::deepseek_v41::v41_tensors::NativeRtxTensors;
@@ -118,7 +118,7 @@ impl<'a> AttentionOutputWeights<'a> {
             position_staging: HostAllocation::new(self.library, capacity as usize * 8)?,
             weights: self,
             capacity,
-            graphs: LayerGraphs::new(self.library),
+            graphs: LayerGraphs::new(self.library, 8 * (cuteafd_core::MAX_DSPARK_PROPOSALS as u32 + 1)),
             ready: None,
             origin: None,
         };
@@ -371,7 +371,7 @@ impl AttentionOutputWave<'_, '_> {
                 )?;
             }
             let rows = attention.rows as u32;
-            if super::v41_layer_graphs::captures_shape(rows) {
+            if super::graph_policy::captures_shape(rows) {
                 if self.graphs.get_shape(self.weights.layer, self.weights, rows).is_none() {
                     unsafe { self.capture(rows)?; }
                 }
@@ -415,7 +415,7 @@ impl AttentionOutputWave<'_, '_> {
                 tokens.len() * 8, stream)?;
         }
         let rows = attention.rows as u32;
-        if !super::v41_layer_graphs::captures_shape(rows) {
+        if !super::graph_policy::captures_shape(rows) {
             unsafe { self.enqueue_on(rows, stream)?; }
             let mut output = self.b(2);
             output.bytes = attention.rows * ROW_BYTES[2];
@@ -457,7 +457,7 @@ impl AttentionOutputWave<'_, '_> {
         let rows = attention.rows as u32;
         if self.graphs.get_shape(self.weights.layer, self.weights, rows).is_none() {
             unsafe { self.enqueue_on(rows, stream)?; }
-            if !super::v41_layer_graphs::captures_shape(rows) {
+            if !super::graph_policy::captures_shape(rows) {
                 let mut output = self.b(2);
                 output.bytes = attention.rows * ROW_BYTES[2];
                 return Ok(Some(output));

@@ -356,7 +356,7 @@ impl<'w, 'a> TargetPass<'w, 'a> {
         }
         if let Some((rows, started)) = step_sample {
             tracing::debug!(target: "cuteafd::target_step", rows,
-                eager=!super::v41_layer_graphs::captures_shape(rows as u32),
+                eager=!super::graph_policy::captures_shape(rows as u32),
                 elapsed_us=started.elapsed().as_micros() as u64, success=result.is_ok(), "V4.1 target verification step");
         }
         result

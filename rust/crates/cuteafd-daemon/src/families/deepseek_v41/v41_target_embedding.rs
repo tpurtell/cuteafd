@@ -1,7 +1,7 @@
 //! Token initialization and image replacement before the first target mHC block.
 use crate::shared::memory::{DeviceAllocation, HostAllocation, LoadStream};
 use crate::families::deepseek_v41::v41_tensors::NativeRtxTensors;
-use crate::families::deepseek_v41::v41_layer_graphs::RowGraphs;
+use crate::shared::decode_graph::RowGraphs;
 use anyhow::{Context, Result, ensure};
 use cuteafd_ffi::{CuteafdDeviceBuffer, NativeLibrary, V41AttentionOps};
 use std::{ffi::c_void, marker::PhantomData};
@@ -71,7 +71,7 @@ impl<'w, 'a> TargetEmbeddingWave<'w, 'a> {
             image_features: DeviceAllocation::new(library, capacity * 10240)?,
             image_indices: DeviceAllocation::new(library, capacity * 4)?,
             capacity,
-            graphs: RowGraphs::new(library, "target_embedding"),
+            graphs: RowGraphs::new(library, "target_embedding", 8 * (cuteafd_core::MAX_DSPARK_PROPOSALS + 1)),
             tokens: Vec::with_capacity(capacity),
             positions: Vec::with_capacity(capacity),
             ready: false,
@@ -113,7 +113,7 @@ impl<'w, 'a> TargetEmbeddingWave<'w, 'a> {
         );
         let bytes: Vec<u8> = tokens.iter().flat_map(|id| id.to_ne_bytes()).collect();
         self.stream.library.copy_h2d(self.ids.buffer, &bytes)?;
-        if !super::v41_layer_graphs::captures_shape(rows as u32) {
+        if !super::graph_policy::captures_shape(rows as u32) {
             let launched = unsafe { self.enqueue(rows) };
             launched.and(self.synchronize())?;
             self.tokens.extend_from_slice(tokens);

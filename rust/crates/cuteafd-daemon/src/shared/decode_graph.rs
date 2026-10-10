@@ -1,4 +1,12 @@
-//! Canonical serving decode shapes; diagnostic scoring stays ungraphed.
+//! Canonical serving decode shapes and exact-key graph ownership.
+mod bank;
+mod owner;
+mod native;
+mod watch;
+pub(crate) use watch::CaptureWatch;
+pub(crate) use native::{LayerGraphs, RowGraphs};
+pub(crate) use bank::{GraphBank, GraphDecision, GraphPolicy, GraphStats};
+pub(crate) use owner::GraphOwner;
 
 pub(crate) fn fatal_drain(result: anyhow::Result<()>, site: &str) {
     if let Err(error) = result {

@@ -1,7 +1,7 @@
 //! Official backbone routing with block-bound inputs and canonical TP4 requests.
 use crate::families::deepseek_v41::v41_attention_binding::QueryBinding;
 use crate::families::deepseek_v41::v41_block::FfnInput;
-use crate::families::deepseek_v41::v41_layer_graphs::LayerGraphs;
+use crate::shared::decode_graph::LayerGraphs;
 use crate::shared::memory::{DeviceAllocation, HostAllocation, LoadStream};
 use crate::families::deepseek_v41::v41_tensors::NativeRtxTensors;
 use anyhow::{ensure, Context, Result};
@@ -91,8 +91,8 @@ impl<'a> BackboneRouterWeights<'a> {
             tokens: Vec::new(),
             layer: self.layer,
             capacity,
-            graphs: LayerGraphs::new(self.library),
-            other_graphs: LayerGraphs::new(self.library),
+            graphs: LayerGraphs::new(self.library, 8 * (cuteafd_core::MAX_DSPARK_PROPOSALS as u32 + 1)),
+            other_graphs: LayerGraphs::new(self.library, 8 * (cuteafd_core::MAX_DSPARK_PROPOSALS as u32 + 1)),
             full_request: true,
             ready: None,
             origin: None,
@@ -637,7 +637,7 @@ impl BackboneRouterWave<'_, '_> {
     /// Same initialized finite hidden and binary-mask contract as execute.
     pub unsafe fn execute_captured(&mut self, rows: u32) -> Result<RouterOutput<'_>> {
         self.invalidate();
-        if !super::v41_layer_graphs::captures_shape(rows) {
+        if !super::graph_policy::captures_shape(rows) {
             return unsafe { self.execute(rows) };
         }
         if self
@@ -695,7 +695,7 @@ impl BackboneRouterWave<'_, '_> {
         } else {
             self.stream.wait().await?;
         }
-        if cold && super::v41_layer_graphs::captures_shape(rows) {
+        if cold && super::graph_policy::captures_shape(rows) {
             // The eager execution above already completed these inputs. Capture
             // records future launches without executing them; publish that result
             // instead of running the same work again on every cache miss.

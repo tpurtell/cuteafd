@@ -285,7 +285,61 @@ pub struct GraphSet {
     pub shapes: u64,
 }
 
+/// Exact startup keys paired with the admission ledger. Keys describe immutable
+/// launch geometry, never process-local pointer addresses.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StartupGraphs<K> {
+    pub inventory: GraphSet,
+    pub keys: Vec<K>,
+}
+
+/// A measured V4.1 executable class on one lane/device. bindings counts stable
+/// source/table geometries of this exact row shape, not a padding bucket.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct V41GraphShape {
+    pub device: u8,
+    pub lane: u8,
+    pub site: String,
+    pub layer: Option<u8>,
+    pub rows: u32,
+    pub bindings: u32,
+}
+
 impl GraphSet {
+    /// Couple a family's exact warm keys to the very ledger charged by its
+    /// planner. Refuse a growth ledger or a shape-count mismatch at startup.
+    pub fn startup<K>(self, keys: Vec<K>) -> Result<StartupGraphs<K>, String> {
+        if self.lifetime != Lifetime::Startup {
+            return Err("cannot warm a graph-growth inventory".into());
+        }
+        if self.shapes != keys.len() as u64 {
+            return Err(format!("startup shape inventory {} differs from warm list {}", self.shapes, keys.len()));
+        }
+        Ok(StartupGraphs { inventory: self, keys })
+    }
+
+    /// Build V4.1's admission from a measured census; deliberately no guessed
+    /// default census or bytes-per-executable. The serving warm-up and planner
+    /// consume this same result once the hardware census is qualified.
+    pub fn v41_startup(shapes: Vec<V41GraphShape>, per_executable: &[u64], margin_percent: u64,
+        minimum_margin: u64) -> Result<StartupGraphs<V41GraphShape>, String> {
+        let mut counts = vec![0u64; per_executable.len()];
+        let mut seen = std::collections::HashSet::new();
+        for shape in &shapes {
+            if shape.rows == 0 || shape.rows > 4096 || shape.bindings == 0
+                || shape.lane > 1 || !seen.insert(shape.clone()) {
+                return Err("invalid or duplicate V4.1 startup graph shape".into());
+            }
+            let count = counts.get_mut(shape.device as usize).ok_or("V4.1 startup graph device outside inventory")?;
+            *count = count.checked_add(u64::from(shape.bindings)).ok_or("V4.1 graph count overflow")?;
+        }
+        let ranks = counts.into_iter().zip(per_executable).map(|(count, &each)| {
+            let set = Self::new(&[count], each, margin_percent, minimum_margin, 0, Lifetime::Startup);
+            set.ranks[0]
+        }).collect();
+        Self { ranks, lifetime: Lifetime::Startup, shapes: shapes.len() as u64 }.startup(shapes)
+    }
+
     /// `executables` per rank at `per_executable` bytes, plus `margin_percent`
     /// of that (at least `minimum_margin`) per rank.
     pub fn new(executables: &[u64], per_executable: u64, margin_percent: u64, minimum_margin: u64,
@@ -401,6 +455,22 @@ pub fn exl3_capacities(rows: u64) -> Vec<u64> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn startup_keys_match_planner_shapes_and_v41_rank_bytes() {
+        let shape = |device, lane, rows| V41GraphShape {
+            device, lane, site: "query".into(), layer: Some(3), rows, bindings: 2,
+        };
+        let keys = vec![shape(0, 0, 1), shape(0, 1, 6), shape(1, 0, 1)];
+        let startup = GraphSet::v41_startup(keys.clone(), &[10, 20], 10, 0).unwrap();
+        assert_eq!(startup.keys, keys);
+        assert_eq!(startup.inventory.ranks.iter().map(|r| (r.executables, r.bytes, r.margin)).collect::<Vec<_>>(),
+            vec![(4, 44, 4), (2, 44, 4)]);
+        assert!(GraphSet::budget(&[100]).startup(vec![1]).is_err());
+        assert!(GraphSet::new(&[2], 10, 0, 0, 2, Lifetime::Startup).startup(vec![1]).is_err());
+        assert!(GraphSet::v41_startup(vec![shape(0, 0, 1), shape(0, 0, 1)], &[10], 0, 0).is_err());
+        assert!(GraphSet::v41_startup(vec![shape(2, 0, 1)], &[10], 0, 0).is_err());
+    }
 
     #[test]
     fn ready_untracked_is_context_plus_code_plus_startup_graphs() {

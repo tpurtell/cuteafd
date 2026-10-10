@@ -2,7 +2,7 @@
 use super::EngramDeviceView;
 use crate::shared::memory::{DeviceAllocation, LoadStream};
 use crate::families::deepseek_v41::v41_tensors::NativeRtxTensors;
-use crate::families::deepseek_v41::v41_layer_graphs::RowGraphs;
+use crate::shared::decode_graph::RowGraphs;
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::{CuteafdDeviceBuffer, NativeLibrary, V41Fp8Plan};
 use cuteafd_loader::OfficialV41Catalog;
@@ -99,7 +99,7 @@ impl<'weights, 'library> EngramGate<'weights, 'library> {
         gathered: &EngramDeviceView,
     ) -> Result<CuteafdDeviceBuffer> {
         self.ready_rows = None;
-        if !crate::families::deepseek_v41::v41_layer_graphs::captures_shape(gathered.rows as u32) {
+        if !crate::families::deepseek_v41::graph_policy::captures_shape(gathered.rows as u32) {
             return unsafe { self.execute(residual, gathered) };
         }
         if self.graphs.get(gathered.rows).is_none() {
@@ -145,7 +145,7 @@ impl<'weights, 'library> EngramGate<'weights, 'library> {
             residual: DeviceAllocation::new(weights.library, output_bytes)?,
             embeddings: DeviceAllocation::new(weights.library, capacity * 24 * 512)?,
             text_mask: DeviceAllocation::new(weights.library, capacity)?,
-            graphs: RowGraphs::new(weights.library, "engram"),
+            graphs: RowGraphs::new(weights.library, "engram", 8 * (cuteafd_core::MAX_DSPARK_PROPOSALS + 1)),
             projected: DeviceAllocation::new(weights.library, projected_bytes)?,
             scratch: DeviceAllocation::new(weights.library, scratch_bytes)?,
             alpha: DeviceAllocation::new(weights.library, 4)?,
@@ -363,7 +363,7 @@ impl<'weights, 'library> EngramGate<'weights, 'library> {
             }
         })();
         if let Err(error) = launched { self.synchronize()?; return Err(error); }
-        if cold && crate::families::deepseek_v41::v41_layer_graphs::captures_shape(gathered.rows as u32) {
+        if cold && crate::families::deepseek_v41::graph_policy::captures_shape(gathered.rows as u32) {
             self.stream.wait().await?;
             unsafe { self.capture_ready(gathered.rows)?; }
             let graph = self.graphs.get(gathered.rows).context("engram graph missing after capture")?;

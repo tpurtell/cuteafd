@@ -9,7 +9,8 @@ use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::{
     CuteafdDeviceBuffer, NativeLibrary, V41SparseAttention, V41SparseBatch, V41SparseSource, V41SparseWindow, V41Kv, V41PeerCopy,
 };
-use std::{collections::VecDeque, ffi::c_void, marker::PhantomData};
+use std::{ffi::c_void, marker::PhantomData};
+use crate::shared::decode_graph::{GraphBank, GraphOwner};
 pub(crate) mod dual;
 
 pub(crate) struct AttentionRequest<'a> {
@@ -77,7 +78,7 @@ pub(crate) struct LocalSparseAttentionWave<'a,const HEADS:usize> {
     // against live proposals before every replay. Inactive graphs never launch.
     // Adaptive mode keeps at most batch_rows variants per layer, including prefill;
     // request layouts can have many more combinations than total row counts.
-    graphs: [VecDeque<(*mut c_void, Vec<usize>)>; 40],
+    graphs: GraphBank<(usize, Vec<usize>), GraphOwner<'a, ()>>,
     graph_limit: usize,
     warmed_kernels: u16,
     cold: Option<ColdSparse>,
@@ -141,7 +142,7 @@ impl<'a,const HEADS:usize> LocalSparseAttentionWave<'a,HEADS> {
             replay_staging: LayerStaging::new(library, capacity * 8, 40)?,
             capacity,
             batch_rows: capacity.min(48),
-            graphs: std::array::from_fn(|_| VecDeque::new()),
+            graphs: GraphBank::new(None),
             graph_limit: 1,
             warmed_kernels: 0,
             cold: None,
@@ -152,7 +153,7 @@ impl<'a,const HEADS:usize> LocalSparseAttentionWave<'a,HEADS> {
     pub fn reserve_decode_rows(&mut self, rows: usize) -> Result<()> {
         ensure!(rows > 0 && rows <= self.capacity && rows <= 64,
             "invalid sparse decode reservation");
-        ensure!(self.cold.is_none() && self.graphs.iter().all(VecDeque::is_empty),
+        ensure!(self.cold.is_none() && self.graphs.len() == 0,
             "sparse decode reservation requires an unused wave");
         if rows <= self.batch_rows { return Ok(()); }
         let library = self.stream.library;
@@ -180,19 +181,19 @@ impl<'a,const HEADS:usize> LocalSparseAttentionWave<'a,HEADS> {
     }
     pub fn clear_graph(&mut self) -> Result<()> {
         self.drain_chain()?;
-        // Attempt every destruction even if one CUDA call reports an error.
-        let mut failure = None;
-        for graph in &mut self.graphs {
-            for (g, _) in graph.drain(..) {
-                if let Err(error) = unsafe { self.stream.library.cuda_graph_exec_destroy(g) } {
-                    failure.get_or_insert(error);
-                }
-            }
-        }
-        match failure {
-            Some(error) => Err(error),
-            None => Ok(()),
-        }
+        self.graphs.retire_all();
+        drop(self.graphs.drain_retired(|| Ok(()))?);
+        Ok(())
+    }
+    fn graph_count(&self, layer: usize) -> usize { self.graphs.count(|(l, _)| *l == layer) }
+    fn insert_graph(&mut self, layer: usize, fingerprint: Vec<usize>, graph: *mut c_void) -> Result<()> {
+        let device = self.stream.library.cuda_get_device()?;
+        // SAFETY: the lane guard retains all captured cache/selection/tail storage.
+        let owner = unsafe { GraphOwner::new(self.stream.library, device, graph, ())? };
+        tracing::debug!(target: "cuteafd::graph_capture", site = "sparse_attention", device, layer,
+            bank = self as *const Self as usize, key = ?fingerprint, "native binding graph captured");
+        self.graphs.insert((layer, fingerprint), owner, None);
+        Ok(())
     }
     unsafe fn enqueue(
         &self,
@@ -350,7 +351,7 @@ impl<'a,const HEADS:usize> LocalSparseAttentionWave<'a,HEADS> {
         if let Some(tail) = tail.as_deref_mut() { unsafe { tail.restore_warmup()?; } }
         self.warmed_kernels |= plan.needed;
         let graph = unsafe { self.capture_plan(&plan, &mut tail)? };
-        self.graphs[plan.layer].push_back((graph, plan.fingerprint));
+        self.insert_graph(plan.layer, plan.fingerprint, graph)?;
         let launched = unsafe { self.stream.library.cuda_graph_launch(graph, self.stream.raw) };
         if let Err(error) = launched { self.synchronize()?; return Err(error); }
         Ok(QueuedSparseAttention { values: slice(self.output.buffer, 0, plan.rows * (HEADS*1024)),
@@ -630,37 +631,37 @@ impl<'a,const HEADS:usize> LocalSparseAttentionWave<'a,HEADS> {
             fingerprint.push(usize::MAX - 1); fingerprint.extend(identity);
             unsafe { tail.as_deref_mut().unwrap().prepare(self.stream.raw)?; }
         }
-        let cached = self.graphs[layer].iter().position(|(_, f)| f == &fingerprint);
-        let fixed_limit = super::v41_layer_graphs::fixed_binding_limit();
-        if cached.is_none() && (!super::v41_layer_graphs::captures_shape(rows as u32)
-            || fixed_limit.is_some_and(|limit| self.graphs[layer].len() >= limit)) {
+        let key = (layer, fingerprint.clone());
+        let cached = self.graphs.get(&key).map(|owner| owner.raw);
+        let fixed_limit = super::graph_policy::fixed_binding_limit();
+        if cached.is_none() && (!super::graph_policy::captures_shape(rows as u32)
+            || fixed_limit.is_some_and(|limit| self.graph_count(layer) >= limit)) {
             // Exact fingerprints can include launch recipes beyond row count.
             // Freeze the bounded bank rather than evicting and recapturing them.
             tracing::debug!(target: "cuteafd::target_step", layer, rows,
-                retained=self.graphs[layer].len(), "V4.1 sparse attention eager binding");
+                retained=self.graph_count(layer), "V4.1 sparse attention eager binding");
             unsafe {
                 self.enqueue(sink, &launches, selected, batch.as_ref())?;
                 if let Some(tail) = tail.as_deref_mut() { tail.enqueue(&queued, self.stream.raw)?; }
             }
             return Ok(Some(queued));
         }
-        let graph = if let Some(index) = cached {
-            // Move a used binding to the newest end of the bounded LRU.
-            let entry = self.graphs[layer].remove(index).unwrap();
-            let graph = entry.0;
-            self.graphs[layer].push_back(entry);
+        let graph = if let Some(graph) = cached {
+            self.graphs.launch(&key);
             if let Some(tail) = tail.as_deref_mut() { unsafe { tail.replay_state()?; } }
             graph
         } else {
             tracing::debug!(target: "cuteafd::graph_capture", site="sparse_attention", layer, rows,
-                retained=self.graphs[layer].len(), limit=self.graph_limit, key=?fingerprint,
+                retained=self.graph_count(layer), limit=self.graph_limit, key=?fingerprint,
                 "graph cache miss");
             tracing::debug!(target: "cuteafd::timing", layer, rows, batched = batch.is_some(), "sparse graph capture");
             if !defer_warmup { self.synchronize()?; }
             let limit = fixed_limit.unwrap_or_else(|| if batch.is_some() { self.batch_rows } else { self.graph_limit });
-            if self.graphs[layer].len() >= limit {
-                let (old, _) = self.graphs[layer].pop_front().unwrap();
-                unsafe { self.stream.library.cuda_graph_exec_destroy(old)?; }
+            if self.graph_count(layer) >= limit {
+                self.graphs.retire_oldest(|(l, _)| *l == layer);
+                // Preserve ownership until a later stream drain, including deferred warmup.
+                let library = self.stream.library; let stream = self.stream.raw;
+                drop(self.graphs.drain_retired(|| unsafe { library.cuda_stream_synchronize(stream) })?);
             }
             // Native dispatch has four row recipes per cache format: split,
             // unsplit single-group, two-group and four-group. Changing pointers
@@ -691,7 +692,7 @@ impl<'a,const HEADS:usize> LocalSparseAttentionWave<'a,HEADS> {
             // Metadata uploads remain ordered on this stream; capture itself
             // contains no await. Previous uses of an evicted graph are complete.
             let graph = unsafe { self.capture_plan(&plan, &mut tail)? };
-            self.graphs[layer].push_back((graph, plan.fingerprint));
+            self.insert_graph(layer, plan.fingerprint, graph)?;
             graph
         };
         let launched = unsafe {

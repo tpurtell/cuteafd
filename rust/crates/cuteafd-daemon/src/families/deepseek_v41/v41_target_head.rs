@@ -98,7 +98,7 @@ impl<'a> TargetHeadWeights<'a> {
             weights: self,
             head,
             capacity,
-            graphs: vec![None; capacity],
+            graphs: crate::shared::decode_graph::RowGraphs::new(self.library, "target_head", capacity),
             fp8_scratch: crate::families::deepseek_v41::v41_tensors::fp8_scratch(self.library, head.fp8(), capacity,
                 crate::families::deepseek_v41::v41_tensors::Fp8Head::All)?,
             ready: None,
@@ -139,7 +139,7 @@ pub(crate) struct TargetHeadWave<'w, 'a> {
     capacity: usize,
     /// Captured head graphs by row count (index rows - 1), kept while serving:
     /// verification widths vary round to round.
-    graphs: Vec<Option<*mut c_void>>,
+    graphs: crate::shared::decode_graph::RowGraphs<'a>,
     /// Scratch of the FP8 head copy when the target head projects through it.
     fp8_scratch: Option<DeviceAllocation<'a>>,
     ready: Option<usize>,
@@ -237,7 +237,12 @@ impl TargetHeadWave<'_, '_> {
         let captured = unsafe { self.stream.library.cuda_graph_end_capture(self.stream.raw) };
         match (launched, captured) {
             (Ok(()), Ok(graph)) => {
-                self.graphs[rows - 1] = Some(graph);
+                // SAFETY: warmup drained and the wave owns every captured pointer.
+                if let Err(error) = unsafe { self.graphs.insert(rows, graph) } {
+                    // SAFETY: failed insertion did not take ownership of graph.
+                    unsafe { self.stream.library.cuda_graph_exec_destroy(graph)?; }
+                    return Err(error);
+                }
                 Ok(())
             }
             (Err(e), Ok(graph)) => {
@@ -331,7 +336,7 @@ impl TargetHeadWave<'_, '_> {
         Ok(())
     }
     unsafe fn capture_block_head(&mut self, rows: usize) -> Result<()> {
-        if super::v41_layer_graphs::captures_shape(rows as u32) && self.graph(rows).is_none() {
+        if super::graph_policy::captures_shape(rows as u32) && self.graph(rows).is_none() {
             unsafe { self.capture(rows)?; }
         }
         Ok(())
@@ -342,7 +347,7 @@ impl TargetHeadWave<'_, '_> {
         let launched = unsafe { self.enqueue(rows) };
         let drained = self.stream.wait().await;
         launched.and(drained)?;
-        if super::v41_layer_graphs::captures_shape(rows as u32) {
+        if super::graph_policy::captures_shape(rows as u32) {
             unsafe { self.capture_ready(rows) }
         } else { Ok(()) }
     }
@@ -357,7 +362,7 @@ impl TargetHeadWave<'_, '_> {
         -> Result<TargetLogits<'_>> {
         unsafe { self.copy_block(block, selected)?; }
         self.synchronize()?;
-        if super::v41_layer_graphs::captures_shape(selected.len() as u32) {
+        if super::graph_policy::captures_shape(selected.len() as u32) {
             unsafe { self.capture_block_head(selected.len())?; self.replay(selected.len())?; }
         } else { unsafe { self.execute(selected.len())?; } }
         self.publish_block(block, selected);
@@ -369,7 +374,7 @@ impl TargetHeadWave<'_, '_> {
         -> Result<TargetLogits<'_>> {
         unsafe { self.copy_block(block, selected)?; }
         // Warmup and replay consume input copies on this same stream.
-        let captured = super::v41_layer_graphs::captures_shape(selected.len() as u32);
+        let captured = super::graph_policy::captures_shape(selected.len() as u32);
         if captured && self.graph(selected.len()).is_none() {
             unsafe { self.prepare_head_cooperative(selected.len()).await?; }
         }
@@ -388,7 +393,7 @@ impl TargetHeadWave<'_, '_> {
         selected: &[usize], cooperative: bool) -> Result<()> {
         unsafe { self.copy_block(block, selected)?; }
         let rows = selected.len();
-        let captured = super::v41_layer_graphs::captures_shape(rows as u32);
+        let captured = super::graph_policy::captures_shape(rows as u32);
         if captured && self.graph(rows).is_none() {
             if cooperative { unsafe { self.prepare_head_cooperative(rows).await?; } }
             else { self.synchronize()?; unsafe { self.capture_block_head(rows)?; } }
@@ -445,7 +450,7 @@ impl TargetHeadWave<'_, '_> {
         );
         unsafe { self.copy_block(block, selected)?; }
         let rows = selected.len();
-        let captured = super::v41_layer_graphs::captures_shape(rows as u32);
+        let captured = super::graph_policy::captures_shape(rows as u32);
         if captured && self.graph(rows).is_none() {
             if cooperative { unsafe { self.prepare_head_cooperative(rows).await?; } }
             else { self.synchronize()?; unsafe { self.capture_block_head(rows)?; } }
@@ -519,17 +524,14 @@ impl TargetHeadWave<'_, '_> {
         unsafe { self.download.rows(logits, STRIDES[4], rows).await }
     }
     fn graph(&self, rows: usize) -> Option<*mut c_void> {
-        rows.checked_sub(1).and_then(|i| self.graphs.get(i).copied().flatten())
+        self.graphs.get(rows)
     }
     pub fn clear_graph(&mut self) -> Result<()> {
         self.invalidate();
         self.stream.require_complete()?;
-        for graph in self.graphs.iter_mut().filter_map(Option::take) {
-            unsafe {
-                self.stream.library.cuda_graph_exec_destroy(graph)?;
-            }
-        }
-        Ok(())
+        // SAFETY: require_complete drained all users before releasing captures.
+        unsafe { self.graphs.clear() }
+
     }
 }
 impl Drop for TargetHeadWave<'_, '_> {

@@ -3,7 +3,7 @@
 pub(crate) mod tp2;
 use crate::families::deepseek_v41::v41_attention_binding::QueryBinding;
 use crate::families::deepseek_v41::v41_block::FfnInput;
-use crate::families::deepseek_v41::v41_layer_graphs::LayerGraphs;
+use crate::shared::decode_graph::LayerGraphs;
 use crate::shared::memory::{DeviceAllocation, LoadStream};
 use crate::families::deepseek_v41::v41_shared_ffn::SharedFfn;
 use crate::families::deepseek_v41::v41_tensors::NativeRtxTensors;
@@ -107,7 +107,7 @@ impl<'a> BackboneSharedWeights<'a> {
             result: DeviceAllocation::new(self.library, capacity as usize * 10240)?,
             layer: self.layer,
             capacity,
-            graphs: LayerGraphs::new(self.library),
+            graphs: LayerGraphs::new(self.library, 8 * (cuteafd_core::MAX_DSPARK_PROPOSALS as u32 + 1)),
             weights: self,
             ready: None,
             origin: None,
@@ -286,7 +286,7 @@ impl BackboneSharedWave<'_, '_> {
                 input.values.bytes, self.stream.raw) { self.synchronize()?; return Err(error); }
         }
         let rows = input.tokens.len() as u32;
-        if !super::v41_layer_graphs::captures_shape(rows) {
+        if !super::graph_policy::captures_shape(rows) {
             unsafe { self.execute(rows)?; }
             self.origin = Some(input.binding());
             return self.output();
@@ -332,7 +332,7 @@ impl BackboneSharedWave<'_, '_> {
         })();
         if let Err(error) = launched { self.synchronize()?; return Err(error); }
         unsafe { crate::shared::memory::chain::finish_cooperative(&self.stream).await?; }
-        if cold && super::v41_layer_graphs::captures_shape(rows) {
+        if cold && super::graph_policy::captures_shape(rows) {
             // The eager execution above already completed these inputs. Capture
             // records future launches without executing them; publish that result
             // instead of running the same work again on every cache miss.
