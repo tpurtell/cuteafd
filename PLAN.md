@@ -2802,17 +2802,22 @@ dual-RTX expert mode.**
   - on 1 RTX, the planner's constant over-reservations (`P2`) cost the
     layers.
 
-  `ExpertsFirst` is an interim fallback only. It is deleted, and `auto`
-  becomes the V4 default, in the same steps that recover the layers: `P4`
-  for 2 RTX and `P2` for 1 RTX. Both land before the first v3 cut.
+  `ExpertsFirst` (`RTX_EXPERT_LAYERS=max`) **stays as a supported mode**
+  (TJ, 2026-10-10: "a mode I want … but it is not the default"). Only the
+  default moves: `auto` becomes the V4 default in the steps that recover the
+  layers, `P4` for 2 RTX and `P2` for 1 RTX, both before the first v3 cut.
+  Under TP2, `ExpertsFirst` places TP2 halves first and gives the pool what
+  is left (subject to its floor).
 - **In a 2-RTX configuration, routed experts on the RTX cards are always TP2
-  halves**, folded into the head split's existing all-reduce. `P4` deletes:
-  - TP1 routed experts on one GPU (today's V4 default leaves GPU1 nearly
-    empty);
+  halves**, folded into the head split's existing all-reduce. `P4` deletes
+  the two placements TP2 replaces, because neither can beat it on PCIe:
+  - TP1 routed experts on one GPU of a 2-RTX layout (today's V4 default
+    leaves GPU1 nearly empty);
   - the GPU1 whole-layer expert ranges (`RTX_EXPERT_PEER`, a hidden-state
     hop each way per layer, and the path with the two-lane deadlock).
 
-  Neither can beat TP2 on PCIe.
+  Every onboard mode (`auto`, `max`/`ExpertsFirst`, `N`, `N%`, `all`) stays
+  and resolves to TP2 halves on 2 RTX.
 - **Single-RTX layouts are TP1 by nature.** Per-layer GPU ownership
   (`Whole{gpu}`: attention, KV and that layer's work on one GPU) stays a
   general capability, and its FFN uses TP2 split or V4.1's owner-reduce per
