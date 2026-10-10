@@ -12,6 +12,9 @@ Attention (KDA), a minority run MLA + DSA.
 - NVIDIA ModelOpt NVFP4 (`nvidia/GLM-5.3-Flash-NVFP4`) — routed experts and
   dense MLPs both run natively in NVFP4.
 
+**Starting configs** (v2.0.0 release cards, natural minimum and maximum; replace the
+placeholder Spark hosts and addresses): Official FP8 [min](../../examples/configs/glm53-flash-fp8-min.config) · [max](../../examples/configs/glm53-flash-fp8-max.config); EXL3 K3.25 [min](../../examples/configs/glm53-flash-exl3-min.config) · [max](../../examples/configs/glm53-flash-exl3-max.config); NVFP4 [min](../../examples/configs/glm53-flash-nvfp4-min.config) · [max](../../examples/configs/glm53-flash-nvfp4-max.config); tr3 4bpw [min](../../examples/configs/glm53-flash-tr3-min.config) · [max](../../examples/configs/glm53-flash-tr3-max.config).
+
 ## Engineering summary
 
 - Attention: hybrid — Kimi Delta Attention (token-sequential linear

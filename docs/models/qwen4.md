@@ -10,6 +10,9 @@ layer every fourth, a PLE n-gram memory table, and fused expert tensors.
 - EXL3 K4.25 PLE publications of the same checkpoint (`qwen4:exl3-k45`).
 - NVIDIA ModelOpt NVFP4 — routed experts run W4A16 (`qwen4:nvfp4`).
 
+**Starting configs** (v2.0.0 release cards, natural minimum and maximum; replace the
+placeholder Spark hosts and addresses): EXL3 K4.25 [min](../../examples/configs/qwen38-exl3-min.config); NVFP4 [min](../../examples/configs/qwen38-nvfp4-min.config).
+
 ## Engineering summary
 
 - Attention: Gated DeltaNet linear recurrence on most layers, full GQA with
@@ -23,8 +26,8 @@ layer every fourth, a PLE n-gram memory table, and fused expert tensors.
   layer; EXL3 K4/K5, FP8 128x128 blocks, or ModelOpt NVFP4 group-16; a local
   (RTX-resident, TP1) expert path is supported.
 - Speculator: native MTP (full attention, 512 experts, and a hyper-connection
-  feedback path). The launcher defaults to MTP3 with resident local EXL3
-  experts; `SPECULATOR=off` disables it and `SPECULATOR_DEPTH` overrides the
+  feedback path). The launcher defaults to MTP3 with resident local EXL3 or
+  NVFP4 experts; `SPECULATOR=off` disables it and `SPECULATOR_DEPTH` overrides the
   depth. The policy adapts the number of drafts to concurrency and acceptance.
 - RTX/Spark layouts: qualified EXL3 fits on one RTX with resident local
   experts; the official FP8 expert package (~173 GB) does not fit one RTX.
@@ -56,7 +59,8 @@ Qwen 3.8 Flash Next EXL3 K4.25, 1 RTX, MTP 3. FP8 projections fail the KL gate (
 
 `EXPERT_BACKEND=auto` prefers resident local EXL3 experts when the planner
 admits the weights, MTP, serving reservations and requested KV pool. After
-local admission, an unset `SPECULATOR` selects native MTP at depth 3. Explicit
+local admission, an unset `SPECULATOR` selects native MTP at depth 3 (EXL3, and
+NVFP4 with its FP8 MTP package). Explicit
 `EXPERT_BACKEND=local` uses the same speculation default. `MTP=0` retains the
 legacy opt-out; explicit depth settings retain their meaning.
 
@@ -126,13 +130,13 @@ readiness field measures only the coordinator process.
   decode-only FP8 projections with dual residency to BF16 projections.
   Matched BF16 ABAB passes parity. Single-copy FP8 projections remain
   opt-in because their golden NLL/KL misses the precision gate.
-- The automatic MTP default is qualified for local EXL3. Other expert formats
-  retain explicit speculation settings.
+- The automatic MTP default is qualified for local EXL3 and NVFP4. Other expert
+  formats retain explicit speculation settings.
 - Local NVFP4 supports explicit `SPECULATOR=mtp`, `SPECULATOR_DEPTH=3`.
   Routed layers use the NVFP4 TP1 package; the MTP layer uses the FP8 TP1
   package. Both stay resident, with one copy per layer and separately
   admitted prefill scratch. This fixes the RC1 minimum-card launch failure.
-  The automatic MTP default remains limited to EXL3.
+  The automatic MTP default covers local EXL3 and NVFP4, as the release cards ran.
 - MTP verify and plain decode can differ at low-margin greedy positions,
   and C1/C4 outputs can differ. The current gate accepts proven verify
   rounding; byte-identical speculation and batch invariance are open. The
@@ -146,8 +150,8 @@ readiness field measures only the coordinator process.
   at the reference configurations.
 - One-RTX NVFP4 local experts must fit resident weight and serving
   reservations. Implicit paging was removed; `--expert-window` explicitly
-  enables the slower paging fallback. The local automatic MTP default is
-  enabled for EXL3; NVFP4 uses explicit MTP settings.
+  enables the slower paging fallback. The local automatic MTP default covers
+  EXL3 and NVFP4.
 - NVFP4 decode/verify uses W4A16; native W4A4 for these small-row shapes is
   deferred.
 

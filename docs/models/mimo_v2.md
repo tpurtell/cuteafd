@@ -15,6 +15,9 @@ experts without a shared expert.
   (same architecture, config, tokenizer and tensor layout; Xiaomi's MOPD2
   pass fixes the RL release's tool-call repetition). RL still loads.
 
+**Starting configs** (v2.0.0 release cards, natural minimum and maximum; replace the
+placeholder Spark hosts and addresses): V2.6 Flash MOPD [min](../../examples/configs/mimo-v26-flash-mxfp4-min.config) · [max](../../examples/configs/mimo-v26-flash-mxfp4-max.config); V2.6 Pro MOPD [min](../../examples/configs/mimo-v26-pro-mxfp4-min.config) · [max](../../examples/configs/mimo-v26-pro-mxfp4-max.config).
+
 ## Engineering summary
 
 - Attention: GQA full attention on some layers, 128-token sliding-window
@@ -30,8 +33,8 @@ experts without a shared expert.
   Spark TP2/TP6, coordinator TP1 local).
 - Speculator: native MTP layers (SWA attention, dense FFN, `eh_proj`
   fusion) or a DFlash external drafter — DFlash is the measured-best
-  speculator for V2.6 Flash MOPD and Pro. Flash defaults to the checkpoint's
-  own `dflash/`, with FP8 drafter weights; `SPECULATOR=off` disables it,
+  speculator for V2.6 Flash MOPD and Pro. Both default to the checkpoint's
+  own `dflash/` (Flash with FP8 drafter weights); `SPECULATOR=off` disables it,
   `SPECULATOR_FP8=auto` preserves source BF16, and `off` explicitly selects BF16.
 - Flash MOPD's constants have separate `mimof`/`mimof2` programs: norm
   epsilon 1e-6, full/SWA RoPE theta 1e7/1e4, target value scale 0.707,

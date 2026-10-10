@@ -12,6 +12,9 @@ own history, not an external-engine parity campaign.
   FP8-named dense tensors with HF-named EXL3 K2 routed experts (~96 GiB per
   Spark rank at TP4).
 
+**Starting configs** (v2.0.0 release cards, natural minimum and maximum; replace the
+placeholder Spark hosts and addresses): V4 Flash MXFP4 [min](../../examples/configs/deepseek-v4-flash-mxfp4-min.config) · [max](../../examples/configs/deepseek-v4-flash-mxfp4-max.config); V4 Pro EXL3 K2 [min](../../examples/configs/deepseek-v4-pro-exl3-min.config) · [max](../../examples/configs/deepseek-v4-pro-exl3-max.config).
+
 ## Engineering summary
 
 - Attention: compressed MLA with an alternating 4/128 ratio schedule, an
@@ -24,7 +27,9 @@ own history, not an external-engine parity campaign.
   EXL3 K2–K4 for V4 Pro (hidden 7168 / intermediate 3072 / 384 experts).
   mHC adds an `hc_head_{fn,base,scale}` output head beyond V4.1's mixing.
 - Speculator: three-stage dSpark drafter at this family's width, reusing
-  V4.1's structure with family-specific geometry.
+  V4.1's structure with family-specific geometry. The launcher drafts with it
+  by default when the checkpoint carries it (`dspark_block_size`);
+  `SPECULATOR=off` disables it. The KV pool defaults to `POOL_TOKENS=auto`.
 - KV format: FP8 128x128 block scales (UE8M0) on coordinator weights.
 - RTX/Spark layouts: head split is the default on 2 RTX (measured decode
   -10% Flash / -12% Pro, prefill neutral); TP6 across all six Sparks is an
