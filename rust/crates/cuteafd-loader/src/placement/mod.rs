@@ -16,11 +16,13 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 pub mod families;
+pub mod inventory;
 mod pool;
 mod solve;
 #[cfg(test)]
 mod tests;
 
+pub use inventory::{ArchContext, GraphRank, GraphSet, Lifetime, ProgramSet, RuntimeSample, ARCH_CONTEXTS};
 pub use pool::PoolPolicy;
 pub use solve::solve;
 
