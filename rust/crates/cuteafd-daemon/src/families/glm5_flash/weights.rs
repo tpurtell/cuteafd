@@ -222,6 +222,7 @@ impl<'a> GlmfLoader<'a> {
             return Ok(false);
         }
         let (h, i) = (cfg.hidden, cfg.dense_intermediate);
+        let mut gate_input_scale = None;
         for (proj, w_key, s_key, rows, cols) in [("gate_proj", "nvfp4_w1", "nvfp4_s1", i, h),
             ("up_proj", "nvfp4_w3", "nvfp4_s3", i, h), ("down_proj", "nvfp4_w2", "nvfp4_s2", h, i)] {
             let name = format!("{mlp}.{proj}");
@@ -231,10 +232,27 @@ impl<'a> GlmfLoader<'a> {
             let (mut scales, dtype, shape) = self.raw(&format!("{name}.weight_scale"))?;
             ensure!(dtype == DType::F8E4M3 && shape == [rows, cols / 16], "{name}.weight_scale: expected E4M3 \
                 [{rows}, {}], found {dtype:?} {shape:?}", cols / 16);
+            let mut input_scale = [0u8; 4];
             for scalar in ["weight_scale_2", "input_scale"] {
                 let (bytes, dtype, _) = self.raw(&format!("{name}.{scalar}"))?;
                 ensure!(dtype == DType::F32 && bytes.len() == 4, "{name}.{scalar}: expected one FP32 value");
+                if scalar == "input_scale" {
+                    input_scale.copy_from_slice(&bytes);
+                }
                 scales.extend_from_slice(&bytes);
+            }
+            // The W4A4 dense FC1 kernel quantizes with the gate projection's
+            // input_scale and dequantizes the up half with the up projection's;
+            // require them bit-identical, as for the routed experts.
+            match proj {
+                "gate_proj" => gate_input_scale = Some(input_scale),
+                "up_proj" => {
+                    let gate = gate_input_scale.expect("gate_proj is packed before up_proj");
+                    ensure!(gate == input_scale, "{mlp}: NVFP4 dense gate input_scale {} and up input_scale {} differ; \
+                        the W4A4 FC1 kernel needs them bit-identical",
+                        f32::from_le_bytes(gate), f32::from_le_bytes(input_scale));
+                }
+                _ => {}
             }
             ops.insert(w_key, self.upload(&weight)?);
             ops.insert(s_key, self.upload(&scales)?);
