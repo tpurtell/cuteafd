@@ -120,6 +120,14 @@ fn assert_equal(case: &Case<'_>, label: &str) -> Placement {
     let notes = runtime.expert_ranges.iter().enumerate().map(|(gpu, r)|
         format!("rtx{gpu}: {} local expert layers ({}..{})", r.layers, r.first, r.first + r.layers)).collect::<Vec<_>>();
     for note in notes { assert!(layout.notes.contains(&note), "{label}: planner lacks {note}"); }
+    // Per-layer ownership: today's V4 is all head split (2 RTX) or all GPU0,
+    // the residual replicated after layer 0 under the split, no charged hop,
+    // and the engine accepts the placement.
+    assert_eq!(runtime.residual.len(), runtime.layers.len() + 1, "{label}: residual homes");
+    assert!(runtime.hops.iter().all(|h| !h.charged()), "{label}: V4 hops");
+    assert!(runtime.items.iter().flatten().all(|i| i.group != "residual hops"), "{label}: hop buffers");
+    super::check_modes(&runtime, case.rtx == 2).unwrap_or_else(|e| panic!("{label}: {e:#}"));
+    assert!(super::check_modes(&runtime, case.rtx != 2).is_err(), "{label}: the other engine shape is refused");
     runtime
 }
 

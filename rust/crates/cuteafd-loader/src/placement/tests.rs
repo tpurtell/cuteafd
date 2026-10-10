@@ -24,6 +24,8 @@ fn request(gpus: usize, free: u64, layers: usize, sparks: usize, onboard: Onboar
         onboard,
         expert_gpus: gpus,
         policy: LayerPolicy { default: vec![LayerMode::HeadSplit], by_kind: Vec::new() },
+        hops: HopSpec::default(),
+        executor: families::DEEPSEEK_V4,
     }
 }
 
@@ -145,4 +147,139 @@ fn onboard_parses_the_launcher_spellings() {
     assert_eq!(Onboard::Fraction(0.5).layers(43), Some(22));
     assert_eq!(Onboard::Layers(99).layers(43), Some(43));
     assert_eq!(Onboard::Layers(12).to_string(), "12");
+}
+
+const W0: LayerMode = LayerMode::Whole { gpu: 0, ffn: FfnMode::Owner };
+const W1: LayerMode = LayerMode::Whole { gpu: 1, ffn: FfnMode::Owner };
+const S0: LayerMode = LayerMode::Whole { gpu: 0, ffn: FfnMode::Split };
+const S1: LayerMode = LayerMode::Whole { gpu: 1, ffn: FfnMode::Split };
+/// V4/V4.1-sized mHC hop: `[4096,4,4096]` BF16 per lane slot = 128 MiB.
+const MHC: HopSpec = HopSpec { row_bytes: 4 * 4096 * 2, rows: 4096, lanes: 2, entry_gpu: 0, head_gpu: 0 };
+const ANY: ExecutorModes = ExecutorModes { family: "test", modes: &[LayerMode::HeadSplit, W0, W1, S0, S1], hops: true };
+
+#[test]
+fn residual_transitions_follow_the_section_3_table() {
+    use ResidualHome::*;
+    let t = |from: ResidualHome, next| { let t = from.transition(next); (t.before, t.after_attention, t.home) };
+    // Into a head split: an owned residual is broadcast first; the split leaves it replicated.
+    assert_eq!(t(Replicated, LayerMode::HeadSplit), (None, None, Replicated));
+    assert_eq!(t(Owned(0), LayerMode::HeadSplit), (Some((0, 1, HopKind::Broadcast)), None, Replicated));
+    assert_eq!(t(Owned(1), LayerMode::HeadSplit), (Some((1, 0, HopKind::Broadcast)), None, Replicated));
+    // A split FFN needs its input on the peer after attention; the all-reduce replicates.
+    assert_eq!(t(Replicated, S1), (None, Some((1, 0)), Replicated));
+    assert_eq!(t(Owned(1), S1), (None, Some((1, 0)), Replicated));
+    assert_eq!(t(Owned(0), S1), (Some((0, 1, HopKind::Boundary)), Some((1, 0)), Replicated));
+    // An owner FFN keeps the residual on its GPU; crossing owners is one boundary hop.
+    assert_eq!(t(Replicated, W1), (None, None, Owned(1)));
+    assert_eq!(t(Owned(1), W1), (None, None, Owned(1)));
+    assert_eq!(t(Owned(0), W1), (Some((0, 1, HopKind::Boundary)), None, Owned(1)));
+}
+
+#[test]
+fn layer_ranges_hop_once_per_boundary_and_back_to_the_head() {
+    // V4.1: layers 0-19 on GPU0, 20-39 on GPU1, head on GPU0.
+    let modes: Vec<_> = (0..40).map(|l| if l < 20 { W0 } else { W1 }).collect();
+    let hops = plan_hops(&modes, &MHC);
+    assert_eq!(hops.iter().map(|h| (h.at, h.from, h.to, h.kind)).collect::<Vec<_>>(), [
+        (HopPoint::BeforeLayer(20), 0, 1, HopKind::Boundary),
+        (HopPoint::Exit, 1, 0, HopKind::Boundary),
+    ]);
+    // One receive pair per lane on each GPU: 2 lanes x 1 hop x 128 MiB.
+    assert_eq!(hop_buffer_bytes(&hops, &MHC, 2), Some(vec![256 << 20, 256 << 20]));
+    // Head on GPU1 with the last range: no exit hop.
+    let tail = plan_hops(&modes, &HopSpec { head_gpu: 1, ..MHC });
+    assert_eq!(tail.len(), 1);
+    assert_eq!(hop_buffer_bytes(&tail, &MHC, 2), Some(vec![0, 256 << 20]));
+}
+
+#[test]
+fn head_split_stacks_only_hop_at_entry_and_charge_nothing() {
+    // Today's V4/GLM/MiMo head split: the embedding broadcast lands in the step input.
+    let hops = plan_hops(&[LayerMode::HeadSplit; 61], &MHC);
+    assert_eq!(hops.len(), 1);
+    assert_eq!((hops[0].at, hops[0].kind, hops[0].charged()), (HopPoint::Entry, HopKind::Broadcast, false));
+    assert_eq!(hop_buffer_bytes(&hops, &MHC, 2), Some(vec![0, 0]));
+}
+
+#[test]
+fn mixed_split_and_whole_layers_broadcast_into_split_ffns() {
+    // GLM Flash's mixed policy: KDA head split, DSA layers whole on alternating GPUs with a split FFN.
+    let modes = [LayerMode::HeadSplit, S0, LayerMode::HeadSplit, S1, LayerMode::HeadSplit];
+    let hops = plan_hops(&modes, &MHC);
+    assert_eq!(hops.iter().map(|h| (h.at, h.from, h.to)).collect::<Vec<_>>(), [
+        (HopPoint::Entry, 0, 1), (HopPoint::AfterAttention(1), 0, 1), (HopPoint::AfterAttention(3), 1, 0),
+    ]);
+    // Each GPU receives one charged hop per lane.
+    assert_eq!(hop_buffer_bytes(&hops, &MHC, 2), Some(vec![256 << 20, 256 << 20]));
+    // Many hops into one GPU alternate between two slots per lane.
+    let many = plan_hops(&[S0, S0, S0, S0], &MHC);
+    assert_eq!(many.len(), 4);
+    assert_eq!(hop_buffer_bytes(&many, &MHC, 2), Some(vec![0, 512 << 20]));
+}
+
+#[test]
+fn placement_records_residual_homes_and_charges_hops_as_fixed_demands() {
+    let mut req = request(2, 44 * GIB, 4, 4, Onboard::Layers(0));
+    req.hops = MHC;
+    req.executor = ANY;
+    req.policy.default = vec![W0];
+    for (index, layer) in req.layers.iter_mut().enumerate() {
+        layer.modes = vec![if index < 2 { W0 } else { W1 }];
+    }
+    let ranges = solve(&req).unwrap();
+    assert_eq!(ranges.residual, [ResidualHome::Owned(0), ResidualHome::Owned(0), ResidualHome::Owned(0),
+        ResidualHome::Owned(1), ResidualHome::Owned(1)]);
+    assert_eq!(ranges.hops.len(), 2);
+    for gpu in 0..2 {
+        assert!(ranges.items[gpu].iter().any(|i| i.group == "residual hops" && i.bytes == 256 << 20), "gpu{gpu}");
+    }
+    assert!(ranges.summary().ends_with("; 2 residual hops"));
+    // The hop buffers come out of the pool: 256 MiB = 64 units of 4 MiB fewer.
+    let mut split = req.clone();
+    split.hops = HopSpec::default();
+    assert_eq!(solve(&split).unwrap().pool_tokens - ranges.pool_tokens, 64 * 256);
+    // Today's V4 request: head split, the residual replicated after layer 0, nothing charged.
+    let v4 = solve(&request(2, 44 * GIB, 4, 4, Onboard::Auto)).unwrap();
+    assert_eq!(v4.residual[0], ResidualHome::Owned(0));
+    assert!(v4.residual[1..].iter().all(|h| *h == ResidualHome::Replicated));
+    assert_eq!(v4.hops.iter().map(|h| h.at).collect::<Vec<_>>(), [HopPoint::Entry]);
+    assert!(!v4.items.iter().flatten().any(|i| i.group == "residual hops"));
+    // One GPU never hops.
+    let one = solve(&request(1, 44 * GIB, 4, 4, Onboard::Auto)).unwrap();
+    assert!(one.hops.is_empty() && one.residual.iter().all(|h| *h == ResidualHome::Owned(0)));
+}
+
+#[test]
+fn executors_refuse_modes_they_cannot_run_at_plan_time() {
+    // V4 runs head split or whole-on-GPU0 only: a layer that allows only GPU1 ownership is refused.
+    let mut req = request(2, 44 * GIB, 4, 4, Onboard::Auto);
+    req.layers[2].modes = vec![W1];
+    assert_eq!(solve(&req), Err(PlacementError::NoMode { layer: 2, allowed: vec![W1] }));
+    // The policy's preference falls through to a mode the executor runs.
+    let mut req = request(2, 44 * GIB, 4, 4, Onboard::Auto);
+    req.policy.default = vec![W1, LayerMode::HeadSplit];
+    for layer in &mut req.layers { layer.modes = vec![W1, LayerMode::HeadSplit]; }
+    assert!(solve(&req).unwrap().layers.iter().all(|l| l.mode == LayerMode::HeadSplit));
+    // An executor without hop points refuses modes that need them (ranges need a boundary hop).
+    let mut req = request(2, 44 * GIB, 4, 4, Onboard::Layers(0));
+    req.executor = ExecutorModes { family: "nohops", modes: &[W0, W1], hops: false };
+    req.policy.default = vec![W0];
+    req.layers[3].modes = vec![W1];
+    assert!(matches!(solve(&req), Err(PlacementError::UnsupportedHop { family: "nohops",
+        hop: Hop { at: HopPoint::BeforeLayer(3), from: 0, to: 1, .. } })));
+    // Without peer access, GPU1-owned and split layers are not executable at all.
+    let mut req = request(2, 44 * GIB, 4, 4, Onboard::Auto);
+    req.inventory.peer_access = false;
+    req.executor = ANY;
+    req.policy.default = vec![S1, W1, W0];
+    for layer in &mut req.layers { layer.modes = vec![S1, W1, W0]; }
+    assert!(solve(&req).unwrap().layers.iter().all(|l| l.mode == W0));
+    // Engines check the placement they are handed against the same set.
+    let mut handed = solve(&request(2, 44 * GIB, 4, 4, Onboard::Auto)).unwrap();
+    assert_eq!(families::DEEPSEEK_V4.check(&handed), Ok(()));
+    handed.layers[1].mode = S1;
+    assert_eq!(families::DEEPSEEK_V4.check(&handed),
+        Err(PlacementError::UnsupportedMode { family: "deepseek_v4", layer: 1, mode: S1 }));
+    assert!(families::DEEPSEEK_V41.runs(W1) && !families::QWEN4.runs(LayerMode::HeadSplit));
+    assert_eq!(families::executor("glm5_flash").map(|e| e.hops), Some(false));
 }
