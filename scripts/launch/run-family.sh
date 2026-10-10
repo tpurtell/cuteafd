@@ -38,7 +38,7 @@ done < <(grep -E '^[A-Z_0-9]+=' "$config")
 get() { printf '%s' "${cfg[$1]:-${2:-}}"; }
 table_backend="${table_override:-$(get TABLE_BACKEND "${CUTEAFD_TABLE_BACKEND:-mmap}")}"
 release_validate_table_backend "$table_backend"
-vision="$(get VISION off)"
+vision="$(get VISION auto)"
 audio="$(get AUDIO auto)"
 vision_replicas="$(get VISION_REPLICAS 1)"
 [[ "$vision_replicas" =~ ^[1-6]$ ]] || release_die "VISION_REPLICAS must be 1..6"
@@ -90,9 +90,10 @@ case "$family" in
   qwen4) serve=serve-qwen4 ;;
   *) echo "run-family.sh serves DeepSeek V4, GLM 5.x, GLM 5.3 Flash, MiMo V2 and Qwen 3.8 checkpoints, not $family (./run.sh serves DeepSeek V4.1)" >&2; exit 2 ;;
 esac
-# Qualified MiMo, GLM Flash and Qwen encoders use Spark-first auto unless explicitly off.
-# Other generic families keep off until their towers are qualified.
-if [[ ( "$family" == mimo_v2 || "$family" == glm5_flash || "$family" == qwen4 ) && -z "$(get VISION)" ]]; then vision=auto; fi
+# VISION and AUDIO default to auto for every family, as the release configs
+# set them. Qualified MiMo, GLM Flash and Qwen towers are placed Spark-first by
+# the encoder plan below; DeepSeek V4 and GLM 5.3 have no tower, so auto starts
+# none and serves text only.
 # Only snapshots shipping qualified MiMo audio opt into Spark-first auto.
 audio="$(release_resolve_audio_mode "$audio" "$root/snapshots/$revision")"
 # Auto/spark placement is resolved by the encoder plan below.
@@ -151,10 +152,12 @@ if [[ -n "$wip_slot" ]]; then
     -e CUTEAFD_NATIVE_LIB=/opt/cuteafd/lib/libcuteafd_native.so --entrypoint /opt/cuteafd/share/release-entrypoint.sh"
 fi
 qwen_exl3=0
+qwen_nvfp4=0
 qwen_mtp=0
 if [[ "$family" == qwen4 ]]; then
-  qwen_features="$(python3 -c 'import json,sys; c=json.load(open(sys.argv[1])); q=c.get("quantization_config", {}); print(int(q.get("quant_method", q.get("method")) == "exl3"), c.get("text_config", c).get("mtp_num_hidden_layers", 0))' "$root/snapshots/$revision/config.json")"
-  read -r qwen_exl3 qwen_mtp <<<"$qwen_features"
+  # NVFP4: a ModelOpt publication with 4-bit weight groups (nvidia/Qwen3.8-Flash-Next-NVFP4).
+  qwen_features="$(python3 -c 'import json,sys; c=json.load(open(sys.argv[1])); q=c.get("quantization_config", {}); m=q.get("quant_method", q.get("method")); g=q.get("config_groups", {}).values(); print(int(m == "exl3"), int(m == "modelopt" and any(x.get("weights", {}).get("num_bits") == 4 for x in g)), c.get("text_config", c).get("mtp_num_hidden_layers", 0))' "$root/snapshots/$revision/config.json")"
+  read -r qwen_exl3 qwen_nvfp4 qwen_mtp <<<"$qwen_features"
 fi
 if [[ "$qwen_exl3" == 1 && "$backend" == auto && "$ranks" != 0 ]]; then
   selected="$(get COORDINATOR_GPUS "$(get COORDINATOR_GPU 0)")"; selected="${selected%%,*}"
@@ -210,8 +213,11 @@ snapshot_of() {
   [[ -d "$dir/snapshots/$rev" ]] || { echo "missing snapshot $id@$rev" >&2; return 1; }
   printf '%s' "/root/.cache/huggingface/hub/models--${id//\//--}/snapshots/$rev"
 }
-# SPECULATOR picks the drafter (Flash MOPD: bundled DFlash; Qwen local EXL3:
-# MTP3; GLM 5.3 Flash: its measured best; otherwise off):
+# SPECULATOR picks the drafter. Unset, each family takes the speculator its
+# release card ran (examples/configs/*.config; scripts/tests/test_example_configs.py
+# keeps the two in step): GLM 5.3 DFlash2; GLM 5.3 Flash its measured best;
+# MiMo V2.6 Flash/Pro MOPD the bundled DFlash; DeepSeek V4 dSpark when the
+# checkpoint carries it; Qwen local EXL3/NVFP4 MTP3; otherwise off.
 #   dflash2  GLM 5.x / GLM 5.3 Flash: the DFlash2 checkpoint SPECULATOR_MODEL_ID
 #            (e.g. incoai/GLM-5.3-DFlash2, incoai/GLM-5.3-Flash-DFlash2);
 #            MiMo V2.6 Flash/Pro: the snapshot's own dflash/ drafter unless
@@ -236,9 +242,16 @@ glm5_flash_speculator() {
     *) echo "dflash2 incoai/GLM-5.3-Flash-DFlash2" ;;
   esac
 }
-# Qualification is for this official checkpoint, not a shape-compatible sibling.
-mimo_flash_mopd=0
+# Qualification is for these official checkpoints, not a shape-compatible sibling.
+mimo_flash_mopd=0 mimo_bundled_dflash=0
 [[ "$family:$model" != mimo_v2:XiaomiMiMo/MiMo-V2.6-Flash-MOPD ]] || mimo_flash_mopd=1
+[[ $mimo_flash_mopd == 0 && "$family:$model" != mimo_v2:XiaomiMiMo/MiMo-V2.6-Pro-MOPD ]] || mimo_bundled_dflash=1
+# DeepSeek V4 checkpoints carry their dSpark drafter beside the target (mtp.0.*,
+# dspark_block_size in config.json); one without it serves without speculation.
+dsv4_dspark=0
+if [[ $family == deepseek_v4 ]]; then
+  dsv4_dspark="$(python3 -c 'import json,sys; print(int(int(json.load(open(sys.argv[1])).get("dspark_block_size") or 0) > 0))' "$root/snapshots/$revision/config.json")"
+fi
 speculator="$(get SPECULATOR)"
 default_drafter=""
 if [[ -z "$speculator" ]]; then
@@ -261,16 +274,21 @@ if [[ -z "$speculator" ]]; then
       speculator=off default_drafter=""
     fi
   fi
-  if [[ $speculator == off && $mimo_flash_mopd == 1 && -z ${cfg[MTP]+set} && -z ${cfg[DFLASH]+set} ]]; then
+  if [[ $speculator == off && $mimo_bundled_dflash == 1 && -z ${cfg[MTP]+set} && -z ${cfg[DFLASH]+set} ]]; then
     speculator=dflash2
-    echo "note: MiMo V2.6 Flash MOPD drafts with its bundled DFlash; SPECULATOR=off disables it" >&2
+    echo "note: $model drafts with its bundled DFlash; SPECULATOR=off disables it" >&2
   fi
-  # Only the resident EXL3 path is qualified. Spark workers serve backbone
-  # layers, not mtp.layers.0; other expert formats keep their opt-in status.
-  # An explicit SPECULATOR=off or legacy MTP=0 disables the family default.
-  if [[ $speculator == off && $qwen_exl3 == 1 && $qwen_mtp == 1 && $ranks == 0 && -z ${cfg[MTP]+set} ]]; then
+  if [[ $speculator == off && $dsv4_dspark == 1 && -z ${cfg[DSPARK]+set} ]]; then
+    speculator=dspark
+    echo "note: DeepSeek V4 drafts with its bundled dSpark; SPECULATOR=off disables it" >&2
+  fi
+  # Only the resident local paths are qualified (EXL3, and NVFP4 with its FP8
+  # MTP package). Spark workers serve backbone layers, not mtp.layers.0; other
+  # expert formats keep their opt-in status. An explicit SPECULATOR=off or
+  # legacy MTP=0 disables the family default.
+  if [[ $speculator == off && ( $qwen_exl3 == 1 || $qwen_nvfp4 == 1 ) && $qwen_mtp == 1 && $ranks == 0 && -z ${cfg[MTP]+set} ]]; then
     speculator=mtp
-    echo "note: Qwen local EXL3 drafts with native MTP (default depth 3); SPECULATOR=off disables it" >&2
+    echo "note: Qwen local $([[ $qwen_exl3 == 1 ]] && echo EXL3 || echo NVFP4) drafts with native MTP (default depth 3); SPECULATOR=off disables it" >&2
   fi
 fi
 case "$family:$speculator" in
@@ -356,7 +374,7 @@ case "$speculator" in
     fi ;;
   mtp)
     mtp_depth=1
-    [[ $qwen_exl3 != 1 || $qwen_mtp != 1 ]] || mtp_depth=3
+    [[ ( $qwen_exl3 != 1 && $qwen_nvfp4 != 1 ) || $qwen_mtp != 1 ]] || mtp_depth=3
     family_args+=(--mtp "$(key SPECULATOR_DEPTH MTP "$mtp_depth")") ;;
 esac
 # SPECULATOR_DRAFTS: adaptive (default) or a fixed draft count per cycle
@@ -435,13 +453,13 @@ if [[ $family == qwen4 ]]; then
   done
 fi
 # POOL_TOKENS=auto (GLM 5.3, GLM 5.3 Flash, MiMo, Qwen, DeepSeek V4): the largest pool the GPUs hold after the
-# planner's remaining costs (up to 2M tokens).
-# GLM 5.3 and Qwen default to auto; Qwen's former 32768-token pool admitted
-# only seven 4096-output requests, below the default eight serving lanes.
-# DeepSeek V4 keeps its engine default.
-glm_default=""; [[ ! $family =~ ^(glm5|qwen4)$ ]] || glm_default=auto
-if [[ $family =~ ^(glm5|qwen4|deepseek_v4)$ && -n "$(get POOL_TOKENS "$glm_default")" ]]; then
-  pool="$(get POOL_TOKENS "$glm_default")"
+# planner's remaining costs (up to 2M tokens). Every family defaults to auto,
+# as its release cards ran; a number pins the pool. Qwen's former 32768-token
+# pool admitted only seven 4096-output requests, below the default eight
+# serving lanes; DeepSeek V4's former engine default was 262144 tokens (v2.0.0
+# cards: 650K-1.3M tokens with auto).
+if [[ $family =~ ^(glm5|qwen4|deepseek_v4)$ ]]; then
+  pool="$(get POOL_TOKENS auto)"
   if [[ "$pool" == auto ]]; then
     pool=0
   fi
