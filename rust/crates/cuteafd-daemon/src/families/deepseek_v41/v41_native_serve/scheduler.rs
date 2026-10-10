@@ -12,6 +12,7 @@ use crate::families::deepseek_v41::v41_requests::RequestBatch;
 use super::prefix::{ImageKeys, PrefixCache, SnapshotKind};
 use super::console;
 use super::copy_drafts::{self, CopyDrafter};
+use crate::shared::draft::clock::RoundClock;
 
 #[cfg(test)]
 pub(crate) fn exercise_distributed_decode<'t, 'd, 'a: 'd>(lib: &'a NativeLibrary,
@@ -1354,6 +1355,9 @@ fn single_lane_round<'w, 'a>(lib: &'a NativeLibrary, runtime: &tokio::runtime::R
         let r = active[slot].as_ref().unwrap();
         Ok((r.id, r.anchor, requests.cache().committed_end(r.lease)?, r.job.max_tokens-r.generated))
     }).collect::<Result<Vec<_>>>()?;
+    // The policy's clock brackets the draft call alone; `draft_us` below (the
+    // console's draft stage) still spans copy lookup and length selection.
+    let mut clock = RoundClock::at(started);
     let draft_start = Instant::now();
     let copies = copy_inputs(active, members, draft.as_deref().map_or(0, |d| d.max_verify_rows() - 1))?;
     let copied: Vec<bool> = copies.iter().map(Option::is_some).collect();
@@ -1363,7 +1367,7 @@ fn single_lane_round<'w, 'a>(lib: &'a NativeLibrary, runtime: &tokio::runtime::R
         draft.skip_copied(lane, &ids, !drafting.is_empty())?;
     }
     let drafted = if drafting.is_empty() { Vec::new() }
-        else if let Some(draft) = draft.as_deref_mut() { draft.propose(lib, lane, &drafting)? }
+        else if let Some(draft) = draft.as_deref_mut() { clock.draft(|| draft.propose(lib, lane, &drafting))? }
         else { drafting.iter().map(|r| vec![r.1]).collect() };
     let mut inputs = copy_drafts::merge(copies, drafted)?;
     let proposal = console::Proposal::capture(&inputs, console::live());
@@ -1437,7 +1441,7 @@ fn single_lane_round<'w, 'a>(lib: &'a NativeLibrary, runtime: &tokio::runtime::R
         }
         let layer_us = pass.captured_layer_us();
         observe_lane_round(draft.as_deref_mut(), capture_routes, lane, false, pass.captured_routes(),
-            &layer_us, active, members, &inputs, &accepted_inputs, &copied, started, draft_us);
+            &layer_us, active, members, &inputs, &accepted_inputs, &copied, &clock);
         if let Some(live) = live {
             live.push(console_round(tally, lane, false, started, draft_us, prepare_us, verified_us,
                 &layer_us, pass.captured_ffn_split(), active, members, &inputs, Some(&round)));
@@ -1480,7 +1484,7 @@ fn single_lane_round<'w, 'a>(lib: &'a NativeLibrary, runtime: &tokio::runtime::R
         }
         let layer_us = pass.captured_layer_us();
         observe_lane_round(draft.as_deref_mut(), capture_routes, lane, false, pass.captured_routes(),
-            &layer_us, active, members, &inputs, &accepted_inputs, &copied, started, draft_us);
+            &layer_us, active, members, &inputs, &accepted_inputs, &copied, &clock);
         if let Some(live) = live {
             live.push(console_round(tally, lane, false, started, draft_us, prepare_us, executed_us - prepared_us,
                 &layer_us, pass.captured_ffn_split(), active, members, &inputs, None));
@@ -1953,7 +1957,7 @@ pub(super) fn console_gauges(active: &[Option<Active<'_>>], requests: &Requests<
 fn observe_lane_round<'a, C: DraftChain<'a>>(draft: Option<&mut DraftRuntime<'_, 'a, C>>, capture_routes: bool,
     lane: usize, shared: bool, routes: &[Vec<[u32; 6]>], layer_us: &[Option<f64>],
     active: &[Option<Active<'a>>], members: &[usize], inputs: &[Vec<u32>], accepted: &[u32], copied: &[bool],
-    started: Instant, draft_us: u64,
+    clock: &RoundClock,
 ) {
     let Some(draft) = draft else { return };
     if !capture_routes { return; }
@@ -1961,7 +1965,7 @@ fn observe_lane_round<'a, C: DraftChain<'a>>(draft: Option<&mut DraftRuntime<'_,
         .filter_map(|(((&slot, input), &count), &copied)|
             active[slot].as_ref().map(|r| (r.id, input.len(), count, copied))).collect();
     if requests.len() != members.len() { return; }
-    draft.observe_round(lane, shared, routes, layer_us, &requests, started.elapsed().as_micros() as u64, draft_us);
+    draft.observe_round(lane, shared, routes, layer_us, &requests, clock.observe());
 }
 /// Resolve one finishing row's retained frontier from its downloaded bytes.
 ///

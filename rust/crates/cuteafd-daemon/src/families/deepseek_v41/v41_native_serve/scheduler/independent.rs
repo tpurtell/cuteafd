@@ -85,6 +85,7 @@ async fn lane<'a, P: VerificationTarget<'a>, C: DraftChain<'a>>(lane: usize, lib
                     .map(|(seed, _)| seed.0).collect();
                 draft.skip_copied(lane, &ids, !drafting.is_empty())?;
             }
+            let mut clock = RoundClock::at(started);
             let (drafted, draft_us) = if drafting.is_empty() { (Vec::new(), 0) } else { loop {
                 let proposed = {
                     let mut draft = draft.borrow_mut();
@@ -96,6 +97,8 @@ async fn lane<'a, P: VerificationTarget<'a>, C: DraftChain<'a>>(lane: usize, lib
                 // draft and transaction before retirement can recycle its slots.
                 tokio::task::yield_now().await;
             } };
+            // The polled draft times itself from issue to completion.
+            if !drafting.is_empty() { clock.drafted_us(draft_us); }
             let mut inputs = copy_drafts::merge(copies, drafted)?;
             let proposal = console::Proposal::capture(&inputs, console::live());
             let shared = active.borrow().iter().flatten().any(|r| r.lane != lane);
@@ -264,7 +267,7 @@ async fn lane<'a, P: VerificationTarget<'a>, C: DraftChain<'a>>(lane: usize, lib
                 let layer_us = pass.captured_layer_us();
                 observe_lane_round(draft.borrow_mut().as_deref_mut(), capture_routes, lane, shared,
                     pass.captured_routes(), &layer_us, &active.borrow(), &members, &inputs,
-                    &accepted_inputs, &copied, started, draft_us);
+                    &accepted_inputs, &copied, &clock);
                 if let Some(live) = live {
                     let active = active.borrow();
                     live.push(console_round(tally, lane, shared, started, draft_us,

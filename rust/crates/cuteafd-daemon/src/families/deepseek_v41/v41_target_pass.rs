@@ -146,7 +146,7 @@ impl<'w, 'a> TargetPass<'w, 'a> {
     /// Device time per layer (FFN finish to FFN finish) of the last captured
     /// pass; layer 0 has no predecessor.
     pub fn captured_layer_us(&self) -> Vec<Option<f64>> {
-        (0..40usize).map(|layer| layer.checked_sub(1).and_then(|previous| self.lane.layer_elapsed_us(previous, layer))).collect()
+        self.lane.layer_clock().read()
     }
     pub fn reserve_sparse_decode_rows(&mut self, rows: usize) -> Result<()> {
         self.lane.reserve_sparse_decode_rows(rows)

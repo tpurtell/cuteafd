@@ -243,8 +243,9 @@ impl<'w, 'a> DistributedTargetPass<'w, 'a> {
             let previous = layer.checked_sub(1)?;
             let (a, b) = (self.map.attention(previous).ok()?, self.map.attention(layer).ok()?);
             let lane = &self.lanes[b];
-            lane.device.run(|| Ok(if a == b { lane.layer_elapsed_us(previous, layer) }
-                else { lane.entry_elapsed_us(layer) })).ok().flatten()
+            let clock = lane.layer_clock();
+            lane.device.run(|| Ok(if a == b { clock.between(previous, layer) }
+                else { clock.since_entry(layer) })).ok().flatten()
         }).collect()
     }
     pub fn reserve_sparse_decode_rows(&mut self, rows: usize) -> Result<()> {

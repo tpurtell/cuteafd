@@ -2,6 +2,9 @@ use super::*;
 use crate::families::deepseek_v41::v41_dspark_cache::{DsparkWindow, WindowLease};
 use crate::families::deepseek_v41::v41_experts::dspark::{DsparkChain, DsparkMainContext, DsparkWeights};
 use crate::families::deepseek_v41::v41_requests::RequestBatch;
+use crate::shared::draft::binding::LaneRound;
+use crate::shared::draft::clock::RoundTimes;
+use crate::shared::draft::evidence::sigmoid;
 mod chain;
 mod policy;
 pub(crate) use policy::snapshot as policy_snapshot;
@@ -26,13 +29,10 @@ pub(crate) struct DraftRuntime<'w, 'a, C = DsparkChain<'w, 'a>> {
     fixed: bool,
     /// Online bandwidth-balance length policy, bound to the installed placement.
     policy: Option<cuteafd_core::DraftPolicy>,
-    /// The policy's predicted round time per lane, awaiting its observation.
-    predicted: [Option<f64>; 2],
     published: Option<Instant>,
-    /// Width drafted for each lane's current round (0: no draft ran).
-    lane_width: [usize; 2],
-    /// Whether each lane's last selection saw an active peer lane.
-    lane_shared: [bool; 2],
+    /// Per lane: the round's draft width, the last selection's regime and
+    /// prediction, and the route storage its observation reuses.
+    lanes: [LaneRound; 2],
 }
 struct DraftRequest {
     leases: [WindowLease; 3],
@@ -86,10 +86,8 @@ impl<'w, 'a> DraftRuntime<'w, 'a> {
             confidence_trace: Default::default(),
             fixed: false,
             policy: None,
-            predicted: [None; 2],
             published: None,
-            lane_width: [0; 2],
-            lane_shared: [false; 2],
+            lanes: std::array::from_fn(|_| LaneRound::new(policy::LAYERS, policy::TOPK)),
         })
     }
 }
@@ -159,10 +157,10 @@ impl<'w, 'a, C: DraftChain<'a>> DraftRuntime<'w, 'a, C> {
     /// or a fit still warming up).
     pub fn select_lengths(&mut self, lane: usize, requests: &[(u64, usize)], shared: bool)
         -> Result<Option<Vec<usize>>> {
-        ensure!(lane < self.predicted.len(), "invalid draft policy lane");
-        self.predicted[lane] = None;
-        self.lane_shared[lane] = shared;
-        let width = self.lane_width[lane];
+        let round = self.lanes.get_mut(lane).context("invalid draft policy lane")?;
+        round.predicted = None;
+        round.shared = shared;
+        let width = round.width;
         // Every request of the round copied: it has no dSpark lengths to choose.
         if requests.is_empty() { return Ok(None); }
         let Some(policy) = &mut self.policy else { return Ok(None) };
@@ -170,7 +168,7 @@ impl<'w, 'a, C: DraftChain<'a>> DraftRuntime<'w, 'a, C> {
             if maximum == 0 { return Ok(Vec::new()); }
             let logits = self.confidence_trace.get(&id).context("missing draft confidence")?;
             ensure!(maximum <= logits.len(), "draft confidence prefix exceeds output");
-            Ok(logits[..maximum].iter().map(|&x| policy::sigmoid(x)).collect::<Vec<_>>())
+            Ok(logits[..maximum].iter().map(|&x| sigmoid(x)).collect::<Vec<_>>())
         }).collect::<Result<Vec<_>>>()?;
         let candidates: Vec<_> = requests.iter().zip(&probabilities)
             .map(|(&(id, _), confidence)| cuteafd_core::DraftCandidate { id, confidence }).collect();
@@ -183,30 +181,32 @@ impl<'w, 'a, C: DraftChain<'a>> DraftRuntime<'w, 'a, C> {
                     expected_tokens=selection.expected_tokens, predicted_us=selection.predicted_us,
                     evaluated=selection.evaluated, selection_us=started.elapsed().as_micros() as u64,
                     "native length selection");
-                self.predicted[lane] = Some(selection.predicted_us);
+                self.lanes[lane].predicted = Some(selection.predicted_us);
                 Some(selection.lengths)
             }
             None => {
                 let ids: Vec<_> = requests.iter().map(|r| r.0).collect();
                 let full: Vec<_> = requests.iter().map(|r| r.1).collect();
-                self.predicted[lane] = policy.predict(shared, &ids, &full, width);
+                self.lanes[lane].predicted = policy.predict(shared, &ids, &full, width);
                 None
             }
         })
     }
     /// Feed one completed lane round to the policy. `requests` are (identity,
-    /// verifier rows, accepted inputs, copied) in lane order; `total_us` spans
-    /// draft start to commit. Observation problems are logged, never fatal.
+    /// verifier rows, accepted inputs, copied) in lane order; `times` span the
+    /// round start to its observation and the draft call alone. Observation
+    /// problems are logged, never fatal.
     pub fn observe_round(&mut self, lane: usize, shared: bool, routes: &[Vec<[u32; 6]>],
-        layer_us: &[Option<f64>], requests: &[(u64, usize, u32, bool)], total_us: u64, draft_us: u64) {
-        let predicted = self.predicted.get_mut(lane).and_then(Option::take);
-        let width = self.lane_width.get(lane).copied().unwrap_or(0);
-        let Some(policy) = &mut self.policy else { return };
-        if let Err(error) = policy::observe(policy, &self.confidence_trace, shared, routes, layer_us,
-            requests, total_us, draft_us, width, predicted) {
+        layer_us: &[Option<f64>], requests: &[policy::LaneRequest], times: RoundTimes) {
+        let Some(round) = self.lanes.get_mut(lane) else { return };
+        let Some(policy) = &mut self.policy else { round.predicted = None; return };
+        let predicted = round.predicted;
+        if let Err(error) = policy::observe(policy, &self.confidence_trace, round, shared, routes, layer_us,
+            requests, times) {
             tracing::warn!(%error, lane, "dSpark policy round observation skipped");
         }
-        tracing::debug!(target: "cuteafd::draft_policy", lane, shared, predicted_us=predicted, total_us,
+        tracing::debug!(target: "cuteafd::draft_policy", lane, shared, predicted_us=predicted,
+            total_us=times.total_us, draft_us=times.draft_us,
             rows=requests.iter().map(|r| r.1).sum::<usize>(), "native length policy observation");
         if self.published.is_none_or(|at| at.elapsed() >= std::time::Duration::from_millis(250)) {
             policy::publish(policy, self.draft_limit);
@@ -222,12 +222,12 @@ impl<'w, 'a, C: DraftChain<'a>> DraftRuntime<'w, 'a, C> {
             Some(policy) => {
                 let requests: Vec<_> = active.iter()
                     .map(|&(id, remaining)| (id, (remaining - 1).min(limit))).collect();
-                policy.choose_width(self.lane_shared[lane], &requests)
+                policy.choose_width(self.lanes[lane].shared, &requests)
             }
             None => maximum,
         };
         self.chains[chain].set_width(width)?;
-        self.lane_width[lane] = width;
+        self.lanes[lane].width = width;
         Ok(width)
     }
     pub fn release(&mut self, id: u64) -> Result<()> {
@@ -446,9 +446,9 @@ impl<'w, 'a, C: DraftChain<'a>> DraftRuntime<'w, 'a, C> {
     /// that did not draft, their accepted rows still reach every window through
     /// the batch commit, which reads the target's taps for every batch member.
     pub fn skip_copied(&mut self, lane: usize, copied: &[u64], drafting: bool) -> Result<()> {
-        ensure!(lane < self.lane_width.len(), "invalid draft lane");
+        ensure!(lane < self.lanes.len(), "invalid draft lane");
         for id in copied { self.confidence_trace.remove(id); }
-        if !drafting { self.lane_width[lane] = 0; }
+        if !drafting { self.lanes[lane].width = 0; }
         Ok(())
     }
 
@@ -500,7 +500,7 @@ impl<'w, 'a, C: DraftChain<'a>> DraftRuntime<'w, 'a, C> {
             .filter(|(_, (_, _, end, remaining))| *end >= 2 && *remaining > 1).collect();
         let outputs: Vec<_> = inputs.iter().map(|(_, anchor, _, _)| vec![*anchor]).collect();
         if active.is_empty() {
-            self.lane_width[lane] = 0;
+            self.lanes[lane].width = 0;
             return Ok(Some((outputs, started.elapsed().as_micros() as u64)));
         }
         let widths: Vec<_> = active.iter().map(|(_, (id, _, _, remaining))| (*id, *remaining)).collect();
@@ -586,7 +586,7 @@ impl<'w, 'a> DraftRuntime<'w, 'a> {
     pub fn propose(&mut self, lib: &'a NativeLibrary, lane: usize,
         inputs: &[(u64, u32, u64, usize)],
     ) -> Result<Vec<Vec<u32>>> {
-        ensure!(lane < self.lane_width.len(), "invalid draft lane");
+        ensure!(lane < self.lanes.len(), "invalid draft lane");
         ensure!(self.pending.iter().all(Option::is_none), "shared draft proposal still pending");
         ensure!(!inputs.is_empty() && inputs.len() <= 16, "invalid draft batch size");
         let mut seen = std::collections::BTreeSet::new();
@@ -600,7 +600,7 @@ impl<'w, 'a> DraftRuntime<'w, 'a> {
         let active: Vec<_> = inputs.iter().enumerate()
             .filter(|(_, (_, _, end, remaining))| *end >= 2 && *remaining > 1).collect();
         let mut outputs: Vec<_> = inputs.iter().map(|(_, anchor, _, _)| vec![*anchor]).collect();
-        if active.is_empty() { self.lane_width[lane] = 0; return Ok(outputs); }
+        if active.is_empty() { self.lanes[lane].width = 0; return Ok(outputs); }
         let widths: Vec<_> = active.iter().map(|(_, (id, _, _, remaining))| (*id, *remaining)).collect();
         let width = self.apply_width(lane, 0, &widths)?;
         let count = active.len();
