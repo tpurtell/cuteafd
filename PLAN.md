@@ -1918,6 +1918,10 @@ TJ: two key items, both urgent right after v2.0.0.
     - **Launcher:** `ATTENTION_PLACEMENT=context|layers|heads` (`heads` is
       today's replicated head split, kept for A/B). The solver charges each
       exactly, and a card records the choice.
+    - **Per-family default (TJ, 2026-10-10):** `context` wherever its
+      measured C1 is at least `layers`' C1 at the 2M pool on the family's max.
+      Otherwise that family defaults to `layers`. The quick A/B decides, and
+      the family's doc records the choice and its numbers.
     - **Order:** design first; then GLM 5.3 (the biggest win, and P9's
       ranges-vs-split choice becomes these options), then V4 Flash/Pro, then
       GLM Flash's DSA layers. V4.1 keeps its 20/20 ranges unless measured.
