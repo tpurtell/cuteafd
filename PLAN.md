@@ -4775,6 +4775,16 @@ for one request, `dspark_policy.rs:647`) is the allocator. Changes:
 | D4 | MiMo (DFlash + MTP block), then GLM 5.3 (shares the GLM binding), then Qwen (chain depth as the pre-draft action), then V4 (fixed-width binding first) | M, S, M, S | per family: the D2 card on its min/max |
 | D5 | Delete `CycleCost`, `Calibration`, `allocate`, the v2 buckets, `glm5/dflash_policy.rs` planning, per-family copy-length loops; `shared/draft_policy.rs` keeps `DraftHistory` and the trace path only | S | tests; failing ids unchanged |
 
+**Delete as you go (TJ, 2026-10-10).** The old per-family policies are ad
+hoc code, so they don't survive behind a switch:
+- **D3 / D4:** each family's port deletes that family's old policy path in
+  the same PR that makes `shared` its default, and the launcher rejects the
+  old key. No fallback onto `CycleCost` anywhere, including cold start:
+  priors are seeded from the geometry and resource classes.
+- **D5:** only removes what is left once no family uses it: `CycleCost`,
+  `Calibration`, `allocate` and the v2 buckets.
+- **The D2 `GLM5_FLASH_DRAFT_POLICY` switch** is temporary; it goes in D3.
+
 **D2 outcome (2026-10-10, work/v3-d2; opt-in `GLM5_FLASH_DRAFT_POLICY=shared`).**
 GLM Flash's geometry: 45 layers, 3 dense (`class: None`), 42 MoE layers
 `remote` (Spark) or `local` (coordinator FP8/EXL3), `slice_bytes` from
