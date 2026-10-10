@@ -3347,6 +3347,18 @@ not upstreams.
 
 ### Phase B: engine backend
 
+**Decisions (TJ, 2026-10-10: "Sure go ahead").** Phase B starts now on
+work/p0:
+- B1 (engine backend) goes first; the gateway routes mount in the serving
+  coordinator.
+- `--official-model-names` is on by default.
+- Per-model `json_schema` is advertised only after a probe passes.
+- B1's gate includes a live Codex WebSocket check.
+- Usage hooks (usage steps 2 and 3) run alongside, plus the C1 overhead A/B
+  that decides whether `--usage` defaults to on.
+- Then B2 and B5, the usage dashboard (steps 7 and 8), then B3, B4 and TTS.
+
+
 1. Add an `Engine` backend that builds the family's prompt from `TurnRequest`
    (reusing each family's chat template and tool syntax) and submits
    `NativeRequest`. Gate it on golden NLL / byte-exact replies against the
