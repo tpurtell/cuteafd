@@ -502,7 +502,7 @@ fn schedule(
     let markers = crate::shared::prefix::marker_ids(&loaded.snapshot, &MESSAGE_STARTS)?;
     let mut states: Vec<usize> = (0..engine.shape.sequences).rev().collect();
     let mut grammars = crate::shared::constraints::Compiler::new(
-        &loaded.library, loaded.snapshot.join("tokenizer.json"));
+        &loaded.library, loaded.snapshot.join("tokenizer.json"), engine.cfg.vocab_size);
     let mut active: Vec<Active<'_>> = Vec::new();
     let (mut requests, mut generated_total) = (0u64, 0u64);
     let chunk_limit = engine.prefill_capacity().min(engine.max_context);

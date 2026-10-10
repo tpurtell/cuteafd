@@ -1,4 +1,4 @@
-use crate::families::deepseek_v41::v41_native_serve::scores::{BatchScores, VOCAB};
+use crate::shared::token_io::ScoreRows;
 use anyhow::{ensure, Result};
 use cuteafd_api::openai::{NativeConstraint, NativeFailure};
 use cuteafd_ffi::{NativeLibrary, CuteafdXGrammarCompiler, CuteafdXGrammarGrammar,
@@ -19,8 +19,9 @@ pub(crate) struct Compiler<'a> {
     order: VecDeque<NativeConstraint>,
 }
 impl<'a> Compiler<'a> {
-    pub fn new(library: &'a NativeLibrary, tokenizer: PathBuf) -> Self {
-        Self::with_vocab(library, tokenizer, VOCAB, vec![STOP_TOKEN])
+    /// A compiler for a DeepSeek tokenizer: `vocab` logits per row, stop id 1.
+    pub fn new(library: &'a NativeLibrary, tokenizer: PathBuf, vocab: usize) -> Self {
+        Self::with_vocab(library, tokenizer, vocab, vec![STOP_TOKEN])
     }
 
     /// A compiler for another tokenizer: `vocab` logits per row and its stop ids.
@@ -192,7 +193,7 @@ impl State<'_> {
     pub fn prepare_verification_masks(&self, input: &[u32]) -> Result<Vec<Option<Vec<u32>>>> {
         self.branch_masks(input, input.len())
     }
-    pub fn select_verification(&self, scores: &BatchScores, offset: usize, input: &[u32]) -> Result<Vec<u32>> {
+    pub fn select_verification(&self, scores: &ScoreRows, offset: usize, input: &[u32]) -> Result<Vec<u32>> {
         self.prepare_verification_masks(input)?.iter().enumerate()
             .map(|(index, mask)| scores.select(offset + index, mask.as_deref()))
             .collect()
@@ -205,7 +206,7 @@ impl State<'_> {
     /// distribution.
     pub fn select_verification_sampled(
         &self,
-        scores: &BatchScores,
+        scores: &ScoreRows,
         offset: usize,
         input: &[u32],
         params: cuteafd_core::TargetSamplingParams,

@@ -21,6 +21,10 @@ use std::path::{Path, PathBuf};
 
 pub(crate) use crate::shared::memory::EmbedPlacement;
 
+#[path = "token_io/scores.rs"]
+pub(crate) mod scores;
+pub(crate) use scores::ScoreRows;
+
 /// Where next tokens are selected.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub(crate) enum SelectPlacement {

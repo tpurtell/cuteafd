@@ -1123,7 +1123,7 @@ mod sampler_wiring_tests {
                 bytes.extend_from_slice(&logit.to_ne_bytes());
             }
         }
-        crate::families::deepseek_v41::v41_native_serve::scores::BatchScores::new(bytes).unwrap()
+        crate::families::deepseek_v41::v41_native_serve::scores::BatchScores::new(VOCAB, bytes).unwrap()
     }
 
     fn wiring_library() -> Option<NativeLibrary> {
@@ -1235,7 +1235,7 @@ mod sampler_wiring_tests {
         let Some(fixture) = WiringWave::build(&plan, &arena, 7, vocab) else { return };
         let rows = fixture.rows;
         let dummy = 129_279u32;
-        let mut next = BatchScores::test_visible(&vec![dummy; rows], logit_bytes(&fixture.values))
+        let mut next = BatchScores::test_visible(crate::families::deepseek_v41::v41_native_serve::scores::VOCAB, &vec![dummy; rows], logit_bytes(&fixture.values))
             .unwrap();
         assert!(next.best.iter().all(|id| *id == dummy), "the fixture starts stale");
         let fallback: Vec<usize> = (0..rows)
@@ -1296,7 +1296,7 @@ mod sampler_wiring_tests {
         let ids: Vec<u32> = (0..rows).map(|row| {
             if row == 5 { dummy } else { sampled.ids[row] }
         }).collect();
-        let mut next = BatchScores::test_visible(&ids, logit_bytes(&fixture.values)).unwrap();
+        let mut next = BatchScores::test_visible(crate::families::deepseek_v41::v41_native_serve::scores::VOCAB, &ids, logit_bytes(&fixture.values)).unwrap();
         let round = SamplingRound { plan, arena, trace_rows: Vec::new() };
         let (device_rows, refused) = admit_device_rows(&round, &sampled).unwrap();
         assert_eq!(refused, vec![5], "the INTERNAL row is the refused set");
@@ -1389,7 +1389,7 @@ mod sampler_wiring_tests {
         let ids: Vec<u32> = (0..rows).map(|row| {
             if row == frontier { stale } else { row_argmax(&values, row, vocab) }
         }).collect();
-        let mut next = BatchScores::test_visible(&ids, logit_bytes(&values)).unwrap();
+        let mut next = BatchScores::test_visible(crate::families::deepseek_v41::v41_native_serve::scores::VOCAB, &ids, logit_bytes(&values)).unwrap();
         let round = SamplingRound { plan, arena, trace_rows: Vec::new() };
         resolve_fallback_rows(&mut next, &round, &[frontier]).unwrap();
         let draw = next.best[frontier];
@@ -2417,7 +2417,7 @@ mod sampler_device_tests {
         let fallback = round.fallback_rows(&refused);
         assert_eq!(fallback, vec![5]);
         let bytes5 = staged.download_row(5)?;
-        let mut next = sampled.with_full_logits(&[5], bytes5)?;
+        let mut next = sampled.with_full_logits(VOCAB, &[5], bytes5)?;
         crate::families::deepseek_v41::v41_native_serve::scheduler::resolve_fallback_rows(&mut next, &round, &fallback)?;
         assert_eq!(next.best[5], expected_fallback,
             "the fallback row commits the CPU draw");
@@ -2605,7 +2605,7 @@ mod sampler_device_tests {
         let fallback = round.fallback_rows(&refused);
         assert_eq!(fallback, vec![2], "the top_k = 300 row is the only fallback");
         let bytes = staged.download_row(2)?;
-        let mut next = sampled.with_full_logits(&[2], bytes)?;
+        let mut next = sampled.with_full_logits(VOCAB, &[2], bytes)?;
         resolve_fallback_rows(&mut next, &round, &fallback)?;
         let draw = next.best[2];
         let frontier_params = round.plan.params[2];

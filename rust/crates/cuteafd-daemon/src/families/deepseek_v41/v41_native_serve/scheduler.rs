@@ -218,7 +218,7 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
     mut prefixes: PrefixCache<'a>,
 ) -> Result<()> {
     let mut active: Vec<Option<Active<'a>>> = (0..args.concurrency).map(|_| None).collect();
-    let mut compiler = crate::shared::constraints::Compiler::new(lib, args.snapshot.join("tokenizer.json"));
+    let mut compiler = crate::shared::constraints::Compiler::new(lib, args.snapshot.join("tokenizer.json"), VOCAB);
     let mut id = 0u64;
     let mut closed = false;
     let mut pending: Option<admission::Pending> = None;
@@ -1188,10 +1188,10 @@ async fn execute_sampled_rows<'a>(pass: &mut TargetPass<'_, 'a>,
     let download: Vec<usize> = fallback.iter().copied().chain(round.trace_rows.iter().copied())
         .collect::<std::collections::BTreeSet<_>>().into_iter().collect();
     let next = if download.is_empty() {
-        BatchScores::from_sampled(&sampled, &round.plan.greedy)?
+        BatchScores::from_sampled(VOCAB, &sampled, &round.plan.greedy)?
     } else {
         let bytes = pass.download_sampled_rows(&sampled, &download).await?;
-        let mut next = sampled.with_full_logits(&download, bytes)?;
+        let mut next = sampled.with_full_logits(VOCAB, &download, bytes)?;
         resolve_fallback_rows(&mut next, round, &fallback)?;
         next
     };
@@ -1221,10 +1221,10 @@ async fn execute_shared_sampled_rows<'a, P: VerificationTarget<'a> + ?Sized>(
     let download: Vec<usize> = fallback.iter().copied().chain(round.trace_rows.iter().copied())
         .collect::<std::collections::BTreeSet<_>>().into_iter().collect();
     let next = if download.is_empty() {
-        BatchScores::from_sampled(&sampled, &round.plan.greedy)?
+        BatchScores::from_sampled(VOCAB, &sampled, &round.plan.greedy)?
     } else {
         let bytes = pass.download_sampled_rows(&sampled, &download).await?;
-        let mut next = sampled.with_full_logits(&download, bytes)?;
+        let mut next = sampled.with_full_logits(VOCAB, &download, bytes)?;
         resolve_fallback_rows(&mut next, round, &fallback)?;
         next
     };
@@ -1281,17 +1281,17 @@ async fn execute_logits<'a>(lib: &'a NativeLibrary, pass: &mut TargetPass<'_, 'a
     requests: &Requests<'a>, batch: &mut Option<RequestBatch>, transport: &mut NativeTp4Wave<'a>,
     capture_routes: bool, compact: bool,
 ) -> Result<BatchScores> {
-    let Some(batch) = batch else { return BatchScores::new(Vec::new()); };
+    let Some(batch) = batch else { return BatchScores::new(VOCAB, Vec::new()); };
     pass.set_route_capture(capture_routes);
     let result = async {
         let selected: Vec<_> = (0..batch.cache()?.positions().len()).collect();
         if compact {
-            return BatchScores::from_greedy(unsafe { pass.execute_greedy(requests, batch, transport, 0, &selected).await? });
+            return BatchScores::from_greedy(VOCAB, unsafe { pass.execute_greedy(requests, batch, transport, 0, &selected).await? });
         }
         let logits = unsafe { pass.execute(requests, batch, transport, 0, &selected).await? };
         let mut bytes = vec![0; logits.logits.bytes];
         lib.copy_d2h(&mut bytes, logits.logits)?;
-        BatchScores::new(bytes)
+        BatchScores::new(VOCAB, bytes)
     }.await;
     pass.set_route_capture(false);
     result
@@ -2052,7 +2052,7 @@ mod sampling_tests {
     /// position rather than the batch row.
     #[test]
     fn sample_target_rows_keys_draws_on_absolute_position() {
-        let batch = BatchScores::new(rows(5)).unwrap();
+        let batch = BatchScores::new(VOCAB, rows(5)).unwrap();
         let params =
             cuteafd_core::TargetSamplingParams::new(0.9, 0.97, Some(8), 0.02, 4242).unwrap();
         assert!(!params.is_greedy());
@@ -2099,7 +2099,7 @@ mod sampling_tests {
             status_detail: vec![0u32; 6],
             logits,
         };
-        let next = BatchScores::from_sampled(&sampled, &greedy).unwrap();
+        let next = BatchScores::from_sampled(VOCAB, &sampled, &greedy).unwrap();
 
         // The device path returns exactly K1's ids and must not invoke the CPU
         // selection, whose failure is the "requires full logits" error below.
@@ -2275,7 +2275,7 @@ mod sampling_tests {
         logits[5] = 4.0;
         logits[17] = 3.5;
         let expected = params.select_token(&logits, None, 900).unwrap() as u32;
-        let batch = BatchScores::new(logits.iter().flat_map(|value| value.to_ne_bytes()).collect())
+        let batch = BatchScores::new(VOCAB, logits.iter().flat_map(|value| value.to_ne_bytes()).collect())
             .unwrap();
         assert_eq!(batch.sample(0, None, plan.params[0], plan.position[0]).unwrap(), expected);
         // The position decides the draw: the seeded uniform at the row's own
@@ -2426,13 +2426,13 @@ mod sampling_tests {
     fn packed_frontier_retention_matches_the_downloaded_rule() {
         let logits: Vec<f32> = (0..VOCAB).map(|token| if token == 5 { 4.0 } else { -1.0 }).collect();
         let bytes: Vec<u8> = logits.iter().flat_map(|value| value.to_ne_bytes()).collect();
-        let batch = BatchScores::new(bytes).unwrap();
+        let batch = BatchScores::new(VOCAB, bytes).unwrap();
         // Greedy (Checked): the cross-check passes and the id is the argmax.
         let checked = retain_packed_frontier(&batch, 0, FrontierRetain::Checked, None).unwrap();
         assert_eq!(checked.select(None).unwrap(), 5);
         // A packed row whose stored draw is not the argmax must be retained
         // as-is under RecordedSample, and rejected under Checked.
-        let mut drawn = BatchScores::new(
+        let mut drawn = BatchScores::new(VOCAB,
             logits.iter().flat_map(|value| value.to_ne_bytes()).collect()).unwrap();
         drawn.best[0] = 7;
         assert_eq!(retain_packed_frontier(&drawn, 0, FrontierRetain::RecordedSample, None)

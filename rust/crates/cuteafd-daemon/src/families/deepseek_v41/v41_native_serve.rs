@@ -810,7 +810,7 @@ fn prefill<'a, P: PrefillTarget<'a>, C: DraftChain<'a>>(
     let result = (|| -> Result<TokenScores> {
         let bytes = runtime.block_on(unsafe { pass.prefill_logits(lib, requests, &mut batch,
             transport, &[rows as usize - 1], Some(&suffix)) })?;
-        let scores = TokenScores::new(bytes)?;
+        let scores = TokenScores::new(scores::VOCAB, bytes)?;
         ensure!(!job.events.is_closed(), "client disconnected");
         runtime.block_on(pass.commit_prefill(requests, &mut batch, draft, rows))?;
         Ok(scores)
@@ -921,7 +921,7 @@ fn score<'a, P: PrefillTarget<'a>, C: DraftChain<'a>>(lib: &'a NativeLibrary, ru
         if result.is_err() { pass.discard(&mut batch)?; }
         let bytes = result?;
         for (j, row) in bytes.chunks_exact(scores::ROW_BYTES).enumerate() {
-            probe.row(step.start + j + 1, &TokenScores::new(row.to_vec())?.logits()?);
+            probe.row(step.start + j + 1, &TokenScores::new(scores::VOCAB, row.to_vec())?.logits()?);
         }
     }
     let _ = job.events.send(Ok(InferenceChunk::Finish { finish_reason: InferenceFinishReason::Length }));
@@ -1006,7 +1006,7 @@ fn prefill_continuation<'a, P: PrefillTarget<'a>, C: DraftChain<'a>>(lib: &'a Na
         let result = (|| -> Result<TokenScores> {
             let bytes = runtime.block_on(unsafe { pass.prefill_logits(lib, requests, &mut batch, transport,
                 &[chunk.len() - 1], None) })?;
-            let scores = TokenScores::new(bytes)?;
+            let scores = TokenScores::new(scores::VOCAB, bytes)?;
             ensure!(!job.events.is_closed(), "client disconnected");
             runtime.block_on(pass.commit_prefill(requests, &mut batch, draft.as_deref_mut(), chunk.len() as u32))?;
             Ok(scores)
