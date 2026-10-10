@@ -25,7 +25,7 @@ withholds incidental performance numbers. Shared-arm parallel cards use one
 smoke scheduler; separately bound arms use independent smoke processes with
 disjoint lock sets. Simulated timings never enter
 medians or paired deltas. Results include JSON, a markdown table, hook logs,
-raw/corrected CUDA 50ms peaks (NVML sampler-context subtraction), worker ring
+raw/corrected CUDA 50ms peaks (NVML sampler-context subtraction). The memory probe holds about 550 MiB of CUDA context on each sampled GPU for the whole run, and the server's admission sees it: a card with `--probe memory` admits a smaller pool than a real launch (V4 Flash max 1.18M where the same plan gives more without the probe). Leave the memory probe off for pool and admission comparisons, and never compare pools across arms that differ in probing, worker ring
 ledger peaks and authenticated console stage events. Explicit probes fail
 rather than silently claim missing evidence. Pool admission and red-square
 image checks run after readiness, before the benchmark. Explicit `panels:`
