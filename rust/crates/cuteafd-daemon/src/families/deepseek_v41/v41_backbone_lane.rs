@@ -13,6 +13,7 @@ use crate::families::deepseek_v41::v41_sparse_attention::{AttentionRequest, Spar
 use crate::families::deepseek_v41::v41_target_embedding::TargetEmbedding;
 use anyhow::{ensure, Context, Result};
 use crate::families::deepseek_v41::v41_backbone_cache::CachePlacement;
+use crate::shared::draft::clock::LayerClock;
 use crate::shared::memory::device::{Device, DeviceOwner};
 mod placement;
 use cuteafd_ffi::{CuteafdDeviceBuffer, NativeLibrary};
@@ -521,45 +522,11 @@ pub(crate) struct BackboneLane<'w, 'a> {
     /// Host FFN stage times summed over the captured pass.
     ffn_split: FfnSplit,
     /// Timing events recorded on the FFN-finish stream while routes are
-    /// captured; consecutive events give each layer's device time.
-    layer_events: LayerEvents<'a>,
+    /// captured; consecutive marks give each layer's device time, and an
+    /// entry mark times the first layer after a GPU handoff.
+    layer_clock: LayerClock<'a>,
 }
 
-/// One timing event per layer, created on the lane's device.
-struct LayerEvents<'a> {
-    library: &'a NativeLibrary,
-    events: Vec<*mut std::ffi::c_void>,
-    recorded: Vec<bool>,
-    /// Recorded when a layer's input arrives from the other GPU, so the first
-    /// layer after a handoff has a same-GPU start.
-    entry: *mut std::ffi::c_void,
-    entry_layer: Option<usize>,
-}
-impl<'a> LayerEvents<'a> {
-    fn new(library: &'a NativeLibrary) -> Result<Self> {
-        let mut events = Vec::with_capacity(41);
-        for _ in 0..41 {
-            match library.cuda_event_create() {
-                Ok(event) => events.push(event),
-                Err(error) => {
-                    for &event in &events { let _ = unsafe { library.cuda_event_destroy(event) }; }
-                    return Err(error);
-                }
-            }
-        }
-        let entry = events.pop().expect("entry event");
-        Ok(Self { library, events, recorded: vec![false; 40], entry, entry_layer: None })
-    }
-}
-impl Drop for LayerEvents<'_> {
-    fn drop(&mut self) {
-        for &event in self.events.iter().chain([&self.entry]) {
-            if let Err(error) = unsafe { self.library.cuda_event_destroy(event) } {
-                tracing::error!(%error, "destroying layer timing event");
-            }
-        }
-    }
-}
 impl<'w, 'a> BackboneLane<'w, 'a> {
     pub fn workspace_bytes(library: &NativeLibrary, capacity: u32) -> Result<[usize; 6]> {
         ensure!(
@@ -614,7 +581,7 @@ impl<'w, 'a> BackboneLane<'w, 'a> {
             capture_routes: false,
             route_capture: Vec::new(),
             ffn_split: FfnSplit::default(),
-            layer_events: LayerEvents::new(weights.library)?,
+            layer_clock: LayerClock::new(weights.library, 40)?,
         })
     }
     fn enter(&mut self, expected: Phase) -> Result<()> {
@@ -972,8 +939,7 @@ impl<'w, 'a> BackboneLane<'w, 'a> {
             self.router.enable_small_graph_shapes();
             self.route_capture.resize_with(40, Vec::new);
             for rows in &mut self.route_capture { rows.clear(); }
-            self.layer_events.recorded.fill(false);
-            self.layer_events.entry_layer = None;
+            self.layer_clock.reset();
             self.ffn_split = FfnSplit::default();
         }
     }
@@ -991,49 +957,22 @@ impl<'w, 'a> BackboneLane<'w, 'a> {
     pub fn uses_peer_projection(&self) -> bool {
         self.dual_sparse.is_some() || self.tp2_query.is_some() || self.tp2_output.is_some()
     }
-    /// FFN completion instants of the captured pass, per layer.
-    /// Device time from layer `from`'s FFN finish to layer `to`'s, for a
-    /// captured pass whose work has completed.
-    pub fn layer_elapsed_us(&self, from: usize, to: usize) -> Option<f64> {
-        let events = &self.layer_events;
-        if !(*events.recorded.get(from)? && *events.recorded.get(to)?) { return None; }
-        unsafe { events.library.cuda_event_elapsed_ms(events.events[from], events.events[to]) }
-            .ok().map(|ms| f64::from(ms) * 1e3)
-    }
-    /// Device time from the handoff arrival of `layer` to its FFN finish.
-    pub fn entry_elapsed_us(&self, layer: usize) -> Option<f64> {
-        let events = &self.layer_events;
-        if events.entry_layer != Some(layer) || !*events.recorded.get(layer)? { return None; }
-        unsafe { events.library.cuda_event_elapsed_ms(events.entry, events.events[layer]) }
-            .ok().map(|ms| f64::from(ms) * 1e3)
-    }
+    /// Device time per layer of the captured pass, once its work completed.
+    pub fn layer_clock(&self) -> &LayerClock<'a> { &self.layer_clock }
     /// Mark the arrival of the current layer's input from the other GPU.
     pub(crate) fn record_layer_entry(&mut self) {
         if !self.capture_routes { return; }
-        let layer = self.layer;
-        let event = self.layer_events.entry;
-        if self.record_timing_event(event) { self.layer_events.entry_layer = Some(layer); }
-    }
-    fn record_timing_event(&self, event: *mut std::ffi::c_void) -> bool {
         let stream = self.block.finish_stream();
-        let library = self.layer_events.library;
-        if unsafe { library.cuda_event_record(event, stream) }.is_err() { return false; }
-        // Unchained passes drained this stream and later rebinds require it
-        // idle; the event completes at once, so wait for it here.
-        if !crate::shared::memory::chain::active() {
-            if let Err(error) = unsafe { library.cuda_event_synchronize(event) } {
-                tracing::warn!(%error, "layer timing event wait failed");
-            }
-        }
-        true
+        // SAFETY: the FFN-finish stream is live on this lane's device; marks
+        // are read only after the pass completes. Unchained passes drained
+        // this stream and later rebinds require it idle, so wait at once.
+        unsafe { self.layer_clock.mark_entry(self.layer, stream, !crate::shared::memory::chain::active()); }
     }
     fn record_layer_finish(&mut self) {
         if !self.capture_routes { return; }
-        let layer = self.layer;
-        let event = self.layer_events.events[layer];
-        if self.record_timing_event(event) {
-            self.layer_events.recorded[layer] = true;
-        }
+        let stream = self.block.finish_stream();
+        // SAFETY: as `record_layer_entry`.
+        unsafe { self.layer_clock.mark(self.layer, stream, !crate::shared::memory::chain::active()); }
     }
     pub fn route_capture_enabled(&self) -> bool { self.capture_routes }
     pub fn reserve_sparse_decode_rows(&mut self, rows: usize) -> Result<()> {

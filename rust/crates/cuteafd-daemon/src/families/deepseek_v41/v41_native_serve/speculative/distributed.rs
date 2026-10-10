@@ -31,7 +31,8 @@ impl<'w, 'a> DraftRuntime<'w, 'a, DistributedDsparkChain<'w, 'a>> {
                 requests: Default::default(), pending: vec![None; lane_count],
                 request_limit: requests as usize, draft_limit: 5, draft_width: weights.draft_width(),
                 confidence_trace: Default::default(), fixed: false, policy: None,
-                predicted: [None; 2], published: None, lane_width: [0; 2], lane_shared: [false; 2],
+                published: None,
+                lanes: std::array::from_fn(|_| LaneRound::new(policy::LAYERS, policy::TOPK)),
             })
         })
     }
