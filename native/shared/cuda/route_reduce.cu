@@ -1,5 +1,6 @@
 #include "cuteafd_experts.h"
 #include "expert_hidden.cuh"
+#include <algorithm>
 #include <atomic>
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
@@ -494,6 +495,35 @@ extern "C" int32_t cuteafd_finish_local_experts_async(const float* routed,
   else
     CUTEAFD_WITH_HIDDEN(cuteafd_expert_hidden(), finish_local<kHidden, 6><<<blocks, 256, 0, static_cast<cudaStream_t>(stream)>>>(routed,
         reinterpret_cast<const __nv_bfloat16*>(shared), reinterpret_cast<__nv_bfloat16*>(output), count));
+  return cudaGetLastError();
+}
+
+namespace {
+__global__ void sum_rtx_tp2_routes(const float* routes, float* sums,
+    uint64_t count, uint32_t hidden, uint32_t topk) {
+  for (uint64_t i = uint64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+       i < count; i += uint64_t(gridDim.x) * blockDim.x) {
+    const uint64_t base = (i / hidden) * topk * hidden + i % hidden;
+    float value = routes[base];
+    for (uint32_t route = 1; route < topk; ++route)
+      value = __fadd_rn(value, routes[base + uint64_t(route) * hidden]);
+    sums[i] = value;
+  }
+}
+}
+extern "C" int32_t cuteafd_sum_rtx_tp2_routes_async(const float* routes, float* sums,
+    uint32_t rows, uint32_t hidden, uint32_t topk, void* stream) {
+  if (!rows || rows > 4096 || !hidden || hidden > 16384 || !topk || topk > 256 ||
+      !routes || !sums || reinterpret_cast<uintptr_t>(routes) % 4 ||
+      reinterpret_cast<uintptr_t>(sums) % 4) return cudaErrorInvalidValue;
+  const uint64_t count = uint64_t(rows) * hidden;
+  const uint64_t input_bytes = count * topk * 4, output_bytes = count * 4;
+  if (reinterpret_cast<uintptr_t>(routes) > UINTPTR_MAX - input_bytes ||
+      reinterpret_cast<uintptr_t>(sums) > UINTPTR_MAX - output_bytes ||
+      overlaps(routes, input_bytes, sums, output_bytes)) return cudaErrorInvalidValue;
+  const auto blocks = static_cast<unsigned>(std::min<uint64_t>((count + 255) / 256, 4096));
+  sum_rtx_tp2_routes<<<blocks, 256, 0, static_cast<cudaStream_t>(stream)>>>(
+      routes, sums, count, hidden, topk);
   return cudaGetLastError();
 }
 
