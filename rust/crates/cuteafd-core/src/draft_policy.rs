@@ -676,6 +676,30 @@ impl DraftPolicy {
         Some(self.cost.predict(regime, rows as f64, ids.len() as f64, megabytes) + draft + self.bias[regime])
     }
 
+    /// Expected committed tokens and predicted lane µs of explicit `lengths`
+    /// for `candidates` after a draft of `width`, with the same calibrated
+    /// survival products and pricing [`select`](Self::select) uses; `None`
+    /// while the fit is warming up. Lets a binding compare its own reference
+    /// shape against the selection on equal terms.
+    pub fn evaluate(&mut self, shared: bool, candidates: &[DraftCandidate<'_>], lengths: &[usize], width: usize)
+        -> Option<(f64, f64)> {
+        if candidates.len() != lengths.len()
+            || candidates.iter().zip(lengths).any(|(c, &n)| n > c.confidence.len()) {
+            return None;
+        }
+        self.cost.usable_regime(self.regime(shared))?;
+        let mut expected = candidates.len() as f64;
+        for (c, &n) in candidates.iter().zip(lengths) {
+            let mut product = 1.;
+            for (position, &p) in c.confidence.iter().enumerate().take(n) {
+                product *= self.request_probability(c.id, position, self.calibrated(position, p));
+                expected += product;
+            }
+        }
+        let ids: Vec<_> = candidates.iter().map(|c| c.id).collect();
+        Some((expected, self.predict(shared, &ids, lengths, width)?))
+    }
+
     /// Choose draft lengths for one lane after a draft of `width`. Returns
     /// `None` while the fit is still warming up or in fixed mode; the caller
     /// then verifies every draft.
@@ -1075,6 +1099,25 @@ mod tests {
 
     fn truth() -> Truth {
         Truth { alpha: [600., 700.], beta: [8., 12.], us_per_mb: [0.9, 7.5], round: [9000., 250., 150.] }
+    }
+
+    #[test]
+    fn evaluate_prices_explicit_shapes_as_select_does() {
+        let mut policy = DraftPolicy::new(placement(5), false).unwrap();
+        let candidates = [DraftCandidate { id: 1, confidence: &[0.9, 0.8, 0.7, 0.6, 0.5] }];
+        assert_eq!(policy.evaluate(false, &candidates, &[3], 5), None, "cold fit");
+        let (truth, mut token) = (truth(), 0);
+        for round in 0..400 { let rows = 1 + round % 8; run_round(&mut policy, &truth, &mut token, rows, rows, None); }
+        let best = policy.select(false, &candidates, 5).unwrap().unwrap();
+        let (expected, us) = policy.evaluate(false, &candidates, &best.lengths, 5).unwrap();
+        assert!((expected - best.expected_tokens).abs() < 1e-9, "{expected} vs {best:?}");
+        assert!((us - best.predicted_us).abs() < 1e-6 * us, "{us} vs {best:?}");
+        // Any other shape is no better than the selection.
+        for n in 0..=5 {
+            let (e, t) = policy.evaluate(false, &candidates, &[n], 5).unwrap();
+            assert!(e / t <= best.expected_tokens / best.predicted_us + 1e-12, "{n}");
+        }
+        assert_eq!(policy.evaluate(false, &candidates, &[6], 5), None, "past the confidence");
     }
 
     #[test]

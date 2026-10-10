@@ -1,6 +1,8 @@
 //! GLM 5.3 Flash (glm5_next) on the generic engine: weights, the coordinator
 //! programs' layer chain, and the golden comparison command.
 pub(crate) mod dspark;
+pub(crate) mod draft_binding;
+mod draft_probe;
 pub(crate) mod engine;
 pub(crate) mod fp8;
 pub(crate) mod prefix;
