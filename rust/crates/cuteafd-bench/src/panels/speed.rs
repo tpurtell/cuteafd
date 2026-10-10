@@ -131,13 +131,6 @@ impl Panel for Concurrency {
 const REWRITE_SOURCE: &str = "ledger/money.py";
 const MIX_TOKENS: u64 = 256;
 
-/// Server totals of verification rounds and output tokens (cumulative).
-fn round_counters(client: &crate::client::Client) -> Option<(f64, f64)> {
-    let stats = client.stats().ok()?;
-    let t = &stats["totals"];
-    Some((t["verification_rounds"].as_f64()?, t["output_tokens"].as_f64()?))
-}
-
 impl Panel for DraftMix {
     fn id(&self) -> &'static str { "draft_mix" }
     fn title(&self) -> &'static str { "Draft mix" }
@@ -170,10 +163,10 @@ impl Panel for DraftMix {
             let prompt = format!("[{}] Rewrite this Python module exactly as it is, adding a one-line comment \
                 `# reviewed` at the very top and changing nothing else. Output only the code.\n\n```python\n{source}```",
                 nonce());
-            let before = round_counters(ctx.client);
+            let before = common::round_counters(ctx.client);
             let drafts = common::draft_counters(ctx.client);
             let chat = ctx.client.chat(plain(&prompt, 1600u64.min(ctx.max_output)), None).context("rewrite decode")?;
-            let after = round_counters(ctx.client);
+            let after = common::round_counters(ctx.client);
             let per_round = before.zip(after).and_then(|((r0, t0), (r1, t1))| (r1 > r0).then(|| (t1 - t0) / (r1 - r0)));
             rewrites.push(json!({"tok_s": chat.timing.decode_tok_s(), "tokens": chat.timing.completion_tokens,
                 "tokens_per_round": per_round,

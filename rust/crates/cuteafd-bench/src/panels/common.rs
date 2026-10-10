@@ -98,11 +98,22 @@ pub fn aggregate(results: &[Timed]) -> f64 {
     if end > start { tokens as f64 / (end - start) } else { 0.0 }
 }
 
-/// Draft counters the server publishes (V4.1 totals), for acceptance.
+/// Counters live under V4.1's `totals` or a generic family's `verify`.
+fn counter_pair(stats: &Value, first: &str, second: &str) -> Option<(f64, f64)> {
+    ["totals", "verify"].into_iter().find_map(|path| {
+        let counters = &stats[path];
+        Some((counters[first].as_f64()?, counters[second].as_f64()?))
+    })
+}
+
+/// Draft counters the server publishes, for acceptance.
 pub fn draft_counters(client: &Client) -> Option<(f64, f64)> {
-    let stats = client.stats().ok()?;
-    let t = &stats["totals"];
-    Some((t["drafted_tokens"].as_f64()?, t["accepted_drafts"].as_f64()?))
+    counter_pair(&client.stats().ok()?, "drafted_tokens", "accepted_drafts")
+}
+
+/// Verification rounds and tokens emitted by those rounds (not prefill).
+pub fn round_counters(client: &Client) -> Option<(f64, f64)> {
+    counter_pair(&client.stats().ok()?, "verification_rounds", "output_tokens")
 }
 
 /// Cumulative mapped-table counters; absence means this family has no mapped tables.
@@ -172,6 +183,21 @@ pub fn doublings(from: u64, max: u64) -> Vec<u64> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn counters_support_v41_totals_and_generic_verify_without_mixing_scopes() {
+        use serde_json::json;
+        for path in ["totals", "verify"] {
+            let mut stats = json!({});
+            stats[path] = json!({"verification_rounds": 10, "output_tokens": 25,
+                "drafted_tokens": 30, "accepted_drafts": 15});
+            assert_eq!(super::counter_pair(&stats, "verification_rounds", "output_tokens"), Some((10., 25.)));
+            assert_eq!(super::counter_pair(&stats, "drafted_tokens", "accepted_drafts"), Some((30., 15.)));
+        }
+        let incomplete = json!({"totals": {"verification_rounds": 10}, "verify": {"output_tokens": 25}});
+        assert_eq!(super::counter_pair(&incomplete, "verification_rounds", "output_tokens"), None);
+        assert_eq!(super::counter_pair(&json!({}), "drafted_tokens", "accepted_drafts"), None);
+    }
+
     #[test]
     fn mapped_intervals_preserve_histograms_and_label_lifetime_maxima() {
         use serde_json::json;

@@ -381,6 +381,8 @@ struct SharedPolicy {
     prior: super::draft_binding::Prior,
     observed: u64,
     skipped: u64,
+    trace: bool,
+    decision: Option<serde_json::Value>,
 }
 
 impl SharedPolicy {
@@ -409,7 +411,8 @@ impl SharedPolicy {
         let policy = cuteafd_core::DraftPolicy::seeded(geometry, super::draft_binding::seed())?;
         engine.arm_draft_probe(engine.decode_rows)?;
         let fp8_head = matches!(engine.draft_head(), super::super::glm5::dflash::TargetHead::Launch(_));
-        Ok(Self { policy, prior: drafter.draft_prior(fp8_head)?, observed: 0, skipped: 0 })
+        let trace = crate::shared::draft_policy::enabled("CUTEAFD_GLMF_DRAFT_TRACE");
+        Ok(Self { policy, prior: drafter.draft_prior(fp8_head)?, observed: 0, skipped: 0, trace, decision: None })
     }
 
     /// `p0` of the drafter's positions, then of an agreed copy's `extension`.
@@ -440,6 +443,18 @@ impl SharedPolicy {
                 tracing::debug!(%error, "draft policy round not observed");
             }
             None => self.skipped += 1,
+        }
+        if self.trace {
+            if let Some(mut decision) = self.decision.take() {
+                decision["outcomes"] = serde_json::json!(requests.iter().map(|r| serde_json::json!({
+                    "id": r.id, "rows": r.rows, "accepted": r.accepted, "source": format!("{:?}", r.source),
+                    "censor": r.censor.map(|c| format!("{c:?}")), "features": r.features,
+                })).collect::<Vec<_>>());
+                decision["round"] = serde_json::json!(self.observed + self.skipped);
+                decision["total_us"] = serde_json::json!(times.total_us);
+                decision["draft_us"] = serde_json::json!(times.draft_us);
+                tracing::info!(target: "cuteafd::draft_decision", decision = %decision, "GLM Flash draft decision");
+            }
         }
         tracing::debug!(target: "cuteafd::draft_policy", requests = requests.len(),
             rows = requests.iter().map(|r| r.rows).sum::<usize>(), predicted_us = ?predicted, total_us = times.total_us,
@@ -602,6 +617,13 @@ mod media_tests {
         assert_eq!(json["by_bucket"]["8"]["verify_ms_sum"], 22.5);
         assert_eq!(json["by_bucket"]["8"]["verify_ms_max"], 12.5);
         assert_eq!(json["by_real_rows"]["1"]["speculative_steps"], 0);
+        assert_eq!(json["verification_rounds"], 3);
+        assert_eq!(json["output_tokens"], 0);
+        stats.output_tokens = 9;
+        stats.drafted_tokens = 12;
+        stats.accepted_drafts = 6;
+        assert_eq!(stats.snapshot()["output_tokens"], 9);
+        assert_eq!(stats.snapshot()["accepted_drafts"], 6);
     }
 
     #[test]
@@ -753,12 +775,16 @@ struct VerifyBucket {
 struct VerifyStats {
     real: [VerifyBucket; WIDE_DECODE_ROWS + 1],
     bucket: [VerifyBucket; WIDE_DECODE_ROWS + 1],
+    output_tokens: u64,
+    drafted_tokens: u64,
+    accepted_drafts: u64,
 }
 
 impl Default for VerifyStats {
     fn default() -> Self {
         Self { real: [VerifyBucket::default(); WIDE_DECODE_ROWS + 1],
-            bucket: [VerifyBucket::default(); WIDE_DECODE_ROWS + 1] }
+            bucket: [VerifyBucket::default(); WIDE_DECODE_ROWS + 1],
+            output_tokens: 0, drafted_tokens: 0, accepted_drafts: 0 }
     }
 }
 
@@ -778,6 +804,9 @@ impl VerifyStats {
         let rows = self.real.iter().enumerate().filter(|(_, v)| v.steps > 0)
             .map(|(rows, value)| (rows.to_string(), value.steps)).collect::<std::collections::BTreeMap<_, _>>();
         serde_json::json!({"rows": rows, "by_real_rows": timing(&self.real), "by_bucket": timing(&self.bucket),
+            "verification_rounds": self.real.iter().map(|b| b.steps).sum::<u64>(),
+            "output_tokens": self.output_tokens, "drafted_tokens": self.drafted_tokens,
+            "accepted_drafts": self.accepted_drafts,
             "timing_scope": "serving verify plus token selection host wall; existing synchronization boundary; excludes draft and commit; cumulative attempts including errors"})
     }
 }
@@ -1336,6 +1365,10 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
                         limit, selector: draft.as_ref().is_some_and(|d| d.confidence.is_empty()), cold: a.drafts.cold() })
                     .collect();
                 let selection = super::draft_binding::select(&mut shared.policy, &candidates, drafted_width, verify_rows);
+                if shared.trace {
+                    shared.decision = Some(super::draft_binding::decision_trace(&mut shared.policy, &candidates,
+                        drafted_width, verify_rows, &selection));
+                }
                 predicted = selection.predicted;
                 selection.lengths
             }
@@ -1537,6 +1570,10 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
             }
             finished
         }).collect();
+        verify_stats.output_tokens += active.iter().zip(&before)
+            .map(|(a, &n)| a.history.len().saturating_sub(n) as u64).sum::<u64>();
+        verify_stats.drafted_tokens += verified.iter().map(|r| r.0.saturating_sub(1) as u64).sum::<u64>();
+        verify_stats.accepted_drafts += verified.iter().map(|r| r.1.saturating_sub(1) as u64).sum::<u64>();
         emit_s += timer.elapsed().as_secs_f64();
         let timer = Instant::now();
         if spec {

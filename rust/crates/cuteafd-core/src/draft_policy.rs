@@ -823,10 +823,22 @@ impl DraftPolicy {
         (hits + OUTCOME_PRIOR * calibrated) / (trials + OUTCOME_PRIOR)
     }
 
+    /// Conditional acceptance used for one request, exposed for opt-in decision
+    /// diagnostics. This does not advance calibration or route history.
+    pub fn probabilities(&self, candidate: DraftCandidate<'_>) -> Vec<f64> {
+        candidate.confidence.iter().enumerate().take(self.geometry.max_positions)
+            .map(|(position, &p)| self.request_probability(candidate.id, position, self.calibrated(position, p)))
+            .collect()
+    }
+
     /// Predicted lane µs for explicit lengths after a draft of `width`, if the
     /// fit is usable.
     pub fn predict(&mut self, shared: bool, ids: &[u64], lengths: &[usize], width: usize) -> Option<f64> {
         let regime = self.usable_regime(self.regime(shared))?;
+        Some(self.predict_regime(regime, ids, lengths, width))
+    }
+
+    fn predict_regime(&mut self, regime: usize, ids: &[u64], lengths: &[usize], width: usize) -> f64 {
         self.clear_counts();
         let mut megabytes = [0.; MAX_RESOURCE_CLASSES];
         for (index, (&id, &length)) in ids.iter().zip(lengths).enumerate() {
@@ -836,8 +848,8 @@ impl DraftPolicy {
         }
         let rows = ids.len() + lengths.iter().sum::<usize>();
         let draft = self.cost.draft_us(regime, ids.len() as f64, width > self.geometry.widths[0]);
-        Some(self.cost.predict(regime, rows as f64, ids.len() as f64, megabytes) + draft
-            + self.adjustment(regime, rows as f64, ids.len()))
+        self.cost.predict(regime, rows as f64, ids.len() as f64, megabytes) + draft
+            + self.adjustment(regime, rows as f64, ids.len())
     }
 
     /// Expected committed tokens and predicted lane µs of explicit `lengths`
@@ -851,7 +863,25 @@ impl DraftPolicy {
             || candidates.iter().zip(lengths).any(|(c, &n)| n > c.confidence.len()) {
             return None;
         }
-        self.usable_regime(self.regime(shared))?;
+        let regime = self.usable_regime(self.regime(shared))?;
+        self.evaluate_regime(regime, candidates, lengths, width)
+    }
+
+    /// Diagnostic evaluation including seed/physical priors before engagement.
+    /// It does not make those warming predictions usable for selection.
+    pub fn diagnostic_evaluate(&mut self, shared: bool, candidates: &[DraftCandidate<'_>], lengths: &[usize], width: usize)
+        -> Option<(f64, f64)> {
+        let regime = self.usable_regime(self.regime(shared)).unwrap_or(self.regime(shared));
+        self.evaluate_regime(regime, candidates, lengths, width)
+    }
+
+    fn evaluate_regime(&mut self, regime: usize, candidates: &[DraftCandidate<'_>], lengths: &[usize], width: usize)
+        -> Option<(f64, f64)> {
+        if candidates.len() != lengths.len()
+            || candidates.iter().zip(lengths).any(|(c, &n)| n > c.confidence.len()
+                || n > self.geometry.max_positions) {
+            return None;
+        }
         let mut expected = candidates.len() as f64;
         for (c, &n) in candidates.iter().zip(lengths) {
             let mut product = 1.;
@@ -861,7 +891,7 @@ impl DraftPolicy {
             }
         }
         let ids: Vec<_> = candidates.iter().map(|c| c.id).collect();
-        Some((expected, self.predict(shared, &ids, lengths, width)?))
+        Some((expected, self.predict_regime(regime, &ids, lengths, width)))
     }
 
     /// Choose draft lengths for one lane after a draft of `width`. Returns

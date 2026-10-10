@@ -940,6 +940,11 @@ if [[ $family == glm5_flash ]]; then
     on) trace_args+=(-e "CUTEAFD_GLMF_ROUTE_RING_CHECK=1") ;;
     *) echo "GLM5_FLASH_ROUTE_RING_CHECK must be on or off" >&2; exit 2 ;;
   esac
+  case "$(get GLM5_FLASH_DRAFT_TRACE off)" in
+    off) ;;
+    on) trace_args+=(-e "CUTEAFD_GLMF_DRAFT_TRACE=1") ;;
+    *) echo "GLM5_FLASH_DRAFT_TRACE must be on or off" >&2; exit 2 ;;
+  esac
   spec_tau="$(get GLM5_FLASH_SPEC_TAU)"
   if [[ -n "$spec_tau" ]]; then
     [[ "$spec_tau" =~ ^(0?[.][0-9]*[1-9][0-9]*|1([.]0*)?)$ ]] || { echo "GLM5_FLASH_SPEC_TAU must be in (0, 1]" >&2; exit 2; }
