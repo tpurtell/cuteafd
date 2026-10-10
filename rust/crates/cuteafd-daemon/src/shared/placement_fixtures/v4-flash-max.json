@@ -1,0 +1,25 @@
+{
+ "model": "deepseek-ai/DeepSeek-V4-Flash-0731",
+ "rtx": 2,
+ "sparks": 4,
+ "context": 1048576,
+ "onboard": "max",
+ "manifest": "~/.cache/cuteafd/builds/v4-placement/plans-input/flash-2-1048576/PROGRAMS.json",
+ "driver": "13.2",
+ "gpus": [
+  {
+   "total_bytes": 101973491712,
+   "admission_free_bytes": 93989876128,
+   "context_bytes": 590610432,
+   "module_bytes": 2097152
+  },
+  {
+   "total_bytes": 101970345984,
+   "admission_free_bytes": 97112037872,
+   "context_bytes": 598999040,
+   "module_bytes": 2097152
+  }
+ ],
+ "pool_tokens": 1323264,
+ "onboard_layers": 19
+}
