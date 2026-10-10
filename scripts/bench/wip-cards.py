@@ -767,7 +767,7 @@ def build_lock_mode(revision):
     return 'native-phase' if 'CUTEAFD_WIP_EXPORT_LOCKS' in text and 'CUTEAFD_WIP_EXPORT_LOCK_FILES' in native else 'legacy-full-build'
 
 
-def build_arms(items, arms, cards, state, task, dry):
+def build_arms(items, arms, cards, state, task, dry, seed='moa'):
     scopes = build_scopes(cards)
     for item in items:
         name, revision = item.split('=', 1)
@@ -788,7 +788,7 @@ def build_arms(items, arms, cards, state, task, dry):
         print('# build locking ' + name + ': ' + arm['build_lock_mode'])
         # Seed on an out-of-pool Spark; stage the sealed slot to the whole union.
         union = {h for card in cards for h in card.get('sparks', [])}
-        hosts = ['moa', *[h for h in HOSTS if h in union and h != 'moa']]
+        hosts = [seed, *[h for h in HOSTS if h in union and h != seed]]
         # Config validation admits 2/3/4/6 ranks, not arbitrary staging unions.
         if len(hosts) not in (2, 3, 4, 6):
             hosts += [h for h in HOSTS if h not in hosts][:6 - len(hosts)]
@@ -824,7 +824,8 @@ def build_arms(items, arms, cards, state, task, dry):
             print(shlex.join(cmd))
             if not dry:
                 if cmd[0] == 'flock':
-                    run(['flock', '-n', str(Path.home() / '.cache/cuteafd/moa.lock'), 'true'])
+                    # A refused probe means another job holds the seed Spark.
+                    run(['flock', '-n', str(Path.home() / f'.cache/cuteafd/{seed}.lock'), 'true'])
                     for host in ('raptor', *HOSTS):
                         marker = 'import pathlib,json; p=pathlib.Path.home()/".cache/cuteafd/builds"/' + repr(root.name) + '; p.mkdir(parents=True,exist_ok=True); m=p/".wip-card-owner.json"; owner=' + repr(dict(task=task, instance=arm['instance'])) + '; assert not m.exists() or json.loads(m.read_text())==owner; assert m.exists() or not any(p.iterdir()); m.write_text(json.dumps(owner))'
                         mark = ['python3', '-c', marker]
@@ -865,6 +866,7 @@ def main():
     parser.add_argument('--probe', action='append', default=[], metavar='CARD:image,memory,console')
     parser.add_argument('--expect-pool', action='append', default=[], metavar='CARD=N')
     parser.add_argument('--build', action='append', default=[], metavar='ARM=REV')
+    parser.add_argument('--seed-host', default='moa', choices=('rhea', 'moa'), help='out-of-pool Spark that compiles and seals --build arms (default moa)')
     parser.add_argument('--cleanup', action='store_true')
     parser.add_argument('--dry-run', action='store_true')
     parser.add_argument('--observe', type=Path, help=argparse.SUPPRESS)
@@ -946,7 +948,7 @@ def main():
                 raise ValueError('invalid Spark count')
             variant['sparks'] = [values.get(f'SPARK_{i}_HOST', card['sparks'][i] if i < len(card['sparks']) else HOSTS[i]) for i in range(count)]
             build_cards.append(variant)
-    build_arms(args.build, arms, build_cards, state, args.task, args.dry_run)
+    build_arms(args.build, arms, build_cards, state, args.task, args.dry_run, args.seed_host)
     key_file = state / 'api-key'
     if not key_file.exists():
         fd = os.open(key_file, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)

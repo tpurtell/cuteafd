@@ -158,6 +158,16 @@ def test_build_stages_union_identical_scopes_and_no_outer_gpu_lock(entry, tmp_pa
     assert scopes['CUTEAFD_WIP_EXPORT_LOCKS'] == 'on'
 
 
+def test_seed_host_moves_the_build_seed_off_moa(entry, tmp_path, monkeypatch):
+    arms = cards.arms_from(['base=b:s'])
+    monkeypatch.setattr(cards, 'build_lock_mode', lambda rev: 'native-phase')
+    cards.build_arms(['base=HEAD'], arms, [entry], tmp_path, 'task', True, 'rhea')
+    cfg = cards.config(tmp_path / 'build-base.config')
+    assert cfg['SPARK_0_HOST'] == 'rhea'
+    hosts = [cfg[f'SPARK_{i}_HOST'] for i in range(int(cfg['SPARK_COUNT']))]
+    assert hosts.count('rhea') == 1 and set(entry['sparks']) <= set(hosts)
+
+
 def test_legacy_build_lock_is_coarse_and_recorded(entry, tmp_path, monkeypatch, capsys):
     monkeypatch.setattr(cards, 'build_lock_mode', lambda rev: 'legacy-full-build')
     arms = cards.arms_from(['base=b:s'])
