@@ -310,7 +310,17 @@ impl Opened {
                 {name} (export_b12x_dsv4_aot.py qwen4 with the fork's fp8_only Qwen programs); rebuild the native \
                 library or run with checkpoint BF16 (--fp8-decode false --mtp-fp8-head false)"))?;
         }
-        programs.load_all()?;
+        // The family's own programs (`qwen4_*`), sampled as the runtime inventory: the image also carries
+        // every other family's modules, which Qwen never launches.
+        let selected = cuteafd_core::coordinator_programs::CoordinatorPrograms { family: "qwen4", split_family: None };
+        let device = self.library.cuda_get_device()?;
+        crate::shared::inventory::RuntimeInventory::measure(&self.library, &[device], |_| {
+            let (loaded, skipped) = programs.load_matching(|name| selected.contains(name))?;
+            tracing::info!(loaded, skipped, "Qwen programs loaded");
+            Ok(())
+        })?;
+        let manifest_json: Option<serde_json::Value> = std::fs::read(&args.manifest).ok()
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok());
         let stream = self.library.cuda_stream_create()?;
         let started = Instant::now();
         let layers = args.layers.unwrap_or(self.cfg.layers).min(self.cfg.layers);
@@ -368,7 +378,9 @@ impl Opened {
             Some(experts)
         } else { None };
         let pool_tokens = if budget_admission {
-            admission::pool_tokens(&self.library, args, &self.cfg, layers, model.mtp.is_some(), future_expert_bytes)?
+            admission::pool_tokens(&self.library, args, &admission::inputs(args, &self.cfg, layers, model.mtp.is_some(),
+                manifest_json.as_ref(), ple.as_ref().filter(|p| p.mapped().is_some()).map(|p| (p.row_bytes as u64, p.fp8)),
+                future_expert_bytes)?)?
         } else { args.pool_tokens };
         let max_context = crate::shared::context::pool_context("qwen4", args.max_context, automatic_context, pool_tokens, 256)?;
         let pages = pool_tokens.div_ceil(engine::PAGE_ROWS);

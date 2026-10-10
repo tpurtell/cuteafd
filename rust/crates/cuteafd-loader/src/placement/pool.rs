@@ -62,5 +62,6 @@ mod tests {
         assert_eq!((explicit.requested, explicit.floor), (Some(32_768), 32_768));
         assert_eq!(PoolPolicy::resolve(&[96 * gib], 131_072, Some(0), 256, true).floor, AGENTIC_FLOOR_TOKENS);
         assert_eq!(PoolPolicy::resolve(&[96 * gib], 131_072, Some(0), 256, true).requested, None);
+
     }
 }

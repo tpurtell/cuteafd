@@ -474,11 +474,11 @@ fi
 # prefill (the engine's default 0.2; 0 prefills whole prompts before the next
 # step). Keys left unset pass nothing (images older than the options run).
 [[ -z "$(get DECODE_SHARE)" ]] || family_args+=(--decode-share "$(get DECODE_SHARE)")
-# RTX_EXPERT_LAYERS (DeepSeek V4, the shared placement solver): unset or max
-# places the most whole routed-expert layers that still leave a 262K pool
-# (v2's experts-first policy), the pool taking the rest up to its target;
-# auto reserves the KV pool (2M PRO / 1M <=32 GB) first and fills what is left
-# (opt-in); N, N% or all fix the RTX-resident layers and the KV pool takes
+# RTX_EXPERT_LAYERS (DeepSeek V4, the shared placement solver): unset is auto
+# for Flash on one RTX and max otherwise (Pro, two RTX); max places the most whole routed-expert layers
+# that still leave a 262K pool (v2's experts-first policy), the pool taking the
+# rest up to its target; auto reserves the KV pool (2M PRO / 1M <=32 GB) first
+# and fills what is left; N, N% or all fix the RTX-resident layers and the KV pool takes
 # every remaining byte (refused below the compiled context). 0 leaves the
 # backbone experts on the Sparks. RTX_EXPERT_PEER=on lets EXL3 layers fill
 # GPU1 under the head split too (opt-in, not yet qualified).
@@ -994,7 +994,7 @@ if { [[ ( "$family" == mimo_v2 || "$family" == qwen4 || "$family" == glm5_flash 
    [[ "$family" == mimo_v2 && "$audio" != off ]]; then
   plan_rtx=1; ((head_split == 0)) || plan_rtx=2
   plan_pool="$(get POOL_TOKENS auto)"; [[ "$plan_pool" != auto ]] || plan_pool=0
-  plan_gib="${coordinator_budget:-95.5}"
+  plan_gib="${coordinator_budget:-94.97}"
   plan_draft_args=()
   if [[ "$family" == mimo_v2 ]]; then
     plan_draft_args+=(--concurrency "$(get CONCURRENCY "$default_concurrency")"

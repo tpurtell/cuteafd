@@ -178,17 +178,20 @@ def test_glm_serving_admits_and_precreates_all_reachable_workspaces():
     # Scoring (`--full-prefill-logits`) precreates the same lanes: a serial prefill runs in lane 0.
     scoring = source.split("pub fn prepare_scoring_prefill(", 1)[1].split("fn step_plan(", 1)[0]
     assert "self.prefill_lanes_of(rank, lanes)" in scoring and "self.workspace(" not in scoring
-    assert "WORKSPACE_RUNTIME_OVERHEAD_BYTES: u64 = 72 << 20" in source
+    # The per-workspace runtime allowance is the loader's shared definition; where the measured
+    # loaded code covers it (`placement::inventory::LOADED_CODE`) the reserve charges that instead.
+    graphs = (ROOT / "rust/crates/cuteafd-loader/src/serving_capacity/glmf_graphs.rs").read_text()
+    assert "WORKSPACE_RUNTIME_OVERHEAD_BYTES: u64 = 72 << 20" in graphs
     assert "measured/calibrated allowance is not exact cuBLAS allocator ownership" in source
     assert "kda.in[24896|12576,4096]" in source
     opening = (root / "glm5_flash/mod.rs").read_text().split("pub fn with_engine", 1)[1]
     admission = opening.index("planned_pool_tokens_with_reserves(")
     assert opening.index("workspace_reserve(") < admission
-    assert "extra + graph_extra + if args.full_prefill_logits { 0 } else { workspace_extra }" in opening
-    assert "workspace_bytes: args.full_prefill_logits.then_some(workspace)" in opening
+    assert 'loaded_code("glmf", "*", split, 0)' in opening and "pending_code(" in opening
+    assert "workspace_bytes: Some(workspace)" in opening
     assert opening.index("let mut scoring_dense") < admission
     assert "match scoring_dense.take()" in opening
-    assert "partial_exchange_reserve(" in opening
+    assert "glmf_graphs::peer_exchange_bytes(" in opening
     assert 'full_prefill_logits_bytes(' not in opening
     assert opening.index("engine.prepare_serving_workspaces()") < opening.index("let result = body(&engine)")
     assert opening.index("engine.prepare_scoring_prefill()") < opening.index("let result = body(&engine)")

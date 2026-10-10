@@ -144,6 +144,9 @@ pub(crate) async fn run_serve(args: ServeArgs) -> Result<()> {
         hub.clone(), api.serve(profile.clone(), &snapshot)?);
     let listener = tokio::net::TcpListener::bind(&args.listen).await?;
     cuteafd_bench::ready(&listener);
+    // The ready ledger (placement gate): one report at readiness, before any request captures
+    // lazy graphs or loads more code.
+    crate::shared::memory_report::log("ready");
     tracing::info!(listen = %args.listen, model = %profile.id, "Qwen 3.8 Flash Next API is ready");
     tokio::select! {
         served = axum::serve(listener, api.app(router, hub)

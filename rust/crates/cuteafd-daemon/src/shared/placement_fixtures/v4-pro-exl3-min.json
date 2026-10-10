@@ -1,0 +1,20 @@
+{
+ "model": "wrldsuksgo2mars/DeepSeek-V4-Pro-0813-EXL3-K2-calibrated-v1",
+ "rtx": 1,
+ "sparks": 4,
+ "context": 1048576,
+ "onboard": "auto",
+ "manifest": "~/.cache/cuteafd/builds/v4-placement/plans-input/pro-1-1048576/PROGRAMS.json",
+ "driver": "13.2",
+ "gpus": [
+  {
+   "total_bytes": 101973491712,
+   "admission_free_bytes": 69685338684,
+   "context_bytes": 588513280,
+   "module_bytes": 2097152
+  }
+ ],
+ "pool_tokens": 2097152,
+ "onboard_layers": 3,
+ "note": "launched on 0b90aeca, whose table lacked the dsv4 exl3 single row (pending 0); admission_free_bytes is the launch's raw free less this table's pending code 271719876 B (untracked at the sample 1039045376 B)"
+}

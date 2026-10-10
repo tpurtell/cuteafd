@@ -8,6 +8,7 @@
 //! now live here, once.
 use crate::families::deepseek_v4::DeepseekV4Config;
 use crate::placement::*;
+use crate::placement::inventory::GraphSet;
 use crate::serving_capacity::{deepseek_v4_cache_geometry, deepseek_v4_expert_cost, deepseek_v4_expert_exchange_bytes,
     deepseek_v4_headroom_bytes, deepseek_v4_layer_unit_bytes, deepseek_v4_peer_exchange_bytes, V4ExpertCost,
     V4WorkspaceRank};
@@ -15,9 +16,11 @@ use cuteafd_core::memory_layout::{Basis, Category};
 
 /// Prefill lanes of the V4 engine (`engine::PREFILL_LANES`).
 pub const PREFILL_LANES: u64 = 2;
-/// Runtime CUDA context + module allowance per role (1 GPU, lead, peer).
-pub const RUNTIME_BYTES: [u64; 3] = [gib(65), gib(60), gib(60)];
-/// Graph allowance per role.
+/// Lazily captured decode graphs per role (1 GPU, lead, peer): V4 keys its
+/// segment graphs by the exact compressed-table width, so the set grows with
+/// traffic after ready (rc3: +0.5-0.65 GiB Flash, +1.2-1.3 GiB Pro within a
+/// smoke run). Reserved as growth beside the pool, never part of the ready
+/// ledger (`inventory::GraphSet::budget`).
 pub const GRAPH_BYTES: [u64; 3] = [gib(35), gib(40), gib(25)];
 /// Step workspace allowance per role at 4096 prefill rows, used only when no
 /// program manifest gives the exact geometry.
@@ -72,6 +75,10 @@ pub struct V4Inputs<'a> {
     pub onboard: Onboard,
     /// Probe-only all-row logits on the lead GPU.
     pub full_prefill_logits: u64,
+    /// Per GPU, the measured code it holds at ready (`placement::inventory::loaded_code`, 0 without an
+    /// entry). Part of the baseline on both sides; on a PRO card the reserve envelope covers it
+    /// (it always did: the code loads after the runtime's sample), so it does not shrink the pool twice.
+    pub code_bytes: Vec<u64>,
 }
 
 /// Prefix mark slots of the V4 arena (`MarkArena::slots_for` over every
@@ -114,8 +121,8 @@ pub fn fixed_demands(inputs: &V4Inputs<'_>) -> Result<(Vec<Demand>, Vec<u64>, Ve
         let workspace = inputs.workspace.as_ref().and_then(|w| w.get(rank)).map(|w| w.fixed_device_bytes)
             .unwrap_or(WORKSPACE_BYTES[role] * inputs.prefill_rows / 4096) + intake;
         let headroom = if inputs.workspace.is_some() {
-            deepseek_v4_headroom_bytes(inputs.gpus[rank].0, inputs.reserve_bytes, workspace + exchange,
-                GRAPH_BYTES[role])
+            deepseek_v4_headroom_bytes(inputs.gpus[rank].0, inputs.reserve_bytes,
+                workspace + exchange + inputs.code_bytes.get(rank).copied().unwrap_or(0), GRAPH_BYTES[role])
         } else {
             inputs.reserve_bytes.saturating_sub(workspace + exchange + GRAPH_BYTES[role]).max(3 << 30)
         }.max(inputs.headroom_floor);
@@ -128,7 +135,7 @@ pub fn fixed_demands(inputs: &V4Inputs<'_>) -> Result<(Vec<Demand>, Vec<u64>, Ve
                 mul(cache.retained_mark_bytes, inputs.mark_slots, "V4 marks")?, Basis::Formula));
         }
         demands.push(Demand::new(gpu, Category::Workspace, "steps", workspace, basis));
-        demands.push(Demand::new(gpu, Category::Runtime, "graph allowance", GRAPH_BYTES[role], Basis::Estimated));
+        demands.push(GraphSet::budget(&[GRAPH_BYTES[role]]).demand(0).on(gpu));
         if gpus == 2 {
             demands.push(Demand::new(gpu, Category::Transport, "peer exchange",
                 deepseek_v4_peer_exchange_bytes(hidden, inputs.prefill_rows, inputs.decode_rows)
@@ -196,10 +203,33 @@ pub fn request(inputs: &V4Inputs<'_>) -> Result<PlacementRequest, PlacementError
     })
 }
 
-/// V4's default onboard until TP2 experts (P4): v2's experts-first policy.
-/// Pool first (`auto`) is opt-in: on the 1-RTX minimum configs it trades two
-/// RTX expert layers for the 2M pool, -5..6% C1 (v3-p1 A/B).
+/// The `LoadedCode::experts` key of a V4 catalog: EXL3 packages load their own modules (the
+/// coordinator holds dSpark and any RTX layers in them), native MXFP4 does not.
+pub fn code_experts(catalog: &crate::OfficialV41Catalog) -> &'static str {
+    if catalog.exl3().is_some() { "exl3" } else { "*" }
+}
+
+/// Each coordinator GPU's measured loaded code (`placement::inventory::LOADED_CODE`) for a V4
+/// model of hidden size `dim` with `experts` (`code_experts`) on `gpus` GPUs.
+pub fn code_bytes(dim: usize, experts: &str, gpus: usize) -> Vec<u64> {
+    let family = if dim == 4096 { "dsv4f" } else { "dsv4p" };
+    (0..gpus).map(|rank| crate::placement::loaded_code(family, experts, gpus == 2, rank as u8).map_or(0, |c| c.bytes))
+        .collect()
+}
+
+/// V4's experts-first policy (v2's default; `RTX_EXPERT_LAYERS=max`).
 pub const DEFAULT_ONBOARD: Onboard = Onboard::ExpertsFirst { pool_floor: crate::placement::EXPERTS_FIRST_POOL_FLOOR };
+
+/// V4's default onboard for a model of hidden size `dim` on `gpus`
+/// coordinator GPUs. Flash on one RTX: pool first (`auto`, the KV planning
+/// rule), which at measured inventory gives up one RTX layer (17 vs 18) for
+/// the 2M pool and holds C1 (v3-p2 matched A/B: 149.2 vs 149.6). Pro on one
+/// RTX keeps experts first: its one layer is 12.4 GiB and pool first costs
+/// C1 (3 vs 4 layers, 65.5 vs 74.8). Two RTX keep experts first until TP2
+/// experts (P4). `RTX_EXPERT_LAYERS=max` / `auto` select either on any layout.
+pub fn default_onboard(dim: usize, gpus: usize) -> Onboard {
+    if gpus == 1 && dim == 4096 { Onboard::Auto } else { DEFAULT_ONBOARD }
+}
 
 /// Whether routed layers may also live on GPU1: opted in, and only for EXL3
 /// packages (per-device executions). Native `rtx_backbone` binds each capacity
