@@ -241,6 +241,8 @@ fn step(
         mul(&[rows, c128_width, 4])?,
     ];
     let lane = sum("V4 lane allocations", &lane_allocations.map(|n| n.max(256)))?;
+    let lane = sum("V4 lane payload", &[lane,
+        if ranks == 2 { mul(&[rows, h, 4])?.max(256) } else { 0 }])?;
     let lane = sum(
         "V4 lane metadata",
         &[
@@ -259,10 +261,10 @@ fn step(
         mul(&[rows, cfg.index_n_heads as u64, 4])?,
         mul(&[rows, cfg.index_topk as u64, 4])?,
         scratch.index_topk_bytes,
-        lead(mul(&[rows, cfg.n_routed_experts as u64, 4])?),
-        lead(mul(&[rows, topk, 4])?),
-        lead(mul(&[rows, topk, 4])?),
-        lead(mul(&[rows, h + h / 32])?),
+        mul(&[rows, cfg.n_routed_experts as u64, 4])?,
+        mul(&[rows, topk, 4])?,
+        mul(&[rows, topk, 4])?,
+        mul(&[rows, h + h / 32])?,
         scratch.shared_bytes,
         4096,
         lead(mul(&[rows.min(64), cfg.vocab_size as u64, 4])?),
@@ -358,8 +360,8 @@ mod tests {
         };
         let flash =
             deepseek_v4_workspace_geometry(&config(false), 4096, 64, 131072, 2, scratch).unwrap();
-        assert_eq!(flash[0].device_bytes(1032).unwrap(), 3_597_309_872);
-        assert_eq!(flash[1].device_bytes(1032).unwrap(), 3_228_071_856);
+        assert_eq!(flash[0].device_bytes(1032).unwrap(), 3_732_576_176);
+        assert_eq!(flash[1].device_bytes(1032).unwrap(), 3_385_367_472);
         assert_eq!(flash[0].pool_unit_device_bytes, (4096 * 2 + 64) * 4);
         let pro = deepseek_v4_workspace_geometry(
             &config(true),
@@ -373,8 +375,8 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(pro[0].device_bytes(1032).unwrap(), 4_734_070_704);
-        assert_eq!(pro[1].device_bytes(1032).unwrap(), 4_076_894_128);
+        assert_eq!(pro[0].device_bytes(1032).unwrap(), 4_970_786_736);
+        assert_eq!(pro[1].device_bytes(1032).unwrap(), 4_350_948_272);
         assert_eq!(
             pro[0].device_bytes(1033).unwrap() - pro[0].device_bytes(1032).unwrap(),
             pro[0].pool_unit_device_bytes

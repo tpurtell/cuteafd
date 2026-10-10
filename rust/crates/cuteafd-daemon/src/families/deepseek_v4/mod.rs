@@ -364,19 +364,37 @@ pub(crate) fn with_engine<T>(
     let _ = held; // Prefix bytes were reserved before placement.
     let started = Instant::now();
     let stages = if args.dspark { engine.weights.dspark.as_ref().map_or(0, |d| d.stages.len()) } else { 0 };
-    for (rank, range) in placement.expert_ranges.iter().enumerate() {
-        let device = if rank == 0 { args.device } else { split_device.context("expert peer device")? };
-        let stream = if rank == 0 { stream } else { peer_stream.context("expert peer stream")?.1 };
-        let local = if skip { None } else { crate::shared::peer_split::on_device(&loaded.library, device,
-            args.device, || local::LocalExperts::load_range(&loaded.library, &args.native_lib, &loaded.catalog,
-                if rank == 0 { stages } else { 0 }, range.first..range.first + range.layers,
-                engine.decode_rows.max(engine.prefill_rows), usize::try_from(range.peak_bytes)?, stream))? };
-        ensure!(local.as_ref().map_or(0, |l| l.layers()) == range.layers,
-            "DeepSeek V4 GPU{rank} local expert allocation differs from admitted placement");
-        engine.install_local(rank, range.first, local)?;
+    let max_rows = engine.decode_rows.max(engine.prefill_rows);
+    let range = &placement.expert_ranges[0];
+    ensure!(split_device.is_none() || range.layers == 0,
+        "TP1 backbone layers are forbidden under a head split");
+    let local = if skip { None } else { local::LocalExperts::load_range(&loaded.library, &args.native_lib,
+        &loaded.catalog, stages, range.first..range.first + range.layers,
+        max_rows, usize::try_from(range.peak_bytes)?, stream)? };
+    ensure!(local.as_ref().map_or(0, |l| l.layers()) == range.layers,
+        "DeepSeek V4 TP1 allocation differs from admitted placement");
+    engine.install_local(local);
+    if let Some(tp2) = placement.tp2.as_ref().filter(|t| t.layers > 0 && !skip) {
+        use crate::shared::experts::rtx::{native::NativeTp2, exl3::Exl3Tp2, RtxExpertLayer};
+        use crate::shared::memory::device::Device;
+        let devices = [Device { library: &loaded.library, id: args.device },
+            Device { library: &loaded.library, id: split_device.context("TP2 needs a head split")? }];
+        let layers = tp2.first..tp2.first + tp2.layers;
+        let budgets = [usize::try_from(tp2.peak_bytes[0])?, usize::try_from(tp2.peak_bytes[1])?];
+        let ranks: [Box<dyn RtxExpertLayer>; 2] = if let Some(manifest) = loaded.catalog.exl3() {
+            let package = crate::shared::experts::exl3::aot_layout_directory(&args.native_lib,
+                manifest.decoder_tiers(), "rtx-tp2");
+            Exl3Tp2::load_pair(devices, &loaded.catalog, &package, layers.clone(), max_rows, budgets)?
+                .map(|rank| Box::new(rank) as Box<dyn RtxExpertLayer>)
+        } else {
+            [Box::new(NativeTp2::load(devices[0], &loaded.catalog, 0, layers.clone(), max_rows, budgets[0])?),
+             Box::new(NativeTp2::load(devices[1], &loaded.catalog, 1, layers.clone(), max_rows, budgets[1])?)]
+        };
+        ensure!(ranks.iter().all(|r| r.layers() == layers), "TP2 loaded layers differ from admitted placement");
+        engine.install_tp2(ranks)?;
     }
-    tracing::info!(local_per_gpu = ?placement.expert_ranges, elapsed_ms = started.elapsed().as_millis() as u64,
-        "DeepSeek V4 expert layers resident on coordinator GPUs");
+    tracing::info!(tp1 = ?placement.expert_ranges, tp2 = ?placement.tp2,
+        elapsed_ms = started.elapsed().as_millis() as u64, "DeepSeek V4 expert layers resident on coordinator GPUs");
     // Implicit Spark worlds: TP4 executors 1..=4, TP2 5..=6, TP3 7..=9, TP6 27..=32.
     let executors = (0..peers.len())
         .map(|rank| cuteafd_transport::expert::v41_spark_executor_id(peers.len(), rank))
@@ -404,7 +422,7 @@ pub(crate) fn with_engine<T>(
     }
     if args.full_prefill_logits { engine.prepare_scoring_prefill()?; }
     engine.warm_local_graphs()?;
-    engine.check_peer_wire(&mut transports, &runtime)?;
+    engine.check_routes(&mut transports, &runtime)?;
     let result = body(&engine, &mut transports, &runtime);
     if let Err(error) = &result {
         // Teardown may fail after a device fault and would otherwise hide this.

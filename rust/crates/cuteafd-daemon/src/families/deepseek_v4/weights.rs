@@ -143,8 +143,6 @@ pub(crate) struct WeightLoader<'a, 'p> {
 enum Share {
     /// Every rank holds the whole operand.
     All,
-    /// Rank 0 only (the router).
-    Lead,
     /// Rows split evenly (per tensor, concatenated): heads, wo groups, shared-expert intermediate.
     Rows,
     /// Columns split evenly: wo_b over the groups, the shared expert's w2 over the intermediate.
@@ -156,7 +154,6 @@ fn share(operand: &str) -> Share {
     match operand {
         "w_q" | "w_q_scale" | "attn_sink" | "wo_a" | "wo_a_scale" | "w13" | "w13_scale" => Share::Rows,
         "wo_b" | "wo_b_scale" | "w2" | "w2_scale" => Share::Cols,
-        "gate" => Share::Lead,
         _ => Share::All,
     }
 }
@@ -260,7 +257,7 @@ impl<'a> WeightLoader<'a, '_> {
                 let shape = self.catalog.tensor(name)?.metadata.shape.clone();
                 for (rank, part) in parts.iter_mut().enumerate() {
                     match kind {
-                        Share::All | Share::Lead => part.extend_from_slice(&raw),
+                        Share::All => part.extend_from_slice(&raw),
                         Share::Rows => {
                             ensure!(raw.len() % ranks == 0 && shape.first().is_some_and(|r| r % ranks == 0),
                                 "{name}: {shape:?} does not split by rows over {ranks} GPUs");
@@ -275,9 +272,6 @@ impl<'a> WeightLoader<'a, '_> {
                 }
             }
             for (rank, part) in parts.into_iter().enumerate() {
-                if kind == Share::Lead && rank > 0 {
-                    continue;
-                }
                 let allocation = self.on_rank(rank, |stream| match source.prep {
                     Prep::Raw => self.upload(&part),
                     Prep::Scale { n, k, groups } => {
@@ -298,9 +292,14 @@ impl<'a> WeightLoader<'a, '_> {
             let raw = self.read(&[format!("{prefix}.ffn.gate.tid2eid")])?;
             let ids = raw.chunks_exact(8).map(|b| i64::from_le_bytes(b.try_into().unwrap()))
                 .map(|id| i32::try_from(id).map(i32::to_le_bytes)).collect::<Result<Vec<_>, _>>()?;
-            operands[0].insert("gate.tid2eid", self.upload(ids.as_flattened())?);
+            for (rank, operands) in operands.iter_mut().enumerate() {
+                operands.insert("gate.tid2eid", self.on_rank(rank, |_| self.upload(ids.as_flattened()))?);
+            }
         } else {
-            operands[0].insert("gate.bias", self.tensor(&format!("{prefix}.ffn.gate.bias"))?);
+            let raw = self.read(&[format!("{prefix}.ffn.gate.bias")])?;
+            for (rank, operands) in operands.iter_mut().enumerate() {
+                operands.insert("gate.bias", self.on_rank(rank, |_| self.upload(&raw))?);
+            }
         }
         Ok(operands.into_iter().map(|operands| LayerWeights { ratio, hash, split: true, operands }).collect())
     }

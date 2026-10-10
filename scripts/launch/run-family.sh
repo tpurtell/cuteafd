@@ -480,12 +480,12 @@ fi
 # auto reserves the KV pool (2M PRO / 1M <=32 GB) first and fills what is left
 # (opt-in); N, N% or all fix the RTX-resident layers and the KV pool takes
 # every remaining byte (refused below the compiled context). 0 leaves the
-# backbone experts on the Sparks. RTX_EXPERT_PEER=on lets EXL3 layers fill
-# GPU1 under the head split too (opt-in, not yet qualified).
+# backbone experts on the Sparks. With two RTX every onboard mode uses TP2
+# halves; GPU1 whole-layer expert ranges are no longer supported.
 if [[ $serve == serve-dsv4 ]]; then
   local_layers="$(get RTX_EXPERT_LAYERS)"
   case "$(get RTX_EXPERT_PEER off)" in
-    on) family_args+=(--peer-expert-ranges) ;;
+    on) echo "GPU1 whole-layer expert ranges were replaced by TP2 halves (v3 P4); remove RTX_EXPERT_PEER" >&2; exit 2 ;;
     off) ;;
     *) echo "RTX_EXPERT_PEER must be on or off" >&2; exit 2 ;;
   esac
