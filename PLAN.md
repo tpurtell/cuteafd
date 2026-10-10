@@ -2767,6 +2767,26 @@ one definition:
 This replaces the 2M constants in `memory_report.rs` (`measured_pool_tokens`,
 `planned_pool_tokens`) and Qwen's admission.
 
+**P1 measured (2026-10-10): pool first costs V4 C1 until GPU1 holds experts.**
+Reserving the 2M pool first on one RTX moves expert layers to the Sparks.
+
+| card | pool | RTX layers | C1 vs p0 |
+|---|---|---|---|
+| Flash min | 521K -> 2.10M | 19 -> 17 | 0.939, 0.970 |
+| Pro min | 356K -> 2.10M | 5 -> 3 | 0.951 |
+| Flash max | 1.18M -> 2.10M | — | C1 0.979, C8 0.873 |
+
+So V4 keeps v2's experts-first default (`Onboard::ExpertsFirst`,
+`RTX_EXPERT_LAYERS=max`), resolved by the shared solver. Pool first (`auto`)
+and the GPU1 EXL3 ranges (`RTX_EXPERT_PEER=on`) are opt-in. The way to get
+both the 2M pool and the RTX experts is TP2 on two RTX (`P4`), not a
+different single-GPU split.
+
+Two latent bugs from b2f26af9's GPU1 ranges are inputs to `P3`/`P4`:
+- native `rtx_backbone` expert variants bind to the first CUDA device
+  (`cudaErrorInvalidDevice` on GPU1);
+- under two-lane prefill, the Pro EXL3 GPU1 ranges deadlock on `peer_wait`.
+
 **Two ways to fix the plan (TJ, 2026-10-10).** By default the KV pool is the
 fixed definition: reserve the pool target, then place expert layers in what
 is left. The solver also takes the inverse, for comparison benchmarking and
