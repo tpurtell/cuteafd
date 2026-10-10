@@ -2,14 +2,12 @@
 use super::*;
 use crate::families::deepseek_v41::v41_backbone_cache::CacheLease;
 use crate::families::deepseek_v41::v41_requests::RequestTokens;
+use crate::shared::prefill_pipeline::{ChunkPermit, PipelineOrder};
 use cuteafd_transport::ExpertV2SourceKind;
 use std::cell::RefCell;
-use tokio::sync::Notify;
 
 pub(super) struct EncoderFlow<'s, 'q, 'a> {
-    pub predecessor: Option<&'s [Notify; 20]>,
-    pub successor: Option<&'s [Notify; 20]>,
-    pub previous_commit: Option<&'s Notify>,
+    pub permit: &'s ChunkPermit<'s>,
     pub suffix: &'s RefCell<&'q mut DeviceOwner<'a, EncoderSuffix<'a>>>,
     pub keep_running: &'s dyn Fn() -> bool,
 }
@@ -67,18 +65,14 @@ impl<'w, 'a> DistributedTargetPass<'w, 'a> {
             complete: false,
         };
         let suffix = RefCell::new(suffix);
-        let published: Vec<[Notify; 20]> = (0..chunks.len())
-            .map(|_| std::array::from_fn(|_| Notify::new()))
-            .collect();
-        let reserved: Vec<Notify> = (0..chunks.len()).map(|_| Notify::new()).collect();
-        let committed: Vec<Notify> = (0..chunks.len()).map(|_| Notify::new()).collect();
+        let order = PipelineOrder::new(chunks.len(), 20);
         let [first, second] = transports;
         tokio::try_join!(
             biased;
             unsafe { self.encoder_stream_lane(0, &requests, lease, chunks, first, &suffix,
-                &published, &reserved, &committed, keep_running) },
+                &order, keep_running) },
             unsafe { other.encoder_stream_lane(1, &requests, lease, chunks, second, &suffix,
-                &published, &reserved, &committed, keep_running) },
+                &order, keep_running) },
         )?;
         guard.complete = true;
         Ok(())
@@ -91,17 +85,13 @@ impl<'w, 'a> DistributedTargetPass<'w, 'a> {
         chunks: &[&[u32]],
         transport: &mut DeviceOwner<'a, NativeTp4Wave<'a>>,
         suffix: &RefCell<&mut DeviceOwner<'a, EncoderSuffix<'a>>>,
-        published: &[[Notify; 20]],
-        reserved: &[Notify],
-        committed: &[Notify],
+        order: &PipelineOrder,
         keep_running: &dyn Fn() -> bool,
     ) -> Result<()> {
         for index in (parity..chunks.len()).step_by(2) {
-            if index != 0 {
-                reserved[index - 1].notified().await;
-            }
+            let permit = order.wait_reserve_turn(index).await;
             ensure!(keep_running(), "client disconnected");
-            let chunk = chunks[index];
+            let chunk = chunks[permit.index()];
             let mut batch = requests.borrow_mut().reserve_encoder(&[RequestTokens {
                 lease,
                 tokens: chunk,
@@ -114,12 +104,10 @@ impl<'w, 'a> DistributedTargetPass<'w, 'a> {
                 batch: &mut batch,
                 complete: false,
             };
-            reserved[index].notify_one();
+            permit.mark_reserved();
             let started = std::time::Instant::now();
             let flow = EncoderFlow {
-                predecessor: index.checked_sub(1).map(|i| &published[i]),
-                successor: (index + 1 < chunks.len()).then_some(&published[index]),
-                previous_commit: index.checked_sub(1).map(|i| &committed[i]),
+                permit: &permit,
                 suffix,
                 keep_running,
             };
@@ -154,7 +142,7 @@ impl<'w, 'a> DistributedTargetPass<'w, 'a> {
                 &[chunk.len() as u32],
             )?;
             guard.complete = true;
-            committed[index].notify_one();
+            permit.commit();
             crate::families::deepseek_v41::v41_native_serve::console::totals::prefill(chunk.len());
             crate::families::deepseek_v41::v41_native_serve::console::Prefill::done(crate::families::deepseek_v41::v41_native_serve::console::PrefillKind::Chunk,
                 parity, index, chunks.len(), chunk.len(), started);
