@@ -714,7 +714,7 @@ fn auto_cannot_flip_to_an_unqualified_executor_mode() {
 
 #[test]
 fn mixed_memory_flips_are_explicit_in_plan_and_summary() {
-    let mut req = request(2, 7 * UNIT / 2, 3, 4, Onboard::Auto);
+    let mut req = request(2, 15 * UNIT / 4, 3, 4, Onboard::Auto);
     req.pool_overhead = vec![0; 2];
     req.executor = CONTEXT;
     req.layers[0].kind = AttentionClass::Mla;
@@ -731,6 +731,13 @@ fn mixed_memory_flips_are_explicit_in_plan_and_summary() {
     assert_eq!(mixed.pool_tokens, 1024);
     assert_eq!(mixed.attention_by_kind, [(AttentionClass::Mla, AttentionPlacement::Context), (AttentionClass::Dsa, AttentionPlacement::Layers)]);
     assert!(mixed.summary().contains("mixed (Mla=context, Dsa=layers)"));
+    // If the Dsa flip alone reaches a smaller target, the earlier equal-pool
+    // Mla context stepping stone is pruned and adds no useless peer traffic.
+    req.pool.target = 768;
+    let pruned = solve(&req).unwrap();
+    assert_eq!(pruned.pool_tokens, 768);
+    assert_eq!(pruned.attention_by_kind, [(AttentionClass::Mla, AttentionPlacement::Heads), (AttentionClass::Dsa, AttentionPlacement::Layers)]);
+    assert_eq!(pruned.peer_row_bytes, 0);
 }
 
 

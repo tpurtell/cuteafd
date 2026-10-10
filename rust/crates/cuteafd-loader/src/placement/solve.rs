@@ -36,7 +36,7 @@ pub fn solve(request: &PlacementRequest) -> Result<Placement, PlacementError> {
             flips.retain(|(k, _)| *k != kind);
             flips.push((kind, mode));
             let trial = solve_once(request, &flips);
-            if trial.as_ref().is_ok_and(|p| p.pool_tokens >= request.pool.target) { return trial; }
+            if trial.as_ref().is_ok_and(|p| p.pool_tokens >= request.pool.target) { return prune_flips(request, &flips); }
             if let Ok(p) = &trial {
                 if p.pool_tokens >= kind_best { kind_best = p.pool_tokens; selected_flips = flips.clone(); }
             }
@@ -44,7 +44,32 @@ pub fn solve(request: &PlacementRequest) -> Result<Placement, PlacementError> {
         }
         flips = selected_flips;
     }
+    if let Ok(placement) = &best {
+        let chosen = placement.attention_by_kind.iter().copied().filter(|(_, mode)| *mode != request.executor.attention_default()).collect::<Vec<_>>();
+        if !chosen.is_empty() { return prune_flips(request, &chosen); }
+    }
     best
+}
+
+fn prune_flips(request: &PlacementRequest, flips: &[(AttentionClass, AttentionPlacement)]) -> Result<Placement, PlacementError> {
+    let mut flips = flips.to_vec();
+    let mut placement = solve_once(request, &flips)?;
+    loop {
+        let mut removed = false;
+        for i in 0..flips.len() {
+            let mut trial = flips.clone();
+            trial.remove(i);
+            if let Ok(candidate) = solve_once(request, &trial) {
+                if candidate.pool_tokens == placement.pool_tokens {
+                    flips = trial;
+                    placement = candidate;
+                    removed = true;
+                    break;
+                }
+            }
+        }
+        if !removed { return Ok(placement); }
+    }
 }
 
 fn solve_once(request: &PlacementRequest, flips: &[(AttentionClass, AttentionPlacement)]) -> Result<Placement, PlacementError> {
