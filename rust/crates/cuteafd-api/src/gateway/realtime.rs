@@ -620,6 +620,11 @@ impl Connection {
         turn.session = Some(session.id.clone());
         turn.tape = self.tape.clone();
         super::driver::account_request(&mut turn, usage.clone(), overrides, true);
+        if let Some(scope) = &usage {
+            // The turn as the backend sees it: the realtime log has no single wire request.
+            scope.log_request(|| serde_json::to_vec(&json!({"type":"realtime.turn","conversation_id":self.conversation_id,
+                "model":turn.requested_model,"instructions":turn.system,"tools":turn.tools,"items":turn.items})).unwrap_or_default().into());
+        }
         self.turn_usage = usage;
         drop(session);
         let has_audio=turn.items.iter().any(|i|matches!(i,Item::Message {content,..} if content.iter().any(|p|matches!(p,Part::Audio {..}))));
@@ -734,7 +739,8 @@ impl Connection {
         let Some(active) = self.active.as_mut() else {
             return vec![];
         };
-        if let Some(usage) = self.turn_usage.take() {
+        let usage = self.turn_usage.take();
+        if let Some(usage) = &usage {
             usage.tokens(active.usage.input_tokens.into(), active.usage.cached_input_tokens.into(),
                 active.usage.output_tokens.into(), active.usage.reasoning_tokens.into());
             if matches!(stop, Some(StopReason::Cancelled)) { usage.stop("cancelled"); }
@@ -742,6 +748,11 @@ impl Connection {
             usage.finished(if error.is_some() { 500 } else { 200 });
         }
         let events = active.finish_turn(stop, error);
+        if let Some(usage) = usage {
+            if let Some(done) = events.iter().rev().find(|e| e["type"] == "response.done") {
+                usage.log_response(|| serde_json::to_vec(&done["response"]).unwrap_or_default().into());
+            }
+        }
         self.sync_output().await;
         self.active.take();
         let mut session = self.session.lock().await;

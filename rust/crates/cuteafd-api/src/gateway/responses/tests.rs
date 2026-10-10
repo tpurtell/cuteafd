@@ -1286,5 +1286,55 @@ async fn websocket_continuation_keeps_additional_tools() {
         assert_eq!(turn.tools.iter().map(|t| t.name.as_str()).collect::<Vec<_>>(), vec!["functions.exec"], "tools on every turn");
     }
     ws.close(None).await.unwrap();
+
+/// Full-log capture through the Messages and Responses front ends (HTTP and WebSocket).
+#[tokio::test]
+async fn full_log_captures_messages_responses_and_websocket_turns() {
+    use crate::usage::{tests::logging_sink, Middleware, track};
+    use futures::SinkExt;
+    let script = || vec![text("answer"), done()];
+    let (router, backend, _) = app(vec![script(), script(), script(), script()]);
+    let (sink, tape) = logging_sink();
+    let router = router.layer(axum::middleware::from_fn_with_state(Middleware::new(sink.clone()), track));
+    let (status, _) = request(&router, "POST", "/v1/messages", json!({"model":"alias","max_tokens":10,"stream":true,
+        "messages":[{"role":"user","content":"hello"}]})).await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = request(&router, "POST", "/v1/responses", json!({"model":"alias","input":"hi","stream":true})).await;
+    assert_eq!(status, StatusCode::OK);
+    // Scripted retains turns (and their usage handles); the record emits when they drop.
+    backend.seen.lock().unwrap().clear();
+    let n = tape.0.lock().unwrap().len();
+    assert_eq!(n, 2);
+    assert_eq!(tape.request(0)["messages"][0]["content"], "hello");
+    assert!(tape.response_text(0).contains("message_start") && tape.response_text(0).contains("answer"));
+    assert!(tape.response_text(1).contains("response.completed"));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap(); });
+    let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/v1/responses")).await.unwrap();
+    for input in ["one", "two"] {
+        ws.send(tokio_tungstenite::tungstenite::Message::Text(
+            json!({"type":"response.create","model":"alias","input":input,"store":false}).to_string())).await.unwrap();
+        loop {
+            let m = tokio::time::timeout(std::time::Duration::from_secs(5), ws.next()).await.unwrap().unwrap().unwrap();
+            if m.to_text().unwrap().contains("\"response.completed\"") { break; }
+        }
+    }
+    ws.close(None).await.unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            backend.seen.lock().unwrap().clear();
+            if tape.0.lock().unwrap().len() >= 4 { break; }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }).await.unwrap();
+    let logs = tape.0.lock().unwrap().clone();
+    let turns = logs.iter().filter(|l| l.meta.protocol == "responses" && l.meta.route == "/v1/responses" && matches!(l.response, crate::usage_log::ResponsePayload::Object(_))).count();
+    assert_eq!(turns, 2, "one log record per WebSocket turn");
+    for (i, l) in logs.iter().enumerate().skip(2) {
+        assert_eq!(tape.request(i)["type"], "response.create");
+        let crate::usage_log::ResponsePayload::Object(b) = &l.response else { panic!("turn response") };
+        assert_eq!(serde_json::from_slice::<Value>(b).unwrap()["status"], "completed");
+    }
     server.abort();
 }

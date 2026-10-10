@@ -112,9 +112,12 @@ impl ApiPolicy {
         cuteafd_api::gateway::auth::GatewayAuth { key: self.key.clone() }
     }
     pub fn app(self, router: axum::Router, hub: Arc<cuteafd_api::openai::ConsoleHub>) -> axum::Router {
+        // Token text reaches only viewers holding the console cookie.
+        hub.set_gate(self.gate.clone());
         let (router, internal) = if self.bench {
             let bench = cuteafd_bench::Bench::global();
             bench.set_console(hub);
+            if let Some(store) = &self.usage { bench.set_usage(usage_toggle(store.clone())); }
             bench.set_api_key(self.key.clone().expect("validated benchmark key"));
             let witness = bench.clone();
             let internal: Arc<dyn Fn(&str, &axum::http::HeaderMap) -> bool + Send + Sync> = Arc::new(move |path, headers| {
@@ -123,14 +126,34 @@ impl ApiPolicy {
             });
             (cuteafd_bench::http::mount(router, bench), Some(internal))
         } else { (router, None) };
-        let router = if let Some(store) = &self.usage { cuteafd_usage::http::mount(router, store.clone(), self.gate.clone()) } else { router };
-        let router = self.gate.mount(router);
-        tracing::info!("console: protected views unlock through the launcher's link");
-        let router = router.layer(axum::middleware::from_fn_with_state(Auth { key: self.key, internal },
+        let router = self.mount_console(router);
+        let router = router.layer(axum::middleware::from_fn_with_state(Auth { key: self.key.clone(), internal },
             cuteafd_api::openai::auth::require_key));
+        self.track(router)
+    }
+    /// The cookie-gated usage routes, `/usage` and `/console/unlock`.
+    pub(crate) fn mount_console(&self, router: axum::Router) -> axum::Router {
+        let router = if let Some(store) = &self.usage { cuteafd_usage::http::mount(router, store.clone(), self.gate.clone()) } else { router };
+        tracing::info!("console: protected views unlock through the launcher's link");
+        self.gate.mount(router)
+    }
+    /// The outermost layer: request accounting and full-log capture.
+    pub(crate) fn track(self, router: axum::Router) -> axum::Router {
         if let Some(store) = self.usage {
             router.layer(axum::middleware::from_fn_with_state(cuteafd_api::usage::Middleware::new(store), cuteafd_api::usage::track))
         } else { router }
+    }
+}
+/// The bench page's include/skip switch for benchmark requests in usage history.
+fn usage_toggle(store: Arc<cuteafd_usage::Store>) -> cuteafd_bench::UsageToggle {
+    let read = store.clone();
+    cuteafd_bench::UsageToggle {
+        get: Arc::new(move || read.settings().record_bench),
+        set: Arc::new(move |record| {
+            let mut settings = store.settings();
+            settings.record_bench = record;
+            store.update_settings(settings).map_err(|e| e.to_string())
+        }),
     }
 }
 pub(crate) fn catch_scheduler_panic(work: impl FnOnce() -> anyhow::Result<()>) -> anyhow::Result<()> {

@@ -330,6 +330,32 @@ async fn events(State(bench): State<Arc<Bench>>) -> Response {
         .into_response()
 }
 
+/// Whether the usage history keeps benchmark requests (default: skip them).
+async fn usage(State(bench): State<Arc<Bench>>) -> Response {
+    match bench.usage.get() {
+        Some(toggle) => Json(json!({"record_bench": (toggle.get)(), "available": true})).into_response(),
+        None => Json(json!({"record_bench": false, "available": false})).into_response(),
+    }
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UsageSwitch {
+    record_bench: bool,
+}
+
+async fn set_usage(State(bench): State<Arc<Bench>>, body: Result<Json<UsageSwitch>, axum::extract::rejection::JsonRejection>) -> Response {
+    let Ok(Json(switch)) = body else {
+        return (StatusCode::BAD_REQUEST, Json(json!({"error": {"message": "expected {\"record_bench\": bool}", "type": "invalid_request_error"}}))).into_response();
+    };
+    let Some(toggle) = bench.usage.get().cloned() else { return not_found("usage history") };
+    match tokio::task::spawn_blocking(move || (toggle.set)(switch.record_bench).map(|()| (toggle.get)())).await {
+        Ok(Ok(record)) => Json(json!({"record_bench": record, "available": true})).into_response(),
+        Ok(Err(message)) => (StatusCode::BAD_REQUEST, Json(json!({"error": {"message": message, "type": "invalid_request_error"}}))).into_response(),
+        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": {"message": "usage settings unavailable", "type": "server_error"}}))).into_response(),
+    }
+}
+
 async fn require_control_key(State(bench): State<Arc<Bench>>, request: Request, next: Next) -> Response {
     if request.uri().path().starts_with("/v1/bench/") && !authorized(&bench, None, request.headers()) {
         return forbidden();
@@ -352,6 +378,7 @@ pub fn routes(bench: Arc<Bench>) -> Router {
         .route("/v1/bench/runs/:id/:file", get(run_file))
         .route("/v1/bench/import", post(import))
         .route("/v1/bench/events", get(events))
+        .route("/v1/bench/usage", get(usage).put(set_usage))
         .layer(axum::extract::DefaultBodyLimit::max(64 << 20))
         .with_state(bench.clone())
         .layer(axum::middleware::from_fn_with_state(bench, require_control_key))
@@ -365,6 +392,33 @@ pub fn mount(router: Router, bench: Arc<Bench>) -> Router {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn usage_switch_requires_the_key_and_round_trips() {
+        use tower::ServiceExt;
+        let bench = Bench::new(crate::store::Store::memory().unwrap());
+        bench.set_api_key(cuteafd_api::openai::auth::ApiKey::new("k").unwrap());
+        let value = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (get_v, set_v) = (value.clone(), value.clone());
+        bench.set_usage(crate::UsageToggle {
+            get: Arc::new(move || get_v.load(std::sync::atomic::Ordering::Relaxed)),
+            set: Arc::new(move |v| { set_v.store(v, std::sync::atomic::Ordering::Relaxed); Ok(()) }),
+        });
+        let app = routes(bench);
+        let call = |method: &str, key: Option<&str>, body: &str| {
+            let mut r = axum::http::Request::builder().method(method).uri("/v1/bench/usage").header("content-type", "application/json");
+            if let Some(k) = key { r = r.header("Authorization", format!("Bearer {k}")); }
+            app.clone().oneshot(r.body(Body::from(body.to_owned())).unwrap())
+        };
+        assert_eq!(call("PUT", None, r#"{"record_bench":true}"#).await.unwrap().status(), StatusCode::FORBIDDEN);
+        let r = call("GET", Some("k"), "").await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&axum::body::to_bytes(r.into_body(), 1024).await.unwrap()).unwrap();
+        assert_eq!(v, json!({"record_bench": false, "available": true}));
+        let r = call("PUT", Some("k"), r#"{"record_bench":true}"#).await.unwrap();
+        assert_eq!(r.status(), StatusCode::OK);
+        assert!(value.load(std::sync::atomic::Ordering::Relaxed));
+        assert_eq!(call("PUT", Some("k"), r#"{"record_bench":1}"#).await.unwrap().status(), StatusCode::BAD_REQUEST);
+    }
 
     #[tokio::test]
     async fn probe_preserves_typed_upstream_status_and_message() {

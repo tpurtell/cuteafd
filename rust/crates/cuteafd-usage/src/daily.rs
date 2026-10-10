@@ -118,6 +118,9 @@ mod tests {
     fn roll_sums_histograms_idempotence_and_ninety_day_expiry() {
         let clock = Arc::new(Clock(AtomicI64::new(10 * 86400000)));
         let store = Store::open_with(None, clock.clone(), 4096).unwrap();
+        let mut settings = store.settings();
+        settings.record_bench = true;
+        store.update_settings(settings).unwrap();
         for i in 0..100 {
             store.record(Record {
                 rid: format!("r{i}"),

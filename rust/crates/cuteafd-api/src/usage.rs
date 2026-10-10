@@ -6,6 +6,7 @@ use axum::{
     middleware::Next,
     response::Response,
 };
+use crate::usage_log::{loggable, FrameTee, LogRecord, LogSink, ResponsePayload, REQUEST_CAP, RESPONSE_CAP};
 use http_body::{Body as _, Frame, SizeHint};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -51,6 +52,8 @@ pub struct Record {
     pub t_admit_ms: Option<f64>,
     pub t_ttft_ms: Option<f64>,
     pub t_total_ms: Option<f64>,
+    /// Engine retirement (last token), from arrival; decode time is retire − first token.
+    pub t_retire_ms: Option<f64>,
     pub prefill_tps: Option<f64>,
     pub decode_tps: Option<f64>,
     pub concurrency_http: Option<u64>,
@@ -71,12 +74,15 @@ pub struct Counters {
     pub log_dropped: AtomicU64,
     pub db_bytes: AtomicU64,
     pub log_bytes: AtomicU64,
+    pub media_bytes: AtomicU64,
+    pub media_files: AtomicU64,
 }
 impl Counters {
     pub fn snapshot(&self) -> serde_json::Value {
         serde_json::json!({"recorded": self.recorded.load(Relaxed), "dropped": self.dropped.load(Relaxed),
             "log_recorded": self.log_recorded.load(Relaxed), "log_dropped": self.log_dropped.load(Relaxed),
-            "db_bytes": self.db_bytes.load(Relaxed), "log_bytes": self.log_bytes.load(Relaxed)})
+            "db_bytes": self.db_bytes.load(Relaxed), "log_bytes": self.log_bytes.load(Relaxed),
+            "media_bytes": self.media_bytes.load(Relaxed), "media_files": self.media_files.load(Relaxed)})
     }
 }
 pub trait UsageSink: Send + Sync + 'static {
@@ -84,6 +90,10 @@ pub trait UsageSink: Send + Sync + 'static {
     fn counters(&self) -> &Counters;
     fn client_ip(&self) -> bool {
         false
+    }
+    /// The full-log tier, when this sink has one.
+    fn log_sink(&self) -> Option<Arc<dyn LogSink>> {
+        None
     }
 }
 /// Handler-owned metadata only. No payload or headers can be attached here.
@@ -104,6 +114,12 @@ pub struct Details {
 struct Inner {
     record: Record,
     sink: Arc<dyn UsageSink>,
+    /// Present only while the full log is on and this protocol is loggable.
+    log: Option<Arc<dyn LogSink>>,
+    /// The full-log store, passed to WebSocket turn children.
+    log_sink: Option<Arc<dyn LogSink>>,
+    log_request: OnceLock<(Vec<Bytes>, bool)>,
+    log_response: OnceLock<ResponsePayload>,
     start: Instant,
     details: OnceLock<Details>,
     status: AtomicU64,
@@ -132,9 +148,21 @@ pub struct UsageHandle(Arc<Inner>);
 pub type UsageScope = UsageHandle;
 impl UsageHandle {
     pub fn new(record: Record, sink: Arc<dyn UsageSink>) -> Self {
+        let log_sink = sink.log_sink();
+        Self::with_log(record, sink, log_sink)
+    }
+    /// A scope that also captures payloads when `log` is on for its protocol.
+    fn with_log(record: Record, sink: Arc<dyn UsageSink>, log_sink: Option<Arc<dyn LogSink>>) -> Self {
+        let log = log_sink
+            .clone()
+            .filter(|l| loggable(&record.protocol) && l.enabled() && (!record.bench || l.bench()));
         Self(Arc::new(Inner {
             record,
             sink,
+            log,
+            log_sink,
+            log_request: OnceLock::new(),
+            log_response: OnceLock::new(),
             start: Instant::now(),
             details: OnceLock::new(),
             status: AtomicU64::new(0),
@@ -160,6 +188,22 @@ impl UsageHandle {
     }
     pub fn rid(&self) -> &str {
         &self.0.record.rid
+    }
+    /// True when this scope captures payloads for the full log.
+    pub fn logging(&self) -> bool {
+        self.0.log.is_some()
+    }
+    /// The turn's request as one JSON document (WebSocket front ends).
+    pub fn log_request(&self, body: impl FnOnce() -> Bytes) {
+        if self.0.log.is_some() {
+            let _ = self.0.log_request.set((vec![body()], false));
+        }
+    }
+    /// The turn's final response object (WebSocket front ends).
+    pub fn log_response(&self, body: impl FnOnce() -> Bytes) {
+        if self.0.log.is_some() {
+            let _ = self.0.log_response.set(ResponsePayload::Object(body()));
+        }
     }
     pub fn details(&self, details: Details) {
         let _ = self.0.details.set(details);
@@ -208,7 +252,7 @@ impl UsageHandle {
         record.ts_ms = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as i64;
         record.protocol = protocol.into();
         record.bytes_in = None;
-        let child = Self::new(record, self.0.sink.clone());
+        let child = Self::with_log(record, self.0.sink.clone(), self.0.log_sink.clone());
         child.0.status.store(200, Relaxed);
         child
     }
@@ -288,6 +332,7 @@ impl Drop for Inner {
             r.rounds = Some(self.rounds.load(Relaxed));
         }
         r.t_total_ms = Some(self.start.elapsed().as_secs_f64() * 1000.);
+        r.t_retire_ms = self.retired.get().copied();
         r.t_ttft_ms = self.first.get().copied();
         r.t_queue_ms = self.queue.get().copied();
         if let Some(&(ms, active)) = self.admit.get() {
@@ -325,6 +370,18 @@ impl Drop for Inner {
             }
         }
         .into();
+        if let Some(log) = self.log.take() {
+            let (request, request_truncated) = self.log_request.take().unwrap_or_default();
+            let unauthenticated = matches!(r.status, 401 | 403);
+            if !request.is_empty() && !unauthenticated {
+                log.record_log(LogRecord {
+                    meta: r.clone(),
+                    request,
+                    request_truncated,
+                    response: self.log_response.take().unwrap_or_default(),
+                });
+            }
+        }
         self.sink.record(r);
     }
 }
@@ -384,8 +441,18 @@ impl Middleware {
         }
     }
 }
+/// The dashboards' own polling and static assets: recording them would make
+/// the history mostly the viewer watching itself.
+fn self_traffic(path: &str) -> bool {
+    path == "/" || path == "/usage" || path == "/bench" || path.starts_with("/assets/")
+        || path.starts_with("/console/usage/") || path.starts_with("/v1/console") || path.starts_with("/v1/bench/")
+        || path == "/health" || path == "/bench/banner.js"
+}
 pub async fn track(State(state): State<Middleware>, mut request: Request, next: Next) -> Response {
     let path = request.uri().path().to_owned();
+    if self_traffic(&path) {
+        return next.run(request).await;
+    }
     // Queries (including the unlock token), auth headers and payloads never enter Record.
     let protocol = match path.as_str() {
         "/v1/chat/completions" => "chat",
@@ -440,6 +507,14 @@ pub async fn track(State(state): State<Middleware>, mut request: Request, next: 
         state.sink.clone(),
     );
     request.extensions_mut().insert(scope.clone());
+    if scope.logging() {
+        // One refcount per body frame; parsing and redaction run on the log writer.
+        let (parts, body) = request.into_parts();
+        request = Request::from_parts(
+            parts,
+            Body::new(TeeBody { body: Box::pin(body), tee: FrameTee::default(), scope: scope.clone() }),
+        );
+    }
     let mut response = next.run(request).await;
     if path == "/v1/stats" && response.status().is_success() {
         let (parts, body) = response.into_parts();
@@ -463,19 +538,64 @@ pub async fn track(State(state): State<Middleware>, mut request: Request, next: 
         .status
         .store(response.status().as_u16().into(), Relaxed);
     let (parts, body) = response.into_parts();
+    let tee = scope.logging().then(|| {
+        let sse = parts
+            .headers
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| v.starts_with("text/event-stream"));
+        (FrameTee::default(), sse)
+    });
     Response::from_parts(
         parts,
         Body::new(TrackedBody {
             body: Box::pin(body),
             scope,
             inflight: state.inflight,
+            tee,
         }),
     )
+}
+/// Clones request frames for the full log as the handler reads them.
+struct TeeBody {
+    body: Pin<Box<Body>>,
+    tee: FrameTee,
+    scope: UsageHandle,
+}
+impl http_body::Body for TeeBody {
+    type Data = Bytes;
+    type Error = axum::Error;
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, axum::Error>>> {
+        let result = self.body.as_mut().poll_frame(cx);
+        if let Poll::Ready(Some(Ok(frame))) = &result {
+            if let Some(bytes) = frame.data_ref() {
+                self.tee.push(bytes, REQUEST_CAP);
+            }
+        }
+        result
+    }
+    fn is_end_stream(&self) -> bool {
+        self.body.is_end_stream()
+    }
+    fn size_hint(&self) -> SizeHint {
+        self.body.size_hint()
+    }
+}
+impl Drop for TeeBody {
+    fn drop(&mut self) {
+        let tee = std::mem::take(&mut self.tee);
+        let _ = self.scope.0.log_request.set((tee.frames, tee.truncated));
+    }
 }
 struct TrackedBody {
     body: Pin<Box<Body>>,
     scope: UsageHandle,
     inflight: Arc<AtomicUsize>,
+    /// Response frames for the full log (refcounts) and whether they are SSE.
+    tee: Option<(FrameTee, bool)>,
 }
 impl http_body::Body for TrackedBody {
     type Data = Bytes;
@@ -495,6 +615,10 @@ impl http_body::Body for TrackedBody {
                         .0
                         .bytes_out
                         .fetch_add(bytes.len() as u64, Relaxed);
+                    let bytes = bytes.clone();
+                    if let Some((tee, _)) = &mut self.tee {
+                        tee.push(&bytes, RESPONSE_CAP);
+                    }
                 }
             }
             _ => {}
@@ -513,6 +637,13 @@ impl Drop for TrackedBody {
         if self.body.is_end_stream() {
             self.scope.0.complete.store(1, Relaxed);
         }
+        if let Some((tee, sse)) = self.tee.take() {
+            let _ = self.scope.0.log_response.set(ResponsePayload::Frames {
+                frames: tee.frames,
+                sse,
+                truncated: tee.truncated,
+            });
+        }
         self.inflight.fetch_sub(1, Relaxed);
     }
 }
@@ -520,18 +651,105 @@ impl Drop for TrackedBody {
 pub(crate) mod tests {
     use super::*;
     #[derive(Default)]
-    pub(crate) struct Sink(pub std::sync::Mutex<Vec<Record>>, Counters);
+    pub(crate) struct Sink(pub std::sync::Mutex<Vec<Record>>, Counters, pub Option<Arc<LogTape>>);
     impl UsageSink for Sink {
         fn record(&self, r: Record) {
-            self.0.lock().unwrap().push(r);
+            self.0.lock().unwrap_or_else(|e| e.into_inner()).push(r);
         }
         fn counters(&self) -> &Counters {
             &self.1
         }
+        fn log_sink(&self) -> Option<Arc<dyn LogSink>> {
+            self.2.clone().map(|l| l as Arc<dyn LogSink>)
+        }
+    }
+    /// A full-log sink that keeps records in memory.
+    #[derive(Default)]
+    pub(crate) struct LogTape(pub std::sync::Mutex<Vec<LogRecord>>, pub std::sync::atomic::AtomicBool);
+    impl LogSink for LogTape {
+        fn enabled(&self) -> bool {
+            !self.1.load(Relaxed)
+        }
+        fn record_log(&self, r: LogRecord) {
+            self.0.lock().unwrap_or_else(|e| e.into_inner()).push(r);
+        }
+    }
+    impl LogTape {
+        pub fn request(&self, i: usize) -> serde_json::Value {
+            let r = &self.0.lock().unwrap()[i];
+            let bytes: Vec<u8> = r.request.iter().flat_map(|b| b.iter().copied()).collect();
+            serde_json::from_slice(&bytes).unwrap()
+        }
+        pub fn response_text(&self, i: usize) -> String {
+            match &self.0.lock().unwrap()[i].response {
+                ResponsePayload::Object(b) => String::from_utf8_lossy(b).into_owned(),
+                ResponsePayload::Frames { frames, .. } => frames.iter().map(|f| String::from_utf8_lossy(f).into_owned()).collect(),
+                ResponsePayload::None => String::new(),
+            }
+        }
+    }
+    pub(crate) fn logging_sink() -> (Arc<Sink>, Arc<LogTape>) {
+        let tape = Arc::new(LogTape::default());
+        (Arc::new(Sink(Default::default(), Counters::default(), Some(tape.clone()))), tape)
+    }
+
+    /// The chat path: one refcount clone per frame; the stream's frames, the
+    /// session and the metadata reach the log, and a failed auth stores nothing.
+    #[tokio::test]
+    async fn chat_capture_tees_request_and_stream_frames() {
+        use tower::ServiceExt;
+        let (sink, tape) = logging_sink();
+        let app = axum::Router::new()
+            .route("/v1/chat/completions", axum::routing::post(|body: Bytes| async move {
+                let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                if v["fail"] == true { return axum::response::IntoResponse::into_response(axum::http::StatusCode::UNAUTHORIZED); }
+                let frames = ["data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"he\"}}]}\n\n", "data: [DONE]\n\n"];
+                axum::response::IntoResponse::into_response(([("content-type", "text/event-stream")], Body::from_stream(futures::stream::iter(
+                    frames.into_iter().map(|f| Ok::<_, std::convert::Infallible>(Bytes::from_static(f.as_bytes())))))))
+            }))
+            .route("/v1/models", axum::routing::get(|| async { "{}" }))
+            .layer(axum::middleware::from_fn_with_state(Middleware::new(sink.clone()), track));
+        let send = |path: &str, body: &str| {
+            app.clone().oneshot(axum::http::Request::post(path).header("user-agent", "claude-cli/1.0")
+                .header("Authorization", "Bearer SECRET").header("x-session-id", "s1").body(Body::from(body.to_owned())).unwrap())
+        };
+        let r = send("/v1/chat/completions", r#"{"messages":[{"role":"user","content":"hi"}]}"#).await.unwrap();
+        axum::body::to_bytes(r.into_body(), 1 << 20).await.unwrap();
+        let r = send("/v1/chat/completions", r#"{"fail":true}"#).await.unwrap();
+        axum::body::to_bytes(r.into_body(), 1 << 20).await.unwrap();
+        let r = app.clone().oneshot(axum::http::Request::get("/v1/models").body(Body::empty()).unwrap()).await.unwrap();
+        axum::body::to_bytes(r.into_body(), 1 << 20).await.unwrap();
+        let logs = tape.0.lock().unwrap().len();
+        assert_eq!(logs, 1, "auth failures and non-inference routes store no payload");
+        assert_eq!(tape.request(0)["messages"][0]["content"], "hi");
+        assert!(tape.response_text(0).contains("\"he\""));
+        let record = tape.0.lock().unwrap()[0].clone();
+        assert!(matches!(record.response, ResponsePayload::Frames { sse: true, truncated: false, .. }));
+        assert_eq!(record.meta.session_id.as_deref(), Some("s1"));
+        assert_eq!(record.meta.client_kind, "claude_code");
+        assert_eq!(record.meta.status, 200);
+        assert_eq!(sink.0.lock().unwrap().len(), 3);
+        // Off means no tee at all.
+        tape.1.store(true, Relaxed);
+        let r = send("/v1/chat/completions", r#"{"messages":[]}"#).await.unwrap();
+        axum::body::to_bytes(r.into_body(), 1 << 20).await.unwrap();
+        assert_eq!(tape.0.lock().unwrap().len(), 1);
+    }
+    /// Benchmark requests skip the log unless the store records them.
+    #[tokio::test]
+    async fn bench_requests_skip_the_full_log_by_default() {
+        use tower::ServiceExt;
+        let (sink, tape) = logging_sink();
+        let app = axum::Router::new().route("/v1/chat/completions", axum::routing::post(|_: Bytes| async { "{}" }))
+            .layer(axum::middleware::from_fn_with_state(Middleware::new(sink.clone()), track));
+        let r = app.oneshot(axum::http::Request::post("/v1/chat/completions").header("x-cuteafd-bench", "t")
+            .body(Body::from("{}")).unwrap()).await.unwrap();
+        axum::body::to_bytes(r.into_body(), 1024).await.unwrap();
+        assert!(tape.0.lock().unwrap().is_empty());
     }
     #[test]
     fn last_reference_and_cancelled() {
-        let sink = Arc::new(Sink(std::sync::Mutex::new(vec![]), Counters::default()));
+        let sink = Arc::new(Sink::default());
         let scope = UsageScope::new(Record::default(), sink.clone());
         let other = scope.clone();
         drop(scope);
@@ -542,7 +760,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn stats_preserves_key_order_and_chat_response() {
         use tower::ServiceExt;
-        let sink = Arc::new(Sink(std::sync::Mutex::new(vec![]), Counters::default()));
+        let sink = Arc::new(Sink::default());
         let bare = axum::Router::new()
             .route(
                 "/v1/stats",
@@ -653,6 +871,15 @@ pub(crate) mod tests {
         }));
         let response = app.oneshot(axum::http::Request::get("/").body(Body::empty()).unwrap()).await.unwrap();
         assert_eq!(response.status(), 200);
+    }
+    #[test]
+    fn dashboard_polling_is_not_recorded() {
+        for p in ["/usage", "/console/usage/summary", "/assets/cuteafd-ui.js", "/v1/console/events", "/v1/bench/status", "/health"] {
+            assert!(self_traffic(p), "{p}");
+        }
+        for p in ["/v1/chat/completions", "/v1/messages", "/v1/stats", "/v1/models", "/console/unlock"] {
+            assert!(!self_traffic(p), "{p}");
+        }
     }
     #[test]
     fn labels_and_classifier() {

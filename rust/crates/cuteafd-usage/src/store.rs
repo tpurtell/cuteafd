@@ -34,6 +34,8 @@ pub struct Settings {
     pub log_enabled: bool,
     pub log_hours: u32,
     pub log_cap_mb: u32,
+    /// Keep image and audio bytes as content-addressed files (else references only).
+    pub log_media: bool,
     pub daily_days: u32,
     pub client_ip: bool,
     pub record_bench: bool,
@@ -43,19 +45,21 @@ impl Default for Settings {
         Self {
             metadata_days: 7,
             metadata_cap_mb: 256,
-            log_enabled: false,
+            log_enabled: true,
             log_hours: 24,
             log_cap_mb: 1024,
+            log_media: true,
             daily_days: 90,
             client_ip: false,
-            record_bench: true,
+            record_bench: false,
         }
     }
 }
 impl Settings {
     pub fn validate(&self) -> Result<()> {
-        if self.metadata_cap_mb == 0 || self.log_cap_mb == 0 {
-            return Err(Error::Settings("size caps must be positive"));
+        // A zero full-log cap or retention turns the full log off.
+        if self.metadata_cap_mb == 0 {
+            return Err(Error::Settings("the metadata size cap must be positive"));
         }
         if self.metadata_days > 3650 || self.log_hours > 87600 || self.daily_days > 3650 {
             return Err(Error::Settings("retention exceeds ten years"));
@@ -174,7 +178,7 @@ impl Store {
     }
     pub fn update_settings(&self, settings: Settings) -> Result<()> {
         settings.validate()?;
-        let enabled = settings.log_enabled && settings.log_hours > 0;
+        let enabled = crate::log::on(&settings);
         self.command(|tx| Command::Settings(settings, tx))?;
         self.log.enabled.store(enabled, Relaxed);
         Ok(())
@@ -203,6 +207,9 @@ impl UsageSink for Store {
     fn client_ip(&self) -> bool {
         self.settings.load().client_ip
     }
+    fn log_sink(&self) -> Option<Arc<dyn cuteafd_api::usage_log::LogSink>> {
+        Some(self.log.clone())
+    }
 }
 fn schema(c: &Connection) -> Result<()> {
     c.busy_timeout(Duration::from_millis(2000))?;
@@ -215,7 +222,7 @@ session_id TEXT, session_source TEXT, turn_index INTEGER, stream INTEGER NOT NUL
 n_items INTEGER, n_tools INTEGER, n_images INTEGER, n_audio INTEGER,
 tokens_in INTEGER, tokens_cached INTEGER, tokens_out INTEGER, tokens_reasoning INTEGER,
 draft_proposed INTEGER, draft_accepted INTEGER, rounds INTEGER,
-t_queue_ms REAL, t_admit_ms REAL, t_ttft_ms REAL, t_total_ms REAL, prefill_tps REAL, decode_tps REAL,
+t_queue_ms REAL, t_admit_ms REAL, t_ttft_ms REAL, t_total_ms REAL, t_retire_ms REAL, prefill_tps REAL, decode_tps REAL,
 concurrency_http INTEGER, concurrency_engine INTEGER, status INTEGER NOT NULL, outcome TEXT NOT NULL,
 stop_reason TEXT, error_class TEXT, bytes_in INTEGER, bytes_out INTEGER, bench INTEGER NOT NULL DEFAULT 0);
 CREATE INDEX IF NOT EXISTS requests_ts ON requests(ts_ms);
@@ -228,6 +235,15 @@ CREATE TABLE IF NOT EXISTS daily (day TEXT, protocol TEXT, client_kind TEXT, mod
 tokens_in INTEGER, tokens_cached INTEGER, tokens_out INTEGER, draft_proposed INTEGER, draft_accepted INTEGER,
 ttft_hist TEXT, decode_hist TEXT, bench INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(day,protocol,client_kind,model,bench));
 CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY,value TEXT NOT NULL);")?;
+    let has_retire = c
+        .prepare("PRAGMA table_info(requests)")?
+        .query_map([], |r| r.get::<_, String>(1))?
+        .collect::<std::result::Result<Vec<_>, _>>()?
+        .iter()
+        .any(|name| name == "t_retire_ms");
+    if !has_retire {
+        c.execute_batch("ALTER TABLE requests ADD COLUMN t_retire_ms REAL;")?;
+    }
     let has_bench = c
         .prepare("PRAGMA table_info(daily)")?
         .query_map([], |r| r.get::<_, String>(1))?

@@ -1,79 +1,78 @@
-//! Opt-in payload capture handles. No headers are accepted by this interface.
+//! Full-log payload capture. The serving path only clones `Bytes` frames
+//! (refcounts); parsing, folding, redaction and storage run on the log writer.
+//! No headers are accepted by this interface.
 use bytes::Bytes;
-use std::sync::Arc;
-#[derive(Clone)]
+
+/// Request frames held per capture. Larger bodies are dropped and counted.
+pub const REQUEST_CAP: usize = 64 << 20;
+/// Response frames held per capture; streams past this are marked truncated.
+pub const RESPONSE_CAP: usize = 16 << 20;
+
+/// What the handler returned, as the client saw it.
+#[derive(Clone, Debug, Default)]
 pub enum ResponsePayload {
+    #[default]
+    None,
+    /// A complete JSON object (non-streaming bodies, WebSocket turns).
     Object(Bytes),
-    Deltas(Vec<Bytes>),
+    /// Body frames in order; `sse` when the content type was an event stream.
+    Frames { frames: Vec<Bytes>, sse: bool, truncated: bool },
 }
-#[derive(Clone)]
+
+/// One request's payloads plus the metadata record it was emitted with.
+#[derive(Clone, Debug)]
 pub struct LogRecord {
-    pub rid: String,
-    pub ts_ms: i64,
-    pub protocol: String,
-    pub request: Bytes,
+    pub meta: crate::usage::Record,
+    pub request: Vec<Bytes>,
+    pub request_truncated: bool,
     pub response: ResponsePayload,
 }
+
 impl LogRecord {
     pub fn byte_len(&self) -> usize {
-        self.request.len()
+        self.request.iter().map(Bytes::len).sum::<usize>()
             + match &self.response {
+                ResponsePayload::None => 0,
                 ResponsePayload::Object(b) => b.len(),
-                ResponsePayload::Deltas(d) => d.iter().map(Bytes::len).sum(),
+                ResponsePayload::Frames { frames, .. } => frames.iter().map(Bytes::len).sum(),
             }
     }
 }
+
+/// The full-log store as seen by the serving side.
 pub trait LogSink: Send + Sync + 'static {
+    /// One relaxed load; `false` means no capture state is created at all.
     fn enabled(&self) -> bool;
+    /// Whether benchmark requests are kept (the usage `record_bench` setting).
+    fn bench(&self) -> bool {
+        false
+    }
     fn record_log(&self, record: LogRecord);
 }
-/// Created only when enabled. Handler-owned buffers need no synchronization.
-pub struct LogCapture {
-    sink: Arc<dyn LogSink>,
-    record: LogRecord,
-    buffered: usize,
+
+/// Protocols whose payloads the full log keeps (never console or admin routes).
+pub fn loggable(protocol: &str) -> bool {
+    matches!(protocol, "chat" | "completions" | "messages" | "responses" | "realtime")
 }
-impl LogCapture {
-    pub fn begin(
-        sink: Arc<dyn LogSink>,
-        rid: &str,
-        ts_ms: i64,
-        protocol: &str,
-        body: &Bytes,
-    ) -> Option<Self> {
-        sink.enabled().then(|| Self {
-            sink,
-            buffered: 0,
-            record: LogRecord {
-                rid: rid.into(),
-                ts_ms,
-                protocol: protocol.into(),
-                request: body.clone(),
-                response: ResponsePayload::Deltas(Vec::with_capacity(32)),
-            },
-        })
-    }
-    pub fn delta(&mut self, delta: &Bytes) {
-        if self.sink.enabled() && self.buffered < 1 << 20 {
-            if let ResponsePayload::Deltas(d) = &mut self.record.response {
-                self.buffered = self.buffered.saturating_add(delta.len());
-                d.push(delta.clone());
-                if self.buffered >= 1 << 20 {
-                    d.push(Bytes::from_static(br#"{"log_truncated":true}"#));
-                }
-            }
-        }
-    }
-    pub fn response(&mut self, response: &Bytes) {
-        if self.sink.enabled() {
-            self.record.response = ResponsePayload::Object(response.clone());
-        }
-    }
+
+/// Accumulates body frames up to a cap, cloning refcounts only.
+#[derive(Default)]
+pub(crate) struct FrameTee {
+    pub frames: Vec<Bytes>,
+    pub bytes: usize,
+    pub truncated: bool,
 }
-impl Drop for LogCapture {
-    fn drop(&mut self) {
-        if self.sink.enabled() {
-            self.sink.record_log(self.record.clone());
+
+impl FrameTee {
+    pub fn push(&mut self, data: &Bytes, cap: usize) {
+        if self.truncated {
+            return;
         }
+        if self.bytes.saturating_add(data.len()) > cap {
+            self.truncated = true;
+            return;
+        }
+        self.bytes += data.len();
+        self.frames.push(data.clone());
     }
 }

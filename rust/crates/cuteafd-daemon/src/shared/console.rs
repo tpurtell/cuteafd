@@ -292,9 +292,9 @@ pub(crate) fn hub(text: bool, layout: impl FnOnce() -> anyhow::Result<Layout>) -
 /// The console switch every serve command takes.
 #[derive(Debug, Clone, Copy, clap::Args)]
 pub(crate) struct ConsoleArgs {
-    /// Let the live console at `/` show generated token text. Anyone who can
-    /// reach the API port can then read every session's output as it streams.
-    #[arg(long, env = "CUTEAFD_CONSOLE_TEXT", num_args = 0..=1, default_value = "false",
+    /// Let the live console at `/` show generated token text. Only viewers
+    /// holding the console unlock cookie receive it (bench runs excepted).
+    #[arg(long, env = "CUTEAFD_CONSOLE_TEXT", num_args = 0..=1, default_value = "true",
         default_missing_value = "true", value_parser = clap::builder::BoolishValueParser::new())]
     pub console_text: bool,
 }

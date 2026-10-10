@@ -90,18 +90,21 @@ impl Worker {
             }
             if viewers && self.frame_at.elapsed() >= FRAME {
                 self.frame_at = Instant::now();
-                let frame = json!({
-                    "type": "frame", "now": self.ms(Instant::now()),
-                    "ev": std::mem::take(&mut self.events),
-                    "g": self.gauges(),
-                });
-                self.hub.publish(frame.to_string());
+                let events = std::mem::take(&mut self.events);
+                // Locked viewers get the same frame without token text.
+                let plain = (!self.hub.bench_text_active() && events.iter().any(has_text))
+                    .then(|| events.iter().map(without_text).collect::<Vec<_>>());
+                let now = self.ms(Instant::now());
+                let gauges = self.gauges();
+                let plain = plain.map(|ev| json!({"type": "frame", "now": now, "ev": ev, "g": gauges}).to_string());
+                let frame = json!({"type": "frame", "now": now, "ev": events, "g": gauges});
+                self.hub.publish_pair(frame.to_string(), plain);
             }
             let period = if viewers { Duration::from_millis(250) } else { Duration::from_secs(2) };
             if self.snapshot_at.elapsed() >= period {
                 self.snapshot_at = Instant::now();
-                let snapshot = self.snapshot();
-                self.hub.set_snapshot(snapshot.to_string());
+                let (full, plain) = self.snapshots();
+                self.hub.set_snapshot_pair(full.to_string(), plain.map(|p| p.to_string()));
             }
         }
     }
@@ -133,6 +136,19 @@ impl Worker {
         Value::Object(object)
     }
 
+    /// The snapshot for unlocked viewers and, when text is cookie-gated, the
+    /// one for locked viewers (`text: "locked"`).
+    fn snapshots(&self) -> (Value, Option<Value>) {
+        let full = self.snapshot();
+        if full["text"] != "on" || self.hub.bench_text_active() {
+            return (full, None);
+        }
+        let mut plain = full.clone();
+        plain["text"] = json!("locked");
+        plain["config"]["text"] = json!("locked");
+        (full, Some(plain))
+    }
+
     fn snapshot(&self) -> Value {
         let requests: Vec<_> = self.requests.iter().map(|(&id, r)| json!({
             "id": id, "lane": r.lane, "prompt": r.prompt, "cached": r.cached, "max": r.max,
@@ -141,12 +157,13 @@ impl Worker {
         })).collect();
         // The config is built once at startup, so its `text` fact carries the
         // live value here: the bench override toggles without a page reload.
+        let text = if self.hub.text_enabled() { "on" } else { "off" };
         let mut config = self.config.clone();
         if let Some(config) = config.as_object_mut() {
-            config.insert("text".into(), json!(self.hub.text_enabled()));
+            config.insert("text".into(), json!(text));
         }
         json!({
-            "type": "snapshot", "now": self.ms(Instant::now()), "text": self.hub.text_enabled(),
+            "type": "snapshot", "now": self.ms(Instant::now()), "text": text,
             "config": config, "requests": requests, "recent": self.recent,
             "g": self.gauges(),
         })
@@ -164,7 +181,7 @@ impl Worker {
             }
             Event::First { id, at, token } => {
                 let t = self.ms(at);
-                let text = self.hub.text_enabled() && self.hub.viewers() > 0;
+                let text = self.hub.text_wanted();
                 let mut piece = None;
                 if let Some(request) = self.requests.get_mut(&id) {
                     request.first = Some(t);
@@ -226,7 +243,7 @@ impl Worker {
     }
 
     fn round(&mut self, round: Round) {
-        let text = self.hub.text_enabled() && self.hub.viewers() > 0;
+        let text = self.hub.text_wanted();
         let mut rows = Vec::with_capacity(round.requests.len());
         for member in &round.requests {
             let mut row = json!([member.id, member.drafted, member.verified, member.accepted,
@@ -317,6 +334,29 @@ impl Worker {
     }
 }
 
+/// A `first` event with a text piece, or a round whose rows carry segments.
+fn has_text(event: &Value) -> bool {
+    match event["e"].as_str() {
+        Some("first") => !event["text"].is_null(),
+        Some("round") => event["req"].as_array().is_some_and(|rows| rows.iter().any(|r| r.as_array().is_some_and(|r| r.len() > 7))),
+        _ => false,
+    }
+}
+
+fn without_text(event: &Value) -> Value {
+    let mut event = event.clone();
+    match event["e"].as_str() {
+        Some("first") => { event["text"] = Value::Null; }
+        Some("round") => {
+            for row in event["req"].as_array_mut().into_iter().flatten() {
+                if let Some(row) = row.as_array_mut() { row.truncate(7); }
+            }
+        }
+        _ => {}
+    }
+    event
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::{Kv, Prefill, Round, RoundRequest};
@@ -355,14 +395,31 @@ mod tests {
     #[test]
     fn snapshots_carry_the_live_bench_text_override() {
         let worker = worker();
-        assert_eq!(worker.snapshot()["text"], false);
-        assert_eq!(worker.snapshot()["config"]["text"], false);
+        assert_eq!(worker.snapshot()["text"], "off");
+        assert_eq!(worker.snapshot()["config"]["text"], "off");
         worker.hub.set_bench_active(true);
-        assert_eq!(worker.snapshot()["text"], true);
-        assert_eq!(worker.snapshot()["config"]["text"], true);
+        assert_eq!(worker.snapshot()["text"], "on");
+        assert_eq!(worker.snapshot()["config"]["text"], "on");
+        assert!(worker.snapshots().1.is_none(), "bench text is public");
         worker.hub.set_bench_active(false);
-        assert_eq!(worker.snapshot()["text"], false);
-        assert_eq!(worker.snapshot()["config"]["text"], false);
+        assert_eq!(worker.snapshot()["text"], "off");
+        assert_eq!(worker.snapshot()["config"]["text"], "off");
+    }
+
+    #[test]
+    fn text_frames_have_a_text_free_twin_for_locked_viewers() {
+        let mut layout = Layout::new("test", "org/model".into(), "/nonexistent".into());
+        layout.layers = None;
+        let worker = Worker::new(ConsoleHub::new(true), layout, Instant::now());
+        let (full, plain) = worker.snapshots();
+        assert_eq!(full["text"], "on");
+        assert_eq!(plain.unwrap()["text"], "locked");
+        let first = json!({"e": "first", "id": 1, "text": [["t", "secret"]]});
+        let round = json!({"e": "round", "req": [[1, 0, 0, 0, 1, 0, 0, [["a", "secret"]]]]});
+        assert!(has_text(&first) && has_text(&round));
+        let stripped = json!([without_text(&first), without_text(&round)]).to_string();
+        assert!(!stripped.contains("secret"));
+        assert!(!has_text(&json!({"e": "admit"})));
     }
 
     #[test]

@@ -121,6 +121,7 @@ dialog h3 { margin: 0; font: 600 12px var(--sans); letter-spacing: .14em; text-t
     <button class="btn go" id="open-run">RUN…</button>
     <select id="runs" aria-label="Report"></select>
     <label class="btn" for="load-json">LOAD JSON</label><input type="file" id="load-json" accept="application/json,.json" hidden>
+    <label class="note" id="usage-record-control" hidden><input type="checkbox" id="usage-record"> Record benchmark requests in usage history</label>
     <span class="spacer"></span>
     <span class="note" id="run-note"></span>
     <div class="menu"><button class="btn" id="export-report">EXPORT REPORT ▾</button><div id="export-menu" hidden></div></div>
@@ -194,6 +195,26 @@ const api = async (path, init) => {
   return body;
 };
 const failed = (r) => r?.baseline?.quality?.status === 'fail';
+async function loadUsageRecording() {
+  try {
+    const response = await authenticatedFetch('/v1/bench/usage');
+    if (!response.ok) return;
+    const body = await response.json();
+    if (!body.available) return;
+    $('usage-record').checked = !!body.record_bench;
+    $('usage-record-control').hidden = false;
+  } catch (_) { /* Older servers have no usage recorder. */ }
+}
+$('usage-record').onchange = async () => {
+  const input = $('usage-record'), previous = !input.checked;
+  input.disabled = true;
+  try {
+    const body = await api('/v1/bench/usage', { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ record_bench: input.checked }) });
+    if (typeof body.record_bench === 'boolean') input.checked = body.record_bench;
+  } catch (error) { input.checked = previous; $('run-note').textContent = error.message; }
+  finally { input.disabled = false; }
+};
+loadUsageRecording();
 
 // ---------------------------------------------------------------- header and banners
 function renderHeader() {

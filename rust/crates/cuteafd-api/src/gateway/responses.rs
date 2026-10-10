@@ -390,6 +390,7 @@ async fn websocket_loop(mut socket: WebSocket, gateway: Arc<Gateway>, tape: Tape
             }
         };
         account(&mut p, turn_usage.clone(), true);
+        if let Some(scope) = &turn_usage { scope.log_request(|| text.clone().into_bytes().into()); }
         p.turn.tape = tape.clone();
         if p.wire.get("generate").is_some_and(|v| !v.is_boolean()) {
             if let Some(scope) = &turn_usage { scope.finished(400); }
@@ -452,7 +453,10 @@ async fn websocket_loop(mut socket: WebSocket, gateway: Arc<Gateway>, tape: Tape
                 }
             }
             if fold.terminal {
-                if let Some(scope) = &turn_usage { scope.finished(if fold.response["status"] == "failed" {500} else {200}); }
+                if let Some(scope) = &turn_usage {
+                    scope.log_response(|| serde_json::to_vec(&fold.response).unwrap_or_default().into());
+                    scope.finished(if fold.response["status"] == "failed" {500} else {200});
+                }
                 break;
             }
             tokio::select! {
