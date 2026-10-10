@@ -2081,7 +2081,9 @@ fn glm_flash_pool_marks_charge_their_reserved_unit_beside_the_pool() {
 #[test]
 fn attention_placement_heads_preserves_default_layout_and_modes_refuse_at_plan_time() {
     use crate::placement::AttentionPlacement;
-    let snapshots = [v4_snapshot(), qwen_snapshot(4), snapshot(v41_config(), &[])];
+    let snapshots = [v4_snapshot(), qwen_snapshot(4), snapshot(v41_config(), &[]),
+        snapshot(glm5_config(), &[]), snapshot(glm5_flash_config(45), &[]),
+        snapshot(mimo_flash_config(), &mimo_flash_tensors()), snapshot(mimo_pro_config(), &mimo_pro_tensors())];
     for dir in snapshots {
         for gpus in [1, 2] {
             let options = PlanOptions { layout: Some(layout::LayoutOptions {

@@ -40,7 +40,7 @@ pub struct PlacementRequest {
     /// None selects the family default and permits memory-driven mode flips.
     pub attention_placement: Option<AttentionPlacement>,
     pub context_buffers: ContextBuffers,
-    /// Owner of the first colocate group under layers (then alternating).
+    /// Tie-break owner of the first group under byte-balanced layer ownership.
     pub layers_first_gpu: u8,
     pub pool: PoolPolicy,
     /// One per backbone layer, in order.

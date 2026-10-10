@@ -183,7 +183,8 @@ pub(crate) fn capture(matches: &ArgMatches, coordinator_budget_gib: Option<f64>)
     let requested = cuteafd_loader::placement::attention::parse(&requested).map_err(anyhow::Error::msg)?;
     let executor = cuteafd_loader::placement::families::executor(family).expect("serve family executor");
     // K0 has no new executor: reject before loading CUDA or starting workers.
-    let mode = executor.check_attention(requested, 2, true)?;
+    let peer = sub.try_get_one::<u32>("rtx_gpus").ok().flatten().is_some_and(|&gpus| gpus == 2);
+    let mode = executor.check_attention(requested, if peer { 2 } else { 1 }, peer)?;
     settings.push(Setting { name: "attention-placement".into(), value: Some(mode.to_string()),
         default: Some(executor.attention_default().to_string()), source: "resolved".into() });
     settings.extend(cuteafd_bench::context::env_settings());

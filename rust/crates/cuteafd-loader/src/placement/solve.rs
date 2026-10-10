@@ -14,9 +14,12 @@ pub fn solve(request: &PlacementRequest) -> Result<Placement, PlacementError> {
     // modes the executor actually runs are candidates.
     let mut kinds = std::collections::BTreeMap::<AttentionClass, u64>::new();
     for layer in &request.layers {
-        if let Some(context) = layer.kv_unit.unit_bytes_context {
-            let saving = layer.kv_unit.unit_bytes_split.iter().sum::<u64>().saturating_sub(context.iter().sum());
-            *kinds.entry(layer.kind).or_default() += saving;
+        if layer.kv_unit.unit_bytes_context.is_some() || matches!(layer.kind, AttentionClass::Csa | AttentionClass::Mla | AttentionClass::Dsa) {
+            let total = |bytes: [u64; 2]| bytes[0].checked_add(bytes[1]).ok_or(PlacementError::Overflow("mode savings"));
+            let owned = layer.kv_unit.unit_bytes_context.map(total).transpose()?.unwrap_or(layer.kv_unit.unit_bytes_whole);
+            let saving = total(layer.kv_unit.unit_bytes_split)?.saturating_sub(owned);
+            let entry = kinds.entry(layer.kind).or_default();
+            *entry = entry.checked_add(saving).ok_or(PlacementError::Overflow("mode savings"))?;
         }
     }
     let mut kinds = kinds.into_iter().collect::<Vec<_>>();
@@ -53,7 +56,16 @@ fn solve_once(request: &PlacementRequest, flips: &[(AttentionClass, AttentionPla
     // policy until a qualified memory lever is needed.
     let executor = &request.executor;
     let mut groups = std::collections::BTreeMap::new();
-    let mut next_owner = request.layers_first_gpu;
+    let mut loads = std::collections::BTreeMap::<(AttentionClass, u64), [u64; 2]>::new();
+    let mut last_kind = std::collections::BTreeMap::new();
+    let mut previous = request.layers_first_gpu;
+    let mut group_bytes = std::collections::BTreeMap::<u16, u64>::new();
+    for layer in &request.layers {
+        if let Some(group) = layer.colocate {
+            let total = group_bytes.entry(group).or_default();
+            *total = total.checked_add(layer.kv_unit.unit_bytes_whole).ok_or(Overflow("colocate KV bytes"))?;
+        }
+    }
     let modes = request.layers.iter().enumerate().map(|(index, layer)| {
         let selected = flips.iter().find(|(kind, _)| *kind == layer.kind).map(|(_, m)| *m)
             .or(request.attention_placement)
@@ -62,10 +74,22 @@ fn solve_once(request: &PlacementRequest, flips: &[(AttentionClass, AttentionPla
             Some(AttentionPlacement::Context) if layer.kv_unit.unit_bytes_context.is_some() => Some(LayerMode::ContextSplit),
             Some(AttentionPlacement::Context) => Some(LayerMode::HeadSplit),
             Some(AttentionPlacement::Layers) if matches!(layer.kind, AttentionClass::Csa | AttentionClass::Mla | AttentionClass::Dsa) => {
-                let owner = match layer.colocate {
-                    Some(group) => *groups.entry(group).or_insert_with(|| { let owner = next_owner; next_owner ^= 1; owner }),
-                    None => { let owner = next_owner; next_owner ^= 1; owner },
+                // Distinct KV geometries are separate balancing kinds (V4 C4,
+                // C128, window). Never alternate raw indices: all C4 are even.
+                let key = (layer.kind, if layer.kind == AttentionClass::Csa { layer.kv_unit.unit_bytes_whole } else { 0 });
+                let existing = layer.colocate.and_then(|group| groups.get(&group).copied());
+                let owner = if let Some(owner) = existing { owner } else {
+                    let load = loads.entry(key).or_default();
+                    let owner = if load[0] < load[1] { 0 } else if load[1] < load[0] { 1 }
+                        else if let Some(last) = last_kind.get(&key) { 1 - *last }
+                        else { previous };
+                    let bytes = layer.colocate.map(|g| group_bytes[&g]).unwrap_or(layer.kv_unit.unit_bytes_whole).max(1);
+                    load[usize::from(owner)] = load[usize::from(owner)].checked_add(bytes).ok_or(Overflow("owned KV bytes"))?;
+                    last_kind.insert(key, owner);
+                    if let Some(group) = layer.colocate { groups.insert(group, owner); }
+                    owner
                 };
+                previous = owner;
                 Some(LayerMode::Whole { gpu: owner, ffn: FfnMode::Split })
             }
             Some(AttentionPlacement::Layers) => Some(LayerMode::HeadSplit),
