@@ -3091,6 +3091,15 @@ after graph warm-up, on a fixed 512-row prefill plus one decode step:
 
 `CUTEAFD_ROUTE_CHECK=N` re-checks every N steps (off by default).
 
+**TP2 expert loader (P4, 2026-10-11).** Each TP2 layer pair is read from
+storage once, into pinned banks, and both GPU halves are uploaded from it
+(32 readers). Storage bytes per layer pair: Flash 4.56 → 3.42 GB, Pro
+10.61 → 6.37 GB. Cold expert load against the duplicate-read loader: Flash
+22.1 → 17.3 s; Pro 16.7 → 17.0 s, 1.7% slower. Pro's load is CPU-read bound
+(16.4 s reading, 0.26 s submitting, ~0 bank wait). 48 EXL3 readers made it
+worse (+3.7%). Follow-ups, measured on their own: GPU-direct reads (cuFile /
+O_DIRECT into pinned banks) and pinned prefetch of the next layers.
+
 **TP2 lane payload sizing (P4 follow-up, 2026-10-10).** The persistent
 per-lane TP2 payload is sized for FP32 (4 B per element), so the BF16 and
 FP32 exchange share one buffer and both dtypes can be warmed. Once BF16
