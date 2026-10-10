@@ -431,8 +431,14 @@ impl SharedPolicy {
             }
             None => self.skipped += 1,
         }
+        tracing::debug!(target: "cuteafd::draft_policy", requests = requests.len(),
+            rows = requests.iter().map(|r| r.rows).sum::<usize>(), predicted_us = ?predicted, total_us = times.total_us,
+            draft_us = ?times.draft_us, observed = matches!(outcome, Some(Ok(()))), "GLM Flash draft round");
         if (self.observed + self.skipped) % 32 == 1 {
             let ring = engine.probe_ring_check().filter(|c| c.layers > 0).map(|c| (c.layers, c.mismatched));
+            if let Some((layers, mismatched)) = ring {
+                tracing::info!(layers, mismatched, "GLM Flash route ring check against staged Spark ids");
+            }
             super::draft_binding::publish(&self.policy, self.observed, self.skipped, ring);
         }
     }
