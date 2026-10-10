@@ -3725,9 +3725,9 @@ Measure BF16 partials first, and FP32 only if the quick tier misses.
 **Lanes.**
 - At C1 there is one lane, and the peer idles through each owned attention.
   So `layers` gives up the attention share of the measured head-split gain.
-- At C > 1 the decode batch splits into two lanes offset by one group: lane
-  A's attention on GPU(k mod 2) runs while lane B's group k−1 runs on the
-  other GPU, then both lanes' FFN all-reduces.
+- At C > 1 a future two-lane decode executor can pipeline the two contiguous
+  ownership ranges. The former alternating-by-group schedule is not the
+  default; measure any such policy separately before enabling it.
 - This is a two-lane decode executor (P7-style, beside the prefill lanes).
   It also pipelines Spark waves between lanes.
 
@@ -3753,8 +3753,8 @@ group 0). The executor records every lane interleaving and asserts
 **Basis.**
 - P2 planner at 94.97 GiB (92.97 capacity), 2M pool unless noted.
 - `context` charges staging and the context exchange.
-- `layers` charges P3 hop slots (4 lanes × 2 × 4,096 rows) and drops the
-  replicated operands.
+- `layers` charges P3 hop slots (GLM: 4 lanes × 2 × 4,096 rows;
+  V4/GLM Flash: 2 lanes) and drops the replicated operands.
 - The caveats are P2's:
   - graphs and workspaces are partly calibrated, and the 64 MiB ledger gate
     has not run on these items;
@@ -3783,8 +3783,8 @@ Contiguous V4 ownership at k=22/31 yields records of 3900702720 /
 4276617216 B (Flash) and 5865209856 / 5851054080 B (Pro), matching the
 earlier per-kind-alternating records but with one ownership transition.
 GLM contiguous records are 27560/26380 B per token versus alternating
-25592/28348. GLM Flash contiguous compact records keep 5/6 MLA owners. Fewer owner transitions do
-not remove Split-FFN broadcasts: there remain 43 / 61 AfterAttention hops.
+25592/28348. GLM Flash contiguous compact records keep 5/6 MLA owners.
+Fewer owner transitions do not remove Split-FFN broadcasts: there remain 43 / 61 AfterAttention hops.
 The extra TP2 counts are calibrated admission fixtures, not executor gates;
 all production attention-placement defaults remain `heads`.
 
