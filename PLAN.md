@@ -2778,14 +2778,20 @@ the edge cards:
   resident on the RTX cards. TP2 halves count as one layer. The solver then
   fills every remaining byte with KV, so the pool is the output, not the
   input.
-  - The pool is still clamped to the compiled extent and rounded to
-    `unit_rows`.
+  - The pool is rounded to `unit_rows`. It is the total KV shared by all
+    requests, so it can exceed the compiled extent; only each request's
+    context is clamped to the extent. V4 Flash max at 21 layers gives an
+    8.48M-token pool, and at 0 layers 16.1M.
   - Below the floor it is a refusal that names the shortfall, the same as
     any no-fit.
   - Concurrency follows the admitted pool unless pinned.
 - Which layers go local is the solver's choice: by `ExpertCost` per byte of
   Spark traffic saved, ties going to the deepest layers. Pin them explicitly
   with `RTX_EXPERT_LAYER_LIST` when a benchmark needs the exact set.
+  - Until the per-layer executor (`P3`, `P7`) lands, V4 runs only a
+    contiguous prefix: GPU0 gets layers `0..k` and GPU1 `k..n`. The solver
+    therefore only picks the GPU split, maximizing the pool, and the pin list
+    waits for `P7`.
 - `0` means every expert on the Sparks; `all` (or `100%`) means Spark-free
   where it fits.
 - The planner (`cuteafd plan --layout --rtx-expert-layers N`) and the runtime
