@@ -98,6 +98,13 @@ pub struct LayoutOptions {
     pub native_mtp_layers: usize,
     /// Whole routed backbone layers resident on the coordinator.
     pub local_expert_layers: Option<usize>,
+    /// Families on the shared solver (V4): how many routed layers are
+    /// RTX-resident (`--rtx-expert-layers auto|max|N|N%|all`); a fixed onboard
+    /// makes the KV pool the output. `None` takes the family default (V4:
+    /// `max`); `local_expert_layers` maps onto `Layers(n)` when unset.
+    pub onboard: Option<crate::placement::Onboard>,
+    /// V4: let EXL3 routed layers fill GPU1 too (`--peer-expert-ranges`).
+    pub peer_expert_ranges: bool,
     /// Matching image's PROGRAMS.json for exact V4 workspace geometry.
     pub workspace_manifest: Option<std::path::PathBuf>,
 }
@@ -139,6 +146,8 @@ impl Default for LayoutOptions {
             context_tokens: 0,
             native_mtp_layers: 3,
             local_expert_layers: None,
+            onboard: None,
+            peer_expert_ranges: false,
             workspace_manifest: None,
         }
     }
@@ -453,7 +462,8 @@ pub fn layout(report: &mut PlanReport, model: &dyn super::FamilyModel, checkpoin
                 ((bytes as u128 * 97 / 100) as u64).min(bytes.saturating_sub(
                     options.headroom_bytes.max(cuteafd_core::serving_capacity::SMALL_CARD_HEADROOM_BYTES)))
             } else { (if family == "deepseek_v41" && automatic { (bytes as u128 * 97 / 100) as u64 } else { bytes })
-                .saturating_sub(if matches!(family, "deepseek_v4" | "deepseek_v41" | "qwen4") { options.headroom_bytes.max(3 * GIB) } else { options.headroom_bytes }) },
+                .saturating_sub(if matches!(family, "deepseek_v41" | "qwen4") { options.headroom_bytes.max(3 * GIB) }
+                    else if family == "deepseek_v4" { 0 } else { options.headroom_bytes }) },
             items: Vec::new(), kv_tokens: 0 })
         .collect();
     let mut waste = Vec::new();
@@ -693,6 +703,9 @@ pub fn layout(report: &mut PlanReport, model: &dyn super::FamilyModel, checkpoin
         let role = if gpus_now == 1 { 0 } else if index == 0 { 1 } else { 2 };
         device.items.push(Item::new(Category::Runtime, "context+modules", "", costs.runtime_bytes[role],
             allowance_basis));
+        // V4's graphs, workspaces, exchange slots, reserve, KV and experts come
+        // from the shared placement solver below.
+        if family == "deepseek_v4" { continue; }
         let graph_allowance = if family == "deepseek_v41" && options.rtx_bytes[index] <= 32 * GIB {
             // Match the qualified fixed-bank envelope reserved by measured_pool_memory.
             2 * GIB
@@ -728,17 +741,6 @@ pub fn layout(report: &mut PlanReport, model: &dyn super::FamilyModel, checkpoin
             _ => 0,
         };
         let workspace = workspace + intake;
-        if family == "deepseek_v4" {
-            // Small cards charge exact workspace/graphs plus the shared floor;
-            // PRO retains the historical --reserve-gib 10 envelope.
-            let headroom = if v4_workspace.is_some() {
-                crate::serving_capacity::deepseek_v4_headroom_bytes(
-                    options.rtx_bytes[index], 10 * GIB, workspace, costs.graph_bytes[role])
-            } else {
-                (10 * GIB).saturating_sub(workspace + costs.graph_bytes[role]).max(3 * GIB)
-            }.max(options.headroom_bytes);
-            device.capacity_bytes = options.rtx_bytes[index].saturating_sub(headroom);
-        }
         let workspace_basis = if v4_workspace.is_some() || (glmf_steps.is_some() && index == 0) { Basis::Formula }
             else { allowance_basis };
         device.items.push(Item::new(Category::Workspace, "steps", "", workspace, workspace_basis));
@@ -776,48 +778,18 @@ pub fn layout(report: &mut PlanReport, model: &dyn super::FamilyModel, checkpoin
     let routed_bytes: u64 = report.components.iter().filter(|c| c.component == Component::RoutedExpert)
         .map(|c| c.bytes).sum();
     let layer_bytes = routed_bytes / model.spec().layers.len().max(1) as u64;
-    let mut local_layers = if family.starts_with("deepseek_v4") {
+    // V4's layers come from the placement solve below.
+    let mut local_layers = if family == "deepseek_v41" {
         options.local_expert_layers.unwrap_or(0).min(model.spec().layers.len())
     } else { 0 };
     let draft_experts: u64 = if family == "deepseek_v4" && native_layers > 0 {
         report.components.iter().filter(|c| c.component == Component::SpeculatorExpert).map(|c| c.bytes).sum()
     } else { 0 };
-    if draft_experts > 0 {
+    if draft_experts > 0 && family != "deepseek_v4" {
         devices[0].items.push(Item::new(Category::Experts, "dSpark stage experts", "native", draft_experts, Basis::Exact));
     }
-    if family == "deepseek_v4" && options.local_expert_layers.is_none() && layer_bytes > 0 {
-        if let Ok(Some(cache)) = model.cache_geometry(CacheOptions { coordinator_ranks: active_gpus,
-            native_mtp_layers: cache_native_layers, prefill_rows: prefill_rows, ..Default::default() }) {
-            let mark_bytes: u64 = cache.ranks.iter().map(|r| r.retained_mark_bytes).sum();
-            let slots = options.prefix_slots.unwrap_or(42.min(2 * GIB / mark_bytes.max(1)).max(2 * concurrency + 2));
-            let state = cache.ranks[0].active_state_per_sequence_bytes * options.state_slots.unwrap_or(concurrency)
-                + cache.ranks[0].fixed_state_bytes + cache.ranks[0].context_table_bytes_per_token * context_tokens;
-            let role = if active_gpus == 1 { 0 } else { 1 };
-            let workspaces: u64 = devices[0].items.iter().filter(|i| i.group == "steps").map(|i| i.bytes).sum();
-            let already = devices[0].used_bytes().saturating_sub(workspaces + costs.graph_bytes[role]);
-            // Automatic expert placement keeps a 262K pool floor; final
-            // admission gives the pool the remaining space. PRO stays legacy.
-            let placement_pool = if automatic { 262144 } else { options.pool_tokens.unwrap_or(262144) };
-            let legacy = cache.ranks[0].persistent_unit_bytes * placement_pool.div_ceil(cache.logical_unit_rows);
-            let expert_workspace = exl3_workspace.unwrap_or(160 * MIB * prefill_rows / 4096);
-            let reserve = if v4_workspace.is_some()
-                && cuteafd_core::serving_capacity::small_card_headroom_bytes(options.rtx_bytes[0]) > 0 {
-                let tables = (2 * prefill_rows + decode_rows) * 4;
-                let units = placement_pool.div_ceil(cache.logical_unit_rows);
-                state + tables * options.state_slots.unwrap_or(concurrency)
-                    + (cache.ranks[0].persistent_unit_bytes + cache.ranks[0].pool_metadata_unit_bytes + tables) * units
-                    + slots * mark_bytes + workspaces + costs.graph_bytes[role]
-                    + crate::serving_capacity::deepseek_v4_headroom_bytes(options.rtx_bytes[0], 10 * GIB,
-                        workspaces, costs.graph_bytes[role]) + expert_workspace
-            } else {
-                state + legacy + slots * mark_bytes + 10 * GIB + expert_workspace
-            };
-            local_layers = (options.rtx_bytes[0].saturating_sub(already + reserve) / layer_bytes)
-                .min(model.spec().layers.len() as u64) as usize;
-        }
-    }
     let mut local_bytes = layer_bytes * local_layers as u64;
-    if local_bytes > 0 && !matches!(report.placement, ExpertPlacement::Local) {
+    if family != "deepseek_v4" && local_bytes > 0 && !matches!(report.placement, ExpertPlacement::Local) {
         if family == "deepseek_v41" && gpus == 2 {
             for device in devices.iter_mut().take(2) {
                 device.items.push(Item::new(Category::Experts, "resident routed layers", "native-tp2", local_bytes / 2, Basis::Formula));
@@ -825,12 +797,6 @@ pub fn layout(report: &mut PlanReport, model: &dyn super::FamilyModel, checkpoin
         } else {
             devices[0].items.push(Item::new(Category::Experts, "resident routed layers", "native", local_bytes, Basis::Exact));
         }
-    }
-
-    if family == "deepseek_v4" && local_bytes + draft_experts > 0 {
-        devices[0].items.push(Item::new(Category::Experts, "local expert workspace", "",
-            exl3_workspace.unwrap_or(160 * MIB * prefill_rows / 4096),
-            if exl3_workspace.is_some() { Basis::Formula } else { Basis::Estimated }));
     }
 
     let mut spark_devices = Vec::new();
@@ -882,13 +848,54 @@ pub fn layout(report: &mut PlanReport, model: &dyn super::FamilyModel, checkpoin
         }
     }
 
+    // DeepSeek V4: one shared admission solve for its fixed demands, the KV
+    // pool and RTX expert ranges (`placement::families::deepseek_v4`), the
+    // same request serve-dsv4 resolves at runtime.
+    let mut pool_tokens = 0;
+    if family == "deepseek_v4" {
+        let solved = deepseek_v4_placement(report, checkpoint, options, &devices[..active_gpus],
+            V4PlanShape { prefill_rows, decode_rows, concurrency, context_tokens, native_layers,
+                cache_native_layers, exl3_workspace, workspace: v4_workspace.clone() });
+        match solved {
+            Ok((placement, reserves)) => {
+                for (device, reserve) in devices.iter_mut().zip(&reserves) {
+                    device.capacity_bytes = options.rtx_bytes[device.index as usize].saturating_sub(*reserve);
+                }
+                for (device, items) in devices.iter_mut().zip(&placement.items) {
+                    device.items.extend(items.iter().cloned());
+                    if device.items.iter().any(|i| i.group == "records") { device.kv_tokens = placement.pool_tokens; }
+                }
+                for (gpu, range) in placement.expert_ranges.iter().enumerate() {
+                    notes.push(format!("rtx{gpu}: {} local expert layers ({}..{})", range.layers,
+                        range.first, range.first + range.layers));
+                }
+                notes.push(format!("placement: {}", placement.summary()));
+                local_layers = placement.onboard_layers;
+                local_bytes = placement.expert_ranges.iter().map(|r| r.peak_bytes).sum();
+                pool_tokens = placement.pool_tokens;
+                if pool_tokens < context_tokens {
+                    notes.push(format!("full-context admission shortfall: context {context_tokens} tokens, pool {pool_tokens} tokens, shortfall {} tokens", context_tokens - pool_tokens));
+                }
+                if active_gpus == 2 {
+                    waste.push(Waste { device: "rtx1".into(), what: "KV records replicated on both GPUs (MLA latent)".into(),
+                        bytes: placement.items[1].iter().filter(|i| i.group == "records").map(|i| i.bytes).sum() });
+                }
+            }
+            Err(error) => {
+                report.placement_supported = false;
+                notes.push(format!("V4 pool-first placement: {error}"));
+            }
+        }
+        if report.encoder.is_none() {
+            resolve_encoder(checkpoint, report, model, &mut devices, &mut spark_devices, &vec![0; gpus], options, &mut notes);
+        }
+    }
     // KV pool: per-device bytes per logical token from the family geometry.
-    let geometry = model.cache_geometry(CacheOptions { coordinator_ranks: active_gpus,
+    let geometry = if family == "deepseek_v4" { Ok(None) } else { model.cache_geometry(CacheOptions { coordinator_ranks: active_gpus,
         native_mtp_layers: if family == "deepseek_v4" || family == "qwen4" { cache_native_layers } else { 0 },
         prefill_rows: prefill_rows, glmf_decode_rows,
         glmf_index: if split { crate::serving_capacity::GlmfIndexCache::Keys } else { options.glmf_index },
-        ..Default::default() });
-    let mut pool_tokens = 0;
+        ..Default::default() }) };
     match geometry {
         Ok(Some(mut geometry)) => {
             for rank in &mut geometry.ranks {
@@ -1009,6 +1016,7 @@ pub fn layout(report: &mut PlanReport, model: &dyn super::FamilyModel, checkpoin
                     bytes: per_token.get(1).copied().unwrap_or(0) * pool_tokens });
             }
         }
+        Ok(None) if family == "deepseek_v4" => {}
         Ok(None) => notes.push(format!("{family}: no cache geometry in the planner yet (engine sizes its own pool)")),
         Err(error) => notes.push(format!("{family}: cache geometry: {error}")),
     }
@@ -1070,6 +1078,56 @@ fn glmf_step_workspace(manifest: &serde_json::Value, checkpoint: &super::Checkpo
     let lanes = if spark { lanes } else { 1 };
     Some(glmf_step_workspaces(&cfg, usize::try_from(lanes).ok()?, rows, decode_rows, &shape, decode, prefill)
         .device_bytes())
+}
+
+/// The planner's V4 shape inputs, beside `LayoutOptions`.
+struct V4PlanShape {
+    prefill_rows: u64,
+    decode_rows: u64,
+    concurrency: u64,
+    context_tokens: u64,
+    native_layers: usize,
+    cache_native_layers: usize,
+    exl3_workspace: Option<u64>,
+    workspace: Option<Vec<crate::serving_capacity::V4WorkspaceRank>>,
+}
+
+/// V4's planned admission: the same `placement::families::deepseek_v4`
+/// request serve-dsv4 solves, with each GPU's planned charges (context,
+/// modules and the weights laid out so far) as the baseline. The devices'
+/// capacities become `rtx_bytes - reserve` so `free_bytes` matches.
+fn deepseek_v4_placement(report: &PlanReport, checkpoint: &super::Checkpoint,
+    options: &LayoutOptions, devices: &[DeviceLayout], shape: V4PlanShape)
+    -> anyhow::Result<(crate::placement::Placement, Vec<u64>)> {
+    use crate::placement::{families::deepseek_v4 as v4, Baseline, Onboard};
+    let cfg = crate::families::deepseek_v4::DeepseekV4Config::read(&checkpoint.snapshot, shape.cache_native_layers)?;
+    let catalog = crate::read_expert_catalog(&checkpoint.snapshot)?;
+    let routed = *catalog.routed_experts();
+    let (experts, draft) = v4::expert_costs(&catalog, shape.native_layers)?;
+    let spark_ranks = match report.placement { ExpertPlacement::Sparks { ranks } => ranks, ExpertPlacement::Local => 0 };
+    let expert_workspace = if catalog.exl3().is_some() { shape.exl3_workspace.unwrap_or(160 * MIB * shape.prefill_rows / 4096) }
+        else { crate::serving_capacity::deepseek_v4_native_workspace(routed.hidden as u64, routed.intermediate as u64,
+            routed.experts as u64, routed.topk as u64, shape.prefill_rows.max(shape.decode_rows))? };
+    let gpus = devices.iter().zip(&options.rtx_bytes).map(|(device, &total)|
+        (total, Baseline::Planned { context_bytes: 0, loaded_bytes: device.used_bytes() })).collect();
+    let mark_slots = options.prefix_slots.map_or_else(|| v4::mark_slots(&cfg, devices.len(), shape.prefill_rows,
+        shape.cache_native_layers, shape.concurrency, options.mimo_prefix_entries, options.mimo_prefix_mark_bytes),
+        Ok)?;
+    let onboard = match (options.onboard, options.local_expert_layers) {
+        (Some(onboard), _) => onboard,
+        (None, Some(n)) => Onboard::Layers(n.saturating_sub(routed.first_layer)),
+        (None, None) => v4::DEFAULT_ONBOARD,
+    };
+    let inputs = v4::V4Inputs { cfg: &cfg, cache_stages: shape.cache_native_layers, gpus, headroom_floor: options.headroom_bytes,
+        spark_ranks, sequences: shape.concurrency, prefill_rows: shape.prefill_rows, decode_rows: shape.decode_rows,
+        max_context: shape.context_tokens, reserve_bytes: v4::RESERVE_BYTES, mark_slots, workspace: shape.workspace,
+        experts, draft, expert_workspace, first_routed: routed.first_layer,
+        peer_experts: v4::peer_experts(&catalog, options.peer_expert_ranges),
+        requested_pool: options.pool_tokens.filter(|&n| n > 0), onboard,
+        full_prefill_logits: 0 };
+    let request = v4::request(&inputs)?;
+    let reserves = request.inventory.gpus.iter().map(|g| g.headroom_bytes).collect();
+    Ok((crate::placement::solve(&request)?, reserves))
 }
 
 fn qwen_exl3_arenas(checkpoint: &super::Checkpoint, mtp: bool) -> Option<(u64, u64)> {

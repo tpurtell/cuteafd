@@ -353,7 +353,7 @@ pub struct Setting {
     pub value: Option<String>,
     #[serde(default)]
     pub default: Option<String>,
-    /// `default`, `cli`, `env`.
+    /// `default`, `cli`, `env`, or `resolved` (decided at admission).
     pub source: String,
 }
 

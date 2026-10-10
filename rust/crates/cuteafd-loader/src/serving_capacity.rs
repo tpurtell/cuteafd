@@ -18,10 +18,12 @@ pub use glmf_workspace::{glmf_expert_rows, glmf_lane_bytes, glmf_manifest_scratc
     glmf_step_workspaces, glmf_table_pages, glmf_temporary_bytes, GlmfKdaState, GlmfLaneBytes, GlmfMissingProgram,
     GlmfScratch, GlmfScratchOptions, GlmfStepShape, GlmfStepWorkspaces, GlmfTemporaryBytes, GLMF_DECODE_ROWS,
     GLMF_DEFAULT_PREFILL_LANES, GLMF_HEAD_WORKSPACE, GLMF_SPARSE_TOPK, GLMF_WIDE_DECODE_ROWS};
+mod v4_placement;
+pub use v4_placement::{deepseek_v4_expert_cost, deepseek_v4_native_workspace, V4ExpertCost};
 mod v4_workspace;
-pub use v4_workspace::{compiled_c128_width, deepseek_v4_headroom_bytes, deepseek_v4_peer_exchange_bytes, deepseek_v4_workspace_geometry, deepseek_v4_workspace_scratch, V4WorkspaceRank, V4WorkspaceScratch};
+pub use v4_workspace::{compiled_c128_width, deepseek_v4_expert_exchange_bytes, deepseek_v4_headroom_bytes, deepseek_v4_peer_exchange_bytes, deepseek_v4_workspace_geometry, deepseek_v4_workspace_scratch, V4WorkspaceRank, V4WorkspaceScratch};
 pub use deepseek::{deepseek_v41_cache_bytes, deepseek_v41_cache_geometry, deepseek_v41_pool_groups,
-    deepseek_v4_cache_geometry};
+    deepseek_v4_cache_geometry, deepseek_v4_layer_unit_bytes};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

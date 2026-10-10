@@ -9,6 +9,17 @@ use serde_json::Value;
 /// V4's 256-source-token unit contains each C4 layer's compressed/index
 /// pages and each C128 layer's compressed page. The head split replicates
 /// these records and the compressor carry; it does not partition them.
+/// Persistent pool bytes of one 256-token unit in one V4 layer, by compress
+/// ratio: C4 records plus index keys, C128 records, none for window-only
+/// layers. metadata::compressed_page_bytes rounds (rows * 584) to 576 bytes.
+pub fn deepseek_v4_layer_unit_bytes(ratio: usize) -> u64 {
+    match ratio {
+        4 => 37_440 + 8_448,
+        128 => 1_728,
+        _ => 0,
+    }
+}
+
 pub fn deepseek_v4_cache_geometry(
     cfg: &DeepseekV4Config,
     ranks: usize,
@@ -36,14 +47,9 @@ pub fn deepseek_v4_cache_geometry(
     }
     let c4 = cfg.compress_ratios.iter().filter(|&&r| r == 4).count() as u64;
     let c128 = cfg.compress_ratios.iter().filter(|&&r| r == 128).count() as u64;
-    // metadata::compressed_page_bytes rounds (rows * 584) to 576 bytes.
-    let pages = sum(
-        "V4 compressed units",
-        &[
-            product("V4 C4 units", &[c4, 37_440 + 8_448])?,
-            product("V4 C128 units", &[c128, 1_728])?,
-        ],
-    )?;
+    let pages = cfg.compress_ratios.iter().try_fold(0u64, |total, &ratio| {
+        sum("V4 compressed units", &[total, deepseek_v4_layer_unit_bytes(ratio)])
+    })?;
     // engine::pool_layer_for: four FP32 carry arrays on C4; two on C128.
     let carry = sum(
         "V4 compressor carry",
