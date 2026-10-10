@@ -159,7 +159,8 @@ pub fn request(inputs: &V4Inputs<'_>) -> Result<PlacementRequest, PlacementError
     let layers = (0..inputs.cfg.n_layers).map(|layer| {
         let unit = deepseek_v4_layer_unit_bytes(inputs.cfg.compress_ratios[layer]);
         let experts = layer.checked_sub(first).and_then(|i| inputs.experts.get(i)).map(|cost| ExpertCost {
-            whole: Bytes2 { resident: cost.resident_bytes, staging: cost.staging_bytes }, tp2: false, spark_ok: true });
+            whole: Bytes2 { resident: cost.resident_bytes, staging: cost.staging_bytes },
+            half: [Bytes2::default(); 2], tp2: false, spark_ok: true });
         LayerDemand {
             kind: AttentionClass::Csa,
             // Coordinator weights load before admission (inside the baseline).

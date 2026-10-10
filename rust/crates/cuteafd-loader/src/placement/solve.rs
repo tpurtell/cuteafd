@@ -194,6 +194,7 @@ pub fn solve(request: &PlacementRequest) -> Result<Placement, PlacementError> {
         layers: modes.into_iter().zip(homes).map(|(mode, experts)| LayerAssignment { mode, experts }).collect(),
         movables,
         expert_ranges: ranges,
+        tp2: None,
         items,
     })
 }

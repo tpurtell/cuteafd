@@ -136,7 +136,10 @@ pub struct Bytes2 {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ExpertCost {
     pub whole: Bytes2,
-    /// Half-width TP2 layers exist for this build (placement PR 4).
+    /// Each rank's half under TP2 (rank 0, rank 1); equal for even splits.
+    pub half: [Bytes2; 2],
+    /// Half-width TP2 layers exist for this build (placement PR 4): on two
+    /// RTX with peer access the layer's RTX home is `RtxTp2`, never `RtxWhole`.
     pub tp2: bool,
     pub spark_ok: bool,
 }
@@ -280,8 +283,12 @@ pub struct Placement {
     pub onboard_layers: usize,
     pub layers: Vec<LayerAssignment>,
     pub movables: Vec<(MovableId, u8)>,
-    /// Contiguous RTX expert range per GPU (`layers == 0`: none).
+    /// Contiguous whole-layer RTX expert range per GPU (`layers == 0`: none).
+    /// Under TP2 every GPU's range is empty and [`Placement::tp2`] holds the layers.
     pub expert_ranges: Vec<ExpertRange>,
+    /// TP2 RTX expert halves (placement PR 4): one contiguous range of routed
+    /// layers whose halves live on both GPUs, with each GPU's arena peak.
+    pub tp2: Option<Tp2Range>,
     /// Every item the solver charged, per GPU (fixed demands, KV records,
     /// expert arenas); the baseline's loaded bytes are not repeated here.
     pub items: Vec<Vec<Item>>,
@@ -310,6 +317,15 @@ pub struct ExpertRange {
     /// Arena peak: workspace, arena movables and every layer, with the
     /// largest transient load staging.
     pub peak_bytes: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Tp2Range {
+    pub first: usize,
+    pub layers: usize,
+    /// Each GPU's arena peak: workspace, arena movables on that GPU, every
+    /// half layer, with the largest transient load staging.
+    pub peak_bytes: [u64; 2],
 }
 
 impl Placement {
