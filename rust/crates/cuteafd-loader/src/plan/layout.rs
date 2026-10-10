@@ -112,7 +112,7 @@ pub struct LayoutOptions {
 impl Default for LayoutOptions {
     fn default() -> Self {
         Self {
-            rtx_bytes: vec![95 * GIB + 512 * MIB],
+            rtx_bytes: vec![crate::placement::inventory::PRO_TOTAL_BYTES],
             vision_replicas: 1,
             host_embedding: false,
             force_gpu_embedding: false,
@@ -1100,7 +1100,8 @@ fn program_families(family: &str, model: &dyn super::FamilyModel, split: bool) -
 fn planned_context(manifest: Option<&serde_json::Value>, families: &[String], total_bytes: u64) -> u64 {
     let names = families.iter().map(String::as_str).collect::<Vec<_>>();
     let modules = manifest.map_or(32 * MIB, |m| crate::placement::ProgramSet::from_manifest(m, &names).module_bytes());
-    crate::placement::ArchContext::coordinator(total_bytes, None).context_bytes + modules
+    let arch = crate::placement::ArchContext::coordinator(total_bytes, None);
+    arch.context_bytes + arch.cublas_bytes + modules
 }
 
 /// GLM 5.3 Flash's step workspaces on one GPU from its program manifest: the bytes its engine

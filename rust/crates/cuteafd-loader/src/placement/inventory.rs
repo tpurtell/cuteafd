@@ -26,11 +26,19 @@ pub struct ArchContext {
     pub arch: &'static str,
     /// Card class: physical memory at most this many bytes (CUDA total).
     pub max_total_bytes: u64,
+    /// The CUDA-reported total of the class's reference card (`cudaMemGetInfo`),
+    /// what a planner without a device lays out (0: unknown, take the budget).
+    pub total_bytes: u64,
     /// Streaming multiprocessors (native scratch and grid sizes key on it).
     pub sms: u32,
-    /// CUDA context + cuBLAS handle + runtime bookkeeping, measured on an
-    /// otherwise empty device after the first allocation (no program modules).
+    /// CUDA context and runtime bookkeeping, measured on an otherwise empty
+    /// device after the first allocation (no program modules, no cuBLAS).
     pub context_bytes: u64,
+    /// A cuBLAS handle and its first GEMM's workspace. The native handle is
+    /// thread-local and created on the serving thread's first GEMM, after the
+    /// runtime's inventory sample, so both sides charge it as a known future
+    /// item (planner: inside "context+modules"; runtime: beside the sample).
+    pub cublas_bytes: u64,
     /// Device bytes one captured decode-graph executable holds (measured).
     pub graph_executable_bytes: u64,
     /// The driver these numbers were measured on.
@@ -47,16 +55,24 @@ pub struct ArchContext {
 /// 596,901,888 B); GB10 by MemAvailable deltas (unified memory) 189-257 MiB
 /// context + 150-160 MiB cuBLAS, recorded at the larger sample.
 pub const ARCH_CONTEXTS: &[ArchContext] = &[
-    ArchContext { arch: "sm_120", max_total_bytes: 34 << 30, sms: 170, context_bytes: 657_719_296,
+    ArchContext { arch: "sm_120", max_total_bytes: 34 << 30, total_bytes: 0, sms: 170, context_bytes: 586_416_128,
+        cublas_bytes: 71_303_168,
         graph_executable_bytes: 149_712, driver: "595.91.07",
         source: "RTX 5090 class: SM120 PRO probe on the same driver/CUDA 13.2; SM count from the 5090 spec" },
-    ArchContext { arch: "sm_120", max_total_bytes: u64::MAX, sms: 188, context_bytes: 657_719_296,
+    ArchContext { arch: "sm_120", max_total_bytes: u64::MAX, total_bytes: 101_973_491_712, sms: 188,
+        context_bytes: 586_416_128, cublas_bytes: 71_303_168,
         graph_executable_bytes: 149_712, driver: "595.91.07",
         source: "RTX PRO 6000 Blackwell probe (CUDA 13.2); Qwen 12,397 graphs = 1,855,979,520 B" },
-    ArchContext { arch: "sm_121", max_total_bytes: u64::MAX, sms: 48, context_bytes: 420 << 20,
+    ArchContext { arch: "sm_121", max_total_bytes: u64::MAX, total_bytes: 130_594_156_544, sms: 48,
+        context_bytes: 257 << 20, cublas_bytes: 160 << 20,
         graph_executable_bytes: 149_712, driver: "580.178.04",
         source: "GB10 probe (CUDA 13.0, MemAvailable deltas): context 189-257 MiB + cuBLAS 150-160 MiB; graph bytes from SM120" },
 ];
+
+/// The coordinator GPU budget `cuteafd plan` lays out without a device or a
+/// `--coordinator-gpu-budget-gib`: the RTX PRO 6000's CUDA-reported total
+/// (94.97 GiB; the card's nominal 95.5 GiB is not what CUDA hands out).
+pub const PRO_TOTAL_BYTES: u64 = 101_973_491_712;
 
 impl ArchContext {
     /// The class of a device with `total_bytes` of memory on `arch`, or the

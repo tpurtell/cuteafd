@@ -284,7 +284,7 @@ const MIB: u64 = 1 << 20;
 fn planner_equals_runtime_deepseek_v4_measured() {
     let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/shared/placement_fixtures");
     let mut checked = 0;
-    for entry in std::fs::read_dir(&dir).unwrap().flatten() {
+    for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
         let path = entry.path();
         if !path.file_name().unwrap().to_string_lossy().starts_with("v4-") { continue; }
         let fixture: Fixture = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
