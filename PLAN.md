@@ -3810,6 +3810,24 @@ its 20/20 ranges. Each family's default comes from its own decision gate.
 | D-V4 | **Decision**, as D-GLM | — | K5, K6 | — |
 | K7 | GLM Flash DSA `context` (11 MLA layers, compact cache on two GPUs); `layers` is P7's mixed mode | M | K3, P7 | section 4's GLM Flash row; D-GLMF on the EXL3 K3.25 max card and the Spark-free card |
 
+**Fork DCP audit (K1, 2026-10-11).** The fork's `b12x/comm/pcie` decode
+context parallel stack covers less than it seemed:
+- **`pcie_dcp_topk`** only transports rank-major score/index planes. It
+  has no selection and no tie policy, so `dsa_candidate_merge` stays a K1
+  kernel.
+- **`pcie_dcp_a2a`** fuses an exchange with an LSE reduce-scatter over
+  heads. It handles BF16/FP16 normalized partials, but has no sink, sums
+  the local rank first and then the peers cyclically (not a fixed
+  GPU0→GPU1 order), and needs 64 fully resident SMs. K2 may use it for
+  no-sink paths if its numerics pass, and if graph/IPC lifetime and
+  occupancy measure well next to decode.
+- **`all_gather_heads` / `all_gather_pair`** move heads and pairs, not
+  paged KV, so the K1 gather stays.
+- **The sparse MLA split merge** already does base-2 LSE with the sink
+  added once, and K1's partial route reuses it.
+- Choice per piece is by exactness first, then measured speed and SM
+  occupancy (TJ: reuse is not a goal).
+
 **Interactions.**
 - **P4 TP2.** The solver's pool step charges `context`/`layers` KV, and the
   freed bytes go to TP2 pairs in step 5. Both modes leave the residual
