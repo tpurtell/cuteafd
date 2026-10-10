@@ -38,11 +38,22 @@ impl HealthWitness {
 /// A failed expert wire is terminal: reject new inference without queueing it.
 pub async fn require_ready(State(health): State<HealthWitness>, request: Request, next: Next) -> Response {
     let path = request.uri().path();
-    // Gateway turns (Messages, Responses) run on the same engine.
-    if request.method() == axum::http::Method::POST && matches!(path, "/v1/chat/completions" | "/v1/completions"
-        | "/v1/messages" | "/v1/responses") {
+    let post = request.method() == axum::http::Method::POST;
+    if post && matches!(path, "/v1/chat/completions" | "/v1/completions") {
         if let Some(reason) = health.reason() {
             return unavailable(reason);
+        }
+    }
+    // Gateway turns run on the same engine: refuse them (and new Responses or
+    // Realtime sockets) in each protocol's own retryable error shape.
+    let gateway_turn = (post && matches!(path, "/v1/messages" | "/v1/responses"))
+        || (request.headers().contains_key(axum::http::header::UPGRADE) && matches!(path, "/v1/responses" | "/v1/realtime"));
+    if gateway_turn {
+        if let Some(reason) = health.reason() {
+            let error = crate::gateway::GatewayError::new(crate::gateway::ErrorKind::Overloaded, format!("engine unavailable: {reason}"));
+            let mut response = if path.starts_with("/v1/messages") { error.anthropic_response() } else { error.openai_response() };
+            response.headers_mut().insert(axum::http::header::RETRY_AFTER, axum::http::HeaderValue::from_static("1"));
+            return response;
         }
     }
     next.run(request).await

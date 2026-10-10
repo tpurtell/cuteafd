@@ -95,7 +95,8 @@ impl ApiPolicy {
             profile.gateway = Some(Arc::new(cuteafd_api::openai::GatewayMount { models, snapshot,
                 options: cuteafd_api::openai::engine::EngineOptions {
                     json_schema: cuteafd_api::openai::engine::probe_json_schema(&profile) },
-                search: policy.search.clone() }));
+                search: policy.search.clone(),
+                gate: self.bench.then(|| cuteafd_bench::http::gate(cuteafd_bench::Bench::global())) }));
         }
         Ok(profile)
     }

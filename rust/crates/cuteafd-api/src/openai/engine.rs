@@ -103,11 +103,15 @@ fn image_url(source: &ImageSource) -> String {
     }
 }
 
-/// Chat content parts for `content`; plain text stays a string (identical
-/// to what a text-only chat client sends).
+/// Chat content for `content`: one text part is a plain string, anything
+/// else a part list, so each family's chat conversion joins parts by its own
+/// rule (DeepSeek's recipe joins text parts with a blank line) exactly as
+/// for a chat client sending the same parts.
 fn content(content: &[Part], role: &str) -> Result<Value, GatewayError> {
-    if content.iter().all(|p| matches!(p, Part::Text { .. })) {
-        return Ok(Value::String(content.iter().map(|p| match p { Part::Text { text } => text.as_str(), _ => "" }).collect()));
+    match content {
+        [] => return Ok(Value::String(String::new())),
+        [Part::Text { text }] => return Ok(Value::String(text.clone())),
+        _ => {}
     }
     let mut parts = Vec::with_capacity(content.len());
     for part in content {
@@ -205,17 +209,19 @@ fn chat_body_with(turn: &TurnRequest, profile: &ModelProfile, names: &ToolNames)
     if let Some(system) = turn.system.as_ref().filter(|s| !s.is_empty()) {
         messages.push(json!({"role":"system","content":system}));
     }
-    // Assistant items fold into one chat assistant message in the order its
-    // template renders them: reasoning_content, content, tool_calls. An item
-    // that would break that order (reasoning after text or calls, text after
-    // calls) starts the next assistant message, as a chat client would send it.
-    fn current<'a>(messages: &'a mut Vec<Value>, accepts: impl Fn(&Map<String, Value>) -> bool) -> &'a mut Map<String, Value> {
-        let open = messages.last().and_then(Value::as_object).is_some_and(|m| m["role"] == "assistant" && accepts(m));
-        if !open { messages.push(json!({"role":"assistant","content":null})); }
+    // One assistant turn is every assistant-side item (reasoning, text, tool
+    // calls, hosted tool calls) between two user, system or tool-result
+    // items: one Anthropic assistant message, or one run of Responses output
+    // items. It becomes one chat assistant message, which every template
+    // renders as reasoning, then content, then calls. Reasoning blocks
+    // concatenate; content keeps every part in order; text after a call stays
+    // in that message (chat requires a call's results to follow it directly).
+    fn current(messages: &mut Vec<Value>) -> &mut Map<String, Value> {
+        if messages.last().is_none_or(|m| m["role"] != "assistant") {
+            messages.push(json!({"role":"assistant","content":null}));
+        }
         messages.last_mut().and_then(Value::as_object_mut).expect("assistant message")
     }
-    let has_calls = |m: &Map<String, Value>| m.get("tool_calls").is_some_and(|c| !c.is_null());
-    let has_content = |m: &Map<String, Value>| m.get("content").is_some_and(|c| !c.is_null());
     fn push_call(message: &mut Map<String, Value>, id: &str, name: String, arguments: String) {
         let calls = message.entry("tool_calls").or_insert_with(|| json!([]));
         if !calls.is_array() { *calls = json!([]); }
@@ -239,18 +245,17 @@ fn chat_body_with(turn: &TurnRequest, profile: &ModelProfile, names: &ToolNames)
             }
             Item::Message { role: Role::Assistant, content: parts } => {
                 let added = content(parts, "assistant")?;
-                let message = current(&mut messages, |m| !has_calls(m));
-                let merged = match (message.remove("content").filter(|c| !c.is_null()), added) {
-                    (None, added) => added,
-                    (Some(Value::String(mut text)), Value::String(more)) => { text.push_str(&more); Value::String(text) }
-                    // Media on either side: keep every part, in order. The chat
-                    // path decides whether the family can carry assistant media.
-                    (Some(existing), added) => { let mut all = parts_of(existing); all.extend(parts_of(added)); Value::Array(all) }
+                let message = current(&mut messages);
+                // The chat path joins parts by the family's rule and decides
+                // whether the family can carry assistant media.
+                let merged = match message.remove("content").filter(|c| !c.is_null()) {
+                    None => added,
+                    Some(existing) => { let mut all = parts_of(existing); all.extend(parts_of(added)); Value::Array(all) }
                 };
                 message.insert("content".into(), merged);
             }
             Item::Reasoning { text, .. } => {
-                let message = current(&mut messages, |m| !has_calls(m) && !has_content(m));
+                let message = current(&mut messages);
                 match message.get_mut("reasoning_content") {
                     Some(Value::String(existing)) => existing.push_str(text),
                     _ => { message.insert("reasoning_content".into(), json!(text)); }
@@ -258,14 +263,22 @@ fn chat_body_with(turn: &TurnRequest, profile: &ModelProfile, names: &ToolNames)
             }
             Item::ToolCall { id, name, arguments } => {
                 let arguments = if arguments.trim().is_empty() { "{}".to_owned() } else { arguments.clone() };
-                push_call(current(&mut messages, |_| true), id, names.wire(name), arguments);
+                push_call(current(&mut messages), id, names.wire(name), arguments);
             }
             Item::ServerToolCall { id, name, input } =>
-                push_call(current(&mut messages, |_| true), id, names.wire(name), input.to_string()),
+                push_call(current(&mut messages), id, names.wire(name), input.to_string()),
             Item::ToolResult { call_id, content: parts, is_error } => {
                 let mut body = content(parts, "tool")?;
+                // Chat has no error flag on tool results; the text says so.
                 if *is_error {
-                    if let Value::String(text) = &mut body { text.insert_str(0, "Error: "); }
+                    match &mut body {
+                        Value::String(text) => text.insert_str(0, "Error: "),
+                        Value::Array(parts) => match parts.iter_mut().find(|p| p["type"] == "text") {
+                            Some(part) => part["text"] = json!(format!("Error: {}", part["text"].as_str().unwrap_or_default())),
+                            None => parts.insert(0, json!({"type":"text","text":"Error:"})),
+                        },
+                        _ => {}
+                    }
                 }
                 messages.push(json!({"role":"tool","tool_call_id":call_id,"content":body}));
             }
@@ -348,11 +361,6 @@ fn chat_body_with(turn: &TurnRequest, profile: &ModelProfile, names: &ToolNames)
     Ok(body)
 }
 
-/// Families whose chat path counts image/audio rows in the prompt.
-fn media_rows_counted(profile: &ModelProfile) -> bool {
-    !matches!(profile.encoding, ModelEncoding::DeepseekV41) || profile.media_preparer.is_none()
-}
-
 impl Engine {
     fn check(&self, turn: &TurnRequest) -> Result<(), GatewayError> {
         let caps = self.capabilities();
@@ -408,6 +416,11 @@ impl Backend for Engine {
     fn start(&self, turn: TurnRequest) -> BoxFuture<'static, Result<TurnStream, GatewayError>> {
         let this = self.clone();
         Box::pin(async move {
+            // Per-turn engine admission: every front end, socket and compact
+            // turn passes here, not only the routes the health layer sees.
+            if let Some(reason) = this.profile().engine_health.as_ref().and_then(super::health::HealthWitness::reason) {
+                return Err(GatewayError::new(ErrorKind::Overloaded, format!("engine unavailable: {reason}")));
+            }
             let names = ToolNames::new(&turn);
             let built = this.built(&turn, &names)?;
             let stops = built.stop_sequences.clone();
@@ -423,22 +436,15 @@ impl Backend for Engine {
         Box::pin(async move {
             let names = ToolNames::new(&turn);
             let mut turn = turn;
-            // Counting never generates: tool and format constraints only shape output.
-            turn.response_format = None;
-            for tool in &mut turn.tools { tool.strict = false; }
+            // Generation-only fields never fail a count; everything that
+            // shapes the prompt (tools, formats, thinking) stays as generated.
+            turn.max_output_tokens = None;
+            turn.sampling = Default::default();
             let built = this.built(&turn, &names)?;
             let Some(snapshot) = this.snapshot.clone() else {
                 return Ok(crate::gateway::backend::estimate_tokens(&turn));
             };
-            if built.has_media() && media_rows_counted(this.profile()) {
-                // Media rows depend on prepared geometry; count them by preparing.
-                return Err(GatewayError::unsupported("count_tokens with image or audio input is not supported by the engine backend yet"));
-            }
-            let prompt = built.prompt().to_owned();
-            let count = tokio::task::spawn_blocking(move || cuteafd_loader::encode_tokenizer_text(&snapshot, &prompt, false))
-                .await.map_err(|_| GatewayError::internal("token counting stopped"))?
-                .map_err(|e| GatewayError::internal(format!("token counting failed: {e:#}")))?;
-            u32::try_from(count.token_ids.len()).map_err(|_| GatewayError::invalid("prompt too long"))
+            super::count_prompt(&this.state, built, snapshot).await.map_err(rejection)
         })
     }
 }

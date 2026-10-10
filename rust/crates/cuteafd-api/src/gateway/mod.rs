@@ -37,6 +37,11 @@ pub use search::SearchProvider;
 pub use session::SessionStore;
 pub use turn::{TurnEvent, TurnRequest};
 
+/// Admission check consulted before every gateway turn, including turns on
+/// already-open Responses and Realtime sockets: `Some(retry_s)` refuses the
+/// turn as busy. Serving installs the in-server benchmark's lockout here.
+pub type TurnGate = Arc<dyn Fn() -> Option<u64> + Send + Sync>;
+
 /// Everything a front end needs.
 pub struct Gateway {
     pub backend: Arc<dyn Backend>,
@@ -46,11 +51,13 @@ pub struct Gateway {
     pub search: Option<Arc<dyn SearchProvider>>,
     /// Bounded reference/page cache and accounting for Codex standalone web.run.
     pub standalone_search: responses::SearchCache,
+    /// Refuses turns while something else owns the engine (a benchmark run).
+    pub gate: Option<TurnGate>,
 }
 
 impl Gateway {
     pub fn new(backend: Arc<dyn Backend>, models: ModelMap) -> Self {
-        Self { backend, models, sessions: SessionStore::default(), search: None, standalone_search: responses::SearchCache::default() }
+        Self { backend, models, sessions: SessionStore::default(), search: None, standalone_search: responses::SearchCache::default(), gate: None }
     }
 
     pub fn with_search(mut self, provider: Arc<dyn SearchProvider>) -> Self {
@@ -61,6 +68,10 @@ impl Gateway {
     /// Resolve the requested model and run one turn, executing hosted tools.
     /// `turn.requested_model` must be set; `turn.model` is filled here.
     pub async fn run(self: &Arc<Self>, mut turn: TurnRequest) -> Result<TurnStream, GatewayError> {
+        if let Some(retry) = self.gate.as_ref().and_then(|gate| gate()) {
+            return Err(GatewayError::new(ErrorKind::Overloaded,
+                format!("a benchmark is running on this server; retry in about {retry} s")));
+        }
         turn.model = self.models.resolve(&turn.requested_model)?;
         let usage = turn.usage.clone();
         if let Some(usage) = &usage { usage.served_model(&turn.model); }

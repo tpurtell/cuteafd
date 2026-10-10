@@ -21,15 +21,18 @@ pub const PAGE: &str = include_str!("../assets/bench.html");
 /// The BENCHMARKING banner any page can include (`/bench/banner.js`).
 pub const BANNER: &str = include_str!("../assets/banner.js");
 
-/// Paths that run inference (and so are refused while a benchmark runs).
-fn inference(method: &Method, path: &str) -> bool {
-    method == Method::POST && matches!(path, "/v1/chat/completions" | "/v1/completions" | "/v1/responses"
-        | "/v1/messages" | "/v1/embeddings")
+/// Paths that run inference (and so are refused while a benchmark runs):
+/// inference POSTs, and new Responses or Realtime sockets. Turns on sockets
+/// opened before the run are refused by the gateway's turn gate (`gate`).
+fn inference(method: &Method, headers: &HeaderMap, path: &str) -> bool {
+    (method == Method::POST && matches!(path, "/v1/chat/completions" | "/v1/completions" | "/v1/responses"
+        | "/v1/messages" | "/v1/embeddings"))
+        || (headers.contains_key(header::UPGRADE) && matches!(path, "/v1/responses" | "/v1/realtime"))
 }
 
 /// Refuses other clients' inference with 503 + Retry-After while a run is active.
 pub async fn lockout(State(bench): State<Arc<Bench>>, request: Request, next: Next) -> Response {
-    if inference(request.method(), request.uri().path()) {
+    if inference(request.method(), request.headers(), request.uri().path()) {
         // The run's own requests carry its token; tools it runs as subprocesses
         // (tool-eval-bench) pass it as their API key.
         let token = request.headers().get(BENCH_HEADER).and_then(|v| v.to_str().ok()).or_else(|| {
@@ -45,6 +48,13 @@ pub async fn lockout(State(bench): State<Arc<Bench>>, request: Request, next: Ne
         }
     }
     next.run(request).await
+}
+
+/// The gateway turn gate for this benchmark: the run drives the engine through
+/// chat completions with its own token, so every gateway turn (open sockets
+/// included) is another client's and waits for the run to end.
+pub fn gate(bench: Arc<Bench>) -> cuteafd_api::gateway::TurnGate {
+    Arc::new(move || bench.locked(None))
 }
 
 /// Loopback, RFC 1918, link-local, CGNAT and IPv6 unique-local addresses.
@@ -384,6 +394,21 @@ mod tests {
         assert_eq!(response.headers()[header::CONTENT_TYPE], "application/json");
         let bytes = axum::body::to_bytes(response.into_body(), 4096).await.unwrap();
         assert_eq!(bytes.as_ref(), body.as_bytes());
+    }
+
+    #[test]
+    fn lockout_covers_inference_posts_and_new_gateway_sockets() {
+        let mut upgrade = HeaderMap::new();
+        upgrade.insert(header::UPGRADE, HeaderValue::from_static("websocket"));
+        let none = HeaderMap::new();
+        for path in ["/v1/chat/completions", "/v1/messages", "/v1/responses"] {
+            assert!(inference(&Method::POST, &none, path), "{path}");
+        }
+        for path in ["/v1/responses", "/v1/realtime"] {
+            assert!(inference(&Method::GET, &upgrade, path), "new {path} sockets wait for the run");
+            assert!(!inference(&Method::GET, &none, path), "plain GET {path} is not inference");
+        }
+        assert!(!inference(&Method::GET, &upgrade, "/v1/console"), "the console socket is not inference");
     }
 
     #[tokio::test]

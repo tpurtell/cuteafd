@@ -63,7 +63,7 @@ struct Worker { prompts: Arc<Mutex<Vec<String>>>, closed: Arc<Mutex<Vec<bool>>> 
 fn serve(mut profile: ModelProfile, snapshot: Option<std::path::PathBuf>, replies: Vec<&'static str>, hold: bool)
     -> (axum::Router, Worker) {
     profile.gateway = Some(Arc::new(GatewayMount { models: crate::gateway::ModelMap::official_names(profile.id.clone()),
-        snapshot, options: EngineOptions::default(), search: None }));
+        snapshot, options: EngineOptions::default(), search: None, gate: None }));
     let (tx, mut rx) = mpsc::channel::<NativeRequest>(4);
     let worker = Worker::default();
     let seen = worker.clone();
@@ -449,4 +449,148 @@ async fn forced_tool_choice_without_its_tool_is_refused_like_chat() {
         assert_eq!(status, StatusCode::BAD_REQUEST, "{text}");
     }
     assert!(worker.prompts.lock().unwrap().is_empty(), "nothing reached the engine");
+}
+
+#[tokio::test]
+async fn multi_part_text_joins_by_each_family_rule() {
+    // Two text blocks are a two-part list on both routes; the family's chat
+    // conversion joins them (DeepSeek's recipe with a blank line).
+    for family in families() {
+        let id = family.profile.id.clone();
+        let chat = json!({"model":id,"stream":false,"max_tokens":8,"thinking":{"type":"disabled"},"messages":[
+            {"role":"system","content":[{"type":"text","text":"sys one"},{"type":"text","text":"sys two"}]},
+            {"role":"user","content":[{"type":"text","text":"first"},{"type":"text","text":"second"}]},
+            {"role":"assistant","content":[{"type":"text","text":"a1"},{"type":"text","text":"a2"}]},
+            {"role":"user","content":"next"}]});
+        let messages = json!({"model":"m","max_tokens":8,"stream":false,"thinking":{"type":"disabled"},
+            "messages":[
+            {"role":"system","content":[{"type":"text","text":"sys one"},{"type":"text","text":"sys two"}]},
+            {"role":"user","content":[{"type":"text","text":"first"},{"type":"text","text":"second"}]},
+            {"role":"assistant","content":[{"type":"text","text":"a1"},{"type":"text","text":"a2"}]},
+            {"role":"user","content":"next"}]});
+        let responses = json!({"model":"m","stream":false,"store":false,"reasoning":{"effort":"none"},"input":[
+            {"type":"message","role":"system","content":[{"type":"input_text","text":"sys one"},{"type":"input_text","text":"sys two"}]},
+            {"type":"message","role":"user","content":[{"type":"input_text","text":"first"},{"type":"input_text","text":"second"}]},
+            {"type":"message","role":"assistant","content":[{"type":"output_text","text":"a1"},{"type":"output_text","text":"a2"}]},
+            {"type":"message","role":"user","content":[{"type":"input_text","text":"next"}]}]});
+        let (app, worker) = serve(family.profile.clone(), family.snapshot.clone(), vec![], false);
+        for (path, body) in [("/v1/chat/completions", chat), ("/v1/messages", messages), ("/v1/responses", responses)] {
+            let (status, text) = post(&app, path, body).await;
+            assert_eq!(status, StatusCode::OK, "{} {path}: {text}", family.name);
+        }
+        let prompts = worker.prompts.lock().unwrap().clone();
+        assert_eq!(prompts[0], prompts[2], "{} Responses", family.name);
+        if let Some(snapshot) = &family.snapshot {
+            let ids = |p: &str| cuteafd_loader::encode_tokenizer_text(snapshot, p, false).unwrap().token_ids;
+            assert_eq!(ids(&prompts[0]), ids(&prompts[2]), "{}", family.name);
+        }
+        // Anthropic's top-level system is one string (its blocks join with a
+        // newline in the Messages front end), so compare from the user turn on.
+        let tail = |p: &str| p[p.find("first").expect("user turn rendered")..].to_owned();
+        assert_eq!(tail(&prompts[0]), tail(&prompts[1]), "{} Messages", family.name);
+        if matches!(family.profile.encoding, ModelEncoding::DeepseekV4 | ModelEncoding::DeepseekV41) {
+            assert!(prompts[1].contains("first\n\nsecond"), "{}: recipe joins text parts with a blank line", family.name);
+        }
+    }
+}
+
+#[tokio::test]
+async fn claude_code_text_call_text_turn_is_one_assistant_message() {
+    // Claude Code: [text, tool_use, text] then the tool_result. One assistant
+    // message with the call; its results follow it directly, as chat requires.
+    for family in families() {
+        let id = family.profile.id.clone();
+        let schema = json!({"type":"object","properties":{"p":{"type":"string"}}});
+        let chat = json!({"model":id,"stream":false,"max_tokens":8,"thinking":{"type":"disabled"},
+            "tools":[{"type":"function","function":{"name":"f","parameters":schema}}],"messages":[
+            {"role":"user","content":"q"},
+            {"role":"assistant","content":[{"type":"text","text":"I will check"},{"type":"text","text":"Please wait"}],
+                "tool_calls":[{"id":"c","type":"function","function":{"name":"f","arguments":"{}"}}]},
+            {"role":"tool","tool_call_id":"c","content":"done"}]});
+        let messages = json!({"model":"m","max_tokens":8,"stream":false,"thinking":{"type":"disabled"},
+            "tools":[{"name":"f","input_schema":schema}],"messages":[
+            {"role":"user","content":"q"},
+            {"role":"assistant","content":[{"type":"text","text":"I will check"},
+                {"type":"tool_use","id":"c","name":"f","input":{}},{"type":"text","text":"Please wait"}]},
+            {"role":"user","content":[{"type":"tool_result","tool_use_id":"c","content":"done"}]}]});
+        let (app, worker) = serve(family.profile.clone(), family.snapshot.clone(), vec![], false);
+        let (a, ta) = post(&app, "/v1/chat/completions", chat).await;
+        let (b, tb) = post(&app, "/v1/messages", messages).await;
+        assert_eq!((a, b), (StatusCode::OK, StatusCode::OK), "{}: {ta} {tb}", family.name);
+        let prompts = worker.prompts.lock().unwrap().clone();
+        assert_eq!(prompts[0], prompts[1], "{}", family.name);
+        if let Some(snapshot) = &family.snapshot {
+            let ids = |p: &str| cuteafd_loader::encode_tokenizer_text(snapshot, p, false).unwrap().token_ids;
+            assert_eq!(ids(&prompts[0]), ids(&prompts[1]), "{}", family.name);
+        }
+    }
+}
+
+#[tokio::test]
+async fn count_tokens_keeps_prompt_shaping_fields_and_ignores_generation_limits() {
+    for family in families().into_iter().filter(|f| f.snapshot.is_some()
+        && matches!(f.profile.encoding, ModelEncoding::Glm(_) | ModelEncoding::Qwen(_))) {
+        let snapshot = family.snapshot.clone().unwrap();
+        let (app, worker) = serve(family.profile.clone(), Some(snapshot.clone()), vec!["{}"], false);
+        // A JSON format puts an instruction in GLM/Qwen prompts; a huge
+        // max_output_tokens would fail generation but never a count.
+        let body = json!({"model":"m","input":"Give me JSON.","store":false,"stream":false,"reasoning":{"effort":"none"},
+            "text":{"format":{"type":"json_object"}},"max_output_tokens":100000000});
+        let (status, text) = post(&app, "/v1/responses/input_tokens", body.clone()).await;
+        assert_eq!(status, StatusCode::OK, "{}: {text}", family.name);
+        let counted = serde_json::from_str::<Value>(&text).unwrap()["input_tokens"].as_u64().unwrap();
+        let mut generate = body.clone();
+        generate["max_output_tokens"] = json!(16);
+        let (status, text) = post(&app, "/v1/responses", generate).await;
+        assert_eq!(status, StatusCode::OK, "{}: {text}", family.name);
+        let prompt = worker.prompts.lock().unwrap()[0].clone();
+        assert!(prompt.contains("JSON object"), "{}: the format instruction is in the prompt", family.name);
+        let expected = cuteafd_loader::encode_tokenizer_text(&snapshot, &prompt, false).unwrap().token_ids.len() as u64;
+        assert_eq!(counted, expected, "{}", family.name);
+    }
+}
+
+#[tokio::test]
+async fn v41_image_count_includes_every_expanded_row() {
+    let Some(family) = families().into_iter().find(|f| f.name == "v41" && f.snapshot.is_some()) else { return };
+    let snapshot = family.snapshot.clone().unwrap();
+    let (app, worker) = serve(family.profile.clone(), Some(snapshot.clone()), vec![], false);
+    let body = json!({"model":"m","max_tokens":8,"thinking":{"type":"disabled"},"messages":[{"role":"user","content":[
+        {"type":"text","text":"What is this?"},
+        {"type":"image","source":{"type":"base64","media_type":"image/png","data":png_b64()}}]}]});
+    let (status, text) = post(&app, "/v1/messages/count_tokens", body.clone()).await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    let counted = serde_json::from_str::<Value>(&text).unwrap()["input_tokens"].as_u64().unwrap() as usize;
+    let mut generate = body;
+    generate["stream"] = json!(false);
+    let (status, text) = post(&app, "/v1/messages", generate).await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    // What native admission admits: the job's prompt ids, each image
+    // placeholder expanded to its decoded grid (`V41VisionPrompt::expand`).
+    let prompt = worker.prompts.lock().unwrap()[0].clone();
+    let ids = cuteafd_loader::encode_tokenizer_text(&snapshot, &prompt, false).unwrap().token_ids;
+    let decoded = crate::openai::images::ImageDecoder::new(1).decode(vec![
+        deepseek_recipe_core::multimodal::ImageSource::Bytes { data: PNG.to_vec(), detail: Default::default() }]).unwrap();
+    let expanded = cuteafd_loader::V41VisionPrompt::expand(&ids, decoded, 1 << 20).unwrap().tokens.len();
+    assert!(expanded > ids.len() + 1, "the image spans many rows");
+    assert_eq!(counted, expanded);
+    eprintln!("v41 image count: {counted} tokens ({} text ids + image rows)", ids.len());
+}
+
+#[tokio::test]
+async fn engine_failure_answers_each_protocol_in_its_own_shape() {
+    let mut profile = ModelProfile::new("test-qwen", ModelEncoding::Qwen(Arc::new(qwen4::fixtures::encoding())));
+    profile.engine_health = Some(crate::openai::health::HealthWitness(Arc::new(|| Some("expert rank 1 disconnected".into()))));
+    let (app, worker) = serve(profile, None, vec![], false);
+    let (status, text) = post(&app, "/v1/messages", json!({"model":"m","max_tokens":8,"messages":[{"role":"user","content":"x"}]})).await;
+    assert_eq!(status.as_u16(), 529, "{text}");
+    let body: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!((body["type"].as_str(), body["error"]["type"].as_str()), (Some("error"), Some("overloaded_error")));
+    let (status, text) = post(&app, "/v1/responses", json!({"model":"m","input":"x"})).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{text}");
+    assert!(serde_json::from_str::<Value>(&text).unwrap()["error"]["message"].as_str().unwrap().contains("expert rank 1"));
+    // Compact runs a model turn too; per-turn admission refuses it.
+    let (status, text) = post(&app, "/v1/responses/compact", json!({"model":"m","input":"x"})).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{text}");
+    assert!(worker.prompts.lock().unwrap().is_empty());
 }

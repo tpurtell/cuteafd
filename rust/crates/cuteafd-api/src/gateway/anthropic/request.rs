@@ -23,10 +23,14 @@ pub(super) fn parse(value: &Value, require_max: bool) -> Result<(TurnRequest, bo
             parts(system)?
                 .into_iter()
                 .filter_map(|p| match p {
-                    // Claude Code's per-request billing metadata (its hash
+                    // Claude Code's per-request billing metadata line (its hash
                     // changes within a session) is not an instruction; at the
-                    // head of the prompt it would defeat prefix caching.
-                    Part::Text { text } if text.starts_with("x-anthropic-billing-header:") => None,
+                    // head of the prompt it would defeat prefix caching. Only
+                    // that line goes; any text after it in the block stays.
+                    Part::Text { text } if text.starts_with("x-anthropic-billing-header:") => {
+                        let rest = text.split_once('\n').map_or("", |(_, rest)| rest);
+                        (!rest.is_empty()).then(|| rest.to_owned())
+                    }
                     Part::Text { text } => Some(text),
                     _ => None,
                 })

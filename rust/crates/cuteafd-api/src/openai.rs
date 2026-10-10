@@ -105,12 +105,15 @@ pub struct GatewayMount {
     pub snapshot: Option<std::path::PathBuf>,
     pub options: engine::EngineOptions,
     pub search: Option<Arc<dyn crate::gateway::SearchProvider>>,
+    /// Refuses gateway turns while the in-server benchmark owns the engine.
+    pub gate: Option<crate::gateway::TurnGate>,
 }
 
 impl std::fmt::Debug for GatewayMount {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("GatewayMount").field("models", &self.models).field("snapshot", &self.snapshot)
-            .field("options", &self.options).field("search", &self.search.as_ref().map(|s| s.name().to_owned())).finish()
+            .field("options", &self.options).field("search", &self.search.as_ref().map(|s| s.name().to_owned()))
+            .field("gate", &self.gate.is_some()).finish()
     }
 }
 
@@ -303,6 +306,7 @@ pub fn router_for_model(queue: mpsc::Sender<NativeRequest>, limits: NativeLimits
         let backend = engine::backend(state.clone(), mount.snapshot.clone(), mount.options);
         let mut gateway = crate::gateway::Gateway::new(backend, mount.models.clone());
         if let Some(search) = &mount.search { gateway = gateway.with_search(search.clone()); }
+        gateway.gate = mount.gate.clone();
         router = router.merge(crate::gateway::router(Arc::new(gateway)).layer(body_limit));
     }
     router.layer(axum::middleware::from_fn_with_state(middleware_health, health::require_ready))
@@ -1014,6 +1018,38 @@ impl Submitter {
         };
         Ok(Running { chunks: Box::pin(chunks), failure, image_tokens, audio_tokens, tap, streaming, include_usage, id, model })
     }
+}
+
+/// Exact prompt tokens the engine will admit for `built`: the tokenized
+/// prompt plus each image's expanded rows, as V4.1 native admission counts
+/// them. Families whose media expand past the API
+/// (encoder-prepared images and audio) refuse rather than undercount.
+pub(crate) async fn count_prompt(state: &NativeState, built: Built, snapshot: std::path::PathBuf) -> Result<u32, Rejection> {
+    let Built { prompt, work, .. } = built;
+    if !work.media.is_empty() || !work.audio.is_empty() {
+        return Err(Rejection::bad("count_tokens with image or audio input is not supported for this model yet (its media rows are counted by the encoder)"));
+    }
+    let images = if work.images.is_empty() { Vec::new() } else {
+        let slot = state.images.slots.clone().acquire_owned().await
+            .map_err(|_| Rejection::unavailable("image preparation is closed"))?;
+        let decoder = state.images.clone();
+        match tokio::task::spawn_blocking(move || { let _slot = slot; decoder.decode(work.images) }).await {
+            Ok(Ok(images)) => images,
+            Ok(Err(e)) => return Err(Rejection::bad(format!("{e:#}"))),
+            Err(e) => return Err(Rejection::new(StatusCode::INTERNAL_SERVER_ERROR, e)),
+        }
+    };
+    // The same spelling the job carries (see `Submitter::submit`).
+    let prompt = if images.is_empty() { prompt } else { prompt.replace("<｜image｜>", "<｜deepseek_image｜>") };
+    let ids = tokio::task::spawn_blocking(move || cuteafd_loader::encode_tokenizer_text(&snapshot, &prompt, false))
+        .await.map_err(|e| Rejection::new(StatusCode::INTERNAL_SERVER_ERROR, e))?
+        .map_err(|e| Rejection::new(StatusCode::INTERNAL_SERVER_ERROR, format!("token counting failed: {e:#}")))?
+        .token_ids;
+    // Each placeholder becomes the image's full span (`V41VisionPrompt::expand`).
+    let placeholders = ids.iter().filter(|&&id| id == cuteafd_loader::V41_IMAGE_TOKEN_ID).count();
+    if placeholders != images.len() { return Err(Rejection::bad("image placeholder count differs from supplied images")); }
+    let count = ids.len() + images.iter().map(|image| image.grid().tokens() - 1).sum::<usize>();
+    u32::try_from(count).map_err(|_| Rejection::bad("prompt too long"))
 }
 
 async fn chat(State(state): State<NativeState>, headers: axum::http::HeaderMap,
