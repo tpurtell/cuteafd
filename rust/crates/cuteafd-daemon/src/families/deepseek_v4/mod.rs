@@ -58,7 +58,8 @@ pub(crate) struct EngineArgs {
     #[arg(long, default_value_t = 0)]
     pub pool_tokens: usize,
     /// Routed-expert layers to keep on the coordinator GPUs (from layer 0):
-    /// `auto` reserves the KV pool first and fills what is left; `N`, `N%`
+    /// `auto` reserves the KV pool first and fills what is left; `max` places
+    /// the most layers that still leave a 262K pool (v2's policy); `N`, `N%`
     /// or `all` fix the RTX layers and the KV pool takes every remaining
     /// byte. 0 sends every layer to the Sparks.
     #[arg(long, value_parser = parse_onboard, conflicts_with = "local_expert_layers")]

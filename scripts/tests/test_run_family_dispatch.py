@@ -326,7 +326,7 @@ def _family_launch_lines(tmp_path: Path, family_config: dict, model: str, keys: 
     return _family_launch_result(tmp_path, family_config, model, keys).stderr
 
 
-@pytest.mark.parametrize("value", [None, "auto", "0", "5", "50%", "all"])
+@pytest.mark.parametrize("value", [None, "auto", "0", "5", "50%", "all", "max"])
 def test_deepseek_v4_honors_explicit_local_expert_limit(tmp_path, value):
     keys = "" if value is None else f"RTX_EXPERT_LAYERS={value}\n"
     result = _family_launch_result(tmp_path, {"model_type": "deepseek_v4"}, "test/dsv4", keys)

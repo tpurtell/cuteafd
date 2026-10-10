@@ -91,6 +91,29 @@ pub fn solve(request: &PlacementRequest) -> Result<Placement, PlacementError> {
     if spark_free && fixed_layers != Some(routed) {
         return Err(PlacementError::SparkFree { layers: routed, placed: fixed_layers.unwrap_or(0) });
     }
+    // Experts first: the most layers whose fixed-onboard pool still meets the
+    // floor (pool output is monotone in the layer count, so bisect).
+    let fixed_layers = match (fixed_layers, request.onboard) {
+        (None, Onboard::ExpertsFirst { pool_floor }) => {
+            let fits = |n: usize| -> bool {
+                let mut trial = request.clone();
+                trial.onboard = Onboard::Layers(n);
+                trial.pool.requested = None;
+                trial.pool.floor = pool_floor.max(request.pool.floor);
+                solve(&trial).is_ok()
+            };
+            let (mut lo, mut hi) = (0usize, routed);
+            if !fits(0) { return Err(PlacementError::Mandatory { gpu: 0,
+                what: format!("a {pool_floor}-token pool beside {}", describe(&request.fixed, 0, &movables)) }); }
+            while lo < hi {
+                let mid = (lo + hi + 1) / 2;
+                if fits(mid) { lo = mid } else { hi = mid - 1 }
+            }
+            Some(lo)
+        }
+        (fixed, _) => fixed,
+    };
+    let experts_first = matches!(request.onboard, Onboard::ExpertsFirst { .. });
     let (units, ranges, homes) = match fixed_layers {
         // Pool first: reserve the target, then fill each GPU's arena in order.
         None => {
@@ -128,6 +151,8 @@ pub fn solve(request: &PlacementRequest) -> Result<Placement, PlacementError> {
             let units = match request.pool.requested {
                 Some(requested) => pool_units(request, fit).map_err(|_| PlacementError::PoolDoesNotFit { requested,
                     fit: fit.saturating_mul(request.pool.unit_rows) })?,
+                // Experts first keeps v2's automatic ceiling: the target.
+                None if experts_first => fit.min(request.pool.wanted_units()),
                 None => fit.min(request.pool.ceiling_units()),
             };
             let tokens = units.saturating_mul(request.pool.unit_rows);

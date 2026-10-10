@@ -476,20 +476,22 @@ fi
 [[ -z "$(get DECODE_SHARE)" ]] || family_args+=(--decode-share "$(get DECODE_SHARE)")
 # RTX_EXPERT_LAYERS (DeepSeek V4, the shared placement solver): auto reserves
 # the KV pool (2M PRO / 1M <=32 GB) first and fills what is left with whole
-# routed-expert layers; N, N% or all fix the RTX-resident layers and the KV
-# pool takes every remaining byte (refused below the compiled context). 0
-# leaves the backbone experts on the Sparks.
+# routed-expert layers; max places the most layers that still leave a 262K
+# pool (v2's experts-first policy), the pool taking the rest up to its
+# target; N, N% or all fix the RTX-resident layers and the KV pool takes every
+# remaining byte (refused below the compiled context). 0 leaves the backbone
+# experts on the Sparks.
 if [[ $serve == serve-dsv4 ]]; then
   local_layers="$(get RTX_EXPERT_LAYERS auto)"
   case "$local_layers" in
     ""|auto) ;;
-    all) family_args+=(--rtx-expert-layers all) ;;
+    all|max) family_args+=(--rtx-expert-layers "$local_layers") ;;
     *%)
       percent="${local_layers%\%}"
       [[ "$percent" =~ ^[0-9]+([.][0-9]+)?$ ]] && awk -v p="$percent" 'BEGIN { exit !(p <= 100) }' ||
-        { echo "RTX_EXPERT_LAYERS must be auto, all, N or N% (0..100%)" >&2; exit 2; }
+        { echo "RTX_EXPERT_LAYERS must be auto, max, all, N or N% (0..100%)" >&2; exit 2; }
       family_args+=(--rtx-expert-layers "$local_layers") ;;
-    *[!0-9]*) echo "RTX_EXPERT_LAYERS must be auto, all, N or N% (0..100%)" >&2; exit 2 ;;
+    *[!0-9]*) echo "RTX_EXPERT_LAYERS must be auto, max, all, N or N% (0..100%)" >&2; exit 2 ;;
     *) family_args+=(--local-expert-layers "$local_layers") ;;
   esac
 fi

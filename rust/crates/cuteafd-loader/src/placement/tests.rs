@@ -114,11 +114,28 @@ fn experts_stay_on_gpu0_when_the_peer_cannot_run_them() {
 }
 
 #[test]
+fn experts_first_fills_layers_above_the_pool_floor() {
+    let req = request(2, 44 * GIB, 60, 4, Onboard::ExpertsFirst { pool_floor: 262_144 });
+    let placement = solve(&req).unwrap();
+    // 262K tokens = 1024 units x 4 MiB = 4 GiB; 40 GiB of arena -> 39 layers per GPU (0.25 + 39 + 0.25 <= 40).
+    assert_eq!(placement.onboard_layers, 60);
+    assert!(placement.pool_tokens >= 262_144 && placement.pool_tokens <= 2 << 20);
+    let mut one = request(1, 44 * GIB, 60, 4, Onboard::ExpertsFirst { pool_floor: 262_144 });
+    one.expert_gpus = 1;
+    let single = solve(&one).unwrap();
+    assert_eq!(single.onboard_layers, 39);
+    assert!(single.pool_tokens >= 262_144);
+    let auto = solve(&request(1, 44 * GIB, 60, 4, Onboard::Auto)).unwrap();
+    assert!(auto.onboard_layers < single.onboard_layers && auto.pool_tokens > single.pool_tokens);
+}
+
+#[test]
 fn onboard_parses_the_launcher_spellings() {
     assert_eq!("auto".parse::<Onboard>(), Ok(Onboard::Auto));
     assert_eq!("12".parse::<Onboard>(), Ok(Onboard::Layers(12)));
     assert_eq!("50%".parse::<Onboard>(), Ok(Onboard::Fraction(0.5)));
     assert_eq!("all".parse::<Onboard>(), Ok(Onboard::Fraction(1.0)));
+    assert_eq!("max".parse::<Onboard>(), Ok(Onboard::ExpertsFirst { pool_floor: 262_144 }));
     assert!("150%".parse::<Onboard>().is_err() && "x".parse::<Onboard>().is_err());
     assert_eq!(Onboard::Fraction(0.5).layers(43), Some(22));
     assert_eq!(Onboard::Layers(99).layers(43), Some(43));

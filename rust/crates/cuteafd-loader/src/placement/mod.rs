@@ -223,13 +223,20 @@ pub enum Onboard {
     Layers(usize),
     /// This fraction of the routed layers, rounded to the nearest layer.
     Fraction(f64),
+    /// Experts first (v2's V4 policy): the most routed layers that still
+    /// leave a pool of `pool_floor` tokens; the pool then takes what is left
+    /// up to the target. `RTX_EXPERT_LAYERS=max`.
+    ExpertsFirst { pool_floor: u64 },
 }
+
+/// v2's V4 expert-first reserve: experts fill the GPUs above a 262K pool.
+pub const EXPERTS_FIRST_POOL_FLOOR: u64 = 262_144;
 
 impl Onboard {
     /// Routed layers this onboard fixes out of `routed`, or `None` for `Auto`.
     pub fn layers(self, routed: usize) -> Option<usize> {
         match self {
-            Self::Auto => None,
+            Self::Auto | Self::ExpertsFirst { .. } => None,
             Self::Layers(n) => Some(n.min(routed)),
             Self::Fraction(f) => Some(((routed as f64 * f.clamp(0.0, 1.0)) + 0.5).floor() as usize),
         }
@@ -242,6 +249,7 @@ impl std::fmt::Display for Onboard {
             Self::Auto => f.write_str("auto"),
             Self::Layers(n) => write!(f, "{n}"),
             Self::Fraction(x) => write!(f, "{}%", x * 100.0),
+            Self::ExpertsFirst { .. } => f.write_str("max"),
         }
     }
 }
@@ -250,10 +258,11 @@ impl std::str::FromStr for Onboard {
     type Err = String;
     fn from_str(text: &str) -> Result<Self, String> {
         let text = text.trim();
-        let invalid = || format!("RTX expert layers must be auto, all, N or N% (got {text:?})");
+        let invalid = || format!("RTX expert layers must be auto, max, all, N or N% (got {text:?})");
         match text {
             "auto" | "" => Ok(Self::Auto),
             "all" => Ok(Self::Fraction(1.0)),
+            "max" => Ok(Self::ExpertsFirst { pool_floor: EXPERTS_FIRST_POOL_FLOOR }),
             _ => match text.strip_suffix('%') {
                 Some(percent) => percent.parse::<f64>().ok().filter(|p| (0.0..=100.0).contains(p))
                     .map(|p| Self::Fraction(p / 100.0)).ok_or_else(invalid),
