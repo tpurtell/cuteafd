@@ -395,7 +395,8 @@ impl<'a> GlmEngine<'a> {
         let exchange = PeerExchange::new(self.library, [RankDevice { device: self.device, stream: self.stream },
             RankDevice { device, stream }], 4 * self.prefill_lanes.max(1), rows * self.cfg.hidden * 2)?;
         let peer = exchange.on(1, || -> Result<GlmPeer<'a>> {
-            self.programs.load_all()?;
+            let selected = cuteafd_core::coordinator_programs::CoordinatorPrograms { family: "glm", split_family: Some("glm2") };
+            self.programs.load_matching(|name| selected.contains(name))?;
             let (kv, index, cos_sin) = caches(self.library, &self.cfg, &layers, self.pages, self.max_context)?;
             Ok(GlmPeer { device, stream, layers, kv, index, cos_sin, decode_workspace: RefCell::new(None),
                 lane_workspaces: RefCell::new(Vec::new()), graphs: RefCell::new(std::collections::HashMap::new()),

@@ -221,9 +221,11 @@ def main():
     parser.add_argument("--device-map", default="rtx0=0,rtx1=1",
                         help="planner device=ledger device pairs for the logs given (e.g. spark0=0)")
     parser.add_argument("--ready", action="store_true",
-                        help="placement gate: the ledger at ready (tracked bytes from the last report, untracked from "
-                             "the first report at or after the API is ready) vs the plan without its growth items; "
-                             "exit 1 when a device differs by more than --tolerance-mib")
+                        help="placement gate: the ledger at ready vs the plan without its growth items; exit 1 when a "
+                             "device differs by more than --tolerance-mib. Tracked bytes come from the last report (fixed-"
+                             "size buffers some families allocate on their first request, e.g. prefill workspaces, count: "
+                             "admission must have reserved them); untracked (context, modules, graphs) from the first "
+                             "report at or after the API is ready, before lazily captured graphs grow it")
     parser.add_argument("--tolerance-mib", type=float, default=64.0)
     args = parser.parse_args()
     if args.ready:
