@@ -1,0 +1,19 @@
+{
+ "model": "deepseek-ai/DeepSeek-V4-Flash-0731",
+ "rtx": 1,
+ "sparks": 2,
+ "context": 1048576,
+ "onboard": "auto",
+ "manifest": "~/.cache/cuteafd/builds/v4-placement/plans-input/flash-1-1048576/PROGRAMS.json",
+ "driver": "13.2",
+ "gpus": [
+  {
+   "total_bytes": 34144990003,
+   "admission_free_bytes": 23609651827,
+   "context_bytes": 598999040,
+   "module_bytes": 2097152
+  }
+ ],
+ "pool_tokens": 830976,
+ "onboard_layers": 0
+}
