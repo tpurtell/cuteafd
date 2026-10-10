@@ -22,6 +22,7 @@ fn request(gpus: usize, free: u64, layers: usize, sparks: usize, onboard: Onboar
         fixed: Vec::new(),
         movables: Vec::new(),
         expert_workspace: GIB / 4,
+        tp2_workspace: [0; 2],
         onboard,
         expert_gpus: gpus,
         policy: LayerPolicy { default: vec![LayerMode::HeadSplit], by_kind: Vec::new() },
@@ -283,4 +284,91 @@ fn executors_refuse_modes_they_cannot_run_at_plan_time() {
         Err(PlacementError::UnsupportedMode { family: "deepseek_v4", layer: 1, mode: S1 }));
     assert!(families::DEEPSEEK_V41.runs(W1) && !families::QWEN4.runs(LayerMode::HeadSplit));
     assert_eq!(families::executor("glm5_flash").map(|e| e.hops), Some(false));
+}
+
+fn tp2_request(free: [u64; 2], onboard: Onboard) -> PlacementRequest {
+    let mut req = request(2, free[0], 60, 4, onboard);
+    req.inventory.gpus[1].baseline = Baseline::Measured { free_bytes: free[1] };
+    req.tp2_workspace = [GIB / 2, GIB / 4];
+    for layer in &mut req.layers {
+        let cost = layer.experts.as_mut().unwrap();
+        cost.tp2 = true;
+        cost.half = [Bytes2 { resident: GIB / 2, staging: GIB / 8 }; 2];
+    }
+    req
+}
+
+#[test]
+fn tp2_auto_fixed_max_use_the_tighter_rank() {
+    for free in [[44 * GIB; 2], [48 * GIB, 44 * GIB], [44 * GIB, 48 * GIB]] {
+        for onboard in [Onboard::Auto, Onboard::Layers(10), Onboard::Fraction(1.0 / 6.0),
+            Onboard::ExpertsFirst { pool_floor: 262_144 }] {
+            let req = tp2_request(free, onboard);
+            let placement = solve(&req).unwrap();
+            assert!(placement.expert_ranges.iter().all(|r| r.layers == 0 && r.peak_bytes == 0));
+            assert!(placement.layers.iter().all(|l| !matches!(l.experts, ExpertHome::RtxWhole { .. })));
+            let t = placement.tp2.unwrap();
+            assert_eq!(t.layers, placement.onboard_layers);
+            assert!(placement.layers[..t.layers].iter().all(|l| l.experts == ExpertHome::RtxTp2));
+            assert_eq!(t.peak_bytes, [GIB / 2 + t.layers as u64 * GIB / 2 + GIB / 8,
+                GIB / 4 + t.layers as u64 * GIB / 2 + GIB / 8]);
+            if onboard == Onboard::Auto {
+                assert_eq!(placement.pool_tokens, 2 << 20);
+                assert_eq!(t.layers, if free[0] == 44 * GIB { 22 } else { 23 });
+            } else if onboard.layers(60).is_some() {
+                assert_eq!(t.layers, 10);
+                let fit = (0..2).map(|g| (free[g] - t.peak_bytes[g]) / UNIT * 256).min().unwrap();
+                assert_eq!(placement.pool_tokens, fit);
+            } else { assert_eq!(t.layers, 60); }
+        }
+    }
+    let mut req = tp2_request([12 * GIB, 48 * GIB], Onboard::Auto);
+    let p = solve(&req).unwrap();
+    assert_eq!(p.pool_tokens, 12 * GIB / UNIT * 256);
+    assert!(p.tp2.is_none());
+    req.onboard = Onboard::Layers(30);
+    assert!(matches!(solve(&req), Err(PlacementError::ExpertLayers { .. })));
+    req = tp2_request([31 * GIB; 2], Onboard::Layers(60));
+    assert!(matches!(solve(&req), Err(PlacementError::BelowFloor { .. })));
+}
+
+#[test]
+fn tp2_keeps_dspark_tp1_arena_separate() {
+    let mut req = tp2_request([44 * GIB; 2], Onboard::Auto);
+    req.movables.push(Movable { id: MovableId::DsparkExperts, allowed: vec![0], expert_arena: true,
+        parts: vec![Bytes2 { resident: 2 * GIB, staging: GIB / 4 }; 3] });
+    let p = solve(&req).unwrap();
+    assert_eq!(p.movables, [(MovableId::DsparkExperts, 0)]);
+    assert_eq!(p.expert_ranges[0].peak_bytes, 6 * GIB + GIB / 2);
+    assert_eq!(p.expert_ranges[1].peak_bytes, 0);
+    let t = p.tp2.unwrap();
+    assert_eq!(t.layers, 9);
+    for g in 0..2 {
+        let charge: u64 = p.items[g].iter().filter(|i| i.category == cuteafd_core::memory_layout::Category::Experts).map(|i| i.bytes).sum();
+        assert_eq!(charge, t.peak_bytes[g] + p.expert_ranges[g].peak_bytes);
+    }
+}
+
+#[test]
+fn one_gpu_placements_ignore_tp2_costs_byte_for_byte() {
+    for onboard in [Onboard::Auto, Onboard::Layers(10), Onboard::Fraction(0.25),
+        Onboard::ExpertsFirst { pool_floor: 262_144 }] {
+        let req = request(1, 44 * GIB, 60, 4, onboard);
+        let expected = solve(&req).unwrap();
+        let mut half = req;
+        half.tp2_workspace = [u64::MAX; 2];
+        for layer in &mut half.layers {
+            layer.experts.as_mut().unwrap().tp2 = true;
+            layer.experts.as_mut().unwrap().half = [Bytes2 { resident: u64::MAX, staging: u64::MAX }; 2];
+        }
+        assert_eq!(solve(&half).unwrap(), expected);
+    }
+}
+
+#[test]
+fn tp2_staging_peak_is_reserved_beside_every_half() {
+    let mut req = tp2_request([44 * GIB; 2], Onboard::Layers(2));
+    req.layers[0].experts.as_mut().unwrap().half[0].staging = 3 * GIB;
+    let t = solve(&req).unwrap().tp2.unwrap();
+    assert_eq!(t.peak_bytes[0], GIB / 2 + GIB + 3 * GIB);
 }

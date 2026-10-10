@@ -9,12 +9,10 @@
 //! movables (drafter stage experts) are charged before the pool too, so an
 //! automatic pool can never crowd them out.
 //!
-//! Placement PR 1 added `HeadSplit` and `Whole` layer modes and contiguous
-//! whole-layer expert ranges (GPU0, then GPU1). PR 3 adds per-layer
-//! ownership: the residual's home at every layer boundary ([`ResidualHome`]),
-//! the [`Hop`]s the modes imply (their receive buffers charged as fixed
-//! demands) and the executor's mode set ([`ExecutorModes`]), refused at plan
-//! time when a layer would need a mode the family cannot run. No TP2 experts.
+//! Per-layer residual homes and hops are validated against the executor's
+//! mode set; hop receive buffers are fixed demands. Peer-accessible two-GPU
+//! builds use a contiguous TP2 expert prefix with no additional residual hop;
+//! TP1 arena-sharing movables retain a separate arena and workspace.
 use cuteafd_core::memory_layout::{Basis, Category, Item};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -48,6 +46,8 @@ pub struct PlacementRequest {
     /// Workspace of a GPU's local expert arena, charged once on every GPU
     /// that holds a routed layer or an arena-sharing movable.
     pub expert_workspace: u64,
+    /// Separate TP2 backbone workspace per rank; excludes TP1 movables.
+    pub tp2_workspace: [u64; 2],
     /// Which fixes the plan: the pool (`Auto`) or the RTX expert layers.
     pub onboard: Onboard,
     /// GPUs (from GPU0) whose executors can hold whole routed layers.
@@ -370,14 +370,19 @@ pub struct ExpertRange {
 pub struct Tp2Range {
     pub first: usize,
     pub layers: usize,
-    /// Each GPU's arena peak: workspace, arena movables on that GPU, every
-    /// half layer, with the largest transient load staging.
+    /// Each GPU's TP2 arena peak: workspace and half layers with transient
+    /// load staging. Excludes the separate TP1 movable arena.
     pub peak_bytes: [u64; 2],
 }
 
 impl Placement {
     /// The `cuteafd plan --layout` line runtimes log once at admission.
     pub fn summary(&self) -> String {
+        if let Some(t) = self.tp2 {
+            return format!("pool {} tokens; onboard {} RTX expert layers: rtx0/rtx1: {} TP2 expert layer halves ({}..{}); arenas [{}, {}] B; TP1 dSpark {} B",
+                self.pool_tokens, self.onboard_layers, t.layers, t.first, t.first + t.layers,
+                t.peak_bytes[0], t.peak_bytes[1], self.expert_ranges[0].peak_bytes);
+        }
         let ranges = self.expert_ranges.iter().enumerate()
             .map(|(gpu, r)| format!("rtx{gpu} {}..{} ({} B)", r.first, r.first + r.layers, r.peak_bytes))
             .collect::<Vec<_>>().join(", ");
