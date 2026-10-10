@@ -63,6 +63,7 @@ async fn create(
     p.turn.tape = tape;
     let streaming = p.wire["stream"].as_bool().unwrap_or(false);
     account(&mut p, usage, streaming);
+    tracing::info!(protocol = "responses", transport = "http", items = p.turn.items.len(), tools = p.turn.tools.len(), "gateway turn");
     let stream = match gateway.run(p.turn.clone()).await {
         Ok(s) => s,
         Err(e) => return e.openai_response(),
@@ -398,7 +399,10 @@ async fn websocket_loop(mut socket: WebSocket, gateway: Arc<Gateway>, tape: Tape
             if p.wire["generate"] == false {
                 gateway.count_tokens(p.turn.clone()).await.map(|_| None)
             } else {
-                gateway.run(p.turn.clone()).await.map(Some)
+                {
+                    tracing::info!(protocol = "responses", transport = "websocket", items = p.turn.items.len(), tools = p.turn.tools.len(), "gateway turn");
+                    gateway.run(p.turn.clone()).await.map(Some)
+                }
             }
         };
         tokio::pin!(start);

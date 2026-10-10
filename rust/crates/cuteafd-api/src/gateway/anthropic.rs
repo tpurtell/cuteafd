@@ -89,7 +89,10 @@ async fn messages(
             ];
             super::driver::account_stream(Box::pin(futures::stream::iter(events)), usage, false)
         } else {
-            gateway.run(turn).await?
+            {
+                tracing::info!(protocol = "messages", transport = "http", items = turn.items.len(), tools = turn.tools.len(), "gateway turn");
+                gateway.run(turn).await?
+            }
         };
         Ok::<_, GatewayError>((model, streaming, stream))
     }
