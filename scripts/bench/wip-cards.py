@@ -30,7 +30,7 @@ CORRECTNESS = {'sim-5090', 'fidelity', 'cache', 'image', 'no-fit', 'packed-check
 NAME = re.compile(r'[A-Za-z0-9][A-Za-z0-9_.-]*\Z')
 ANSI = re.compile(r'\x1b\[[0-9;]*m')
 METRICS = ('C1', 'C8', '8K', 'kl', 'top1', 'pool', 'readiness_s')
-PANELS = {'baseline', 'hardware', 'configuration', 'decode_content', 'concurrency', 'prefill', 'retained', 'prefix_cache', 'startup', 'agentic', 'tool_eval', 'structured', 'ifeval', 'code', 'math', 'needle', 'fidelity', 'fidelity_full', 'reasoning_effort'}
+PANELS = {'baseline', 'hardware', 'configuration', 'decode_content', 'concurrency', 'draft_mix', 'prefill', 'retained', 'prefix_cache', 'startup', 'agentic', 'tool_eval', 'structured', 'ifeval', 'code', 'math', 'needle', 'fidelity', 'fidelity_full', 'reasoning_effort'}
 
 
 def short_instance(value):
