@@ -131,6 +131,10 @@ impl ProgramSet {
     }
 }
 
+/// The planner item group of reserved bytes allocated only after ready (lazy
+/// graph captures, graph margins): outside the ready-ledger compare.
+pub const GRAPH_GROWTH: &str = "graph growth";
+
 /// When an item exists relative to readiness.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -146,7 +150,10 @@ pub enum Lifetime {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GraphRank {
     pub executables: u64,
+    /// Reserved: the captured estimate plus the driver margin.
     pub bytes: u64,
+    /// Of `bytes`, the margin (driver variance, late captures); growth.
+    pub margin: u64,
 }
 
 /// The decode graph set a family captures, per rank (lead first). The
@@ -167,15 +174,15 @@ impl GraphSet {
         shapes: u64, lifetime: Lifetime) -> Self {
         let ranks = executables.iter().map(|&count| {
             let measured = count.saturating_mul(per_executable);
-            GraphRank { executables: count, bytes: measured.saturating_add(
-                (measured.saturating_mul(margin_percent).div_ceil(100)).max(minimum_margin)) }
+            let margin = measured.saturating_mul(margin_percent).div_ceil(100).max(minimum_margin);
+            GraphRank { executables: count, bytes: measured.saturating_add(margin), margin }
         }).collect();
         Self { ranks, lifetime, shapes }
     }
 
     /// A lazily captured set bounded by a byte budget per rank.
     pub fn budget(per_rank: &[u64]) -> Self {
-        Self { ranks: per_rank.iter().map(|&bytes| GraphRank { executables: 0, bytes }).collect(),
+        Self { ranks: per_rank.iter().map(|&bytes| GraphRank { executables: 0, bytes, margin: bytes }).collect(),
             lifetime: Lifetime::Growth, shapes: 0 }
     }
 
@@ -189,6 +196,16 @@ impl GraphSet {
         let group = match self.lifetime { Lifetime::Startup => "graphs", Lifetime::Growth => "graph growth" };
         super::Demand::new(rank as u8, Category::Runtime, group, self.bytes(rank), Basis::Formula)
     }
+
+    /// The planner items for `rank`: the captured estimate at ready ("graphs")
+    /// and the margin (or a lazy set's budget) as "graph growth".
+    pub fn items(&self, rank: usize) -> Vec<cuteafd_core::memory_layout::Item> {
+        use cuteafd_core::memory_layout::Item;
+        let Some(r) = self.ranks.get(rank) else { return Vec::new() };
+        let captured = match self.lifetime { Lifetime::Startup => r.bytes - r.margin, Lifetime::Growth => 0 };
+        [("graphs", captured), (GRAPH_GROWTH, r.bytes - captured)].into_iter().filter(|(_, b)| *b > 0)
+            .map(|(group, bytes)| Item::new(Category::Runtime, group, "", bytes, Basis::Formula)).collect()
+    }
 }
 
 /// Exact scratch of an `fp8moe` expert package (FP8, NVFP4, NVFP4-A4) at the
@@ -200,6 +217,27 @@ pub fn fp8moe_scratch_bytes(manifest: &Value, layout: &str, rows: u64) -> Option
     capacities.iter().filter_map(|c| Some((c["capacity"].as_u64()?, c["scratch_bytes"].as_u64()?)))
         .filter(|&(capacity, _)| capacity >= rows).min_by_key(|&(capacity, _)| capacity)
         .map(|(_, bytes)| bytes.max(256))
+}
+
+/// The `fp8moe` package a coordinator loads for `format` experts of geometry
+/// `family` (`fp8-<family>[-nvfp4[a4]]`, W4A4 preferred where built, as
+/// `shared::experts::fp8::package_directory`), under `lib`'s `fp8/` tree, and
+/// its scratch for `rows` rows.
+pub fn fp8moe_package_scratch(lib: &std::path::Path, family: &str,
+    format: crate::formats::fp8_experts::ExpertFormat, rows: u64) -> Option<(String, u64)> {
+    use crate::formats::fp8_experts::ExpertFormat;
+    let a4 = (format == ExpertFormat::Nvfp4).then(|| format!("fp8-{family}-nvfp4a4"));
+    let name = a4.filter(|n| lib.join("fp8").join(n).is_dir())
+        .unwrap_or_else(|| format!("fp8-{family}{}", format.package_suffix()));
+    let manifest: Value = serde_json::from_slice(&std::fs::read(lib.join("fp8").join(&name).join("manifest.json")).ok()?).ok()?;
+    Some((name, fp8moe_scratch_bytes(&manifest, "tp1", rows)?))
+}
+
+/// The image's `lib/` directory next to a `share/PROGRAMS.json` manifest
+/// (`/opt/cuteafd/share/PROGRAMS.json` -> `/opt/cuteafd/lib`).
+pub fn image_lib(manifest: Option<&std::path::Path>) -> std::path::PathBuf {
+    let manifest = manifest.unwrap_or(std::path::Path::new("/opt/cuteafd/share/PROGRAMS.json"));
+    manifest.parent().map(|share| share.join("../lib")).unwrap_or_else(|| "/opt/cuteafd/lib".into())
 }
 
 /// The EXL3 capacities a local executor compiles for at most `rows` live rows:
@@ -236,6 +274,8 @@ mod tests {
     fn graph_set_margins_and_lifetimes() {
         let set = GraphSet::new(&[12_397, 0], 149_712, 10, 256 << 20, 253, Lifetime::Startup);
         assert_eq!(set.bytes(0), 1_855_979_664 + (256 << 20));
+        assert_eq!(set.items(0).iter().map(|i| (i.group.as_str(), i.bytes)).collect::<Vec<_>>(),
+            [("graphs", 1_855_979_664), ("graph growth", 256 << 20)]);
         assert_eq!(set.demand(0).group, "graphs");
         assert_eq!(GraphSet::budget(&[1 << 30]).demand(0).group, "graph growth");
     }

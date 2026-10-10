@@ -8,6 +8,7 @@
 //! now live here, once.
 use crate::families::deepseek_v4::DeepseekV4Config;
 use crate::placement::*;
+use crate::placement::inventory::GraphSet;
 use crate::serving_capacity::{deepseek_v4_cache_geometry, deepseek_v4_expert_cost, deepseek_v4_expert_exchange_bytes,
     deepseek_v4_headroom_bytes, deepseek_v4_layer_unit_bytes, deepseek_v4_peer_exchange_bytes, V4ExpertCost,
     V4WorkspaceRank};
@@ -15,9 +16,11 @@ use cuteafd_core::memory_layout::{Basis, Category};
 
 /// Prefill lanes of the V4 engine (`engine::PREFILL_LANES`).
 pub const PREFILL_LANES: u64 = 2;
-/// Runtime CUDA context + module allowance per role (1 GPU, lead, peer).
-pub const RUNTIME_BYTES: [u64; 3] = [gib(65), gib(60), gib(60)];
-/// Graph allowance per role.
+/// Lazily captured decode graphs per role (1 GPU, lead, peer): V4 keys its
+/// segment graphs by the exact compressed-table width, so the set grows with
+/// traffic after ready (rc3: +0.5-0.65 GiB Flash, +1.2-1.3 GiB Pro within a
+/// smoke run). Reserved as growth beside the pool, never part of the ready
+/// ledger (`inventory::GraphSet::budget`).
 pub const GRAPH_BYTES: [u64; 3] = [gib(35), gib(40), gib(25)];
 /// Step workspace allowance per role at 4096 prefill rows, used only when no
 /// program manifest gives the exact geometry.
@@ -128,7 +131,7 @@ pub fn fixed_demands(inputs: &V4Inputs<'_>) -> Result<(Vec<Demand>, Vec<u64>, Ve
                 mul(cache.retained_mark_bytes, inputs.mark_slots, "V4 marks")?, Basis::Formula));
         }
         demands.push(Demand::new(gpu, Category::Workspace, "steps", workspace, basis));
-        demands.push(Demand::new(gpu, Category::Runtime, "graph allowance", GRAPH_BYTES[role], Basis::Estimated));
+        demands.push(GraphSet::budget(&[GRAPH_BYTES[role]]).demand(0).on(gpu));
         if gpus == 2 {
             demands.push(Demand::new(gpu, Category::Transport, "peer exchange",
                 deepseek_v4_peer_exchange_bytes(hidden, inputs.prefill_rows, inputs.decode_rows)
