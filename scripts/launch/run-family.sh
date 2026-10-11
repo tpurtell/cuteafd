@@ -1329,6 +1329,12 @@ if [[ "${CUTEAFD_GRAPH_CENSUS:-}" == 1 ]]; then
       -e "CUTEAFD_GRAPH_CENSUS_CONTROL=/run/cuteafd-graph-census/$(basename "$CUTEAFD_GRAPH_CENSUS_CONTROL")")
   fi
 fi
+if [[ -n "${CUTEAFD_GRAPH_EAGER:-}" ]]; then
+  [[ -n "$wip_layout" ]] || { printf '%s\n' 'Graph eager override requires a WIP build' >&2; exit 2; }
+  [[ "$CUTEAFD_GRAPH_EAGER" == layer_row ]] || { printf '%s\n' 'Graph eager override must be layer_row' >&2; exit 2; }
+  [[ "${CUTEAFD_GRAPH_CENSUS:-}" != 1 ]] || { printf '%s\n' 'Graph eager A/B requires census timing disabled' >&2; exit 2; }
+  graph_census_args+=(-e CUTEAFD_GRAPH_EAGER=layer_row)
+fi
 bench_nonce_env_args=()
 [[ -z "${CUTEAFD_BENCH_NONCE_SEED:-}" ]] || bench_nonce_env_args+=(-e "CUTEAFD_BENCH_NONCE_SEED=$CUTEAFD_BENCH_NONCE_SEED")
 tp2_env_args=()

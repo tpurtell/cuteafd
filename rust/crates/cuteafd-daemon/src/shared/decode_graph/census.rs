@@ -2,6 +2,7 @@
 use std::sync::{atomic::{AtomicU8, Ordering}, OnceLock};
 
 static ENABLED: OnceLock<bool> = OnceLock::new();
+static STARTUP_EAGER: OnceLock<bool> = OnceLock::new();
 static EAGER: AtomicU8 = AtomicU8::new(0);
 
 pub(crate) fn enabled() -> bool {
@@ -26,8 +27,16 @@ pub(crate) fn idle() {
     }
 }
 
+fn startup_eager(bank: &str, value: Option<&str>) -> bool {
+    bank == "layer_row" && value == Some("layer_row")
+}
+
 pub(crate) fn eager(bank: &str) -> bool {
-    enabled() && bank_id(bank).is_some_and(|id| id != 0 && id == EAGER.load(Ordering::Relaxed))
+    // WIP launchers admit this startup-only arm without enabling census timing.
+    let forced = bank == "layer_row" && *STARTUP_EAGER.get_or_init(|| {
+        startup_eager("layer_row", std::env::var("CUTEAFD_GRAPH_EAGER").ok().as_deref())
+    });
+    forced || (enabled() && bank_id(bank).is_some_and(|id| id != 0 && id == EAGER.load(Ordering::Relaxed)))
 }
 
 pub(crate) fn arm() -> u8 { EAGER.load(Ordering::Relaxed) }
@@ -52,6 +61,34 @@ pub(crate) unsafe fn dispatch(library: &cuteafd_ffi::NativeLibrary,
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn startup_eager_only_selects_layer_row_without_timing() {
+        assert!(super::startup_eager("layer_row", Some("layer_row")));
+        for value in [None, Some(""), Some("sparse"), Some("all")] {
+            assert!(!super::startup_eager("layer_row", value));
+        }
+        assert!(!super::startup_eager("sparse", Some("layer_row")));
+    }
+
+    #[test]
+    fn startup_eager_does_not_enable_census_timing() {
+        const CHILD: &str = "CUTEAFD_GRAPH_EAGER_TEST_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            assert!(super::eager("layer_row"));
+            assert!(!super::enabled());
+            for bank in ["sparse", "index", "head", "dspark", "window"] {
+                assert!(!super::eager(bank));
+            }
+            return;
+        }
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "shared::decode_graph::census::tests::startup_eager_does_not_enable_census_timing"])
+            .env(CHILD, "1").env("CUTEAFD_GRAPH_EAGER", "layer_row")
+            .env_remove("CUTEAFD_GRAPH_CENSUS").env_remove("CUTEAFD_GRAPH_CENSUS_CONTROL")
+            .status().unwrap();
+        assert!(status.success());
+    }
+
     #[test]
     fn unknown_control_does_not_select_a_bank() {
         assert_eq!(super::bank_id("baseline"), Some(0));

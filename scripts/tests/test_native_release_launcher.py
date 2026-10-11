@@ -146,6 +146,7 @@ class NativeReleaseLauncherTest(unittest.TestCase):
                     with self.subTest(launcher=launcher, value=value, wip=wip, path=path):
                         env = dict(os.environ)
                         env.pop('CUTEAFD_GRAPH_CENSUS', None)
+                        env.pop('CUTEAFD_GRAPH_EAGER', None)
                         if value is not None:
                             env['CUTEAFD_GRAPH_CENSUS'] = value
                         env['CUTEAFD_GRAPH_CENSUS_CONTROL'] = path
@@ -164,6 +165,32 @@ class NativeReleaseLauncherTest(unittest.TestCase):
                                 expected += ['-v', f'{directory}:/run/cuteafd-graph-census:ro', '-e',
                                     'CUTEAFD_GRAPH_CENSUS_CONTROL=/run/cuteafd-graph-census/bank.txt']
                         expected += ['after']
+                        self.assertEqual(result.stdout, ('\0'.join(expected) + '\0').encode())
+
+    def test_startup_graph_eager_override_is_wip_only_and_untimed(self) -> None:
+        for launcher in ['run.sh', 'scripts/launch/run-family.sh']:
+            source = (ROOT / launcher).read_text()
+            suffix = source.split('if [[ -n "${CUTEAFD_GRAPH_EAGER:-}" ]]; then\n', 1)[1]
+            block = 'if [[ -n "${CUTEAFD_GRAPH_EAGER:-}" ]]; then\n' + suffix.split('\nfi', 1)[0] + '\nfi\n'
+            for eager, census, wip, valid in [
+                (None, None, '', True), ('', None, '', True),
+                ('layer_row', None, '/slot', True), ('layer_row', '0', '/slot', True),
+                ('layer_row', None, '', False), ('sparse', None, '/slot', False),
+                ('layer_row', '1', '/slot', False),
+            ]:
+                with self.subTest(launcher=launcher, eager=eager, census=census, wip=wip):
+                    env = dict(os.environ)
+                    for name, value in [('CUTEAFD_GRAPH_EAGER', eager), ('CUTEAFD_GRAPH_CENSUS', census)]:
+                        env.pop(name, None)
+                        if value is not None:
+                            env[name] = value
+                    harness = 'set -euo pipefail\nrelease_die() { exit 2; }\nwip_layout=$1\ngraph_census_args=()\n'
+                    result = subprocess.run(['bash', '-c', harness + block +
+                        'printf "%s\\0" before "${graph_census_args[@]}" after', 'test', wip],
+                        env=env, capture_output=True)
+                    self.assertEqual(result.returncode == 0, valid, result.stderr)
+                    if valid:
+                        expected = ['before'] + (['-e', 'CUTEAFD_GRAPH_EAGER=layer_row'] if eager else []) + ['after']
                         self.assertEqual(result.stdout, ('\0'.join(expected) + '\0').encode())
 
     def test_embedding_placement_registered_and_gpu_default(self) -> None:
