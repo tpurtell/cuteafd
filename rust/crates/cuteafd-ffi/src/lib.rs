@@ -26,8 +26,10 @@ pub use shared::v41_experts::{
     V41CompactReducer, V41LocalExpertReducer, V41Tp2ExpertReducer, V41RouteReducer, V41_EXPERT_POINTER_COUNT,
     v41_pack_intermediate_supported, v41_rank_count_supported,
 };
+pub use shared::rtx_combine::{RtxPartialDtype, RtxTp2Combine};
 mod cuda_runtime;
 pub mod memory_ledger;
+pub mod synchronized_load;
 
 static COORDINATOR_GPU_BUDGET: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static GPU_BUDGET_ALLOCATION: Mutex<()> = Mutex::new(());

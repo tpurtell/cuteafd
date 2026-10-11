@@ -62,11 +62,11 @@ pub struct V4Inputs<'a> {
     pub experts: Vec<V4ExpertCost>,
     /// dSpark stage experts loaded into GPU0's arena (`--dspark`).
     pub draft: Vec<V4ExpertCost>,
-    /// Routed layers may also live on GPU1. EXL3 executions are per device;
-    /// the native `rtx_backbone` variant table binds each capacity to the
-    /// first device that initializes it (native/shared/src/v41_experts.cc),
-    /// so native MXFP4 layers stay on GPU0 until TP2 experts (placement P4).
-    pub peer_experts: bool,
+    /// Half-layer residency per routed backbone layer and rank.
+    pub experts_half: Vec<[V4ExpertCost; 2]>,
+    pub tp2_workspace: [u64; 2],
+    /// Force FP32 FFN payloads for prefill as well as decode.
+    pub exchange_f32: bool,
     /// The local expert arena's workspace.
     pub expert_workspace: u64,
     pub first_routed: usize,
@@ -138,7 +138,7 @@ pub fn fixed_demands(inputs: &V4Inputs<'_>) -> Result<(Vec<Demand>, Vec<u64>, Ve
         demands.push(GraphSet::budget(&[GRAPH_BYTES[role]]).demand(0).on(gpu));
         if gpus == 2 {
             demands.push(Demand::new(gpu, Category::Transport, "peer exchange",
-                deepseek_v4_peer_exchange_bytes(hidden, inputs.prefill_rows, inputs.decode_rows)
+                deepseek_v4_peer_exchange_bytes(hidden, inputs.prefill_rows, inputs.decode_rows, true, inputs.exchange_f32)
                     .map_err(|_| PlacementError::Overflow("V4 peer exchange"))?, Basis::Formula));
             demands.push(Demand::new(gpu, Category::Transport, "expert peer exchange", exchange, Basis::Formula));
         }
@@ -155,7 +155,7 @@ pub fn fixed_demands(inputs: &V4Inputs<'_>) -> Result<(Vec<Demand>, Vec<u64>, Ve
 }
 
 /// The complete V4 request: CSA layers (replicated latent under the head
-/// split), whole-layer RTX experts GPU0 then GPU1, dSpark stage experts in
+/// split), TP2 backbone halves on two RTX, dSpark stage experts in
 /// GPU0's arena. The pool unit sums each layer's records plus the overhead.
 pub fn request(inputs: &V4Inputs<'_>) -> Result<PlacementRequest, PlacementError> {
     let gpus = inputs.gpus.len();
@@ -166,7 +166,9 @@ pub fn request(inputs: &V4Inputs<'_>) -> Result<PlacementRequest, PlacementError
     let layers = (0..inputs.cfg.n_layers).map(|layer| {
         let unit = deepseek_v4_layer_unit_bytes(inputs.cfg.compress_ratios[layer]);
         let experts = layer.checked_sub(first).and_then(|i| inputs.experts.get(i)).map(|cost| ExpertCost {
-            whole: Bytes2 { resident: cost.resident_bytes, staging: cost.staging_bytes }, tp2: false, spark_ok: true });
+            whole: Bytes2 { resident: cost.resident_bytes, staging: cost.staging_bytes },
+            half: inputs.experts_half.get(layer - first).map(|halves| halves.map(|h| Bytes2 { resident: h.resident_bytes, staging: h.staging_bytes })).unwrap_or_default(),
+            tp2: gpus == 2 && inputs.experts_half.get(layer - first).is_some(), spark_ok: true });
         LayerDemand {
             kind: AttentionClass::Csa,
             // Coordinator weights load before admission (inside the baseline).
@@ -191,8 +193,9 @@ pub fn request(inputs: &V4Inputs<'_>) -> Result<PlacementRequest, PlacementError
         fixed,
         movables,
         expert_workspace: inputs.expert_workspace,
+        tp2_workspace: inputs.tp2_workspace,
         onboard: inputs.onboard,
-        expert_gpus: if inputs.peer_experts { gpus } else { 1 },
+        expert_gpus: if gpus == 2 && inputs.experts_half.is_empty() { 0 } else { 1 },
         policy: LayerPolicy { default: vec![LayerMode::HeadSplit, LayerMode::Whole { gpu: 0, ffn: FfnMode::Owner }],
             by_kind: Vec::new() },
         // The mHC streams `[T,4,H]` BF16; V4's only hop is the entry
@@ -217,24 +220,29 @@ pub fn code_bytes(dim: usize, experts: &str, gpus: usize) -> Vec<u64> {
         .collect()
 }
 
-/// V4's experts-first policy (v2's default; `RTX_EXPERT_LAYERS=max`).
-pub const DEFAULT_ONBOARD: Onboard = Onboard::ExpertsFirst { pool_floor: crate::placement::EXPERTS_FIRST_POOL_FLOOR };
-
-/// V4's default onboard on `gpus` coordinator GPUs. Both Flash and Pro on
-/// one RTX reserve the KV pool first (`auto`); placement throughput costs
-/// are performance bugs, not reasons to change the pool-first policy.
-/// Two RTX keep experts first until TP2 experts (P4).
-/// `RTX_EXPERT_LAYERS=max` / `auto` select either on any layout.
-pub fn default_onboard(_dim: usize, gpus: usize) -> Onboard {
-    if gpus == 1 { Onboard::Auto } else { DEFAULT_ONBOARD }
+/// V4 defaults uniformly to pool-first placement. Explicit `max` remains
+/// supported; on two RTX every resident backbone expert is a TP2 half.
+pub fn default_onboard() -> Onboard {
+    Onboard::Auto
 }
 
-/// Whether routed layers may also live on GPU1: opted in, and only for EXL3
-/// packages (per-device executions). Native `rtx_backbone` binds each capacity
-/// to the first device that initializes it; the GPU1 EXL3 range executor
-/// deadlocks two-lane prefill (peer_wait), so it stays opt-in until P3/P4.
-pub fn peer_experts(catalog: &crate::OfficialV41Catalog, opt_in: bool) -> bool {
-    opt_in && catalog.exl3().is_some()
+#[cfg(test)]
+mod default_tests {
+    use super::*;
+
+    #[test]
+    fn default_onboard_is_pool_first_for_every_v4_layout() {
+        assert_eq!(default_onboard(), Onboard::Auto);
+    }
+}
+
+/// Exact TP2 halves in backbone order, CPU only.
+pub fn expert_half_costs(catalog: &crate::OfficialV41Catalog) -> anyhow::Result<Vec<[V4ExpertCost; 2]>> {
+    let routed = catalog.routed_experts();
+    (routed.first_layer..routed.layers).map(|layer| Ok([
+        crate::serving_capacity::deepseek_v4_tp2_expert_cost(catalog, layer, 0)?,
+        crate::serving_capacity::deepseek_v4_tp2_expert_cost(catalog, layer, 1)?,
+    ])).collect()
 }
 
 /// Whole-layer residency of every routed backbone layer and `stages` dSpark

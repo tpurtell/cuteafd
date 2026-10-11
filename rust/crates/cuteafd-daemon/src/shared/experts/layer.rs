@@ -375,6 +375,7 @@ impl<'a> ExpertWeights<'a> {
         let mut planning_seconds = 0.;
         let mut read_seconds = 0.;
         let mut upload_pack_seconds = 0.;
+        let mut storage_bytes_read = 0;
         // WILLNEED can perform blocking I/O, serializing all six tensor extents
         // per expert. Let the bounded parallel readers issue the reads instead.
         // CPU readers borrow disjoint pinned byte slices; all CUDA calls remain
@@ -391,12 +392,12 @@ impl<'a> ExpertWeights<'a> {
                 let mut readers = Vec::with_capacity(plans.len());
                 for ((plan, host), scratch) in plans.iter().zip(&mut hosts).zip(&mut read_scratch) {
                     let bytes = host.bytes_mut();
-                    readers.push(scope.spawn(move || plan.read_into(bytes, scratch)));
+                    readers.push(scope.spawn(move || OfficialV41Catalog::count_storage_reads(|| plan.read_into(bytes, scratch))));
                 }
                 for reader in readers {
-                    reader
+                    storage_bytes_read += reader
                         .join()
-                        .map_err(|_| anyhow::anyhow!("expert read thread panicked"))??;
+                        .map_err(|_| anyhow::anyhow!("expert read thread panicked"))??.1;
                 }
                 Ok(())
             })?;
@@ -436,7 +437,7 @@ impl<'a> ExpertWeights<'a> {
             unsafe { library.cuda_stream_synchronize(stream.raw)?; }
             upload_pack_seconds += started.elapsed().as_secs_f64();
         }
-        tracing::info!(?layer, experts, allocation_seconds, planning_seconds, read_seconds,
+        tracing::info!(?layer, experts, storage_bytes_read, allocation_seconds, planning_seconds, read_seconds,
             upload_pack_seconds, elapsed_seconds = load_started.elapsed().as_secs_f64(),
             staging_bytes_per_expert = budget.device_staging_bytes,
             "native expert load timeline");
@@ -448,6 +449,122 @@ impl<'a> ExpertWeights<'a> {
             nvfp4: None,
             format: ExpertFormat::of(catalog),
         })
+    }
+
+    /// Read each native projection once for both GPUs. Eight readers in each
+    /// of two full-width banks fit the original pair's 16 half-width slots.
+    pub(crate) fn load_tp2_pair(
+        devices: [crate::shared::memory::device::Device<'a>; 2],
+        catalog: &OfficialV41Catalog,
+        layers: std::ops::Range<usize>,
+        available: [usize; 2],
+    ) -> Result<[crate::shared::memory::device::DeviceOwner<'a, Vec<Self>>; 2]> {
+        use super::paired_load::{self, Projection, Fences};
+        let started = std::time::Instant::now();
+        let lanes = EXPERT_READ_LANES / 2;
+        let mut weights = [devices[0].own(|| Ok(Vec::new()))?, devices[1].own(|| Ok(Vec::new()))?];
+        let mut staging_bytes = [0; 2];
+        let mut pinned_admitted = 0;
+        let mut full_bytes = 0;
+        let mut remaining = available;
+        for layer in layers.clone() {
+            let full = catalog.expert_staging(V41ExpertSelection::BackboneFull { layer, expert: 0 })?;
+            full_bytes = full_bytes.max(full.staging_bytes());
+            let mut pinned = 0;
+            for rank in 0..2 {
+                let selection = ExpertLayer::BackboneTp2 { layer, rank };
+                let (budget, sizes, _, experts) = Self::layout(devices[rank].library, catalog, selection)?;
+                ensure!(budget.peak_device_bytes()? <= remaining[rank], "paired native admission exceeded");
+                staging_bytes[rank] = staging_bytes[rank].max(budget.device_staging_bytes);
+                pinned += budget.pinned_host_bytes;
+                remaining[rank] -= budget.resident_bytes;
+                devices[rank].run(|| {
+                    let mut owned = Vec::with_capacity(4);
+                    for bytes in sizes { owned.push(DeviceAllocation::new(devices[rank].library, bytes)?); }
+                    weights[rank].push(Self { buffers: owned.try_into().ok().expect("four native slabs"),
+                        layer: selection, experts, budget, nvfp4: None, format: ExpertFormat::Native });
+                    Ok(())
+                })?;
+            }
+            pinned_admitted = pinned_admitted.max(pinned);
+        }
+        let staging = [devices[0].own(|| DeviceAllocation::new(devices[0].library, staging_bytes[0]))?,
+            devices[1].own(|| DeviceAllocation::new(devices[1].library, staging_bytes[1]))?];
+        let mut hosts = paired_load::banks(devices[0], lanes, full_bytes, pinned_admitted)?;
+        let mut fences = Fences::new(devices)?;
+        // Last owners constructed: drain both streams before any bank/slab release.
+        let streams = paired_load::streams(devices)?;
+        let allocation_seconds = started.elapsed().as_secs_f64();
+        let mut group = 0;
+        for (index, layer) in layers.enumerate() {
+            let layer_started = std::time::Instant::now();
+            let experts = weights[0][index].experts;
+            let mut storage_bytes_read = 0;
+            let mut read_seconds = 0.;
+            let mut bank_wait_seconds = 0.;
+            let mut upload_submit_seconds = 0.;
+            for first in (0..experts).step_by(lanes) {
+                let bank = group % 2;
+                let wait_started = std::time::Instant::now();
+                fences.reuse(bank)?;
+                bank_wait_seconds += wait_started.elapsed().as_secs_f64();
+                let count = lanes.min(experts - first);
+                let full_plans = (first..first + count).map(|expert|
+                    catalog.expert_staging(V41ExpertSelection::BackboneFull { layer, expert }))
+                    .collect::<Result<Vec<_>>>()?;
+                let rank_plans = (0..2).map(|rank| (first..first + count).map(|expert|
+                    catalog.expert_staging(V41ExpertSelection::BackboneTp2 { layer, expert, rank }))
+                    .collect::<Result<Vec<_>>>()).collect::<Result<Vec<_>>>()?;
+                let plans = full_plans.iter().map(|plan| plan.tensor_names().iter().enumerate().map(|(slot, name)| {
+                    Projection::new(catalog, name.clone(), plan.tensor_ranges()[slot].start,
+                        [catalog.backbone_tp2_slice(name, 0)?, catalog.backbone_tp2_slice(name, 1)?])
+                }).collect::<Result<Vec<_>>>()).collect::<Result<Vec<_>>>()?;
+                paired_load::trace_overlap(&streams, "read_start", layer, first)?;
+                let read_started = std::time::Instant::now();
+                storage_bytes_read += paired_load::read_group(catalog, &plans, &mut hosts[bank])?;
+                read_seconds += read_started.elapsed().as_secs_f64();
+                let upload_started = std::time::Instant::now();
+                for rank in 0..2 {
+                    devices[rank].run(|| {
+                        let weight = &weights[rank][index];
+                        let packer = devices[rank].library.v41_expert_packer(rank_plans[rank][0].intermediate_size() as u32)?;
+                        for (lane, jobs) in plans.iter().enumerate() {
+                            let ranges = rank_plans[rank][lane].tensor_ranges();
+                            for (slot, job) in jobs.iter().enumerate() {
+                                let mut destination = staging[rank].buffer;
+                                // SAFETY: rank staging and tensor ranges were admitted before allocation.
+                                unsafe { destination.ptr = destination.ptr.cast::<u8>().add(ranges[slot].start).cast(); }
+                                destination.bytes = ranges[slot].len();
+                                job.upload(devices[rank], rank, hosts[bank][lane].buffer, destination, &streams[rank])?;
+                            }
+                            // SAFETY: all sources/destinations belong to this rank; its
+                            // serialized stream packs before the next staging overwrite.
+                            unsafe {
+                                let strides = packer.packed_bytes();
+                                let sources = std::array::from_fn(|slot| staging[rank].buffer.ptr.cast::<u8>()
+                                    .add(ranges[slot].start).cast_const());
+                                let destinations = std::array::from_fn(|slot| weight.buffers[slot].buffer.ptr.cast::<u8>()
+                                    .add((first + lane) * strides[slot] as usize));
+                                packer.pack(sources, destinations, streams[rank].raw)?;
+                            }
+                        }
+                        Ok(())
+                    })?;
+                }
+                upload_submit_seconds += upload_started.elapsed().as_secs_f64();
+                fences.record(bank, &streams)?;
+                paired_load::trace_overlap(&streams, "both_submitted", layer, first)?;
+                group += 1;
+            }
+            tracing::info!(layer, storage_bytes_read, read_seconds, bank_wait_seconds, upload_submit_seconds,
+                elapsed_seconds = layer_started.elapsed().as_secs_f64(),
+                "native TP2 shared-read layer timeline");
+        }
+        paired_load::drain(&streams)?;
+        tracing::info!(allocation_seconds, elapsed_seconds = started.elapsed().as_secs_f64(),
+            pinned_host_bytes = full_bytes * lanes * 2, pinned_admitted,
+            read_scratch_bytes = 0, "native TP2 shared-read load complete");
+        Ok(weights)
     }
 
     /// Load the W4A4 planes for one layer and adopt its buffers.

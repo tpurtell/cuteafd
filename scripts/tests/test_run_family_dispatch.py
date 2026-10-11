@@ -341,13 +341,18 @@ def test_deepseek_v4_honors_explicit_local_expert_limit(tmp_path, value):
         assert f"--rtx-expert-layers {value}" in launch
 
 
-@pytest.mark.parametrize("value,flag", [(None, False), ("off", False), ("on", True)])
-def test_deepseek_v4_peer_expert_ranges_are_opt_in(tmp_path, value, flag):
+@pytest.mark.parametrize("value", [None, "off", "on"])
+def test_deepseek_v4_rejects_retired_peer_expert_ranges(tmp_path, value):
     keys = "" if value is None else f"RTX_EXPERT_PEER={value}\n"
     result = _family_launch_result(tmp_path, {"model_type": "deepseek_v4"}, "test/dsv4", keys)
-    assert result.returncode == 0, result.stderr
-    launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-dsv4" in line)
-    assert ("--peer-expert-ranges" in launch) == flag
+    if value == "on":
+        assert result.returncode == 2
+        assert "GPU1 whole-layer expert ranges were replaced by TP2 halves (v3 P4); remove RTX_EXPERT_PEER" in result.stderr
+        assert "docker run" not in result.stderr
+    else:
+        assert result.returncode == 0, result.stderr
+        launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-dsv4" in line)
+        assert "--peer-expert-ranges" not in launch
 
 
 @pytest.mark.parametrize("value", ["-1", "101%", "half", "5x"])

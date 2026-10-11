@@ -39,21 +39,20 @@ pub fn compiled_c128_width(manifest: &Value, family: &str) -> Result<u64, CacheG
 }
 
 /// Four peer slots per each of the two prefill lanes, plus release flags.
-pub fn deepseek_v4_peer_exchange_bytes(hidden: u64, prefill_rows: u64, decode_rows: u64)
-    -> Result<u64, CacheGeometryError> {
-    sum("V4 peer exchange", &[product("V4 peer slots", &[8, prefill_rows.max(decode_rows), hidden, 2])?, 256])
+pub fn deepseek_v4_peer_exchange_bytes(hidden: u64, prefill_rows: u64, decode_rows: u64,
+    tp2: bool, exchange_f32: bool) -> Result<u64, CacheGeometryError> {
+    let slot = if exchange_f32 { product("V4 F32 peer slot", &[prefill_rows.max(decode_rows), hidden, 4])? }
+        else { product("V4 prefill peer slot", &[prefill_rows, hidden, 2])?
+            .max(product("V4 decode peer slot", &[decode_rows, hidden, if tp2 { 4 } else { 2 }])?) };
+    sum("V4 peer exchange", &[product("V4 peer slots", &[8, slot])?, 256])
 }
 
-/// Additional expert slots and the lead's packing buffer. Per-lane/parity
-/// slots carry route IDs, route weights and the lead shared-expert half.
-pub fn deepseek_v4_expert_exchange_bytes(hidden: u64, topk: u64, prefill: u64, decode: u64, rank: usize)
+/// TP2 route-broadcast fallback: two lanes, two parities, per GPU. No
+/// hidden/shared packing buffer, peer wire, or direction multiplier.
+pub fn deepseek_v4_expert_exchange_bytes(_hidden: u64, topk: u64, prefill: u64, decode: u64, _rank: usize)
     -> Result<u64, CacheGeometryError> {
-    // Each section of the packed payload starts 16-byte aligned (+32 B).
-    let payload = sum("V4 expert payload", &[product("V4 expert rows", &[prefill.max(decode), hidden * 2 + topk * 8])?, 32])?;
-    sum("V4 expert exchange", &[product("V4 expert slots", &[4, payload])?,
-        256, if rank == 0 { payload.max(256) } else { 0 },
-        (hidden + hidden / 32).max(256),
-        if rank == 1 { product("V4 peer wire", &[2 * prefill + decode, hidden + hidden / 32])? } else { 3 * 256 }])
+    let payload = sum("V4 route payload", &[product("V4 route rows", &[prefill.max(decode), topk, 8])?, 16])?;
+    sum("V4 route exchange", &[product("V4 route slots", &[4, payload])?, 256])
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -241,6 +240,8 @@ fn step(
         mul(&[rows, c128_width, 4])?,
     ];
     let lane = sum("V4 lane allocations", &lane_allocations.map(|n| n.max(256)))?;
+    let lane = sum("V4 lane payload", &[lane,
+        if ranks == 2 { mul(&[rows, h, 4])?.max(256) } else { 0 }])?;
     let lane = sum(
         "V4 lane metadata",
         &[
@@ -259,10 +260,10 @@ fn step(
         mul(&[rows, cfg.index_n_heads as u64, 4])?,
         mul(&[rows, cfg.index_topk as u64, 4])?,
         scratch.index_topk_bytes,
-        lead(mul(&[rows, cfg.n_routed_experts as u64, 4])?),
-        lead(mul(&[rows, topk, 4])?),
-        lead(mul(&[rows, topk, 4])?),
-        lead(mul(&[rows, h + h / 32])?),
+        mul(&[rows, cfg.n_routed_experts as u64, 4])?,
+        mul(&[rows, topk, 4])?,
+        mul(&[rows, topk, 4])?,
+        mul(&[rows, h + h / 32])?,
         scratch.shared_bytes,
         4096,
         lead(mul(&[rows.min(64), cfg.vocab_size as u64, 4])?),
@@ -294,10 +295,13 @@ mod expert_exchange_tests {
     fn reservation_matches_persistent_slots_lanes_and_checks() {
         for h in [4096, 7168] {
             for (prefill, decode) in [(4096, 64), (16, 64)] {
-                let payload = prefill.max(decode) * (h * 2 + 6 * 8) + 32;
-                let check = h + h / 32;
-                let lead = 4 * payload + 256 + payload + check + 3 * 256;
-                let peer = 4 * payload + 256 + check + (2 * prefill + decode) * check;
+                let payload = prefill.max(decode) * 6 * 8 + 16;
+                let lead = 4 * payload + 256;
+                let peer = lead;
+                assert_eq!(deepseek_v4_peer_exchange_bytes(h, prefill, decode, true, false).unwrap(),
+                    8 * (prefill * h * 2).max(decode * h * 4) + 256);
+                assert_eq!(deepseek_v4_peer_exchange_bytes(h, prefill, decode, true, true).unwrap(),
+                    8 * prefill.max(decode) * h * 4 + 256);
                 assert_eq!(deepseek_v4_expert_exchange_bytes(h, 6, prefill, decode, 0).unwrap(), lead);
                 assert_eq!(deepseek_v4_expert_exchange_bytes(h, 6, prefill, decode, 1).unwrap(), peer);
             }
@@ -358,8 +362,8 @@ mod tests {
         };
         let flash =
             deepseek_v4_workspace_geometry(&config(false), 4096, 64, 131072, 2, scratch).unwrap();
-        assert_eq!(flash[0].device_bytes(1032).unwrap(), 3_597_309_872);
-        assert_eq!(flash[1].device_bytes(1032).unwrap(), 3_228_071_856);
+        assert_eq!(flash[0].device_bytes(1032).unwrap(), 3_732_576_176);
+        assert_eq!(flash[1].device_bytes(1032).unwrap(), 3_385_367_472);
         assert_eq!(flash[0].pool_unit_device_bytes, (4096 * 2 + 64) * 4);
         let pro = deepseek_v4_workspace_geometry(
             &config(true),
@@ -373,8 +377,8 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(pro[0].device_bytes(1032).unwrap(), 4_734_070_704);
-        assert_eq!(pro[1].device_bytes(1032).unwrap(), 4_076_894_128);
+        assert_eq!(pro[0].device_bytes(1032).unwrap(), 4_970_786_736);
+        assert_eq!(pro[1].device_bytes(1032).unwrap(), 4_350_948_272);
         assert_eq!(
             pro[0].device_bytes(1033).unwrap() - pro[0].device_bytes(1032).unwrap(),
             pro[0].pool_unit_device_bytes

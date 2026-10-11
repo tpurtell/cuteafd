@@ -40,8 +40,9 @@ pub(crate) struct EngineArgs {
     /// Split every backbone layer's attention heads (w_q rows, sinks, wo
     /// groups) and shared expert over --device and this second GPU; mHC, the
     /// latent projection, compressors, indexer and caches are replicated, the
-    /// partial sums meet over peer memory. Router, head and drafter stay on --device; whole routed-expert
-    /// layers fill both GPUs after reserving their KV pools.
+    /// partial sums meet over peer memory. Routers are replicated; head and
+    /// drafter stay on --device. Routed-expert TP2 halves fill both GPUs after
+    /// reserving their KV pools.
     #[arg(long)]
     pub split_device: Option<i32>,
     /// Optional expert-input quantizer SM ceiling (default: this device's SM count).
@@ -58,19 +59,18 @@ pub(crate) struct EngineArgs {
     #[arg(long, default_value_t = 0)]
     pub pool_tokens: usize,
     /// Routed-expert layers to keep on the coordinator GPUs (from layer 0):
-    /// `max` (the default) places the most layers that still leave a 262K
-    /// pool (v2's policy); `auto` reserves the 2M KV pool first and fills
-    /// what is left; `N`, `N%` or `all` fix the RTX layers and the KV pool
+    /// `max` places the most layers that still leave a 262K pool;
+    /// `auto` (the default on every layout) reserves the target KV pool first and
+    /// fills what is left; `N`, `N%` or `all` fix the RTX layers and the KV pool
     /// takes every remaining byte. 0 sends every layer to the Sparks.
     #[arg(long, value_parser = parse_onboard, conflicts_with = "local_expert_layers")]
     pub rtx_expert_layers: Option<cuteafd_loader::placement::Onboard>,
     /// Alias of `--rtx-expert-layers N`.
     #[arg(long)]
     pub local_expert_layers: Option<usize>,
-    /// Let EXL3 routed-expert layers fill GPU1 too under --split-device
-    /// (opt-in: its two-lane prefill exchange is not yet qualified).
-    #[arg(long)]
-    pub peer_expert_ranges: bool,
+    /// Removed GPU1 whole-layer placement flag.
+    #[arg(long = "peer-expert-ranges", hide = true, value_parser = crate::cli::reject_peer_expert_ranges)]
+    pub deprecated_peer_expert_ranges: bool,
     /// Keep the dSpark drafter's stage experts on the coordinator GPU (before
     /// backbone layers) so the engine can draft.
     #[arg(long)]
@@ -158,14 +158,13 @@ fn parse_onboard(text: &str) -> std::result::Result<cuteafd_loader::placement::O
 
 impl EngineArgs {
     /// The resolved `--rtx-expert-layers` / `--local-expert-layers`.
-    /// The RTX expert policy for a model of hidden size `dim` on `gpus` serving GPUs (the head split
-    /// as resolved, not as requested).
-    pub(crate) fn onboard(&self, dim: usize, gpus: usize) -> Result<cuteafd_loader::placement::Onboard> {
+    /// Pool first uniformly unless an explicit onboard policy is selected.
+    pub(crate) fn onboard(&self) -> Result<cuteafd_loader::placement::Onboard> {
         use cuteafd_loader::placement::Onboard;
         Ok(match (self.rtx_expert_layers, self.local_expert_layers) {
             (Some(onboard), _) => onboard,
             (None, Some(layers)) => Onboard::Layers(layers),
-            (None, None) => cuteafd_loader::placement::families::deepseek_v4::default_onboard(dim, gpus),
+            (None, None) => cuteafd_loader::placement::families::deepseek_v4::default_onboard(),
         })
     }
 
@@ -319,7 +318,7 @@ pub(crate) fn with_engine<T>(
     // request `cuteafd plan --layout` resolves, over one measured sample per
     // GPU taken after weights and modules and before any cache or expert.
     let placement = {
-        use cuteafd_loader::placement::{Baseline, Onboard};
+        use cuteafd_loader::placement::Baseline;
         ensure!(args.max_sequences > 0, "--max-sequences must be positive");
         let devices: Vec<_> = std::iter::once(args.device).chain(split_device).collect();
         // Each GPU's free bytes less the measured code still to load before ready (lazily loaded
@@ -334,14 +333,39 @@ pub(crate) fn with_engine<T>(
             })
         }).collect::<Result<Vec<_>>>()?;
         let cache_stages = model.dspark.as_ref().map_or(0, |d| d.stages.len());
-        let onboard = args.onboard(loaded.cfg.dim, devices.len())?;
+        let onboard = args.onboard()?;
         let stages = if args.dspark && !args.skip_routed_experts { cache_stages } else { 0 };
-        let expert_workspace = if args.skip_routed_experts || (onboard == Onboard::Layers(0) && stages == 0) { Some(0) }
+        let max_rows = prefill_rows.max(decode_rows);
+        let expert_workspace = if args.skip_routed_experts
+            || (stages == 0 && (split_device.is_some() || onboard.layers(loaded.cfg.n_layers) == Some(0))) { Some(0) }
             else { local::workspace_bytes(&loaded.library, &args.native_lib, &loaded.catalog,
-                prefill_rows.max(decode_rows))?.map(|bytes| bytes as u64) };
+                max_rows)?.map(|bytes| bytes as u64) };
+        let tp2_workspace = if split_device.is_some() && !args.skip_routed_experts
+            && onboard.layers(loaded.cfg.n_layers) != Some(0) {
+            use crate::shared::experts::rtx::{native::NativeTp2, exl3::Exl3Tp2};
+            let measured = if let Some(manifest) = loaded.catalog.exl3() {
+                let package = crate::shared::experts::exl3::aot_layout_directory(&args.native_lib,
+                    manifest.decoder_tiers(), "rtx-tp2");
+                Exl3Tp2::workspace_bytes_for(&package, loaded.cfg.dim, max_rows)
+            } else { NativeTp2::workspace_bytes_for(&loaded.library, max_rows) };
+            match measured {
+                Ok(bytes) => {
+                    let planned = cuteafd_loader::serving_capacity::deepseek_v4_tp2_workspace(
+                        &loaded.catalog, Some(&args.manifest), max_rows as u64)?;
+                    ensure!(bytes as u64 == planned,
+                        "V4 TP2 workspace differs from planner: runtime {bytes}, planned {planned}");
+                    Some([bytes as u64; 2])
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "V4 TP2 expert package unavailable; auto may keep routed layers on Sparks");
+                    None
+                }
+            }
+        } else { None };
+        let exchange_f32 = engine::ExchangePolicy::from_env()? == engine::ExchangePolicy::F32;
         let inputs = admission::Inputs { cfg: &loaded.cfg, catalog: &loaded.catalog, manifest: &loaded.manifest,
             family: loaded.family, gpus, cache_stages, prefill_rows, decode_rows, max_context, prefix,
-            expert_workspace };
+            expert_workspace, tp2_workspace, exchange_f32 };
         inventory.record(loaded.family, &inputs.gpus.iter().map(|(_, b)| match b {
             Baseline::Measured { free_bytes } => *free_bytes, Baseline::Planned { .. } => 0 }).collect::<Vec<_>>());
         let request = admission::request(args, &inputs)?;
@@ -389,25 +413,43 @@ pub(crate) fn with_engine<T>(
         skip_routed: skip,
     })?;
     if let Some((device, stream)) = peer_stream {
-        engine.attach_peer(device, stream, shares.pop().context("head-split shares")?, engine::PeerParts { shape })?;
+        engine.attach_peer(device, stream, shares.pop().context("head-split shares")?, engine::PeerParts { shape, tp2: placement.tp2.as_ref().is_some_and(|t| t.layers > 0) })?;
     }
     let held = held(&engine)?;
     let _ = held; // Prefix bytes were reserved before placement.
     let started = Instant::now();
     let stages = if args.dspark { engine.weights.dspark.as_ref().map_or(0, |d| d.stages.len()) } else { 0 };
-    for (rank, range) in placement.expert_ranges.iter().enumerate() {
-        let device = if rank == 0 { args.device } else { split_device.context("expert peer device")? };
-        let stream = if rank == 0 { stream } else { peer_stream.context("expert peer stream")?.1 };
-        let local = if skip { None } else { crate::shared::peer_split::on_device(&loaded.library, device,
-            args.device, || local::LocalExperts::load_range(&loaded.library, &args.native_lib, &loaded.catalog,
-                if rank == 0 { stages } else { 0 }, range.first..range.first + range.layers,
-                engine.decode_rows.max(engine.prefill_rows), usize::try_from(range.peak_bytes)?, stream))? };
-        ensure!(local.as_ref().map_or(0, |l| l.layers()) == range.layers,
-            "DeepSeek V4 GPU{rank} local expert allocation differs from admitted placement");
-        engine.install_local(rank, range.first, local)?;
+    let max_rows = engine.decode_rows.max(engine.prefill_rows);
+    let range = &placement.expert_ranges[0];
+    ensure!(split_device.is_none() || range.layers == 0,
+        "TP1 backbone layers are forbidden under a head split");
+    let local = if skip { None } else { local::LocalExperts::load_range(&loaded.library, &args.native_lib,
+        &loaded.catalog, stages, range.first..range.first + range.layers,
+        max_rows, usize::try_from(range.peak_bytes)?, stream)? };
+    ensure!(local.as_ref().map_or(0, |l| l.layers()) == range.layers,
+        "DeepSeek V4 TP1 allocation differs from admitted placement");
+    engine.install_local(local);
+    if let Some(tp2) = placement.tp2.as_ref().filter(|t| t.layers > 0 && !skip) {
+        use crate::shared::experts::rtx::{native::NativeTp2, exl3::Exl3Tp2, RtxExpertLayer};
+        use crate::shared::memory::device::Device;
+        let devices = [Device { library: &loaded.library, id: args.device },
+            Device { library: &loaded.library, id: split_device.context("TP2 needs a head split")? }];
+        let layers = tp2.first..tp2.first + tp2.layers;
+        let budgets = [usize::try_from(tp2.peak_bytes[0])?, usize::try_from(tp2.peak_bytes[1])?];
+        let ranks: [Box<dyn RtxExpertLayer>; 2] = if let Some(manifest) = loaded.catalog.exl3() {
+            let package = crate::shared::experts::exl3::aot_layout_directory(&args.native_lib,
+                manifest.decoder_tiers(), "rtx-tp2");
+            Exl3Tp2::load_pair(devices, &loaded.catalog, &package, layers.clone(), max_rows, budgets)?
+                .map(|rank| Box::new(rank) as Box<dyn RtxExpertLayer>)
+        } else {
+            NativeTp2::load_pair(devices, &loaded.catalog, layers.clone(), max_rows, budgets)?
+                .map(|rank| Box::new(rank) as Box<dyn RtxExpertLayer>)
+        };
+        ensure!(ranks.iter().all(|r| r.layers() == layers), "TP2 loaded layers differ from admitted placement");
+        engine.install_tp2(ranks)?;
     }
-    tracing::info!(local_per_gpu = ?placement.expert_ranges, elapsed_ms = started.elapsed().as_millis() as u64,
-        "DeepSeek V4 expert layers resident on coordinator GPUs");
+    tracing::info!(tp1 = ?placement.expert_ranges, tp2 = ?placement.tp2,
+        elapsed_ms = started.elapsed().as_millis() as u64, "DeepSeek V4 expert layers resident on coordinator GPUs");
     // Implicit Spark worlds: TP4 executors 1..=4, TP2 5..=6, TP3 7..=9, TP6 27..=32.
     let executors = (0..peers.len())
         .map(|rank| cuteafd_transport::expert::v41_spark_executor_id(peers.len(), rank))
@@ -435,7 +477,7 @@ pub(crate) fn with_engine<T>(
     }
     if args.full_prefill_logits { engine.prepare_scoring_prefill()?; }
     engine.warm_local_graphs()?;
-    engine.check_peer_wire(&mut transports, &runtime)?;
+    engine.check_routes(&mut transports, &runtime)?;
     let result = body(&engine, &mut transports, &runtime);
     if let Err(error) = &result {
         // Teardown may fail after a device fault and would otherwise hide this.
@@ -457,13 +499,25 @@ pub(crate) fn with_engine<T>(
 }
 
 fn golden(args: GoldenArgs) -> Result<()> {
+    let started = Instant::now();
     let loaded = load(&args.engine)?;
     let cfg = loaded.cfg.clone();
-    with_engine(&loaded, &args.engine, None, |_| Ok(0), |engine, transports, runtime| match args.token_check {
-        Some(steps) => token_check(&args, &loaded, engine, transports, runtime, steps),
-        None if !args.resume_at.is_empty() => resume(&args, engine, transports, runtime),
-        None if args.nll => nll_run(&args, &cfg, engine, transports, runtime),
-        None => golden_run(&args, &cfg, engine, transports, runtime),
+    with_engine(&loaded, &args.engine, None, |_| Ok(0), |engine, transports, runtime| {
+        let before = engine.graph_capture_counts();
+        println!("golden ready: {:.3} s | graph captures {} | TP2 expert graph captures {}",
+            started.elapsed().as_secs_f64(), before.0, before.1);
+        let result = match args.token_check {
+            Some(steps) => token_check(&args, &loaded, engine, transports, runtime, steps),
+            None if !args.resume_at.is_empty() => resume(&args, engine, transports, runtime),
+            None if args.nll => nll_run(&args, &cfg, engine, transports, runtime),
+            None => golden_run(&args, &cfg, engine, transports, runtime),
+        };
+        let after = engine.graph_capture_counts();
+        println!("golden post-ready captures: all {} | TP2 experts {}", after.0 - before.0, after.1 - before.1);
+        for setting in cuteafd_bench::context::get().settings.into_iter().filter(|s| s.name.starts_with("route-")) {
+            println!("golden {}: {}", setting.name, setting.value.unwrap_or_default());
+        }
+        result
     })
 }
 

@@ -162,6 +162,19 @@ def test_build_stages_union_identical_scopes_and_no_outer_gpu_lock(entry, tmp_pa
     assert 'qwen4:nvfp4' in families and 'qwen4:fp8' not in families and 'glmf:fp8' in families
 
 
+@pytest.mark.parametrize('name,tag', [('v4-flash-min', 'dsv4f'), ('v4-pro-exl3-max', 'dsv4p')])
+@pytest.mark.parametrize('gpus,override,wants_tp2', [([0], None, False), ([0, 1], None, True), ([0], '2', True), ([0, 1], '1', False)])
+def test_v4_scopes_keep_full_experts_and_add_dual_rtx_halves(entry, name, tag, gpus, override, wants_tp2):
+    values = {'SPARK_COUNT': '4'}
+    if override is not None:
+        values['RTX_GPUS'] = override
+    scope = cards.build_scopes([{**entry, 'name': name, 'family': 'deepseek_v4', 'gpus': gpus, 'set': values}])
+    families = set(scope['CUTEAFD_WIP_EXPERT_FAMILIES'].split(';'))
+    assert tag + ':rtx_backbone' in families
+    assert (tag + ':rtx_tp2' in families) == wants_tp2
+    assert tag + ':spark' in families
+
+
 def test_seed_host_moves_the_build_seed_off_moa(entry, tmp_path, monkeypatch):
     arms = cards.arms_from(['base=b:s'])
     monkeypatch.setattr(cards, 'build_lock_mode', lambda rev: 'native-phase')

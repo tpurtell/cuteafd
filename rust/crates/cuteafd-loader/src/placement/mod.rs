@@ -9,12 +9,10 @@
 //! movables (drafter stage experts) are charged before the pool too, so an
 //! automatic pool can never crowd them out.
 //!
-//! Placement PR 1 added `HeadSplit` and `Whole` layer modes and contiguous
-//! whole-layer expert ranges (GPU0, then GPU1). PR 3 adds per-layer
-//! ownership: the residual's home at every layer boundary ([`ResidualHome`]),
-//! the [`Hop`]s the modes imply (their receive buffers charged as fixed
-//! demands) and the executor's mode set ([`ExecutorModes`]), refused at plan
-//! time when a layer would need a mode the family cannot run. No TP2 experts.
+//! Per-layer residual homes and hops are validated against the executor's
+//! mode set; hop receive buffers are fixed demands. Peer-accessible two-GPU
+//! builds use a contiguous TP2 expert prefix with no additional residual hop;
+//! TP1 arena-sharing movables retain a separate arena and workspace.
 use cuteafd_core::memory_layout::{Basis, Category, Item};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -50,6 +48,8 @@ pub struct PlacementRequest {
     /// Workspace of a GPU's local expert arena, charged once on every GPU
     /// that holds a routed layer or an arena-sharing movable.
     pub expert_workspace: u64,
+    /// Separate TP2 backbone workspace per rank; excludes TP1 movables.
+    pub tp2_workspace: [u64; 2],
     /// Which fixes the plan: the pool (`Auto`) or the RTX expert layers.
     pub onboard: Onboard,
     /// GPUs (from GPU0) whose executors can hold whole routed layers.
@@ -149,7 +149,10 @@ pub struct Bytes2 {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ExpertCost {
     pub whole: Bytes2,
-    /// Half-width TP2 layers exist for this build (placement PR 4).
+    /// Each rank's half under TP2 (rank 0, rank 1); equal for even splits.
+    pub half: [Bytes2; 2],
+    /// Half-width TP2 layers exist for this build (placement PR 4): on two
+    /// RTX with peer access the layer's RTX home is `RtxTp2`, never `RtxWhole`.
     pub tp2: bool,
     pub spark_ok: bool,
 }
@@ -327,13 +330,17 @@ pub struct Placement {
     pub onboard_layers: usize,
     pub layers: Vec<LayerAssignment>,
     pub movables: Vec<(MovableId, u8)>,
-    /// Contiguous RTX expert range per GPU (`layers == 0`: none).
+    /// Contiguous whole-layer RTX expert range per GPU (`layers == 0`: none).
+    /// Under TP2 every GPU's range is empty and [`Placement::tp2`] holds the layers.
     pub expert_ranges: Vec<ExpertRange>,
     /// The residual's home at each layer boundary: before layer `i` at `i`,
     /// after the last layer at `layers.len()`.
     pub residual: Vec<ResidualHome>,
     /// Every residual move the layer modes imply, in execution order.
     pub hops: Vec<Hop>,
+    /// TP2 RTX expert halves (placement PR 4): one contiguous range of routed
+    /// layers whose halves live on both GPUs, with each GPU's arena peak.
+    pub tp2: Option<Tp2Range>,
     /// Every item the solver charged, per GPU (fixed demands, KV records,
     /// expert arenas); the baseline's loaded bytes are not repeated here.
     pub items: Vec<Vec<Item>>,
@@ -364,9 +371,23 @@ pub struct ExpertRange {
     pub peak_bytes: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Tp2Range {
+    pub first: usize,
+    pub layers: usize,
+    /// Each GPU's TP2 arena peak: workspace and half layers with transient
+    /// load staging. Excludes the separate TP1 movable arena.
+    pub peak_bytes: [u64; 2],
+}
+
 impl Placement {
     /// The `cuteafd plan --layout` line runtimes log once at admission.
     pub fn summary(&self) -> String {
+        if let Some(t) = self.tp2 {
+            return format!("pool {} tokens; onboard {} RTX expert layers: rtx0/rtx1: {} TP2 expert layer halves ({}..{}); arenas [{}, {}] B; TP1 dSpark {} B",
+                self.pool_tokens, self.onboard_layers, t.layers, t.first, t.first + t.layers,
+                t.peak_bytes[0], t.peak_bytes[1], self.expert_ranges[0].peak_bytes);
+        }
         let ranges = self.expert_ranges.iter().enumerate()
             .map(|(gpu, r)| format!("rtx{gpu} {}..{} ({} B)", r.first, r.first + r.layers, r.peak_bytes))
             .collect::<Vec<_>>().join(", ");

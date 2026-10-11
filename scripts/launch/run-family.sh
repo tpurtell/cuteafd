@@ -480,12 +480,12 @@ fi
 # rest up to its target; auto reserves the KV pool (2M PRO / 1M <=32 GB) first
 # and fills what is left; N, N% or all fix the RTX-resident layers and the KV pool takes
 # every remaining byte (refused below the compiled context). 0 leaves the
-# backbone experts on the Sparks. RTX_EXPERT_PEER=on lets EXL3 layers fill
-# GPU1 under the head split too (opt-in, not yet qualified).
+# backbone experts on the Sparks. With two RTX every onboard mode uses TP2
+# halves; GPU1 whole-layer expert ranges are no longer supported.
 if [[ $serve == serve-dsv4 ]]; then
   local_layers="$(get RTX_EXPERT_LAYERS)"
   case "$(get RTX_EXPERT_PEER off)" in
-    on) family_args+=(--peer-expert-ranges) ;;
+    on) echo "GPU1 whole-layer expert ranges were replaced by TP2 halves (v3 P4); remove RTX_EXPERT_PEER" >&2; exit 2 ;;
     off) ;;
     *) echo "RTX_EXPERT_PEER must be on or off" >&2; exit 2 ;;
   esac
@@ -1308,10 +1308,14 @@ table_env_args=()
 [[ -z "${CUTEAFD_TABLE_ACCOUNTING:-}" ]] || table_env_args+=(-e "CUTEAFD_TABLE_ACCOUNTING=$CUTEAFD_TABLE_ACCOUNTING")
 bench_nonce_env_args=()
 [[ -z "${CUTEAFD_BENCH_NONCE_SEED:-}" ]] || bench_nonce_env_args+=(-e "CUTEAFD_BENCH_NONCE_SEED=$CUTEAFD_BENCH_NONCE_SEED")
+tp2_env_args=()
+for key in CUTEAFD_TP2_EXCHANGE CUTEAFD_ROUTE_CHECK; do
+  [[ -z "${!key:-}" ]] || tp2_env_args+=(-e "$key=${!key}")
+done
 docker run -d --name "$coordinator_name" --restart no --gpus "$gpus" --network host --ipc host \
   --security-opt "seccomp=$repo_root/docker/seccomp-code-bench.json" \
   --ulimit memlock=-1:-1 --device=/dev/infiniband -e RUST_LOG=info -e "CUTEAFD_SPARK_INTAKE=$intake" \
-  -e "CUTEAFD_CONSOLE_TEXT=$([[ $console_text == on ]] && echo true || echo false)" "${bond_args[@]}" "${table_env_args[@]}" "${bench_nonce_env_args[@]}" \
+  -e "CUTEAFD_CONSOLE_TEXT=$([[ $console_text == on ]] && echo true || echo false)" "${bond_args[@]}" "${table_env_args[@]}" "${bench_nonce_env_args[@]}" "${tp2_env_args[@]}" \
   -e "CUTEAFD_FP8_EXPERT_PREFILL=$fp8_prefill" -e "CUTEAFD_IMAGE=$coordinator_image" "${wip_mount_args[@]}" "${device_map_args[@]}" \
   -v "$hub:/root/.cache/huggingface/hub:ro" -v "$bench_dir:/root/.cache/cuteafd/bench" \
   "${api_mount_args[@]}" "${chat_template_mounts[@]}" "${trace_args[@]}" "${probe_args[@]}" "$coordinator_image" cuteafd "${coordinator_budget_args[@]}" $serve --snapshot "$snapshot" \

@@ -156,6 +156,141 @@ impl<'a> Exl3Weights<'a> {
         Ok(self.buffers[index].buffer)
     }
 
+    /// A full compressed projection bank feeds both GPU slices, including
+    /// replicated rotations, with each MCG word validated once per projection.
+    pub(crate) fn load_tp2_pair(
+        devices: [crate::shared::memory::device::Device<'a>; 2],
+        catalog: &OfficialV41Catalog,
+        layers: std::ops::Range<usize>,
+        available: [usize; 2],
+    ) -> Result<[crate::shared::memory::device::DeviceOwner<'a, Vec<Self>>; 2]> {
+        use super::paired_load::{self, Fences, Projection};
+        let started = std::time::Instant::now();
+        let mut weights = [devices[0].own(|| Ok(Vec::new()))?, devices[1].own(|| Ok(Vec::new()))?];
+        let mut remaining = available;
+        let mut full_bytes = 0;
+        let mut pinned_admitted = 0;
+        for layer in layers.clone() {
+            let mut pinned = 0;
+            for rank in 0..2 {
+                let plan = layout(catalog, ExpertLayer::BackboneTp2 { layer, rank }, V41Exl3Partition::Disjoint)?;
+                let budget = budget(catalog, &plan)?;
+                ensure!(budget.peak_device_bytes()? <= remaining[rank], "paired EXL3 admission exceeded");
+                remaining[rank] -= budget.resident_bytes;
+                pinned += budget.pinned_host_bytes;
+                for jobs in plan.loads.chunks(JOBS_PER_EXPERT) {
+                    let bytes = jobs.iter().try_fold(0usize, |total, job|
+                        Ok::<_, anyhow::Error>(total + usize::try_from(catalog.tensor(&job.tensor)?.metadata.byte_length)?))?;
+                    full_bytes = full_bytes.max(bytes);
+                }
+                // Initial descriptor tables use this bank too.
+                full_bytes = full_bytes.max(plan.buffers.iter().map(|b| b.initial_words.len() * 4).max().unwrap_or(0));
+                devices[rank].run(|| {
+                    let (offsets, bytes) = arena_layout(&plan)?;
+                    let arena = DeviceAllocation::new(devices[rank].library, bytes)?;
+                    let buffers = plan.buffers.iter().zip(offsets).map(|(spec, offset)| {
+                        let mut buffer = arena.buffer;
+                        // SAFETY: checked arena layout reserves every aligned buffer.
+                        unsafe { buffer.ptr = buffer.ptr.cast::<u8>().add(offset).cast(); }
+                        buffer.bytes = spec.bytes.max(16);
+                        WeightBuffer { buffer }
+                    }).collect();
+                    weights[rank].push(Self { buffers, _arena: arena, layout: plan, budget });
+                    Ok(())
+                })?;
+            }
+            pinned_admitted = pinned_admitted.max(pinned);
+        }
+        let mut hosts = paired_load::banks(devices[0], EXPERT_READ_LANES, full_bytes, pinned_admitted)?;
+        let mut fences = Fences::new(devices)?;
+        // Drain before pinned banks and GPU arenas on every error/unwind path.
+        let streams = paired_load::streams(devices)?;
+        let allocation_seconds = started.elapsed().as_secs_f64();
+        for index in 0..weights[0].len() {
+            // Initialize each GPU's descriptors using pinned storage only after
+            // the previous layer's consumers of this bank have finished.
+            for rank in 0..2 {
+                for (spec, buffer) in weights[rank][index].layout.buffers.iter().zip(&weights[rank][index].buffers) {
+                    if spec.initial_words.is_empty() { continue; }
+                    paired_load::drain(&streams)?;
+                    for (dst, word) in hosts[0][0].bytes_mut().chunks_exact_mut(4).zip(&spec.initial_words) {
+                        dst.copy_from_slice(&word.to_le_bytes());
+                    }
+                    devices[rank].run(|| {
+                        // SAFETY: descriptor source stays alive and unchanged through drain.
+                        unsafe { devices[rank].library.copy_host_buffer_h2d_async(buffer.buffer,
+                            hosts[0][0].buffer, spec.initial_words.len() * 4, streams[rank].raw)?; }
+                        Ok(())
+                    })?;
+                }
+            }
+            paired_load::drain(&streams)?;
+        }
+        let mut group = 0;
+        for (index, layer) in layers.enumerate() {
+            let layer_started = std::time::Instant::now();
+            let experts = weights[0][index].layout.experts;
+            let mut storage_bytes_read = 0;
+            let mut read_seconds = 0.;
+            let mut bank_wait_seconds = 0.;
+            let mut upload_submit_seconds = 0.;
+            for first in (0..experts).step_by(EXPERT_READ_LANES) {
+                let bank = group % BANKS;
+                let wait_started = std::time::Instant::now();
+                fences.reuse(bank)?;
+                bank_wait_seconds += wait_started.elapsed().as_secs_f64();
+                let count = EXPERT_READ_LANES.min(experts - first);
+                let plans = (first..first + count).map(|expert| {
+                    let mut offset = 0;
+                    (expert * JOBS_PER_EXPERT..(expert + 1) * JOBS_PER_EXPERT).map(|job| {
+                        let name = &weights[0][index].layout.loads[job].tensor;
+                        ensure!(*name == weights[1][index].layout.loads[job].tensor,
+                            "paired EXL3 projection mismatch");
+                        let projection = Projection::new(catalog, name.clone(), offset,
+                            [catalog.exl3_tensor_slice(name, 2, 0)?, catalog.exl3_tensor_slice(name, 2, 1)?])?;
+                        offset += projection.bytes;
+                        Ok(projection)
+                    }).collect::<Result<Vec<_>>>()
+                }).collect::<Result<Vec<_>>>()?;
+                paired_load::trace_overlap(&streams, "read_start", layer, first)?;
+                let read_started = std::time::Instant::now();
+                storage_bytes_read += paired_load::read_group(catalog, &plans, &mut hosts[bank])?;
+                read_seconds += read_started.elapsed().as_secs_f64();
+                let upload_started = std::time::Instant::now();
+                for rank in 0..2 {
+                    for (lane, jobs) in plans.iter().enumerate() {
+                        for (slot, projection) in jobs.iter().enumerate() {
+                            let weight = &weights[rank][index];
+                            let job = &weight.layout.loads[(first + lane) * JOBS_PER_EXPERT + slot];
+                            ensure!(job.bytes == projection.slices[rank].bytes(), "paired EXL3 slice size mismatch");
+                            for &(buffer, offset) in &job.destinations {
+                                let mut destination = weight.buffers[buffer].buffer;
+                                ensure!(offset.checked_add(job.bytes).is_some_and(|end| end <= destination.bytes),
+                                    "paired EXL3 upload exceeds destination");
+                                // SAFETY: checked resident destination extent belongs to this GPU.
+                                unsafe { destination.ptr = destination.ptr.cast::<u8>().add(offset).cast(); }
+                                destination.bytes = job.bytes;
+                                projection.upload(devices[rank], rank, hosts[bank][lane].buffer,
+                                    destination, &streams[rank])?;
+                            }
+                        }
+                    }
+                }
+                upload_submit_seconds += upload_started.elapsed().as_secs_f64();
+                fences.record(bank, &streams)?;
+                paired_load::trace_overlap(&streams, "both_submitted", layer, first)?;
+                group += 1;
+            }
+            tracing::info!(layer, storage_bytes_read, read_seconds, bank_wait_seconds, upload_submit_seconds,
+                elapsed_seconds = layer_started.elapsed().as_secs_f64(), "EXL3 TP2 shared-read layer timeline");
+        }
+        paired_load::drain(&streams)?;
+        tracing::info!(allocation_seconds, elapsed_seconds = started.elapsed().as_secs_f64(),
+            pinned_host_bytes = full_bytes * EXPERT_READ_LANES * BANKS, pinned_admitted,
+            read_scratch_bytes = 0, "EXL3 TP2 shared-read load complete");
+        Ok(weights)
+    }
+
     pub(crate) fn load(
         library: &'a NativeLibrary,
         catalog: &OfficialV41Catalog,
@@ -234,6 +369,8 @@ impl<'a> Exl3Weights<'a> {
                 library.cuda_stream_synchronize(streams[0].raw)?;
             }
         }
+        let load_started = std::time::Instant::now();
+        let mut storage_bytes_read = 0;
         for (group, first) in (0..layout.experts).step_by(EXPERT_READ_LANES).enumerate() {
             let bank = group % BANKS;
             let count = (layout.experts - first).min(EXPERT_READ_LANES);
@@ -251,7 +388,7 @@ impl<'a> Exl3Weights<'a> {
                 {
                     let plan = &layout;
                     let bytes = host.bytes_mut();
-                    readers.push(scope.spawn(move || -> Result<()> {
+                    readers.push(scope.spawn(move || OfficialV41Catalog::count_storage_reads(|| {
                         let mut offset = 0;
                         for job in
                             (first + lane) * JOBS_PER_EXPERT..(first + lane + 1) * JOBS_PER_EXPERT
@@ -266,12 +403,12 @@ impl<'a> Exl3Weights<'a> {
                             offset += size;
                         }
                         Ok(())
-                    }));
+                    })));
                 }
                 for reader in readers {
-                    reader
+                    storage_bytes_read += reader
                         .join()
-                        .map_err(|_| anyhow::anyhow!("EXL3 reader panicked"))??;
+                        .map_err(|_| anyhow::anyhow!("EXL3 reader panicked"))??.1;
                 }
                 Ok(())
             })?;
@@ -311,6 +448,8 @@ impl<'a> Exl3Weights<'a> {
                 library.cuda_stream_synchronize(stream.raw)?;
             }
         }
+        tracing::info!(?layer, storage_bytes_read, elapsed_seconds = load_started.elapsed().as_secs_f64(),
+            "EXL3 expert load timeline");
         Ok(Self {
             buffers,
             _arena: arena,

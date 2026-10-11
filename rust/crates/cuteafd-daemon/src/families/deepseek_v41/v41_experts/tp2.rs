@@ -760,6 +760,10 @@ impl<'a> PeerReduction<'a> {
 }
 
 #[cfg(test)]
+#[path = "tp2/shared_tests.rs"]
+mod shared_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use cuteafd_ffi::NativeLibrary;

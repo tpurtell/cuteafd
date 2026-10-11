@@ -1331,18 +1331,45 @@ pub struct V41Tp2ExpertReducer<'a> {
     reduce: ReduceTp2Fn,
     reduce_bf16_routes: Option<ReduceTp2Bf16RoutesFn>,
     sum_routes: Option<SumTp2RoutesFn>,
+    sum_routes_geometry: Option<SumRtxTp2RoutesFn>,
 }
+type SumRtxTp2RoutesFn = unsafe extern "C" fn(*const f32, *mut f32, u32, u32, u32, *mut c_void) -> i32;
 type SumTp2RoutesFn = unsafe extern "C" fn(*const f32, *mut f32, u32, *mut c_void) -> i32;
 impl NativeLibrary {
     pub fn v41_tp2_expert_reducer(&self) -> Result<V41Tp2ExpertReducer<'_>> {
         Ok(V41Tp2ExpertReducer { _library: self,
             reduce: unsafe { *self.lib.get::<ReduceTp2Fn>(b"cuteafd_reduce_tp2_experts_async")? },
             reduce_bf16_routes: unsafe { self.lib.get::<ReduceTp2Bf16RoutesFn>(b"cuteafd_reduce_tp2_bf16_routes_async").ok().map(|f| *f) },
-            sum_routes: unsafe { self.lib.get::<SumTp2RoutesFn>(b"cuteafd_sum_tp2_routes_async").ok().map(|f| *f) } })
+            sum_routes: unsafe { self.lib.get::<SumTp2RoutesFn>(b"cuteafd_sum_tp2_routes_async").ok().map(|f| *f) },
+            // SAFETY: this additive symbol matches cuteafd_experts.h; optional for old libraries.
+            sum_routes_geometry: unsafe { self.lib.get::<SumRtxTp2RoutesFn>(b"cuteafd_sum_rtx_tp2_routes_async").ok().map(|f| *f) } })
     }
 }
 impl V41Tp2ExpertReducer<'_> {
     pub fn supports_route_sums(&self) -> bool { self.sum_routes.is_some() }
+    pub fn supports_geometry_route_sums(&self) -> bool { self.sum_routes_geometry.is_some() }
+    /// FP32 route sums in route order, with no intermediate rounding.
+    /// # Safety
+    /// `routes` is FP32 [rows,geometry.topk,geometry.hidden], `sums` is FP32
+    /// [rows,geometry.hidden], disjoint on the current device and live through
+    /// completion. Input production must precede this operation on `stream`.
+    pub unsafe fn sum_routes_geometry(&self, routes: CuteafdDeviceBuffer, sums: CuteafdDeviceBuffer,
+        rows: u32, geometry: cuteafd_core::ExpertGeometry, stream: *mut c_void) -> Result<()> {
+        ensure!((1..=4096).contains(&rows) && (1..=16384).contains(&geometry.hidden)
+            && (1..=256).contains(&geometry.topk), "invalid TP2 route-sum geometry");
+        let bytes = (rows as usize).checked_mul(geometry.hidden as usize)
+            .and_then(|n| n.checked_mul(4)).context("TP2 route-sum extent overflow")?;
+        let route_bytes = bytes.checked_mul(geometry.topk as usize)
+            .context("TP2 route-sum route extent overflow")?;
+        ensure!(routes.device_id == sums.device_id && routes.bytes >= route_bytes && sums.bytes >= bytes,
+            "TP2 route-sum buffers have incompatible device or extent");
+        let function = self.sum_routes_geometry.context("native geometry-aware TP2 route sums unavailable")?;
+        // SAFETY: callers provide the documented device storage and ordering; extents checked above.
+        let status = unsafe { function(routes.ptr.cast(), sums.ptr.cast(), rows,
+            geometry.hidden, geometry.topk, stream) };
+        ensure!(status == 0, "TP2 geometry route sums failed with CUDA status {status}");
+        Ok(())
+    }
     /// FP32 token sums of one rank's six FP32 route planes, route order 0..5.
     /// # Safety
     /// `routes` is FP32 [rows,6,5120] and `sums` FP32 [rows,5120] on the current

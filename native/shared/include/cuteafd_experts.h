@@ -193,6 +193,21 @@ int32_t cuteafd_reduce_tp2_experts_async(const float* rank0, const float* rank1,
 // [rows,5120], adding routes in order 0..5 on this stream.
 int32_t cuteafd_sum_tp2_routes_async(const float* routes, float* sums, uint32_t rows,
     void* stream);
+
+// Geometry-aware FP32 route sum: [rows,topk,hidden] -> [rows,hidden]. Starts
+// with route 0, then adds routes 1..topk in FP32 round-to-nearest order, exactly
+// as the legacy V4.1 sum above. Disjoint storage; no allocation or sync.
+int32_t cuteafd_sum_rtx_tp2_routes_async(const float* routes, float* sums,
+    uint32_t rows, uint32_t hidden, uint32_t topk, void* stream);
+
+// TP2 RTX fused combine. partial: out = dtype(FP32(routed) + FP32(shared)) over
+// count elements (dtype 0 BF16, 1 FP32; routed FP32 and shared BF16 may each be
+// null). sum: out = BF16(FP32(rank0) + FP32(rank1)), inputs of dtype, rank order
+// fixed so both GPUs produce the same bits. No output/input overlap.
+int32_t cuteafd_rtx_tp2_partial_async(const float* routed, const uint16_t* shared,
+    void* out, uint64_t count, uint32_t dtype, void* stream);
+int32_t cuteafd_rtx_tp2_sum_async(const void* rank0, const void* rank1, uint16_t* out,
+    uint64_t count, uint32_t dtype, void* stream);
 #ifdef __cplusplus
 }
 #endif

@@ -16,6 +16,7 @@ pub fn solve(request: &PlacementRequest) -> Result<Placement, PlacementError> {
         return Err(PlacementError::Inventory("demand on an absent GPU"));
     }
     let split = gpus == 2 && request.inventory.peer_access;
+    let tp2 = split && request.layers.iter().any(|l| l.experts.is_some_and(|c| c.tp2));
 
     // 1. Layer modes: the policy's first mode this build and its executor run.
     let executor = &request.executor;
@@ -145,40 +146,39 @@ pub fn solve(request: &PlacementRequest) -> Result<Placement, PlacementError> {
         (fixed, _) => fixed,
     };
     let experts_first = matches!(request.onboard, Onboard::ExpertsFirst { .. });
-    let (units, ranges, homes) = match fixed_layers {
+    let (units, ranges, homes, tp2_range) = match fixed_layers {
         // Pool first: reserve the target, then fill each GPU's arena in order.
         None => {
             let fit = pool_fit(&available, &used, &arenas, &unit_bytes);
             let units = pool_units(request, fit)?;
             let used = with_pool(&used, &unit_bytes, units)?;
-            let caps = [usize::MAX, if request.expert_gpus > 1 { usize::MAX } else { 0 }];
-            let (ranges, homes, _) = place_experts(request, &available, &used, &mut arenas, first_moe,
+            let caps = [if request.expert_gpus > 0 { usize::MAX } else { 0 }, if request.expert_gpus > 1 { usize::MAX } else { 0 }];
+            let (ranges, homes, _, tp2_range) = place_experts(request, &available, &used, &mut arenas, first_moe,
                 request.layers.len(), &caps)?;
-            (units, ranges, homes)
+            (units, ranges, homes, tp2_range)
         }
         // Fixed onboard: exactly `n` routed layers (the contiguous prefix the
         // executors run), split over the GPUs where the pool is largest; the
         // pool is the output.
         Some(n) => {
             let end = nth_moe_end(request, first_moe, n);
-            let mut best: Option<(u64, Vec<ExpertRange>, Vec<ExpertHome>, Vec<Arena>)> = None;
-            let splits: Vec<usize> = if gpus == 1 || request.expert_gpus < 2 { vec![n] } else { (0..=n).rev().collect() };
+            let mut best: Option<(u64, Vec<ExpertRange>, Vec<ExpertHome>, Option<Tp2Range>)> = None;
+            let splits: Vec<usize> = if tp2 || gpus == 1 || request.expert_gpus < 2 { vec![n] } else { (0..=n).rev().collect() };
             let mut most = 0;
             for on_first in splits {
                 let mut trial = arenas.clone();
-                let caps = [on_first, if gpus == 2 { n - on_first } else { 0 }];
-                let (ranges, homes, next) = place_experts(request, &available, &used, &mut trial, first_moe, end, &caps)?;
-                let placed = homes.iter().filter(|h| matches!(h, ExpertHome::RtxWhole { .. })).count();
+                let caps = [if request.expert_gpus > 0 { on_first } else { 0 }, if gpus == 2 { n - on_first } else { 0 }];
+                let (ranges, homes, next, tp2_range) = place_experts(request, &available, &used, &mut trial, first_moe, end, &caps)?;
+                let placed = homes.iter().filter(|h| matches!(h, ExpertHome::RtxWhole { .. } | ExpertHome::RtxTp2)).count();
                 most = most.max(placed);
                 if next < end || placed < n { continue; }
                 let fit = pool_fit(&available, &used, &trial, &unit_bytes);
-                if best.as_ref().is_none_or(|(units, ..)| fit > *units) { best = Some((fit, ranges, homes, trial)); }
+                if best.as_ref().is_none_or(|(units, ..)| fit > *units) { best = Some((fit, ranges, homes, tp2_range)); }
             }
-            let Some((fit, ranges, homes, trial)) = best else {
+            let Some((fit, ranges, homes, tp2_range)) = best else {
                 return Err(if spark_free { PlacementError::SparkFree { layers: routed, placed: most } }
                     else { PlacementError::ExpertLayers { requested: n, placed: most } });
             };
-            drop(trial);
             let units = match request.pool.requested {
                 Some(requested) => pool_units(request, fit).map_err(|_| PlacementError::PoolDoesNotFit { requested,
                     fit: fit.saturating_mul(request.pool.unit_rows) })?,
@@ -191,7 +191,7 @@ pub fn solve(request: &PlacementRequest) -> Result<Placement, PlacementError> {
                 return Err(PlacementError::BelowFloor { pool: tokens, floor: request.pool.floor, layers: n,
                     short: request.pool.floor - tokens });
             }
-            (units, ranges, homes)
+            (units, ranges, homes, tp2_range)
         }
     };
     if units == 0 {
@@ -204,6 +204,11 @@ pub fn solve(request: &PlacementRequest) -> Result<Placement, PlacementError> {
     for gpu in 0..gpus {
         if unit_bytes[gpu] > 0 {
             items[gpu].push(Item::new(Category::Kv, "records", "", unit_bytes[gpu] * units, Basis::Formula));
+        }
+        if let Some(range) = tp2_range {
+            items[gpu].push(Item::new(Category::Experts,
+                format!("TP2 expert layer halves {}..{}", range.first, range.first + range.layers),
+                "tp2", range.peak_bytes[gpu], Basis::Formula));
         }
         let range = ranges[gpu];
         if range.peak_bytes > 0 {
@@ -222,6 +227,7 @@ pub fn solve(request: &PlacementRequest) -> Result<Placement, PlacementError> {
         expert_ranges: ranges,
         residual,
         hops,
+        tp2: tp2_range,
         items,
     })
 }
@@ -281,7 +287,11 @@ fn nth_moe_end(request: &PlacementRequest, first: usize, n: usize) -> usize {
 /// range, then GPU1's, each in its own arena and holding at most `caps[gpu]`
 /// routed layers. Returns the ranges, homes and the first layer not placed.
 fn place_experts(request: &PlacementRequest, available: &[u64], used: &[u64], arenas: &mut [Arena],
-    first_moe: usize, limit: usize, caps: &[usize]) -> Result<(Vec<ExpertRange>, Vec<ExpertHome>, usize), PlacementError> {
+    first_moe: usize, limit: usize, caps: &[usize]) -> Result<(Vec<ExpertRange>, Vec<ExpertHome>, usize, Option<Tp2Range>), PlacementError> {
+    if available.len() == 2 && request.inventory.peer_access
+        && request.layers.iter().any(|l| l.experts.is_some_and(|c| c.tp2)) {
+        return place_tp2(request, available, used, arenas, first_moe, limit, caps[0]);
+    }
     let mut next = first_moe;
     let mut ranges = Vec::new();
     let mut homes = vec![ExpertHome::Spark; request.layers.len()];
@@ -304,7 +314,7 @@ fn place_experts(request: &PlacementRequest, available: &[u64], used: &[u64], ar
         *arena = trial;
         ranges.push(ExpertRange { first, layers: next - first, peak_bytes: arena.peak });
     }
-    Ok((ranges, homes, next))
+    Ok((ranges, homes, next, None))
 }
 
 /// Whether the inventory can run `mode`: a head split, a split FFN or any
@@ -339,6 +349,7 @@ struct Arena {
     opened: bool,
     resident: u64,
     peak: u64,
+    staging: u64,
 }
 
 impl Arena {
@@ -352,4 +363,39 @@ impl Arena {
         self.resident = self.resident.checked_add(part.resident).ok_or(PlacementError::Overflow("expert arena"))?;
         Ok(())
     }
+}
+
+/// TP1 movable arenas remain alive beside distinct TP2 backbone arenas. Both
+/// peaks are reserved; fixed onboard never searches a whole-layer GPU split.
+fn place_tp2(request: &PlacementRequest, available: &[u64], used: &[u64], tp1: &mut [Arena],
+    first: usize, limit: usize, cap: usize)
+    -> Result<(Vec<ExpertRange>, Vec<ExpertHome>, usize, Option<Tp2Range>), PlacementError> {
+    let ranges = tp1.iter().map(|a| ExpertRange { first, layers: 0, peak_bytes: a.peak }).collect();
+    let mut halves = [Arena::default(), Arena::default()];
+    let mut homes = vec![ExpertHome::Spark; request.layers.len()];
+    let (mut next, mut placed) = (first, 0);
+    while next < limit && placed < cap {
+        let Some(cost) = request.layers[next].experts else { next += 1; continue };
+        if !cost.tp2 { break; }
+        let mut candidate = halves.clone();
+        for gpu in 0..2 {
+            candidate[gpu].open(request.tp2_workspace[gpu]);
+            candidate[gpu].add(cost.half[gpu])?;
+            candidate[gpu].staging = candidate[gpu].staging.max(cost.half[gpu].staging);
+            candidate[gpu].peak = candidate[gpu].resident.checked_add(candidate[gpu].staging)
+                .ok_or(PlacementError::Overflow("TP2 resident plus largest staging"))?;
+        }
+        if (0..2).any(|g| candidate[g].peak > available[g].saturating_sub(used[g]).saturating_sub(tp1[g].peak)) { break; }
+        halves = candidate;
+        homes[next] = ExpertHome::RtxTp2;
+        next += 1;
+        placed += 1;
+    }
+    let range = (placed > 0).then_some(Tp2Range { first, layers: next - first,
+        peak_bytes: [halves[0].peak, halves[1].peak] });
+    for gpu in 0..2 {
+        tp1[gpu].peak = tp1[gpu].peak.checked_add(halves[gpu].peak)
+            .ok_or(PlacementError::Overflow("TP1 and TP2 arena peaks"))?;
+    }
+    Ok((ranges, homes, next, range))
 }

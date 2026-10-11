@@ -72,3 +72,29 @@ def test_the_tagged_ready_report_wins_over_a_later_periodic_one(tmp_path):
     first, last = memory_audit.ready_reports(str(log))
     assert first["stage"] == "ready" and first["devices"][0]["untracked"] == 100 * MIB
     assert last["devices"][0]["untracked"] == 500 * MIB
+
+
+def test_pool_following_v4_page_tables_use_the_planners_kv_records_scope(tmp_path):
+    engine = (Path(__file__).parents[2] / "rust/crates/cuteafd-daemon/src/families/deepseek_v4/engine.rs").read_text()
+    allocation = engine.split("c4_page_table: {", 1)[1].split("},", 1)[0]
+    assert 'scope("kv/records")' in allocation
+    assert "ints(rows.max(1) * self.shape.units)?" in allocation
+    table_bytes = (2_097_152 // 256) * (2 * 4096 + 64) * 4
+    log = tmp_path / "coordinator.log"
+    log.write_text(report(1000 * MIB + table_bytes, 900 * MIB + table_bytes,
+                          {"weights": 900 * MIB, "kv/records": table_bytes}))
+    categories = memory_audit.summarize(next(memory_audit.reports(str(log))))["devices"][0]["categories"]
+    assert categories["kv"] == table_bytes
+    assert categories.get("workspace", 0) == 0
+
+
+def test_tp2_expert_loaders_scope_both_parent_and_parallel_rank_allocations():
+    root = Path(__file__).parents[2] / "rust/crates/cuteafd-daemon/src/shared/experts/rtx"
+    for name in ["native.rs", "exl3.rs"]:
+        source = (root / name).read_text()
+        assert 'format!("experts/TP2 expert layer halves {}..{}", layers.start, layers.end)' in source
+        parent = source.split("pub(crate) fn load_pair(", 1)[1]
+        assert 'scope_owned(&label)' in parent.split("synchronized_load::load_pair", 1)[0]
+        parallel = parent.split("synchronized_load::load_pair", 1)[1]
+        assert 'scope_owned(&label)' in parallel.split("Ok(vec![", 1)[0]
+    assert memory_audit.category("experts/TP2 expert layer halves 0..36") == "experts"

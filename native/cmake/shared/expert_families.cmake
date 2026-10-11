@@ -5,8 +5,8 @@
 # role's slice from the family geometry and names every symbol
 # `cuteafd_{family}[_{role}]_expert_*`; the runtime selects the family from the
 # checkpoint's routed-expert geometry (`ExpertGeometry::family`). Spark roles
-# build into the SM121 image, `rtx_backbone` (complete experts resident on the
-# coordinator) into the SM120 one; entries for the other architecture are
+# build into the SM121 image, `rtx_backbone` (complete experts) and `rtx_tp2`
+# (half-width experts) into the SM120 one; entries for the other architecture are
 # skipped so one list serves both builds.
 #
 # FAMILY:exl3-kTIERS entries (for example `dsv4p:exl3-k23`, `glm:exl3-k45`) are EXL3 packages,
@@ -41,13 +41,15 @@ set(CUTEAFD_EXPERT_FAMILY_WIDTH "1:64,16:128,80:128,256:128,1024:128,4096:128" C
 set(expert_ops info initialize output_kind bind_scratch initialize_scratch_async launch)
 
 foreach(entry IN LISTS CUTEAFD_NATIVE_EXPERT_FAMILIES)
-  if(NOT entry MATCHES "^(dsv4f|dsv4p):(spark|spark_tp2|rtx_backbone)$")
-    message(FATAL_ERROR "CUTEAFD_EXPERT_FAMILIES entry ${entry} must be (dsv4f|dsv4p):(spark|spark_tp2|rtx_backbone)")
+  if(NOT entry MATCHES "^(dsv4f|dsv4p):(spark|spark_tp2|rtx_backbone|rtx_tp2)$")
+    message(FATAL_ERROR "CUTEAFD_EXPERT_FAMILIES entry ${entry} must be (dsv4f|dsv4p):(spark|spark_tp2|rtx_backbone|rtx_tp2)")
   endif()
   set(family "${CMAKE_MATCH_1}")
   set(role "${CMAKE_MATCH_2}")
-  if(role STREQUAL "rtx_backbone")
+  set(device_handles "")
+  if(role MATCHES "^rtx_")
     set(wanted coordinator)
+    set(device_handles "#define CUTEAFD_EXPERT_PER_DEVICE_HANDLES 1\n")
   else()
     set(wanted spark)
   endif()
@@ -60,6 +62,8 @@ foreach(entry IN LISTS CUTEAFD_NATIVE_EXPERT_FAMILIES)
     set(symbol "cuteafd_${family}")
   elseif(role STREQUAL "rtx_backbone")
     set(symbol "cuteafd_${family}_local")
+  elseif(role STREQUAL "rtx_tp2")
+    set(symbol "cuteafd_${family}_tp2")
   else()
     set(symbol "cuteafd_${family}_${role}")
   endif()
@@ -74,9 +78,9 @@ foreach(entry IN LISTS CUTEAFD_NATIVE_EXPERT_FAMILIES)
   endforeach()
   set(wrapper "${dir}/${family}_${role}_experts.cc")
   file(GENERATE OUTPUT "${wrapper}" CONTENT
-"// Generated: ${family} ${role} routed-expert family (native FP8 K32, SM121).
+"// Generated: ${family} ${role} routed-expert family (native FP8 K32).
 #define CUTEAFD_EXPERT_VARIANTS_HEADER \"${variant_header}\"
-${renames}#include \"${CMAKE_CURRENT_SOURCE_DIR}/shared/src/v41_experts.cc\"
+${device_handles}${renames}#include \"${CMAKE_CURRENT_SOURCE_DIR}/shared/src/v41_experts.cc\"
 ")
   set(objects)
   set(headers)

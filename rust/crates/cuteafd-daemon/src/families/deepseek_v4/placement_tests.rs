@@ -30,13 +30,14 @@ struct Case<'a> {
     /// `None`: the family default (no flag on either side).
     onboard: Option<Onboard>,
     dspark: bool,
-    peer: bool,
+    exchange_f32: bool,
+    peer_budget: Option<u64>,
 }
 
 fn planned(case: &Case<'_>) -> (MemoryLayout, bool, Vec<String>) {
     let report = plan(case.snapshot, &PlanOptions { placement: ExpertPlacement::from_spark_ranks(case.sparks),
-        layout: Some(LayoutOptions { rtx_bytes: vec![case.budget; case.rtx], context_tokens: case.context,
-            workspace_manifest: Some(case.manifest.to_path_buf()), onboard: case.onboard, peer_expert_ranges: case.peer,
+        layout: Some(LayoutOptions { rtx_bytes: (0..case.rtx).map(|g| if g == 1 { case.peer_budget.unwrap_or(case.budget) } else { case.budget }).collect(), context_tokens: case.context,
+            workspace_manifest: Some(case.manifest.to_path_buf()), onboard: case.onboard, exchange_f32: case.exchange_f32,
             native_mtp_layers: if case.dspark { 3 } else { 0 }, headroom_bytes: 0, ..Default::default() }),
         ..Default::default() }).unwrap();
     let hints = report.hints.iter().map(|h| h.what.clone()).collect();
@@ -45,6 +46,10 @@ fn planned(case: &Case<'_>) -> (MemoryLayout, bool, Vec<String>) {
 
 /// serve-dsv4's admission over the planner's own loaded bytes as the sample.
 fn runtime(case: &Case<'_>, layout: &MemoryLayout) -> anyhow::Result<Placement> {
+    runtime_with_tp1(case, layout, true)
+}
+
+fn runtime_with_tp1(case: &Case<'_>, layout: &MemoryLayout, tp1_available: bool) -> anyhow::Result<Placement> {
     let manifest: serde_json::Value = serde_json::from_slice(&std::fs::read(case.manifest)?)?;
     let catalog = cuteafd_loader::read_expert_catalog(case.snapshot)?;
     let cfg = cuteafd_loader::families::deepseek_v4::DeepseekV4Config::read(case.snapshot, 1)?;
@@ -53,7 +58,6 @@ fn runtime(case: &Case<'_>, layout: &MemoryLayout) -> anyhow::Result<Placement> 
     let mut argv = vec!["serve".to_string(), "--snapshot".into(), case.snapshot.display().to_string(),
         "--native-lib".into(), "/nonexistent/libcuteafd.so".into(), "--peers".into(), peers];
     if let Some(onboard) = case.onboard { argv.extend(["--rtx-expert-layers".into(), onboard.to_string()]); }
-    if case.peer { argv.push("--peer-expert-ranges".into()); }
     if case.rtx == 2 { argv.extend(["--split-device".into(), "1".into()]); }
     if case.dspark { argv.push("--dspark".into()); }
     let cli = Cli::try_parse_from(argv)?;
@@ -61,18 +65,23 @@ fn runtime(case: &Case<'_>, layout: &MemoryLayout) -> anyhow::Result<Placement> 
     let stages = (0..).take_while(|stage| catalog.tensors().iter()
         .any(|t| t.metadata.name.starts_with(&format!("mtp.{stage}.")))).count();
     let gpus = layout.devices.iter().filter(|d| d.kind == cuteafd_core::memory_layout::DeviceKind::Rtx)
-        .map(|device| {
+        .enumerate().map(|(gpu, device)| {
             let loaded: u64 = device.items.iter().filter(|i| matches!(i.category,
                 Category::Weights | Category::Embedding | Category::Drafter) || i.group == "context+modules")
                 .map(|i| i.bytes).sum();
-            (case.budget, Baseline::Measured { free_bytes: case.budget - loaded })
+            let budget = if gpu == 1 { case.peer_budget.unwrap_or(case.budget) } else { case.budget };
+            (budget, Baseline::Measured { free_bytes: budget - loaded })
         }).collect();
     // The planner's EXL3 arena from the same capacity manifests serve-dsv4 reads.
     let expert_workspace = layout_expert_workspace(case, &catalog)?;
     let inputs = admission::Inputs { cfg: &cfg, catalog: &catalog, manifest: &manifest, family, gpus,
         cache_stages: stages, prefill_rows: manifest["capacities"]["prefill_rows"].as_u64().unwrap() as usize,
         decode_rows: manifest["capacities"]["decode_rows"].as_u64().unwrap() as usize,
-        max_context: case.context as usize, prefix: Some(&cli.prefix), expert_workspace: Some(expert_workspace) };
+        max_context: case.context as usize, prefix: Some(&cli.prefix), expert_workspace: tp1_available.then_some(expert_workspace),
+        tp2_workspace: if case.rtx == 2 { cuteafd_loader::serving_capacity::deepseek_v4_tp2_workspace(
+            &catalog, Some(case.manifest), manifest["capacities"]["prefill_rows"].as_u64().unwrap()
+                .max(manifest["capacities"]["decode_rows"].as_u64().unwrap())).ok().map(|b| [b; 2]) } else { None },
+        exchange_f32: case.exchange_f32 };
     Ok(solve(&admission::request(&cli.engine, &inputs)?)?)
 }
 
@@ -111,7 +120,8 @@ fn assert_equal(case: &Case<'_>, label: &str) -> Placement {
         for item in items {
             assert!(device.items.contains(item), "{label}: rtx{gpu} lacks {item:?}");
         }
-        let reserve = case.budget - device.capacity_bytes;
+        let budget = if gpu == 1 { case.peer_budget.unwrap_or(case.budget) } else { case.budget };
+        let reserve = budget - device.capacity_bytes;
         assert!(reserve > 0, "{label}: rtx{gpu} has no reserve");
     }
     let notes = runtime.expert_ranges.iter().enumerate().map(|(gpu, r)|
@@ -125,6 +135,14 @@ fn assert_equal(case: &Case<'_>, label: &str) -> Placement {
     assert!(runtime.items.iter().flatten().all(|i| i.group != "residual hops"), "{label}: hop buffers");
     super::check_modes(&runtime, case.rtx == 2).unwrap_or_else(|e| panic!("{label}: {e:#}"));
     assert!(super::check_modes(&runtime, case.rtx != 2).is_err(), "{label}: the other engine shape is refused");
+    if let Some(t) = runtime.tp2 {
+        assert!(runtime.expert_ranges.iter().all(|r| r.layers == 0));
+        assert!(layout.notes.contains(&format!("rtx0/rtx1: {} TP2 expert layer halves ({}..{})", t.layers, t.first, t.first + t.layers)));
+        for gpu in 0..2 {
+            let bytes: u64 = layout.devices[gpu].items.iter().filter(|i| i.format == "tp2").map(|i| i.bytes).sum();
+            assert_eq!(bytes, t.peak_bytes[gpu], "{label}: rtx{gpu} TP2 arena");
+        }
+    }
     runtime
 }
 
@@ -147,13 +165,13 @@ fn planner_equals_runtime_deepseek_v4_fixture() {
     let manifest = synthetic(dir.path());
     for (rtx, budget) in [(1, 24u64 << 30), (2, 24 << 30)] {
         for context in [131_072, 1_048_576] {
-            let max = Onboard::ExpertsFirst { pool_floor: 262_144 };
-            for onboard in [None, Some(Onboard::Auto), Some(max), Some(Onboard::Layers(2)), Some(Onboard::Layers(0))] {
+            for onboard in [None, Some(Onboard::Auto), Some(Onboard::Layers(2)), Some(Onboard::Layers(0)), Some(Onboard::Fraction(0.5)),
+                Some(Onboard::ExpertsFirst { pool_floor: 262_144 })] {
                 let case = Case { snapshot: dir.path(), manifest: &manifest, rtx, sparks: 2, context, budget,
-                    onboard, dspark: false, peer: false };
+                    onboard, dspark: false, exchange_f32: false, peer_budget: None };
                 let placement = assert_equal(&case, &format!("fixture rtx{rtx} {context} {onboard:?}"));
-                // The default: pool first for Flash on one RTX, experts first on two (`default_onboard`).
-                let effective = onboard.unwrap_or(cuteafd_loader::placement::families::deepseek_v4::default_onboard(4096, rtx));
+                // The default: pool first for Flash on one or two RTX (`default_onboard`).
+                let effective = onboard.unwrap_or(cuteafd_loader::placement::families::deepseek_v4::default_onboard());
                 match effective {
                     Onboard::ExpertsFirst { .. } => assert!(placement.pool_tokens >= 262_144, "experts first keeps a 262K pool"),
                     Onboard::Auto => assert_eq!(placement.pool_tokens, 1 << 20, "24 GiB cards target 1M"),
@@ -161,11 +179,52 @@ fn planner_equals_runtime_deepseek_v4_fixture() {
                         assert_eq!(placement.onboard_layers, n);
                         assert!(placement.pool_tokens >= 1 << 20, "a fixed onboard fills the pool past the target");
                     }
-                    _ => unreachable!(),
+                    Onboard::Fraction(_) => assert_eq!(placement.onboard_layers, 2),
                 }
             }
         }
     }
+}
+
+#[test]
+fn planner_equals_runtime_deepseek_v4_fixture_tp2_asym_dspark_f32() {
+    let dir = tempfile::tempdir().unwrap();
+    let manifest = synthetic(dir.path());
+    cuteafd_loader::plan::testing::write_v4_snapshot_with_dspark(dir.path(), 3);
+    for onboard in [None, Some(Onboard::Auto), Some(Onboard::Layers(2)), Some(Onboard::Fraction(0.5)),
+        Some(Onboard::ExpertsFirst { pool_floor: 262_144 })] {
+        for exchange_f32 in [false, true] {
+            let case = Case { snapshot: dir.path(), manifest: &manifest, rtx: 2, sparks: 2,
+                context: 1_048_576, budget: 32 << 30, peer_budget: Some(30 << 30),
+                onboard, dspark: true, exchange_f32 };
+            let p = assert_equal(&case, &format!("fixture TP2 dSpark {onboard:?} f32={exchange_f32}"));
+            assert!(p.expert_ranges.iter().all(|r| r.layers == 0));
+            assert!(p.expert_ranges[0].peak_bytes > 0);
+            assert_eq!(p.expert_ranges[1].peak_bytes, 0);
+            assert_eq!(p.tp2.unwrap().layers, p.onboard_layers);
+        }
+    }
+}
+
+#[test]
+fn tp2_backbone_admission_does_not_require_tp1_kernels() {
+    let dir = tempfile::tempdir().unwrap();
+    let manifest = synthetic(dir.path());
+    for onboard in [None, Some(Onboard::Auto), Some(Onboard::Layers(0)), Some(Onboard::Layers(2)),
+        Some(Onboard::ExpertsFirst { pool_floor: 262_144 })] {
+        let case = Case { snapshot: dir.path(), manifest: &manifest, rtx: 2, sparks: 2,
+            context: 1_048_576, budget: 24 << 30, peer_budget: None, onboard, dspark: false, exchange_f32: false };
+        let (layout, supported, _) = planned(&case);
+        assert!(supported);
+        assert_eq!(runtime_with_tp1(&case, &layout, false).unwrap(), runtime(&case, &layout).unwrap());
+    }
+}
+
+#[test]
+fn removed_peer_expert_ranges_has_a_clear_error() {
+    let err = Cli::try_parse_from(["serve", "--snapshot", "fixture", "--native-lib", "none", "--peer-expert-ranges"])
+        .err().expect("old flag must refuse").to_string();
+    assert!(err.contains("GPU1 whole-layer expert ranges were replaced by TP2 halves"), "{err}");
 }
 
 fn snapshot(model: &str) -> Option<PathBuf> {
@@ -194,62 +253,53 @@ fn planner_equals_runtime_deepseek_v4() {
         eprintln!("planner_equals_runtime_deepseek_v4: V4 snapshots or manifests absent; skipped");
         return;
     };
-    let budget = 90u64 << 30;
-    let mut auto = std::collections::BTreeMap::new();
+    let budget = (95.5 * (1u64 << 30) as f64) as u64;
     for context in [131_072u64, 1_048_576] {
         for (model, snapshot, rtx, sparks) in [("flash", &flash, 1, 2), ("flash", &flash, 2, 4),
             ("pro", &pro, 1, 4), ("pro", &pro, 2, 6)] {
             let manifest = inputs.join(format!("{model}-{rtx}-{context}/PROGRAMS.json"));
-            // Pool first with GPU1 ranges opted in (EXL3 only; native binds to GPU0).
-            let case = Case { snapshot, manifest: &manifest, rtx, sparks, context, budget,
-                onboard: Some(Onboard::Auto), dspark: true, peer: true };
-            let placement = assert_equal(&case, &format!("{model} rtx{rtx} {context}"));
-            assert_eq!(placement.pool_tokens, 2 << 20, "{model} rtx{rtx}: pool first reaches 2M");
-            if rtx == 2 { assert_eq!(placement.expert_ranges[1].layers > 0, model == "pro", "{model}: GPU1 routed layers"); }
-            // The default: pool first on one RTX (the 2M pool), experts first on two (GPU0 only, a
-            // pool between 262K and the target).
-            let default = assert_equal(&Case { onboard: None, peer: false, ..case }, &format!("{model} rtx{rtx} {context} default"));
-            assert!(default.expert_ranges.get(1).is_none_or(|r| r.layers == 0));
-            let dim = if model == "flash" { 4096 } else { 7168 };
-            if matches!(cuteafd_loader::placement::families::deepseek_v4::default_onboard(dim, rtx), Onboard::Auto) {
-                assert_eq!(default.pool_tokens, 2 << 20, "{model}: a pool-first default reaches 2M");
-            } else { assert!((262_144..=2 << 20).contains(&default.pool_tokens)); }
-            auto.insert((model, rtx, context), placement);
+            for onboard in [None, Some(Onboard::Auto), Some(Onboard::ExpertsFirst { pool_floor: 262_144 }),
+                Some(Onboard::Layers(2)), Some(Onboard::Fraction(0.03))] {
+                for asymmetric in [false, true] {
+                    let case = Case { snapshot, manifest: &manifest, rtx, sparks, context, budget,
+                        onboard, dspark: true, exchange_f32: asymmetric,
+                        peer_budget: asymmetric.then_some(budget - (2 << 30)) };
+                    let placement = assert_equal(&case, &format!("{model} rtx{rtx} {context} {onboard:?} asym={asymmetric}"));
+                    if rtx == 2 {
+                        assert!(placement.expert_ranges.iter().all(|r| r.layers == 0));
+                        assert_eq!(placement.tp2.unwrap().layers, placement.onboard_layers);
+                        assert!(placement.expert_ranges[0].peak_bytes > 0);
+                        assert_eq!(placement.expert_ranges[1].peak_bytes, 0);
+                        if onboard.is_none() || onboard == Some(Onboard::Auto) { assert_eq!(placement.pool_tokens, 2 << 20); }
+                    } else { assert!(placement.tp2.is_none()); }
+                }
+            }
         }
     }
-    // Pool first is extent-independent at these budgets.
-    for model in ["flash", "pro"] {
-        for rtx in [1, 2] {
-            assert_eq!(auto[&(model, rtx, 131_072)].expert_ranges, auto[&(model, rtx, 1_048_576)].expert_ranges);
-        }
-    }
-    // Experts first (v2's policy): more layers than auto, a pool above 262K.
-    for (model, snapshot, sparks) in [("flash", &flash, 2), ("pro", &pro, 4)] {
-        let manifest = inputs.join(format!("{model}-1-1048576/PROGRAMS.json"));
-        let case = Case { snapshot, manifest: &manifest, rtx: 1, sparks, context: 1_048_576, budget,
-            onboard: Some(Onboard::ExpertsFirst { pool_floor: 262_144 }), dspark: true, peer: false };
-        let placement = assert_equal(&case, &format!("{model} min max"));
-        assert!(placement.onboard_layers > auto[&(model, 1, 1_048_576)].onboard_layers);
-        assert!((262_144..2 << 20).contains(&placement.pool_tokens));
-    }
-    // Fixed onboard: the pool is the output.
-    for context in [131_072u64, 1_048_576] {
-        let manifest = inputs.join(format!("flash-2-{context}/PROGRAMS.json"));
-        let case = Case { snapshot: &flash, manifest: &manifest, rtx: 2, sparks: 4, context, budget,
-            onboard: Some(Onboard::Auto), dspark: true, peer: true };
-        // Native MXFP4 layers stay on GPU0: 15 fit beside a fixed onboard's
-        // minimum pool; Pro EXL3 max splits half of its 61 over both GPUs.
-        let placement = assert_equal(&Case { onboard: Some(Onboard::Layers(12)), ..case }, &format!("flash max {context} onboard 12"));
-        assert_eq!((placement.onboard_layers, placement.expert_ranges[1].layers), (12, 0));
-        assert!(placement.pool_tokens > 2 << 20, "fewer layers than auto leave a pool above the target");
-        let manifest = inputs.join(format!("pro-2-{context}/PROGRAMS.json"));
-        let pro_case = Case { snapshot: &pro, manifest: &manifest, rtx: 2, sparks: 6, context, budget,
-            onboard: Some(Onboard::Layers(6)), dspark: true, peer: true };
-        let pro_fixed = assert_equal(&pro_case, &format!("pro max {context} onboard 6"));
-        assert_eq!(pro_fixed.onboard_layers, 6);
-        assert!(pro_fixed.expert_ranges[1].layers > 0 && pro_fixed.pool_tokens > 2 << 20);
-        let percent = Case { onboard: Some(Onboard::Fraction(0.1)), ..pro_case };
-        assert_eq!(assert_equal(&percent, "pro max 10%").onboard_layers, 6);
+}
+
+#[test]
+fn planner_equals_runtime_deepseek_v4_missing_tp2_package() {
+    let (Some(pro), Some(inputs)) = (snapshot("wrldsuksgo2mars/DeepSeek-V4-Pro-0813-EXL3-K2-calibrated-v1"), inputs_dir()) else {
+        eprintln!("missing TP2 package test: real EXL3 snapshot/manifests absent; skipped");
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let source = inputs.join("pro-2-1048576");
+    let manifest = dir.path().join("PROGRAMS.json");
+    std::fs::copy(source.join("PROGRAMS.json"), &manifest).unwrap();
+    let package = dir.path().join("exl3/exl3-dsv4p-k23");
+    std::fs::create_dir_all(&package).unwrap();
+    std::os::unix::fs::symlink(source.join("exl3/exl3-dsv4p-k23/rtx-tp1"), package.join("rtx-tp1")).unwrap();
+    for onboard in [None, Some(Onboard::Auto), Some(Onboard::Layers(0))] {
+        let case = Case { snapshot: &pro, manifest: &manifest, rtx: 2, sparks: 6,
+            context: 1_048_576, budget: (95.5 * (1u64 << 30) as f64) as u64,
+            peer_budget: None, onboard, dspark: false, exchange_f32: false };
+        let p = assert_equal(&case, &format!("missing TP2 package {onboard:?}"));
+        assert_eq!(p.onboard_layers, 0);
+        assert!(p.tp2.is_none());
+        assert!(p.layers.iter().all(|l| l.experts == cuteafd_loader::placement::ExpertHome::Spark));
+        assert!(p.expert_ranges.iter().all(|r| r.layers == 0 && r.peak_bytes == 0));
     }
 }
 
@@ -259,6 +309,8 @@ fn planner_equals_runtime_deepseek_v4() {
 /// context, modules and weights.
 #[derive(serde::Deserialize)]
 struct Fixture {
+    #[serde(default)]
+    historical_tp1: bool,
     model: String,
     rtx: usize,
     sparks: usize,
@@ -277,6 +329,40 @@ struct Fixture {
 struct FixtureGpu {
     total_bytes: u64,
     admission_free_bytes: u64,
+    /// Preserve the raw launch sample when its code table predates the ready measurement.
+    #[serde(default)]
+    reserved_code_bytes: Option<u64>,
+    #[serde(default)]
+    untracked_at_admission_bytes: Option<u64>,
+}
+
+impl FixtureGpu {
+    fn free_with_current_code(&self, code: u64) -> u64 {
+        match (self.reserved_code_bytes, self.untracked_at_admission_bytes) {
+            (Some(reserved), Some(untracked)) => {
+                let loaded = cuteafd_loader::placement::inventory::LoadedCode {
+                    family: "dsv4", experts: "*", split: true, rank: 0,
+                    bytes: code, source: "fixture replay",
+                };
+                let context = cuteafd_loader::placement::inventory::ArchContext::for_device(
+                    "sm_120", self.total_bytes).context_bytes;
+                self.admission_free_bytes.checked_add(reserved).unwrap()
+                    .checked_sub(loaded.pending(untracked, context)).unwrap()
+            }
+            (None, None) => self.admission_free_bytes,
+            _ => panic!("fixture must record both pending-code inputs"),
+        }
+    }
+}
+
+#[test]
+fn measured_fixture_replays_pending_code_without_changing_raw_sample() {
+    let gpu = FixtureGpu { total_bytes: 101_973_491_712, admission_free_bytes: 93_570_006_176,
+        reserved_code_bytes: Some(967_770_976), untracked_at_admission_bytes: Some(598_715_904) };
+    assert_eq!(gpu.free_with_current_code(980_070_752), gpu.admission_free_bytes);
+    assert_eq!(gpu.free_with_current_code(1_007_333_728), gpu.admission_free_bytes - 27_262_976);
+    assert_eq!(gpu.free_with_current_code(0), gpu.admission_free_bytes + 967_770_976);
+    assert_eq!(gpu.admission_free_bytes, 93_570_006_176);
 }
 
 const MIB: u64 = 1 << 20;
@@ -295,6 +381,7 @@ fn planner_equals_runtime_deepseek_v4_measured() {
         let path = entry.path();
         if !path.file_name().unwrap().to_string_lossy().starts_with("v4-") { continue; }
         let fixture: Fixture = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        if fixture.historical_tp1 { continue; }
         let label = path.file_stem().unwrap().to_string_lossy().into_owned();
         let manifest = PathBuf::from(shellexpand(&fixture.manifest));
         let (Some(snapshot), true) = (snapshot(&fixture.model), manifest.is_file()) else {
@@ -305,16 +392,21 @@ fn planner_equals_runtime_deepseek_v4_measured() {
         assert!(fixture.gpus.iter().all(|g| g.total_bytes.abs_diff(budget) < 8 * MIB), "{label}: unequal GPUs");
         let onboard = fixture.onboard.as_deref().map(|o| o.parse::<Onboard>().unwrap());
         let case = Case { snapshot: &snapshot, manifest: &manifest, rtx: fixture.rtx, sparks: fixture.sparks,
-            context: fixture.context, budget, onboard, dspark: true, peer: false };
+            context: fixture.context, budget, onboard, dspark: true, exchange_f32: false,
+            peer_budget: fixture.gpus.get(1).map(|g| g.total_bytes) };
         let (layout, supported, hints) = planned(&case);
         assert!(supported, "{label}: planner refused: {:?} {:?}", layout.notes, hints);
-        // The planner's view of the sample: everything loaded before admission.
+        let catalog = cuteafd_loader::read_expert_catalog(&snapshot).unwrap();
+        let cfg = cuteafd_loader::families::deepseek_v4::DeepseekV4Config::read(&snapshot, 1).unwrap();
+        let code = cuteafd_loader::placement::families::deepseek_v4::code_bytes(
+            cfg.dim, cuteafd_loader::placement::families::deepseek_v4::code_experts(&catalog), fixture.rtx);
+        // Replay pending-code reservation, retaining the raw launch sample.
         for (gpu, measured) in fixture.gpus.iter().enumerate() {
             let device = &layout.devices[gpu];
             let planned_loaded: u64 = device.items.iter().filter(|i| matches!(i.category,
                 Category::Weights | Category::Embedding | Category::Drafter) || i.group == "context+modules")
                 .map(|i| i.bytes).sum();
-            let measured_loaded = measured.total_bytes - measured.admission_free_bytes;
+            let measured_loaded = measured.total_bytes - measured.free_with_current_code(code[gpu]);
             let diff = planned_loaded as i64 - measured_loaded as i64;
             eprintln!("{label} rtx{gpu}: planned loaded {planned_loaded} measured {measured_loaded} diff {diff} \
                 (driver {})", fixture.driver);
@@ -334,6 +426,35 @@ fn planner_equals_runtime_deepseek_v4_measured() {
         let slack = (64 * MIB).div_ceil(unit.max(1)) * 256;
         assert!(layout.pool_tokens.abs_diff(runtime.pool_tokens) <= slack, "{label}: pool {} planned vs {} measured",
             layout.pool_tokens, runtime.pool_tokens);
+        if fixture.rtx == 2 {
+            assert!(runtime.expert_ranges.iter().all(|r| r.layers == 0));
+            assert_eq!(runtime.tp2.unwrap().layers, fixture.onboard_layers);
+            // Re-solve the same measured pre-allocation inventory for every
+            // retained onboard policy; no deleted two-RTX TP1 placement.
+            for onboard in [None, Some(Onboard::Auto),
+                Some(Onboard::ExpertsFirst { pool_floor: 262_144 }),
+                Some(Onboard::Layers(2)), Some(Onboard::Fraction(0.03))] {
+                let variant = Case { onboard, ..case };
+                let (layout, supported, hints) = planned(&variant);
+                assert!(supported, "{label} {onboard:?}: {hints:?}");
+                let runtime = runtime_measured(&variant, &fixture).unwrap();
+                let tp2 = runtime.tp2.unwrap();
+                assert!(runtime.expert_ranges.iter().all(|r| r.layers == 0));
+                assert!(layout.notes.contains(&format!(
+                    "rtx0/rtx1: {} TP2 expert layer halves ({}..{})",
+                    tp2.layers, tp2.first, tp2.first + tp2.layers)), "{label} {onboard:?}");
+                assert!(layout.pool_tokens.abs_diff(runtime.pool_tokens) <= slack,
+                    "{label} {onboard:?}: pool {} planned vs {} measured",
+                    layout.pool_tokens, runtime.pool_tokens);
+                if onboard.is_none() || onboard == Some(Onboard::Auto) {
+                    assert_eq!(runtime.pool_tokens, 2 << 20);
+                }
+                if let Some(Onboard::Layers(n)) = onboard {
+                    assert_eq!(runtime.onboard_layers, n);
+                }
+                eprintln!("{label} {onboard:?}: TP2 {} layers pool {}", tp2.layers, runtime.pool_tokens);
+            }
+        }
         checked += 1;
     }
     eprintln!("planner_equals_runtime_deepseek_v4_measured: {checked} fixtures");
@@ -352,17 +473,45 @@ fn runtime_measured(case: &Case<'_>, fixture: &Fixture) -> anyhow::Result<Placem
     let peers = (0..case.sparks).map(|r| format!("10.0.0.{}:1970{r}", r + 1)).collect::<Vec<_>>().join(",");
     let mut argv = vec!["serve".to_string(), "--snapshot".into(), case.snapshot.display().to_string(),
         "--native-lib".into(), "/nonexistent/libcuteafd.so".into(), "--peers".into(), peers, "--dspark".into()];
-    if let Some(onboard) = &fixture.onboard { argv.extend(["--rtx-expert-layers".into(), onboard.clone()]); }
+    if let Some(onboard) = case.onboard { argv.extend(["--rtx-expert-layers".into(), onboard.to_string()]); }
     if case.rtx == 2 { argv.extend(["--split-device".into(), "1".into()]); }
     let cli = Cli::try_parse_from(argv)?;
     let stages = (0..).take_while(|stage| catalog.tensors().iter()
         .any(|t| t.metadata.name.starts_with(&format!("mtp.{stage}.")))).count();
-    let gpus = fixture.gpus.iter().map(|g| (g.total_bytes, Baseline::Measured { free_bytes: g.admission_free_bytes }))
-        .collect();
+    let code = cuteafd_loader::placement::families::deepseek_v4::code_bytes(
+        cfg.dim, cuteafd_loader::placement::families::deepseek_v4::code_experts(&catalog), fixture.rtx);
+    let gpus = fixture.gpus.iter().enumerate().map(|(gpu, g)| (g.total_bytes,
+        Baseline::Measured { free_bytes: g.free_with_current_code(code[gpu]) })).collect();
     let expert_workspace = layout_expert_workspace(case, &catalog)?;
     let inputs = admission::Inputs { cfg: &cfg, catalog: &catalog, manifest: &manifest, family, gpus,
         cache_stages: stages, prefill_rows: manifest["capacities"]["prefill_rows"].as_u64().unwrap() as usize,
         decode_rows: manifest["capacities"]["decode_rows"].as_u64().unwrap() as usize,
-        max_context: case.context as usize, prefix: Some(&cli.prefix), expert_workspace: Some(expert_workspace) };
+        max_context: case.context as usize, prefix: Some(&cli.prefix), expert_workspace: Some(expert_workspace),
+        tp2_workspace: if case.rtx == 2 { cuteafd_loader::serving_capacity::deepseek_v4_tp2_workspace(
+            &catalog, Some(case.manifest), manifest["capacities"]["prefill_rows"].as_u64().unwrap()
+                .max(manifest["capacities"]["decode_rows"].as_u64().unwrap())).ok().map(|b| [b; 2]) } else { None },
+        exchange_f32: case.exchange_f32 };
     Ok(solve(&admission::request(&cli.engine, &inputs)?)?)
+}
+
+/// P2's two-RTX fixture predates TP2 and its deleted GPU0-only routed layout.
+/// Preserve its recorded sample and pending-code arithmetic, not its TP1 answer.
+#[test]
+fn historical_p2_flash_max_inventory_and_pending_code() {
+    let fixture: Fixture = serde_json::from_str(include_str!(
+        "../../shared/placement_fixtures/v4-flash-max.json")).unwrap();
+    assert!(fixture.historical_tp1);
+    assert_eq!((fixture.rtx, fixture.sparks), (2, 4));
+    for (gpu, code) in fixture.gpus.iter().zip([560_200_800, 260_349_424]) {
+        assert!(gpu.admission_free_bytes < gpu.total_bytes);
+        let measured_used = gpu.total_bytes - gpu.admission_free_bytes;
+        let historical = cuteafd_loader::placement::inventory::LoadedCode {
+            family: "dsv4", experts: "*", split: true, rank: 0,
+            bytes: code, source: "historical P2 TP1 sample",
+        };
+        let context = 586_416_128;
+        assert_eq!(historical.pending(context + 100, context), code - 100);
+        assert_eq!(historical.pending(context + code, context), 0);
+        assert!(measured_used > context + code);
+    }
 }

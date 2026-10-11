@@ -15,6 +15,31 @@ impl V41Exl3TensorSlice {
     pub fn bytes(self) -> usize {
         self.rows * self.selected_row_bytes
     }
+    /// Verify that a TP2 pair needs exactly one complete source projection.
+    /// Replicated rotations may have identical slices; split projections must
+    /// cover adjacent ranges, with neither gaps nor extra source bytes.
+    pub fn validate_pair(pair: [Self; 2], source_bytes: usize) -> Result<()> {
+        let [a, b] = pair;
+        ensure!(a.rows > 0 && a.source_row_bytes > 0 && a.rows == b.rows
+            && a.source_row_bytes == b.source_row_bytes,
+            "incompatible TP2 projection rows");
+        ensure!(a.rows.checked_mul(a.source_row_bytes) == Some(source_bytes),
+            "TP2 projection source size mismatch");
+        for slice in pair {
+            ensure!(slice.selected_row_bytes > 0
+                && slice.column_start_bytes.checked_add(slice.selected_row_bytes)
+                    .is_some_and(|end| end <= slice.source_row_bytes),
+                "TP2 projection slice exceeds source row");
+        }
+        let full = |s: Self| s.column_start_bytes == 0
+            && s.selected_row_bytes == s.source_row_bytes;
+        ensure!((full(a) && full(b)) || (a.column_start_bytes == 0
+            && b.column_start_bytes == a.selected_row_bytes
+            && b.column_start_bytes + b.selected_row_bytes == b.source_row_bytes),
+            "TP2 projection ranges overlap or leave unread gaps");
+        Ok(())
+    }
+
     pub fn scratch_bytes(self) -> usize {
         if self.rows > 1 && self.selected_row_bytes != self.source_row_bytes {
             self.source_row_bytes
@@ -160,7 +185,7 @@ fn read_slice(
     scratch: &mut [u8],
 ) -> Result<()> {
     if slice.rows == 1 || slice.selected_row_bytes == slice.source_row_bytes {
-        file.read_exact_at(
+        super::v41_catalog::projection_read(file,
             &mut dst[..slice.bytes()],
             offset
                 .checked_add(slice.column_start_bytes as u64)
@@ -176,7 +201,7 @@ fn read_slice(
             .checked_mul(slice.source_row_bytes as u64)
             .and_then(|n| offset.checked_add(n))
             .context("EXL3 row offset overflow")?;
-        file.read_exact_at(&mut scratch[..rows * slice.source_row_bytes], file_offset)?;
+        super::v41_catalog::projection_read(file, &mut scratch[..rows * slice.source_row_bytes], file_offset)?;
         for row in 0..rows {
             let src = row * slice.source_row_bytes + slice.column_start_bytes;
             let dest = (start + row) * slice.selected_row_bytes;
@@ -266,6 +291,51 @@ mod tests {
             }
         }
         println!("K3/K4 gate/up/down packed tensors and rotations reconstruct exactly for disjoint TP2/TP4 and paired TP4");
+    }
+
+    #[test]
+    fn shared_tp2_union_covers_each_projection_once() -> Result<()> {
+        for kind in [V41Exl3ProjectionKind::Gate, V41Exl3ProjectionKind::Up, V41Exl3ProjectionKind::Down] {
+            for bits in 2..=5 {
+                let (input, output) = if kind == V41Exl3ProjectionKind::Down { (2304, 128) } else { (128, 2304) };
+                let projection = V41Exl3Projection { name: "test".into(), kind, bits,
+                    input_features: input, output_features: output };
+                for suffix in ["trellis", "suh", "svh", "mcg"] {
+                    let full = tensor_slice(&projection, suffix, 1, 0)?;
+                    let pair = [tensor_slice(&projection, suffix, 2, 0)?, tensor_slice(&projection, suffix, 2, 1)?];
+                    V41Exl3TensorSlice::validate_pair(pair, full.bytes())?;
+                    let source: Vec<_> = (0..full.bytes()).map(|i| (i % 251) as u8).collect();
+                    let dir = tempfile::tempdir()?;
+                    let file = File::options().create_new(true).read(true).write(true).open(dir.path().join("tensor"))?;
+                    file.write_all_at(&source, 64)?;
+                    let mut once = vec![0; source.len()];
+                    file.read_exact_at(&mut once, 64)?;
+                    for slice in pair {
+                        let mut legacy = vec![0; slice.bytes()];
+                        read_slice(&file, 64, slice, &mut legacy, &mut vec![0; slice.scratch_bytes() * 3])?;
+                        let pitched: Vec<_> = (0..slice.rows).flat_map(|row| {
+                            let start = row * slice.source_row_bytes + slice.column_start_bytes;
+                            once[start..start + slice.selected_row_bytes].iter().copied()
+                        }).collect();
+                        assert_eq!(pitched, legacy);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn shared_tp2_union_rejects_gaps_overlap_and_oversized_slices() {
+        let slice = V41Exl3TensorSlice { rows: 4, source_row_bytes: 16,
+            column_start_bytes: 0, selected_row_bytes: 8 };
+        let right = V41Exl3TensorSlice { column_start_bytes: 8, ..slice };
+        assert!(V41Exl3TensorSlice::validate_pair([slice, right], 64).is_ok());
+        for start in [0, 7, 9, usize::MAX] {
+            assert!(V41Exl3TensorSlice::validate_pair([slice,
+                V41Exl3TensorSlice { column_start_bytes: start, ..slice }], 64).is_err());
+        }
+        assert!(V41Exl3TensorSlice::validate_pair([slice, right], 65).is_err());
     }
 
     #[test]
