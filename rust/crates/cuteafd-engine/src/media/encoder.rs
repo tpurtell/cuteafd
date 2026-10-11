@@ -65,6 +65,18 @@ pub trait EncoderClient {
     fn cancel(&mut self, ticket: EncoderTicket);
 }
 
+impl<C: EncoderClient + ?Sized> EncoderClient for &mut C {
+    fn submit(&mut self, job: EncodeJob) -> Result<EncoderTicket, MediaError> {
+        (**self).submit(job)
+    }
+    fn poll(&mut self, ticket: EncoderTicket) -> Option<Result<EncodeOutput, MediaError>> {
+        (**self).poll(ticket)
+    }
+    fn cancel(&mut self, ticket: EncoderTicket) {
+        (**self).cancel(ticket);
+    }
+}
+
 struct Pending {
     job: EncodeJob,
     polls: usize,
