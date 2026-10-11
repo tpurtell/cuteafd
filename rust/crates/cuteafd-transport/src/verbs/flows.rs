@@ -624,6 +624,7 @@ mod tests {
             client_native_endpoint: native,
             write_target: None,
             flow_label,
+            worker_selection_digest: None,
         }
     }
 
