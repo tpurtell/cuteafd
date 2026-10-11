@@ -28,7 +28,8 @@ def write_bridge(output: Path, manifest: dict) -> None:
         raise ValueError('invalid EXL3 cooperative grid capacity')
     # Mixed Trellis owns a complete K reduction per MN tile; a smaller grid
     # changes CTA assignment, not reduction order. Barriers count actual grid_x.
-    # Keep all exported buffer sizes: barrier offsets still embed export-time SMs.
+    # Barrier offsets and scratch use the declared workspace capacity, not the
+    # export card. A smaller SM120 build can therefore use every PRO 6000 SM.
     # CuTe AOT stores kernel handles in globals inside each loaded DSO. Every
     # context must retain the same CUDA libraries; recreating them per lane or
     # device replaces those globals and loses another device's launch attributes.
@@ -51,10 +52,13 @@ def write_bridge(output: Path, manifest: dict) -> None:
     lines += ['extern "C" int cuteafd_exl3_create(void** out) {',
         'if (!out) return int(cudaErrorInvalidValue); *out = nullptr;',
         'Context* ctx = new(std::nothrow) Context; if (!ctx) return int(cudaErrorMemoryAllocation);',
-        'cudaError_t status = cudaGetDevice(&ctx->device); cudaDeviceProp props{};',
-        'if (status == cudaSuccess) status = cudaGetDeviceProperties(&props, ctx->device);',
-        f'if (status != cudaSuccess || props.major != {manifest["compute"][0]} || props.minor != {manifest["compute"][1]} || props.multiProcessorCount < 1) {{ delete ctx; return int(cudaErrorInvalidDevice); }}',
-        f'ctx->grid_cap = (props.multiProcessorCount < {manifest["sms"]} ? props.multiProcessorCount : {manifest["sms"]}) * {manifest["blocks_per_sm"]};',
+        'cudaError_t status = cudaGetDevice(&ctx->device); int major = 0, minor = 0, sms = 0;',
+        'if (status == cudaSuccess) status = cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, ctx->device);',
+        'if (status == cudaSuccess) status = cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, ctx->device);',
+        'if (status == cudaSuccess) status = cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, ctx->device);',
+        'if (status != cudaSuccess) { delete ctx; return int(status); }',
+        f'if (major != {manifest["compute"][0]} || minor != {manifest["compute"][1]} || sms < 1 || sms > {manifest["sms"]}) {{ delete ctx; return int(cudaErrorInvalidDevice); }}',
+        f'ctx->grid_cap = sms * {manifest["blocks_per_sm"]};',
         'std::lock_guard<std::mutex> lock(modules.mutex);',
         'int error = load_core(ctx->device); if (!error) error = load_sum(ctx->device);',
         'if (error) { if (!modules.users) unload_modules(); delete ctx; return error; }',
@@ -188,7 +192,7 @@ def export(output: Path, intermediate: int, experts: int, capacity: int,
     import torch
     from b12x.moe._shared.kernels.w4a16.host import route_pack_capacity
     from b12x.moe._shared.kernels.w4a16.mixed_trellis import (
-        compile_mixed_trellis, compile_mixed_trellis3, make_mixed_trellis_buffers,
+        EXL3_AOT_MAX_SMS, compile_mixed_trellis, compile_mixed_trellis3, make_mixed_trellis_buffers,
     )
     from b12x.moe._shared.kernels.w4a16.mixed_trellis4 import compile_mixed_trellis4
     from b12x.moe.fused_moe._impl import (
@@ -210,6 +214,9 @@ def export(output: Path, intermediate: int, experts: int, capacity: int,
     props = torch.cuda.get_device_properties(0)
     if (props.major, props.minor) not in ((12, 0), (12, 1)):
         raise ValueError("V4.1 export requires native SM120 or SM121")
+    workspace_sms = EXL3_AOT_MAX_SMS[(props.major, props.minor)]
+    if props.multi_processor_count > workspace_sms:
+        raise ValueError("EXL3 device exceeds the declared AOT workspace SM capacity")
     direct = _projection_mixed_direct_topk_routes(capacity, topk, direct_exl3=len(bits) == 2)
     if routing != "auto":
         direct = routing == "direct"
@@ -221,7 +228,8 @@ def export(output: Path, intermediate: int, experts: int, capacity: int,
     options = dict(size_m=capacity, hidden_size=hidden, intermediate_size=intermediate,
         tier0_num_experts=experts, tier1_num_experts=experts, top_k=topk,
         route_num_experts=experts, max_m_blocks=route_blocks,
-        sms=props.multi_processor_count, max_shared_mem=props.shared_memory_per_block_optin,
+        sms=props.multi_processor_count, workspace_sms=workspace_sms,
+        max_shared_mem=props.shared_memory_per_block_optin,
         force_tile_config=_projection_mixed_tile_config(tile, hidden_size=hidden,
             intermediate_size=intermediate, token_count=capacity, direct_topk_routes=direct),
         tier0_bits=bits[0], tier1_bits=bits[1], trellis_codebook="mcg", swiglu_limit=swiglu_limit,
@@ -290,7 +298,8 @@ def export(output: Path, intermediate: int, experts: int, capacity: int,
                 raise ValueError(f'route metadata exceeds canonical capacity: {name}')
             spec.update(shape=[count], bytes=count * 4)
     manifest = {"schema": "cuteafd.v41-exl3-aot.v1", "sparkinfer_revision": _pinned_sparkinfer.REVISION,
-        "gpu": props.name, "compute": [props.major, props.minor], "sms": props.multi_processor_count,
+        "gpu": props.name, "compute": [props.major, props.minor], "sms": workspace_sms,
+        "physical_sms": props.multi_processor_count,
         "hidden": hidden, "intermediate": intermediate, "experts": experts, "top_k": topk,
         "capacity": capacity, "output_dtype": output_dtype, "bits": list(bits), "swiglu_limit": swiglu_limit,
         "direct": direct, "route_slots": route_slots, "route_blocks": route_blocks,
