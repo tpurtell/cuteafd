@@ -106,6 +106,7 @@ impl<'a> Fp8MoeTp2<'a> {
         ensure!(!layers.is_empty() && layers.start >= tensors.shape().first_layer
             && layers.end <= tensors.shape().layers, "invalid FP8 MoE TP2 layer range");
         let started = std::time::Instant::now();
+        let _scope = cuteafd_ffi::memory_ledger::scope("experts/TP2 FP8 expert layer halves");
         let plans = [Self::plan(tensors, directory, 0, max_rows)?, Self::plan(tensors, directory, 1, max_rows)?];
         for rank in 0..2 {
             let required = plans[rank].resident_layer_bytes.checked_mul(layers.len())
@@ -253,33 +254,28 @@ mod tests {
     }
 
     #[test]
-    fn planner_equals_runtime_glm5_flash_tp2_retained_form_scratch_at_1024() -> Result<()> {
-        use cuteafd_loader::placement::families::glm5_flash::expert_workspace;
-        use cuteafd_loader::plan::testing::{glm5_flash_config, glm5_flash_tensors, write_snapshot};
-        let root = tempfile::tempdir()?;
-        let config = glm5_flash_config(2);
-        write_snapshot(root.path(), &config, &glm5_flash_tensors(&config), None);
-        let catalog = cuteafd_loader::read_expert_catalog(root.path())?;
-        let share = root.path().join("share");
-        let package = root.path().join("lib/fp8/fp8-glmf");
-        std::fs::create_dir_all(&share)?;
-        std::fs::create_dir_all(&package)?;
+    fn planner_inventory_matches_runtime_retained_form_scratch() -> Result<()> {
+        use cuteafd_loader::placement::inventory::fp8moe_scratch_bytes;
         // Measured SM188/170 exports: W8A8 is larger at 1024, auto at 4096.
         let retained = [(1024, 163_779_584), (4096, 734_346_240)];
         let capacities: Vec<_> = retained.iter().map(|&(capacity, scratch)|
             serde_json::json!({"capacity": capacity, "scratch_bytes": scratch})).collect();
-        std::fs::write(package.join("manifest.json"), serde_json::to_vec(&serde_json::json!({
-            "layouts": {"tp2": {"capacities": capacities}}
-        }))?)?;
+        let manifest = serde_json::json!({"layouts": {"tp2": {"capacities": capacities}}});
         for (rows, abi_scratch) in retained {
-            let (_, _, runtime) = workspace(abi_scratch, catalog.routed_experts().hidden, rows)?;
-            let planned = expert_workspace(&catalog, Some(&share.join("PROGRAMS.json")), rows as u64, 2)?;
+            let scratch = fp8moe_scratch_bytes(&manifest, "tp2", rows as u64)
+                .context("planner retained-form scratch inventory")?;
+            let (_, output, runtime) = workspace(abi_scratch, 4096, rows)?;
+            let planned = scratch + output as u64;
             assert_eq!(planned, runtime as u64);
             if rows == 1024 {
                 assert_eq!(planned, 172_168_192);
                 assert_eq!(abi_scratch - 117_510_144, 46_269_440);
             }
         }
+        // Admission uses the smallest sufficient bucket, not the request rows.
+        assert_eq!(fp8moe_scratch_bytes(&manifest, "tp2", 1023), Some(163_779_584));
+        assert_eq!(fp8moe_scratch_bytes(&manifest, "tp2", 1025), Some(734_346_240));
+        assert_eq!(fp8moe_scratch_bytes(&manifest, "tp2", 4097), None);
         Ok(())
     }
 
