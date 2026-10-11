@@ -41,6 +41,36 @@ fn request(row_count: usize, source_kind: ExpertV2SourceKind) -> Result<ExpertPr
 }
 
 #[test]
+fn capacity_error_is_final_empty_and_preserves_request_identity() -> Result<()> {
+    let mut request = request(128, ExpertV2SourceKind::Prefill)?;
+    request.header.flags |= EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16;
+    let response = ExpertProtocolV2ResponseRef::row_capacity_error(&request.header, 80, 99)?;
+    assert_eq!(response.header.request_id, request.header.request_id);
+    assert_eq!(response.header.placement_version, request.header.placement_version);
+    assert_eq!(response.header.layer_id, request.header.layer_id);
+    assert_eq!(response.header.executor_id, 99);
+    assert_eq!(response.header.status, ExpertProtocolV2Status::Error);
+    assert!(!response.more_chunks());
+    assert!(response.partial_output_payload.is_empty());
+    let mut frame = ExpertProtocolV2FrameBuffer::default();
+    let encoded = frame.encode_borrowed_response_prefix(&response)?;
+    let decoded = ExpertProtocolV2Response::decode(encoded)?;
+    assert_eq!(decoded.header, response.header);
+    assert_eq!(decoded.header.ensure_success(128).unwrap_err().to_string(),
+        "expert worker rejected 128 rows: capacity 80");
+    let mut malformed = response.clone();
+    malformed.header.status = ExpertProtocolV2Status::Ok;
+    assert!(malformed.validate().is_err());
+    malformed = response.clone();
+    malformed.header.flags |= EXPERT_PROTOCOL_V2_FLAG_RESPONSE_MORE_CHUNKS;
+    assert!(malformed.validate().is_err());
+    malformed = response.clone();
+    malformed.header.row_count = 1;
+    assert!(malformed.validate().is_err());
+    Ok(())
+}
+
+#[test]
 fn encode_decode_one_row_flash_request_has_8192_payload_bytes() -> Result<()> {
     let request = request(1, ExpertV2SourceKind::Decode)?;
     let encoded = request.encode()?;

@@ -4312,7 +4312,7 @@ fn validate_response_matches_request(
             request.header.layer_id
         );
     }
-    Ok(())
+    response.ensure_success(request.header.row_count)
 }
 
 fn validate_control_endpoint_metadata(
@@ -5078,6 +5078,27 @@ mod persistent_tests {
             response.partial_output_payload,
             vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
         );
+    }
+
+    #[test]
+    fn capacity_rejection_precedes_host_and_gpu_row_coverage_checks() {
+        let request = persistent_chunk_request(128);
+        let response = crate::ExpertProtocolV2ResponseRef::row_capacity_error(&request.header, 80, 99).unwrap();
+        let mut frame = ExpertProtocolV2FrameBuffer::default();
+        let encoded = frame.encode_borrowed_response_prefix(&response).unwrap();
+        let view = ExpertProtocolV2ResponseView::parse(encoded).unwrap();
+        let expected = "expert worker rejected 128 rows: capacity 80";
+        for validate_only in [false, true] {
+            let mut assembler = if validate_only { ProtocolV2ResponseChunkAssembler::validation_only(&request) }
+                else { ProtocolV2ResponseChunkAssembler::new(&request) };
+            assert_eq!(assembler.accept(&request, &view).unwrap_err().to_string(), expected);
+        }
+        let landed = ExpertProtocolV2ResponseView::parse_landed_header(encoded).unwrap();
+        let mut assembler = ProtocolV2ResponseChunkAssembler::validation_only(&request);
+        assert_eq!(assembler.accept_landed(&request, &landed).unwrap_err().to_string(), expected);
+        let mut stale = response.header;
+        stale.request_id += 1;
+        assert!(validate_response_matches_request(&stale, &request).unwrap_err().to_string().contains("request_id"));
     }
 
     #[test]

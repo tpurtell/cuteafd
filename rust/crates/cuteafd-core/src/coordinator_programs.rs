@@ -1,4 +1,21 @@
 //! Programs belonging to one coordinator, including unsplit draft/target work.
+
+// Literal registry consumed by release-common.sh as well as the serving owners.
+pub const V41_PREFILL_MIN_ROWS: u32 = 80;
+pub const V41_PREFILL_MAX_ROWS: u32 = 4096;
+pub const V41_LIVE_MIN_ROWS: u32 = 256;
+pub const V41_DECODER_REPLAY_ROWS: u32 = 128;
+pub const V41_SERVING_AOT_ROWS: [u32; 3] = [256, 1024, 4096];
+
+pub fn v41_live_rows(chunk: u32) -> Option<u32> {
+    (V41_PREFILL_MIN_ROWS..=V41_PREFILL_MAX_ROWS).contains(&chunk)
+        .then_some(chunk.max(V41_LIVE_MIN_ROWS).max(V41_DECODER_REPLAY_ROWS))
+}
+
+pub fn v41_aot_rows(chunk: u32) -> Option<u32> {
+    let live = v41_live_rows(chunk)?;
+    V41_SERVING_AOT_ROWS.into_iter().find(|&rows| rows >= live)
+}
 #[derive(Debug, Clone, Copy)]
 pub struct CoordinatorPrograms<'a> {
     pub family: &'a str,
@@ -77,6 +94,20 @@ impl std::error::Error for MissingCoordinatorProgram {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn v41_serving_rows_cover_live_chunks_and_decoder_replay() {
+        for chunk in V41_PREFILL_MIN_ROWS..=V41_PREFILL_MAX_ROWS {
+            let live = v41_live_rows(chunk).unwrap();
+            let aot = v41_aot_rows(chunk).unwrap();
+            assert!(live >= chunk && live >= V41_DECODER_REPLAY_ROWS && live >= V41_LIVE_MIN_ROWS);
+            assert!(aot >= live && V41_SERVING_AOT_ROWS.contains(&aot));
+        }
+        for invalid in [0, 79, 4097, u32::MAX] {
+            assert_eq!(v41_live_rows(invalid), None);
+            assert_eq!(v41_aot_rows(invalid), None);
+        }
+    }
 
     #[test]
     fn namespace_selection_keeps_only_serving_and_split_families() {

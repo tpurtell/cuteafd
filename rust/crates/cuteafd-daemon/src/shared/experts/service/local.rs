@@ -230,6 +230,15 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
             let mut execution_failed = false;
             let wait = (wait_index == Some(index)).then_some(idle_wait);
             let result = connections[index].poll(wait, |view, mapped, emit| {
+                // The wire parser has validated framing and identities. Reject
+                // oversize work with a final response, not an unanswered peer drop.
+                if view.header.row_count > config.capacity {
+                    let response = cuteafd_transport::protocol_v2::ExpertProtocolV2ResponseRef::row_capacity_error(
+                        &view.header, config.capacity, executor_id)?;
+                    tracing::warn!(rows = view.header.row_count, capacity = config.capacity,
+                        request_id = view.header.request_id, "native expert request rejected");
+                    return emit(ProtocolV2ExecutorResponseRef::Host(response));
+                }
                 // A topology-bound worker admits only the ownership-aware
                 // request contract; every other family is a protocol mismatch,
                 // not a silent fallback.

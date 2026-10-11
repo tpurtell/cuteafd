@@ -77,7 +77,7 @@ pub(super) fn attach(endpoint: &NativeRdmaEndpoint, landing: DeviceLanding, addr
 
 impl ProtocolV2ResponseChunkAssembler {
     /// A whole-plane response whose payload landed in device memory.
-    fn accept_landed(&mut self, request: &ExpertProtocolV2Request, header: &ExpertProtocolV2ResponseHeader)
+    pub(super) fn accept_landed(&mut self, request: &ExpertProtocolV2Request, header: &ExpertProtocolV2ResponseHeader)
         -> Result<()> {
         anyhow::ensure!(!self.final_chunk_received, "ProtocolV2 response chunk arrived after the final chunk");
         validate_response_matches_request(header, request)?;

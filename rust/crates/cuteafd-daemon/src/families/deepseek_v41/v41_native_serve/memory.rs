@@ -127,7 +127,8 @@ pub(super) fn admit_small_card_startup(lib: &cuteafd_ffi::NativeLibrary,
     if total > 32usize << 30 { return Ok(()); }
     ensure!(args.rtx_expert_layers == LocalLayers::Count(0),
         "32 GB V4.1 startup admission requires --rtx-expert-layers 0; use a larger coordinator for local experts");
-    let capacity = args.prefill_batch_tokens.max(256);
+    let capacity = cuteafd_core::coordinator_programs::v41_live_rows(args.prefill_batch_tokens)
+        .context("invalid V4.1 prefill batch")?;
     let rows = capacity as usize;
     let head_rows = if args.dspark_draft_limit > 5 { 64 } else { 48 };
     let mut owners: Vec<(&str, usize)> = vec![
