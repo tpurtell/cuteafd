@@ -22,6 +22,7 @@ use super::engine::{MimoEngine, MimoPlacement, DECODE_ROWS};
 use super::prefix::MimoPrefix;
 use super::serve_failures::FailureRecipients;
 use crate::shared::prefix::CudaCopyEngine;
+use crate::shared::speculation::copy::LongestBackward;
 use cuteafd_engine::media::{EmbeddingCache, MediaAdmission, MediaPoll, MediaReady, MediaWaiter, RequestMedia, MediaKeys};
 use cuteafd_engine::prefix::{After, MarkArena, PointPolicy, PrefixCache, PrefixConfig, PrefixFamily, SnapshotKind};
 use crate::families::glm5::dflash_policy::{self, CycleCost, DraftHistory, Group, Shape};
@@ -42,9 +43,6 @@ use tokio::sync::mpsc;
 
 /// Most copy-window draft tokens verified per sequence and step.
 const COPY_DRAFT: usize = 7;
-
-#[path = "copy.rs"]
-mod copy;
 
 #[derive(Debug, clap::Args)]
 pub(crate) struct ServeArgs {
@@ -358,7 +356,7 @@ struct Active<'a> {
     job: NativeRequest,
     /// Prompt and generated tokens, for copy-window drafts.
     history: Vec<u32>,
-    copy_index: Option<copy::CopyIndex>,
+    copy_index: Option<LongestBackward>,
     keyed_history: Vec<u32>,
     media: RequestMedia,
     /// The sequence's DFlash ring slot (None: copy-window drafts only).
@@ -872,7 +870,7 @@ fn schedule_inner(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path
                         copy_drafts: DraftHistory::default(),
                         counts: [0; 6],
                         history: p.tokens,
-                        copy_index: policy.indexed_copy.then(copy::CopyIndex::default),
+                        copy_index: policy.indexed_copy.then(LongestBackward::default),
                         keyed_history: p.keys.tokens().to_vec(),
                         media: p.media,
                         draft_limit: draft,
@@ -961,7 +959,7 @@ fn schedule_inner(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path
         // Greedy copy windows replace, rather than accompany, this sequence's neural draft.
         let copies = (policy.indexed_copy || (copy_policy && policy.copy > 0)).then(|| active.iter_mut().enumerate().map(|(i, a)| {
             if a.job.sampling.is_greedy() {
-                a.copy_index.get_or_insert_with(copy::CopyIndex::default).propose(&a.history, limits[i].min(draft))
+                a.copy_index.get_or_insert_with(LongestBackward::default).propose(&a.history, limits[i].min(draft))
             } else { Vec::new() }
         }).collect::<Vec<_>>());
         // DFlash drafts after every next token (sequences with a ring slot),
