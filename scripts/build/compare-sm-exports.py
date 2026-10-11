@@ -87,6 +87,9 @@ def jobs(scope):
     result.extend((f"routed-{geometry}", "package_fp8_moe_aot.py",
                    ["--geometry", geometry, "--capacities", CAPACITIES])
                   for geometry in ROUTED_GEOMETRIES)
+    result.extend((f"routed-{geometry}-tp2", "package_fp8_moe_aot.py",
+                   ["--geometry", geometry, "--capacities", CAPACITIES, "--layouts", "tp2", "--exact-slices"])
+                  for geometry in ROUTED_GEOMETRIES if not geometry.startswith("glmfdense"))
     result.extend((f"exl3-{geometry}", "package_exl3_aot.py",
                    ["--geometry", geometry, "--capacities", CAPACITIES])
                   for geometry in EXL3_GEOMETRIES)
@@ -102,21 +105,30 @@ def export_routed(extra, output):
     import package_fp8_moe_aot as package
     geometry = extra[extra.index("--geometry") + 1]
     capacities = sorted({int(item) for item in extra[extra.index("--capacities") + 1].split(",")})
-    _, g = package.layout_geometry(GEOMETRIES[geometry], "tp1")
-    forms = [(rows, "auto") for rows in capacities]
-    forms += [(rows, form) for rows in capacities for form in prefill_forms(g, rows, False)]
+    base = GEOMETRIES[geometry]
+    layouts = extra[extra.index("--layouts") + 1].split(",") if "--layouts" in extra else ["tp1"]
+    if "--exact-slices" in extra:
+        for layout in list(layouts):
+            tp = int(layout.removeprefix("tp"))
+            widths = sorted(set(package.exact_widths(base.intermediate, tp)), reverse=True)
+            if tp > 1 and widths and base.with_tp(tp).slice * tp > base.intermediate:
+                layouts += [f"tp{tp}-w{width}" for width in widths]
     records = []
-    for rows, form in forms:
-        stem = f"fp8moe_{geometry}_tp1_m{rows}" + ("" if form == "auto" else "_" + form)
-        with exportable_compilation():
-            program = compile_fp8_moe_aot(g, route="auto", max_rows=rows, wire=False, prefill=form)
-        program.export_to_c(str(output), stem, "cuteafd_" + stem)
-        checked = validate_exported_header(program, output / f"{stem}.h", "cuteafd_" + stem)
-        if checked["argument_count"] != package.POINTERS + 2:
-            raise ValueError(f"{stem}: unexpected routed expert ABI")
-        records.append({"name": stem, "capacity": rows, "form": form, "abi": checked,
-                        "scratch_bytes": fp8_moe_scratch_bytes(g, "auto", rows, False, form)})
-        print(f"exported {stem}", flush=True)
+    for layout in layouts:
+        _, g = package.layout_geometry(base, layout)
+        forms = [(rows, "auto") for rows in capacities]
+        forms += [(rows, form) for rows in capacities for form in prefill_forms(g, rows, False)]
+        for rows, form in forms:
+            stem = f"fp8moe_{geometry}_{layout.replace('-', '_')}_m{rows}" + ("" if form == "auto" else "_" + form)
+            with exportable_compilation():
+                program = compile_fp8_moe_aot(g, route="auto", max_rows=rows, wire=False, prefill=form)
+            program.export_to_c(str(output), stem, "cuteafd_" + stem)
+            checked = validate_exported_header(program, output / f"{stem}.h", "cuteafd_" + stem)
+            if checked["argument_count"] != package.POINTERS + 2:
+                raise ValueError(f"{stem}: unexpected routed expert ABI")
+            records.append({"name": stem, "layout": layout, "capacity": rows, "form": form, "abi": checked,
+                            "scratch_bytes": fp8_moe_scratch_bytes(g, "auto", rows, False, form)})
+            print(f"exported {stem}", flush=True)
     (output / "routed.json").write_text(json.dumps({"programs": records}, indent=2) + "\n")
 
 
