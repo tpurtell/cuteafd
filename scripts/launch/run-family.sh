@@ -480,15 +480,13 @@ fi
 # prefill (the engine's default 0.2; 0 prefills whole prompts before the next
 # step). Keys left unset pass nothing (images older than the options run).
 [[ -z "$(get DECODE_SHARE)" ]] || family_args+=(--decode-share "$(get DECODE_SHARE)")
-# RTX_EXPERT_LAYERS (DeepSeek V4, the shared placement solver): unset is auto
-# for Flash and Pro on one RTX and max on two RTX; max places the most whole routed-expert layers
-# that still leave a 262K pool (v2's experts-first policy), the pool taking the
-# rest up to its target; auto reserves the KV pool (2M PRO / 1M <=32 GB) first
-# and fills what is left; N, N% or all fix the RTX-resident layers and the KV pool takes
-# every remaining byte (refused below the compiled context). 0 leaves the
+# RTX_EXPERT_LAYERS (DeepSeek V4 and GLM 5.3): unset is uniformly pool-first
+# auto; max is the explicit experts-first policy leaving at least a 262K pool.
+# N, N% or all fix the RTX-resident routed layers, then the KV pool fills the
+# remaining budget up to its target (refused below its floor). 0 leaves the
 # backbone experts on the Sparks. With two RTX every onboard mode uses TP2
 # halves; GPU1 whole-layer expert ranges are no longer supported.
-if [[ $serve == serve-dsv4 ]]; then
+if [[ $serve == serve-dsv4 || $serve == serve-glm ]]; then
   local_layers="$(get RTX_EXPERT_LAYERS)"
   case "$(get RTX_EXPERT_PEER off)" in
     on) echo "GPU1 whole-layer expert ranges were replaced by TP2 halves (v3 P4); remove RTX_EXPERT_PEER" >&2; exit 2 ;;
@@ -504,7 +502,8 @@ if [[ $serve == serve-dsv4 ]]; then
         { echo "RTX_EXPERT_LAYERS must be auto, max, all, N or N% (0..100%)" >&2; exit 2; }
       family_args+=(--rtx-expert-layers "$local_layers") ;;
     *[!0-9]*) echo "RTX_EXPERT_LAYERS must be auto, max, all, N or N% (0..100%)" >&2; exit 2 ;;
-    *) family_args+=(--local-expert-layers "$local_layers") ;;
+    *) if [[ $serve == serve-glm ]]; then family_args+=(--rtx-expert-layers "$local_layers");
+       else family_args+=(--local-expert-layers "$local_layers"); fi ;;
   esac
 fi
 # GLM, GLM Flash, MiMo, Qwen: L2_PREFETCH (off, auto = 3/4 of the L2, or MiB;

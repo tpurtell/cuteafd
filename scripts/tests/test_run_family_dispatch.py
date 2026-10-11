@@ -341,6 +341,46 @@ def test_deepseek_v4_honors_explicit_local_expert_limit(tmp_path, value):
         assert f"--rtx-expert-layers {value}" in launch
 
 
+@pytest.mark.parametrize("value", [None, "auto", "0", "5", "50%", "all", "max"])
+def test_glm53_honors_explicit_tp2_expert_limit(tmp_path, value):
+    keys = "" if value is None else f"RTX_EXPERT_LAYERS={value}\n"
+    result = _family_launch_result(tmp_path, {
+        "model_type": "glm_moe_dsa", "num_hidden_layers": 4, "first_k_dense_replace": 3,
+    }, "test/glm", keys)
+    assert result.returncode == 0, result.stderr
+    launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-glm " in line)
+    assert "--local-expert-layers" not in launch
+    if value is None:
+        assert "--rtx-expert-layers" not in launch
+    else:
+        assert f"--rtx-expert-layers {value}" in launch
+
+
+@pytest.mark.parametrize("value", ["-1", "101%", "half", "5x"])
+def test_glm53_rejects_invalid_tp2_expert_limit_before_launch(tmp_path, value):
+    result = _family_launch_result(tmp_path, {
+        "model_type": "glm_moe_dsa", "num_hidden_layers": 4, "first_k_dense_replace": 3,
+    }, "test/glm", f"RTX_EXPERT_LAYERS={value}\n")
+    assert result.returncode == 2 and "RTX_EXPERT_LAYERS must be" in result.stderr
+    assert "docker run" not in result.stderr and "nest drop-caches" not in result.stderr
+
+
+@pytest.mark.parametrize("value", [None, "off", "on"])
+def test_glm53_rejects_retired_peer_expert_ranges(tmp_path, value):
+    keys = "" if value is None else f"RTX_EXPERT_PEER={value}\n"
+    result = _family_launch_result(tmp_path, {
+        "model_type": "glm_moe_dsa", "num_hidden_layers": 4, "first_k_dense_replace": 3,
+    }, "test/glm", keys)
+    if value == "on":
+        assert result.returncode == 2
+        assert "GPU1 whole-layer expert ranges were replaced by TP2 halves" in result.stderr
+        assert "docker run" not in result.stderr and "nest drop-caches" not in result.stderr
+    else:
+        assert result.returncode == 0, result.stderr
+        launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-glm " in line)
+        assert "--peer-expert-ranges" not in launch
+
+
 @pytest.mark.parametrize("value", [None, "off", "on"])
 def test_deepseek_v4_rejects_retired_peer_expert_ranges(tmp_path, value):
     keys = "" if value is None else f"RTX_EXPERT_PEER={value}\n"
