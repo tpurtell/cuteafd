@@ -105,6 +105,7 @@ impl<'a> Fp8MoeTp2<'a> {
             "invalid FP8 MoE TP2 device pair");
         ensure!(!layers.is_empty() && layers.start >= tensors.shape().first_layer
             && layers.end <= tensors.shape().layers, "invalid FP8 MoE TP2 layer range");
+        let started = std::time::Instant::now();
         let plans = [Self::plan(tensors, directory, 0, max_rows)?, Self::plan(tensors, directory, 1, max_rows)?];
         for rank in 0..2 {
             let required = plans[rank].resident_layer_bytes.checked_mul(layers.len())
@@ -112,10 +113,12 @@ impl<'a> Fp8MoeTp2<'a> {
             ensure!(required <= budgets[rank], "FP8 MoE TP2 rank {rank} needs {required} bytes; budget {}", budgets[rank]);
         }
         if std::env::var("CUTEAFD_TP2_SHARED_READ").as_deref() == Ok("0") {
-            return Ok([
+            let ranks = [
                 Self::load(devices[0], tensors, directory, layers.clone(), 0, max_rows, budgets[0])?,
                 Self::load(devices[1], tensors, directory, layers, 1, max_rows, budgets[1])?,
-            ]);
+            ];
+            Self::log_pair_load(&ranks, started.elapsed().as_secs_f64());
+            return Ok(ranks);
         }
         let completions = [RankCompletion::new(Event::new(devices[0])?), RankCompletion::new(Event::new(devices[1])?)];
         let experts = Fp8Experts::load_pair(devices, tensors, [&plans[0].directory, &plans[1].directory],
@@ -131,7 +134,17 @@ impl<'a> Fp8MoeTp2<'a> {
         };
         let [left_completion, right_completion] = completions;
         let [left, right] = experts;
-        Ok([make(0, left_completion, left)?, make(1, right_completion, right)?])
+        let ranks = [make(0, left_completion, left)?, make(1, right_completion, right)?];
+        Self::log_pair_load(&ranks, started.elapsed().as_secs_f64());
+        Ok(ranks)
+    }
+
+    fn log_pair_load(ranks: &[Self; 2], elapsed_seconds: f64) {
+        for rank in ranks {
+            tracing::info!(rank = rank.rank, device = rank.device.id, layers = rank.layers.len(),
+                resident_bytes = rank.resident_bytes(), workspace_bytes = rank.workspace_bytes,
+                elapsed_seconds, "FP8 TP2 rank load complete");
+        }
     }
 
     pub(crate) fn resident_bytes(&self) -> usize {
@@ -234,6 +247,37 @@ mod tests {
                 info.tp = 2;
                 info.slice += 128;
                 assert!(validate_info(&info, &tensors, rank, Slicing::Blocks(128), 16).is_err());
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn planner_equals_runtime_glm5_flash_tp2_retained_form_scratch_at_1024() -> Result<()> {
+        use cuteafd_loader::placement::families::glm5_flash::expert_workspace;
+        use cuteafd_loader::plan::testing::{glm5_flash_config, glm5_flash_tensors, write_snapshot};
+        let root = tempfile::tempdir()?;
+        let config = glm5_flash_config(2);
+        write_snapshot(root.path(), &config, &glm5_flash_tensors(&config), None);
+        let catalog = cuteafd_loader::read_expert_catalog(root.path())?;
+        let share = root.path().join("share");
+        let package = root.path().join("lib/fp8/fp8-glmf");
+        std::fs::create_dir_all(&share)?;
+        std::fs::create_dir_all(&package)?;
+        // Measured SM188/170 exports: W8A8 is larger at 1024, auto at 4096.
+        let retained = [(1024, 163_779_584), (4096, 734_346_240)];
+        let capacities: Vec<_> = retained.iter().map(|&(capacity, scratch)|
+            serde_json::json!({"capacity": capacity, "scratch_bytes": scratch})).collect();
+        std::fs::write(package.join("manifest.json"), serde_json::to_vec(&serde_json::json!({
+            "layouts": {"tp2": {"capacities": capacities}}
+        }))?)?;
+        for (rows, abi_scratch) in retained {
+            let (_, _, runtime) = workspace(abi_scratch, catalog.routed_experts().hidden, rows)?;
+            let planned = expert_workspace(&catalog, Some(&share.join("PROGRAMS.json")), rows as u64, 2)?;
+            assert_eq!(planned, runtime as u64);
+            if rows == 1024 {
+                assert_eq!(planned, 172_168_192);
+                assert_eq!(abi_scratch - 117_510_144, 46_269_440);
             }
         }
         Ok(())
