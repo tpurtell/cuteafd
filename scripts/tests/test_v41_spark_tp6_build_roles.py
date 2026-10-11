@@ -59,10 +59,9 @@ def _role_block(script: Path = BUILD, *, variable: str = "spark_tp_roles",
     end = text.index(BLOCK_END, start)
     block = text[start:end]
     assert f"{variable}=" in block, f"{script.name} role block moved"
-    # The block must still validate its own tokens: build.sh canonicalizes through
-    # its helper (loop variable `entry`), wip.sh keeps its inline case
-    # (`wip_spark_tp_role`).
-    guard = ('case "$entry" in' if script == BUILD
+    # The release selector delegates validation to the sourced common helper.
+    # WIP still validates its local role list inline.
+    guard = ('release_spark_tp_roles_canonical' if script == BUILD
              else f'case "${"wip_" if variable.startswith("wip_") else ""}spark_tp_role" in')
     assert guard in block, f"{script.name} role selector moved; update this extractor"
     return block

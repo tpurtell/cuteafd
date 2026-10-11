@@ -388,8 +388,8 @@ class StopConfigModeTest(StopHarness):
 
     def test_unsupported_count_is_launch_invalid_but_stop_safe(self):
         config = self.raw_config(
-            "count-five.config",
-            "SPARK_COUNT=5\n" + self.host_lines(SIX_HOSTS),
+            "count-nine.config",
+            "SPARK_COUNT=9\n" + self.host_lines(SIX_HOSTS),
         )
         self.assertEqual(self.load(config).returncode, 2)
         self.assertEqual(self.load(config, "stop").returncode, 0)
@@ -524,11 +524,11 @@ class StopHelperScopeTest(unittest.TestCase):
     def test_out_of_range_host_key_fails_clearly(self):
         """A rank key the grammar cannot represent is reported, not skipped."""
         result = self.run_common(
-            self.HOST_VARS + "SPARK_6_HOST=extra\n",
+            self.HOST_VARS + "SPARK_8_HOST=extra\n",
             'release_select_stop_hosts; echo "reached"',
         )
         self.assertEqual(result.returncode, 2, result.stdout)
-        self.assertIn("unsupported Spark host key SPARK_6_HOST", result.stderr)
+        self.assertIn("unsupported Spark host key SPARK_8_HOST", result.stderr)
         self.assertNotIn("reached", result.stdout)
 
     def test_non_canonical_rank_key_fails_clearly(self):

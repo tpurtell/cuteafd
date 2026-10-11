@@ -189,11 +189,11 @@ release_stop_wip_containers
             ('SPARK_COUNT=3\nSPARK_TP=3', 'set together or omitted together'),
             ('SPARK_COUNT=3\nSPARK_EP=1', 'set together or omitted together'),
             ('SPARK_COUNT=3\nSPARK_TP=3\nSPARK_EP=2', 'must equal SPARK_COUNT'),
-            ('SPARK_COUNT=3\nSPARK_TP=1\nSPARK_EP=3', 'SPARK_TP must be 2, 3, 4, or 6'),
+            ('SPARK_COUNT=3\nSPARK_TP=1\nSPARK_EP=3', 'unsupported native Spark topology TP1EP3'),
             ('SPARK_COUNT=3\nSPARK_TP=2\nSPARK_EP=1', 'must equal SPARK_COUNT'),
             ('SPARK_COUNT=3\nSPARK_TP=3\nSPARK_EP=1\nEXPERT_FORMAT=exl3\nSPARKINFER_EXL3=auto',
              'requires EXPERT_FORMAT=native'),
-            ('SPARK_COUNT=5', 'SPARK_COUNT must be 0, 2, 3, 4, or 6'),
+            ('SPARK_COUNT=9', 'SPARK_COUNT must be in 0..8'),
         ]:
             with self.subTest(settings=settings):
                 result = self.config(settings)
