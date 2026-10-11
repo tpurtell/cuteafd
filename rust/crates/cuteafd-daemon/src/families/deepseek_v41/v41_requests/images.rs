@@ -60,6 +60,10 @@ impl RequestImages {
             })
             .collect())
     }
+    /// Whether span `index` already holds its features.
+    pub fn has_features(&self, index: usize) -> bool {
+        self.spans.get(index).is_some_and(|span| span.features.is_some())
+    }
     pub fn install(&mut self, index: usize, features: Vec<u8>) -> Result<()> {
         let span = self
             .spans
