@@ -284,6 +284,49 @@ mod tests {
         assert!(check(&glmf_tp2_fixture(6, 0..6, 2, true, false)).is_err());
     }
 
+    fn glmf_remote_draft_round(s: &mut Schedule, reused: bool, input_ack_before_head: bool) {
+        if reused { s.wait(0, "draft-taps-ack", 0, "previous tap projection consumed"); }
+        s.push(0, "draft-taps", 0, "target tap pack final");
+        s.wait(1, "draft-taps", 0, "remote tap pack arrival");
+        s.push(1, "draft-taps-ack", 0, "remote tap projection consumed");
+        if reused { s.wait(0, "draft-input-ack", 0, "previous draft input consumed"); }
+        s.push(0, "draft-input", 0, "target embedding gather final");
+        s.wait(1, "draft-input", 0, "remote embedding rows arrival");
+        if reused { s.wait(1, "draft-hidden-ack", 0, "previous target head consumed"); }
+        s.push(1, "draft-hidden", 0, "remote full-R normalized rows final");
+        // Waiting for the entire draft to finish before launching its target
+        // head is a cycle: the draft itself waits for the head's logits.
+        if input_ack_before_head { s.wait(0, "draft-input-ack", 0, "premature input consumed wait"); }
+        s.wait(0, "draft-hidden", 0, "target normalized rows arrival");
+        s.push(0, "draft-hidden-ack", 0, "target full-R head consumed");
+        if reused { s.wait(0, "draft-logits-ack", 0, "previous draft logits consumed"); }
+        s.push(0, "draft-logits", 0, "target full-R logits final");
+        s.wait(1, "draft-logits", 0, "remote logits arrival");
+        s.push(1, "draft-logits-ack", 0, "remote sampler consumed");
+        s.push(1, "draft-input-ack", 0, "remote draft input consumed");
+    }
+
+    #[test]
+    fn glmf_tp2_then_remote_draft_ack_schedule_drains_reused_slots() {
+        // Design fixture only: the remote executor must record this ordering
+        // from its real enqueue paths before enabling GPU1 placement.
+        for lanes in [1, 2] {
+            for broadcast in [false, true] {
+                let mut schedule = Schedule::default();
+                for round in 0..3 {
+                    let target = glmf_tp2_fixture(6, 1..4, lanes, broadcast, true);
+                    for (stream, next) in schedule.streams.iter_mut().zip(target.streams) { stream.extend(next); }
+                    glmf_remote_draft_round(&mut schedule, round > 0, false);
+                }
+                assert_eq!(check(&schedule), Ok(()));
+            }
+        }
+        let mut schedule = glmf_tp2_fixture(6, 1..4, 2, true, true);
+        glmf_remote_draft_round(&mut schedule, false, true);
+        assert_eq!(check(&schedule).unwrap_err().blocked,
+            [Some("premature input consumed wait".into()), Some("remote logits arrival".into())]);
+    }
+
     #[test]
     fn glmf_tp2_three_lane_front_is_not_an_admitted_schedule() {
         assert!(check(&glmf_tp2_fixture(5, 1..4, 3, false, true)).is_err());
