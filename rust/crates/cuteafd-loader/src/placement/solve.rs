@@ -6,9 +6,79 @@ use cuteafd_core::memory_layout::{Basis, Category, Item};
 /// Places `request`. Pure arithmetic over the request: the planner and the
 /// runtime get the same answer for the same inputs.
 pub fn solve(request: &PlacementRequest) -> Result<Placement, PlacementError> {
+    request.executor.check_attention(request.attention_placement, request.inventory.gpus.len(), request.inventory.peer_access)?;
+    let mut best = solve_once(request, &[]);
+    if request.attention_placement.is_some() || request.inventory.gpus.len() != 2 || !request.inventory.peer_access
+        || best.as_ref().is_ok_and(|p| p.pool_tokens >= request.pool.target) { return best; }
+    // Step 7: largest replicated-KV saving first. Only auto may flip; only
+    // modes the executor actually runs are candidates.
+    let mut kinds = std::collections::BTreeMap::<AttentionClass, u64>::new();
+    for layer in &request.layers {
+        if layer.kv_unit.unit_bytes_context.is_some() || matches!(layer.kind, AttentionClass::Csa | AttentionClass::Mla | AttentionClass::Dsa) {
+            let total = |bytes: [u64; 2]| bytes[0].checked_add(bytes[1]).ok_or(PlacementError::Overflow("mode savings"));
+            let owned = layer.kv_unit.unit_bytes_context.map(total).transpose()?.unwrap_or(layer.kv_unit.unit_bytes_whole);
+            let saving = total(layer.kv_unit.unit_bytes_split)?.saturating_sub(owned);
+            let entry = kinds.entry(layer.kind).or_default();
+            *entry = entry.checked_add(saving).ok_or(PlacementError::Overflow("mode savings"))?;
+        }
+    }
+    let mut kinds = kinds.into_iter().collect::<Vec<_>>();
+    kinds.sort_by_key(|&(kind, saving)| (std::cmp::Reverse(saving), kind));
+    let mut flips = Vec::new();
+    for (kind, _) in kinds {
+        let prior_flips = flips.clone();
+        let mut kind_best = best.as_ref().map(|p| p.pool_tokens).unwrap_or(0);
+        let mut selected_flips = prior_flips.clone();
+        for mode in [AttentionPlacement::Context, AttentionPlacement::Layers] {
+            if mode == AttentionPlacement::Context && !request.layers.iter().any(|l| l.kind == kind && l.kv_unit.unit_bytes_context.is_some()) { continue; }
+            if request.executor.check_attention(Some(mode), 2, true).is_err() { continue; }
+            flips = prior_flips.clone();
+            flips.retain(|(k, _)| *k != kind);
+            flips.push((kind, mode));
+            let trial = solve_once(request, &flips);
+            if trial.as_ref().is_ok_and(|p| p.pool_tokens >= request.pool.target) { return prune_flips(request, &flips); }
+            if let Ok(p) = &trial {
+                if p.pool_tokens >= kind_best { kind_best = p.pool_tokens; selected_flips = flips.clone(); }
+            }
+            if trial.as_ref().is_ok_and(|p| best.as_ref().map_or(true, |b| p.pool_tokens >= b.pool_tokens)) { best = trial; }
+        }
+        flips = selected_flips;
+    }
+    if let Ok(placement) = &best {
+        let chosen = placement.attention_by_kind.iter().copied().filter(|(_, mode)| *mode != request.executor.attention_default()).collect::<Vec<_>>();
+        if !chosen.is_empty() { return prune_flips(request, &chosen); }
+    }
+    best
+}
+
+fn prune_flips(request: &PlacementRequest, flips: &[(AttentionClass, AttentionPlacement)]) -> Result<Placement, PlacementError> {
+    let mut flips = flips.to_vec();
+    let mut placement = solve_once(request, &flips)?;
+    loop {
+        let mut removed = false;
+        for i in 0..flips.len() {
+            let mut trial = flips.clone();
+            trial.remove(i);
+            if let Ok(candidate) = solve_once(request, &trial) {
+                // Removing context can also recover an odd pool unit that its
+                // even-unit constraint rounded away.
+                if candidate.pool_tokens >= placement.pool_tokens {
+                    flips = trial;
+                    placement = candidate;
+                    removed = true;
+                    break;
+                }
+            }
+        }
+        if !removed { return Ok(placement); }
+    }
+}
+
+fn solve_once(request: &PlacementRequest, flips: &[(AttentionClass, AttentionPlacement)]) -> Result<Placement, PlacementError> {
     use PlacementError::Overflow;
     let gpus = request.inventory.gpus.len();
     if !(1..=2).contains(&gpus) { return Err(PlacementError::Inventory("one or two coordinator GPUs")); }
+    if request.layers_first_gpu > 1 { return Err(PlacementError::Inventory("layers first GPU must be 0 or 1")); }
     if request.pool.unit_rows == 0 { return Err(PlacementError::Inventory("zero pool unit rows")); }
     if request.pool_overhead.len() != gpus { return Err(PlacementError::Inventory("pool overhead per GPU")); }
     if request.fixed.iter().any(|d| usize::from(d.gpu) >= gpus)
@@ -18,9 +88,35 @@ pub fn solve(request: &PlacementRequest) -> Result<Placement, PlacementError> {
     let split = gpus == 2 && request.inventory.peer_access;
     let tp2 = split && request.layers.iter().any(|l| l.experts.is_some_and(|c| c.tp2));
 
-    // 1. Layer modes: the policy's first mode this build and its executor run.
+    // 1. Explicit attention placement is strict. Auto retains the existing
+    // policy until a qualified memory lever is needed.
     let executor = &request.executor;
+    let layer_selected = |layer: &LayerDemand| flips.iter().find(|(kind, _)| *kind == layer.kind).map(|(_, m)| *m)
+        .or(request.attention_placement).unwrap_or_else(|| executor.attention_default()) == AttentionPlacement::Layers
+        && matches!(layer.kind, AttentionClass::Csa | AttentionClass::Mla | AttentionClass::Dsa);
+    let switch = if request.layers.iter().any(&layer_selected) { layer_switch(request, &layer_selected)? } else { 0 };
     let modes = request.layers.iter().enumerate().map(|(index, layer)| {
+        let selected = flips.iter().find(|(kind, _)| *kind == layer.kind).map(|(_, m)| *m)
+            .or(request.attention_placement)
+            .or_else(|| (executor.attention_default() != AttentionPlacement::Heads).then(|| executor.attention_default()));
+        let desired = match selected {
+            Some(AttentionPlacement::Context) if layer.kv_unit.unit_bytes_context.is_some() => Some(LayerMode::ContextSplit),
+            Some(AttentionPlacement::Context) => Some(LayerMode::HeadSplit),
+            Some(AttentionPlacement::Layers) if matches!(layer.kind, AttentionClass::Csa | AttentionClass::Mla | AttentionClass::Dsa) => {
+                let owner = if index < switch { request.layers_first_gpu } else { 1 - request.layers_first_gpu };
+                Some(LayerMode::Whole { gpu: owner, ffn: FfnMode::Split })
+            }
+            Some(AttentionPlacement::Layers) => Some(LayerMode::HeadSplit),
+            // Heads is the established layout, including V4.1's ranges.
+            Some(AttentionPlacement::Heads) => None,
+            _ => None,
+        };
+        if let Some(mode) = desired {
+            if !layer.modes.contains(&mode) || !executable(mode, gpus, split) || !executor.runs(mode) {
+                return Err(PlacementError::UnsupportedMode { family: executor.family, layer: index, mode });
+            }
+            return Ok(mode);
+        }
         let wanted = request.policy.preference(layer.kind);
         wanted.iter().copied().chain(layer.modes.iter().copied())
             .find(|mode| layer.modes.contains(mode) && executable(*mode, gpus, split) && executor.runs(*mode))
@@ -40,21 +136,33 @@ pub fn solve(request: &PlacementRequest) -> Result<Placement, PlacementError> {
         items[gpu].push(item);
         Ok(())
     };
-    for demand in &request.fixed {
+    let context = modes.contains(&LayerMode::ContextSplit);
+    let context_demands = if context { request.context_buffers.demands()? } else { Vec::new() };
+    for demand in request.fixed.iter().chain(&context_demands) {
         charge(&mut items, &mut used, usize::from(demand.gpu),
             Item::new(demand.category, demand.group.clone(), "", demand.bytes, demand.basis))?;
     }
     let mut layer_weights = vec![0u64; gpus];
     let mut unit_bytes = request.pool_overhead.clone();
+    let mut layer_fixed = vec![0u64; gpus];
     for (layer, mode) in request.layers.iter().zip(&modes) {
         for gpu in 0..gpus {
             let (weights, kv) = per_gpu(layer, *mode, gpu);
+            let state = match mode {
+                LayerMode::HeadSplit | LayerMode::ContextSplit => layer.fixed_bytes.split[gpu],
+                LayerMode::Whole { gpu: owner, .. } if usize::from(*owner) == gpu => layer.fixed_bytes.whole,
+                LayerMode::Whole { .. } => 0,
+            };
+            layer_fixed[gpu] = layer_fixed[gpu].checked_add(state).ok_or(Overflow("layer state"))?;
             layer_weights[gpu] = layer_weights[gpu].checked_add(weights).ok_or(Overflow("layer weights"))?;
             unit_bytes[gpu] = unit_bytes[gpu].checked_add(kv).ok_or(Overflow("pool unit"))?;
         }
     }
     for (gpu, &bytes) in layer_weights.iter().enumerate() {
         if bytes > 0 { charge(&mut items, &mut used, gpu, Item::new(Category::Weights, "layers", "", bytes, Basis::Exact))?; }
+    }
+    for (gpu, &bytes) in layer_fixed.iter().enumerate() {
+        if bytes > 0 { charge(&mut items, &mut used, gpu, Item::new(Category::Kv, "layer state and marks", "", bytes, Basis::Formula))?; }
     }
     // Hop receive buffers are fixed demands of the modes (charged before the pool).
     let hop_bytes = hop_buffer_bytes(&hops, &request.hops, gpus).ok_or(Overflow("hop buffers"))?;
@@ -114,7 +222,7 @@ pub fn solve(request: &PlacementRequest) -> Result<Placement, PlacementError> {
                 trial.onboard = Onboard::Layers(n);
                 trial.pool.requested = None;
                 trial.pool.floor = floor;
-                solve(&trial).is_ok()
+                solve_once(&trial, flips).is_ok()
             };
             let (mut lo, mut hi) = (0usize, routed);
             if !fits(0) {
@@ -125,7 +233,7 @@ pub fn solve(request: &PlacementRequest) -> Result<Placement, PlacementError> {
                     let mut trial = request.clone();
                     trial.onboard = Onboard::Layers(0);
                     trial.pool.floor = pool_floor;
-                    solve(&trial).is_ok()
+                    solve_once(&trial, flips).is_ok()
                 };
                 if !fallback { return Err(match request.pool.requested {
                     Some(requested) => PlacementError::PoolDoesNotFit { requested, fit: 0 },
@@ -135,7 +243,7 @@ pub fn solve(request: &PlacementRequest) -> Result<Placement, PlacementError> {
                 let mut trial = request.clone();
                 trial.onboard = Onboard::Layers(0);
                 trial.pool.floor = pool_floor;
-                return solve(&trial);
+                return solve_once(&trial, flips);
             }
             while lo < hi {
                 let mid = (lo + hi + 1) / 2;
@@ -150,7 +258,7 @@ pub fn solve(request: &PlacementRequest) -> Result<Placement, PlacementError> {
         // Pool first: reserve the target, then fill each GPU's arena in order.
         None => {
             let fit = pool_fit(&available, &used, &arenas, &unit_bytes);
-            let units = pool_units(request, fit)?;
+            let units = pool_units(request, if context { fit / 2 * 2 } else { fit })?;
             let used = with_pool(&used, &unit_bytes, units)?;
             let caps = [if request.expert_gpus > 0 { usize::MAX } else { 0 }, if request.expert_gpus > 1 { usize::MAX } else { 0 }];
             let (ranges, homes, _, tp2_range) = place_experts(request, &available, &used, &mut arenas, first_moe,
@@ -197,6 +305,17 @@ pub fn solve(request: &PlacementRequest) -> Result<Placement, PlacementError> {
     if units == 0 {
         return Err(PlacementError::Mandatory { gpu: 0, what: format!("one KV unit beside {}", describe(&request.fixed, 0, &movables)) });
     }
+    let units = if context {
+        if request.pool.requested.is_some() && units % 2 != 0 {
+            return Err(PlacementError::Inventory("context pool must contain an even number of logical units"));
+        }
+        units / 2 * 2
+    } else { units };
+    if context && (units == 0 || units.saturating_mul(request.pool.unit_rows) < request.pool.floor) {
+        let pool = units.saturating_mul(request.pool.unit_rows);
+        return Err(PlacementError::BelowFloor { pool, floor: request.pool.floor, layers: 0,
+            short: request.pool.floor.saturating_sub(pool) });
+    }
     let onboard_layers = homes.iter().filter(|h| matches!(h, ExpertHome::RtxWhole { .. } | ExpertHome::RtxTp2)).count();
 
     // Charged items: pool records and expert arenas.
@@ -221,6 +340,21 @@ pub fn solve(request: &PlacementRequest) -> Result<Placement, PlacementError> {
         .map(|(layer, home)| if layer.experts.is_none() { ExpertHome::Dense } else { home }).collect::<Vec<_>>();
     Ok(Placement {
         pool_tokens,
+        attention_placement: if context { AttentionPlacement::Context }
+            else if request.attention_placement == Some(AttentionPlacement::Layers) || flips.iter().any(|(_, m)| *m == AttentionPlacement::Layers) {
+                AttentionPlacement::Layers
+            } else { AttentionPlacement::Heads },
+        attention_by_kind: request.layers.iter().map(|layer| {
+            let mode = flips.iter().find(|(kind, _)| *kind == layer.kind).map(|(_, mode)| *mode)
+                .or(request.attention_placement).unwrap_or_else(|| executor.attention_default());
+            (layer.kind, mode)
+        }).collect::<std::collections::BTreeMap<_, _>>().into_iter().collect(),
+        peer_row_bytes: if context {
+            request.layers.iter().zip(&modes).filter(|(_, m)| **m == LayerMode::ContextSplit).try_fold(0u64, |sum, (layer, _)|
+                request.context_buffers.query_row_bytes.checked_add(request.context_buffers.partial_row_bytes)
+                    .and_then(|n| n.checked_add(if layer.context_indexer { request.context_buffers.candidate_row_bytes } else { 0 }))
+                    .and_then(|n| n.checked_add(sum))).ok_or(Overflow("context peer rows"))?
+        } else { 0 },
         onboard_layers,
         layers: modes.into_iter().zip(homes).map(|(mode, experts)| LayerAssignment { mode, experts }).collect(),
         movables,
@@ -230,6 +364,47 @@ pub fn solve(request: &PlacementRequest) -> Result<Placement, PlacementError> {
         tp2: tp2_range,
         items,
     })
+}
+
+/// One ownership boundary, never inside an indexer/colocate group. Compare
+/// persistent bytes at the requested pool, then the pool left by fixed state.
+fn layer_switch(request: &PlacementRequest, selected: &impl Fn(&LayerDemand) -> bool) -> Result<usize, PlacementError> {
+    let mut best = None;
+    for k in 0..=request.layers.len() {
+        if request.layers.iter().enumerate().any(|(i, layer)| selected(layer) && layer.colocate.is_some_and(|group|
+            request.layers.iter().enumerate().any(|(j, other)| selected(other) && other.colocate == Some(group) && (i < k) != (j < k)))) { continue; }
+        let mut kv = [0u64; 2];
+        let mut fixed = [0u64; 2];
+        for (i, layer) in request.layers.iter().enumerate().filter(|(_, l)| selected(l)) {
+            let gpu = usize::from(if i < k { request.layers_first_gpu } else { 1 - request.layers_first_gpu });
+            kv[gpu] = kv[gpu].checked_add(layer.kv_unit.unit_bytes_whole).ok_or(PlacementError::Overflow("owned KV bytes"))?;
+            fixed[gpu] = fixed[gpu].checked_add(layer.fixed_bytes.whole).ok_or(PlacementError::Overflow("owned state"))?;
+        }
+        let mut owned = [0u64; 2];
+        for gpu in 0..2 { owned[gpu] = kv[gpu].checked_mul(request.pool.wanted_units()).and_then(|b| b.checked_add(fixed[gpu]))
+            .ok_or(PlacementError::Overflow("owned pool bytes"))?; }
+        let mut pool_bytes = request.pool_overhead.clone();
+        let mut base = [0u64; 2];
+        for demand in &request.fixed {
+            let g = usize::from(demand.gpu);
+            base[g] = base[g].checked_add(demand.bytes).ok_or(PlacementError::Overflow("ownership fixed"))?;
+        }
+        for (i, layer) in request.layers.iter().enumerate() {
+            for g in 0..request.inventory.gpus.len() {
+                let owner = usize::from(if i < k { request.layers_first_gpu } else { 1 - request.layers_first_gpu });
+                let (bytes, state, weights) = if selected(layer) {
+                    if g == owner { (layer.kv_unit.unit_bytes_whole, layer.fixed_bytes.whole, layer.weights.whole) } else { (0, 0, 0) }
+                } else { (layer.kv_unit.unit_bytes_split[g], layer.fixed_bytes.split[g], layer.weights.split[g]) };
+                pool_bytes[g] = pool_bytes[g].checked_add(bytes).ok_or(PlacementError::Overflow("ownership pool"))?;
+                base[g] = base[g].checked_add(state).and_then(|n| n.checked_add(weights)).ok_or(PlacementError::Overflow("ownership fixed"))?;
+            }
+        }
+        let fit = (0..request.inventory.gpus.len()).filter(|&g| pool_bytes[g] > 0).map(|g|
+            request.inventory.gpus[g].available().saturating_sub(base[g]) / pool_bytes[g]).min().unwrap_or(u64::MAX);
+        let score = (owned[0].max(owned[1]), std::cmp::Reverse(fit), k);
+        if best.as_ref().is_none_or(|(old, _)| score < *old) { best = Some((score, k)); }
+    }
+    best.map(|(_, k)| k).ok_or(PlacementError::Inventory("no legal layer ownership boundary"))
 }
 
 /// The residual's home at every layer boundary (`[0]`: the embedding's GPU,
@@ -321,7 +496,7 @@ fn place_experts(request: &PlacementRequest, available: &[u64], used: &[u64], ar
 /// layer on GPU1 needs two GPUs with peer access.
 fn executable(mode: LayerMode, gpus: usize, split: bool) -> bool {
     match mode {
-        LayerMode::HeadSplit | LayerMode::Whole { ffn: FfnMode::Split, .. } => split,
+        LayerMode::HeadSplit | LayerMode::ContextSplit | LayerMode::Whole { ffn: FfnMode::Split, .. } => split,
         LayerMode::Whole { gpu: 0, ffn: FfnMode::Owner } => true,
         LayerMode::Whole { gpu, .. } => usize::from(gpu) < gpus && split,
     }
@@ -330,8 +505,9 @@ fn executable(mode: LayerMode, gpus: usize, split: bool) -> bool {
 /// A layer's weights and pool-unit bytes on `gpu` under `mode`.
 fn per_gpu(layer: &LayerDemand, mode: LayerMode, gpu: usize) -> (u64, u64) {
     match mode {
-        LayerMode::HeadSplit => (layer.weights.split[gpu], layer.kv_unit.split[gpu]),
-        LayerMode::Whole { gpu: owner, .. } if usize::from(owner) == gpu => (layer.weights.whole, layer.kv_unit.whole),
+        LayerMode::HeadSplit => (layer.weights.split[gpu], layer.kv_unit.unit_bytes_split[gpu]),
+        LayerMode::ContextSplit => (layer.weights.split[gpu], layer.kv_unit.unit_bytes_context.expect("context layer")[gpu]),
+        LayerMode::Whole { gpu: owner, .. } if usize::from(owner) == gpu => (layer.weights.whole, layer.kv_unit.unit_bytes_whole),
         LayerMode::Whole { .. } => (0, 0),
     }
 }

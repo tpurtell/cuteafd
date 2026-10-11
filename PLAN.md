@@ -3705,11 +3705,13 @@ Measure BF16 partials first, and FP32 only if the quick tier misses.
 
 **Modes.**
 - **Mode:** P3's `Whole{gpu, Split}` on every MLA/DSA/CSA layer. Ownership
-  alternates by colocate group:
-  - GLM 5.3: groups `{0}`, `{1}`, then the four-layer indexer groups,
-    21 groups in all;
-  - V4: per layer;
-  - GLM Flash: its 11 DSA layers (P7's "mixed" plan).
+  is contiguous with one switch point `k`: GPU `layers_first_gpu` owns
+  `[0,k)`, its peer `[k,n)`. Choose `k` to minimize the larger owned KV
+  plus fixed-state bytes at the requested pool; break ties by the larger
+  admissible pool, then smaller `k`. Colocate/indexer groups never straddle
+  the switch. GLM Flash's KDA layers stay split; only its 11 MLA layers
+  participate in ownership. This replaces per-kind alternation; retain it
+  only as a possible future two-lane experiment, not an implemented policy.
 - **Transition:** each layer's transition is section 3's single whole layer
   between split layers:
   - the owner's attention (unsplit `glm_*` / `dsv4f_*` programs);
@@ -3727,9 +3729,9 @@ Measure BF16 partials first, and FP32 only if the quick tier misses.
 **Lanes.**
 - At C1 there is one lane, and the peer idles through each owned attention.
   So `layers` gives up the attention share of the measured head-split gain.
-- At C > 1 the decode batch splits into two lanes offset by one group: lane
-  A's attention on GPU(k mod 2) runs while lane B's group k−1 runs on the
-  other GPU, then both lanes' FFN all-reduces.
+- At C > 1 a future two-lane decode executor can pipeline the two contiguous
+  ownership ranges. The former alternating-by-group schedule is not the
+  default; measure any such policy separately before enabling it.
 - This is a two-lane decode executor (P7-style, beside the prefill lanes).
   It also pipelines Spark waves between lanes.
 
@@ -3755,8 +3757,8 @@ group 0). The executor records every lane interleaving and asserts
 **Basis.**
 - P2 planner at 94.97 GiB (92.97 capacity), 2M pool unless noted.
 - `context` charges staging and the context exchange.
-- `layers` charges P3 hop slots (4 lanes × 2 × 4,096 rows) and drops the
-  replicated operands.
+- `layers` charges P3 hop slots (GLM: 4 lanes × 2 × 4,096 rows;
+  V4/GLM Flash: 2 lanes) and drops the replicated operands.
 - The caveats are P2's:
   - graphs and workspaces are partly calibrated, and the 64 MiB ledger gate
     has not run on these items;
@@ -3766,12 +3768,29 @@ group 0). The executor records every lane interleaving and asserts
 
 | family (max) | `heads` (today) | `context` | `layers` | extra RTX TP2 layers (`heads` → `context` / `layers`) |
 |---|---|---|---|---|
-| GLM 5.3 EXL3 K4, 2 RTX + 6 | pool 1.29M (2M needs 105.4 GiB latent per GPU); 93.0 / 82.0 GiB, 64.9 GiB latent per GPU | 2M: 82.3 / 71.3 GiB (52.7 latent + 1.5 staging per GPU; frees 52.7 GiB per GPU against `heads` at 2M); max pool 2.52M | 2M: 77.8 / 72.1 GiB (25,592 / 28,348 B per token; the latent exists once); max 2.73M | none: no local GLM 5.3 expert backend (with one: 4 / 6 half-layer pairs) |
-| GLM 5.3 NVFP4, 2 RTX + 6 | pool 1.13M; 93.0 / 82.0 | 2M: 90.4 / 79.4; max 2.20M | 2M: 85.9 / 80.2; max 2.40M | none (1 / 2) |
-| V4 Flash, 2 RTX + 4, P4 TP2 | 2M, 36 TP2 pairs, 7.87 GiB records per GPU, GPU0 slack 0.07 | frees 3.68 (C4) − 0.35 staging | frees 4.96 − 0.50 hop slots | 36 → 38 / 38 |
-| V4 Pro EXL3 K2, 2 RTX + 6, P4 TP2 | 2M, 10 pairs, 11.16 GiB per GPU | frees 5.25 − 0.35 | frees 6.83 − 0.88 | 10 → 11 / 12 |
+| GLM 5.3 EXL3 K4, 2 RTX + 6 | pool 1.29M (2M needs 105.4 GiB latent per GPU); 93.0 / 82.0 GiB, 64.9 GiB latent per GPU | 2M: 82.3 / 71.3 GiB (52.7 latent + 1.5 staging per GPU; frees 52.7 GiB per GPU against `heads` at 2M); max pool 2.52M | 2M: 81.6 / 68.3 GiB (27,560 / 26,380 B per token; contiguous ownership, latent exists once); max 2.54M | none: no local GLM 5.3 expert backend (with one: 4 / 5 half-layer pairs) |
+| GLM 5.3 NVFP4, 2 RTX + 6 | pool 1.13M; 93.0 / 82.0 | 2M: 90.4 / 79.4; max 2.20M | 2M: 89.7 / 76.4; max 2.22M | none (1 / 1) |
+| V4 Flash, 2 RTX + 4, P4 TP2 | 2M, 36 TP2 pairs, 7.616 GiB records per GPU, GPU0 slack 0.07 | frees 3.676 (C4) − 0.350 staging − 0.017 exchange = 3.309 per GPU | frees 4.483 / 4.180 after 0.500 hop slots | 36 → 38 / 38 |
+| V4 Pro EXL3 K2, 2 RTX + 6, P4 TP2 | 2M, 10 pairs, 10.912 GiB records per GPU | frees 5.251 − 0.350 − 0.033 = 4.868 per GPU | frees 5.797 / 5.851 after 0.875 hop slots | 10 → 11 / 12 |
 | GLM Flash K3.25, 2 RTX + 4 | 2M: 41.8 / 37.8, 23.05 GiB MLA records + keys per GPU | compact, half the units: frees 15.9 per GPU | compact on owners: frees 17.1 / 16.0 | P6 TP2: 37 of 42 → 42 / 42 |
 | GLM Flash K3.25, 2 RTX, Spark-free | 2M with TP2: 98.6 / 99.4, no fit | 82.7 / 83.5, fits | 89.6 / 85.3 (section 4's mixed), fits | all experts on RTX |
+
+K0 CPU fixtures use exact physical V4 pages: Flash
+`8192 × (21 × 45888 + 20 × 1728) = 8177319936 B` (7.616 GiB), Pro
+`8192 × (30 × 45888 + 31 × 1728) = 11716263936 B` (10.912 GiB).
+Context staging is `2 × 4096 × 45888 = 375914496 B` per GPU;
+exchange is parity × 2 lanes × 64 rows × (query + partial + candidates):
+17.03125 MiB for Flash/GLM Flash, 34.0625 MiB for Pro, 21.03125 MiB
+for GLM 5.3. GLM context totals/max pools keep their rounding; contiguous layer ownership
+changes GLM layers to 81.6/68.3 GiB (EXL3), 89.7/76.4 (NVFP4).
+Contiguous V4 ownership at k=22/31 yields records of 3900702720 /
+4276617216 B (Flash) and 5865209856 / 5851054080 B (Pro), matching the
+earlier per-kind-alternating records but with one ownership transition.
+GLM contiguous records are 27560/26380 B per token versus alternating
+25592/28348. GLM Flash contiguous compact records keep 5/6 MLA owners.
+Fewer owner transitions do not remove Split-FFN broadcasts: there remain 43 / 61 AfterAttention hops.
+The extra TP2 counts are calibrated admission fixtures, not executor gates;
+all production attention-placement defaults remain `heads`.
 
 ### 7. Cost against today's head split
 
@@ -3854,7 +3873,7 @@ its 20/20 ranges. Each family's default comes from its own decision gate.
 | K4 | GLM 5.3 `layers`: per-layer executor (`Whole{g, Split}` by indexer group, `AfterAttention` hops via `HopLink`), two-lane decode/verify | L | K2, P9a | quick fidelity; order fixtures per interleaving; A/B at max at 2M |
 | D-GLM | **Decision:** C1 `context` vs `layers` at 2M on max (3 interleaved sessions; 6 if within 1%), plus C8/C16 for both. Default per TJ's rule, recorded in `docs/models/glm5.md` with the numbers. | — | K3, K4 | — |
 | K5 | V4 Flash/Pro `context` on C4 layers (C128 and window layers stay `HeadSplit`), sink in the combine, with P4 TP2 (+2 / +1 pairs) | M | K3, P4 | section 4's V4 rows; exact cache; A/B at max at 2M |
-| K6 | V4 `layers` (`Whole{g, Split}` alternating, P4's fused combine on split FFNs) on S4c/P7's per-layer executor | M | K5, P7 | as K4 |
+| K6 | V4 `layers` (`Whole{g, Split}` with one contiguous ownership switch, P4's fused combine on split FFNs) on S4c/P7's per-layer executor | M | K5, P7 | as K4 |
 | D-V4 | **Decision**, as D-GLM | — | K5, K6 | — |
 | K7 | GLM Flash DSA `context` (11 MLA layers, compact cache on two GPUs); `layers` is P7's mixed mode | M | K3, P7 | section 4's GLM Flash row; D-GLMF on the EXL3 K3.25 max card and the Spark-free card |
 

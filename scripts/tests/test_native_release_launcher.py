@@ -13,6 +13,22 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 class NativeReleaseLauncherTest(unittest.TestCase):
+    def test_attention_placement_is_strict_before_starting_containers(self) -> None:
+        source = (ROOT / 'scripts/launch/run-family.sh').read_text()
+        block = source.split('attention_placement="$(get ATTENTION_PLACEMENT auto)"', 1)[1].split('\ncase "$family" in', 1)[0]
+        self.assertLess(source.index('case "$attention_placement" in'), source.index('docker run'))
+        self.assertIn('--attention-placement "$attention_placement"', source)
+        self.assertIn('CUTEAFD_ATTENTION_PLACEMENT=$attention_placement', source)
+        for family in ['glm5', 'glm5_flash', 'deepseek_v4', 'mimo_v2', 'qwen4']:
+            for mode in ['auto', 'heads', 'context', 'layers', 'bad']:
+                result = subprocess.run(['bash', '-c',
+                    'source scripts/lib/release-common.sh; release_known_key ATTENTION_PLACEMENT; '
+                    'family="$1"; attention_placement="$2"; ' + block,
+                    'test', family, mode], cwd=ROOT, text=True, capture_output=True)
+                self.assertEqual(result.returncode == 0, mode in ['auto', 'heads'], result.stderr)
+                if mode in ['context', 'layers']:
+                    self.assertIn(f'{family} cannot run attention placement {mode}', result.stderr)
+
     def test_table_backend_preflight_and_seccomp_are_narrow(self) -> None:
         for backend, valid in [('mmap', True), ('uring', True), ('mincore-routed', True), ('direct', False)]:
             result = subprocess.run(['bash', '-c',

@@ -8,15 +8,18 @@ const UNIT: u64 = 4 << 20;
 /// layers (2M tokens: 8192 units, 32 GiB).
 fn request(gpus: usize, free: u64, layers: usize, sparks: usize, onboard: Onboard) -> PlacementRequest {
     PlacementRequest {
+        attention_placement: None,
+        context_buffers: ContextBuffers::default(),
+        layers_first_gpu: 0,
         inventory: Inventory {
             gpus: vec![GpuBudget { capacity_bytes: 96 * GIB, headroom_bytes: 0,
                 baseline: Baseline::Measured { free_bytes: free } }; gpus],
             spark_ranks: sparks, peer_access: gpus == 2 },
         pool: PoolPolicy::resolve(&vec![96 * GIB; gpus], 131_072, None, 256, sparks == 0),
         layers: (0..layers).map(|_| LayerDemand { kind: AttentionClass::Csa, weights: ModeBytes::default(),
-            kv_unit: ModeBytes::default(),
-            experts: Some(ExpertCost { whole: Bytes2 { resident: GIB, staging: GIB / 4 }, half: [Bytes2::default(); 2], tp2: false,
-                spark_ok: true }),
+            kv_unit: ModeBytes::default().into(), colocate: None,
+            fixed_bytes: ModeBytes::default(), context_indexer: false,
+            experts: Some(ExpertCost { whole: Bytes2 { resident: GIB, staging: GIB / 4 }, half: [Bytes2::default(); 2], tp2: false, spark_ok: true }),
             modes: vec![LayerMode::HeadSplit, LayerMode::Whole { gpu: 0, ffn: FfnMode::Owner }] }).collect(),
         pool_overhead: vec![UNIT; gpus],
         fixed: Vec::new(),
@@ -395,4 +398,381 @@ fn experts_first_falls_back_to_a_spark_pool_below_the_context() {
     let mut spark_free = request(1, 8 * GIB, 60, 0, Onboard::ExpertsFirst { pool_floor: EXPERTS_FIRST_POOL_FLOOR });
     spark_free.pool = PoolPolicy::resolve(&[32 * GIB], 1 << 20, None, 256, true);
     assert!(solve(&spark_free).is_err());
+}
+
+
+#[test]
+fn attention_selectors_are_strict_until_family_executors_land() {
+    for executor in families::EXECUTORS {
+        assert_eq!(executor.check_attention(None, 2, true).unwrap(), AttentionPlacement::Heads);
+        for mode in [AttentionPlacement::Context, AttentionPlacement::Layers] {
+            assert!(matches!(executor.check_attention(Some(mode), 2, true),
+                Err(PlacementError::AttentionPlacement { family, mode: refused, .. }) if family == executor.family && refused == mode));
+        }
+    }
+    assert_eq!(attention::parse("auto"), Ok(None));
+    assert_eq!(attention::parse("context"), Ok(Some(AttentionPlacement::Context)));
+    assert!(attention::parse("CONTEXT").is_err());
+}
+
+const CONTEXT: ExecutorModes = ExecutorModes { family: "fixture", modes: &[
+    LayerMode::HeadSplit, LayerMode::ContextSplit, S0, S1, W0], hops: true };
+
+#[test]
+fn context_residuals_and_buffers_match_heads_and_section_6() {
+    for from in [ResidualHome::Replicated, ResidualHome::Owned(0), ResidualHome::Owned(1)] {
+        assert_eq!(from.transition(LayerMode::ContextSplit), from.transition(LayerMode::HeadSplit));
+    }
+    for (token, q, p, c, stage) in [(788, 36_864, 32_896, 16_384, 1.54),
+        (179, 32_768, 32_896, 4_096, 0.35), (179, 65_536, 65_792, 8_192, 0.35),
+        (561, 32_768, 32_896, 4_096, 1.10)] {
+        let buffers = ContextBuffers { staging_unit_bytes: token, staging_unit_rows: 1, query_row_bytes: q, partial_row_bytes: p,
+            candidate_row_bytes: c, compiled_extent: 1 << 20, decode_rows: 64, lanes: 2 };
+        let demands = buffers.demands().unwrap();
+        assert!((demands[0].bytes as f64 / GIB as f64 - stage).abs() < 0.005);
+        assert_eq!(demands[1].bytes, 2 * 2 * 64 * (q + p + c));
+        assert_eq!(demands[0].bytes, demands[2].bytes);
+    }
+    assert!(ContextBuffers { staging_unit_bytes: u64::MAX, compiled_extent: 2, ..Default::default() }.demands().is_err());
+}
+
+#[test]
+fn context_halves_units_but_keeps_other_layers_and_fixed_bytes_replicated() {
+    let mut req = request(2, 44 * GIB, 2, 4, Onboard::Auto);
+    req.pool_overhead = vec![0; 2];
+    req.executor = CONTEXT;
+    req.attention_placement = Some(AttentionPlacement::Context);
+    req.layers[0].kv_unit = KvDemand { unit_bytes_whole: UNIT, unit_bytes_split: [UNIT; 2], unit_bytes_context: Some([UNIT / 2; 2]) };
+    req.layers[0].modes.push(LayerMode::ContextSplit);
+    req.layers[0].fixed_bytes = ModeBytes::replicated(GIB);
+    req.layers[1].kv_unit = ModeBytes::replicated(UNIT / 8).into();
+    let plan = solve(&req).unwrap();
+    assert_eq!(plan.layers[0].mode, LayerMode::ContextSplit);
+    assert_eq!(plan.layers[1].mode, LayerMode::HeadSplit);
+    for items in plan.items {
+        assert_eq!(items.iter().find(|i| i.group == "records").unwrap().bytes, (UNIT / 2 + UNIT / 8) * 8192);
+        assert_eq!(items.iter().find(|i| i.group == "layer state and marks").unwrap().bytes, GIB);
+    }
+}
+
+#[test]
+fn only_auto_uses_the_memory_lever_and_colocate_groups_keep_their_owner() {
+    let mut req = request(2, 20 * GIB, 4, 4, Onboard::Auto);
+    req.pool_overhead = vec![0; 2];
+    req.executor = CONTEXT;
+    for (index, layer) in req.layers.iter_mut().enumerate() {
+        layer.kv_unit = KvDemand { unit_bytes_whole: UNIT / 4, unit_bytes_split: [UNIT / 4; 2],
+            unit_bytes_context: Some([UNIT / 8; 2]) };
+        layer.modes = vec![LayerMode::HeadSplit, LayerMode::ContextSplit, S0, S1];
+        layer.colocate = Some((index / 2) as u16);
+    }
+    req.attention_placement = Some(AttentionPlacement::Heads);
+    let heads = solve(&req).unwrap();
+    assert!(heads.pool_tokens < req.pool.target);
+    req.attention_placement = None;
+    let context = solve(&req).unwrap();
+    assert_eq!(context.pool_tokens, req.pool.target);
+    assert_eq!(context.attention_placement, AttentionPlacement::Context);
+    req.attention_placement = Some(AttentionPlacement::Layers);
+    let layers = solve(&req).unwrap();
+    assert_eq!(layers.layers.iter().map(|l| l.mode).collect::<Vec<_>>(), [S0, S0, S1, S1]);
+    req.attention_placement = Some(AttentionPlacement::Context);
+    req.inventory.peer_access = false;
+    assert!(solve(&req).is_err());
+}
+
+#[test]
+fn section_6_glm_memory_uses_one_latent_and_charges_every_exchange_slot() {
+    // P2's fixed demands, taken from the design's plan JSON after records.
+    // Full indexers on 0/1/2 and each fourth layer thereafter: 21 in 78.
+    let fixed = [30_180_346_250u64, 18_353_380_746];
+    let buffers = ContextBuffers { staging_unit_bytes: 788, staging_unit_rows: 1, query_row_bytes: 36_864,
+        partial_row_bytes: 32_896, candidate_row_bytes: 16_384,
+        compiled_extent: 1 << 20, decode_rows: 64, lanes: 2 };
+    for nvfp4 in [false, true] {
+        let mut req = request(2, inventory::PRO_TOTAL_BYTES - 2 * GIB, 78, 6, Onboard::Auto);
+        req.pool_overhead = vec![0; 2];
+        req.context_buffers = buffers;
+        req.layers_first_gpu = 1;
+        req.executor = CONTEXT;
+        for (layer, demand) in req.layers.iter_mut().enumerate() {
+            let indexer = layer <= 2 || (layer >= 6 && (layer - 6) % 4 == 0);
+            let token = 656 + if indexer { 132 } else { 0 };
+            demand.kind = AttentionClass::Mla;
+            demand.experts = None;
+            demand.context_indexer = indexer;
+            demand.kv_unit = KvDemand { unit_bytes_whole: token * 64, unit_bytes_split: [token * 64; 2],
+                unit_bytes_context: Some([token * 32; 2]) };
+            demand.colocate = Some(if layer < 2 { layer as u16 } else { (2 + (layer - 2) / 4) as u16 });
+            demand.modes = vec![LayerMode::HeadSplit, LayerMode::ContextSplit, S1, S0];
+        }
+        req.pool.unit_rows = 64;
+        req.fixed = fixed.into_iter().enumerate().map(|(gpu, bytes)| Demand::new(gpu as u8, Category::Workspace,
+            "P2 fixed", bytes + if nvfp4 { 8_685_388_318 } else { 0 }, Basis::Estimated)).collect();
+        req.hops = HopSpec { row_bytes: 12_288, rows: 4096, lanes: 4, entry_gpu: 0, head_gpu: 0 };
+        req.attention_placement = Some(AttentionPlacement::Heads);
+        let heads = solve(&req).unwrap();
+        print_attention_fixture(if nvfp4 { "GLM 5.3 NVFP4" } else { "GLM 5.3 EXL3" }, AttentionPlacement::Heads, &heads);
+        req.attention_placement = Some(AttentionPlacement::Context);
+        let context = solve(&req).unwrap();
+        print_attention_fixture(if nvfp4 { "GLM 5.3 NVFP4" } else { "GLM 5.3 EXL3" }, AttentionPlacement::Context, &context);
+        let mut max_req = req.clone();
+        max_req.onboard = Onboard::Layers(0);
+        let max_pool = solve(&max_req).unwrap().pool_tokens;
+        assert!((max_pool as f64 / 1e6 - if nvfp4 { 2.20 } else { 2.52 }).abs() < 0.005);
+        eprintln!("K0 GLM context max_pool={max_pool}");
+        assert_eq!(context.pool_tokens, 2 << 20);
+        assert_eq!(context.peer_row_bytes, 78 * (36_864 + 32_896) + 21 * 16_384);
+        let used = context.items.iter().map(|items| items.iter().map(|i| i.bytes).sum::<u64>() as f64 / GIB as f64).collect::<Vec<_>>();
+        let expected = if nvfp4 { [90.4, 79.4] } else { [82.3, 71.3] };
+        for gpu in 0..2 { assert!((used[gpu] - expected[gpu]).abs() < 0.07, "NVFP4={nvfp4} GPU{gpu}: {}", used[gpu]); }
+        assert!((heads.pool_tokens as f64 / 1e6 - if nvfp4 { 1.13 } else { 1.29 }).abs() < 0.015);
+        req.attention_placement = Some(AttentionPlacement::Layers);
+        // The design drops 1.386 GiB replicated operands, half from each GPU.
+        for d in &mut req.fixed { d.bytes -= (1_287_508_185 + 200_991_168) / 2; }
+        let layers = solve(&req).unwrap();
+        print_attention_fixture(if nvfp4 { "GLM 5.3 NVFP4" } else { "GLM 5.3 EXL3" }, AttentionPlacement::Layers, &layers);
+        let mut max_req = req.clone();
+        max_req.onboard = Onboard::Layers(0);
+        let max_pool = solve(&max_req).unwrap().pool_tokens;
+        assert!((max_pool as f64 / 1e6 - if nvfp4 { 2.22 } else { 2.54 }).abs() < 0.005);
+        eprintln!("K0 GLM layers max_pool={max_pool}");
+        let records = layers.items.iter().map(|items| items.iter().find(|i| i.group == "records").unwrap().bytes / (2 << 20)).collect::<Vec<_>>();
+        let k = layers.layers.iter().position(|l| l.mode == S0).unwrap();
+        eprintln!("K0 GLM layers switch={k} hops={}", layers.hops.len());
+        assert!(layers.layers[..k].iter().all(|l| l.mode == S1));
+        assert!(layers.layers[k..].iter().all(|l| l.mode == S0));
+        eprintln!("K0 GLM layers records={records:?}");
+        let used = layers.items.iter().map(|items| items.iter().map(|i| i.bytes).sum::<u64>() as f64 / GIB as f64).collect::<Vec<_>>();
+        let expected = if nvfp4 { [89.7, 76.4] } else { [81.6, 68.3] };
+        for gpu in 0..2 { assert!((used[gpu] - expected[gpu]).abs() < 0.07, "NVFP4={nvfp4} layers GPU{gpu}: {}", used[gpu]); }
+    }
+}
+
+
+#[test]
+fn section_6_v4_and_glm_flash_memory_savings() {
+    let records = (2u64 << 20) * 11 * (528 + 512 + 33);
+    let compact = (2u64 << 20) * 11 * (528 + 33);
+    assert!((records as f64 / GIB as f64 - 23.05).abs() < 0.01);
+    let staging = ContextBuffers { staging_unit_bytes: 256 * 528 + 64 * 132,
+        staging_unit_rows: 256, compiled_extent: 1 << 20, ..Default::default() }.demands().unwrap()[0].bytes;
+    let exchange = 4 * 64 * (32_768 + 32_896 + 4_096);
+    let freed = (records - compact / 2 - staging - exchange) as f64 / GIB as f64;
+    assert!((freed - 15.9).abs() < 0.05);
+    let hop = 2 * 2 * 4096 * 32_784;
+    let layers_freed = [(records - compact * 5 / 11 - hop) as f64 / GIB as f64,
+        (records - compact * 6 / 11 - hop) as f64 / GIB as f64];
+    assert!((layers_freed[0] - 17.1).abs() < 0.05 && (layers_freed[1] - 16.0).abs() < 0.05);
+    assert!((98.6 - freed - 82.7).abs() < 0.07 && (99.4 - freed - 83.5).abs() < 0.07);
+}
+
+
+fn print_attention_fixture(family: &str, mode: AttentionPlacement, placement: &Placement) {
+    let fixed = placement.items.iter().map(|items| items.iter()
+        .filter(|i| i.group != "records" && i.category != Category::Experts)
+        .map(|i| i.bytes).sum::<u64>()).collect::<Vec<_>>();
+    eprintln!("K0 {family} {mode}: pool={} onboard={} fixed={fixed:?}", placement.pool_tokens, placement.onboard_layers);
+}
+
+#[test]
+fn section_6_tp2_counts_use_exact_pages_and_real_layer_ownership() {
+    // Calibrated section-six admission model, not a runtime executor: the P4
+    // table supplies per-half bytes and slack; geometry supplies exact pages.
+    for (name, count, c4, dim, state, half, pairs, slack, expected) in [
+        ("V4 Flash", 43usize, 21usize, 4096u64, 2.048f64, 1.594f64, 36usize, 0.074110f64, [36, 38, 38]),
+        ("V4 Pro", 61, 30, 7168, 2.487, 2.9921875, 10, 0.734058, [10, 11, 12]),
+    ] {
+        let available = inventory::PRO_TOTAL_BYTES - 2 * GIB;
+        let mut req = request(2, available, count, 4, Onboard::Auto);
+        req.executor = CONTEXT;
+        req.pool_overhead = vec![0; 2];
+        req.context_buffers = ContextBuffers { staging_unit_bytes: 45_888, staging_unit_rows: 256,
+            query_row_bytes: if dim == 4096 { 32_768 } else { 65_536 },
+            partial_row_bytes: if dim == 4096 { 32_896 } else { 65_792 },
+            candidate_row_bytes: if dim == 4096 { 4_096 } else { 8_192 },
+            compiled_extent: 1 << 20, decode_rows: 64, lanes: 2 };
+        req.hops = HopSpec { row_bytes: 4 * dim * 2 + 16, rows: 4096, lanes: 2, entry_gpu: 0, head_gpu: 0 };
+        let half = (half * GIB as f64) as u64;
+        let state_unit = (state * GIB as f64 / count as f64) as u64;
+        for (i, layer) in req.layers.iter_mut().enumerate() {
+            // Official configs: C4 layers 2,4,...; Pro begins with two C128.
+            let ratio = if i >= 2 && i % 2 == 0 { 4 } else if name == "V4 Pro" || i >= 2 { 128 } else { 0 };
+            let unit = crate::serving_capacity::deepseek_v4_layer_unit_bytes(ratio);
+            layer.kv_unit = KvDemand { unit_bytes_whole: unit, unit_bytes_split: [unit; 2],
+                unit_bytes_context: (ratio == 4).then_some([unit / 2; 2]) };
+            layer.context_indexer = ratio == 4;
+            layer.fixed_bytes = ModeBytes::replicated(state_unit);
+            layer.modes = vec![LayerMode::HeadSplit, LayerMode::ContextSplit, S0, S1];
+            layer.experts = (i >= 2).then_some(ExpertCost { whole: Bytes2::default(),
+                half: [Bytes2 { resident: half, staging: 0 }; 2], tp2: true, spark_ok: true });
+        }
+        assert_eq!(req.layers.iter().filter(|l| l.context_indexer).count(), c4);
+        let records = req.layers.iter().map(|l| l.kv_unit.unit_bytes_whole).sum::<u64>() * 8192;
+        let base = available - records - state_unit * count as u64 - pairs as u64 * half - (slack * GIB as f64) as u64;
+        req.fixed = (0..2).map(|gpu| Demand::new(gpu, Category::Workspace, "P4 adjusted fixed", base, Basis::Estimated)).collect();
+        for (mode, layers) in [AttentionPlacement::Heads, AttentionPlacement::Context, AttentionPlacement::Layers].into_iter().zip(expected) {
+            req.attention_placement = Some(mode);
+            let p = solve(&req).unwrap();
+            print_attention_fixture(name, mode, &p);
+            assert_eq!(p.pool_tokens, 2 << 20);
+            assert_eq!(p.onboard_layers, layers, "{name} {mode}");
+            let kv = p.items.iter().map(|items| items.iter().filter(|i| i.group == "records").map(|i| i.bytes).sum::<u64>()).collect::<Vec<_>>();
+            eprintln!("K0 {name} {mode}: kv={kv:?} hops={}", p.hops.len());
+            if mode == AttentionPlacement::Layers {
+                let k = p.layers.iter().position(|l| l.mode == S1).unwrap_or(p.layers.len());
+                eprintln!("K0 {name} layers switch={k}");
+                assert!(p.layers[..k].iter().all(|l| l.mode == S0));
+                assert!(p.layers[k..].iter().all(|l| l.mode == S1));
+            }
+        }
+    }
+    // GLM Flash P6 hypothetical TP2 admission: current production has no
+    // such executor. Compact pages on 11 MLA owners; KDA remains split.
+    let mut req = request(2, inventory::PRO_TOTAL_BYTES - 2 * GIB, 45, 4, Onboard::Auto);
+    req.executor = CONTEXT;
+    req.layers_first_gpu = 1;
+    req.pool_overhead = vec![0; 2];
+    req.context_buffers = ContextBuffers { staging_unit_bytes: 256 * 528 + 64 * 132, staging_unit_rows: 256,
+        query_row_bytes: 32_768, partial_row_bytes: 32_896, candidate_row_bytes: 4_096,
+        compiled_extent: 1 << 20, decode_rows: 64, lanes: 2 };
+    req.hops = HopSpec { row_bytes: 32_784, rows: 4096, lanes: 2, entry_gpu: 0, head_gpu: 0 };
+    for (i, layer) in req.layers.iter_mut().enumerate() {
+        let mla = i % 4 == 3;
+        layer.kind = if mla { AttentionClass::Mla } else { AttentionClass::Kda };
+        layer.kv_unit = if mla { KvDemand { unit_bytes_whole: 256 * 561, unit_bytes_split: [256 * 1073; 2],
+            unit_bytes_context: Some([256 * 561 / 2; 2]) } } else { KvDemand::default() };
+        layer.context_indexer = mla;
+        layer.modes = vec![LayerMode::HeadSplit, LayerMode::ContextSplit, S0, S1];
+        layer.experts = (i >= 3).then_some(ExpertCost { whole: Bytes2::default(),
+            half: [Bytes2 { resident: (115.59 * GIB as f64 / 42.0 / 2.0) as u64, staging: 0 }; 2], tp2: true, spark_ok: true });
+    }
+    req.fixed = [20_100_569_073, 15_815_582_073].into_iter().enumerate().map(|(gpu, bytes)|
+        Demand::new(gpu as u8, Category::Workspace, "P2 fixed", bytes, Basis::Estimated)).collect();
+    let spark_req = req.clone();
+    for (mode, layers) in [(AttentionPlacement::Heads, 37), (AttentionPlacement::Context, 42), (AttentionPlacement::Layers, 42)] {
+        req.attention_placement = Some(mode);
+        let p = solve(&req).unwrap();
+        print_attention_fixture("GLM Flash", mode, &p);
+        let kv = p.items.iter().map(|items| items.iter().filter(|i| i.group == "records").map(|i| i.bytes).sum::<u64>()).collect::<Vec<_>>();
+        eprintln!("K0 GLM Flash {mode}: kv={kv:?} hops={}", p.hops.len());
+        assert_eq!(p.pool_tokens, 2 << 20);
+        assert_eq!(p.onboard_layers, layers);
+        if mode == AttentionPlacement::Layers {
+            let k = p.layers.iter().position(|l| l.mode == S0).unwrap();
+            eprintln!("K0 GLM Flash layers switch={k}");
+        }
+    }
+    let mut free_req = spark_req;
+    free_req.inventory.spark_ranks = 0;
+    for mode in [AttentionPlacement::Context, AttentionPlacement::Layers] {
+        free_req.attention_placement = Some(mode);
+        let p = solve(&free_req).unwrap();
+        assert_eq!(p.onboard_layers, 42);
+        assert!(p.pool_tokens >= 2 << 20);
+        print_attention_fixture("GLM Flash Spark-free", mode, &p);
+    }
+}
+
+
+#[test]
+fn context_pool_rounding_never_crosses_floor_and_explicit_units_are_even() {
+    let mut req = request(2, GIB, 1, 4, Onboard::Layers(0));
+    req.executor = CONTEXT;
+    req.attention_placement = Some(AttentionPlacement::Context);
+    req.pool_overhead = vec![0; 2];
+    req.pool.unit_rows = 1;
+    req.pool.floor = 3;
+    req.pool.target = 3;
+    req.pool.ceiling = 3;
+    req.layers[0].kv_unit = KvDemand { unit_bytes_whole: 2, unit_bytes_split: [2; 2], unit_bytes_context: Some([1; 2]) };
+    req.layers[0].modes.push(LayerMode::ContextSplit);
+    req.layers[0].experts = None;
+    assert!(matches!(solve(&req), Err(PlacementError::BelowFloor { pool: 2, .. })));
+    req.pool.floor = 1;
+    req.pool.requested = Some(3);
+    assert!(matches!(solve(&req), Err(PlacementError::Inventory(_))));
+}
+
+
+#[test]
+fn auto_cannot_flip_to_an_unqualified_executor_mode() {
+    for executor in families::EXECUTORS {
+        let mut req = request(2, 20 * GIB, 2, 4, Onboard::Auto);
+        req.executor = executor;
+        for layer in &mut req.layers {
+            layer.modes = vec![LayerMode::HeadSplit, LayerMode::ContextSplit, S0, S1, W0, W1];
+            layer.kv_unit = KvDemand { unit_bytes_whole: UNIT, unit_bytes_split: [UNIT; 2], unit_bytes_context: Some([UNIT / 2; 2]) };
+        }
+        req.pool_overhead = vec![0; 2];
+        let auto = solve(&req).unwrap();
+        req.attention_placement = Some(AttentionPlacement::Heads);
+        assert_eq!(auto, solve(&req).unwrap(), "{}", executor.family);
+        assert!(auto.layers.iter().all(|l| executor.runs(l.mode)));
+    }
+}
+
+#[test]
+fn mixed_memory_flips_are_explicit_in_plan_and_summary() {
+    let mut req = request(2, 15 * UNIT / 4, 3, 4, Onboard::Auto);
+    req.pool_overhead = vec![0; 2];
+    req.executor = CONTEXT;
+    req.context_buffers = ContextBuffers { query_row_bytes: 64, partial_row_bytes: 128,
+        decode_rows: 1, lanes: 1, ..ContextBuffers::default() };
+    req.layers[0].kind = AttentionClass::Mla;
+    req.layers[0].kv_unit = KvDemand { unit_bytes_whole: UNIT, unit_bytes_split: [UNIT; 2], unit_bytes_context: Some([UNIT / 2; 2]) };
+    req.layers[0].modes = vec![LayerMode::HeadSplit, LayerMode::ContextSplit];
+    req.layers[1].kind = AttentionClass::Dsa;
+    req.layers[1].kv_unit = KvDemand { unit_bytes_whole: UNIT / 4, unit_bytes_split: [UNIT / 4; 2], unit_bytes_context: None };
+    req.layers[1].modes = vec![LayerMode::HeadSplit, S0, S1];
+    req.layers[2] = req.layers[1].clone();
+    req.pool.target = 1024;
+    req.pool.floor = 1;
+    for layer in &mut req.layers { layer.experts = None; }
+    let mixed = solve(&req).unwrap();
+    assert_eq!(mixed.pool_tokens, 1024);
+    assert_eq!(mixed.attention_by_kind, [(AttentionClass::Mla, AttentionPlacement::Context), (AttentionClass::Dsa, AttentionPlacement::Layers)]);
+    assert!(mixed.summary().contains("mixed (Mla=context, Dsa=layers)"));
+    assert_eq!(mixed.peer_row_bytes, 192);
+    // If the Dsa flip alone reaches an odd-unit target, pruning the Mla
+    // context stepping stone recovers the unit and removes its peer traffic.
+    req.pool.target = 768;
+    let pruned = solve(&req).unwrap();
+    assert_eq!(pruned.pool_tokens, 768);
+    assert_eq!(pruned.attention_by_kind, [(AttentionClass::Mla, AttentionPlacement::Heads), (AttentionClass::Dsa, AttentionPlacement::Layers)]);
+    assert_eq!(pruned.peer_row_bytes, 0);
+    // Beyond the available pool, removing context leaves the final four-unit
+    // pool unchanged; the equal-pool stepping stone must still be pruned.
+    for gpu in &mut req.inventory.gpus {
+        gpu.baseline = Baseline::Measured { free_bytes: 5 * UNIT };
+    }
+    req.pool.target = 1280;
+    let pruned = solve(&req).unwrap();
+    assert_eq!(pruned.pool_tokens, 1024);
+    assert_eq!(pruned.attention_by_kind, [(AttentionClass::Mla, AttentionPlacement::Heads), (AttentionClass::Dsa, AttentionPlacement::Layers)]);
+    assert_eq!(pruned.peer_row_bytes, 0);
+}
+
+
+#[test]
+fn contiguous_layer_switch_keeps_groups_and_breaks_equal_bytes_by_pool() {
+    let mut req = request(2, 32 * GIB, 4, 4, Onboard::Auto);
+    req.executor = CONTEXT;
+    req.attention_placement = Some(AttentionPlacement::Layers);
+    req.pool_overhead = vec![0; 2];
+    for layer in &mut req.layers {
+        layer.experts = None;
+        layer.modes = vec![LayerMode::HeadSplit, S0, S1];
+        layer.kv_unit = ModeBytes::replicated(UNIT / 4).into();
+    }
+    req.layers[1].colocate = Some(7);
+    req.layers[2].colocate = Some(7);
+    // k=1 and k=3 have equal largest owned bytes; the asymmetric fixed
+    // demand makes GPU1's larger suffix worse, so choose k=3.
+    req.fixed = vec![Demand::new(1, Category::Workspace, "rank1 fixed", 8 * GIB, Basis::Exact)];
+    let p = solve(&req).unwrap();
+    assert_eq!(p.layers.iter().map(|l| l.mode).collect::<Vec<_>>(), [S0, S0, S0, S1]);
+    req.fixed.clear();
+    let p = solve(&req).unwrap();
+    assert_eq!(p.layers.iter().map(|l| l.mode).collect::<Vec<_>>(), [S0, S1, S1, S1]);
 }

@@ -102,6 +102,8 @@ pub fn phases() -> Vec<(String, f64)> {
 
 /// The API accepts requests on `listen` from now on.
 pub fn mark_ready(listen: SocketAddr) {
+    let placement = get().settings.iter().find(|s| s.name == "attention-placement").and_then(|s| s.value.clone());
+    if let Some(placement) = placement { tracing::info!(attention_placement = placement, "ready attention placement"); }
     phase("API listening");
     let _ = state().ready.set(SystemTime::now());
     let _ = state().listen.set(listen);

@@ -290,6 +290,9 @@ pub(crate) struct PlanArgs {
     /// Coordinator GPUs for --layout (1 or 2; Qwen currently uses only the first).
     #[arg(long, default_value_t = 1)]
     pub(crate) rtx: usize,
+    /// Attention placement: auto is the qualified family default (heads until decided).
+    #[arg(long, default_value = "auto", value_parser = ["auto", "context", "layers", "heads"])]
+    pub(crate) attention_placement: String,
     /// Resolved global logical GPU ceiling; PRO defaults to its CUDA total (94.97 GiB).
     #[arg(skip)]
     pub(crate) coordinator_gpu_budget_gib: Option<f64>,

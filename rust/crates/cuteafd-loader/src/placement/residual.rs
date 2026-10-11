@@ -110,7 +110,7 @@ impl ResidualHome {
     /// lists only the inbound hop).
     pub fn transition(self, next: LayerMode) -> Transition {
         match next {
-            LayerMode::HeadSplit => Transition {
+            LayerMode::HeadSplit | LayerMode::ContextSplit => Transition {
                 before: match self {
                     Self::Replicated => None,
                     Self::Owned(g) => Some((g, 1 - g.min(1), HopKind::Broadcast)),

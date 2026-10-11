@@ -173,7 +173,10 @@ pub fn request(inputs: &V4Inputs<'_>) -> Result<PlacementRequest, PlacementError
             kind: AttentionClass::Csa,
             // Coordinator weights load before admission (inside the baseline).
             weights: ModeBytes::default(),
-            kv_unit: ModeBytes::replicated(unit),
+            kv_unit: KvDemand { unit_bytes_whole: unit, unit_bytes_split: [unit; 2],
+                unit_bytes_context: (inputs.cfg.compress_ratios[layer] == 4).then_some([unit.div_ceil(2), unit / 2]) },
+            colocate: None, fixed_bytes: ModeBytes::default(),
+            context_indexer: inputs.cfg.compress_ratios[layer] == 4,
             experts,
             modes: if gpus == 2 { vec![LayerMode::HeadSplit] } else { vec![LayerMode::Whole { gpu: 0, ffn: FfnMode::Owner }] },
         }
@@ -184,6 +187,13 @@ pub fn request(inputs: &V4Inputs<'_>) -> Result<PlacementRequest, PlacementError
     };
     let geometry_unit = 256;
     Ok(PlacementRequest {
+        attention_placement: None,
+        layers_first_gpu: 0,
+        context_buffers: ContextBuffers { staging_unit_bytes: deepseek_v4_layer_unit_bytes(4), staging_unit_rows: 256,
+            query_row_bytes: if inputs.cfg.dim == 4096 { 32_768 } else { 65_536 },
+            partial_row_bytes: if inputs.cfg.dim == 4096 { 32_896 } else { 65_792 },
+            candidate_row_bytes: if inputs.cfg.dim == 4096 { 4_096 } else { 8_192 },
+            compiled_extent: inputs.max_context, decode_rows: inputs.decode_rows, lanes: PREFILL_LANES },
         inventory: Inventory { gpus: budgets, spark_ranks: inputs.spark_ranks, peer_access: gpus == 2 },
         pool: PoolPolicy { ceiling: POOL_CEILING_TOKENS, ..PoolPolicy::resolve(
             &inputs.gpus.iter().map(|g| g.0).collect::<Vec<_>>(), inputs.max_context, inputs.requested_pool,

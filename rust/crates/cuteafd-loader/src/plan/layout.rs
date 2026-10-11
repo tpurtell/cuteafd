@@ -496,7 +496,8 @@ pub fn layout(report: &mut PlanReport, model: &dyn super::FamilyModel, checkpoin
             items: Vec::new(), kv_tokens: 0 })
         .collect();
     let mut waste = Vec::new();
-    let mut notes = vec![format!("resolved context {context_tokens} tokens (checkpoint {checkpoint_context})")];
+    let mut notes = vec![format!("resolved context {context_tokens} tokens (checkpoint {checkpoint_context})"),
+        format!("attention placement {}", report.attention_placement)];
     let reference_gpu = gpus == 1 && (94 * GIB..=96 * GIB).contains(&options.rtx_bytes[0])
         && native_layers > 0 && options.local_expert_layers.is_none();
     let package = report.experts.as_ref().map(|e| e.package.as_str());

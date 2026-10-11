@@ -157,7 +157,7 @@ async fn main() -> Result<()> {
         tracing::info!(gib, bytes = budget.0, "installed per-GPU coordinator memory budget; SM count and L2 unchanged");
     }
     // A serve command's resolved options, for the server's benchmark reports.
-    commands::bench::capture(&matches, coordinator_budget_gib);
+    commands::bench::capture(&matches, coordinator_budget_gib)?;
     // Memory ledger reports for the long-running roles (device use by category).
     match &command {
         Commands::Expertd(_) => shared::memory_report::monitor("expertd", std::time::Duration::from_secs(10)),
