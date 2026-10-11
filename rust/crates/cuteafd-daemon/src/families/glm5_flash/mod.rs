@@ -115,7 +115,7 @@ pub(crate) struct EngineArgs {
     #[arg(long, value_enum, env = "CUTEAFD_GLMF_REPLAY_RECORDS", default_value = "own")]
     pub replay_records: engine::ReplayRecords,
     /// Spark ranks in TP order (HOST:PORT,...) serving the fp8 expert family.
-    #[arg(long, conflicts_with = "local_experts")]
+    #[arg(long)]
     pub peers: Option<String>,
     /// Run the routed experts on this GPU: EXL3 checkpoints through the
     /// coordinator `exl3-glmf-k<tiers>/rtx-tp1` package, FP8 ones through the
@@ -123,6 +123,9 @@ pub(crate) struct EngineArgs {
     /// for the experts (the official FP8 one with EXL3 coordinator weights).
     #[arg(long)]
     pub local_experts: bool,
+    /// Routed layer onboarding: auto (pool first), max, N, N%, or all.
+    #[arg(long, env = "RTX_EXPERT_LAYERS", value_parser = parse_onboard)]
+    pub rtx_expert_layers: Option<cuteafd_loader::placement::Onboard>,
     #[arg(long)]
     pub experts_snapshot: Option<PathBuf>,
     /// TP1 FP8 package directory (default `<libdir>/fp8/fp8-glmf/tp1`).
@@ -574,7 +577,7 @@ mod draft_cli_tests {
             let rest = &source[start..];
             &rest[..rest.find("\n    }\n").unwrap()]
         };
-        let (dense, experts) = (body("load_dense"), body("experts"));
+        let (dense, experts) = (body("load_dense"), body("experts_range"));
         let sized = ["args.expert", "_rows()"].concat();
         assert!(dense.contains(&["DenseNvfp4::load(&self.library, &directory, &self.cfg, ", &sized, ")?"].concat()));
         // FP8 experts, EXL3 experts and the Spark transports, each with the rows among its arguments.
@@ -613,235 +616,16 @@ mod draft_cli_tests {
         assert_eq!(engine::output_shard_reserve(4, 2048, 4096), engine::output_shard_reserve(2, 4096, 4096));
     }
 
+    const SPARKS: [&str; 2] = ["--peers", "127.0.0.1:19441"];
+
     #[test]
-    fn measured_admission_keeps_the_planners_headroom_and_graph_allowance() {
-        let defaults = parse(&[]);
-        assert_eq!(defaults.headroom_bytes().unwrap(),
+    fn shared_admission_preserves_headroom_and_onboarding_options() {
+        assert_eq!(parse(&[]).headroom_bytes().unwrap(),
             cuteafd_loader::plan::layout::LayoutOptions::default().headroom_bytes);
         assert_eq!(parse(&["--headroom-gib", "1"]).headroom_bytes().unwrap(), 1 << 30);
         assert!(parse(&["--headroom-gib=-1"]).headroom_bytes().is_err());
-        assert_eq!(graph_reserve(&defaults), 1_610_612_736);
-        let budgeted = parse(&["--graph-budget-mib", "512"]);
-        assert_eq!((budgeted.graph_budget_mib, graph_reserve(&budgeted)), (Some(512), 512 << 20));
-        // A graph budget captures lazily within it: never at startup, whatever the environment.
-        assert!(!budgeted.startup_graphs());
-        assert_eq!(defaults.startup_graphs(), engine::startup_graphs_enabled());
-    }
-
-    const SPARKS: [&str; 2] = ["--peers", "127.0.0.1:19441"];
-
-    /// `flags` with `--graph-budget-mib budget` when there is one.
-    fn with_budget(flags: &[&str], budget: Option<&str>) -> EngineArgs {
-        let mut flags = flags.to_vec();
-        if let Some(mib) = budget {
-            flags.extend(["--graph-budget-mib", mib]);
-        }
-        parse(&flags)
-    }
-
-    /// A fixed pool is admitted from the planner's costs, which kept only the 1.5 GiB graph allowance
-    /// on the GPU whatever the graph budget: at `--graph-budget-mib 4096`, 2,684,354,560 B short of what
-    /// lazily captured graphs may fill. It now keeps the budget or the allowance, whichever is larger,
-    /// with Spark or local experts, served or not (without a serving loop it was not admitted at all).
-    #[test]
-    fn a_fixed_pool_keeps_the_graph_budget_or_the_allowance_free() {
-        let allowance = cuteafd_loader::plan::layout::family_costs("glm5_flash").graph_bytes;
-        assert_eq!(allowance, [1_610_612_736; 3]);
-        for (budget, excess) in [("4096", 2_684_354_560), ("512", 0), ("1536", 0), ("1537", 1 << 20)] {
-            for experts in [&SPARKS[..], &["--local-experts"][..]] {
-                let mut args = with_budget(&[experts, &["--pool-tokens", "131072"][..]].concat(), Some(budget));
-                // The GPU's graph bytes: the planner's allowance (role 0) and the extra each GPU's reserve takes.
-                let extra = planned_graph_extra(&args, None, allowance[0]);
-                assert_eq!(extra, excess, "{budget} MiB");
-                assert_eq!(allowance[0] + extra, (budget.parse::<u64>().unwrap() << 20).max(allowance[0]));
-                for serving in [Some((16, true)), None] {
-                    args.serving_graph_policy = serving;
-                    assert_eq!(kv_admission(&args, false, false), KvAdmission::Planned, "{budget} MiB {serving:?}");
-                }
-            }
-        }
-        // Without a budget: served, planned; otherwise planned beside the startup set, else unchecked.
-        let mut lazy = with_budget(&[&SPARKS[..], &["--pool-tokens", "131072"][..]].concat(), None);
-        assert_eq!(kv_admission(&lazy, false, false),
-            if lazy.startup_graphs() { KvAdmission::Planned } else { KvAdmission::Unchecked });
-        lazy.serving_graph_policy = Some((16, true));
-        assert_eq!(kv_admission(&lazy, false, false), KvAdmission::Planned);
-    }
-
-    /// A head split is admitted from the planner's costs, its pool automatic or fixed, and each rank's
-    /// graph cache may fill the budget (`GlmfEngine::set_graph_budget`): both GPUs keep the budget or
-    /// the allowance, whichever is larger.
-    #[test]
-    fn a_head_split_keeps_the_graph_budget_or_the_allowance_free_on_both_gpus() {
-        let allowance = cuteafd_loader::plan::layout::family_costs("glm5_flash").graph_bytes;
-        for (budget, excess) in [("4096", 2_684_354_560u64), ("512", 0), ("1536", 0)] {
-            for pool in ["0", "131072"] {
-                let args = with_budget(&[&SPARKS[..], &["--split-device", "1", "--pool-tokens", pool][..]].concat(),
-                    Some(budget));
-                // A coordinator GPU budget measures one GPU only.
-                for gpu_budget in [false, true] {
-                    assert_eq!(kv_admission(&args, gpu_budget, true), KvAdmission::Planned,
-                        "{budget} MiB, pool {pool}");
-                }
-                // Both GPUs (the planner's roles 1 and 2) keep their allowance and the same extra.
-                let extra = planned_graph_extra(&args, None, allowance[0]);
-                assert_eq!(extra, excess, "{budget} MiB, pool {pool}");
-                for role in [1, 2] {
-                    assert_eq!(allowance[role] + extra, (budget.parse::<u64>().unwrap() << 20).max(allowance[role]));
-                }
-            }
-        }
-    }
-
-    /// The default path is unchanged: one GPU with Spark experts and an automatic pool, served or not,
-    /// or any one-GPU launch under a coordinator GPU budget, is admitted from measured free memory,
-    /// which keeps the graph budget itself, below the allowance or above it (else the allowance).
-    #[test]
-    fn the_measured_admission_keeps_the_graph_budget_itself() {
-        let allowance = cuteafd_loader::plan::layout::family_costs("glm5_flash").graph_bytes[0];
-        for (budget, kept) in [(None, allowance), (Some("512"), 536_870_912), (Some("4096"), 4_294_967_296)] {
-            let mut args = with_budget(&[&SPARKS[..], &["--pool-tokens", "0"][..]].concat(), budget);
-            for serving in [Some((16, true)), None] {
-                args.serving_graph_policy = serving;
-                assert_eq!(kv_admission(&args, false, false), KvAdmission::Measured, "{budget:?}");
-                assert_eq!(kv_admission(&args, true, false), KvAdmission::Measured, "{budget:?}");
-            }
-            assert_eq!(graph_reserve(&args), kept, "{budget:?}");
-            // A fixed pool or local experts: measured under a GPU budget, planned without one.
-            for flags in [&[&SPARKS[..], &["--pool-tokens", "131072"][..]].concat(), &vec!["--local-experts"]] {
-                let mut other = with_budget(flags, budget);
-                other.serving_graph_policy = Some((16, true));
-                assert_eq!(kv_admission(&other, true, false), KvAdmission::Measured, "{budget:?} {flags:?}");
-                assert_eq!(kv_admission(&other, false, false), KvAdmission::Planned, "{budget:?} {flags:?}");
-            }
-        }
-        // The startup set's planned extra is unchanged: its largest rank above the allowance.
-        let lazy = with_budget(&SPARKS, None);
-        assert_eq!(planned_graph_extra(&lazy, Some(&[5_000_000_000, 4_000_000_000]), allowance),
-            5_000_000_000 - allowance);
-        assert_eq!(planned_graph_extra(&lazy, Some(&[1_000_000_000]), allowance), 0);
-        assert_eq!(planned_graph_extra(&lazy, None, allowance), 0);
-    }
-
-    /// `measured_pool_tokens` modelled on a 5090 (33,711,521,792 B) at default flags with Spark experts,
-    /// an automatic pool and 16 sequences, from what its launches measured once start-up had allocated
-    /// everything but the pool: `free` bytes free (11,876,761,600 at 8,192 and at 131,072 tokens), and
-    /// 2 GiB of headroom and 7,702,414,080 B of state and marks kept beside the graphs, at 11,804 B a
-    /// token in 256-token units. The GPU's one-unit check, then the pool in what the reserve leaves
-    /// (`admitted_pool_tokens`). Records each measurement's graph bytes in `calls`.
-    fn measured_on_a_5090(free: u64, calls: &std::cell::RefCell<Vec<u64>>)
-        -> impl FnMut(u64) -> anyhow::Result<usize> + '_ {
-        use cuteafd_core::serving_capacity::{DeviceMemory, GpuMemoryBudget, DEFAULT_GPU_KV_TOKENS};
-        const TOTAL: u64 = 33_711_521_792;
-        move |graphs| {
-            calls.borrow_mut().push(graphs);
-            let reserve = (2u64 << 30) + graphs + 7_702_414_080;
-            GpuMemoryBudget(TOTAL).admit(DeviceMemory { device: 0, total_bytes: TOTAL, baseline_free_bytes: free },
-                reserve + 256 * 11_804)?;
-            let room = free as i64 - reserve as i64;
-            let tokens = cuteafd_core::memory_layout::size_pool(&[room], &[11_804], 256, DEFAULT_GPU_KV_TOKENS);
-            anyhow::ensure!(tokens >= 256, crate::shared::memory_report::NoKvRoom { free_after_reserve: vec![room] });
-            Ok(tokens as usize)
-        }
-    }
-
-    /// The 5090's measured refusal (its one-unit check): `required` bytes against 33,711,521,792. At default
-    /// flags, 131,072 tokens and 16 sequences the launch beside the startup set (28,060 graphs,
-    /// 4,998,676,312 B) was refused needing 36,686,356,056 B, short 2,974,834,264 B.
-    fn the_5090_refusal(required: u64, shortfall: u64) -> cuteafd_core::serving_capacity::CapacityError {
-        cuteafd_core::serving_capacity::CapacityError::GpuBudgetExceeded { device: 0, required,
-            budget: 33_711_521_792, shortfall }
-    }
-
-    /// The launch the measured admission refused falls back to lazily captured graphs, which keep the
-    /// 1.5 GiB allowance: 3,388,063,576 B more room, 35,072 tokens. With less free memory, short either
-    /// way, the startup refusal stands.
-    #[test]
-    fn a_measured_admission_falls_back_to_lazy_capture_on_a_real_shortfall() {
-        use cuteafd_core::serving_capacity::CapacityError;
-        let args = parse(&[&SPARKS[..], &["--pool-tokens", "0"][..]].concat());
-        assert_eq!(kv_admission(&args, false, false), KvAdmission::Measured);
-        let (allowance, set) = (graph_reserve(&args), 4_998_676_312);
-        assert_eq!(allowance, 1_610_612_736);
-        let calls = std::cell::RefCell::new(Vec::new());
-        // The model refuses the startup set as the launch did.
-        let refused = measured_on_a_5090(11_876_761_600, &calls)(set).unwrap_err();
-        assert_eq!(refused.downcast_ref::<CapacityError>(), Some(&the_5090_refusal(36_686_356_056, 2_974_834_264)));
-        assert_eq!(calls.take(), [set]);
-        // Measured again keeping the allowance: lazy capture, 35,072 tokens.
-        let admitted = measured_admission(&args, Some(set), measured_on_a_5090(11_876_761_600, &calls)).unwrap();
-        assert_eq!(admitted, (35_072, false));
-        assert_eq!(calls.take(), [set, allowance]);
-        // 876,761,600 B less free: short by 463,532,288 B with the allowance too, so the startup refusal stands.
-        let error = measured_admission(&args, Some(set), measured_on_a_5090(11_000_000_000, &calls)).unwrap_err();
-        assert_eq!(error.downcast_ref::<CapacityError>(), Some(&the_5090_refusal(37_563_117_656, 3_851_595_864)));
-        assert_eq!(calls.take(), [set, allowance]);
-    }
-
-    /// A startup set that fits is kept as before: measured once, captured at startup. At 8,192 tokens the
-    /// launch's set (10,580 graphs, 1,926,552,328 B) left the 8,448 tokens it admitted. A set within the
-    /// allowance (1,474,297,856 B, what that launch captured) is kept exactly, not as the allowance, and
-    /// refused, has no room to gain from lazy capture: its refusal stands, measured once.
-    #[test]
-    fn a_measured_admission_keeps_a_startup_set_that_fits_unchanged() {
-        let args = parse(&[&SPARKS[..], &["--pool-tokens", "0"][..]].concat());
-        let calls = std::cell::RefCell::new(Vec::new());
-        for (set, tokens) in [(1_926_552_328, 8_448), (1_474_297_856, 46_592)] {
-            let admitted = measured_admission(&args, Some(set), measured_on_a_5090(11_876_761_600, &calls)).unwrap();
-            assert_eq!(admitted, (tokens, true));
-            assert_eq!(calls.take(), [set]);
-        }
-        let error = measured_admission(&args, Some(1_474_297_856), measured_on_a_5090(11_000_000_000, &calls))
-            .unwrap_err();
-        assert!(crate::shared::memory_report::kv_shortfall(&error), "{error:#}");
-        assert_eq!(calls.take(), [1_474_297_856]);
-    }
-
-    /// A lazy retry that fails for another reason (its memory sample, an overflow, a CUDA query) returns
-    /// its own error, whole, beneath the startup refusal; a first measurement that fails so is not retried.
-    #[test]
-    fn a_measured_retry_that_fails_for_another_reason_keeps_its_own_error() {
-        use crate::shared::memory_report::kv_shortfall;
-        use cuteafd_core::serving_capacity::CapacityError;
-        let args = parse(&[&SPARKS[..], &["--pool-tokens", "0"][..]].concat());
-        let (allowance, set) = (graph_reserve(&args), 4_998_676_312);
-        let refusal = || anyhow::Error::from(the_5090_refusal(36_686_356_056, 2_974_834_264));
-        let others: [fn() -> anyhow::Error; 3] = [
-            || CapacityError::Invalid("invalid GPU budget or physical memory sample").into(),
-            || anyhow::anyhow!("KV admission reserve overflows"),
-            || anyhow::anyhow!("cuteafd_cuda_memory_info returned status 1: unspecified launch failure"),
-        ];
-        let calls = std::cell::RefCell::new(Vec::new());
-        // Measurements answering `answers` in turn.
-        let scripted = |mut answers: Vec<anyhow::Result<usize>>| { answers.reverse(); let calls = &calls;
-            move |graphs: u64| { calls.borrow_mut().push(graphs); answers.pop().expect("at most two measurements") } };
-        let chain = |error: &anyhow::Error| error.chain().map(|cause| cause.to_string()).collect::<Vec<_>>();
-        for other in others {
-            let error = measured_admission(&args, Some(set), scripted(vec![Err(refusal()), Err(other())])).unwrap_err();
-            assert!(!kv_shortfall(&error), "{error:#}");
-            assert_eq!(&chain(&error)[1..], chain(&other()).as_slice());
-            assert!(error.to_string().contains(&format!("({:#})", refusal())), "{error:#}");
-            assert_eq!(calls.take(), [set, allowance]);
-            let error = measured_admission(&args, Some(set), scripted(vec![Err(other())])).unwrap_err();
-            assert_eq!(chain(&error), chain(&other()));
-            assert_eq!(calls.take(), [set]);
-        }
-    }
-
-    /// Without a startup set (a graph budget turns startup capture off, as `CUTEAFD_GLMF_STARTUP_GRAPHS=0`
-    /// does) the measured admission measures once, keeping the budget, else the allowance, and captures
-    /// lazily, with nothing to fall back to: at 512 MiB the 126,208 tokens the budgeted launch admitted;
-    /// at 4096 MiB its refusal stands.
-    #[test]
-    fn a_measured_admission_without_a_startup_set_measures_once() {
-        let calls = std::cell::RefCell::new(Vec::new());
-        for (budget, kept, admitted) in [(None, 1_610_612_736, Some(35_072)), (Some("512"), 536_870_912, Some(126_208)),
-            (Some("4096"), 4_294_967_296, None)] {
-            let args = with_budget(&[&SPARKS[..], &["--pool-tokens", "0"][..]].concat(), budget);
-            assert!(budget.is_none() || !args.startup_graphs());
-            let result = measured_admission(&args, None, measured_on_a_5090(11_876_761_600, &calls));
-            assert_eq!(result.ok(), admitted.map(|tokens| (tokens, false)), "{budget:?}");
-            assert_eq!(calls.take(), [kept], "{budget:?}");
+        for (option, expected) in [("auto", "auto"), ("all", "100%"), ("3", "3"), ("50%", "50%")] {
+            assert_eq!(parse(&["--rtx-expert-layers", option]).rtx_expert_layers.unwrap().to_string(), expected);
         }
     }
 
@@ -866,13 +650,12 @@ mod draft_cli_tests {
         }
     }
 
-    /// Only Spark experts have transports to warm at start-up: `experts` returns skipped and local
-    /// experts before any transport exists, and `--local-experts` cannot be given with `--peers`.
+    /// Local onboarding and Spark transports coexist: the admitted layer home selects each.
     #[test]
     fn only_spark_experts_have_transports_to_warm() {
         assert!(parse(&["--local-experts"]).peers.is_none());
         assert!(Parse::try_parse_from(["test", "--snapshot", "/checkpoint", "--native-lib", "/native",
-            "--local-experts", "--peers", "127.0.0.1:19441"]).is_err());
+            "--local-experts", "--peers", "127.0.0.1:19441"]).is_ok());
         let spark = parse(&SPARKS);
         assert_eq!((spark.peers.as_deref(), spark.local_experts, spark.prefill_rows), (Some(SPARKS[1]), false, 4096));
     }
@@ -1106,65 +889,17 @@ pub(crate) fn glmf_startup_program(name: &str, split: bool, wide: bool) -> bool 
     (name.starts_with("glmf_") && (wide || !name.ends_with("_m128"))) || (split && name.starts_with("glmf2_"))
 }
 
-/// What a measured admission keeps free for decode graph executables: the graph budget, else the
-/// planner's allowance.
-fn graph_reserve(args: &EngineArgs) -> u64 {
-    args.graph_budget_mib.map_or(cuteafd_loader::plan::layout::family_costs("glm5_flash").graph_bytes[0], |mib| mib << 20)
+fn parse_onboard(text: &str) -> std::result::Result<cuteafd_loader::placement::Onboard, String> {
+    text.parse()
 }
 
-/// How a launch admits its KV pool.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum KvAdmission {
-    /// From the free memory measured once everything else is allocated: one GPU with Spark experts
-    /// and an automatic pool, or any one-GPU launch under a coordinator GPU budget. It keeps the
-    /// startup set's reserve free for decode graphs, else `graph_reserve` (`measured_admission`).
-    Measured,
-    /// From the planner's per-GPU costs before the engine allocates: a head split, local experts
-    /// without a GPU budget, a fixed pool. Every GPU keeps the planner's graph allowance and
-    /// `planned_graph_extra` free.
-    Planned,
-    /// None: a fixed pool taken as given by a command without a serving loop, a GPU budget or
-    /// all-row prefill logits, and with no decode graph memory to keep (neither the startup set nor
-    /// a graph budget).
-    Unchecked,
-}
-
-/// The KV admission of a launch with these arguments: `gpu_budget`, a coordinator GPU budget is set;
-/// `split`, a head split's second GPU serves.
-fn kv_admission(args: &EngineArgs, gpu_budget: bool, split: bool) -> KvAdmission {
-    if (args.pool_tokens == 0 || gpu_budget) && !split && (!args.local_experts || gpu_budget) {
-        KvAdmission::Measured
-    } else if args.pool_tokens == 0 || args.full_prefill_logits || gpu_budget || args.startup_graphs()
-        || args.graph_budget_mib.is_some() || args.serving_graph_policy.is_some() {
-        KvAdmission::Planned
-    } else {
-        KvAdmission::Unchecked
-    }
-}
-
-/// What a planned admission keeps free for decode graph executables on every GPU beyond the
-/// planner's `allowance`, which `planned_pool_tokens_with_reserves` charges each GPU: the startup
-/// set's largest rank when graphs are captured at startup, else the graph budget, which each rank's
-/// cache may fill (`GlmfEngine::set_graph_budget`). So every GPU keeps max(allowance, startup set or
-/// budget): a budget below the allowance keeps the allowance.
-fn planned_graph_extra(args: &EngineArgs, startup_reserve: Option<&[u64]>, allowance: u64) -> u64 {
-    let startup = startup_reserve.and_then(|reserve| reserve.iter().copied().max()).unwrap_or(0);
-    startup.max(args.graph_budget_mib.map_or(0, |mib| mib << 20)).saturating_sub(allowance)
-}
-
-/// The measured admission beside the startup decode graphs (`startup`, the set's reserve on its one
-/// GPU; None when graphs are captured lazily). `measure(graphs)` sizes the pool from the free memory
-/// measured now, keeping `graphs` bytes free for decode graphs. It keeps the startup set's reserve
-/// exactly, below the allowance or above it. When that leaves no room for a pool, it measures again
-/// keeping `graph_reserve` (with a startup set, the planner's allowance), and decode graphs are
-/// captured lazily: the planned admission's rule (`engine::admit_beside_decode_graphs`). Everything
-/// else precedes the pool, so only the graph reserve differs between the two measurements. Returns the
-/// pool and whether decode graphs are captured at startup.
-fn measured_admission(args: &EngineArgs, startup: Option<u64>, mut measure: impl FnMut(u64) -> Result<usize>)
-    -> Result<(usize, bool)> {
-    let lazy = graph_reserve(args);
-    engine::admit_beside_decode_graphs(startup.map(|reserve| engine::StartupGraphReserve { reserve, allowance: lazy }),
-        |graphs| measure(graphs.unwrap_or(lazy)))
+fn admitted_tp2_range(placement: &cuteafd_loader::placement::Placement) -> Result<Option<std::ops::Range<usize>>> {
+    let selected: Vec<_> = placement.layers.iter().enumerate().filter_map(|(i, l)|
+        (l.experts == cuteafd_loader::placement::ExpertHome::RtxTp2).then_some(i)).collect();
+    let Some(&first) = selected.first() else { return Ok(None) };
+    let end = selected.last().copied().unwrap() + 1;
+    ensure!(selected.len() == end - first, "GLM Flash TP2 currently requires a contiguous routed range");
+    Ok(Some(first..end))
 }
 
 /// The checkpoint and native library, opened on the calling thread.
@@ -1185,7 +920,7 @@ impl Opened {
 
 pub(crate) fn open(args: &EngineArgs) -> Result<Opened> {
     check_options(args)?;
-    let checkpoint = Checkpoint::coordinator(&args.snapshot, args.local_experts, false)?;
+    let checkpoint = Checkpoint::coordinator(&args.snapshot, false, false)?;
     let cfg = GlmNextConfig::read(&args.snapshot)?;
     let fp8_checkpoint = args.fp8_snapshot.as_deref()
         .map(|snapshot| Checkpoint::coordinator(snapshot, false, false)).transpose()?;
@@ -1211,7 +946,7 @@ pub(crate) fn open(args: &EngineArgs) -> Result<Opened> {
         && geometry.topk as usize == cfg.topk && geometry.intermediate as usize == cfg.moe_intermediate,
         "checkpoint experts do not match the GLM 5.3 Flash geometry");
     cuteafd_core::set_expert_geometry(geometry).map_err(|g| anyhow::anyhow!("expert geometry already {g:?}"))?;
-    let experts = if args.local_experts {
+    let experts = if args.layers.unwrap_or(cfg.layers) > cfg.dense.iter().take_while(|&&d| d).count() {
         let source = args.experts_snapshot.as_deref().unwrap_or(&args.snapshot);
         let catalog = cuteafd_loader::read_expert_catalog(source)?;
         ensure!(catalog.fp8().is_some() || catalog.exl3().is_some(),
@@ -1233,6 +968,105 @@ pub(crate) fn served_index_cache(requested: engine::IndexCache, head_split: bool
 }
 
 impl Opened {
+    fn admit(&self, args: &EngineArgs, programs: &cuteafd_ffi::programs::Programs<'_>, layers: usize,
+        index: engine::IndexCache, marks: usize, peer: Option<i32>, automatic_context: bool)
+        -> Result<(cuteafd_loader::placement::Placement, cuteafd_loader::placement::GraphSet)> {
+        use cuteafd_loader::placement::{self, families::glm5_flash as admission};
+        use cuteafd_loader::families::glm5_flash::resident::{resident_weights, router_replica_bytes, GlmfRepresentation};
+        use cuteafd_loader::serving_capacity::{glmf_step_scratch, glmf_step_workspaces, glmf_table_pages,
+            GlmfScratchOptions, GlmfStepShape};
+        ensure!(args.expert_window.is_none(), "solver admission does not support diagnostic expert paging");
+        let devices: Vec<_> = std::iter::once(args.device).chain(peer).collect();
+        let split = devices.len() == 2;
+        let inventory = crate::shared::inventory::RuntimeInventory::measure(&self.library, &devices, |_| {
+            programs.load_matching(|name| glmf_startup_program(name, split, args.decode_rows > engine::DECODE_ROWS))?;
+            Ok(())
+        })?;
+        let pending_code = devices.iter().enumerate().map(|(rank, &device)|
+            crate::shared::inventory::pending_code(&self.library, device, rank, split, "glmf", "*"))
+            .collect::<Result<Vec<_>>>()?;
+        let headers = Checkpoint::coordinator(&args.snapshot, false, false)?;
+        let representation = GlmfRepresentation { kda_fp8: args.kda_fp8 != fp8::KdaFp8::Off,
+            fp8_head: args.fp8_head, output_shard: args.kda_output_shard };
+        let resident = resident_weights(&headers, &self.cfg, layers, devices.len(), representation).map_err(anyhow::Error::msg)?;
+        let router_replica_bytes = router_replica_bytes(&headers, &self.cfg, layers).map_err(anyhow::Error::msg)?;
+        let spark_ranks = args.peers.as_deref().map_or(0, |p| p.split(',').count());
+        let lanes = engine::configured_prefill_lanes(spark_ranks > 0, layers == self.cfg.layers, args.prefill_lanes);
+        let lookup = |name: &str| programs.spec(name).ok().map(|p| p.scratch.get("scratch").copied().unwrap_or(0));
+        let scratch = GlmfScratchOptions { split, kda_w8: representation.kda_fp8,
+            kda_fp32_partials: args.kda_fp32_partials, kda_output_shard: args.kda_output_shard,
+            kda_prefill_expanded: args.kda_prefill_expanded, index_compact: index == engine::IndexCache::Compact,
+            kda_state: args.kda_state.into() };
+        let decode = glmf_step_scratch(lookup, &self.cfg, scratch, args.decode_rows as u64, true)?;
+        let mut prefill = glmf_step_scratch(lookup, &self.cfg, scratch, args.prefill_rows as u64, false)?;
+        if args.replay_records == engine::ReplayRecords::Shared {
+            prefill.programs = prefill.programs.max(cuteafd_loader::serving_capacity::glm_flash_kda_replay_bytes_rows(
+                &self.cfg, layers, devices.len(), args.decode_rows as u64)?);
+        }
+        let (table_pages, table_pool_pages) = glmf_table_pages(args.max_context as u64);
+        let shape = GlmfStepShape { lead: true, split, local_experts: !split && self.fp8().is_some(),
+            tp2_experts: split, spark: spark_ranks > 0, partial_bytes: if args.kda_fp32_partials { 4 } else { 2 },
+            output_shard: args.kda_output_shard, full_prefill_logits: args.full_prefill_logits, table_pages, table_pool_pages };
+        let workspace = (0..devices.len()).map(|rank| {
+            let shape = if rank == 0 { shape } else { GlmfStepShape { lead: false, local_experts: false, spark: false, ..shape } };
+            glmf_step_workspaces(&self.cfg, lanes, args.prefill_rows as u64, args.decode_rows as u64, &shape, decode, prefill).device_bytes()
+        }).collect();
+        let mut experts = self.experts.as_ref().map(|c| admission::expert_costs(c, split)).transpose()?.unwrap_or_default();
+        experts.truncate(self.cfg.dense[..layers].iter().filter(|&&d| !d).count());
+        if args.skip_experts { for cost in &mut experts { cost.whole = Default::default(); cost.half = Default::default(); } }
+        let mut tp2_workspace = [0; 2];
+        let mut expert_workspace = 0;
+        if let Some(catalog) = self.experts.as_ref().filter(|_| !args.skip_experts) {
+            if split {
+                if let Some(tensors) = catalog.fp8() {
+                    let package = args.fp8_package.clone().unwrap_or_else(|| crate::shared::experts::fp8::package_directory(
+                        &args.native_lib, 2, tensors.format()));
+                    for rank in 0..2 { tp2_workspace[rank] = crate::shared::experts::rtx::fp8moe::Fp8MoeTp2::plan(
+                        tensors, &package, rank, args.expert_rows())?.workspace_bytes as u64; }
+                } else {
+                    let exl3 = catalog.exl3().context("EXL3 inventory")?;
+                    let package = crate::shared::experts::exl3::aot_layout_directory(&args.native_lib, exl3.decoder_tiers(), "rtx-tp2");
+                    tp2_workspace = [crate::shared::experts::rtx::exl3::Exl3Tp2::workspace_bytes_for(&package,
+                        self.cfg.hidden, args.expert_rows())? as u64; 2];
+                }
+            } else { expert_workspace = admission::expert_workspace(catalog, Some(&args.manifest), args.expert_rows() as u64, 1)?; }
+        }
+        let sms = inventory.gpus[0].sms as usize;
+        let drafter_bytes = args.draft.as_ref().map(|path| -> Result<u64> {
+            let config = serde_json::from_slice(&std::fs::read(path.join("config.json"))?)?;
+            let slots = args.draft_context_slots.unwrap_or(20.max(args.draft_sequences));
+            let (resident, scratch) = cuteafd_loader::families::glm5::draft_representation::draft_resident_bytes_with_mode(
+                &config, slots, args.draft_sequences.min(slots), sms as u64,
+                cuteafd_loader::families::glm5::draft_representation::GlmDraftRepresentation::from_fp8_option(args.draft_fp8),
+                args.draft_linear.code() as u8)?;
+            Ok(resident + scratch)
+        }).transpose()?.unwrap_or(0);
+        let (sequences, speculation) = args.serving_graph_policy.unwrap_or((16, args.draft.is_some()));
+        let pool = if args.pool_tokens > 0 { args.pool_tokens } else { cuteafd_core::serving_capacity::DEFAULT_GPU_KV_TOKENS as usize };
+        let graphs = if args.startup_graphs() {
+            admission::startup_graphs(&self.cfg, layers, args.max_context, pool,
+                sequences, speculation, devices.len(), args.decode_rows, sms)
+        } else { placement::GraphSet::budget(&vec![args.graph_budget_mib.map_or(1536 << 20, |mib| mib << 20); devices.len()]) };
+        let onboard = args.rtx_expert_layers.unwrap_or_else(|| if args.local_experts {
+            placement::Onboard::Layers(experts.len()) } else { admission::default_onboard() });
+        let inputs = admission::GlmfInputs { cfg: &self.cfg, layers,
+            gpus: inventory.baselines(&[]), pending_code, headroom_bytes: args.headroom_bytes()?, spark_ranks,
+            prefill_lanes: lanes as u64, prefill_rows: args.prefill_rows as u64, decode_rows: args.decode_rows as u64,
+            partial_bytes: if args.kda_fp32_partials { 4 } else { 2 }, max_context: args.max_context as u64, sequences: sequences as u64, state_slots: args.slots as u64,
+            mark_slots: marks as u64, pool_marks: args.prefix_marks == prefix::PrefixMarks::Pool, index: index.into(),
+            kda_state_bytes: args.kda_state.bytes() as u64, shared_replay: args.replay_records == engine::ReplayRecords::Shared,
+            representation, resident, router_replica_bytes, workspace, graphs, experts, expert_workspace, tp2_workspace,
+            drafter_bytes, requested_pool: (args.pool_tokens > 0).then_some(args.pool_tokens as u64), onboard,
+            full_prefill_logits: 0 };
+        let target = placement::PoolPolicy::resolve(&inputs.gpus.iter().map(|g| g.0).collect::<Vec<_>>(),
+            args.max_context as u64, inputs.requested_pool, 256, spark_ranks == 0).target;
+        let (placement, graphs) = admission::solve_with_graphs(&inputs, target, automatic_context, sms, true)?;
+        ensure!(placement.movables.iter().all(|(_, gpu)| *gpu == 0), "GPU1 drafter executor not installed");
+        tracing::info!(placement = %placement.summary(), "GLM Flash admission before weights");
+        cuteafd_bench::context::set_resolved("rtx-expert-layers", &placement.onboard_layers.to_string());
+        Ok((placement, graphs))
+    }
+
     /// Builds the engine and hands it to `body`. Either KV admission keeps the prefix marks of
     /// `args.mark_arena` the caller allocates once the engine exists free, counted on the layout
     /// the engine serves (`engine.mark_slots`).
@@ -1356,6 +1190,9 @@ impl Opened {
             fp8_scales: args.fp8_scales, device: args.device,
             peers: peer_stream.iter().map(|&(device, stream)| crate::shared::peer_split::RankDevice { device, stream })
                 .collect() };
+        let (placement, admitted_graphs) = self.admit(args, &programs, layers, index_cache, mark_slots,
+            split_device, automatic_context)?;
+        if !args.skip_experts && placement.tp2.is_some() { engine::check_tp2_lanes(args.prefill_lanes)?; }
         let source = self.embed_source()?;
         let (embedding, (model, mut shares)) = crate::shared::token_io::TokenEmbedding::load(&self.library, source,
             args.token_io.embed_placement, || {
@@ -1388,221 +1225,26 @@ impl Opened {
             head = model.head.name(), head_mib = mib(single.head_bf16 + single.head_fp8),
             elapsed_ms = started.elapsed().as_millis() as u64,
             "GLM 5.3 Flash coordinator weights resident (one copy each)");
-        // All-row prefill logits (`--full-prefill-logits`) admit as a GPU budget does: experts before the
-        // pool, and a fixed pool checked against the exact workspaces. Only a GPU budget also widens the
-        // eager admission below.
-        let gpu_budget = cuteafd_ffi::coordinator_gpu_budget().is_some();
-        let budgeted = args.full_prefill_logits || gpu_budget;
-        // With a ceiling, establish local expert ownership before KV spends
-        // the remaining budget. Lazy EXL3 owners reserve their loader peak.
-        let mut future_expert_bytes = 0;
-        let mut admitted_experts = if budgeted {
-            ensure!(args.expert_window.is_none(),
-                "coordinator GPU budget admission requires resident experts, not diagnostic --expert-window paging");
-            let experts = self.experts(args)?;
-            if let Some(engine::Experts::LocalExl3(local)) = &experts {
-                ensure!(local.window >= layers,
-                    "coordinator GPU budget admission requires all EXL3 layers resident; increase --exl3-window or use Sparks");
-                let plan = crate::families::deepseek_v4::local::plan(&self.library, &local.native_lib,
-                    local.catalog, 0, layers, local.max_rows, local.budget)?;
-                let expected = layers.saturating_sub(local.catalog.routed_experts().first_layer);
-                ensure!(plan.layers == expected, "coordinator GPU budget cannot fit the requested EXL3 expert window");
-                future_expert_bytes = plan.peak_bytes as u64;
-            }
-            Some(experts)
-        } else { None };
         let moe = (0..layers).any(|l| !self.cfg.dense[l]);
-        // Pool marks keep `GLMF_POOL_MARK_RESERVED_UNITS` units beside the admitted pool, never
-        // handed out (see `prefix`): the admission reserves their bytes like any fixed cost and the
-        // engine allocates them past the pool's tokens, so the pool admitted is the pool usable.
         let reserved_units = if args.prefix_marks == prefix::PrefixMarks::Pool {
             cuteafd_loader::serving_capacity::GLMF_POOL_MARK_RESERVED_UNITS } else { 0 };
-        let reserved_bytes = if reserved_units == 0 { 0 } else {
-            let geometry = cuteafd_loader::serving_capacity::glm_flash_rank_cache_geometry(&self.cfg, layers, 1,
-                index_cache.into(), args.kda_state.bytes() as u64)?;
-            let rank = geometry.ranks.first().context("GLM 5.3 Flash cache geometry without a rank")?;
-            reserved_units * (rank.persistent_unit_bytes + rank.pool_metadata_unit_bytes)
-        };
-        // Startup decode graphs (`CUTEAFD_GLMF_STARTUP_GRAPHS`, the default): every graph a serving
-        // loop launches is captured before readiness, so the pool leaves their reserve free (per rank).
-        // A graph budget (`--graph-budget-mib`) asks for lazily captured graphs within it instead.
-        let startup_graphs = args.startup_graphs();
-        if engine::startup_graphs_enabled() && !startup_graphs {
-            tracing::info!(graph_budget_mib = ?args.graph_budget_mib,
-                "GLM Flash decode graphs captured lazily within the graph budget, not at startup");
-        }
-        let initial_pool = if args.pool_tokens == 0 {
-            cuteafd_core::serving_capacity::DEFAULT_GPU_KV_TOKENS as usize
-        } else { args.pool_tokens };
-        let buckets = engine::DecodeBuckets::new(engine::verify_budget(args.decode_rows, self.library.sm_count()?));
-        let graph_reserve_at = |pool: usize| {
-            let (sequences, speculation) = args.serving_graph_policy.unwrap_or((16, true));
-            let context = cuteafd_loader::serving_capacity::glmf_graphs::admitted_graph_context(
-                args.max_context, pool, automatic_context);
-            startup_graphs.then(|| engine::serving_graph_reserve(context, pool, self.cfg.dense_context(),
-                sequences, speculation, layers, peer_stream.is_some(), &buckets))
-        };
-        // Eager admission (an automatic or budgeted pool on one GPU, its experts on Sparks or
-        // admitted under the budget): the drafter, the Spark transports and intake, the dense
-        // package, the token selector and every step workspace exist before the pool is sized, so
-        // the pool takes the free memory they leave, less the headroom, the graph reserve and the
-        // cache state still to come; the MLA pools are allocated last (`GlmfEngine::new`). With
-        // all-row prefill logits the lanes' temporaries already hold them.
-        let admission = kv_admission(args, gpu_budget, peer_stream.is_some());
-        let eager = admission == KvAdmission::Measured;
-        ensure!(eager || args.replay_records == engine::ReplayRecords::Own, "--replay-records shared needs the step \
-            workspaces before the KV pool: one GPU whose pool is sized from measured memory (an automatic pool with \
-            Spark experts, or a coordinator GPU budget)");
-        let mut early = None;
-        let mut records = None;
-        // Admit the package before KV sizing; measured free memory then excludes its buffers (the
-        // eager admission loads it with the rest of start-up).
-        let mut scoring_dense = if args.full_prefill_logits && !eager { self.load_dense(args, &model.layers)? }
-            else { None };
-        let (pool_tokens, startup_graphs) = if eager {
-            let experts = if moe {
-                match admitted_experts.take() { Some(experts) => experts, None => self.experts(args)? }
-            } else { None };
-            let drafter = self.load_drafter(args, stream, &embedding)?;
-            if let Some(drafter) = &drafter {
-                drafter.prepare_workspace()?;
-            }
-            let dense = self.load_dense(args, &model.layers)?;
-            let mut selector = crate::shared::token_io::TokenSelector::new(&self.library, args.token_io.token_select,
-                self.cfg.vocab_size, args.decode_rows)?;
-            selector.reserve_sampler()?;
-            let lanes = if engine::prefill_pipelines(layers, self.cfg.layers, experts.as_ref(), args.prefill_lanes) {
-                args.prefill_lanes
-            } else { 1 };
-            let workspaces = engine::StepWorkspaces::allocate(&engine::StepPlan::new(&self.library, &programs, &self.cfg,
-                &model.layers, experts.as_ref(), step_settings(args, index_cache)), args.prefill_rows, lanes)?;
-            // The caches this engine builds: records per token, the sequences' state and marks, and
-            // the speculative records follow the index cache, and a BF16 KDA state halves the state
-            // per sequence and each mark the arena holds. The replay records and commit tables hold the
-            // decode rows (`later` charges them: they are allocated with the pool).
-            let geometry = cuteafd_loader::serving_capacity::glm_flash_rank_cache_geometry_rows(&self.cfg, layers, 1,
-                index_cache.into(), args.kda_state.bytes() as u64, args.decode_rows as u64)?;
-            let rank = geometry.ranks.first().context("GLM 5.3 Flash cache geometry without a rank")?;
-            let unit = geometry.logical_unit_rows.max(1);
-            // Shared replay records (of the decode rows) sit in the prefill scratch the workspaces already
-            // hold.
-            let shared_records = if args.replay_records == engine::ReplayRecords::Shared {
-                cuteafd_loader::serving_capacity::glm_flash_kda_replay_bytes_rows(&self.cfg, layers, 1,
-                    args.decode_rows as u64)?
-            } else { 0 };
-            let state = rank.fixed_state_bytes + rank.active_state_per_sequence_bytes * args.slots as u64
-                + rank.speculative_replay_bytes - shared_records;
-            // The prefix mark arena the caller allocates once the engine exists.
-            let marks = mark_slots as u64 * rank.retained_mark_bytes;
-            tracing::info!(device = args.device, state_bytes = state, mark_slots,
-                mark_bytes = marks, "KV admission reserves recurrent state, replay records and prefix marks");
-            // Graphs: the startup set's reserve, or the lazy graphs' budget (else the planner's allowance),
-            // which they keep too when the startup set leaves no room for a pool (`measured_admission`).
-            // The measured code still to load before ready (`placement::inventory::LOADED_CODE`; the
-            // workspaces' untracked runtime memory is part of it).
-            let code = crate::shared::inventory::pending_code(&self.library, args.device, 0, false, "glmf", "*")?;
-            let (headroom, later) = (args.headroom_bytes()?, state + marks + future_expert_bytes + reserved_bytes + code);
-            let admitted = cuteafd_loader::serving_capacity::glmf_graphs::solve_graph_pool(initial_pool, |pool| {
-                let startup = graph_reserve_at(pool).and_then(|reserve| reserve.first().copied());
-                measured_admission(args, startup, |graphs| {
-                let reserve = crate::shared::memory_report::MeasuredReserve { headroom, graphs, later };
-                crate::shared::memory_report::measured_pool_tokens(&self.library, args.device,
-                    (rank.persistent_unit_bytes + rank.pool_metadata_unit_bytes).div_ceil(unit), unit, reserve,
-                    (args.pool_tokens > 0).then_some(args.pool_tokens as u64))
-                })
-            })?;
-            records = if shared_records > 0 {
-                tracing::info!(records_bytes = shared_records, later_bytes = later,
-                    "GLM 5.3 Flash KDA replay records in the prefill lanes' scratch");
-                Some(workspaces.prefill_scratch().context("shared replay records need the prefill lanes")?)
-            } else { None };
-            early = Some((experts, drafter, dense, selector, workspaces));
-            admitted
-        } else if admission == KvAdmission::Planned {
-            // 0: automatic; fixed pools (budgeted, served, or beside decode graphs) retain their
-            // requested size and refuse before allocation if the future storage would not fit.
-            let precise_split = args.kda_fp32_partials || args.kda_output_shard;
-            let devices: Vec<i32> = if precise_split {
-                vec![args.device, args.split_device.context("precise head split")?]
-            } else {
-                std::iter::once(args.device)
-                    .chain(peer_stream.map(|(d, _)| d)).collect()
-            };
-            // The step workspaces this engine makes before readiness (`workspace_reserve`, per rank: the
-            // decode workspace, the prefill lanes over their shared temporaries, and the measured runtime
-            // allowance per workspace), past the planner's workspace allowance; with all-row prefill
-            // logits, their exact union replaces the allowance.
-            let spark = args.peers.is_some();
-            let plan = engine::StepPlan::new(&self.library, &programs, &self.cfg, &model.layers, None,
-                step_settings(args, index_cache)).with_experts(!args.skip_experts && self.fp8().is_some(), spark);
-            let lanes = engine::configured_prefill_lanes(spark, layers == self.cfg.layers, args.prefill_lanes);
-            // Each rank's exact workspaces plus the measured code still to load before ready
-            // (`placement::inventory::LOADED_CODE`, which holds the workspaces' untracked runtime
-            // memory); without a measured entry, the per-workspace runtime allowance.
-            let split = devices.len() == 2;
-            let workspace_reserve = match cuteafd_loader::placement::loaded_code("glmf", "*", split, 0) {
-                Some(_) => devices.iter().enumerate().map(|(rank, &device)| Ok(
-                    plan.workspace_bytes(rank, args.prefill_rows, lanes)?
-                        + crate::shared::inventory::pending_code(&self.library, device, rank, split, "glmf", "*")?))
-                    .collect::<Result<Vec<_>>>()?,
-                None => engine::workspace_reserve(&plan, args.prefill_rows, lanes, peer_stream.is_some(),
-                    args.draft.is_some())?,
-            };
-            let costs = cuteafd_loader::plan::layout::family_costs("glm5_flash");
-            tracing::info!(lanes, workspace_reserve_bytes = ?workspace_reserve,
-                "GLM Flash exact workspace union before KV admission");
-            let allowance = costs.graph_bytes[0];
-            let lazy_extra = planned_graph_extra(args, None, allowance);
-            let draft_bytes = args.draft.as_ref().map(|path| -> Result<u64> {
-                let config = serde_json::from_slice(&std::fs::read(path.join("config.json"))?)?;
-                let draft_slots = args.draft_context_slots.unwrap_or(20.max(args.draft_sequences));
-                let (resident, scratch) = cuteafd_loader::families::glm5::draft_representation::draft_resident_bytes_with_mode(
-                    &config, draft_slots, args.draft_sequences.min(draft_slots), self.library.sm_count()? as u64,
-                    cuteafd_loader::families::glm5::draft_representation::GlmDraftRepresentation::from_fp8_option(args.draft_fp8),
-                    args.draft_linear.code() as u8)?;
-                Ok(resident + scratch)
-            }).transpose()?.unwrap_or(0);
-            let exchange = cuteafd_loader::serving_capacity::glmf_graphs::peer_exchange_bytes(
-                lanes as u64, args.prefill_rows as u64, self.cfg.hidden as u64,
-                if args.kda_fp32_partials { 4 } else { 2 }, args.kda_output_shard);
-            // Every GPU keeps the prefix mark arena the caller allocates (its part of `mark_slots`
-            // marks, whatever the KDA state) and the speculative replay records free, as the runtime
-            // allocates them.
-            // The token selector and GPU sampler of `--decode-rows 128` beyond the 64-row ones the
-            // runtime allowance holds: the serving loop makes them after the pool, on the lead GPU.
-            let selector = wide_selector_bytes(args.decode_rows, self.cfg.vocab_size);
-            // The Spark intake planes of experts sized for decode steps wider than a prefill lane
-            // (`--prefill-rows 64 --decode-rows 128`), past the lane's rows, also on the lead GPU.
-            let intake = match args.peers.as_deref() {
-                Some(peers) if moe && !args.skip_experts => wide_intake_bytes(args, peers.split(',').count(),
-                    self.cfg.hidden),
-                _ => 0,
-            };
-            cuteafd_loader::serving_capacity::glmf_graphs::solve_graph_pool(initial_pool, |pool| {
-                let startup_reserve = graph_reserve_at(pool);
-                let startup = startup_reserve.as_deref().map(|reserve| engine::StartupGraphReserve {
-                    reserve: reserve.iter().copied().max().unwrap_or(0), allowance });
-                engine::admit_beside_decode_graphs(startup, |graphs| {
-                // The startup set's bytes above the allowance (none when captured lazily), or the budget's.
-                let graph_extra = graphs.map_or(0, |bytes| bytes.saturating_sub(allowance)).max(lazy_extra);
-                let reserves: Vec<_> = workspace_reserve.iter().enumerate().map(|(rank, &workspace)|
-                    crate::shared::memory_report::RankReserve {
-                        extra_bytes: reserved_bytes + graph_extra
-                            + if rank == 0 { selector + intake } else { 0 },
-                        workspace_bytes: Some(workspace),
-                        transport_bytes: Some(if peer_stream.is_some() { exchange } else { 0 }),
-                        draft_bytes: Some(if rank == 0 { draft_bytes } else { 0 }),
-                    }).collect();
-                crate::shared::memory_report::planned_pool_tokens_with_reserves(&self.library, &args.snapshot, &devices,
-                    args.draft.as_deref(), args.prefill_rows, args.slots, mark_slots as u64,
-                    (args.pool_tokens > 0).then_some(args.pool_tokens as u64), future_expert_bytes, &reserves,
-                    index_cache.into(), args.kda_state.bytes() as u64, args.decode_rows as u64)
-                })
-            })?
-        } else {
-            (args.pool_tokens, startup_graphs)
-        };
+        let pool_tokens = usize::try_from(placement.pool_tokens)?;
+        let startup_graphs = admitted_graphs.lifetime == cuteafd_loader::placement::Lifetime::Startup;
         let max_context = crate::shared::context::pool_context("glm5_flash", args.max_context, automatic_context, pool_tokens, 256)?;
+        let early_workspaces = if args.replay_records == engine::ReplayRecords::Shared {
+            let mut settings = step_settings(args, index_cache);
+            settings.max_context = max_context;
+            let spark = !args.skip_experts && placement.layers.iter().any(|l|
+                l.experts == cuteafd_loader::placement::ExpertHome::Spark);
+            let local = !args.skip_experts && !placement.expert_ranges.is_empty() && self.fp8().is_some();
+            let tp2 = !args.skip_experts && placement.tp2.is_some();
+            let plan = engine::StepPlan::new(&self.library, &programs, &self.cfg, &model.layers, None, settings)
+                .with_experts(local, spark, tp2);
+            let lanes = engine::configured_prefill_lanes(spark, layers == self.cfg.layers, args.prefill_lanes);
+            Some(engine::StepWorkspaces::allocate(&plan, args.prefill_rows, lanes)?)
+        } else { None };
+        let records = early_workspaces.as_ref().map(|w| w.prefill_scratch()
+            .context("shared replay records need prefill lanes")).transpose()?;
         let pages = (pool_tokens + reserved_units as usize * engine::UNIT_ROWS).div_ceil(engine::PAGE_ROWS);
         let mut engine = engine::GlmfEngine::new(&self.library, &programs, self.cfg.clone(), model, stream,
             max_context, args.prefill_rows, args.prefill_lanes, pages, args.slots, embedding, index_cache,
@@ -1627,42 +1269,69 @@ impl Opened {
         engine.fp8_prefill = engine::Fp8Prefill { mla: group(Fp8PrefillGroup::Mla), ffn: group(Fp8PrefillGroup::Ffn),
             kda_bits: i32::from(kda && group(Fp8PrefillGroup::KdaIn))
                 | (i32::from(kda && group(Fp8PrefillGroup::KdaO)) << 1) };
-        match early {
-            Some((experts, drafter, dense, selector, workspaces)) => {
-                engine.drafter = drafter;
-                if let Some(dense) = dense {
-                    engine.set_dense_nvfp4(dense);
+        let tp2_range = if args.skip_experts { None } else { admitted_tp2_range(&placement)? };
+        if let Some(range) = tp2_range {
+            ensure!(startup_graphs, "GLM Flash TP2 experts require startup graphs; remove --graph-budget-mib and \
+                set CUTEAFD_GLMF_STARTUP_GRAPHS=1 (post-ready captures are not admitted)");
+            let peer = peer_stream.context("TP2 placement without peer device")?;
+            let catalog = self.experts.as_ref().context("TP2 expert catalog")?;
+            let devices = [crate::shared::memory::device::Device { library: &self.library, id: args.device },
+                crate::shared::memory::device::Device { library: &self.library, id: peer.0 }];
+            let budgets = placement.tp2.context("TP2 arena admission")?.peak_bytes.map(usize::try_from);
+            let budgets = [budgets[0].clone()?, budgets[1].clone()?];
+            use crate::shared::experts::rtx::{exl3::Exl3Tp2, fp8moe::Fp8MoeTp2, RtxExpertLayer};
+            let ranks: [Box<dyn RtxExpertLayer + '_>; 2] = if let Some(manifest) = catalog.exl3() {
+                let package = crate::shared::experts::exl3::aot_layout_directory(&args.native_lib,
+                    manifest.decoder_tiers(), "rtx-tp2");
+                Exl3Tp2::load_pair(devices, catalog, &package, range, args.expert_rows(), budgets)?
+                    .map(|r| Box::new(r) as Box<dyn RtxExpertLayer>)
+            } else {
+                let tensors = catalog.fp8().context("FP8 TP2 tensors")?;
+                let package = args.fp8_package.clone().unwrap_or_else(||
+                    crate::shared::experts::fp8::package_directory(&args.native_lib, 2, tensors.format()));
+                Fp8MoeTp2::load_pair(devices, tensors, &package, range, args.expert_rows(), budgets)?
+                    .map(|r| Box::new(r) as Box<dyn RtxExpertLayer>)
+            };
+            engine.install_tp2(ranks)?;
+        }
+        // Spark links remain available for every layer whose admitted home is Spark.
+        let spark = placement.layers.iter().any(|l| l.experts == cuteafd_loader::placement::ExpertHome::Spark);
+        if moe {
+            if let Some(range) = placement.expert_ranges.first().filter(|r| r.layers > 0) {
+                let budget = usize::try_from(range.peak_bytes)?;
+                let range = range.first..range.first + range.layers;
+                let mut expert_args = args.clone();
+                expert_args.local_experts = true;
+                expert_args.peers = None;
+                if let Some(experts) = self.experts_range(&expert_args, Some(range.clone()), Some(budget))? {
+                    if let engine::Experts::LocalExl3(local) = &experts { local.ensure(range.start, stream)?; }
+                    engine.install_local(range, experts);
                 }
-                if let Some(experts) = experts {
-                    engine.set_experts(experts);
-                }
-                engine.install_workspaces(workspaces)?;
-                engine.set_selector(selector);
             }
-            None => {
-                engine.drafter = self.load_drafter(args, stream, &engine.embedding)?;
-                let dense = match scoring_dense.take() {
-                    Some(dense) => Some(dense),
-                    None => self.load_dense(args, &engine.weights.layers)?,
-                };
-                if let Some(dense) = dense {
-                    engine.set_dense_nvfp4(dense);
-                }
-                if moe {
-                    if let Some(experts) = match admitted_experts { Some(experts) => experts, None => self.experts(args)? } {
-                        engine.set_experts(experts);
-                    }
-                }
+            if spark || args.skip_experts {
+                let mut expert_args = args.clone();
+                expert_args.local_experts = false;
+                if let Some(experts) = self.experts(&expert_args)? { engine.set_experts(experts); }
             }
         }
+        engine.drafter = self.load_drafter(args, stream, &engine.embedding)?;
+        if let Some(dense) = self.load_dense(args, &engine.weights.layers)? { engine.set_dense_nvfp4(dense); }
         if let Some(budget) = args.l2.budget(&self.library, crate::shared::l2_prefetch::GLM_DEFAULT)? {
             engine.l2 = Some(crate::shared::l2_prefetch::L2Prefetch::new(&self.library, budget, &engine.decode_read_order())?);
             if engine.ranks() > 1 {
                 engine.attach_peer_l2(budget)?;
             }
         }
+        if let Some(workspaces) = early_workspaces { engine.install_workspaces(workspaces)?; }
         if args.serving_graph_policy.is_some() { engine.prepare_serving_workspaces()?; }
         if args.full_prefill_logits { engine.prepare_scoring_prefill()?; }
+        engine.prime_tp2()?;
+        if engine.has_tp2() {
+            let (sequences, speculation) = args.serving_graph_policy.unwrap_or((16, engine.drafter.is_some()));
+            engine.warm_decode_graphs(sequences.min(args.decode_rows), speculation)?;
+            engine.check_admitted_graphs(&admitted_graphs)?;
+            engine.check_tp2_routes()?;
+        }
         let result = body(&engine);
         drop(engine);
         // SAFETY: the engine that used the streams is gone.
@@ -1705,20 +1374,25 @@ impl Opened {
     }
 
     fn experts<'s>(&'s self, args: &EngineArgs) -> Result<Option<engine::Experts<'s>>> {
+        self.experts_range(args, None, None)
+    }
+
+    fn experts_range<'s>(&'s self, args: &EngineArgs, range: Option<std::ops::Range<usize>>, budget: Option<usize>) -> Result<Option<engine::Experts<'s>>> {
         if args.skip_experts {
             return Ok(Some(engine::Experts::Skip));
         }
-        if let Some(tensors) = self.fp8() {
+        if let Some(tensors) = self.fp8().filter(|_| args.local_experts) {
             let directory = args.fp8_package.clone()
                 .unwrap_or_else(|| crate::shared::experts::fp8::package_directory(&args.native_lib, 1, tensors.format()));
-            let (free, _) = self.library.cuda_memory_info()?;
+            let budget = match budget { Some(bytes) => bytes, None => self.library.cuda_memory_info()?.0
+                .saturating_sub(args.expert_reserve_gib.saturating_mul(1 << 30)) };
             ensure!(args.expert_window != Some(0), "--expert-window must be at least 1");
             let layers = args.layers.unwrap_or(self.cfg.layers).min(self.cfg.layers);
             let first = (0..layers).find(|&layer| !self.cfg.dense[layer]).unwrap_or(layers);
-            let resident = if args.expert_window.is_some() { 0..0 } else { first..layers };
+            let resident = range.clone().unwrap_or_else(|| if args.expert_window.is_some() { 0..0 } else { first..layers });
             let started = Instant::now();
             let experts = crate::shared::experts::fp8::Fp8Experts::load(&self.library, tensors, &directory, resident, 1, 0,
-                args.expert_rows(), free.saturating_sub(args.expert_reserve_gib.saturating_mul(1 << 30)))
+                args.expert_rows(), budget)
                 .context("local routed experts must fit with step and prefix-cache reservations; use --peers for Sparks, \
                     or --expert-window N for diagnostic paging")?;
             let loads = experts.layers.len();
@@ -1729,14 +1403,15 @@ impl Opened {
                 window: args.expert_window, loads: std::cell::RefCell::new(loads),
             })));
         }
-        if let Some(catalog) = self.experts.as_ref().filter(|c| c.exl3().is_some()) {
-            let (free, _) = self.library.cuda_memory_info()?;
+        if let Some(catalog) = self.experts.as_ref().filter(|c| args.local_experts && c.exl3().is_some()) {
+            let budget = match budget { Some(bytes) => bytes,
+                None => self.library.cuda_memory_info()?.0.saturating_sub(12 << 30) };
             return Ok(Some(engine::Experts::LocalExl3(engine::LocalExl3 {
                 library: &self.library, native_lib: args.native_lib.clone(), catalog,
-                resident: std::cell::RefCell::new(None), window: args.exl3_window.max(1),
-                layers: args.layers.unwrap_or(self.cfg.layers).min(self.cfg.layers), max_rows: args.expert_rows(),
+                resident: std::cell::RefCell::new(None), window: range.as_ref().map_or(args.exl3_window.max(1), |r| r.len()),
+                layers: range.as_ref().map_or(args.layers.unwrap_or(self.cfg.layers).min(self.cfg.layers), |r| r.end), max_rows: args.expert_rows(),
                 // Room for the step workspace (logits alone are 2.4 GiB at 4096 rows).
-                budget: free.saturating_sub(12 << 30), loads: std::cell::RefCell::new(0),
+                budget, loads: std::cell::RefCell::new(0),
             })));
         }
         let Some(peers) = args.peers.as_deref() else { return Ok(None) };
