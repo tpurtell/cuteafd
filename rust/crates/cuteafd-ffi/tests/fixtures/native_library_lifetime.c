@@ -133,6 +133,12 @@ int cuteafd_fp8_w8a16_pack(const void *source, void *packed, void *scale,
     return pack_status;
 }
 
+int cuteafd_cuda_stream_query(void *stream, int *ready) {
+    (void)stream;
+    *ready = 0;
+    return 0;
+}
+
 int cuteafd_cuda_stream_synchronize(void *stream) {
     (void)stream;
     event('S');
