@@ -1,0 +1,31 @@
+{
+ "model": "wrldsuksgo2mars/DeepSeek-V4-Pro-0813-EXL3-K2-calibrated-v1",
+ "rtx": 2,
+ "sparks": 6,
+ "context": 1048576,
+ "onboard": null,
+ "manifest": "~/.cache/cuteafd/builds/v3-p4/c1/artifacts/PROGRAMS.json",
+ "driver": "13.2",
+ "source_revision": "b367a34f4facae3d755df8f334db913c73635c11",
+ "source": "C6 2026-10-11 tagged-ready TP2 launch; raw admission_free_bytes includes interim code reservation. Replay removes reserved_code_bytes and applies current LoadedCode::pending to untracked_at_admission_bytes; the observed placement remains unchanged.",
+ "gpus": [
+  {
+   "total_bytes": 101973491712,
+   "admission_free_bytes": 80413837328,
+   "context_bytes": 590610432,
+   "module_bytes": 2097152,
+   "reserved_code_bytes": 561657840,
+   "untracked_at_admission_bytes": 1069256704
+  },
+  {
+   "total_bytes": 101970345984,
+   "admission_free_bytes": 85878167708,
+   "context_bytes": 598999040,
+   "module_bytes": 2097152,
+   "reserved_code_bytes": 399976292,
+   "untracked_at_admission_bytes": 1055356832
+  }
+ ],
+ "pool_tokens": 2097152,
+ "onboard_layers": 10
+}

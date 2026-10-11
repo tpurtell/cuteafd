@@ -599,7 +599,11 @@ impl<'a> Engine<'a> {
             swa_lengths: ints(rows)?,
             c4: metadata(4)?,
             c128: metadata(128)?,
-            c4_page_table: ints(rows.max(1) * self.shape.units)?,
+            c4_page_table: {
+                // Pool-following tables are KV records, matching placement::solve.
+                let _memory_scope = cuteafd_ffi::memory_ledger::scope("kv/records");
+                ints(rows.max(1) * self.shape.units)?
+            },
             c4_visible: ints(rows)?,
             c4_indexed_lengths: ints(rows)?,
             c128_indices: ints(rows * self.c128_width)?,

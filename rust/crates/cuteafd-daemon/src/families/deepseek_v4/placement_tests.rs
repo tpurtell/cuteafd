@@ -329,6 +329,40 @@ struct Fixture {
 struct FixtureGpu {
     total_bytes: u64,
     admission_free_bytes: u64,
+    /// Preserve the raw launch sample when its code table predates the ready measurement.
+    #[serde(default)]
+    reserved_code_bytes: Option<u64>,
+    #[serde(default)]
+    untracked_at_admission_bytes: Option<u64>,
+}
+
+impl FixtureGpu {
+    fn free_with_current_code(&self, code: u64) -> u64 {
+        match (self.reserved_code_bytes, self.untracked_at_admission_bytes) {
+            (Some(reserved), Some(untracked)) => {
+                let loaded = cuteafd_loader::placement::inventory::LoadedCode {
+                    family: "dsv4", experts: "*", split: true, rank: 0,
+                    bytes: code, source: "fixture replay",
+                };
+                let context = cuteafd_loader::placement::inventory::ArchContext::for_device(
+                    "sm_120", self.total_bytes).context_bytes;
+                self.admission_free_bytes.checked_add(reserved).unwrap()
+                    .checked_sub(loaded.pending(untracked, context)).unwrap()
+            }
+            (None, None) => self.admission_free_bytes,
+            _ => panic!("fixture must record both pending-code inputs"),
+        }
+    }
+}
+
+#[test]
+fn measured_fixture_replays_pending_code_without_changing_raw_sample() {
+    let gpu = FixtureGpu { total_bytes: 101_973_491_712, admission_free_bytes: 93_570_006_176,
+        reserved_code_bytes: Some(967_770_976), untracked_at_admission_bytes: Some(598_715_904) };
+    assert_eq!(gpu.free_with_current_code(980_070_752), gpu.admission_free_bytes);
+    assert_eq!(gpu.free_with_current_code(1_007_333_728), gpu.admission_free_bytes - 27_262_976);
+    assert_eq!(gpu.free_with_current_code(0), gpu.admission_free_bytes + 967_770_976);
+    assert_eq!(gpu.admission_free_bytes, 93_570_006_176);
 }
 
 const MIB: u64 = 1 << 20;
@@ -358,16 +392,21 @@ fn planner_equals_runtime_deepseek_v4_measured() {
         assert!(fixture.gpus.iter().all(|g| g.total_bytes.abs_diff(budget) < 8 * MIB), "{label}: unequal GPUs");
         let onboard = fixture.onboard.as_deref().map(|o| o.parse::<Onboard>().unwrap());
         let case = Case { snapshot: &snapshot, manifest: &manifest, rtx: fixture.rtx, sparks: fixture.sparks,
-            context: fixture.context, budget, onboard, dspark: true, exchange_f32: false, peer_budget: None };
+            context: fixture.context, budget, onboard, dspark: true, exchange_f32: false,
+            peer_budget: fixture.gpus.get(1).map(|g| g.total_bytes) };
         let (layout, supported, hints) = planned(&case);
         assert!(supported, "{label}: planner refused: {:?} {:?}", layout.notes, hints);
-        // The planner's view of the sample: everything loaded before admission.
+        let catalog = cuteafd_loader::read_expert_catalog(&snapshot).unwrap();
+        let cfg = cuteafd_loader::families::deepseek_v4::DeepseekV4Config::read(&snapshot, 1).unwrap();
+        let code = cuteafd_loader::placement::families::deepseek_v4::code_bytes(
+            cfg.dim, cuteafd_loader::placement::families::deepseek_v4::code_experts(&catalog), fixture.rtx);
+        // Replay pending-code reservation, retaining the raw launch sample.
         for (gpu, measured) in fixture.gpus.iter().enumerate() {
             let device = &layout.devices[gpu];
             let planned_loaded: u64 = device.items.iter().filter(|i| matches!(i.category,
                 Category::Weights | Category::Embedding | Category::Drafter) || i.group == "context+modules")
                 .map(|i| i.bytes).sum();
-            let measured_loaded = measured.total_bytes - measured.admission_free_bytes;
+            let measured_loaded = measured.total_bytes - measured.free_with_current_code(code[gpu]);
             let diff = planned_loaded as i64 - measured_loaded as i64;
             eprintln!("{label} rtx{gpu}: planned loaded {planned_loaded} measured {measured_loaded} diff {diff} \
                 (driver {})", fixture.driver);
@@ -439,8 +478,10 @@ fn runtime_measured(case: &Case<'_>, fixture: &Fixture) -> anyhow::Result<Placem
     let cli = Cli::try_parse_from(argv)?;
     let stages = (0..).take_while(|stage| catalog.tensors().iter()
         .any(|t| t.metadata.name.starts_with(&format!("mtp.{stage}.")))).count();
-    let gpus = fixture.gpus.iter().map(|g| (g.total_bytes, Baseline::Measured { free_bytes: g.admission_free_bytes }))
-        .collect();
+    let code = cuteafd_loader::placement::families::deepseek_v4::code_bytes(
+        cfg.dim, cuteafd_loader::placement::families::deepseek_v4::code_experts(&catalog), fixture.rtx);
+    let gpus = fixture.gpus.iter().enumerate().map(|(gpu, g)| (g.total_bytes,
+        Baseline::Measured { free_bytes: g.free_with_current_code(code[gpu]) })).collect();
     let expert_workspace = layout_expert_workspace(case, &catalog)?;
     let inputs = admission::Inputs { cfg: &cfg, catalog: &catalog, manifest: &manifest, family, gpus,
         cache_stages: stages, prefill_rows: manifest["capacities"]["prefill_rows"].as_u64().unwrap() as usize,

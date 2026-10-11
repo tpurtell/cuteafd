@@ -108,7 +108,7 @@ impl ArchContext {
 /// after ready: never in this number, always charged as "graph growth".
 /// Measured per serving configuration (v3-p2 cards, RTX PRO 6000 SM120,
 /// driver 595.91.07, CUDA 13.2, 2026-10-10). The two-RTX `dsv4` entries are
-/// TP2 expert halves (P4); interim first-post-ready values await tagged ready measurement.
+/// TP2 expert halves (P4), measured at tagged ready on 2026-10-11.
 ///
 /// The planner charges `bytes` (with the context) as the GPU's runtime
 /// baseline. The runtime's admission sample already holds part of it (the
@@ -146,17 +146,16 @@ pub const LOADED_CODE: &[LoadedCode] = &[
     LoadedCode { family: "dsv4", experts: "*", split: false, rank: 0, bytes: 322_050_368,
         source: "v4-flash-sim5090 (0 RTX layers): untracked 908,466,496 - context 586,416,128; \
             v4-flash-min p0 (18 FP8 layers) 309,476,320" },
-    // Interim TP2 loaded code: first-post-ready sample less P2 early-request offsets.
-    LoadedCode { family: "dsv4", experts: "exl3", split: true, rank: 0, bytes: 1_044_498_416,
-        source: "v4-pro-exl3-max TP2 interim rtx0: 1,071,761,392 - 27,262,976 early-request offset (47a6d74b)" },
-    LoadedCode { family: "dsv4", experts: "exl3", split: true, rank: 1, bytes: 868_916_996,
-        source: "v4-pro-exl3-max TP2 interim rtx1: 898,277,124 - 29,360,128 early-request offset (47a6d74b)" },
+    LoadedCode { family: "dsv4", experts: "exl3", split: true, rank: 0, bytes: 1_059_185_592,
+        source: "v4-pro-exl3 TP2 tagged ready rtx0 (b367a34f, 2026-10-11): untracked 1,645,601,720 - context 586,416,128" },
+    LoadedCode { family: "dsv4", experts: "exl3", split: true, rank: 1, bytes: 885_694_212,
+        source: "v4-pro-exl3 TP2 tagged ready rtx1 (b367a34f, 2026-10-11): untracked 1,472,110,340 - context 586,416,128" },
     LoadedCode { family: "dsv4", experts: "exl3", split: false, rank: 0, bytes: 724_349_124,
         source: "v4-pro-exl3-min (1 RTX + 4 Sparks, 3 EXL3 layers): untracked 1,310,765,252 - context 586,416,128" },
-    LoadedCode { family: "dsv4", experts: "*", split: true, rank: 0, bytes: 980_070_752,
-        source: "v4-flash-max TP2 interim rtx0: 1,007,333,728 - 27,262,976 early-request offset (47a6d74b)" },
-    LoadedCode { family: "dsv4", experts: "*", split: true, rank: 1, bytes: 773_694_416,
-        source: "v4-flash-max TP2 interim rtx1: 803,054,544 - 29,360,128 early-request offset (47a6d74b)" },
+    LoadedCode { family: "dsv4", experts: "*", split: true, rank: 0, bytes: 1_007_333_728,
+        source: "v4-flash TP2 tagged ready rtx0 (b367a34f, 2026-10-11): untracked 1,593,749,856 - context 586,416,128" },
+    LoadedCode { family: "dsv4", experts: "*", split: true, rank: 1, bytes: 803_054_544,
+        source: "v4-flash TP2 tagged ready rtx1 (b367a34f, 2026-10-11): untracked 1,389,470,672 - context 586,416,128" },
     LoadedCode { family: "glmf", experts: "*", split: false, rank: 0, bytes: 436_389_024,
         source: "glm53f-exl3-min: untracked 2,968,962,208 - graphs 1,946,157,056 - context 586,416,128" },
     LoadedCode { family: "glmf", experts: "*", split: true, rank: 0, bytes: 500_143_488,
@@ -430,16 +429,29 @@ mod tests {
         assert_eq!(loaded_code("qwen4", "exl3", false, 0).unwrap().bytes, 780_221_844);
         // An unmeasured package falls back to the family's rank entry.
         assert!(loaded_code("qwen4", "none", false, 0).is_some());
-        assert_eq!(loaded_code("dsv4p2", "fp8", true, 1).unwrap().bytes, 773_694_416);
+        assert_eq!(loaded_code("dsv4p2", "fp8", true, 1).unwrap().bytes, 803_054_544);
         // An exact package row wins over the family's any-package row, wherever it sits in the table.
         assert_eq!(loaded_code("dsv4p", "exl3", false, 0).unwrap().bytes, 724_349_124);
         assert_eq!(loaded_code("dsv4f", "*", false, 0).unwrap().bytes, 322_050_368);
-        assert_eq!(loaded_code("dsv4p", "exl3", true, 1).unwrap().bytes, 868_916_996);
+        assert_eq!(loaded_code("dsv4p", "exl3", true, 1).unwrap().bytes, 885_694_212);
         assert_eq!(loaded_code("mimop", "none", true, 0).unwrap().bytes, 365_259_264);
         assert!(loaded_code("glm", "fp8", false, 0).is_none());
         let code = loaded_code("glmf", "exl3", false, 0).unwrap();
         assert_eq!(code.pending(586_416_128 + 100, 586_416_128), code.bytes - 100);
         assert_eq!(code.pending(586_416_128 + (1 << 40), 586_416_128), 0);
+    }
+
+    #[test]
+    fn v4_tp2_code_matches_tagged_ready_untracked_bytes() {
+        let context = ARCH_CONTEXTS[1].context_bytes;
+        for (experts, untracked) in [("*", [1_593_749_856, 1_389_470_672]),
+            ("exl3", [1_645_601_720, 1_472_110_340])] {
+            for (rank, bytes) in untracked.into_iter().enumerate() {
+                let code = loaded_code("dsv4", experts, true, rank as u8).unwrap();
+                assert_eq!(context + code.bytes, bytes);
+                assert!(code.source.contains("tagged ready"));
+            }
+        }
     }
 
     #[test]
