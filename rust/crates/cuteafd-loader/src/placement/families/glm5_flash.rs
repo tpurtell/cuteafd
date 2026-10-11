@@ -38,14 +38,38 @@ pub struct GlmfInputs<'a> {
     pub experts: Vec<ExpertCost>,
     pub expert_workspace: u64,
     pub tp2_workspace: [u64; 2],
-    /// Entire DFlash allocation, including package scratch; embedding stays host mapped.
+    /// SM-independent draft weights and owned activations; embedding stays host mapped.
     pub drafter_bytes: u64,
+    /// fp8_linear workspace on each candidate GPU, keyed by that GPU's physical SM count.
+    pub drafter_scratch: Vec<u64>,
     pub requested_pool: Option<u64>,
     pub onboard: Onboard,
     pub full_prefill_logits: u64,
 }
 
 pub fn default_onboard() -> Onboard { Onboard::Auto }
+
+/// Shared checkpoint-derived inventory; only package scratch depends on the chosen GPU.
+pub fn drafter_inventory(config: &serde_json::Value, slots: usize, sequences: usize,
+    sms: &[u64], representation: crate::families::glm5::draft_representation::GlmDraftRepresentation,
+    mode: u8) -> Result<(u64, Vec<u64>), crate::families::glm5::draft_representation::GlmDraftStorageError> {
+    use crate::families::glm5::draft_representation::{draft_resident_bytes_with_mode, GlmDraftStorageError};
+    if ![1, 2].contains(&sms.len()) {
+        return Err(GlmDraftStorageError::Unsupported("GLM Flash draft candidate inventory needs one or two GPUs"));
+    }
+    let mut owned = None;
+    let mut scratch = Vec::with_capacity(sms.len());
+    for &sms in sms {
+        let (bytes, workspace) = draft_resident_bytes_with_mode(config, slots, sequences, sms, representation, mode)?;
+        if owned.is_some_and(|previous| previous != bytes) {
+            return Err(GlmDraftStorageError::Unsupported("GLM Flash owned draft bytes depend on SM count"));
+        }
+        bytes.checked_add(workspace).ok_or(GlmDraftStorageError::Overflow)?;
+        owned = Some(bytes);
+        scratch.push(workspace);
+    }
+    Ok((owned.unwrap(), scratch))
+}
 
 /// Dormant GPU1 DFlash bridge inventory, not permission to move the drafter.
 /// `rows` is the drafter's full admitted batch (sequences * block), not a
@@ -88,6 +112,12 @@ pub fn request(i: &GlmfInputs<'_>) -> Result<PlacementRequest, PlacementError> {
         || i.resident.len() != ranks || i.workspace.len() != ranks || i.graphs.ranks.len() != ranks
         || i.pending_code.len() != ranks || ![2, 4].contains(&i.partial_bytes) {
         return Err(PlacementError::Inventory("GLM Flash rank/layer inventory"));
+    }
+    if i.drafter_scratch.len() != ranks || (i.drafter_bytes == 0 && i.drafter_scratch.iter().any(|&bytes| bytes != 0)) {
+        return Err(PlacementError::Inventory("GLM Flash draft scratch inventory"));
+    }
+    for &scratch in &i.drafter_scratch {
+        i.drafter_bytes.checked_add(scratch).ok_or(PlacementError::Overflow("GLM Flash draft inventory"))?;
     }
     if ranks == 2 && i.decode_rows != cache::GLMF_DECODE_ROWS {
         return Err(PlacementError::Inventory("GLM Flash head split needs 64 decode rows"));
@@ -170,7 +200,10 @@ pub fn request(i: &GlmfInputs<'_>) -> Result<PlacementRequest, PlacementError> {
             i.requested_pool, geometry.logical_unit_rows, i.spark_ranks == 0),
         layers, pool_overhead: geometry.ranks.iter().map(|g| g.pool_metadata_unit_bytes).collect(), fixed,
         movables: if i.drafter_bytes == 0 { vec![] } else { vec![Movable { id: MovableId::Drafter,
-            parts: vec![Bytes2 { resident: i.drafter_bytes, staging: 0 }], allowed: vec![0], expert_arena: false, conditional: vec![] }] },
+            parts: vec![Bytes2 { resident: i.drafter_bytes, staging: 0 }], allowed: vec![0], expert_arena: false,
+            conditional: i.drafter_scratch.iter().enumerate().filter(|(_, bytes)| **bytes > 0).map(|(rank, &bytes)|
+                MovableDemands { placement_gpu: rank as u8, demands: vec![Demand::new(rank as u8,
+                    Category::Workspace, "DFlash fp8-linear scratch", bytes, Basis::Formula)] }).collect() }] },
         expert_workspace: i.expert_workspace, tp2_workspace: i.tp2_workspace, onboard: i.onboard,
         expert_gpus: usize::from(ranks == 1 || i.experts.iter().all(|cost| cost.tp2)),
         policy: LayerPolicy { default: if ranks == 2 { vec![LayerMode::HeadSplit] } else {
@@ -320,7 +353,7 @@ mod tests {
                 whole: Bytes2 { resident: 2 << 30, staging: 0 },
                 half: [Bytes2 { resident: 1 << 30, staging: 0 }; 2], tp2: ranks == 2, spark_ok: true }).collect(),
             expert_workspace: 128 << 20, tp2_workspace: [128 << 20; 2], drafter_bytes: 3 << 30,
-            requested_pool: None, onboard: default_onboard(), full_prefill_logits: 0,
+            drafter_scratch: vec![0; ranks], requested_pool: None, onboard: default_onboard(), full_prefill_logits: 0,
         }
     }
 
@@ -368,6 +401,92 @@ mod tests {
                 assert!(!p.layers.iter().any(|l| matches!(l.experts, ExpertHome::RtxWhole { .. })));
             }
         }
+    }
+
+    fn draft_config() -> serde_json::Value {
+        serde_json::json!({"hidden_size":4096, "intermediate_size":12288, "num_hidden_layers":5,
+            "num_attention_heads":32, "num_key_value_heads":8, "head_dim":128, "vocab_size":154880,
+            "dflash_config":{"target_layer_ids":[0,8,16,24,32], "conv_group_size":16,
+                "selector_rank":256, "block_size":8}})
+    }
+
+    #[test]
+    fn draft_inventory_keeps_owned_bytes_independent_and_scratch_candidate_local() {
+        use crate::families::glm5::draft_representation::{draft_resident_bytes_with_mode, GlmDraftRepresentation};
+        for mode in 0..=2 {
+            for representation in [GlmDraftRepresentation::Fp8Only, GlmDraftRepresentation::Bf16Only] {
+                let (owned, scratch) = drafter_inventory(&draft_config(), 8, 8, &[188, 170], representation, mode).unwrap();
+                for (rank, sms) in [188, 170].into_iter().enumerate() {
+                    assert_eq!((owned, scratch[rank]), draft_resident_bytes_with_mode(&draft_config(), 8, 8,
+                        sms, representation, mode).unwrap());
+                }
+                if representation == GlmDraftRepresentation::Bf16Only { assert_eq!(scratch, [0, 0]); }
+                else { assert!(scratch[0] > scratch[1]); }
+            }
+        }
+        let (owned, scratch) = drafter_inventory(&draft_config(), 8, 8, &[188, 170], GlmDraftRepresentation::Fp8Only, 2).unwrap();
+        assert_eq!(owned, 1_835_700_096);
+        assert_eq!(scratch, [30_491_648, 28_394_496]);
+        let cfg = GlmNextConfig::from_hf(&crate::plan::testing::glm5_flash_config(2)).unwrap();
+        let mut input = inputs(&cfg, 2, inventory::PRO_TOTAL_BYTES);
+        input.drafter_bytes = owned;
+        input.drafter_scratch = scratch;
+        let req = request(&input).unwrap();
+        assert_eq!(req.movables[0].allowed, [0]);
+        assert_eq!(req.movables[0].conditional.iter().map(|c| (c.placement_gpu, c.demands[0].gpu,
+            c.demands[0].category, c.demands[0].bytes, c.demands[0].basis)).collect::<Vec<_>>(),
+            [(0, 0, Category::Workspace, 30_491_648, Basis::Formula),
+             (1, 1, Category::Workspace, 28_394_496, Basis::Formula)]);
+        let actual = solve(&req).unwrap();
+        assert_eq!(actual.movables, [(MovableId::Drafter, 0)]);
+        assert_eq!(actual.items[0].iter().filter(|d| d.category == Category::Drafter).map(|d| d.bytes).sum::<u64>(), owned);
+        assert_eq!(actual.items[0].iter().find(|d| d.group == "DFlash fp8-linear scratch").unwrap().bytes, 30_491_648);
+        assert!(actual.items[1].iter().all(|d| d.category != Category::Drafter && d.group != "DFlash fp8-linear scratch"));
+        // Splitting the ledger categories must not change the old GPU0 total or pool/layer decision.
+        input.drafter_bytes += input.drafter_scratch[0];
+        input.drafter_scratch.fill(0);
+        let lumped = solve(&request(&input).unwrap()).unwrap();
+        assert_eq!(actual.pool_tokens, lumped.pool_tokens);
+        assert_eq!(actual.layers, lumped.layers);
+        for rank in 0..2 {
+            assert_eq!(actual.items[rank].iter().map(|d| d.bytes).sum::<u64>(),
+                lumped.items[rank].iter().map(|d| d.bytes).sum::<u64>());
+        }
+    }
+
+    #[test]
+    fn draft_inventory_rejects_bad_devices_and_orphan_or_overflow_scratch() {
+        use crate::families::glm5::draft_representation::GlmDraftRepresentation;
+        for sms in [vec![], vec![188, 170, 188], vec![0], vec![4097], vec![188, 0]] {
+            assert!(drafter_inventory(&draft_config(), 8, 8, &sms, GlmDraftRepresentation::Fp8Only, 2).is_err());
+        }
+        let cfg = GlmNextConfig::from_hf(&crate::plan::testing::glm5_flash_config(2)).unwrap();
+        let mut input = inputs(&cfg, 2, inventory::PRO_TOTAL_BYTES);
+        input.drafter_scratch = vec![256];
+        assert!(matches!(request(&input), Err(PlacementError::Inventory("GLM Flash draft scratch inventory"))));
+        input.drafter_scratch = vec![256, 0];
+        input.drafter_bytes = 0;
+        assert!(matches!(request(&input), Err(PlacementError::Inventory("GLM Flash draft scratch inventory"))));
+        input.drafter_bytes = u64::MAX;
+        assert!(matches!(request(&input), Err(PlacementError::Overflow("GLM Flash draft inventory"))));
+    }
+
+    #[test]
+    fn draft_inventory_keeps_dspark_local_and_category_separated() {
+        use crate::families::glm5::draft_representation::GlmDraftRepresentation;
+        let config = serde_json::json!({"speculators_model_type":"dspark", "block_size":4, "markov_rank":256,
+            "aux_hidden_state_layer_ids":[0,8,16,24,32], "transformer_layer_config":{
+                "hidden_size":4096, "intermediate_size":12288, "num_hidden_layers":3, "num_attention_heads":32,
+                "num_key_value_heads":8, "head_dim":64, "vocab_size":154880}});
+        let (owned, scratch) = drafter_inventory(&config, 8, 8, &[188, 170], GlmDraftRepresentation::Fp8Only, 2).unwrap();
+        let cfg = GlmNextConfig::from_hf(&crate::plan::testing::glm5_flash_config(2)).unwrap();
+        let mut input = inputs(&cfg, 2, inventory::PRO_TOTAL_BYTES);
+        input.drafter_bytes = owned;
+        input.drafter_scratch = scratch;
+        let req = request(&input).unwrap();
+        assert_eq!(req.movables[0].allowed, [0]);
+        assert!(req.movables[0].conditional.iter().flat_map(|c| &c.demands).all(|d| d.category == Category::Workspace));
+        assert_eq!(solve(&req).unwrap().movables, [(MovableId::Drafter, 0)]);
     }
 
     #[test]

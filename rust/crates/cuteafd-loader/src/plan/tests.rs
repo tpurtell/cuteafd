@@ -1370,6 +1370,52 @@ fn glm5_flash_layout_keeps_the_graph_budget_as_the_admission_does() {
 }
 
 #[test]
+fn glm5_flash_layout_uses_physical_candidate_scratch_without_double_counting_override() {
+    use cuteafd_core::memory_layout::{Category, DeviceKind};
+    use crate::families::glm5::draft_representation::GlmDraftRepresentation;
+    let dir = snapshot(glm5_flash_config(2), &glm5_flash_tensors(&glm5_flash_config(2)));
+    let draft = tempfile::tempdir().unwrap();
+    let config = json!({"hidden_size":4096, "intermediate_size":12288, "num_hidden_layers":5,
+        "num_attention_heads":32, "num_key_value_heads":8, "head_dim":128, "vocab_size":154880,
+        "dflash_config":{"target_layer_ids":[0,8,16,24,32], "conv_group_size":16,
+            "selector_rank":256, "block_size":8}});
+    std::fs::write(draft.path().join("config.json"), config.to_string()).unwrap();
+    let mut options = layout::LayoutOptions { rtx_bytes: vec![32 << 30, 96 << 30], concurrency:8,
+        draft_sequences:8, draft_context_slots:Some(8), glmf_drafter_snapshot:Some(draft.path().into()),
+        context_tokens:131_072, ..Default::default() };
+    let run = |options: &layout::LayoutOptions| {
+        let report = plan(dir.path(), &PlanOptions { layout:Some(options.clone()), ..sparks(4) }).unwrap();
+        assert!(report.placement_supported, "{:?}", report.memory_layout.as_ref().unwrap().notes);
+        report.memory_layout.unwrap()
+    };
+    let bytes = |memory: &cuteafd_core::memory_layout::MemoryLayout, rank, category| memory.devices.iter()
+        .filter(|d| d.kind == DeviceKind::Rtx && d.index == rank).flat_map(|d| &d.items)
+        .filter(|i| i.category == category && (category == Category::Drafter || i.group == "DFlash fp8-linear scratch"))
+        .map(|i| i.bytes).sum::<u64>();
+    let (owned, scratch) = crate::placement::families::glm5_flash::drafter_inventory(&config,8,8,
+        &[170,188],GlmDraftRepresentation::Fp8Only,2).unwrap();
+    let natural = run(&options);
+    assert_eq!(bytes(&natural,0,Category::Drafter), owned);
+    assert_eq!(bytes(&natural,0,Category::Workspace), scratch[0]);
+    assert_eq!(bytes(&natural,1,Category::Workspace), 0);
+    options.physical_sms = Some(188);
+    let simulated = run(&options);
+    assert_eq!(bytes(&simulated,0,Category::Drafter), owned);
+    assert_eq!(bytes(&simulated,0,Category::Workspace), scratch[1]);
+    options.drafter_bytes = owned + scratch[1];
+    // An explicit total must work even when no checkpoint can be read.
+    options.glmf_drafter_snapshot = Some(draft.path().join("absent"));
+    let explicit = run(&options);
+    assert_eq!(bytes(&explicit,0,Category::Drafter), options.drafter_bytes);
+    assert_eq!(bytes(&explicit,0,Category::Workspace), 0);
+    assert_eq!(explicit.pool_tokens, simulated.pool_tokens);
+    options.glmf_drafter_disabled = true;
+    let disabled = run(&options);
+    assert_eq!(bytes(&disabled,0,Category::Drafter), 0);
+    assert_eq!(bytes(&disabled,0,Category::Workspace), 0);
+}
+
+#[test]
 fn glm5_flash_disabled_draft_omits_arenas_and_speculative_graphs() {
     use cuteafd_core::memory_layout::Category;
     let dir = snapshot(glm5_flash_config(2), &glm5_flash_tensors(&glm5_flash_config(2)));

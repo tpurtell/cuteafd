@@ -1118,15 +1118,14 @@ impl Opened {
             } else { expert_workspace = admission::expert_workspace(catalog, Some(&args.manifest), args.expert_rows() as u64, 1)?; }
         }
         let sms = inventory.gpus[0].sms as usize;
-        let drafter_bytes = args.draft.as_ref().map(|path| -> Result<u64> {
+        let draft_sms: Vec<_> = inventory.gpus.iter().map(|gpu| gpu.sms as u64).collect();
+        let (drafter_bytes, drafter_scratch) = args.draft.as_ref().map(|path| -> Result<_> {
             let config = serde_json::from_slice(&std::fs::read(path.join("config.json"))?)?;
             let slots = args.draft_context_slots.unwrap_or(20.max(args.draft_sequences));
-            let (resident, scratch) = cuteafd_loader::families::glm5::draft_representation::draft_resident_bytes_with_mode(
-                &config, slots, args.draft_sequences.min(slots), sms as u64,
+            Ok(admission::drafter_inventory(&config, slots, args.draft_sequences.min(slots), &draft_sms,
                 cuteafd_loader::families::glm5::draft_representation::GlmDraftRepresentation::from_fp8_option(args.draft_fp8),
-                args.draft_linear.code() as u8)?;
-            Ok(resident + scratch)
-        }).transpose()?.unwrap_or(0);
+                args.draft_linear.code() as u8)?)
+        }).transpose()?.unwrap_or_else(|| (0, vec![0; devices.len()]));
         let (sequences, speculation) = args.serving_graph_policy.unwrap_or((16, args.draft.is_some()));
         let pool = if args.pool_tokens > 0 { args.pool_tokens } else { cuteafd_core::serving_capacity::DEFAULT_GPU_KV_TOKENS as usize };
         let graphs = if args.startup_graphs() {
@@ -1143,7 +1142,7 @@ impl Opened {
             mark_slots: marks as u64, pool_marks: args.prefix_marks == prefix::PrefixMarks::Pool, index: index.into(),
             kda_state_bytes: args.kda_state.bytes() as u64, shared_replay: args.replay_records == engine::ReplayRecords::Shared,
             representation, resident, router_replica_bytes, workspace, graphs, experts, expert_workspace, tp2_workspace,
-            drafter_bytes, requested_pool: (args.pool_tokens > 0).then_some(args.pool_tokens as u64), onboard,
+            drafter_bytes, drafter_scratch, requested_pool: (args.pool_tokens > 0).then_some(args.pool_tokens as u64), onboard,
             full_prefill_logits: 0 };
         let target = placement::PoolPolicy::resolve(&inputs.gpus.iter().map(|g| g.0).collect::<Vec<_>>(),
             args.max_context as u64, inputs.requested_pool, 256, spark_ranks == 0).target;
