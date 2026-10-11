@@ -258,6 +258,8 @@ impl Opened {
         context_args.max_context = crate::shared::context::checkpoint_context(
             &args.snapshot, &args.manifest, "glm5", args.max_context)?;
         let args = &context_args;
+        ensure!(!args.skip_routed_experts || args.peers.is_none(),
+            "--skip-routed-experts is a coordinator-only diagnostic; do not pass --peers");
         let programs = self.library.programs()?.with_manifest(&args.manifest)?;
         programs.capacities().require_context("glm5", args.max_context)?;
         // GLM 5.3's own programs (`glm_*`, and the head split's `glm2_*`), sampled as the runtime
@@ -329,14 +331,17 @@ impl Opened {
         let pending_code = devices.iter().enumerate().map(|(rank, &device)|
             crate::shared::inventory::pending_code(&self.library, device, rank, devices.len() == 2, "glm", "*"))
             .collect::<Result<Vec<_>>>()?;
+        let spark_ranks = args.peers.as_deref().map_or(0, |p| p.split(',').count());
+        let prefill_lanes = glm::prefill_lanes(spark_ranks, engine::configured_lanes() as u64) as usize;
         let request = glm::request(&glm::GlmInputs { cfg: &self.cfg, layers, gpus, headroom_bytes: 2 << 30,
-            spark_ranks: args.peers.as_deref().map_or(0, |p| p.split(',').count()),
+            spark_ranks, skip_routed_experts: args.skip_routed_experts,
             prefill_rows: args.prefill_rows as u64,
-            prefill_lanes: if args.peers.is_some() { engine::configured_lanes() as u64 } else { 1 },
+            prefill_lanes: prefill_lanes as u64,
             max_context: args.max_context as u64, scratch: Some([scratch(true)?, scratch(false)?]),
             drafter_bytes, drafter_staging, pending_code, experts: Vec::new(),
             expert_workspace: 0, tp2_workspace: [0; 2], requested_pool: (args.pool_tokens > 0).then_some(args.pool_tokens as u64),
-            onboard: args.rtx_expert_layers, full_prefill_logits: args.full_prefill_logits })?;
+            onboard: if args.skip_routed_experts { cuteafd_loader::placement::Onboard::Layers(0) }
+                else { args.rtx_expert_layers }, full_prefill_logits: args.full_prefill_logits })?;
         let placement = cuteafd_loader::placement::solve(&request)?;
         cuteafd_loader::placement::families::GLM5.check(&placement)?;
         tracing::info!(placement = %placement.summary(), "GLM admission");
@@ -344,7 +349,7 @@ impl Opened {
         let max_context = crate::shared::context::pool_context("glm5", args.max_context, automatic_context, pool_tokens, 256)?;
         let pages = pool_tokens.div_ceil(engine::PAGE_ROWS);
         let mut engine = engine::GlmEngine::new(&self.library, &programs, self.cfg.clone(), model, stream,
-            max_context, args.prefill_rows, pages, embedding)?;
+            max_context, args.prefill_rows, pages, embedding, prefill_lanes)?;
         engine.full_prefill_logits = args.full_prefill_logits;
         if let Some((device, stream)) = peer_stream {
             engine.attach_peer(device, stream, shares.pop().context("head-split shares")?)?;
@@ -387,7 +392,7 @@ impl Opened {
         }).transpose()?;
         // One transport thread per prefill lane (their waves fly beside each other's).
         let mut lanes = match args.peers.as_deref() {
-            Some(peers) => (0..engine::configured_lanes()).filter(|_| engine::configured_lanes() > 1).map(|_| {
+            Some(peers) => (0..prefill_lanes).filter(|_| prefill_lanes > 1).map(|_| {
                 let (peers, executors) = ranks(peers)?;
                 SparkLane::new(&self.library, peers, executors, 4096, config.clone(), row_bytes)
             }).collect::<Result<Vec<_>>>()?,

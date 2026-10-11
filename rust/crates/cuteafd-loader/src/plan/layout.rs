@@ -1461,9 +1461,8 @@ fn glm5_placement(report: &PlanReport, checkpoint: &super::Checkpoint, options: 
     use crate::placement::{families::glm5 as glm, Baseline, Onboard};
     let cfg = crate::families::glm5::GlmDsaConfig::from_hf(&checkpoint.config)?;
     let spark_ranks = match report.placement { ExpertPlacement::Sparks { ranks } => ranks, ExpertPlacement::Local => 0 };
-    let lanes = if options.prefill_lanes > 0 { options.prefill_lanes.clamp(1, 4) }
-        else if spark_ranks > 0 { glm_prefill_lanes(std::env::var("CUTEAFD_GLM_PREFILL_LANES").ok().as_deref()) as u64 }
-        else { 1 };
+    let lanes = glm::prefill_lanes(spark_ranks, if options.prefill_lanes > 0 { options.prefill_lanes }
+        else { glm_prefill_lanes(std::env::var("CUTEAFD_GLM_PREFILL_LANES").ok().as_deref()) as u64 });
     let (draft, draft_staging) = if options.glm5_drafter_disabled { (0, 0) }
         else if options.drafter_bytes > 0 { (options.drafter_bytes, 0) }
         else {
@@ -1483,7 +1482,7 @@ fn glm5_placement(report: &PlanReport, checkpoint: &super::Checkpoint, options: 
         Baseline::Planned { context_bytes: 0, loaded_bytes: d.used_bytes() })).collect();
     let onboard = options.onboard.or(options.local_expert_layers.map(Onboard::Layers)).unwrap_or_else(glm::default_onboard);
     let mut request = glm::request(&glm::GlmInputs { cfg: &cfg, layers: cfg.layers, gpus,
-        headroom_bytes: options.headroom_bytes, spark_ranks, prefill_rows: rows, prefill_lanes: lanes,
+        headroom_bytes: options.headroom_bytes, spark_ranks, skip_routed_experts: false, prefill_rows: rows, prefill_lanes: lanes,
         max_context: context, scratch, drafter_bytes: draft, drafter_staging: draft_staging, pending_code: Vec::new(),
         experts: Vec::new(), expert_workspace: 0, tp2_workspace: [0; 2], requested_pool: options.pool_tokens,
         onboard, full_prefill_logits: options.full_prefill_logits })?;

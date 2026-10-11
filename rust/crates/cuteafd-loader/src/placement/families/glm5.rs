@@ -9,6 +9,13 @@ use cuteafd_core::memory_layout::{Basis, Category};
 pub const PAGE_ROWS: u64 = 64;
 pub const DECODE_ROWS: u64 = 64;
 pub const DEFAULT_PREFILL_LANES: u64 = 3;
+pub const SKIP_RANKS: usize = 4;
+
+/// Only Spark prefill pipelines execute multiple lanes; local/diagnostic runs are serial.
+pub fn prefill_lanes(spark_ranks: usize, configured: u64) -> u64 {
+    if spark_ranks == 0 { 1 } else { configured.clamp(1, 4) }
+}
+
 const FLOOR: u64 = 256;
 const GIB: u64 = 1 << 30;
 
@@ -73,6 +80,8 @@ pub struct GlmInputs<'a> {
     pub gpus: Vec<(u64, Baseline)>,
     pub headroom_bytes: u64,
     pub spark_ranks: usize,
+    /// Coordinator-only diagnostics replace routed FFNs with zero intake planes.
+    pub skip_routed_experts: bool,
     pub prefill_rows: u64,
     pub prefill_lanes: u64,
     pub max_context: u64,
@@ -102,6 +111,10 @@ pub fn request(inputs: &GlmInputs<'_>) -> Result<PlacementRequest, PlacementErro
     }
     let geometry = glm_cache_geometry(cfg, inputs.layers, gpus)
         .map_err(|_| PlacementError::Inventory("GLM cache geometry"))?;
+    if inputs.skip_routed_experts && (!inputs.experts.is_empty() || inputs.spark_ranks != 0
+        || inputs.prefill_lanes != 1 || inputs.onboard != Onboard::Layers(0)) {
+        return Err(PlacementError::Inventory("GLM skipped experts require serial diagnostic admission without local/Spark experts"));
+    }
     let routed = inputs.layers.saturating_sub(cfg.first_moe_layer);
     if !inputs.experts.is_empty() && inputs.experts.len() != routed {
         return Err(PlacementError::Inventory("GLM costs must cover every selected routed layer"));
@@ -150,6 +163,11 @@ pub fn request(inputs: &GlmInputs<'_>) -> Result<PlacementRequest, PlacementErro
             fixed.push(Demand::new(gpu, Category::Transport, "peer exchange", bytes, Basis::Formula));
         }
         if rank == 0 {
+            if inputs.skip_routed_experts {
+                fixed.push(Demand::new(gpu, Category::Transport, "diagnostic zero expert planes",
+                    SKIP_RANKS as u64 * (inputs.prefill_rows.max(DECODE_ROWS) * cfg.hidden as u64 * 2).max(FLOOR),
+                    Basis::Formula));
+            }
             if inputs.spark_ranks > 0 {
                 let endpoints = 1 + if inputs.prefill_lanes > 1 { inputs.prefill_lanes } else { 0 };
                 fixed.push(Demand::new(gpu, Category::Transport, "Spark intake planes",
@@ -177,8 +195,10 @@ pub fn request(inputs: &GlmInputs<'_>) -> Result<PlacementRequest, PlacementErro
         colocate: Some(cfg.index_source(layer) as u16),
         // Preserve routed identity even without local kernels: Spark-free and
         // explicit local requests must fail, not turn these into dense layers.
-        experts: layer.checked_sub(cfg.first_moe_layer).map(|i| inputs.experts.get(i).copied().unwrap_or(ExpertCost {
-            whole: Bytes2::default(), half: [Bytes2::default(); 2], tp2: false, spark_ok: true })),
+        experts: if inputs.skip_routed_experts { None } else {
+            layer.checked_sub(cfg.first_moe_layer).map(|i| inputs.experts.get(i).copied().unwrap_or(ExpertCost {
+                whole: Bytes2::default(), half: [Bytes2::default(); 2], tp2: false, spark_ok: true }))
+        },
         modes: if gpus == 2 { vec![LayerMode::HeadSplit] } else { vec![LayerMode::Whole { gpu: 0, ffn: FfnMode::Owner }] },
     }).collect();
     let cards: Vec<_> = inputs.gpus.iter().map(|g| g.0).collect();
@@ -234,6 +254,105 @@ pub fn manifest_scratch(cfg: &GlmDsaConfig, split: bool, manifest: &serde_json::
     Ok([step_scratch(cfg, split, true, lookup)?, step_scratch(cfg, split, false, lookup)?])
 }
 
+/// Executable EXL3 TP2 inventory; native NVFP4 and TP1 are deliberately not admitted.
+#[derive(Debug, Clone)]
+pub struct LocalInventory {
+    pub package: std::path::PathBuf,
+    pub experts: Vec<ExpertCost>,
+    pub backend_workspace: u64,
+    pub extra_workspace: [u64; 2],
+}
+
+impl LocalInventory {
+    pub fn workspace(&self) -> [u64; 2] {
+        self.extra_workspace.map(|bytes| bytes + self.backend_workspace)
+    }
+
+    pub fn workspace_for(&self, cfg: &GlmDsaConfig, rows: u64, lanes: u64,
+        exchange_f32: bool) -> [u64; 2] {
+        local_extra_workspace(cfg.hidden as u64, cfg.experts as u64, cfg.topk as u64,
+            rows, lanes, exchange_f32).map(|bytes| bytes + self.backend_workspace)
+    }
+}
+
+fn local_extra_workspace(h: u64, experts: u64, topk: u64, rows: u64, lanes: u64,
+    exchange_f32: bool) -> [u64; 2] {
+    let dtype = if exchange_f32 { 4 } else { 2 };
+    let payload = (DECODE_ROWS * h * dtype).max(FLOOR) + lanes * (rows * h * dtype).max(FLOOR);
+    let exchange_rows = rows.max(DECODE_ROWS);
+    let routes = 2 * lanes * (exchange_rows * topk * 8).next_multiple_of(16)
+        + ((2 * lanes + 1) * 16).max(FLOOR) + FLOOR;
+    let wide_exchange = if exchange_f32 { 4 * lanes * exchange_rows * h * 2 } else { 0 };
+    let common = payload + routes + wide_exchange + FLOOR;
+    // Rank 1 normally owns 256-byte placeholders for logits, ids, weights and wire.
+    let peer_routes = [experts * 4, topk * 4, topk * 4, h + h / 32].into_iter().map(|width|
+        (DECODE_ROWS * width).max(FLOOR) - FLOOR
+            + lanes * ((rows * width).max(FLOOR) - FLOOR)).sum::<u64>();
+    [common, common + peer_routes]
+}
+
+pub fn local_inventory(catalog: &crate::OfficialV41Catalog, manifest: &std::path::Path,
+    selected_layers: usize, rows: u64, lanes: u64, exchange_f32: bool) -> anyhow::Result<LocalInventory> {
+    let exl3 = catalog.exl3().ok_or_else(|| anyhow::anyhow!(
+        "GLM RTX TP2 currently requires EXL3; native NVFP4 needs the BF16 routed/shared partial adapter"))?;
+    let shape = catalog.routed_experts();
+    anyhow::ensure!(shape.hidden == 6144 && shape.intermediate == 2048 && shape.experts == 256
+        && shape.topk == 8 && (1..=4096).contains(&rows) && (1..=4).contains(&lanes)
+        && (shape.first_layer..=shape.layers).contains(&selected_layers), "GLM TP2 geometry/layer extent");
+    let tiers = exl3.decoder_tiers().iter().map(usize::to_string).collect::<String>();
+    let stem = format!("exl3-glm-k{tiers}");
+    let parent = manifest.parent().ok_or_else(|| anyhow::anyhow!("GLM program manifest parent"))?;
+    let package = [parent.join("exl3").join(&stem), parent.join("../lib/exl3").join(&stem)]
+        .into_iter().map(|p| p.join("rtx-tp2")).find(|p| p.is_dir())
+        .ok_or_else(|| anyhow::anyhow!("missing {stem}/rtx-tp2 package"))?;
+    let capacities = [1u64, 16, 80, 256, 1024, 4096];
+    let max_rows = rows.max(DECODE_ROWS);
+    let compiled = capacities.into_iter().find(|&c| c >= max_rows).unwrap();
+    let manifests = capacities.into_iter().filter(|&c| c <= compiled).map(|capacity| {
+        let directory = package.join(format!("m{capacity}"));
+        let value: serde_json::Value = serde_json::from_slice(&std::fs::read(directory.join("v41_exl3.json"))?)?;
+        anyhow::ensure!(value["hidden"].as_u64() == Some(shape.hidden as u64)
+            && value["intermediate"].as_u64() == Some(shape.intermediate as u64 / 2)
+            && value["experts"].as_u64() == Some(shape.experts as u64)
+            && value["top_k"].as_u64() == Some(shape.topk as u64)
+            && value["capacity"].as_u64() == Some(capacity)
+            && value["output_dtype"].as_str() == Some("fp32")
+            && value["bits"] == serde_json::json!(exl3.decoder_tiers()),
+            "GLM TP2 EXL3 capacity/geometry/tiers/output mismatch in {}", directory.display());
+        let library = directory.join("libcuteafd_exl3.so");
+        anyhow::ensure!(library.is_file(), "GLM TP2 missing binary {}", library.display());
+        let lut = value["trellis_lut"]["file"].as_str()
+            .ok_or_else(|| anyhow::anyhow!("GLM TP2 missing trellis LUT asset name"))?;
+        anyhow::ensure!(directory.join(lut).is_file(), "GLM TP2 missing trellis LUT in {}", directory.display());
+        if value["direct"].as_bool() != Some(true) {
+            for file in ["v41_exl3_routes.json", "libv41_exl3_routes.so"] {
+                anyhow::ensure!(directory.join(file).is_file(), "GLM TP2 missing {file} in {}", directory.display());
+            }
+        }
+        // Runtime separately attests ELF geometry and LUT hashes before execution.
+        Ok(value)
+    }).collect::<anyhow::Result<Vec<_>>>()?;
+    let backend_workspace = crate::serving_capacity::exl3_workspace_bytes(&manifests, true)?
+        + max_rows * shape.hidden as u64 * 4;
+    let mut experts = Vec::new();
+    for layer in shape.first_layer..selected_layers {
+        let whole = exl3.residency(crate::V41Exl3Layer::Backbone(layer), 1, 0)?.device_arena_layout()?.1 as u64;
+        let mut half = [Bytes2::default(); 2];
+        for (rank, bytes) in half.iter_mut().enumerate() {
+            bytes.resident = exl3.residency(crate::V41Exl3Layer::Backbone(layer), 2, rank)?.device_arena_layout()?.1 as u64;
+        }
+        for suffix in ["weight", "e_score_correction_bias"] {
+            half[1].resident += catalog.tensor(&format!("model.layers.{layer}.mlp.gate.{suffix}"))?
+                .metadata.byte_length.max(FLOOR);
+        }
+        experts.push(ExpertCost { whole: Bytes2 { resident: whole, staging: 0 }, half,
+            tp2: true, spark_ok: true });
+    }
+    Ok(LocalInventory { package, experts, backend_workspace,
+        extra_workspace: local_extra_workspace(shape.hidden as u64, shape.experts as u64,
+            shape.topk as u64, rows, lanes, exchange_f32) })
+}
+
 pub fn default_onboard() -> Onboard { Onboard::Auto }
 
 #[cfg(test)]
@@ -254,7 +373,7 @@ mod tests {
     fn inputs<'a>(cfg: &'a GlmDsaConfig, cards: &[u64]) -> GlmInputs<'a> {
         GlmInputs { cfg, layers: cfg.layers, gpus: cards.iter().enumerate().map(|(rank, &total)| (total,
             Baseline::Planned { context_bytes: GIB, loaded_bytes: if rank == 0 { 14 * GIB } else { 12 * GIB } })).collect(),
-            headroom_bytes: 2 * GIB, spark_ranks: 4, prefill_rows: 4096, prefill_lanes: 3,
+            headroom_bytes: 2 * GIB, spark_ranks: 4, skip_routed_experts: false, prefill_rows: 4096, prefill_lanes: 3,
             max_context: 1 << 20, scratch: Some([GlmScratch { programs: 16 << 20, topk: 1 << 20 }; 2]),
             drafter_bytes: 3 * GIB, drafter_staging: 0, pending_code: vec![],
             experts: (cfg.first_moe_layer..cfg.layers).map(|_| ExpertCost {
@@ -291,6 +410,39 @@ mod tests {
     }
 
     #[test]
+    fn skipped_experts_admit_serial_diagnostics_without_a_local_backend() {
+        let cfg = config();
+        for cards in [vec![96 * GIB], vec![96 * GIB; 2]] {
+            let mut i = inputs(&cfg, &cards);
+            i.spark_ranks = 0;
+            i.prefill_lanes = prefill_lanes(0, 3);
+            i.experts.clear();
+            i.expert_workspace = 0;
+            i.tp2_workspace = [0; 2];
+            i.drafter_bytes = 0;
+            i.requested_pool = Some(65536);
+            i.onboard = Onboard::Layers(0);
+            assert!(solve(&request(&i).unwrap()).is_err(), "normal Spark-free execution must fail closed");
+            i.skip_routed_experts = true;
+            let request = request(&i).unwrap();
+            assert!(request.layers.iter().all(|layer| layer.experts.is_none()));
+            let planes = request.fixed.iter().filter(|d| d.group == "diagnostic zero expert planes")
+                .map(|d| (d.gpu, d.bytes)).collect::<Vec<_>>();
+            assert_eq!(planes, vec![(0, 4 * 4096 * 6144 * 2)]);
+            let p = solve(&request).unwrap();
+            assert_eq!(p.pool_tokens, 65536);
+            assert_eq!(p.onboard_layers, 0);
+            assert!(p.tp2.is_none());
+            i.prefill_lanes = 3;
+            assert!(super::request(&i).is_err(), "skip diagnostics must retain serial admission");
+        }
+        for configured in 1..=4 {
+            assert_eq!(prefill_lanes(0, configured), 1);
+            assert_eq!(prefill_lanes(4, configured), configured);
+        }
+    }
+
+    #[test]
     fn replicated_heads_cannot_admit_two_million_tokens() {
         let cfg = config();
         let mut i = inputs(&cfg, &[96 * GIB; 2]);
@@ -299,6 +451,121 @@ mod tests {
         let geometry = glm_cache_geometry(&cfg, cfg.layers, 2).unwrap();
         assert_eq!(geometry.ranks[0].persistent_unit_bytes / PAGE_ROWS, 53940);
         assert_eq!(geometry.ranks[0], geometry.ranks[1]);
+    }
+
+    fn local_fixture() -> (tempfile::TempDir, crate::OfficialV41Catalog, std::path::PathBuf) {
+        use crate::plan::testing::{exl3, exl3_compact, glm5_config, glm5_tensors, write_snapshot};
+        use serde_json::json;
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = glm5_config();
+        config["quantization_config"] = exl3_compact(4);
+        let mut tensors = glm5_tensors(|name, n, k| exl3(name, n, k, 4));
+        for expert in 1..256 {
+            for (projection, n, k) in [("gate_proj", 2048, 6144), ("up_proj", 2048, 6144),
+                ("down_proj", 6144, 2048)] {
+                tensors.extend(exl3(&format!("model.layers.1.mlp.experts.{expert}.{projection}"), n, k, 4));
+            }
+        }
+        let snapshot = dir.path().join("snapshot");
+        write_snapshot(&snapshot, &config, &tensors, None);
+        let catalog = crate::read_expert_catalog(&snapshot).unwrap();
+        let manifest = dir.path().join("PROGRAMS.json");
+        std::fs::write(&manifest, b"{\"programs\":[]}").unwrap();
+        for capacity in [1, 16, 80] {
+            let package = dir.path().join(format!("exl3/exl3-glm-k45/rtx-tp2/m{capacity}"));
+            std::fs::create_dir_all(&package).unwrap();
+            let value = json!({"hidden": 6144, "intermediate": 1024, "experts": 256,
+                "top_k": 8, "capacity": capacity, "bits": [4, 5], "output_dtype": "fp32",
+                "input_format": "e4m3_k32", "direct": false,
+                "trellis_lut": {"file": "lut.bin", "bytes": 32}, "buffers": {
+                    "scratch": {"allocation": "scratch", "bytes": capacity * 64,
+                        "dtype": "f32", "zero_on_create": false},
+                    "state": {"allocation": "state", "bytes": 0,
+                        "dtype": "i32", "zero_on_create": true}}});
+            std::fs::write(package.join("v41_exl3.json"), serde_json::to_vec(&value).unwrap()).unwrap();
+            // Header-only fixtures do not attest or execute these stand-in assets.
+            for file in ["libcuteafd_exl3.so", "lut.bin", "v41_exl3_routes.json", "libv41_exl3_routes.so"] {
+                std::fs::write(package.join(file), b"").unwrap();
+            }
+        }
+        (dir, catalog, manifest)
+    }
+
+    #[test]
+    fn local_inventory_charges_all_retained_capacities_and_exact_rank_storage() {
+        let (_dir, catalog, manifest) = local_fixture();
+        let local = local_inventory(&catalog, &manifest, 2, 64, 3, false).unwrap();
+        assert_eq!(local.backend_workspace, 80 * 64 + 3 * (32 + 16) + 64 * 6144 * 4);
+        assert_eq!(local.experts.len(), 1);
+        let exl3 = catalog.exl3().unwrap();
+        let layer = crate::V41Exl3Layer::Backbone(1);
+        assert_eq!(local.experts[0].whole.resident, exl3.residency(layer, 1, 0).unwrap()
+            .device_arena_layout().unwrap().1 as u64);
+        for rank in 0..2 {
+            let router = if rank == 1 { 256 * 6144 * 2 + 256 * 4 } else { 0 };
+            assert_eq!(local.experts[0].half[rank].resident, exl3.residency(layer, 2, rank).unwrap()
+                .device_arena_layout().unwrap().1 as u64 + router);
+            assert_eq!(local.experts[0].half[rank].staging, 0);
+        }
+        let wide = local_inventory(&catalog, &manifest, 2, 64, 3, true).unwrap();
+        let widening = (DECODE_ROWS + 3 * 64) * 6144 * 2 + 4 * 3 * 64 * 6144 * 2;
+        for rank in 0..2 {
+            assert_eq!(wide.workspace()[rank] - local.workspace()[rank], widening);
+        }
+        assert!(local_inventory(&catalog, &manifest, 0, 64, 3, false).is_err());
+        assert!(local_inventory(&catalog, &manifest, 3, 64, 3, false).is_err());
+    }
+
+    #[test]
+    fn local_inventory_keeps_decode_capacity_with_short_prefill_rows() {
+        let (_dir, catalog, manifest) = local_fixture();
+        for rows in [1, 16, 63] {
+            for lanes in [1, 3, 4] {
+                for f32 in [false, true] {
+                    let local = local_inventory(&catalog, &manifest, 2, rows, lanes, f32).unwrap();
+                    assert_eq!(local.backend_workspace, 80 * 64 + 3 * (32 + 16) + DECODE_ROWS * 6144 * 4);
+                    let dtype = if f32 { 4 } else { 2 };
+                    let payloads = (DECODE_ROWS * 6144 * dtype).max(FLOOR)
+                        + lanes * (rows * 6144 * dtype).max(FLOOR);
+                    let route_slots = 2 * lanes * (DECODE_ROWS * 8 * 8)
+                        + ((2 * lanes + 1) * 16).max(FLOOR) + FLOOR;
+                    let widened_exchange = if f32 { 4 * lanes * DECODE_ROWS * 6144 * 2 } else { 0 };
+                    assert_eq!(local.extra_workspace[0], payloads + route_slots + widened_exchange + FLOOR);
+                    let peer_routes = [256 * 4, 8 * 4, 8 * 4, 6144 + 6144 / 32].into_iter().map(|width|
+                        (DECODE_ROWS * width).max(FLOOR) - FLOOR
+                            + lanes * ((rows * width).max(FLOOR) - FLOOR)).sum::<u64>();
+                    assert_eq!(local.extra_workspace[1] - local.extra_workspace[0], peer_routes);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn local_inventory_refuses_missing_assets_and_mismatched_specializations() {
+        use serde_json::json;
+        let (dir, catalog, manifest) = local_fixture();
+        let package = dir.path().join("exl3/exl3-glm-k45/rtx-tp2/m16");
+        let path = package.join("v41_exl3.json");
+        let original: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        for (field, value) in [("hidden", json!(5120)), ("intermediate", json!(2048)),
+            ("experts", json!(128)), ("top_k", json!(6)), ("capacity", json!(80)),
+            ("output_dtype", json!("bf16")), ("bits", json!([4, null, 5]))] {
+            let mut changed = original.clone();
+            changed[field] = value;
+            std::fs::write(&path, serde_json::to_vec(&changed).unwrap()).unwrap();
+            let error = local_inventory(&catalog, &manifest, 2, 64, 3, false).unwrap_err();
+            assert!(error.to_string().contains("capacity/geometry/tiers/output mismatch"), "{field}: {error:#}");
+        }
+        std::fs::write(&path, serde_json::to_vec(&original).unwrap()).unwrap();
+        for asset in ["libcuteafd_exl3.so", "lut.bin", "v41_exl3_routes.json", "libv41_exl3_routes.so"] {
+            std::fs::remove_file(package.join(asset)).unwrap();
+            let error = local_inventory(&catalog, &manifest, 2, 64, 3, false).unwrap_err();
+            assert!(error.to_string().contains("missing"), "{asset}: {error:#}");
+            std::fs::write(package.join(asset), b"").unwrap();
+        }
+        std::fs::remove_dir_all(dir.path().join("exl3")).unwrap();
+        let error = local_inventory(&catalog, &manifest, 2, 64, 3, false).unwrap_err();
+        assert!(error.to_string().contains("missing exl3-glm-k45/rtx-tp2 package"), "{error:#}");
     }
 
     #[test]

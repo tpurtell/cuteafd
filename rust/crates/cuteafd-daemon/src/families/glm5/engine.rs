@@ -50,7 +50,7 @@ pub(crate) const INDEX_PAGE_BYTES: usize = 8448;
 /// Most Spark ranks a step's partials come from (the compact reducer's limit).
 const MAX_RANKS: usize = 6;
 /// Ranks whose (zero) partials a skipped exchange uploads: the TP4 layout.
-const SKIP_RANKS: usize = 4;
+const SKIP_RANKS: usize = cuteafd_loader::placement::families::glm5::SKIP_RANKS;
 /// Rows of the decode-route programs (`_m64`).
 pub(crate) const DECODE_ROWS: usize = 64;
 /// Most lanes a long Spark prefill chunk splits into (CUTEAFD_GLM_PREFILL_LANES,
@@ -350,14 +350,15 @@ impl<'a> GlmEngine<'a> {
     #[allow(clippy::too_many_arguments)]
     pub fn new(library: &'a NativeLibrary, programs: &'a Programs<'a>, cfg: GlmDsaConfig,
         weights: GlmWeights<'a>, stream: *mut c_void, max_context: usize, prefill_rows: usize, pages: usize,
-        embedding: TokenEmbedding<'a>) -> Result<Self> {
+        embedding: TokenEmbedding<'a>, prefill_lanes: usize) -> Result<Self> {
+        ensure!((1..=4).contains(&prefill_lanes), "GLM prefill lanes must match admitted inventory");
         let quantize_grid = Fp8QuantizeGrid::new(library.sm_count()?, None)?;
         ensure!(embedding.hidden() == cfg.hidden, "embedding rows of {} for hidden {}", embedding.hidden(), cfg.hidden);
         let (kv, index, cos_sin) = caches(library, &cfg, &weights.layers, pages, max_context)?;
         let device = library.cuda_get_device()?;
         Ok(Self { quantize_grid, device, peer: None, exchange: None, library, programs, cfg, weights, stream, max_context, prefill_rows, pages, kv, index, cos_sin,
             decode_workspace: RefCell::new(None), lane_workspaces: RefCell::new(Vec::new()),
-            prefill_lanes: configured_lanes(),
+            prefill_lanes,
             lanes: RefCell::new(Vec::new()), full_prefill_logits: false, skip: None, l2: None, profile: RefCell::new([0.0; 3]),
             exchange_host: RefCell::new([0.0; 4]),
             graphs: RefCell::new(std::collections::HashMap::new()), graphs_warmed: Cell::new(false), graphs_warming: Cell::new(false), graph_misses: Cell::new(0), drafter: None, embedding, prefill_w8a8: true })
