@@ -41,6 +41,8 @@ pub struct GlmfStepShape {
     pub split: bool,
     /// Routed experts on this GPU (the FP8 package): their partial rows.
     pub local_experts: bool,
+    /// TP2 halves: both ranks route and keep wire/routed rows, even with Spark fallback layers.
+    pub tp2_experts: bool,
     /// Routed experts on Spark ranks: pinned staging of the routes and wire rows.
     pub spark: bool,
     /// Bytes per element of the attention partial: 2, or 4 with FP32 KDA partials.
@@ -260,7 +262,7 @@ impl GlmfTemporaryBytes {
 /// A lane's own buffers for steps of up to `rows` rows.
 pub fn glmf_lane_bytes(cfg: &GlmNextConfig, rows: u64, decode: bool, shape: &GlmfStepShape) -> GlmfLaneBytes {
     let (t, h, topk) = (rows, cfg.hidden as u64, cfg.topk as u64);
-    let lead = |bytes: u64| if shape.lead { bytes } else { 0 };
+    let route = |bytes: u64| if shape.lead || shape.tp2_experts { bytes } else { 0 };
     // Decode steps carry one padded table row per step row; prefill steps one shared row.
     let table_rows = if decode { t } else { 1 };
     GlmfLaneBytes {
@@ -272,7 +274,7 @@ pub fn glmf_lane_bytes(cfg: &GlmNextConfig, rows: u64, decode: bool, shape: &Glm
         x: t * h * 2,
         delta: t * h * shape.partial_bytes,
         shared: t * h * 2,
-        routed: (shape.lead && shape.local_experts).then_some(t * h * 2),
+        routed: ((shape.lead && shape.local_experts) || shape.tp2_experts).then_some(t * h * 2),
         positions: t * 8,
         kv_slots: t * 8,
         kda_slots: t * 4,
@@ -283,10 +285,10 @@ pub fn glmf_lane_bytes(cfg: &GlmNextConfig, rows: u64, decode: bool, shape: &Glm
         pool_table: table_rows * shape.table_pool_pages * 4,
         ids: t * 4,
         select: t * 8,
-        router_logits: lead(t * cfg.experts as u64 * 4),
-        route_ids: lead(t * topk * 4),
-        route_weights: lead(t * topk * 4),
-        wire: lead(t * (h + h / 32)),
+        router_logits: route(t * cfg.experts as u64 * 4),
+        route_ids: route(t * topk * 4),
+        route_weights: route(t * topk * 4),
+        wire: route(t * (h + h / 32)),
         router_host: if shape.lead && shape.spark { t * (topk * 8 + h + h / 32) } else { FLOOR },
     }
 }
@@ -409,7 +411,7 @@ mod tests {
 
     /// One RTX + Sparks, BF16 KDA, at the base run's 118,528-token pool (1,852 MLA pages).
     fn spark_shape() -> GlmfStepShape {
-        GlmfStepShape { lead: true, split: false, local_experts: false, spark: true, partial_bytes: 2,
+        GlmfStepShape { lead: true, split: false, local_experts: false, tp2_experts: false, spark: true, partial_bytes: 2,
             output_shard: false, full_prefill_logits: false, table_pages: 1852, table_pool_pages: 463 }
     }
 
@@ -559,6 +561,20 @@ mod tests {
         assert_eq!((temps.logits, temps.head_workspace), (0, 0));
         // Decode tables hold a padded row per step row; prefill tables one shared row.
         assert_eq!((lead.page_table, lane.page_table), (64 * 1852 * 4, 1852 * 4));
+    }
+
+    #[test]
+    fn tp2_peer_keeps_routing_and_routed_rows_without_extra_payload() {
+        let cfg = glm53_flash();
+        let shape = GlmfStepShape { lead: false, split: true, spark: false, tp2_experts: true, ..spark_shape() };
+        let peer = glmf_lane_bytes(&cfg, 64, true, &shape);
+        let lead = glmf_lane_bytes(&cfg, 64, true, &GlmfStepShape { lead: true, ..shape });
+        assert_eq!(peer.routed, Some(64 * cfg.hidden as u64 * 2));
+        assert_eq!(peer.router_logits, 64 * cfg.experts as u64 * 4);
+        assert_eq!((peer.route_ids, peer.route_weights, peer.wire), (lead.route_ids, lead.route_weights, lead.wire));
+        let old = glmf_lane_bytes(&cfg, 64, true, &GlmfStepShape { tp2_experts: false, ..shape });
+        assert_eq!((peer.delta, peer.shared), (old.delta, old.shared));
+        assert_eq!(peer.router_host, FLOOR);
     }
 
     /// The wide decode programs' scratch at capacity in the offline SM 12.0 export of SparkInfer
