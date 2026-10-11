@@ -513,7 +513,12 @@ mod tests {
         let experts = vec![Some(ExpertCost { whole: Bytes2::default(),
             half: [Bytes2 { resident: 600 << 20, staging: 64 << 20 }, Bytes2 { resident: 400 << 20, staging: 32 << 20 }],
             tp2: true, spark_ok: true }); 48];
-        for kv_format in [Qwen4KvCache::Bf16, Qwen4KvCache::Fp8] {
+        for (kv_format, wire) in [Qwen4KvCache::Bf16, Qwen4KvCache::Fp8].into_iter()
+            .flat_map(|kv| [false, true].map(|wire| (kv, wire))) {
+            let transport = QwenTp2Rows::new(cfg.hidden as u64, cfg.topk as u64, 4096, wire).unwrap()
+                .demands().unwrap();
+            let mut fixed = vec![Demand::new(0, Category::Weights, "owner0 head", 1 << 30, Basis::Exact)];
+            fixed.extend(transport.iter().cloned());
             let inputs = |measured| QwenDualInputs {
                 admission: QwenAdmissionInputs { cfg: &cfg, layers: 48, mtp: false, kv_format, manifest: None,
                     prefill_rows: 4096, slots: 16, mark_bytes: 0, full_prefill_logits: 0,
@@ -522,7 +527,7 @@ mod tests {
                     baseline: if measured { Baseline::Measured { free_bytes: (96 << 30) - (512 << 20) } }
                         else { Baseline::Planned { context_bytes: 512 << 20, loaded_bytes: 0 } } }),
                 layer_weights: &weights, layer_experts: &experts,
-                fixed: vec![Demand::new(0, Category::Weights, "owner0 head", 1 << 30, Basis::Exact)],
+                fixed: fixed.clone(),
                 tp2_workspace: [128 << 20, 96 << 20], pending_code_bytes: [64 << 20; 2], mark_slots: 18,
                 max_context: 131072, requested_pool: Some(2 << 20), spark_ranks: 0, onboard: Onboard::Auto,
                 startup_graph_modes: Some((16, true)),
@@ -531,6 +536,10 @@ mod tests {
             let measured = dual_placement(&inputs(true)).unwrap();
             assert_eq!(planned, measured);
             assert_eq!(planned.pool_tokens, 2 << 20);
+            for demand in &transport {
+                assert!(planned.items[usize::from(demand.gpu)].iter().any(|item|
+                    item.group == demand.group && item.category == demand.category && item.bytes == demand.bytes));
+            }
             assert!(planned.layers.iter().all(|layer| layer.experts == ExpertHome::RtxTp2));
             let owners = planned.layers.iter().map(|layer| match layer.mode {
                 LayerMode::Whole { gpu, .. } => usize::from(gpu), _ => unreachable!(),
