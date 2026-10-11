@@ -20,7 +20,64 @@
 use anyhow::Result;
 use std::cell::RefCell;
 use std::collections::VecDeque;
-use std::time::Instant;
+use std::time::{Duration, Instant};
+
+/// A soft time/row limit: the next indivisible family unit always runs.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ChunkBudget {
+    pub target: Option<Duration>,
+    pub row_cap: usize,
+}
+
+impl ChunkBudget {
+    pub const WHOLE: Self = Self { target: None, row_cap: usize::MAX };
+}
+
+/// A legal, drained boundary chosen by the family, not a generic row split.
+pub(crate) struct PrefillUnit<U> {
+    pub work: U,
+    pub rows: usize,
+    pub estimate: Duration,
+    pub finalizes: bool,
+}
+
+pub(crate) trait PrefillDriver {
+    type Cursor;
+    type Unit;
+    type Output;
+    /// The next legal unit within `budget` (always at least one indivisible unit).
+    fn plan(&self, cursor: &Self::Cursor, budget: ChunkBudget) -> Result<PrefillUnit<Self::Unit>>;
+    /// Run one unit to drained, committed completion; `Some` finishes the prompt.
+    fn execute(&mut self, cursor: &mut Self::Cursor, unit: &PrefillUnit<Self::Unit>) -> Result<Option<Self::Output>>;
+    fn observe(&mut self, unit: &PrefillUnit<Self::Unit>, took: Duration);
+    /// After a failed unit, drain queued work and leave the request releasable.
+    fn abort_and_drain(&mut self, cursor: &mut Self::Cursor) -> Result<()>;
+}
+
+/// Plan, execute and observe one unit; preserve the original error if cleanup fails.
+pub(crate) fn run_unit<D: PrefillDriver>(driver: &mut D, cursor: &mut D::Cursor,
+    budget: ChunkBudget) -> Result<Option<D::Output>> {
+    let result = (|| {
+        let unit = driver.plan(cursor, budget)?;
+        let started = Instant::now();
+        let output = driver.execute(cursor, &unit)?;
+        driver.observe(&unit, started.elapsed());
+        Ok(output)
+    })();
+    if result.is_err() {
+        if let Err(error) = driver.abort_and_drain(cursor) {
+            tracing::error!(%error, "draining failed prefill unit");
+        }
+    }
+    result
+}
+
+/// Finish a prompt without imposing a time or row boundary on its units.
+pub(crate) fn run_to_end<D: PrefillDriver>(driver: &mut D, cursor: &mut D::Cursor) -> Result<D::Output> {
+    loop {
+        if let Some(output) = run_unit(driver, cursor, ChunkBudget::WHOLE)? { return Ok(output); }
+    }
+}
 
 /// A round starts no further chunk once it has spent this long (seconds):
 /// a burst of short prompts prefills in one round, a long prompt gets one
@@ -71,6 +128,15 @@ impl<P> PrefillQueue<P> {
     pub fn new(share: f64) -> Self {
         Self { waiting: VecDeque::new(), share, owed: 0.0, last_round: 0.0, round_s: ROUND_S }
     }
+
+    /// Limit a family round to one completed wave without changing its row plan.
+    pub fn one_wave_rounds(mut self) -> Self {
+        self.round_s = 0.0;
+        self
+    }
+
+    /// Independent decode lanes stop at a completed boundary after this debt.
+    pub fn decode_seconds(&self) -> f64 { self.owed.max(0.0) }
 
     pub fn len(&self) -> usize {
         self.waiting.len()
@@ -244,6 +310,101 @@ pub(crate) fn add_phases<const N: usize>(total: &mut [f64; N], phases: [f64; N])
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct FakeDriver {
+        fail_plan: bool,
+        fail_execute: bool,
+        fail_abort: bool,
+        log: Vec<&'static str>,
+    }
+
+    impl PrefillDriver for FakeDriver {
+        type Cursor = usize;
+        type Unit = usize;
+        type Output = usize;
+        fn plan(&self, cursor: &usize, budget: ChunkBudget) -> Result<PrefillUnit<usize>> {
+            anyhow::ensure!(!self.fail_plan, "plan failed");
+            let rows = if budget.target.is_none() { (*cursor).min(3) } else { budget.row_cap.max(1).min(*cursor) };
+            Ok(PrefillUnit { work: rows, rows, estimate: Duration::from_micros(rows as u64), finalizes: rows == *cursor })
+        }
+        fn execute(&mut self, cursor: &mut usize, unit: &PrefillUnit<usize>) -> Result<Option<usize>> {
+            self.log.push("execute");
+            anyhow::ensure!(!self.fail_execute, "execute failed");
+            assert_eq!(unit.rows, unit.work);
+            assert_eq!(unit.estimate, Duration::from_micros(unit.rows as u64));
+            *cursor -= unit.work;
+            assert_eq!(unit.finalizes, *cursor == 0);
+            Ok(unit.finalizes.then_some(42))
+        }
+        fn observe(&mut self, _unit: &PrefillUnit<usize>, _took: Duration) { self.log.push("observe"); }
+        fn abort_and_drain(&mut self, _cursor: &mut usize) -> Result<()> {
+            self.log.push("abort");
+            anyhow::ensure!(!self.fail_abort, "abort failed");
+            Ok(())
+        }
+    }
+
+    fn fake_driver() -> FakeDriver {
+        FakeDriver { fail_plan: false, fail_execute: false, fail_abort: false, log: Vec::new() }
+    }
+
+    #[test]
+    fn driver_units_resume_and_whole_finishes_without_row_splits() {
+        let mut driver = fake_driver();
+        let mut cursor = 5;
+        let budget = ChunkBudget { target: Some(Duration::ZERO), row_cap: 2 };
+        assert_eq!(run_unit(&mut driver, &mut cursor, budget).unwrap(), None);
+        assert_eq!(cursor, 3);
+        assert_eq!(run_to_end(&mut driver, &mut cursor).unwrap(), 42);
+        assert_eq!(cursor, 0);
+        assert_eq!(driver.log, ["execute", "observe", "execute", "observe"]);
+        let mut cursor = 1;
+        assert_eq!(run_unit(&mut driver, &mut cursor, ChunkBudget { row_cap: 0, ..budget }).unwrap(), Some(42));
+        let mut driver = fake_driver();
+        let mut cursor = 7;
+        assert_eq!(run_to_end(&mut driver, &mut cursor).unwrap(), 42);
+        assert_eq!(driver.log, ["execute", "observe", "execute", "observe", "execute", "observe"]);
+    }
+
+    #[test]
+    fn driver_failures_drain_and_preserve_the_original_error() {
+        for plan in [false, true] {
+            for cleanup in [false, true] {
+                let mut driver = fake_driver();
+                driver.fail_plan = plan;
+                driver.fail_execute = !plan;
+                driver.fail_abort = cleanup;
+                let mut cursor = 5;
+                let error = run_unit(&mut driver, &mut cursor, ChunkBudget::WHOLE).unwrap_err();
+                assert_eq!(error.to_string(), if plan { "plan failed" } else { "execute failed" });
+                assert_eq!(cursor, 5);
+                assert_eq!(driver.log, if plan { vec!["abort"] } else { vec!["execute", "abort"] });
+            }
+        }
+    }
+
+    #[test]
+    fn one_wave_rounds_bound_bursts_and_preserve_exclusive_zero_share() {
+        for share in [0.0, 0.2, 0.5] {
+            let mut queue = PrefillQueue::new(share).one_wave_rounds();
+            queue.push(Prompt { id: 0, left: 3 });
+            queue.push(Prompt { id: 1, left: 2 });
+            let mut log = Vec::new();
+            run(&mut queue, &mut log, 0);
+            if share == 0.0 {
+                assert_eq!(log, [0, 0, 0, 1, 1]);
+                assert!(queue.is_empty());
+            } else {
+                assert_eq!(log, [0]);
+                queue.settle(true);
+                assert!(queue.decode_seconds() > 0.0);
+                queue.stepped(queue.decode_seconds());
+                assert!(queue.due(true));
+                run(&mut queue, &mut log, 0);
+                assert_eq!(log, [0, 1]);
+            }
+        }
+    }
 
     /// A prompt of `left` chunks, recording the order chunks ran in.
     struct Prompt {
