@@ -157,6 +157,12 @@ int cuteafd_cuda_stream_synchronize(void *stream) {
     return ++drain_calls > drain_after ? drain_status : 0;
 }
 
+int cuteafd_cuda_stream_destroy(void *stream) {
+    (void)stream;
+    event('T');
+    return 0;
+}
+
 int cuteafd_cuda_set_device(int device) { current_device = device; return 0; }
 
 int cuteafd_copy_h2d(struct device_buffer dst, const void *source, size_t bytes) {

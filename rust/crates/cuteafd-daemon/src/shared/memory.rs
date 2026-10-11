@@ -166,9 +166,11 @@ impl LoadStream<'_> {
         impl Drop for Drain<'_, '_> {
             fn drop(&mut self) {
                 if !self.complete {
-                    if let Err(error) = unsafe { self.stream.library.cuda_stream_synchronize(self.stream.raw) } {
-                        tracing::error!(%error, "draining cancelled V4.1 stream wait");
-                    }
+                    // SAFETY: the borrowed stream and queued storage remain owned by the caller.
+                    crate::shared::decode_graph::fatal_drain(
+                        unsafe { self.stream.library.cuda_stream_synchronize(self.stream.raw) }
+                            .map_err(anyhow::Error::from),
+                        "cancelled loading stream wait");
                 }
             }
         }
@@ -183,11 +185,73 @@ impl LoadStream<'_> {
 impl Drop for LoadStream<'_> {
     fn drop(&mut self) {
         // Owners must drop this stream before releasing buffers used by queued work.
-        if let Err(error) = unsafe { self.library.cuda_stream_synchronize(self.raw) } {
-            tracing::error!(%error, "draining V4.1 loading stream");
-        }
+        // SAFETY: this owner retains the stream until its queued work has drained.
+        crate::shared::decode_graph::fatal_drain(
+            unsafe { self.library.cuda_stream_synchronize(self.raw) }.map_err(anyhow::Error::from),
+            "loading stream");
         if let Err(error) = unsafe { self.library.cuda_stream_destroy(self.raw) } {
             tracing::error!(%error, "destroying V4.1 loading stream");
         }
+    }
+}
+
+#[cfg(test)]
+mod load_stream_lifetime_tests {
+    use super::*;
+    use cuteafd_ffi::native_library_lifetime_fixture::Fixture;
+    use std::{future::Future, task::{Context, Poll, Waker}};
+
+    #[test]
+    #[ignore = "requires an allocated CPU build slot and explicit NVMe fixture directory"]
+    fn failed_load_stream_drains_abort_before_release() -> Result<()> {
+        use std::os::unix::process::ExitStatusExt;
+        const CHILD: &str = "CUTEAFD_FATAL_LOAD_STREAM_CHILD";
+        if let Ok(path) = std::env::var(CHILD) {
+            let fixture = Fixture::build()?;
+            std::fs::write(std::env::var("CUTEAFD_FATAL_LOAD_STREAM_EVIDENCE")?,
+                fixture.directory().join("events").to_str().unwrap())?;
+            let library = fixture.load()?;
+            let weights = [DeviceAllocation::new(&library, 256)?, DeviceAllocation::new(&library, 256)?];
+            let staging = [HostAllocation::new(&library, 256)?, HostAllocation::new(&library, 256)?];
+            fixture.configure_pack(&library, 0, 1)?;
+            match path.as_str() {
+                "drop" => drop(LoadStream { library: &library, raw: std::ptr::null_mut() }),
+                "cancel" => {
+                    let stream = LoadStream { library: &library, raw: std::ptr::null_mut() };
+                    let mut wait = Box::pin(stream.wait());
+                    let mut context = Context::from_waker(Waker::noop());
+                    assert!(matches!(wait.as_mut().poll(&mut context), Poll::Pending));
+                    drop(wait);
+                }
+                "pair" => {
+                    fixture.configure_drain_after(&library, 1)?;
+                    let streams = [
+                        device::Device { library: &library, id: 0 }
+                            .own(|| Ok(LoadStream { library: &library, raw: std::ptr::null_mut() }))?,
+                        device::Device { library: &library, id: 1 }
+                            .own(|| Ok(LoadStream { library: &library, raw: std::ptr::null_mut() }))?,
+                    ];
+                    drop(streams);
+                }
+                _ => unreachable!(),
+            }
+            drop(staging);
+            drop(weights);
+            drop(library);
+            panic!("failed loading-stream drain returned without abort");
+        }
+        let root = std::path::PathBuf::from(std::env::var("CUTEAFD_NATIVE_LIFETIME_FIXTURE_DIR")?);
+        std::fs::create_dir_all(&root)?;
+        for path in ["drop", "cancel", "pair"] {
+            let evidence = root.join(format!("fatal-load-stream-{}-{path}", std::process::id()));
+            let status = std::process::Command::new(std::env::current_exe()?)
+                .args(["--exact", "shared::memory::load_stream_lifetime_tests::failed_load_stream_drains_abort_before_release", "--ignored"])
+                .env(CHILD, path).env("CUTEAFD_FATAL_LOAD_STREAM_EVIDENCE", &evidence).status()?;
+            assert_eq!(status.signal(), Some(libc::SIGABRT));
+            let events = std::fs::read_to_string(std::fs::read_to_string(evidence)?)?;
+            assert_eq!(events, if path == "pair" { "DDAASTS" } else { "DDAAS" },
+                "failed drain must abort before its stream destroy, pinned/device free or module unload");
+        }
+        Ok(())
     }
 }
