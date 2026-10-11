@@ -15,16 +15,17 @@ impl<'a> SourceCache<'a> {
         Ok(storage)
     }
     /// Complete RAM-restored payload publication before exposing the rebuilt
-    /// prefix. This admission path already waits for the host-cache upload.
+    /// pages. This admission path already waits for the host-cache upload.
     /// # Safety
-    /// Host uploads are complete and the prefix's pages remain exclusively owned.
-    pub unsafe fn publish_restored_prefix(&self,prefix:&SourcePrefix)->Result<()> {
+    /// Host uploads are complete and the pages remain exclusively owned.
+    pub unsafe fn publish_restored_pages(&self,pages:&[u32])->Result<()> {
         let Some(replica)=&self.replica else { return Ok(()); };
-        let copied=unsafe { replica.storage.copy_restored_pages(self,prefix,replica.restore.raw) };
+        let copied=unsafe { replica.storage.copy_restored_pages(self,pages,replica.restore.raw) };
         // A partial copy must finish before the caller can release its pages.
         let drained=replica.restore.drain();
         copied.and(drained)
     }
+    pub fn replicated(&self) -> bool { self.replica.is_some() }
 }
 
 pub(crate) struct SourceReplica<'a> {
@@ -33,7 +34,8 @@ pub(crate) struct SourceReplica<'a> {
     scales: Allocation<'a>,
     pages: Allocation<'a>,
     lengths: Allocation<'a>,
-    pool: Rc<RefCell<PagePool>>,
+    /// The authoritative cache's identity (its writing flags).
+    owner: Rc<std::cell::Cell<u16>>,
     capacity: usize,
     stride: usize,
 }
@@ -60,7 +62,7 @@ impl<'a> SourceReplica<'a> {
         ensure!(std::ptr::eq(source.lengths.library, device.library)
             && source.kv_values.buffer.device_id != device.id,
             "source replica requires a peer device from the same library");
-        ensure!(source.writing.get() == 0 && source.pool.borrow().free.len()*PAGE_ROWS == source.capacity,
+        ensure!(source.writing.get() == 0 && source.pages.iter().all(Vec::is_empty),
             "source replica requires an empty source pool");
         device.run(|| device.library.cuda_enable_peer(source.kv_values.buffer.device_id))?;
         let lengths = Allocation::new(device, source.lengths.buffer.bytes)?;
@@ -70,11 +72,11 @@ impl<'a> SourceReplica<'a> {
             values: Allocation::new(device, source.capacity*KV_VALUES)?,
             scales: Allocation::new(device, source.capacity*KV_SCALES)?,
             pages: Allocation::new(device, source.page_table.buffer.bytes)?,
-            lengths, pool: source.pool.clone(), capacity: source.capacity, stride: source.stride,
+            lengths, owner: source.writing.clone(), capacity: source.capacity, stride: source.stride,
         })
     }
     fn check(&self, source: &SourceCache<'_>) -> Result<()> {
-        ensure!(Rc::ptr_eq(&self.pool, &source.pool), "foreign source replica");
+        ensure!(Rc::ptr_eq(&self.owner, &source.writing), "foreign source replica");
         Ok(())
     }
     /// # Safety
@@ -87,10 +89,6 @@ impl<'a> SourceReplica<'a> {
         self.check(source)?;
         source.validate_plan(plan)?;
         self.values.device.run(|| {
-            // A shared tail moved to a new physical page needs its old prefix too.
-            for &(_, _, _, destination) in &plan.replacements {
-                unsafe { self.copy_rows(source, destination as usize*PAGE_ROWS, PAGE_ROWS, stream)?; }
-            }
             for &(slot, new) in &plan.lengths {
                 let mut row = source.rows[slot];
                 while row < new as usize {
@@ -100,17 +98,8 @@ impl<'a> SourceReplica<'a> {
                     row += count;
                 }
             }
-            // Publish changed page-table entries after payload copies. Lengths
-            // follow every table entry, so a ready length never exposes stale KV.
-            for &(slot, logical, _, _) in &plan.replacements {
-                unsafe { self.copy_metadata(source, slot*self.stride*4+logical*4, 4, stream)?; }
-            }
-            for (slot, pages) in &plan.additions {
-                if !pages.is_empty() {
-                    unsafe { self.copy_metadata(source,
-                        (slot*self.stride+source.pages[*slot].len())*4, pages.len()*4, stream)?; }
-                }
-            }
+            // Page tables were installed at bind; lengths follow the payload copies, so a ready
+            // length never exposes stale KV.
             for &(slot, _) in &plan.lengths {
                 unsafe { self.copy_length(source, slot, stream)?; }
             }
@@ -122,18 +111,13 @@ impl<'a> SourceReplica<'a> {
     /// # Safety
     /// Source writes are ordered before this destination stream. Retain both
     /// allocations and the prefix until completion, draining on all error paths.
-    pub unsafe fn copy_restored_pages(&self, source: &SourceCache<'_>, prefix: &SourcePrefix,
+    pub unsafe fn copy_restored_pages(&self, source: &SourceCache<'_>, pages: &[u32],
         stream: *mut c_void) -> Result<()> {
         self.check(source)?;
-        ensure!(Rc::ptr_eq(&self.pool, &prefix.pool), "foreign restored source prefix");
         self.values.device.run(|| {
-            let mut remaining = prefix.rows;
-            for &page in &prefix.pages {
-                let count = remaining.min(PAGE_ROWS);
-                if count > 0 { unsafe { self.copy_rows(source, page as usize*PAGE_ROWS, count, stream)?; } }
-                remaining -= count;
+            for &page in pages {
+                unsafe { self.copy_rows(source, page as usize*PAGE_ROWS, PAGE_ROWS, stream)?; }
             }
-            ensure!(remaining == 0, "restored source prefix is truncated");
             Ok(())
         })
     }
@@ -208,7 +192,7 @@ mod tests {
 
     #[test]
     #[ignore = "requires CUTEAFD_NATIVE_LIB and two CUDA GPUs"]
-    fn peer_source_replica_append_cow_and_host_restore() -> Result<()> {
+    fn peer_source_replica_append_fork_and_host_restore() -> Result<()> {
         let lib = unsafe { NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? };
         for gpu in 0..2 {
             let owner = Device { library: &lib, id: gpu };
@@ -218,12 +202,10 @@ mod tests {
                 let replica = source.enable_replica(peer)?;
                 let producer = LoadStream { library: &lib, raw: lib.cuda_stream_create()? };
                 let mut publication = crate::shared::memory::peer_publication::PeerPublication::new(owner,peer)?;
-                let mut append = |source: &mut SourceCache<'_>, old, new, value| -> Result<()> {
-                    let plan = source.reserve(&[(0,old,new)])?;
-                    unsafe { source.copy_shared_tails(&plan,producer.raw)?;
-                        lib.cuda_stream_synchronize(producer.raw)?; }
+                let mut append = |source: &mut SourceCache<'_>, slot, old, new, value| -> Result<()> {
+                    let plan = source.reserve(&[(slot,old,new)])?;
                     for row in old..new {
-                        let physical = source.destination(&plan,0,row)? as usize;
+                        let physical = source.destination(&plan,slot,row)? as usize;
                         for (b,width) in [(source.kv_values.buffer,KV_VALUES),(source.kv_scales.buffer,KV_SCALES)] {
                             lib.copy_h2d(slice(b,physical*width,width),&vec![value;width])?;
                         }
@@ -252,20 +234,22 @@ mod tests {
                         Ok(())
                     })
                 };
-                append(&mut source,0,255,0x22)?;
+                source.bind(0,&[0,1],0)?;
+                append(&mut source,0,0,255,0x22)?;
                 check(&source,0,&vec![0x22;255])?;
-                let retained=source.retain_prefix(0,255)?;
-                source.restore_prefix(1,&retained)?;
-                append(&mut source,255,258,0x44)?;
+                // A fork at 255 rows: page 0 shared, the tail copied into page 2 (none here: the
+                // whole snapshot sits in page 0), then its own page 3.
+                source.bind(1,&[0,3],255)?;
+                append(&mut source,0,255,258,0x44)?;
                 let mut expected=vec![0x22;255];expected.extend([0x44;3]);
                 check(&source,0,&expected)?;
                 check(&source,1,&vec![0x22;255])?;
-                let restored=source.allocate_prefix(2,300)?;
-                for &page in &restored.pages {
+                // Host-restored pages: written, published to the replica, then bound.
+                for page in [4u32,5] {
                     for b in &source.page_segments(page)[2..] { lib.copy_h2d(*b,&vec![0x66;b.bytes])?; }
                 }
-                unsafe { source.publish_restored_prefix(&restored)?; }
-                source.restore_prefix(2,&restored)?;
+                unsafe { source.publish_restored_pages(&[4,5])?; }
+                source.bind(2,&[4,5],300)?;
                 check(&source,2,&vec![0x66;300])?;
                 source.release(2)?;
                 source.reset(2)?;

@@ -81,7 +81,6 @@ mod tests {
         devices[1].run(|| {
             let geometry = policy::remote_geometry(5);
             actual.bind_policy(geometry.clone())?; reference.bind_policy(geometry)?;
-            actual.reserve_prefixes(4)?; reference.reserve_prefixes(4)?;
             for id in 1000..1016 { actual.admit(id)?; reference.admit(id)?; }
             Ok(())
         })?;
@@ -120,19 +119,20 @@ mod tests {
             }
             eprintln!("PASS distributed runtime requests_per_lane={count}: identical proposals/confidence and independent polling");
         }
-        actual.queue_prefix(0, 1000, 8)?;
-        while !actual.prefix_ready(0, 1000)? { std::thread::yield_now(); }
-        let saved = actual.finish_prefix(0, 1000)?;
+        let saved = devices[1].run(|| crate::shared::memory::DeviceAllocation::new(&lib,
+            crate::families::deepseek_v41::v41_native_serve::speculative::DRAFT_MARK_BYTES))?;
+        actual.queue_mark(0, 1000, 8, saved.buffer)?;
+        while !actual.mark_ready(0)? { std::thread::yield_now(); }
         actual.release(1000)?;
         actual.admit(2000)?;
-        actual.restore_prefix(2000, 8, &saved)?;
+        actual.restore_mark(2000, 8, saved.buffer)?;
         actual.validate_position(2000, 8)?;
         for id in 1001..1016 { actual.release(id)?; }
         actual.release(2000)?;
         assert_eq!(lib.cuda_get_device()?, 0);
         drop(actual); // Retained snapshot storage outlives the producing runtime.
         assert_eq!(lib.cuda_get_device()?, 0);
-        drop(saved); // The prefix carries GPU1 ownership even outside its runtime.
+        drop(saved);
         assert_eq!(lib.cuda_get_device()?, 0);
         eprintln!("PASS distributed runtime queued prefix, release/re-admission, restore and device restoration");
         Ok(())

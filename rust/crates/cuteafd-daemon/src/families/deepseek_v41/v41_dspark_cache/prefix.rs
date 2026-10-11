@@ -1,70 +1,64 @@
+//! A dSpark window's part of a prefix snapshot: its ring's initialized rows (at most 128),
+//! copied into storage the caller owns (the prefix engine's mark arena), described by the ring's
+//! end. A restored request drafts warm.
 use super::*;
-use crate::shared::memory::{SnapshotPool, SnapshotStorage};
 
-pub(crate) struct DsparkPrefix<'a> {
-    owner: u64,
-    end: u64,
-    ring: SnapshotStorage<'a>,
-}
-impl DsparkPrefix<'_> {
-    pub fn end(&self) -> u64 {
-        self.end
-    }
-}
 fn slice(mut buffer: CuteafdDeviceBuffer, offset: usize, bytes: usize) -> CuteafdDeviceBuffer {
     debug_assert!(offset + bytes <= buffer.bytes);
     buffer.ptr = unsafe { buffer.ptr.cast::<u8>().add(offset).cast() };
     buffer.bytes = bytes;
     buffer
 }
+
 impl<'a> DsparkWindow<'a> {
-    pub fn reserve_prefixes(&mut self, slots: usize) -> Result<usize> {
-        ensure!(self.prefix_pool.is_none() && self.slots.iter().all(|s| s.request.is_none()),
-            "draft snapshot arena must be installed before admission");
-        if slots > 0 { self.prefix_pool = Some(SnapshotPool::new(self.stream.library, V41DsparkCache::SLOT_BYTES, slots)?); }
-        Ok(self.prefix_pool.as_ref().map_or(0, SnapshotPool::device_bytes))
+    /// Bytes a retained ring of a window ending at `end` holds.
+    pub fn ring_bytes(end: u64) -> usize {
+        end.min(128) as usize * V41DsparkCache::ROW_BYTES
     }
-    pub fn retain_prefix(&mut self, lease: WindowLease) -> Result<DsparkPrefix<'a>> {
-        let prefix = self.copy_prefix(lease, self.stream.raw)?;
+    /// Copy `lease`'s ring into `destination` (`SLOT_BYTES`) synchronously; returns its end.
+    pub fn capture_ring(&mut self, lease: WindowLease, destination: CuteafdDeviceBuffer) -> Result<u64> {
+        let end = self.copy_ring(lease, destination, self.stream.raw)?;
         self.synchronize()?;
-        Ok(prefix)
+        Ok(end)
     }
-    pub fn queue_prefix(&mut self, lane: usize, lease: WindowLease) -> Result<()> {
+    /// [`DsparkWindow::capture_ring`] queued on capture lane `lane`'s stream; the slot stays
+    /// readable only (no writer may run) until the copy lands or is aborted.
+    pub fn queue_ring(&mut self, lane: usize, lease: WindowLease, destination: CuteafdDeviceBuffer) -> Result<u64> {
         let copies = self.prefix_copies.get(lane).context("invalid draft snapshot lane")?;
         ensure!(copies.pending.is_none(), "draft snapshot lane is occupied");
         let stream = copies.stream.raw;
         let slot = self.validate(lease)?;
         let mut used = [false; 16]; used[slot] = true;
         let reservation = self.access.reserve(used)?;
-        let prefix = self.copy_prefix(lease, stream)?;
-        self.prefix_copies[lane].pending = Some((lease, prefix, reservation));
-        Ok(())
+        let end = self.copy_ring(lease, destination, stream)?;
+        self.prefix_copies[lane].pending = Some((lease, reservation));
+        Ok(end)
     }
-    pub fn prefix_ready(&self, lane: usize, lease: WindowLease) -> Result<bool> {
+    /// Whether lane `lane`'s queued ring copy landed; the lane and its reservation free once
+    /// it has.
+    pub fn ring_ready(&mut self, lane: usize) -> Result<bool> {
         let copies = self.prefix_copies.get(lane).context("invalid draft snapshot lane")?;
-        ensure!(copies.pending.as_ref().is_some_and(|(l, _, _)| *l == lease), "draft snapshot owner differs");
-        self.validate(lease)?;
-        copies.ready()
+        ensure!(copies.pending.is_some(), "no draft snapshot is pending on this lane");
+        let ready = copies.ready()?;
+        if ready { self.prefix_copies[lane].pending = None; }
+        Ok(ready)
     }
-    pub fn finish_prefix(&mut self, lane: usize, lease: WindowLease) -> Result<DsparkPrefix<'a>> {
-        ensure!(self.prefix_ready(lane, lease)?, "draft snapshot copies are incomplete");
-        Ok(self.prefix_copies[lane].pending.take().unwrap().1)
+    /// Whether a ring copy is queued on lane `lane`.
+    pub fn lane_pending(&self, lane: usize) -> bool {
+        self.prefix_copies.get(lane).is_some_and(|copies| copies.pending.is_some())
     }
-    pub fn abort_prefix(&mut self, lane: usize) -> Result<()> {
+    pub fn abort_ring(&mut self, lane: usize) -> Result<()> {
         self.prefix_copies.get_mut(lane).context("invalid draft snapshot lane")?.abort()
     }
-    fn copy_prefix(&self, lease: WindowLease, stream: *mut c_void) -> Result<DsparkPrefix<'a>> {
+    fn copy_ring(&self, lease: WindowLease, destination: CuteafdDeviceBuffer, stream: *mut c_void) -> Result<u64> {
         let slot = self.validate(lease)?;
         self.access.readable(slot)?;
-        let end = self.slots[slot]
-            .end
-            .context("cannot retain an unseeded draft window")?;
-        let bytes = end.min(128) as usize * V41DsparkCache::ROW_BYTES;
-        ensure!(bytes > 0, "cannot retain an empty draft window");
-        let ring = SnapshotStorage::new(self.stream.library, bytes, self.prefix_pool.as_ref())?;
+        let end = self.slots[slot].end.context("cannot retain an unseeded draft window")?;
+        let bytes = Self::ring_bytes(end);
+        ensure!(bytes > 0 && bytes <= destination.bytes, "draft ring does not fit its snapshot storage");
         let copied = unsafe {
             self.stream.library.copy_d2d_async(
-                ring.buffer,
+                slice(destination, 0, bytes),
                 slice(self.ring.buffer, slot * V41DsparkCache::SLOT_BYTES, bytes),
                 bytes,
                 stream,
@@ -74,28 +68,20 @@ impl<'a> DsparkWindow<'a> {
             unsafe { self.stream.library.cuda_stream_synchronize(stream)?; }
             return Err(error);
         }
-        Ok(DsparkPrefix {
-            owner: self.owner,
-            end,
-            ring,
-        })
+        Ok(end)
     }
-    pub fn restore_prefix(&mut self, lease: WindowLease, prefix: &DsparkPrefix<'a>) -> Result<()> {
+    /// Restore a ring captured at `end` from `source` into a fresh window lease.
+    pub fn restore_ring(&mut self, lease: WindowLease, end: u64, source: CuteafdDeviceBuffer) -> Result<()> {
         let slot = self.validate(lease)?;
         self.access.writable(slot)?;
-        ensure!(
-            prefix.owner == self.owner && self.slots[slot].end.is_none(),
-            "foreign draft prefix or nonfresh window"
-        );
+        let bytes = Self::ring_bytes(end);
+        ensure!(self.slots[slot].end.is_none() && bytes > 0 && bytes <= source.bytes,
+            "nonfresh draft window or short ring storage");
         let copied = unsafe {
             self.stream.library.copy_d2d_async(
-                slice(
-                    self.ring.buffer,
-                    slot * V41DsparkCache::SLOT_BYTES,
-                    prefix.ring.buffer.bytes,
-                ),
-                prefix.ring.buffer,
-                prefix.ring.buffer.bytes,
+                slice(self.ring.buffer, slot * V41DsparkCache::SLOT_BYTES, bytes),
+                slice(source, 0, bytes),
+                bytes,
                 self.stream.raw,
             )
         };
@@ -104,106 +90,87 @@ impl<'a> DsparkWindow<'a> {
             self.slots[slot].request = None;
             return Err(error);
         }
-        self.slots[slot].end = Some(prefix.end);
+        self.slots[slot].end = Some(end);
         Ok(())
     }
+    pub fn owner(&self) -> u64 {
+        self.owner
+    }
+    pub fn library(&self) -> &'a NativeLibrary {
+        self.stream.library
+    }
 }
+
 #[cfg(test)]
 mod tests {
     use super::*;
     #[test]
     #[ignore = "requires CUTEAFD_NATIVE_LIB and CUDA"]
-    fn native_queued_draft_prefixes_preserve_peers_and_abort() -> Result<()> {
+    fn native_queued_draft_rings_preserve_peers_and_abort() -> Result<()> {
         let lib = unsafe { NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? };
         let mut window = DsparkWindow::new(&lib, 2, 128, usize::MAX)?;
-        window.reserve_prefixes(3)?;
+        let storage = DeviceAllocation::new(&lib, 3 * V41DsparkCache::SLOT_BYTES)?;
+        let at = |i: usize| slice(storage.buffer, i * V41DsparkCache::SLOT_BYTES, V41DsparkCache::SLOT_BYTES);
         for end in [5u64, 128, 129, 1_000_000] {
             let first = window.begin_request(0, 1)?;
             let second = window.begin_request(1, 2)?;
             window.slots[0].end = Some(end); window.slots[1].end = Some(end);
-            let bytes = end.min(128) as usize * V41DsparkCache::ROW_BYTES;
+            let bytes = DsparkWindow::ring_bytes(end);
             let original: Vec<u8> = (0..bytes).map(|i| (i % 251) as u8).collect();
             lib.copy_h2d(slice(window.ring.buffer, 0, bytes), &original)?;
             lib.copy_h2d(slice(window.ring.buffer, V41DsparkCache::SLOT_BYTES, bytes), &vec![29; bytes])?;
-            let direct = window.retain_prefix(first)?;
-            window.queue_prefix(0, first)?;
-            window.queue_prefix(1, second)?;
+            assert_eq!(window.capture_ring(first, at(0))?, end);
+            window.queue_ring(0, first, at(1))?;
+            window.queue_ring(1, second, at(2))?;
             assert!(window.release(first).is_err());
             assert!(window.access.writable(0).is_err());
-            assert!(window.prefix_ready(0, second).is_err());
-            assert!(window.queue_prefix(1, first).is_err());
-            while !window.prefix_ready(1, second)? { std::thread::yield_now(); }
-            let peer = window.finish_prefix(1, second)?;
+            assert!(window.queue_ring(1, first, at(2)).is_err());
+            while !window.ring_ready(1)? { std::thread::yield_now(); }
             let mut actual = vec![0; bytes];
-            lib.copy_d2h(&mut actual, peer.ring.buffer)?;
+            lib.copy_d2h(&mut actual, slice(at(2), 0, bytes))?;
             assert_eq!(actual, vec![29; bytes]);
-            drop(peer);
-            window.queue_prefix(1, second)?;
-            window.abort_prefix(1)?;
+            window.queue_ring(1, second, at(2))?;
+            window.abort_ring(1)?;
             window.release(second)?;
             assert!(window.release(first).is_err());
-            while !window.prefix_ready(0, first)? { std::thread::yield_now(); }
-            let queued = window.finish_prefix(0, first)?;
-            lib.copy_d2h(&mut actual, queued.ring.buffer)?;
+            while !window.ring_ready(0)? { std::thread::yield_now(); }
+            lib.copy_d2h(&mut actual, slice(at(1), 0, bytes))?;
             assert_eq!(actual, original);
-            let mut expected = vec![0; bytes];
-            lib.copy_d2h(&mut expected, direct.ring.buffer)?;
-            assert_eq!(actual, expected);
+            let mut direct = vec![0; bytes];
+            lib.copy_d2h(&mut direct, slice(at(0), 0, bytes))?;
+            assert_eq!(actual, direct);
             window.release(first)?;
         }
         Ok(())
     }
     #[test]
     #[ignore = "requires CUTEAFD_NATIVE_LIB and CUDA"]
-    fn native_draft_prefix_survives_slot_reuse() -> Result<()> {
+    fn native_draft_ring_survives_slot_reuse() -> Result<()> {
         let lib = unsafe { NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? };
         let mut window = DsparkWindow::new(&lib, 2, 128, usize::MAX)?;
-        window.reserve_prefixes(1)?;
+        let storage = DeviceAllocation::new(&lib, V41DsparkCache::SLOT_BYTES)?;
         for end in [5u64, 128, 129, 1000000] {
             let old = window.begin_request(0, 1)?;
-            assert!(window.retain_prefix(old).is_err());
+            assert!(window.capture_ring(old, storage.buffer).is_err());
             window.slots[0].end = Some(end);
-            let bytes = end.min(128) as usize * V41DsparkCache::ROW_BYTES;
+            let bytes = DsparkWindow::ring_bytes(end);
             let original: Vec<u8> = (0..bytes).map(|i| (i % 251) as u8).collect();
             lib.copy_h2d(slice(window.ring.buffer, 0, bytes), &original)?;
-            let prefix = window.retain_prefix(old)?;
+            let saved = window.capture_ring(old, storage.buffer)?;
             window.release(old)?;
             let replacement = window.begin_request(0, 2)?;
             lib.copy_h2d(slice(window.ring.buffer, 0, bytes), &vec![0xff; bytes])?;
             let resumed = window.begin_request(1, 3)?;
-            window.restore_prefix(resumed, &prefix)?;
+            window.restore_ring(resumed, saved, storage.buffer)?;
             let mut restored = vec![0; bytes];
-            lib.copy_d2h(
-                &mut restored,
-                slice(window.ring.buffer, V41DsparkCache::SLOT_BYTES, bytes),
-            )?;
+            lib.copy_d2h(&mut restored, slice(window.ring.buffer, V41DsparkCache::SLOT_BYTES, bytes))?;
             assert_eq!(restored, original);
             assert_eq!(window.committed_end(resumed)?, Some(end));
             assert!(window.validate(old).is_err());
-            assert!(window.restore_prefix(resumed, &prefix).is_err());
+            assert!(window.restore_ring(resumed, saved, storage.buffer).is_err());
             window.release(replacement)?;
             window.release(resumed)?;
         }
         Ok(())
-    }
-}
-
-impl<'a> DsparkPrefix<'a> {
-    pub fn parts(&self) -> (u64, u64, &SnapshotStorage<'a>) {
-        (self.owner, self.end, &self.ring)
-    }
-    pub fn from_parts(owner: u64, end: u64, ring: SnapshotStorage<'a>) -> Self {
-        Self { owner, end, ring }
-    }
-}
-impl<'a> DsparkWindow<'a> {
-    pub fn owner(&self) -> u64 {
-        self.owner
-    }
-    pub fn prefix_pool(&self) -> Option<&SnapshotPool<'a>> {
-        self.prefix_pool.as_ref()
-    }
-    pub fn library(&self) -> &'a NativeLibrary {
-        self.stream.library
     }
 }

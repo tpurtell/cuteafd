@@ -1,478 +1,625 @@
-use super::speculative::DraftChain;
+//! DeepSeek V4.1 as a prefix-cache family (`cuteafd_engine::prefix`).
+//!
+//! **Pages.** One engine page is a 512-token unit: one page (256 source rows) of each ratio-two
+//! source (layers 2, 8, 14) and two pages of the ratio-one source (layer 20), 5 x 91,136 B =
+//! 455,680 B (~890 B/token). A request's units are allocated for its whole declared lifetime at
+//! admission (V4.1 admits by declared lifetime) and bound to every source's page table, so the
+//! decode path never allocates; a restore shares the snapshot's full units and copies its
+//! partial tail unit once (one eager copy per restore and per capture, PLAN decision 4).
+//!
+//! **Mark.** Arena slots hold the positional state: every window's ring rows and each source's
+//! odd-frontier carry (`BackboneMark::BYTES`, 2,720,064 B, on the prefix-copy device) and, with
+//! dSpark, the three drafter rings (`DRAFT_MARK_BYTES`, 202,752 B, on the drafter's
+//! device): one combined mark per snapshot, so a restored request drafts warm (MiMo
+//! precedent). [`V41Meta`] describes it as plain data: window spans, the frontier, the Engram
+//! lookback and the drafter's frontier.
+//!
+//! **Restore plans.** Exact frontiers restore the mark byte-exactly. An exact ancestor followed
+//! by a suffix of at least 128 tokens resumes as an encoder continuation (encoder rings and carry
+//! restored, decoder rings rebuilt by the suffix's final replay): still exact. A partial match is
+//! `ApproximateReplay`: sources are shared through the even-aligned common prefix
+//! (`source_end`), encoder windows restart empty 128 tokens earlier (`replay_start`) and Engram
+//! history is rebuilt there from the prompt's native ids.
 use super::*;
-use crate::families::deepseek_v41::v41_backbone_cache::{BackboneCache, BackbonePrefix, CacheLease};
-use crate::families::deepseek_v41::v41_compressor::{Gain, Pressure};
-use crate::families::deepseek_v41::v41_requests::RequestPrefix;
-use speculative::DraftPrefix;
-mod images;
-pub(super) use images::ImageKeys;
-use images::ImageKeySpace;
-pub(super) use cuteafd_core::prefix::{Retention, SnapshotKind};
-mod host_cache;
-pub(super) use host_cache::HostCacheBinding;
-struct Saved<'a> {
-    session: Option<String>,
-    _images: ImageKeys,
-    target: RequestPrefix<'a>,
-    draft: Option<DraftPrefix<'a>>,
-    next: RetainedScores,
-    /// The host cache's write-behind copy of this snapshot, if one was issued.
-    ticket: Option<cuteafd_hostcache::cache::StoreTicket>,
+use super::scores::RetainedScores;
+use crate::families::deepseek_v41::v41_backbone_cache::{BackboneMark, CacheLease, UNIT_BYTES, UNIT_TOKENS};
+use crate::families::deepseek_v41::v41_requests::RequestMark;
+use crate::shared::memory::device::{Allocation, Device};
+use crate::shared::prefix::{cuda_copy::range, CudaCopyEngine};
+use cuteafd_engine::prefix::{
+    After, BoxError, CaptureTicket, Captured, Eviction, FamilyLayout, LaggedState, Mark, MarkSlot, MarkStore,
+    PrefixCache, PrefixConfig, PrefixFamily, RestoreCandidate, RestoreContext, RestoreFidelity, RestorePlan,
+    ReuseRule, TailCopy,
+};
+use cuteafd_hostcache::copy::DeviceRange;
+use serde::{Deserialize, Serialize};
+use std::cell::{Cell, RefCell};
+pub(crate) use cuteafd_engine::media::MediaSpan;
+/// A prompt's media-keyed token copy for the radix and its image spans (engine `MediaKeys`).
+pub(crate) type ImageKeys = cuteafd_engine::media::MediaKeys;
+pub(crate) use cuteafd_engine::prefix::SnapshotKind;
+
+/// A V4.1 snapshot's metadata: what its mark's bytes mean. Plain, serializable data.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct V41Meta {
+    pub request: RequestMark,
+    /// The drafter rings' frontier, when the mark carries them.
+    pub draft_end: Option<u64>,
 }
-pub(super) struct PrefixCache<'a> {
-    retained: Retention<Saved<'a>>,
-    images: ImageKeySpace,
-    pending: [Option<PendingRetention>; 2],
-    host: Option<HostCacheBinding<'a>>,
-    /// Failed copy release barriers retain their source allocations here.
-    quarantined: Vec<Saved<'a>>,
-    capture_session: Option<String>,
-    restored_session: Option<String>,
+
+/// One admitted request's place in the cache: its units and its lease.
+pub(crate) struct V41Placement {
+    pub units: Vec<u32>,
+    pub lease: CacheLease,
+    /// Draft request identity when dSpark runs.
+    pub draft: Option<u64>,
+    /// Tokens the placement holds committed state for (the commit point).
+    pub len: usize,
+    /// The restore plan that produced this placement, if any.
+    pub plan: Option<RestorePlan>,
 }
-struct PendingRetention {
-    session: Option<String>,
-    kind: SnapshotKind,
-    keys: Vec<u32>,
-    images: ImageKeys,
-    next: RetainedScores,
-    id: u64,
-    lease: CacheLease,
-    draft: bool,
+
+/// The family's device side, borrowing the request bank and the drafter for one call.
+pub(crate) struct V41Prefix<'r, 'a, 'w, C: DraftChain<'a>> {
+    requests: RefCell<&'r mut Requests<'a>>,
+    draft: RefCell<Option<&'r mut DraftRuntime<'w, 'a, C>>>,
+    arena: &'r Arenas<'a>,
+    units: usize,
+    partial: bool,
+    /// Capture lane of the next queued capture (`queue_capture`'s ticket is the lane).
+    lane: Cell<usize>,
 }
-impl Drop for PrefixCache<'_> {
-    fn drop(&mut self) {
-        if let Some(host) = &mut self.host {
-            if let Err(error) = host.release_barrier() {
-                // The raw device references remain live on a failed CUDA
-                // drain. Keep their owners held even during shutdown.
-                std::mem::forget(std::mem::replace(&mut self.retained, Retention::new(0)));
-                std::mem::forget(std::mem::take(&mut self.quarantined));
-                tracing::error!(%error, "host snapshot shutdown drain failed; retaining device storage");
+
+/// The mark arenas, allocated before serving: target marks on the backbone's prefix-copy
+/// device, draft marks on the drafter's.
+pub(crate) struct Arenas<'a> {
+    target: Option<std::rc::Rc<Allocation<'a>>>,
+    draft: Option<std::rc::Rc<Allocation<'a>>>,
+    slots: usize,
+}
+
+impl<'a> Arenas<'a> {
+    pub fn new(target: Device<'a>, draft: Option<Device<'a>>, slots: usize) -> Result<Self> {
+        let _scope = cuteafd_ffi::memory_ledger::scope("prefix/snapshot");
+        let target = (slots > 0).then(|| Allocation::new(target, slots * BackboneMark::BYTES).map(std::rc::Rc::new))
+            .transpose()?;
+        let draft = match draft {
+            Some(device) if slots > 0 => Some(std::rc::Rc::new(Allocation::new(device, slots * super::speculative::DRAFT_MARK_BYTES)?)),
+            _ => None,
+        };
+        Ok(Self { target, draft, slots })
+    }
+    pub fn device_bytes(slots: usize, draft: bool) -> usize {
+        slots * (BackboneMark::BYTES + if draft { super::speculative::DRAFT_MARK_BYTES } else { 0 })
+    }
+    fn target(&self, slot: MarkSlot) -> Result<cuteafd_ffi::CuteafdDeviceBuffer> {
+        let arena = self.target.as_ref().context("no prefix mark arena")?;
+        ensure!((slot.0 as usize) < self.slots, "mark slot {} of {}", slot.0, self.slots);
+        Ok(view(arena.buffer, slot.0 as usize * BackboneMark::BYTES, BackboneMark::BYTES))
+    }
+    fn draft(&self, slot: MarkSlot) -> Result<Option<cuteafd_ffi::CuteafdDeviceBuffer>> {
+        Ok(match &self.draft {
+            Some(arena) => {
+                ensure!((slot.0 as usize) < self.slots, "mark slot {} of {}", slot.0, self.slots);
+                Some(view(arena.buffer, slot.0 as usize * super::speculative::DRAFT_MARK_BYTES, super::speculative::DRAFT_MARK_BYTES))
             }
-        }
+            None => None,
+        })
+    }
+    pub fn owners(&self) -> Vec<std::rc::Rc<Allocation<'a>>> {
+        self.target.iter().chain(&self.draft).cloned().collect()
     }
 }
-impl<'a> PrefixCache<'a> {
-    pub fn new(limit: usize) -> Self {
-        Self {
-            retained: Retention::new(limit),
-            images: ImageKeySpace::default(),
-            pending: [None, None],
-            host: None,
-            quarantined: Vec::new(),
-            capture_session: None,
-            restored_session: None,
-        }
+
+fn view(buffer: cuteafd_ffi::CuteafdDeviceBuffer, offset: usize, bytes: usize) -> cuteafd_ffi::CuteafdDeviceBuffer {
+    debug_assert!(offset + bytes <= buffer.bytes);
+    cuteafd_ffi::CuteafdDeviceBuffer { ptr: unsafe { buffer.ptr.cast::<u8>().add(offset).cast() }, bytes, ..buffer }
+}
+
+fn boxed(error: anyhow::Error) -> BoxError {
+    format!("{error:#}").into()
+}
+
+/// V4.1's geometry for the prefix engine over `units` 512-token units.
+pub(crate) fn layout(units: usize, draft: bool, partial: bool) -> FamilyLayout {
+    FamilyLayout {
+        page_rows: UNIT_TOKENS,
+        pages: units,
+        page_bytes: UNIT_BYTES,
+        mark_bytes: BackboneMark::BYTES + if draft { super::speculative::DRAFT_MARK_BYTES } else { 0 },
+        draft_bytes: 0,
+        rule: if partial { ReuseRule::V41 } else { ReuseRule::EXACT },
+        mark_store: MarkStore::Arena,
     }
-    pub fn capture_session(&mut self, session: Option<String>) { self.capture_session = session; }
-    pub fn restored_session(&self) -> Option<&str> { self.restored_session.as_deref() }
-    /// Attach the host snapshot cache (`None` keeps every path exactly as before).
-    pub fn with_host_cache(mut self, host: Option<HostCacheBinding<'a>>) -> Self {
-        self.host = host;
+}
+
+/// The automatic host budget: logical capacity above `entries * max_context` tokens (as
+/// before), in this layout's slabs: one unit slab per 512 tokens plus one mark per snapshot.
+pub(crate) fn host_budget(layout: FamilyLayout, device_tokens: u64, entries: u32, max_context: u32, chunk: u64)
+    -> Result<cuteafd_hostcache::budget::Budget> {
+    let mut budget = cuteafd_hostcache::budget::plan(device_tokens, entries, max_context, chunk, false)?;
+    if budget.pinned_bytes == 0 { return Ok(budget); }
+    let unit = UNIT_TOKENS as u64;
+    let snapshots = 2 * u64::from(entries) + 2;
+    let units = budget.host_tokens / unit + budget.staging_tokens / unit + snapshots;
+    let chunks = |slabs: u64, bytes: usize| -> Result<u64> {
+        let per = chunk / bytes as u64;
+        ensure!(per > 0, "host cache chunk is smaller than a V4.1 snapshot slab");
+        Ok(slabs.div_ceil(per))
+    };
+    budget.pinned_bytes = (chunks(units, layout.page_bytes)? + chunks(snapshots, layout.mark_bytes)?)
+        .checked_mul(chunk).context("host cache budget overflow")?;
+    Ok(budget)
+}
+
+/// Where V4.1 resumes a snapshot: the default plan, except that an exact ancestor followed by
+/// at least 128 new tokens continues its encoder (exact), and a partial match shares sources
+/// through the even-aligned, media-safe common prefix and replays 128 tokens before it.
+pub(crate) fn plan(hit: RestoreCandidate<'_>, partial: bool) -> RestorePlan {
+    if hit.common == hit.snapshot_end {
+        return RestorePlan::under(ReuseRule::V41, hit);
+    }
+    let source_end = if partial { hit.media_safe(hit.common / 2 * 2) } else { 0 };
+    let replay_start = hit.media_safe(source_end.saturating_sub(128));
+    RestorePlan {
+        snapshot_end: hit.snapshot_end,
+        target_end: hit.target_end,
+        lag: LaggedState { source_end: if replay_start == 0 { 0 } else { source_end }, replay_start },
+        fidelity: RestoreFidelity::ApproximateReplay,
+    }
+}
+
+impl<'r, 'a, 'w, C: DraftChain<'a>> V41Prefix<'r, 'a, 'w, C> {
+    pub fn new(requests: &'r mut Requests<'a>, draft: Option<&'r mut DraftRuntime<'w, 'a, C>>, arena: &'r Arenas<'a>,
+        partial: bool) -> Self {
+        let units = requests.cache().unit_capacity();
+        Self { requests: RefCell::new(requests), draft: RefCell::new(draft), arena, units, partial, lane: Cell::new(0) }
+    }
+    /// Capture lane for the next queued capture.
+    pub fn on_lane(&self, lane: usize) -> &Self {
+        self.lane.set(lane);
         self
     }
-    /// Poll the host cache's copies; called once per scheduler step.
-    pub fn tick(&mut self) {
-        if let Some(host) = &mut self.host {
-            host.tick();
+    fn bind_units(&self, placement: &V41Placement, rows: usize) -> Result<()> {
+        let mut requests = self.requests.borrow_mut();
+        let pages = requests.cache().unit_pages(&placement.units);
+        let rows = requests.cache().source_rows(rows);
+        let pages = [&pages[0][..], &pages[1][..], &pages[2][..], &pages[3][..]];
+        requests.bind_units(placement.lease, placement.units.clone(), pages, rows)
+    }
+}
+
+impl<'a, C: DraftChain<'a>> PrefixFamily<V41Meta> for V41Prefix<'_, 'a, '_, C> {
+    type Placement = V41Placement;
+
+    fn layout(&self) -> FamilyLayout {
+        layout(self.units, self.arena.draft.is_some(), self.partial)
+    }
+    fn eviction(&self) -> Eviction {
+        Eviction::FreesPages
+    }
+    fn plan_restore(&self, hit: RestoreCandidate<'_>) -> RestorePlan {
+        plan(hit, self.partial)
+    }
+    fn capture_meta(&self, placement: &V41Placement, len: usize) -> Result<V41Meta, BoxError> {
+        let requests = self.requests.borrow();
+        let backbone = requests.cache().mark_meta(placement.lease).map_err(boxed)?;
+        if backbone.end as usize != len {
+            return Err(format!("V4.1 captures its committed frontier only ({} != {len})", backbone.end).into());
         }
+        let (position, recent) = requests.engram_lookback(placement.lease).map_err(boxed)?;
+        let draft_end = match (placement.draft, self.draft.borrow().as_ref()) {
+            (Some(id), Some(draft)) => Some(draft.committed_end(id).map_err(boxed)?),
+            _ => None,
+        };
+        Ok(V41Meta { request: RequestMark { backbone, engram_position: position, engram_recent: recent }, draft_end })
     }
-    pub fn host_metrics(&self) -> Option<cuteafd_hostcache::metrics::Snapshot> {
-        self.host.as_ref().map(HostCacheBinding::metrics)
+    fn bind(&self, placement: &mut V41Placement) -> Result<(), BoxError> {
+        self.bind_units(placement, 0).map_err(boxed)
     }
-    /// Whether the completed-turn bank will actually store a frontier.
-    ///
-    /// This is the same `bank.limit()` guard `retain`/`queue_retain` apply
-    /// (`prefix.rs:177`, `:206`): a zero limit disables retention entirely, so a
-    /// finishing request must not pay the one-row frontier D2H (design §10.4).
-    /// The scheduler consults this **before** scheduling a retention download, so
-    /// a cache-disabled deployment downloads no frontier row at all.
-    pub fn turn_bank_enabled(&self) -> bool {
-        self.retained.bank(SnapshotKind::Turn).limit() > 0
+    fn discard(&self, placement: &mut V41Placement) -> Result<(), BoxError> {
+        // The engine releases the placement's units itself: take them off the request so its
+        // release (here or by the scheduler) does not unreference them a second time. A
+        // failed restore may already have released the lease; then they were queued for
+        // reclaim instead, and are taken back from there.
+        let mut requests = self.requests.borrow_mut();
+        if requests.take_units(placement.lease).is_empty() {
+            requests.forget_released_units(&placement.units);
+        }
+        Ok(())
     }
-    /// The host cache's effective configuration, exported with the metrics.
-    pub fn host_config(&self) -> Option<&cuteafd_hostcache::config::Config> {
-        self.host.as_ref().map(HostCacheBinding::config)
-    }
-    /// Once per prefill chunk (packet HC-9): observe the store stream (`tick`) first — a
-    /// completion is otherwise only seen at the scheduler loop's `tick`, which a synchronous
-    /// prefill blocks for its whole duration — then the bounded pacing hold that limits how
-    /// long the oldest pending store copy may stay outstanding. The observation runs on
-    /// every prefill chunk regardless of `store_pace_ns`; the pacing hold itself is a no-op
-    /// and moves no hold metric when `store_pace_ns` is 0 (store metrics may move, because
-    /// the observation commits completions). No-op without a host cache; the full contract
-    /// lives at `cuteafd_hostcache::HostCache::prefill_hold`.
-    pub fn prefill_hold(&mut self) -> anyhow::Result<()> {
-        match &mut self.host {
-            Some(host) => {
-                host.tick();
-                host.prefill_hold()
+    fn restore_with(&self, mark: Option<&Mark>, saved: Option<&V41Meta>, placement: &mut V41Placement,
+        plan: &RestorePlan, context: &RestoreContext<'_>) -> Result<(), BoxError> {
+        // The forked rows through `source_end` are initialized in the bound pages.
+        self.bind_units(placement, plan.lag.source_end).map_err(boxed)?;
+        let mut requests = self.requests.borrow_mut();
+        // Tail copies of forked units were enqueued on the prefix stream; restores below read
+        // the pages only through later kernels on the same stream or after its drain.
+        if plan.exact() {
+            let (Some(Mark::Slot(slot)), Some(saved)) = (mark, saved) else {
+                return Err("an exact V4.1 restore needs its arena mark and metadata".into());
+            };
+            let continuation = (plan.target_end - plan.snapshot_end >= 128).then_some(plan.target_end as u64);
+            let target = self.arena.target(*slot).map_err(boxed)?;
+            requests.restore_mark(placement.lease, &saved.request, target, continuation).map_err(boxed)?;
+            if continuation.is_none() {
+                let mut draft = self.draft.borrow_mut();
+                match (placement.draft, draft.as_deref_mut(), saved.draft_end, self.arena.draft(*slot).map_err(boxed)?) {
+                    (Some(id), Some(draft), Some(end), Some(ring)) => draft.restore_mark(id, end, ring).map_err(boxed)?,
+                    (None, None, None, _) | (None, None, _, None) => {}
+                    _ => return Err("retained execution mode differs".into()),
+                }
             }
-            None => Ok(()),
+            placement.len = plan.snapshot_end;
+        } else {
+            let start = requests.restore_encoder_prefix(placement.lease, plan.lag.source_end, context.native_tokens)
+                .map_err(boxed)?;
+            if start != plan.lag.replay_start {
+                return Err(format!("encoder replay starts at {start}, plan {}", plan.lag.replay_start).into());
+            }
+            placement.len = start;
         }
+        placement.plan = Some(*plan);
+        Ok(())
     }
-    /// Replace a same-key snapshot or evict the oldest when the bank is full, before another
-    /// arena slot is taken; every dropped snapshot passes through the host cache first.
-    fn make_bank_room(&mut self, kind: SnapshotKind, keys: &[u32]) {
-        let bank = self.retained.bank_mut(kind);
-        let dropped = match bank.remove_exact(keys) {
-            Some(replaced) => Some(replaced),
-            None if bank.entries() >= bank.limit() => bank.evict_oldest(),
+    fn pages<'p>(&self, placement: &'p V41Placement) -> &'p [u32] {
+        &placement.units
+    }
+    fn commit_point(&self, placement: &V41Placement) -> usize {
+        placement.len
+    }
+    fn capture(&self, slot: MarkSlot, placement: &V41Placement, len: usize) -> Result<(), BoxError> {
+        let target = self.arena.target(slot).map_err(boxed)?;
+        let saved = self.requests.borrow_mut().capture_mark(placement.lease, target).map_err(boxed)?;
+        if saved.backbone.end as usize != len {
+            return Err("V4.1 captures its committed frontier only".into());
+        }
+        if let (Some(id), Some(draft), Some(ring)) = (placement.draft, self.draft.borrow_mut().as_deref_mut(),
+            self.arena.draft(slot).map_err(boxed)?) {
+            draft.capture_mark(id, len as u64, ring).map_err(boxed)?;
+        }
+        Ok(())
+    }
+    fn queue_capture(&self, slot: MarkSlot, placement: &V41Placement, len: usize, tail: Option<TailCopy>)
+        -> Result<Option<CaptureTicket>, BoxError> {
+        let lane = self.lane.get();
+        if let Some(tail) = tail { self.copy_rows(tail)?; }
+        // The tail copy runs on the prefix stream; order the lane's copies after it.
+        self.requests.borrow().cache().drain_prefix_stream().map_err(boxed)?;
+        let target = self.arena.target(slot).map_err(boxed)?;
+        let saved = self.requests.borrow_mut().queue_mark(lane, placement.lease, target).map_err(boxed)?;
+        if saved.backbone.end as usize != len {
+            let _ = self.requests.borrow_mut().abort_mark(lane);
+            return Err("V4.1 captures its committed frontier only".into());
+        }
+        if let (Some(id), Some(draft), Some(ring)) = (placement.draft, self.draft.borrow_mut().as_deref_mut(),
+            self.arena.draft(slot).map_err(boxed)?) {
+            if let Err(error) = draft.queue_mark(lane, id, len as u64, ring) {
+                let _ = self.requests.borrow_mut().abort_mark(lane);
+                return Err(boxed(error));
+            }
+        }
+        Ok(Some(CaptureTicket(lane as u32)))
+    }
+    fn capture_ready(&self, ticket: CaptureTicket) -> Result<bool, BoxError> {
+        let lane = ticket.0 as usize;
+        let mut requests = self.requests.borrow_mut();
+        let mut draft = self.draft.borrow_mut();
+        // Poll both before publishing: a capture is complete only when target and drafter
+        // copies both landed.
+        let target = if requests.mark_pending(lane) { requests.mark_ready(lane).map_err(boxed)? } else { true };
+        let rings = match draft.as_deref_mut() {
+            Some(draft) if draft.mark_pending(lane) => draft.mark_ready(lane).map_err(boxed)?,
+            _ => true,
+        };
+        Ok(target && rings)
+    }
+    fn abort_capture(&self, ticket: CaptureTicket) -> Result<(), BoxError> {
+        let lane = ticket.0 as usize;
+        let target = self.requests.borrow_mut().abort_mark(lane);
+        let rings = self.draft.borrow_mut().as_deref_mut().map_or(Ok(()), |draft| draft.abort_mark(lane));
+        target.and(rings).map_err(boxed)
+    }
+    fn host_restored(&self, pages: &[u32]) -> Result<(), BoxError> {
+        self.requests.borrow().cache().publish_units(pages).map_err(boxed)
+    }
+    fn restore(&self, _: Option<MarkSlot>, _: &mut V41Placement, _: usize) -> Result<(), BoxError> {
+        Err("V4.1 restores through its restore plan".into())
+    }
+    fn copy_rows(&self, copy: TailCopy) -> Result<(), BoxError> {
+        let requests = self.requests.borrow();
+        requests.cache().copy_unit_rows(copy.from, copy.to, copy.rows).map_err(boxed)?;
+        // Replicated layouts mirror the copied tail before any placement reads it.
+        requests.cache().publish_units(&[copy.to]).map_err(boxed)
+    }
+    fn drain(&self) -> Result<(), BoxError> {
+        self.requests.borrow().cache().drain_prefix_stream().map_err(boxed)
+    }
+    fn page_segments(&self, page: u32) -> Vec<DeviceRange> {
+        self.requests.borrow().cache().unit_segments(page).into_iter().map(range).collect()
+    }
+    fn mark_segments(&self, slot: MarkSlot) -> Vec<DeviceRange> {
+        let mut segments = Vec::with_capacity(2);
+        if let Ok(target) = self.arena.target(slot) { segments.push(range(target)); }
+        if let Ok(Some(ring)) = self.arena.draft(slot) { segments.push(range(ring)); }
+        segments
+    }
+}
+
+/// The scheduler's prefix cache: the engine's [`PrefixCache`] with V4.1's metadata, plus the
+/// family's arenas and the capture lanes' pending tickets.
+pub(crate) struct V41Cache<'a> {
+    cache: PrefixCache<CudaCopyEngine<'a>, V41Meta>,
+    arenas: Arenas<'a>,
+    partial: bool,
+    pending: [Option<CaptureTicket>; 2],
+    capture_session: Option<String>,
+}
+
+/// What a V4.1 admission restored: the resume point and, for an exact full-prompt hit, the
+/// retained scores of the first token.
+pub(crate) struct Restored {
+    pub cached: usize,
+    pub scores: Option<RetainedScores>,
+    pub plan: Option<RestorePlan>,
+}
+
+impl<'a> V41Cache<'a> {
+    pub fn new(arenas: Arenas<'a>, config: PrefixConfig, partial: bool,
+        host: Option<(cuteafd_hostcache::config::Config, CudaCopyEngine<'a>)>, layout: FamilyLayout) -> Result<Self> {
+        let cache = PrefixCache::new(layout, config, host).map_err(|e| anyhow::anyhow!("{e}"))?;
+        Ok(Self { cache, arenas, partial, pending: [None, None], capture_session: None })
+    }
+    pub fn arenas(&self) -> &Arenas<'a> { &self.arenas }
+    /// A cache that retains nothing (component fixtures).
+    #[cfg(test)]
+    pub fn disabled() -> Self {
+        Self::configured(0)
+    }
+    /// A cache of `entries` per bank with no arena or host tier (CPU fixtures: nothing is
+    /// captured).
+    #[cfg(test)]
+    pub fn configured(entries: usize) -> Self {
+        let config = PrefixConfig { entries, mark_slots: 0, keep_logits: true, min_tokens: 1 };
+        Self::new(Arenas { target: None, draft: None, slots: 0 }, config, true, None, layout(1, false, true))
+            .expect("a fixture prefix cache")
+    }
+    pub fn partial(&self) -> bool { self.partial }
+    pub fn engine(&self) -> &PrefixCache<CudaCopyEngine<'a>, V41Meta> { &self.cache }
+    pub fn family<'r, 'w, C: DraftChain<'a>>(&'r self, requests: &'r mut Requests<'a>,
+        draft: Option<&'r mut DraftRuntime<'w, 'a, C>>) -> V41Prefix<'r, 'a, 'w, C> {
+        V41Prefix::new(requests, draft, &self.arenas, self.partial)
+    }
+    pub fn capture_session(&mut self, session: Option<String>) {
+        self.capture_session = session.clone();
+        self.cache.capture_session(session);
+    }
+    pub fn restored_session(&self) -> Option<&str> { self.cache.restored_session() }
+    pub fn turn_bank_enabled(&self) -> bool { self.cache.turn_bank_enabled() }
+    pub fn host_config(&self) -> Option<&cuteafd_hostcache::config::Config> { self.cache.host_config() }
+    pub fn host_metrics(&self) -> Option<cuteafd_hostcache::metrics::Snapshot> { self.cache.stats().host }
+    pub fn stats(&self) -> cuteafd_engine::prefix::PrefixStats { self.cache.stats() }
+    pub fn prefill_hold(&mut self) -> Result<()> { self.cache.prefill_hold() }
+
+    /// Unreference released requests' units (after the family drained) and poll the host tier.
+    pub fn tick<C: DraftChain<'a>>(&mut self, requests: &mut Requests<'a>, draft: Option<&mut DraftRuntime<'_, 'a, C>>)
+        -> Result<()> {
+        self.reclaim(requests, draft)?;
+        self.cache.tick();
+        Ok(())
+    }
+    fn reclaim<C: DraftChain<'a>>(&mut self, requests: &mut Requests<'a>, draft: Option<&mut DraftRuntime<'_, 'a, C>>)
+        -> Result<()> {
+        let released = requests.take_released_units();
+        if released.is_empty() { return Ok(()); }
+        let family = V41Prefix::new(requests, draft, &self.arenas, self.partial);
+        for units in released {
+            self.cache.release(&family, &units).map_err(|e| anyhow::anyhow!("{e}"))?;
+        }
+        Ok(())
+    }
+
+    /// Admit a request leased at `lease` (fresh, its draft request admitted as `draft_id`):
+    /// look `keys` up (media-keyed copy of `native`), allocate units for `capacity` tokens
+    /// (prompt plus its declared output), restore. Pool pressure is `SourcePoolExhausted`; a
+    /// restore that fails is a miss.
+    #[allow(clippy::too_many_arguments)]
+    pub fn admit<C: DraftChain<'a>>(&mut self, requests: &mut Requests<'a>, mut draft: Option<&mut DraftRuntime<'_, 'a, C>>,
+        lease: CacheLease, draft_id: Option<u64>, keys: &[u32], native: &[u32], media: &[MediaSpan], capacity: usize,
+        cold: bool) -> Result<Restored> {
+        self.reclaim(requests, draft.as_deref_mut())?;
+        let family = V41Prefix::new(requests, draft, &self.arenas, self.partial);
+        let build = |units: Vec<u32>| V41Placement { units, lease, draft: draft_id, len: 0, plan: None };
+        let admitted = if cold || !self.cache.enabled() {
+            self.cache.admit_cold(&family, keys.len(), capacity, build)
+        } else {
+            self.cache.admit_native(&family, keys, native, media, capacity, true, build)
+        };
+        let admitted = match admitted {
+            Ok(admitted) => admitted,
+            Err(cuteafd_engine::prefix::PrefixError::Pages(pages)) => {
+                return Err(crate::families::deepseek_v41::v41_compressor::SourcePoolExhausted {
+                    work_index: 0, needed: pages.needed, available: pages.free }.into());
+            }
+            Err(error) => return Err(anyhow::anyhow!("{error}")),
+        };
+        let scores = match &admitted.after {
+            Some(after) => {
+                let logits = after.logits.as_ref().context("exact prefix has no retained logits")?;
+                let bytes = logits.iter().flat_map(|v| v.to_ne_bytes()).collect();
+                Some(RetainedScores::new(super::scores::VOCAB, bytes)?)
+            }
             None => None,
         };
-        if let Some(saved) = dropped {
-            self.host_dropped(saved);
+        let plan = admitted.placement.plan;
+        Ok(Restored { cached: admitted.resume, scores, plan })
+    }
+
+    /// Whether `work` (each request's remaining declared tokens) fits the units bound to it.
+    pub fn fits(&self, requests: &Requests<'a>, work: &[(CacheLease, u32)]) -> Result<bool> {
+        match requests.cache().check_append_capacity(work) {
+            Ok(()) => Ok(true),
+            Err(error) if exhausted(&error) => Ok(false),
+            Err(error) => Err(error),
         }
     }
-    /// Issue the write-behind copy, then insert; an insertion-time eviction also passes through
-    /// the host cache.
-    fn insert_saved(&mut self, kind: SnapshotKind, keys: &[u32], mut saved: Saved<'a>, requests: &Requests<'a>) {
-        if let Some(host) = &mut self.host {
-            saved.ticket = match host.store(kind, keys, &saved, requests) {
-                Ok(ticket) => ticket,
-                Err(error) => {
-                    tracing::warn!(target: "cuteafd::host_cache", %error, "snapshot not stored in the host cache");
-                    None
-                }
-            };
-        }
-        if let Some(evicted) = self.retained.bank_mut(kind).insert(keys, saved) {
-            self.host_dropped(evicted);
-        }
-    }
-    /// A snapshot leaves the device: let its host copy finish within budget, then drop it.
-    fn host_dropped(&mut self, saved: Saved<'a>) {
-        if let Some(host) = &mut self.host {
-            if host.before_evict(saved.ticket) == cuteafd_hostcache::cache::EvictDecision::Held {
-                self.quarantined.push(saved);
-                tracing::error!("host snapshot copy did not drain; quarantining device snapshot");
-                return;
-            }
-        }
-        drop(saved);
-    }
-    /// On a device-bank miss, rebuild the best host snapshot into the bank so the engine's own
-    /// restore finds it. The snapshot needs device pages exactly as a prefill of the same tokens
-    /// would, so room is made the same way first: the oldest retained device snapshots are
-    /// evicted (through the host cache) until the pool can take it.
-    fn host_restore<C: speculative::DraftChain<'a>>(
-        &mut self,
-        keys: &[u32],
-        lease: CacheLease,
-        requests: &Requests<'a>,
-        draft: Option<&DraftRuntime<'_, 'a, C>>,
-    ) -> Result<()> {
-        let Some(host) = &mut self.host else {
-            return Ok(());
+
+    /// Give back the units of an idle request past what `keep_tokens` needs (its output
+    /// allowance shrank to fit the pool).
+    pub fn trim<C: DraftChain<'a>>(&mut self, requests: &mut Requests<'a>, draft: Option<&mut DraftRuntime<'_, 'a, C>>,
+        lease: CacheLease, keep_tokens: usize) -> Result<()> {
+        let mut units = requests.units(lease)?.to_vec();
+        let keep = keep_tokens.div_ceil(UNIT_TOKENS).max(1);
+        if units.len() <= keep { return Ok(()); }
+        let dropped = units.split_off(keep);
+        let (pages, rows) = {
+            let cache = requests.cache();
+            let committed = cache.committed_end(lease)? as usize;
+            (cache.unit_pages(&units), cache.source_rows(committed))
         };
-        let Some(hit) = host.lookup(keys) else {
-            return Ok(());
-        };
-        let tokens = host.snapshot_tokens(hit.key).context("host snapshot has no tokens")?;
-        if let Err(error) = self.make_room(requests, &[(lease, tokens.len() as u32)]) {
-            if error.downcast_ref::<crate::families::deepseek_v41::v41_compressor::SourcePoolExhausted>().is_none() {
-                return Err(error);
-            }
-            // Nothing left to evict and the pool still cannot hold the snapshot: the prefill
-            // that follows faces the same pool, so this is the engine's pressure path, not a
-            // cache fault.
-            tracing::warn!(target: "cuteafd::host_cache", %error, "host restore abandoned: no device room; prefilling");
-            self.host.as_mut().unwrap().count_abandoned_restore();
-            return Ok(());
-        }
-        let host = self.host.as_mut().unwrap();
-        // A restore that still cannot complete (a missing part, a copy failure) is abandoned and
-        // counted; the request then prefills exactly as it would with no cache. The cache must
-        // never turn a cache miss into a request error.
-        let saved = match host.restore(&hit, requests, draft) {
-            Ok(Some(saved)) => saved,
-            Ok(None) => return Ok(()),
-            Err(error) => {
-                tracing::warn!(target: "cuteafd::host_cache", %error, "host restore abandoned; prefilling");
-                host.count_abandoned_restore();
-                return Ok(());
-            }
-        };
-        if let Some(evicted) = self.retained.bank_mut(hit.kind).insert(&tokens, saved) {
-            self.host_dropped(evicted);
-        }
-        Ok(())
+        requests.rebind_shrunk(lease, units, [&pages[0], &pages[1], &pages[2], &pages[3]], rows)?;
+        let family = V41Prefix::new(requests, draft, &self.arenas, self.partial);
+        self.cache.release(&family, &dropped).map_err(|e| anyhow::anyhow!("{e}"))
     }
-    pub fn prepare_key(&mut self, tokens: &[u32], images: &[cuteafd_loader::V41ImageSpan]) -> Result<ImageKeys> {
-        self.images.prepare(tokens, images)
+
+    /// Units a pool of `free` units plus every snapshot-only unit could still give.
+    pub fn could_fit(&self, units: usize) -> bool { self.cache.could_free(units) }
+
+    /// Retain a snapshot of `lease` at its committed frontier (synchronously).
+    #[allow(clippy::too_many_arguments)]
+    pub fn retain<C: DraftChain<'a>>(&mut self, requests: &mut Requests<'a>, draft: Option<&mut DraftRuntime<'_, 'a, C>>,
+        kind: SnapshotKind, keys: &[u32], media: &[MediaSpan], next: &RetainedScores, lease: CacheLease, draft_id: Option<u64>)
+        -> Result<()> {
+        if !self.cache.enabled() { return Ok(()); }
+        let end = requests.cache().committed_end(lease)? as usize;
+        ensure!(end > 0 && end <= keys.len(), "retained token frontier differs");
+        let units = requests.units(lease)?.to_vec();
+        let placement = V41Placement { units, lease, draft: draft_id, len: end, plan: None };
+        let after = After::from_logits(&next.logits()?, true);
+        let family = V41Prefix::new(requests, draft, &self.arenas, self.partial);
+        self.cache.capture_media(&family, kind, &keys[..end], media, &placement, after)
+            .map(drop).map_err(|e| anyhow::anyhow!("{e}"))
     }
-    pub fn retain<C: DraftChain<'a>>(
-        &mut self,
-        kind: SnapshotKind,
-        tokens: &[u32],
-        images: &ImageKeys,
-        next: &RetainedScores,
-        id: u64,
-        lease: CacheLease,
-        requests: &mut Requests<'a>,
-        draft: Option<&mut DraftRuntime<'_, 'a, C>>,
-    ) -> Result<()> {
-        let bank = self.retained.bank_mut(kind);
-        if bank.limit() == 0 {
-            return Ok(());
-        }
-        let end = requests.cache().committed_end(lease)?;
-        ensure!(
-            end > 0 && end as usize <= tokens.len(),
-            "retained token frontier differs"
-        );
-        let keys = images.encode(&tokens[..end as usize])?;
-        // Evict before allocating another tail, keeping peak retained residency
-        // within the configured number of completed states.
-        self.make_bank_room(kind, &keys);
-        let target = requests.retain_prefix(lease, BackbonePrefix::device_bytes())?;
-        let draft = draft.map(|d| d.retain_prefix(id, end)).transpose()?;
-        let saved = Saved {
-            session: self.capture_session.clone(),
-            _images: images.through(end as usize),
-            target,
-            draft,
-            next: next.clone(),
-            ticket: None,
-        };
-        self.insert_saved(kind, &keys, saved, requests);
-        Ok(())
-    }
-    pub fn queue_retain<C: DraftChain<'a>>(&mut self, lane: usize, kind: SnapshotKind, tokens: &[u32],
-        images: &ImageKeys, next: &RetainedScores, id: u64, lease: CacheLease,
-        requests: &mut Requests<'a>, mut draft: Option<&mut DraftRuntime<'_, 'a, C>>) -> Result<bool> {
+    /// [`V41Cache::retain`] with its copies queued on capture lane `lane`; poll it with
+    /// [`V41Cache::poll_retain`]. `Ok(false)` when nothing was queued.
+    #[allow(clippy::too_many_arguments)]
+    pub fn queue_retain<C: DraftChain<'a>>(&mut self, lane: usize, requests: &mut Requests<'a>,
+        draft: Option<&mut DraftRuntime<'_, 'a, C>>, kind: SnapshotKind, keys: &[u32], media: &[MediaSpan],
+        next: &RetainedScores, lease: CacheLease, draft_id: Option<u64>) -> Result<bool> {
         ensure!(self.pending.get(lane).context("invalid retention lane")?.is_none(), "retention lane occupied");
-        let bank = self.retained.bank_mut(kind);
-        if bank.limit() == 0 { return Ok(false); }
-        let end = requests.cache().committed_end(lease)?;
-        ensure!(end > 0 && end as usize <= tokens.len(), "retained token frontier differs");
-        let keys = images.encode(&tokens[..end as usize])?;
-        self.make_bank_room(kind, &keys);
-        requests.queue_prefix(lane, lease)?;
-        if let Some(draft) = draft.as_deref_mut() {
-            if let Err(error) = draft.queue_prefix(lane, id, end) {
-                if let Err(cleanup) = requests.abort_prefix(lane) {
-                    tracing::error!(%cleanup, "draining target snapshot after draft failure");
-                }
-                return Err(error);
+        if !self.cache.enabled() { return Ok(false); }
+        let end = requests.cache().committed_end(lease)? as usize;
+        ensure!(end > 0 && end <= keys.len(), "retained token frontier differs");
+        let units = requests.units(lease)?.to_vec();
+        let placement = V41Placement { units, lease, draft: draft_id, len: end, plan: None };
+        let after = After::from_logits(&next.logits()?, true);
+        let family = V41Prefix::new(requests, draft, &self.arenas, self.partial);
+        family.on_lane(lane);
+        match self.cache.queue_capture(&family, kind, &keys[..end], media, &placement, after)
+            .map_err(|e| anyhow::anyhow!("{e}"))? {
+            Captured::Queued(ticket) => {
+                self.pending[lane] = Some(ticket);
+                Ok(true)
             }
+            Captured::Done | Captured::Skipped => Ok(false),
         }
-        self.pending[lane] = Some(PendingRetention { session: self.capture_session.clone(), kind, keys: keys.into_owned(), images: images.through(end as usize),
-            next: next.clone(), id, lease, draft: draft.is_some() });
-        Ok(true)
     }
     pub fn poll_retain<C: DraftChain<'a>>(&mut self, lane: usize, requests: &mut Requests<'a>,
-        mut draft: Option<&mut DraftRuntime<'_, 'a, C>>) -> Result<bool> {
-        let pending = self.pending.get(lane).and_then(Option::as_ref).context("retention is not pending")?;
-        ensure!(pending.draft == draft.is_some(), "pending retention execution mode differs");
-        if !requests.prefix_ready(lane, pending.lease)? { return Ok(false); }
-        if let Some(draft) = draft.as_deref() {
-            if !draft.prefix_ready(lane, pending.id)? { return Ok(false); }
-        }
-        let target = requests.finish_prefix(lane, pending.lease)?;
-        let saved_draft = draft.as_deref_mut().map(|d| d.finish_prefix(lane, pending.id)).transpose()?;
-        let pending = self.pending[lane].take().unwrap();
-        // Another lane may have inserted while these copies ran. Radix insertion
-        // enforces the bank limit again; two extra arena slots cover both pending copies.
-        let saved = Saved { session: pending.session, _images: pending.images, target, draft: saved_draft, next: pending.next, ticket: None };
-        self.insert_saved(pending.kind, &pending.keys, saved, requests);
-        Ok(true)
+        draft: Option<&mut DraftRuntime<'_, 'a, C>>) -> Result<bool> {
+        let ticket = self.pending.get(lane).copied().flatten().context("retention is not pending")?;
+        let family = V41Prefix::new(requests, draft, &self.arenas, self.partial);
+        let done = self.cache.poll_capture(&family, ticket).map_err(|e| anyhow::anyhow!("{e}"))?;
+        if done { self.pending[lane] = None; }
+        Ok(done)
     }
     pub fn abort_retain<C: DraftChain<'a>>(&mut self, lane: usize, requests: &mut Requests<'a>,
         draft: Option<&mut DraftRuntime<'_, 'a, C>>) -> Result<()> {
-        let target = requests.abort_prefix(lane);
-        let speculative = draft.map(|d| d.abort_prefix(lane)).transpose();
-        if let Some(pending) = self.pending.get_mut(lane) { *pending = None; }
-        target.and(speculative.map(|_| ()))
-    }
-    pub fn restore<C: DraftChain<'a>>(
-        &mut self,
-        tokens: &[u32],
-        images: &ImageKeys,
-        id: u64,
-        lease: CacheLease,
-        requests: &mut Requests<'a>,
-        draft: Option<&mut DraftRuntime<'_, 'a, C>>,
-    ) -> Result<Option<(usize, Option<RetainedScores>)>> {
-        self.restored_session = None;
-        let keys = images.encode(tokens)?;
-        if self.retained.lookup_reusable(&keys).is_none() {
-            self.host_restore(&keys, lease, requests, draft.as_deref())?;
-        }
-        // This immutable lookup borrow pins the source across restoration. No
-        // eviction can run until the lease has acquired its shared source pages
-        // and the synchronous restore has drained every queued copy.
-        let Some((end, frontier, saved)) = self.retained.lookup_reusable(&keys) else {
-            return Ok(None);
-        };
-        self.restored_session = saved.session.clone();
-        ensure!(
-            saved.target.end() == frontier as u64 && saved.draft.is_some() == draft.is_some(),
-            "retained execution mode or token frontier differs"
-        );
-        if end != frontier {
-            let start =
-                requests.restore_encoder_prefix(lease, &saved.target, end / 2 * 2, tokens)?;
-            // Draft rings stay fresh until decoder replay seeds the final window.
-            // The saved next token belongs to a different frontier and is unused.
-            return Ok(Some((start, None)));
-        }
-        if tokens.len() - end >= 128 {
-            requests.restore_encoder_continuation(lease, &saved.target, tokens.len() as u64)?;
-            // Every final decoder/draft row comes from the new encoder suffix.
-            return Ok(Some((end, None)));
-        }
-        requests.restore_prefix(lease, &saved.target)?;
-        if let (Some(draft), Some(saved)) = (draft, saved.draft.as_ref()) {
-            draft.restore_prefix(id, end as u64, saved)?;
-        }
-        Ok(Some((end, Some(saved.next.clone()))))
-    }
-    /// Evict retained snapshots until `work` fits, least useful loss first. First the oldest
-    /// snapshot (prompts before turns) some of whose pages no live request table holds:
-    /// evicting a whole inactive chain frees pages, so snapshot-only sharing protects nothing.
-    /// A snapshot the tables hold entirely frees no page. One that also shares a partial tail an
-    /// append writes (the source a request just reused, or a request's own prompt snapshot)
-    /// still costs that tail's copy, so those go last, and only when dropping all of them makes
-    /// `work` fit. The rest gain nothing and stay.
-    pub fn make_room(&mut self, requests: &Requests<'a>, work: &[(CacheLease, u32)]) -> Result<()> {
-        let cache = requests.cache();
-        let mut error = match cache.check_append_capacity(work) {
-            Ok(()) => return Ok(()),
-            Err(error) if exhausted(&error) => error,
-            Err(error) => return Err(error),
-        };
-        // Built once, only under pressure: eviction never changes request tables.
-        let pressure = self.pressure(cache, work)?;
-        let gain = |saved: &Saved<'a>| saved.target.parts().0.gain(&pressure).unwrap_or(Gain::Nothing);
-        let mut copies_fit = None;
-        while let Some(saved) = next_victim(&mut self.retained, &gain, &mut copies_fit,
-            |retained| copies_released_fit(retained, cache, work, &pressure))? {
-            self.host_dropped(saved);
-            error = match cache.check_append_capacity(work) {
-                Ok(()) => return Ok(()),
-                Err(error) if exhausted(&error) => error,
-                Err(error) => return Err(error),
-            };
-        }
-        Err(error)
-    }
-    /// Whether `work` fits the pool as it is, evicting nothing.
-    pub fn fits(&self, requests: &Requests<'a>, work: &[(CacheLease, u32)]) -> Result<bool> {
-        as_fit(requests.cache().check_append_capacity(work))
-    }
-    /// Evict every retained snapshot whose eviction gains `work` only copies: those live tables
-    /// hold entirely that share a partial tail `work` appends to, such as the source a request
-    /// just reused. After a failed `make_room` this leaves `work` exactly the room it would have
-    /// with nothing cached.
-    pub fn release_copies(&mut self, requests: &Requests<'a>, work: &[(CacheLease, u32)]) -> Result<()> {
-        let pressure = self.pressure(requests.cache(), work)?;
-        let gain = |saved: &Saved<'a>| saved.target.parts().0.gain(&pressure).unwrap_or(Gain::Nothing);
-        while let Some((_, saved)) = self.retained.evict_one_where(&|saved| gain(saved) != Gain::Copies) {
-            self.host_dropped(saved);
-        }
-        Ok(())
-    }
-    /// The cache's sources under `work`, after weighing every retained snapshot against them
-    /// once: a snapshot whose sources do not match the cache's, in order, is an error.
-    fn pressure(&self, cache: &BackboneCache<'a>, work: &[(CacheLease, u32)]) -> Result<Vec<Pressure>> {
-        let pressure = cache.pressure(work)?;
-        for saved in self.retained.values() {
-            saved.target.parts().0.gain(&pressure)?;
-        }
-        Ok(pressure)
+        let Some(ticket) = self.pending.get_mut(lane).and_then(Option::take) else { return Ok(()) };
+        let family = V41Prefix::new(requests, draft, &self.arenas, self.partial);
+        self.cache.abort_capture(&family, ticket).map_err(|e| anyhow::anyhow!("{e}"))
     }
 }
 
-fn exhausted(error: &anyhow::Error) -> bool {
+/// The radix key of a request's `tokens` (its prompt then its generated tokens): the prompt's
+/// media-keyed copy, then the generated tokens' native ids (images occur only in prompts).
+pub(crate) fn keyed<'t>(keys: &ImageKeys, tokens: &'t [u32]) -> std::borrow::Cow<'t, [u32]> {
+    if keys.spans().is_empty() { return std::borrow::Cow::Borrowed(tokens); }
+    let prompt = keys.tokens();
+    let mut out = prompt[..prompt.len().min(tokens.len())].to_vec();
+    out.extend_from_slice(&tokens[out.len()..]);
+    std::borrow::Cow::Owned(out)
+}
+
+/// The draft request identity of request `id` when a drafter runs.
+pub(crate) fn draft_id<T>(draft: &Option<T>, id: u64) -> Option<u64> {
+    draft.is_some().then_some(id)
+}
+
+pub(crate) fn exhausted(error: &anyhow::Error) -> bool {
     error.downcast_ref::<crate::families::deepseek_v41::v41_compressor::SourcePoolExhausted>().is_some()
 }
 
-/// A capacity check as a fit: exhaustion is `false`, any other failure an error.
-fn as_fit(check: Result<()>) -> Result<bool> {
-    match check {
-        Ok(()) => Ok(true),
-        Err(error) if exhausted(&error) => Ok(false),
-        Err(error) => Err(error),
-    }
-}
-
-/// Whether `work` fits with every snapshot in `retained` whose eviction gains only copies
-/// counted as gone; `false` when there is none.
-fn copies_released_fit(retained: &Retention<Saved<'_>>, cache: &BackboneCache<'_>, work: &[(CacheLease, u32)],
-    pressure: &[Pressure]) -> Result<bool> {
-    let mut released = pressure.to_vec();
-    let mut sharers = 0;
-    for saved in retained.values() {
-        let backbone = saved.target.parts().0;
-        if backbone.gain(pressure)? == Gain::Copies {
-            backbone.release_tails(&mut released)?;
-            sharers += 1;
-        }
-    }
-    Ok(sharers > 0 && as_fit(cache.check_append_capacity_released(work, &released))?)
-}
-
-/// `make_room`'s next eviction, or `None` when nothing it may evict is left: the oldest entry
-/// (prompts before turns) whose eviction frees pages; once none is left, and only if
-/// `copies_fit` (asked once, the answer kept in `answer`) says dropping every entry that gains
-/// copies makes the work fit, the oldest of those. Entries that gain nothing always stay.
-fn next_victim<T>(retained: &mut Retention<T>, gain: &dyn Fn(&T) -> Gain, answer: &mut Option<bool>,
-    copies_fit: impl FnOnce(&Retention<T>) -> Result<bool>) -> Result<Option<T>> {
-    if let Some((_, victim)) = retained.evict_one_where(&|entry| gain(entry) != Gain::Pages) {
-        return Ok(Some(victim));
-    }
-    let fits = match *answer {
-        Some(fits) => fits,
-        None => *answer.insert(copies_fit(retained)?),
-    };
-    Ok(if fits {
-        retained.evict_one_where(&|entry| gain(entry) != Gain::Copies).map(|(_, victim)| victim)
-    } else {
-        None
-    })
+/// The engine's media spans of a V4.1 prompt's images (full 256-bit identities) and the prompt's
+/// media-keyed token copy for the radix.
+pub(crate) fn media_keys(tokens: &[u32], images: &[cuteafd_loader::V41ImageSpan])
+    -> Result<cuteafd_engine::media::MediaKeys> {
+    let spans: Vec<MediaSpan> = images.iter().map(|span| MediaSpan {
+        start: span.start,
+        len: span.image.grid().tokens(),
+        key: cuteafd_core::ImageKey(*span.image.identity()).into(),
+    }).collect();
+    cuteafd_engine::media::MediaKeys::new(tokens, super::scores::VOCAB as u32, &spans)
+        .map_err(|e| anyhow::anyhow!("image cache keys: {e}"))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cuteafd_core::ImageKey;
 
-    /// Entries are `(name, gain)`; the predicate wiring is `next_victim`'s gain closure.
-    fn retained(entries: &[(SnapshotKind, u32, Gain)]) -> Retention<(u32, Gain)> {
-        let mut retained = Retention::new(8);
-        for &(kind, name, gain) in entries {
-            retained.bank_mut(kind).insert(&[name], (name, gain));
-        }
-        retained
-    }
-
-    fn evictions(retained: &mut Retention<(u32, Gain)>, copies_fit: bool, asked: &std::cell::Cell<u32>) -> Vec<u32> {
-        let mut fits = None;
-        std::iter::from_fn(|| next_victim(retained, &|&(_, gain)| gain, &mut fits, |_| {
-            asked.set(asked.get() + 1);
-            Ok(copies_fit)
-        }).unwrap().map(|(name, _)| name)).collect()
+    fn candidate<'m>(common: usize, snapshot_end: usize, target_end: usize, media: &'m [MediaSpan]) -> RestoreCandidate<'m> {
+        RestoreCandidate { common, snapshot_end, target_end, resume: ReuseRule::V41.skipped(common, snapshot_end),
+            media, saved_media: media }
     }
 
     #[test]
-    fn snapshots_that_free_pages_go_first_and_copy_sharers_only_when_that_fits() {
-        use SnapshotKind::{Prompt, Turn};
-        let entries = [(Turn, 1, Gain::Pages), (Prompt, 2, Gain::Copies), (Prompt, 3, Gain::Nothing),
-            (Prompt, 4, Gain::Pages), (Turn, 5, Gain::Copies), (Turn, 6, Gain::Nothing)];
-        let asked = std::cell::Cell::new(0);
-        // Pages first in bank order (prompts before turns, oldest first); then the copy sharers,
-        // the same way; the snapshots that gain nothing never.
-        let mut all = retained(&entries);
-        assert_eq!(evictions(&mut all, true, &asked), [4, 1, 2, 5]);
-        assert_eq!(asked.get(), 1, "the copy question is asked once per pressure episode");
-        assert_eq!(all.values().map(|&(name, _)| name).collect::<std::collections::BTreeSet<_>>(),
-            [3, 6].into());
-        // When dropping every copy sharer would still not fit, they all stay.
-        let mut kept = retained(&entries);
-        assert_eq!(evictions(&mut kept, false, &asked), [4, 1]);
-        assert_eq!(kept.values().count(), 4);
-        // With nothing that frees pages, a reused source is the only eviction left.
-        let mut reused = retained(&[(Prompt, 7, Gain::Copies), (Turn, 8, Gain::Nothing)]);
-        assert_eq!(evictions(&mut reused, true, &asked), [7]);
+    fn exact_frontiers_restore_exactly_and_partial_ones_replay_from_an_even_source_frontier() {
+        let exact = plan(candidate(1001, 1001, 1001, &[]), true);
+        assert_eq!((exact.fidelity, exact.lag), (RestoreFidelity::Exact, LaggedState { source_end: 1001, replay_start: 1001 }));
+        // Odd frontier, long suffix: still exact (encoder continuation is the family's choice).
+        let ancestor = plan(candidate(777, 777, 2000, &[]), true);
+        assert!(ancestor.exact() && ancestor.resume() == 777);
+        // A partial match keeps sources through the even common prefix, replays 128 earlier.
+        let partial = plan(candidate(1001, 1500, 1600, &[]), true);
+        assert_eq!((partial.fidelity, partial.lag),
+            (RestoreFidelity::ApproximateReplay, LaggedState { source_end: 1000, replay_start: 872 }));
+        assert!(partial.check(1001).is_ok());
+        // Too short to replay a window: nothing reused; partial reuse off: nothing either.
+        assert_eq!(plan(candidate(100, 500, 600, &[]), true).resume(), 0);
+        assert_eq!(plan(candidate(1001, 1500, 1600, &[]), false).resume(), 0);
+    }
+
+    #[test]
+    fn partial_frontiers_never_land_inside_an_image() {
+        let image = [MediaSpan { start: 900, len: 200, key: ImageKey([7; 32]).into() }];
+        // Common prefix inside the image: sources stop at its first row, replay before that.
+        let inside = plan(candidate(1001, 1500, 1600, &image), true);
+        assert_eq!(inside.lag, LaggedState { source_end: 900, replay_start: 772 });
+        // Replay start inside an image rounds down to its first row.
+        let after = [MediaSpan { start: 800, len: 100, key: ImageKey([7; 32]).into() }];
+        let rounded = plan(candidate(1001, 1500, 1600, &after), true);
+        assert_eq!(rounded.lag, LaggedState { source_end: 1000, replay_start: 800 });
+        assert!(rounded.check(1001).is_ok());
+    }
+
+    #[test]
+    fn metadata_is_plain_serializable_data() {
+        let meta = V41Meta {
+            request: RequestMark { backbone: BackboneMark { end: 513, windows: vec![(385, 513); 40] },
+                engram_position: 513, engram_recent: vec![Some(5), None, Some(7)] },
+            draft_end: Some(513),
+        };
+        let text = serde_json::to_string(&meta).unwrap();
+        assert_eq!(serde_json::from_str::<V41Meta>(&text).unwrap(), meta);
     }
 }

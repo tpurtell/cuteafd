@@ -183,8 +183,8 @@ pub(crate) struct Gauges {
 impl Gauges {
     /// Gauges of a generic family over the engine prefix cache, which also
     /// owns its device page pool.
-    pub fn prefix_cache<E: cuteafd_hostcache::copy::CopyEngine>(cache: &cuteafd_engine::prefix::PrefixCache<E>,
-        decoding: usize, prefilling: usize, queued: usize) -> Self {
+    pub fn prefix_cache<E: cuteafd_hostcache::copy::CopyEngine, M: Clone + Default>(
+        cache: &cuteafd_engine::prefix::PrefixCache<E, M>, decoding: usize, prefilling: usize, queued: usize) -> Self {
         let stats = cache.stats();
         let used = stats.pages.saturating_sub(stats.pages_free);
         let kv = Kv { pages: stats.pages as u64, free: stats.pages_free as u64,

@@ -12,9 +12,9 @@ mod source_cache;
 mod commit;
 use commit::PendingCommit;
 mod prefix;
-pub(crate) use prefix::{release_snapshot_tails, snapshot_gain, CompressorPrefix, COMPRESSOR_PREFIX_BYTES};
+pub(crate) use prefix::COMPRESSOR_PREFIX_BYTES;
 use source_cache::SourceCache;
-pub(crate) use source_cache::{Gain, IndexCacheView, KvCacheView, Pressure, SourcePoolExhausted};
+pub(crate) use source_cache::{IndexCacheView, KvCacheView, SourcePoolExhausted, PAGE_ROWS, SOURCE_ROW_BYTES};
 pub(crate) use source_cache::replica::SourceReplica;
 static NEXT_PROPOSAL: AtomicU64 = AtomicU64::new(1);
 pub(crate) fn reserve_source_snapshot() -> Result<u64> {
@@ -62,6 +62,9 @@ pub(crate) struct CompressorState<'a> {
     slot_count: usize,
     layer: usize,
     owner: u64,
+    /// The prefix engine binds every lease's pages (`bind`). Off (component use): a lease gets
+    /// its slot's own fixed slab of `pages / slots` pages, the fully provisioned layout.
+    engine_pages: bool,
 }
 impl<'a> CompressorState<'a> {
     pub fn replica(&self) -> Option<std::rc::Rc<SourceReplica<'a>>> {
@@ -117,7 +120,14 @@ impl<'a> CompressorState<'a> {
             slot_count: slots,
             layer,
             owner,
+            engine_pages: false,
         })
+    }
+    /// Leases start unbound; the prefix engine binds their pages ([`CompressorState::bind`]).
+    pub fn use_engine_pages(&mut self) -> Result<()> {
+        ensure!(self.slots.iter().all(|s| s.request.is_none()), "page ownership changes only before admission");
+        self.engine_pages = true;
+        Ok(())
     }
     pub fn begin_request(&mut self, slot: usize, request: u64) -> Result<CompressorLease> {
         ensure!(
@@ -133,6 +143,11 @@ impl<'a> CompressorState<'a> {
             .checked_add(1)
             .context("compressor generation exhausted")?;
         self.index.reset(slot)?;
+        if !self.engine_pages {
+            let per_slot = self.index.page_count() / self.slot_count;
+            let pages: Vec<u32> = (slot * per_slot..(slot + 1) * per_slot).map(|p| p as u32).collect();
+            self.index.bind(slot, &pages, 0)?;
+        }
         self.slots[slot] = Slot {
             generation,
             request: Some(request),
@@ -173,16 +188,27 @@ impl<'a> CompressorState<'a> {
     pub(crate) fn ensure_not_writing(&self, lease: CompressorLease) -> Result<()> {
         self.validate(lease).map(|_| ())
     }
-    /// This source's pool under the append transaction `work` (`SourceCache::pressure`).
-    pub fn pressure(&self, work: &[(CompressorLease, u32)]) -> Result<Pressure> {
-        self.index.pressure(&self.appends(work)?)
-    }
     pub fn check_append_capacity(&self, work: &[(CompressorLease, u32)]) -> Result<()> {
         self.index.reserve(&self.appends(work)?).map(|_| ())
     }
-    /// `check_append_capacity`, as if the references `pressure` counts as dropped were gone.
-    pub fn check_append_capacity_released(&self, work: &[(CompressorLease, u32)], pressure: &Pressure) -> Result<()> {
-        self.index.check_released(&self.appends(work)?, pressure)
+    /// Bind physical `pages` (in row order) to a fresh or growing lease, with `rows` initialized
+    /// (rows of pages the prefix engine forked). See `SourceCache::bind`.
+    pub fn bind(&mut self, lease: CompressorLease, pages: &[u32], rows: usize) -> Result<()> {
+        let slot = self.validate(lease)?;
+        self.index.bind(slot, pages, rows)
+    }
+    /// Shrink a lease's binding to `pages`, a prefix of its pages holding its `rows`.
+    pub fn rebind(&mut self, lease: CompressorLease, pages: &[u32], rows: usize) -> Result<()> {
+        let slot = self.validate(lease)?;
+        self.index.shrink(slot, pages, rows)
+    }
+    /// Pages bound to a lease and its initialized source rows.
+    pub fn binding(&self, lease: CompressorLease) -> Result<(&[u32], usize)> {
+        Ok(self.index.binding(self.validate_identity(lease)?))
+    }
+    /// Source rows per model token: 2 tokens per row at the ratio-two sources, 1 at layer 20.
+    pub fn ratio(&self) -> usize {
+        ratio(self.layer).expect("a compressor source layer")
     }
     /// `work`'s source rows: `(slot, old rows, new rows)` for `SourceCache::reserve`.
     fn appends(&self, work: &[(CompressorLease, u32)]) -> Result<Vec<(usize, usize, usize)>> {

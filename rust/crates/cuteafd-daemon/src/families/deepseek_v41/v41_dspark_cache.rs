@@ -14,7 +14,6 @@ static NEXT_OWNER: AtomicU64 = AtomicU64::new(1);
 mod prefix;
 mod queued;
 pub(crate) use queued::WindowWrite;
-pub(crate) use prefix::DsparkPrefix;
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) struct WindowLease {
     owner: u64,
@@ -102,8 +101,9 @@ impl Drop for WriteReservation {
     }
 }
 pub(crate) struct DsparkWindow<'a> {
-    prefix_copies: [crate::shared::memory::SnapshotCopies<'a, (WindowLease, DsparkPrefix<'a>, ReadReservation)>; 2],
-    prefix_pool: Option<crate::shared::memory::SnapshotPool<'a>>,
+    /// Per capture lane: a stream for queued ring copies and the reservation keeping the
+    /// captured slot read-only meanwhile.
+    prefix_copies: [crate::shared::memory::SnapshotCopies<'a, (WindowLease, ReadReservation)>; 2],
     stream: LoadStream<'a>,
     kernel: V41DsparkCache<'a>,
     source: DeviceAllocation<'a>,
@@ -144,7 +144,6 @@ impl<'a> DsparkWindow<'a> {
         let mut value = Self {
             prefix_copies: [crate::shared::memory::SnapshotCopies::new(library)?,
                 crate::shared::memory::SnapshotCopies::new(library)?],
-            prefix_pool: None,
             stream: LoadStream {
                 library,
                 raw: library.cuda_stream_create()?,
@@ -473,7 +472,8 @@ mod reservation_tests {
         let first_write = window.prepare_async_write(&[chunk(first, 2)], 2)?;
         let second_write = window.prepare_async_write(&[chunk(second, 2)], 2)?;
         assert!(window.attention_read(&[(first, 2)]).is_err());
-        assert!(window.retain_prefix(first).is_err());
+        let ring = DeviceAllocation::new(&lib, V41DsparkCache::SLOT_BYTES)?;
+        assert!(window.capture_ring(first, ring.buffer).is_err());
         assert!(window.release(first).is_err());
         assert_eq!(window.committed_end(first)?, Some(2));
         let descriptors = [DeviceAllocation::new(&lib, 384)?, DeviceAllocation::new(&lib, 384)?];

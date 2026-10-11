@@ -24,10 +24,8 @@ fn highest_physical_page_scatter_score_attention_and_fork() -> Result<()> {
         raw: library.cuda_stream_create()?,
     };
     let mut cache = SourceCache::new(&library, 262144, 2)?;
-    // Normal allocation starts at low pages. Place the highest page at the
-    // next allocation position without fabricating initialized rows.
-    let last = cache.pool.borrow().free.len() - 1;
-    cache.pool.borrow_mut().free.swap(0, last);
+    // Bind the highest physical page without fabricating initialized rows.
+    cache.bind(0, &[262143], 0)?;
     let plan = cache.reserve(&[(0, 0, 256)])?;
     let destinations: Vec<_> = (0..256)
         .map(|row| cache.destination(&plan, 0, row))
@@ -203,8 +201,11 @@ fn highest_physical_page_scatter_score_attention_and_fork() -> Result<()> {
     // Copy all four planes from a retained high partial page into a low page,
     // append privately, and verify the original highest row was not overwritten.
     let original = super::tests::read(&cache, 0, 256)?;
-    let prefix = cache.retain_prefix(0, 255)?;
-    cache.restore_prefix(1, &prefix)?;
+    unsafe {
+        cache.copy_page_rows(262143, 0, 255, stream.raw)?;
+        library.cuda_stream_synchronize(stream.raw)?;
+    }
+    cache.bind(1, &[0], 255)?;
     super::tests::append(&mut cache, 1, 255, 256, 0x11, stream.raw)?;
     assert_ne!(cache.pages[0][0], cache.pages[1][0]);
     assert_eq!(super::tests::read(&cache, 0, 256)?, original);
@@ -213,8 +214,6 @@ fn highest_physical_page_scatter_score_attention_and_fork() -> Result<()> {
     assert!(branch[255 * SOURCE_ROW_BYTES..].iter().all(|&v| v == 0x11));
     cache.release(0)?;
     cache.release(1)?;
-    drop(prefix);
-    assert_eq!(cache.pool.borrow().free.len(), 262144);
     eprintln!("PASS highest row=67108863, KV byte offset=17179868928; scatter, both index scorers, attention, four-plane COW");
     Ok(())
 }

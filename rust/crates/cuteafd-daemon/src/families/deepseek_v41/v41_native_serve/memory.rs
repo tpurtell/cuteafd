@@ -185,7 +185,7 @@ pub(super) fn admit_small_card_startup(lib: &cuteafd_ffi::NativeLibrary,
     }
     ensure!(args.prefix_cache_entries <= 128, "invalid retained-turn limit");
     let snapshot_slots = if args.prefix_cache_entries == 0 { 0 } else { 2 * args.prefix_cache_entries as usize + 2 };
-    let snapshots = snapshot_slots * (crate::families::deepseek_v41::v41_backbone_cache::BackbonePrefix::device_bytes().div_ceil(256) * 256
+    let snapshots = snapshot_slots * (crate::families::deepseek_v41::v41_backbone_cache::BackboneMark::BYTES
         + if args.dspark { 3 * 128 * 528 } else { 0 });
     owners.push(("snapshot arenas", snapshots));
     let fixed = owners.iter().try_fold(0usize, |n, (_, b)| n.checked_add(*b).context("startup fixed-owner overflow"))?;
@@ -581,7 +581,7 @@ mod tests {
 
     #[test]
     fn snapshot_arenas_are_fixed_occupancy_without_changing_pool_tokens() {
-        let tail = crate::families::deepseek_v41::v41_backbone_cache::BackbonePrefix::device_bytes().div_ceil(256) * 256;
+        let tail = crate::families::deepseek_v41::v41_backbone_cache::BackboneMark::BYTES;
         let bytes = 50 * (tail + 3 * cuteafd_ffi::V41DsparkCache::SLOT_BYTES);
         let free = 56 << 30;
         let total = 96 << 30;

@@ -14,18 +14,24 @@ use cuteafd_ffi::NativeLibrary;
 use cuteafd_loader::{EngramPipeline, EngramRequestTokens, EngramWave};
 use cuteafd_transport::ExpertV2SourceKind;
 
+/// The `slots` index of `lease`.
+fn lease_slot(slots: &[Option<Request>], lease: CacheLease) -> Result<usize> {
+    slots.iter().position(|r| r.as_ref().is_some_and(|r| r.lease == lease)).context("request history missing")
+}
 struct Request {
     lease: CacheLease,
     history: EngramHistory,
     prefill: Option<EngramPrefillCursor>,
     images: RequestImages,
 }
-pub(crate) struct RequestPrefix<'a> {
-    cache: crate::families::deepseek_v41::v41_backbone_cache::BackbonePrefix<'a>,
-    history: EngramHistory,
-}
-impl RequestPrefix<'_> {
-    pub fn end(&self) -> u64 { self.cache.end() }
+/// A request's part of a prefix snapshot besides its device mark: the backbone's frontiers and
+/// the Engram lookback, as plain data.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct RequestMark {
+    pub backbone: crate::families::deepseek_v41::v41_backbone_cache::BackboneMark,
+    /// Engram history position and compressed lookback (chronological; None: image barrier).
+    pub engram_position: u64,
+    pub engram_recent: Vec<Option<u32>>,
 }
 pub(crate) struct RequestTokens<'a> {
     pub lease: CacheLease,
@@ -62,9 +68,14 @@ impl Drop for RequestBatch {
 }
 pub(crate) struct Requests<'a> {
     cache: BackboneCache<'a>,
-    prefix_histories: [Option<(CacheLease, EngramHistory)>; 2],
+    /// Per capture lane: the lease whose snapshot is queued.
+    prefix_leases: [Option<CacheLease>; 2],
     pipeline: EngramPipeline,
     slots: Vec<Option<Request>>,
+    /// Per slot: prefix-engine units (512 tokens) the slot's sources are bound to.
+    units: Vec<Vec<u32>>,
+    /// Units of released slots, for the prefix engine to unreference once their consumers drained.
+    released_units: Vec<Vec<u32>>,
     image_requests: usize,
     /// Requests released so far; admission waiters retry when it moves.
     releases: u64,
@@ -79,9 +90,11 @@ impl<'a> Requests<'a> {
     ) -> Result<Self> {
         Ok(Self {
             cache: BackboneCache::new(library, slots, pages, cache_budget)?,
-            prefix_histories: [None, None],
+            prefix_leases: [None, None],
             pipeline,
             slots: (0..slots).map(|_| None).collect(),
+            units: vec![Vec::new(); slots],
+            released_units: Vec::new(),
             image_requests: 0,
             releases: 0,
         })
@@ -96,9 +109,11 @@ impl<'a> Requests<'a> {
     ) -> Result<Self> {
         Ok(Self {
             cache: BackboneCache::new_distributed(library, map, slots, pages, budgets)?,
-            prefix_histories: [None, None],
+            prefix_leases: [None, None],
             pipeline,
             slots: (0..slots).map(|_| None).collect(),
+            units: vec![Vec::new(); slots],
+            released_units: Vec::new(),
             image_requests: 0,
             releases: 0,
         })
@@ -109,7 +124,11 @@ impl<'a> Requests<'a> {
     pub fn new_replicated(library:&'a NativeLibrary,pipeline:EngramPipeline,slots:usize,
         pages:[usize;4],map:crate::families::deepseek_v41::v41_backbone_cache::CachePlacement,budgets:[usize;2])->Result<Self> {
         Ok(Self { cache:BackboneCache::new_replicated(library,map,slots,pages,budgets)?,
-            prefix_histories:[None,None],pipeline,slots:(0..slots).map(|_|None).collect(),image_requests:0,releases:0 })
+            prefix_leases:[None,None],pipeline,slots:(0..slots).map(|_|None).collect(),units:vec![Vec::new();slots],
+            released_units:Vec::new(),image_requests:0,releases:0 })
+    }
+    fn request_identity(&self, lease: CacheLease) -> Result<&Request> {
+        self.slots.iter().flatten().find(|r| r.lease == lease).context("request history missing")
     }
     fn request(&self, lease: CacheLease) -> Result<&Request> {
         self.cache.request_id(lease)?;
@@ -164,10 +183,18 @@ impl<'a> Requests<'a> {
         if !self.slots[slot].as_ref().unwrap().images.is_empty() { self.image_requests -= 1; }
         self.slots[slot] = None;
         self.releases += 1;
+        let units = std::mem::take(&mut self.units[slot]);
         // Cache failure invalidation may already have revoked its root lease.
         if self.cache.request_id(lease).is_ok() {
-            self.cache.release(&[lease])?;
+            if let Err(error) = self.cache.release(&[lease]) {
+                // A failed cleanup may leave consumers of these pages queued: never hand them out
+                // again.
+                tracing::error!(%error, units = units.len(), "request cleanup failed; its units stay held");
+                std::mem::forget(units);
+                return Err(error);
+            }
         }
+        if !units.is_empty() { self.released_units.push(units); }
         Ok(())
     }
     /// Moves whenever a request is released.
@@ -176,60 +203,106 @@ impl<'a> Requests<'a> {
         if self.slots.iter().flatten().any(|r| r.lease == lease) { self.release(lease)?; }
         Ok(())
     }
-    pub fn install_prefix_pool(&mut self, pool: crate::shared::memory::SnapshotPool<'a>) -> Result<()> {
-        self.cache.install_prefix_pool(pool)
+    /// The prefix engine owns every request's source pages (call before admission).
+    pub fn use_engine_pages(&mut self) -> Result<()> {
+        self.cache.use_engine_pages()
     }
-    pub fn retain_prefix(&mut self, lease: CacheLease, budget: usize) -> Result<RequestPrefix<'a>> {
+    /// Bind prefix-engine `units` (512 tokens each; their physical pages per source are
+    /// `pages[i]`) to a fresh or growing request, with `rows[i]` forked rows initialized. The
+    /// request owns these unit references until it is released.
+    pub fn bind_units(&mut self, lease: CacheLease, units: Vec<u32>, pages: [&[u32]; 4], rows: [usize; 4]) -> Result<()> {
+        self.request(lease)?;
+        ensure!(units.starts_with(&self.units[lease_slot(&self.slots, lease)?]), "unit binding rewrites a request's units");
+        self.cache.bind_sources(lease, pages, rows)?;
+        let slot = lease_slot(&self.slots, lease)?;
+        self.units[slot] = units;
+        Ok(())
+    }
+    /// Shrink an idle request's binding to `units` (a prefix of its units); the caller releases
+    /// the rest. Rows past the new binding were never written.
+    pub fn rebind_shrunk(&mut self, lease: CacheLease, units: Vec<u32>, pages: [&[u32]; 4], rows: [usize; 4]) -> Result<()> {
+        self.request(lease)?;
+        let slot = lease_slot(&self.slots, lease)?;
+        ensure!(self.units[slot].starts_with(&units), "shrunk binding is not a prefix of the request's units");
+        self.cache.rebind_sources(lease, pages, rows)?;
+        self.units[slot] = units;
+        Ok(())
+    }
+    /// A request's committed Engram position and compressed lookback (chronological).
+    pub fn engram_lookback(&self, lease: CacheLease) -> Result<(u64, Vec<Option<u32>>)> {
+        let request = self.request(lease)?;
+        Ok((request.history.position(), request.history.lookback()))
+    }
+    /// Whether a snapshot copy of this bank is queued on capture lane `lane`.
+    pub fn mark_pending(&self, lane: usize) -> bool {
+        self.prefix_leases.get(lane).is_some_and(Option::is_some)
+    }
+    /// Units a request's sources are bound to.
+    pub fn units(&self, lease: CacheLease) -> Result<&[u32]> {
+        self.request(lease)?;
+        Ok(&self.units[lease_slot(&self.slots, lease)?])
+    }
+    /// Forget a live request's units without releasing them: the prefix engine already owns
+    /// their references (it abandons a placement whose restore failed).
+    pub fn take_units(&mut self, lease: CacheLease) -> Vec<u32> {
+        lease_slot(&self.slots, lease).map(|slot| std::mem::take(&mut self.units[slot])).unwrap_or_default()
+    }
+    /// Drop a released request's queued units (the prefix engine releases them itself).
+    pub fn forget_released_units(&mut self, units: &[u32]) {
+        if let Some(i) = self.released_units.iter().rposition(|queued| queued == units) {
+            self.released_units.swap_remove(i);
+        }
+    }
+    /// Units of released requests, for the prefix engine to unreference (after it drains).
+    pub fn take_released_units(&mut self) -> Vec<Vec<u32>> {
+        std::mem::take(&mut self.released_units)
+    }
+    fn mark_of(&self, request: &Request, backbone: crate::families::deepseek_v41::v41_backbone_cache::BackboneMark)
+        -> RequestMark {
+        RequestMark { backbone, engram_position: request.history.position(), engram_recent: request.history.lookback() }
+    }
+    /// Copy a complete request's backbone mark into `mark` (synchronously) and describe it.
+    pub fn capture_mark(&mut self, lease: CacheLease, mark: cuteafd_ffi::CuteafdDeviceBuffer) -> Result<RequestMark> {
         let request = self.request(lease)?;
         ensure!(request.prefill.is_none() && request.history.position() == self.cache.committed_end(lease)?,
             "request prefix has pending or inconsistent history");
-        let history = request.history.fork()?;
-        let cache = self.cache.retain_prefix(lease, budget)?;
-        Ok(RequestPrefix { cache, history })
+        let backbone = self.cache.capture_mark(lease, mark)?;
+        Ok(self.mark_of(self.request(lease)?, backbone))
     }
-    pub fn queue_prefix(&mut self, lane: usize, lease: CacheLease) -> Result<()> {
-        ensure!(self.prefix_histories.get(lane).context("invalid snapshot lane")?.is_none(),
+    /// [`Requests::capture_mark`] queued on capture lane `lane`.
+    pub fn queue_mark(&mut self, lane: usize, lease: CacheLease, mark: cuteafd_ffi::CuteafdDeviceBuffer) -> Result<RequestMark> {
+        ensure!(self.prefix_leases.get(lane).context("invalid snapshot lane")?.is_none(),
             "request snapshot lane is occupied");
         let request = self.request(lease)?;
         ensure!(request.prefill.is_none() && request.history.position() == self.cache.committed_end(lease)?,
             "request prefix has pending or inconsistent history");
-        let history = request.history.fork()?;
-        self.cache.queue_prefix(lane, lease, crate::families::deepseek_v41::v41_backbone_cache::BackbonePrefix::device_bytes())?;
-        self.prefix_histories[lane] = Some((lease, history));
-        Ok(())
+        let backbone = self.cache.queue_mark(lane, lease, mark)?;
+        self.prefix_leases[lane] = Some(lease);
+        Ok(self.mark_of(self.request_identity(lease)?, backbone))
     }
-    pub fn prefix_ready(&self, lane: usize, lease: CacheLease) -> Result<bool> {
-        ensure!(self.prefix_histories.get(lane).and_then(Option::as_ref).is_some_and(|(l, _)| *l == lease),
-            "request snapshot owner differs");
-        self.cache.prefix_ready(lane, lease)
+    pub fn mark_ready(&mut self, lane: usize) -> Result<bool> {
+        ensure!(self.prefix_leases.get(lane).is_some_and(Option::is_some), "no request snapshot is pending");
+        let ready = self.cache.mark_ready(lane)?;
+        if ready { self.prefix_leases[lane] = None; }
+        Ok(ready)
     }
-    pub fn finish_prefix(&mut self, lane: usize, lease: CacheLease) -> Result<RequestPrefix<'a>> {
-        ensure!(self.prefix_ready(lane, lease)?, "request snapshot copies are incomplete");
-        let cache = self.cache.finish_prefix(lane, lease)?;
-        let history = self.prefix_histories[lane].take().unwrap().1;
-        Ok(RequestPrefix { cache, history })
-    }
-    pub fn abort_prefix(&mut self, lane: usize) -> Result<()> {
-        let drained = self.cache.abort_prefix(lane);
-        if let Some(history) = self.prefix_histories.get_mut(lane) { *history = None; }
+    pub fn abort_mark(&mut self, lane: usize) -> Result<()> {
+        let drained = self.cache.abort_mark(lane);
+        if let Some(lease) = self.prefix_leases.get_mut(lane) { *lease = None; }
         drained
     }
-    pub fn restore_prefix(&mut self, lease: CacheLease, prefix: &RequestPrefix<'a>) -> Result<()> {
-        self.restore_retained(lease, prefix, None)
-    }
-    pub fn restore_encoder_continuation(&mut self, lease: CacheLease,
-        prefix: &RequestPrefix<'a>, prompt_end: u64) -> Result<()> {
-        self.restore_retained(lease, prefix, Some(prompt_end))
-    }
-    fn restore_retained(&mut self, lease: CacheLease, prefix: &RequestPrefix<'a>,
+    /// Restore an exact snapshot (`saved`, its bytes in `mark`) into a fresh request whose
+    /// sources hold its rows. With `prompt_end`, the restored frontier continues the encoder
+    /// over a suffix of at least 128 rows instead (decoder rings start fresh).
+    pub fn restore_mark(&mut self, lease: CacheLease, saved: &RequestMark, mark: cuteafd_ffi::CuteafdDeviceBuffer,
         prompt_end: Option<u64>) -> Result<()> {
         let request = self.request(lease)?;
         ensure!(request.history.position() == 0 && request.prefill.is_none()
-            && prefix.history.position() == prefix.cache.end(), "invalid request prefix restore");
-        let history = prefix.history.fork()?;
+            && saved.engram_position == saved.backbone.end, "invalid request prefix restore");
+        let history = EngramHistory::from_recent(request.history.pad_id(), saved.engram_position, &saved.engram_recent)?;
         let restored = match prompt_end {
-            Some(end) => self.cache.restore_encoder_continuation(lease, &prefix.cache, end),
-            None => self.cache.restore_prefix(lease, &prefix.cache),
+            Some(end) => self.cache.restore_encoder_continuation(lease, &saved.backbone, mark, end),
+            None => self.cache.restore_mark(lease, &saved.backbone, mark),
         };
         if let Err(error) = restored {
             if let Err(cleanup) = self.release(lease) {
@@ -248,13 +321,10 @@ impl<'a> Requests<'a> {
             .map(|m| m.into_iter().map(u8::from).collect::<Vec<_>>());
         self.pipeline.history_at(start as u64, &prompt[recent_start..start], image_mask.as_deref())
     }
-    pub fn restore_encoder_prefix(
-        &mut self,
-        lease: CacheLease,
-        prefix: &RequestPrefix<'a>,
-        end: usize,
-        prompt: &[u32],
-    ) -> Result<usize> {
+    /// A partial hit: sources hold the snapshot's rows through the even-aligned `end`; encoder
+    /// windows restart empty at `end - 128` and Engram history is rebuilt there from the
+    /// prompt's native token ids. Returns the replay start.
+    pub fn restore_encoder_prefix(&mut self, lease: CacheLease, end: usize, prompt: &[u32]) -> Result<usize> {
         let request = self.request(lease)?;
         ensure!(
             request.history.position() == 0 && request.prefill.is_none() && end <= prompt.len(),
@@ -262,10 +332,7 @@ impl<'a> Requests<'a> {
         );
         let start = end.saturating_sub(128);
         let history = self.encoder_history_at(lease, start, prompt)?;
-        if let Err(error) =
-            self.cache
-                .restore_encoder_prefix(lease, &prefix.cache, end as u64, prompt.len() as u64)
-        {
+        if let Err(error) = self.cache.restore_encoder_prefix(lease, end as u64, prompt.len() as u64) {
             if let Err(cleanup) = self.release_if_present(lease) {
                 tracing::error!(%cleanup, "releasing failed encoder history restore");
             }
@@ -740,11 +807,3 @@ mod tests {
 #[cfg(test)]
 mod image_tests;
 
-impl<'a> RequestPrefix<'a> {
-    pub fn parts(&self) -> (&crate::families::deepseek_v41::v41_backbone_cache::BackbonePrefix<'a>, &EngramHistory) {
-        (&self.cache, &self.history)
-    }
-    pub fn from_parts(cache: crate::families::deepseek_v41::v41_backbone_cache::BackbonePrefix<'a>, history: EngramHistory) -> Self {
-        Self { cache, history }
-    }
-}

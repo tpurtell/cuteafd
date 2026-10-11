@@ -135,6 +135,17 @@ impl<'a> CudaCopyEngine<'a> {
         engine.owners = owners;
         Ok(engine)
     }
+    /// Register `buffers` the caller keeps alive past the cache (pools) and `owners` the engine
+    /// keeps alive until its queues drain (arenas), on every device they span.
+    pub fn registered_with_owners(library: &'a NativeLibrary, buffers: &[CuteafdDeviceBuffer],
+        owners: Vec<Rc<Allocation<'a>>>) -> Result<Self> {
+        ensure!(owners.iter().all(|owner| std::ptr::eq(owner.device.library, library)),
+            "snapshot allocations belong to a different native library");
+        let all: Vec<_> = buffers.iter().copied().chain(owners.iter().map(|owner| owner.buffer)).collect();
+        let mut engine = Self::registered(library, &all)?;
+        engine.owners = owners;
+        Ok(engine)
+    }
     fn create(library: &'a NativeLibrary, template: CuteafdDeviceBuffer, regions: Option<Regions>) -> Result<Self> {
         let ids = regions.as_ref().map(|r| r.devices.clone()).unwrap_or_else(|| vec![template.device_id]);
         let mut streams = Vec::with_capacity(ids.len());

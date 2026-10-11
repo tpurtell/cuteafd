@@ -196,6 +196,14 @@ impl EngramHistory {
         self.pad
     }
 
+    /// The committed lookback in chronological order, `min(position, 3)` entries (None: an
+    /// image barrier): with `pad_id` and `position`, what [`EngramHistory::from_recent`] needs to
+    /// rebuild this history under a fresh identity.
+    pub fn lookback(&self) -> Vec<Option<u32>> {
+        let count = self.position.min(3) as usize;
+        self.recent[..count].iter().rev().copied().collect()
+    }
+
     pub fn position(&self) -> u64 {
         self.position
     }
@@ -299,6 +307,10 @@ mod tests {
             assert!(resumed.commit(&expected, 1).is_err());
             assert!(full.commit(&actual, 1).is_err());
             resumed.commit(&actual, 2)?;
+            // The lookback a snapshot records rebuilds the same history.
+            assert_eq!(full.lookback(), recent);
+            let rebuilt = super::EngramHistory::from_recent(2, full.position(), &full.lookback())?;
+            assert_eq!(rebuilt.prepare(position as u64, &next, next.len())?.hashes, expected.hashes);
             if position < tokens.len() {
                 let step = full.prepare(position as u64, &tokens[position..position + 1], 1)?;
                 full.commit(&step, 1)?;

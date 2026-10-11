@@ -1,7 +1,7 @@
 //! One request lease spans every backbone window and compressed source.
 use crate::families::deepseek_v41::v41_backbone_router::ExpertRow;
 use crate::families::deepseek_v41::v41_compressor::{
-    CompressorChunk, CompressorLease, CompressorState, CompressorWave, IndexProposal, Pressure,
+    CompressorChunk, CompressorLease, CompressorState, CompressorWave, IndexProposal,
 };
 use crate::families::deepseek_v41::v41_index_selection::SelectionRequest;
 use crate::families::deepseek_v41::v41_sparse_attention::AttentionRequest;
@@ -20,7 +20,7 @@ mod prefix;
 mod placement;
 pub(crate) mod peer_inputs;
 pub(crate) use placement::CachePlacement;
-pub(crate) use prefix::BackbonePrefix;
+pub(crate) use prefix::{BackboneMark, UNIT_BYTES, UNIT_TOKENS};
 use ced::CachePhase;
 pub(crate) use ced::CacheStage;
 
@@ -170,9 +170,11 @@ impl CacheAttention<'_> {
 }
 
 pub(crate) struct BackboneCache<'a> {
-    prefix_copies: [crate::shared::memory::SnapshotCopies<'a, (CacheLease, BackbonePrefix<'a>)>; 2],
-    prefix_pool: Option<crate::shared::memory::SnapshotPool<'a>>,
+    /// Per capture lane: a stream for queued snapshot copies and the lease it captures.
+    prefix_copies: [crate::shared::memory::SnapshotCopies<'a, CacheLease>; 2],
     prefix_stream: crate::shared::memory::LoadStream<'a>,
+    #[cfg(test)]
+    test_queued: [Option<(CacheLease, crate::shared::memory::DeviceAllocation<'a>, BackboneMark)>; 2],
     windows: Vec<DeviceOwner<'a, WindowState<'a>>>,
     sources: Vec<DeviceOwner<'a, CompressorState<'a>>>,
     requests: Vec<Option<Request>>,
@@ -330,8 +332,9 @@ impl<'a> BackboneCache<'a> {
         Ok(Self {
             prefix_copies: [crate::shared::memory::SnapshotCopies::new(library)?,
                 crate::shared::memory::SnapshotCopies::new(library)?],
-            prefix_pool: None,
             prefix_stream: crate::shared::memory::LoadStream { library, raw: library.cuda_stream_create()? },
+            #[cfg(test)]
+            test_queued: [None, None],
             windows,
             sources,
             requests: (0..slots).map(|_| None).collect(),
@@ -361,7 +364,7 @@ impl<'a> BackboneCache<'a> {
     }
     fn request(&self, lease: CacheLease) -> Result<&Request> {
         let request = self.request_identity(lease)?;
-        ensure!(!self.prefix_copies.iter().any(|p| p.pending.as_ref().is_some_and(|(l, _)| *l == lease)),
+        ensure!(!self.prefix_copies.iter().any(|p| p.pending.as_ref().is_some_and(|l| *l == lease)),
             "backbone request has pending snapshot copies");
         Ok(request)
     }
@@ -453,28 +456,49 @@ impl<'a> BackboneCache<'a> {
             _ => end,
         })
     }
-    /// Each compressed source's pool under the append transaction `work`, in `sources()` order:
-    /// what a retained snapshot's eviction is weighed against.
-    pub fn pressure(&self, work: &[(CacheLease, u32)]) -> Result<Vec<Pressure>> {
-        self.sources.iter().enumerate()
-            .map(|(i, source)| source.pressure(&self.source_work(i, work)?))
-            .collect()
-    }
+    /// Whether every request of `work` can append its tokens inside its bound pages; an error
+    /// (`SourcePoolExhausted` past the binding) names the first that cannot.
     pub fn check_append_capacity(&self, work: &[(CacheLease, u32)]) -> Result<()> {
         for (i, source) in self.sources.iter().enumerate() {
             source.check_append_capacity(&self.source_work(i, work)?)?;
         }
         Ok(())
     }
-    /// `check_append_capacity`, as if the references each source's `pressure` counts as
-    /// dropped were gone. Each pressure must be its own source's.
-    pub fn check_append_capacity_released(&self, work: &[(CacheLease, u32)], pressure: &[Pressure]) -> Result<()> {
-        ensure!(pressure.len() == self.sources.len(), "pressure for {} sources, the cache has {}",
-            pressure.len(), self.sources.len());
-        for (i, (source, pressure)) in self.sources.iter().zip(pressure).enumerate() {
-            source.check_append_capacity_released(&self.source_work(i, work)?, pressure)?;
+    /// The prefix engine binds every request's source pages; leases start unbound. Call once,
+    /// before admission.
+    pub fn use_engine_pages(&mut self) -> Result<()> {
+        ensure!(self.requests.iter().all(Option::is_none), "page ownership changes only before admission");
+        for source in &mut self.sources {
+            let device = source.device;
+            device.run(|| source.use_engine_pages())?;
         }
         Ok(())
+    }
+    /// Bind each source's physical pages (`pages[i]`, row order) to a fresh or growing request,
+    /// with the rows forked pages already hold (`rows[i]`).
+    pub fn bind_sources(&mut self, lease: CacheLease, pages: [&[u32]; 4], rows: [usize; 4]) -> Result<()> {
+        let sources = self.request(lease)?.sources;
+        for (((state, lease), pages), rows) in self.sources.iter_mut().zip(sources).zip(pages).zip(rows) {
+            let device = state.device;
+            device.run(|| state.bind(lease, pages, rows))?;
+        }
+        Ok(())
+    }
+    /// Shrink a request's source bindings to `pages` (a prefix of each); see `SourceCache::rebind`.
+    pub fn rebind_sources(&mut self, lease: CacheLease, pages: [&[u32]; 4], rows: [usize; 4]) -> Result<()> {
+        let sources = self.request(lease)?.sources;
+        for (((state, lease), pages), rows) in self.sources.iter_mut().zip(sources).zip(pages).zip(rows) {
+            let device = state.device;
+            device.run(|| state.rebind(lease, pages, rows))?;
+        }
+        Ok(())
+    }
+    /// Each source's rows per model token and page count, in `sources()` order.
+    pub fn source_geometry(&self) -> [(usize, usize); 4] {
+        std::array::from_fn(|i| {
+            let state = self.sources[i].get();
+            (state.ratio(), state.source_cache().page_count())
+        })
     }
     fn source_work(&self, source: usize, work: &[(CacheLease, u32)]) -> Result<Vec<(CompressorLease, u32)>> {
         work.iter().map(|&(lease, tokens)| Ok((self.request(lease)?.sources[source], tokens))).collect()
@@ -1000,9 +1024,6 @@ mod context_geometry_tests {
 impl<'a> BackboneCache<'a> {
     pub fn owner(&self) -> u64 {
         self.owner
-    }
-    pub fn prefix_pool(&self) -> Option<&crate::shared::memory::SnapshotPool<'a>> {
-        self.prefix_pool.as_ref()
     }
     pub fn prefix_library(&self) -> &'a NativeLibrary {
         self.prefix_stream.library

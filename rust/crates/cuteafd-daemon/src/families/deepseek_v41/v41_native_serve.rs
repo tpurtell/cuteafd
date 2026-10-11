@@ -11,7 +11,6 @@ use scores::RetainedScores;
 mod copy_drafts;
 pub(crate) mod prefix;
 pub(crate) mod memory;
-use crate::families::deepseek_v41::v41_backbone_cache::BackboneCache;
 use crate::families::deepseek_v41::v41_backbone_execution::BackboneExecution;
 use crate::families::deepseek_v41::v41_backbone_execution::CacheProducerWeights;
 use crate::families::deepseek_v41::v41_backbone_lane::BackboneLane;
@@ -599,10 +598,10 @@ fn worker(
         (args.prefix_cache_entries as usize).checked_mul(2).and_then(|n| n.checked_add(2))
             .context("snapshot slot count overflow")?
     };
-    let target_prefix_pool = (snapshot_slots > 0).then(|| crate::shared::memory::SnapshotPool::new(
-        &lib, crate::families::deepseek_v41::v41_backbone_cache::BackbonePrefix::device_bytes(), snapshot_slots)).transpose()?;
-    let draft_snapshot_bytes = draft.as_mut().map(|d| d.reserve_prefixes(snapshot_slots)).transpose()?.unwrap_or(0);
-    let snapshot_bytes = target_prefix_pool.as_ref().map_or(0, crate::shared::memory::SnapshotPool::device_bytes) + draft_snapshot_bytes;
+    let prefix_arenas = prefix::Arenas::new(
+        crate::shared::memory::device::Device { library: &lib, id: lib.cuda_get_device()? },
+        draft.as_ref().map(|d| d.mark_device()), snapshot_slots)?;
+    let snapshot_bytes = prefix::Arenas::device_bytes(snapshot_slots, draft.is_some());
     tracing::info!(snapshot_slots, snapshot_bytes, "snapshot arenas reserved before serving");
     cuteafd_ffi::memory_ledger::relabel_other("v41/prefix-snapshots");
     if small_card { memory::startup_phase(&lib, "v41/prefix-snapshots", device_total)?; }
@@ -633,7 +632,7 @@ fn worker(
     let mut requests = Requests::new(&lib, pipeline, args.concurrency as usize, pool.pages, pool.cache_bytes)?;
     cuteafd_ffi::memory_ledger::relabel_other("v41/kv");
     if small_card { memory::startup_phase(&lib, "v41/kv", device_total)?; }
-    if let Some(pool) = target_prefix_pool { requests.install_prefix_pool(pool)?; }
+    requests.use_engine_pages()?;
     let mut local_layers = 0usize;
     // Published only on the single-RTX path; the 2-RTX distributed worker owns
     // its own handshake. Dropping it without a ready acknowledgement leaves the
@@ -734,7 +733,7 @@ fn worker(
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
-    let prefixes = scheduler::prepare_prefix_cache(&lib, &args, &requests)?;
+    let prefixes = scheduler::prepare_prefix_cache(&lib, &args, &requests, prefix_arenas, draft.is_some())?;
     scheduler::publish_capacity(&requests, &prefixes);
     vision.connect()?;
     ready

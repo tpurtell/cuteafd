@@ -304,10 +304,9 @@ pub(super) fn worker(mut args: crate::cli::NativeServeArgs, mut receive: mpsc::R
     memory_checkpoint("vision")?;
     ensure!(args.prefix_cache_entries <= 128, "invalid retained-turn limit");
     let snapshot_slots = if args.prefix_cache_entries == 0 { 0 } else { 2 * args.prefix_cache_entries as usize + 2 };
-    let target_prefix_pool = (snapshot_slots > 0).then(|| crate::shared::memory::SnapshotPool::new(
-        &lib, crate::families::deepseek_v41::v41_backbone_cache::BackbonePrefix::device_bytes(), snapshot_slots)).transpose()?;
-    let draft_snapshot_bytes = draft.as_mut().map(|d| d.reserve_prefixes(snapshot_slots)).transpose()?.unwrap_or(0);
-    let snapshot_bytes = target_prefix_pool.as_ref().map_or(0, crate::shared::memory::SnapshotPool::device_bytes) + draft_snapshot_bytes;
+    let prefix_arenas = super::prefix::Arenas::new(devices[0],
+        draft.as_ref().map(|d| d.mark_device()), snapshot_slots)?;
+    let snapshot_bytes = super::prefix::Arenas::device_bytes(snapshot_slots, draft.is_some());
     memory_checkpoint("snapshot arenas")?;
     // Every other persistent owner is now live. Reserve both transport lanes,
     // minimum routed weights, KV and setup headroom before filling extra layers.
@@ -411,11 +410,11 @@ pub(super) fn worker(mut args: crate::cli::NativeServeArgs, mut receive: mpsc::R
     } else { Requests::new_distributed(&lib,pipeline,args.concurrency as usize,pool.pages,map,pool.cache_bytes)? };
     pass.configure_cache_replicas(requests.cache())?;
     second.configure_cache_replicas(requests.cache())?;
-    if let Some(pool) = target_prefix_pool { requests.install_prefix_pool(pool)?; }
+    requests.use_engine_pages()?;
     memory_checkpoint("allocated KV cache")?;
     crate::shared::memory_report::release_load_staging(&lib);
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
-    let prefixes = scheduler::prepare_prefix_cache(&lib, &args, &requests)?;
+    let prefixes = scheduler::prepare_prefix_cache(&lib, &args, &requests, prefix_arenas, draft.is_some())?;
     scheduler::publish_capacity(&requests, &prefixes);
     tracing::info!(elapsed_ms=started.elapsed().as_millis(), "dual RTX serving owners ready");
     vision.connect()?;

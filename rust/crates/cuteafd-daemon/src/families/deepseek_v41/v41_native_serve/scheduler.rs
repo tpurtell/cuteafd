@@ -9,7 +9,7 @@ use layout::ServingTarget;
 use super::scores::{ScoreRows, VOCAB};
 use crate::families::deepseek_v41::v41_backbone_cache::CacheLease;
 use crate::families::deepseek_v41::v41_requests::RequestBatch;
-use super::prefix::{ImageKeys, PrefixCache, SnapshotKind};
+use super::prefix::{draft_id, keyed, ImageKeys, V41Cache as PrefixCache, SnapshotKind};
 use super::console;
 use super::copy_drafts;
 use crate::shared::speculation::copy::{self as copy_search, LatestWindow};
@@ -27,8 +27,8 @@ pub(crate) fn exercise_distributed_decode<'t, 'd, 'a: 'd>(lib: &'a NativeLibrary
 ) -> Result<()> {
     let (events, mut output) = mpsc::unbounded_channel();
     let (_submit, receive) = mpsc::channel(1);
-    let mut prefixes = PrefixCache::new(2);
-    let image_keys = prefixes.prepare_key(tokens, &[])?;
+    let mut prefixes = PrefixCache::disabled();
+    let image_keys = super::prefix::media_keys(tokens, &[])?;
     let mut request = Active { constraint: None, ticket: console::Ticket::new(id, 0, None), lease,
         job: NativeRequest { prompt: String::new(), constraint: None, images: Vec::new(), media: Vec::new(), audio: Vec::new(), max_tokens: 4, sampling: Default::default(), stop_token_ids: Vec::new(), events, usage: None, probe: None },
         decoder: cuteafd_loader::streaming_token_decoder(snapshot, false)?, anchor,
@@ -145,9 +145,10 @@ fn retire_request<'a, C: DraftChain<'a>>(mut request: Active<'a>, requests: &mut
     if request.cacheable && prefixes.turn_bank_enabled()
         && requests.cache().request_id(request.lease).is_ok() {
         prefixes.capture_session(request.job.usage.as_ref().map(|u| u.session_id().to_owned()));
+        let id = draft_id(&draft, request.id());
         let retained = request.next_after_commit.as_ref().context("finished request has no retained logits")
-            .and_then(|next| prefixes.retain(SnapshotKind::Turn, &request.tokens, &request.image_keys,
-                next, request.id(), request.lease, requests, draft.as_deref_mut()));
+            .and_then(|next| prefixes.retain(requests, draft.as_deref_mut(), SnapshotKind::Turn,
+                &keyed(&request.image_keys, &request.tokens), request.image_keys.spans(), next, request.lease, id));
         if let Err(error) = retained { tracing::warn!(%error, "completed request prefix was not retained"); }
     }
     // Release both owners even if one cleanup reports an error.
@@ -160,25 +161,32 @@ fn retire_request<'a, C: DraftChain<'a>>(mut request: Active<'a>, requests: &mut
 /// cache configuration or allocation failure must fail startup, not leave a
 /// healthy-looking front door whose worker has already exited.
 pub(super) fn prepare_prefix_cache<'a>(lib: &'a NativeLibrary, args: &crate::cli::NativeServeArgs,
-    requests: &Requests<'a>) -> Result<PrefixCache<'a>> {
-    let template = requests.cache().sources()[0].get().source_cache().page_segments(0)[0];
+    requests: &Requests<'a>, arenas: super::prefix::Arenas<'a>, draft: bool) -> Result<PrefixCache<'a>> {
+    let units = requests.cache().unit_capacity();
+    let layout = super::prefix::layout(units, draft, true);
     let mut config = args.host_cache_config()?;
     if matches!(args.host_cache_bytes, super::memory::HostBudget::Auto) {
-        // Logical source capacity, irrespective of which GPU owns each source.
-        // Do not count replicated storage or private COW/tail pages as tokens.
-        let raw_tokens = requests.cache().sources().iter().zip([2u64, 2, 2, 1])
-            .map(|(source, ratio)| source.get().source_cache().capacity as u64 * ratio)
-            .min().context("missing compressed cache sources")?;
+        // Logical unit capacity, irrespective of which GPU owns each source. Do not count
+        // replicated storage or eager tail copies as tokens.
+        let raw_tokens = (units * crate::families::deepseek_v41::v41_backbone_cache::UNIT_TOKENS) as u64;
         let spare_tokens = (u64::from(args.concurrency) + 2*u64::from(args.prefix_cache_entries))*512;
-        let budget = cuteafd_hostcache::budget::plan(raw_tokens.saturating_sub(spare_tokens),
-            args.prefix_cache_entries, args.max_context_tokens, config.chunk_bytes, args.dspark)?;
+        let budget = super::prefix::host_budget(layout, raw_tokens.saturating_sub(spare_tokens),
+            args.prefix_cache_entries, args.max_context_tokens, config.chunk_bytes)?;
         config.bytes = budget.pinned_bytes;
         config.validate()?;
         tracing::info!(target: "cuteafd::host_cache", capacity=?budget,
             "automatic host cache budget (staging and snapshot overhead excluded from token capacity)");
     }
-    let host_cache = super::prefix::HostCacheBinding::new(lib, config, template)?;
-    Ok(PrefixCache::new(args.prefix_cache_entries as usize).with_host_cache(host_cache))
+    let host = if config.enabled() && args.prefix_cache_entries > 0 {
+        let engine = crate::shared::prefix::CudaCopyEngine::registered_with_owners(lib,
+            &requests.cache().source_buffers(), arenas.owners())?;
+        tracing::info!(target: "cuteafd::host_cache", config = ?config, "host snapshot cache enabled");
+        Some((config, engine))
+    } else { None };
+    let entries = args.prefix_cache_entries as usize;
+    let prefix = cuteafd_engine::prefix::PrefixConfig { entries, mark_slots: if entries == 0 { 0 } else { 2 * entries + 2 },
+        keep_logits: true, min_tokens: 1 };
+    PrefixCache::new(arenas, prefix, true, host, layout)
 }
 
 /// The per-second `stats` payload for the serving worker.
@@ -200,6 +208,9 @@ fn serving_stats<C: cuteafd_engine::media::EncoderClient>(prefixes: &PrefixCache
     let mut stats = serde_json::json!({
         "host_cache": prefixes.host_metrics(),
         "host_cache_config": prefixes.host_config(),
+        // The engine's prefix counters: hits by kind, hit tokens, host promotions (host-tier
+        // restores), captures, evictions and page/mark occupancy.
+        "prefix": prefixes.stats(),
         "target_sampling": sampling_stats::snapshot(),
         "dspark_policy": super::speculative::policy_snapshot(),
         "copy_drafts": copy_drafts::stats(),
@@ -276,7 +287,7 @@ fn serve_loop<'w, 'a, P: ServingTarget<'w, 'a>, const SHARED_PREFILL: bool>(lib:
         if let Some(reason) = cuteafd_transport::health::failure_reason() {
             anyhow::bail!("expert wire unavailable until restart: {reason}");
         }
-        prefixes.tick();
+        prefixes.tick(requests, draft.as_deref_mut())?;
         let media_ready = media.poll(requests, draft.as_deref_mut())?;
         if stats_published.elapsed() >= std::time::Duration::from_secs(1) {
             stats_published = Instant::now();
@@ -370,57 +381,41 @@ fn serve_loop<'w, 'a, P: ServingTarget<'w, 'a>, const SHARED_PREFILL: bool>(lib:
             let admitted = (|| -> Result<_> {
                 let admission::Prepared { job, prompt, images } = &mut prepared;
                 if let Some(draft) = draft.as_deref_mut() { draft.admit(id)?; }
-                let image_keys = prefixes.prepare_key(prompt, images)?;
+                let image_keys = super::prefix::media_keys(prompt, images)?;
                 if !images.is_empty() {
                     requests.attach_images(lease, crate::families::deepseek_v41::v41_requests::RequestImages::new(images)?)?;
                 }
                 let restore_started = Instant::now();
-                let hit = if crate::shared::probe::cold(&job.probe) { None }
-                    else { prefixes.restore(prompt, &image_keys, id, lease, requests, draft.as_deref_mut())? };
+                // Units for the request's whole declared lifetime are allocated here and the
+                // best snapshot restored into them; every running request already owns its
+                // own lifetime units, so this is the whole capacity check.
+                let cold = crate::shared::probe::cold(&job.probe);
+                let draft_id = draft_id(&draft, id);
+                let lifetime = |output: usize| prompt.len().saturating_add(output);
+                let restored = match prefixes.admit(requests, draft.as_deref_mut(), lease, draft_id, image_keys.tokens(),
+                    prompt, image_keys.spans(), lifetime(job.max_tokens), cold) {
+                    Err(error) if busy_slots == 0 && super::prefix::exhausted(&error) => {
+                        // Idle and short: grant the longest output that fits the pool (every
+                        // snapshot-only unit counted as free), then admit at that lifetime.
+                        let requested = job.max_tokens;
+                        let units = |output: usize| lifetime(output)
+                            .div_ceil(crate::families::deepseek_v41::v41_backbone_cache::UNIT_TOKENS);
+                        let granted = kv_waiter.shrink_output(&mut prefixes, requested,
+                            |prefixes, output| Ok::<_, anyhow::Error>(prefixes.could_fit(units(output))), |_, _| Ok(()))?
+                            .ok_or(error)?;
+                        let restored = prefixes.admit(requests, draft.as_deref_mut(), lease, draft_id, image_keys.tokens(),
+                            prompt, image_keys.spans(), lifetime(granted), cold)?;
+                        if granted < requested {
+                            tracing::warn!(request_id=id, prompt_tokens=prompt.len(), cached_tokens=restored.cached,
+                                requested, granted, "max_tokens shrunk to fit the GPU KV pool");
+                        }
+                        job.max_tokens = granted;
+                        restored
+                    }
+                    other => other?,
+                };
+                let hit = (restored.cached > 0).then_some((restored.cached, restored.scores));
                 let restore = (restore_started, Instant::now());
-                // Check the declared lifetime budget of every active request,
-                // including the new request, against the actual source pages.
-                // This preserves prefix sharing and accounts for partial-page COW.
-                let mut capacity = active.iter().flatten().map(|r| Ok((r.lease,
-                    admission::remaining_budget(r.tokens.len(), r.job.max_tokens-r.generated,
-                        requests.cache().committed_end(r.lease)?)?)))
-                    .collect::<Result<Vec<_>>>()?;
-                for parked in media.leased() {
-                    capacity.push((parked.lease, admission::remaining_budget(parked.prepared.prompt.len(),
-                        parked.prepared.job.max_tokens, requests.cache().committed_end(parked.lease)?)?));
-                }
-                if SHARED_PREFILL {
-                    for parked in prefills.iter() {
-                        let r = &parked.request;
-                        capacity.push((r.lease, admission::remaining_budget(r.tokens.len(), r.job.max_tokens,
-                            requests.cache().committed_end(r.lease)?)?));
-                    }
-                }
-                capacity.push((lease, admission::remaining_budget(prompt.len(), job.max_tokens,
-                    requests.cache().committed_end(lease)?)?));
-                if let Err(error) = prefixes.make_room(requests, &capacity) {
-                    if busy_slots != 0
-                        || error.downcast_ref::<crate::families::deepseek_v41::v41_compressor::SourcePoolExhausted>().is_none() {
-                        return Err(error);
-                    }
-                    // Idle and short. A snapshot that only costs this request a copy-on-write
-                    // tail (the source it reused) goes first, so a cached prompt has the room
-                    // the same request has cold; then the longest output that fits is granted.
-                    let committed = requests.cache().committed_end(lease)?;
-                    let budget = |output| admission::remaining_budget(prompt.len(), output, committed);
-                    let requested = job.max_tokens;
-                    prefixes.release_copies(requests, &[(lease, budget(requested)?)])?;
-                    let granted = kv_waiter.shrink_output(&mut prefixes, requested,
-                        |prefixes, output| prefixes.fits(requests, &[(lease, budget(output)?)]),
-                        |prefixes, output| prefixes.make_room(requests, &[(lease, budget(output)?)]))?
-                        .ok_or(error)?;
-                    if granted < requested {
-                        tracing::warn!(request_id=id, prompt_tokens=prompt.len(),
-                            cached_tokens=hit.as_ref().map_or(0, |(end, _)| *end), requested, granted,
-                            "max_tokens shrunk to fit the GPU KV pool");
-                    }
-                    job.max_tokens = granted;
-                }
                 let resume = if images.is_empty() { prompt.len() } else {
                     let source_end = requests.cache().committed_end(lease)? as usize;
                     let start = if requests.cache().stage(lease)? == crate::families::deepseek_v41::v41_backbone_cache::CacheStage::EncoderReplay {
@@ -512,7 +507,9 @@ fn serve_loop<'w, 'a, P: ServingTarget<'w, 'a>, const SHARED_PREFILL: bool>(lib:
                 }
                 if cached != prompt.len() && !crate::shared::probe::cold(&job.probe) {
                   prefixes.capture_session(job.usage.as_ref().map(|u| u.session_id().to_owned()));
-                  if let Err(error) = prefixes.retain(SnapshotKind::Prompt, &prompt, &image_keys, &scores, id, lease, requests, draft.as_deref_mut()) {
+                  let draft_request = draft_id(&draft, id);
+                  if let Err(error) = prefixes.retain(requests, draft.as_deref_mut(), SnapshotKind::Prompt, image_keys.tokens(),
+                      image_keys.spans(), &scores, lease, draft_request) {
                     tracing::warn!(%error, "prompt prefix was not retained");
                   }
                 }
@@ -580,7 +577,8 @@ fn serve_loop<'w, 'a, P: ServingTarget<'w, 'a>, const SHARED_PREFILL: bool>(lib:
             let r = active[slot].as_ref().unwrap();
             (r.lease, (r.job.max_tokens - r.generated).min(draft.as_ref().map_or(1, |d| d.max_verify_rows())) as u32)
         }).collect();
-        let room = prefixes.make_room(requests, &capacity);
+        // Every request's units cover its declared lifetime: this only validates the bindings.
+        let room = requests.cache().check_append_capacity(&capacity);
         if let Err(error) = &room {
             if let Some(pressure) = error.downcast_ref::<crate::families::deepseek_v41::v41_compressor::SourcePoolExhausted>() {
                 let slot = *members.iter().flatten().nth(pressure.work_index)
@@ -664,8 +662,9 @@ fn prefill_round<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, runti
         }
         if !crate::shared::probe::cold(&request.job.probe) {
             prefixes.capture_session(request.ticket.session());
-            if let Err(error) = prefixes.retain(SnapshotKind::Prompt, &request.tokens, &request.image_keys, &scores,
-                request.id(), request.lease, requests, draft.as_deref_mut()) {
+            let id = draft_id(&draft, request.id());
+            if let Err(error) = prefixes.retain(requests, draft.as_deref_mut(), SnapshotKind::Prompt,
+                &keyed(&request.image_keys, &request.tokens), request.image_keys.spans(), &scores, request.lease, id) {
                 tracing::warn!(%error, "prompt prefix was not retained");
             }
         }
@@ -2049,10 +2048,11 @@ pub(super) fn console_round(tally: console::Tally, lane: usize, shared: bool, st
 /// Publishes the resolved KV pool (the compressed source with the fewest
 /// tokens) and host-cache bytes for the benchmark's capacity record.
 pub(crate) fn publish_capacity(requests: &Requests<'_>, prefixes: &PrefixCache<'_>) {
-    let tokens = requests.cache().sources().iter().zip([2u64, 2, 2, 1]).map(|(source, ratio)| {
-        let [total, _, _] = source.get().source_cache().occupancy();
-        (total * 256 * ratio, total)
-    }).min();
+    // A unit is one page of each ratio-two source (the binding ones): same tokens and pages as
+    // the per-source report before units.
+    let units = requests.cache().unit_capacity() as u64;
+    let tokens = (units > 0).then_some((units * crate::families::deepseek_v41::v41_backbone_cache::UNIT_TOKENS as u64,
+        units));
     let host = prefixes.host_config().map_or(0, |config| config.bytes as u64);
     if let Some((tokens, pages)) = tokens {
         cuteafd_bench::context::set_kv(tokens, pages, "FP4 compressed (CSA/HCA) + FP8 window", host);
@@ -2064,19 +2064,13 @@ pub(super) fn console_gauges(active: &[Option<Active<'_>>], requests: &Requests<
     prefixes: &PrefixCache<'_>, queued: usize, pending: Option<bool>) -> console::Event {
     let mut lanes = [0u8; 2];
     for request in active.iter().flatten() { lanes[request.lane().min(1)] += 1; }
-    // Report the compressed-KV source closest to exhaustion; ratio-2 sources
-    // hold two tokens per row.
-    let kv = requests.cache().sources().iter().zip([2u64, 2, 2, 1]).map(|(source, ratio)| {
-        let [total, free, held] = source.get().source_cache().occupancy();
-        [total, free, held, ratio]
-    }).max_by(|a, b| {
-        let used = |v: &[u64; 4]| (v[0] - v[1]) as f64 / v[0].max(1) as f64;
-        used(a).total_cmp(&used(b))
-    });
-    let host = prefixes.host_metrics().and_then(|metrics| serde_json::to_value(metrics).ok());
-    let kv = kv.map(|[pages, free, active, ratio]| console::Kv { pages, free, active, tokens_per_page: 256 * ratio });
-    console::Event::Gauges(console::Gauges { lanes: lanes.to_vec(), queued: queued as u32, prefilling: None, pending,
-        kv, host, prefix: None })
+    // The engine's gauges: one page is a 512-token unit across all four sources.
+    let _ = requests;
+    let mut gauges = console::Gauges::prefix_cache(prefixes.engine(), 0, 0, queued);
+    gauges.lanes = lanes.to_vec();
+    gauges.prefilling = None;
+    gauges.pending = pending;
+    console::Event::Gauges(gauges)
 }
 
 fn observe_lane_round<'a, C: DraftChain<'a>>(draft: Option<&mut DraftRuntime<'_, 'a, C>>, capture_routes: bool,
@@ -2472,14 +2466,13 @@ mod sampling_tests {
         }
     }
 
-    /// The turn-bank capability answers exactly what `retain`/`queue_retain` use
-    /// (`bank.limit() > 0`), so a zero-entry cache disables the frontier transfer
-    /// and a configured one keeps it.
+    /// The turn-bank capability answers exactly what `retain`/`queue_retain` use (a
+    /// zero-entry cache retains nothing), so it disables the frontier transfer and a
+    /// configured one keeps it.
     #[test]
     fn turn_bank_enabled_mirrors_the_retention_limit() {
-        assert!(!PrefixCache::new(0).turn_bank_enabled(), "limit 0 disables retention");
-        assert!(PrefixCache::new(1).turn_bank_enabled());
-        assert!(PrefixCache::new(32).turn_bank_enabled());
+        assert!(!PrefixCache::disabled().turn_bank_enabled(), "limit 0 disables retention");
+        for entries in [1, 32] { assert!(PrefixCache::configured(entries).turn_bank_enabled()); }
     }
 
     /// The bytes the gate removes are exported, so the saving is observable and
@@ -2528,8 +2521,8 @@ mod sampling_tests {
             "planned_fallback_rows", "refused_fallback_rows", "frontier_download_rows",
             "frontier_gated_rows", "frontier_gated_bytes", "frontier_packed_rows",
             "frontier_packed_saved_bytes"];
-        // `PrefixCache::new(0)` has no host cache and a disabled turn bank.
-        let disabled = PrefixCache::new(0);
+        // A zero-entry cache has no host cache and a disabled turn bank.
+        let disabled = PrefixCache::disabled();
         assert!(disabled.host_metrics().is_none());
         assert!(!disabled.turn_bank_enabled());
         let waiter = cuteafd_engine::prefix::DeferredAdmission::default();
@@ -2549,7 +2542,8 @@ mod sampling_tests {
         }
         // A configured bank keeps the **full** key set (the host keys stay null
         // here, because this fixture has no host cache attached either).
-        let configured = serving_stats(&PrefixCache::new(8), &waiter, &media);
+        let configured = serving_stats(&PrefixCache::configured(8), &waiter, &media);
+        assert!(configured["prefix"]["promotions"].is_u64(), "{configured}");
         assert!(configured["host_cache"].is_null(), "{configured}");
         assert!(configured["host_cache_config"].is_null(), "{configured}");
         for key in COUNTERS {

@@ -103,7 +103,6 @@ impl<'a> CompressorWave<'_, 'a> {
         let plan = &pending.plan;
         let completed = &pending.completed;
         (|| -> Result<()> {
-            unsafe { state.index.copy_shared_tails(plan, self.stream.raw)?; }
             if !completed.is_empty() {
                 unsafe {
                     self.stream.library.copy_h2d_async(

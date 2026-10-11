@@ -1,5 +1,8 @@
 use super::*;
 use crate::families::deepseek_v41::v41_dspark_cache::{DsparkWindow, WindowLease};
+use cuteafd_ffi::CuteafdDeviceBuffer;
+/// Bytes of one request's retained rings in a draft mark: three windows' full slots.
+pub(crate) const DRAFT_MARK_BYTES: usize = 3 * cuteafd_ffi::V41DsparkCache::SLOT_BYTES;
 use crate::families::deepseek_v41::v41_experts::dspark::{DsparkChain, DsparkMainContext, DsparkWeights};
 use crate::families::deepseek_v41::v41_requests::RequestBatch;
 use crate::shared::draft::binding::LaneRound;
@@ -38,9 +41,6 @@ struct DraftRequest {
     leases: [WindowLease; 3],
     rng: cuteafd_core::DsparkRng,
     slot: usize,
-}
-pub(crate) struct DraftPrefix<'a> {
-    windows: crate::shared::memory::device::DeviceOwner<'a, Vec<crate::families::deepseek_v41::v41_dspark_cache::DsparkPrefix<'a>>>,
 }
 impl<'w, 'a> DraftRuntime<'w, 'a> {
     pub fn new(
@@ -251,89 +251,115 @@ impl<'w, 'a, C: DraftChain<'a>> DraftRuntime<'w, 'a, C> {
         }
         failure.map_or(Ok(()), Err)
     }
-    pub fn reserve_prefixes(&mut self, slots: usize) -> Result<usize> {
-        let _device = self.chains[0].execution_device().map(|device| device.enter()).transpose()?;
-        let mut bytes = 0;
-        for window in &mut self.windows { bytes += window.reserve_prefixes(slots)?; }
-        Ok(bytes)
+    /// The device every draft window (and so every draft mark) lives on.
+    pub fn mark_device(&self) -> crate::shared::memory::device::Device<'a> {
+        self.windows[0].device()
     }
-    pub fn retain_prefix(&mut self, id: u64, end: u64) -> Result<DraftPrefix<'a>> {
-        let _device = self.chains[0].execution_device().map(|device| device.enter()).transpose()?;
+    fn ring_at(mark: CuteafdDeviceBuffer, stage: usize) -> CuteafdDeviceBuffer {
+        let bytes = cuteafd_ffi::V41DsparkCache::SLOT_BYTES;
+        CuteafdDeviceBuffer { ptr: unsafe { mark.ptr.cast::<u8>().add(stage * bytes).cast() }, bytes, ..mark }
+    }
+    fn check_frontier(&self, id: u64, end: u64) -> Result<[WindowLease; 3]> {
         let request = self.requests.get(&id).context("draft request not admitted")?;
         for (window, lease) in self.windows.iter().zip(request.leases) {
             ensure!(window.committed_end(lease)? == Some(end), "draft and target prefix frontiers differ");
         }
-        let device = self.windows[0].device();
-        let windows = device.own(|| self.windows.iter_mut().zip(request.leases)
-            .map(|(window, lease)| window.retain_prefix(lease)).collect::<Result<Vec<_>>>())?;
-        Ok(DraftPrefix { windows })
+        Ok(request.leases)
     }
-    pub fn queue_prefix(&mut self, lane: usize, id: u64, end: u64) -> Result<()> {
+    /// Copy request `id`'s three rings at frontier `end` into `mark` (`MARK_BYTES` on
+    /// `mark_device`) synchronously.
+    pub fn capture_mark(&mut self, id: u64, end: u64, mark: CuteafdDeviceBuffer) -> Result<()> {
+        let _device = self.chains[0].execution_device().map(|device| device.enter()).transpose()?;
+        ensure!(mark.bytes == DRAFT_MARK_BYTES, "draft mark storage size differs");
+        let leases = self.check_frontier(id, end)?;
+        let device = self.windows[0].device();
+        device.run(|| {
+            for (stage, (window, lease)) in self.windows.iter_mut().zip(leases).enumerate() {
+                window.capture_ring(lease, Self::ring_at(mark, stage))?;
+            }
+            Ok(())
+        })
+    }
+    /// [`DraftRuntime::capture_mark`] queued on capture lane `lane`.
+    pub fn queue_mark(&mut self, lane: usize, id: u64, end: u64, mark: CuteafdDeviceBuffer) -> Result<()> {
         let _device = self.chains[0].execution_device().map(|device| device.enter()).transpose()?;
         ensure!(self.pending_prefix_ids.get(lane).context("invalid draft snapshot lane")?.is_none(),
             "draft snapshot lane is occupied");
         ensure!(!self.pending_prefix_ids.contains(&Some(id)), "draft snapshot already pending");
-        let request = self.requests.get(&id).context("draft request not admitted")?;
-        for (window, lease) in self.windows.iter().zip(request.leases) {
-            ensure!(window.committed_end(lease)? == Some(end), "draft and target prefix frontiers differ");
-        }
-        let leases = request.leases;
+        ensure!(mark.bytes == DRAFT_MARK_BYTES, "draft mark storage size differs");
+        let leases = self.check_frontier(id, end)?;
         self.pending_prefix_ids[lane] = Some(id);
-        let queued = self.windows.iter_mut().zip(leases)
-            .try_for_each(|(window, lease)| window.queue_prefix(lane, lease));
+        let device = self.windows[0].device();
+        let queued = device.run(|| {
+            for (stage, (window, lease)) in self.windows.iter_mut().zip(leases).enumerate() {
+                window.queue_ring(lane, lease, Self::ring_at(mark, stage))?;
+            }
+            Ok(())
+        });
         if let Err(error) = queued {
-            if let Err(cleanup) = self.abort_prefix(lane) {
+            if let Err(cleanup) = self.abort_mark(lane) {
                 tracing::error!(%cleanup, "draining failed draft snapshot enqueue");
             }
             return Err(error);
         }
         Ok(())
     }
-    pub fn prefix_ready(&self, lane: usize, id: u64) -> Result<bool> {
-        let _device = self.chains[0].execution_device().map(|device| device.enter()).transpose()?;
-        ensure!(self.pending_prefix_ids.get(lane) == Some(&Some(id)), "draft snapshot owner differs");
-        let request = self.requests.get(&id).context("draft snapshot request missing")?;
+    /// Whether a ring copy is queued on capture lane `lane`.
+    pub fn mark_pending(&self, lane: usize) -> bool {
+        self.pending_prefix_ids.get(lane).is_some_and(Option::is_some)
+    }
+    /// The common frontier of request `id`'s three rings.
+    pub fn committed_end(&self, id: u64) -> Result<u64> {
+        let request = self.requests.get(&id).context("draft request not admitted")?;
+        let mut end = None;
         for (window, lease) in self.windows.iter().zip(request.leases) {
-            if !window.prefix_ready(lane, lease)? { return Ok(false); }
+            let current = window.committed_end(lease)?.context("draft window is not seeded")?;
+            ensure!(end.is_none_or(|e| e == current), "draft windows disagree on the frontier");
+            end = Some(current);
         }
-        Ok(true)
+        end.context("no draft windows")
     }
-    pub fn finish_prefix(&mut self, lane: usize, id: u64) -> Result<DraftPrefix<'a>> {
+    /// Whether lane `lane`'s queued rings all landed; the lane frees once they have.
+    pub fn mark_ready(&mut self, lane: usize) -> Result<bool> {
         let _device = self.chains[0].execution_device().map(|device| device.enter()).transpose()?;
-        ensure!(self.prefix_ready(lane, id)?, "draft snapshot copies are incomplete");
-        let leases = self.requests[&id].leases;
-        let device = self.windows[0].device();
-        let windows = device.own(|| self.windows.iter_mut().zip(leases)
-            .map(|(window, lease)| window.finish_prefix(lane, lease)).collect::<Result<Vec<_>>>())?;
-        self.pending_prefix_ids[lane] = None;
-        Ok(DraftPrefix { windows })
+        ensure!(self.pending_prefix_ids.get(lane).is_some_and(Option::is_some), "no draft snapshot is pending");
+        let mut ready = true;
+        for window in &mut self.windows {
+            // A window whose copy already landed freed its lane; poll only the rest.
+            if window.lane_pending(lane) { ready &= window.ring_ready(lane)?; }
+        }
+        if ready { self.pending_prefix_ids[lane] = None; }
+        Ok(ready)
     }
-    pub fn abort_prefix(&mut self, lane: usize) -> Result<()> {
+    pub fn abort_mark(&mut self, lane: usize) -> Result<()> {
         let _device = self.chains[0].execution_device().map(|device| device.enter()).transpose()?;
         ensure!(lane < self.pending_prefix_ids.len(), "invalid draft snapshot lane");
         let mut failure = None;
         for window in &mut self.windows {
-            if let Err(error) = window.abort_prefix(lane) { failure.get_or_insert(error); }
+            if let Err(error) = window.abort_ring(lane) { failure.get_or_insert(error); }
         }
         self.pending_prefix_ids[lane] = None;
         failure.map_or(Ok(()), Err)
     }
-    pub fn restore_prefix(&mut self, id: u64, end: u64, prefix: &DraftPrefix<'a>) -> Result<()> {
+    /// Restore request `id`'s rings at frontier `end` from `mark`. A failure releases the draft
+    /// request.
+    pub fn restore_mark(&mut self, id: u64, end: u64, mark: CuteafdDeviceBuffer) -> Result<()> {
         let _device = self.chains[0].execution_device().map(|device| device.enter()).transpose()?;
+        ensure!(mark.bytes == DRAFT_MARK_BYTES && mark.device_id == self.windows[0].device().id,
+            "draft mark storage differs from the runtime's");
+        let leases = self.requests.get(&id).context("draft request not admitted")?.leases;
         let device = self.windows[0].device();
-        ensure!(prefix.windows.device.id == device.id
-            && std::ptr::eq(prefix.windows.device.library, device.library), "draft prefix device differs from runtime");
-        let request = self.requests.get(&id).context("draft request not admitted")?;
-        ensure!(prefix.windows.len() == 3 && prefix.windows.iter().all(|p| p.end() == end),
-            "retained draft and target frontiers differ");
-        let leases = request.leases;
-        for (stage, saved) in prefix.windows.iter().enumerate() {
-            if let Err(error) = self.windows[stage].restore_prefix(leases[stage], saved) {
-                if let Err(cleanup) = self.release(id) {
-                    tracing::error!(%cleanup, "releasing failed draft prefix restore");
-                }
-                return Err(error);
+        let restored = device.run(|| {
+            for (stage, lease) in leases.into_iter().enumerate() {
+                self.windows[stage].restore_ring(lease, end, Self::ring_at(mark, stage))?;
             }
+            Ok(())
+        });
+        if let Err(error) = restored {
+            if let Err(cleanup) = self.release(id) {
+                tracing::error!(%cleanup, "releasing failed draft prefix restore");
+            }
+            return Err(error);
         }
         Ok(())
     }
@@ -525,53 +551,6 @@ impl<'w, 'a, C: DraftChain<'a>> DraftRuntime<'w, 'a, C> {
 
     pub fn confidence_trace(&self, id: u64) -> Option<&[f32]> {
         self.confidence_trace.get(&id).map(Vec::as_slice)
-    }
-}
-
-impl<'a> DraftPrefix<'a> {
-    pub fn parts(&self) -> &[crate::families::deepseek_v41::v41_dspark_cache::DsparkPrefix<'a>] {
-        self.windows.get().as_slice()
-    }
-    pub fn from_parts(library: &'a NativeLibrary, windows: Vec<crate::families::deepseek_v41::v41_dspark_cache::DsparkPrefix<'a>>) -> Result<Self> {
-        ensure!(windows.len() == 3, "draft prefix requires three windows");
-        let device = crate::shared::memory::device::Device {
-            library, id: windows[0].parts().2.buffer.device_id,
-        };
-        ensure!(windows.iter().all(|window| window.parts().2.buffer.device_id == device.id),
-            "draft prefix windows span devices");
-        Ok(Self { windows: device.own(move || Ok(windows))? })
-    }
-}
-
-#[cfg(test)]
-mod restored_prefix_tests {
-    use super::*;
-    use crate::families::deepseek_v41::v41_dspark_cache::DsparkPrefix;
-    use crate::shared::memory::{device::Device, SnapshotStorage};
-
-    #[test]
-    #[ignore = "requires CUTEAFD_NATIVE_LIB and two CUDA devices"]
-    fn native_host_draft_prefix_keeps_gpu1_owner() -> Result<()> {
-        let lib = unsafe { NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? };
-        lib.cuda_set_device(0)?;
-        let device = Device { library: &lib, id: 1 };
-        let mut window = device.own(|| DsparkWindow::new(&lib, 1, 1, usize::MAX))?;
-        // Exercise both the allocation fallback and the preallocated serving arena.
-        for pooled in [false, true] {
-            if pooled { device.run(|| window.reserve_prefixes(3))?; }
-            let rings = (0..3).map(|_| {
-                window.device().run(|| SnapshotStorage::new(
-                    window.library(), 64, window.prefix_pool()))
-                    .map(|ring| DsparkPrefix::from_parts(window.owner(), 2, ring))
-            }).collect::<Result<Vec<_>>>()?;
-            assert_eq!(lib.cuda_get_device()?, 0);
-            let prefix = DraftPrefix::from_parts(&lib, rings)?;
-            assert_eq!(prefix.windows.device.id, 1);
-            assert!(prefix.parts().iter().all(|p| p.parts().2.buffer.device_id == 1));
-            drop(prefix);
-            assert_eq!(lib.cuda_get_device()?, 0);
-        }
-        Ok(())
     }
 }
 

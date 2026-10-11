@@ -1,12 +1,9 @@
+//! A compressed source's part of a prefix snapshot: its committed frontier and, at an odd
+//! ratio-two frontier, the pending group's two FP32 projections (the carry). The source rows
+//! themselves live in pages the prefix engine owns and forks; nothing here holds pages.
 use super::*;
-use source_cache::SourcePrefix;
 
 pub(crate) const COMPRESSOR_PREFIX_BYTES: usize = 4096;
-pub(crate) struct CompressorPrefix {
-    owner: u64,
-    end: u64,
-    source: SourcePrefix,
-}
 
 fn slice(mut buffer: CuteafdDeviceBuffer, offset: usize, bytes: usize) -> CuteafdDeviceBuffer {
     debug_assert!(offset + bytes <= buffer.bytes);
@@ -16,27 +13,20 @@ fn slice(mut buffer: CuteafdDeviceBuffer, offset: usize, bytes: usize) -> Cuteaf
 }
 
 impl CompressorState<'_> {
-    /// Restore only complete compression groups from a retained source. There
-    /// is no pending group at this frontier, so no saved carry is read. This is
-    /// the global backing for a later bounded local-window reconstruction.
-    pub fn restore_compressed_prefix(
-        &mut self,
-        lease: CompressorLease,
-        prefix: &CompressorPrefix,
-        end: u64,
-    ) -> Result<()> {
+    /// Start a fresh lease at the complete-group frontier `end` of pages the prefix engine
+    /// forked and bound: no pending group exists there, so no carry is read. This is the global
+    /// backing for a later bounded local-window reconstruction.
+    pub fn restore_compressed_prefix(&mut self, lease: CompressorLease, end: u64) -> Result<()> {
         let slot = self.validate(lease)?;
         let step = ratio(self.layer)? as u64;
+        let rows = (end / step) as usize;
         ensure!(
-            prefix.owner == self.owner
-                && end <= prefix.end
-                && end % step == 0
+            end % step == 0
                 && self.slots[slot].end == 0
-                && self.slots[slot].version == 0,
-            "foreign, unaligned or nonfresh compressed prefix restore"
+                && self.slots[slot].version == 0
+                && self.index.binding(slot).1 == rows,
+            "unaligned or nonfresh compressed prefix restore, or bound rows differ"
         );
-        let source = prefix.source.truncate((end / step) as usize)?;
-        self.index.restore_prefix(slot, &source)?;
         self.slots[slot].end = end;
         self.slots[slot].version = 1;
         Ok(())
@@ -50,16 +40,13 @@ impl CompressorState<'_> {
         lease: CompressorLease,
         destination: CuteafdDeviceBuffer,
         stream: *mut c_void,
-    ) -> Result<CompressorPrefix> {
+    ) -> Result<u64> {
         let slot = self.validate(lease)?;
         ensure!(
             destination.bytes == COMPRESSOR_PREFIX_BYTES,
             "compressor prefix storage size differs"
         );
         let end = self.slots[slot].end;
-        let source = self
-            .index
-            .retain_prefix(slot, end as usize / ratio(self.layer)?)?;
         if end % 2 == 1 {
             if let Some(pending) = &self.pending {
                 for (i, buffer) in pending.iter().enumerate() {
@@ -74,33 +61,29 @@ impl CompressorState<'_> {
                 }
             }
         }
-        Ok(CompressorPrefix {
-            owner: self.owner,
-            end,
-            source,
-        })
+        Ok(end)
     }
 
     /// # Safety
     /// Drain the stream before observing or releasing the restored request. A
-    /// partially failed restore must revoke the enclosing backbone request.
+    /// partially failed restore must revoke the enclosing backbone request. The lease's pages
+    /// hold the snapshot's source rows through `end`.
     pub unsafe fn restore_prefix(
         &mut self,
         lease: CompressorLease,
-        prefix: &CompressorPrefix,
+        end: u64,
         source: CuteafdDeviceBuffer,
         stream: *mut c_void,
     ) -> Result<()> {
         let slot = self.validate(lease)?;
         ensure!(
-            prefix.owner == self.owner
-                && self.slots[slot].end == 0
+            self.slots[slot].end == 0
                 && self.slots[slot].version == 0
-                && source.bytes == COMPRESSOR_PREFIX_BYTES,
-            "foreign compressor prefix or nonfresh destination"
+                && source.bytes == COMPRESSOR_PREFIX_BYTES
+                && self.index.binding(slot).1 == end as usize / ratio(self.layer)?,
+            "nonfresh compressor destination or bound rows differ from the snapshot"
         );
-        self.index.restore_prefix(slot, &prefix.source)?;
-        if prefix.end % 2 == 1 {
+        if end % 2 == 1 {
             if let Some(pending) = &self.pending {
                 for (i, buffer) in pending.iter().enumerate() {
                     unsafe {
@@ -114,7 +97,7 @@ impl CompressorState<'_> {
                 }
             }
         }
-        self.slots[slot].end = prefix.end;
+        self.slots[slot].end = end;
         self.slots[slot].version = 1;
         Ok(())
     }
@@ -139,6 +122,8 @@ mod tests {
             assert_eq!(saved.buffer.device_id,0);
             let original = state.begin_request(0, 1)?;
             let rows = 601 / ratio(layer)?;
+            let pages: Vec<u32> = (0..rows.div_ceil(PAGE_ROWS) as u32).collect();
+            state.bind(original, &pages, 0)?;
             let plan = state.index.reserve(&[(0, 0, rows)])?;
             for buffer in [
                 state.index.packed.buffer,
@@ -159,22 +144,20 @@ mod tests {
                     lib.copy_h2d(buffer.buffer, &vec![0x33; buffer.buffer.bytes])?;
                 }
             }
-            let prefix = unsafe { state.retain_prefix(original, saved.buffer, stream.raw)? };
+            assert_eq!(unsafe { state.retain_prefix(original, saved.buffer, stream.raw)? }, 601);
             unsafe {
                 lib.cuda_stream_synchronize(stream.raw)?;
             }
             state.release(original)?;
             let resumed = state.begin_request(1, 2)?;
-            assert!(state
-                .restore_compressed_prefix(resumed, &prefix, 602)
-                .is_err());
-            if layer == 2 {
-                assert!(state
-                    .restore_compressed_prefix(resumed, &prefix, 513)
-                    .is_err());
-            }
             let end = if layer == 2 { 514 } else { 513 };
-            state.restore_compressed_prefix(resumed, &prefix, end)?;
+            // The engine forks the snapshot's pages through `end` (shared full pages).
+            state.bind(resumed, &pages, end as usize / ratio(layer)?)?;
+            assert!(state.restore_compressed_prefix(resumed, 602).is_err());
+            if layer == 2 {
+                assert!(state.restore_compressed_prefix(resumed, 513).is_err());
+            }
+            state.restore_compressed_prefix(resumed, end)?;
             assert_eq!(state.committed_end(resumed)?, end);
             assert_eq!(
                 state.index_cache(resumed)?.rows,
@@ -183,9 +166,7 @@ mod tests {
             assert_eq!(state.kv_cache(resumed)?.rows, end as usize / ratio(layer)?);
             assert!(state.committed_proposal(resumed, 0..end + 1, 1).is_err());
             assert!(state.committed_proposal(resumed, end - 128..end, 1).is_ok());
-            assert!(state
-                .restore_compressed_prefix(resumed, &prefix, end)
-                .is_err());
+            assert!(state.restore_compressed_prefix(resumed, end).is_err());
             state.release(resumed)?;
         }
         Ok(())
@@ -210,7 +191,7 @@ mod tests {
         for (i, buffer) in state.pending.as_ref().unwrap().iter().enumerate() {
             lib.copy_h2d(slice(buffer.buffer, 0, 2048), &vec![0x31 + i as u8; 2048])?;
         }
-        let prefix = unsafe { state.retain_prefix(original, saved.buffer, stream.raw)? };
+        let end = unsafe { state.retain_prefix(original, saved.buffer, stream.raw)? };
         unsafe {
             lib.cuda_stream_synchronize(stream.raw)?;
         }
@@ -221,7 +202,7 @@ mod tests {
         }
         let resumed = state.begin_request(1, 3)?;
         unsafe {
-            state.restore_prefix(resumed, &prefix, saved.buffer, stream.raw)?;
+            state.restore_prefix(resumed, end, saved.buffer, stream.raw)?;
             lib.cuda_stream_synchronize(stream.raw)?;
         }
         assert_eq!(state.committed_end(resumed)?, 1);
@@ -233,7 +214,7 @@ mod tests {
         }
         assert!(state.validate(original).is_err());
         assert!(
-            unsafe { state.restore_prefix(resumed, &prefix, saved.buffer, stream.raw) }.is_err()
+            unsafe { state.restore_prefix(resumed, end, saved.buffer, stream.raw) }.is_err()
         );
         state.release(replacement)?;
         state.release(resumed)?;
@@ -241,32 +222,3 @@ mod tests {
     }
 }
 
-impl CompressorPrefix {
-    /// Owner, frontier and the retained source pages, for the host cache.
-    pub fn parts(&self) -> (u64, u64, &SourcePrefix) {
-        (self.owner, self.end, &self.source)
-    }
-    /// Rebuild from a host copy; `source` comes from `SourceCache::allocate_prefix`.
-    pub fn from_parts(owner: u64, end: u64, source: SourcePrefix) -> Self {
-        Self { owner, end, source }
-    }
-}
-
-/// What evicting a snapshot whose compressed sources are `sources` gains an append
-/// transaction, given each source's `pressure` in the same order: the most any source gains.
-/// The order is checked, not assumed: counts that differ, or a source weighed against another
-/// source's pool, are an error.
-pub(crate) fn snapshot_gain(sources: &[CompressorPrefix], pressure: &[Pressure]) -> Result<Gain> {
-    ensure!(sources.len() == pressure.len(), "snapshot has {} compressed sources, the cache {}",
-        sources.len(), pressure.len());
-    sources.iter().zip(pressure).try_fold(Gain::Nothing, |gain, (prefix, pressure)| {
-        Ok(gain.max(prefix.source.gain(pressure)?))
-    })
-}
-
-/// Count a snapshot's references to the appended tails as dropped, source by source. The order
-/// is checked as in `snapshot_gain` before anything is counted.
-pub(crate) fn release_snapshot_tails(sources: &[CompressorPrefix], pressure: &mut [Pressure]) -> Result<()> {
-    snapshot_gain(sources, pressure)?;
-    sources.iter().zip(pressure).try_for_each(|(prefix, pressure)| pressure.release(&prefix.source))
-}

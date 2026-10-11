@@ -1,11 +1,6 @@
 use super::*;
 
 pub(crate) const WINDOW_PREFIX_BYTES: usize = 128 * 528 + 8;
-pub(crate) struct WindowPrefix {
-    owner: u64,
-    end: u64,
-    begin: u64,
-}
 
 // Valid ring positions can wrap once. Never copy uninitialized padding from a
 // short request or the unpopulated beginning of a bounded decoder replay.
@@ -26,7 +21,7 @@ impl WindowState<'_> {
         lease: WindowLease,
         destination: CuteafdDeviceBuffer,
         stream: *mut c_void,
-    ) -> Result<WindowPrefix> {
+    ) -> Result<(u64, u64)> {
         let slot = self.validate(lease)?;
         ensure!(
             destination.bytes == WINDOW_PREFIX_BYTES,
@@ -56,11 +51,7 @@ impl WindowState<'_> {
                 stream,
             )?;
         }
-        Ok(WindowPrefix {
-            owner: self.owner,
-            end: live.end,
-            begin: live.begin,
-        })
+        Ok((live.begin, live.end))
     }
 
     /// # Safety
@@ -72,19 +63,20 @@ impl WindowState<'_> {
     pub unsafe fn restore_prefix(
         &mut self,
         lease: WindowLease,
-        prefix: &WindowPrefix,
+        begin: u64,
+        end: u64,
         source: CuteafdDeviceBuffer,
         stream: *mut c_void,
     ) -> Result<()> {
         let slot = self.validate(lease)?;
         ensure!(
-            prefix.owner == self.owner
+            begin <= end
                 && self.slots[slot].end == 0
                 && self.slots[slot].version == 0
                 && source.bytes == WINDOW_PREFIX_BYTES,
-            "foreign window prefix or nonfresh destination"
+            "invalid window span or nonfresh destination"
         );
-        for (offset, rows) in spans(prefix.begin, prefix.end) {
+        for (offset, rows) in spans(begin, end) {
             for (destination, width, base) in [
                 (self.values.buffer, 512, 0),
                 (self.scales.buffer, 16, 128 * 512),
@@ -107,8 +99,8 @@ impl WindowState<'_> {
                 stream,
             )?;
         }
-        self.slots[slot].begin = prefix.begin;
-        self.slots[slot].end = prefix.end;
+        self.slots[slot].begin = begin;
+        self.slots[slot].end = end;
         self.slots[slot].version = 1;
         unsafe { self.publish_replica_restore(lease,stream)?; }
         Ok(())
@@ -151,7 +143,7 @@ mod tests {
             let scales: Vec<u8> = (0..128 * 16).map(|i| (i % 137) as u8).collect();
             lib.copy_h2d(view.values, &values)?;
             lib.copy_h2d(view.scales, &scales)?;
-            let prefix = unsafe { state.retain_prefix(old, saved.buffer, stream.raw)? };
+            let (begin, end) = unsafe { state.retain_prefix(old, saved.buffer, stream.raw)? };
             unsafe {
                 lib.cuda_stream_synchronize(stream.raw)?;
             }
@@ -162,7 +154,7 @@ mod tests {
             lib.copy_h2d(view.scales, &vec![0xff; view.scales.bytes])?;
             let resumed = state.begin_request(1, 3)?;
             unsafe {
-                state.restore_prefix(resumed, &prefix, saved.buffer, stream.raw)?;
+                state.restore_prefix(resumed, begin, end, saved.buffer, stream.raw)?;
                 lib.cuda_stream_synchronize(stream.raw)?;
             }
             let view = state.view(resumed)?;
@@ -178,21 +170,12 @@ mod tests {
             }
             assert!(state.validate(old).is_err());
             assert!(
-                unsafe { state.restore_prefix(resumed, &prefix, saved.buffer, stream.raw) }
+                unsafe { state.restore_prefix(resumed, begin, end, saved.buffer, stream.raw) }
                     .is_err()
             );
             state.release(replacement)?;
             state.release(resumed)?;
         }
         Ok(())
-    }
-}
-
-impl WindowPrefix {
-    pub fn parts(&self) -> (u64, u64, u64) {
-        (self.owner, self.end, self.begin)
-    }
-    pub fn from_parts(owner: u64, end: u64, begin: u64) -> Self {
-        Self { owner, end, begin }
     }
 }

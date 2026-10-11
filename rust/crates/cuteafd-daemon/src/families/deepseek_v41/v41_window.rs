@@ -15,7 +15,7 @@ pub(crate) mod replica;
 mod commit;
 use commit::PendingCommit;
 pub(crate) use commit::BatchedWindowCommit;
-pub(crate) use prefix::{WindowPrefix, WINDOW_PREFIX_BYTES};
+pub(crate) use prefix::WINDOW_PREFIX_BYTES;
 static NEXT_SNAPSHOT: AtomicU64 = AtomicU64::new(1);
 fn next(counter: &AtomicU64) -> Result<u64> {
     counter
@@ -180,6 +180,11 @@ impl<'a> WindowState<'a> {
     }
     pub fn end(&self, lease: WindowLease) -> Result<u64> {
         Ok(self.slots[self.validate_identity(lease)?].end)
+    }
+    /// The ring's initialized span `(begin, end)` (host bookkeeping only).
+    pub fn span(&self, lease: WindowLease) -> Result<(u64, u64)> {
+        let slot = self.slots[self.validate_identity(lease)?];
+        Ok((slot.begin, slot.end))
     }
     pub fn request_id(&self, lease: WindowLease) -> Result<u64> {
         self.slots[self.validate_identity(lease)?]

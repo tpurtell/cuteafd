@@ -210,13 +210,13 @@ mod tests {
                 drop(append);
                 assert!(unsafe { replica.copy_commit(&state,lease,402,producer.raw) }.is_err());
                 let storage=DeviceAllocation::new(&lib,WINDOW_PREFIX_BYTES)?;
-                let prefix=unsafe { state.retain_prefix(lease,storage.buffer,producer.raw)? };
+                let (begin,end)=unsafe { state.retain_prefix(lease,storage.buffer,producer.raw)? };
                 producer.drain()?;
                 for restore_device in [owner,peer] {
                     let restored=state.begin_request(1,2)?;
                     let restore_stream=Stream::new(restore_device)?;
                     restore_device.run(||unsafe {
-                        state.restore_prefix(restored,&prefix,storage.buffer,restore_stream.raw)
+                        state.restore_prefix(restored,begin,end,storage.buffer,restore_stream.raw)
                     })?;
                     restore_stream.drain()?;
                     check(&state,restored,&expected_values,&expected_scales)?;

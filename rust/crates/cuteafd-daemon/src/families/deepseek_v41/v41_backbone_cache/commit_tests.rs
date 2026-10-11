@@ -70,7 +70,7 @@ fn placed_cache_commits_match_direct_and_preserve_peer_requests() -> Result<()> 
     expected[0] = committed_bytes(&lib,&reference,refs[0])?;
     assert_eq!(bank.committed_end(leases[0])?,5);
     assert!(committed_bytes(&lib,&bank,leases[0])? == expected[0], "odd-boundary continuation differs");
-    let saved = bank.retain_prefix(leases[0],BackbonePrefix::device_bytes())?;
+    let saved = bank.retain_prefix(leases[0],BackboneMark::BYTES)?;
     let batch = bank.plan(&[CacheWork { lease:leases[0],tokens:3,kind:ExpertV2SourceKind::Decode }])?;
     produce(&lib,&bank,&batch,&mut lanes[0].windows,&mut lanes[0].sources,77)?;
     unsafe { lanes[0].enqueue_cache_commit(&bank,&batch,&[2])?; }
@@ -258,7 +258,7 @@ fn qualify_encoder_prefix_replay(
     produce(lib, bank, &batch, windows, sources, 81)?;
     bank.commit(&batch, windows, sources, &[385])?;
     let expected = committed_bytes(lib, bank, original)?;
-    bank.queue_prefix(0, original, BackbonePrefix::device_bytes())?;
+    bank.queue_prefix(0, original, BackboneMark::BYTES)?;
     while !bank.prefix_ready(0, original)? { std::thread::yield_now(); }
     let saved = bank.finish_prefix(0, original)?;
     bank.release(&[original])?;
@@ -267,12 +267,12 @@ fn qualify_encoder_prefix_replay(
         .collect::<Result<Vec<_>>>()?;
     for &lease in &resumed {
         assert!(bank
-            .restore_encoder_prefix(lease, &saved, 259, 300)
+            .restore_encoder_prefix_from(lease, &saved, 259, 300)
             .is_err());
         assert!(bank
-            .restore_encoder_prefix(lease, &saved, 386, 400)
+            .restore_encoder_prefix_from(lease, &saved, 386, 400)
             .is_err());
-        assert_eq!(bank.restore_encoder_prefix(lease, &saved, 258, 300)?, 130);
+        assert_eq!(bank.restore_encoder_prefix_from(lease, &saved, 258, 300)?, 130);
         assert_eq!(bank.committed_end(lease)?, 258);
         assert_eq!(bank.history_end(lease)?, 130);
         assert!(bank.begin_decoder_replay(lease).is_err());
@@ -348,9 +348,9 @@ fn qualify_encoder_prefix_replay(
     let full = bank.begin_request(0, 9400)?;
     let encoder = bank.begin_request(1, 9401)?;
     bank.restore_prefix(full, &saved)?;
-    assert!(bank.restore_encoder_continuation(encoder, &saved, 512).is_err());
-    assert!(bank.restore_encoder_continuation(encoder, &saved, 1048577).is_err());
-    bank.restore_encoder_continuation(encoder, &saved, 514)?;
+    assert!(bank.restore_continuation(encoder, &saved, 512).is_err());
+    assert!(bank.restore_continuation(encoder, &saved, 1048577).is_err());
+    bank.restore_continuation(encoder, &saved, 514)?;
     assert_eq!(bank.history_end(encoder)?, 385);
     for layer in 20..40 {
         assert_eq!(bank.windows[layer].end(bank.request(encoder)?.windows[layer])?, 0);
@@ -442,8 +442,6 @@ fn real_all_cache_commits_preserve_prefixes_and_revoke_partial_failure() -> Resu
     // while their original source page remains retained by the prefix.
     let mut bank =
         BackboneCache::new(&lib, 16, [18; 4], BackboneCache::device_bytes(16, [18; 4])?)?;
-    bank.install_prefix_pool(crate::shared::memory::SnapshotPool::new(
-        &lib, BackbonePrefix::device_bytes(), 2)?)?;
     let leases = (0..16)
         .map(|s| bank.begin_request(s, 100 + s as u64))
         .collect::<Result<Vec<_>>>()?;
@@ -578,18 +576,18 @@ fn real_all_cache_commits_preserve_prefixes_and_revoke_partial_failure() -> Resu
     // Slot 1 ends at 129 tokens: an odd compressor group and a wrapped SWA.
     // Restore into a recycled slot, then compare the next real-weight commit.
     let expected = committed_bytes(&lib, &bank, leases[1])?;
-    bank.queue_prefix(0, leases[1], BackbonePrefix::device_bytes())?;
+    bank.queue_prefix(0, leases[1], BackboneMark::BYTES)?;
     assert!(bank.release(&[leases[1]]).is_err());
-    assert!(bank.retain_prefix(leases[1], BackbonePrefix::device_bytes()).is_err());
+    assert!(bank.retain_prefix(leases[1], BackboneMark::BYTES).is_err());
     assert!(bank.plan(&[CacheWork { lease: leases[1], tokens: 1, kind: ExpertV2SourceKind::Decode }]).is_err());
     assert!(bank.request_id(leases[1]).is_ok());
-    bank.queue_prefix(1, leases[2], BackbonePrefix::device_bytes())?;
-    assert!(bank.queue_prefix(1, leases[3], BackbonePrefix::device_bytes()).is_err());
+    bank.queue_prefix(1, leases[2], BackboneMark::BYTES)?;
+    assert!(bank.queue_prefix(1, leases[3], BackboneMark::BYTES).is_err());
     assert!(bank.prefix_ready(1, leases[1]).is_err());
     while !bank.prefix_ready(1, leases[2])? { std::thread::yield_now(); }
     drop(bank.finish_prefix(1, leases[2])?);
     // Aborting a second copy returns only its storage; lane zero remains reserved.
-    bank.queue_prefix(1, leases[2], BackbonePrefix::device_bytes())?;
+    bank.queue_prefix(1, leases[2], BackboneMark::BYTES)?;
     bank.abort_prefix(1)?;
     assert!(bank.release(&[leases[1]]).is_err());
     let peer = bank.plan(&[CacheWork { lease: leases[2], tokens: 1, kind: ExpertV2SourceKind::Decode }])?;
@@ -598,7 +596,7 @@ fn real_all_cache_commits_preserve_prefixes_and_revoke_partial_failure() -> Resu
     while !bank.prefix_ready(0, leases[1])? { std::thread::yield_now(); }
     let saved = bank.finish_prefix(0, leases[1])?;
     assert_eq!(saved.end(), 129);
-    assert!(bank.retain_prefix(leases[1], BackbonePrefix::device_bytes() - 1).is_err());
+    assert!(bank.retain_prefix(leases[1], BackboneMark::BYTES - 1).is_err());
     bank.release(&leases[..1])?;
     let restored = bank.begin_request(0, 900)?;
     let stale = bank.plan(&[CacheWork { lease: restored, tokens: 1, kind: ExpertV2SourceKind::Decode }])?;
