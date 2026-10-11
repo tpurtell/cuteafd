@@ -2,6 +2,8 @@ import importlib.util
 import json
 from pathlib import Path
 
+import pytest
+
 SPEC = importlib.util.spec_from_file_location("memory_audit", Path(__file__).parents[1] / "bench" / "memory-audit.py")
 memory_audit = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(memory_audit)
@@ -33,12 +35,13 @@ def item(category, group, mib):
     return {"category": category, "group": group, "bytes": mib * MIB}
 
 
-def run(log, plan):
+def run(log, plan, strict=False, mapping="rtx0=0", tolerance=64.0):
     class Args:
         logs = [str(log)]
         compare = str(plan)
-        device_map = "rtx0=0"
-        tolerance_mib = 64.0
+        device_map = mapping
+        tolerance_mib = tolerance
+        strict_ready = strict
     return memory_audit.ready_gate(Args)
 
 
@@ -72,6 +75,71 @@ def test_the_tagged_ready_report_wins_over_a_later_periodic_one(tmp_path):
     first, last = memory_audit.ready_reports(str(log))
     assert first["stage"] == "ready" and first["devices"][0]["untracked"] == 100 * MIB
     assert last["devices"][0]["untracked"] == 500 * MIB
+
+
+def tagged_ready():
+    return report(1600 * MIB, 1500 * MIB, {"weights": 1000 * MIB, "kv": 500 * MIB}).replace(
+        '"stage": "coordinator"', '"stage": "ready"')
+
+
+def test_strict_ready_uses_one_snapshot_not_later_tracked_allocations(tmp_path):
+    fit = [item("weights", "w", 1000), item("kv", "records", 500),
+           item("runtime", "context+modules+graphs", 100), item("runtime", "graph growth", 900)]
+    log, plan = write(tmp_path, fit)
+    log.write_text(tagged_ready() + report(2900 * MIB, 1800 * MIB,
+                                         {"weights": 1000 * MIB, "kv": 500 * MIB, "workspace": 300 * MIB}))
+    assert run(log, plan, strict=True) == 0
+    assert memory_audit.strict_ready_ledger(log)["0"] == {"weights": 1000 * MIB, "kv": 500 * MIB,
+                                                        "runtime": 100 * MIB}
+    assert run(log, plan) == 1  # Legacy reconstruction includes the later workspace.
+    plan.write_text(json.dumps({"memory_layout": {"devices": [{"kind": "rtx", "index": 0,
+                           "items": fit[:-1] + [item("kv", "extra", 65)]}]}}))
+    assert run(log, plan, strict=True) == 1
+
+
+def test_strict_ready_rejects_missing_tag_or_requested_device(tmp_path):
+    log, plan = write(tmp_path, [])
+    assert run(log, plan, strict=True) == 1
+    log.write_text(tagged_ready())
+    assert run(log, plan, strict=True, mapping="rtx0=1") == 1
+    assert run(log, plan, strict=True, mapping="rtx1=0") == 2
+    assert run(log, plan, strict=True, mapping="rtx0=0,rtx0=1") == 2
+    assert run(log, plan, strict=True, mapping="rtx0") == 2
+
+
+@pytest.mark.parametrize("change", [
+    "missing_used", "missing_untracked", "missing_scopes", "negative_untracked", "tracked_mismatch",
+    "used_mismatch", "total_mismatch", "duplicate_device", "empty_devices", "boolean_bytes",
+])
+def test_strict_ready_rejects_incomplete_or_inconsistent_query_bytes(tmp_path, change):
+    log, plan = write(tmp_path, [])
+    value = json.loads(tagged_ready().split("report=", 1)[1])
+    device = value["devices"][0]
+    if change.startswith("missing_"):
+        del device[change.removeprefix("missing_")]
+    elif change == "negative_untracked":
+        device["untracked"] = -1
+    elif change == "tracked_mismatch":
+        device["tracked"] += 1
+    elif change == "used_mismatch":
+        device["used"] += 1
+    elif change == "total_mismatch":
+        device["total"] = 1
+    elif change == "duplicate_device":
+        value["devices"].append(dict(device))
+    elif change == "empty_devices":
+        value["devices"] = []
+    elif change == "boolean_bytes":
+        device["untracked"] = True
+    log.write_text("INFO memory ledger report=" + json.dumps(value) + "\n")
+    assert run(log, plan, strict=True) == 1
+
+
+@pytest.mark.parametrize("tolerance", [-1.0, float("nan"), float("inf")])
+def test_strict_ready_rejects_invalid_tolerance(tmp_path, tolerance):
+    log, plan = write(tmp_path, [])
+    log.write_text(tagged_ready())
+    assert run(log, plan, strict=True, tolerance=tolerance) == 2
 
 
 def test_pool_following_v4_page_tables_use_the_planners_kv_records_scope(tmp_path):

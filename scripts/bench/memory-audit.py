@@ -185,18 +185,69 @@ def ready_ledger(path):
     return out
 
 
+def strict_ready_ledger(path):
+    """Use only the tagged ready snapshot; never reconstruct it from traffic."""
+    ready = next((report for report in reports(path) if report.get("stage") == "ready"), None)
+    if ready is None:
+        raise ValueError("no tagged stage=ready report")
+    devices = ready.get("devices", [])
+    if not isinstance(devices, list) or not devices:
+        raise ValueError("tagged ready report has no devices")
+    seen = set()
+    for device in devices:
+        if not isinstance(device, dict):
+            raise ValueError("invalid ready device record")
+        device_id = device.get("device")
+        if not isinstance(device_id, int) or isinstance(device_id, bool) or device_id in seen:
+            raise ValueError("invalid or duplicate ready device")
+        seen.add(device_id)
+        for field in ("used", "total", "tracked", "untracked"):
+            value = device.get(field)
+            if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                raise ValueError(f"device {device_id} missing or invalid {field} bytes")
+        scopes = device.get("scopes")
+        if not isinstance(scopes, dict) or any(not isinstance(scope, str) or not isinstance(value, int)
+                or isinstance(value, bool) or value < 0 for scope, value in scopes.items()):
+            raise ValueError(f"device {device_id} missing or invalid scopes")
+        if sum(scopes.values()) != device["tracked"] or device["tracked"] + device["untracked"] != device["used"]:
+            raise ValueError(f"device {device_id} inconsistent ready accounting")
+        if device["used"] > device["total"]:
+            raise ValueError(f"device {device_id} ready use exceeds total bytes")
+    return {str(device["device"]): device["categories"] for device in summarize(ready)["devices"]}
+
+
 def ready_gate(args):
     plan = json.load(open(args.compare))["memory_layout"] if args.compare else None
     if plan is None:
         print("--ready needs --compare PLAN", file=sys.stderr)
         return 2
     names = {("rtx" if d["kind"] == "rtx" else "spark") + str(d["index"]): d for d in plan["devices"]}
-    mapping = dict(pair.split("=") for pair in args.device_map.split(","))
+    strict = getattr(args, "strict_ready", False)
+    try:
+        pairs = [pair.split("=") for pair in args.device_map.split(",")]
+        mapping = dict(pairs)
+        if strict and (not args.logs or len(mapping) != len(pairs)
+                or len(set(mapping.values())) != len(mapping) or any(name not in names for name in mapping)):
+            raise ValueError("strict ready requires logs and distinct, present planner/device mappings")
+        if strict and (not 0 <= args.tolerance_mib < float("inf")):
+            raise ValueError("strict ready requires a finite nonnegative tolerance")
+    except ValueError as error:
+        print(f"invalid device mapping or tolerance: {error}", file=sys.stderr)
+        return 2
     worst = 0.0
+    missing = False
     for path in args.logs:
-        ledger = ready_ledger(path)
+        try:
+            ledger = strict_ready_ledger(path) if strict else ready_ledger(path)
+        except ValueError as error:
+            print(f"{path}: {error}", file=sys.stderr)
+            missing = True
+            continue
         for planned, ledger_id in mapping.items():
             if planned not in names or ledger_id not in ledger:
+                if strict:
+                    print(f"{path}: no ready evidence for {planned} (ledger device {ledger_id})", file=sys.stderr)
+                    missing = True
                 continue
             predicted, growth = defaultdict(int), 0
             for item in names[planned]["items"]:
@@ -214,7 +265,7 @@ def ready_gate(args):
                 p_, m_ = predicted.get(cat, 0), measured.get(cat, 0)
                 print(f"   {cat:<12} {p_ / (1 << 20):9.0f} {m_ / (1 << 20):9.0f} {(p_ - m_) / (1 << 20):+8.0f}")
     print(f"worst device difference {worst:.0f} MiB (tolerance {args.tolerance_mib:.0f})")
-    return 0 if worst <= args.tolerance_mib else 1
+    return 0 if not missing and worst <= args.tolerance_mib else 1
 
 
 def main():
@@ -231,9 +282,12 @@ def main():
                              "size buffers some families allocate on their first request, e.g. prefill workspaces, count: "
                              "admission must have reserved them); untracked (context, modules, graphs) from the first "
                              "report at or after the API is ready, before lazily captured graphs grow it")
+    parser.add_argument("--strict-ready", action="store_true",
+                        help="placement gate using only a complete tagged stage=ready snapshot; missing devices or "
+                             "runtime query bytes fail, and later tracked allocations never replace ready evidence")
     parser.add_argument("--tolerance-mib", type=float, default=64.0)
     args = parser.parse_args()
-    if args.ready:
+    if args.ready or args.strict_ready:
         sys.exit(ready_gate(args))
     results = {}
     for path in args.logs:
