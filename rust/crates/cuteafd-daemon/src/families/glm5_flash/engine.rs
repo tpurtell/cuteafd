@@ -4238,7 +4238,8 @@ mod prefill_lane_tests {
             ("integration/cuteafd/_glm_kernels.py", 0xabb3_5df9_3a4c_9796),
             ("integration/cuteafd/_fp8_weights.py", 0xb186_4a9c_36b1_7b30),
             ("integration/cuteafd/dsv4_mhc.py", 0x6b2a_c5a5_1dfa_46c5),
-            ("integration/cuteafd/_common.py", 0x74ad_1b69_f557_a0a5),
+            // Pin 8c211189 adds only Qwen4Geometry::kv_record_bytes; GLM routes are unchanged.
+            ("integration/cuteafd/_common.py", 0x86ea_ace0_6ff1_26ca),
             ("gemm/bf16_gemv/_skinny.py", 0x26cd_c0f9_cb63_d3a9),
         ] {
             let bytes = std::fs::read(root.join(path)).unwrap();
