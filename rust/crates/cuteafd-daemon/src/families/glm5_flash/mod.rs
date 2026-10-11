@@ -121,6 +121,9 @@ pub(crate) struct EngineArgs {
     /// Spark ranks in TP order (HOST:PORT,...) serving the fp8 expert family.
     #[arg(long)]
     pub peers: Option<String>,
+    /// Select the solver's exact Spark layer set before worker expert allocation.
+    #[arg(long, requires = "peers")]
+    pub placement_handshake: bool,
     /// Run the routed experts on this GPU: EXL3 checkpoints through the
     /// coordinator `exl3-glmf-k<tiers>/rtx-tp1` package, FP8 ones through the
     /// TP1 `fp8-glmf` package. `--experts-snapshot` names another checkpoint
@@ -718,6 +721,34 @@ mod draft_cli_tests {
         }
     }
 
+    #[test]
+    fn worker_placement_handshake_is_opt_in_and_requires_peers() {
+        assert!(!parse(&[]).placement_handshake);
+        assert!(parse(&["--peers", "127.0.0.1:19441", "--placement-handshake"]).placement_handshake);
+        assert!(Parse::try_parse_from(["test", "--snapshot", "/checkpoint", "--native-lib", "/native",
+            "--placement-handshake"]).is_err());
+    }
+
+    #[test]
+    fn solved_spark_selection_excludes_dense_and_local_layers_and_keeps_absolute_ids() {
+        use cuteafd_loader::placement::{ExpertHome, LayerAssignment, LayerMode};
+        let mut cfg = GlmNextConfig::from_hf(&cuteafd_loader::plan::testing::glm5_flash_config(2)).unwrap();
+        cfg.layers = 45;
+        cfg.dense = (0..45).map(|layer| layer < 3).collect();
+        let mut assignments = vec![LayerAssignment { mode: LayerMode::HeadSplit, experts: ExpertHome::Spark }; 45];
+        for assigned in &mut assignments[3..24] { assigned.experts = ExpertHome::RtxTp2; }
+        assert_eq!(admitted_spark_layers(&cfg, &assignments, false).unwrap(), (24..45).collect::<Vec<_>>());
+        assert!(admitted_spark_layers(&cfg, &assignments, true).unwrap().is_empty());
+        for assigned in &mut assignments[24..] { assigned.experts = ExpertHome::RtxWhole { gpu: 0 }; }
+        assert!(admitted_spark_layers(&cfg, &assignments, false).unwrap().is_empty());
+        assert!(admitted_spark_layers(&cfg, &assignments[..3], false).unwrap().is_empty());
+        assignments[24].experts = ExpertHome::Spark;
+        assignments[26].experts = ExpertHome::Spark;
+        assert!(admitted_spark_layers(&cfg, &assignments, false).unwrap_err().to_string().contains("contiguous"));
+        assignments.push(assignments[0]);
+        assert!(admitted_spark_layers(&cfg, &assignments, false).is_err());
+    }
+
     /// Local onboarding and Spark transports coexist: the admitted layer home selects each.
     #[test]
     fn only_spark_experts_have_transports_to_warm() {
@@ -976,6 +1007,19 @@ fn runtime_resident_weights(checkpoint: &Checkpoint, cfg: &GlmNextConfig, layers
         resident[0].embedding = 0;
     }
     Ok(resident)
+}
+
+fn admitted_spark_layers(cfg: &GlmNextConfig, layers: &[cuteafd_loader::placement::LayerAssignment],
+    skip: bool) -> Result<Vec<usize>> {
+    ensure!(layers.len() <= cfg.layers && cfg.dense.len() == cfg.layers,
+        "GLM Flash Spark selection has invalid layer bounds");
+    // Dense assignments may carry the solver's default Spark home but own no routed experts.
+    let selected: Vec<_> = layers.iter().enumerate().filter_map(|(layer, assigned)|
+        (!skip && !cfg.dense[layer] && assigned.experts == cuteafd_loader::placement::ExpertHome::Spark)
+            .then_some(layer)).collect();
+    ensure!(selected.windows(2).all(|pair| pair[1] == pair[0] + 1),
+        "GLM Flash Spark selection requires a contiguous routed range");
+    Ok(selected)
 }
 
 fn admitted_tp2_range(placement: &cuteafd_loader::placement::Placement) -> Result<Option<std::ops::Range<usize>>> {
@@ -1279,6 +1323,24 @@ impl Opened {
         let (placement, admitted_graphs) = self.admit(args, &programs, layers, index_cache, mark_slots,
             split_device, automatic_context)?;
         if !args.skip_experts && placement.tp2.is_some() { engine::check_tp2_lanes(args.prefill_lanes)?; }
+        let spark_layers = admitted_spark_layers(&self.cfg, &placement.layers, args.skip_experts)?;
+        let spark_range = spark_layers.first().map(|&first| first..spark_layers.last().copied().unwrap() + 1);
+        if args.placement_handshake {
+            let peers = args.peers.as_deref().context("worker placement handshake needs Spark peers")?
+                .split(',').map(str::parse).collect::<std::result::Result<Vec<std::net::SocketAddr>, _>>()?;
+            let geometry = if let Some(catalog) = &self.experts { catalog.routed_experts().geometry()? }
+                else { cuteafd_core::ExpertGeometry { hidden: u32::try_from(self.cfg.hidden)?,
+                    experts: u32::try_from(self.cfg.experts)?, topk: u32::try_from(self.cfg.topk)?,
+                    intermediate: u32::try_from(self.cfg.moe_intermediate)?, layers: u32::try_from(self.cfg.layers)? } };
+            let source = args.experts_snapshot.as_deref().unwrap_or(&args.snapshot);
+            let identity = cuteafd_transport::worker_selection::WorkerIdentity::from_snapshot(
+                source, geometry, peers.len(), None)?;
+            let selection = cuteafd_transport::worker_selection::WorkerSelection::new(identity, &spark_layers)?;
+            cuteafd_transport::worker_selection::select_worker_layers(&peers, &selection,
+                std::time::Duration::from_secs(1200))?;
+            tracing::info!(layers = ?spark_layers, digest = %selection.digest()?,
+                "GLM Flash Spark solved layer set acknowledged before lanes");
+        }
         let source = self.embed_source()?;
         let (embedding, (model, mut shares)) = crate::shared::token_io::TokenEmbedding::load(&self.library, source,
             args.token_io.embed_placement, || {
@@ -1320,8 +1382,7 @@ impl Opened {
         let early_workspaces = if args.replay_records == engine::ReplayRecords::Shared {
             let mut settings = step_settings(args, index_cache);
             settings.max_context = max_context;
-            let spark = !args.skip_experts && placement.layers.iter().any(|l|
-                l.experts == cuteafd_loader::placement::ExpertHome::Spark);
+            let spark = !spark_layers.is_empty();
             let local = !args.skip_experts && !placement.expert_ranges.is_empty() && self.fp8().is_some();
             let tp2 = !args.skip_experts && placement.tp2.is_some();
             let plan = engine::StepPlan::new(&self.library, &programs, &self.cfg, &model.layers, None, settings)
@@ -1381,7 +1442,7 @@ impl Opened {
             engine.install_tp2(ranks)?;
         }
         // Spark links remain available for every layer whose admitted home is Spark.
-        let spark = placement.layers.iter().any(|l| l.experts == cuteafd_loader::placement::ExpertHome::Spark);
+        let spark = !spark_layers.is_empty();
         if moe {
             if let Some(range) = placement.expert_ranges.first().filter(|r| r.layers > 0) {
                 let budget = usize::try_from(range.peak_bytes)?;
@@ -1397,7 +1458,9 @@ impl Opened {
             if spark || args.skip_experts {
                 let mut expert_args = args.clone();
                 expert_args.local_experts = false;
-                if let Some(experts) = self.experts(&expert_args)? { engine.set_experts(experts); }
+                if let Some(experts) = self.experts_range(&expert_args, spark_range.clone(), None)? {
+                    engine.set_experts(experts);
+                }
             }
         }
         engine.drafter = self.load_drafter(args, stream, &engine.embedding)?;
@@ -1459,10 +1522,6 @@ impl Opened {
         Ok(Some(dense))
     }
 
-    fn experts<'s>(&'s self, args: &EngineArgs) -> Result<Option<engine::Experts<'s>>> {
-        self.experts_range(args, None, None)
-    }
-
     fn experts_range<'s>(&'s self, args: &EngineArgs, range: Option<std::ops::Range<usize>>, budget: Option<usize>) -> Result<Option<engine::Experts<'s>>> {
         if args.skip_experts {
             return Ok(Some(engine::Experts::Skip));
@@ -1501,6 +1560,11 @@ impl Opened {
             })));
         }
         let Some(peers) = args.peers.as_deref() else { return Ok(None) };
+        let layers = args.layers.unwrap_or(self.cfg.layers).min(self.cfg.layers);
+        let remote = range.context("GLM Flash Spark transport needs an admitted routed range")?;
+        if remote.is_empty() { return Ok(None); }
+        ensure!(remote.end <= layers && self.cfg.dense[remote.clone()].iter().all(|&dense| !dense),
+            "GLM Flash Spark transport range must contain only served routed layers");
         let peers = peers.split(',').map(str::parse).collect::<std::result::Result<Vec<std::net::SocketAddr>, _>>()?;
         let executors: Vec<u64> = (0..peers.len())
             .map(|rank| cuteafd_transport::expert::v41_spark_executor_id(peers.len(), rank))
@@ -1519,10 +1583,9 @@ impl Opened {
         // prompt would reconnect four ranks mid-prefill, and the first request would open transport 0.
         // Every transport a prefill runs on (transport 0 also carries decode, verify and serial chunks)
         // is warmed with `expert_rows` rows, the most any of its waves carries.
-        let layers = args.layers.unwrap_or(self.cfg.layers).min(self.cfg.layers);
         let warmed = engine::configured_prefill_lanes(true, layers == self.cfg.layers, transports.len());
         let warm_rows = args.expert_rows();
-        let warm = engine::spark_warmup_request(&self.cfg, warm_rows)?;
+        let warm = engine::spark_warmup_request(&self.cfg, warm_rows, remote.start)?;
         let rings = || cuteafd_ffi::memory_ledger::snapshot().by_scope(cuteafd_ffi::memory_ledger::Space::Pinned, -1)
             .get("transport/rdma-rings").copied().unwrap_or(0);
         let (started, before) = (Instant::now(), rings());

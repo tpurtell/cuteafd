@@ -1548,12 +1548,13 @@ fn spark_request(hidden: usize, topk: usize, layer: usize, rows: usize, routes: 
 }
 
 /// The wave that warms a Spark transport at start-up (as GLM-5, MiMo and DeepSeek V4 warm theirs):
-/// `rows` zero rows of prefill at the first MoE layer, every gate zero and the experts in turn. Each
+/// `rows` zero rows of prefill at the first selected Spark layer, every gate zero and the experts in turn. Each
 /// rank's session sizes its rings for the request that opens it, and the transport drops and
 /// reconnects a rank whose rings a later request outgrows, so a transport warmed with the most rows
 /// any of its waves carries never reconnects while serving.
-pub(crate) fn spark_warmup_request(cfg: &GlmNextConfig, rows: usize) -> Result<ExpertProtocolV2Request> {
-    let layer = (0..cfg.layers).find(|&layer| !cfg.dense[layer]).context("no MoE layer to warm the Spark transports")?;
+pub(crate) fn spark_warmup_request(cfg: &GlmNextConfig, rows: usize, layer: usize) -> Result<ExpertProtocolV2Request> {
+    ensure!(layer < cfg.layers && cfg.dense.get(layer) == Some(&false),
+        "Spark transport warmup layer {layer} is not a routed layer");
     let (h, topk) = (cfg.hidden, cfg.topk);
     let routes = (0..rows * topk).map(|i| ExpertProtocolV2RouteEntry {
         row_index: (i / topk) as u32, expert_id: (i % cfg.experts) as u32, gate_weight: 0.0,
@@ -5699,7 +5700,7 @@ mod spark_warmup_tests {
     #[test]
     fn the_warmup_is_a_full_lane_of_zero_gates_in_the_serving_format() {
         let cfg = glm53_flash();
-        let warm = spark_warmup_request(&cfg, 4096).unwrap();
+        let warm = spark_warmup_request(&cfg, 4096, 3).unwrap();
         let serving = wave(&cfg, 4096, ExpertV2SourceKind::Prefill);
         assert_eq!((&warm.header, &warm.rows), (&serving.header, &serving.rows));
         assert_eq!((warm.header.layer_id, warm.header.row_count, warm.header.hidden_dtype, warm.header.flags),
@@ -5715,6 +5716,18 @@ mod spark_warmup_tests {
         assert_eq!(8 * (request.next_multiple_of(4096) + answer.next_multiple_of(4096)), 411_500_544);
     }
 
+    #[test]
+    fn warmup_targets_the_first_selected_remote_layer_not_the_first_moe() {
+        let cfg = glm53_flash();
+        let initial = spark_warmup_request(&cfg, 64, 3).unwrap();
+        let selected = spark_warmup_request(&cfg, 64, 24).unwrap();
+        assert_eq!(selected.header.layer_id, 24);
+        assert_eq!(selected.hidden_payload, initial.hidden_payload);
+        assert_eq!(selected.routes, initial.routes);
+        assert_eq!(selected.wire_stats().wire_bytes, initial.wire_stats().wire_bytes);
+        for layer in [0, 2, 45] { assert!(spark_warmup_request(&cfg, 64, layer).is_err()); }
+    }
+
     /// No wave of a warmed transport is larger than its warm-up: decode and verify steps and prefill
     /// lanes or serial chunks of up to the warmed rows fit the slots it opened, so `post` never drops
     /// and reconnects a warmed rank while serving.
@@ -5722,7 +5735,7 @@ mod spark_warmup_tests {
     fn no_wave_outgrows_a_warmed_session() {
         let cfg = glm53_flash();
         for rows in [2048, 4096] {
-            let warm = spark_warmup_request(&cfg, rows).unwrap();
+            let warm = spark_warmup_request(&cfg, rows, 3).unwrap();
             let (request, answer) = (warm.wire_stats().wire_bytes, response_bytes(&warm));
             for t in [1, 2, DECODE_ROWS - 1, DECODE_ROWS, 128, 1023, 1024, 2048, 2072, 2109, 2176, 4095, 4096]
                 .into_iter().filter(|&t| t <= rows) {

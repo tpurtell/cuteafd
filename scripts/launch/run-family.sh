@@ -212,6 +212,11 @@ layer_args="--first-layer $first_layer"
 spark_worker_env=""
 # Options only the Spark expert workers take.
 spark_worker_args=""
+placement_handshake=0
+if [[ "$family" == glm5_flash && "${CUTEAFD_PLACEMENT_HANDSHAKE:-0}" == 1 ]]; then
+  placement_handshake=1
+  layer_args+=" --placement-handshake"
+fi
 # Snapshot of a model id (and optional revision) inside the containers.
 snapshot_of() {
   local id="$1" rev="$2" dir="$hub/models--${1//\//--}"
@@ -1238,9 +1243,11 @@ done
 wait
 for ((rank = 0; rank < ranks; rank++)); do
   host="$(get "SPARK_${rank}_HOST")"
-  # Expert readiness follows synchronous encoder startup in the same process.
+  # Selection workers bootstrap after media admission, before expert weights load.
+  ready_marker='worker ready'
+  ((placement_handshake == 0)) || ready_marker='worker bootstrap ready'
   ready_deadline=$((SECONDS + 900))
-  until ssh "$host" "docker logs cuteafd-spark-expert-$host-$port 2>&1 | grep -q 'worker ready'"; do
+  until ssh "$host" "docker logs cuteafd-spark-expert-$host-$port 2>&1 | grep -q '$ready_marker'"; do
     ((SECONDS < ready_deadline)) || { echo "$host readiness timed out" >&2; exit 1; }
     ssh "$host" "docker ps -q -f name=cuteafd-spark-expert-$host-$port | grep -q ." ||
       { echo "$host expert worker exited:" >&2; ssh "$host" "docker logs --tail 20 cuteafd-spark-expert-$host-$port" >&2; exit 1; }
@@ -1272,6 +1279,7 @@ fi
 peer_csv="$(IFS=,; echo "${peers[*]}")"
 peer_args=()
 [[ -z "$peer_csv" ]] || peer_args=(--peers "$peer_csv")
+((placement_handshake == 0 || ranks == 0)) || peer_args+=(--placement-handshake)
 # The in-server benchmark keeps its history (SQLite) on the host; the image
 # name labels its reports.
 bench_dir="$HOME/.cache/cuteafd/bench"

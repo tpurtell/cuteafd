@@ -127,6 +127,47 @@ def test_family_table_names_every_launchable_family() -> None:
         assert out.stdout.split()[0] == family
 
 
+@pytest.mark.parametrize("enabled", [False, True])
+def test_glmf_solved_worker_startup_waits_bootstrap_only_when_opted_in(tmp_path: Path, enabled: bool) -> None:
+    result = _family_launch_result(tmp_path, SPLIT_CONFIGS["glm5_flash"], "test/glmf",
+                                  "SPECULATOR=off\nVISION=off\nAUDIO=off\nGLM5_FLASH_FP8_MODEL_ID=off\n",
+                                  extra_env={"CUTEAFD_PLACEMENT_HANDSHAKE": str(int(enabled)),
+                                             "STUB_WORKER_READY": "worker bootstrap ready" if enabled else "worker ready"})
+    assert result.returncode == 0, result.stderr
+    lines = result.stderr.splitlines()
+    worker = next(line for line in lines if "cuteafd expertd-native" in line)
+    coordinator = next(line for line in lines if "cuteafd" in line and "serve-glmf" in line)
+    assert ("--placement-handshake" in worker) == enabled
+    assert ("--placement-handshake" in coordinator) == enabled
+    marker = "worker bootstrap ready" if enabled else "worker ready"
+    readiness = next(i for i, line in enumerate(lines) if f"grep -q '{marker}'" in line)
+    assert readiness < lines.index(coordinator)
+    if enabled:
+        assert not any("grep -q 'worker ready'" in line for line in lines)
+
+
+def test_glmf_zero_spark_launch_does_not_enable_worker_selection(tmp_path: Path) -> None:
+    result = _family_launch_result(tmp_path, SPLIT_CONFIGS["glm5_flash"], "test/glmf",
+                                  "SPARK_COUNT=0\nSPECULATOR=off\nVISION=off\nAUDIO=off\nGLM5_FLASH_FP8_MODEL_ID=off\n",
+                                  extra_env={"CUTEAFD_PLACEMENT_HANDSHAKE": "1"})
+    assert result.returncode == 0, result.stderr
+    assert "--placement-handshake" not in result.stderr
+    assert "cuteafd expertd-native" not in result.stderr
+
+
+def test_glmf_selection_is_sealed_after_solve_before_loading_or_opening_lanes() -> None:
+    source = (ROOT / "rust/crates/cuteafd-daemon/src/families/glm5_flash/mod.rs").read_text()
+    body = source[source.index("    pub fn with_engine<"):source.index("    /// The drafter `--draft`")]
+    assert body.index("self.admit(") < body.index("admitted_spark_layers(") < body.index("select_worker_layers(")
+    assert body.index("select_worker_layers(") < body.index("TokenEmbedding::load(") < body.index("self.experts_range(")
+    assert "args.experts_snapshot.as_deref().unwrap_or(&args.snapshot)" in body
+    assert "WorkerSelection::new(identity, &spark_layers)" in body
+    assert "let spark = !spark_layers.is_empty();" in body
+    expert = source[source.index("    fn experts_range<"):source.index("impl Opened {\n    /// The checkpoint's `embed_tokens`")]
+    assert expert.index("if remote.is_empty() { return Ok(None); }") < expert.index("SparkLink::new(")
+    assert "spark_warmup_request(&self.cfg, warm_rows, remote.start)" in expert
+
+
 def test_family_table_matches_the_rust_launch_fixtures(tmp_path: Path) -> None:
     """checkpoint-family.py and cuteafd-loader plan::launch read the same cases the
     same way (both spellings, exact pattern lengths, agreement)."""
@@ -173,7 +214,7 @@ def _family_launch_result(tmp_path: Path, family_config: dict, model: str, keys:
         (bin_dir / tool).write_text('#!/usr/bin/env bash\nprintf "%s " "$(basename "$0")" "$@" >&2; echo >&2\n'
                                     + ('case "$*" in *"docker run --rm"*"python3"*) exit 2 ;; esac\n'
                                        if preflight_error and tool == "ssh" else '') +
-                                    'case "$*" in *"docker logs"*) echo "worker ready"; '
+                                    'case "$*" in *"docker logs"*) echo "${STUB_WORKER_READY:-worker ready}"; '
                                     'echo "audio encoder ready backend=mimo_audio_fp32_v1/cuda13000/cufft12000/cublas13.0.0/cute_aot_sm121/export' + 'cd' * 32 + '" ;; esac\n' +
                                     ('case "$*" in image\\ inspect*) echo test-pin ;; '
                                      'cp\\ *) dst="${@: -1}"; mkdir -p "$dst"; '
