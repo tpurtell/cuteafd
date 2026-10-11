@@ -34,11 +34,11 @@ async fn lane<'a, P: VerificationTarget<'a>, C: DraftChain<'a>>(lane: usize, lib
             // This lane has completed all of its own GPU/transport work. Retire
             // only its requests; the peer need not stop or migrate survivors.
             let retired: Vec<_> = active.borrow().iter().enumerate().filter_map(|(slot, entry)|
-                entry.as_ref().filter(|r| r.lane == lane && (r.finished || r.job.events.is_closed()))
+                entry.as_ref().filter(|r| r.lane() == lane && (r.finished || r.job.events.is_closed()))
                     .map(|_| slot)).collect();
             for slot in retired {
                 let request = active.borrow_mut()[slot].take().unwrap();
-                let request_id = request.id;
+                let request_id = request.id();
                 retire(lane, request, requests, prefixes, draft).await?;
                 tracing::debug!(target: "cuteafd::lane_schedule", lane, request_id, round_id,
                     "independent lane request retired");
@@ -51,7 +51,7 @@ async fn lane<'a, P: VerificationTarget<'a>, C: DraftChain<'a>>(lane: usize, lib
                     drain.set(true); return Ok(());
                 }
                 active.iter().enumerate().filter_map(|(slot, r)|
-                    r.as_ref().filter(|r| r.lane == lane).map(|_| slot)).collect()
+                    r.as_ref().filter(|r| r.lane() == lane).map(|_| slot)).collect()
             };
             if members.is_empty() { return Ok(()); }
             ensure!(members.len() <= 8, "independent lane exceeds eight requests");
@@ -69,7 +69,7 @@ async fn lane<'a, P: VerificationTarget<'a>, C: DraftChain<'a>>(lane: usize, lib
                 prefixes.borrow_mut().make_room(&mut requests, &capacity)?;
                 members.iter().map(|&slot| {
                     let r = active[slot].as_ref().unwrap();
-                    Ok((r.id, r.anchor, requests.cache().committed_end(r.lease)?, r.job.max_tokens-r.generated))
+                    Ok((r.id(), r.anchor, requests.cache().committed_end(r.lease)?, r.job.max_tokens-r.generated))
                 }).collect::<Result<Vec<_>>>()?
             };
             // A request that copies from its own history skips this round's dSpark draft.
@@ -101,7 +101,7 @@ async fn lane<'a, P: VerificationTarget<'a>, C: DraftChain<'a>>(lane: usize, lib
             if !drafting.is_empty() { clock.drafted_us(draft_us); }
             let mut inputs = crate::shared::speculation::copy::merge(copies, drafted)?;
             let proposal = console::Proposal::capture(&inputs, console::live());
-            let shared = active.borrow().iter().flatten().any(|r| r.lane != lane);
+            let shared = active.borrow().iter().flatten().any(|r| r.lane() != lane);
             let (inputs, mut batch, capture_routes) = {
                 let active = active.borrow();
                 let mut requests = requests.borrow_mut();
@@ -115,7 +115,7 @@ async fn lane<'a, P: VerificationTarget<'a>, C: DraftChain<'a>>(lane: usize, lib
                 // the peer lane's activity selects the shared-regime fit.
                 if let Some(draft) = draft.as_deref_mut() {
                     let candidates: Vec<_> = members.iter().zip(&inputs).zip(&copied).filter(|(_, copied)| !**copied)
-                        .map(|((&slot, input), _)| (active[slot].as_ref().unwrap().id, input.len()-1)).collect();
+                        .map(|((&slot, input), _)| (active[slot].as_ref().unwrap().id(), input.len()-1)).collect();
                     if let Some(lengths) = draft.select_lengths(lane, &candidates, shared)? {
                         for (input, length) in inputs.iter_mut().zip(&copied).filter(|(_, copied)| !**copied)
                             .map(|(input, _)| input).zip(lengths) { input.truncate(length+1); }
@@ -301,7 +301,7 @@ async fn lane<'a, P: VerificationTarget<'a>, C: DraftChain<'a>>(lane: usize, lib
     result
 }
 
-async fn retire<'a, C: DraftChain<'a>>(lane: usize, request: Active<'a>, requests: &RefCell<&mut Requests<'a>>,
+async fn retire<'a, C: DraftChain<'a>>(lane: usize, mut request: Active<'a>, requests: &RefCell<&mut Requests<'a>>,
     prefixes: &RefCell<&mut PrefixCache<'a>>, draft: &RefCell<Option<&mut DraftRuntime<'_, 'a, C>>>) -> Result<()> {
     request.console_retire();
     // Chunk-4b: consult the turn bank before requiring the retained frontier, so
@@ -314,10 +314,10 @@ async fn retire<'a, C: DraftChain<'a>>(lane: usize, request: Active<'a>, request
             let next = request.next_after_commit.as_ref().context("finished request has no retained logits")?;
             prefixes.borrow_mut().capture_session(request.job.usage.as_ref().map(|u| u.session_id().to_owned()));
             let queued = prefixes.borrow_mut().queue_retain(lane, SnapshotKind::Turn, &request.tokens,
-                &request.image_keys, next, request.id, request.lease, &mut requests.borrow_mut(),
+                &request.image_keys, next, request.id(), request.lease, &mut requests.borrow_mut(),
                 draft.borrow_mut().as_deref_mut())?;
             if queued {
-                tracing::debug!(target: "cuteafd::lane_schedule", lane, request_id=request.id,
+                tracing::debug!(target: "cuteafd::lane_schedule", lane, request_id=request.id(),
                     "independent snapshot queued");
                 loop {
                     let ready = prefixes.borrow_mut().poll_retain(lane, &mut requests.borrow_mut(),
@@ -325,7 +325,7 @@ async fn retire<'a, C: DraftChain<'a>>(lane: usize, request: Active<'a>, request
                     if ready { break; }
                     tokio::task::yield_now().await;
                 }
-                tracing::debug!(target: "cuteafd::lane_schedule", lane, request_id=request.id,
+                tracing::debug!(target: "cuteafd::lane_schedule", lane, request_id=request.id(),
                     "independent snapshot published");
             }
             Ok(())
@@ -339,6 +339,6 @@ async fn retire<'a, C: DraftChain<'a>>(lane: usize, request: Active<'a>, request
         }
     }
     let target = requests.borrow_mut().release_if_present(request.lease);
-    let speculative = draft.borrow_mut().as_deref_mut().map(|d| d.release(request.id)).transpose();
+    let speculative = draft.borrow_mut().as_deref_mut().map(|d| d.release(request.id())).transpose();
     target.and(speculative.map(|_| ()))
 }
