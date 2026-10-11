@@ -1198,7 +1198,12 @@ fn schedule(engine: &Qwen4Engine<'_>, opened: &Opened, snapshot: &std::path::Pat
                 ("gpu", gpu(0)), ("experts", gpu(1))]
         });
         if let Some(trace) = trace.as_mut() {
+            let contexts: Vec<Vec<usize>> = starts.iter().zip(&sequences)
+                .map(|(&start, rows)| (1..=rows.len()).map(|offset| start + offset).collect()).collect();
             trace.cycle(serde_json::json!({"rows": tokens.len(), "seqs": sequences.len(),
+                "attention": engine.verify_attention_trace(&contexts,
+                    engine.verify_bucket_rows(tokens.len(), spec, diagnostic)),
+                "contexts": contexts,
                 "ids": active.iter().map(|a| a.id).collect::<Vec<_>>(),
                 "depths": sequences.iter().map(|s| s.len() - 1).collect::<Vec<_>>(),
                 "kept": kept.iter().map(|k| k.map_or(0, |(n, _)| n)).collect::<Vec<_>>(),
