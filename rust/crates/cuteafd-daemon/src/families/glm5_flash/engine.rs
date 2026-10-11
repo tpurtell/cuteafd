@@ -1623,10 +1623,14 @@ impl<'a> GlmfEngine<'a> {
             verify_rows = self.verify_rows, startup = self.startup_graphs,
             "GLM Flash decode buckets pass the projection thresholds");
         if !self.startup_graphs { return Ok(0); }
-        let shapes = serving_graph_shapes(self.max_context, self.pages, self.cfg.dense_context(), sequences, speculation,
-            &self.buckets);
+        let startup = cuteafd_loader::serving_capacity::glmf_graphs::startup_set(
+            self.max_context, self.pages * PAGE_ROWS, self.cfg.dense_context(), sequences,
+            speculation, self.weights.layers.len(), self.peer.is_some(), &self.buckets);
+        ensure!(self.peer.as_ref().is_none_or(|peer| peer.layers.len() == self.weights.layers.len()),
+            "startup graph peer layer inventory differs from planner");
+        let shapes = startup.keys;
         let segments = self.weights.layers.len() + 1;
-        let expected = shapes.len() * (segments + self.peer.as_ref().map_or(0, |p| p.layers.len()));
+        let expected = startup.inventory.ranks.iter().map(|rank| rank.executables as usize).sum::<usize>();
         tracing::info!(shapes = shapes.len(), graphs = expected, plain_rows = ?self.buckets.plain,
             spec_rows = ?self.buckets.spec, "GLM Flash startup decode graph admission");
         // Allocate fixed workspaces before measuring the graph executables' physical memory.
@@ -2590,6 +2594,7 @@ impl<'a> GlmfEngine<'a> {
     fn decode_step(&self, sequences: &mut [(&mut GlmfPlacement, usize)], tokens: &[u32],
         on_layer: Option<&mut dyn FnMut(usize, &[u8]) -> Result<()>>, spec: bool,
         trace: Option<&std::path::Path>, media: Option<&cuteafd_engine::media::RequestMedia>, eager: bool) -> Result<Option<DeviceLogits>> {
+        let _capture_watch = crate::shared::decode_graph::CaptureWatch::round();
         let rows: usize = sequences.iter().map(|(_, n)| n).sum();
         ensure!(rows > 0 && rows <= self.decode_rows && tokens.len() == rows,
             "decode step of {rows} rows (--decode-rows {})", self.decode_rows);
@@ -3309,7 +3314,8 @@ impl<'a> GlmfEngine<'a> {
             GraphCounts {
                 stats: GraphStats { captures: total.stats.captures + stats.captures,
                     recaptures: total.stats.recaptures + stats.recaptures,
-                    evictions: total.stats.evictions + stats.evictions },
+                    evictions: total.stats.evictions + stats.evictions,
+                    eager_runs: total.stats.eager_runs + stats.eager_runs },
                 held: total.held + graphs.len(),
                 shapes: total.shapes + graphs.count(|key| key.segment == 0),
                 bytes: total.bytes + graphs.bytes(),

@@ -1332,6 +1332,26 @@ fn glm5_flash_layout_keeps_the_graph_budget_as_the_admission_does() {
 }
 
 #[test]
+fn glm5_flash_startup_inventory_preserves_reference_plan_json() {
+    let dir = snapshot(glm5_flash_config(45),
+        &[t("model.language_model.layers.0.self_attn.A_log", "F32", &[64])]);
+    let mut plans = serde_json::Map::new();
+    for (name, gpus, ranks) in [("min", 1, 4), ("max", 2, 4), ("two-rtx-no-spark", 2, 0)] {
+        let options = PlanOptions { layout: Some(layout::LayoutOptions {
+            rtx_bytes: vec![96 << 30; gpus], pool_tokens: Some(2_097_152),
+            context_tokens: 1_048_576, ..Default::default()
+        }), ..sparks(ranks) };
+        let mut value = serde_json::to_value(plan(dir.path(), &options).unwrap()).unwrap();
+        value["snapshot"] = json!("<fixture>");
+        plans.insert(name.into(), value);
+    }
+    let actual = Value::Object(plans);
+    let expected: Value = serde_json::from_str(include_str!(
+        "../../tests/fixtures/glmf-startup-plans.json")).unwrap();
+    assert_eq!(actual, expected);
+}
+
+#[test]
 fn glm5_flash_disabled_draft_omits_arenas_and_speculative_graphs() {
     use cuteafd_core::memory_layout::Category;
     let dir = snapshot(glm5_flash_config(2), &[t("model.language_model.layers.0.self_attn.A_log", "F32", &[64])]);

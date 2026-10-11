@@ -1148,24 +1148,21 @@ pub fn layout(report: &mut PlanReport, model: &dyn super::FamilyModel, checkpoin
                     let target = options.pool_tokens.filter(|&n| n > 0).unwrap_or(target_pool_tokens);
                     use crate::serving_capacity::glmf_graphs::{admit_beside_decode_graphs, solve_graph_pool, StartupGraphReserve};
                     let solved = solve_graph_pool(target as usize, |candidate| {
-                        let counts = crate::serving_capacity::glmf_graphs::serving_graph_counts(
+                        let startup_set = crate::serving_capacity::glmf_graphs::startup_set(
                             crate::serving_capacity::glmf_graphs::admitted_graph_context(context_tokens as usize, candidate, options.context_tokens == 0),
                             candidate, cfg.dense_context(), concurrency as usize, drafter > 0, cfg.layers, split, &buckets);
-                        let reserve = counts.iter().map(|&count|
-                            crate::serving_capacity::glmf_graphs::graph_reserve_bytes(count as usize)).max().unwrap_or(0);
+                        let reserve = startup_set.inventory.ranks.iter().map(|rank| rank.bytes).max().unwrap_or(0);
                         admit_beside_decode_graphs(Some(StartupGraphReserve { reserve, allowance: costs.graph_bytes[0] }), |startup| {
                             for (rank, device) in devices.iter_mut().take(active_gpus).enumerate() {
                                 device.items.retain(|i| i.group != "graph allowance" && i.group != "graphs" && i.group != "graph growth");
                                 // The captured set at ready (per-role measured bytes); the reserve's margin is
                                 // growth.
-                                let role = if !split { 0 } else { 1 + rank };
-                                let measured = crate::serving_capacity::glmf_graphs::measured_graph_bytes(counts[rank], role)
-                                    .min(crate::serving_capacity::glmf_graphs::graph_reserve_bytes(counts[rank] as usize));
+                                let measured = startup_set.inventory.at_ready(rank);
                                 if startup.is_some() {
                                     device.items.push(Item::new(Category::Runtime, "graphs", "", measured, Basis::Calibrated));
                                 }
                                 let growth = if startup.is_some() {
-                                    crate::serving_capacity::glmf_graphs::graph_reserve_bytes(counts[rank] as usize) - measured
+                                    startup_set.inventory.growth(rank)
                                 } else { costs.graph_bytes[0] };
                                 device.items.push(Item::new(Category::Runtime, "graph growth", "", growth, Basis::Formula));
                             }

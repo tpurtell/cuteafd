@@ -164,6 +164,12 @@ pub const LOADED_CODE: &[LoadedCode] = &[
         source: "glm53f-exl3-max rtx1: untracked 3,085,306,112 - graphs 2,283,798,528 - context 586,416,128" },
 ];
 
+/// GLM Flash startup executable means (SM120 RTX PRO 6000, CUDA driver
+/// 595.91.07, EXL3 K3.25, 64 decode rows, v3-p2 ready ledgers, 2026-10-10).
+/// One GPU: 1,946,157,056 / 13,800; split lead: 2,231,369,728 / 13,800;
+/// split peer: 2,283,798,528 / 13,500. Values retain P2's rounded arithmetic.
+pub const GLMF_GRAPH_BYTES_BY_ROLE: [u64; 3] = [141_027, 161_694, 169_171];
+
 /// The table's family key of a program family (`dsv4f`, `mimop2`, ...).
 pub fn loaded_code_family(program_family: &str) -> &str {
     let base = program_family.trim_end_matches('2');
@@ -327,7 +333,7 @@ impl GraphSet {
         let mut seen = std::collections::HashSet::new();
         for shape in &shapes {
             if shape.rows == 0 || shape.rows > 4096 || shape.bindings == 0
-                || shape.lane > 1 || !seen.insert(shape.clone()) {
+                || shape.lane > 1 || !seen.insert((shape.device, shape.lane, shape.site.clone(), shape.layer, shape.rows)) {
                 return Err("invalid or duplicate V4.1 startup graph shape".into());
             }
             let count = counts.get_mut(shape.device as usize).ok_or("V4.1 startup graph device outside inventory")?;

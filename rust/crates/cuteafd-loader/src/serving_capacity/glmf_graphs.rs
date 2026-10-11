@@ -51,7 +51,7 @@ impl DecodeBuckets {
 /// 595.91.07, EXL3 K3.25, 64 decode rows, 2026-10-10): one GPU 1,946,157,056 B / 13,800 graphs;
 /// head-split lead 2,231,369,728 B / 13,800; peer 2,283,798,528 B / 13,500 (the split graphs carry
 /// the peer exchange's waits and copies).
-pub const MEASURED_GRAPH_BYTES_BY_ROLE: [u64; 3] = [141_027, 161_694, 169_171];
+pub use crate::placement::inventory::GLMF_GRAPH_BYTES_BY_ROLE as MEASURED_GRAPH_BYTES_BY_ROLE;
 
 /// Measured bytes of `graphs` startup executables on `role` (0: one GPU, 1: split lead, 2: peer).
 pub fn measured_graph_bytes(graphs: u64, role: usize) -> u64 {
@@ -67,12 +67,8 @@ pub fn graph_reserve_bytes(graphs: usize) -> u64 {
 #[allow(clippy::too_many_arguments)]
 pub fn serving_graph_reserve(context: usize, pool_tokens: usize, dense: usize,
     sequences: usize, speculation: bool, layers: usize, peer: bool, buckets: &DecodeBuckets) -> Vec<u64> {
-    let shapes = serving_graph_shapes(context, pool_tokens.div_ceil(PAGE_ROWS), dense, sequences, speculation,
-        buckets).len();
-    let graphs = std::iter::once(shapes * (layers + 1))
-        .chain(peer.then_some(shapes * layers)).collect::<Vec<_>>();
-    let bytes: Vec<_> = graphs.iter().map(|&count| graph_reserve_bytes(count)).collect();
-    bytes
+    startup_set(context, pool_tokens, dense, sequences, speculation, layers, peer, buckets)
+        .inventory.ranks.iter().map(|rank| rank.bytes).collect()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -195,6 +191,26 @@ mod tests {
         assert_eq!(verify_budget(128, 170), 127);
         assert_eq!(verify_budget(128, 132), 99);
     }
+}
+
+/// One immutable geometry list and per-rank ledger for both admission and
+/// capture. Retain the existing reserve and per-role rounding byte-for-byte.
+#[allow(clippy::too_many_arguments)]
+pub fn startup_set(context: usize, pool_tokens: usize, dense: usize, sequences: usize,
+    speculation: bool, layers: usize, peer: bool, buckets: &DecodeBuckets)
+    -> crate::placement::inventory::StartupGraphs<(usize, bool, GraphGeometry)> {
+    use crate::placement::inventory::{GraphRank, GraphSet, Lifetime};
+    let keys = serving_graph_shapes(context, pool_tokens.div_ceil(PAGE_ROWS), dense, sequences, speculation, buckets);
+    let shapes = keys.len() as u64;
+    let ranks = std::iter::once(shapes * (layers + 1) as u64)
+        .chain(peer.then_some(shapes * layers as u64)).enumerate().map(|(rank, executables)| {
+            let role = if peer { 1 + rank } else { 0 };
+            let bytes = graph_reserve_bytes(executables as usize);
+            let measured = measured_graph_bytes(executables, role).min(bytes);
+            GraphRank { executables, bytes, margin: bytes - measured }
+        }).collect();
+    GraphSet { ranks, shapes, lifetime: Lifetime::Startup }.startup(keys)
+        .expect("startup geometry list and ledger are constructed together")
 }
 
 #[allow(clippy::too_many_arguments)]

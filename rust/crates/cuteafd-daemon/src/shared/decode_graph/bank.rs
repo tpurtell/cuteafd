@@ -14,6 +14,7 @@ pub(crate) struct GraphStats {
     pub captures: u64,
     pub recaptures: u64,
     pub evictions: u64,
+    pub eager_runs: u64,
 }
 
 /// A bank miss is not implicit permission to capture on a live request.
@@ -44,7 +45,7 @@ pub(crate) struct GraphBank<K, E> {
     retired: Vec<E>,
 }
 
-impl<K: Hash + Eq + Clone, E> GraphBank<K, E> {
+impl<K: Hash + Eq + Clone + std::fmt::Debug, E> GraphBank<K, E> {
     pub fn new(budget: Option<u64>) -> Self {
         Self::with_policy(GraphPolicy::Budgeted { bytes: budget })
     }
@@ -86,11 +87,21 @@ impl<K: Hash + Eq + Clone, E> GraphBank<K, E> {
         let decision = if self.entries.contains_key(key) { GraphDecision::Replay }
             else if self.policy == GraphPolicy::FixedStartup { GraphDecision::Eager }
             else { GraphDecision::Capture };
+        if decision == GraphDecision::Eager {
+            self.stats.eager_runs += 1;
+            let count = self.stats.eager_runs;
+            if count <= 8 || count.is_power_of_two() {
+                tracing::info!(target: "cuteafd::graph_capture", bank = self as *const Self as usize, ?key, eager_runs = count,
+                    "fixed startup unknown graph key executed eagerly");
+            }
+        }
         (decision, self.launch(key))
     }
 
     pub fn set_budget(&mut self, budget: Option<u64>) {
-        self.policy = GraphPolicy::Budgeted { bytes: budget };
+        if matches!(self.policy, GraphPolicy::Budgeted { .. }) {
+            self.policy = GraphPolicy::Budgeted { bytes: budget };
+        }
     }
 
     pub fn budget(&self) -> Option<u64> {
@@ -186,6 +197,16 @@ impl<K: Hash + Eq + Clone, E> GraphBank<K, E> {
     pub fn stats(&self) -> GraphStats { self.stats }
 }
 
+impl<K, E> Drop for GraphBank<K, E> {
+    fn drop(&mut self) {
+        if self.policy == GraphPolicy::FixedStartup && self.stats.eager_runs > 0 {
+            tracing::info!(target: "cuteafd::graph_capture", bank = self as *const Self as usize,
+                eager_runs = self.stats.eager_runs, captures = self.stats.captures,
+                "fixed startup graph bank final counters");
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -196,6 +217,12 @@ mod tests {
         assert_eq!(bank.enqueue(&6), (GraphDecision::Replay, Some(&6)));
         assert_eq!(bank.enqueue(&3), (GraphDecision::Eager, None));
         assert_eq!(bank.stats().captures, 3);
+        assert_eq!(bank.stats().eager_runs, 1);
+        bank.enqueue(&3);
+        assert_eq!(bank.stats().eager_runs, 2);
+        bank.set_budget(Some(100));
+        assert_eq!(bank.enqueue(&4), (GraphDecision::Eager, None));
+        assert_eq!(bank.stats().eager_runs, 3);
         assert!(bank.warm(&[], |_| Ok((0, None))).is_err());
         let mut duplicate = GraphBank::with_policy(GraphPolicy::FixedStartup);
         assert!(duplicate.warm(&[1, 1], |key| Ok((*key, None))).is_err());
@@ -250,7 +277,7 @@ mod tests {
 mod budget_tests {
     use super::*;
 
-    fn insert<K: Hash + Eq + Clone, E>(bank: &mut GraphBank<K, E>, key: K, exec: E, bytes: Option<u64>) -> Vec<E> {
+    fn insert<K: Hash + Eq + Clone + std::fmt::Debug, E>(bank: &mut GraphBank<K, E>, key: K, exec: E, bytes: Option<u64>) -> Vec<E> {
         bank.insert(key, exec, bytes);
         bank.drain_retired(|| Ok(())).unwrap()
     }
@@ -323,7 +350,7 @@ mod budget_tests {
         // Frozen: a capture that measures more is still charged one executable.
         assert_eq!(insert(&mut cache, 4, 4, Some(8 * MIB)), vec![2]);
         assert_eq!((cache.len(), cache.bytes()), (3, 3 * MIB));
-        assert_eq!(cache.stats(), GraphStats { captures: 5, recaptures: 0, evictions: 2 });
+        assert_eq!(cache.stats(), GraphStats { captures: 5, recaptures: 0, evictions: 2, eager_runs: 0 });
     }
 
     #[test]
