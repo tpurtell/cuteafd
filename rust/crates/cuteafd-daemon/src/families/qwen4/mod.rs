@@ -222,6 +222,19 @@ impl Opened {
     }
 }
 
+fn required_fp8_programs(args: &EngineArgs) -> Vec<String> {
+    let mut required = Vec::new();
+    if args.fp8_decode {
+        let suffix = if args.kv_format == cuteafd_loader::families::qwen4::Qwen4KvCache::Fp8 { "_kv_fp8" } else { "" };
+        for cap in ["m64".to_string(), format!("m{}", args.prefill_rows)] {
+            required.extend([format!("qwen4_gdn_w8_{cap}"),
+                format!("qwen4_attn_producer_w8{suffix}_{cap}"), format!("qwen4_attn_o_w8_{cap}")]);
+        }
+    }
+    if args.mtp_fp8_head { required.push("qwen4_head_fp8".into()); }
+    required
+}
+
 #[cfg(test)]
 mod weight_representation_tests {
     use super::*;
@@ -250,6 +263,22 @@ mod weight_representation_tests {
         assert!(args(&["--fp8-head", "true"]).unwrap().mtp_fp8_head);
         // The W8A8 switch applies to FP8-only projections only.
         assert!(args(&["--fp8-prefill-w8a8", "true"]).is_err());
+    }
+
+    #[test]
+    fn required_fp8_producer_uses_selected_kv_format() {
+        for format in ["bf16", "fp8"] {
+            let parsed = args(&["--fp8-decode", "true", "--kv-format", format]).unwrap();
+            let required = required_fp8_programs(&parsed);
+            let suffix = if format == "fp8" { "_kv_fp8" } else { "" };
+            for cap in ["m64".to_string(), format!("m{}", parsed.prefill_rows)] {
+                assert!(required.contains(&format!("qwen4_attn_producer_w8{suffix}_{cap}")));
+                let other = if format == "fp8" { "" } else { "_kv_fp8" };
+                assert!(!required.contains(&format!("qwen4_attn_producer_w8{other}_{cap}")));
+                assert!(required.contains(&format!("qwen4_gdn_w8_{cap}")));
+                assert!(required.contains(&format!("qwen4_attn_o_w8_{cap}")));
+            }
+        }
     }
 
     #[test]
@@ -299,15 +328,7 @@ impl Opened {
         let args = &context_args;
         let programs = self.library.programs()?.with_manifest(&args.manifest)?;
         programs.capacities().require_context("qwen4", args.max_context)?;
-        let mut required: Vec<String> = Vec::new();
-        if args.fp8_decode {
-            for cap in ["m64".to_string(), format!("m{}", args.prefill_rows)] {
-                required.extend(["gdn", "attn_producer", "attn_o"].map(|p| format!("qwen4_{p}_w8_{cap}")));
-            }
-        }
-        if args.mtp_fp8_head {
-            required.push("qwen4_head_fp8".into());
-        }
+        let required = required_fp8_programs(args);
         for name in &required {
             programs.spec(name).with_context(|| format!("--fp8-decode / --mtp-fp8-head need the FP8-only program \
                 {name} (export_b12x_dsv4_aot.py qwen4 with the fork's fp8_only Qwen programs); rebuild the native \
