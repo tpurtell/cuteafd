@@ -4170,8 +4170,9 @@ impl Drop for GlmfEngine<'_> {
     fn drop(&mut self) {
         // SAFETY: the engine owns this stream and its resident weights. Drain
         // queued work, including a failed step, before their storage drops.
-        crate::shared::decode_graph::fatal_drain(self.synchronize(), "GLM Flash engine ranks");
+        let _ = self.synchronize();
         unsafe {
+            let _ = self.library.cuda_stream_synchronize(self.stream);
             let _ = self.library.cuda_event_destroy(self.routes_ready);
         }
         if let Some(ops) = self.ops.take() {
