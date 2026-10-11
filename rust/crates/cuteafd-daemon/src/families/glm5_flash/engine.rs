@@ -4573,13 +4573,11 @@ fn drain_ranks(ranks: usize, mut drain: impl FnMut(usize) -> Result<()>) -> Resu
 
 impl Drop for GlmfEngine<'_> {
     fn drop(&mut self) {
-        // SAFETY: the engine owns this stream and its resident weights. Drain
-        // queued work, including a failed step, before their storage drops.
-        let _ = self.synchronize();
-        unsafe {
-            let _ = self.library.cuda_stream_synchronize(self.stream);
-            let _ = self.library.cuda_event_destroy(self.routes_ready);
-        }
+        // Every rank can still read graph operands, weights and workspaces.
+        // Abort before any owner releases storage when drainage is unproved.
+        crate::shared::decode_graph::fatal_drain(self.synchronize(), "GLM Flash engine");
+        // SAFETY: all rank streams drained while their event and operands remained live.
+        let _ = unsafe { self.library.cuda_event_destroy(self.routes_ready) };
         self.graphs = RefCell::new(GraphCache::new(None));
         if let Some(peer) = &mut self.peer { peer.graphs = RefCell::new(GraphCache::new(None)); }
         self.retired.borrow_mut().clear();
@@ -4636,6 +4634,70 @@ mod tp2_tests {
             assert!(drain_ranks(ranks, |rank| { attempted.push(rank); Ok(()) }).is_ok());
             assert_eq!(attempted, (0..ranks).collect::<Vec<_>>());
         }
+    }
+
+    #[test]
+    #[ignore = "requires an explicit NVMe CPU fixture directory"]
+    fn failed_native_rank_drains_abort_before_any_storage_release() -> Result<()> {
+        use cuteafd_ffi::native_library_lifetime_fixture::Fixture;
+        use crate::shared::memory::device::{Allocation, Device};
+        use std::os::unix::process::ExitStatusExt;
+        const CHILD: &str = "CUTEAFD_GLMF_FATAL_RANK_CHILD";
+        if let Ok(after) = std::env::var(CHILD) {
+            let fixture = Fixture::build()?;
+            std::fs::write(std::env::var("CUTEAFD_GLMF_FATAL_RANK_EVIDENCE")?,
+                fixture.directory().join("events").to_str().context("fixture evidence path")?)?;
+            let library = fixture.load()?;
+            let storage = [Allocation::new(Device { library: &library, id: 0 }, 256)?,
+                Allocation::new(Device { library: &library, id: 1 }, 256)?];
+            fixture.configure_pack(&library, 0, 1)?;
+            fixture.configure_drain_after(&library, after.parse()?)?;
+            let result = drain_ranks(2, |rank| Device { library: &library, id: rank as i32 }.run(|| {
+                // SAFETY: the CPU fixture accepts a null stream; both storage owners remain live.
+                unsafe { library.cuda_stream_synchronize(std::ptr::null_mut()) }
+            }));
+            crate::shared::decode_graph::fatal_drain(result, "GLM Flash engine");
+            drop(storage);
+            drop(library);
+            panic!("failed aggregate drainage returned without abort");
+        }
+        let root = std::path::PathBuf::from(std::env::var("CUTEAFD_NATIVE_LIFETIME_FIXTURE_DIR")?);
+        std::fs::create_dir_all(&root)?;
+        for after in [0, 1] {
+            let evidence = root.join(format!("glmf-fatal-ranks-{}-{after}", std::process::id()));
+            let status = std::process::Command::new(std::env::current_exe()?)
+                .args(["--exact", "families::glm5_flash::engine::tp2_tests::failed_native_rank_drains_abort_before_any_storage_release",
+                    "--ignored"])
+                .env(CHILD, after.to_string()).env("CUTEAFD_GLMF_FATAL_RANK_EVIDENCE", &evidence).status()?;
+            assert_eq!(status.signal(), Some(libc::SIGABRT));
+            let events = std::fs::read_to_string(std::fs::read_to_string(evidence)?)?;
+            assert_eq!(events, "DDSS", "both ranks must drain before fatal; neither storage nor module may release");
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires an explicit NVMe CPU fixture directory"]
+    fn successful_native_rank_drains_preserve_cleanup_and_device_context() -> Result<()> {
+        use cuteafd_ffi::native_library_lifetime_fixture::Fixture;
+        use crate::shared::memory::device::{Allocation, Device};
+        let fixture = Fixture::build()?;
+        let library = fixture.load()?;
+        let storage = [Allocation::new(Device { library: &library, id: 0 }, 256)?,
+            Allocation::new(Device { library: &library, id: 1 }, 256)?];
+        fixture.configure_pack(&library, 0, 0)?;
+        library.cuda_set_device(1)?;
+        crate::shared::decode_graph::fatal_drain(drain_ranks(2, |rank|
+            Device { library: &library, id: rank as i32 }.run(|| {
+                // SAFETY: the CPU fixture accepts a null stream; all operands remain live.
+                unsafe { library.cuda_stream_synchronize(std::ptr::null_mut()) }
+            })), "GLM Flash engine");
+        assert_eq!(library.cuda_get_device()?, 1);
+        drop(storage);
+        assert_eq!(library.cuda_get_device()?, 1);
+        drop(library);
+        assert_eq!(fixture.events()?, "DDSSddU");
+        Ok(())
     }
 
     #[test]
