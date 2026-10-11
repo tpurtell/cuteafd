@@ -118,6 +118,24 @@ pub fn resident_weights(checkpoint: &Checkpoint, cfg: &GlmNextConfig, layers: us
     Ok(out)
 }
 
+/// Router operands newly replicated on GPU1 by the TP2 executor, counted before loading.
+pub fn router_replica_bytes(checkpoint: &Checkpoint, cfg: &GlmNextConfig, layers: usize) -> Result<u64, String> {
+    let mut bytes = 0u64;
+    for layer in 0..layers.min(cfg.layers) {
+        if cfg.dense[layer] { continue; }
+        let prefix = format!("model.language_model.layers.{layer}.mlp.gate");
+        for (suffix, f32) in [("weight", false), ("e_score_correction_bias", true)] {
+            let name = format!("{prefix}.{suffix}");
+            let tensor = checkpoint.tensors.iter().find(|t| t.meta.name == name)
+                .ok_or_else(|| format!("GLM Flash router operand missing: {name}"))?;
+            let resident = if f32 { tensor.meta.shape.iter().product::<usize>() as u64 * 4 }
+                else { tensor.meta.byte_length };
+            bytes = bytes.checked_add(resident.max(256)).ok_or_else(|| "GLM Flash router bytes overflow".to_string())?;
+        }
+    }
+    Ok(bytes)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
