@@ -36,13 +36,14 @@ pub fn request(inputs: &QwenInputs<'_>, graph_bytes: u64) -> anyhow::Result<Plac
         layers.push(LayerDemand {
             kind: if kind == Qwen4Attention::Full { AttentionClass::Gqa } else { AttentionClass::Gdn },
             weights: ModeBytes::default(),
-            kv_unit: ModeBytes { whole: bytes - previous, split: [0; 2] },
+            kv_unit: KvDemand { unit_bytes_whole: bytes - previous, ..Default::default() },
+            fixed_bytes: ModeBytes::default(), context_indexer: false, colocate: None,
             experts: None,
             modes: vec![whole],
         });
         previous = bytes;
     }
-    let records: u64 = layers.iter().map(|l| l.kv_unit.whole).sum();
+    let records: u64 = layers.iter().map(|l| l.kv_unit.unit_bytes_whole).sum();
     // Includes optional MTP records, pool metadata, the prefill/decode page
     // tables, and the existing per-token rounding of those table bytes.
     let overhead = admission.per_token.checked_mul(unit_rows).and_then(|n| n.checked_sub(records))
@@ -57,6 +58,8 @@ pub fn request(inputs: &QwenInputs<'_>, graph_bytes: u64) -> anyhow::Result<Plac
         inventory: Inventory { gpus: vec![GpuBudget { capacity_bytes: inputs.capacity_bytes,
             headroom_bytes: admission.headroom, baseline: inputs.baseline }],
             spark_ranks: inputs.spark_ranks, peer_access: false },
+        attention_placement: Some(AttentionPlacement::Heads),
+        context_buffers: ContextBuffers::default(), layers_first_gpu: 0,
         pool: PoolPolicy::resolve(&[inputs.capacity_bytes], inputs.max_context, inputs.requested_pool,
             unit_rows, inputs.spark_ranks == 0),
         layers, pool_overhead: vec![overhead], fixed, movables: Vec::new(),
@@ -162,7 +165,7 @@ mod tests {
             };
             let req = request(&inputs, LAZY_GRAPH_BYTES).unwrap();
             let admission = qwen_admission(&inputs.admission).unwrap();
-            assert_eq!(req.layers.iter().map(|l| l.kv_unit.whole).sum::<u64>() + req.pool_overhead[0],
+            assert_eq!(req.layers.iter().map(|l| l.kv_unit.unit_bytes_whole).sum::<u64>() + req.pool_overhead[0],
                 admission.per_token * 256);
             assert!(req.fixed.iter().any(|d| d.group == "lazy EXL3 window" && d.bytes == 10 << 30));
             assert!(req.fixed.iter().any(|d| d.group == "loaded code" && d.bytes == 780_221_844));
