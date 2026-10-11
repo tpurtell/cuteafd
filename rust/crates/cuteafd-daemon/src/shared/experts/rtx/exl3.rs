@@ -101,6 +101,7 @@ impl<'a> Exl3Tp2<'a> {
         max_rows: usize,
         budgets: [usize; 2],
     ) -> Result<[Self; 2]> {
+        let started = std::time::Instant::now();
         let label = format!("experts/TP2 expert layer halves {}..{}", layers.start, layers.end);
         let _memory_scope = cuteafd_ffi::memory_ledger::scope_owned(&label);
         validate_layers(&layers, 0)?;
@@ -219,7 +220,16 @@ impl<'a> Exl3Tp2<'a> {
                 output_bytes(geometry, max_rows)?,
             )?);
         }
+        for rank in &ranks {
+            tracing::info!(rank = rank.rank, device = rank.device.id, layers = rank.layers.len(),
+                resident_bytes = rank.resident_bytes(), workspace_bytes = rank.workspace_bytes,
+                elapsed_seconds = started.elapsed().as_secs_f64(), "EXL3 TP2 rank load complete");
+        }
         Ok(ranks)
+    }
+
+    pub(crate) fn resident_bytes(&self) -> usize {
+        self.weights.iter().map(|weight| weight.budget.resident_bytes).sum()
     }
 }
 
