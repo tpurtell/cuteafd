@@ -835,8 +835,8 @@ impl<'a> GlmfLoader<'a> {
             put(&mut ops, "w_down_scale", s);
         }
         if !dense {
-            ops[0].insert("gate", self.one(&format!("{p}.mlp.gate.weight"))?);
-            ops[0].insert("gate.bias", self.f32(&[format!("{p}.mlp.gate.e_score_correction_bias")])?);
+            put(&mut ops, "gate", self.replicate(self.one(&format!("{p}.mlp.gate.weight"))?)?);
+            put(&mut ops, "gate.bias", self.replicate(self.f32(&[format!("{p}.mlp.gate.e_score_correction_bias")])?)?);
         }
         Ok(ops.into_iter().map(|operands| GlmfLayer { attention, dense, split: true, operands }).collect())
     }

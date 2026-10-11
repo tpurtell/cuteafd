@@ -979,11 +979,11 @@ mod tests {
         let (mark, per_sequence) = (rank.retained_mark_bytes, rank.active_state_per_sequence_bytes);
         assert_eq!((mark, per_sequence), (147_619_840, 147_619_840));
         let snapshot = tempfile::tempdir().unwrap();
-        write_snapshot(snapshot.path(), &config, &[], None);
+        write_snapshot(snapshot.path(), &config, &cuteafd_loader::plan::testing::glm5_flash_tensors(&config), None);
         let model = snapshot.path().display().to_string();
         let layout = |extra: &[&str]| {
             let argv = ["cuteafd", "plan", model.as_str(), "--layout", "--spark-ranks", "4", "--rtx", "1",
-                "--rtx-gib", "96", "--pool-tokens", "0"];
+                "--rtx-gib", "96", "--pool-tokens", "0", "--drafter-gib", "2"];
             let cli = crate::cli::Cli::try_parse_from(argv.into_iter().chain(extra.iter().copied())).unwrap();
             let crate::cli::Commands::Plan(args) = cli.command else { panic!("plan") };
             options(&args).unwrap()
@@ -993,7 +993,7 @@ mod tests {
             let memory = plan(std::path::Path::new(&model), &layout(extra)).unwrap().memory_layout.unwrap();
             let group = |name: &str| memory.devices[0].items.iter().filter(|i| i.group == name).map(|i| i.bytes)
                 .sum::<u64>();
-            (group("marks"), group("state"))
+            (group("marks"), group("KDA state and replay") + group("DSA index tails and replay") + group("commit tables"))
         };
         let state = |slots: u64| rank.fixed_state_bytes + per_sequence * slots + rank.speculative_replay_bytes;
         // serve-glmf's own counts for `sequences`, `entries` and a mark budget (MiB).
