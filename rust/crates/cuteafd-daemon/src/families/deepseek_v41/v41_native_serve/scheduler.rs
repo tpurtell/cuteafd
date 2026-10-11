@@ -11,7 +11,8 @@ use crate::families::deepseek_v41::v41_backbone_cache::CacheLease;
 use crate::families::deepseek_v41::v41_requests::RequestBatch;
 use super::prefix::{ImageKeys, PrefixCache, SnapshotKind};
 use super::console;
-use super::copy_drafts::{self, CopyDrafter};
+use super::copy_drafts;
+use crate::shared::speculation::copy::{self as copy_search, LatestWindow};
 use crate::shared::draft::clock::RoundClock;
 
 #[cfg(test)]
@@ -79,7 +80,7 @@ pub(super) struct Active<'a> {
     image_keys: ImageKeys,
     next_after_commit: Option<RetainedScores>,
     /// Copy windows over `tokens`; `None` when copy drafting is off.
-    copy: Option<CopyDrafter>,
+    copy: Option<LatestWindow>,
 }
 impl Active<'_> {
     /// Why the request left the scheduler, for the live console.
@@ -229,7 +230,7 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
     let mut stats_published = Instant::now();
     let limits = cuteafd_api::openai::NativeLimits::new(args.max_context_tokens, args.max_output_tokens)?;
     let copy_windows = draft.is_some() && copy_drafts::enabled();
-    tracing::info!(copy_drafts=copy_windows, window=copy_drafts::WINDOW, "copy-window drafting");
+    tracing::info!(copy_drafts=copy_windows, window=copy_search::WINDOW, "copy-window drafting");
     let result = (|| -> Result<()> {
     loop {
         if let Some(reason) = cuteafd_transport::health::failure_reason() {
@@ -474,7 +475,7 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
                 let anchor = scores.sample(mask, job.sampling, 0)?;
                 Ok(Active { constraint, id, lease, job, decoder, anchor, generated: 0, buffered: 0, lane,
                     finished: false, cacheable: false, failed: false, tokens: prompt, image_keys, next_after_commit: Some(scores),
-                    copy: copy_windows.then(CopyDrafter::default) })
+                    copy: copy_windows.then(LatestWindow::default) })
             })();
             match result {
                 Ok(mut request) => {
@@ -1319,14 +1320,14 @@ fn copy_inputs(active: &mut [Option<Active<'_>>], members: &[usize], max_drafts:
     members.iter().map(|&slot| {
         let request = active[slot].as_mut().unwrap();
         if !request.job.sampling.is_greedy() || crate::shared::probe::no_speculation(&request.job.probe) { return Ok(None); }
-        let cap = copy_drafts::cap(request.job.max_tokens - request.generated, max_drafts);
+        let cap = copy_search::cap(request.job.max_tokens - request.generated, max_drafts);
         let Some(copied) = request.copy.as_mut().and_then(|copy| copy.propose(&request.tokens, cap))
             else { return Ok(None) };
         let mut input = Vec::with_capacity(copied.len() + 1);
         input.push(request.anchor);
         input.extend(copied);
         if let Some(constraint) = &request.constraint { constraint.truncate_proposal(&mut input)?; }
-        Ok((input.len() > copy_drafts::MIN_DRAFTS).then_some(input))
+        Ok((input.len() > copy_search::MIN_DRAFTS).then_some(input))
     }).collect()
 }
 
@@ -1369,7 +1370,7 @@ fn single_lane_round<'w, 'a>(lib: &'a NativeLibrary, runtime: &tokio::runtime::R
     let drafted = if drafting.is_empty() { Vec::new() }
         else if let Some(draft) = draft.as_deref_mut() { clock.draft(|| draft.propose(lib, lane, &drafting))? }
         else { drafting.iter().map(|r| vec![r.1]).collect() };
-    let mut inputs = copy_drafts::merge(copies, drafted)?;
+    let mut inputs = copy_search::merge(copies, drafted)?;
     let proposal = console::Proposal::capture(&inputs, console::live());
     for (&slot, input) in members.iter().zip(&mut inputs) {
         let r = active[slot].as_ref().unwrap();
