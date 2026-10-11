@@ -670,14 +670,16 @@ def test_glmf_admission_and_verify_keys_reject_bad_values_before_launch(tmp_path
 
 
 @pytest.mark.parametrize("keys,expected,absent", [
-    ("", ("CUTEAFD_GLMF_DRAFT_POLICY=cycle",), ("CUTEAFD_GLMF_ROUTE_RING_CHECK",)),
+    ("", ("CUTEAFD_GLMF_DRAFT_POLICY=shared",), ("CUTEAFD_GLMF_ROUTE_RING_CHECK",)),
+    ("GLM5_FLASH_DRAFT_POLICY=\n", ("CUTEAFD_GLMF_DRAFT_POLICY=shared",), ("CUTEAFD_GLMF_ROUTE_RING_CHECK",)),
+    ("GLM5_FLASH_DRAFT_POLICY=cycle\n", ("CUTEAFD_GLMF_DRAFT_POLICY=cycle",), ("CUTEAFD_GLMF_ROUTE_RING_CHECK",)),
     ("GLM5_FLASH_DRAFT_POLICY=shared\n", ("CUTEAFD_GLMF_DRAFT_POLICY=shared",), ("CUTEAFD_GLMF_ROUTE_RING_CHECK",)),
     ("GLM5_FLASH_DRAFT_POLICY=shared\nGLM5_FLASH_ROUTE_RING_CHECK=on\n",
      ("CUTEAFD_GLMF_DRAFT_POLICY=shared", "CUTEAFD_GLMF_ROUTE_RING_CHECK=1"), ()),
     ("GLM5_FLASH_DRAFT_TRACE=on\n", ("CUTEAFD_GLMF_DRAFT_TRACE=1",), ()),
 ])
 def test_glmf_draft_policy_keys_reach_the_coordinator(tmp_path, keys, expected, absent):
-    """The shared draft policy is opt-in (cycle by default) and the route ring check is diagnostic."""
+    """The shared draft policy is the default and the route ring check is diagnostic."""
     result = _family_launch_result(tmp_path, GLMF_CONFIG, "test/glmf", f"GLM5_FLASH_FP8_MODEL_ID=off\n{keys}")
     assert result.returncode == 0, result.stderr
     launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-glmf" in line)

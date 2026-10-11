@@ -97,8 +97,8 @@ impl PolicyKind {
     }
     fn parse(value: Option<&str>) -> Result<Self> {
         match value.map(str::trim) {
-            None | Some("" | "cycle") => Ok(Self::Cycle),
-            Some("shared") => Ok(Self::Shared),
+            None | Some("" | "shared") => Ok(Self::Shared),
+            Some("cycle") => Ok(Self::Cycle),
             Some(other) => anyhow::bail!("CUTEAFD_GLMF_DRAFT_POLICY must be cycle or shared, got {other:?}"),
         }
     }
@@ -475,8 +475,9 @@ mod tests {
     }
 
     #[test]
-    fn policy_kind_defaults_to_cycle_and_rejects_unknown_values() {
-        assert_eq!(PolicyKind::parse(None).unwrap(), PolicyKind::Cycle);
+    fn policy_kind_defaults_to_shared_and_rejects_unknown_values() {
+        assert_eq!(PolicyKind::parse(None).unwrap(), PolicyKind::Shared);
+        assert_eq!(PolicyKind::parse(Some("")).unwrap(), PolicyKind::Shared);
         assert_eq!(PolicyKind::parse(Some("cycle")).unwrap(), PolicyKind::Cycle);
         assert_eq!(PolicyKind::parse(Some("shared")).unwrap(), PolicyKind::Shared);
         assert!(PolicyKind::parse(Some("buckets")).is_err());
