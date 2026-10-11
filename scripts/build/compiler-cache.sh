@@ -129,6 +129,11 @@ PY
   export CUTEAFD_KACHE_WARNING_DIR="$build_dir/compiler-cache/warned"
   rmdir "$CUTEAFD_KACHE_WARNING_DIR" 2>/dev/null || true
   export RUSTC_WRAPPER="$launcher" CC_KNOWN_WRAPPER_CUSTOM=compiler-cache
+  # kache restores and plain-retry fallbacks leave rustc's incremental
+  # dep-graph/query-cache partial ("missing incremental ... paths"), which
+  # forces a fresh target. kache already caches whole crates, so incremental
+  # adds nothing under it.
+  export CARGO_INCREMENTAL=0
   export CC="$shim_dir/cc" CXX="$shim_dir/c++" CUTEAFD_KACHE_SHIM_DIR="$shim_dir"
   export CMAKE_C_COMPILER_LAUNCHER="$launcher" CMAKE_CXX_COMPILER_LAUNCHER="$launcher"
   export CUTEAFD_KACHE_MODE=enabled
