@@ -18,7 +18,7 @@ mod points;
 #[cfg(test)]
 mod tests;
 
-pub use admission::{AdmissionPoll, DeferredAdmission};
+pub use admission::{fit_output, AdmissionPoll, AdmissionStats, DeferredAdmission};
 pub use cache::{Admitted, Hit, HostPayload, PrefixCache, PrefixConfig, PrefixError, PrefixStats, Source};
 pub use chain::{content_id, page_chain, CONTENT_CLASS};
 pub use cuteafd_core::prefix::{ReuseRule, SnapshotKind};
