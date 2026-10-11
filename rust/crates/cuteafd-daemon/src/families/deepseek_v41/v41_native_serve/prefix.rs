@@ -15,7 +15,7 @@ struct Saved<'a> {
     _images: ImageKeys,
     target: RequestPrefix<'a>,
     draft: Option<DraftPrefix<'a>>,
-    next: TokenScores,
+    next: RetainedScores,
     /// The host cache's write-behind copy of this snapshot, if one was issued.
     ticket: Option<cuteafd_hostcache::cache::StoreTicket>,
 }
@@ -34,7 +34,7 @@ struct PendingRetention {
     kind: SnapshotKind,
     keys: Vec<u32>,
     images: ImageKeys,
-    next: TokenScores,
+    next: RetainedScores,
     id: u64,
     lease: CacheLease,
     draft: bool,
@@ -206,7 +206,7 @@ impl<'a> PrefixCache<'a> {
         kind: SnapshotKind,
         tokens: &[u32],
         images: &ImageKeys,
-        next: &TokenScores,
+        next: &RetainedScores,
         id: u64,
         lease: CacheLease,
         requests: &mut Requests<'a>,
@@ -239,7 +239,7 @@ impl<'a> PrefixCache<'a> {
         Ok(())
     }
     pub fn queue_retain<C: DraftChain<'a>>(&mut self, lane: usize, kind: SnapshotKind, tokens: &[u32],
-        images: &ImageKeys, next: &TokenScores, id: u64, lease: CacheLease,
+        images: &ImageKeys, next: &RetainedScores, id: u64, lease: CacheLease,
         requests: &mut Requests<'a>, mut draft: Option<&mut DraftRuntime<'_, 'a, C>>) -> Result<bool> {
         ensure!(self.pending.get(lane).context("invalid retention lane")?.is_none(), "retention lane occupied");
         let bank = self.retained.bank_mut(kind);
@@ -293,7 +293,7 @@ impl<'a> PrefixCache<'a> {
         lease: CacheLease,
         requests: &mut Requests<'a>,
         draft: Option<&mut DraftRuntime<'_, 'a, C>>,
-    ) -> Result<Option<(usize, Option<TokenScores>)>> {
+    ) -> Result<Option<(usize, Option<RetainedScores>)>> {
         self.restored_session = None;
         let keys = images.encode(tokens)?;
         if self.retained.lookup_reusable(&keys).is_none() {

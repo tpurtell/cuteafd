@@ -1108,12 +1108,12 @@ mod sampler_wiring_tests {
         }
     }
 
-    /// A full-logit `BatchScores` whose every value is `value(row)`. Used to
+    /// A full-logit `ScoreRows` whose every value is `value(row)`. Used to
     /// plant a deliberately stale device id in a row's slot: the commit path for
     /// a device-routed row reads `best`, and a kernel that failed leaves that
     /// slot at the caller's sentinel.
     fn batch_with_value(value: impl Fn(usize) -> u32, rows: usize,
-    ) -> crate::families::deepseek_v41::v41_native_serve::scores::BatchScores {
+    ) -> crate::families::deepseek_v41::v41_native_serve::scores::ScoreRows {
         use crate::families::deepseek_v41::v41_native_serve::scores::{ROW_BYTES, VOCAB};
         let mut bytes = Vec::with_capacity(rows * ROW_BYTES);
         for row in 0..rows {
@@ -1123,7 +1123,7 @@ mod sampler_wiring_tests {
                 bytes.extend_from_slice(&logit.to_ne_bytes());
             }
         }
-        crate::families::deepseek_v41::v41_native_serve::scores::BatchScores::new(VOCAB, bytes).unwrap()
+        crate::families::deepseek_v41::v41_native_serve::scores::ScoreRows::new(VOCAB, bytes).unwrap()
     }
 
     fn wiring_library() -> Option<NativeLibrary> {
@@ -1224,7 +1224,7 @@ mod sampler_wiring_tests {
     fn resolving_a_fallback_row_stores_the_cpu_token_in_its_best_slot() {
         use super::recording_sampler as rec;
         use crate::families::deepseek_v41::v41_native_serve::scheduler::{resolve_fallback_rows, SamplingRound};
-        use crate::families::deepseek_v41::v41_native_serve::scores::{BatchScores, ROW_BYTES};
+        use crate::families::deepseek_v41::v41_native_serve::scores::{ScoreRows, ROW_BYTES};
         let _serial = rec::lock_and_reset();
         let vocab = rec::TEST_VOCAB;
         let Some(_library) = wiring_library() else {
@@ -1235,7 +1235,7 @@ mod sampler_wiring_tests {
         let Some(fixture) = WiringWave::build(&plan, &arena, 7, vocab) else { return };
         let rows = fixture.rows;
         let dummy = 129_279u32;
-        let mut next = BatchScores::test_visible(crate::families::deepseek_v41::v41_native_serve::scores::VOCAB, &vec![dummy; rows], logit_bytes(&fixture.values))
+        let mut next = ScoreRows::test_visible(crate::families::deepseek_v41::v41_native_serve::scores::VOCAB, &vec![dummy; rows], logit_bytes(&fixture.values))
             .unwrap();
         assert!(next.best.iter().all(|id| *id == dummy), "the fixture starts stale");
         let fallback: Vec<usize> = (0..rows)
@@ -1273,7 +1273,7 @@ mod sampler_wiring_tests {
         use super::recording_sampler as rec;
         use crate::families::deepseek_v41::v41_native_serve::scheduler::{admit_device_rows, resolve_fallback_rows,
             select_routed, SamplingRound};
-        use crate::families::deepseek_v41::v41_native_serve::scores::BatchScores;
+        use crate::families::deepseek_v41::v41_native_serve::scores::ScoreRows;
         let _serial = rec::lock_and_reset();
         let vocab = rec::TEST_VOCAB;
         let Some(_library) = wiring_library() else {
@@ -1296,7 +1296,7 @@ mod sampler_wiring_tests {
         let ids: Vec<u32> = (0..rows).map(|row| {
             if row == 5 { dummy } else { sampled.ids[row] }
         }).collect();
-        let mut next = BatchScores::test_visible(crate::families::deepseek_v41::v41_native_serve::scores::VOCAB, &ids, logit_bytes(&fixture.values)).unwrap();
+        let mut next = ScoreRows::test_visible(crate::families::deepseek_v41::v41_native_serve::scores::VOCAB, &ids, logit_bytes(&fixture.values)).unwrap();
         let round = SamplingRound { plan, arena, trace_rows: Vec::new() };
         let (device_rows, refused) = admit_device_rows(&round, &sampled).unwrap();
         assert_eq!(refused, vec![5], "the INTERNAL row is the refused set");
@@ -1357,7 +1357,7 @@ mod sampler_wiring_tests {
         use super::recording_sampler as rec;
         use crate::families::deepseek_v41::v41_native_serve::scheduler::{frontier_retain, resolve_fallback_rows,
             resolve_frontier, FrontierRetain, SamplingRound};
-        use crate::families::deepseek_v41::v41_native_serve::scores::BatchScores;
+        use crate::families::deepseek_v41::v41_native_serve::scores::ScoreRows;
         let _serial = rec::lock_and_reset();
         let vocab = rec::TEST_VOCAB;
         let Some(library) = wiring_library() else {
@@ -1389,7 +1389,7 @@ mod sampler_wiring_tests {
         let ids: Vec<u32> = (0..rows).map(|row| {
             if row == frontier { stale } else { row_argmax(&values, row, vocab) }
         }).collect();
-        let mut next = BatchScores::test_visible(crate::families::deepseek_v41::v41_native_serve::scores::VOCAB, &ids, logit_bytes(&values)).unwrap();
+        let mut next = ScoreRows::test_visible(crate::families::deepseek_v41::v41_native_serve::scores::VOCAB, &ids, logit_bytes(&values)).unwrap();
         let round = SamplingRound { plan, arena, trace_rows: Vec::new() };
         resolve_fallback_rows(&mut next, &round, &[frontier]).unwrap();
         let draw = next.best[frontier];
@@ -1953,7 +1953,7 @@ mod sampler_device_tests {
 
         // Chunk 4b retention gate: the one-row frontier transfer the gate removes
         // when the turn bank is disabled. This is the production pageable D2H
-        // (`BatchScores::retain_from_device`), measured per row and extrapolated
+        // (`ScoreRows::retain_from_device`), measured per row and extrapolated
         // to a representative finishing batch (every one of 8 requests finishing
         // in its last round).
         {
@@ -2266,7 +2266,7 @@ mod sampler_device_tests {
         }
 
         /// Download one row's full logits (the per-row D2H the production
-        /// `BatchScores::retain_from_device` performs).
+        /// `ScoreRows::retain_from_device` performs).
         fn download_row(&self, row: usize) -> Result<Vec<u8>> {
             let mut slice = self.logits;
             slice.ptr = unsafe { slice.ptr.cast::<u8>().add(row * VOCAB * 4).cast() };
