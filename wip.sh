@@ -732,7 +732,10 @@ build_expert() {
   if [[ "${wip_export_locks:-off}" == on ]]; then
     local spark_lock
     case "$seed_host" in rhea|moa) spark_lock="$HOME/.cache/cuteafd/$seed_host.lock" ;; *) spark_lock="$HOME/.cache/cuteafd/sparks.lock" ;; esac
-    flock -n "$spark_lock" true || release_die "refusing Spark export on $seed_host: $spark_lock is held (choose an idle seed)"
+    # Hold the seed's hardware lock for the whole Spark export, so a card run
+    # on that host can't start mid-build (a bare probe released it at once).
+    exec {spark_lock_fd}>>"$spark_lock"
+    flock -n "$spark_lock_fd" || release_die "refusing Spark export on $seed_host: $spark_lock is held (choose an idle seed)"
   fi
   sync_seed_source
   local image_id
@@ -760,6 +763,7 @@ build_expert() {
     /wip/source/scripts/build/finalize-wip-slot.sh \
     /wip/source spark-expert "$slot" /wip/output/expert \
     "$SPARK_EXPERT_DOCKER_DEV" "$image_id"
+  [[ -z "${spark_lock_fd:-}" ]] || exec {spark_lock_fd}>&-
 }
 
 case "$role" in
