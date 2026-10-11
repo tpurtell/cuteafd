@@ -51,8 +51,9 @@ pub enum Mark {
 }
 
 /// A device snapshot: `tokens.len()` rows of `pages` (every page immutable: full pages are
-/// shared with their writer, the partial tail is the entry's own copy) and its mark.
-pub(crate) struct Entry {
+/// shared with their writer, the partial tail is the entry's own copy), its mark and the
+/// family's metadata for it.
+pub(crate) struct Entry<M> {
     pub session: Option<String>,
     pub tokens: Vec<u32>,
     pub media: Vec<cuteafd_core::MediaSpan>,
@@ -60,12 +61,13 @@ pub(crate) struct Entry {
     pub pages: Vec<u32>,
     pub mark: Option<Mark>,
     pub after: After,
+    pub meta: M,
     pub last_use: u64,
     /// The host tier's write-behind copy, when one was issued.
     pub ticket: Option<StoreTicket>,
 }
 
-impl Entry {
+impl<M> Entry<M> {
     pub fn len(&self) -> usize {
         self.tokens.len()
     }

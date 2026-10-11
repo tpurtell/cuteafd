@@ -18,8 +18,11 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::rc::Rc;
 use super::points::{plan as plan_points, PointPolicy};
+use super::family::{CaptureTicket, Eviction, LaggedState, RestoreCandidate, RestoreContext, RestoreFidelity, RestorePlan};
+use super::cache::Captured;
 
 include!("media_tests.rs");
+include!("plan_tests.rs");
 
 const ROWS: usize = 4; // page rows
 const RING: usize = 16; // ring slots per sequence
