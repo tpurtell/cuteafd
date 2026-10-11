@@ -319,9 +319,6 @@ def precheck(job):
             result['image'] = {'model': model, 'answer': answer}
             if not re.search(r'\bred\b', answer, re.I):
                 raise ValueError('image answer does not identify red')
-        if 'image' in job['probes'] and job.get('nonce_seed'):
-            # Image prechecks precede the benchmark; match its first request, not the probe.
-            result['prompt_hash_offset'] = len(re.findall(r'prompt_token_hash\s*=\s*"?([0-9a-f]{16})', ready_log(job)))
         result['status'] = 'pass'
     except Exception as error:
         result.update(status='failed', error=str(error))
@@ -562,8 +559,7 @@ def summarize_job(job, exit_code):
     if job.get('nonce_seed'):
         text = '\n'.join(ANSI.sub('', p.read_text(errors='replace')) for p in (dest / 'smoke' / 'logs').glob('*.coordinator.log'))
         hashes = re.findall(r'prompt_token_hash\s*=\s*"?([0-9a-f]{16})', text)
-        offset = row.get('precheck', {}).get('prompt_hash_offset', 0)
-        row.update(nonce_seed=job['nonce_seed'], first_prompt_token_hash=hashes[offset] if len(hashes) > offset else None, requests=matched_requests(dest), state=str(dest))
+        row.update(nonce_seed=job['nonce_seed'], first_prompt_token_hash=hashes[0] if hashes else None, requests=matched_requests(dest), state=str(dest))
         if not row['requests']:
             row.update(status='failed', error='matched prompts produced no per-request console rounds')
     save(dest / 'result.json', row)
@@ -960,6 +956,8 @@ def main():
     for card in cards:
         if args.matched_prompts or args.nonce_seed is not None:
             probes[card['name']].add('console')
+            if args.matched_prompts and 'image' in probes[card['name']]:
+                raise ValueError('--matched-prompts cannot precede its first benchmark request with an image probe')
         requested_panels(card.get('profile', 'smoke'))
         card['set'].update(overrides.get(card['name'], {}))
         values = {**config(card['config']), **card['set']}
