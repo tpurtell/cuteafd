@@ -727,16 +727,8 @@ build_coordinator() {
     "$COORDINATOR_DOCKER_DEV" "$image_id"
 }
 
-build_expert() {
+build_expert() (
   echo "== incrementally building Spark expert slot $slot on $seed_host =="
-  if [[ "${wip_export_locks:-off}" == on ]]; then
-    local spark_lock
-    case "$seed_host" in rhea|moa) spark_lock="$HOME/.cache/cuteafd/$seed_host.lock" ;; *) spark_lock="$HOME/.cache/cuteafd/sparks.lock" ;; esac
-    # Hold the seed's hardware lock for the whole Spark export, so a card run
-    # on that host can't start mid-build (a bare probe released it at once).
-    exec {spark_lock_fd}>>"$spark_lock"
-    flock -n "$spark_lock_fd" || release_die "refusing Spark export on $seed_host: $spark_lock is held (choose an idle seed)"
-  fi
   sync_seed_source
   local image_id
   image_id="$(ssh -o BatchMode=yes "$seed_host" "docker image inspect -f '{{.Id}}' '$SPARK_EXPERT_DOCKER_DEV'")"
@@ -757,14 +749,22 @@ build_expert() {
   fi
   # The role list and build-scope opt-ins travel inside a single quoted remote
   # command so a `tp2;tp3` value is never split by the remote shell.
-  ssh -o BatchMode=yes "$seed_host" \
-    "docker exec -e 'CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS:-}' -e 'RUST_TEST_THREADS=${RUST_TEST_THREADS:-}' -e 'CMAKE_BUILD_PARALLEL_LEVEL=${CMAKE_BUILD_PARALLEL_LEVEL:-}' -e 'CUTEAFD_BUILD_CACHES=${CUTEAFD_BUILD_CACHES:-on}' -e 'CUTEAFD_SCCACHE_CUDA=$cuda_cache' -e 'CUTEAFD_KACHE=$cache_wrapper' -e 'CUTEAFD_WIP_SPARK_TP_ROLES=$wip_spark_tp_roles' -e 'CUTEAFD_WIP_EXPERT_FAMILIES=${CUTEAFD_WIP_EXPERT_FAMILIES:-}' -e 'CUTEAFD_WIP_FP8_MOE_BF16_FAMILIES=$bf16_families' -e 'CUTEAFD_WIP_EXL3_AOT=${CUTEAFD_WIP_EXL3_AOT:-ON}' -e 'CUTEAFD_WIP_NVFP4_AOT=${CUTEAFD_WIP_NVFP4_AOT:-ON}' -e 'CUTEAFD_WIP_AUDIO_AOT=$audio_aot' '$spark_container' /wip/source/scripts/build/build-wip-artifacts.sh /wip/source expert 121 /wip/build/expert /wip/output/expert"
-  ssh -o BatchMode=yes "$seed_host" docker exec "$spark_container" \
+  local build_command
+  build_command="docker exec -e 'CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS:-}' -e 'RUST_TEST_THREADS=${RUST_TEST_THREADS:-}' -e 'CMAKE_BUILD_PARALLEL_LEVEL=${CMAKE_BUILD_PARALLEL_LEVEL:-}' -e 'CUTEAFD_BUILD_CACHES=${CUTEAFD_BUILD_CACHES:-on}' -e 'CUTEAFD_SCCACHE_CUDA=$cuda_cache' -e 'CUTEAFD_KACHE=$cache_wrapper' -e 'CUTEAFD_WIP_SPARK_TP_ROLES=$wip_spark_tp_roles' -e 'CUTEAFD_WIP_EXPERT_FAMILIES=${CUTEAFD_WIP_EXPERT_FAMILIES:-}' -e 'CUTEAFD_WIP_FP8_MOE_BF16_FAMILIES=$bf16_families' -e 'CUTEAFD_WIP_EXL3_AOT=${CUTEAFD_WIP_EXL3_AOT:-ON}' -e 'CUTEAFD_WIP_NVFP4_AOT=${CUTEAFD_WIP_NVFP4_AOT:-ON}' -e 'CUTEAFD_WIP_AUDIO_AOT=$audio_aot' '$spark_container' timeout --kill-after=30 7200 /wip/source/scripts/build/build-wip-artifacts.sh /wip/source expert 121 /wip/build/expert /wip/output/expert"
+  timeout --kill-after=30 7260 ssh -o BatchMode=yes "$seed_host" "$build_command rust"
+  if [[ "${wip_export_locks:-off}" == on ]]; then
+    local spark_lock spark_lock_fd
+    case "$seed_host" in rhea|moa) spark_lock="$HOME/.cache/cuteafd/$seed_host.lock" ;; *) spark_lock="$HOME/.cache/cuteafd/sparks.lock" ;; esac
+    exec {spark_lock_fd}>>"$spark_lock"
+    flock -w 1800 "$spark_lock_fd" || release_die "timed out waiting for Spark export on $seed_host"
+  fi
+  timeout --kill-after=30 7260 ssh -o BatchMode=yes "$seed_host" "$build_command native"
+  timeout --kill-after=30 300 ssh -o BatchMode=yes "$seed_host" docker exec "$spark_container" \
     /wip/source/scripts/build/finalize-wip-slot.sh \
     /wip/source spark-expert "$slot" /wip/output/expert \
     "$SPARK_EXPERT_DOCKER_DEV" "$image_id"
   [[ -z "${spark_lock_fd:-}" ]] || exec {spark_lock_fd}>&-
-}
+)
 
 case "$role" in
   coordinator) build_coordinator ;;
