@@ -113,8 +113,9 @@ impl<'w, 'a> TargetEmbeddingWave<'w, 'a> {
         );
         let bytes: Vec<u8> = tokens.iter().flat_map(|id| id.to_ne_bytes()).collect();
         self.stream.library.copy_h2d(self.ids.buffer, &bytes)?;
-        if !super::graph_policy::captures_shape(rows as u32) {
-            let launched = unsafe { self.enqueue(rows) };
+        if !super::graph_policy::captures_shape(rows as u32) || crate::shared::decode_graph::census::eager("layer_row") {
+            let launched = unsafe { crate::shared::decode_graph::census::dispatch(self.stream.library,
+                self.stream.raw, c"layer_row", rows, None, || self.enqueue(rows)) };
             launched.and(self.synchronize())?;
             self.tokens.extend_from_slice(tokens);
             self.positions.extend_from_slice(positions);
@@ -151,9 +152,8 @@ impl<'w, 'a> TargetEmbeddingWave<'w, 'a> {
         }
         let graph = self.graphs.get(rows).context("target embedding graph missing")?;
         let launched = unsafe {
-            self.stream
-                .library
-                .cuda_graph_launch(graph, self.stream.raw)
+            crate::shared::decode_graph::census::dispatch(self.stream.library, self.stream.raw, c"layer_row", rows,
+                Some(graph), || self.enqueue(rows))
         };
         launched.and(self.synchronize())?;
         self.tokens.extend_from_slice(tokens);

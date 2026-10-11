@@ -99,7 +99,7 @@ impl<'w,'a> Rank<'w,'a> {
     // the peer rank. Capture records the next invocation without repeating work.
     fn capture_ready(&mut self,layer:usize,rows:u32)->Result<()> {
         let weights=self.weights.iter().find(|w|w.layer==layer).context("projection layer absent")?;
-        if !super::graph_policy::captures_shape(rows)
+        if !super::graph_policy::captures_shape(rows) || crate::shared::decode_graph::census::eager("layer_row")
             || self.graphs.get_shape(layer,weights,rows).is_some() { return Ok(()); }
         let device=self.stream.device;
         device.run(||unsafe {
@@ -188,7 +188,7 @@ impl<'w,'a> Wave<'w,'a> {
     fn capture_gather_ready(&mut self,rows:u32)->Result<()> {
         // The gather uses only this wave's fixed storage, independent of layer.
         let weights=&self.ranks[self.owner].weights[0];
-        if !super::graph_policy::captures_shape(rows)
+        if !super::graph_policy::captures_shape(rows) || crate::shared::decode_graph::census::eager("layer_row")
             || self.gather_graphs.get_shape(0,weights,rows).is_some() { return Ok(()); }
         let stream=self.ranks[self.owner].stream.raw;let device=self.output.device;
         device.run(||unsafe {
@@ -244,18 +244,18 @@ impl<'w,'a> Wave<'w,'a> {
                     rank.stream.device.library.cuda_stream_wait_event(rank.stream.raw,wave.input_ready[input_rank].raw)?;
                 }
                 rank.copy.launch_rows(rank.input.buffer,input,k*2,rows as usize,k*2,k*2,rank.stream.raw)?;
-                if let Some((graph,_))=rank.graphs.get_shape(layer,weights,rows) {
-                    rank.stream.device.library.cuda_graph_launch(graph,rank.stream.raw)
-                } else { rank.enqueue(weights,rows) }
+                crate::shared::decode_graph::census::dispatch(rank.stream.device.library, rank.stream.raw,
+                    c"layer_row", rows as usize, rank.graphs.get_shape(layer,weights,rows).map(|(raw,_)|raw),
+                    || rank.enqueue(weights,rows))
             })?;
         }
         let owner=&wave.ranks[wave.owner];let peer=&wave.ranks[1-wave.owner];
         wave.peer_done.record(&peer.stream)?;
         owner.stream.device.run(||unsafe {
             owner.stream.device.library.cuda_stream_wait_event(owner.stream.raw,wave.peer_done.raw)?;
-            if let Some((graph,_))=wave.gather_graphs.get_shape(0,&owner.weights[0],rows) {
-                owner.stream.device.library.cuda_graph_launch(graph,owner.stream.raw)
-            } else { wave.enqueue_gather(rows) }
+            crate::shared::decode_graph::census::dispatch(owner.stream.device.library, owner.stream.raw,
+                c"layer_row", rows as usize, wave.gather_graphs.get_shape(0,&owner.weights[0],rows).map(|(raw,_)|raw),
+                || wave.enqueue_gather(rows))
         })?;
         let output=CuteafdDeviceBuffer { bytes:rows as usize*n*2,..wave.output.buffer };
         let result=owner.stream.device.run(||consume(output,owner.stream.raw))?;

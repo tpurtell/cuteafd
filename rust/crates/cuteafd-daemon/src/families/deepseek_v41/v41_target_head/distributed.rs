@@ -67,13 +67,13 @@ impl<'w, 'a> Rank<'w, 'a> {
             } else {
                 lib.copy_peer_async(self.input.buffer, input, rows * 10240, self.stream.raw)?;
             }
-            if let Some(graph) = self.graphs[mode].get(rows) { lib.cuda_graph_launch(graph, self.stream.raw) }
-            else { self.enqueue(rows, greedy) }
+            crate::shared::decode_graph::census::dispatch(lib, self.stream.raw, c"head", rows,
+                self.graphs[mode].get(rows), || self.enqueue(rows, greedy))
         }
     }
     unsafe fn capture_ready(&mut self, rows: usize, greedy: bool) -> Result<()> {
         let mode = usize::from(greedy);
-        if self.graphs[mode].get(rows).is_none() {
+        if self.graphs[mode].get(rows).is_none() && !crate::shared::decode_graph::census::eager("head") {
             let lib = self.stream.library;
             unsafe { lib.cuda_graph_begin_capture(self.stream.raw)?; }
             let queued = unsafe { self.enqueue(rows, greedy) };

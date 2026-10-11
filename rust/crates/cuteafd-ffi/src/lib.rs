@@ -1973,6 +1973,61 @@ impl NativeLibrary {
         Ok(out_ms)
     }
 
+    /// # Safety
+    /// The closure submits only to the given live stream on the current device.
+    pub unsafe fn cuda_graph_census_call<T>(&self, stream: *mut c_void, bank: &std::ffi::CStr,
+        rows: usize, replay: bool, arm: u8, call: impl FnOnce() -> Result<T>) -> Result<T> {
+        // SAFETY: the caller retains the stream and device through both records.
+        let token = unsafe { self.cuda_graph_census_begin(stream, bank, rows as u64, replay, arm)? };
+        struct Span<'a> { library: &'a NativeLibrary, token: *mut c_void }
+        impl Span<'_> {
+            fn finish(&mut self) -> Result<()> {
+                let token = std::mem::replace(&mut self.token, std::ptr::null_mut());
+                if token.is_null() { return Ok(()); }
+                // SAFETY: the closure contract preserves the token's stream/device.
+                unsafe { self.library.cuda_graph_census_end(token) }
+            }
+        }
+        impl Drop for Span<'_> {
+            fn drop(&mut self) {
+                if let Err(error) = self.finish() {
+                    tracing::error!(%error, "closing graph census span during unwind");
+                }
+            }
+        }
+        let mut span = Span { library: self, token };
+        let started = std::time::Instant::now();
+        let result = call();
+        let host_ns = started.elapsed().as_nanos() as u64;
+        let ended = span.finish();
+        if !token.is_null() {
+            tracing::info!(target: "cuteafd::graph_capture", bank = %bank.to_string_lossy(), rows,
+                replay, arm, host_ns, "graph census wrapper call");
+        }
+        result.and_then(|value| ended.map(|()| value))
+    }
+
+    /// # Safety
+    /// Stream belongs to the current device and remains live through census_end.
+    pub unsafe fn cuda_graph_census_begin(&self, stream: *mut c_void,
+        bank: &std::ffi::CStr, rows: u64, replay: bool, arm: u8) -> Result<*mut c_void> {
+        type Begin = unsafe extern "C" fn(*mut c_void, *const std::ffi::c_char, u64, i32, i32, *mut *mut c_void) -> CuteafdStatus;
+        let begin: Symbol<Begin> = unsafe { self.lib.get(b"cuteafd_cuda_graph_census_begin")? };
+        let mut token = std::ptr::null_mut();
+        let status = unsafe { begin(stream, bank.as_ptr(), rows, i32::from(replay), i32::from(arm), &mut token) };
+        self.status_to_result("cuteafd_cuda_graph_census_begin", status)?;
+        Ok(token)
+    }
+
+    /// # Safety
+    /// Token is the unconsumed result of census_begin on the current device.
+    pub unsafe fn cuda_graph_census_end(&self, token: *mut c_void) -> Result<()> {
+        type End = unsafe extern "C" fn(*mut c_void) -> CuteafdStatus;
+        let end: Symbol<End> = unsafe { self.lib.get(b"cuteafd_cuda_graph_census_end")? };
+        let status = unsafe { end(token) };
+        self.status_to_result("cuteafd_cuda_graph_census_end", status)
+    }
+
     #[track_caller]
     pub unsafe fn cuda_graph_begin_capture(&self, cuda_stream: *mut c_void) -> Result<()> {
         let site = std::panic::Location::caller();
@@ -1990,6 +2045,7 @@ impl NativeLibrary {
         self.status_to_result("cuteafd_cuda_graph_begin_capture", status)
     }
 
+    #[track_caller]
     pub unsafe fn cuda_graph_end_capture(&self, cuda_stream: *mut c_void) -> Result<*mut c_void> {
         let _budget_guard = coordinator_gpu_budget().map(|_| GPU_BUDGET_ALLOCATION.lock()
             .unwrap_or_else(|e| e.into_inner()));
@@ -1998,6 +2054,10 @@ impl NativeLibrary {
         let mut cuda_graph_exec = std::ptr::null_mut();
         let status = unsafe { end_capture_fn(cuda_stream, &mut cuda_graph_exec) };
         self.status_to_result("cuteafd_cuda_graph_end_capture", status)?;
+        if std::env::var_os("CUTEAFD_GRAPH_CENSUS").is_some_and(|value| value == "1") {
+            tracing::info!(target: "cuteafd::graph_capture", exec = ?cuda_graph_exec,
+                site = %std::panic::Location::caller(), "graph census executable site");
+        }
         if coordinator_gpu_budget().is_some() {
             if let Err(error) = self.cuda_memory_info() {
                 // SAFETY: capture ended and this executable has never launched;

@@ -128,6 +128,44 @@ class NativeReleaseLauncherTest(unittest.TestCase):
                 expected = b'before\0after\0' if not seed else b'before\0-e\0CUTEAFD_BENCH_NONCE_SEED=pair-123\0after\0'
                 self.assertEqual(result.stdout, expected)
 
+    def test_graph_census_is_wip_only_and_default_argv_is_identical(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            control = Path(directory) / 'bank.txt'
+            control.write_text('baseline\n')
+            for launcher in ['run.sh', 'scripts/launch/run-family.sh']:
+                source = (ROOT / launcher).read_text()
+                suffix = source.split('graph_census_args=()\n', 1)[1]
+                block = 'graph_census_args=()\n' + suffix.split('\nfi', 1)[0] + '\nfi\n'
+                self.assertIn('"${graph_census_args[@]}"', source)
+                for value, wip, path, valid in [
+                    (None, '', str(control), True), ('0', '', str(control), True),
+                    ('1', '/slot', str(control), True), ('1', '/slot', '', True),
+                    ('1', '', str(control), False), ('1', '/slot', 'relative', False),
+                    ('1', '/slot', str(control) + '.missing', False),
+                ]:
+                    with self.subTest(launcher=launcher, value=value, wip=wip, path=path):
+                        env = dict(os.environ)
+                        env.pop('CUTEAFD_GRAPH_CENSUS', None)
+                        if value is not None:
+                            env['CUTEAFD_GRAPH_CENSUS'] = value
+                        env['CUTEAFD_GRAPH_CENSUS_CONTROL'] = path
+                        harness = 'set -euo pipefail\nrelease_die() { exit 2; }\nwip_layout=$1\n'
+                        result = subprocess.run(['bash', '-c', harness + block +
+                            'printf "%s\\0" before "${graph_census_args[@]}" after', 'test', wip],
+                            env=env, capture_output=True)
+                        self.assertEqual(result.returncode == 0, valid, result.stderr)
+                        if not valid:
+                            continue
+                        expected = ['before']
+                        if value == '1':
+                            expected += ['-e', 'CUTEAFD_GRAPH_CENSUS=1', '-e',
+                                         'RUST_LOG=info,cuteafd::graph_capture=debug']
+                            if path:
+                                expected += ['-v', f'{directory}:/run/cuteafd-graph-census:ro', '-e',
+                                    'CUTEAFD_GRAPH_CENSUS_CONTROL=/run/cuteafd-graph-census/bank.txt']
+                        expected += ['after']
+                        self.assertEqual(result.stdout, ('\0'.join(expected) + '\0').encode())
+
     def test_embedding_placement_registered_and_gpu_default(self) -> None:
         result = subprocess.run(['bash', '-c',
             'source scripts/lib/release-common.sh; release_known_key EMBEDDING; '

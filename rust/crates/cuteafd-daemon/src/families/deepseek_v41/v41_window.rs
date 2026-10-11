@@ -540,18 +540,23 @@ impl WindowWave<'_, '_> {
             && query.hidden.device_id == self.input.buffer.device_id
             && query.tokens()?.iter().copied().eq(chunks.iter().flat_map(|c|
                 c.position..c.position + u64::from(c.tokens))), "queued cache query differs");
-        self.select_graph(prepared.rows, state.owner, false)?;
-        let capture = self.graph.is_none();
+        let forced_eager = crate::shared::decode_graph::census::eager("window");
+        if !forced_eager { self.select_graph(prepared.rows, state.owner, false)?; }
+        let capture = !forced_eager && self.graph.is_none();
         let result = (|| -> Result<()> {
             // Reads only the normalized layer input: overlap the query projections.
             unsafe { crate::shared::memory::chain::join_fork(self.stream.library, self.stream.raw)?; }
             unsafe { self.stream.library.copy_d2d_async(self.input.buffer, query.hidden,
                 query.hidden.bytes, self.stream.raw)?; }
             self.upload(&prepared)?;
-            unsafe {
-                if capture { self.enqueue(prepared.rows) }
+            let dispatch = || unsafe {
+                if capture || forced_eager { self.enqueue(prepared.rows) }
                 else { self.stream.library.cuda_graph_launch(self.current_graph().unwrap().0, self.stream.raw) }
-            }
+            };
+            if crate::shared::decode_graph::census::enabled() {
+                unsafe { self.stream.library.cuda_graph_census_call(self.stream.raw, c"window", prepared.rows,
+                    !capture && !forced_eager, crate::shared::decode_graph::census::arm(), dispatch) }
+            } else { dispatch() }
         })();
         self.pending_query = Some((prepared, capture));
         if let Err(error) = result { self.abort_query()?; return Err(error); }
@@ -697,8 +702,15 @@ impl WindowWave<'_, '_> {
             rows == p.rows && owner == state.owner,
             "window capture binding differs"
         );
-        let launched = self.upload(&p).and_then(|()| unsafe {
-            self.stream.library.cuda_graph_launch(g, self.stream.raw)
+        let launched = self.upload(&p).and_then(|()| {
+            let eager = crate::shared::decode_graph::census::eager("window");
+            let dispatch = || unsafe {
+                if eager { self.enqueue(p.rows) } else { self.stream.library.cuda_graph_launch(g, self.stream.raw) }
+            };
+            if crate::shared::decode_graph::census::enabled() {
+                unsafe { self.stream.library.cuda_graph_census_call(self.stream.raw, c"window", p.rows, !eager,
+                    crate::shared::decode_graph::census::arm(), dispatch) }
+            } else { dispatch() }
         });
         launched.and(unsafe { crate::shared::memory::chain::finish(self.stream.library, self.stream.raw) })?;
         self.ready = Some(p);

@@ -398,15 +398,16 @@ impl IndexQueryWave<'_, '_> {
         self.tokens.extend_from_slice(tokens);
         let rows = query.rows as u32;
         let graph = self.graphs.get_shape(self.weights.layer, self.weights, rows);
-        self.pending = Some((rows, binding, graph.is_none() && super::graph_policy::captures_shape(rows)));
+        self.pending = Some((rows, binding, graph.is_none() && super::graph_policy::captures_shape(rows)
+            && !crate::shared::decode_graph::census::eager("layer_row")));
         let result = (|| -> Result<()> { unsafe {
             crate::shared::memory::chain::join(self.stream.library, self.stream.raw)?;
             for (dst, src) in [(self.qr.buffer, query.normalized_rank),
                 (self.hidden.buffer, query.hidden), (self.positions.buffer, query.positions)] {
                 self.stream.library.copy_d2d_async(dst, src, src.bytes, self.stream.raw)?;
             }
-            if let Some((graph, _)) = graph { self.stream.library.cuda_graph_launch(graph, self.stream.raw) }
-            else { self.enqueue(rows) }
+            crate::shared::decode_graph::census::dispatch(self.stream.library, self.stream.raw, c"layer_row",
+                rows as usize, graph.map(|(raw,_)|raw), || self.enqueue(rows))
         }})();
         if result.is_err() { self.abort_pending()?; }
         result

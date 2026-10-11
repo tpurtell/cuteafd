@@ -51,7 +51,8 @@ impl<'w, 'a> Normalize<'w, 'a> {
                 }
                 first += count;
             }
-            lib.cuda_graph_launch(graph, self.stream.raw)?;
+            crate::shared::decode_graph::census::dispatch(lib, self.stream.raw, c"head", rows,
+                Some(graph), || self.enqueue(rows))?;
             crate::shared::memory::chain::finish(lib, self.stream.raw)
         }
     }
@@ -68,12 +69,12 @@ impl<'w, 'a> Normalize<'w, 'a> {
                 }
                 first += count;
             }
-            if let Some(graph) = self.graphs.get(rows) { self.weights.library.cuda_graph_launch(graph, self.stream.raw) }
-            else { self.enqueue(rows) }
+            crate::shared::decode_graph::census::dispatch(self.weights.library, self.stream.raw, c"head", rows,
+                self.graphs.get(rows), || self.enqueue(rows))
         } })();
         let drained = self.stream.wait().await;
         queued.and(drained)?;
-        if self.graphs.get(rows).is_none() {
+        if self.graphs.get(rows).is_none() && !crate::shared::decode_graph::census::eager("head") {
             let lib = self.weights.library;
             unsafe { lib.cuda_graph_begin_capture(self.stream.raw)?; }
             let queued = unsafe { self.enqueue(rows) };

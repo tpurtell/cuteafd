@@ -1,6 +1,7 @@
 #include "cuteafd_native.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cerrno>
 #include <chrono>
 #include <cstdint>
@@ -8,6 +9,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <memory>
 #include <new>
 #include <string>
 #include <vector>
@@ -586,6 +588,128 @@ void set_version_string(char* dst, size_t dst_len, int version) {
   set_fixed_string(dst, dst_len, buffer);
 }
 
+bool graph_census_enabled() {
+  static const bool enabled = [] {
+    const char* value = std::getenv("CUTEAFD_GRAPH_CENSUS");
+    return value != nullptr && std::strcmp(value, "1") == 0;
+  }();
+  return enabled;
+}
+
+struct CensusSpan {
+  cudaEvent_t start = nullptr, end = nullptr;
+  cudaStream_t stream = nullptr;
+  int device = -1, replay = 0, arm = 0;
+  uint64_t rows = 0, submitted_unix_ns = 0;
+  std::string bank;
+  ~CensusSpan() {
+    int previous = -1;
+    cudaGetDevice(&previous);
+    if (device >= 0 && previous != device) { cudaSetDevice(device); }
+    if (start) { cudaEventDestroy(start); }
+    if (end) { cudaEventDestroy(end); }
+    if (previous >= 0 && previous != device) { cudaSetDevice(previous); }
+  }
+};
+thread_local std::vector<std::unique_ptr<CensusSpan>> census_pending;
+thread_local std::vector<std::unique_ptr<CensusSpan>> census_free;
+
+void drain_census_spans(int device, size_t limit = SIZE_MAX) {
+  thread_local size_t cursor = 0;
+  // Dispatch checks only a bounded slice; existing waits drain the full queue.
+  const size_t checks = std::min(limit, census_pending.size());
+  for (size_t checked = 0; checked < checks && !census_pending.empty(); ++checked) {
+    cursor %= census_pending.size();
+    auto& span = census_pending[cursor];
+    if (span->device != device) { ++cursor; continue; }
+    const cudaError_t ready = cudaEventQuery(span->end);
+    if (ready == cudaErrorNotReady) { ++cursor; continue; }
+    float elapsed = 0;
+    const cudaError_t status = ready == cudaSuccess ? cudaEventElapsedTime(&elapsed, span->start, span->end) : ready;
+    std::fprintf(stderr,
+        "CUTEAFD_GRAPH_CENSUS {\"event\":\"device_call\",\"bank\":\"%s\",\"device\":%d,"
+        "\"rows\":%llu,\"replay\":%d,\"arm\":%d,\"submitted_unix_ns\":%llu,\"device_us\":%.6f,\"status\":%d}\n",
+        span->bank.c_str(), device, static_cast<unsigned long long>(span->rows),
+        span->replay, span->arm, static_cast<unsigned long long>(span->submitted_unix_ns),
+        elapsed * 1000.0, static_cast<int>(status));
+    census_free.push_back(std::move(span));
+    if (cursor + 1 != census_pending.size()) { span = std::move(census_pending.back()); }
+    census_pending.pop_back();
+  }
+  (void)cudaGetLastError();
+}
+
+std::string census_json_string(const char* value) {
+  std::string out = "\"";
+  for (const unsigned char* p = reinterpret_cast<const unsigned char*>(value); *p; ++p) {
+    if (*p == '\"' || *p == '\\') { out += '\\'; out += static_cast<char>(*p); }
+    else if (*p < 32) {
+      char escaped[7];
+      std::snprintf(escaped, sizeof(escaped), "\\u%04x", *p);
+      out += escaped;
+    } else { out += static_cast<char>(*p); }
+  }
+  return out + "\"";
+}
+
+void record_graph_census(cudaGraph_t graph, cudaGraphExec_t exec,
+                         cudaError_t before_status, size_t before_free,
+                         cudaError_t after_status, size_t after_free) {
+  static std::atomic<uint64_t> serial{0};
+  int device = -1;
+  cudaGetDevice(&device);
+  size_t count = 0;
+  cudaError_t status = cudaGraphGetNodes(graph, nullptr, &count);
+  std::vector<cudaGraphNode_t> nodes(count);
+  if (status == cudaSuccess && count) {
+    status = cudaGraphGetNodes(graph, nodes.data(), &count);
+  }
+  std::string details = "[";
+  if (status == cudaSuccess) {
+    for (size_t i = 0; i < count; ++i) {
+      if (i) { details += ','; }
+      cudaGraphNodeType type;
+      const cudaError_t type_status = cudaGraphNodeGetType(nodes[i], &type);
+      details += "{\"kind\":" + std::to_string(type_status == cudaSuccess ? static_cast<int>(type) : -1);
+      if (type_status == cudaSuccess && type == cudaGraphNodeTypeKernel) {
+        cudaKernelNodeParams params{};
+        const char* name = nullptr;
+        cudaError_t name_status = cudaGraphKernelNodeGetParams(nodes[i], &params);
+#if CUDART_VERSION >= 13000
+        if (name_status == cudaSuccess) { name_status = cudaFuncGetName(&name, params.func); }
+#else
+        name_status = cudaErrorNotSupported;
+#endif
+        // Driver-loaded AOT kernels may not have a runtime host-function entry.
+        CUresult driver_name_status = CUDA_ERROR_NOT_SUPPORTED;
+        if (name == nullptr) {
+          CUDA_KERNEL_NODE_PARAMS driver_params{};
+          driver_name_status = cuGraphKernelNodeGetParams(reinterpret_cast<CUgraphNode>(nodes[i]), &driver_params);
+          if (driver_name_status == CUDA_SUCCESS) {
+            driver_name_status = cuFuncGetName(&name, driver_params.func);
+          }
+        }
+        details += ",\"kernel\":" + census_json_string(name != nullptr ? name : "unresolved");
+        details += ",\"driver_name_status\":" + std::to_string(static_cast<int>(driver_name_status));
+        details += ",\"name_status\":" + std::to_string(static_cast<int>(name_status));
+      }
+      details += '}';
+    }
+  }
+  details += ']';
+  const bool bytes_valid = before_status == cudaSuccess && after_status == cudaSuccess;
+  // Instantiate-only deltas include allocator granularity/reuse; preserve signed
+  // values rather than claiming every executable has an independent allocation.
+  const int64_t delta = bytes_valid ? static_cast<int64_t>(before_free) - static_cast<int64_t>(after_free) : 0;
+  std::fprintf(stderr,
+      "CUTEAFD_GRAPH_CENSUS {\"event\":\"capture\",\"id\":%llu,\"exec\":\"%p\",\"device\":%d,"
+      "\"nodes\":%zu,\"node_status\":%d,\"instantiate_bytes\":%lld,\"bytes_valid\":%s,\"details\":%s}\n",
+      static_cast<unsigned long long>(serial.fetch_add(1) + 1), reinterpret_cast<void*>(exec), device,
+      count, static_cast<int>(status), static_cast<long long>(delta), bytes_valid ? "true" : "false", details.c_str());
+  // Diagnostic API failures must not contaminate the next launch error check.
+  (void)cudaGetLastError();
+}
+
 cuteafd_status_t fill_cuda_graph_capture_info(cudaGraph_t graph, cudaGraphExec_t graph_exec,
                                             cuteafd_cuda_graph_capture_info_t* out) {
   size_t node_count = 0;
@@ -1060,6 +1184,11 @@ extern "C" cuteafd_status_t cuteafd_cuda_stream_synchronize(void* cuda_stream) {
   if (err != cudaSuccess) {
     return fail_cuda(CUTEAFD_STATUS_INTERNAL_ERROR, "cudaStreamSynchronize failed", err);
   }
+  if (graph_census_enabled()) {
+    int device = -1;
+    cudaGetDevice(&device);
+    drain_census_spans(device);
+  }
 #else
   if (cuda_stream != nullptr) {
     return fail(CUTEAFD_STATUS_CUDA_UNAVAILABLE,
@@ -1081,6 +1210,11 @@ extern "C" cuteafd_status_t cuteafd_cuda_stream_query(void* cuda_stream, int32_t
     return fail_cuda(CUTEAFD_STATUS_INTERNAL_ERROR, "cudaStreamQuery failed", err);
   }
   *ready = 1;
+  if (graph_census_enabled()) {
+    int device = -1;
+    cudaGetDevice(&device);
+    drain_census_spans(device);
+  }
   return ok();
 #else
   return fail(CUTEAFD_STATUS_CUDA_UNAVAILABLE,
@@ -1215,6 +1349,60 @@ extern "C" cuteafd_status_t cuteafd_cuda_event_elapsed_ms(void* start_event, voi
 #endif
 }
 
+extern "C" cuteafd_status_t cuteafd_cuda_graph_census_begin(
+    void* stream, const char* bank, uint64_t rows, int32_t replay, int32_t arm, void** token) {
+  if (!token || !bank || !stream) { return fail(CUTEAFD_STATUS_INVALID_ARGUMENT, "invalid census span"); }
+  *token = nullptr;
+#if CUTEAFD_NATIVE_ENABLE_CUDA
+  if (!graph_census_enabled()) { return ok(); }
+  cudaStreamCaptureStatus capture_status;
+  const cudaError_t capture_query = cudaStreamIsCapturing(reinterpret_cast<cudaStream_t>(stream), &capture_status);
+  if (capture_query != cudaSuccess) { return fail_cuda(CUTEAFD_STATUS_INTERNAL_ERROR, "census capture query", capture_query); }
+  if (capture_status != cudaStreamCaptureStatusNone) { return ok(); }
+  int device = -1;
+  cudaGetDevice(&device);
+  drain_census_spans(device, 8);
+  std::unique_ptr<CensusSpan> span;
+  auto free = std::find_if(census_free.begin(), census_free.end(),
+      [device](const auto& entry) { return entry->device == device; });
+  if (free != census_free.end()) { span = std::move(*free); census_free.erase(free); }
+  else {
+    if (census_pending.size() >= 4096) {
+      std::fprintf(stderr, "CUTEAFD_GRAPH_CENSUS {\"event\":\"device_sample_dropped\"}\n");
+      return ok();
+    }
+    span = std::make_unique<CensusSpan>();
+    span->device = device;
+    cudaError_t status = cudaEventCreate(&span->start);
+    if (status == cudaSuccess) { status = cudaEventCreate(&span->end); }
+    if (status != cudaSuccess) { return fail_cuda(CUTEAFD_STATUS_INTERNAL_ERROR, "census event creation", status); }
+  }
+  span->stream = reinterpret_cast<cudaStream_t>(stream);
+  span->bank = bank; span->rows = rows; span->replay = replay; span->arm = arm;
+  span->submitted_unix_ns = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+      std::chrono::system_clock::now().time_since_epoch()).count());
+  cudaError_t status = cudaEventRecord(span->start, span->stream);
+  if (status != cudaSuccess) { return fail_cuda(CUTEAFD_STATUS_INTERNAL_ERROR, "census start event", status); }
+  *token = span.release();
+  return ok();
+#else
+  return fail(CUTEAFD_STATUS_CUDA_UNAVAILABLE, "census CUDA unavailable");
+#endif
+}
+
+extern "C" cuteafd_status_t cuteafd_cuda_graph_census_end(void* token) {
+#if CUTEAFD_NATIVE_ENABLE_CUDA
+  if (!token) { return ok(); }
+  std::unique_ptr<CensusSpan> span(static_cast<CensusSpan*>(token));
+  cudaError_t status = cudaEventRecord(span->end, span->stream);
+  if (status != cudaSuccess) { return fail_cuda(CUTEAFD_STATUS_INTERNAL_ERROR, "census end event", status); }
+  census_pending.push_back(std::move(span));
+  return ok();
+#else
+  return fail(CUTEAFD_STATUS_CUDA_UNAVAILABLE, "census CUDA unavailable");
+#endif
+}
+
 extern "C" cuteafd_status_t cuteafd_cuda_graph_begin_capture(void* cuda_stream) {
   if (cuda_stream == nullptr) {
     return fail(CUTEAFD_STATUS_INVALID_ARGUMENT, "CUDA graph capture stream is null");
@@ -1280,7 +1468,11 @@ extern "C" cuteafd_status_t cuteafd_cuda_graph_end_capture_retained(
     return fail(CUTEAFD_STATUS_INTERNAL_ERROR, "cudaStreamEndCapture returned a null graph");
   }
   cudaGraphExec_t graph_exec = nullptr;
+  size_t before_free = 0, after_free = 0, total = 0;
+  const bool census = graph_census_enabled();
+  const cudaError_t before_status = census ? cudaMemGetInfo(&before_free, &total) : cudaSuccess;
   err = cudaGraphInstantiate(&graph_exec, graph, 0);
+  const cudaError_t after_status = census ? cudaMemGetInfo(&after_free, &total) : cudaSuccess;
   if (err != cudaSuccess) {
     cudaGraphDestroy(graph);
     return fail_cuda(CUTEAFD_STATUS_INTERNAL_ERROR, "cudaGraphInstantiate failed", err);
@@ -1295,6 +1487,7 @@ extern "C" cuteafd_status_t cuteafd_cuda_graph_end_capture_retained(
     cudaGraphDestroy(graph);
     return status;
   }
+  if (census) { record_graph_census(graph, graph_exec, before_status, before_free, after_status, after_free); }
   return ok();
 #else
   return fail(CUTEAFD_STATUS_CUDA_UNAVAILABLE,
@@ -1379,6 +1572,9 @@ extern "C" cuteafd_status_t cuteafd_cuda_graph_exec_destroy(void* cuda_graph_exe
   cudaError_t err = cudaGraphExecDestroy(reinterpret_cast<cudaGraphExec_t>(cuda_graph_exec));
   if (err != cudaSuccess) {
     return fail_cuda(CUTEAFD_STATUS_INTERNAL_ERROR, "cudaGraphExecDestroy failed", err);
+  }
+  if (graph_census_enabled()) {
+    std::fprintf(stderr, "CUTEAFD_GRAPH_CENSUS {\"event\":\"destroy\",\"exec\":\"%p\"}\n", cuda_graph_exec);
   }
   return ok();
 #else

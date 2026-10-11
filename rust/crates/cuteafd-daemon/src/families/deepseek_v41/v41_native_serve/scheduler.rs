@@ -299,7 +299,13 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
                     if let Some(live) = console::live() {
                         live.push(console_gauges(&active, requests, &prefixes, receive.len(), Some(false)));
                     }
-                    match receive.blocking_recv() { Some(job) => job, None => { closed = true; break; } }
+                    match receive.blocking_recv() {
+                        Some(job) => {
+                            crate::shared::decode_graph::census::idle();
+                            job
+                        }
+                        None => { closed = true; break; }
+                    }
                 } else {
                     match receive.try_recv() {
                         Ok(job) => job,
@@ -510,6 +516,7 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
             }
         }
         if active.iter().all(Option::is_none) {
+            crate::shared::decode_graph::census::idle();
             crate::shared::decode_graph::CaptureWatch::flush();
             if closed && images_waiting.iter().all(Option::is_none) && image_backlog.is_empty() { break; }
             if images_waiting.iter().any(Option::is_some) { std::thread::sleep(Duration::from_millis(1)); }
@@ -538,6 +545,11 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
                 continue;
             }
         }
+        let census_started = crate::shared::decode_graph::census::enabled().then(|| {
+            tracing::info!(target: "cuteafd::graph_capture", arm=crate::shared::decode_graph::census::arm(),
+                requests=members.iter().map(Vec::len).sum::<usize>(), "graph census decode step begin");
+            Instant::now()
+        });
         let result = room.and_then(|_| P::decode_round(lib, runtime, first, second,
             requests, first_transport, second_transport, &mut active, &members,
             draft.as_deref_mut(), &mut prefixes, receive,
@@ -546,6 +558,10 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
                 host_pending: !image_backlog.is_empty(),
                 blocked_at: pending.as_ref().map(|p| p.active_when_blocked.saturating_sub(images_waiting.iter().flatten().count())),
                 pending: pending.as_ref().map(|p| &p.prepared.job) }));
+        if let Some(started) = census_started {
+            tracing::info!(target: "cuteafd::graph_capture", arm=crate::shared::decode_graph::census::arm(),
+                host_ns=started.elapsed().as_nanos() as u64, success=result.is_ok(), "graph census decode step end");
+        }
         if let Err(error) = result {
             tracing::error!(error=%format!("{error:#}"), "native decode round failed");
             P::reset_connections(first_transport)?; P::reset_connections(second_transport)?;

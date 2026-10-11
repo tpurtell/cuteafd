@@ -198,13 +198,14 @@ impl<'s, 'w, 'a> PendingLaneFfn<'s, 'w, 'a> {
             let library=lane.weights.library;
             let (values,stream,projected)=unsafe { lane.projection.finish_tp2_then(rows as u32,output,producer,
                 |projected,stream| {
-                    if let Some((graph,_))=cached {
+                    if cached.is_some() && !crate::shared::decode_graph::census::eager("layer_row") {
                         lane.block.prepare_ffn_graph_replay(binding,rows)?;
-                        library.cuda_graph_launch(graph,stream)?;
-                    } else {lane.block.enqueue_ffn(binding,rows,projected,stream)?;}
+                    }
+                    crate::shared::decode_graph::census::dispatch(library, stream, c"layer_row", rows,
+                        cached.map(|(raw,_)|raw), || lane.block.enqueue_ffn(binding,rows,projected,stream).map(|_| ()))?;
                     Ok((lane.block.graph_normalized_storage(rows),stream,projected))
                 }).await? };
-            if cached.is_none() {
+            if cached.is_none() && !crate::shared::decode_graph::census::eager("layer_row") {
                 // Warm output is complete. Recording the next invocation restores
                 // host phase without executing the FFN prefix a second time.
                 unsafe {graphs.capture_ready(&mut lane.block,weights,binding,rows,projected,stream)?;}

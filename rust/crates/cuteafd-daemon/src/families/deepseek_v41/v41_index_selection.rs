@@ -550,7 +550,8 @@ impl<'a> IndexSelectionWave<'a> {
             }
             staging[rows * 48 + i * 8..rows * 48 + i * 8 + 8].copy_from_slice(&m[1].to_ne_bytes());
         }
-        let capture = self.select_graph(&fingerprint)?;
+        let forced_eager = crate::shared::decode_graph::census::eager("index");
+        let capture = if forced_eager { false } else { self.select_graph(&fingerprint)? };
         if defer {
             self.in_flight = true;
             if let Some(busy) = &self.shared_scratch_busy { busy.set(true); }
@@ -593,12 +594,16 @@ impl<'a> IndexSelectionWave<'a> {
                 (Err(e), Err(_)) | (Ok(()), Err(e)) => return Err(e),
             }
         }
-        let launched = if capture {
-            let g = self.graph.as_ref().context("selection graph missing")?.0;
-            unsafe { self.stream.library.cuda_graph_launch(g, self.stream.raw) }
-        } else {
-            unsafe { self.enqueue(query, requests, shared, rows, tiles, width, use_candidates) }
+        let dispatch = || unsafe {
+            if capture {
+                let g = self.graph.as_ref().context("selection graph missing")?.0;
+                self.stream.library.cuda_graph_launch(g, self.stream.raw)
+            } else { self.enqueue(query, requests, shared, rows, tiles, width, use_candidates) }
         };
+        let launched = if crate::shared::decode_graph::census::enabled() {
+            unsafe { self.stream.library.cuda_graph_census_call(self.stream.raw, c"index", rows, capture,
+                crate::shared::decode_graph::census::arm(), dispatch) }
+        } else { dispatch() };
         let ready = Ready { origin: query.origin(), layer: query.layer, rows, bindings };
         if defer {
             launched?;

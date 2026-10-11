@@ -313,6 +313,11 @@ cuteafd_status_t cuteafd_cuda_event_destroy(void* cuda_event);
 cuteafd_status_t cuteafd_cuda_event_record(void* cuda_event, void* cuda_stream);
 cuteafd_status_t cuteafd_cuda_event_synchronize(void* cuda_event);
 cuteafd_status_t cuteafd_cuda_event_elapsed_ms(void* start_event, void* end_event, float* out_ms);
+// Opt-in census spans never synchronize. Completed device timings are drained
+// at later span calls; the bounded pending queue drops samples under overload.
+cuteafd_status_t cuteafd_cuda_graph_census_begin(void* cuda_stream, const char* bank,
+    uint64_t rows, int32_t replay, int32_t arm, void** token);
+cuteafd_status_t cuteafd_cuda_graph_census_end(void* token);
 cuteafd_status_t cuteafd_cuda_graph_begin_capture(void* cuda_stream);
 cuteafd_status_t cuteafd_cuda_graph_end_capture(void* cuda_stream, void** out_cuda_graph_exec);
 cuteafd_status_t cuteafd_cuda_graph_end_capture_retained(

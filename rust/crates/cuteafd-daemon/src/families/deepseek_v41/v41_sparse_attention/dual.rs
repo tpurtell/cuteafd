@@ -97,10 +97,10 @@ impl<'a> DualAttentionWave<'a> {
         let library=self.halves[0].device.library;
         let (attention,stream)=unsafe { self.complete_owned_then(|attention,stream| {
             tail.prepare(stream)?;
-            if let Some(graph)=graph {
-                tail.replay_state()?;
-                library.cuda_graph_launch(graph,stream)?;
-            } else { tail.enqueue(&attention,stream)?; }
+            let eager = crate::shared::decode_graph::census::eager("layer_row");
+            if graph.is_some() && !eager { tail.replay_state()?; }
+            crate::shared::decode_graph::census::dispatch(library, stream, c"layer_row", rows,
+                graph, || tail.enqueue(&attention,stream))?;
             Ok((attention,stream))
         }).await? };
         if graph.is_some() { return Ok(()); }

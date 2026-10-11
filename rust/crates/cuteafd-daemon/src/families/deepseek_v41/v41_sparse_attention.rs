@@ -633,6 +633,18 @@ impl<'a,const HEADS:usize> LocalSparseAttentionWave<'a,HEADS> {
         }
         let key = (layer, fingerprint.clone());
         let cached = self.graphs.get(&key).map(|owner| owner.raw);
+        if crate::shared::decode_graph::census::eager("sparse") {
+            // Retain every executable; only dispatch changes between census arms.
+            unsafe {
+                self.stream.library.cuda_graph_census_call(self.stream.raw, c"sparse", rows, false,
+                    crate::shared::decode_graph::census::arm(), || {
+                        self.enqueue(sink, &launches, selected, batch.as_ref())?;
+                        if let Some(tail) = tail.as_deref_mut() { tail.enqueue(&queued, self.stream.raw)?; }
+                        Ok(())
+                    })?;
+            }
+            return Ok(Some(queued));
+        }
         let fixed_limit = super::graph_policy::fixed_binding_limit();
         if cached.is_none() && (!super::graph_policy::captures_shape(rows as u32)
             || fixed_limit.is_some_and(|limit| self.graph_count(layer) >= limit)) {
@@ -649,6 +661,13 @@ impl<'a,const HEADS:usize> LocalSparseAttentionWave<'a,HEADS> {
         let graph = if let Some(graph) = cached {
             self.graphs.launch(&key);
             if let Some(tail) = tail.as_deref_mut() { unsafe { tail.replay_state()?; } }
+            if crate::shared::decode_graph::census::enabled() {
+                unsafe {
+                    self.stream.library.cuda_graph_census_call(self.stream.raw, c"sparse", rows, true,
+                        crate::shared::decode_graph::census::arm(), || self.stream.library.cuda_graph_launch(graph, self.stream.raw))?;
+                }
+                return Ok(Some(queued));
+            }
             graph
         } else {
             tracing::debug!(target: "cuteafd::graph_capture", site="sparse_attention", layer, rows,

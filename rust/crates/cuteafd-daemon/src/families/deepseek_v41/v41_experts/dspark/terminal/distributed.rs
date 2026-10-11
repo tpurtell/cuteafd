@@ -59,10 +59,10 @@ impl<'w, 'a> DistributedDsparkTerminal<'w, 'a> {
         let device = self.terminal.device;
         let terminal = self.terminal.get();
         device.run(|| unsafe {
-            if let Some(graph) = self.graphs.get(&(terminal.width(), usize::from(sampling), requests)) {
-                device.library.cuda_graph_launch(graph.raw, terminal.stream.raw)
-            } else if sampling { terminal.enqueue_sampling_on(requests, terminal.stream.raw) }
-            else { terminal.enqueue_normalize_on(requests, terminal.stream.raw) }
+            let graph = self.graphs.get(&(terminal.width(), usize::from(sampling), requests)).map(|owner| owner.raw);
+            crate::shared::decode_graph::census::dispatch(device.library, terminal.stream.raw, c"dspark", requests,
+                graph, || if sampling { terminal.enqueue_sampling_on(requests, terminal.stream.raw) }
+                    else { terminal.enqueue_normalize_on(requests, terminal.stream.raw) })
         })
     }
     unsafe fn capture_stage(&mut self, requests: usize, sampling: bool) -> Result<()> {
@@ -70,7 +70,7 @@ impl<'w, 'a> DistributedDsparkTerminal<'w, 'a> {
         let terminal = self.terminal.get();
         let mode = usize::from(sampling);
         let width = terminal.width();
-        if !self.graphs.contains(&(width, mode, requests)) {
+        if !self.graphs.contains(&(width, mode, requests)) && !crate::shared::decode_graph::census::eager("dspark") {
             let graph = device.run(|| unsafe {
                 device.library.cuda_graph_begin_capture(terminal.stream.raw)?;
                 let queued = if sampling { terminal.enqueue_sampling_on(requests, terminal.stream.raw) }

@@ -88,7 +88,7 @@ impl<'w, 'a> DistributedDsparkChain<'w, 'a> {
         if let Some(captured) = chain.graphs.get(&(count, chain.width)) {
             ensure!(captured.pins == reads.each_ref().map(|read| read.owner), "distributed draft capture owner differs");
         }
-        let pending = PendingDraft { count, reads, warming: !chain.has_graph(count), armed: true,
+        let pending = PendingDraft { count, reads, warming: !chain.has_graph(count) && !crate::shared::decode_graph::census::eager("dspark"), armed: true,
             library: chain.stream.library, stream: chain.stream.raw };
         // The local guard drains partial submission failures under GPU1 before
         // releasing cache readers. Success transfers it into lane-owned state.
@@ -96,8 +96,10 @@ impl<'w, 'a> DistributedDsparkChain<'w, 'a> {
             let lib = chain.stream.library;
             lib.copy_h2d_async(chain.tokens.buffer, &chain.token_staging.bytes_mut()[..count * 4], chain.stream.raw)?;
             for stage in 0..3 { chain.stages[stage].upload_on(&pending.reads[stage], bindings[stage], chain.stream.raw)?; }
-            if pending.warming { chain.enqueue(&pending.reads, count)?; }
-            else { lib.cuda_graph_launch(chain.graphs.get(&(count, chain.width)).context("distributed draft graph missing")?.raw, chain.stream.raw)?; }
+            let graph = chain.graphs.get(&(count, chain.width)).map(|owner| owner.raw);
+            let stream = chain.stream.raw;
+            crate::shared::decode_graph::census::dispatch(lib, stream, c"dspark", count, graph,
+                || chain.enqueue(&pending.reads, count))?;
             let source = chain.stages[2].output_storage();
             let target = self.terminal.inputs();
             chain.ops.terminal_layout(source[0], source[1], target[0], target[1], count as u32, chain.stream.raw)?;

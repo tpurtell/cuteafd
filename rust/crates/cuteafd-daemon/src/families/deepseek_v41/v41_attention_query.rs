@@ -482,8 +482,8 @@ impl AttentionQueryWave<'_, '_> {
             prepare(self.stream.raw, self.input())?;
             // The normalized input is complete here; cache producers fork from it.
             crate::shared::memory::chain::mark_fork(self.stream.library, self.stream.raw)?;
-            if let Some((graph, _)) = graph { self.stream.library.cuda_graph_launch(graph, self.stream.raw) }
-            else { self.enqueue(rows) }
+            crate::shared::decode_graph::census::dispatch(self.stream.library, self.stream.raw, c"layer_row",
+                rows as usize, graph.map(|(raw, _)| raw), || self.enqueue(rows))
         } })();
         let drained = if queued.is_err() { self.stream.wait().await }
             else { unsafe { crate::shared::memory::chain::finish_cooperative(&self.stream).await } };
@@ -491,7 +491,7 @@ impl AttentionQueryWave<'_, '_> {
         if graph.is_none() {
             // Eager output is complete; capture only records the next execution.
             // Replaying now would duplicate work whenever a shape was evicted.
-            if super::graph_policy::captures_shape(rows) {
+            if super::graph_policy::captures_shape(rows) && !crate::shared::decode_graph::census::eager("layer_row") {
                 unsafe { self.capture_ready(rows)?; }
             }
         }
@@ -538,8 +538,8 @@ impl AttentionQueryWave<'_, '_> {
             self.stream.library.copy_host_buffer_h2d_async(self.positions(),self.position_staging.buffer,
                 tokens.len()*8,self.stream.raw)?;
             prepare(self.stream.raw,self.input())?;
-            if let Some((graph,_))=graph { self.stream.library.cuda_graph_launch(graph,self.stream.raw)?; }
-            else { self.enqueue_rank(rows)?; }
+            crate::shared::decode_graph::census::dispatch(self.stream.library, self.stream.raw, c"layer_row",
+                rows as usize, graph.map(|(raw, _)| raw), || self.enqueue_rank(rows))?;
             projection.execute_after(self.weights.layer,rows,self.b(2),Some(self.stream.raw),|projected,stream| {
                 self.stream.library.copy_d2d_async(self.b(3),projected,rows as usize*ROW_BYTES[3],stream)?;
                 #[cfg(test)]
@@ -547,7 +547,8 @@ impl AttentionQueryWave<'_, '_> {
                 self.norm.rope(self.b(3),self.b(6),self.b(3),rows,64,false,stream)
             }).await?;
         }
-        if graph.is_none() && super::graph_policy::captures_shape(rows) {
+        if graph.is_none() && super::graph_policy::captures_shape(rows)
+            && !crate::shared::decode_graph::census::eager("layer_row") {
             unsafe { self.stream.library.cuda_graph_begin_capture(self.stream.raw)?; }
             let queued=unsafe { self.enqueue_rank(rows) };
             let captured=unsafe { self.stream.library.cuda_graph_end_capture(self.stream.raw) };

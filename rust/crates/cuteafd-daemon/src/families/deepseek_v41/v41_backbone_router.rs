@@ -671,10 +671,10 @@ impl BackboneRouterWave<'_, '_> {
         let cold = self.graphs.get_shape(self.layer, self.weights, rows).is_none();
         let launched = (|| unsafe {
             self.stage_inputs(input.values, image_mask)?;
-            if cold { self.enqueue(rows) } else {
-                let (graph, _) = self.graphs.get_shape(self.layer, self.weights, rows).unwrap();
-                self.stream.library.cuda_graph_launch(graph, self.stream.raw)
-            }
+            let graph = self.graphs.get_shape(self.layer, self.weights, rows).map(|(raw, _)| raw);
+            let library = self.stream.library; let stream = self.stream.raw;
+            crate::shared::decode_graph::census::dispatch(library, stream, c"layer_row", rows as usize,
+                graph, || self.enqueue(rows))
         })();
         if let Err(error) = launched { self.synchronize()?; return Err(error); }
         // Captured routes of device-read layers go to this layer's ring slot
@@ -695,7 +695,8 @@ impl BackboneRouterWave<'_, '_> {
         } else {
             self.stream.wait().await?;
         }
-        if cold && super::graph_policy::captures_shape(rows) {
+        if cold && super::graph_policy::captures_shape(rows)
+            && !crate::shared::decode_graph::census::eager("layer_row") {
             // The eager execution above already completed these inputs. Capture
             // records future launches without executing them; publish that result
             // instead of running the same work again on every cache miss.

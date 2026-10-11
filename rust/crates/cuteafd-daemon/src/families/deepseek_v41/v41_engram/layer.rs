@@ -358,12 +358,12 @@ impl<'weights, 'library> EngramGate<'weights, 'library> {
         let launched = (|| unsafe {
             crate::shared::memory::chain::join(self.weights.library, self.stream.raw)?;
             self.enqueue_inputs(residual, gathered)?;
-            if cold { self.enqueue(gathered.rows) } else {
-                self.weights.library.cuda_graph_launch(graph.unwrap(), self.stream.raw)
-            }
+            crate::shared::decode_graph::census::dispatch(self.weights.library, self.stream.raw, c"layer_row",
+                gathered.rows, graph, || self.enqueue(gathered.rows))
         })();
         if let Err(error) = launched { self.synchronize()?; return Err(error); }
-        if cold && crate::families::deepseek_v41::graph_policy::captures_shape(gathered.rows as u32) {
+        if cold && crate::families::deepseek_v41::graph_policy::captures_shape(gathered.rows as u32)
+            && !crate::shared::decode_graph::census::eager("layer_row") {
             self.stream.wait().await?;
             unsafe { self.capture_ready(gathered.rows)?; }
             let graph = self.graphs.get(gathered.rows).context("engram graph missing after capture")?;

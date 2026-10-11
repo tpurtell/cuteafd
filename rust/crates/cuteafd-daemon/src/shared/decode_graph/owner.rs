@@ -4,14 +4,7 @@ use anyhow::{ensure, Result};
 use cuteafd_ffi::NativeLibrary;
 use std::ffi::c_void;
 
-pub(crate) fn fatal_drain(result: Result<()>, site: &str) {
-    if let Err(error) = result {
-        tracing::error!(%error, site, "graph storage drain failed; aborting before storage release");
-        // AGENTS: drain queued work before publishing or releasing storage.
-        // A failed drain cannot prove captured pointers are no longer in use.
-        std::process::abort();
-    }
-}
+use super::fatal_drain;
 
 pub(crate) struct GraphOwner<'a, P> {
     pub raw: *mut c_void,

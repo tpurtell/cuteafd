@@ -793,8 +793,9 @@ impl<'w, 'a> CompressorWave<'w, 'a> {
             && query.hidden.device_id == self.input.buffer.device_id
             && query.tokens()?.iter().copied().eq(chunks.iter().flat_map(|c|
                 c.position..c.position + u64::from(c.tokens))), "queued cache query differs");
-        self.select_graph(prepared.rows, state.owner, false)?;
-        let capture = self.graph.is_none();
+        let forced_eager = crate::shared::decode_graph::census::eager("layer_row");
+        if !forced_eager { self.select_graph(prepared.rows, state.owner, false)?; }
+        let capture = !forced_eager && self.graph.is_none();
         let result = (|| -> Result<()> {
             // Reads only the normalized layer input: overlap the query projections.
             unsafe { crate::shared::memory::chain::join_fork(self.stream.library, self.stream.raw)?; }
@@ -802,8 +803,9 @@ impl<'w, 'a> CompressorWave<'w, 'a> {
                 query.hidden.bytes, self.stream.raw)?; }
             self.upload_queued(&prepared)?;
             unsafe {
-                if capture { self.enqueue(state, prepared.rows) }
-                else { self.stream.library.cuda_graph_launch(self.graph.unwrap().0, self.stream.raw) }
+                crate::shared::decode_graph::census::dispatch(self.stream.library, self.stream.raw, c"layer_row",
+                    prepared.rows, if capture || forced_eager { None } else { self.graph.map(|(raw,_,_)|raw) },
+                    || self.enqueue(state, prepared.rows))
             }
         })();
         self.pending_query = Some((prepared, capture));
@@ -878,7 +880,8 @@ impl<'w, 'a> CompressorWave<'w, 'a> {
                 self.stream.library.copy_d2d_async(self.input.buffer, query.hidden,
                     query.hidden.bytes, self.stream.raw)?;
                 self.upload_queued(&prepared)?;
-                self.stream.library.cuda_graph_launch(graph, self.stream.raw)?;
+                crate::shared::decode_graph::census::dispatch(self.stream.library, self.stream.raw, c"layer_row",
+                    prepared.rows, Some(graph), || self.enqueue(state, prepared.rows))?;
                 crate::shared::memory::chain::finish(self.stream.library, self.stream.raw)
             } })();
             if let Err(error) = queued { self.synchronize()?; return Err(error); }
@@ -959,9 +962,8 @@ impl<'w, 'a> CompressorWave<'w, 'a> {
         );
         self.upload(&prepared)?;
         let launched = unsafe {
-            self.stream
-                .library
-                .cuda_graph_launch(graph, self.stream.raw)
+            crate::shared::decode_graph::census::dispatch(self.stream.library, self.stream.raw, c"layer_row",
+                rows, Some(graph), || self.enqueue(state, rows))
         };
         let drained = self.synchronize();
         launched.and(drained)?;

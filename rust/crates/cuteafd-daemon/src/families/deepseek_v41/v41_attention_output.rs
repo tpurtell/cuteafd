@@ -415,8 +415,10 @@ impl AttentionOutputWave<'_, '_> {
                 tokens.len() * 8, stream)?;
         }
         let rows = attention.rows as u32;
-        if !super::graph_policy::captures_shape(rows) {
-            unsafe { self.enqueue_on(rows, stream)?; }
+        if !super::graph_policy::captures_shape(rows) || crate::shared::decode_graph::census::eager("layer_row") {
+            let library = self.stream.library;
+            unsafe { crate::shared::decode_graph::census::dispatch(library, stream, c"layer_row", rows as usize,
+                None, || self.enqueue_on(rows, stream))?; }
             let mut output = self.b(2);
             output.bytes = attention.rows * ROW_BYTES[2];
             return Ok(output);
@@ -429,7 +431,9 @@ impl AttentionOutputWave<'_, '_> {
         let (graph, count) = self.graphs.get_shape(self.weights.layer, self.weights, rows)
             .context("queued output graph missing")?;
         ensure!(count == rows, "queued output graph shape differs");
-        unsafe { self.stream.library.cuda_graph_launch(graph, stream)?; }
+        let library = self.stream.library;
+        unsafe { crate::shared::decode_graph::census::dispatch(library, stream, c"layer_row", rows as usize,
+            Some(graph), || self.enqueue_on(rows, stream))?; }
         let mut output = self.b(2);
         output.bytes = attention.rows * ROW_BYTES[2];
         Ok(output)
@@ -455,9 +459,17 @@ impl AttentionOutputWave<'_, '_> {
                 tokens.len() * 8, stream)?;
         }
         let rows = attention.rows as u32;
+        if crate::shared::decode_graph::census::enabled() && self.graphs.get_shape(self.weights.layer, self.weights, rows).is_some() {
+            let graph = self.graphs.get_shape(self.weights.layer, self.weights, rows).map(|(raw, _)| raw);
+            let library = self.stream.library;
+            unsafe { crate::shared::decode_graph::census::dispatch(library, stream, c"layer_row", rows as usize,
+                graph, || self.enqueue_on(rows, stream))?; }
+            let mut output = self.b(2); output.bytes = attention.rows * ROW_BYTES[2];
+            return Ok(Some(output));
+        }
         if self.graphs.get_shape(self.weights.layer, self.weights, rows).is_none() {
             unsafe { self.enqueue_on(rows, stream)?; }
-            if !super::graph_policy::captures_shape(rows) {
+            if !super::graph_policy::captures_shape(rows) || crate::shared::decode_graph::census::eager("layer_row") {
                 let mut output = self.b(2);
                 output.bytes = attention.rows * ROW_BYTES[2];
                 return Ok(Some(output));
