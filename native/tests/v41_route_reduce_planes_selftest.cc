@@ -186,26 +186,6 @@ int main() {
       launch_and_verify(rows, ranks, true, false, "with shared");
       launch_and_verify(rows, ranks, true, true, "shared exact alias");
 
-      // Keep a legacy-symbol byte comparison until all callers have migrated.
-      if (ranks == 2 || ranks == 3 || ranks == 4 || ranks == 6) {
-        const auto selected = slots(ranks);
-        for (bool use_shared : {false, true}) {
-          if (use_shared) upload_shared(rows);
-          const auto* shared = use_shared ? reinterpret_cast<const uint16_t*>(shared_raw) : nullptr;
-          require(cuteafd_reduce_compact_bf16_planes_async(selected.data(), shared,
-                      reinterpret_cast<uint16_t*>(equivalence_raw), rows, ranks, nullptr) == cudaSuccess,
-                  "legacy equivalence launch failed");
-          require(cuteafd_reduce_compact_bf16_eight_planes_async(selected.data(), shared,
-                      reinterpret_cast<uint16_t*>(output_raw), rows, ranks, nullptr) == cudaSuccess,
-                  "eight-plane equivalence launch failed");
-          check_cuda(cudaStreamSynchronize(nullptr), "legacy equivalence synchronize");
-          std::vector<uint16_t> a(size_t(rows) * kHidden), b(size_t(rows) * kHidden);
-          check_cuda(cudaMemcpy(a.data(), output_raw, a.size() * 2, cudaMemcpyDeviceToHost), "copy eight");
-          check_cuda(cudaMemcpy(b.data(), equivalence_raw, b.size() * 2, cudaMemcpyDeviceToHost), "copy legacy");
-          require(a == b, "eight-plane and legacy reducers disagree");
-        }
-      }
-
       // The historical 2- and 4-plane entry points must be bit-identical to the
       // generic entry point for the same ordered planes.
       if (ranks == 2 || ranks == 4) {

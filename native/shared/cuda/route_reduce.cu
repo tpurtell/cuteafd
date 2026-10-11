@@ -143,35 +143,6 @@ __global__ void reduce_compact_eight(const __nv_bfloat16* p0,
     output[offset] = __float2bfloat16_rn(value);
   }
 }
-
-// Shared validation for the replicated-group N-plane compact reducer. Accepts
-// exactly 1, 2, 3, 4 or 6 active planes; every inactive slot must be null. All
-// extents and alignment checks are done in uint64 to avoid overflow.
-bool valid_compact_planes(const uint16_t* const planes[6], const uint16_t* shared,
-    uint16_t* output, uint32_t rows, uint32_t ranks) {
-  if (!planes || !output || !rows || rows > 4096 ||
-      (ranks != 1 && ranks != 2 && ranks != 3 && ranks != 4 && ranks != 6))
-    return false;
-  const uint64_t bytes = uint64_t(rows) * cuteafd_expert_hidden() * 2;
-  if (reinterpret_cast<uintptr_t>(output) % 2 ||
-      reinterpret_cast<uintptr_t>(output) > UINTPTR_MAX - bytes)
-    return false;
-  for (uint32_t rank = 0; rank < 6; ++rank) {
-    if (rank >= ranks) {
-      if (planes[rank]) return false;
-      continue;
-    }
-    const auto pointer = reinterpret_cast<uintptr_t>(planes[rank]);
-    if (!planes[rank] || pointer % 2 || pointer > UINTPTR_MAX - bytes ||
-        overlaps(planes[rank], bytes, output, bytes))
-      return false;
-  }
-  if (shared && (reinterpret_cast<uintptr_t>(shared) % 2 ||
-      reinterpret_cast<uintptr_t>(shared) > UINTPTR_MAX - bytes ||
-      (shared != output && overlaps(shared, bytes, output, bytes))))
-    return false;
-  return true;
-}
 }
 
 extern "C" int32_t cuteafd_compact_bf16_routes_async(const uint16_t* routes,
@@ -275,47 +246,6 @@ extern "C" int32_t cuteafd_reduce_tp2_compact_bf16_async(
       nullptr, nullptr,
       reinterpret_cast<const __nv_bfloat16*>(shared),
       reinterpret_cast<__nv_bfloat16*>(output), count);
-  return cudaGetLastError();
-}
-
-extern "C" int32_t cuteafd_reduce_compact_bf16_planes_async(
-    const uint16_t* const planes[6], const uint16_t* shared, uint16_t* output,
-    uint32_t rows, uint32_t ranks, void* stream) {
-  if (!valid_compact_planes(planes, shared, output, rows, ranks))
-    return cudaErrorInvalidValue;
-  const uint64_t count = uint64_t(rows) * cuteafd_expert_hidden();
-  const unsigned blocks = static_cast<unsigned>(count / 256 < 4096 ? count / 256 : 4096);
-  auto cuda_stream = static_cast<cudaStream_t>(stream);
-  const auto* p0 = reinterpret_cast<const __nv_bfloat16*>(planes[0]);
-  const auto* p1 = reinterpret_cast<const __nv_bfloat16*>(planes[1]);
-  const auto* p2 = reinterpret_cast<const __nv_bfloat16*>(planes[2]);
-  const auto* p3 = reinterpret_cast<const __nv_bfloat16*>(planes[3]);
-  const auto* p4 = reinterpret_cast<const __nv_bfloat16*>(planes[4]);
-  const auto* p5 = reinterpret_cast<const __nv_bfloat16*>(planes[5]);
-  const auto* shared_bf16 = reinterpret_cast<const __nv_bfloat16*>(shared);
-  auto* output_bf16 = reinterpret_cast<__nv_bfloat16*>(output);
-  switch (ranks) {
-    case 1:
-      reduce_compact<1><<<blocks, 256, 0, cuda_stream>>>(p0, nullptr, nullptr, nullptr,
-          nullptr, nullptr, shared_bf16, output_bf16, count);
-      break;
-    case 2:
-      reduce_compact<2><<<blocks, 256, 0, cuda_stream>>>(p0, p1, nullptr, nullptr,
-          nullptr, nullptr, shared_bf16, output_bf16, count);
-      break;
-    case 3:
-      reduce_compact<3><<<blocks, 256, 0, cuda_stream>>>(p0, p1, p2, nullptr,
-          nullptr, nullptr, shared_bf16, output_bf16, count);
-      break;
-    case 4:
-      reduce_compact<4><<<blocks, 256, 0, cuda_stream>>>(p0, p1, p2, p3, nullptr,
-          nullptr, shared_bf16, output_bf16, count);
-      break;
-    default:
-      reduce_compact<6><<<blocks, 256, 0, cuda_stream>>>(p0, p1, p2, p3, p4, p5,
-          shared_bf16, output_bf16, count);
-      break;
-  }
   return cudaGetLastError();
 }
 

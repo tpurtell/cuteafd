@@ -138,13 +138,15 @@ def test_native_role_ids_and_reducer_abi_are_declared() -> None:
     header = HEADER.read_text(encoding="utf-8")
     assert "5: Spark TP2 shard (intermediate 1152)" in header
     assert "6: Spark TP3 shard (intermediate 768)" in header
-    assert "cuteafd_reduce_compact_bf16_planes_async" in header
-    assert "const uint16_t* const planes[6]" in header
+    assert "cuteafd_reduce_compact_bf16_eight_planes_async" in header
+    assert "const uint16_t* const planes[8]" in header
+    assert "cuteafd_reduce_compact_bf16_planes_async" not in header
     assert "uint32_t ranks" in header
 
     reduce_source = REDUCE.read_text(encoding="utf-8")
     assert "if constexpr (Ranks >= 6)" in reduce_source
-    assert "valid_compact_planes" in reduce_source
+    assert "ranks > 8" in reduce_source
+    assert "cuteafd_reduce_compact_bf16_planes_async" not in reduce_source
     # The two historical fixed entry points must remain.
     assert "cuteafd_reduce_compact_bf16_async" in reduce_source
     assert "cuteafd_reduce_tp2_compact_bf16_async" in reduce_source
