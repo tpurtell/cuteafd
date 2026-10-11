@@ -12,6 +12,17 @@ pub const LAZY_GRAPH_BYTES: u64 = (1 << 30) / 2;
 pub const SPARK_WORKSPACE_BYTES: u64 = 56 * (1 << 30) / 100;
 pub const SPARK_RING_BYTES: u64 = 78 * (1 << 30) / 100;
 
+/// A dual Qwen executor requires nonempty whole-width ownership on both ends.
+/// Do not silently turn the shared solver's legal all-on-one-rank cut into a
+/// private cut heuristic or a partly idle dual executor.
+pub fn check_dual_layer_owners(owners: &[usize]) -> anyhow::Result<()> {
+    anyhow::ensure!(owners.first() == Some(&0) && owners.last() == Some(&1)
+        && owners.iter().all(|&owner| owner <= 1)
+        && owners.windows(2).filter(|pair| pair[0] != pair[1]).count() == 1,
+        "Qwen dual attention needs nonempty owners and one contiguous owner-zero to owner-one cutover");
+    Ok(())
+}
+
 pub struct QwenInputs<'a> {
     pub admission: QwenAdmissionInputs<'a>,
     pub capacity_bytes: u64,

@@ -714,10 +714,7 @@ fn validate_layer_owners(owners: &[usize], devices: usize) -> Result<()> {
     ensure!(!owners.is_empty() && matches!(devices, 1 | 2), "invalid Qwen attention owners");
     ensure!(owners.iter().all(|&owner| owner < devices), "Qwen attention owner out of range");
     if devices == 1 { return Ok(()); }
-    ensure!(owners[0] == 0 && owners.last() == Some(&1)
-        && owners.windows(2).filter(|pair| pair[0] != pair[1]).count() == 1,
-        "Qwen dual attention needs one contiguous owner-zero to owner-one cutover");
-    Ok(())
+    cuteafd_loader::placement::families::qwen4::check_dual_layer_owners(owners)
 }
 
 /// Compact recurrent pools on one owner. Global layer ids never index these directly.
