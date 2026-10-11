@@ -284,6 +284,7 @@ impl PrefixFamily for MimoPrefix<'_, '_> {
                 ReuseRule::EXACT
             },
             mark_store: MarkStore::Arena,
+            page_owners: Default::default(),
         }
     }
 

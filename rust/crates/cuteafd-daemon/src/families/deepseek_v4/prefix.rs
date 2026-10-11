@@ -219,6 +219,7 @@ impl PrefixFamily for Dsv4Prefix<'_, '_> {
             draft_bytes: 0,
             rule: ReuseRule::EXACT,
             mark_store: MarkStore::Arena,
+            page_owners: Default::default(),
         }
     }
 

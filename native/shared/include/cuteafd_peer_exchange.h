@@ -27,6 +27,25 @@ int32_t cuteafd_peer_add_bf16_async(const void* a, const void* b, void* out, uin
 // a default. The source must not be rewritten until the peer has waited.
 int32_t cuteafd_peer_push_signal(void* destination, const void* source, uint64_t bytes,
     uint32_t* flag, uint32_t* send_state, uint32_t blocks, void* stream);
+// A strided byte plane: `rows` rows of `row_bytes` from `source` (rows
+// `source_pitch` apart) to `destination` (`destination_pitch` apart), either
+// pointer on the current device or its peer. All five sizes and both pointers
+// 16-byte aligned; a plane of 0 rows copies nothing.
+typedef struct cuteafd_peer_plane {
+  void* destination;
+  const void* source;
+  uint64_t rows;
+  uint64_t row_bytes;
+  uint64_t destination_pitch;
+  uint64_t source_pitch;
+} cuteafd_peer_plane_t;
+#define CUTEAFD_PEER_MAX_PLANES 4
+// On A's stream: copy `count` (1..4) planes in one launch, then publish the
+// next sequence to `flag` as `cuteafd_peer_push_signal` does (same
+// `send_state` layout, so the two may share a link). `flag` and `send_state`
+// both null: copy only. Graph-capturable (the planes are kernel arguments).
+int32_t cuteafd_peer_push_planes(const cuteafd_peer_plane_t* planes, uint32_t count, uint32_t* flag,
+    uint32_t* send_state, uint32_t blocks, void* stream);
 // On B's stream: one warp spins until `flag` reaches the next expected
 // sequence (acquire), so later work on the stream sees the pushed bytes. After
 // 60 s without it (the peer's stream failed or was never fed) the kernel traps:

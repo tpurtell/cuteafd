@@ -22,9 +22,9 @@
 use super::chain::{content_id, page_chain_media};
 use crate::media::{round_frontier, snapshot_media, verify_media, MediaError, MediaSpan};
 use super::entry::{victim, After, Entry, EntryId, Mark};
-use super::family::{BoxError, FamilyLayout, MarkStore, PrefixFamily};
+use super::family::{BoxError, FamilyLayout, MarkStore, PageOwners, PrefixFamily};
 use super::marks::MarkArena;
-use super::pages::{PoolExhausted, RefPagePool};
+use super::pages::{Need, PoolExhausted, RefPagePool};
 use cuteafd_core::prefix::{Retention, SnapshotKind};
 use cuteafd_hostcache::cache::{
     DevicePage, DeviceSnapshot, EvictDecision, HostCache, RestoreOutcome, RestoreTarget, StoreOutcome,
@@ -137,6 +137,8 @@ pub struct PrefixStats {
     pub entries_turn: usize,
     pub pages: usize,
     pub pages_free: usize,
+    /// Allocated pages per GPU half (parity pools only).
+    pub pages_used_by_gpu: Option<[usize; 2]>,
     pub pages_shared: usize,
     /// Distinct pages held by retained snapshots; when no request runs, every used page is one.
     pub pages_retained: usize,
@@ -169,6 +171,9 @@ impl<E: CopyEngine> PrefixCache<E> {
     pub fn new(layout: FamilyLayout, config: PrefixConfig, host: Option<(cuteafd_hostcache::config::Config, E)>)
         -> Result<Self, PrefixError> {
         // Before the host tier pins its memory.
+        if layout.page_owners == PageOwners::Parity && (layout.pages % 2 != 0 || layout.mark_store != MarkStore::Arena) {
+            return Err(PrefixError::Layout("parity half pools need an even page count and arena marks"));
+        }
         if let MarkStore::Pool { pages, reserved } = layout.mark_store {
             if layout.mark_bytes == 0 || pages == 0 || pages > layout.pages.saturating_sub(reserved) {
                 return Err(PrefixError::Layout("pool-page marks take at least one page and at most the pool's \
@@ -187,7 +192,10 @@ impl<E: CopyEngine> PrefixCache<E> {
         Ok(Self {
             retained: Retention::with_rule(config.entries, layout.rule),
             entries: BTreeMap::new(),
-            pool: RefPagePool::with_reserved(layout.pages, layout.page_rows, layout.mark_store.reserved()),
+            pool: match layout.page_owners {
+                PageOwners::Uniform => RefPagePool::with_reserved(layout.pages, layout.page_rows, layout.mark_store.reserved()),
+                PageOwners::Parity => RefPagePool::parity(layout.pages, layout.page_rows, 0),
+            },
             arena: MarkArena::new(slots, layout.mark_bytes),
             host,
             clock: 0,
@@ -256,8 +264,8 @@ impl<E: CopyEngine> PrefixCache<E> {
                 }
             }
         }
-        self.make_room(family, total, None)?;
-        let pages = self.pool.alloc(total)?;
+        self.make_room_for(family, self.pool.need_for(0..total), None)?;
+        let pages = self.pool.alloc_for(0..total)?;
         Ok(Admitted { placement: build(pages), resume: 0, after: None, source: None })
     }
 
@@ -266,8 +274,8 @@ impl<E: CopyEngine> PrefixCache<E> {
     pub fn admit_cold<F: PrefixFamily<Placement = P>, P>(&mut self, family: &F, tokens: usize,
         capacity: usize, build: impl FnOnce(Vec<u32>) -> P) -> Result<Admitted<P>, PrefixError> {
         let total = self.pool.pages_for(capacity.max(tokens));
-        self.make_room(family, total, None)?;
-        let pages = self.pool.alloc(total)?;
+        self.make_room_for(family, self.pool.need_for(0..total), None)?;
+        let pages = self.pool.alloc_for(0..total)?;
         Ok(Admitted { placement: build(pages), resume: 0, after: None, source: None })
     }
 
@@ -380,8 +388,8 @@ impl<E: CopyEngine> PrefixCache<E> {
 
     fn restore_hit<F: PrefixFamily<Placement = P>, P>(&mut self, family: &F, hit: &Hit, tokens: &[u32], total: usize,
         promoted: bool, build: &mut impl FnMut(Vec<u32>) -> P) -> Result<Option<Admitted<P>>, PrefixError> {
-        let need = self.pool.fork_cost(hit.resume, total);
-        if !self.make_room(family, need, Some(hit.id))? {
+        let need = self.pool.fork_need(hit.resume, total);
+        if !self.make_room_for(family, need, Some(hit.id))? {
             return Ok(None);
         }
         let entry = self.entries.get(&hit.id).expect("the hit is kept while making room");
@@ -392,13 +400,13 @@ impl<E: CopyEngine> PrefixCache<E> {
         let pages = fork.pages.clone();
         let mut placement = build(fork.pages);
         self.dirty = true;
-        let restored = match fork.copy {
+        let restored = self.check_owners(family, &pages).and_then(|()| match fork.copy {
             Some(copy) => {
                 self.stats.cow_copies += 1;
                 family.copy_rows(copy)
             }
             None => Ok(()),
-        }
+        })
         .and_then(|()| match &mark {
             Some(Mark::Pages(pages)) => family.restore_pages(pages, &mut placement, hit.resume),
             Some(Mark::Slot(slot)) => family.restore(Some(*slot), &mut placement, hit.resume),
@@ -477,8 +485,8 @@ impl<E: CopyEngine> PrefixCache<E> {
         let len = tokens.len();
         let total = self.pool.pages_for(len);
         // The rows a fork copies and, for pool-page marks, the mark's own pages.
-        let mark_pages = self.layout.mark_store.pages();
-        if !self.make_room(family, self.pool.fork_cost(len, total) + mark_pages, None)? {
+        let mark_pages = self.pool.need_for(0..self.layout.mark_store.pages());
+        if !self.make_room_for(family, self.pool.fork_need(len, total) + mark_pages, None)? {
             self.give_back(family, slot.map(Mark::Slot))?;
             self.stats.capture_skips += 1;
             return Ok(false);
@@ -560,7 +568,13 @@ impl<E: CopyEngine> PrefixCache<E> {
     /// nothing is left to evict and the pool is still short.
     pub fn make_room<F: PrefixFamily>(&mut self, family: &F, pages: usize, keep: Option<EntryId>)
         -> Result<bool, PrefixError> {
-        while self.pool.free() < pages {
+        self.make_room_for(family, self.pool.need_for(0..pages), keep)
+    }
+
+    /// [`PrefixCache::make_room`] for fresh pages per half (both halves of a parity pool must fit).
+    pub fn make_room_for<F: PrefixFamily>(&mut self, family: &F, need: Need, keep: Option<EntryId>)
+        -> Result<bool, PrefixError> {
+        while !self.pool.fits(need) {
             match self.victim(keep) {
                 Some(id) => self.evict(family, id)?,
                 None => return Ok(false),
@@ -573,10 +587,10 @@ impl<E: CopyEngine> PrefixCache<E> {
     /// be evicted; existing live pages keep their references on failed growth.
     pub fn grow<F: PrefixFamily>(&mut self, family: &F, pages: &mut Vec<u32>, tokens: usize)
         -> Result<(), PrefixError> {
-        let additional = self.pool.pages_for(tokens).saturating_sub(pages.len());
-        if additional == 0 { return Ok(()); }
-        self.make_room(family, additional, None)?;
-        pages.extend(self.pool.alloc(additional)?);
+        let positions = pages.len()..self.pool.pages_for(tokens).max(pages.len());
+        if positions.is_empty() { return Ok(()); }
+        self.make_room_for(family, self.pool.need_for(positions.clone()), None)?;
+        pages.extend(self.pool.alloc_for(positions)?);
         Ok(())
     }
 
@@ -593,6 +607,7 @@ impl<E: CopyEngine> PrefixCache<E> {
         stats.entries_turn = self.retained.bank(SnapshotKind::Turn).entries();
         stats.pages = self.pool.capacity();
         stats.pages_free = self.pool.free();
+        stats.pages_used_by_gpu = self.pool.is_parity().then(|| self.pool.used_halves());
         stats.pages_shared = self.pool.shared();
         let mut retained: Vec<u32> = self.entries.values()
             .flat_map(|e| e.pages.iter().chain(e.mark_pages()).copied()).collect();
@@ -627,6 +642,15 @@ impl<E: CopyEngine> PrefixCache<E> {
         Ok(())
     }
 
+    /// The family places each page where the pool says it lives (parity pools: GPU `id & 1`).
+    fn check_owners<F: PrefixFamily>(&self, family: &F, pages: &[u32]) -> Result<(), BoxError> {
+        match pages.iter().find(|&&page| family.page_device(page) != self.pool.owner(page)) {
+            Some(&page) => Err(format!("page {page} lives on {:?} for the family, {:?} in the pool",
+                family.page_device(page), self.pool.owner(page)).into()),
+            None => Ok(()),
+        }
+    }
+
     /// Whether marks live in the arena (a family with marks and no pool-page store).
     fn arena_marks(&self) -> bool {
         self.layout.mark_bytes > 0 && self.layout.mark_store == MarkStore::Arena
@@ -637,7 +661,7 @@ impl<E: CopyEngine> PrefixCache<E> {
     fn take_mark_pages(&mut self) -> Result<Option<Mark>, PrefixError> {
         match self.layout.mark_store {
             MarkStore::Pool { pages, .. } if self.layout.mark_bytes > 0 => {
-                let mut pages = self.pool.alloc(pages)?;
+                let mut pages = self.pool.alloc_for(0..pages)?;
                 pages.sort_unstable();
                 Ok(Some(Mark::Pages(pages)))
             }
@@ -710,6 +734,7 @@ impl<E: CopyEngine> PrefixCache<E> {
         }
         self.drain(family)?;
         let entry = self.entries.get(&id).expect("stored entry is retained");
+        self.check_owners(family, &entry.pages).map_err(|source| PrefixError::Family { what: "page owners", source })?;
         let ids = self.identities(&entry.tokens, &entry.media, &entry.pages);
         let mut pages: [Vec<DevicePage>; cuteafd_hostcache::COMPRESSORS] = Default::default();
         pages[0] = entry.pages.iter().zip(ids).map(|(&page, id)| DevicePage { id, segments: family.page_segments(page) }).collect();
@@ -767,8 +792,8 @@ impl<E: CopyEngine> PrefixCache<E> {
             return Ok(None);
         }
         let need = self.pool.pages_for(len);
-        let mark_pages = self.layout.mark_store.pages();
-        if !self.make_room(family, need + mark_pages, None)? {
+        let fresh = self.pool.need_for(0..need) + self.pool.need_for(0..self.layout.mark_store.pages());
+        if !self.make_room_for(family, fresh, None)? {
             return Ok(None);
         }
         let slot = if self.arena_marks() {
@@ -784,17 +809,24 @@ impl<E: CopyEngine> PrefixCache<E> {
         } else {
             None
         };
-        if self.pool.free() < need + mark_pages {
+        if !self.pool.fits(fresh) {
             self.give_back(family, slot.map(Mark::Slot))?;
             return Ok(None);
         }
-        let pages = self.pool.alloc(need)?;
+        let pages = self.pool.alloc_for(0..need)?;
         let mark = match slot {
             Some(slot) => Some(Mark::Slot(slot)),
             None => self.take_mark_pages()?,
         };
         // The restore stream writes these pages and the mark: nothing queued may still use them.
         self.drain(family)?;
+        if let Err(source) = self.check_owners(family, &pages) {
+            tracing::warn!(target: "cuteafd::prefix", error = %source, "host restore abandoned; prefilling");
+            self.stats.restore_failures += 1;
+            self.release(family, &pages)?;
+            self.give_back(family, mark)?;
+            return Ok(None);
+        }
         let ids = self.identities(&snapshot_tokens, &saved_media, &pages);
         let mut target_pages: [Vec<DevicePage>; cuteafd_hostcache::COMPRESSORS] = Default::default();
         target_pages[0] = pages.iter().zip(ids).map(|(&page, id)| DevicePage { id, segments: family.page_segments(page) }).collect();
@@ -822,6 +854,21 @@ impl<E: CopyEngine> PrefixCache<E> {
                 host.engine_mut().release_barrier(Stream::Restore)
                     .map_err(|error| PrefixError::Host(format!("host restore release barrier: {error:#}")))?;
                 tracing::warn!(target: "cuteafd::prefix", ?outcome, tokens = len, "host restore abandoned; prefilling");
+                self.stats.restore_failures += 1;
+                self.release(family, &pages)?;
+                self.give_back(family, mark)?;
+                return Ok(None);
+            }
+        }
+        // Replicated bytes came back to GPU0 only; copy them to GPU1 before anything reads them.
+        let mut replicas: Vec<_> = pages.iter().flat_map(|&page| family.page_replicas(page)).collect();
+        if let Some(Mark::Slot(slot)) = &mark {
+            replicas.extend(family.mark_replicas(*slot));
+        }
+        if !replicas.is_empty() {
+            self.dirty = true;
+            if let Err(source) = family.copy_replicas(&replicas) {
+                tracing::warn!(target: "cuteafd::prefix", error = %source, tokens = len, "host restore replicas failed; prefilling");
                 self.stats.restore_failures += 1;
                 self.release(family, &pages)?;
                 self.give_back(family, mark)?;

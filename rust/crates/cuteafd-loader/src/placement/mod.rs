@@ -30,7 +30,7 @@ pub use inventory::{loaded_code, ArchContext, GraphRank, GraphSet, Lifetime, Loa
 pub use pool::PoolPolicy;
 pub use residual::{hop_buffer_bytes, plan_hops, Hop, HopKind, HopPoint, HopSpec, ResidualHome, Transition, HOP_SLOTS};
 pub use solve::solve;
-pub use attention::{AttentionPlacement, ContextBuffers, KvDemand};
+pub use attention::{AttentionPlacement, ContextBuffers, ContextExchangeLayout, KvDemand, CONTEXT_EXCHANGES};
 
 /// What a request asks of the hardware, built by a family from its own
 /// geometry; see `families::<family>`.

@@ -44,6 +44,19 @@ impl MarkStore {
     }
 }
 
+/// Which GPU holds a page's rows.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub enum PageOwners {
+    /// One GPU, or every GPU holds its own copy of every page (today's head split).
+    #[default]
+    Uniform,
+    /// Token-split `context` attention: page id `i` lives on GPU `i & 1` at local index `i >> 1`
+    /// (a [`super::RefPagePool::parity`] pool), and a sequence's page `j` has parity `j % 2`.
+    /// Replicated per-page or per-mark bytes (V4's C128 records, its window marks) are stored
+    /// once from GPU0 and copied to GPU1 after a host restore ([`PrefixFamily::page_replicas`]).
+    Parity,
+}
+
 /// A family's snapshot geometry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct FamilyLayout {
@@ -67,6 +80,8 @@ pub struct FamilyLayout {
     pub rule: ReuseRule,
     /// Where marks live: an arena of `PrefixConfig::mark_slots` (the default), or pool pages.
     pub mark_store: MarkStore,
+    /// Which GPU holds each page ([`PageOwners::Parity`]: two half pools; marks in an arena).
+    pub page_owners: PageOwners,
 }
 
 impl FamilyLayout {
@@ -104,13 +119,42 @@ pub trait PrefixFamily {
     /// Touches tables and buffers only, never graph shapes or workspaces.
     fn restore(&self, mark: Option<MarkSlot>, placement: &mut Self::Placement, len: usize) -> Result<(), BoxError>;
     /// Copy rows `[0, copy.rows)` of every paged buffer from page `copy.from` to page `copy.to`.
+    /// Under [`PageOwners::Parity`] both pages sit at the same logical position: rows partitioned
+    /// by page live on (and copy on the stream of) `copy.owner` only; replicated rows copy on
+    /// every GPU that holds them.
     fn copy_rows(&self, copy: TailCopy) -> Result<(), BoxError>;
     /// Wait for every copy enqueued so far.
     fn drain(&self) -> Result<(), BoxError>;
-    /// Device ranges of one page (host tier), concatenated in this order on the host.
+    /// Device ranges of one page (host tier), concatenated in this order on the host. Each page's
+    /// bytes are stored once: under [`PageOwners::Parity`], its partitioned rows on its owner
+    /// GPU and GPU0's copy of any replicated rows. Two pages of the same parity list segments of
+    /// the same lengths in the same order (a restore lands in a fresh page of that parity).
     fn page_segments(&self, page: u32) -> Vec<DeviceRange>;
-    /// Device ranges of one mark slot (host tier).
+    /// Device ranges of one mark slot (host tier): GPU0's copy of a mark every GPU holds.
     fn mark_segments(&self, slot: MarkSlot) -> Vec<DeviceRange>;
+    /// The GPU that holds `page`'s partitioned rows: `None` under [`PageOwners::Uniform`], `Some(page
+    /// & 1)` under [`PageOwners::Parity`] (the cache checks it before any host copy).
+    fn page_device(&self, page: u32) -> Option<u8> {
+        let _ = page;
+        None
+    }
+    /// Replicated bytes of `page` that [`PrefixFamily::page_segments`] stores from GPU0 only:
+    /// `(GPU0 range, GPU1 range)` pairs of equal length, copied GPU0 -> GPU1 by
+    /// [`PrefixFamily::copy_replicas`] once a host restore landed. Empty: nothing replicated.
+    fn page_replicas(&self, page: u32) -> Vec<(DeviceRange, DeviceRange)> {
+        let _ = page;
+        Vec::new()
+    }
+    /// As [`PrefixFamily::page_replicas`] for a mark slot.
+    fn mark_replicas(&self, slot: MarkSlot) -> Vec<(DeviceRange, DeviceRange)> {
+        let _ = slot;
+        Vec::new()
+    }
+    /// Enqueue `copies` (source on GPU0, destination on GPU1) on the destination GPU's stream,
+    /// ordered before its next forward pass; [`PrefixFamily::drain`] waits for them.
+    fn copy_replicas(&self, copies: &[(DeviceRange, DeviceRange)]) -> Result<(), BoxError> {
+        if copies.is_empty() { Ok(()) } else { Err("this family has no replicated snapshot bytes".into()) }
+    }
     /// A mark-less family's stand-in for the mark of its host snapshots (the host tier keeps a
     /// tail per snapshot): at most `max(mark_bytes, 1)` bytes of device scratch that host
     /// restores overwrite and nothing reads. Empty (the default): no host snapshots without a

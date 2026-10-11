@@ -44,6 +44,41 @@ __global__ void push_signal(uint4* destination, const uint4* source, uint64_t un
   }
 }
 
+// Up to four strided byte planes (each local or on the peer), then one
+// signal exactly as `push_signal` publishes it (the same `send_state`
+// sequence and arrival counter, so the two kernels may share a flag).
+struct Planes {
+  cuteafd_peer_plane_t plane[CUTEAFD_PEER_MAX_PLANES];
+  uint64_t first_unit[CUTEAFD_PEER_MAX_PLANES + 1];
+  uint32_t count;
+};
+
+__global__ void push_planes(Planes planes, uint32_t* flag, uint32_t* state) {
+  const uint64_t units = planes.first_unit[planes.count];
+  const uint64_t stride = uint64_t(gridDim.x) * blockDim.x;
+  for (uint64_t i = uint64_t(blockIdx.x) * blockDim.x + threadIdx.x; i < units; i += stride) {
+    uint32_t p = 0;
+    while (i >= planes.first_unit[p + 1]) ++p;
+    const cuteafd_peer_plane_t& plane = planes.plane[p];
+    const uint64_t per_row = plane.row_bytes / 16, unit = i - planes.first_unit[p];
+    const uint64_t row = unit / per_row, column = unit % per_row;
+    reinterpret_cast<uint4*>(static_cast<uint8_t*>(plane.destination) + row * plane.destination_pitch)[column] =
+        reinterpret_cast<const uint4*>(static_cast<const uint8_t*>(plane.source) + row * plane.source_pitch)[column];
+  }
+  if (!flag) return;
+  __threadfence_system();
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    if (atomicAdd(&state[1], 1u) == gridDim.x - 1) {
+      __threadfence_system();
+      state[1] = 0;
+      const uint32_t sequence = state[0] + 1;
+      state[0] = sequence;
+      store_release_sys(flag, sequence);
+    }
+  }
+}
+
 __device__ __forceinline__ uint64_t global_ns() {
   uint64_t ns;
   asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(ns));
@@ -232,7 +267,8 @@ extern "C" int32_t cuteafd_peer_exchange_initialize() {
   // Loads the exchange kernels on the current device now: a lazily loaded kernel's
   // first launch may wait for the device to idle, which a spinning wait never does.
   cudaFuncAttributes attributes{};
-  for (const void* kernel : {reinterpret_cast<const void*>(push_signal), reinterpret_cast<const void*>(wait_flag),
+  for (const void* kernel : {reinterpret_cast<const void*>(push_signal), reinterpret_cast<const void*>(push_planes),
+       reinterpret_cast<const void*>(wait_flag),
        reinterpret_cast<const void*>(add_bf16), reinterpret_cast<const void*>(host_signal),
        reinterpret_cast<const void*>(wait_written)}) {
     const cudaError_t status = cudaFuncGetAttributes(&attributes, kernel);
@@ -264,6 +300,30 @@ extern "C" int32_t cuteafd_peer_push_signal(void* destination, const void* sourc
   const uint64_t units = bytes / 16;
   push_signal<<<default_blocks(units, blocks), 256, 0, static_cast<cudaStream_t>(stream)>>>(
       static_cast<uint4*>(destination), static_cast<const uint4*>(source), units, flag, send_state);
+  return cudaGetLastError();
+}
+
+extern "C" int32_t cuteafd_peer_push_planes(const cuteafd_peer_plane_t* planes, uint32_t count, uint32_t* flag,
+    uint32_t* send_state, uint32_t blocks, void* stream) {
+  if (!planes || !count || count > CUTEAFD_PEER_MAX_PLANES || !stream || (flag && !send_state) ||
+      (!flag && send_state))
+    return cudaErrorInvalidValue;
+  Planes packed{};
+  packed.count = count;
+  for (uint32_t p = 0; p < count; ++p) {
+    const cuteafd_peer_plane_t& plane = planes[p];
+    const auto misaligned = (reinterpret_cast<uintptr_t>(plane.destination) | reinterpret_cast<uintptr_t>(plane.source) |
+        plane.row_bytes | plane.destination_pitch | plane.source_pitch) & 15;
+    if (misaligned || (plane.rows && (!plane.destination || !plane.source || !plane.row_bytes ||
+        plane.row_bytes > plane.destination_pitch || plane.row_bytes > plane.source_pitch)) ||
+        plane.rows > (1ull << 32) || plane.row_bytes > (1ull << 32))
+      return cudaErrorInvalidValue;
+    packed.plane[p] = plane;
+    packed.first_unit[p + 1] = packed.first_unit[p] + (plane.rows ? plane.rows * (plane.row_bytes / 16) : 0);
+  }
+  const uint64_t units = packed.first_unit[count];
+  for (uint32_t p = count; p < CUTEAFD_PEER_MAX_PLANES; ++p) packed.first_unit[p + 1] = units;
+  push_planes<<<default_blocks(units, blocks), 256, 0, static_cast<cudaStream_t>(stream)>>>(packed, flag, send_state);
   return cudaGetLastError();
 }
 

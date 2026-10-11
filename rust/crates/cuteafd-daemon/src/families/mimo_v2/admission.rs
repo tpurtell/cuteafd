@@ -189,6 +189,7 @@ pub(super) fn preflight(
                 draft_bytes: 0,
                 rule: cuteafd_engine::prefix::ReuseRule::EXACT,
                 mark_store: cuteafd_engine::prefix::MarkStore::Arena,
+                page_owners: Default::default(),
             };
             prefix.host_config(layout, args.max_context)?
         }

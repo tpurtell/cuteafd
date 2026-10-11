@@ -61,21 +61,65 @@ pub struct ContextBuffers {
     pub candidate_row_bytes: u64,
     pub compiled_extent: u64,
     pub decode_rows: u64,
+    /// Decode lanes that exchange concurrently (the gather-route prefill
+    /// never uses the context exchange).
     pub lanes: u64,
 }
 
+/// One GPU's context exchange storage, per (layer parity, lane) slot:
+/// the assembled query `[rows, 2 halves, q]` and candidate lists `[rows, 2K]`
+/// (own half written locally, the peer's half pushed in, both read in place
+/// by the partial and merge kernels), the peer's partial of this GPU's heads,
+/// and three flags of 16 B each. Shared by the solver's demand and the
+/// runtime allocation (`shared/peer_split/context.rs`), so they agree to the
+/// byte.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ContextExchangeLayout {
+    pub slots: u64,
+    pub rows: u64,
+    pub query_bytes: u64,
+    pub candidate_bytes: u64,
+    pub partial_bytes: u64,
+}
+
+/// Exchanges per slot: q, candidates, partial.
+pub const CONTEXT_EXCHANGES: u64 = 3;
+
+impl ContextExchangeLayout {
+    /// Two layer parities per lane.
+    pub fn new(buffers: &ContextBuffers) -> Self {
+        Self { slots: 2 * buffers.lanes, rows: buffers.decode_rows, query_bytes: buffers.query_row_bytes,
+            candidate_bytes: buffers.candidate_row_bytes, partial_bytes: buffers.partial_row_bytes }
+    }
+    /// Assembled query rows: both GPUs' halves.
+    pub fn query_row(&self) -> Option<u64> { self.query_bytes.checked_mul(2) }
+    /// Assembled candidate rows: both GPUs' lists.
+    pub fn candidate_row(&self) -> Option<u64> { self.candidate_bytes.checked_mul(2) }
+    /// Receive bytes of one slot (query, candidates, partial), before flags.
+    pub fn slot_bytes(&self) -> Option<[u64; 3]> {
+        Some([self.rows.checked_mul(self.query_row()?)?, self.rows.checked_mul(self.candidate_row()?)?,
+            self.rows.checked_mul(self.partial_bytes)?])
+    }
+    /// Flag words: four u32 per exchange per slot (sequence, send state, recv state).
+    pub fn control_bytes(&self) -> Option<u64> {
+        self.slots.checked_mul(CONTEXT_EXCHANGES)?.checked_mul(16)
+    }
+    /// Everything one GPU allocates for the exchange.
+    pub fn bytes(&self) -> Option<u64> {
+        let [q, c, p] = self.slot_bytes()?;
+        q.checked_add(c)?.checked_add(p)?.checked_mul(self.slots)?.checked_add(self.control_bytes()?)
+    }
+}
+
 impl ContextBuffers {
-    /// PLAN attention placement sections 1/2: two staging parity slots and
-    /// q/candidates/partial receive slots per parity and lane, at decode rows.
+    /// PLAN attention placement sections 1/2: two staging parity slots and the
+    /// context exchange exactly as it allocates ([`ContextExchangeLayout`]).
     pub fn demands(self) -> Result<Vec<Demand>, PlacementError> {
         let overflow = || PlacementError::Overflow("context buffers");
         let units = self.compiled_extent.div_ceil(self.staging_unit_rows.max(1));
         let staging = self.staging_unit_bytes.checked_mul(units)
             .and_then(|n| n.checked_mul(2)).ok_or_else(overflow)?;
-        let payload = self.query_row_bytes.checked_add(self.partial_row_bytes)
-            .and_then(|n| n.checked_add(self.candidate_row_bytes)).ok_or_else(overflow)?;
-        let exchange = payload.checked_mul(self.decode_rows).and_then(|n| n.checked_mul(self.lanes))
-            .and_then(|n| n.checked_mul(2)).ok_or_else(overflow)?;
+        let exchange = ContextExchangeLayout::new(&self).bytes().ok_or_else(overflow)?;
         Ok((0..2).flat_map(|gpu| [
             Demand::new(gpu, Category::Workspace, "context staging", staging, Basis::Formula),
             Demand::new(gpu, Category::Transport, "context exchange", exchange, Basis::Formula),

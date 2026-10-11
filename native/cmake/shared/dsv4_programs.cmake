@@ -46,10 +46,14 @@ if(CUTEAFD_ENABLE_QWEN4_AOT)
   endif()
 endif()
 set(CUTEAFD_DSV4_DIR "${CMAKE_CURRENT_BINARY_DIR}/dsv4_programs")
+string(TOLOWER "${CUTEAFD_CONTEXT_SPLIT_AOT}" context_split_aot)
+if(NOT context_split_aot MATCHES "^(off|on|only)$")
+  message(FATAL_ERROR "CUTEAFD_CONTEXT_SPLIT_AOT must be OFF, ON or ONLY")
+endif()
 set(CUTEAFD_DSV4_EXPORT_ARGS --geometry "${CUTEAFD_PROGRAM_GEOMETRY}"
   --decode-rows "${CUTEAFD_DSV4_DECODE_ROWS}" --prefill-rows "${CUTEAFD_DSV4_PREFILL_ROWS}"
   --glmf-wide-decode-rows "${CUTEAFD_GLMF_WIDE_DECODE_ROWS}"
-  --max-context "${CUTEAFD_DSV4_MAX_CONTEXT}")
+  --max-context "${CUTEAFD_DSV4_MAX_CONTEXT}" --context-split "${context_split_aot}")
 set(stamp "${CMAKE_CURRENT_BINARY_DIR}/dsv4_programs.stamp")
 file(GENERATE OUTPUT "${stamp}" CONTENT "${CUTEAFD_DSV4_EXPORT_ARGS}\n")
 # The program list lives in the exporter; objects are collected into one
