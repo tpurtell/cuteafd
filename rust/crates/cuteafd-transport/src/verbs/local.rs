@@ -130,7 +130,7 @@ impl LocalVerbsExpertConnection {
     /// the environment on the poll path.
     pub fn accept(stream: TcpStream, max_frame_bytes: usize, timing: bool) -> Result<Self> {
         verbs_host_preflight()?;
-        let start = Self::read_persistent_start(&stream, max_frame_bytes)?;
+        let start = Self::read_persistent_start(&stream, max_frame_bytes, None)?;
         let path =
             verbs_host_native_library_path().context("native RoCE library not configured")?;
         let library = Arc::new(unsafe { NativeLibrary::load(&path) }?);
@@ -148,8 +148,26 @@ impl LocalVerbsExpertConnection {
         timing: bool,
         budget: Arc<RingBudget>,
     ) -> Result<Self> {
+        Self::accept_with_selection(stream, max_frame_bytes, timing, budget, None)
+    }
+
+    /// An opt-in placement worker rejects unsealed or different later lanes
+    /// before any mapped ring/native endpoint allocation.
+    pub fn accept_with_selection(
+        stream: TcpStream, max_frame_bytes: usize, timing: bool,
+        budget: Arc<RingBudget>, selection: Option<(usize, &crate::worker_selection::WorkerSelection)>,
+    ) -> Result<Self> {
+        let start = match Self::read_persistent_start(&stream, max_frame_bytes, selection) {
+            Ok(start) => start,
+            Err(error) => {
+                if !error.is::<crate::worker_selection::WorkerSelectionOnly>() && !error.is::<FlowProbesOnly>() {
+                    let mut stream = stream;
+                    let _ = crate::worker_selection::reject_worker_selection(&mut stream, &error);
+                }
+                return Err(error);
+            }
+        };
         verbs_host_preflight()?;
-        let start = Self::read_persistent_start(&stream, max_frame_bytes)?;
         // Validate the wire ring geometry first so the reserved byte count is
         // the authoritative span that the native allocation will pin.
         let (request_ring, response_ring) = Self::validated_rings(&start)?;
@@ -211,6 +229,7 @@ impl LocalVerbsExpertConnection {
     fn read_persistent_start(
         stream: &TcpStream,
         max_frame_bytes: usize,
+        selection: Option<(usize, &crate::worker_selection::WorkerSelection)>,
     ) -> Result<VerbsHostProtocolV2PersistentStart> {
         configure_control_stream(stream, default_control_timeout())?;
         let mut reader = BufReader::new(stream.try_clone()?);
@@ -222,7 +241,15 @@ impl LocalVerbsExpertConnection {
             let mut stream = stream.try_clone()?;
             value = flows::serve_flow_probes(&mut stream, &mut reader, &library, value)?.ok_or(FlowProbesOnly)?;
         }
+        if value["message"] == "worker_selection_start" {
+            let (rank, expected) = selection.context("worker is not placement-handshake enabled")?;
+            crate::worker_selection::acknowledge_repeat(&mut stream.try_clone()?, value, rank, expected)?;
+            return Err(crate::worker_selection::WorkerSelectionOnly.into());
+        }
         let start: VerbsHostProtocolV2PersistentStart = serde_json::from_value(value)?;
+        let digest = selection.map(|(_, selection)| selection.digest()).transpose()?;
+        anyhow::ensure!(start.worker_selection_digest == digest,
+            "worker connection does not match its loaded placement");
         anyhow::ensure!(
             start.message == "protocol_v2_persistent_start",
             "native owner requires persistent RoCE bootstrap"
@@ -773,6 +800,90 @@ mod budget_tests {
         owner.join().unwrap()?;
         assert!(started.elapsed() < Duration::from_millis(500));
         assert_eq!(budget.used(), 0);
+        Ok(())
+    }
+
+    fn placement_selection(layers: &[usize]) -> crate::worker_selection::WorkerSelection {
+        let identity = serde_json::from_value(serde_json::json!({
+            "checkpoint": "0".repeat(64), "geometry": [6144, 384, 8, 2048, 70],
+            "world": 2, "topology": null
+        })).unwrap();
+        crate::worker_selection::WorkerSelection::new(identity, layers).unwrap()
+    }
+
+    fn placement_start(digest: Option<String>, lane: u32) -> serde_json::Value {
+        let native = serde_json::json!({
+            "port_num": 1, "qp_num": 2, "psn": 3, "lid": 0, "active_mtu": 5,
+            "gid_hex": "0".repeat(32), "send_frame_bytes": 4096, "recv_frame_bytes": 4096,
+            "send_registered_span_bytes": 32768, "recv_registered_span_bytes": 32768,
+            "max_send_wr": 8, "max_recv_wr": 8, "max_sge": 2,
+            "device_name": "test", "status": "test"
+        });
+        let mut endpoint = native.clone();
+        endpoint["role"] = "client".into();
+        endpoint["host"] = "coordinator".into();
+        let mut start = serde_json::json!({
+            "message": "protocol_v2_persistent_start", "execution_lane": lane,
+            "request_capacity_wire_bytes": 4096, "response_capacity_wire_bytes": 4096,
+            "request_registered_span_bytes": 32768, "response_registered_span_bytes": 32768,
+            "ring_depth": 8, "request_slot_stride_bytes": 4096, "response_slot_stride_bytes": 4096,
+            "client_endpoint": endpoint, "client_native_endpoint": native
+        });
+        if let Some(digest) = digest { start["worker_selection_digest"] = digest.into(); }
+        start
+    }
+
+    #[test]
+    fn worker_selection_lanes_reject_mismatch_before_ring_reservation() -> Result<()> {
+        let selection = placement_selection(&[13, 14]);
+        let digest = selection.digest()?;
+        for (wire, expected, accepted) in [
+            (None, None, true), (None, Some(&selection), false),
+            (Some(digest.clone()), None, false),
+            (Some("1".repeat(64)), Some(&selection), false),
+            (Some(digest), Some(&selection), true),
+        ] {
+            for lane in [0, 1, 2] {
+                let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+                let mut client = TcpStream::connect(listener.local_addr()?)?;
+                let (server, _) = listener.accept()?;
+                write_control(&mut client, &placement_start(wire.clone(), lane))?;
+                let budget = RingBudget::new(0);
+                let start = LocalVerbsExpertConnection::read_persistent_start(
+                    &server, 4096, expected.map(|selection| (0, selection)));
+                assert_eq!(start.is_ok(), accepted);
+                assert_eq!(budget.used(), 0);
+                if let Ok(start) = start { assert_eq!(start.execution_lane, lane); }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn worker_selection_repeat_ack_is_control_only_and_immutable() -> Result<()> {
+        let selection = placement_selection(&[13, 14]);
+        let changed = placement_selection(&[14]);
+        for (sent, rank, accepted) in [(&selection, 0, true), (&changed, 0, false), (&selection, 1, false)] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+            let mut client = TcpStream::connect(listener.local_addr()?)?;
+            let (server, _) = listener.accept()?;
+            write_control(&mut client, &serde_json::json!({
+                "message": "worker_selection_start", "rank": rank,
+                "selection": sent, "digest": sent.digest()?
+            }))?;
+            let result = LocalVerbsExpertConnection::accept_with_selection(
+                server, 4096, false, RingBudget::new(0), Some((0, &selection)));
+            let error = result.err().context("control-only selection allocated a native session")?;
+            assert_eq!(error.is::<crate::worker_selection::WorkerSelectionOnly>(), accepted);
+            client.set_read_timeout(Some(Duration::from_secs(3)))?;
+            let reply = read_control_value(&mut BufReader::new(client));
+            if accepted {
+                let reply = reply?;
+                assert_eq!(reply["message"], "worker_selection_ready");
+                assert_eq!(reply["selection"], serde_json::to_value(&selection)?);
+                assert_eq!(reply["digest"], selection.digest()?);
+            } else { assert!(reply.is_err()); }
+        }
         Ok(())
     }
 

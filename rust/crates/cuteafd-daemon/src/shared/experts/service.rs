@@ -62,6 +62,7 @@ pub(crate) async fn run(args: crate::cli::NativeExpertDaemonArgs) -> Result<()> 
         world: args.world as usize,
         first_layer: args.first_layer as usize,
         last_layer: args.last_layer.map(|layer| layer as usize),
+        placement_handshake: args.placement_handshake,
         capacity: args.capacity,
         device_budget: args.device_budget_bytes,
         max_frame_bytes: args.max_frame_bytes,
@@ -92,6 +93,7 @@ pub(crate) struct NativeExpertServiceConfig {
     pub first_layer: usize,
     /// Inclusive last resident layer; `None` serves through the model's last.
     pub last_layer: Option<usize>,
+    pub placement_handshake: bool,
     pub capacity: u32,
     pub device_budget: usize,
     pub max_frame_bytes: usize,
@@ -501,6 +503,7 @@ mod tests {
             world,
             first_layer: 0,
             last_layer: None,
+            placement_handshake: false,
             capacity: 16,
             device_budget: 1 << 40,
             max_frame_bytes: 64 << 20,

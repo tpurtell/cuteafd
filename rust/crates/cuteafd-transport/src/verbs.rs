@@ -2131,6 +2131,7 @@ impl VerbsHostProtocolV2PersistentClientSession {
             client_native_endpoint: endpoint.native_descriptor(),
             write_target: write.map(|target| landing::expose(&endpoint, target)).transpose()?,
             flow_label,
+            worker_selection_digest: crate::worker_selection::peer_selection_digest(addr)?,
         };
         write_control(&mut stream, &start)?;
         let ready: VerbsHostProtocolV2PersistentReady = read_control(&mut reader)?;
@@ -3365,6 +3366,9 @@ struct VerbsHostProtocolV2PersistentStart {
     /// absent or 0: the kernel derives one from the QP numbers.
     #[serde(default, skip_serializing_if = "is_zero_label")]
     flow_label: u32,
+    /// Immutable coordinator selection established before worker allocation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    worker_selection_digest: Option<String>,
 }
 
 fn is_zero_label(label: &u32) -> bool {

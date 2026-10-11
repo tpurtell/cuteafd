@@ -23,6 +23,7 @@ pub mod health {
 mod debug_json;
 pub mod protocol_v2;
 pub mod expert;
+pub mod worker_selection;
 // Old module path, kept for one release (naming pass).
 pub use expert as v41_expert;
 mod protocol_v2_tcp;

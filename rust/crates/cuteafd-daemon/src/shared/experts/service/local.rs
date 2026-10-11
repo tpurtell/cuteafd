@@ -10,6 +10,70 @@ use std::{
     time::{Duration, Instant},
 };
 
+fn apply_worker_selection(config: &mut NativeExpertServiceConfig,
+    selection: &cuteafd_transport::worker_selection::WorkerSelection,
+    first_routed: usize, layers: usize) -> Result<()> {
+    ensure!(selection.ranges().len() <= 1,
+        "disjoint worker layer selection needs a sparse native loader");
+    if let Some(range) = selection.ranges().first() {
+        let allowed = config.resident_layers(layers)?;
+        ensure!(range.first as usize >= first_routed && range.first as usize >= allowed.start
+            && range.end as usize <= allowed.end, "solved worker selection is outside launched resident range");
+        config.first_layer = range.first as usize;
+        config.last_layer = Some(range.end as usize - 1);
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod selection_tests {
+    use super::*;
+    #[test]
+    fn solved_worker_suffix_controls_loaded_and_admitted_range() {
+        use cuteafd_transport::worker_selection::{WorkerIdentity, WorkerSelection};
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("config.json"), "{}").unwrap();
+        std::fs::write(dir.path().join("model.safetensors.index.json"), "{}").unwrap();
+        let geometry = cuteafd_core::ExpertGeometry::MIMO_V26_PRO;
+        let identity = WorkerIdentity::from_snapshot(dir.path(), geometry, 6, None).unwrap();
+        // Native config uses the same range consumed by every backend planner.
+        let mut config = NativeExpertServiceConfig { encoder: None, audio_encoder: None,
+            library: "/native.so".into(), exl3_aot_dir: None, exl3_schedule: Default::default(), fp8_package: None,
+            snapshot: dir.path().into(), rank: 0, world: 6, first_layer: 1, last_layer: None,
+            placement_handshake: true, capacity: 4096, device_budget: 121 << 30, max_frame_bytes: 64 << 20,
+            topology: None, native_spark_tp2: false, bf16_ingress: false };
+        let selection = WorkerSelection::new(identity.clone(), &(13..70).collect::<Vec<_>>()).unwrap();
+        apply_worker_selection(&mut config, &selection, 1, 70).unwrap();
+        assert_eq!(config.resident_layers(70).unwrap(), 13..70);
+        assert_eq!(config.selection(13).unwrap(), ExpertLayer::BackboneExl3Tp { layer: 13, rank: 0, world: 6 });
+        let disjoint = WorkerSelection::new(identity.clone(), &[13, 15]).unwrap();
+        assert!(apply_worker_selection(&mut config, &disjoint, 1, 70).is_err());
+        let before = WorkerSelection::new(identity.clone(), &[0]).unwrap();
+        assert!(apply_worker_selection(&mut config, &before, 1, 70).is_err());
+        let empty = WorkerSelection::new(identity, &[]).unwrap();
+        apply_worker_selection(&mut config, &empty, 1, 70).unwrap();
+        assert!(empty.ranges().is_empty());
+    }
+}
+
+fn run_empty_selection(listener: TcpListener, rank: usize,
+    selection: &cuteafd_transport::worker_selection::WorkerSelection) -> Result<()> {
+    listener.set_nonblocking(false)?;
+    for accepted in listener.incoming() {
+        let mut stream = accepted?;
+        let result = (|| -> Result<()> {
+            let repeated = cuteafd_transport::worker_selection::receive_worker_selection(&stream, rank, Duration::from_secs(30))?;
+            ensure!(&repeated == selection, "empty worker selection is immutable until restart");
+            cuteafd_transport::worker_selection::acknowledge_worker_selection(&mut stream, rank, selection)
+        })();
+        if let Err(error) = result {
+            let _ = cuteafd_transport::worker_selection::reject_worker_selection(&mut stream, &error);
+            tracing::warn!(%error, "empty worker rejects expert traffic or changed selection");
+        }
+    }
+    Ok(())
+}
+
 struct Admission {
     stop: Arc<AtomicBool>,
 }
@@ -64,10 +128,58 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
         config.library.clone(), config.device_budget as u64)?;
     config.device_budget = config.device_budget.checked_sub(usize::try_from(reserved)?)
         .context("media reservation exceeds Spark budget")?;
+    // Media may be admitted first, but expert allocation waits for the one
+    // coordinator-authoritative selection. Bootstrap-ready is not weights-ready.
+    let mut bootstrap = if config.placement_handshake {
+        let listener = TcpListener::bind(listen)?;
+        listener.set_nonblocking(true)?;
+        tracing::info!(rank = config.rank, world = config.world, "native worker bootstrap ready");
+        let deadline = Instant::now() + Duration::from_secs(1200);
+        let mut stream = loop {
+            ensure!(Instant::now() < deadline, "coordinator worker selection timed out");
+            match listener.accept() {
+                Ok((stream, _)) => break stream,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => thread::sleep(Duration::from_millis(100)),
+                Err(error) => return Err(error.into()),
+            }
+        };
+        let selected = (|| -> Result<_> {
+            let selection = cuteafd_transport::worker_selection::receive_worker_selection(&stream, config.rank, Duration::from_secs(1200))?;
+            let identity = cuteafd_transport::worker_selection::WorkerIdentity::from_snapshot(
+                &config.snapshot, geometry, config.world, config.topology)?;
+            selection.validate_for(&identity)?;
+            apply_worker_selection(&mut config, &selection, catalog.routed_experts().first_layer,
+                catalog.routed_experts().layers)?;
+            Ok(selection)
+        })();
+        let selection = match selected {
+            Ok(selection) => selection,
+            Err(error) => {
+                let _ = cuteafd_transport::worker_selection::reject_worker_selection(&mut stream, &error);
+                return Err(error);
+            }
+        };
+        if selection.ranges().is_empty() {
+            cuteafd_transport::worker_selection::acknowledge_worker_selection(&mut stream, config.rank, &selection)?;
+            tracing::info!(rank = config.rank, layers = 0, resident_bytes = 0, "native empty expert worker ready");
+            return run_empty_selection(listener, config.rank, &selection);
+        }
+        Some((listener, stream, selection))
+    } else { None };
+    // SAFETY: this owner keeps the library loaded through weights/execution Drop.
     let library = unsafe { NativeLibrary::load(&config.library) }?;
-    let (weights, remaining) = {
+    let loaded = {
         let _memory_scope = cuteafd_ffi::memory_ledger::scope("experts/weights");
-        load_weights(&library, &catalog, &config)?
+        load_weights(&library, &catalog, &config)
+    };
+    let (weights, remaining) = match loaded {
+        Ok(loaded) => loaded,
+        Err(error) => {
+            if let Some((_, stream, _)) = bootstrap.as_mut() {
+                let _ = cuteafd_transport::worker_selection::reject_worker_selection(stream, &error);
+            }
+            return Err(error);
+        }
     };
     // The loaders' synchronous uploads grew the library's pinned staging buffer
     // to the largest projection (hundreds of MB of unified memory on GB10);
@@ -80,9 +192,18 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
     tracing::info!(released_bytes = released, page_cache_advised_bytes = advised, cached_before,
         cached_after = crate::shared::memory_report::cached_bytes(),
         "released load-time pinned upload staging and checkpoint page cache");
-    let mut execution = {
+    let allocated = {
         let _memory_scope = cuteafd_ffi::memory_ledger::scope("experts/workspace");
-        weights.execution(&library, &config, remaining)?
+        weights.execution(&library, &config, remaining)
+    };
+    let mut execution = match allocated {
+        Ok(execution) => execution,
+        Err(error) => {
+            if let Some((_, stream, _)) = bootstrap.as_mut() {
+                let _ = cuteafd_transport::worker_selection::reject_worker_selection(stream, &error);
+            }
+            return Err(error);
+        }
     };
     let mut exchange = HostExpertExchange::new(config.capacity)?;
     let mut row_indices = vec![0; config.capacity as usize];
@@ -103,7 +224,21 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
         None,
         ring_budget_log.as_ref().map(|budget| (budget.used(), budget.peak())),
     );
-    let listener = TcpListener::bind(listen)?;
+    let (listener, worker_selection) = if let Some((listener, mut stream, selection)) = bootstrap.take() {
+        let range = &selection.ranges()[0];
+        let exact = range.first as usize == config.first_layer
+            && range.end as usize == config.last_layer.context("selected worker end")? + 1
+            && weights.len() == (range.end - range.first) as usize;
+        if !exact {
+            let error = anyhow::anyhow!("loaded worker layers do not match the solved selection");
+            let _ = cuteafd_transport::worker_selection::reject_worker_selection(&mut stream, &error);
+            return Err(error);
+        }
+        cuteafd_transport::worker_selection::acknowledge_worker_selection(&mut stream, config.rank, &selection)?;
+        tracing::info!(rank = config.rank, first_layer = config.first_layer, layers = weights.len(),
+            selection_digest = %selection.digest()?, "coordinator-selected worker weights ready");
+        (listener, Some(selection))
+    } else { (TcpListener::bind(listen)?, None) };
     listener.set_nonblocking(true)?;
     let (admit, incoming) = mpsc::sync_channel(2);
     let stop = Arc::new(AtomicBool::new(false));
@@ -112,6 +247,7 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
     // Resolved once here: the admission thread and the poll loop must not read
     // the process environment per connection or per poll.
     let protocol_v2_timing = cuteafd_transport::protocol_v2_timing_from_env();
+    let worker_rank = config.rank;
     thread::Builder::new()
         .name("v41-roce-bootstrap".into())
         .spawn(move || {
@@ -119,11 +255,12 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
                 match listener.accept() {
                     Ok((stream, _)) => {
                         let admitted = match &ring_budget {
-                            Some(budget) => LocalVerbsExpertConnection::accept_with_budget(
+                            Some(budget) => LocalVerbsExpertConnection::accept_with_selection(
                                 stream,
                                 max_frame_bytes,
                                 protocol_v2_timing,
                                 Arc::clone(budget),
+                                worker_selection.as_ref().map(|selection| (worker_rank, selection)),
                             ),
                             None => LocalVerbsExpertConnection::accept(
                                 stream,
@@ -139,6 +276,9 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
                             }
                             // A coordinator placing its flows on a bonded port
                             // probes, then connects its sessions separately.
+                            Err(error) if error.is::<cuteafd_transport::worker_selection::WorkerSelectionOnly>() => {
+                                tracing::debug!("acknowledged unchanged worker selection")
+                            }
                             Err(error) if error.is::<cuteafd_transport::FlowProbesOnly>() => {
                                 tracing::debug!("served RDMA flow probes")
                             }
