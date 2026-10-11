@@ -2721,4 +2721,3 @@ mod sampling_tests {
         assert_eq!(row.ln_min_p.to_bits(), 0.05f32.ln().to_bits());
     }
 }
-
