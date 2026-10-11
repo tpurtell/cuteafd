@@ -1084,6 +1084,19 @@ impl ReplayDrafter for GlmDrafter<'_> {
 pub(crate) fn replay(drafter: &(impl ReplayDrafter + ?Sized), tokens: &[u32], greedy: &[u32],
     taps: &dyn Fn(usize, usize) -> Result<Vec<u8>>, embed: &dyn Fn(&[u32]) -> Result<Vec<u8>>, head: *const c_void,
     start: usize) -> Result<()> {
+    replay_with(drafter, tokens, greedy, taps, embed, &|sequences, rows| {
+        let sequences: Vec<_> = sequences.iter().map(|s| (s.slot, s.anchor, s.position)).collect();
+        drafter.draft_tokens(&sequences, rows, head)
+    }, start)
+}
+
+/// Diagnostic replay through a caller-owned draft path. A remote drafter can
+/// scope its device and borrow the target head through its transport callback,
+/// rather than treating a raw head pointer as resident on the draft device.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn replay_with(drafter: &(impl ReplayDrafter + ?Sized), tokens: &[u32], greedy: &[u32],
+    taps: &dyn Fn(usize, usize) -> Result<Vec<u8>>, embed: &dyn Fn(&[u32]) -> Result<Vec<u8>>,
+    draft: &dyn Fn(&[DraftSeq], &[u8]) -> Result<Vec<Vec<u32>>>, start: usize) -> Result<()> {
     let (block, drafts) = (drafter.block(), drafter.drafts());
     ensure!(tokens.len() > start + block && greedy.len() >= tokens.len(), "replay needs more than {} tokens", start + block);
     let anchors: Vec<usize> = (start..tokens.len() - block).collect();
@@ -1105,7 +1118,7 @@ pub(crate) fn replay(drafter: &(impl ReplayDrafter + ?Sized), tokens: &[u32], gr
             }
             let rows = embed(&[tokens[p]])?;
             let timer = std::time::Instant::now();
-            let draft = drafter.draft_tokens(&[(0, tokens[p], p)], &rows, head)?.remove(0);
+            let draft = draft(&[DraftSeq { slot: 0, anchor: tokens[p], position: p, valid_from: 0 }], &rows)?.remove(0);
             seconds.push(timer.elapsed().as_secs_f64());
             if rows_seen.len() < 64 {
                 rows_seen.push(drafter.last_hidden(1)?.chunks_exact(2)
@@ -1132,12 +1145,13 @@ pub(crate) fn replay(drafter: &(impl ReplayDrafter + ?Sized), tokens: &[u32], gr
         let p = *anchors.last().unwrap();
         let mut line = String::new();
         for count in [1usize, 2, 4, 8, 16].into_iter().filter(|&c| c <= drafter.sequences()) {
-            let seqs: Vec<(usize, u32, usize)> = (0..count).map(|slot| (slot, tokens[p], p)).collect();
+            let seqs: Vec<DraftSeq> = (0..count)
+                .map(|slot| DraftSeq { slot, anchor: tokens[p], position: p, valid_from: 0 }).collect();
             let rows = embed(&vec![tokens[p]; count])?;
             let mut times = Vec::new();
             for run in 0..9 {
                 let timer = std::time::Instant::now();
-                drafter.draft_tokens(&seqs, &rows, head)?;
+                draft(&seqs, &rows)?;
                 if run >= 2 {
                     times.push(timer.elapsed().as_secs_f64());
                 }
@@ -1403,6 +1417,126 @@ mod replay_mode_tests {
             -> Result<Vec<Vec<u32>>> { unreachable!() }
         fn tap_rows(&self) -> usize { TAP_ROWS }
         fn last_hidden(&self, _: usize) -> Result<Vec<u8>> { unreachable!() }
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum ReplayEvent {
+        Mode(bool),
+        Taps(usize, usize),
+        Context(usize, Vec<u8>),
+        Embed(Vec<u32>),
+        Draft(Vec<(usize, u32, usize, usize)>, Vec<u8>),
+        Hidden(usize),
+    }
+
+    struct ReplayProbe {
+        legacy: bool,
+        forbid_raw_head: bool,
+        events: RefCell<Vec<ReplayEvent>>,
+    }
+
+    impl ReplayProbe {
+        fn record_draft(&self, seqs: &[DraftSeq], rows: &[u8]) -> Result<Vec<Vec<u32>>> {
+            self.events.borrow_mut().push(ReplayEvent::Draft(seqs.iter()
+                .map(|s| (s.slot, s.anchor, s.position, s.valid_from)).collect(), rows.to_vec()));
+            Ok(vec![vec![0; 3]; seqs.len()])
+        }
+    }
+
+    impl ReplayDrafter for ReplayProbe {
+        fn block(&self) -> usize { 4 }
+        fn sequences(&self) -> usize { 4 }
+        fn has_fp8(&self) -> bool { self.legacy }
+        fn set_fp8(&self, on: bool) { self.events.borrow_mut().push(ReplayEvent::Mode(on)); }
+        fn resident_modes(&self) -> Vec<ReplayMode> {
+            if self.legacy {
+                vec![ReplayMode { name: "BF16", legacy_fp8: Some(false) },
+                    ReplayMode { name: "FP8", legacy_fp8: Some(true) }]
+            } else {
+                vec![ReplayMode { name: "FP8", legacy_fp8: None }]
+            }
+        }
+        fn context(&self, taps: &[u8], first: usize) -> Result<()> {
+            self.events.borrow_mut().push(ReplayEvent::Context(first, taps.to_vec()));
+            Ok(())
+        }
+        fn draft_tokens(&self, seqs: &[(usize, u32, usize)], rows: &[u8], head: *const c_void)
+            -> Result<Vec<Vec<u32>>> {
+            assert!(!self.forbid_raw_head, "callback replay must not invoke the raw-head path");
+            assert!(head.is_null());
+            self.record_draft(&seqs.iter().map(|&(slot, anchor, position)|
+                DraftSeq { slot, anchor, position, valid_from: 0 }).collect::<Vec<_>>(), rows)
+        }
+        fn tap_rows(&self) -> usize { 2 }
+        fn last_hidden(&self, sequences: usize) -> Result<Vec<u8>> {
+            self.events.borrow_mut().push(ReplayEvent::Hidden(sequences));
+            Ok(vec![0, 0])
+        }
+    }
+
+    fn expected_replay_events(legacy: bool) -> Vec<ReplayEvent> {
+        let mut events = Vec::new();
+        for mode in if legacy { vec![Some(false), Some(true)] } else { vec![None] } {
+            if let Some(on) = mode { events.push(ReplayEvent::Mode(on)); }
+            let mut done = 0;
+            for position in 3..8 {
+                while done < position {
+                    let n = (position - done).min(2);
+                    events.push(ReplayEvent::Taps(done, n));
+                    events.push(ReplayEvent::Context(done, (done..done + n).map(|r| r as u8).collect()));
+                    done += n;
+                }
+                events.push(ReplayEvent::Embed(vec![position as u32]));
+                events.push(ReplayEvent::Draft(vec![(0, position as u32, position, 0)], vec![position as u8]));
+                events.push(ReplayEvent::Hidden(1));
+            }
+            for count in [1, 2, 4] {
+                events.push(ReplayEvent::Embed(vec![7; count]));
+                for _ in 0..9 {
+                    events.push(ReplayEvent::Draft((0..count).map(|slot| (slot, 7, 7, 0)).collect(), vec![7; count]));
+                }
+            }
+        }
+        if legacy { events.push(ReplayEvent::Mode(true)); }
+        events
+    }
+
+    #[test]
+    fn callback_replay_preserves_single_wide_context_order_and_valid_from() {
+        let tokens: Vec<u32> = (0..12).collect();
+        for legacy in [false, true] {
+            for callback in [false, true] {
+                let p = ReplayProbe { legacy, forbid_raw_head: callback, events: RefCell::new(Vec::new()) };
+                let taps = |first: usize, n: usize| {
+                    p.events.borrow_mut().push(ReplayEvent::Taps(first, n));
+                    Ok((first..first + n).map(|r| r as u8).collect())
+                };
+                let embed = |ids: &[u32]| {
+                    p.events.borrow_mut().push(ReplayEvent::Embed(ids.to_vec()));
+                    Ok(ids.iter().map(|&id| id as u8).collect())
+                };
+                if callback {
+                    replay_with(&p, &tokens, &[0; 12], &taps, &embed,
+                        &|seqs, rows| p.record_draft(seqs, rows), 3).unwrap();
+                } else {
+                    replay(&p, &tokens, &[0; 12], &taps, &embed, std::ptr::null(), 3).unwrap();
+                }
+                assert_eq!(*p.events.borrow(), expected_replay_events(legacy));
+            }
+        }
+    }
+
+    #[test]
+    fn callback_replay_stops_at_draft_error_without_hidden_or_wide_reads() {
+        let p = ReplayProbe { legacy: false, forbid_raw_head: true, events: RefCell::new(Vec::new()) };
+        let error = replay_with(&p, &[0; 12], &[0; 12], &|_, n| Ok(vec![0; n]), &|_| Ok(vec![0]),
+            &|seqs, rows| {
+                p.record_draft(seqs, rows)?;
+                anyhow::bail!("injected remote draft failure")
+            }, 3).unwrap_err();
+        assert_eq!(error.to_string(), "injected remote draft failure");
+        assert_eq!(*p.events.borrow(), [ReplayEvent::Context(0, vec![0; 2]),
+            ReplayEvent::Context(2, vec![0]), ReplayEvent::Draft(vec![(0, 0, 3, 0)], vec![0])]);
     }
 
     #[test]
