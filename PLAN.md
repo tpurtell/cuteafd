@@ -4596,6 +4596,362 @@ picker and the remote binding, so no container execution path ever exists.
 |---|------|------|------|
 | W4 | Remote-only execution: host and key settings card, SSH picker, host-aware workspace registry, session to host binding, remote `@file`, `fs-ssh` watch, local execution rows unmounted. Lands with W0 for the first usable build | M | On one Spark: bash, read, edit, search, terminal and file watch run remotely with the remote user's shell and environment; nothing executes in the container (process audit while a session works); two sessions on two hosts at once; restart then restore reconnects; the model cannot read the key file through any tool |
 
+### Remote-first harness design (2026-10-11)
+
+DSH was built for local execution, where processes, watches, terminals and
+searches are free and instantaneous. Its SSH family (`packages/ssh/*`) makes
+one remote host look like the local world through the `ctx.fs`,
+`ctx.subprocess` and `ctx.sandbox` seams, with the harness keeping sessions,
+model transport and approvals (`docs/subsystems/ssh.md:170-192`). This section
+decides, subsystem by subsystem, how each works when every session's workspace
+is remote, what we patch, and in which W-step. Paths are `deepseek-harness/`
+at `d7432673`; "helper" is the `dsh-ssh` helper we build from the fork.
+
+**Facts that drive the design.**
+- The connection is one OpenSSH master whose own command is the helper
+  (`ssh -T -M -S <ctl> -o ControlPersist=no … <host> <helper>`,
+  `packages/ssh/ssh/src/index.ts:299-303`). Administrative RPC is 4-byte
+  framed JSON on the exec channel, bidirectional (the peer handles inbound
+  requests, `protocol.ts:197-227`); every program stream is a separate
+  forwarded Unix socket (`ssh -O forward`, a subprocess per stream,
+  `index.ts:171`) authenticated with TLS-PSK. Heartbeats every `leaseMs/3`
+  (10 s); the helper kills every managed process when the lease (30 s) or
+  the channel ends (`helper.ts:84-87`, `helper-processes.ts:363`). Loss is
+  final: "never reconnects to replay a possibly executed action"
+  (`ssh.md:188`), `SshRpcPeer.close` rejects all pending calls.
+- The helper is a Node program running the **local** providers on the
+  remote (`SandboxedFileSystem`, `LocalSubprocessRuntime`,
+  `LocalSandboxProvider`, `helper.ts:27-35`), so remote reads, atomic edits,
+  version guards, bwrap/Landlock confinement and PTYs are the same code as
+  local. `fs-local` already has chokidar `watch`; `fs-ssh` does not expose
+  it (`fs-ssh/src/index.ts`, 107 lines, no `watch`).
+- Tools reach providers through the context they were applied with. Preset
+  plugins mount once in a shared preset subtree
+  (`packages/preset/agent-preset-registry/src/mount.ts`, `index.ts:281`),
+  so a provider installed on `agent.ctx` does not move a tool whose closure
+  holds the preset `ctx` (W0+W4 finding). Prior art for call-time
+  resolution exists: `terminal-controller` reads
+  `agent.ctx.get('subprocess')` per call
+  (`packages/api/terminal-controller/src/index.ts:332-339`) and the tool
+  runtime resolves `workingDirectory` and `sandboxPolicy` per execution
+  (`packages/core/tools/src/index.ts:947-961`).
+- `tool-fs-search` spawns the **container's** `@vscode/ripgrep` path through
+  `ctx.subprocess` (`packages/fs/tool-fs-search/src/search-core.ts:85-87`):
+  remotely that is a binary that does not exist on the host. `glob` and
+  `grep` are broken until this is fixed, so it belongs to W4's gate.
+- The helper is started by sshd as `$SHELL -c <command>`: a non-login,
+  non-interactive shell. PATH, conda, modules and `~/.profile` exports are
+  absent, and every spawned process inherits that environment
+  (`helper-processes.ts:180-181`, merged onto the helper's own env).
+- `ssh` stderr is discarded (`index.ts:306`), so an auth failure, a changed
+  host key and an unreachable host all surface as "SSH helper disconnected".
+
+**0. Routing: one execution world per session, resolved per call.** A
+`cuteafd-execution-worlds` host plugin owns `ExecutionWorld {host, path,
+connection, fs, subprocess, sandbox, facts, state}` per live session, built
+from the header's `cuteafd_workspace` (W0's typed field, fork `c3c68dd9`).
+The root `ctx.fs`, `ctx.subprocess` and `ctx.sandbox` rows are **dispatching
+providers**: each method forwards to the current world's provider, where
+"current" is an `AsyncLocalStorage` set at three choke points: a prepended
+`tools/execute` waterfall listener (`within(exec.agent, next)`, no core
+patch), a prepended `agent/pre-step` listener (covers `agent-instructions`
+and `working-directory.ensure` outside tool calls), and the API gateway's
+Remote dispatch when it resolves an `Agent` or a session-scoped request (one
+patch in `packages/api/gateway`, plus a 5-line entry in `workspace-files`,
+whose `WorkspaceFileScope` names the session). Outside any world the
+dispatcher throws `NoExecutionWorldError`; there is no local fallback, which
+is the "local execution removed" rule made structural. This replaces W0's
+`exec.agent?.executionCtx ?? ctx` edits in nine tool packages: zero per-tool
+patches, and every operator-installed plugin that uses `ctx.fs` or
+`ctx.subprocess` routes remotely without knowing. Handles created inside a
+world (a `RemoteProcess`, a PTY, a text stream) close over their connection,
+so the jobs pump, terminal follow streams and `readOutput` work outside the
+ALS scope. The guard test mounts a recording fake world, runs every tool the
+standard preset registers in a remote session, and asserts each dispatched
+through that world and that no local `fs`/`subprocess`/`sandbox` provider is
+reachable from the root. v3 (W4/W5).
+
+**1. Transport.** One `SshConnection` plus helper **per host alias**, in an
+isolated child context (`ctx.isolate` over `ssh`, `fs`, `subprocess`,
+`sandbox`; `sandboxPolicy` stays shared), refcounted by the sessions bound
+to that host and disposed 60 s after the last one goes. One master per host
+rather than per session: fewer processes, one warm channel for a session's
+subagents, and the failure domain is already the host. Upstream's
+non-reconnecting semantics stay: a drop fails every in-flight call with a
+typed error (outcome unknown, never replayed), the world enters
+`disconnected`, the agent loop sees a normal tool error ("host `emu`
+unreachable; the command did not run" or "…lost mid-call; outcome unknown")
+and decides, and the next call reconnects lazily (new master and helper,
+exponential backoff capped at 30 s, a "Reconnect" action in the banner).
+A host reboot is the same path; nothing remote survives it in v3 (see 2).
+OpenSSH settings: `ServerAliveInterval=5`, `ServerAliveCountMax=2`,
+`ConnectTimeout=10`, `LogLevel=ERROR`, `leaseMs` 15000, so a dead host is
+detected within ~15 s instead of 30. Liveness in the UI: a per-session dot
+(connecting / ready / degraded / disconnected) with the host alias and the
+heartbeat round trip. Patch size: the pool and dispatcher are our package;
+`dsh-ssh` gets a bounded stderr ring (next item 12) and the login-shell
+launch (8). v3 (W5).
+
+**2. Process lifecycle.** Commands, background jobs and PTYs are helper
+children in a managed range; cancellation is `process.terminate` over the
+admin channel; the helper's lease kills orphans within 15 s of a drop. In v3
+a connection loss therefore kills every job and terminal on that host: the
+job settles `failed` with "connection lost; exit code unknown", the terminal
+shows `exited: connection lost`. Honest, and the same as upstream. **Later
+(W8): detached execution.** The helper grows a per-host daemon mode
+(`dsh-helper --daemon`, started with `systemd-run --user --scope` when
+available, else `setsid`), `process.detach(id)` reparents a job to it with
+stdout/stderr spilled to `~/.cache/cuteafd/dsh-helper/jobs/<id>/`, and
+`process.attach(id)` after a reconnect or a container restart returns the
+spill offsets, live tail and exit code. Bash background jobs and terminals
+opt in; the jobs registry records `(host, remoteJobId)` in a plugin-owned
+session event so a restored session lists and reattaches them. Not tmux: it
+is not guaranteed on a host, and it owns no exit codes or offsets.
+
+**3. File watching.** What watching does: the sidebar file tree
+(`ui-sidebar-files` → `workspaceFiles.changes`, one non-recursive directory
+watch per open node, `packages/api/workspace-files/src/changes.ts:79`) and
+`fs/observed` invalidation. The model never watches, and `workspace-changes`
+uses git. So: no recursive watches, no watching build output, and nothing an
+agent needs. Decision: `cuteafd.fs.watch {target}` / `cuteafd.fs.unwatch
+{id}` helper RPCs backed by the helper's own `fs.watch` (chokidar, already
+in `fs-local`), with a helper-to-client `cuteafd.watch.changed {id}`
+notification through the existing bidirectional peer, debounced 250 ms per
+watch, at most 64 watches per connection (the 65th fails `FS_IO_ERROR`,
+the sidebar falls back to its refresh button). Non-recursive only, as the
+consumer. W4 ships `watch` throwing unsupported (the sidebar's refresh works
+and `changes` reports `watch-unsupported`); W5 lands the helper watch. No
+polling: it costs a round trip per open directory every few seconds for a
+view nobody is looking at most of the time. v3 (W5).
+
+**4. Terminal.** Already remote: `terminal-controller` spawns through the
+world's `subprocess.spawnTerminal`, which is a helper PTY with its own SSH
+channel; resize, signals and foreground inspection are RPCs
+(`subprocess-ssh/src/index.ts:293-330`). The host keeps the recovery screen
+and scrollback, so a browser reconnect replays as today. An SSH drop kills
+the PTY (2); reconnecting to a live terminal after a drop is W8's attach.
+Nothing to patch in v3 beyond routing (0).
+
+**5. LSP.** `lsp-stdio` spawns the configured server through `ctx.subprocess`
+and reads through `ctx.fs` (`packages/lsp/lsp-stdio/src/index.ts:146-157`),
+so a server installed on the host works through the world as-is. Cost: one
+server process per language per host, seconds of startup, hundreds of MB,
+and a `command` that must exist on that host. Benefit to an agent with `rg`:
+modest (four queries). Decision: off in v3; W7 adds a per-host "language
+servers" list on the host card (command, extensions), registered through the
+world and started on first query. Later.
+
+**6. Search and reads.** `glob`/`grep` must run the host's ripgrep: patch
+`resolveRgPath` to `ctx.subprocess.resolveExecutable('rg')` (dispatched to
+the host) and, when absent, to the `rg` our helper archive ships beside the
+helper (the path arrives in `hello.cuteafd.tools.rg`). This is W4's gate
+("search runs remotely"), so it lands with W4. Reads are already one RPC
+for files up to 8 MiB (`fs.readText`, `helper.ts:185`) and a chunk stream
+above; the `read` tool is resolve + stat + read, three round trips, which
+at LAN latency is a few milliseconds (9). Binary reads go through
+`readBytes`/`readByteRange` as base64 inside the 64 MiB frame cap
+(`read_image` included). No batching API in v3; measure first (9), batch if
+the numbers say so.
+
+**7. Sandbox and approvals.** `sandbox-ssh` asks the helper to confine the
+argv with the host's own bwrap or Landlock (`helper.ts:149-154`), and
+`fs.write`/`fs.edit` carry the per-call policy the helper enforces
+(`helper.ts:228-245`). The meaning is unchanged on a remote host: file
+effects of the SSH user, confined to the session's path under
+`workspace-write`, with the `full`/`partial` enforcement fact reported in
+results. Approvals stay host-side (the UI answerer), unchanged. Danger
+levels map one to one: `danger-full-access` on a cluster host means
+"whatever the SSH user may do", including sparknest and the lock files,
+so the presets keep DSH's defaults (`workspace-write` + ask, `danger` +
+never) and the host card shows the effective preset and the "serving" tag.
+A dedicated remote user is an operator choice when registering a host, not
+v3 work. Remote sandboxing beyond file effects (network, process
+visibility) is out of scope, as upstream.
+
+**8. Environment and paths.** Launch the helper through the remote login
+shell: the exec command becomes `exec "$SHELL" -l -c '<helper command>'`
+(bash, zsh and fish all accept `-l -c`), so `/etc/profile`,
+`~/.bash_profile`/`~/.profile`, conda's and modules' exports and the user's
+PATH are what every spawned process inherits. Commands keep upstream's
+`bash -c` (`bash-local/src/index.ts:188`): interactive-only hooks (direnv,
+`.bashrc` aliases) are not present, and the prompt says so; the model can
+`source` what it needs. cwd is the header's remote path; relative paths
+resolve on the host against it; `~` is the remote home; temp is the
+host's `/tmp`. `hello` grows `cuteafd: {hostname, user, home, shell, arch,
+release, tools}` (one `helloSchema` line on the client, a few in the
+helper) for the prompt (11) and the host card. Hosts: Linux x64/arm64 and
+macOS (the helper's four targets). **Windows hosts are out of scope** (no
+helper target, no sshd PTY semantics we rely on); the host card refuses
+them at registration. v3 (W5).
+
+**9. Latency budget.** LAN RTT is ~0.2 ms and a helper RPC ~1-3 ms, so file
+tools are cheap. The expensive part is process launch: `process.prepare`,
+then one `ssh -O forward` **subprocess per stream** (stdout, stderr, stdin
+or control), each a 20-40 ms exec, then `process.start`, `process.done`
+and `process.terminate`: roughly 100-150 ms of overhead per `bash`, `rg` or
+`git` call before the command runs. Targets: fs tool ≤ 10 ms p50, process
+tool ≤ 50 ms p50 of overhead over the command itself, connection open ≤ 2 s
+on a Spark. Plan: W5 measures (table per tool, raptor→Spark and
+raptor→raptor); W6 adds `cuteafd.process.run`, a single RPC for the
+collect-mode, no-stdin, no-control spawns (bash foreground and background,
+rg, git): argv, cwd, env, caps in, outcome, bounded tails and spill paths
+out, with `cuteafd.process.output` notifications for jobs, no forwarded
+sockets at all. PTYs, LSP and PTC keep the forwarded-stream path. If
+forwards still dominate, W6 also replaces the `ssh -O forward` spawn with
+the OpenSSH mux protocol spoken directly to the control socket
+(`PROTOCOL.mux`, `MUX_C_OPEN_FWD`), about 150 lines inside
+`controlCommand`. Prefetch: open the host's connection at session create or
+restore, not at the first tool call, and `stat` the cwd then. Stop bar: the
+targets above, or a measured floor of RTT plus helper work.
+
+**10. Multiple hosts.** One host per session (the header), for v3 and
+after: a single execution world keeps every path the model sees
+unambiguous. Subagents and forks inherit the parent's header
+(`cuteafd_workspace` copied in `agents.create` meta, W0 does this for forks;
+spawn is checked in W5). No per-tool host targeting. Moving a session to
+another host is a fork with a new header plus a notice to the model that
+paths in its history refer to the old host (W9, S, only if asked for).
+Agent teams across hosts are out of scope.
+
+**11. The model's view.** A `cuteafd:remote-host` prompt section (order
+beside the persona) says: the workspace is `<path>` on host `<alias>`
+(`<hostname>`, `<os> <arch>`, user `<user>`), reached over SSH; every tool
+(bash, read, edit, glob, grep, terminal) runs on that host; the assistant's
+own machine is not accessible; there is no display or browser on the host;
+network locality is the host's (`localhost` means `<alias>`); commands run
+in a non-interactive shell with the login environment. The
+`working-directory` context line becomes `Current working directory:
+"<path>" on host <alias>` (`packages/session/working-directory/src/index.ts:172`,
+one line). Tool descriptions are not patched: the section is cheaper and
+the KV prefix stays one block. The transcript header in the UI shows the
+alias and state. v3 (W5).
+
+**12. Failure UX.** `dsh-ssh` keeps a bounded (4 KiB) ring of `ssh` stderr
+and classifies exit 255 into `unreachable` (`Connection refused`, `No route
+to host`, `Could not resolve hostname`, `timed out`), `auth-failed`
+(`Permission denied (publickey`), `host-key-changed` (`REMOTE HOST
+IDENTIFICATION HAS CHANGED`), plus our own `helper-mismatch` (digest or
+protocol) and `helper-missing` (install needed); raw stderr never reaches
+the model (it can contain paths). The session banner shows the state with
+one action: Reconnect, Re-trust (shows the new fingerprint, the card's
+confirm flow), Fix key (opens the host card), Install helper. The agent
+loop needs nothing: a tool call during `disconnected` fails fast with the
+typed message and the model answers or stops; a call that was in flight
+reports "outcome unknown". Restoring a session whose host is down opens it
+read-only with the banner; tools fail fast until reconnect. Disk full on
+the host: `fs.write` fails `FS_IO_ERROR` (ENOSPC) and spill files are
+dropped with a tail-only note (`logSpillFailure`); a helper that cannot
+create its temp root fails `hello` with a clear message. v3 (W5).
+
+**13. Change view.** `workspace-changes` snapshots the git working tree at
+turn start and end (`git add --all` into a private `GIT_INDEX_FILE`, then
+`write-tree`; `diff-tree --numstat` between the two; `cat-file` for a
+file's sides, `packages/deliverables/workspace-changes/src/git.ts:162-235`)
+and, for paths git does not cover, copies whole files around each file-tool
+edit with `node:fs` into a local temp tree (`capture.ts:41-65`,
+`recorder.ts:2`). Routing git through the world moves the commands but
+leaves the index file, the captures and the blob reads on the wrong
+machine, so W4 unmounts it in remote sessions. Decision: run upstream's
+recorder **inside the helper**. The helper already runs the local
+providers; it imports the recorder (`git.ts`, `capture.ts`, `recorder.ts`,
+exported by a `./recorder` entry we add to the package) and exposes
+`cuteafd.changes.start {session, cwd}`, `turnStart {turn}`, `observe
+{toolResult}` (the file-tool result paths), `turnEnd {turn}` → summary, and
+`diff {turn, path}` → both sides, with temp index and captures under the
+host's `/tmp`. A `cuteafd-workspace-changes-remote` host package replaces
+the `workspace-changes` row: it implements the same `workspaceChanges`
+service and `workspace/changes` session event by forwarding, so the client
+file-change view is untouched. Caps stay the recorder's (`maxFiles`,
+`fileMaxBytes`); a disconnect mid-turn abandons that turn's record, as a
+failed snapshot does today. Later (W7).
+
+**14. Skills.** `skill-filesystem` scans project roots
+(`<projectRoot>/.dsh/skills`, `<projectRoot>/.agents/skills`), user roots
+(`$DSH_HOME/skills`, `$DSH_AGENTS_HOME/skills`) and the bundled root with
+`node:fs` and chokidar (`packages/skill/skill-filesystem/src/index.ts:244-262,
+459-491`). Remotely the project roots and the remote user's own
+`~/.agents/skills` are on the host; the operator's roots in the mounted
+folder (`/data/agents/skills`, `/data/dsh/skills`) and the bundled root are
+not, and they are trusted operator content. Decision: two providers on
+`ctx.skills`. The upstream provider stays mounted with `includeDefaultRoots:
+false` and the two mounted-folder roots as custom roots (local, watched,
+unchanged). A `cuteafd-skill-remote` provider serves the remote roots:
+`<projectRoot>/.dsh/skills`, `<projectRoot>/.agents/skills` and
+`~/.agents/skills` on the host, ranked as upstream ranks them. One helper
+RPC, `cuteafd.skills.scan {roots, known: {path: mtime}}`, returns every
+`SKILL.md`'s frontmatter and mtime in one round trip and bodies only for
+entries whose mtime changed, so a scan is a few milliseconds. Refresh: at
+session start, at every `turn/start` (one RPC, cached by mtime), on the
+Skills card's refresh button, and through a `watch` on each root directory
+from W5's budget (three per session). `load()` reads the body through the
+world's `fs.readText`. The W4 interim (read once at session start) becomes
+this in W5.
+
+**Order after W0-W4.**
+
+| # | Step | Size | Gate |
+|---|------|------|------|
+| W5 | Remote correctness: execution-world dispatcher (ALS) replacing per-tool `executionCtx` edits; per-host connection pool; login-shell helper launch; `hello.cuteafd` facts; remote-host prompt section and cwd line; helper `fs.watch` replacing unsupported; remote skill provider with `skills.scan` and refresh; stderr classification, states, banner and lazy reconnect; subagent header inheritance; per-tool overhead table | M | Guard test: every standard-preset tool dispatches through the recording world, no local provider reachable; two sessions on two hosts; `bash -c 'echo $PATH'` equals `ssh host 'echo $PATH'` under a login shell; prompt names the host; killing sshd mid-call yields the typed error within 15 s, the banner, and a reconnect on the next call; the sidebar updates after a remote `touch` within 1 s; a skill added under the remote `.agents/skills` is listed on the next turn and the operator's mounted skills stay listed; overhead table recorded |
+| W6 | Latency: `cuteafd.process.run` one-RPC path for collect-mode spawns with `process.output` job notifications; mux-protocol forwards if forwards still dominate; connection prefetch at session open | M | Overhead before → after per tool on raptor→Spark; bash ≤ 50 ms p50, fs ≤ 10 ms p50, or a measured floor; byte-identical tool results to the forwarded path on recorded sessions |
+| W7 | Change view in the helper (`changes.*` RPCs running upstream's recorder on the host, forwarding `workspaceChanges` service); LSP on the host: per-host language-server list on the host card, `lsp-stdio` through the world, off by default | M | A turn that edits tracked, untracked and ignored files on a Spark shows the same summary and diffs as a local session on the same repo; no temp files left in the container; goToDefinition and findReferences on a Rust and a TS repo on a Spark; no server process when the list is empty |
+| W8 | Detached execution: helper daemon mode, `process.detach`/`attach`, spill directory, job and terminal reattach after reconnect and container restart | L | A 10-minute job survives `ssh -O exit`, a container restart and a reconnect; its output and exit code are read back; orphan count on the host is zero after the session ends |
+| W9 | Host move: fork a session onto another host with a model notice | S | Paths in the fork's history are flagged; tools run on the new host |
+
+**What the helper grows (ours, in the fork)** versus plain OpenSSH:
+- Helper RPCs, all under a `cuteafd.` prefix handled by one
+  `helper-cuteafd.ts` module that upstream `helper.ts` calls through a
+  three-line hook, so a rebase re-applies one hook: `fs.watch`/`fs.unwatch`
+  with `watch.changed` notifications, `skills.scan` and `hello.cuteafd`
+  facts (W5); `process.run` and `process.output` (W6); `changes.*` running
+  the upstream recorder on the host (W7); daemon mode with
+  `process.detach`/`attach` (W8). Protocol version stays upstream's; our
+  capabilities are advertised in `hello`.
+- Archive contents: `rg` beside the helper (W4), later the daemon
+  launcher. We build the archive in the sidecar image build (the fork
+  already builds helpers) and pin its hash there; first connect installs it
+  to `~/.cache/cuteafd/dsh-helper/<version>/` over the same SSH alias.
+- Client side in `dsh-ssh`: login-shell launch, stderr ring and
+  classification, `helloSchema` extension, tuned keepalive and lease, and
+  (W6) mux-protocol forwards. Everything else, connection pooling, the
+  dispatcher, states, banner, prompt section and host card, lives in
+  `packages/cuteafd/*`.
+- Plain OpenSSH does the rest: `ControlMaster`, `ServerAlive*`,
+  `ConnectTimeout`, `IdentitiesOnly`, per-alias `UserKnownHostsFile`,
+  `StrictHostKeyChecking=yes`, `BatchMode`, `ForwardAgent=no`.
+
+**Rebase risks and how the patches stay small.** The core touches are the
+session header field (done), the gateway ALS entry, `workspace-files`'s
+entry, `tool-fs-search`'s `rg` resolution, the `working-directory` line, and
+the three `dsh-ssh` client changes; each is its own commit prefixed
+`cuteafd:` and under 40 lines. Everything with real logic is a new package
+under `packages/cuteafd/*` or the `helper-cuteafd.ts` module. The risks:
+upstream reworking `SshConnection` or the helper protocol (our RPCs are
+namespaced and hook in at one line, but a protocol-version bump means
+rebuilding and reinstalling helpers, which first-connect install handles);
+upstream adding its own `watch` or reconnect (we drop ours); the preset
+registry changing how tools capture `ctx` (irrelevant to the dispatcher,
+which sits below the tools); `ToolRuntime` ceasing to expose `tools/execute`
+as a waterfall (then the dispatcher enters from `agent/pre-step` alone and
+one core patch around dispatch). `dsh-smoke.sh` runs the guard test and one
+remote task on every rebase.
+
+**Decisions for TJ (with recommendations).**
+1. Connection per host (shared by its sessions) or per session?
+   *Per host*: fewer processes, warm for subagents, same failure domain.
+2. Detached jobs (W8) through our helper daemon, or tmux? *Helper daemon*,
+   with `systemd-run --user` when present; tmux owns no offsets or exit
+   codes and may be missing.
+3. Default preset on cluster hosts: *`workspace-write` + ask everywhere*;
+   `danger-full-access` is an explicit per-session switch, as in DSH.
+4. LSP: *off by default*, per-host opt-in in W7.
+5. Keepalive and lease at 15 s detection (a 5 s keepalive on every idle
+   connection)? *Yes*; the chatter is negligible on the LAN.
+6. macOS hosts allowed at registration? *Yes* (the helper supports them);
+   Windows refused.
+7. Replace W0's per-tool `executionCtx` edits with the ALS dispatcher now,
+   before W4's gate? *Yes*: it is less code, it covers operator-installed
+   plugins, and the guard test is only writable against it.
+
 ### Staged steps and gates
 
 | # | Step | Size | Needs phase B | Gate |
