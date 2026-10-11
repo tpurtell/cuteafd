@@ -48,7 +48,7 @@ pub fn request(inputs: &QwenInputs<'_>, graph_bytes: u64) -> anyhow::Result<Plac
             kind: if kind == Qwen4Attention::Full { AttentionClass::Gqa } else { AttentionClass::Gdn },
             weights: ModeBytes::default(),
             kv_unit: KvDemand { unit_bytes_whole: bytes - previous, ..Default::default() },
-            fixed_bytes: ModeBytes::default(), context_indexer: false, colocate: None,
+            fixed_bytes: ModeBytes::default(), extra: Vec::new(), context_indexer: false, colocate: None,
             experts: None,
             modes: vec![whole],
         });
@@ -283,6 +283,26 @@ pub fn dual_projection_load_staging(cfg: &crate::families::qwen4::Qwen4Config, l
         "FP8 projection load staging", bytes, Basis::Formula)).collect()
 }
 
+/// PLE backing and its device scale follow the owning whole-width layer.
+/// Host-preloaded and mapped tables retain only the scale on the GPU.
+pub fn dual_ple_demands(cfg: &crate::families::qwen4::Qwen4Config, layers: usize,
+    resident: &crate::families::qwen4::resident::Qwen4CheckpointResident,
+    device_backing: bool) -> anyhow::Result<Vec<Vec<LayerExtraDemand>>> {
+    anyhow::ensure!(layers <= cfg.layers && cfg.ple_layers.len() <= 1,
+        "Qwen PLE demands need a backbone prefix and at most one table");
+    let mut demands = vec![Vec::new(); layers];
+    if let Some(&layer) = cfg.ple_layers.first().filter(|&&layer| layer < layers) {
+        anyhow::ensure!(resident.ple_table_bytes > 0, "Qwen PLE layer {layer} has no table backing headers");
+        if device_backing {
+            demands[layer].push(LayerExtraDemand::new(Category::Tables, "PLE table", resident.ple_table_bytes,
+                LayerResidency::Owner, Basis::Exact));
+        }
+        demands[layer].push(LayerExtraDemand::new(Category::Tables, "PLE scale", 256,
+            LayerResidency::Owner, Basis::Formula));
+    }
+    Ok(demands)
+}
+
 /// Admission contract for the private whole-owner executor. Unlike the legacy
 /// single-owner path, layer weights and routed halves are future allocations;
 /// both baselines must be sampled before loading them. The public selector
@@ -292,7 +312,9 @@ pub struct QwenDualInputs<'a> {
     pub gpus: [GpuBudget; 2],
     pub layer_weights: &'a [u64],
     pub layer_experts: &'a [Option<ExpertCost>],
-    /// Head, MTP weights/experts, embedding, PLE table and exact transport
+    /// Owner-local side allocations, such as device PLE backing and its scale.
+    pub layer_extra: &'a [Vec<LayerExtraDemand>],
+    /// Head, MTP weights/experts, embedding and exact transport
     /// buffers. Head/MTP are owner-only groups, not paired rank groups.
     pub fixed: Vec<Demand>,
     pub tp2_workspace: [u64; 2],
@@ -311,7 +333,8 @@ const DUAL_WHOLE: [LayerMode; 2] = [LayerMode::Whole { gpu: 0, ffn: FfnMode::Own
 pub fn dual_request(inputs: &QwenDualInputs<'_>, graph_bytes: [u64; 2]) -> anyhow::Result<PlacementRequest> {
     let a = &inputs.admission;
     anyhow::ensure!(a.layers > 1 && a.layers <= a.cfg.layers
-        && inputs.layer_weights.len() == a.layers && inputs.layer_experts.len() == a.layers,
+        && inputs.layer_weights.len() == a.layers && inputs.layer_experts.len() == a.layers
+        && inputs.layer_extra.len() == a.layers,
         "Qwen dual demands must name every backbone layer");
     anyhow::ensure!(a.future_expert_bytes == 0, "Qwen dual experts must be solver-owned TP2 halves");
     anyhow::ensure!(inputs.layer_experts.iter().flatten().all(|cost| cost.tp2),
@@ -330,7 +353,8 @@ pub fn dual_request(inputs: &QwenDualInputs<'_>, graph_bytes: [u64; 2]) -> anyho
             weights: ModeBytes::replicated(inputs.layer_weights[index]),
             kv_unit: KvDemand { unit_bytes_whole: current.persistent_unit_bytes - previous.persistent_unit_bytes,
                 ..Default::default() },
-            fixed_bytes: ModeBytes::replicated(state), context_indexer: false, colocate: None,
+            fixed_bytes: ModeBytes::replicated(state), extra: inputs.layer_extra[index].clone(),
+            context_indexer: false, colocate: None,
             experts: inputs.layer_experts[index], modes: DUAL_WHOLE.to_vec(),
         });
         previous = current;
@@ -440,6 +464,66 @@ mod tests {
             assert!(!demands.iter().any(|d| d.category == Category::Tables || d.category == Category::Experts));
         }
         assert!(dual_owner0_weights(&Qwen4CheckpointResident::default(), false).is_empty());
+    }
+
+    #[test]
+    fn qwen_dual_ple_demands_charge_only_selected_device_backing() {
+        use crate::families::qwen4::resident::Qwen4CheckpointResident;
+        let mut cfg = Qwen4Config::from_hf(&crate::plan::testing::qwen4_config(4)).unwrap();
+        cfg.ple_layers = vec![1];
+        let resident = Qwen4CheckpointResident { ple_table_bytes: 123_456, ..Default::default() };
+        for device in [false, true] {
+            let demands = dual_ple_demands(&cfg, 4, &resident, device).unwrap();
+            assert!(demands.iter().enumerate().all(|(layer, extra)| layer == 1 || extra.is_empty()));
+            assert_eq!(demands[1].iter().map(|d| d.bytes).sum::<u64>(), 256 + if device { 123_456 } else { 0 });
+            assert!(demands[1].iter().all(|d| d.category == Category::Tables && d.residency == LayerResidency::Owner));
+        }
+        assert!(dual_ple_demands(&cfg, 1, &resident, true).unwrap()[0].is_empty());
+        assert!(dual_ple_demands(&cfg, 4, &Qwen4CheckpointResident::default(), false).is_err());
+        let resident = Qwen4CheckpointResident { ple_table_bytes: u64::MAX, ..Default::default() };
+        assert_eq!(dual_ple_demands(&cfg, 4, &resident, true).unwrap()[1][0].bytes, u64::MAX);
+    }
+
+    #[test]
+    fn qwen_cutover_moves_ple_table_and_scale_to_the_selected_owner() {
+        let mut cfg = Qwen4Config::from_hf(&crate::plan::testing::qwen4_config(4)).unwrap();
+        cfg.ple_layers = vec![1];
+        cfg.ple_dim = 2560;
+        let resident = crate::families::qwen4::resident::Qwen4CheckpointResident {
+            ple_table_bytes: 1 << 30, ..Default::default() };
+        let extra = dual_ple_demands(&cfg, 4, &resident, true).unwrap();
+        let inputs = QwenInputs {
+            admission: QwenAdmissionInputs { cfg: &cfg, layers: 4, mtp: false, kv_format: Qwen4KvCache::Bf16,
+                manifest: None, prefill_rows: 4096, slots: 16, mark_bytes: 0, full_prefill_logits: 0,
+                ple: None, future_expert_bytes: 0, headroom: 0 },
+            capacity_bytes: 96 << 30, baseline: Baseline::Measured { free_bytes: 96 << 30 },
+            pending_code_bytes: 0, max_context: 131072, requested_pool: Some(2 << 20), spark_ranks: 0,
+            startup_graph_modes: None,
+        };
+        let mut req = request(&inputs, 0).unwrap();
+        req.inventory.gpus = vec![req.inventory.gpus[0]; 2];
+        req.inventory.peer_access = true;
+        req.attention_placement = Some(AttentionPlacement::Layers);
+        req.executor = ExecutorModes { family: "qwen4", modes: &DUAL_WHOLE, hops: true };
+        req.policy.default = DUAL_WHOLE.to_vec();
+        req.fixed.clear();
+        req.pool_overhead = vec![0; 2];
+        for (layer, extra) in req.layers.iter_mut().zip(extra) {
+            layer.modes = DUAL_WHOLE.to_vec();
+            layer.kv_unit = ModeBytes::replicated((1 << 30) / 4096).into();
+            layer.extra = extra;
+        }
+        for (entry, cut, owner) in [(0, 2, 0), (4 << 30, 1, 1)] {
+            req.fixed = vec![Demand::new(0, Category::Weights, "entry", entry, Basis::Exact)];
+            let placement = solve(&req).unwrap();
+            assert_eq!(placement.pool_tokens, 2 << 20);
+            assert_eq!(placement.layers.iter().take_while(|l| l.mode == DUAL_WHOLE[0]).count(), cut);
+            assert_eq!(placement.layers[1].mode, DUAL_WHOLE[owner]);
+            for gpu in 0..2 {
+                assert_eq!(placement.items[gpu].iter().filter(|i| i.category == Category::Tables)
+                    .map(|i| i.bytes).sum::<u64>(), if gpu == owner { (1 << 30) + 256 } else { 0 });
+            }
+        }
     }
 
     #[test]
@@ -570,14 +654,20 @@ mod tests {
     #[test]
     fn planner_equals_runtime_qwen4_dual_contract() {
         use crate::serving_capacity::qwen_graphs::qwen_cache_geometry_placed;
-        let cfg = Qwen4Config::from_hf(&crate::plan::testing::qwen4_config(48)).unwrap();
+        let mut cfg = Qwen4Config::from_hf(&crate::plan::testing::qwen4_config(48)).unwrap();
+        cfg.ple_layers = vec![23];
+        cfg.ple_dim = 2560;
+        let resident = crate::families::qwen4::resident::Qwen4CheckpointResident {
+            ple_table_bytes: 2 << 30, ple_row_bytes: 160, ..Default::default() };
         let weights = vec![100 << 20; 48];
         let experts = vec![Some(ExpertCost { whole: Bytes2::default(),
             half: [Bytes2 { resident: 600 << 20, staging: 64 << 20 }, Bytes2 { resident: 400 << 20, staging: 32 << 20 }],
             tp2: true, spark_ok: true }); 48];
-        for (kv_format, wire, fp8_projections) in [Qwen4KvCache::Bf16, Qwen4KvCache::Fp8].into_iter()
+        for (kv_format, wire, fp8_projections, device_table) in [Qwen4KvCache::Bf16, Qwen4KvCache::Fp8].into_iter()
             .flat_map(|kv| [false, true].into_iter().flat_map(move |wire|
-                [false, true].map(|fp8| (kv, wire, fp8)))) {
+                [false, true].into_iter().flat_map(move |fp8|
+                    [false, true].map(|device| (kv, wire, fp8, device))))) {
+            let layer_extra = dual_ple_demands(&cfg, 48, &resident, device_table).unwrap();
             let transport = QwenTp2Rows::new(cfg.hidden as u64, cfg.topk as u64, 4096, wire).unwrap()
                 .demands().unwrap();
             let staging = dual_projection_load_staging(&cfg, 48, false,
@@ -591,7 +681,7 @@ mod tests {
                 gpus: [0, 1].map(|_| GpuBudget { capacity_bytes: 96 << 30, headroom_bytes: 3 << 30,
                     baseline: if measured { Baseline::Measured { free_bytes: (96 << 30) - (512 << 20) } }
                         else { Baseline::Planned { context_bytes: 512 << 20, loaded_bytes: 0 } } }),
-                layer_weights: &weights, layer_experts: &experts,
+                layer_weights: &weights, layer_experts: &experts, layer_extra: &layer_extra,
                 fixed: fixed.clone(),
                 tp2_workspace: [128 << 20, 96 << 20], pending_code_bytes: [64 << 20; 2], mark_slots: 18,
                 max_context: 131072, requested_pool: Some(2 << 20), spark_ranks: 0, onboard: Onboard::Auto,
@@ -614,6 +704,11 @@ mod tests {
                 LayerMode::Whole { gpu, .. } => usize::from(gpu), _ => unreachable!(),
             }).collect::<Vec<_>>();
             check_dual_layer_owners(&owners).unwrap();
+            for gpu in 0..2 {
+                let tables = planned.items[gpu].iter().filter(|item| item.category == Category::Tables)
+                    .map(|item| item.bytes).sum::<u64>();
+                assert_eq!(tables, if gpu == owners[23] { 256 + if device_table { 2 << 30 } else { 0 } } else { 0 });
+            }
             assert_eq!(planned.hops.len(), 2);
             let req = dual_request(&inputs(false), [0; 2]).unwrap();
             let geometry = qwen_cache_geometry_placed(&cfg, &owners, false, kv_format).unwrap();

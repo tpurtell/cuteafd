@@ -18,7 +18,7 @@ fn request(gpus: usize, free: u64, layers: usize, sparks: usize, onboard: Onboar
         pool: PoolPolicy::resolve(&vec![96 * GIB; gpus], 131_072, None, 256, sparks == 0),
         layers: (0..layers).map(|_| LayerDemand { kind: AttentionClass::Csa, weights: ModeBytes::default(),
             kv_unit: ModeBytes::default().into(), colocate: None,
-            fixed_bytes: ModeBytes::default(), context_indexer: false,
+            fixed_bytes: ModeBytes::default(), extra: Vec::new(), context_indexer: false,
             experts: Some(ExpertCost { whole: Bytes2 { resident: GIB, staging: GIB / 4 }, half: [Bytes2::default(); 2], tp2: false, spark_ok: true }),
             modes: vec![LayerMode::HeadSplit, LayerMode::Whole { gpu: 0, ffn: FfnMode::Owner }] }).collect(),
         pool_overhead: vec![UNIT; gpus],
@@ -843,6 +843,45 @@ fn owner_balance_request() -> PlacementRequest {
 fn owner_cut(req: &PlacementRequest) -> usize {
     let p = solve(req).unwrap();
     p.layers.iter().take_while(|layer| layer.mode == S0).count()
+}
+
+#[test]
+fn layer_extra_rows_follow_the_cutover_and_reduce_available_pool() {
+    let mut req = owner_balance_request();
+    req.layers[1].extra = vec![LayerExtraDemand::new(Category::Tables, "side table", GIB,
+        LayerResidency::Owner, Basis::Exact)];
+    let first = solve(&req).unwrap();
+    assert_eq!(owner_cut(&req), 2);
+    assert!(first.items[0].iter().any(|i| i.category == Category::Tables && i.group == "side table" && i.bytes == GIB));
+    assert!(!first.items[1].iter().any(|i| i.group == "side table"));
+    req.fixed.push(Demand::new(0, Category::Weights, "entry weights", 4 * GIB, Basis::Exact));
+    let moved = solve(&req).unwrap();
+    assert_eq!(owner_cut(&req), 1);
+    assert!(moved.items[1].iter().any(|i| i.group == "side table" && i.bytes == GIB));
+    assert!(!moved.items[0].iter().any(|i| i.group == "side table"));
+    req.layers[1].extra[0].bytes = 8 * GIB;
+    req.fixed.clear();
+    // A large side table participates in the primary owner balance, not just
+    // the final charge: k2 has 12/4 GiB, better than k1's 2/14 or k0's 0/16.
+    assert_eq!(owner_cut(&req), 2);
+    req.layers[0].extra = std::mem::take(&mut req.layers[1].extra);
+    assert_eq!(owner_cut(&req), 1);
+    req.layers[1].extra = std::mem::take(&mut req.layers[0].extra);
+    req.attention_placement = Some(AttentionPlacement::Heads);
+    req.layers[1].extra[0].bytes = GIB;
+    assert!(matches!(solve(&req), Err(PlacementError::OwnerDemand { layer: 1, .. })));
+    req.layers[1].extra[0].residency = LayerResidency::Replicated;
+    let split = solve(&req).unwrap();
+    assert!(split.items.iter().all(|rank| rank.iter().any(|i| i.group == "side table" && i.bytes == GIB)));
+    req.inventory.gpus.iter_mut().for_each(|gpu| gpu.baseline = Baseline::Measured { free_bytes: 2 * GIB });
+    req.pool.target = 2 << 20;
+    req.pool.floor = 1;
+    let limited = solve(&req).unwrap();
+    assert_eq!(limited.pool_tokens, GIB / (UNIT / 4) * 256);
+    req.layers[1].extra[0].bytes = u64::MAX;
+    req.layers[1].extra.push(LayerExtraDemand::new(Category::Tables, "scale", 256,
+        LayerResidency::Replicated, Basis::Formula));
+    assert!(matches!(solve(&req), Err(PlacementError::Overflow(_))));
 }
 
 #[test]

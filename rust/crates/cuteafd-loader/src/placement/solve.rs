@@ -125,6 +125,13 @@ fn solve_once(request: &PlacementRequest, flips: &[(AttentionClass, AttentionPla
             .find(|mode| layer.modes.contains(mode) && executable(*mode, gpus, split) && executor.runs(*mode))
             .ok_or_else(|| PlacementError::NoMode { layer: index, allowed: layer.modes.clone() })
     }).collect::<Result<Vec<_>, _>>()?;
+    for (index, (layer, &mode)) in request.layers.iter().zip(&modes).enumerate() {
+        if !matches!(mode, LayerMode::Whole { .. }) {
+            if let Some(demand) = layer.extra.iter().find(|d| d.residency == LayerResidency::Owner) {
+                return Err(PlacementError::OwnerDemand { layer: index, group: demand.group.clone(), mode });
+            }
+        }
+    }
     // Residual homes and the hops the modes imply (one GPU never hops).
     let (residual, hops) = residual_plan(&modes, &request.hops, gpus);
     if let Some(hop) = hops.iter().find(|h| h.at != HopPoint::Entry).filter(|_| !executor.hops) {
@@ -166,6 +173,16 @@ fn solve_once(request: &PlacementRequest, flips: &[(AttentionClass, AttentionPla
     }
     for (gpu, &bytes) in layer_fixed.iter().enumerate() {
         if bytes > 0 { charge(&mut items, &mut used, gpu, Item::new(Category::Kv, "layer state and marks", "", bytes, Basis::Formula))?; }
+    }
+    for (layer, &mode) in request.layers.iter().zip(&modes) {
+        for demand in &layer.extra {
+            for gpu in 0..gpus {
+                if demand.on_gpu(mode, gpu) {
+                    charge(&mut items, &mut used, gpu,
+                        Item::new(demand.category, demand.group.clone(), "", demand.bytes, demand.basis))?;
+                }
+            }
+        }
     }
     // Hop receive buffers are fixed demands of the modes (charged before the pool).
     let hop_bytes = hop_buffer_bytes(&hops, &request.hops, gpus).ok_or(Overflow("hop buffers"))?;
@@ -409,6 +426,10 @@ fn layer_switch(request: &PlacementRequest, selected: &impl Fn(&LayerDemand) -> 
             kv[gpu] = kv[gpu].checked_add(layer.kv_unit.unit_bytes_whole).ok_or(PlacementError::Overflow("owned KV bytes"))?;
             fixed[gpu] = fixed[gpu].checked_add(layer.fixed_bytes.whole).and_then(|n| n.checked_add(layer.weights.whole))
                 .ok_or(PlacementError::Overflow("owned state and weights"))?;
+            for demand in &layer.extra {
+                fixed[gpu] = fixed[gpu].checked_add(demand.bytes)
+                    .ok_or(PlacementError::Overflow("owned layer extras"))?;
+            }
         }
         let mut owned = [0u64; 2];
         for gpu in 0..2 { owned[gpu] = kv[gpu].checked_mul(request.pool.wanted_units()).and_then(|b| b.checked_add(fixed[gpu]))
@@ -427,6 +448,14 @@ fn layer_switch(request: &PlacementRequest, selected: &impl Fn(&LayerDemand) -> 
                 } else { (layer.kv_unit.unit_bytes_split[g], layer.fixed_bytes.split[g], layer.weights.split[g]) };
                 pool_bytes[g] = pool_bytes[g].checked_add(bytes).ok_or(PlacementError::Overflow("ownership pool"))?;
                 base[g] = base[g].checked_add(state).and_then(|n| n.checked_add(weights)).ok_or(PlacementError::Overflow("ownership fixed"))?;
+                let mode = if selected(layer) { LayerMode::Whole { gpu: owner as u8, ffn: FfnMode::Owner } }
+                    else { LayerMode::HeadSplit };
+                for demand in &layer.extra {
+                    if demand.on_gpu(mode, g) {
+                        base[g] = base[g].checked_add(demand.bytes)
+                            .ok_or(PlacementError::Overflow("ownership layer extras"))?;
+                    }
+                }
             }
         }
         let fit = (0..request.inventory.gpus.len()).filter(|&g| pool_bytes[g] > 0).map(|g|

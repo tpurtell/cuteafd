@@ -103,10 +103,11 @@ pub(super) fn dual_experts(args: &EngineArgs, catalog: &cuteafd_loader::Official
 }
 
 /// Checkpoint-native whole-layer storage plus entry-owner operands, planned
-/// before allocations. PLE placement and draft experts are separate demands.
+/// before allocations. PLE follows its layer; draft experts remain separate.
 pub(super) struct DualWeightPlan {
     pub resident: cuteafd_loader::families::qwen4::resident::Qwen4CheckpointResident,
     pub fixed: Vec<cuteafd_loader::placement::Demand>,
+    pub layer_extra: Vec<Vec<cuteafd_loader::placement::LayerExtraDemand>>,
 }
 
 pub(super) fn dual_weights(args: &EngineArgs, checkpoint: &cuteafd_loader::plan::Checkpoint,
@@ -117,7 +118,9 @@ pub(super) fn dual_weights(args: &EngineArgs, checkpoint: &cuteafd_loader::plan:
     let mut fixed = qwen4::dual_owner0_weights(&resident,
         args.token_io.embed_placement == crate::shared::token_io::EmbedPlacement::Host);
     fixed.extend(qwen4::dual_projection_load_staging(cfg, layers, mtp, selected));
-    Ok(DualWeightPlan { resident, fixed })
+    let layer_extra = qwen4::dual_ple_demands(cfg, layers, &resident,
+        args.table_placement == crate::shared::mapped_table::TablePlacement::Device)?;
+    Ok(DualWeightPlan { resident, fixed, layer_extra })
 }
 
 #[cfg(test)]
@@ -177,7 +180,9 @@ mod tests {
             engine: super::super::EngineArgs,
         }
         let dir = tempfile::tempdir()?;
-        let config = testing::qwen4_config(2);
+        let mut config = testing::qwen4_config(2);
+        config["text_config"]["ple_layer_ids"] = serde_json::json!([2]);
+        config["text_config"]["ple_embed_dim"] = serde_json::json!(2560);
         let cfg = cuteafd_loader::families::qwen4::Qwen4Config::from_hf(&config)?;
         let mut tensors = Vec::new();
         for layer in 0..2 {
@@ -191,6 +196,8 @@ mod tests {
             testing::t("model.language_model.hyper_connection_mixer.hc_norm.weight", "BF16", &[2560]),
             testing::t("model.language_model.embed_tokens.weight", "BF16", &[64, 2560]),
             testing::t("lm_head.weight", "BF16", &[64, 2560]),
+            testing::t("model.language_model.layers.1.ple.ple_embedding.ngram_embedding.shard_0.weight",
+                "F8_E4M3", &[100, 160]),
         ]);
         testing::write_snapshot(dir.path(), &config, &tensors, None);
         let checkpoint = cuteafd_loader::plan::Checkpoint::open(dir.path())?;
@@ -218,6 +225,18 @@ mod tests {
                 }
                 assert!(plan.fixed.iter().filter(|d| d.category != cuteafd_core::memory_layout::Category::Staging)
                     .all(|d| d.gpu == 0));
+                for placement in [crate::shared::mapped_table::TablePlacement::Device,
+                    crate::shared::mapped_table::TablePlacement::HostPreload,
+                    crate::shared::mapped_table::TablePlacement::Mapped] {
+                    args.table_placement = placement;
+                    let plan = super::dual_weights(&args, &checkpoint, &cfg, 2, false)?;
+                    assert_eq!(plan.layer_extra.len(), 2);
+                    assert!(plan.layer_extra[0].is_empty());
+                    assert_eq!(plan.layer_extra[1].iter().map(|d| d.bytes).sum::<u64>(),
+                        256 + if placement == crate::shared::mapped_table::TablePlacement::Device { 16_000 } else { 0 });
+                    assert!(plan.layer_extra[1].iter().all(|d| d.category == cuteafd_core::memory_layout::Category::Tables
+                        && d.residency == cuteafd_loader::placement::LayerResidency::Owner));
+                }
             }
         }
         Ok(())

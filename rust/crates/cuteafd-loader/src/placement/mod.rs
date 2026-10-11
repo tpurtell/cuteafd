@@ -132,6 +132,8 @@ pub struct LayerDemand {
     pub kv_unit: KvDemand,
     /// Active state and prefix marks: replicated under context, owned under layers.
     pub fixed_bytes: ModeBytes,
+    /// Side tables or other named allocations that follow this layer's mode.
+    pub extra: Vec<LayerExtraDemand>,
     /// Whether this context layer exchanges a new candidate list.
     pub context_indexer: bool,
     /// Layers sharing an indexer/source must keep the same whole-layer owner.
@@ -140,6 +142,38 @@ pub struct LayerDemand {
     pub experts: Option<ExpertCost>,
     /// The modes this build can execute for the layer, in preference order.
     pub modes: Vec<LayerMode>,
+}
+
+/// Residency of a layer's side allocation, independent of expert placement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LayerResidency {
+    /// Only the whole-width layer owner; split modes have no unique owner.
+    Owner,
+    /// The whole owner, or one full copy on each rank of a split layer.
+    Replicated,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LayerExtraDemand {
+    pub category: Category,
+    pub group: String,
+    pub bytes: u64,
+    pub residency: LayerResidency,
+    pub basis: Basis,
+}
+
+impl LayerExtraDemand {
+    pub fn new(category: Category, group: impl Into<String>, bytes: u64,
+        residency: LayerResidency, basis: Basis) -> Self {
+        Self { category, group: group.into(), bytes, residency, basis }
+    }
+
+    pub(crate) fn on_gpu(&self, mode: LayerMode, gpu: usize) -> bool {
+        match mode {
+            LayerMode::Whole { gpu: owner, .. } => usize::from(owner) == gpu,
+            LayerMode::HeadSplit | LayerMode::ContextSplit => self.residency == LayerResidency::Replicated,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -442,6 +476,8 @@ pub enum PlacementError {
     NoMode { layer: usize, allowed: Vec<LayerMode> },
     #[error("{family} cannot run layer {layer} as {mode:?}")]
     UnsupportedMode { family: &'static str, layer: usize, mode: LayerMode },
+    #[error("layer {layer} demand {group} needs a unique owner, unavailable under {mode:?}")]
+    OwnerDemand { layer: usize, group: String, mode: LayerMode },
     #[error("{family} cannot run the residual hop {hop:?}")]
     UnsupportedHop { family: &'static str, hop: Hop },
     #[error("{family} cannot run attention placement {mode}: {reason}")]

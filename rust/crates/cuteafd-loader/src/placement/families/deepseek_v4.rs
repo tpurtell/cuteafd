@@ -175,7 +175,7 @@ pub fn request(inputs: &V4Inputs<'_>) -> Result<PlacementRequest, PlacementError
             weights: ModeBytes::default(),
             kv_unit: KvDemand { unit_bytes_whole: unit, unit_bytes_split: [unit; 2],
                 unit_bytes_context: (inputs.cfg.compress_ratios[layer] == 4).then_some([unit.div_ceil(2), unit / 2]) },
-            colocate: None, fixed_bytes: ModeBytes::default(),
+            colocate: None, fixed_bytes: ModeBytes::default(), extra: Vec::new(),
             context_indexer: inputs.cfg.compress_ratios[layer] == 4,
             experts,
             modes: if gpus == 2 { vec![LayerMode::HeadSplit] } else { vec![LayerMode::Whole { gpu: 0, ffn: FfnMode::Owner }] },
