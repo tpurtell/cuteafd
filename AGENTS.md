@@ -109,7 +109,9 @@ before → after tables with conditions.
   `scripts/build/assert-build-filesystem.py` on every path first. Never reuse a
   Cargo cache that has seen filesystem errors.
 - Initialize submodules recursively at their pinned commits in every fresh
-  worktree before building or testing. Hold `build.lock` only while compiling.
+  worktree before building or testing. Compile through
+  `scripts/build/build-slot.sh CMD` (three niced -j16 slots; slot 0 is
+  `build.lock`, which wip.sh and build.sh take), held only while compiling.
 - `./wip.sh --slot S --role both` for iteration, `./run.sh --wip S
   --restart` to launch; `./build.sh` and `./run.sh` for
   release images. Slots isolate artifacts, not GPUs or ports: serialize
