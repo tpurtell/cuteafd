@@ -48,18 +48,24 @@ pub(super) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
             options.glmf_mark_lanes.unwrap_or(sequences), options.mimo_prefix_entries,
             geometry.ranks.iter().map(|r| r.retained_mark_bytes).sum(), options.mimo_prefix_mark_bytes));
         let shared = if options.glmf_shared_replay { crate::serving_capacity::glm_flash_kda_replay_bytes_rows(&cfg, cfg.layers, ranks, decode_rows)? } else { 0 };
-        let mut workspace = manifest.and_then(|m| glmf_step_workspace(m, checkpoint, &report.placement,
-            lanes, rows, context, decode_rows, shared, options.glmf_index == crate::serving_capacity::GlmfIndexCache::Compact,
-            ranks == 2, representation, options.glmf_prefill_expanded, available.is_some(), options.glmf_kda_fp32_partials));
-        if workspace.is_none() && manifest.is_some() {
+        let step_workspace = |placement: &ExpertPlacement, lanes| manifest.and_then(|m|
+            glmf_step_workspace(m, checkpoint, placement, lanes, rows, context, decode_rows, shared,
+                options.glmf_index == crate::serving_capacity::GlmfIndexCache::Compact,
+                ranks == 2, representation, options.glmf_prefill_expanded, available.is_some(), options.glmf_kda_fp32_partials));
+        let mut workspace = step_workspace(&report.placement, lanes);
+        let mut local_workspace = step_workspace(&ExpertPlacement::Local, 1);
+        if (workspace.is_none() || local_workspace.is_none()) && manifest.is_some() {
             anyhow::bail!("GLM Flash program manifest lacks the requested step scratch geometry");
         }
         if workspace.is_none() {
             notes.push("GLM Flash workspace estimate needs --workspace-manifest for qualification".into());
-            workspace = Some((0..ranks).map(|_| (if ranks == 1 { gib(268) } else { gib(472) })
-                * (lanes * rows).max(8192) / 8192).collect());
+            let estimate = |lanes: u64| (0..ranks).map(|_| (if ranks == 1 { gib(268) } else { gib(472) })
+                * (lanes * rows).max(8192) / 8192).collect();
+            workspace = Some(estimate(lanes));
+            local_workspace = Some(estimate(1));
         }
         let mut workspace = workspace.unwrap();
+        let mut local_workspace = local_workspace.unwrap();
         if checkpoint.tensors.iter().any(|t| t.meta.name.ends_with("mlp.gate_proj.weight") && t.meta.dtype == cuteafd_core::DType::U8) {
             let dense = options.glmf_dense_manifest.as_ref().and_then(|p| std::fs::read(p).ok())
                 .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
@@ -67,6 +73,7 @@ pub(super) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
                 .or_else(|| placement::inventory::dense_package_scratch(&placement::inventory::image_lib(options.workspace_manifest.as_deref()), "glmfdense", max_rows, glmf::nvfp4_a4()))
                 .ok_or_else(|| anyhow::anyhow!("dense NVFP4 package scratch manifest missing"))?;
             workspace[0] += dense + 8 * max_rows;
+            local_workspace[0] += dense + 8 * max_rows;
         }
         let draft_sms: Vec<_> = options.rtx_bytes[..ranks].iter().map(|&total|
             options.physical_sms.unwrap_or(placement::ArchContext::coordinator(total, None).sms) as u64).collect();
@@ -106,14 +113,18 @@ pub(super) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
             decode_rows, partial_bytes: if options.glmf_kda_fp32_partials { 4 } else { 2 }, max_context: context, sequences, speculation: draft > 0, state_slots: options.state_slots.unwrap_or(sequences.max(8)),
             mark_slots: marks, pool_marks: options.glmf_pool_marks && options.mimo_prefix_entries > 0,
             index: options.glmf_index, kda_state_bytes: 4, shared_replay: options.glmf_shared_replay, representation,
-            resident, router_replica_bytes: router, workspace, graphs, experts,
+            resident, router_replica_bytes: router, workspace, local_workspace, graphs, experts,
             expert_workspace: if ranks == 1 { available.unwrap_or(0) } else { 0 },
             tp2_workspace: if ranks == 2 { [available.unwrap_or(0); 2] } else { [0; 2] },
             drafter_bytes: draft, drafter_scratch, requested_pool: options.pool_tokens.filter(|&n| n > 0), onboard,
             full_prefill_logits: if options.full_prefill_logits { full_prefill_logits_bytes("glm5_flash", rows, cfg.vocab_size as u64) } else { 0 } };
-        glmf::solve_with_graphs(&inputs, target, options.context_tokens == 0,
+        glmf::solve_working_set_with_graphs(&inputs, target, options.context_tokens == 0,
             options.physical_sms.unwrap_or(placement::ArchContext::coordinator(options.rtx_bytes[0], None).sms) as usize,
-            available.is_some()).map(|(placed, _)| placed).map_err(Into::into)
+            available.is_some()).map(|(placed, _, working)| {
+                notes.push(format!("selected Spark ranks {}, prefill lanes {}, layers {:?}",
+                    working.spark_ranks, working.prefill_lanes, working.spark_layers));
+                placed
+            }).map_err(Into::into)
     })();
     let mut local = 0;
     match admitted {

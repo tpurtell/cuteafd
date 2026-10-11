@@ -163,6 +163,12 @@ def test_glmf_selection_is_sealed_after_solve_before_loading_or_opening_lanes() 
     assert "args.experts_snapshot.as_deref().unwrap_or(&args.snapshot)" in body
     assert "WorkerSelection::new(identity, &spark_layers)" in body
     assert "let spark = !spark_layers.is_empty();" in body
+    assert "selected_args.prefill_lanes = usize::try_from(working.prefill_lanes)?;" in body
+    assert body.index("working.prefill_lanes") < body.index("TokenEmbedding::load(")
+    assert "spark_layers == working.spark_layers" in body
+    admission = source[source.index("    fn admit("):source.index("    pub fn with_engine<")]
+    assert "solve_working_set_with_graphs(" in admission
+    assert "let local_workspace = workspaces(false, 1);" in admission
     expert = source[source.index("    fn experts_range<"):source.index("impl Opened {\n    /// The checkpoint's `embed_tokens`")]
     assert expert.index("if remote.is_empty() { return Ok(None); }") < expert.index("SparkLink::new(")
     assert "spark_warmup_request(&self.cfg, warm_rows, remote.start)" in expert

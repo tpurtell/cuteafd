@@ -1099,7 +1099,8 @@ pub(crate) fn served_index_cache(requested: engine::IndexCache, head_split: bool
 impl Opened {
     fn admit(&self, args: &EngineArgs, programs: &cuteafd_ffi::programs::Programs<'_>, layers: usize,
         index: engine::IndexCache, marks: usize, peer: Option<i32>, automatic_context: bool)
-        -> Result<(cuteafd_loader::placement::Placement, cuteafd_loader::placement::GraphSet)> {
+        -> Result<(cuteafd_loader::placement::Placement, cuteafd_loader::placement::GraphSet,
+            cuteafd_loader::placement::families::glm5_flash::GlmfWorkingSet)> {
         use cuteafd_loader::placement::{self, families::glm5_flash as admission};
         use cuteafd_loader::families::glm5_flash::resident::{router_replica_bytes, GlmfRepresentation};
         use cuteafd_loader::serving_capacity::{glmf_step_scratch, glmf_step_workspaces, glmf_table_pages,
@@ -1137,10 +1138,13 @@ impl Opened {
         let shape = GlmfStepShape { lead: true, split, local_experts: !split && self.fp8().is_some(),
             tp2_experts: split, spark: spark_ranks > 0, partial_bytes: if args.kda_fp32_partials { 4 } else { 2 },
             output_shard: args.kda_output_shard, full_prefill_logits: args.full_prefill_logits, table_pages, table_pool_pages };
-        let workspace = (0..devices.len()).map(|rank| {
-            let shape = if rank == 0 { shape } else { GlmfStepShape { lead: false, local_experts: false, spark: false, ..shape } };
+        let workspaces = |spark, lanes| (0..devices.len()).map(|rank| {
+            let shape = if rank == 0 { GlmfStepShape { spark, ..shape } }
+                else { GlmfStepShape { lead: false, local_experts: false, spark: false, ..shape } };
             glmf_step_workspaces(&self.cfg, lanes, args.prefill_rows as u64, args.decode_rows as u64, &shape, decode, prefill).device_bytes()
-        }).collect();
+        }).collect::<Vec<_>>();
+        let workspace = workspaces(spark_ranks > 0, lanes);
+        let local_workspace = workspaces(false, 1);
         let mut experts = self.experts.as_ref().map(|c| admission::expert_costs(c, split)).transpose()?.unwrap_or_default();
         experts.truncate(self.cfg.dense[..layers].iter().filter(|&&d| !d).count());
         if args.skip_experts { for cost in &mut experts { cost.whole = Default::default(); cost.half = Default::default(); } }
@@ -1185,16 +1189,17 @@ impl Opened {
             sequences: sequences.min(args.decode_rows) as u64, speculation, state_slots: args.slots as u64,
             mark_slots: marks as u64, pool_marks: args.prefix_marks == prefix::PrefixMarks::Pool, index: index.into(),
             kda_state_bytes: args.kda_state.bytes() as u64, shared_replay: args.replay_records == engine::ReplayRecords::Shared,
-            representation, resident, router_replica_bytes, workspace, graphs, experts, expert_workspace, tp2_workspace,
+            representation, resident, router_replica_bytes, workspace, local_workspace, graphs, experts, expert_workspace, tp2_workspace,
             drafter_bytes, drafter_scratch, requested_pool: (args.pool_tokens > 0).then_some(args.pool_tokens as u64), onboard,
             full_prefill_logits: 0 };
         let target = placement::PoolPolicy::resolve(&inputs.gpus.iter().map(|g| g.0).collect::<Vec<_>>(),
             args.max_context as u64, inputs.requested_pool, 256, spark_ranks == 0).target;
-        let (placement, graphs) = admission::solve_with_graphs(&inputs, target, automatic_context, sms, true)?;
+        let (placement, graphs, working) = admission::solve_working_set_with_graphs(&inputs, target, automatic_context, sms, true)?;
         ensure!(placement.movables.iter().all(|(_, gpu)| *gpu == 0), "GPU1 drafter executor not installed");
-        tracing::info!(placement = %placement.summary(), "GLM Flash admission before weights");
+        tracing::info!(placement = %placement.summary(), spark_ranks = working.spark_ranks,
+            prefill_lanes = working.prefill_lanes, spark_layers = ?working.spark_layers, "GLM Flash admission before weights");
         cuteafd_bench::context::set_resolved("rtx-expert-layers", &placement.onboard_layers.to_string());
-        Ok((placement, graphs))
+        Ok((placement, graphs, working))
     }
 
     /// Builds the engine and hands it to `body`. Either KV admission keeps the prefix marks of
@@ -1320,10 +1325,17 @@ impl Opened {
             fp8_scales: args.fp8_scales, device: args.device,
             peers: peer_stream.iter().map(|&(device, stream)| crate::shared::peer_split::RankDevice { device, stream })
                 .collect() };
-        let (placement, admitted_graphs) = self.admit(args, &programs, layers, index_cache, mark_slots,
+        let (placement, admitted_graphs, working) = self.admit(args, &programs, layers, index_cache, mark_slots,
             split_device, automatic_context)?;
+        let mut selected_args = args.clone();
+        if selected_args.peers.is_some() {
+            selected_args.prefill_lanes = usize::try_from(working.prefill_lanes)?;
+        }
+        let args = &selected_args;
         if !args.skip_experts && placement.tp2.is_some() { engine::check_tp2_lanes(args.prefill_lanes)?; }
         let spark_layers = admitted_spark_layers(&self.cfg, &placement.layers, args.skip_experts)?;
+        if !args.skip_experts { ensure!(spark_layers == working.spark_layers,
+            "GLM Flash runtime Spark selection disagrees with admitted working set"); }
         let spark_range = spark_layers.first().map(|&first| first..spark_layers.last().copied().unwrap() + 1);
         if args.placement_handshake {
             let peers = args.peers.as_deref().context("worker placement handshake needs Spark peers")?
