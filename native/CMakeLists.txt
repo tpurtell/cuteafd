@@ -59,6 +59,8 @@ set(CUTEAFD_DSV4_DECODE_ROWS "64" CACHE STRING "DeepSeek V4 decode program capac
 set(CUTEAFD_DSV4_PREFILL_ROWS "4096" CACHE STRING "DeepSeek V4 prefill program capacity")
 set(CUTEAFD_GLMF_WIDE_DECODE_ROWS "128" CACHE STRING
   "GLM 5.3 Flash wide decode and verify program capacity (serve --decode-rows 128); 0 exports none")
+set(CUTEAFD_CONTEXT_SPLIT_AOT "OFF" CACHE STRING
+  "Token-split attention primitives (scored top-k, candidate merge, partial, combine, gather) for the flash/pro/glm/glmf program geometries: OFF, ON (after every other program) or ONLY")
 set(CUTEAFD_DSV4_MAX_CONTEXT "1048576" CACHE STRING "Coordinator cache extent compiled into programs (clamped per checkpoint geometry)")
 if((CUTEAFD_ENABLE_V41_HC_LAGGED_AOT OR CUTEAFD_ENABLE_V41_NARROW_AOT) AND NOT CUTEAFD_ENABLE_V41_FP8_AOT)
   message(FATAL_ERROR "Candidate mHC/narrow AOT requires V4.1 FP8 AOT")

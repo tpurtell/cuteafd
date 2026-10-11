@@ -437,7 +437,9 @@ fn context_residuals_and_buffers_match_heads_and_section_6() {
             candidate_row_bytes: c, compiled_extent: 1 << 20, decode_rows: 64, lanes: 2 };
         let demands = buffers.demands().unwrap();
         assert!((demands[0].bytes as f64 / GIB as f64 - stage).abs() < 0.005);
-        assert_eq!(demands[1].bytes, 2 * 2 * 64 * (q + p + c));
+        // Two parities x two lanes of [64 rows x (both query halves + partial + both
+        // candidate lists)], plus three 16-byte flags per slot: what ContextExchange allocates.
+        assert_eq!(demands[1].bytes, 2 * 2 * 64 * (2 * q + p + 2 * c) + 2 * 2 * 3 * 16);
         assert_eq!(demands[0].bytes, demands[2].bytes);
     }
     assert!(ContextBuffers { staging_unit_bytes: u64::MAX, compiled_extent: 2, ..Default::default() }.demands().is_err());
@@ -596,7 +598,7 @@ fn section_6_v4_and_glm_flash_memory_savings() {
     assert!((records as f64 / GIB as f64 - 23.05).abs() < 0.01);
     let staging = ContextBuffers { staging_unit_bytes: 256 * 528 + 64 * 132,
         staging_unit_rows: 256, compiled_extent: 1 << 20, ..Default::default() }.demands().unwrap()[0].bytes;
-    let exchange = 4 * 64 * (32_768 + 32_896 + 4_096);
+    let exchange = 4 * 64 * (2 * 32_768 + 32_896 + 2 * 4_096) + 4 * 3 * 16;
     let freed = (records - compact / 2 - staging - exchange) as f64 / GIB as f64;
     assert!((freed - 15.9).abs() < 0.05);
     let hop = 2 * 2 * 4096 * 32_784;

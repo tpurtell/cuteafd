@@ -564,7 +564,13 @@ def main() -> None:
     parser.add_argument("--only", help="comma-separated stem suffixes (diagnostics)")
     parser.add_argument("--context-split-only", action="store_true",
                         help="export K1 primitives for flash/pro/glm/glmf, no engine wiring")
+    parser.add_argument("--context-split", choices=("off", "on", "only"), default="off",
+                        help="token-split attention primitives for flash/pro/glm/glmf: on appends them after "
+                             "every other program (existing stems unchanged); only exports nothing else")
     args = parser.parse_args()
+    if args.context_split_only:
+        args.context_split = "only"
+    args.context_split_only = args.context_split == "only"
 
     import torch
     from b12x.integration.cuteafd import (
@@ -647,6 +653,13 @@ def main() -> None:
         # Last, so every program above compiles exactly as before.
         work += [("glmf", *item) for item in glmf_wide_decode_programs(GLM53_FLASH, args.decode_rows,
                                                                        args.glmf_wide_decode_rows, geometry_context("glmf", args.max_context))]
+    if args.context_split == "on":
+        # After every other program, so each existing object and table index is unchanged.
+        bases = {"flash": FLASH, "pro": PRO, "glm": GLM53, "glmf": GLM53_FLASH}
+        families = {"flash": "dsv4f", "pro": "dsv4p", "glm": "glm", "glmf": "glmf"}
+        for name in (n for n in geometries if n in bases):
+            work += [(families[name], *item) for item in context_split_programs(
+                bases[name], args.decode_rows, geometry_context(name, args.max_context))]
     for family, suffix, op, params, thunk in work:
         if selected is not None and suffix not in selected:
             continue

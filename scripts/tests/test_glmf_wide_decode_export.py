@@ -190,3 +190,18 @@ def test_context_split_opt_in_geometry(exporter, family, heads, index_topk, pool
         assert layouts["paged_staging_gather_swa"] == 149760
     else:
         assert layouts["paged_staging_gather_kv"] == record_bytes*64
+
+
+def test_context_split_programs_append_after_every_other_program_when_switched_on():
+    """CUTEAFD_CONTEXT_SPLIT_AOT (default OFF) reaches the exporter; ON appends the primitives after
+    the glmf wide programs so no existing stem or table index moves, ONLY exports nothing else."""
+    cmake = (ROOT / "native" / "CMakeLists.txt").read_text()
+    assert 'set(CUTEAFD_CONTEXT_SPLIT_AOT "OFF" CACHE STRING' in cmake
+    programs = (ROOT / "native" / "cmake" / "shared" / "dsv4_programs.cmake").read_text()
+    assert '--context-split "${context_split_aot}"' in programs
+    source = EXPORTER.read_text()
+    assert 'parser.add_argument("--context-split", choices=("off", "on", "only"), default="off",' in source
+    wide = source.index("glmf_wide_decode_programs(GLM53_FLASH, args.decode_rows,")
+    appended = source.index('if args.context_split == "on":')
+    assert appended > wide, "context-split programs must come after every existing program"
+    assert 'context_split_programs(\n                bases[name], args.decode_rows, geometry_context(name, args.max_context))' in source
