@@ -7,7 +7,7 @@ pub(crate) mod console;
 mod distributed;
 mod placement;
 pub(crate) mod scores;
-use scores::TokenScores;
+use scores::RetainedScores;
 mod copy_drafts;
 pub(crate) mod prefix;
 pub(crate) mod memory;
@@ -767,7 +767,7 @@ fn prefill<'a, P: PrefillTarget<'a>, C: DraftChain<'a>>(
     job: &NativeRequest,
     draft: Option<&mut DraftRuntime<'_, 'a, C>>,
     hold: &mut dyn FnMut() -> Result<()>,
-) -> Result<TokenScores> {
+) -> Result<RetainedScores> {
     use crate::families::deepseek_v41::v41_backbone_cache::{CacheStage, CacheWork};
     let end = tokens.len() as u64;
     let cached = requests.cache().committed_end(lease)? as usize;
@@ -860,10 +860,10 @@ fn prefill<'a, P: PrefillTarget<'a>, C: DraftChain<'a>>(
     let rows = (end - start) as u32;
     let mut batch = requests.prepare_replay(&[CacheWork { lease, tokens: rows, kind: ExpertV2SourceKind::Prefill }])?;
     let started = Instant::now();
-    let result = (|| -> Result<TokenScores> {
+    let result = (|| -> Result<RetainedScores> {
         let bytes = runtime.block_on(unsafe { pass.prefill_logits(lib, requests, &mut batch,
             transport, &[rows as usize - 1], Some(&suffix)) })?;
-        let scores = TokenScores::new(scores::VOCAB, bytes)?;
+        let scores = RetainedScores::new(scores::VOCAB, bytes)?;
         ensure!(!job.events.is_closed(), "client disconnected");
         runtime.block_on(pass.commit_prefill(requests, &mut batch, draft, rows))?;
         Ok(scores)
@@ -974,7 +974,7 @@ fn score<'a, P: PrefillTarget<'a>, C: DraftChain<'a>>(lib: &'a NativeLibrary, ru
         if result.is_err() { pass.discard(&mut batch)?; }
         let bytes = result?;
         for (j, row) in bytes.chunks_exact(scores::ROW_BYTES).enumerate() {
-            probe.row(step.start + j + 1, &TokenScores::new(scores::VOCAB, row.to_vec())?.logits()?);
+            probe.row(step.start + j + 1, &RetainedScores::new(scores::VOCAB, row.to_vec())?.logits()?);
         }
     }
     let _ = job.events.send(Ok(InferenceChunk::Finish { finish_reason: InferenceFinishReason::Length }));
@@ -1046,7 +1046,7 @@ mod scoring_tests {
 fn prefill_continuation<'a, P: PrefillTarget<'a>, C: DraftChain<'a>>(lib: &'a NativeLibrary, runtime: &tokio::runtime::Runtime,
     pass: &mut P, requests: &mut Requests<'a>, transport: &mut P::Transport,
     lease: crate::families::deepseek_v41::v41_backbone_cache::CacheLease, tokens: &[u32], chunk_rows: usize,
-    job: &NativeRequest, mut draft: Option<&mut DraftRuntime<'_, 'a, C>>, hold: &mut dyn FnMut() -> Result<()>) -> Result<TokenScores> {
+    job: &NativeRequest, mut draft: Option<&mut DraftRuntime<'_, 'a, C>>, hold: &mut dyn FnMut() -> Result<()>) -> Result<RetainedScores> {
     ensure!(!tokens.is_empty(), "prefix continuation has no uncached rows");
     let mut anchor = None;
     let count = tokens.len().div_ceil(chunk_rows);
@@ -1056,10 +1056,10 @@ fn prefill_continuation<'a, P: PrefillTarget<'a>, C: DraftChain<'a>>(lib: &'a Na
         let started = Instant::now();
         let mut batch = requests.prepare(&[RequestTokens { lease, tokens: chunk,
             image_mask: None, kind: ExpertV2SourceKind::Prefill }])?;
-        let result = (|| -> Result<TokenScores> {
+        let result = (|| -> Result<RetainedScores> {
             let bytes = runtime.block_on(unsafe { pass.prefill_logits(lib, requests, &mut batch, transport,
                 &[chunk.len() - 1], None) })?;
-            let scores = TokenScores::new(scores::VOCAB, bytes)?;
+            let scores = RetainedScores::new(scores::VOCAB, bytes)?;
             ensure!(!job.events.is_closed(), "client disconnected");
             runtime.block_on(pass.commit_prefill(requests, &mut batch, draft.as_deref_mut(), chunk.len() as u32))?;
             Ok(scores)

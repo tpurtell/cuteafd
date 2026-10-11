@@ -40,7 +40,7 @@ pub(super) struct ImageAdmission {
     pub id: u64,
     pub lease: CacheLease,
     pub image_keys: ImageKeys,
-    pub hit: Option<(usize, Option<TokenScores>)>,
+    pub hit: Option<(usize, Option<RetainedScores>)>,
     pub restore: (Instant, Instant),
     pub needed: Vec<usize>,
     pub next: usize,
