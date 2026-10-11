@@ -3886,6 +3886,49 @@ context parallel stack covers less than it seemed:
     the allocator underprices wide verifies.
   - `layers` with two lanes changes the lane count, not the per-row price.
 
+### Deferred experiment: alternating vs one-cutover `layers` ownership (TJ, 2026-10-11)
+
+**Default:** `layers` uses one cutover point, k, chosen for byte balance (K0).
+Alternating ownership is a later experiment, possibly after v3. It will be
+measured, not assumed.
+
+**Where alternating could win.** Only with two-lane decode (C > 1), and
+mostly at long context, where attention dominates a step.
+- One cutover pipelines too. The two lanes sit half a forward pass apart:
+  lane A's layer i runs on GPU0 while lane B's layer i + n/2 runs on GPU1.
+- The difference is balance within each time slot. Alternating pairs
+  adjacent layers (similar cost). One cutover pairs layer i with layer
+  i + n/2, which can be a different kind, and attention cost grows with
+  context. So bubbles from slot imbalance grow with context too.
+- That is why a win, if any, appears only at high context. The experiment
+  needs C8/C16 at short, 128K and 256K+ contexts, not only C1 at short
+  context.
+
+**Costs.**
+- An ownership change needs a residual hop only where the FFN is not split.
+- With TP2-split FFN, every layer broadcasts anyway (K0: 43/61), so
+  alternating adds no transfers there.
+- With Spark or owner FFN, each change is a hop of hidden × rows in BF16:
+  a few µs at decode rows over P2P. Measure it before the full experiment.
+
+**Per family.** Groups that share index or source state never split across
+GPUs (`colocate`), so alternation granularity is the group:
+- **V4.1:** a compressed layer's reindex reads its source group's full
+  CSA. Alternation would go group by group. Window-only (SWA) layers could
+  alternate freely, but their attention is small, so moving them buys
+  little balance. Expected: little gain; V4.1 keeps its 20/20 ranges unless
+  this measures a win.
+- **GLM 5.3:** shared-indexer layers colocate with their full-indexer
+  layer, so alternation would go in indexer groups.
+- **V4:** C4 and C128 interleave, so a slot pairs C4 with C4 only when the
+  layer offset is even. One cutover at an even offset may already balance.
+- **GLM Flash:** 11 MLA layers between KDA layers.
+
+**When.** After two-lane decode exists (K4/K6/P7). The comparison is
+one-cutover vs alternating on the same build, at 2M, C1/C8/C16 × short/128K/
+256K, on V4 max and GLM 5.3 max. A family switches only if alternating wins
+C8/C16 at long context and loses no C1.
+
 ### 9. Open questions for TJ (with recommendations)
 
 **Decided (TJ, 2026-10-11): all eight as recommended.**
