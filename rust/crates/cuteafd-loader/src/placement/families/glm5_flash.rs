@@ -47,6 +47,41 @@ pub struct GlmfInputs<'a> {
 
 pub fn default_onboard() -> Onboard { Onboard::Auto }
 
+/// Dormant GPU1 DFlash bridge inventory, not permission to move the drafter.
+/// `rows` is the drafter's full admitted batch (sequences * block), not a
+/// target-head launch chunk. GPU1's existing draft destinations are already
+/// in the movable; publisher streams/modules belong to the sampled baseline.
+pub fn remote_dflash_bridge_demands(hidden: u64, vocab: u64, taps: u64, rows: u64)
+    -> Result<MovableDemands, PlacementError> {
+    if hidden == 0 || vocab == 0 || taps == 0 || rows == 0 || rows > i32::MAX as u64 {
+        return Err(PlacementError::Inventory("GLM Flash remote DFlash bridge geometry"));
+    }
+    let mul = |a: u64, b: u64| a.checked_mul(b)
+        .ok_or(PlacementError::Overflow("GLM Flash remote DFlash bridge"));
+    let hidden_rows = mul(mul(rows, hidden)?, 2)?.max(256);
+    let bytes = [
+        ("DFlash bridge taps", mul(mul(mul(2048, taps)?, hidden)?, 2)?.max(256)),
+        ("DFlash bridge input ids", mul(rows, 4)?.max(256)),
+        ("DFlash bridge gathered input", hidden_rows),
+        ("DFlash bridge normalized hidden", hidden_rows),
+        ("DFlash bridge logits", mul(mul(rows, vocab)?, 4)?.max(256)),
+        ("DFlash bridge head scratch", 4 << 20),
+    ];
+    let mut demands: Vec<_> = bytes.into_iter().map(|(group, bytes)|
+        Demand::new(0, Category::Drafter, group, bytes, Basis::Formula)).collect();
+    // Four zero-size receive slots still own 256B each; controls and the
+    // abort word own 256B each. No duplicate payload destination is allocated.
+    for gpu in 0..2 {
+        demands.push(Demand::new(gpu, Category::Transport, "DFlash bridge exchange",
+            4 * 256 + 256 + 256, Basis::Formula));
+    }
+    for gpu in 0..2 {
+        demands.iter().filter(|d| d.gpu == gpu).try_fold(0u64, |sum, d|
+            sum.checked_add(d.bytes).ok_or(PlacementError::Overflow("GLM Flash remote DFlash bridge")))?;
+    }
+    Ok(MovableDemands { placement_gpu: 1, demands })
+}
+
 pub fn request(i: &GlmfInputs<'_>) -> Result<PlacementRequest, PlacementError> {
     let ranks = i.gpus.len();
     if ![1, 2].contains(&ranks) || i.layers == 0 || i.layers > i.cfg.layers
@@ -333,6 +368,62 @@ mod tests {
                 assert!(!p.layers.iter().any(|l| matches!(l.experts, ExpertHome::RtxWhole { .. })));
             }
         }
+    }
+
+    #[test]
+    fn remote_dflash_bridge_counts_full_rows_and_only_new_allocations() {
+        let bridge = remote_dflash_bridge_demands(4096, 154_880, 6, 16 * 8).unwrap();
+        assert_eq!(bridge.placement_gpu, 1);
+        let actual: Vec<_> = bridge.demands.iter().map(|d|
+            (d.gpu, d.category, d.group.as_str(), d.bytes, d.basis)).collect();
+        assert_eq!(actual, vec![
+            (0, Category::Drafter, "DFlash bridge taps", 100_663_296, Basis::Formula),
+            (0, Category::Drafter, "DFlash bridge input ids", 512, Basis::Formula),
+            (0, Category::Drafter, "DFlash bridge gathered input", 1_048_576, Basis::Formula),
+            (0, Category::Drafter, "DFlash bridge normalized hidden", 1_048_576, Basis::Formula),
+            (0, Category::Drafter, "DFlash bridge logits", 79_298_560, Basis::Formula),
+            (0, Category::Drafter, "DFlash bridge head scratch", 4_194_304, Basis::Formula),
+            (0, Category::Transport, "DFlash bridge exchange", 1536, Basis::Formula),
+            (1, Category::Transport, "DFlash bridge exchange", 1536, Basis::Formula),
+        ]);
+        assert_eq!(bridge.demands.iter().filter(|d| d.gpu == 0).map(|d| d.bytes).sum::<u64>(), 186_255_360);
+        // Even tiny direct payloads retain their allocator's 256B minimum.
+        let tiny = remote_dflash_bridge_demands(1, 1, 1, 1).unwrap();
+        for group in ["DFlash bridge input ids", "DFlash bridge gathered input",
+            "DFlash bridge normalized hidden", "DFlash bridge logits"] {
+            assert_eq!(tiny.demands.iter().find(|d| d.group == group).unwrap().bytes, 256);
+        }
+    }
+
+    #[test]
+    fn remote_dflash_bridge_rejects_geometry_product_and_total_overflow() {
+        for (hidden, vocab, taps, rows) in [(0, 1, 1, 1), (1, 0, 1, 1), (1, 1, 0, 1),
+            (1, 1, 1, 0), (1, 1, 1, i32::MAX as u64 + 1)] {
+            assert!(matches!(remote_dflash_bridge_demands(hidden, vocab, taps, rows),
+                Err(PlacementError::Inventory(_))));
+        }
+        for (hidden, vocab, taps, rows) in [(u64::MAX, 1, 1, 1), (1, u64::MAX, 1, 1),
+            (1, 1, u64::MAX, 1), (u64::MAX / 4096, 1, 1, 1)] {
+            assert!(matches!(remote_dflash_bridge_demands(hidden, vocab, taps, rows),
+                Err(PlacementError::Overflow(_))));
+        }
+    }
+
+    #[test]
+    fn remote_dflash_bridge_stays_dormant_for_gpu0_only_drafter() {
+        let cfg = GlmNextConfig::from_hf(&crate::plan::testing::glm5_flash_config(2)).unwrap();
+        let mut req = request(&inputs(&cfg, 2, inventory::PRO_TOTAL_BYTES)).unwrap();
+        assert_eq!(req.movables[0].allowed, [0]);
+        assert!(req.movables[0].conditional.is_empty());
+        let expected = solve(&req).unwrap();
+        req.movables[0].conditional.push(remote_dflash_bridge_demands(cfg.hidden as u64,
+            cfg.vocab_size as u64, 6, 128).unwrap());
+        let actual = solve(&req).unwrap();
+        assert_eq!(actual.items, expected.items);
+        assert_eq!(actual.movables, expected.movables);
+        assert_eq!(actual.pool_tokens, expected.pool_tokens);
+        assert_eq!(actual.layers, expected.layers);
+        assert!(actual.items.iter().flatten().all(|d| !d.group.starts_with("DFlash bridge")));
     }
 
     #[test]
