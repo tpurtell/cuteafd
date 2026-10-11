@@ -99,7 +99,7 @@ fn explicit_pool_is_strict_and_movables_share_the_arena() {
     req.pool.requested = Some(4 << 20);
     assert!(matches!(solve(&req), Err(PlacementError::PoolDoesNotFit { requested: 4194304, .. })));
     req.pool.requested = Some(1 << 20);
-    req.movables.push(Movable { id: MovableId::DsparkExperts, allowed: vec![0], expert_arena: true,
+    req.movables.push(Movable { id: MovableId::DsparkExperts, allowed: vec![0], expert_arena: true, conditional: vec![],
         parts: vec![Bytes2 { resident: 2 * GIB, staging: GIB / 4 }; 3] });
     let placement = solve(&req).unwrap();
     assert_eq!(placement.pool_tokens, 1 << 20);
@@ -344,7 +344,7 @@ fn tp2_auto_fixed_max_use_the_tighter_rank() {
 #[test]
 fn tp2_keeps_dspark_tp1_arena_separate() {
     let mut req = tp2_request([44 * GIB; 2], Onboard::Auto);
-    req.movables.push(Movable { id: MovableId::DsparkExperts, allowed: vec![0], expert_arena: true,
+    req.movables.push(Movable { id: MovableId::DsparkExperts, allowed: vec![0], expert_arena: true, conditional: vec![],
         parts: vec![Bytes2 { resident: 2 * GIB, staging: GIB / 4 }; 3] });
     let p = solve(&req).unwrap();
     assert_eq!(p.movables, [(MovableId::DsparkExperts, 0)]);
@@ -822,4 +822,139 @@ fn contiguous_layer_switch_keeps_groups_and_breaks_equal_bytes_by_pool() {
     req.fixed.clear();
     let p = solve(&req).unwrap();
     assert_eq!(p.layers.iter().map(|l| l.mode).collect::<Vec<_>>(), [S0, S1, S1, S1]);
+}
+
+
+fn conditional_request() -> PlacementRequest {
+    let mut req = request(2, 44 * GIB, 0, 4, Onboard::Auto);
+    req.movables.push(Movable { id: MovableId::Drafter, parts: vec![Bytes2 { resident: 3 * GIB, staging: 0 }],
+        allowed: vec![0, 1], expert_arena: false, conditional: vec![MovableDemands { placement_gpu: 1,
+            demands: vec![Demand::new(0, Category::Workspace, "bridge", GIB, Basis::Formula),
+                Demand::new(1, Category::Transport, "controls", 256, Basis::Exact)] }] });
+    req
+}
+
+fn group_bytes(p: &Placement, gpu: usize, group: &str) -> u64 {
+    p.items[gpu].iter().filter(|i| i.group == group).map(|i| i.bytes).sum()
+}
+
+#[test]
+fn conditional_movable_charges_only_selected_home_and_all_affected_devices() {
+    let mut req = conditional_request();
+    req.movables[0].allowed = vec![0]; // Dormant GPU1 inventory is legal.
+    let local = solve(&req).unwrap();
+    assert_eq!(local.movables, [(MovableId::Drafter, 0)]);
+    assert_eq!(group_bytes(&local, 0, "bridge"), 0);
+    assert_eq!(group_bytes(&local, 1, "controls"), 0);
+    req.movables[0].allowed = vec![0, 1];
+    req.inventory.gpus[1].baseline = Baseline::Measured { free_bytes: 60 * GIB };
+    assert_eq!(solve(&req).unwrap().movables, [(MovableId::Drafter, 1)]);
+    req.movables[0].allowed = vec![1];
+    let remote = solve(&req).unwrap();
+    assert_eq!(remote.movables, [(MovableId::Drafter, 1)]);
+    assert_eq!(group_bytes(&remote, 0, "bridge"), GIB);
+    assert_eq!(group_bytes(&remote, 1, "controls"), 256);
+    assert_eq!(group_bytes(&remote, 1, "Drafter"), 3 * GIB);
+}
+
+#[test]
+fn conditional_movable_ties_are_deterministic_and_following_costs_accumulate_once() {
+    let mut req = conditional_request();
+    req.movables[0].conditional = vec![MovableDemands { placement_gpu: 0, demands: vec![] },
+        MovableDemands { placement_gpu: 1, demands: vec![] }];
+    let first = solve(&req).unwrap();
+    assert_eq!(first.movables, [(MovableId::Drafter, 0)]);
+    req.movables[0].allowed.reverse();
+    assert_eq!(solve(&req).unwrap(), first);
+    req.movables[0].conditional.clear();
+    assert_eq!(solve(&req).unwrap(), first);
+    let mut another = conditional_request().movables.remove(0);
+    another.id = MovableId::Vision;
+    another.allowed = vec![1];
+    req.movables.push(another);
+    let placed = solve(&req).unwrap();
+    assert_eq!(placed.movables, [(MovableId::Drafter, 0), (MovableId::Vision, 1)]);
+    assert_eq!(group_bytes(&placed, 0, "bridge"), GIB);
+    assert_eq!(group_bytes(&placed, 1, "controls"), 256);
+}
+
+#[test]
+fn conditional_movable_bridge_pressure_falls_back_before_pool_admission() {
+    let mut req = conditional_request();
+    req.inventory.gpus[1].baseline = Baseline::Measured { free_bytes: 60 * GIB };
+    req.movables[0].conditional[0].demands[0].bytes = 43 * GIB;
+    let placed = solve(&req).unwrap();
+    assert_eq!(placed.movables, [(MovableId::Drafter, 0)]);
+    assert_eq!(group_bytes(&placed, 0, "bridge"), 0);
+    req.movables[0].allowed = vec![1];
+    assert!(matches!(solve(&req), Err(PlacementError::BelowFloor { .. })));
+    req.movables[0].allowed = vec![0, 1];
+    req.pool.requested = Some(2 << 20);
+    assert_eq!(solve(&req).unwrap().movables, [(MovableId::Drafter, 0)]);
+    req.movables[0].allowed = vec![1];
+    assert!(matches!(solve(&req), Err(PlacementError::PoolDoesNotFit { .. })));
+    req.movables[0].conditional[0].demands[0].bytes = 45 * GIB;
+    assert!(matches!(solve(&req), Err(PlacementError::Mandatory { gpu: 0, what }) if what.contains("bridge")));
+    req.movables[0].allowed = vec![0, 1];
+    req.movables[0].parts[0].resident = 61 * GIB;
+    assert!(matches!(solve(&req), Err(PlacementError::Mandatory { .. })));
+}
+
+#[test]
+fn conditional_movable_validates_keys_destinations_and_checked_sums() {
+    let req = conditional_request();
+    let mut invalid = req.clone();
+    let duplicate = invalid.movables[0].conditional[0].clone();
+    invalid.movables[0].conditional.push(duplicate);
+    assert!(matches!(solve(&invalid), Err(PlacementError::Inventory(_))));
+    invalid = req.clone();
+    invalid.movables[0].conditional[0].placement_gpu = 2;
+    assert!(matches!(solve(&invalid), Err(PlacementError::Inventory(_))));
+    invalid = req.clone();
+    invalid.movables[0].conditional[0].demands[0].gpu = 2;
+    assert!(matches!(solve(&invalid), Err(PlacementError::Inventory(_))));
+    invalid = req;
+    invalid.movables[0].allowed = vec![1];
+    invalid.movables[0].conditional[0].demands[0].bytes = u64::MAX;
+    invalid.movables[0].conditional[0].demands.push(Demand::new(0, Category::Workspace, "overflow", 1, Basis::Exact));
+    assert!(matches!(solve(&invalid), Err(PlacementError::Overflow(_))));
+}
+
+#[test]
+fn conditional_movable_preserves_arena_peak_and_strict_pool() {
+    let mut req = conditional_request();
+    req.movables[0].allowed = vec![1];
+    req.movables[0].expert_arena = true;
+    req.movables[0].parts = vec![Bytes2 { resident: 3 * GIB, staging: GIB }];
+    req.pool.requested = Some(2 << 20);
+    let placed = solve(&req).unwrap();
+    assert_eq!(placed.pool_tokens, 2 << 20);
+    assert_eq!(placed.expert_ranges[1].peak_bytes, 4 * GIB + GIB / 4);
+    assert_eq!(group_bytes(&placed, 1, "Drafter"), 0);
+    req.pool.requested = Some(4 << 20);
+    assert!(matches!(solve(&req), Err(PlacementError::PoolDoesNotFit { .. })));
+}
+
+#[test]
+fn conditional_movable_selected_device_scratch_and_planned_measured_agree() {
+    let mut req = conditional_request();
+    // Synthetic per-SM scratch: common residency plus SM170 minimum, then
+    // the exact selected-device delta (real families supply their own formula).
+    req.movables[0].parts[0].resident += 170 * 1024;
+    req.movables[0].conditional.insert(0, MovableDemands { placement_gpu: 0,
+        demands: vec![Demand::new(0, Category::Workspace, "SM188 scratch delta", (188 - 170) * 1024, Basis::Formula)] });
+    req.movables[0].conditional[1].demands.push(Demand::new(1, Category::Workspace,
+        "SM170 scratch delta", 0, Basis::Formula));
+    for home in [0, 1] {
+        req.movables[0].allowed = vec![home];
+        let measured = solve(&req).unwrap();
+        let mut planned = req.clone();
+        for gpu in &mut planned.inventory.gpus {
+            gpu.baseline = Baseline::Planned { context_bytes: 52 * GIB, loaded_bytes: 0 };
+        }
+        assert_eq!(solve(&planned).unwrap(), measured);
+        assert_eq!(group_bytes(&measured, home as usize, if home == 0 { "SM188 scratch delta" }
+            else { "SM170 scratch delta" }), u64::from(if home == 0 { 18u32 } else { 0u32 }) * 1024);
+        assert_eq!(group_bytes(&measured, home as usize, "Drafter"), 3 * GIB + 170 * 1024);
+    }
 }

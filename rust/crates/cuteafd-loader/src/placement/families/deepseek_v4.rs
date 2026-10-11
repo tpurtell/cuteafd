@@ -182,7 +182,7 @@ pub fn request(inputs: &V4Inputs<'_>) -> Result<PlacementRequest, PlacementError
         }
     }).collect();
     let movables = if inputs.draft.is_empty() { Vec::new() } else {
-        vec![Movable { id: MovableId::DsparkExperts, allowed: vec![0], expert_arena: true,
+        vec![Movable { id: MovableId::DsparkExperts, allowed: vec![0], expert_arena: true, conditional: vec![],
             parts: inputs.draft.iter().map(|c| Bytes2 { resident: c.resident_bytes, staging: c.staging_bytes }).collect() }]
     };
     let geometry_unit = 256;
