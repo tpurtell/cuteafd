@@ -21,6 +21,7 @@ use std::ffi::c_void;
 
 pub(crate) mod combine;
 pub(crate) mod exl3;
+pub(crate) mod fp8moe;
 pub(crate) mod native;
 pub(crate) mod routes;
 
