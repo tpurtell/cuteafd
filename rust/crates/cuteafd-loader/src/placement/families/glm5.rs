@@ -376,10 +376,18 @@ pub fn manifest_scratch(cfg: &GlmDsaConfig, split: bool, manifest: &serde_json::
     Ok([step_scratch(cfg, split, true, lookup)?, step_scratch(cfg, split, false, lookup)?])
 }
 
-/// Executable EXL3 TP2 inventory; native NVFP4 and TP1 are deliberately not admitted.
+/// Local package arithmetic, including its input and routed-partial representation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GlmLocalFormat {
+    Exl3,
+    Nvfp4 { w4a4: bool },
+}
+
+/// Header-only TP2 inventory. Runtime must attest the native ABI before execution.
 #[derive(Debug, Clone)]
 pub struct LocalInventory {
     pub package: std::path::PathBuf,
+    pub format: GlmLocalFormat,
     pub experts: Vec<ExpertCost>,
     pub backend_workspace: u64,
     pub extra_workspace: [u64; 2],
@@ -426,12 +434,21 @@ fn local_extra_workspace(h: u64, experts: u64, topk: u64, rows: u64, lanes: u64,
 
 pub fn local_inventory(catalog: &crate::OfficialV41Catalog, manifest: &std::path::Path,
     selected_layers: usize, rows: u64, lanes: u64, exchange_f32: bool) -> anyhow::Result<LocalInventory> {
-    let exl3 = catalog.exl3().ok_or_else(|| anyhow::anyhow!(
-        "GLM RTX TP2 currently requires EXL3; native NVFP4 needs the BF16 routed/shared partial adapter"))?;
+    local_inventory_selected(catalog, manifest, selected_layers, rows, lanes, exchange_f32,
+        std::env::var("CUTEAFD_NVFP4_ACTIVATIONS").as_deref() != Ok("a16"))
+}
+
+/// Explicit activation selection keeps package admission deterministic in tests.
+pub fn local_inventory_selected(catalog: &crate::OfficialV41Catalog, manifest: &std::path::Path,
+    selected_layers: usize, rows: u64, lanes: u64, exchange_f32: bool, a4: bool)
+    -> anyhow::Result<LocalInventory> {
     let shape = catalog.routed_experts();
     anyhow::ensure!(shape.hidden == 6144 && shape.intermediate == 2048 && shape.experts == 256
         && shape.topk == 8 && (1..=4096).contains(&rows) && (1..=4).contains(&lanes)
         && (shape.first_layer..=shape.layers).contains(&selected_layers), "GLM TP2 geometry/layer extent");
+    let Some(exl3) = catalog.exl3() else {
+        return nvfp4_inventory(catalog, manifest, selected_layers, rows, lanes, exchange_f32, a4);
+    };
     let tiers = exl3.decoder_tiers().iter().map(usize::to_string).collect::<String>();
     let stem = format!("exl3-glm-k{tiers}");
     let parent = manifest.parent().ok_or_else(|| anyhow::anyhow!("GLM program manifest parent"))?;
@@ -481,9 +498,87 @@ pub fn local_inventory(catalog: &crate::OfficialV41Catalog, manifest: &std::path
         experts.push(ExpertCost { whole: Bytes2 { resident: whole, staging: 0 }, half,
             tp2: true, spark_ok: true });
     }
-    Ok(LocalInventory { package, experts, backend_workspace,
+    Ok(LocalInventory { package, format: GlmLocalFormat::Exl3, experts, backend_workspace,
         extra_workspace: local_extra_workspace(shape.hidden as u64, shape.experts as u64,
             shape.topk as u64, rows, lanes, exchange_f32) })
+}
+
+fn nvfp4_inventory(catalog: &crate::OfficialV41Catalog, manifest: &std::path::Path,
+    selected_layers: usize, rows: u64, lanes: u64, exchange_f32: bool, a4: bool)
+    -> anyhow::Result<LocalInventory> {
+    use crate::formats::fp8_experts::{ExpertFormat, Fp8Projection, Slicing};
+    let tensors = catalog.fp8().filter(|t| t.format() == ExpertFormat::Nvfp4)
+        .ok_or_else(|| anyhow::anyhow!("GLM RTX TP2 needs EXL3 or native ModelOpt NVFP4 expert tensors"))?;
+    anyhow::ensure!(!exchange_f32,
+        "GLM NVFP4 TP2 emits BF16 routed partials; use BF16 exchange (no BF16-to-FP32 partial adapter)");
+    let parent = manifest.parent().ok_or_else(|| anyhow::anyhow!("GLM program manifest parent"))?;
+    let roots = [parent.join("fp8"), parent.join("../lib/fp8")];
+    let find = |name: &str| roots.iter().map(|root| root.join(name).join("tp2")).find(|p| p.is_dir());
+    let (package, w4a4) = if let Some(package) = a4.then(|| find("fp8-glm-nvfp4a4")).flatten() {
+        (package, true)
+    } else {
+        (find("fp8-glm-nvfp4").ok_or_else(|| anyhow::anyhow!(
+            "missing GLM native NVFP4 tp2 package (fp8-glm-nvfp4a4/tp2 or fp8-glm-nvfp4/tp2)"))?, false)
+    };
+    let value: serde_json::Value = serde_json::from_slice(&std::fs::read(
+        package.parent().unwrap().join("manifest.json"))?)?;
+    let shape = catalog.routed_experts();
+    let layout = &value["layouts"]["tp2"];
+    let geometry = if w4a4 { "glm_nvfp4a4" } else { "glm_nvfp4" };
+    anyhow::ensure!(value["schema"].as_str() == Some("cuteafd.fp8moe-package.v1")
+        && value["role"].as_str() == Some("coordinator") && value["geometry"].as_str() == Some(geometry)
+        && layout["tp"].as_u64() == Some(2) && layout["hidden"].as_u64() == Some(shape.hidden as u64)
+        && layout["intermediate"].as_u64() == Some(shape.intermediate as u64)
+        && layout["slice"].as_u64() == Some(shape.intermediate as u64 / 2)
+        && layout["experts"].as_u64() == Some(shape.experts as u64)
+        && layout["top_k"].as_u64() == Some(shape.topk as u64)
+        && layout["input"].as_str() == Some("bf16") && layout["weights"].as_str() == Some("nvfp4")
+        && layout["swiglu_limit"].as_f64() == Some(0.0),
+        "GLM TP2 NVFP4 package geometry/input/format mismatch in {}", package.display());
+    // NVFP4 has one program per capacity. Non-default forms need the ABI's
+    // largest-form scratch query, which this header-only inventory cannot infer.
+    anyhow::ensure!(layout["prefill_forms"].as_object().is_some_and(|forms|
+        forms.values().all(|v| v.as_array().is_some_and(Vec::is_empty))),
+        "GLM TP2 NVFP4 non-default prefill forms need largest-form scratch metadata");
+    let capacities = layout["capacities"].as_array()
+        .ok_or_else(|| anyhow::anyhow!("GLM TP2 NVFP4 capacities missing"))?
+        .iter().map(|c| -> anyhow::Result<(u64, u64)> {
+            Ok((c["capacity"].as_u64().filter(|&n| n > 0)
+                .ok_or_else(|| anyhow::anyhow!("GLM TP2 NVFP4 capacity is invalid"))?,
+                c["scratch_bytes"].as_u64()
+                    .ok_or_else(|| anyhow::anyhow!("GLM TP2 NVFP4 scratch is invalid"))?))
+        }).collect::<anyhow::Result<Vec<_>>>()?;
+    anyhow::ensure!(!capacities.is_empty() && capacities.windows(2).all(|w| w[0].0 < w[1].0),
+        "GLM TP2 NVFP4 capacities must be strictly increasing");
+    let max_rows = rows.max(DECODE_ROWS);
+    let scratch = capacities.iter().find(|&&(capacity, _)| capacity >= max_rows)
+        .map(|&(_, bytes)| bytes.max(FLOOR)).ok_or_else(|| anyhow::anyhow!(
+            "GLM TP2 NVFP4 package has no capacity for {max_rows} rows"))?;
+    let library = package.join("libcuteafd_fp8moe.so");
+    anyhow::ensure!(library.is_file(), "GLM TP2 missing binary {}", library.display());
+    let backend_workspace = scratch.checked_add(max_rows * shape.hidden as u64 * 2)
+        .ok_or_else(|| anyhow::anyhow!("GLM TP2 NVFP4 workspace overflow"))?;
+    let resident = |tp, rank| -> anyhow::Result<u64> {
+        Fp8Projection::ALL.iter().try_fold(0u64, |sum, &projection| {
+            let (weights, _) = tensors.slice_bytes_with(projection, tp, rank, Slicing::Blocks(128))?;
+            Ok(sum + (shape.experts * weights).max(FLOOR as usize) as u64
+                + tensors.scale_region_bytes_with(projection, tp, rank, Slicing::Blocks(128))?
+                    .max(FLOOR as usize) as u64)
+        })
+    };
+    let whole = Bytes2 { resident: resident(1, 0)?, staging: 0 };
+    let halves = [resident(2, 0)?, resident(2, 1)?];
+    let experts = (shape.first_layer..selected_layers).map(|layer| -> anyhow::Result<ExpertCost> {
+        let mut half = halves.map(|resident| Bytes2 { resident, staging: 0 });
+        for suffix in ["weight", "e_score_correction_bias"] {
+            half[1].resident += catalog.tensor(&format!("model.layers.{layer}.mlp.gate.{suffix}"))?
+                .metadata.byte_length.max(FLOOR);
+        }
+        Ok(ExpertCost { whole, half, tp2: true, spark_ok: true })
+    }).collect::<anyhow::Result<Vec<_>>>()?;
+    Ok(LocalInventory { package, format: GlmLocalFormat::Nvfp4 { w4a4 }, experts, backend_workspace,
+        extra_workspace: local_extra_workspace(shape.hidden as u64, shape.experts as u64,
+            shape.topk as u64, rows, lanes, false) })
 }
 
 pub fn default_onboard() -> Onboard { Onboard::Auto }
@@ -871,6 +966,151 @@ mod tests {
         std::fs::remove_dir_all(dir.path().join("exl3")).unwrap();
         let error = local_inventory(&catalog, &manifest, 2, 64, 3, false).unwrap_err();
         assert!(error.to_string().contains("missing exl3-glm-k45/rtx-tp2 package"), "{error:#}");
+    }
+
+    fn nvfp4_fixture() -> (tempfile::TempDir, crate::OfficialV41Catalog, std::path::PathBuf) {
+        use crate::plan::testing::{glm5_config, glm5_tensors, nvfp4, write_snapshot};
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = glm5_config();
+        config["quantization_config"] = serde_json::json!({"quant_method":"modelopt", "quant_algo":"NVFP4",
+            "config_groups":{"group_0":{"weights":{"num_bits":4,"type":"float","group_size":16}}}});
+        let mut tensors = glm5_tensors(nvfp4);
+        for expert in 1..256 {
+            for (projection, n, k) in [("gate_proj", 2048, 6144), ("up_proj", 2048, 6144),
+                ("down_proj", 6144, 2048)] {
+                tensors.extend(nvfp4(&format!("model.layers.1.mlp.experts.{expert}.{projection}"), n, k));
+            }
+        }
+        let snapshot = dir.path().join("snapshot");
+        write_snapshot(&snapshot, &config, &tensors, None);
+        let catalog = crate::read_expert_catalog(&snapshot).unwrap();
+        let share = dir.path().join("share");
+        std::fs::create_dir_all(&share).unwrap();
+        let manifest = share.join("PROGRAMS.json");
+        std::fs::write(&manifest, b"{\"programs\":[]}").unwrap();
+        for (geometry, offset) in [("glm_nvfp4", 1000), ("glm_nvfp4a4", 2000)] {
+            let name = geometry.replace('_', "-");
+            let package = dir.path().join(format!("lib/fp8/fp8-{name}"));
+            std::fs::create_dir_all(package.join("tp2")).unwrap();
+            std::fs::write(package.join("manifest.json"), serde_json::json!({
+                "schema":"cuteafd.fp8moe-package.v1", "role":"coordinator", "geometry":geometry,
+                "layouts":{"tp2":{"tp":2, "hidden":6144, "intermediate":2048, "slice":1024,
+                    "experts":256, "top_k":8, "input":"bf16", "weights":"nvfp4", "swiglu_limit":0.0,
+                    "prefill_forms":{"w8a16":[], "w8a8":[]},
+                    "capacities":([1,16,80,256,1024,4096].map(|capacity|
+                        serde_json::json!({"capacity":capacity,"scratch_bytes":offset + capacity * 64})))}}
+            }).to_string()).unwrap();
+            // Header fixtures do not execute or attest their stand-in native binary.
+            std::fs::write(package.join("tp2/libcuteafd_fp8moe.so"), b"").unwrap();
+        }
+        (dir, catalog, manifest)
+    }
+
+    #[test]
+    fn nvfp4_inventory_retains_native_scales_and_selects_matching_activation_package() {
+        let (dir, catalog, manifest) = nvfp4_fixture();
+        let whole = 3 * (256 * 6144 * 2048 / 2 + 256 * 6144 * 2048 / 16 + 256 * 8);
+        let half = 3 * (256 * 6144 * 1024 / 2 + 256 * 6144 * 1024 / 16 + 256 * 8);
+        for rows in [1u64, 16, 63, 64, 81, 4096] {
+            for a4 in [false, true] {
+                let local = local_inventory_selected(&catalog, &manifest, 2, rows, 3, false, a4).unwrap();
+                assert_eq!(local.format, GlmLocalFormat::Nvfp4 { w4a4: a4 });
+                assert_eq!(local.experts.len(), 1);
+                assert_eq!(local.experts[0].whole, Bytes2 { resident: whole, staging: 0 });
+                assert_eq!(local.experts[0].half[0], Bytes2 { resident: half, staging: 0 });
+                assert_eq!(local.experts[0].half[1], Bytes2 {
+                    resident: half + 256 * 6144 * 2 + 256 * 4, staging: 0 });
+                assert!(local.experts[0].tp2);
+                let max_rows = rows.max(DECODE_ROWS);
+                let capacity = [1,16,80,256,1024,4096].into_iter().find(|&n| n >= max_rows).unwrap();
+                let scratch = if a4 { 2000 } else { 1000 };
+                assert_eq!(local.backend_workspace, scratch + capacity * 64 + max_rows * 6144 * 2);
+                assert_eq!(local.extra_workspace, local_extra_workspace(6144, 256, 8, rows, 3, false));
+                assert_eq!(local.workspace_for(&GlmDsaConfig::from_hf(&crate::plan::testing::glm5_config()).unwrap(), rows, 1, false),
+                    local_extra_workspace(6144, 256, 8, rows, 1, false).map(|b| b + local.backend_workspace));
+            }
+        }
+        std::fs::remove_dir_all(dir.path().join("lib/fp8/fp8-glm-nvfp4a4/tp2")).unwrap();
+        let fallback = local_inventory_selected(&catalog, &manifest, 2, 64, 1, false, true).unwrap();
+        assert_eq!(fallback.format, GlmLocalFormat::Nvfp4 { w4a4: false });
+        assert!(fallback.package.ends_with("fp8-glm-nvfp4/tp2"));
+    }
+
+    #[test]
+    fn native_nvfp4_inventory_planner_equals_runtime_selected_working_set() {
+        let (_dir, catalog, manifest) = nvfp4_fixture();
+        let cfg = GlmDsaConfig::from_hf(&crate::plan::testing::glm5_config()).unwrap();
+        for a4 in [false, true] {
+            for rows in [1, 63, 4096] {
+                let local = local_inventory_selected(&catalog, &manifest, 2, rows, 3, false, a4).unwrap();
+                let serial = local.workspace_for(&cfg, rows, 1, false);
+                for onboard in [Onboard::Auto, Onboard::Layers(0), Onboard::Layers(1), Onboard::Fraction(1.0)] {
+                    let planned = GlmInputs { prefill_rows: rows, experts: local.experts.clone(),
+                        expert_workspace: 0, tp2_workspace: local.workspace(),
+                        drafter_bytes: 0, requested_pool: Some(65536), onboard, ..inputs(&cfg, &[96 * GIB; 2]) };
+                    let mut runtime = planned.clone();
+                    for (total, baseline) in &mut runtime.gpus {
+                        let Baseline::Planned { context_bytes, loaded_bytes } = *baseline else { unreachable!() };
+                        *baseline = Baseline::Measured { free_bytes: *total - context_bytes - loaded_bytes };
+                    }
+                    let (p, pw) = solve_working_set(&planned, serial, None).unwrap();
+                    let (r, rw) = solve_working_set(&runtime, serial, None).unwrap();
+                    assert_eq!((p.clone(), pw.clone()), (r, rw));
+                    assert_eq!(p.pool_tokens, 65536);
+                    assert!(p.expert_ranges.iter().all(|range| range.layers == 0));
+                    if onboard == Onboard::Layers(0) {
+                        assert!(pw.rtx_layers.is_empty());
+                        assert_eq!(pw.spark_layers, vec![1]);
+                        assert_eq!(pw.tp2_workspace, [0; 2]);
+                        assert_eq!((pw.spark_ranks, pw.prefill_lanes), (4, 3));
+                    } else {
+                        assert_eq!(pw.rtx_layers, vec![1]);
+                        assert!(pw.spark_layers.is_empty());
+                        assert_eq!(pw.tp2_workspace, serial);
+                        assert_eq!((pw.spark_ranks, pw.prefill_lanes), (0, 1));
+                        assert_eq!(p.tp2.unwrap().layers, 1);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn nvfp4_inventory_refuses_unimplemented_exchange_and_bad_package_contracts() {
+        use serde_json::json;
+        let (dir, catalog, manifest) = nvfp4_fixture();
+        let error = local_inventory_selected(&catalog, &manifest, 2, 64, 3, true, true).unwrap_err();
+        assert!(error.to_string().contains("use BF16 exchange"), "{error:#}");
+        let package = dir.path().join("lib/fp8/fp8-glm-nvfp4a4");
+        let path = package.join("manifest.json");
+        let original: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        for (field, value) in [("tp", json!(1)), ("hidden", json!(5120)), ("slice", json!(2048)),
+            ("top_k", json!(6)), ("input", json!("wire")), ("weights", json!("mxfp4")),
+            ("swiglu_limit", json!(7.0))] {
+            let mut changed = original.clone();
+            changed["layouts"]["tp2"][field] = value;
+            std::fs::write(&path, changed.to_string()).unwrap();
+            let error = local_inventory_selected(&catalog, &manifest, 2, 64, 3, false, true).unwrap_err();
+            assert!(error.to_string().contains("geometry/input/format mismatch"), "{field}: {error:#}");
+        }
+        for (field, value) in [
+            ("capacities", json!([{"capacity":80,"scratch_bytes":null}])),
+            ("capacities", json!([{"capacity":80,"scratch_bytes":1},{"capacity":16,"scratch_bytes":2}])),
+            ("capacities", json!([{"capacity":16,"scratch_bytes":1}])),
+            ("prefill_forms", json!({"w8a16":[80],"w8a8":[]})),
+        ] {
+            let mut changed = original.clone();
+            changed["layouts"]["tp2"][field] = value;
+            std::fs::write(&path, changed.to_string()).unwrap();
+            assert!(local_inventory_selected(&catalog, &manifest, 2, 64, 3, false, true).is_err(), "{field}");
+        }
+        std::fs::write(&path, original.to_string()).unwrap();
+        std::fs::remove_file(package.join("tp2/libcuteafd_fp8moe.so")).unwrap();
+        let error = local_inventory_selected(&catalog, &manifest, 2, 64, 3, false, true).unwrap_err();
+        assert!(error.to_string().contains("missing binary"), "{error:#}");
+        std::fs::remove_dir_all(dir.path().join("lib/fp8")).unwrap();
+        let error = local_inventory_selected(&catalog, &manifest, 2, 64, 3, false, true).unwrap_err();
+        assert!(error.to_string().contains("missing GLM native NVFP4 tp2 package"), "{error:#}");
     }
 
     #[test]
