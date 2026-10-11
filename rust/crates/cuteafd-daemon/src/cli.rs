@@ -460,6 +460,9 @@ pub(crate) struct NativeExpertDaemonArgs {
     /// layer. A partial range serves a subset of layers, for bring-up and probes.
     #[arg(long, value_parser = clap::value_parser!(u32).range(0..256))]
     pub(crate) last_layer: Option<u32>,
+    /// Wait for the coordinator's solved layer selection before allocating experts.
+    #[arg(long)]
+    pub(crate) placement_handshake: bool,
     /// Official local snapshot directory, including all shard headers.
     #[arg(long)]
     pub(crate) snapshot: PathBuf,
