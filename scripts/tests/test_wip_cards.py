@@ -464,7 +464,7 @@ def test_runtime_seed_is_explicit_only(entry, tmp_path, monkeypatch, seed):
     assert seen[0].get('CUTEAFD_BENCH_NONCE_SEED') == seed
 
 
-@pytest.mark.parametrize('status', ['pass', 'failed'])
+@pytest.mark.parametrize('status', ['pass', 'fail', 'failed'])
 def test_summary_extracts_exact_cache_check(entry, tmp_path, status):
     job = make(entry, tmp_path)
     report = Path(job['state']) / 'reports' / 'one' / 'report.json'
@@ -473,7 +473,7 @@ def test_summary_extracts_exact_cache_check(entry, tmp_path, status):
     report.write_text(json.dumps({'baseline': {'quality': {'checks': [check], 'status': status}}}))
     row = cards.summarize_job(job, 0)
     assert row['cache'] == check
-    assert row['status'] == ('failed' if status == 'failed' else 'pass')
+    assert row['status'] == ('pass' if status == 'pass' else 'failed')
 
 
 def test_shared_wip_same_slot_and_distinct_serving_instances(entry, tmp_path):

@@ -530,7 +530,9 @@ def summarize_job(job, exit_code):
         checks = quality.get('checks', [])
         fidelity = next((c for c in checks if c['id'] == 'fidelity'), {})
         row.update(C1=next((d['tok_s'] for d in card.get('decode', []) if d['content'] == 'code'), None), C8=(card.get('concurrent') or {}).get('aggregate_tok_s'), **{'8K': (card.get('prefill') or {}).get('tok_s')}, kl=fidelity.get('metrics', {}).get('kl'), top1=fidelity.get('metrics', {}).get('top1'), cache=next((c for c in checks if c['id'] in ('cache_exact', 'cache')), None), spec=next((c for c in checks if 'spec' in c['id']), None), pool=(card.get('capacity') or {}).get('kv_tokens'), readiness_s=report.get('server', {}).get('readiness_s'), report=str(reports[0]), quality=quality.get('status'))
-        if report.get('status') == 'failed' or quality.get('status') == 'failed' or any(c.get('status') == 'failed' for c in checks):
+        # Report/panel statuses serialize as 'failed'; Rust CheckStatus as 'fail'.
+        failed = {'fail', 'failed'}
+        if report.get('status') in failed or quality.get('status') in failed or any(c.get('status') in failed for c in checks):
             row['status'] = 'failed'
     if job.get('correctness_parallel'):
         for metric in ('C1', 'C8', '8K'):
