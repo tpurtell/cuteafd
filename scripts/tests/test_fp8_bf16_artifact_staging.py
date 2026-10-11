@@ -23,6 +23,15 @@ assert preflight_spec.loader is not None
 preflight_spec.loader.exec_module(preflight)
 
 
+def test_coordinator_exports_tp2_for_every_routed_weight_format():
+    for layouts in (package_tool.ROLE_LAYOUTS, package_tool.MXFP4_ROLE_LAYOUTS,
+                    package_tool.NVFP4_ROLE_LAYOUTS):
+        assert layouts["coordinator"] == ("tp1", "tp2")
+    assert package_tool.ROLE_INPUT["coordinator"] == "bf16"
+    cmake = (REPO / "native/cmake/shared/fp8_moe.cmake").read_text()
+    assert 'set(exact_slices "--exact-slices")' in cmake
+
+
 def write_package(path: Path, *, input_kind="wire", role="spark", revision=REVISION):
     layout = "tp4" if role == "spark" else "tp1"
     library = path / layout / "libcuteafd_fp8moe.so"

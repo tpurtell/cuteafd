@@ -337,6 +337,15 @@ impl<'a> Fp8Experts<'a> {
             .with_context(|| format!("FP8 expert layer {layer} is not resident"))
     }
 
+    /// Exact device allocation sizes, without querying CUDA after admission.
+    pub fn resident_bytes(&self) -> usize {
+        self.layers.iter().flat_map(|layer| &layer.regions).map(|region| region.buffer.bytes).sum()
+    }
+
+    pub fn scratch_bytes(&self) -> usize {
+        self.scratch.buffer.bytes
+    }
+
     /// Whether the package takes FP8 K32 wire rows (else BF16 rows).
     pub fn wire_input(&self) -> bool {
         self.module.info().wire_input
