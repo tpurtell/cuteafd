@@ -333,7 +333,7 @@ impl Opened {
             .collect::<Result<Vec<_>>>()?;
         let spark_ranks = args.peers.as_deref().map_or(0, |p| p.split(',').count());
         let prefill_lanes = glm::prefill_lanes(spark_ranks, engine::configured_lanes() as u64) as usize;
-        let request = glm::request(&glm::GlmInputs { cfg: &self.cfg, layers, gpus, headroom_bytes: 2 << 30,
+        let inputs = glm::GlmInputs { cfg: &self.cfg, layers, gpus, headroom_bytes: 2 << 30,
             spark_ranks, skip_routed_experts: args.skip_routed_experts,
             prefill_rows: args.prefill_rows as u64,
             prefill_lanes: prefill_lanes as u64,
@@ -341,8 +341,10 @@ impl Opened {
             drafter_bytes, drafter_staging, pending_code, experts: Vec::new(),
             expert_workspace: 0, tp2_workspace: [0; 2], requested_pool: (args.pool_tokens > 0).then_some(args.pool_tokens as u64),
             onboard: if args.skip_routed_experts { cuteafd_loader::placement::Onboard::Layers(0) }
-                else { args.rtx_expert_layers }, full_prefill_logits: args.full_prefill_logits })?;
-        let placement = cuteafd_loader::placement::solve(&request)?;
+                else { args.rtx_expert_layers }, full_prefill_logits: args.full_prefill_logits };
+        let (placement, working) = glm::solve_working_set(&inputs, [0; 2], None)?;
+        let prefill_lanes = usize::try_from(working.prefill_lanes)?;
+        let selected_peers = if working.spark_ranks > 0 { args.peers.as_deref() } else { None };
         cuteafd_loader::placement::families::GLM5.check(&placement)?;
         tracing::info!(placement = %placement.summary(), "GLM admission");
         let pool_tokens = usize::try_from(placement.pool_tokens)?;
@@ -386,12 +388,12 @@ impl Opened {
             timeout: std::time::Duration::from_secs(120), max_frame_bytes: 64 << 20 };
         let row_bytes = self.cfg.hidden * 2;
         crate::shared::memory_report::release_load_staging(&self.library);
-        let mut transport = args.peers.as_deref().map(|peers| -> Result<SparkLink<'_>> {
+        let mut transport = selected_peers.map(|peers| -> Result<SparkLink<'_>> {
             let (peers, executors) = ranks(peers)?;
             SparkLink::new(&self.library, &peers, &executors, 4096, config.clone(), row_bytes)
         }).transpose()?;
         // One transport thread per prefill lane (their waves fly beside each other's).
-        let mut lanes = match args.peers.as_deref() {
+        let mut lanes = match selected_peers {
             Some(peers) => (0..prefill_lanes).filter(|_| prefill_lanes > 1).map(|_| {
                 let (peers, executors) = ranks(peers)?;
                 SparkLane::new(&self.library, peers, executors, 4096, config.clone(), row_bytes)
@@ -402,7 +404,8 @@ impl Opened {
         // Connect every rank and register full-size buffers now: the first
         // request otherwise pays seconds of connection setup.
         let (rows, h, topk, experts, layer) =
-            (args.prefill_rows, self.cfg.hidden, self.cfg.topk, self.cfg.experts, self.cfg.first_moe_layer as u32);
+            (args.prefill_rows, self.cfg.hidden, self.cfg.topk, self.cfg.experts,
+                working.spark_layers.first().copied().unwrap_or(self.cfg.first_moe_layer) as u32);
         let warm = move || -> Result<cuteafd_transport::ExpertProtocolV2Request> {
             let routes = (0..rows * topk).map(|i| cuteafd_transport::ExpertProtocolV2RouteEntry {
                 row_index: (i / topk) as u32, expert_id: (i % experts) as u32, gate_weight: 0.0,

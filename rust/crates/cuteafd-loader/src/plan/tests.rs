@@ -192,13 +192,16 @@ fn glm5_layout_matches_runtime_request_from_header_baseline() {
                 .filter(|i| matches!(i.category, Category::Weights | Category::Embedding)
                     || i.group == "context+modules")
                 .map(|i| i.bytes).sum::<u64>() })).collect();
-        let r = glm::request(&glm::GlmInputs { cfg: &cfg, layers: cfg.layers, gpus,
-            headroom_bytes: options.headroom_bytes, spark_ranks: 4, skip_routed_experts: false, prefill_rows: 4096,
+        let inputs = glm::GlmInputs { cfg: &cfg, layers: cfg.layers, gpus,
+            headroom_bytes: options.headroom_bytes, spark_ranks: 4, skip_routed_experts: false,
+            prefill_rows: 4096,
             prefill_lanes: 3, max_context: 65536, scratch: None, drafter_bytes: 0,
             drafter_staging: 0, pending_code: vec![], experts: vec![], expert_workspace: 0,
             tp2_workspace: [0; 2], requested_pool: pool, onboard: Onboard::Auto,
-            full_prefill_logits: false }).unwrap();
-        let runtime = crate::placement::solve(&r).unwrap();
+            full_prefill_logits: false };
+        let (runtime, working) = glm::solve_working_set(&inputs, [0; 2], Some(report.attention_placement)).unwrap();
+        assert_eq!(working.spark_ranks, 4);
+        assert_eq!(working.prefill_lanes, 3);
         assert_eq!(memory.pool_tokens, runtime.pool_tokens);
         for (rank, items) in runtime.items.iter().enumerate() {
             for item in items { assert!(memory.devices[rank].items.contains(item), "missing {item:?}"); }

@@ -1022,7 +1022,10 @@ pub fn layout(report: &mut PlanReport, model: &dyn super::FamilyModel, checkpoin
     if family == "glm5" {
         match glm5_placement(report, checkpoint, options, &devices[..active_gpus], workspace_manifest.as_ref(),
             prefill_rows, context_tokens) {
-            Ok(placement) => {
+            Ok((placement, working)) => {
+                if working.spark_layers.is_empty() { spark_devices.clear(); }
+                notes.push(format!("GLM selected working set: {} Spark layers, {} ranks, {} prefill lanes",
+                    working.spark_layers.len(), working.spark_ranks, working.prefill_lanes));
                 for (device, items) in devices.iter_mut().zip(&placement.items) {
                     device.items.extend(items.iter().cloned());
                     device.kv_tokens = placement.pool_tokens;
@@ -1457,7 +1460,7 @@ fn qwen_package_scratch(checkpoint: &super::Checkpoint, report: &PlanReport, wor
 /// GLM's shared admission over header-derived coordinator storage.
 fn glm5_placement(report: &PlanReport, checkpoint: &super::Checkpoint, options: &LayoutOptions,
     devices: &[DeviceLayout], manifest: Option<&serde_json::Value>, rows: u64, context: u64)
-    -> anyhow::Result<crate::placement::Placement> {
+    -> anyhow::Result<(crate::placement::Placement, crate::placement::families::glm5::GlmWorkingSet)> {
     use crate::placement::{families::glm5 as glm, Baseline, Onboard};
     let cfg = crate::families::glm5::GlmDsaConfig::from_hf(&checkpoint.config)?;
     let spark_ranks = match report.placement { ExpertPlacement::Sparks { ranks } => ranks, ExpertPlacement::Local => 0 };
@@ -1481,13 +1484,12 @@ fn glm5_placement(report: &PlanReport, checkpoint: &super::Checkpoint, options: 
     let gpus = devices.iter().zip(&options.rtx_bytes).map(|(d, &capacity)| (capacity,
         Baseline::Planned { context_bytes: 0, loaded_bytes: d.used_bytes() })).collect();
     let onboard = options.onboard.or(options.local_expert_layers.map(Onboard::Layers)).unwrap_or_else(glm::default_onboard);
-    let mut request = glm::request(&glm::GlmInputs { cfg: &cfg, layers: cfg.layers, gpus,
+    let inputs = glm::GlmInputs { cfg: &cfg, layers: cfg.layers, gpus,
         headroom_bytes: options.headroom_bytes, spark_ranks, skip_routed_experts: false, prefill_rows: rows, prefill_lanes: lanes,
         max_context: context, scratch, drafter_bytes: draft, drafter_staging: draft_staging, pending_code: Vec::new(),
         experts: Vec::new(), expert_workspace: 0, tp2_workspace: [0; 2], requested_pool: options.pool_tokens,
-        onboard, full_prefill_logits: options.full_prefill_logits })?;
-    request.attention_placement = Some(report.attention_placement);
-    Ok(crate::placement::solve(&request)?)
+        onboard, full_prefill_logits: options.full_prefill_logits };
+    Ok(glm::solve_working_set(&inputs, [0; 2], Some(report.attention_placement))?)
 }
 
 struct V4PlanShape {
