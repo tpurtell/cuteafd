@@ -3,6 +3,23 @@ use crate::NativeLibrary;
 use anyhow::{ensure, Result};
 use std::ffi::c_void;
 
+/// A strided byte plane for [`NativeLibrary::peer_push_planes`]
+/// (`cuteafd_peer_plane_t`): `rows` rows of `row_bytes`, pitches in bytes,
+/// everything 16-byte aligned.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct PeerPlane {
+    pub destination: *mut c_void,
+    pub source: *const c_void,
+    pub rows: u64,
+    pub row_bytes: u64,
+    pub destination_pitch: u64,
+    pub source_pitch: u64,
+}
+
+/// `CUTEAFD_PEER_MAX_PLANES`.
+pub const PEER_MAX_PLANES: usize = 4;
+
 /// One `cuteafd_p2p_probe` measurement (see `cuteafd_peer_exchange.h`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum P2pTest {
@@ -299,6 +316,32 @@ impl NativeLibrary {
             status == 0,
             "peer push of {bytes} bytes failed with CUDA error {status}"
         );
+        Ok(())
+    }
+
+    /// Copies up to [`PEER_MAX_PLANES`] strided planes (local or peer) in one
+    /// launch, then publishes the next sequence to `flag` exactly as
+    /// [`NativeLibrary::peer_push_signal`] does, so the two share a link
+    /// (see `cuteafd_peer_push_planes`). `link` `None` copies only.
+    ///
+    /// # Safety
+    /// As [`NativeLibrary::peer_push_signal`] for every plane: `stream` is on
+    /// the current device, which has peer access to any peer pointer; every
+    /// source stays unchanged and every destination unread until the matching
+    /// wait (or, without a link, until later work on this stream).
+    pub unsafe fn peer_push_planes(
+        &self,
+        planes: &[PeerPlane],
+        link: Option<(*mut u32, *mut u32)>,
+        blocks: u32,
+        stream: *mut c_void,
+    ) -> Result<()> {
+        type F = unsafe extern "C" fn(*const PeerPlane, u32, *mut u32, *mut u32, u32, *mut c_void) -> i32;
+        ensure!((1..=PEER_MAX_PLANES).contains(&planes.len()), "{} planes in one push", planes.len());
+        let f = *unsafe { self.lib.get::<F>(b"cuteafd_peer_push_planes") }?;
+        let (flag, send_state) = link.unwrap_or((std::ptr::null_mut(), std::ptr::null_mut()));
+        let status = unsafe { f(planes.as_ptr(), planes.len() as u32, flag, send_state, blocks, stream) };
+        ensure!(status == 0, "peer push of {} planes failed with CUDA error {status}", planes.len());
         Ok(())
     }
 
