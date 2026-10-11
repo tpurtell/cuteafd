@@ -293,6 +293,11 @@ pub(crate) struct Draft {
 /// FP32 logits `[rows, vocab]` of BF16 rows `[rows, hidden]` on a stream: `(x, logits, rows, stream)`.
 pub(crate) type HeadLaunch<'h> = Box<dyn Fn(*const c_void, *mut f32, usize, *mut c_void) -> Result<()> + 'h>;
 
+/// Populate BF16 draft input rows on the supplied stream. A remote target
+/// gathers on its own device and lands the rows before this stream consumes them.
+/// The callback retains every source/transport buffer until the queued copy completes.
+pub(crate) type InputLaunch<'h> = dyn Fn(&[u32], CuteafdDeviceBuffer, *mut c_void) -> Result<()> + 'h;
+
 /// The target's vocabulary head a draft step borrows: its only resident copy,
 /// never duplicated or repacked by the drafter.
 pub(crate) enum TargetHead<'h> {
@@ -309,6 +314,11 @@ enum HeadCall<'h> {
     Launch(&'h HeadLaunch<'h>),
 }
 
+fn draft_input_ids(sequences: &[DraftSeq], mask_token: u32, block: usize) -> Vec<u32> {
+    sequences.iter().flat_map(|seq| std::iter::once(seq.anchor)
+        .chain(std::iter::repeat_n(mask_token, block - 1))).collect()
+}
+
 /// Where a draft step's input rows come from.
 #[derive(Clone, Copy)]
 enum DraftInput<'r, 'e> {
@@ -316,6 +326,8 @@ enum DraftInput<'r, 'e> {
     Rows(&'r [u8]),
     /// Gathered on the device from the target's embedding table by token id.
     Table(&'r TokenEmbedding<'e>),
+    /// A device-ordered gather/transport bridge owned by the target.
+    Launch(&'r InputLaunch<'r>),
 }
 
 pub(crate) struct GlmDrafter<'a> {
@@ -819,6 +831,14 @@ impl<'a> GlmDrafter<'a> {
         self.draft_from(sequences, DraftInput::Table(embedding), self.head_call(&head)?)
     }
 
+    /// Device input bridge for a drafter on another GPU. Existing same-device
+    /// callers keep `draft_device`; the bridge must order input writes before
+    /// returning and keep its owners alive through the draft's stream drain.
+    pub(crate) fn draft_device_with(&self, sequences: &[DraftSeq], input: &InputLaunch<'_>, head: TargetHead<'_>)
+        -> Result<Vec<Draft>> {
+        self.draft_from(sequences, DraftInput::Launch(input), self.head_call(&head)?)
+    }
+
     fn head_call<'h>(&self, head: &'h TargetHead<'h>) -> Result<HeadCall<'h>> {
         Ok(match head {
             TargetHead::Bf16(owner) => HeadCall::Bf16(self.borrowed_head(owner)?),
@@ -841,7 +861,7 @@ impl<'a> GlmDrafter<'a> {
         let (s_count, block, h) = (sequences.len(), c.block, c.hidden);
         let rows_ok = match input {
             DraftInput::Rows(r) => r.len() == s_count * h * 2,
-            DraftInput::Table(_) => true,
+            DraftInput::Table(_) | DraftInput::Launch(_) => true,
         };
         ensure!(s_count > 0 && s_count <= self.max_sequences && rows_ok, "draft step of {s_count} sequences");
         let rows = s_count * block;
@@ -872,10 +892,12 @@ impl<'a> GlmDrafter<'a> {
                 self.put(&w.h, &embed)?;
             }
             DraftInput::Table(embedding) => {
-                let ids: Vec<u32> = sequences.iter()
-                    .flat_map(|seq| std::iter::once(seq.anchor).chain(std::iter::repeat_n(c.mask_token, block - 1)))
-                    .collect();
+                let ids = draft_input_ids(sequences, c.mask_token, block);
                 embedding.embed(&ids, w.ids.buffer, 1, w.h.buffer, self.stream)?;
+            }
+            DraftInput::Launch(input) => {
+                let ids = draft_input_ids(sequences, c.mask_token, block);
+                input(&ids, w.h.buffer, self.stream)?;
             }
         }
         self.put(&w.positions, bytes_of(&positions))?;
@@ -1268,6 +1290,15 @@ mod checkpoint_header_tests {
         assert!(checkpoint.bytes("fc.weight", &[4, 1]).is_err());
         checkpoint.tensors.get_mut("fc.weight").unwrap().byte_length = 6;
         assert!(checkpoint.bytes("fc.weight", &[2, 2]).is_err());
+    }
+
+    #[test]
+    fn device_input_bridge_keeps_anchor_then_mask_row_order() {
+        let seqs = [DraftSeq { slot: 1, anchor: 42, position: 7, valid_from: 0 },
+            DraftSeq { slot: 0, anchor: 9, position: 13, valid_from: 0 }];
+        assert_eq!(draft_input_ids(&seqs, 17, 3), [42, 17, 17, 9, 17, 17]);
+        assert_eq!(draft_input_ids(&seqs, 17, 1), [42, 9]);
+        assert!(draft_input_ids(&[], 17, 8).is_empty());
     }
 
     fn small_config() -> DflashConfig {
