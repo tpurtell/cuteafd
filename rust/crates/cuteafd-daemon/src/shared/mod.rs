@@ -23,6 +23,7 @@ pub(crate) mod prefill_share;
 pub(crate) mod prefix;
 pub(crate) mod probe;
 pub(crate) mod sampler;
+pub(crate) mod speculation;
 pub(crate) mod token_io;
 pub(crate) mod spark_intake;
 pub(crate) mod spark_topology;
