@@ -157,17 +157,19 @@ impl LocalVerbsExpertConnection {
         stream: TcpStream, max_frame_bytes: usize, timing: bool,
         budget: Arc<RingBudget>, selection: Option<(usize, &crate::worker_selection::WorkerSelection)>,
     ) -> Result<Self> {
+        // Keep legacy setup ordering byte-for-byte when selection is off.
+        if selection.is_none() { verbs_host_preflight()?; }
         let start = match Self::read_persistent_start(&stream, max_frame_bytes, selection) {
             Ok(start) => start,
             Err(error) => {
-                if !error.is::<crate::worker_selection::WorkerSelectionOnly>() && !error.is::<FlowProbesOnly>() {
+                if selection.is_some() && !error.is::<crate::worker_selection::WorkerSelectionOnly>() && !error.is::<FlowProbesOnly>() {
                     let mut stream = stream;
                     let _ = crate::worker_selection::reject_worker_selection(&mut stream, &error);
                 }
                 return Err(error);
             }
         };
-        verbs_host_preflight()?;
+        if selection.is_some() { verbs_host_preflight()?; }
         // Validate the wire ring geometry first so the reserved byte count is
         // the authoritative span that the native allocation will pin.
         let (request_ring, response_ring) = Self::validated_rings(&start)?;
