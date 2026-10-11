@@ -35,6 +35,16 @@ pub(crate) struct GoldenArgs {
     /// Save the scored rows' F32 logits here (`[rows, vocab]`, little endian).
     #[arg(long)]
     pub save_logits: Option<PathBuf>,
+    /// Prefix-cache restore check instead of scoring: for each P, serve `tokens[..P]` (retained
+    /// as a prompt snapshot), repeat it (an exact hit: every generated row must be byte-identical),
+    /// then continue it by a short (<128) and a long (>=128) suffix of the golden tokens (exact
+    /// ancestor restores, compared with the same request served cold) and branch it at P - 37
+    /// (a partial, approximate replay: generated rows' KL and top-1 against cold). Comma separated.
+    #[arg(long, value_delimiter = ',')]
+    pub resume_at: Vec<usize>,
+    /// Generated rows recorded per request in --resume-at.
+    #[arg(long, default_value_t = 16)]
+    pub resume_rows: usize,
 }
 
 /// Rows the probe records, in position order: each row's log-probabilities
@@ -61,6 +71,9 @@ fn read_tokens(args: &GoldenArgs) -> Result<Vec<u32>> {
 
 fn golden(args: GoldenArgs) -> Result<()> {
     let tokens = read_tokens(&args)?;
+    if !args.resume_at.is_empty() {
+        return resume::check(args.serve, &tokens, &args.resume_at, args.resume_rows);
+    }
     ensure!((1..tokens.len()).contains(&args.score_from), "--score-from must be inside the golden prompt");
     let GoldenArgs { serve, golden, score_from, score_path, verify_rows, save_logits, .. } = args;
     let dump = tempdir()?;
@@ -208,6 +221,9 @@ fn report(args: &Report, tokens: &[u32], rows: &Rows, seconds: f64) -> Result<()
     }
     Ok(())
 }
+
+#[path = "v41_golden/resume.rs"]
+mod resume;
 
 #[cfg(test)]
 mod tests {
