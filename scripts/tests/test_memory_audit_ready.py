@@ -98,3 +98,13 @@ def test_tp2_expert_loaders_scope_both_parent_and_parallel_rank_allocations():
         parallel = parent.split("synchronized_load::load_pair", 1)[1]
         assert 'scope_owned(&label)' in parallel.split("Ok(vec![", 1)[0]
     assert memory_audit.category("experts/TP2 expert layer halves 0..36") == "experts"
+
+
+def test_fp8_tp2_pair_scopes_its_bf16_output_with_the_expert_arena():
+    root = Path(__file__).parents[2] / "rust/crates/cuteafd-daemon/src/shared/experts/rtx"
+    source = (root / "fp8moe.rs").read_text()
+    pair = source.split("pub(crate) fn load_pair(", 1)[1].split("fn log_pair_load", 1)[0]
+    scope = 'scope("experts/TP2 FP8 expert layer halves")'
+    assert scope in pair.split("Fp8Experts::load_pair", 1)[0]
+    assert pair.index(scope) < pair.index("Allocation::new(devices[rank], plans[rank].output_bytes)")
+    assert memory_audit.category("experts/TP2 FP8 expert layer halves") == "experts"
