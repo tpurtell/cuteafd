@@ -299,6 +299,9 @@ pub(crate) struct PlanArgs {
     /// Explicit KV pool tokens for --layout (0 or omitted: automatic).
     #[arg(long)]
     pub(crate) pool_tokens: Option<u64>,
+    /// Qwen full-attention KV format for --layout.
+    #[arg(long, default_value_t = cuteafd_loader::families::qwen4::Qwen4KvCache::Bf16)]
+    pub(crate) kv_format: cuteafd_loader::families::qwen4::Qwen4KvCache,
     /// External drafter GiB on the last GPU for --layout (DFlash).
     #[arg(long, default_value_t = 0.0)]
     pub(crate) drafter_gib: f64,

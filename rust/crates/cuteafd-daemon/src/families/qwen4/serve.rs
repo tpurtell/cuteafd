@@ -218,7 +218,7 @@ fn serve_loop(mut args: super::EngineArgs, mut receive: mpsc::Receiver<NativeReq
     let mut media = MediaAdmission::new(EmbeddingCache::new(bytes), encoder, 16);
     if args.pool_tokens == 0 {
         let geometry = cuteafd_loader::serving_capacity::qwen_cache_geometry(&opened.cfg,
-            opened.cfg.layers, args.mtp > 0)?;
+            opened.cfg.layers, args.mtp > 0, args.kv_format)?;
         let mark = geometry.ranks[0].retained_mark_bytes as usize;
         let slots = MarkArena::slots_for(max_sequences, prefix.prefix_cache_entries, mark,
             prefix.prefix_cache_mark_mib << 20);
@@ -463,10 +463,10 @@ fn prefix_cache<'e, 'a>(engine: &'e Qwen4Engine<'a>, args: &PrefixArgs, lanes: u
         min_tokens: args.prefix_cache_min_tokens };
     let cache = PrefixCache::new(layout, config, host)?;
     tracing::info!(entries, mark_slots = family.slots(), mark_bytes = family.mark_bytes(), page_bytes = layout.page_bytes,
-        pages = layout.pages, page_rows = layout.page_rows, host_bytes, points = ?args.points(),
+        pages = layout.pages, page_rows = layout.page_rows, kv_format = %engine.kv_format, host_bytes, points = ?args.points(),
         "Qwen 3.8 Flash Next prefix cache");
     cuteafd_bench::context::set_kv((layout.pages * layout.page_rows) as u64, layout.pages as u64,
-        &"BF16 full-attention + GDN/PLE state".to_string(), host_bytes);
+        &format!("{} full-attention + BF16 index + GDN/PLE state", engine.kv_format), host_bytes);
     Ok((family, cache))
 }
 

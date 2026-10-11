@@ -31,7 +31,7 @@ pub fn request(inputs: &QwenInputs<'_>, graph_bytes: u64) -> anyhow::Result<Plac
     let mut previous = 0;
     let mut layers = Vec::new();
     for (index, &kind) in inputs.admission.cfg.attention[..inputs.admission.layers].iter().enumerate() {
-        let geometry = crate::serving_capacity::qwen_cache_geometry(inputs.admission.cfg, index + 1, false)?;
+        let geometry = crate::serving_capacity::qwen_cache_geometry(inputs.admission.cfg, index + 1, false, inputs.admission.kv_format)?;
         let bytes = geometry.ranks[0].persistent_unit_bytes;
         layers.push(LayerDemand {
             kind: if kind == Qwen4Attention::Full { AttentionClass::Gqa } else { AttentionClass::Gdn },
@@ -106,7 +106,7 @@ pub fn placement(inputs: &QwenInputs<'_>) -> anyhow::Result<Placement> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::families::qwen4::Qwen4Config;
+    use crate::families::qwen4::{Qwen4Config, Qwen4KvCache};
     use crate::serving_capacity::qwen_graphs::qwen_graph_pool;
 
     #[test]
@@ -114,13 +114,14 @@ mod tests {
         let mut config = crate::plan::testing::qwen4_config(48);
         config["text_config"]["mtp_num_hidden_layers"] = serde_json::json!(1);
         let cfg = Qwen4Config::from_hf(&config).unwrap();
-        for total in [32_u64 << 30, 101_973_491_712] {
+        for (total, kv_format) in [32_u64 << 30, 101_973_491_712].into_iter().flat_map(|total|
+            [Qwen4KvCache::Bf16, Qwen4KvCache::Fp8].map(|format| (total, format))) {
             for (expert_bytes, mtp) in [(45_u64 << 30, false), (50_u64 << 30, true)] {
                 for requested in [None, Some(32768), Some(2097152)] {
                     let context = 131072;
                     let context_bytes = 586_416_128;
                     let inputs = |baseline| QwenInputs {
-                        admission: QwenAdmissionInputs { cfg: &cfg, layers: 48, mtp, manifest: None,
+                        admission: QwenAdmissionInputs { cfg: &cfg, layers: 48, mtp, kv_format, manifest: None,
                             prefill_rows: 4096, slots: 16, mark_bytes: 256 << 20, full_prefill_logits: 0,
                             ple: Some((160, true)), future_expert_bytes: 0, headroom: 3 << 30 },
                         capacity_bytes: total, baseline, pending_code_bytes: 0, max_context: context,
@@ -154,9 +155,10 @@ mod tests {
         let mut config = crate::plan::testing::qwen4_config(48);
         config["text_config"]["mtp_num_hidden_layers"] = serde_json::json!(1);
         let cfg = Qwen4Config::from_hf(&config).unwrap();
-        for mtp in [false, true] {
+        for (mtp, kv_format) in [false, true].into_iter().flat_map(|mtp|
+            [Qwen4KvCache::Bf16, Qwen4KvCache::Fp8].map(|format| (mtp, format))) {
             let inputs = QwenInputs {
-                admission: QwenAdmissionInputs { cfg: &cfg, layers: 48, mtp, manifest: None,
+                admission: QwenAdmissionInputs { cfg: &cfg, layers: 48, mtp, kv_format, manifest: None,
                     prefill_rows: 4096, slots: 16, mark_bytes: 256 << 20, full_prefill_logits: 0,
                     ple: None, future_expert_bytes: 10 << 30, headroom: 3 << 30 },
                 capacity_bytes: 96 << 30, baseline: Baseline::Measured { free_bytes: 70 << 30 },

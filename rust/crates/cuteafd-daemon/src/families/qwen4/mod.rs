@@ -42,6 +42,9 @@ pub(crate) struct EngineArgs {
     /// Tokens the K/V record pools hold across sequences (0: planner admission).
     #[arg(long, default_value_t = 32_768)]
     pub pool_tokens: usize,
+    /// Full-attention KV records (BF16 index keys in either format).
+    #[arg(long, default_value_t = cuteafd_loader::families::qwen4::Qwen4KvCache::Bf16)]
+    pub kv_format: cuteafd_loader::families::qwen4::Qwen4KvCache,
     /// Concrete serving prefix arena reservation; filled before engine loading.
     #[arg(skip)]
     pub planner_prefix_bytes: Option<u64>,
@@ -385,7 +388,7 @@ impl Opened {
         let max_context = crate::shared::context::pool_context("qwen4", args.max_context, automatic_context, pool_tokens, 256)?;
         let pages = pool_tokens.div_ceil(engine::PAGE_ROWS);
         let mut engine = engine::Qwen4Engine::new(&self.library, &programs, self.cfg.clone(), model, ple, stream,
-            max_context, args.prefill_rows, pages, args.slots, embedding)?;
+            max_context, args.prefill_rows, pages, args.slots, args.kv_format, embedding)?;
         if args.planner_graph_modes.is_some() { engine.enable_startup_graphs(); }
         engine.w8a8_prefill = args.fp8_prefill_w8a8;
         if let Some(experts) = match admitted_experts { Some(experts) => experts, None => self.experts(args, layers, stream)? } {

@@ -102,6 +102,7 @@ pub struct Admitted<P> {
 
 /// What travels with a host snapshot besides its device bytes.
 pub struct HostPayload {
+    pub record_format: &'static str,
     pub session: Option<String>,
     pub after: After,
     pub media: Vec<MediaSpan>,
@@ -720,7 +721,8 @@ impl<E: CopyEngine> PrefixCache<E> {
             draft: None,
             scores: Vec::new(),
         };
-        let payload = HostPayload { session: entry.session.clone(), after: entry.after.clone(), media: entry.media.clone() };
+        let payload = HostPayload { record_format: family.record_format(), session: entry.session.clone(),
+            after: entry.after.clone(), media: entry.media.clone() };
         let host = self.host.as_mut().expect("checked");
         let ticket = match host.store(&snapshot, payload) {
             StoreOutcome::Issued(ticket) | StoreOutcome::Deferred(ticket) => Some(ticket),
@@ -752,6 +754,9 @@ impl<E: CopyEngine> PrefixCache<E> {
         let (Some(snapshot_tokens), Some(payload)) = (host.snapshot_tokens(hit.key), host.payload(hit.key)) else {
             return Ok(None);
         };
+        if payload.record_format != family.record_format() {
+            return Ok(None);
+        }
         let snapshot_tokens = snapshot_tokens.to_vec();
         let after = payload.after.clone();
         let saved_media = payload.media.clone();
