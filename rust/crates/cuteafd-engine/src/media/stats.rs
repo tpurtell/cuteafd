@@ -4,6 +4,9 @@ use serde::Serialize;
 #[derive(Clone, Debug, Default, PartialEq, Serialize)]
 pub struct MediaStats {
     pub encodes: u64,
+    pub submit_waits: u64,
+    pub submit_timeouts: u64,
+    pub encode_timeouts: u64,
     pub encode_ms_p50: f64,
     pub encode_ms_p99: f64,
     pub cache_hits: u64,
