@@ -45,6 +45,9 @@ impl RequestMedia {
     pub fn spans(&self) -> &[MediaSpan] {
         &self.spans
     }
+    pub fn span_features(&self, index: usize) -> Option<&std::sync::Arc<[u8]>> {
+        self.features.get(index)?.as_ref()?.features()
+    }
     pub fn prompt_len(&self) -> usize {
         self.prompt_len
     }
@@ -156,6 +159,28 @@ mod tests {
     use super::super::ImageKey;
     use crate::media::EmbeddingCache;
     use std::sync::Arc;
+    #[test]
+    fn span_features_borrows_attached_features_by_index() {
+        let key = ImageKey([7; 32]);
+        let other = ImageKey([8; 32]);
+        let mut request = RequestMedia::new(vec![
+            MediaSpan { start: 0, len: 1, key: key.into() },
+            MediaSpan { start: 1, len: 1, key: other.into() },
+            MediaSpan { start: 2, len: 1, key: key.into() },
+        ], 2, 3).unwrap();
+        assert!(request.span_features(0).is_none());
+        assert!(request.span_features(3).is_none());
+        let features: Arc<[u8]> = Arc::from([0, 0, 0x80, 0x3f]);
+        let mut cache = EmbeddingCache::new(4);
+        let pin = cache.reserve(key, 4).unwrap();
+        let lease = cache.complete(key, Arc::clone(&features)).unwrap();
+        request.attach(lease).unwrap();
+        drop(pin);
+        assert!(Arc::ptr_eq(request.span_features(0).unwrap(), &features));
+        assert!(request.span_features(1).is_none());
+        assert!(Arc::ptr_eq(request.span_features(2).unwrap(), &features));
+        assert!(request.span_features(usize::MAX).is_none());
+    }
     #[test]
     fn probe_override_uses_a_separate_budgeted_cache_identity() {
         let image = ImageKey([7; 32]); let override_key = ImageKey([8; 32]);
