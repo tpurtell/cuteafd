@@ -43,9 +43,13 @@ pub(crate) struct EngineArgs {
     /// Second GPU of a two-GPU head split: each GPU runs half the KDA and MLA heads (its
     /// KDA state) and half the dense and shared-expert intermediate; mHC, the MLA latent
     /// records and the DSA indexer are replicated; the partial sums meet over peer memory.
-    /// Router, routed experts, LM head and drafter stay on --device.
+    /// Router replicas and admitted routed expert TP2 halves run on both GPUs;
+    /// LM head and drafter stay on --device.
     #[arg(long)]
     pub split_device: Option<i32>,
+    /// Attention executor placement; context/layers are not implemented for GLM Flash.
+    #[arg(long, env = "CUTEAFD_ATTENTION_PLACEMENT", default_value = "auto")]
+    pub attention_placement: String,
     /// Run only the first N layers (layers 0-2 are the dense ones).
     #[arg(long)]
     pub layers: Option<usize>,
@@ -399,6 +403,24 @@ mod draft_cli_tests {
         assert_eq!(parse(&["--draft-head", "tensor"]).draft_head, DraftHead::Tensor);
         assert!(Parse::try_parse_from(["test", "--snapshot", "/checkpoint", "--native-lib", "/native",
             "--draft-head", "fp8"]).is_err());
+    }
+
+    #[test]
+    fn attention_selectors_fail_closed_before_checkpoint_or_cuda() {
+        for mode in ["auto", "heads"] {
+            for peer in [false, true] {
+                let mut args = parse(&["--attention-placement", mode]);
+                args.split_device = peer.then_some(1);
+                check_options(&args).unwrap();
+            }
+        }
+        for mode in ["context", "layers", "unknown"] {
+            for peer in [false, true] {
+                let mut args = parse(&["--attention-placement", mode]);
+                args.split_device = peer.then_some(1);
+                assert!(check_options(&args).unwrap_err().to_string().contains("attention placement"));
+            }
+        }
     }
 
     #[test]
@@ -814,6 +836,10 @@ pub(crate) struct GoldenArgs {
 
 /// Option combinations rejected before any checkpoint or native work.
 fn check_options(args: &EngineArgs) -> Result<()> {
+    let requested = cuteafd_loader::placement::attention::parse(&args.attention_placement)
+        .map_err(anyhow::Error::msg)?;
+    let executor = cuteafd_loader::placement::families::executor("glm5_flash").context("GLM Flash executor")?;
+    executor.check_attention(requested, 1 + usize::from(args.split_device.is_some()), args.split_device.is_some())?;
     let precise = args.kda_fp32_partials || args.kda_output_shard;
     ensure!(!(precise || args.kda_prefill_expanded) ||
         (args.split_device.is_some() && args.kda_fp8 != fp8::KdaFp8::Off),
@@ -1052,7 +1078,8 @@ impl Opened {
         let inputs = admission::GlmfInputs { cfg: &self.cfg, layers,
             gpus: inventory.baselines(&[]), pending_code, headroom_bytes: args.headroom_bytes()?, spark_ranks,
             prefill_lanes: lanes as u64, prefill_rows: args.prefill_rows as u64, decode_rows: args.decode_rows as u64,
-            partial_bytes: if args.kda_fp32_partials { 4 } else { 2 }, max_context: args.max_context as u64, sequences: sequences as u64, state_slots: args.slots as u64,
+            partial_bytes: if args.kda_fp32_partials { 4 } else { 2 }, max_context: args.max_context as u64,
+            sequences: sequences.min(args.decode_rows) as u64, speculation, state_slots: args.slots as u64,
             mark_slots: marks as u64, pool_marks: args.prefix_marks == prefix::PrefixMarks::Pool, index: index.into(),
             kda_state_bytes: args.kda_state.bytes() as u64, shared_replay: args.replay_records == engine::ReplayRecords::Shared,
             representation, resident, router_replica_bytes, workspace, graphs, experts, expert_workspace, tp2_workspace,
