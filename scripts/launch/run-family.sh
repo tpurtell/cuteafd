@@ -161,7 +161,7 @@ qwen_exl3=0
 qwen_nvfp4=0
 qwen_mtp=0
 if [[ "$family" == qwen4 ]]; then
-  kv_format="$(get KV_FORMAT bf16)"
+  kv_format="$(get KV_FORMAT fp8)"
   case "$kv_format" in bf16|fp8) ;; *) release_die "KV_FORMAT must be bf16 or fp8" ;; esac
   # NVFP4: a ModelOpt publication with 4-bit weight groups (nvidia/Qwen3.8-Flash-Next-NVFP4).
   qwen_features="$(python3 -c 'import json,sys; c=json.load(open(sys.argv[1])); q=c.get("quantization_config", {}); m=q.get("quant_method", q.get("method")); g=q.get("config_groups", {}).values(); print(int(m == "exl3"), int(m == "modelopt" and any(x.get("weights", {}).get("num_bits") == 4 for x in g)), c.get("text_config", c).get("mtp_num_hidden_layers", 0))' "$root/snapshots/$revision/config.json")"
@@ -199,7 +199,7 @@ if [[ "$qwen_exl3" == 1 && "$backend" == auto && "$ranks" != 0 ]]; then
       # Older images that do not qualify auto placement keep the Spark fallback.
       preferred="$(docker run --rm --network none -v "$hub:/root/.cache/huggingface/hub:ro" "${wip_mount_args[@]}" \
         "$coordinator_image" cuteafd plan "$snapshot" --attention-placement "$attention_placement" --vision "$vision" --audio "$audio" --json --layout \
-        --rtx 1 --coordinator-gpu-budget-gib "$free_gib" --coordinator-weight-budget-gib "$free_gib" --pool-tokens "$pool" --kv-format "$kv_format" \
+        --rtx 1 --coordinator-gpu-budget-gib "$free_gib" --coordinator-weight-budget-gib "$free_gib" --pool-tokens "$pool" --kv-cache "$kv_format" \
         | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["spark_ranks"])' 2>/dev/null || true)"
       if [[ "$preferred" == 0 ]]; then
         echo "note: Qwen EXL3 auto selected resident local experts on GPU $selected; EXPERT_BACKEND=spark forces Spark ranks" >&2
@@ -450,7 +450,7 @@ fi
 # resident E4M3 copy; QWEN_FP8_HEAD=on|off does the same for the head target and
 # MTP share. Unset keeps the engine defaults.
 if [[ $family == qwen4 ]]; then
-  family_args+=(--kv-format "$kv_format")
+  family_args+=(--kv-cache "$kv_format")
   for key in FP8_DECODE:--fp8-decode FP8_HEAD:--mtp-fp8-head; do
     mode="$(get "QWEN_${key%%:*}")"
     case "$mode" in
@@ -1041,7 +1041,7 @@ if { [[ ( "$family" == mimo_v2 || "$family" == qwen4 || "$family" == glm5_flash 
   if [[ "$family" == glm5_flash && "${decode_rows:-64}" == 128 ]]; then
     plan_draft_args+=(--decode-rows 128)
   fi
-  [[ "$family" != qwen4 ]] || plan_draft_args+=(--kv-format "$kv_format")
+  [[ "$family" != qwen4 ]] || plan_draft_args+=(--kv-cache "$kv_format")
   plan_json="$(docker run --rm --network none -v "$hub:/root/.cache/huggingface/hub:ro" "${wip_mount_args[@]}" \
     "$coordinator_image" cuteafd plan "$snapshot" --attention-placement "$attention_placement" --vision "$vision" --audio "$audio" --json --layout \
     --spark-ranks "$ranks" --spark-budget-gib "$(python3 -c 'import sys;print(int(sys.argv[1])/2**30)' "$budget")" \

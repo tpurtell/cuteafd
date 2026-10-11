@@ -43,7 +43,7 @@ pub(crate) struct EngineArgs {
     #[arg(long, default_value_t = 32_768)]
     pub pool_tokens: usize,
     /// Full-attention KV records (BF16 index keys in either format).
-    #[arg(long, default_value_t = cuteafd_loader::families::qwen4::Qwen4KvCache::Bf16)]
+    #[arg(long = "kv-cache", default_value_t = cuteafd_loader::families::qwen4::Qwen4KvCache::default())]
     pub kv_format: cuteafd_loader::families::qwen4::Qwen4KvCache,
     /// Concrete serving prefix arena reservation; filled before engine loading.
     #[arg(skip)]
@@ -266,9 +266,19 @@ mod weight_representation_tests {
     }
 
     #[test]
+    fn kv_cache_defaults_to_fp8_and_keeps_explicit_bf16() {
+        use cuteafd_loader::families::qwen4::Qwen4KvCache;
+        assert_eq!(args(&[]).unwrap().kv_format, Qwen4KvCache::Fp8);
+        assert_eq!(args(&["--kv-cache", "bf16"]).unwrap().kv_format, Qwen4KvCache::Bf16);
+        assert_eq!(args(&["--kv-cache", "fp8"]).unwrap().kv_format, Qwen4KvCache::Fp8);
+        assert!(args(&["--kv-cache", "int8"]).is_err());
+        assert!(args(&["--kv-format", "bf16"]).is_err());
+    }
+
+    #[test]
     fn required_fp8_producer_uses_selected_kv_format() {
         for format in ["bf16", "fp8"] {
-            let parsed = args(&["--fp8-decode", "true", "--kv-format", format]).unwrap();
+            let parsed = args(&["--fp8-decode", "true", "--kv-cache", format]).unwrap();
             let required = required_fp8_programs(&parsed);
             let suffix = if format == "fp8" { "_kv_fp8" } else { "" };
             for cap in ["m64".to_string(), format!("m{}", parsed.prefill_rows)] {

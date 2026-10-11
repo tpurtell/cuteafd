@@ -293,13 +293,14 @@ def test_qwen_startup_graph_default_is_owned_by_engine(tmp_path, setting, expect
         assert f"CUTEAFD_QWEN4_STARTUP_GRAPHS={expected}" in result.stderr
 
 
-@pytest.mark.parametrize("setting,expected", [("", "bf16"), ("bf16", "bf16"), ("fp8", "fp8")])
-def test_qwen_kv_format_is_explicit_and_bf16_default(tmp_path, setting, expected):
+@pytest.mark.parametrize("setting,expected", [("", "fp8"), ("bf16", "bf16"), ("fp8", "fp8")])
+def test_qwen_kv_format_is_explicit_and_fp8_default(tmp_path, setting, expected):
     keys = "" if not setting else f"KV_FORMAT={setting}\n"
     result = _family_launch_result(tmp_path, SPLIT_CONFIGS["qwen4"], "test/qwen", keys)
     assert result.returncode == 0, result.stderr
     launch = next(line for line in result.stderr.splitlines() if "serve-qwen4 --snapshot" in line)
-    assert f"--kv-format {expected}" in launch
+    assert f"--kv-cache {expected}" in launch
+    assert "--kv-format" not in launch
 
 
 def test_qwen_invalid_kv_format_fails_before_launch(tmp_path):

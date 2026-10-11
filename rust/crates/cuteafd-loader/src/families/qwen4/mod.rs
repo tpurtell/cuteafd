@@ -12,9 +12,9 @@ pub use ngram::{NgramHasher, NgramHistory};
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Qwen4KvCache {
-    #[default]
     Bf16,
     /// E4M3 K then V, followed by per-token/per-head FP32 K and V descales.
+    #[default]
     Fp8,
 }
 

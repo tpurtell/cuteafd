@@ -95,7 +95,7 @@ impl Default for CacheOptions {
             coordinator_ranks: 1,
             native_mtp_layers: 0,
             mimo_kv: MimoKvCache::Int8,
-            qwen_kv: Qwen4KvCache::Bf16,
+            qwen_kv: Qwen4KvCache::default(),
             prefill_rows: 4096,
             glmf_index: GlmfIndexCache::Keys,
             kda_state_bytes: 4,
@@ -943,7 +943,8 @@ mod tests {
         let mut config = qwen4_config(48);
         config["text_config"]["mtp_num_hidden_layers"] = json!(1);
         let cfg = Qwen4Config::from_hf(&config).unwrap();
-        assert_eq!(CacheOptions::default().qwen_kv, Qwen4KvCache::Bf16);
+        assert_eq!(CacheOptions::default().qwen_kv, Qwen4KvCache::Fp8);
+        assert_eq!(crate::plan::layout::LayoutOptions::default().qwen_kv, Qwen4KvCache::Fp8);
         assert_eq!(Qwen4KvCache::Bf16.record_bytes(2, 256), 2048);
         assert_eq!(Qwen4KvCache::Fp8.record_bytes(2, 256), 1040);
         for mtp in [false, true] {

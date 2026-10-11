@@ -88,7 +88,7 @@ mod tests {
                     .map(|i| i.bytes).sum::<u64>();
                 let mut args = Cli::try_parse_from(["serve", "--snapshot", snapshot.path().to_str().unwrap(),
                     "--native-lib", "/nonexistent/lib.so", "--max-context", "131072", "--slots", "8",
-                    "--pool-tokens", &pool.unwrap_or(0).to_string(), "--kv-format", &kv_format.to_string()])?.engine;
+                    "--pool-tokens", &pool.unwrap_or(0).to_string(), "--kv-cache", &kv_format.to_string()])?.engine;
                 args.planner_prefix_bytes = Some(0);
                 args.planner_graph_modes = Some((8, true));
                 let inputs = super::inputs(&args, &cfg, 48, false, None, None, 0)?;
