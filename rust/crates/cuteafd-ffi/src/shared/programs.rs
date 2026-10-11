@@ -214,6 +214,8 @@ impl<'a> Programs<'a> {
             }
             // SAFETY: loading reads the static table and loads a CUDA library.
             let status = unsafe { (self.load)(*index) };
+            ensure!(status != -12001,
+                "loading {name} refused: insufficient resident SMs for its fused diagnostic CTA barrier");
             ensure!(status == 0, "loading {name} failed with CUDA status {status}");
             loaded += 1;
         }
@@ -245,6 +247,8 @@ impl<'a> Programs<'a> {
         // SAFETY: loading reads the program table and loads a CUDA library on
         // the caller's current device.
         let status = unsafe { (self.load)(*index) };
+        ensure!(status != -12001,
+            "loading {name} refused: insufficient resident SMs for its fused diagnostic CTA barrier");
         ensure!(status == 0, "loading {name} failed with CUDA status {status}");
         Ok(Program { programs: self, index: *index, spec })
     }

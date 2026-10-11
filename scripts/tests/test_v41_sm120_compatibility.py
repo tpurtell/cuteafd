@@ -18,6 +18,7 @@ using cudaLibrary_t = void*;
 using cudaStream_t = void*;
 using cudaError_t = int;
 constexpr int cudaSuccess=0, cudaErrorInvalidValue=1, cudaErrorMemoryAllocation=2, cudaErrorInvalidDevice=101;
+constexpr int cudaErrorInvalidResourceHandle=400, cudaErrorNoKernelImageForDevice=209;
 constexpr int cudaDevAttrComputeCapabilityMajor=1, cudaDevAttrComputeCapabilityMinor=2,
               cudaDevAttrMultiProcessorCount=3;
 inline int device=2, major=12, minor=0, recorded_grid=0, recorded_cap=0, attribute_error=0, override_sms=0;
@@ -128,6 +129,61 @@ int main() {
    reinterpret_cast<uint8_t*>(0x20000),1,nullptr)==cudaErrorInvalidDevice);
 }
 """
+
+
+def test_fused_diagnostic_load_fails_before_cuda_initialization_on_sm170():
+    compiler = shutil.which("g++")
+    if not compiler:
+        pytest.skip("native bridge qualification needs a C++ compiler")
+    subprocess.run(["python3", str(ROOT / "scripts/build/assert-build-filesystem.py"), str(BUILD_ROOT)], check=True)
+    BUILD_ROOT.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=BUILD_ROOT) as temp:
+        directory = Path(temp)
+        (directory / "cuda_runtime.h").write_text(CUDA)
+        (directory / "dsv4_programs.h").write_text(r'''
+#pragma once
+#include "cuda_runtime.h"
+inline int initializes=0;
+inline void counted_init(void** args) { ++initializes; init(args); }
+#define CUTEAFD_DSV4_CC_MINOR 0
+#define CUTEAFD_DSV4_PROGRAMS \
+ {"flash",counted_init,load,noop,1,"i",188}, \
+ {"pro",counted_init,load,noop,1,"i",188}, \
+ {"glm",counted_init,load,noop,1,"i",188}, \
+ {"glmf",counted_init,load,noop,1,"i",188}, \
+ {"m16",counted_init,load,noop,1,"i",11}, \
+ {"ordinary",counted_init,load,noop,1,"i",0}
+''')
+        (directory / "main.cc").write_text(r'''
+#include <cassert>
+#include "SOURCE"
+int main() {
+ for (uint32_t i=0; i<4; ++i) {
+  assert(cuteafd_dsv4_program_load(i)==CUTEAFD_DSV4_ERROR_INSUFFICIENT_RESIDENT_SMS);
+  assert(initializes==0 && !programs[i].library && !programs[i].loaded[2]);
+  void* pointers[]={reinterpret_cast<void*>(0x10000)}; uint64_t scalars[]={1};
+  assert(cuteafd_dsv4_program_launch(i,pointers,scalars,nullptr)==cudaErrorInvalidResourceHandle);
+ }
+ attribute_error=999;
+ assert(cuteafd_dsv4_program_load(0)==999 && initializes==0);
+ attribute_error=0; override_sms=188;
+ for (uint32_t i=0; i<4; ++i) {
+  assert(cuteafd_dsv4_program_load(i)==0);
+  assert(cuteafd_dsv4_program_load(i)==0);
+ }
+ assert(initializes==4);
+ override_sms=170;
+ assert(cuteafd_dsv4_program_load(0)==CUTEAFD_DSV4_ERROR_INSUFFICIENT_RESIDENT_SMS);
+ assert(cuteafd_dsv4_program_load(4)==0 && cuteafd_dsv4_program_load(5)==0);
+ override_sms=0; minor=1;
+ assert(cuteafd_dsv4_program_load(5)==cudaErrorNoKernelImageForDevice);
+}
+'''.replace("SOURCE", str(ROOT / "native/shared/src/dsv4_programs.cc")))
+        subprocess.run([compiler, "-std=c++17", "-pthread", "-I", str(directory),
+                        "-I", str(ROOT / "native/shared/include"),
+                        str(directory / "main.cc"), "-o", str(directory / "test")],
+                       check=True, timeout=750)
+        subprocess.run([str(directory / "test")], check=True, timeout=30)
 
 
 @pytest.mark.parametrize("blocks", [1, 2])

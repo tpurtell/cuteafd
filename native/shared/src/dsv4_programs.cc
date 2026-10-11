@@ -1,6 +1,6 @@
 // Generic launcher for the exported DeepSeek V4 coordinator programs. The
 // exporter generates dsv4_programs.h: one {name, init, load, entry, pointer
-// count, scalar kinds} row per program.
+// count, scalar kinds, minimum resident SMs} row per program.
 #include "cuteafd_dsv4_programs.h"
 #include "dsv4_programs.h"
 #include <cuda_runtime.h>
@@ -19,6 +19,7 @@ struct Program {
   LaunchFn launch;
   uint32_t pointers;
   const char* kinds;
+  uint32_t minimum_sms;
   cudaLibrary_t library = nullptr;
   bool loaded[kMaxDevices] = {};
 };
@@ -49,9 +50,18 @@ extern "C" int32_t cuteafd_dsv4_program_load(uint32_t index) {
   cudaError_t status = cudaGetDevice(&device);
   if (status != cudaSuccess) return status;
   if (device < 0 || device >= kMaxDevices) return cudaErrorInvalidDevice;
-  cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device);
-  cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device);
+  status = cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device);
+  if (status != cudaSuccess) return status;
+  status = cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device);
+  if (status != cudaSuccess) return status;
   if (major != 12 || minor != CUTEAFD_DSV4_CC_MINOR) return cudaErrorNoKernelImageForDevice;
+  if (program->minimum_sms) {
+    int sms = 0;
+    status = cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device);
+    if (status != cudaSuccess) return status;
+    if (sms <= 0 || static_cast<uint32_t>(sms) < program->minimum_sms)
+      return CUTEAFD_DSV4_ERROR_INSUFFICIENT_RESIDENT_SMS;
+  }
   std::lock_guard<std::mutex> lock(load_mutex);
   if (program->loaded[device]) return cudaSuccess;
   auto* library = &program->library;

@@ -623,7 +623,7 @@ def build(args: argparse.Namespace) -> None:
                 if geometry != 'v41':
                     options['hidden'] = hidden
                 block = route_block(geometry, capacity)
-                ws = tile is None and warp_specialized(geometry, args.role, width, capacity)
+                ws = len(args.bits) == 2 and tile is None and warp_specialized(geometry, args.role, width, capacity)
                 if ws:
                     block = 64
                 if block != 8:
@@ -638,9 +638,9 @@ def build(args: argparse.Namespace) -> None:
                         options['ws_dynamic_tiles'] = True
                     if (policy_tile := ws_tile(geometry, args.role, width, capacity)) is not None:
                         options['tile'] = policy_tile
-                elif tile is None and fused_input_rotation(geometry, args.role, width, capacity):
+                elif len(args.bits) == 2 and tile is None and fused_input_rotation(geometry, args.role, width, capacity):
                     options['fused_input_rotation'] = True
-                elif token_major_rotation(geometry, capacity):
+                elif len(args.bits) == 2 and token_major_rotation(geometry, capacity):
                     options['token_major_rotation'] = True
                 if (limit := swiglu_limit(geometry)) != 10.0:
                     options['swiglu_limit'] = limit

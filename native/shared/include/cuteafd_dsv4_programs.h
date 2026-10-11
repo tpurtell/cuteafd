@@ -16,6 +16,10 @@ typedef struct {
   char scalar_kinds[16];
 } cuteafd_dsv4_program_info_t;
 
+/* A fused diagnostic's spin-barrier CTA group cannot be resident on this card.
+ * This is an engine contract error, not a CUDA runtime status. */
+#define CUTEAFD_DSV4_ERROR_INSUFFICIENT_RESIDENT_SMS (-12001)
+
 uint32_t cuteafd_dsv4_program_count(void);
 int32_t cuteafd_dsv4_program_info(uint32_t index, cuteafd_dsv4_program_info_t* out);
 /* Loads the program's kernels on the current device; idempotent per device. */

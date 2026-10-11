@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import contextmanager
 import hashlib
 import importlib.util
 import json
@@ -137,16 +138,31 @@ def export_routed(extra, output):
     (output / "routed.json").write_text(json.dumps({"programs": records}, indent=2) + "\n")
 
 
+@contextmanager
+def cpu_trellis_luts(modules, cpu_device):
+    # Each tier module binds the helper independently. The LUT is a runtime
+    # buffer, not a compiler input; retain its values without initializing CUDA.
+    originals = [(module, module._trellis256_execution_lut) for module in modules]
+    try:
+        for module, original in originals:
+            module._trellis256_execution_lut = lambda device, codebook, original=original: original(cpu_device, codebook)
+        yield
+    finally:
+        for module, original in originals:
+            module._trellis256_execution_lut = original
+
+
 def export_exl3(extra, output):
     """Follow production coordinator profiles and tuning, but allocate no CUDA buffers."""
+    import torch
+    from b12x.moe._shared.kernels.w4a16 import mixed_trellis, mixed_trellis4
+    with cpu_trellis_luts((mixed_trellis, mixed_trellis4), torch.device("cpu")):
+        _export_exl3(extra, output)
+
+
+def _export_exl3(extra, output):
     import package_exl3_aot as package
     from export_b12x_exl3_aot import export
-    import torch
-    from b12x.moe._shared.kernels.w4a16 import mixed_trellis
-    original_lut = mixed_trellis._trellis256_execution_lut
-    # The LUT is a runtime buffer created after compilation, not a compiler input.
-    # Keep its exact values on CPU; the offline worker still forbids CUDA allocation.
-    mixed_trellis._trellis256_execution_lut = lambda device, codebook: original_lut(torch.device("cpu"), codebook)
     geometry = extra[extra.index("--geometry") + 1]
     capacities = sorted({int(item) for item in extra[extra.index("--capacities") + 1].split(",")})
     bits = tuple(int(item) for item in extra[extra.index("--bits") + 1].split(",")) if "--bits" in extra else (3, 4)
@@ -154,7 +170,7 @@ def export_exl3(extra, output):
         for rows in capacities:
             options = {"hidden": package.GEOMETRIES[geometry][0], "compile_only": True}
             block = package.route_block(geometry, rows)
-            if package.warp_specialized(geometry, "coordinator", width, rows):
+            if len(bits) == 2 and package.warp_specialized(geometry, "coordinator", width, rows):
                 block = 64
                 options["warp_specialized"] = True
                 if package.wire_input(geometry, "coordinator", width, rows):
@@ -167,9 +183,9 @@ def export_exl3(extra, output):
                 tile = package.ws_tile(geometry, "coordinator", width, rows)
                 if tile is not None:
                     options["tile"] = tile
-            elif package.fused_input_rotation(geometry, "coordinator", width, rows):
+            elif len(bits) == 2 and package.fused_input_rotation(geometry, "coordinator", width, rows):
                 options["fused_input_rotation"] = True
-            elif package.token_major_rotation(geometry, rows):
+            elif len(bits) == 2 and package.token_major_rotation(geometry, rows):
                 options["token_major_rotation"] = True
             options.update(route_block=block, swiglu_limit=package.swiglu_limit(geometry))
             export(output / profile / f"m{rows}", width, experts, rows, bits, "auto", topk, dtype, **options)

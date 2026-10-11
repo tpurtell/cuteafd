@@ -63,6 +63,15 @@ def validate_table_residency(stem: str, geometry: dict, *, diagnostic: bool = Fa
                          "residency gate and grid-agnostic fallback before entering the serving table")
 
 
+def program_minimum_sms(stem: str, geometry: dict) -> int:
+    minimum = geometry.get("minimum_sms", 0)
+    if type(minimum) is not int or minimum < 0:
+        raise ValueError(f"{stem}: invalid minimum_sms residency contract")
+    if geometry.get("route") == "paged_fused" and "minimum_sms" not in geometry:
+        raise ValueError(f"{stem}: paged_fused diagnostic is missing its minimum_sms residency contract")
+    return minimum
+
+
 def programs(g, decode_rows: int, prefill_rows: int, max_context: int):
     """(stem suffix, op, params, compile thunk) for every exported program."""
     from b12x.integration.cuteafd import dsv4_compressor as comp
@@ -669,6 +678,7 @@ def main() -> None:
         with exportable_compilation():
             program = thunk()
         validate_table_residency(stem, program.geometry, diagnostic=selected is not None)
+        minimum_sms = program_minimum_sms(stem, program.geometry)
         program.export_to_c(str(output), stem, "cuteafd_" + stem)
         header = output / f"{stem}.h"
         checked = validate_exported_header(program, header, "cuteafd_" + stem)
@@ -693,7 +703,7 @@ def main() -> None:
         includes.append(f'#include "{stem}.h"')
         entries.append(
             f'{{"{stem}", _mlir_cuteafd_{stem}_cuda_init, _mlir_cuteafd_{stem}_cuda_load_to_device, '
-            f'{checked["symbol"]}, {len(abi["pointers"])}, "{kinds}"}}'
+            f'{checked["symbol"]}, {len(abi["pointers"])}, "{kinds}", {minimum_sms}}}'
         )
         print(f"exported {stem}: {len(abi['pointers'])} pointers, scalars '{kinds}'", flush=True)
     if not entries:

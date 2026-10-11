@@ -4,6 +4,8 @@ import importlib.util
 import json
 from pathlib import Path
 import struct
+import sys
+from types import SimpleNamespace
 
 import pytest
 
@@ -192,14 +194,68 @@ def test_offline_exporters_do_not_initialize_or_allocate_cuda():
         assert 'torch.empty(1, dtype=torch.uint8, device="cuda")' not in source
 
 
-def residency_gate():
+@pytest.mark.parametrize("bits", [(3, 4), (3, 4, 5), (2, 3, 4, 5)])
+@pytest.mark.parametrize("rotation", ["warp_specialized", "fused_input_rotation", "token_major_rotation"])
+def test_multitier_exports_do_not_use_two_tier_only_schedules(tmp_path, monkeypatch, bits, rotation):
+    recorded = []
+    package = SimpleNamespace(
+        GEOMETRIES={"qwen4": (4096,)},
+        profiles_for_role=lambda *_: [("tp1", 512, 128, 8, "bf16", [])],
+        route_block=lambda *_: 8, swiglu_limit=lambda *_: 10.0,
+        wire_input=lambda *_: False, ws_input_stages=lambda *_: None,
+        ws_dynamic_tiles=lambda *_: False, ws_tile=lambda *_: None,
+    )
+    for name in ("warp_specialized", "fused_input_rotation", "token_major_rotation"):
+        setattr(package, name, lambda *_, name=name: name == rotation)
+    monkeypatch.setitem(sys.modules, "package_exl3_aot", package)
+    monkeypatch.setitem(sys.modules, "export_b12x_exl3_aot", SimpleNamespace(
+        export=lambda *args, **kwargs: recorded.append((args, kwargs))))
+    compare_sm._export_exl3(["--geometry", "qwen4", "--capacities", "1024",
+                            "--bits", ",".join(map(str, bits))], tmp_path)
+    assert len(recorded) == 1
+    assert recorded[0][0][4] == bits
+    assert recorded[0][1].get(rotation, False) == (len(bits) == 2)
+
+
+def test_cpu_lut_override_covers_all_bindings_and_restores_on_error():
+    first = SimpleNamespace(_trellis256_execution_lut=lambda device, codebook: ("first", device, codebook))
+    fourth = SimpleNamespace(_trellis256_execution_lut=lambda device, codebook: ("fourth", device, codebook))
+    originals = [module._trellis256_execution_lut for module in (first, fourth)]
+    with pytest.raises(RuntimeError, match="compile failed"):
+        with compare_sm.cpu_trellis_luts((first, fourth), "cpu"):
+            assert first._trellis256_execution_lut("cuda", "codebook") == ("first", "cpu", "codebook")
+            assert fourth._trellis256_execution_lut("cuda", "codebook") == ("fourth", "cpu", "codebook")
+            raise RuntimeError("compile failed")
+    assert [module._trellis256_execution_lut for module in (first, fourth)] == originals
+
+
+def test_production_package_limits_special_rotation_to_two_tiers():
+    source = (ROOT / "python/tools/aot/package_exl3_aot.py").read_text()
+    for policy in ("warp_specialized", "fused_input_rotation", "token_major_rotation"):
+        matches = [line for line in source.splitlines()
+                   if f"{policy}(geometry," in line and line.startswith("                ")]
+        assert matches and all("len(args.bits) == 2" in line for line in matches)
+
+
+def residency_gate(name="validate_table_residency"):
     # Load the pure gate without importing the CUDA compiler on the host.
     path = ROOT / "python/tools/aot/export_b12x_dsv4_aot.py"
     node = next(node for node in ast.parse(path.read_text()).body
-                if isinstance(node, ast.FunctionDef) and node.name == "validate_table_residency")
+                if isinstance(node, ast.FunctionDef) and node.name == name)
     namespace = {}
     exec(compile(ast.Module(body=[node], type_ignores=[]), str(path), "exec"), namespace)
-    return namespace["validate_table_residency"]
+    return namespace[name]
+
+
+@pytest.mark.parametrize("minimum", [188, 170, 11, 0])
+def test_diagnostic_minimum_sms_contract_exported(minimum):
+    assert residency_gate("program_minimum_sms")("diagnostic", {"route": "paged_fused", "minimum_sms": minimum}) == minimum
+
+
+@pytest.mark.parametrize("geometry", [{"route": "paged_fused"}, {"minimum_sms": -1}, {"minimum_sms": True}])
+def test_invalid_diagnostic_minimum_sms_contract_rejected(geometry):
+    with pytest.raises(ValueError, match="minimum_sms"):
+        residency_gate("program_minimum_sms")("diagnostic", geometry)
 
 
 @pytest.mark.parametrize("rows", [1, 16, 64, 128, 4096])
