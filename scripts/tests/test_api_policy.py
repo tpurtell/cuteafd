@@ -1,6 +1,7 @@
 """CPU contracts for optional keyed API and benchmark launcher wiring."""
 from pathlib import Path
 import os
+import json
 import stat
 import subprocess
 
@@ -64,12 +65,22 @@ def test_generated_key_is_private_atomic_reused_and_path_only(tmp_path):
     assert key.strip() not in result.stdout + result.stderr
     assert stat.S_IMODE(path.stat().st_mode) == 0o600
     assert stat.S_IMODE(path.parent.stat().st_mode) == 0o700
-    assert list(path.parent.iterdir()) == [path]
+    named = path.with_name("api-keys")
+    assert set(path.parent.iterdir()) == {path, named}
+    assert stat.S_IMODE(named.stat().st_mode) == 0o600
+    keys = json.loads(named.read_text())
+    assert keys["default"] == path.read_text().strip()
+    assert keys["agent"] != keys["default"]
     again = prepare_key(tmp_path, "on")
     assert again.returncode == 0, again.stderr
     assert path.read_text() == key
     assert again.stdout == str(path)
-    assert list(path.parent.iterdir()) == [path]
+    named = path.with_name("api-keys")
+    assert set(path.parent.iterdir()) == {path, named}
+    assert stat.S_IMODE(named.stat().st_mode) == 0o600
+    keys = json.loads(named.read_text())
+    assert keys["default"] == path.read_text().strip()
+    assert keys["agent"] != keys["default"]
 
 
 def test_concurrent_key_provisioning_preserves_one_key(tmp_path):
@@ -81,7 +92,12 @@ def test_concurrent_key_provisioning_preserves_one_key(tmp_path):
     assert len({result.stdout for result in results}) == 1
     path = Path(results[0].stdout)
     assert stat.S_IMODE(path.stat().st_mode) == 0o600
-    assert list(path.parent.iterdir()) == [path]
+    named = path.with_name("api-keys")
+    assert set(path.parent.iterdir()) == {path, named}
+    assert stat.S_IMODE(named.stat().st_mode) == 0o600
+    keys = json.loads(named.read_text())
+    assert keys["default"] == path.read_text().strip()
+    assert keys["agent"] != keys["default"]
 
 
 def test_generated_key_refuses_unsafe_existing_file(tmp_path):

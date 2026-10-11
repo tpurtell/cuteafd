@@ -113,6 +113,7 @@ pub struct Details {
 }
 struct Inner {
     record: Record,
+    key_name: OnceLock<String>,
     sink: Arc<dyn UsageSink>,
     /// Present only while the full log is on and this protocol is loggable.
     log: Option<Arc<dyn LogSink>>,
@@ -148,6 +149,7 @@ struct Inner {
 pub struct UsageHandle(Arc<Inner>);
 pub type UsageScope = UsageHandle;
 impl UsageHandle {
+    pub fn key_name(&self, name: String) { let _ = self.0.key_name.set(name); }
     pub fn new(record: Record, sink: Arc<dyn UsageSink>) -> Self {
         let log_sink = sink.log_sink();
         Self::with_log(record, sink, log_sink)
@@ -159,6 +161,7 @@ impl UsageHandle {
             .filter(|l| loggable(&record.protocol) && l.enabled() && (!record.bench || l.bench()));
         Self(Arc::new(Inner {
             record,
+            key_name: OnceLock::new(),
             sink,
             log,
             log_sink,
@@ -257,6 +260,7 @@ impl UsageHandle {
     /// A websocket turn owns a distinct row and never retains the connection scope.
     pub fn child(&self, protocol: &str) -> Self {
         let mut record = self.0.record.clone();
+        if let Some(name) = self.0.key_name.get() { record.key_label = Some(name.clone()); }
         record.rid = uuid::Uuid::new_v4().to_string();
         record.ts_ms = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as i64;
         record.protocol = protocol.into();
@@ -303,6 +307,7 @@ impl UsageHandle {
 impl Drop for Inner {
     fn drop(&mut self) {
         let mut r = self.record.clone();
+        if let Some(name) = self.key_name.get() { r.key_label = Some(name.clone()); }
         if let Some(d) = self.details.get() {
             r.model_requested = d.model_requested.clone();
             r.model_served = d.model_served.clone();
@@ -468,7 +473,7 @@ impl Middleware {
 /// The dashboards' own polling and static assets: recording them would make
 /// the history mostly the viewer watching itself.
 fn self_traffic(path: &str) -> bool {
-    path == "/" || path == "/usage" || path == "/bench" || path.starts_with("/assets/")
+    path == "/agent" || path.starts_with("/agent/") || path == "/" || path == "/usage" || path == "/bench" || path.starts_with("/assets/")
         || path.starts_with("/console/usage/") || path.starts_with("/v1/console") || path.starts_with("/v1/bench/")
         || path == "/health" || path == "/bench/banner.js"
 }

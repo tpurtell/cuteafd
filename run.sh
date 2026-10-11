@@ -3,6 +3,10 @@ set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$repo_root/scripts/lib/release-common.sh"
+if [[ "${1:-}" == --agent ]]; then
+  shift
+  exec "$repo_root/scripts/launch/agent.sh" "${@:-start}"
+fi
 
 usage() {
   cat <<'EOF'
@@ -30,6 +34,7 @@ cuteafd-coordinator-INSTANCE instead of the one shared cuteafd-coordinator, and
 ./stop.sh with the same configuration stops only that one. Accepts Docker's
 container-name characters, [A-Za-z0-9_.-], as scripts/launch/run-family.sh does.
 
+  --agent [start|stop|status]    independent experimental workspace sidecar
   --config FILE                 alternate complete configuration
   --listen HOST:PORT            API address (default 0.0.0.0:8000)
   --rtx-gpus auto|1|2           select automatically or force a layout (default auto)
@@ -667,6 +672,10 @@ echo "== starting native RTX coordinator =="
 local -a args=(--vision "$VISION" --audio "$AUDIO" serve-native "${vision_args[@]}" --snapshot "/root/.cache/huggingface/$snapshot_rel" --native-lib /opt/cuteafd/lib/libcuteafd_native.so --peers "$peers" --rtx-gpus "$RELEASE_RTX_GPUS" --embedding-placement "$EMBEDDING" --listen "$ADDR" --prefill-batch-tokens "$PREFILL_BATCH_TOKENS" --concurrency "$CONCURRENCY" --prefix-cache-entries "$PREFIX_CACHE_ENTRIES" --max-context-tokens "$MAX_CONTEXT_TOKENS" --max-output-tokens "$MAX_OUTPUT_TOKENS")
 [[ -z "${COORDINATOR_GPU_BUDGET_GIB:-}" ]] || args+=(--coordinator-gpu-budget-gib "$COORDINATOR_GPU_BUDGET_GIB")
 local -a api_mount_args=()
+agent_home="${CUTEAFD_AGENT_HOME:-$HOME/.local/share/cuteafd/agent}"
+mkdir -p "$agent_home/dsh"; chmod 700 "$agent_home" "$agent_home/dsh"
+api_mount_args+=(--mount "type=bind,src=$(readlink -f "$agent_home/dsh"),dst=/run/cuteafd-agent-dsh,readonly"
+  -e CUTEAFD_AGENT_TOKEN_FILE=/run/cuteafd-agent-dsh/launch-token -e "CUTEAFD_AGENT_PORT=${CUTEAFD_AGENT_PORT:-3010}")
 case "${USAGE:-on}" in on|off) ;; *) release_die "USAGE must be on or off" ;; esac
 if ((console_supported)); then
   args+=(--usage "${USAGE:-on}")
@@ -678,6 +687,8 @@ if [[ -n "${API_KEY_FILE:-}" ]]; then
   [[ -f "$API_KEY_FILE" && -r "$API_KEY_FILE" ]] || release_die "API_KEY_FILE must name a readable file"
   api_mount_args+=(--mount "type=bind,src=$(readlink -f "$API_KEY_FILE"),dst=/run/cuteafd-api-key,readonly")
   args+=(--api-key-file /run/cuteafd-api-key)
+  api_mount_args+=(--mount "type=bind,src=$(readlink -f "$(dirname "$API_KEY_FILE")"),dst=/run/cuteafd-key-directory,readonly"
+    -e CUTEAFD_API_KEYS_FILE=/run/cuteafd-key-directory/api-keys)
 fi
 case "${ENABLE_BENCH:-off}" in
   on) args+=(--enable-bench) ;;

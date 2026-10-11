@@ -96,7 +96,14 @@ impl ApiArgs {
             for file in [&self.api_key_file, &self.console_secret_file].into_iter().flatten() {
                 if let Ok(text) = std::fs::read_to_string(file) { secrets.push(text.trim().to_owned()); }
             }
-            store.log.set_secrets(secrets);
+            if let Some(key) = &key { secrets.extend(key.secrets()); }
+            store.log.set_secrets(secrets.clone());
+            if let Some(key) = &key {
+                let log = store.log.clone();
+                key.on_reload(Arc::new(move |named| {
+                    let mut all = secrets.clone(); all.extend(named); log.set_secrets(all);
+                }));
+            }
         }
         Ok(ApiPolicy { key, bench: self.enable_bench, usage, gate, gateway, bench_token: None, live: None })
     }
@@ -161,7 +168,7 @@ impl ApiPolicy {
             cuteafd_usage::http::mount_with_live(router, store.clone(), self.gate.clone(), self.live.clone())
         } else { router };
         tracing::info!("console: protected views unlock through the launcher's link");
-        self.gate.mount(router)
+        self.gate.mount(cuteafd_api::agent::mount(router, self.gate.clone()))
     }
     /// The outermost layer: request accounting and full-log capture.
     pub(crate) fn track(self, router: axum::Router) -> axum::Router {
