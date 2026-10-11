@@ -64,7 +64,7 @@ pub(super) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
             let dense = options.glmf_dense_manifest.as_ref().and_then(|p| std::fs::read(p).ok())
                 .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
                 .and_then(|m| placement::inventory::fp8moe_scratch_bytes(&m, "tp1", max_rows))
-                .or_else(|| placement::inventory::dense_package_scratch(&placement::inventory::image_lib(options.workspace_manifest.as_deref()), "glmfdense", max_rows, true))
+                .or_else(|| placement::inventory::dense_package_scratch(&placement::inventory::image_lib(options.workspace_manifest.as_deref()), "glmfdense", max_rows, glmf::nvfp4_a4()))
                 .ok_or_else(|| anyhow::anyhow!("dense NVFP4 package scratch manifest missing"))?;
             workspace[0] += dense + 8 * max_rows;
         }
@@ -100,7 +100,7 @@ pub(super) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
                 sequences as usize, draft > 0, ranks, decode_rows as usize, options.physical_sms.unwrap_or(188) as usize));
         let inputs = glmf::GlmfInputs { cfg: &cfg, layers: cfg.layers, gpus: baselines, pending_code: vec![0; ranks],
             headroom_bytes: options.headroom_bytes, spark_ranks, prefill_lanes: lanes, prefill_rows: rows,
-            decode_rows, partial_bytes: if options.glmf_kda_fp32_partials { 4 } else { 2 }, max_context: context, sequences, state_slots: options.state_slots.unwrap_or(sequences.max(8)),
+            decode_rows, partial_bytes: if options.glmf_kda_fp32_partials { 4 } else { 2 }, max_context: context, sequences, speculation: draft > 0, state_slots: options.state_slots.unwrap_or(sequences.max(8)),
             mark_slots: marks, pool_marks: options.glmf_pool_marks && options.mimo_prefix_entries > 0,
             index: options.glmf_index, kda_state_bytes: 4, shared_replay: options.glmf_shared_replay, representation,
             resident, router_replica_bytes: router, workspace, graphs, experts,
