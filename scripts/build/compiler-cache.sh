@@ -277,12 +277,15 @@ if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
     exec "$@"
   fi
   # Preserve genuine compiler errors, but never let an optional cache break a build.
-  if [[ -n "${CUTEAFD_KACHE_ACTIVE:-}" ]] &&
-     timeout -k 5 "${CUTEAFD_KACHE_TIMEOUT_SECONDS:-300}" "$CUTEAFD_KACHE_ACTIVE" "$@"; then
-    exit 0
+  status=0
+  if [[ -n "${CUTEAFD_KACHE_ACTIVE:-}" ]]; then
+    timeout -k 5 "${CUTEAFD_KACHE_TIMEOUT_SECONDS:-300}" "$CUTEAFD_KACHE_ACTIVE" "$@" && exit 0
+    status=$?
   fi
   if [[ -n "${CUTEAFD_KACHE_ACTIVE:-}" ]] && mkdir "${CUTEAFD_KACHE_WARNING_DIR:-/nonexistent}" 2>/dev/null; then
-    printf 'warning: cuteafd kache invocation failed or timed out; retrying with plain compiler\n' >&2
+    # Record why caching stopped: 124/137 is the timeout, anything else kache or the compiler.
+    printf 'exit %s: %s\n' "$status" "$*" > "$CUTEAFD_KACHE_WARNING_DIR/first-failure" 2>/dev/null || true
+    printf 'warning: cuteafd kache invocation failed or timed out (exit %s); retrying with plain compiler\n' "$status" >&2
   fi
   exec "$@"
 fi
