@@ -87,6 +87,12 @@ impl ExecutorModes {
     /// Recorded family default. No decision gate has enabled another mode yet.
     pub fn attention_default(&self) -> AttentionPlacement { AttentionPlacement::Heads }
 
+    /// Prefer split FFN ownership when available, otherwise owner reduction.
+    pub fn whole_mode(&self, gpu: u8) -> Option<LayerMode> {
+        [FfnMode::Split, FfnMode::Owner].into_iter()
+            .map(|ffn| LayerMode::Whole { gpu, ffn }).find(|&mode| self.runs(mode))
+    }
+
     /// Unlike the legacy layer-range modes, the new selectors are strict and
     /// never silently become heads or a one-GPU layout.
     pub fn check_attention(&self, requested: Option<AttentionPlacement>, gpus: usize, peer: bool)
@@ -97,15 +103,12 @@ impl ExecutorModes {
                 return Err(PlacementError::AttentionPlacement { family: self.family, mode,
                     reason: "requires two coordinator GPUs with peer access" });
             }
-            let needed = match mode {
-                AttentionPlacement::Context => &[LayerMode::ContextSplit][..],
-                AttentionPlacement::Layers => &[
-                    LayerMode::Whole { gpu: 0, ffn: FfnMode::Split },
-                    LayerMode::Whole { gpu: 1, ffn: FfnMode::Split },
-                ][..],
+            let supported = match mode {
+                AttentionPlacement::Context => self.runs(LayerMode::ContextSplit),
+                AttentionPlacement::Layers => (0..2).all(|gpu| self.whole_mode(gpu).is_some()),
                 AttentionPlacement::Heads => unreachable!(),
             };
-            if needed.iter().any(|m| !self.runs(*m)) {
+            if !supported {
                 return Err(PlacementError::AttentionPlacement { family: self.family, mode,
                     reason: "executor not implemented; only heads attention placement is qualified" });
             }

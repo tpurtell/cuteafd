@@ -149,6 +149,13 @@ fi
 
 release_load_config "$config"
 for name in "${!overrides[@]}"; do printf -v "$name" '%s' "${overrides[$name]}"; done
+# V4.1 serves its established ranges until its runtime consumes solver placement.
+attention_placement="${ATTENTION_PLACEMENT:-auto}"
+case "$attention_placement" in
+  auto|heads) ;;
+  context|layers) release_die "deepseek_v41 cannot run attention placement $attention_placement: runtime solver placement not implemented; existing ranges stay unchanged" ;;
+  *) release_die "ATTENTION_PLACEMENT must be auto, context, layers or heads" ;;
+esac
 release_validate_table_backend "$TABLE_BACKEND"
 case "$EMBEDDING" in host|gpu) ;; *) release_die "EMBEDDING must be host or gpu" ;; esac
 if [[ -n "$wip_slot" ]]; then
