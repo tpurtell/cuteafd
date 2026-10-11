@@ -305,6 +305,50 @@ pub fn glm5_flash_config(layers: usize) -> Value {
     })
 }
 
+/// Complete coordinator headers plus one expert per routed layer; payloads stay sparse.
+pub fn glm5_flash_tensors(config: &Value) -> Vec<Tensor> {
+    use crate::families::glm5_flash::{GlmNextAttention, GlmNextConfig};
+    let cfg = GlmNextConfig::from_hf(config).unwrap();
+    let h = cfg.hidden;
+    let mut out = vec![t("model.language_model.embed_tokens.weight", "BF16", &[cfg.vocab_size, h]),
+        t("model.language_model.norm.weight", "BF16", &[h]), t("lm_head.weight", "BF16", &[cfg.vocab_size, h])];
+    for layer in 0..cfg.layers {
+        let p = format!("model.language_model.layers.{layer}");
+        for site in ["attn", "ffn"] { for suffix in ["fn", "scale", "base"] {
+            out.push(t(format!("{p}.hc_{site}_{suffix}"), "F32", &[4]));
+        } }
+        for norm in ["input_layernorm", "post_attention_layernorm"] { out.push(t(format!("{p}.{norm}.weight"), "BF16", &[h])); }
+        let a = format!("{p}.self_attn");
+        if cfg.attention[layer] == GlmNextAttention::Kda {
+            for proj in ["q_proj", "k_proj", "v_proj", "f_a_proj", "g_a_proj", "b_proj", "o_proj", "f_b_proj", "g_b_proj"] {
+                out.push(t(format!("{a}.{proj}.weight"), "BF16", &[h, h]));
+            }
+            for proj in ["q", "k", "v"] { out.push(t(format!("{a}.{proj}_conv1d.weight"), "F32", &[h, 4])); }
+            for suffix in ["A_log", "dt_bias"] { out.push(t(format!("{a}.{suffix}"), "F32", &[cfg.kda_heads])); }
+            out.push(t(format!("{a}.o_norm.weight"), "BF16", &[cfg.kda_head_dim]));
+        } else {
+            for suffix in ["q_a_layernorm.weight", "kv_a_layernorm.weight", "indexer.wq_b.weight", "indexer.wk.weight", "indexer.weights_proj.weight", "indexer.index_kpool_compress_gate", "indexer.k_norm.weight", "indexer.k_norm.bias", "indexer.index_kpool_compress_ape"] {
+                out.push(t(format!("{a}.{suffix}"), "BF16", &[128]));
+            }
+            for (proj, n, k) in [("q_a_proj", cfg.q_lora_rank, h), ("kv_a_proj_with_mqa", cfg.kv_lora_rank, h),
+                ("q_b_proj", cfg.heads * cfg.qk_nope_dim, cfg.q_lora_rank), ("o_proj", h, cfg.heads * cfg.v_head_dim)] {
+                out.extend(fp8(&format!("{a}.{proj}"), n, k, None));
+            }
+        }
+        let mlp = if cfg.dense[layer] { format!("{p}.mlp") } else { format!("{p}.mlp.shared_experts") };
+        let width = if cfg.dense[layer] { cfg.dense_intermediate } else { cfg.moe_intermediate };
+        for proj in ["gate_proj", "up_proj"] { out.extend(fp8(&format!("{mlp}.{proj}"), width, h, None)); }
+        out.extend(fp8(&format!("{mlp}.down_proj"), h, width, None));
+        if !cfg.dense[layer] {
+            out.push(t(format!("{p}.mlp.gate.weight"), "BF16", &[cfg.experts, h]));
+            out.push(t(format!("{p}.mlp.gate.e_score_correction_bias"), "F32", &[cfg.experts]));
+            for proj in ["gate_proj", "up_proj"] { out.extend(fp8(&format!("{p}.mlp.experts.0.{proj}"), cfg.moe_intermediate, h, None)); }
+            out.extend(fp8(&format!("{p}.mlp.experts.0.down_proj"), h, cfg.moe_intermediate, None));
+        }
+    }
+    out
+}
+
 /// Qwen 3.8 Flash Next's config with `layers` layers (every fourth full attention).
 pub fn qwen4_config(layers: usize) -> Value {
     json!({

@@ -188,10 +188,45 @@ pub fn expert_workspace(catalog: &crate::OfficialV41Catalog, manifest: Option<&s
     let name = if fp8.format() == crate::formats::fp8_experts::ExpertFormat::Nvfp4 && lib.join("fp8").join(a4).is_dir() {
         a4.to_string()
     } else { format!("fp8-glmf{}", fp8.format().package_suffix()) };
-    let value: serde_json::Value = serde_json::from_slice(&std::fs::read(lib.join("fp8").join(name).join("manifest.json"))?)?;
-    Ok(inventory::fp8moe_scratch_bytes(&value, &format!("tp{tp}"), rows)
-        .ok_or_else(|| anyhow::anyhow!("missing GLM Flash tp{tp} scratch for {rows} rows"))?
-        + rows * shape.hidden as u64 * 2)
+    let value: serde_json::Value = serde_json::from_slice(&std::fs::read(lib.join("fp8").join(&name).join("manifest.json"))?)?;
+    let scratch = inventory::fp8moe_scratch_bytes(&value, &format!("tp{tp}"), rows)
+        .ok_or_else(|| anyhow::anyhow!("missing GLM Flash tp{tp} scratch for {rows} rows"))?;
+    let bf16 = lib.join("fp8").join(format!("{name}-bf16"));
+    let sibling = if bf16.join(format!("tp{tp}")).is_dir() {
+        let manifest: serde_json::Value = serde_json::from_slice(&std::fs::read(bf16.join("manifest.json"))?)?;
+        inventory::fp8moe_scratch_bytes(&manifest, &format!("tp{tp}"), rows)
+            .ok_or_else(|| anyhow::anyhow!("missing BF16-input GLM Flash scratch"))?
+    } else { 0 };
+    Ok(scratch.max(sibling) + if tp == 2 { rows * shape.hidden as u64 * 2 } else { 0 })
+}
+
+/// Rebuild startup graphs at the admitted pool rather than a pre-admission guess.
+/// Explicit graph budgets retain their growth-only lifetime.
+pub fn solve_with_graphs(i: &GlmfInputs<'_>, target: u64, automatic_context: bool,
+    sms: usize, rtx_experts: bool) -> Result<(Placement, GraphSet), PlacementError> {
+    let mut candidate = i.requested_pool.unwrap_or(target.max(i.max_context));
+    if i.requested_pool.is_none() && (i.onboard.layers(i.experts.len()).is_some() || i.spark_ranks == 0) {
+        let mut req = request(i)?;
+        if !rtx_experts { req.expert_gpus = 0; }
+        candidate = solve(&req)?.pool_tokens;
+    }
+    loop {
+        let mut trial = i.clone();
+        if i.graphs.lifetime == Lifetime::Startup {
+            let context = glmf_graphs::admitted_graph_context(i.max_context as usize, candidate as usize, automatic_context);
+            trial.graphs = startup_graphs(i.cfg, i.layers, context, candidate as usize, i.sequences as usize,
+                i.drafter_bytes > 0, i.gpus.len(), i.decode_rows as usize, sms);
+        }
+        let mut req = request(&trial)?;
+        if !rtx_experts { req.expert_gpus = 0; }
+        req.pool.target = req.pool.target.max(target).min(candidate);
+        req.pool.ceiling = candidate;
+        let placed = solve(&req)?;
+        if i.requested_pool.is_some() || i.graphs.lifetime != Lifetime::Startup || placed.pool_tokens >= candidate {
+            return Ok((placed, trial.graphs));
+        }
+        candidate = placed.pool_tokens;
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -279,6 +314,53 @@ mod tests {
                 assert!(!p.layers.iter().any(|l| matches!(l.experts, ExpertHome::RtxWhole { .. })));
             }
         }
+    }
+
+    #[test]
+    fn glm5_flash_header_costs_and_fp8_package_scratch_are_static() {
+        use crate::plan::testing::{glm5_flash_config, glm5_flash_tensors, write_snapshot};
+        use crate::formats::fp8_experts::{Fp8Projection, Slicing};
+        let dir = tempfile::tempdir().unwrap();
+        let config = glm5_flash_config(2);
+        write_snapshot(dir.path(), &config, &glm5_flash_tensors(&config), None);
+        let catalog = crate::read_expert_catalog(dir.path()).unwrap();
+        let fp8 = catalog.fp8().unwrap();
+        let costs = expert_costs(&catalog, true).unwrap();
+        let exact = |tp, rank| Fp8Projection::ALL.iter().map(|&proj| {
+            let (bytes, _) = fp8.slice_bytes_with(proj, tp, rank, Slicing::Blocks(128)).unwrap();
+            (bytes * fp8.shape().experts).max(256) as u64
+                + fp8.scale_region_bytes_with(proj, tp, rank, Slicing::Blocks(128)).unwrap().max(256) as u64
+        }).sum::<u64>();
+        assert_eq!(costs[0].whole.resident, exact(1, 0));
+        assert_eq!(costs[0].half.map(|c| c.resident), [exact(2, 0), exact(2, 1)]);
+        let share = dir.path().join("share");
+        let package = dir.path().join("lib/fp8/fp8-glmf");
+        std::fs::create_dir_all(&share).unwrap();
+        std::fs::create_dir_all(&package).unwrap();
+        let path = share.join("PROGRAMS.json");
+        assert!(expert_workspace(&catalog, Some(&path), 4096, 2).is_err());
+        std::fs::write(package.join("manifest.json"), serde_json::json!({"layouts": {
+            "tp1": {"capacities":[{"capacity":4096,"scratch_bytes":12345}]},
+            "tp2": {"capacities":[{"capacity":4096,"scratch_bytes":67890}]}}}).to_string()).unwrap();
+        assert_eq!(expert_workspace(&catalog, Some(&path), 4096, 1).unwrap(), 12345);
+        assert_eq!(expert_workspace(&catalog, Some(&path), 4096, 2).unwrap(), 67890 + 4096 * 4096 * 2);
+        assert!(expert_workspace(&catalog, Some(&path), 4097, 2).is_err());
+        let cfg = GlmNextConfig::from_hf(&config).unwrap();
+        let checkpoint = crate::plan::Checkpoint::open(dir.path()).unwrap();
+        assert_eq!(crate::families::glm5_flash::resident::router_replica_bytes(&checkpoint, &cfg, 2).unwrap(),
+            288 * 4096 * 2 + 288 * 4);
+    }
+
+    #[test]
+    fn glm5_flash_graph_inventory_rebuilds_at_the_smaller_pool() {
+        let cfg = GlmNextConfig::from_hf(&crate::plan::testing::glm5_flash_config(45)).unwrap();
+        let input = inputs(&cfg, 1, 32 << 30);
+        let (placed, graphs) = solve_with_graphs(&input, 1 << 20, true, 170, true).unwrap();
+        assert!(placed.pool_tokens < 1 << 20);
+        let context = glmf_graphs::admitted_graph_context(input.max_context as usize, placed.pool_tokens as usize, true);
+        let expected = startup_graphs(&cfg, cfg.layers, context, placed.pool_tokens as usize,
+            input.sequences as usize, true, 1, 64, 170);
+        assert_eq!(graphs.ranks, expected.ranks);
     }
 
     #[test]
