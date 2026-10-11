@@ -190,7 +190,9 @@ pub(super) fn prepare_prefix_cache<'a>(lib: &'a NativeLibrary, args: &crate::cli
 /// and the phase-3 campaign could not measure the saving there (review FIX 1).
 /// `host_cache`/`host_cache_config` are `null` without a cache, which preserves
 /// the previous key shape when one is bound.
-fn serving_stats(prefixes: &PrefixCache<'_>) -> serde_json::Value {
+fn serving_stats<C: cuteafd_engine::media::EncoderClient>(prefixes: &PrefixCache<'_>,
+    kv_waiter: &cuteafd_engine::prefix::DeferredAdmission<admission::Prepared>,
+    media: &admission::Media<C>) -> serde_json::Value {
     // Deliberately exports the cache's whole effective `Config` under
     // `host_cache_config` (packet HC-9), not just `store_pace_ns`: fleet
     // operators tune several of these knobs, and one key keeps the export
@@ -201,7 +203,8 @@ fn serving_stats(prefixes: &PrefixCache<'_>) -> serde_json::Value {
         "target_sampling": sampling_stats::snapshot(),
         "dspark_policy": super::speculative::policy_snapshot(),
         "copy_drafts": copy_drafts::stats(),
-        "admission": admission::stats(),
+        "admission": kv_waiter.stats(),
+        "media": media.stats(),
         "totals": console::totals::snapshot(),
     });
     crate::shared::probe::graph_capture_stats(&mut stats);
@@ -258,10 +261,12 @@ fn serve_loop<'w, 'a, P: ServingTarget<'w, 'a>, const SHARED_PREFILL: bool>(lib:
     let mut compiler = crate::shared::constraints::Compiler::new(lib, args.snapshot.join("tokenizer.json"), VOCAB);
     let mut id = 0u64;
     let mut closed = false;
-    let mut pending: Option<admission::Pending> = None;
-    let mut images_waiting: Vec<Option<admission::ImageAdmission>> = (0..args.concurrency).map(|_| None).collect();
-    let image_limit = admission::image_admission_limit(args.concurrency as usize)?;
-    let mut image_backlog = std::collections::VecDeque::new();
+    // A prepared request whose lifetime budget does not fit beside the running
+    // ones waits here, holding no lease, until a request retires.
+    let mut kv_waiter = cuteafd_engine::prefix::DeferredAdmission::<admission::Prepared>::default();
+    // Admitted (leased, restored) requests whose images the restored frontier
+    // still needs wait here for their encodes; decode keeps running.
+    let mut media = admission::Media::new(&mut *vision, args.concurrency as usize)?;
     let mut stats_published = Instant::now();
     let limits = cuteafd_api::openai::NativeLimits::new(args.max_context_tokens, args.max_output_tokens)?;
     let copy_windows = draft.is_some() && copy_drafts::enabled();
@@ -272,28 +277,15 @@ fn serve_loop<'w, 'a, P: ServingTarget<'w, 'a>, const SHARED_PREFILL: bool>(lib:
             anyhow::bail!("expert wire unavailable until restart: {reason}");
         }
         prefixes.tick();
-        for entry in &mut images_waiting {
-            let Some(image) = entry.as_mut() else { continue };
-            let result = if image.prepared.job.events.is_closed() { Err(anyhow::anyhow!("client disconnected")) }
-                else { image.poll(vision, requests) };
-            if let Err(error) = result {
-                let mut image = entry.take().unwrap();
-                image.cancel(vision);
-                let failure = error.downcast_ref::<cuteafd_api::openai::NativeFailure>()
-                    .cloned().unwrap_or_else(|| cuteafd_api::openai::NativeFailure::Unavailable(format!("{error:#}")));
-                let _ = image.prepared.job.events.send(Err(failure));
-                requests.release_if_present(image.lease)?;
-                if let Some(draft) = draft.as_deref_mut() { draft.release(image.id)?; }
-            }
-        }
+        let media_ready = media.poll(requests, draft.as_deref_mut())?;
         if stats_published.elapsed() >= std::time::Duration::from_secs(1) {
             stats_published = Instant::now();
             if let Ok(mut slot) = stats.lock() {
-                *slot = serving_stats(&prefixes);
+                *slot = serving_stats(&prefixes, &kv_waiter, &media);
             }
         }
         if let Some(live) = console::live().filter(|live| live.gauges_due()) {
-            live.push(console_gauges(&active, requests, &prefixes, receive.len(), Some(pending.is_some())));
+            live.push(console_gauges(&active, requests, &prefixes, receive.len(), Some(!kv_waiter.is_empty())));
         }
         // This point is reached only after both complete stacks have drained and
         // committed. No cache owner is migrated or retired inside a layer stack.
@@ -314,26 +306,28 @@ fn serve_loop<'w, 'a, P: ServingTarget<'w, 'a>, const SHARED_PREFILL: bool>(lib:
         }
         // Admit available work at a completed boundary. Prefill currently owns
         // both lanes; mixed prefill/decode interleaving is a subsequent policy.
-        let mut intake = receive.len().max(1) + image_backlog.len();
-        while let Some(slot) = (0..active.len()).find(|&slot| images_waiting[slot].as_ref().is_some_and(admission::ImageAdmission::ready))
-            .or_else(|| (0..active.len()).find(|&slot| active[slot].is_none() && images_waiting[slot].is_none()
-                && !(SHARED_PREFILL && prefills.iter().any(|parked| parked.slot == slot)))) {
-            if images_waiting[slot].is_none() {
+        let mut media_ready = media_ready.into_iter();
+        let mut intake = receive.len().max(1);
+        loop {
+            let busy_slots = active.iter().flatten().count() + media.len() + media_ready.len()
+                + if SHARED_PREFILL { prefills.len() } else { 0 };
+            let backlog = !media.full() && !media.backlog.is_empty();
+            let (prepared, id, lease, slot, image_keys, hit, restore) = if let Some(leased) = media_ready.next() {
+                tracing::info!(request_id=leased.id, encoder_ms=leased.started.elapsed().as_secs_f64()*1000.0,
+                    "native asynchronous vision preparation");
+                leased.into_admitted()
+            } else {
+            let Some(slot) = (0..active.len()).find(|&slot| active[slot].is_none() && !media.holds(slot)
+                && !(SHARED_PREFILL && prefills.iter().any(|parked| parked.slot == slot))) else { break };
+            let mut prepared = match kv_waiter.poll(0, requests.release_epoch(), busy_slots > 0,
+                |prepared| prepared.job.events.is_closed()) {
+                cuteafd_engine::prefix::AdmissionPoll::Ready(prepared) => prepared,
+                cuteafd_engine::prefix::AdmissionPoll::Blocked => break,
+                cuteafd_engine::prefix::AdmissionPoll::Empty if backlog => media.backlog.pop_front().unwrap(),
+                cuteafd_engine::prefix::AdmissionPoll::Empty => {
                 if intake == 0 { break; }
                 intake -= 1;
-            }
-            let active_count = active.iter().flatten().count() + images_waiting.iter().flatten().count()
-                + if SHARED_PREFILL { prefills.len() } else { 0 };
-            if images_waiting[slot].is_none() && pending.as_ref().is_some_and(|p| p.active_when_blocked == active_count
-                && !p.prepared.job.events.is_closed()) { break; }
-            let (prepared, id, lease, image_keys, hit, restore) = if let Some(image) = images_waiting[slot].take() {
-                tracing::info!(request_id=image.id, encoded_images=image.needed.len(),
-                    encoder_ms=image.started.elapsed().as_secs_f64()*1000.0, "native asynchronous vision preparation");
-                (image.prepared, image.id, image.lease, image.image_keys, image.hit, image.restore)
-            } else {
-            let mut prepared = if let Some(pending) = pending.take() { pending.prepared }
-                else if images_waiting.iter().flatten().count() < image_limit && !image_backlog.is_empty() { image_backlog.pop_front().unwrap() } else {
-                let job = if active_count == 0 && images_waiting.iter().all(Option::is_none) && !closed {
+                let job = if busy_slots == 0 && !closed {
                     // Going idle: publish final occupancy so the console does not show stale lanes.
                     if let Some(live) = console::live() {
                         live.push(console_gauges(&active, requests, &prefixes, receive.len(), Some(false)));
@@ -357,11 +351,13 @@ fn serve_loop<'w, 'a, P: ServingTarget<'w, 'a>, const SHARED_PREFILL: bool>(lib:
                         continue;
                     }
                 }
+                }
             };
             if prepared.job.events.is_closed() { continue; }
-            if !prepared.images.is_empty() && images_waiting.iter().flatten().count() >= image_limit {
-                if image_backlog.len() < (args.concurrency as usize).max(8) {
-                    image_backlog.push_back(prepared);
+            if !prepared.images.is_empty() && media.full() {
+                // Encoder waiters are full: wait host-side, holding no lease.
+                if media.backlog.len() < (args.concurrency as usize).max(8) {
+                    media.backlog.push_back(prepared);
                 } else {
                     let _ = prepared.job.events.send(Err(cuteafd_api::openai::NativeFailure::Unavailable(
                         "image admission queue full".into())));
@@ -389,7 +385,7 @@ fn serve_loop<'w, 'a, P: ServingTarget<'w, 'a>, const SHARED_PREFILL: bool>(lib:
                     admission::remaining_budget(r.tokens.len(), r.job.max_tokens-r.generated,
                         requests.cache().committed_end(r.lease)?)?)))
                     .collect::<Result<Vec<_>>>()?;
-                for parked in images_waiting.iter().flatten() {
+                for parked in media.leased() {
                     capacity.push((parked.lease, admission::remaining_budget(parked.prepared.prompt.len(),
                         parked.prepared.job.max_tokens, requests.cache().committed_end(parked.lease)?)?));
                 }
@@ -403,7 +399,7 @@ fn serve_loop<'w, 'a, P: ServingTarget<'w, 'a>, const SHARED_PREFILL: bool>(lib:
                 capacity.push((lease, admission::remaining_budget(prompt.len(), job.max_tokens,
                     requests.cache().committed_end(lease)?)?));
                 if let Err(error) = prefixes.make_room(requests, &capacity) {
-                    if active_count != 0
+                    if busy_slots != 0
                         || error.downcast_ref::<crate::families::deepseek_v41::v41_compressor::SourcePoolExhausted>().is_none() {
                         return Err(error);
                     }
@@ -414,33 +410,37 @@ fn serve_loop<'w, 'a, P: ServingTarget<'w, 'a>, const SHARED_PREFILL: bool>(lib:
                     let budget = |output| admission::remaining_budget(prompt.len(), output, committed);
                     let requested = job.max_tokens;
                     prefixes.release_copies(requests, &[(lease, budget(requested)?)])?;
-                    let granted = admission::shrink(&mut prefixes, requested,
+                    let granted = kv_waiter.shrink_output(&mut prefixes, requested,
                         |prefixes, output| prefixes.fits(requests, &[(lease, budget(output)?)]),
                         |prefixes, output| prefixes.make_room(requests, &[(lease, budget(output)?)]))?
                         .ok_or(error)?;
-                    tracing::warn!(request_id=id, prompt_tokens=prompt.len(),
-                        cached_tokens=hit.as_ref().map_or(0, |(end, _)| *end), requested, granted,
-                        "max_tokens shrunk to fit the GPU KV pool");
+                    if granted < requested {
+                        tracing::warn!(request_id=id, prompt_tokens=prompt.len(),
+                            cached_tokens=hit.as_ref().map_or(0, |(end, _)| *end), requested, granted,
+                            "max_tokens shrunk to fit the GPU KV pool");
+                    }
                     job.max_tokens = granted;
                 }
-                let needed = if images.is_empty() { Vec::new() } else {
+                let resume = if images.is_empty() { prompt.len() } else {
                     let source_end = requests.cache().committed_end(lease)? as usize;
-                    let start = if requests.cache().stage(lease)? == crate::families::deepseek_v41::v41_backbone_cache::CacheStage::EncoderReplay {
+                    if requests.cache().stage(lease)? == crate::families::deepseek_v41::v41_backbone_cache::CacheStage::EncoderReplay {
                         requests.cache().history_end(lease)? as usize
-                    } else { source_end };
-                    requests.images(lease)?.needed(start, prompt.len())?
+                    } else { source_end }
                 };
-                Ok((image_keys, hit, restore, needed))
+                Ok((image_keys, hit, restore, resume))
             })();
-            let (image_keys, hit, restore, needed) = match admitted {
+            let (image_keys, hit, restore, resume) = match admitted {
                 Ok(value) => value,
                 Err(error) => {
                     requests.release_if_present(lease)?;
                     if let Some(draft) = draft.as_deref_mut() { draft.release(id)?; }
                     if error.downcast_ref::<crate::families::deepseek_v41::v41_compressor::SourcePoolExhausted>().is_some() {
-                        if active_count > 0 {
-                            tracing::debug!(request_id=id, active_count, "waiting for request KV token budget");
-                            pending = Some(admission::Pending { prepared, active_when_blocked: active_count });
+                        if busy_slots > 0 {
+                            tracing::debug!(request_id=id, busy_slots, "waiting for request KV token budget");
+                            if let Err(prepared) = kv_waiter.defer_until_release(prepared, true, requests.release_epoch()) {
+                                let _ = prepared.job.events.send(Err(cuteafd_api::openai::NativeFailure::Unavailable(
+                                    "KV admission queue full".into())));
+                            }
                             break;
                         }
                         let _ = events.send(Err(cuteafd_api::openai::NativeFailure::BadRequest(
@@ -453,12 +453,15 @@ fn serve_loop<'w, 'a, P: ServingTarget<'w, 'a>, const SHARED_PREFILL: bool>(lib:
                     continue;
                 }
             };
-            if !needed.is_empty() {
-                images_waiting[slot] = Some(admission::ImageAdmission { prepared, id, lease, image_keys, hit, restore,
-                    needed, next:0, ticket:None, started:Instant::now() });
+            if resume < prepared.prompt.len() && !prepared.images.is_empty() {
+                // Encode what the restored frontier still needs; the lease waits.
+                let leased = admission::Leased { prepared, id, lease, slot, image_keys, hit, restore, started: Instant::now() };
+                if let Err((leased, error)) = media.enqueue(leased, resume) {
+                    leased.fail(error, requests, draft.as_deref_mut())?;
+                }
                 continue;
             }
-            (prepared, id, lease, image_keys, hit, restore)
+            (prepared, id, lease, slot, image_keys, hit, restore)
             };
             let lane = usize::from(loads[1] < loads[0]);
             let events = prepared.job.events.clone();
@@ -561,9 +564,9 @@ fn serve_loop<'w, 'a, P: ServingTarget<'w, 'a>, const SHARED_PREFILL: bool>(lib:
             }
         }
         if active.iter().all(Option::is_none) {
-            if closed && images_waiting.iter().all(Option::is_none) && image_backlog.is_empty()
+            if closed && media.is_empty() && kv_waiter.is_empty()
                 && (!SHARED_PREFILL || prefills.is_empty()) { break; }
-            if images_waiting.iter().any(Option::is_some) { std::thread::sleep(Duration::from_millis(1)); }
+            if media.len() > 0 { std::thread::sleep(Duration::from_millis(1)); }
             continue;
         }
         let members: [Vec<usize>; 2] = std::array::from_fn(|lane| active.iter().enumerate()
@@ -594,12 +597,9 @@ fn serve_loop<'w, 'a, P: ServingTarget<'w, 'a>, const SHARED_PREFILL: bool>(lib:
         let result = room.and_then(|_| P::decode_round(lib, runtime, first, second,
             requests, first_transport, second_transport, &mut active, &members,
             draft.as_deref_mut(), &mut prefixes, receive,
-            admission::Wake { media_pending: images_waiting.iter().any(Option::is_some),
-                media_slots: images_waiting.iter().flatten().count() + parked,
-                host_pending: !image_backlog.is_empty(),
-                blocked_at: pending.as_ref().map(|p| p.active_when_blocked
-                    .saturating_sub(images_waiting.iter().flatten().count() + parked)),
-                pending: pending.as_ref().map(|p| &p.prepared.job),
+            admission::Wake { media_pending: media.len() > 0,
+                media_slots: media.len() + parked,
+                retry: kv_waiter.pending().map(|prepared| (&prepared.job, requests.release_epoch())),
                 prefill_deadline: decode_started.filter(|_| parked > 0)
                     .map(|started| started + Duration::from_secs_f64(prefills.decode_seconds())) }));
         if let Some(started) = decode_started { prefills.stepped(started.elapsed().as_secs_f64()); }
@@ -626,19 +626,7 @@ fn serve_loop<'w, 'a, P: ServingTarget<'w, 'a>, const SHARED_PREFILL: bool>(lib:
             }
         }
     }
-    for mut image in images_waiting.into_iter().flatten() {
-        image.cancel(vision);
-        let _ = image.prepared.job.events.send(Err(cuteafd_api::openai::NativeFailure::Unavailable(
-            "vision admission stopped".into())));
-        if let Err(error) = requests.release_if_present(image.lease) {
-            tracing::warn!(%error, "releasing stopped image cache owner");
-        }
-        if let Some(draft) = draft.as_deref_mut() {
-            if let Err(error) = draft.release(image.id) {
-                tracing::warn!(%error, "releasing stopped image draft owner");
-            }
-        }
-    }
+    media.stop(requests, draft.as_deref_mut());
     result
 }
 
@@ -2540,7 +2528,16 @@ mod sampling_tests {
         let disabled = PrefixCache::new(0);
         assert!(disabled.host_metrics().is_none());
         assert!(!disabled.turn_bank_enabled());
-        let snapshot = serving_stats(&disabled);
+        let waiter = cuteafd_engine::prefix::DeferredAdmission::default();
+        let mut encoder = cuteafd_engine::media::FakeEncoder::default();
+        let media = admission::Media::new(&mut encoder, 4).unwrap();
+        let snapshot = serving_stats(&disabled, &waiter, &media);
+        for key in ["output_shrinks", "output_tokens_withheld", "deferred"] {
+            assert!(snapshot["admission"][key].is_u64(), "missing admission {key} in {snapshot}");
+        }
+        for key in ["encodes", "submit_waits", "submit_timeouts", "encode_timeouts"] {
+            assert!(snapshot["media"][key].is_u64(), "missing media {key} in {snapshot}");
+        }
         assert!(snapshot["host_cache"].is_null(), "{snapshot}");
         assert!(snapshot["host_cache_config"].is_null(), "{snapshot}");
         for key in COUNTERS {
@@ -2548,7 +2545,7 @@ mod sampling_tests {
         }
         // A configured bank keeps the **full** key set (the host keys stay null
         // here, because this fixture has no host cache attached either).
-        let configured = serving_stats(&PrefixCache::new(8));
+        let configured = serving_stats(&PrefixCache::new(8), &waiter, &media);
         assert!(configured["host_cache"].is_null(), "{configured}");
         assert!(configured["host_cache_config"].is_null(), "{configured}");
         for key in COUNTERS {
