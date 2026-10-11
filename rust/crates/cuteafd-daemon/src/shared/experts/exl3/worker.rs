@@ -183,8 +183,8 @@ impl<'a> Exl3Worker<'a> {
     }
 
     fn validate_rank(world: usize, rank: usize) -> Result<()> {
-        ensure!(matches!(world, 1 | 2 | 3 | 4 | 6) && rank < world,
-            "EXL3 worker requires implicit Spark TP1, TP2, TP3, TP4 or TP6 weights");
+        ensure!((1..=8).contains(&world) && rank < world,
+            "EXL3 worker requires implicit Spark TP1..8 weights and rank below world");
         Ok(())
     }
 

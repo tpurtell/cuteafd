@@ -21,7 +21,7 @@ impl Drop for Admission {
 
 pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result<()> {
     ensure!(
-        config.rank < config.world && matches!(config.world, 1 | 2 | 3 | 4 | 6),
+        config.rank < config.world && (1..=8).contains(&config.world),
         "native rank must be below the launched Spark world"
     );
     ensure!(

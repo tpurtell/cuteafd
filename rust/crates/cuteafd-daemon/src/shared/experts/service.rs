@@ -573,6 +573,36 @@ mod tests {
     }
 
     #[test]
+    fn new_implicit_worlds_select_compressed_rank_packages() {
+        for world in [1, 5, 7, 8] {
+            for rank in 0..world {
+                let config = config(world, rank, None);
+                assert_eq!(config.selection(7).unwrap(),
+                    ExpertLayer::BackboneExl3Tp { layer: 7, rank, world });
+                assert!(config.exl3_directory_for(&[4, 5])
+                    .ends_with(format!("tp{world}-rank{rank}")));
+            }
+        }
+    }
+
+    #[test]
+    fn new_worlds_require_nonempty_whole_h128_blocks() {
+        for intermediate in [640, 2048, 2304, 3072] {
+            for world in [1, 5, 7, 8] {
+                let result = validate_new_world_blocks(intermediate, world);
+                assert_eq!(result.is_ok(), intermediate / 128 >= world);
+                if let Err(error) = result {
+                    assert!(error.to_string().contains(&format!("Spark TP{world}")));
+                    assert!(error.to_string().contains("H128"));
+                }
+            }
+        }
+        // Keep the calibrated legacy NVFP4 TP6 16-row split available.
+        assert!(validate_new_world_blocks(640, 6).is_ok());
+        assert!(validate_new_world_blocks(639, 5).is_err());
+    }
+
+    #[test]
     fn legacy_selection_is_unchanged_and_topology_must_agree() {
         assert_eq!(config(4, 3, None).selection(2).unwrap(), ExpertLayer::Backbone { layer: 2, rank: 3 });
         assert_eq!(config(2, 1, None).selection(2).unwrap(), ExpertLayer::BackboneTp2 { layer: 2, rank: 1 });
@@ -843,6 +873,16 @@ mod tests {
     }
 }
 
+fn validate_new_world_blocks(intermediate: usize, world: usize) -> Result<()> {
+    ensure!(
+        !matches!(world, 1 | 5 | 7 | 8)
+            || (intermediate % 128 == 0 && intermediate / 128 >= world),
+        "Spark TP{world} requires at least one whole H128 expert block per rank; intermediate {intermediate} has {} blocks",
+        intermediate / 128
+    );
+    Ok(())
+}
+
 /// Reject an explicit topology before any weight allocation: it is defined only
 /// for the official native checkpoint, its rank count must match `--world`, and
 /// every rank must be inside the topology. Legacy V4.1 native TP4/EXL3
@@ -863,20 +903,23 @@ fn validate_topology(config: &NativeExpertServiceConfig, catalog: &OfficialV41Ca
         return Ok(());
     }
     ensure!(
-        matches!(config.world, 1 | 2 | 3 | 4 | 6) && config.rank < config.world,
-        "implicit Spark world must be 1, 2, 3, 4 or 6 with rank below world; \
+        (1..=8).contains(&config.world) && config.rank < config.world,
+        "implicit Spark world must be 1..8 with rank below world; \
          an explicit TP x EP topology must pass --spark-tp/--spark-ep"
     );
+    if catalog.exl3().is_some() || catalog.fp8().is_some() {
+        let intermediate = catalog.routed_experts().geometry()?.intermediate as usize;
+        validate_new_world_blocks(intermediate, config.world)?;
+    }
     ensure!(
-        config.world != 1 || (catalog.exl3().is_some()
-            && catalog.routed_experts().geometry()?.family() == Some("qwen4")),
-        "implicit Spark TP1 requires Qwen EXL3 experts (qwen4:exl3-k45)"
+        config.world != 1 || catalog.exl3().is_some() || catalog.fp8().is_some(),
+        "implicit Spark TP1 requires a matching EXL3/FP8/MXFP4/NVFP4 package"
     );
     // Native FP4 Flash has a distinct TP2 shard. Other native FP4 layouts
     // continue to require the explicit ownership-aware topology outside TP4.
     ensure!(
         config.world == 4 || catalog.exl3().is_some() || config.native_spark_tp2
-            || (matches!(config.world, 2 | 6) && catalog.fp8().is_some()),
+            || catalog.fp8().is_some(),
         "this implicit Spark group requires EXL3/FP8 experts or native V4 Flash TP2; \
          other native groups must pass --spark-tp/--spark-ep"
     );
@@ -909,9 +952,9 @@ impl NativeExpertServiceConfig {
             return Ok(match self.world {
                 2 if self.native_spark_tp2 => ExpertLayer::BackboneReplicatedTp { layer, rank: self.rank, world: 2 },
                 2 => ExpertLayer::BackboneTp2 { layer, rank: self.rank },
-                // Admission above admits world 3 only for an EXL3 checkpoint, so
-                // this can never resolve to the native FP8 shard family.
-                1 | 3 | 6 => ExpertLayer::BackboneExl3Tp { layer, rank: self.rank, world: self.world },
+                // Compressed generic shards carry their implicit TP degree.
+                // Native groups outside TP4 require the explicit topology.
+                1 | 3 | 5 | 6 | 7 | 8 => ExpertLayer::BackboneExl3Tp { layer, rank: self.rank, world: self.world },
                 _ => ExpertLayer::Backbone { layer, rank: self.rank },
             });
         };

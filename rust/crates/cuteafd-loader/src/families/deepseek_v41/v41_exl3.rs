@@ -110,7 +110,7 @@ impl V41Exl3Projection {
         layout: V41Exl3Partition,
     ) -> Result<Range<usize>> {
         ensure!(
-            matches!(world, 1 | 2 | 3 | 4 | 6) && rank < world,
+            (1..=8).contains(&world) && rank < world,
             "invalid EXL3 TP rank/world"
         );
         let intermediate = match self.kind {
@@ -1345,7 +1345,42 @@ mod tests {
                 assert_eq!(p.intermediate_partition(6, rank).unwrap(), rank * 512..(rank + 1) * 512);
             }
             assert!(p.intermediate_partition(6, 6).is_err());
-            assert!(p.intermediate_partition(5, 0).is_err());
+            assert!(p.intermediate_partition(9, 0).is_err());
+        }
+    }
+
+    #[test]
+    fn new_transport_worlds_partition_nonempty_h128_blocks_exactly() {
+        for intermediate in [640, 2048, 2304, 3072] {
+            for kind in [V41Exl3ProjectionKind::Gate, V41Exl3ProjectionKind::Down] {
+                let (input_features, output_features) = if kind == V41Exl3ProjectionKind::Down {
+                    (intermediate, 5120)
+                } else {
+                    (5120, intermediate)
+                };
+                let p = V41Exl3Projection { name: "test".into(), kind, bits: 4,
+                    input_features, output_features };
+                for world in [1, 5, 7, 8] {
+                    if intermediate / 128 < world {
+                        assert!(p.intermediate_partition(world, 0).is_err());
+                        continue;
+                    }
+                    let mut cursor = 0;
+                    let mut widths = Vec::new();
+                    for rank in 0..world {
+                        let range = p.intermediate_partition(world, rank).unwrap();
+                        assert_eq!(range.start, cursor);
+                        assert_eq!(range.start % 128, 0);
+                        assert_eq!(range.end % 128, 0);
+                        assert!(!range.is_empty());
+                        widths.push(range.len());
+                        cursor = range.end;
+                    }
+                    assert_eq!(cursor, intermediate);
+                    assert!(widths.iter().max().unwrap() - widths.iter().min().unwrap() <= 128);
+                    assert!(p.intermediate_partition(world, world).is_err());
+                }
+            }
         }
     }
 
@@ -1403,7 +1438,7 @@ mod tests {
             }
             // Only the admitted EXL3 worlds partition; six-rank Spark layouts
             // stay native, and an empty shard is never produced.
-            for world in [5usize, 6, 8, 19] {
+            for world in [0usize, 6, 9, 19] {
                 assert!(
                     p.intermediate_partition(world, 0).is_err(),
                     "EXL3 world {world} must stay unadmitted"

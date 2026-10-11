@@ -105,7 +105,7 @@ mod tests {
 
     #[test]
     fn approved_layouts_require_their_exact_rank_count() {
-        for (tp, ep) in [(2u8, 1u8), (3, 1), (4, 1), (2, 2), (3, 2), (2, 3), (6, 1)] {
+        for (tp, ep) in [(1u8, 1u8), (2, 1), (3, 1), (4, 1), (5, 1), (6, 1), (7, 1), (8, 1), (2, 2), (3, 2), (2, 3)] {
             let expected = topology(tp, ep);
             let resolved = resolve(Some(tp), Some(ep), expected.world_size(), "serve-native")
                 .unwrap()
@@ -118,7 +118,7 @@ mod tests {
 
     #[test]
     fn unapproved_layouts_and_ranges_are_rejected() {
-        for (tp, ep) in [(1u8, 1u8), (2, 4), (4, 2), (3, 3), (0, 1), (6, 2), (6, 3)] {
+        for (tp, ep) in [(9u8, 1u8), (2, 4), (4, 2), (3, 3), (0, 1), (6, 2), (6, 3)] {
             let world = tp as usize * ep as usize;
             assert!(resolve(Some(tp), Some(ep), world, "serve-native").is_err(), "{tp}x{ep}");
         }

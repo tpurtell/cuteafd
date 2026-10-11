@@ -84,7 +84,7 @@ pub(crate) const SPARSE_TOPK: usize = 2112;
 /// BF16 K/V record of one token: K [2, 256] then V [2, 256].
 pub(crate) const RECORD_BYTES: usize = 2048;
 pub(crate) const INDEX_DIM: usize = 128;
-const MAX_RANKS: usize = 6;
+const MAX_RANKS: usize = crate::shared::spark_intake::MAX_INTAKE_RANKS;
 const HC: usize = 4;
 /// Tokens per QSA index block, and blocks per pool-cache page.
 pub(crate) const BLOCK: usize = 4;

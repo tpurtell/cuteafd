@@ -73,12 +73,11 @@ fn residency_selection(layer: ExpertLayer) -> Result<(V41Exl3Layer, usize, usize
         ExpertLayer::BackboneTp2 { layer, rank } => (V41Exl3Layer::Backbone(layer), 2, rank),
         // Implicit compact TP shard on a compressed checkpoint: the shard count
         // rides on the layer, so the whole-block H128 partition drives residency
-        // directly. One-, three- and six-rank groups reach this layer; the two-rank
-        // compact profile keeps `BackboneTp2` untouched above.
+        // directly. The two- and four-rank legacy layers stay untouched above.
         ExpertLayer::BackboneExl3Tp { layer, rank, world } => {
             ensure!(
-                matches!(world, 1 | 3 | 6) && rank < world,
-                "EXL3 Spark shards support implicit one-, three- and six-rank groups, got TP{world} rank {rank}"
+                (1..=8).contains(&world) && rank < world,
+                "EXL3 Spark shards require TP1..8 and rank below world, got TP{world} rank {rank}"
             );
             (V41Exl3Layer::Backbone(layer), world, rank)
         }
@@ -465,7 +464,7 @@ mod tests {
 
     #[test]
     fn implicit_shard_residency_selection_admits_whole_experts() -> Result<()> {
-        for world in [1, 3, 6] {
+        for world in 1..=8 {
             for rank in 0..world {
                 let (layer, selected_world, selected_rank) = residency_selection(
                     ExpertLayer::BackboneExl3Tp { layer: 7, rank, world })?;
@@ -474,7 +473,7 @@ mod tests {
             }
             assert!(residency_selection(ExpertLayer::BackboneExl3Tp { layer: 7, rank: world, world }).is_err());
         }
-        for world in [0, 2, 4, 5, 7] {
+        for world in [0, 9] {
             assert!(residency_selection(ExpertLayer::BackboneExl3Tp { layer: 7, rank: 0, world }).is_err());
         }
         assert!(matches!(residency_selection(ExpertLayer::BackboneTp2 { layer: 7, rank: 1 })?,

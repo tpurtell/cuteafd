@@ -170,12 +170,20 @@ pub(super) fn load_fp8<'a>(
     // whole 32-blocks padded to 128 (MiMo V2.6 Pro: TP6, TP2), NVFP4 ones whole
     // 16-blocks padded to 128 (TP3 as well). `slice` checks it; the package
     // directory has a layout per built world.
-    ensure!(config.topology.is_none() && matches!(config.world, 2 | 3 | 4 | 6),
-        "FP8/MXFP4/NVFP4 experts serve implicit Spark TP2, TP3, TP4 or TP6 groups");
+    ensure!(config.topology.is_none() && (1..=8).contains(&config.world),
+        "FP8/MXFP4/NVFP4 experts require implicit Spark TP1..8 groups");
     tensors.slice(config.world)?;
     let directory = config.fp8_package.clone()
         .unwrap_or_else(|| crate::shared::experts::fp8::package_directory(&config.library, config.world, tensors.format()));
     let (directory, slicing) = crate::shared::experts::fp8::exact_layout(&directory, tensors, config.world, config.rank);
+    if matches!(config.world, 5 | 7 | 8) {
+        ensure!(
+            slicing == cuteafd_loader::formats::fp8_experts::Slicing::Blocks(128)
+                || tensors.shape().intermediate as usize % (128 * config.world) == 0,
+            "Spark TP{} requires every whole-H128 rank-width package beside {}; padded fallback is not supported for this new count",
+            config.world, directory.display()
+        );
+    }
     let layers = config.resident_layers(catalog.routed_experts().layers)?;
     let workspace = Fp8Worker::workspace_bytes(config.capacity as usize);
     let budget = config.device_budget.checked_sub(workspace).context("FP8 worker workspace exceeds the budget")?;

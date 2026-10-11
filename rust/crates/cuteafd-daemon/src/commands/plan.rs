@@ -1082,7 +1082,7 @@ mod tests {
         let error = run_plan(args(pro.path(), 4, true)).unwrap_err();
         assert!(error.to_string().contains("is not servable by this build"), "{error:#}");
         // Options that describe no deployment fail before the checkpoint is read.
-        for (ranks, budget) in [(5, 100.0), (8, 100.0), (4, f64::NAN), (4, 0.0), (4, -3.0)] {
+        for (ranks, budget) in [(9, 100.0), (4, f64::NAN), (4, 0.0), (4, -3.0)] {
             let error = run_plan(PlanArgs { spark_budget_gib: budget, ..args(flash.path(), ranks, false) }).unwrap_err();
             assert!(matches!(error.downcast_ref::<PlanError>(), Some(PlanError::InvalidOption { .. })),
                 "{ranks} ranks, {budget} GiB: {error:#}");

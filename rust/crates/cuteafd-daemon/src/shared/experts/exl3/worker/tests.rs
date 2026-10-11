@@ -43,13 +43,13 @@ fn reference(fixture: &Path, aot: &Path, capacity: usize) -> Result<Vec<Vec<u8>>
 
 #[test]
 fn exl3_worker_rank_bounds_include_tp1() -> Result<()> {
-    for world in [1, 2, 3, 4, 6] {
+    for world in 1..=8 {
         for rank in 0..world {
             Exl3Worker::validate_rank(world, rank)?;
         }
         assert!(Exl3Worker::validate_rank(world, world).is_err());
     }
-    for world in [0, 5, 7] {
+    for world in [0, 9] {
         assert!(Exl3Worker::validate_rank(world, 0).is_err());
     }
     Ok(())
