@@ -55,6 +55,10 @@ impl<'e, 'a> Qwen4Prefix<'e, 'a> {
         let _memory_scope = cuteafd_ffi::memory_ledger::scope("prefix");
         let paged = engine.paged_buffers();
         ensure!(!paged.is_empty(), "Qwen 3.8 Flash Next without a full-attention layer");
+        let state_regions = engine.slot_regions(0);
+        let device = paged[0][0].device_id;
+        ensure!(paged.iter().flatten().chain(&state_regions).all(|buffer| buffer.device_id == device),
+            "Qwen dual-device prefix snapshots require segmented backing; refusing a single-device mark arena");
         for [records, keys, pools] in &paged {
             ensure!(records.bytes >= engine.pages * PAGE_ROWS * RECORD_BYTES
                 && keys.bytes >= engine.pages * PAGE_ROWS * KEY_BYTES
