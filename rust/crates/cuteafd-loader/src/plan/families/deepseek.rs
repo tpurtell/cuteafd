@@ -6,7 +6,6 @@ use serde_json::Value;
 use super::{describe, require};
 use crate::families::deepseek_v4::DeepseekV4Config;
 use crate::plan::checkpoint::{opt_usize_field, usize_field, Checkpoint};
-use crate::plan::experts::TRANSPORT_WORLDS;
 use crate::plan::family::{ConfigError, ExpertContract, Family, FamilyModel, Hint, RuntimeStatus};
 use crate::plan::format::{Encoding, QuantOperand, ScaleEncoding};
 use crate::plan::names::{indexed, indexed_tail};
@@ -428,7 +427,8 @@ impl FamilyModel for DeepSeekModel {
         Some(ExpertContract {
             package: format!("{geometry}:{format} (expertd-native)"),
             block: 128,
-            spark_worlds: TRANSPORT_WORLDS.into_iter().filter(|&world| world != 1).collect(),
+            // Native packages remain bounded independently of transport capacity.
+            spark_worlds: vec![2, 3, 4, 6],
             local: Err(format!("{serve} runs routed experts on 2, 3, 4 or 6 Spark ranks (its local expert layers \
                 supplement them)")),
         })

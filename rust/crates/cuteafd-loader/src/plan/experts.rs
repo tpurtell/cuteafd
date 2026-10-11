@@ -15,10 +15,11 @@
 //!   6 when the intermediate has at least six 128-row blocks; Qwen also has TP1.
 //! - DeepSeek native experts (expertd-native MXFP4 / EXL3): 2, 3, 4 and 6.
 //!
-//! The expert transport (RoCE verbs, TCP) runs 1, 2, 3, 4 or 6 Spark ranks.
+//! The expert transport (RoCE verbs, TCP) runs one through eight Spark ranks.
+//! Package coverage below is independent of transport capacity.
 
 /// Spark worlds the expert transport runs.
-pub const TRANSPORT_WORLDS: [usize; 5] = [1, 2, 3, 4, 6];
+pub const TRANSPORT_WORLDS: [usize; 8] = [1, 2, 3, 4, 5, 6, 7, 8];
 
 /// Default Spark layouts of an FP8 (E4M3, 128x128 scales) expert package.
 pub fn fp8_spark_worlds(intermediate: usize) -> Vec<usize> {

@@ -257,14 +257,14 @@ impl Default for PlanOptions {
 
 impl PlanOptions {
     /// Rejects options that describe no deployment: Spark worlds the
-    /// transport does not run (it runs 1, 2, 3, 4 or 6; 0 is the local-only
+    /// transport does not run (it runs 1 through 8; 0 is the local-only
     /// placement) and empty budgets.
     pub fn validate(&self) -> Result<(), PlanError> {
         if let ExpertPlacement::Sparks { ranks } = self.placement {
             if !experts::TRANSPORT_WORLDS.contains(&ranks) {
                 return Err(PlanError::InvalidOption {
                     option: "spark ranks",
-                    reason: format!("{ranks}: the expert transport runs 1, 2, 3, 4 or 6 Spark ranks \
+                    reason: format!("{ranks}: the expert transport runs 1 through 8 Spark ranks \
                         (0 places every routed expert on the coordinator)"),
                 });
             }
