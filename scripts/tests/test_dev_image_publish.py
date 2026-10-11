@@ -150,9 +150,10 @@ def test_dev_failure_names_leg_cancels_other_and_skips_publish(tmp_path, failing
     assert result.returncode != 0
     assert f'[{failing}] dev image build leg failed (exit 17)' in result.stderr
     assert (events / 'remote-cancel').exists()
+    from test_release_build_parallel import process_stops
     for leg in ('coordinator', 'expert'):
-        from test_release_build_parallel import process_running
-        assert not process_running(int((events / f'{leg}.pid').read_text()))
+        # A cancelled leg may still be exiting when the launcher returns.
+        assert not process_stops(int((events / f'{leg}.pid').read_text()))
     assert 'docker push' not in log.read_text()
     assert 'imagetools create' not in log.read_text()
     assert 'docker tag' not in log.read_text()
