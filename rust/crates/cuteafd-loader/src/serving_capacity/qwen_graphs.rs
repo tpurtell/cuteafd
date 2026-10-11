@@ -92,6 +92,120 @@ pub fn qwen_startup_graphs(context: usize, pool_tokens: usize, dense: usize, seq
         shapes as u64, Lifetime::Startup))
 }
 
+/// Owner-local layer fronts, owner0 head, and (for a dual owner chain) the
+/// materialized owner0 cutover post and owner1 final post. This is the same
+/// segment inventory as the executor, not a duplicated whole set per GPU.
+pub fn qwen_graph_segments(owners: &[usize]) -> Option<Vec<u64>> {
+    if owners.is_empty() || owners[0] != 0 || owners.iter().any(|&owner| owner > 1) { return None; }
+    let dual = owners.contains(&1);
+    if dual && (owners.last() != Some(&1)
+        || owners.windows(2).filter(|pair| pair[0] != pair[1]).count() != 1) { return None; }
+    let mut counts = vec![0u64; if dual { 2 } else { 1 }];
+    for &owner in owners { counts[owner] = counts[owner].checked_add(1)?; }
+    counts[0] = counts[0].checked_add(if dual { 2 } else { 1 })?;
+    if dual { counts[1] = counts[1].checked_add(1)?; }
+    Some(counts)
+}
+
+pub fn qwen_startup_graphs_placed(context: usize, pool_tokens: usize, dense: usize, sequences: usize,
+    speculation: bool, owners: &[usize]) -> Option<GraphSet> {
+    let shapes = qwen_serving_graph_shapes(context, qwen_pool_pages(pool_tokens)?, dense, sequences, speculation).len();
+    let executables = qwen_graph_segments(owners)?.into_iter()
+        .map(|segments| (shapes as u64).checked_mul(segments)).collect::<Option<Vec<_>>>()?;
+    Some(GraphSet::new(&executables, QWEN_GRAPH_BYTES_PER_GRAPH, QWEN_GRAPH_MARGIN_PERCENT, QWEN_GRAPH_MARGIN_BYTES,
+        shapes as u64, Lifetime::Startup))
+}
+
+#[cfg(test)]
+mod owner_graph_tests {
+    use super::*;
+
+    #[test]
+    fn qwen_owner_segments_match_cutover_and_exit() {
+        assert_eq!(qwen_graph_segments(&[0; 48]), Some(vec![49]));
+        for cut in [1, 24, 47] {
+            let owners: Vec<_> = (0..48).map(|layer| usize::from(layer >= cut)).collect();
+            assert_eq!(qwen_graph_segments(&owners), Some(vec![cut as u64 + 2, (48 - cut) as u64 + 1]));
+            for speculation in [false, true] {
+                let graphs = qwen_startup_graphs_placed(131072, 2097152, 32768, 16, speculation, &owners).unwrap();
+                assert_eq!(graphs.ranks[0].executables, graphs.shapes * (cut as u64 + 2));
+                assert_eq!(graphs.ranks[1].executables, graphs.shapes * ((48 - cut) as u64 + 1));
+                assert_eq!(graphs.ranks.iter().map(|rank| rank.executables).sum::<u64>(), graphs.shapes * 51);
+                for rank in 0..2 { assert_eq!(graphs.at_ready(rank) + graphs.growth(rank), graphs.bytes(rank)); }
+            }
+        }
+    }
+
+    #[test]
+    fn qwen_owner_cache_preserves_global_totals_and_mtp_home() {
+        let mut config = crate::plan::testing::qwen4_config(48);
+        config["text_config"]["mtp_num_hidden_layers"] = serde_json::json!(1);
+        let mut cfg = crate::families::qwen4::Qwen4Config::from_hf(&config).unwrap();
+        cfg.ple_layers = vec![1];
+        for cut in [1, 2, 24, 47] {
+            let owners: Vec<_> = (0..48).map(|layer| usize::from(layer >= cut)).collect();
+            for mtp in [false, true] {
+                let whole = super::super::qwen_cache_geometry(&cfg, 48, mtp).unwrap();
+                let placed = qwen_cache_geometry_placed(&cfg, &owners, mtp).unwrap();
+                assert_eq!(placed.placement, super::super::KvPlacement::PartitionedLayers);
+                assert_eq!(placed.ranks.iter().map(|rank| rank.persistent_unit_bytes).sum::<u64>(), whole.ranks[0].persistent_unit_bytes);
+                assert_eq!(placed.ranks.iter().map(|rank| rank.active_state_per_sequence_bytes).sum::<u64>(), whole.ranks[0].active_state_per_sequence_bytes);
+                assert_eq!(placed.ranks.iter().map(|rank| rank.retained_mark_bytes).sum::<u64>(), whole.ranks[0].retained_mark_bytes);
+                assert_eq!(placed.ranks.iter().map(|rank| rank.speculative_replay_bytes).sum::<u64>(), whole.ranks[0].speculative_replay_bytes);
+                assert_eq!(placed.ranks[0].fixed_state_bytes, whole.ranks[0].fixed_state_bytes);
+                assert_eq!(placed.ranks[1].fixed_state_bytes, 3 * 64 * 4);
+                let no_mtp = qwen_cache_geometry_placed(&cfg, &owners, false).unwrap();
+                assert_eq!(placed.ranks[1], no_mtp.ranks[1]);
+            }
+        }
+    }
+
+    #[test]
+    fn qwen_owner_segments_refuse_unsupported_topologies() {
+        for owners in [vec![], vec![1], vec![0, 2], vec![0, 1, 0], vec![0, 1, 0, 1]] {
+            assert!(qwen_graph_segments(&owners).is_none());
+        }
+    }
+}
+
+/// Partition the authoritative cache geometry by whole-layer owner, while
+/// retaining logical global unit ids. Commit tables exist on each owner;
+/// the deferred MTP id buffer and MTP pools remain on the head's owner0.
+pub fn qwen_cache_geometry_placed(cfg: &crate::families::qwen4::Qwen4Config, owners: &[usize], mtp: bool)
+    -> anyhow::Result<super::FamilyCacheGeometry> {
+    use super::{KvPlacement, RankCacheGeometry};
+    let segments = qwen_graph_segments(owners).ok_or_else(|| anyhow::anyhow!("invalid Qwen cache owners"))?;
+    anyhow::ensure!(owners.len() <= cfg.layers, "Qwen cache owner count exceeds the backbone");
+    let mut geometry = super::qwen_cache_geometry(cfg, owners.len(), mtp)?;
+    if segments.len() == 1 { return Ok(geometry); }
+    let mut ranks = vec![RankCacheGeometry::default(); 2];
+    let mut previous = RankCacheGeometry::default();
+    let add = |dst: &mut u64, bytes: u64| -> anyhow::Result<()> {
+        *dst = dst.checked_add(bytes).ok_or_else(|| anyhow::anyhow!("Qwen owner cache overflow"))?;
+        Ok(())
+    };
+    for (layer, &owner) in owners.iter().enumerate() {
+        let current = super::qwen_cache_geometry(cfg, layer + 1, false)?.ranks[0];
+        let rank = &mut ranks[owner];
+        add(&mut rank.persistent_unit_bytes, current.persistent_unit_bytes - previous.persistent_unit_bytes)?;
+        add(&mut rank.active_state_per_sequence_bytes,
+            current.active_state_per_sequence_bytes - previous.active_state_per_sequence_bytes)?;
+        add(&mut rank.retained_mark_bytes, current.retained_mark_bytes - previous.retained_mark_bytes)?;
+        add(&mut rank.speculative_replay_bytes, current.speculative_replay_bytes - previous.speculative_replay_bytes)?;
+        previous = current;
+    }
+    let all = geometry.ranks[0];
+    add(&mut ranks[0].persistent_unit_bytes, all.persistent_unit_bytes - previous.persistent_unit_bytes)?;
+    add(&mut ranks[0].active_state_per_sequence_bytes,
+        all.active_state_per_sequence_bytes - previous.active_state_per_sequence_bytes)?;
+    ranks[0].pool_metadata_unit_bytes = all.pool_metadata_unit_bytes;
+    ranks[0].fixed_state_bytes = all.fixed_state_bytes;
+    ranks[1].fixed_state_bytes = 3 * QWEN_DECODE_ROWS as u64 * 4;
+    geometry.placement = KvPlacement::PartitionedLayers;
+    geometry.ranks = ranks;
+    Ok(geometry)
+}
+
 /// The largest pool (whole units, at most `target`) whose startup graph set
 /// fits `available` bytes beside `fixed` at `per_token` bytes a token, with
 /// that set: descend from the no-graph bound until the pool's own set fits
