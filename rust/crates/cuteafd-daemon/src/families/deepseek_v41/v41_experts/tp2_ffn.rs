@@ -181,23 +181,7 @@ impl<'a> Wave<'a> {
         let local = values.device_id as usize;
         let remote = 1 - local;
         let upload = &self.streams[remote];
-        struct Drain<'s, 'a> {
-            stream: &'s Stream<'a>,
-            complete: bool,
-        }
-        impl Drop for Drain<'_, '_> {
-            fn drop(&mut self) {
-                if !self.complete {
-                    if let Err(error) = self.stream.drain() {
-                        tracing::error!(%error,"draining TP2 shared input upload");
-                    }
-                }
-            }
-        }
-        let mut guard = Drain {
-            stream: upload,
-            complete: false,
-        };
+        let mut guard = upload.cancellation_guard("TP2 shared input upload");
         if crate::shared::memory::chain::deferred() {
             // Both GPUs' streams follow the input's producers (the chain head).
             self.streams[0].join_chain()?;
@@ -284,24 +268,8 @@ impl<'a> Wave<'a> {
                 "TP2 FFN input extent/device mismatch"
             );
         }
-        struct Drain<'s, 'a> {
-            stream: &'s Stream<'a>,
-            complete: bool,
-        }
-        impl Drop for Drain<'_, '_> {
-            fn drop(&mut self) {
-                if !self.complete {
-                    if let Err(error) = self.stream.drain() {
-                        tracing::error!(%error, "draining TP2 FFN input upload");
-                    }
-                }
-            }
-        }
         let upload = &self.streams[remote];
-        let mut guard = Drain {
-            stream: upload,
-            complete: false,
-        };
+        let mut guard = upload.cancellation_guard("TP2 FFN input upload");
         // Do not submit DMA behind an unresolved stream dependency: a blocked
         // copy packet can hold up independent lanes on the shared copy engine.
         // Chained producers of these inputs are settled on the host as well.

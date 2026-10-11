@@ -53,7 +53,7 @@ impl<'a> Wave<'a> {
             fn drop(&mut self) {
                 if !self.complete {
                     for rank in self.ranks.iter() {
-                        if let Err(error) = rank.stream.drain() { tracing::error!(%error, "draining shared TP2 rank"); }
+                        rank.stream.drain_or_abort("shared TP2 rank");
                     }
                 }
             }

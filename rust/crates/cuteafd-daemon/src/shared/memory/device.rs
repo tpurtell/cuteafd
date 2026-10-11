@@ -142,6 +142,92 @@ mod allocation_lifetime_tests {
     use super::*;
     use cuteafd_ffi::native_library_lifetime_fixture::Fixture;
 
+    fn failed_sync_aborts_before_free(path: &str) -> Result<()> {
+        use std::os::unix::process::ExitStatusExt;
+        const CHILD: &str = "CUTEAFD_FATAL_SYNC_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            let fixture = Fixture::build()?;
+            std::fs::write(std::env::var("CUTEAFD_FATAL_SYNC_EVIDENCE")?, fixture.directory().join("events").to_str().unwrap())?;
+            let library = fixture.load()?;
+            let device = Device { library: &library, id: 0 };
+            let allocation = Allocation::new(device, 256)?;
+            let stream = Stream { device, raw: std::ptr::null_mut() };
+            fixture.configure_pack(&library, 0, 1)?;
+            match path {
+                "stream_drop" => drop(stream),
+                "wait_cancel" => {
+                    let runtime = tokio::runtime::Builder::new_current_thread().build()?;
+                    runtime.block_on(async {
+                        let mut wait = std::pin::pin!(stream.wait());
+                        std::future::poll_fn(|cx| {
+                            assert!(wait.as_mut().poll(cx).is_pending());
+                            std::task::Poll::Ready(())
+                        }).await;
+                        drop(wait);
+                    });
+                }
+                _ => {
+                    let site = match path {
+                        "peer_cancel" => "cancelled peer transfer",
+                        "tp2_shared_cancel" => "TP2 shared input upload",
+                        "tp2_ffn_cancel" => "TP2 FFN input upload",
+                        "tp2_rank_cancel" => "cancelled TP2 rank",
+                        "tp2_shared_rank_cancel" => "shared TP2 rank",
+                        _ => unreachable!(),
+                    };
+                    if matches!(path, "tp2_rank_cancel" | "tp2_shared_rank_cancel") { stream.drain_or_abort(site); }
+                    else { drop(stream.cancellation_guard(site)); }
+                }
+            }
+            drop(allocation);
+            panic!("failed synchronize returned without abort");
+        }
+        let root = std::path::PathBuf::from(std::env::var("CUTEAFD_NATIVE_LIFETIME_FIXTURE_DIR")?);
+        std::fs::create_dir_all(&root)?;
+        let evidence = root.join(format!("fatal-sync-{}-{path}", std::process::id()));
+        let status = std::process::Command::new(std::env::current_exe()?)
+            .args(["--exact", &format!("shared::memory::device::allocation_lifetime_tests::{path}"), "--ignored"])
+            .env(CHILD, "1").env("CUTEAFD_FATAL_SYNC_EVIDENCE", &evidence).status()?;
+        assert_eq!(status.signal(), Some(libc::SIGABRT));
+        let events = std::fs::read_to_string(std::fs::read_to_string(evidence)?)?;
+        assert_eq!(events, "DS", "abort must precede cudaFree and module unload");
+        Ok(())
+    }
+
+    macro_rules! failed_sync_test {
+        ($name:ident) => {
+            #[test]
+            #[ignore = "requires an allocated CPU build slot and explicit NVMe fixture directory"]
+            fn $name() -> Result<()> { failed_sync_aborts_before_free(stringify!($name)) }
+        };
+    }
+    failed_sync_test!(stream_drop);
+    failed_sync_test!(wait_cancel);
+    failed_sync_test!(peer_cancel);
+    failed_sync_test!(tp2_rank_cancel);
+    failed_sync_test!(tp2_shared_rank_cancel);
+    failed_sync_test!(tp2_shared_cancel);
+    failed_sync_test!(tp2_ffn_cancel);
+
+    #[test]
+    #[ignore = "requires an allocated CPU build slot and explicit NVMe fixture directory"]
+    fn explicit_drain_error_remains_recoverable() -> Result<()> {
+        let fixture = Fixture::build()?;
+        let library = fixture.load()?;
+        let device = Device { library: &library, id: 0 };
+        let allocation = Allocation::new(device, 256)?;
+        let stream = Stream { device, raw: std::ptr::null_mut() };
+        fixture.configure_pack(&library, 0, 1)?;
+        assert!(stream.drain().is_err());
+        library.quarantine_module_after_failed_drain();
+        // Deliberate error handling retains the raw stream as well as storage.
+        std::mem::forget(stream);
+        drop(allocation);
+        drop(library);
+        assert_eq!(fixture.events()?, "DS");
+        Ok(())
+    }
+
     #[test]
     #[ignore = "requires an allocated CPU build slot and explicit NVMe fixture directory"]
     fn quarantined_allocation_drop_never_calls_cuda_free() -> Result<()> {
@@ -176,6 +262,12 @@ impl<'a> Stream<'a> {
     pub(crate) fn drain(&self) -> Result<()> {
         self.device.run(|| unsafe { self.device.library.cuda_stream_synchronize(self.raw) })
     }
+    pub(crate) fn drain_or_abort(&self, site: &str) {
+        crate::shared::decode_graph::fatal_drain(self.drain(), site);
+    }
+    pub(crate) fn cancellation_guard(&self, site: &'static str) -> CancellationDrain<'_, 'a> {
+        CancellationDrain { stream: self, complete: false, site }
+    }
     /// Completes this stream's queued work for later stages: a host wait
     /// ([`Self::wait`]), or under [`super::chain::deferred`] a chain merge
     /// (later stages join the chain head; no host wait).
@@ -191,27 +283,25 @@ impl<'a> Stream<'a> {
     }
     /// Retain queued work through cooperative completion or cancellation drain.
     pub(crate) async fn wait(&self) -> Result<()> {
-        struct Drain<'s, 'a> { stream: &'s Stream<'a>, complete: bool }
-        impl Drop for Drain<'_, '_> {
-            fn drop(&mut self) {
-                if !self.complete {
-                    if let Err(error) = self.stream.drain() {
-                        tracing::error!(%error, "draining interrupted device stream");
-                    }
-                }
-            }
-        }
-        let mut guard = Drain { stream: self, complete: false };
+        let mut guard = self.cancellation_guard("interrupted device stream");
         while !self.ready()? { tokio::task::yield_now().await; }
         guard.complete = true;
         Ok(())
     }
 }
+pub(crate) struct CancellationDrain<'s, 'a> {
+    stream: &'s Stream<'a>,
+    pub complete: bool,
+    site: &'static str,
+}
+impl Drop for CancellationDrain<'_, '_> {
+    fn drop(&mut self) {
+        if !self.complete { self.stream.drain_or_abort(self.site); }
+    }
+}
 impl Drop for Stream<'_> {
     fn drop(&mut self) {
-        if let Err(error) = self.drain() {
-            tracing::error!(%error, "draining device-owned stream");
-        }
+        self.drain_or_abort("device-owned stream");
         if let Err(error) = self.device.run(|| unsafe { self.device.library.cuda_stream_destroy(self.raw) }) {
             tracing::error!(%error, "destroying device-owned stream");
         }
@@ -282,17 +372,7 @@ impl<'a> PeerTransfer<'a> {
             && std::ptr::eq(library, producer.device.library)
             && bytes <= source.buffer.bytes && bytes <= destination.buffer.bytes,
             "peer transfer owner or extent mismatch");
-        struct Drain<'s, 'a> { stream: &'s Stream<'a>, complete: bool }
-        impl Drop for Drain<'_, '_> {
-            fn drop(&mut self) {
-                if !self.complete {
-                    if let Err(error) = self.stream.drain() {
-                        tracing::error!(%error, "draining cancelled peer transfer");
-                    }
-                }
-            }
-        }
-        let mut drain = Drain { stream: &self.destination, complete: false };
+        let mut drain = self.destination.cancellation_guard("cancelled peer transfer");
         self.ready.device.run(|| unsafe { library.cuda_event_record(self.ready.raw, producer.raw) })?;
         let deferred = super::chain::deferred();
         let sm = self.sm.as_ref().filter(|_| deferred);

@@ -13,6 +13,7 @@ mod families {
 }
 #[path = "../src/shared"]
 mod shared {
+    pub(crate) mod decode_graph;
     pub(crate) mod fp8_linear;
     pub(crate) mod memory;
 }

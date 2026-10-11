@@ -313,9 +313,7 @@ impl<'a> ExpertWave<'a> {
             fn drop(&mut self) {
                 if !self.complete {
                     for rank in self.ranks.iter() {
-                        if let Err(error) = rank.stream.drain() {
-                            tracing::error!(%error, "draining cancelled TP2 rank");
-                        }
+                        rank.stream.drain_or_abort("cancelled TP2 rank");
                     }
                 }
             }

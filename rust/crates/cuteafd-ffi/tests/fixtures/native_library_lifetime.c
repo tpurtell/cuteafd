@@ -133,10 +133,34 @@ int cuteafd_fp8_w8a16_pack(const void *source, void *packed, void *scale,
     return pack_status;
 }
 
+int cuteafd_cuda_event_synchronize(void *handle) {
+    (void)handle;
+    event('S');
+    return ++drain_calls > drain_after ? drain_status : 0;
+}
+
+int cuteafd_cuda_event_destroy(void *handle) {
+    (void)handle;
+    event('E');
+    return 0;
+}
+
+int cuteafd_cuda_stream_query(void *stream, int *ready) {
+    (void)stream;
+    *ready = 0;
+    return 0;
+}
+
 int cuteafd_cuda_stream_synchronize(void *stream) {
     (void)stream;
     event('S');
     return ++drain_calls > drain_after ? drain_status : 0;
+}
+
+int cuteafd_cuda_stream_destroy(void *stream) {
+    (void)stream;
+    event('T');
+    return 0;
 }
 
 int cuteafd_cuda_set_device(int device) { current_device = device; return 0; }

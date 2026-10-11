@@ -1,5 +1,13 @@
 //! Canonical serving decode shapes; diagnostic scoring stays ungraphed.
 
+pub(crate) fn fatal_drain(result: anyhow::Result<()>, site: &str) {
+    if let Err(error) = result {
+        tracing::error!(%error, site, "graph storage drain failed; aborting before storage release");
+        // A failed drain cannot prove captured pointers are no longer in use.
+        std::process::abort();
+    }
+}
+
 pub(crate) const ROW_BUCKETS: [usize; 4] = [1, 4, 16, 64];
 
 pub(crate) fn row_bucket(rows: usize) -> usize {
