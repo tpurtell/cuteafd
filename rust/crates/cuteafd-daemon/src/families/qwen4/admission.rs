@@ -48,9 +48,103 @@ pub(super) fn pool_tokens(library: &NativeLibrary, args: &EngineArgs, inputs: &Q
     Ok(usize::try_from(placement.pool_tokens)?)
 }
 
+/// Static rank packages, selected before either device allocates experts. The
+/// loader manifest plan and backend DSO ABI must agree on widths and bytes.
+pub(super) struct DualExpertPlan {
+    pub packages: [std::path::PathBuf; 2],
+    pub costs: Vec<Option<cuteafd_loader::placement::ExpertCost>>,
+    pub workspace: [u64; 2],
+    pub wire: bool,
+}
+
+pub(super) fn dual_experts(args: &EngineArgs, catalog: &cuteafd_loader::OfficialV41Catalog,
+    layers: usize) -> Result<DualExpertPlan> {
+    use anyhow::{ensure, Context};
+    use crate::shared::experts::rtx::{exl3::Exl3Tp2, fp8moe::Fp8MoeTp2};
+    use cuteafd_loader::formats::fp8_experts::Slicing;
+    let rows = args.prefill_rows.max(super::engine::DECODE_ROWS);
+    let costs = qwen4::dual_expert_costs(catalog, layers)?;
+    let wire = catalog.exl3().is_some();
+    let (packages, backend_workspace) = if let Some(exl3) = catalog.exl3() {
+        let name = crate::shared::experts::exl3::package_name("qwen4", exl3.decoder_tiers());
+        let root = args.native_lib.parent().unwrap_or(std::path::Path::new(".")).join("exl3").join(name);
+        let packages = [0, 1].map(|rank| root.join(format!("rtx-tp2-rank{rank}")));
+        let workspace = [Exl3Tp2::workspace_bytes_for(&packages[0], catalog.routed_experts().hidden, rows)?,
+            Exl3Tp2::workspace_bytes_for(&packages[1], catalog.routed_experts().hidden, rows)?];
+        (packages, workspace)
+    } else {
+        let tensors = catalog.fp8().context("Qwen dual experts need EXL3/FP8/NVFP4")?;
+        let directory = args.fp8_package.clone().unwrap_or_else(||
+            crate::shared::experts::fp8::package_directory(&args.native_lib, 2, tensors.format()));
+        let plans = [Fp8MoeTp2::plan(tensors, &directory, 0, rows)?,
+            Fp8MoeTp2::plan(tensors, &directory, 1, rows)?];
+        for rank in 0..2 {
+            ensure!(plans[rank].slicing == Slicing::Blocks(128),
+                "Qwen dual experts require complete-H128 exact rank packages; padded TP2 is unsupported");
+            for cost in costs.iter().flatten() {
+                ensure!(cost.half[rank].resident == plans[rank].resident_layer_bytes as u64
+                    && cost.half[rank].staging == plans[rank].staging_bytes as u64,
+                    "Qwen TP2 header residency disagrees with backend rank {rank}");
+            }
+        }
+        let workspace = plans.each_ref().map(|plan| plan.workspace_bytes);
+        (plans.map(|plan| plan.directory), workspace)
+    };
+    let workspace = qwen4::dual_expert_workspace(catalog,
+        packages.each_ref().map(|p| p.as_path()), rows as u64)?;
+    for rank in 0..2 {
+        ensure!(workspace[rank] == backend_workspace[rank] as u64,
+            "Qwen TP2 manifest workspace disagrees with backend rank {rank}");
+    }
+    Ok(DualExpertPlan { packages, costs, workspace, wire })
+}
+
 #[cfg(test)]
 mod tests {
     use cuteafd_loader::serving_capacity::qwen_graphs::*;
+
+    #[test]
+    fn dual_exl3_packages_match_shared_manifest_plan_before_cuda() -> anyhow::Result<()> {
+        use clap::Parser;
+        use cuteafd_loader::plan::testing;
+        #[derive(Parser)]
+        struct Cli {
+            #[command(flatten)]
+            engine: super::super::EngineArgs,
+        }
+        let dir = tempfile::tempdir()?;
+        let (tensors, metadata) = testing::qwen4_exl3(1, 4);
+        testing::write_snapshot(dir.path(), &testing::qwen4_config(1), &tensors, None);
+        testing::write_quantize_config(dir.path(), &metadata);
+        let catalog = cuteafd_loader::read_expert_catalog(dir.path())?;
+        let mut args = Cli::try_parse_from(["serve", "--snapshot", dir.path().to_str().unwrap(),
+            "--native-lib", "/absent/native.so", "--prefill-rows", "16"])?.engine;
+        args.native_lib = dir.path().join("libcuteafd_native.so");
+        // Qwen admits at least the 64-row decode shape, hence m80 as well.
+        let package = crate::shared::experts::exl3::package_name("qwen4", catalog.exl3().unwrap().decoder_tiers());
+        for (rank, width) in [384, 256].into_iter().enumerate() {
+            for capacity in [1, 16, 80] {
+                let path = dir.path().join("exl3").join(&package)
+                    .join(format!("rtx-tp2-rank{rank}/m{capacity}"));
+                std::fs::create_dir_all(&path)?;
+                let manifest = serde_json::json!({"hidden": 2560, "intermediate": width, "experts": 512,
+                    "top_k": 10, "capacity": capacity, "output_dtype": "fp32", "trellis_lut": {"bytes": 32},
+                    "buffers": {"scratch": {"allocation": "scratch", "bytes": capacity * width,
+                        "dtype": "f16", "zero_on_create": false},
+                        "state": {"allocation": "state", "bytes": 16, "zero_on_create": true}}});
+                std::fs::write(path.join("v41_exl3.json"), serde_json::to_vec(&manifest)?)?;
+            }
+        }
+        let plan = super::dual_experts(&args, &catalog, 1)?;
+        assert!(plan.wire);
+        assert_eq!(plan.costs.len(), 1);
+        assert!(plan.costs[0].unwrap().half[0].resident > plan.costs[0].unwrap().half[1].resident);
+        assert_eq!(plan.workspace, [80 * 384 + 3 * (32 + 16) + 97 * 2560 * 2 + 64 * 2560 * 4,
+            80 * 256 + 3 * (32 + 16) + 97 * 2560 * 2 + 64 * 2560 * 4]);
+        std::fs::remove_file(plan.packages[1].join("m80/v41_exl3.json"))?;
+        assert!(super::dual_experts(&args, &catalog, 1).is_err());
+        Ok(())
+    }
 
     fn set(count: u64) -> Option<cuteafd_loader::placement::GraphSet> {
         Some(cuteafd_loader::placement::GraphSet::new(&[count], QWEN_GRAPH_BYTES_PER_GRAPH, QWEN_GRAPH_MARGIN_PERCENT,
