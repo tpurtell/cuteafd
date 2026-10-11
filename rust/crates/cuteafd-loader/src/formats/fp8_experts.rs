@@ -139,8 +139,9 @@ pub enum Slicing {
 }
 
 /// Use unequal whole-H128 slices only when every rank's width is packaged.
-/// The planner and worker must inspect the same package tree; an incomplete
-/// tree or CUTEAFD_FP8_EXACT_SLICES=0 retains the legacy padded layout.
+/// An incomplete Spark tree or CUTEAFD_FP8_EXACT_SLICES=0 selects the legacy
+/// padded layout. The worker validates its width against the planner recipe
+/// before allocation; the coordinator package tree never defines Spark slicing.
 pub fn exact_layout_directory(directory: &Path, tensors: &Fp8ExpertTensors, tp: usize,
     rank: usize) -> (PathBuf, Slicing) {
     exact_layout_directory_with(directory, tensors, tp, rank,

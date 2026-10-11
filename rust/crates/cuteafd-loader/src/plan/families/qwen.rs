@@ -4,7 +4,7 @@
 use super::{bf16, bf16_or_f32, describe, leaf, require};
 use crate::families::qwen4::{Qwen4Attention, Qwen4Config};
 use crate::plan::checkpoint::Checkpoint;
-use crate::plan::experts::{exl3_spark_worlds, fp8_spark_worlds, nvfp4_spark_worlds};
+use crate::plan::experts::spark_worlds;
 use crate::plan::family::{ConfigError, ExpertContract, Family, FamilyModel, Hint, RuntimeStatus};
 use crate::plan::format::{Encoding, QuantOperand, ScaleEncoding};
 use crate::plan::names::indexed;
@@ -279,7 +279,7 @@ impl FamilyModel for QwenModel {
             return Some(ExpertContract {
                 package: "qwen4:exl3-k45".into(),
                 block: 128,
-                spark_worlds: std::iter::once(1).chain(exl3_spark_worlds(moe.intermediate)).collect(),
+                spark_worlds: spark_worlds("qwen4:exl3-k45", moe.intermediate),
                 local: Ok("serve-qwen4 --local-experts (TP1 EXL3 package)".into()),
             });
         }
@@ -287,14 +287,14 @@ impl FamilyModel for QwenModel {
             return Some(ExpertContract {
                 package: "qwen4:nvfp4".into(),
                 block: 16,
-                spark_worlds: nvfp4_spark_worlds(moe.intermediate),
+                spark_worlds: spark_worlds("qwen4:nvfp4", moe.intermediate),
                 local: Ok("serve-qwen4 --local-experts (fp8-qwen4-nvfp4 tp1)".into()),
             });
         }
         operand.is_fp8_block(128, &[ScaleEncoding::F32, ScaleEncoding::Bf16]).then(|| ExpertContract {
             package: "qwen4:fp8".into(),
             block: 128,
-            spark_worlds: fp8_spark_worlds(moe.intermediate),
+            spark_worlds: spark_worlds("qwen4:fp8", moe.intermediate),
             local: Ok("serve-qwen4 --local-experts (fp8-qwen4 tp1)".into()),
         })
     }

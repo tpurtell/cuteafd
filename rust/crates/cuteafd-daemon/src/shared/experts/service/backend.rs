@@ -176,6 +176,17 @@ pub(super) fn load_fp8<'a>(
     let directory = config.fp8_package.clone()
         .unwrap_or_else(|| crate::shared::experts::fp8::package_directory(&config.library, config.world, tensors.format()));
     let (directory, slicing) = crate::shared::experts::fp8::exact_layout(&directory, tensors, config.world, config.rank);
+    let family = crate::shared::experts::fp8::package_family(cuteafd_core::expert_geometry().family(), tensors.format());
+    let format = if tensors.format() == cuteafd_loader::formats::fp8_experts::ExpertFormat::Nvfp4 { "nvfp4" } else { "fp8" };
+    // Known recipes must match admission bytes. Explicit unqualified packages
+    // remain runnable for their hardware gate, without widening planner support.
+    if let Ok(recipe) = cuteafd_loader::plan::experts::spark_recipe(
+        &format!("{family}:{format}"), tensors.shape().intermediate, config.world,
+    ) {
+        let root = directory.parent().context("Spark package layout has no package root")?;
+        recipe.validate_installed(root, config.rank, slicing, tensors.rank_width(config.world, config.rank, slicing)?)
+            .context("installed Spark packages do not match the planner recipe; padded fallback cannot widen rank storage")?;
+    }
     if matches!(config.world, 5 | 7 | 8) {
         ensure!(
             slicing == cuteafd_loader::formats::fp8_experts::Slicing::Blocks(128)

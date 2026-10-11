@@ -8,7 +8,7 @@ use super::{bf16, bf16_or_f32, bf16_or_fp8_block128, describe, fp8_f32_block128,
 use crate::families::glm5::{GlmDsaConfig, GlmIndexer};
 use crate::families::glm5_flash::{GlmNextAttention, GlmNextConfig};
 use crate::plan::checkpoint::{opt_usize_field, usize_field, Checkpoint};
-use crate::plan::experts::{exl3_spark_worlds, fp8_spark_worlds, nvfp4_spark_worlds};
+use crate::plan::experts::spark_worlds;
 use crate::plan::family::{ConfigError, ExpertContract, Family, FamilyModel, Hint, RuntimeStatus};
 use crate::plan::format::{QuantOperand, ScaleEncoding};
 use crate::plan::names::indexed;
@@ -569,7 +569,7 @@ impl FamilyModel for GlmModel {
             return Some(ExpertContract {
                 package: format!("{}:nvfp4", self.geometry()),
                 block: 16,
-                spark_worlds: nvfp4_spark_worlds(moe.intermediate),
+                spark_worlds: spark_worlds(&format!("{}:nvfp4", self.geometry()), moe.intermediate),
                 local,
             });
         }
@@ -578,14 +578,14 @@ impl FamilyModel for GlmModel {
             return Some(ExpertContract {
                 package: format!("{}:exl3-{tiers}", self.geometry()),
                 block: 128,
-                spark_worlds: exl3_spark_worlds(moe.intermediate),
+                spark_worlds: spark_worlds(&format!("{}:exl3-{tiers}", self.geometry()), moe.intermediate),
                 local,
             });
         }
         operand.is_fp8_block(128, &[ScaleEncoding::F32, ScaleEncoding::Bf16]).then(|| ExpertContract {
             package: format!("{}:fp8", self.geometry()),
             block: 128,
-            spark_worlds: fp8_spark_worlds(moe.intermediate),
+            spark_worlds: spark_worlds(&format!("{}:fp8", self.geometry()), moe.intermediate),
             local,
         })
     }

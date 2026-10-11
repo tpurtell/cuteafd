@@ -925,14 +925,16 @@ pub fn layout(report: &mut PlanReport, model: &dyn super::FamilyModel, checkpoin
         // rank to the widest slice.
         let package = report.experts.as_ref().map_or("", |e| e.package.as_str());
         let intermediate = model.spec().moe.as_ref().map_or(0, |m| m.intermediate);
-        let exact = !package.starts_with("v41") && intermediate % 128 == 0 && intermediate / 128 >= ranks;
+        let recipe = (!package.starts_with("v41")).then(||
+            super::experts::spark_recipe(package, intermediate, ranks).ok()).flatten();
+        let exact = recipe.as_ref().is_some_and(|recipe|
+            matches!(recipe.slicing, crate::formats::fp8_experts::Slicing::Blocks(_)));
         let rank_bytes = |rank: usize| -> u64 {
             if !exact {
                 return stored;
             }
-            let blocks = intermediate / 128;
-            let own = blocks / ranks + usize::from(rank < blocks % ranks);
-            (routed as f64 * (own * 128) as f64 / intermediate as f64) as u64
+            let width = recipe.as_ref().expect("exact recipe").widths[rank];
+            (routed as f64 * width as f64 / intermediate as f64) as u64
         };
         for rank in 0..ranks {
             let stored = model.spec().moe.as_ref().and_then(|moe|

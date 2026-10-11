@@ -12,7 +12,7 @@ use super::deepseek::routed_shape;
 use super::{bf16, bf16_or_fp8_block128, describe, leaf, require};
 use crate::families::mimo_v2::{checkpoint_tp, FusedQkvLayout, MimoAttention, MimoV2Config};
 use crate::plan::checkpoint::Checkpoint;
-use crate::plan::experts::{fp8_spark_worlds, mxfp4_spark_worlds};
+use crate::plan::experts::spark_worlds;
 use crate::plan::family::{ConfigError, ExpertContract, Family, FamilyModel, Hint, RuntimeStatus};
 use crate::plan::format::{Encoding, QuantOperand, RowTiling, ScaleEncoding};
 use crate::plan::names::indexed;
@@ -506,19 +506,19 @@ impl FamilyModel for MimoModel {
             "mimo" if operand.is_fp8_block(128, &[ScaleEncoding::F32, ScaleEncoding::Bf16]) => Some(ExpertContract {
                 package: "mimo:fp8".into(),
                 block: 128,
-                spark_worlds: fp8_spark_worlds(self.cfg.moe_intermediate),
+                spark_worlds: spark_worlds("mimo:fp8", self.cfg.moe_intermediate),
                 local: Ok("serve-mimo --local-experts (fp8-mimo tp1)".into()),
             }),
             "mimof" if operand.is_mxfp4(32) => Some(ExpertContract {
                 package: "mimof:fp8 (MXFP4)".into(),
                 block: 32,
-                spark_worlds: vec![2, 4],
+                spark_worlds: spark_worlds("mimof:fp8", self.cfg.moe_intermediate),
                 local: Ok("serve-mimo --local-experts (fp8-mimof tp1)".into()),
             }),
             "mimop" if operand.is_mxfp4(32) => Some(ExpertContract {
                 package: "mimop:fp8 (MXFP4)".into(),
                 block: 32,
-                spark_worlds: mxfp4_spark_worlds(),
+                spark_worlds: spark_worlds("mimop:fp8", self.cfg.moe_intermediate),
                 local: Ok("serve-mimo --local-experts (fp8-mimop tp1)".into()),
             }),
             _ => None,

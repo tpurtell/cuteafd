@@ -72,7 +72,7 @@ unsafe fn load_module(directory: &Path) -> Result<Fp8MoeModule> {
     Ok(module)
 }
 
-fn package_family(family: Option<&'static str>, format: ExpertFormat) -> &'static str {
+pub(super) fn package_family(family: Option<&'static str>, format: ExpertFormat) -> &'static str {
     match (family, format) {
         (Some("mimo"), ExpertFormat::Mxfp4) => "mimof",
         (family, _) => family.unwrap_or("unknown"),
