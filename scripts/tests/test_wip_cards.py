@@ -438,3 +438,72 @@ def test_shared_wip_same_slot_and_distinct_serving_instances(entry, tmp_path):
 def test_shared_external_wip_cleanup_never_deletes_build(monkeypatch):
     monkeypatch.setattr(cards,'cleanup_script',lambda *a: pytest.fail('external build cleanup'))
     cards.cleanup({'off':{'instance':'off','slot':'s','wip_instance':'shared'},'on':{'instance':'on','slot':'s','wip_instance':'shared'}},'task',False)
+
+
+@pytest.mark.parametrize('dry', [True, False])
+def test_release_arm_uses_same_launcher_without_wip(entry, tmp_path, monkeypatch, dry):
+    kit = tmp_path / 'kit'
+    kit.mkdir()
+    (kit / 'matrix-main.json').write_text(json.dumps(dict(entries=[entry])))
+    state = tmp_path / 'state'
+    argv = ['wip-cards', '--kit', str(kit), '--cards', 'v41-min', '--interleave',
+            '--repeats', '1', '--arm', 'candidate=v3s1a-c:s',
+            '--arm-release', 'release=v3s1a-release:v2.0.0', '--state', str(state),
+            '--repo', '/same-candidate-launcher']
+    if dry:
+        argv.append('--dry-run')
+    monkeypatch.setattr(sys, 'argv', argv)
+    monkeypatch.setattr(cards, 'assert_absent', lambda job: None)
+    monkeypatch.setattr(cards, 'slot_check', lambda arm, host: json.dumps(
+        dict(image='release', image_id='sha256:abc', repo_digests=['digest']) if 'release' in arm
+        else dict(slot='s', seal_sha256='seal', artifact_manifest_sha256='artifacts')))
+    commands = []
+    def detached(cmd, log, exit_file, env):
+        commands.append(cmd)
+        exit_file.write_text('0\n')
+        return SimpleNamespace(wait=lambda: 0)
+    monkeypatch.setattr(cards, 'detached', detached)
+    monkeypatch.setattr(cards, 'summarize_job', lambda job, code: dict(card=job['card'], arm=job['arm'], repeat=1, simulated=True, status='pass'))
+    monkeypatch.setattr(cards, 'write_summary', lambda *args: None)
+    assert cards.main() == 0
+    jobs = json.loads((state / 'plan.json').read_text())['jobs']
+    release = next(job for job in jobs if job['arm'] == 'release')
+    assert release['entry']['run_args'] == []
+    values = release['entry']['set']
+    assert 'WIP_INSTANCE' not in values and 'WIP_ROOT' not in values
+    assert values['COORDINATOR_DOCKER_INFERENCE'] == 'ghcr.io/tpurtell/cuteafd-coordinator:v2.0.0'
+    assert values['SPARK_EXPERT_DOCKER_INFERENCE'] == 'ghcr.io/tpurtell/cuteafd-spark-expert:v2.0.0'
+    assert jobs[0]['entry']['run_args'] == ['--wip', 's']
+    assert all(cmd[cmd.index('--repo') + 1] == '/same-candidate-launcher' for cmd in commands)
+    if not dry:
+        saved = json.loads((Path(release['state']) / 'job.json').read_text())
+        assert saved['artifacts']['raptor']['image_id'] == 'sha256:abc'
+
+
+def test_release_arm_validation_and_cleanup(entry, tmp_path, monkeypatch):
+    with pytest.raises(ValueError, match='unique'):
+        cards.arms_from(['base=b:s'], ['base=r:v2.0.0'])
+    with pytest.raises(ValueError, match='unique'):
+        cards.arms_from(['base=b:s'], ['release=b:v2.0.0'])
+    with pytest.raises(ValueError, match='invalid release'):
+        cards.arms_from([], ['release=r:v2.0.0/other'])
+    arms = cards.arms_from([], ['release=r:v2.0.0'])
+    with pytest.raises(ValueError, match='invalid --arm-wip'):
+        cards.shared_wip(arms, ['release=shared'], [], 1)
+    with pytest.raises(ValueError, match='refuses release'):
+        cards.build_arms(['release=HEAD'], arms, [entry], tmp_path, 'task', True)
+    monkeypatch.setattr(cards, 'cleanup_script', lambda *a: pytest.fail('release cleanup'))
+    cards.cleanup(arms, 'task', False)
+
+
+def test_release_arm_checks_local_and_remote_images(monkeypatch):
+    calls = []
+    monkeypatch.setattr(cards, 'run', lambda cmd: calls.append(cmd) or SimpleNamespace(
+        stdout=json.dumps([dict(Id='sha256:abc', RepoDigests=['digest'])])))
+    arm = cards.arms_from([], ['release=r:v2.0.0'])['release']
+    for host in ('raptor', 'kiwi'):
+        meta = json.loads(cards.slot_check(arm, host))
+        assert meta['image_id'] == 'sha256:abc'
+    assert calls[0] == ['docker', 'image', 'inspect', 'ghcr.io/tpurtell/cuteafd-coordinator:v2.0.0']
+    assert calls[1][:4] == ['ssh', '-o', 'BatchMode=yes', 'kiwi']
+    assert 'cuteafd-spark-expert:v2.0.0' in calls[1][-1]
