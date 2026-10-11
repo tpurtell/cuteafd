@@ -311,12 +311,16 @@ class Driver:
             observed = any(v > 0 for v in restore_counts) if restore_counts else None
             metrics.update(cached_tokens=cached(again), byte_exact=identical, host_restore_observed=observed)
             case["metrics"] = metrics
-            case["pass"] = (cached(again) == first["usage"]["prompt_tokens"] and identical and observed is not False)
+            require = getattr(self.args, "require_host_path", False)
+            verified = observed is True if require else observed is not False
+            case["pass"] = (cached(again) == first["usage"]["prompt_tokens"] and identical and verified)
             case["host_path_verified"] = observed
             if observed is False:
                 case["error"] = "full hit did not exercise host restore; check --entries and host cache budget"
             elif observed is None:
                 case["note"] = "restore telemetry absent: exact hit passed, host tier unverified"
+                if require:
+                    case["error"] = "--require-host-path: no host restore/promotion counter in /v1/stats"
         self.case("host_restore", run)
 
     def admission(self):
@@ -450,6 +454,8 @@ def parser():
             s.add_argument("--image-start-token", type=int)
         if name == "host":
             s.add_argument("--entries", type=int, default=20)
+            s.add_argument("--require-host-path", action="store_true",
+                           help="host: fail unless a restore/promotion counter in /v1/stats advanced")
         if name == "agentic":
             s.add_argument("--sessions", type=int, choices=(1, 2), default=2)
             s.add_argument("--max-turns", type=int, default=4)
