@@ -29,10 +29,10 @@ pub(crate) fn exercise_distributed_decode<'t, 'd, 'a: 'd>(lib: &'a NativeLibrary
     let (_submit, receive) = mpsc::channel(1);
     let mut prefixes = PrefixCache::new(2);
     let image_keys = prefixes.prepare_key(tokens, &[])?;
-    let mut request = Active { constraint: None, id, lease,
+    let mut request = Active { constraint: None, ticket: console::Ticket::new(id, 0, None), lease,
         job: NativeRequest { prompt: String::new(), constraint: None, images: Vec::new(), media: Vec::new(), audio: Vec::new(), max_tokens: 4, sampling: Default::default(), stop_token_ids: Vec::new(), events, usage: None, probe: None },
         decoder: cuteafd_loader::streaming_token_decoder(snapshot, false)?, anchor,
-        generated: 0, buffered: 0, lane: 0, finished: false, cacheable: false, failed: false,
+        generated: 0, buffered: 0, finished: false, cacheable: false, failed: false,
         tokens: tokens.to_vec(), image_keys, next_after_commit: None, copy: None };
     request.emit(&[anchor])?;
     ensure!(!request.finished, "fixture requires a nonterminal continuation anchor");
@@ -64,14 +64,14 @@ pub(crate) fn exercise_distributed_decode<'t, 'd, 'a: 'd>(lib: &'a NativeLibrary
 
 pub(super) struct Active<'a> {
     constraint: Option<crate::shared::constraints::State<'a>>,
-    id: u64,
+    /// The request's id and decode lane, and its console/usage lifecycle.
+    ticket: console::Ticket,
     lease: CacheLease,
     job: NativeRequest,
     decoder: cuteafd_loader::StreamingTokenDecoder,
     anchor: u32,
     generated: usize,
     buffered: usize,
-    lane: usize,
     finished: bool,
     cacheable: bool,
     /// The engine reported an error to a still-connected client (console only).
@@ -83,15 +83,12 @@ pub(super) struct Active<'a> {
     copy: Option<LatestWindow>,
 }
 impl Active<'_> {
-    /// Why the request left the scheduler, for the live console.
-    fn console_reason(&self) -> &'static str {
-        if self.cacheable { "finished" } else if self.failed { "failed" } else { "cancelled" }
-    }
-    fn console_retire(&self) {
-        if let Some(usage) = &self.job.usage { usage.retired(self.generated as u64, self.console_reason()); }
-        console::totals::retired();
-        console::lifecycle(console::Event::Retire { id: self.id, at: Instant::now(),
-            reason: self.console_reason(), generated: self.generated as u32 });
+    fn id(&self) -> u64 { self.ticket.id() }
+    fn lane(&self) -> usize { self.ticket.lane() }
+    /// Retire the console/usage ticket: failed when the engine reported an
+    /// error to a connected client, else finished or cancelled.
+    fn console_retire(&mut self) {
+        if self.failed { self.ticket.fail(self.generated) } else { self.ticket.done(self.generated) }
     }
     fn emit_one(&mut self, token: u32) -> Result<[Option<InferenceChunk>; 3]> {
         ensure!(!self.job.events.is_closed(), "client disconnected");
@@ -122,6 +119,7 @@ impl Active<'_> {
             push(InferenceChunk::Finish { finish_reason: if token == 1 { InferenceFinishReason::Stop }
                 else { InferenceFinishReason::Length } });
             self.finished = true;
+            self.ticket.finishing();
             // A cold benchmark probe leaves nothing behind.
             self.cacheable = !crate::shared::probe::cold(&self.job.probe);
         }
@@ -136,7 +134,7 @@ impl Active<'_> {
     }
 }
 
-fn retire_request<'a, C: DraftChain<'a>>(request: Active<'a>, requests: &mut Requests<'a>,
+fn retire_request<'a, C: DraftChain<'a>>(mut request: Active<'a>, requests: &mut Requests<'a>,
     prefixes: &mut PrefixCache<'a>, mut draft: Option<&mut DraftRuntime<'_, 'a, C>>) -> Result<()> {
     request.console_retire();
     // Chunk-4b: retention is consulted **before** the retained frontier is
@@ -149,12 +147,12 @@ fn retire_request<'a, C: DraftChain<'a>>(request: Active<'a>, requests: &mut Req
         prefixes.capture_session(request.job.usage.as_ref().map(|u| u.session_id().to_owned()));
         let retained = request.next_after_commit.as_ref().context("finished request has no retained logits")
             .and_then(|next| prefixes.retain(SnapshotKind::Turn, &request.tokens, &request.image_keys,
-                next, request.id, request.lease, requests, draft.as_deref_mut()));
+                next, request.id(), request.lease, requests, draft.as_deref_mut()));
         if let Err(error) = retained { tracing::warn!(%error, "completed request prefix was not retained"); }
     }
     // Release both owners even if one cleanup reports an error.
     let target = requests.release_if_present(request.lease);
-    let speculative = draft.map(|draft| draft.release(request.id)).transpose();
+    let speculative = draft.map(|draft| draft.release(request.id())).transpose();
     target.and(speculative.map(|_| ()))
 }
 
@@ -268,11 +266,11 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
             }
         }
         let mut loads = [0usize; 2];
-        for request in active.iter().flatten() { loads[request.lane] += 1; }
+        for request in active.iter().flatten() { loads[request.lane()] += 1; }
         while loads[0].abs_diff(loads[1]) > 1 {
             let heavy = usize::from(loads[1] > loads[0]);
-            let request = active.iter_mut().flatten().find(|r| r.lane == heavy).unwrap();
-            request.lane = 1 - heavy;
+            let request = active.iter_mut().flatten().find(|r| r.lane() == heavy).unwrap();
+            request.ticket.set_lane(1 - heavy);
             loads[heavy] -= 1; loads[1 - heavy] += 1;
         }
         // Admit available work at a completed boundary. Prefill currently owns
@@ -417,7 +415,7 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
             let lane = usize::from(loads[1] < loads[0]);
             let events = prepared.job.events.clone();
             let admission::Prepared { job, prompt, images } = prepared;
-            let mut counted = false;
+            let mut ticket = console::Ticket::new(id, lane as u8, job.usage.clone());
             let result = (|| -> Result<Active<'a>> {
                 let mut constraint = job.constraint.as_ref().map(|spec| compiler.matcher(spec)).transpose()?;
                 ensure!(!job.events.is_closed(), "client disconnected");
@@ -431,29 +429,15 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
                     prompt_usage: PromptUsage { prompt_tokens: prompt.len(), prompt_cache_hit_tokens: cached },
                 }))?;
                 crate::shared::probe::admitted(&job.probe, "deepseek_v41", &prompt, cached);
-                if let Some(usage) = &job.usage {
-                    if cached > 0 {
-                        if let Some(session) = prefixes.restored_session() { usage.session(session.to_owned(), "prefix"); }
-                    }
-                    usage.admitted(console::totals::active() + 1);
-                    usage.prompt_tokens(prompt.len() as u64, cached as u64);
+                if let (Some(usage), Some(session)) = (&job.usage, prefixes.restored_session().filter(|_| cached > 0)) {
+                    usage.session(session.to_owned(), "prefix");
                 }
-                console::totals::admitted(prompt.len(), cached);
-                counted = true;
+                ticket.announce(prompt.len(), cached, job.max_tokens, constraint.is_some(), image_count as usize, restore);
                 if let Some(from) = crate::shared::probe::scoring(&job.probe) {
                     P::begin_request(first_transport)?; P::begin_request(second_transport)?;
                     super::score(lib, runtime, first, second, requests, first_transport, second_transport, lease,
                         &prompt, from, args.prefill_batch_tokens as usize, &job, draft.as_deref_mut(),
                         &mut || prefixes.prefill_hold())?;
-                }
-                console::lifecycle(console::Event::Admit { id, at: restore.0, prompt: prompt.len() as u32,
-                    cached: cached as u32, max: job.max_tokens as u32, lane: lane as u8,
-                    grammar: constraint.is_some(), images: image_count });
-                if cached > 0 {
-                    if let Some(live) = console::live() {
-                        live.push(console::Event::Prefill(console::Prefill { id: Some(id), kind: console::PrefillKind::Restore,
-                            lane: 0, index: 0, of: 1, rows: cached as u32, started: restore.0, finished: restore.1 }));
-                    }
                 }
                 P::begin_request(first_transport)?; P::begin_request(second_transport)?;
                 let scores = if cached == prompt.len() { hit.expect("complete prefix hit").1.context("exact prefix has no logits")? }
@@ -473,15 +457,14 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
                 let mask = constraint.as_mut().map(|state| state.mask()).transpose()?.flatten();
                 // The first generated token is emitted-token index 0.
                 let anchor = scores.sample(mask, job.sampling, 0)?;
-                Ok(Active { constraint, id, lease, job, decoder, anchor, generated: 0, buffered: 0, lane,
+                Ok(Active { constraint, ticket: std::mem::replace(&mut ticket, console::Ticket::new(id, 0, None)),
+                    lease, job, decoder, anchor, generated: 0, buffered: 0,
                     finished: false, cacheable: false, failed: false, tokens: prompt, image_keys, next_after_commit: Some(scores),
                     copy: copy_windows.then(LatestWindow::default) })
             })();
             match result {
                 Ok(mut request) => {
-                    if let Some(usage) = &request.job.usage { usage.first_token(); }
-                    console::totals::output(1);
-                    console::lifecycle(console::Event::First { id: request.id, at: Instant::now(), token: request.anchor });
+                    request.ticket.first(request.anchor);
                     if let Err(error) = request.emit(&[request.anchor]) {
                         request.failed = !request.job.events.is_closed();
                         let _ = request.job.events.send(Err(format!("{error:#}").into()));
@@ -490,7 +473,8 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
                     active[slot] = Some(request); loads[lane] += 1;
                 }
                 Err(error) if error.downcast_ref::<super::ScoringDone>().is_some() => {
-                    console::totals::retired();
+                    ticket.finishing();
+                    ticket.done(0);
                     requests.release_if_present(lease)?;
                     if let Some(draft) = draft.as_deref_mut() { draft.release(id)?; }
                 }
@@ -499,9 +483,7 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
                     let failure = error.downcast_ref::<cuteafd_api::openai::NativeFailure>()
                         .cloned().unwrap_or_else(|| format!("{error:#}").into());
                     let _ = events.send(Err(failure));
-                    if counted { console::totals::retired(); }
-                    console::lifecycle(console::Event::Retire { id, at: Instant::now(),
-                        reason: if events.is_closed() { "cancelled" } else { "failed" }, generated: 0 });
+                    if events.is_closed() { ticket.cancel() } else { ticket.fail(0) }
                     tracing::warn!(%error, "native request admission failed");
                     requests.release_if_present(lease)?;
                     if let Some(draft) = draft.as_deref_mut() { draft.release(id)?; }
@@ -515,7 +497,7 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
             continue;
         }
         let members: [Vec<usize>; 2] = std::array::from_fn(|lane| active.iter().enumerate()
-            .filter_map(|(slot, request)| request.as_ref().filter(|r| r.lane == lane && !r.finished
+            .filter_map(|(slot, request)| request.as_ref().filter(|r| r.lane() == lane && !r.finished
                 && !r.job.events.is_closed()).map(|_| slot)).collect());
         if members.iter().all(Vec::is_empty) { continue; }
         let capacity: Vec<_> = members.iter().flatten().map(|&slot| {
@@ -1354,7 +1336,7 @@ fn single_lane_round<'w, 'a>(lib: &'a NativeLibrary, runtime: &tokio::runtime::R
     let capture_routes = draft.as_deref().is_some_and(DraftRuntime::capture_routes);
     let seeds = members.iter().map(|&slot| {
         let r = active[slot].as_ref().unwrap();
-        Ok((r.id, r.anchor, requests.cache().committed_end(r.lease)?, r.job.max_tokens-r.generated))
+        Ok((r.id(), r.anchor, requests.cache().committed_end(r.lease)?, r.job.max_tokens-r.generated))
     }).collect::<Result<Vec<_>>>()?;
     // The policy's clock brackets the draft call alone; `draft_us` below (the
     // console's draft stage) still spans copy lookup and length selection.
@@ -1380,7 +1362,7 @@ fn single_lane_round<'w, 'a>(lib: &'a NativeLibrary, runtime: &tokio::runtime::R
     // This path runs only while the other lane is empty.
     if let Some(draft) = draft.as_deref_mut() {
         let candidates: Vec<_> = members.iter().zip(&inputs).zip(&copied).filter(|(_, copied)| !**copied)
-            .map(|((&slot, input), _)| (active[slot].as_ref().unwrap().id, input.len()-1)).collect();
+            .map(|((&slot, input), _)| (active[slot].as_ref().unwrap().id(), input.len()-1)).collect();
         if let Some(lengths) = draft.select_lengths(lane, &candidates, false)? {
             for (input, length) in inputs.iter_mut().zip(&copied).filter(|(_, copied)| !**copied)
                             .map(|(input, _)| input).zip(lengths) { input.truncate(length+1); }
@@ -1789,7 +1771,7 @@ fn prepare_commit_lane<'a, C: DraftChain<'a>>(lane: usize,
             let top_two = (offset..offset + input.len())
                 .map(|row| next.top_two(row)).collect::<Result<Vec<_>>>()?;
             tracing::debug!(target: "cuteafd::logit_trace",
-                request_id=request.id, lane, generated=request.generated,
+                request_id=request.id(), lane, generated=request.generated,
                 context_tokens=requests.cache().committed_end(request.lease)?,
                 input=?input, selected=?selected, top_two=?top_two,
                 accepted_inputs=decision.accepted_inputs,
@@ -1798,13 +1780,13 @@ fn prepare_commit_lane<'a, C: DraftChain<'a>>(lane: usize,
                 "native verification logits");
         }
         if let Some(confidence) = draft
-            .and_then(|draft| draft.confidence_trace(request.id)) {
+            .and_then(|draft| draft.confidence_trace(request.id())) {
             // Agreement after the first mismatch is conditional on a
             // rejected history and must not be treated as acceptance.
             let matched = input.iter().skip(1).zip(selected.iter())
                 .take_while(|(proposal, target)| proposal == target).count();
             tracing::debug!(target: "cuteafd::draft_policy",
-                request_id=request.id, lane, generated=request.generated,
+                request_id=request.id(), lane, generated=request.generated,
                 context_tokens=requests.cache().committed_end(request.lease)?,
                 verifier_rows=input.len(), lane_rows=inputs.iter().map(Vec::len).sum::<usize>(),
                 constrained=request.constraint.is_some(), raw_confidence=?confidence,
@@ -1918,7 +1900,7 @@ pub(super) fn console_round(tally: console::Tally, lane: usize, shared: bool, st
     tally.round(lane, shared, started, draft_us, prepare_us, verify_us, layer_us, ffn,
         members.iter().zip(masked).map(|(&slot, masked)| {
             let request = active[slot].as_ref().expect("round member remains active until retirement");
-            (request.id, masked, request.finished)
+            (request.id(), masked, request.finished)
         }))
 }
 
@@ -1939,7 +1921,7 @@ pub(crate) fn publish_capacity(requests: &Requests<'_>, prefixes: &PrefixCache<'
 pub(super) fn console_gauges(active: &[Option<Active<'_>>], requests: &Requests<'_>,
     prefixes: &PrefixCache<'_>, queued: usize, pending: Option<bool>) -> console::Event {
     let mut lanes = [0u8; 2];
-    for request in active.iter().flatten() { lanes[request.lane.min(1)] += 1; }
+    for request in active.iter().flatten() { lanes[request.lane().min(1)] += 1; }
     // Report the compressed-KV source closest to exhaustion; ratio-2 sources
     // hold two tokens per row.
     let kv = requests.cache().sources().iter().zip([2u64, 2, 2, 1]).map(|(source, ratio)| {
@@ -1964,7 +1946,7 @@ fn observe_lane_round<'a, C: DraftChain<'a>>(draft: Option<&mut DraftRuntime<'_,
     if !capture_routes { return; }
     let requests: Vec<_> = members.iter().zip(inputs).zip(accepted).zip(copied)
         .filter_map(|(((&slot, input), &count), &copied)|
-            active[slot].as_ref().map(|r| (r.id, input.len(), count, copied))).collect();
+            active[slot].as_ref().map(|r| (r.id(), input.len(), count, copied))).collect();
     if requests.len() != members.len() { return; }
     draft.observe_round(lane, shared, routes, layer_us, &requests, clock.observe());
 }
