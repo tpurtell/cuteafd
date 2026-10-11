@@ -32,6 +32,24 @@ def test_coordinator_exports_tp2_for_every_routed_weight_format():
     assert 'set(exact_slices "--exact-slices")' in cmake
 
 
+def test_capacity_scratch_reserves_largest_retained_form_like_runtime_abi():
+    programs = [
+        {"capacity": 4096, "form": "w8a8", "scratch": 470028288},
+        {"capacity": 1024, "form": "auto", "scratch": 117510144},
+        {"capacity": 16, "form": "auto", "scratch": 1841152},
+        {"capacity": 4096, "form": "auto", "scratch": 734346240},
+        {"capacity": 1024, "form": "w8a8", "scratch": 163779584},
+    ]
+    assert package_tool.capacity_scratch(programs) == [
+        {"capacity": 16, "scratch_bytes": 1841152},
+        {"capacity": 1024, "scratch_bytes": 163779584},
+        {"capacity": 4096, "scratch_bytes": 734346240},
+    ]
+    source = TOOL.read_text()
+    assert '"capacities": capacity_scratch(programs)' in source
+    assert "kPrograms[i].scratch > *bytes" in source
+
+
 def write_package(path: Path, *, input_kind="wire", role="spark", revision=REVISION):
     layout = "tp4" if role == "spark" else "tp1"
     library = path / layout / "libcuteafd_fp8moe.so"
