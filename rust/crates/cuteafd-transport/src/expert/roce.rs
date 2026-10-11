@@ -69,7 +69,7 @@ impl SparkExperts {
         Self::with_clients(&peers, &executors, capacity, &config,
             LocalTp4Client::new_tp2(peers, config.clone()), None)
     }
-    /// Generic constructor for the validated physical rank counts 1, 2, 3, 4 and 6
+    /// Generic constructor for the validated physical rank counts 1..=8
     /// under the legacy (non-ownership) frame contract.
     pub fn new_ranks(
         peers: &[SocketAddr],
@@ -106,8 +106,8 @@ impl SparkExperts {
         mut clients: LocalTp4Client,
         topology: Option<SparkTopology>,
     ) -> Result<Self> {
-        ensure!(peers.len() == executors.len() && matches!(peers.len(), 1 | 2 | 3 | 4 | 6),
-            "native TP/EP requires one, two, three, four or six matching peers and executors");
+        ensure!(peers.len() == executors.len() && (1..=8).contains(&peers.len()),
+            "native TP/EP requires 1..=8 matching peers and executors");
         if let Some(topology) = topology {
             ensure!(
                 peers.len() == topology.world_size(),

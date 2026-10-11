@@ -60,9 +60,9 @@ const WORD_MASK: u32 = 0xfff;
 
 /// Validated native Spark `TP×EP` topology.
 ///
-/// The supported set is exactly `TP2EP1`, `TP3EP1`, the legacy `TP4EP1`,
-/// `TP2EP2`, `TP3EP2`, `TP2EP3` and the pure `TP6EP1`; anything else is
-/// rejected. `TP×EP` is the physical rank count, with no dummy ranks.
+/// Pure TP accepts every degree in 1..=8; replicated groups retain the
+/// qualified `TP2EP2`, `TP3EP2` and `TP2EP3` layouts. `TP×EP` is the physical
+/// rank count, with no dummy ranks. Package/fit admission is a separate gate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct SparkTopology {
     tp: u8,
@@ -182,9 +182,13 @@ impl SparkTopology {
             (2, 2) => Ok(17),
             (2, 3) => Ok(21),
             (6, 1) => Ok(27),
+            (1, 1) => Ok(33),
+            // New pure-TP worlds reserve eight IDs each, above every legacy
+            // namespace. Existing workers retain their exact executor identity.
+            (tp @ 1..=8, 1) => Ok(64 + 8 * u64::from(tp)),
             (tp, ep) => bail!(
                 "unsupported native Spark TP×EP topology TP{tp}EP{ep}: \
-                 supported are TP2EP1, TP3EP1, TP4EP1, TP2EP2, TP3EP2, TP2EP3 and TP6EP1"
+                 supported are TP1..TP8 with EP1, TP2EP2, TP3EP2 and TP2EP3"
             ),
         }
     }
@@ -369,6 +373,28 @@ mod tests {
         SparkTopology::NATIVE_TP6_EP1,
     ];
 
+    #[test]
+    fn pure_tp_one_through_eight_have_disjoint_executor_namespaces() -> Result<()> {
+        let mut ids = BTreeSet::new();
+        for world in 1..=8 {
+            let topology = SparkTopology::new(world, 1)?;
+            assert_eq!(topology.world_size(), usize::from(world));
+            for rank in 0..topology.world_size() {
+                let id = topology.executor_id(rank)?;
+                assert!(ids.insert(id), "executor namespace overlaps at {id}");
+                assert_eq!(topology.rank_of_executor(id), Some(rank));
+                assert_eq!(crate::expert::v41_spark_executor_id(usize::from(world), rank)?, id);
+            }
+            assert!(topology.executor_id(topology.world_size()).is_err());
+        }
+        for topology in [SparkTopology::NATIVE_TP2_EP2, SparkTopology::NATIVE_TP3_EP2,
+                         SparkTopology::NATIVE_TP2_EP3] {
+            for id in topology.executor_ids() { assert!(ids.insert(id)); }
+        }
+        assert!(SparkTopology::new(9, 1).is_err());
+        Ok(())
+    }
+
     fn owners_for(topology: SparkTopology) -> Vec<u8> {
         (0..V41_ROUTED_EXPERTS)
             .map(|expert| (expert % topology.group_count() as usize) as u8)
@@ -457,7 +483,7 @@ mod tests {
         for (tp, ep) in [
             (0, 0),
             (0, 1),
-            (1, 1),
+            (9, 1),
             (1, 2),
             (1, 3),
             (2, 0),
@@ -467,7 +493,7 @@ mod tests {
             (4, 3),
             (3, 3),
             (2, 4),
-            (5, 1),
+            (5, 2),
             (6, 2),
             (6, 3),
             (255, 1),
@@ -818,6 +844,40 @@ mod tests {
     }
 
     #[test]
+    fn pure_tp_one_through_eight_rejects_stale_and_foreign_responses() -> Result<()> {
+        for world in 1..=8 {
+            let topology = SparkTopology::new(world, 1)?;
+            let owners = owners_for(topology);
+            let request = native_request(2, topology, &owners)?;
+            let frame = request.encode()?;
+            let native = BackboneRequest::parse_native_group(&frame, 2, topology)?;
+            let executors = topology.executor_ids();
+            let mut receiver = V41Tp4ChunkReceiver::new_ranks(&native, &executors, 200_000)?;
+            let payload = vec![0x11; native.plane_bytes()?];
+            let mut stale = native.response(executors[0], &payload)?.to_owned()?;
+            stale.header.request_id += 1;
+            assert!(receiver.push(&stale.encode()?, |_, _, _| panic!("stale response")).is_err());
+            for other_world in (1..=8).filter(|other| *other != world) {
+                let foreign_id = SparkTopology::new(other_world, 1)?.executor_id(0)?;
+                let response = native.response(foreign_id, &payload)?.to_owned()?.encode()?;
+                assert!(receiver.push(&response, |_, _, _| panic!("foreign topology")).is_err());
+            }
+            for rank in (0..usize::from(world)).rev() {
+                let response = native.response(executors[rank], &payload)?.to_owned()?.encode()?;
+                receiver.push(&response, |actual, start, bytes| {
+                    assert_eq!((actual, start), (rank, 0));
+                    assert_eq!(bytes, payload);
+                    Ok(())
+                })?;
+                assert!(receiver.push(&response, |_, _, _| panic!("duplicate response")).is_err());
+                assert_eq!(receiver.complete(), rank == 0);
+            }
+            assert_eq!(receiver.received_rows_slice(), vec![2; usize::from(world)]);
+        }
+        Ok(())
+    }
+
+    #[test]
     fn six_rank_chunked_coverage_rejects_reordered_overlapping_and_bad_final_markers() -> Result<()> {
         let topology = SparkTopology::NATIVE_TP2_EP3;
         let owners = owners_for(topology);
@@ -960,7 +1020,7 @@ mod tests {
 
     #[test]
     fn generic_roce_constructors_validate_world_topology_and_identity() -> Result<()> {
-        let peers: Vec<SocketAddr> = (0..6)
+        let peers: Vec<SocketAddr> = (0..9)
             .map(|index| format!("127.0.0.1:{}", 24_000 + index).parse())
             .collect::<std::result::Result<_, _>>()?;
         let config = frame_config();
@@ -980,8 +1040,15 @@ mod tests {
         assert_eq!(three.world_size(), 3);
         assert_eq!(three.topology(), None);
 
+        for world in 1..=8 {
+            let topology = SparkTopology::new(world as u8, 1)?;
+            let client = SparkExperts::new_topology(topology, &peers[..world], 80, config.clone())?;
+            assert_eq!(client.world_size(), world);
+            let legacy = SparkExperts::new_ranks(&peers[..world], &topology.executor_ids(), 80, config.clone())?;
+            assert_eq!(legacy.world_size(), world);
+        }
         // Unsupported world sizes, mismatched topology peers, duplicates.
-        assert!(SparkExperts::new_ranks(&peers[..5], &[1, 2, 3, 4, 5], 80, config.clone()).is_err());
+        assert!(SparkExperts::new_ranks(&peers, &[1, 2, 3, 4, 5, 6, 7, 8, 9], 80, config.clone()).is_err());
         assert!(SparkExperts::new_ranks(&peers[..2], &[1, 2, 3], 80, config.clone()).is_err());
         assert!(SparkExperts::new_topology(
             SparkTopology::NATIVE_TP3_EP2,

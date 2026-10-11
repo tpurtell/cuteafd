@@ -283,7 +283,7 @@ async fn implicit_tp1_round_trips_chunks_and_reuses_connection() -> Result<()> {
 
 #[test]
 fn generic_tcp_constructors_validate_world_and_topology() -> Result<()> {
-    let peers: Vec<SocketAddr> = (0..6)
+    let peers: Vec<SocketAddr> = (0..9)
         .map(|index| format!("127.0.0.1:{}", 25_000 + index).parse())
         .collect::<std::result::Result<_, _>>()?;
     for topology in [
@@ -300,7 +300,14 @@ fn generic_tcp_constructors_validate_world_and_topology() -> Result<()> {
         assert_eq!(client.world_size(), world);
         assert_eq!(client.topology(), Some(topology));
     }
-    assert!(V41Tp4Tcp::new_ranks(&peers[..5], &[1, 2, 3, 4, 5], 80, config()).is_err());
+    for world in 1..=8 {
+        let topology = SparkTopology::new(world as u8, 1)?;
+        let client = V41Tp4Tcp::new_topology(topology, &peers[..world], 80, config())?;
+        assert_eq!(client.world_size(), world);
+        let legacy = V41Tp4Tcp::new_ranks(&peers[..world], &topology.executor_ids(), 80, config())?;
+        assert_eq!(legacy.world_size(), world);
+    }
+    assert!(V41Tp4Tcp::new_ranks(&peers, &[1, 2, 3, 4, 5, 6, 7, 8, 9], 80, config()).is_err());
     assert!(V41Tp4Tcp::new_ranks(&peers[..2], &[1, 2, 3], 80, config()).is_err());
     assert!(V41Tp4Tcp::new_topology(
         SparkTopology::NATIVE_TP3_EP2,
@@ -313,6 +320,43 @@ fn generic_tcp_constructors_validate_world_and_topology() -> Result<()> {
     assert!(V41Tp4Tcp::new_ranks(&peers[..3], &[7, 7, 9], 80, config()).is_err());
     assert!(V41Tp4Tcp::new_ranks(&peers[..3], &[7, 0, 9], 80, config()).is_err());
     assert!(V41Tp4Tcp::new_ranks(&peers[..3], &[7, 8, 9], 0, config()).is_err());
+    Ok(())
+}
+
+#[tokio::test]
+async fn pure_tp_one_through_eight_tcp_collects_every_rank() -> Result<()> {
+    for world in 1..=8 {
+        let executors = SparkTopology::new(world as u8, 1)?.executor_ids();
+        let mut peers = Vec::new();
+        let mut servers = Vec::new();
+        for rank in 0..world {
+            let listener = TcpListener::bind("127.0.0.1:0").await?;
+            peers.push(listener.local_addr()?);
+            let executor = executors[rank];
+            servers.push(tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await?;
+                let frame = read_request(&mut stream).await?;
+                let native = BackboneRequest::parse(&frame, 2)?;
+                for row in 0..native.rows() {
+                    let payload = vec![rank as u8 + 1; V41_PARTIAL_ROW_BYTES as usize];
+                    let mut indices = [0u32];
+                    let response = native.response_chunk(executor, row, &payload, &mut indices, FRAME)?;
+                    stream.write_all(&response.to_owned()?.encode()?).await?;
+                }
+                Ok::<_, anyhow::Error>(())
+            }));
+        }
+        let mut transport = V41Tp4Tcp::new_ranks(&peers, &executors, 2, config())?;
+        let mut received = vec![0; world];
+        transport.execute(&request(2), |rank, row, bytes| {
+            assert_eq!(row, received[rank]);
+            assert!(bytes.iter().all(|&byte| byte == rank as u8 + 1));
+            received[rank] += 1;
+            Ok(())
+        }).await?;
+        assert_eq!(received, vec![2; world]);
+        for server in servers { timeout(Duration::from_secs(3), server).await???; }
+    }
     Ok(())
 }
 

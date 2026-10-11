@@ -468,7 +468,7 @@ release_known_key() {
     GLM5_FLASH_PREFILL_BATCH) return 0 ;;
     GLM5_FLASH_VERIFY_POLICY|GLM5_FLASH_SPEC_TAU|GLM5_FLASH_DRAFT_POLICY|GLM5_FLASH_ROUTE_RING_CHECK) return 0 ;;
     PROBE_DUMP_ROOT|ATTENTION_PLACEMENT) return 0 ;;
-    HTTP_QUEUE_DEPTH|HTTP_QUEUE_WAIT_MS|MODEL_ID|MODEL_VARIANT|MODEL_REVISION|EXPERT_FORMAT|DSPARK|DSPARK_DRAFT_POLICY|V41_COPY_DRAFTS|RTX_GPUS|RTX_EXPERT_LAYERS|RTX_EXPERT_PEER|COORDINATOR_GPU|COORDINATOR_GPU_UUID|COORDINATOR_GPU_PCI_BUS_ID|COORDINATOR_GPU_HEADROOM_GIB|KV_POOL_TOKENS|KV_POOL_SIZE|HOST_CACHE_BYTES|MEMORY_RESERVATION|MAX_CONTEXT_TOKENS|MAX_OUTPUT_TOKENS|CONCURRENCY|PREFIX_CACHE_ENTRIES|PREFILL_BATCH_TOKENS|SPARK_DEVICE_BUDGET_BYTES|SPARK_REDUCTION_MIN_ROWS|SPARKINFER_EXL3|SPARK_COUNT|SPARK_TP|SPARK_EP|ADDR|EXPERT_PORT|SPARK_[0-5]_HOST|SPARK_[0-5]_LANE_A|SPARK_[0-5]_LANE_B|COORDINATOR_DOCKER_DEV|COORDINATOR_DOCKER_INFERENCE|SPARK_EXPERT_DOCKER_DEV|SPARK_EXPERT_DOCKER_INFERENCE|COORDINATOR_GPU_BUDGET_GIB|SPARK_HOSTS)
+    HTTP_QUEUE_DEPTH|HTTP_QUEUE_WAIT_MS|MODEL_ID|MODEL_VARIANT|MODEL_REVISION|EXPERT_FORMAT|DSPARK|DSPARK_DRAFT_POLICY|V41_COPY_DRAFTS|RTX_GPUS|RTX_EXPERT_LAYERS|RTX_EXPERT_PEER|COORDINATOR_GPU|COORDINATOR_GPU_UUID|COORDINATOR_GPU_PCI_BUS_ID|COORDINATOR_GPU_HEADROOM_GIB|KV_POOL_TOKENS|KV_POOL_SIZE|HOST_CACHE_BYTES|MEMORY_RESERVATION|MAX_CONTEXT_TOKENS|MAX_OUTPUT_TOKENS|CONCURRENCY|PREFIX_CACHE_ENTRIES|PREFILL_BATCH_TOKENS|SPARK_DEVICE_BUDGET_BYTES|SPARK_REDUCTION_MIN_ROWS|SPARKINFER_EXL3|SPARK_COUNT|SPARK_TP|SPARK_EP|ADDR|EXPERT_PORT|SPARK_[0-7]_HOST|SPARK_[0-7]_LANE_A|SPARK_[0-7]_LANE_B|COORDINATOR_DOCKER_DEV|COORDINATOR_DOCKER_INFERENCE|SPARK_EXPERT_DOCKER_DEV|SPARK_EXPERT_DOCKER_INFERENCE|COORDINATOR_GPU_BUDGET_GIB|SPARK_HOSTS)
       return 0
       ;;
     *)
@@ -485,7 +485,7 @@ release_spark_host_rows() {
   [[ "$csv" =~ ^[a-z]+(,[a-z]+)*$ ]] || release_die "SPARK_HOSTS must be a comma-separated Spark pool host list"
   IFS=, read -r -a hosts <<<"$csv"
   if [[ "$mode" == launch ]]; then
-    [[ "$count" =~ ^[0-6]$ && "${#hosts[@]}" == "$count" ]] ||
+    [[ "$count" =~ ^[0-8]$ && "${#hosts[@]}" == "$count" ]] ||
       release_die "SPARK_HOSTS must name exactly SPARK_COUNT=$count hosts"
   fi
   for host in "${hosts[@]}"; do
@@ -867,7 +867,8 @@ release_load_config() {
             release_die "SPARK_COUNT=6 requires explicit SPARK_TP and SPARK_EP, or EXPERT_FORMAT=exl3 for the implicit EXL3 TP6 split"
         fi
         ;;
-      *) release_die "SPARK_COUNT must be 0, 2, 3, 4, or 6" ;;
+      1|5|7|8) [[ "$EXL3_PAIRED_TP4" == off ]] || release_die "SPARK_COUNT=$SPARK_COUNT is incompatible with EXL3_PAIRED_TP4" ;;
+      *) release_die "SPARK_COUNT must be in 0..8" ;;
     esac
 
     local missing_b=0 present_b=0 spark_required="$SPARK_COUNT"
@@ -998,8 +999,7 @@ release_resolve_local_model_revision() {
 # site through this predicate.
 release_spark_compact_active() {
   case "$SPARK_COUNT" in
-    2) return 0 ;;
-    3) [[ -z "$SPARK_TP" && -z "$SPARK_EP" ]] ;;
+    2|3) [[ -z "$SPARK_TP" && -z "$SPARK_EP" ]] ;;
     *) return 1 ;;
   esac
 }
@@ -1125,8 +1125,8 @@ release_spark_rank_map() {
 
 release_validate_spark_topology() {
   case "$SPARK_TP" in
-    ""|2|3|4|6) ;;
-    *) release_die "SPARK_TP must be 2, 3, 4, or 6" ;;
+    ""|[1-8]) ;;
+    *) release_die "SPARK_TP must be in 1..8" ;;
   esac
   case "$SPARK_EP" in
     ""|1|2|3) ;;
@@ -1136,8 +1136,8 @@ release_validate_spark_topology() {
     release_die "SPARK_TP and SPARK_EP must be set together or omitted together"
   release_spark_topology_explicit || return 0
 
-  [[ "$SPARK_COUNT" == 3 || "$SPARK_COUNT" == 4 || "$SPARK_COUNT" == 6 ]] ||
-    release_die "explicit SPARK_TP/SPARK_EP requires SPARK_COUNT=3, 4 or 6"
+  [[ "$SPARK_COUNT" =~ ^[1-8]$ ]] ||
+    release_die "explicit SPARK_TP/SPARK_EP requires SPARK_COUNT in 1..8"
   [[ "$EXPERT_FORMAT" == native ]] ||
     release_die "explicit SPARK_TP/SPARK_EP requires EXPERT_FORMAT=native"
   [[ "$EXL3_PAIRED_TP4" == off ]] ||
@@ -1147,8 +1147,8 @@ release_validate_spark_topology() {
   ((SPARK_TP * SPARK_EP == SPARK_COUNT)) ||
     release_die "SPARK_TP(${SPARK_TP}) * SPARK_EP(${SPARK_EP}) must equal SPARK_COUNT(${SPARK_COUNT})"
   case "${SPARK_TP}x${SPARK_EP}" in
-    3x1|2x2|3x2|2x3|4x1|6x1) ;;
-    *) release_die "unsupported native Spark topology TP${SPARK_TP}EP${SPARK_EP}; approved: TP3EP1, TP2EP2, TP3EP2, TP2EP3, TP4EP1, TP6EP1" ;;
+    [1-8]x1|2x2|3x2|2x3) ;;
+    *) release_die "unsupported native Spark topology TP${SPARK_TP}EP${SPARK_EP}; approved: TP1..TP8 with EP1, TP2EP2, TP3EP2, TP2EP3" ;;
   esac
 }
 
@@ -1528,14 +1528,15 @@ CONTAINER
 
 # Build availability is independent of the four-rank runtime topology.
 release_select_build_hosts() {
-  local requested="${1:-}" host configured found prior name
+  local requested="${1:-}" host configured found prior name rank
   local -a configured_hosts=()
   if [[ -n "${SPARK_COUNT:-}" ]]; then
     mapfile -t configured_hosts < <(release_spark_values HOST)
   else
     # Callers that have not loaded a configuration may still set the host keys
     # directly; fall back to the bounded rank keys and keep only filled ones.
-    for name in SPARK_0_HOST SPARK_1_HOST SPARK_2_HOST SPARK_3_HOST SPARK_4_HOST SPARK_5_HOST; do
+    for ((rank = 0; rank < 8; rank++)); do
+      name="SPARK_${rank}_HOST"
       [[ -n "${!name:-}" ]] && configured_hosts+=("${!name}")
     done
   fi

@@ -105,8 +105,8 @@ impl BackboneRequest<'_> {
 /// As with complete responses, request IDs must identify unique in-flight waves.
 pub struct V41Tp4ChunkReceiver {
     identity: V41Tp4Planes<'static>,
-    received: [u32; 6],
-    finished: [bool; 6],
+    received: [u32; 8],
+    finished: [bool; 8],
     max_frame_bytes: usize,
 }
 impl V41Tp4ChunkReceiver {
@@ -125,7 +125,7 @@ impl V41Tp4ChunkReceiver {
     ) -> Result<Self> {
         Self::new_ranks(request, &executors, max_frame_bytes)
     }
-    /// Generic constructor for the validated physical rank counts 1, 2, 3, 4 and 6.
+    /// Generic constructor for the validated physical rank counts 1..=8.
     ///
     /// A request admitted under the native replicated-group contract must match
     /// its topology's world size; paired EXL3 keeps its four-rank requirement.
@@ -135,8 +135,8 @@ impl V41Tp4ChunkReceiver {
         max_frame_bytes: usize,
     ) -> Result<Self> {
         ensure!(
-            matches!(executors.len(), 1 | 2 | 3 | 4 | 6),
-            "native TP/EP requires one, two, three, four or six executors"
+            (1..=8).contains(&executors.len()),
+            "native TP/EP requires 1..=8 executors"
         );
         if request.is_paired() {
             ensure!(executors.len() == 4, "paired EXL3 requires four ranks");
@@ -150,8 +150,8 @@ impl V41Tp4ChunkReceiver {
         request.response_chunk_rows(max_frame_bytes)?;
         Ok(Self {
             identity: V41Tp4Planes::from_header_ranks(&request.view.header, executors)?,
-            received: [0; 6],
-            finished: [false; 6],
+            received: [0; 8],
+            finished: [false; 8],
             max_frame_bytes,
         })
     }
@@ -193,8 +193,8 @@ impl V41Tp4ChunkReceiver {
             "response frame cannot fit one native token row");
         Ok(Self {
             identity: V41Tp4Planes::from_header_ranks(&request.header, executors)?,
-            received: [0; 6],
-            finished: [false; 6],
+            received: [0; 8],
+            finished: [false; 8],
             max_frame_bytes,
         })
     }
@@ -230,8 +230,8 @@ impl V41Tp4ChunkReceiver {
         );
         Ok(Self {
             identity: V41Tp4Planes::from_header_ranks(&request.header, executors)?,
-            received: [0; 6],
-            finished: [false; 6],
+            received: [0; 8],
+            finished: [false; 8],
             max_frame_bytes,
         })
     }

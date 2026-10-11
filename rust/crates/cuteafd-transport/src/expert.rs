@@ -45,22 +45,8 @@ pub const V41_PARTIAL_ROW_BYTES: u32 = V41_HIDDEN * 2;
 /// [`SparkTopology::executor_id`], which owns the wider disjoint
 /// namespaces and rejects a legacy identity.
 pub fn v41_spark_executor_id(world: usize, rank: usize) -> Result<u64> {
-    let base = match world {
-        // Whole-expert Qwen Spark TP1 uses a namespace disjoint from all TP x EP layouts.
-        1 => 33,
-        4 => 1,
-        2 => 5,
-        3 => 7,
-        // The implicit six-rank EXL3 group is the same six disjoint
-        // intermediate slices as `TP6EP1`, so it shares that 27..=32 namespace.
-        6 => 27,
-        _ => anyhow::bail!(
-            "native Spark executor requires an implicit world of 1, 2, 3, 4 or 6; \
-             an explicit topology must use SparkTopology::executor_id"
-        ),
-    };
-    ensure!(rank < world, "native Spark executor rank {rank} is outside world {world}");
-    Ok(rank as u64 + base)
+    ensure!((1..=8).contains(&world), "native Spark executor world must be in 1..=8, got {world}");
+    SparkTopology::new(world as u8, 1)?.executor_id(rank)
 }
 
 // Shared by wire parsing on workers and validation of owned coordinator requests.
@@ -403,40 +389,24 @@ impl<'a> BackboneRequest<'a> {
 }
 
 // Fixed-size rank identities keep per-wave validation allocation-free.
-enum V41Executors {
-    Tp1([u64; 1]),
-    Tp2([u64; 2]),
-    Tp3([u64; 3]),
-    Tp4([u64; 4]),
-    Tp6([u64; 6]),
+struct V41Executors {
+    ids: [u64; 8],
+    len: usize,
 }
 impl V41Executors {
     fn new(executors: &[u64]) -> Result<Self> {
-        Ok(match executors.len() {
-            1 => Self::Tp1(executors.try_into().expect("one executor")),
-            2 => Self::Tp2(executors.try_into().expect("two executors")),
-            3 => Self::Tp3(executors.try_into().expect("three executors")),
-            4 => Self::Tp4(executors.try_into().expect("four executors")),
-            6 => Self::Tp6(executors.try_into().expect("six executors")),
-            other => anyhow::bail!(
-                "native TP/EP requires one, two, three, four or six executors, got {other}"
-            ),
-        })
+        ensure!((1..=8).contains(&executors.len()),
+            "native TP/EP requires 1..=8 executors, got {}", executors.len());
+        let mut ids = [0; 8];
+        ids[..executors.len()].copy_from_slice(executors);
+        Ok(Self { ids, len: executors.len() })
     }
-    fn as_slice(&self) -> &[u64] {
-        match self {
-            Self::Tp1(ids) => ids,
-            Self::Tp2(ids) => ids,
-            Self::Tp3(ids) => ids,
-            Self::Tp4(ids) => ids,
-            Self::Tp6(ids) => ids,
-        }
-    }
-    fn len(&self) -> usize { self.as_slice().len() }
+    fn as_slice(&self) -> &[u64] { &self.ids[..self.len] }
+    fn len(&self) -> usize { self.len }
 }
 
 /// Collects complete native rank planes in rank order, independently of arrival
-/// order, for every validated world size (1, 2, 3, 4 or 6). Payloads are borrowed;
+/// order, for every validated world size (1..=8). Payloads are borrowed;
 /// keep their frame storage alive until GPU copies finish. Request IDs must
 /// uniquely identify in-flight waves within a placement version.
 pub struct V41Tp4Planes<'a> {
@@ -445,13 +415,13 @@ pub struct V41Tp4Planes<'a> {
     layer: u32,
     rows: u32,
     executors: V41Executors,
-    planes: [Option<&'a [u8]>; 6],
+    planes: [Option<&'a [u8]>; 8],
 }
 impl<'a> V41Tp4Planes<'a> {
     pub fn new(request: &BackboneRequest<'_>, executors: [u64; 4]) -> Result<Self> {
         Self::from_header(&request.view.header, executors)
     }
-    /// Generic constructor for the validated physical rank counts 1, 2, 3, 4 and 6.
+    /// Generic constructor for the validated physical rank counts 1..=8.
     pub fn new_ranks(request: &BackboneRequest<'_>, executors: &[u64]) -> Result<Self> {
         if let Some(topology) = request.native_topology() {
             ensure!(
@@ -466,8 +436,8 @@ impl<'a> V41Tp4Planes<'a> {
     }
     fn from_header_ranks(h: &crate::ExpertProtocolV2RequestHeader, executors: &[u64]) -> Result<Self> {
         ensure!(
-            matches!(executors.len(), 1 | 2 | 3 | 4 | 6),
-            "native TP/EP requires one, two, three, four or six executors"
+            (1..=8).contains(&executors.len()),
+            "native TP/EP requires 1..=8 executors"
         );
         for (rank, id) in executors.iter().enumerate() {
             ensure!(
@@ -481,7 +451,7 @@ impl<'a> V41Tp4Planes<'a> {
             layer: h.layer_id,
             rows: h.row_count,
             executors: V41Executors::new(executors)?,
-            planes: [None; 6],
+            planes: [None; 8],
         })
     }
     /// Rejections leave the collection unchanged.
@@ -592,7 +562,7 @@ mod tests {
             (0, 0),
             (1, 1),
             (6, 6),
-            (5, 0),
+            (9, 0),
             (2, 2),
             (3, 3),
             (4, 4),
