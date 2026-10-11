@@ -169,7 +169,41 @@ fn e4m3_and_e5m2_are_distinct_operands() {
     assert!(ue8m0.is_fp8_block(128, &[ScaleEncoding::Ue8m0]) && !ue8m0.is_fp8_block(128, &[ScaleEncoding::F32]));
     // Both rows of a GLM routed expert: E4M3 accepted, E5M2 rejected.
     let dir = snapshot(glm5_config(), &glm5_tensors(|name, n, k| fp8(name, n, k, None)));
-    assert!(plan(dir.path(), &PlanOptions::default()).unwrap().executable());
+    let report = plan(dir.path(), &PlanOptions::default()).unwrap();
+    assert!(report.executable(), "{}", render(&report));
+}
+
+#[test]
+fn glm5_layout_matches_runtime_request_from_header_baseline() {
+    use crate::placement::{families::glm5 as glm, Baseline, Onboard};
+    use cuteafd_core::memory_layout::Category;
+    let dir = snapshot(glm5_config(), &glm5_tensors(|name, n, k| fp8(name, n, k, None)));
+    let cfg = crate::families::glm5::GlmDsaConfig::from_hf(&glm5_config()).unwrap();
+    for (cards, pool) in [vec![32 << 30], vec![96 << 30], vec![96 << 30, 80 << 30]].into_iter()
+        .flat_map(|cards| [None, Some(65536)].map(|pool| (cards.clone(), pool))) {
+        let options = layout::LayoutOptions { rtx_bytes: cards.clone(), context_tokens: 65536,
+            pool_tokens: pool, prefill_rows: 4096, prefill_lanes: 3,
+            glm5_drafter_disabled: true, ..Default::default() };
+        let report = plan(dir.path(), &PlanOptions { layout: Some(options.clone()), ..Default::default() }).unwrap();
+        assert!(report.executable(), "{}", render(&report));
+        let memory = report.memory_layout.unwrap();
+        let gpus = memory.devices.iter().filter(|d| d.kind == cuteafd_core::memory_layout::DeviceKind::Rtx)
+            .map(|d| (d.capacity_bytes, Baseline::Measured { free_bytes: d.capacity_bytes - d.items.iter()
+                .filter(|i| matches!(i.category, Category::Weights | Category::Embedding)
+                    || i.group == "context+modules")
+                .map(|i| i.bytes).sum::<u64>() })).collect();
+        let r = glm::request(&glm::GlmInputs { cfg: &cfg, layers: cfg.layers, gpus,
+            headroom_bytes: options.headroom_bytes, spark_ranks: 4, prefill_rows: 4096,
+            prefill_lanes: 3, max_context: 65536, scratch: None, drafter_bytes: 0,
+            drafter_staging: 0, pending_code: vec![], experts: vec![], expert_workspace: 0,
+            tp2_workspace: [0; 2], requested_pool: pool, onboard: Onboard::Auto,
+            full_prefill_logits: false }).unwrap();
+        let runtime = crate::placement::solve(&r).unwrap();
+        assert_eq!(memory.pool_tokens, runtime.pool_tokens);
+        for (rank, items) in runtime.items.iter().enumerate() {
+            for item in items { assert!(memory.devices[rank].items.contains(item), "missing {item:?}"); }
+        }
+    }
 }
 
 #[test]

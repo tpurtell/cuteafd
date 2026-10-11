@@ -167,7 +167,14 @@ pub fn request(inputs: &GlmInputs<'_>) -> Result<PlacementRequest, PlacementErro
     let layers = (0..inputs.layers).map(|layer| LayerDemand {
         kind: AttentionClass::Dsa,
         weights: ModeBytes::default(),
-        kv_unit: ModeBytes::replicated(PAGE_ROWS * 656 + if cfg.indexers[layer] == GlmIndexer::Full { 8448 } else { 0 }),
+        kv_unit: {
+            let unit = PAGE_ROWS * 656 + if cfg.indexers[layer] == GlmIndexer::Full { 8448 } else { 0 };
+            KvDemand { unit_bytes_whole: unit, unit_bytes_split: [unit; 2],
+                unit_bytes_context: Some([unit.div_ceil(2), unit / 2]) }
+        },
+        fixed_bytes: ModeBytes::default(),
+        context_indexer: cfg.indexers[layer] == GlmIndexer::Full,
+        colocate: Some(cfg.index_source(layer) as u16),
         // Preserve routed identity even without local kernels: Spark-free and
         // explicit local requests must fail, not turn these into dense layers.
         experts: layer.checked_sub(cfg.first_moe_layer).map(|i| inputs.experts.get(i).copied().unwrap_or(ExpertCost {
@@ -176,6 +183,11 @@ pub fn request(inputs: &GlmInputs<'_>) -> Result<PlacementRequest, PlacementErro
     }).collect();
     let cards: Vec<_> = inputs.gpus.iter().map(|g| g.0).collect();
     Ok(PlacementRequest {
+        attention_placement: None,
+        layers_first_gpu: 0,
+        context_buffers: ContextBuffers { staging_unit_bytes: PAGE_ROWS * 788, staging_unit_rows: PAGE_ROWS,
+            query_row_bytes: 36_864, partial_row_bytes: 32_896, candidate_row_bytes: cfg.index_topk as u64 * 8,
+            compiled_extent: inputs.max_context, decode_rows: DECODE_ROWS, lanes: inputs.prefill_lanes },
         inventory: Inventory { gpus: inputs.gpus.iter().map(|&(capacity_bytes, baseline)| GpuBudget {
             capacity_bytes, baseline, headroom_bytes: inputs.headroom_bytes }).collect(),
             spark_ranks: inputs.spark_ranks, peer_access: gpus == 2 },
@@ -189,6 +201,37 @@ pub fn request(inputs: &GlmInputs<'_>) -> Result<PlacementRequest, PlacementErro
             lanes: inputs.prefill_lanes, entry_gpu: 0, head_gpu: 0 },
         executor: super::GLM5,
     })
+}
+
+/// Header-only draft storage shared by plan and serve (mode 0 is GLM's W8A16).
+pub fn drafter_bytes(snapshot: &std::path::Path, slots: usize, sequences: usize,
+    sms: u64, bf16: bool) -> anyhow::Result<u64> {
+    use crate::families::glm5::draft_representation::{draft_resident_bytes_with_mode, GlmDraftRepresentation};
+    let config = crate::plan::checkpoint::read_json(&snapshot.join("config.json"))?;
+    let (owned, scratch) = draft_resident_bytes_with_mode(&config, slots, sequences, sms,
+        if bf16 { GlmDraftRepresentation::Bf16Only } else { GlmDraftRepresentation::Fp8Only }, 0)?;
+    owned.checked_add(scratch).ok_or_else(|| anyhow::anyhow!("GLM draft storage overflow"))
+}
+
+/// Largest transient BF16 source retained while packing one draft projection.
+pub fn drafter_staging(snapshot: &std::path::Path, slots: usize, sequences: usize,
+    bf16: bool) -> anyhow::Result<u64> {
+    use crate::families::glm5::draft_representation::{draft_geometry, GlmDraftCapacity,
+        GlmDraftRepresentation, GlmDraftRuntimeLayout};
+    let config = crate::plan::checkpoint::read_json(&snapshot.join("config.json"))?;
+    let (geometry, block) = draft_geometry(&config)?;
+    let capacity = GlmDraftCapacity::new(slots, sequences, usize::try_from(block)?)?;
+    Ok(GlmDraftRuntimeLayout::new(geometry,
+        if bf16 { GlmDraftRepresentation::Bf16Only } else { GlmDraftRepresentation::Fp8Only },
+        capacity, 2048)?.weights.max_load_staging)
+}
+
+pub fn manifest_scratch(cfg: &GlmDsaConfig, split: bool, manifest: &serde_json::Value)
+    -> anyhow::Result<[GlmScratch; 2]> {
+    let programs = manifest["programs"].as_array().ok_or_else(|| anyhow::anyhow!("program manifest has no programs"))?;
+    let lookup = |name: &str| programs.iter().find(|p| p["name"].as_str() == Some(name))
+        .map(|p| p["scratch_bytes_at_capacity"]["scratch"].as_u64().unwrap_or(0));
+    Ok([step_scratch(cfg, split, true, lookup)?, step_scratch(cfg, split, false, lookup)?])
 }
 
 pub fn default_onboard() -> Onboard { Onboard::Auto }
@@ -269,6 +312,22 @@ mod tests {
         i.onboard = Onboard::Auto;
         i.spark_ranks = 0;
         assert!(matches!(solve(&request(&i).unwrap()), Err(PlacementError::SparkFree { .. })));
+    }
+
+    #[test]
+    fn context_costs_and_shared_indexer_groups_are_ready_for_k3() {
+        let cfg = config();
+        let r = request(&inputs(&cfg, &[96 * GIB; 2])).unwrap();
+        assert_eq!(r.layers.iter().filter(|l| l.context_indexer).count(), 21);
+        for (layer, demand) in r.layers.iter().enumerate() {
+            let halves = demand.kv_unit.unit_bytes_context.unwrap();
+            assert_eq!(halves[0] + halves[1], demand.kv_unit.unit_bytes_whole);
+            assert_eq!(demand.colocate, Some(cfg.index_source(layer) as u16));
+        }
+        assert_eq!(r.executor.attention_default(), AttentionPlacement::Heads);
+        let mut context = r;
+        context.attention_placement = Some(AttentionPlacement::Context);
+        assert!(matches!(solve(&context), Err(PlacementError::AttentionPlacement { .. })));
     }
 
     #[test]

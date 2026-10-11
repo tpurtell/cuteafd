@@ -47,6 +47,9 @@ pub(crate) struct EngineArgs {
     pub pool_tokens: usize,
     #[arg(long, default_value_t = 4096)]
     pub prefill_rows: usize,
+    /// Pool-first by default; local requests require an exported RTX backend.
+    #[arg(long, env = "RTX_EXPERT_LAYERS", default_value = "auto")]
+    pub rtx_expert_layers: cuteafd_loader::placement::Onboard,
     /// Spark expert ranks in TP order (HOST:PORT,...), for MoE layers.
     #[arg(long)]
     pub peers: Option<String>,
@@ -261,12 +264,6 @@ impl Opened {
         // inventory; the image's other families are never launched here.
         let selected = cuteafd_core::coordinator_programs::CoordinatorPrograms { family: "glm",
             split_family: args.split_device.map(|_| "glm2") };
-        let device = self.library.cuda_get_device()?;
-        crate::shared::inventory::RuntimeInventory::measure(&self.library, &[device], |_| {
-            let (loaded, skipped) = programs.load_matching(|name| selected.contains(name))?;
-            tracing::info!(loaded, skipped, "GLM programs loaded");
-            Ok(())
-        })?;
         let stream = self.library.cuda_stream_create()?;
         // The head split's second GPU and its stream (load kernels, then the engine's).
         // A head split needs its share's programs (`glm2`) in this build.
@@ -290,6 +287,12 @@ impl Opened {
             }
             None => None,
         };
+        let devices: Vec<_> = std::iter::once(args.device).chain(split_device).collect();
+        let inventory = crate::shared::inventory::RuntimeInventory::measure(&self.library, &devices, |_| {
+            let (loaded, skipped) = programs.load_matching(|name| selected.contains(name))?;
+            tracing::info!(loaded, skipped, "GLM programs loaded");
+            Ok(())
+        })?;
         let draft_file = args.draft.as_deref().map(dflash::prefetch);
         let started = Instant::now();
         let layers = args.layers.unwrap_or(self.cfg.layers).min(self.cfg.layers);
@@ -304,21 +307,40 @@ impl Opened {
         tracing::info!(layers, elapsed_ms = started.elapsed().as_millis() as u64,
             gib = format!("{:.2}", bytes as f64 / (1u64 << 30) as f64),
             split_gib = format!("{:.2}", peer_bytes as f64 / (1u64 << 30) as f64), "GLM coordinator weights resident");
-        let pool_tokens = if args.full_prefill_logits || args.pool_tokens == 0 || cuteafd_ffi::coordinator_gpu_budget().is_some() {
-            // The planner's GLM costs stay free on each GPU; records fill the rest.
-            let devices: Vec<i32> = std::iter::once(args.device).chain(peer_stream.map(|(d, _)| d)).collect();
-            // GLM 5.3's pages are its whole state: no recurrent slots, no mark arena.
-            crate::shared::memory_report::planned_pool_tokens_with_reserves(&self.library, &args.snapshot, &devices,
-                args.draft.as_deref(), args.prefill_rows, 0, 0,
-                (args.pool_tokens > 0).then_some(args.pool_tokens as u64), 0,
-                &crate::shared::memory_report::lead_reserves(devices.len(),
-                    if args.full_prefill_logits { cuteafd_loader::plan::layout::full_prefill_logits_bytes_with_lanes(
-                        "glm5", args.prefill_rows as u64, self.cfg.vocab_size as u64,
-                        if args.peers.is_some() { engine::configured_lanes() } else { 1 }) } else { 0 }),
-                Default::default(), 4, cuteafd_loader::serving_capacity::GLMF_DECODE_ROWS)?
-        } else {
-            args.pool_tokens
-        };
+        use cuteafd_loader::placement::{families::glm5 as glm, Baseline};
+        let gpus = devices.iter().map(|&device| -> Result<_> {
+            self.library.cuda_set_device(device)?;
+            let (free, total) = self.library.cuda_memory_info()?;
+            Ok((total as u64, Baseline::Measured { free_bytes: free as u64 }))
+        }).collect::<Result<Vec<_>>>();
+        self.library.cuda_set_device(args.device)?;
+        let gpus = gpus?;
+        inventory.record("glm5", &gpus.iter().map(|(_, b)| match b {
+            Baseline::Measured { free_bytes } => *free_bytes, _ => unreachable!(),
+        }).collect::<Vec<_>>());
+        let scratch = |decode| glm::step_scratch(&self.cfg, devices.len() == 2, decode,
+            |name| programs.spec(name).ok().map(|p| p.scratch.get("scratch").copied().unwrap_or(0)));
+        let drafter_bytes = args.draft.as_deref().map(|snapshot| glm::drafter_bytes(snapshot,
+            args.draft_context_slots.unwrap_or(20.max(args.draft_sequences)), args.draft_sequences,
+            self.library.sm_count()? as u64, args.draft_fp8 == Some(false))).transpose()?.unwrap_or(0);
+        let drafter_staging = args.draft.as_deref().map(|snapshot| glm::drafter_staging(snapshot,
+            args.draft_context_slots.unwrap_or(20.max(args.draft_sequences)), args.draft_sequences,
+            args.draft_fp8 == Some(false))).transpose()?.unwrap_or(0);
+        let pending_code = devices.iter().enumerate().map(|(rank, &device)|
+            crate::shared::inventory::pending_code(&self.library, device, rank, devices.len() == 2, "glm", "*"))
+            .collect::<Result<Vec<_>>>()?;
+        let request = glm::request(&glm::GlmInputs { cfg: &self.cfg, layers, gpus, headroom_bytes: 2 << 30,
+            spark_ranks: args.peers.as_deref().map_or(0, |p| p.split(',').count()),
+            prefill_rows: args.prefill_rows as u64,
+            prefill_lanes: if args.peers.is_some() { engine::configured_lanes() as u64 } else { 1 },
+            max_context: args.max_context as u64, scratch: Some([scratch(true)?, scratch(false)?]),
+            drafter_bytes, drafter_staging, pending_code, experts: Vec::new(),
+            expert_workspace: 0, tp2_workspace: [0; 2], requested_pool: (args.pool_tokens > 0).then_some(args.pool_tokens as u64),
+            onboard: args.rtx_expert_layers, full_prefill_logits: args.full_prefill_logits })?;
+        let placement = cuteafd_loader::placement::solve(&request)?;
+        cuteafd_loader::placement::families::GLM5.check(&placement)?;
+        tracing::info!(placement = %placement.summary(), "GLM admission");
+        let pool_tokens = usize::try_from(placement.pool_tokens)?;
         let max_context = crate::shared::context::pool_context("glm5", args.max_context, automatic_context, pool_tokens, 256)?;
         let pages = pool_tokens.div_ceil(engine::PAGE_ROWS);
         let mut engine = engine::GlmEngine::new(&self.library, &programs, self.cfg.clone(), model, stream,

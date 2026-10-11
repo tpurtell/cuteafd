@@ -355,14 +355,8 @@ pub(crate) fn planned_pool_tokens_with_reserves(library: &cuteafd_ffi::NativeLib
     let geometry = model.cache_geometry(CacheOptions {
         coordinator_ranks: cache_ranks, glmf_index, kda_state_bytes, glmf_decode_rows, ..Default::default() })?
         .with_context(|| format!("{} has no cache geometry for {} GPUs", family.id(), devices.len()))?;
-    let mut costs = cuteafd_loader::plan::layout::family_costs(family.id());
-    if family.id() == "glm5" {
-        let cfg = cuteafd_loader::families::glm5::GlmDsaConfig::from_hf(&checkpoint.config)?;
-        let context = cuteafd_loader::serving_capacity::checkpoint_context_limit(&checkpoint.config)?
-            .context("GLM checkpoint has no context limit")?;
-        let graph_bytes = cuteafd_loader::serving_capacity::glm_decode_graph_allowance(context as usize, cfg.layers)?;
-        costs.graph_bytes = costs.graph_bytes.map(|bytes| bytes.max(graph_bytes));
-    }
+    anyhow::ensure!(family.id() != "glm5", "GLM 5.3 admission must use its shared PlacementRequest");
+    let costs = cuteafd_loader::plan::layout::family_costs(family.id());
     let reserve = Reserve {
         costs,
         headroom: cuteafd_loader::plan::layout::LayoutOptions::default().headroom_bytes,

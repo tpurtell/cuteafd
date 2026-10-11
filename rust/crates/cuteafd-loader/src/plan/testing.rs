@@ -228,7 +228,8 @@ pub fn mimo_pro_tensors() -> Vec<Tensor> {
 pub fn glm5_config() -> Value {
     json!({
         "architectures": ["GlmMoeDsaForCausalLM"], "model_type": "glm_moe_dsa", "vocab_size": 64,
-        "hidden_size": 6144, "num_hidden_layers": 2, "num_attention_heads": 64, "q_lora_rank": 2048,
+        "hidden_size": 6144, "num_hidden_layers": 2, "max_position_embeddings": 1048576,
+        "num_attention_heads": 64, "q_lora_rank": 2048,
         "kv_lora_rank": 512, "qk_nope_head_dim": 192, "qk_rope_head_dim": 64, "v_head_dim": 256,
         "index_n_heads": 32, "index_head_dim": 128, "index_topk": 2048, "indexer_types": ["full", "shared"],
         "first_k_dense_replace": 1, "mlp_layer_types": ["dense", "sparse"], "intermediate_size": 12288,

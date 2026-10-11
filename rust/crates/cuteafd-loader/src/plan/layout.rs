@@ -14,6 +14,7 @@ use cuteafd_core::memory_layout::{size_pool, Basis, Category, DeviceKind, Device
 mod deepseek_v4;
 mod v41;
 mod mimo;
+mod glm5;
 
 const GIB: u64 = 1 << 30;
 const MIB: u64 = 1 << 20;
@@ -80,6 +81,10 @@ pub struct LayoutOptions {
     pub glmf_drafter_snapshot: Option<std::path::PathBuf>,
     /// Dense NVFP4 package manifest; otherwise discovered beside PROGRAMS.json.
     pub glmf_dense_manifest: Option<std::path::PathBuf>,
+    /// GLM 5.3's external drafter; absent resolves its launcher default.
+    pub glm5_drafter_snapshot: Option<std::path::PathBuf>,
+    pub glm5_drafter_disabled: bool,
+    pub glm5_draft_bf16: bool,
     /// Keep this much of every GPU free for runtime growth.
     pub headroom_bytes: u64,
     /// Concurrent sequences (state slots = concurrency + 2).
@@ -156,6 +161,9 @@ impl Default for LayoutOptions {
             glmf_drafter_disabled: false,
             glmf_drafter_snapshot: None,
             glmf_dense_manifest: None,
+            glm5_drafter_snapshot: None,
+            glm5_drafter_disabled: false,
+            glm5_draft_bf16: false,
             headroom_bytes: 2 * GIB,
             concurrency: 0,
             state_slots: None,
@@ -318,21 +326,6 @@ pub fn family_costs(family: &str) -> FamilyCosts {
         spark_host_bytes: 13 * GIB,
     };
     match family {
-        // GLM 5.3 EXL3 K4 + DFlash2 (BF16, 4.58 GiB checkpoint + 1.3 GiB context/buffers).
-        "glm5" => FamilyCosts {
-            // Untracked 0.89 / 0.82 GiB at ready, 2.62 / 2.14 after one decode+prefill
-            // bench and still rising (graphs per layer x exact rows x table width).
-            runtime_bytes: [gib(74), gib(89), gib(82)],
-            graph_bytes: [gib(300), gib(300), gib(300)],
-            workspace_bytes: [gib(651), gib(559), gib(422)],
-            exchange_bytes: gib(56),
-            drafter_bytes: gib(588),
-            mtp_resident: false,
-            attention_replicated: 0.10,
-            spark_workspace_bytes: gib(190),
-            spark_ring_bytes: gib(231),
-            ..generic
-        },
         // Coordinator inventory comes from MiMo's shared admission contract.
         // Spark-side allowances remain separate from this coordinator port.
         "mimo_v2" => FamilyCosts {
@@ -479,7 +472,14 @@ pub fn layout(report: &mut PlanReport, model: &dyn super::FamilyModel, checkpoin
     let context_tokens = resolved_context(family, options.context_tokens, checkpoint_context, workspace_manifest.as_ref());
     let target_pool_tokens = options.target_pool_tokens.max(context_tokens);
     let conversions = load_conversions(family, checkpoint);
-    let costs = family_costs(family);
+    let mut costs = family_costs(family);
+    // Coordinator GLM demands come only from its request. These remaining
+    // allowances describe Spark workers, not the removed coordinator ledger.
+    if family == "glm5" {
+        costs.mtp_resident = false;
+        costs.spark_workspace_bytes = gib(190);
+        costs.spark_ring_bytes = gib(231);
+    }
     let gpus = options.rtx_bytes.len().clamp(1, 2);
     // Qwen currently executes entirely on the first coordinator GPU.
     let split = gpus == 2 && options.head_split && family != "qwen4";
@@ -545,7 +545,18 @@ pub fn layout(report: &mut PlanReport, model: &dyn super::FamilyModel, checkpoin
                 report.vision != super::MediaMode::Off || item.group != "vision").cloned());
         }
     }
-    let exact = resident_layout(family, checkpoint, if split { 2 } else { 1 }, native_layers > 0, options.glmf_representation);
+    let exact = if family == "glm5" {
+        match glm5::resident(checkpoint, if split { 2 } else { 1 }) {
+            Ok(resident) => Some(resident),
+            Err(error) => {
+                report.placement_supported = false;
+                let what = format!("GLM resident operands: {error:#}");
+                report.hints.push(super::Hint { what: what.clone(), how: "Supply the checkpoint's complete coordinator tensor headers.".into() });
+                notes.push(what);
+                None
+            }
+        }
+    } else { resident_layout(family, checkpoint, if split { 2 } else { 1 }, native_layers > 0, options.glmf_representation) };
     if let Some(ranks) = &exact {
         for (device, rank) in devices.iter_mut().zip(ranks) {
             for (group, format, bytes) in rank {
@@ -688,7 +699,7 @@ pub fn layout(report: &mut PlanReport, model: &dyn super::FamilyModel, checkpoin
         else if options.drafter_bytes > 0 { options.drafter_bytes }
         else { glmf_draft.map_or(costs.drafter_bytes, |d| d.0) };
     // MiMo charges its drafter in its own reservation contract.
-    if drafter > 0 && family != "mimo_v2" {
+    if drafter > 0 && !matches!(family, "mimo_v2" | "glm5") {
         devices[0].items.push(Item::new(Category::Drafter, "drafter", "", drafter, allowance_basis));
     }
 
@@ -795,14 +806,10 @@ pub fn layout(report: &mut PlanReport, model: &dyn super::FamilyModel, checkpoin
         // V4's graphs, workspaces, exchange slots, reserve, KV and experts come
         // from the shared placement solver below; Qwen's from its shared
         // admission (`serving_capacity::qwen_graphs::qwen_admission`).
-        if matches!(family, "deepseek_v4" | "qwen4" | "mimo_v2") { continue; }
+        if matches!(family, "deepseek_v4" | "qwen4" | "mimo_v2" | "glm5") { continue; }
         let graph_allowance = if family == "deepseek_v41" && options.rtx_bytes[index] <= 32 * GIB {
             // Match the qualified fixed-bank envelope reserved by measured_pool_memory.
             2 * GIB
-        } else if family == "glm5" {
-            crate::families::glm5::GlmDsaConfig::from_hf(&checkpoint.config).ok()
-                .and_then(|cfg| crate::serving_capacity::glm_decode_graph_allowance(context_tokens as usize, cfg.layers).ok())
-                .unwrap_or(costs.graph_bytes[role]).max(costs.graph_bytes[role])
         } else { costs.graph_bytes[role] };
         if family == "glm5_flash" {
             let lanes = if matches!(report.placement, ExpertPlacement::Sparks { .. }) {
@@ -1012,6 +1019,35 @@ pub fn layout(report: &mut PlanReport, model: &dyn super::FamilyModel, checkpoin
             resolve_encoder(checkpoint, report, model, &mut devices, &mut spark_devices, &vec![0; gpus], options, &mut notes);
         }
     }
+    if family == "glm5" {
+        match glm5_placement(report, checkpoint, options, &devices[..active_gpus], workspace_manifest.as_ref(),
+            prefill_rows, context_tokens) {
+            Ok(placement) => {
+                for (device, items) in devices.iter_mut().zip(&placement.items) {
+                    device.items.extend(items.iter().cloned());
+                    device.kv_tokens = placement.pool_tokens;
+                }
+                local_layers = placement.onboard_layers;
+                local_bytes = placement.tp2.map_or(0, |t| t.peak_bytes.iter().sum())
+                    + placement.expert_ranges.iter().map(|r| r.peak_bytes).sum::<u64>();
+                pool_tokens = placement.pool_tokens;
+                notes.push(format!("placement: {}", placement.summary()));
+                if active_gpus == 2 {
+                    waste.push(Waste { device: "rtx1".into(), what: "KV records replicated on both GPUs (MLA latent)".into(),
+                        bytes: placement.items[1].iter().filter(|i| i.group == "records").map(|i| i.bytes).sum() });
+                }
+                if pool_tokens < context_tokens {
+                    notes.push(format!("full-context admission shortfall: context {context_tokens} tokens, pool {pool_tokens} tokens"));
+                }
+            }
+            Err(error) => {
+                report.placement_supported = false;
+                let what = format!("GLM placement: {error:#}");
+                report.hints.push(super::Hint { what: what.clone(), how: "Use supported heads attention and an admissible pool/local expert request; supply matching program and drafter headers.".into() });
+                notes.push(what);
+            }
+        }
+    }
     // Qwen: the serve-qwen4 admission, over the planned weights and experts.
     if family == "qwen4" {
         if report.encoder.is_none() {
@@ -1037,7 +1073,7 @@ pub fn layout(report: &mut PlanReport, model: &dyn super::FamilyModel, checkpoin
         }
     }
     // KV pool: per-device bytes per logical token from the family geometry.
-    let geometry = if matches!(family, "deepseek_v4" | "qwen4" | "mimo_v2") { Ok(None) } else { model.cache_geometry(CacheOptions { coordinator_ranks: active_gpus,
+    let geometry = if matches!(family, "deepseek_v4" | "qwen4" | "mimo_v2" | "glm5") { Ok(None) } else { model.cache_geometry(CacheOptions { coordinator_ranks: active_gpus,
         native_mtp_layers: if family == "deepseek_v4" || family == "qwen4" { cache_native_layers } else { 0 },
         prefill_rows: prefill_rows, glmf_decode_rows,
         glmf_index: if split { crate::serving_capacity::GlmfIndexCache::Keys } else { options.glmf_index },
@@ -1213,7 +1249,7 @@ pub fn layout(report: &mut PlanReport, model: &dyn super::FamilyModel, checkpoin
                     bytes: per_token.get(1).copied().unwrap_or(0) * pool_tokens });
             }
         }
-        Ok(None) if matches!(family, "deepseek_v4" | "qwen4" | "mimo_v2") => {}
+        Ok(None) if matches!(family, "deepseek_v4" | "qwen4" | "mimo_v2" | "glm5") => {}
         Ok(None) => notes.push(format!("{family}: no cache geometry in the planner yet (engine sizes its own pool)")),
         Err(error) => notes.push(format!("{family}: cache geometry: {error}")),
     }
@@ -1418,7 +1454,43 @@ fn qwen_package_scratch(checkpoint: &super::Checkpoint, report: &PlanReport, wor
     out
 }
 
-/// The planner's V4 shape inputs, beside `LayoutOptions`.
+/// GLM's shared admission over header-derived coordinator storage.
+fn glm5_placement(report: &PlanReport, checkpoint: &super::Checkpoint, options: &LayoutOptions,
+    devices: &[DeviceLayout], manifest: Option<&serde_json::Value>, rows: u64, context: u64)
+    -> anyhow::Result<crate::placement::Placement> {
+    use crate::placement::{families::glm5 as glm, Baseline, Onboard};
+    let cfg = crate::families::glm5::GlmDsaConfig::from_hf(&checkpoint.config)?;
+    let spark_ranks = match report.placement { ExpertPlacement::Sparks { ranks } => ranks, ExpertPlacement::Local => 0 };
+    let lanes = if options.prefill_lanes > 0 { options.prefill_lanes.clamp(1, 4) }
+        else if spark_ranks > 0 { glm_prefill_lanes(std::env::var("CUTEAFD_GLM_PREFILL_LANES").ok().as_deref()) as u64 }
+        else { 1 };
+    let (draft, draft_staging) = if options.glm5_drafter_disabled { (0, 0) }
+        else if options.drafter_bytes > 0 { (options.drafter_bytes, 0) }
+        else {
+            let snapshot = options.glm5_drafter_snapshot.clone().or_else(|| {
+                let home = std::env::var_os("HF_HOME").map(std::path::PathBuf::from)
+                    .unwrap_or_else(|| std::path::PathBuf::from("/mnt/sparknest/hf-home"));
+                crate::resolve_snapshot_at_revision("incoai/GLM-5.3-DFlash2", Some(&home), None).ok().and_then(|r| r.snapshot_path)
+            }).ok_or_else(|| anyhow::anyhow!("GLM drafter config unavailable; pass its snapshot, --drafter-gib, or disable speculation"))?;
+            let sequences = options.draft_sequences as usize;
+            let slots = options.draft_context_slots.unwrap_or(20.max(options.draft_sequences)) as usize;
+            (glm::drafter_bytes(&snapshot, slots, sequences,
+                options.physical_sms.unwrap_or_else(|| crate::placement::ArchContext::for_device("sm_120", options.rtx_bytes[0]).sms) as u64,
+                options.glm5_draft_bf16)?, glm::drafter_staging(&snapshot, slots, sequences, options.glm5_draft_bf16)?)
+        };
+    let scratch = manifest.map(|m| glm::manifest_scratch(&cfg, devices.len() == 2, m)).transpose()?;
+    let gpus = devices.iter().zip(&options.rtx_bytes).map(|(d, &capacity)| (capacity,
+        Baseline::Planned { context_bytes: 0, loaded_bytes: d.used_bytes() })).collect();
+    let onboard = options.onboard.or(options.local_expert_layers.map(Onboard::Layers)).unwrap_or_else(glm::default_onboard);
+    let mut request = glm::request(&glm::GlmInputs { cfg: &cfg, layers: cfg.layers, gpus,
+        headroom_bytes: options.headroom_bytes, spark_ranks, prefill_rows: rows, prefill_lanes: lanes,
+        max_context: context, scratch, drafter_bytes: draft, drafter_staging: draft_staging, pending_code: Vec::new(),
+        experts: Vec::new(), expert_workspace: 0, tp2_workspace: [0; 2], requested_pool: options.pool_tokens,
+        onboard, full_prefill_logits: options.full_prefill_logits })?;
+    request.attention_placement = Some(report.attention_placement);
+    Ok(crate::placement::solve(&request)?)
+}
+
 struct V4PlanShape {
     prefill_rows: u64,
     decode_rows: u64,

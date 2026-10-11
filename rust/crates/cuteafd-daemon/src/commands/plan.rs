@@ -73,6 +73,8 @@ fn options(args: &PlanArgs) -> Result<PlanOptions, PlanError> {
                 workspace_manifest: args.workspace_manifest.clone(),
                 glmf_drafter_disabled: args.no_speculator || args.speculator == "off",
                 glmf_drafter_snapshot: args.drafter_snapshot.clone(),
+                glm5_drafter_disabled: args.no_speculator || args.speculator == "off",
+                glm5_drafter_snapshot: args.drafter_snapshot.clone(),
                 drafter_bytes: if args.drafter_gib > 0.0 { budget_bytes("--drafter-gib", args.drafter_gib)? } else { 0 },
                 ..Default::default()
             })

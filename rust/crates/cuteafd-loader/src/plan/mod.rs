@@ -569,8 +569,9 @@ pub fn plan(snapshot: &Path, options: &PlanOptions) -> Result<PlanReport, PlanEr
         });
     }
     if options.layout.is_none() {
+        // A tensor-only inventory does not request an external speculation checkpoint.
         let inventory = layout::LayoutOptions { rtx_bytes: vec![options.coordinator_budget_bytes], spark_bytes: options.spark_budget_bytes,
-            spark_allocation_budget_bytes: Some(options.spark_budget_bytes), ..Default::default() };
+            spark_allocation_budget_bytes: Some(options.spark_budget_bytes), glm5_drafter_disabled: true, ..Default::default() };
         let _ = layout::layout(&mut report, model.as_ref(), &checkpoint, &inventory);
     }
     if let Some(encoder) = &report.encoder {
