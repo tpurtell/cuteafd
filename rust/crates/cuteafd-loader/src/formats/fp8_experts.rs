@@ -138,6 +138,17 @@ pub enum Slicing {
     Blocks(usize),
 }
 
+/// A packed checkpoint matrix window uploaded directly from a shared read bank.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Fp8MatrixSlice {
+    pub source_offset: usize,
+    pub source_pitch: usize,
+    pub destination_pitch: usize,
+    pub width: usize,
+    pub rows: usize,
+    pub destination_bytes: usize,
+}
+
 impl Fp8ExpertTensors {
     pub fn name(&self, layer: usize, expert: usize, projection: Fp8Projection) -> String {
         if self.mtp_layers && layer >= self.shape.layers {
@@ -454,6 +465,77 @@ impl Fp8ExpertTensors {
         Ok(bytes)
     }
 
+    /// Full projection sizes in the device format: BF16 block scales widen
+    /// exactly to FP32; NVFP4 appends one alpha and input scale per expert.
+    pub fn projection_bytes(&self, projection: Fp8Projection) -> (usize, usize) {
+        let (rows, cols) = self.dims(projection);
+        if self.format.packed_fp4() {
+            (rows * cols / 2, rows * cols / self.format.group()
+                + usize::from(self.format == ExpertFormat::Nvfp4) * 8)
+        } else {
+            (rows * cols, rows.div_ceil(128) * cols.div_ceil(128) * 4)
+        }
+    }
+
+    /// One source read feeds every rank's projection. Returns checkpoint bytes
+    /// read, which excludes exact BF16-to-FP32 scale widening.
+    pub fn read_projection_once(&self, layer: usize, expert: usize, projection: Fp8Projection,
+        weight: &mut [u8], scale: &mut [u8]) -> Result<usize> {
+        self.check(layer, expert, projection)?;
+        let name = self.name(layer, expert, projection);
+        let sizes = self.projection_bytes(projection);
+        ensure!((weight.len(), scale.len()) == sizes, "{name}: shared projection buffers have the wrong size");
+        let w = self.located(&name)?;
+        let suffix = if self.format.packed_fp4() { "_scale" } else { "_scale_inv" };
+        let s = self.located(&format!("{name}{suffix}"))?;
+        let read = |located: &Located, out: &mut [u8]| -> Result<()> {
+            std::fs::File::open(self.snapshot.join(&located.shard))?.read_exact_at(out, located.offset)
+                .with_context(|| format!("reading shared projection {name}"))
+        };
+        read(w, weight)?;
+        let raw_bytes = usize::try_from(s.bytes)?;
+        read(s, &mut scale[..raw_bytes])?;
+        if s.dtype == DType::Bf16 {
+            // Widen backward in place so the pinned source needs no second grid.
+            for index in (0..raw_bytes / 2).rev() {
+                let value = u16::from_le_bytes([scale[2 * index], scale[2 * index + 1]]);
+                scale[4 * index..4 * index + 4].copy_from_slice(&(u32::from(value) << 16).to_le_bytes());
+            }
+        }
+        let scalars = if self.format == ExpertFormat::Nvfp4 {
+            scale[sizes.1 - 8..sizes.1 - 4].copy_from_slice(&self.read_alpha(layer, expert, projection)?.to_le_bytes());
+            scale[sizes.1 - 4..].copy_from_slice(&self.read_input_scale(layer, expert, projection)?.to_le_bytes());
+            8
+        } else { 0 };
+        Ok(weight.len() + raw_bytes + scalars)
+    }
+
+    /// Weight and scale-grid windows of one shared source projection. NVFP4's
+    /// two replicated scalars are separate from the matrix windows.
+    pub fn projection_slices(&self, projection: Fp8Projection, tp: usize, rank: usize, slicing: Slicing)
+        -> Result<[Fp8MatrixSlice; 2]> {
+        let (rows, cols) = self.dims(projection);
+        let (first, len) = self.rank_range_with(tp, rank, slicing)?;
+        let stored = self.rank_width(tp, rank, slicing)?;
+        let bytes = self.slice_bytes_with(projection, tp, rank, slicing)?;
+        let matrix = |row_unit: usize, column_unit: usize, element: usize, destination_bytes| {
+            let source_pitch = cols.div_ceil(column_unit) * element;
+            if projection == Fp8Projection::Down {
+                Fp8MatrixSlice { source_offset: first / column_unit * element, source_pitch,
+                    destination_pitch: stored.div_ceil(column_unit) * element,
+                    width: len / column_unit * element, rows: rows.div_ceil(row_unit), destination_bytes }
+            } else {
+                Fp8MatrixSlice { source_offset: first / row_unit * source_pitch, source_pitch,
+                    destination_pitch: source_pitch, width: source_pitch, rows: len / row_unit, destination_bytes }
+            }
+        };
+        Ok(if self.format.packed_fp4() {
+            [matrix(1, 2, 1, bytes.0), matrix(1, self.format.group(), 1, bytes.1)]
+        } else {
+            [matrix(1, 1, 1, bytes.0), matrix(128, 128, 4, bytes.1)]
+        })
+    }
+
     /// `read_slice` for packed FP4 (MXFP4, NVFP4): rank rows `[first, first +
     /// len)` of gate/up (rows) or down (K columns), zero-padded to the stored
     /// slice width.
@@ -764,6 +846,77 @@ mod tests {
         assert!(error.contains("layer 0") && error.contains("expert 1"), "{error}");
         assert!(error.contains("gate input_scale 1") && error.contains("up input_scale 0.5"), "{error}");
         assert!(!error.contains("expert 0"), "{error}");
+    }
+
+    #[test]
+    fn shared_projection_windows_match_rank_reads_for_every_format_and_padding() -> Result<()> {
+        use crate::plan::testing::{fp8, mxfp4, nvfp4, write_snapshot};
+        for (format, bf16) in [(ExpertFormat::Fp8Block128, false), (ExpertFormat::Fp8Block128, true),
+            (ExpertFormat::Mxfp4, false), (ExpertFormat::Nvfp4, false)] {
+            let dir = tempfile::tempdir()?;
+            let shape = RoutedExpertShape { layers: 1, first_layer: 0, experts: 2, topk: 1, hidden: 256,
+                intermediate: 640, draft_stages: 0, draft_experts: 0 };
+            let mut fixtures = Vec::new();
+            for expert in 0..shape.experts {
+                for (projection, n, k) in [("gate", shape.intermediate, shape.hidden),
+                    ("up", shape.intermediate, shape.hidden), ("down", shape.hidden, shape.intermediate)] {
+                    let name = format!("model.layers.0.mlp.experts.{expert}.{projection}_proj");
+                    let mut tensors = match format {
+                        ExpertFormat::Fp8Block128 => fp8(&name, n, k, None),
+                        ExpertFormat::Mxfp4 => mxfp4(&name, n, k),
+                        ExpertFormat::Nvfp4 => nvfp4(&name, n, k),
+                    };
+                    if bf16 { tensors[1].1 = "BF16"; }
+                    fixtures.extend(tensors);
+                }
+            }
+            write_snapshot(dir.path(), &serde_json::json!({}), &fixtures, None);
+            let tensors = Fp8ExpertTensors::read(dir.path(), shape)?;
+            for (name, located) in &tensors.tensors {
+                let bytes = if name.ends_with("_scale_2") || name.ends_with(".input_scale") {
+                    0.25f32.to_le_bytes().to_vec()
+                } else {
+                    (0..located.bytes as usize).map(|i| ((i * 31 + i / 7 + 11) % 251) as u8).collect()
+                };
+                std::fs::OpenOptions::new().write(true).open(dir.path().join(&located.shard))?
+                    .write_all_at(&bytes, located.offset)?;
+            }
+            for expert in 0..shape.experts {
+                for projection in Fp8Projection::ALL {
+                    let sizes = tensors.projection_bytes(projection);
+                    let mut full_weight = vec![0; sizes.0];
+                    let mut full_scale = vec![0; sizes.1];
+                    let read = tensors.read_projection_once(0, expert, projection, &mut full_weight, &mut full_scale)?;
+                    let expected = if bf16 { sizes.0 + sizes.1 / 2 } else { sizes.0 + sizes.1 };
+                    assert_eq!(read, expected);
+                    for slicing in [Slicing::Padded, Slicing::Blocks(128)] {
+                        for rank in 0..2 {
+                            let sizes = tensors.slice_bytes_with(projection, 2, rank, slicing)?;
+                            let mut weight = vec![0; sizes.0];
+                            let mut scale = vec![0; sizes.1];
+                            tensors.read_slice_with(0, expert, projection, 2, rank, slicing,
+                                &mut weight, &mut scale, &mut Vec::new())?;
+                            let windows = tensors.projection_slices(projection, 2, rank, slicing)?;
+                            for (window, source, expected) in [(windows[0], &full_weight, weight),
+                                (windows[1], &full_scale, scale)] {
+                                let mut destination = vec![0; window.destination_bytes];
+                                for row in 0..window.rows {
+                                    let at = window.source_offset + row * window.source_pitch;
+                                    destination[row * window.destination_pitch..][..window.width]
+                                        .copy_from_slice(&source[at..at + window.width]);
+                                }
+                                assert_eq!(destination, expected, "{format:?} {projection:?} {slicing:?} rank {rank}");
+                            }
+                        }
+                    }
+                    if format == ExpertFormat::Nvfp4 {
+                        assert_eq!(&full_scale[full_scale.len() - 8..], &[0, 0, 128, 62, 0, 0, 128, 62]);
+                    }
+                    assert!(tensors.read_projection_once(0, expert, projection, &mut [], &mut full_scale).is_err());
+                }
+            }
+        }
+        Ok(())
     }
 
     #[test]
