@@ -306,6 +306,8 @@ static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 /// page; dropping it without [`Ticket::done`] retires the request as failed.
 pub(crate) struct Ticket {
     id: u64,
+    /// The decode lane the page draws the request on (0 for single-lane families).
+    lane: u8,
     done: bool,
     /// The request sent its finish (EOS, stop or length) to the client.
     finished: bool,
@@ -317,26 +319,45 @@ pub(crate) struct Ticket {
 /// at `admit_started` (shown as a restore step when nonzero).
 pub(crate) fn admit(prompt: usize, cached: usize, max: usize, grammar: bool, images: usize,
     admit_started: Instant, usage: Option<cuteafd_api::usage::UsageHandle>) -> Ticket {
-    if let Some(usage) = &usage {
-        usage.admitted(totals::active() as u64 + 1);
-        usage.prompt_tokens(prompt as u64, cached as u64);
-    }
     let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
-    totals::admitted(prompt, cached);
-    let at = Instant::now();
-    lifecycle(Event::Admit { id, at: admit_started, prompt: prompt as u32, cached: cached as u32,
-        max: max.min(u32::MAX as usize) as u32, lane: 0, grammar, images: images.min(u16::MAX as usize) as u16 });
-    if cached > 0 {
-        if let Some(live) = live() {
-            live.push(Event::Prefill(Prefill { id: Some(id), kind: PrefillKind::Restore, lane: 0, index: 0, of: 1,
-                rows: cached as u32, started: admit_started, finished: at }));
-        }
-    }
-    Ticket { id, done: false, finished: false, usage }
+    let mut ticket = Ticket::new(id, 0, usage);
+    ticket.announce(prompt, cached, max, grammar, images, (admit_started, Instant::now()));
+    ticket
 }
 
 impl Ticket {
+    /// A ticket for request `id` on `lane` whose family owns the id. Nothing is
+    /// counted or shown until [`Self::announce`]; dropped before that, it is silent.
+    pub fn new(id: u64, lane: u8, usage: Option<cuteafd_api::usage::UsageHandle>) -> Self {
+        Self { id, lane, done: true, finished: false, usage }
+    }
+
+    /// Count and announce the admission. `cached` prompt rows came from the prefix
+    /// cache restore that ran over `restore` (shown as a restore step when nonzero).
+    pub fn announce(&mut self, prompt: usize, cached: usize, max: usize, grammar: bool, images: usize,
+        restore: (Instant, Instant)) {
+        self.done = false;
+        if let Some(usage) = &self.usage {
+            usage.admitted(totals::active() as u64 + 1);
+            usage.prompt_tokens(prompt as u64, cached as u64);
+        }
+        totals::admitted(prompt, cached);
+        lifecycle(Event::Admit { id: self.id, at: restore.0, prompt: prompt as u32, cached: cached as u32,
+            max: max.min(u32::MAX as usize) as u32, lane: self.lane, grammar,
+            images: images.min(u16::MAX as usize) as u16 });
+        if cached > 0 {
+            if let Some(live) = live() {
+                live.push(Event::Prefill(Prefill { id: Some(self.id), kind: PrefillKind::Restore, lane: self.lane,
+                    index: 0, of: 1, rows: cached as u32, started: restore.0, finished: restore.1 }));
+            }
+        }
+    }
+
     pub fn id(&self) -> u64 { self.id }
+    pub fn lane(&self) -> usize { usize::from(self.lane) }
+    /// Move the request to another decode lane (lane balancing).
+    pub fn set_lane(&mut self, lane: usize) { self.lane = lane.min(u8::MAX as usize) as u8; }
+    pub fn usage(&self) -> Option<&cuteafd_api::usage::UsageHandle> { self.usage.as_ref() }
     pub fn session(&self) -> Option<String> { self.usage.as_ref().map(|u| u.session_id().to_owned()) }
 
     /// A prefill chunk of `rows` prompt rows that began at `started` just finished.
@@ -368,6 +389,9 @@ impl Ticket {
 
     /// The client left before the request produced anything.
     pub fn cancel(&mut self) { self.retire("cancelled", 0); }
+
+    /// The engine failed the request after `generated` tokens.
+    pub fn fail(&mut self, generated: usize) { self.retire("failed", generated); }
 
     fn retire(&mut self, reason: &'static str, generated: usize) {
         if std::mem::replace(&mut self.done, true) { return; }
@@ -510,7 +534,7 @@ mod tests {
 
     #[test]
     fn step_counts_members_without_a_viewer() {
-        let ticket = Ticket { id: 7, done: true, finished: false, usage: None };
+        let ticket = Ticket { id: 7, lane: 0, done: true, finished: false, usage: None };
         let mut step = Step { started: Instant::now(), lane: 0, live: None, text: false, requests: Vec::new(),
             tally: [0; 4] };
         // 5 drafted, 3 verified, 2 accepted (3 emitted); then a plain decode row.

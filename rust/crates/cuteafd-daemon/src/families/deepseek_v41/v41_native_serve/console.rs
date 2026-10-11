@@ -6,8 +6,8 @@
 //! round whose stages the V4.1 [`layout`] declares.
 use crate::families::deepseek_v41::v41_backbone_lane::FfnSplit;
 use crate::shared::console::{Color, Layers, Layout, Speculator, StepGroup};
-pub(crate) use crate::shared::console::{install, lifecycle, live, totals, Event, Gauges, Kv, Live, Prefill,
-    PrefillKind, Round, RoundRequest};
+pub(crate) use crate::shared::console::{install, live, totals, Event, Gauges, Kv, Live, Prefill,
+    PrefillKind, Round, RoundRequest, Ticket};
 use serde_json::{json, Value};
 use std::time::Instant;
 
