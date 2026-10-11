@@ -152,7 +152,7 @@ async fn lane<'a, P: VerificationTarget<'a>, C: DraftChain<'a>>(lane: usize, lib
                 // terminal, keeps the whole-round CPU path.
                 let mut round = None;
                 let next = if compact {
-                    BatchScores::from_greedy(scores::VOCAB, unsafe {
+                    ScoreRows::from_greedy(scores::VOCAB, unsafe {
                         pass.execute_shared_greedy(requests, current, transport, 0, &selected).await?
                     })?
                 } else if use_sampled_terminal(P::SUPPORTS_SAMPLED_TERMINAL,
@@ -168,7 +168,7 @@ async fn lane<'a, P: VerificationTarget<'a>, C: DraftChain<'a>>(lane: usize, lib
                     // counter must not claim the servable rows as device work.
                     sampling_stats::record_round(false, 0, 0);
                     unsafe { pass.execute_shared(requests, current, transport, 0, &selected).await?; }
-                    BatchScores::new(scores::VOCAB, pass.download_logits(current, &selected).await?)?
+                    ScoreRows::new(scores::VOCAB, pass.download_logits(current, &selected).await?)?
                 };
                 let verify_us = started.elapsed().as_micros() as u64 - prepared_us;
                 tracing::debug!(target: "cuteafd::cost_model", batch=batch_id, lane, round_id,

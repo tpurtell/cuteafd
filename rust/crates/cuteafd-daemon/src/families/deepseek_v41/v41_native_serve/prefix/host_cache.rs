@@ -34,7 +34,7 @@ pub(super) struct HostSaved {
     session: Option<String>,
     images: ImageKeys,
     history: EngramHistory,
-    next: TokenScores,
+    next: RetainedScores,
     owner: u64,
     end: u64,
     /// `WindowPrefix` parts per backbone window.

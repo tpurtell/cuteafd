@@ -6,7 +6,7 @@ mod independent;
 mod admission;
 mod layout;
 use layout::ServingTarget;
-use super::scores::{BatchScores, VOCAB};
+use super::scores::{ScoreRows, VOCAB};
 use crate::families::deepseek_v41::v41_backbone_cache::CacheLease;
 use crate::families::deepseek_v41::v41_requests::RequestBatch;
 use super::prefix::{ImageKeys, PrefixCache, SnapshotKind};
@@ -77,7 +77,7 @@ pub(super) struct Active<'a> {
     failed: bool,
     tokens: Vec<u32>,
     image_keys: ImageKeys,
-    next_after_commit: Option<TokenScores>,
+    next_after_commit: Option<RetainedScores>,
     /// Copy windows over `tokens`; `None` when copy drafting is off.
     copy: Option<CopyDrafter>,
 }
@@ -1136,14 +1136,14 @@ fn build_sampling_round<'a>(active: &[Option<Active<'a>>], members: &[usize],
 /// `sample_target_rows` / `State::select_verification_sampled`, so the fallback
 /// is the CPU value rather than a look-alike.
 ///
-/// **The result is stored into `next.best[row]`** (`BatchScores::store_sampled`).
+/// **The result is stored into `next.best[row]`** (`ScoreRows::store_sampled`).
 /// That matters for a row the device refused *after* the launch: its plan route
 /// is still `device_served()`, so the commit path consumes `next.best[row]`
 /// directly, and a kernel that reported `INTERNAL` left that slot at the
 /// caller's sentinel. Computing the fallback without storing it would commit the
 /// stale device slot — a silent wrong token. Storing it also means the commit
 /// path never needs to recompute a fallback row, so no row is sampled twice.
-pub(crate) fn resolve_fallback_rows(next: &mut BatchScores, round: &SamplingRound,
+pub(crate) fn resolve_fallback_rows(next: &mut ScoreRows, round: &SamplingRound,
     rows: &[usize],
 ) -> Result<()> {
     for &row in rows {
@@ -1175,7 +1175,7 @@ pub(crate) fn resolve_fallback_rows(next: &mut BatchScores, round: &SamplingRoun
 async fn execute_sampled_rows<'a>(pass: &mut TargetPass<'_, 'a>,
     requests: &Requests<'a>, batch: &mut RequestBatch, transport: &mut NativeTp4Wave<'a>,
     round: &SamplingRound,
-) -> Result<BatchScores> {
+) -> Result<ScoreRows> {
     let selected: Vec<_> = (0..batch.cache()?.positions().len()).collect();
     unsafe {
         pass.execute_sampled(requests, batch, transport, 0, &selected, &round.plan.rows,
@@ -1189,7 +1189,7 @@ async fn execute_sampled_rows<'a>(pass: &mut TargetPass<'_, 'a>,
     let download: Vec<usize> = fallback.iter().copied().chain(round.trace_rows.iter().copied())
         .collect::<std::collections::BTreeSet<_>>().into_iter().collect();
     let next = if download.is_empty() {
-        BatchScores::from_sampled(VOCAB, &sampled, &round.plan.greedy)?
+        ScoreRows::from_sampled(VOCAB, &sampled, &round.plan.greedy)?
     } else {
         let bytes = pass.download_sampled_rows(&sampled, &download).await?;
         let mut next = sampled.with_full_logits(VOCAB, &download, bytes)?;
@@ -1208,7 +1208,7 @@ async fn execute_sampled_rows<'a>(pass: &mut TargetPass<'_, 'a>,
 async fn execute_shared_sampled_rows<'a, P: VerificationTarget<'a> + ?Sized>(
     pass: &mut P, requests: &std::cell::RefCell<&mut Requests<'a>>,
     batch: &mut RequestBatch, transport: &mut P::Transport, round: &SamplingRound,
-) -> Result<BatchScores> {
+) -> Result<ScoreRows> {
     let selected: Vec<_> = (0..batch.cache()?.positions().len()).collect();
     unsafe {
         pass.execute_shared_sampled(requests, batch, transport, 0, &selected, &round.plan.rows,
@@ -1222,7 +1222,7 @@ async fn execute_shared_sampled_rows<'a, P: VerificationTarget<'a> + ?Sized>(
     let download: Vec<usize> = fallback.iter().copied().chain(round.trace_rows.iter().copied())
         .collect::<std::collections::BTreeSet<_>>().into_iter().collect();
     let next = if download.is_empty() {
-        BatchScores::from_sampled(VOCAB, &sampled, &round.plan.greedy)?
+        ScoreRows::from_sampled(VOCAB, &sampled, &round.plan.greedy)?
     } else {
         let bytes = pass.download_sampled_rows(&sampled, &download).await?;
         let mut next = sampled.with_full_logits(VOCAB, &download, bytes)?;
@@ -1281,18 +1281,18 @@ pub(crate) fn admit_device_rows(round: &SamplingRound,
 async fn execute_logits<'a>(lib: &'a NativeLibrary, pass: &mut TargetPass<'_, 'a>,
     requests: &Requests<'a>, batch: &mut Option<RequestBatch>, transport: &mut NativeTp4Wave<'a>,
     capture_routes: bool, compact: bool,
-) -> Result<BatchScores> {
-    let Some(batch) = batch else { return BatchScores::new(VOCAB, Vec::new()); };
+) -> Result<ScoreRows> {
+    let Some(batch) = batch else { return ScoreRows::new(VOCAB, Vec::new()); };
     pass.set_route_capture(capture_routes);
     let result = async {
         let selected: Vec<_> = (0..batch.cache()?.positions().len()).collect();
         if compact {
-            return BatchScores::from_greedy(VOCAB, unsafe { pass.execute_greedy(requests, batch, transport, 0, &selected).await? });
+            return ScoreRows::from_greedy(VOCAB, unsafe { pass.execute_greedy(requests, batch, transport, 0, &selected).await? });
         }
         let logits = unsafe { pass.execute(requests, batch, transport, 0, &selected).await? };
         let mut bytes = vec![0; logits.logits.bytes];
         lib.copy_d2h(&mut bytes, logits.logits)?;
-        BatchScores::new(VOCAB, bytes)
+        ScoreRows::new(VOCAB, bytes)
     }.await;
     pass.set_route_capture(false);
     result
@@ -1511,7 +1511,7 @@ fn single_lane_round<'w, 'a>(lib: &'a NativeLibrary, runtime: &tokio::runtime::R
 /// `base_position + index`, never on the batch row, so a member's position in a
 /// multi-request round and any rejected draft rows cannot shift its stream.
 fn sample_target_rows(
-    next: &BatchScores,
+    next: &ScoreRows,
     offset: usize,
     input: &[u32],
     params: cuteafd_core::TargetSamplingParams,
@@ -1526,7 +1526,7 @@ fn sample_target_rows(
 ///
 /// A device-sampled **stochastic** row's `next.best[row]` is a *draw*, not an
 /// argmax, so the retention cross-check in
-/// [`BatchScores::retain_downloaded_with`] must not run for it: it validates a
+/// [`ScoreRows::retain_downloaded_with`] must not run for it: it validates a
 /// greedy selection and would raise a spurious "GPU and retained CPU greedy
 /// selection differ". The recorded id is the value the verification already
 /// consumed, so the retained token is that id with the downloaded row for a
@@ -1602,9 +1602,9 @@ pub(crate) fn frontier_download(whole_batch_has_logits: bool, row_has_logits: bo
 /// two cannot drift. (`WholeBatch` keeps its own `next.retain` path: a fully
 /// downloaded batch is CPU-selected, where the stored `best` is the unmasked
 /// argmax and the mask cross-check would be spurious.)
-pub(crate) fn retain_packed_frontier(next: &BatchScores, row: usize, retain: FrontierRetain,
+pub(crate) fn retain_packed_frontier(next: &ScoreRows, row: usize, retain: FrontierRetain,
     mask: Option<&[u32]>,
-) -> Result<TokenScores> {
+) -> Result<RetainedScores> {
     match retain {
         FrontierRetain::Checked => next.retain_packed(row, mask),
         FrontierRetain::RecordedSample => next.retain(row),
@@ -1642,7 +1642,7 @@ struct CommitDecision {
     emitted: usize,
     accepted: Vec<u32>,
     emissions: Vec<Vec<u32>>,
-    next_after_commit: Vec<Option<TokenScores>>,
+    next_after_commit: Vec<Option<RetainedScores>>,
     /// Finishing frontier rows that need the one-row device D2H: retention is
     /// enabled and the row is not already on the host.
     frontier_downloads: Vec<(usize, usize, Option<Vec<u32>>, FrontierRetain)>,
@@ -1667,7 +1667,7 @@ enum SampleSource {
 /// which is the slice K1 filled: the device applies the grammar mask itself, so
 /// a constrained row consumes its masked id instead of re-running the masked
 /// argmax (which would fail, because no logits were downloaded).
-fn selected_target_rows(next: &BatchScores, offset: usize, len: usize,
+fn selected_target_rows(next: &ScoreRows, offset: usize, len: usize,
     source: SampleSource,
 ) -> Result<std::borrow::Cow<'_, [u32]>> {
     use std::borrow::Cow;
@@ -1690,7 +1690,7 @@ fn selected_target_rows(next: &BatchScores, offset: usize, len: usize,
 /// CPU-selected. The closure is consulted only when the row has no stored
 /// selection at all, so the device-selection property stays testable.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn select_routed<'a, F>(next: &'a BatchScores, round: Option<&SamplingRound>,
+pub(crate) fn select_routed<'a, F>(next: &'a ScoreRows, round: Option<&SamplingRound>,
     offset: usize, row: usize, len: usize, recompute: F,
 ) -> Result<std::borrow::Cow<'a, [u32]>>
 where
@@ -1699,7 +1699,7 @@ where
     let stored = match round {
         // A row whose selection is already stored is consumed as-is, whichever
         // producer stored it: a device row's `best[row]` came from the kernels,
-        // and a fallback row's was written by `BatchScores::store_sampled` after
+        // and a fallback row's was written by `ScoreRows::store_sampled` after
         // the launch. Keying on "does this row carry its logits" rather than on
         // the plan route is what makes a row the device **refused after the
         // launch** commit the stored CPU token instead of the stale device slot
@@ -1723,7 +1723,7 @@ where
 /// device-selected round must never call it, because that path needs full
 /// logits the device path deliberately did not download. Keeping the two
 /// separate is what makes that property testable rather than incidental.
-fn select_target_row<F>(next: &BatchScores, offset: usize, len: usize, source: SampleSource,
+fn select_target_row<F>(next: &ScoreRows, offset: usize, len: usize, source: SampleSource,
     recompute: F,
 ) -> Result<std::borrow::Cow<'_, [u32]>>
 where
@@ -1737,7 +1737,7 @@ where
 
 fn prepare_commit_lane<'a, C: DraftChain<'a>>(lane: usize,
     requests: &Requests<'a>, active: &[Option<Active<'a>>], members: &[usize], inputs: &[Vec<u32>],
-    next: &BatchScores, draft: Option<&DraftRuntime<'_, 'a, C>>, verify_us: u64,
+    next: &ScoreRows, draft: Option<&DraftRuntime<'_, 'a, C>>, verify_us: u64,
     round: Option<&SamplingRound>, retain_enabled: bool,
 ) -> Result<CommitDecision> {
     let mut accepted_drafts = 0u32;
@@ -1974,16 +1974,16 @@ fn observe_lane_round<'a, C: DraftChain<'a>>(draft: Option<&mut DraftRuntime<'_,
 ///
 /// * [`FrontierRetain::Checked`] — the recorded id is a greedy selection, so it
 ///   is validated against the row's own grammar mask by
-///   [`BatchScores::retain_downloaded_with`] (the chunk-1 property: a device/CPU
+///   [`ScoreRows::retain_downloaded_with`] (the chunk-1 property: a device/CPU
 ///   greedy disagreement is an error, not a silent token).
 /// * [`FrontierRetain::RecordedSample`] — the recorded id is a stochastic draw
 ///   produced by the same path, so the row is retained as-is
-///   ([`BatchScores::retain`]); running the argmax cross-check would be checking
+///   ([`ScoreRows::retain`]); running the argmax cross-check would be checking
 ///   a draw for being an argmax.
-pub(crate) fn resolve_frontier(retain: FrontierRetain, next: &BatchScores, row: usize,
+pub(crate) fn resolve_frontier(retain: FrontierRetain, next: &ScoreRows, row: usize,
     bytes: &[u8],
     mask: Option<&[u32]>,
-) -> Result<TokenScores> {
+) -> Result<RetainedScores> {
     match retain {
         FrontierRetain::Checked => next.retain_downloaded_with(row, bytes, mask),
         FrontierRetain::RecordedSample => next.retain_from_bytes(row, bytes),
@@ -1994,7 +1994,7 @@ pub(crate) fn resolve_frontier(retain: FrontierRetain, next: &BatchScores, row: 
 fn commit_lane<'w, 'a>(lib: &'a NativeLibrary, lane: usize,
     pass: &mut TargetPass<'w, 'a>, requests: &mut Requests<'a>,
     active: &mut [Option<Active<'a>>], members: &[usize], inputs: &[Vec<u32>],
-    owned_batch: &mut Option<RequestBatch>, next: &BatchScores,
+    owned_batch: &mut Option<RequestBatch>, next: &ScoreRows,
     mut draft: Option<&mut DraftRuntime<'_, 'a>>, verify_us: u64,
     round: Option<&SamplingRound>, retain_enabled: bool,
 ) -> Result<(u32, usize, Vec<Vec<u32>>, Vec<u32>)> {
@@ -2056,7 +2056,7 @@ mod sampling_tests {
     /// position rather than the batch row.
     #[test]
     fn sample_target_rows_keys_draws_on_absolute_position() {
-        let batch = BatchScores::new(VOCAB, rows(5)).unwrap();
+        let batch = ScoreRows::new(VOCAB, rows(5)).unwrap();
         let params =
             cuteafd_core::TargetSamplingParams::new(0.9, 0.97, Some(8), 0.02, 4242).unwrap();
         assert!(!params.is_greedy());
@@ -2103,7 +2103,7 @@ mod sampling_tests {
             status_detail: vec![0u32; 6],
             logits,
         };
-        let next = BatchScores::from_sampled(VOCAB, &sampled, &greedy).unwrap();
+        let next = ScoreRows::from_sampled(VOCAB, &sampled, &greedy).unwrap();
 
         // The device path returns exactly K1's ids and must not invoke the CPU
         // selection, whose failure is the "requires full logits" error below.
@@ -2279,7 +2279,7 @@ mod sampling_tests {
         logits[5] = 4.0;
         logits[17] = 3.5;
         let expected = params.select_token(&logits, None, 900).unwrap() as u32;
-        let batch = BatchScores::new(VOCAB, logits.iter().flat_map(|value| value.to_ne_bytes()).collect())
+        let batch = ScoreRows::new(VOCAB, logits.iter().flat_map(|value| value.to_ne_bytes()).collect())
             .unwrap();
         assert_eq!(batch.sample(0, None, plan.params[0], plan.position[0]).unwrap(), expected);
         // The position decides the draw: the seeded uniform at the row's own
@@ -2430,13 +2430,13 @@ mod sampling_tests {
     fn packed_frontier_retention_matches_the_downloaded_rule() {
         let logits: Vec<f32> = (0..VOCAB).map(|token| if token == 5 { 4.0 } else { -1.0 }).collect();
         let bytes: Vec<u8> = logits.iter().flat_map(|value| value.to_ne_bytes()).collect();
-        let batch = BatchScores::new(VOCAB, bytes).unwrap();
+        let batch = ScoreRows::new(VOCAB, bytes).unwrap();
         // Greedy (Checked): the cross-check passes and the id is the argmax.
         let checked = retain_packed_frontier(&batch, 0, FrontierRetain::Checked, None).unwrap();
         assert_eq!(checked.select(None).unwrap(), 5);
         // A packed row whose stored draw is not the argmax must be retained
         // as-is under RecordedSample, and rejected under Checked.
-        let mut drawn = BatchScores::new(VOCAB,
+        let mut drawn = ScoreRows::new(VOCAB,
             logits.iter().flat_map(|value| value.to_ne_bytes()).collect()).unwrap();
         drawn.best[0] = 7;
         assert_eq!(retain_packed_frontier(&drawn, 0, FrontierRetain::RecordedSample, None)
