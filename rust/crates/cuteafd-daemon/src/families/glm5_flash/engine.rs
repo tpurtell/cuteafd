@@ -2198,11 +2198,10 @@ impl<'a> GlmfEngine<'a> {
 
     /// Drains every rank's stream.
     pub(crate) fn synchronize(&self) -> Result<()> {
-        for rank in 0..self.ranks() {
-            // SAFETY: the engine owns these streams.
-            self.on(rank, || unsafe { self.library.cuda_stream_synchronize(self.stream_of(rank)) })?;
-        }
-        Ok(())
+        drain_ranks(self.ranks(), |rank| {
+            // SAFETY: the engine owns these streams and retains all queued operands.
+            self.on(rank, || unsafe { self.library.cuda_stream_synchronize(self.stream_of(rank)) })
+        })
     }
 
     /// Before a sequence's first step: zeroes its KDA state and maps its pool pages.
@@ -4562,6 +4561,16 @@ impl StepLogits {
     }
 }
 
+/// A failed rank must not prevent an attempt to drain the other consumers.
+fn drain_ranks(ranks: usize, mut drain: impl FnMut(usize) -> Result<()>) -> Result<()> {
+    let mut failures = Vec::new();
+    for rank in 0..ranks {
+        if let Err(error) = drain(rank) { failures.push(format!("rank {rank}: {error:#}")); }
+    }
+    ensure!(failures.is_empty(), "GLM Flash stream drainage failed: {}", failures.join("; "));
+    Ok(())
+}
+
 impl Drop for GlmfEngine<'_> {
     fn drop(&mut self) {
         // SAFETY: the engine owns this stream and its resident weights. Drain
@@ -4602,6 +4611,32 @@ pub(crate) fn check_tp2_lanes(lanes: usize) -> Result<()> {
 mod tp2_tests {
     use super::*;
     use crate::shared::peer_split::order;
+
+    #[test]
+    fn rank_drain_attempts_every_consumer_and_retains_all_errors() {
+        let mut attempted = Vec::new();
+        let error = drain_ranks(2, |rank| {
+            attempted.push(rank);
+            anyhow::bail!("injected rank {rank} failure")
+        }).unwrap_err().to_string();
+        assert_eq!(attempted, [0, 1]);
+        assert!(error.contains("rank 0: injected rank 0 failure"));
+        assert!(error.contains("rank 1: injected rank 1 failure"));
+        for failed in [0, 1] {
+            attempted.clear();
+            assert!(drain_ranks(2, |rank| {
+                attempted.push(rank);
+                if rank == failed { anyhow::bail!("injected failure"); }
+                Ok(())
+            }).is_err());
+            assert_eq!(attempted, [0, 1]);
+        }
+        for ranks in [1, 2] {
+            attempted.clear();
+            assert!(drain_ranks(ranks, |rank| { attempted.push(rank); Ok(()) }).is_ok());
+            assert_eq!(attempted, (0..ranks).collect::<Vec<_>>());
+        }
+    }
 
     #[test]
     fn route_payload_is_aligned_with_separate_canonical_sections() {
