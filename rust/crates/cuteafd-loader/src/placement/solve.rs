@@ -85,6 +85,16 @@ fn solve_once(request: &PlacementRequest, flips: &[(AttentionClass, AttentionPla
         || request.movables.iter().any(|m| m.allowed.is_empty() || m.allowed.iter().any(|&g| usize::from(g) >= gpus)) {
         return Err(PlacementError::Inventory("demand on an absent GPU"));
     }
+    for movable in &request.movables {
+        let mut keys = Vec::new();
+        for conditional in &movable.conditional {
+            if usize::from(conditional.placement_gpu) >= gpus || keys.contains(&conditional.placement_gpu)
+                || conditional.demands.iter().any(|d| usize::from(d.gpu) >= gpus) {
+                return Err(PlacementError::Inventory("invalid movable conditional demand"));
+            }
+            keys.push(conditional.placement_gpu);
+        }
+    }
     let split = gpus == 2 && request.inventory.peer_access;
     let tp2 = split && request.layers.iter().any(|l| l.experts.is_some_and(|c| c.tp2));
 
@@ -171,14 +181,33 @@ fn solve_once(request: &PlacementRequest, flips: &[(AttentionClass, AttentionPla
     }
     let available = request.inventory.gpus.iter().map(GpuBudget::available).collect::<Vec<_>>();
 
-    // 3. Mandatory movables on the allowed GPU with the most room, largest first.
+    // 3. Mandatory movables, largest first. Conditional reservations participate
+    // in candidate choice; ordinary movables retain the most-free-GPU policy.
     let mut order: Vec<usize> = (0..request.movables.len()).collect();
-    let total = |m: &Movable| m.parts.iter().map(|p| p.resident).sum::<u64>();
-    order.sort_by_key(|&i| std::cmp::Reverse(total(&request.movables[i])));
+    let totals = request.movables.iter().map(|m| m.parts.iter().try_fold(0u64, |n, p| n.checked_add(p.resident))
+        .ok_or(Overflow("movable"))).collect::<Result<Vec<_>, _>>()?;
+    order.sort_by_key(|&i| std::cmp::Reverse(totals[i]));
     let mut arenas: Vec<Arena> = (0..gpus).map(|_| Arena::default()).collect();
     let mut movables = Vec::new();
+    let mut selected_fixed = request.fixed.clone();
     for index in order {
         let movable = &request.movables[index];
+        if !movable.conditional.is_empty() {
+            let (gpu, candidate_used, candidate_arenas, demands) = conditional_movable(
+                request, movable, &available, &used, &arenas, &unit_bytes, context)?;
+            used = candidate_used;
+            arenas = candidate_arenas;
+            if !movable.expert_arena {
+                items[gpu].push(Item::new(Category::Drafter, format!("{:?}", movable.id), "",
+                    totals[index], Basis::Exact));
+            }
+            selected_fixed.extend(demands.iter().cloned());
+            for demand in demands {
+                items[usize::from(demand.gpu)].push(Item::new(demand.category, demand.group, "", demand.bytes, demand.basis));
+            }
+            movables.push((movable.id, gpu as u8));
+            continue;
+        }
         let gpu = usize::from(*movable.allowed.iter()
             .max_by_key(|&&g| (available[usize::from(g)].saturating_sub(used[usize::from(g)] + arenas[usize::from(g)].peak), std::cmp::Reverse(g)))
             .expect("allowed is non-empty"));
@@ -201,7 +230,7 @@ fn solve_once(request: &PlacementRequest, flips: &[(AttentionClass, AttentionPla
     let first_moe = request.layers.iter().position(|l| l.experts.is_some()).unwrap_or(request.layers.len());
     for gpu in 0..gpus {
         if available[gpu].checked_sub(used[gpu] + arenas[gpu].peak).is_none() {
-            return Err(PlacementError::Mandatory { gpu: gpu as u8, what: describe(&request.fixed, gpu, &movables) });
+            return Err(PlacementError::Mandatory { gpu: gpu as u8, what: describe(&selected_fixed, gpu, &movables) });
         }
     }
     let fixed_layers = match request.onboard.layers(routed) {
@@ -238,7 +267,7 @@ fn solve_once(request: &PlacementRequest, flips: &[(AttentionClass, AttentionPla
                 if !fallback { return Err(match request.pool.requested {
                     Some(requested) => PlacementError::PoolDoesNotFit { requested, fit: 0 },
                     None => PlacementError::Mandatory { gpu: 0,
-                        what: format!("a {floor}-token pool beside {}", describe(&request.fixed, 0, &movables)) },
+                        what: format!("a {floor}-token pool beside {}", describe(&selected_fixed, 0, &movables)) },
                 }); }
                 let mut trial = request.clone();
                 trial.onboard = Onboard::Layers(0);
@@ -303,7 +332,7 @@ fn solve_once(request: &PlacementRequest, flips: &[(AttentionClass, AttentionPla
         }
     };
     if units == 0 {
-        return Err(PlacementError::Mandatory { gpu: 0, what: format!("one KV unit beside {}", describe(&request.fixed, 0, &movables)) });
+        return Err(PlacementError::Mandatory { gpu: 0, what: format!("one KV unit beside {}", describe(&selected_fixed, 0, &movables)) });
     }
     let units = if context {
         if request.pool.requested.is_some() && units % 2 != 0 {
@@ -419,6 +448,65 @@ fn residual_plan(modes: &[LayerMode], spec: &HopSpec, gpus: usize) -> (Vec<Resid
     }
     let hops = if gpus == 2 { plan_hops(modes, spec) } else { Vec::new() };
     (homes, hops)
+}
+
+/// Try cross-device reservations before selecting a movable's home. Ordinary
+/// movables retain their historical most-free-device policy.
+#[allow(clippy::type_complexity)]
+fn conditional_movable(request: &PlacementRequest, movable: &Movable, available: &[u64],
+    used: &[u64], arenas: &[Arena], unit_bytes: &[u64], context: bool)
+    -> Result<(usize, Vec<u64>, Vec<Arena>, Vec<Demand>), PlacementError> {
+    let resident = movable.parts.iter().try_fold(0u64, |n, p| n.checked_add(p.resident))
+        .ok_or(PlacementError::Overflow("movable"))?;
+    let mut best: Option<((u64, u64, std::cmp::Reverse<u8>), usize, Vec<u64>, Vec<Arena>, Vec<Demand>)> = None;
+    let mut refusal = None;
+    for &home in &movable.allowed {
+        let gpu = usize::from(home);
+        let mut trial_used = used.to_vec();
+        let mut trial_arenas = arenas.to_vec();
+        if movable.expert_arena {
+            trial_arenas[gpu].open(request.expert_workspace);
+            for &part in &movable.parts { trial_arenas[gpu].add(part)?; }
+        } else {
+            trial_used[gpu] = trial_used[gpu].checked_add(resident)
+                .ok_or(PlacementError::Overflow("movable"))?;
+        }
+        let demands = movable.conditional.iter().find(|d| d.placement_gpu == home)
+            .map_or_else(Vec::new, |d| d.demands.clone());
+        for demand in &demands {
+            let charged = usize::from(demand.gpu);
+            trial_used[charged] = trial_used[charged].checked_add(demand.bytes)
+                .ok_or(PlacementError::Overflow("movable conditional demand"))?;
+        }
+        let totals = trial_used.iter().zip(&trial_arenas).map(|(&bytes, arena)|
+            bytes.checked_add(arena.peak).ok_or(PlacementError::Overflow("movable candidate peak")))
+            .collect::<Result<Vec<_>, _>>()?;
+        if let Some(charged) = (0..available.len()).find(|&g| totals[g] > available[g]) {
+            refusal.get_or_insert_with(|| PlacementError::Mandatory { gpu: charged as u8,
+                what: format!("{:?}, {}", movable.id, describe(&demands, charged, &[])) });
+            continue;
+        }
+        let fit = pool_fit(available, &trial_used, &trial_arenas, unit_bytes);
+        let fit = if context { fit / 2 * 2 } else { fit };
+        let required = request.pool.requested.map_or(request.pool.floor, |n| n.max(request.pool.floor))
+            .div_ceil(request.pool.unit_rows);
+        if fit < required {
+            refusal.get_or_insert_with(|| match request.pool.requested {
+                Some(requested) => PlacementError::PoolDoesNotFit { requested,
+                    fit: fit.saturating_mul(request.pool.unit_rows) },
+                None => PlacementError::BelowFloor { pool: fit.saturating_mul(request.pool.unit_rows),
+                    floor: request.pool.floor, layers: 0,
+                    short: request.pool.floor.saturating_sub(fit.saturating_mul(request.pool.unit_rows)) },
+            });
+            continue;
+        }
+        let score = (fit, available[gpu] - totals[gpu], std::cmp::Reverse(home));
+        if best.as_ref().is_none_or(|(previous, ..)| score > *previous) {
+            best = Some((score, gpu, trial_used, trial_arenas, demands));
+        }
+    }
+    best.map(|(_, gpu, used, arenas, demands)| (gpu, used, arenas, demands))
+        .ok_or_else(|| refusal.unwrap_or(PlacementError::Inventory("no movable candidate")))
 }
 
 /// Whole units every KV-owning GPU holds beside what is charged and its arena.

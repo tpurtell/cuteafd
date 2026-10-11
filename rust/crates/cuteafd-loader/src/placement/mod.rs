@@ -267,10 +267,21 @@ pub struct Movable {
     pub id: MovableId,
     /// Loaded in order; each part's staging is transient.
     pub parts: Vec<Bytes2>,
-    /// Allowed GPUs; the solver takes the one with the most free bytes.
+    /// Allowed GPUs; most free bytes for ordinary movables, best remaining
+    /// pool capacity for candidates with conditional demands.
     pub allowed: Vec<u8>,
     /// Shares the GPU's local expert arena (workspace and peak accounting).
     pub expert_arena: bool,
+    /// Additional fixed demands keyed by the selected placement GPU. An absent
+    /// key adds nothing; dormant keys may name a present, currently disallowed GPU.
+    pub conditional: Vec<MovableDemands>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MovableDemands {
+    pub placement_gpu: u8,
+    /// Charged on each demand's GPU, which need not be the movable's home.
+    pub demands: Vec<Demand>,
 }
 
 /// How many routed-expert layers are RTX-resident (`RTX_EXPERT_LAYERS`,

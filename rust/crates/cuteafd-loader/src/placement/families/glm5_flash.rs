@@ -135,7 +135,7 @@ pub fn request(i: &GlmfInputs<'_>) -> Result<PlacementRequest, PlacementError> {
             i.requested_pool, geometry.logical_unit_rows, i.spark_ranks == 0),
         layers, pool_overhead: geometry.ranks.iter().map(|g| g.pool_metadata_unit_bytes).collect(), fixed,
         movables: if i.drafter_bytes == 0 { vec![] } else { vec![Movable { id: MovableId::Drafter,
-            parts: vec![Bytes2 { resident: i.drafter_bytes, staging: 0 }], allowed: vec![0], expert_arena: false }] },
+            parts: vec![Bytes2 { resident: i.drafter_bytes, staging: 0 }], allowed: vec![0], expert_arena: false, conditional: vec![] }] },
         expert_workspace: i.expert_workspace, tp2_workspace: i.tp2_workspace, onboard: i.onboard,
         expert_gpus: usize::from(ranks == 1 || i.experts.iter().all(|cost| cost.tp2)),
         policy: LayerPolicy { default: if ranks == 2 { vec![LayerMode::HeadSplit] } else {
@@ -364,6 +364,13 @@ mod tests {
         assert_eq!(expert_workspace(&catalog, Some(&path), 4096, 1).unwrap(), 12345);
         assert_eq!(expert_workspace(&catalog, Some(&path), 4096, 2).unwrap(), 67890 + 4096 * 4096 * 2);
         assert!(expert_workspace(&catalog, Some(&path), 4097, 2).is_err());
+        // Measured GLMf TP2 package ABI maxima, plus its owned BF16 output.
+        std::fs::write(package.join("manifest.json"), serde_json::json!({"layouts": {
+            "tp2": {"capacities":[{"capacity":1024,"scratch_bytes":163779584},
+                {"capacity":4096,"scratch_bytes":734346240}]}}}).to_string()).unwrap();
+        for (rows, scratch) in [(1024, 163779584), (4096, 734346240)] {
+            assert_eq!(expert_workspace(&catalog, Some(&path), rows, 2).unwrap(), scratch + rows * 4096 * 2);
+        }
         let cfg = GlmNextConfig::from_hf(&config).unwrap();
         let checkpoint = crate::plan::Checkpoint::open(dir.path()).unwrap();
         assert_eq!(crate::families::glm5_flash::resident::router_replica_bytes(&checkpoint, &cfg, 2).unwrap(),
