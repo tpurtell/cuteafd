@@ -423,9 +423,11 @@ fn serve_loop<'w, 'a, P: ServingTarget<'w, 'a>, const SHARED_PREFILL: bool>(lib:
                 }
                 let resume = if images.is_empty() { prompt.len() } else {
                     let source_end = requests.cache().committed_end(lease)? as usize;
-                    if requests.cache().stage(lease)? == crate::families::deepseek_v41::v41_backbone_cache::CacheStage::EncoderReplay {
+                    let start = if requests.cache().stage(lease)? == crate::families::deepseek_v41::v41_backbone_cache::CacheStage::EncoderReplay {
                         requests.cache().history_end(lease)? as usize
-                    } else { source_end }
+                    } else { source_end };
+                    // Encode only when a span from the restored frontier on lacks features.
+                    if requests.images(lease)?.needed(start, prompt.len())?.is_empty() { prompt.len() } else { start }
                 };
                 Ok((image_keys, hit, restore, resume))
             })();
@@ -453,10 +455,11 @@ fn serve_loop<'w, 'a, P: ServingTarget<'w, 'a>, const SHARED_PREFILL: bool>(lib:
                     continue;
                 }
             };
-            if resume < prepared.prompt.len() && !prepared.images.is_empty() {
+            if resume < prepared.prompt.len() {
                 // Encode what the restored frontier still needs; the lease waits.
-                let leased = admission::Leased { prepared, id, lease, slot, image_keys, hit, restore, started: Instant::now() };
-                if let Err((leased, error)) = media.enqueue(leased, resume) {
+                let leased = admission::Leased { prepared, id, lease, slot, image_keys, hit, restore, resume,
+                    started: Instant::now() };
+                if let Err((leased, error)) = media.enqueue(leased) {
                     leased.fail(error, requests, draft.as_deref_mut())?;
                 }
                 continue;
@@ -599,6 +602,7 @@ fn serve_loop<'w, 'a, P: ServingTarget<'w, 'a>, const SHARED_PREFILL: bool>(lib:
             draft.as_deref_mut(), &mut prefixes, receive,
             admission::Wake { media_pending: media.len() > 0,
                 media_slots: media.len() + parked,
+                host_pending: !media.full() && !media.backlog.is_empty(),
                 retry: kv_waiter.pending().map(|prepared| (&prepared.job, requests.release_epoch())),
                 prefill_deadline: decode_started.filter(|_| parked > 0)
                     .map(|started| started + Duration::from_secs_f64(prefills.decode_seconds())) }));
