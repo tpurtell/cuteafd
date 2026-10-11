@@ -576,7 +576,7 @@ fn schedule_inner(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path
             if snapshot_waiter.as_ref().is_some_and(|ready| prefills.iter().any(|p|
                 !p.job.events.is_closed() && !probe::cold(&p.job.probe)
                 && snapshot_extension(&p.keys, &ready.job().keys, prefix.prefix_cache_min_tokens))) { break; }
-            let ready = if let Some(ready) = snapshot_waiter.take() { ready } else { match kv_waiter.poll(cache.pool().free(), cache.pool().release_epoch(), busy,
+            let ready = if let Some(ready) = snapshot_waiter.take() { ready } else { match kv_waiter.poll(cache.pool().admission_free(), cache.pool().release_epoch(), busy,
                 |ready| ready.job().job.events.is_closed()) {
                 cuteafd_engine::prefix::AdmissionPoll::Blocked => break,
                 cuteafd_engine::prefix::AdmissionPoll::Ready(ready) => ready,

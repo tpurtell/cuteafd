@@ -475,7 +475,7 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
         }
         while active.len() + prefills.len() < max_sequences {
             let busy = !active.is_empty() || !prefills.is_empty();
-            let job = match kv_waiter.poll(cache.pool().free(), cache.pool().release_epoch(), busy, |job| job.events.is_closed()) {
+            let job = match kv_waiter.poll(cache.pool().admission_free(), cache.pool().release_epoch(), busy, |job| job.events.is_closed()) {
                 cuteafd_engine::prefix::AdmissionPoll::Blocked => break,
                 cuteafd_engine::prefix::AdmissionPoll::Ready(job) => job,
                 cuteafd_engine::prefix::AdmissionPoll::Empty => {

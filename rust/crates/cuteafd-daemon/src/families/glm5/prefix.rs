@@ -71,6 +71,7 @@ impl PrefixFamily for GlmPrefix<'_, '_> {
             draft_bytes: 0,
             rule: if self.partial { ReuseRule::paged(PAGE_ROWS) } else { ReuseRule::EXACT },
             mark_store: MarkStore::Arena,
+            page_owners: Default::default(),
         }
     }
 

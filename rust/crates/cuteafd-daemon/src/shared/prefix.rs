@@ -228,7 +228,7 @@ mod tests {
     #[test]
     fn mimo_cap_preserves_explicit_disabled_and_fixed_budgets() {
         let layout = FamilyLayout { page_rows: 64, pages: 1024, page_bytes: 65536, mark_bytes: 4096,
-            draft_bytes: 0, rule: cuteafd_core::prefix::ReuseRule::EXACT, mark_store: Default::default() };
+            draft_bytes: 0, rule: cuteafd_core::prefix::ReuseRule::EXACT, mark_store: Default::default(), page_owners: Default::default() };
         let mut disabled = Cli::parse_from(["serve", "--host-cache-bytes", "0"]).prefix;
         disabled.mimo_host_cap = true;
         assert!(disabled.host_config(layout, 32768).unwrap().is_none());
@@ -278,11 +278,11 @@ mod tests {
             .unwrap();
         assert_eq!(cli.prefix.host_cache_bytes, HostBudget::Auto);
         let invalid = FamilyLayout { page_rows: 0, pages: 0, page_bytes: 0, mark_bytes: 0,
-            draft_bytes: 0, rule: cuteafd_core::prefix::ReuseRule::EXACT, mark_store: Default::default() };
+            draft_bytes: 0, rule: cuteafd_core::prefix::ReuseRule::EXACT, mark_store: Default::default(), page_owners: Default::default() };
         assert!(cli.prefix.host_config(invalid, 0).unwrap().is_none());
         let cli = Cli::parse_from(["serve", "--host-cache-bytes", "64GiB"]);
         let layout = FamilyLayout { page_rows: 64, pages: 1024, page_bytes: 65536, mark_bytes: 4096,
-            draft_bytes: 0, rule: cuteafd_core::prefix::ReuseRule::EXACT, mark_store: Default::default() };
+            draft_bytes: 0, rule: cuteafd_core::prefix::ReuseRule::EXACT, mark_store: Default::default(), page_owners: Default::default() };
         let config = cli.prefix.host_config(layout, 32768).unwrap().unwrap();
         assert_eq!((config.bytes, config.max_tokens), (64 << 30, 32768));
     }

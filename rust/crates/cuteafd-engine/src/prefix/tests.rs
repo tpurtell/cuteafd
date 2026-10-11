@@ -137,7 +137,7 @@ impl Fake {
         FamilyLayout { page_rows: ROWS, pages: self.pages, page_bytes: ROWS * ROW,
             mark_bytes: if self.markless { 0 } else { WINDOW * ROW }, draft_bytes: 0, rule: self.rule,
             mark_store: if self.pooled { MarkStore::Pool { pages: MARK_PAGES, reserved: self.reserved } }
-                else { MarkStore::Arena } }
+                else { MarkStore::Arena }, page_owners: Default::default() }
     }
     /// Row `i` of the mark held in pool `pages`.
     fn mark_row(&self, pages: &[u32], i: usize) -> DeviceRange {

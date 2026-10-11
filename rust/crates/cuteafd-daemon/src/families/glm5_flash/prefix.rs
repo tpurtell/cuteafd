@@ -347,6 +347,7 @@ impl PrefixFamily for GlmfPrefix<'_, '_> {
             rule: ReuseRule::EXACT,
             mark_store: if self.mark_units > 0 { MarkStore::Pool { pages: self.mark_units, reserved: RESERVED_UNITS } }
                 else { MarkStore::Arena },
+            page_owners: Default::default(),
         }
     }
 
