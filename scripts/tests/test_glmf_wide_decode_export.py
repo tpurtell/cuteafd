@@ -37,7 +37,8 @@ def exporter(monkeypatch):
         monkeypatch.setenv(name, "1")
     monkeypatch.setitem(sys.modules, "_pinned_sparkinfer", types.SimpleNamespace(REVISION="test"))
     package = types.ModuleType("b12x.integration.cuteafd")
-    for name in ("glmf", "dsv4_mhc", "glm_sparse_mla", "context_split", "qwen4", "qwen4_gdn", "qwen4_attention"):
+    for name in ("glmf", "dsv4_mhc", "glm_sparse_mla", "context_split", "qwen4", "qwen4_gdn", "qwen4_attention",
+                 "glm_attention"):
         module = _Compilers(f"b12x.integration.cuteafd.{name}")
         setattr(package, name, module)
         monkeypatch.setitem(sys.modules, module.__name__, module)
@@ -216,6 +217,21 @@ def test_context_split_opt_in_geometry(exporter, family, heads, index_topk, pool
         assert layouts["paged_staging_gather_swa"] == 149760
     else:
         assert layouts["paged_staging_gather_kv"] == record_bytes*64
+
+
+def test_glm_context_producers_write_the_assembled_query_half(exporter):
+    g = types.SimpleNamespace(heads=32, latent_dim=576)
+    work = exporter.glm_context_producers(g, 64)
+    calls = {stem: (params, thunk()) for stem, _, params, thunk in work}
+    assert set(calls) == {"producer_q2_m64", "producer_q2_bf16_m64"}
+    for stem, (params, call) in calls.items():
+        assert params["query_row"] == 2 * 32 * 576 and call[3]["query_row"] == 2 * 32 * 576
+        assert call[3]["max_rows"] == 64
+    assert calls["producer_q2_m64"][1][3]["fp8_only"] == "decode"
+    assert "fp8_only" not in calls["producer_q2_bf16_m64"][1][3]
+    source = EXPORTER.read_text()
+    assert 'if "glm" in geometries and "glm2" in geometries:' in source
+    assert source.index('glm_context_producers(half, args.decode_rows)') > source.index('if args.context_split == "on":')
 
 
 def test_context_split_programs_append_after_every_other_program_when_switched_on():

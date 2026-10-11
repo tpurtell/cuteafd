@@ -532,6 +532,20 @@ def qwen4_programs(g, decode_rows: int, prefill_rows: int, max_context: int):
     return out
 
 
+def glm_context_producers(g, decode_rows: int):
+    """GLM 5.x head-split (``g`` the half geometry) decode producers whose ``query`` rows are
+    ``2 * heads * latent`` apart: the context-split engine points ``query`` at this GPU's half
+    of the assembled query, so the query exchange pushes only the peer's copy."""
+    from b12x.integration.cuteafd import glm_attention as attn
+    row = 2 * g.heads * g.latent_dim
+    return [
+        (f"producer_q2_m{decode_rows}", "producer", {"max_rows": decode_rows, "fp8_only": "decode", "query_row": row},
+         lambda: attn.compile_glm_producer_aot(g, max_rows=decode_rows, fp8_only="decode", query_row=row)),
+        (f"producer_q2_bf16_m{decode_rows}", "producer", {"max_rows": decode_rows, "weights": "bf16", "query_row": row},
+         lambda: attn.compile_glm_producer_aot(g, max_rows=decode_rows, query_row=row)),
+    ]
+
+
 def context_split_programs(g, decode_rows: int, max_context: int):
     """Opt-in K1 primitives only; never change a serving table by default."""
     from b12x.integration.cuteafd import context_split as split
@@ -695,6 +709,12 @@ def main() -> None:
         for name in (n for n in geometries if n in bases):
             work += [(families[name], *item) for item in context_split_programs(
                 bases[name], args.decode_rows, geometry_context(name, args.max_context))]
+        if "glm" in geometries and "glm2" in geometries:
+            # GLM 5.3 context decode: each GPU's head-split producer writes its heads straight
+            # into its half of the two-GPU assembled query (rows 2 x heads x 576 apart).
+            half = dataclasses.replace(GLM53, name="glm53_tp2", heads=GLM53.heads // 2,
+                                       dense_inter=GLM53.dense_inter // 2, moe_inter=GLM53.moe_inter // 2)
+            work += [("glm2", *item) for item in glm_context_producers(half, args.decode_rows)]
     for family, suffix, op, params, thunk in work:
         if selected is not None and suffix not in selected:
             continue

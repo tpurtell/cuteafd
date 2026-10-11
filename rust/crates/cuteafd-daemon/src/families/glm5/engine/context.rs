@@ -70,6 +70,9 @@ pub(super) struct GlmContextSplit<'a> {
     partial: [[Vec<(usize, String)>; 2]; 2],
     /// `lse_combine2`'s sink operand (unused without a sink; GLM 5.3 has none).
     sink: [Dev<'a>; 2],
+    /// The build carries `glm2_producer_q2_*`: decode producers write straight into this GPU's
+    /// half of the assembled query, and the query exchange pushes only the peer's copy.
+    in_place_query: bool,
 }
 
 /// The `glm_sparse_mla_partial_h{begin}_s{N}_m64` variants this GPU runs, as (row cap, program)
@@ -154,7 +157,9 @@ impl<'a> GlmContextSplit<'a> {
         let (r0, s0) = rank(0, &mut first)?;
         let (r1, s1) = rank(1, &mut second)?;
         partial = [first, second];
-        Ok(Self { ranks: [r0, r1], exchange, staging_pages, partial, sink: [s0, s1] })
+        let in_place_query = ["glm2_producer_q2_m64", "glm2_producer_q2_bf16_m64"].iter()
+            .all(|name| engine.programs.spec(name).is_ok());
+        Ok(Self { ranks: [r0, r1], exchange, staging_pages, partial, sink: [s0, s1], in_place_query })
     }
 
     /// Bytes this split allocated on each GPU beside the exchange (the solver's
@@ -226,10 +231,17 @@ impl<'a> GlmEngine<'a> {
         let (kv, index_cache, _) = self.rank_caches(rank, index);
         let half_heads = self.cfg.heads / 2;
         let query_half = half_heads * 576 * 2;
-        // The producer's query rows are `[t, H/2, 576]` contiguous: into this GPU's
-        // workspace query, then pushed into both assembled buffers.
-        self.producer(rank, w, layer, rows, "m64", kv.buffer, w.query.buffer.ptr)?;
-        exchange.push_query(rank, s, w.query.buffer.ptr, query_half, t)?;
+        if split.in_place_query {
+            // The q2 producer writes this GPU's heads into its half of the assembled query (rows
+            // two halves apart): the exchange then pushes only the peer's copy.
+            let own: *mut c_void = exchange.buffers(rank, s)?.query.cast::<u8>().wrapping_add(rank * query_half).cast();
+            self.producer_as(rank, w, layer, rows, "m64", kv.buffer, own, "producer_q2")?;
+            exchange.push_query(rank, s, own, 2 * query_half, t)?;
+        } else {
+            // Contiguous query rows into the workspace, then into both assembled buffers.
+            self.producer(rank, w, layer, rows, "m64", kv.buffer, w.query.buffer.ptr)?;
+            exchange.push_query(rank, s, w.query.buffer.ptr, query_half, t)?;
+        }
         if let Some(index_cache) = index_cache {
             self.index_producer(rank, w, layer, rows, "m64", index_cache.buffer)?;
             let k = self.cfg.index_topk;

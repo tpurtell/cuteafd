@@ -1828,9 +1828,17 @@ impl<'a> GlmEngine<'a> {
     #[allow(clippy::too_many_arguments)]
     fn producer(&self, rank: usize, w: &Workspace<'_>, layer: &GlmLayer<'_>, rows: Scalar, cap: &str,
         kv: cuteafd_ffi::CuteafdDeviceBuffer, query: *mut c_void) -> Result<()> {
+        self.producer_as(rank, w, layer, rows, cap, kv, query, "producer")
+    }
+
+    /// [`Self::producer`] through the `glm_{stem}_[bf16_]{cap}` program (`producer_q2`: query rows
+    /// two head halves apart, into a context split's assembled query).
+    #[allow(clippy::too_many_arguments)]
+    fn producer_as(&self, rank: usize, w: &Workspace<'_>, layer: &GlmLayer<'_>, rows: Scalar, cap: &str,
+        kv: cuteafd_ffi::CuteafdDeviceBuffer, query: *mut c_void, stem: &str) -> Result<()> {
         let (_, _, cos_sin) = self.rank_caches(rank, 0);
         let bf16 = layer.range("w_q_b").is_some();
-        let variant = if bf16 { format!("glm_producer_bf16_{cap}") } else { format!("glm_producer_{cap}") };
+        let variant = if bf16 { format!("glm_{stem}_bf16_{cap}") } else { format!("glm_{stem}_{cap}") };
         let mut producer = vec![("x", w.x.buffer.ptr), ("positions", w.positions.buffer.ptr),
             ("kv_slots", w.slots.buffer.ptr), ("cos_sin", cos_sin.buffer.ptr)];
         producer.extend(weight(layer, "w_qkv_a", cap)?);
