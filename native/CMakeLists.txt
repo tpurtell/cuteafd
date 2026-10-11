@@ -32,6 +32,8 @@ if(DEFINED CUTEAFD_V41_SPARK_TP_ROLES AND NOT CUTEAFD_V41_SPARK_TP_ROLES STREQUA
 endif()
 set(CUTEAFD_EXPERT_FAMILIES "" CACHE STRING
   "Extra SM121 routed-expert kernel families as FAMILY:ROLE (e.g. dsv4f:spark)")
+set(CUTEAFD_GENERIC_SPARK_COUNTS "" CACHE STRING
+  "Opt-in generic EXL3/FP8/NVFP4 Spark TP counts (1..8, semicolon list); empty preserves packaged defaults")
 option(CUTEAFD_V41_VOCAB_ROW_EXPERIMENT "Use experimental single-row FP32 vocabulary projection" OFF)
 option(CUTEAFD_ENABLE_EXL3_PACKAGES "Build loadable mixed EXL3 expert packages" OFF)
 # Deprecated spelling, accepted for one release.

@@ -64,15 +64,27 @@ or (glm|glmf|qwen4):nvfp4[a4] (ModelOpt NVFP4, W4A16 or W4A4 large-row steps)")
   if(CUTEAFD_FP8_MOE_ROLE STREQUAL "spark")
     set(exact_slices "--exact-slices")
   endif()
+  set(requested_layouts)
+  if(CUTEAFD_FP8_MOE_ROLE STREQUAL "spark" AND NOT CUTEAFD_GENERIC_SPARK_COUNTS STREQUAL "")
+    foreach(count IN LISTS CUTEAFD_GENERIC_SPARK_COUNTS)
+      if(NOT count MATCHES "^[1-8]$")
+        message(FATAL_ERROR "CUTEAFD_GENERIC_SPARK_COUNTS requires counts 1..8, got ${count}")
+      endif()
+      list(APPEND requested_layouts "tp${count}")
+    endforeach()
+    list(REMOVE_DUPLICATES requested_layouts)
+    list(JOIN requested_layouts "," requested_layout_csv)
+    set(requested_layouts --layouts "${requested_layout_csv}")
+  endif()
   set(stamp "${CMAKE_CURRENT_BINARY_DIR}/fp8_moe_${geometry}.stamp")
-  file(GENERATE OUTPUT "${stamp}" CONTENT "role=${CUTEAFD_FP8_MOE_ROLE}|capacities=${CUTEAFD_FP8_MOE_CAPACITIES}|${exact_slices}\n")
+  file(GENERATE OUTPUT "${stamp}" CONTENT "role=${CUTEAFD_FP8_MOE_ROLE}|capacities=${CUTEAFD_FP8_MOE_CAPACITIES}|${exact_slices}|${requested_layouts}\n")
   add_custom_command(
     OUTPUT "${package}/manifest.json"
     COMMAND ${CUTEAFD_SPARKINFER_VERIFY_COMMAND}
     COMMAND "${CMAKE_COMMAND}" -E rm -rf "${package}"
     COMMAND "${CMAKE_COMMAND}" -E env ${CUTEAFD_SPARKINFER_PYTHON_ENV}
       "${Python3_EXECUTABLE}" "${CUTEAFD_FP8_MOE_TOOL}" build
-      --role "${CUTEAFD_FP8_MOE_ROLE}" --geometry "${geometry}" --capacities "${CUTEAFD_FP8_MOE_CAPACITIES}" ${exact_slices}
+      --role "${CUTEAFD_FP8_MOE_ROLE}" --geometry "${geometry}" --capacities "${CUTEAFD_FP8_MOE_CAPACITIES}" ${exact_slices} ${requested_layouts}
       --build-dir "${CMAKE_CURRENT_BINARY_DIR}/fp8_moe_exports" --output "${package}"
       --cxx "${CMAKE_CXX_COMPILER}" --cuda-include "${CUTEAFD_FP8_MOE_CUDA_INCLUDE}"
       --cuda-libdir "$<TARGET_FILE_DIR:CUDA::cudart>" --runtime "${CUTEAFD_B12X_AOT_RUNTIME_LIBRARY}"
@@ -89,7 +101,7 @@ or (glm|glmf|qwen4):nvfp4[a4] (ModelOpt NVFP4, W4A16 or W4A4 large-row steps)")
       COMMAND "${CMAKE_COMMAND}" -E rm -rf "${bf16_package}"
       COMMAND "${CMAKE_COMMAND}" -E env ${CUTEAFD_SPARKINFER_PYTHON_ENV}
         "${Python3_EXECUTABLE}" "${CUTEAFD_FP8_MOE_TOOL}" build
-        --role spark --input bf16 --geometry "${geometry}" --capacities "${CUTEAFD_FP8_MOE_CAPACITIES}" ${exact_slices}
+        --role spark --input bf16 --geometry "${geometry}" --capacities "${CUTEAFD_FP8_MOE_CAPACITIES}" ${exact_slices} ${requested_layouts}
         --build-dir "${CMAKE_CURRENT_BINARY_DIR}/fp8_moe_exports_bf16" --output "${bf16_package}"
         --cxx "${CMAKE_CXX_COMPILER}" --cuda-include "${CUTEAFD_FP8_MOE_CUDA_INCLUDE}"
         --cuda-libdir "$<TARGET_FILE_DIR:CUDA::cudart>" --runtime "${CUTEAFD_B12X_AOT_RUNTIME_LIBRARY}"

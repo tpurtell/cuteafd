@@ -254,6 +254,10 @@ def layout_geometry(base, layout: str):
     """``tp<n>`` (padded) or ``tp<n>-w<width>`` (exact) -> (tp, geometry)."""
     tp_part, _, width = layout.partition("-w")
     tp = int(tp_part.removeprefix("tp"))
+    if tp not in range(1, 9):
+        raise SystemExit(f"{layout}: Spark TP must be in 1..8")
+    if tp in (1, 5, 7, 8) and not exact_widths(base.intermediate, tp):
+        raise SystemExit(f"{layout}: intermediate {base.intermediate} needs a nonempty whole-H128 slice per rank")
     g = base.with_tp(tp)
     if width:
         if int(width) not in exact_widths(base.intermediate, tp):

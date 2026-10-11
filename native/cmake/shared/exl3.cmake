@@ -167,6 +167,39 @@ foreach(entry IN LISTS CUTEAFD_EXPERT_FAMILIES)
   if(CUTEAFD_EXL3_ROLE STREQUAL "spark" AND NOT CUTEAFD_EXL3_GEOMETRY STREQUAL "qwen4")
     list(APPEND CUTEAFD_EXL3_GEOMETRY_LAYOUTS tp6-rank0 tp6-rank1 tp6-rank2 tp6-rank3 tp6-rank4 tp6-rank5)
   endif()
+  set(CUTEAFD_EXL3_PROFILE_ARGS)
+  if(CUTEAFD_EXL3_ROLE STREQUAL "spark" AND NOT CUTEAFD_GENERIC_SPARK_COUNTS STREQUAL "")
+    if(CUTEAFD_EXL3_GEOMETRY STREQUAL "qwen4")
+      set(intermediate_blocks 5)
+    elseif(CUTEAFD_EXL3_GEOMETRY STREQUAL "dsv4p")
+      set(intermediate_blocks 24)
+    else()
+      set(intermediate_blocks 16)
+    endif()
+    set(CUTEAFD_EXL3_GEOMETRY_LAYOUTS)
+    set(requested_profiles)
+    foreach(count IN LISTS CUTEAFD_GENERIC_SPARK_COUNTS)
+      if(NOT count MATCHES "^[1-8]$" OR count GREATER intermediate_blocks)
+        message(FATAL_ERROR "${CUTEAFD_EXL3_GEOMETRY}: TP${count} requires a nonempty H128 slice on each of 1..8 ranks")
+      endif()
+      math(EXPR last_rank "${count} - 1")
+      foreach(rank RANGE 0 ${last_rank})
+        list(APPEND CUTEAFD_EXL3_GEOMETRY_LAYOUTS "tp${count}-rank${rank}")
+        math(EXPR blocks "${intermediate_blocks} / ${count}")
+        math(EXPR remainder "${intermediate_blocks} % ${count}")
+        if(rank LESS remainder)
+          math(EXPR blocks "${blocks} + 1")
+        endif()
+        math(EXPR width "${blocks} * 128")
+        list(APPEND requested_profiles "tp${count}-width${width}")
+      endforeach()
+    endforeach()
+    list(REMOVE_DUPLICATES CUTEAFD_EXL3_GEOMETRY_LAYOUTS)
+    list(REMOVE_DUPLICATES requested_profiles)
+    foreach(profile IN LISTS requested_profiles)
+      list(APPEND CUTEAFD_EXL3_PROFILE_ARGS --profile "${profile}")
+    endforeach()
+  endif()
   list(JOIN CUTEAFD_EXL3_GEOMETRY_LAYOUTS "," CUTEAFD_EXL3_GEOMETRY_REQUIRE)
   string(JOIN "|" CUTEAFD_EXL3_CONFIG_KEY "geometry=${CUTEAFD_EXL3_GEOMETRY}" "role=${CUTEAFD_EXL3_ROLE}"
     "layouts=${CUTEAFD_EXL3_GEOMETRY_REQUIRE}" "capacities=${CUTEAFD_V41_EXL3_CAPACITIES}"
@@ -180,7 +213,7 @@ foreach(entry IN LISTS CUTEAFD_EXPERT_FAMILIES)
       --role "${CUTEAFD_EXL3_ROLE}" --geometry "${CUTEAFD_EXL3_GEOMETRY}"
       --capacities "${CUTEAFD_EXL3_CAPACITIES_ARG}"
       --bits ${CUTEAFD_EXL3_FAMILY_TIERS}
-      --require-layout "${CUTEAFD_EXL3_GEOMETRY_REQUIRE}"
+      --require-layout "${CUTEAFD_EXL3_GEOMETRY_REQUIRE}" ${CUTEAFD_EXL3_PROFILE_ARGS}
       --build-dir "${CMAKE_CURRENT_BINARY_DIR}/exl3_exports/${CUTEAFD_EXL3_GEOMETRY}-k${CUTEAFD_EXL3_FAMILY_TAG}"
       --output "${CUTEAFD_EXL3_PACKAGE}"
       --cxx "${CMAKE_CXX_COMPILER}" --cuda-include "${CUTEAFD_EXL3_CUDA_INCLUDE}"

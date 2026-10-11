@@ -732,6 +732,7 @@ timeout "$export_timeout" --foreground docker run --rm --name "$coordinator_expo
   "${release_build_user_args[@]}" \
   "${compiler_cache_args[@]}" \
   -e "CUTEAFD_RELEASE_EXPERT_FAMILIES=${CUTEAFD_RELEASE_EXPERT_FAMILIES:-}" \
+  -e "CUTEAFD_RELEASE_GENERIC_SPARK_COUNTS=${CUTEAFD_RELEASE_GENERIC_SPARK_COUNTS:-}" \
   -e "CUTEAFD_RELEASE_FP8_MOE_BF16_FAMILIES=$bf16_families" \
   -e "CUTEAFD_RELEASE_AUDIO_AOT=$audio_aot" \
   ${native_build_env_args[@]+"${native_build_env_args[@]}"} \
@@ -997,6 +998,7 @@ docker run --rm --name "$export_container" \
   -e "CUTEAFD_RELEASE_EXL3_PAIRED_TP4=$exl3_paired_tp4" \
   -e "CUTEAFD_RELEASE_SPARK_TP_ROLES=$spark_tp_roles" \
   -e "CUTEAFD_RELEASE_EXPERT_FAMILIES=$expert_families" \
+  -e "CUTEAFD_RELEASE_GENERIC_SPARK_COUNTS=${CUTEAFD_RELEASE_GENERIC_SPARK_COUNTS:-}" \
   -e "CUTEAFD_RELEASE_FP8_MOE_BF16_FAMILIES=$bf16_families" \
   -e "CUTEAFD_RELEASE_AUDIO_AOT=$audio_aot" \
   ${native_build_env_args[@]+"${native_build_env_args[@]}"} \

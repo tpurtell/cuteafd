@@ -49,6 +49,58 @@ def test_qwen_tp5_exact_slice_has_no_padding():
     assert not any(layout.startswith(("tp6", "tp7", "tp8")) for layout in package_tool.spark_layouts(640))
 
 
+@pytest.mark.parametrize("counts,expected", [("", ""), ("5", "--layouts;tp5"),
+                                            ("1;5;7;8", "--layouts;tp1,tp5,tp7,tp8")])
+def test_cmake_requested_counts_preserve_defaults_and_select_both_input_forms(tmp_path, counts, expected):
+    source = (REPO / "native/cmake/shared/fp8_moe.cmake").read_text()
+    body = source.split("  set(requested_layouts)", 1)[1].split("  set(stamp ", 1)[0]
+    script = tmp_path / "select.cmake"
+    script.write_text('set(CUTEAFD_FP8_MOE_ROLE spark)\n'
+                      f'set(CUTEAFD_GENERIC_SPARK_COUNTS "{counts}")\n'
+                      'set(requested_layouts)\n' + body + '\nmessage("LAYOUTS=${requested_layouts}")\n')
+    result = subprocess.run(["cmake", "-P", str(script)], capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0, result.stderr
+    assert f"LAYOUTS={expected}" in result.stderr
+    assert source.count('${exact_slices} ${requested_layouts}') >= 2
+
+
+@pytest.mark.parametrize("counts", ["0", "9", "5;bad"])
+def test_cmake_requested_counts_fail_before_compilation(tmp_path, counts):
+    source = (REPO / "native/cmake/shared/fp8_moe.cmake").read_text()
+    body = source.split("  set(requested_layouts)", 1)[1].split("  set(stamp ", 1)[0]
+    script = tmp_path / "select.cmake"
+    script.write_text('set(CUTEAFD_FP8_MOE_ROLE spark)\n'
+                      f'set(CUTEAFD_GENERIC_SPARK_COUNTS "{counts}")\n' + body)
+    result = subprocess.run(["cmake", "-P", str(script)], capture_output=True, text=True, timeout=30)
+    assert result.returncode != 0
+    assert "requires counts 1..8" in result.stderr
+
+
+@pytest.mark.parametrize("geometry,blocks", [("qwen4", 5), ("glm", 16), ("glmf", 16),
+                                             ("dsv4f", 16), ("dsv4p", 24)])
+@pytest.mark.parametrize("count", range(1, 9))
+def test_cmake_exl3_requested_counts_match_packager_profiles(tmp_path, geometry, blocks, count):
+    source = (REPO / "native/cmake/shared/exl3.cmake").read_text()
+    body = source.split("  set(CUTEAFD_EXL3_PROFILE_ARGS)", 1)[1].split(
+        '  list(JOIN CUTEAFD_EXL3_GEOMETRY_LAYOUTS', 1)[0]
+    script = tmp_path / "select.cmake"
+    script.write_text('set(CUTEAFD_EXL3_ROLE spark)\n'
+                      f'set(CUTEAFD_EXL3_GEOMETRY {geometry})\n'
+                      f'set(CUTEAFD_GENERIC_SPARK_COUNTS {count})\n' + body
+                      + '\nmessage("LAYOUTS=${CUTEAFD_EXL3_GEOMETRY_LAYOUTS}")\n'
+                      + 'message("PROFILES=${CUTEAFD_EXL3_PROFILE_ARGS}")\n')
+    result = subprocess.run(["cmake", "-P", str(script)], capture_output=True, text=True, timeout=30)
+    if count > blocks:
+        assert result.returncode != 0
+        assert "requires a nonempty H128 slice" in result.stderr
+        return
+    assert result.returncode == 0, result.stderr
+    assert 'LAYOUTS=' + ';'.join(f'tp{count}-rank{rank}' for rank in range(count)) in result.stderr
+    widths = sorted({(blocks // count + (rank < blocks % count)) * 128 for rank in range(count)}, reverse=True)
+    profiles = ';'.join(part for width in widths for part in ('--profile', f'tp{count}-width{width}'))
+    assert f'PROFILES={profiles}' in result.stderr
+
+
 def write_package(path: Path, *, input_kind="wire", role="spark", revision=REVISION):
     layout = "tp4" if role == "spark" else "tp1"
     library = path / layout / "libcuteafd_fp8moe.so"
