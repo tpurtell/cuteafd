@@ -424,6 +424,52 @@ mod draft_cli_tests {
     }
 
     #[test]
+    fn runtime_host_embedding_inventory_preserves_target_head_and_peer_weights() {
+        use crate::shared::token_io::EmbedPlacement;
+        use cuteafd_loader::families::glm5_flash::resident::GlmfRepresentation;
+        use cuteafd_loader::plan::checkpoint::CheckpointTensor;
+        let config = cuteafd_loader::plan::testing::glm5_flash_config(2);
+        let cfg = GlmNextConfig::from_hf(&config).unwrap();
+        let mut offset = 0;
+        let tensors = cuteafd_loader::plan::testing::glm5_flash_tensors(&config)
+            .into_iter().map(|(name, dtype, shape)| {
+                let (dtype, width) = match dtype {
+                    "BF16" => (cuteafd_core::DType::Bf16, 2),
+                    "F32" => (cuteafd_core::DType::F32, 4),
+                    "F8_E4M3" => (cuteafd_core::DType::F8E4M3, 1),
+                    other => panic!("unsupported fixture dtype {other}"),
+                };
+                let byte_length = shape.iter().product::<usize>() as u64 * width;
+                let tensor = CheckpointTensor { shard: "fixture".into(),
+                    meta: cuteafd_loader::SafetensorsTensorMetadata { name,
+                        dtype, shape, byte_length, byte_offset: offset } };
+                offset += byte_length;
+                tensor
+            }).collect();
+        let mut checkpoint = Checkpoint { snapshot: "fixture".into(), config, quantize_config: None,
+            weight_map: Default::default(), tensors, missing_shards: vec![], shard_bytes: 0 };
+        for ranks in [1, 2] {
+            for fp8_head in [false, true] {
+                let representation = GlmfRepresentation { fp8_head, ..Default::default() };
+                let gpu = runtime_resident_weights(&checkpoint, &cfg, cfg.layers, ranks, representation, EmbedPlacement::Gpu).unwrap();
+                let host = runtime_resident_weights(&checkpoint, &cfg, cfg.layers, ranks, representation, EmbedPlacement::Host).unwrap();
+                assert_eq!((gpu[0].embedding, host[0].embedding), (524_288, 0));
+                assert!(gpu[0].weights > 0);
+                assert_eq!(gpu.iter().map(|r| r.weights).collect::<Vec<_>>(), host.iter().map(|r| r.weights).collect::<Vec<_>>());
+                if ranks == 2 { assert_eq!(host[1].embedding, 0); assert!(host[1].weights > 0); }
+            }
+        }
+        checkpoint.config["tie_word_embeddings"] = serde_json::json!(true);
+        let error = runtime_resident_weights(&checkpoint, &cfg, 0, 2, Default::default(), EmbedPlacement::Host).unwrap_err();
+        assert!(error.to_string().contains("tie_word_embeddings=true"));
+        assert!(runtime_resident_weights(&checkpoint, &cfg, 0, 2, Default::default(), EmbedPlacement::Gpu).is_ok());
+        checkpoint.config["tie_word_embeddings"] = serde_json::json!(false);
+        checkpoint.tensors[2].meta.byte_offset = 0;
+        let error = runtime_resident_weights(&checkpoint, &cfg, 0, 2, Default::default(), EmbedPlacement::Host).unwrap_err();
+        assert!(error.to_string().contains("aliases its storage"));
+    }
+
+    #[test]
     fn single_copy_fp8_options_are_accepted() {
         for extra in [&[][..], &["--kda-fp8", "row128"][..], &["--kda-fp8", "channel"][..], &["--fp8-head"][..],
             &["--kda-fp8", "row128", "--fp8-prefill", "kda-in,kda-o"][..], &["--fp8-prefill", "all"][..],
@@ -919,6 +965,19 @@ fn parse_onboard(text: &str) -> std::result::Result<cuteafd_loader::placement::O
     text.parse()
 }
 
+fn runtime_resident_weights(checkpoint: &Checkpoint, cfg: &GlmNextConfig, layers: usize, ranks: usize,
+    representation: cuteafd_loader::families::glm5_flash::resident::GlmfRepresentation,
+    embedding: crate::shared::token_io::EmbedPlacement)
+    -> Result<Vec<cuteafd_loader::families::glm5_flash::resident::GlmfResidentRank>> {
+    let mut resident = cuteafd_loader::families::glm5_flash::resident::resident_weights(
+        checkpoint, cfg, layers, ranks, representation).map_err(anyhow::Error::msg)?;
+    if embedding == crate::shared::token_io::EmbedPlacement::Host {
+        checkpoint.require_untied_embedding("model.language_model.embed_tokens.weight")?;
+        resident[0].embedding = 0;
+    }
+    Ok(resident)
+}
+
 fn admitted_tp2_range(placement: &cuteafd_loader::placement::Placement) -> Result<Option<std::ops::Range<usize>>> {
     let selected: Vec<_> = placement.layers.iter().enumerate().filter_map(|(i, l)|
         (l.experts == cuteafd_loader::placement::ExpertHome::RtxTp2).then_some(i)).collect();
@@ -998,7 +1057,7 @@ impl Opened {
         index: engine::IndexCache, marks: usize, peer: Option<i32>, automatic_context: bool)
         -> Result<(cuteafd_loader::placement::Placement, cuteafd_loader::placement::GraphSet)> {
         use cuteafd_loader::placement::{self, families::glm5_flash as admission};
-        use cuteafd_loader::families::glm5_flash::resident::{resident_weights, router_replica_bytes, GlmfRepresentation};
+        use cuteafd_loader::families::glm5_flash::resident::{router_replica_bytes, GlmfRepresentation};
         use cuteafd_loader::serving_capacity::{glmf_step_scratch, glmf_step_workspaces, glmf_table_pages,
             GlmfScratchOptions, GlmfStepShape};
         ensure!(args.expert_window.is_none(), "solver admission does not support diagnostic expert paging");
@@ -1014,7 +1073,8 @@ impl Opened {
         let headers = Checkpoint::coordinator(&args.snapshot, false, false)?;
         let representation = GlmfRepresentation { kda_fp8: args.kda_fp8 != fp8::KdaFp8::Off,
             fp8_head: args.fp8_head, output_shard: args.kda_output_shard };
-        let resident = resident_weights(&headers, &self.cfg, layers, devices.len(), representation).map_err(anyhow::Error::msg)?;
+        let resident = runtime_resident_weights(&headers, &self.cfg, layers, devices.len(), representation,
+            args.token_io.embed_placement)?;
         let router_replica_bytes = router_replica_bytes(&headers, &self.cfg, layers).map_err(anyhow::Error::msg)?;
         let spark_ranks = args.peers.as_deref().map_or(0, |p| p.split(',').count());
         let lanes = engine::configured_prefill_lanes(spark_ranks > 0, layers == self.cfg.layers, args.prefill_lanes);
