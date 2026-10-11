@@ -85,8 +85,8 @@ impl<'w, 'a> DistributedDsparkChain<'w, 'a> {
         self.terminal.validate_sampling(count)?;
         let chain = self.chain.get_mut();
         let reads = chain.prepare(windows, bindings)?;
-        if let Some(&(_, owners)) = chain.graphs.get(&(count, chain.width)) {
-            ensure!(owners == reads.each_ref().map(|read| read.owner), "distributed draft capture owner differs");
+        if let Some(captured) = chain.graphs.get(&(count, chain.width)) {
+            ensure!(captured.pins == reads.each_ref().map(|read| read.owner), "distributed draft capture owner differs");
         }
         let pending = PendingDraft { count, reads, warming: !chain.has_graph(count), armed: true,
             library: chain.stream.library, stream: chain.stream.raw };
@@ -97,7 +97,7 @@ impl<'w, 'a> DistributedDsparkChain<'w, 'a> {
             lib.copy_h2d_async(chain.tokens.buffer, &chain.token_staging.bytes_mut()[..count * 4], chain.stream.raw)?;
             for stage in 0..3 { chain.stages[stage].upload_on(&pending.reads[stage], bindings[stage], chain.stream.raw)?; }
             if pending.warming { chain.enqueue(&pending.reads, count)?; }
-            else { lib.cuda_graph_launch(chain.graphs[&(count, chain.width)].0, chain.stream.raw)?; }
+            else { lib.cuda_graph_launch(chain.graphs.get(&(count, chain.width)).context("distributed draft graph missing")?.raw, chain.stream.raw)?; }
             let source = chain.stages[2].output_storage();
             let target = self.terminal.inputs();
             chain.ops.terminal_layout(source[0], source[1], target[0], target[1], count as u32, chain.stream.raw)?;

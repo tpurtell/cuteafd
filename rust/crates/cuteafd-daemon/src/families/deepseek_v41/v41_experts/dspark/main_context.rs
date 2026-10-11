@@ -1,4 +1,5 @@
 //! Shared main-hidden projection and three independent committed-KV producers.
+use crate::shared::decode_graph::{fatal_drain, BindingGraphs};
 use super::{DsparkProjection, DsparkWeights, ProjectionKind};
 use crate::families::deepseek_v41::v41_dspark_cache::{DsparkWindow, WindowChunk, WindowWrite};
 use crate::shared::memory::{DeviceAllocation, HostAllocation, LoadStream};
@@ -22,7 +23,7 @@ pub(crate) struct DsparkMainContext<'weights, 'library> {
     frequencies: DeviceAllocation<'library>,
     rotated: [DeviceAllocation<'library>; 3],
     capacity: u32,
-    graph: Option<(*mut c_void, u32)>,
+    graph: BindingGraphs<'library, u32>,
     ready: Option<u32>,
     pending_writes: Option<[WindowWrite; 3]>,
     commit_descriptors: [DeviceAllocation<'library>; 3],
@@ -70,7 +71,7 @@ impl<'library> DsparkWeights<'library> {
                 DeviceAllocation::new(library, capacity as usize * 1024)?,
             ],
             capacity,
-            graph: None,
+            graph: BindingGraphs::new(library)?,
             ready: None,
             pending_writes: None,
             commit_descriptors: [DeviceAllocation::new(library, 384)?, DeviceAllocation::new(library, 384)?, DeviceAllocation::new(library, 384)?],
@@ -260,7 +261,7 @@ impl DsparkMainContext<'_, '_> {
         let launched = unsafe { self.enqueue(rows) };
         let captured = unsafe { self.stream.library.cuda_graph_end_capture(self.stream.raw) };
         match (launched, captured) {
-            (Ok(()), Ok(graph)) => self.graph = Some((graph, rows)),
+            (Ok(()), Ok(graph)) => unsafe { self.graph.insert(rows, graph)?; },
             (Err(error), Ok(graph)) => {
                 unsafe {
                     self.stream.library.cuda_graph_exec_destroy(graph)?;
@@ -275,7 +276,7 @@ impl DsparkMainContext<'_, '_> {
     /// Same initialized-input and exclusive-use contract as execute.
     pub unsafe fn replay(&mut self, rows: u32) -> Result<()> {
         self.prepare(rows)?;
-        let (graph, captured) = self.graph.context("main context not captured")?;
+        let (graph, captured) = self.graph.get().context("main context not captured")?;
         ensure!(rows == captured, "main context replay rows differ");
         let launched = unsafe {
             self.stream
@@ -363,14 +364,9 @@ impl DsparkMainContext<'_, '_> {
 }
 impl Drop for DsparkMainContext<'_, '_> {
     fn drop(&mut self) {
-        if let Err(error) = self.synchronize() {
-            tracing::error!(%error,"draining dSpark main context");
-        }
+        fatal_drain(self.synchronize(), "dSpark main_context");
         self.pending_writes = None; // Stream drained before slot reservations release.
-        if let Some((graph, _)) = self.graph.take() {
-            if let Err(error) = unsafe { self.stream.library.cuda_graph_exec_destroy(graph) } {
-                tracing::error!(%error,"destroying dSpark main context graph");
-            }
-        }
+        // SAFETY: owning stream has drained before executable retirement.
+        fatal_drain(unsafe { self.graph.clear() }, "dSpark main_context graphs");
     }
 }

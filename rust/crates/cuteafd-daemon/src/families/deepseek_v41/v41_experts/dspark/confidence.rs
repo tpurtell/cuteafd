@@ -1,3 +1,4 @@
+use crate::shared::decode_graph::{fatal_drain, BindingGraphs};
 use super::DsparkWeights;
 use crate::shared::memory::{DeviceAllocation, LoadStream};
 use anyhow::{ensure, Context, Result};
@@ -12,7 +13,7 @@ pub(crate) struct DsparkConfidence<'weights, 'library> {
     output: DeviceAllocation<'library>,
     kernel: V41DsparkConfidence<'library>,
     weights: &'weights DsparkWeights<'library>,
-    graph: Option<(*mut c_void, usize)>,
+    graph: BindingGraphs<'library, usize>,
     capacity: usize,
     ready_rows: Option<usize>,
 }
@@ -41,7 +42,7 @@ impl<'library> DsparkWeights<'library> {
             output: DeviceAllocation::new(library, capacity * 4)?,
             kernel,
             weights: self,
-            graph: None,
+            graph: BindingGraphs::new(library)?,
             capacity,
             ready_rows: None,
         })
@@ -120,7 +121,8 @@ impl DsparkConfidence<'_, '_> {
         let capture = unsafe { self.stream.library.cuda_graph_end_capture(self.stream.raw) };
         match (launch, capture) {
             (Ok(()), Ok(graph)) => {
-                self.graph = Some((graph, rows));
+                // SAFETY: wave pins captured storage through drained teardown.
+                unsafe { self.graph.insert(rows, graph)?; }
                 Ok(())
             }
             (Err(error), Ok(graph)) => {
@@ -137,7 +139,7 @@ impl DsparkConfidence<'_, '_> {
     /// Same input contract as execute; rows must match the captured shape.
     pub unsafe fn replay(&mut self, rows: usize) -> Result<CuteafdDeviceBuffer> {
         self.ready_rows = None;
-        let (graph, captured_rows) = self.graph.context("confidence graph is not captured")?;
+        let (graph, captured_rows) = self.graph.get().context("confidence graph is not captured")?;
         ensure!(
             rows == captured_rows,
             "confidence replay shape differs from capture"
@@ -154,11 +156,8 @@ impl DsparkConfidence<'_, '_> {
     pub fn clear_graph(&mut self) -> Result<()> {
         self.ready_rows = None;
         self.synchronize()?;
-        if let Some((graph, _)) = self.graph.take() {
-            unsafe {
-                self.stream.library.cuda_graph_exec_destroy(graph)?;
-            }
-        }
+        // SAFETY: owning stream has drained before executable retirement.
+        unsafe { self.graph.clear()?; }
         Ok(())
     }
     /// Raw FP32 scores, without sigmoid; borrowed until reuse/drop.
@@ -173,13 +172,8 @@ impl DsparkConfidence<'_, '_> {
 }
 impl Drop for DsparkConfidence<'_, '_> {
     fn drop(&mut self) {
-        if let Err(error) = self.synchronize() {
-            tracing::error!(%error, "draining dSpark confidence execution");
-        }
-        if let Some((graph, _)) = self.graph.take() {
-            if let Err(error) = unsafe { self.stream.library.cuda_graph_exec_destroy(graph) } {
-                tracing::error!(%error, "destroying dSpark confidence graph");
-            }
-        }
+        fatal_drain(self.synchronize(), "dSpark confidence");
+        // SAFETY: owning stream has drained before executable retirement.
+        fatal_drain(unsafe { self.graph.clear() }, "dSpark confidence graphs");
     }
 }

@@ -1,4 +1,5 @@
 //! Draft transformer chain with optional shared embedding and terminal heads.
+use crate::shared::decode_graph::{fatal_drain, GraphBank, GraphOwner};
 use super::{DsparkStage, DsparkTerminal, DsparkWeights};
 use crate::families::deepseek_v41::v41_dspark_cache::{DsparkWindow, WindowLease, WindowRead};
 use crate::shared::memory::{DeviceAllocation, HostAllocation, LoadStream};
@@ -17,7 +18,7 @@ pub(crate) struct DsparkChain<'weights, 'library> {
     maximum: usize,
     stages: [DsparkStage<'weights, 'library>; 3],
     /// Captured complete drafts keyed by (request count, width).
-    graphs: std::collections::BTreeMap<(usize, usize), (*mut c_void, [u64; 3])>,
+    graphs: GraphBank<(usize, usize), GraphOwner<'library, [u64; 3]>>,
     ready: Option<usize>,
     pending: Option<PendingDraft<'library>>,
     download: HostAllocation<'library>,
@@ -41,9 +42,7 @@ struct PendingDraft<'a> {
 impl Drop for PendingDraft<'_> {
     fn drop(&mut self) {
         if self.armed {
-            if let Err(error) = unsafe { self.library.cuda_stream_synchronize(self.stream) } {
-                tracing::error!(%error, "draining pending draft before releasing cache readers");
-            }
+            fatal_drain(unsafe { self.library.cuda_stream_synchronize(self.stream) }, "pending draft readers");
         }
     }
 }
@@ -122,7 +121,7 @@ impl<'library> DsparkWeights<'library> {
                 self.stage(1, requests, bytes)?,
                 self.stage(2, requests, bytes)?,
             ],
-            graphs: Default::default(),
+            graphs: GraphBank::new(None),
             ready: None,
             pending: None,
             download: HostAllocation::new(library, requests as usize * (2 * self.draft_width + 1) * 4)?,
@@ -156,7 +155,7 @@ impl DsparkChain<'_, '_> {
         self.terminal.as_mut().context("dSpark chain has no terminal")?
             .stage_sampling(rngs, temperatures)
     }
-    pub fn has_graph(&self, count: usize) -> bool { self.graphs.contains_key(&(count, self.width)) }
+    pub fn has_graph(&self, count: usize) -> bool { self.graphs.contains(&(count, self.width)) }
     pub fn width(&self) -> usize { self.width }
     /// Select the draft width (5 or 7, within the loaded maximum) for the next
     /// draft. All storage is sized for the maximum; each width keeps its own
@@ -390,7 +389,11 @@ impl DsparkChain<'_, '_> {
         self.invalidate();
         match (launched, captured) {
             (Ok(()), Ok(graph)) => {
-                self.graphs.insert((count, self.width), (graph, reads.each_ref().map(|r| r.owner)));
+                let device = self.tokens.buffer.device_id;
+                // SAFETY: chain pins all captured weights/workspaces and drains on Drop.
+                let owner = unsafe { GraphOwner::new(self.stream.library, device, graph,
+                    reads.each_ref().map(|r| r.owner))? };
+                self.graphs.insert((count, self.width), owner, None);
                 tracing::debug!(target: "cuteafd::graph_capture", count, width=self.width,
                     bank=self as *const Self as usize, retained=self.graphs.len(),
                     "native dSpark chain graph captured");
@@ -414,7 +417,8 @@ impl DsparkChain<'_, '_> {
     ) -> Result<[CuteafdDeviceBuffer; 2]> {
         let reads = self.prepare(windows, bindings)?;
         let count = bindings[0].len();
-        let &(graph, owners) = self.graphs.get(&(count, self.width)).context("dSpark chain count not captured")?;
+        let captured = self.graphs.get(&(count, self.width)).context("dSpark chain count not captured")?;
+        let (graph, owners) = (captured.raw, captured.pins);
         ensure!(
             count == bindings[0].len() && owners == reads.each_ref().map(|r| r.owner),
             "dSpark chain capture binding differs"
@@ -438,8 +442,8 @@ impl DsparkChain<'_, '_> {
         bindings: [&[(WindowLease, u64)]; 3]) -> Result<()> {
         let reads = self.prepare(windows, bindings)?;
         let count = bindings[0].len();
-        if let Some(&(_, owners)) = self.graphs.get(&(count, self.width)) {
-            ensure!(owners == reads.each_ref().map(|r| r.owner), "dSpark chain capture binding differs");
+        if let Some(captured) = self.graphs.get(&(count, self.width)) {
+            ensure!(captured.pins == reads.each_ref().map(|r| r.owner), "dSpark chain capture binding differs");
         }
         self.terminal.as_ref().context("dSpark chain has no terminal")?.output_storage(count)?;
         let pending = PendingDraft { count, reads, warming: !self.has_graph(count), armed: true,
@@ -459,7 +463,7 @@ impl DsparkChain<'_, '_> {
         Ok(())
     }
     unsafe fn launch_download(&mut self, count: usize) -> Result<()> {
-        let graph = self.graphs.get(&(count, self.width)).context("dSpark chain count not captured")?.0;
+        let graph = self.graphs.get(&(count, self.width)).context("dSpark chain count not captured")?.raw;
         let output = self.terminal.as_ref().context("dSpark chain has no terminal")?.output_storage(count)?;
         unsafe {
             self.stream.library.cuda_graph_launch(graph, self.stream.raw)?;
@@ -511,15 +515,10 @@ impl DsparkChain<'_, '_> {
 }
 impl Drop for DsparkChain<'_, '_> {
     fn drop(&mut self) {
-        if let Err(error) = self.synchronize() {
-            tracing::error!(%error,"draining dSpark chain");
-        }
+        fatal_drain(self.synchronize(), "dSpark chain");
         if let Some(pending) = &mut self.pending { pending.armed = false; }
         self.pending = None; // GPU work has drained before read reservations release.
-        for (_, (graph, _)) in std::mem::take(&mut self.graphs) {
-            if let Err(error) = unsafe { self.stream.library.cuda_graph_exec_destroy(graph) } {
-                tracing::error!(%error,"destroying dSpark chain graph");
-            }
-        }
+        self.graphs.retire_all();
+        fatal_drain(self.graphs.drain_retired(|| Ok(())).map(drop), "dSpark chain graphs");
     }
 }

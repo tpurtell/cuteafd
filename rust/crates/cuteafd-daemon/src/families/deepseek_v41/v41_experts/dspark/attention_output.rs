@@ -1,4 +1,5 @@
 //! Inverse RoPE -> grouped FP8 wo_a -> native FP8 wo_b on one owned stream.
+use crate::shared::decode_graph::{fatal_drain, BindingGraphs};
 use super::{DsparkProjection, DsparkWeights, ProjectionKind};
 use crate::shared::memory::{DeviceAllocation, LoadStream};
 use anyhow::{ensure, Context, Result};
@@ -17,7 +18,7 @@ pub(crate) struct DsparkAttentionOutput<'weights, 'library> {
     input: DeviceAllocation<'library>,
     frequencies: DeviceAllocation<'library>,
     capacity: u32,
-    graph: Option<(*mut c_void, u32)>,
+    graph: BindingGraphs<'library, u32>,
     ready: Option<u32>,
 }
 impl<'library> DsparkWeights<'library> {
@@ -55,7 +56,7 @@ impl<'library> DsparkWeights<'library> {
             input: DeviceAllocation::new(library, capacity as usize * 65536)?,
             frequencies: DeviceAllocation::new(library, capacity as usize * 256)?,
             capacity,
-            graph: None,
+            graph: BindingGraphs::new(library)?,
             ready: None,
         })
     }
@@ -143,7 +144,8 @@ impl DsparkAttentionOutput<'_, '_> {
         let captured = unsafe { self.stream.library.cuda_graph_end_capture(self.stream.raw) };
         match (launched, captured) {
             (Ok(()), Ok(graph)) => {
-                self.graph = Some((graph, rows));
+                // SAFETY: wave pins captured storage through drained teardown.
+                unsafe { self.graph.insert(rows, graph)?; }
                 Ok(())
             }
             (Err(error), Ok(graph)) => {
@@ -162,6 +164,7 @@ impl DsparkAttentionOutput<'_, '_> {
         self.ready = None;
         let (graph, captured) = self
             .graph
+            .get()
             .context("dSpark attention output was not captured")?;
         ensure!(
             rows == captured,
@@ -188,14 +191,9 @@ impl DsparkAttentionOutput<'_, '_> {
 }
 impl Drop for DsparkAttentionOutput<'_, '_> {
     fn drop(&mut self) {
-        if let Err(error) = self.synchronize() {
-            tracing::error!(%error,"draining dSpark attention output");
-        }
-        if let Some((graph, _)) = self.graph.take() {
-            if let Err(error) = unsafe { self.stream.library.cuda_graph_exec_destroy(graph) } {
-                tracing::error!(%error,"destroying dSpark attention output graph");
-            }
-        }
+        fatal_drain(self.synchronize(), "dSpark attention_output");
+        // SAFETY: owning stream has drained before executable retirement.
+        fatal_drain(unsafe { self.graph.clear() }, "dSpark attention_output graphs");
     }
 }
 

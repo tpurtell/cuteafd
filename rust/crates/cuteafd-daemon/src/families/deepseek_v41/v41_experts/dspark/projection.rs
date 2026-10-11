@@ -1,4 +1,5 @@
 //! Native dSpark main/attention FP8 matrix ownership.
+use crate::shared::decode_graph::{fatal_drain, BindingGraphs};
 use super::DsparkWeights;
 use crate::shared::memory::{DeviceAllocation, LoadStream};
 use crate::families::deepseek_v41::v41_tensors::NativeRtxTensors;
@@ -110,7 +111,7 @@ pub(crate) struct DsparkProjection<'weights, 'library> {
     input: CuteafdDeviceBuffer,
     _owned_input: Option<DeviceAllocation<'library>>,
     output: DeviceAllocation<'library>,
-    graph: Option<(*mut c_void, u32)>,
+    graph: BindingGraphs<'library, u32>,
     ready: Option<u32>,
 }
 impl<'library> DsparkWeights<'library> {
@@ -161,7 +162,7 @@ impl<'library> DsparkWeights<'library> {
             input,
             _owned_input: owned_input,
             output: DeviceAllocation::new(library, capacity as usize * n as usize * 2)?,
-            graph: None,
+            graph: BindingGraphs::new(library)?,
             ready: None,
         };
         unsafe {
@@ -257,7 +258,8 @@ impl DsparkProjection<'_, '_> {
         let captured = unsafe { self.stream.library.cuda_graph_end_capture(self.stream.raw) };
         match (launched, captured) {
             (Ok(()), Ok(graph)) => {
-                self.graph = Some((graph, rows));
+                // SAFETY: wave pins captured storage through drained teardown.
+                unsafe { self.graph.insert(rows, graph)?; }
                 Ok(())
             }
             (Err(error), Ok(graph)) => {
@@ -274,7 +276,7 @@ impl DsparkProjection<'_, '_> {
     /// Same input contract as execute, with the captured row count.
     pub unsafe fn replay(&mut self, rows: u32) -> Result<CuteafdDeviceBuffer> {
         self.ready = None;
-        let (graph, captured) = self.graph.context("dSpark projection was not captured")?;
+        let (graph, captured) = self.graph.get().context("dSpark projection was not captured")?;
         ensure!(
             rows == captured,
             "dSpark projection replay rows differ from capture"
@@ -300,13 +302,8 @@ impl DsparkProjection<'_, '_> {
 }
 impl Drop for DsparkProjection<'_, '_> {
     fn drop(&mut self) {
-        if let Err(error) = self.synchronize() {
-            tracing::error!(%error,"draining dSpark projection");
-        }
-        if let Some((graph, _)) = self.graph.take() {
-            if let Err(error) = unsafe { self.stream.library.cuda_graph_exec_destroy(graph) } {
-                tracing::error!(%error,"destroying dSpark projection graph");
-            }
-        }
+        fatal_drain(self.synchronize(), "dSpark projection");
+        // SAFETY: owning stream has drained before executable retirement.
+        fatal_drain(unsafe { self.graph.clear() }, "dSpark projection graphs");
     }
 }

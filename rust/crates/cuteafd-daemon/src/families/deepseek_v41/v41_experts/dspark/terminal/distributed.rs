@@ -11,7 +11,7 @@ pub(crate) struct DistributedDsparkTerminal<'w, 'a> {
     terminal: DeviceOwner<'a, DsparkTerminal<'w, 'a>>,
     head: DistributedVocabularyWave<'w, 'a>,
     /// Captured stages indexed [width 5/7][normalize/sample][requests - 1].
-    graphs: [[[Option<*mut c_void>; 16]; 2]; 2],
+    graphs: crate::shared::decode_graph::GraphBank<(usize, usize, usize), crate::shared::decode_graph::GraphOwner<'a, ()>>,
     ready: Option<usize>,
     pending: Option<(usize, Phase)>,
 }
@@ -38,7 +38,7 @@ impl<'w, 'a> DistributedDsparkTerminal<'w, 'a> {
         Ok(Self {
             terminal: devices[1].own(|| weights.terminal_storage(None, capacity, required[1] - head_bytes[1]))?,
             head,
-            graphs: [[[None; 16]; 2]; 2], ready: None, pending: None,
+            graphs: crate::shared::decode_graph::GraphBank::new(None), ready: None, pending: None,
         })
     }
     /// GPU1 residual/pre-mix and anchor storage, with the ordinary terminal layout.
@@ -59,8 +59,8 @@ impl<'w, 'a> DistributedDsparkTerminal<'w, 'a> {
         let device = self.terminal.device;
         let terminal = self.terminal.get();
         device.run(|| unsafe {
-            if let Some(graph) = self.graphs[usize::from(terminal.width() == 7)][usize::from(sampling)][requests - 1] {
-                device.library.cuda_graph_launch(graph, terminal.stream.raw)
+            if let Some(graph) = self.graphs.get(&(terminal.width(), usize::from(sampling), requests)) {
+                device.library.cuda_graph_launch(graph.raw, terminal.stream.raw)
             } else if sampling { terminal.enqueue_sampling_on(requests, terminal.stream.raw) }
             else { terminal.enqueue_normalize_on(requests, terminal.stream.raw) }
         })
@@ -69,8 +69,8 @@ impl<'w, 'a> DistributedDsparkTerminal<'w, 'a> {
         let device = self.terminal.device;
         let terminal = self.terminal.get();
         let mode = usize::from(sampling);
-        let width = usize::from(terminal.width() == 7);
-        if self.graphs[width][mode][requests - 1].is_none() {
+        let width = terminal.width();
+        if !self.graphs.contains(&(width, mode, requests)) {
             let graph = device.run(|| unsafe {
                 device.library.cuda_graph_begin_capture(terminal.stream.raw)?;
                 let queued = if sampling { terminal.enqueue_sampling_on(requests, terminal.stream.raw) }
@@ -82,7 +82,9 @@ impl<'w, 'a> DistributedDsparkTerminal<'w, 'a> {
                     (Err(error), Err(_)) | (Ok(()), Err(error)) => Err(error),
                 }
             })?;
-            self.graphs[width][mode][requests - 1] = Some(graph);
+            // SAFETY: terminal pins all storage and Drop drains its device stream.
+            let owner = unsafe { crate::shared::decode_graph::GraphOwner::new(device.library, device.id, graph, ())? };
+            self.graphs.insert((width, mode, requests), owner, None);
         }
         Ok(())
     }
@@ -158,9 +160,7 @@ impl<'w, 'a> DistributedDsparkTerminal<'w, 'a> {
         if self.pending.take().is_some() {
             self.head.cancel_copy_logits();
             self.head.cancel_logits();
-            if let Err(error) = self.terminal.device.run(|| self.terminal.synchronize()) {
-                tracing::error!(%error, "draining cancelled distributed terminal");
-            }
+            fatal_drain(self.terminal.device.run(|| self.terminal.synchronize()), "cancelled distributed terminal");
         }
         self.ready = None;
     }
@@ -269,12 +269,8 @@ impl Drop for DistributedDsparkTerminal<'_, '_> {
     fn drop(&mut self) {
         self.cancel();
         let device = self.terminal.device;
-        if let Err(error) = device.run(|| {
-            self.terminal.synchronize()?;
-            for graph in self.graphs.iter_mut().flatten().flatten().filter_map(Option::take) {
-                unsafe { device.library.cuda_graph_exec_destroy(graph)?; }
-            }
-            Ok(())
-        }) { tracing::error!(%error, "destroying distributed draft terminal graphs"); }
+        fatal_drain(device.run(|| self.terminal.synchronize()), "distributed terminal");
+        self.graphs.retire_all();
+        fatal_drain(self.graphs.drain_retired(|| Ok(())).map(drop), "distributed terminal graphs");
     }
 }

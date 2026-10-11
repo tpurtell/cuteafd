@@ -2,6 +2,8 @@
 mod bank;
 mod owner;
 mod native;
+mod binding;
+pub(crate) use binding::BindingGraphs;
 mod watch;
 pub(crate) use watch::CaptureWatch;
 pub(crate) use native::{LayerGraphs, RowGraphs};

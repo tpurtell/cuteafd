@@ -1,3 +1,4 @@
+use crate::shared::decode_graph::{fatal_drain, BindingGraphs};
 use super::{DsparkConfidence, DsparkMarkov, DsparkWeights};
 use crate::shared::memory::{DeviceAllocation, HostAllocation, LoadStream};
 use crate::families::deepseek_v41::v41_tensors::VocabularyHead;
@@ -39,7 +40,7 @@ pub(crate) struct DsparkTerminal<'weights, 'library> {
     capacity: usize,
     /// Live draft width; storage is sized for the loaded maximum.
     width: usize,
-    graph: Option<(*mut c_void, usize)>,
+    graph: BindingGraphs<'library, usize>,
     ready_requests: Option<usize>,
 }
 impl<'library> DsparkWeights<'library> {
@@ -94,7 +95,7 @@ impl<'library> DsparkWeights<'library> {
             tokens: DeviceAllocation::new(library, capacity * (self.draft_width + 1) * 4)?,
             capacity,
             width: self.draft_width,
-            graph: None,
+            graph: BindingGraphs::new(library)?,
             ready_requests: None,
         })
     }
@@ -348,7 +349,8 @@ impl DsparkTerminal<'_, '_> {
         let captured = unsafe { self.stream.library.cuda_graph_end_capture(self.stream.raw) };
         match (launch, captured) {
             (Ok(()), Ok(graph)) => {
-                self.graph = Some((graph, requests));
+                // SAFETY: wave pins captured storage through drained teardown.
+                unsafe { self.graph.insert(requests, graph)?; }
                 Ok(())
             }
             (Err(error), Ok(graph)) => {
@@ -369,7 +371,7 @@ impl DsparkTerminal<'_, '_> {
             self.sampling_requests == Some(requests),
             "sampling state does not match replay requests"
         );
-        let (graph, captured) = self.graph.context("terminal graph is not captured")?;
+        let (graph, captured) = self.graph.get().context("terminal graph is not captured")?;
         ensure!(
             requests == captured,
             "terminal replay shape differs from capture"
@@ -386,11 +388,8 @@ impl DsparkTerminal<'_, '_> {
     pub fn clear_graph(&mut self) -> Result<()> {
         self.ready_requests = None;
         self.synchronize()?;
-        if let Some((graph, _)) = self.graph.take() {
-            unsafe {
-                self.stream.library.cuda_graph_exec_destroy(graph)?;
-            }
-        }
+        // SAFETY: owning stream has drained before executable retirement.
+        unsafe { self.graph.clear()?; }
         Ok(())
     }
     /// Tokens [K+1,R] (anchor then K drafts), corrected raw logits [K,R,V],
@@ -412,13 +411,8 @@ impl DsparkTerminal<'_, '_> {
 }
 impl Drop for DsparkTerminal<'_, '_> {
     fn drop(&mut self) {
-        if let Err(error) = self.synchronize() {
-            tracing::error!(%error, "draining dSpark terminal");
-        }
-        if let Some((graph, _)) = self.graph.take() {
-            if let Err(error) = unsafe { self.stream.library.cuda_graph_exec_destroy(graph) } {
-                tracing::error!(%error, "destroying dSpark terminal graph");
-            }
-        }
+        fatal_drain(self.synchronize(), "dSpark terminal");
+        // SAFETY: owning stream has drained before executable retirement.
+        fatal_drain(unsafe { self.graph.clear() }, "dSpark terminal graphs");
     }
 }

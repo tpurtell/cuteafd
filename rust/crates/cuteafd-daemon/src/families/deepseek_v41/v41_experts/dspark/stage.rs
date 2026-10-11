@@ -1,4 +1,5 @@
 //! One complete attention/mHC/FFN draft stage, captured on its expert stream.
+use crate::shared::decode_graph::{fatal_drain, BindingGraphs};
 use super::{DsparkAttentionWave, DsparkFfn, DsparkWeights, HcSublayer};
 use crate::families::deepseek_v41::v41_dspark_cache::{DsparkWindow, WindowLease, WindowRead};
 use anyhow::{ensure, Context, Result};
@@ -10,7 +11,7 @@ pub(crate) struct DsparkStage<'weights, 'library> {
     boundary: HcSublayer<'weights, 'library>,
     attention: DsparkAttentionWave<'weights, 'library>,
     library: &'library NativeLibrary,
-    graph: Option<(*mut c_void, usize, u64)>,
+    graph: BindingGraphs<'library, (usize, u64)>,
     requests: u32,
     width: usize,
     ready: bool,
@@ -53,7 +54,7 @@ impl<'library> DsparkWeights<'library> {
                 DsparkAttentionWave::device_bytes_with_width(library, requests, self.draft_width)?,
             )?,
             library,
-            graph: None,
+            graph: BindingGraphs::new(library)?,
             requests,
             width: self.draft_width,
             ready: false,
@@ -181,7 +182,8 @@ impl DsparkStage<'_, '_> {
         self.invalidate();
         match (launched, captured) {
             (Ok(()), Ok(graph)) => {
-                self.graph = Some((graph, requests.len(), read.owner));
+                // SAFETY: wave pins captured storage through drained teardown.
+                unsafe { self.graph.insert((requests.len(), read.owner), graph)?; }
                 Ok(())
             }
             (Err(error), Ok(graph)) => {
@@ -201,7 +203,7 @@ impl DsparkStage<'_, '_> {
         requests: &[(WindowLease, u64)],
     ) -> Result<[CuteafdDeviceBuffer; 2]> {
         let read = self.prepare(window, requests)?;
-        let (graph, count, owner) = self.graph.context("dSpark stage not captured")?;
+        let (graph, (count, owner)) = self.graph.get().context("dSpark stage not captured")?;
         ensure!(
             count == requests.len() && owner == read.owner,
             "dSpark stage capture binding differs"
@@ -223,13 +225,8 @@ impl DsparkStage<'_, '_> {
 }
 impl Drop for DsparkStage<'_, '_> {
     fn drop(&mut self) {
-        if let Err(error) = self.ffn.synchronize() {
-            tracing::error!(%error,"draining dSpark stage");
-        }
-        if let Some((graph, _, _)) = self.graph.take() {
-            if let Err(error) = unsafe { self.library.cuda_graph_exec_destroy(graph) } {
-                tracing::error!(%error,"destroying dSpark stage graph");
-            }
-        }
+        fatal_drain(self.ffn.synchronize(), "dSpark stage");
+        // SAFETY: owning stream has drained before executable retirement.
+        fatal_drain(unsafe { self.graph.clear() }, "dSpark stage graphs");
     }
 }

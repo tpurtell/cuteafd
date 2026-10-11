@@ -1,4 +1,5 @@
 //! One complete dSpark FFN boundary on its owned expert wave stream.
+use crate::shared::decode_graph::{fatal_drain, BindingGraphs};
 use super::{DsparkRouter, DsparkSharedFfn, DsparkWeights, HcSublayer};
 use super::expert_backend::DraftExperts;
 use anyhow::{ensure, Context, Result};
@@ -13,7 +14,7 @@ pub(crate) struct DsparkFfn<'weights, 'library> {
     shared: DsparkSharedFfn<'weights, 'library>,
     device_bytes: usize,
     library: &'library NativeLibrary,
-    graph: Option<(*mut c_void, u32)>,
+    graph: BindingGraphs<'library, u32>,
 }
 impl<'library> DsparkWeights<'library> {
     pub fn ffn_bytes(&self, capacity: u32) -> Result<usize> {
@@ -62,7 +63,7 @@ impl<'library> DsparkWeights<'library> {
             )?,
             device_bytes: bytes,
             library,
-            graph: None,
+            graph: BindingGraphs::new(library)?,
         })
     }
 }
@@ -148,7 +149,8 @@ impl DsparkFfn<'_, '_> {
         self.boundary.invalidate();
         match (launched, captured) {
             (Ok(()), Ok(graph)) => {
-                self.graph = Some((graph, rows));
+                // SAFETY: wave pins captured storage through drained teardown.
+                unsafe { self.graph.insert(rows, graph)?; }
                 Ok(())
             }
             (Err(error), Ok(graph)) => {
@@ -164,7 +166,7 @@ impl DsparkFfn<'_, '_> {
     /// Same initialized-input contract as execute; rows must match capture.
     pub unsafe fn replay(&mut self, rows: u32) -> Result<[CuteafdDeviceBuffer; 2]> {
         self.boundary.invalidate();
-        let (graph, captured_rows) = self.graph.context("dSpark FFN graph was not captured")?;
+        let (graph, captured_rows) = self.graph.get().context("dSpark FFN graph was not captured")?;
         ensure!(
             rows == captured_rows,
             "dSpark FFN replay rows differ from capture"
@@ -181,13 +183,8 @@ impl DsparkFfn<'_, '_> {
 }
 impl Drop for DsparkFfn<'_, '_> {
     fn drop(&mut self) {
-        if let Err(error) = self.experts.synchronize() {
-            tracing::error!(%error,"draining dSpark FFN boundary");
-        }
-        if let Some((graph, _)) = self.graph.take() {
-            if let Err(error) = unsafe { self.library.cuda_graph_exec_destroy(graph) } {
-                tracing::error!(%error,"destroying dSpark FFN graph");
-            }
-        }
+        fatal_drain(self.experts.synchronize(), "dSpark ffn");
+        // SAFETY: owning stream has drained before executable retirement.
+        fatal_drain(unsafe { self.graph.clear() }, "dSpark ffn graphs");
     }
 }

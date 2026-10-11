@@ -1,4 +1,5 @@
 //! One-stream draft attention with generation-checked committed cache reads.
+use crate::shared::decode_graph::{fatal_drain, BindingGraphs};
 use super::{DsparkAttentionOutput, DsparkProjection, DsparkWeights, ProjectionKind};
 use crate::families::deepseek_v41::v41_dspark_cache::{DsparkWindow, WindowLease, WindowRead};
 use crate::shared::memory::{DeviceAllocation, HostAllocation, LoadStream};
@@ -22,7 +23,7 @@ pub(crate) struct DsparkAttentionWave<'weights, 'library> {
     staging: HostAllocation<'library>,
     requests: u32,
     width: usize,
-    graph: Option<(*mut c_void, u32, u64)>,
+    graph: BindingGraphs<'library, (u32, u64)>,
     ready: Option<u32>,
 }
 impl<'library> DsparkWeights<'library> {
@@ -71,7 +72,7 @@ impl<'library> DsparkWeights<'library> {
             staging: HostAllocation::new(library, 128 + rows as usize * 8)?,
             requests,
             width: self.draft_width,
-            graph: None,
+            graph: BindingGraphs::new(library)?,
             ready: None,
         })
     }
@@ -285,7 +286,8 @@ impl DsparkAttentionWave<'_, '_> {
         let captured = unsafe { self.stream.library.cuda_graph_end_capture(self.stream.raw) };
         match (launched, captured) {
             (Ok(()), Ok(graph)) => {
-                self.graph = Some((graph, requests.len() as u32, read.owner));
+                // SAFETY: wave pins captured storage through drained teardown.
+                unsafe { self.graph.insert((requests.len() as u32, read.owner), graph)?; }
                 Ok(())
             }
             (Err(error), Ok(graph)) => {
@@ -306,7 +308,7 @@ impl DsparkAttentionWave<'_, '_> {
         requests: &[(WindowLease, u64)],
     ) -> Result<CuteafdDeviceBuffer> {
         let read = self.prepare(window, requests)?;
-        let (graph, count, owner) = self.graph.context("attention wave not captured")?;
+        let (graph, (count, owner)) = self.graph.get().context("attention wave not captured")?;
         ensure!(
             count as usize == requests.len() && owner == read.owner,
             "attention wave capture binding differs"
@@ -331,13 +333,8 @@ impl DsparkAttentionWave<'_, '_> {
 }
 impl Drop for DsparkAttentionWave<'_, '_> {
     fn drop(&mut self) {
-        if let Err(error) = self.synchronize() {
-            tracing::error!(%error,"draining attention wave");
-        }
-        if let Some((graph, _, _)) = self.graph.take() {
-            if let Err(error) = unsafe { self.stream.library.cuda_graph_exec_destroy(graph) } {
-                tracing::error!(%error,"destroying attention wave graph");
-            }
-        }
+        fatal_drain(self.synchronize(), "dSpark attention_wave");
+        // SAFETY: owning stream has drained before executable retirement.
+        fatal_drain(unsafe { self.graph.clear() }, "dSpark attention_wave graphs");
     }
 }

@@ -1,3 +1,4 @@
+use crate::shared::decode_graph::{fatal_drain, BindingGraphs};
 use super::DsparkWeights;
 use crate::shared::memory::{DeviceAllocation, LoadStream};
 use anyhow::{ensure, Context, Result};
@@ -15,7 +16,7 @@ pub(crate) struct DsparkMarkov<'weights, 'library> {
     embedding: DeviceAllocation<'library>,
     logits: DeviceAllocation<'library>,
     weights: &'weights DsparkWeights<'library>,
-    graph: Option<(*mut c_void, usize)>,
+    graph: BindingGraphs<'library, usize>,
     capacity: usize,
     ready_rows: Option<usize>,
 }
@@ -46,7 +47,7 @@ impl<'library> DsparkWeights<'library> {
             embedding: DeviceAllocation::new(library, capacity * 512)?,
             logits: DeviceAllocation::new(library, capacity * 129280 * 4)?,
             weights: self,
-            graph: None,
+            graph: BindingGraphs::new(library)?,
             capacity,
             ready_rows: None,
         })
@@ -134,7 +135,8 @@ impl DsparkMarkov<'_, '_> {
         let capture = unsafe { self.stream.library.cuda_graph_end_capture(self.stream.raw) };
         match (launch, capture) {
             (Ok(()), Ok(graph)) => {
-                self.graph = Some((graph, rows));
+                // SAFETY: wave pins captured storage through drained teardown.
+                unsafe { self.graph.insert(rows, graph)?; }
                 Ok(())
             }
             (Err(error), Ok(graph)) => {
@@ -151,7 +153,7 @@ impl DsparkMarkov<'_, '_> {
     /// Same input contract as execute; rows must match the captured shape.
     pub unsafe fn replay(&mut self, rows: usize) -> Result<[CuteafdDeviceBuffer; 2]> {
         self.ready_rows = None;
-        let (graph, captured_rows) = self.graph.context("markov graph is not captured")?;
+        let (graph, captured_rows) = self.graph.get().context("markov graph is not captured")?;
         ensure!(
             rows == captured_rows,
             "markov replay shape differs from capture"
@@ -168,11 +170,8 @@ impl DsparkMarkov<'_, '_> {
     pub fn clear_graph(&mut self) -> Result<()> {
         self.ready_rows = None;
         self.synchronize()?;
-        if let Some((graph, _)) = self.graph.take() {
-            unsafe {
-                self.stream.library.cuda_graph_exec_destroy(graph)?;
-            }
-        }
+        // SAFETY: owning stream has drained before executable retirement.
+        unsafe { self.graph.clear()?; }
         Ok(())
     }
     /// BF16 preceding-token embeddings and FP32 logits bias, in matching row
@@ -188,13 +187,8 @@ impl DsparkMarkov<'_, '_> {
 }
 impl Drop for DsparkMarkov<'_, '_> {
     fn drop(&mut self) {
-        if let Err(error) = self.synchronize() {
-            tracing::error!(%error, "draining dSpark markov execution");
-        }
-        if let Some((graph, _)) = self.graph.take() {
-            if let Err(error) = unsafe { self.stream.library.cuda_graph_exec_destroy(graph) } {
-                tracing::error!(%error, "destroying dSpark markov graph");
-            }
-        }
+        fatal_drain(self.synchronize(), "dSpark markov");
+        // SAFETY: owning stream has drained before executable retirement.
+        fatal_drain(unsafe { self.graph.clear() }, "dSpark markov graphs");
     }
 }
