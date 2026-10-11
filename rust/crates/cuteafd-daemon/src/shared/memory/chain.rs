@@ -99,8 +99,9 @@ impl<'a> StageChain<'a> {
         })();
         library.cuda_set_device(previous)?;
         if let Err(error) = created {
+            drain_fences(library, &fences);
             for &(_, event) in events.iter().chain(&forks) { let _ = unsafe { library.cuda_event_destroy(event) }; }
-            destroy_fences(library, &fences);
+            release_fences(library, &fences);
             return Err(error);
         }
         Ok(Self { library, events: events.into(), head: Rc::new(Cell::new(None)),
@@ -152,23 +153,29 @@ impl<'a> StageChain<'a> {
 }
 impl Drop for StageChain<'_> {
     fn drop(&mut self) {
-        if let Err(error) = self.drain() {
-            tracing::error!(%error, "draining target stage chain");
-        }
+        crate::shared::decode_graph::fatal_drain(self.drain(), "target stage chain");
+        drain_fences(self.library, &self.fences);
         for &(_, event) in self.events.iter().chain(self.forks.iter()) {
             if let Err(error) = unsafe { self.library.cuda_event_destroy(event) } {
                 tracing::error!(%error, "destroying target stage chain event");
             }
         }
-        destroy_fences(self.library, &self.fences);
+        release_fences(self.library, &self.fences);
     }
 }
 
-fn destroy_fences(library: &NativeLibrary, fences: &[Fence]) {
+fn drain_fences(library: &NativeLibrary, fences: &[Fence]) {
     for fence in fences {
-        // SAFETY: created by this chain; drained before destruction.
+        // SAFETY: this chain retains every fence stream and event until all drain.
+        crate::shared::decode_graph::fatal_drain(
+            unsafe { library.cuda_stream_synchronize(fence.stream) }, "target stage chain fence");
+    }
+}
+
+fn release_fences(library: &NativeLibrary, fences: &[Fence]) {
+    for fence in fences {
+        // SAFETY: created by this chain; all fences drained before destruction.
         unsafe {
-            let _ = library.cuda_stream_synchronize(fence.stream);
             let _ = library.cuda_stream_destroy(fence.stream);
             for event in fence.events { let _ = library.cuda_event_destroy(event); }
         }
@@ -355,9 +362,9 @@ impl<F> Drop for ChainScope<'_, F> {
             // independently), so draining needs no progress from this future.
             // CUDA permits event synchronization from another current device;
             // this leaves the caller's device and thread-local scope unchanged.
-            if let Err(error) = unsafe { self.library.cuda_event_synchronize(self.current.events[head].1) } {
-                tracing::error!(%error, "draining cancelled target stage chain");
-            }
+            crate::shared::decode_graph::fatal_drain(
+                unsafe { self.library.cuda_event_synchronize(self.current.events[head].1) },
+                "cancelled target stage chain");
         }
         // Field destruction follows this body. Inner stream guards still drain
         // submissions not yet recorded in the chain before releasing their owners.
@@ -463,6 +470,60 @@ mod tests {
     use std::sync::atomic::Ordering;
     use std::task::Waker;
     use std::time::Duration;
+
+    #[test]
+    #[ignore = "requires an allocated CPU build slot and explicit NVMe fixture directory"]
+    fn failed_chain_drops_abort_before_release() -> Result<()> {
+        use cuteafd_ffi::native_library_lifetime_fixture::Fixture;
+        use std::os::unix::process::ExitStatusExt;
+        const CHILD: &str = "CUTEAFD_FATAL_CHAIN_CHILD";
+        if let Some(path) = std::env::var_os(CHILD) {
+            let fixture = Fixture::build()?;
+            std::fs::write(std::env::var("CUTEAFD_FATAL_CHAIN_EVIDENCE")?,
+                fixture.directory().join("events").to_str().unwrap())?;
+            let library = fixture.load()?;
+            let allocation = Allocation::new(Device { library: &library, id: 0 }, 256)?;
+            fixture.configure_pack(&library, 0, 1)?;
+            if path == "fence" { fixture.configure_drain_after(&library, 1)?; }
+            let chain = StageChain {
+                library: &library,
+                events: vec![(0, std::ptr::null_mut())].into(),
+                head: Rc::new(Cell::new((path != "fence").then_some(0))),
+                forks: vec![(0, std::ptr::null_mut())].into(), fork: Rc::new(Cell::new(None)),
+                fences: if path == "fence" {
+                    vec![Fence { device: 0, stream: std::ptr::null_mut(),
+                        events: [std::ptr::null_mut(); 2] }; 2]
+                } else { vec![] }.into(),
+                marked: Rc::new(Cell::new([None; 2])), device: Cell::new(true),
+            };
+            if path == "cancel" {
+                let mut scope = Box::pin(chain.handle().scope(async move {
+                    let _allocation = allocation;
+                    std::future::pending::<()>().await;
+                }));
+                let mut context = Context::from_waker(Waker::noop());
+                assert!(scope.as_mut().poll(&mut context).is_pending());
+                drop(scope);
+            } else {
+                drop(chain);
+                drop(allocation);
+            }
+            panic!("failed chain drain returned without abort");
+        }
+        let root = std::path::PathBuf::from(std::env::var("CUTEAFD_NATIVE_LIFETIME_FIXTURE_DIR")?);
+        std::fs::create_dir_all(&root)?;
+        for path in ["head", "fence", "cancel"] {
+            let evidence = root.join(format!("fatal-chain-{}-{path}", std::process::id()));
+            let status = std::process::Command::new(std::env::current_exe()?)
+                .args(["--exact", "shared::memory::chain::tests::failed_chain_drops_abort_before_release", "--ignored"])
+                .env(CHILD, path).env("CUTEAFD_FATAL_CHAIN_EVIDENCE", &evidence).status()?;
+            assert_eq!(status.signal(), Some(libc::SIGABRT));
+            let events = std::fs::read_to_string(std::fs::read_to_string(evidence)?)?;
+            let expected = if path == "fence" { "DSS" } else { "DS" };
+            assert_eq!(events, expected, "abort must precede any event/fence/storage release");
+        }
+        Ok(())
+    }
 
     /// Models staging returned to a pool by an inner future's destructor. It
     /// must already be reusable when that destructor starts, not just after the
