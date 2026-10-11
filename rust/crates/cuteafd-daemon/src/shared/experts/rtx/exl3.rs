@@ -101,6 +101,8 @@ impl<'a> Exl3Tp2<'a> {
         max_rows: usize,
         budgets: [usize; 2],
     ) -> Result<[Self; 2]> {
+        let label = format!("experts/TP2 expert layer halves {}..{}", layers.start, layers.end);
+        let _memory_scope = cuteafd_ffi::memory_ledger::scope_owned(&label);
         validate_layers(&layers, 0)?;
         ensure!(
             devices[0].id != devices[1].id && std::ptr::eq(devices[0].library, devices[1].library),
@@ -161,6 +163,7 @@ impl<'a> Exl3Tp2<'a> {
                 // SAFETY: fresh GPU owners only; load drains all uploads and
                 // DeviceOwner drops on the owning GPU, including partial errors.
                 unsafe { cuteafd_ffi::synchronized_load::load_pair(|rank| devices[rank].own(|| {
+                    let _memory_scope = cuteafd_ffi::memory_ledger::scope_owned(&label);
                     Ok(vec![Exl3Weights::load(devices[rank].library, catalog,
                         ExpertLayer::BackboneTp2 { layer, rank }, available[rank])?])
                 })) }

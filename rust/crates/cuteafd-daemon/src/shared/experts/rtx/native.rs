@@ -188,6 +188,8 @@ impl<'a> NativeTp2<'a> {
     ) -> Result<[Self; 2]> {
         ensure!(devices[0].id != devices[1].id && std::ptr::eq(devices[0].library, devices[1].library),
             "invalid native TP2 device pair");
+        let label = format!("experts/TP2 expert layer halves {}..{}", layers.start, layers.end);
+        let _memory_scope = cuteafd_ffi::memory_ledger::scope_owned(&label);
         let workspaces = [Self::admit(devices[0], catalog, 0, &layers, max_rows, budgets[0])?,
             Self::admit(devices[1], catalog, 1, &layers, max_rows, budgets[1])?];
         let available = [budgets[0] - workspaces[0], budgets[1] - workspaces[1]];
@@ -199,6 +201,7 @@ impl<'a> NativeTp2<'a> {
                 // SAFETY: fresh, unaliased GPU owners only; both workers drain
                 // before returning and DeviceOwner destroys on its owning GPU.
                 let pair = unsafe { cuteafd_ffi::synchronized_load::load_pair(|rank| devices[rank].own(|| {
+                    let _memory_scope = cuteafd_ffi::memory_ledger::scope_owned(&label);
                     Ok(vec![ExpertWeights::load(devices[rank].library, catalog,
                         ExpertLayer::BackboneTp2 { layer, rank }, remaining[rank])?])
                 })) }?;
@@ -224,6 +227,8 @@ impl<'a> NativeTp2<'a> {
         max_rows: usize,
         budget: usize,
     ) -> Result<Self> {
+        let _memory_scope = cuteafd_ffi::memory_ledger::scope_owned(&format!(
+            "experts/TP2 expert layer halves {}..{}", layers.start, layers.end));
         let workspace_bytes = Self::admit(device, catalog, rank, &layers, max_rows, budget)?;
         let weights = device.own(|| {
             let mut loaded = Vec::with_capacity(layers.len());
