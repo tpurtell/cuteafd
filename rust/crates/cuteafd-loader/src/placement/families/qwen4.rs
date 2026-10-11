@@ -114,6 +114,39 @@ pub fn placement(inputs: &QwenInputs<'_>) -> anyhow::Result<Placement> {
     }
 }
 
+/// Header-only exact expert costs. Qwen TP2 owns complete H128 blocks: at
+/// intermediate640 the halves are384/256. Callers must validate packages with
+/// those widths before admitting this request; padded320/320 is not this ABI.
+pub fn dual_expert_costs(catalog: &crate::OfficialV41Catalog, layers: usize)
+    -> anyhow::Result<Vec<Option<ExpertCost>>> {
+    let shape = catalog.routed_experts();
+    anyhow::ensure!(shape.first_layer == 0 && layers <= shape.layers,
+        "Qwen expert costs require a complete routed backbone prefix");
+    (0..layers).map(|layer| {
+        let bytes = |world, rank| -> anyhow::Result<Bytes2> {
+            let resident = if let Some(exl3) = catalog.exl3() {
+                exl3.residency(crate::V41Exl3Layer::Backbone(layer), world, rank)?.device_arena_layout()?.1 as u64
+            } else {
+                use crate::formats::fp8_experts::{Fp8Projection, Slicing};
+                let tensors = catalog.fp8().ok_or_else(|| anyhow::anyhow!("Qwen TP2 needs EXL3/FP8/NVFP4 tensors"))?
+                    .for_layer(layer)?;
+                tensors.validate_layer(layer)?;
+                let slicing = if world == 2 { Slicing::Blocks(128) } else { Slicing::Padded };
+                Fp8Projection::ALL.iter().try_fold(0u64, |total, &projection| {
+                    let (weights, _) = tensors.slice_bytes_with(projection, world, rank, slicing)?;
+                    let scales = tensors.scale_region_bytes_with(projection, world, rank, slicing)?;
+                    (weights as u64).checked_mul(shape.experts as u64)
+                        .and_then(|n| n.checked_add(scales as u64)).and_then(|n| n.checked_add(total))
+                        .ok_or_else(|| anyhow::anyhow!("Qwen TP2 expert residency overflow"))
+                })?
+            };
+            Ok(Bytes2 { resident, staging: 0 })
+        };
+        Ok(Some(ExpertCost { whole: bytes(1, 0)?, half: [bytes(2, 0)?, bytes(2, 1)?],
+            tp2: true, spark_ok: true }))
+    }).collect()
+}
+
 /// Admission contract for the private whole-owner executor. Unlike the legacy
 /// single-owner path, layer weights and routed halves are future allocations;
 /// both baselines must be sampled before loading them. The public selector
@@ -257,6 +290,44 @@ mod tests {
     use super::*;
     use crate::families::qwen4::{Qwen4Config, Qwen4KvCache};
     use crate::serving_capacity::qwen_graphs::qwen_graph_pool;
+
+    #[test]
+    fn qwen_tp2_costs_use_exact_header_storage() {
+        use crate::plan::testing::{qwen4_config, qwen4_exl3, nvfp4, write_snapshot};
+        let dir = tempfile::tempdir().unwrap();
+        let config = qwen4_config(1);
+        let (tensors, manifest) = qwen4_exl3(1, 4);
+        write_snapshot(dir.path(), &config, &tensors, None);
+        crate::plan::testing::write_quantize_config(dir.path(), &manifest);
+        let catalog = crate::read_expert_catalog(dir.path()).unwrap();
+        let costs = dual_expert_costs(&catalog, 1).unwrap();
+        let cost = costs[0].unwrap();
+        assert!(cost.half[0].resident > cost.half[1].resident);
+        for rank in 0..2 {
+            let residency = catalog.exl3().unwrap().residency(crate::V41Exl3Layer::Backbone(0), 2, rank).unwrap();
+            assert_eq!(cost.half[rank].resident, residency.device_arena_layout().unwrap().1 as u64);
+            assert_eq!(cost.half[rank].staging, 0);
+        }
+        let mut config = config;
+        config["quantization_config"] = serde_json::json!({"quant_method": "modelopt", "quant_algo": "NVFP4",
+            "config_groups": {"group_0": {"weights": {"num_bits": 4, "type": "float", "group_size": 16}}}});
+        let mut tensors = Vec::new();
+        for expert in 0..512 {
+            for (projection, n, k) in [("gate_proj", 640, 2560), ("up_proj", 640, 2560), ("down_proj", 2560, 640)] {
+                tensors.extend(nvfp4(&format!("model.language_model.layers.0.mlp.experts.{expert}.{projection}"), n, k));
+            }
+        }
+        // New directory avoids the EXL3 side-file cross-check from the first fixture.
+        let dir = tempfile::tempdir().unwrap();
+        write_snapshot(dir.path(), &config, &tensors, None);
+        let catalog = crate::read_expert_catalog(dir.path()).unwrap();
+        let cost = dual_expert_costs(&catalog, 1).unwrap()[0].unwrap();
+        // Three projection value+scale grids, plus alpha and input scale per expert.
+        for (rank, width) in [384_u64, 256].into_iter().enumerate() {
+            assert_eq!(cost.half[rank], Bytes2 { resident: 512 * (3 * width * 2560 * 9 / 16 + 3 * 8), staging: 0 });
+        }
+        assert_eq!(cost.whole.resident, 512 * (3 * 640 * 2560 * 9 / 16 + 3 * 8));
+    }
 
     #[test]
     fn planner_equals_runtime_qwen4_dual_contract() {
