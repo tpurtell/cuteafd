@@ -253,13 +253,13 @@ impl PendingDualAttention<'_,'_> {
 impl Drop for PendingDualAttention<'_,'_> {
     fn drop(&mut self) {
         if let Some(wave) = self.wave.as_deref_mut() {
-            if let Err(error) = wave.drain() { tracing::error!(%error,"draining dual attention on cancellation"); }
+            if let Err(error) = wave.drain() { crate::shared::decode_graph::fatal_drain(Err(error), "dual attention cancellation"); }
         }
     }
 }
 impl Drop for DualAttentionWave<'_> {
     fn drop(&mut self) {
-        if let Err(error) = self.drain() { tracing::error!(%error,"draining dual attention owner"); }
+        if let Err(error) = self.drain() { crate::shared::decode_graph::fatal_drain(Err(error), "dual attention"); }
         let owner=self.halves[0].device;
         self.tails.retire_all();
         if let Err(error)=owner.run(||self.tails.drain_retired(||Ok(())).map(drop)) {

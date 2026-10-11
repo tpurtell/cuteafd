@@ -234,7 +234,7 @@ impl<'w, 'a> TargetEmbeddingWave<'w, 'a> {
 impl Drop for TargetEmbeddingWave<'_, '_> {
     fn drop(&mut self) {
         if let Err(e) = self.clear_graph() {
-            tracing::error!(%e, "draining target embedding");
+            crate::shared::decode_graph::fatal_drain(Err(e), "target embedding");
         }
     }
 }

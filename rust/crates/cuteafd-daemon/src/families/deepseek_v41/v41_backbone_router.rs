@@ -748,10 +748,10 @@ impl BackboneRouterWave<'_, '_> {
 }
 impl Drop for BackboneRouterWave<'_, '_> {
     fn drop(&mut self) {
-        let drained = self.synchronize();
+        crate::shared::decode_graph::fatal_drain(self.synchronize(), "backbone router");
         let current = unsafe { self.graphs.clear() };
         let other = unsafe { self.other_graphs.clear() };
-        if let Err(e) = drained.and(current).and(other) {
+        if let Err(e) = current.and(other) {
             tracing::error!(%e,"draining backbone router");
         }
     }

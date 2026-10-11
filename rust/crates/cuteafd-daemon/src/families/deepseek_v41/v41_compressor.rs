@@ -1125,11 +1125,11 @@ impl<'w, 'a> CompressorWave<'w, 'a> {
 }
 impl Drop for CompressorWave<'_, '_> {
     fn drop(&mut self) {
-        if let Err(error) = self.synchronize() { tracing::error!(%error, "draining pending source commit"); }
+        if let Err(error) = self.synchronize() { crate::shared::decode_graph::fatal_drain(Err(error), "source commit"); }
         self.pending_query = None;
         self.pending_commit = None;
         if let Err(error) = self.clear_graph() {
-            tracing::error!(%error,"draining compressor graph");
+            crate::shared::decode_graph::fatal_drain(Err(error), "compressor");
         }
     }
 }

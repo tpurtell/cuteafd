@@ -381,7 +381,7 @@ impl<'a,const HEADS:usize> LocalSparseAttentionWave<'a,HEADS> {
         impl Drop for Drain<'_> {
             fn drop(&mut self) { if !self.2 {
                 if let Err(error) = unsafe { self.0.cuda_stream_synchronize(self.1) } {
-                    tracing::error!(%error, "draining direct attention graph on unwind");
+                    crate::shared::decode_graph::fatal_drain(Err(error), "direct attention unwind");
                 }
             } }
         }
@@ -410,7 +410,7 @@ impl<'a,const HEADS:usize> LocalSparseAttentionWave<'a,HEADS> {
         impl Drop for Drain<'_> {
             fn drop(&mut self) { if !self.2 {
                 if let Err(error) = unsafe { self.0.cuda_stream_synchronize(self.1) } {
-                    tracing::error!(%error, "draining attention continuation on unwind");
+                    crate::shared::decode_graph::fatal_drain(Err(error), "attention continuation unwind");
                 }
             }}
         }
@@ -746,7 +746,7 @@ impl LocalSparseAttentionWave<'_,32> {
 impl<const HEADS:usize> Drop for LocalSparseAttentionWave<'_,HEADS> {
     fn drop(&mut self) {
         if let Err(e) = self.clear_graph() {
-            tracing::error!(%e,"draining sparse attention graph");
+            crate::shared::decode_graph::fatal_drain(Err(e), "sparse attention");
         }
     }
 }

@@ -98,7 +98,7 @@ impl<'w, 'a> Normalize<'w, 'a> {
 impl Drop for Normalize<'_, '_> {
     fn drop(&mut self) {
         let lib = self.weights.library;
-        if let Err(error) = unsafe { lib.cuda_stream_synchronize(self.stream.raw) } { tracing::error!(%error, "draining target norm"); }
+        if let Err(error) = unsafe { lib.cuda_stream_synchronize(self.stream.raw) } { crate::shared::decode_graph::fatal_drain(Err(error), "target normalization"); }
         // SAFETY: Normalize drained its only stream before releasing captured pointers.
         if let Err(error) = unsafe { self.graphs.clear() } { tracing::error!(%error, "destroying target norm graph"); }
     }

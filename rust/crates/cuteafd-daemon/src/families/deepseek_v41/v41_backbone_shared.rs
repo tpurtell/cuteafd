@@ -379,7 +379,7 @@ impl Drop for BackboneSharedWave<'_, '_> {
             .synchronize()
             .and_then(|()| unsafe { self.graphs.clear() })
         {
-            tracing::error!(%e,"draining backbone shared FFN");
+            crate::shared::decode_graph::fatal_drain(Err(e), "shared FFN");
         }
     }
 }

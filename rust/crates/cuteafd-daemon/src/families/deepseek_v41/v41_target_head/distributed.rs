@@ -108,7 +108,7 @@ impl Drop for Rank<'_, '_> {
     fn drop(&mut self) {
         let lib = self.stream.library;
         if let Err(error) = unsafe { lib.cuda_stream_synchronize(self.stream.raw) } {
-            tracing::error!(%error, "draining vocabulary rank");
+            crate::shared::decode_graph::fatal_drain(Err(error), "vocabulary rank");
         }
         for graphs in &mut self.graphs {
             // SAFETY: the rank drained its stream before releasing captured pointers.
@@ -338,7 +338,7 @@ impl<'w, 'a> DistributedVocabularyWave<'w, 'a> {
         if self.pending_logits.take().is_some() {
             for rank in &self.ranks {
                 if let Err(error) = rank.device.run(|| unsafe { rank.stream.library.cuda_stream_synchronize(rank.stream.raw) }) {
-                    tracing::error!(%error, "draining cancelled vocabulary projection");
+                    crate::shared::decode_graph::fatal_drain(Err(error), "vocabulary projection cancellation");
                 }
             }
         }
@@ -405,7 +405,7 @@ impl<'w, 'a> DistributedVocabularyWave<'w, 'a> {
     pub fn cancel_copy_logits(&mut self) {
         if self.copy_pending {
             if let Err(error) = self.merge_stream.drain() {
-                tracing::error!(%error, "draining cancelled vocabulary assembly");
+                crate::shared::decode_graph::fatal_drain(Err(error), "vocabulary assembly cancellation");
             }
             self.copy_pending = false;
         }

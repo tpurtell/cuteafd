@@ -469,7 +469,7 @@ impl Drop for IndexQueryWave<'_, '_> {
             .synchronize()
             .and_then(|_| unsafe { self.graphs.clear() })
         {
-            tracing::error!(%error,"draining index query graph");
+            crate::shared::decode_graph::fatal_drain(Err(error), "index query");
         }
     }
 }

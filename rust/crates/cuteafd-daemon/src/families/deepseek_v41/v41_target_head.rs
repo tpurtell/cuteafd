@@ -537,7 +537,7 @@ impl TargetHeadWave<'_, '_> {
 impl Drop for TargetHeadWave<'_, '_> {
     fn drop(&mut self) {
         if let Err(e) = self.clear_graph() {
-            tracing::error!(%e,"draining target head");
+            crate::shared::decode_graph::fatal_drain(Err(e), "target head");
         }
     }
 }

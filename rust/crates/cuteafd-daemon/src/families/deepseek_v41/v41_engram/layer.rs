@@ -429,7 +429,7 @@ impl<'weights, 'library> EngramGate<'weights, 'library> {
 impl Drop for EngramGate<'_, '_> {
     fn drop(&mut self) {
         if let Err(error) = self.synchronize() {
-            tracing::error!(%error, "draining native engram residual gate");
+            crate::shared::decode_graph::fatal_drain(Err(error), "Engram gate");
         }
         // SAFETY: destruction follows the containing stream's drain.
         if let Err(error) = unsafe { self.graphs.clear() } {

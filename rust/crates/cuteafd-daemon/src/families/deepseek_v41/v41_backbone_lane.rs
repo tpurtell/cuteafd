@@ -228,7 +228,7 @@ impl Drop for PendingLaneFfn<'_, '_, '_> {
             let drained=if let Some(dual)=lane.dual_sparse.as_mut() { dual.drain() }
                 else { lane.sparse.as_mut().map_or(Ok(()),|sparse|sparse.drain_chain()) };
             if let Err(error) = drained {
-                tracing::error!(%error, "draining cancelled attention chain");
+                crate::shared::decode_graph::fatal_drain(Err(error), "attention chain cancellation");
             }
             lane.block.reset();
             lane.phase = Phase::Invalid;

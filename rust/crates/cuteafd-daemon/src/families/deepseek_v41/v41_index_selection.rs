@@ -630,9 +630,9 @@ fn fixed_binding_admitted(cached: bool, allowed_shape: bool, count: usize, limit
 }
 impl Drop for IndexSelectionWave<'_> {
     fn drop(&mut self) {
-        if let Err(error) = self.abort_pending() { tracing::error!(%error, "draining pending index selection"); }
+        if let Err(error) = self.abort_pending() { crate::shared::decode_graph::fatal_drain(Err(error), "pending index selection"); }
         if let Err(error) = self.clear_graph() {
-            tracing::error!(%error,"draining index selection graph");
+            crate::shared::decode_graph::fatal_drain(Err(error), "index selection");
         }
     }
 }

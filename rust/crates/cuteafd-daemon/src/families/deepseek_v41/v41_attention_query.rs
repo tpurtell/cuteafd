@@ -527,7 +527,7 @@ impl AttentionQueryWave<'_, '_> {
             fn drop(&mut self) {
                 if !self.complete {
                     if let Err(error)=unsafe { self.stream.library.cuda_stream_synchronize(self.stream.raw) } {
-                        tracing::error!(%error,"draining interrupted TP2 query prefix");
+                        crate::shared::decode_graph::fatal_drain(Err(error), "TP2 query unwind");
                     }
                 }
             }
@@ -608,7 +608,7 @@ impl Drop for AttentionQueryWave<'_, '_> {
                 let first=self.graphs.clear();let second=self.tp2_prefix_graphs.clear();first.and(second)
             })
         {
-            tracing::error!(%error,"draining attention query graph");
+            crate::shared::decode_graph::fatal_drain(Err(error), "attention query");
         }
     }
 }

@@ -577,7 +577,7 @@ impl Drop for AttentionOutputWave<'_, '_> {
             .synchronize()
             .and_then(|()| unsafe { self.graphs.clear() })
         {
-            tracing::error!(%error,"draining attention output graph");
+            crate::shared::decode_graph::fatal_drain(Err(error), "attention output");
         }
     }
 }

@@ -121,7 +121,7 @@ impl<'w,'a> Rank<'w,'a> {
 }
 impl Drop for Rank<'_,'_> {
     fn drop(&mut self) {
-        if let Err(error)=self.stream.drain() { tracing::error!(%error,"draining projection rank"); }
+        if let Err(error)=self.stream.drain() { crate::shared::decode_graph::fatal_drain(Err(error), "projection rank"); }
         let device=self.stream.device;
         if let Err(error)=device.run(||unsafe { self.graphs.clear() }) {
             tracing::error!(%error,"destroying projection rank graphs");
@@ -143,7 +143,7 @@ struct Drain<'s,'w,'a> { wave: &'s mut Wave<'w,'a>, complete: bool }
 impl Drop for Drain<'_,'_,'_> {
     fn drop(&mut self) {
         if !self.complete {
-            if let Err(error)=self.wave.drain() { tracing::error!(%error,"draining interrupted projection"); }
+            if let Err(error)=self.wave.drain() { crate::shared::decode_graph::fatal_drain(Err(error), "projection unwind"); }
         }
     }
 }
@@ -267,7 +267,7 @@ impl<'w,'a> Wave<'w,'a> {
 }
 impl Drop for Wave<'_,'_> {
     fn drop(&mut self) {
-        if let Err(error)=self.drain() { tracing::error!(%error,"draining projection wave"); }
+        if let Err(error)=self.drain() { crate::shared::decode_graph::fatal_drain(Err(error), "projection"); }
         let device=self.output.device;
         if let Err(error)=device.run(||unsafe { self.gather_graphs.clear() }) {
             tracing::error!(%error,"destroying projection gather graphs");
