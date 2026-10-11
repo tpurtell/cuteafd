@@ -389,6 +389,9 @@ pub(crate) struct PlanArgs {
     /// Plan the bundled MiMo drafter without FP8 conversion.
     #[arg(long)]
     pub(crate) mimo_draft_bf16: bool,
+    /// Plan GLM 5.3's DFlash2 drafter with native BF16 projections.
+    #[arg(long)]
+    pub(crate) glm5_draft_bf16: bool,
     /// MiMo native local expert package manifest.json for exact scratch.
     #[arg(long)]
     pub(crate) mimo_expert_manifest: Option<PathBuf>,

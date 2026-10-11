@@ -75,6 +75,7 @@ fn options(args: &PlanArgs) -> Result<PlanOptions, PlanError> {
                 glmf_drafter_snapshot: args.drafter_snapshot.clone(),
                 glm5_drafter_disabled: args.no_speculator || args.speculator == "off",
                 glm5_drafter_snapshot: args.drafter_snapshot.clone(),
+                glm5_draft_bf16: args.glm5_draft_bf16,
                 drafter_bytes: if args.drafter_gib > 0.0 { budget_bytes("--drafter-gib", args.drafter_gib)? } else { 0 },
                 ..Default::default()
             })
@@ -587,6 +588,7 @@ mod tests {
             mimo_decode_graphs: false,
             physical_sms: None,
             mimo_draft_bf16: false,
+            glm5_draft_bf16: false,
             mimo_expert_manifest: None,
             prefix_marks: crate::families::glm5_flash::prefix::PrefixMarks::Arena,
             native_mtp_layers: 3,
@@ -933,6 +935,19 @@ mod tests {
         let options = options(&request).unwrap();
         assert_eq!(options.spark_budget_bytes, 82 << 30);
         assert_eq!(options.layout.unwrap().spark_allocation_budget_bytes, Some(82 << 30));
+    }
+
+    #[test]
+    fn glm5_draft_representation_reaches_the_layout() {
+        use clap::Parser;
+        for (extra, bf16) in [(&[][..], false), (&["--glm5-draft-bf16"][..], true)] {
+            let cli = crate::cli::Cli::try_parse_from(
+                ["cuteafd", "plan", "/not-read", "--layout"].into_iter().chain(extra.iter().copied())).unwrap();
+            let crate::cli::Commands::Plan(args) = cli.command else { panic!("plan") };
+            let layout = options(&args).unwrap().layout.unwrap();
+            assert_eq!(layout.glm5_draft_bf16, bf16);
+            assert!(!layout.mimo_draft_bf16, "GLM's representation must not affect MiMo");
+        }
     }
 
     #[test]
