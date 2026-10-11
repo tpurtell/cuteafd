@@ -40,7 +40,7 @@ pub fn solve(request: &PlacementRequest) -> Result<Placement, PlacementError> {
             if let Ok(p) = &trial {
                 if p.pool_tokens >= kind_best { kind_best = p.pool_tokens; selected_flips = flips.clone(); }
             }
-            if trial.as_ref().is_ok_and(|p| best.as_ref().map_or(true, |b| p.pool_tokens > b.pool_tokens)) { best = trial; }
+            if trial.as_ref().is_ok_and(|p| best.as_ref().map_or(true, |b| p.pool_tokens >= b.pool_tokens)) { best = trial; }
         }
         flips = selected_flips;
     }
@@ -60,7 +60,9 @@ fn prune_flips(request: &PlacementRequest, flips: &[(AttentionClass, AttentionPl
             let mut trial = flips.clone();
             trial.remove(i);
             if let Ok(candidate) = solve_once(request, &trial) {
-                if candidate.pool_tokens == placement.pool_tokens {
+                // Removing context can also recover an odd pool unit that its
+                // even-unit constraint rounded away.
+                if candidate.pool_tokens >= placement.pool_tokens {
                     flips = trial;
                     placement = candidate;
                     removed = true;

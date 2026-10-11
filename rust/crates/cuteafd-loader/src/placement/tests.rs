@@ -717,6 +717,8 @@ fn mixed_memory_flips_are_explicit_in_plan_and_summary() {
     let mut req = request(2, 15 * UNIT / 4, 3, 4, Onboard::Auto);
     req.pool_overhead = vec![0; 2];
     req.executor = CONTEXT;
+    req.context_buffers = ContextBuffers { query_row_bytes: 64, partial_row_bytes: 128,
+        decode_rows: 1, lanes: 1, ..ContextBuffers::default() };
     req.layers[0].kind = AttentionClass::Mla;
     req.layers[0].kv_unit = KvDemand { unit_bytes_whole: UNIT, unit_bytes_split: [UNIT; 2], unit_bytes_context: Some([UNIT / 2; 2]) };
     req.layers[0].modes = vec![LayerMode::HeadSplit, LayerMode::ContextSplit];
@@ -731,11 +733,22 @@ fn mixed_memory_flips_are_explicit_in_plan_and_summary() {
     assert_eq!(mixed.pool_tokens, 1024);
     assert_eq!(mixed.attention_by_kind, [(AttentionClass::Mla, AttentionPlacement::Context), (AttentionClass::Dsa, AttentionPlacement::Layers)]);
     assert!(mixed.summary().contains("mixed (Mla=context, Dsa=layers)"));
-    // If the Dsa flip alone reaches a smaller target, the earlier equal-pool
-    // Mla context stepping stone is pruned and adds no useless peer traffic.
+    assert_eq!(mixed.peer_row_bytes, 192);
+    // If the Dsa flip alone reaches an odd-unit target, pruning the Mla
+    // context stepping stone recovers the unit and removes its peer traffic.
     req.pool.target = 768;
     let pruned = solve(&req).unwrap();
     assert_eq!(pruned.pool_tokens, 768);
+    assert_eq!(pruned.attention_by_kind, [(AttentionClass::Mla, AttentionPlacement::Heads), (AttentionClass::Dsa, AttentionPlacement::Layers)]);
+    assert_eq!(pruned.peer_row_bytes, 0);
+    // Beyond the available pool, removing context leaves the final four-unit
+    // pool unchanged; the equal-pool stepping stone must still be pruned.
+    for gpu in &mut req.inventory.gpus {
+        gpu.baseline = Baseline::Measured { free_bytes: 5 * UNIT };
+    }
+    req.pool.target = 1280;
+    let pruned = solve(&req).unwrap();
+    assert_eq!(pruned.pool_tokens, 1024);
     assert_eq!(pruned.attention_by_kind, [(AttentionClass::Mla, AttentionPlacement::Heads), (AttentionClass::Dsa, AttentionPlacement::Layers)]);
     assert_eq!(pruned.peer_row_bytes, 0);
 }

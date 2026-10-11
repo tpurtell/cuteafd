@@ -3869,7 +3869,7 @@ its 20/20 ranges. Each family's default comes from its own decision gate.
 | K4 | GLM 5.3 `layers`: per-layer executor (`Whole{g, Split}` by indexer group, `AfterAttention` hops via `HopLink`), two-lane decode/verify | L | K2, P9a | quick fidelity; order fixtures per interleaving; A/B at max at 2M |
 | D-GLM | **Decision:** C1 `context` vs `layers` at 2M on max (3 interleaved sessions; 6 if within 1%), plus C8/C16 for both. Default per TJ's rule, recorded in `docs/models/glm5.md` with the numbers. | — | K3, K4 | — |
 | K5 | V4 Flash/Pro `context` on C4 layers (C128 and window layers stay `HeadSplit`), sink in the combine, with P4 TP2 (+2 / +1 pairs) | M | K3, P4 | section 4's V4 rows; exact cache; A/B at max at 2M |
-| K6 | V4 `layers` (`Whole{g, Split}` alternating, P4's fused combine on split FFNs) on S4c/P7's per-layer executor | M | K5, P7 | as K4 |
+| K6 | V4 `layers` (`Whole{g, Split}` with one contiguous ownership switch, P4's fused combine on split FFNs) on S4c/P7's per-layer executor | M | K5, P7 | as K4 |
 | D-V4 | **Decision**, as D-GLM | — | K5, K6 | — |
 | K7 | GLM Flash DSA `context` (11 MLA layers, compact cache on two GPUs); `layers` is P7's mixed mode | M | K3, P7 | section 4's GLM Flash row; D-GLMF on the EXL3 K3.25 max card and the Spark-free card |
 
