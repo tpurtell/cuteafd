@@ -26,6 +26,13 @@ cuteafd_sccache_cuda_setup() {
     cuteafd_compiler_cache_warn 'sccache cache/tool unavailable'; return 0
   fi
   export SCCACHE_DIR="$cache" CUTEAFD_SCCACHE_CUDA_ACTIVE="$wrapper"
+  # WIP containers share the host network, so the default 127.0.0.1:4226
+  # server would be another container's daemon, whose mount namespace lacks
+  # this build's files ("No such file or directory" in CMake's CUDA probe).
+  # Give each cache directory its own port.
+  if [[ -z "${SCCACHE_SERVER_PORT:-}" ]]; then
+    export SCCACHE_SERVER_PORT=$((20000 + $(printf '%s' "$cache" | cksum | cut -d' ' -f1) % 20000))
+  fi
   export CMAKE_CUDA_COMPILER_LAUNCHER="$wrapper"
 }
 
