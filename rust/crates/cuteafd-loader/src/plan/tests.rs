@@ -2095,10 +2095,15 @@ fn attention_placement_heads_preserves_default_layout_and_modes_refuse_at_plan_t
             assert_eq!(auto.config_error, heads.config_error);
             for mode in [AttentionPlacement::Context, AttentionPlacement::Layers] {
                 let unsupported = plan(dir.path(), &PlanOptions { attention_placement: Some(mode), ..options.clone() }).unwrap();
-                assert!(!unsupported.executable());
-                let reason = unsupported.config_error.unwrap();
-                assert!(reason.contains(auto.family.as_deref().unwrap()) && reason.contains(&mode.to_string()), "{reason}");
-                assert!(unsupported.memory_layout.is_none());
+                let executor = crate::placement::families::executor(auto.family.as_deref().unwrap()).unwrap();
+                if executor.check_attention(Some(mode), gpus, gpus == 2).is_ok() {
+                    assert!(unsupported.config_error.is_none());
+                } else {
+                    assert!(!unsupported.executable());
+                    let reason = unsupported.config_error.unwrap();
+                    assert!(reason.contains(auto.family.as_deref().unwrap()) && reason.contains(&mode.to_string()), "{reason}");
+                    assert!(unsupported.memory_layout.is_none());
+                }
             }
         }
     }

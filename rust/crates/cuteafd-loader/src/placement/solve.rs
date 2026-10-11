@@ -14,7 +14,8 @@ pub fn solve(request: &PlacementRequest) -> Result<Placement, PlacementError> {
     // modes the executor actually runs are candidates.
     let mut kinds = std::collections::BTreeMap::<AttentionClass, u64>::new();
     for layer in &request.layers {
-        if layer.kv_unit.unit_bytes_context.is_some() || matches!(layer.kind, AttentionClass::Csa | AttentionClass::Mla | AttentionClass::Dsa) {
+        if layer.kv_unit.unit_bytes_context.is_some() || layer_whole_mode(request, layer, 0).is_some()
+            && layer_whole_mode(request, layer, 1).is_some() {
             let total = |bytes: [u64; 2]| bytes[0].checked_add(bytes[1]).ok_or(PlacementError::Overflow("mode savings"));
             let owned = layer.kv_unit.unit_bytes_context.map(total).transpose()?.unwrap_or(layer.kv_unit.unit_bytes_whole);
             let saving = total(layer.kv_unit.unit_bytes_split)?.saturating_sub(owned);
@@ -31,6 +32,8 @@ pub fn solve(request: &PlacementRequest) -> Result<Placement, PlacementError> {
         let mut selected_flips = prior_flips.clone();
         for mode in [AttentionPlacement::Context, AttentionPlacement::Layers] {
             if mode == AttentionPlacement::Context && !request.layers.iter().any(|l| l.kind == kind && l.kv_unit.unit_bytes_context.is_some()) { continue; }
+            if mode == AttentionPlacement::Layers && !request.layers.iter().any(|l| l.kind == kind
+                && layer_whole_mode(request, l, 0).is_some() && layer_whole_mode(request, l, 1).is_some()) { continue; }
             if request.executor.check_attention(Some(mode), 2, true).is_err() { continue; }
             flips = prior_flips.clone();
             flips.retain(|(k, _)| *k != kind);
@@ -93,7 +96,7 @@ fn solve_once(request: &PlacementRequest, flips: &[(AttentionClass, AttentionPla
     let executor = &request.executor;
     let layer_selected = |layer: &LayerDemand| flips.iter().find(|(kind, _)| *kind == layer.kind).map(|(_, m)| *m)
         .or(request.attention_placement).unwrap_or_else(|| executor.attention_default()) == AttentionPlacement::Layers
-        && matches!(layer.kind, AttentionClass::Csa | AttentionClass::Mla | AttentionClass::Dsa);
+        && layer_whole_mode(request, layer, 0).is_some() && layer_whole_mode(request, layer, 1).is_some();
     let switch = if request.layers.iter().any(&layer_selected) { layer_switch(request, &layer_selected)? } else { 0 };
     let modes = request.layers.iter().enumerate().map(|(index, layer)| {
         let selected = flips.iter().find(|(kind, _)| *kind == layer.kind).map(|(_, m)| *m)
@@ -102,9 +105,9 @@ fn solve_once(request: &PlacementRequest, flips: &[(AttentionClass, AttentionPla
         let desired = match selected {
             Some(AttentionPlacement::Context) if layer.kv_unit.unit_bytes_context.is_some() => Some(LayerMode::ContextSplit),
             Some(AttentionPlacement::Context) => Some(LayerMode::HeadSplit),
-            Some(AttentionPlacement::Layers) if matches!(layer.kind, AttentionClass::Csa | AttentionClass::Mla | AttentionClass::Dsa) => {
+            Some(AttentionPlacement::Layers) if layer_selected(layer) => {
                 let owner = if index < switch { request.layers_first_gpu } else { 1 - request.layers_first_gpu };
-                Some(LayerMode::Whole { gpu: owner, ffn: FfnMode::Split })
+                layer_whole_mode(request, layer, owner)
             }
             Some(AttentionPlacement::Layers) => Some(LayerMode::HeadSplit),
             // Heads is the established layout, including V4.1's ranges.
@@ -364,6 +367,11 @@ fn solve_once(request: &PlacementRequest, flips: &[(AttentionClass, AttentionPla
         tp2: tp2_range,
         items,
     })
+}
+
+fn layer_whole_mode(request: &PlacementRequest, layer: &LayerDemand, gpu: u8) -> Option<LayerMode> {
+    [FfnMode::Split, FfnMode::Owner].into_iter().map(|ffn| LayerMode::Whole { gpu, ffn })
+        .find(|mode| layer.modes.contains(mode) && request.executor.runs(*mode))
 }
 
 /// One ownership boundary, never inside an indexer/colocate group. Compare

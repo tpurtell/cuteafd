@@ -29,6 +29,20 @@ class NativeReleaseLauncherTest(unittest.TestCase):
                 if mode in ['context', 'layers']:
                     self.assertIn(f'{family} cannot run attention placement {mode}', result.stderr)
 
+    def test_v41_layers_refuses_before_runtime_consumes_solver_placement(self) -> None:
+        source = (ROOT / 'run.sh').read_text()
+        block = source.split('attention_placement="${ATTENTION_PLACEMENT:-auto}"', 1)[1].split(
+            'release_validate_table_backend "$TABLE_BACKEND"', 1)[0]
+        self.assertLess(source.index('case "$attention_placement" in'), source.index('docker run'))
+        for mode in ['auto', 'heads', 'context', 'layers', 'bad']:
+            result = subprocess.run(['bash', '-c',
+                'source scripts/lib/release-common.sh; attention_placement="$1"; ' + block,
+                'test', mode], cwd=ROOT, text=True, capture_output=True)
+            self.assertEqual(result.returncode == 0, mode in ['auto', 'heads'], result.stderr)
+            if mode in ['context', 'layers']:
+                self.assertIn(f'deepseek_v41 cannot run attention placement {mode}', result.stderr)
+                self.assertIn('existing ranges stay unchanged', result.stderr)
+
     def test_table_backend_preflight_and_seccomp_are_narrow(self) -> None:
         for backend, valid in [('mmap', True), ('uring', True), ('mincore-routed', True), ('direct', False)]:
             result = subprocess.run(['bash', '-c',

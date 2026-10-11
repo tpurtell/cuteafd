@@ -402,12 +402,19 @@ fn experts_first_falls_back_to_a_spark_pool_below_the_context() {
 
 
 #[test]
-fn attention_selectors_are_strict_until_family_executors_land() {
+fn attention_selectors_follow_declared_executor_capabilities() {
     for executor in families::EXECUTORS {
         assert_eq!(executor.check_attention(None, 2, true).unwrap(), AttentionPlacement::Heads);
         for mode in [AttentionPlacement::Context, AttentionPlacement::Layers] {
-            assert!(matches!(executor.check_attention(Some(mode), 2, true),
-                Err(PlacementError::AttentionPlacement { family, mode: refused, .. }) if family == executor.family && refused == mode));
+            let supported = match mode {
+                AttentionPlacement::Context => executor.runs(LayerMode::ContextSplit),
+                AttentionPlacement::Layers => (0..2).all(|gpu| executor.whole_mode(gpu).is_some()),
+                AttentionPlacement::Heads => unreachable!(),
+            };
+            let result = executor.check_attention(Some(mode), 2, true);
+            if supported { assert_eq!(result.unwrap(), mode); }
+            else { assert!(matches!(result,
+                Err(PlacementError::AttentionPlacement { family, mode: refused, .. }) if family == executor.family && refused == mode)); }
         }
     }
     assert_eq!(attention::parse("auto"), Ok(None));
@@ -479,6 +486,38 @@ fn only_auto_uses_the_memory_lever_and_colocate_groups_keep_their_owner() {
     req.attention_placement = Some(AttentionPlacement::Context);
     req.inventory.peer_access = false;
     assert!(solve(&req).is_err());
+}
+
+#[test]
+fn layers_selector_supports_gqa_gdn_owner_reduction_and_prefers_split() {
+    const OWNERS: ExecutorModes = ExecutorModes { family: "owner", modes: &[W0, W1], hops: true };
+    let mut req = request(2, 96 * GIB, 4, 0, Onboard::Auto);
+    req.executor = OWNERS;
+    req.attention_placement = Some(AttentionPlacement::Layers);
+    req.pool_overhead = vec![0; 2];
+    req.hops = MHC;
+    for (i, layer) in req.layers.iter_mut().enumerate() {
+        layer.kv_unit = ModeBytes::replicated(UNIT / 4).into();
+        layer.kind = if i % 2 == 0 { AttentionClass::Gqa } else { AttentionClass::Gdn };
+        layer.modes = vec![W0, W1];
+        layer.experts = None;
+    }
+    assert_eq!(OWNERS.check_attention(req.attention_placement, 2, true).unwrap(), AttentionPlacement::Layers);
+    let plan = solve(&req).unwrap();
+    assert_eq!(plan.layers.iter().map(|l| l.mode).collect::<Vec<_>>(), [W0, W0, W1, W1]);
+    assert_eq!(plan.hops.len(), 2);
+    assert_eq!(plan.hops[0].at, HopPoint::BeforeLayer(2));
+    assert_eq!(plan.hops[1].at, HopPoint::Exit);
+    assert!(OWNERS.check_attention(req.attention_placement, 1, true).is_err());
+    req.executor = ExecutorModes { family: "both", modes: &[W0, W1, S0, S1], hops: true };
+    for layer in &mut req.layers { layer.modes = vec![W0, W1, S0, S1]; }
+    assert_eq!(req.executor.whole_mode(0), Some(S0));
+    assert_eq!(solve(&req).unwrap().layers.iter().map(|l| l.mode).collect::<Vec<_>>(), [S0, S0, S1, S1]);
+    // A kind with no owner-capable layer kernels stays split even though
+    // other kinds in the same executor support whole ownership.
+    req.layers[1].modes = vec![LayerMode::HeadSplit];
+    req.executor = CONTEXT;
+    assert_eq!(solve(&req).unwrap().layers[1].mode, LayerMode::HeadSplit);
 }
 
 #[test]
@@ -643,7 +682,8 @@ fn section_6_tp2_counts_use_exact_pages_and_real_layer_ownership() {
         layer.kv_unit = if mla { KvDemand { unit_bytes_whole: 256 * 561, unit_bytes_split: [256 * 1073; 2],
             unit_bytes_context: Some([256 * 561 / 2; 2]) } } else { KvDemand::default() };
         layer.context_indexer = mla;
-        layer.modes = vec![LayerMode::HeadSplit, LayerMode::ContextSplit, S0, S1];
+        layer.modes = if mla { vec![LayerMode::HeadSplit, LayerMode::ContextSplit, S0, S1] }
+            else { vec![LayerMode::HeadSplit] };
         layer.experts = (i >= 3).then_some(ExpertCost { whole: Bytes2::default(),
             half: [Bytes2 { resident: (115.59 * GIB as f64 / 42.0 / 2.0) as u64, staging: 0 }; 2], tp2: true, spark_ok: true });
     }
@@ -707,8 +747,15 @@ fn auto_cannot_flip_to_an_unqualified_executor_mode() {
         req.pool_overhead = vec![0; 2];
         let auto = solve(&req).unwrap();
         req.attention_placement = Some(AttentionPlacement::Heads);
-        assert_eq!(auto, solve(&req).unwrap(), "{}", executor.family);
+        let heads = solve(&req).unwrap();
+        if executor.check_attention(Some(AttentionPlacement::Layers), 2, true).is_err() {
+            assert_eq!(auto, heads, "{}", executor.family);
+        } else {
+            assert!(auto.pool_tokens >= heads.pool_tokens);
+        }
         assert!(auto.layers.iter().all(|l| executor.runs(l.mode)));
+        assert!(auto.attention_by_kind.iter().all(|(_, mode)|
+            executor.check_attention(Some(*mode), 2, true).is_ok()));
     }
 }
 
