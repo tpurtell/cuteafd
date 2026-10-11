@@ -376,7 +376,7 @@ struct Active<'a> {
     ticket: console::Ticket,
 }
 
-/// The shared draft policy and its per-round plumbing (`CUTEAFD_GLMF_DRAFT_POLICY=shared`).
+/// The shared draft policy and its per-round plumbing.
 struct SharedPolicy {
     policy: cuteafd_core::DraftPolicy,
     prior: super::draft_binding::Prior,

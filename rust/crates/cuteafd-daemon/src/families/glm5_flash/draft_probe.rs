@@ -13,7 +13,7 @@
 //!
 //! The probe is armed only by the shared draft policy and is active only
 //! between [`RoundProbe::begin`] and [`RoundProbe::finish`] around a serving
-//! verify step: prefill, goldens and the `CycleCost` path never touch it.
+//! verify step: prefill, goldens and fixed/chain draft policies never touch it.
 //! `CUTEAFD_GLMF_ROUTE_RING_CHECK=1` (diagnostic, off by default) also rings
 //! the Spark layers and compares the ring with the staged ids, which checks
 //! the ring on hardware wherever Spark experts serve.
