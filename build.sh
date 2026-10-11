@@ -177,33 +177,7 @@ spark_release_version="${SPARK_EXPERT_DOCKER_INFERENCE##*:}"
 # CUTEAFD_RELEASE_SPARK_TP_ROLES is an explicit SUBSET override for a bounded
 # topology A/B or a legacy TP4-only rebuild (empty).
 # release-spark-tp-roles:start
-release_spark_tp_roles_canonical() {
-  # Echo a role list sorted and de-duplicated, or die. An unknown token, an empty
-  # element, an embedded newline or a duplicate would advertise a topology the
-  # image cannot serve. The wholly empty list is the explicit legacy TP4-only
-  # request. $2 names the source in diagnostics: the build override or the label.
-  local raw="$1" source_name="${2:-CUTEAFD_RELEASE_SPARK_TP_ROLES}"
-  local entry prior
-  local -a parts=() selected=()
-  [[ -n "$raw" ]] || return 0
-  [[ "$raw" != *";;"* && "$raw" != ";"* && "$raw" != *";" && "$raw" != *$'\n'* ]] ||
-    release_die "$source_name is not a ';'-separated role list: $raw"
-  IFS=';' read -ra parts <<<"$raw"
-  for entry in "${parts[@]}"; do
-    case "$entry" in
-      tp2|tp3|tp6) ;;
-      *) release_die "$source_name accepts only tp2, tp3 and tp6, got: $entry" ;;
-    esac
-    for prior in ${selected[@]+"${selected[@]}"}; do
-      [[ "$prior" != "$entry" ]] ||
-        release_die "$source_name lists $entry more than once"
-    done
-    selected+=("$entry")
-  done
-  printf '%s\n' "${selected[@]}" | sort | paste -sd';' -
-}
-
-release_universal_spark_tp_roles="tp2;tp3;tp6"
+release_universal_spark_tp_roles="$(release_spark_tp_roles_default)"
 # `${VAR-default}`, not `:-`, so an explicitly empty override stays the legacy
 # TP4-only request rather than falling back to the universal set.
 spark_tp_roles="$(release_spark_tp_roles_canonical \
