@@ -920,7 +920,7 @@ impl<'a> Engine<'a> {
                 (Some(link), _) => link.pointers(),
                 (None, Some(transport)) => transport.intake.pointers(),
                 (None, None) if self.skip_routed || self.local_layers() == self.weights.layers.len() =>
-                    [std::ptr::null(); 6],
+                    [std::ptr::null(); crate::shared::spark_intake::MAX_INTAKE_RANKS],
                 (None, None) => anyhow::bail!("no transport"),
             };
             let local_layers = self.local_layers();
@@ -1020,10 +1020,10 @@ impl<'a> Engine<'a> {
             };
             let local_layers = self.local_layers();
             let pipelined = transports.len() >= lanes.len() && lanes.len() > 1;
-            let planes: Vec<[*const u16; 6]> = transports.iter().map(|t| t.intake.pointers()).collect();
+            let planes: Vec<[*const u16; crate::shared::spark_intake::MAX_INTAKE_RANKS]> = transports.iter().map(|t| t.intake.pointers()).collect();
             let post = |(layer, lane): (usize, usize), ranks: usize| {
                 let slot = if pipelined { lane } else { 0 };
-                let plane = planes.get(slot).copied().unwrap_or([std::ptr::null(); 6]);
+                let plane = planes.get(slot).copied().unwrap_or([std::ptr::null(); crate::shared::spark_intake::MAX_INTAKE_RANKS]);
                 self.post_layer(w, &w.lanes[lane], lane, ranks, plane, rows_of(lane), layer)?;
                 self.tap(w, &w.lanes[lane], layer, lanes[lane].tables.rows)
             };
@@ -1203,7 +1203,7 @@ impl<'a> Engine<'a> {
 
     /// The layer's routed partials + shared expert, reduced, then mHC post
     /// into stream a.
-    fn post(&self, w: &Workspace<'_>, lane: &Lane<'_>, ranks: usize, planes: [*const u16; 6], rows: Scalar,
+    fn post(&self, w: &Workspace<'_>, lane: &Lane<'_>, ranks: usize, planes: [*const u16; crate::shared::spark_intake::MAX_INTAKE_RANKS], rows: Scalar,
         layer: usize) -> Result<()> {
         if ranks == SKIPPED_EXPERTS {
             return self.run("mhc_post", &[
@@ -1237,7 +1237,7 @@ impl<'a> Engine<'a> {
 
     /// A backbone layer's [`Self::post`] for lane `index`: [`Self::post_split`] under a head split.
     #[allow(clippy::too_many_arguments)]
-    fn post_layer(&self, w: &Workspace<'_>, lane: &Lane<'_>, index: usize, ranks: usize, planes: [*const u16; 6],
+    fn post_layer(&self, w: &Workspace<'_>, lane: &Lane<'_>, index: usize, ranks: usize, planes: [*const u16; crate::shared::spark_intake::MAX_INTAKE_RANKS],
         rows: Scalar, layer: usize) -> Result<()> {
         if self.peer.is_some() {
             self.post_split(w, lane, index, ranks, planes, rows, layer)
@@ -1251,7 +1251,7 @@ impl<'a> Engine<'a> {
     /// half alone when routed experts are skipped), sent to rank 1 first (not after
     /// the last layer), plus rank 1's half, then mHC post.
     #[allow(clippy::too_many_arguments)]
-    fn post_split(&self, w: &Workspace<'_>, lane: &Lane<'_>, index: usize, ranks: usize, planes: [*const u16; 6],
+    fn post_split(&self, w: &Workspace<'_>, lane: &Lane<'_>, index: usize, ranks: usize, planes: [*const u16; crate::shared::spark_intake::MAX_INTAKE_RANKS],
         rows: Scalar, layer: usize) -> Result<()> {
         let Scalar::I32(count) = rows else { unreachable!() };
         if self.tp2_layer(layer) && ranks == LOCAL_EXPERTS {

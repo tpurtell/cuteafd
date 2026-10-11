@@ -63,7 +63,7 @@ pub(super) fn expert_capacity(prefill_rows: usize) -> usize {
 const ATTENTION_PARTS: usize = 3;
 
 /// Most Spark ranks a step's partials come from (the compact reducer's limit).
-const MAX_RANKS: usize = 6;
+const MAX_RANKS: usize = crate::shared::spark_intake::MAX_INTAKE_RANKS;
 
 /// What the coordinator sends the Spark ranks as expert input rows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]

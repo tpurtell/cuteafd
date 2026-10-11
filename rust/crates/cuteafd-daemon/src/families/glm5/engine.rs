@@ -48,7 +48,7 @@ pub(crate) const RECORD_BYTES: usize = 656;
 const RECORD_PAGE_BYTES: usize = PAGE_ROWS * RECORD_BYTES;
 pub(crate) const INDEX_PAGE_BYTES: usize = 8448;
 /// Most Spark ranks a step's partials come from (the compact reducer's limit).
-const MAX_RANKS: usize = 6;
+const MAX_RANKS: usize = crate::shared::spark_intake::MAX_INTAKE_RANKS;
 /// Ranks whose (zero) partials a skipped exchange uploads: the TP4 layout.
 const SKIP_RANKS: usize = 4;
 /// Rows of the decode-route programs (`_m64`).
@@ -1060,7 +1060,7 @@ impl<'a> GlmEngine<'a> {
         let planes = match (experts.as_ref(), &self.skip) {
             (_, Some(skip)) => skip.pointers(),
             (Some((transport, _)), None) => transport.intake.pointers(),
-            (None, None) => [std::ptr::null(); 6],
+            (None, None) => [std::ptr::null(); MAX_RANKS],
         };
         // Previous layer's FFN output: none (first layer), in `delta`, or Spark planes.
         let mut previous = Previous::First;
@@ -1470,7 +1470,7 @@ impl<'a> GlmEngine<'a> {
         let owned = self.lane_workspaces.borrow();
         let workspaces: Vec<&Workspace<'_>> = owned.iter().collect();
         let mut transports = self.lanes.borrow_mut();
-        let planes: Vec<[*const u16; 6]> = transports.iter().map(|lane| lane.intake.pointers()).collect();
+        let planes: Vec<[*const u16; crate::shared::spark_intake::MAX_INTAKE_RANKS]> = transports.iter().map(|lane| lane.intake.pointers()).collect();
         ensure!(transports.len() >= lanes.len(), "{} lanes need as many lane transports", lanes.len());
         let counts: Vec<usize> = lanes.iter().map(|l| l.positions.len()).collect();
         let starts: Vec<usize> = counts.iter().scan(0, |first, &n| {
@@ -1644,7 +1644,7 @@ impl<'a> GlmEngine<'a> {
     /// A transport's rank planes + shared expert into `delta`. The next
     /// wave on that transport is dispatched only after its stage's stream
     /// sync, which follows this reduce.
-    fn reduce(&self, planes: [*const u16; 6], w: &Workspace<'_>, ranks: usize, t: usize) -> Result<()> {
+    fn reduce(&self, planes: [*const u16; crate::shared::spark_intake::MAX_INTAKE_RANKS], w: &Workspace<'_>, ranks: usize, t: usize) -> Result<()> {
         // SAFETY: the transport's intake planes, shared and delta are live
         // [t, h] BF16 buffers ordered after the wave's intake.
         unsafe {

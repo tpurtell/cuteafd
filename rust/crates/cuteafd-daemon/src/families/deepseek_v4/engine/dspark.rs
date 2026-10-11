@@ -200,7 +200,7 @@ impl<'a> Engine<'a> {
                         w.route_weights.buffer.ptr, lane.shared.buffer.ptr, self.stream)?;
                 }
             }
-            self.post(w, lane, LOCAL_EXPERTS, [std::ptr::null(); 6], scalar, layer)?;
+            self.post(w, lane, LOCAL_EXPERTS, [std::ptr::null(); crate::shared::spark_intake::MAX_INTAKE_RANKS], scalar, layer)?;
         }
         self.run("mhc_head", &[
             ("residual", lane.stream_a.buffer.ptr), ("fn", dspark.head_fn.buffer.ptr),

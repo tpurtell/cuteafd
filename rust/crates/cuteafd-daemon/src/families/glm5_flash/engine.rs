@@ -295,7 +295,7 @@ impl RecordGuard {
     }
 }
 
-const MAX_RANKS: usize = 6;
+const MAX_RANKS: usize = crate::shared::spark_intake::MAX_INTAKE_RANKS;
 /// Lanes a long Spark prefill chunk splits into by default, and at most (`--prefill-lanes`; each
 /// lane's GPU layers run while the other lanes' Spark waves are in flight, one transport per
 /// lane), and the fewest rows per lane worth another exchange per layer.
