@@ -190,12 +190,11 @@ pub fn v41_pack_intermediate_supported(intermediate: u32) -> bool {
     intermediate > 0 && intermediate % 32 == 0 && intermediate <= 8192
 }
 
-/// Physical-rank counts the compact reduction contract defines: legacy 2 and 4
-/// plus whole-expert TP1 and replicated-group 3 and 6. Library-independent; use
+/// Physical-rank counts the compact reduction contract defines: one through eight. Library-independent; use
 /// [`V41CompactReducer::supports_rank_count`] for what the loaded library can
 /// actually execute.
 pub fn v41_rank_count_supported(ranks: u32) -> bool {
-    matches!(ranks, 1 | 2 | 3 | 4 | 6)
+    (1..=8).contains(&ranks)
 }
 
 /// Expected `(experts, logical, kernel, topk)` for one `(family, role)` pair
@@ -308,15 +307,15 @@ impl V41CompactReducer<'_> {
     /// Whether the loaded library can reduce `ranks` physical-rank BF16 planes.
     ///
     /// 4 is always available (the 4-plane entry point is required to construct
-    /// this handle); 2 depends on the optional TP2 entry point and 1/3/6 depend on
+    /// this handle); 2 depends on the optional TP2 entry point and 1/3/5/6/7/8 depend on
     /// the optional N-plane entry point. Check this during admission, before any
     /// allocation or readiness publication, so an older library fails fast
     /// instead of at the first reduction. Any other value is unsupported.
     pub fn supports_rank_count(&self, ranks: u32) -> bool {
         match ranks {
-            2 => self.reduce_tp2.is_some(),
+            2 => self.reduce_planes.is_some() || self.reduce_tp2.is_some(),
             4 => true,
-            1 | 3 | 6 => self.reduce_planes.is_some(),
+            1 | 3 | 5 | 6 | 7 | 8 => self.reduce_planes.is_some(),
             _ => false,
         }
     }
@@ -326,7 +325,7 @@ impl V41CompactReducer<'_> {
     pub fn require_rank_count(&self, ranks: u32) -> Result<()> {
         ensure!(
             v41_rank_count_supported(ranks),
-            "unsupported physical rank count {ranks}; expected 1, 2, 3, 4 or 6"
+            "unsupported physical rank count {ranks}; expected 1 through 8"
         );
         ensure!(
             self.supports_rank_count(ranks),
@@ -338,7 +337,7 @@ impl V41CompactReducer<'_> {
     /// The physical-rank counts this loaded library can reduce, in ascending
     /// order. Useful for startup logging and fallback rejection.
     pub fn available_rank_counts(&self) -> Vec<u32> {
-        [1u32, 2, 3, 4, 6]
+        (1u32..=8)
             .into_iter()
             .filter(|ranks| self.supports_rank_count(*ranks))
             .collect()
@@ -404,6 +403,10 @@ impl V41CompactReducer<'_> {
         rows: u32,
         stream: *mut c_void,
     ) -> Result<()> {
+        if self.reduce_planes.is_some() {
+            // SAFETY: forwards the caller's device views and lifetime contract.
+            return unsafe { self.reduce_planes(planes, 2, shared, output, rows, stream) };
+        }
         let function = self.reduce_tp2.context("native TP2 compact BF16 reduction unavailable")?;
         let status = unsafe { function(planes.as_ptr(), shared, output, rows, stream) };
         ensure!(status == 0, "V4.1 TP2 compact reduction failed with CUDA status {status}");
@@ -424,6 +427,10 @@ impl V41CompactReducer<'_> {
         rows: u32,
         stream: *mut c_void,
     ) -> Result<()> {
+        if self.reduce_planes.is_some() {
+            // SAFETY: forwards the caller's device views and lifetime contract.
+            return unsafe { self.reduce_planes(planes, 4, shared, output, rows, stream) };
+        }
         let status = unsafe { (self.reduce)(planes.as_ptr(), shared, output, rows, stream) };
         ensure!(
             status == 0,
@@ -438,14 +445,14 @@ impl V41CompactReducer<'_> {
     /// one plane directly to the coordinator, with no group-local reduction.
     /// # Safety
     /// `planes[0..ranks]` must be live non-null CUDA BF16 [rows,5120] views on the
-    /// current device; `planes[ranks..6]` must be null. Output must not overlap any
+    /// current device; `planes[ranks..N]` must be null. Output must not overlap any
     /// plane and may alias `shared` only exactly. 1 <= rows <= 4096 and ranks is
-    /// 1, 2, 3, 4 or 6. Storage and this library must outlive stream completion and
-    /// every captured graph replay, with producer writes ordered first. The six
+    /// in 1..=8. Storage and this library must outlive stream completion and
+    /// every captured graph replay, with producer writes ordered first. The eight
     /// pointers travel to the kernel by value; no device pointer array is used.
-    pub unsafe fn reduce_planes(
+    pub unsafe fn reduce_planes<const N: usize>(
         &self,
-        planes: [*const u16; 6],
+        planes: [*const u16; N],
         ranks: u32,
         shared: *const u16,
         output: *mut u16,
@@ -453,13 +460,18 @@ impl V41CompactReducer<'_> {
         stream: *mut c_void,
     ) -> Result<()> {
         ensure!(
-            matches!(ranks, 1 | 2 | 3 | 4 | 6),
-            "N-plane reduction requires ranks 1, 2, 3, 4 or 6"
+            (1..=8).contains(&ranks),
+            "N-plane reduction requires ranks 1 through 8"
         );
         let function = self
             .reduce_planes
             .context("native N-plane compact BF16 reduction unavailable")?;
-        let status = unsafe { function(planes.as_ptr(), shared, output, rows, ranks, stream) };
+        ensure!(N <= 8 && ranks as usize <= N, "rank planes exceed the supplied buffer or eight-slot ABI");
+        let mut eight = [std::ptr::null(); 8];
+        eight[..N].copy_from_slice(&planes);
+        // SAFETY: the local eight-slot host array is read synchronously; device
+        // buffers retain the caller's documented stream/graph lifetime.
+        let status = unsafe { function(eight.as_ptr(), shared, output, rows, ranks, stream) };
         ensure!(
             status == 0,
             "V4.1 {ranks}-plane compact reduction failed with CUDA status {status}"
@@ -528,7 +540,7 @@ impl NativeLibrary {
             },
             reduce_planes: unsafe {
                 self.lib
-                    .get::<ReduceCompactPlanesFn>(b"cuteafd_reduce_compact_bf16_planes_async")
+                    .get::<ReduceCompactPlanesFn>(b"cuteafd_reduce_compact_bf16_eight_planes_async")
                     .ok()
                     .map(|f| *f)
             },
@@ -953,11 +965,11 @@ mod tests {
     }
 
     #[test]
-    fn rank_count_contract_is_one_two_three_four_six() {
-        for ranks in [1u32, 2, 3, 4, 6] {
+    fn rank_count_contract_is_one_through_eight() {
+        for ranks in 1u32..=8 {
             assert!(v41_rank_count_supported(ranks));
         }
-        for ranks in [0u32, 5, 7, 12] {
+        for ranks in [0u32, 9, 12] {
             assert!(!v41_rank_count_supported(ranks));
         }
     }
@@ -972,17 +984,17 @@ mod tests {
         assert!(reducer.supports_rank_count(4));
         assert!(reducer.require_rank_count(4).is_ok());
         // Unsupported counts are rejected before any allocation or launch.
-        assert!(!reducer.supports_rank_count(5));
-        assert!(reducer.require_rank_count(5).is_err());
+        assert!(!reducer.supports_rank_count(9));
+        assert!(reducer.require_rank_count(9).is_err());
         assert!(reducer.require_rank_count(0).is_err());
         // Whatever the library reports must agree with the contract set.
         for ranks in reducer.available_rank_counts() {
             assert!(v41_rank_count_supported(ranks));
             assert!(reducer.require_rank_count(ranks).is_ok());
         }
-        // The current build must expose the replicated-group 3/6 path.
+        // The current build must expose every count through the eight-slot path.
         assert!(
-            reducer.supports_rank_count(3) && reducer.supports_rank_count(6),
+            (1..=8).all(|ranks| reducer.supports_rank_count(ranks)),
             "current library is missing the N-plane compact reducer"
         );
         Ok(())

@@ -1,7 +1,7 @@
 // Exact-reference check for the replicated-group N-plane compact reducer.
 //
 // Independent host scalar reference: each physical rank contributes one BF16
-// [rows,5120] plane, the 1/2/3/4/6 planes are summed in rank order in FP32, the
+// [rows,5120] plane, the 1..8 planes are summed in rank order in FP32, the
 // optional BF16 shared expert is added exactly once, and the result is rounded
 // once to BF16. Also checks:
 //   * the historical TP2/TP4 entry points agree bit-for-bit with the generic
@@ -13,7 +13,7 @@
 //     (ranks 1, 3 and 6) instead of baking them;
 //   * all-zero and single-zero active planes contribute exact zeros;
 //   * every malformed case is rejected with exactly one violation in an
-//     otherwise-valid six-slot argument set.
+//     otherwise-valid eight-slot argument set.
 //
 // Requires a CUDA device; exits 77 (ctest SKIP) when none is present.
 #include "cuteafd_experts.h"
@@ -63,9 +63,9 @@ float from_bf16(uint16_t value) {
 // BF16-representable, order-sensitive payloads: the cancellation pairs expose
 // an ordered FP32 sum, and the small offsets expose an intermediate rounding.
 float payload(uint32_t rank, uint32_t index) {
-  static const float first[6] = {16777216.0f, 1.0f, -16777216.0f, 1.0f, 0.5f, -0.5f};
-  static const float second[6] = {256.0f, 1.0f, 2.0f, -1.0f, 0.25f, -0.25f};
-  static const float third[6] = {-256.0f, -1.0f, -2.0f, 1.0f, -0.25f, 0.25f};
+  static const float first[8] = {16777216.0f, 1.0f, -16777216.0f, 1.0f, 0.5f, -0.5f, 2.0f, -2.0f};
+  static const float second[8] = {256.0f, 1.0f, 2.0f, -1.0f, 0.25f, -0.25f, 0.125f, -0.125f};
+  static const float third[8] = {-256.0f, -1.0f, -2.0f, 1.0f, -0.25f, 0.25f, -0.125f, 0.125f};
   switch (index % 8) {
     case 0: return first[rank];
     case 1: return second[rank];
@@ -84,7 +84,7 @@ int main() {
   }
   check_cuda(cudaSetDevice(0), "cudaSetDevice");
 
-  void* raw[6] = {};
+  void* raw[8] = {};
   void* shared_raw = nullptr;
   void* output_raw = nullptr;
   // Second independent destination for the generic-vs-fixed equivalence check.
@@ -97,11 +97,11 @@ int main() {
 
   // Host-side mirror of the BF16 values currently resident in raw[rank]; the
   // scalar reference always reads this, never the device contents.
-  std::vector<uint16_t> host_plane[6];
+  std::vector<uint16_t> host_plane[8];
   std::vector<uint16_t> host_shared;
 
   auto fill_host = [&](uint32_t rows, float scale, float shared_value) {
-    for (uint32_t rank = 0; rank < 6; ++rank) {
+    for (uint32_t rank = 0; rank < 8; ++rank) {
       host_plane[rank].resize(size_t(rows) * kHidden);
       for (size_t i = 0; i < host_plane[rank].size(); ++i)
         host_plane[rank][i] = bf16(payload(rank, static_cast<uint32_t>(i)) * scale);
@@ -109,7 +109,7 @@ int main() {
     host_shared.assign(size_t(rows) * kHidden, bf16(shared_value));
   };
   auto upload_planes = [&]() {
-    for (uint32_t rank = 0; rank < 6; ++rank)
+    for (uint32_t rank = 0; rank < 8; ++rank)
       check_cuda(cudaMemcpy(raw[rank], host_plane[rank].data(),
                             host_plane[rank].size() * 2, cudaMemcpyHostToDevice),
                  "upload plane");
@@ -118,10 +118,10 @@ int main() {
     check_cuda(cudaMemcpy(shared_raw, host_shared.data(), size_t(rows) * kHidden * 2,
                           cudaMemcpyHostToDevice), "upload shared");
   };
-  // Six-slot view with exactly `ranks` active planes; inactive slots are null.
+  // Eight-slot view with exactly `ranks` active planes; inactive slots are null.
   auto slots = [&](uint32_t ranks) {
-    std::array<const uint16_t*, 6> selected{};
-    for (uint32_t rank = 0; rank < 6; ++rank)
+    std::array<const uint16_t*, 8> selected{};
+    for (uint32_t rank = 0; rank < 8; ++rank)
       selected[rank] = rank < ranks ? reinterpret_cast<const uint16_t*>(raw[rank]) : nullptr;
     return selected;
   };
@@ -167,7 +167,7 @@ int main() {
                      : reinterpret_cast<uint16_t*>(output_raw);
     check_cuda(cudaMemset(destination, kPoison, plane_bytes), "poison destination");
     if (use_shared) upload_shared(rows);
-    require(cuteafd_reduce_compact_bf16_planes_async(
+    require(cuteafd_reduce_compact_bf16_eight_planes_async(
                 selected.data(), use_shared ? reinterpret_cast<const uint16_t*>(shared_raw)
                                             : nullptr,
                 destination, rows, ranks, nullptr) == cudaSuccess,
@@ -181,10 +181,30 @@ int main() {
   for (uint32_t rows : {1u, 16u, 80u, 3u, 4096u}) {
     fill_host(rows, 1.0f, 1.0f);
     upload_planes();
-    for (uint32_t ranks : {1u, 2u, 3u, 4u, 6u}) {
+    for (uint32_t ranks : {1u, 2u, 3u, 4u, 5u, 6u, 7u, 8u}) {
       launch_and_verify(rows, ranks, false, false, "no shared");
       launch_and_verify(rows, ranks, true, false, "with shared");
       launch_and_verify(rows, ranks, true, true, "shared exact alias");
+
+      // Keep a legacy-symbol byte comparison until all callers have migrated.
+      if (ranks == 2 || ranks == 3 || ranks == 4 || ranks == 6) {
+        const auto selected = slots(ranks);
+        for (bool use_shared : {false, true}) {
+          if (use_shared) upload_shared(rows);
+          const auto* shared = use_shared ? reinterpret_cast<const uint16_t*>(shared_raw) : nullptr;
+          require(cuteafd_reduce_compact_bf16_planes_async(selected.data(), shared,
+                      reinterpret_cast<uint16_t*>(equivalence_raw), rows, ranks, nullptr) == cudaSuccess,
+                  "legacy equivalence launch failed");
+          require(cuteafd_reduce_compact_bf16_eight_planes_async(selected.data(), shared,
+                      reinterpret_cast<uint16_t*>(output_raw), rows, ranks, nullptr) == cudaSuccess,
+                  "eight-plane equivalence launch failed");
+          check_cuda(cudaStreamSynchronize(nullptr), "legacy equivalence synchronize");
+          std::vector<uint16_t> a(size_t(rows) * kHidden), b(size_t(rows) * kHidden);
+          check_cuda(cudaMemcpy(a.data(), output_raw, a.size() * 2, cudaMemcpyDeviceToHost), "copy eight");
+          check_cuda(cudaMemcpy(b.data(), equivalence_raw, b.size() * 2, cudaMemcpyDeviceToHost), "copy legacy");
+          require(a == b, "eight-plane and legacy reducers disagree");
+        }
+      }
 
       // The historical 2- and 4-plane entry points must be bit-identical to the
       // generic entry point for the same ordered planes.
@@ -194,7 +214,7 @@ int main() {
         uint16_t* fixed_output = reinterpret_cast<uint16_t*>(equivalence_raw);
         check_cuda(cudaMemset(generic, 0, plane_bytes), "memset generic");
         check_cuda(cudaMemset(fixed_output, 0, plane_bytes), "memset fixed");
-        require(cuteafd_reduce_compact_bf16_planes_async(
+        require(cuteafd_reduce_compact_bf16_eight_planes_async(
                     selected.data(), nullptr, generic, rows, ranks, nullptr) == cudaSuccess,
                 "generic equivalence launch failed");
         if (ranks == 2) {
@@ -229,7 +249,7 @@ int main() {
     const uint32_t rows = 16;
     fill_host(rows, 1.0f, 1.0f);
     upload_planes();
-    for (uint32_t ranks : {1u, 2u, 3u, 4u, 6u}) {
+    for (uint32_t ranks : {1u, 2u, 3u, 4u, 5u, 6u, 7u, 8u}) {
       for (uint32_t zero = 0; zero < ranks; ++zero) {
         const std::vector<uint16_t> saved = host_plane[zero];
         std::fill(host_plane[zero].begin(), host_plane[zero].end(), uint16_t(0));
@@ -242,7 +262,7 @@ int main() {
                               size_t(rows) * kHidden * 2, cudaMemcpyHostToDevice),
                    "restore active plane");
       }
-      for (uint32_t rank = 0; rank < 6; ++rank) {
+      for (uint32_t rank = 0; rank < 8; ++rank) {
         std::fill(host_plane[rank].begin(), host_plane[rank].end(), uint16_t(0));
         check_cuda(cudaMemcpy(raw[rank], host_plane[rank].data(),
                               size_t(rows) * kHidden * 2, cudaMemcpyHostToDevice),
@@ -262,7 +282,7 @@ int main() {
     const uint32_t rows = 16;
     cudaStream_t stream = nullptr;
     check_cuda(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), "create capture stream");
-    for (uint32_t ranks : {1u, 3u, 6u}) {
+    for (uint32_t ranks : {1u, 3u, 6u, 7u, 8u}) {
       fill_host(rows, 1.0f, 1.0f);
       upload_planes();
       upload_shared(rows);
@@ -270,7 +290,7 @@ int main() {
       const auto selected = slots(ranks);
       check_cuda(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal),
                  "begin capture");
-      require(cuteafd_reduce_compact_bf16_planes_async(
+      require(cuteafd_reduce_compact_bf16_eight_planes_async(
                   selected.data(), reinterpret_cast<const uint16_t*>(shared_raw),
                   reinterpret_cast<uint16_t*>(output_raw), rows, ranks, stream) == cudaSuccess,
               "captured launch failed");
@@ -311,13 +331,13 @@ int main() {
     auto* output = reinterpret_cast<uint16_t*>(output_raw);
     auto call = [&](const uint16_t* const* planes, const uint16_t* shared,
                     uint16_t* destination, uint32_t call_rows, uint32_t ranks) {
-      return cuteafd_reduce_compact_bf16_planes_async(
+      return cuteafd_reduce_compact_bf16_eight_planes_async(
           planes, shared, destination, call_rows, ranks, nullptr);
     };
 
     const auto all_six = slots(6);
-    require(call(all_six.data(), nullptr, output, rows, 5) != cudaSuccess,
-            "ranks=5 accepted");
+    require(call(all_six.data(), nullptr, output, rows, 9) != cudaSuccess,
+            "ranks=9 accepted");
     require(call(all_six.data(), nullptr, output, rows, 0) != cudaSuccess,
             "ranks=0 accepted");
     require(call(all_six.data(), nullptr, output, 0, 6) != cudaSuccess,

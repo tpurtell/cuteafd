@@ -150,7 +150,9 @@ int32_t cuteafd_reduce_compact_bf16_async(const uint16_t* const planes[4],
  * Same alias/lifetime rules as TP4 above; no allocation or synchronization. */
 int32_t cuteafd_reduce_tp2_compact_bf16_async(const uint16_t* const planes[2],
     const uint16_t* shared, uint16_t* output, uint32_t rows, void* stream);
-/* Replicated-group compact reduction: sum `ranks` BF16 [rows,5120] physical-rank
+/* Deprecated six-slot ABI; retained only for the migration equivalence gate.
+ * Delete after the gate no longer needs the legacy symbol.
+ * Replicated-group compact reduction: sum `ranks` BF16 [rows,5120] physical-rank
  * partial planes in rank order in FP32, add optional BF16 shared exactly once,
  * then round once to BF16. ranks must be 1, 2, 3, 4 or 6. planes is a host array of
  * six device pointers: entries [0,ranks) must be non-null and aligned; entries
@@ -160,6 +162,13 @@ int32_t cuteafd_reduce_tp2_compact_bf16_async(const uint16_t* const planes[2],
  * any plane). 1 <= rows <= 4096. The kernel receives the six pointers by value;
  * no device pointer array and no per-call allocation are used. */
 int32_t cuteafd_reduce_compact_bf16_planes_async(const uint16_t* const planes[6],
+    const uint16_t* shared, uint16_t* output, uint32_t rows, uint32_t ranks,
+    void* stream);
+/* Eight-slot successor of the six-slot ABI above. ranks is in 1..8;
+ * inactive slots [ranks,8) must be null. Ordered FP32 accumulation and BF16
+ * rounding are identical to the legacy reducer for every legacy rank count.
+ * Same alias/lifetime rules; eight device pointers are passed by value. */
+int32_t cuteafd_reduce_compact_bf16_eight_planes_async(const uint16_t* const planes[8],
     const uint16_t* shared, uint16_t* output, uint32_t rows, uint32_t ranks,
     void* stream);
 /* Full local routed output: sum six FP32 routes (token_sums=0) or consume

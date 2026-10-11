@@ -755,7 +755,7 @@ unsafe fn enqueue_reduce_planes(reducer: &V41CompactReducer<'_>, stream: &LoadSt
         4 => unsafe { reducer.reduce(
             std::array::from_fn(|rank| planes[rank].buffer.ptr.cast::<u16>().cast_const()),
             shared, output.ptr.cast(), rows, stream.raw) },
-        3 | 6 => unsafe { reducer.reduce_planes(
+        3 | 6 => unsafe { reducer.reduce_planes::<8>(
             std::array::from_fn(|rank| planes.get(rank)
                 .map_or(std::ptr::null(), |plane| plane.buffer.ptr.cast::<u16>().cast_const())),
             planes.len() as u32, shared, output.ptr.cast(), rows, stream.raw) },
