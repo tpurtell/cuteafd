@@ -7,6 +7,7 @@
 //! solver state theirs now, so their solver ports (P6, P8-P10, P12) start
 //! from the executor's real limits.
 pub mod deepseek_v4;
+pub mod glm5;
 
 use super::{ExecutorModes, FfnMode, LayerMode};
 
