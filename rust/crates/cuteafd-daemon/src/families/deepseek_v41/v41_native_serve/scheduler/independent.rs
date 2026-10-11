@@ -1,8 +1,9 @@
 //! Lane-local rounds; shared owners are borrowed only during synchronous work.
 use super::*;
-use std::cell::{Cell, RefCell};
+use crate::shared::serve::lanes::{self, LaneCommit, LaneLease, LaneSet};
+use std::cell::RefCell;
 
-pub(super) fn run<'a, P: VerificationTarget<'a>, C: DraftChain<'a>>(lib: &'a NativeLibrary, runtime: &tokio::runtime::Runtime,
+pub(super) fn run<'a, P: VerificationTarget<'a>, C: DraftChain<'a>>(runtime: &tokio::runtime::Runtime,
     first: &mut P, second: &mut P, requests: &mut Requests<'a>,
     first_transport: &mut P::Transport, second_transport: &mut P::Transport,
     active: &mut [Option<Active<'a>>], draft: Option<&mut DraftRuntime<'_, 'a, C>>,
@@ -12,25 +13,64 @@ pub(super) fn run<'a, P: VerificationTarget<'a>, C: DraftChain<'a>>(lib: &'a Nat
     let active = RefCell::new(active);
     let draft = RefCell::new(draft);
     let prefixes = RefCell::new(prefixes);
-    let drain = Cell::new(false);
+    let set = LaneSet::default();
     // Do not cancel the peer future on error: it may own queued CUDA/RDMA work.
-    let results = runtime.block_on(async { tokio::join!(
-        lane(0, lib, first, first_transport, &requests, &active, &draft, &prefixes, receive, &drain, wake),
-        lane(1, lib, second, second_transport, &requests, &active, &draft, &prefixes, receive, &drain, wake),
-    ) });
-    results.0?; results.1?;
-    Ok(())
+    runtime.block_on(set.join(
+        set.lease(0).run(lane(set.lease(0), first, first_transport, &requests, &active, &draft, &prefixes, receive, wake)),
+        set.lease(1).run(lane(set.lease(1), second, second_transport, &requests, &active, &draft, &prefixes, receive, wake)),
+    ))
 }
 
-async fn lane<'a, P: VerificationTarget<'a>, C: DraftChain<'a>>(lane: usize, lib: &'a NativeLibrary, pass: &mut P,
+/// One lane round's target and draft commit.
+struct Commit<'r, 'q, 'w, 'd, 'a, P: VerificationTarget<'a>, C: DraftChain<'a>> {
+    lane: usize,
+    pass: &'r mut P,
+    requests: &'r RefCell<&'q mut Requests<'a>>,
+    draft: &'r RefCell<Option<&'d mut DraftRuntime<'w, 'a, C>>>,
+    batch: &'r mut RequestBatch,
+    accepted: &'r [u32],
+}
+impl<'a, P: VerificationTarget<'a>, C: DraftChain<'a>> LaneCommit for Commit<'_, '_, '_, '_, 'a, P, C> {
+    fn begin(&mut self) -> Result<()> {
+        if let Some(draft) = self.draft.borrow_mut().as_deref_mut() {
+            draft.begin_queued_commit(self.lane, self.pass, &self.requests.borrow(), self.batch, self.accepted)?;
+        }
+        self.pass.enqueue_cache_commit(&self.requests.borrow(), self.batch, self.accepted)
+    }
+    fn ready(&mut self) -> Result<bool> {
+        let draft = self.draft.borrow().as_deref().map(|draft| draft.poll_queued_commit(self.lane))
+            .transpose()?.unwrap_or(true);
+        Ok(self.pass.poll_cache_commit()? && draft)
+    }
+    fn publish(&mut self) -> Result<()> {
+        match self.draft.borrow_mut().as_deref_mut() {
+            Some(draft) => draft.finish_queued_commit(self.lane, self.pass, &mut self.requests.borrow_mut(),
+                self.batch, self.accepted),
+            None => self.pass.commit(&mut self.requests.borrow_mut(), self.batch, self.accepted),
+        }
+    }
+    fn abort_and_drain(&mut self) -> Result<()> {
+        let target = self.pass.abort_cache_commit(&mut self.requests.borrow_mut());
+        if let Err(cleanup) = &target { tracing::error!(%cleanup, "draining failed lane window commit"); }
+        let draft = match self.draft.borrow_mut().as_deref_mut() {
+            Some(draft) => draft.abort_queued_commit(self.lane, &mut self.requests.borrow_mut(), self.batch),
+            None => { self.requests.borrow_mut().revoke_batch(self.batch); Ok(()) }
+        };
+        if let Err(cleanup) = &draft { tracing::error!(%cleanup, "draining failed lane draft commit"); }
+        target.and(draft)
+    }
+}
+
+async fn lane<'a, P: VerificationTarget<'a>, C: DraftChain<'a>>(lease: LaneLease<'_>, pass: &mut P,
     transport: &mut P::Transport, requests: &RefCell<&mut Requests<'a>>,
     active: &RefCell<&mut [Option<Active<'a>>]>, draft: &RefCell<Option<&mut DraftRuntime<'_, 'a, C>>>,
-    prefixes: &RefCell<&mut PrefixCache<'a>>, receive: &mpsc::Receiver<NativeRequest>, drain: &Cell<bool>, wake: admission::Wake<'_>,
+    prefixes: &RefCell<&mut PrefixCache<'a>>, receive: &mpsc::Receiver<NativeRequest>, wake: admission::Wake<'_>,
 ) -> Result<()> {
-    let result = async {
+    let lane = lease.index();
+    {
         let mut round_id = 0u64;
         loop {
-            if drain.get() { return Ok(()); }
+            if lease.stopping() { return Ok(()); }
             // This lane has completed all of its own GPU/transport work. Retire
             // only its requests; the peer need not stop or migrate survivors.
             let retired: Vec<_> = active.borrow().iter().enumerate().filter_map(|(slot, entry)|
@@ -48,7 +88,7 @@ async fn lane<'a, P: VerificationTarget<'a>, C: DraftChain<'a>>(lane: usize, lib
                 let active = active.borrow();
                 if wake.poll_media(round_id)
                     || (!wake.media_pending && wake.ready(active.iter().flatten().count(), active.len(), !receive.is_empty())) {
-                    drain.set(true); return Ok(());
+                    lease.stop(); return Ok(());
                 }
                 active.iter().enumerate().filter_map(|(slot, r)|
                     r.as_ref().filter(|r| r.lane() == lane).map(|_| slot)).collect()
@@ -201,36 +241,8 @@ async fn lane<'a, P: VerificationTarget<'a>, C: DraftChain<'a>>(lane: usize, lib
                             Some(resolve_frontier(retain, &next, row, bytes, mask.as_deref())?);
                     }
                 }
-                let committed: Result<()> = async {
-                    if let Some(draft) = draft.borrow_mut().as_deref_mut() {
-                        draft.begin_queued_commit(lane, pass, &requests.borrow(),
-                            batch.as_ref().unwrap(), &decision.accepted)?;
-                    }
-                    pass.enqueue_cache_commit(&requests.borrow(), batch.as_ref().unwrap(), &decision.accepted)?;
-                    loop {
-                        let draft_ready = draft.borrow().as_deref().map(|draft| draft.poll_queued_commit(lane))
-                            .transpose()?.unwrap_or(true);
-                        if pass.poll_cache_commit()? && draft_ready { break; }
-                        tokio::task::yield_now().await;
-                    }
-                    if let Some(draft) = draft.borrow_mut().as_deref_mut() {
-                        draft.finish_queued_commit(lane, pass, &mut requests.borrow_mut(),
-                            batch.as_mut().unwrap(), &decision.accepted)
-                    } else {
-                        pass.commit(&mut requests.borrow_mut(), batch.as_mut().unwrap(), &decision.accepted)
-                    }
-                }.await;
-                if let Err(error) = committed {
-                    if let Err(cleanup) = pass.abort_cache_commit(&mut requests.borrow_mut()) {
-                        tracing::error!(%cleanup, "draining failed lane window commit");
-                    }
-                    if let Some(draft) = draft.borrow_mut().as_deref_mut() {
-                        if let Err(cleanup) = draft.abort_queued_commit(lane, &mut requests.borrow_mut(), batch.as_mut().unwrap()) {
-                            tracing::error!(%cleanup, "draining failed lane draft commit");
-                        }
-                    } else { requests.borrow_mut().revoke_batch(batch.as_mut().unwrap()); }
-                    return Err(error);
-                }
+                lanes::commit(&mut Commit { lane, pass: &mut *pass, requests, draft, batch: batch.as_mut().unwrap(),
+                    accepted: &decision.accepted }).await?;
                 let (accepted, emitted, emissions, accepted_inputs) = publish_commit_lane(&mut active.borrow_mut(),
                     &members, &mut batch, decision)?;
                 finish_copies(&mut active.borrow_mut(), &members, &copied, &inputs, &accepted_inputs);
@@ -296,9 +308,7 @@ async fn lane<'a, P: VerificationTarget<'a>, C: DraftChain<'a>>(lane: usize, lib
             // queuing another draft on the shared RTX.
             tokio::task::yield_now().await;
         }
-    }.await;
-    if result.is_err() { drain.set(true); }
-    result
+    }
 }
 
 async fn retire<'a, C: DraftChain<'a>>(lane: usize, mut request: Active<'a>, requests: &RefCell<&mut Requests<'a>>,

@@ -357,7 +357,6 @@ impl Ticket {
     pub fn lane(&self) -> usize { usize::from(self.lane) }
     /// Move the request to another decode lane (lane balancing).
     pub fn set_lane(&mut self, lane: usize) { self.lane = lane.min(u8::MAX as usize) as u8; }
-    pub fn usage(&self) -> Option<&cuteafd_api::usage::UsageHandle> { self.usage.as_ref() }
     pub fn session(&self) -> Option<String> { self.usage.as_ref().map(|u| u.session_id().to_owned()) }
 
     /// A prefill chunk of `rows` prompt rows that began at `started` just finished.
