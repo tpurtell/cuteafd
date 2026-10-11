@@ -206,11 +206,18 @@ fn generic_selection_is_rejected_for_exl3_and_nvfp4_publications() {
                 catalog.expert_staging(selection).is_err(),
                 "generic native FP4/E8M0 staging must not read a ModelOpt NVFP4 expert"
             );
-            assert!(
-                catalog.nvfp4_expert_staging(selection).is_err(),
-                "NVFP4 staging has no generic TP selection"
-            );
-            eprintln!("NVFP4 publication rejected generic native TP staging");
+            for world in [3, 6] {
+                let shard = V41ExpertSelection::BackboneTp {
+                    layer: 0, expert: 0, rank: 0, world,
+                };
+                let plan = catalog.nvfp4_expert_staging(shard).unwrap();
+                assert_eq!(plan.intermediate_size(), INTERMEDIATE / world);
+                let bad_rank = V41ExpertSelection::BackboneTp {
+                    layer: 0, expert: 0, rank: world, world,
+                };
+                assert!(catalog.nvfp4_expert_staging(bad_rank).is_err());
+            }
+            eprintln!("NVFP4 publication rejected native staging; native W4A4 TP3/TP6 admitted");
             checked += 1;
         }
     }

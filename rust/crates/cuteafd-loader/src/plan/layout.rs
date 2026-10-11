@@ -885,7 +885,14 @@ pub fn layout(report: &mut PlanReport, model: &dyn super::FamilyModel, checkpoin
     // before the KV pool. Explicit placement is reproducible on any inventory.
     let routed_bytes: u64 = report.components.iter().filter(|c| c.component == Component::RoutedExpert)
         .map(|c| c.bytes).sum();
-    let layer_bytes = routed_bytes / model.spec().layers.len().max(1) as u64;
+    let package = report.experts.as_ref().map_or("", |e| e.package.as_str());
+    let source_layer_bytes = routed_bytes / model.spec().layers.len().max(1) as u64;
+    let packed_layer = |ranks: usize| model.spec().moe.as_ref().and_then(|moe|
+        v41::packed_expert_bytes(package, moe.experts as u64, model.spec().hidden as u64,
+            (moe.intermediate / ranks) as u64));
+    let layer_bytes = packed_layer(1).unwrap_or(source_layer_bytes);
+    let local_rank_bytes = packed_layer(active_gpus)
+        .unwrap_or(layer_bytes / active_gpus as u64);
     // V4's layers come from the placement solve below.
     let mut local_layers = if family == "deepseek_v41" {
         options.local_expert_layers.unwrap_or(0).min(model.spec().layers.len())
@@ -900,7 +907,7 @@ pub fn layout(report: &mut PlanReport, model: &dyn super::FamilyModel, checkpoin
     if family != "deepseek_v4" && local_bytes > 0 && !matches!(report.placement, ExpertPlacement::Local) {
         if family == "deepseek_v41" && gpus == 2 {
             for device in devices.iter_mut().take(2) {
-                device.items.push(Item::new(Category::Experts, "resident routed layers", "native-tp2", local_bytes / 2, Basis::Formula));
+                device.items.push(Item::new(Category::Experts, "resident routed layers", "native-tp2", local_rank_bytes * local_layers as u64, Basis::Formula));
             }
         } else {
             devices[0].items.push(Item::new(Category::Experts, "resident routed layers", "native", local_bytes, Basis::Exact));
@@ -928,7 +935,10 @@ pub fn layout(report: &mut PlanReport, model: &dyn super::FamilyModel, checkpoin
             (routed as f64 * (own * 128) as f64 / intermediate as f64) as u64
         };
         for rank in 0..ranks {
-            let stored = rank_bytes(rank);
+            let stored = model.spec().moe.as_ref().and_then(|moe|
+                v41::packed_expert_bytes(package, moe.experts as u64, model.spec().hidden as u64,
+                    (moe.intermediate / ranks) as u64))
+                .map_or_else(|| rank_bytes(rank), |bytes| bytes * (model.spec().layers.len() - local_layers) as u64);
             let mut device = DeviceLayout { kind: DeviceKind::Spark, index: rank as u32, capacity_bytes: options.spark_bytes,
                 items: Vec::new(), kv_tokens: 0 };
             if matches!(family, "deepseek_v4" | "deepseek_v41" | "qwen4") {
@@ -1248,7 +1258,7 @@ pub fn layout(report: &mut PlanReport, model: &dyn super::FamilyModel, checkpoin
     }
 
     if family == "deepseek_v41" && options.local_expert_layers.is_none() && layer_bytes > 0 {
-        let per_gpu = if active_gpus == 2 { layer_bytes / 2 } else { layer_bytes };
+        let per_gpu = local_rank_bytes;
         let room = devices.iter().take(active_gpus).map(|d| d.free_bytes().max(0) as u64).min().unwrap_or(0);
         local_layers = (room.saturating_sub(512 * MIB) / per_gpu).min(model.spec().layers.len() as u64) as usize;
         local_bytes = layer_bytes * local_layers as u64;
@@ -1262,9 +1272,16 @@ pub fn layout(report: &mut PlanReport, model: &dyn super::FamilyModel, checkpoin
     // Spark inventory earlier.
     if family == "deepseek_v41" {
         let routed: u64 = report.components.iter().filter(|c| c.owner == Owner::SparkSliced && c.component != Component::SpeculatorExpert).map(|c| c.bytes).sum();
+        let package = report.experts.as_ref().map_or("", |e| e.package.as_str());
+        let packed_rank = model.spec().moe.as_ref().and_then(|moe|
+            (!spark_devices.is_empty()).then(|| spark_devices.len()).and_then(|ranks|
+                v41::packed_expert_bytes(package, moe.experts as u64, model.spec().hidden as u64,
+                    (moe.intermediate / ranks) as u64)))
+            .map(|bytes| bytes * (model.spec().layers.len() - local_layers) as u64);
         for spark in &mut spark_devices {
             if let Some(experts) = spark.items.iter_mut().find(|i| i.category == Category::Experts) {
-                experts.bytes = (routed.saturating_sub(local_bytes) as f64 * report.spark_rank_share) as u64;
+                experts.bytes = packed_rank.unwrap_or_else(||
+                    (routed.saturating_sub(local_bytes) as f64 * report.spark_rank_share) as u64);
             }
         }
     }

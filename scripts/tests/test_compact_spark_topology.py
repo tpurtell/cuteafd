@@ -225,12 +225,12 @@ release_stop_wip_containers
                 candidate['variants'][0][field] = value
                 self.assertEqual(check(candidate).returncode, 2)
         self.assertEqual(check(dict(base, compute=[12, 0])).returncode, 2)
-        # Compact admission only exists for the compact degrees TP2 and TP3.
+        # Whole-width variant admission includes TP6 but not padded TP4.
         rejected = subprocess.run(['bash', '-euc',
             'source scripts/lib/release-common.sh; release_validate_exl3_compact_variants 256 k23 4',
             'test'], cwd=ROOT, input=json.dumps(base), text=True, capture_output=True)
         self.assertEqual(rejected.returncode, 2)
-        self.assertIn('supports TP2 or TP3', rejected.stderr)
+        self.assertIn('supports TP2, TP3 or TP6', rejected.stderr)
         # A TP3 layout never passes the TP2 shim and vice versa.
         shim = subprocess.run(['bash', '-euc',
             'source scripts/lib/release-common.sh; release_validate_exl3_tp2_variants 256 k23',

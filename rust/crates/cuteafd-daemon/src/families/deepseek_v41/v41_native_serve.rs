@@ -128,12 +128,12 @@ fn start(mut args: crate::cli::NativeServeArgs, http: bool) -> Result<Started> {
     // is never compact.
     let compact = legacy_compact(topology, args.peers.len());
     ensure!(
-        topology.is_some() || matches!(args.peers.len(), 2 | 3 | 4),
-        "two, three or four Spark peers required for the legacy non-topology layout; \
+        topology.is_some() || matches!(args.peers.len(), 2 | 3 | 4 | 6),
+        "two, three, four or six Spark peers required for the legacy non-topology layout; \
          an explicit --spark-tp/--spark-ep topology carries its own rank count"
     );
     ensure!(
-        args.peers.len() == 4 || topology.is_some() || (args.rtx_gpus == 1 && !args.exl3_paired_tp4),
+        matches!(args.peers.len(), 4 | 6) || topology.is_some() || (args.rtx_gpus == 1 && !args.exl3_paired_tp4),
         "two or three Spark peers require the single-RTX, non-paired EXL3 profile"
     );
     if compact {
@@ -329,9 +329,14 @@ fn spark_transport(
             cuteafd_transport::expert::v41_spark_executor_id(3, 2)?,
         ], capacity, config),
         4 => SparkExperts::new(peers.try_into().expect("four peers"), [1, 2, 3, 4], capacity, config),
+        6 => {
+            let ids = (0..6).map(|rank| cuteafd_transport::expert::v41_spark_executor_id(6, rank))
+                .collect::<Result<Vec<_>>>()?;
+            SparkExperts::new_ranks(peers, &ids, capacity, config)
+        }
         _ => anyhow::bail!(
-            "the legacy non-topology transport takes two, three or four Spark peers; \
-             a six-rank layout (pure TP6EP1 or replicated) must pass --spark-tp/--spark-ep"
+            "the legacy non-topology transport takes two, three, four or six Spark peers; \
+             replicated layouts must pass --spark-tp/--spark-ep"
         ),
     }
 }
@@ -415,11 +420,10 @@ fn worker(
         // library cannot reduce this physical-rank count.
         lib.v41_compact_reducer()?
             .require_rank_count(topology.world_size() as u32)?;
-    } else if args.peers.len() == 3 {
-        // The implicit three-rank EXL3 group reduces through the N-plane entry,
-        // so it gets the same fail-fast rule. The two-rank group keeps using its
-        // historical pairwise reducer path untouched.
-        lib.v41_compact_reducer()?.require_rank_count(3)?;
+    } else if matches!(args.peers.len(), 3 | 6) {
+        // Implicit EXL3 groups use the N-plane reducer too; reject missing
+        // artifacts before weights are loaded. TP2 keeps its pairwise path.
+        lib.v41_compact_reducer()?.require_rank_count(args.peers.len() as u32)?;
     }
     ensure!(
         args.peers.len() == 4 || topology.is_some() || catalog.exl3().is_some(),

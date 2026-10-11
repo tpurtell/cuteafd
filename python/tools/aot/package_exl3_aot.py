@@ -473,8 +473,8 @@ def profiles_for_role(role: str, geometry: str = 'v41') -> list[tuple]:
     """(profile, width, experts, top-k, dtype, [layout destinations]) per role.
 
     TP4 keeps the padded 640/512 pair-split because I=2304/4 is not a whole number
-    of 128-wide Trellis blocks; TP2 (9+9) and TP3 (6+6+6) split exactly, so each of
-    those compiles one export per capacity that its ranks share byte-for-byte.
+    of 128-wide Trellis blocks; TP2 (9 blocks/rank), TP3 (6) and TP6 (3)
+    split exactly, each compiling one export per capacity shared by its ranks.
     Other geometries derive the same H128 split from their own intermediate.
     """
     if geometry != 'v41':
@@ -484,7 +484,9 @@ def profiles_for_role(role: str, geometry: str = 'v41') -> list[tuple]:
                 ('tp4-width512', 512, 384, 6, 'bf16', ['tp4-rank2', 'tp4-rank3']),
                 ('tp2-width1152', 1152, 384, 6, 'bf16', ['tp2-rank0', 'tp2-rank1']),
                 ('tp3-width768', 768, 384, 6, 'bf16',
-                 ['tp3-rank0', 'tp3-rank1', 'tp3-rank2'])]
+                 ['tp3-rank0', 'tp3-rank1', 'tp3-rank2']),
+                ('tp6-width384', 384, 384, 6, 'bf16',
+                 [f'tp6-rank{rank}' for rank in range(6)])]
     return [('rtx-tp1', 2304, 384, 6, 'fp32', ['rtx-tp1']),
             ('rtx-tp2', 1152, 384, 6, 'fp32', ['rtx-tp2']),
             ('dspark', 2304, 128, 3, 'bf16', ['dspark'])]

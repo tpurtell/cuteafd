@@ -267,14 +267,15 @@ minimum_expert_layers=1
 expert_format=native
 model_is_nvfp4="$(jq -r '.quantization_config.moe_quant_algo // empty' "$hf_home/$snapshot_rel/config.json" 2>/dev/null || true)"
 [[ "$model_is_nvfp4" == "NVFP4" ]] && expert_format=nvfp4
-# The explicit replicated topology is approved for the official native
-# checkpoint only. Reject a routed quant before any service change; EXL3 and
-# NVFP4 keep their existing non-topology behavior.
+# Replicated groups require native experts; NVFP4 supports pure TP3/4/6.
+# EXL3 uses implicit disjoint groups. Reject other modes before service changes.
 if ((topology_explicit)); then
   [[ "$model_is_exl3" != true ]] ||
     release_die "explicit SPARK_TP/SPARK_EP requires the native official checkpoint; EXL3 is not supported"
-  [[ "$model_is_nvfp4" != "NVFP4" ]] ||
-    release_die "explicit SPARK_TP/SPARK_EP requires the native official checkpoint; NVFP4 is not supported"
+  if [[ "$model_is_nvfp4" == "NVFP4" ]]; then
+    [[ "$spark_ep" == 1 && ( "$spark_tp" == 3 || "$spark_tp" == 4 || "$spark_tp" == 6 ) ]] ||
+      release_die "NVFP4 supports pure SPARK_TP=3/4/6 SPARK_EP=1, not replicated groups"
+  fi
 fi
 if [[ "$model_is_exl3" == true ]]; then
   case "$exl3_family_tag" in
@@ -289,7 +290,7 @@ fi
 # weights cannot fit the device budget. The floor is derived from the actual
 # budget and the resolved TP degree, not a hardcoded 20.
 if ((topology_explicit)) && [[ "$RTX_EXPERT_LAYERS" == auto ]]; then
-  remote_capacity=$((SPARK_DEVICE_BUDGET_BYTES / $(release_spark_layer_bytes "$spark_tp")))
+  remote_capacity=$((SPARK_DEVICE_BUDGET_BYTES / $(release_spark_layer_bytes "$spark_tp" "$expert_format")))
   ((remote_capacity > 40)) && remote_capacity=40
   topology_min_layers=$((40 - remote_capacity))
   ((topology_min_layers < 1)) && topology_min_layers=1
@@ -349,7 +350,7 @@ if ((topology_explicit)); then
   if [[ "$spark_first_layer" == runtime-plan ]]; then
     spark_admission="PENDING (coordinator placement plan not yet published; weight-only check uses the real dynamic boundary)"
   else
-    spark_admission="$(release_validate_spark_weight_admission "$spark_first_layer" "$spark_tp" "$SPARK_DEVICE_BUDGET_BYTES")"
+    spark_admission="$(release_validate_spark_weight_admission "$spark_first_layer" "$spark_tp" "$SPARK_DEVICE_BUDGET_BYTES" "$expert_format")"
   fi
 fi
 if ((RELEASE_RTX_GPUS == 2)); then
@@ -449,7 +450,7 @@ REMOTE
 )" || release_die "Spark host preflight failed on $host (see the messages above)"
   if [[ "$model_is_exl3" == true ]]; then
     identity="$(release_exl3_package_identity "$sparkinfer_commit" <<<"$spark_manifest")"
-    if release_spark_compact_active; then
+    if release_spark_compact_active || [[ "$SPARK_COUNT" == 6 ]]; then
       [[ "$identity" != paired:* ]] ||
         release_die "SPARK_COUNT=$SPARK_COUNT requires disjoint EXL3 packages, not paired TP4"
       release_validate_exl3_compact_variants "$expert_capacity" "$exl3_family_tag" "$SPARK_COUNT" <<<"$spark_manifest"
@@ -474,7 +475,7 @@ if [[ -n "$spark_tp_roles_required" ]]; then
     if [[ -n "${wip_slot:-}" ]]; then
       # Slots overlay a toolchain image: its label cannot describe their exports.
       advertised_roles="$(release_ssh -o ConnectTimeout=10 "$host" \
-        docker exec -i "$wip_spark_container" python3 - "$wip_slot" <<'PY'
+        docker exec -i "$wip_spark_container" python3 - "$wip_slot" "${expert_format:-native}" "$spark_tp_roles_required" <<'PY'
 import hashlib
 import json
 import pathlib
@@ -495,6 +496,8 @@ try:
     assert manifest.get('schema') == 1 and isinstance(roles, list) and all(role in ('tp2', 'tp3', 'tp6') for role in roles), 'invalid TP roles'
     assert roles == meta.get('spark_tp_roles'), 'slot and artifact roles differ'
     assert manifest.get('symbols_verified') is True, 'TP symbols are not verified'
+    if sys.argv[2] == 'nvfp4':
+        assert sys.argv[3] in manifest.get('nvfp4_spark_tp_roles', []), 'NVFP4 TP role is not built'
     assert hashlib.sha256((artifacts / 'libcuteafd_native.so').read_bytes()).hexdigest() == manifest.get('native_library_sha256'), 'native library hash mismatch'
     print(';'.join(roles))
 except (OSError, ValueError, AssertionError) as error:
@@ -512,6 +515,17 @@ PY
         release_die "$host WIP slot $wip_slot does not advertise required expert role $spark_tp_roles_required (advertised: ${advertised_roles:-<none>}); rebuild with CUTEAFD_WIP_SPARK_TP_ROLES=$spark_tp_roles_required"
       fi
       release_die "$host Spark image does not advertise required expert role $spark_tp_roles_required (advertised: ${advertised_roles:-<none>}); refusing an unbuilt TP$spark_tp topology: use the published universal release pair, or rebuild with CUTEAFD_RELEASE_SPARK_TP_ROLES=$spark_tp_roles_required"
+    fi
+    if [[ "${expert_format:-native}" == nvfp4 && -z "${wip_slot:-}" ]]; then
+      release_ssh -o ConnectTimeout=10 "$host" docker run --rm --network none \
+        --entrypoint python3 "$SPARK_EXPERT_DOCKER_INFERENCE" -c '
+import hashlib, json, pathlib, sys
+root = pathlib.Path("/opt/cuteafd")
+manifest = json.loads((root / "share/V41_EXPERT_TP_AOT.json").read_text())
+assert manifest.get("symbols_verified") is True, "NVFP4 TP symbols are not verified"
+assert sys.argv[1] in manifest.get("nvfp4_spark_tp_roles", []), "NVFP4 TP role is not built"
+assert hashlib.sha256((root / "lib/libcuteafd_native.so").read_bytes()).hexdigest() == manifest.get("native_library_sha256"), "NVFP4 library hash mismatch"
+' "$spark_tp_roles_required" || release_die "$host lacks verified NVFP4 $spark_tp_roles_required exports; rebuild the Spark image"
     fi
     [[ -n "$spark_advertised_roles" ]] || spark_advertised_roles="$advertised_roles"
   done
@@ -760,7 +774,7 @@ if [[ -n "$placement_directory" ]]; then
   if ((topology_explicit)); then
     # Re-check against the boundary the coordinator actually published; this is
     # the dynamic value, not the auto placeholder.
-    spark_admission="$(release_validate_spark_weight_admission "$spark_first_layer" "$spark_tp" "$SPARK_DEVICE_BUDGET_BYTES")"
+    spark_admission="$(release_validate_spark_weight_admission "$spark_first_layer" "$spark_tp" "$SPARK_DEVICE_BUDGET_BYTES" "$expert_format")"
     echo "  runtime Spark weight admission (workspace/staging NOT accounted): $spark_admission"
   fi
 fi

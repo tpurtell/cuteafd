@@ -103,7 +103,7 @@ def dynamic_symbols(library: Path) -> tuple[set[str], str]:
     return set(), ""
 
 
-def validate_role_export(role: str, manifest_path: Path, export_dir: Path) -> dict:
+def validate_role_export(role: str, manifest_path: Path, export_dir: Path, *, nvfp4: bool = False) -> dict:
     if not manifest_path.is_file():
         fail(f"requested role {role} produced no manifest: {manifest_path}")
     payload = json.loads(manifest_path.read_text())
@@ -113,6 +113,8 @@ def validate_role_export(role: str, manifest_path: Path, export_dir: Path) -> di
         fail(f"{manifest_path}: capability {payload.get('capability')!r}, expected {EXPECTED_CAPABILITY}")
     if payload.get("role") != f"spark_{role}":
         fail(f"{manifest_path}: role {payload.get('role')!r}, expected spark_{role}")
+    if nvfp4 and (payload.get("quant_mode") != "nvfp4" or payload.get("input_format") != "bf16"):
+        fail(f"{manifest_path}: NVFP4 role requires native W4A4 with BF16 fabric input")
     expected_degree = ROLE_TP_DEGREE[role]
     if payload.get("spark_tp_degree") != expected_degree:
         fail(f"{manifest_path}: spark_tp_degree {payload.get('spark_tp_degree')!r}, expected {expected_degree}")
@@ -173,6 +175,7 @@ def main() -> int:
     parser.add_argument("--requested", default="", help="semicolon-separated tp2/tp3/tp6 list")
     parser.add_argument("--native-build-dir", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--nvfp4", action="store_true", help="also require NVFP4 Spark TP3/TP6 exports")
     parser.add_argument(
         "--native-library",
         type=Path,
@@ -215,6 +218,21 @@ def main() -> int:
                     "the role module was not linked into the built library"
                 )
 
+    nvfp4_manifests: dict[str, dict] = {}
+    if args.nvfp4:
+        for role in roles:
+            if role not in ("tp3", "tp6"):
+                continue
+            export_dir = args.native_build_dir / f"v41_nvfp4_spark_{role}"
+            nvfp4_manifests[role] = validate_role_export(
+                role, export_dir / "v41_nvfp4_experts.json", export_dir, nvfp4=True
+            )
+            if symbol_tool:
+                required = [f"cuteafd_v41_nvfp4_spark_{role}_expert_{entry}" for entry in ("info", "launch")]
+                missing = [symbol for symbol in required if symbol not in symbols]
+                if missing:
+                    fail(f"{args.native_library} is missing NVFP4 {role} symbols {missing}")
+
     document = {
         "schema": 1,
         "role": args.role,
@@ -224,6 +242,8 @@ def main() -> int:
         "symbols_verified": bool(roles) and bool(symbol_tool),
         "symbol_verification_tool": symbol_tool or None,
         "manifests": manifests,
+        "nvfp4_spark_tp_roles": list(nvfp4_manifests),
+        "nvfp4_manifests": nvfp4_manifests,
     }
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(document, sort_keys=True, separators=(",", ":")) + "\n")

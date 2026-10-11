@@ -19,8 +19,8 @@ pub(crate) enum ExpertLayer {
     BackboneTp2 { layer: usize, rank: usize },
     /// Explicit replicated-group native Spark shard. `world` is this group's
     /// tensor-parallel degree (2, 3, 4 or 6) and `rank` is the shard index
-    /// inside the group (`global_rank % world`). Only the official native
-    /// checkpoint may select it; EXL3/NVFP4 keep their own layers. `world: 6`
+    /// inside the group (`global_rank % world`). Native checkpoints support
+    /// replicated groups; NVFP4 uses pure TP3/TP6 only. `world: 6`
     /// is the pure unreplicated `TP6EP1` layout: six disjoint intermediate
     /// slices of every expert, so every rank sees every route.
     BackboneReplicatedTp { layer: usize, rank: usize, world: usize },
@@ -149,6 +149,8 @@ impl ExpertLayer {
             Self::Backbone { .. } => library.v41_nvfp4_expert_kernel(capacity),
             Self::BackboneTp2 { .. } => library.v41_nvfp4_tp2_expert_kernel(capacity),
             Self::BackboneFull { .. } => library.v41_nvfp4_local_expert_kernel(capacity),
+            Self::BackboneReplicatedTp { world: tp @ (3 | 6), .. } =>
+                library.v41_nvfp4_spark_expert_kernel(capacity, tp),
             // Raw publications keep draft experts at source MXFP4 precision.
             other => other.kernel(library, capacity),
         }
@@ -159,6 +161,8 @@ impl ExpertLayer {
             Self::Backbone { .. } => library.v41_nvfp4_expert_info(capacity),
             Self::BackboneTp2 { .. } => library.v41_nvfp4_tp2_expert_info(capacity),
             Self::BackboneFull { .. } => library.v41_nvfp4_local_expert_info(capacity),
+            Self::BackboneReplicatedTp { world: tp @ (3 | 6), .. } =>
+                library.v41_nvfp4_spark_expert_info(capacity, tp),
             other => other.info(library, capacity),
         }
     }
