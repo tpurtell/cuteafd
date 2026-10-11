@@ -1007,6 +1007,82 @@ fn spark_rank_options_follow_transport_and_packages() {
 }
 
 #[test]
+fn qwen_empty_h128_spark_ranks_are_geometry_invalid_not_fit() {
+    let qwen = qwen_snapshot(4);
+    for ranks in [6, 7, 8] {
+        let options = sparks(ranks);
+        let report = plan(qwen.path(), &options).unwrap();
+        assert!(!report.fits && !report.placement_supported && !report.executable());
+        assert!(report.hints.iter().any(|hint| hint.what.contains("geometry-invalid")), "{}", render(&report));
+    }
+    // A missing TP5 package is distinct from invalid geometry: all five
+    // ranks own one H128 block, even before its hardware gate qualifies it.
+    let report = plan(qwen.path(), &sparks(5)).unwrap();
+    assert!(report.fits);
+    assert!(!report.hints.iter().any(|hint| hint.what.contains("geometry-invalid")));
+}
+
+#[test]
+fn exl3_tp6_geometry_remains_supported_for_v41_glm_and_flash() {
+    for (mut config, prefix, hidden, intermediate) in [
+        (v41_config(), "layers.0.ffn.experts.0.w1", 5120, 2304),
+        (glm5_config(), "model.layers.1.mlp.experts.0.gate_proj", 6144, 2048),
+        (glm5_flash_config(2), "model.language_model.layers.1.mlp.experts.0.gate_proj", 4096, 2048),
+    ] {
+        config["quantization_config"] = exl3_compact(4);
+        let mut tensors = Vec::new();
+        let mut projections = Vec::new();
+        if prefix.starts_with("layers.") {
+            tensors.extend(exl3(prefix, intermediate, hidden, 4));
+            projections.push((prefix.to_string(), 4, hidden, intermediate));
+        } else {
+            let stem = prefix.strip_suffix("0.gate_proj").unwrap();
+            let count = if hidden == 6144 { 256 } else { 288 };
+            for expert in 0..count {
+                for (projection, n, k) in [("gate_proj", intermediate, hidden), ("up_proj", intermediate, hidden),
+                    ("down_proj", hidden, intermediate)] {
+                    let name = format!("{stem}{expert}.{projection}");
+                    tensors.extend(exl3(&name, n, k, 4));
+                    projections.push((name, 4, k, n));
+                }
+            }
+        }
+        let dir = snapshot(config, &tensors);
+        write_quantize_config(dir.path(), &exl3_manifest(&exl3_compact(4), &projections));
+        let report = plan(dir.path(), &sparks(6)).unwrap();
+        assert!(report.placement_supported && report.fits && report.executable(), "{}", render(&report));
+        assert!(report.experts.as_ref().unwrap().spark_worlds.contains(&6));
+        assert!(!report.hints.iter().any(|hint| hint.what.contains("geometry-invalid")), "{}", render(&report));
+    }
+}
+
+#[test]
+fn qwen_nvfp4_legacy_tp6_remains_valid_but_new_empty_h128_ranks_do_not() {
+    let mut config = qwen4_config(1);
+    config["quantization_config"] = json!({"quant_method": "modelopt", "quant_algo": "NVFP4", "group_size": 16});
+    let mut tensors = Vec::new();
+    for expert in 0..512 {
+        for (projection, n, k) in [("gate_proj", 640, 2560), ("up_proj", 640, 2560), ("down_proj", 2560, 640)] {
+            let prefix = format!("model.language_model.layers.0.mlp.experts.{expert}.{projection}");
+            tensors.extend([
+                t(format!("{prefix}.weight"), "U8", &[n, k / 2]),
+                t(format!("{prefix}.weight_scale"), "F8_E4M3", &[n, k / 16]),
+                t(format!("{prefix}.weight_scale_2"), "F32", &[]),
+                t(format!("{prefix}.input_scale"), "F32", &[]),
+            ]);
+        }
+    }
+    let dir = snapshot(config, &tensors);
+    let legacy = plan(dir.path(), &sparks(6)).unwrap();
+    assert!(legacy.placement_supported && legacy.fits && legacy.executable(), "{}", render(&legacy));
+    for ranks in [7, 8] {
+        let report = plan(dir.path(), &sparks(ranks)).unwrap();
+        assert!(!report.placement_supported && !report.fits && !report.executable());
+        assert!(report.hints.iter().any(|hint| hint.what.contains("geometry-invalid")), "{}", render(&report));
+    }
+}
+
+#[test]
 fn invalid_budgets_are_typed_option_errors() {
     for gib in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, 0.0, -1.0, 1e30, f64::MIN_POSITIVE] {
         assert!(matches!(budget_bytes("--spark-budget-gib", gib), Err(PlanError::InvalidOption { .. })), "{gib}");
