@@ -47,6 +47,8 @@ pub(super) struct Leased {
     pub image_keys: ImageKeys,
     pub hit: Option<(usize, Option<RetainedScores>)>,
     pub restore: (Instant, Instant),
+    /// The frontier the restored prefix reached; images from here on are encoded.
+    pub resume: usize,
     pub started: Instant,
 }
 impl Leased {
@@ -80,6 +82,8 @@ pub(super) struct Media<C: EncoderClient> {
     /// Image requests over the waiter limit, prepared host-side, no lease.
     pub backlog: std::collections::VecDeque<Prepared>,
     limit: usize,
+    /// Requests that waited for encodes while holding a KV lease.
+    leased_waits: u64,
 }
 
 /// Feature bytes per image row: 5120 BF16 values.
@@ -96,7 +100,8 @@ impl<C: EncoderClient> Media<C> {
         let budget = EmbeddingCache::default_budget(crate::shared::prefix::budget::host_total()? as usize).max(pinned);
         let mut admission = MediaAdmission::new(EmbeddingCache::new(budget), encoder, limit);
         admission.set_encode_limits(cuteafd_loader::V41_MAX_IMAGES, usize::MAX);
-        Ok(Self { admission, leased: (0..slots).map(|_| None).collect(), backlog: Default::default(), limit })
+        Ok(Self { admission, leased: (0..slots).map(|_| None).collect(), backlog: Default::default(), limit,
+            leased_waits: 0 })
     }
     /// Leased requests waiting on encodes.
     pub fn len(&self) -> usize { self.leased.iter().flatten().count() }
@@ -107,8 +112,8 @@ impl<C: EncoderClient> Media<C> {
     /// Park a request at the encoder: `resume` is the frontier its restored
     /// prefix reached (V4.1 restores before encoding, so the engine's resume is
     /// exact and never reconciles).
-    pub fn enqueue(&mut self, leased: Leased, resume: usize) -> std::result::Result<(), (Leased, anyhow::Error)> {
-        let slot = leased.slot;
+    pub fn enqueue(&mut self, leased: Leased) -> std::result::Result<(), (Leased, anyhow::Error)> {
+        let (slot, resume) = (leased.slot, leased.resume);
         let waiter = (|| {
             let spans = &leased.prepared.images;
             let media: Vec<MediaSpan> = spans.iter().map(|span| MediaSpan { start: span.start,
@@ -120,6 +125,7 @@ impl<C: EncoderClient> Media<C> {
         })();
         let waiter = match waiter { Ok(waiter) => waiter, Err(error) => return Err((leased, error.into())) };
         if let Err((_, error)) = self.admission.enqueue(waiter) { return Err((leased, media_failure(error))); }
+        self.leased_waits += 1;
         self.leased[slot] = Some(leased);
         Ok(())
     }
@@ -137,9 +143,11 @@ impl<C: EncoderClient> Media<C> {
             let leased = &self.leased;
             match self.admission.poll(|&slot| leased[slot].is_none()) {
                 MediaPoll::Ready(waiter) => {
+                    // V4.1 restores before it encodes, so the waiter's resume is exact.
+                    debug_assert!(waiter.retries() == 0 && !waiter.cold(), "V4.1 media waiter reconciled");
                     let (slot, media) = waiter.into_parts();
                     let request = self.leased[slot].take().context("media waiter without a request")?;
-                    match install(requests, request.lease, &request.prepared, &media) {
+                    match install(requests, &request, &media) {
                         Ok(()) => ready.push(request),
                         Err(error) => request.fail(error, requests, draft.as_deref_mut())?,
                     }
@@ -166,7 +174,12 @@ impl<C: EncoderClient> Media<C> {
         for prepared in self.backlog.drain(..) { let _ = prepared.job.events.send(Err(unavailable())); }
         let _ = self.admission.poll(|_| true);
     }
-    pub fn stats(&self) -> cuteafd_engine::media::MediaStats { self.admission.stats(0, 0) }
+    pub fn stats(&self) -> serde_json::Value {
+        let mut stats = serde_json::to_value(self.admission.stats(0, 0)).unwrap_or_default();
+        stats["leased_media_waits"] = self.leased_waits.into();
+        stats["backlog"] = self.backlog.len().into();
+        stats
+    }
 }
 
 /// Leased requests that may wait on encodes at once: `CUTEAFD_V41_IMAGE_ADMISSIONS`
@@ -187,11 +200,9 @@ fn bounded_image_admissions(concurrency: usize, limit: usize) -> Result<usize> {
 }
 
 /// Copy each span's encoded rows into the request's V4.1 image table.
-fn install(requests: &mut Requests<'_>, lease: CacheLease, prepared: &Prepared, media: &RequestMedia) -> Result<()> {
-    let needed: std::collections::BTreeSet<usize> = (0..prepared.images.len())
-        .filter(|&index| media.span_features(index).is_some()).collect();
-    for index in needed {
-        if requests.images(lease)?.has_features(index) { continue; }
+fn install(requests: &mut Requests<'_>, request: &Leased, media: &RequestMedia) -> Result<()> {
+    let (lease, prepared) = (request.lease, &request.prepared);
+    for index in requests.images(lease)?.needed(request.resume, prepared.prompt.len())? {
         let rows = media.span_features(index).context("encoded span missing")?;
         ensure!(rows.len() == prepared.images[index].image.grid().tokens() * IMAGE_ROW_BYTES,
             cuteafd_api::openai::NativeFailure::Unavailable("invalid V4.1 feature reply".into()));
@@ -218,6 +229,8 @@ pub(super) fn media_failure(error: MediaError) -> anyhow::Error {
 pub(super) struct Wake<'p> {
     pub media_pending: bool,
     pub media_slots: usize,
+    /// Image requests wait host-side for an encoder waiter slot.
+    pub host_pending: bool,
     /// The deferred request and the release epoch it waits past.
     pub retry: Option<(&'p NativeRequest, u64)>,
     /// Shared prefill: lanes stop at a completed round once this decode debt is paid.
@@ -236,7 +249,7 @@ impl Wake<'_> {
         match self.retry {
             Some((job, _)) if job.events.is_closed() => true,
             Some((_, blocked)) => active + self.media_slots < slots && epoch != blocked,
-            None => active + self.media_slots < slots && queued,
+            None => active + self.media_slots < slots && (queued || self.host_pending),
         }
     }
 }
@@ -270,6 +283,9 @@ mod tests {
         assert!(!full.ready(14, 16, true, 0));
         assert!(full.ready(13, 16, true, 0));
         assert!(!Wake::default().ready(16, 16, true, 0));
+        let backlog = Wake { host_pending:true, ..Default::default() };
+        assert!(backlog.ready(1, 16, false, 0));
+        assert!(!backlog.ready(16, 16, false, 0));
         assert!(!Wake::default().poll_media(1));
         assert!(!Wake::default().poll_media(u64::MAX));
     }
