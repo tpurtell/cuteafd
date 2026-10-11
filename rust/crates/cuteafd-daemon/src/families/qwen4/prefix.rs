@@ -23,11 +23,12 @@
 //! sequence drafts once its own rows reach the stash (its MTP K/V before the restore point are
 //! the snapshot writer's, the same pairs for the same tokens, except the last).
 //!
-//! Every copy is enqueued on the engine stream, in order with the forward passes, and `drain`
-//! synchronizes it.
+//! Each logical mark preserves global-layer ordering across owner-local arenas. Copies enqueue
+//! on the owning execution stream; drain retires work on every owner.
 use super::engine::{history_of, Allocator, Qwen4Engine, Qwen4Placement, BLOCK, INDEX_DIM, PAGE_ROWS, RECORD_BYTES,
     UNIT_ROWS};
-use crate::shared::memory::DeviceAllocation;
+use crate::shared::memory::device::{Allocation, Device};
+use std::rc::Rc;
 use crate::shared::prefix::view;
 use anyhow::{ensure, Context, Result};
 use cuteafd_engine::prefix::{BoxError, FamilyLayout, MarkSlot, MarkStore, PrefixFamily, ReuseRule, TailCopy};
@@ -40,12 +41,38 @@ const KEY_BYTES: usize = INDEX_DIM * 2;
 const BLOCK_KEY_BYTES: usize = INDEX_DIM * 2;
 const POOL_PAGE_BYTES: usize = PAGE_ROWS * BLOCK_KEY_BYTES;
 
+#[derive(Debug, PartialEq, Eq)]
+struct MarkLayout {
+    owners: Vec<(i32, usize)>,
+    /// Owner arena, byte offset, byte length, in global state-region order.
+    regions: Vec<(usize, usize, usize)>,
+    bytes: usize,
+}
+
+impl MarkLayout {
+    fn new(regions: &[(i32, usize)]) -> Result<Self> {
+        let mut layout = Self { owners: Vec::new(), regions: Vec::new(), bytes: 0 };
+        for &(device, bytes) in regions {
+            let owner = layout.owners.iter().position(|&(id, _)| id == device).unwrap_or_else(|| {
+                layout.owners.push((device, 0));
+                layout.owners.len() - 1
+            });
+            let offset = layout.owners[owner].1;
+            layout.owners[owner].1 = offset.checked_add(bytes).context("Qwen owner mark size overflow")?;
+            layout.bytes = layout.bytes.checked_add(bytes).context("Qwen logical mark size overflow")?;
+            layout.regions.push((owner, offset, bytes));
+        }
+        Ok(layout)
+    }
+}
+
 pub(crate) struct Qwen4Prefix<'e, 'a> {
     engine: &'e Qwen4Engine<'a>,
     /// Per paged layer: records, raw index keys, pooled block keys.
     paged: Vec<[CuteafdDeviceBuffer; 3]>,
     mark_bytes: usize,
-    arena: Option<DeviceAllocation<'a>>,
+    mark_layout: MarkLayout,
+    arenas: Vec<Rc<Allocation<'a>>>,
     slots: usize,
 }
 
@@ -56,19 +83,25 @@ impl<'e, 'a> Qwen4Prefix<'e, 'a> {
         let paged = engine.paged_buffers();
         ensure!(!paged.is_empty(), "Qwen 3.8 Flash Next without a full-attention layer");
         let state_regions = engine.slot_regions(0);
-        let device = paged[0][0].device_id;
-        ensure!(paged.iter().flatten().chain(&state_regions).all(|buffer| buffer.device_id == device),
-            "Qwen dual-device prefix snapshots require segmented backing; refusing a single-device mark arena");
+        for buffer in paged.iter().flatten().chain(&state_regions) {
+            engine.state_stream(buffer.device_id)?;
+        }
         for [records, keys, pools] in &paged {
             ensure!(records.bytes >= engine.pages * PAGE_ROWS * RECORD_BYTES
                 && keys.bytes >= engine.pages * PAGE_ROWS * KEY_BYTES
                 && pools.bytes >= engine.pool_pages * POOL_PAGE_BYTES, "attention cache buffers smaller than the units");
         }
-        let mark_bytes: usize = engine.slot_regions(0).iter().map(|r| r.bytes).sum();
+        let mark_layout = MarkLayout::new(&state_regions.iter().map(|r| (r.device_id, r.bytes)).collect::<Vec<_>>())?;
+        let mark_bytes = mark_layout.bytes;
         ensure!(mark_bytes > 0, "Qwen 3.8 Flash Next without GDN state");
         let slots = slots(mark_bytes);
-        let arena = if slots > 0 { Some(DeviceAllocation::new(engine.library, slots * mark_bytes)?) } else { None };
-        Ok(Self { engine, paged, mark_bytes, arena, slots })
+        let arenas = if slots == 0 { Vec::new() } else {
+            mark_layout.owners.iter().map(|&(id, bytes)| {
+                let bytes = slots.checked_mul(bytes).context("Qwen mark arena overflow")?;
+                Allocation::new(Device { library: engine.library, id }, bytes).map(Rc::new)
+            }).collect::<Result<Vec<_>>>()?
+        };
+        Ok(Self { engine, paged, mark_bytes, mark_layout, arenas, slots })
     }
 
     pub fn mark_bytes(&self) -> usize {
@@ -80,19 +113,16 @@ impl<'e, 'a> Qwen4Prefix<'e, 'a> {
     }
 
     pub fn slots(&self) -> usize {
-        if self.arena.is_some() { self.slots } else { 0 }
-    }
-
-    /// A device buffer of the engine (the host tier's copy-engine template).
-    pub fn template(&self) -> CuteafdDeviceBuffer {
-        self.paged[0][0]
+        self.slots
     }
 
     fn copy(&self, dst: CuteafdDeviceBuffer, src: CuteafdDeviceBuffer) -> Result<()> {
-        debug_assert_eq!(dst.bytes, src.bytes);
-        // SAFETY: both views lie inside live engine allocations (checked by `view`); the copy is
-        // ordered on the engine stream with every forward pass that reads or writes them.
-        unsafe { self.engine.library.copy_d2d_async(dst, src, src.bytes, self.engine.stream) }
+        ensure!(dst.bytes == src.bytes && dst.device_id == src.device_id, "Qwen snapshot region mismatch");
+        let stream = self.engine.state_stream(dst.device_id)?;
+        // SAFETY: views belong to retained allocations and serialize with owner-local forward passes.
+        Device { library: self.engine.library, id: dst.device_id }.run(|| unsafe {
+            self.engine.library.copy_d2d_async(dst, src, src.bytes, stream)
+        })
     }
 
     /// The device ranges of one unit, per paged layer: records, raw index keys, pooled keys.
@@ -107,23 +137,33 @@ impl<'e, 'a> Qwen4Prefix<'e, 'a> {
         Ok(out)
     }
 
-    /// Copy every state region of slot `state` to or from mark `slot`.
-    fn move_mark(&self, slot: MarkSlot, state: i32, capture: bool) -> Result<()> {
-        let arena = self.arena.as_ref().map(|a| a.buffer).context("no mark arena")?;
+    pub fn snapshot_owners(&self) -> Vec<Rc<Allocation<'a>>> {
+        let mut owners = self.engine.snapshot_owners();
+        owners.extend(self.arenas.iter().cloned());
+        owners
+    }
+
+    fn mark_buffers(&self, slot: MarkSlot) -> Result<Vec<CuteafdDeviceBuffer>> {
         ensure!((slot.0 as usize) < self.slots, "mark slot {} of {}", slot.0, self.slots);
+        self.mark_layout.regions.iter().map(|&(owner, offset, bytes)| {
+            let stride = self.mark_layout.owners[owner].1;
+            let arena = self.arenas.get(owner).context("no mark arena")?;
+            view(arena.buffer, slot.0 as usize * stride + offset, bytes)
+        }).collect()
+    }
+
+    /// Copy global state-region order without inter-device copies or approximation.
+    fn move_mark(&self, slot: MarkSlot, state: i32, capture: bool) -> Result<()> {
         ensure!(state >= 0 && (state as usize) < self.engine.slots, "state slot {state} of {}", self.engine.slots);
-        let mut offset = slot.0 as usize * self.mark_bytes;
-        for region in self.engine.slot_regions(state as usize) {
-            let mark = view(arena, offset, region.bytes)?;
-            if capture {
-                self.copy(mark, region)?;
-            } else {
-                self.copy(region, mark)?;
-            }
-            offset += region.bytes;
+        let regions = self.engine.slot_regions(state as usize);
+        let marks = self.mark_buffers(slot)?;
+        ensure!(regions.len() == marks.len(), "Qwen snapshot region count changed");
+        for (region, mark) in regions.into_iter().zip(marks) {
+            if capture { self.copy(mark, region)?; } else { self.copy(region, mark)?; }
         }
         Ok(())
     }
+
 }
 
 impl PrefixFamily for Qwen4Prefix<'_, '_> {
@@ -188,8 +228,7 @@ impl PrefixFamily for Qwen4Prefix<'_, '_> {
     }
 
     fn drain(&self) -> Result<(), BoxError> {
-        // SAFETY: the engine owns this stream.
-        Ok(unsafe { self.engine.library.cuda_stream_synchronize(self.engine.stream) }?)
+        Ok(self.engine.drain_state()?)
     }
 
     fn page_segments(&self, page: u32) -> Vec<DeviceRange> {
@@ -198,10 +237,8 @@ impl PrefixFamily for Qwen4Prefix<'_, '_> {
     }
 
     fn mark_segments(&self, slot: MarkSlot) -> Vec<DeviceRange> {
-        self.arena.as_ref().map_or_else(Vec::new, |arena| vec![DeviceRange {
-            addr: arena.buffer.ptr as u64 + (slot.0 as usize * self.mark_bytes) as u64,
-            bytes: self.mark_bytes,
-        }])
+        self.mark_buffers(slot).unwrap_or_default().into_iter()
+            .map(|buffer| DeviceRange { addr: buffer.ptr as u64, bytes: buffer.bytes }).collect()
     }
 }
 
@@ -245,11 +282,14 @@ pub(crate) fn prefill_digest(engine: &Qwen4Engine<'_>, placement: &mut Qwen4Plac
 }
 
 fn download(engine: &Qwen4Engine<'_>, range: CuteafdDeviceBuffer) -> Result<Vec<u8>> {
-    // SAFETY: the engine owns this stream; draining it retires every write to `range`.
-    unsafe { engine.library.cuda_stream_synchronize(engine.stream)? };
-    let mut bytes = vec![0u8; range.bytes];
-    engine.library.copy_d2h(&mut bytes, range)?;
-    Ok(bytes)
+    let stream = engine.state_stream(range.device_id)?;
+    Device { library: engine.library, id: range.device_id }.run(|| {
+        // SAFETY: the owner stream retires every write to this live range.
+        unsafe { engine.library.cuda_stream_synchronize(stream)? };
+        let mut bytes = vec![0u8; range.bytes];
+        engine.library.copy_d2h(&mut bytes, range)?;
+        Ok(bytes)
+    })
 }
 
 /// Every byte of state slot `slot` (GDN conv and recurrent state per layer, PLE conv state).
@@ -353,9 +393,11 @@ fn resume_case(engine: &Qwen4Engine<'_>, family: &Qwen4Prefix<'_, '_>, allocator
         // The restored state reads back exactly as the captured one.
         family.capture(MarkSlot(1), &b, at).map_err(err)?;
         let mark = |slot: u32| -> Result<Vec<u8>> {
-            let range = family.mark_segments(MarkSlot(slot))[0];
-            download(engine, CuteafdDeviceBuffer { ptr: range.addr as *mut std::ffi::c_void, bytes: range.bytes,
-                ..family.template() })
+            let mut bytes = Vec::new();
+            for region in family.mark_buffers(MarkSlot(slot))? {
+                bytes.extend(download(engine, region)?);
+            }
+            Ok(bytes)
         };
         let mark_equal = mark(0)? == mark(1)?;
         // The state at P (every paged row and the state slot): what a restore must reproduce.
@@ -412,6 +454,19 @@ fn resume_case(engine: &Qwen4Engine<'_>, family: &Qwen4Prefix<'_, '_>, allocator
 mod tests {
     use super::super::engine::Qwen4Placement;
     use cuteafd_loader::families::qwen4::NgramHistory;
+
+    #[test]
+    fn logical_marks_keep_global_order_with_compact_owner_arenas() {
+        let layout = super::MarkLayout::new(&[(1, 8), (0, 16), (1, 32), (0, 4)]).unwrap();
+        assert_eq!(layout.owners, [(1, 40), (0, 20)]);
+        assert_eq!(layout.regions, [(0, 0, 8), (1, 0, 16), (0, 8, 32), (1, 16, 4)]);
+        assert_eq!(layout.bytes, 60);
+        let single = super::MarkLayout::new(&[(0, 8), (0, 16)]).unwrap();
+        assert_eq!(single.owners, [(0, 24)]);
+        assert_eq!(single.regions, [(0, 0, 8), (0, 8, 16)]);
+        assert!(super::MarkLayout::new(&[(0, usize::MAX), (1, 1)]).is_err());
+        assert!(super::MarkLayout::new(&[(0, usize::MAX), (0, 1)]).is_err());
+    }
 
     #[test]
     fn units_expand_to_record_and_pool_pages() {

@@ -454,7 +454,9 @@ fn prefix_cache<'e, 'a>(engine: &'e Qwen4Engine<'a>, args: &PrefixArgs, lanes: u
     let budget = args.prefix_cache_mark_mib << 20;
     anyhow::ensure!(args.prefix_partial == Toggle::Off, "Qwen 3.8 Flash Next restores exact snapshots only (GDN state)");
     let family = Qwen4Prefix::new(engine, |mark| if entries == 0 { 0 } else { MarkArena::slots_for(lanes, entries, mark, budget) })?;
-    let host = args.host_tier(engine.library, family.template(), family.layout(), engine.max_context)?;
+    let host = args.host_config(family.layout(), engine.max_context)?.map(|config|
+        CudaCopyEngine::registered_owned(engine.library, family.snapshot_owners()).map(|copy| (config, copy)))
+        .transpose()?;
     let host_bytes = host.as_ref().map_or(0, |(config, _)| config.bytes);
     let layout = family.layout();
     let config = PrefixConfig { entries, mark_slots: family.slots(), keep_logits: true,

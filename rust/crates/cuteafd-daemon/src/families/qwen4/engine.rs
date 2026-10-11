@@ -23,8 +23,9 @@
 use super::weights::{Qwen4Head, Qwen4Layer, Qwen4Weights};
 use crate::shared::experts::fp8::{Fp8Experts, Fp8Layer};
 use crate::shared::launch_grid::Fp8QuantizeGrid;
-use crate::shared::memory::{DeviceAllocation, HostAllocation};
-use crate::shared::memory::device::{Device, DeviceOwner};
+use crate::shared::memory::HostAllocation;
+use crate::shared::memory::device::{Allocation, Device, DeviceOwner};
+use std::rc::Rc;
 use crate::shared::token_io::{DeviceLogits, TokenEmbedding};
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::programs::{Programs, Scalar, VocabularyHead, VOCABULARY_HEAD_WORKSPACE};
@@ -40,7 +41,7 @@ use std::cell::{Cell, RefCell};
 use crate::shared::decode_graph::{check_bucket_thresholds, masked_row, real_row_moe, ProjectionThreshold};
 use std::ffi::c_void;
 
-type Dev<'a> = DeviceAllocation<'a>;
+type Dev<'a> = Rc<Allocation<'a>>;
 
 pub(crate) const PAGE_ROWS: usize = 64;
 /// Rows of the decode-shaped programs (`_m64`).
@@ -725,7 +726,7 @@ impl<'a> GdnBank<'a> {
     fn new(library: &'a NativeLibrary, programs: &'a Programs<'a>, stream: *mut c_void,
         cfg: &Qwen4Config, layers: usize, slots: usize) -> Result<Self> {
         let zeroed = |bytes: usize| -> Result<Dev<'a>> {
-            let allocation = DeviceAllocation::new(library, bytes.max(256))?;
+            let allocation = Rc::new(Allocation::new(Device { library, id: library.cuda_get_device()? }, bytes.max(256))?);
             library.cuda_zero_bytes(allocation.buffer, allocation.buffer.bytes)?;
             Ok(allocation)
         };
@@ -866,12 +867,13 @@ struct GraphKey {
     pool_stride: usize,
 }
 
-struct GraphExec<'a>(*mut c_void, &'a NativeLibrary);
+struct GraphExec<'a>(*mut c_void, Device<'a>);
 
 impl Drop for GraphExec<'_> {
     fn drop(&mut self) {
-        // SAFETY: the executable graph is owned here and no longer launched.
-        let _ = unsafe { self.1.cuda_graph_exec_destroy(self.0) };
+        if self.1.library.is_quarantined_after_failed_drain() { return; }
+        // SAFETY: the executable graph is owned here and its execution stream drained.
+        let _ = self.1.run(|| unsafe { self.1.library.cuda_graph_exec_destroy(self.0) });
     }
 }
 
@@ -894,7 +896,7 @@ impl<'a> Qwen4Engine<'a> {
         ensure!(embedding.hidden() == cfg.hidden, "embedding rows of {} for hidden {}", embedding.hidden(), cfg.hidden);
         cfg.check_programs()?;
         let zeroed = |bytes: usize| -> Result<Dev<'a>> {
-            let allocation = DeviceAllocation::new(library, bytes.max(256))?;
+            let allocation = Rc::new(Allocation::new(Device { library, id: library.cuda_get_device()? }, bytes.max(256))?);
             library.cuda_zero_bytes(allocation.buffer, allocation.buffer.bytes)?;
             Ok(allocation)
         };
@@ -1201,6 +1203,37 @@ impl<'a> Qwen4Engine<'a> {
         out
     }
 
+    /// Retain every backing allocation the host tier can read or restore.
+    pub(crate) fn snapshot_owners(&self) -> Vec<Rc<Allocation<'a>>> {
+        let mut owners = Vec::new();
+        for (kv, index) in self.kv.iter().zip(&self.index) {
+            if let (Some(kv), Some((keys, pools))) = (kv, index) {
+                owners.extend([kv.clone(), keys.clone(), pools.clone()]);
+            }
+        }
+        if let Some((kv, keys, pools)) = &self.mtp_kv {
+            owners.extend([kv.clone(), keys.clone(), pools.clone()]);
+        }
+        for bank in &self.gdn_banks {
+            owners.extend([&bank.conv, &bank.state].into_iter().filter_map(|p| p.as_ref().cloned()));
+        }
+        owners.extend(self.ple_state.as_ref().cloned());
+        owners
+    }
+
+    pub(crate) fn state_stream(&self, device: i32) -> Result<*mut c_void> {
+        self.gdn_banks.iter().find(|bank| bank.device.id == device)
+            .map(|bank| bank.stream).context("Qwen snapshot device without an execution stream")
+    }
+
+    pub(crate) fn drain_state(&self) -> Result<()> {
+        for bank in &self.gdn_banks {
+            // SAFETY: each bank owns its execution stream and live state allocations.
+            bank.device.run(|| unsafe { self.library.cuda_stream_synchronize(bank.stream) })?;
+        }
+        Ok(())
+    }
+
     fn conv_slot_bytes(cfg: &Qwen4Config) -> usize {
         (cfg.conv_kernel - 1) * cfg.gdn_conv_width() * 2
     }
@@ -1273,7 +1306,7 @@ impl<'a> Qwen4Engine<'a> {
     }
 
     fn alloc(&self, bytes: usize) -> Result<Dev<'a>> {
-        DeviceAllocation::new(self.library, bytes.max(256))
+        Ok(Rc::new(Allocation::new(Device { library: self.library, id: self.library.cuda_get_device()? }, bytes.max(256))?))
     }
 
     fn run(&self, name: &str, pointers: &[(&str, *mut c_void)], scalars: &[Scalar]) -> Result<()> {
@@ -2179,8 +2212,9 @@ impl<'a> Qwen4Engine<'a> {
         unsafe { self.library.cuda_graph_begin_capture(self.stream)? };
         let captured = segment();
         // SAFETY: ends the capture begun above on the same stream.
+        let device = Device { library: self.library, id: self.library.cuda_get_device()? };
         let exec = unsafe { self.library.cuda_graph_end_capture(self.stream) }
-            .map(|exec| GraphExec(exec, self.library));
+            .map(|exec| GraphExec(exec, device));
         captured?;
         let exec = exec?;
         // SAFETY: the new graph reads and writes persistent engine buffers.
