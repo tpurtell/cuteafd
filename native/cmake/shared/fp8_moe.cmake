@@ -1,8 +1,8 @@
 # Exact FP8 routed-expert packages (FAMILY:fp8 entries of CUTEAFD_EXPERT_FAMILIES,
 # for example mimo:fp8 or glm:fp8): the checkpoint's E4M3 experts with FP32
 # 128x128 block scales, run by b12x fp8_moe programs. Each entry builds
-# fp8-FAMILY/ next to the native library: tp1 in the SM120 coordinator build
-# (RTX local / MTP layers), tp4, tp2 and tp6 in the SM121 Spark build. The daemon
+# fp8-FAMILY/ next to the native library: tp1 and tp2 in the SM120 coordinator
+# build (RTX local / MTP and TP2 routed layers), tp4, tp2 and tp6 in the SM121 Spark build. The daemon
 # resolves <libdir>/fp8/fp8-FAMILY/tp<world>; the artifact scripts install
 # the packages there. FAMILY:nvfp4 entries (glm, glmf, qwen4) build
 # fp8-FAMILY-nvfp4/ the same way for NVIDIA ModelOpt NVFP4 releases (W4A16:
@@ -58,12 +58,9 @@ foreach(entry IN LISTS CUTEAFD_FP8_MOE_ENTRIES)
     message(FATAL_ERROR "FP8 expert family ${entry} must be (mimo|mimop|mimof|glm|glmf|qwen4):fp8 (mimof/mimop: MXFP4 weights) \
 or (glm|glmf|qwen4):nvfp4[a4] (ModelOpt NVFP4, W4A16 or W4A4 large-row steps)")
   endif()
-  # Spark packages also carry exact layouts (tp<n>-w<width>: ranks own whole
-  # 128-row blocks without zero padding; the worker prefers them).
-  set(exact_slices "")
-  if(CUTEAFD_FP8_MOE_ROLE STREQUAL "spark")
-    set(exact_slices "--exact-slices")
-  endif()
+  # Both roles carry exact layouts where TP slices differ in width; RTX TP2
+  # uses the same whole-H128 contract as the Spark backend.
+  set(exact_slices "--exact-slices")
   set(stamp "${CMAKE_CURRENT_BINARY_DIR}/fp8_moe_${geometry}.stamp")
   file(GENERATE OUTPUT "${stamp}" CONTENT "role=${CUTEAFD_FP8_MOE_ROLE}|capacities=${CUTEAFD_FP8_MOE_CAPACITIES}|${exact_slices}\n")
   add_custom_command(
