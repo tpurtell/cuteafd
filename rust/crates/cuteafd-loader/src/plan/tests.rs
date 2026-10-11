@@ -1349,6 +1349,17 @@ fn glm5_flash_startup_inventory_preserves_reference_plan_json() {
     let expected: Value = serde_json::from_str(include_str!(
         "../../tests/fixtures/glmf-startup-plans.json")).unwrap();
     assert_eq!(actual, expected);
+    let mut legacy = actual;
+    for report in legacy.as_object_mut().unwrap().values_mut() {
+        assert_eq!(report.as_object_mut().unwrap().shift_remove("attention_placement"), Some(json!("heads")));
+        let notes = report["memory_layout"]["notes"].as_array_mut().unwrap();
+        assert_eq!(notes.remove(1), json!("attention placement heads"));
+    }
+    // Removing only K0's heads metadata must recover the pre-rebase full plan:
+    // every byte, startup inventory, and admission field remains unchanged.
+    use sha2::{Digest, Sha256};
+    assert_eq!(format!("{:x}", Sha256::digest(serde_json::to_vec(&legacy).unwrap())),
+        "c8e254afb255deb186853608e055d56e7f1bd841f1b12cf3cab108e92794c67f");
 }
 
 #[test]
