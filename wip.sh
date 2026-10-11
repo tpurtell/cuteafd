@@ -24,9 +24,9 @@ incrementally builds a named WIP slot. The coordinator container builds and
 runs coordinator slots. The first configured Spark builds Spark slots, which
 are copied directly and concurrently to the other persistent Spark WIP
 containers.
-An explicit SPARK_TP=2/3/6 topology builds the matching opt-in SM121 expert role;
-CUTEAFD_WIP_SPARK_TP_ROLES=tp2;tp3;tp6 overrides that selection. The default
-configuration builds no extra role and keeps the historical Spark TP4 shard.
+The default builds the shared release Spark role set alongside historical TP4,
+independent of the serving topology. CUTEAFD_WIP_SPARK_TP_ROLES selects an
+explicit subset (empty keeps only TP4).
 Set CUTEAFD_WIP_FP8_MOE_BF16_FAMILIES=mimo to add BF16-input Spark siblings
 for selected FAMILY:fp8 packages. This does not change serving defaults.
 Set CUTEAFD_WIP_AUDIO_AOT=ON to build the optional audio tower on both SM120
@@ -121,28 +121,12 @@ mapfile -t wip_hosts < <(release_spark_values HOST)
 seed_host="${wip_hosts[0]}"
 wip_target_hosts=("${wip_hosts[@]:1}")
 
-# Opt-in replicated-group Spark expert roles for the WIP slot. The default and
-# explicit TP4xEP1 build no extra role; an explicit TP2/TP3/TP6 topology selects
-# the matching SM121 role.
-wip_spark_tp_roles="${CUTEAFD_WIP_SPARK_TP_ROLES:-}"
-if [[ -z "$wip_spark_tp_roles" ]] && release_spark_topology_explicit; then
-  case "$SPARK_TP" in
-    2) wip_spark_tp_roles=tp2 ;;
-    3) wip_spark_tp_roles=tp3 ;;
-    4) wip_spark_tp_roles= ;;
-    6) wip_spark_tp_roles=tp6 ;;
-  esac
-fi
-if [[ -n "$wip_spark_tp_roles" ]]; then
-  IFS=';' read -ra wip_spark_tp_role_list <<<"$wip_spark_tp_roles"
-  for wip_spark_tp_role in "${wip_spark_tp_role_list[@]}"; do
-    case "$wip_spark_tp_role" in
-      tp2|tp3|tp6) ;;
-      *) release_die "CUTEAFD_WIP_SPARK_TP_ROLES accepts only tp2, tp3 and tp6, got: $wip_spark_tp_role" ;;
-    esac
-  done
-  unset wip_spark_tp_role wip_spark_tp_role_list
-fi
+# Opt-in replicated-group Spark expert roles for the WIP slot. Shared slots
+# derive coverage from the release role configuration; an explicit empty
+# override keeps the legacy TP4-only escape hatch.
+wip_spark_tp_roles="$(release_spark_tp_roles_canonical \
+  "${CUTEAFD_WIP_SPARK_TP_ROLES-$(release_spark_tp_roles_default)}" \
+  CUTEAFD_WIP_SPARK_TP_ROLES)"
 
 if ((dry_run)); then
   echo "WIP dry-run passed; no container, image, SSH or build operation was performed."

@@ -16,10 +16,9 @@ asserted:
   configured topology, so one published image pair serves every approved native
   topology. Detailed malformed-input coverage lives in
   `test_release_universal_images.py`.
-* `wip.sh` resolves the *documented subset* for the slot's explicit topology
-  (2→tp2, 3→tp3, 6→tp6, TP4/default→none), because a WIP slot rebuilds on demand
-  for one measured A/B and must not pay for three unrelated exports. Its subset is
-  always contained in the release default.
+* `wip.sh` derives its default from the same shared release role configuration.
+  Shared slots cover the actual TP3 minimum and TP6 reference card. An explicit
+  subset override (including empty for legacy TP4) remains available.
 
 The manifest half writes a synthetic role export for a requested role and checks
 that the writer accepts the geometry it was told to expect (tp6: intermediate
@@ -59,12 +58,8 @@ def _role_block(script: Path = BUILD, *, variable: str = "spark_tp_roles",
     end = text.index(BLOCK_END, start)
     block = text[start:end]
     assert f"{variable}=" in block, f"{script.name} role block moved"
-    # The block must still validate its own tokens: build.sh canonicalizes through
-    # its helper (loop variable `entry`), wip.sh keeps its inline case
-    # (`wip_spark_tp_role`).
-    guard = ('case "$entry" in' if script == BUILD
-             else f'case "${"wip_" if variable.startswith("wip_") else ""}spark_tp_role" in')
-    assert guard in block, f"{script.name} role selector moved; update this extractor"
+    assert "release_spark_tp_roles_canonical" in block, f"{script.name} role validator moved"
+    assert "release_spark_tp_roles_default" in block, f"{script.name} role default moved"
     return block
 
 
@@ -140,23 +135,20 @@ def test_build_rejects_an_unknown_role_with_a_clear_error() -> None:
 @pytest.mark.parametrize(
     "spark_tp,override,expected",
     [
-        ("", None, ""),
-        ("4", None, ""),
-        ("6", None, "tp6"),
-        ("2", None, "tp2"),
-        ("3", None, "tp3"),
+        ("", None, UNIVERSAL),
+        ("4", None, UNIVERSAL),
+        ("6", None, UNIVERSAL),
+        ("2", None, UNIVERSAL),
+        ("3", None, UNIVERSAL),
+        ("3", "", ""),
+        ("6", "", ""),
         ("", UNIVERSAL, UNIVERSAL),
         ("", "tp6", "tp6"),
         ("4", UNIVERSAL, UNIVERSAL),
     ],
 )
 def test_wip_role_selection_matrix(spark_tp, override, expected) -> None:
-    """wip.sh keeps the per-slot subset plan and the same allowlist.
-
-    Before tp6 was accepted here, the candidate six-role WIP build aborted at
-    argument validation even though the artifact script and CMake already
-    understood tp6.
-    """
+    """WIP shares release defaults and validation, with a subset escape hatch."""
     result = _run_wip_roles(spark_tp, override)
     assert _roles(result) == expected
 
@@ -178,6 +170,16 @@ def test_wip_subset_is_always_contained_in_the_release_default() -> None:
     for spark_tp in ("2", "3", "4", "6"):
         slot = set(_roles(_run_wip_roles(spark_tp, None)).split(";")) - {""}
         assert slot <= release, (spark_tp, slot, release)
+
+
+@pytest.mark.parametrize("tp,width", [(3, 768), (6, 384)])
+def test_nvfp4_launcher_admission_matches_resident_planes(tp: int, width: int) -> None:
+    result = subprocess.run(
+        ["bash", "-c", f'source "{RELEASE_COMMON}"; release_spark_layer_bytes {tp} nvfp4'],
+        capture_output=True, text=True, timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+    assert int(result.stdout) == 384 * (3 * 5120 * width * 9 // 16 + 16)
 
 
 def test_release_and_wip_artifact_scripts_share_the_allowlist() -> None:
@@ -275,6 +277,35 @@ def test_manifest_writer_accepts_tp6_and_rejects_a_wrong_extent(tmp_path: Path) 
     failed = invoke()
     assert failed.returncode == 2
     assert "kernel_intermediate" in failed.stderr
+
+
+@pytest.mark.parametrize("role", ["tp3", "tp6"])
+def test_nvfp4_manifest_requires_exact_export_and_bf16_input(tmp_path: Path, role: str) -> None:
+    native_dir = tmp_path / f"v41_spark_{role}_experts"
+    native_path = _write_export(native_dir, f"spark_{role}")
+    nvfp4_dir = tmp_path / f"v41_nvfp4_spark_{role}"
+    nvfp4_dir.mkdir()
+    for artifact in native_dir.iterdir():
+        if artifact.suffix in (".o", ".h"):
+            (nvfp4_dir / artifact.name).write_bytes(artifact.read_bytes())
+    payload = json.loads(native_path.read_text())
+    payload.update(quant_mode="nvfp4", input_format="bf16")
+    path = nvfp4_dir / "v41_nvfp4_experts.json"
+    path.write_text(json.dumps(payload))
+    library = tmp_path / "libcuteafd_native.so"
+    library.write_bytes(b"stub")
+    output = tmp_path / "V41_EXPERT_TP_AOT.json"
+    command = [sys.executable, str(MANIFEST), "--role", "expert", "--requested", role,
+               "--nvfp4", "--native-build-dir", str(tmp_path), "--native-library", str(library),
+               "--output", str(output)]
+    result = subprocess.run(command, capture_output=True, text=True, timeout=60)
+    assert result.returncode == 0, result.stderr
+    assert json.loads(output.read_text())["nvfp4_spark_tp_roles"] == [role]
+    payload["input_format"] = "fp8_k32"
+    path.write_text(json.dumps(payload))
+    result = subprocess.run(command, capture_output=True, text=True, timeout=60)
+    assert result.returncode == 2
+    assert "BF16 fabric input" in result.stderr
 
 
 def test_manifest_writer_rejects_an_unknown_role_before_touching_files(

@@ -486,53 +486,56 @@ mod tests {
             .residency(V41Exl3Layer::Backbone(40), 1, 0)
             .is_err());
         assert!(manifest.residency(V41Exl3Layer::Dspark(3), 1, 0).is_err());
-        // Three-rank EXL3 is admitted (see `three_rank_residency_is_disjoint_and_equal`),
-        // so only out-of-range ranks and unadmitted worlds fail.
+        // TP3 and TP6 are exact whole-block splits; reject invalid ranks/worlds.
         assert!(manifest.residency(V41Exl3Layer::Backbone(0), 3, 3).is_err());
-        // Six-rank Spark layouts stay native: no EXL3 TP6 artifact family exists.
-        assert!(manifest.residency(V41Exl3Layer::Backbone(0), 6, 0).is_err());
+        assert!(manifest.residency(V41Exl3Layer::Backbone(0), 6, 6).is_err());
+        assert!(manifest.residency(V41Exl3Layer::Backbone(0), 5, 0).is_err());
         assert!(manifest.residency(V41Exl3Layer::Backbone(0), 4, 4).is_err());
     }
 
-    /// The three-rank Spark group is exact: unlike TP4 it has no unequal split
-    /// and no paired boundary, so the shards must tile 2304 channels evenly.
+    /// Whole-block TP3/TP6 shards tile 2304 channels without TP4's unequal split.
     #[test]
-    fn three_rank_residency_is_disjoint_and_equal() {
+    fn tp3_tp6_residency_is_disjoint_and_equal() {
         for tiers in [&[2, 3][..], &[3, 4]] {
             let manifest = fixture(tiers);
             let full = manifest
                 .residency(V41Exl3Layer::Backbone(0), 1, 0)
                 .unwrap();
-            let shard_payload: Vec<usize> = (0..3)
-                .map(|rank| {
-                    let plan = manifest
-                        .residency_with_layout(
-                            V41Exl3Layer::Backbone(0),
-                            3,
-                            rank,
-                            V41Exl3Partition::Disjoint,
-                        )
-                        .unwrap();
-                    assert_eq!((plan.world, plan.rank, plan.layout), (3, rank, V41Exl3Partition::Disjoint));
-                    assert_eq!(plan.intermediate, 768);
-                    assert_eq!(plan.intermediate_start, rank * 768);
-                    assert_eq!(plan.tiers, tiers);
-                    plan.buffers
-                        .iter()
-                        .filter(|b| b.name.starts_with("tier"))
-                        .map(|b| b.bytes)
-                        .sum()
-                })
-                .collect();
-            assert_eq!(shard_payload[0], shard_payload[1]);
-            assert_eq!(shard_payload[1], shard_payload[2]);
             let full_payload: usize = full
                 .buffers
                 .iter()
                 .filter(|b| b.name.starts_with("tier"))
                 .map(|b| b.bytes)
                 .sum();
-            assert_eq!(shard_payload.iter().sum::<usize>(), full_payload);
+            for world in [3, 6] {
+                let width = 2304 / world;
+                let shard_payload: Vec<usize> = (0..world)
+                    .map(|rank| {
+                        let plan = manifest
+                            .residency_with_layout(
+                                V41Exl3Layer::Backbone(0),
+                                world,
+                                rank,
+                                V41Exl3Partition::Disjoint,
+                            )
+                            .unwrap();
+                        assert_eq!(
+                            (plan.world, plan.rank, plan.layout),
+                            (world, rank, V41Exl3Partition::Disjoint)
+                        );
+                        assert_eq!(plan.intermediate, width);
+                        assert_eq!(plan.intermediate_start, rank * width);
+                        assert_eq!(plan.tiers, tiers);
+                        plan.buffers
+                            .iter()
+                            .filter(|b| b.name.starts_with("tier"))
+                            .map(|b| b.bytes)
+                            .sum()
+                    })
+                    .collect();
+                assert!(shard_payload.iter().all(|&bytes| bytes == shard_payload[0]));
+                assert_eq!(shard_payload.iter().sum::<usize>(), full_payload);
+            }
         }
     }
     #[test]

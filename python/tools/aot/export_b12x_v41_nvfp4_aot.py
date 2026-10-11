@@ -38,6 +38,8 @@ import _pinned_sparkinfer
 # role -> (experts, intermediate, topk, capability)
 ROLES = {
     "spark": (384, 576, 6, (12, 1)),
+    "spark_tp3": (384, 768, 6, (12, 1)),
+    "spark_tp6": (384, 384, 6, (12, 1)),
     "rtx_backbone": (384, 2304, 6, (12, 0)),
     "rtx_tp2": (384, 1152, 6, (12, 0)),
     "dspark_tp2": (128, 1152, 3, (12, 0)),
@@ -187,6 +189,8 @@ def export(
         },
         "variants": [],
     }
+    if role.startswith("spark"):
+        manifest["spark_tp_degree"] = {"spark": 4, "spark_tp3": 3, "spark_tp6": 6}[role]
     includes: list[str] = []
     entries: list[str] = []
     for requested_rows in rows:
@@ -322,7 +326,8 @@ def export(
             raise ValueError(f"unexpected deterministic NVFP4 route output for {label}")
         info = [
             2,  # abi_version: bridge layout only, no compact variant
-            {"spark": 1, "rtx_backbone": 2, "rtx_tp2": 3, "dspark_tp2": 4}[role],
+            {"spark": 1, "rtx_backbone": 2, "rtx_tp2": 3, "dspark_tp2": 4,
+             "spark_tp3": 6, "spark_tp6": 7}[role],
             experts,
             5120,
             source_intermediate,

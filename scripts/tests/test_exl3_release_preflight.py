@@ -50,9 +50,10 @@ if tool == 'docker':
             assert 'exl3' in script and 'manifest.json' in script and 'cat' in script
         paired = os.environ['MOCK_LAYOUT'] == 'paired'
         if os.environ.get('MOCK_MISMATCH') == os.environ['MOCK_HOST']: paired = not paired
-        variants = [dict(directory=f'tp2-rank{rank}/m{capacity}', capacity=capacity,
-                         intermediate=1152, experts=384, top_k=6, output_dtype='bf16', bits=[2,3])
-                    for rank in range(2) for capacity in [1,16,80,256,1024,4096]]
+        tp = int(os.environ.get('MOCK_TP', '2'))
+        variants = [dict(directory=f'tp{tp}-rank{rank}/m{capacity}', capacity=capacity,
+                         intermediate=2304//tp, experts=384, top_k=6, output_dtype='bf16', bits=[2,3])
+                    for rank in range(tp) for capacity in [1,16,80,256,1024,4096]]
         if os.environ.get('MOCK_LEGACY') == '1': variants = []
         print(json.dumps(dict(schema='cuteafd.exl3-package.v1', role='spark', variants=variants, compute=[12,1],
                               sparkinfer_revision=os.environ['MOCK_REVISION'], paired_tp4=paired)))
@@ -82,11 +83,12 @@ class Exl3ReleasePreflightTest(unittest.TestCase):
                        MOCK_REVISION=json.loads((ROOT / 'third_party/sparkinfer.lock.json').read_text())['revision'],
                        MOCK_LAYOUT='paired' if paired else 'disjoint',
                        MOCK_LEGACY='1' if legacy else '', MOCK_GPU_MIB=str(gpu_mib),
+                       MOCK_TP=str(spark_count if spark_count in (2, 3, 6) else 2),
                        MOCK_MISMATCH='dodo' if mismatch else '')
             config = directory / 'release.config'
             config.write_text((ROOT / 'cuteafd.config').read_text()
                               + f'\nSPARK_COUNT={spark_count}\n'
-                              + ('EXPERT_FORMAT=exl3\nSPARKINFER_EXL3=auto\n' if spark_count == 2 else '')
+                              + ('EXPERT_FORMAT=exl3\nSPARKINFER_EXL3=auto\n' if spark_count in (2, 3, 6) else '')
                               + (f'MEMORY_RESERVATION={reservation}\n' if reservation else '')
                               + (f'INSTANCE={instance}\n' if instance else ''))
             result = subprocess.run(['bash', 'run.sh', '--config', str(config),
@@ -133,6 +135,17 @@ class Exl3ReleasePreflightTest(unittest.TestCase):
         four, _ = self.launch(paired=False)
         self.assertNotEqual(result.stdout.split('release identity: ')[1],
                             four.stdout.split('release identity: ')[1])
+
+    def test_six_rank_disjoint_package_admission_is_exact_and_fail_fast(self):
+        result, calls = self.launch(spark_count=6, paired=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('Spark ranks: 6;', result.stdout)
+        self.assertEqual(sum(tool == 'docker' and args[0] == 'run' for tool, _, args in calls), 6)
+        for kwargs, message in [({'legacy': True}, 'lacks required TP6'),
+                                ({'paired': True}, 'requires disjoint EXL3 packages')]:
+            result, _ = self.launch(spark_count=6, **{'paired': False, **kwargs})
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn(message, result.stderr)
 
     def test_compact_prefill_cli_override_cannot_restore_large_capacity(self):
         for requested, expected in [('4096', '256'), ('80', '80')]:

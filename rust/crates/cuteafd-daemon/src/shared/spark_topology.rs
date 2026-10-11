@@ -38,9 +38,9 @@ pub(crate) fn resolve(
     Ok(Some(topology))
 }
 
-/// Explicit replicated groups are defined only for the official native
-/// checkpoint. Reject EXL3 or NVFP4 publications before any weight allocation,
-/// transport connection or readiness publication.
+/// Replicated groups require native experts. NVFP4 additionally supports pure
+/// TP3/TP4/TP6; EXL3 keeps its implicit disjoint layout. Reject unsupported
+/// formats before allocation, transport connection or readiness publication.
 pub(crate) fn require_native(
     topology: Option<SparkTopology>,
     catalog: &OfficialV41Catalog,
@@ -49,9 +49,10 @@ pub(crate) fn require_native(
         return Ok(());
     };
     ensure!(
-        catalog.exl3().is_none() && catalog.nvfp4().is_none(),
-        "explicit SPARK_TP/SPARK_EP {}x{} requires the official native checkpoint; \
-         EXL3 and NVFP4 publications keep their separate non-topology paths",
+        catalog.exl3().is_none() && (catalog.nvfp4().is_none()
+            || (topology.ep() == 1 && matches!(topology.tp(), 3 | 4 | 6))),
+        "explicit SPARK_TP/SPARK_EP {}x{} requires native experts or pure \
+         NVFP4 TP3/TP4/TP6; EXL3 uses its implicit disjoint layout",
         topology.tp(),
         topology.ep()
     );

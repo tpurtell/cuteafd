@@ -13,6 +13,24 @@ pub fn native_expert_bytes(experts: u64, hidden: u64, intermediate: u64) -> u64 
     experts * hidden * intermediate.div_ceil(128) * 128 * 51 / 32
 }
 
+/// NVFP4 native planes mirror `Nvfp4Side::plane_sizes`: fused FC1, FC2,
+/// F8_128x4 scale planes and four per-expert FP32 vectors. TP3/TP6 are exact;
+/// TP4 uses the default 576->640 kernel extent.
+pub fn nvfp4_expert_bytes(experts: u64, hidden: u64, intermediate: u64) -> u64 {
+    let stored = intermediate.div_ceil(128) * 128;
+    experts * (3 * hidden * stored / 2
+        + (2 * stored).div_ceil(128) * 128 * (hidden / 16).div_ceil(4) * 4
+        + hidden.div_ceil(128) * 128 * (stored / 16).div_ceil(4) * 4 + 16)
+}
+
+pub fn packed_expert_bytes(package: &str, experts: u64, hidden: u64, intermediate: u64) -> Option<u64> {
+    if package.starts_with("v41:mxfp4") {
+        Some(native_expert_bytes(experts, hidden, intermediate))
+    } else if package.starts_with("v41:nvfp4") {
+        Some(nvfp4_expert_bytes(experts, hidden, intermediate))
+    } else { None }
+}
+
 /// Default backbone/dSpark weights, without routed backbone experts. Vision
 /// is admitted separately by the encoder placement. Target embedding lives on RTX0, target normalization
 /// on the decoder (RTX1 under CED), and vocabulary is evenly partitioned
@@ -147,6 +165,18 @@ mod tests {
         assert_eq!(two[1], 42 * 3 * 128 * 528);
         assert_eq!(prefix_bytes(0, true, 2), vec![0, 0]);
         assert_eq!(dspark_cache_bytes(16, 4096), 15_828_096);
+    }
+
+    #[test]
+    fn tp3_and_tp6_charge_whole_native_and_nvfp4_planes() {
+        for (tp, width) in [(3, 768), (6, 384)] {
+            let native = native_expert_bytes(384, 5120, width);
+            assert_eq!(native * tp, native_expert_bytes(384, 5120, 2304));
+            let nvfp4 = nvfp4_expert_bytes(384, 5120, width);
+            assert_eq!(nvfp4, 384 * (3 * 5120 * width * 9 / 16 + 16));
+            assert_eq!(nvfp4 * tp, nvfp4_expert_bytes(384, 5120, 2304) + (tp - 1) * 384 * 16);
+        }
+        assert_eq!(nvfp4_expert_bytes(384, 5120, 576), nvfp4_expert_bytes(384, 5120, 640));
     }
 
     #[test]

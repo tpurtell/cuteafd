@@ -216,8 +216,8 @@ fn expected_expert_geometry(
         (_, 1) => 4,
         (_, 2) => 1,
         (_, 3) | (false, 5) => 2,
-        (false, 6) => 3,
-        (false, 7) => 6,
+        (_, 6) => 3,
+        (_, 7) => 6,
         _ => return None,
     };
     let logical = geometry.slice(tp).filter(|value| value % 32 == 0)?;
@@ -618,6 +618,8 @@ impl NativeLibrary {
             8 => b"cuteafd_v41_spark_tp2_expert_info",
             9 => b"cuteafd_v41_spark_tp3_expert_info",
             11 => b"cuteafd_v41_spark_tp6_expert_info",
+            12 => b"cuteafd_v41_nvfp4_spark_tp3_expert_info",
+            13 => b"cuteafd_v41_nvfp4_spark_tp6_expert_info",
             _ => b"cuteafd_v41_expert_info",
         };
         let name = family_symbol(name)?;
@@ -644,7 +646,7 @@ impl NativeLibrary {
             info.hidden_size,
             geometry.hidden
         );
-        let nvfp4 = matches!(interface, 5 | 6 | 7);
+        let nvfp4 = matches!(interface, 5 | 6 | 7 | 12 | 13);
         ensure!(
             if nvfp4 {
                 // W4A4 consumes BF16 hidden rows; the FP4 quantization happens
@@ -688,6 +690,8 @@ impl NativeLibrary {
             8 => Some(5),
             9 => Some(6),
             11 => Some(7),
+            12 => Some(6),
+            13 => Some(7),
             other => Some(u32::from(other)),
         };
         match expected_role {
@@ -759,6 +763,23 @@ impl NativeLibrary {
         self.expert_kernel_for(capacity, 6)
     }
 
+    /// Whole-block Spark TP3/TP6 W4A4 shards, without intermediate padding.
+    pub fn v41_nvfp4_spark_expert_info(&self, capacity: u32, tp: usize) -> Result<V41ExpertInfo> {
+        self.expert_info_for(capacity, match tp {
+            3 => 12,
+            6 => 13,
+            _ => anyhow::bail!("NVFP4 Spark shard requires TP3 or TP6, got TP{tp}"),
+        })
+    }
+
+    pub fn v41_nvfp4_spark_expert_kernel(&self, capacity: u32, tp: usize) -> Result<V41ExpertKernel<'_>> {
+        self.expert_kernel_for(capacity, match tp {
+            3 => 12,
+            6 => 13,
+            _ => anyhow::bail!("NVFP4 Spark shard requires TP3 or TP6, got TP{tp}"),
+        })
+    }
+
     fn expert_kernel_for(&self, capacity: u32, interface: u8) -> Result<V41ExpertKernel<'_>> {
         let info = self.expert_info_for(capacity, interface)?;
         // One symbol prefix per family/role. The NVFP4 family exposes its own
@@ -773,6 +794,8 @@ impl NativeLibrary {
             8 => "cuteafd_v41_spark_tp2",
             9 => "cuteafd_v41_spark_tp3",
             11 => "cuteafd_v41_spark_tp6",
+            12 => "cuteafd_v41_nvfp4_spark_tp3",
+            13 => "cuteafd_v41_nvfp4_spark_tp6",
             _ => "cuteafd_v41",
         };
         let prefix = String::from_utf8(family_symbol(prefix.as_bytes())?)?;
@@ -792,7 +815,7 @@ impl NativeLibrary {
             status == 0,
             "V4.1 expert initialization failed with CUDA status {status}"
         );
-        let nvfp4 = matches!(interface, 5 | 6 | 7);
+        let nvfp4 = matches!(interface, 5 | 6 | 7 | 12 | 13);
         let output_kind = if info.abi_version == 3 || nvfp4 {
             type OutputKindFn = unsafe extern "C" fn(i32, *mut u32) -> i32;
             let query = unsafe { self.lib.get::<OutputKindFn>(&symbol("output_kind"))? };
@@ -926,9 +949,9 @@ mod tests {
         assert_eq!(expected_expert_geometry(V41, false, 5, 1152), Some((384, 1152, 1152, 6)));
         assert_eq!(expected_expert_geometry(V41, false, 6, 768), Some((384, 768, 768, 6)));
         assert_eq!(expected_expert_geometry(V41, false, 7, 384), Some((384, 384, 384, 6)));
-        // Role 7 exists only in the native FP8 family: the W4A4 table and an
-        // unknown role id both fail closed instead of matching by accident.
-        assert_eq!(expected_expert_geometry(V41, true, 7, 384), None);
+        // Whole-block NVFP4 Spark roles preserve the same logical geometry.
+        assert_eq!(expected_expert_geometry(V41, true, 6, 768), Some((384, 768, 768, 6)));
+        assert_eq!(expected_expert_geometry(V41, true, 7, 384), Some((384, 384, 384, 6)));
         assert_eq!(expected_expert_geometry(V41, false, 9, 384), None);
         // Historical Spark TP4 padding and RTX TP2 role semantics are unchanged.
         assert_eq!(expected_expert_geometry(V41, false, 1, 640), Some((384, 576, 640, 6)));

@@ -424,6 +424,7 @@ topology_explicit={topology_explicit}
 spark_tp={spark_tp}
 spark_ep={spark_ep}
 spark_admission=not-applicable
+expert_format=native
 spark_exl3_identity=
 gpu_request=device=uuid0,uuid1
 gpu_uuid_csv=uuid0,uuid1
@@ -1584,7 +1585,8 @@ SPARK_EXPERT_DOCKER_INFERENCE=registry.example/spark:v9
                               text=True, capture_output=True, timeout=20)
 
     def wip_gate(self, *, roles: list[str], verified: bool = True,
-                 corrupt_hash: bool = False, corrupt_host: bool = False) -> subprocess.CompletedProcess[str]:
+                 corrupt_hash: bool = False, corrupt_host: bool = False,
+                 expert_format: str = 'native', nvfp4_roles: list[str] | None = None) -> subprocess.CompletedProcess[str]:
         block = run_sh_block('spark_advertised_roles=""', "\n# Zero-Spark deployments")
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -1594,6 +1596,7 @@ SPARK_EXPERT_DOCKER_INFERENCE=registry.example/spark:v9
                 artifacts.mkdir(parents=True)
                 (artifacts / 'libcuteafd_native.so').write_bytes(b'test library')
                 manifest = json.dumps({'schema': 1, 'spark_tp_roles': roles,
+                                      'nvfp4_spark_tp_roles': nvfp4_roles or [],
                                       'symbols_verified': verified,
                                       'native_library_sha256': hashlib.sha256(b'test library').hexdigest()}).encode()
                 (artifacts / 'V41_EXPERT_TP_AOT.json').write_bytes(manifest)
@@ -1610,7 +1613,7 @@ release_ssh() {
   [[ "$1" == -o ]]; shift 2
   host="$1"; shift
   [[ "$1" == docker && "$2" == exec && "$3" == -i && "$5" == python3 ]]
-  python3 -c 'import sys; code=sys.stdin.read().replace("/wip/slots",sys.argv[1]); sys.argv=["guard",sys.argv[2]]; exec(compile(code,"guard","exec"))' "$MOCK_SLOTS/$host" "$7"
+  python3 -c 'import sys; code=sys.stdin.read().replace("/wip/slots",sys.argv[1]); sys.argv=["guard",*sys.argv[2:]]; exec(compile(code,"guard","exec"))' "$MOCK_SLOTS/$host" "$7" "$8" "$9"
 }
 hosts=(h0 h1 h2)
 spark_tp=3
@@ -1618,7 +1621,7 @@ spark_tp_roles_required=tp3
 wip_slot=slot
 wip_spark_container=wip-test
 SPARK_EXPERT_DOCKER_INFERENCE=unused
-''' + block + '\nprintf "advertised=%s\\n" "$spark_advertised_roles"\n'
+''' + f'expert_format={expert_format}\n' + block + '\nprintf "advertised=%s\\n" "$spark_advertised_roles"\n'
             return subprocess.run(['bash', '-c', script], cwd=ROOT, text=True,
                                   capture_output=True, timeout=20,
                                   env={**os.environ, 'MOCK_SLOTS': str(root)})
@@ -1627,6 +1630,13 @@ SPARK_EXPERT_DOCKER_INFERENCE=unused
         result = self.wip_gate(roles=['tp3', 'tp6'])
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn('advertised=tp3;tp6', result.stdout)
+
+    def test_wip_nvfp4_requires_its_own_verified_role(self) -> None:
+        result = self.wip_gate(roles=['tp3'], expert_format='nvfp4')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('NVFP4 TP role is not built', result.stderr)
+        result = self.wip_gate(roles=['tp3'], expert_format='nvfp4', nvfp4_roles=['tp3'])
+        self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_wip_rejects_missing_role_or_unverified_symbols(self) -> None:
         for roles, verified in ((['tp6'], True), (['tp3'], False)):

@@ -62,7 +62,11 @@ pub(super) fn worker(mut args: crate::cli::NativeServeArgs, mut receive: mpsc::R
         // physical-rank count.
         lib.v41_compact_reducer()?
             .require_rank_count(topology.world_size() as u32)?;
+    } else if matches!(args.peers.len(), 3 | 6) {
+        lib.v41_compact_reducer()?.require_rank_count(args.peers.len() as u32)?;
     }
+    ensure!(args.peers.len() == 4 || topology.is_some() || catalog.exl3().is_some(),
+        "implicit non-TP4 Spark layouts require an EXL3 checkpoint");
     let paired_profile = crate::families::deepseek_v41::v41_experts::paired::PairedProfile::for_serving(&catalog, args.exl3_paired_tp4)?;
     let map = CachePlacement::encoder_decoder();
     let started = Instant::now();

@@ -117,15 +117,8 @@ impl V41Exl3Projection {
             V41Exl3ProjectionKind::Down => self.input_features,
             _ => self.output_features,
         };
-        // Six ranks are the implicit EXL3 TP6 split of every non-V4.1 geometry:
-        // even where the H128 blocks divide (V4 Pro: 24 -> 4 apiece), else the
-        // first ranks own the extra blocks (2048: 3, 3, 3, 3, 2, 2), each rank
-        // with the export of its own width. V4.1's 2304 keeps its six-rank
-        // Spark layouts native.
-        ensure!(
-            world != 6 || intermediate != 2304,
-            "EXL3 six-rank partition is not used for V4.1"
-        );
+        // Whole H128 blocks: V4.1 TP3/TP6 own exactly six/three blocks;
+        // uneven geometries put one extra block on the first ranks.
         ensure!(
             intermediate % 128 == 0,
             "EXL3 intermediate axis is not H128 aligned"
@@ -1390,6 +1383,7 @@ mod tests {
                 // six whole blocks with no padding or duplicated boundary.
                 (3, vec![768, 768, 768]),
                 (4, vec![640, 640, 512, 512]),
+                (6, vec![384; 6]),
             ] {
                 let mut cursor = 0;
                 for (rank, width) in widths.into_iter().enumerate() {
@@ -1401,9 +1395,8 @@ mod tests {
                 assert_eq!(cursor, 2304);
                 assert!(p.intermediate_partition(world, world).is_err());
             }
-            // Only the admitted EXL3 worlds partition; six-rank Spark layouts
-            // stay native, and an empty shard is never produced.
-            for world in [5usize, 6, 8, 19] {
+            // Unadmitted worlds and empty shards fail closed.
+            for world in [5usize, 8, 19] {
                 assert!(
                     p.intermediate_partition(world, 0).is_err(),
                     "EXL3 world {world} must stay unadmitted"

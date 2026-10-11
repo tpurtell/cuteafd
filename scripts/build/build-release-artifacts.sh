@@ -340,7 +340,10 @@ install -m 0644 "$build_root/native/v41_experts/v41_experts.json" "$output_dir/V
 # Always write the built-role manifest, including the empty-role default, so
 # the release Dockerfile can COPY it unconditionally. Every listed role is
 # derived from the AOT export manifest CMake actually produced.
+nvfp4_manifest_args=()
+[[ "${CUTEAFD_RELEASE_NVFP4_AOT:-ON}" != ON ]] || nvfp4_manifest_args+=(--nvfp4)
 python3 "$build_root/source/scripts/build/write-v41-expert-tp-manifest.py" \
+  "${nvfp4_manifest_args[@]}" \
   --role "$role" \
   --requested "$spark_tp_roles" \
   --native-build-dir "$build_root/native" \

@@ -403,7 +403,7 @@ impl OfficialV41Catalog {
     /// whole source rows are read through caller-owned scratch and each row's
     /// byte/group-aligned column window is copied out, so the file offset of
     /// every row is checked before the read.
-    fn read_backbone_tp_into(
+    pub(super) fn read_backbone_tp_into(
         &self,
         name: &str,
         geometry: V41BackboneTpGeometry,

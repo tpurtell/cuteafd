@@ -304,7 +304,10 @@ install -m 0644 "$build_dir/native/v41_experts/v41_experts.json" "$output_dir/V4
 # Always emit the built-role manifest (empty for the legacy default). Roles are
 # derived from the AOT export manifests CMake actually produced and bound to the
 # built library hash, so a stale/partial export cannot advertise a role.
+nvfp4_manifest_args=()
+[[ "$nvfp4_aot" != ON ]] || nvfp4_manifest_args+=(--nvfp4)
 python3 "$source_dir/scripts/build/write-v41-expert-tp-manifest.py" \
+  "${nvfp4_manifest_args[@]}" \
   --role "$role" \
   --requested "$spark_tp_roles" \
   --native-build-dir "$build_dir/native" \

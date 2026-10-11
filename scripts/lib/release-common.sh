@@ -242,7 +242,7 @@ release_exl3_package_identity() {
 # before any service change. TP2 is the default degree.
 release_validate_exl3_compact_variants() {
   local capacity="$1" family="$2" tp="${3:-2}"
-  [[ "$tp" == 2 || "$tp" == 3 ]] || release_die "compact EXL3 variant admission supports TP2 or TP3, got TP$tp"
+  [[ "$tp" == 2 || "$tp" == 3 || "$tp" == 6 ]] || release_die "EXL3 variant admission supports TP2, TP3 or TP6, got TP$tp"
   local width=$((2304 / tp))
   [[ "$family" =~ ^k([23])([34])$ && ( "$family" == k23 || "$family" == k34 ) ]] || release_die "cannot resolve compact EXL3 package bit tiers"
   local low="${BASH_REMATCH[1]}" high="${BASH_REMATCH[2]}"
@@ -1584,7 +1584,20 @@ release_spark_first_layer() {
 # (1,804,861,440 * TP4/TP = 7,219,445,760 / TP). They are weight arithmetic only
 # and do not include workspace, staging or runtime headroom.
 release_spark_layer_bytes() {
-  case "$1" in
+  local tp="$1" format="${2:-native}"
+  if [[ "$format" == nvfp4 ]]; then
+    local intermediate stored fc1_rows down_scale_cols
+    case "$tp" in 3|4|6) ;; *) release_die "NVFP4 Spark weights require TP3, TP4 or TP6" ;; esac
+    intermediate=$((2304 / tp))
+    stored=$(((intermediate + 127) / 128 * 128))
+    fc1_rows=$(((2 * stored + 127) / 128 * 128))
+    down_scale_cols=$(((stored / 16 + 3) / 4 * 4))
+    # Mirror Nvfp4Side::plane_sizes plus its four per-expert FP32 vectors.
+    printf '%s\n' "$((384 * (3 * 5120 * stored / 2 + fc1_rows * 320 + 5120 * down_scale_cols + 16)))"
+    return
+  fi
+  [[ "$format" == native ]] || release_die "unsupported Spark weight format: $format"
+  case "$tp" in
     2) printf '%s\n' 3609722880 ;;
     3) printf '%s\n' 2406481920 ;;
     4) printf '%s\n' 2005401600 ;;
@@ -1603,8 +1616,8 @@ release_spark_remote_layers() {
 }
 
 release_spark_remote_weight_bytes() {
-  local first_layer="$1" tp="$2"
-  printf '%s\n' "$(($(release_spark_remote_layers "$first_layer") * $(release_spark_layer_bytes "$tp")))"
+  local first_layer="$1" tp="$2" format="${3:-native}"
+  printf '%s\n' "$(($(release_spark_remote_layers "$first_layer") * $(release_spark_layer_bytes "$tp" "$format")))"
 }
 
 # Weight-only admission for the resolved dynamic RTX/Spark boundary.
@@ -1615,10 +1628,10 @@ release_spark_remote_weight_bytes() {
 # service reports them at startup. run.sh prints the residual and labels it
 # explicitly. Weight-only overflow is a hard failure before any service change.
 release_validate_spark_weight_admission() {
-  local first_layer="$1" tp="$2" budget="$3" remote_layers weight margin
+  local first_layer="$1" tp="$2" budget="$3" format="${4:-native}" remote_layers weight margin
   [[ "$budget" =~ ^[1-9][0-9]*$ ]] || release_die "Spark device budget must be a positive integer"
   remote_layers="$(release_spark_remote_layers "$first_layer")"
-  weight="$(release_spark_remote_weight_bytes "$first_layer" "$tp")"
+  weight="$(release_spark_remote_weight_bytes "$first_layer" "$tp" "$format")"
   ((weight <= budget)) ||
     release_die "Spark TP${tp} weight-only admission fails: ${remote_layers} remote layers need ${weight} B > ${budget} B budget (lower the RTX boundary first layer)"
   margin=$((budget - weight))

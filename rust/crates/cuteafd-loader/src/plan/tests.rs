@@ -104,6 +104,63 @@ fn deepseek_v41_components_formats_and_placement() {
 }
 
 #[test]
+fn v41_tp3_tp6_layout_charges_packed_residency_and_bf16_rings() {
+    use cuteafd_core::memory_layout::{Category, DeviceKind};
+    for nvfp4 in [false, true] {
+        let mut tensors = Vec::new();
+        for projection in ["w1", "w2", "w3"] {
+            let (n, k) = if projection == "w2" { (5120, 2304) } else { (2304, 5120) };
+            let prefix = format!("layers.0.ffn.experts.0.{projection}");
+            if nvfp4 {
+                tensors.extend([
+                    t(&format!("{prefix}.weight"), "U8", &[n, k / 2]),
+                    t(&format!("{prefix}.weight_scale"), "F8_E4M3", &[n, k / 16]),
+                    t(&format!("{prefix}.weight_scale_2"), "F32", &[]),
+                    t(&format!("{prefix}.input_scale"), "F32", &[]),
+                ]);
+            } else {
+                tensors.extend([
+                    t(&format!("{prefix}.weight"), "I8", &[n, k / 2]),
+                    t(&format!("{prefix}.scale"), "F8_E8M0", &[n, k / 32]),
+                ]);
+            }
+        }
+        let dir = snapshot(v41_config(), &tensors);
+        for (ranks, gpus) in [(3, 1), (6, 2)] {
+            let options = PlanOptions { layout: Some(layout::LayoutOptions {
+                rtx_bytes: vec![96 << 30; gpus], local_expert_layers: Some(1),
+                pool_tokens: Some(2_097_152), ..Default::default()
+            }), ..sparks(ranks) };
+            let report = plan(dir.path(), &options).unwrap();
+            let memory = report.memory_layout.as_ref().unwrap();
+            let experts = report.experts.as_ref().unwrap();
+            assert!(experts.package.starts_with(if nvfp4 { "v41:nvfp4" } else { "v41:mxfp4" }));
+            let packed = |tp: u64| {
+                let width = (2304 / tp).div_ceil(128) * 128;
+                if nvfp4 { 384 * (3 * 5120 * width * 9 / 16 + 16) }
+                else { 384 * 5120 * width * 51 / 32 }
+            };
+            for device in &memory.devices {
+                match device.kind {
+                    DeviceKind::Spark => {
+                        assert_eq!(device.by_category()[&Category::Experts], packed(ranks as u64));
+                        let rings = device.items.iter().find(|item| item.group == "rdma rings").unwrap();
+                        assert_eq!(rings.bytes, layout::v41_spark_ring_allowance(
+                            "deepseek_v41", options.layout.as_ref().unwrap().spark_capacity_rows, 0, nvfp4,
+                        ));
+                    }
+                    DeviceKind::Rtx => {
+                        let local = device.items.iter().find(|item| item.group == "resident routed layers").unwrap();
+                        assert_eq!(local.bytes, packed(gpus as u64));
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn v41_rejects_an_unsupported_expert_format_with_a_hint() {
     let dir = snapshot(
         v41_config(),

@@ -9,7 +9,7 @@ use crate::OfficialV41Catalog;
 use anyhow::{ensure, Context, Result};
 use std::ops::Range;
 
-use crate::families::deepseek_v41::v41_expert_staging::V41ExpertSelection;
+use crate::families::deepseek_v41::v41_expert_staging::{V41BackboneTpGeometry, V41ExpertSelection};
 
 /// Number of staged regions: three packed weights, three scale planes and
 /// six replicated FP32 scalars.
@@ -66,6 +66,18 @@ impl OfficialV41Catalog {
                     Some(rank),
                 )
             }
+            V41ExpertSelection::BackboneTp { layer, expert, rank, world } => {
+                ensure!(layer < config.num_hidden_layers, "backbone layer out of range");
+                ensure!(expert < config.n_routed_experts, "backbone expert out of range");
+                let geometry = V41BackboneTpGeometry::new(
+                    config.moe_intermediate_size, config.hidden_size, world, rank,
+                )?;
+                (
+                    format!("layers.{layer}.ffn.experts.{expert}"),
+                    geometry.intermediate_size(),
+                    Some(rank),
+                )
+            }
             V41ExpertSelection::BackboneFull { layer, expert } => {
                 ensure!(layer < config.num_hidden_layers, "backbone layer out of range");
                 ensure!(expert < config.n_routed_experts, "backbone expert out of range");
@@ -105,6 +117,10 @@ impl OfficialV41Catalog {
                 || matches!(selection, V41ExpertSelection::BackboneFull { .. })
             {
                 usize::try_from(self.tensor(name)?.metadata.byte_length)?
+            } else if let V41ExpertSelection::BackboneTp { world, .. } = selection {
+                let length = self.tensor(name)?.metadata.byte_length;
+                ensure!(length % world as u64 == 0, "NVFP4 tensor does not divide into TP{world}: {name}");
+                usize::try_from(length / world as u64)?
             } else if matches!(selection, V41ExpertSelection::BackboneTp2 { .. }) {
                 usize::try_from(self.tensor(name)?.metadata.byte_length / 2)?
             } else {
@@ -248,6 +264,14 @@ impl V41Nvfp4Staging<'_> {
                 std::fs::File::open(self.catalog.snapshot().join(&tensor.shard))?
                     .read_exact_at(&mut staging[range.clone()], tensor.metadata.byte_offset)
                     .with_context(|| format!("staging NVFP4 tensor {name}"))?;
+            } else if let V41ExpertSelection::BackboneTp { world, rank, .. } = self.selection {
+                let config = self.catalog.config().text();
+                let geometry = V41BackboneTpGeometry::new(
+                    config.moe_intermediate_size, config.hidden_size, world, rank,
+                )?;
+                self.catalog
+                    .read_backbone_tp_into(name, geometry, &mut staging[range.clone()], scratch)
+                    .with_context(|| format!("staging TP{world} NVFP4 tensor {name}"))?;
             } else if let V41ExpertSelection::BackboneTp2 { rank, .. } = self.selection {
                 self.catalog
                     .read_backbone_tp2_into(name, rank, &mut staging[range.clone()], scratch)
@@ -264,7 +288,8 @@ impl V41Nvfp4Staging<'_> {
     fn rank(&self) -> Option<usize> {
         match self.selection {
             V41ExpertSelection::Backbone { rank, .. } => Some(rank),
-            V41ExpertSelection::BackboneTp2 { rank, .. } => Some(rank),
+            V41ExpertSelection::BackboneTp2 { rank, .. }
+            | V41ExpertSelection::BackboneTp { rank, .. } => Some(rank),
             _ => None,
         }
     }
@@ -277,7 +302,7 @@ mod tests {
 
     #[test]
     #[ignore = "requires CUTEAFD_NVFP4_SNAPSHOT pointing to a local ModelOpt NVFP4 publication"]
-    fn real_snapshot_stages_tp4_and_tp2_experts() {
+    fn real_snapshot_stages_tp4_tp2_tp3_and_tp6_experts() {
         let path = std::env::var_os("CUTEAFD_NVFP4_SNAPSHOT").expect("CUTEAFD_NVFP4_SNAPSHOT");
         let catalog =
             crate::read_official_v41_catalog("nvidia/DeepSeek-V4.1-Flash-NVFP4", Path::new(&path))
@@ -286,6 +311,8 @@ mod tests {
             V41ExpertSelection::Backbone { layer: 0, expert: 0, rank: 0 },
             V41ExpertSelection::Backbone { layer: 39, expert: 383, rank: 3 },
             V41ExpertSelection::BackboneTp2 { layer: 20, expert: 100, rank: 1 },
+            V41ExpertSelection::BackboneTp { layer: 0, expert: 0, rank: 2, world: 3 },
+            V41ExpertSelection::BackboneTp { layer: 39, expert: 383, rank: 5, world: 6 },
         ] {
             let staging = catalog.nvfp4_expert_staging(selection).unwrap();
             assert!(staging.w13_contiguous(), "W3/W1 must be adjacent");
@@ -310,7 +337,52 @@ mod tests {
             assert_eq!(ranges[3].end, ranges[4].start);
             assert_eq!(ranges[1].end, ranges[2].start);
         }
-        println!("NVFP4 staging read TP4 and TP2 experts from the real snapshot");
+        println!("NVFP4 staging read TP4, TP2, TP3 and TP6 experts from the real snapshot");
+    }
+
+    #[test]
+    #[ignore = "requires CUTEAFD_NVFP4_SNAPSHOT pointing to a local ModelOpt NVFP4 publication"]
+    fn real_snapshot_tp3_tp6_regions_match_full() {
+        let path = std::env::var_os("CUTEAFD_NVFP4_SNAPSHOT").expect("CUTEAFD_NVFP4_SNAPSHOT");
+        let catalog = crate::read_official_v41_catalog(
+            "nvidia/DeepSeek-V4.1-Flash-NVFP4", Path::new(&path),
+        ).unwrap();
+        let full = catalog.nvfp4_expert_staging(
+            V41ExpertSelection::BackboneFull { layer: 0, expert: 0 },
+        ).unwrap();
+        let mut full_bytes = vec![0; full.staging_bytes()];
+        full.read_into(&mut full_bytes, &mut []).unwrap();
+        for world in [3, 6] {
+            for rank in 0..world {
+                let shard = catalog.nvfp4_expert_staging(V41ExpertSelection::BackboneTp {
+                    layer: 0, expert: 0, rank, world,
+                }).unwrap();
+                assert_eq!(shard.intermediate_size(), 2304 / world);
+                let mut bytes = vec![0; shard.staging_bytes()];
+                let mut scratch = vec![0; shard.minimum_read_scratch_bytes()];
+                shard.read_into(&mut bytes, &mut scratch).unwrap();
+                for slot in 0..V41_NVFP4_STAGING_SLOTS {
+                    let actual = &bytes[shard.ranges[slot].clone()];
+                    let source = &full_bytes[full.ranges[slot].clone()];
+                    if slot >= 6 {
+                        assert_eq!(actual, source, "TP{world} rank{rank} scalar{slot}");
+                    } else if slot == 2 || slot == 5 {
+                        // FC2 payload and K16 scales slice each packed row's columns.
+                        let row_bytes = source.len() / full.hidden_size();
+                        let width = row_bytes / world;
+                        for (row, actual) in actual.chunks_exact(width).enumerate() {
+                            let start = row * row_bytes + rank * width;
+                            assert_eq!(actual, &source[start..start + width],
+                                "TP{world} rank{rank} slot{slot} row{row}");
+                        }
+                    } else {
+                        let start = rank * actual.len();
+                        assert_eq!(actual, &source[start..start + actual.len()],
+                            "TP{world} rank{rank} slot{slot}");
+                    }
+                }
+            }
+        }
     }
 
     #[test]
@@ -318,7 +390,7 @@ mod tests {
         // The adjacency invariant is structural: slots 0/1 and 3/4 are laid
         // out consecutively with 16-byte alignment, and every size is a
         // multiple of 16, so the pair ranges must touch.
-        for (intermediate, hidden, group) in [(576usize, 5120usize, 16usize), (1152, 5120, 16)] {
+        for (intermediate, hidden, group) in [(576usize, 5120usize, 16usize), (1152, 5120, 16), (768, 5120, 16), (384, 5120, 16)] {
             let weight = intermediate * hidden / 2;
             let scale = intermediate * hidden / group;
             assert_eq!(weight % 16, 0);

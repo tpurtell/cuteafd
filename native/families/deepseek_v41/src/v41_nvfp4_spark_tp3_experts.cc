@@ -1,0 +1,9 @@
+// Whole-block NVFP4 Spark TP3 shard, BF16 fabric input.
+#define CUTEAFD_V41_NVFP4_VARIANTS_HEADER "v41_nvfp4_spark_tp3_variants.h"
+#define cuteafd_expert_info cuteafd_v41_nvfp4_spark_tp3_expert_info
+#define cuteafd_expert_initialize cuteafd_v41_nvfp4_spark_tp3_expert_initialize
+#define cuteafd_expert_output_kind cuteafd_v41_nvfp4_spark_tp3_expert_output_kind
+#define cuteafd_expert_bind_scratch cuteafd_v41_nvfp4_spark_tp3_expert_bind_scratch
+#define cuteafd_expert_initialize_scratch_async cuteafd_v41_nvfp4_spark_tp3_expert_initialize_scratch_async
+#define cuteafd_expert_launch cuteafd_v41_nvfp4_spark_tp3_expert_launch
+#include "v41_experts.cc"
