@@ -1992,9 +1992,13 @@ value (the measured GLM Flash regression and V4's 603K pool first).
 | 24 | `D5` delete `CycleCost`, `Calibration`, `allocate`, v2 buckets, `glm5/dflash_policy.rs` planning, per-family copy loops | D | S | 16 | tests; failing ids unchanged |
 | 25 | `S6` delete and rename: legacy non-topology path, `v41_` module prefix, dated compatibility readers | S | M | 21, 23 | full V4.1 parity (3 interleaved sessions) against v2.0.0 |
 
-**Release cuts.** Full V4.1 parity and the agentic bench run at cuts, not per
-step: a cut after step 11 (placement for V4, draft policy for GLM Flash,
-V4.1 byte-exact on shared types), one after step 20, and v3.0.0 after 25.
+**Release gate (TJ, 2026-10-11): no v3 release** until every family has TP2
+RTX experts and solver-planned memory and attention: V4 (P4, done),
+GLM Flash (P6/P7), MiMo (P8), GLM 5.3 (P9 plus its K-step), Qwen (P10) and
+V4.1 (P12). The shared adaptive draft policy is the default for every family,
+with the old per-family policies deleted (D3 GLM Flash, D4 the rest, D5 the
+remains). There are no intermediate v3 cuts. Full V4.1 parity and the agentic
+bench run at that one cut.
 
 **v3 reference cards (TJ, 2026-10-10).** Besides each family's min/max, these
 cards are in the regular test set for the unification steps and are v3
