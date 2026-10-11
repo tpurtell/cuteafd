@@ -131,19 +131,7 @@ pub(crate) fn nvfp4_activations() -> Nvfp4Activations {
 /// CUTEAFD_FP8_EXACT_SLICES=0 keeps the padded layout.
 pub(crate) fn exact_layout(directory: &Path, tensors: &Fp8ExpertTensors, tp: usize, rank: usize)
     -> (PathBuf, Slicing) {
-    let padded = (directory.to_path_buf(), Slicing::Padded);
-    if std::env::var("CUTEAFD_FP8_EXACT_SLICES").is_ok_and(|v| v == "0") || tp < 2 {
-        return padded;
-    }
-    let (Some(package), Some(layout)) = (directory.parent(), directory.file_name().and_then(|n| n.to_str())) else {
-        return padded;
-    };
-    let exact = Slicing::Blocks(128);
-    let dir_of = |r: usize| tensors.rank_width(tp, r, exact).ok().map(|w| package.join(format!("{layout}-w{w}")));
-    match (0..tp).map(dir_of).collect::<Option<Vec<_>>>() {
-        Some(dirs) if dirs.iter().all(|d| d.is_dir()) => (dirs[rank].clone(), exact),
-        _ => padded,
-    }
+    cuteafd_loader::formats::fp8_experts::exact_layout_directory(directory, tensors, tp, rank)
 }
 
 /// The BF16-input sibling of an FP8 package directory:
