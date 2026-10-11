@@ -80,6 +80,15 @@ pub(crate) trait RtxExpertLayer {
     /// valid after the last [`Self::enqueue`] completes on its stream and
     /// until the next one.
     fn output(&self) -> *mut c_void;
+    /// Initialize first-use kernels before queuing any peer waits. Native and
+    /// EXL3 callers already prewarm their step packages; FP8 primes capacities.
+    ///
+    /// # Safety
+    /// The input/routes contain the backend's maximum initialized row count on
+    /// this rank; the startup stream has no pending peer waits and is drained.
+    unsafe fn prime(&mut self, _input: ExpertInput, _routes: Routes, _stream: *mut c_void) -> Result<()> {
+        Ok(())
+    }
     /// This rank's routed sum for `rows` rows of `layer` into [`Self::output`]:
     /// no shared add, no inter-rank reduce, no finish or copy.
     ///

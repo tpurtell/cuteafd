@@ -279,6 +279,25 @@ impl<'a> Fp8Experts<'a> {
         bf16_directory: Option<&Path>, layers: std::ops::Range<usize>, tp: usize, rank: usize, capacity: usize,
         budget: usize) -> Result<Self> {
         let _memory_scope = cuteafd_ffi::memory_ledger::scope("experts/weights");
+        let mut experts = Self::prepare(library, tensors, directory, bf16_directory, layers.clone(), tp,
+            rank, capacity, budget)?;
+        let slicing = if directory.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.contains("-w")) {
+            Slicing::Blocks(128)
+        } else { Slicing::Padded };
+        experts.layers = layers.map(|layer| {
+            let started = std::time::Instant::now();
+            let loaded = Fp8Layer::load_with(library, tensors, layer, tp, rank, slicing)?;
+            tracing::info!(layer, tp, rank, elapsed_ms = started.elapsed().as_millis() as u64,
+                "FP8 expert layer resident");
+            Ok(loaded)
+        }).collect::<Result<Vec<_>>>()?;
+        Ok(experts)
+    }
+
+    fn prepare(library: &'a NativeLibrary, tensors: &Fp8ExpertTensors, directory: &Path,
+        bf16_directory: Option<&Path>, layers: std::ops::Range<usize>, tp: usize, rank: usize, capacity: usize,
+        budget: usize) -> Result<Self> {
+        let _memory_scope = cuteafd_ffi::memory_ledger::scope("experts/weights");
         // `tp<n>-w<width>` layouts store each rank's own whole 128-row blocks (see `exact_layout`).
         let slicing = match directory.file_name().and_then(|n| n.to_str()).and_then(|n| n.split_once("-w")) {
             Some(_) => Slicing::Blocks(128),
@@ -321,15 +340,172 @@ impl<'a> Fp8Experts<'a> {
             bf16_module.as_ref().map(|(_, scratch)| *scratch), budget)?;
         tracing::info!(resident_bytes, scratch_bytes, budget, bf16_package = ?bf16_directory,
             "FP8 expert allocation admitted");
-        let layers = layers.map(|layer| {
-            let started = std::time::Instant::now();
-            let loaded = Fp8Layer::load_with(library, tensors, layer, tp, rank, slicing)?;
-            tracing::info!(layer, tp, rank, elapsed_ms = started.elapsed().as_millis() as u64,
-                "FP8 expert layer resident");
-            Ok(loaded)
-        }).collect::<Result<Vec<_>>>()?;
         let scratch = DeviceAllocation::new(library, scratch_bytes)?;
-        Ok(Self { layers, scratch, bf16_module: bf16_module.map(|(module, _)| module), module, tp, rank })
+        Ok(Self { layers: Vec::with_capacity(layers.len()), scratch,
+            bf16_module: bf16_module.map(|(module, _)| module), module, tp, rank })
+    }
+
+    /// Bounded P4 double banks: each checkpoint projection is read once, then
+    /// both GPUs take their own row/column window from the same pinned bytes.
+    pub fn load_pair(devices: [crate::shared::memory::device::Device<'a>; 2], tensors: &Fp8ExpertTensors,
+        directories: [&Path; 2], slicing: [Slicing; 2], layers: std::ops::Range<usize>, capacity: usize,
+        budgets: [usize; 2]) -> Result<[crate::shared::memory::device::DeviceOwner<'a, Self>; 2]> {
+        use super::paired_load::{self, Fences};
+        use crate::shared::memory::device::Device;
+        use cuteafd_ffi::{CuteafdDeviceBuffer, CuteafdHostBuffer};
+        use cuteafd_loader::formats::fp8_experts::Fp8MatrixSlice;
+        let _memory_scope = cuteafd_ffi::memory_ledger::scope("experts/weights");
+        let started = std::time::Instant::now();
+        ensure!(slicing[0] == slicing[1], "FP8 paired ranks disagree on slicing");
+        let mut owners = [
+            devices[0].own(|| Self::prepare(devices[0].library, tensors, directories[0], None,
+                layers.clone(), 2, 0, capacity, budgets[0]))?,
+            devices[1].own(|| Self::prepare(devices[1].library, tensors, directories[1], None,
+                layers.clone(), 2, 1, capacity, budgets[1]))?,
+        ];
+        for layer in layers.clone() {
+            for rank in 0..2 {
+                devices[rank].run(|| {
+                    let mut regions = Vec::with_capacity(6);
+                    for projection in Fp8Projection::ALL {
+                        let (weights, _) = tensors.slice_bytes_with(projection, 2, rank, slicing[rank])?;
+                        for bytes in [weights * tensors.shape().experts,
+                            tensors.scale_region_bytes_with(projection, 2, rank, slicing[rank])?] {
+                            regions.push(DeviceAllocation::new(devices[rank].library, bytes)?);
+                        }
+                    }
+                    owners[rank].layers.push(Fp8Layer { layer, regions });
+                    Ok(())
+                })?;
+            }
+        }
+        let sizes = Fp8Projection::ALL.map(|p| tensors.projection_bytes(p));
+        let mut offsets = [0; 3];
+        let mut full_bytes = 0;
+        let mut zero_bytes = 0;
+        for (slot, projection) in Fp8Projection::ALL.into_iter().enumerate() {
+            offsets[slot] = full_bytes;
+            full_bytes += sizes[slot].0 + sizes[slot].1;
+            for rank in 0..2 {
+                let bytes = tensors.slice_bytes_with(projection, 2, rank, slicing[rank])?;
+                zero_bytes = zero_bytes.max(bytes.0).max(bytes.1);
+            }
+        }
+        let bank_bytes = full_bytes.checked_add(zero_bytes).context("FP8 paired bank overflow")?;
+        let pinned_bytes = bank_bytes.checked_mul(READERS * 2).context("FP8 paired staging overflow")?;
+        let mut hosts = paired_load::banks(devices[0], READERS, bank_bytes, pinned_bytes)?;
+        let mut fences = Fences::new(devices)?;
+        // Last owner drops first and drains both streams on every error path,
+        // before pinned banks, device weights or package modules can be freed.
+        let streams = paired_load::streams(devices)?;
+        let allocation_seconds = started.elapsed().as_secs_f64();
+
+        fn upload(device: Device<'_>, host: CuteafdHostBuffer, source_offset: usize,
+            mut destination: CuteafdDeviceBuffer, destination_offset: usize, window: Fp8MatrixSlice,
+            zero_offset: usize, stream: *mut c_void) -> Result<()> {
+            ensure!(destination_offset.checked_add(window.destination_bytes).is_some_and(|n| n <= destination.bytes),
+                "FP8 paired upload exceeds resident region");
+            ensure!(source_offset.checked_add(window.source_offset).is_some_and(|n| n < host.bytes),
+                "FP8 paired source exceeds pinned bank");
+            device.run(|| {
+                // SAFETY: windows are checked against the retained resident region;
+                // pinned banks are fenced before reuse and streams drain on unwind.
+                unsafe {
+                    destination.ptr = destination.ptr.cast::<u8>().add(destination_offset).cast();
+                    destination.bytes = window.destination_bytes;
+                    let copied = window.width * window.rows;
+                    if copied < window.destination_bytes {
+                        let mut zeros = host;
+                        zeros.ptr = zeros.ptr.cast::<u8>().add(zero_offset).cast();
+                        zeros.bytes -= zero_offset;
+                        device.library.copy_host_buffer_h2d_async(destination, zeros,
+                            window.destination_bytes, stream)?;
+                    }
+                    let mut source = host;
+                    let offset = source_offset + window.source_offset;
+                    source.ptr = source.ptr.cast::<u8>().add(offset).cast();
+                    source.bytes -= offset;
+                    device.library.copy_host_buffer_h2d_2d_async(destination, window.destination_pitch, source,
+                        window.source_pitch, window.width, window.rows, stream)
+                }
+            })
+        }
+
+        let mut group = 0;
+        for (index, layer) in layers.enumerate() {
+            let layer_started = std::time::Instant::now();
+            let mut storage_bytes_read = 0;
+            let mut read_seconds = 0.;
+            let mut bank_wait_seconds = 0.;
+            let mut upload_submit_seconds = 0.;
+            for first in (0..tensors.shape().experts).step_by(READERS) {
+                let count = READERS.min(tensors.shape().experts - first);
+                let bank = group % 2;
+                let wait = std::time::Instant::now();
+                fences.reuse(bank)?;
+                bank_wait_seconds += wait.elapsed().as_secs_f64();
+                paired_load::trace_overlap(&streams, "read_start", layer, first)?;
+                let read_started = std::time::Instant::now();
+                let mut jobs = Vec::with_capacity(count * 3);
+                for (lane, host) in hosts[bank][..count].iter_mut().enumerate() {
+                    let mut bytes = &mut host.bytes_mut()[..full_bytes];
+                    for (slot, projection) in Fp8Projection::ALL.into_iter().enumerate() {
+                        let (source, rest) = bytes.split_at_mut(sizes[slot].0 + sizes[slot].1);
+                        let (weight, scale) = source.split_at_mut(sizes[slot].0);
+                        jobs.push((first + lane, projection, weight, scale));
+                        bytes = rest;
+                    }
+                }
+                jobs.sort_unstable_by_key(|(_, _, w, s)| w.len() + s.len());
+                storage_bytes_read += paired_load::read_jobs(jobs, READERS * 2,
+                    |(expert, projection, weight, scale)| tensors.read_projection_once(layer, expert, projection,
+                        weight, scale))?;
+                if tensors.format() == ExpertFormat::Nvfp4 {
+                    for (lane, host) in hosts[bank][..count].iter().enumerate() {
+                        let bytes = host.bytes();
+                        let gate = offsets[0] + sizes[0].0 + sizes[0].1 - 4;
+                        let up = offsets[1] + sizes[1].0 + sizes[1].1 - 4;
+                        Fp8ExpertTensors::check_input_scales(layer, &bytes[gate..gate + 4], &bytes[up..up + 4])
+                            .with_context(|| format!("shared projection expert {}", first + lane))?;
+                    }
+                }
+                read_seconds += read_started.elapsed().as_secs_f64();
+                let upload_started = std::time::Instant::now();
+                for rank in 0..2 {
+                    for (lane, host) in hosts[bank][..count].iter().enumerate() {
+                        let expert = first + lane;
+                        for (slot, projection) in Fp8Projection::ALL.into_iter().enumerate() {
+                            let windows = tensors.projection_slices(projection, 2, rank, slicing[rank])?;
+                            let regions = &owners[rank].layers[index].regions;
+                            upload(devices[rank], host.buffer, offsets[slot], regions[2 * slot].buffer,
+                                expert * windows[0].destination_bytes, windows[0], full_bytes, streams[rank].raw)?;
+                            upload(devices[rank], host.buffer, offsets[slot] + sizes[slot].0, regions[2 * slot + 1].buffer,
+                                expert * windows[1].destination_bytes, windows[1], full_bytes, streams[rank].raw)?;
+                            if tensors.format() == ExpertFormat::Nvfp4 {
+                                let grid_bytes = windows[1].destination_bytes * tensors.shape().experts;
+                                for scalar in 0..2 {
+                                    let source = offsets[slot] + sizes[slot].0 + sizes[slot].1 - 8 + scalar * 4;
+                                    upload(devices[rank], host.buffer, source, regions[2 * slot + 1].buffer,
+                                        grid_bytes + scalar * tensors.shape().experts * 4 + expert * 4,
+                                        Fp8MatrixSlice { source_offset: 0, source_pitch: 4, destination_pitch: 4,
+                                            width: 4, rows: 1, destination_bytes: 4 }, full_bytes, streams[rank].raw)?;
+                                }
+                            }
+                        }
+                    }
+                }
+                upload_submit_seconds += upload_started.elapsed().as_secs_f64();
+                fences.record(bank, &streams)?;
+                paired_load::trace_overlap(&streams, "both_submitted", layer, first)?;
+                group += 1;
+            }
+            tracing::info!(layer, storage_bytes_read, read_seconds, bank_wait_seconds, upload_submit_seconds,
+                elapsed_seconds = layer_started.elapsed().as_secs_f64(), "FP8 TP2 shared-read layer timeline");
+        }
+        paired_load::drain(&streams)?;
+        tracing::info!(allocation_seconds, pinned_host_bytes = pinned_bytes, read_scratch_bytes = 0,
+            elapsed_seconds = started.elapsed().as_secs_f64(), "FP8 TP2 shared-read load complete");
+        Ok(owners)
     }
 
     pub fn index_of(&self, layer: usize) -> Result<usize> {
@@ -428,6 +604,59 @@ mod tests {
         let no_local = ["test", "--snapshot", "/snapshot", "--native-lib", "/native.so", "--expert-window", "1"];
         assert!(QwenArgs::try_parse_from(no_local).is_err());
         assert!(GlmfArgs::try_parse_from(no_local).is_err());
+    }
+
+    #[test]
+    #[ignore = "requires two CUDA GPUs, CUTEAFD_NATIVE_LIB, CUTEAFD_FP8_TP2_SNAPSHOT and CUTEAFD_FP8_TP2_PACKAGE"]
+    fn paired_uploads_are_byte_exact_against_checkpoint_rank_slices() -> anyhow::Result<()> {
+        use super::{exact_layout, ExpertFormat, Fp8Experts, Fp8ExpertTensors, Fp8Layer, Fp8Projection, NativeLibrary};
+        use anyhow::ensure;
+        use crate::shared::memory::device::Device;
+        use cuteafd_ffi::fp8_moe::Fp8MoeMetadata;
+        use cuteafd_loader::RoutedExpertShape;
+        let snapshot = std::path::PathBuf::from(std::env::var("CUTEAFD_FP8_TP2_SNAPSHOT")?);
+        let package = std::path::PathBuf::from(std::env::var("CUTEAFD_FP8_TP2_PACKAGE")?);
+        let layer = std::env::var("CUTEAFD_FP8_TP2_LAYER").unwrap_or_else(|_| "3".into()).parse::<usize>()?;
+        // SAFETY: qualification paths name this task's trusted native/package artifacts.
+        let library = unsafe { NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? };
+        // SAFETY: the same trusted package supplies only static geometry/scratch ABI here.
+        let metadata = unsafe { Fp8MoeMetadata::read(&package) }?;
+        let info = &metadata.info;
+        let tensors = Fp8ExpertTensors::read(&snapshot, RoutedExpertShape { layers: layer + 1,
+            first_layer: layer, experts: info.experts, topk: info.topk, hidden: info.hidden,
+            intermediate: info.intermediate, draft_stages: 0, draft_experts: 0 })?;
+        let layouts = [exact_layout(&package, &tensors, 2, 0), exact_layout(&package, &tensors, 2, 1)];
+        let devices = [Device { library: &library, id: 0 }, Device { library: &library, id: 1 }];
+        let budgets = [0, 1].map(|rank| Fp8Layer::bytes_for(&tensors, 2, rank, layouts[rank].1)
+            .and_then(|resident| Ok(resident + metadata.scratch_for(1)?.max(256))));
+        let [left, right] = budgets;
+        let owners = Fp8Experts::load_pair(devices, &tensors, [&layouts[0].0, &layouts[1].0],
+            layouts.each_ref().map(|layout| layout.1), layer..layer + 1, 1, [left?, right?])?;
+        for rank in 0..2 {
+            for (slot, projection) in Fp8Projection::ALL.into_iter().enumerate() {
+                let sizes = tensors.slice_bytes_with(projection, 2, rank, layouts[rank].1)?;
+                let mut weights = vec![0; sizes.0 * info.experts];
+                let mut scales = vec![0; tensors.scale_region_bytes_with(projection, 2, rank, layouts[rank].1)?];
+                for expert in 0..info.experts {
+                    tensors.read_slice_with(layer, expert, projection, 2, rank, layouts[rank].1,
+                        &mut weights[expert * sizes.0..][..sizes.0], &mut scales[expert * sizes.1..][..sizes.1],
+                        &mut Vec::new())?;
+                    if tensors.format() == ExpertFormat::Nvfp4 {
+                        let scalar = sizes.1 * info.experts;
+                        scales[scalar + expert * 4..][..4]
+                            .copy_from_slice(&tensors.read_alpha(layer, expert, projection)?.to_le_bytes());
+                        scales[scalar + info.experts * 4 + expert * 4..][..4]
+                            .copy_from_slice(&tensors.read_input_scale(layer, expert, projection)?.to_le_bytes());
+                    }
+                }
+                for (region, expected) in [(2 * slot, weights), (2 * slot + 1, scales)] {
+                    let mut actual = vec![0; expected.len()];
+                    devices[rank].run(|| library.copy_d2h(&mut actual, owners[rank].layers[0].regions[region].buffer))?;
+                    ensure!(actual == expected, "TP2 paired upload differs: rank {rank} layer {layer} {projection:?} region {region}");
+                }
+            }
+        }
+        Ok(())
     }
 
     #[test]

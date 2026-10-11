@@ -97,27 +97,67 @@ impl<'a> Fp8MoeTp2<'a> {
             workspace_bytes: plan.workspace_bytes, experts, output })
     }
 
-    /// Both halves are admitted before either allocates. Unlike Native/EXL3,
-    /// Fp8ExpertTensors has no shared-read projection bank yet; each rank loads
-    /// only its own slice through the existing bounded readers.
+    /// Both halves are admitted before either allocates; P4's shared pinned
+    /// banks read each source projection once for both rank windows.
     pub(crate) fn load_pair(devices: [Device<'a>; 2], tensors: &Fp8ExpertTensors, directory: &Path,
         layers: Range<usize>, max_rows: usize, budgets: [usize; 2]) -> Result<[Self; 2]> {
         ensure!(devices[0].id != devices[1].id && std::ptr::eq(devices[0].library, devices[1].library),
             "invalid FP8 MoE TP2 device pair");
+        ensure!(!layers.is_empty() && layers.start >= tensors.shape().first_layer
+            && layers.end <= tensors.shape().layers, "invalid FP8 MoE TP2 layer range");
+        let plans = [Self::plan(tensors, directory, 0, max_rows)?, Self::plan(tensors, directory, 1, max_rows)?];
         for rank in 0..2 {
-            let plan = Self::plan(tensors, directory, rank, max_rows)?;
-            let required = plan.resident_layer_bytes.checked_mul(layers.len())
-                .and_then(|n| n.checked_add(plan.workspace_bytes)).context("FP8 MoE TP2 allocation overflow")?;
+            let required = plans[rank].resident_layer_bytes.checked_mul(layers.len())
+                .and_then(|n| n.checked_add(plans[rank].workspace_bytes)).context("FP8 MoE TP2 allocation overflow")?;
             ensure!(required <= budgets[rank], "FP8 MoE TP2 rank {rank} needs {required} bytes; budget {}", budgets[rank]);
         }
-        Ok([
-            Self::load(devices[0], tensors, directory, layers.clone(), 0, max_rows, budgets[0])?,
-            Self::load(devices[1], tensors, directory, layers, 1, max_rows, budgets[1])?,
-        ])
+        if std::env::var("CUTEAFD_TP2_SHARED_READ").as_deref() == Ok("0") {
+            return Ok([
+                Self::load(devices[0], tensors, directory, layers.clone(), 0, max_rows, budgets[0])?,
+                Self::load(devices[1], tensors, directory, layers, 1, max_rows, budgets[1])?,
+            ]);
+        }
+        let completions = [RankCompletion::new(Event::new(devices[0])?), RankCompletion::new(Event::new(devices[1])?)];
+        let experts = Fp8Experts::load_pair(devices, tensors, [&plans[0].directory, &plans[1].directory],
+            plans.each_ref().map(|p| p.slicing), layers.clone(), max_rows,
+            [budgets[0] - plans[0].output_bytes, budgets[1] - plans[1].output_bytes])?;
+        let make = |rank: usize, completion, experts: DeviceOwner<'a, Fp8Experts<'a>>| -> Result<Self> {
+            ensure!(experts.resident_bytes() == plans[rank].resident_layer_bytes * layers.len()
+                && experts.scratch_bytes() == plans[rank].scratch_bytes,
+                "FP8 MoE TP2 static pair allocation plan disagrees with runtime");
+            let output = Allocation::new(devices[rank], plans[rank].output_bytes)?;
+            Ok(Self { completion, device: devices[rank], rank: rank as u8, layers: layers.clone(), max_rows,
+                workspace_bytes: plans[rank].workspace_bytes, experts, output })
+        };
+        let [left_completion, right_completion] = completions;
+        let [left, right] = experts;
+        Ok([make(0, left_completion, left)?, make(1, right_completion, right)?])
     }
 
     pub(crate) fn resident_bytes(&self) -> usize {
         self.experts.resident_bytes()
+    }
+
+    /// Force first-use CUDA loading of each serving capacity before any device
+    /// peer-wait is queued. Uses the caller's already admitted startup buffers.
+    ///
+    /// # Safety
+    /// As enqueue, but input/routes must contain max_rows valid rows and the
+    /// stream must have no pending peer waits. Startup outputs are discarded.
+    pub(crate) unsafe fn prime(&mut self, input: ExpertInput, routes: Routes, stream: *mut c_void) -> Result<()> {
+        let top = self.experts.module.info().capacity_for(self.max_rows)
+            .context("FP8 TP2 priming capacity disappeared")?;
+        let capacities: Vec<_> = self.experts.module.info().capacities.iter().copied()
+            .filter(|&capacity| capacity <= top).collect();
+        for capacity in capacities {
+            // SAFETY: caller supplies retained rows/routes for every startup bucket.
+            unsafe { self.enqueue(self.layers.start, capacity.min(self.max_rows), input, routes, stream)?; }
+            self.device.run(|| {
+                // SAFETY: this rank owns the startup stream, with no peer waits.
+                unsafe { self.device.library.cuda_stream_synchronize(stream) }
+            })?;
+        }
+        Ok(())
     }
 }
 
@@ -128,6 +168,11 @@ impl RtxExpertLayer for Fp8MoeTp2<'_> {
     fn device(&self) -> i32 { self.device.id }
     fn workspace_bytes(&self) -> usize { self.workspace_bytes }
     fn output(&self) -> *mut c_void { self.output.buffer.ptr }
+
+    unsafe fn prime(&mut self, input: ExpertInput, routes: Routes, stream: *mut c_void) -> Result<()> {
+        // SAFETY: the trait's startup buffer/stream contract is the inherent method's.
+        unsafe { Fp8MoeTp2::prime(self, input, routes, stream) }
+    }
 
     unsafe fn enqueue(&mut self, layer: usize, rows: usize, input: ExpertInput, routes: Routes,
         stream: *mut c_void) -> Result<()> {
