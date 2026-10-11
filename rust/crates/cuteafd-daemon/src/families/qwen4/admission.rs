@@ -21,12 +21,41 @@ pub(super) fn inputs<'a>(args: &EngineArgs, cfg: &'a Qwen4Config, layers: usize,
         headroom: cuteafd_loader::plan::layout::LayoutOptions::default().headroom_bytes.max(3 << 30) })
 }
 
+/// Admission follows the selected executor, not unused configured peers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ExpertSource {
+    LocalFp8,
+    LocalExl3,
+    Spark { ranks: usize },
+    None,
+}
+
+impl ExpertSource {
+    pub(super) fn selected(experts: Option<&super::engine::Experts<'_>>) -> Result<Self> {
+        Ok(match experts {
+            Some(super::engine::Experts::Local(_)) => Self::LocalFp8,
+            Some(super::engine::Experts::LocalExl3(_)) => Self::LocalExl3,
+            Some(super::engine::Experts::Spark { transport, .. }) => Self::Spark { ranks: transport.borrow().world_size() },
+            Some(super::engine::Experts::SharedOnly) | None => Self::None,
+            Some(super::engine::Experts::Tp2 { .. }) => anyhow::bail!("Qwen TP2 needs dual admission"),
+        })
+    }
+
+    fn code_key(self) -> &'static str {
+        match self { Self::LocalFp8 => "fp8", Self::LocalExl3 => "exl3", Self::Spark { .. } | Self::None => "none" }
+    }
+
+    fn spark_ranks(self) -> usize {
+        match self { Self::Spark { ranks } => ranks, _ => 0 }
+    }
+}
+
 /// Qwen's KV pool from one sample of free memory after weights, the PLE table and resident experts:
 /// the shared admission's fixed items and, with startup graphs, the largest pool whose own graph set
 /// fits beside them.
-pub(super) fn pool_tokens(library: &NativeLibrary, args: &EngineArgs, inputs: &QwenAdmissionInputs<'_>) -> Result<usize> {
-    let experts = if args.peers.is_some() { "none" } else if inputs.future_expert_bytes > 0 { "exl3" } else { "fp8" };
-    let pending = crate::shared::inventory::pending_code(library, args.device, 0, false, "qwen4", experts)?;
+pub(super) fn pool_tokens(library: &NativeLibrary, args: &EngineArgs, inputs: &QwenAdmissionInputs<'_>,
+    source: ExpertSource) -> Result<usize> {
+    let pending = crate::shared::inventory::pending_code(library, args.device, 0, false, "qwen4", source.code_key())?;
     let enabled = super::engine::startup_graphs_enabled(
         std::env::var("CUTEAFD_QWEN4_GRAPHS").ok().as_deref(),
         std::env::var("CUTEAFD_QWEN4_STARTUP_GRAPHS").ok().as_deref());
@@ -39,13 +68,19 @@ pub(super) fn pool_tokens(library: &NativeLibrary, args: &EngineArgs, inputs: &Q
         manifest: inputs.manifest, prefill_rows: inputs.prefill_rows, slots: inputs.slots,
         mark_bytes: inputs.mark_bytes, full_prefill_logits: inputs.full_prefill_logits,
         ple: inputs.ple, future_expert_bytes: inputs.future_expert_bytes, headroom: inputs.headroom };
-    let placement = qwen4::placement(&qwen4::QwenInputs { admission, capacity_bytes: total as u64,
-        baseline: Baseline::Measured { free_bytes: available as u64 }, pending_code_bytes: pending,
-        max_context: args.max_context as u64, requested_pool: (args.pool_tokens > 0).then_some(args.pool_tokens as u64),
-        spark_ranks: usize::from(args.peers.is_some()),
-        startup_graph_modes: args.planner_graph_modes.filter(|_| enabled) })?;
+    let placement = qwen4::placement(&placement_inputs(args, admission, source,
+        (available as u64, total as u64), pending, enabled))?;
     tracing::info!(pool_tokens = placement.pool_tokens, "Qwen shared solver admission before allocation");
     Ok(usize::try_from(placement.pool_tokens)?)
+}
+
+fn placement_inputs<'a>(args: &EngineArgs, admission: QwenAdmissionInputs<'a>, source: ExpertSource,
+    (available, total): (u64, u64), pending: u64, graphs_enabled: bool) -> qwen4::QwenInputs<'a> {
+    qwen4::QwenInputs { admission, capacity_bytes: total,
+        baseline: Baseline::Measured { free_bytes: available }, pending_code_bytes: pending,
+        max_context: args.max_context as u64, requested_pool: (args.pool_tokens > 0).then_some(args.pool_tokens as u64),
+        spark_ranks: source.spark_ranks(),
+        startup_graph_modes: args.planner_graph_modes.filter(|_| graphs_enabled) }
 }
 
 /// Static rank packages, selected before either device allocates experts. The
@@ -292,6 +327,48 @@ mod tests {
                 }
             }
         }
+        Ok(())
+    }
+
+    #[test]
+    fn selected_local_source_ignores_configured_peers_for_admission() -> anyhow::Result<()> {
+        use super::{placement_inputs, ExpertSource};
+        use clap::Parser;
+        use cuteafd_loader::placement::families::qwen4;
+        #[derive(Parser)]
+        struct Cli {
+            #[command(flatten)]
+            engine: super::super::EngineArgs,
+        }
+        let cfg = cuteafd_loader::families::qwen4::Qwen4Config::from_hf(
+            &cuteafd_loader::plan::testing::qwen4_config(48))?;
+        let local = Cli::try_parse_from(["serve", "--snapshot", "/absent/checkpoint", "--native-lib", "/absent/native.so",
+            "--local-experts", "--max-context", "131072"])?.engine;
+        let mut with_peers = local.clone();
+        with_peers.peers = Some("127.0.0.1:1234,127.0.0.1:1235".into());
+        let input = |args, source, pending| -> anyhow::Result<_> {
+            Ok(placement_inputs(args, super::inputs(args, &cfg, 48, false, None, None, 0)?,
+                source, (96 << 30, 96 << 30), pending, false))
+        };
+        for (source, key) in [(ExpertSource::LocalFp8, "fp8"), (ExpertSource::LocalExl3, "exl3")] {
+            assert_eq!(source.code_key(), key);
+            assert_eq!(source.spark_ranks(), 0);
+            let pending = cuteafd_loader::placement::loaded_code("qwen4", source.code_key(), false, 0)
+                .unwrap().pending(0, 0);
+            let plain = input(&local, source, pending)?;
+            let peers = input(&with_peers, source, pending)?;
+            assert_eq!(peers.pending_code_bytes, pending);
+            assert_eq!(peers.spark_ranks, 0);
+            assert_eq!(qwen4::request(&plain, 0)?, qwen4::request(&peers, 0)?);
+            assert_eq!(qwen4::placement(&plain)?, qwen4::placement(&peers)?);
+        }
+        let spark = ExpertSource::Spark { ranks: 4 };
+        assert_eq!(spark.code_key(), "none");
+        // The selected transport's actual world, not the configured two peers.
+        assert_eq!(input(&with_peers, spark, 0)?.spark_ranks, 4);
+        assert_eq!(ExpertSource::selected(None)?, ExpertSource::None);
+        let shared = super::super::engine::Experts::SharedOnly;
+        assert_eq!(ExpertSource::selected(Some(&shared))?, ExpertSource::None);
         Ok(())
     }
 
