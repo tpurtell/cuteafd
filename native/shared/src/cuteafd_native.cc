@@ -701,11 +701,27 @@ void record_graph_census(cudaGraph_t graph, cudaGraphExec_t exec,
   // Instantiate-only deltas include allocator granularity/reuse; preserve signed
   // values rather than claiming every executable has an independent allocation.
   const int64_t delta = bytes_valid ? static_cast<int64_t>(before_free) - static_cast<int64_t>(after_free) : 0;
-  std::fprintf(stderr,
+  // Docker multiplexes stdout/stderr in 16 KiB chunks. Long node records
+  // need a dedicated file so Rust tracing cannot split their JSON framing.
+  static FILE* captures = std::fopen("/tmp/cuteafd-graph-census-captures.jsonl", "a");
+  const uint64_t id = serial.fetch_add(1) + 1;
+  if (captures == nullptr) {
+    std::fprintf(stderr, "CUTEAFD_GRAPH_CENSUS {\"event\":\"capture_write_failed\",\"id\":%llu}\n",
+        static_cast<unsigned long long>(id));
+    (void)cudaGetLastError();
+    return;
+  }
+  flockfile(captures);
+  const int written = std::fprintf(captures,
       "CUTEAFD_GRAPH_CENSUS {\"event\":\"capture\",\"id\":%llu,\"exec\":\"%p\",\"device\":%d,"
       "\"nodes\":%zu,\"node_status\":%d,\"instantiate_bytes\":%lld,\"bytes_valid\":%s,\"details\":%s}\n",
-      static_cast<unsigned long long>(serial.fetch_add(1) + 1), reinterpret_cast<void*>(exec), device,
+      static_cast<unsigned long long>(id), reinterpret_cast<void*>(exec), device,
       count, static_cast<int>(status), static_cast<long long>(delta), bytes_valid ? "true" : "false", details.c_str());
+  const bool saved = std::fflush(captures) == 0 && written >= 0;
+  funlockfile(captures);
+  std::fprintf(stderr, "CUTEAFD_GRAPH_CENSUS {\"event\":\"%s\",\"id\":%llu,\"exec\":\"%p\"}\n",
+      saved ? "capture_ref" : "capture_write_failed", static_cast<unsigned long long>(id),
+      reinterpret_cast<void*>(exec));
   // Diagnostic API failures must not contaminate the next launch error check.
   (void)cudaGetLastError();
 }
