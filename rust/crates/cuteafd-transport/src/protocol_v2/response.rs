@@ -303,7 +303,50 @@ impl ExpertProtocolV2Response {
     }
 }
 
+impl ExpertProtocolV2ResponseHeader {
+    pub(super) fn validate_row_capacity_error(&self) -> Result<()> {
+        if self.flags & super::EXPERT_PROTOCOL_V2_FLAG_RESPONSE_ROW_CAPACITY_ERROR != 0 {
+            let allowed = super::EXPERT_PROTOCOL_V2_FLAG_RESPONSE_ROW_CAPACITY_ERROR
+                | super::EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16
+                | EXPERT_PROTOCOL_V2_FLAG_DEBUG_CHECKSUM;
+            if self.status != ExpertProtocolV2Status::Error || self.row_count != 0
+                || self.output_payload_bytes != 0 || self.flags & !allowed != 0
+                || self.output_dtype != ExpertV2Dtype::Bf16 || self.output_dim == 0
+                || self.output_dim.checked_mul(2) != Some(self.output_row_stride_bytes) {
+                bail!("invalid final row capacity error response");
+            }
+        }
+        Ok(())
+    }
+
+    /// Called after response/request identities have been checked, before row assembly.
+    pub(crate) fn ensure_success(&self, requested_rows: u32) -> Result<()> {
+        if self.status == ExpertProtocolV2Status::Error {
+            if self.flags & super::EXPERT_PROTOCOL_V2_FLAG_RESPONSE_ROW_CAPACITY_ERROR != 0 {
+                bail!("expert worker rejected {requested_rows} rows: capacity {}", self.output_dim);
+            }
+            bail!("expert worker rejected {requested_rows} rows (request {}, layer {})",
+                self.request_id, self.layer_id);
+        }
+        Ok(())
+    }
+}
+
 impl<'a> ExpertProtocolV2ResponseRef<'a> {
+    /// Reject an admitted wire request without allocating or executing its rows.
+    pub fn row_capacity_error(request: &super::ExpertProtocolV2RequestHeader,
+        capacity: u32, executor_id: u64) -> Result<Self> {
+        let mut response = Self::new_with_output_stride(request.request_id,
+            request.placement_version, request.layer_id, 0, capacity, ExpertV2Dtype::Bf16,
+            capacity.checked_mul(2).context("row capacity error stride overflow")?,
+            ExpertProtocolV2Status::Error, &[])?;
+        response.header.executor_id = executor_id;
+        response.header.flags = (request.flags & super::EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16)
+            | super::EXPERT_PROTOCOL_V2_FLAG_RESPONSE_ROW_CAPACITY_ERROR;
+        response.validate()?;
+        Ok(response)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn new_with_output_stride(
         request_id: u64,
@@ -588,6 +631,7 @@ fn validate_response_shape(
     payload_bytes: usize,
 ) -> Result<()> {
     validate_flags(header.flags, "response")?;
+    header.validate_row_capacity_error()?;
     let row_indexed = response_row_indices_enabled(header.flags);
     if row_indexed != row_indices.is_some() {
         bail!("ExpertProtocolV2 response row-index flag and row index table disagree");

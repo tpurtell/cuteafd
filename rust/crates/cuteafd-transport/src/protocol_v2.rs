@@ -32,6 +32,9 @@ pub const EXPERT_PROTOCOL_V2_FLAG_STREAM_FINAL: u32 = 1 << 8;
 pub const EXPERT_PROTOCOL_V2_FLAG_SPARK_REDUCTION: u32 = 1 << 9;
 // Native V4.1 compact BF16 rank partials; echoed in responses.
 pub const EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16: u32 = 1 << 16;
+// Final empty Error: output_dim carries the worker's admitted row capacity.
+// Header-only metadata is also readable when the response lands on the GPU.
+pub const EXPERT_PROTOCOL_V2_FLAG_RESPONSE_ROW_CAPACITY_ERROR: u32 = 1 << 17;
 pub const EXPERT_PROTOCOL_V2_FLAG_SPARK_ROW_SHARDED_REDUCTION: u32 = 1 << 11;
 const EXPERT_PROTOCOL_V2_SPARK_COLLECTIVE_PART_COUNT_SHIFT: u32 = 12;
 const EXPERT_PROTOCOL_V2_SPARK_COLLECTIVE_PART_COUNT_MASK: u32 =
@@ -495,7 +498,8 @@ fn validate_flags(flags: u32, label: &str) -> Result<()> {
                 | EXPERT_PROTOCOL_V2_SPARK_COLLECTIVE_PART_COUNT_MASK
         }
         "response" => {
-            EXPERT_PROTOCOL_V2_FLAG_DEBUG_CHECKSUM
+            EXPERT_PROTOCOL_V2_FLAG_RESPONSE_ROW_CAPACITY_ERROR
+                | EXPERT_PROTOCOL_V2_FLAG_DEBUG_CHECKSUM
                 | EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16
                 | EXPERT_PROTOCOL_V2_FLAG_RESPONSE_ROW_INDICES
                 | EXPERT_PROTOCOL_V2_FLAG_RESPONSE_MORE_CHUNKS

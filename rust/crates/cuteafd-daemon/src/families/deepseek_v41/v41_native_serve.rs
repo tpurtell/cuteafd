@@ -189,14 +189,8 @@ fn start(mut args: crate::cli::NativeServeArgs, http: bool) -> Result<Started> {
 // Reserve a supported AOT capacity once; live prefill chunks retain the user's
 // requested size. All backbone/draft workspaces and transport share this bound.
 fn prefill_capacity(batch_tokens: u32) -> Result<u32> {
-    anyhow::ensure!(
-        (80..=4096).contains(&batch_tokens),
-        "prefill batch must be in 80..=4096"
-    );
-    [80, 256, 1024, 4096]
-        .into_iter()
-        .find(|&capacity| capacity >= batch_tokens.max(128))
-        .context("no prefill capacity covers the requested batch")
+    cuteafd_core::coordinator_programs::v41_aot_rows(batch_tokens)
+        .context("prefill batch must be in 80..=4096")
 }
 
 fn admit_small_card_capacity(total: usize, batch: u32) -> Result<()> {
@@ -400,7 +394,8 @@ fn worker(
     // buffer follows the live prefill chunk (as the dual-RTX path does: the
     // FP8 plans keep their full scratch). 2048-row chunks: ~9 GiB less.
     let aot_capacity = prefill_capacity(args.prefill_batch_tokens)?;
-    let capacity = args.prefill_batch_tokens.max(256);
+    let capacity = cuteafd_core::coordinator_programs::v41_live_rows(args.prefill_batch_tokens)
+        .context("invalid V4.1 prefill batch")?;
     let rows = capacity as usize;
     let catalog = cuteafd_loader::read_official_v41_catalog(
         cuteafd_loader::OFFICIAL_V41_MODEL_ID,

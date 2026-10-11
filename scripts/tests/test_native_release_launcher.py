@@ -13,6 +13,41 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 class NativeReleaseLauncherTest(unittest.TestCase):
+    def test_v41_worker_capacity_covers_every_coordinator_chunk_and_replay(self) -> None:
+        chunks = list(range(80, 4097))
+        result = subprocess.run(['bash', '-c',
+            'source scripts/lib/release-common.sh; repo_root=$PWD; release_v41_expert_capacity "$@"',
+            'test', *map(str, chunks)], cwd=ROOT, text=True, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        capacities = list(map(int, result.stdout.splitlines()))
+        self.assertEqual(len(capacities), len(chunks))
+        for chunk, capacity in zip(chunks, capacities):
+            self.assertEqual(capacity, next(rows for rows in [256, 1024, 4096] if rows >= max(chunk, 256, 128)))
+        source = (ROOT / 'run.sh').read_text()
+        self.assertIn('expert_capacity="$(release_v41_expert_capacity "$PREFILL_BATCH_TOKENS")"', source)
+        self.assertIn('--prefill-rows "$expert_capacity"', source)
+
+    def test_v41_capacity_registry_rejects_invalid_chunks_and_syntax_drift(self) -> None:
+        registry = Path('rust/crates/cuteafd-core/src/coordinator_programs.rs')
+        for value in ['0', '79', '4097', 'x']:
+            result = subprocess.run(['bash', '-c',
+                'source scripts/lib/release-common.sh; repo_root=$PWD; release_v41_expert_capacity "$1"',
+                'test', value], cwd=ROOT, text=True, capture_output=True)
+            self.assertNotEqual(result.returncode, 0)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / registry).parent.mkdir(parents=True)
+            source = (ROOT / registry).read_text()
+            for changed in [source.replace('V41_LIVE_MIN_ROWS: u32 = 256;', 'V41_LIVE_MIN_ROWS: u32 = 128 * 2;'),
+                            source.replace('pub const V41_DECODER_REPLAY_ROWS: u32 = 128;', ''),
+                            source + '\npub const V41_PREFILL_MIN_ROWS: u32 = 80;\n']:
+                (root / registry).write_text(changed)
+                result = subprocess.run(['bash', '-c',
+                    'source scripts/lib/release-common.sh; repo_root="$1"; release_v41_expert_capacity 80',
+                    'test', str(root)], cwd=ROOT, text=True, capture_output=True)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn('row registry', result.stderr)
+
     def test_attention_placement_is_strict_before_starting_containers(self) -> None:
         source = (ROOT / 'scripts/launch/run-family.sh').read_text()
         block = source.split('attention_placement="$(get ATTENTION_PLACEMENT auto)"', 1)[1].split('\ncase "$family" in', 1)[0]

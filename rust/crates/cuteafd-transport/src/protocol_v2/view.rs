@@ -535,6 +535,7 @@ impl<'a> ExpertProtocolV2ResponseView<'a> {
             flags,
             executor_id: read_u64(bytes, RESPONSE_EXECUTOR_ID_OFFSET, "executor_id")?,
         };
+        header.validate_row_capacity_error()?;
         if header.output_dim == 0 {
             bail!("ExpertProtocolV2 response output_dim must be non-zero");
         }
@@ -640,6 +641,7 @@ impl<'a> ExpertProtocolV2ResponseView<'a> {
     }
 
     fn validate(&self) -> Result<()> {
+        self.header.validate_row_capacity_error()?;
         if self.row_indexed() != self.row_index_bytes.is_some() {
             bail!("ExpertProtocolV2 response row-index flag and row index table disagree");
         }

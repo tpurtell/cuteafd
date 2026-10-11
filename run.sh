@@ -375,11 +375,8 @@ else
   [[ "$image_sparkinfer" == "$sparkinfer_commit" ]] || release_die "coordinator image uses another SparkInfer revision (run ./build.sh)"
 fi
 
-expert_capacity=4096
-if ((PREFILL_BATCH_TOKENS <= 80)); then expert_capacity=80
-elif ((PREFILL_BATCH_TOKENS <= 256)); then expert_capacity=256
-elif ((PREFILL_BATCH_TOKENS <= 1024)); then expert_capacity=1024
-fi
+expert_capacity="$(release_v41_expert_capacity "$PREFILL_BATCH_TOKENS")" ||
+  release_die "cannot resolve expert row capacity"
 mapfile -t hosts < <(release_spark_values HOST)
 mapfile -t lanes < <(release_spark_values LANE_A)
 spark_exl3_identity=""

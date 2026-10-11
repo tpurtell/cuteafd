@@ -11,6 +11,42 @@ release_die() {
   exit 2
 }
 
+# The worker and coordinator must admit the same live rows, including decoder
+# replay. Fail closed if the Rust registry stops being literal declarations.
+release_v41_expert_capacity() {
+  local registry="${repo_root:?}/rust/crates/cuteafd-core/src/coordinator_programs.rs"
+  python3 - "$registry" "$@" <<'PYROWS'
+import pathlib, re, sys
+source = pathlib.Path(sys.argv[1]).read_text()
+def literal(name, shape):
+    declarations = re.findall(r'^pub const ' + name + r':.*$', source, re.M)
+    if len(declarations) != 1:
+        raise ValueError(f'missing or duplicate row registry constant {name}')
+    match = re.fullmatch(r'pub const ' + name + shape, declarations[0])
+    if match is None:
+        raise ValueError(f'nonliteral row registry constant {name}')
+    return match.group(1)
+try:
+    names = ('PREFILL_MIN_ROWS', 'PREFILL_MAX_ROWS', 'LIVE_MIN_ROWS', 'DECODER_REPLAY_ROWS')
+    low, high, floor, replay = (int(literal('V41_' + name, r': u32 = ([0-9]+);')) for name in names)
+    capacities = [int(x) for x in literal('V41_SERVING_AOT_ROWS',
+        r': \[u32; 3\] = \[([0-9]+, [0-9]+, [0-9]+)\];').split(', ')]
+    if not (0 < low <= floor <= high and 0 < replay <= high
+            and capacities == sorted(set(capacities)) and capacities[-1] >= high
+            and all(0 < x <= 0xffffffff for x in [low, high, floor, replay, *capacities])):
+        raise ValueError('invalid row registry geometry')
+    if not sys.argv[2:]:
+        raise ValueError('missing prefill chunk')
+    for text in sys.argv[2:]:
+        if not re.fullmatch(r'[0-9]+', text) or not low <= int(text) <= high:
+            raise ValueError(f'prefill chunk must be in {low}..{high}: {text}')
+        required = max(int(text), floor, replay)
+        print(next(rows for rows in capacities if rows >= required))
+except (ValueError, StopIteration) as error:
+    sys.exit(f'V4.1 row registry: {error}')
+PYROWS
+}
+
 release_validate_wip_instance() {
   [[ -z "${WIP_INSTANCE:-}" || "$WIP_INSTANCE" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,40}$ ]] ||
     release_die "WIP_INSTANCE must be [A-Za-z0-9_.-], starting with a letter or digit (max 41 characters)"

@@ -139,7 +139,7 @@ class Exl3ReleasePreflightTest(unittest.TestCase):
             result, _ = self.launch(spark_count=2, paired=False,
                                     extra=('--prefill-batch-tokens', requested))
             self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertIn(f'prefill batch tokens: {expected}; expert capacity: {expected}', result.stdout)
+            self.assertIn(f'prefill batch tokens: {expected}; expert capacity: 256', result.stdout)
         four, _ = self.launch(paired=False)
         self.assertIn('prefill batch tokens: 2048; expert capacity: 4096', four.stdout)
 

@@ -556,7 +556,7 @@ impl LocalVerbsExpertConnection {
                         // its previous send completed (the in-flight check above).
                         unsafe { std::ptr::copy_nonoverlapping(response.partial_output_payload.as_ptr(), slot.host_ptr,
                             bytes); }
-                        let flag = written_flag(request_id, response_has_more || response.row_indices.is_some());
+                        let flag = written_response_flag(&response.header, response_has_more || response.row_indices.is_some());
                         let send_started = timing_enabled.then(Instant::now);
                         endpoint.post_write_flagged(&target, response_send_offset, if flag & VERBS_HOST_WRITE_FLAG_ERROR != 0
                             { 0 } else { bytes }, flag, VERBS_HOST_SEND_WR_ID + response_send_slot as u64)?;
@@ -642,7 +642,7 @@ impl LocalVerbsExpertConnection {
                         match write_target {
                             Some(target) => {
                                 // Write mode: rows to the client's plane, then the flag.
-                                let flag = written_flag(request_id, response_has_more);
+                                let flag = written_response_flag(&response.header, response_has_more);
                                 endpoint.post_write_flagged(&target, response_send_offset + response_prefix.len(),
                                     if flag & VERBS_HOST_WRITE_FLAG_ERROR != 0 { 0 } else {
                                         response.partial_output_payload.bytes },
@@ -714,11 +714,11 @@ impl LocalVerbsExpertConnection {
     }
 }
 
-/// The flag a write-mode response publishes: its request id, with
-/// [`VERBS_HOST_WRITE_FLAG_ERROR`] when its rows could not be written whole
-/// (a chunked or row-indexed response has no plane layout).
-fn written_flag(request_id: u64, unwritable: bool) -> u64 {
-    (request_id & !VERBS_HOST_WRITE_FLAG_ERROR) | if unwritable { VERBS_HOST_WRITE_FLAG_ERROR } else { 0 }
+/// A final Error must never publish a successful flag for an untouched plane.
+fn written_response_flag(header: &ExpertProtocolV2ResponseHeader, unwritable: bool) -> u64 {
+    let failed = unwritable || header.status == crate::protocol_v2::ExpertProtocolV2Status::Error;
+    (header.request_id & !VERBS_HOST_WRITE_FLAG_ERROR)
+        | if failed { VERBS_HOST_WRITE_FLAG_ERROR } else { 0 }
 }
 
 fn check_peer_liveness(stream: &TcpStream, next: &mut Instant) -> Result<()> {
@@ -738,6 +738,20 @@ fn ensure_peer_open(stream: &TcpStream) -> Result<()> {
 #[cfg(test)]
 mod budget_tests {
     use super::*;
+
+    #[test]
+    fn write_mode_error_response_sets_error_flag_without_losing_request_identity() {
+        let mut header = ExpertProtocolV2ResponseHeader {
+            request_id: 42, placement_version: 7, layer_id: 13, row_count: 0,
+            output_dim: 80, output_dtype: crate::ExpertV2Dtype::Bf16,
+            output_row_stride_bytes: 160, output_payload_bytes: 0,
+            status: crate::ExpertProtocolV2Status::Error, flags: 0, executor_id: 1,
+        };
+        assert_eq!(written_response_flag(&header, false), 42 | VERBS_HOST_WRITE_FLAG_ERROR);
+        header.status = crate::ExpertProtocolV2Status::Ok;
+        assert_eq!(written_response_flag(&header, false), 42);
+        assert_eq!(written_response_flag(&header, true), 42 | VERBS_HOST_WRITE_FLAG_ERROR);
+    }
 
     #[test]
     fn busy_peer_eof_releases_rings_without_an_idle_window() -> Result<()> {

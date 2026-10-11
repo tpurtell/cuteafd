@@ -515,10 +515,7 @@ impl<'a> V41Tp4Planes<'a> {
                 && h.layer_id == self.layer,
             "stale or mismatched native TP response"
         );
-        ensure!(
-            h.status == ExpertProtocolV2Status::Ok,
-            "native expert execution failed"
-        );
+        h.ensure_success(self.rows)?;
         ensure!(
             h.output_dim == cuteafd_core::expert_geometry().hidden
                 && h.output_dtype == ExpertV2Dtype::Bf16
