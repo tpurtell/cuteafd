@@ -12,6 +12,7 @@ use crate::serving_capacity::{CacheOptions, KvPlacement};
 use cuteafd_core::memory_layout::{size_pool, Basis, Category, DeviceKind, DeviceLayout, Item, MemoryLayout, Waste};
 
 mod deepseek_v4;
+mod glm5_flash;
 mod v41;
 mod mimo;
 
@@ -124,6 +125,8 @@ pub struct LayoutOptions {
     pub onboard: Option<crate::placement::Onboard>,
     /// V4: force FP32 FFN exchange payloads for prefill as well as TP2 decode.
     pub exchange_f32: bool,
+    /// GLM Flash KDA partials and their peer payloads use FP32.
+    pub glmf_kda_fp32_partials: bool,
     /// Matching image's PROGRAMS.json for exact V4 workspace geometry.
     pub workspace_manifest: Option<std::path::PathBuf>,
 }
@@ -176,6 +179,7 @@ impl Default for LayoutOptions {
             local_expert_layers: None,
             onboard: None,
             exchange_f32: false,
+            glmf_kda_fp32_partials: false,
             workspace_manifest: None,
         }
     }
@@ -347,19 +351,6 @@ pub fn family_costs(family: &str) -> FamilyCosts {
             spark_ring_bytes: gib(117),
             ..generic
         },
-        // GLM 5.3 Flash EXL3 + DFlash2; one GPU (no head split). Without a program manifest,
-        // one GPU's step workspaces: decode and two lanes of 4,096 rows over shared temporaries
-        // (`serving_capacity::glmf_step_workspaces` of the 5090 export, 2.68 GiB).
-        "glm5_flash" => FamilyCosts {
-            runtime_bytes: [gib(78), gib(78), gib(78)],
-            graph_bytes: [gib(150), gib(150), gib(150)],
-            workspace_bytes: [gib(268), gib(472), gib(472)],
-            drafter_bytes: gib(324),
-            mtp_resident: false,
-            spark_workspace_bytes: gib(56),
-            spark_ring_bytes: gib(78),
-            ..generic
-        },
         "deepseek_v4" => FamilyCosts {
             runtime_bytes: [gib(65), gib(60), gib(60)],
             graph_bytes: [gib(35), gib(40), gib(25)],
@@ -477,6 +468,9 @@ pub fn layout(report: &mut PlanReport, model: &dyn super::FamilyModel, checkpoin
         else { 8 };
     let checkpoint_context = report.cache_requirements.as_ref().and_then(|r| r.checkpoint_max_context_tokens).unwrap_or(0);
     let context_tokens = resolved_context(family, options.context_tokens, checkpoint_context, workspace_manifest.as_ref());
+    if family == "glm5_flash" {
+        return glm5_flash::layout(report, model, checkpoint, options, workspace_manifest.as_ref(), prefill_rows, concurrency, context_tokens);
+    }
     let target_pool_tokens = options.target_pool_tokens.max(context_tokens);
     let conversions = load_conversions(family, checkpoint);
     let costs = family_costs(family);
@@ -668,25 +662,7 @@ pub fn layout(report: &mut PlanReport, model: &dyn super::FamilyModel, checkpoin
             exl3_workspace.unwrap_or(gib(115) * prefill_rows / 4096),
             if exl3_workspace.is_some() { Basis::Formula } else { allowance_basis }));
     }
-    // The drafter lives on the lead GPU (taps and head are there under a head split).
-    let glmf_draft = if family == "glm5_flash" && !options.glmf_drafter_disabled && exact.is_some() {
-        let snapshot = options.glmf_drafter_snapshot.clone().or_else(|| {
-            let home = std::env::var_os("HF_HOME").map(std::path::PathBuf::from)
-                .unwrap_or_else(|| std::path::PathBuf::from("/mnt/sparknest/hf-home"));
-            crate::resolve_snapshot_at_revision("incoai/GLM-5.3-Flash-DFlash2", Some(&home), None).ok()
-                .and_then(|r| r.snapshot_path)
-        });
-        snapshot.and_then(|p| std::fs::read(p.join("config.json")).ok())
-            .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
-            .and_then(|cfg| crate::families::glm5::draft_representation::draft_resident_bytes(&cfg,
-                options.draft_context_slots.unwrap_or(concurrency.max(8)) as usize,
-                options.draft_sequences.max(concurrency).min(options.draft_context_slots.unwrap_or(concurrency.max(8))) as usize,
-                options.physical_sms.unwrap_or_else(|| crate::placement::ArchContext::for_device("sm_120",
-                    options.rtx_bytes[0]).sms) as u64).ok())
-    } else { None };
-    let drafter = if family == "glm5_flash" && options.glmf_drafter_disabled { 0 }
-        else if options.drafter_bytes > 0 { options.drafter_bytes }
-        else { glmf_draft.map_or(costs.drafter_bytes, |d| d.0) };
+    let drafter = if options.drafter_bytes > 0 { options.drafter_bytes } else { costs.drafter_bytes };
     // MiMo charges its drafter in its own reservation contract.
     if drafter > 0 && family != "mimo_v2" {
         devices[0].items.push(Item::new(Category::Drafter, "drafter", "", drafter, allowance_basis));
@@ -705,67 +681,6 @@ pub fn layout(report: &mut PlanReport, model: &dyn super::FamilyModel, checkpoin
     } else { None };
     if family == "deepseek_v4" && v4_workspace.is_none() {
         notes.push("V4 workspace allowance is estimated without a matching PROGRAMS.json; use --workspace-manifest for Flash/Pro allocation geometry".into());
-    }
-
-    // GLM 5.3 Flash on one GPU: the step workspaces its engine allocates, from the program manifest.
-    let glmf_lanes = if options.prefill_lanes > 0 { options.prefill_lanes }
-        else { crate::serving_capacity::GLMF_DEFAULT_PREFILL_LANES };
-    // `--decode-rows 128` runs the wide `_m128` programs on one GPU; the build must export them.
-    let glmf_decode_rows = if family == "glm5_flash" { options.glmf_decode_rows }
-        else { crate::serving_capacity::GLMF_DECODE_ROWS };
-    let glmf_wide = glmf_decode_rows > crate::serving_capacity::GLMF_DECODE_ROWS;
-    if glmf_wide && split {
-        report.placement_supported = false;
-        notes.push("GLM 5.3 Flash's 128-row decode programs run on one GPU: a head split takes --decode-rows 64".into());
-    }
-    if glmf_wide && workspace_manifest.as_ref().is_some_and(|manifest|
-        crate::serving_capacity::glmf_manifest_scratch(manifest)("glmf_mhc_post_pre_m128").is_none()) {
-        report.placement_supported = false;
-        notes.push("GLM 5.3 Flash --decode-rows 128 needs the 128-row decode programs, which this program manifest \
-            lacks (build with CUTEAFD_GLMF_WIDE_DECODE_ROWS=128)".into());
-    }
-    // A GLM 5.3 Flash graph budget, kept as the engine's KV admission keeps it: from measured free
-    // memory (one GPU, Spark experts, an automatic pool) the budget itself, from the planner's costs
-    // (a head split, local experts, a fixed pool) the budget or the graph allowance, whichever is larger.
-    let glmf_measured = !split && automatic && matches!(report.placement, ExpertPlacement::Sparks { .. });
-    // Shared replay records (measured admission only): the KDA records of the decode rows, in the
-    // prefill scratch.
-    let glmf_shared_records = if family == "glm5_flash" && options.glmf_shared_replay {
-        if glmf_measured {
-            crate::families::glm5_flash::GlmNextConfig::from_hf(&checkpoint.config).ok()
-                .and_then(|cfg| crate::serving_capacity::glm_flash_kda_replay_bytes_rows(&cfg, cfg.layers, 1,
-                    glmf_decode_rows).ok())
-                .unwrap_or(0)
-        } else {
-            notes.push("GLM 5.3 Flash --replay-records shared needs one GPU, Spark experts and an automatic pool \
-                (the engine refuses it otherwise); planned with records of their own".into());
-            0
-        }
-    } else { 0 };
-    let glmf_steps = (family == "glm5_flash").then(|| workspace_manifest.as_ref()
-        .and_then(|manifest| glmf_step_workspace(manifest, checkpoint, &report.placement, glmf_lanes, prefill_rows,
-            context_tokens, glmf_decode_rows, glmf_shared_records,
-            options.glmf_index == crate::serving_capacity::GlmfIndexCache::Compact, split,
-            options.glmf_representation, options.glmf_prefill_expanded))).flatten();
-
-    if family == "glm5_flash" && checkpoint.tensors.iter().any(|t|
-        t.meta.name.ends_with("mlp.gate_proj.weight") && t.meta.dtype == cuteafd_core::DType::U8) {
-        let rows = crate::serving_capacity::glmf_expert_rows(prefill_rows, glmf_decode_rows);
-        let scratch = if let Some(package) = options.glmf_dense_manifest.as_ref() {
-            std::fs::read(package).ok()
-                .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
-                .and_then(|m| crate::placement::inventory::fp8moe_scratch_bytes(&m, "tp1", rows))
-        } else {
-            crate::placement::inventory::dense_package_scratch(
-                &crate::placement::inventory::image_lib(options.workspace_manifest.as_deref()),
-                "glmfdense", rows, true)
-        };
-        if let Some(scratch) = scratch {
-            devices[0].items.push(Item::new(Category::Weights, "dense NVFP4 package arenas", "",
-                scratch + 8 * crate::serving_capacity::glmf_expert_rows(prefill_rows, glmf_decode_rows), Basis::Formula));
-        } else {
-            notes.push("GLM Flash dense NVFP4 scratch needs fp8-glmfdense-nvfp4a4/manifest.json beside the image PROGRAMS.json; package arenas are not counted".into());
-        }
     }
 
     // Fixed runtime costs.
@@ -804,65 +719,15 @@ pub fn layout(report: &mut PlanReport, model: &dyn super::FamilyModel, checkpoin
                 .and_then(|cfg| crate::serving_capacity::glm_decode_graph_allowance(context_tokens as usize, cfg.layers).ok())
                 .unwrap_or(costs.graph_bytes[role]).max(costs.graph_bytes[role])
         } else { costs.graph_bytes[role] };
-        if family == "glm5_flash" {
-            let lanes = if matches!(report.placement, ExpertPlacement::Sparks { .. }) {
-                glmf_lanes as usize
-            } else { 1 };
-            // The measured loaded code (`context+modules`) holds the workspaces' untracked runtime memory.
-            if crate::placement::loaded_code("glmf", "*", split, index as u8).is_none() {
-                device.items.push(Item::new(Category::Runtime, "workspace runtime overhead", "",
-                    crate::serving_capacity::glmf_graphs::workspace_runtime_overhead(lanes, index == 0 && drafter > 0),
-                    Basis::Formula));
-            }
-            if let Some(budget) = options.graph_budget_bytes {
-                device.items.push(Item::new(Category::Runtime, "graph growth", "",
-                    if glmf_measured { budget } else { budget.max(graph_allowance) }, Basis::Formula));
-            } else {
-                device.items.push(Item::new(Category::Runtime, "graph allowance", "", graph_allowance, allowance_basis));
-            }
-        } else {
-            device.items.push(Item::new(Category::Runtime, "graph allowance", "", graph_allowance, allowance_basis));
-        }
-        let workspace = match glmf_steps {
-            Some(ref steps) => steps[index],
-            // The allowance covers the default lanes' rows in flight; more rows in flight take more.
-            None if family == "glm5_flash" && role == 0 =>
-                costs.workspace_bytes[role] * (glmf_lanes * prefill_rows.max(1)).max(8192) / 8192,
-            _ => v4_workspace.as_ref().and_then(|ranks| ranks.get(index)).map_or_else(
-                || costs.workspace_bytes[role] * prefill_rows.max(1) / if family == "deepseek_v41" { 2048 } else { 4096 },
-                |rank| rank.fixed_device_bytes),
-        };
-        // V4 keeps one 4096-row intake plane per Spark and prefill lane; GLM 5.3 Flash one plane
-        // per Spark and lane of its widest step's rows (a lane's, or 128 decode rows past a
-        // narrower lane). Decode reuses lane zero; every plane belongs to the lead GPU.
-        let intake = match (family, report.placement) {
-            ("deepseek_v4", ExpertPlacement::Sparks { ranks }) if index == 0 =>
-                2 * ranks as u64 * 4096 * model.spec().hidden as u64 * 2,
-            ("glm5_flash", ExpertPlacement::Sparks { ranks }) if index == 0 =>
-                crate::serving_capacity::glmf_spark_intake_bytes(glmf_lanes, ranks as u64,
-                    crate::serving_capacity::glmf_expert_rows(prefill_rows, glmf_decode_rows), model.spec().hidden as u64),
-            _ => 0,
-        };
-        let workspace = workspace + intake;
-        if index == 0 && glmf_draft.is_some() {
-            device.items.push(Item::new(Category::Workspace, "draft FP8 scratch", "", glmf_draft.unwrap().1, Basis::Formula));
-        }
-        let workspace_basis = if v4_workspace.is_some() || (glmf_steps.is_some()) { Basis::Formula }
-            else { allowance_basis };
-        device.items.push(Item::new(Category::Workspace, "steps", "", workspace, workspace_basis));
-        if glmf_wide && !split && index == 0 {
-            // The token selector and GPU sampler of 128-row steps, beyond the 64-row ones the runtime
-            // allowance holds.
-            let vocab = model.spec().vocab as u64;
-            device.items.push(Item::new(Category::Workspace, "wide decode selector", "",
-                crate::serving_capacity::glmf_selector_bytes(glmf_decode_rows, vocab)
-                    - crate::serving_capacity::glmf_selector_bytes(crate::serving_capacity::GLMF_DECODE_ROWS, vocab),
-                Basis::Formula));
-            if glmf_steps.is_none() {
-                notes.push("GLM 5.3 Flash --decode-rows 128: without a program manifest the steps allowance \
-                    assumes 64-row decode workspaces (pass --workspace-manifest)".into());
-            }
-        }
+        device.items.push(Item::new(Category::Runtime, "graph allowance", "", graph_allowance, allowance_basis));
+        let workspace = v4_workspace.as_ref().and_then(|ranks| ranks.get(index)).map_or_else(
+            || costs.workspace_bytes[role] * prefill_rows.max(1) / if family == "deepseek_v41" { 2048 } else { 4096 },
+            |rank| rank.fixed_device_bytes);
+        let intake = if family == "deepseek_v4" && index == 0 {
+            match report.placement { ExpertPlacement::Sparks { ranks } => 2 * ranks as u64 * 4096 * model.spec().hidden as u64 * 2, _ => 0 }
+        } else { 0 };
+        device.items.push(Item::new(Category::Workspace, "steps", "", workspace + intake,
+            if v4_workspace.is_some() { Basis::Formula } else { allowance_basis }));
         if options.full_prefill_logits && index == 0 {
             device.items.push(Item::new(Category::Workspace, "probe prefill logits", "",
                 full_prefill_logits_bytes_with_lanes(family, prefill_rows, model.spec().vocab as u64,
@@ -870,9 +735,7 @@ pub fn layout(report: &mut PlanReport, model: &dyn super::FamilyModel, checkpoin
                         std::env::var("CUTEAFD_GLM_PREFILL_LANES").ok().as_deref())), Basis::Formula));
         }
         if split {
-            let exact_peer = if family == "glm5_flash" {
-                Some(crate::serving_capacity::glmf_graphs::peer_exchange_bytes(glmf_lanes, prefill_rows, model.spec().hidden as u64, 2, options.glmf_representation.output_shard))
-            } else if family == "deepseek_v4" {
+            let exact_peer = if family == "deepseek_v4" {
                 crate::serving_capacity::deepseek_v4_peer_exchange_bytes(model.spec().hidden as u64, prefill_rows, decode_rows, true, options.exchange_f32).ok()
             } else { None };
             device.items.push(Item::new(Category::Transport, "peer exchange", "", exact_peer.unwrap_or(costs.exchange_bytes),
@@ -1039,8 +902,7 @@ pub fn layout(report: &mut PlanReport, model: &dyn super::FamilyModel, checkpoin
     // KV pool: per-device bytes per logical token from the family geometry.
     let geometry = if matches!(family, "deepseek_v4" | "qwen4" | "mimo_v2") { Ok(None) } else { model.cache_geometry(CacheOptions { coordinator_ranks: active_gpus,
         native_mtp_layers: if family == "deepseek_v4" || family == "qwen4" { cache_native_layers } else { 0 },
-        prefill_rows: prefill_rows, glmf_decode_rows,
-        glmf_index: if split { crate::serving_capacity::GlmfIndexCache::Keys } else { options.glmf_index },
+        prefill_rows,
         ..Default::default() }) };
     match geometry {
         Ok(Some(mut geometry)) => {
@@ -1060,18 +922,13 @@ pub fn layout(report: &mut PlanReport, model: &dyn super::FamilyModel, checkpoin
                 } else { None }
             } else { None };
             // GLM 5.3 Flash takes no mark without entries, so pool marks then keep no unit back.
-            let pool_marks = family == "glm5_flash" && options.glmf_pool_marks && options.mimo_prefix_entries > 0;
+            let pool_marks = false;
             let marks = if pool_marks { 0 } else { options.prefix_slots.unwrap_or_else(|| {
                 let bytes: u64 = geometry.ranks.iter().map(|r| r.retained_mark_bytes).sum();
                 if family == "mimo_v2" {
                     let draft = warm_draft.as_ref().and_then(|r| r.as_ref().ok()).map_or(0, |r| r.0);
                     cuteafd_core::prefix::mark_slots_for(concurrency, options.mimo_prefix_entries,
                         bytes.saturating_add(draft), options.mimo_prefix_mark_bytes)
-                } else if family == "glm5_flash" {
-                    // serve-glmf's arena with the same knobs, over one whole mark of the layout
-                    // planned here (token keys, which a head split keeps).
-                    cuteafd_core::prefix::mark_slots_for(options.glmf_mark_lanes.unwrap_or(concurrency),
-                        options.mimo_prefix_entries, bytes, options.mimo_prefix_mark_bytes)
                 } else if matches!(family, "deepseek_v4" | "qwen4") {
                     // The arena the family's server allocates at the default knobs (`MarkArena::slots_for`).
                     42.min((2 * GIB) / bytes.max(1)).max(2 * concurrency + 2)
@@ -1083,12 +940,11 @@ pub fn layout(report: &mut PlanReport, model: &dyn super::FamilyModel, checkpoin
             // Reserve fixed state and marks before sizing records. Otherwise
             // an automatic pool consumes the bytes those allocations need.
             for (device, rank) in devices.iter_mut().zip(&geometry.ranks) {
-                let state_slots = options.state_slots.unwrap_or(if family == "glm5_flash" { concurrency.max(8) }
-                    else if matches!(family, "qwen4" | "deepseek_v4" | "deepseek_v41") { concurrency }
+                let state_slots = options.state_slots.unwrap_or(if matches!(family, "qwen4" | "deepseek_v4" | "deepseek_v41") { concurrency }
                     else { concurrency + 2 });
                 device.items.push(Item::new(Category::Kv, "state", "", rank.fixed_state_bytes
                     + (rank.active_state_per_sequence_bytes + if family == "deepseek_v4" { rank.pool_metadata_unit_bytes } else { 0 }) * state_slots
-                    + rank.speculative_replay_bytes.saturating_sub(glmf_shared_records)
+                    + rank.speculative_replay_bytes
                     + rank.context_table_bytes_per_token * context_tokens, Basis::Formula));
                 if family != "deepseek_v41" && marks > 0 && rank.retained_mark_bytes > 0 {
                     device.items.push(Item::new(Category::Prefix, "marks", "", rank.retained_mark_bytes * marks,
@@ -1137,62 +993,11 @@ pub fn layout(report: &mut PlanReport, model: &dyn super::FamilyModel, checkpoin
                 let kv: Vec<u64> = per_token.iter().map(|&cost| cost.saturating_mul(target)).collect();
                 resolve_encoder(checkpoint, report, model, &mut devices, &mut spark_devices, &kv, options, &mut notes);
             }
-            let mut glmf_admitted_pool = None;
-            // The graph inventory depends on the admitted pool, not on a pre-admission guess.
-            if family == "glm5_flash" && options.graph_budget_bytes.is_none() {
-                let cfg = crate::families::glm5_flash::GlmNextConfig::from_hf(&checkpoint.config).ok();
-                if let Some(cfg) = cfg {
-                    let arch = crate::placement::ArchContext::for_device("sm_120", options.rtx_bytes[0]);
-                    let buckets = crate::serving_capacity::glmf_graphs::DecodeBuckets::new(
-                        crate::serving_capacity::glmf_graphs::verify_budget(glmf_decode_rows as usize, arch.sms as usize));
-                    let target = options.pool_tokens.filter(|&n| n > 0).unwrap_or(target_pool_tokens);
-                    use crate::serving_capacity::glmf_graphs::{admit_beside_decode_graphs, solve_graph_pool, StartupGraphReserve};
-                    let solved = solve_graph_pool(target as usize, |candidate| {
-                        let counts = crate::serving_capacity::glmf_graphs::serving_graph_counts(
-                            crate::serving_capacity::glmf_graphs::admitted_graph_context(context_tokens as usize, candidate, options.context_tokens == 0),
-                            candidate, cfg.dense_context(), concurrency as usize, drafter > 0, cfg.layers, split, &buckets);
-                        let reserve = counts.iter().map(|&count|
-                            crate::serving_capacity::glmf_graphs::graph_reserve_bytes(count as usize)).max().unwrap_or(0);
-                        admit_beside_decode_graphs(Some(StartupGraphReserve { reserve, allowance: costs.graph_bytes[0] }), |startup| {
-                            for (rank, device) in devices.iter_mut().take(active_gpus).enumerate() {
-                                device.items.retain(|i| i.group != "graph allowance" && i.group != "graphs" && i.group != "graph growth");
-                                // The captured set at ready (per-role measured bytes); the reserve's margin is
-                                // growth.
-                                let role = if !split { 0 } else { 1 + rank };
-                                let measured = crate::serving_capacity::glmf_graphs::measured_graph_bytes(counts[rank], role)
-                                    .min(crate::serving_capacity::glmf_graphs::graph_reserve_bytes(counts[rank] as usize));
-                                if startup.is_some() {
-                                    device.items.push(Item::new(Category::Runtime, "graphs", "", measured, Basis::Calibrated));
-                                }
-                                let growth = if startup.is_some() {
-                                    crate::serving_capacity::glmf_graphs::graph_reserve_bytes(counts[rank] as usize) - measured
-                                } else { costs.graph_bytes[0] };
-                                device.items.push(Item::new(Category::Runtime, "graph growth", "", growth, Basis::Formula));
-                            }
-                            let free: Vec<_> = devices.iter().map(DeviceLayout::free_bytes).collect();
-                            let next = options.pool_tokens.filter(|&n| n > 0).unwrap_or_else(|| size_pool(&free, &per_token, unit, target));
-                            if next < unit || free.iter().zip(&per_token).any(|(&room, &cost)|
-                                cost > 0 && room < (next * cost) as i64) { return Err(true); }
-                            Ok(next as usize)
-                        }, |shortfall| *shortfall, |retry, _| retry)
-                    });
-                    match solved {
-                        Ok((pool, startup)) => {
-                            glmf_admitted_pool = Some(pool as u64);
-                            if !startup { notes.push("GLM Flash startup graph admission refused; lazy graphs keep the allowance".into()); }
-                        }
-                        Err(_) => {
-                            glmf_admitted_pool = Some(0);
-                            notes.push("GLM Flash has no room for a KV pool beside startup or lazy graphs".into());
-                        }
-                    }
-                }
-            }
             let free: Vec<i64> = devices.iter().map(DeviceLayout::free_bytes).collect();
-            pool_tokens = glmf_admitted_pool.or(options.pool_tokens.filter(|&tokens| tokens != 0))
+            pool_tokens = options.pool_tokens.filter(|&tokens| tokens != 0)
                 .unwrap_or_else(|| size_pool(&free, &per_token, unit,
                     if family == "deepseek_v41" { if small_card { 1 << 20 } else { v41::DEFAULT_POOL_TOKENS } }
-                    else if small_card && family != "glm5_flash" { (1 << 20).max(context_tokens) } else { target_pool_tokens }));
+                    else if small_card { (1 << 20).max(context_tokens) } else { target_pool_tokens }));
             if pool_tokens < context_tokens {
                 notes.push(format!("full-context admission shortfall: context {context_tokens} tokens, pool {pool_tokens} tokens, shortfall {} tokens", context_tokens - pool_tokens));
             }
@@ -1316,19 +1121,19 @@ fn planned_context(manifest: Option<&serde_json::Value>, families: &[String], to
 #[allow(clippy::too_many_arguments)]
 fn glmf_step_workspace(manifest: &serde_json::Value, checkpoint: &super::Checkpoint, placement: &ExpertPlacement,
     lanes: u64, rows: u64, context: u64, decode_rows: u64, shared_records: u64, index_compact: bool, split: bool,
-    repr: crate::families::glm5_flash::resident::GlmfRepresentation, expanded: bool) -> Option<Vec<u64>> {
+    repr: crate::families::glm5_flash::resident::GlmfRepresentation, expanded: bool, tp2_experts: bool, fp32_partials: bool) -> Option<Vec<u64>> {
     use crate::serving_capacity::{glmf_manifest_scratch, glmf_step_scratch, glmf_step_workspaces, glmf_table_pages,
         GlmfScratchOptions, GlmfStepShape};
     let cfg = crate::families::glm5_flash::GlmNextConfig::from_hf(&checkpoint.config).ok()?;
     let lookup = glmf_manifest_scratch(manifest);
     // FP8 KDA projections run the w8 programs: charge their scratch too where the build has them.
-    let options = GlmfScratchOptions { index_compact: index_compact && !split, split, kda_output_shard: split && repr.output_shard, kda_prefill_expanded: split && expanded,
+    let options = GlmfScratchOptions { index_compact: index_compact && !split, split, kda_fp32_partials: fp32_partials, kda_output_shard: split && repr.output_shard, kda_prefill_expanded: split && expanded,
         kda_w8: repr.kda_fp8 && lookup("glmf_kda_w8_m64").is_some() && lookup("glmf_kda_w8_m4096").is_some(),
         ..Default::default() };
     let context = if context > 0 { context } else { manifest["capacities"]["max_context"].as_u64().unwrap_or(131_072) };
     let (table_pages, table_pool_pages) = glmf_table_pages(context);
     let spark = matches!(placement, ExpertPlacement::Sparks { .. });
-    let shape = GlmfStepShape { lead: true, split, local_experts: !spark, spark, partial_bytes: 2,
+    let shape = GlmfStepShape { lead: true, split, local_experts: !spark || tp2_experts, tp2_experts: split && tp2_experts, spark, partial_bytes: if fp32_partials { 4 } else { 2 },
         output_shard: split && repr.output_shard, full_prefill_logits: false, table_pages, table_pool_pages };
     let decode = glmf_step_scratch(&lookup, &cfg, options, decode_rows, true).ok()?;
     let mut prefill = glmf_step_scratch(&lookup, &cfg, options, rows, false).ok()?;
