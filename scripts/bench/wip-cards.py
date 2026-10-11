@@ -68,7 +68,7 @@ def run(cmd, **kwargs):
     return subprocess.run(cmd, check=True, text=True, capture_output=True, timeout=120, **kwargs)
 
 
-def arms_from(values):
+def arms_from(values, releases=()):
     arms = {}
     for value in values:
         name, address = value.split('=', 1)
@@ -78,6 +78,14 @@ def arms_from(values):
         if name in arms or instance in [a['instance'] for a in arms.values()]:
             raise ValueError('arm names and WIP instances must be unique')
         arms[name] = {'instance': instance, 'slot': slot}
+    for value in releases:
+        name, address = value.split('=', 1)
+        instance, tag = address.split(':', 1)
+        if not all(NAME.fullmatch(x) for x in (name, instance, tag)) or len(instance) > 41 or len(tag) > 128:
+            raise ValueError('invalid release arm, instance or tag')
+        if name in arms or instance in [a['instance'] for a in arms.values()]:
+            raise ValueError('arm names and instances must be unique')
+        arms[name] = {'instance': instance, 'slot': None, 'release': tag}
     return arms
 
 
@@ -86,13 +94,15 @@ def shared_wip(arms, mappings, builds, parallel):
         raise ValueError('--arm-wip refuses --build and parallel runs')
     for value in mappings:
         name, instance = value.split('=', 1)
-        if name not in arms or not NAME.fullmatch(instance) or len(instance) > 41:
+        if name not in arms or 'release' in arms[name] or not NAME.fullmatch(instance) or len(instance) > 41:
             raise ValueError('invalid --arm-wip mapping')
         if 'wip_instance' in arms[name]:
             raise ValueError('duplicate --arm-wip mapping')
         arms[name]['wip_instance'] = instance
     slots = {}
     for arm in arms.values():
+        if 'release' in arm:
+            continue
         instance = arm.get('wip_instance', arm['instance'])
         if instance in slots and slots[instance] != arm['slot']:
             raise ValueError('shared WIP instance requires identical slots')
@@ -170,7 +180,14 @@ def generate(entry, arm_name, arm, state, key_file, overrides, probes, expected_
         index = HOSTS.index(host) + 1
         values.update({f'SPARK_{i}_HOST': host, f'SPARK_{i}_LANE_A': f'10.55.0.{index}', f'SPARK_{i}_LANE_B': f'10.55.1.{index}'})
     values.update(API_KEY_FILE=str(key_file), ENABLE_BENCH='on', WIP_INSTANCE=arm.get('wip_instance', arm['instance']), INSTANCE=arm['instance'], SPARK_COUNT=str(count), RTX_GPUS=str(len(gpus)), COORDINATOR_GPU=str(gpus[0]))
-    if arm.get('root'):
+    run_args = ['--wip', arm['slot']]
+    if 'release' in arm:
+        values.pop('WIP_INSTANCE', None)
+        values.pop('WIP_ROOT', None)
+        values['COORDINATOR_DOCKER_INFERENCE'] = 'ghcr.io/tpurtell/cuteafd-coordinator:' + arm['release']
+        values['SPARK_EXPERT_DOCKER_INFERENCE'] = 'ghcr.io/tpurtell/cuteafd-spark-expert:' + arm['release']
+        run_args = []
+    elif arm.get('root'):
         values['WIP_ROOT'] = arm['root']
     card = entry['name']
     values['INSTANCE'] = short_instance(f"{arm['instance']}-{card}-r{repeat}")
@@ -182,7 +199,7 @@ def generate(entry, arm_name, arm, state, key_file, overrides, probes, expected_
     base = dest / 'base.config'
     base.write_text(''.join(f'{k}={v}\n' for k, v in sorted(values.items())))
     metadata = {k: entry.pop(k) for k in ('source_matrix', 'correctness_only', 'published', 'compared', 'kind', 'probes', 'expected_pool') if k in entry}
-    entry.update(name=label, config=str(base), set=values, gpus=gpus, sparks=hosts, run_args=['--wip', arm['slot']])
+    entry.update(name=label, config=str(base), set=values, gpus=gpus, sparks=hosts, run_args=run_args)
     job = dict(card=card, arm=arm_name, repeat=repeat, simulated=bool(simulated), state=str(dest), entry=entry, metadata=metadata, probes=probes, expected_pool=expected_pool)
     hook = [sys.executable, str(Path(__file__).resolve())]
     timeout = int(entry.get('timeout_s', 900)) + int(entry.get('run_timeout_s', 900)) + 120
@@ -644,6 +661,11 @@ def assert_absent(job):
 
 
 def slot_check(arm, host):
+    if 'release' in arm:
+        image = 'ghcr.io/tpurtell/cuteafd-' + ('coordinator' if host == 'raptor' else 'spark-expert') + ':' + arm['release']
+        cmd = ['docker', 'image', 'inspect', image]
+        info = json.loads(run(cmd if host == 'raptor' else ['ssh', '-o', 'BatchMode=yes', host, shlex.join(cmd)]).stdout)[0]
+        return json.dumps({'image': image, 'image_id': info['Id'], 'repo_digests': info.get('RepoDigests', [])})
     instance = arm.get('wip_instance', arm['instance'])
     container = ('cuteafd-coordinator-wip-' if host == 'raptor' else 'cuteafd-spark-expert-wip-') + instance
     role = 'coordinator' if host == 'raptor' else 'spark-expert'
@@ -720,8 +742,8 @@ print('verified absent', root, overlay)
 
 def cleanup(arms, task, dry):
     for arm in arms.values():
-        if 'wip_instance' in arm:
-            continue  # External sealed builds are never owned by this card task.
+        if 'wip_instance' in arm or 'release' in arm:
+            continue  # External sealed builds and release images are never owned by this task.
         script = cleanup_script(arm, task)
         for host in ('raptor', *HOSTS):
             cmd = ['python3', '-c', script] if host == 'raptor' else ['ssh', '-o', 'BatchMode=yes', host, shlex.join(['python3', '-c', script])]
@@ -777,6 +799,8 @@ def build_arms(items, arms, cards, state, task, dry, seed='moa'):
         if name not in arms:
             raise ValueError('unknown build arm ' + name)
         arm = arms[name]
+        if 'release' in arm:
+            raise ValueError('--build refuses release arm ' + name)
         source = Path.home() / '.cache/cuteafd/builds' / task / ('source-' + name)
         if not dry:
             source.parent.mkdir(parents=True, exist_ok=True)
@@ -851,6 +875,7 @@ def main():
     parser.add_argument('--kit', type=Path, default=Path.home() / '.cache/cuteafd/builds/release-v2-rc2/kit')
     parser.add_argument('--cards', nargs='+', default=[])
     parser.add_argument('--arm', action='append', default=[], metavar='NAME=INSTANCE:SLOT')
+    parser.add_argument('--arm-release', action='append', default=[], metavar='NAME=INSTANCE:TAG', help='use published image pair with the same launcher, without --wip')
     parser.add_argument('--arm-wip', action='append', default=[], metavar='NAME=WIP_INSTANCE', help='reuse an external sealed WIP build; serving instances stay distinct')
     parser.add_argument('--card-arm', action='append', default=[], metavar='CARD=ARM', help='matrix mode: bind a card to one arm (useful for disjoint correctness pairs)')
     mode = parser.add_mutually_exclusive_group()
@@ -881,12 +906,12 @@ def main():
         return 0
     if not NAME.fullmatch(args.task) or args.parallel < 1 or args.repeats < 1:
         parser.error('invalid task, repeats or parallelism')
-    arms = arms_from(args.arm)
+    arms = arms_from(args.arm, args.arm_release)
     shared_wip(arms, args.arm_wip, args.build, args.parallel)
     if args.nonce_seed is not None and (not args.nonce_seed or '\n' in args.nonce_seed or '\r' in args.nonce_seed):
         parser.error('--nonce-seed must be non-empty and single-line')
     if not arms:
-        parser.error('at least one --arm is required')
+        parser.error('at least one --arm or --arm-release is required')
     if args.matched_prompts and not args.interleave:
         parser.error('--matched-prompts requires --interleave')
     if args.interleave and (len(arms) < 2 or args.parallel != 1):
@@ -897,7 +922,7 @@ def main():
         plan = state / 'plan.json'
         if plan.exists():
             recorded = json.loads(plan.read_text())
-            if recorded['task'] != args.task or set(recorded['arms']) != set(arms) or any(recorded['arms'][name]['instance'] != arm['instance'] or recorded['arms'][name]['slot'] != arm['slot'] for name, arm in arms.items()):
+            if recorded['task'] != args.task or set(recorded['arms']) != set(arms) or any(recorded['arms'][name]['instance'] != arm['instance'] or recorded['arms'][name]['slot'] != arm['slot'] or recorded['arms'][name].get('release') != arm.get('release') for name, arm in arms.items()):
                 raise ValueError('cleanup does not match this task plan')
             arms = recorded['arms']
         cleanup(arms, args.task, args.dry_run)
@@ -1010,7 +1035,8 @@ def main():
             job['artifacts'] = {}
             for host in ('raptor', *job['entry']['sparks']):
                 meta = json.loads(slot_check(arms[job['arm']], host))
-                job['artifacts'][host] = {k: meta[k] for k in ('slot', 'seal_sha256', 'artifact_manifest_sha256')}
+                keys = ('image', 'image_id', 'repo_digests') if 'release' in arms[job['arm']] else ('slot', 'seal_sha256', 'artifact_manifest_sha256')
+                job['artifacts'][host] = {k: meta[k] for k in keys}
             save(dest / 'job.json', {**job, 'probes': sorted(job['probes'])})
         except (ValueError, subprocess.SubprocessError) as error:
             row = {k: job[k] for k in ('card', 'arm', 'repeat', 'simulated')}
