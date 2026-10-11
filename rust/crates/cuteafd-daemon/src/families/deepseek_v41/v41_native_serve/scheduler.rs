@@ -218,6 +218,7 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
     stats: std::sync::Arc<std::sync::Mutex<serde_json::Value>>,
     mut prefixes: PrefixCache<'a>,
 ) -> Result<()> {
+    let _capture_session = crate::shared::decode_graph::CaptureWatch::session();
     let mut active: Vec<Option<Active<'a>>> = (0..args.concurrency).map(|_| None).collect();
     let mut compiler = crate::shared::constraints::Compiler::new(lib, args.snapshot.join("tokenizer.json"), VOCAB);
     let mut id = 0u64;
@@ -509,6 +510,7 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
             }
         }
         if active.iter().all(Option::is_none) {
+            crate::shared::decode_graph::CaptureWatch::flush();
             if closed && images_waiting.iter().all(Option::is_none) && image_backlog.is_empty() { break; }
             if images_waiting.iter().any(Option::is_some) { std::thread::sleep(Duration::from_millis(1)); }
             continue;
