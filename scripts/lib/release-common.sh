@@ -481,8 +481,10 @@ release_known_key() {
 # unless SPARK_HOSTS is set; legacy SPARK_<rank>_* configurations remain verbatim.
 release_spark_host_rows() {
   local csv="$1" count="$2" mode="${3:-launch}" host index rank=0 seen=,
+  local key configured_host lane_a lane_b
   local -a hosts
-  [[ "$csv" =~ ^[a-z]+(,[a-z]+)*$ ]] || release_die "SPARK_HOSTS must be a comma-separated Spark pool host list"
+  [[ "$csv" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*(,[A-Za-z0-9][A-Za-z0-9._-]*)*$ ]] ||
+    release_die "SPARK_HOSTS must be a comma-separated Spark pool host list"
   IFS=, read -r -a hosts <<<"$csv"
   if [[ "$mode" == launch ]]; then
     [[ "$count" =~ ^[0-8]$ && "${#hosts[@]}" == "$count" ]] ||
@@ -494,7 +496,22 @@ release_spark_host_rows() {
     case "$host" in
       ostrich) index=1 ;; dodo) index=2 ;; emu) index=3 ;;
       kiwi) index=4 ;; rhea) index=5 ;; moa) index=6 ;;
-      *) release_die "SPARK_HOSTS names unknown Spark pool host $host" ;;
+      *)
+        lane_a= lane_b=
+        for index in {0..7}; do
+          key="SPARK_${index}_HOST"
+          configured_host="${!key:-}"
+          if [[ "$configured_host" == "$host" ]]; then
+            key="SPARK_${index}_LANE_A"; lane_a="${!key:-}"
+            key="SPARK_${index}_LANE_B"; lane_b="${!key:-}"
+            break
+          fi
+        done
+        [[ -n "$lane_a" ]] ||
+          release_die "SPARK_HOSTS names unknown Spark pool host $host; configure SPARK_<rank>_HOST and LANE_A for this custom host"
+        printf '%s %s %s %s\n' "$rank" "$host" "$lane_a" "$lane_b"
+        rank=$((rank + 1))
+        continue ;;
     esac
     printf '%s %s 10.55.0.%s 10.55.1.%s\n' "$rank" "$host" "$index" "$index"
     rank=$((rank + 1))

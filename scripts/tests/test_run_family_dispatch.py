@@ -322,6 +322,49 @@ def test_explicit_pool_hosts_reject_invalid_selection(tmp_path: Path, hosts: str
     assert "cuteafd serve-qwen4" not in result.stderr
 
 
+@pytest.mark.parametrize("count", [1, 5, 7, 8])
+def test_explicit_custom_hosts_use_configured_rails_in_csv_order(count):
+    hosts = [f"spark-{rank}.example" for rank in range(count)]
+    script = ['set -eu', 'source "$1"']
+    for rank, host in enumerate(hosts):
+        script += [f'SPARK_{rank}_HOST={host}', f'SPARK_{rank}_LANE_A=192.0.2.{rank + 1}',
+                   f'SPARK_{rank}_LANE_B=198.51.100.{rank + 1}']
+    script.append(f'release_spark_host_rows "{",".join(reversed(hosts))}" {count}')
+    result = subprocess.run(["bash", "-c", "\n".join(script), "test",
+                             str(ROOT / "scripts/lib/release-common.sh")],
+                            capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.splitlines() == [
+        f"{rank} {host} 192.0.2.{count - rank} 198.51.100.{count - rank}"
+        for rank, host in enumerate(reversed(hosts))]
+
+
+@pytest.mark.parametrize("host,lane_a,message", [
+    ("spark-7.example", "", "configure SPARK_<rank>_HOST and LANE_A"),
+    ("spark-7.example,spark-7.example", "192.0.2.8", "duplicate host"),
+    ("spark-7.example,", "192.0.2.8", "comma-separated Spark pool host list"),
+    ("spark;bad", "192.0.2.8", "comma-separated Spark pool host list"),
+])
+def test_explicit_custom_hosts_fail_closed(host, lane_a, message):
+    env = {**os.environ, "SPARK_7_HOST": "spark-7.example", "SPARK_7_LANE_A": lane_a}
+    result = subprocess.run(["bash", "-c", 'set -eu; source "$1"; release_spark_host_rows "$2" "$3"',
+                             "test", str(ROOT / "scripts/lib/release-common.sh"), host,
+                             str(len(host.split(",")))], env=env,
+                            capture_output=True, text=True, timeout=30)
+    assert result.returncode == 2
+    assert message in result.stderr
+
+
+def test_explicit_custom_host_secondary_rail_is_optional():
+    env = {**os.environ, "SPARK_7_HOST": "spark-7.example", "SPARK_7_LANE_A": "192.0.2.8",
+           "SPARK_7_LANE_B": ""}
+    result = subprocess.run(["bash", "-c", 'set -eu; source "$1"; release_spark_host_rows spark-7.example 1',
+                             "test", str(ROOT / "scripts/lib/release-common.sh")], env=env,
+                            capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == "0 spark-7.example 192.0.2.8 \n"
+
+
 def _family_launch_lines(tmp_path: Path, family_config: dict, model: str, keys: str) -> str:
     return _family_launch_result(tmp_path, family_config, model, keys).stderr
 
