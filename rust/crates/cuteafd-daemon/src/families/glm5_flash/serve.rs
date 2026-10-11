@@ -382,7 +382,7 @@ struct SharedPolicy {
     observed: u64,
     skipped: u64,
     trace: bool,
-    decision: Option<serde_json::Value>,
+    decision: Option<super::draft_binding::DecisionTrace>,
 }
 
 impl SharedPolicy {
@@ -433,6 +433,16 @@ impl SharedPolicy {
     /// The completed round, once the verify step's stream drained.
     fn observe(&mut self, engine: &GlmfEngine<'_>, requests: &[super::draft_binding::Verified<'_>],
         times: crate::shared::draft::clock::RoundTimes, width: usize, predicted: Option<f64>) {
+        // The caller captured the round clock before diagnostics; evaluate
+        // against the pre-observation policy without charging trace work to its fit.
+        let decision = if self.trace {
+            self.decision.take().map(|d| {
+                let timer = Instant::now();
+                let mut value = d.evaluate(&mut self.policy);
+                value["diagnostic_us"] = serde_json::json!(timer.elapsed().as_micros() as u64);
+                value
+            })
+        } else { None };
         let policy = &mut self.policy;
         let outcome = engine.probe_finish(|routes, layer_us|
             super::draft_binding::observe(policy, requests, routes, layer_us, times, width, predicted));
@@ -445,12 +455,13 @@ impl SharedPolicy {
             None => self.skipped += 1,
         }
         if self.trace {
-            if let Some(mut decision) = self.decision.take() {
+            if let Some(mut decision) = decision {
                 decision["outcomes"] = serde_json::json!(requests.iter().map(|r| serde_json::json!({
                     "id": r.id, "rows": r.rows, "accepted": r.accepted, "source": format!("{:?}", r.source),
                     "censor": r.censor.map(|c| format!("{c:?}")), "features": r.features,
                 })).collect::<Vec<_>>());
                 decision["round"] = serde_json::json!(self.observed + self.skipped);
+                decision["observed"] = serde_json::json!(matches!(outcome, Some(Ok(()))));
                 decision["total_us"] = serde_json::json!(times.total_us);
                 decision["draft_us"] = serde_json::json!(times.draft_us);
                 tracing::info!(target: "cuteafd::draft_decision", decision = %decision, "GLM Flash draft decision");
@@ -1366,7 +1377,7 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
                     .collect();
                 let selection = super::draft_binding::select(&mut shared.policy, &candidates, drafted_width, verify_rows);
                 if shared.trace {
-                    shared.decision = Some(super::draft_binding::decision_trace(&mut shared.policy, &candidates,
+                    shared.decision = Some(super::draft_binding::DecisionTrace::capture(&candidates,
                         drafted_width, verify_rows, &selection));
                 }
                 predicted = selection.predicted;
@@ -1596,7 +1607,8 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
                     prior: draft.map(|_| shared_priors[i].as_slice()),
                     features: draft.filter(|d| d.confidence.is_empty()).map(|d| d.features.as_slice()), censor }
             }).collect();
-            shared.observe(engine, &requests, round_clock.observe(), drafted_width, predicted);
+            let times = round_clock.observe();
+            shared.observe(engine, &requests, times, drafted_width, predicted);
         }
         for (i, request) in active.iter().enumerate() {
             let proposal = if used_copy[i] { &sequences[i][1..] } else { drafted[i].as_ref().map_or(&[][..], |d| &d.tokens) };

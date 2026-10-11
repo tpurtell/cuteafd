@@ -294,6 +294,27 @@ pub(crate) fn select(policy: &mut DraftPolicy, candidates: &[Candidate<'_>], wid
     Selection { lengths, predicted }
 }
 
+/// Inputs retained inside a round; expensive diagnostics run only after its
+/// clock closes, before the policy learns from the observed outcome.
+pub(crate) struct DecisionTrace {
+    requests: Vec<(u64, Vec<f64>, usize, bool, bool)>,
+    width: usize,
+    max_rows: usize,
+    selection: Selection,
+}
+
+impl DecisionTrace {
+    pub fn capture(candidates: &[Candidate<'_>], width: usize, max_rows: usize, selection: &Selection) -> Self {
+        Self { requests: candidates.iter().map(|c| (c.id, c.prior.to_vec(), c.limit, c.selector, c.cold)).collect(),
+            width, max_rows, selection: Selection { lengths: selection.lengths.clone(), predicted: selection.predicted } }
+    }
+    pub fn evaluate(self, policy: &mut DraftPolicy) -> serde_json::Value {
+        let candidates: Vec<_> = self.requests.iter().map(|&(id, ref prior, limit, selector, cold)|
+            Candidate { id, prior, limit, selector, cold }).collect();
+        decision_trace(policy, &candidates, self.width, self.max_rows, &self.selection)
+    }
+}
+
 /// Opt-in decision diagnostic: vary each request's length with the other
 /// requests held at their chosen lengths. At C1 this enumerates every shape.
 /// Call only when tracing is enabled; evaluations do not train the policy.
@@ -316,10 +337,12 @@ pub(crate) fn decision_trace(policy: &mut DraftPolicy, candidates: &[Candidate<'
         serde_json::json!({"id": c.id, "prior": c.confidence, "calibrated": probabilities,
             "chosen": selection.lengths[i], "cold_request": cold_request, "candidates": candidates})
     }).collect();
+    let cost = policy.cost_snapshot(false);
     serde_json::json!({"engaged": policy.engaged(false), "requests": requests,
         "chosen": selection.lengths, "predicted_us": selection.predicted,
         "corrections": policy.corrections(false), "platt": policy.calibration(),
-        "position_reached": policy.stats().position_reached})
+        "position_reached": policy.stats().position_reached,
+        "cost": {"layers": cost.layers, "round": cost.round, "draft": cost.draft}})
 }
 
 /// Trims the longest drafts one row at a time until every request's anchor
@@ -534,10 +557,14 @@ mod tests {
         let candidate = [Candidate { id: 4, prior: &[0.6; 7], limit: 6, selector: true, cold: false }];
         let chosen = select(&mut policy, &candidate, 7, 64);
         let before = policy.stats().clone();
-        let trace = decision_trace(&mut policy, &candidate, 7, 64, &chosen);
+        let trace = DecisionTrace::capture(&candidate, 7, 64, &chosen).evaluate(&mut policy);
         assert_eq!(trace["requests"][0]["candidates"].as_array().unwrap().len(), 7);
         assert_eq!(trace["requests"][0]["calibrated"].as_array().unwrap().len(), 6);
         assert_eq!(trace["requests"][0]["chosen"], chosen.lengths[0]);
+        let cost = policy.cost_snapshot(false);
+        assert_eq!(trace["cost"]["round"], serde_json::json!(cost.round));
+        assert_eq!(trace["cost"]["layers"], serde_json::json!(cost.layers));
+        assert_eq!(trace["cost"]["draft"], serde_json::json!(cost.draft));
         assert_eq!(*policy.stats(), before);
         let after = select(&mut policy, &candidate, 7, 64);
         assert_eq!((after.lengths, after.predicted), (chosen.lengths, chosen.predicted));
