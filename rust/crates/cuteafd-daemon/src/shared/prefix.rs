@@ -5,7 +5,7 @@ use cuteafd_engine::prefix::{FamilyLayout, PointPolicy};
 use cuteafd_ffi::{CuteafdDeviceBuffer, NativeLibrary};
 
 #[path = "prefix/budget.rs"]
-mod budget;
+pub(crate) mod budget;
 pub(crate) use budget::HostBudget;
 pub(crate) mod cuda_copy;
 pub(crate) use cuda_copy::CudaCopyEngine;

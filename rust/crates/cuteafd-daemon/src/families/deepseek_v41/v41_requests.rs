@@ -66,6 +66,8 @@ pub(crate) struct Requests<'a> {
     pipeline: EngramPipeline,
     slots: Vec<Option<Request>>,
     image_requests: usize,
+    /// Requests released so far; admission waiters retry when it moves.
+    releases: u64,
 }
 impl<'a> Requests<'a> {
     pub fn new(
@@ -81,6 +83,7 @@ impl<'a> Requests<'a> {
             pipeline,
             slots: (0..slots).map(|_| None).collect(),
             image_requests: 0,
+            releases: 0,
         })
     }
     pub fn new_distributed(
@@ -97,6 +100,7 @@ impl<'a> Requests<'a> {
             pipeline,
             slots: (0..slots).map(|_| None).collect(),
             image_requests: 0,
+            releases: 0,
         })
     }
     pub fn cache(&self) -> &BackboneCache<'a> {
@@ -105,7 +109,7 @@ impl<'a> Requests<'a> {
     pub fn new_replicated(library:&'a NativeLibrary,pipeline:EngramPipeline,slots:usize,
         pages:[usize;4],map:crate::families::deepseek_v41::v41_backbone_cache::CachePlacement,budgets:[usize;2])->Result<Self> {
         Ok(Self { cache:BackboneCache::new_replicated(library,map,slots,pages,budgets)?,
-            prefix_histories:[None,None],pipeline,slots:(0..slots).map(|_|None).collect(),image_requests:0 })
+            prefix_histories:[None,None],pipeline,slots:(0..slots).map(|_|None).collect(),image_requests:0,releases:0 })
     }
     fn request(&self, lease: CacheLease) -> Result<&Request> {
         self.cache.request_id(lease)?;
@@ -159,12 +163,15 @@ impl<'a> Requests<'a> {
         // Revoke the history owner even if device-cache cleanup fails.
         if !self.slots[slot].as_ref().unwrap().images.is_empty() { self.image_requests -= 1; }
         self.slots[slot] = None;
+        self.releases += 1;
         // Cache failure invalidation may already have revoked its root lease.
         if self.cache.request_id(lease).is_ok() {
             self.cache.release(&[lease])?;
         }
         Ok(())
     }
+    /// Moves whenever a request is released.
+    pub fn release_epoch(&self) -> u64 { self.releases }
     pub fn release_if_present(&mut self, lease: CacheLease) -> Result<()> {
         if self.slots.iter().flatten().any(|r| r.lease == lease) { self.release(lease)?; }
         Ok(())

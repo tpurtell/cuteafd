@@ -87,7 +87,8 @@ async fn lane<'a, P: VerificationTarget<'a>, C: DraftChain<'a>>(lease: LaneLease
             let members: Vec<_> = {
                 let active = active.borrow();
                 if wake.prefill_due(round_id) || wake.poll_media(round_id)
-                    || (!wake.media_pending && wake.ready(active.iter().flatten().count(), active.len(), !receive.is_empty())) {
+                    || (!wake.media_pending && wake.ready(active.iter().flatten().count(), active.len(), !receive.is_empty(),
+                        requests.borrow().release_epoch())) {
                     lease.stop(); return Ok(());
                 }
                 active.iter().enumerate().filter_map(|(slot, r)|

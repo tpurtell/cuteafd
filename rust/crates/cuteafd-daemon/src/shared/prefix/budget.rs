@@ -63,6 +63,9 @@ pub(super) fn host_memory() -> Result<HostMemory> {
     Ok(memory)
 }
 
+/// Host RAM total for host-side caches sized from it (`EmbeddingCache::default_budget`).
+pub(crate) fn host_total() -> Result<u64> { Ok(host_memory()?.total) }
+
 fn meminfo(text: &str) -> Result<HostMemory> {
     let field = |name: &str| -> Result<u64> {
         let value = text.lines().find_map(|line| line.strip_prefix(name))
