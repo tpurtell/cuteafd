@@ -86,7 +86,7 @@ async fn lane<'a, P: VerificationTarget<'a>, C: DraftChain<'a>>(lease: LaneLease
             // Admission/prefill still uses both execution lanes.
             let members: Vec<_> = {
                 let active = active.borrow();
-                if wake.poll_media(round_id)
+                if wake.prefill_due(round_id) || wake.poll_media(round_id)
                     || (!wake.media_pending && wake.ready(active.iter().flatten().count(), active.len(), !receive.is_empty())) {
                     lease.stop(); return Ok(());
                 }
