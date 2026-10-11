@@ -1,0 +1,24 @@
+# syntax=docker/dockerfile:1.7
+# Build on the target's native Linux host; never cross-compile packaged workers.
+ARG NODE_IMAGE=node:24-bookworm
+FROM ${NODE_IMAGE} AS build
+RUN apt-get update && apt-get install -y --no-install-recommends musl-tools python3 && rm -rf /var/lib/apt/lists/*
+RUN npm install --global pnpm@11.28.5
+WORKDIR /opt/dsh
+COPY third_party/deepseek-harness/ ./
+COPY third_party/deepseek-harness.lock.json /opt/source-lock.json
+COPY scripts/build/verify-dsh-source.py scripts/build/verify-sparkinfer-source.py /opt/verify/
+ARG DSH_SOURCE_COMMIT
+ENV DSH_SOURCE_DIRTY=false NODE_OPTIONS=--max-old-space-size=8192
+RUN python3 /opt/verify/verify-dsh-source.py --source /opt/dsh --lock /opt/source-lock.json \
+ && python3 -c 'import json,os; assert json.load(open("/opt/source-lock.json"))["revision"] == os.environ["DSH_SOURCE_COMMIT"]'
+RUN pnpm install --frozen-lockfile \
+ && arch="$(node -p process.arch)" \
+ && pnpm exec tsx scripts/build-exe-for-ssh-helper.ts --target "node24-linux-$arch" --output "/opt/helpers/linux-$arch" \
+ && tar -xzf /opt/helpers/linux-$arch/*.tar.gz -C "/opt/helpers/linux-$arch" \
+ && mv /opt/helpers/linux-$arch/*.tar.gz "/opt/helpers/linux-$arch/helper.tar.gz" \
+ && mv "/opt/helpers/linux-$arch/dsh-ssh-helper/dsh-ssh-helper" "/opt/helpers/linux-$arch/executable" \
+ && rm -rf "/opt/helpers/linux-$arch/dsh-ssh-helper" \
+ && mv "/opt/helpers/linux-$arch/executable" "/opt/helpers/linux-$arch/dsh-ssh-helper"
+FROM scratch
+COPY --from=build /opt/helpers /opt/helpers

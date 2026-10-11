@@ -1,0 +1,48 @@
+# syntax=docker/dockerfile:1.7
+ARG NODE_IMAGE=node:24-bookworm
+ARG ARM64_HELPER_IMAGE=cuteafd-agent-helper:arm64
+FROM ${ARM64_HELPER_IMAGE} AS arm64_helper
+FROM ${NODE_IMAGE} AS build
+RUN apt-get update && apt-get install -y --no-install-recommends musl-tools python3 && rm -rf /var/lib/apt/lists/*
+WORKDIR /opt/dsh
+COPY third_party/deepseek-harness/ ./
+RUN npm install --global pnpm@11.28.5
+ENV NODE_OPTIONS=--max-old-space-size=8192
+ARG DSH_SOURCE_COMMIT
+ARG DSH_SOURCE_DIRTY=false
+COPY third_party/deepseek-harness.lock.json /opt/source-lock.json
+COPY scripts/build/verify-dsh-source.py scripts/build/verify-sparkinfer-source.py /opt/verify/
+RUN python3 /opt/verify/verify-dsh-source.py --source /opt/dsh --lock /opt/source-lock.json \
+ && python3 -c 'import json,os; lock=json.load(open("/opt/source-lock.json")); assert os.environ["DSH_SOURCE_COMMIT"] == lock["revision"]; assert os.environ["DSH_SOURCE_DIRTY"] == "false"'
+RUN DSH_CLIENT_COMMIT_HASH="$DSH_SOURCE_COMMIT" pnpm install --frozen-lockfile \
+ && DSH_CLIENT_COMMIT_HASH="$DSH_SOURCE_COMMIT" pnpm run build --artifacts-only
+# Source-built helper carries its own Node runtime and private workers.
+RUN pnpm exec tsx scripts/build-exe-for-ssh-helper.ts --target node24-linux-x64 --output /opt/helpers/linux-x64 \
+ && tar -xzf /opt/helpers/linux-x64/*.tar.gz -C /opt/helpers/linux-x64 \
+ && cp /opt/helpers/linux-x64/dsh-ssh-helper/dsh-ssh-helper /opt/helpers/linux-x64/dsh-ssh-helper.bin \
+ && mv /opt/helpers/linux-x64/dsh-ssh-helper.bin /opt/helpers/linux-x64/executable \
+ && mv /opt/helpers/linux-x64/*.tar.gz /opt/helpers/linux-x64/helper.tar.gz \
+ && rm -rf /opt/helpers/linux-x64/dsh-ssh-helper \
+ && mv /opt/helpers/linux-x64/executable /opt/helpers/linux-x64/dsh-ssh-helper
+COPY --from=arm64_helper /opt/helpers/linux-arm64 /opt/helpers/linux-arm64
+# Require both helpers to match this source pin, not a stale artifact image.
+RUN node --import tsx --input-type=module -e 'import {mkdtemp,rm,readFile} from "node:fs/promises"; import {extractHelper} from "./scripts/verify-ssh-helper-artifact.ts"; import {verifyPayload,fileDigest} from "./scripts/ssh-helper/artifact.ts"; for(const arch of ["x64","arm64"]){const directory=await mkdtemp("/opt/check-helper-"); try{const root=await extractHelper(`/opt/helpers/linux-${arch}/helper.tar.gz`,directory); const manifest=await verifyPayload(root); if(manifest.commit!==process.env.DSH_SOURCE_COMMIT||manifest.dirty||manifest.target!==`node24-linux-${arch}`)throw Error("helper source identity mismatch"); if(await fileDigest(`${root}/dsh-ssh-helper`)!==await fileDigest(`/opt/helpers/linux-${arch}/dsh-ssh-helper`))throw Error("helper executable mismatch");}finally{await rm(directory,{recursive:true,force:true})}}'
+# Deploy only production packages, flattening workspace links to a single Cordis instance.
+RUN pnpm exec tsx scripts/deploy-cuteafd-runtime.ts --output /opt/runtime
+
+FROM node:24-bookworm-slim AS runtime
+RUN apt-get update && apt-get install -y --no-install-recommends openssh-client git ca-certificates procps \
+ && rm -rf /var/lib/apt/lists/*
+COPY --from=build /opt/runtime /opt/dsh
+COPY --from=build /opt/helpers /opt/dsh/helpers
+COPY --from=build /usr/local/lib/node_modules/pnpm /usr/local/lib/node_modules/pnpm
+RUN ln -s /usr/local/lib/node_modules/pnpm/bin/pnpm.cjs /usr/local/bin/pnpm \
+ && printf '#!/bin/sh\nexec node /opt/dsh/node_modules/@cuteafd/dsh-admin/lib/index.js "$@"\n' > /usr/local/bin/dsh-cuteafd \
+ && chmod 755 /usr/local/bin/dsh-cuteafd
+COPY --chmod=755 docker/agent-entrypoint.sh /usr/local/bin/cuteafd-agent
+ENV HOME=/agent/home DSH_HOME=/agent/dsh DSH_AGENTS_HOME=/agent/agents DSH_TELEMETRY_DISABLED=1 DSH_REMOTE_ONLY=1
+WORKDIR /agent
+EXPOSE 3010
+USER 1000:1000
+ENTRYPOINT ["/usr/local/bin/cuteafd-agent"]
+CMD ["--profile", "cuteafd", "--port", "3010", "--no-open"]

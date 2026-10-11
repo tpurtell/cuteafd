@@ -15,3 +15,7 @@
 [submodule "third_party/tool-eval-bench"]
 	path = third_party/tool-eval-bench
 	url = https://github.com/SeraphimSerapis/tool-eval-bench.git
+[submodule "third_party/deepseek-harness"]
+	path = third_party/deepseek-harness
+	url = https://github.com/tpurtell/deepseek-harness.git
+	branch = cuteafd
