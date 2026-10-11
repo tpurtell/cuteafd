@@ -31,6 +31,38 @@ def load_tool():
     return module
 
 
+@pytest.mark.parametrize("geometry", ["dsv4f", "dsv4p", "glm", "glmf", "qwen4"])
+def test_generic_spark_profiles_cover_every_nonempty_whole_block_rank(geometry):
+    tool = load_tool()
+    intermediate = tool.GEOMETRIES[geometry][1]
+    profiles = tool.profiles_for_role("spark", geometry)
+    for tp in range(1, 9):
+        ranks = {}
+        for _name, width, _experts, _topk, dtype, destinations in profiles:
+            assert dtype == "bf16"
+            for destination in destinations:
+                if destination.startswith(f"tp{tp}-rank"):
+                    rank = int(destination.split("rank")[1])
+                    assert rank not in ranks
+                    ranks[rank] = width
+        if tp > intermediate // 128:
+            assert not ranks
+        else:
+            assert sorted(ranks) == list(range(tp))
+            assert sum(ranks.values()) == intermediate
+            assert all(width > 0 and width % 128 == 0 for width in ranks.values())
+            assert max(ranks.values()) - min(ranks.values()) <= 128
+
+
+@pytest.mark.parametrize("geometry", ["dsv4f", "dsv4p", "glm", "glmf", "qwen4"])
+def test_all_counts_are_opt_in_and_legacy_build_profiles_remain(geometry):
+    tool = load_tool()
+    legacy = tool.build_profiles("spark", geometry)
+    worlds = {int(profile[0].split("-")[0][2:]) for profile in legacy}
+    assert worlds == ({1, 2, 3, 4} if geometry == "qwen4" else {2, 3, 4, 6})
+    assert tool.build_profiles("spark", geometry, all_spark_counts=True) == tool.profiles_for_role("spark", geometry)
+
+
 def _manifest(path: Path, role: str = "coordinator") -> None:
     path.write_text(json.dumps({"schema": "cuteafd.exl3-package.v1", "role": role}))
 

@@ -456,11 +456,9 @@ def shard_profiles(geometry: str, role: str) -> list[tuple]:
             profiles.append(('rtx-tp2', intermediate // 2, experts, topk, 'fp32', ['rtx-tp2']))
         return profiles
     profiles = []
-    # Six ranks wherever each gets at least one H128 block (V4 Pro: 24 -> 4;
-    # 2048: 16 -> 3/2; not Qwen's 5).
-    worlds = (4, 2, 3, 6) if blocks >= 6 else (4, 2, 3)
-    if geometry == 'qwen4':
-        worlds = (*worlds, 1)
+    # Every transport count with at least one whole rotation block per rank.
+    # Qwen's five H128 blocks intentionally exclude TP6/7/8.
+    worlds = range(1, min(8, blocks) + 1)
     for world in worlds:
         widths: dict[int, list[str]] = {}
         for rank in range(world):
@@ -490,6 +488,16 @@ def profiles_for_role(role: str, geometry: str = 'v41') -> list[tuple]:
     return [('rtx-tp1', 2304, 384, 6, 'fp32', ['rtx-tp1']),
             ('rtx-tp2', 1152, 384, 6, 'fp32', ['rtx-tp2']),
             ('dspark', 2304, 128, 3, 'bf16', ['dspark'])]
+
+
+def build_profiles(role: str, geometry: str, *, all_spark_counts: bool = False) -> list[tuple]:
+    profiles = profiles_for_role(role, geometry)
+    if all_spark_counts or role != 'spark' or geometry == 'v41':
+        return profiles
+    worlds = {2, 3, 4, 6} if GEOMETRIES[geometry][1] // 128 >= 6 else {2, 3, 4}
+    if geometry == 'qwen4':
+        worlds.add(1)
+    return [profile for profile in profiles if int(profile[0].split('-')[0][2:]) in worlds]
 
 
 def parse_requested_layouts(values: list[str], role: str, geometry: str = 'v41') -> list[str]:
@@ -578,8 +586,11 @@ def build(args: argparse.Namespace) -> None:
     if not capacities or any(v < 1 or v > 4096 for v in capacities):
         raise ValueError('EXL3 capacities must be in 1..4096')
     overrides = residency_overrides(getattr(args, 'residency', []), capacities, paired)
-    profiles = profiles_for_role(args.role, geometry)
+    all_counts = getattr(args, 'all_spark_counts', False)
+    if all_counts and (args.role != 'spark' or paired):
+        raise ValueError('--all-spark-counts requires an unpaired Spark role')
     only = set(getattr(args, 'profile', None) or [])
+    profiles = build_profiles(args.role, geometry, all_spark_counts=all_counts or bool(only))
     if only:
         unknown = only - {profile for profile, *_ in profiles}
         if unknown:
@@ -743,9 +754,11 @@ def main() -> None:
     create.add_argument('--role', choices=('spark', 'coordinator'), required=True)
     create.add_argument('--geometry', choices=sorted(GEOMETRIES), default='v41',
                         help='Routed-expert geometry (cuteafd_core::ExpertGeometry::family)')
+    create.add_argument('--all-spark-counts', action='store_true',
+                        help='Opt in to all nonempty H128 Spark TP profiles (1..8)')
     create.add_argument('--profile', action='append', default=[],
                         help='Build only these profiles (repeatable), for bring-up; '
-                             'a release package builds every profile of its role')
+                             'without selection the legacy role profiles remain the default')
     create.add_argument('--paired-tp4', action='store_true', help='Export explicit paired H128 ownership kernels for all four Spark ranks')
     create.add_argument('--residency', action='append', default=[], metavar='CAPACITY=BLOCKS',
                         help='Explicit paired-package blocks/SM override; repeat per capacity (for example 80=2). B12X validates resources.')

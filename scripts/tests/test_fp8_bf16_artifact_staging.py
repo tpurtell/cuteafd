@@ -23,6 +23,32 @@ assert preflight_spec.loader is not None
 preflight_spec.loader.exec_module(preflight)
 
 
+@pytest.mark.parametrize("intermediate", [640, 2048, 2304, 3072])
+def test_all_spark_counts_own_unequal_whole_blocks(intermediate):
+    layouts = package_tool.spark_layouts(intermediate)
+    for tp in range(1, 9):
+        widths = package_tool.exact_widths(intermediate, tp)
+        if tp > intermediate // 128:
+            assert not widths
+            assert f"tp{tp}" not in layouts
+            continue
+        assert len(widths) == tp
+        assert sum(widths) == intermediate
+        assert all(width > 0 and width % 128 == 0 for width in widths)
+        assert max(widths) - min(widths) <= 128
+        assert f"tp{tp}" in layouts
+        if len(set(widths)) > 1:
+            assert all(f"tp{tp}-w{width}" in layouts for width in widths)
+    assert package_tool.exact_widths(intermediate, 0) == []
+    assert package_tool.exact_widths(intermediate, 9) == []
+
+
+def test_qwen_tp5_exact_slice_has_no_padding():
+    assert package_tool.exact_widths(640, 5) == [128] * 5
+    assert "tp5" in package_tool.spark_layouts(640)
+    assert not any(layout.startswith(("tp6", "tp7", "tp8")) for layout in package_tool.spark_layouts(640))
+
+
 def write_package(path: Path, *, input_kind="wire", role="spark", revision=REVISION):
     layout = "tp4" if role == "spark" else "tp1"
     library = path / layout / "libcuteafd_fp8moe.so"

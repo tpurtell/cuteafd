@@ -214,9 +214,23 @@ def exact_widths(intermediate: int, tp: int) -> list[int]:
     """Stored widths of TP ranks owning whole 128-row blocks exactly (TP6 of
     2048: 384, 384, 384, 384, 256, 256), as the worker's exact layouts expect."""
     blocks = intermediate // 128
-    if intermediate % 128 or blocks < tp:
+    if not 1 <= tp <= 8 or intermediate % 128 or blocks < tp:
         return []
     return [(blocks // tp + (rank < blocks % tp)) * 128 for rank in range(tp)]
+
+
+def spark_layouts(intermediate: int, *, exact: bool = True) -> list[str]:
+    """Every meaningful TP1..8 layout, with unequal whole-H128 rank extents."""
+    layouts = []
+    for tp in range(1, 9):
+        widths = exact_widths(intermediate, tp)
+        if not widths:
+            continue
+        layout = f"tp{tp}"
+        layouts.append(layout)
+        if exact and len(set(widths)) > 1:
+            layouts.extend(f"{layout}-w{width}" for width in sorted(set(widths), reverse=True))
+    return layouts
 
 
 def with_width(g, width: int):
@@ -288,7 +302,7 @@ def build(args: argparse.Namespace) -> None:
     # whole 128-row blocks (Qwen 3.8 Flash Next's 640 splits into none), and
     # TP6 of any intermediate of at least six blocks: uneven whole blocks
     # zero-padded to the widest (2048: 3, 3, 3, 3, 2, 2 blocks stored as 384).
-    elif not args.layouts:
+    elif not args.layouts and not getattr(args, "all_spark_counts", False):
         def servable(tp: int) -> bool:
             blocks = base.intermediate // 128
             return base.intermediate % (128 * tp) == 0 or (tp == 6 and blocks >= 6)
@@ -297,6 +311,12 @@ def build(args: argparse.Namespace) -> None:
         if not layouts:
             raise SystemExit(f"{args.geometry}: intermediate {base.intermediate} has no default {args.role} "
                              "TP layout of whole 128-row blocks; pass --layouts")
+    if getattr(args, "all_spark_counts", False):
+        if args.role != "spark":
+            raise SystemExit("--all-spark-counts requires Spark role")
+        if args.layouts:
+            raise SystemExit("--all-spark-counts and --layouts are mutually exclusive")
+        layouts = spark_layouts(base.intermediate)
     if args.exact_slices:
         # Exact layouts beside each padded TP layout whose ranks would store padding.
         for layout in list(layouts):
@@ -408,6 +428,8 @@ def main() -> None:
                         required=True)
     create.add_argument("--layouts", help="comma list (default: tp4,tp2,tp6 where they split for spark, "
                         "tp1 for coordinator)")
+    create.add_argument("--all-spark-counts", action="store_true",
+                        help="build TP1..8 with at least one H128 block per rank, including unequal exact slices")
     create.add_argument("--capacities", default="1,16,80,256,1024,4096")
     create.add_argument("--exact-slices", action="store_true",
                         help="also build tp<n>-w<width> layouts: ranks own whole 128-row blocks, each stored at its "
