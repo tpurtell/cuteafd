@@ -54,6 +54,7 @@ pub(super) struct DualExpertPlan {
     pub packages: [std::path::PathBuf; 2],
     pub costs: Vec<Option<cuteafd_loader::placement::ExpertCost>>,
     pub workspace: [u64; 2],
+    pub transport: Vec<cuteafd_loader::placement::Demand>,
     pub wire: bool,
 }
 
@@ -96,7 +97,9 @@ pub(super) fn dual_experts(args: &EngineArgs, catalog: &cuteafd_loader::Official
         ensure!(workspace[rank] == backend_workspace[rank] as u64,
             "Qwen TP2 manifest workspace disagrees with backend rank {rank}");
     }
-    Ok(DualExpertPlan { packages, costs, workspace, wire })
+    let shape = catalog.routed_experts();
+    let transport = qwen4::QwenTp2Rows::new(shape.hidden as u64, shape.topk as u64, rows as u64, wire)?.demands()?;
+    Ok(DualExpertPlan { packages, costs, workspace, transport, wire })
 }
 
 #[cfg(test)]

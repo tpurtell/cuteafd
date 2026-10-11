@@ -770,25 +770,23 @@ struct Tp2Rows {
     weights: usize,
     bytes: usize,
     partial_bytes: usize,
+    reduction_bytes: usize,
+    exchange_slot_bytes: usize,
 }
 
 impl Tp2Rows {
     fn new(hidden: usize, topk: usize, rows: usize, wire: bool,
         partial: crate::shared::experts::rtx::PartialDtype) -> Result<Self> {
-        ensure!(hidden > 0 && topk > 0 && rows > 0 && (!wire || hidden % 32 == 0),
-            "invalid Qwen TP2 row geometry");
-        let mul = |a: usize, b: usize| a.checked_mul(b).context("Qwen TP2 row extent overflow");
-        let align = |bytes: usize| bytes.checked_add(15).map(|n| n / 16 * 16)
-            .context("Qwen TP2 row padding overflow");
-        let input = mul(rows, if wire { hidden.checked_add(hidden / 32).context("Qwen wire stride overflow")? }
-            else { mul(hidden, 2)? })?;
-        let ids = align(input)?;
-        let route_bytes = mul(mul(rows, topk)?, 4)?;
-        let weights = ids.checked_add(align(route_bytes)?).context("Qwen TP2 routes overflow")?;
-        let bytes = weights.checked_add(align(route_bytes)?).context("Qwen TP2 payload overflow")?;
-        let element = match partial { crate::shared::experts::rtx::PartialDtype::F32 => 4,
-            crate::shared::experts::rtx::PartialDtype::Bf16 => 2 };
-        Ok(Self { input, ids, weights, bytes, partial_bytes: mul(mul(rows, hidden)?, element)? })
+        use crate::shared::experts::rtx::PartialDtype;
+        ensure!(matches!((wire, partial), (true, PartialDtype::F32) | (false, PartialDtype::Bf16)),
+            "Qwen TP2 wire and partial ABI disagree");
+        let layout = cuteafd_loader::placement::families::qwen4::QwenTp2Rows::new(
+            hidden as u64, topk as u64, rows as u64, wire)?;
+        Ok(Self { input: usize::try_from(layout.input)?, ids: usize::try_from(layout.ids)?,
+            weights: usize::try_from(layout.weights)?, bytes: usize::try_from(layout.bytes)?,
+            partial_bytes: usize::try_from(layout.partial_bytes)?,
+            reduction_bytes: usize::try_from(layout.reduction_bytes)?,
+            exchange_slot_bytes: usize::try_from(layout.exchange_slot_bytes)? })
     }
 }
 
@@ -830,12 +828,10 @@ impl<'a> QwenTp2<'a> {
         };
         let _scope = devices[0].enter()?;
         let exchange = crate::shared::peer_split::PeerExchange::new_abortable(library, ranks, 2,
-            layout.bytes.max(layout.partial_bytes).checked_add(15).context("Qwen TP2 slot overflow")? / 16 * 16)?;
+            layout.exchange_slot_bytes)?;
         let combine = [devices[0].run(|| library.rtx_tp2_combine())?, devices[1].run(|| library.rtx_tp2_combine())?];
         let send = [zero(0, layout.bytes)?, zero(1, layout.bytes)?];
-        let result_bytes = max_rows.checked_mul(hidden).and_then(|n| n.checked_mul(2))
-            .context("Qwen TP2 reduction extent overflow")?;
-        let reduced = [zero(0, result_bytes)?, zero(1, result_bytes)?];
+        let reduced = [zero(0, layout.reduction_bytes)?, zero(1, layout.reduction_bytes)?];
         let mut tp2 = Self { library, ranks: devices, experts: std::mem::ManuallyDrop::new(experts),
             exchange: std::mem::ManuallyDrop::new(exchange), combine, send, reduced,
             hidden, topk, max_rows, wire, layout };
@@ -853,7 +849,7 @@ impl<'a> QwenTp2<'a> {
                 let partial = cuteafd_ffi::CuteafdDeviceBuffer { ptr: tp2.experts[rank].output(),
                     bytes: layout.partial_bytes, device_id: devices[rank].id, ..Default::default() };
                 library.cuda_zero_bytes(partial, partial.bytes)?;
-                let shared = zero(rank, result_bytes)?;
+                let shared = zero(rank, layout.reduction_bytes)?;
                 // SAFETY: initialize geometry-generic sum/add on disjoint retained buffers.
                 unsafe {
                     tp2.combine[rank].sum(partial.ptr, partial.ptr, tp2.reduced[rank].buffer.ptr.cast(),
@@ -3235,16 +3231,23 @@ mod owner_state_tests {
         use crate::shared::experts::rtx::PartialDtype;
         for wire in [false, true] {
             for rows in [1, 3, 64, 4096] {
-                let p = Tp2Rows::new(2560, 10, rows, wire, PartialDtype::F32)?;
+                let partial = if wire { PartialDtype::F32 } else { PartialDtype::Bf16 };
+                let p = Tp2Rows::new(2560, 10, rows, wire, partial)?;
+                let planned = cuteafd_loader::placement::families::qwen4::QwenTp2Rows::new(
+                    2560, 10, rows as u64, wire)?;
+                assert_eq!(p.exchange_slot_bytes as u64, planned.exchange_slot_bytes);
+                assert_eq!(p.reduction_bytes as u64, planned.reduction_bytes);
                 assert_eq!(p.ids % 16, 0);
                 assert_eq!(p.weights % 16, 0);
                 assert_eq!(p.bytes % 16, 0);
                 assert!(p.ids >= p.input && p.weights >= p.ids + rows * 40);
-                assert_eq!(p.partial_bytes, rows * 2560 * 4);
+                assert_eq!(p.partial_bytes, rows * 2560 * if wire { 4 } else { 2 });
             }
         }
         assert!(Tp2Rows::new(usize::MAX, 10, 64, false, PartialDtype::F32).is_err());
         assert!(Tp2Rows::new(2561, 10, 64, true, PartialDtype::F32).is_err());
+        assert!(Tp2Rows::new(2560, 10, 64, false, PartialDtype::F32).is_err());
+        assert!(Tp2Rows::new(2560, 10, 64, true, PartialDtype::Bf16).is_err());
         Ok(())
     }
 

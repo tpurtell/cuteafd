@@ -210,6 +210,53 @@ pub fn dual_expert_workspace(catalog: &crate::OfficialV41Catalog,
     Ok(bytes)
 }
 
+/// Exact TP2 row ABI shared by admission and the owner executor. EXL3 sends
+/// E4M3/K32 wire rows and produces FP32 partials; native packages use BF16.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QwenTp2Rows {
+    pub input: u64,
+    pub ids: u64,
+    pub weights: u64,
+    pub bytes: u64,
+    pub partial_bytes: u64,
+    pub reduction_bytes: u64,
+    pub exchange_slot_bytes: u64,
+}
+
+impl QwenTp2Rows {
+    pub fn new(hidden: u64, topk: u64, rows: u64, wire: bool) -> anyhow::Result<Self> {
+        anyhow::ensure!(hidden > 0 && topk > 0 && rows > 0 && (!wire || hidden % 32 == 0),
+            "invalid Qwen TP2 row geometry");
+        let overflow = || anyhow::anyhow!("Qwen TP2 row extent overflow");
+        let mul = |a: u64, b: u64| a.checked_mul(b).ok_or_else(overflow);
+        let align = |bytes: u64| bytes.checked_add(15).map(|n| n / 16 * 16).ok_or_else(overflow);
+        let stride = if wire { hidden.checked_add(hidden / 32).ok_or_else(overflow)? }
+            else { mul(hidden, 2)? };
+        let input = mul(rows, stride)?;
+        let ids = align(input)?;
+        let route_bytes = align(mul(mul(rows, topk)?, 4)?)?;
+        let weights = ids.checked_add(route_bytes).ok_or_else(overflow)?;
+        let bytes = weights.checked_add(route_bytes).ok_or_else(overflow)?;
+        let partial_bytes = mul(mul(rows, hidden)?, if wire { 4 } else { 2 })?;
+        Ok(Self { input, ids, weights, bytes, partial_bytes,
+            reduction_bytes: mul(mul(rows, hidden)?, 2)?,
+            exchange_slot_bytes: align(bytes.max(partial_bytes))? })
+    }
+
+    /// Data buffers and existing peer control only. Abort words and independent
+    /// publisher resources are admitted separately by the sealed transport API.
+    pub fn demands(self) -> anyhow::Result<Vec<Demand>> {
+        let receive = self.exchange_slot_bytes.max(256).checked_mul(2)
+            .ok_or_else(|| anyhow::anyhow!("Qwen TP2 receive extent overflow"))?;
+        Ok((0..2).flat_map(|gpu| [
+            Demand::new(gpu, Category::Transport, "expert send", self.bytes, Basis::Formula),
+            Demand::new(gpu, Category::Transport, "expert receive", receive, Basis::Formula),
+            Demand::new(gpu, Category::Transport, "expert reduction", self.reduction_bytes, Basis::Formula),
+            Demand::new(gpu, Category::Transport, "expert peer control", 256, Basis::Formula),
+        ]).collect())
+    }
+}
+
 /// Admission contract for the private whole-owner executor. Unlike the legacy
 /// single-owner path, layer weights and routed halves are future allocations;
 /// both baselines must be sampled before loading them. The public selector
@@ -353,6 +400,35 @@ mod tests {
     use super::*;
     use crate::families::qwen4::{Qwen4Config, Qwen4KvCache};
     use crate::serving_capacity::qwen_graphs::qwen_graph_pool;
+
+    #[test]
+    fn qwen_tp2_transport_matches_owner_buffers_and_abi() -> anyhow::Result<()> {
+        for wire in [false, true] {
+            for rows in [1, 3, 64, 4096] {
+                let p = QwenTp2Rows::new(2560, 10, rows, wire)?;
+                let align = |bytes: u64| bytes.div_ceil(16) * 16;
+                let payload = align(rows * if wire { 2640 } else { 5120 }) + 2 * align(rows * 40);
+                assert_eq!(p.bytes, payload);
+                assert_eq!(p.partial_bytes, rows * 2560 * if wire { 4 } else { 2 });
+                assert_eq!(p.reduction_bytes, rows * 5120);
+                assert_eq!(p.exchange_slot_bytes, align(payload.max(p.partial_bytes)));
+                let demands = p.demands()?;
+                assert_eq!(demands.len(), 8);
+                for rank in 0..2 {
+                    let rank_bytes = demands.iter().filter(|d| d.gpu == rank).map(|d| d.bytes).sum::<u64>();
+                    assert_eq!(rank_bytes, payload + 2 * p.exchange_slot_bytes.max(256) + rows * 5120 + 256);
+                }
+            }
+        }
+        let tiny = QwenTp2Rows::new(32, 1, 1, true)?;
+        assert_eq!(tiny.demands()?.iter().filter(|d| d.group == "expert receive")
+            .map(|d| d.bytes).collect::<Vec<_>>(), vec![512, 512]);
+        for (hidden, topk, rows, wire) in [(0, 10, 64, false), (2560, 0, 64, false),
+            (2560, 10, 0, true), (2561, 10, 64, true), (u64::MAX, 10, 64, false)] {
+            assert!(QwenTp2Rows::new(hidden, topk, rows, wire).is_err());
+        }
+        Ok(())
+    }
 
     #[test]
     fn qwen_tp2_costs_use_exact_header_storage() {
