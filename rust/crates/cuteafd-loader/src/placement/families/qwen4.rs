@@ -147,6 +147,69 @@ pub fn dual_expert_costs(catalog: &crate::OfficialV41Catalog, layers: usize)
     }).collect()
 }
 
+/// Exact rank-package workspace before CUDA initialization. Packages are
+/// explicitly selected by the caller; unequal ranks may never fall back to a
+/// padded sibling. The runtime also checks its DSO ABI against these totals.
+pub fn dual_expert_workspace(catalog: &crate::OfficialV41Catalog,
+    packages: [&std::path::Path; 2], rows: u64) -> anyhow::Result<[u64; 2]> {
+    use crate::formats::fp8_experts::{ExpertFormat, Slicing};
+    let shape = catalog.routed_experts();
+    anyhow::ensure!(rows > 0, "Qwen TP2 workspace needs positive rows");
+    let mut bytes = [0; 2];
+    for rank in 0..2 {
+        let package = packages[rank];
+        let width = if let Some(exl3) = catalog.exl3() {
+            exl3.residency(crate::V41Exl3Layer::Backbone(0), 2, rank)?.intermediate as u64
+        } else {
+            catalog.fp8().ok_or_else(|| anyhow::anyhow!("Qwen TP2 expert format is unsupported"))?
+                .rank_width(2, rank, Slicing::Blocks(128))? as u64
+        };
+        let scratch = if catalog.exl3().is_some() {
+            anyhow::ensure!(rows <= 4096, "Qwen EXL3 TP2 capacity exceeds 4096 rows");
+            let manifests = crate::placement::inventory::exl3_capacities(rows).into_iter().map(|capacity| {
+                let path = package.join(format!("m{capacity}/v41_exl3.json"));
+                let value: serde_json::Value = serde_json::from_slice(&std::fs::read(&path)?)?;
+                anyhow::ensure!(value["hidden"].as_u64() == Some(shape.hidden as u64)
+                    && value["intermediate"].as_u64() == Some(width)
+                    && value["experts"].as_u64() == Some(shape.experts as u64)
+                    && value["top_k"].as_u64() == Some(shape.topk as u64)
+                    && value["capacity"].as_u64() == Some(capacity)
+                    && value["output_dtype"].as_str() == Some("fp32"),
+                    "Qwen EXL3 TP2 rank {rank} package geometry mismatch: {}", path.display());
+                Ok(value)
+            }).collect::<anyhow::Result<Vec<_>>>()?;
+            crate::serving_capacity::exl3_workspace_bytes(&manifests, true)?
+        } else {
+            let tensors = catalog.fp8().unwrap();
+            let parent = package.parent().ok_or_else(|| anyhow::anyhow!("Qwen TP2 package has no parent"))?;
+            let name = package.file_name().and_then(|n| n.to_str())
+                .ok_or_else(|| anyhow::anyhow!("Qwen TP2 package has no layout name"))?;
+            let manifest: serde_json::Value = serde_json::from_slice(&std::fs::read(parent.join("manifest.json"))?)?;
+            let info = &manifest["layouts"][name];
+            let weights = match tensors.format() {
+                ExpertFormat::Fp8Block128 => info["weights"].as_str() == Some("fp8"),
+                ExpertFormat::Mxfp4 => info["weights"].as_str() == Some("mxfp4"),
+                ExpertFormat::Nvfp4 => matches!(info["weights"].as_str(), Some("nvfp4" | "nvfp4a4")),
+            };
+            anyhow::ensure!(info["tp"].as_u64() == Some(2)
+                && info["hidden"].as_u64() == Some(shape.hidden as u64)
+                && info["intermediate"].as_u64() == Some(shape.intermediate as u64)
+                && info["slice"].as_u64() == Some(width)
+                && info["experts"].as_u64() == Some(shape.experts as u64)
+                && info["top_k"].as_u64() == Some(shape.topk as u64)
+                && info["input"].as_str() == Some("bf16") && weights,
+                "Qwen FP8/NVFP4 TP2 rank {rank} package geometry mismatch: {}", package.display());
+            crate::placement::inventory::fp8moe_scratch_bytes(&manifest, name, rows)
+                .ok_or_else(|| anyhow::anyhow!("Qwen TP2 rank {rank} has no capacity for {rows} rows"))?
+        };
+        let output_element = if catalog.exl3().is_some() { 4 } else { 2 };
+        bytes[rank] = rows.checked_mul(shape.hidden as u64).and_then(|n| n.checked_mul(output_element))
+            .and_then(|output| output.checked_add(scratch))
+            .ok_or_else(|| anyhow::anyhow!("Qwen TP2 workspace overflow"))?;
+    }
+    Ok(bytes)
+}
+
 /// Admission contract for the private whole-owner executor. Unlike the legacy
 /// single-owner path, layer weights and routed halves are future allocations;
 /// both baselines must be sampled before loading them. The public selector
@@ -308,6 +371,25 @@ mod tests {
             assert_eq!(cost.half[rank].resident, residency.device_arena_layout().unwrap().1 as u64);
             assert_eq!(cost.half[rank].staging, 0);
         }
+        let packages = [dir.path().join("rtx-tp2-rank0"), dir.path().join("rtx-tp2-rank1")];
+        for (rank, width) in [384, 256].into_iter().enumerate() {
+            for capacity in [1, 16] {
+                let path = packages[rank].join(format!("m{capacity}"));
+                std::fs::create_dir_all(&path).unwrap();
+                let manifest = serde_json::json!({"hidden": 2560, "intermediate": width, "experts": 512,
+                    "top_k": 10, "capacity": capacity, "output_dtype": "fp32", "trellis_lut": {"bytes": 32},
+                    "buffers": {"scratch": {"allocation": "scratch", "bytes": capacity * width,
+                        "dtype": "f16", "zero_on_create": false},
+                        "state": {"allocation": "state", "bytes": 16, "zero_on_create": true}}});
+                std::fs::write(path.join("v41_exl3.json"), serde_json::to_vec(&manifest).unwrap()).unwrap();
+            }
+        }
+        assert_eq!(dual_expert_workspace(&catalog, packages.each_ref().map(|p| p.as_path()), 16).unwrap(),
+            [16 * 384 + 2 * (32 + 16) + 17 * 2560 * 2 + 16 * 2560 * 4,
+             16 * 256 + 2 * (32 + 16) + 17 * 2560 * 2 + 16 * 2560 * 4]);
+        assert!(dual_expert_workspace(&catalog, [packages[1].as_path(), packages[0].as_path()], 16).is_err());
+        assert!(dual_expert_workspace(&catalog, packages.each_ref().map(|p| p.as_path()), 17).is_err());
+        assert!(dual_expert_workspace(&catalog, packages.each_ref().map(|p| p.as_path()), 4097).is_err());
         let mut config = config;
         config["quantization_config"] = serde_json::json!({"quant_method": "modelopt", "quant_algo": "NVFP4",
             "config_groups": {"group_0": {"weights": {"num_bits": 4, "type": "float", "group_size": 16}}}});
@@ -327,6 +409,24 @@ mod tests {
             assert_eq!(cost.half[rank], Bytes2 { resident: 512 * (3 * width * 2560 * 9 / 16 + 3 * 8), staging: 0 });
         }
         assert_eq!(cost.whole.resident, 512 * (3 * 640 * 2560 * 9 / 16 + 3 * 8));
+        let package = |width, scratch| serde_json::json!({"tp": 2, "hidden": 2560, "slice": width,
+            "intermediate": 640, "experts": 512, "top_k": 10, "input": "bf16", "weights": "nvfp4a4",
+            "capacities": [{"capacity": 1, "scratch_bytes": 128}, {"capacity": 16, "scratch_bytes": scratch}]});
+        let mut manifest = serde_json::json!({"layouts": {"tp2-w384": package(384, 1000),
+            "tp2-w256": package(256, 2000)}});
+        let save = |value: &serde_json::Value| std::fs::write(dir.path().join("manifest.json"),
+            serde_json::to_vec(value).unwrap()).unwrap();
+        save(&manifest);
+        let packages = [dir.path().join("tp2-w384"), dir.path().join("tp2-w256")];
+        let paths = packages.each_ref().map(|p| p.as_path());
+        assert_eq!(dual_expert_workspace(&catalog, paths, 9).unwrap(), [1000 + 9 * 2560 * 2, 2000 + 9 * 2560 * 2]);
+        assert_eq!(dual_expert_workspace(&catalog, paths, 1).unwrap(), [256 + 2560 * 2; 2]);
+        assert!(dual_expert_workspace(&catalog, [paths[1], paths[0]], 9).is_err());
+        assert!(dual_expert_workspace(&catalog, paths, 17).is_err());
+        assert!(dual_expert_workspace(&catalog, paths, 0).is_err());
+        manifest["layouts"]["tp2-w256"]["input"] = serde_json::json!("wire");
+        save(&manifest);
+        assert!(dual_expert_workspace(&catalog, paths, 9).is_err());
     }
 
     #[test]
