@@ -14,6 +14,9 @@
 use crate::shared::memory::DeviceAllocation;
 use anyhow::{ensure, Context, Result};
 
+// K3 (GLM 5.3 `context`) is the first executor; until it lands nothing outside tests uses this.
+#[allow(dead_code)]
+pub(crate) mod context;
 pub(crate) mod hop;
 pub(crate) mod order;
 use cuteafd_ffi::NativeLibrary;
@@ -361,6 +364,16 @@ impl<'a> PeerExchange<'a> {
             })?;
         }
         Ok(())
+    }
+
+    /// Rank `rank`'s terminal abort word (None: a legacy, non-abortable
+    /// exchange). Other exchanges on the same streams (the context exchange)
+    /// spin on it too, so this exchange's publish/drain covers their waits;
+    /// they must be dropped before this exchange.
+    #[allow(dead_code)] // first used by K3's context executor
+    pub fn abort_word(&self, rank: usize) -> Result<Option<*const u32>> {
+        ensure!(rank < 2, "abort word of rank {rank}");
+        Ok(self.abort.as_ref().map(|abort| abort.sides[rank].word.buffer.ptr.cast_const().cast()))
     }
 
     pub fn stream(&self, rank: usize) -> *mut c_void {
