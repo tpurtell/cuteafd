@@ -87,9 +87,20 @@ pub(super) fn remote_expert_bytes(geometry: &PolicyGeometry) -> f64 {
     geometry.layers[LAYERS - 1].slice_bytes
 }
 
-/// One verified request of a lane round: identity, verifier rows, accepted
-/// inputs, and whether its drafts were copied from its own history.
-pub(super) type LaneRequest = (u64, usize, u32, bool);
+/// One verified request of a lane round, in lane order.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct LaneRequest {
+    pub id: u64,
+    /// Verifier rows executed, anchor included.
+    pub rows: usize,
+    /// Accepted inputs, anchor included.
+    pub accepted: u32,
+    /// The drafts were copied from the request's own history.
+    pub copied: bool,
+}
+impl From<(u64, usize, u32, bool)> for LaneRequest {
+    fn from((id, rows, accepted, copied): (u64, usize, u32, bool)) -> Self { Self { id, rows, accepted, copied } }
+}
 
 /// Feed one completed lane round to the policy through the shared observation
 /// builder. `requests` are in lane order; `lane.width` is the round's dSpark
@@ -115,17 +126,17 @@ pub(super) fn observe(policy: &mut DraftPolicy, confidence_trace: &BTreeMap<u64,
     let predicted = lane.predicted.take();
     // Every drafted position's confidence, verified or not: the policy
     // bounds reliability evidence to reached positions itself.
-    let heads: Vec<Option<Vec<f64>>> = requests.iter().map(|&(id, _, _, copied)| if copied { None }
-        else { confidence_trace.get(&id).map(|logits| logits.iter().map(|&x| sigmoid(x)).collect()) })
+    let heads: Vec<Option<Vec<f64>>> = requests.iter().map(|request| if request.copied { None }
+        else { confidence_trace.get(&request.id).map(|logits| logits.iter().map(|&x| sigmoid(x)).collect()) })
         .collect();
-    let round: Vec<_> = requests.iter().zip(&heads).map(|(&(id, rows, accepted, copied), head)| RoundRequest {
-        id, rows, accepted: accepted as usize,
-        source: if copied { DraftSource::Copy } else if head.is_some() { DraftSource::Neural }
+    let round: Vec<_> = requests.iter().zip(&heads).map(|(request, head)| RoundRequest {
+        id: request.id, rows: request.rows, accepted: request.accepted as usize,
+        source: if request.copied { DraftSource::Copy } else if head.is_some() { DraftSource::Neural }
             else { DraftSource::Undrafted },
         evidence: head.as_deref().map(Evidence::Head),
         censor: None,
     }).collect();
-    let rows = requests.iter().map(|request| request.1).sum();
+    let rows = requests.iter().map(|request| request.rows).sum();
     lane.routes.fill(capture, rows, ROUTE_EXPERT_MASK)?;
     binding::observe(policy, &RoundRecord { shared, requests: &round, routes: &lane.routes,
         layer_us, times, draft: (lane.width > 0).then_some(DraftPass { width: lane.width }), predicted })
@@ -254,7 +265,8 @@ mod tests {
         let mut lane = LaneRound::new(LAYERS, TOPK);
         lane.width = width;
         lane.predicted = predicted;
-        observe(policy, confidence_trace, &mut lane, shared, routes, layer_us, requests,
+        let requests: Vec<LaneRequest> = requests.iter().map(|&r| r.into()).collect();
+        observe(policy, confidence_trace, &mut lane, shared, routes, layer_us, &requests,
             RoundTimes { total_us, draft_us: Some(draft_us) })
     }
 
@@ -455,7 +467,8 @@ mod tests {
                     assert_eq!(format!("{:?}", binding::build(&record, after.widths()[0]).unwrap().view()), expected,
                         "round {round}");
                 }
-                let new = observe(&mut after, &trace, &mut lane, shared, &routes, &layer_us, &requests,
+                let typed: Vec<LaneRequest> = requests.iter().map(|&r| r.into()).collect();
+                let new = observe(&mut after, &trace, &mut lane, shared, &routes, &layer_us, &typed,
                     RoundTimes { total_us, draft_us: Some(draft_us) });
                 assert_eq!((old.is_ok(), new.is_ok()), (well_formed, well_formed), "round {round}");
                 assert_eq!(lane.predicted, None);

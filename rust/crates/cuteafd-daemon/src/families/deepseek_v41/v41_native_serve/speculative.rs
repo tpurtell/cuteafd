@@ -7,7 +7,7 @@ use crate::shared::draft::clock::RoundTimes;
 use crate::shared::draft::evidence::sigmoid;
 mod chain;
 mod policy;
-pub(crate) use policy::snapshot as policy_snapshot;
+pub(crate) use policy::{snapshot as policy_snapshot, LaneRequest};
 pub(crate) use chain::DraftChain;
 mod distributed;
 
@@ -207,7 +207,7 @@ impl<'w, 'a, C: DraftChain<'a>> DraftRuntime<'w, 'a, C> {
         }
         tracing::debug!(target: "cuteafd::draft_policy", lane, shared, predicted_us=predicted,
             total_us=times.total_us, draft_us=times.draft_us,
-            rows=requests.iter().map(|r| r.1).sum::<usize>(), "native length policy observation");
+            rows=requests.iter().map(|r| r.rows).sum::<usize>(), "native length policy observation");
         if self.published.is_none_or(|at| at.elapsed() >= std::time::Duration::from_millis(250)) {
             policy::publish(policy, self.draft_limit);
             self.published = Some(Instant::now());
