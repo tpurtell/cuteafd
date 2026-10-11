@@ -3,6 +3,7 @@ use super::{
     EncoderTicket, MediaKey, MediaError, MediaStats, RequestMedia,
 };
 use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::time::{Duration, Instant};
 
 /// A waiter contains host descriptors only, never a placement, pages, or a state-slot lease.
 #[derive(Debug)]
@@ -13,6 +14,7 @@ pub struct MediaWaiter<T> {
     resume: usize,
     retries: u8,
     cold: bool,
+    submit_waited: bool,
     pins: Vec<EmbeddingLease>,
     error: Option<MediaError>,
 }
@@ -50,6 +52,7 @@ impl<T> MediaWaiter<T> {
             resume,
             retries: 0,
             cold: false,
+            submit_waited: false,
             pins: Vec::new(),
             error: None,
         })
@@ -111,12 +114,15 @@ pub enum MediaPoll<T> {
     Failed(T, MediaError),
 }
 struct Flight {
-    ticket: EncoderTicket,
+    ticket: Option<EncoderTicket>,
+    queued_at: Instant,
+    submitted_at: Option<Instant>,
     _pin: EmbeddingLease,
 }
 
 /// A bounded media_pending queue and one in-flight encode per modality-tagged MediaKey, shared across requests.
 /// poll is nonblocking and ready requests may pass a slower encoder job (decode stays runnable).
+/// Encoder queue saturation keeps reservations pinned and retries submission in pending order.
 pub struct MediaAdmission<T, C: EncoderClient> {
     pub cache: EmbeddingCache,
     encoder: C,
@@ -126,6 +132,11 @@ pub struct MediaAdmission<T, C: EncoderClient> {
     max_images: usize,
     max_tokens: usize,
     encodes: u64,
+    submit_timeout: Duration,
+    encode_timeout: Duration,
+    encode_timeouts: u64,
+    submit_waits: u64,
+    submit_timeouts: u64,
     skipped: u64,
     latencies: Latencies,
 }
@@ -140,9 +151,20 @@ impl<T, C: EncoderClient> MediaAdmission<T, C> {
             max_images: 16,
             max_tokens: 32768,
             encodes: 0,
+            submit_timeout: Duration::from_secs(60),
+            encode_timeout: Duration::from_secs(60),
+            encode_timeouts: 0,
+            submit_waits: 0,
+            submit_timeouts: 0,
             skipped: 0,
             latencies: Latencies::default(),
         }
+    }
+    pub fn set_encode_timeout(&mut self, timeout: Duration) {
+        self.encode_timeout = timeout;
+    }
+    pub fn set_submit_timeout(&mut self, timeout: Duration) {
+        self.submit_timeout = timeout;
     }
     pub fn set_encode_limits(&mut self, images: usize, tokens: usize) {
         self.max_images = images;
@@ -226,15 +248,77 @@ impl<T, C: EncoderClient> MediaAdmission<T, C> {
             let bytes = waiter.prepared[key].feature_bytes()?;
             waiter.pins.push(self.cache.reserve(*key, bytes)?);
         }
-        for key in new {
+        let queued = self.flights.values().any(|flight| flight.ticket.is_none());
+        for &key in &new {
             let pin = self
                 .cache
                 .reserve(key, waiter.prepared[&key].feature_bytes()?)?;
-            let ticket = self.encoder.submit(waiter.prepared[&key].clone())?;
-            self.flights.insert(key, Flight { ticket, _pin: pin });
-            self.encodes += 1;
+            self.flights.insert(key, Flight { ticket: None, queued_at: Instant::now(), submitted_at: None, _pin: pin });
+        }
+        if queued {
+            self.mark_submit_wait(waiter);
+            return Ok(());
+        }
+        for key in new {
+            match self.encoder.submit(waiter.prepared[&key].clone()) {
+                Ok(ticket) => {
+                    let flight = self.flights.get_mut(&key).unwrap();
+                    flight.ticket = Some(ticket);
+                    flight.submitted_at = Some(Instant::now());
+                    self.encodes += 1;
+                }
+                Err(MediaError::QueueFull) => {
+                    self.mark_submit_wait(waiter);
+                    break;
+                }
+                Err(error) => return Err(error),
+            }
         }
         Ok(())
+    }
+    fn mark_submit_wait(&mut self, waiter: &mut MediaWaiter<T>) {
+        let blocked = waiter.media.needed(waiter.resume, waiter.media.prompt_len())
+            .any(|span| self.flights.get(&span.key).is_some_and(|flight| flight.ticket.is_none()));
+        if blocked && !waiter.submit_waited {
+            waiter.submit_waited = true;
+            self.submit_waits += 1;
+        }
+    }
+    fn expire_submissions(&mut self) {
+        for waiter in &mut self.pending {
+            if waiter.error.is_some() { continue; }
+            let unsubmitted: Vec<_> = waiter.media.needed(waiter.resume, waiter.media.prompt_len())
+                .filter_map(|span| self.flights.get(&span.key))
+                .filter(|flight| flight.ticket.is_none()).collect();
+            if unsubmitted.is_empty() { continue; }
+            if !waiter.submit_waited {
+                waiter.submit_waited = true;
+                self.submit_waits += 1;
+            }
+            if unsubmitted.iter().any(|flight| flight.queued_at.elapsed() >= self.submit_timeout) {
+                waiter.error = Some(MediaError::QueueFull);
+                self.submit_timeouts += 1;
+            }
+        }
+    }
+    fn submit_pending(&mut self) {
+        for waiter in &mut self.pending {
+            if waiter.error.is_some() { continue; }
+            let keys: BTreeSet<_> = waiter.media
+                .needed(waiter.resume, waiter.media.prompt_len()).map(|s| s.key).collect();
+            for key in keys {
+                let Some(flight) = self.flights.get_mut(&key).filter(|f| f.ticket.is_none()) else { continue };
+                match self.encoder.submit(waiter.prepared[&key].clone()) {
+                    Ok(ticket) => {
+                        flight.ticket = Some(ticket);
+                        flight.submitted_at = Some(Instant::now());
+                        self.encodes += 1;
+                    }
+                    Err(MediaError::QueueFull) => return,
+                    Err(error) => { waiter.error = Some(error); break; }
+                }
+            }
+        }
     }
     /// Call once per serve-loop step. Cancelled requests do not hold up later ones.
     pub fn poll(&mut self, mut cancelled: impl FnMut(&T) -> bool) -> MediaPoll<T> {
@@ -242,9 +326,16 @@ impl<T, C: EncoderClient> MediaAdmission<T, C> {
         self.cancel_unused();
         let keys: Vec<_> = self.flights.keys().copied().collect();
         for key in keys {
-            let ticket = self.flights[&key].ticket;
-            let Some(result) = self.encoder.poll(ticket) else {
-                continue;
+            let Some(ticket) = self.flights[&key].ticket else { continue };
+            let result = match self.encoder.poll(ticket) {
+                Some(result) => result,
+                None if self.flights[&key].submitted_at
+                    .is_some_and(|submitted| submitted.elapsed() >= self.encode_timeout) => {
+                    self.encoder.cancel(ticket);
+                    self.encode_timeouts += 1;
+                    Err(MediaError::Encoder("encode timed out".into()))
+                }
+                None => continue,
             };
             self.flights.remove(&key);
             let result = result.and_then(|output| {
@@ -256,6 +347,7 @@ impl<T, C: EncoderClient> MediaAdmission<T, C> {
                 Ok(lease)
             });
             for waiter in &mut self.pending {
+                if waiter.error.is_some() { continue; }
                 if !waiter
                     .media
                     .needed(waiter.resume, waiter.media.prompt_len())
@@ -273,6 +365,9 @@ impl<T, C: EncoderClient> MediaAdmission<T, C> {
                 }
             }
         }
+        // Completions free encoder queue slots before retrying unsubmitted keys in FIFO order.
+        self.submit_pending();
+        self.expire_submissions();
         let ready = self
             .pending
             .iter()
@@ -313,7 +408,7 @@ impl<T, C: EncoderClient> MediaAdmission<T, C> {
             .collect();
         for key in unused {
             if let Some(flight) = self.flights.remove(&key) {
-                self.encoder.cancel(flight.ticket);
+                if let Some(ticket) = flight.ticket { self.encoder.cancel(ticket); }
             }
         }
     }
@@ -321,6 +416,9 @@ impl<T, C: EncoderClient> MediaAdmission<T, C> {
         let (encode_ms_p50, encode_ms_p99) = self.latencies.percentiles();
         MediaStats {
             encodes: self.encodes,
+            submit_waits: self.submit_waits,
+            submit_timeouts: self.submit_timeouts,
+            encode_timeouts: self.encode_timeouts,
             encode_ms_p50,
             encode_ms_p99,
             cache_hits: self.cache.hits(),
@@ -335,7 +433,7 @@ impl<T, C: EncoderClient> MediaAdmission<T, C> {
 impl<T, C: EncoderClient> Drop for MediaAdmission<T, C> {
     fn drop(&mut self) {
         for flight in self.flights.values() {
-            self.encoder.cancel(flight.ticket);
+            if let Some(ticket) = flight.ticket { self.encoder.cancel(ticket); }
         }
     }
 }
@@ -368,6 +466,183 @@ mod tests {
             _ => panic!("not ready"),
         }
     }
+    struct SaturatedEncoder {
+        inner: FakeEncoder,
+        full_submits: usize,
+        fail_submit: bool,
+        order: Vec<MediaKey>,
+        cancellations: Arc<std::sync::atomic::AtomicUsize>,
+    }
+    impl SaturatedEncoder {
+        fn new(full_submits: usize) -> Self {
+            Self { inner: FakeEncoder::default(), full_submits, fail_submit: false,
+                order: Vec::new(), cancellations: Arc::default() }
+        }
+    }
+    impl EncoderClient for SaturatedEncoder {
+        fn submit(&mut self, job: EncodeJob) -> Result<EncoderTicket, MediaError> {
+            if self.full_submits > 0 {
+                self.full_submits -= 1;
+                return Err(MediaError::QueueFull);
+            }
+            if self.fail_submit { return Err(MediaError::Encoder("submit failed".into())); }
+            if self.inner.pending() >= 1 { return Err(MediaError::QueueFull); }
+            self.order.push(job.key);
+            self.inner.submit(job)
+        }
+        fn poll(&mut self, ticket: EncoderTicket) -> Option<Result<super::super::EncodeOutput, MediaError>> {
+            self.inner.poll(ticket)
+        }
+        fn cancel(&mut self, ticket: EncoderTicket) {
+            self.cancellations.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.inner.cancel(ticket);
+        }
+    }
+
+    #[test]
+    fn queue_full_retries_four_images_in_pending_order_without_failing() {
+        let mut queue = MediaAdmission::new(EmbeddingCache::new(40), SaturatedEncoder::new(3), 3);
+        queue.enqueue(waiter(1, &[1, 2, 3, 4], 0)).unwrap();
+        queue.enqueue(waiter(2, &[5], 0)).unwrap();
+        queue.enqueue(waiter(3, &[2], 0)).unwrap();
+        assert_eq!(queue.cache.bytes(), 40, "unsubmitted outputs stay reserved");
+        assert_eq!(queue.encoder().inner.submitted, 0);
+        let mut completed = Vec::new();
+        for _ in 0..16 {
+            match queue.poll(|_| false) {
+                MediaPoll::Ready(ready) => {
+                    assert!(ready.media().ready(0, ready.media().prompt_len()));
+                    completed.push(*ready.job());
+                }
+                MediaPoll::Failed(_, error) => panic!("saturation must wait: {error}"),
+                MediaPoll::Empty => break,
+                MediaPoll::Pending => (),
+            }
+        }
+        completed.sort_unstable();
+        assert_eq!(completed, [1, 2, 3]);
+        assert_eq!(queue.encoder().order, (1..=5).map(|key| ImageKey([key; 32]).into()).collect::<Vec<_>>());
+        assert_eq!(queue.stats(0, 0).encodes, 5);
+        assert_eq!(queue.stats(0, 0).submit_waits, 3);
+        assert_eq!(queue.stats(0, 0).submit_timeouts, 0);
+    }
+
+    #[test]
+    fn borrowed_encoder_client_delegates_submission_polling_and_cancellation() {
+        let mut encoder = FakeEncoder::default();
+        {
+            let mut queue = MediaAdmission::new(EmbeddingCache::new(8), &mut encoder, 1);
+            queue.enqueue(waiter(1, &[1], 0)).unwrap();
+            drop(ready(queue.poll(|_| false)));
+            queue.enqueue(waiter(2, &[2], 0)).unwrap();
+        }
+        assert_eq!((encoder.submitted, encoder.cancelled, encoder.pending()), (2, 1, 0));
+    }
+
+    #[test]
+    fn aged_completed_encode_is_accepted_before_timeout() {
+        let mut queue = MediaAdmission::new(EmbeddingCache::new(8), FakeEncoder::default(), 1);
+        queue.enqueue(waiter(1, &[1], 0)).unwrap();
+        for flight in queue.flights.values_mut() {
+            flight.submitted_at = Some(Instant::now() - Duration::from_secs(61));
+        }
+        assert_eq!(*ready(queue.poll(|_| false)).job(), 1);
+        assert_eq!(queue.encoder().cancelled, 0);
+        assert_eq!(queue.stats(0, 0).encode_timeouts, 0);
+    }
+
+    #[test]
+    fn encode_timeout_cancels_shared_ticket_and_preserves_first_error() {
+        let mut encoder = FakeEncoder::default();
+        encoder.delay_polls = usize::MAX;
+        let mut queue = MediaAdmission::new(EmbeddingCache::new(8), encoder, 3);
+        queue.set_encode_timeout(Duration::from_secs(60));
+        for id in 1..=3 { queue.enqueue(waiter(id, &[1], 0)).unwrap(); }
+        queue.pending[0].error = Some(MediaError::Encoder("first error".into()));
+        for flight in queue.flights.values_mut() {
+            flight.submitted_at = Some(Instant::now() - Duration::from_secs(61));
+        }
+        for (id, message) in [(1, "first error"), (2, "encode timed out"), (3, "encode timed out")] {
+            match queue.poll(|_| false) {
+                MediaPoll::Failed(job, MediaError::Encoder(error)) => assert_eq!((job, error.as_str()), (id, message)),
+                other => panic!("expected encoder timeout, got {other:?}"),
+            }
+        }
+        assert_eq!(queue.encoder().cancelled, 1);
+        assert_eq!(queue.stats(0, 0).encode_timeouts, 1);
+        assert_eq!(queue.cache.bytes(), 0);
+        assert!(matches!(queue.poll(|_| false), MediaPoll::Empty));
+        assert_eq!(queue.encoder().cancelled, 1);
+    }
+
+    #[test]
+    fn delayed_poll_retries_submission_before_expiring_the_waiter() {
+        let mut queue = MediaAdmission::new(EmbeddingCache::new(8), SaturatedEncoder::new(1), 1);
+        queue.enqueue(waiter(1, &[1], 0)).unwrap();
+        for flight in queue.flights.values_mut() {
+            flight.queued_at = Instant::now() - Duration::from_secs(61);
+        }
+        assert!(matches!(queue.poll(|_| false), MediaPoll::Pending));
+        assert_eq!(queue.encoder().inner.submitted, 1);
+        assert_eq!(queue.stats(0, 0).submit_timeouts, 0);
+        assert_eq!(*ready(queue.poll(|_| false)).job(), 1);
+        assert_eq!(queue.stats(0, 0).submit_waits, 1);
+    }
+
+    #[test]
+    fn unsubmitted_waiter_times_out_once_and_cancellation_wins() {
+        let mut queue = MediaAdmission::new(EmbeddingCache::new(32), SaturatedEncoder::new(usize::MAX), 2);
+        queue.set_submit_timeout(Duration::from_secs(60));
+        queue.enqueue(waiter(1, &[1, 2, 3, 4], 0)).unwrap();
+        assert!(matches!(queue.poll(|_| false), MediaPoll::Pending));
+        for flight in queue.flights.values_mut() {
+            flight.queued_at = Instant::now() - Duration::from_secs(61);
+        }
+        assert!(matches!(queue.poll(|_| false), MediaPoll::Failed(1, MediaError::QueueFull)));
+        assert_eq!(queue.cache.bytes(), 0);
+        assert_eq!(queue.stats(0, 0).submit_waits, 1);
+        assert_eq!(queue.stats(0, 0).submit_timeouts, 1);
+        assert!(matches!(queue.poll(|_| false), MediaPoll::Empty));
+        assert_eq!(queue.stats(0, 0).submit_timeouts, 1);
+        queue.enqueue(waiter(2, &[1], 0)).unwrap();
+        queue.set_submit_timeout(Duration::ZERO);
+        assert!(matches!(queue.poll(|_| true), MediaPoll::Empty));
+        assert_eq!(queue.stats(0, 0).submit_timeouts, 1);
+        assert_eq!(queue.cache.bytes(), 0);
+    }
+
+    #[test]
+    fn unsubmitted_keys_cancel_and_drop_without_encoder_cancellation() {
+        let mut queue = MediaAdmission::new(EmbeddingCache::new(32), SaturatedEncoder::new(1), 1);
+        queue.enqueue(waiter(1, &[1, 2, 3, 4], 0)).unwrap();
+        assert!(matches!(queue.poll(|_| true), MediaPoll::Empty));
+        assert_eq!(queue.cache.bytes(), 0);
+        assert_eq!(queue.encoder().inner.submitted, 0);
+        let cancellations = Arc::clone(&queue.encoder().cancellations);
+        queue.encoder_mut().full_submits = 1;
+        queue.enqueue(waiter(2, &[1, 2, 3, 4], 0)).unwrap();
+        drop(queue);
+        assert_eq!(cancellations.load(std::sync::atomic::Ordering::Relaxed), 0);
+        let mut queue = MediaAdmission::new(EmbeddingCache::new(32), SaturatedEncoder::new(0), 1);
+        queue.enqueue(waiter(3, &[1, 2, 3, 4], 0)).unwrap();
+        let cancellations = Arc::clone(&queue.encoder().cancellations);
+        drop(queue);
+        assert_eq!(cancellations.load(std::sync::atomic::Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn retry_submit_errors_other_than_queue_full_fail_and_release_reservations() {
+        let mut queue = MediaAdmission::new(EmbeddingCache::new(32), SaturatedEncoder::new(1), 1);
+        queue.enqueue(waiter(1, &[1, 2, 3, 4], 0)).unwrap();
+        queue.encoder_mut().fail_submit = true;
+        assert!(matches!(queue.poll(|_| false), MediaPoll::Failed(1, MediaError::Encoder(_))));
+        assert_eq!(queue.cache.bytes(), 0);
+        assert_eq!(queue.encoder().inner.submitted, 0);
+        assert!(queue.flights.is_empty());
+        assert!(matches!(queue.enqueue(waiter(2, &[1], 0)), Err((_, MediaError::Encoder(_)))));
+        assert_eq!(queue.cache.bytes(), 0);
+    }
+
     #[test]
     fn audio_cache_dedupes_content_without_aliasing_images_and_reencodes_exactly() {
         use crate::media::{AudioKey, MediaKeys, verify_media};
