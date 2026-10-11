@@ -148,6 +148,7 @@ fn start(mut args: crate::cli::NativeServeArgs, http: bool) -> Result<Started> {
     if args.pool_tokens == Some(0) && args.memory_reservation.is_none() {
         args.memory_reservation = Some("97%".parse()?);
     }
+    ensure!((0.0..1.0).contains(&args.decode_share), "--decode-share must be in [0, 1)");
     args.host_cache_config()?;
     // The golden runs the worker without the API, so it loads no keyed policy.
     let api = if http { Some(args.api.load()?) } else { None };
