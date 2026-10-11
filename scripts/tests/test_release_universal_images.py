@@ -136,9 +136,12 @@ release_spark_tp_roles_canonical "$1" CUTEAFD_RELEASE_SPARK_TP_ROLES
 
 def test_role_allowlist_and_comparison_each_exist_once():
     text = BUILD.read_text(encoding="utf-8")
-    assert text.count("release_spark_tp_roles_canonical() {") == 1
-    # A second inline `case` would be a second allowlist free to drift.
-    assert len(re.findall(r"tp2\|tp3\|tp6\)", text)) == 1
+    common = RELEASE_COMMON.read_text(encoding="utf-8")
+    assert common.count("release_spark_tp_roles_canonical() {") == 1
+    assert "release_spark_tp_roles_canonical() {" not in text
+    assert 'release_universal_spark_tp_roles="$(release_spark_tp_roles_default)"' in text
+    # Release and WIP use the same allowlist rather than copies that can drift.
+    assert len(re.findall(r"tp2\|tp3\|tp6\)", common)) == 1
     assert '*";$spark_tp_roles;"*' not in text, "substring role comparison is back"
 
 

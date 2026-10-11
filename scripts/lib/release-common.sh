@@ -1060,6 +1060,34 @@ release_spark_values() {
 # tp_rank = rank % TP.
 # ---------------------------------------------------------------------------
 
+# Release and WIP must advertise the same compiled extra Spark roles. TP4 is
+# built separately; keep the qualified default until new roles have exports.
+release_spark_tp_roles_default() {
+  printf '%s\n' 'tp2;tp3;tp6'
+}
+
+release_spark_tp_roles_canonical() {
+  local raw="$1" source_name="${2:-CUTEAFD_RELEASE_SPARK_TP_ROLES}"
+  local entry prior
+  local -a parts=() selected=()
+  [[ -n "$raw" ]] || return 0
+  [[ "$raw" != *";;"* && "$raw" != ";"* && "$raw" != *";" && "$raw" != *$'\n'* ]] ||
+    release_die "$source_name is not a ';'-separated role list: $raw"
+  IFS=';' read -ra parts <<<"$raw"
+  for entry in "${parts[@]}"; do
+    case "$entry" in
+      tp2|tp3|tp6) ;;
+      *) release_die "$source_name accepts only tp2, tp3 and tp6, got: $entry" ;;
+    esac
+    for prior in ${selected[@]+"${selected[@]}"}; do
+      [[ "$prior" != "$entry" ]] ||
+        release_die "$source_name lists $entry more than once"
+    done
+    selected+=("$entry")
+  done
+  printf '%s\n' "${selected[@]}" | sort | paste -sd';' -
+}
+
 release_spark_topology_explicit() {
   [[ -n "$SPARK_TP" || -n "$SPARK_EP" ]]
 }
