@@ -101,22 +101,38 @@ impl<'a> Exl3Tp2<'a> {
         max_rows: usize,
         budgets: [usize; 2],
     ) -> Result<[Self; 2]> {
+        Self::load_pair_with_packages(devices, catalog, expert_geometry(), [package; 2],
+            layers, max_rows, budgets)
+    }
+
+    /// Rank-specific exports support unequal complete-H128 partitions (Qwen 384/256).
+    pub(crate) fn load_pair_with_packages(
+        devices: [Device<'a>; 2],
+        catalog: &cuteafd_loader::OfficialV41Catalog,
+        geometry: ExpertGeometry,
+        packages: [&Path; 2],
+        layers: Range<usize>,
+        max_rows: usize,
+        budgets: [usize; 2],
+    ) -> Result<[Self; 2]> {
         let label = format!("experts/TP2 expert layer halves {}..{}", layers.start, layers.end);
         let _memory_scope = cuteafd_ffi::memory_ledger::scope_owned(&label);
         validate_layers(&layers, 0)?;
+        ensure!(geometry == expert_geometry(), "EXL3 TP2 geometry differs from native process geometry");
         ensure!(
             devices[0].id != devices[1].id && std::ptr::eq(devices[0].library, devices[1].library),
             "invalid EXL3 TP2 device pair"
         );
-        let geometry = expert_geometry();
-        let workspace_bytes =
-            Self::workspace_bytes_for(package, geometry.hidden as usize, max_rows)?;
+        let workspace_bytes = [
+            Self::workspace_bytes_for(packages[0], geometry.hidden as usize, max_rows)?,
+            Self::workspace_bytes_for(packages[1], geometry.hidden as usize, max_rows)?,
+        ];
         let mut remaining = [0; 2];
         for rank in 0..2 {
             remaining[rank] = budgets[rank]
-                .checked_sub(workspace_bytes)
+                .checked_sub(workspace_bytes[rank])
                 .context("EXL3 TP2 workspace exceeds budget")?;
-            let mut used = workspace_bytes;
+            let mut used = workspace_bytes[rank];
             for layer in layers.clone() {
                 let plan = Exl3Weights::plan(catalog, ExpertLayer::BackboneTp2 { layer, rank })?;
                 used = used
@@ -138,7 +154,7 @@ impl<'a> Exl3Tp2<'a> {
                 layers: layers.clone(),
                 geometry,
                 max_rows,
-                workspace_bytes,
+                workspace_bytes: workspace_bytes[0],
                 executions: None,
                 weights: devices[0].own(|| Ok(Rc::new(Vec::with_capacity(layers.len()))))?,
                 output: None,
@@ -150,7 +166,7 @@ impl<'a> Exl3Tp2<'a> {
                 layers: layers.clone(),
                 geometry,
                 max_rows,
-                workspace_bytes,
+                workspace_bytes: workspace_bytes[1],
                 executions: None,
                 weights: devices[1].own(|| Ok(Rc::new(Vec::with_capacity(layers.len()))))?,
                 output: None,
@@ -187,8 +203,8 @@ impl<'a> Exl3Tp2<'a> {
             }
             ranks
         };
-        let paths = directories(package, max_rows)?;
-        for rank in &mut ranks {
+        for (index, rank) in ranks.iter_mut().enumerate() {
+            let paths = directories(packages[index], max_rows)?;
             rank.executions = Some(rank.device.own(|| {
                 let arena = Exl3Workspace::new(rank.device.library, &paths)?;
                 paths

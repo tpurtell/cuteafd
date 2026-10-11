@@ -476,10 +476,15 @@ class PackageProfileTests(unittest.TestCase):
                           for c in (1024, 4096)], [False, False, False, False, False, True])
 
     def test_qwen4_uneven_blocks_and_route_policy(self):
-        """Qwen's 640 intermediate is five H128 blocks: no dual-RTX halves, the
-        first Spark ranks own the extra block, 32-row route blocks above m80."""
-        coordinator = [name for name, *_ in package.shard_profiles('qwen4', 'coordinator')]
-        self.assertEqual(coordinator, ['rtx-tp1'])
+        """Qwen's five H128 blocks use native unequal TP2 and Spark shards."""
+        coordinator = {name: (width, dest) for name, width, _, _, _, dest
+                       in package.shard_profiles('qwen4', 'coordinator')}
+        self.assertEqual(coordinator, {'rtx-tp1': (640, ['rtx-tp1']),
+                                      'rtx-tp2-rank0': (384, ['rtx-tp2-rank0']),
+                                      'rtx-tp2-rank1': (256, ['rtx-tp2-rank1'])})
+        self.assertEqual(package.parse_requested_layouts(['rtx-tp2-rank0', 'rtx-tp2-rank1'],
+                                                        'coordinator', 'qwen4'),
+                         ['rtx-tp2-rank0', 'rtx-tp2-rank1'])
         spark = {name: (width, dest) for name, width, _, _, _, dest in package.shard_profiles('qwen4', 'spark')}
         self.assertEqual(spark['tp1-width640'], (640, ['tp1-rank0']))
         tp1 = next(p for p in package.shard_profiles('qwen4', 'spark') if p[0] == 'tp1-width640')
@@ -494,6 +499,19 @@ class PackageProfileTests(unittest.TestCase):
         self.assertEqual([package.route_block('qwen4', c) for c in (1, 16, 80, 256, 1024, 4096)],
                          [8, 8, 8, 32, 32, 32])
         self.assertIsNone(package.swiglu_limit('qwen4'))
+
+    def test_qwen4_coordinator_requires_both_native_tp2_widths(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            output, manifest, calls, capacities = self.build_fixture(
+                Path(temporary), 'coordinator', (4, 5),
+                require=['rtx-tp2-rank0', 'rtx-tp2-rank1'], geometry='qwen4')
+            for rank, width in enumerate((384, 256)):
+                variants = [v for v in manifest['variants']
+                            if v['directory'].startswith(f'rtx-tp2-rank{rank}/')]
+                self.assertEqual({v['capacity'] for v in variants}, set(capacities))
+                self.assertTrue(all(v['intermediate'] == width and v['output_dtype'] == 'fp32'
+                                    for v in variants))
+            package.verify(output)
 
     def test_verify_cross_checks_the_recorded_route_block(self):
         """A variant's route block must be the one its export compiled."""
