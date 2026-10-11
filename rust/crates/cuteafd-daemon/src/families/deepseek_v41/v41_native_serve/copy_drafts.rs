@@ -2,8 +2,6 @@
 
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
-pub(super) use crate::shared::speculation::copy::{LatestWindow as CopyDrafter, cap, merge, WINDOW, MIN_DRAFTS};
-
 /// Opt-in: copy-heavy edits gain, but normal C1 misses the no-regression bar.
 pub(super) fn enabled() -> bool {
     std::env::var("CUTEAFD_COPY_DRAFTS").is_ok_and(|value| value == "1")

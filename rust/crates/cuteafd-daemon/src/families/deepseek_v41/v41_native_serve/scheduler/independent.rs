@@ -99,7 +99,7 @@ async fn lane<'a, P: VerificationTarget<'a>, C: DraftChain<'a>>(lane: usize, lib
             } };
             // The polled draft times itself from issue to completion.
             if !drafting.is_empty() { clock.drafted_us(draft_us); }
-            let mut inputs = copy_drafts::merge(copies, drafted)?;
+            let mut inputs = crate::shared::speculation::copy::merge(copies, drafted)?;
             let proposal = console::Proposal::capture(&inputs, console::live());
             let shared = active.borrow().iter().flatten().any(|r| r.lane != lane);
             let (inputs, mut batch, capture_routes) = {
