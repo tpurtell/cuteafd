@@ -92,6 +92,16 @@ def digest(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def capacity_scratch(programs: list[dict]) -> list[dict]:
+    """Match the static ABI reservation across every retained prefill form."""
+    scratch = {}
+    for program in programs:
+        capacity = program["capacity"]
+        scratch[capacity] = max(scratch.get(capacity, 0), program["scratch"])
+    return [{"capacity": capacity, "scratch_bytes": scratch[capacity]}
+            for capacity in sorted(scratch)]
+
+
 def bridge_source(programs: list[dict], info: list[int]) -> str:
     includes = "\n".join(f'#include "{p["stem"]}.h"' for p in programs)
     rows = ",\n".join(
@@ -348,8 +358,7 @@ def build(args: argparse.Namespace) -> None:
                 "tp": tp, "hidden": g.hidden, "slice": g.slice, "experts": g.experts, "top_k": g.top_k,
                 "intermediate": g.intermediate, "swiglu_limit": g.swiglu_limit, "input": "wire" if wire else "bf16",
                 "weights": g.weights,
-                "capacities": [{"capacity": p["capacity"], "scratch_bytes": p["scratch"]} for p in programs
-                               if p["form"] == "auto"],
+                "capacities": capacity_scratch(programs),
                 "prefill_forms": {form: [p["capacity"] for p in programs if p["form"] == form]
                                   for form in FORMS[1:]}}
         manifest["files"] = {str(p.relative_to(stage)): {"bytes": p.stat().st_size, "sha256": digest(p)}
