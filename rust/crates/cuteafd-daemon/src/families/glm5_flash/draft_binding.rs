@@ -85,25 +85,6 @@ fn spark_class() -> ResourceClass {
 /// beats them by this ratio.
 const REFERENCE_MARGIN: f64 = 1.02;
 
-/// Which verify-length policy GLM Flash runs (`CUTEAFD_GLMF_DRAFT_POLICY`):
-/// `cycle` keeps the `CycleCost` table fit; `shared` is the resource-priced
-/// core with this binding.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum PolicyKind { Cycle, Shared }
-
-impl PolicyKind {
-    pub fn from_env() -> Result<Self> {
-        Self::parse(std::env::var("CUTEAFD_GLMF_DRAFT_POLICY").ok().as_deref())
-    }
-    fn parse(value: Option<&str>) -> Result<Self> {
-        match value.map(str::trim) {
-            None | Some("" | "cycle") => Ok(Self::Cycle),
-            Some("shared") => Ok(Self::Shared),
-            Some(other) => anyhow::bail!("CUTEAFD_GLMF_DRAFT_POLICY must be cycle or shared, got {other:?}"),
-        }
-    }
-}
-
 /// Where a layer's routed experts run and what one device reads per expert.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) enum LayerHome {
@@ -294,6 +275,57 @@ pub(crate) fn select(policy: &mut DraftPolicy, candidates: &[Candidate<'_>], wid
     Selection { lengths, predicted }
 }
 
+/// Inputs retained inside a round; expensive diagnostics run only after its
+/// clock closes, before the policy learns from the observed outcome.
+pub(crate) struct DecisionTrace {
+    requests: Vec<(u64, Vec<f64>, usize, bool, bool)>,
+    width: usize,
+    max_rows: usize,
+    selection: Selection,
+}
+
+impl DecisionTrace {
+    pub fn capture(candidates: &[Candidate<'_>], width: usize, max_rows: usize, selection: &Selection) -> Self {
+        Self { requests: candidates.iter().map(|c| (c.id, c.prior.to_vec(), c.limit, c.selector, c.cold)).collect(),
+            width, max_rows, selection: Selection { lengths: selection.lengths.clone(), predicted: selection.predicted } }
+    }
+    pub fn evaluate(self, policy: &mut DraftPolicy) -> serde_json::Value {
+        let candidates: Vec<_> = self.requests.iter().map(|&(id, ref prior, limit, selector, cold)|
+            Candidate { id, prior, limit, selector, cold }).collect();
+        decision_trace(policy, &candidates, self.width, self.max_rows, &self.selection)
+    }
+}
+
+/// Opt-in decision diagnostic: vary each request's length with the other
+/// requests held at their chosen lengths. At C1 this enumerates every shape.
+/// Call only when tracing is enabled; evaluations do not train the policy.
+pub(crate) fn decision_trace(policy: &mut DraftPolicy, candidates: &[Candidate<'_>], width: usize,
+    max_rows: usize, selection: &Selection) -> serde_json::Value {
+    let cores: Vec<_> = candidates.iter().map(|c| DraftCandidate { id: c.id,
+        confidence: &c.prior[..c.prior.len().min(c.limit).min(policy.geometry().max_positions)] }).collect();
+    let requests: Vec<_> = cores.iter().enumerate().map(|(i, c)| {
+        let probabilities = policy.probabilities(*c);
+        let cold_request = candidates[i].cold;
+        let others = candidates.len() + selection.lengths.iter().sum::<usize>() - selection.lengths[i];
+        let available = c.confidence.len().min(max_rows.saturating_sub(others));
+        let candidates: Vec<_> = (0..=available).map(|length| {
+            let mut lengths = selection.lengths.clone();
+            lengths[i] = length;
+            let prediction = policy.diagnostic_evaluate(false, &cores, &lengths, width);
+            serde_json::json!({"length": length, "expected_tokens": prediction.map(|p| p.0),
+                "predicted_us": prediction.map(|p| p.1)})
+        }).collect();
+        serde_json::json!({"id": c.id, "prior": c.confidence, "calibrated": probabilities,
+            "chosen": selection.lengths[i], "cold_request": cold_request, "candidates": candidates})
+    }).collect();
+    let cost = policy.cost_snapshot(false);
+    serde_json::json!({"engaged": policy.engaged(false), "requests": requests,
+        "chosen": selection.lengths, "predicted_us": selection.predicted,
+        "corrections": policy.corrections(false), "platt": policy.calibration(),
+        "position_reached": policy.stats().position_reached,
+        "cost": {"layers": cost.layers, "round": cost.round, "draft": cost.draft}})
+}
+
 /// Trims the longest drafts one row at a time until every request's anchor
 /// and drafts fit `max_rows`; true when it trimmed.
 fn fit_budget(lengths: &mut [usize], max_rows: usize) -> bool {
@@ -424,14 +456,6 @@ mod tests {
     }
 
     #[test]
-    fn policy_kind_defaults_to_cycle_and_rejects_unknown_values() {
-        assert_eq!(PolicyKind::parse(None).unwrap(), PolicyKind::Cycle);
-        assert_eq!(PolicyKind::parse(Some("cycle")).unwrap(), PolicyKind::Cycle);
-        assert_eq!(PolicyKind::parse(Some("shared")).unwrap(), PolicyKind::Shared);
-        assert!(PolicyKind::parse(Some("buckets")).is_err());
-    }
-
-    #[test]
     fn geometry_has_dense_layers_without_class_and_one_class_per_home() {
         let g = geometry(&homes(true), 288, 8, 64, 7, 0).unwrap();
         DraftPolicy::new(g.clone(), false).unwrap();
@@ -498,6 +522,42 @@ mod tests {
         assert_eq!(select(&mut policy, &cold, 7, 64).lengths, vec![5]);
         let head = [Candidate { id: 9, prior: &[0.01; 7], limit: 7, selector: false, cold: true }];
         assert_eq!(select(&mut policy, &head, 7, 64).lengths, vec![0]);
+    }
+
+    #[test]
+    fn decision_trace_enumerates_c1_lengths_without_training_or_changing_selection() {
+        let mut policy = warm_policy(true);
+        let candidate = [Candidate { id: 4, prior: &[0.6; 7], limit: 6, selector: true, cold: false }];
+        let chosen = select(&mut policy, &candidate, 7, 64);
+        let before = policy.stats().clone();
+        let trace = DecisionTrace::capture(&candidate, 7, 64, &chosen).evaluate(&mut policy);
+        assert_eq!(trace["requests"][0]["candidates"].as_array().unwrap().len(), 7);
+        assert_eq!(trace["requests"][0]["calibrated"].as_array().unwrap().len(), 6);
+        assert_eq!(trace["requests"][0]["chosen"], chosen.lengths[0]);
+        let cost = policy.cost_snapshot(false);
+        assert_eq!(trace["cost"]["round"], serde_json::json!(cost.round));
+        assert_eq!(trace["cost"]["layers"], serde_json::json!(cost.layers));
+        assert_eq!(trace["cost"]["draft"], serde_json::json!(cost.draft));
+        assert_eq!(*policy.stats(), before);
+        let after = select(&mut policy, &candidate, 7, 64);
+        assert_eq!((after.lengths, after.predicted), (chosen.lengths, chosen.predicted));
+    }
+
+    #[test]
+    fn cold_decision_trace_exposes_seed_prices_without_engaging_policy() {
+        let mut policy = DraftPolicy::seeded(geometry(&homes(true), 288, 8, 64, 7, 0).unwrap(), seed()).unwrap();
+        let candidate = [Candidate { id: 4, prior: &[0.6; 7], limit: 7, selector: true, cold: true }];
+        let chosen = select(&mut policy, &candidate, 7, 64);
+        assert!(chosen.predicted.is_none());
+        let trace = decision_trace(&mut policy, &candidate, 7, 64, &chosen);
+        assert_eq!(trace["engaged"], false);
+        assert_eq!(trace["requests"][0]["cold_request"], true);
+        let prices = trace["requests"][0]["candidates"].as_array().unwrap();
+        assert_eq!(prices.len(), 8);
+        assert!(prices.iter().all(|p| p["predicted_us"].as_f64().is_some_and(|us| us > 0.)));
+        assert!(!policy.engaged(false));
+        assert_eq!(policy.stats().rounds, 0);
+        assert_eq!(select(&mut policy, &candidate, 7, 64).lengths, chosen.lengths);
     }
 
     #[test]

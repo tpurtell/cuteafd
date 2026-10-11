@@ -318,7 +318,6 @@ pub(crate) struct DsparkDrafter<'a> {
     /// How the FP8 GEMMs run (--draft-linear), and the latest mode the FP8 scratch serves.
     fp8_rows: Cell<fp8_linear::Fp8Rows>,
     fp8_admitted: fp8_linear::Fp8Rows,
-    confidence_scales: fp8_linear::Fp8Scales,
 }
 
 fn at(dev: &Dev<'_>, bytes: usize) -> *mut c_void {
@@ -332,14 +331,6 @@ fn bytes_of<T: Copy>(values: &[T]) -> &[u8] {
 }
 
 impl<'a> DsparkDrafter<'a> {
-    pub fn confidence_policy(&self, family: &str, fp8_head: bool) -> Result<crate::shared::draft_confidence::ConfidencePolicy> {
-        let head = if fp8_head { "head-fp8-row".into() } else { format!("head-bf16-{:?}", self.head_mode.get()) };
-        let numerics = format!("{}-{:?}-{head}-{:?}-r1", self.representation.name(), self.fp8_rows.get(),
-            self.confidence_scales).to_ascii_lowercase();
-        // dSpark supplies a trained confidence head, not top-16 selector features.
-        crate::shared::draft_confidence::ConfidencePolicy::history(format!("{family}/dspark/{numerics}"))
-    }
-
     /// Uploads the drafter's tensors (see [`prefetch`]) and allocates `slots`
     /// ring contexts; draft steps take up to `max_sequences` sequences.
     /// `mask_row` is the target embedding of the mask token; `fp8_rows` how the
@@ -459,7 +450,6 @@ impl<'a> DsparkDrafter<'a> {
             mask_row,
             workspace: RefCell::new(None),
             representation,
-            confidence_scales: scales,
             fp8_workspace,
             head_mode: Cell::new(DraftHead::Exact),
             fp8_rows: Cell::new(fp8_rows),
@@ -784,13 +774,6 @@ pub(crate) enum Drafter<'a> {
 }
 
 impl<'a> Drafter<'a> {
-    pub fn confidence_policy(&self, fp8_head: bool) -> Result<crate::shared::draft_confidence::ConfidencePolicy> {
-        match self {
-            Self::Dflash2(d) => d.confidence_policy("glm5_flash", fp8_head),
-            Self::Dspark(d) => d.confidence_policy("glm5_flash", fp8_head),
-        }
-    }
-
     /// The shared draft policy's prior: DFlash2's keyed selector fit, or the
     /// dSpark confidence head blended with the history rate.
     pub fn draft_prior(&self, fp8_head: bool) -> Result<super::draft_binding::Prior> {
