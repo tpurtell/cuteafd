@@ -177,7 +177,7 @@ impl<'w, 'a> DistributedDsparkChain<'w, 'a> {
                 drop(pending);
             }
             drained
-        }) { tracing::error!(%error, "draining cancelled distributed draft"); }
+        }) { fatal_drain(Err(error), "cancelled distributed draft"); }
         self.ready = None;
     }
     pub fn output(&self) -> Result<[CuteafdDeviceBuffer; 3]> {
