@@ -138,6 +138,30 @@ pub enum Slicing {
     Blocks(usize),
 }
 
+/// Use unequal whole-H128 slices only when every rank's width is packaged.
+/// The planner and worker must inspect the same package tree; an incomplete
+/// tree or CUTEAFD_FP8_EXACT_SLICES=0 retains the legacy padded layout.
+pub fn exact_layout_directory(directory: &Path, tensors: &Fp8ExpertTensors, tp: usize,
+    rank: usize) -> (PathBuf, Slicing) {
+    exact_layout_directory_with(directory, tensors, tp, rank,
+        std::env::var("CUTEAFD_FP8_EXACT_SLICES").as_deref() != Ok("0"))
+}
+
+fn exact_layout_directory_with(directory: &Path, tensors: &Fp8ExpertTensors, tp: usize,
+    rank: usize, enabled: bool) -> (PathBuf, Slicing) {
+    let padded = (directory.to_path_buf(), Slicing::Padded);
+    if !enabled || tp < 2 || rank >= tp { return padded; }
+    let (Some(package), Some(layout)) = (directory.parent(), directory.file_name().and_then(|name| name.to_str()))
+        else { return padded; };
+    let exact = Slicing::Blocks(128);
+    let paths = (0..tp).map(|rank| tensors.rank_width(tp, rank, exact).ok()
+        .map(|width| package.join(format!("{layout}-w{width}")))).collect::<Option<Vec<_>>>();
+    match paths {
+        Some(paths) if paths.iter().all(|path| path.is_dir()) => (paths[rank].clone(), exact),
+        _ => padded,
+    }
+}
+
 impl Fp8ExpertTensors {
     pub fn name(&self, layer: usize, expert: usize, projection: Fp8Projection) -> String {
         if self.mtp_layers && layer >= self.shape.layers {
@@ -772,6 +796,35 @@ mod tests {
         assert_eq!(mxfp4.slice(6).unwrap(), 384);
         assert_eq!(ranges(&mxfp4, 6), [(0, 352), (352, 352), (704, 352), (1056, 352), (1408, 320), (1728, 320)]);
         assert_eq!(mxfp4.slice(2).unwrap(), 1024);
+    }
+
+    #[test]
+    fn package_selection_requires_every_rank_width_and_honors_opt_out() {
+        for format in [ExpertFormat::Fp8Block128, ExpertFormat::Mxfp4, ExpertFormat::Nvfp4] {
+            let tensors = catalog(format, 2048);
+            let dir = tempfile::tempdir().unwrap();
+            let padded = dir.path().join("tp6");
+            std::fs::create_dir(&padded).unwrap();
+            for rank in 0..6 {
+                assert_eq!(exact_layout_directory_with(&padded, &tensors, 6, rank, true),
+                    (padded.clone(), Slicing::Padded));
+            }
+            std::fs::create_dir(dir.path().join("tp6-w384")).unwrap();
+            assert_eq!(exact_layout_directory_with(&padded, &tensors, 6, 0, true),
+                (padded.clone(), Slicing::Padded));
+            std::fs::create_dir(dir.path().join("tp6-w256")).unwrap();
+            for rank in 0..6 {
+                let width = tensors.rank_width(6, rank, Slicing::Blocks(128)).unwrap();
+                assert_eq!(exact_layout_directory_with(&padded, &tensors, 6, rank, true),
+                    (dir.path().join(format!("tp6-w{width}")), Slicing::Blocks(128)));
+                assert_eq!(exact_layout_directory_with(&padded, &tensors, 6, rank, false),
+                    (padded.clone(), Slicing::Padded));
+            }
+            assert_eq!(exact_layout_directory_with(&padded, &tensors, 6, 6, true),
+                (padded.clone(), Slicing::Padded));
+            assert_eq!(exact_layout_directory_with(&padded, &tensors, 1, 0, true),
+                (padded, Slicing::Padded));
+        }
     }
 
     #[test]
