@@ -154,7 +154,7 @@ fn projection_slots<'a>(plan: &'a [Projection], mut bytes: &'a mut [u8])
     Ok(slots)
 }
 
-fn read_jobs<T: Send>(jobs: Vec<T>, workers: usize,
+pub(crate) fn read_jobs<T: Send>(jobs: Vec<T>, workers: usize,
     read: impl Fn(T) -> Result<usize> + Sync) -> Result<usize> {
     use std::sync::Mutex;
     let workers = workers.min(jobs.len());

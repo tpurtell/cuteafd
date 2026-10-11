@@ -166,6 +166,13 @@ def test_catalog_includes_all_geometries_and_fused_suspects():
     assert len(names) == len(set(names))
     assert set(compare_sm.GEOMETRIES) <= set(names)
     assert {f"routed-{name}" for name in compare_sm.ROUTED_GEOMETRIES} <= set(names)
+    for geometry in compare_sm.ROUTED_GEOMETRIES:
+        if geometry.startswith("glmfdense"):
+            assert f"routed-{geometry}-tp2" not in names
+            continue
+        args = next(args for name, _, args in jobs if name == f"routed-{geometry}-tp2")
+        assert args[args.index("--layouts") + 1] == "tp2"
+        assert "--exact-slices" in args
     assert {f"exl3-{name}" for name in compare_sm.EXL3_GEOMETRIES} <= set(names)
     assert {"v41-fp8", "v41-experts", "v41-index", "v41-router", "v41-attention"} <= set(names)
     assert {"suspect-flash-m1", "suspect-flash-m16", "suspect-glm-mla", "suspect-glmf-mla"} <= set(names)
