@@ -187,7 +187,7 @@ pub fn request(inputs: &GlmInputs<'_>) -> Result<PlacementRequest, PlacementErro
         layers_first_gpu: 0,
         context_buffers: ContextBuffers { staging_unit_bytes: PAGE_ROWS * 788, staging_unit_rows: PAGE_ROWS,
             query_row_bytes: 36_864, partial_row_bytes: 32_896, candidate_row_bytes: cfg.index_topk as u64 * 8,
-            compiled_extent: inputs.max_context, decode_rows: DECODE_ROWS, lanes: inputs.prefill_lanes },
+            compiled_extent: inputs.max_context, decode_rows: DECODE_ROWS, lanes: 1 },
         inventory: Inventory { gpus: inputs.gpus.iter().map(|&(capacity_bytes, baseline)| GpuBudget {
             capacity_bytes, baseline, headroom_bytes: inputs.headroom_bytes }).collect(),
             spark_ranks: inputs.spark_ranks, peer_access: gpus == 2 },
@@ -324,6 +324,9 @@ mod tests {
             assert_eq!(halves[0] + halves[1], demand.kv_unit.unit_bytes_whole);
             assert_eq!(demand.colocate, Some(cfg.index_source(layer) as u16));
         }
+        assert_eq!(r.context_buffers.lanes, 1, "prefill gathers do not use the context exchange");
+        assert_eq!(r.context_buffers.decode_rows, DECODE_ROWS);
+        assert_eq!(r.hops.lanes, 3, "prefill lane ownership is unchanged");
         assert_eq!(r.executor.attention_default(), AttentionPlacement::Heads);
         let mut context = r;
         context.attention_placement = Some(AttentionPlacement::Context);
