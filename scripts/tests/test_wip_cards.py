@@ -303,6 +303,48 @@ def test_pool_precheck_and_red_square():
     assert cards.struct.unpack('>II', png[16:24]) == (224, 224)
 
 
+def test_spark_native_phase_holds_lock_without_locking_cargo(tmp_path):
+    text = (ROOT / 'wip.sh').read_text()
+    function = text[text.index('build_expert() ('):text.index('\ncase "$role" in', text.index('build_expert() ('))]
+    tools = tmp_path / 'tools'
+    tools.mkdir()
+    for name, script in {
+        'ssh': '#!/bin/sh\nprintf "ssh %s\\n" "$*" >> "$TRACE"\nprintf "image-id\\n"\n',
+        'flock': '#!/bin/sh\nprintf "flock %s\\n" "$*" >> "$TRACE"\n',
+    }.items():
+        path = tools / name
+        path.write_text(script)
+        path.chmod(0o755)
+    home = tmp_path / 'home'
+    (home / '.cache/cuteafd').mkdir(parents=True)
+    trace = tmp_path / 'trace'
+    setup = '''set -euo pipefail
+sync_seed_source() { :; }
+release_die() { exit 2; }
+slot=test seed_host=rhea spark_container=owned SPARK_EXPERT_DOCKER_DEV=image
+wip_spark_tp_roles='tp3;tp6' bf16_families= audio_aot=OFF
+CUTEAFD_WIP_EXPORT_LOCKS=on wip_export_locks=on
+'''
+    subprocess.run(['bash', '-c', setup + function + '\nbuild_expert'], check=True,
+                   env={**os.environ, 'HOME': str(home), 'PATH': str(tools) + ':' + os.environ['PATH'], 'TRACE': str(trace)})
+    lines = trace.read_text().splitlines()
+    rust = next(i for i, line in enumerate(lines) if line.endswith('/wip/output/expert rust'))
+    lock = next(i for i, line in enumerate(lines) if line.startswith('flock -w 1800'))
+    native = next(i for i, line in enumerate(lines) if line.endswith('/wip/output/expert native'))
+    finalize = next(i for i, line in enumerate(lines) if 'finalize-wip-slot.sh' in line)
+    assert rust < lock < native < finalize
+    assert subprocess.run(['flock', '-n', str(home / '.cache/cuteafd/rhea.lock'), 'true']).returncode == 0
+
+
+def test_split_native_phase_requires_matching_rust_source_and_cache_mode():
+    text = (ROOT / 'scripts/build/build-wip-artifacts.sh').read_text()
+    assert 'phase="${6:-all}"' in text
+    assert '[[ "$phase" == native ]] || cuteafd_build_cache_cargo_offline' in text
+    assert 'rust_phase_marker="$CARGO_TARGET_DIR/.wip-rust-phase-fingerprint"' in text
+    assert '"$wip_rust_fingerprint" && -x "$CARGO_TARGET_DIR/release/cuteafd"' in text
+    assert '[[ "$phase" != rust ]] || exit 0' in text
+
+
 def test_native_export_lock_only_after_cargo(tmp_path):
     text = (ROOT / 'scripts/build/build-wip-artifacts.sh').read_text()
     start = text.index('export_lock_fds=()')

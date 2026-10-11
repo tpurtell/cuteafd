@@ -2,11 +2,13 @@
 set -euo pipefail
 
 usage() {
-  echo "usage: build-wip-artifacts.sh SOURCE_DIR ROLE CUDA_ARCH BUILD_DIR OUTPUT_DIR" >&2
+  echo "usage: build-wip-artifacts.sh SOURCE_DIR ROLE CUDA_ARCH BUILD_DIR OUTPUT_DIR [all|rust|native]" >&2
   exit 2
 }
 
-[[ $# -eq 5 ]] || usage
+[[ $# -eq 5 || $# -eq 6 ]] || usage
+phase="${6:-all}"
+case "$phase" in all|rust|native) ;; *) usage ;; esac
 source_dir="$(realpath "$1")"
 role="$2"
 cuda_arch="$3"
@@ -114,7 +116,7 @@ source "$(dirname "${BASH_SOURCE[0]}")/compiler-cache.sh"
 cuteafd_compiler_cache_setup "$build_dir"
 # kache restores hardlinks; plain and cached Cargo must not share outputs.
 export CARGO_TARGET_DIR="$build_dir/cargo-target$( [[ "${CUTEAFD_KACHE_MODE:-disabled}" != enabled ]] || printf -- '-kache' )"
-cuteafd_build_cache_cargo_offline "$source_dir/rust/Cargo.toml"
+[[ "$phase" == native ]] || cuteafd_build_cache_cargo_offline "$source_dir/rust/Cargo.toml"
 if [[ "${CUTEAFD_WIP_EXPORT_LOCKS:-off}" == on ]] && ! cuteafd_compiler_cache_check_cmake_compilers "$build_dir/native"; then
   # Copied configure metadata can name a different compiler shim. Objects and
   # AOT outputs remain reusable; only the stale configure identity is discarded.
@@ -156,12 +158,20 @@ else
 fi
 [[ -n "${RUST_TEST_THREADS:-}" ]] || unset RUST_TEST_THREADS
 [[ -n "${CMAKE_BUILD_PARALLEL_LEVEL:-}" ]] || unset CMAKE_BUILD_PARALLEL_LEVEL
-cargo build \
-  --locked \
-  --quiet \
-  --manifest-path "$source_dir/rust/Cargo.toml" \
-  -p cuteafd-daemon \
-  --release
+rust_phase_marker="$CARGO_TARGET_DIR/.wip-rust-phase-fingerprint"
+if [[ "$phase" != native ]]; then
+  cargo build \
+    --locked \
+    --quiet \
+    --manifest-path "$source_dir/rust/Cargo.toml" \
+    -p cuteafd-daemon \
+    --release
+  printf '%s' "$wip_rust_fingerprint" >"$rust_phase_marker"
+  [[ "$phase" != rust ]] || exit 0
+else
+  [[ "$(cat "$rust_phase_marker" 2>/dev/null || true)" == "$wip_rust_fingerprint" && -x "$CARGO_TARGET_DIR/release/cuteafd" ]] ||
+    { echo 'native phase needs a successful rust phase for this source and cache mode' >&2; exit 2; }
+fi
 
 # Cargo is complete before GPU admission. Locks are host files individually
 # bind-mounted by wip.sh; ordinary WIP builds do not acquire hardware locks.
