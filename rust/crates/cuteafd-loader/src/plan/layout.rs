@@ -381,12 +381,12 @@ pub fn family_costs(family: &str) -> FamilyCosts {
             ..generic
         },
         "qwen4" => FamilyCosts {
-            runtime_bytes: [gib(91), gib(91), 0],
-            graph_bytes: [gib(50), gib(50), 0],
-            workspace_bytes: [gib(120), gib(120), 0],
-            mark_slots: 18,
-            spark_workspace_bytes: gib(56),
-            spark_ring_bytes: gib(78),
+            runtime_bytes: [0; 3],
+            graph_bytes: [0; 3],
+            workspace_bytes: [0; 3],
+            mark_slots: crate::placement::families::qwen4::DEFAULT_MARK_SLOTS,
+            spark_workspace_bytes: crate::placement::families::qwen4::SPARK_WORKSPACE_BYTES,
+            spark_ring_bytes: crate::placement::families::qwen4::SPARK_RING_BYTES,
             ..generic
         },
         _ => generic,
@@ -1024,8 +1024,7 @@ pub fn layout(report: &mut PlanReport, model: &dyn super::FamilyModel, checkpoin
                 &mut notes);
         }
         match qwen_placement(checkpoint, report, options, &mut devices[0], workspace_manifest.as_ref(),
-            QwenPlanShape { prefill_rows, concurrency, context_tokens, mtp: cache_native_layers > 0,
-                target: target_pool_tokens }) {
+            QwenPlanShape { prefill_rows, concurrency, context_tokens, mtp: cache_native_layers > 0 }) {
             Ok(tokens) => pool_tokens = tokens,
             Err(error) => {
                 report.placement_supported = false;
@@ -1348,7 +1347,6 @@ struct QwenPlanShape {
     concurrency: u64,
     context_tokens: u64,
     mtp: bool,
-    target: u64,
 }
 
 /// serve-qwen4's admission on the planned GPU: the shared fixed items
@@ -1371,28 +1369,26 @@ fn qwen_placement(checkpoint: &super::Checkpoint, report: &PlanReport, options: 
     let ple = checkpoint.tensors.iter().find(|t| t.meta.name.contains("ngram_embedding.shard_"))
         .map(|t| ((cfg.ple_dim / cfg.ple_rows().max(1)) as u64
             * if t.meta.dtype == cuteafd_core::DType::F8E4M3 { 1 } else { 2 }, t.meta.dtype == cuteafd_core::DType::F8E4M3));
-    let admission = qwen_admission(&QwenAdmissionInputs { cfg: &cfg, layers: cfg.layers, mtp, manifest,
-        prefill_rows: shape.prefill_rows, slots: options.state_slots.unwrap_or(shape.concurrency), mark_bytes: marks,
-        full_prefill_logits: logits, ple, future_expert_bytes: 0, headroom: options.headroom_bytes.max(3 * GIB) })?;
     for (package, bytes) in qwen_package_scratch(checkpoint, report, options.workspace_manifest.as_deref(),
         shape.prefill_rows, mtp) {
         device.items.push(Item::new(Category::Experts, "package scratch", package, bytes, Basis::Formula));
     }
-    // The device's capacity already keeps `max(--headroom, 3 GiB)` back, as `admission.headroom`.
-    let available = (device.free_bytes().max(0) as u64).saturating_add(admission.headroom);
-    let requested = options.pool_tokens.filter(|&n| n > 0);
-    let sequences = shape.concurrency.min(QWEN_DECODE_ROWS as u64) as usize;
-    let context = shape.context_tokens as usize;
-    let (tokens, graphs) = qwen_graph_pool(available, admission.fixed(), admission.per_token, shape.target, requested,
-        |tokens| qwen_startup_graphs(context, tokens as usize, cfg.dense_context(), sequences, true, cfg.layers))
-        .map_err(anyhow::Error::msg)?;
-    for (category, group, bytes) in &admission.items {
-        device.items.push(Item::new(*category, *group, "", *bytes, Basis::Formula));
-    }
-    device.items.extend(graphs.items(0));
-    device.items.push(Item::new(Category::Kv, "records", "", admission.per_token * tokens, Basis::Formula));
-    device.kv_tokens = tokens;
-    Ok(tokens)
+    let loaded_bytes = device.used_bytes();
+    let inputs = crate::placement::families::qwen4::QwenInputs {
+        admission: QwenAdmissionInputs { cfg: &cfg, layers: cfg.layers, mtp, manifest,
+            prefill_rows: shape.prefill_rows, slots: options.state_slots.unwrap_or(shape.concurrency), mark_bytes: marks,
+            full_prefill_logits: logits, ple, future_expert_bytes: 0, headroom: options.headroom_bytes.max(3 * GIB) },
+        capacity_bytes: options.rtx_bytes[0],
+        baseline: crate::placement::Baseline::Planned { context_bytes: 0, loaded_bytes },
+        pending_code_bytes: 0, max_context: shape.context_tokens,
+        requested_pool: options.pool_tokens.filter(|&n| n > 0),
+        spark_ranks: match report.placement { ExpertPlacement::Sparks { ranks } => ranks, ExpertPlacement::Local => 0 },
+        startup_graph_modes: Some((shape.concurrency.min(16) as usize, true)),
+    };
+    let placement = crate::placement::families::qwen4::placement(&inputs)?;
+    device.items.extend(placement.items[0].iter().cloned());
+    device.kv_tokens = placement.pool_tokens;
+    Ok(placement.pool_tokens)
 }
 
 /// Package scratch of Qwen's resident FP8/NVFP4 experts (`Fp8Experts::load`): one scratch per package
