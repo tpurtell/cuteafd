@@ -5,10 +5,14 @@ use crate::plan::{Checkpoint, Component, Family};
 use crate::plan::families::qwen::QWEN4;
 use anyhow::{ensure, Result};
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Qwen4CheckpointResident {
     /// Target operands, including the PLE projections and stream mixer, excluding the head.
     pub target_bytes: u64,
+    /// Whole-width layer operands, including shared FFN and PLE projections.
+    pub layer_bytes: Vec<u64>,
+    /// Target operands without a layer id (the final stream mixer), on owner0.
+    pub entry_bytes: u64,
     /// Native MTP coordinator operands, excluding routed experts and the shared head.
     pub mtp_bytes: u64,
     pub head_bytes: u64,
@@ -27,7 +31,7 @@ pub fn checkpoint_resident_bytes(checkpoint: &Checkpoint, cfg: &Qwen4Config,
     let model = QWEN4.open(checkpoint).map_err(|e| anyhow::anyhow!("{}", e.0))?;
     let layers = layers.min(cfg.layers);
     ensure!(!mtp || cfg.mtp_layers == 1 && layers == cfg.layers, "Qwen MTP requires the complete target and one MTP layer");
-    let mut out = Qwen4CheckpointResident::default();
+    let mut out = Qwen4CheckpointResident { layer_bytes: vec![0; layers], ..Default::default() };
     for tensor in &checkpoint.tensors {
         let name = tensor.meta.name.as_str();
         let Some(role) = QWEN4.classify(model.spec(), name) else { continue };
@@ -59,16 +63,25 @@ pub fn checkpoint_resident_bytes(checkpoint: &Checkpoint, cfg: &Qwen4Config,
             bytes = tensor.meta.shape.iter().map(|&d| d as u64).product::<u64>() * 4;
         }
         if role.component == Component::Speculator { out.mtp_bytes += bytes; }
-        else { out.target_bytes += bytes; }
+        else if let Some(layer) = role.layer { out.layer_bytes[layer] += bytes; }
+        else { out.entry_bytes += bytes; }
     }
     // Shared gate/up/gate row concatenation: 1281 source rows, 1296 resident rows.
     let padding = (1296usize.saturating_sub(2 * cfg.shared_intermediate + 1) * cfg.hidden * 2) as u64;
-    out.target_bytes += padding * layers as u64;
     if mtp { out.mtp_bytes += padding; }
+    for (layer, bytes) in out.layer_bytes.iter_mut().enumerate() {
+        let projections = super::layer_projections(cfg, cfg.attention[layer], Some(layer));
+        let bf16 = projections.iter().map(|p| super::bf16_bytes(p.rows, p.cols) as u64).sum::<u64>();
+        let selected = projections.iter().map(|p| if representation.fp8_projections {
+            super::fp8_block_bytes(p.rows, p.cols) as u64
+        } else { super::bf16_bytes(p.rows, p.cols) as u64 }).sum::<u64>();
+        *bytes = bytes.checked_add(padding).and_then(|n| n.checked_sub(bf16))
+            .and_then(|n| n.checked_add(selected))
+            .ok_or_else(|| anyhow::anyhow!("Qwen projection headers do not cover layer {layer}"))?;
+    }
+    out.target_bytes = out.layer_bytes.iter().try_fold(out.entry_bytes, |sum, bytes| sum.checked_add(*bytes))
+        .ok_or_else(|| anyhow::anyhow!("Qwen target resident bytes overflow"))?;
     let target = resident_bytes(cfg, layers, false, representation);
-    out.target_bytes = out.target_bytes.checked_sub(target.projections_bf16 as u64)
-        .ok_or_else(|| anyhow::anyhow!("Qwen projection headers do not cover the selected target"))?
-        + target.projections as u64;
     if mtp {
         let all = resident_bytes(cfg, layers, true, representation);
         out.mtp_bytes = out.mtp_bytes.checked_sub((all.projections_bf16 - target.projections_bf16) as u64)
@@ -119,6 +132,8 @@ mod tests {
         assert_eq!(bf16.head_bytes, 64 * 2560 * 2);
         assert_eq!((bf16.ple_table_bytes, bf16.ple_row_bytes), (1000 * 160 * 2, 160 * 2));
         assert_eq!(bf16.mtp_bytes, 0);
+        assert_eq!(bf16.layer_bytes, vec![bf16.target_bytes]);
+        assert_eq!(bf16.entry_bytes, 0);
         let fp8 = checkpoint_resident_bytes(&checkpoint, &cfg, 1, false,
             Qwen4Representation { fp8_projections: true, fp8_head: true }).unwrap();
         assert_eq!(fp8.head_bytes, 64 * 2560 + 64 * 20 * 4);
@@ -126,6 +141,33 @@ mod tests {
             Qwen4Representation { fp8_projections: true, fp8_head: true });
         assert_eq!(bf16.target_bytes - fp8.target_bytes,
             (selection.projections_bf16 - selection.projections_fp8) as u64);
+        let mut two_config = qwen4_config(2);
+        two_config["text_config"]["layer_types"] = serde_json::json!(["linear_attention", "linear_attention"]);
+        let two_cfg = Qwen4Config::from_hf(&two_config).unwrap();
+        let mut two_tensors = tensors.clone();
+        two_tensors.extend(tensors.iter().filter(|t| t.0.starts_with(p)).map(|t|
+            (t.0.replace("layers.0", "layers.1"), t.1, t.2.clone())));
+        two_tensors.push(t("model.language_model.layers.1.mlp.gate.weight", "BF16", &[512, 2560]));
+        two_tensors.push(t("model.language_model.hyper_connection_mixer.hc_norm.weight", "BF16", &[2560]));
+        write_snapshot(&dir, &two_config, &two_tensors, None);
+        let two_checkpoint = Checkpoint::open(&dir).unwrap();
+        for representation in [Qwen4Representation::default(),
+            Qwen4Representation { fp8_projections: true, fp8_head: true }] {
+            let single = checkpoint_resident_bytes(&checkpoint, &cfg, 1, false, representation).unwrap();
+            let two = checkpoint_resident_bytes(&two_checkpoint, &two_cfg, 2, false, representation).unwrap();
+            assert_eq!(two.entry_bytes, 2560 * 2);
+            assert_eq!(two.layer_bytes, vec![single.target_bytes, single.target_bytes + 512 * 2560 * 2]);
+            assert_eq!(two.target_bytes, two.entry_bytes + two.layer_bytes.iter().sum::<u64>());
+            assert_eq!(two.head_bytes, single.head_bytes);
+            assert_eq!(two.embedding_bytes, single.embedding_bytes);
+        }
+        // One oversized layer must not hide another layer's missing projections.
+        two_tensors.retain(|t| !t.0.ends_with("layers.1.linear_attn.out_proj.weight"));
+        two_tensors.push(t("model.language_model.layers.0.mlp.gate.extra.weight", "BF16", &[16384, 2560]));
+        write_snapshot(&dir, &two_config, &two_tensors, None);
+        let incomplete = Checkpoint::open(&dir).unwrap();
+        assert!(checkpoint_resident_bytes(&incomplete, &two_cfg, 2, false,
+            Qwen4Representation::default()).is_err());
         std::fs::remove_dir_all(dir).unwrap();
     }
 }
