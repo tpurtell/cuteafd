@@ -1,0 +1,19 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Agent Workspace</title>
+<link rel="stylesheet" href="/assets/cuteafd-ui.css"><link rel="stylesheet" href="/agent/theme.css">
+<style>
+body { height:100dvh; min-height:0; overflow:hidden; }
+.agent-shell { height:100%; display:flex; flex-direction:column; padding:14px 18px 12px; gap:12px; }
+.agent-shell header { flex:none; min-width:0; }
+.agent-shell .nav { flex-wrap:wrap; max-width:100%; }
+@media(max-width:600px) { .agent-shell .nav { margin-left:0; gap:5px; } .agent-shell .nav a { padding:6px 8px; font-size:10px; letter-spacing:.08em; } }
+.agent-shell main { flex:1; min-height:0; display:flex; }
+.agent-shell iframe { width:100%; height:100%; border:1px solid var(--line); border-radius:12px; background:var(--panel); }
+.agent-offline { margin:auto; max-width:600px; padding:28px; border:1px solid var(--line); border-radius:12px; background:var(--panel); }
+.agent-offline h1 { font-size:22px; margin-top:0; }
+.agent-offline p { color:var(--ink-2); }
+.agent-offline code { display:block; padding:12px; background:var(--bg); border:1px solid var(--line); border-radius:6px; overflow-wrap:anywhere; }
+@media(max-width:600px) { .agent-shell { padding:12px 16px; } .brand span { letter-spacing:.12em; } .agent-offline { padding:20px; } }
+</style></head><body><script>if(matchMedia('(prefers-color-scheme: dark)').matches)document.body.setAttribute('data-ds-dark-theme','');</script><div class="agent-shell"><header id="header"></header><main><!--WORKSPACE--></main></div>
+<script src="/assets/cuteafd-ui.js"></script><script>CuteUI.header(document.getElementById('header'),{page:'agent',subtitle:'Experimental workspace'});if(!document.body.hasAttribute('data-ds-dark-theme')){const logo=document.querySelector('.logo');logo.src='/agent/logo-light.svg';}</script>
+</body></html>

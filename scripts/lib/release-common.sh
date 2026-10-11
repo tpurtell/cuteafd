@@ -317,9 +317,21 @@ release_print_console_link() {
   fi
 }
 
+# Common configured/benchmark key resolution; sidecars never invent a second default.
+release_resolve_api_key() {
+  local enabled="${1:-off}" instance="${2:-default}"
+  if [[ -z "${API_KEY_FILE:-}" && -f "$HOME/.config/cuteafd/api-key" ]]; then
+    API_KEY_FILE="$HOME/.config/cuteafd/api-key"
+  fi
+  if [[ -z "${API_KEY_FILE:-}" && "$enabled" == on && -f "$HOME/.cache/cuteafd/$instance/api-key" ]]; then
+    API_KEY_FILE="$HOME/.cache/cuteafd/$instance/api-key"
+  fi
+}
+
 # Benchmark opt-in provisions a reusable key, never exposing it in logs or argv.
 release_prepare_api_key() {
   local enabled="${1:-off}" instance="${2:-default}"
+  release_resolve_api_key off "$instance"
   case "$enabled" in
     on|off) ;;
     *) release_die "ENABLE_BENCH must be on or off" ;;
@@ -331,6 +343,23 @@ release_prepare_api_key() {
   fi
   if [[ -n "${API_KEY_FILE:-}" ]]; then
     [[ -f "$API_KEY_FILE" && -r "$API_KEY_FILE" ]] || release_die "API_KEY_FILE must name a readable file"
+    python3 - "$API_KEY_FILE" <<'PY_KEYS'
+import json, os, pathlib, secrets, tempfile
+legacy = pathlib.Path(__import__('sys').argv[1])
+path = legacy.with_name("api-keys")
+if not path.exists():
+    key = legacy.read_text().rstrip("\r\n")
+    fd, tmp = tempfile.mkstemp(prefix=".api-keys-", dir=path.parent)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w") as stream:
+            json.dump({"default": key, "agent": secrets.token_urlsafe(32)}, stream)
+            stream.write("\n")
+        # Do not replace a concurrently provisioned key set.
+        try: os.link(tmp, path)
+        except FileExistsError: pass
+    finally: os.unlink(tmp)
+PY_KEYS
   fi
 }
 

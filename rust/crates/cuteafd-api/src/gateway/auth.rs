@@ -34,13 +34,17 @@ pub fn accepts(key: &ApiKey, headers: &HeaderMap) -> bool {
     key.accepts(&authorization)
 }
 
-pub async fn require_key(State(auth): State<GatewayAuth>, request: Request, next: Next) -> Response {
+pub async fn require_key(State(auth): State<GatewayAuth>, mut request: Request, next: Next) -> Response {
     let path = request.uri().path();
     if let Some(key) = &auth.key {
         if (path == "/v1" || path.starts_with("/v1/")) && !accepts(key, request.headers()) {
             let error = GatewayError::new(ErrorKind::Authentication, "invalid x-api-key or Authorization bearer key");
             return if path.starts_with("/v1/messages") { error.anthropic_response() } else { error.openai_response() };
         }
+    }
+    if let Some(identity) = auth.key.as_ref().and_then(|key| presented(request.headers()).and_then(|token| key.identity(token))) {
+        if let Some(scope) = request.extensions().get::<crate::usage::UsageHandle>() { scope.key_name(identity.0.clone()); }
+        request.extensions_mut().insert(identity);
     }
     next.run(request).await
 }

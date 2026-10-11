@@ -1278,6 +1278,10 @@ family_args+=(--table-backend "$table_backend")
 console_text="$(get CONSOLE_TEXT on)"
 case "$console_text" in on|off) ;; *) echo "CONSOLE_TEXT must be on or off" >&2; exit 2 ;; esac
 api_mount_args=()
+agent_home="${CUTEAFD_AGENT_HOME:-$HOME/.local/share/cuteafd/agent}"
+mkdir -p "$agent_home/dsh"; chmod 700 "$agent_home" "$agent_home/dsh"
+api_mount_args+=(--mount "type=bind,src=$(readlink -f "$agent_home/dsh"),dst=/run/cuteafd-agent-dsh,readonly"
+  -e CUTEAFD_AGENT_TOKEN_FILE=/run/cuteafd-agent-dsh/launch-token -e "CUTEAFD_AGENT_PORT=${CUTEAFD_AGENT_PORT:-3010}")
 API_KEY_FILE="$(get API_KEY_FILE "${API_KEY_FILE:-}")"
 ENABLE_BENCH="$(get ENABLE_BENCH off)"
 release_prepare_api_key "$ENABLE_BENCH" "${instance:-default}"
@@ -1295,6 +1299,8 @@ if [[ -n "$API_KEY_FILE" ]]; then
   API_KEY_FILE="$(readlink -f "$API_KEY_FILE")"
   api_mount_args+=(--mount "type=bind,src=$API_KEY_FILE,dst=/run/cuteafd-api-key,readonly")
   family_args+=(--api-key-file /run/cuteafd-api-key)
+  api_mount_args+=(--mount "type=bind,src=$(readlink -f "$(dirname "$API_KEY_FILE")"),dst=/run/cuteafd-key-directory,readonly"
+    -e CUTEAFD_API_KEYS_FILE=/run/cuteafd-key-directory/api-keys)
 fi
 case "$ENABLE_BENCH" in
   on) family_args+=(--enable-bench) ;;

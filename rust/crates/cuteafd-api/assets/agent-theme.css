@@ -1,0 +1,71 @@
+/* Standalone theme bridge loaded by the DSH facet plugin at /agent/theme.css.
+   Explicit data-theme wins; otherwise follow the viewer's color preference. */
+:root {
+  color-scheme:light;
+  --bg:#f5f7fb; --panel:#ffffff; --panel-2:#edf2f8; --well:#f0f3f8;
+  --ink:#182336; --ink-2:#45566e; --muted:#596b84; --line:#d4deeb; --line-2:#b9c9dd;
+  --target:#006fa8; --accepted:#087d59; --warn:#936100; --bad:#c82d49;
+  --dsw-background:var(--bg); --dsw-background-primary:var(--bg);
+  --dsw-background-secondary:var(--panel); --dsw-background-tertiary:var(--panel-2);
+  --dsw-bg:var(--bg); --dsw-panel:var(--panel);
+  --dsw-text:var(--ink); --dsw-text-primary:var(--ink); --dsw-text-secondary:var(--ink-2);
+  --dsw-text-tertiary:var(--muted); --dsw-border:var(--line); --dsw-border-color:var(--line);
+  --dsw-primary:var(--target); --dsw-accent:var(--target);
+  --dsw-success:var(--accepted); --dsw-warning:var(--warn); --dsw-error:var(--bad);
+}
+@media(prefers-color-scheme:dark) { :root:not([data-theme="light"]) {
+  color-scheme:dark;
+  --bg:#05070b; --panel:#0a0e15; --panel-2:#0e141d; --well:#070a10;
+  --ink:#e8eef8; --ink-2:#9dabc1; --muted:#5f6e86; --line:#172030; --line-2:#22304a;
+  --target:#4cc3ff; --accepted:#2ee6a6; --warn:#ffb547; --bad:#ff5d73;
+} }
+:root[data-theme="dark"] {
+  color-scheme:dark;
+  --bg:#05070b; --panel:#0a0e15; --panel-2:#0e141d; --well:#070a10;
+  --ink:#e8eef8; --ink-2:#9dabc1; --muted:#5f6e86; --line:#172030; --line-2:#22304a;
+  --target:#4cc3ff; --accepted:#2ee6a6; --warn:#ffb547; --bad:#ff5d73;
+}
+
+/* DSH public aliases inherit body-local light/dark tokens. */
+body {
+  --bg:#f5f7fb; --panel:#ffffff; --panel-2:#edf2f8; --well:#f0f3f8;
+  --ink:#182336; --ink-2:#45566e; --muted:#596b84; --line:#d4deeb; --line-2:#b9c9dd;
+  --target:#006fa8; --accepted:#087d59; --warn:#936100; --bad:#c82d49;
+  --dsw-alias-bg-base:var(--bg);
+  --dsw-alias-bg-layer-1:var(--panel);
+  --dsw-alias-bg-layer-2:var(--panel-2);
+  --dsw-alias-bg-layer-3:var(--well);
+  --dsw-alias-bg-overlay:var(--panel);
+  --dsw-alias-interactive-bg-hover:var(--panel-2);
+  --dsw-alias-interactive-bg-active:var(--line);
+  --dsw-alias-interactive-bg-hover-accent:var(--line-2);
+  --dsw-alias-interactive-bg-hover-danger:var(--bad);
+  --dsw-alias-label-primary:var(--ink);
+  --dsw-alias-label-secondary:var(--ink-2);
+  --dsw-alias-label-tertiary:var(--muted);
+  --dsw-alias-label-dimmed:var(--muted);
+  --dsw-alias-label-caption:var(--ink-2);
+  --dsw-alias-label-primary-inverted:var(--bg);
+  --dsw-alias-link:var(--target);
+  --dsw-alias-border-l1:var(--line);
+  --dsw-alias-border-l2:var(--line-2);
+  --dsw-alias-border-l3:var(--line-2);
+  --dsw-alias-border-l4:var(--muted);
+  --dsw-alias-brand-primary:var(--target);
+  --dsw-alias-brand-text:var(--target);
+  --dsw-alias-button-primary-fill:var(--target);
+  --dsw-alias-button-primary-hover:var(--ink-2);
+  --dsw-alias-state-success-primary:var(--accepted);
+  --dsw-alias-state-warn-primary:var(--warn);
+  --dsw-alias-state-error-primary:var(--bad);
+  --dsw-alias-state-business-primary:var(--target);
+  --dsw-alias-markdown-code-block:var(--well);
+  --dsw-alias-markdown-inline-code:var(--panel-2);
+  --dsw-alias-code-diff-added:var(--accepted);
+  --dsw-alias-code-diff-deleted:var(--bad);
+}
+body[data-ds-dark-theme] {
+  --bg:#05070b; --panel:#0a0e15; --panel-2:#0e141d; --well:#070a10;
+  --ink:#e8eef8; --ink-2:#9dabc1; --muted:#5f6e86; --line:#172030; --line-2:#22304a;
+  --target:#4cc3ff; --accepted:#2ee6a6; --warn:#ffb547; --bad:#ff5d73;
+}
