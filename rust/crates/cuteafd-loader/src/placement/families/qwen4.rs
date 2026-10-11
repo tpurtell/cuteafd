@@ -257,6 +257,32 @@ impl QwenTp2Rows {
     }
 }
 
+/// Whole-width non-layer operands on the entry/head/MTP owner. Layer operands
+/// are passed to `dual_request` separately; PLE backing follows its layer owner,
+/// and draft expert arenas/workspaces must be supplied by their package plan.
+pub fn dual_owner0_weights(resident: &crate::families::qwen4::resident::Qwen4CheckpointResident,
+    host_embedding: bool) -> Vec<Demand> {
+    [
+        (Category::Weights, "owner0 head", resident.head_bytes),
+        (Category::Weights, "owner0 mixer", resident.entry_bytes),
+        (Category::Weights, "owner0 MTP weights", resident.mtp_bytes),
+        (Category::Embedding, "owner0 embedding", if host_embedding { 0 } else { resident.embedding_bytes }),
+    ].into_iter().filter(|(_, _, bytes)| *bytes > 0)
+        .map(|(category, group, bytes)| Demand::new(0, category, group, bytes, Basis::Exact)).collect()
+}
+
+/// Conservative load-only conversion peak on both nonempty owners, before the
+/// cutover is chosen. Kept as a steady-state reserve until load lifetimes are
+/// modeled; the paired group does not bias the owner-boundary objective.
+pub fn dual_projection_load_staging(cfg: &crate::families::qwen4::Qwen4Config, layers: usize, mtp: bool,
+    selected: crate::families::qwen4::resident::Qwen4Representation) -> Vec<Demand> {
+    let bytes = crate::families::qwen4::resident::resident_bytes(cfg, layers, mtp, selected)
+        .max_device_staging as u64;
+    if bytes == 0 { return Vec::new(); }
+    (0..2).map(|gpu| Demand::new(gpu, Category::Staging,
+        "FP8 projection load staging", bytes, Basis::Formula)).collect()
+}
+
 /// Admission contract for the private whole-owner executor. Unlike the legacy
 /// single-owner path, layer weights and routed halves are future allocations;
 /// both baselines must be sampled before loading them. The public selector
@@ -402,6 +428,42 @@ mod tests {
     use crate::serving_capacity::qwen_graphs::qwen_graph_pool;
 
     #[test]
+    fn qwen_dual_owner0_weights_exclude_layer_and_table_storage() {
+        use crate::families::qwen4::resident::Qwen4CheckpointResident;
+        let resident = Qwen4CheckpointResident { target_bytes: 700, layer_bytes: vec![200, 400], entry_bytes: 100,
+            mtp_bytes: 300, head_bytes: 500, embedding_bytes: 600, ple_table_bytes: 900, ple_row_bytes: 160 };
+        for (host, expected) in [(false, 1500), (true, 900)] {
+            let demands = dual_owner0_weights(&resident, host);
+            assert!(demands.iter().all(|d| d.gpu == 0 && d.basis == Basis::Exact));
+            assert_eq!(demands.iter().map(|d| d.bytes).sum::<u64>(), expected);
+            assert_eq!(demands.iter().filter(|d| d.category == Category::Embedding).count(), usize::from(!host));
+            assert!(!demands.iter().any(|d| d.category == Category::Tables || d.category == Category::Experts));
+        }
+        assert!(dual_owner0_weights(&Qwen4CheckpointResident::default(), false).is_empty());
+    }
+
+    #[test]
+    fn qwen_dual_projection_staging_preserves_bf16_and_host_head_defaults() {
+        use crate::families::qwen4::resident::Qwen4Representation;
+        let cfg = Qwen4Config::from_hf(&crate::plan::testing::qwen4_config(48)).unwrap();
+        for mtp in [false, true] {
+            for fp8_head in [false, true] {
+                let selected = Qwen4Representation { fp8_projections: false, fp8_head };
+                assert!(dual_projection_load_staging(&cfg, 48, mtp, selected).is_empty());
+                let demands = dual_projection_load_staging(&cfg, 48, mtp,
+                    Qwen4Representation { fp8_projections: true, fp8_head });
+                assert_eq!(demands.len(), 2);
+                for (gpu, demand) in demands.iter().enumerate() {
+                    assert_eq!(demand.gpu, gpu as u8);
+                    assert_eq!(demand.bytes, 84_377_600);
+                    assert_eq!(demand.category, Category::Staging);
+                    assert_eq!(demand.group, "FP8 projection load staging");
+                }
+            }
+        }
+    }
+
+    #[test]
     fn qwen_tp2_transport_matches_owner_buffers_and_abi() -> anyhow::Result<()> {
         for wire in [false, true] {
             for rows in [1, 3, 64, 4096] {
@@ -513,12 +575,15 @@ mod tests {
         let experts = vec![Some(ExpertCost { whole: Bytes2::default(),
             half: [Bytes2 { resident: 600 << 20, staging: 64 << 20 }, Bytes2 { resident: 400 << 20, staging: 32 << 20 }],
             tp2: true, spark_ok: true }); 48];
-        for (kv_format, wire) in [Qwen4KvCache::Bf16, Qwen4KvCache::Fp8].into_iter()
-            .flat_map(|kv| [false, true].map(|wire| (kv, wire))) {
+        for (kv_format, wire, fp8_projections) in [Qwen4KvCache::Bf16, Qwen4KvCache::Fp8].into_iter()
+            .flat_map(|kv| [false, true].into_iter().flat_map(move |wire|
+                [false, true].map(|fp8| (kv, wire, fp8)))) {
             let transport = QwenTp2Rows::new(cfg.hidden as u64, cfg.topk as u64, 4096, wire).unwrap()
                 .demands().unwrap();
+            let staging = dual_projection_load_staging(&cfg, 48, false,
+                crate::families::qwen4::resident::Qwen4Representation { fp8_projections, fp8_head: false });
             let mut fixed = vec![Demand::new(0, Category::Weights, "owner0 head", 1 << 30, Basis::Exact)];
-            fixed.extend(transport.iter().cloned());
+            fixed.extend(transport.iter().chain(&staging).cloned());
             let inputs = |measured| QwenDualInputs {
                 admission: QwenAdmissionInputs { cfg: &cfg, layers: 48, mtp: false, kv_format, manifest: None,
                     prefill_rows: 4096, slots: 16, mark_bytes: 0, full_prefill_logits: 0,
@@ -536,9 +601,13 @@ mod tests {
             let measured = dual_placement(&inputs(true)).unwrap();
             assert_eq!(planned, measured);
             assert_eq!(planned.pool_tokens, 2 << 20);
-            for demand in &transport {
+            for demand in transport.iter().chain(&staging) {
                 assert!(planned.items[usize::from(demand.gpu)].iter().any(|item|
                     item.group == demand.group && item.category == demand.category && item.bytes == demand.bytes));
+            }
+            for gpu in 0..2 {
+                assert_eq!(planned.items[gpu].iter().filter(|item| item.group == "FP8 projection load staging")
+                    .map(|item| item.bytes).sum::<u64>(), if fp8_projections { 84_377_600 } else { 0 });
             }
             assert!(planned.layers.iter().all(|layer| layer.experts == ExpertHome::RtxTp2));
             let owners = planned.layers.iter().map(|layer| match layer.mode {

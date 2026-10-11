@@ -102,6 +102,24 @@ pub(super) fn dual_experts(args: &EngineArgs, catalog: &cuteafd_loader::Official
     Ok(DualExpertPlan { packages, costs, workspace, transport, wire })
 }
 
+/// Checkpoint-native whole-layer storage plus entry-owner operands, planned
+/// before allocations. PLE placement and draft experts are separate demands.
+pub(super) struct DualWeightPlan {
+    pub resident: cuteafd_loader::families::qwen4::resident::Qwen4CheckpointResident,
+    pub fixed: Vec<cuteafd_loader::placement::Demand>,
+}
+
+pub(super) fn dual_weights(args: &EngineArgs, checkpoint: &cuteafd_loader::plan::Checkpoint,
+    cfg: &Qwen4Config, layers: usize, mtp: bool) -> Result<DualWeightPlan> {
+    use cuteafd_loader::families::qwen4::resident::{checkpoint_resident_bytes, Qwen4Representation};
+    let selected = Qwen4Representation { fp8_projections: args.fp8_decode, fp8_head: args.mtp_fp8_head };
+    let resident = checkpoint_resident_bytes(checkpoint, cfg, layers, mtp, selected)?;
+    let mut fixed = qwen4::dual_owner0_weights(&resident,
+        args.token_io.embed_placement == crate::shared::token_io::EmbedPlacement::Host);
+    fixed.extend(qwen4::dual_projection_load_staging(cfg, layers, mtp, selected));
+    Ok(DualWeightPlan { resident, fixed })
+}
+
 #[cfg(test)]
 mod tests {
     use cuteafd_loader::serving_capacity::qwen_graphs::*;
@@ -146,6 +164,62 @@ mod tests {
             80 * 256 + 3 * (32 + 16) + 97 * 2560 * 2 + 64 * 2560 * 4]);
         std::fs::remove_file(plan.packages[1].join("m80/v41_exl3.json"))?;
         assert!(super::dual_experts(&args, &catalog, 1).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn dual_weight_headers_match_selected_operands_before_cuda() -> anyhow::Result<()> {
+        use clap::Parser;
+        use cuteafd_loader::plan::testing;
+        #[derive(Parser)]
+        struct Cli {
+            #[command(flatten)]
+            engine: super::super::EngineArgs,
+        }
+        let dir = tempfile::tempdir()?;
+        let config = testing::qwen4_config(2);
+        let cfg = cuteafd_loader::families::qwen4::Qwen4Config::from_hf(&config)?;
+        let mut tensors = Vec::new();
+        for layer in 0..2 {
+            let prefix = format!("model.language_model.layers.{layer}.linear_attn");
+            for (name, rows, cols) in [("in_proj_qkv", 10240, 2560), ("in_proj_z", 6144, 2560),
+                ("in_proj_b", 48, 2560), ("in_proj_a", 48, 2560), ("out_proj", 2560, 6144)] {
+                tensors.push(testing::t(format!("{prefix}.{name}.weight"), "BF16", &[rows, cols]));
+            }
+        }
+        tensors.extend([
+            testing::t("model.language_model.hyper_connection_mixer.hc_norm.weight", "BF16", &[2560]),
+            testing::t("model.language_model.embed_tokens.weight", "BF16", &[64, 2560]),
+            testing::t("lm_head.weight", "BF16", &[64, 2560]),
+        ]);
+        testing::write_snapshot(dir.path(), &config, &tensors, None);
+        let checkpoint = cuteafd_loader::plan::Checkpoint::open(dir.path())?;
+        let mut args = Cli::try_parse_from(["serve", "--snapshot", dir.path().to_str().unwrap(),
+            "--native-lib", "/absent/native.so"])?.engine;
+        for projections in [false, true] {
+            for host in [false, true] {
+                args.fp8_decode = projections;
+                args.token_io.embed_placement = if host { crate::shared::token_io::EmbedPlacement::Host }
+                    else { crate::shared::token_io::EmbedPlacement::Gpu };
+                let plan = super::dual_weights(&args, &checkpoint, &cfg, 2, false)?;
+                assert_eq!(plan.resident.layer_bytes.len(), 2);
+                assert_eq!(plan.resident.target_bytes, plan.resident.entry_bytes
+                    + plan.resident.layer_bytes.iter().sum::<u64>());
+                let staging = if projections { 84_377_600 } else { 0 };
+                assert_eq!(plan.fixed.iter().map(|d| d.bytes).sum::<u64>(), plan.resident.entry_bytes
+                    + plan.resident.head_bytes + if host { 0 } else { plan.resident.embedding_bytes }
+                    + 2 * staging);
+                let load = plan.fixed.iter().filter(|d| d.category == cuteafd_core::memory_layout::Category::Staging)
+                    .collect::<Vec<_>>();
+                assert_eq!(load.len(), if projections { 2 } else { 0 });
+                for (gpu, demand) in load.iter().enumerate() {
+                    assert_eq!((demand.gpu, demand.bytes), (gpu as u8, staging));
+                    assert_eq!(demand.group, "FP8 projection load staging");
+                }
+                assert!(plan.fixed.iter().filter(|d| d.category != cuteafd_core::memory_layout::Category::Staging)
+                    .all(|d| d.gpu == 0));
+            }
+        }
         Ok(())
     }
 
