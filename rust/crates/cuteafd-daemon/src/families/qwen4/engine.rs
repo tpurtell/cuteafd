@@ -83,8 +83,7 @@ pub(crate) fn copy_row_limit(rows: usize, sequences: usize) -> usize {
 
 /// Selected-slot row width of the sparse attention (2048 + 3, padded to 64).
 pub(crate) const SPARSE_TOPK: usize = 2112;
-/// BF16 K/V record of one token: K [2, 256] then V [2, 256].
-pub(crate) const RECORD_BYTES: usize = 2048;
+/// BF16 index-key width, independent of the K/V record format.
 pub(crate) const INDEX_DIM: usize = 128;
 const MAX_RANKS: usize = 6;
 const HC: usize = 4;
@@ -989,6 +988,8 @@ pub(crate) struct Qwen4Engine<'a> {
     pub max_context: usize,
     pub prefill_rows: usize,
     pub pages: usize,
+    pub kv_format: cuteafd_loader::families::qwen4::Qwen4KvCache,
+    pub kv_record_bytes: usize,
     pub slots: usize,
     /// Per full layer: the K/V record pool.
     kv: Vec<Option<Dev<'a>>>,
@@ -1115,11 +1116,11 @@ impl<'a> Qwen4Engine<'a> {
     #[allow(clippy::too_many_arguments)]
     pub fn new(library: &'a NativeLibrary, programs: &'a Programs<'a>, cfg: Qwen4Config, weights: Qwen4Weights<'a>,
         ple: Option<super::ple::PleTable<'a>>, stream: *mut c_void, max_context: usize, prefill_rows: usize,
-        pages: usize, slots: usize, embedding: TokenEmbedding<'a>) -> Result<Self> {
+        pages: usize, slots: usize, kv_format: cuteafd_loader::families::qwen4::Qwen4KvCache, embedding: TokenEmbedding<'a>) -> Result<Self> {
         let device = Device { library, id: library.cuda_get_device()? };
         let owners = vec![0; weights.layers.len()];
         Self::new_placed(library, cfg, weights, ple, &owners, &[(device, programs, stream)],
-            max_context, prefill_rows, pages, slots, embedding)
+            max_context, prefill_rows, pages, slots, kv_format, embedding)
     }
 
     /// Whole-width attention owners; head, embedding and MTP remain on rank zero.
@@ -1128,7 +1129,8 @@ impl<'a> Qwen4Engine<'a> {
     pub fn new_placed(library: &'a NativeLibrary, cfg: Qwen4Config, weights: Qwen4Weights<'a>,
         ple: Option<super::ple::PleTable<'a>>, owners: &[usize],
         ranks: &[(Device<'a>, &'a Programs<'a>, *mut c_void)], max_context: usize,
-        prefill_rows: usize, pages: usize, slots: usize, embedding: TokenEmbedding<'a>) -> Result<Self> {
+        prefill_rows: usize, pages: usize, slots: usize,
+        kv_format: cuteafd_loader::families::qwen4::Qwen4KvCache, embedding: TokenEmbedding<'a>) -> Result<Self> {
         ensure!(!ranks.is_empty() && ranks.len() <= 2, "Qwen supports one or two attention owners");
         ensure!(ranks.iter().all(|(device, _, _)| std::ptr::eq(device.library, library)),
             "Qwen attention owners use different native libraries");
@@ -1141,6 +1143,20 @@ impl<'a> Qwen4Engine<'a> {
             device.run(|| Ok(Fp8QuantizeGrid::new(library.sm_count()?, None)?))).collect::<Result<Vec<_>>>()?;
         ensure!(embedding.hidden() == cfg.hidden, "embedding rows of {} for hidden {}", embedding.hidden(), cfg.hidden);
         cfg.check_programs()?;
+        let kv_record_bytes = kv_format.record_bytes(cfg.kv_heads, cfg.head_dim);
+        let kv_suffix = if kv_format == cuteafd_loader::families::qwen4::Qwen4KvCache::Fp8 { "_kv_fp8" } else { "" };
+        for (owner, &(_, owner_programs, _)) in ranks.iter().enumerate() {
+            for cap in ["m64", "m4096"] {
+                for layer in weights.layers.iter().enumerate()
+                    .filter(|(global, _)| owners[*global] == owner).map(|(_, layer)| layer)
+                    .chain(weights.mtp.iter().filter(|_| owner == 0).map(|m| &m.layer))
+                    .filter(|layer| layer.attention == Qwen4Attention::Full) {
+                    owner_programs.spec(&format!("qwen4_sparse_gqa{kv_suffix}_{cap}"))?;
+                    let stem = if Self::w8(layer) { "attn_producer_w8" } else { "attn_producer" };
+                    owner_programs.spec(&format!("qwen4_{stem}{kv_suffix}_{cap}"))?;
+                }
+            }
+        }
         let zeroed = |bytes: usize| -> Result<Dev<'a>> {
             let allocation = Rc::new(Allocation::new(Device { library, id: library.cuda_get_device()? }, bytes.max(256))?);
             library.cuda_zero_bytes(allocation.buffer, allocation.buffer.bytes)?;
@@ -1158,7 +1174,7 @@ impl<'a> Qwen4Engine<'a> {
             let _layer_scope = device.enter()?;
             match layer.attention {
                 Qwen4Attention::Full => {
-                    kv.push(Some(zeroed(pages * PAGE_ROWS * RECORD_BYTES)?));
+                    kv.push(Some(zeroed(pages * PAGE_ROWS * kv_record_bytes)?));
                     index.push(Some((zeroed(pages * PAGE_ROWS * INDEX_DIM * 2)?,
                         zeroed(pool_pages * PAGE_ROWS * INDEX_DIM * 2)?)));
                 }
@@ -1189,14 +1205,14 @@ impl<'a> Qwen4Engine<'a> {
             (None, None)
         };
         let (mtp_kv, mtp_pending) = if weights.mtp.is_some() {
-            (Some((zeroed(pages * PAGE_ROWS * RECORD_BYTES)?, zeroed(pages * PAGE_ROWS * INDEX_DIM * 2)?,
+            (Some((zeroed(pages * PAGE_ROWS * kv_record_bytes)?, zeroed(pages * PAGE_ROWS * INDEX_DIM * 2)?,
                 zeroed(pool_pages * PAGE_ROWS * INDEX_DIM * 2)?)),
              Some(zeroed(slots * MTP_PENDING_ROWS * HC * cfg.hidden * 2)?))
         } else {
             (None, None)
         };
         let pool_logical = zeroed(pool_pages * 4)?;
-        Ok(Self { quantize_grids, active_owner: Cell::new(0), library, programs, cfg, weights, ple, stream, max_context, prefill_rows, pages, slots, kv, state_map, gdn_banks, index, ple_state, ple_replay, ple_pending: RefCell::new(None),
+        Ok(Self { quantize_grids, active_owner: Cell::new(0), library, programs, cfg, weights, ple, stream, max_context, prefill_rows, pages, slots, kv_format, kv_record_bytes, kv, state_map, gdn_banks, index, ple_state, ple_replay, ple_pending: RefCell::new(None),
             mtp_kv, mtp_pending,
             last_streams: std::cell::Cell::new((false, 0)), mtp_streams: std::cell::Cell::new((false, 0)), pool_logical,
             pool_logical_host: RefCell::new(vec![0; pool_pages]), pool_pages, workspace: RefCell::new(None),
@@ -1661,9 +1677,9 @@ impl<'a> Qwen4Engine<'a> {
         let mut scratch = 0;
         for name in ["qwen4_hc_pre".to_string(), "qwen4_hc_post_pre".into(), "qwen4_head".into(),
             "qwen4_shared".into(), ple.into(), "qwen4_mtp_feedback".into(), format!("qwen4_gdn_{cap}"),
-            format!("qwen4_attn_producer_{cap}"), format!("qwen4_gdn_w8_{cap}"),
-            format!("qwen4_attn_producer_w8_{cap}"), format!("qwen4_attn_o_w8_{cap}"),
-            format!("qwen4_sparse_gqa_{cap}"), format!("qwen4_attn_o_{cap}")] {
+            format!("qwen4_{}_{cap}", self.kv_stem("attn_producer")), format!("qwen4_gdn_w8_{cap}"),
+            format!("qwen4_{}_{cap}", self.kv_stem("attn_producer_w8")), format!("qwen4_attn_o_w8_{cap}"),
+            format!("qwen4_{}_{cap}", self.kv_stem("sparse_gqa")), format!("qwen4_attn_o_{cap}")] {
             if let Ok(bytes) = self.scratch(&name) {
                 scratch = usize::max(scratch, bytes);
             }
@@ -2897,6 +2913,15 @@ impl<'a> Qwen4Engine<'a> {
         }
     }
 
+    fn kv_stem(&self, stem: &str) -> String {
+        if self.kv_format == cuteafd_loader::families::qwen4::Qwen4KvCache::Fp8 { format!("{stem}_kv_fp8") } else { stem.into() }
+    }
+
+    fn kv_program(&self, layer: &Qwen4Layer<'_>, cap: &str) -> String {
+        let stem = if Self::w8(layer) { "attn_producer_w8" } else { "attn_producer" };
+        format!("qwen4_{}_{cap}", self.kv_stem(stem))
+    }
+
     fn program(layer: &Qwen4Layer<'_>, stem: &str, cap: &str) -> String {
         if Self::w8(layer) { format!("qwen4_{stem}_w8_{cap}") } else { format!("qwen4_{stem}_{cap}") }
     }
@@ -2947,7 +2972,7 @@ impl<'a> Qwen4Engine<'a> {
             ("pool_slots", w.pool_slots.buffer.ptr), ("kv_cache", cache), ("token_keys", keys),
             ("index_cache", blocks), ("query", w.query.buffer.ptr), ("gate", w.gate.buffer.ptr),
             ("index_q", w.index_q.buffer.ptr), ("scratch", w.scratch.buffer.ptr)]);
-        self.run(&Self::program(layer, "attn_producer", cap), &pointers, &self.w8_scalars(layer, rows, cap))?;
+        self.run(&self.kv_program(layer, cap), &pointers, &self.w8_scalars(layer, rows, cap))?;
         if tables.long {
             self.run(&format!("qwen4_index_topk_{cap}"), &[("index_q", w.index_q.buffer.ptr),
                 ("positions", w.positions.buffer.ptr), ("index_cache", blocks),
@@ -2956,7 +2981,7 @@ impl<'a> Qwen4Engine<'a> {
         }
         self.run("qwen4_index_expand", &[("positions", w.positions.buffer.ptr), ("blocks", w.blocks.buffer.ptr),
             ("indices", w.indices.buffer.ptr), ("lengths", w.lengths.buffer.ptr)], &[rows])?;
-        self.run(&format!("qwen4_sparse_gqa_{cap}"), &[("query", w.query.buffer.ptr), ("kv_cache", cache),
+        self.run(&format!("qwen4_{}_{cap}", self.kv_stem("sparse_gqa")), &[("query", w.query.buffer.ptr), ("kv_cache", cache),
             ("positions", w.positions.buffer.ptr), ("page_table", w.page_table.buffer.ptr),
             ("indices", w.indices.buffer.ptr), ("out", w.attn.buffer.ptr), ("scratch", w.scratch.buffer.ptr)],
             &[rows, Scalar::I32(tables.page_width as i32), Scalar::I32(tables.page_stride as i32)])?;

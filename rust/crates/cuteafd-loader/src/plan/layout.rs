@@ -115,6 +115,8 @@ pub struct LayoutOptions {
     pub context_tokens: u64,
     /// Resident native drafter stages (zero disables optional native MTP).
     pub native_mtp_layers: usize,
+    /// Qwen full-attention record format; index keys remain BF16.
+    pub qwen_kv: crate::families::qwen4::Qwen4KvCache,
     /// Whole routed backbone layers resident on the coordinator.
     pub local_expert_layers: Option<usize>,
     /// Families on the shared solver (V4): how many routed layers are
@@ -173,6 +175,7 @@ impl Default for LayoutOptions {
             mimo_expert_manifest: None,
             context_tokens: 0,
             native_mtp_layers: 3,
+            qwen_kv: Default::default(),
             local_expert_layers: None,
             onboard: None,
             exchange_f32: false,
@@ -1017,7 +1020,7 @@ pub fn layout(report: &mut PlanReport, model: &dyn super::FamilyModel, checkpoin
         if report.encoder.is_none() {
             let target = options.pool_tokens.filter(|&tokens| tokens != 0).unwrap_or(target_pool_tokens);
             let per_token = crate::families::qwen4::Qwen4Config::from_hf(&checkpoint.config).ok()
-                .and_then(|cfg| crate::serving_capacity::qwen_cache_geometry(&cfg, cfg.layers, cache_native_layers > 0).ok())
+                .and_then(|cfg| crate::serving_capacity::qwen_cache_geometry(&cfg, cfg.layers, cache_native_layers > 0, options.qwen_kv).ok())
                 .map_or(0, |g| (g.ranks[0].persistent_unit_bytes + g.ranks[0].pool_metadata_unit_bytes)
                     .div_ceil(g.logical_unit_rows.max(1)));
             resolve_encoder(checkpoint, report, model, &mut devices, &mut spark_devices, &[per_token * target], options,
@@ -1358,7 +1361,7 @@ fn qwen_placement(checkpoint: &super::Checkpoint, report: &PlanReport, options: 
     use crate::serving_capacity::qwen_graphs::*;
     let cfg = crate::families::qwen4::Qwen4Config::from_hf(&checkpoint.config)?;
     let mtp = shape.mtp && cfg.mtp_layers > 0;
-    let geometry = crate::serving_capacity::qwen_cache_geometry(&cfg, cfg.layers, mtp)?;
+    let geometry = crate::serving_capacity::qwen_cache_geometry(&cfg, cfg.layers, mtp, options.qwen_kv)?;
     let mark = geometry.ranks[0].retained_mark_bytes;
     let marks = options.prefix_slots.unwrap_or_else(|| cuteafd_core::prefix::mark_slots_for(shape.concurrency,
         options.mimo_prefix_entries, mark, options.mimo_prefix_mark_bytes)) * mark;
@@ -1375,7 +1378,7 @@ fn qwen_placement(checkpoint: &super::Checkpoint, report: &PlanReport, options: 
     }
     let loaded_bytes = device.used_bytes();
     let inputs = crate::placement::families::qwen4::QwenInputs {
-        admission: QwenAdmissionInputs { cfg: &cfg, layers: cfg.layers, mtp, manifest,
+        admission: QwenAdmissionInputs { cfg: &cfg, layers: cfg.layers, mtp, kv_format: options.qwen_kv, manifest,
             prefill_rows: shape.prefill_rows, slots: options.state_slots.unwrap_or(shape.concurrency), mark_bytes: marks,
             full_prefill_logits: logits, ple, future_expert_bytes: 0, headroom: options.headroom_bytes.max(3 * GIB) },
         capacity_bytes: options.rtx_bytes[0],

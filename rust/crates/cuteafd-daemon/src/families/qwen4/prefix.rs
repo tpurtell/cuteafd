@@ -25,7 +25,7 @@
 //!
 //! Each logical mark preserves global-layer ordering across owner-local arenas. Copies enqueue
 //! on the owning execution stream; drain retires work on every owner.
-use super::engine::{history_of, Allocator, Qwen4Engine, Qwen4Placement, BLOCK, INDEX_DIM, PAGE_ROWS, RECORD_BYTES,
+use super::engine::{history_of, Allocator, Qwen4Engine, Qwen4Placement, BLOCK, INDEX_DIM, PAGE_ROWS,
     UNIT_ROWS};
 use crate::shared::memory::device::{Allocation, Device};
 use std::rc::Rc;
@@ -87,7 +87,7 @@ impl<'e, 'a> Qwen4Prefix<'e, 'a> {
             engine.state_stream(buffer.device_id)?;
         }
         for [records, keys, pools] in &paged {
-            ensure!(records.bytes >= engine.pages * PAGE_ROWS * RECORD_BYTES
+            ensure!(records.bytes >= engine.pages * PAGE_ROWS * engine.kv_record_bytes
                 && keys.bytes >= engine.pages * PAGE_ROWS * KEY_BYTES
                 && pools.bytes >= engine.pool_pages * POOL_PAGE_BYTES, "attention cache buffers smaller than the units");
         }
@@ -109,7 +109,7 @@ impl<'e, 'a> Qwen4Prefix<'e, 'a> {
     }
 
     pub fn page_bytes(&self) -> usize {
-        self.paged.len() * (UNIT_ROWS * (RECORD_BYTES + KEY_BYTES) + POOL_PAGE_BYTES)
+        self.paged.len() * (UNIT_ROWS * (self.engine.kv_record_bytes + KEY_BYTES) + POOL_PAGE_BYTES)
     }
 
     pub fn slots(&self) -> usize {
@@ -130,7 +130,7 @@ impl<'e, 'a> Qwen4Prefix<'e, 'a> {
         let unit = unit as usize;
         let mut out = Vec::with_capacity(3 * self.paged.len());
         for &[records, keys, pools] in &self.paged {
-            out.push(view(records, unit * UNIT_ROWS * RECORD_BYTES, UNIT_ROWS * RECORD_BYTES)?);
+            out.push(view(records, unit * UNIT_ROWS * self.engine.kv_record_bytes, UNIT_ROWS * self.engine.kv_record_bytes)?);
             out.push(view(keys, unit * UNIT_ROWS * KEY_BYTES, UNIT_ROWS * KEY_BYTES)?);
             out.push(view(pools, unit * POOL_PAGE_BYTES, POOL_PAGE_BYTES)?);
         }
@@ -168,6 +168,13 @@ impl<'e, 'a> Qwen4Prefix<'e, 'a> {
 
 impl PrefixFamily for Qwen4Prefix<'_, '_> {
     type Placement = Qwen4Placement;
+
+    fn record_format(&self) -> &'static str {
+        match self.engine.kv_format {
+            cuteafd_loader::families::qwen4::Qwen4KvCache::Bf16 => "qwen4_bf16_v1",
+            cuteafd_loader::families::qwen4::Qwen4KvCache::Fp8 => "qwen4_e4m3_token_head_f32_v1",
+        }
+    }
 
     fn layout(&self) -> FamilyLayout {
         FamilyLayout {
@@ -214,7 +221,7 @@ impl PrefixFamily for Qwen4Prefix<'_, '_> {
     fn copy_rows(&self, copy: TailCopy) -> Result<(), BoxError> {
         let blocks = copy.rows / BLOCK;
         for &[records, keys, pools] in &self.paged {
-            for (buffer, row) in [(records, RECORD_BYTES), (keys, KEY_BYTES)] {
+            for (buffer, row) in [(records, self.engine.kv_record_bytes), (keys, KEY_BYTES)] {
                 self.copy(view(buffer, copy.to as usize * UNIT_ROWS * row, copy.rows * row)?,
                     view(buffer, copy.from as usize * UNIT_ROWS * row, copy.rows * row)?)?;
             }
@@ -312,7 +319,7 @@ fn paged_rows(family: &Qwen4Prefix<'_, '_>, placement: &Qwen4Placement, len: usi
         let rows = (len - u * UNIT_ROWS).min(UNIT_ROWS);
         let unit_blocks = (blocks.saturating_sub(u * PAGE_ROWS)).min(PAGE_ROWS);
         for ranges in family.unit_ranges(unit)?.chunks_exact(3).take(layers) {
-            out.extend_from_slice(&download(family.engine, ranges[0])?[..rows * RECORD_BYTES]);
+            out.extend_from_slice(&download(family.engine, ranges[0])?[..rows * family.engine.kv_record_bytes]);
             out.extend_from_slice(&download(family.engine, ranges[1])?[..rows * KEY_BYTES]);
             out.extend_from_slice(&download(family.engine, ranges[2])?[..unit_blocks * BLOCK_KEY_BYTES]);
         }

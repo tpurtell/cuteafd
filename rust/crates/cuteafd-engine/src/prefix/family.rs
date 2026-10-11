@@ -84,6 +84,10 @@ pub trait PrefixFamily {
     type Placement;
 
     fn layout(&self) -> FamilyLayout;
+    /// Record schema carried by host snapshots; formats cannot share restored bytes.
+    fn record_format(&self) -> &'static str {
+        "opaque_v1"
+    }
     /// The placement's pages, in row order.
     fn pages<'p>(&self, placement: &'p Self::Placement) -> &'p [u32];
     /// Committed rows: the length a snapshot of this placement may capture (a speculative

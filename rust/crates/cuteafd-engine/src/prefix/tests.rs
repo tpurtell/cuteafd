@@ -106,6 +106,7 @@ struct Fake {
     slots: usize,
     queue: RefCell<Vec<Op>>,
     fail_restore: Cell<bool>,
+    record_format: Cell<&'static str>,
     drains: Cell<usize>,
     rule: ReuseRule,
     /// A pages-only family (GLM 5.3): no mark; restores resume at the snapshot's length and the
@@ -121,7 +122,7 @@ impl Fake {
     fn new(pages: usize, rings: usize, slots: usize) -> Self {
         let bytes = (pages * ROWS + rings * RING + slots * WINDOW) * ROW;
         let mem = Rc::new(RefCell::new(StubCopyEngine::new(CopyModel::default(), bytes, 1 << 26)));
-        Self { mem, pages, rings, slots, queue: RefCell::new(Vec::new()), fail_restore: Cell::new(false), drains: Cell::new(0),
+        Self { mem, pages, rings, slots, queue: RefCell::new(Vec::new()), fail_restore: Cell::new(false), record_format: Cell::new("opaque_v1"), drains: Cell::new(0),
             rule: ReuseRule::EXACT, markless: false, pooled: false, reserved: 0 }
     }
     /// Marks in pool pages: no arena slot exists (any use of one panics). `pages` pages hand
@@ -201,6 +202,9 @@ impl Fake {
 
 impl PrefixFamily for Fake {
     type Placement = Placement;
+    fn record_format(&self) -> &'static str {
+        self.record_format.get()
+    }
     fn layout(&self) -> FamilyLayout {
         Fake::layout(self)
     }
@@ -612,6 +616,33 @@ fn host_tier_restores_evicted_snapshots_exactly_and_shares_identical_prefixes() 
     let mut longer = next.clone();
     longer.push(7);
     fake.forward(&mut p, &longer).unwrap();
+    cache.release(&fake, &p.pages).unwrap();
+}
+
+#[test]
+fn host_snapshot_rejects_a_different_record_format_before_copying() {
+    let fake = Fake::new(24, 4, 8);
+    fake.record_format.set("qwen4_e4m3_token_head_f32_v1");
+    let mut cache = cache(&fake, 8, 1 << 20);
+    let prompt = seq(100, 26);
+    let (_, _, p) = serve(&mut cache, &fake, 0, &prompt, &[], 32);
+    fake.mem.borrow_mut().advance(10_000_000);
+    cache.tick();
+    cache.release(&fake, &p.pages).unwrap();
+    assert_eq!(cache.stats().host.unwrap().stores_completed, 1);
+    cache.clear(&fake).unwrap();
+    fake.record_format.set("qwen4_bf16_v1");
+    let hit = cache.admit(&fake, &prompt, 32, false,
+        |pages| Placement { pages, ring: 1, len: 0, ring_from: 0 }).unwrap();
+    assert_eq!(hit.resume, 0);
+    assert_eq!(cache.stats().promotions, 0);
+    assert_eq!(cache.stats().host.unwrap().restores, 0);
+    cache.release(&fake, &hit.placement.pages).unwrap();
+    fake.record_format.set("qwen4_e4m3_token_head_f32_v1");
+    let (resume, _, p) = serve(&mut cache, &fake, 2, &prompt, &[], 32);
+    assert_eq!(resume, prompt.len());
+    assert_eq!(cache.stats().promotions, 1);
+    assert_eq!(cache.stats().host.unwrap().restores, 1);
     cache.release(&fake, &p.pages).unwrap();
 }
 

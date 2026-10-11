@@ -37,7 +37,7 @@ def exporter(monkeypatch):
         monkeypatch.setenv(name, "1")
     monkeypatch.setitem(sys.modules, "_pinned_sparkinfer", types.SimpleNamespace(REVISION="test"))
     package = types.ModuleType("b12x.integration.cuteafd")
-    for name in ("glmf", "dsv4_mhc", "glm_sparse_mla", "context_split"):
+    for name in ("glmf", "dsv4_mhc", "glm_sparse_mla", "context_split", "qwen4", "qwen4_gdn", "qwen4_attention"):
         module = _Compilers(f"b12x.integration.cuteafd.{name}")
         setattr(package, name, module)
         monkeypatch.setitem(sys.modules, module.__name__, module)
@@ -67,6 +67,20 @@ def test_checkpoint_extent_table_and_head_splits(exporter, geometry, checkpoint,
         assert exporter.geometry_context(name, 2097152) == limit
     with pytest.raises(ValueError, match="positive"):
         exporter.geometry_context(geometry, 0)
+
+
+def test_qwen_fp8_kv_exports_preserve_bf16_and_weight_variants(exporter):
+    programs = exporter.qwen4_programs(GEOMETRY, 64, 4096, 262144)
+    calls = {stem: thunk()[3] for stem, _, _, thunk in programs}
+    assert len(calls) == len(programs)
+    for cap in (64, 4096):
+        for stem in ("attn_producer", "sparse_gqa"):
+            assert "kv_format" not in calls[f"{stem}_m{cap}"]
+            assert calls[f"{stem}_kv_fp8_m{cap}"] == {"max_rows": cap, "kv_format": "fp8"}
+        mode = "decode" if cap == 64 else "prefill"
+        assert calls[f"attn_producer_w8_kv_fp8_m{cap}"] == {
+            "max_rows": cap, "fp8_only": mode, "kv_format": "fp8"}
+    assert calls["attn_producer_fp8_kv_fp8_m64"] == {"max_rows": 64, "fp8": True, "kv_format": "fp8"}
 
 
 def test_wide_index_uses_clamped_extent(exporter):

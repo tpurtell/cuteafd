@@ -12,11 +12,11 @@ use cuteafd_loader::placement::{families::qwen4, Baseline};
 #[allow(clippy::too_many_arguments)]
 pub(super) fn inputs<'a>(args: &EngineArgs, cfg: &'a Qwen4Config, layers: usize, mtp: bool,
     manifest: Option<&'a serde_json::Value>, ple: Option<(u64, bool)>, future_expert_bytes: u64) -> Result<QwenAdmissionInputs<'a>> {
-    let geometry = qwen_cache_geometry(cfg, layers, mtp)?;
+    let geometry = qwen_cache_geometry(cfg, layers, mtp, args.kv_format)?;
     let marks = args.planner_prefix_bytes.unwrap_or(geometry.ranks[0].retained_mark_bytes * qwen4::DEFAULT_MARK_SLOTS);
     let logits = if args.full_prefill_logits { cuteafd_loader::plan::layout::full_prefill_logits_bytes(
         "qwen4", args.prefill_rows as u64, cfg.vocab_size as u64) } else { 0 };
-    Ok(QwenAdmissionInputs { cfg, layers, mtp, manifest, prefill_rows: args.prefill_rows as u64,
+    Ok(QwenAdmissionInputs { cfg, layers, mtp, kv_format: args.kv_format, manifest, prefill_rows: args.prefill_rows as u64,
         slots: args.slots as u64, mark_bytes: marks, full_prefill_logits: logits, ple, future_expert_bytes,
         headroom: cuteafd_loader::plan::layout::LayoutOptions::default().headroom_bytes.max(3 << 30) })
 }
@@ -35,7 +35,7 @@ pub(super) fn pool_tokens(library: &NativeLibrary, args: &EngineArgs, inputs: &Q
     let sample = library.cuda_memory_info();
     library.cuda_set_device(current)?;
     let (available, total) = sample?;
-    let admission = QwenAdmissionInputs { cfg: inputs.cfg, layers: inputs.layers, mtp: inputs.mtp,
+    let admission = QwenAdmissionInputs { cfg: inputs.cfg, layers: inputs.layers, mtp: inputs.mtp, kv_format: inputs.kv_format,
         manifest: inputs.manifest, prefill_rows: inputs.prefill_rows, slots: inputs.slots,
         mark_bytes: inputs.mark_bytes, full_prefill_logits: inputs.full_prefill_logits,
         ple: inputs.ple, future_expert_bytes: inputs.future_expert_bytes, headroom: inputs.headroom };
@@ -62,6 +62,7 @@ mod tests {
         use clap::Parser;
         use cuteafd_loader::plan::{plan, testing, ExpertPlacement, PlanOptions};
         use cuteafd_loader::plan::layout::LayoutOptions;
+        use cuteafd_loader::families::qwen4::Qwen4KvCache;
         use cuteafd_loader::placement::{families::qwen4, Baseline};
         #[derive(Parser)]
         struct Cli {
@@ -71,12 +72,13 @@ mod tests {
         let snapshot = tempfile::tempdir()?;
         testing::write_snapshot(snapshot.path(), &testing::qwen4_config(48), &[], None);
         let cfg = cuteafd_loader::families::qwen4::Qwen4Config::read(snapshot.path())?;
-        for capacity in [32_u64 << 30, 101_973_491_712] {
+        for (capacity, kv_format) in [32_u64 << 30, 101_973_491_712].into_iter().flat_map(|capacity|
+            [Qwen4KvCache::Bf16, Qwen4KvCache::Fp8].map(|format| (capacity, format))) {
             for pool in [None, Some(32768)] {
                 let report = plan(snapshot.path(), &PlanOptions {
                     placement: ExpertPlacement::Local,
                     layout: Some(LayoutOptions { rtx_bytes: vec![capacity], context_tokens: 131072,
-                        pool_tokens: pool, concurrency: 8, state_slots: Some(8), prefix_slots: Some(0),
+                        pool_tokens: pool, qwen_kv: kv_format, concurrency: 8, state_slots: Some(8), prefix_slots: Some(0),
                         ..Default::default() }), ..Default::default()
                 })?;
                 let layout = report.memory_layout.unwrap();
@@ -86,7 +88,7 @@ mod tests {
                     .map(|i| i.bytes).sum::<u64>();
                 let mut args = Cli::try_parse_from(["serve", "--snapshot", snapshot.path().to_str().unwrap(),
                     "--native-lib", "/nonexistent/lib.so", "--max-context", "131072", "--slots", "8",
-                    "--pool-tokens", &pool.unwrap_or(0).to_string()])?.engine;
+                    "--pool-tokens", &pool.unwrap_or(0).to_string(), "--kv-format", &kv_format.to_string()])?.engine;
                 args.planner_prefix_bytes = Some(0);
                 args.planner_graph_modes = Some((8, true));
                 let inputs = super::inputs(&args, &cfg, 48, false, None, None, 0)?;

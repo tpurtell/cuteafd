@@ -144,9 +144,11 @@ mod owner_graph_tests {
         cfg.ple_layers = vec![1];
         for cut in [1, 2, 24, 47] {
             let owners: Vec<_> = (0..48).map(|layer| usize::from(layer >= cut)).collect();
-            for mtp in [false, true] {
-                let whole = super::super::qwen_cache_geometry(&cfg, 48, mtp).unwrap();
-                let placed = qwen_cache_geometry_placed(&cfg, &owners, mtp).unwrap();
+            for (mtp, kv_format) in [false, true].into_iter().flat_map(|mtp|
+                [crate::families::qwen4::Qwen4KvCache::Bf16, crate::families::qwen4::Qwen4KvCache::Fp8]
+                    .into_iter().map(move |format| (mtp, format))) {
+                let whole = super::super::qwen_cache_geometry(&cfg, 48, mtp, kv_format).unwrap();
+                let placed = qwen_cache_geometry_placed(&cfg, &owners, mtp, kv_format).unwrap();
                 assert_eq!(placed.placement, super::super::KvPlacement::PartitionedLayers);
                 assert_eq!(placed.ranks.iter().map(|rank| rank.persistent_unit_bytes).sum::<u64>(), whole.ranks[0].persistent_unit_bytes);
                 assert_eq!(placed.ranks.iter().map(|rank| rank.active_state_per_sequence_bytes).sum::<u64>(), whole.ranks[0].active_state_per_sequence_bytes);
@@ -154,7 +156,7 @@ mod owner_graph_tests {
                 assert_eq!(placed.ranks.iter().map(|rank| rank.speculative_replay_bytes).sum::<u64>(), whole.ranks[0].speculative_replay_bytes);
                 assert_eq!(placed.ranks[0].fixed_state_bytes, whole.ranks[0].fixed_state_bytes);
                 assert_eq!(placed.ranks[1].fixed_state_bytes, 3 * 64 * 4);
-                let no_mtp = qwen_cache_geometry_placed(&cfg, &owners, false).unwrap();
+                let no_mtp = qwen_cache_geometry_placed(&cfg, &owners, false, kv_format).unwrap();
                 assert_eq!(placed.ranks[1], no_mtp.ranks[1]);
             }
         }
@@ -171,12 +173,13 @@ mod owner_graph_tests {
 /// Partition the authoritative cache geometry by whole-layer owner, while
 /// retaining logical global unit ids. Commit tables exist on each owner;
 /// the deferred MTP id buffer and MTP pools remain on the head's owner0.
-pub fn qwen_cache_geometry_placed(cfg: &crate::families::qwen4::Qwen4Config, owners: &[usize], mtp: bool)
+pub fn qwen_cache_geometry_placed(cfg: &crate::families::qwen4::Qwen4Config, owners: &[usize], mtp: bool,
+    kv_format: crate::families::qwen4::Qwen4KvCache)
     -> anyhow::Result<super::FamilyCacheGeometry> {
     use super::{KvPlacement, RankCacheGeometry};
     let segments = qwen_graph_segments(owners).ok_or_else(|| anyhow::anyhow!("invalid Qwen cache owners"))?;
     anyhow::ensure!(owners.len() <= cfg.layers, "Qwen cache owner count exceeds the backbone");
-    let mut geometry = super::qwen_cache_geometry(cfg, owners.len(), mtp)?;
+    let mut geometry = super::qwen_cache_geometry(cfg, owners.len(), mtp, kv_format)?;
     if segments.len() == 1 { return Ok(geometry); }
     let mut ranks = vec![RankCacheGeometry::default(); 2];
     let mut previous = RankCacheGeometry::default();
@@ -185,7 +188,7 @@ pub fn qwen_cache_geometry_placed(cfg: &crate::families::qwen4::Qwen4Config, own
         Ok(())
     };
     for (layer, &owner) in owners.iter().enumerate() {
-        let current = super::qwen_cache_geometry(cfg, layer + 1, false)?.ranks[0];
+        let current = super::qwen_cache_geometry(cfg, layer + 1, false, kv_format)?.ranks[0];
         let rank = &mut ranks[owner];
         add(&mut rank.persistent_unit_bytes, current.persistent_unit_bytes - previous.persistent_unit_bytes)?;
         add(&mut rank.active_state_per_sequence_bytes,
@@ -262,14 +265,16 @@ pub fn qwen_workspace_bytes(cfg: &crate::families::qwen4::Qwen4Config, t: u64, d
 
 /// The largest scratch among the programs one Qwen step launches at `cap`
 /// (`m64` / `m4096`), and the index top-k scratch, from the program manifest.
-pub fn qwen_step_scratch(manifest: &serde_json::Value, decode: bool, ple_fp8: bool) -> (u64, u64) {
+pub fn qwen_step_scratch(manifest: &serde_json::Value, decode: bool, ple_fp8: bool,
+    kv_format: crate::families::qwen4::Qwen4KvCache) -> (u64, u64) {
     let cap = if decode { "m64" } else { "m4096" };
+    let suffix = if kv_format == crate::families::qwen4::Qwen4KvCache::Fp8 { "_kv_fp8" } else { "" };
     let scratch = |name: &str| manifest["programs"].as_array().into_iter().flatten()
         .find(|p| p["name"] == name).and_then(|p| p["scratch_bytes_at_capacity"]["scratch"].as_u64()).unwrap_or(0);
     let names = ["qwen4_hc_pre".to_string(), "qwen4_hc_post_pre".into(), "qwen4_head".into(), "qwen4_shared".into(),
         if ple_fp8 { "qwen4_ple_fp8" } else { "qwen4_ple_bf16" }.into(), "qwen4_mtp_feedback".into(),
-        format!("qwen4_gdn_{cap}"), format!("qwen4_attn_producer_{cap}"), format!("qwen4_gdn_w8_{cap}"),
-        format!("qwen4_attn_producer_w8_{cap}"), format!("qwen4_attn_o_w8_{cap}"), format!("qwen4_sparse_gqa_{cap}"),
+        format!("qwen4_gdn_{cap}"), format!("qwen4_attn_producer{suffix}_{cap}"), format!("qwen4_gdn_w8_{cap}"),
+        format!("qwen4_attn_producer_w8{suffix}_{cap}"), format!("qwen4_attn_o_w8_{cap}"), format!("qwen4_sparse_gqa{suffix}_{cap}"),
         format!("qwen4_attn_o_{cap}")];
     (names.iter().map(|n| scratch(n)).max().unwrap_or(0), scratch(&format!("qwen4_index_topk_{cap}")))
 }
@@ -295,6 +300,7 @@ pub struct QwenAdmissionInputs<'a> {
     pub cfg: &'a crate::families::qwen4::Qwen4Config,
     pub layers: usize,
     pub mtp: bool,
+    pub kv_format: crate::families::qwen4::Qwen4KvCache,
     pub manifest: Option<&'a serde_json::Value>,
     pub prefill_rows: u64,
     pub slots: u64,
@@ -309,7 +315,7 @@ pub struct QwenAdmissionInputs<'a> {
 
 pub fn qwen_admission(inputs: &QwenAdmissionInputs<'_>) -> Result<QwenAdmission, super::CacheGeometryError> {
     use cuteafd_core::memory_layout::Category;
-    let geometry = super::qwen_cache_geometry(inputs.cfg, inputs.layers, inputs.mtp)?;
+    let geometry = super::qwen_cache_geometry(inputs.cfg, inputs.layers, inputs.mtp, inputs.kv_format)?;
     let rank = &geometry.ranks[0];
     let unit = geometry.logical_unit_rows;
     // Prefill owns one page table and decode one per row, each with four
@@ -319,7 +325,7 @@ pub fn qwen_admission(inputs: &QwenAdmissionInputs<'_>) -> Result<QwenAdmission,
     let ple_fp8 = inputs.ple.is_some_and(|p| p.1);
     let mapped = inputs.ple.map(|p| p.0);
     let workspace = |decode: bool| {
-        let (scratch, topk) = inputs.manifest.map_or((0, 0), |m| qwen_step_scratch(m, decode, ple_fp8));
+        let (scratch, topk) = inputs.manifest.map_or((0, 0), |m| qwen_step_scratch(m, decode, ple_fp8, inputs.kv_format));
         let (t, logits) = if decode { (QWEN_DECODE_ROWS as u64, QWEN_DECODE_ROWS as u64) } else { (inputs.prefill_rows.max(1), 1) };
         // Page tables follow the pool (per_token above).
         qwen_workspace_bytes(inputs.cfg, t, decode, logits, 0, mapped, scratch, topk)
@@ -334,4 +340,31 @@ pub fn qwen_admission(inputs: &QwenAdmissionInputs<'_>) -> Result<QwenAdmission,
         (Category::Experts, "lazy EXL3 window", inputs.future_expert_bytes),
     ].into_iter().filter(|i| i.2 > 0).collect();
     Ok(QwenAdmission { per_token, items, headroom: inputs.headroom })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::qwen_step_scratch;
+    use crate::families::qwen4::Qwen4KvCache;
+
+    #[test]
+    fn scratch_admission_selects_the_kv_format_and_capacity() {
+        let mut programs = Vec::new();
+        for (cap, factor) in [("m64", 1_u64), ("m4096", 10)] {
+            for (stem, bytes) in [("attn_producer", 300), ("attn_producer_w8", 400),
+                ("sparse_gqa", 500), ("attn_producer_kv_fp8", 600),
+                ("attn_producer_w8_kv_fp8", 700), ("sparse_gqa_kv_fp8", 800),
+                ("index_topk", 200)] {
+                programs.push(serde_json::json!({"name": format!("qwen4_{stem}_{cap}"),
+                    "scratch_bytes_at_capacity": {"scratch": bytes * factor}}));
+            }
+        }
+        let manifest = serde_json::json!({"programs": programs});
+        for (decode, factor) in [(true, 1), (false, 10)] {
+            assert_eq!(qwen_step_scratch(&manifest, decode, false, Qwen4KvCache::Bf16),
+                (500 * factor, 200 * factor));
+            assert_eq!(qwen_step_scratch(&manifest, decode, false, Qwen4KvCache::Fp8),
+                (800 * factor, 200 * factor));
+        }
+    }
 }
