@@ -310,7 +310,9 @@ impl Locks {
             "sparks.lock" => 0, "gpu0.lock" => 1, "gpu1.lock" => 2,
             "rhea.lock" => 3, "moa.lock" => 4, _ => 5,
         });
-        let deadline = Instant::now() + Duration::from_secs(1800);
+        // A deep shared queue can hold the pool for hours; CUTEAFD_SMOKE_LOCK_WAIT_S raises the bound.
+        let wait = std::env::var("CUTEAFD_SMOKE_LOCK_WAIT_S").ok().and_then(|s| s.parse().ok()).unwrap_or(1800);
+        let deadline = Instant::now() + Duration::from_secs(wait);
         for name in ordered {
             if self.held.contains_key(name) {
                 continue;
