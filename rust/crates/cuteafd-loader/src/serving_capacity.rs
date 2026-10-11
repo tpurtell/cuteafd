@@ -4,7 +4,7 @@
 use crate::families::glm5::{GlmDsaConfig, GlmIndexer};
 use crate::families::glm5_flash::{GlmNextAttention, GlmNextConfig};
 use crate::families::mimo_v2::{MimoAttention, MimoKvCache, MimoV2Config};
-use crate::families::qwen4::{Qwen4Attention, Qwen4Config};
+use crate::families::qwen4::{Qwen4Attention, Qwen4Config, Qwen4KvCache};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
@@ -77,6 +77,7 @@ pub struct CacheOptions {
     pub coordinator_ranks: usize,
     pub native_mtp_layers: usize,
     pub mimo_kv: MimoKvCache,
+    pub qwen_kv: Qwen4KvCache,
     /// DeepSeek V4's window ring holds one prefill chunk plus its window.
     pub prefill_rows: u64,
     /// GLM 5.3 Flash's DSA index cache.
@@ -94,6 +95,7 @@ impl Default for CacheOptions {
             coordinator_ranks: 1,
             native_mtp_layers: 0,
             mimo_kv: MimoKvCache::Int8,
+            qwen_kv: Qwen4KvCache::default(),
             prefill_rows: 4096,
             glmf_index: GlmfIndexCache::Keys,
             kda_state_bytes: 4,
@@ -471,6 +473,7 @@ pub fn qwen_cache_geometry(
     cfg: &Qwen4Config,
     layers: usize,
     mtp: bool,
+    kv_format: Qwen4KvCache,
 ) -> Result<FamilyCacheGeometry, CacheGeometryError> {
     selected("qwen4", cfg.layers, layers)?;
     if cfg.kv_heads != 2
@@ -570,7 +573,7 @@ pub fn qwen_cache_geometry(
         ranks: vec![RankCacheGeometry {
             persistent_unit_bytes: product(
                 "Qwen full/MTP pools",
-                &[full + u64::from(mtp), 256 * (2048 + 256) + 64 * 256],
+                &[full + u64::from(mtp), 256 * (kv_format.record_bytes(cfg.kv_heads, cfg.head_dim) as u64 + 256) + 64 * 256],
             )?,
             pool_metadata_unit_bytes: 4,
             active_state_per_sequence_bytes: sum("Qwen active state", &[mark, mtp_pending])?,
@@ -917,8 +920,8 @@ mod tests {
         let mut config = qwen4_config(48);
         config["text_config"]["mtp_num_hidden_layers"] = json!(1);
         let cfg = Qwen4Config::from_hf(&config).unwrap();
-        let plain = qwen_cache_geometry(&cfg, 48, false).unwrap();
-        let mtp = qwen_cache_geometry(&cfg, 48, true).unwrap();
+        let plain = qwen_cache_geometry(&cfg, 48, false, Qwen4KvCache::Bf16).unwrap();
+        let mtp = qwen_cache_geometry(&cfg, 48, true, Qwen4KvCache::Bf16).unwrap();
         assert_eq!(plain.ranks[0].persistent_unit_bytes / 256, 28416);
         assert_eq!(
             mtp.ranks[0].persistent_unit_bytes - plain.ranks[0].persistent_unit_bytes,
@@ -933,6 +936,63 @@ mod tests {
             mtp.ranks[0].retained_mark_bytes,
             plain.ranks[0].retained_mark_bytes
         );
+    }
+
+    #[test]
+    fn qwen_fp8_kv_changes_only_paged_records_including_mtp() {
+        let mut config = qwen4_config(48);
+        config["text_config"]["mtp_num_hidden_layers"] = json!(1);
+        let cfg = Qwen4Config::from_hf(&config).unwrap();
+        assert_eq!(CacheOptions::default().qwen_kv, Qwen4KvCache::Fp8);
+        assert_eq!(crate::plan::layout::LayoutOptions::default().qwen_kv, Qwen4KvCache::Fp8);
+        assert_eq!(Qwen4KvCache::Bf16.record_bytes(2, 256), 2048);
+        assert_eq!(Qwen4KvCache::Fp8.record_bytes(2, 256), 1040);
+        for mtp in [false, true] {
+            let bf16 = qwen_cache_geometry(&cfg, 48, mtp, Qwen4KvCache::Bf16).unwrap();
+            let mut fp8 = qwen_cache_geometry(&cfg, 48, mtp, Qwen4KvCache::Fp8).unwrap();
+            let layers = 12 + u64::from(mtp);
+            assert_eq!(bf16.ranks[0].persistent_unit_bytes, layers * 256 * 2368);
+            assert_eq!(fp8.ranks[0].persistent_unit_bytes, layers * 256 * 1360);
+            fp8.ranks[0].persistent_unit_bytes = bf16.ranks[0].persistent_unit_bytes;
+            assert_eq!(fp8, bf16, "state, marks, tables and replay are independent of KV format");
+        }
+    }
+
+    #[test]
+    fn qwen_fixed_byte_pool_capacity_single_and_whole_layer_owners() {
+        let mut config = qwen4_config(48);
+        config["text_config"]["mtp_num_hidden_layers"] = json!(1);
+        let cfg = Qwen4Config::from_hf(&config).unwrap();
+        // A 24/24 layer cut puts six full-attention layers on each owner.
+        // The head owner also owns the optional MTP pool. Other fixed storage
+        // has already been deducted from these identical 16 GiB pool budgets.
+        let expected = [
+            (false, false, [604416, 1052160]),
+            (false, true, [557824, 971264]),
+            (true, false, [1208576, 2103808]),
+            (true, true, [1036032, 1803264]),
+        ];
+        for (dual, mtp, capacities) in expected {
+            for (format, capacity) in [Qwen4KvCache::Bf16, Qwen4KvCache::Fp8].into_iter().zip(capacities) {
+                let all = qwen_cache_geometry(&cfg, 48, mtp, format).unwrap();
+                let first = qwen_cache_geometry(&cfg, 24, false, format).unwrap();
+                let records = if dual {
+                    vec![first.ranks[0].persistent_unit_bytes,
+                        all.ranks[0].persistent_unit_bytes - first.ranks[0].persistent_unit_bytes]
+                } else {
+                    vec![all.ranks[0].persistent_unit_bytes]
+                };
+                // Pool metadata and prefill/decode tables are charged on every
+                // owner using the same conservative per-token admission rounding.
+                let tables = (1 + qwen_graphs::QWEN_DECODE_ROWS as u64) * 5 * 4;
+                let rates: Vec<_> = records.iter().map(|&bytes|
+                    (bytes + all.ranks[0].pool_metadata_unit_bytes + tables).div_ceil(256)).collect();
+                let tokens = rates.iter().map(|rate| (16_u64 << 30) / rate / 256 * 256).min().unwrap();
+                assert_eq!(tokens, capacity, "dual={dual} mtp={mtp} format={format}");
+                assert!(rates.iter().all(|rate| tokens * rate <= 16_u64 << 30));
+                assert!(rates.iter().any(|rate| (tokens + 256) * rate > 16_u64 << 30));
+            }
+        }
     }
 
     fn full_mimo(mut config: Value, full: usize, swa: usize) -> MimoV2Config {

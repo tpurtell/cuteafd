@@ -219,7 +219,7 @@ impl FamilyModel for QwenModel {
         if options.coordinator_ranks != 1 || options.native_mtp_layers > 1 {
             return Err(CacheGeometryError::Unsupported { family: "qwen4", what: "only one coordinator and at most one native MTP layer execute" });
         }
-        qwen_cache_geometry(&self.cfg, self.cfg.layers, options.native_mtp_layers == 1).map(Some)
+        qwen_cache_geometry(&self.cfg, self.cfg.layers, options.native_mtp_layers == 1, options.qwen_kv).map(Some)
     }
 
     fn accepts(&self, role: &TensorRole, stem: &str, operand: &mut QuantOperand) -> Result<(), String> {

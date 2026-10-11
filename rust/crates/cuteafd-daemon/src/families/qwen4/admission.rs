@@ -1,23 +1,22 @@
 //! Qwen automatic KV admission after weights/PLE and exact expert ownership are established.
 use super::EngineArgs;
-use anyhow::{ensure, Context, Result};
+use anyhow::Result;
 use cuteafd_ffi::NativeLibrary;
 use cuteafd_loader::families::qwen4::Qwen4Config;
 use cuteafd_loader::serving_capacity::qwen_cache_geometry;
 
-use cuteafd_loader::serving_capacity::qwen_graphs::{qwen_admission, qwen_graph_pool, qwen_startup_graphs,
-    QwenAdmissionInputs, QWEN_GRAPH_BYTES_PER_GRAPH};
+use cuteafd_loader::serving_capacity::qwen_graphs::QwenAdmissionInputs;
+use cuteafd_loader::placement::{families::qwen4, Baseline};
 
 /// The shared admission inputs (`serving_capacity::qwen_graphs::qwen_admission`) at serve's arguments.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn inputs<'a>(args: &EngineArgs, cfg: &'a Qwen4Config, layers: usize, mtp: bool,
     manifest: Option<&'a serde_json::Value>, ple: Option<(u64, bool)>, future_expert_bytes: u64) -> Result<QwenAdmissionInputs<'a>> {
-    let geometry = qwen_cache_geometry(cfg, layers, mtp)?;
-    let costs = cuteafd_loader::plan::layout::family_costs("qwen4");
-    let marks = args.planner_prefix_bytes.unwrap_or(geometry.ranks[0].retained_mark_bytes * costs.mark_slots);
+    let geometry = qwen_cache_geometry(cfg, layers, mtp, args.kv_format)?;
+    let marks = args.planner_prefix_bytes.unwrap_or(geometry.ranks[0].retained_mark_bytes * qwen4::DEFAULT_MARK_SLOTS);
     let logits = if args.full_prefill_logits { cuteafd_loader::plan::layout::full_prefill_logits_bytes(
         "qwen4", args.prefill_rows as u64, cfg.vocab_size as u64) } else { 0 };
-    Ok(QwenAdmissionInputs { cfg, layers, mtp, manifest, prefill_rows: args.prefill_rows as u64,
+    Ok(QwenAdmissionInputs { cfg, layers, mtp, kv_format: args.kv_format, manifest, prefill_rows: args.prefill_rows as u64,
         slots: args.slots as u64, mark_bytes: marks, full_prefill_logits: logits, ple, future_expert_bytes,
         headroom: cuteafd_loader::plan::layout::LayoutOptions::default().headroom_bytes.max(3 << 30) })
 }
@@ -26,38 +25,27 @@ pub(super) fn inputs<'a>(args: &EngineArgs, cfg: &'a Qwen4Config, layers: usize,
 /// the shared admission's fixed items and, with startup graphs, the largest pool whose own graph set
 /// fits beside them.
 pub(super) fn pool_tokens(library: &NativeLibrary, args: &EngineArgs, inputs: &QwenAdmissionInputs<'_>) -> Result<usize> {
-    let mut admission = qwen_admission(inputs)?;
-    // The measured code still to load before ready (lazily loaded functions, cuBLAS, the expert
-    // package's modules: `placement::inventory::LOADED_CODE`), which the planner charges in its baseline.
     let experts = if args.peers.is_some() { "none" } else if inputs.future_expert_bytes > 0 { "exl3" } else { "fp8" };
     let pending = crate::shared::inventory::pending_code(library, args.device, 0, false, "qwen4", experts)?;
-    if pending > 0 { admission.items.push((cuteafd_core::memory_layout::Category::Runtime, "loaded code", pending)); }
-    let target = cuteafd_core::serving_capacity::DEFAULT_GPU_KV_TOKENS;
-    let requested = (args.pool_tokens > 0).then_some(args.pool_tokens as u64);
     let enabled = super::engine::startup_graphs_enabled(
         std::env::var("CUTEAFD_QWEN4_GRAPHS").ok().as_deref(),
         std::env::var("CUTEAFD_QWEN4_STARTUP_GRAPHS").ok().as_deref());
-    let costs = cuteafd_loader::plan::layout::family_costs("qwen4");
-    let (requested, graph_bytes) = if let Some((sequences, speculation)) = args.planner_graph_modes.filter(|_| enabled) {
-        ensure!(sequences <= 16, "Qwen startup graphs support at most 16 concurrent sequences");
-        let current = library.cuda_get_device()?;
-        library.cuda_set_device(args.device)?;
-        let sample = library.cuda_memory_info();
-        library.cuda_set_device(current)?;
-        let (available, _) = sample?;
-        let (tokens, set) = qwen_graph_pool(available as u64, admission.fixed(), admission.per_token, target, requested,
-            |tokens| qwen_startup_graphs(args.max_context, tokens as usize, inputs.cfg.dense_context(), sequences,
-                speculation, inputs.layers)).map_err(anyhow::Error::msg)?;
-        tracing::info!(pool_tokens = tokens, graphs = set.ranks[0].executables, graph_reserve_bytes = set.bytes(0),
-            bytes_per_graph = QWEN_GRAPH_BYTES_PER_GRAPH, headroom_bytes = admission.headroom,
-            items = ?admission.items, "Qwen graph-aware KV admission before allocation");
-        (Some(tokens), set.bytes(0))
-    } else { (requested, costs.graph_bytes[0]) };
-    let tokens = crate::shared::memory_report::admitted_pool_tokens(library,
-        &[crate::shared::memory_report::KvDevice { device: args.device,
-            bytes_per_token: admission.per_token, reserve_bytes: admission.fixed().checked_add(graph_bytes)
-                .context("Qwen admission reserve overflow")? }], 256, target, requested)?;
-    Ok(usize::try_from(tokens)?)
+    let current = library.cuda_get_device()?;
+    library.cuda_set_device(args.device)?;
+    let sample = library.cuda_memory_info();
+    library.cuda_set_device(current)?;
+    let (available, total) = sample?;
+    let admission = QwenAdmissionInputs { cfg: inputs.cfg, layers: inputs.layers, mtp: inputs.mtp, kv_format: inputs.kv_format,
+        manifest: inputs.manifest, prefill_rows: inputs.prefill_rows, slots: inputs.slots,
+        mark_bytes: inputs.mark_bytes, full_prefill_logits: inputs.full_prefill_logits,
+        ple: inputs.ple, future_expert_bytes: inputs.future_expert_bytes, headroom: inputs.headroom };
+    let placement = qwen4::placement(&qwen4::QwenInputs { admission, capacity_bytes: total as u64,
+        baseline: Baseline::Measured { free_bytes: available as u64 }, pending_code_bytes: pending,
+        max_context: args.max_context as u64, requested_pool: (args.pool_tokens > 0).then_some(args.pool_tokens as u64),
+        spark_ranks: usize::from(args.peers.is_some()),
+        startup_graph_modes: args.planner_graph_modes.filter(|_| enabled) })?;
+    tracing::info!(pool_tokens = placement.pool_tokens, "Qwen shared solver admission before allocation");
+    Ok(usize::try_from(placement.pool_tokens)?)
 }
 
 #[cfg(test)]
@@ -67,6 +55,54 @@ mod tests {
     fn set(count: u64) -> Option<cuteafd_loader::placement::GraphSet> {
         Some(cuteafd_loader::placement::GraphSet::new(&[count], QWEN_GRAPH_BYTES_PER_GRAPH, QWEN_GRAPH_MARGIN_PERCENT,
             QWEN_GRAPH_MARGIN_BYTES, 0, cuteafd_loader::placement::Lifetime::Startup))
+    }
+
+    #[test]
+    fn planner_equals_runtime_qwen4() -> anyhow::Result<()> {
+        use clap::Parser;
+        use cuteafd_loader::plan::{plan, testing, ExpertPlacement, PlanOptions};
+        use cuteafd_loader::plan::layout::LayoutOptions;
+        use cuteafd_loader::families::qwen4::Qwen4KvCache;
+        use cuteafd_loader::placement::{families::qwen4, Baseline};
+        #[derive(Parser)]
+        struct Cli {
+            #[command(flatten)]
+            engine: super::super::EngineArgs,
+        }
+        let snapshot = tempfile::tempdir()?;
+        testing::write_snapshot(snapshot.path(), &testing::qwen4_config(48), &[], None);
+        let cfg = cuteafd_loader::families::qwen4::Qwen4Config::read(snapshot.path())?;
+        for (capacity, kv_format) in [32_u64 << 30, 101_973_491_712].into_iter().flat_map(|capacity|
+            [Qwen4KvCache::Bf16, Qwen4KvCache::Fp8].map(|format| (capacity, format))) {
+            for pool in [None, Some(32768)] {
+                let report = plan(snapshot.path(), &PlanOptions {
+                    placement: ExpertPlacement::Local,
+                    layout: Some(LayoutOptions { rtx_bytes: vec![capacity], context_tokens: 131072,
+                        pool_tokens: pool, qwen_kv: kv_format, concurrency: 8, state_slots: Some(8), prefix_slots: Some(0),
+                        ..Default::default() }), ..Default::default()
+                })?;
+                let layout = report.memory_layout.unwrap();
+                let device = &layout.devices[0];
+                let baseline = device.items.iter().filter(|i| !matches!(i.group.as_str(), "records" | "state" |
+                    "marks" | "graphs" | "graph growth" | "decode step" | "prefill step"))
+                    .map(|i| i.bytes).sum::<u64>();
+                let mut args = Cli::try_parse_from(["serve", "--snapshot", snapshot.path().to_str().unwrap(),
+                    "--native-lib", "/nonexistent/lib.so", "--max-context", "131072", "--slots", "8",
+                    "--pool-tokens", &pool.unwrap_or(0).to_string(), "--kv-cache", &kv_format.to_string()])?.engine;
+                args.planner_prefix_bytes = Some(0);
+                args.planner_graph_modes = Some((8, true));
+                let inputs = super::inputs(&args, &cfg, 48, false, None, None, 0)?;
+                let placement = qwen4::placement(&qwen4::QwenInputs { admission: inputs, capacity_bytes: capacity,
+                    baseline: Baseline::Measured { free_bytes: capacity - baseline }, pending_code_bytes: 0,
+                    max_context: 131072, requested_pool: pool, spark_ranks: 0,
+                    startup_graph_modes: args.planner_graph_modes })?;
+                assert_eq!(placement.pool_tokens, layout.pool_tokens);
+                for item in &placement.items[0] {
+                    assert!(device.items.contains(item), "runtime item absent in plan: {item:?}");
+                }
+            }
+        }
+        Ok(())
     }
 
     #[test]

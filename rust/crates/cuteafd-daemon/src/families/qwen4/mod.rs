@@ -42,6 +42,9 @@ pub(crate) struct EngineArgs {
     /// Tokens the K/V record pools hold across sequences (0: planner admission).
     #[arg(long, default_value_t = 32_768)]
     pub pool_tokens: usize,
+    /// Full-attention KV records (BF16 index keys in either format).
+    #[arg(long = "kv-cache", default_value_t = cuteafd_loader::families::qwen4::Qwen4KvCache::default())]
+    pub kv_format: cuteafd_loader::families::qwen4::Qwen4KvCache,
     /// Concrete serving prefix arena reservation; filled before engine loading.
     #[arg(skip)]
     pub planner_prefix_bytes: Option<u64>,
@@ -219,6 +222,19 @@ impl Opened {
     }
 }
 
+fn required_fp8_programs(args: &EngineArgs) -> Vec<String> {
+    let mut required = Vec::new();
+    if args.fp8_decode {
+        let suffix = if args.kv_format == cuteafd_loader::families::qwen4::Qwen4KvCache::Fp8 { "_kv_fp8" } else { "" };
+        for cap in ["m64".to_string(), format!("m{}", args.prefill_rows)] {
+            required.extend([format!("qwen4_gdn_w8_{cap}"),
+                format!("qwen4_attn_producer_w8{suffix}_{cap}"), format!("qwen4_attn_o_w8_{cap}")]);
+        }
+    }
+    if args.mtp_fp8_head { required.push("qwen4_head_fp8".into()); }
+    required
+}
+
 #[cfg(test)]
 mod weight_representation_tests {
     use super::*;
@@ -247,6 +263,32 @@ mod weight_representation_tests {
         assert!(args(&["--fp8-head", "true"]).unwrap().mtp_fp8_head);
         // The W8A8 switch applies to FP8-only projections only.
         assert!(args(&["--fp8-prefill-w8a8", "true"]).is_err());
+    }
+
+    #[test]
+    fn kv_cache_defaults_to_fp8_and_keeps_explicit_bf16() {
+        use cuteafd_loader::families::qwen4::Qwen4KvCache;
+        assert_eq!(args(&[]).unwrap().kv_format, Qwen4KvCache::Fp8);
+        assert_eq!(args(&["--kv-cache", "bf16"]).unwrap().kv_format, Qwen4KvCache::Bf16);
+        assert_eq!(args(&["--kv-cache", "fp8"]).unwrap().kv_format, Qwen4KvCache::Fp8);
+        assert!(args(&["--kv-cache", "int8"]).is_err());
+        assert!(args(&["--kv-format", "bf16"]).is_err());
+    }
+
+    #[test]
+    fn required_fp8_producer_uses_selected_kv_format() {
+        for format in ["bf16", "fp8"] {
+            let parsed = args(&["--fp8-decode", "true", "--kv-cache", format]).unwrap();
+            let required = required_fp8_programs(&parsed);
+            let suffix = if format == "fp8" { "_kv_fp8" } else { "" };
+            for cap in ["m64".to_string(), format!("m{}", parsed.prefill_rows)] {
+                assert!(required.contains(&format!("qwen4_attn_producer_w8{suffix}_{cap}")));
+                let other = if format == "fp8" { "" } else { "_kv_fp8" };
+                assert!(!required.contains(&format!("qwen4_attn_producer_w8{other}_{cap}")));
+                assert!(required.contains(&format!("qwen4_gdn_w8_{cap}")));
+                assert!(required.contains(&format!("qwen4_attn_o_w8_{cap}")));
+            }
+        }
     }
 
     #[test]
@@ -296,15 +338,7 @@ impl Opened {
         let args = &context_args;
         let programs = self.library.programs()?.with_manifest(&args.manifest)?;
         programs.capacities().require_context("qwen4", args.max_context)?;
-        let mut required: Vec<String> = Vec::new();
-        if args.fp8_decode {
-            for cap in ["m64".to_string(), format!("m{}", args.prefill_rows)] {
-                required.extend(["gdn", "attn_producer", "attn_o"].map(|p| format!("qwen4_{p}_w8_{cap}")));
-            }
-        }
-        if args.mtp_fp8_head {
-            required.push("qwen4_head_fp8".into());
-        }
+        let required = required_fp8_programs(args);
         for name in &required {
             programs.spec(name).with_context(|| format!("--fp8-decode / --mtp-fp8-head need the FP8-only program \
                 {name} (export_b12x_dsv4_aot.py qwen4 with the fork's fp8_only Qwen programs); rebuild the native \
@@ -385,7 +419,7 @@ impl Opened {
         let max_context = crate::shared::context::pool_context("qwen4", args.max_context, automatic_context, pool_tokens, 256)?;
         let pages = pool_tokens.div_ceil(engine::PAGE_ROWS);
         let mut engine = engine::Qwen4Engine::new(&self.library, &programs, self.cfg.clone(), model, ple, stream,
-            max_context, args.prefill_rows, pages, args.slots, embedding)?;
+            max_context, args.prefill_rows, pages, args.slots, args.kv_format, embedding)?;
         if args.planner_graph_modes.is_some() { engine.enable_startup_graphs(); }
         engine.w8a8_prefill = args.fp8_prefill_w8a8;
         if let Some(experts) = match admitted_experts { Some(experts) => experts, None => self.experts(args, layers, stream)? } {

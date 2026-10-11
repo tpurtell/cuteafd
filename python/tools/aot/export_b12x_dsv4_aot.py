@@ -503,6 +503,21 @@ def qwen4_programs(g, decode_rows: int, prefill_rows: int, max_context: int):
             (f"attn_o_w8_m{cap}", "attn_o", {"max_rows": cap, "fp8_only": mode},
              lambda r=cap, m=mode: attn.compile_qwen4_attn_o_aot(g, max_rows=r, fp8_only=m)),
         ]
+    # KV format is independent of projection-weight format; preserve the BF16 exports.
+    for cap in (decode_rows, prefill_rows):
+        out += [
+            (f"attn_producer_kv_fp8_m{cap}", "attn_producer", {"max_rows": cap, "kv_format": "fp8"},
+             lambda r=cap: attn.compile_qwen4_attn_producer_aot(g, max_rows=r, kv_format="fp8")),
+            (f"sparse_gqa_kv_fp8_m{cap}", "sparse_gqa", {"max_rows": cap, "kv_format": "fp8"},
+             lambda r=cap: attn.compile_qwen4_sparse_gqa_aot(g, max_rows=r, kv_format="fp8")),
+        ]
+    out.append((f"attn_producer_fp8_kv_fp8_m{decode_rows}", "attn_producer",
+                {"max_rows": decode_rows, "fp8": True, "kv_format": "fp8"},
+                lambda: attn.compile_qwen4_attn_producer_aot(g, max_rows=decode_rows, fp8=True, kv_format="fp8")))
+    for mode, cap in (("decode", decode_rows), ("prefill", prefill_rows)):
+        out.append((f"attn_producer_w8_kv_fp8_m{cap}", "attn_producer",
+                    {"max_rows": cap, "fp8_only": mode, "kv_format": "fp8"},
+                    lambda r=cap, m=mode: attn.compile_qwen4_attn_producer_aot(g, max_rows=r, fp8_only=m, kv_format="fp8")))
     return out
 
 

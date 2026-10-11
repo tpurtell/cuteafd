@@ -9,7 +9,7 @@
 //! indexer.index_qk_proj]`, the shared expert `w_gate_up = [gate_proj;
 //! up_proj; shared_expert_gate; 15 zero rows]`, PLE `w_kv = [key_proj;
 //! value_proj]` and FP32 `conv_w [10240, 4]`.
-use crate::shared::memory::DeviceAllocation;
+use crate::shared::memory::device::{Allocation, Device};
 use anyhow::{ensure, Context, Result};
 use cuteafd_core::DType;
 use cuteafd_ffi::{CuteafdDeviceBuffer, NativeLibrary};
@@ -26,7 +26,7 @@ pub(crate) const SHARED_ROWS: usize = 1296;
 
 pub(crate) struct Qwen4Layer<'a> {
     pub attention: Qwen4Attention,
-    operands: HashMap<&'static str, DeviceAllocation<'a>>,
+    operands: HashMap<&'static str, Allocation<'a>>,
 }
 
 impl Qwen4Layer<'_> {
@@ -45,6 +45,13 @@ impl Qwen4Layer<'_> {
 
     pub fn bytes(&self) -> usize {
         self.operands.values().map(|a| a.buffer.bytes).sum()
+    }
+
+    pub fn device(&self) -> Result<i32> {
+        let device = self.operands.values().next().context("Qwen layer without operands")?.device.id;
+        ensure!(self.operands.values().all(|allocation| allocation.device.id == device),
+            "Qwen whole-width layer operands span devices");
+        Ok(device)
     }
 
     /// Bytes of the selectable projections, after checking that each is held in
@@ -84,12 +91,12 @@ pub(crate) fn projection_residency(names: &[&str], fp8: bool) -> Result<()> {
 /// representation (the checkpoint's BF16, or an E4M3 copy with FP32 per-row x
 /// 128-K scales made at load, run through `qwen4_head_fp8` in 16-row spans).
 pub(crate) enum Qwen4Head<'a> {
-    Bf16(DeviceAllocation<'a>),
-    Fp8 { values: DeviceAllocation<'a>, scales: DeviceAllocation<'a> },
+    Bf16(Allocation<'a>),
+    Fp8 { values: Allocation<'a>, scales: Allocation<'a> },
 }
 
 impl Qwen4Head<'_> {
-    pub fn allocations(&self) -> Vec<&DeviceAllocation<'_>> {
+    pub fn allocations(&self) -> Vec<&Allocation<'_>> {
         match self {
             Self::Bf16(w) => vec![w],
             Self::Fp8 { values, scales } => vec![values, scales],
@@ -108,7 +115,7 @@ impl Qwen4Head<'_> {
 pub(crate) struct Qwen4Weights<'a> {
     pub layers: Vec<Qwen4Layer<'a>>,
     /// The final hyper-connection mixer: norm, w_down, w_up.
-    pub mixer: [DeviceAllocation<'a>; 3],
+    pub mixer: [Allocation<'a>; 3],
     pub head: Qwen4Head<'a>,
     /// The native MTP layer (`mtp.*`), when loaded.
     pub mtp: Option<MtpWeights<'a>>,
@@ -137,13 +144,13 @@ impl Qwen4Weights<'_> {
 pub(crate) struct MtpWeights<'a> {
     pub layer: Qwen4Layer<'a>,
     /// `pre_fc_norm_hidden` [4H], `pre_fc_norm_embedding` [H], `fc_hidden`, `fc_embedding` [H, H].
-    pub norm_hidden: DeviceAllocation<'a>,
-    pub norm_embed: DeviceAllocation<'a>,
-    pub fc_hidden: DeviceAllocation<'a>,
-    pub fc_embed: DeviceAllocation<'a>,
+    pub norm_hidden: Allocation<'a>,
+    pub norm_embed: Allocation<'a>,
+    pub fc_hidden: Allocation<'a>,
+    pub fc_embed: Allocation<'a>,
     /// `mtp.hyper_connection_mixer`: norm, w_down, w_up. The drafts read the
     /// target's head ([`Qwen4Weights::head`]).
-    pub mixer: [DeviceAllocation<'a>; 3],
+    pub mixer: [Allocation<'a>; 3],
 }
 
 impl MtpWeights<'_> {
@@ -175,6 +182,10 @@ fn f32_bytes(values: &[f32]) -> Vec<u8> {
 }
 
 impl<'a> Qwen4Loader<'a> {
+    fn device(&self) -> Result<Device<'a>> {
+        Ok(Device { library: self.library, id: self.library.cuda_get_device()? })
+    }
+
     pub fn tensor(&self, name: &str) -> Result<&CheckpointTensor> {
         cuteafd_ffi::memory_ledger::tensor(name);
         let at = self.checkpoint.tensors.binary_search_by(|t| t.meta.name.as_str().cmp(name))
@@ -191,19 +202,19 @@ impl<'a> Qwen4Loader<'a> {
         Ok((bytes, tensor.meta.dtype.clone(), tensor.meta.shape.clone()))
     }
 
-    fn upload(&self, bytes: &[u8]) -> Result<DeviceAllocation<'a>> {
-        let allocation = DeviceAllocation::new(self.library, bytes.len().max(256))?;
+    fn upload(&self, bytes: &[u8]) -> Result<Allocation<'a>> {
+        let allocation = Allocation::new(self.device()?, bytes.len().max(256))?;
         self.library.copy_h2d(allocation.buffer, bytes)?;
         Ok(allocation)
     }
 
     /// The row-concatenation of BF16 2-D `names` plus `pad_rows` zero rows as one operand.
-    fn rows(&self, names: &[String], pad_rows: usize) -> Result<DeviceAllocation<'a>> {
+    fn rows(&self, names: &[String], pad_rows: usize) -> Result<Allocation<'a>> {
         let _memory_format = cuteafd_ffi::memory_ledger::format("bf16");
         let tensors = names.iter().map(|n| self.raw(n).map(|t| (n, t))).collect::<Result<Vec<_>>>()?;
         let cols = tensors[0].1 .2[1];
         let rows: usize = tensors.iter().map(|(_, (_, _, shape))| shape[0]).sum::<usize>() + pad_rows;
-        let out = DeviceAllocation::new(self.library, rows * cols * 2)?;
+        let out = Allocation::new(self.device()?, rows * cols * 2)?;
         self.library.cuda_zero_bytes(out.buffer, out.buffer.bytes)?;
         let mut row = 0;
         for (name, (bytes, dtype, shape)) in &tensors {
@@ -221,7 +232,7 @@ impl<'a> Qwen4Loader<'a> {
         Ok(out)
     }
 
-    fn one(&self, name: &str) -> Result<DeviceAllocation<'a>> {
+    fn one(&self, name: &str) -> Result<Allocation<'a>> {
         let _memory_format = cuteafd_ffi::memory_ledger::format("bf16");
         let (bytes, dtype, _) = self.raw(name)?;
         ensure!(dtype == DType::Bf16, "{name}: coordinator tensors must be BF16, found {dtype:?}");
@@ -229,7 +240,7 @@ impl<'a> Qwen4Loader<'a> {
     }
 
     /// A BF16 tensor widened to FP32.
-    fn f32(&self, name: &str) -> Result<DeviceAllocation<'a>> {
+    fn f32(&self, name: &str) -> Result<Allocation<'a>> {
         let _memory_format = cuteafd_ffi::memory_ledger::format("f32");
         let (bytes, dtype, _) = self.raw(name)?;
         let values = match dtype {
@@ -240,7 +251,7 @@ impl<'a> Qwen4Loader<'a> {
         self.upload(&f32_bytes(&values))
     }
 
-    fn hc(&self, prefix: &str, inject: bool) -> Result<[DeviceAllocation<'a>; 3]> {
+    fn hc(&self, prefix: &str, inject: bool) -> Result<[Allocation<'a>; 3]> {
         let mut di = vec![format!("{prefix}.input_mix_weight_down.weight")];
         if inject {
             di.push(format!("{prefix}.block_inject_weight.weight"));
@@ -255,7 +266,7 @@ impl<'a> Qwen4Loader<'a> {
 
     /// The decoder layer under `p` (a target layer or `mtp.layers.0`).
     fn layer_at(&self, cfg: &Qwen4Config, p: &str, attention: Qwen4Attention, ple: bool) -> Result<Qwen4Layer<'a>> {
-        let mut ops: HashMap<&'static str, DeviceAllocation<'a>> = HashMap::new();
+        let mut ops: HashMap<&'static str, Allocation<'a>> = HashMap::new();
         for (site, names) in [("attn_hyper_connection", ["attn.norm", "attn.w_di", "attn.w_up"]),
             ("mlp_hyper_connection", ["mlp.norm", "mlp.w_di", "mlp.w_up"])] {
             for (name, value) in names.into_iter().zip(self.hc(&format!("{p}.{site}"), true)?) {
@@ -309,8 +320,8 @@ impl<'a> Qwen4Loader<'a> {
                 let staging = ops.remove(projection.operand).context("projection to quantize")?;
                 ensure!(staging.buffer.bytes == resident::bf16_bytes(rows, cols),
                     "{p} {}: BF16 [{rows}, {cols}] expected", projection.operand);
-                let q = DeviceAllocation::new(self.library, rows * cols)?;
-                let scale = DeviceAllocation::new(self.library, resident::fp8_block_scale_bytes(rows, cols))?;
+                let q = Allocation::new(self.device()?, rows * cols)?;
+                let scale = Allocation::new(self.device()?, resident::fp8_block_scale_bytes(rows, cols))?;
                 // SAFETY: the BF16 staging weight, the E4M3 copy and the scales are live
                 // device buffers of these shapes; the stream drains before the staging
                 // buffer drops (on error the drain result decides, as below).
@@ -343,6 +354,18 @@ impl<'a> Qwen4Loader<'a> {
     /// with `fp8_head` only an E4M3 copy (quantized on the host; the BF16 head
     /// never reaches the device).
     pub fn model(&self, cfg: &Qwen4Config, layers: usize, mtp: bool, fp8_head: bool) -> Result<Qwen4Weights<'a>> {
+        let layers = layers.min(cfg.layers);
+        self.model_placed(cfg, &vec![0; layers], &[(self.device()?, self.stream)], mtp, fp8_head)
+    }
+
+    /// Whole-width layers follow the global owner map; head and draft stay on the entry owner.
+    pub fn model_placed(&self, cfg: &Qwen4Config, owners: &[usize],
+        ranks: &[(Device<'a>, *mut c_void)], mtp: bool, fp8_head: bool) -> Result<Qwen4Weights<'a>> {
+        ensure!(!ranks.is_empty() && owners.len() <= cfg.layers && owners.iter().all(|&owner| owner < ranks.len()),
+            "invalid Qwen weight placement");
+        ensure!(ranks.iter().all(|(device, _)| std::ptr::eq(device.library, self.library)),
+            "Qwen weight placement crosses native libraries");
+        let _entry = ranks[0].0.enter()?;
         let (head, dtype, shape) = self.raw("lm_head.weight")?;
         ensure!(dtype == DType::Bf16 && shape == [cfg.vocab_size, cfg.hidden], "lm_head must be BF16 [vocab, hidden]");
         let head = if fp8_head {
@@ -359,7 +382,12 @@ impl<'a> Qwen4Loader<'a> {
         };
         let mtp = if mtp { Some(self.mtp(cfg)?) } else { None };
         Ok(Qwen4Weights {
-            layers: (0..layers.min(cfg.layers)).map(|l| self.layer(cfg, l)).collect::<Result<_>>()?,
+            layers: owners.iter().enumerate().map(|(layer, &owner)| {
+                let (device, stream) = ranks[owner];
+                let loader = Qwen4Loader { library: self.library, checkpoint: self.checkpoint,
+                    fp8_decode: self.fp8_decode, fp8_scales: self.fp8_scales, stream };
+                device.run(|| loader.layer(cfg, layer))
+            }).collect::<Result<_>>()?,
             mixer: self.hc(&format!("{PREFIX}hyper_connection_mixer"), false)?,
             head,
             mtp,

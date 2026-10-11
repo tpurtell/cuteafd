@@ -148,14 +148,16 @@ pub fn qwen_workspace_bytes(cfg: &crate::families::qwen4::Qwen4Config, t: u64, d
 
 /// The largest scratch among the programs one Qwen step launches at `cap`
 /// (`m64` / `m4096`), and the index top-k scratch, from the program manifest.
-pub fn qwen_step_scratch(manifest: &serde_json::Value, decode: bool, ple_fp8: bool) -> (u64, u64) {
+pub fn qwen_step_scratch(manifest: &serde_json::Value, decode: bool, ple_fp8: bool,
+    kv_format: crate::families::qwen4::Qwen4KvCache) -> (u64, u64) {
     let cap = if decode { "m64" } else { "m4096" };
+    let suffix = if kv_format == crate::families::qwen4::Qwen4KvCache::Fp8 { "_kv_fp8" } else { "" };
     let scratch = |name: &str| manifest["programs"].as_array().into_iter().flatten()
         .find(|p| p["name"] == name).and_then(|p| p["scratch_bytes_at_capacity"]["scratch"].as_u64()).unwrap_or(0);
     let names = ["qwen4_hc_pre".to_string(), "qwen4_hc_post_pre".into(), "qwen4_head".into(), "qwen4_shared".into(),
         if ple_fp8 { "qwen4_ple_fp8" } else { "qwen4_ple_bf16" }.into(), "qwen4_mtp_feedback".into(),
-        format!("qwen4_gdn_{cap}"), format!("qwen4_attn_producer_{cap}"), format!("qwen4_gdn_w8_{cap}"),
-        format!("qwen4_attn_producer_w8_{cap}"), format!("qwen4_attn_o_w8_{cap}"), format!("qwen4_sparse_gqa_{cap}"),
+        format!("qwen4_gdn_{cap}"), format!("qwen4_attn_producer{suffix}_{cap}"), format!("qwen4_gdn_w8_{cap}"),
+        format!("qwen4_attn_producer_w8{suffix}_{cap}"), format!("qwen4_attn_o_w8_{cap}"), format!("qwen4_sparse_gqa{suffix}_{cap}"),
         format!("qwen4_attn_o_{cap}")];
     (names.iter().map(|n| scratch(n)).max().unwrap_or(0), scratch(&format!("qwen4_index_topk_{cap}")))
 }
@@ -181,6 +183,7 @@ pub struct QwenAdmissionInputs<'a> {
     pub cfg: &'a crate::families::qwen4::Qwen4Config,
     pub layers: usize,
     pub mtp: bool,
+    pub kv_format: crate::families::qwen4::Qwen4KvCache,
     pub manifest: Option<&'a serde_json::Value>,
     pub prefill_rows: u64,
     pub slots: u64,
@@ -195,7 +198,7 @@ pub struct QwenAdmissionInputs<'a> {
 
 pub fn qwen_admission(inputs: &QwenAdmissionInputs<'_>) -> Result<QwenAdmission, super::CacheGeometryError> {
     use cuteafd_core::memory_layout::Category;
-    let geometry = super::qwen_cache_geometry(inputs.cfg, inputs.layers, inputs.mtp)?;
+    let geometry = super::qwen_cache_geometry(inputs.cfg, inputs.layers, inputs.mtp, inputs.kv_format)?;
     let rank = &geometry.ranks[0];
     let unit = geometry.logical_unit_rows;
     // Prefill owns one page table and decode one per row, each with four
@@ -205,7 +208,7 @@ pub fn qwen_admission(inputs: &QwenAdmissionInputs<'_>) -> Result<QwenAdmission,
     let ple_fp8 = inputs.ple.is_some_and(|p| p.1);
     let mapped = inputs.ple.map(|p| p.0);
     let workspace = |decode: bool| {
-        let (scratch, topk) = inputs.manifest.map_or((0, 0), |m| qwen_step_scratch(m, decode, ple_fp8));
+        let (scratch, topk) = inputs.manifest.map_or((0, 0), |m| qwen_step_scratch(m, decode, ple_fp8, inputs.kv_format));
         let (t, logits) = if decode { (QWEN_DECODE_ROWS as u64, QWEN_DECODE_ROWS as u64) } else { (inputs.prefill_rows.max(1), 1) };
         // Page tables follow the pool (per_token above).
         qwen_workspace_bytes(inputs.cfg, t, decode, logits, 0, mapped, scratch, topk)
@@ -220,4 +223,31 @@ pub fn qwen_admission(inputs: &QwenAdmissionInputs<'_>) -> Result<QwenAdmission,
         (Category::Experts, "lazy EXL3 window", inputs.future_expert_bytes),
     ].into_iter().filter(|i| i.2 > 0).collect();
     Ok(QwenAdmission { per_token, items, headroom: inputs.headroom })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::qwen_step_scratch;
+    use crate::families::qwen4::Qwen4KvCache;
+
+    #[test]
+    fn scratch_admission_selects_the_kv_format_and_capacity() {
+        let mut programs = Vec::new();
+        for (cap, factor) in [("m64", 1_u64), ("m4096", 10)] {
+            for (stem, bytes) in [("attn_producer", 300), ("attn_producer_w8", 400),
+                ("sparse_gqa", 500), ("attn_producer_kv_fp8", 600),
+                ("attn_producer_w8_kv_fp8", 700), ("sparse_gqa_kv_fp8", 800),
+                ("index_topk", 200)] {
+                programs.push(serde_json::json!({"name": format!("qwen4_{stem}_{cap}"),
+                    "scratch_bytes_at_capacity": {"scratch": bytes * factor}}));
+            }
+        }
+        let manifest = serde_json::json!({"programs": programs});
+        for (decode, factor) in [(true, 1), (false, 10)] {
+            assert_eq!(qwen_step_scratch(&manifest, decode, false, Qwen4KvCache::Bf16),
+                (500 * factor, 200 * factor));
+            assert_eq!(qwen_step_scratch(&manifest, decode, false, Qwen4KvCache::Fp8),
+                (800 * factor, 200 * factor));
+        }
+    }
 }

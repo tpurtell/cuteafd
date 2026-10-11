@@ -23,7 +23,9 @@
 use super::weights::{Qwen4Head, Qwen4Layer, Qwen4Weights};
 use crate::shared::experts::fp8::{Fp8Experts, Fp8Layer};
 use crate::shared::launch_grid::Fp8QuantizeGrid;
-use crate::shared::memory::{DeviceAllocation, HostAllocation};
+use crate::shared::memory::HostAllocation;
+use crate::shared::memory::device::{Allocation, Device, DeviceOwner};
+use std::rc::Rc;
 use crate::shared::token_io::{DeviceLogits, TokenEmbedding};
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::programs::{Programs, Scalar, VocabularyHead, VOCABULARY_HEAD_WORKSPACE};
@@ -39,7 +41,7 @@ use std::cell::{Cell, RefCell};
 use crate::shared::decode_graph::{check_bucket_thresholds, masked_row, real_row_moe, ProjectionThreshold};
 use std::ffi::c_void;
 
-type Dev<'a> = DeviceAllocation<'a>;
+type Dev<'a> = Rc<Allocation<'a>>;
 
 pub(crate) const PAGE_ROWS: usize = 64;
 /// Rows of the decode-shaped programs (`_m64`).
@@ -81,8 +83,7 @@ pub(crate) fn copy_row_limit(rows: usize, sequences: usize) -> usize {
 
 /// Selected-slot row width of the sparse attention (2048 + 3, padded to 64).
 pub(crate) const SPARSE_TOPK: usize = 2112;
-/// BF16 K/V record of one token: K [2, 256] then V [2, 256].
-pub(crate) const RECORD_BYTES: usize = 2048;
+/// BF16 index-key width, independent of the K/V record format.
 pub(crate) const INDEX_DIM: usize = 128;
 const MAX_RANKS: usize = 6;
 const HC: usize = 4;
@@ -678,6 +679,82 @@ pub(crate) enum MtpSource {
     Buffer(*mut c_void),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LayerStateHome {
+    owner: usize,
+    gdn_ordinal: Option<usize>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct LayerStateMap {
+    layers: Vec<LayerStateHome>,
+    gdn_layers: Vec<usize>,
+}
+
+impl LayerStateMap {
+    fn new(kinds: &[Qwen4Attention], owners: &[usize], devices: usize) -> Result<Self> {
+        ensure!(devices > 0 && kinds.len() == owners.len(), "invalid Qwen layer ownership map");
+        let mut gdn_layers = vec![0; devices];
+        let mut layers = Vec::with_capacity(kinds.len());
+        for (&kind, &owner) in kinds.iter().zip(owners) {
+            ensure!(owner < devices, "Qwen layer owner {owner} outside {devices} devices");
+            let gdn_ordinal = if kind == Qwen4Attention::Gdn {
+                let ordinal = gdn_layers[owner];
+                gdn_layers[owner] += 1;
+                Some(ordinal)
+            } else { None };
+            layers.push(LayerStateHome { owner, gdn_ordinal });
+        }
+        Ok(Self { layers, gdn_layers })
+    }
+}
+
+/// Compact recurrent pools on one owner. Global layer ids never index these directly.
+struct GdnBank<'a> {
+    library: &'a NativeLibrary,
+    programs: &'a Programs<'a>,
+    stream: *mut c_void,
+    layers: usize,
+    conv: Option<Dev<'a>>,
+    state: Option<Dev<'a>>,
+    replay: Option<Dev<'a>>,
+    commit_tables: Dev<'a>,
+}
+
+impl<'a> GdnBank<'a> {
+    fn new(library: &'a NativeLibrary, programs: &'a Programs<'a>, stream: *mut c_void,
+        cfg: &Qwen4Config, layers: usize, slots: usize) -> Result<Self> {
+        let zeroed = |bytes: usize| -> Result<Dev<'a>> {
+            let allocation = Rc::new(Allocation::new(Device { library, id: library.cuda_get_device()? }, bytes.max(256))?);
+            library.cuda_zero_bytes(allocation.buffer, allocation.buffer.bytes)?;
+            Ok(allocation)
+        };
+        let (conv, state, replay) = if layers > 0 {
+            (Some(zeroed(layers * slots * Qwen4Engine::conv_slot_bytes(cfg))?),
+             Some(zeroed(layers * slots * Qwen4Engine::state_slot_bytes(cfg))?),
+             Some(zeroed(layers * gdn_replay_bytes(cfg))?))
+        } else { (None, None, None) };
+        Ok(Self { library, programs, stream, layers, conv, state, replay,
+            commit_tables: zeroed(3 * DECODE_ROWS * 4)? })
+    }
+
+    fn commit(&self, table: &[i32], sequences: usize, slots: usize) -> Result<()> {
+        // SAFETY: this bank owns the stream; its previous table readers retire before upload.
+        unsafe { self.library.cuda_stream_synchronize(self.stream)? };
+        self.library.copy_h2d(cuteafd_ffi::CuteafdDeviceBuffer {
+            bytes: std::mem::size_of_val(table), ..self.commit_tables.buffer }, bytes_of(table))?;
+        if let (Some(conv), Some(state), Some(replay)) = (&self.conv, &self.state, &self.replay) {
+            let program = self.programs.program("qwen4_gdn_commit", &["state", "conv_state", "replay", "tables"])?;
+            let scalars = [sequences, self.layers, slots].map(|n| i32::try_from(n).map(Scalar::I32));
+            let scalars = scalars.into_iter().collect::<std::result::Result<Vec<_>, _>>()?;
+            // SAFETY: the live owner-local pools match the compact layer/slot geometry.
+            unsafe { program.launch(&[state.buffer.ptr, conv.buffer.ptr, replay.buffer.ptr,
+                self.commit_tables.buffer.ptr], &scalars, self.stream)? };
+        }
+        Ok(())
+    }
+}
+
 pub(crate) struct Qwen4Engine<'a> {
     quantize_grid: Fp8QuantizeGrid,
     pub library: &'a NativeLibrary,
@@ -689,18 +766,14 @@ pub(crate) struct Qwen4Engine<'a> {
     pub max_context: usize,
     pub prefill_rows: usize,
     pub pages: usize,
+    pub kv_format: cuteafd_loader::families::qwen4::Qwen4KvCache,
+    pub kv_record_bytes: usize,
     pub slots: usize,
     /// Per full layer: the K/V record pool.
     kv: Vec<Option<Dev<'a>>>,
-    /// Per layer: its ordinal among the GDN layers.
-    gdn_ord: Vec<Option<usize>>,
-    /// Every GDN layer's pools back to back (the commit program's layout):
-    /// conv state BF16 [layers, slots, 3, C], FP32 recurrent state [layers,
-    /// slots, 48, 128, 128], and the speculative replay records [layers, record].
-    gdn_conv: Option<Dev<'a>>,
-    gdn_state: Option<Dev<'a>>,
-    gdn_replay: Option<Dev<'a>>,
-    gdn_layers: usize,
+    /// One global layer map; recurrent pools are compact only within an owner.
+    state_map: LayerStateMap,
+    gdn_banks: Vec<DeviceOwner<'a, GdnBank<'a>>>,
     /// Per full layer: raw per-token index keys (BF16 [record slots, 128]) and pooled block keys.
     index: Vec<Option<(Dev<'a>, Dev<'a>)>>,
     /// PLE conv state pool (BF16 [slots, 9, 4H]) and its speculative replay record ([64, 4H]).
@@ -708,8 +781,6 @@ pub(crate) struct Qwen4Engine<'a> {
     ple_replay: Option<Dev<'a>>,
     /// Mapped PLE table: the current step's rows, gathering until the PLE layer.
     ple_pending: RefCell<Option<crate::shared::mapped_table::PendingRows>>,
-    /// Commit tables (I32 [3, sequences]).
-    commit_tables: Dev<'a>,
     /// The MTP layer's K/V records and index caches, and the stash of target
     /// pre-mixer stream rows awaiting the MTP (BF16 [slots, 64, 4, H]).
     mtp_kv: Option<(Dev<'a>, Dev<'a>, Dev<'a>)>,
@@ -797,12 +868,13 @@ struct GraphKey {
     pool_stride: usize,
 }
 
-struct GraphExec<'a>(*mut c_void, &'a NativeLibrary);
+struct GraphExec<'a>(*mut c_void, Device<'a>);
 
 impl Drop for GraphExec<'_> {
     fn drop(&mut self) {
-        // SAFETY: the executable graph is owned here and no longer launched.
-        let _ = unsafe { self.1.cuda_graph_exec_destroy(self.0) };
+        if self.1.library.is_quarantined_after_failed_drain() { return; }
+        // SAFETY: the executable graph is owned here and its execution stream drained.
+        let _ = self.1.run(|| unsafe { self.1.library.cuda_graph_exec_destroy(self.0) });
     }
 }
 
@@ -819,44 +891,47 @@ impl<'a> Qwen4Engine<'a> {
     #[allow(clippy::too_many_arguments)]
     pub fn new(library: &'a NativeLibrary, programs: &'a Programs<'a>, cfg: Qwen4Config, weights: Qwen4Weights<'a>,
         ple: Option<super::ple::PleTable<'a>>, stream: *mut c_void, max_context: usize, prefill_rows: usize,
-        pages: usize, slots: usize, embedding: TokenEmbedding<'a>) -> Result<Self> {
+        pages: usize, slots: usize, kv_format: cuteafd_loader::families::qwen4::Qwen4KvCache, embedding: TokenEmbedding<'a>) -> Result<Self> {
         let _memory_scope = cuteafd_ffi::memory_ledger::scope("kv");
         let quantize_grid = Fp8QuantizeGrid::new(library.sm_count()?, None)?;
         ensure!(embedding.hidden() == cfg.hidden, "embedding rows of {} for hidden {}", embedding.hidden(), cfg.hidden);
         cfg.check_programs()?;
+        let kv_record_bytes = kv_format.record_bytes(cfg.kv_heads, cfg.head_dim);
+        let kv_suffix = if kv_format == cuteafd_loader::families::qwen4::Qwen4KvCache::Fp8 { "_kv_fp8" } else { "" };
+        for cap in ["m64", "m4096"] {
+            programs.spec(&format!("qwen4_sparse_gqa{kv_suffix}_{cap}"))?;
+            for layer in weights.layers.iter().chain(weights.mtp.iter().map(|m| &m.layer)).filter(|l| l.attention == Qwen4Attention::Full) {
+                let stem = if Self::w8(layer) { "attn_producer_w8" } else { "attn_producer" };
+                programs.spec(&format!("qwen4_{stem}{kv_suffix}_{cap}"))?;
+            }
+        }
         let zeroed = |bytes: usize| -> Result<Dev<'a>> {
-            let allocation = DeviceAllocation::new(library, bytes.max(256))?;
+            let allocation = Rc::new(Allocation::new(Device { library, id: library.cuda_get_device()? }, bytes.max(256))?);
             library.cuda_zero_bytes(allocation.buffer, allocation.buffer.bytes)?;
             Ok(allocation)
         };
         // Whole allocation units: four record pages and one pool page each.
         let pages = pages.max(1).next_multiple_of(UNIT_PAGES);
         let pool_pages = pages / UNIT_PAGES;
-        let (mut kv, mut gdn_ord, mut index) = (Vec::new(), Vec::new(), Vec::new());
-        let mut gdn_layers = 0;
+        let (mut kv, mut index) = (Vec::new(), Vec::new());
+        let kinds: Vec<_> = weights.layers.iter().map(|l| l.attention).collect();
+        let state_map = LayerStateMap::new(&kinds, &vec![0; kinds.len()], 1)?;
         for layer in &weights.layers {
             match layer.attention {
                 Qwen4Attention::Full => {
-                    kv.push(Some(zeroed(pages * PAGE_ROWS * RECORD_BYTES)?));
-                    gdn_ord.push(None);
+                    kv.push(Some(zeroed(pages * PAGE_ROWS * kv_record_bytes)?));
                     index.push(Some((zeroed(pages * PAGE_ROWS * INDEX_DIM * 2)?,
                         zeroed(pool_pages * PAGE_ROWS * INDEX_DIM * 2)?)));
                 }
                 Qwen4Attention::Gdn => {
                     kv.push(None);
-                    gdn_ord.push(Some(gdn_layers));
-                    gdn_layers += 1;
                     index.push(None);
                 }
             }
         }
-        let (gdn_conv, gdn_state, gdn_replay) = if gdn_layers > 0 {
-            (Some(zeroed(gdn_layers * slots * Self::conv_slot_bytes(&cfg))?),
-             Some(zeroed(gdn_layers * slots * Self::state_slot_bytes(&cfg))?),
-             Some(zeroed(gdn_layers * gdn_replay_bytes(&cfg))?))
-        } else {
-            (None, None, None)
-        };
+        let device = Device { library, id: library.cuda_get_device()? };
+        let gdn_banks = vec![device.own(|| GdnBank::new(library, programs, stream, &cfg,
+            state_map.gdn_layers[0], slots))?];
         let (ple_state, ple_replay) = if weights.layers.len() > cfg.ple_layers.first().copied().unwrap_or(usize::MAX) {
             (Some(zeroed(slots * PLE_STATE_ROWS * cfg.hc_width() * 2)?),
              Some(zeroed(REPLAY_ROWS * cfg.hc_width() * 2)?))
@@ -864,16 +939,15 @@ impl<'a> Qwen4Engine<'a> {
             (None, None)
         };
         let (mtp_kv, mtp_pending) = if weights.mtp.is_some() {
-            (Some((zeroed(pages * PAGE_ROWS * RECORD_BYTES)?, zeroed(pages * PAGE_ROWS * INDEX_DIM * 2)?,
+            (Some((zeroed(pages * PAGE_ROWS * kv_record_bytes)?, zeroed(pages * PAGE_ROWS * INDEX_DIM * 2)?,
                 zeroed(pool_pages * PAGE_ROWS * INDEX_DIM * 2)?)),
              Some(zeroed(slots * MTP_PENDING_ROWS * HC * cfg.hidden * 2)?))
         } else {
             (None, None)
         };
         let pool_logical = zeroed(pool_pages * 4)?;
-        Ok(Self { quantize_grid, library, programs, cfg, weights, ple, stream, max_context, prefill_rows, pages, slots, kv, gdn_ord,
-            gdn_conv, gdn_state, gdn_replay, gdn_layers, index, ple_state, ple_replay, ple_pending: RefCell::new(None),
-            commit_tables: zeroed(3 * DECODE_ROWS * 4)?, mtp_kv, mtp_pending,
+        Ok(Self { quantize_grid, library, programs, cfg, weights, ple, stream, max_context, prefill_rows, pages, slots, kv_format, kv_record_bytes, kv, state_map, gdn_banks, index, ple_state, ple_replay, ple_pending: RefCell::new(None),
+            mtp_kv, mtp_pending,
             last_streams: std::cell::Cell::new((false, 0)), mtp_streams: std::cell::Cell::new((false, 0)), pool_logical,
             pool_logical_host: RefCell::new(vec![0; pool_pages]), pool_pages, workspace: RefCell::new(None),
             decode_workspace: RefCell::new(None), experts: None, profile: RefCell::new([0.0; 2]),
@@ -971,8 +1045,7 @@ impl<'a> Qwen4Engine<'a> {
                 self.prefill_device(placement, &tokens[..32], None, None, 1)?;
             }
             let original = placements.clone();
-            let mut buffers: Vec<_> = [&self.gdn_conv, &self.gdn_state, &self.ple_state]
-                .into_iter().filter_map(|pool| pool.as_ref().map(|pool| pool.buffer)).collect();
+            let mut buffers = self.persistent_state_buffers();
             for [kv, keys, pools] in self.paged_buffers() {
                 // Snapshot complete pools: any masked-row write, even outside the live sequences, fails.
                 buffers.extend([kv, keys, pools]);
@@ -1023,8 +1096,7 @@ impl<'a> Qwen4Engine<'a> {
         let mut placement = allocator.admit(69)?;
         self.prefill_device(&mut placement, &tokens[..32], None, None, 1)?;
         let original = placement.clone();
-        let mut buffers: Vec<_> = [&self.gdn_conv, &self.gdn_state, &self.ple_state]
-            .into_iter().filter_map(|pool| pool.as_ref().map(|pool| pool.buffer)).collect();
+        let mut buffers = self.persistent_state_buffers();
         for [kv, keys, pools] in self.paged_buffers() { buffers.extend([kv, keys, pools]); }
         let before = snapshot(&buffers)?;
         let exact = self.verify_device_ungraphed(&mut [(&mut placement, input)], true)?
@@ -1053,6 +1125,21 @@ impl<'a> Qwen4Engine<'a> {
     /// Physical row extent for an ordinary serving verify; diagnostics are ungraphed.
     pub(crate) fn verify_bucket_rows(&self, rows: usize, spec: bool, diagnostic: bool) -> usize {
         if self.startup_graphs && self.use_graphs && !diagnostic { decode_bucket(rows, spec) } else { rows }
+    }
+
+    /// Logical record traffic, not measured DRAM traffic (GQA reuse and L2 can reduce it).
+    /// Called only for the opt-in per-cycle trace, after the device work completes.
+    pub(crate) fn verify_attention_trace(&self, contexts: &[Vec<usize>], rows: usize) -> serde_json::Value {
+        let full_layers = self.weights.layers.iter().filter(|l| l.attention == Qwen4Attention::Full).count();
+        let records: usize = contexts.iter().flatten().map(|&n| n.min(SPARSE_TOPK)).sum();
+        let splits = if rows == 1 { 64 } else if rows <= 4 { 32 } else { 16 };
+        serde_json::json!({"program": format!("qwen4_{}_m64", self.kv_stem("sparse_gqa")),
+            "route": "selected_split", "physical_rows": rows, "splits": splits,
+            "qk_tile": [16, 32, 16], "pv_tile": [16, 256, 16], "kv_warps": 2,
+            "record_bytes": self.kv_record_bytes, "target_full_layers": full_layers,
+            "logical_records_per_layer_upper_bound": records,
+            "logical_record_bytes_upper_bound": records as u64 * self.kv_record_bytes as u64 * full_layers as u64,
+            "traffic_scope": "target verify; exact for dense contexts, upper bound for sparse; excludes index/query, padding and MTP draft; not DRAM bytes"})
     }
 
     pub fn captured_graphs(&self) -> usize {
@@ -1141,6 +1228,37 @@ impl<'a> Qwen4Engine<'a> {
         out
     }
 
+    /// Retain every backing allocation the host tier can read or restore.
+    pub(crate) fn snapshot_owners(&self) -> Vec<Rc<Allocation<'a>>> {
+        let mut owners = Vec::new();
+        for (kv, index) in self.kv.iter().zip(&self.index) {
+            if let (Some(kv), Some((keys, pools))) = (kv, index) {
+                owners.extend([kv.clone(), keys.clone(), pools.clone()]);
+            }
+        }
+        if let Some((kv, keys, pools)) = &self.mtp_kv {
+            owners.extend([kv.clone(), keys.clone(), pools.clone()]);
+        }
+        for bank in &self.gdn_banks {
+            owners.extend([&bank.conv, &bank.state].into_iter().filter_map(|p| p.as_ref().cloned()));
+        }
+        owners.extend(self.ple_state.as_ref().cloned());
+        owners
+    }
+
+    pub(crate) fn state_stream(&self, device: i32) -> Result<*mut c_void> {
+        self.gdn_banks.iter().find(|bank| bank.device.id == device)
+            .map(|bank| bank.stream).context("Qwen snapshot device without an execution stream")
+    }
+
+    pub(crate) fn drain_state(&self) -> Result<()> {
+        for bank in &self.gdn_banks {
+            // SAFETY: each bank owns its execution stream and live state allocations.
+            bank.device.run(|| unsafe { self.library.cuda_stream_synchronize(bank.stream) })?;
+        }
+        Ok(())
+    }
+
     fn conv_slot_bytes(cfg: &Qwen4Config) -> usize {
         (cfg.conv_kernel - 1) * cfg.gdn_conv_width() * 2
     }
@@ -1165,10 +1283,13 @@ impl<'a> Qwen4Engine<'a> {
     pub(crate) fn slot_regions(&self, slot: usize) -> Vec<cuteafd_ffi::CuteafdDeviceBuffer> {
         let mut regions = Vec::new();
         let (conv, state) = (Self::conv_slot_bytes(&self.cfg), Self::state_slot_bytes(&self.cfg));
-        for ord in 0..self.gdn_layers {
-            if let (Some(c), Some(s)) = (&self.gdn_conv, &self.gdn_state) {
-                regions.push(Self::region(c, (ord * self.slots + slot) * conv, conv));
-                regions.push(Self::region(s, (ord * self.slots + slot) * state, state));
+        for layer in &self.state_map.layers {
+            if let Some(ord) = layer.gdn_ordinal {
+                let bank = &self.gdn_banks[layer.owner];
+                if let (Some(c), Some(s)) = (&bank.conv, &bank.state) {
+                    regions.push(Self::region(c, (ord * self.slots + slot) * conv, conv));
+                    regions.push(Self::region(s, (ord * self.slots + slot) * state, state));
+                }
             }
         }
         if let Some(ple) = &self.ple_state {
@@ -1178,13 +1299,23 @@ impl<'a> Qwen4Engine<'a> {
         regions
     }
 
-    /// GDN layer `ord`'s conv state pool, recurrent state pool and replay record.
-    fn gdn_pools(&self, ord: usize) -> Result<[*mut c_void; 3]> {
-        let (c, s, r) = (self.gdn_conv.as_ref(), self.gdn_state.as_ref(), self.gdn_replay.as_ref());
-        let (Some(c), Some(s), Some(r)) = (c, s, r) else { anyhow::bail!("GDN layer without state pools") };
-        let slots = self.slots;
-        Ok([Self::region(c, ord * slots * Self::conv_slot_bytes(&self.cfg), 0).ptr,
-            Self::region(s, ord * slots * Self::state_slot_bytes(&self.cfg), 0).ptr,
+    fn persistent_state_buffers(&self) -> Vec<cuteafd_ffi::CuteafdDeviceBuffer> {
+        let mut buffers: Vec<_> = self.gdn_banks.iter().flat_map(|bank|
+            [&bank.conv, &bank.state].into_iter().filter_map(|pool| pool.as_ref().map(|p| p.buffer))).collect();
+        buffers.extend(self.ple_state.as_ref().map(|p| p.buffer));
+        buffers
+    }
+
+    /// Global GDN layer's conv/state/replay pointers inside its owner's bank.
+    fn gdn_pools(&self, index: usize) -> Result<[*mut c_void; 3]> {
+        let layer = self.state_map.layers.get(index).context("GDN global layer out of range")?;
+        let ord = layer.gdn_ordinal.context("GDN layer without a state pool")?;
+        let bank = &self.gdn_banks[layer.owner];
+        let (Some(c), Some(s), Some(r)) = (&bank.conv, &bank.state, &bank.replay) else {
+            anyhow::bail!("GDN layer without state pools")
+        };
+        Ok([Self::region(c, ord * self.slots * Self::conv_slot_bytes(&self.cfg), 0).ptr,
+            Self::region(s, ord * self.slots * Self::state_slot_bytes(&self.cfg), 0).ptr,
             Self::region(r, ord * gdn_replay_bytes(&self.cfg), 0).ptr])
     }
 
@@ -1193,13 +1324,14 @@ impl<'a> Qwen4Engine<'a> {
         let slot = usize::try_from(slot)?;
         ensure!(slot < self.slots, "state slot {slot} out of range");
         for region in self.slot_regions(slot) {
-            self.library.cuda_zero_bytes(region, region.bytes)?;
+            Device { library: self.library, id: region.device_id }.run(||
+                self.library.cuda_zero_bytes(region, region.bytes))?;
         }
         Ok(())
     }
 
     fn alloc(&self, bytes: usize) -> Result<Dev<'a>> {
-        DeviceAllocation::new(self.library, bytes.max(256))
+        Ok(Rc::new(Allocation::new(Device { library: self.library, id: self.library.cuda_get_device()? }, bytes.max(256))?))
     }
 
     fn run(&self, name: &str, pointers: &[(&str, *mut c_void)], scalars: &[Scalar]) -> Result<()> {
@@ -1223,9 +1355,9 @@ impl<'a> Qwen4Engine<'a> {
         let mut scratch = 0;
         for name in ["qwen4_hc_pre".to_string(), "qwen4_hc_post_pre".into(), "qwen4_head".into(),
             "qwen4_shared".into(), ple.into(), "qwen4_mtp_feedback".into(), format!("qwen4_gdn_{cap}"),
-            format!("qwen4_attn_producer_{cap}"), format!("qwen4_gdn_w8_{cap}"),
-            format!("qwen4_attn_producer_w8_{cap}"), format!("qwen4_attn_o_w8_{cap}"),
-            format!("qwen4_sparse_gqa_{cap}"), format!("qwen4_attn_o_{cap}")] {
+            format!("qwen4_{}_{cap}", self.kv_stem("attn_producer")), format!("qwen4_gdn_w8_{cap}"),
+            format!("qwen4_{}_{cap}", self.kv_stem("attn_producer_w8")), format!("qwen4_attn_o_w8_{cap}"),
+            format!("qwen4_{}_{cap}", self.kv_stem("sparse_gqa")), format!("qwen4_attn_o_{cap}")] {
             if let Ok(bytes) = self.scratch(&name) {
                 scratch = usize::max(scratch, bytes);
             }
@@ -1552,16 +1684,13 @@ impl<'a> Qwen4Engine<'a> {
         }
         // SAFETY: the engine owns this stream; the previous commit's table is consumed.
         unsafe { self.library.cuda_stream_synchronize(self.stream)? };
-        self.put(&self.commit_tables, &table)?;
         let i32s = |v: usize| -> Result<Scalar> { Ok(Scalar::I32(i32::try_from(v)?)) };
-        if let (Some(conv), Some(state), Some(replay)) = (&self.gdn_conv, &self.gdn_state, &self.gdn_replay) {
-            self.run("qwen4_gdn_commit", &[("state", state.buffer.ptr), ("conv_state", conv.buffer.ptr),
-                ("replay", replay.buffer.ptr), ("tables", self.commit_tables.buffer.ptr)],
-                &[i32s(n)?, i32s(self.gdn_layers)?, i32s(self.slots)?])?;
+        for bank in &self.gdn_banks {
+            bank.device.run(|| bank.commit(&table, n, self.slots))?;
         }
         if let (Some(state), Some(replay)) = (&self.ple_state, &self.ple_replay) {
             self.run("qwen4_ple_commit", &[("conv_state", state.buffer.ptr), ("replay", replay.buffer.ptr),
-                ("tables", self.commit_tables.buffer.ptr)], &[i32s(n)?])?;
+                ("tables", self.gdn_banks[0].commit_tables.buffer.ptr)], &[i32s(n)?])?;
         }
         Ok(())
     }
@@ -2108,8 +2237,9 @@ impl<'a> Qwen4Engine<'a> {
         unsafe { self.library.cuda_graph_begin_capture(self.stream)? };
         let captured = segment();
         // SAFETY: ends the capture begun above on the same stream.
+        let device = Device { library: self.library, id: self.library.cuda_get_device()? };
         let exec = unsafe { self.library.cuda_graph_end_capture(self.stream) }
-            .map(|exec| GraphExec(exec, self.library));
+            .map(|exec| GraphExec(exec, device));
         captured?;
         let exec = exec?;
         // SAFETY: the new graph reads and writes persistent engine buffers.
@@ -2220,14 +2350,22 @@ impl<'a> Qwen4Engine<'a> {
         }
     }
 
+    fn kv_stem(&self, stem: &str) -> String {
+        if self.kv_format == cuteafd_loader::families::qwen4::Qwen4KvCache::Fp8 { format!("{stem}_kv_fp8") } else { stem.into() }
+    }
+
+    fn kv_program(&self, layer: &Qwen4Layer<'_>, cap: &str) -> String {
+        let stem = if Self::w8(layer) { "attn_producer_w8" } else { "attn_producer" };
+        format!("qwen4_{}_{cap}", self.kv_stem(stem))
+    }
+
     fn program(layer: &Qwen4Layer<'_>, stem: &str, cap: &str) -> String {
         if Self::w8(layer) { format!("qwen4_{stem}_w8_{cap}") } else { format!("qwen4_{stem}_{cap}") }
     }
 
     fn gdn(&self, w: &Workspace<'_>, index: usize, layer: &Qwen4Layer<'_>, rows: Scalar, cap: &str, spec: bool)
         -> Result<()> {
-        let ord = self.gdn_ord[index].context("GDN layer without a state pool")?;
-        let [conv, state, replay] = self.gdn_pools(ord)?;
+        let [conv, state, replay] = self.gdn_pools(index)?;
         let mut pointers = vec![("x", w.x.buffer.ptr)];
         pointers.extend(Self::projection(layer, "w_in")?);
         pointers.extend([("conv_w", layer.ptr("conv_w")?), ("a_log", layer.ptr("a_log")?),
@@ -2271,7 +2409,7 @@ impl<'a> Qwen4Engine<'a> {
             ("pool_slots", w.pool_slots.buffer.ptr), ("kv_cache", cache), ("token_keys", keys),
             ("index_cache", blocks), ("query", w.query.buffer.ptr), ("gate", w.gate.buffer.ptr),
             ("index_q", w.index_q.buffer.ptr), ("scratch", w.scratch.buffer.ptr)]);
-        self.run(&Self::program(layer, "attn_producer", cap), &pointers, &self.w8_scalars(layer, rows, cap))?;
+        self.run(&self.kv_program(layer, cap), &pointers, &self.w8_scalars(layer, rows, cap))?;
         if tables.long {
             self.run(&format!("qwen4_index_topk_{cap}"), &[("index_q", w.index_q.buffer.ptr),
                 ("positions", w.positions.buffer.ptr), ("index_cache", blocks),
@@ -2280,7 +2418,7 @@ impl<'a> Qwen4Engine<'a> {
         }
         self.run("qwen4_index_expand", &[("positions", w.positions.buffer.ptr), ("blocks", w.blocks.buffer.ptr),
             ("indices", w.indices.buffer.ptr), ("lengths", w.lengths.buffer.ptr)], &[rows])?;
-        self.run(&format!("qwen4_sparse_gqa_{cap}"), &[("query", w.query.buffer.ptr), ("kv_cache", cache),
+        self.run(&format!("qwen4_{}_{cap}", self.kv_stem("sparse_gqa")), &[("query", w.query.buffer.ptr), ("kv_cache", cache),
             ("positions", w.positions.buffer.ptr), ("page_table", w.page_table.buffer.ptr),
             ("indices", w.indices.buffer.ptr), ("out", w.attn.buffer.ptr), ("scratch", w.scratch.buffer.ptr)],
             &[rows, Scalar::I32(tables.page_width as i32), Scalar::I32(tables.page_stride as i32)])?;
@@ -2488,5 +2626,33 @@ impl Drop for Qwen4Engine<'_> {
             let _ = self.library.cuda_stream_synchronize(self.stream);
             let _ = self.library.cuda_event_destroy(self.routes_ready);
         }
+    }
+}
+
+#[cfg(test)]
+mod owner_state_tests {
+    use super::*;
+
+    #[test]
+    fn global_layer_state_map_keeps_owner_local_gdn_ordinals() -> Result<()> {
+        use Qwen4Attention::{Full, Gdn};
+        let kinds = [Gdn, Gdn, Full, Gdn, Full, Gdn, Gdn, Full];
+        for cutover in 1..kinds.len() {
+            let owners: Vec<_> = (0..kinds.len()).map(|i| usize::from(i >= cutover)).collect();
+            let map = LayerStateMap::new(&kinds, &owners, 2)?;
+            let mut counts = [0; 2];
+            for (global, home) in map.layers.iter().enumerate() {
+                assert_eq!(home.owner, owners[global]);
+                if kinds[global] == Gdn {
+                    assert_eq!(home.gdn_ordinal, Some(counts[home.owner]));
+                    counts[home.owner] += 1;
+                } else { assert_eq!(home.gdn_ordinal, None); }
+            }
+            assert_eq!(map.gdn_layers, counts);
+            assert_eq!(counts.iter().sum::<usize>(), 5);
+        }
+        assert!(LayerStateMap::new(&kinds, &[0], 2).is_err());
+        assert!(LayerStateMap::new(&[Gdn], &[2], 2).is_err());
+        Ok(())
     }
 }

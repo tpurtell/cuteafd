@@ -218,7 +218,7 @@ fn serve_loop(mut args: super::EngineArgs, mut receive: mpsc::Receiver<NativeReq
     let mut media = MediaAdmission::new(EmbeddingCache::new(bytes), encoder, 16);
     if args.pool_tokens == 0 {
         let geometry = cuteafd_loader::serving_capacity::qwen_cache_geometry(&opened.cfg,
-            opened.cfg.layers, args.mtp > 0)?;
+            opened.cfg.layers, args.mtp > 0, args.kv_format)?;
         let mark = geometry.ranks[0].retained_mark_bytes as usize;
         let slots = MarkArena::slots_for(max_sequences, prefix.prefix_cache_entries, mark,
             prefix.prefix_cache_mark_mib << 20);
@@ -454,17 +454,19 @@ fn prefix_cache<'e, 'a>(engine: &'e Qwen4Engine<'a>, args: &PrefixArgs, lanes: u
     let budget = args.prefix_cache_mark_mib << 20;
     anyhow::ensure!(args.prefix_partial == Toggle::Off, "Qwen 3.8 Flash Next restores exact snapshots only (GDN state)");
     let family = Qwen4Prefix::new(engine, |mark| if entries == 0 { 0 } else { MarkArena::slots_for(lanes, entries, mark, budget) })?;
-    let host = args.host_tier(engine.library, family.template(), family.layout(), engine.max_context)?;
+    let host = args.host_config(family.layout(), engine.max_context)?.map(|config|
+        CudaCopyEngine::registered_owned(engine.library, family.snapshot_owners()).map(|copy| (config, copy)))
+        .transpose()?;
     let host_bytes = host.as_ref().map_or(0, |(config, _)| config.bytes);
     let layout = family.layout();
     let config = PrefixConfig { entries, mark_slots: family.slots(), keep_logits: true,
         min_tokens: args.prefix_cache_min_tokens };
     let cache = PrefixCache::new(layout, config, host)?;
     tracing::info!(entries, mark_slots = family.slots(), mark_bytes = family.mark_bytes(), page_bytes = layout.page_bytes,
-        pages = layout.pages, page_rows = layout.page_rows, host_bytes, points = ?args.points(),
+        pages = layout.pages, page_rows = layout.page_rows, kv_format = %engine.kv_format, host_bytes, points = ?args.points(),
         "Qwen 3.8 Flash Next prefix cache");
     cuteafd_bench::context::set_kv((layout.pages * layout.page_rows) as u64, layout.pages as u64,
-        &"BF16 full-attention + GDN/PLE state".to_string(), host_bytes);
+        &format!("{} full-attention + BF16 index + GDN/PLE state", engine.kv_format), host_bytes);
     Ok((family, cache))
 }
 
@@ -1196,7 +1198,12 @@ fn schedule(engine: &Qwen4Engine<'_>, opened: &Opened, snapshot: &std::path::Pat
                 ("gpu", gpu(0)), ("experts", gpu(1))]
         });
         if let Some(trace) = trace.as_mut() {
+            let contexts: Vec<Vec<usize>> = starts.iter().zip(&sequences)
+                .map(|(&start, rows)| (1..=rows.len()).map(|offset| start + offset).collect()).collect();
             trace.cycle(serde_json::json!({"rows": tokens.len(), "seqs": sequences.len(),
+                "attention": engine.verify_attention_trace(&contexts,
+                    engine.verify_bucket_rows(tokens.len(), spec, diagnostic)),
+                "contexts": contexts,
                 "ids": active.iter().map(|a| a.id).collect::<Vec<_>>(),
                 "depths": sequences.iter().map(|s| s.len() - 1).collect::<Vec<_>>(),
                 "kept": kept.iter().map(|k| k.map_or(0, |(n, _)| n)).collect::<Vec<_>>(),

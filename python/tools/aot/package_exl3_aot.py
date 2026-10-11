@@ -451,9 +451,14 @@ def shard_profiles(geometry: str, role: str) -> list[tuple]:
     blocks = intermediate // 128
     if role != 'spark':
         profiles = [('rtx-tp1', intermediate, experts, topk, 'fp32', ['rtx-tp1'])]
-        # Dual-RTX halves only where they are whole H128 blocks (not Qwen's 640).
         if blocks % 2 == 0:
             profiles.append(('rtx-tp2', intermediate // 2, experts, topk, 'fp32', ['rtx-tp2']))
+        else:
+            # Unequal ranks preserve complete native H128 rotations, with no padding.
+            for rank in range(2):
+                width = (blocks // 2 + (rank < blocks % 2)) * 128
+                name = f'rtx-tp2-rank{rank}'
+                profiles.append((name, width, experts, topk, 'fp32', [name]))
         return profiles
     profiles = []
     # Six ranks wherever each gets at least one H128 block (V4 Pro: 24 -> 4;

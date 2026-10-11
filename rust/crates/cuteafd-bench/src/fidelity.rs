@@ -245,7 +245,7 @@ fn comparison_settings(server: &serde_json::Value) -> Result<serde_json::Value> 
             // GLM 5.3 Flash's kda-state (its KDA recurrent state's storage) and target-head (the
             // target LM head's GEMM) change numerics only.
             if !matches!(name, "CUTEAFD_V41_FP8_HEAD" | "fp8-head" | "kda-fp8" | "fp8-prefill"
-                | "fp8-decode" | "mtp-fp8-head" | "kv-cache" | "expert-input" | "kda-state" | "target-head") {
+                | "fp8-decode" | "mtp-fp8-head" | "kv-cache" | "kv-format" | "expert-input" | "kda-state" | "target-head") {
                 fixed.insert(name.to_owned(), value.clone());
             }
         }
@@ -574,6 +574,23 @@ mod tests {
         assert!(compare(&a, &a, 0.005, 0.005, 100, 1).is_err());
         a = b.clone(); a.settings["family"] = serde_json::json!("other");
         assert!(compare(&a, &b, 0.005, 0.005, 100, 1).is_err());
+    }
+
+    #[test]
+    fn pairing_accepts_qwen_kv_cache_but_not_pool_or_scheduling() {
+        let mut b = run(3, 8);
+        b.settings = serde_json::json!({"model": "checkpoint", "settings": [
+            {"name": "concurrency", "value": "16"},
+            {"name": "pool-tokens", "value": "0"},
+            {"name": "kv-cache", "value": "bf16"}]});
+        let mut a = b.clone();
+        a.settings["settings"][2]["value"] = serde_json::json!("fp8");
+        assert!(compare(&a, &b, 0.005, 0.005, 100, 1).unwrap().pass);
+        for (index, value) in [(0, "8"), (1, "32768")] {
+            let mut changed = a.clone();
+            changed.settings["settings"][index]["value"] = serde_json::json!(value);
+            assert!(compare(&changed, &b, 0.005, 0.005, 100, 1).is_err());
+        }
     }
 
     #[test]

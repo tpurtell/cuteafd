@@ -1,5 +1,8 @@
 """Execute the real native bridges against stubbed CUDA/AOT launch entries."""
+import importlib.util
 from pathlib import Path
+import sys
+from types import ModuleType
 import shutil
 import subprocess
 import tempfile
@@ -12,14 +15,16 @@ BUILD_ROOT = Path.home() / ".cache/cuteafd/builds/plat1-sm120/native-host-tests"
 CUDA = r"""
 #pragma once
 using cudaLibrary_t = void*;
+using cudaStream_t = void*;
 using cudaError_t = int;
-constexpr int cudaSuccess=0, cudaErrorInvalidValue=1, cudaErrorInvalidDevice=101;
+constexpr int cudaSuccess=0, cudaErrorInvalidValue=1, cudaErrorMemoryAllocation=2, cudaErrorInvalidDevice=101;
 constexpr int cudaDevAttrComputeCapabilityMajor=1, cudaDevAttrComputeCapabilityMinor=2,
               cudaDevAttrMultiProcessorCount=3;
-inline int device=2, major=12, minor=0, recorded_grid=0, recorded_cap=0;
+inline int device=2, major=12, minor=0, recorded_grid=0, recorded_cap=0, attribute_error=0, override_sms=0;
 inline int cudaGetDevice(int* out) { *out=device; return 0; }
 inline int cudaDeviceGetAttribute(int* out, int attr, int dev) {
-  *out=attr==1 ? major : attr==2 ? minor : dev==2 ? 170 : 188; return 0;
+  if (attribute_error) return attribute_error;
+  *out=attr==1 ? major : attr==2 ? minor : override_sms ? override_sms : dev==2 ? 170 : 188; return 0;
 }
 inline int cudaLibraryUnload(void*) { return 0; }
 inline void init(void** args) { **static_cast<void***>(args[0])=reinterpret_cast<void*>(1); }
@@ -123,6 +128,81 @@ int main() {
    reinterpret_cast<uint8_t*>(0x20000),1,nullptr)==cudaErrorInvalidDevice);
 }
 """
+
+
+@pytest.mark.parametrize("blocks", [1, 2])
+def test_exl3_generated_bridge_uses_runtime_sms_and_propagates_errors(monkeypatch, blocks):
+    compiler = shutil.which("g++")
+    if not compiler:
+        pytest.skip("native bridge qualification needs a C++ compiler")
+    monkeypatch.setitem(sys.modules, "_pinned_sparkinfer", ModuleType("_pinned_sparkinfer"))
+    spec = importlib.util.spec_from_file_location(
+        "sm_test_exl3_export", ROOT / "python/tools/aot/export_b12x_exl3_aot.py")
+    exporter = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(exporter)
+    subprocess.run(["python3", str(ROOT / "scripts/build/assert-build-filesystem.py"), str(BUILD_ROOT)], check=True)
+    BUILD_ROOT.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=BUILD_ROOT) as temp:
+        directory = Path(temp)
+        (directory / "cuda_runtime.h").write_text(CUDA)
+        objects = []
+        for role in ("core", "sum"):
+            label = f"v41_exl3_{role}"
+            (directory / f"{label}.h").write_text(f'''
+#pragma once
+#include "cuda_runtime.h"
+struct cuteafd_{label}_Kernel_Module_t {{ cudaLibrary_t module; }};
+inline void _mlir_cuteafd_{label}_cuda_init(void** args) {{
+  struct Init {{ cudaLibrary_t** library; cudaError_t* status; }};
+  auto* init = reinterpret_cast<Init*>(args);
+  **init->library = reinterpret_cast<void*>(1); *init->status = 0;
+}}
+inline void _mlir_cuteafd_{label}_cuda_load_to_device(void**) {{}}
+inline int wrapper_{role}(cuteafd_{label}_Kernel_Module_t*, void*, int32_t, int32_t grid, cudaStream_t) {{ recorded_grid=grid; return 0; }}
+''')
+            objects.append(dict(label=label, wrapper=f"wrapper_{role}", parameters=[
+                f"cuteafd_{label}_Kernel_Module_t *module", "void *input",
+                "int32_t active_m", "int32_t grid_x", "cudaStream_t stream"]))
+        exporter.write_bridge(directory, dict(blocks_per_sm=blocks, sms=188, compute=[12, 0],
+            capacity=16, hidden=128, intermediate=128, experts=4, top_k=2,
+            bits=[3, 4], output_dtype="bf16", objects=objects))
+        (directory / "main.cc").write_text(r'''
+#include <algorithm>
+#include <cassert>
+#include <cstdint>
+#include <initializer_list>
+#include "v41_exl3_bridge.cc"
+int main() {
+ for (int dev : {2,5}) {
+  device=dev; void* handle=nullptr;
+  assert(cuteafd_exl3_create(&handle)==0);
+  void* pointers[]={reinterpret_cast<void*>(0x10000)};
+  for (int requested : {1,94,170,188,376}) {
+   int32_t scalars[]={16,requested};
+   const int expected=std::min(requested,(dev==2 ? 170 : 188)*BLOCKS);
+   assert(cuteafd_exl3_core(handle,pointers,scalars,nullptr)==0);
+   assert(recorded_grid==expected && scalars[1]==requested);
+   assert(cuteafd_exl3_sum(handle,pointers,scalars,nullptr)==0);
+   assert(recorded_grid==expected);
+  }
+  device=dev==2 ? 5 : 2;
+  int32_t scalars[]={1,1};
+  assert(cuteafd_exl3_core(handle,pointers,scalars,nullptr)==cudaErrorInvalidDevice);
+  cuteafd_exl3_destroy(handle);
+ }
+ void* handle=reinterpret_cast<void*>(1);
+ attribute_error=999;
+ assert(cuteafd_exl3_create(&handle)==999 && handle==nullptr);
+ attribute_error=0; override_sms=189;
+ assert(cuteafd_exl3_create(&handle)==cudaErrorInvalidDevice && handle==nullptr);
+ override_sms=0; minor=1;
+ assert(cuteafd_exl3_create(&handle)==cudaErrorInvalidDevice && handle==nullptr);
+}
+'''.replace("BLOCKS", str(blocks)))
+        subprocess.run([compiler, "-std=c++17", "-pthread", "-I", str(directory),
+                        str(directory / "main.cc"), "-o", str(directory / "test")],
+                       check=True, timeout=750)
+        subprocess.run([str(directory / "test")], check=True, timeout=30)
 
 
 @pytest.mark.parametrize("family", ["fp8", "expert"])

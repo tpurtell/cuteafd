@@ -299,6 +299,9 @@ pub(crate) struct PlanArgs {
     /// Explicit KV pool tokens for --layout (0 or omitted: automatic).
     #[arg(long)]
     pub(crate) pool_tokens: Option<u64>,
+    /// Qwen full-attention KV format for --layout.
+    #[arg(long = "kv-cache", default_value_t = cuteafd_loader::families::qwen4::Qwen4KvCache::default())]
+    pub(crate) kv_format: cuteafd_loader::families::qwen4::Qwen4KvCache,
     /// External drafter GiB on the last GPU for --layout (DFlash).
     #[arg(long, default_value_t = 0.0)]
     pub(crate) drafter_gib: f64,
@@ -577,6 +580,24 @@ pub(crate) struct TransportCapabilitiesArgs {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn plan_qwen_kv_defaults_to_fp8_and_keeps_explicit_bf16() {
+        use clap::Parser;
+        use cuteafd_loader::families::qwen4::Qwen4KvCache;
+        let base = ["cuteafd", "plan", "/model"];
+        for (flags, expected) in [
+            (vec![], Qwen4KvCache::Fp8),
+            (vec!["--kv-cache", "bf16"], Qwen4KvCache::Bf16),
+            (vec!["--kv-cache", "fp8"], Qwen4KvCache::Fp8),
+        ] {
+            let super::Commands::Plan(args) = super::Cli::try_parse_from(
+                base.into_iter().chain(flags)).unwrap().command else { panic!("expected plan"); };
+            assert_eq!(args.kv_format, expected);
+        }
+        assert!(super::Cli::try_parse_from(base.into_iter().chain(["--kv-cache", "int8"])).is_err());
+        assert!(super::Cli::try_parse_from(base.into_iter().chain(["--kv-format", "bf16"])).is_err());
+    }
+
     #[test]
     fn dsv4_golden_accepts_nll_and_requires_it_for_saved_logits() {
         use clap::Parser;
