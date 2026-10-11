@@ -1946,7 +1946,8 @@ fn observe_lane_round<'a, C: DraftChain<'a>>(draft: Option<&mut DraftRuntime<'_,
     if !capture_routes { return; }
     let requests: Vec<_> = members.iter().zip(inputs).zip(accepted).zip(copied)
         .filter_map(|(((&slot, input), &count), &copied)|
-            active[slot].as_ref().map(|r| (r.id(), input.len(), count, copied))).collect();
+            active[slot].as_ref().map(|r| super::speculative::LaneRequest { id: r.id(), rows: input.len(),
+                accepted: count, copied })).collect();
     if requests.len() != members.len() { return; }
     draft.observe_round(lane, shared, routes, layer_us, &requests, clock.observe());
 }
