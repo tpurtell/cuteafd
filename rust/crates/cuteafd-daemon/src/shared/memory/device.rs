@@ -127,9 +127,38 @@ impl<'a> Allocation<'a> {
 }
 impl Drop for Allocation<'_> {
     fn drop(&mut self) {
+        if self.device.library.is_quarantined_after_failed_drain() {
+            // Match legacy allocations: cudaFree may wait on unproved work.
+            return;
+        }
         if let Err(error) = self.device.run(|| self.device.library.free_device_buffer(&mut self.buffer)) {
             tracing::error!(%error, "freeing device-owned allocation");
         }
+    }
+}
+
+#[cfg(test)]
+mod allocation_lifetime_tests {
+    use super::*;
+    use cuteafd_ffi::native_library_lifetime_fixture::Fixture;
+
+    #[test]
+    #[ignore = "requires an allocated CPU build slot and explicit NVMe fixture directory"]
+    fn quarantined_allocation_drop_never_calls_cuda_free() -> Result<()> {
+        for quarantined in [false, true] {
+            let fixture = Fixture::build()?;
+            let library = fixture.load()?;
+            let allocation = Allocation::new(Device { library: &library, id: 1 }, 256)?;
+            assert_eq!(library.cuda_get_device()?, 0, "allocation must restore the current device");
+            if quarantined { library.quarantine_module_after_failed_drain(); }
+            drop(allocation);
+            assert_eq!(fixture.events()?, if quarantined { "D" } else { "Dd" });
+            assert_eq!(library.cuda_get_device()?, 0, "drop must preserve the current device");
+            drop(library);
+            assert_eq!(fixture.events()?, if quarantined { "D" } else { "DdU" });
+            assert_eq!(fixture.resident()?, quarantined);
+        }
+        Ok(())
     }
 }
 
