@@ -4779,10 +4779,10 @@ PATH are what every spawned process inherits. Commands keep upstream's
 resolve on the host against it; `~` is the remote home; temp is the
 host's `/tmp`. `hello` grows `cuteafd: {hostname, user, home, shell, arch,
 release, tools}` (one `helloSchema` line on the client, a few in the
-helper) for the prompt (11) and the host card. Hosts: Linux x64/arm64 and
-macOS (the helper's four targets). **Windows hosts are out of scope** (no
-helper target, no sshd PTY semantics we rely on); the host card refuses
-them at registration. v3 (W5).
+helper) for the prompt (11) and the host card. Hosts: anything that accepts SSH
+and runs bash where the helper has a build (Linux x64/arm64 glibc >= 2.28,
+WSL included, and macOS); the host card probes and names what is missing
+(decision 6). v3 (W5).
 
 **9. Latency budget.** LAN RTT is ~0.2 ms and a helper RPC ~1-3 ms, so file
 tools are cheap. The expensive part is process launch: `process.prepare`,
@@ -4935,22 +4935,27 @@ as a waterfall (then the dispatcher enters from `agent/pre-step` alone and
 one core patch around dispatch). `dsh-smoke.sh` runs the guard test and one
 remote task on every rebase.
 
-**Decisions for TJ (with recommendations).**
-1. Connection per host (shared by its sessions) or per session?
-   *Per host*: fewer processes, warm for subagents, same failure domain.
-2. Detached jobs (W8) through our helper daemon, or tmux? *Helper daemon*,
-   with `systemd-run --user` when present; tmux owns no offsets or exit
-   codes and may be missing.
-3. Default preset on cluster hosts: *`workspace-write` + ask everywhere*;
-   `danger-full-access` is an explicit per-session switch, as in DSH.
-4. LSP: *off by default*, per-host opt-in in W7.
-5. Keepalive and lease at 15 s detection (a 5 s keepalive on every idle
-   connection)? *Yes*; the chatter is negligible on the LAN.
-6. macOS hosts allowed at registration? *Yes* (the helper supports them);
-   Windows refused.
-7. Replace W0's per-tool `executionCtx` edits with the ALS dispatcher now,
-   before W4's gate? *Yes*: it is less code, it covers operator-installed
-   plugins, and the guard test is only writable against it.
+**Decided (TJ, 2026-10-11).**
+1. **One SSH connection per session**, not per host. A session's subagents
+   share it. This replaces the per-host pool in item 1: each session owns
+   its `SshConnection` and helper in its own child context, closed when the
+   session closes or after 60 s idle, and a drop affects only that session.
+2. **Detached jobs (W8) through our own helper**, which we control: daemon
+   mode, with `systemd-run --user` when present. Not tmux.
+3. **Permission defaults unchanged.** The presets keep DSH's own defaults
+   (`workspace-write` + ask; `danger-full-access` as an explicit
+   per-session switch).
+4. **LSP off by default**, which is also upstream's default: the `lsp` group
+   ships no servers and no bundle mounts it. W7 adds a per-host opt-in list.
+5. 15 s dead-host detection (5 s keepalive, 15 s lease), as recommended.
+6. **Hosts: anything that accepts SSH and runs bash**, WSL included (its
+   sshd is Linux). Registration probes the host: `bash` present, `uname -sm`,
+   libc. It accepts the host when the helper has a build for that platform:
+   Linux x64/arm64 with glibc >= 2.28 (WSL included), and macOS x64/arm64.
+   Otherwise it names what is missing. musl (Alpine), FreeBSD, and native
+   Windows via MSYS or Cygwin bash need a helper build first, and are added
+   when a host needs them.
+7. The ALS dispatcher replaces the per-tool edits before W4's gate (done).
 
 ### Staged steps and gates
 
