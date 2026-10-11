@@ -1,4 +1,5 @@
 //! What a family tells the prefix cache, and the device work it does for it.
+use super::entry::Mark;
 use super::marks::MarkSlot;
 use super::pages::TailCopy;
 use cuteafd_core::prefix::ReuseRule;
@@ -44,6 +45,126 @@ impl MarkStore {
     }
 }
 
+/// Which retained snapshot page pressure evicts first.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub enum Eviction {
+    /// Least recently used, prompts before turns at equal use ([`super::victim`]).
+    #[default]
+    LeastRecent,
+    /// The least recently used snapshot whose eviction frees a page: one with a page (or mark
+    /// page) no live placement and no other snapshot holds. A snapshot every page of which a
+    /// running request or a longer snapshot also holds frees nothing and stays, so its prefix
+    /// stays reusable (V4.1's `Gain::Pages` rule, generalized).
+    FreesPages,
+}
+
+/// Whether a restore reproduces the state a prefill of the same tokens would have.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum RestoreFidelity {
+    /// Every byte the model reads is the snapshot's (AGENTS "Exact prefix-cache restores").
+    Exact,
+    /// Shared pages hold exact rows through `source_end`, but positional state restarts empty
+    /// at `replay_start` and the replayed rows rebuild it approximately (a partial match).
+    ApproximateReplay,
+}
+
+/// Two frontiers of one restore: shared pages are exact through `source_end`; prefill resumes at
+/// `replay_start` (<= `source_end`), rebuilding positional state from there. Equal for an exact
+/// frontier. V4.1's partial match keeps compressed sources through the even-aligned common prefix
+/// but rebuilds its windows from 128 rows earlier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct LaggedState {
+    pub source_end: usize,
+    pub replay_start: usize,
+}
+
+/// A snapshot the cache selected for a prompt, before the family plans its restore.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RestoreCandidate<'m> {
+    /// Tokens the prompt and the snapshot share, raw (not yet rounded to a media boundary).
+    pub common: usize,
+    /// The snapshot's length.
+    pub snapshot_end: usize,
+    /// The prompt's length.
+    pub target_end: usize,
+    /// The resume the cache ranked this snapshot by: the reuse rule's, rounded down to a point
+    /// outside every image of either prompt.
+    pub resume: usize,
+    /// Media spans of the prompt and of the snapshot.
+    pub media: &'m [cuteafd_core::MediaSpan],
+    pub saved_media: &'m [cuteafd_core::MediaSpan],
+}
+
+impl RestoreCandidate<'_> {
+    /// `at`, rounded down to a point inside no image of either prompt.
+    pub fn media_safe(&self, at: usize) -> usize {
+        let mut at = at;
+        loop {
+            let rounded = crate::media::round_frontier(crate::media::round_frontier(at, self.media), self.saved_media);
+            if rounded == at { return at; }
+            at = rounded;
+        }
+    }
+}
+
+/// How a family restores a selected snapshot ([`PrefixFamily::plan_restore`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct RestorePlan {
+    pub snapshot_end: usize,
+    pub target_end: usize,
+    pub lag: LaggedState,
+    pub fidelity: RestoreFidelity,
+}
+
+impl RestorePlan {
+    /// The default plan under `rule`: an exact frontier restores its mark; a partial match
+    /// resumes at the rule's replay start with no mark, its pages forked through the same point.
+    pub fn under(rule: ReuseRule, hit: RestoreCandidate<'_>) -> Self {
+        let _ = rule;
+        let exact = hit.common == hit.snapshot_end;
+        let resume = if exact { hit.snapshot_end } else { hit.resume };
+        Self {
+            snapshot_end: hit.snapshot_end,
+            target_end: hit.target_end,
+            lag: LaggedState { source_end: resume, replay_start: resume },
+            fidelity: if exact { RestoreFidelity::Exact } else { RestoreFidelity::ApproximateReplay },
+        }
+    }
+    /// Where prefill resumes.
+    pub fn resume(&self) -> usize {
+        self.lag.replay_start
+    }
+    pub fn exact(&self) -> bool {
+        self.fidelity == RestoreFidelity::Exact
+    }
+    /// The invariants every plan keeps: replay never starts past the shared source frontier,
+    /// nor the source frontier past the snapshot or the prompt, and an exact plan resumes at the
+    /// snapshot's own frontier.
+    pub fn check(&self, common: usize) -> Result<(), &'static str> {
+        let LaggedState { source_end, replay_start } = self.lag;
+        if replay_start > source_end || source_end > common.min(self.snapshot_end) || source_end > self.target_end {
+            return Err("restore plan frontiers out of order");
+        }
+        if self.exact() && (source_end != self.snapshot_end || replay_start != source_end) {
+            return Err("an exact restore resumes at its snapshot's frontier");
+        }
+        Ok(())
+    }
+}
+
+/// What a restore may read besides the snapshot: the prompt's native token ids (never the radix'
+/// media-keyed copy) and its media spans, so a partial restore can rebuild token-derived state
+/// (V4.1's Engram lookback) at `replay_start`.
+#[derive(Debug, Clone, Copy)]
+pub struct RestoreContext<'t> {
+    pub native_tokens: &'t [u32],
+    pub media: &'t [cuteafd_core::MediaSpan],
+}
+
+/// A family's handle on a queued asynchronous capture ([`PrefixFamily::queue_capture`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct CaptureTicket(pub u32);
+
 /// A family's snapshot geometry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct FamilyLayout {
@@ -80,10 +201,85 @@ impl FamilyLayout {
 /// stream (in stream order with its forward passes); [`PrefixFamily::drain`] waits for it. The
 /// cache drains before it publishes a snapshot to the host tier and before it releases pages or
 /// mark slots, so no queued copy ever reads storage someone else was handed.
-pub trait PrefixFamily {
+///
+/// `M` is the family's snapshot metadata: small host data that describes the device bytes (ring
+/// frontiers, token-derived history), captured with the mark and handed back on restore. It is
+/// plain data, never a device handle, so a host-tier entry stays self-describing. `()` for
+/// families whose pages and mark are the whole state.
+pub trait PrefixFamily<M: Clone + Default = ()> {
     type Placement;
 
     fn layout(&self) -> FamilyLayout;
+    /// The metadata of a snapshot of `placement` at `len`, taken with its mark.
+    fn capture_meta(&self, placement: &Self::Placement, len: usize) -> Result<M, BoxError> {
+        let _ = (placement, len);
+        Ok(M::default())
+    }
+    /// How to restore a selected snapshot. The default follows the layout's [`ReuseRule`]:
+    /// exact frontiers restore the mark, partial matches replay. A family may resume an exact
+    /// ancestor differently (V4.1 continues its encoder past a long suffix) but never plans an
+    /// approximate restore for an exact frontier.
+    fn plan_restore(&self, hit: RestoreCandidate<'_>) -> RestorePlan {
+        RestorePlan::under(self.layout().rule, hit)
+    }
+    /// Which snapshot page pressure evicts first.
+    fn eviction(&self) -> Eviction {
+        Eviction::LeastRecent
+    }
+    /// Install a freshly built placement's pages wherever the family's kernels read them (V4.1:
+    /// every compressed source's page table). Runs once per placement, before any restore or
+    /// prefill; `discard` undoes it when the cache abandons the placement.
+    fn bind(&self, placement: &mut Self::Placement) -> Result<(), BoxError> {
+        let _ = placement;
+        Ok(())
+    }
+    /// The cache abandons a bound placement whose restore failed (its pages go back to the pool
+    /// once the family drained): reset whatever `bind` and a partial restore installed.
+    fn discard(&self, placement: &mut Self::Placement) -> Result<(), BoxError> {
+        let _ = placement;
+        Ok(())
+    }
+    /// Restore a selected snapshot into a bound placement whose pages were forked through
+    /// `plan.lag.source_end`. `mark` and `saved` are the snapshot's for an exact plan and `None`
+    /// for a partial one, which starts positional state empty at `plan.lag.replay_start` and may
+    /// rebuild token-derived state from `context`. The default restores the mark at the resume
+    /// point ([`PrefixFamily::restore`] / `restore_pages`).
+    fn restore_with(&self, mark: Option<&Mark>, saved: Option<&M>, placement: &mut Self::Placement,
+        plan: &RestorePlan, context: &RestoreContext<'_>) -> Result<(), BoxError> {
+        let _ = (saved, context);
+        match mark {
+            Some(Mark::Pages(pages)) => self.restore_pages(pages, placement, plan.resume()),
+            Some(Mark::Slot(slot)) => self.restore(Some(*slot), placement, plan.resume()),
+            None => self.restore(None, placement, plan.resume()),
+        }
+    }
+    /// Asynchronous capture: enqueue the snapshot's tail copy (`tail`, in place of
+    /// [`PrefixFamily::copy_rows`]) and the mark copy of `placement` at `len` into `slot` on a
+    /// stream the scheduler does not wait on, returning a ticket to poll. `Ok(None)` (the default)
+    /// before enqueueing anything: the family captures synchronously instead.
+    fn queue_capture(&self, slot: MarkSlot, placement: &Self::Placement, len: usize, tail: Option<TailCopy>)
+        -> Result<Option<CaptureTicket>, BoxError> {
+        let _ = (slot, placement, len, tail);
+        Ok(None)
+    }
+    /// Whether every copy of a queued capture has landed (target and drafter alike).
+    fn capture_ready(&self, ticket: CaptureTicket) -> Result<bool, BoxError> {
+        let _ = ticket;
+        Ok(true)
+    }
+    /// Drain a queued capture's copies and forget it; its storage returns to the cache only if
+    /// this succeeds.
+    fn abort_capture(&self, ticket: CaptureTicket) -> Result<(), BoxError> {
+        let _ = ticket;
+        Ok(())
+    }
+    /// The host tier wrote `pages` (and the snapshot's mark) of a restored snapshot: publish them
+    /// wherever the family keeps copies of pages (V4.1's peer FP4 replicas). Runs before any
+    /// placement can see the pages.
+    fn host_restored(&self, pages: &[u32]) -> Result<(), BoxError> {
+        let _ = pages;
+        Ok(())
+    }
     /// The placement's pages, in row order.
     fn pages<'p>(&self, placement: &'p Self::Placement) -> &'p [u32];
     /// Committed rows: the length a snapshot of this placement may capture (a speculative

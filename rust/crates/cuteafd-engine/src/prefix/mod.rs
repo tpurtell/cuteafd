@@ -19,11 +19,12 @@ mod points;
 mod tests;
 
 pub use admission::{fit_output, AdmissionPoll, AdmissionStats, DeferredAdmission};
-pub use cache::{Admitted, Hit, HostPayload, PrefixCache, PrefixConfig, PrefixError, PrefixStats, Source};
+pub use cache::{Admitted, Captured, Hit, HostPayload, PrefixCache, PrefixConfig, PrefixError, PrefixStats, Source};
 pub use chain::{content_id, page_chain, CONTENT_CLASS};
 pub use cuteafd_core::prefix::{ReuseRule, SnapshotKind};
 pub use entry::{greedy, victim, After, EntryId, Mark};
-pub use family::{BoxError, FamilyLayout, MarkStore, PrefixFamily};
+pub use family::{BoxError, CaptureTicket, Eviction, FamilyLayout, LaggedState, MarkStore, PrefixFamily, RestoreCandidate,
+    RestoreContext, RestoreFidelity, RestorePlan};
 pub use marks::{ArenaExhausted, MarkArena, MarkSlot};
 pub use pages::{Fork, FreedPage, PoolExhausted, RefPagePool, TailCopy};
 pub use points::{message_boundaries, plan as plan_points, plan_media as plan_media_points, PointPlan, PointPolicy};
