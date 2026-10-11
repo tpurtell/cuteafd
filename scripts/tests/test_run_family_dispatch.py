@@ -169,6 +169,17 @@ def test_glmf_selection_is_sealed_after_solve_before_loading_or_opening_lanes() 
     admission = source[source.index("    fn admit("):source.index("    pub fn with_engine<")]
     assert "solve_working_set_with_graphs(" in admission
     assert "let local_workspace = workspaces(false, 1);" in admission
+    assert "admission::step_workspace_demands(" in admission
+    normalization = body.split("let mut selected_args = args.clone();", 1)[1].split("let args = &selected_args;", 1)[0]
+    assert "if " not in normalization, "zero-peer exchanges must also use admitted effective lanes"
+    planner = (ROOT / "rust/crates/cuteafd-loader/src/plan/layout/glm5_flash.rs").read_text()
+    assert "Ok((placed, working))" in planner and "selected = Some(working);" in planner
+    assert "0..working.spark_ranks" in planner and "selected.filter(|working| working.spark_ranks > 0)" in planner
+    loader = (ROOT / "rust/crates/cuteafd-loader/src/placement/families/glm5_flash.rs").read_text()
+    request = loader.split("pub fn request_for_working_set(", 1)[1].split("/// Exact header-only", 1)[0]
+    assert "working.includes(row.component)" in request
+    assert "GlmfComponent::RtxExperts, gpu, Category::Transport, \"route exchange\"" in request
+    assert "GlmfComponent::SparkExperts, gpu, Category::Transport, \"Spark intake\"" in request
     expert = source[source.index("    fn experts_range<"):source.index("impl Opened {\n    /// The checkpoint's `embed_tokens`")]
     assert expert.index("if remote.is_empty() { return Ok(None); }") < expert.index("SparkLink::new(")
     assert "spark_warmup_request(&self.cfg, warm_rows, remote.start)" in expert

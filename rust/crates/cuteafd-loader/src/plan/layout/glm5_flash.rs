@@ -12,7 +12,7 @@ pub(super) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
         kind: DeviceKind::Rtx, index: rank as u32, capacity_bytes: bytes.saturating_sub(options.headroom_bytes),
         items: vec![], kv_tokens: 0 }).collect();
     let mut pool = 0;
-    let admitted = (|| -> anyhow::Result<placement::Placement> {
+    let admitted = (|| -> anyhow::Result<(placement::Placement, glmf::GlmfWorkingSet)> {
         let cfg = GlmNextConfig::from_hf(&checkpoint.config)?;
         let spark_ranks = match report.placement { ExpertPlacement::Local => 0, ExpertPlacement::Sparks { ranks } => ranks };
         let lanes = if options.prefill_lanes > 0 { options.prefill_lanes } else { crate::serving_capacity::GLMF_DEFAULT_PREFILL_LANES };
@@ -51,7 +51,7 @@ pub(super) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
         let step_workspace = |placement: &ExpertPlacement, lanes| manifest.and_then(|m|
             glmf_step_workspace(m, checkpoint, placement, lanes, rows, context, decode_rows, shared,
                 options.glmf_index == crate::serving_capacity::GlmfIndexCache::Compact,
-                ranks == 2, representation, options.glmf_prefill_expanded, available.is_some(), options.glmf_kda_fp32_partials));
+                ranks == 2, representation, options.glmf_prefill_expanded, available.is_some() && (ranks == 2 || catalog.fp8().is_some()), options.glmf_kda_fp32_partials));
         let mut workspace = step_workspace(&report.placement, lanes);
         let mut local_workspace = step_workspace(&ExpertPlacement::Local, 1);
         if (workspace.is_none() || local_workspace.is_none()) && manifest.is_some() {
@@ -59,8 +59,10 @@ pub(super) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
         }
         if workspace.is_none() {
             notes.push("GLM Flash workspace estimate needs --workspace-manifest for qualification".into());
-            let estimate = |lanes: u64| (0..ranks).map(|_| (if ranks == 1 { gib(268) } else { gib(472) })
-                * (lanes * rows).max(8192) / 8192).collect();
+            let estimate = |lanes: u64| (0..ranks).map(|rank| glmf::GlmfBufferDemand::new(
+                glmf::GlmfComponent::Always, rank as u8, Category::Workspace, "steps",
+                (if ranks == 1 { gib(268) } else { gib(472) }) * (lanes * rows).max(8192) / 8192,
+                Basis::Calibrated)).collect();
             workspace = Some(estimate(lanes));
             local_workspace = Some(estimate(1));
         }
@@ -72,8 +74,10 @@ pub(super) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
                 .and_then(|m| placement::inventory::fp8moe_scratch_bytes(&m, "tp1", max_rows))
                 .or_else(|| placement::inventory::dense_package_scratch(&placement::inventory::image_lib(options.workspace_manifest.as_deref()), "glmfdense", max_rows, glmf::nvfp4_a4()))
                 .ok_or_else(|| anyhow::anyhow!("dense NVFP4 package scratch manifest missing"))?;
-            workspace[0] += dense + 8 * max_rows;
-            local_workspace[0] += dense + 8 * max_rows;
+            for profile in [&mut workspace, &mut local_workspace] {
+                profile.push(glmf::GlmfBufferDemand::new(glmf::GlmfComponent::Always, 0,
+                    Category::Workspace, "steps", dense + 8 * max_rows, Basis::Formula));
+            }
         }
         let draft_sms: Vec<_> = options.rtx_bytes[..ranks].iter().map(|&total|
             options.physical_sms.unwrap_or(placement::ArchContext::coordinator(total, None).sms) as u64).collect();
@@ -123,14 +127,14 @@ pub(super) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
             available.is_some()).map(|(placed, _, working)| {
                 notes.push(format!("selected Spark ranks {}, prefill lanes {}, layers {:?}",
                     working.spark_ranks, working.prefill_lanes, working.spark_layers));
-                placed
+                (placed, working)
             }).map_err(Into::into)
     })();
-    let mut local = 0;
+    let mut selected = None;
     match admitted {
-        Ok(placed) => {
+        Ok((placed, working)) => {
             pool = placed.pool_tokens;
-            local = placed.onboard_layers;
+            selected = Some(working);
             for (device, items) in devices.iter_mut().zip(&placed.items) {
                 device.items.extend(items.iter().cloned()); device.kv_tokens = pool;
             }
@@ -138,11 +142,11 @@ pub(super) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
         }
         Err(error) => { report.placement_supported = false; notes.push(format!("GLM Flash pool-first placement: {error:#}")); }
     }
-    if let ExpertPlacement::Sparks { ranks } = report.placement {
+    if let Some(working) = selected.filter(|working| working.spark_ranks > 0) {
         let total = report.components.iter().filter(|c| c.component == Component::RoutedExpert).map(|c| c.bytes).sum::<u64>();
         let routed = model.spec().moe_layers().max(1);
-        let remaining = total.saturating_sub(total / routed as u64 * local as u64);
-        for rank in 0..ranks {
+        let remaining = total.saturating_sub(total / routed as u64 * working.rtx_layers.len() as u64);
+        for rank in 0..working.spark_ranks {
             devices.push(DeviceLayout { kind: DeviceKind::Spark, index: rank as u32, capacity_bytes: options.spark_bytes,
                 kv_tokens: 0, items: vec![Item::new(Category::Experts, "routed_expert", "", (remaining as f64 * report.spark_rank_share) as u64, Basis::Exact),
                     Item::new(Category::Workspace, "expert waves", "", gib(56) * options.spark_capacity_rows / 4096, Basis::Calibrated),

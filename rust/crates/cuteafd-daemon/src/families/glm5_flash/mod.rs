@@ -1103,7 +1103,7 @@ impl Opened {
             cuteafd_loader::placement::families::glm5_flash::GlmfWorkingSet)> {
         use cuteafd_loader::placement::{self, families::glm5_flash as admission};
         use cuteafd_loader::families::glm5_flash::resident::{router_replica_bytes, GlmfRepresentation};
-        use cuteafd_loader::serving_capacity::{glmf_step_scratch, glmf_step_workspaces, glmf_table_pages,
+        use cuteafd_loader::serving_capacity::{glmf_step_scratch, glmf_table_pages,
             GlmfScratchOptions, GlmfStepShape};
         ensure!(args.expert_window.is_none(), "solver admission does not support diagnostic expert paging");
         let devices: Vec<_> = std::iter::once(args.device).chain(peer).collect();
@@ -1135,14 +1135,11 @@ impl Opened {
                 &self.cfg, layers, devices.len(), args.decode_rows as u64)?);
         }
         let (table_pages, table_pool_pages) = glmf_table_pages(args.max_context as u64);
-        let shape = GlmfStepShape { lead: true, split, local_experts: !split && self.fp8().is_some(),
-            tp2_experts: split, spark: spark_ranks > 0, partial_bytes: if args.kda_fp32_partials { 4 } else { 2 },
+        let shape = GlmfStepShape { lead: true, split, local_experts: !args.skip_experts && !split && self.fp8().is_some(),
+            tp2_experts: !args.skip_experts && split, spark: spark_ranks > 0, partial_bytes: if args.kda_fp32_partials { 4 } else { 2 },
             output_shard: args.kda_output_shard, full_prefill_logits: args.full_prefill_logits, table_pages, table_pool_pages };
-        let workspaces = |spark, lanes| (0..devices.len()).map(|rank| {
-            let shape = if rank == 0 { GlmfStepShape { spark, ..shape } }
-                else { GlmfStepShape { lead: false, local_experts: false, spark: false, ..shape } };
-            glmf_step_workspaces(&self.cfg, lanes, args.prefill_rows as u64, args.decode_rows as u64, &shape, decode, prefill).device_bytes()
-        }).collect::<Vec<_>>();
+        let workspaces = |spark, lanes| admission::step_workspace_demands(&self.cfg, lanes,
+            args.prefill_rows as u64, args.decode_rows as u64, GlmfStepShape { spark, ..shape }, decode, prefill);
         let workspace = workspaces(spark_ranks > 0, lanes);
         let local_workspace = workspaces(false, 1);
         let mut experts = self.experts.as_ref().map(|c| admission::expert_costs(c, split)).transpose()?.unwrap_or_default();
@@ -1328,9 +1325,7 @@ impl Opened {
         let (placement, admitted_graphs, working) = self.admit(args, &programs, layers, index_cache, mark_slots,
             split_device, automatic_context)?;
         let mut selected_args = args.clone();
-        if selected_args.peers.is_some() {
-            selected_args.prefill_lanes = usize::try_from(working.prefill_lanes)?;
-        }
+        selected_args.prefill_lanes = usize::try_from(working.prefill_lanes)?;
         let args = &selected_args;
         if !args.skip_experts && placement.tp2.is_some() { engine::check_tp2_lanes(args.prefill_lanes)?; }
         let spark_layers = admitted_spark_layers(&self.cfg, &placement.layers, args.skip_experts)?;

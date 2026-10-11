@@ -1090,6 +1090,109 @@ fn glm5_flash_layout_charges_the_engine_step_workspaces_and_headroom() {
     assert_eq!(graphs, [("graph growth", 512 << 20)]);
 }
 
+#[test]
+fn glm5_flash_selected_working_set_drives_plan_request_and_runtime_buffers() {
+    use crate::placement::{self, families::glm5_flash as glmf, Baseline, Onboard};
+    use crate::families::glm5_flash::{GlmNextConfig, resident};
+    use crate::serving_capacity::{glmf_manifest_scratch, glmf_step_scratch, glmf_step_workspaces,
+        glmf_table_pages, GlmfScratchOptions, GlmfStepShape};
+    use cuteafd_core::memory_layout::{Category, DeviceKind};
+    let config = glm5_flash_config(4);
+    let cfg = GlmNextConfig::from_hf(&config).unwrap();
+    let dir = snapshot(config, &glm5_flash_tensors(&glm5_flash_config(4)));
+    let share = dir.path().join("share");
+    let package = dir.path().join("lib/fp8/fp8-glmf");
+    std::fs::create_dir_all(&share).unwrap();
+    std::fs::create_dir_all(&package).unwrap();
+    std::fs::write(package.join("manifest.json"), json!({"layouts":{"tp2":{
+        "capacities":[{"capacity":4096,"scratch_bytes":12345}]}}}).to_string()).unwrap();
+    let programs: Vec<_> = ["mhc_post_pre", "kda", "mla_producer", "o", "ffn_i2048",
+        "ffn_i12288", "index_producer"].into_iter().flat_map(|name|
+            ["m64", "m4096"].map(move |cap| format!("glmf_{name}_{cap}")))
+        .chain(["glmf_mhc_pre", "glmf_sparse_mla_decode_m64", "glmf_sparse_mla_prefill_m4096",
+            "glmf_index_topk_decode_m64", "glmf_index_topk_prefill_m4096"].map(str::to_string))
+        .map(|name| json!({"name":name,"scratch_bytes_at_capacity":{"scratch":4096}})).collect();
+    let manifest = json!({"capacities":{"max_context":262144},"programs":programs});
+    let path = share.join("PROGRAMS.json");
+    std::fs::write(&path, manifest.to_string()).unwrap();
+    let checkpoint = Checkpoint::open(dir.path()).unwrap();
+    let catalog = crate::read_expert_catalog(dir.path()).unwrap();
+    let lookup = glmf_manifest_scratch(&manifest);
+    let scratch = GlmfScratchOptions { split: true, ..Default::default() };
+    let decode = glmf_step_scratch(&lookup, &cfg, scratch, 64, true).unwrap();
+    let prefill = glmf_step_scratch(&lookup, &cfg, scratch, 4096, false).unwrap();
+    let (table_pages, table_pool_pages) = glmf_table_pages(262144);
+    let shape = GlmfStepShape { lead: true, split: true, local_experts: false, tp2_experts: true,
+        spark: true, partial_bytes: 2, output_shard: false, full_prefill_logits: false,
+        table_pages, table_pool_pages };
+    // Configured peers with all RTX, mixed, all Spark, then the zero-peer CLI default of two lanes.
+    for (peers, onboard, expected_rtx) in [(4, Onboard::Auto, 3), (4, Onboard::Layers(1), 1),
+        (4, Onboard::Layers(0), 0), (0, Onboard::Auto, 3)] {
+        let options = PlanOptions { layout: Some(layout::LayoutOptions {
+            rtx_bytes: vec![placement::inventory::PRO_TOTAL_BYTES; 2], head_split: true,
+            context_tokens: 262144, pool_tokens: Some(2 << 20), onboard: Some(onboard),
+            prefill_rows: 4096, prefill_lanes: 2, state_slots: Some(8), prefix_slots: Some(8),
+            glmf_drafter_disabled: true, glmf_prefill_expanded: false,
+            glmf_representation: resident::GlmfRepresentation { kda_fp8: false, fp8_head: false, output_shard: false },
+            graph_budget_bytes: Some(64 << 20),
+            workspace_manifest: Some(path.clone()), ..Default::default() }), ..sparks(peers) };
+        let report = plan(dir.path(), &options).unwrap();
+        assert!(report.placement_supported, "{}", render(&report));
+        let opts = options.layout.as_ref().unwrap();
+        let input = glmf::GlmfInputs { cfg: &cfg, layers: cfg.layers,
+            gpus: opts.rtx_bytes.iter().enumerate().map(|(rank, &total)| (total, Baseline::Planned {
+                context_bytes: placement::ArchContext::coordinator(total, None).context_bytes
+                    + placement::loaded_code("glmf", "fp8", true, rank as u8).unwrap().bytes,
+                loaded_bytes: 0 })).collect(), pending_code: vec![0; 2], headroom_bytes: opts.headroom_bytes,
+            spark_ranks: peers, prefill_lanes: 2, prefill_rows: 4096, decode_rows: 64, partial_bytes: 2,
+            max_context: 262144, sequences: 8, speculation: false, state_slots: 8, mark_slots: 8,
+            pool_marks: false, index: opts.glmf_index, kda_state_bytes: 4, shared_replay: false,
+            representation: opts.glmf_representation,
+            resident: resident::resident_weights(&checkpoint, &cfg, cfg.layers, 2, opts.glmf_representation).unwrap(),
+            router_replica_bytes: resident::router_replica_bytes(&checkpoint, &cfg, cfg.layers).unwrap(),
+            workspace: glmf::step_workspace_demands(&cfg, 2, 4096, 64, shape, decode, prefill),
+            local_workspace: glmf::step_workspace_demands(&cfg, 1, 4096, 64,
+                GlmfStepShape { spark: false, ..shape }, decode, prefill),
+            graphs: placement::GraphSet::budget(&[64 << 20; 2]), experts: glmf::expert_costs(&catalog, true).unwrap(),
+            expert_workspace: 0, tp2_workspace: [glmf::expert_workspace(&catalog, Some(&path), 4096, 2).unwrap(); 2],
+            drafter_bytes: 0, drafter_scratch: vec![0; 2], requested_pool: Some(2 << 20), onboard,
+            full_prefill_logits: 0 };
+        let (placed, graphs, working) = glmf::solve_working_set_with_graphs(&input, 2 << 20, false, 188, true).unwrap();
+        assert_eq!(working.rtx_layers.len(), expected_rtx);
+        assert_eq!(placed.onboard_layers, expected_rtx);
+        let spark = !working.spark_layers.is_empty();
+        assert_eq!((working.spark_ranks, working.prefill_lanes), if spark { (4, 2) } else { (0, 1) });
+        let mut admitted = input.clone();
+        admitted.graphs = graphs;
+        let request = glmf::request_for_working_set(&admitted, &working).unwrap();
+        assert_eq!(request.inventory.spark_ranks, working.spark_ranks);
+        assert_eq!(request.hops.lanes, working.prefill_lanes);
+        if expected_rtx == 0 { assert_eq!(request.tp2_workspace, [0; 2]); }
+        let memory = report.memory_layout.unwrap();
+        assert_eq!(memory.devices.iter().filter(|d| d.kind == DeviceKind::Spark).count(), working.spark_ranks);
+        for rank in 0..2 {
+            // Plan ledger is exactly the selected request's solver ledger, not configured-peer rows.
+            let plan_rows: Vec<_> = memory.devices[rank].items.iter().filter(|item| item.group != "context+modules").collect();
+            assert_eq!(plan_rows, placed.items[rank].iter().collect::<Vec<_>>());
+            let selected_shape = GlmfStepShape { lead: rank == 0, spark: rank == 0 && spark,
+                local_experts: false, tp2_experts: expected_rtx > 0, ..shape };
+            let allocated = glmf_step_workspaces(&cfg, working.prefill_lanes as usize, 4096, 64,
+                &selected_shape, decode, prefill).device_bytes();
+            let charged = |group: &str| request.fixed.iter().filter(|d| d.gpu as usize == rank && d.group == group)
+                .map(|d| d.bytes).sum::<u64>();
+            assert_eq!(charged("steps"), allocated);
+            assert_eq!(charged("peer exchange"), crate::serving_capacity::glmf_graphs::peer_exchange_bytes(
+                working.prefill_lanes, 4096, 4096, 2, false));
+            let slots = 2 * working.prefill_lanes;
+            assert_eq!(charged("route exchange"), if expected_rtx == 0 { 0 } else {
+                slots * (4096 * 8 * 8) + ((slots + 1) * 16).max(256) });
+            assert_eq!(charged("Spark intake"), if rank == 0 && spark { 268435456 } else { 0 });
+            assert!(request.fixed.iter().filter(|d| d.gpu as usize == rank && d.category == Category::Workspace)
+                .map(|d| d.bytes).sum::<u64>() > 0);
+        }
+    }
+}
+
 /// `--decode-rows 128` in the planner charges what the engine allocates for it: the decode workspace of
 /// 128 rows over both program sets' scratch (planned = allocated, from the same arithmetic and
 /// manifest), the wide token selector and sampler, and the speculative replay records and commit tables
@@ -1955,7 +2058,12 @@ fn glm_flash_vision_plan_matches_resident_admission_and_mimo_shape() {
         let encoder = report.encoder.as_ref().unwrap();
         assert_eq!(encoder.weights, 1_128_026_176);
         assert_eq!(encoder.admitted_bytes(), 1_919_933_760);
-        assert_eq!(encoder.kind, if ranks > 0 { EncoderKind::Spark { rank: 0 } } else { EncoderKind::Rtx { gpu: 0 } });
+        // A tower-only fixture cannot admit backbone experts; configured peers do
+        // not create Spark device rows. Encoder placement follows the actual rows.
+        let selected_sparks = report.memory_layout.as_ref().unwrap().devices.iter()
+            .filter(|d| d.kind == cuteafd_core::memory_layout::DeviceKind::Spark).count();
+        assert_eq!(selected_sparks, 0);
+        assert_eq!(encoder.kind, EncoderKind::Rtx { gpu: gpus - 1 });
         let vision = report.components.iter().find(|c| c.component == Component::Vision).unwrap();
         assert_eq!(vision.status, Status::Ready);
         assert_eq!(vision.rejected, 0);
@@ -2003,9 +2111,10 @@ fn glm_flash_vision_plan_matches_resident_admission_and_mimo_shape() {
     let encoder_keys = |report: &super::PlanReport| serde_json::to_value(report.encoder.as_ref().unwrap())
         .unwrap().as_object().unwrap().keys().cloned().collect::<Vec<_>>();
     assert_eq!(encoder_keys(&glm), encoder_keys(&report));
-    assert_eq!(glm.encoder.as_ref().unwrap().kind, report.encoder.as_ref().unwrap().kind);
+    assert_eq!(glm.encoder.as_ref().unwrap().kind, EncoderKind::Rtx { gpu: 0 });
+    assert_eq!(report.encoder.as_ref().unwrap().kind, EncoderKind::Spark { rank: 0 });
     let rendered = super::render(&glm);
-    assert!(rendered.contains("Spark { rank: 0 }") && rendered.contains("1128026176"));
+    assert!(rendered.contains("Rtx { gpu: 0 }") && rendered.contains("1128026176"));
     assert!(!rendered.contains("MiMo key-0"));
 }
 

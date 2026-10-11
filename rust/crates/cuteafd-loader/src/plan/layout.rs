@@ -1121,8 +1121,8 @@ fn planned_context(manifest: Option<&serde_json::Value>, families: &[String], to
 #[allow(clippy::too_many_arguments)]
 fn glmf_step_workspace(manifest: &serde_json::Value, checkpoint: &super::Checkpoint, placement: &ExpertPlacement,
     lanes: u64, rows: u64, context: u64, decode_rows: u64, shared_records: u64, index_compact: bool, split: bool,
-    repr: crate::families::glm5_flash::resident::GlmfRepresentation, expanded: bool, tp2_experts: bool, fp32_partials: bool) -> Option<Vec<u64>> {
-    use crate::serving_capacity::{glmf_manifest_scratch, glmf_step_scratch, glmf_step_workspaces, glmf_table_pages,
+    repr: crate::families::glm5_flash::resident::GlmfRepresentation, expanded: bool, rtx_experts: bool, fp32_partials: bool) -> Option<Vec<crate::placement::families::glm5_flash::GlmfBufferDemand>> {
+    use crate::serving_capacity::{glmf_manifest_scratch, glmf_step_scratch, glmf_table_pages,
         GlmfScratchOptions, GlmfStepShape};
     let cfg = crate::families::glm5_flash::GlmNextConfig::from_hf(&checkpoint.config).ok()?;
     let lookup = glmf_manifest_scratch(manifest);
@@ -1133,7 +1133,7 @@ fn glmf_step_workspace(manifest: &serde_json::Value, checkpoint: &super::Checkpo
     let context = if context > 0 { context } else { manifest["capacities"]["max_context"].as_u64().unwrap_or(131_072) };
     let (table_pages, table_pool_pages) = glmf_table_pages(context);
     let spark = matches!(placement, ExpertPlacement::Sparks { .. });
-    let shape = GlmfStepShape { lead: true, split, local_experts: !spark || tp2_experts, tp2_experts: split && tp2_experts, spark, partial_bytes: if fp32_partials { 4 } else { 2 },
+    let shape = GlmfStepShape { lead: true, split, local_experts: !split && rtx_experts, tp2_experts: split && rtx_experts, spark, partial_bytes: if fp32_partials { 4 } else { 2 },
         output_shard: split && repr.output_shard, full_prefill_logits: false, table_pages, table_pool_pages };
     let decode = glmf_step_scratch(&lookup, &cfg, options, decode_rows, true).ok()?;
     let mut prefill = glmf_step_scratch(&lookup, &cfg, options, rows, false).ok()?;
@@ -1141,10 +1141,8 @@ fn glmf_step_workspace(manifest: &serde_json::Value, checkpoint: &super::Checkpo
     prefill.programs = prefill.programs.max(shared_records);
     // A lane needs a Spark transport of its own: local experts prefill in one.
     let lanes = if spark { lanes } else { 1 };
-    (0..if split { 2 } else { 1 }).map(|rank| {
-        let shape = if rank == 0 { shape } else { GlmfStepShape { lead: false, spark: false, local_experts: false, ..shape } };
-        Some(glmf_step_workspaces(&cfg, usize::try_from(lanes).ok()?, rows, decode_rows, &shape, decode, prefill).device_bytes())
-    }).collect()
+    Some(crate::placement::families::glm5_flash::step_workspace_demands(&cfg,
+        usize::try_from(lanes).ok()?, rows, decode_rows, shape, decode, prefill))
 }
 
 /// The planner's Qwen shape inputs, beside `LayoutOptions`.

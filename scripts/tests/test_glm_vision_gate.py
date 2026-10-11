@@ -188,7 +188,7 @@ def test_glm_serving_admits_and_precreates_all_reachable_workspaces():
     gathering = module.split("fn admit(", 1)[1].split("pub fn with_engine", 1)[0]
     admission = gathering.index("admission::solve_working_set_with_graphs(")
     for required in ("RuntimeInventory::measure(", "pending_code(", "resident_weights(",
-                     "glmf_step_workspaces(", "admission::startup_graphs("):
+                     "admission::step_workspace_demands(", "admission::startup_graphs("):
         assert gathering.index(required) < admission
     assert "representation, resident, router_replica_bytes, workspace, local_workspace, graphs" in gathering
     opening = module.split("pub fn with_engine", 1)[1]
