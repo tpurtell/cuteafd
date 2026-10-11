@@ -1,6 +1,7 @@
 """CPU-only Docker argv and filesystem-admission gates for persistent caches."""
 import json
 import os
+import re
 from pathlib import Path
 import subprocess
 
@@ -216,7 +217,7 @@ def test_cargo_offline_probe_and_locked_builds(tmp_path):
     result = subprocess.run(['bash', '-c', script], env=env, text=True, capture_output=True, check=True)
     assert result.stdout.endswith('unset')
     for name in ('build-release-artifacts.sh', 'build-wip-artifacts.sh'):
-        assert 'cargo build \\\n  --locked' in (ROOT/'scripts/build'/name).read_text()
+        assert re.search(r'cargo build \\\n\s+--locked', (ROOT/'scripts/build'/name).read_text())
 
 
 @pytest.mark.parametrize("arch", ["x86_64", "aarch64"])
