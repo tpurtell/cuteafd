@@ -1412,6 +1412,30 @@ impl<'a> Engine<'a> {
         rows: Scalar,
         cap: usize,
     ) -> Result<()> {
+        self.attention_produce(rank, layer, weights, lane, w, rows, cap)?;
+        let cache = &self.caches_on(rank)[layer];
+        let rope = self.attention_rope(rank, weights.ratio);
+        let (attention, indexed_cache, indexed_indices, indexed_lengths) =
+            self.compress(rank, layer, weights, cache, tables, &lane.tables, w, rope, rows, cap)?;
+        debug_assert_eq!(attention, self.attention_kind(weights.ratio, tables));
+        self.attention_sparse(rank, weights, tables, lane, w, rows, cap,
+            cache.main.buffer.ptr, indexed_cache, indexed_indices, indexed_lengths)?;
+        self.attention_project(rank, weights, lane, w, rows, cap)
+    }
+
+    fn attention_rope(&self, rank: usize, ratio: usize) -> &Dev<'a> {
+        match (rank, &self.peer, ratio) {
+            (1, Some(peer), 0) => &peer.rope_window,
+            (1, Some(peer), _) => &peer.rope_compressed,
+            (_, _, 0) => &self.rope_window,
+            _ => &self.rope_compressed,
+        }
+    }
+
+    /// The replicated mHC/latent producer, with only its query heads split.
+    #[allow(clippy::too_many_arguments)]
+    fn attention_produce(&self, rank: usize, layer: usize, weights: &LayerWeights<'_>,
+        lane: &Lane<'_>, w: &Workspace<'_>, rows: Scalar, cap: usize) -> Result<()> {
         let m = &lane.tables;
         let (pools, rope_window, rope_compressed) = match (rank, &self.peer) {
             (1, Some(peer)) => (&peer.pools, &peer.rope_window, &peer.rope_compressed),
@@ -1420,7 +1444,6 @@ impl<'a> Engine<'a> {
         let cache = &pools[layer];
         let ratio = weights.ratio;
         let rope = if ratio == 0 { rope_window } else { rope_compressed };
-        let mode = if tables.decode { "decode" } else { "prefill" };
         let split = weights.attention_split;
         let a = &lane.stream_a;
         self.run_on(rank, false, "mhc_pre", &[
@@ -1434,17 +1457,30 @@ impl<'a> Engine<'a> {
             ("w_q", weights.ptr("w_q")?), ("w_q_scale", weights.ptr("w_q_scale")?), ("q_norm", weights.ptr("q_norm")?),
             ("kv_norm", weights.ptr("kv_norm")?), ("main_kv_cache", cache.main.buffer.ptr), ("query", w.query.buffer.ptr),
             ("q_rank", w.q_rank.buffer.ptr), ("scratch", w.scratch.buffer.ptr),
-        ], &[rows])?;
-        let (attention, indexed_cache, indexed_indices, indexed_lengths) =
-            self.compress(rank, layer, weights, cache, tables, m, w, rope, rows, cap)?;
-        debug_assert_eq!(attention, self.attention_kind(ratio, tables));
-        self.run_on(rank, split, &format!("sparse_mla_{mode}_{attention}_m{cap}"), &[
-            ("q", w.query.buffer.ptr), ("swa_cache", cache.main.buffer.ptr), ("swa_indices", m.swa_indices.buffer.ptr),
+        ], &[rows])
+    }
+
+    /// Heads arithmetic over either the pool or a gathered context view.
+    #[allow(clippy::too_many_arguments)]
+    fn attention_sparse(&self, rank: usize, weights: &LayerWeights<'_>, tables: &StepTables,
+        lane: &Lane<'_>, w: &Workspace<'_>, rows: Scalar, cap: usize, main: *mut c_void,
+        indexed_cache: *mut c_void, indexed_indices: *mut c_void, indexed_lengths: *mut c_void) -> Result<()> {
+        let m = &lane.tables;
+        let mode = if tables.decode { "decode" } else { "prefill" };
+        let attention = self.attention_kind(weights.ratio, tables);
+        self.run_on(rank, weights.attention_split, &format!("sparse_mla_{mode}_{attention}_m{cap}"), &[
+            ("q", w.query.buffer.ptr), ("swa_cache", main), ("swa_indices", m.swa_indices.buffer.ptr),
             ("swa_lengths", m.swa_lengths.buffer.ptr), ("indexed_cache", indexed_cache),
             ("indexed_indices", indexed_indices), ("indexed_lengths", indexed_lengths),
             ("attn_sink", weights.ptr("attn_sink")?), ("out", w.attn_out.buffer.ptr), ("scratch", w.scratch.buffer.ptr),
-        ], &[rows])?;
-        self.run_on(rank, split, &format!("wo_m{cap}"), &[
+        ], &[rows])
+    }
+
+    fn attention_project(&self, rank: usize, weights: &LayerWeights<'_>, lane: &Lane<'_>,
+        w: &Workspace<'_>, rows: Scalar, cap: usize) -> Result<()> {
+        let m = &lane.tables;
+        let rope = self.attention_rope(rank, weights.ratio);
+        self.run_on(rank, weights.attention_split, &format!("wo_m{cap}"), &[
             ("o", w.attn_out.buffer.ptr), ("positions", m.positions.buffer.ptr), ("cos_sin", rope.buffer.ptr),
             ("wo_a", weights.ptr("wo_a")?), ("wo_a_scale", weights.ptr("wo_a_scale")?), ("wo_b", weights.ptr("wo_b")?),
             ("wo_b_scale", weights.ptr("wo_b_scale")?), ("out", w.delta.buffer.ptr), ("scratch", w.scratch.buffer.ptr),
@@ -1521,11 +1557,34 @@ impl<'a> Engine<'a> {
         if ratio == 0 {
             return Ok(window);
         }
-        let (groups, metadata, names) = if ratio == 4 {
-            (tables.c4_groups, &m.c4, &tables.c4_tables)
-        } else {
-            (tables.c128_groups, &m.c128, &tables.c128_tables)
-        };
+        self.compress_records(rank, layer, weights, cache, tables, m, w, rope, rows, cap)?;
+        let groups = if ratio == 4 { tables.c4_groups } else { tables.c128_groups };
+        let compressed = cache.compressed.as_ref().context("compressed cache")?.buffer.ptr;
+        if groups == 0 {
+            return Ok(window);
+        }
+        if ratio == 128 {
+            return Ok(("c128", compressed, m.c128_indices.buffer.ptr, m.c128_lengths.buffer.ptr));
+        }
+        self.index_produce(rank, weights, m, w, rope, rows, cap)?;
+        let mode = if tables.decode { "decode" } else { "prefill" };
+        self.run_on(rank, false, &format!("index_topk_{mode}_m{cap}"), &[
+            ("q_fp8", w.index_query.buffer.ptr), ("weights", w.index_weights.buffer.ptr),
+            ("index_k_cache", cache.index.as_ref().context("index cache")?.buffer.ptr),
+            ("page_table", m.c4_page_table.buffer.ptr), ("cache_lengths", m.c4_visible.buffer.ptr),
+            ("output_indices", w.selected.buffer.ptr), ("scratch", w.topk_scratch.buffer.ptr),
+        ], &[rows, Scalar::I32(tables.c4_table_width as i32), Scalar::I32(tables.c4_table_stride as i32)])?;
+        Ok(("c4", compressed, w.selected.buffer.ptr, m.c4_indexed_lengths.buffer.ptr))
+    }
+
+    /// Updates replicated carry while the supplied slots choose record ownership.
+    #[allow(clippy::too_many_arguments)]
+    fn compress_records(&self, rank: usize, layer: usize, weights: &LayerWeights<'_>, cache: &LayerCache<'_>,
+        tables: &StepTables, m: &StepBuffers<'_>, w: &Workspace<'_>, rope: &Dev<'_>, rows: Scalar, cap: usize)
+        -> Result<()> {
+        let ratio = weights.ratio;
+        ensure!(matches!(ratio, 4 | 128), "compressor requires C4 or C128");
+        let (metadata, names) = if ratio == 4 { (&m.c4, &tables.c4_tables) } else { (&m.c128, &tables.c128_tables) };
         let compressed = cache.compressed.as_ref().context("compressed cache")?.buffer.ptr;
         let mut pointers: Vec<(&str, *mut c_void)> = vec![("hidden", w.y.buffer.ptr)];
         pointers.extend(names.iter().zip(metadata).map(|((name, _), buffer)| (*name, buffer.buffer.ptr)));
@@ -1555,27 +1614,18 @@ impl<'a> Engine<'a> {
             self.run_on(rank, false, &format!("compressor_{program}_c{ratio}"), &pointers,
                 &[rows, Scalar::I32(completed), Scalar::I32(1)])
         }
-        .with_context(|| format!("layer {layer} compressor"))?;
-        if groups == 0 {
-            return Ok(window);
-        }
-        if ratio == 128 {
-            return Ok(("c128", compressed, m.c128_indices.buffer.ptr, m.c128_lengths.buffer.ptr));
-        }
+        .with_context(|| format!("layer {layer} compressor"))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn index_produce(&self, rank: usize, weights: &LayerWeights<'_>, m: &StepBuffers<'_>, w: &Workspace<'_>,
+        rope: &Dev<'_>, rows: Scalar, cap: usize) -> Result<()> {
         self.run_on(rank, false, &format!("index_producer_m{cap}"), &[
             ("q_rank", w.q_rank.buffer.ptr), ("hidden", w.y.buffer.ptr), ("positions", m.positions.buffer.ptr),
             ("cos_sin", rope.buffer.ptr), ("w_q", weights.ptr("index_w_q")?), ("w_q_scale", weights.ptr("index_w_q_scale")?),
             ("w_proj", weights.ptr("index_w_proj")?), ("query", w.index_query.buffer.ptr),
             ("head_weights", w.index_weights.buffer.ptr), ("scratch", w.scratch.buffer.ptr),
-        ], &[rows])?;
-        let mode = if tables.decode { "decode" } else { "prefill" };
-        self.run_on(rank, false, &format!("index_topk_{mode}_m{cap}"), &[
-            ("q_fp8", w.index_query.buffer.ptr), ("weights", w.index_weights.buffer.ptr),
-            ("index_k_cache", cache.index.as_ref().context("index cache")?.buffer.ptr),
-            ("page_table", m.c4_page_table.buffer.ptr), ("cache_lengths", m.c4_visible.buffer.ptr),
-            ("output_indices", w.selected.buffer.ptr), ("scratch", w.topk_scratch.buffer.ptr),
-        ], &[rows, Scalar::I32(tables.c4_table_width as i32), Scalar::I32(tables.c4_table_stride as i32)])?;
-        Ok(("c4", compressed, w.selected.buffer.ptr, m.c4_indexed_lengths.buffer.ptr))
+        ], &[rows])
     }
 
     /// Router download, shared expert launch, host routing, Spark exchange
