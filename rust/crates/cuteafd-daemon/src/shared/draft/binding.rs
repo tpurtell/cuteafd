@@ -50,6 +50,8 @@ pub(crate) struct RoundRequest<'a> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct DraftPass {
     pub width: usize,
+    /// Actual drafter batch extent; None preserves an unmigrated adapter's pricing.
+    pub requests: Option<usize>,
 }
 
 /// Everything one completed lane round reports.
@@ -76,6 +78,7 @@ pub(crate) struct Observation<'a> {
     layer_us: Vec<Option<f64>>,
     total_us: f64,
     draft_us: f64,
+    drafted_requests: Option<usize>,
     wide: bool,
     predicted_us: Option<f64>,
 }
@@ -84,7 +87,7 @@ impl Observation<'_> {
     pub fn view(&self) -> DraftRoundObservation<'_> {
         DraftRoundObservation { shared: self.shared, requests: &self.requests, routes: self.routes,
             layer_us: &self.layer_us, total_us: self.total_us, predicted_us: self.predicted_us,
-            draft_us: self.draft_us, wide: self.wide }
+            draft_us: self.draft_us, drafted_requests: self.drafted_requests, wide: self.wide }
     }
 }
 
@@ -111,6 +114,7 @@ pub(crate) fn build<'a>(record: &RoundRecord<'a>, native_width: usize) -> Result
         (false, _) => (total as f64, f64::NAN),
     };
     Ok(Observation { shared: record.shared, requests, routes: record.routes.flat(), layer_us, total_us, draft_us,
+        drafted_requests: record.draft.and_then(|pass| pass.requests),
         wide: record.draft.is_some_and(|pass| pass.width > native_width),
         predicted_us: if copied { None } else { record.predicted } })
 }
@@ -177,9 +181,11 @@ mod tests {
         let requests = [request(1, 4, 2, DraftSource::Neural, Some(Evidence::Head(&p)), None),
             request(2, 1, 1, DraftSource::Undrafted, None, None)];
         let routes = routes(5);
-        let built = build(&record(&requests, &routes, Some(DraftPass { width: 7 })), 5).unwrap();
+        let built = build(&record(&requests, &routes, Some(DraftPass { width: 7, requests: Some(1) })), 5).unwrap();
         let view = built.view();
         assert_eq!((view.total_us, view.draft_us, view.wide, view.predicted_us), (5_000., 1_200., true, Some(4_000.)));
+        assert_eq!(view.drafted_requests, Some(1));
+        assert_eq!(view.requests.len(), 2);
         assert_eq!(view.layer_us, [None, Some(10.)]);
         assert_eq!((view.requests[0].confidence, view.requests[1].confidence), (Some(&p[..]), None));
         assert_eq!(view.routes.len(), 2 * 5 * 2);
@@ -194,7 +200,7 @@ mod tests {
         let requests = [request(1, 3, 2, DraftSource::Neural, Some(Evidence::Head(&p)), None),
             request(2, 4, 4, DraftSource::Copy, Some(Evidence::Head(&p)), None)];
         let routes = routes(7);
-        let built = build(&record(&requests, &routes, Some(DraftPass { width: 5 })), 5).unwrap();
+        let built = build(&record(&requests, &routes, Some(DraftPass { width: 5, requests: None })), 5).unwrap();
         let view = built.view();
         assert_eq!((view.total_us, view.predicted_us, view.wide), (3_800., None, false));
         assert!(view.draft_us.is_nan());
@@ -209,7 +215,7 @@ mod tests {
             request(3, 5, 3, DraftSource::Neural, Some(Evidence::Head(&p)), None),
             request(4, 2, 1, DraftSource::Neural, Some(Evidence::History), None)];
         let routes = routes(17);
-        let built = build(&record(&requests, &routes, Some(DraftPass { width: 5 })), 5).unwrap();
+        let built = build(&record(&requests, &routes, Some(DraftPass { width: 5, requests: None })), 5).unwrap();
         let confidence: Vec<_> = built.view().requests.iter().map(|r| r.confidence.map(<[f64]>::len)).collect();
         assert_eq!(confidence, [Some(2), Some(0), Some(4), None]);
     }

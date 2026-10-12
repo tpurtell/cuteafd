@@ -728,6 +728,7 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
         let cycle = Instant::now();
         let mut round_clock = crate::shared::draft::clock::RoundClock::at(cycle);
         let mut drafted_width = 0;
+        let mut drafted_requests = 0;
         let mut tally = console::Step::begin(0);
         let (phases_before, engine_before) = (phases, tally.live().then(|| *engine.profile.borrow()));
         // Rows each sequence may add after its next token.
@@ -756,6 +757,7 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
                         valid_from: a.draft_from })))
                     .take(drafter.max_batch_sequences())
                     .collect();
+                drafted_requests = seqs.len();
                 let drafts = round_clock.draft(|| drafter.draft_device(&seqs.iter().map(|(_, s)| *s).collect::<Vec<_>>(), &engine.embedding,
                     super::dflash::TargetHead::Bf16(&engine.weights.head)));
                 drafted_width = drafter.cfg.drafts();
@@ -792,7 +794,7 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
             (None, Some(shared)) if drafted_width > 0 => {
                 let candidates: Vec<_> = active.iter().zip(&priors).zip(&limits).map(|((a, prior), &limit)|
                     resource::Candidate { id: a.ticket.id(), prior, limit, selector: true, cold: a.drafts.cold() }).collect();
-                let selection = resource::select(&mut shared.policy, &candidates, drafted_width, DECODE_ROWS);
+                let selection = resource::select_drafted(&mut shared.policy, &candidates, drafted_width, DECODE_ROWS, drafted_requests);
                 predicted = selection.predicted;
                 selection.lengths
             }
@@ -930,8 +932,8 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
                     censor }
             }).collect();
             let times = round_clock.observe();
-            if let Some(Err(error)) = engine.probe_finish(|routes, layer_us| resource::observe(
-                &mut shared.policy, &requests, routes, layer_us, times, drafted_width, predicted)) {
+            if let Some(Err(error)) = engine.probe_finish(|routes, layer_us| resource::observe_drafted(
+                &mut shared.policy, &requests, routes, layer_us, times, drafted_width, predicted, Some(drafted_requests))) {
                 tracing::debug!(%error, "GLM draft round not observed");
             }
             if shared.policy.stats().rounds % 32 == 1 {

@@ -239,6 +239,11 @@ pub(crate) struct Selection {
 /// cold drafts.
 pub(crate) fn select(policy: &mut DraftPolicy, candidates: &[Candidate<'_>], width: usize, max_rows: usize)
     -> Selection {
+    select_drafted(policy, candidates, width, max_rows, candidates.len())
+}
+
+pub(crate) fn select_drafted(policy: &mut DraftPolicy, candidates: &[Candidate<'_>], width: usize,
+    max_rows: usize, drafted_requests: usize) -> Selection {
     let positions = policy.geometry().max_positions;
     let confidence: Vec<&[f64]> = candidates.iter()
         .map(|c| &c.prior[..c.prior.len().min(c.limit).min(positions)]).collect();
@@ -248,14 +253,14 @@ pub(crate) fn select(policy: &mut DraftPolicy, candidates: &[Candidate<'_>], wid
     let cold = policy.cold_drafts().unwrap_or(usize::MAX);
     let mut lengths: Vec<usize> = confidence.iter().map(|c| c.len().min(cold)).collect();
     let mut predicted = None;
-    if let Ok(Some(selection)) = policy.select_within(false, &cores, width, max_rows) {
+    if let Ok(Some(selection)) = policy.select_drafted_within(false, &cores, width, max_rows, drafted_requests) {
         lengths = selection.lengths;
         predicted = Some(selection.predicted_us);
         let ratio = selection.expected_tokens / selection.predicted_us;
         if let [only] = candidates {
             let n = START_DRAFTS.min(confidence[0].len());
             if only.selector && !only.cold && lengths[0] != n {
-                if let Some((tokens, us)) = policy.evaluate(false, &cores, &[n], width) {
+                if let Some((tokens, us)) = policy.evaluate_drafted(false, &cores, &[n], width, drafted_requests) {
                     if ratio < tokens / us * REFERENCE_MARGIN {
                         lengths[0] = n;
                         predicted = Some(us);
@@ -360,6 +365,13 @@ pub(crate) struct Verified<'a> {
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn observe(policy: &mut DraftPolicy, requests: &[Verified<'_>], routes: &RoundRoutes,
     layer_us: &[Option<f64>], times: RoundTimes, width: usize, predicted: Option<f64>) -> Result<(), ObserveError> {
+    observe_drafted(policy, requests, routes, layer_us, times, width, predicted, None)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn observe_drafted(policy: &mut DraftPolicy, requests: &[Verified<'_>], routes: &RoundRoutes,
+    layer_us: &[Option<f64>], times: RoundTimes, width: usize, predicted: Option<f64>,
+    drafted_requests: Option<usize>) -> Result<(), ObserveError> {
     let features: Vec<Vec<SelectorFeatures>> = requests.iter().map(|r| r.features.unwrap_or_default().iter()
         .map(|&[margin, p_top, entropy, rank]| SelectorFeatures { margin, p_top, entropy, rank }).collect()).collect();
     let round: Vec<RoundRequest<'_>> = requests.iter().zip(&features).map(|(r, features)| RoundRequest {
@@ -372,7 +384,7 @@ pub(crate) fn observe(policy: &mut DraftPolicy, requests: &[Verified<'_>], route
         censor: r.censor,
     }).collect();
     binding::observe(policy, &RoundRecord { shared: false, requests: &round, routes, layer_us, times,
-        draft: (width > 0).then_some(DraftPass { width }), predicted })
+        draft: (width > 0).then_some(DraftPass { width, requests: drafted_requests }), predicted })
 }
 
 static SNAPSHOT: Mutex<Option<serde_json::Value>> = Mutex::new(None);

@@ -139,7 +139,7 @@ pub(super) fn observe(policy: &mut DraftPolicy, confidence_trace: &BTreeMap<u64,
     let rows = requests.iter().map(|request| request.rows).sum();
     lane.routes.fill(capture, rows, ROUTE_EXPERT_MASK)?;
     binding::observe(policy, &RoundRecord { shared, requests: &round, routes: &lane.routes,
-        layer_us, times, draft: (lane.width > 0).then_some(DraftPass { width: lane.width }), predicted })
+        layer_us, times, draft: (lane.width > 0).then_some(DraftPass { width: lane.width, requests: None }), predicted })
 }
 
 static SNAPSHOT: Mutex<Option<serde_json::Value>> = Mutex::new(None);
@@ -267,7 +267,7 @@ mod tests {
             let mut before = DraftPolicy::new(placement(), false).unwrap();
             before.observe(DraftRoundObservation { shared: false, requests: &observed, routes: &flat_routes(&routes(13)),
                 layer_us: &layer_us, total_us: 20_000., predicted_us: predicted,
-                draft_us: if width > 0 { 1_500. } else { f64::NAN }, wide: width > 5 }).unwrap();
+                draft_us: if width > 0 { 1_500. } else { f64::NAN }, drafted_requests: None, wide: width > 5 }).unwrap();
             let mut after = DraftPolicy::new(placement(), false).unwrap();
             observe_now(&mut after, &trace(), false, &routes(13), &layer_us, &requests, 20_000, 1_500, width, predicted)
                 .unwrap();

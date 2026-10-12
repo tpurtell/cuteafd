@@ -594,6 +594,8 @@ pub struct DraftRoundObservation<'a> {
     /// Wall µs of the draft pass (NaN if none ran), and whether it used the
     /// wide width.
     pub draft_us: f64,
+    /// Sequences passed to the drafter; None retains all-request legacy pricing.
+    pub drafted_requests: Option<usize>,
     pub wide: bool,
     /// The policy's prediction for this round's shape, if it made one.
     pub predicted_us: Option<f64>,
@@ -847,10 +849,10 @@ impl DraftPolicy {
     /// fit is usable.
     pub fn predict(&mut self, shared: bool, ids: &[u64], lengths: &[usize], width: usize) -> Option<f64> {
         let regime = self.usable_regime(self.regime(shared))?;
-        Some(self.predict_regime(regime, ids, lengths, width))
+        Some(self.predict_regime(regime, ids, lengths, width, ids.len()))
     }
 
-    fn predict_regime(&mut self, regime: usize, ids: &[u64], lengths: &[usize], width: usize) -> f64 {
+    fn predict_regime(&mut self, regime: usize, ids: &[u64], lengths: &[usize], width: usize, drafted_requests: usize) -> f64 {
         self.clear_counts();
         let mut megabytes = [0.; MAX_RESOURCE_CLASSES];
         for (index, (&id, &length)) in ids.iter().zip(lengths).enumerate() {
@@ -859,7 +861,7 @@ impl DraftPolicy {
             }
         }
         let rows = ids.len() + lengths.iter().sum::<usize>();
-        let draft = self.cost.draft_us(regime, ids.len() as f64, width > self.geometry.widths[0]);
+        let draft = self.cost.draft_us(regime, drafted_requests as f64, width > self.geometry.widths[0]);
         self.cost.predict(regime, rows as f64, ids.len() as f64, megabytes) + draft
             + self.adjustment(regime, rows as f64, ids.len())
     }
@@ -871,12 +873,18 @@ impl DraftPolicy {
     /// shape against the selection on equal terms.
     pub fn evaluate(&mut self, shared: bool, candidates: &[DraftCandidate<'_>], lengths: &[usize], width: usize)
         -> Option<(f64, f64)> {
-        if candidates.len() != lengths.len()
+        self.evaluate_drafted(shared, candidates, lengths, width, candidates.len())
+    }
+
+    /// Evaluate a mixed verifier batch with the actual drafter batch extent.
+    pub fn evaluate_drafted(&mut self, shared: bool, candidates: &[DraftCandidate<'_>], lengths: &[usize],
+        width: usize, drafted_requests: usize) -> Option<(f64, f64)> {
+        if drafted_requests > candidates.len() || candidates.len() != lengths.len()
             || candidates.iter().zip(lengths).any(|(c, &n)| n > c.confidence.len()) {
             return None;
         }
         let regime = self.usable_regime(self.regime(shared))?;
-        self.evaluate_regime(regime, candidates, lengths, width)
+        self.evaluate_regime(regime, candidates, lengths, width, drafted_requests)
     }
 
     /// Diagnostic evaluation including seed/physical priors before engagement.
@@ -884,10 +892,10 @@ impl DraftPolicy {
     pub fn diagnostic_evaluate(&mut self, shared: bool, candidates: &[DraftCandidate<'_>], lengths: &[usize], width: usize)
         -> Option<(f64, f64)> {
         let regime = self.usable_regime(self.regime(shared)).unwrap_or(self.regime(shared));
-        self.evaluate_regime(regime, candidates, lengths, width)
+        self.evaluate_regime(regime, candidates, lengths, width, candidates.len())
     }
 
-    fn evaluate_regime(&mut self, regime: usize, candidates: &[DraftCandidate<'_>], lengths: &[usize], width: usize)
+    fn evaluate_regime(&mut self, regime: usize, candidates: &[DraftCandidate<'_>], lengths: &[usize], width: usize, drafted_requests: usize)
         -> Option<(f64, f64)> {
         if candidates.len() != lengths.len()
             || candidates.iter().zip(lengths).any(|(c, &n)| n > c.confidence.len()
@@ -903,7 +911,7 @@ impl DraftPolicy {
             }
         }
         let ids: Vec<_> = candidates.iter().map(|c| c.id).collect();
-        Some((expected, self.predict_regime(regime, &ids, lengths, width)))
+        Some((expected, self.predict_regime(regime, &ids, lengths, width, drafted_requests)))
     }
 
     /// Choose draft lengths for one lane after a draft of `width`. Returns
@@ -921,9 +929,16 @@ impl DraftPolicy {
     /// request at its anchor.
     pub fn select_within(&mut self, shared: bool, candidates: &[DraftCandidate<'_>], width: usize, max_rows: usize)
         -> Result<Option<DraftSelection>, DraftPolicyError> {
+        self.select_drafted_within(shared, candidates, width, max_rows, candidates.len())
+    }
+
+    /// Select over all verifier requests while pricing only the sequences drafted.
+    pub fn select_drafted_within(&mut self, shared: bool, candidates: &[DraftCandidate<'_>], width: usize,
+        max_rows: usize, drafted_requests: usize) -> Result<Option<DraftSelection>, DraftPolicyError> {
         if candidates.is_empty() || candidates.len() > self.geometry.max_requests {
             return Err(DraftPolicyError::Requests(self.geometry.max_requests));
         }
+        if drafted_requests > candidates.len() { return Err(DraftPolicyError::RequestExtent); }
         for candidate in candidates {
             if candidate.confidence.len() > self.geometry.max_positions
                 || candidate.confidence.iter().any(|p| !p.is_finite() || !(0.0..=1.0).contains(p)) {
@@ -944,7 +959,7 @@ impl DraftPolicy {
             }).collect()
         }).collect();
         let ids: Vec<_> = candidates.iter().map(|c| c.id).collect();
-        let draft = self.cost.draft_us(regime, ids.len() as f64, width > self.geometry.widths[0]);
+        let draft = self.cost.draft_us(regime, drafted_requests as f64, width > self.geometry.widths[0]);
         Ok(Some(self.select_core(regime, &ids, &cumulative, draft, max_rows)))
     }
 
@@ -1168,6 +1183,9 @@ impl DraftPolicy {
         }
         let regime = self.regime(round.shared);
         let requests = round.requests.len() as f64;
+        let drafted_requests = round.drafted_requests.unwrap_or(round.requests.len());
+        if drafted_requests > round.requests.len() { return Err(DraftPolicyError::RequestExtent); }
+        let drafted_requests = drafted_requests as f64;
         let layer_routes = |layer: usize| &round.routes[layer * rows * topk..][..rows * topk];
         let drafted = round.draft_us.is_finite();
         let draft_us = if drafted { round.draft_us } else { 0. };
@@ -1182,7 +1200,7 @@ impl DraftPolicy {
                     * priced.slice_bytes / 1e6;
             }
             let linear = self.cost.predict(regime, rows as f64, requests, megabytes)
-                + if drafted { self.cost.draft_us(regime, requests, round.wide) } else { 0. };
+                + if drafted { self.cost.draft_us(regime, drafted_requests, round.wide) } else { 0. };
             let predicted = linear + self.adjustment(regime, rows as f64, round.requests.len());
             let (count, error) = &mut self.timed[regime];
             *count += 1;
@@ -1210,7 +1228,7 @@ impl DraftPolicy {
         if drafted {
             let wide = usize::from(round.wide);
             let flag = wide as f64;
-            self.cost.draft[regime].observe([1., requests, flag, flag * requests], round.draft_us);
+            self.cost.draft[regime].observe([1., drafted_requests, flag, flag * drafted_requests], round.draft_us);
             self.cost.draft_samples[regime][wide] += 1;
             self.stats.width_rounds[wide] += 1;
             self.since_width[wide] = 0;
@@ -1388,7 +1406,7 @@ mod tests {
         }
         let requests = [ObservedDraftRequest { id: 1, rows, accepted, confidence: None }];
         policy.observe(DraftRoundObservation { shared: false, requests: &requests, routes: &flat(&routes),
-            layer_us: &layer_us, total_us: total, predicted_us: predicted, draft_us: f64::NAN, wide: false }).unwrap();
+            layer_us: &layer_us, total_us: total, predicted_us: predicted, draft_us: f64::NAN, drafted_requests: None, wide: false }).unwrap();
         *token += accepted as u64;
         total
     }
@@ -1519,7 +1537,7 @@ mod tests {
             for _ in 0..4 {
                 let requests = [ObservedDraftRequest { id, rows: 1, accepted: 1, confidence: None }];
                 policy.observe(DraftRoundObservation { shared: false, requests: &requests, routes: &flat(&routes),
-                    layer_us: &layer_us, total_us: f64::NAN, predicted_us: None, draft_us: f64::NAN, wide: false }).unwrap();
+                    layer_us: &layer_us, total_us: f64::NAN, predicted_us: None, draft_us: f64::NAN, drafted_requests: None, wide: false }).unwrap();
             }
         }
         policy.clear_counts();
@@ -1545,7 +1563,7 @@ mod tests {
         let confidence = [0.9, 0.8, 0.7, 0.6];
         let requests = [ObservedDraftRequest { id: 1, rows: 5, accepted: 2, confidence: Some(&confidence) }];
         policy.observe(DraftRoundObservation { shared: false, requests: &requests, routes: &flat(&routes),
-            layer_us: &[None; 40], total_us: f64::NAN, predicted_us: None, draft_us: f64::NAN, wide: false }).unwrap();
+            layer_us: &[None; 40], total_us: f64::NAN, predicted_us: None, draft_us: f64::NAN, drafted_requests: None, wide: false }).unwrap();
         let stats = policy.stats();
         assert_eq!(stats.position_reached, [1, 1, 0, 0, 0, 0, 0]);
         assert_eq!(stats.position_accepted, [1, 0, 0, 0, 0, 0, 0]);
@@ -1572,7 +1590,7 @@ mod tests {
             let accepted = truth.iter().take_while(|&&p| uniform() < p).count();
             let requests = [ObservedDraftRequest { id: 1, rows: 8, accepted: accepted + 1, confidence: Some(&confidence) }];
             policy.observe(DraftRoundObservation { shared: false, requests: &requests, routes: &flat(&routes),
-                layer_us: &[None; 40], total_us: f64::NAN, predicted_us: None, draft_us: f64::NAN, wide: false }).unwrap();
+                layer_us: &[None; 40], total_us: f64::NAN, predicted_us: None, draft_us: f64::NAN, drafted_requests: None, wide: false }).unwrap();
         }
         assert!((policy.calibrated(0, 0.95) - 0.95).abs() < 0.02, "{:?}", policy.calibration());
         assert!((policy.calibrated(5, 0.95) - 0.8).abs() < 0.03, "{:?}", policy.calibration());
@@ -1619,7 +1637,7 @@ mod tests {
             let total = predicted - policy.time_bias()[0] + if round % 10 == 0 { 10_000. } else { 0. };
             let requests = [ObservedDraftRequest { id: 1, rows: 1, accepted: 1, confidence: None }];
             policy.observe(DraftRoundObservation { shared: false, requests: &requests, routes: &flat(&routes),
-                layer_us: &[None; 40], total_us: total, predicted_us: Some(predicted), draft_us: f64::NAN, wide: false }).unwrap();
+                layer_us: &[None; 40], total_us: total, predicted_us: Some(predicted), draft_us: f64::NAN, drafted_requests: None, wide: false }).unwrap();
         }
         assert!((policy.time_bias()[0] - 1000.).abs() < 250., "{:?}", policy.time_bias());
     }
@@ -1643,7 +1661,7 @@ mod tests {
         }
         let requests = [ObservedDraftRequest { id, rows, accepted, confidence: Some(confidence) }];
         policy.observe(DraftRoundObservation { shared: false, requests: &requests, routes: &flat(&routes),
-            layer_us: &layer_us, total_us: total, predicted_us: None, draft_us, wide: width > 5 }).unwrap();
+            layer_us: &layer_us, total_us: total, predicted_us: None, draft_us, drafted_requests: None, wide: width > 5 }).unwrap();
         *token += accepted as u64;
     }
 
@@ -1675,6 +1693,36 @@ mod tests {
         let mut fixed = DraftPolicy::new(placement(5), true).unwrap();
         assert_eq!(fixed.choose_action(false, &[(1, 5)], &[
             DraftAction { width: 5, draft_us: 100. }, DraftAction { width: 0, draft_us: 0. }], 64).unwrap(), Some(0));
+    }
+
+    #[test]
+    fn mixed_batches_price_and_fit_only_the_drafted_sequences() {
+        let mut policy = DraftPolicy::new(placement(5), false).unwrap();
+        let mut token = 0;
+        for _ in 0..400 { width_round(&mut policy, &mut token, 1, 5, 6, 6, &[0.99; 5]); }
+        let candidates: Vec<_> = (0..16).map(|id| DraftCandidate { id,
+            confidence: if id < 4 { &[0.99; 5] } else { &[] } }).collect();
+        let selection = policy.select_drafted_within(false, &candidates, 5, 64, 4).unwrap().unwrap();
+        assert!(selection.lengths[4..].iter().all(|&n| n == 0));
+        let (tokens, us) = policy.evaluate_drafted(false, &candidates, &selection.lengths, 5, 4).unwrap();
+        assert!((tokens - selection.expected_tokens).abs() < 1e-10);
+        assert!((us - selection.predicted_us).abs() < 1e-8);
+        let (_, all_drafted_us) = policy.evaluate(false, &candidates, &selection.lengths, 5).unwrap();
+        let extra = policy.cost.draft_us(0, 16., false) - policy.cost.draft_us(0, 4., false);
+        assert!((all_drafted_us - us - extra).abs() < 1e-8);
+        assert!(policy.select_drafted_within(false, &candidates, 5, 64, 17).is_err());
+
+        let requests: Vec<_> = (0..16).map(|id| ObservedDraftRequest { id,
+            rows: if id < 4 { 6 } else { 1 }, accepted: 1, confidence: None }).collect();
+        let routes = vec![1u16; 40 * 36 * 6];
+        let mut expected = policy.cost.draft[0].clone();
+        expected.observe([1., 4., 0., 0.], 3_000.);
+        policy.observe(DraftRoundObservation { shared: false, requests: &requests, routes: &routes,
+            layer_us: &[None; 40], total_us: f64::NAN, predicted_us: None, draft_us: 3_000.,
+            drafted_requests: Some(4), wide: false }).unwrap();
+        assert_eq!(format!("{:?}", policy.cost.draft[0]), format!("{expected:?}"));
+        // Undrafted members still retain their verifier route history.
+        assert!(policy.history.contains_key(&15));
     }
 
     #[test]
@@ -1830,7 +1878,7 @@ mod tests {
                         id: r.0, rows: length + 1, accepted, confidence: if copied { None } else { Some(&c[..]) } })
                     .collect();
                 let result = policy.observe(DraftRoundObservation { shared, requests: &observed, routes: &flat(&routes),
-                    layer_us: &layer_us, total_us: total, draft_us, wide: drafted && width > policy.widths()[0],
+                    layer_us: &layer_us, total_us: total, draft_us, drafted_requests: None, wide: drafted && width > policy.widths()[0],
                     predicted_us: predicted });
                 transcript.word("observed", u64::from(result.is_ok()));
                 for (r, &a) in live.iter_mut().zip(&accepted) { r.1 += a as u64; }
@@ -1840,7 +1888,7 @@ mod tests {
                     let mut bad = routes.clone();
                     bad[5][rows - 1][0] = 400;
                     let result = policy.observe(DraftRoundObservation { shared, requests: &observed, routes: &flat(&bad),
-                        layer_us: &layer_us, total_us: total, draft_us, wide: false, predicted_us: None });
+                        layer_us: &layer_us, total_us: total, draft_us, drafted_requests: None, wide: false, predicted_us: None });
                     transcript.word("rejected", u64::from(result.is_err()));
                 }
                 if round % 16 == 15 { record_state(transcript, &policy); }
@@ -1909,7 +1957,7 @@ mod tests {
         let observed: Vec<_> = (0..requests).map(|r| ObservedDraftRequest { id: 1 + r as u64, rows: per,
             accepted: per, confidence: None }).collect();
         policy.observe(DraftRoundObservation { shared: false, requests: &observed, routes: &flat(&routes),
-            layer_us: &layer_us, total_us: total, predicted_us: None, draft_us: f64::NAN, wide: false }).unwrap();
+            layer_us: &layer_us, total_us: total, predicted_us: None, draft_us: f64::NAN, drafted_requests: None, wide: false }).unwrap();
         *token += per as u64;
         total
     }
@@ -1989,9 +2037,9 @@ mod tests {
         let requests = [ObservedDraftRequest { id: 1, rows: 2, accepted: 1, confidence: None }];
         let routes: Vec<Vec<[u32; 6]>> = (0..40).map(|_| vec![[1, 2, 3, 4, 5, 6]]).collect();
         assert!(policy.observe(DraftRoundObservation { shared: false, requests: &requests, routes: &flat(&routes),
-            layer_us: &[None; 40], total_us: 1., predicted_us: None, draft_us: f64::NAN, wide: false }).is_err());
+            layer_us: &[None; 40], total_us: 1., predicted_us: None, draft_us: f64::NAN, drafted_requests: None, wide: false }).is_err());
         assert!(policy.observe(DraftRoundObservation { shared: false, requests: &requests[..0], routes: &[1],
-            layer_us: &[], total_us: 1., predicted_us: None, draft_us: f64::NAN, wide: false }).is_err());
+            layer_us: &[], total_us: 1., predicted_us: None, draft_us: f64::NAN, drafted_requests: None, wide: false }).is_err());
         assert!(DraftPolicy::new(v41(|_| false, |_| 0., vec![5, 7]), false).is_err());
     }
 }
