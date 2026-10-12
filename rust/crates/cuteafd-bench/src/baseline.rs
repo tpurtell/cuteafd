@@ -471,6 +471,7 @@ fn spec_lossless(run: &mut Run<'_>, check: &mut Check) -> Result<()> {
     // points at state (KV or recurrent rows a verify left behind).
     let noise = RowNoise::between(on_record, off_record, off_record.prompt_ids.len() + same);
     noise.record(check);
+    check.set("prefix_noise_rows", json!(&noise.rows));
     // And whether one-row decoding is even reproducible: the same request
     // again without drafts. Rows that differ here are run-to-run
     // nondeterminism (reduction order), not anything a verify does.
@@ -489,6 +490,8 @@ fn spec_lossless(run: &mut Run<'_>, check: &mut Check) -> Result<()> {
     let margin = |record: &ProbeRecord| record.rows.iter().find(|r| r.position == position)
         .and_then(|r| (r.top.len() >= 2).then(|| f64::from(r.top[0].1 - r.top[1].1)));
     let margins = (margin(off_record), margin(on_record));
+    check.set("divergence_margin_off", margins.0);
+    check.set("divergence_margin_on", margins.1);
     let tie = match margins {
         (Some(x), Some(y)) => x.min(y) < TIE_NATS,
         (Some(x), None) | (None, Some(x)) => x < TIE_NATS,
@@ -536,6 +539,14 @@ fn flip_verdict(tie: bool, decode_repeats: bool, noise: &RowNoise) -> CheckStatu
 
 /// Per-row difference between two greedy runs' recorded rows over their
 /// identical prefix: the log-probability of the (shared) top token.
+#[derive(Debug, PartialEq, serde::Serialize)]
+struct RowNoiseSample {
+    generated_index: usize,
+    position: usize,
+    delta: f64,
+    hash_exact: bool,
+}
+
 #[derive(Debug, Default, PartialEq)]
 struct RowNoise {
     compared: usize,
@@ -544,6 +555,7 @@ struct RowNoise {
     median: f64,
     /// Generated-token index of the first row more than 0.01 nats apart.
     first_over: Option<usize>,
+    rows: Vec<RowNoiseSample>,
 }
 
 impl RowNoise {
@@ -552,7 +564,7 @@ impl RowNoise {
         let start = b.prompt_ids.len();
         let mut deltas = Vec::new();
         let mut noise = RowNoise::default();
-        for row in b.rows.iter().filter(|r| r.position < end) {
+        for row in b.rows.iter().filter(|r| r.position >= start && r.position < end) {
             let Some(other) = a.rows.iter().find(|r| r.position == row.position) else { continue };
             let (Some(x), Some(y)) = (row.top.first(), other.top.first()) else { continue };
             if x.0 != y.0 {
@@ -564,6 +576,12 @@ impl RowNoise {
             if delta > 0.01 && noise.first_over.is_none() {
                 noise.first_over = Some(row.position.saturating_sub(start));
             }
+            noise.rows.push(RowNoiseSample {
+                generated_index: row.position - start,
+                position: row.position,
+                delta,
+                hash_exact: row.hash == other.hash,
+            });
             deltas.push(delta);
         }
         deltas.sort_by(f64::total_cmp);
@@ -815,6 +833,33 @@ mod tests {
         assert_eq!(RowNoise::between(&on, &ProbeRecord::default(), 13).describe(), "");
     }
 
+    #[test]
+    fn prefix_noise_diagnostic_contains_only_compared_positions_and_numbers() {
+        use cuteafd_api::openai::probe::ProbeRow;
+        let row = |position, token, probability, hash: &str| ProbeRow {
+            position, hash: hash.into(), top: vec![(token, probability)], ..ProbeRow::default()
+        };
+        let off = ProbeRecord { prompt_ids: vec![777; 10], rows: vec![
+            row(9, 900, -0.5, "prompt"), row(10, 901, -0.5, "same"),
+            row(11, 902, -0.5, "off"), row(12, 903, -0.5, "flip"),
+            row(13, 904, -0.5, "after"),
+        ], ..ProbeRecord::default() };
+        let on = ProbeRecord { prompt_ids: off.prompt_ids.clone(), rows: vec![
+            row(9, 900, -0.75, "prompt-other"), row(10, 901, -0.5, "same"),
+            row(11, 902, -0.75, "on"), row(12, 905, -0.5, "different-top"),
+            row(13, 904, -0.75, "after-other"),
+        ], ..ProbeRecord::default() };
+        let noise = RowNoise::between(&on, &off, 13);
+        let mut check = Check::default();
+        check.set("prefix_noise_rows", json!(&noise.rows));
+        assert_eq!(check.metrics["prefix_noise_rows"], json!([
+            {"generated_index": 0, "position": 10, "delta": 0.0, "hash_exact": true},
+            {"generated_index": 1, "position": 11, "delta": 0.25, "hash_exact": false},
+        ]));
+        assert_eq!(noise.compared, noise.rows.len());
+        assert_eq!((noise.max, noise.median), (0.25, 0.25));
+    }
+
     /// A record of `prompt` prompt ids with `cached` restored, rows `(position, hash)` and `generated`.
     fn record(prompt: usize, cached: usize, rows: &[(usize, &str)], generated: &[u32]) -> ProbeRecord {
         use cuteafd_api::openai::probe::ProbeRow;
@@ -880,7 +925,8 @@ mod tests {
 
     #[test]
     fn a_flip_after_verify_rounding_is_informational_only_when_decode_repeats() {
-        let noise = |compared, identical| RowNoise { compared, identical, max: 0.1, median: 0.01, first_over: None };
+        let noise = |compared, identical| RowNoise { compared, identical, max: 0.1, median: 0.01,
+            ..RowNoise::default() };
         // A near tie passes whatever else holds.
         assert_eq!(flip_verdict(true, false, &noise(0, 0)), CheckStatus::Pass);
         // Deterministic decode, and drafted rows differed before the flip: rounding.
