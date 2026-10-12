@@ -81,6 +81,76 @@ pub struct V4Inputs<'a> {
     pub code_bytes: Vec<u64>,
 }
 
+/// Native C4 context kernel scratch, read from the selected AOT manifest.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct V4Context {
+    pub topk_scratch: u64,
+    pub partial_scratch: u64,
+}
+
+/// Fail closed when either head range or any gather/merge primitive is absent.
+/// This inventories bindings only; it does not advertise executor support.
+pub fn manifest_context(manifest: &serde_json::Value, family: &str, heads: usize,
+    decode_rows: u64) -> Option<V4Context> {
+    let programs = manifest["programs"].as_array()?;
+    let lookup = |name: &str| programs.iter().find(|p| p["name"].as_str() == Some(name))
+        .map(|p| p["scratch_bytes_at_capacity"]["scratch"].as_u64().unwrap_or(0));
+    if heads == 0 || heads % 2 != 0 || decode_rows == 0 { return None; }
+    for suffix in ["dsa_candidate_merge", "lse_combine2", "paged_staging_gather_c4", "paged_staging_gather_index"] {
+        lookup(&format!("{family}_{suffix}"))?;
+    }
+    let partial = |begin| programs.iter().filter(|p| p["name"].as_str().is_some_and(|name|
+        name.starts_with(&format!("{family}_sparse_mla_partial_h{begin}_s"))
+            && name.ends_with(&format!("_m{decode_rows}"))))
+        .map(|p| p["scratch_bytes_at_capacity"]["scratch"].as_u64().unwrap_or(0)).max();
+    Some(V4Context { topk_scratch: lookup(&format!("{family}_scored_index_topk_decode_m{decode_rows}"))?,
+        partial_scratch: partial(0)?.max(partial(heads / 2)?) })
+}
+
+/// A prefill lane may finish a group begun in history and span an extra unit.
+/// Every second unit is local; four planes cover payload, footer, keys, scales.
+pub fn context_commit_units(prefill_rows: u64) -> u64 {
+    (prefill_rows.div_ceil(256) + 1).div_ceil(2)
+}
+
+/// Non-owner compressor CTAs need distinct output rows, not one aliased slot.
+pub fn context_scratch_units(decode_rows: u64) -> u64 {
+    decode_rows.div_ceil(64)
+}
+
+/// Per-rank buffers beside staging/exchange, with the engine's 256-byte floor.
+/// Scratch output pages exist per C4 layer; everything else is shared by layer.
+pub fn context_workspace(cfg: &DeepseekV4Config, extent: u64, prefill_rows: u64, decode_rows: u64,
+    prefill_lanes: u64, context: V4Context) -> Vec<(&'static str, u64)> {
+    let partial = decode_rows * cfg.n_heads as u64 / 2 * (512 * 2 + 4);
+    let half = extent.div_ceil(256).div_ceil(2);
+    let commit = 4 * 3 * context_commit_units(prefill_rows) * 8;
+    let mut out = vec![("candidates", decode_rows * cfg.index_topk as u64 * 8),
+        ("own-head partial", partial), ("peer-head partial", partial),
+        ("scored top-k scratch", context.topk_scratch), ("partial scratch", context.partial_scratch),
+        ("gather tables", 2 * half * 4), ("local selected lengths", decode_rows * 4),
+        ("empty window lengths", decode_rows * 4)];
+    out.extend((0..prefill_lanes).map(|_| ("commit blocks", commit)));
+    let scratch_units = context_scratch_units(decode_rows);
+    for _ in cfg.compress_ratios.iter().filter(|&&ratio| ratio == 4) {
+        out.push(("C4 scratch records", scratch_units * 37_440));
+        out.push(("C4 scratch index", scratch_units * 8_448));
+    }
+    out
+}
+
+/// One canonical demand for the runtime's context-only memory. Prefill gathers
+/// through two staging parities; decode exchanges on a single lane.
+pub fn context_buffers(cfg: &DeepseekV4Config, extent: u64, prefill_rows: u64, decode_rows: u64,
+    prefill_lanes: u64, context: V4Context) -> ContextBuffers {
+    ContextBuffers { staging_unit_bytes: deepseek_v4_layer_unit_bytes(4), staging_unit_rows: 256,
+        query_row_bytes: cfg.n_heads as u64 / 2 * 512 * 2,
+        partial_row_bytes: cfg.n_heads as u64 / 2 * (512 * 2 + 4),
+        candidate_row_bytes: cfg.index_topk as u64 * 8, compiled_extent: extent, decode_rows, lanes: 1,
+        workspace_bytes: context_workspace(cfg, extent, prefill_rows, decode_rows, prefill_lanes, context)
+            .iter().map(|&(_, bytes)| bytes.max(256)).sum() }
+}
+
 /// Prefix mark slots of the V4 arena (`MarkArena::slots_for` over every
 /// rank's mark), 0 without prefix entries.
 pub fn mark_slots(cfg: &DeepseekV4Config, gpus: usize, prefill_rows: u64, cache_stages: usize, sequences: u64,
@@ -243,6 +313,71 @@ mod default_tests {
     #[test]
     fn default_onboard_is_pool_first_for_every_v4_layout() {
         assert_eq!(default_onboard(), Onboard::Auto);
+    }
+
+    fn context_cfg() -> DeepseekV4Config {
+        DeepseekV4Config::from_model_args(&serde_json::json!({
+            "vocab_size":129280,"dim":4096,"moe_inter_dim":2048,"n_layers":43,"n_hash_layers":3,
+            "n_heads":64,"n_routed_experts":256,"n_shared_experts":1,"n_activated_experts":6,
+            "score_func":"sqrtsoftplus","route_scale":1.5,"swiglu_limit":10.0,"q_lora_rank":1024,
+            "head_dim":512,"rope_head_dim":64,"o_groups":8,"o_lora_rank":1024,"window_size":128,
+            "original_seq_len":65536,"rope_theta":10000,"rope_factor":16,"beta_fast":32,"beta_slow":1,
+            "index_n_heads":64,"index_head_dim":128,"index_topk":512,"hc_mult":4,"hc_sinkhorn_iters":20,
+            "compress_rope_theta":160000,"compress_ratios":(0..43).map(|i|
+                if i < 2 { 0 } else if i % 2 == 0 { 4 } else { 128 }).collect::<Vec<_>>()
+        }), 0).unwrap()
+    }
+
+    #[test]
+    fn context_workspace_charges_distinct_scratch_pages_and_four_commit_planes() {
+        let mut cfg = context_cfg();
+        for (heads, topk, c4_layers) in [(64, 512, 21), (128, 1024, 30)] {
+            cfg.n_heads = heads;
+            cfg.index_topk = topk;
+            cfg.compress_ratios = vec![4; c4_layers];
+            for rows in [1, 64, 65, 128] {
+                let scratch = V4Context { topk_scratch: 12345, partial_scratch: 56789 };
+                let buffers = context_buffers(&cfg, 1 << 20, 4096, rows, 2, scratch);
+                let workspace = context_workspace(&cfg, 1 << 20, 4096, rows, 2, scratch);
+                assert_eq!(buffers.lanes, 1);
+                assert_eq!(buffers.staging_unit_bytes, 45_888);
+                assert_eq!(buffers.query_row_bytes, heads as u64 / 2 * 1024);
+                assert_eq!(buffers.partial_row_bytes, heads as u64 / 2 * 1028);
+                assert_eq!(buffers.candidate_row_bytes, topk as u64 * 8);
+                assert_eq!(buffers.workspace_bytes, workspace.iter().map(|&(_, n)| n.max(256)).sum::<u64>());
+                assert_eq!(workspace.iter().filter(|&&(name, _)| name == "commit blocks").count(), 2);
+                assert!(workspace.iter().filter(|&&(name, _)| name == "commit blocks")
+                    .all(|&(_, n)| n == 4 * 3 * 9 * 8));
+                let scratch_bytes: u64 = workspace.iter().filter(|&&(name, _)| name.starts_with("C4 scratch"))
+                    .map(|&(_, n)| n).sum();
+                assert_eq!(scratch_bytes, c4_layers as u64 * rows.div_ceil(64) * 45_888);
+                let demands = buffers.demands().unwrap();
+                assert_eq!(demands.iter().find(|d| d.group == "context staging").unwrap().bytes,
+                    2 * 4096 * 45_888);
+            }
+        }
+        assert_eq!(context_commit_units(1), 1);
+        assert_eq!(context_commit_units(257), 2);
+    }
+
+    #[test]
+    fn context_manifest_needs_both_head_ranges_and_every_primitive() {
+        let names = ["dsv4f_scored_index_topk_decode_m64", "dsv4f_dsa_candidate_merge", "dsv4f_lse_combine2",
+            "dsv4f_paged_staging_gather_c4", "dsv4f_paged_staging_gather_index",
+            "dsv4f_sparse_mla_partial_h0_s4_m64", "dsv4f_sparse_mla_partial_h32_s8_m64"];
+        let manifest = serde_json::json!({"programs":names.iter().enumerate().map(|(i, name)|
+            serde_json::json!({"name":name,"scratch_bytes_at_capacity":{"scratch":i as u64 * 1024}}))
+            .collect::<Vec<_>>()});
+        assert_eq!(manifest_context(&manifest, "dsv4f", 64, 64),
+            Some(V4Context { topk_scratch: 0, partial_scratch: 6144 }));
+        for missing in 0..names.len() {
+            let mut incomplete = manifest.clone();
+            incomplete["programs"].as_array_mut().unwrap().remove(missing);
+            assert!(manifest_context(&incomplete, "dsv4f", 64, 64).is_none());
+        }
+        assert!(manifest_context(&manifest, "dsv4p", 128, 64).is_none());
+        assert!(manifest_context(&manifest, "dsv4f", 64, 128).is_none());
+        assert!(manifest_context(&manifest, "dsv4f", 0, 64).is_none());
     }
 }
 
