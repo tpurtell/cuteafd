@@ -413,6 +413,18 @@ def test_qwen_invalid_kv_format_fails_before_launch(tmp_path):
     assert "serve-qwen4 --snapshot" not in result.stderr
 
 
+def test_mimo_transport_timing_is_resolved_once_for_all_prefill_lanes():
+    source = (ROOT / "rust/crates/cuteafd-daemon/src/families/mimo_v2/mod.rs").read_text()
+    timing = "let timing = cuteafd_transport::protocol_v2_timing_from_env();"
+    start = source.index(timing)
+    link = source.index("let link = ||", start)
+    end = source.index("crate::shared::memory_report::release_load_staging", link)
+    assert start < link
+    assert source.count(timing) == 1
+    assert "TcpTransportConfig { timing," in source[link:end]
+    assert "timing: false" not in source[link:end]
+
+
 @pytest.mark.parametrize("config,keys,env,endpoints", [
     ({"model_type": "deepseek_v4"}, "", {}, 2),
     ({"model_type": "glm_moe_dsa", "num_hidden_layers": 4, "first_k_dense_replace": 3}, "", {}, 4),

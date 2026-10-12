@@ -1109,9 +1109,10 @@ impl Opened {
         let executors: Vec<u64> = (0..peers.len())
             .map(|rank| cuteafd_transport::expert::v41_spark_executor_id(peers.len(), rank))
             .collect::<Result<_>>()?;
+        let timing = cuteafd_transport::protocol_v2_timing_from_env();
         let link = || -> Result<crate::shared::spark_intake::SparkLink<'_>> {
             let mut link=crate::shared::spark_intake::SparkLink::new(&self.library, &peers, &executors,
-            u32::try_from(engine::expert_capacity(args.prefill_rows))?, cuteafd_transport::TcpTransportConfig { timing: false,
+            u32::try_from(engine::expert_capacity(args.prefill_rows))?, cuteafd_transport::TcpTransportConfig { timing,
                 timeout: std::time::Duration::from_secs(120), max_frame_bytes: 64 << 20 }, self.cfg.hidden * 2)?;
             link.enable_terminal_ownership(self.library.clone())?;
             Ok(link)
