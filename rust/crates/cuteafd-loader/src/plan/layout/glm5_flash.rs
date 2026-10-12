@@ -12,6 +12,7 @@ pub(super) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
         kind: DeviceKind::Rtx, index: rank as u32, capacity_bytes: bytes.saturating_sub(options.headroom_bytes),
         items: vec![], kv_tokens: 0 }).collect();
     let mut pool = 0;
+    let mut waste = Vec::new();
     let admitted = (|| -> anyhow::Result<(placement::Placement, glmf::GlmfWorkingSet)> {
         let cfg = GlmNextConfig::from_hf(&checkpoint.config)?;
         let spark_ranks = match report.placement { ExpertPlacement::Local => 0, ExpertPlacement::Sparks { ranks } => ranks };
@@ -117,7 +118,7 @@ pub(super) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
         let graphs = options.graph_budget_bytes.map(|bytes| placement::GraphSet::budget(&vec![bytes; ranks]))
             .unwrap_or_else(|| glmf::startup_graphs(&cfg, cfg.layers, context as usize, target as usize,
                 sequences as usize, draft > 0, ranks, decode_rows as usize, options.physical_sms.unwrap_or(188) as usize));
-        let inputs = glmf::GlmfInputs { cfg: &cfg, layers: cfg.layers, local_tp2_exl3, gpus: baselines, pending_code: vec![0; ranks],
+        let inputs = glmf::GlmfInputs { attention: Default::default(), cfg: &cfg, layers: cfg.layers, local_tp2_exl3, gpus: baselines, pending_code: vec![0; ranks],
             headroom_bytes: options.headroom_bytes, spark_ranks, prefill_lanes: lanes, prefill_rows: rows,
             decode_rows, partial_bytes: if options.glmf_kda_fp32_partials { 4 } else { 2 }, max_context: context, sequences, speculation: draft > 0, state_slots: options.state_slots.unwrap_or(sequences.max(8)),
             mark_slots: marks, pool_marks: options.glmf_pool_marks && options.mimo_prefix_entries > 0,
@@ -155,6 +156,10 @@ pub(super) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
                     how: "Raise --coordinator-weight-budget-gib or use Spark experts.".into(),
                 });
             }
+        }
+        let replicas = glmf::replicated_mla_bytes(&cfg, inputs.index, &placed)?;
+        if replicas > 0 {
+            waste.push(Waste { device: "rtx1".into(), what: "KV records replicated on both GPUs (MLA latent and index)".into(), bytes: replicas });
         }
         notes.push(format!("selected Spark ranks {}, prefill lanes {}, layers {:?}",
             working.spark_ranks, working.prefill_lanes, working.spark_layers));
@@ -203,5 +208,5 @@ pub(super) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
     let mut sparks = devices.split_off(ranks);
     resolve_encoder(checkpoint, report, model, &mut devices, &mut sparks, &vec![0; ranks], options, &mut notes);
     devices.extend(sparks);
-    MemoryLayout { devices, pool_tokens: pool, waste: vec![], notes }
+    MemoryLayout { devices, pool_tokens: pool, waste, notes }
 }

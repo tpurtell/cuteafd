@@ -1354,7 +1354,7 @@ fn glm5_flash_selected_working_set_drives_plan_request_and_runtime_buffers() {
         let report = plan(dir.path(), &options).unwrap();
         assert!(report.placement_supported, "{}", render(&report));
         let opts = options.layout.as_ref().unwrap();
-        let input = glmf::GlmfInputs { cfg: &cfg, layers: cfg.layers, local_tp2_exl3: false,
+        let input = glmf::GlmfInputs { attention: Default::default(), cfg: &cfg, layers: cfg.layers, local_tp2_exl3: false,
             gpus: opts.rtx_bytes.iter().enumerate().map(|(rank, &total)| (total, Baseline::Planned {
                 context_bytes: placement::ArchContext::coordinator(total, None).context_bytes
                     + placement::loaded_code("glmf", "fp8", true, rank as u8).unwrap().bytes,

@@ -4,8 +4,44 @@ use crate::serving_capacity::{self as cache, glmf_graphs};
 use crate::placement::*;
 use cuteafd_core::memory_layout::{Basis, Category};
 
+/// Candidate layout inventory. Executors stay fail-closed until the family
+/// binds all cache, prefill, verify and prefix paths.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct GlmfAttention {
+    pub mode: AttentionPlacement,
+    pub first_owner: u8,
+    pub topk_scratch: u64,
+    pub partial_scratch: u64,
+}
+
+/// Additional per-rank context allocations, in serving allocation order.
+pub fn context_workspace(cfg: &GlmNextConfig, extent: u64, rows: u64, lanes: u64,
+    context: GlmfAttention) -> Vec<(&'static str, u64)> {
+    let partial = cache::GLMF_DECODE_ROWS * cfg.heads as u64 / 2 * (512 * 2 + 4);
+    let units = extent.div_ceil(256).div_ceil(2);
+    let commits = (rows.div_ceil(256) + 1).div_ceil(2);
+    let mut out = vec![("candidates", cache::GLMF_DECODE_ROWS * (cfg.index_topk / cfg.index_kpool) as u64 * 8),
+        ("own-head partial", partial), ("peer-head partial", partial),
+        ("scored top-k scratch", context.topk_scratch), ("partial scratch", context.partial_scratch),
+        ("gather tables", 2 * units * 4)];
+    out.extend((0..lanes).map(|_| ("commit blocks", 3 * 3 * commits * 8)));
+    out
+}
+
+pub fn context_buffers(cfg: &GlmNextConfig, extent: u64, rows: u64, lanes: u64,
+    context: GlmfAttention) -> ContextBuffers {
+    ContextBuffers { staging_unit_bytes: 256 * 528 + 64 * 132, staging_unit_rows: 256,
+        query_row_bytes: cfg.heads as u64 / 2 * 512 * 2,
+        partial_row_bytes: cfg.heads as u64 / 2 * (512 * 2 + 4),
+        candidate_row_bytes: (cfg.index_topk / cfg.index_kpool) as u64 * 8,
+        compiled_extent: extent, decode_rows: cache::GLMF_DECODE_ROWS, lanes: 1,
+        workspace_bytes: context_workspace(cfg, extent, rows, lanes, context).iter()
+            .map(|&(_, bytes)| bytes.max(256)).sum() }
+}
+
 #[derive(Debug, Clone)]
 pub struct GlmfInputs<'a> {
+    pub attention: GlmfAttention,
     pub cfg: &'a GlmNextConfig,
     pub layers: usize,
     /// Sample after programs, before any weights; planned baseline charges context/code only.
@@ -52,6 +88,21 @@ pub struct GlmfInputs<'a> {
 }
 
 pub fn default_onboard() -> Onboard { Onboard::Auto }
+
+/// Duplicate context-scaling MLA records on the second GPU, excluding the
+/// small replicated compact tails, KDA state and pool metadata.
+pub fn replicated_mla_bytes(cfg: &GlmNextConfig, index: cache::GlmfIndexCache,
+    placed: &Placement) -> Result<u64, PlacementError> {
+    if placed.items.len() != 2 { return Ok(0); }
+    if placed.layers.len() > cfg.attention.len() {
+        return Err(PlacementError::Inventory("GLM Flash waste layer inventory"));
+    }
+    let replicas = placed.layers.iter().zip(&cfg.attention).filter(|(layer, kind)|
+        **kind == GlmNextAttention::Mla && layer.mode == LayerMode::HeadSplit).count() as u64;
+    let unit = 256 * (528 + if index == cache::GlmfIndexCache::Keys { 512 } else { 0 }) + 64 * 132;
+    replicas.checked_mul(unit).and_then(|bytes| bytes.checked_mul(placed.pool_tokens.div_ceil(256)))
+        .ok_or(PlacementError::Overflow("GLM Flash replicated MLA records"))
+}
 
 /// Shared checkpoint-derived inventory; only package scratch depends on the chosen GPU.
 pub fn drafter_inventory(config: &serde_json::Value, slots: usize, sequences: usize,
@@ -164,11 +215,15 @@ pub fn request_for_working_set(i: &GlmfInputs<'_>, working: &GlmfWorkingSet) -> 
     if ranks == 2 && i.decode_rows != cache::GLMF_DECODE_ROWS {
         return Err(PlacementError::Inventory("GLM Flash head split needs 64 decode rows"));
     }
+    if i.attention.mode == AttentionPlacement::Context && i.pool_marks {
+        return Err(PlacementError::Inventory("GLM Flash context prefix marks need an arena"));
+    }
     if i.shared_replay && (ranks != 1 || working.spark_ranks == 0 || i.requested_pool.is_some()) {
         return Err(PlacementError::Inventory("GLM Flash shared replay needs single-GPU automatic Spark admission"));
     }
-    let geometry = cache::glm_flash_rank_cache_geometry_rows(i.cfg, i.layers, ranks, i.index,
-        i.kda_state_bytes, i.decode_rows).map_err(|_| PlacementError::Inventory("GLM Flash cache geometry"))?;
+    let geometry = cache::glm_flash_placed_cache_geometry_rows(i.cfg, i.layers, ranks, i.index,
+        i.kda_state_bytes, i.decode_rows, i.attention.mode, i.attention.first_owner as usize)
+        .map_err(|_| PlacementError::Inventory("GLM Flash cache geometry"))?;
     let routed = i.cfg.dense[..i.layers].iter().filter(|&&d| !d).count();
     if i.experts.len() != routed {
         return Err(PlacementError::Inventory("GLM Flash routed expert inventory"));
@@ -185,12 +240,18 @@ pub fn request_for_working_set(i: &GlmfInputs<'_>, working: &GlmfWorkingSet) -> 
                 unit_bytes_context: mla.then_some([unit / 2; 2]) },
             fixed_bytes: ModeBytes::default(), context_indexer: mla, colocate: None, extra: vec![],
             experts: if i.cfg.dense[layer] { None } else { expert.next().copied() },
-            modes: if ranks == 2 { vec![LayerMode::HeadSplit] } else { vec![LayerMode::Whole { gpu: 0, ffn: FfnMode::Owner }] } });
+            modes: if ranks == 2 && mla { vec![LayerMode::HeadSplit, LayerMode::ContextSplit,
+                LayerMode::Whole { gpu: 0, ffn: FfnMode::Split }, LayerMode::Whole { gpu: 1, ffn: FfnMode::Split }] }
+                else if ranks == 2 { vec![LayerMode::HeadSplit] }
+                else { vec![LayerMode::Whole { gpu: 0, ffn: FfnMode::Owner }] } });
     }
     let mla = i.cfg.attention[..i.layers].iter().filter(|&&a| a == GlmNextAttention::Mla).count() as u64;
-    let tails = if i.index == cache::GlmfIndexCache::Compact { mla * cache::GLMF_INDEX_TAIL_BYTES } else { 0 };
-    let index_replay = if tails > 0 { mla * i.decode_rows * 512 } else { 0 };
     for (rank, g) in geometry.ranks.iter().enumerate() {
+        let local_mla = if i.attention.mode == AttentionPlacement::Layers {
+            mla / 2 + u64::from(rank == i.attention.first_owner as usize) * (mla % 2)
+        } else { mla };
+        let tails = if i.index == cache::GlmfIndexCache::Compact { local_mla * cache::GLMF_INDEX_TAIL_BYTES } else { 0 };
+        let index_replay = if tails > 0 { local_mla * i.decode_rows * 512 } else { 0 };
         let gpu = rank as u8;
         fixed.push(GlmfBufferDemand::new(GlmfComponent::Always, gpu, Category::Runtime, "pending code", i.pending_code.get(rank).copied().unwrap_or(0), Basis::Calibrated));
         fixed.push(GlmfBufferDemand::new(GlmfComponent::Always, gpu, Category::Embedding, "embedding", i.resident[rank].embedding, Basis::Exact));
@@ -237,7 +298,9 @@ pub fn request_for_working_set(i: &GlmfInputs<'_>, working: &GlmfWorkingSet) -> 
     fixed.extend(workspace.iter().cloned());
     let fixed = working.demands(&fixed).cloned().collect();
     Ok(PlacementRequest {
-        attention_placement: None, context_buffers: Default::default(), layers_first_gpu: 0,
+        attention_placement: (i.attention.mode != AttentionPlacement::Heads).then_some(i.attention.mode),
+        context_buffers: context_buffers(i.cfg, i.max_context, i.prefill_rows, working.prefill_lanes, i.attention),
+        layers_first_gpu: i.attention.first_owner,
         inventory: Inventory { gpus: i.gpus.iter().map(|&(capacity_bytes, baseline)| GpuBudget {
             capacity_bytes, headroom_bytes: i.headroom_bytes, baseline }).collect(), spark_ranks: working.spark_ranks, peer_access: ranks == 2 },
         pool: PoolPolicy::resolve(&i.gpus.iter().map(|g| g.0).collect::<Vec<_>>(), i.max_context,
@@ -253,7 +316,8 @@ pub fn request_for_working_set(i: &GlmfInputs<'_>, working: &GlmfWorkingSet) -> 
         onboard: if i.spark_ranks == 0 { i.onboard } else { Onboard::Layers(working.rtx_layers.len()) },
         expert_gpus: usize::from(ranks == 1 || i.experts.iter().all(|cost| cost.tp2)),
         policy: LayerPolicy { default: if ranks == 2 { vec![LayerMode::HeadSplit] } else {
-            vec![LayerMode::Whole { gpu: 0, ffn: FfnMode::Owner }] }, by_kind: vec![], ..LayerPolicy::default() },
+            vec![LayerMode::Whole { gpu: 0, ffn: FfnMode::Owner }] }, by_kind: vec![],
+            ownership: LayerOwnership::Alternating, ..LayerPolicy::default() },
         hops: HopSpec { row_bytes: 4 * i.cfg.hidden as u64 * 2, rows: i.prefill_rows.max(i.decode_rows),
             lanes: working.prefill_lanes, entry_gpu: 0, head_gpu: 0 }, executor: super::GLM5_FLASH,
     })
@@ -521,7 +585,7 @@ mod tests {
     fn inputs(cfg: &GlmNextConfig, ranks: usize, capacity: u64) -> GlmfInputs<'_> {
         let context = ArchContext::coordinator(capacity, None).context_bytes;
         GlmfInputs {
-            cfg, layers: cfg.layers,
+            attention: Default::default(), cfg, layers: cfg.layers,
             gpus: (0..ranks).map(|rank| (capacity, Baseline::Planned {
                 context_bytes: context + loaded_code("glmf", "exl3", ranks == 2, rank as u8).unwrap().bytes,
                 loaded_bytes: 0 })).collect(), pending_code: vec![0; ranks], local_tp2_exl3: false, headroom_bytes: 1 << 30,
@@ -1053,6 +1117,86 @@ mod tests {
         let expected = startup_graphs(&cfg, cfg.layers, context, placed.pool_tokens as usize,
             input.sequences as usize, true, 1, 64, 188);
         assert_eq!(graphs.ranks, expected.ranks);
+    }
+
+    #[test]
+    fn candidate_mla_modes_have_no_replicated_kv_and_keep_kda_split() {
+        let mut config = crate::plan::testing::glm5_flash_config(45);
+        config["text_config"]["layer_types"] = serde_json::json!((0..45).map(|l|
+            if l % 4 == 3 { "deepseek_sparse_attention" } else { "linear_attention" }).collect::<Vec<_>>());
+        let cfg = GlmNextConfig::from_hf(&config).unwrap();
+        for sparks in [0, 4] {
+            let mut input = inputs(&cfg, 2, inventory::PRO_TOTAL_BYTES);
+            input.spark_ranks = sparks;
+            input.onboard = Onboard::Layers(if sparks == 0 { input.experts.len() } else { 0 });
+            input.pool_marks = false;
+            input.graphs = GraphSet::budget(&[64 << 20; 2]);
+            input.drafter_bytes = 0;
+            input.requested_pool = Some(2 << 20);
+            // Synthetic experts isolate cache storage while retaining the real
+            // working-set, TP2, graph and per-layer hop admission arithmetic.
+            for expert in &mut input.experts { expert.whole = Bytes2::default(); expert.half = [Bytes2::default(); 2]; }
+            let heads = solve(&request(&input).unwrap()).unwrap();
+            let heads_bytes = replicated_mla_bytes(&cfg, input.index, &heads).unwrap();
+            assert_eq!(heads_bytes, 11 * (256 * (528 + 512) + 64 * 132) * (2 << 20) / 256);
+            for mode in [AttentionPlacement::Context, AttentionPlacement::Layers] {
+                input.index = cache::GlmfIndexCache::Compact;
+                input.attention.mode = mode;
+                let mut req = request(&input).unwrap();
+                assert!(matches!(solve(&req), Err(PlacementError::AttentionPlacement { .. })), "production remains fail-closed");
+                // A test-only executor proves planner accounting without claiming
+                // these modes are qualified or available to serving.
+                req.executor = ExecutorModes { family: "glm5_flash candidate", modes: &[LayerMode::HeadSplit,
+                    LayerMode::ContextSplit, LayerMode::Whole { gpu: 0, ffn: FfnMode::Split },
+                    LayerMode::Whole { gpu: 1, ffn: FfnMode::Split }], hops: true, attention: AttentionPlacement::Heads };
+                let placed = solve(&req).unwrap();
+                assert_eq!(placed.pool_tokens, 2 << 20);
+                assert_eq!(replicated_mla_bytes(&cfg, input.index, &placed).unwrap(), 0);
+                assert!(placed.layers.iter().zip(&cfg.attention).filter(|(_, kind)| **kind == GlmNextAttention::Kda)
+                    .all(|(layer, _)| layer.mode == LayerMode::HeadSplit));
+                let mla: Vec<_> = placed.layers.iter().zip(&cfg.attention).filter(|(_, kind)| **kind == GlmNextAttention::Mla)
+                    .map(|(layer, _)| layer.mode).collect();
+                if mode == AttentionPlacement::Context {
+                    assert_eq!(mla, vec![LayerMode::ContextSplit; 11]);
+                } else {
+                    assert_eq!(mla, (0..11).map(|i| LayerMode::Whole { gpu: (i % 2) as u8,
+                        ffn: FfnMode::Split }).collect::<Vec<_>>());
+                }
+                let record_bytes: u64 = placed.items.iter().flatten().filter(|i| i.group == "records").map(|i| i.bytes).sum();
+                assert_eq!(record_bytes, (11 * (256 * 528 + 64 * 132) + 8) * (2 << 20) / 256);
+                let mut measured = req.clone();
+                for gpu in &mut measured.inventory.gpus {
+                    let Baseline::Planned { context_bytes, loaded_bytes } = gpu.baseline else { unreachable!() };
+                    gpu.baseline = Baseline::Measured { free_bytes: gpu.capacity_bytes - context_bytes - loaded_bytes };
+                }
+                let runtime = solve(&measured).unwrap();
+                assert_eq!(placed.items, runtime.items);
+                assert_eq!(placed.layers, runtime.layers);
+                assert_eq!(placed.pool_tokens, runtime.pool_tokens);
+            }
+        }
+    }
+
+    #[test]
+    fn candidate_context_inventory_matches_exchange_and_allocation_floor() {
+        let cfg = GlmNextConfig::from_hf(&crate::plan::testing::glm5_flash_config(4)).unwrap();
+        let context = GlmfAttention { mode: AttentionPlacement::Context, topk_scratch: 123456,
+            partial_scratch: 654321, ..Default::default() };
+        let buffers = context_buffers(&cfg, 1 << 20, 4096, 3, context);
+        assert_eq!((buffers.query_row_bytes, buffers.partial_row_bytes, buffers.candidate_row_bytes),
+            (32768, 32896, 4096));
+        assert_eq!(buffers.lanes, 1);
+        let workspace = context_workspace(&cfg, 1 << 20, 4096, 3, context);
+        assert_eq!(workspace.len(), 9);
+        assert_eq!(workspace.last().unwrap().1, 3 * 3 * 9 * 8);
+        assert_eq!(buffers.workspace_bytes, workspace.iter().map(|&(_, bytes)| bytes.max(256)).sum::<u64>());
+        let demands = buffers.demands().unwrap();
+        for gpu in 0..2 {
+            let bytes = |group: &str| demands.iter().find(|d| d.gpu == gpu && d.group == group).unwrap().bytes;
+            assert_eq!(bytes("context staging"), 2 * (1 << 20) / 256 * (256 * 528 + 64 * 132));
+            assert_eq!(bytes("context exchange"), ContextExchangeLayout::new(&buffers).bytes().unwrap());
+            assert_eq!(bytes("context workspace"), buffers.workspace_bytes);
+        }
     }
 
     #[test]

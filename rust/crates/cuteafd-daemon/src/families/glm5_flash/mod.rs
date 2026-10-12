@@ -1234,7 +1234,7 @@ impl Opened {
         } else { placement::GraphSet::budget(&vec![args.graph_budget_mib.map_or(1536 << 20, |mib| mib << 20); devices.len()]) };
         let onboard = args.rtx_expert_layers.unwrap_or_else(|| if args.local_experts {
             placement::Onboard::Layers(experts.len()) } else { admission::default_onboard() });
-        let inputs = admission::GlmfInputs { cfg: &self.cfg, layers, local_tp2_exl3,
+        let inputs = admission::GlmfInputs { attention: Default::default(), cfg: &self.cfg, layers, local_tp2_exl3,
             gpus: inventory.baselines(&[]), pending_code, headroom_bytes: args.headroom_bytes()?, spark_ranks,
             prefill_lanes: lanes as u64, prefill_rows: args.prefill_rows as u64, decode_rows: args.decode_rows as u64,
             partial_bytes: if args.kda_fp32_partials { 4 } else { 2 }, max_context: args.max_context as u64,

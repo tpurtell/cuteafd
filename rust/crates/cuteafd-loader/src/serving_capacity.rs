@@ -34,6 +34,7 @@ pub enum KvPlacement {
     Replicated,
     PartitionedHeads,
     PartitionedLayers,
+    PartitionedContext,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -346,7 +347,32 @@ pub fn glm_flash_rank_cache_geometry_rows(
     state_bytes: u64,
     decode_rows: u64,
 ) -> Result<FamilyCacheGeometry, CacheGeometryError> {
+    glm_flash_placed_cache_geometry_rows(cfg, layers, ranks, index, state_bytes, decode_rows,
+        crate::placement::AttentionPlacement::Heads, 0)
+}
+
+/// Storage for a candidate attention placement, not an executor capability.
+/// KDA always partitions heads. Context owns alternate 256-token units, while
+/// layers owns alternate MLA layers; compact tails/replay follow those owners.
+pub fn glm_flash_placed_cache_geometry_rows(
+    cfg: &GlmNextConfig,
+    layers: usize,
+    ranks: usize,
+    index: GlmfIndexCache,
+    state_bytes: u64,
+    decode_rows: u64,
+    attention: crate::placement::AttentionPlacement,
+    first_owner: usize,
+) -> Result<FamilyCacheGeometry, CacheGeometryError> {
+    use crate::placement::AttentionPlacement;
     selected("glm5_flash", cfg.layers, layers)?;
+    if first_owner >= ranks || (attention != AttentionPlacement::Heads && ranks != 2)
+        || (attention == AttentionPlacement::Context && index != GlmfIndexCache::Compact)
+        || (ranks == 2 && attention != AttentionPlacement::Heads && decode_rows != GLMF_DECODE_ROWS) {
+        return Err(CacheGeometryError::Unsupported {
+            family: "glm5_flash", what: "owned/context attention cache geometry",
+        });
+    }
     if ![GLMF_DECODE_ROWS, GLMF_WIDE_DECODE_ROWS].contains(&decode_rows) {
         return Err(CacheGeometryError::Unsupported {
             family: "glm5_flash",
@@ -399,7 +425,7 @@ pub fn glm_flash_rank_cache_geometry_rows(
         ],
     )?;
     let compact = index == GlmfIndexCache::Compact;
-    if compact && ranks != 1 {
+    if compact && ranks != 1 && attention == AttentionPlacement::Heads {
         return Err(CacheGeometryError::Unsupported {
             family: "glm5_flash",
             what: "compact index cache under a head split",
@@ -412,24 +438,33 @@ pub fn glm_flash_rank_cache_geometry_rows(
     } else {
         sum("GLM Flash MLA unit", &[256 * (528 + 512), 64 * 132])?
     };
-    // Compact: each sequence's index tails, and a key | gate record of the decode rows per MLA layer.
-    let tails = if compact { product("GLM Flash index tails", &[mla, GLMF_INDEX_TAIL_BYTES])? } else { 0 };
-    let index_replay = if compact { product("GLM Flash index replay", &[mla, decode_rows, 512])? } else { 0 };
     let kda_state = product("GLM Flash active KDA", &[kda, state])?;
-    Ok(FamilyCacheGeometry {
-        logical_unit_rows: 256,
-        placement: if ranks == 1 { KvPlacement::SingleDevice } else { KvPlacement::Replicated },
-        ranks: vec![RankCacheGeometry {
-            persistent_unit_bytes: product("GLM Flash MLA pools", &[mla, per_layer_unit])?,
+    let ranks = (0..ranks).map(|rank| {
+        let resident_mla = if attention == AttentionPlacement::Layers {
+            mla / 2 + u64::from(rank == first_owner) * (mla % 2)
+        } else { mla };
+        let tails = if compact { product("GLM Flash index tails", &[resident_mla, GLMF_INDEX_TAIL_BYTES])? } else { 0 };
+        let index_replay = if compact { product("GLM Flash index replay", &[resident_mla, decode_rows, 512])? } else { 0 };
+        Ok(RankCacheGeometry {
+            persistent_unit_bytes: product("GLM Flash MLA pools", &[resident_mla, per_layer_unit])?
+                / if attention == AttentionPlacement::Context { 2 } else { 1 },
             pool_metadata_unit_bytes: 4,
             active_state_per_sequence_bytes: sum("GLM Flash active state", &[kda_state, tails])?,
             retained_mark_bytes: sum("GLM Flash mark", &[kda_state, tails])?,
             speculative_replay_bytes: sum("GLM Flash replay",
                 &[product("GLM Flash KDA replay", &[kda, replay])?, index_replay])?,
-            // The commit tables: slot, first row and kept rows of up to `decode_rows` sequences.
             fixed_state_bytes: product("GLM Flash commit tables", &[3, decode_rows, 4])?,
             context_table_bytes_per_token: 0,
-        }; ranks],
+        })
+    }).collect::<Result<Vec<_>, CacheGeometryError>>()?;
+    Ok(FamilyCacheGeometry {
+        logical_unit_rows: 256,
+        placement: if ranks.len() == 1 { KvPlacement::SingleDevice } else { match attention {
+            AttentionPlacement::Heads => KvPlacement::Replicated,
+            AttentionPlacement::Context => KvPlacement::PartitionedContext,
+            AttentionPlacement::Layers => KvPlacement::PartitionedLayers,
+        } },
+        ranks,
     })
 }
 
@@ -808,6 +843,54 @@ mod tests {
         assert_eq!(both.ranks[0].active_state_per_sequence_bytes, both.ranks[0].retained_mark_bytes);
         assert_eq!((both.ranks[0].persistent_unit_bytes, both.ranks[0].speculative_replay_bytes),
             (compact.ranks[0].persistent_unit_bytes, compact.ranks[0].speculative_replay_bytes));
+    }
+
+    #[test]
+    fn flash_candidate_context_and_layers_store_each_mla_unit_once() {
+        use crate::placement::AttentionPlacement::{Context, Heads, Layers};
+        let mut config = glm5_flash_config(45);
+        config["text_config"]["layer_types"] = json!((0..45).map(|i|
+            if i % 4 == 3 { "deepseek_sparse_attention" } else { "linear_attention" }).collect::<Vec<_>>());
+        let cfg = GlmNextConfig::from_hf(&config).unwrap();
+        let single = glm_flash_rank_cache_geometry(&cfg, 45, 1, GlmfIndexCache::Compact, 4).unwrap();
+        let kda = glm_flash_rank_cache_geometry(&cfg, 45, 2, GlmfIndexCache::Keys, 4).unwrap().ranks[0];
+        let unit = 256 * 528 + 64 * 132;
+        let placed = |mode, first| glm_flash_placed_cache_geometry_rows(&cfg, 45, 2,
+            GlmfIndexCache::Compact, 4, 64, mode, first).unwrap();
+        let context = placed(Context, 0);
+        assert_eq!(context.placement, KvPlacement::PartitionedContext);
+        assert_eq!(context.ranks[0], context.ranks[1]);
+        for rank in &context.ranks {
+            assert_eq!(rank.persistent_unit_bytes, 11 * unit / 2);
+            assert_eq!(rank.retained_mark_bytes, kda.retained_mark_bytes + 11 * GLMF_INDEX_TAIL_BYTES);
+            assert_eq!(rank.speculative_replay_bytes, kda.speculative_replay_bytes + 11 * 64 * 512);
+        }
+        for first in [0, 1] {
+            let owned = placed(Layers, first);
+            assert_eq!(owned.placement, KvPlacement::PartitionedLayers);
+            assert_eq!(owned.ranks[first].persistent_unit_bytes, 6 * unit);
+            assert_eq!(owned.ranks[1 - first].persistent_unit_bytes, 5 * unit);
+            for (rank, mla) in [(first, 6), (1 - first, 5)] {
+                assert_eq!(owned.ranks[rank].retained_mark_bytes, kda.retained_mark_bytes + mla * GLMF_INDEX_TAIL_BYTES);
+                assert_eq!(owned.ranks[rank].speculative_replay_bytes, kda.speculative_replay_bytes + mla * 64 * 512);
+                assert_eq!(owned.ranks[rank].pool_metadata_unit_bytes, 4);
+                assert_eq!(owned.ranks[rank].fixed_state_bytes, 3 * 64 * 4);
+            }
+            assert_eq!(owned.ranks.iter().map(|r| r.retained_mark_bytes).sum::<u64>(), single.ranks[0].retained_mark_bytes);
+            assert_eq!(owned.ranks.iter().map(|r| r.speculative_replay_bytes).sum::<u64>(), single.ranks[0].speculative_replay_bytes);
+            for geometry in [&context, &owned] {
+                assert_eq!(geometry.ranks.iter().map(|r| r.persistent_unit_bytes).sum::<u64>(), single.ranks[0].persistent_unit_bytes);
+            }
+        }
+        for (ranks, cache, rows, mode, first) in [(1, GlmfIndexCache::Compact, 64, Context, 0),
+            (2, GlmfIndexCache::Keys, 64, Context, 0), (2, GlmfIndexCache::Compact, 128, Context, 0),
+            (2, GlmfIndexCache::Compact, 64, Heads, 0), (2, GlmfIndexCache::Keys, 128, Layers, 0),
+            (2, GlmfIndexCache::Compact, 64, Layers, 2)] {
+            assert!(glm_flash_placed_cache_geometry_rows(&cfg, 45, ranks, cache, 4, rows, mode, first).is_err());
+        }
+        let keys = glm_flash_placed_cache_geometry_rows(&cfg, 45, 2, GlmfIndexCache::Keys, 4, 64, Layers, 1).unwrap();
+        let full = glm_flash_cache_geometry(&cfg, 45).unwrap();
+        assert_eq!(keys.ranks.iter().map(|r| r.persistent_unit_bytes).sum::<u64>(), full.ranks[0].persistent_unit_bytes);
     }
 
     /// The KDA records alone: every geometry's replay bytes less the compact index's key | gate

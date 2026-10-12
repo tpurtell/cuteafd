@@ -1010,6 +1010,7 @@ pub fn render(report: &PlanReport) -> String {
                 crate::serving_capacity::KvPlacement::Replicated => "replicated KV",
                 crate::serving_capacity::KvPlacement::PartitionedHeads => "partitioned KV heads",
                 crate::serving_capacity::KvPlacement::PartitionedLayers => "partitioned KV layers/sources",
+                crate::serving_capacity::KvPlacement::PartitionedContext => "partitioned KV context",
             };
             for (rank, cost) in layout.ranks.iter().enumerate() {
                 let bytes_per_token = cost.persistent_unit_bytes as f64 / layout.logical_unit_rows as f64;

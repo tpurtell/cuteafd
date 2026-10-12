@@ -23,7 +23,21 @@ pub struct GlmfResidentRank {
 /// as the source checkpoint stores them. Routed experts, media and external drafts are separate.
 pub fn resident_weights(checkpoint: &Checkpoint, cfg: &GlmNextConfig, layers: usize, ranks: usize,
     repr: GlmfRepresentation) -> Result<Vec<GlmfResidentRank>, String> {
-    if !(1..=2).contains(&ranks) { return Err("GLM Flash weights require one or two ranks".into()); }
+    resident_weights_placed(checkpoint, cfg, layers, ranks, repr,
+        crate::placement::AttentionPlacement::Heads, 0)
+}
+
+/// Candidate MLA ownership with KDA and FFN operands still head-split. This
+/// inventory does not advertise support for an unqualified executor.
+pub fn resident_weights_placed(checkpoint: &Checkpoint, cfg: &GlmNextConfig, layers: usize, ranks: usize,
+    repr: GlmfRepresentation, attention: crate::placement::AttentionPlacement, first_owner: usize)
+    -> Result<Vec<GlmfResidentRank>, String> {
+    use crate::placement::AttentionPlacement;
+    if !(1..=2).contains(&ranks) || first_owner >= ranks
+        || (attention != AttentionPlacement::Heads && ranks != 2) {
+        return Err("GLM Flash attention weights require valid one/two-rank ownership".into());
+    }
+    let owned = attention == AttentionPlacement::Layers;
     let tensor = |name: &str| checkpoint.tensors.iter().find(|t| t.meta.name == name)
         .ok_or_else(|| format!("GLM Flash resident operand missing: {name}"));
     let elements = |name: &str| -> Result<u64, String> {
@@ -32,7 +46,7 @@ pub fn resident_weights(checkpoint: &Checkpoint, cfg: &GlmNextConfig, layers: us
     };
     let mut out = vec![GlmfResidentRank::default(); ranks];
     out[0].embedding = tensor("model.language_model.embed_tokens.weight")?.meta.byte_length.max(256);
-    let fp8 = |names: &[String], split: bool, row128: bool| -> Result<u64, String> {
+    let fp8_ranks = |names: &[String], divisor: usize, row128: bool| -> Result<u64, String> {
         let mut values = 0;
         let mut scales = 0;
         for name in names {
@@ -44,13 +58,16 @@ pub fn resident_weights(checkpoint: &Checkpoint, cfg: &GlmNextConfig, layers: us
             values += n * k;
             scales += if row128 { n * k.div_ceil(128) * 4 } else { n.div_ceil(128) * k.div_ceil(128) * 4 };
         }
-        let divisor = if split { ranks as u64 } else { 1 };
-        Ok((values / divisor).max(256) + (scales / divisor).max(256))
+        Ok((values / divisor as u64).max(256) + (scales / divisor as u64).max(256))
     };
+    let fp8 = |names: &[String], split: bool, row128: bool| fp8_ranks(names, if split { ranks } else { 1 }, row128);
     out[0].weights = tensor("model.language_model.norm.weight")?.meta.byte_length.max(256)
         + if repr.fp8_head { fp8(&["lm_head.weight".into()], false, true)? }
             else { tensor("lm_head.weight")?.meta.byte_length.max(256) };
+    let mut mla_owner = first_owner;
     for layer in 0..layers.min(cfg.layers) {
+        let owner = mla_owner;
+        if cfg.attention[layer] == GlmNextAttention::Mla { mla_owner ^= 1; }
         let p = format!("model.language_model.layers.{layer}");
         let a = |s: &str| format!("{p}.self_attn.{s}");
         let one = |s: &str| -> Result<u64, String> { Ok(tensor(s)?.meta.byte_length.max(256)) };
@@ -83,16 +100,19 @@ pub fn resident_weights(checkpoint: &Checkpoint, cfg: &GlmNextConfig, layers: us
                     bytes += one(&a("o_norm.weight"))?;
                 }
                 GlmNextAttention::Mla => {
-                    bytes += one(&a("q_a_layernorm.weight"))? + one(&a("kv_a_layernorm.weight"))?;
-                    // kv_b is absorbed into BF16 UK and UV, divided by heads.
-                    bytes += (cfg.heads * cfg.qk_nope_dim * cfg.kv_lora_rank * 2 / ranks) as u64;
-                    bytes += (cfg.heads * cfg.v_head_dim * cfg.kv_lora_rank * 2 / ranks) as u64;
-                    bytes += fp8(&[a("q_a_proj.weight"), a("kv_a_proj_with_mqa.weight")], false, false)?;
-                    bytes += fp8(&[a("q_b_proj.weight")], ranks > 1, false)? + fp8(&[a("o_proj.weight")], ranks > 1, false)?;
-                    bytes += one(&a("indexer.wq_b.weight"))?;
-                    bytes += ["wk.weight", "weights_proj.weight", "index_kpool_compress_gate"].iter()
-                        .map(|s| elements(&a(&format!("indexer.{s}")))).collect::<Result<Vec<_>, _>>()?.into_iter().sum::<u64>() * 2;
-                    for s in ["k_norm.weight", "k_norm.bias", "index_kpool_compress_ape"] { bytes += one(&a(&format!("indexer.{s}")))?; }
+                    if !owned || rank == owner {
+                        let parts = if owned { 1 } else { ranks };
+                        bytes += one(&a("q_a_layernorm.weight"))? + one(&a("kv_a_layernorm.weight"))?;
+                        bytes += (cfg.heads * cfg.qk_nope_dim * cfg.kv_lora_rank * 2 / parts) as u64;
+                        bytes += (cfg.heads * cfg.v_head_dim * cfg.kv_lora_rank * 2 / parts) as u64;
+                        bytes += fp8(&[a("q_a_proj.weight"), a("kv_a_proj_with_mqa.weight")], false, false)?;
+                        bytes += fp8_ranks(&[a("q_b_proj.weight")], parts, false)?
+                            + fp8_ranks(&[a("o_proj.weight")], parts, false)?;
+                        bytes += one(&a("indexer.wq_b.weight"))?;
+                        bytes += ["wk.weight", "weights_proj.weight", "index_kpool_compress_gate"].iter()
+                            .map(|s| elements(&a(&format!("indexer.{s}")))).collect::<Result<Vec<_>, _>>()?.into_iter().sum::<u64>() * 2;
+                        for s in ["k_norm.weight", "k_norm.bias", "index_kpool_compress_ape"] { bytes += one(&a(&format!("indexer.{s}")))?; }
+                    }
                 }
             }
             let mlp = if cfg.dense[layer] { format!("{p}.mlp") } else { format!("{p}.mlp.shared_experts") };
@@ -160,6 +180,46 @@ mod tests {
         assert_eq!(split[0].weights, single[0].weights);
         assert_eq!((split[1].embedding, split[1].weights), (0, 0));
         assert!(resident_weights(&checkpoint, &cfg, 2, 1, Default::default()).unwrap_err().contains("resident operand missing"));
+    }
+
+    #[test]
+    fn owned_mla_inventory_preserves_kda_ffn_and_global_operands() {
+        use crate::placement::AttentionPlacement::{Context, Heads, Layers};
+        use crate::plan::testing::{glm5_flash_config, glm5_flash_tensors, write_snapshot};
+        let dir = tempfile::tempdir().unwrap();
+        let config = glm5_flash_config(6);
+        write_snapshot(dir.path(), &config, &glm5_flash_tensors(&config), None);
+        let checkpoint = Checkpoint::open(dir.path()).unwrap();
+        let cfg = GlmNextConfig::from_hf(&config).unwrap();
+        let heads = resident_weights(&checkpoint, &cfg, 6, 2, Default::default()).unwrap();
+        let context = resident_weights_placed(&checkpoint, &cfg, 6, 2, Default::default(), Context, 0).unwrap();
+        assert_eq!(heads.iter().map(|r| (r.weights, r.embedding)).collect::<Vec<_>>(),
+            context.iter().map(|r| (r.weights, r.embedding)).collect::<Vec<_>>());
+        let owned0 = resident_weights_placed(&checkpoint, &cfg, 6, 2, Default::default(), Layers, 0).unwrap();
+        let owned1 = resident_weights_placed(&checkpoint, &cfg, 6, 2, Default::default(), Layers, 1).unwrap();
+        let mut previous = [0; 2];
+        for layers in 0..=6 {
+            let single = resident_weights(&checkpoint, &cfg, layers, 1, Default::default()).unwrap();
+            let split = resident_weights(&checkpoint, &cfg, layers, 2, Default::default()).unwrap();
+            for first in [0, 1] {
+                let owned = resident_weights_placed(&checkpoint, &cfg, layers, 2, Default::default(), Layers, first).unwrap();
+                assert_eq!(owned.iter().map(|r| r.embedding).collect::<Vec<_>>(), split.iter().map(|r| r.embedding).collect::<Vec<_>>());
+                let total = |ranks: &[GlmfResidentRank]| ranks.iter().map(|r| r.weights).sum::<u64>();
+                let saving = total(&split) - total(&owned);
+                if layers > 0 && cfg.attention[layers - 1] == GlmNextAttention::Kda {
+                    assert_eq!(saving, previous[first], "KDA must remain unchanged");
+                }
+                if layers > 0 && cfg.attention[layers - 1] == GlmNextAttention::Mla {
+                    assert!(saving > previous[first], "replicated MLA operands are removed");
+                }
+                previous[first] = saving;
+                assert!(total(&owned) >= single[0].weights, "FFN metadata remains replicated");
+            }
+        }
+        assert_eq!(owned0[0].weights - owned1[0].weights, owned1[1].weights - owned0[1].weights);
+        for (ranks, mode, first) in [(1, Layers, 0), (2, Context, 2), (0, Heads, 0)] {
+            assert!(resident_weights_placed(&checkpoint, &cfg, 6, ranks, Default::default(), mode, first).is_err());
+        }
     }
 
     #[test]
