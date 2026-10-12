@@ -28,7 +28,7 @@ fn request(gpus: usize, free: u64, layers: usize, sparks: usize, onboard: Onboar
         tp2_workspace: [0; 2],
         onboard,
         expert_gpus: gpus,
-        policy: LayerPolicy { default: vec![LayerMode::HeadSplit], by_kind: Vec::new() },
+        policy: LayerPolicy { default: vec![LayerMode::HeadSplit], by_kind: Vec::new(), ..LayerPolicy::default() },
         hops: HopSpec::default(),
         executor: families::DEEPSEEK_V4,
     }
@@ -809,6 +809,74 @@ fn mixed_memory_flips_are_explicit_in_plan_and_summary() {
     assert_eq!(pruned.peer_row_bytes, 0);
 }
 
+
+#[test]
+fn measured_per_kind_policy_interleaves_owned_mla_and_partitioned_kda() {
+    let mut req = request(2, 32 * GIB, 8, 4, Onboard::Auto);
+    req.executor = CONTEXT;
+    req.pool_overhead = vec![0; 2];
+    req.policy.attention = vec![(AttentionClass::Mla, AttentionPlacement::Layers),
+        (AttentionClass::Kda, AttentionPlacement::Heads)];
+    req.policy.ownership = LayerOwnership::Alternating;
+    req.layers_first_gpu = 1;
+    for (index, layer) in req.layers.iter_mut().enumerate() {
+        layer.experts = None;
+        layer.kind = if index % 2 == 0 { AttentionClass::Mla } else { AttentionClass::Kda };
+        layer.kv_unit = if index % 2 == 0 { ModeBytes::replicated(UNIT).into() } else { KvDemand::default() };
+        layer.modes = if index % 2 == 0 { vec![LayerMode::HeadSplit, S0, S1] } else { vec![LayerMode::HeadSplit] };
+    }
+    req.layers[0].colocate = Some(7);
+    req.layers[4].colocate = Some(7);
+    let placed = solve(&req).unwrap();
+    assert_eq!(placed.layers.iter().map(|layer| layer.mode).collect::<Vec<_>>(),
+        [S1, LayerMode::HeadSplit, S0, LayerMode::HeadSplit, S1, LayerMode::HeadSplit, S1, LayerMode::HeadSplit]);
+    assert_eq!(placed.attention_placement, AttentionPlacement::Layers);
+    assert_eq!(placed.attention_by_kind, req.policy.attention);
+    assert!(placed.hops.iter().filter(|hop| hop.at != HopPoint::Entry)
+        .all(|hop| matches!(hop.at, HopPoint::AfterAttention(index) if index % 2 == 0)));
+    // A policy is still strict when memory is short, not silently changed to context/heads.
+    req.inventory.gpus.iter_mut().for_each(|gpu| gpu.baseline = Baseline::Measured { free_bytes: 2 * UNIT });
+    assert!(solve(&req).is_err());
+    // Explicit heads bypasses the recorded auto policy for reference measurements.
+    req.attention_placement = Some(AttentionPlacement::Heads);
+    req.inventory.gpus.iter_mut().for_each(|gpu| gpu.baseline = Baseline::Measured { free_bytes: 32 * GIB });
+    assert!(solve(&req).unwrap().layers.iter().all(|layer| layer.mode == LayerMode::HeadSplit));
+}
+
+#[test]
+fn measured_kind_does_not_flip_even_when_context_would_grow_the_pool() {
+    let mut req = request(2, GIB, 1, 4, Onboard::Auto);
+    req.executor = CONTEXT;
+    req.pool_overhead = vec![0; 2];
+    req.pool.target = 2 << 20;
+    req.pool.floor = 256;
+    req.layers[0].experts = None;
+    req.layers[0].kind = AttentionClass::Mla;
+    req.layers[0].modes = vec![LayerMode::HeadSplit, LayerMode::ContextSplit];
+    req.layers[0].kv_unit = KvDemand { unit_bytes_whole: UNIT, unit_bytes_split: [UNIT; 2],
+        unit_bytes_context: Some([UNIT / 2; 2]) };
+    req.policy.attention = vec![(AttentionClass::Mla, AttentionPlacement::Heads)];
+    let measured = solve(&req).unwrap();
+    assert_eq!(measured.pool_tokens, 65_536);
+    assert_eq!(measured.layers[0].mode, LayerMode::HeadSplit);
+    req.policy.attention.clear();
+    let memory_driven = solve(&req).unwrap();
+    assert!(memory_driven.pool_tokens > measured.pool_tokens);
+    assert_eq!(memory_driven.layers[0].mode, LayerMode::ContextSplit);
+}
+
+#[test]
+fn per_kind_attention_policy_is_strict_only_on_peer_tp2() {
+    let mut req = request(2, 32 * GIB, 1, 4, Onboard::Auto);
+    req.policy.attention = vec![(AttentionClass::Mla, AttentionPlacement::Context)];
+    req.layers[0].kind = AttentionClass::Mla;
+    assert!(matches!(solve(&req), Err(PlacementError::AttentionPlacement { .. })));
+    req.inventory.peer_access = false;
+    assert!(solve(&req).is_ok(), "no-peer layout retains the legacy single-device policy");
+    req.inventory.peer_access = true;
+    req.policy.attention.push(req.policy.attention[0]);
+    assert!(matches!(solve(&req), Err(PlacementError::Inventory(_))));
+}
 
 #[test]
 fn contiguous_layer_switch_keeps_groups_and_breaks_equal_bytes_by_pool() {

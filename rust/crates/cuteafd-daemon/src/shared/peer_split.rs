@@ -17,6 +17,9 @@ use anyhow::{ensure, Context, Result};
 // K3 (GLM 5.3 `context`) is the first executor; until it lands nothing outside tests uses this.
 #[allow(dead_code)]
 pub(crate) mod context;
+// Family bindings qualify these shared executors incrementally.
+#[allow(dead_code)]
+pub(crate) mod attention;
 pub(crate) mod hop;
 pub(crate) mod order;
 use cuteafd_ffi::NativeLibrary;

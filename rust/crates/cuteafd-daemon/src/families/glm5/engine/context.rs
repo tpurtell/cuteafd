@@ -33,8 +33,7 @@
 //! after both streams drained (as the head split's `peer_tables` does), so no
 //! queued kernel ever reads a table the host rewrites.
 use super::*;
-use crate::shared::peer_split::context::{combine_order, local_pages, page_owner, shard_rows, slot as context_slot,
-    ContextExchange};
+use crate::shared::peer_split::context::{local_pages, page_owner, shard_rows, ContextExchange};
 use cuteafd_ffi::CuteafdDeviceBuffer;
 use cuteafd_loader::placement::families::glm5::{context_buffers, context_commit_pages, context_workspace, GlmContext};
 
@@ -220,53 +219,73 @@ impl<'a> GlmEngine<'a> {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn context_decode_attention(&self, rank: usize, w: &Workspace<'_>, index: usize,
         layer: &GlmLayer<'_>, rows: Scalar, t: usize, tables: &StepTables) -> Result<()> {
-        let split = self.context.as_ref().context("context split")?;
-        let (own, exchange) = (&split.ranks[rank], &split.exchange);
-        let s = context_slot(index, 0);
-        let (kv, index_cache, _) = self.rank_caches(rank, index);
-        let half_heads = self.cfg.heads / 2;
-        let query_half = half_heads * 576 * 2;
-        // The producer's query rows are `[t, H/2, 576]` contiguous: into this GPU's
-        // workspace query, then pushed into both assembled buffers.
-        self.producer(rank, w, layer, rows, "m64", kv.buffer, w.query.buffer.ptr)?;
-        exchange.push_query(rank, s, w.query.buffer.ptr, query_half, t)?;
-        if let Some(index_cache) = index_cache {
-            self.index_producer(rank, w, layer, rows, "m64", index_cache.buffer)?;
-            let k = self.cfg.index_topk;
-            let (scores, indices) = (own.candidates.buffer.ptr, view(&own.candidates, DECODE_ROWS * k * 4, t * k * 4)?.ptr);
-            let width = Scalar::I32(tables.table_stride as i32);
-            self.run_on(rank, "glm_scored_index_topk_decode_m64", &[("q", w.q_fp8.buffer.ptr),
-                ("weights", w.head_weights.buffer.ptr), ("cache", index_cache.buffer.ptr),
-                ("table", w.page_table.buffer.ptr), ("lengths", w.cache_lengths.buffer.ptr), ("indices", indices),
-                ("scores", scores), ("scratch", own.topk_scratch.buffer.ptr)],
-                &[rows, width, width, Scalar::I32(2), Scalar::I32(rank as i32)])?;
-            exchange.push_candidates(rank, s, scores, indices, t)?;
-            let (all_scores, all_indices) = exchange.wait_candidates(rank, s)?;
-            // The merged global lists overwrite this GPU's (already pushed) list; its own picks
-            // become the local selection `indices`/`lengths` (shared-indexer layers reuse it).
-            self.run_on(rank, "glm_dsa_candidate_merge", &[("scores", all_scores), ("indices", all_indices),
-                ("out_scores", scores), ("out_indices", indices), ("table", w.page_table.buffer.ptr),
-                ("local_slots", w.indices.buffer.ptr), ("local_lengths", w.lengths.buffer.ptr)],
-                &[rows, width, Scalar::I32(rank as i32)])?;
+        use crate::shared::peer_split::attention::{context_decode, Candidates, ContextKernels, Partial, Query};
+        struct Bindings<'e, 'a, 'w, 'l> {
+            engine: &'e GlmEngine<'a>, w: &'e Workspace<'w>, layer: &'e GlmLayer<'l>,
+            tables: &'e StepTables, rank: usize, index: usize, rows: Scalar, t: usize,
         }
-        let query = exchange.wait_query(rank, s)?;
-        let partial = |heads: usize, out: &Dev<'_>| -> Result<(*mut c_void, *mut c_void)> {
-            let lse = view(out, DECODE_ROWS * half_heads * 512 * 2, t * half_heads * 4)?.ptr;
-            self.run_on(rank, pick(&split.partial[rank][heads], t), &[("q", query), ("cache", kv.buffer.ptr),
-                ("indices", w.indices.buffer.ptr), ("lengths", w.lengths.buffer.ptr),
-                ("extra_cache", kv.buffer.ptr), ("extra_indices", w.indices.buffer.ptr),
-                ("extra_lengths", w.lengths.buffer.ptr), ("out", out.buffer.ptr), ("lse", lse),
-                ("scratch", own.partial_scratch.buffer.ptr)], &[rows])?;
-            Ok((out.buffer.ptr, lse))
-        };
-        // The peer's heads first: their partial travels while this GPU computes its own.
-        let (values, lse) = partial(1 - rank, &own.peer)?;
-        exchange.push_partial(rank, s, values, lse, t)?;
-        let mine = partial(rank, &own.own)?;
-        let received = exchange.wait_partial(rank, s)?;
-        let [(o0, l0), (o1, l1)] = combine_order(rank, mine, received);
-        self.run_on(rank, "glm_lse_combine2", &[("o0", o0), ("l0", l0), ("o1", o1), ("l1", l1),
-            ("sink", split.sink[rank].buffer.ptr), ("out", w.attn.buffer.ptr)], &[rows])?;
+        impl ContextKernels for Bindings<'_, '_, '_, '_> {
+            fn produce(&mut self) -> Result<Query> {
+                let e = self.engine;
+                let (kv, _, _) = e.rank_caches(self.rank, self.index);
+                e.producer(self.rank, self.w, self.layer, self.rows, "m64", kv.buffer, self.w.query.buffer.ptr)?;
+                Ok(Query { values: self.w.query.buffer.ptr, row_pitch: e.cfg.heads / 2 * 576 * 2 })
+            }
+            fn score(&mut self) -> Result<Option<Candidates>> {
+                let (e, w, rank) = (self.engine, self.w, self.rank);
+                let (_, cache, _) = e.rank_caches(rank, self.index);
+                let Some(cache) = cache else { return Ok(None) };
+                let own = &e.context.as_ref().context("context split")?.ranks[rank];
+                e.index_producer(rank, w, self.layer, self.rows, "m64", cache.buffer)?;
+                let k = e.cfg.index_topk;
+                let candidates = Candidates { scores: own.candidates.buffer.ptr,
+                    indices: view(&own.candidates, DECODE_ROWS * k * 4, self.t * k * 4)?.ptr };
+                let width = Scalar::I32(self.tables.table_stride as i32);
+                e.run_on(rank, "glm_scored_index_topk_decode_m64", &[("q", w.q_fp8.buffer.ptr),
+                    ("weights", w.head_weights.buffer.ptr), ("cache", cache.buffer.ptr),
+                    ("table", w.page_table.buffer.ptr), ("lengths", w.cache_lengths.buffer.ptr),
+                    ("indices", candidates.indices.cast_mut()), ("scores", candidates.scores.cast_mut()),
+                    ("scratch", own.topk_scratch.buffer.ptr)],
+                    &[self.rows, width, width, Scalar::I32(2), Scalar::I32(rank as i32)])?;
+                Ok(Some(candidates))
+            }
+            fn merge(&mut self, scores: *mut c_void, indices: *mut c_void) -> Result<()> {
+                let (e, w, rank) = (self.engine, self.w, self.rank);
+                let own = &e.context.as_ref().context("context split")?.ranks[rank];
+                let k = e.cfg.index_topk;
+                e.run_on(rank, "glm_dsa_candidate_merge", &[("scores", scores), ("indices", indices),
+                    ("out_scores", own.candidates.buffer.ptr),
+                    ("out_indices", view(&own.candidates, DECODE_ROWS * k * 4, self.t * k * 4)?.ptr),
+                    ("table", w.page_table.buffer.ptr), ("local_slots", w.indices.buffer.ptr),
+                    ("local_lengths", w.lengths.buffer.ptr)],
+                    &[self.rows, Scalar::I32(self.tables.table_stride as i32), Scalar::I32(rank as i32)])
+            }
+            fn partial(&mut self, query: *mut c_void, heads_rank: usize) -> Result<Partial> {
+                let (e, w, rank) = (self.engine, self.w, self.rank);
+                let split = e.context.as_ref().context("context split")?;
+                let own = &split.ranks[rank];
+                let out = if heads_rank == rank { &own.own } else { &own.peer };
+                let heads = e.cfg.heads / 2;
+                let lse = view(out, DECODE_ROWS * heads * 512 * 2, self.t * heads * 4)?.ptr;
+                let (kv, _, _) = e.rank_caches(rank, self.index);
+                e.run_on(rank, pick(&split.partial[rank][heads_rank], self.t), &[("q", query), ("cache", kv.buffer.ptr),
+                    ("indices", w.indices.buffer.ptr), ("lengths", w.lengths.buffer.ptr),
+                    ("extra_cache", kv.buffer.ptr), ("extra_indices", w.indices.buffer.ptr),
+                    ("extra_lengths", w.lengths.buffer.ptr), ("out", out.buffer.ptr), ("lse", lse),
+                    ("scratch", own.partial_scratch.buffer.ptr)], &[self.rows])?;
+                Ok(Partial { values: out.buffer.ptr, lse })
+            }
+            fn combine(&mut self, [first, second]: [Partial; 2]) -> Result<()> {
+                let e = self.engine;
+                let split = e.context.as_ref().context("context split")?;
+                e.run_on(self.rank, "glm_lse_combine2", &[("o0", first.values), ("l0", first.lse),
+                    ("o1", second.values), ("l1", second.lse), ("sink", split.sink[self.rank].buffer.ptr),
+                    ("out", self.w.attn.buffer.ptr)], &[self.rows])
+            }
+        }
+        let split = self.context.as_ref().context("context split")?;
+        context_decode(&split.exchange, rank, index, 0, t,
+            &mut Bindings { engine: self, w, layer, tables, rank, index, rows, t })?;
         self.o_proj(rank, w, layer, "m64", rows)
     }
 
@@ -368,25 +387,13 @@ fn rank_tables(tables: &StepTables, rank: usize, pages: usize) -> Result<StepTab
 /// records, index keys, index scales, each as `[src | dst | bytes]` lists of `limit` u64
 /// (zero padded); and the block count per kind.
 fn commit_blocks(rank: usize, start: usize, rows: usize, pages: &[u32], limit: usize) -> Result<(Vec<u64>, usize)> {
-    let end = start + rows;
-    ensure!(end.div_ceil(PAGE_ROWS) <= pages.len(), "commit past the sequence's pages");
-    let mut blocks: [[Vec<u64>; 3]; 3] = Default::default();
-    for page in (start / PAGE_ROWS..end.div_ceil(PAGE_ROWS)).filter(|&p| page_owner(p) == rank) {
-        ensure!(pages[page] as usize % 2 == rank, "logical page {page} has id {} of the wrong parity", pages[page]);
-        let local = (pages[page] >> 1) as usize;
-        let first = start.max(page * PAGE_ROWS) - page * PAGE_ROWS;
-        let count = end.min((page + 1) * PAGE_ROWS) - page * PAGE_ROWS - first;
-        for (kind, (row_bytes, base, page_bytes)) in [(RECORD_BYTES, 0, RECORD_PAGE_BYTES), (128, 0, INDEX_PAGE_BYTES),
-            (4, INDEX_KEYS, INDEX_PAGE_BYTES)].into_iter().enumerate() {
-            blocks[kind][0].push((page * page_bytes + base + first * row_bytes) as u64);
-            blocks[kind][1].push((local * page_bytes + base + first * row_bytes) as u64);
-            blocks[kind][2].push((count * row_bytes) as u64);
-        }
-    }
-    let commits = blocks[0][0].len();
-    ensure!(commits <= limit, "{commits} commit pages past {limit}");
-    Ok((blocks.iter().flat_map(|kind| kind.iter().flat_map(|list|
-        list.iter().copied().chain(std::iter::repeat_n(0, limit - list.len())))).collect(), commits))
+    use crate::shared::peer_split::context::{commit_blocks, CommitPlane};
+    let planes = [(RECORD_BYTES, 0, RECORD_PAGE_BYTES), (128, 0, INDEX_PAGE_BYTES),
+        (4, INDEX_KEYS, INDEX_PAGE_BYTES)].map(|(row_bytes, base, unit_bytes)| CommitPlane {
+            first: start, rows, rows_per_unit: PAGE_ROWS, row_bytes, base, unit_bytes,
+        });
+    let blocks = commit_blocks(rank, pages, &planes, limit)?;
+    Ok((blocks.table, blocks.counts[0]))
 }
 
 #[cfg(test)]

@@ -32,6 +32,15 @@ pub fn parse(value: &str) -> Result<Option<AttentionPlacement>, String> {
     if value == "auto" { Ok(None) } else { value.parse().map(Some) }
 }
 
+/// How owned attention is distributed. Range ownership preserves the existing
+/// V4.1 layout; alternating colocate groups can interleave with split KDA/GQA.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum LayerOwnership {
+    #[default]
+    Ranges,
+    Alternating,
+}
+
 /// Pool bytes per logical unit. A context unit is charged at half its bytes
 /// on each GPU; the solver reserves an even number of units for the half pools.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]

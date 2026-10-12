@@ -7,6 +7,20 @@ use cuteafd_core::memory_layout::{Basis, Category, Item};
 /// runtime get the same answer for the same inputs.
 pub fn solve(request: &PlacementRequest) -> Result<Placement, PlacementError> {
     request.executor.check_attention(request.attention_placement, request.inventory.gpus.len(), request.inventory.peer_access)?;
+    if request.attention_placement.is_none() {
+        let mut kinds = Vec::new();
+        for &(kind, _) in &request.policy.attention {
+            if kinds.contains(&kind) || !request.layers.iter().any(|layer| layer.kind == kind) {
+                return Err(PlacementError::Inventory("duplicate or absent attention policy kind"));
+            }
+            kinds.push(kind);
+        }
+        if request.inventory.gpus.len() == 2 && request.inventory.peer_access {
+            for &(_, mode) in &request.policy.attention {
+                request.executor.check_attention(Some(mode), 2, true)?;
+            }
+        }
+    }
     let mut best = solve_once(request, &[]);
     if request.attention_placement.is_some() || request.inventory.gpus.len() != 2 || !request.inventory.peer_access
         || best.as_ref().is_ok_and(|p| p.pool_tokens >= request.pool.target) { return best; }
@@ -27,6 +41,8 @@ pub fn solve(request: &PlacementRequest) -> Result<Placement, PlacementError> {
     kinds.sort_by_key(|&(kind, saving)| (std::cmp::Reverse(saving), kind));
     let mut flips = Vec::new();
     for (kind, _) in kinds {
+        // A measured per-kind policy is a decision, not a memory experiment.
+        if request.policy.attention.iter().any(|(k, _)| *k == kind) { continue; }
         let prior_flips = flips.clone();
         let mut kind_best = best.as_ref().map(|p| p.pool_tokens).unwrap_or(0);
         let mut selected_flips = prior_flips.clone();
@@ -48,7 +64,8 @@ pub fn solve(request: &PlacementRequest) -> Result<Placement, PlacementError> {
         flips = selected_flips;
     }
     if let Ok(placement) = &best {
-        let chosen = placement.attention_by_kind.iter().copied().filter(|(_, mode)| *mode != request.executor.attention_default()).collect::<Vec<_>>();
+        let chosen = placement.attention_by_kind.iter().copied().filter(|(kind, mode)|
+            *mode != selected_attention(request, &[], *kind)).collect::<Vec<_>>();
         if !chosen.is_empty() { return prune_flips(request, &chosen); }
     }
     best
@@ -104,21 +121,16 @@ fn solve_once(request: &PlacementRequest, flips: &[(AttentionClass, AttentionPla
     // 1. Explicit attention placement is strict. Auto retains the existing
     // policy until a qualified memory lever is needed.
     let executor = &request.executor;
-    let layer_selected = |layer: &LayerDemand| flips.iter().find(|(kind, _)| *kind == layer.kind).map(|(_, m)| *m)
-        .or(request.attention_placement)
-        .unwrap_or_else(|| if split { executor.attention_default() } else { AttentionPlacement::Heads }) == AttentionPlacement::Layers
+    let layer_selected = |layer: &LayerDemand| selected_attention(request, flips, layer.kind) == AttentionPlacement::Layers
         && layer_whole_mode(request, layer, 0).is_some() && layer_whole_mode(request, layer, 1).is_some();
-    let switch = if request.layers.iter().any(&layer_selected) { layer_switch(request, &layer_selected)? } else { 0 };
+    let owners = layer_owners(request, &layer_selected)?;
     let modes = request.layers.iter().enumerate().map(|(index, layer)| {
-        let selected = flips.iter().find(|(kind, _)| *kind == layer.kind).map(|(_, m)| *m)
-            .or(request.attention_placement)
-            // A family default other than heads applies only where it can run.
-            .or_else(|| (split && executor.attention_default() != AttentionPlacement::Heads).then(|| executor.attention_default()));
+        let selected = Some(selected_attention(request, flips, layer.kind));
         let desired = match selected {
             Some(AttentionPlacement::Context) if layer.kv_unit.unit_bytes_context.is_some() => Some(LayerMode::ContextSplit),
             Some(AttentionPlacement::Context) => Some(LayerMode::HeadSplit),
             Some(AttentionPlacement::Layers) if layer_selected(layer) => {
-                let owner = if index < switch { request.layers_first_gpu } else { 1 - request.layers_first_gpu };
+                let owner = owners[index];
                 layer_whole_mode(request, layer, owner)
             }
             Some(AttentionPlacement::Layers) => Some(LayerMode::HeadSplit),
@@ -392,13 +404,11 @@ fn solve_once(request: &PlacementRequest, flips: &[(AttentionClass, AttentionPla
     Ok(Placement {
         pool_tokens,
         attention_placement: if context { AttentionPlacement::Context }
-            else if request.attention_placement == Some(AttentionPlacement::Layers) || flips.iter().any(|(_, m)| *m == AttentionPlacement::Layers) {
+            else if request.layers.iter().any(&layer_selected) {
                 AttentionPlacement::Layers
             } else { AttentionPlacement::Heads },
         attention_by_kind: request.layers.iter().map(|layer| {
-            let mode = flips.iter().find(|(kind, _)| *kind == layer.kind).map(|(_, mode)| *mode)
-                .or(request.attention_placement)
-                .unwrap_or_else(|| if split { executor.attention_default() } else { AttentionPlacement::Heads });
+            let mode = selected_attention(request, flips, layer.kind);
             (layer.kind, mode)
         }).collect::<std::collections::BTreeMap<_, _>>().into_iter().collect(),
         peer_row_bytes: if context {
@@ -416,6 +426,41 @@ fn solve_once(request: &PlacementRequest, flips: &[(AttentionClass, AttentionPla
         tp2: tp2_range,
         items,
     })
+}
+
+fn selected_attention(request: &PlacementRequest, flips: &[(AttentionClass, AttentionPlacement)],
+    kind: AttentionClass) -> AttentionPlacement {
+    request.attention_placement
+        .or_else(|| (request.inventory.gpus.len() == 2 && request.inventory.peer_access)
+            .then(|| request.policy.attention.iter().find(|(k, _)| *k == kind).map(|(_, mode)| *mode)).flatten())
+        .or_else(|| flips.iter().find(|(k, _)| *k == kind).map(|(_, mode)| *mode))
+        .unwrap_or_else(|| if request.inventory.gpus.len() == 2 && request.inventory.peer_access {
+            request.executor.attention_default()
+        } else { AttentionPlacement::Heads })
+}
+
+fn layer_owners(request: &PlacementRequest, selected: &impl Fn(&LayerDemand) -> bool)
+    -> Result<Vec<u8>, PlacementError> {
+    if !request.layers.iter().any(selected) { return Ok(vec![0; request.layers.len()]); }
+    match request.policy.ownership {
+        LayerOwnership::Ranges => {
+            let switch = layer_switch(request, selected)?;
+            Ok((0..request.layers.len()).map(|index| if index < switch { request.layers_first_gpu }
+                else { 1 - request.layers_first_gpu }).collect())
+        }
+        LayerOwnership::Alternating => {
+            let mut groups = std::collections::BTreeMap::new();
+            let mut next = request.layers_first_gpu;
+            Ok(request.layers.iter().map(|layer| {
+                if !selected(layer) { return 0; }
+                if let Some(owner) = layer.colocate.and_then(|group| groups.get(&group).copied()) { return owner; }
+                let owner = next;
+                next = 1 - next;
+                if let Some(group) = layer.colocate { groups.insert(group, owner); }
+                owner
+            }).collect())
+        }
+    }
 }
 
 fn layer_whole_mode(request: &PlacementRequest, layer: &LayerDemand, gpu: u8) -> Option<LayerMode> {

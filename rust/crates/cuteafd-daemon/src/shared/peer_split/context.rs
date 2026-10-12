@@ -56,9 +56,10 @@ pub(crate) fn page_owner(page: usize) -> usize {
     page % 2
 }
 
-/// The (layer parity, lane) slot of `layer` on decode lane `lane`.
-pub(crate) fn slot(layer: usize, lane: usize) -> usize {
-    2 * lane + layer % 2
+/// The (context ordinal parity, lane) slot on decode lane `lane`. Count only
+/// context layers when they interleave with other attention kinds.
+pub(crate) fn slot(context_index: usize, lane: usize) -> usize {
+    2 * lane + context_index % 2
 }
 
 /// `rank`'s compact half table of a sequence: the local page index of each
@@ -83,6 +84,69 @@ pub(crate) fn shard_rows(len: usize, page_rows: usize, rank: usize) -> usize {
 /// first, then GPU1's, whichever GPU runs the combine.
 pub(crate) fn combine_order<T>(rank: usize, own: T, received: T) -> [T; 2] {
     if rank == 0 { [own, received] } else { [received, own] }
+}
+
+/// One cache plane within an ownership unit. Its row coordinates can differ
+/// from token coordinates (pooled index keys use one row per four tokens).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct CommitPlane {
+    pub first: usize,
+    pub rows: usize,
+    pub rows_per_unit: usize,
+    pub row_bytes: usize,
+    pub base: usize,
+    pub unit_bytes: usize,
+}
+
+/// Staging-to-pool copies, one `[source | destination | bytes]` list per plane.
+/// All lists are zero-padded to `limit`, and counts may differ between planes.
+pub(crate) struct CommitBlocks {
+    pub table: Vec<u64>,
+    pub counts: Vec<usize>,
+}
+
+/// Ownership and offset arithmetic shared by every gathered context prefill.
+/// `pages` are parity pool IDs at logical unit positions, never physical IDs
+/// guessed from a sequence. Callers upload once after draining table users.
+pub(crate) fn commit_blocks(rank: usize, pages: &[u32], planes: &[CommitPlane], limit: usize)
+    -> Result<CommitBlocks> {
+    ensure!(rank < 2 && limit > 0, "commit needs rank 0/1 and positive capacity");
+    let mut table = Vec::new();
+    let mut counts = Vec::new();
+    for plane in planes {
+        ensure!(plane.rows_per_unit > 0 && plane.row_bytes > 0, "zero commit plane geometry");
+        let end = plane.first.checked_add(plane.rows).context("commit rows overflow")?;
+        let payload = plane.rows_per_unit.checked_mul(plane.row_bytes)
+            .and_then(|n| plane.base.checked_add(n)).context("commit plane overflow")?;
+        ensure!(payload <= plane.unit_bytes, "commit plane extends past its unit");
+        ensure!(end.div_ceil(plane.rows_per_unit) <= pages.len(), "commit past the sequence's units");
+        let mut lists: [Vec<u64>; 3] = Default::default();
+        if plane.rows > 0 {
+            for unit in (plane.first / plane.rows_per_unit..end.div_ceil(plane.rows_per_unit))
+                .filter(|&unit| page_owner(unit) == rank) {
+                let id = pages[unit];
+                ensure!(id as usize % 2 == rank, "logical unit {unit} has id {id} of the wrong parity");
+                let start = unit * plane.rows_per_unit;
+                let first = plane.first.max(start) - start;
+                let count = end.min(start.saturating_add(plane.rows_per_unit)) - start - first;
+                let offset = plane.base.checked_add(first.checked_mul(plane.row_bytes).context("commit offset overflow")?)
+                    .context("commit offset overflow")?;
+                let address = |unit: usize| unit.checked_mul(plane.unit_bytes).and_then(|n| n.checked_add(offset))
+                    .context("commit address overflow");
+                lists[0].push(address(unit)? as u64);
+                lists[1].push(address((id >> 1) as usize)? as u64);
+                lists[2].push(count.checked_mul(plane.row_bytes).context("commit size overflow")? as u64);
+            }
+        }
+        let count = lists[0].len();
+        ensure!(count <= limit, "{count} commit units past {limit}");
+        counts.push(count);
+        table.extend(lists.into_iter().flat_map(|list| {
+            let padding = limit - list.len();
+            list.into_iter().chain(std::iter::repeat_n(0, padding))
+        }));
+    }
+    Ok(CommitBlocks { table, counts })
 }
 
 /// Partial value width (the latent's 512 BF16 values per head).
@@ -337,6 +401,62 @@ impl<'a> ContextExchange<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compact_pool_commit_planes_cover_each_owned_row_once() {
+        // GLM Flash: 256 tokens per unit, 64 pooled index rows. Open tails
+        // live in per-sequence state and are not committed as completed pools.
+        let pages = [4u32, 9, 6, 11];
+        let first = 253;
+        let end = 773;
+        let planes = [CommitPlane { first, rows: end - first, rows_per_unit: 256,
+            row_bytes: 528, base: 0, unit_bytes: 256 * 528 },
+            CommitPlane { first: first / 4, rows: end / 4 - first / 4, rows_per_unit: 64,
+                row_bytes: 128, base: 0, unit_bytes: 64 * 132 },
+            CommitPlane { first: first / 4, rows: end / 4 - first / 4, rows_per_unit: 64,
+                row_bytes: 4, base: 64 * 128, unit_bytes: 64 * 132 }];
+        let mut coverage = [vec![0; end], vec![0; end / 4], vec![0; end / 4]];
+        for rank in 0..2 {
+            let blocks = commit_blocks(rank, &pages, &planes, 3).unwrap();
+            assert_eq!(blocks.table.len(), 27);
+            for (kind, plane) in planes.iter().enumerate() {
+                let lists = &blocks.table[kind * 9..][..9];
+                for i in 0..blocks.counts[kind] {
+                    let source = lists[i] as usize;
+                    let unit = source / plane.unit_bytes;
+                    let local_first = (source % plane.unit_bytes - plane.base) / plane.row_bytes;
+                    let count = lists[6 + i] as usize / plane.row_bytes;
+                    assert_eq!(page_owner(unit), rank);
+                    assert_eq!(lists[3 + i] as usize, (pages[unit] >> 1) as usize * plane.unit_bytes
+                        + plane.base + local_first * plane.row_bytes);
+                    for row in unit * plane.rows_per_unit + local_first..unit * plane.rows_per_unit + local_first + count {
+                        coverage[kind][row] += 1;
+                    }
+                }
+            }
+        }
+        for (plane, coverage) in planes.iter().zip(coverage) {
+            assert!(coverage[..plane.first].iter().all(|&n| n == 0));
+            assert!(coverage[plane.first..].iter().all(|&n| n == 1));
+        }
+        assert!(commit_blocks(0, &[5], &planes[..1], 1).is_err());
+        assert!(commit_blocks(0, &pages, &planes, 1).is_err());
+        assert!(commit_blocks(2, &pages, &planes, 3).is_err());
+    }
+
+    #[test]
+    fn commit_planes_allow_empty_frontiers_and_reject_bad_geometry() {
+        let plane = CommitPlane { first: 4, rows: 0, rows_per_unit: 4, row_bytes: 2,
+            base: 0, unit_bytes: 8 };
+        let blocks = commit_blocks(1, &[4], &[plane], 2).unwrap();
+        assert_eq!(blocks.counts, [0]);
+        assert_eq!(blocks.table, [0; 6]);
+        assert!(commit_blocks(0, &[5], &[CommitPlane { first: 0, rows: 1, ..plane }], 1).is_err());
+        assert!(commit_blocks(0, &[4], &[CommitPlane { first: usize::MAX, rows: 1, ..plane }], 1).is_err());
+        assert!(commit_blocks(0, &[4], &[CommitPlane { base: 1, ..plane }], 1).is_err());
+        assert!(commit_blocks(0, &[4], &[CommitPlane { rows_per_unit: 0, ..plane }], 1).is_err());
+        assert!(commit_blocks(0, &[4], &[plane], 0).is_err());
+    }
 
     #[test]
     fn owners_follow_the_logical_page_and_shards_split_rows() {

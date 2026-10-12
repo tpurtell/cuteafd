@@ -253,7 +253,7 @@ pub fn request_for_working_set(i: &GlmfInputs<'_>, working: &GlmfWorkingSet) -> 
         onboard: if i.spark_ranks == 0 { i.onboard } else { Onboard::Layers(working.rtx_layers.len()) },
         expert_gpus: usize::from(ranks == 1 || i.experts.iter().all(|cost| cost.tp2)),
         policy: LayerPolicy { default: if ranks == 2 { vec![LayerMode::HeadSplit] } else {
-            vec![LayerMode::Whole { gpu: 0, ffn: FfnMode::Owner }] }, by_kind: vec![] },
+            vec![LayerMode::Whole { gpu: 0, ffn: FfnMode::Owner }] }, by_kind: vec![], ..LayerPolicy::default() },
         hops: HopSpec { row_bytes: 4 * i.cfg.hidden as u64 * 2, rows: i.prefill_rows.max(i.decode_rows),
             lanes: working.prefill_lanes, entry_gpu: 0, head_gpu: 0 }, executor: super::GLM5_FLASH,
     })

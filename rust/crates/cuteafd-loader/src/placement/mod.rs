@@ -32,7 +32,7 @@ pub use inventory::{loaded_code, ArchContext, GraphRank, GraphSet, Lifetime, Loa
 pub use pool::PoolPolicy;
 pub use residual::{hop_buffer_bytes, plan_hops, Hop, HopKind, HopPoint, HopSpec, ResidualHome, Transition, HOP_SLOTS};
 pub use solve::solve;
-pub use attention::{AttentionPlacement, ContextBuffers, ContextExchangeLayout, KvDemand, CONTEXT_EXCHANGES};
+pub use attention::{AttentionPlacement, ContextBuffers, ContextExchangeLayout, KvDemand, LayerOwnership, CONTEXT_EXCHANGES};
 
 /// What a request asks of the hardware, built by a family from its own
 /// geometry; see `families::<family>`.
@@ -264,6 +264,10 @@ impl ExecutorModes {
 pub struct LayerPolicy {
     pub default: Vec<LayerMode>,
     pub by_kind: Vec<(AttentionClass, Vec<LayerMode>)>,
+    /// Qualified, measured defaults per attention kind. Explicit CLI placement
+    /// overrides these; the solver's memory lever cannot replace them.
+    pub attention: Vec<(AttentionClass, AttentionPlacement)>,
+    pub ownership: LayerOwnership,
 }
 
 impl LayerPolicy {
