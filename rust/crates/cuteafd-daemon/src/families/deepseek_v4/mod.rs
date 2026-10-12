@@ -795,7 +795,7 @@ mod program_selection_tests {
                                         assert!(selected.contains(&name), "unselected dispatch {name}");
                                         assert!(required.contains(&name), "startup misses dispatch {name}");
                                         if split && (args.starts_with("_on(1, true,") || args.starts_with("_on(rank, split,")
-                                            || args.starts_with("_on(0, weights.split,")) {
+                                            || args.starts_with("_on(0, weights.ffn_split,") || args.starts_with("_on(1, weights.ffn_split,")) {
                                             let name = format!("{split_family}_{suffix}");
                                             assert!(selected.contains(&name) && required.contains(&name),
                                                 "startup misses split dispatch {name}");

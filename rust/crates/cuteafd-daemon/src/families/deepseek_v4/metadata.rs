@@ -62,6 +62,7 @@ pub(crate) fn rope_table(cfg: &DeepseekV4Config, compressed: bool, positions: us
 /// Host tables for one step of one sequence: its rows start at `start`
 /// (0 for the initial prefill) and the caches already hold `start` tokens.
 /// Prefill steps must start at 0; decode steps are one row.
+#[derive(Clone)]
 pub(crate) struct StepTables {
     pub decode: bool,
     /// Decode-shaped step whose sequences contribute consecutive rows (a
@@ -331,6 +332,139 @@ mod tests {
     }
 
     #[test]
+    fn c4_context_continuation_commits_preserve_prior_planar_rows() -> anyhow::Result<()> {
+        let units = [4, 9, 0, 3];
+        let planes = [(576, 0, compressed_page_bytes(4)), (8, 64 * 576, compressed_page_bytes(4)),
+            (128, 0, INDEX_PAGE_BYTES), (4, 64 * 128, INDEX_PAGE_BYTES)];
+        for first in [0, 1, 63, 64, 65, 127, 128, 191] {
+            for groups in [0, 1, 4, 64] {
+                if first + groups > units.len() * 64 { continue; }
+                for rank in 0..2 {
+                    let commits = c4_context_commits(rank, first, groups, &units, 4)?;
+                    for (plane, &(row_bytes, base, unit_bytes)) in planes.iter().enumerate() {
+                        let table = &commits.table[plane * 12..];
+                        let mut coverage = vec![false; units.len() * 64];
+                        for i in 0..commits.counts[plane] {
+                            let source = table[i] as usize;
+                            let logical = source / unit_bytes;
+                            let start = (source % unit_bytes - base) / row_bytes;
+                            let count = table[8 + i] as usize / row_bytes;
+                            assert_eq!(logical % 2, rank);
+                            assert_eq!(table[4 + i] as usize / unit_bytes, (units[logical] >> 1) as usize);
+                            for group in logical * 64 + start..logical * 64 + start + count {
+                                assert!(!coverage[group]);
+                                coverage[group] = true;
+                            }
+                        }
+                        for (group, &covered) in coverage.iter().enumerate() {
+                            assert_eq!(covered, group >= first && group < first + groups && (group / 64) % 2 == rank);
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn c4_context_decode_and_verify_tables_preserve_replicated_state() -> anyhow::Result<()> {
+        let shape = PoolShape::new(2, 4096, 16);
+        let placement = super::super::pool::Placement::new(0, vec![4, 9, 0, 3]);
+        for tables in [decode_step(&[(&placement, 255), (&placement, 259), (&placement, 771)],
+            &shape, 512, 8)?, verify_step(&[(&placement, 250, 16)], &shape, 512, 8)?] {
+            for rank in 0..2 {
+                let shard = c4_context_tables(&tables, rank, shape.units, 1)?;
+                assert_eq!(shard.c128_tables, tables.c128_tables);
+                assert_eq!(shard.c128_indices, tables.c128_indices);
+                assert_eq!(shard.main_slots, tables.main_slots);
+                assert_eq!(shard.swa_indices, tables.swa_indices);
+                assert_eq!(shard.positions, tables.positions);
+                for row in 0..tables.rows {
+                    assert_eq!(shard.c4_visible[row] as usize,
+                        crate::shared::peer_split::context::shard_rows(tables.c4_visible[row] as usize, 64, rank));
+                    assert_eq!(shard.swa_lengths[row], if rank == 1 { tables.swa_lengths[row] } else { 0 });
+                }
+                let name = if tables.chunked { "group_source_positions" } else { "positions" };
+                let positions = &tables.c4_tables.iter().find(|(n, _)| *n == name).unwrap().1;
+                let slots = &shard.c4_tables.iter().find(|(n, _)| *n == "compressed_slots").unwrap().1;
+                let active = if tables.chunked { tables.c4_tables.iter().find(|(n, _)| *n == "active_groups")
+                    .unwrap().1[0] as usize } else { tables.rows };
+                for (&position, &slot) in positions.iter().zip(slots).take(active) {
+                    if (position as usize / 256) % 2 == rank {
+                        let original = placement.group_slot(4, position as usize / 4)?;
+                        assert_eq!(slot, (original / 64 / 2) * 64 + original % 64);
+                    } else {
+                        assert!(slot >= (shape.units / 2 * 64) as i32);
+                        assert!(slot < ((shape.units / 2 * 64) + tables.rows) as i32);
+                    }
+                }
+            }
+        }
+        let short = super::super::pool::Placement::new(0, vec![4]);
+        let tables = decode_step(&[(&short, 256)], &shape, 512, 8)?;
+        for rank in 0..2 {
+            assert!(c4_context_tables(&tables, rank, shape.units, 0).is_ok());
+        }
+        let invalid = super::super::pool::Placement::new(0, vec![5]);
+        let tables = decode_step(&[(&invalid, 3)], &shape, 512, 8)?;
+        assert!(c4_context_tables(&tables, 0, shape.units, 0).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn c4_context_gathered_prefill_preserves_replicated_tables() -> anyhow::Result<()> {
+        let shape = PoolShape::new(2, 4096, 16);
+        let placement = super::super::pool::Placement::new(1, vec![4, 9, 0, 3]);
+        for (start, rows) in [(0, 300), (1, 2), (250, 16), (300, 100), (509, 264)] {
+            let tables = prefill_step(&placement, &shape, start, rows, 512, 8)?;
+            let gathered = c4_context_prefill_tables(&tables)?;
+            assert_eq!(gathered.c4_page_table, vec![0, 1, 2, 3]);
+            assert_eq!(gathered.c4_visible, tables.c4_visible);
+            assert_eq!(gathered.c4_indexed_lengths, tables.c4_indexed_lengths);
+            assert_eq!(gathered.c4_table_width, tables.c4_table_width);
+            assert_eq!(gathered.c128_tables, tables.c128_tables);
+            assert_eq!(gathered.c128_indices, tables.c128_indices);
+            assert_eq!(gathered.c128_lengths, tables.c128_lengths);
+            assert_eq!(gathered.main_slots, tables.main_slots);
+            assert_eq!(gathered.swa_indices, tables.swa_indices);
+            assert_eq!(gathered.swa_lengths, tables.swa_lengths);
+            for ((name, before), (_, after)) in tables.c4_tables.iter().zip(&gathered.c4_tables) {
+                if *name == "compressed_slots" {
+                    let groups = (start + rows) / 4 - start / 4;
+                    let expected: Vec<_> = (start / 4..(start + rows) / 4).map(|g| g as i32).collect();
+                    assert_eq!(&after[..groups], expected.as_slice());
+                } else {
+                    assert_eq!(before, after);
+                }
+            }
+        }
+        let tables = decode_step(&[(&placement, 3)], &shape, 512, 8)?;
+        assert!(c4_context_prefill_tables(&tables).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn c4_context_discarded_groups_have_distinct_scratch_rows() -> anyhow::Result<()> {
+        let shape = PoolShape::new(2, 4096, 16);
+        let a = super::super::pool::Placement::new(0, vec![4, 9, 0, 3]);
+        let b = super::super::pool::Placement::new(1, vec![6, 11, 2, 5]);
+        let tables = verify_step(&[(&a, 0, 268), (&b, 0, 268)], &shape, 512, 8)?;
+        let scratch = shape.units / 2 * 64;
+        for rank in 0..2 {
+            let shard = c4_context_tables(&tables, rank, shape.units, 0)?;
+            let active = tables.c4_tables.iter().find(|(n, _)| *n == "active_groups").unwrap().1[0] as usize;
+            let slots = &shard.c4_tables.iter().find(|(n, _)| *n == "compressed_slots").unwrap().1;
+            let discarded: Vec<_> = slots.iter().take(active).copied().filter(|&s| s as usize >= scratch).collect();
+            let unique: std::collections::HashSet<_> = discarded.iter().copied().collect();
+            assert_eq!(unique.len(), discarded.len());
+            assert!(!discarded.is_empty());
+            assert!(discarded.iter().all(|&s| (s as usize) < scratch + tables.rows));
+            if rank == 1 { assert!(discarded.len() > 64); }
+        }
+        Ok(())
+    }
+
+    #[test]
     fn prefill_and_decode_tables_use_physical_slots() -> anyhow::Result<()> {
         let shape = PoolShape::new(2, 4096, 64);
         let mut pool = PoolAllocator::new(shape);
@@ -362,6 +496,122 @@ mod tests {
         assert_eq!(compressed_page_bytes(128), 1_728);
         Ok(())
     }
+}
+
+/// Commit only newly completed C4 rows from a gathered prefill view. V4
+/// records and index keys/scales are planar, not interleaved 584-byte rows.
+fn c4_context_commits(rank: usize, first_group: usize, groups: usize, units: &[u32], limit: usize)
+    -> anyhow::Result<crate::shared::peer_split::context::CommitBlocks> {
+    use crate::shared::peer_split::context::{commit_blocks, CommitPlane};
+    let rows_per_unit = compressed_page_rows(4);
+    let planes = [(576, 0, compressed_page_bytes(4)),
+        (8, rows_per_unit * 576, compressed_page_bytes(4)),
+        (128, 0, INDEX_PAGE_BYTES), (4, rows_per_unit * 128, INDEX_PAGE_BYTES)]
+        .map(|(row_bytes, base, unit_bytes)| CommitPlane {
+            first: first_group, rows: groups, rows_per_unit, row_bytes, base, unit_bytes,
+        });
+    commit_blocks(rank, units, &planes, limit)
+}
+
+/// Head-split prefill over a logical, gathered C4 view. Only C4 output slots
+/// and its index page table change; window rings, C128 and carry remain physical.
+fn c4_context_prefill_tables(tables: &StepTables) -> anyhow::Result<StepTables> {
+    anyhow::ensure!(!tables.decode && !tables.chunked, "C4 gathered tables need prefill");
+    let mut out = tables.clone();
+    let positions_name = if tables.start == 0 { "group_source_starts" } else { "group_source_positions" };
+    let positions = tables.c4_tables.iter().find(|(name, _)| *name == positions_name)
+        .ok_or_else(|| anyhow::anyhow!("C4 compressor lacks {positions_name}"))?.1.clone();
+    let active = usize::try_from(*tables.c4_tables.iter().find(|(name, _)| *name == "active_groups")
+        .and_then(|(_, values)| values.first()).ok_or_else(|| anyhow::anyhow!("C4 active groups missing"))?)?;
+    let slots = &mut out.c4_tables.iter_mut().find(|(name, _)| *name == "compressed_slots")
+        .ok_or_else(|| anyhow::anyhow!("C4 compressor lacks slots"))?.1;
+    anyhow::ensure!(positions.len() >= active && slots.len() >= active && active <= tables.rows,
+        "C4 prefill compressor table too short");
+    let end = tables.start.checked_add(tables.rows)
+        .ok_or_else(|| anyhow::anyhow!("C4 prefill range overflow"))?;
+    for (&position, slot) in positions.iter().zip(slots).take(active) {
+        let position = usize::try_from(position)?;
+        anyhow::ensure!(position % 4 == 0 && position.checked_add(4).is_some_and(|p|
+            p > tables.start && p <= end), "C4 group outside prefill range");
+        *slot = i32::try_from(position / 4)?;
+    }
+    out.c4_page_table = (0..tables.c4_page_table.len()).map(i32::try_from)
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(out)
+}
+
+/// Decode/verify metadata for one C4 token shard. C128, the window ring and
+/// compressor carry stay replicated. Non-owner compressed writes land in a
+/// scratch row per active compressor CTA; exactly one rank contributes the
+/// window union. Both C4 caches need `ceil(rows / 64)` extra scratch pages.
+fn c4_context_tables(tables: &StepTables, rank: usize, units: usize, window_rank: usize)
+    -> anyhow::Result<StepTables> {
+    use crate::shared::peer_split::context::{local_pages, page_owner, shard_rows};
+    anyhow::ensure!(tables.decode && rank < 2 && window_rank < 2 && units > 0 && units % 2 == 0,
+        "C4 context metadata needs decode/verify, two ranks and an even parity pool");
+    let rows_per_unit = compressed_page_rows(4);
+    let local_units = units / 2;
+    let scratch_slot = local_units.checked_mul(rows_per_unit)
+        .ok_or_else(|| anyhow::anyhow!("C4 scratch slot overflow"))?;
+    let scratch_end = scratch_slot.checked_add(tables.rows)
+        .ok_or_else(|| anyhow::anyhow!("C4 scratch range overflow"))?;
+    i32::try_from(scratch_end)?;
+    let pool_slots = units.checked_mul(rows_per_unit)
+        .ok_or_else(|| anyhow::anyhow!("C4 pool slot overflow"))?;
+    let mut out = tables.clone();
+    out.c4_page_table.clear();
+    out.c4_table_stride = tables.c4_table_stride.div_ceil(2).max(1);
+    out.c4_table_width = tables.c4_table_width.div_ceil(2).max(1);
+    anyhow::ensure!(tables.c4_visible.len() == tables.rows && tables.c4_table_stride > 0
+        && tables.c4_page_table.len() == tables.rows * tables.c4_table_stride,
+        "C4 decode page table does not cover its rows");
+    for row in 0..tables.rows {
+        let visible = usize::try_from(tables.c4_visible[row])?;
+        let used = visible.div_ceil(rows_per_unit);
+        anyhow::ensure!(used <= tables.c4_table_stride, "C4 visibility past row table");
+        let ids = tables.c4_page_table[row * tables.c4_table_stride..][..used].iter()
+            .map(|&id| {
+                anyhow::ensure!(id >= 0 && (id as usize) < units, "C4 page outside parity pool");
+                Ok(id as u32)
+            }).collect::<anyhow::Result<Vec<_>>>()?;
+        let local = local_pages(&ids, rank)?;
+        out.c4_page_table.extend(local.into_iter().map(|id| id as i32));
+        out.c4_page_table.resize((row + 1) * out.c4_table_stride, local_units as i32);
+        out.c4_visible[row] = i32::try_from(shard_rows(visible, rows_per_unit, rank))?;
+    }
+    let positions_name = if tables.chunked { "group_source_positions" } else { "positions" };
+    let positions = tables.c4_tables.iter().find(|(name, _)| *name == positions_name)
+        .ok_or_else(|| anyhow::anyhow!("C4 compressor lacks {positions_name}"))?.1.clone();
+    let active = if tables.chunked {
+        usize::try_from(*tables.c4_tables.iter().find(|(name, _)| *name == "active_groups")
+            .and_then(|(_, values)| values.first()).ok_or_else(|| anyhow::anyhow!("C4 active groups missing"))?)?
+    } else { tables.rows };
+    let slots = &mut out.c4_tables.iter_mut().find(|(name, _)| *name == "compressed_slots")
+        .ok_or_else(|| anyhow::anyhow!("C4 compressor lacks slots"))?.1;
+    anyhow::ensure!(active <= tables.rows && positions.len() >= active && slots.len() >= active,
+        "C4 compressor table too short or too many active groups");
+    for (group, (position, slot)) in positions.iter().zip(slots).take(active).enumerate() {
+        let position = usize::try_from(*position)?;
+        if !tables.chunked && position % 4 != 3 {
+            // Decode updates carry on every row, but reads the output slot
+            // only when a group completes. Capacity may end mid-group.
+            *slot = i32::try_from(scratch_slot + group)?;
+            continue;
+        }
+        anyhow::ensure!(*slot >= 0 && (*slot as usize) < pool_slots
+            && (*slot as usize / rows_per_unit) % 2 == page_owner(position / SOURCE_PAGE_TOKENS),
+            "C4 write on wrong parity page");
+        if page_owner(position / SOURCE_PAGE_TOKENS) == rank {
+            *slot = (*slot / rows_per_unit as i32 / 2) * rows_per_unit as i32
+                + *slot % rows_per_unit as i32;
+        } else {
+            // Continuation launches one CTA per completed group, and decode
+            // one per sequence: a shared scratch row would race across CTAs.
+            *slot = i32::try_from(scratch_slot + group)?;
+        }
+    }
+    if rank != window_rank { out.swa_lengths.fill(0); }
+    Ok(out)
 }
 
 /// Tables for a decode-shaped step in which each sequence contributes

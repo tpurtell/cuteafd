@@ -86,6 +86,14 @@ impl PoolAllocator {
         Self { free_states: (0..shape.sequences).rev().collect(), units: RefPagePool::new(shape.units, SOURCE_PAGE_TOKENS) }
     }
 
+    /// Context C4 units use stable logical parity; C128 pages retain the same
+    /// IDs in their replicated pools. Scratch lives outside the allocatable units.
+    pub fn context(shape: PoolShape) -> Result<Self> {
+        ensure!(shape.units > 0 && shape.units % 2 == 0, "C4 context pool needs two equal halves");
+        Ok(Self { free_states: (0..shape.sequences).rev().collect(),
+            units: RefPagePool::parity(shape.units, SOURCE_PAGE_TOKENS, 0) })
+    }
+
     pub fn free_states(&self) -> usize {
         self.free_states.len()
     }
@@ -117,6 +125,31 @@ impl PoolAllocator {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn context_forks_preserve_compression_unit_owner() -> Result<()> {
+        let shape = PoolShape::new(3, 4096, 16);
+        let mut pool = PoolAllocator::context(shape)?;
+        let source = pool.admit(1024)?;
+        for (logical, &id) in source.units.iter().enumerate() {
+            assert_eq!(id as usize % 2, logical % 2);
+        }
+        for len in [1, 255, 256, 257, 511, 512, 513, 767, 768, 769, 1024] {
+            let (fork, tail) = pool.fork(&source, len, 1280)?;
+            for (logical, &id) in fork.units.iter().enumerate() {
+                assert_eq!(id as usize % 2, logical % 2);
+            }
+            if let Some(tail) = tail {
+                assert_eq!(tail.from % 2, tail.to % 2);
+                assert_eq!(tail.from as usize % 2, (len / SOURCE_PAGE_TOKENS) % 2);
+            }
+            pool.release(fork);
+        }
+        pool.release(source);
+        assert_eq!(pool.free_states(), shape.sequences);
+        assert!(PoolAllocator::context(PoolShape::new(1, 4096, 15)).is_err());
+        Ok(())
+    }
 
     #[test]
     fn ring_and_group_slots() -> Result<()> {

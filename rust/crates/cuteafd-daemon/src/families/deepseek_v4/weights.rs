@@ -28,10 +28,11 @@ struct Source {
 pub(crate) struct LayerWeights<'a> {
     pub ratio: usize,
     pub hash: bool,
-    /// One GPU's share of a head split: its heads' `w_q` rows and sinks, its
-    /// output groups' `wo_a` / `wo_b` columns (a partial sum) and its slice of
-    /// the shared expert (a partial sum); it runs the split programs.
-    pub split: bool,
+    /// Head/group slices use the split attention programs. Owned attention
+    /// keeps whole projections even when its FFN remains split.
+    pub attention_split: bool,
+    /// Shared-expert intermediate slices use the split FFN programs.
+    pub ffn_split: bool,
     /// Device operands; routing adds `gate.bias` (FP32, score layers) or
     /// `gate.tid2eid` (I32 [vocab, topk], hash layers).
     operands: HashMap<&'static str, DeviceAllocation<'a>>,
@@ -149,12 +150,66 @@ enum Share {
     Cols,
 }
 
-/// The head-split share of operand `operand`.
-fn share(operand: &str) -> Share {
+/// Attention and FFN ownership are independent for whole-attention layers.
+fn share(operand: &str, attention_split: bool, ffn_split: bool) -> Share {
     match operand {
-        "w_q" | "w_q_scale" | "attn_sink" | "wo_a" | "wo_a_scale" | "w13" | "w13_scale" => Share::Rows,
-        "wo_b" | "wo_b_scale" | "w2" | "w2_scale" => Share::Cols,
+        "w_q" | "w_q_scale" | "attn_sink" | "wo_a" | "wo_a_scale" if attention_split => Share::Rows,
+        "wo_b" | "wo_b_scale" if attention_split => Share::Cols,
+        "w13" | "w13_scale" if ffn_split => Share::Rows,
+        "w2" | "w2_scale" if ffn_split => Share::Cols,
         _ => Share::All,
+    }
+}
+
+/// A mode's checkpoint layout, resolved before uploading any operands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WeightSplit {
+    attention: bool,
+    ffn: bool,
+    owner: Option<usize>,
+}
+
+impl WeightSplit {
+    fn for_mode(mode: cuteafd_loader::placement::LayerMode, ratio: usize, ranks: usize) -> Result<Self> {
+        use cuteafd_loader::placement::{FfnMode, LayerMode};
+        ensure!(ranks == 1 || ranks == 2, "V4 weights need one or two ranks");
+        Ok(match mode {
+            LayerMode::HeadSplit => {
+                ensure!(ranks == 2, "V4 head split needs two ranks");
+                Self { attention: true, ffn: true, owner: None }
+            }
+            LayerMode::ContextSplit => {
+                ensure!(ranks == 2 && ratio == 4, "V4 context weights need two ranks and C4");
+                Self { attention: true, ffn: true, owner: None }
+            }
+            LayerMode::Whole { gpu, ffn } => {
+                let owner = usize::from(gpu);
+                ensure!(owner < ranks && (ranks == 1 || ratio == 4), "V4 attention owner or ratio unsupported");
+                ensure!((ranks == 1 && ffn == FfnMode::Owner) || (ranks == 2 && ffn == FfnMode::Split),
+                    "V4 owned attention keeps the existing FFN placement");
+                Self { attention: false, ffn: ffn == FfnMode::Split, owner: Some(owner) }
+            }
+        })
+    }
+
+    fn operand(self, operand: &str, rank: usize) -> Option<Share> {
+        let ffn = operand.starts_with("ffn.") || operand.starts_with("gate")
+            || matches!(operand, "w13" | "w13_scale" | "w2" | "w2_scale");
+        if !ffn && self.owner.is_some_and(|owner| owner != rank) {
+            None
+        } else {
+            Some(share(operand, self.attention, self.ffn))
+        }
+    }
+}
+
+fn scale_extents(operand: &str, kind: Share, n: usize, k: usize, groups: usize, ranks: usize)
+    -> (usize, usize, usize) {
+    match (operand, kind) {
+        ("wo_a_scale", Share::Rows) => (n, k, groups / ranks),
+        (_, Share::Rows) => (n / ranks, k, groups),
+        (_, Share::Cols) => (n, k / ranks, groups),
+        _ => (n, k, groups),
     }
 }
 
@@ -202,11 +257,22 @@ impl<'a> WeightLoader<'a, '_> {
     }
 
     pub fn layer(&self, cfg: &DeepseekV4Config, layer: usize) -> Result<Vec<LayerWeights<'a>>> {
+        use cuteafd_loader::placement::{FfnMode, LayerMode};
+        let mode = if self.peers.is_empty() { LayerMode::Whole { gpu: 0, ffn: FfnMode::Owner } }
+            else { LayerMode::HeadSplit };
+        self.layer_mode(cfg, layer, mode)
+    }
+
+    /// The caller must select modes before its baseline/admission sample.
+    /// Until the executor is bound, production calls [`Self::layer`] only.
+    fn layer_mode(&self, cfg: &DeepseekV4Config, layer: usize,
+        mode: cuteafd_loader::placement::LayerMode) -> Result<Vec<LayerWeights<'a>>> {
+        let ratio = *cfg.compress_ratios.get(layer).context("V4 weight layer past config")?;
+        let layout = WeightSplit::for_mode(mode, ratio, self.ranks())?;
         if self.peers.is_empty() {
-            return Ok(vec![self.block(cfg, &format!("layers.{layer}"), cfg.compress_ratios[layer],
-                cfg.is_hash_layer(layer))?]);
+            return Ok(vec![self.block(cfg, &format!("layers.{layer}"), ratio, cfg.is_hash_layer(layer))?]);
         }
-        self.block_split(cfg, &format!("layers.{layer}"), cfg.compress_ratios[layer], cfg.is_hash_layer(layer))
+        self.block_shared(cfg, &format!("layers.{layer}"), ratio, cfg.is_hash_layer(layer), layout)
     }
 
     /// GPUs of the head split this loader fills (1: no split).
@@ -244,11 +310,12 @@ impl<'a> WeightLoader<'a, '_> {
     /// One block's operands over the head split's ranks (see [`share`]): each
     /// tensor read once, every rank's slice uploaded on its GPU (scales re-laid
     /// by that GPU's scale-prep program at the slice's extents).
-    fn block_split(&self, cfg: &DeepseekV4Config, prefix: &str, ratio: usize, hash: bool) -> Result<Vec<LayerWeights<'a>>> {
+    fn block_shared(&self, cfg: &DeepseekV4Config, prefix: &str, ratio: usize, hash: bool,
+        layout: WeightSplit) -> Result<Vec<LayerWeights<'a>>> {
         let ranks = self.ranks();
         let mut operands: Vec<HashMap<&'static str, DeviceAllocation<'a>>> = (0..ranks).map(|_| HashMap::new()).collect();
         for source in layer_sources(cfg, ratio) {
-            let kind = share(source.operand);
+            let kind = share(source.operand, layout.attention, layout.ffn);
             let names: Vec<String> = source.tensors.iter().map(|t| format!("{prefix}.{t}")).collect();
             // Per rank, the concatenation of each tensor's slice.
             let mut parts: Vec<Vec<u8>> = vec![Vec::new(); ranks];
@@ -256,6 +323,7 @@ impl<'a> WeightLoader<'a, '_> {
                 let raw = self.read(std::slice::from_ref(name))?;
                 let shape = self.catalog.tensor(name)?.metadata.shape.clone();
                 for (rank, part) in parts.iter_mut().enumerate() {
+                    if layout.operand(source.operand, rank).is_none() { continue; }
                     match kind {
                         Share::All => part.extend_from_slice(&raw),
                         Share::Rows => {
@@ -272,15 +340,11 @@ impl<'a> WeightLoader<'a, '_> {
                 }
             }
             for (rank, part) in parts.into_iter().enumerate() {
+                if layout.operand(source.operand, rank).is_none() { continue; }
                 let allocation = self.on_rank(rank, |stream| match source.prep {
                     Prep::Raw => self.upload(&part),
                     Prep::Scale { n, k, groups } => {
-                        let (n, k, groups) = match (source.operand, kind) {
-                            ("wo_a_scale", _) => (n, k, groups / ranks),
-                            (_, Share::Rows) => (n / ranks, k, groups),
-                            (_, Share::Cols) => (n, k / ranks, groups),
-                            _ => (n, k, groups),
-                        };
+                        let (n, k, groups) = scale_extents(source.operand, kind, n, k, groups, ranks);
                         self.scale_on(&part, n, k, groups, stream)
                     }
                 })?;
@@ -301,7 +365,9 @@ impl<'a> WeightLoader<'a, '_> {
                 operands.insert("gate.bias", self.on_rank(rank, |_| self.upload(&raw))?);
             }
         }
-        Ok(operands.into_iter().map(|operands| LayerWeights { ratio, hash, split: true, operands }).collect())
+        Ok(operands.into_iter().map(|operands| LayerWeights {
+            ratio, hash, attention_split: layout.attention, ffn_split: layout.ffn, operands,
+        }).collect())
     }
 
     /// One block's operands from the checkpoint names under `prefix`.
@@ -325,7 +391,7 @@ impl<'a> WeightLoader<'a, '_> {
         } else {
             operands.insert("gate.bias", self.tensor(&format!("{prefix}.ffn.gate.bias"))?);
         }
-        Ok(LayerWeights { ratio, hash, split: false, operands })
+        Ok(LayerWeights { ratio, hash, attention_split: false, ffn_split: false, operands })
     }
 
     /// The drafter, when the checkpoint carries one (`mtp.0.main_proj`).
@@ -373,4 +439,77 @@ impl<'a> WeightLoader<'a, '_> {
         }, shares.collect()))
     }
 
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn v4_owned_attention_does_not_unsplit_shared_ffn_weights() {
+        for (operand, axis) in [("w_q", Share::Rows), ("w_q_scale", Share::Rows),
+            ("attn_sink", Share::Rows), ("wo_a", Share::Rows), ("wo_a_scale", Share::Rows),
+            ("wo_b", Share::Cols), ("wo_b_scale", Share::Cols)] {
+            assert_eq!(share(operand, true, true), axis);
+            assert_eq!(share(operand, false, true), Share::All);
+        }
+        for (operand, axis) in [("w13", Share::Rows), ("w13_scale", Share::Rows),
+            ("w2", Share::Cols), ("w2_scale", Share::Cols)] {
+            assert_eq!(share(operand, true, true), axis);
+            assert_eq!(share(operand, false, true), axis);
+            assert_eq!(share(operand, true, false), Share::All);
+        }
+        for operand in ["w_qkv", "w_qkv_scale", "joint_projection", "index_w_q", "gate"] {
+            for attention_split in [false, true] {
+                for ffn_split in [false, true] {
+                    assert_eq!(share(operand, attention_split, ffn_split), Share::All);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn v4_modes_load_attention_only_on_its_owner() -> Result<()> {
+        use cuteafd_loader::placement::{FfnMode, LayerMode};
+        for owner in 0..2 {
+            let layout = WeightSplit::for_mode(LayerMode::Whole { gpu: owner, ffn: FfnMode::Split }, 4, 2)?;
+            for operand in ["attn.fn", "attn.norm", "w_qkv", "w_qkv_scale", "w_q", "attn_sink",
+                "wo_a", "wo_a_scale", "wo_b", "joint_projection", "main_norm", "index_norm", "index_w_q",
+                "ffn.fn", "ffn.norm", "w13", "w13_scale", "w2", "w2_scale", "gate"] {
+                for rank in 0..2 {
+                    let ffn = operand.starts_with("ffn.") || operand.starts_with("gate")
+                        || matches!(operand, "w13" | "w13_scale" | "w2" | "w2_scale");
+                    assert_eq!(layout.operand(operand, rank).is_some(), ffn || rank == usize::from(owner),
+                        "{operand} on rank {rank}");
+                }
+            }
+            for operand in ["gate.bias", "gate.tid2eid", "ffn.fn", "ffn.norm"] {
+                assert_eq!(layout.operand(operand, 0), Some(Share::All));
+                assert_eq!(layout.operand(operand, 1), Some(Share::All));
+            }
+            assert_eq!(layout.operand("w13", 0), Some(Share::Rows));
+            assert_eq!(layout.operand("w2", 1), Some(Share::Cols));
+            assert_eq!(layout.operand("wo_a", usize::from(owner)), Some(Share::All));
+        }
+        assert!(WeightSplit::for_mode(LayerMode::ContextSplit, 128, 2).is_err());
+        assert!(WeightSplit::for_mode(LayerMode::ContextSplit, 4, 1).is_err());
+        assert!(WeightSplit::for_mode(LayerMode::Whole { gpu: 1, ffn: FfnMode::Owner }, 4, 2).is_err());
+        assert!(WeightSplit::for_mode(LayerMode::Whole { gpu: 0, ffn: FfnMode::Split }, 128, 2).is_err());
+        assert_eq!(WeightSplit::for_mode(LayerMode::ContextSplit, 4, 2)?,
+            WeightSplit::for_mode(LayerMode::HeadSplit, 4, 2)?);
+        Ok(())
+    }
+
+    #[test]
+    fn v4_whole_attention_preserves_output_scale_groups() {
+        for groups in [8, 16] {
+            assert_eq!(scale_extents("wo_a_scale", Share::All, 1024, 4096, groups, 2),
+                (1024, 4096, groups));
+            assert_eq!(scale_extents("wo_a_scale", Share::Rows, 1024, 4096, groups, 2),
+                (1024, 4096, groups / 2));
+        }
+        assert_eq!(scale_extents("w13_scale", Share::Rows, 4096, 4096, 1, 2), (2048, 4096, 1));
+        assert_eq!(scale_extents("w2_scale", Share::Cols, 4096, 2048, 1, 2), (4096, 1024, 1));
+        assert_eq!(scale_extents("w_q_scale", Share::Rows, 32768, 1024, 1, 2), (16384, 1024, 1));
+    }
 }

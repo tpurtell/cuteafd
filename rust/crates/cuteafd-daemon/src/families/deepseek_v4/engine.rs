@@ -363,7 +363,7 @@ impl<'a> Engine<'a> {
     pub fn attach_peer(&mut self, device: i32, stream: *mut c_void, layers: Vec<LayerWeights<'a>>, parts: PeerParts)
         -> Result<()> {
         let _memory_scope = cuteafd_ffi::memory_ledger::scope("peer-split");
-        ensure!(self.split_family.is_some() && layers.len() == self.cfg.n_layers && layers.iter().all(|l| l.split),
+        ensure!(self.split_family.is_some() && layers.len() == self.cfg.n_layers && layers.iter().all(|l| l.attention_split && l.ffn_split),
             "attach_peer needs the head-split shares of every backbone layer");
         let slot_bytes = if parts.tp2 || self.exchange_policy == ExchangePolicy::F32 {
             self.exchange_policy.slot_bytes(self.prefill_rows, self.decode_rows, self.cfg.dim)
@@ -458,7 +458,7 @@ impl<'a> Engine<'a> {
             parts.library.copy_h2d(allocation.buffer, bytes_of(&values))?;
             Ok(allocation)
         };
-        let split_family = match (parts.weights.layers.first().is_some_and(|l| l.split), parts.family) {
+        let split_family = match (parts.weights.layers.iter().any(|l| l.attention_split || l.ffn_split), parts.family) {
             (false, _) => None,
             (true, "dsv4f") => Some("dsv4f2"),
             (true, "dsv4p") => Some("dsv4p2"),
@@ -1302,7 +1302,7 @@ impl<'a> Engine<'a> {
         self.attention_front(1, layer, weights, tables, lane, w, rows, cap)?;
         self.attention_sum(1, layer, index, w, rows)?;
         self.attention_back(1, weights, lane, w, rows, cap, w.sum.buffer.ptr)?;
-        self.run_on(1, true, &format!("shared_ffn_m{cap}"), &[
+        self.run_on(1, weights.ffn_split, &format!("shared_ffn_m{cap}"), &[
             ("x", w.y.buffer.ptr), ("w13", weights.ptr("w13")?), ("w13_scale", weights.ptr("w13_scale")?),
             ("w2", weights.ptr("w2")?), ("w2_scale", weights.ptr("w2_scale")?), ("out", lane.shared.buffer.ptr),
             ("scratch", w.scratch.buffer.ptr),
@@ -1421,7 +1421,7 @@ impl<'a> Engine<'a> {
         let ratio = weights.ratio;
         let rope = if ratio == 0 { rope_window } else { rope_compressed };
         let mode = if tables.decode { "decode" } else { "prefill" };
-        let split = weights.split;
+        let split = weights.attention_split;
         let a = &lane.stream_a;
         self.run_on(rank, false, "mhc_pre", &[
             ("residual", a.buffer.ptr), ("fn", weights.ptr("attn.fn")?), ("scale", weights.ptr("attn.scale")?),
@@ -1661,7 +1661,7 @@ impl<'a> Engine<'a> {
     fn shared_ffn(&self, layer: usize, w: &Workspace<'_>, lane: &Lane<'_>, rows: Scalar, cap: usize,
         weights: &LayerWeights<'_>) -> Result<()> {
         // A head split's layers hold half the shared expert (its program family's share).
-        self.run_on(0, weights.split, &format!("shared_ffn_m{cap}"), &[
+        self.run_on(0, weights.ffn_split, &format!("shared_ffn_m{cap}"), &[
             ("x", w.y.buffer.ptr), ("w13", weights.ptr("w13")?), ("w13_scale", weights.ptr("w13_scale")?),
             ("w2", weights.ptr("w2")?), ("w2_scale", weights.ptr("w2_scale")?), ("out", lane.shared.buffer.ptr),
             ("scratch", w.scratch.buffer.ptr),
