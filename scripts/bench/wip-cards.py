@@ -537,7 +537,9 @@ def observe(job):
                 # trace must have records. Diagnostic only: the row decides.
                 try:
                     active = (http(os.environ['CUTEAFD_SMOKE_URL'], '/v1/bench/status').get('active') or {})
-                    if active and (active.get('panel') != 'baseline' or active.get('fraction', 0) >= .05):
+                    # Past the first warm-up: 5% into the run, or (a run that skips
+                    # the baseline starts its first panel at once) 60 s into it.
+                    if active and (active.get('fraction', 0) >= .05 or active.get('elapsed_s', 0) >= 60):
                         trace_due = trace_due or time.monotonic() + 5
                 except (OSError, RuntimeError, ValueError):
                     pass
