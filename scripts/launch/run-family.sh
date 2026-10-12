@@ -481,7 +481,11 @@ if [[ $family =~ ^(glm5|qwen4|deepseek_v4)$ ]]; then
   fi
   family_args+=(--pool-tokens "$pool")
 fi
-# COPY_DRAFTS=off: decode without copy-window drafts (serve-glm, serve-glmf, serve-mimo, serve-qwen4).
+# GLM 5.3 has only agreement extensions, priced by its shared neural policy.
+if [[ $family == glm5 && -n "$(get COPY_DRAFTS)" ]]; then
+  echo "COPY_DRAFTS was removed for GLM 5.3: copies only extend agreeing neural drafts; delete the key" >&2
+  exit 2
+fi
 if [[ "$(get COPY_DRAFTS on)" == off ]]; then
   [[ $serve != serve-dsv4 ]] || { echo "COPY_DRAFTS applies to GLM, MiMo and Qwen checkpoints" >&2; exit 2; }
   family_args+=(--no-copy-drafts)
@@ -580,6 +584,10 @@ fi
 trace_args=()
 # Experimental shared policy changes stay off until emitted-throughput gates pass.
 for policy_key in DRAFT_COST_BUCKETS DRAFT_CONFIDENCE COPY_DRAFT_POLICY; do
+  if [[ $family == glm5 && -n "$(get "$policy_key")" ]]; then
+    echo "$policy_key was removed for GLM 5.3: it always runs the shared draft policy; delete the key" >&2
+    exit 2
+  fi
   case "$(get "$policy_key" off)" in
     on) trace_args+=(-e "CUTEAFD_$policy_key=1") ;;
     off) trace_args+=(-e "CUTEAFD_$policy_key=0") ;;

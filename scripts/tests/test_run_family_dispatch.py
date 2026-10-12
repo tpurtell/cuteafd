@@ -97,6 +97,16 @@ def test_glm53_bare_default_uses_release_dflash2(tmp_path: Path) -> None:
     assert "models--incoai--GLM-5.3-DFlash2/snapshots/abc" in result.stderr
 
 
+@pytest.mark.parametrize("key", ["COPY_DRAFTS", "COPY_DRAFT_POLICY", "DRAFT_CONFIDENCE", "DRAFT_COST_BUCKETS"])
+@pytest.mark.parametrize("value", ["on", "off"])
+def test_glm53_rejects_removed_draft_switches(tmp_path: Path, key: str, value: str) -> None:
+    result = _family_launch_result(tmp_path, {
+        "model_type": "glm_moe_dsa", "num_hidden_layers": 4, "first_k_dense_replace": 3,
+    }, "zai-org/GLM-5.3", f"{key}={value}\n")
+    assert result.returncode != 0
+    assert f"{key} was removed for GLM 5.3" in result.stderr
+
+
 def test_shared_draft_policy_rejects_unknown_switch_value(tmp_path: Path) -> None:
     result = _family_launch_result(tmp_path, {"model_type": "mimo_v2_flash", "num_hidden_layers": 2,
                                             "moe_layer_freq": [0, 1]}, "XiaomiMiMo/MiMo-V2-Flash",

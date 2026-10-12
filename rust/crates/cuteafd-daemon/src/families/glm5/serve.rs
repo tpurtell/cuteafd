@@ -2,8 +2,8 @@
 //! prefill per admitted request and one decode-shaped step for every active
 //! sequence. With a DFlash2 drafter (--draft), every step first drafts after
 //! each sequence's next token on the GPU and verifies as many drafts as the
-//! adaptive policy (glm/dflash_policy.rs) prices worthwhile; copy-window
-//! drafts extend a DFlash2 draft they agree with.
+//! shared resource policy prices worthwhile. History copies extend only a
+//! whole-window agreeing greedy neural draft, never replace it.
 //!
 //! Prefix cache (`cuteafd_engine::prefix` over `super::prefix::GlmPrefix`):
 //! the pages are the whole state, so admission restores the deepest retained
@@ -15,7 +15,8 @@
 //! a decode whose client left is not retained. `prompt_cache_hit_tokens`
 //! reports the restored rows; `/v1/stats` carries the cache's counters.
 use super::dflash::{ContextRow, DraftSeq, TAP_ROWS};
-use super::dflash_policy::{self, DraftHistory, Shape};
+use crate::shared::draft_policy::DraftHistory;
+use crate::shared::draft::evidence::{Censor, DraftSource};
 use super::engine::{GlmEngine, GlmPlacement, DECODE_ROWS};
 use super::prefix::GlmPrefix;
 use crate::shared::prefix::CudaCopyEngine;
@@ -23,8 +24,6 @@ use crate::shared::prefix::{PrefixArgs, Toggle};
 use crate::shared::probe;
 use cuteafd_engine::prefix::{After, PointPlan, PointPolicy, PrefixCache, PrefixConfig, PrefixFamily, SnapshotKind};
 
-/// Most copy-window draft tokens verified per sequence and step.
-const COPY_DRAFT: usize = 7;
 use super::{open, Opened};
 use crate::shared::token_io::{SelectBatch, SelectPlacement, TokenSelector};
 use crate::shared::prefill_share::{Chunk, DecodeShareArgs};
@@ -60,9 +59,6 @@ pub(crate) struct ServeArgs {
     /// template's Low effort, think block open, a short plan as reasoning).
     #[arg(long, env = "CUTEAFD_GLM_THINKING_OFF", default_value = "empty")]
     pub thinking_off: GlmThinkingOff,
-    /// Decode one token per step (no copy-window drafts).
-    #[arg(long)]
-    pub no_copy_drafts: bool,
     /// With --draft: verify exactly this many DFlash2 drafts per step
     /// (within the rows) instead of the adaptive policy.
     #[arg(long)]
@@ -102,7 +98,7 @@ pub(crate) async fn run_serve(args: ServeArgs) -> Result<()> {
             .max(args.max_sequences.saturating_mul(5).div_ceil(4)));
     }
     let (worker_stats, max_sequences) = (stats.clone(), args.max_sequences);
-    let policy = Policy { copy: if args.no_copy_drafts { 0 } else { COPY_DRAFT }, fixed: args.draft_fixed,
+    let policy = Policy { fixed: args.draft_fixed,
         decode_share: args.decode_share };
     let prefix = args.prefix.clone();
     let hub = console::hub(args.console.console_text, || Ok(console_layout(&args, &profile.id)));
@@ -135,14 +131,9 @@ fn console_layout(args: &ServeArgs, model: &str) -> console::Layout {
     layout.hardware = console::hardware(1 + usize::from(args.engine.split_device.is_some()), sparks, false);
     layout.split = args.engine.split_device.map(|_| "head split".into());
     layout.concurrency = args.max_sequences.min(DECODE_ROWS);
-    let copy = if args.no_copy_drafts { "" } else { " · copy windows" };
-    let policy = args.draft_fixed.map_or_else(|| "adaptive".to_string(), |n| format!("fixed {n}"));
-    layout.speculator = match (&args.engine.draft, args.no_copy_drafts) {
-        (Some(_), _) => Some(console::Speculator { name: "DFlash2".into(), positions: 8, policy: policy + copy }),
-        (None, false) => Some(console::Speculator { name: "Copy window".into(), positions: COPY_DRAFT,
-            policy: "adaptive length".into() }),
-        (None, true) => None,
-    };
+    let policy = args.draft_fixed.map_or_else(|| "shared resource-priced + agreed copies".to_string(), |n| format!("fixed {n}"));
+    layout.speculator = args.engine.draft.as_ref().map(|_| console::Speculator {
+        name: "DFlash2".into(), positions: 8, policy });
     layout.steps = vec![
         StepGroup::new("Decode step", "host clock", &[("round.cycle", "step", Target),
             ("draft", "DFlash2 draft", Accepted), ("plan", "draft plan + copy windows", Ink),
@@ -158,11 +149,9 @@ fn console_layout(args: &ServeArgs, model: &str) -> console::Layout {
     layout
 }
 
-/// Speculation settings: copy-window draft cap (0 disables) and a fixed
-/// DFlash2 draft count replacing the adaptive policy.
+/// A diagnostic fixed DFlash2 count, otherwise shared resource-priced selection.
 #[derive(Debug, Clone, Copy)]
 struct Policy {
-    copy: usize,
     fixed: Option<usize>,
     decode_share: DecodeShareArgs,
 }
@@ -232,19 +221,11 @@ struct Active<'a> {
     prompt_tokens: usize,
     /// Prompt and generated tokens, for copy-window drafts.
     history: Vec<u32>,
-    /// Current copy-draft length (halved after a fully rejected draft,
-    /// doubled after a fully accepted one) and steps left before drafting
-    /// resumes once it reached zero.
-    draft_limit: usize,
-    draft_pause: usize,
     /// DFlash2 ring slot and draft outcomes (None without a drafter slot).
     slot: Option<usize>,
     drafts: DraftHistory,
-    copy_drafts: DraftHistory,
-    /// Hash of `history` (identical sequences share it).
-    digest: u64,
-    /// Steps, DFlash2 drafts verified and accepted, copy drafts verified and accepted.
-    counts: [usize; 5],
+    /// Steps and neural/agreed-tail drafts verified and accepted.
+    counts: [usize; 3],
     constraint: Option<crate::shared::constraints::State<'a>>,
     placement: GlmPlacement,
     /// First position the DFlash2 drafter's context holds for this sequence
@@ -261,6 +242,26 @@ struct Active<'a> {
     buffered: usize,
     started: Instant,
     ticket: console::Ticket,
+}
+
+/// Fixed diagnostic counts still share one verifier budget, anchors included.
+fn trim_budget(lengths: &mut [usize], budget: usize) -> bool {
+    let mut rows = lengths.len() + lengths.iter().sum::<usize>();
+    let trimmed = rows > budget;
+    while rows > budget {
+        let Some(index) = (0..lengths.len()).filter(|&i| lengths[i] > 0).max_by_key(|&i| lengths[i]) else { break };
+        lengths[index] -= 1;
+        rows -= 1;
+    }
+    trimmed
+}
+
+/// Stops censor an unjudged continuation, never a disagreeing draft token.
+fn finish_censor(finished: bool, committed: usize, rows: &[u32], last: Option<u32>, stops: &[u32]) -> Option<Censor> {
+    if !finished { return None; }
+    let next = rows.get(committed);
+    if next.is_some() && next != last.as_ref() { return None; }
+    Some(if last.is_some_and(|token| stops.contains(&token)) { Censor::Eos } else { Censor::OutputLimit })
 }
 
 /// Commits a selected token to the request's grammar.
@@ -298,7 +299,6 @@ impl Active<'_> {
     fn emit(&mut self, token: u32) -> Result<bool> {
         crate::shared::probe::token(&self.job.probe, token);
         self.history.push(token);
-        self.digest = digest(self.digest, token);
         self.generated += 1;
         self.buffered += 1;
         // A grammar that accepted one of its stop tokens has ended the request.
@@ -367,31 +367,6 @@ impl Trace {
     }
 }
 
-const DIGEST_SEED: u64 = 0xcbf2_9ce4_8422_2325;
-
-fn digest(state: u64, token: u32) -> u64 {
-    (state ^ u64::from(token)).wrapping_mul(0x0100_0000_01b3)
-}
-
-/// Longest n-gram (from 8 down to 4 tokens) that ends the history and occurred
-/// earlier; proposes up to `limit` tokens that followed its latest earlier
-/// occurrence (a copy window). Exact: the verify step accepts only tokens the
-/// model itself produces.
-fn copy_drafts(history: &[u32], limit: usize) -> Vec<u32> {
-    let len = history.len();
-    for n in (4..=8).rev() {
-        if len <= n {
-            continue;
-        }
-        let tail = &history[len - n..];
-        if let Some(start) = (0..len - n).rev().find(|&i| &history[i..i + n] == tail) {
-            let from = start + n;
-            return history[from..(from + limit).min(len)].to_vec();
-        }
-    }
-    Vec::new()
-}
-
 /// The prefix cache over `engine` (always present: with zero entries it is the page allocator).
 fn prefix_cache<'e, 'a>(engine: &'e GlmEngine<'a>, args: &PrefixArgs)
     -> Result<(GlmPrefix<'e, 'a>, PrefixCache<CudaCopyEngine<'a>>)> {
@@ -439,7 +414,8 @@ fn publish(stats: &Mutex<serde_json::Value>, requests: u64, generated: u64, acti
     cache: &PrefixCache<CudaCopyEngine<'_>>) {
     if let Ok(mut stats) = stats.lock() {
         *stats = serde_json::json!({"requests": requests, "generated_tokens": generated, "active": active,
-            "prefilling": prefilling, "prefix_cache": cache.stats()});
+            "prefilling": prefilling, "prefix_cache": cache.stats(),
+            "draft_policy": crate::shared::draft::resource::snapshot()});
     }
 }
 
@@ -455,15 +431,14 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
     let tokenizer = cuteafd_loader::LoadedTokenizer::from_snapshot(&opened.snapshot)?;
     let drafter = engine.drafter.as_ref();
     let mut free_slots: Vec<usize> = drafter.map_or(Vec::new(), |d| (0..d.slots).rev().collect());
-    // Measured at TP4; other Spark layouts scale its Spark share (TP6: 384 / 512).
-    let widest = dflash_policy::widest_slice(engine.cfg.moe_intermediate, ranks);
-    let table = dflash_policy::rescale_spark(&dflash_policy::K4_TP4_STEP_MS, dflash_policy::K4_TP4_GPU_MS, 512, widest);
-    let mut cost = dflash_policy::step_cost(&table, DECODE_ROWS);
-    let mut confidence = drafter.map(|d| d.confidence_policy("glm5", false)).transpose()?;
-    let copy_policy = crate::shared::draft_policy::enabled("CUTEAFD_COPY_DRAFT_POLICY");
-    let refine_confidence = crate::shared::draft_policy::enabled("CUTEAFD_DRAFT_CONFIDENCE");
-    tracing::info!(copy_policy, refine_confidence, "shared draft policy experiments");
-    let mut skip = dflash_policy::DraftSkip::default();
+    use crate::shared::draft::{resource, runtime::SharedPolicy};
+    let mut shared = drafter.map(|d| {
+        let homes = resource::homes(&engine.weights.layers.iter().map(|layer| layer.dense).collect::<Vec<_>>(),
+            None, &opened.snapshot, Some(ranks))?;
+        engine.arm_draft_probe()?;
+        SharedPolicy::new(&homes, engine.cfg.experts, engine.cfg.topk, DECODE_ROWS, d.cfg.drafts(),
+            resource::Prior::Selector(d.selector_fit("glm5", false)?), resource::seed())
+    }).transpose()?;
     let mut active: Vec<Active<'_>> = Vec::new();
     let (mut requests, mut generated_total, mut admitted_total) = (0u64, 0u64, 0u64);
     let mut selector = TokenSelector::new(&opened.library, select, engine.cfg.vocab_size, DECODE_ROWS)?;
@@ -698,14 +673,10 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
                     let mut request = Active {
                         id: p.id,
                         prompt_tokens: p.tokens.len(),
-                        digest: p.tokens.iter().fold(DIGEST_SEED, |d, &t| digest(d, t)),
                         history: p.tokens,
-                        draft_limit: policy.copy,
-                        draft_pause: 0,
                         slot,
                         drafts: DraftHistory::default(),
-                        copy_drafts: DraftHistory::default(),
-                        counts: [0; 5],
+                        counts: [0; 3],
                         decoder: cuteafd_loader::streaming_token_decoder(&opened.snapshot, false)?,
                         job: p.job, constraint: p.constraint, placement: p.placement, draft_from: resume, turn: None,
                         capacity: p.capacity, next: 0, generated: 0, buffered: 0, started: Instant::now(),
@@ -755,25 +726,40 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
             continue;
         }
         let cycle = Instant::now();
+        let mut round_clock = crate::shared::draft::clock::RoundClock::at(cycle);
+        let mut drafted_width = 0;
         let mut tally = console::Step::begin(0);
         let (phases_before, engine_before) = (phases, tally.live().then(|| *engine.profile.borrow()));
         // Rows each sequence may add after its next token.
-        let room = (DECODE_ROWS / active.len()).max(1) - 1;
+        let room = DECODE_ROWS.saturating_sub(active.len());
         let limits: Vec<usize> = active.iter().map(|a| if probe::no_speculation(&a.job.probe) { 0 } else {
             room.min(a.job.max_tokens - a.generated - 1).min(a.capacity - a.placement.len - 1) }).collect();
-        // DFlash2 drafts after every next token, then the policy's counts.
+        // Skip/block decisions use the same resource prices as post-draft lengths.
+        let eligible: Vec<_> = active.iter().zip(&limits).filter(|(a, limit)| a.slot.is_some() && **limit > 0)
+            .map(|(a, &limit)| (a.ticket.id(), limit)).take(drafter.map_or(0, |d| d.max_batch_sequences())).collect();
+        let run_draft = if eligible.is_empty() { false } else if policy.fixed.is_some()
+            || active.iter().any(|a| a.drafts.cold() && eligible.iter().any(|&(id, _)| id == a.ticket.id())) { true } else {
+            let shared = shared.as_mut().expect("eligible draft slots have a shared policy");
+            let fit = shared.policy.cost_snapshot(false).draft;
+            let actions = [cuteafd_core::DraftAction { width: 0, draft_us: 0. }, cuteafd_core::DraftAction {
+                width: drafter.unwrap().cfg.drafts(), draft_us: fit[0] + fit[1] * eligible.len() as f64 }];
+            // Undrafted members still contribute their anchors, routes and emitted tokens.
+            let requests: Vec<_> = active.iter().map(|a| (a.ticket.id(),
+                eligible.iter().find(|&&(id, _)| id == a.ticket.id()).map_or(0, |&(_, room)| room))).collect();
+            shared.policy.choose_action(false, &requests, &actions, DECODE_ROWS)?.is_none_or(|action| action == 1)
+        };
         let timer = Instant::now();
         let drafted: Vec<Option<super::dflash::Draft>> = match drafter {
-            Some(drafter) if skip.drafts() && active.iter().any(|a| a.slot.is_some()) => {
+            Some(drafter) if run_draft => {
                 let seqs: Vec<(usize, DraftSeq)> = active.iter().enumerate()
-                    .filter_map(|(i, a)| a.slot.map(|slot| (i, DraftSeq { slot, anchor: a.next, position: a.placement.len,
+                    .filter_map(|(i, a)| a.slot.filter(|_| limits[i] > 0).map(|slot| (i, DraftSeq { slot, anchor: a.next, position: a.placement.len,
                         valid_from: a.draft_from })))
                     .take(drafter.max_batch_sequences())
                     .collect();
-                let timer = Instant::now();
-                let drafts = drafter.draft_device(&seqs.iter().map(|(_, s)| *s).collect::<Vec<_>>(), &engine.embedding,
-                    super::dflash::TargetHead::Bf16(&engine.weights.head));
-                cost.observe_draft(active.len(), timer.elapsed().as_secs_f64() * 1e3);
+                let drafts = round_clock.draft(|| drafter.draft_device(&seqs.iter().map(|(_, s)| *s).collect::<Vec<_>>(), &engine.embedding,
+                    super::dflash::TargetHead::Bf16(&engine.weights.head)));
+                drafted_width = drafter.cfg.drafts();
+
                 let mut out = vec![None; active.len()];
                 match drafts {
                     Ok(drafts) => {
@@ -790,74 +776,40 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
         };
         phases[0] += timer.elapsed().as_secs_f64();
         let timer = Instant::now();
-        // Identical sequences (same tokens at the same position) route alike
-        // and draft alike: the policy prices and plans them as one group.
-        let key = |a: &Active<'_>| (a.placement.len, a.digest);
-        let priors: Vec<Vec<f64>> = active.iter().zip(&drafted).map(|(a, draft)| {
-            confidence.as_ref().map_or(Vec::new(), |policy| policy.prior(&a.drafts,
-                draft.as_ref().map(|d| d.features.as_slice()), draft.as_ref().map_or(0, |d| d.tokens.len())))
-        }).collect();
-        let rates: Vec<Vec<f64>> = priors.iter().map(|prior| confidence.as_ref()
-            .map_or_else(|| prior.clone(), |policy| policy.apply(prior))).collect();
-        let inputs: Vec<dflash_policy::PlanInput<'_>> = active.iter().enumerate().map(|(i, a)| dflash_policy::PlanInput {
-            key: key(a), history: &a.drafts, features: drafted[i].as_ref().map(|d| d.features.as_slice()),
-            confidence: None, rates: Some(&rates[i]), limit: limits[i],
-        }).collect();
-        let planned = dflash_policy::plan_counts(&inputs, policy.fixed, &cost);
-        drop(inputs);
-        skip.after(drafted.iter().any(Option::is_some) && policy.fixed.is_none(), planned.iter().all(|&n| n == 0));
-        // Each sequence verifies its next token, then its DFlash2 drafts, or
-        // a copy-window draft when it agrees with them and runs longer.
-        let copy_choice = copy_policy.then(|| {
-            let proposals = active.iter().enumerate().map(|(i, a)| {
-            if !a.job.sampling.is_greedy() { return Vec::new(); }
-            copy_drafts(&a.history, limits[i].min(a.draft_limit))
-        }).collect::<Vec<_>>();
-            let copy_rates: Vec<_> = active.iter().zip(&proposals).map(|(a, copy)| a.copy_drafts.conditional(copy.len())).collect();
-            let inputs: Vec<_> = active.iter().enumerate().map(|(i, a)| crate::shared::draft_policy::CopyInput {
-                key: key(a), neural: drafted[i].as_ref().map_or(&[], |d| &d.tokens[..planned[i]]),
-                confidence: &rates[i], copy: &proposals[i], copy_confidence: &copy_rates[i],
+        let extensions: Vec<_> = active.iter().zip(&drafted).zip(&limits).map(|((a, draft), &limit)|
+            draft.as_ref().map_or(Vec::new(), |d| crate::shared::draft::copy::extension(
+                &a.history, &d.tokens, limit, a.job.sampling.is_greedy()))).collect();
+        let priors: Vec<_> = active.iter().zip(&drafted).zip(&extensions).map(|((a, draft), extension)|
+            match (&shared, draft) {
+                (Some(shared), Some(d)) => shared.prior(&a.drafts,
+                    &resource::DraftEvidence::Selector(&d.features), extension.len()),
+                _ => Vec::new(),
             }).collect();
-            let (lengths, used) = crate::shared::draft_policy::compete_copies(&inputs,
-                drafted.iter().any(Option::is_some), 0, &cost);
-            (proposals, lengths, used)
-        });
-        let mut used_copy = vec![false; active.len()];
-        let sequences: Vec<Vec<u32>> = active.iter_mut().enumerate().map(|(i, a)| {
-            if a.draft_pause > 0 {
-                a.draft_pause -= 1;
-                if a.draft_pause == 0 {
-                    a.draft_limit = 1;
-                }
+        let mut predicted = None;
+        let mut planned = match (policy.fixed, shared.as_mut()) {
+            (Some(fixed), _) => drafted.iter().zip(&limits).map(|(draft, &limit)|
+                draft.as_ref().map_or(0, |d| fixed.min(limit).min(d.tokens.len()))).collect(),
+            (None, Some(shared)) if drafted_width > 0 => {
+                let candidates: Vec<_> = active.iter().zip(&priors).zip(&limits).map(|((a, prior), &limit)|
+                    resource::Candidate { id: a.ticket.id(), prior, limit, selector: true, cold: a.drafts.cold() }).collect();
+                let selection = resource::select(&mut shared.policy, &candidates, drafted_width, DECODE_ROWS);
+                predicted = selection.predicted;
+                selection.lengths
             }
-            let dflash: &[u32] = drafted[i].as_ref().map_or(&[], |d| &d.tokens[..planned[i]]);
-            let full: &[u32] = drafted[i].as_ref().map_or(&[], |d| &d.tokens);
-            // `emit` already appended `next` to the history.
-            let copy = copy_drafts(&a.history, limits[i].min(a.draft_limit));
-            let agrees = copy.iter().zip(full).take_while(|(c, d)| c == d).count() >= dflash.len();
-            let draft = if let Some((copies, lengths, used)) = &copy_choice {
-                used_copy[i] = used[i];
-                if used[i] { copies[i][..lengths[i]].to_vec() } else { dflash.to_vec() }
-            } else if copy.len() > dflash.len() && agrees {
-                used_copy[i] = true;
-                copy
-            } else {
-                dflash.to_vec()
-            };
+            _ => vec![0; active.len()],
+        };
+        if trim_budget(&mut planned, DECODE_ROWS) { predicted = None; }
+        let sequences: Vec<Vec<u32>> = active.iter().enumerate().map(|(i, a)| {
+            let full = drafted[i].as_ref().map_or(&[][..], |d| d.tokens.as_slice());
+            let draft = full.iter().chain(&extensions[i]).take(planned[i]).copied();
             let mut rows: Vec<u32> = std::iter::once(a.next).chain(draft).collect();
-            // Drafts the grammar rejects could never be kept: verify none of them.
-            if let Some(state) = a.constraint.as_ref() {
-                state.truncate_proposal(&mut rows)?;
-            }
+            if let Some(state) = a.constraint.as_ref() { state.truncate_proposal(&mut rows)?; }
             Ok(rows)
         }).collect::<Result<_>>()?;
         let mut poisoned: Vec<Option<String>> = vec![None; sequences.len()];
         let starts: Vec<usize> = active.iter().map(|a| a.placement.len).collect();
-        let distinct_rows: usize = active.iter().zip(&sequences).map(|(a, rows)| (key(a), rows))
-            .collect::<std::collections::HashSet<_>>().iter().map(|(_, rows)| rows.len()).sum();
         let tokens: Vec<u32> = sequences.iter().flatten().copied().collect();
-        let mut cycle_host = timer.elapsed().as_secs_f64();
-        phases[1] += cycle_host;
+        phases[1] += timer.elapsed().as_secs_f64();
         // Each row draws at the position after it, masked along its sequence's drafts.
         let timer = Instant::now();
         let mut batch = SelectBatch::default();
@@ -866,18 +818,20 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
             poisoned[i] = batch.push_sequence_isolated(a.job.sampling, a.constraint.as_ref(), rows, start as u64 + 1);
         }
         phases[2] += timer.elapsed().as_secs_f64();
-        cycle_host += timer.elapsed().as_secs_f64();
         let mut rows: Vec<(&mut GlmPlacement, usize)> = active.iter_mut().zip(&sequences)
             .map(|(a, s)| (&mut a.placement, s.len())).collect();
         let timer = Instant::now();
+        engine.probe_begin(tokens.len());
         let step = engine.verify_device(&mut rows, &tokens, transport.as_deref_mut().map(|t| (t, runtime)))
             .and_then(|logits| logits.context("decode needs every layer"))
             .and_then(|logits| Ok((selector.select(&logits, &batch)?, logits)));
+        engine.probe_end();
         let (selected, logits) = match step {
             Ok(step) => step,
             Err(error) => {
                 tracing::warn!("decode step failed: {error:#}");
                 for request in active.drain(..) {
+                    if let Some(shared) = shared.as_mut() { shared.policy.release(request.ticket.id()); }
                     let _ = request.job.events.send(Err(NativeFailure::Worker(format!("{error:#}"))));
                     release(&family, &mut cache, &mut free_slots, &request.placement, request.slot);
                 }
@@ -885,7 +839,6 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
             }
         };
         let verify_ms = timer.elapsed().as_secs_f64() * 1e3;
-        cost.observe_verify(Shape { rows: tokens.len(), distinct: distinct_rows, sequences: sequences.len() }, verify_ms);
         phases[3] += verify_ms / 1e3;
         phases[6] += 1.0;
         phases[7] += tokens.len() as f64;
@@ -897,14 +850,17 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
         let before: Vec<usize> = active.iter().map(|a| a.history.len()).collect();
         // A normal finish's turn snapshot keeps the row that produced the last token.
         let retain_turn = cache.enabled();
-        let finished: Vec<bool> = active.iter_mut().zip(&sequences).zip(starts).enumerate()
+        let mut verified = vec![(0usize, 1usize, Some(Censor::Cancelled)); active.len()];
+        let finished: Vec<bool> = active.iter_mut().zip(&sequences).zip(&starts).enumerate()
             .map(|(i, ((request, rows), start))| {
             if let Some(error) = poisoned[i].take() {
                 let _ = request.job.events.send(Err(NativeFailure::Worker(error)));
+                verified[i] = (rows.len(), 1, Some(Censor::Cancelled));
                 offset += rows.len();
                 return true;
             }
             let mut finished = false;
+            let mut cancelled = false;
             for j in 0..rows.len() {
                 // Rows 0..=j are committed; the token row j produces is next.
                 request.placement.len = start + j + 1;
@@ -928,6 +884,7 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
                     Err(error) => {
                         let _ = request.job.events.send(Err(NativeFailure::Worker(format!("{error:#}"))));
                         finished = true;
+                        cancelled = true;
                         break;
                     }
                 }
@@ -938,51 +895,51 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
             }
             offset += rows.len();
             let (drafted, accepted) = (rows.len() - 1, committed - 1);
+            let censor = if cancelled { Some(Censor::Cancelled) } else {
+                finish_censor(finished, committed, rows, request.history.last().copied(), &request.job.stop_token_ids)
+            };
+            verified[i] = (rows.len(), committed, censor);
             request.counts[0] += 1;
-            if used_copy[i] {
-                request.copy_drafts.observe(drafted.min(accepted + usize::from(!finished)), accepted);
-                request.counts[3] += drafted;
-                request.counts[4] += accepted;
-            } else {
-                request.counts[1] += drafted;
-                request.counts[2] += accepted;
-            }
-            if planned[i] > 0 && (!used_copy[i] || (!refine_confidence && !copy_policy)) {
-                if let Some(policy) = confidence.as_mut().filter(|_| !used_copy[i]) {
-                    policy.observe(&request.drafts, draft_list[i].as_ref().map(|d| d.features.as_slice()),
-                        &priors[i], drafted, accepted, finished, request.ticket.id());
-                }
-                request.drafts.observe(if refine_confidence || copy_policy { drafted.min(accepted + usize::from(!finished)) } else { planned[i] }, accepted);
+            request.counts[1] += drafted;
+            request.counts[2] += accepted;
+            if planned[i] > 0 {
+                request.drafts.observe(drafted.min(accepted + usize::from(censor.is_none())), accepted);
             }
             if let Some(trace) = trace_ref.as_mut() {
-                if let Err(error) = trace.cycle(request.id, start, rows.len(), committed, planned[i], used_copy[i],
+                if let Err(error) = trace.cycle(request.id, *start, rows.len(), committed, planned[i], false,
                     draft_list[i].as_ref(), verify_ms) {
                     tracing::warn!("trace: {error:#}");
-                }
-            }
-            // Adapt the copy-draft length to how much of it the model reproduced.
-            if used_copy[i] || drafter.is_none() {
-                if drafted > 0 && accepted == 0 {
-                    request.draft_limit /= 2;
-                    if request.draft_limit == 0 {
-                        request.draft_pause = 8;
-                    }
-                } else if drafted > 0 && accepted == drafted {
-                    request.draft_limit = (request.draft_limit * 2).clamp(1, policy.copy.max(1));
                 }
             }
             finished
         }).collect();
         phases[4] += timer.elapsed().as_secs_f64();
-        cycle_host += timer.elapsed().as_secs_f64();
         let timer = Instant::now();
         if let Some(drafter) = drafter {
             drafter.update(&context)?;
         }
         phases[5] += timer.elapsed().as_secs_f64();
-        cost.observe_host(active.len(), 1e3 * (cycle_host + timer.elapsed().as_secs_f64()));
+        if let Some(shared) = shared.as_mut() {
+            let requests: Vec<_> = active.iter().enumerate().map(|(i, a)| {
+                let (rows, accepted, censor) = verified[i];
+                resource::Verified { id: a.ticket.id(), rows, accepted,
+                    source: if rows > 1 && drafted[i].is_some() { DraftSource::Neural }
+                        else { DraftSource::Undrafted },
+                    prior: drafted[i].as_ref().map(|_| priors[i].as_slice()),
+                    features: drafted[i].as_ref().map(|d| d.features.as_slice()),
+                    censor }
+            }).collect();
+            let times = round_clock.observe();
+            if let Some(Err(error)) = engine.probe_finish(|routes, layer_us| resource::observe(
+                &mut shared.policy, &requests, routes, layer_us, times, drafted_width, predicted)) {
+                tracing::debug!(%error, "GLM draft round not observed");
+            }
+            if shared.policy.stats().rounds % 32 == 1 {
+                resource::publish(&shared.policy, shared.policy.stats().rounds, 0, None);
+            }
+        }
         for (i, request) in active.iter().enumerate() {
-            let proposal = if used_copy[i] { &sequences[i][1..] } else { drafted[i].as_ref().map_or(&[][..], |d| &d.tokens) };
+            let proposal = &sequences[i][1..];
             tally.member(&request.ticket, proposal, sequences[i].len() - 1, &request.history[before[i]..],
                 request.constraint.is_some(), finished[i]);
         }
@@ -998,6 +955,7 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
                 continue;
             }
             let mut request = active.remove(index);
+            if let Some(shared) = shared.as_mut() { shared.policy.release(request.ticket.id()); }
             request.ticket.done(request.generated);
             if let Some(trace) = trace.as_mut() {
                 trace.done(request.id, request.prompt_tokens, &request.history[request.prompt_tokens..])?;
@@ -1007,10 +965,10 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
             let seconds = request.started.elapsed().as_secs_f64();
             let engine_phases = std::mem::take(&mut *engine.profile.borrow_mut());
             let host = std::mem::take(&mut phases);
-            let [steps, dflash, dflash_ok, copy, copy_ok] = request.counts;
+            let [steps, dflash, dflash_ok] = request.counts;
             let per_step = |s: f64| 1e3 * s / host[6].max(1.0);
             tracing::info!(tokens = request.generated, seconds, tok_s = request.generated as f64 / seconds,
-                active = active.len(), steps, dflash, dflash_ok, copy, copy_ok, gpu_wait_s = engine_phases[0],
+                active = active.len(), steps, dflash, dflash_ok, gpu_wait_s = engine_phases[0],
                 experts_s = engine_phases[1], head_s = engine_phases[2], "request complete");
             tracing::info!(steps = host[6], rows_per_step = host[7] / host[6].max(1.0), draft_ms = per_step(host[0]),
                 plan_ms = per_step(host[1]), embed_ms = per_step(host[2]), verify_ms = per_step(host[3]),
@@ -1031,5 +989,30 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
         publish(stats, requests, generated_total, active.len(), prefills.len(), &cache);
         console::gauges(|| console::Gauges::prefix_cache(&cache, active.len(), prefills.len(), receive.len() + kv_waiter.len()));
         prefills.stepped(cycle.elapsed().as_secs_f64());
+    }
+}
+
+#[cfg(test)]
+mod draft_tests {
+    use super::*;
+
+    #[test]
+    fn stops_censor_only_unjudged_agreed_drafts() {
+        assert_eq!(finish_censor(false, 2, &[1, 5, 9], Some(9), &[9]), None);
+        assert_eq!(finish_censor(true, 2, &[1, 5, 9, 4], Some(9), &[9]), Some(Censor::Eos));
+        assert_eq!(finish_censor(true, 2, &[1, 5, 7, 4], Some(9), &[9]), None);
+        assert_eq!(finish_censor(true, 1, &[1, 5, 6], Some(5), &[9]), Some(Censor::OutputLimit));
+        assert_eq!(finish_censor(true, 3, &[1, 5, 6], Some(8), &[9]), Some(Censor::OutputLimit));
+    }
+
+    #[test]
+    fn fixed_counts_keep_every_anchor_inside_the_global_budget() {
+        let mut lengths = [7; 16];
+        assert!(trim_budget(&mut lengths, 64));
+        assert_eq!(lengths.len() + lengths.iter().sum::<usize>(), 64);
+        assert!(lengths.iter().all(|&length| length == 3));
+        let mut lengths = [32, 0, 0, 0];
+        assert!(!trim_budget(&mut lengths, 64));
+        assert_eq!(lengths, [32, 0, 0, 0]);
     }
 }
