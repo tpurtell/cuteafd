@@ -259,6 +259,78 @@ mod tests {
     use super::*;
 
     #[test]
+    fn c4_context_planar_commits_cover_owned_pages_byte_exactly() -> anyhow::Result<()> {
+        use crate::shared::peer_split::context::{commit_blocks, CommitPlane};
+        let units = [4, 9, 0, 3];
+        let record_bytes = compressed_page_bytes(4);
+        let record_planes = [
+            (576, 0, 64),
+            (8, 64 * 576, 64),
+            (64, 64 * 584, 1),
+        ];
+        let mut planes = Vec::new();
+        for (row_bytes, base, rows_per_unit) in record_planes {
+            planes.push(CommitPlane { first: 0, rows: units.len() * rows_per_unit,
+                rows_per_unit, row_bytes, base, unit_bytes: record_bytes });
+        }
+        for (row_bytes, base) in [(128, 0), (4, 64 * 128)] {
+            planes.push(CommitPlane { first: 0, rows: units.len() * 64,
+                rows_per_unit: 64, row_bytes, base, unit_bytes: INDEX_PAGE_BYTES });
+        }
+        for rank in 0..2 {
+            let commits = commit_blocks(rank, &units, &planes, units.len())?;
+            for (plane_index, plane) in planes.iter().enumerate() {
+                let table = &commits.table[plane_index * 3 * units.len()..];
+                for entry in 0..commits.counts[plane_index] {
+                    let source = table[entry] as usize;
+                    let destination = table[units.len() + entry] as usize;
+                    let bytes = table[2 * units.len() + entry] as usize;
+                    let logical = source / plane.unit_bytes;
+                    assert_eq!(logical % 2, rank);
+                    assert_eq!(destination / plane.unit_bytes, (units[logical] >> 1) as usize);
+                    assert_eq!(source % plane.unit_bytes, plane.base);
+                    assert_eq!(bytes, plane.rows_per_unit * plane.row_bytes);
+                }
+            }
+            for (range, unit_bytes) in [(0..3, record_bytes), (3..5, INDEX_PAGE_BYTES)] {
+                for logical in (rank..units.len()).step_by(2) {
+                    let mut coverage = vec![0u8; unit_bytes];
+                    for plane_index in range.clone() {
+                        let table = &commits.table[plane_index * 3 * units.len()..];
+                        for entry in 0..commits.counts[plane_index] {
+                            let source = table[entry] as usize;
+                            if source / unit_bytes != logical { continue; }
+                            let begin = source % unit_bytes;
+                            let bytes = table[2 * units.len() + entry] as usize;
+                            for count in &mut coverage[begin..begin + bytes] { *count += 1; }
+                        }
+                    }
+                    assert!(coverage.iter().all(|&count| count == 1));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn c4_context_ownership_frontiers_do_not_split_compression_groups() {
+        use crate::shared::peer_split::context::{page_owner, shard_rows};
+        for source_tokens in 0..=1025 {
+            let completed = source_tokens / 4;
+            let counts = [shard_rows(completed, 64, 0), shard_rows(completed, 64, 1)];
+            assert_eq!(counts[0] + counts[1], completed);
+            for rank in 0..2 {
+                assert_eq!(counts[rank], (0..completed).filter(|&group|
+                    page_owner(group / 64) == rank).count());
+            }
+            if source_tokens % 4 == 3 {
+                assert_eq!(page_owner(source_tokens / SOURCE_PAGE_TOKENS),
+                    page_owner(completed / 64));
+            }
+        }
+    }
+
+    #[test]
     fn prefill_and_decode_tables_use_physical_slots() -> anyhow::Result<()> {
         let shape = PoolShape::new(2, 4096, 64);
         let mut pool = PoolAllocator::new(shape);
