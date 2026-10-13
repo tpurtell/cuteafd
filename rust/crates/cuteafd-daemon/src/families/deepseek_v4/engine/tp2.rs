@@ -157,7 +157,7 @@ impl<'a> Engine<'a> {
     pub(super) fn shutdown_submission(&self, transports: &[SparkLink<'_>]) -> Result<()> {
         self.terminal.set(crate::shared::peer_split::TerminalState::Aborting);
         let result = (|| {
-            if self.tp2.is_some() { self.retire_tp2()?; }
+            if self.exchange.is_some() { self.retire_tp2()?; }
             else {
                 for rank in 0..(1 + usize::from(self.peer.is_some())) {
                     // SAFETY: all queued operands remain owned through shutdown.
@@ -175,10 +175,8 @@ impl<'a> Engine<'a> {
 
     /// Both abort words precede either drain; graphs and backend owners remain live.
     pub fn retire_tp2(&self) -> Result<()> {
-        if self.tp2.is_none() { return Ok(()); }
-        if self.tp2.as_ref().unwrap().routes.terminal_state() == crate::shared::peer_split::TerminalState::Drained {
-            return Ok(());
-        }
+        let Some(exchange) = &self.exchange else { return Ok(()); };
+        if exchange.terminal_state() == crate::shared::peer_split::TerminalState::Drained { return Ok(()); }
         let home = crate::shared::memory::device::Device { library: self.library, id: self.device };
         home.run(|| {
             self.publish_tp2_abort()?;
@@ -190,7 +188,7 @@ impl<'a> Engine<'a> {
             self.on(0, || { self.graphs.borrow_mut().clear(); Ok(()) })?;
             self.on(1, || { self.peer()?.graphs.borrow_mut().clear(); Ok(()) })?;
             self.exchange()?.finish_terminal(true);
-            self.tp2.as_ref().unwrap().routes.finish_terminal(true);
+            if let Some(tp2) = &self.tp2 { tp2.routes.finish_terminal(true); }
             Ok(())
         })
     }

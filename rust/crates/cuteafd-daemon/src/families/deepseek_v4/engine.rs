@@ -390,8 +390,7 @@ impl<'a> Engine<'a> {
         let slot_bytes = if parts.tp2 || self.exchange_policy == ExchangePolicy::F32 {
             self.exchange_policy.slot_bytes(self.prefill_rows, self.decode_rows, self.cfg.dim)
         } else { self.prefill_rows.max(self.decode_rows) * self.cfg.dim * 2 };
-        let create = if parts.tp2 { PeerExchange::new_abortable } else { PeerExchange::new };
-        let exchange = create(self.library, [RankDevice { device: self.device, stream: self.stream },
+        let exchange = PeerExchange::new_abortable(self.library, [RankDevice { device: self.device, stream: self.stream },
             RankDevice { device, stream }], 4 * PREFILL_LANES, slot_bytes)?;
         let peer = exchange.on(1, || -> Result<V4Peer<'a>> {
             self.programs.load_matching(|name| self.selected_programs().contains(name))?;
@@ -851,7 +850,7 @@ impl<'a> Engine<'a> {
         transports: &mut [SparkLink<'_>],
         runtime: &tokio::runtime::Runtime,
         logit_rows: usize,
-        mut on_layer: Option<&mut dyn FnMut(usize, &[u8]) -> Result<()>>,
+        on_layer: Option<&mut dyn FnMut(usize, &[u8]) -> Result<()>>,
         download: bool,
     ) -> Result<Logits> {
         let transports = RefCell::new(transports);

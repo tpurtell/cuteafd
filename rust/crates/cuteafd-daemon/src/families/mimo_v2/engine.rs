@@ -853,6 +853,15 @@ impl<'a> MimoEngine<'a> {
                 failures.push(format!("Spark owner release: {error:#}"));
             }
         }
+        if failures.is_empty() {
+            for rank in 0..self.ranks() {
+                if let Err(error) = self.on(rank, || {
+                    if rank == 0 { self.graphs.borrow_mut().clear(); }
+                    else { self.peer.as_ref().context("peer graphs")?.graphs.borrow_mut().clear(); }
+                    Ok(())
+                }) { failures.push(format!("rank {rank} graph retirement: {error:#}")); }
+            }
+        }
         let drained=failures.is_empty();
         self.terminal.set(if drained { TerminalState::Drained } else { TerminalState::Retained });
         if let Some(exchange)=&self.exchange { exchange.finish_terminal(drained); }

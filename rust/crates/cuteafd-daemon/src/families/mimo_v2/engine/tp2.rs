@@ -351,7 +351,7 @@ mod tests {
             for broadcast in [false, true] {
                 for lanes in [1, 2, 3] {
                     let mut s = Schedule::default();
-                    for _ in 0..3 { prefill(&mut s, &homes, lanes, broadcast, false); }
+                    for _ in 0..3 { prefill(&mut s, &homes, lanes, broadcast, false); s.end_request(); }
                     assert_eq!(crate::shared::peer_split::order::check_submission_faults(&s), Ok(()), "lanes={lanes} broadcast={broadcast}");
                 }
                 let mut eager = Schedule::default();
@@ -359,6 +359,8 @@ mod tests {
                 for _ in 0..3 {
                     prefill(&mut eager, &homes, 1, broadcast, true);
                     decode(&mut graph, &homes, broadcast);
+                    eager.end_request();
+                    graph.end_request();
                 }
                 assert_eq!(crate::shared::peer_split::order::check_submission_faults(&eager), Ok(()), "eager broadcast={broadcast}");
                 assert_eq!(crate::shared::peer_split::order::check_submission_faults(&graph), Ok(()), "decode broadcast={broadcast}");

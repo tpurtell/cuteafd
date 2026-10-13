@@ -1920,7 +1920,7 @@ impl<'a> GlmfEngine<'a> {
         self.terminal.set(crate::shared::peer_split::TerminalState::Aborting);
         let result = (|| {
             let home = crate::shared::memory::device::Device { library: self.library, id: self.device };
-            if self.peer.is_some() { home.run(|| self.publish_tp2_abort())?; }
+            if self.peer.is_some() || self.drafter.is_some() { home.run(|| self.publish_tp2_abort())?; }
             self.synchronize()?;
             if let Some(Experts::Spark { transports, .. }) = &self.experts {
                 for link in transports.borrow().iter() { link.intake.terminal_drain_copies()?; }
@@ -3467,7 +3467,7 @@ impl<'a> GlmfEngine<'a> {
     }
 
     fn step(&self, tables: &StepTables, tokens: &[u32], logit_rows: usize,
-        mut on_layer: Option<&mut dyn FnMut(usize, &[u8]) -> Result<()>>,
+        on_layer: Option<&mut dyn FnMut(usize, &[u8]) -> Result<()>>,
         forced: Option<&dyn Fn(usize) -> Option<Vec<u8>>>, trace: Option<&std::path::Path>, media: Option<&cuteafd_engine::media::RequestMedia>) -> Result<Option<DeviceLogits>> {
         crate::shared::experts::rtx::pair::submit(
             || self.require_live(), || self.shutdown_submission(),
