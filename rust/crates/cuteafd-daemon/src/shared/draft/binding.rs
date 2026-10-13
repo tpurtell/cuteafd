@@ -92,8 +92,8 @@ impl Observation<'_> {
     }
 }
 
-/// Build one round's observation. `native_width` is the drafter's native
-/// block (`policy.widths()[0]`); a pass wider than it is the wide width.
+/// Build one round's observation. `native_width` is the narrow draft-cost
+/// width (`policy.widths()[0]`), independent of the neural-confidence boundary.
 pub(crate) fn build<'a>(record: &RoundRecord<'a>, native_width: usize) -> Result<Observation<'a>, ObserveError> {
     let rows: usize = record.requests.iter().map(|request| request.rows).sum();
     record.routes.complete()?;
@@ -142,15 +142,57 @@ pub(crate) fn observe(policy: &mut DraftPolicy, record: &RoundRecord<'_>) -> Res
 
 /// Opt-in complete observation capture, including dSpark head evidence. The
 /// selector-only ConfidencePolicy trace does not cover that serving path.
-fn trace_round(policy: &DraftPolicy, record: &RoundRecord<'_>) {
+fn replay_trace() -> Option<&'static crate::shared::speculation_trace::Trace> {
     use std::sync::OnceLock;
     static TRACE: OnceLock<Option<crate::shared::speculation_trace::Trace>> = OnceLock::new();
-    let Some(trace) = TRACE.get_or_init(|| {
+    TRACE.get_or_init(|| {
         match crate::shared::speculation_trace::Trace::open("CUTEAFD_DRAFT_CONFIDENCE_TRACE") {
             Ok(trace) => trace,
-            Err(error) => { tracing::warn!(%error, "draft round trace open failed"); None }
+            Err(error) => { tracing::warn!(%error, "draft replay trace open failed"); None }
         }
-    }) else { return };
+    }).as_ref()
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn trace_action(policy: &DraftPolicy, shared: bool, requests: &[(u64, usize)],
+    actions: &[cuteafd_core::DraftAction], action_rooms: Option<&[&[usize]]>, max_rows: usize,
+    chosen: Option<usize>, executed: usize) {
+    let Some(trace) = replay_trace() else { return };
+    let value = action_trace_value(policy, shared, requests, actions, action_rooms, max_rows, chosen, executed);
+    if let Err(error) = trace.write(&value) { tracing::warn!(%error, "draft action trace failed"); }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn action_trace_value(policy: &DraftPolicy, shared: bool, requests: &[(u64, usize)],
+    actions: &[cuteafd_core::DraftAction], action_rooms: Option<&[&[usize]]>, max_rows: usize,
+    chosen: Option<usize>, executed: usize) -> serde_json::Value {
+    serde_json::json!({"type": "draft_action", "round": policy.stats().rounds,
+        "shared": shared, "requests": requests, "max_rows": max_rows,
+        "actions": actions.iter().enumerate().map(|(index, action)| serde_json::json!({
+            "width": action.width, "draft_us": action.draft_us,
+            "rooms": action_rooms.map(|rooms| rooms[index])
+        })).collect::<Vec<_>>(), "chosen": chosen, "executed": executed,
+        "cold": chosen.is_none(), "engaged": policy.engaged(shared, requests.len())})
+}
+
+pub(crate) fn trace_selection(policy: &DraftPolicy, candidates: &[cuteafd_core::DraftCandidate<'_>],
+    width: usize, drafted_requests: usize, max_rows: usize, lengths: &[usize]) {
+    let Some(trace) = replay_trace() else { return };
+    let value = selection_trace_value(policy, candidates, width, drafted_requests, max_rows, lengths);
+    if let Err(error) = trace.write(&value) { tracing::warn!(%error, "draft selection trace failed"); }
+}
+
+fn selection_trace_value(policy: &DraftPolicy, candidates: &[cuteafd_core::DraftCandidate<'_>],
+    width: usize, drafted_requests: usize, max_rows: usize, lengths: &[usize]) -> serde_json::Value {
+    serde_json::json!({"type": "draft_selection", "round": policy.stats().rounds,
+        "requests": candidates.iter().zip(lengths).map(|(&candidate, &length)| serde_json::json!({
+            "id": candidate.id, "raw_confidence": candidate.confidence,
+            "calibrated_confidence": policy.probabilities(candidate), "selected_drafts": length
+        })).collect::<Vec<_>>(), "width": width, "drafted_requests": drafted_requests, "max_rows": max_rows})
+}
+
+fn trace_round(policy: &DraftPolicy, record: &RoundRecord<'_>) {
+    let Some(trace) = replay_trace() else { return };
     let geometry = policy.geometry();
     if record.routes.layers() != geometry.layers.len()
         || record.routes.flat().len() != geometry.layers.len() * record.routes.rows() * usize::from(geometry.topk) {
@@ -196,6 +238,7 @@ fn round_trace_value(policy: &DraftPolicy, record: &RoundRecord<'_>) -> serde_js
         "geometry": geometry.layers.iter().map(|l| serde_json::json!({"class": l.class,
             "slice_bytes": l.slice_bytes, "group_rows": l.group_rows, "timed": l.timed})).collect::<Vec<_>>(),
         "group_rows_by_rows": geometry.group_rows_by_rows,
+        "executed_group_rows": (0..geometry.layers.len()).map(|layer| geometry.group_rows(layer, rows)).collect::<Vec<_>>(),
         "megabytes": megabytes, "layer_us": record.layer_us,
         "total_us": record.times.total_us, "draft_us": record.times.draft_us,
         "draft_width": record.draft.map(|d| d.width), "drafted_requests": record.draft.and_then(|d| d.requests),
@@ -489,6 +532,94 @@ mod tests {
         assert_eq!(value["bucket"], 0);
         assert_eq!(value["selected"], serde_json::json!({"bucket": 0, "shared": false}));
         assert_eq!(value["length_rule"], "priced");
+    }
+
+    #[test]
+    fn round_trace_prices_executed_installed_grouping_not_static_capacity() {
+        use cuteafd_core::{LayerResource, PolicyGeometry, PolicySeed, ResourceClass};
+        let geometry = PolicyGeometry { layers: vec![LayerResource {
+            class: Some(0), slice_bytes: 1e6, group_rows: 8, timed: true }; 2],
+            experts: 8, topk: 2, max_requests: 16, max_positions: 5, widths: vec![5],
+            classes: vec![ResourceClass::rtx()],
+            group_rows_by_rows: (0..=16).map(|rows| vec![if rows == 1 { 1 } else { 8 }; 2]).collect(), regimes: 1 };
+        let policy = DraftPolicy::seeded(geometry, PolicySeed::weak(5)).unwrap();
+        let requests = [request(1, 16, 1, DraftSource::Undrafted, None, None)];
+        let wide_routes = routes(16);
+        let value = round_trace_value(&policy, &record(&requests, &wide_routes, None));
+        assert_eq!(value["geometry"][0]["group_rows"], 8);
+        assert_eq!(value["executed_group_rows"], serde_json::json!([8, 8]));
+        // Two experts each appear sixteen times: two M8 reads each, not one M16 read.
+        assert_eq!(value["megabytes"], serde_json::json!([4., 4.]));
+        let requests = [request(1, 1, 1, DraftSource::Undrafted, None, None)];
+        let routes = routes(1);
+        let value = round_trace_value(&policy, &record(&requests, &routes, None));
+        assert_eq!(value["executed_group_rows"], serde_json::json!([1, 1]));
+        assert_eq!(value["megabytes"], serde_json::json!([2., 2.]));
+    }
+
+    #[test]
+    fn replay_decisions_keep_unverified_priors_and_action_participants() {
+        use cuteafd_core::{DraftAction, DraftCandidate, LayerResource, PolicyGeometry, PolicySeed, ResourceClass};
+        let geometry = PolicyGeometry { layers: vec![LayerResource {
+            class: Some(0), slice_bytes: 1e6, group_rows: 2, timed: true }; 2],
+            experts: 8, topk: 2, max_requests: 4, max_positions: 5, widths: vec![3, 5],
+            classes: vec![ResourceClass::rtx()], group_rows_by_rows: Vec::new(), regimes: 1 };
+        let policy = DraftPolicy::new(geometry, PolicySeed::weak(5), false).unwrap();
+        let actions = [DraftAction { width: 0, draft_us: 0. }, DraftAction { width: 3, draft_us: 2500. },
+            DraftAction { width: 5, draft_us: 3000. }];
+        let masks: [&[usize]; 3] = [&[0, 0], &[3, 3], &[5, 0]];
+        let action = action_trace_value(&policy, false, &[(1, 5), (2, 5)], &actions, Some(&masks),
+            8, None, 1);
+        assert_eq!(action["type"], "draft_action");
+        assert_eq!(action["actions"][1]["rooms"], serde_json::json!([3, 3]));
+        assert_eq!(action["actions"][2]["rooms"], serde_json::json!([5, 0]));
+        assert_eq!(action["actions"][2]["draft_us"], 3000.);
+        assert!(action["chosen"].is_null());
+        assert_eq!(action["executed"], 1);
+        assert_eq!(action["cold"], true);
+        let p = [0.9, 0.8, 0.7, 0.6, 0.5];
+        let candidates = [DraftCandidate { id: 1, confidence: &p }, DraftCandidate { id: 2, confidence: &[] }];
+        let selection = selection_trace_value(&policy, &candidates, 5, 1, 8, &[1, 0]);
+        assert_eq!(selection["requests"][0]["raw_confidence"], serde_json::json!(p));
+        assert_eq!(selection["requests"][0]["selected_drafts"], 1);
+        assert_eq!(selection["requests"][0]["calibrated_confidence"].as_array().unwrap().len(), 5);
+        assert_eq!(selection["requests"][1]["raw_confidence"], serde_json::json!([]));
+        assert_eq!(selection["drafted_requests"], 1);
+    }
+
+    #[test]
+    fn fixed_trace_values_leave_policy_decisions_and_fits_unchanged() {
+        use cuteafd_core::{DraftAction, DraftCandidate, LayerResource, PolicyGeometry, PolicySeed, ResourceClass};
+        let geometry = PolicyGeometry { layers: vec![LayerResource {
+            class: Some(0), slice_bytes: 1e6, group_rows: 16, timed: true }; 2],
+            experts: 8, topk: 2, max_requests: 16, max_positions: 5, widths: vec![5],
+            classes: vec![ResourceClass::rtx()], group_rows_by_rows: Vec::new(), regimes: 1 };
+        let plain = DraftPolicy::new(geometry, PolicySeed::weak(5), false).unwrap();
+        let mut policies = [plain.clone(), plain];
+        let p = [0.95, 0.9, 0.8, 0.65, 0.5];
+        let candidates = [DraftCandidate { id: 1, confidence: &p }, DraftCandidate { id: 2, confidence: &[] }];
+        let masks: [&[usize]; 1] = [&[5, 0]];
+        for _ in 0..160 {
+            let actions = [DraftAction { width: 5, draft_us: policies[1].draft_cost_drafted(false, 2, 1, 5) }];
+            let _ = action_trace_value(&policies[1], false, &[(1, 5), (2, 0)], &actions,
+                Some(&masks), 8, Some(0), 0);
+            let selections: Vec<_> = policies.iter_mut().map(|policy|
+                policy.select_drafted_within(false, &candidates, 5, 8, 1).unwrap()).collect();
+            assert_eq!(selections[0], selections[1]);
+            let lengths = selections[0].as_ref().map_or(vec![5, 0], |s| s.lengths.clone());
+            let _ = selection_trace_value(&policies[1], &candidates, 5, 1, 8, &lengths);
+            let requests = [request(1, lengths[0] + 1, (lengths[0] + 1).min(4), DraftSource::Neural,
+                Some(Evidence::History(&p)), None), request(2, 1, 1, DraftSource::Undrafted, None, None)];
+            let routes = routes(lengths[0] + 2);
+            let round = RoundRecord { shared: false, requests: &requests, routes: &routes,
+                layer_us: &[Some(100.), Some(100.)], times: RoundTimes { total_us: 800, draft_us: Some(200) },
+                draft: Some(DraftPass { width: 5, requests: Some(1) }), predicted: None };
+            let _ = round_trace_value(&policies[1], &round);
+            for policy in &mut policies { observe(policy, &round).unwrap(); }
+            assert_eq!(policies[0].calibration(), policies[1].calibration());
+            assert_eq!(policies[0].cost_snapshot(false, 2).to_json(&["local"]),
+                policies[1].cost_snapshot(false, 2).to_json(&["local"]));
+        }
     }
 
     #[test]

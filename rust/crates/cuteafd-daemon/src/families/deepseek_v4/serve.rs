@@ -389,6 +389,17 @@ fn speculative_step(
     let noise = engine.cfg.dspark_noise_token_id as u32;
     let draft_indices: Vec<usize> = active.iter().enumerate().filter_map(|(i, _)|
         (limits[i] > 0 && block > 0).then_some(i)).take(engine.decode_rows / block.max(1)).collect();
+    if crate::shared::draft_policy::speculation_trace_path("CUTEAFD_DRAFT_CONFIDENCE_TRACE").is_some() {
+        let requests: Vec<_> = active.iter().zip(&limits).map(|(request, &room)| (request.ticket.id(), room)).collect();
+        let mut rooms = vec![0; active.len()];
+        for &index in &draft_indices { rooms[index] = limits[index].min(block); }
+        let actions = [cuteafd_core::DraftAction { width: block,
+            draft_us: shared.policy.draft_cost_drafted(false, active.len(), draft_indices.len(), block) }];
+        // The fixed binding never scores a pre-draft action; report its actual
+        // mask without querying or mutating the adaptive action selector.
+        binding::trace_action(&shared.policy, false, &requests, &actions, Some(&[&rooms]),
+            engine.decode_rows, Some(0), 0);
+    }
     let mut drafts = vec![Vec::new(); active.len()];
     if !draft_indices.is_empty() {
         let inputs: Vec<u32> = draft_indices.iter().flat_map(|&i|

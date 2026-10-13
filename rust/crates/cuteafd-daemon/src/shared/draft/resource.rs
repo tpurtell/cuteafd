@@ -320,6 +320,7 @@ pub(crate) fn select_drafted(policy: &mut DraftPolicy, candidates: &[Candidate<'
         }
     }
     if fit_budget(&mut lengths, max_rows) { predicted = None; }
+    binding::trace_selection(policy, &cores, width, drafted_requests, max_rows, &lengths);
     Selection { lengths, predicted }
 }
 
