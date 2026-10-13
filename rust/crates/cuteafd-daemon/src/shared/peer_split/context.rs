@@ -118,6 +118,18 @@ pub(crate) fn partial_programs(manifest: &serde_json::Value, family: &str, begin
     Ok(out)
 }
 
+/// Select once at load, using numerical plan rows rather than live execution rows.
+/// Every exported alternative has the same full execution capacity in its name.
+pub(crate) fn partial_program(manifest: &serde_json::Value, family: &str, begin: usize,
+    execution_capacity_rows: usize, sms: usize,
+    plan: &cuteafd_core::coordinator_programs::AttentionReductionPlan) -> Result<String> {
+    ensure!(plan.capacity_rows() <= execution_capacity_rows,
+        "attention numerical domain exceeds execution capacity");
+    let partials = partial_programs(manifest, family, begin, execution_capacity_rows, sms)?;
+    partials.into_iter().find(|(cap, _)| *cap >= plan.rows()).map(|(_, name)| name)
+        .context("attention plan has no partial reduction recipe")
+}
+
 /// The variant of `partials` (ascending caps, [`partial_programs`]) a step of `rows` rows runs.
 pub(crate) fn pick_partial(partials: &[(usize, String)], rows: usize) -> &str {
     partials.iter().find(|(cap, _)| *cap >= rows).or(partials.last()).map_or("", |(_, name)| name.as_str())
@@ -505,6 +517,14 @@ mod tests {
         assert!(partial_programs(&manifest, "dsv4p", 0, 64, 188).is_err(), "no head-0 variant");
         assert!(partial_programs(&manifest, "dsv4f", 64, 64, 188).is_err(), "family prefixes do not cross");
         assert_eq!(pick_partial(&[], 4), "");
+        for (drafts, chosen) in [(None, "dsv4p_sparse_mla_partial_h64_s16_m64"),
+            (Some(7), "dsv4p_sparse_mla_partial_h64_s16_m64"),
+            (Some(8), "dsv4p_sparse_mla_partial_h64_s2_m64")] {
+            let plan = cuteafd_core::coordinator_programs::AttentionReductionPlan::new(64, drafts, None).unwrap();
+            assert_eq!(partial_program(&manifest, "dsv4p", 64, 64, 188, &plan).unwrap(), chosen);
+        }
+        let wide = cuteafd_core::coordinator_programs::AttentionReductionPlan::new(128, None, None).unwrap();
+        assert!(partial_program(&manifest, "dsv4p", 64, 64, 188, &wide).is_err());
     }
 
     #[test]
