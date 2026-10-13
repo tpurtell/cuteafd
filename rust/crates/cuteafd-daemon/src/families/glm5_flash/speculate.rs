@@ -537,7 +537,7 @@ fn parse_replay_rounds(text: &str, vocab: usize, decode_rows: usize) -> Result<V
 }
 
 /// The target, selector, commit and drafter context lifecycle from a cold single-request trace.
-fn private_replay_dir(path: &std::path::Path) -> Result<()> {
+pub(super) fn private_replay_dir(path: &std::path::Path) -> Result<()> {
     use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
     match std::fs::symlink_metadata(path) {
         Ok(meta) => ensure!(meta.is_dir() && meta.permissions().mode() & 0o077 == 0,
@@ -550,7 +550,7 @@ fn private_replay_dir(path: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
-fn private_replay_write(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
+pub(super) fn private_replay_write(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
     std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(path)?.write_all(bytes)?;
@@ -597,6 +597,8 @@ fn replay_rounds(args: &GoldenArgs, engine: &GlmfEngine<'_>, sequence: &[u32], p
     let vocab = engine.cfg.vocab_size;
     let request = rounds[0].request_ids[0];
     let mut anchor = argmax(&prompt_logits);
+    let snapshots = engine.enable_replay_snapshots()?;
+    ensure!(!snapshots || args.replay_dump.is_some(), "replay snapshots need --replay-dump");
     for round in rounds {
         ensure!(round.request_ids[0] == request && round.starts[0] == target.len,
             "round {}: request or position changed (expected {})", round.round, target.len);
@@ -610,6 +612,11 @@ fn replay_rounds(args: &GoldenArgs, engine: &GlmfEngine<'_>, sequence: &[u32], p
                 &engine.embedding, engine.draft_head())?.remove(0);
             println!("round {}: neural proposal matches trace {}", round.round,
                 round.neural_tokens[0].as_ref().is_some_and(|tokens| *tokens == draft.tokens));
+        }
+        if snapshots {
+            let dir = args.replay_dump.as_ref().unwrap().join(format!("round{}", round.round));
+            private_replay_dir(&dir)?;
+            engine.replay_snapshot_directory(dir.join("target"))?;
         }
         let logits = engine.verify_device(&mut [(&mut target, input.len())], input, round.spec)?
             .context("trace replay needs every layer")?;
@@ -646,7 +653,11 @@ fn replay_rounds(args: &GoldenArgs, engine: &GlmfEngine<'_>, sequence: &[u32], p
             Some(committed)
         };
         let mut expected = Vec::new();
-        for &token in &input[..keep] {
+        for (row, &token) in input[..keep].iter().enumerate() {
+            if snapshots {
+                engine.replay_snapshot_directory(args.replay_dump.as_ref().unwrap()
+                    .join(format!("round{}/serial{row:02}", round.round)))?;
+            }
             expected.extend(engine.verify_device(&mut [(&mut serial, 1)], &[token], false)?
                 .context("serial replay needs every layer")?.to_host(engine.library)?);
         }

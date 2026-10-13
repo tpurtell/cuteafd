@@ -969,9 +969,10 @@ pub(crate) struct GoldenArgs {
     /// Isolate one real routed-expert layer with --local-experts: compare a
     /// fixed first row across m1/m16/m80 packages and require that changing
     /// later inputs in the same row geometry cannot change it. No backbone
-    /// weights or drafter load; this checks expert compute, not model KL.
+    /// weights or drafter load; this checks expert compute, not model KL. A private expert.json
+    /// snapshot path instead of a row count runs its exact wire/routes through TP2 m1 and m80.
     #[arg(long)]
-    pub expert_row_check: Option<usize>,
+    pub expert_row_check: Option<String>,
     /// Dump fixed-token serial and --step-rows-wide layer outputs and router
     /// inputs to this directory, then report their full-vocabulary KL.
     #[arg(long)]
@@ -1035,6 +1036,15 @@ mod replay_cli_tests {
     struct Parse {
         #[command(flatten)]
         args: GoldenArgs,
+    }
+
+    #[test]
+    fn expert_check_preserves_numeric_mode_and_accepts_private_snapshot() {
+        let base = ["test", "--snapshot", "/checkpoint", "--native-lib", "/native", "--golden", "/golden"];
+        for input in ["6", "/private/segment03/expert.json"] {
+            let parsed = Parse::try_parse_from(base.into_iter().chain(["--expert-row-check", input])).unwrap();
+            assert_eq!(parsed.args.expert_row_check.as_deref(), Some(input));
+        }
     }
 
     #[test]
@@ -1941,8 +1951,11 @@ pub(crate) async fn run_golden(mut args: GoldenArgs) -> Result<()> {
 
 fn golden(args: GoldenArgs) -> Result<()> {
     let opened = open(&args.engine)?;
-    if let Some(rows) = args.expert_row_check {
-        return expert_rows::check(&args.engine, &opened, rows);
+    if let Some(input) = &args.expert_row_check {
+        return match input.parse::<usize>() {
+            Ok(rows) => expert_rows::check(&args.engine, &opened, rows),
+            Err(_) => expert_rows::check_snapshot(&args.engine, &opened, std::path::Path::new(input)),
+        };
     }
     opened.with_engine(&args.engine, |engine| golden_run(&args, &opened, engine))
 }

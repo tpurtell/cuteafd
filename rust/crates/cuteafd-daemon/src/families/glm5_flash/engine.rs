@@ -69,6 +69,22 @@ use std::rc::Rc;
 
 type Dev<'a> = DeviceAllocation<'a>;
 
+/// Private replay diagnostics: stable storage allocated once, after startup capture.
+/// Copies run between graph segments; no diagnostic operation enters a capture closure.
+struct ReplaySnapshots<'a> {
+    buffers: Vec<Vec<Dev<'a>>>,
+    routed: Vec<Vec<Dev<'a>>>,
+    directory: Option<std::path::PathBuf>,
+}
+
+fn replay_snapshot_layout(hidden: usize, topk: usize) -> [(&'static str, usize); 9] {
+    [("streams.bin", HC * hidden * 2), ("ffn_residual.bin", HC * hidden * 2),
+        ("ffn_input.bin", hidden * 2), ("ffn_partial.bin", hidden * 2),
+        ("route_ids.bin", topk * 4), ("route_weights.bin", topk * 4),
+        ("attention_out.bin", hidden * 2), ("shared_partial.bin", hidden * 2),
+        ("wire.bin", hidden + hidden / 32)]
+}
+
 #[path = "engine/context.rs"]
 mod context;
 pub(crate) use cuteafd_loader::placement::families::glm5_flash::GlmfAttention;
@@ -1327,6 +1343,7 @@ pub(crate) struct GlmfEngine<'a> {
     table_pages: usize,
     table_pool_pages: usize,
     decode_workspace: RefCell<Option<Workspace<'a>>>,
+    replay_snapshots: RefCell<Option<ReplaySnapshots<'a>>>,
     /// Prefill lanes of `prefill_rows` rows over one set of temporaries (pipelined Spark prefill;
     /// a serial prefill runs in the first).
     lane_workspaces: RefCell<Vec<Workspace<'a>>>,
@@ -1662,7 +1679,7 @@ impl<'a> GlmfEngine<'a> {
             kda_ordinal, mla_ordinal, index_cache, replay_records, records: RecordGuard::new(replay_records), caches,
             device, context_mode, context: None, context_units: RefCell::new(Vec::new()),
             peer: None, exchange: None, drafter: None, pool_logical_host: RefCell::new(vec![0; pool_pages]), pool_pages,
-            table_pages, table_pool_pages, decode_workspace: RefCell::new(None),
+            table_pages, table_pool_pages, decode_workspace: RefCell::new(None), replay_snapshots: RefCell::new(None),
             lane_workspaces: RefCell::new(Vec::new()),
             experts: None, tp2: None, local: None, dense_nvfp4: None, profile: RefCell::new([0.0; 3]), graphs: RefCell::new(GraphBank::new(None)),
             use_graphs: std::env::var("CUTEAFD_GLMF_GRAPHS").map_or(true, |v| v != "0"),
@@ -2171,6 +2188,16 @@ impl<'a> GlmfEngine<'a> {
             // SAFETY: input/routes and expert scratch are rank-local and serialized on one stream.
             unsafe { experts.enqueue(layer, rows, input, routes, self.stream_of(rank),
                 &mut || self.abort_tp2_or_terminate())?; }
+            if let Some(snapshots) = self.replay_snapshots.borrow().as_ref().filter(|s| s.directory.is_some()) {
+                ensure!(rows <= self.decode_rows && experts.partial() == PartialDtype::F32,
+                    "expert replay snapshots require FP32 TP2 partials");
+                let bytes = rows * self.cfg.hidden * 4;
+                // SAFETY: enqueue produced these rank-local rows; the copy precedes output reuse,
+                // and the stable destination remains live through the round-end drain.
+                unsafe { self.library.copy_d2d_async(snapshots.routed[rank][layer].buffer,
+                    cuteafd_ffi::CuteafdDeviceBuffer { ptr: experts.output(), bytes, device_id: experts.device(), flags: 0 },
+                    bytes, self.stream_of(rank))?; }
+            }
             if experts.partial() == PartialDtype::F32 {
                 // SAFETY: enqueue's raw FP32 output is copied into this lane's BF16 payload before scratch reuse.
                 unsafe { tp2.combine.partial(experts.output().cast(), w.shared.buffer.ptr.cast(), out,
@@ -3086,6 +3113,86 @@ impl<'a> GlmfEngine<'a> {
 
     pub(crate) fn production_replay_ready(&self) -> bool { self.use_graphs && self.startup_graphs }
 
+    pub(crate) fn enable_replay_snapshots(&self) -> Result<bool> {
+        if !std::env::var("CUTEAFD_GLMF_REPLAY_SNAPSHOTS").is_ok_and(|v| v == "1") { return Ok(false); }
+        ensure!(self.production_replay_ready(), "replay snapshots require startup graphs");
+        self.synchronize()?;
+        let layout = replay_snapshot_layout(self.cfg.hidden, self.cfg.topk);
+        let mut buffers = Vec::new();
+        for _ in 0..=self.weights.layers.len() {
+            buffers.push(layout.iter().map(|(_, bytes)| self.alloc(self.decode_rows * bytes))
+                .collect::<Result<Vec<_>>>()?);
+        }
+        let mut routed = Vec::new();
+        for rank in 0..self.ranks() {
+            routed.push(self.on(rank, || (0..self.weights.layers.len())
+                .map(|_| self.alloc(self.decode_rows * self.cfg.hidden * 4)).collect::<Result<Vec<_>>>())?);
+        }
+        *self.replay_snapshots.borrow_mut() = Some(ReplaySnapshots { buffers, routed, directory: None });
+        Ok(true)
+    }
+
+    pub(crate) fn replay_snapshot_directory(&self, directory: std::path::PathBuf) -> Result<()> {
+        super::speculate::private_replay_dir(&directory)?;
+        self.replay_snapshots.borrow_mut().as_mut().context("snapshots not enabled")?.directory = Some(directory);
+        Ok(())
+    }
+
+    fn snapshot_replay_segment(&self, w: &Workspace<'_>, index: usize, rows: usize, routed: bool) -> Result<()> {
+        let snapshots = self.replay_snapshots.borrow();
+        let snapshots = snapshots.as_ref().context("snapshots not enabled")?;
+        let layout = replay_snapshot_layout(self.cfg.hidden, self.cfg.topk);
+        // A split's attention sum survives the external MoE; single-GPU delta does not.
+        let sources = [Some(&w.streams[0]), Some(&w.streams[1]), Some(&w.x), Some(&w.delta),
+            Some(&w.route_ids), Some(&w.route_weights), w.sum.as_ref(), Some(&w.shared), Some(&w.wire)];
+        for (i, source) in sources.into_iter().enumerate().take(if routed { 9 } else { 4 }) {
+            let Some(source) = source else { continue };
+            ensure!(rows <= self.decode_rows && rows * layout[i].1 <= source.buffer.bytes,
+                "replay snapshot exceeds workspace rows");
+            // SAFETY: both buffers are rank-0 owned and retained through the round-end drain;
+            // this copy follows the segment/expert writes and precedes the next segment's reuse.
+            unsafe { self.library.copy_d2d_async(snapshots.buffers[index][i].buffer, source.buffer,
+                rows * layout[i].1, self.stream)?; }
+        }
+        Ok(())
+    }
+
+    fn finish_replay_snapshots(&self, tables: &StepTables, rows: usize) -> Result<()> {
+        self.synchronize()?;
+        let snapshots = self.replay_snapshots.borrow();
+        let snapshots = snapshots.as_ref().context("snapshots not enabled")?;
+        let directory = snapshots.directory.as_ref().context("snapshot directory not selected")?;
+        let layout = replay_snapshot_layout(self.cfg.hidden, self.cfg.topk);
+        for (index, buffers) in snapshots.buffers.iter().enumerate() {
+            let dir = directory.join(format!("segment{index:02}"));
+            super::speculate::private_replay_dir(&dir)?;
+            let routed = self.weights.layers.get(index).is_some_and(|layer| !layer.dense);
+            for (i, (buffer, (name, bytes))) in buffers.iter().zip(layout).enumerate().take(if routed { 9 } else { 4 }) {
+                if i == 6 && self.peer.is_none() { continue; }
+                super::speculate::private_replay_write(&dir.join(name), &self.download(buffer, rows * bytes)?)?;
+            }
+            if routed && self.tp2_layer(index) {
+                for (rank, buffers) in snapshots.routed.iter().enumerate() {
+                    let mut bytes = vec![0; tables.real_rows * self.cfg.hidden * 4];
+                    self.on(rank, || self.library.copy_d2h(&mut bytes, cuteafd_ffi::CuteafdDeviceBuffer {
+                        bytes: tables.real_rows * self.cfg.hidden * 4, ..buffers[index].buffer }))?;
+                    super::speculate::private_replay_write(&dir.join(format!("routed_rank{rank}.bin")), &bytes)?;
+                }
+            }
+            if routed {
+                super::speculate::private_replay_write(&dir.join("expert.json"), &serde_json::to_vec(&serde_json::json!({
+                    "layer": index, "rows": tables.real_rows, "hidden": self.cfg.hidden, "topk": self.cfg.topk,
+                    "wire": "wire.bin", "ids": "route_ids.bin", "weights": "route_weights.bin" }))?)?;
+            }
+        }
+        super::speculate::private_replay_write(&directory.join("geometry.json"),
+            &serde_json::to_vec(&serde_json::json!({"bucket": rows, "live": tables.real_rows,
+                "spec": tables.spec, "graphs": self.graphs.borrow().len(),
+                "peer_graphs": self.peer.as_ref().map_or(0, |p| p.graphs.borrow().len()),
+                "hidden": self.cfg.hidden, "experts": self.cfg.experts, "topk": self.cfg.topk}))?)?;
+        Ok(())
+    }
+
     /// Physical row count of an ordinary serving verify (lazy graphs use exact rows).
     pub(crate) fn serving_decode_rows(&self, rows: usize, spec: bool) -> usize {
         if self.use_graphs && self.startup_graphs { self.buckets.bucket(rows, spec) } else { rows }
@@ -3614,6 +3721,8 @@ impl<'a> GlmfEngine<'a> {
     fn decode_graphed(&self, w: &Workspace<'_>, w1: Option<&Workspace<'_>>, tables: &StepTables, tables1: &StepTables,
         t: usize, rows: Scalar, logit_rows: usize) -> Result<Option<DeviceLogits>> {
         self.release_retired_graphs()?;
+        let snapshot = self.replay_snapshots.borrow().as_ref().is_some_and(|s| s.directory.is_some())
+            && !self.warming_graphs.get();
         let layers = &self.weights.layers;
         // Every layer resident: the last segment ends in the head and the greedy selection.
         let head = layers.len() == self.cfg.layers && logit_rows == t;
@@ -3738,11 +3847,15 @@ impl<'a> GlmfEngine<'a> {
                     if let Some(w1) = w1 { self.peer_segment(index + 1, w1, t, tables1)?; }
                 }
             }
+            if snapshot {
+                self.snapshot_replay_segment(w, index, t, layers.get(index).is_some_and(|layer| !layer.dense))?;
+            }
             if index < layers.len() {
                 crate::shared::console::layer_mark(index);
                 self.probe_mark(index)?;
             }
         }
+        if snapshot { self.finish_replay_snapshots(tables, t)?; }
         if layers.len() < self.cfg.layers {
             self.synchronize()?;
             return Ok(None);
@@ -4895,6 +5008,30 @@ pub(crate) fn check_tp2_lanes(lanes: usize) -> Result<()> {
     ensure!((1..=2).contains(&lanes),
         "GLM Flash TP2 supports one or two prefill lanes; --prefill-lanes {lanes} has no admitted exchange schedule");
     Ok(())
+}
+
+#[cfg(test)]
+mod replay_snapshot_tests {
+    use super::*;
+
+    #[test]
+    fn snapshots_preserve_stream_and_route_row_widths() {
+        let layout = replay_snapshot_layout(4096, 8);
+        assert_eq!(layout.map(|(_, bytes)| bytes), [32768, 32768, 8192, 8192, 32, 32, 8192, 8192, 4224]);
+        assert_eq!(layout[6].0, "attention_out.bin");
+        assert_eq!(layout[7].0, "shared_partial.bin");
+    }
+
+    #[test]
+    fn snapshot_calls_stay_outside_capture_closure() {
+        let source = include_str!("engine.rs").split("\n#[cfg(test)]").next().unwrap();
+        let decode = source.split("    fn decode_graphed(").nth(1).unwrap();
+        let capture = decode.split("self.replay(key, || -> Result<()> {").nth(1).unwrap()
+            .split("            })?;").next().unwrap();
+        assert!(!capture.contains("snapshot"));
+        assert!(decode.contains("if snapshot {\n                self.snapshot_replay_segment"));
+        assert!(decode.contains("if snapshot { self.finish_replay_snapshots(tables, t)?; }"));
+    }
 }
 
 #[cfg(test)]
