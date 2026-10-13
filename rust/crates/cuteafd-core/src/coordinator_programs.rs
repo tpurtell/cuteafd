@@ -50,6 +50,39 @@ impl AttentionReductionPlan {
     }
 }
 
+/// A load-time dense output reduction. Live rows select storage, never arithmetic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OutputReductionPlan {
+    capacity_rows: usize,
+    expected_rows: usize,
+    split_slices: usize,
+}
+
+impl OutputReductionPlan {
+    pub fn serial(capacity_rows: usize, split_slices: usize) -> Result<Self, OutputPlanError> {
+        if capacity_rows == 0 || !matches!(split_slices, 1 | 2 | 4) {
+            return Err(OutputPlanError::InvalidRecipe);
+        }
+        Ok(Self { capacity_rows, expected_rows: 1, split_slices })
+    }
+    pub fn expected_rows(self) -> usize { self.expected_rows }
+    pub fn split_slices(self) -> usize { self.split_slices }
+    pub fn validate(self, capacity: usize, expected_rows: usize, split_slices: usize,
+        all_rows: bool) -> Result<(), OutputPlanError> {
+        if capacity >= self.capacity_rows && expected_rows == self.expected_rows
+            && split_slices == self.split_slices && all_rows { Ok(()) }
+        else { Err(OutputPlanError::IncompatibleExport) }
+    }
+}
+
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum OutputPlanError {
+    #[error("invalid dense output reduction recipe")]
+    InvalidRecipe,
+    #[error("dense output export does not honor the immutable reduction plan")]
+    IncompatibleExport,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SparseAttentionBackend { NativeFp32, Bf16Aot }
 
@@ -226,6 +259,20 @@ pub struct CardPlanError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn output_recipe_is_immutable_and_rejects_partial_row_exports() {
+        let plan = OutputReductionPlan::serial(64, 2).unwrap();
+        for _rows in 1..=64 {
+            assert_eq!((plan.expected_rows(), plan.split_slices()), (1, 2));
+            assert!(plan.validate(80, 1, 2, true).is_ok());
+        }
+        assert!(plan.validate(16, 1, 2, true).is_err());
+        assert!(plan.validate(80, 16, 1, true).is_err());
+        assert!(plan.validate(80, 1, 2, false).is_err());
+        assert!(OutputReductionPlan::serial(0, 2).is_err());
+        assert!(OutputReductionPlan::serial(64, 3).is_err());
+    }
 
     #[test]
     fn sparse_recipe_is_immutable_across_decode_verify_widths() {

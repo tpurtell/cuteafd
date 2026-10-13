@@ -24,6 +24,8 @@ struct Variant {
   uint32_t groups;
   uint64_t grouped_output_offset;
   uint32_t plan_sms = 0;
+  uint32_t expected_rows = 0;
+  uint32_t all_rows = 0;
   int device = -1;
   int device_sms = 0;
 };
@@ -101,6 +103,17 @@ extern "C" int32_t cuteafd_v41_fp8_matrix_info(int32_t rows, int32_t k, int32_t 
   if (sms <= 0) return cudaErrorInvalidDevice;
   auto* v = capacity(rows, k, n, 0, sms); if (!v) return cudaErrorInvalidValue;
   *out = v->info; return 0;
+}
+extern "C" int32_t cuteafd_v41_fp8_matrix_reduction_info(int32_t rows, int32_t k, int32_t n,
+    cuteafd_v41_fp8_reduction_info_t* out) {
+  if (!out) return cudaErrorInvalidValue;
+  int device = -1, sms = 0;
+  auto status = cudaGetDevice(&device); if (status) return status;
+  status = cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device); if (status) return status;
+  if (sms <= 0) return cudaErrorInvalidDevice;
+  auto* v = capacity(rows, k, n, 0, sms); if (!v) return cudaErrorInvalidValue;
+  *out = {1, v->info.capacity_rows, v->expected_rows, v->split_slices, v->all_rows};
+  return 0;
 }
 extern "C" int32_t cuteafd_v41_fp8_matrix_initialize(int32_t rows, int32_t k, int32_t n, void** out) {
   if (!out) return cudaErrorInvalidValue; *out = nullptr;

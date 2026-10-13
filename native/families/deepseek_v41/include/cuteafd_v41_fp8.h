@@ -13,6 +13,11 @@ typedef struct {
   uint64_t scratch_bytes, values_offset, row_scales_offset, mma_scales_offset;
   uint64_t packed_weight_scale_bytes;
 } cuteafd_v41_fp8_info_t;
+typedef struct {
+  uint32_t abi_version, capacity_rows, expected_rows, split_slices, all_rows;
+} cuteafd_v41_fp8_reduction_info_t;
+int32_t cuteafd_v41_fp8_matrix_reduction_info(int32_t capacity, int32_t k, int32_t n,
+    cuteafd_v41_fp8_reduction_info_t* out);
 /* Matrix entry points cover engram, shared FFN, dSpark main and attention FP8 shapes.
  * Shapes are explicit (K input, N output); only compiled capacities are admitted. */
 int32_t cuteafd_v41_fp8_matrix_info(int32_t capacity, int32_t k, int32_t n, cuteafd_v41_fp8_info_t* out);

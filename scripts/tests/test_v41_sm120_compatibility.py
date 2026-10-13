@@ -44,9 +44,9 @@ FP8_HEADER = r"""
 #define CUTEAFD_V41_FP8_SMS 188
 static const uint32_t grids[] = {752};
 #define CUTEAFD_V41_FP8_VARIANTS \
- {{1,1,32,32,64,0,16,32,16},{init,load,quant},{init,load,plan170},{init,load,noop},grids,0,1,1,0,170}, \
- {{1,1,32,32,128,0,16,32,16},{init,load,quant},{init,load,plan188},{init,load,noop},grids,64,4,1,0,188}, \
- {{1,1,256,32,64,0,16,32,16},{init,load,grouped_quant},{init,load,noop},{init,load,grouped_quant},grids,0,1,8,0}
+ {{1,1,32,32,64,0,16,32,16},{init,load,quant},{init,load,plan170},{init,load,noop},grids,0,1,1,0,170,1,1}, \
+ {{1,1,32,32,128,0,16,32,16},{init,load,quant},{init,load,plan188},{init,load,noop},grids,64,4,1,0,188,1,1}, \
+ {{1,1,256,32,64,0,16,32,16},{init,load,grouped_quant},{init,load,noop},{init,load,grouped_quant},grids,0,1,8,0,0,1,1}
 #define CUTEAFD_V41_HC_PROJECT_MODULE {init,load,noop}
 """
 
@@ -57,6 +57,17 @@ extern "C" int32_t cuteafd_v41_fp8_grouped_output(const uint16_t*,uint16_t*,int3
 extern "C" int32_t cuteafd_v41_fp8_reduce_splits(const float*,uint16_t*,int32_t,int32_t,int32_t,void*) { return 0; }
 extern "C" int32_t cuteafd_v41_fp8_initialize_storage(void*,uint64_t,float*,void*) { return 0; }
 int main() {
+ static_assert(sizeof(cuteafd_v41_fp8_info_t)==56);
+ static_assert(sizeof(cuteafd_v41_fp8_reduction_info_t)==20);
+ cuteafd_v41_fp8_reduction_info_t recipe{};
+ assert(cuteafd_v41_fp8_matrix_reduction_info(1,32,32,nullptr)==cudaErrorInvalidValue);
+ assert(cuteafd_v41_fp8_matrix_reduction_info(80,32,32,&recipe)==cudaErrorInvalidValue);
+ attribute_error=cudaErrorInvalidDevice;
+ assert(cuteafd_v41_fp8_matrix_reduction_info(1,32,32,&recipe)==cudaErrorInvalidDevice);
+ attribute_error=0;
+ override_sms=-1;
+ assert(cuteafd_v41_fp8_matrix_reduction_info(1,32,32,&recipe)==cudaErrorInvalidDevice);
+ override_sms=0;
  void* h=nullptr;
  minor=1;
  assert(cuteafd_v41_fp8_matrix_initialize(1,32,32,&h)==cudaErrorInvalidDevice && h==nullptr);
@@ -69,6 +80,9 @@ int main() {
    cuteafd_v41_fp8_info_t info;
    assert(cuteafd_v41_fp8_matrix_info(1,k,32,&info)==0);
    assert(info.scratch_bytes==(k==32 && dev==5 ? 128 : 64));
+   assert(cuteafd_v41_fp8_matrix_reduction_info(1,k,32,&recipe)==0);
+   assert(recipe.abi_version==1 && recipe.capacity_rows==1 && recipe.expected_rows==1);
+   assert(recipe.split_slices==(k==32 && dev==5 ? 4u : 1u) && recipe.all_rows==1);
    assert(cuteafd_v41_fp8_launch(h,reinterpret_cast<uint16_t*>(0x10000),
      reinterpret_cast<uint8_t*>(0x20000),reinterpret_cast<uint8_t*>(0x30000),
      reinterpret_cast<void*>(0x40000),info.scratch_bytes,reinterpret_cast<float*>(0x50000),

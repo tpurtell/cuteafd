@@ -89,7 +89,7 @@ def dispatch_header(output: Path, manifest: dict) -> None:
                                            variant[kind + '_abi']['symbol'])) + '}')
         if groups == 1:
             modules.append('{nullptr,nullptr,nullptr}')
-        variants.append('{{' + ','.join(map(str, info)) + '},' + ','.join(modules) + ',' + label + '_grids,' + str(variant['split_k_offset']) + ',' + str(variant['split_k_slices']) + ',' + str(groups) + ',' + str(variant.get('grouped_output_offset', 0)) + ',' + str(variant.get('plan_sms', 0)) + '}')
+        variants.append('{{' + ','.join(map(str, info)) + '},' + ','.join(modules) + ',' + label + '_grids,' + str(variant['split_k_offset']) + ',' + str(variant['split_k_slices']) + ',' + str(groups) + ',' + str(variant.get('grouped_output_offset', 0)) + ',' + str(variant.get('plan_sms', 0)) + ',' + str(variant.get('expected_m', capacity)) + ',' + str(int(capacity == 1 or variant.get('split_k_all_m', False))) + '}')
     lines.append('#define CUTEAFD_V41_FP8_VARIANTS ' + ','.join(variants))
     (output / 'v41_fp8_variants.h').write_text('\n'.join(lines) + '\n')
 
@@ -127,6 +127,10 @@ def export(output: Path, rows: tuple[int, ...], projections=PROJECTIONS) -> None
                     from b12x._lib.dense_gemm import v41_fp8_aot_expected_m
                     expected_m = v41_fp8_aot_expected_m(capacity=capacity, input_dim=k, output_dim=n,
                         sm_count=plan_sms, num_groups=groups)
+                fixed_output = name in ("o_b", "o_b_tp2") and capacity <= 80
+                if fixed_output:
+                    expected_m = 1
+                all_m = fixed_output and capacity > 1
                 quant = (compile_wo_grouped_quant_aot(groups=groups, group_width=k // groups)
                          if groups > 1 else compile_mxfp8_rows_quant_aot(
                              size_k=k, scale_block_size=32, expected_m=expected_m, amax_floor=1e-4))
@@ -136,7 +140,8 @@ def export(output: Path, rows: tuple[int, ...], projections=PROJECTIONS) -> None
                     rope_quant.export_to_c(str(output), label + '_quant_rope', 'cuteafd_' + label + '_quant_rope')
                 gemm, split_k = compile_dense_gemm_mxfp8_aot(size_m=capacity, size_n=n // groups, size_k=k // groups, num_groups=groups,
                                                   expected_m=expected_m, sfb_k_replicated=False, device=device,
-                                                  return_split_k_metadata=True, sm_count=plan_sms)
+                                                  return_split_k_metadata=True, sm_count=plan_sms,
+                                                  **({"split_k_all_m": True} if all_m else {}))
                 gemm.export_to_c(str(output), label + '_gemm', 'cuteafd_' + label + '_gemm')
                 layout = _block_fp8_linear_scratch_layout(tokens=capacity, in_features=k,
                                                         out_features=n, output_dtype=torch.bfloat16)
@@ -156,7 +161,7 @@ def export(output: Path, rows: tuple[int, ...], projections=PROJECTIONS) -> None
                                         activation_scratch_bytes=output_offset,
                                         scratch_bytes=output_offset + capacity * n * 2,
                                         activation_mma_scale_shape=[32, 4, (capacity + 127) // 128, 4, k // groups // 128, groups])
-                manifest['variants'].append({'capacity': capacity, 'plan_sms': plan_sms if dual else 0, 'expected_m': expected_m, 'label': label, 'input_dim': k, 'output_dim': n,
+                manifest['variants'].append({'capacity': capacity, 'plan_sms': plan_sms if dual else 0, 'expected_m': expected_m, 'split_k_all_m': all_m, 'label': label, 'input_dim': k, 'output_dim': n,
                     'activation_scratch_bytes': layout.nbytes,
                     'scratch_bytes': split_offset + split_bytes if split_k > 1 else layout.nbytes,
                     'split_k_offset': split_offset, 'split_k_bytes': split_bytes,

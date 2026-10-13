@@ -19,6 +19,17 @@ pub struct V41Fp8Info {
 }
 const _: [(); 56] = [(); std::mem::size_of::<V41Fp8Info>()];
 
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub(super) struct OutputReductionInfo {
+    pub abi_version: u32,
+    pub capacity_rows: u32,
+    pub expected_rows: u32,
+    pub split_slices: u32,
+    pub all_rows: u32,
+}
+const _: [(); 20] = [(); std::mem::size_of::<OutputReductionInfo>()];
+
 type InfoFn = unsafe extern "C" fn(i32, i32, i32, *mut V41Fp8Info) -> i32;
 type InitFn = unsafe extern "C" fn(i32, i32, i32, *mut *mut c_void) -> i32;
 type ScratchFn = unsafe extern "C" fn(*mut c_void, *mut c_void, u64, *mut f32, *mut c_void) -> i32;
@@ -45,6 +56,19 @@ pub struct V41Fp8Kernel<'a> {
     launch: LaunchFn,
 }
 impl NativeLibrary {
+    pub(super) fn v41_output_reduction_info(&self, capacity: u32, k: u32, n: u32)
+        -> Result<OutputReductionInfo> {
+        type ReductionFn = unsafe extern "C" fn(i32, i32, i32, *mut OutputReductionInfo) -> i32;
+        let mut info = OutputReductionInfo::default();
+        // SAFETY: the loaded library owns the symbol; out is a writable ABI value.
+        let status = unsafe {
+            let function: ReductionFn = *self.lib.get(b"cuteafd_v41_fp8_matrix_reduction_info")?;
+            function(i32::try_from(capacity)?, i32::try_from(k)?, i32::try_from(n)?, &mut info)
+        };
+        ensure!(status == 0 && info.abi_version == 1 && info.capacity_rows == capacity
+            && info.all_rows <= 1, "unsupported native output reduction ABI/recipe");
+        Ok(info)
+    }
     pub fn v41_fp8_info(&self, capacity: u32) -> Result<V41Fp8Info> {
         self.v41_fp8_matrix_info(capacity, 6144, 25600)
     }
