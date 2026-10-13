@@ -76,6 +76,10 @@ pub(crate) trait RtxExpertLayer {
     /// Exact device bytes of the execution workspace (scratch and the routed
     /// output) for up to `rows` rows; feeds `ExpertCost`.
     fn workspace_bytes(&self) -> usize;
+    /// Route grouping of the selected live-row package; zero queries the compiled maximum.
+    fn group_rows(&self, _rows: usize) -> Result<usize> {
+        anyhow::bail!("expert backend does not publish installed grouping metadata")
+    }
     /// This rank's routed partial `[rows, hidden]` of [`Self::partial`],
     /// valid after the last [`Self::enqueue`] completes on its stream and
     /// until the next one.

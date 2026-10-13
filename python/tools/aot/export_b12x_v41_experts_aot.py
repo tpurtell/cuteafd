@@ -16,6 +16,7 @@ import re
 from pathlib import Path
 
 import _pinned_sparkinfer
+from expert_grouping import native_group_macros
 
 
 POINTER_SLOTS = (
@@ -205,6 +206,7 @@ def write_native_bridge(output_dir: Path, manifest: dict) -> None:
         f"#define CUTEAFD_V41_CC_MINOR {manifest['capability'][1]}",
         f"#define CUTEAFD_V41_SMS {48 if manifest['capability'][1] == 1 else 188}",
         "#define CUTEAFD_V41_VARIANTS " + ", ".join(entries),
+        *native_group_macros(manifest["variants"]),
     ]
     (output_dir / "v41_expert_variants.h").write_text("\n".join(lines) + "\n")
 
@@ -386,6 +388,7 @@ def export(output_dir: Path, role: str, rows: tuple[int, ...], input_format: str
                 "capacity_rows": capacity,
                 "max_rows": plan.max_rows,
                 "route_mode": config.dynamic_route_mode,
+                "group_rows": 1 if direct_routing else core.dynamic_tile_m,
                 "output_splits": 5 if direct_routing else 1,
                 "max_active_clusters": clusters,
                 "physical_tiles": core.dynamic_physical_tiles,

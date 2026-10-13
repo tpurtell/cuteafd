@@ -70,6 +70,9 @@ int32_t cuteafd_v41_expert_input_quantize_async(void* kernel,
  * Initialize before graph capture; each variant binds to its first CUDA device.
  * Kernel handles borrow the library and must outlive every launch/graph replay.
  * Callers own CUDA buffers, capacity, initialization and stream ordering. */
+/* Additive metadata query: rows=0 gives the compiled grouped tile; positive
+ * rows select the actual compact/hybrid path. No GPU initialization is needed. */
+int32_t cuteafd_v41_expert_group_rows(int32_t capacity, int32_t rows, uint32_t* out);
 int32_t cuteafd_v41_expert_info(int32_t capacity, cuteafd_expert_info_t* out);
 int32_t cuteafd_v41_expert_initialize(int32_t capacity, void** out_kernel);
 int32_t cuteafd_v41_expert_launch(void* kernel, const cuteafd_expert_launch_t* args);
@@ -88,6 +91,7 @@ int32_t cuteafd_v41_expert_initialize_scratch_async(void* kernel, void* storage,
  * 7: TP6 384). All are unpadded (kernel_intermediate == logical_intermediate).
  * Artifacts are pre-compiled per capacity; there is no runtime compilation path. */
 int32_t cuteafd_v41_spark_tp2_expert_info(int32_t capacity, cuteafd_expert_info_t* out);
+int32_t cuteafd_v41_spark_tp2_expert_group_rows(int32_t capacity, int32_t rows, uint32_t* out);
 int32_t cuteafd_v41_spark_tp2_expert_initialize(int32_t capacity, void** out_kernel);
 int32_t cuteafd_v41_spark_tp2_expert_launch(void* kernel, const cuteafd_expert_launch_t* args);
 int32_t cuteafd_v41_spark_tp2_expert_bind_scratch(void* kernel, void* storage,
@@ -96,6 +100,7 @@ int32_t cuteafd_v41_spark_tp2_expert_initialize_scratch_async(void* kernel, void
     uint64_t bytes, void* stream);
 int32_t cuteafd_v41_spark_tp2_expert_output_kind(int32_t capacity, uint32_t* out);
 int32_t cuteafd_v41_spark_tp3_expert_info(int32_t capacity, cuteafd_expert_info_t* out);
+int32_t cuteafd_v41_spark_tp3_expert_group_rows(int32_t capacity, int32_t rows, uint32_t* out);
 int32_t cuteafd_v41_spark_tp3_expert_initialize(int32_t capacity, void** out_kernel);
 int32_t cuteafd_v41_spark_tp3_expert_launch(void* kernel, const cuteafd_expert_launch_t* args);
 int32_t cuteafd_v41_spark_tp3_expert_bind_scratch(void* kernel, void* storage,
@@ -104,6 +109,7 @@ int32_t cuteafd_v41_spark_tp3_expert_initialize_scratch_async(void* kernel, void
     uint64_t bytes, void* stream);
 int32_t cuteafd_v41_spark_tp3_expert_output_kind(int32_t capacity, uint32_t* out);
 int32_t cuteafd_v41_spark_tp6_expert_info(int32_t capacity, cuteafd_expert_info_t* out);
+int32_t cuteafd_v41_spark_tp6_expert_group_rows(int32_t capacity, int32_t rows, uint32_t* out);
 int32_t cuteafd_v41_spark_tp6_expert_initialize(int32_t capacity, void** out_kernel);
 int32_t cuteafd_v41_spark_tp6_expert_launch(void* kernel, const cuteafd_expert_launch_t* args);
 int32_t cuteafd_v41_spark_tp6_expert_bind_scratch(void* kernel, void* storage,

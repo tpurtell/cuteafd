@@ -338,6 +338,24 @@ impl<'a> LocalExperts<'a> {
         }))
     }
 
+    pub fn group_rows(&self, rows: usize) -> Result<usize> {
+        match &self.backend {
+            Backend::Native { states, .. } => {
+                if rows == 0 {
+                    return Ok(states.last().context("no installed local expert capacity")?.kernel.group_rows());
+                }
+                states.iter().find(|s| s.kernel.info().capacity_rows as usize >= rows)
+                    .context("no local expert capacity for this many rows")?.kernel.group_rows_for(rows)
+            }
+            Backend::Exl3 { executions, row_policy, .. } => {
+                let selected = if rows == 0 { executions.last() } else {
+                    executions.iter().find(|e| e.capacity() >= row_policy.required_capacity(rows))
+                };
+                Ok(selected.context("no local EXL3 capacity for this many rows")?.group_rows())
+            }
+        }
+    }
+
     pub fn layers(&self) -> usize {
         match &self.backend {
             Backend::Native { layers, .. } => layers.len(),

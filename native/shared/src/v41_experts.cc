@@ -4,6 +4,7 @@
 // before including this file; a bare build is the V4.1 Spark TP4 shard.
 #ifndef cuteafd_expert_info
 #define cuteafd_expert_info cuteafd_v41_expert_info
+#define cuteafd_expert_group_rows cuteafd_v41_expert_group_rows
 #define cuteafd_expert_initialize cuteafd_v41_expert_initialize
 #define cuteafd_expert_output_kind cuteafd_v41_expert_output_kind
 #define cuteafd_expert_bind_scratch cuteafd_v41_expert_bind_scratch
@@ -44,6 +45,9 @@
 #endif
 #ifndef CUTEAFD_V41_OUTPUT_KIND
 #define CUTEAFD_V41_OUTPUT_KIND(capacity) 0
+#endif
+#ifndef CUTEAFD_V41_GROUP_ROWS
+#define CUTEAFD_V41_GROUP_ROWS(capacity, rows) 0u
 #endif
 #if defined(CUTEAFD_V41_TP2_EXPERTS) && !defined(CUTEAFD_EXPERT_PER_DEVICE_HANDLES)
 #define CUTEAFD_EXPERT_PER_DEVICE_HANDLES 1
@@ -153,6 +157,19 @@ extern "C" int32_t cuteafd_expert_info(int32_t capacity, cuteafd_expert_info_t* 
   if (!variant || !out) return cudaErrorInvalidValue;
   *out = variant->info;
   return cudaSuccess;
+}
+
+// Metadata-only: no device query or kernel initialization is required.
+extern "C" int32_t cuteafd_expert_group_rows(int32_t capacity, int32_t rows, uint32_t* out) {
+  if (!out || rows < 0 || rows > capacity) return cudaErrorInvalidValue;
+  for (const auto& variant : variants) {
+    if (variant.info.capacity_rows != static_cast<uint32_t>(capacity)) continue;
+    const uint32_t group = CUTEAFD_V41_GROUP_ROWS(capacity, rows);
+    if (!group) return cudaErrorInvalidValue;
+    *out = group;
+    return cudaSuccess;
+  }
+  return cudaErrorInvalidValue;
 }
 
 extern "C" int32_t cuteafd_expert_output_kind(int32_t capacity, uint32_t* out) {

@@ -161,6 +161,8 @@ impl V41ExpertLaunchArgs {
     }
 }
 
+type GroupRowsFn = unsafe extern "C" fn(i32, i32, *mut u32) -> i32;
+
 type InfoFn = unsafe extern "C" fn(i32, *mut V41ExpertInfo) -> i32;
 type InitializeFn = unsafe extern "C" fn(i32, *mut *mut c_void) -> i32;
 type LaunchFn = unsafe extern "C" fn(*mut c_void, *const V41ExpertLaunchArgs) -> i32;
@@ -517,6 +519,8 @@ pub struct V41ExpertKernel<'a> {
     initialize_scratch: InitScratchFn,
     info: V41ExpertInfo,
     output_kind: V41ExpertOutputKind,
+    group_rows: usize,
+    query_group_rows: GroupRowsFn,
 }
 
 impl NativeLibrary {
@@ -836,6 +840,9 @@ impl NativeLibrary {
         };
         let prefix = String::from_utf8(family_symbol(prefix.as_bytes())?)?;
         let symbol = |operation: &str| format!("{prefix}_expert_{operation}").into_bytes();
+        // SAFETY: this additive entry point writes one u32 and loads no CUDA state.
+        let query_group_rows = unsafe { *self.lib.get::<GroupRowsFn>(&symbol("group_rows"))? };
+        let group_rows = query_expert_group_rows(query_group_rows, capacity, 0)?;
         let initialize = unsafe {
             self.lib
                 .get::<InitializeFn>(&symbol("initialize"))?
@@ -881,11 +888,32 @@ impl NativeLibrary {
             initialize_scratch,
             info,
             output_kind,
+            group_rows,
+            query_group_rows,
         })
     }
 }
 
+fn query_expert_group_rows(query: GroupRowsFn, capacity: u32, rows: usize) -> Result<usize> {
+    let mut group = 0;
+    // SAFETY: the query borrows the loaded library and writes one host u32.
+    let status = unsafe { query(i32::try_from(capacity)?, i32::try_from(rows)?, &mut group) };
+    ensure!(status == 0 && matches!(group, 1 | 8 | 16 | 32 | 64 | 128),
+        "native expert grouping metadata unavailable for capacity {capacity}, rows {rows}: status {status}, group {group}");
+    Ok(group as usize)
+}
+
 impl V41ExpertKernel<'_> {
+    /// Compiled grouped tile; use `group_rows_for` for a hybrid's live path.
+    pub fn group_rows(&self) -> usize { self.group_rows }
+
+    /// Zero queries the compiled tile; positive rows follow a hybrid's cutoff.
+    pub fn group_rows_for(&self, rows: usize) -> Result<usize> {
+        ensure!(rows <= self.info.capacity_rows as usize,
+            "invalid native expert grouping row count {rows}");
+        query_expert_group_rows(self.query_group_rows, self.info.capacity_rows, rows)
+    }
+
     pub fn accumulates_tokens(&self) -> bool { self.output_kind == V41ExpertOutputKind::Fp32Tokens }
 
     pub fn output_kind(&self) -> V41ExpertOutputKind { self.output_kind }
@@ -954,6 +982,21 @@ impl V41ExpertKernel<'_> {
 mod tests {
     use super::*;
     const V41: cuteafd_core::ExpertGeometry = cuteafd_core::ExpertGeometry::DEEPSEEK_V41;
+
+    unsafe extern "C" fn stub_group_rows(capacity: i32, rows: i32, out: *mut u32) -> i32 {
+        if capacity != 80 || rows < 0 || rows > capacity { return 1; }
+        // SAFETY: the query helper always supplies a valid host u32 output.
+        unsafe { *out = if rows > 0 && rows <= 8 { 1 } else { 16 }; }
+        0
+    }
+    #[test]
+    fn group_query_preserves_compiled_tile_and_hybrid_selection() {
+        for (rows, group) in [(0,16),(1,1),(8,1),(9,16),(80,16)] {
+            assert_eq!(query_expert_group_rows(stub_group_rows,80,rows).unwrap(),group);
+        }
+        assert!(query_expert_group_rows(stub_group_rows,80,81).is_err());
+        assert!(query_expert_group_rows(stub_group_rows,16,0).is_err());
+    }
 
     #[test]
     fn output_kind_preserves_route_axis_and_dtype() {

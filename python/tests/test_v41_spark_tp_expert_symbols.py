@@ -37,6 +37,7 @@ inline int cudaDeviceGetAttribute(int* value, int attribute, int) {
 # Placeholders avoid brace escaping so the C aggregate stays literal.
 VARIANT = """
 #pragma once
+#define CUTEAFD_V41_GROUP_ROWS(capacity, rows) 16u
 #define CUTEAFD_V41_CC_MINOR 1
 #define CUTEAFD_V41_SMS 188
 static int launches = 0;
@@ -96,6 +97,9 @@ int main() {{
         cuteafd_v41_spark_tp2_expert_launch, 5, 1152);
   check(cuteafd_v41_spark_tp3_expert_info, cuteafd_v41_spark_tp3_expert_initialize,
         cuteafd_v41_spark_tp3_expert_launch, 6, 768);
+  uint32_t group=0;
+  assert(cuteafd_v41_spark_tp2_expert_group_rows(16,0,&group)==0 && group==16);
+  assert(cuteafd_v41_spark_tp3_expert_group_rows(16,16,&group)==0 && group==16);
   // The two families must be distinct symbols with distinct role ids.
   cuteafd_expert_info_t tp2{{}}, tp3{{}};
   assert(cuteafd_v41_spark_tp2_expert_info(16, &tp2) == 0);

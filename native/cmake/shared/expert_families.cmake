@@ -38,7 +38,7 @@ set(CUTEAFD_EXPERT_FAMILY_ROWS 1 16 80 256 1024 4096)
 # keeps the narrow decode tile.
 set(CUTEAFD_EXPERT_FAMILY_WIDTH "1:64,16:128,80:128,256:128,1024:128,4096:128" CACHE STRING
   "Slice width map for non-V4.1 expert families")
-set(expert_ops info initialize output_kind bind_scratch initialize_scratch_async launch)
+set(expert_ops info initialize output_kind group_rows bind_scratch initialize_scratch_async launch)
 
 foreach(entry IN LISTS CUTEAFD_NATIVE_EXPERT_FAMILIES)
   if(NOT entry MATCHES "^(dsv4f|dsv4p):(spark|spark_tp2|rtx_backbone|rtx_tp2)$")
@@ -104,6 +104,7 @@ ${device_handles}${renames}#include \"${CMAKE_CURRENT_SOURCE_DIR}/shared/src/v41
       "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/aot/export_b12x_slices_aot.py"
       "${CMAKE_CURRENT_SOURCE_DIR}/shared/src/v41_experts.cc"
       "${stamp}"
+      "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/lib/expert_grouping.py"
       ${CUTEAFD_SPARKINFER_PROVENANCE_INPUTS} ${CUTEAFD_SPARKINFER_EXPORT_INPUTS}
     COMMENT "Exporting ${family} ${role} routed-expert kernels"
     VERBATIM

@@ -106,6 +106,7 @@ foreach(tp IN LISTS CUTEAFD_V41_SPARK_TP_SELECTED)
       "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/aot/export_b12x_v41_experts_aot.py"
       "${CMAKE_CURRENT_SOURCE_DIR}/${wrapper_src}"
       "${width_stamp}"
+      "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/lib/expert_grouping.py"
       ${CUTEAFD_SPARKINFER_PROVENANCE_INPUTS} ${CUTEAFD_SPARKINFER_EXPORT_INPUTS}
     COMMENT "Exporting ${role} replicated-group Spark expert kernels"
     VERBATIM
