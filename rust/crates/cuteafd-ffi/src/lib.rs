@@ -22,7 +22,7 @@ pub use families::deepseek_v41::v41_fp8_plan::{V41Fp8Plan, V41Fp8PlanInfo};
 pub use shared::v41_exl3::{exl3_shard_widths, V41Exl3Info, V41Exl3Kernel, V41Exl3Layout, V41Exl3Routes};
 pub use shared::v41_exl3_wire::V41Exl3Wire;
 pub use shared::v41_experts::{
-    V41ExpertInfo, V41ExpertInputQuantizer, V41ExpertKernel, V41ExpertLaunchArgs, V41ExpertPacker, V41ExpertPointer, V41ExpertOutputKind,
+    V41ExpertReduction, V41ExpertInfo, V41ExpertInputQuantizer, V41ExpertKernel, V41ExpertLaunchArgs, V41ExpertPacker, V41ExpertPointer, V41ExpertOutputKind,
     V41CompactReducer, V41LocalExpertReducer, V41Tp2ExpertReducer, V41RouteReducer, V41_EXPERT_POINTER_COUNT,
     v41_pack_intermediate_supported, v41_rank_count_supported,
 };

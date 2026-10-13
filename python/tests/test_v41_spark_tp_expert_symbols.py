@@ -46,6 +46,7 @@ static void launch(void** args, int count) {
   ++launches;
   *static_cast<int*>(args[52]) = count == 53 ? 0 : 1;
 }
+#define CUTEAFD_EXPERT_REDUCTION_CASES case 16: *out = {1,64,2,__PLANES__,1,1,32,128,128}; return 0;
 #define CUTEAFD_V41_VARIANTS {{2,__ROLE__,384,5120,__LOGICAL__,__KERNEL__,6,16,4096,32,32,64,64,188,7},initialize,load,launch,{0}}
 """
 
@@ -55,6 +56,7 @@ def _variant(role: int, logical: int, kernel: int) -> str:
         VARIANT.replace("__ROLE__", str(role))
         .replace("__LOGICAL__", str(logical))
         .replace("__KERNEL__", str(kernel))
+        .replace("__PLANES__", str(logical // 64))
     )
 
 PROGRAM = """
@@ -96,6 +98,14 @@ int main() {{
         cuteafd_v41_spark_tp2_expert_launch, 5, 1152);
   check(cuteafd_v41_spark_tp3_expert_info, cuteafd_v41_spark_tp3_expert_initialize,
         cuteafd_v41_spark_tp3_expert_launch, 6, 768);
+  cuteafd_expert_reduction_t r2{{}}, r3{{}};
+  assert(cuteafd_v41_spark_tp2_expert_info_reduction(16, &r2) == 0);
+  assert(cuteafd_v41_spark_tp3_expert_info_reduction(16, &r3) == 0);
+  assert(r2.version == 1 && r2.slice_width == 64 && r2.fc2_k_steps == 2);
+  assert(r2.plane_count == 18 && r3.plane_count == 12);
+  assert(r2.plane_fold == 1 && r2.implementation == 1);
+  assert(cuteafd_v41_spark_tp2_expert_info_reduction(80, &r2) != 0);
+  assert(cuteafd_v41_spark_tp3_expert_info_reduction(16, nullptr) != 0);
   // The two families must be distinct symbols with distinct role ids.
   cuteafd_expert_info_t tp2{{}}, tp3{{}};
   assert(cuteafd_v41_spark_tp2_expert_info(16, &tp2) == 0);

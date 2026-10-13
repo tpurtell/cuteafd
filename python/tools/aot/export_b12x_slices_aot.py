@@ -86,6 +86,24 @@ def role_geometry(family, role):
     return shape["experts"], intermediate, (intermediate + 127) // 128 * 128, shape["topk"]
 
 
+def numerical_recipe(width: int, intermediate: int, *, atomic: bool, compact: bool) -> dict:
+    """Pinned slice products and fold order, independent of launch capacity."""
+    if width not in (64, 128, 192) or intermediate <= 0 or intermediate % 32:
+        raise ValueError("unsupported native slice reduction geometry")
+    return dict(
+        schema=1,
+        slice_width=width,
+        fc1_mma_mnk=[16, 8, 32],
+        fc1_k_stage=128,
+        fc2_k_steps=width // 32,
+        block_threads=128,
+        plane_count=(intermediate + width - 1) // width,
+        plane_fold="atomic_tokens" if atomic else "ascending_fp32",
+        implementation="hybrid" if compact else "slices",
+        output_kind="fp32_tokens" if atomic else "fp32_routes",
+    )
+
+
 def export(output, capacities, width, atomic_min_capacity=None, role="spark", *, standard_names=False, compact_max_capacity=None, compact_live_rows=None, family="v41"):
     import torch
     import cutlass
@@ -149,7 +167,7 @@ def export(output, capacities, width, atomic_min_capacity=None, role="spark", *,
                       kernel_intermediate=kernel_intermediate, topk=topk),
         variants=[],
     )
-    includes, entries = [], []
+    includes, entries, reductions = [], [], []
     for capacity in capacities:
         compact = compact_max_capacity is not None and capacity <= compact_max_capacity
         atomic = not compact and atomic_min_capacity is not None and capacity >= atomic_min_capacity
@@ -160,7 +178,7 @@ def export(output, capacities, width, atomic_min_capacity=None, role="spark", *,
         # identity contract (pinned kernel constants + this variant's compiled
         # width). It is keyed on static capacity and model geometry only: no live
         # row, token, group or expert count enters the export, the compile key,
-        # or this audit block. Other roles keep their existing manifest exactly.
+        # or this audit block. Other roles omit this TP3-specific identity.
         recorded_geometry = (
             launch_geometry(
                 capacity,
@@ -348,12 +366,18 @@ def export(output, capacities, width, atomic_min_capacity=None, role="spark", *,
             + ",".join("UINT64_MAX" if x is None else str(x) for x in offsets)
             + "}}"
         )
+        recipe = numerical_recipe(selected_width, intermediate, atomic=atomic, compact=compact)
+        reductions.append(
+            f"case {capacity}: *out = {{1,{selected_width},{recipe['fc2_k_steps']},"
+            f"{planes},{2 if atomic else 1},{2 if compact else 1},32,128,128}}; return 0;")
         manifest["variants"].append(
             dict(
                 name=label,
                 implementation="hybrid" if compact else "slices",
                 compact_live_rows=min(capacity, compact_live_rows) if compact else None,
                 width=selected_width,
+                numerical_recipe=numerical_recipe(selected_width, intermediate,
+                                                  atomic=atomic, compact=compact),
                 output_kind="fp32_tokens" if atomic else "fp32_routes",
                 native_abi_version=3 if atomic else 2,
                 capacity_rows=capacity,
@@ -373,6 +397,7 @@ def export(output, capacities, width, atomic_min_capacity=None, role="spark", *,
                 f"#define CUTEAFD_V41_CC_MINOR {props.minor}",
                 f"#define CUTEAFD_V41_SMS {workspace_sms}",
                 "#define CUTEAFD_V41_VARIANTS " + ",".join(entries),
+                "#define CUTEAFD_EXPERT_REDUCTION_CASES " + " ".join(reductions),
                 "#define CUTEAFD_V41_OUTPUT_KIND(capacity) (" +
                 (" || ".join(f"((capacity)=={v['capacity_rows']})" for v in manifest['variants']
                              if v['output_kind'] == 'fp32_tokens') or "0") + " ? 1u : 0u)",

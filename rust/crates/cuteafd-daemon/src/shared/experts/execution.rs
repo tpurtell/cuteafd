@@ -19,6 +19,31 @@ fn compact_output_role(role: u32) -> bool {
     matches!(role, 1 | 5 | 6 | 7)
 }
 
+/// Admit the exact states owned by this wave before allocating their scratch.
+/// RTX/NVFP4 and other families retain their existing dispatch contracts.
+fn native_reduction_plan(layer: ExpertLayer, library: &NativeLibrary, capacity: u32,
+    nvfp4: bool) -> Result<Option<super::ExpertReductionPlan>> {
+    if nvfp4 || !compact_output_role(layer.role())
+        || cuteafd_core::expert_geometry().family() != Some("v41") {
+        return Ok(None);
+    }
+    let mut capacities = vec![capacity]; // execution_state index 0: main
+    if capacity > 1 { capacities.push(1); } // index 1: serial
+    if capacity > 80 { capacities.push(80); } // index 2: grouped decode
+    let variants = capacities.into_iter().map(|rows| {
+        let info = layer.select_info(library, rows, false)?;
+        let recipe = library.v41_spark_expert_reduction(&info)?;
+        if rows <= 80 {
+            ensure!(recipe.plane_fold == 1 && recipe.implementation == 1,
+                "native Spark decode requires ordered FP32 slice planes, not atomic/hybrid arithmetic");
+        }
+        Ok((rows as usize, recipe))
+    }).collect::<Result<Vec<_>>>()?;
+    let plan = super::ExpertReductionPlan::new(&variants)
+        .context("native MXFP4 Spark decode differs from canonical m1 slice/fold recipe")?;
+    Ok(Some(plan))
+}
+
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ExpertExecutionBudget {
     pub scratch_bytes: usize,
@@ -64,6 +89,7 @@ pub(crate) struct ExpertExecution<'weights, 'library> {
     pub(crate) kernel: V41ExpertKernel<'library>,
     decode: Option<DecodeExecution<'library>>,
     small: Option<DecodeExecution<'library>>,
+    reduction_plan: Option<super::ExpertReductionPlan>,
     reducer: V41RouteReducer<'library>,
     timing: Option<ExpertTiming<'library>>,
     worker_timing: Option<timing::WorkerTiming<'library>>,
@@ -98,6 +124,7 @@ impl<'library> ExpertWeights<'library> {
         capacity: u32,
         nvfp4: bool,
     ) -> Result<ExpertExecutionBudget> {
+        let _ = native_reduction_plan(layer, library, capacity, nvfp4)?;
         let info = layer.select_info(library, capacity, nvfp4)?;
         let hidden = (capacity as usize)
             .checked_mul(info.input_row_bytes()?)
@@ -130,6 +157,7 @@ impl<'library> ExpertWeights<'library> {
         available_device_bytes: usize,
     ) -> Result<ExpertExecution<'_, 'library>> {
         let library = self.buffers[0].library;
+        let reduction_plan = native_reduction_plan(self.layer, library, capacity, self.is_nvfp4())?;
         let budget = self.execution_budget(capacity)?;
         ensure!(
             budget.total()? <= available_device_bytes,
@@ -239,6 +267,7 @@ impl<'library> ExpertWeights<'library> {
             kernel,
             decode,
             small,
+            reduction_plan,
             reducer,
             timing,
             worker_timing: None,
@@ -333,7 +362,7 @@ impl<'weights, 'library> ExpertExecution<'weights, 'library> {
             rows > 0 && rows <= self.kernel.info().capacity_rows,
             "invalid expert output row count"
         );
-        let (kernel, slots, scratch) = self.execution_state(rows);
+        let (kernel, slots, scratch) = self.execution_state(rows)?;
         ensure!(kernel.output_kind() == cuteafd_ffi::V41ExpertOutputKind::Fp32Routes,
             "expert output is not FP32 route planes");
         Ok(CuteafdDeviceBuffer {
@@ -346,22 +375,37 @@ impl<'weights, 'library> ExpertExecution<'weights, 'library> {
     fn execution_state(
         &self,
         rows: u32,
-    ) -> (
+    ) -> Result<(
         &V41ExpertKernel<'library>,
         &[*mut c_void; 44],
         &DeviceAllocation<'library>,
-    ) {
+    )> {
+        if let Some(plan) = &self.reduction_plan {
+            let capacities = [Some(self.kernel.info().capacity_rows),
+                self.decode.as_ref().map(|s| s.kernel.info().capacity_rows),
+                self.small.as_ref().map(|s| s.kernel.info().capacity_rows)];
+            let index = plan.execution_index(rows as usize, rows as usize,
+                capacities.into_iter().flatten().map(|c| c as usize))?;
+            return match index {
+                0 => Ok((&self.kernel, &self.slots, &self.scratch)),
+                1 => self.decode.as_ref().map(|s| (&s.kernel, &s.slots, &s.scratch))
+                    .context("admitted native expert decode state missing"),
+                2 => self.small.as_ref().map(|s| (&s.kernel, &s.slots, &s.scratch))
+                    .context("admitted native expert grouped state missing"),
+                _ => anyhow::bail!("invalid fixed native expert state index"),
+            };
+        }
         if rows == 1 {
             if let Some(decode) = &self.decode {
-                return (&decode.kernel, &decode.slots, &decode.scratch);
+                return Ok((&decode.kernel, &decode.slots, &decode.scratch));
             }
         }
         if let Some(small) = &self.small {
             if rows <= small.kernel.info().capacity_rows {
-                return (&small.kernel, &small.slots, &small.scratch);
+                return Ok((&small.kernel, &small.slots, &small.scratch));
             }
         }
-        (&self.kernel, &self.slots, &self.scratch)
+        Ok((&self.kernel, &self.slots, &self.scratch))
     }
 
     pub fn synchronize(&self) -> Result<()> {
@@ -387,7 +431,7 @@ impl<'weights, 'library> ExpertExecution<'weights, 'library> {
             !include_shared || self.shared.is_some(),
             "shared output belongs on coordinator RTX"
         );
-        let (kernel, slots, _) = self.execution_state(rows);
+        let (kernel, slots, _) = self.execution_state(rows)?;
         let args = V41ExpertLaunchArgs::new(kernel.info(), *slots, rows, stream)?;
         unsafe {
             kernel.launch(&args)?;
@@ -675,7 +719,7 @@ impl ExpertExecution<'_, '_> {
             .buffer);
         unsafe {
             let reducer = self.compact_reducer.as_ref().context("missing compact reducer")?;
-            let (kernel, slots, _) = self.execution_state(request.rows());
+            let (kernel, slots, _) = self.execution_state(request.rows())?;
             match kernel.output_kind() {
                 cuteafd_ffi::V41ExpertOutputKind::Fp32Tokens =>
                     reducer.compact_tokens(slots[41].cast(), output.ptr.cast(), request.rows(), self.stream.raw)?,
@@ -732,7 +776,7 @@ impl ExpertExecution<'_, '_> {
                 self._weights.budget().resident_bytes / histogram.len() * active_experts;
             tracing::debug!(target: "cuteafd::expert_timing",
                 layer, executor_id, rows=request.rows(), active_experts, direct_registered_output=destination.is_some(),
-                kernel_capacity=self.execution_state(request.rows()).0.info().capacity_rows,
+                kernel_capacity=self.execution_state(request.rows())?.0.info().capacity_rows,
                 max_expert_rows=histogram.iter().copied().max().unwrap_or(0),
                 ?expert_rows_histogram, expert_rows_tail_routes,
                 unique_expert_weight_bytes, output_bytes=bytes,

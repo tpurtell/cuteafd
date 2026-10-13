@@ -102,6 +102,39 @@ pub struct V41ExpertInfo {
     pub input_dtype: u32,
 }
 
+/// Additive compiled slice/fold attestation; never infer it from live rows.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct V41ExpertReduction {
+    pub version: u32,
+    pub slice_width: u32,
+    pub fc2_k_steps: u32,
+    pub plane_count: u32,
+    pub plane_fold: u32,
+    pub implementation: u32,
+    pub mma_k: u32,
+    pub block_threads: u32,
+    pub fc1_k_stage: u32,
+}
+impl V41ExpertReduction {
+    pub fn validate(&self, info: &V41ExpertInfo) -> Result<()> {
+        ensure!(self.version == 1 && matches!(self.slice_width, 64 | 128 | 192)
+            && self.mma_k == 32 && self.block_threads == 128 && self.fc1_k_stage == 128,
+            "unsupported native expert reduction attestation");
+        ensure!(self.fc2_k_steps == self.slice_width / self.mma_k
+            && self.plane_count == info.logical_intermediate.div_ceil(self.slice_width)
+            && self.plane_count.checked_mul(self.slice_width)
+                .is_some_and(|extent| extent <= info.kernel_intermediate),
+            "native expert slice/fold geometry differs from compiled expert info");
+        ensure!(matches!(self.plane_fold, 1 | 2) && matches!(self.implementation, 1 | 2),
+            "unknown native expert plane fold or implementation");
+        ensure!((self.plane_fold == 1 && info.abi_version == 2)
+            || (self.plane_fold == 2 && info.abi_version == 3),
+            "native expert plane fold disagrees with output ABI");
+        Ok(())
+    }
+}
+
 impl V41ExpertInfo {
     pub fn input_row_bytes(&self) -> Result<usize> {
         let hidden = self.hidden_size as usize;
@@ -637,6 +670,27 @@ impl NativeLibrary {
             1 => Ok(true),
             _ => anyhow::bail!("NVFP4 AOT input-scale policy is unknown; rebuild the native library"),
         }
+    }
+
+    /// Query immutable MXFP4 Spark numerical metadata before allocation/readiness.
+    pub fn v41_spark_expert_reduction(&self, info: &V41ExpertInfo) -> Result<V41ExpertReduction> {
+        type Query = unsafe extern "C" fn(i32, *mut V41ExpertReduction) -> i32;
+        let name: &[u8] = match info.role {
+            1 => b"cuteafd_v41_expert_info_reduction",
+            5 => b"cuteafd_v41_spark_tp2_expert_info_reduction",
+            6 => b"cuteafd_v41_spark_tp3_expert_info_reduction",
+            7 => b"cuteafd_v41_spark_tp6_expert_info_reduction",
+            _ => anyhow::bail!("native slice reduction metadata requires a Spark role"),
+        };
+        // SAFETY: additive C ABI writes exactly the repr(C) attestation structure.
+        let function = unsafe { self.lib.get::<Query>(name) }
+            .context("native Spark experts lack compiled reduction attestation; rebuild AOT exports")?;
+        let mut result = V41ExpertReduction::default();
+        // SAFETY: output is writable and capacity conversion is checked.
+        let status = unsafe { function(i32::try_from(info.capacity_rows)?, &mut result) };
+        ensure!(status == 0, "native expert reduction query failed with CUDA status {status}");
+        result.validate(info)?;
+        Ok(result)
     }
 
     fn expert_info_for(&self, capacity: u32, interface: u8) -> Result<V41ExpertInfo> {
@@ -1280,6 +1334,33 @@ mod tests {
         assert!(info.input_row_bytes().is_err());
         info.input_dtype = 3;
         assert!(info.input_row_bytes().is_err());
+    }
+
+    #[test]
+    fn compiled_slice_reduction_attestation_fails_closed() {
+        assert_eq!(std::mem::size_of::<V41ExpertReduction>(), 36);
+        for (intermediate, planes) in [(576, 9), (1152, 18), (768, 12), (384, 6)] {
+            let info = V41ExpertInfo { abi_version: 2, logical_intermediate: intermediate,
+                kernel_intermediate: intermediate.div_ceil(128) * 128, ..Default::default() };
+            let recipe = V41ExpertReduction { version: 1, slice_width: 64, fc2_k_steps: 2,
+                plane_count: planes, plane_fold: 1, implementation: 1,
+                mma_k: 32, block_threads: 128, fc1_k_stage: 128 };
+            recipe.validate(&info).unwrap();
+            for bad in [V41ExpertReduction { version: 0, ..recipe },
+                V41ExpertReduction { slice_width: 0, ..recipe },
+                V41ExpertReduction { fc2_k_steps: 6, ..recipe },
+                V41ExpertReduction { plane_count: planes + 1, ..recipe },
+                V41ExpertReduction { plane_fold: 2, ..recipe },
+                V41ExpertReduction { implementation: 0, ..recipe },
+                V41ExpertReduction { mma_k: 16, ..recipe },
+                V41ExpertReduction { block_threads: 256, ..recipe }] {
+                assert!(bad.validate(&info).is_err());
+            }
+            let prefill = V41ExpertReduction { slice_width: 192, fc2_k_steps: 6,
+                plane_count: planes / 3, plane_fold: 2, ..recipe };
+            prefill.validate(&V41ExpertInfo { abi_version: 3, ..info }).unwrap();
+            assert_ne!(prefill, recipe);
+        }
     }
 
     #[test]

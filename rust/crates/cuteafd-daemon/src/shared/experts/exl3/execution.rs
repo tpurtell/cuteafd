@@ -75,7 +75,7 @@ impl Exl3Schedule {
 /// Capacity and scheduling may differ, but not the products or their grouping.
 #[derive(Debug)]
 pub(crate) struct Exl3ReductionPlan {
-    decode: Vec<(usize, usize)>,
+    plan: crate::shared::experts::ExpertReductionPlan,
 }
 
 impl Exl3ReductionPlan {
@@ -121,36 +121,23 @@ impl Exl3ReductionPlan {
             }
             Ok(result)
         };
-        let canonical = manifests.iter().find(|m| m["capacity"].as_u64() == Some(1))
-            .with_context(|| format!("EXL3 package {} needs the canonical m1 export", package.display()))?;
-        let canonical = signature(canonical)
-            .with_context(|| format!("EXL3 package {} canonical reduction", package.display()))?;
-        let mut decode = Vec::new();
-        let mut maximum = 0;
-        for (index, meta) in manifests.iter().enumerate() {
+        let variants = manifests.iter().enumerate().map(|(index, meta)| {
             let capacity = meta["capacity"].as_u64().context("EXL3 export lacks capacity")? as usize;
-            maximum = maximum.max(capacity);
-            if capacity <= 80 && signature(meta)
-                .with_context(|| format!("EXL3 reduction export {}", directories[index].display()))? == canonical {
-                decode.push((capacity, index));
-            }
-        }
-        decode.sort_unstable();
-        ensure!(decode.last().is_some_and(|&(capacity, _)| capacity >= maximum.min(80)),
-            "EXL3 package {} has no export covering {} decode rows with canonical m1 K tile, CTA threads and route reduction; export a matching capacity",
-            package.display(), maximum.min(80));
-        Ok(Self { decode })
+            let signature = if capacity <= 80 {
+                Some(signature(meta)
+                    .with_context(|| format!("EXL3 reduction export {}", directories[index].display()))?)
+            } else { None };
+            Ok((capacity, signature))
+        }).collect::<Result<Vec<_>>>()?;
+        let plan = crate::shared::experts::ExpertReductionPlan::new(&variants)
+            .with_context(|| format!("EXL3 package {} canonical m1 K tile, CTA threads and route reduction", package.display()))?;
+        Ok(Self { plan })
     }
 
     pub(crate) fn execution_index(&self, rows: usize, required: usize, capacities: impl Iterator<Item = usize>) -> Result<usize> {
-        ensure!(rows > 0, "EXL3 live rows must be positive");
-        if rows <= 80 {
-            return self.decode.iter().find(|&&(capacity, _)| capacity >= rows)
-                .map(|&(_, index)| index).context("EXL3 decode exceeds fixed reduction plan");
-        }
-        capacities.enumerate().find(|&(_, capacity)| capacity >= required)
-            .map(|(index, _)| index).context("no EXL3 execution for admitted rows")
+        self.plan.execution_index(rows, required, capacities)
     }
+
 }
 
 #[derive(Deserialize)]

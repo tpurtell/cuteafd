@@ -57,6 +57,18 @@ typedef struct cuteafd_expert_info_t {
   uint32_t input_dtype; /* ABI 2: 1 BF16; 7 row E4M3 + UE8M0 K32 scales */
 } cuteafd_expert_info_t;
 
+/* Additive numerical attestation; the existing 64-byte expert info ABI is unchanged.
+ * Fold: 1 ascending FP32 slice planes, 2 atomic tokens. Implementation: 1 slices,
+ * 2 hybrid. Generated from the same recipe as the compiled AOT variant. */
+typedef struct cuteafd_expert_reduction_t {
+  uint32_t version, slice_width, fc2_k_steps, plane_count, plane_fold;
+  uint32_t implementation, mma_k, block_threads, fc1_k_stage;
+} cuteafd_expert_reduction_t;
+int32_t cuteafd_v41_expert_info_reduction(int32_t capacity, cuteafd_expert_reduction_t* out);
+int32_t cuteafd_v41_spark_tp2_expert_info_reduction(int32_t capacity, cuteafd_expert_reduction_t* out);
+int32_t cuteafd_v41_spark_tp3_expert_info_reduction(int32_t capacity, cuteafd_expert_reduction_t* out);
+int32_t cuteafd_v41_spark_tp6_expert_info_reduction(int32_t capacity, cuteafd_expert_reduction_t* out);
+
 /* Prewarm before graph capture. Quantize BF16 [rows,5120] into contiguous
  * 5280-byte rows: 5120 E4M3 bytes then 160 UE8M0 K32 scales, amax floor 1e-4.
  * Caller owns nonoverlapping 16-byte-aligned input/output on the initialized

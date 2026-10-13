@@ -33,22 +33,22 @@ set(CUTEAFD_V41_SPARK_TP_EXPERT_TARGETS)
 set(CUTEAFD_V41_SPARK_TP_EXPERT_INCLUDE_DIRS)
 set(CUTEAFD_V41_SPARK_TP_EXPERT_ROWS 1 16 80 256 1024 4096)
 set(CUTEAFD_V41_SPARK_TP_EXPERT_ROWS_ARG "1,16,80,256,1024,4096")
-# Capacity 1 is the narrow decode tile; every wider capacity uses width 192.
+# Decode capacities through 80 share the serial width-64 reduction recipe;
+# prefill capacities retain width 192.
 # Per-role cache strings so a build can select a width map for TP2, TP3 and TP6
 # independently (for example a capacity-80 candidate) without patching this file.
-# All defaults are byte-identical to the previous single shared map, so an
-# unconfigured build exports exactly the same objects. Each value is either a
+# Each value is either a
 # scalar 64/128/192 or a full `capacity:width` map; the exporter validates that a
 # map covers every precompiled capacity exactly once and that widths are
 # 64/128/192, so an invalid override fails the export instead of being silently
 # accepted here. For TP6 the extra `slices * width <= kernel_intermediate`
 # relation (384 % 32 == 0, so 384/64, 384/128 and 384/192 all tile exactly) is
 # checked by the exporter's slice kernel too; an untileable width fails there.
-set(CUTEAFD_V41_SPARK_TP2_SLICE_WIDTH "1:64,16:192,80:192,256:192,1024:192,4096:192" CACHE STRING
+set(CUTEAFD_V41_SPARK_TP2_SLICE_WIDTH "1:64,16:64,80:64,256:192,1024:192,4096:192" CACHE STRING
   "Spark TP2 expert slice width: scalar 64/128/192 or capacity:width map")
-set(CUTEAFD_V41_SPARK_TP3_SLICE_WIDTH "1:64,16:192,80:192,256:192,1024:192,4096:192" CACHE STRING
+set(CUTEAFD_V41_SPARK_TP3_SLICE_WIDTH "1:64,16:64,80:64,256:192,1024:192,4096:192" CACHE STRING
   "Spark TP3 expert slice width: scalar 64/128/192 or capacity:width map")
-set(CUTEAFD_V41_SPARK_TP6_SLICE_WIDTH "1:64,16:192,80:192,256:192,1024:192,4096:192" CACHE STRING
+set(CUTEAFD_V41_SPARK_TP6_SLICE_WIDTH "1:64,16:64,80:64,256:192,1024:192,4096:192" CACHE STRING
   "Spark TP6 expert slice width: scalar 64/128/192 or capacity:width map")
 
 foreach(tp IN LISTS CUTEAFD_V41_SPARK_TP_SELECTED)

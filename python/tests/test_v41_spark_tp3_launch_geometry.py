@@ -31,7 +31,7 @@ import v41_spark_tp3_launch_geometry as geometry  # noqa: E402
 CAPACITIES = (1, 16, 80, 256, 1024, 4096)
 # The reviewed default width map is the CMake cache default, not a production
 # constant: the module deliberately carries no second copy of it.
-CMAKE_DEFAULT_WIDTHS = {1: 64, 16: 192, 80: 192, 256: 192, 1024: 192, 4096: 192}
+CMAKE_DEFAULT_WIDTHS = {1: 64, 16: 64, 80: 64, 256: 192, 1024: 192, 4096: 192}
 
 # Pinned-source tripwires for the constants this module asserts. Kept in the test
 # so production has one authority (the pinned kernel) and no duplicated prose.

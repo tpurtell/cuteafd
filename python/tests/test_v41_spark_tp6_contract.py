@@ -38,7 +38,7 @@ HIDDEN = 5120
 TOPK = 6
 EXPERTS = 384
 SUPPORTED_WIDTHS = (64, 128, 192)
-DEFAULT_WIDTH_MAP = "1:64,16:192,80:192,256:192,1024:192,4096:192"
+DEFAULT_WIDTH_MAP = "1:64,16:64,80:64,256:192,1024:192,4096:192"
 
 
 def _literal_assignments(path: Path, names: set[str]) -> dict[str, object]:

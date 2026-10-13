@@ -158,7 +158,7 @@ def test_packer_accepts_tp3_extent_and_requires_scale_alignment() -> None:
     assert "intermediate % 32 != 0" in pack
 
 
-SPARK_WIDTH_DEFAULT = "1:64,16:192,80:192,256:192,1024:192,4096:192"
+SPARK_WIDTH_DEFAULT = "1:64,16:64,80:64,256:192,1024:192,4096:192"
 
 
 def test_spark_tp_width_maps_are_per_role_cache_knobs_with_identical_defaults() -> None:
@@ -367,3 +367,58 @@ def test_exporter_cli_rejects_invalid_width_maps(
         _run_exporter_cli(_exporter_argv("1:64,16:192,80:192", rows="1,1,80"))
     assert excinfo.value.code == 2
     assert "rows must be unique capacities in 1..4096" in capsys.readouterr().err
+
+
+def _slice_recipe():
+    tree = ast.parse(SLICES.read_text())
+    node = next(node for node in tree.body
+                if isinstance(node, ast.FunctionDef) and node.name == "numerical_recipe")
+    namespace = {}
+    exec(compile(ast.Module(body=[node], type_ignores=[]), str(SLICES), "exec"), namespace)
+    return namespace["numerical_recipe"]
+
+
+def test_decode_width_recipe_preserves_m1_and_prefill() -> None:
+    tree = ast.parse(EXPERTS.read_text())
+    widths = next(node.value for node in ast.walk(tree)
+                  if isinstance(node, ast.Assign)
+                  and any(isinstance(target, ast.Name) and target.id == "widths"
+                          for target in node.targets))
+    rows = (1, 16, 80, 256, 1024, 4096)
+    selected = eval(compile(ast.Expression(widths), str(EXPERTS), "eval"), {"rows": rows})
+    assert selected == {1: 64, 16: 64, 80: 64, 256: 192, 1024: 192, 4096: 192}
+    tp = CMAKE_TP.read_text()
+    for degree in (2, 3, 6):
+        assert f'SPARK_TP{degree}_SLICE_WIDTH "1:64,16:64,80:64,256:192,1024:192,4096:192"' in tp
+
+
+def test_native_manifest_records_inner_accumulation_and_outer_fold() -> None:
+    recipe = _slice_recipe()
+    for intermediate, planes in ((576, 9), (1152, 18), (768, 12), (384, 6)):
+        serial = recipe(64, intermediate, atomic=False, compact=False)
+        assert serial["fc2_k_steps"] == 2
+        assert serial["plane_count"] == planes
+        assert serial["plane_fold"] == "ascending_fp32"
+        assert serial["output_kind"] == "fp32_routes"
+        prefill = recipe(192, intermediate, atomic=True, compact=False)
+        assert prefill["fc2_k_steps"] == 6
+        assert prefill["plane_count"] == planes // 3
+        assert prefill["plane_fold"] == "atomic_tokens"
+        assert prefill["output_kind"] == "fp32_tokens"
+        assert prefill != serial
+    assert recipe(64, 576, atomic=False, compact=True)["implementation"] == "hybrid"
+    source = SLICES.read_text()
+    assert "numerical_recipe=numerical_recipe(selected_width, intermediate," in source
+
+
+def test_compiled_numerical_attestation_is_additive_and_role_scoped() -> None:
+    source = SLICES.read_text()
+    assert "#define CUTEAFD_EXPERT_REDUCTION_CASES " in source
+    assert "recipe['fc2_k_steps']" in source
+    assert "{planes},{2 if atomic else 1},{2 if compact else 1},32,128,128" in source
+    native = (ROOT / "native/shared/src/v41_experts.cc").read_text()
+    assert "CUTEAFD_JOIN(cuteafd_expert_info, _reduction)" in native
+    assert "static_assert(sizeof(cuteafd_expert_info_t) == 64)" in native
+    header = HEADER.read_text()
+    for prefix in ("v41", "v41_spark_tp2", "v41_spark_tp3", "v41_spark_tp6"):
+        assert f"cuteafd_{prefix}_expert_info_reduction" in header
