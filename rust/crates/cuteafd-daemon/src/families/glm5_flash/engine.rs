@@ -1273,6 +1273,7 @@ pub(crate) struct GlmfEngine<'a> {
     /// rows keep the `_m64` ones). The decode workspace, the replay records and the commit tables
     /// hold this many rows.
     pub decode_rows: usize,
+    pub(super) attention_plan: cuteafd_core::coordinator_programs::AttentionReductionPlan,
     /// The most rows a verify step schedules, the drafts' budget: `decode_rows`, or with the wide
     /// programs this GPU's whole sparse MLA waves ([`verify_budget`]: 127 on an RTX 5090).
     pub verify_rows: usize,
@@ -1668,7 +1669,9 @@ impl<'a> GlmfEngine<'a> {
         let (table_pages, table_pool_pages) = glmf_table_pages(max_context as u64);
         let (table_pages, table_pool_pages) = (usize::try_from(table_pages)?, usize::try_from(table_pool_pages)?);
         Ok(Self { quantize_grid, library, programs, cfg, weights, stream, max_context, prefill_rows, prefill_lane_count,
-            pages, slots, decode_rows, verify_rows, buckets: DecodeBuckets::new(verify_rows),
+            pages, slots, decode_rows, verify_rows,
+            attention_plan: cuteafd_core::coordinator_programs::AttentionReductionPlan::new(DECODE_ROWS, None, None)?,
+            buckets: DecodeBuckets::new(verify_rows),
             replay_rows: std::cell::Cell::new(DECODE_ROWS),
             kda_ordinal, mla_ordinal, index_cache, replay_records, records: RecordGuard::new(replay_records), caches,
             device, context_mode, context: None, context_units: RefCell::new(Vec::new()),
@@ -4323,9 +4326,12 @@ impl<'a> GlmfEngine<'a> {
                 crate::families::glm5::engine::print_mla_check(index, &stats);
             }
         } else {
+            let decode_scalars = [rows, Scalar::I32(self.attention_plan.rows() as i32)];
+            let prefill_scalars = [rows];
+            let scalars = if tables.decode { &decode_scalars[..] } else { &prefill_scalars[..] };
             self.run_on(rank, split, &format!("sparse_mla_{mode}_{cap}"), &[("q", w.query.buffer.ptr), ("kv_cache", cache),
                 ("indices", w.indices.buffer.ptr), ("lengths", w.lengths.buffer.ptr), ("out", w.latent.buffer.ptr),
-                ("scratch", w.scratch.buffer.ptr)], &[rows])?;
+                ("scratch", w.scratch.buffer.ptr)], scalars)?;
         }
         if let Some(dir) = trace {
             std::fs::write(dir.join("mla_latent.bin"), self.download(&w.latent,

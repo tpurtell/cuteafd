@@ -76,10 +76,14 @@ def test_qwen_fp8_kv_exports_preserve_bf16_and_weight_variants(exporter):
     calls = {stem: thunk()[3] for stem, _, _, thunk in programs}
     assert len(calls) == len(programs)
     for cap in (64, 4096):
+        mode = "decode" if cap == 64 else "prefill"
         for stem in ("attn_producer", "sparse_gqa"):
             assert "kv_format" not in calls[f"{stem}_m{cap}"]
-            assert calls[f"{stem}_kv_fp8_m{cap}"] == {"max_rows": cap, "kv_format": "fp8"}
-        mode = "decode" if cap == 64 else "prefill"
+            expected = {"max_rows": cap, "kv_format": "fp8"}
+            if stem == "sparse_gqa":
+                expected["route"] = mode
+                assert calls[f"{stem}_m{cap}"]["route"] == mode
+            assert calls[f"{stem}_kv_fp8_m{cap}"] == expected
         assert calls[f"attn_producer_w8_kv_fp8_m{cap}"] == {
             "max_rows": cap, "fp8_only": mode, "kv_format": "fp8"}
     assert calls["attn_producer_fp8_kv_fp8_m64"] == {"max_rows": 64, "fp8": True, "kv_format": "fp8"}
@@ -150,9 +154,9 @@ def test_the_wide_programs_keep_the_decode_routes(exporter):
     assert kwargs["kda_s16_m128"] == {"max_rows": 128, "fp8": True, "state_dtype": "bfloat16",
                                       "state_rounding": "window", "seq_ctas": 8, "decode_tiles": True}
     assert kwargs["mhc_post_pre_m128"] == {"max_rows": 128, "route": "decode"}
-    # The 128-row bucket keeps one split where the planner would split it maximally.
+    # Wide execution shares the m64 numerical recipe domain.
     assert kwargs["sparse_mla_decode_m128"] == {"route": "decode", "max_rows": 128, "name": "glmf_sparse_mla",
-                                                "fp32_partials": True, "full_launch_splits": 1, "sm_count": None}
+                                                "fp32_partials": True, "plan_capacity_rows": 64, "sm_count": None}
     mla = next(thunk for stem, _, _, thunk in exporter.glmf_wide_decode_programs(
         GEOMETRY, 64, 128, 131072) if stem == "sparse_mla_decode_m128")
     for sms in (170, 188):

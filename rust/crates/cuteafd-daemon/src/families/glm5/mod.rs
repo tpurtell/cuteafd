@@ -96,6 +96,9 @@ pub(crate) struct EngineArgs {
     /// exchange per layer), or heads (replicated latent, head-split attention).
     #[arg(long, env = "CUTEAFD_ATTENTION_PLACEMENT", default_value = "auto")]
     pub attention_placement: String,
+    /// Numerical decode/verify reduction plan rows; automatic uses the active drafter width.
+    #[arg(long, env = "CUTEAFD_ATTENTION_PLAN_ROWS")]
+    pub attention_plan_rows: Option<usize>,
 }
 
 #[cfg(test)]
@@ -116,6 +119,19 @@ mod draft_cli_tests {
         assert_eq!(parsed.draft_fp8, None);
         assert_eq!(parsed.draft_sequences, 16);
         assert_eq!(parsed.draft_context_slots.unwrap_or(20.max(parsed.draft_sequences)), 20);
+    }
+
+    #[test]
+    fn attention_plan_override_is_permanent_and_validated_against_numerical_domain() {
+        let parsed = Parse::try_parse_from(["test", "--snapshot", "/checkpoint", "--native-lib", "/native",
+            "--attention-plan-rows", "8"]).unwrap().engine;
+        assert_eq!(parsed.attention_plan_rows, Some(8));
+        for value in ["0", "65"] {
+            let parsed = Parse::try_parse_from(["test", "--snapshot", "/checkpoint", "--native-lib", "/native",
+                "--attention-plan-rows", value]).unwrap().engine;
+            assert!(cuteafd_core::coordinator_programs::AttentionReductionPlan::new(
+                engine::DECODE_ROWS, None, parsed.attention_plan_rows).is_err());
+        }
     }
 
     #[test]
@@ -268,10 +284,24 @@ impl Opened {
             "--skip-routed-experts is a coordinator-only diagnostic; do not pass --peers");
         let programs = self.library.programs()?.with_manifest(&args.manifest)?;
         programs.capacities().require_context("glm5", args.max_context)?;
+        let provisional_drafter = args.draft.as_deref().map(dflash::DflashConfig::read).transpose()?;
+        if let Some(cfg) = &provisional_drafter {
+            ensure!(cfg.hidden == self.cfg.hidden && cfg.vocab == self.cfg.vocab_size
+                && cfg.taps.iter().all(|&l| l < self.cfg.layers), "the DFlash2 drafter does not fit this target");
+        }
+        let attention_plan = cuteafd_core::coordinator_programs::AttentionReductionPlan::new(
+            engine::DECODE_ROWS, provisional_drafter.as_ref().map(|cfg| cfg.drafts()), args.attention_plan_rows)?;
+        let legacy_manifest = args.manifest.with_file_name("DSV4_PROGRAMS.json");
+        let manifest_path = if !args.manifest.exists()
+            && args.manifest.file_name() == Some("PROGRAMS.json".as_ref()) && legacy_manifest.exists() {
+            &legacy_manifest
+        } else { &args.manifest };
+        let manifest: serde_json::Value = serde_json::from_slice(&std::fs::read(manifest_path)?)?;
         // GLM 5.3's own programs (`glm_*`, and the head split's `glm2_*`), sampled as the runtime
         // inventory; the image's other families are never launched here.
         let selected = cuteafd_core::coordinator_programs::CoordinatorPrograms { family: "glm",
             split_family: args.split_device.map(|_| "glm2") };
+        let programs = programs.with_attention_plan(attention_plan, |name| selected.contains(name))?;
         let stream = self.library.cuda_stream_create()?;
         // The head split's second GPU and its stream (load kernels, then the engine's).
         // A head split needs its share's programs (`glm2`) in this build.
@@ -340,8 +370,21 @@ impl Opened {
         let spark_ranks = args.peers.as_deref().map_or(0, |p| p.split(',').count());
         // Token-split attention: the build's programs (GPU0's table; both GPUs load the same).
         let names: Vec<&str> = programs.names().collect();
-        let context = (devices.len() == 2).then(|| glm::context_programs(names.iter().copied(),
+        let mut context = (devices.len() == 2).then(|| glm::context_programs(names.iter().copied(),
             |name| programs.spec(name).ok().map(|p| p.scratch.get("scratch").copied().unwrap_or(0)))).flatten();
+        if let Some(context) = &mut context {
+            let selected_scratch = devices.iter().map(|&device| -> Result<u64> {
+                self.library.cuda_set_device(device)?;
+                let sms = self.library.sm_count()?;
+                [0, self.cfg.heads / 2].into_iter().map(|begin| {
+                    let name = crate::shared::peer_split::context::partial_program(
+                        &manifest, "glm", begin, engine::DECODE_ROWS, sms, &attention_plan)?;
+                    Ok(programs.spec(&name)?.scratch.get("scratch").copied().unwrap_or(0))
+                }).collect::<Result<Vec<_>>>().map(|sizes| sizes.into_iter().max().unwrap_or(0))
+            }).collect::<Result<Vec<_>>>();
+            self.library.cuda_set_device(args.device)?;
+            context.partial_scratch = selected_scratch?.into_iter().max().unwrap_or(0);
+        }
         let prefill_lanes = glm::prefill_lanes(spark_ranks, engine::configured_lanes() as u64) as usize;
         let inputs = glm::GlmInputs { cfg: &self.cfg, layers, gpus, headroom_bytes: 2 << 30,
             spark_ranks, skip_routed_experts: args.skip_routed_experts,
@@ -370,12 +413,12 @@ impl Opened {
             max_context, args.prefill_rows, pages, embedding, prefill_lanes, context.filter(|_| context_kv))?;
         engine.spark_bf16 = cuteafd_loader::plan::Checkpoint::inventory(&self.snapshot)?.spark_input_is_bf16();
         engine.full_prefill_logits = args.full_prefill_logits;
+        engine.attention_plan = attention_plan;
         if let Some((device, stream)) = peer_stream {
             engine.attach_peer(device, stream, shares.pop().context("head-split shares")?)?;
         }
         if context_kv {
             // The solver charged staging over the compiled extent it was given.
-            let manifest: serde_json::Value = serde_json::from_slice(&std::fs::read(&args.manifest)?)?;
             engine.attach_context(args.max_context, &manifest)?;
         }
         engine.prefill_w8a8 = !args.prefill_w8a16;
@@ -399,6 +442,9 @@ impl Opened {
             engine.drafter = Some(drafter);
             tracing::info!(elapsed_ms = started.elapsed().as_millis() as u64, "DFlash2 drafter resident");
         }
+        engine.attention_plan = attention_plan.validate_loaded(engine.drafter.as_ref().map(|d| d.cfg.drafts()))?;
+        tracing::info!(plan_rows = engine.attention_plan.rows(),
+            active_drafts = ?engine.attention_plan.active_drafts(), "immutable attention reduction plan");
         let ranks = |peers: &str| -> Result<(Vec<std::net::SocketAddr>, Vec<u64>)> {
             let peers = peers.split(',').map(str::parse).collect::<std::result::Result<Vec<std::net::SocketAddr>, _>>()?;
             let executors: Vec<u64> = (0..peers.len())

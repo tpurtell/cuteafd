@@ -390,14 +390,10 @@ def glmf_wide_decode_programs(g, decode_rows: int, wide_rows: int, max_context: 
          lambda: glmf.compile_glmf_mla_producer_aot(g, max_rows=r, fp8_only="decode")),
         (f"o_m{r}", "o", {"max_rows": r, "fp8_only": "decode"},
          lambda: glmf.compile_glmf_o_aot(g, max_rows=r, fp8_only="decode")),
-        # One split for the 128-row bucket, as the 64-row program's 64-row bucket: the split
-        # planner finds no split count within its waves once the unsplit launch exceeds them
-        # (128 rows x 4 head blocks, 512 CTAs on 170 SMs) and would split it 33 ways, FP32
-        # partials of 33 chunks per row and head in a 554,729,472-byte scratch. On 188 SMs the
-        # planner's own plan is one split, so the option changes no object there.
-        (f"sparse_mla_decode_m{r}", "sparse_mla", {"route": "decode", "max_rows": r, "full_launch_splits": 1},
+        # Wide execution preserves the m64 numerical domain and selected recipe.
+        (f"sparse_mla_decode_m{r}", "sparse_mla", {"route": "decode", "max_rows": r, "plan_capacity_rows": 64},
          lambda sm_count=None: mla.compile_glm_sparse_mla_aot(g, route="decode", max_rows=r, name="glmf_sparse_mla",
-                                                fp32_partials=True, full_launch_splits=1, sm_count=sm_count)),
+                                                fp32_partials=True, plan_capacity_rows=64, sm_count=sm_count)),
     ]
     for inter in (g.moe_inter, g.dense_inter):
         out.append((f"ffn_i{inter}_m{r}", "ffn", {"max_rows": r, "inter": inter, "fp8_only": "decode"},
@@ -484,15 +480,15 @@ def qwen4_programs(g, decode_rows: int, prefill_rows: int, max_context: int):
     from b12x.integration.cuteafd import qwen4_attention as attn
 
     out.append(("index_expand", "index_expand", {}, lambda: attn.compile_qwen4_index_expand_aot(g)))
-    for rows in (decode_rows, prefill_rows):
+    for mode, rows in (("decode", decode_rows), ("prefill", prefill_rows)):
         out += [
             (f"gdn_m{rows}", "gdn", {"max_rows": rows}, lambda r=rows: qwen4_gdn.compile_qwen4_gdn_aot(g, max_rows=r)),
             (f"attn_producer_m{rows}", "attn_producer", {"max_rows": rows},
              lambda r=rows: attn.compile_qwen4_attn_producer_aot(g, max_rows=r)),
             (f"index_topk_m{rows}", "index_topk", {"max_rows": rows, "max_context": max_context},
              lambda r=rows: attn.compile_qwen4_index_topk_aot(g, max_rows=r, max_context=max_context)),
-            (f"sparse_gqa_m{rows}", "sparse_gqa", {"max_rows": rows},
-             lambda r=rows: attn.compile_qwen4_sparse_gqa_aot(g, max_rows=r)),
+            (f"sparse_gqa_m{rows}", "sparse_gqa", {"max_rows": rows, "route": mode},
+             lambda r=rows, m=mode: attn.compile_qwen4_sparse_gqa_aot(g, max_rows=r, route=m)),
             (f"attn_o_m{rows}", "attn_o", {"max_rows": rows}, lambda r=rows: attn.compile_qwen4_attn_o_aot(g, max_rows=r)),
         ]
     # Decode programs over E4M3 copies of the large projections (<= 16 live rows).
@@ -519,12 +515,12 @@ def qwen4_programs(g, decode_rows: int, prefill_rows: int, max_context: int):
              lambda r=cap, m=mode: attn.compile_qwen4_attn_o_aot(g, max_rows=r, fp8_only=m)),
         ]
     # KV format is independent of projection-weight format; preserve the BF16 exports.
-    for cap in (decode_rows, prefill_rows):
+    for mode, cap in (("decode", decode_rows), ("prefill", prefill_rows)):
         out += [
             (f"attn_producer_kv_fp8_m{cap}", "attn_producer", {"max_rows": cap, "kv_format": "fp8"},
              lambda r=cap: attn.compile_qwen4_attn_producer_aot(g, max_rows=r, kv_format="fp8")),
-            (f"sparse_gqa_kv_fp8_m{cap}", "sparse_gqa", {"max_rows": cap, "kv_format": "fp8"},
-             lambda r=cap: attn.compile_qwen4_sparse_gqa_aot(g, max_rows=r, kv_format="fp8")),
+            (f"sparse_gqa_kv_fp8_m{cap}", "sparse_gqa", {"max_rows": cap, "kv_format": "fp8", "route": mode},
+             lambda r=cap, m=mode: attn.compile_qwen4_sparse_gqa_aot(g, max_rows=r, kv_format="fp8", route=m)),
         ]
     out.append((f"attn_producer_fp8_kv_fp8_m{decode_rows}", "attn_producer",
                 {"max_rows": decode_rows, "fp8": True, "kv_format": "fp8"},

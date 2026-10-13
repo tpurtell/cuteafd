@@ -64,6 +64,10 @@ NVFP4 with its FP8 MTP package). Explicit
 `EXPERT_BACKEND=local` uses the same speculation default. `MTP=0` retains the
 legacy opt-out; explicit depth settings retain their meaning.
 
+| Attention configuration | Default | Contract |
+| --- | --- | --- |
+| `ATTENTION_PLAN_ROWS` / `--attention-plan-rows` | `auto` | Numerical recipe from actually loaded MTP depth + 1, clamped to 64; without MTP, 1. Explicit 1..64 overrides it. Split count and merge backend stay fixed for decode/verify; explicit prefill remains direct, including short prefills. |
+
 The default is selected by delivered C1/C4 code and reasoning-on agentic
 tok/s, with C16 and 8K prefill measured alongside. Native MTP also prefills
 its own attention state. Release smoke uses

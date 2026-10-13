@@ -131,6 +131,30 @@ def test_glm53_rejects_removed_draft_switches(tmp_path: Path, key: str, value: s
     assert f"{key} was removed for GLM 5.3" in result.stderr
 
 
+@pytest.mark.parametrize("value", [None, "auto", "1", "8", "64"])
+def test_attention_plan_rows_reaches_only_the_coordinator(tmp_path: Path, value) -> None:
+    result = _family_launch_result(tmp_path, {"model_type": "glm_moe_dsa", "num_hidden_layers": 4,
+                                            "first_k_dense_replace": 3}, "zai-org/GLM-5.3",
+                                  f"ATTENTION_PLAN_ROWS={value}\n" if value else "")
+    assert result.returncode == 0, result.stderr
+    launches = [line for line in result.stderr.splitlines() if "docker run -d" in line]
+    if value in (None, "auto"):
+        assert all("CUTEAFD_ATTENTION_PLAN_ROWS=" not in line for line in launches)
+    else:
+        assert any(f"CUTEAFD_ATTENTION_PLAN_ROWS={value}" in line for line in launches)
+        assert all("CUTEAFD_ATTENTION_PLAN_ROWS=" not in line for line in launches
+                   if "cuteafd-spark-expert" in line)
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "8.0", "maybe", "08"])
+def test_attention_plan_rows_rejects_invalid_launcher_values(tmp_path: Path, value) -> None:
+    result = _family_launch_result(tmp_path, {"model_type": "glm_moe_dsa", "num_hidden_layers": 4,
+                                            "first_k_dense_replace": 3}, "zai-org/GLM-5.3",
+                                  f"ATTENTION_PLAN_ROWS={value}\n")
+    assert result.returncode != 0
+    assert "ATTENTION_PLAN_ROWS must be auto or a positive integer" in result.stderr
+
+
 @pytest.mark.parametrize("value", [None, "on", "off"])
 def test_thermal_report_key_defaults_on_and_reaches_the_coordinator(tmp_path: Path, value) -> None:
     result = _family_launch_result(tmp_path, {"model_type": "mimo_v2_flash", "num_hidden_layers": 2,

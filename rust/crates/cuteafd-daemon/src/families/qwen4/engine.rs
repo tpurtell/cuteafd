@@ -1047,6 +1047,7 @@ pub(crate) struct Qwen4Engine<'a> {
     pub embedding: TokenEmbedding<'a>,
     /// Deferred MTP drafts of a cycle: U32 [MTP_DEFERRED_STEPS, DECODE_ROWS].
     mtp_drafts: Dev<'a>,
+    pub(super) attention_plan: cuteafd_core::coordinator_programs::AttentionReductionPlan,
 }
 
 type GraphGeometry = cuteafd_loader::serving_capacity::qwen_graphs::QwenGraphGeometry;
@@ -1228,7 +1229,8 @@ impl<'a> Qwen4Engine<'a> {
             startup_graphs: false,
             warming_graphs: Cell::new(false), w8a8_prefill: false, spark_bf16: false, full_prefill_logits: false,
             routes_ready: library.cuda_event_create_ordering()?, l2: None, embedding,
-            mtp_drafts: zeroed(MTP_DEFERRED_STEPS * DECODE_ROWS * 4)? })
+            mtp_drafts: zeroed(MTP_DEFERRED_STEPS * DECODE_ROWS * 4)?,
+            attention_plan: cuteafd_core::coordinator_programs::AttentionReductionPlan::new(DECODE_ROWS, None, None)? })
     }
 
     pub(super) fn enable_startup_graphs(&mut self) {
@@ -1448,7 +1450,8 @@ impl<'a> Qwen4Engine<'a> {
     pub(crate) fn verify_attention_trace(&self, contexts: &[Vec<usize>], rows: usize) -> serde_json::Value {
         let full_layers = self.weights.layers.iter().filter(|l| l.attention == Qwen4Attention::Full).count();
         let records: usize = contexts.iter().flatten().map(|&n| n.min(SPARSE_TOPK)).sum();
-        let splits = if rows == 1 { 64 } else if rows <= 4 { 32 } else { 16 };
+        let hint = self.attention_plan.rows();
+        let splits = if hint == 1 { 64 } else if hint <= 4 { 32 } else { 16 };
         serde_json::json!({"program": format!("qwen4_{}_m64", self.kv_stem("sparse_gqa")),
             "route": "selected_split", "physical_rows": rows, "splits": splits,
             "qk_tile": [16, 32, 16], "pv_tile": [16, 256, 16], "kv_warps": 2,
@@ -3095,7 +3098,8 @@ impl<'a> Qwen4Engine<'a> {
         self.run(&format!("qwen4_{}_{cap}", self.kv_stem("sparse_gqa")), &[("query", w.query.buffer.ptr), ("kv_cache", cache),
             ("positions", w.positions.buffer.ptr), ("page_table", w.page_table.buffer.ptr),
             ("indices", w.indices.buffer.ptr), ("out", w.attn.buffer.ptr), ("scratch", w.scratch.buffer.ptr)],
-            &[rows, Scalar::I32(tables.page_width as i32), Scalar::I32(tables.page_stride as i32)])?;
+            &[rows, Scalar::I32(tables.page_width as i32), Scalar::I32(tables.page_stride as i32),
+                Scalar::I32(self.attention_plan.rows() as i32)])?;
         let mut pointers = vec![("attn", w.attn.buffer.ptr), ("gate", w.gate.buffer.ptr)];
         pointers.extend(Self::projection(layer, "w_o")?);
         pointers.extend([("out", w.delta.buffer.ptr), ("scratch", w.scratch.buffer.ptr)]);
