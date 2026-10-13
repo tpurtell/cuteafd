@@ -18,6 +18,7 @@ fn config() -> Option<&'static Config> {
         Some(Config { directory: directory.into(), prompt, requests: Mutex::new(BTreeSet::new()) })
     }).as_ref()
 }
+pub(super) fn enabled() -> bool { config().is_some() }
 fn matches_prompt(prompt: &[u32], position: u64, tokens: &[u32]) -> bool {
     position == 0 && !prompt.is_empty() && tokens == prompt
 }
