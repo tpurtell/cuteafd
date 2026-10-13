@@ -67,6 +67,14 @@ and arms for cleanup. Source worktrees are retained for inspection.
   runs in the smoke binary, so arms with different server builds measure the
   same workload; pass `--binary` built from a checkout that has it (wip-cards
   checks).
+- `--panels baseline,spec_lossless_set` adds the lossless merge gate: every
+  case of `scripts/bench/fixtures/spec-lossless-set-v1.json` (or
+  `--lossless-set FILE`, `[{id, prompt, nonce}]` with the full nonce string)
+  runs cold with drafts on and off for 128 greedy tokens and must match in
+  token ids and every row hash, with no tie tolerance. The row fails as
+  `quality` naming the failing cases; each case's probe pair (prompt ids,
+  generated ids, row hashes, top two) stays in `report.json` under the pass's
+  `evidence`. The baseline's single `spec_lossless` check is unchanged.
 - `--trace` gives every job `SPECULATION_TRACE=<job>/speculation-trace.jsonl`.
   The observer notes it after warm-up; a speculating arm that wrote nothing
   fails its row. `--set CARD:PROFILE=census,transport-timing,expert-timing`

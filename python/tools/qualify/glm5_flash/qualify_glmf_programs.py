@@ -256,7 +256,7 @@ def main() -> None:
                     dtype=torch.uint8, device="cuda")
                 dec_latent = torch.empty(k_rows, n, lat, dtype=torch.bfloat16, device="cuda")
                 dec.launch(query[t - k_rows:].contiguous(), cache, indices[t - k_rows:].contiguous(),
-                           lengths[t - k_rows:].contiguous(), dec_latent, dec_scratch, scalars=[k_rows])
+                           lengths[t - k_rows:].contiguous(), dec_latent, dec_scratch, scalars=[k_rows, 8])
                 report(f"mla decode route, {k_rows} rows", dec_latent, latent[t - k_rows:])
 
             # mHC post + ffn pre

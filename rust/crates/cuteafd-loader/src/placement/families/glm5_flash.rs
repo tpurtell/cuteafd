@@ -317,8 +317,8 @@ pub fn request_for_working_set(i: &GlmfInputs<'_>, working: &GlmfWorkingSet) -> 
     if i.attention.mode == AttentionPlacement::Context && i.pool_marks {
         return Err(PlacementError::Inventory("GLM Flash context prefix marks need an arena"));
     }
-    if i.shared_replay && (ranks != 1 || working.spark_ranks == 0 || i.requested_pool.is_some()) {
-        return Err(PlacementError::Inventory("GLM Flash shared replay needs single-GPU automatic Spark admission"));
+    if i.shared_replay && (ranks != 1 || working.spark_ranks == 0) {
+        return Err(PlacementError::Inventory("GLM Flash --replay-records shared needs one coordinator GPU and Spark experts (independent of --pool-tokens)"));
     }
     let geometry = cache::glm_flash_placed_cache_geometry_rows(i.cfg, i.layers, ranks, i.index,
         i.kda_state_bytes, i.decode_rows, i.attention.mode, i.attention.first_owner as usize)

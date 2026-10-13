@@ -113,6 +113,9 @@ pub(crate) struct EngineArgs {
     /// its experts local) and verifies up to this many drafts per sequence.
     #[arg(long, default_value_t = 0)]
     pub mtp: usize,
+    /// Numerical attention recipe rows; automatic uses the actually loaded MTP width.
+    #[arg(long, env = "CUTEAFD_ATTENTION_PLAN_ROWS")]
+    pub attention_plan_rows: Option<usize>,
     /// Hold lm_head as E4M3 with FP32 per-row x 128-K scales (quantized on the
     /// host at load) INSTEAD of BF16: the one head the target (prefill, verify,
     /// golden rows) and the MTP drafts share, every logits row through
@@ -231,6 +234,14 @@ fn required_fp8_programs(args: &EngineArgs) -> Vec<String> {
     required
 }
 
+fn attention_plan(args: &EngineArgs, loaded_mtp: bool)
+    -> std::result::Result<cuteafd_core::coordinator_programs::AttentionReductionPlan,
+        cuteafd_core::coordinator_programs::AttentionPlanError>
+{
+    cuteafd_core::coordinator_programs::AttentionReductionPlan::new(
+        engine::DECODE_ROWS, loaded_mtp.then_some(args.mtp), args.attention_plan_rows)
+}
+
 #[cfg(test)]
 mod weight_representation_tests {
     use super::*;
@@ -259,6 +270,32 @@ mod weight_representation_tests {
         assert!(args(&["--fp8-head", "true"]).unwrap().mtp_fp8_head);
         // The W8A8 switch applies to FP8-only projections only.
         assert!(args(&["--fp8-prefill-w8a8", "true"]).is_err());
+    }
+
+    #[test]
+    fn attention_plan_uses_loaded_mtp_and_validates_override() {
+        for drafts in [1, 3, 63, 100] {
+            let draft_arg = drafts.to_string();
+            let parsed = args(&["--mtp", &draft_arg]).unwrap();
+            let plain = attention_plan(&parsed, false).unwrap();
+            assert_eq!(plain.rows(), 1);
+            assert_eq!(plain.active_drafts(), None);
+            let loaded = attention_plan(&parsed, true).unwrap();
+            assert_eq!(loaded.rows(), (drafts + 1).min(engine::DECODE_ROWS));
+            assert_eq!(loaded.active_drafts(), Some(drafts));
+        }
+        for rows in [1, 8, 64] {
+            let row_arg = rows.to_string();
+            let parsed = args(&["--mtp", "3", "--attention-plan-rows", &row_arg]).unwrap();
+            for loaded in [false, true] {
+                assert_eq!(attention_plan(&parsed, loaded).unwrap().rows(), rows);
+            }
+        }
+        for row_arg in ["0", "65"] {
+            let parsed = args(&["--attention-plan-rows", row_arg]).unwrap();
+            assert!(attention_plan(&parsed, false).is_err());
+        }
+        assert!(args(&["--attention-plan-rows", "auto"]).is_err());
     }
 
     #[test]
@@ -351,7 +388,7 @@ impl Opened {
             tracing::info!(loaded, skipped, "Qwen programs loaded");
             Ok(())
         })?;
-        let manifest_json: Option<serde_json::Value> = std::fs::read(&args.manifest).ok()
+        let mut manifest_json: Option<serde_json::Value> = std::fs::read(&args.manifest).ok()
             .and_then(|bytes| serde_json::from_slice(&bytes).ok());
         let stream = self.library.cuda_stream_create()?;
         let started = Instant::now();
@@ -362,6 +399,21 @@ impl Opened {
         let (embedding, model) = crate::shared::token_io::TokenEmbedding::load(&self.library, source,
             args.token_io.embed_placement,
             || { let _memory_scope = cuteafd_ffi::memory_ledger::scope("weights"); loader.model(&self.cfg, layers, args.mtp > 0 && layers == self.cfg.layers, args.mtp_fp8_head) })?;
+        let attention_plan = attention_plan(args, model.mtp.is_some())?;
+        let programs = programs.with_attention_plan(attention_plan, |name| selected.contains(name))?;
+        if let Some(manifest) = &mut manifest_json {
+            if let Some(entries) = manifest["programs"].as_array_mut() {
+                for entry in entries {
+                    if !entry["name"].as_str().is_some_and(|name| selected.contains(name)) { continue; }
+                    if let Some(bytes) = cuteafd_core::coordinator_programs::attention_plan_scratch(
+                        &entry["geometry"], attention_plan)? {
+                        entry["scratch_bytes_at_capacity"]["scratch"] = bytes.into();
+                    }
+                }
+            }
+        }
+        tracing::info!(plan_rows = attention_plan.rows(), active_drafts = ?attention_plan.active_drafts(),
+            "Qwen immutable attention reduction plan from loaded MTP");
         let resident: usize = model.layers.iter().map(weights::Qwen4Layer::bytes).sum::<usize>()
             + model.mtp.as_ref().map_or(0, weights::MtpWeights::bytes) + model.head.bytes();
         // One resident representation per selectable weight, as the plan accounts for it.
@@ -419,6 +471,7 @@ impl Opened {
         let pages = pool_tokens.div_ceil(engine::PAGE_ROWS);
         let mut engine = engine::Qwen4Engine::new(&self.library, &programs, self.cfg.clone(), model, ple, stream,
             max_context, args.prefill_rows, pages, args.slots, args.kv_format, embedding)?;
+        engine.attention_plan = attention_plan;
         engine.spark_bf16 = self.checkpoint.spark_input_is_bf16();
         if args.planner_graph_modes.is_some() { engine.enable_startup_graphs(); }
         engine.w8a8_prefill = args.fp8_prefill_w8a8;

@@ -320,8 +320,12 @@ facts recorded somewhere for agents working on it.
 ### Hosts
 
 - `raptor`: coordinator, x86-64, 2× RTX PRO 6000 Blackwell 96 GB (SM120),
-  power-capped at 325 W during unattended runs. Fabric 10.55.0.22 /
-  10.55.1.22.
+  power-limited by the gpu-powerd daemon (900 W shared budget, thermal
+  model with an 80 °C target and an 85 °C hard drop; typically 450 W per
+  card when both are busy). It replaced the static 325 W cap, which existed
+  to stop prefill heat from dropping a card off the bus (Xid 79). Never
+  change power limits or the daemon's config yourself; cards report the
+  limit they ran at. Fabric 10.55.0.22 / 10.55.1.22.
 - Sparks (GB10, SM121, ARM64, 121 GiB unified; `nvidia-smi` memory reads
   N/A, measure with CUDA): ostrich, dodo, emu, kiwi, rhea, moa at
   10.55.0.1–6. Ranks 0–5 in that order. All six are the pool. TP4 on the

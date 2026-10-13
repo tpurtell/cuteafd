@@ -65,8 +65,8 @@ pub struct LayoutOptions {
     /// `GLMF_POOL_MARK_RESERVED_UNITS` units allocated beside the pool and never handed out.
     pub glmf_pool_marks: bool,
     /// GLM 5.3 Flash's KDA replay records in the prefill lanes' scratch (`--replay-records shared`):
-    /// out of the state, and the scratch holds at least them. The engine takes them only where it
-    /// sizes the pool from measured memory (one GPU, Spark experts, an automatic pool).
+    /// out of the state, and the scratch holds at least them. Supported with one GPU and Spark
+    /// experts, for either an automatic or an explicit pool.
     pub glmf_shared_replay: bool,
     /// Spark wave capacity in rows (`expertd --capacity`).
     pub spark_capacity_rows: u64,

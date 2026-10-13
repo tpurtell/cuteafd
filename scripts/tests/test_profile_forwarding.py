@@ -170,7 +170,7 @@ def test_family_launch_without_profile_adds_nothing(tmp_path):
 
 
 def test_v41_worker_takes_profile_args_after_every_positional():
-    source = (ROOT / 'run.sh').read_text()
+    source = (ROOT / 'scripts/launch/run-family.sh').read_text()
     invocation, remote = source.split('echo "== starting native Spark experts =="', 1)[1].split("<<'REMOTE' &", 1)
     remote = remote.split('\nREMOTE', 1)[0]
     assert '--profile-args' in invocation
@@ -191,4 +191,7 @@ def test_v41_worker_takes_profile_args_after_every_positional():
     assert '${profile_args[@]+"${profile_args[@]}"}' in coordinator
     assert '"$COORDINATOR_DOCKER_INFERENCE" ${profile_wrapper[@]+"${profile_wrapper[@]}"} cuteafd' in coordinator
     assert '${profile_wrapper_args[@]+"${profile_wrapper_args[@]}"}' in coordinator
-    assert 'release_profile_wrapper "${PROFILE:-}" "${PROFILE_DIR:-}" "$(hostname -s)" coordinator' in source
+    # V4.1 takes the coordinator wrapper from the shared helper every family uses.
+    assert source.count('release_profile_wrapper "$(get PROFILE)" "$(get PROFILE_DIR)" "$(hostname -s)" coordinator') == 1
+    v41 = source[source.index('launch_deepseek_v41() {'):]
+    assert 'shared_profile_args' in v41[:v41.index('start_coordinator() {')]

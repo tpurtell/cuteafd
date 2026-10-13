@@ -35,7 +35,7 @@ import pytest
 
 REPO = Path(__file__).resolve().parents[2]
 COMMON = REPO / "scripts" / "lib" / "release-common.sh"
-RUN = REPO / "run.sh"
+RUN = REPO / "scripts" / "launch" / "run-family.sh"
 
 DIE = 2  # release_die's status in the library
 SOURCE = 'source scripts/lib/release-common.sh\n'
@@ -234,6 +234,7 @@ RUN_STATEMENTS = {
 }
 
 RUN_VARS = """
+shared_worker_env_args=(-e CUTEAFD_FP8_EXPERT_PREFILL=auto -e CUTEAFD_THERMAL=on)
 hosts=(seed0 seed1)
 i=0
 host=seed0
@@ -263,7 +264,10 @@ BATCH_TIMEOUT = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=10"]
 
 
 def run_text() -> str:
-    return RUN.read_text(encoding="utf-8")
+    """DeepSeek V4.1's serving lifecycle: run-family.sh's launch_deepseek_v41."""
+    text = RUN.read_text(encoding="utf-8")
+    start = text.index("launch_deepseek_v41() {\n")
+    return text[start:text.index("\n}\n", text.index('echo "  context/output:', start)) + 3]
 
 
 def _slice(name: str) -> str:
@@ -303,7 +307,7 @@ class TestRunShLifecycle:
     def test_no_direct_ssh_call_survives_in_the_lifecycle(self):
         # Only the code is scanned: the usage heredoc talks *about* ssh options for
         # the operator, which is prose rather than a call site.
-        body = run_text().split("EOF\n}\n", 1)[1]
+        body = run_text()
         offenders = [
             f"{number}: {line.strip()}"
             for number, line in enumerate(body.splitlines(), start=1)
@@ -375,7 +379,7 @@ class TestRunShLifecycle:
         # An operator reading `./run.sh --help` must learn the same thing the build
         # documents, including the alias warning that makes /dev/null the wrong
         # answer for most hosts.
-        usage = run_text().split("usage() {", 1)[1].split("\nEOF", 1)[0]
+        usage = (REPO / "run.sh").read_text().split("usage() {", 1)[1].split("\nEOF", 1)[0]
         assert "CUTEAFD_RELEASE_SSH_CONFIG" in usage
         assert "BatchMode" in usage
         assert "Include ~/.ssh/config" in usage
@@ -415,6 +419,8 @@ class TestRunShLifecycle:
             "cuteafd-spark-expert:v10", "cuteafd-spark-expert-seed0-19441", "0",
             "4096", "107374182400", "19441", "hub/models--x--M/snapshots/rev",
             "fp", "0", "2", "explicit", "2", "2", "", "", "", "info", "__none__",
+            # Docker options follow the positionals behind one sentinel.
+            "--profile-args", "-e", "CUTEAFD_FP8_EXPERT_PREFILL=auto", "-e", "CUTEAFD_THERMAL=on",
         ], payload
 
     def test_empty_optionals_do_not_shift_the_launch_vector(self, tmp_path):
@@ -426,8 +432,8 @@ class TestRunShLifecycle:
         assert result.returncode == 0, result.stderr
         payload = _remote_payload(invocations[0])
         assert payload[13:16] == ["/dev/infiniband", "", ""], payload
-        assert payload[16:] == ["info", "__none__"], payload
-        assert len(payload) == 18, payload
+        assert payload[16:18] == ["info", "__none__"], payload
+        assert payload[18] == "--profile-args", payload
 
 
 

@@ -89,9 +89,8 @@ pub(crate) fn combine_order<T>(rank: usize, own: T, received: T) -> [T; 2] {
 /// The `{family}_sparse_mla_partial_h{begin}_s{N}_m{rows}` variants a GPU with `sms` SMs runs,
 /// as (row cap, program) ascending: the exporter's split plan per (SM count, row cap)
 /// (`row_caps`; a variant without it serves the full `rows` of its `device_sm_counts`), else
-/// the one variant. A step of `t` rows runs the smallest cap >= `t` ([`pick_partial`]): a few
-/// verify rows plan more splits.
-pub(crate) fn partial_programs(manifest: &serde_json::Value, family: &str, begin: usize, rows: usize, sms: usize)
+/// the one variant. These caps describe numerical plan alternatives, not live row limits.
+fn partial_programs(manifest: &serde_json::Value, family: &str, begin: usize, rows: usize, sms: usize)
     -> Result<Vec<(usize, String)>> {
     let programs = manifest["programs"].as_array().context("program manifest")?;
     let prefix = format!("{family}_sparse_mla_partial_h{begin}_s");
@@ -118,9 +117,16 @@ pub(crate) fn partial_programs(manifest: &serde_json::Value, family: &str, begin
     Ok(out)
 }
 
-/// The variant of `partials` (ascending caps, [`partial_programs`]) a step of `rows` rows runs.
-pub(crate) fn pick_partial(partials: &[(usize, String)], rows: usize) -> &str {
-    partials.iter().find(|(cap, _)| *cap >= rows).or(partials.last()).map_or("", |(_, name)| name.as_str())
+/// Select once at load, using numerical plan rows rather than live execution rows.
+/// Every exported alternative has the same full execution capacity in its name.
+pub(crate) fn partial_program(manifest: &serde_json::Value, family: &str, begin: usize,
+    execution_capacity_rows: usize, sms: usize,
+    plan: &cuteafd_core::coordinator_programs::AttentionReductionPlan) -> Result<String> {
+    ensure!(plan.capacity_rows() <= execution_capacity_rows,
+        "attention numerical domain exceeds execution capacity");
+    let partials = partial_programs(manifest, family, begin, execution_capacity_rows, sms)?;
+    partials.into_iter().find(|(cap, _)| *cap >= plan.rows()).map(|(_, name)| name)
+        .context("attention plan has no partial reduction recipe")
 }
 
 /// One cache plane within an ownership unit. Its row coordinates can differ
@@ -495,16 +501,20 @@ mod tests {
         let plans = partial_programs(&manifest, "dsv4p", 64, 64, 188).unwrap();
         assert_eq!(plans, [(1, "dsv4p_sparse_mla_partial_h64_s16_m64".to_string()),
             (8, "dsv4p_sparse_mla_partial_h64_s16_m64".to_string()), (64, "dsv4p_sparse_mla_partial_h64_s2_m64".to_string())]);
-        assert_eq!([1, 8, 9, 64, 65].map(|rows| pick_partial(&plans, rows)), ["dsv4p_sparse_mla_partial_h64_s16_m64",
-            "dsv4p_sparse_mla_partial_h64_s16_m64", "dsv4p_sparse_mla_partial_h64_s2_m64",
-            "dsv4p_sparse_mla_partial_h64_s2_m64", "dsv4p_sparse_mla_partial_h64_s2_m64"]);
         // Another row count selects only its own variants.
         assert_eq!(partial_programs(&manifest, "dsv4p", 64, 128, 188).unwrap(),
             [(128, "dsv4p_sparse_mla_partial_h64_s4_m128".to_string())]);
         assert!(partial_programs(&manifest, "dsv4p", 64, 128, 170).is_ok(), "the one variant serves any SM count");
         assert!(partial_programs(&manifest, "dsv4p", 0, 64, 188).is_err(), "no head-0 variant");
         assert!(partial_programs(&manifest, "dsv4f", 64, 64, 188).is_err(), "family prefixes do not cross");
-        assert_eq!(pick_partial(&[], 4), "");
+        for (drafts, chosen) in [(None, "dsv4p_sparse_mla_partial_h64_s16_m64"),
+            (Some(7), "dsv4p_sparse_mla_partial_h64_s16_m64"),
+            (Some(8), "dsv4p_sparse_mla_partial_h64_s2_m64")] {
+            let plan = cuteafd_core::coordinator_programs::AttentionReductionPlan::new(64, drafts, None).unwrap();
+            assert_eq!(partial_program(&manifest, "dsv4p", 64, 64, 188, &plan).unwrap(), chosen);
+        }
+        let wide = cuteafd_core::coordinator_programs::AttentionReductionPlan::new(128, None, None).unwrap();
+        assert!(partial_program(&manifest, "dsv4p", 64, 64, 188, &wide).is_err());
     }
 
     #[test]

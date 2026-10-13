@@ -148,6 +148,7 @@ rows 64 recover the matched gate while retaining the four other defaults.
 | Launcher key | Default | Resolution / old value |
 | --- | --- | --- |
 | `GLM5_FLASH_DECODE_ROWS` | `auto` | Resolves to `64`. Explicit `128` remains opt-in on one GPU with the required m128 programs. |
+| `ATTENTION_PLAN_ROWS` | `auto` | Startup numerical recipe: loaded drafter width + 1, clamped to 64; without a drafter, 1. Explicit 1..64 overrides it. The m64/m128 execution capacities share this domain; selected scratch holds the full execution capacity. |
 | `GLM5_FLASH_INDEX_CACHE` | `auto` | `compact` on one GPU, `keys` with a head split. |
 | `GLM5_FLASH_REPLAY_RECORDS` | `auto` | `shared` on one GPU with Spark experts and an automatic pool; otherwise `own`. |
 | `GLM5_FLASH_DRAFT_HEAD` | `tensor` | With an external drafter; `exact` restores the old path. Target verification is unchanged. |

@@ -1289,6 +1289,7 @@ pub(crate) struct GlmfEngine<'a> {
     /// rows keep the `_m64` ones). The decode workspace, the replay records and the commit tables
     /// hold this many rows.
     pub decode_rows: usize,
+    pub(super) attention_plan: cuteafd_core::coordinator_programs::AttentionReductionPlan,
     /// The most rows a verify step schedules, the drafts' budget: `decode_rows`, or with the wide
     /// programs this GPU's whole sparse MLA waves ([`verify_budget`]: 127 on an RTX 5090).
     pub verify_rows: usize,
@@ -1674,7 +1675,9 @@ impl<'a> GlmfEngine<'a> {
         let (table_pages, table_pool_pages) = glmf_table_pages(max_context as u64);
         let (table_pages, table_pool_pages) = (usize::try_from(table_pages)?, usize::try_from(table_pool_pages)?);
         Ok(Self { quantize_grid, library, programs, cfg, weights, stream, max_context, prefill_rows, prefill_lane_count,
-            pages, slots, decode_rows, verify_rows, buckets: DecodeBuckets::new(verify_rows),
+            pages, slots, decode_rows, verify_rows,
+            attention_plan: cuteafd_core::coordinator_programs::AttentionReductionPlan::new(DECODE_ROWS, None, None)?,
+            buckets: DecodeBuckets::new(verify_rows),
             replay_rows: std::cell::Cell::new(DECODE_ROWS),
             kda_ordinal, mla_ordinal, index_cache, replay_records, records: RecordGuard::new(replay_records), caches,
             device, context_mode, context: None, context_units: RefCell::new(Vec::new()),
@@ -4424,9 +4427,12 @@ impl<'a> GlmfEngine<'a> {
                 crate::families::glm5::engine::print_mla_check(index, &stats);
             }
         } else {
+            let decode_scalars = [rows, Scalar::I32(self.attention_plan.rows() as i32)];
+            let prefill_scalars = [rows];
+            let scalars = if tables.decode { &decode_scalars[..] } else { &prefill_scalars[..] };
             self.run_on(rank, split, &format!("sparse_mla_{mode}_{cap}"), &[("q", w.query.buffer.ptr), ("kv_cache", cache),
                 ("indices", w.indices.buffer.ptr), ("lengths", w.lengths.buffer.ptr), ("out", w.latent.buffer.ptr),
-                ("scratch", w.scratch.buffer.ptr)], &[rows])?;
+                ("scratch", w.scratch.buffer.ptr)], scalars)?;
         }
         if let Some(dir) = trace {
             std::fs::write(dir.join("mla_latent.bin"), self.download(&w.latent,
@@ -5246,17 +5252,19 @@ mod prefill_lane_tests {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../third_party/sparkinfer/b12x");
         // Any exporter change requires re-auditing shapes and arithmetic routes.
         for (path, expected) in [
-            // 1fac01ca adds owned index expansion only; decode projection shapes,
-            // arithmetic routes and thresholds are unchanged.
-            ("integration/cuteafd/glmf.py", 0x708f_0673_eb7e_87cd_u64),
-            // 9769b043 adds GlmQueryRope query_row (default heads * latent, the prior stride; GLM
-            // Flash decode never passes it), so projection shapes and routes are unchanged.
-            ("integration/cuteafd/_glm_kernels.py", 0x3aa5_9169_9149_9ba0),
+            // 09f29429 adds opt-in recurrence seq_ctas; 34698ec2 adds opt-in KDA
+            // decode_tiles. Defaults retain the projection shapes/routes and thresholds.
+            ("integration/cuteafd/glmf.py", 0xc821_9987_07e9_af1f_u64),
+            // 34698ec2 forwards an empty-by-default tiles_by_rows table; the GLM
+            // skinny crossover and default TMA projection remain unchanged.
+            ("integration/cuteafd/_glm_kernels.py", 0xe0ff_fc34_61c4_e6fb),
             ("integration/cuteafd/_fp8_weights.py", 0xb186_4a9c_36b1_7b30),
             ("integration/cuteafd/dsv4_mhc.py", 0x6b2a_c5a5_1dfa_46c5),
             // b629baef adds Qwen4Geometry::kv_record_bytes only; GLM projection routes are unchanged.
             ("integration/cuteafd/_common.py", 0x86ea_ace0_6ff1_26ca),
-            ("gemm/bf16_gemv/_skinny.py", 0x26cd_c0f9_cb63_d3a9),
+            // 34698ec2's RowTiledBf16Projection is opt-in; skinny_config,
+            // skinny_max_rows and the default RoutedBf16Projection paths are unchanged.
+            ("gemm/bf16_gemv/_skinny.py", 0xc52c_5862_a23d_41f0),
         ] {
             let bytes = std::fs::read(root.join(path)).unwrap();
             let hash = bytes.iter().fold(0xcbf2_9ce4_8422_2325_u64,

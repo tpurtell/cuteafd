@@ -93,7 +93,7 @@ def main():
         if re.sub(r"\s+", "", signature[1]) != re.sub(r"\s+", "", ",".join(expected)):
             raise ValueError("unexpected generated vision attention ABI: " + signature[1])
         artifacts = {p.name: hashlib.sha256(p.read_bytes()).hexdigest()
-            for p in destination.glob(stem + ".*") if p.is_file() and p != manifest_path}
+            for p in sorted(destination.glob(stem + ".*")) if p.is_file() and p != manifest_path}
         manifest = dict(schema=1, sparkinfer_revision=_pinned_sparkinfer.REVISION,
             source_tree_sha256=_pinned_sparkinfer.LOCK_DATA["source_tree_sha256"],
             capability=list(capability), geometry=dict(heads=HEADS, head_dim=dim,

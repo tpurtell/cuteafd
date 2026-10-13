@@ -120,6 +120,9 @@ pub struct Entry {
     /// prefill_lengths), e.g. a profiler's capture range.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub window: Option<Window>,
+    /// A `spec_lossless_set` case file (absolute, or relative to --repo); default: the shipped set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lossless_set: Option<String>,
 }
 
 /// `open` runs once after the sweep's first warm-up, just before its first
@@ -239,6 +242,7 @@ impl Entry {
             prefill_lengths: self.prefill_lengths.clone().or_else(|| defaults.prefill_lengths.clone()),
             baseline: self.baseline.or(defaults.baseline),
             window: self.window.clone().or_else(|| defaults.window.clone()),
+            lossless_set: self.lossless_set.clone().or_else(|| defaults.lossless_set.clone()),
         }
     }
 
@@ -681,6 +685,9 @@ pub fn run(args: SmokeArgs) -> Result<()> {
         if entry.window.is_some() && entry.levels.is_none() && entry.prefill_lengths.is_none() {
             bail!("{}: window needs levels or prefill_lengths (it frames the sweep's timed requests)", entry.name);
         }
+        if let Some(path) = &entry.lossless_set {
+            crate::panels::lossless::CaseSet::load(&args.repo.join(path)).with_context(|| format!("{}: lossless_set", entry.name))?;
+        }
         entries.push(entry);
     }
     let mut state = load_state(&paths.state);
@@ -694,9 +701,10 @@ pub fn run(args: SmokeArgs) -> Result<()> {
     eprintln!("{} entries, {} to run, build {build}, up to {} at once", entries.len(), pending.len(), args.parallel);
     if args.dry_run {
         for e in &pending {
-            eprintln!("  {} family={} gpus={:?} sparks={:?} locks={:?} levels={:?} post_load_c1={} prefill_lengths={:?} baseline={} window={} set={:?}",
+            eprintln!("  {} family={} gpus={:?} sparks={:?} locks={:?} levels={:?} post_load_c1={} prefill_lengths={:?} baseline={} window={} lossless_set={} set={:?}",
                 e.name, e.family.as_deref().unwrap_or("?"), e.gpus, e.sparks, locks_for(e), e.levels,
-                e.post_load_c1.unwrap_or(false), e.prefill_lengths, e.baseline.unwrap_or(true), e.window.is_some(), e.set);
+                e.post_load_c1.unwrap_or(false), e.prefill_lengths, e.baseline.unwrap_or(true), e.window.is_some(),
+                e.lossless_set.as_deref().unwrap_or("default"), e.set);
         }
         return Ok(());
     }
@@ -980,7 +988,9 @@ fn run_entry(entry: &Entry, repo: &Path, out_root: &Path, configs: &Path, logs: 
             export: vec!["svg".into(), "card".into(), "json".into()], out: None, label: Some(entry.name.clone()),
             root: out_root.to_path_buf(),
             api_key: api_key.clone(), quiet: true,
-            deadline: Some(Duration::from_secs(entry.run_timeout_s.unwrap_or(900))) };
+            deadline: Some(Duration::from_secs(entry.run_timeout_s.unwrap_or(900))),
+            lossless_set: entry.lossless_set.as_ref().map(|p| crate::panels::lossless::CaseSet::load(&repo.join(p)))
+                .transpose()? };
         let (mut report, dir) = crate::cli::run(&options)?;
         // Publication markers are runner metadata, not serving defaults. This
         // also works against images built before these markers existed.

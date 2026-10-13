@@ -110,7 +110,7 @@ def export(output: Path, rows: tuple[int, ...], projections=PROJECTIONS) -> None
     output.mkdir(parents=True, exist_ok=True)
     (output / 'v41_fp8.json').unlink(missing_ok=True)
     manifest = {'schema': 2, 'role': 'coordinator', 'capability': [props.major, props.minor],
-                'physical_sms': props.multi_processor_count, 'device': props.name,
+                'physical_sms': props.multi_processor_count, 'device': _pinned_sparkinfer.export_target(props),
                 'projections': [{'name': name, 'n': n, 'k': k, 'weight_block': [32,32],
                                  'groups': 8 if name == 'o_a' else 1,
                                  'activation_block': 32, 'activation_amax_floor': 0.0 if name == 'o_a' else 1e-4} for name,n,k in projections],

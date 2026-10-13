@@ -46,13 +46,32 @@ METRICS = ('C1', 'C8', '8K', 'kl', 'top1', 'pool', 'readiness_s')
 SUMMARY_METRICS = ('C1', 'C8', 'sweep C1', 'sweep C4', 'sweep C8', 'sweep C16', 'post-load C1', '8K', 'kl', 'top1', 'pool', 'readiness_s')
 LOWER_IS_BETTER = {'kl', 'readiness_s'}  # also every 'prefill N TTFT s'
 FAILURE = re.compile(r'(?i)(\berror\b|\bpanicked\b|\bfatal\b|\bfailed\b|undefined symbol|no such file|refus|exited:|timed out|out of memory|traceback)')
-PANELS = {'baseline', 'hardware', 'configuration', 'decode_content', 'concurrency', 'draft_mix', 'prefill', 'retained', 'prefix_cache', 'startup', 'agentic', 'tool_eval', 'structured', 'ifeval', 'code', 'math', 'needle', 'fidelity', 'fidelity_full', 'reasoning_effort'}
+PANELS = {'baseline', 'hardware', 'configuration', 'decode_content', 'concurrency', 'draft_mix', 'prefill', 'retained', 'prefix_cache', 'startup', 'agentic', 'tool_eval', 'structured', 'ifeval', 'code', 'math', 'needle', 'fidelity', 'fidelity_full', 'reasoning_effort', 'spec_lossless_set'}
 
 
 def short_instance(value):
     if not NAME.fullmatch(value):
         raise ValueError('invalid instance: ' + value)
     return value if len(value) <= 41 else value[:32] + '-' + hashlib.sha256(value.encode()).hexdigest()[:8]
+
+
+def load_lossless_set(path):
+    """An absolute, checked spec_lossless_set case file; the server re-validates."""
+    path = Path(path).expanduser().resolve()
+    cases = json.loads(path.read_text())
+    if not isinstance(cases, list) or not cases or len(cases) > 64:
+        raise ValueError(f'{path}: a lossless set is a JSON list of 1 to 64 cases')
+    ids = set()
+    for case in cases:
+        if not isinstance(case, dict) or set(case) - {'id', 'prompt', 'nonce', 'source', 'reconstructed'} \
+                or not all(isinstance(case.get(k), str) and case[k].strip() for k in ('id', 'prompt', 'nonce')):
+            raise ValueError(f'{path}: each case needs string id, prompt and nonce (optional source, reconstructed)')
+        if not re.fullmatch(r'[A-Za-z0-9_.-]{1,64}', case['id']) or case['id'] in ids:
+            raise ValueError(f"{path}: invalid or duplicate case id {case['id']!r}")
+        if re.search(r'[\[\]\x00-\x1f]', case['nonce']):
+            raise ValueError(f"{path}: case {case['id']}: nonce has brackets or control characters")
+        ids.add(case['id'])
+    return str(path)
 
 
 def requested_panels(profile):
@@ -318,6 +337,15 @@ def binary_supports(binary, repo, job, needs):
         raise ValueError(f"{binary} predates smoke fields {', '.join(missing)}; build cuteafd from this checkout and pass --binary")
 
 
+def launcher_forwards_v41_trace(repo):
+    """Whether the checkout's V4.1 launch forwards SPECULATION_TRACE: run.sh's own
+    path before #82, run-family.sh's shared trace helper since."""
+    family = repo / 'scripts/launch/run-family.sh'
+    if family.is_file() and 'launch_deepseek_v41' in family.read_text():
+        return 'CUTEAFD_SPECULATION_TRACE' in family.read_text()
+    return 'CUTEAFD_SPECULATION_TRACE' in (repo / 'run.sh').read_text()
+
+
 def speculating(values):
     """Whether a launch resolves a speculator (traces are written only then)."""
     return values.get('SPECULATOR', 'auto') != 'off' and values.get('DSPARK', 'on') != 'off'
@@ -347,6 +375,11 @@ def preflight_job(job, arm):
         if needs['audio'] and contents.get('audio') is False:
             problems.append(f"{host}: slot {arm['slot']} was built without the audio tower (AUDIO={values.get('AUDIO', 'auto')}); "
                             'rebuild with CUTEAFD_WIP_AUDIO_AOT=ON or set AUDIO=off')
+        role = needs.get('tp_role')
+        # The seal check always reports tp_roles (None: no TP manifest); a record
+        # without the field is not a seal check result and carries no attestation.
+        if role and host != 'raptor' and 'tp_roles' in contents:
+            problems.extend(tp_role_problems(host, arm['slot'], role, needs.get('nvfp4', False), contents))
     for key in ('SPECULATION_TRACE', 'PROFILE_DIR'):
         if values.get(key):
             directory = Path(values[key]) if key == 'PROFILE_DIR' else Path(values[key]).parent
@@ -355,6 +388,24 @@ def preflight_job(job, arm):
     if problems:
         raise ValueError('; '.join(problems))
     return artifacts
+
+
+def tp_role_problems(host, slot, role, nvfp4, contents):
+    """The launcher's fail-closed V4.1 role check (#98): every Spark rank's slot
+    attests the role, with verified symbols and matching hashes."""
+    attested = contents.get('tp_roles')
+    rebuild = f'rebuild with CUTEAFD_WIP_SPARK_TP_ROLES={role} (wip-cards --build derives it from the card)'
+    if attested is None:
+        return [f'{host}: slot {slot} has no V41_EXPERT_TP_AOT.json; it cannot attest Spark TP role {role}; {rebuild}']
+    if attested.get('error'):
+        return [f"{host}: slot {slot} cannot attest Spark TP role {role}: {attested['error']}; {rebuild}"]
+    if role not in attested.get('roles', []):
+        return [f"{host}: slot {slot} attests Spark TP roles {';'.join(attested.get('roles')) or '<none>'}, not {role}; {rebuild}"]
+    if not attested.get('verified'):
+        return [f'{host}: slot {slot}: TP symbols are not verified for {role}; {rebuild}']
+    if nvfp4 and role not in attested.get('nvfp4', []):
+        return [f'{host}: slot {slot} lacks verified NVFP4 {role} exports; {rebuild} with the NVFP4 scope']
+    return []
 
 
 def smoke_command(binary, repo, job):
@@ -701,7 +752,7 @@ def classify(row, launched):
         return 'preflight'
     if not launched:
         return 'launch'
-    if row.get('quality') in ('fail', 'failed') or any(isinstance(row.get(k), dict) and row[k].get('status') in ('fail', 'failed') for k in ('cache', 'spec')):
+    if row.get('quality') in ('fail', 'failed') or any(isinstance(row.get(k), dict) and row[k].get('status') in ('fail', 'failed') for k in ('cache', 'spec', 'lossless_set')):
         return 'quality'
     return 'measurement'
 
@@ -750,6 +801,11 @@ def summarize_job(job, exit_code):
             fail(row, 'quality: ' + '; '.join(bad)[:400], 'quality')
         elif report.get('status') in failed or quality.get('status') in failed:
             fail(row, 'report ' + str(report.get('status')) + ': ' + str(report.get('error') or '')[:300])
+        lossless = lossless_set_result(report)
+        if lossless:
+            row['lossless_set'] = lossless
+            if lossless['status'] == 'fail':
+                fail(row, 'quality: spec_lossless_set: ' + lossless['summary'][:400], 'quality')
     if job.get('correctness_parallel'):
         for metric in ('C1', 'C8', '8K'):
             row[metric] = None
@@ -812,6 +868,24 @@ def summarize_job(job, exit_code):
     row['failure_kind'] = row.get('failure_kind') or classify(row, launched)
     save(dest / 'result.json', row)
     return row
+
+
+def lossless_set_result(report):
+    """The spec_lossless_set panel's verdict: its gate over every case, or a
+    failure when the panel errored or produced no pass. Case evidence stays in
+    report.json."""
+    panel = next((p for p in report.get('panels', []) if p.get('id') == 'spec_lossless_set'), None)
+    if panel is None:
+        return None
+    passes = panel.get('passes') or []
+    if panel.get('status') == 'unsupported':
+        return {'status': 'skipped', 'summary': panel.get('error') or 'unsupported'}
+    if not passes:
+        return {'status': 'fail', 'summary': panel.get('error') or 'no pass recorded'}
+    last = passes[-1]
+    return {'status': 'pass' if last.get('gate') == 'pass' else 'fail', 'summary': last.get('summary', ''),
+            'passed': last.get('passed'), 'total': last.get('total'), 'set': last.get('set'),
+            'failing': [r['id'] for r in last.get('rows', []) if not r.get('pass')]}
 
 
 def matched_requests(dest):
@@ -883,6 +957,17 @@ def status_cell(check):
     return str(check.get('status', '')) + (' (' + check['summary'][:60] + ')' if check.get('summary') and check.get('status') != 'pass' else '')
 
 
+def spec_cell(row):
+    """The baseline's single spec check, then the lossless set's k/N when it ran."""
+    text = status_cell(row.get('spec'))
+    lossless = row.get('lossless_set')
+    if isinstance(lossless, dict):
+        text = (text + '; ' if text else '') + f"set {lossless.get('passed', '?')}/{lossless.get('total', '?')} {lossless['status']}"
+        if lossless.get('failing'):
+            text += ' (' + ', '.join(lossless['failing'])[:80] + ')'
+    return text
+
+
 def write_summary(state, rows, arms):
     validate_matched_pairs(rows, list(arms))
     names = list(arms)
@@ -930,7 +1015,7 @@ def write_summary(state, rows, arms):
         profile_cell = f"{len(profile.get('files', []))} files" if profile else ''
         if profile.get('reports'):
             profile_cell += ': ' + ', '.join(f"{r['name']} ({r['bytes'] / 2**20:.1f} MiB)" for r in profile['reports'])
-        text += f"| {r['card']} | {r['arm']} | {r['repeat']} | {r['status']}{' (simulated)' if r.get('simulated') else ''} | {r.get('failure_kind') or ''} | {cell(status_cell(r.get('spec')))} | {cell(status_cell(r.get('cache')))} | {trace_cell} | {profile_cell} | {cell((r.get('error') or '')[:240])} |\n"
+        text += f"| {r['card']} | {r['arm']} | {r['repeat']} | {r['status']}{' (simulated)' if r.get('simulated') else ''} | {r.get('failure_kind') or ''} | {cell(spec_cell(r))} | {cell(status_cell(r.get('cache')))} | {trace_cell} | {profile_cell} | {cell((r.get('error') or '')[:240])} |\n"
     if failed:
         text += '\n## Failures\n\nlaunch = the server never served the card; quality = it served and a correctness check failed; measurement = it served and a measurement or evidence check failed; preflight = refused before hardware.\n\n'
         for r in failed:
@@ -999,7 +1084,26 @@ def contents(p):
         if out.returncode==0: audio=any(line.split()[-1:]==['cuteafd_audio_required'] for line in out.stdout.splitlines())
     except (OSError,subprocess.SubprocessError):
         pass
-    return dict(packages=packages,audio=audio)
+    return dict(packages=packages,audio=audio,tp_roles=tp_roles(p,art))
+def tp_roles(p,art):
+    # The V4.1 Spark TP roles this slot attests, verified as run-family.sh's
+    # launch_deepseek_v41 verifies them; None when the slot carries no manifest.
+    try:
+        meta=json.loads((p/'META.json').read_bytes())
+        data=(art/'V41_EXPERT_TP_AOT.json').read_bytes()
+    except (OSError,ValueError):
+        return None
+    try:
+        assert hashlib.sha256(data).hexdigest()==meta.get('v41_expert_tp_manifest_sha256'),'TP manifest hash mismatch'
+        manifest=json.loads(data)
+        roles=manifest.get('spark_tp_roles')
+        assert manifest.get('schema')==1 and isinstance(roles,list) and all(r in ('tp2','tp3','tp6') for r in roles),'invalid TP roles'
+        assert roles==meta.get('spark_tp_roles'),'slot and artifact roles differ'
+        lib=hashlib.sha256((art/'libcuteafd_native.so').read_bytes()).hexdigest()
+        assert lib==manifest.get('native_library_sha256'),'native library hash mismatch'
+        return dict(roles=roles,verified=manifest.get('symbols_verified') is True,nvfp4=manifest.get('nvfp4_spark_tp_roles',[]),error=None)
+    except (OSError,ValueError,AssertionError) as error:
+        return dict(roles=[],verified=False,nvfp4=[],error=str(error))
 try:
     m=check(host,lambda path: path.read_bytes())
     m['seal_source']='host:'+str(host)
@@ -1169,7 +1273,40 @@ def slot_needs(card):
     if int(values.get('SPARK_COUNT', len(card.get('sparks', [])))) == 0:
         spark = set()
     return dict(coordinator=sorted(coordinator), spark=sorted(spark),
-                audio=scopes.get('CUTEAFD_WIP_AUDIO_AOT') == 'ON')
+                audio=scopes.get('CUTEAFD_WIP_AUDIO_AOT') == 'ON', **v41_tp_role(card, values))
+
+
+def v41_tp_role(card, values):
+    """The SM121 expert role a DeepSeek V4.1 card's Spark TP requires, as the
+    launcher derives it (scripts/launch/run-family.sh, launch_deepseek_v41): an
+    explicit SPARK_TP/SPARK_EP topology with TP 2, 3 or 6, or a native non-EXL3
+    count other than 0 and 4 (TP = count). TP4 is the built-in default role.
+    NVFP4 checkpoints need the role's NVFP4 exports too."""
+    if card.get('family') != 'deepseek_v41':
+        return dict(tp_role=None, nvfp4=False)
+    count = int(values.get('SPARK_COUNT', len(card.get('sparks', []))))
+    explicit = bool(values.get('SPARK_TP') or values.get('SPARK_EP'))
+    exl3 = values.get('EXPERT_FORMAT', 'native') == 'exl3'
+    tp = int(values['SPARK_TP']) if explicit and values.get('SPARK_TP') else count
+    role = None
+    if explicit and tp in (2, 3, 6):
+        role = f'tp{tp}'
+    elif not explicit and not exl3 and count not in (0, 4) and count in (2, 3, 6):
+        role = f'tp{count}'
+    return dict(tp_role=role, nvfp4=checkpoint_is_nvfp4(values))
+
+
+def checkpoint_is_nvfp4(values):
+    """Whether the card's checkpoint ships NVFP4 routed experts (its own
+    config.json's moe_quant_algo, as the launcher reads it)."""
+    model = values.get('MODEL_ID', 'deepseek-ai/DeepSeek-V4.1-Flash')
+    hub = Path(os.environ.get('HF_HOME', Path.home() / '.cache/huggingface')) / 'hub' / ('models--' + model.replace('/', '--'))
+    revision = values.get('MODEL_REVISION') or ((hub / 'refs/main').read_text().strip() if (hub / 'refs/main').is_file() else '')
+    try:
+        quant = json.loads((hub / 'snapshots' / revision / 'config.json').read_text()).get('quantization_config') or {}
+        return quant.get('moe_quant_algo') == 'NVFP4'
+    except (OSError, ValueError):
+        return 'nvfp4' in model.lower()
 
 
 def toolchain_hash(revision):
@@ -1399,6 +1536,8 @@ def main():
     parser.add_argument('--probe', action='append', default=[], metavar='CARD:image,memory,console')
     parser.add_argument('--panels', metavar='LIST', help='run these server panels on every card instead of its profile '
                         '(comma list; "baseline" for the basic card + quick quality alone; "none" for no server profile)')
+    parser.add_argument('--lossless-set', type=Path, metavar='FILE', help='case file for the spec_lossless_set panel '
+                        '(JSON [{id, prompt, nonce}]); default: the shipped scripts/bench/fixtures/spec-lossless-set-v1.json')
     parser.add_argument('--levels', metavar='C,C', help='client-side code-decode sweep at these concurrency levels after the profile, e.g. 1,16')
     parser.add_argument('--post-load-c1', action='store_true', help='re-measure C1 after the widest --levels level')
     parser.add_argument('--prefill-lengths', metavar='N,N', help='client-side cold prefill at these prompt lengths (one untimed warm '
@@ -1513,15 +1652,22 @@ def main():
             card['profile'] = profile
             if listed and 'baseline' not in listed:
                 card['baseline'] = False  # Explicit panels alone; list baseline to keep it.
+    lossless_set = None
+    if args.lossless_set is not None:
+        lossless_set = load_lossless_set(args.lossless_set)
+        if not any('spec_lossless_set' in requested_panels(card.get('profile', 'smoke')) for card in cards):
+            parser.error('--lossless-set needs --panels with spec_lossless_set')
     for card in cards:
+        if lossless_set:
+            card['lossless_set'] = lossless_set
         if prefill_lengths:
             card['prefill_lengths'] = prefill_lengths
         if levels:
             card['levels'] = levels
             if args.post_load_c1:
                 card['post_load_c1'] = True
-        if args.trace and card.get('family') == 'deepseek_v41' and not (args.repo / 'run.sh').read_text().count('CUTEAFD_SPECULATION_TRACE'):
-            raise ValueError(f"{card['name']}: this checkout's run.sh does not forward SPECULATION_TRACE on the V4.1 path")
+        if args.trace and card.get('family') == 'deepseek_v41' and not launcher_forwards_v41_trace(args.repo):
+            raise ValueError(f"{card['name']}: this checkout's launcher does not forward SPECULATION_TRACE on the V4.1 path")
     probes = {card['name']: set(card.get('probes', [])) for card in cards}
     expected = {card['name']: card.get('expected_pool') for card in cards}
     for item in args.probe:
@@ -1634,7 +1780,8 @@ def main():
             print(f'wip-cards: resume keeps {len(kept)} passed job(s), reruns {len(jobs) - len(kept)}', file=sys.stderr)
     fields = (['levels', 'post_load_c1'] if args.levels else []) + (['prefill_lengths'] if prefill_lengths else []) + \
         (['baseline'] if any(job['entry'].get('baseline') is False for job in jobs) else []) + \
-        (['window'] if any(job['entry'].get('window') for job in jobs) else [])
+        (['window'] if any(job['entry'].get('window') for job in jobs) else []) + \
+        (['lossless_set'] if any(job['entry'].get('lossless_set') for job in jobs) else [])
     for job in jobs[:1]:
         binary_supports(args.binary, args.repo, job, fields)
     # Everything checkable without hardware, before any queue ticket.

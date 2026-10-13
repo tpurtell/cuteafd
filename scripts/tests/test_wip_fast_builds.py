@@ -162,6 +162,8 @@ release_die() {{ exit 2; }}
 cuteafd_compiler_cache_warn() {{ :; }}
 slot=test coordinator_container=owned COORDINATOR_DOCKER_DEV=image bf16_families= audio_aot=OFF
 CUTEAFD_WIP_EXPORT_LOCKS=on wip_export_locks=on wip_export_gpu_lock=gpu1
+# The fair turn only (off-queue modes: test_wip_coordinator_export_modes.py).
+CUTEAFD_WIP_COORDINATOR_EXPORT=turn
 '''
     result = subprocess.run(['bash', '-c', setup + helpers + '\nbuild_coordinator'], capture_output=True, text=True,
                             env={**os.environ, 'HOME': str(tmp_path / 'home'), 'PATH': f'{tools}:{os.environ["PATH"]}',

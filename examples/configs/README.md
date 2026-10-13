@@ -46,9 +46,10 @@ prefer the official MXFP4 release.
 The speculator and pool keys repeat the launcher's bare defaults for the
 family: dropping them gives the same launch, and
 `scripts/tests/test_example_configs.py` keeps the two in step. The one named
-exception is V4.1's `POOL_TOKENS=auto`: its cards ran with it, while `run.sh`
-keeps V4.1's own pool policy when the key is absent. Roadmap step S5 moves
-V4.1 onto `run-family.sh` and unifies that default.
+exception is V4.1's `POOL_TOKENS=auto`: its cards ran with it, while V4.1's
+release loader leaves the key empty when absent (the launch then resolves
+auto). V4.1 launches through `run-family.sh` like every family (#82); roadmap
+step S5 unifies this default with the other families'.
 
 ## TP x EP layout examples (DeepSeek V4.1)
 

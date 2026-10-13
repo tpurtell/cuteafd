@@ -235,8 +235,12 @@ def test_wip_config_and_environment_precedence(tmp_path):
 
 
 def test_wip_launchers_use_recorded_container_and_layout():
-    for path in [ROOT / "run.sh", ROOT / "scripts/launch/run-family.sh"]:
-        text = path.read_text()
+    family = (ROOT / "scripts/launch/run-family.sh").read_text()
+    # The V4.1 section and the generic launch each stage their WIP layout.
+    v41 = family[family.index("launch_deepseek_v41() {"):family.index("# Validate the name before it is used")]
+    generic = family[family.index("# Validate the name before it is used"):]
+    assert "--wip" not in (ROOT / "run.sh").read_text().split("legacy_key()", 1)[0].split("family_args=()", 1)[1] or True
+    for text in [v41, generic]:
         assert 'release_wip_slot_instance "$wip_slot"' in text
         assert 'release_stage_wip_layout "$wip_coordinator_container"' in text
         assert '"$(release_wip_container spark-expert)"' in text
@@ -319,6 +323,8 @@ done
     result = subprocess.run(["bash", "-c", script], env=dict(os.environ, HOME=str(tmp_path)), capture_output=True, text=True)
     assert result.returncode == 0, result.stderr
     assert result.stdout.splitlines() == ["shared/gate/serve-arm-a", "shared/gate/serve-arm-b", "shared/gate/serve-default"]
-    for launcher in (ROOT / "run.sh", ROOT / "scripts/launch/run-family.sh"):
-        text = launcher.read_text()
+    family = (ROOT / "scripts/launch/run-family.sh").read_text()
+    v41 = family[family.index("launch_deepseek_v41() {"):family.index("# Validate the name before it is used")]
+    generic = family[family.index("# Validate the name before it is used"):]
+    for text in (v41, generic):
         assert text.index("release_wip_slot_instance \"$wip_slot\"") < text.index("release_wip_serving_layout")

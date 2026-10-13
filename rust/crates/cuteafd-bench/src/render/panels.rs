@@ -33,6 +33,7 @@ pub fn body(doc: &mut Doc, t: &Theme, id: &str, panel: &PanelResult, w: f64) -> 
         "needle" => needle(doc, t, latest, w),
         "math" => scored(doc, t, latest, w, "correct", "rows", "question", "correct"),
         "code" => scored(doc, t, latest, w, "passed", "rows", "problem", "passed"),
+        "spec_lossless_set" => scored(doc, t, latest, w, "passed", "rows", "reason", "pass"),
         "ifeval" => ifeval(doc, t, latest, w),
         "reasoning_effort" => reasoning(doc, t, latest, w),
         "agentic" => agentic(doc, t, latest, w),

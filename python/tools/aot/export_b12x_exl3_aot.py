@@ -298,7 +298,7 @@ def export(output: Path, intermediate: int, experts: int, capacity: int,
                 raise ValueError(f'route metadata exceeds canonical capacity: {name}')
             spec.update(shape=[count], bytes=count * 4)
     manifest = {"schema": "cuteafd.v41-exl3-aot.v1", "sparkinfer_revision": _pinned_sparkinfer.REVISION,
-        "gpu": props.name, "compute": [props.major, props.minor], "sms": workspace_sms,
+        "gpu": _pinned_sparkinfer.export_target(props), "compute": [props.major, props.minor], "sms": workspace_sms,
         "physical_sms": props.multi_processor_count,
         "hidden": hidden, "intermediate": intermediate, "experts": experts, "top_k": topk,
         "capacity": capacity, "output_dtype": output_dtype, "bits": list(bits), "swiglu_limit": swiglu_limit,

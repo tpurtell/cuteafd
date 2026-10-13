@@ -10,6 +10,7 @@ pub mod agentic;
 pub mod common;
 pub mod fidelity;
 pub mod info;
+pub mod lossless;
 pub mod names;
 pub mod quality;
 pub mod reasoning;
@@ -103,6 +104,8 @@ pub struct Ctx<'a> {
     /// The server's request limits (`/v1/models`).
     pub max_context: u64,
     pub max_output: u64,
+    /// The run's lossless case set, when the client sent one (else the shipped default).
+    pub lossless_set: Option<&'a lossless::CaseSet>,
 }
 
 pub trait Panel: Send + Sync {
@@ -122,7 +125,7 @@ pub trait Panel: Send + Sync {
 pub fn catalog() -> Vec<&'static dyn Panel> {
     vec![&info::HARDWARE, &info::CONFIGURATION, &speed::DECODE_CONTENT, &speed::CONCURRENCY, &speed::DRAFT_MIX, &speed::PREFILL,
         &speed::RETAINED, &speed::PREFIX_CACHE, &agentic::AGENTIC, &quality::STRUCTURED, &quality::NEEDLE, &quality::IFEVAL,
-        &fidelity::STANDARD, &fidelity::FULL, &quality::CODE, &quality::MATH, &reasoning::REASONING, &tools::TOOL_EVAL, &info::STARTUP]
+        &fidelity::STANDARD, &fidelity::FULL, &quality::CODE, &quality::MATH, &reasoning::REASONING, &tools::TOOL_EVAL, &lossless::LOSSLESS_SET, &info::STARTUP]
 }
 
 pub fn find(id: &str) -> Option<&'static dyn Panel> {

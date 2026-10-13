@@ -114,12 +114,12 @@ impl Run<'_> {
 }
 
 /// Probe record of a chat, or an error naming what is missing.
-fn probe_of(chat: &Chat) -> Result<&ProbeRecord> {
+pub(crate) fn probe_of(chat: &Chat) -> Result<&ProbeRecord> {
     chat.probe.as_ref().context("no probe record")
 }
 
 /// Whether the engine honoured the probe at all.
-fn honoured(record: &ProbeRecord) -> bool {
+pub(crate) fn honoured(record: &ProbeRecord) -> bool {
     record.engine.is_some()
 }
 
@@ -440,7 +440,8 @@ fn spec_lossless(run: &mut Run<'_>, check: &mut Check) -> Result<()> {
         return Ok(());
     };
     const TOKENS: u64 = 128;
-    let text = format!("[{}] {}", nonce(), CONTENT[0].1);
+    let tag = nonce();
+    let text = format!("[{tag}] {}", CONTENT[0].1);
     let spec = |off: bool| ProbeSpec { cold: true, no_speculation: off, record_rows: TOKENS as usize, top_k: 2,
         ..ProbeSpec::default() };
     let on = run.client.chat(plain(&text, TOKENS), Some(spec(false)))?;
@@ -465,6 +466,8 @@ fn spec_lossless(run: &mut Run<'_>, check: &mut Check) -> Result<()> {
         check.summary = format!("{speculator}: {} greedy tokens identical with drafts on and off {rates}", a.len());
         return Ok(());
     }
+    // Any divergence keeps what replays it (the verdict below may still pass a near tie).
+    check.set("replay", replay(&tag, &text, TOKENS, off_record));
     // Evidence for numerics vs state: how far the drafted run's rows already
     // were from the one-row run's on the identical prefix. A flip within that
     // noise is rounding; noise that is zero until a point and then grows
@@ -487,9 +490,7 @@ fn spec_lossless(run: &mut Run<'_>, check: &mut Check) -> Result<()> {
     // Verify rows and single-row steps may round differently: a flip where the
     // top two candidates are within rounding of each other is a tie, not a loss.
     let position = off_record.prompt_ids.len() + same;
-    let margin = |record: &ProbeRecord| record.rows.iter().find(|r| r.position == position)
-        .and_then(|r| (r.top.len() >= 2).then(|| f64::from(r.top[0].1 - r.top[1].1)));
-    let margins = (margin(off_record), margin(on_record));
+    let margins = (top_two_margin(off_record, position), top_two_margin(on_record, position));
     check.set("divergence_margin_off", margins.0);
     check.set("divergence_margin_on", margins.1);
     let tie = match margins {
@@ -517,6 +518,19 @@ fn spec_lossless(run: &mut Run<'_>, check: &mut Check) -> Result<()> {
     Ok(())
 }
 
+/// Log-probability margin between the top two candidates of the row predicting `position`.
+pub(crate) fn top_two_margin(record: &ProbeRecord, position: usize) -> Option<f64> {
+    record.rows.iter().find(|r| r.position == position)
+        .and_then(|r| (r.top.len() >= 2).then(|| f64::from(r.top[0].1 - r.top[1].1)))
+}
+
+/// What replays one probed request exactly: the nonce, the request text and the prompt ids the
+/// engine ran. Random nonces are otherwise lost, so every lossless failure keeps this.
+pub(crate) fn replay(nonce: &str, text: &str, max_tokens: u64, record: &ProbeRecord) -> Value {
+    json!({"nonce": nonce, "text": text, "max_tokens": max_tokens, "thinking": "disabled", "temperature": 0,
+        "prompt_ids": record.prompt_ids})
+}
+
 /// The lossless verdict for a drafts-on vs drafts-off flip.
 ///
 /// A near tie passes. Otherwise the flip is verify rounding, reported but not
@@ -542,7 +556,7 @@ fn flip_verdict(tie: bool, decode_repeats: bool, noise: &RowNoise) -> CheckStatu
 /// Per-row difference between two greedy runs' recorded rows over their
 /// identical prefix: the log-probability of the (shared) top token.
 #[derive(Debug, PartialEq, serde::Serialize)]
-struct RowNoiseSample {
+pub(crate) struct RowNoiseSample {
     generated_index: usize,
     position: usize,
     delta: f64,
@@ -550,19 +564,19 @@ struct RowNoiseSample {
 }
 
 #[derive(Debug, Default, PartialEq)]
-struct RowNoise {
-    compared: usize,
-    identical: usize,
-    max: f64,
-    median: f64,
+pub(crate) struct RowNoise {
+    pub(crate) compared: usize,
+    pub(crate) identical: usize,
+    pub(crate) max: f64,
+    pub(crate) median: f64,
     /// Generated-token index of the first row more than 0.01 nats apart.
-    first_over: Option<usize>,
-    rows: Vec<RowNoiseSample>,
+    pub(crate) first_over: Option<usize>,
+    pub(crate) rows: Vec<RowNoiseSample>,
 }
 
 impl RowNoise {
     /// Rows predicting positions before `end` that both records hold.
-    fn between(a: &ProbeRecord, b: &ProbeRecord, end: usize) -> Self {
+    pub(crate) fn between(a: &ProbeRecord, b: &ProbeRecord, end: usize) -> Self {
         let start = b.prompt_ids.len();
         let mut deltas = Vec::new();
         let mut noise = RowNoise::default();
@@ -605,7 +619,7 @@ impl RowNoise {
         }
     }
 
-    fn describe(&self) -> String {
+    pub(crate) fn describe(&self) -> String {
         if self.compared == 0 {
             return String::new();
         }
@@ -840,6 +854,14 @@ mod tests {
         assert!((noise.max - 0.1).abs() < 1e-6 && (noise.median - 0.005).abs() < 1e-6, "{noise:?}");
         assert!(noise.describe().contains("1 of 3 rows byte-identical"));
         assert_eq!(RowNoise::between(&on, &ProbeRecord::default(), 13).describe(), "");
+    }
+
+    #[test]
+    fn a_divergence_keeps_what_replays_it() {
+        let record = ProbeRecord { prompt_ids: vec![3, 1, 4], ..ProbeRecord::default() };
+        let text = format!("[{}] {}", "0a1b2c3d4e", CONTENT[0].1);
+        assert_eq!(replay("0a1b2c3d4e", &text, 128, &record), json!({"nonce": "0a1b2c3d4e", "text": text,
+            "max_tokens": 128, "thinking": "disabled", "temperature": 0, "prompt_ids": [3, 1, 4]}));
     }
 
     #[test]

@@ -167,7 +167,7 @@ def export(
         "input_format": "bf16",
         "activation": "silu",
         "sparkinfer_revision": _pinned_sparkinfer.REVISION,
-        "device": properties.name,
+        "device": _pinned_sparkinfer.export_target(properties),
         "capability": [properties.major, properties.minor],
         "physical_sms": properties.multi_processor_count,
         "tile_m": tile_m,

@@ -380,7 +380,7 @@ class LauncherTopologyTest(unittest.TestCase):
 
     def run_startup(self, *, gpus, plan, topology_explicit, spark_tp, spark_ep, spark_count, hosts,
                     extra_env=None, extra_setup=""):
-        source = (ROOT / "run.sh").read_text()
+        source = (ROOT / "scripts/launch/run-family.sh").read_text()
         block = source[source.index("placement_directory="):source.index("api_url=")]
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -452,6 +452,14 @@ spark_first_layer=0
 wip_layout=
 wip_slot=
 SPARK_COUNT={spark_count}
+# Shared launch features (run-family.sh helpers) at their defaults.
+bench_dir="$HOME/.cache/cuteafd/bench"
+api_args=() api_mount_args=() probe_args=() trace_args=() bench_nonce_env_args=() graph_census_args=()
+profile_args=() profile_wrapper=() profile_wrapper_args=()
+shared_env_args=(-e CUTEAFD_SPARK_INTAKE=auto -e CUTEAFD_CONSOLE_TEXT=true -e CUTEAFD_ATTENTION_PLACEMENT=auto -e CUTEAFD_FP8_EXPERT_PREFILL=auto)
+shared_worker_env_args=(-e CUTEAFD_FP8_EXPERT_PREFILL=auto -e CUTEAFD_THERMAL=on)
+thermal_args=(-e CUTEAFD_THERMAL=on)
+v41_fp8_head_args=()
 {extra_setup}'''
             result = subprocess.run(
                 ["bash", "-c", setup + block, "test", str(gpus)],
@@ -467,7 +475,16 @@ SPARK_COUNT={spark_count}
                 if events_path.exists()
                 else []
             )
-            return result, events
+            # Worker docker options follow the positional contract behind a
+            # --profile-args sentinel; these tests index the positionals.
+            trimmed = []
+            for tool, args in events:
+                if tool == "ssh" and "-s" in args and "--profile-args" in args:
+                    tail = args[args.index("--profile-args") + 1:]
+                    assert "-e" in tail and "CUTEAFD_THERMAL=on" in tail, tail
+                    args = args[:args.index("--profile-args")]
+                trimmed.append([tool, args])
+            return result, trimmed
 
     def test_default_launch_passes_no_topology_flags_or_dummy_peers(self) -> None:
         result, events = self.run_startup(
@@ -654,7 +671,7 @@ SPARK_COUNT={spark_count}
                 )
 
     def test_worker_remote_block_emits_flags_only_when_explicit(self) -> None:
-        source = (ROOT / "run.sh").read_text()
+        source = (ROOT / "scripts/launch/run-family.sh").read_text()
         _, remote = source.split("echo \"== starting native Spark experts ==\"", 1)[1].split("<<'REMOTE' &", 1)
         remote = remote.split("\nREMOTE", 1)[0].replace(" >/dev/null", "")
         harness = 'source scripts/lib/release-common.sh; docker() { printf "%s\\n" "$@"; }\n' + remote
@@ -946,7 +963,7 @@ class BuildScopeTest(unittest.TestCase):
         self.assertIn("V41_EXPERT_TP_AOT.json", dockerfile)
 
     def test_run_sh_accepts_actual_placement_gpus_and_opens_single_rtx_handoff(self) -> None:
-        release = (ROOT / "run.sh").read_text()
+        release = (ROOT / "scripts/launch/run-family.sh").read_text()
         self.assertIn('--argjson gpus "$RELEASE_RTX_GPUS"', release)
         self.assertIn("(.rtx_gpus == 1 or .rtx_gpus == 2) and .rtx_gpus <= $gpus", release)
         self.assertIn(".rtx_expert_layers > 0 or .rtx_gpus == 1", release)
@@ -956,7 +973,7 @@ class BuildScopeTest(unittest.TestCase):
         self.assertNotIn("((RELEASE_RTX_GPUS == 2)); then\n  docker exec \"$coordinator\" sh -c 'cp", release)
 
     def test_native_pool_policy_changes_fingerprint_and_preserves_omitted_policy(self) -> None:
-        expression = next(line for line in (ROOT / "run.sh").read_text().splitlines()
+        expression = next(line for line in (ROOT / "scripts/launch/run-family.sh").read_text().splitlines()
                           if line.startswith('fingerprint="'))
         hashes = []
         for setting in (None, "", "auto", "1024"):
@@ -974,7 +991,7 @@ class BuildScopeTest(unittest.TestCase):
         self.assertEqual(len(set(hashes)), 3)
 
     def test_run_sh_image_diagnostics_name_the_reference_and_host(self) -> None:
-        release = (ROOT / "run.sh").read_text()
+        release = (ROOT / "scripts/launch/run-family.sh").read_text()
         # A missing coordinator image is a naming problem, not a build problem:
         # the message must carry the configured reference and both remedies.
         self.assertIn("coordinator image is missing: $COORDINATOR_DOCKER_INFERENCE", release)
@@ -999,7 +1016,7 @@ class BuildScopeTest(unittest.TestCase):
 
     def test_removed_adaptive_cost_mode_is_not_forwarded(self) -> None:
         # The online length policy has no offline cost profile or mode switch.
-        self.assertNotIn("CUTEAFD_ADAPTIVE_COST_MODE", (ROOT / "run.sh").read_text())
+        self.assertNotIn("CUTEAFD_ADAPTIVE_COST_MODE", (ROOT / "scripts/launch/run-family.sh").read_text())
 
 
 
@@ -1396,7 +1413,7 @@ class CandidateLauncherTest(unittest.TestCase):
 
 def run_sh_block(start: str, end: str) -> str:
     """Extract one literal run.sh block so a test can execute the real code."""
-    source = (ROOT / "run.sh").read_text()
+    source = (ROOT / "scripts/launch/run-family.sh").read_text()
     return source[source.index(start):source.index(end, source.index(start))]
 
 
@@ -1506,7 +1523,7 @@ unset HF_HOME
     @classmethod
     def statement(cls) -> str:
         if cls.STATEMENT is None:
-            source = (ROOT / "run.sh").read_text()
+            source = (ROOT / "scripts/launch/run-family.sh").read_text()
             start = source.index('spark_manifest="$(release_ssh')
             end = source.index(' (see the messages above)"', start) + len(' (see the messages above)"')
             cls.STATEMENT = source[start:end]

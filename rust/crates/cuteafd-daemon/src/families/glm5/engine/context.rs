@@ -65,21 +65,10 @@ pub(super) struct GlmContextSplit<'a> {
     pub exchange: ContextExchange<'a>,
     /// Logical pages one staging view holds: the compiled extent's.
     staging_pages: usize,
-    /// Per GPU, the partial programs of heads `[0, H/2)` and `[H/2, H)` by row cap.
-    partial: [[Vec<(usize, String)>; 2]; 2],
+    /// Per GPU, one immutable partial recipe for each head range.
+    partial: [[String; 2]; 2],
     /// `lse_combine2`'s sink operand (unused without a sink; GLM 5.3 has none).
     sink: [Dev<'a>; 2],
-}
-
-/// The `glm_sparse_mla_partial_h{begin}_s{N}_m64` variants this GPU runs, as (row cap, program)
-/// ascending ([`crate::shared::peer_split::context::partial_programs`]).
-fn partial_programs(manifest: &serde_json::Value, begin: usize, sms: usize) -> Result<Vec<(usize, String)>> {
-    crate::shared::peer_split::context::partial_programs(manifest, "glm", begin, DECODE_ROWS, sms)
-}
-
-/// The variant of `partials` (ascending caps) a step of `rows` rows runs.
-fn pick(partials: &[(usize, String)], rows: usize) -> &str {
-    crate::shared::peer_split::context::pick_partial(partials, rows)
 }
 
 /// A view of `bytes` at `offset` inside `dev`.
@@ -102,12 +91,13 @@ impl<'a> GlmContextSplit<'a> {
         ensure!(exchange.heads() == cfg.heads / 2 && exchange.topk() == cfg.index_topk, "context exchange geometry");
         let staging_pages = extent.div_ceil(PAGE_ROWS);
         let list = context_workspace(cfg, extent as u64, rows, lanes, context);
-        let mut partial: [[Vec<(usize, String)>; 2]; 2] = Default::default();
-        let rank = |rank: usize, partial: &mut [Vec<(usize, String)>; 2]| -> Result<(ContextRank<'a>, Dev<'a>)> {
+        let mut partial: [[String; 2]; 2] = Default::default();
+        let rank = |rank: usize, partial: &mut [String; 2]| -> Result<(ContextRank<'a>, Dev<'a>)> {
             engine.on(rank, || {
                 let sms = engine.library.sm_count()?;
                 for (slot, begin) in partial.iter_mut().zip([0, cfg.heads / 2]) {
-                    *slot = partial_programs(manifest, begin, sms)?;
+                    *slot = crate::shared::peer_split::context::partial_program(
+                        manifest, "glm", begin, DECODE_ROWS, sms, &engine.attention_plan)?;
                 }
                 let _scope = cuteafd_ffi::memory_ledger::scope("context-workspace");
                 let mut allocations = list.iter().map(|&(_, bytes)| engine.alloc(bytes as usize))
@@ -244,7 +234,7 @@ impl<'a> GlmEngine<'a> {
                 let heads = e.cfg.heads / 2;
                 let lse = view(out, DECODE_ROWS * heads * 512 * 2, self.t * heads * 4)?.ptr;
                 let (kv, _, _) = e.rank_caches(rank, self.index);
-                e.run_on(rank, pick(&split.partial[rank][heads_rank], self.t), &[("q", query), ("cache", kv.buffer.ptr),
+                e.run_on(rank, &split.partial[rank][heads_rank], &[("q", query), ("cache", kv.buffer.ptr),
                     ("indices", w.indices.buffer.ptr), ("lengths", w.lengths.buffer.ptr),
                     ("extra_cache", kv.buffer.ptr), ("extra_indices", w.indices.buffer.ptr),
                     ("extra_lengths", w.lengths.buffer.ptr), ("out", out.buffer.ptr), ("lse", lse),
@@ -391,17 +381,18 @@ mod tests {
             {"name": "glm_sparse_mla_partial_h0_s32_m64", "params": {"device_sm_counts": [170, 188],
                 "row_caps": {"170": [1], "188": [1]}}},
             {"name": "glm_sparse_mla_partial_h32_s4_m64", "params": {"device_sm_counts": [188]}}]});
-        let at188 = partial_programs(&manifest, 0, 188).unwrap();
-        assert_eq!(at188, [(1, "glm_sparse_mla_partial_h0_s32_m64".to_string()),
-            (8, "glm_sparse_mla_partial_h0_s11_m64".to_string()), (64, "glm_sparse_mla_partial_h0_s4_m64".to_string())]);
-        assert_eq!([1, 2, 8, 9, 64].map(|rows| pick(&at188, rows)), ["glm_sparse_mla_partial_h0_s32_m64",
-            "glm_sparse_mla_partial_h0_s11_m64", "glm_sparse_mla_partial_h0_s11_m64",
-            "glm_sparse_mla_partial_h0_s4_m64", "glm_sparse_mla_partial_h0_s4_m64"]);
-        assert_eq!(pick(&partial_programs(&manifest, 0, 170).unwrap(), 4), "glm_sparse_mla_partial_h0_s8_m64");
-        // A manifest before row caps: its SM count's variant serves every row count.
-        assert_eq!(partial_programs(&manifest, 32, 188).unwrap(), [(64, "glm_sparse_mla_partial_h32_s4_m64".to_string())]);
-        assert!(partial_programs(&manifest, 32, 170).is_ok(), "the one variant serves an unplanned SM count");
-        assert!(partial_programs(&serde_json::json!({"programs": []}), 0, 188).is_err());
+        use crate::shared::peer_split::context::partial_program;
+        let plan = cuteafd_core::coordinator_programs::AttentionReductionPlan::new(DECODE_ROWS, Some(7), None).unwrap();
+        assert_eq!(partial_program(&manifest, "glm", 0, DECODE_ROWS, 188, &plan).unwrap(),
+            "glm_sparse_mla_partial_h0_s11_m64");
+        assert_eq!(partial_program(&manifest, "glm", 0, DECODE_ROWS, 170, &plan).unwrap(),
+            "glm_sparse_mla_partial_h0_s8_m64");
+        // A legacy single variant serves the plan on either card.
+        for sms in [170, 188] {
+            assert_eq!(partial_program(&manifest, "glm", 32, DECODE_ROWS, sms, &plan).unwrap(),
+                "glm_sparse_mla_partial_h32_s4_m64");
+        }
+        assert!(partial_program(&serde_json::json!({"programs": []}), "glm", 0, DECODE_ROWS, 188, &plan).is_err());
     }
 
     #[test]

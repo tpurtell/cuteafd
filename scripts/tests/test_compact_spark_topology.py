@@ -217,7 +217,7 @@ release_stop_wip_containers
         self.assertEqual(shim.returncode, 2)
 
     def test_daemon_remote_arguments_preserve_world(self):
-        source = (ROOT / 'run.sh').read_text()
+        source = (ROOT / 'scripts/launch/run-family.sh').read_text()
         invocation, remote = source.split('echo "== starting native Spark experts =="', 1)[1].split("<<'REMOTE' &", 1)
         remote = remote.split('\nREMOTE', 1)[0]
         self.assertIn('"$SPARK_COUNT"', invocation)

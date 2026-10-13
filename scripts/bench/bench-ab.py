@@ -137,8 +137,8 @@ def main() -> None:
     parser.add_argument("--run-arg", action="append", default=[], help="extra run.sh argument (repeatable)")
     parser.add_argument("--arm-arg", action="append", default=[],
                         help="NAME=ARG: launcher argument for one arm only, shell-split, e.g. 'prune=--config FILE' (repeatable)")
-    parser.add_argument("--launch", default="./run.sh --rtx-gpus {rtx} --restart",
-                        help="launcher run in each arm's checkout ({rtx} is the layout), e.g. 'scripts/launch/run-family.sh --restart'")
+    parser.add_argument("--launch", default="./run.sh --set RTX_GPUS={rtx} --restart",
+                        help="launcher run in each arm's checkout ({rtx} is the layout), e.g. 'scripts/launch/run-family.sh --restart'; checkouts before #82 take './run.sh --rtx-gpus {rtx} --restart'")
     parser.add_argument("--battery", choices=["decode", "agentic"], default="decode")
     parser.add_argument("--agentic-recording", type=Path, help="bench-agentic-session.py record output (--battery agentic)")
     parser.add_argument("--agentic-arg", action="append", default=[],

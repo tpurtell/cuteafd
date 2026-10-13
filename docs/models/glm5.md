@@ -60,6 +60,10 @@ one warm launch per arm, `CONCURRENCY=4`, code tok/s (C4 aggregate), golden
 
 GLM 5.3 EXL3 K4, 1 RTX + 4 Sparks. `SPECULATOR_FP8=off` keeps the BF16 drafter.
 
+| Attention configuration | Default | Contract |
+| --- | --- | --- |
+| `ATTENTION_PLAN_ROWS` / `--attention-plan-rows` | `auto` | Numerical recipe chosen once before admission: loaded drafter width + 1, clamped to 64; without a drafter, 1. Explicit 1..64 overrides it. Serial decode and verification share the recipe; selected scratch covers all 64 execution rows. |
+
 ## Known limits
 
 <!-- release-v2-limits -->

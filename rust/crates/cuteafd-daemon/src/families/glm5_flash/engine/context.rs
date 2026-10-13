@@ -32,7 +32,7 @@
 //! **Tables.** A step's per-rank tables are built on the host and uploaded once at the step's
 //! start, after both streams drained, so no queued kernel reads a table the host rewrites.
 use super::*;
-use crate::shared::peer_split::context::{commit_blocks, local_pages, page_owner, pick_partial, partial_programs,
+use crate::shared::peer_split::context::{commit_blocks, local_pages, page_owner, partial_program,
     CommitPlane, ContextExchange};
 use cuteafd_ffi::CuteafdDeviceBuffer;
 use cuteafd_loader::placement::families::glm5_flash::{context_buffers, context_commit_units, context_workspace,
@@ -74,8 +74,8 @@ pub(super) struct GlmfContextSplit<'a> {
     pub exchange: ContextExchange<'a>,
     /// Logical units one staging view holds: the compiled extent's.
     staging_units: usize,
-    /// Per GPU, the partial programs of heads `[0, H/2)` and `[H/2, H)` by row cap.
-    partial: [[Vec<(usize, String)>; 2]; 2],
+    /// Per GPU, one immutable startup recipe for heads `[0, H/2)` and `[H/2, H)`.
+    partial: [[String; 2]; 2],
     /// `lse_combine2`'s sink operand (never read: GLM Flash has no sink).
     sink: [Dev<'a>; 2],
 }
@@ -101,10 +101,11 @@ impl<'a> GlmfContextSplit<'a> {
         ensure!(exchange.heads() == cfg.heads / 2 && exchange.topk() == cfg.index_topk / KPOOL, "context exchange geometry");
         let staging_units = extent.div_ceil(UNIT_ROWS);
         let list = context_workspace(cfg, extent as u64, rows, lanes, context);
-        let rank = |rank: usize| -> Result<(ContextRank<'a>, Dev<'a>, [Vec<(usize, String)>; 2])> {
+        let rank = |rank: usize| -> Result<(ContextRank<'a>, Dev<'a>, [String; 2])> {
             engine.on(rank, || {
                 let sms = engine.library.sm_count()?;
-                let partial = [0, cfg.heads / 2].map(|begin| partial_programs(manifest, "glmf", begin, DECODE_ROWS, sms));
+                let partial = [0, cfg.heads / 2].map(|begin| partial_program(
+                    manifest, "glmf", begin, DECODE_ROWS, sms, &engine.attention_plan));
                 let [a, b] = partial;
                 let partial = [a?, b?];
                 let _scope = cuteafd_ffi::memory_ledger::scope("context-workspace");
@@ -314,8 +315,7 @@ impl<'a> GlmfEngine<'a> {
                 let heads = e.cfg.heads / 2;
                 let lse = view(out, DECODE_ROWS * heads * 512 * 2, self.t * heads * 4)?.ptr;
                 let kv = e.caches_of(rank).kv[self.index].as_ref().context("MLA layer without a record pool")?.buffer.ptr;
-                let name = pick_partial(&split.partial[rank][heads_rank], self.t);
-                let name = name.strip_prefix("glmf_").context("partial program name")?;
+                let name = split.partial[rank][heads_rank].strip_prefix("glmf_").context("partial program name")?;
                 e.run_on(rank, false, name, &[("q", query), ("cache", kv),
                     ("indices", w.indices.buffer.ptr), ("lengths", w.lengths.buffer.ptr),
                     ("extra_cache", kv), ("extra_indices", w.indices.buffer.ptr),

@@ -8981,7 +8981,7 @@ def main():
         print(stem, flush=True)
     write_dispatcher(destination)
     table_hashes = write_tables(destination)
-    files = {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in destination.iterdir()
+    files = {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in sorted(destination.iterdir())
         if p.is_file() and p.name not in {manifest_path.name, "audio_identity.h"}
         and p.suffix in {".o", ".h", ".cc"}}
     runtime = Path(__file__).resolve().parents[3] / "native/shared/cuda/audio_runtime.cu"

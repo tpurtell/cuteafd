@@ -150,9 +150,14 @@ printf '%s' "$CONSOLE_SECRET_FILE"
     assert path.stat().st_ino == inode
     assert path.read_text() != old
     assert old.strip() not in first.stdout + first.stderr + rotate.stdout + rotate.stderr
-    for launcher in [ROOT / "run.sh", ROOT / "scripts/launch/run-family.sh"]:
-        source = launcher.read_text()
+    # run.sh dispatches; run-family.sh serves every family (V4.1 in its own section).
+    family = (ROOT / "scripts/launch/run-family.sh").read_text()
+    v41 = family[family.index("launch_deepseek_v41() {"):family.index("# Validate the name before it is used")]
+    generic = family[family.index("# Validate the name before it is used"):]
+    for source in [v41, generic]:
         assert source.count("release_print_console_link") == 1
+    assert "release_print_console_link" not in (ROOT / "run.sh").read_text()
+    for source in [family]:
         assert "--console-secret-file /run/cuteafd-console-secret" in source
         assert "dst=/run/cuteafd-console-secret,readonly" in source
         assert "/run/cuteafd/usage" in source
@@ -174,9 +179,11 @@ if release_console_supported test-image "${{BINARY:-}}"; then printf supported; 
                                      "HELP": help_text, "BINARY": binary})
         assert result.returncode == 0, result.stderr
         assert result.stdout == expected
-    for path in [ROOT / "run.sh", ROOT / "scripts/launch/run-family.sh"]:
-        source = path.read_text()
-        assert 'if release_console_supported' in source
+    family = (ROOT / "scripts/launch/run-family.sh").read_text()
+    assert family.count('if release_console_supported') == 1  # the shared API helper
+    v41 = family[family.index("launch_deepseek_v41() {"):family.index("# Validate the name before it is used")]
+    generic = family[family.index("# Validate the name before it is used"):]
+    for source in [v41, generic]:
         assert 'if ((console_supported)); then release_print_console_link' in source
     assert 'LABEL org.cuteafd.console-gate="1"' in (ROOT / "docker/Dockerfile.release").read_text()
 
@@ -192,12 +199,12 @@ def test_every_serve_path_uses_explicit_keyed_policy():
         assert "api.app(router," in source, path
         assert "api.serve(profile" in source, path  # shared health + gateway mount
         assert "cuteafd_bench::app(" not in source, path
-    for path in [ROOT / "run.sh", ROOT / "scripts/launch/run-family.sh"]:
-        source = path.read_text()
-        assert "--api-key-file /run/cuteafd-api-key" in source
-        assert "--enable-bench" in source
-        assert "dst=/run/cuteafd-api-key,readonly" in source
-        assert "release_prepare_api_key" in source
-    native_launcher = (ROOT / "run.sh").read_text()
-    assert native_launcher.index("if ((dry_run)); then") < native_launcher.index("release_prepare_api_key")
-    assert native_launcher.index("release_prepare_api_key") < native_launcher.index("start_coordinator()")
+    family = (ROOT / "scripts/launch/run-family.sh").read_text()
+    assert "--api-key-file /run/cuteafd-api-key" in family
+    assert "--enable-bench" in family
+    assert "dst=/run/cuteafd-api-key,readonly" in family
+    assert family.count("release_prepare_api_key") == 1  # the shared API helper
+    native_launcher = family[family.index("launch_deepseek_v41() {"):family.index("# Validate the name before it is used")]
+    # V4.1 provisions keys only after a dry run has returned, before its coordinator.
+    assert native_launcher.index("if ((dry_run)); then") < native_launcher.index("shared_api_state")
+    assert native_launcher.index("shared_api_state") < native_launcher.index("start_coordinator()")

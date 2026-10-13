@@ -10,6 +10,14 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[2]
+FAMILY = ROOT / 'scripts' / 'launch' / 'run-family.sh'
+
+
+def v41_source() -> str:
+    """DeepSeek V4.1's launch: run-family.sh's launch_deepseek_v41 section."""
+    text = FAMILY.read_text()
+    start = text.index('launch_deepseek_v41() {\n')
+    return text[start:text.index('\n}\n', text.index('echo "  context/output:', start)) + 3]
 
 
 class NativeReleaseLauncherTest(unittest.TestCase):
@@ -68,13 +76,12 @@ class NativeReleaseLauncherTest(unittest.TestCase):
             finally:
                 root.chmod(0o700)
                 sibling.chmod(0o700)
-        for launcher, target in [('run.sh', '$SPECULATION_TRACE'),
-                                 ('scripts/launch/run-family.sh', '$trace')]:
-            self.assertIn(f'release_require_writable_state --file "{target}"',
-                          (ROOT / launcher).read_text())
+        # One shared trace admission for every family (V4.1 included).
+        self.assertEqual(FAMILY.read_text().count('release_require_writable_state --file "$trace"'), 1)
+        self.assertIn('shared_trace_args', v41_source())
 
     def test_v41_placement_uses_writable_serving_home(self) -> None:
-        source = (ROOT / 'run.sh').read_text()
+        source = v41_source()
         self.assertIn('placement_directory=/tmp/cuteafd-home/placement', source)
         self.assertNotIn('placement_directory=/run/cuteafd-placement', source)
 
@@ -104,15 +111,16 @@ bash -c 'release_serving_docker_args; printf "%s\\0" "${RELEASE_SERVING_ARGS[@]}
                 self.assertTrue(env[key].startswith('/tmp/cuteafd-home'))
 
     def test_all_serving_launchers_use_shared_identity_and_nonroot_mounts(self) -> None:
-        for launcher in ['run.sh', 'scripts/launch/run-family.sh']:
-            source = (ROOT / launcher).read_text()
+        for source in [v41_source(), FAMILY.read_text()]:
             self.assertIn('$(declare -f release_serving_docker_args release_require_writable_state)', source)
             self.assertIn('release_serving_docker_args\ndocker run -d "${RELEASE_SERVING_ARGS[@]}"', source)
             self.assertNotIn('/root/', source)
             self.assertNotIn('-e USER=tj', source)
             self.assertIn(':/run/cuteafd/bench', source)
-            self.assertIn(':/run/cuteafd/usage', source)
-        v41 = (ROOT / 'run.sh').read_text().split("<<'REMOTE' &", 1)[1].split('\nREMOTE', 1)[0]
+        # Usage state comes from the one shared API/console helper.
+        self.assertEqual(FAMILY.read_text().count('-v "$USAGE_DIR:/run/cuteafd/usage"'), 1)
+        self.assertIn('shared_api_state', v41_source())
+        v41 = v41_source().split("<<'REMOTE' &", 1)[1].split('\nREMOTE', 1)[0]
         self.assertIn('release_serving_docker_args\ndocker run -d "${RELEASE_SERVING_ARGS[@]}"', v41)
 
     def test_v41_worker_capacity_covers_every_coordinator_chunk_and_replay(self) -> None:
@@ -125,7 +133,7 @@ bash -c 'release_serving_docker_args; printf "%s\\0" "${RELEASE_SERVING_ARGS[@]}
         self.assertEqual(len(capacities), len(chunks))
         for chunk, capacity in zip(chunks, capacities):
             self.assertEqual(capacity, next(rows for rows in [256, 1024, 4096] if rows >= max(chunk, 256, 128)))
-        source = (ROOT / 'run.sh').read_text()
+        source = v41_source()
         self.assertIn('expert_capacity="$(release_v41_expert_capacity "$PREFILL_BATCH_TOKENS")"', source)
         self.assertIn('--prefill-rows "$count_prefill"', source)
         self.assertIn('encoder_plan="$count_plan"', source)
@@ -162,8 +170,9 @@ bash -c 'release_serving_docker_args; printf "%s\\0" "${RELEASE_SERVING_ARGS[@]}
 
     def test_attention_placement_is_strict_before_starting_containers(self) -> None:
         source = (ROOT / 'scripts/launch/run-family.sh').read_text()
-        block = source.split('attention_placement="$(get ATTENTION_PLACEMENT auto)"', 1)[1].split('\ncase "$family" in', 1)[0]
-        self.assertLess(source.index('case "$attention_placement:$family" in'), source.index('docker run'))
+        generic = source[source.index('# Validate the name before it is used to identify allocations'):]
+        block = generic.split('attention_placement="$(get ATTENTION_PLACEMENT auto)"', 1)[1].split('\ncase "$family" in', 1)[0]
+        self.assertLess(generic.index('case "$attention_placement:$family" in'), generic.index('docker run'))
         self.assertIn('--attention-placement "$attention_placement"', source)
         self.assertIn('CUTEAFD_ATTENTION_PLACEMENT=$attention_placement', source)
         for family in ['glm5', 'glm5_flash', 'deepseek_v4', 'mimo_v2', 'qwen4']:
@@ -179,7 +188,7 @@ bash -c 'release_serving_docker_args; printf "%s\\0" "${RELEASE_SERVING_ARGS[@]}
                     self.assertIn(f'{family} cannot run attention placement {mode}', result.stderr)
 
     def test_v41_layers_refuses_before_runtime_consumes_solver_placement(self) -> None:
-        source = (ROOT / 'run.sh').read_text()
+        source = v41_source()
         block = source.split('attention_placement="${ATTENTION_PLACEMENT:-auto}"', 1)[1].split(
             'case "$EMBEDDING" in', 1)[0]
         self.assertLess(source.index('case "$attention_placement" in'), source.index('docker run'))
@@ -204,6 +213,9 @@ bash -c 'release_serving_docker_args; printf "%s\\0" "${RELEASE_SERVING_ARGS[@]}
         self.assertTrue({'io_uring_setup', 'io_uring_enter', 'io_uring_register'} <= allowed)
         for launcher in ['run.sh', 'scripts/launch/run-family.sh']:
             source = (ROOT / launcher).read_text()
+            if launcher == 'run.sh':
+                self.assertNotIn('TABLE_BACKEND', source)
+                continue
             self.assertNotIn('--table-backend', source)
             self.assertNotIn('TABLE_BACKEND', source)
             self.assertIn('seccomp=$repo_root/docker/seccomp-code-bench.json', source)
@@ -213,8 +225,10 @@ bash -c 'release_serving_docker_args; printf "%s\\0" "${RELEASE_SERVING_ARGS[@]}
             self.assertNotIn('CUTEAFD_TABLE_ACCOUNTING', (ROOT / launcher).read_text())
 
     def test_matched_nonce_is_opt_in_and_default_argv_is_identical(self) -> None:
-        for launcher in ['run.sh', 'scripts/launch/run-family.sh']:
-            source = (ROOT / launcher).read_text()
+        # One shared helper; V4.1's coordinator expands the same array.
+        self.assertIn('"${bench_nonce_env_args[@]}"', v41_source())
+        self.assertIn('shared_bench_nonce_args', v41_source())
+        for source in [FAMILY.read_text()]:
             block = 'bench_nonce_env_args=()\n' + source.split('bench_nonce_env_args=()\n', 1)[1].split('\n', 1)[0]
             self.assertIn('"${bench_nonce_env_args[@]}"', source)
             for seed in [None, '', 'pair-123']:
@@ -228,9 +242,12 @@ bash -c 'release_serving_docker_args; printf "%s\\0" "${RELEASE_SERVING_ARGS[@]}
                 self.assertEqual(result.stdout, expected)
 
     def test_v41_speculation_trace_reaches_coordinator_with_host_mount(self) -> None:
-        source = (ROOT / 'run.sh').read_text()
-        block = 'trace_args=()\n' + source.split('trace_args=()\n', 1)[1].split('\ngraph_census_args=()', 1)[0]
-        coordinator = source.split('start_coordinator() {', 1)[1].split('\n}', 1)[0]
+        source = FAMILY.read_text()
+        # The shared helper body, run with V4.1's family name.
+        block = 'family=deepseek_v41\ndeclare -A cfg=()\n[[ -z "${SPECULATION_TRACE:-}" ]] || cfg[SPECULATION_TRACE]="$SPECULATION_TRACE"\n' \
+            + 'get() { printf "%s" "${cfg[$1]:-${2:-}}"; }\nkey() { printf "%s" "${cfg[$1]:-${3:-}}"; }\n' \
+            + source.split('shared_trace_args() {\n', 1)[1].split('\n}\n', 1)[0] + '\n'
+        coordinator = v41_source().split('start_coordinator() {', 1)[1].split('\n}', 1)[0]
         self.assertIn('"${trace_args[@]}"', coordinator)
         with tempfile.TemporaryDirectory() as directory:
             path = str(Path(directory) / 'trace with spaces' / 'rounds.jsonl')
@@ -245,11 +262,14 @@ bash -c 'release_serving_docker_args; printf "%s\\0" "${RELEASE_SERVING_ARGS[@]}
                         '\nprintf "%s\\0" before "${trace_args[@]}" after'], env=environment, capture_output=True)
                     self.assertEqual(result.returncode == 0, valid, result.stderr)
                     if valid:
-                        expected = ['before']
+                        # The shared draft policy switches (default off) precede the trace.
+                        expected = ['before', '-e', 'CUTEAFD_DRAFT_COST_BUCKETS=0', '-e', 'CUTEAFD_DRAFT_CONFIDENCE=0',
+                                    '-e', 'CUTEAFD_DRAFT_SURVIVAL_LENGTHS=0']
                         if value:
                             parent = str(Path(value).parent)
                             self.assertTrue(Path(parent).is_dir())
-                            expected += ['-v', f'{parent}:{parent}', '-e', f'CUTEAFD_SPECULATION_TRACE={value}']
+                            expected += ['-v', f'{parent}:{parent}', '-e', f'CUTEAFD_SPECULATION_TRACE={value}',
+                                         '-e', f'CUTEAFD_GLM_TRACE={value}', '-e', f'CUTEAFD_QWEN4_TRACE={value}']
                         expected += ['after']
                         self.assertEqual(result.stdout, ('\0'.join(expected) + '\0').encode())
 
@@ -257,7 +277,8 @@ bash -c 'release_serving_docker_args; printf "%s\\0" "${RELEASE_SERVING_ARGS[@]}
         with tempfile.TemporaryDirectory() as directory:
             control = Path(directory) / 'bank.txt'
             control.write_text('baseline\n')
-            for launcher in ['run.sh', 'scripts/launch/run-family.sh']:
+            self.assertIn('shared_graph_census_args', v41_source())
+            for launcher in ['scripts/launch/run-family.sh']:
                 source = (ROOT / launcher).read_text()
                 suffix = source.split('graph_census_args=()\n', 1)[1]
                 block = 'graph_census_args=()\n' + suffix.split('\nfi', 1)[0] + '\nfi\n'
@@ -293,7 +314,7 @@ bash -c 'release_serving_docker_args; printf "%s\\0" "${RELEASE_SERVING_ARGS[@]}
                         self.assertEqual(result.stdout, ('\0'.join(expected) + '\0').encode())
 
     def test_startup_graph_eager_override_is_wip_only_and_untimed(self) -> None:
-        for launcher in ['run.sh', 'scripts/launch/run-family.sh']:
+        for launcher in ['scripts/launch/run-family.sh']:
             source = (ROOT / launcher).read_text()
             suffix = source.split('if [[ -n "${CUTEAFD_GRAPH_EAGER:-}" ]]; then\n', 1)[1]
             block = 'if [[ -n "${CUTEAFD_GRAPH_EAGER:-}" ]]; then\n' + suffix.split('\nfi', 1)[0] + '\nfi\n'
@@ -324,14 +345,14 @@ bash -c 'release_serving_docker_args; printf "%s\\0" "${RELEASE_SERVING_ARGS[@]}
             'release_load_config scripts/fixtures/cuteafd.build-v11.config; printf "%s" "$EMBEDDING"'], cwd=ROOT, text=True, capture_output=True)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout, 'gpu')
-        native = (ROOT / 'run.sh').read_text()
+        native = v41_source()
         generic = (ROOT / 'scripts/launch/run-family.sh').read_text()
         self.assertIn('--embedding-placement "$EMBEDDING"', native)
         self.assertIn('family_args=(--embedding-placement "$embedding")', generic)
-        self.assertIn('cfg[EMBEDDING]="$embedding_override"', generic)
+        self.assertIn('cfg_overrides[EMBEDDING]="$embedding_override"', generic)
 
     def test_small_card_embedding_default_and_explicit_overrides(self) -> None:
-        source = (ROOT / 'run.sh').read_text()
+        source = v41_source()
         block = source.split('if python3 -c', 1)[1].split('\nsnapshot_rel=', 1)[0]
         block = 'if python3 -c' + block
         for gib, config_value, override, expected in (
@@ -347,11 +368,11 @@ bash -c 'release_serving_docker_args; printf "%s\\0" "${RELEASE_SERVING_ARGS[@]}
                     harness = '''set -euo pipefail
 release_spark_compact_active() { return 1; }
 release_die() { exit 1; }
-declare -A overrides
+declare -A cfg_overrides
 profile_gib=$1
 config=$2
 EMBEDDING=${3:-gpu}
-overrides[EMBEDDING]=$4
+cfg_overrides[EMBEDDING]=$4
 [[ -z "$4" ]] || EMBEDDING=$4
 PREFILL_BATCH_TOKENS=2048
 MEMORY_RESERVATION=
@@ -555,7 +576,7 @@ spark_tp_roles=
 
     def test_shell_is_valid_and_help_exposes_native_controls(self) -> None:
         subprocess.run(
-            ["bash", "-n", "run.sh", "scripts/lib/release-common.sh"],
+            ["bash", "-n", "run.sh", "scripts/launch/run-family.sh", "scripts/lib/release-common.sh"],
             cwd=ROOT,
             check=True,
         )
@@ -566,20 +587,13 @@ spark_tp_roles=
             capture_output=True,
             text=True,
         ).stdout
-        for option in (
-            "--listen",
-            "--rtx-gpus",
-            "--concurrency",
-            "--kv-pool-size",
-            "--memory-reservation",
-            "--prefix-cache-entries",
-            "--max-context-tokens",
-            "--max-output-tokens",
-            "--prefill-batch-tokens",
-            "--dspark",
-            "--no-dspark",
-        ):
+        # The V4.1 controls are configuration keys, settable per launch with --set.
+        for option in ("--set KEY=VALUE", "--dry-run", "--wip", "--restart", "--embedding-placement"):
             self.assertIn(option, help_text)
+        for key in ("RTX_GPUS", "CONCURRENCY", "KV_POOL_SIZE", "MEMORY_RESERVATION", "PREFIX_CACHE_ENTRIES",
+                    "MAX_CONTEXT_TOKENS", "MAX_OUTPUT_TOKENS", "PREFILL_BATCH_TOKENS", "DSPARK",
+                    "DSPARK_DRAFT_LIMIT", "TP2_ATTENTION"):
+            self.assertIn(key, help_text)
 
     def test_standard_release_defaults_are_native(self) -> None:
         script = r'''
@@ -615,7 +629,7 @@ printf '%s\n' "$MODEL_ID" "$MODEL_REVISION" "$EXPERT_FORMAT" "$SPARKINFER_EXL3" 
 
 
     def test_launchers_use_cuteafd_container_names(self) -> None:
-        combined = (ROOT / "build.sh").read_text() + (ROOT / "run.sh").read_text()
+        combined = (ROOT / "build.sh").read_text() + (ROOT / "run.sh").read_text() + FAMILY.read_text()
         common = (ROOT / "scripts/lib/release-common.sh").read_text()
         self.assertNotIn("ds4rt", combined.lower())
         self.assertIn("cuteafd-coordinator", common)
@@ -624,7 +638,7 @@ printf '%s\n' "$MODEL_ID" "$MODEL_REVISION" "$EXPERT_FORMAT" "$SPARKINFER_EXL3" 
         self.assertIn("serve-native", combined)
 
     def test_standard_launch_records_runtime_placement(self) -> None:
-        script = (ROOT / "run.sh").read_text()
+        script = v41_source()
         self.assertIn('RUST_LOG=${RUST_LOG:-info}', script)
         self.assertIn('--rtx-gpus "$RELEASE_RTX_GPUS"', script)
         self.assertIn('--first-layer "$first_layer"', script)
@@ -639,18 +653,27 @@ printf '%s\n' "$MODEL_ID" "$MODEL_REVISION" "$EXPERT_FORMAT" "$SPARKINFER_EXL3" 
         self.assertIn('"cuteafd_v41_tp2_expert_info"', script)
 
     def test_invalid_direct_overrides_fail_before_external_checks(self) -> None:
-        for args, message in (
-            (["--concurrency", "17"], "CONCURRENCY must be in 1..16"),
-            (["--prefix-cache-entries", "129"], "PREFIX_CACHE_ENTRIES must be in 0..128"),
-            (["--max-context-tokens", "1048577"], "MAX_CONTEXT_TOKENS must be in 1..1048576"),
-            (["--max-output-tokens", "393217"], "MAX_OUTPUT_TOKENS must be in 1..393216"),
-            (["--rtx-gpus", "3"], "RTX_GPUS must be auto, 1, or 2"),
-        ):
-            result = subprocess.run(
-                ["./run.sh", *args], cwd=ROOT, capture_output=True, text=True
-            )
-            self.assertEqual(result.returncode, 2)
-            self.assertIn(message, result.stderr)
+        with tempfile.TemporaryDirectory() as home:
+            env = {**os.environ, "HOME": home, "PATH": "/usr/bin:/bin"}
+            for args, message in (
+                (["--set", "CONCURRENCY=17"], "CONCURRENCY must be in 1..16"),
+                (["--set", "PREFIX_CACHE_ENTRIES=129"], "PREFIX_CACHE_ENTRIES must be in 0..128"),
+                (["--set", "MAX_CONTEXT_TOKENS=1048577"], "MAX_CONTEXT_TOKENS must be in 1..1048576"),
+                (["--set", "MAX_OUTPUT_TOKENS=393217"], "MAX_OUTPUT_TOKENS must be in 1..393216"),
+                (["--set", "RTX_GPUS=3"], "RTX_GPUS must be auto, 1, or 2"),
+                (["--set", "DSPARK_DRAFT_LIMIT=8"], "DSPARK_DRAFT_LIMIT must be in 1..7"),
+                (["--set", "NOT_A_KEY=1"], "unknown configuration key: NOT_A_KEY"),
+                # The former options name the key that replaced them.
+                (["--concurrency", "4"], "--set CONCURRENCY=VALUE"),
+                (["--dspark-draft-limit", "7"], "--set DSPARK_DRAFT_LIMIT=VALUE"),
+                (["--tp2-attention"], "--set TP2_<OPTION>=on|off"),
+            ):
+                with self.subTest(args=args):
+                    # docker/ssh/nvidia-smi are absent from PATH: a launch reaching an
+                    # external check would fail on the missing tool, not this message.
+                    result = subprocess.run(["./run.sh", *args], cwd=ROOT, capture_output=True, text=True, env=env)
+                    self.assertEqual(result.returncode, 2, result.stderr)
+                    self.assertIn(message, result.stderr)
 
 
 class V10BuildTargetTest(unittest.TestCase):

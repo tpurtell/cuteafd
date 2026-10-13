@@ -1870,11 +1870,41 @@ fn glm5_flash_layout_moves_shared_replay_records_into_the_prefill_scratch() {
     assert_eq!(item(&small, true, None, Category::Workspace, "steps"),
         item(&small, false, None, Category::Workspace, "steps") + records - (1 << 20));
     assert_eq!(item(&small, false, None, Category::Kv, "state") - item(&small, true, None, Category::Kv, "state"), records);
-    // A fixed pool admits from the planner's costs, where the engine keeps the records of their own.
-    let fixed = Some(131_072);
-    assert!(!report(&path, true, fixed).placement_supported);
-    let notes = report(&path, true, fixed).memory_layout.unwrap().notes.join("\n");
-    assert!(notes.contains("shared replay needs single-GPU"), "{notes}");
+    // Explicit pools use the same shared scratch and omit the same state copy.
+    for tokens in [131_072, 524_288, 1_572_864] {
+        let fixed = Some(tokens);
+        let shared = report(&path, true, fixed);
+        assert!(shared.executable(), "{shared:?}");
+        assert_eq!(shared.memory_layout.unwrap().pool_tokens, tokens);
+        assert_eq!(item(&path, false, fixed, Category::Kv, "state") - item(&path, true, fixed, Category::Kv, "state"), records);
+        assert_eq!(item(&path, false, fixed, Category::Workspace, "steps"), item(&path, true, fixed, Category::Workspace, "steps"));
+    }
+    assert_eq!(report(&path, true, None).memory_layout.unwrap().pool_tokens, 1_048_576);
+}
+
+#[test]
+fn glm5_flash_spark_count_refusal_preserves_pool_and_replay_constraints() {
+    let config = glm5_flash_config(2);
+    let dir = snapshot(config.clone(), &glm5_flash_tensors(&config));
+    let options = |gpus, pool| PlanOptions { layout: Some(layout::LayoutOptions {
+        drafter_bytes: 256 << 20, rtx_bytes: vec![32 << 30; gpus],
+        context_tokens: 131_072, glmf_shared_replay: true,
+        pool_tokens: Some(pool), ..Default::default()
+    }), ..sparks(4) };
+    let supported = plan_spark_count(dir.path(), &options(1, 524_288), 4, Some(4)).unwrap();
+    assert!(supported.executable(), "{supported:?}");
+    assert_eq!(supported.memory_layout.unwrap().pool_tokens, 524_288);
+    let split = plan_spark_count(dir.path(), &options(2, 524_288), 4, Some(4)).unwrap();
+    assert!(!split.fits && !split.placement_supported);
+    let reasons = split.hints.iter().map(|hint| hint.what.as_str()).collect::<Vec<_>>().join("; ");
+    assert!(reasons.contains("--replay-records shared needs one coordinator GPU"), "{reasons}");
+    assert!(reasons.contains("--pool-tokens"), "{reasons}");
+    assert!(!reasons.contains("checkpoint tensors or required package artifacts unavailable"), "{reasons}");
+    let oversized = plan_spark_count(dir.path(), &options(1, 1 << 40), 4, Some(4)).unwrap();
+    assert!(!oversized.fits && !oversized.placement_supported);
+    let reasons = oversized.hints.iter().map(|hint| hint.what.as_str()).collect::<Vec<_>>().join("; ");
+    assert!(reasons.contains("GLM Flash pool-first placement:"), "{reasons}");
+    assert!(!reasons.contains("checkpoint tensors or required package artifacts unavailable"), "{reasons}");
 }
 
 /// A GLM 5.3 Flash graph budget is kept as the engine's KV admission keeps it: the budget itself on one

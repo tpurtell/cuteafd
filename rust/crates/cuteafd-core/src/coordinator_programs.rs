@@ -1,5 +1,61 @@
 //! Programs belonging to one coordinator, including unsplit draft/target work.
 
+/// An immutable numerical reduction recipe hint, not an execution row limit.
+/// Choose before admission/capture and reuse it for serial decode and verification.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AttentionReductionPlan {
+    capacity_rows: usize,
+    active_drafts: Option<usize>,
+    override_rows: Option<usize>,
+    rows: usize,
+}
+
+impl AttentionReductionPlan {
+    pub fn new(capacity_rows: usize, active_drafts: Option<usize>, override_rows: Option<usize>)
+        -> Result<Self, AttentionPlanError> {
+        if capacity_rows == 0 { return Err(AttentionPlanError::ZeroCapacity); }
+        let automatic = match active_drafts {
+            Some(drafts) => drafts.checked_add(1).ok_or(AttentionPlanError::DraftOverflow)?.min(capacity_rows),
+            None => 1,
+        };
+        let rows = match override_rows {
+            Some(rows) if rows == 0 || rows > capacity_rows =>
+                return Err(AttentionPlanError::InvalidOverride { rows, capacity_rows }),
+            Some(rows) => rows,
+            None => automatic,
+        };
+        Ok(Self { capacity_rows, active_drafts, override_rows, rows })
+    }
+
+    pub fn rows(self) -> usize { self.rows }
+    pub fn capacity_rows(self) -> usize { self.capacity_rows }
+    pub fn active_drafts(self) -> Option<usize> { self.active_drafts }
+
+    /// Admission may use validated checkpoint geometry before loading the drafter.
+    /// Check raw geometry too: different widths can clamp to the same plan.
+    pub fn validate_loaded(self, active_drafts: Option<usize>) -> Result<Self, AttentionPlanError> {
+        let loaded = Self::new(self.capacity_rows, active_drafts, self.override_rows)?;
+        if loaded != self {
+            return Err(AttentionPlanError::DrafterMismatch {
+                provisional: self.active_drafts, loaded: active_drafts,
+            });
+        }
+        Ok(loaded)
+    }
+}
+
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum AttentionPlanError {
+    #[error("attention numerical plan capacity must be positive")]
+    ZeroCapacity,
+    #[error("active drafter width overflows verifier rows")]
+    DraftOverflow,
+    #[error("attention plan rows {rows} outside numerical domain 1..={capacity_rows}")]
+    InvalidOverride { rows: usize, capacity_rows: usize },
+    #[error("loaded attention drafter geometry {loaded:?} differs from admission geometry {provisional:?}")]
+    DrafterMismatch { provisional: Option<usize>, loaded: Option<usize> },
+}
+
 // Literal registry consumed by release-common.sh as well as the serving owners.
 pub const V41_PREFILL_MIN_ROWS: u32 = 80;
 pub const V41_PREFILL_MAX_ROWS: u32 = 4096;
@@ -91,6 +147,32 @@ impl std::fmt::Display for MissingCoordinatorProgram {
 
 impl std::error::Error for MissingCoordinatorProgram {}
 
+/// Charge only the selected numerical recipe at full execution capacity.
+/// Export geometry owns recipe scratch; this helper is independent of family names.
+pub fn attention_plan_scratch(geometry: &serde_json::Value, plan: AttentionReductionPlan)
+    -> Result<Option<u64>, AttentionScratchError> {
+    let Some(recipes) = geometry.get("attention_plan_scratch") else { return Ok(None) };
+    let invalid = || AttentionScratchError;
+    let capacity = geometry["attention_plan_capacity_rows"].as_u64().ok_or_else(invalid)?;
+    if capacity != plan.capacity_rows() as u64 { return Err(invalid()); }
+    let recipes = recipes.as_array().ok_or_else(invalid)?;
+    let mut previous = 0;
+    let mut selected = None;
+    for recipe in recipes {
+        let cap = recipe["rows_cap"].as_u64().ok_or_else(invalid)?;
+        let bytes = recipe["scratch"].as_u64().ok_or_else(invalid)?;
+        if cap <= previous || cap > capacity { return Err(invalid()); }
+        previous = cap;
+        if selected.is_none() && cap >= plan.rows() as u64 { selected = Some(bytes); }
+    }
+    if previous != capacity { return Err(invalid()); }
+    selected.map(Some).ok_or_else(invalid)
+}
+
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+#[error("invalid attention recipe scratch contract or numerical domain mismatch")]
+pub struct AttentionScratchError;
+
 /// Select the same 170/188-SM program recipe as native load, before admission.
 /// The retained plans allow another device to select its own scratch envelope.
 pub fn select_card_plans(manifest: &mut serde_json::Value, sms: u32) -> Result<(), CardPlanError> {
@@ -129,6 +211,61 @@ pub struct CardPlanError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn attention_plan_uses_active_drafts_not_execution_width() {
+        for (drafts, rows) in [(None, 1), (Some(0), 1), (Some(7), 8), (Some(63), 64), (Some(127), 64)] {
+            let plan = AttentionReductionPlan::new(64, drafts, None).unwrap();
+            assert_eq!(plan.rows(), rows);
+            assert_eq!(plan.validate_loaded(drafts).unwrap(), plan);
+        }
+        assert_eq!(AttentionReductionPlan::new(64, Some(7), Some(1)).unwrap().rows(), 1);
+        assert_eq!(AttentionReductionPlan::new(64, None, Some(8)).unwrap().rows(), 8);
+    }
+
+    #[test]
+    fn attention_plan_rejects_invalid_geometry_and_unclamped_overrides() {
+        assert_eq!(AttentionReductionPlan::new(0, None, None), Err(AttentionPlanError::ZeroCapacity));
+        assert_eq!(AttentionReductionPlan::new(64, Some(usize::MAX), Some(1)), Err(AttentionPlanError::DraftOverflow));
+        for rows in [0, 65, usize::MAX] {
+            assert_eq!(AttentionReductionPlan::new(64, None, Some(rows)),
+                Err(AttentionPlanError::InvalidOverride { rows, capacity_rows: 64 }));
+        }
+    }
+
+    #[test]
+    fn attention_plan_checks_raw_loaded_geometry_even_when_clamped_or_overridden() {
+        for override_rows in [None, Some(8)] {
+            let plan = AttentionReductionPlan::new(64, Some(80), override_rows).unwrap();
+            assert_eq!(plan.validate_loaded(Some(81)), Err(AttentionPlanError::DrafterMismatch {
+                provisional: Some(80), loaded: Some(81),
+            }));
+        }
+        assert!(AttentionReductionPlan::new(64, None, None).unwrap().validate_loaded(Some(0)).is_err());
+    }
+
+    #[test]
+    fn attention_scratch_reserves_selected_recipe_at_full_capacity() {
+        let geometry = serde_json::json!({"attention_plan_capacity_rows": 64,
+            "attention_plan_scratch": [{"rows_cap": 1, "scratch": 67371008},
+                {"rows_cap": 8, "scratch": 23158784}, {"rows_cap": 64, "scratch": 8421376}]});
+        for (rows, bytes) in [(1, 67371008), (8, 23158784), (9, 8421376), (64, 8421376)] {
+            let plan = AttentionReductionPlan::new(64, None, Some(rows)).unwrap();
+            assert_eq!(attention_plan_scratch(&geometry, plan).unwrap(), Some(bytes));
+        }
+        let plan = AttentionReductionPlan::new(64, Some(7), None).unwrap();
+        assert_eq!(attention_plan_scratch(&serde_json::json!({}), plan).unwrap(), None);
+        for defect in 0..4 {
+            let mut bad = geometry.clone();
+            match defect {
+                0 => bad["attention_plan_capacity_rows"] = 128.into(),
+                1 => bad["attention_plan_scratch"][1]["rows_cap"] = 1.into(),
+                2 => bad["attention_plan_scratch"][2]["rows_cap"] = 63.into(),
+                _ => bad["attention_plan_scratch"][0]["scratch"] = (-1).into(),
+            }
+            assert!(attention_plan_scratch(&bad, plan).is_err());
+        }
+    }
 
     fn dual_manifest() -> serde_json::Value {
         serde_json::json!({"programs": [{"name": "dsv4p_sparse_mla_decode_c128_m64",

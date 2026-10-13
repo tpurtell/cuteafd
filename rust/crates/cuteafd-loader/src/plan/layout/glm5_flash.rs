@@ -188,7 +188,16 @@ pub(super) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
             }
             notes.push(format!("placement: {}", placed.summary()));
         }
-        Err(error) => { report.placement_supported = false; notes.push(format!("GLM Flash pool-first placement: {error:#}")); }
+        Err(error) => {
+            report.placement_supported = false;
+            report.fits = false;
+            let reason = format!("GLM Flash pool-first placement: {error:#}");
+            report.hints.push(super::super::Hint {
+                what: reason.clone(),
+                how: "Change the reported pool, replay-records or placement constraint.".into(),
+            });
+            notes.push(reason);
+        }
     }
     if let Some(working) = selected.filter(|working| working.spark_ranks > 0) {
         let total = report.components.iter().filter(|c| c.component == Component::RoutedExpert).map(|c| c.bytes).sum::<u64>();

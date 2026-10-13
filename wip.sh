@@ -488,6 +488,11 @@ preflight_existing_container_images() {
 preflight_existing_container_images
 ((wip_spark_leg == 0)) || distribute_spark_dev_image
 
+# wip_container_gpu_ok CONTAINER: its GPU still answers NVML.
+wip_container_gpu_ok() {
+  timeout 60 docker exec "$1" nvidia-smi -L >/dev/null 2>&1
+}
+
 ensure_local_container() {
   local image_id container_id
   image_id="$(docker image inspect -f '{{.Id}}' "$COORDINATOR_DOCKER_DEV")"
@@ -506,8 +511,15 @@ ensure_local_container() {
     cuteafd_build_cache_docker_args "$wip_mount_root" /wip/home "$wip_toolchain_hash" dry >/dev/null
     [[ "$(docker inspect -f '{{.State.Running}}' "$coordinator_container")" == true ]] ||
       docker start "$coordinator_container" >/dev/null
-    docker exec "$coordinator_container" mkdir -p /wip/build /wip/output /wip/slots /wip/incoming /wip/run /wip/cache
-    return
+    # A container can outlive its GPU access (a host daemon-reload drops NVML in
+    # running containers). Its state is all on the /wip bind mount, so recreate it
+    # rather than fail later in the export.
+    if wip_container_gpu_ok "$coordinator_container"; then
+      docker exec "$coordinator_container" mkdir -p /wip/build /wip/output /wip/slots /wip/incoming /wip/run /wip/cache
+      return
+    fi
+    echo "WIP: $coordinator_container lost GPU access (nvidia-smi -L failed); recreating it" >&2
+    docker rm -f "$coordinator_container" >/dev/null
   fi
   local -a args=(
     run -d --name "$coordinator_container" --restart no
@@ -975,6 +987,94 @@ wip_seed_lease_release() {
   wip_seed_lease_dir=""
   unset CUTEAFD_WIP_SEED_LEASE
 }
+# Coordinator export modes, in order (CUTEAFD_WIP_COORDINATOR_EXPORT):
+#   auto    capped, then remote (when CUTEAFD_EXPORT_HOST names one), then turn
+#   capped  a raptor GPU whose lock we hold or get at once, then turn
+#   remote  the SM120 export host (oliver) through sparknest, then turn
+#   turn    the fair turn on gpu${COORDINATOR_GPU} only (the old behavior)
+# Never a GPU whose lock someone else holds; exports are pinned (#127), so a
+# raptor and an oliver export of the same inputs are the same bytes.
+wip_coordinator_export_modes() {
+  case "${CUTEAFD_WIP_COORDINATOR_EXPORT:-auto}" in
+    auto) printf 'capped '; [[ -z "${CUTEAFD_EXPORT_HOST:-}" ]] || printf 'remote '; printf 'turn\n' ;;
+    capped) printf 'capped turn\n' ;;
+    remote) printf 'remote turn\n' ;;
+    turn) printf 'turn\n' ;;
+    *) release_die "CUTEAFD_WIP_COORDINATOR_EXPORT must be auto, remote, capped or turn" ;;
+  esac
+}
+
+# wip_remote_export: the native key's entry from CUTEAFD_EXPORT_HOST, through
+# sparknest, then restored here with REQUIRE_HIT (no GPU turn on raptor).
+wip_remote_export() {
+  local host="${CUTEAFD_EXPORT_HOST:-}" key env_file started=$SECONDS
+  [[ -n "$host" ]] || return 75
+  read -r _ key <"$state_dir/output/coordinator/.native-cache-key" || return 75
+  env_file="$(mktemp "${TMPDIR:-/tmp}/wip-export-env.XXXXXXXX")"
+  printf '%s\n' "${coordinator_build[@]}" | grep -E '^CUTEAFD_[A-Z0-9_]+=' >"$env_file"
+  printf 'CUTEAFD_WIP_EXPORT_LOCKS=off\n' >>"$env_file"
+  echo "WIP coordinator export: remote on $host${CUTEAFD_EXPORT_HOST_ADDR:+ ($CUTEAFD_EXPORT_HOST_ADDR)}"
+  local layers status=0
+  layers="$(docker image inspect -f '{{json .RootFS.Layers}}' "$COORDINATOR_DOCKER_DEV" | sha256sum | awk '{print $1}')"
+  "$repo_root/scripts/build/export-remote.sh" "$host" "$staging_dir" "$key" "$env_file" \
+    "$COORDINATOR_DOCKER_DEV" "$layers" || status=$?
+  if ((status != 0)); then
+    rm -f "$env_file"
+    echo "WIP coordinator export: $host unavailable (export-remote exited $status); next mode" >&2
+    return 75
+  fi
+  rm -f "$env_file"
+  native_store_nest raptor x86_64 "$(realpath "$state_dir")" coordinator import
+  native_store_sync "" "$state_dir" "$(uname -m)" coordinator import
+  docker exec -e CUTEAFD_WIP_NATIVE_REQUIRE_HIT=1 "${coordinator_build[@]:2}" native || return 75
+  echo "WIP phase coordinator export-remote: $((SECONDS - started))s ($host)"
+}
+
+# wip_capped_export BUILD...: the native phase on a raptor GPU we hold: one
+# whose lock the caller already holds, else gpu1 then gpu0 if its lock is free
+# right now (non-blocking; held only for the export). A one-off container on
+# that GPU (the WIP container is bound to COORDINATOR_GPU), admitted by the
+# host's nvidia-smi and stopped by the watchdog if it outgrows its cap.
+wip_capped_export() {
+  local status=0
+  CUTEAFD_CAPPED_BUILD="$(printf '%q ' "$@")" \
+    python3 "$repo_root/scripts/build/export-placement.py" hold --gpus "${CUTEAFD_WIP_EXPORT_GPUS:-1,0}" -- \
+    bash -c "$(declare -f wip_capped_export_on release_gpu_device_args); $(declare -p repo_root coordinator_container COORDINATOR_DOCKER_DEV); wip_capped_export_on" ||
+    status=$?
+  ((status == 0)) || { echo "WIP coordinator export: capped export exited $status; next mode" >&2; return 75; }
+}
+
+# wip_capped_export_on: runs under export-placement.py hold, CUTEAFD_EXPORT_GPU set.
+wip_capped_export_on() {
+  local placement="$repo_root/scripts/build/export-placement.py" gpu cap jobs used started=$SECONDS
+  gpu="$(nvidia-smi --query-gpu=index,uuid --format=csv,noheader | awk -F', ' -v i="$CUTEAFD_EXPORT_GPU" '$1 == i {print $2}')"
+  [[ -n "$gpu" ]] || return 75
+  read -r cap jobs used < <(python3 "$placement" admit --gpu "$gpu" --headroom-mib "${CUTEAFD_WIP_EXPORT_HEADROOM_MIB:-4096}") ||
+    { echo "WIP coordinator export: gpu$CUTEAFD_EXPORT_GPU has no room for a capped export" >&2; return 75; }
+  echo "WIP coordinator export: capped on gpu$CUTEAFD_EXPORT_GPU (${cap} MiB, ${jobs} jobs; ${used} MiB in use)"
+  # The coordinator build's environment (its -e pairs), in a one-off container
+  # on that GPU sharing the WIP container's /wip and cache mounts.
+  local -a build env_args=()
+  eval "build=($CUTEAFD_CAPPED_BUILD)"
+  local i
+  for ((i = 2; i < ${#build[@]}; i++)); do
+    [[ "${build[i]}" == -e ]] && env_args+=(-e "${build[i + 1]}")
+  done
+  local id status=0 gpu_args
+  mapfile -t gpu_args < <(release_gpu_device_args "$gpu")
+  id="$(docker run -d --name "${coordinator_container}-export-$$" --user "$(id -u):$(id -g)" "${gpu_args[@]}" \
+    -e HOME=/wip/home -e "USER=$(id -un)" -e "LOGNAME=$(id -un)" "${env_args[@]}" \
+    -e "CMAKE_BUILD_PARALLEL_LEVEL=$jobs" -e "CUDA_VISIBLE_DEVICES=$gpu" -e "NVIDIA_VISIBLE_DEVICES=$gpu" \
+    --volumes-from "$coordinator_container" --entrypoint sleep "$COORDINATOR_DOCKER_DEV" infinity)" || return 75
+  # The watchdog counts only this container's processes (its cgroup carries the ID).
+  python3 "$placement" watch --gpu "$gpu" --cap-mib "$cap" --cgroup "$id" -- \
+    docker exec "$id" /wip/source/scripts/build/build-wip-artifacts.sh \
+    /wip/source coordinator 120 /wip/build/coordinator /wip/output/coordinator native || status=$?
+  docker rm -f "$id" >/dev/null 2>&1 || true
+  ((status == 0)) || return "$status"
+  echo "WIP phase coordinator export-capped: $((SECONDS - started))s (gpu$CUTEAFD_EXPORT_GPU)"
+}
+
 build_coordinator() {
   echo "== incrementally building coordinator slot $slot =="
   sync_local_source
@@ -1049,9 +1149,24 @@ build_coordinator() {
     docker exec -e CUTEAFD_WIP_NATIVE_REQUIRE_HIT=1 "${coordinator_build[@]:2}" native ||
       release_die "coordinator WIP native restore failed"
   else
-    echo "WIP coordinator export: queueing for $wip_export_gpu_lock"
-    wip_hwlock "$wip_export_gpu_lock" "${coordinator_build[@]}" native ||
-      release_die "coordinator WIP export failed or got no fair turn on $wip_export_gpu_lock"
+    # Off-queue first (#126): the exporters only compile, so the export needs a
+    # CUDA context and a few GiB, not an exclusive GPU. Each mode exits 75 when
+    # it cannot run here and the next one is tried; the fair turn is last.
+    local mode exported=0
+    for mode in $(wip_coordinator_export_modes); do
+      case "$mode" in
+        remote) wip_remote_export && exported=1 ;;
+        capped) wip_capped_export "${coordinator_build[@]}" && exported=1 ;;
+        turn)
+          echo "WIP coordinator export: queueing for $wip_export_gpu_lock"
+          wip_hwlock "$wip_export_gpu_lock" "${coordinator_build[@]}" native ||
+            release_die "coordinator WIP export failed or got no fair turn on $wip_export_gpu_lock"
+          exported=1
+          ;;
+      esac
+      ((exported == 0)) || { echo "WIP coordinator export: done by $mode"; break; }
+    done
+    ((exported)) || release_die "no coordinator export mode succeeded"
   fi
   native_store_sync "" "${state_dir:-/nonexistent}" "$(uname -m)" coordinator publish
   docker exec -e "CUTEAFD_WIP_BUILD_KEY=${wip_coordinator_key:-}" "$coordinator_container" \

@@ -35,6 +35,9 @@ pub struct RunRequest {
     /// rates. Ignored for profiles; default true.
     #[serde(default)]
     pub baseline: Option<bool>,
+    /// Cases for `spec_lossless_set` (default: the shipped set).
+    #[serde(default)]
+    pub lossless_set: Option<panels::lossless::SetRequest>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -45,6 +48,8 @@ pub enum StartError {
     UnknownProfile(String),
     #[error("the server is not ready")]
     NotReady,
+    #[error("invalid lossless set: {0}")]
+    InvalidSet(String),
 }
 
 /// What the progress ticker knows about the panel now running: enough to price
@@ -369,6 +374,8 @@ impl Bench {
     /// Starts a run; returns its id.
     pub fn start(self: &Arc<Self>, request: RunRequest) -> Result<String, StartError> {
         let base = crate::context::loopback().ok_or(StartError::NotReady)?;
+        let lossless_set = request.lossless_set.clone().map(|set| set.validated()).transpose()
+            .map_err(StartError::InvalidSet)?;
         let (name, planned) = match (&request.panels, &request.profile) {
             (Some(panels), _) => ("custom".to_string(),
                 panels.iter().map(|id| PlannedPanel { id: id.clone(), passes: 1 }).collect::<Vec<_>>()),
@@ -408,7 +415,7 @@ impl Bench {
         // clients), so its console text is allowed until it retires.
         let text = BenchText::enable(self);
         std::thread::Builder::new().name("cuteafd-bench".into()).spawn(move || {
-            bench.execute(active, base, plan, report, text, skip_baseline);
+            bench.execute(active, base, plan, report, text, skip_baseline, lossless_set);
         }).expect("spawn the benchmark thread");
         Ok(id)
     }
@@ -422,7 +429,8 @@ impl Bench {
     }
 
     fn execute(self: Arc<Self>, active: ActiveRun, base: String, plan: Vec<PlannedPanel>,
-        report: Arc<Mutex<Report>>, text: Option<BenchText>, skip_baseline: bool) {
+        report: Arc<Mutex<Report>>, text: Option<BenchText>, skip_baseline: bool,
+        lossless_set: Option<panels::lossless::CaseSet>) {
         let id = active.id.clone();
         let progress = Progress::default();
         let done = Arc::new(AtomicBool::new(false));
@@ -432,7 +440,7 @@ impl Bench {
             std::thread::Builder::new().name("cuteafd-bench-tick".into())
                 .spawn(move || bench.tick(&report, &progress, &done, &base)).ok()
         };
-        let outcome = self.run_plan(&active, &base, &report, &progress, &plan, skip_baseline);
+        let outcome = self.run_plan(&active, &base, &report, &progress, &plan, skip_baseline, lossless_set.as_ref());
         {
             let mut r = report.lock().expect("report lock");
             r.finished = Some(now_rfc3339());
@@ -472,7 +480,8 @@ impl Bench {
     }
 
     fn run_plan(&self, active: &ActiveRun, base: &str, report: &Arc<Mutex<Report>>, progress: &Progress,
-        plan: &[PlannedPanel], skip_baseline: bool) -> anyhow::Result<()> {
+        plan: &[PlannedPanel], skip_baseline: bool, lossless_set: Option<&panels::lossless::CaseSet>)
+        -> anyhow::Result<()> {
         let mut client = Client::new(base, Some(active.token.clone()), active.cancel.clone()).with_api_key(self.api_key.get().cloned());
         let record = client.discover()?;
         let max_context = record["max_context_tokens"].as_u64().unwrap_or(8192);
@@ -540,7 +549,7 @@ impl Bench {
                 client.check()?;
                 self.begin(active, panel.id(), estimate, remaining, total, pass, planned.passes, progress);
                 let ctx = Ctx { client: &client, info: &info, baseline: baseline.as_ref(), rates, progress, pass,
-                    history: &earlier, max_context, max_output };
+                    history: &earlier, max_context, max_output, lossless_set };
                 let table_before = panels::common::mapped_counters(&client);
                 let thermal_mark = client.thermal_mark();
                 let outcome = panel.run(&ctx);

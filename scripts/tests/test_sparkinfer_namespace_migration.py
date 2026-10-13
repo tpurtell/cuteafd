@@ -343,7 +343,9 @@ def test_standalone_bootstrap_imports_verified_submodule() -> None:
 
 
 def test_release_preflight_requires_matching_engine_revisions() -> None:
-    release = (ROOT / "run.sh").read_text(encoding="utf-8")
+    # DeepSeek V4.1's release launch (run-family.sh's launch_deepseek_v41).
+    release = (ROOT / "scripts/launch/run-family.sh").read_text(encoding="utf-8")
+    release = release[release.index("launch_deepseek_v41() {"):]
 
     assert (
         """engine_commit="$(docker image inspect -f '{{index .Config.Labels "org.opencontainers.image.revision"}}'"""

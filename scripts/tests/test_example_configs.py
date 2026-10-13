@@ -64,8 +64,8 @@ FAMILY_DOCS = {"deepseek_v41": "deepseek_v41", "deepseek_v4": "deepseek_v4", "gl
 SPECULATOR_KEYS = ("SPECULATOR", "SPECULATOR_MODEL_ID", "SPECULATOR_DEPTH", "DSPARK")
 POOL_KEYS = ("POOL_TOKENS",)
 # The one named exception (decided 2026-10-10): the V4.1 cards ran with
-# POOL_TOKENS=auto, so the V4.1 examples pin it, while run.sh keeps V4.1's own
-# pool policy when the key is absent. Roadmap step S5 moves V4.1 onto
+# POOL_TOKENS=auto, so the V4.1 examples pin it, while the V4.1 loader leaves the key
+# empty when absent (run-family.sh's V4.1 section then resolves auto). Roadmap step S5 moves V4.1 onto
 # run-family.sh, where the defaults are unified and this exception goes away.
 POOL_EXCEPTIONS = {("deepseek_v41", "POOL_TOKENS"): "auto"}
 
@@ -266,7 +266,7 @@ def test_family_starting_config_matches_the_launcher_defaults(path: Path, tmp_pa
 
 @pytest.mark.parametrize("path", V41, ids=lambda p: p.name)
 def test_v41_starting_config_matches_the_launcher_defaults(path: Path, tmp_path: Path) -> None:
-    """V4.1 runs through run.sh's own loader: its speculator key matches the loader
+    """V4.1 runs through the release loader (run-family.sh's V4.1 section): its speculator key matches the loader
     default, and POOL_TOKENS is the one named exception (see POOL_EXCEPTIONS)."""
     values = keys(path)
     result = subprocess.run(

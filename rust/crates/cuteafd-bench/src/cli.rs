@@ -29,6 +29,8 @@ pub struct RunOptions {
     pub quiet: bool,
     /// Cancel the run and fail when it takes longer (a server too slow to finish).
     pub deadline: Option<Duration>,
+    /// Cases for the `spec_lossless_set` panel (default: the server's shipped set).
+    pub lossless_set: Option<crate::panels::lossless::CaseSet>,
 }
 
 fn agent() -> ureq::Agent {
@@ -122,6 +124,9 @@ pub fn run(options: &RunOptions) -> Result<(Report, PathBuf)> {
     body["passes"] = Value::Object(options.passes.iter().map(|(k, v)| (k.clone(), json!(v))).collect());
     if let Some(baseline) = options.baseline {
         body["baseline"] = json!(baseline);
+    }
+    if let Some(set) = &options.lossless_set {
+        body["lossless_set"] = json!(crate::panels::lossless::SetRequest::of(set));
     }
     let response = authorize(agent.post(&format!("{base}/v1/bench/runs")), &options.api_key)
         .send_json(body);

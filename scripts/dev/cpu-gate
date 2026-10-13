@@ -71,14 +71,16 @@ def python_for(source):
     raise SystemExit('cpu-gate: no .venv here or in the main checkout (uv venv --python 3.12 .venv; see AGENTS.md)')
 
 
-def prepare(source, root):
+def prepare(source, root, owned=False):
     checked([sys.executable, str(source / 'scripts/build/assert-build-filesystem.py'), str(root)])
     for path in (root / 'tmp', root / 'logs'):
         path.mkdir(parents=True, exist_ok=True)
     # `submodule update` checks out the commit HEAD records, so an uncommitted pin bump (a gitlink
     # staged or changed but not committed) would be silently reset and the gate would test the old
-    # kernels. Refuse instead: commit the pin bump, then gate.
-    moved = pin_changes(source)
+    # kernels. Refuse instead: commit the pin bump, then gate. The --base worktree is the gate's
+    # own (owned): it is re-detached at each base, so its submodules still sit at the previous
+    # base's pins until the update below moves them, which is exactly what should happen there.
+    moved = [] if owned else pin_changes(source)
     if moved:
         raise SystemExit('cpu-gate: submodule pins differ from HEAD (commit the bump first): ' + ', '.join(moved))
     log(f'submodules at their pinned commits ({source})')
@@ -227,8 +229,8 @@ def scripts(source, root, args, env):
     return result
 
 
-def gate(source, root, args):
-    prepare(source, root)
+def gate(source, root, args, owned=False):
+    prepare(source, root, owned)
     env = {**os.environ, 'TMPDIR': str(root / 'tmp'), 'PYTHONDONTWRITEBYTECODE': '1'}
     suites = []
     if args.cargo:
@@ -292,7 +294,7 @@ def main():
             checked(['git', '-C', str(base_source), 'checkout', '-q', '--detach', args.base])
         else:
             checked(['git', '-C', str(args.source), 'worktree', 'add', '-q', '--detach', str(base_source), args.base])
-        record['base'] = gate(base_source, root / 'base', args)
+        record['base'] = gate(base_source, root / 'base', args, owned=True)
         record['new_failing'] = {}
         for suite in record['suites']:
             before = next((s for s in record['base']['suites'] if s['suite'] == suite['suite']), {})

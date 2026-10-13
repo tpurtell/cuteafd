@@ -383,9 +383,11 @@ def export(output, capacities, width, atomic_min_capacity=None, role="spark", *,
     if family == "v41":
         # Other families receive rows the coordinator already quantized.
         export_input_quantizer(output, manifest)
+    # Sorted: directory order is filesystem-specific and made two hosts'
+    # otherwise identical manifests differ (#127).
     manifest["artifact_sha256"] = {
         path.name: hashlib.sha256(path.read_bytes()).hexdigest()
-        for path in output.iterdir()
+        for path in sorted(output.iterdir())
         if path.suffix in (".h", ".o")
     }
     (output / "v41_experts.json").write_text(json.dumps(manifest, indent=2) + "\n")

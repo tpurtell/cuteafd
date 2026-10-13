@@ -98,7 +98,7 @@ class Exl3ReleasePreflightTest(unittest.TestCase):
                               + (f'MEMORY_RESERVATION={reservation}\n' if reservation else '')
                               + (f'INSTANCE={instance}\n' if instance else ''))
             result = subprocess.run(['bash', 'run.sh', '--config', str(config),
-                                     '--rtx-gpus', rtx_gpus, *extra,
+                                     '--set', f'RTX_GPUS={rtx_gpus}', *extra,
                                      '--restart' if mismatch else '--dry-run'],
                                     cwd=ROOT, env=env, capture_output=True, text=True)
             log = directory / 'calls.jsonl'
@@ -156,7 +156,7 @@ class Exl3ReleasePreflightTest(unittest.TestCase):
     def test_spark_count_preserves_prefill_cli_override(self):
         for requested, expected, capacity in [('4096', '4096', '4096'), ('80', '80', '256')]:
             result, _ = self.launch(spark_count=2, paired=False,
-                                    extra=('--prefill-batch-tokens', requested))
+                                    extra=('--set', f'PREFILL_BATCH_TOKENS={requested}'))
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn(f'prefill batch tokens: {expected}; expert capacity: {capacity}', result.stdout)
         four, calls = self.launch(paired=False)

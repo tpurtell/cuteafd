@@ -631,3 +631,32 @@ if(CUTEAFD_ENABLE_CUDA)
   add_test(NAME cuteafd_glm_mla_prefill_selftest COMMAND cuteafd_glm_mla_prefill_selftest 512 656 64 2)
   add_test(NAME cuteafd_glm_mla_prefill_selftest_528 COMMAND cuteafd_glm_mla_prefill_selftest 512 528 64 2)
 endif()
+
+# Reproducible CUDA objects (#127): nvcc embeds its temp file name
+# (tmpxft_<pid>_...) and random per-TU IDs into every object, so two builds of
+# the same source never matched, on one host or across hosts. -objtemp gives
+# the intermediates a deterministic name beside the object and --frandom-seed
+# fixes the IDs; each translation unit is seeded with its own path relative to
+# this source root (unique per file, stable across hosts and build trees).
+if(CUTEAFD_ENABLE_CUDA)
+  function(cuteafd_reproducible_cuda_objects)
+    get_property(targets DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}" PROPERTY BUILDSYSTEM_TARGETS)
+    foreach(target IN LISTS targets)
+      get_target_property(type "${target}" TYPE)
+      if(type STREQUAL "INTERFACE_LIBRARY" OR type STREQUAL "UTILITY")
+        continue()
+      endif()
+      get_target_property(sources "${target}" SOURCES)
+      foreach(source IN LISTS sources)
+        if(NOT source MATCHES "\\.cu$")
+          continue()
+        endif()
+        get_filename_component(absolute "${source}" ABSOLUTE BASE_DIR "${CMAKE_CURRENT_SOURCE_DIR}")
+        file(RELATIVE_PATH relative "${CMAKE_CURRENT_SOURCE_DIR}" "${absolute}")
+        set_property(SOURCE "${source}" TARGET_DIRECTORY "${target}" APPEND PROPERTY COMPILE_OPTIONS
+          "-objtemp" "--frandom-seed=${target}/${relative}")
+      endforeach()
+    endforeach()
+  endfunction()
+  cmake_language(DEFER CALL cuteafd_reproducible_cuda_objects)
+endif()

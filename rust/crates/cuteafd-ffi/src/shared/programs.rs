@@ -120,6 +120,7 @@ pub struct ProgramSpec {
     /// Scratch pointer name -> bytes at the program's capacity (manifest only).
     pub scratch: HashMap<String, u64>,
     pub capacity_rows: u32,
+    pub geometry: serde_json::Value,
 }
 
 pub struct Programs<'a> {
@@ -155,6 +156,7 @@ impl NativeLibrary {
                 scalar_kinds: kinds,
                 scratch: HashMap::new(),
                 capacity_rows: 0,
+                geometry: serde_json::Value::Null,
             };
             programs.insert(name, (index, spec));
         }
@@ -193,6 +195,7 @@ impl<'a> Programs<'a> {
             ensure!(pointers.len() == spec.pointers.len(), "{name}: manifest and library disagree on pointers");
             spec.pointers = pointers;
             spec.capacity_rows = entry["capacity_rows"].as_u64().unwrap_or(0) as u32;
+            spec.geometry = entry["geometry"].clone();
             if let Some(scratch) = entry["scratch_bytes_at_capacity"].as_object() {
                 spec.scratch = scratch.iter().filter_map(|(k, v)| Some((k.clone(), v.as_u64()?))).collect();
             }
@@ -201,12 +204,32 @@ impl<'a> Programs<'a> {
                 for (index, sms) in [170, 188].into_iter().enumerate() {
                     let plan = plans.iter().find(|p| p["sm_count"].as_u64() == Some(sms))
                         .context("validated card plan disappeared")?;
+                    specs[index].geometry = plan["geometry"].clone();
                     specs[index].scratch = plan["scratch_bytes_at_capacity"].as_object().context("card scratch")?
                         .iter().map(|(k, v)| Ok((k.clone(), v.as_u64().context("card scratch bytes")?)))
                         .collect::<Result<_>>()?;
                 }
                 self.card_specs.insert(name.to_string(), specs);
             }
+        }
+        Ok(self)
+    }
+
+    /// Set recipe scratch before any serving owner allocates workspaces.
+    /// Retained per-card specs are narrowed independently; native ABI is unchanged.
+    pub fn with_attention_plan(mut self, plan: cuteafd_core::coordinator_programs::AttentionReductionPlan,
+        keep: impl Fn(&str) -> bool) -> Result<Self> {
+        let select = |spec: &mut ProgramSpec| -> Result<()> {
+            if let Some(bytes) = cuteafd_core::coordinator_programs::attention_plan_scratch(&spec.geometry, plan)? {
+                spec.scratch.insert("scratch".into(), bytes);
+            }
+            Ok(())
+        };
+        for (_, spec) in self.programs.values_mut() {
+            if keep(&spec.name) { select(spec)?; }
+        }
+        for (name, specs) in &mut self.card_specs {
+            if keep(name) { for spec in specs { select(spec)?; } }
         }
         Ok(self)
     }

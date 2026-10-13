@@ -2,7 +2,7 @@
 set -euo pipefail
 
 usage() {
-  echo "usage: build-wip-artifacts.sh SOURCE_DIR ROLE CUDA_ARCH BUILD_DIR OUTPUT_DIR [all|rust|native]" >&2
+  echo "usage: build-wip-artifacts.sh SOURCE_DIR ROLE CUDA_ARCH BUILD_DIR OUTPUT_DIR [all|rust|native|export]" >&2
   exit 2
 }
 
@@ -10,7 +10,10 @@ usage() {
 phase="${6:-all}"
 # Name the failing line and command: a container exec only reports an exit code.
 trap 'status=$?; echo "build-wip-artifacts.sh: line $LINENO: \"$BASH_COMMAND\" exited $status (role ${2:-?}, phase $phase)" >&2' ERR
-case "$phase" in all|rust|native) ;; *) usage ;; esac
+# export: only the native/AOT outputs and their native-store entry, no Cargo and
+# no daemon (an export host such as oliver; the slot's own native phase then
+# restores the entry with CUTEAFD_WIP_NATIVE_REQUIRE_HIT=1).
+case "$phase" in all|rust|native|export) ;; *) usage ;; esac
 source_dir="$(realpath "$1")"
 role="$2"
 cuda_arch="$3"
@@ -119,8 +122,8 @@ source "$(dirname "${BASH_SOURCE[0]}")/compiler-cache.sh"
 cuteafd_compiler_cache_setup "$build_dir"
 # kache restores hardlinks; plain and cached Cargo must not share outputs.
 export CARGO_TARGET_DIR="$build_dir/cargo-target$( [[ "${CUTEAFD_KACHE_MODE:-disabled}" != enabled ]] || printf -- '-kache' )"
-[[ "$phase" == native ]] || cuteafd_build_cache_cargo_offline "$source_dir/rust/Cargo.toml"
-if [[ "${CUTEAFD_WIP_EXPORT_LOCKS:-off}" == on || "$phase" == native ]] && ! cuteafd_compiler_cache_check_cmake_compilers "$build_dir/native"; then
+[[ "$phase" == native || "$phase" == export ]] || cuteafd_build_cache_cargo_offline "$source_dir/rust/Cargo.toml"
+if [[ "${CUTEAFD_WIP_EXPORT_LOCKS:-off}" == on || "$phase" == native || "$phase" == export ]] && ! cuteafd_compiler_cache_check_cmake_compilers "$build_dir/native"; then
   # Copied configure metadata can name a different compiler shim. Objects and
   # AOT outputs remain reusable; only the stale configure identity is discarded.
   rm -f "$build_dir/native/CMakeCache.txt"
@@ -169,7 +172,7 @@ wip_phase_mark() {
   printf 'WIP phase %s %s: %ss%s\n' "$role" "$1" "$2" "${3:+ ($3)}"
 }
 # A fresh build starts the table; the native phase and a retried Rust phase append.
-[[ "$phase" == native || "${CUTEAFD_WIP_PHASE_APPEND:-0}" == 1 ]] || : >"$wip_phase_log"
+[[ "$phase" == native || "$phase" == export || "${CUTEAFD_WIP_PHASE_APPEND:-0}" == 1 ]] || : >"$wip_phase_log"
 
 # Native outputs (library, AOT exports, packages, manifests) are a pure function
 # of their inputs: native/, python/, the build helpers, the pinned submodule
@@ -192,6 +195,9 @@ wip_native_key() {
       grep -vE '^CUTEAFD_WIP_(EXPORT_LOCKS|EXPORT_LOCK_FILES|HOST_EXPORT_TURN|SEED_WAIT_S|EXPORT_WAIT_S|NATIVE_STORE|NATIVE_CACHE|NATIVE_REQUIRE_HIT|DEV_IMAGE_ID)=' |
       LC_ALL=C sort
     printf 'audio %s exl3 %s nvfp4 %s coordinator_aot %s xgrammar %s\n' "$audio_aot" "$exl3_aot" "$nvfp4_aot" "$coordinator_aot" "$xgrammar"
+    # The CuTe DSL host target the exporters pin (#127; python/tools/lib/_pinned_sparkinfer.py):
+    # an override, or "native", changes every exported object's host code.
+    printf 'cute-host-target %s\n' "${CUTEAFD_CUTE_HOST_TARGET-<pinned default>}"
     # Pinned submodule trees by their verified lock digests (sparkinfer, xgrammar,
     # transformers), then every native, exporter and build-helper file.
     cat "$source_dir/third_party/"*.lock.json
@@ -199,7 +205,9 @@ wip_native_key() {
       LC_ALL=C sort -z | xargs -0 sha256sum)
   } | sha256sum | awk '{print $1}'
 }
-if [[ "$phase" != native ]]; then
+if [[ "$phase" == export ]]; then
+  :
+elif [[ "$phase" != native ]]; then
   rust_started=$SECONDS
   cargo build \
     --locked \
@@ -224,7 +232,7 @@ if [[ "${CUTEAFD_WIP_NATIVE_CACHE:-on}" == on && "${CUTEAFD_BUILD_CACHES:-on}" !
   if [[ -f "$native_entry/COMPLETE" ]] && (cd "$native_entry/output" && sha256sum --quiet --strict -c ../NATIVE_SHA256SUMS); then
     native_hit=1
   fi
-  [[ "$phase" == native ]] ||
+  [[ "$phase" == native || "$phase" == export ]] ||
     wip_phase_mark native-key $((SECONDS - native_key_started)) "$native_key $([[ $native_hit == 1 ]] && echo hit || echo miss)"
 fi
 # wip.sh reads this after the rust phase: a hit needs no GPU turn for the native phase.
@@ -393,8 +401,12 @@ else
   printf '%s\n' '{"schema":1,"role":"expert","enabled":false}' >"$output_dir/V41_FP8_AOT.json"
 fi
 fi
+if [[ "${phase:-all}" != export ]]; then
 install -m 0755 "$CARGO_TARGET_DIR/release/cuteafd" "$output_dir/cuteafd"
-if [[ -n "${CUTEAFD_KACHE:-}${CUTEAFD_KACHE_REQUESTED:-}" ]]; then
+fi
+if [[ "${phase:-all}" == export ]]; then
+  :
+elif [[ -n "${CUTEAFD_KACHE:-}${CUTEAFD_KACHE_REQUESTED:-}" ]]; then
   python3 "$(dirname "${BASH_SOURCE[0]}")/write-compiler-provenance.py" \
     "$source_dir" "$output_dir/cuteafd" "$output_dir/COMPILER_PROVENANCE.json"
 elif [[ -f "$output_dir/COMPILER_PROVENANCE.json" ]]; then
@@ -432,6 +444,7 @@ fi
 [[ -z "${native_started:-}" ]] ||
   wip_phase_mark native $((SECONDS - native_started)) "$([[ ${native_hit:-0} == 1 ]] && echo reused || echo built)"
 
+[[ "${phase:-all}" != export ]] || exit 0
 (
   cd "$output_dir"
   sha256sum cuteafd libcuteafd_native.so V41_EXPERT_AOT.json V41_EXPERT_TP_AOT.json V41_FP8_AOT.json PROGRAMS.json >ARTIFACT_SHA256SUMS

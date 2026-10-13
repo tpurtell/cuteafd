@@ -299,7 +299,7 @@ def export(output_dir: Path, role: str, rows: tuple[int, ...], input_format: str
         "spark_tp_degree": SPARK_TP_DEGREES.get(role),
         "input_format": input_format,
         "sparkinfer_revision": _pinned_sparkinfer.REVISION,
-        "device": properties.name,
+        "device": _pinned_sparkinfer.export_target(properties),
         "capability": list(capability),
         "physical_sms": properties.multi_processor_count,
         "geometry": {

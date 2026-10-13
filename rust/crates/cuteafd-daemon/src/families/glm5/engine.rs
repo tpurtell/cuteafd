@@ -308,6 +308,7 @@ pub(crate) struct GlmEngine<'a> {
     graph_misses: Cell<u64>,
     /// The DFlash2 drafter; every step taps its target layers.
     pub drafter: Option<super::dflash::GlmDrafter<'a>>,
+    pub(super) attention_plan: cuteafd_core::coordinator_programs::AttentionReductionPlan,
     /// L2 prefetch of the next layer's weights during decode exchanges.
     pub l2: Option<crate::shared::l2_prefetch::L2Prefetch>,
     /// The token embedding table (resident on this GPU or read from its shard).
@@ -383,6 +384,7 @@ impl<'a> GlmEngine<'a> {
             context_units: RefCell::new(Vec::new()), library, programs, cfg, weights, stream, max_context, prefill_rows, pages, kv, index, cos_sin,
             decode_workspace: RefCell::new(None), lane_workspaces: RefCell::new(Vec::new()),
             prefill_lanes,
+            attention_plan: cuteafd_core::coordinator_programs::AttentionReductionPlan::new(DECODE_ROWS, None, None)?,
             lanes: RefCell::new(Vec::new()), spark_bf16: false, full_prefill_logits: false, skip: None, l2: None, profile: RefCell::new([0.0; 3]),
             exchange_host: RefCell::new([0.0; 4]), draft_probe: RefCell::new(None),
             graphs: RefCell::new(std::collections::HashMap::new()), graphs_warmed: Cell::new(false), graphs_warming: Cell::new(false), graph_misses: Cell::new(0), drafter: None, embedding, prefill_w8a8: true })
@@ -1853,10 +1855,13 @@ impl<'a> GlmEngine<'a> {
                 print_mla_check(index, &stats);
             }
         } else {
+            let decode_scalars = [rows, Scalar::I32(self.attention_plan.rows() as i32)];
+            let prefill_scalars = [rows];
+            let scalars = if tables.decode { &decode_scalars[..] } else { &prefill_scalars[..] };
             self.run_on(rank, &Self::program(layer, &format!("glm_sparse_mla_{mode}_{cap}")), &[
                 ("q", w.query.buffer.ptr), ("kv_cache", kv.ptr), ("indices", w.indices.buffer.ptr),
                 ("lengths", w.lengths.buffer.ptr), ("out", w.attn.buffer.ptr), ("scratch", w.scratch.buffer.ptr)],
-                &[rows])?;
+                scalars)?;
         }
         self.o_proj(rank, w, layer, cap, rows)
     }

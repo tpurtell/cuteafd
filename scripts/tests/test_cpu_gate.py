@@ -114,7 +114,7 @@ def test_benches_record_medians_and_fail_on_a_bound_or_an_empty_run(tmp_path, mo
 
 def test_benches_flag_runs_only_the_bench_suite(tmp_path, monkeypatch):
     seen = []
-    monkeypatch.setattr(gate, 'prepare', lambda source, root: None)
+    monkeypatch.setattr(gate, 'prepare', lambda source, root, owned=False: None)
     monkeypatch.setattr(gate, 'checked', lambda cmd, **k: 'abc' if 'rev-parse' in cmd else '')
     for name in ('cargo', 'scripts', 'benches'):
         monkeypatch.setattr(gate, name, lambda s, r, a, e, n=name: seen.append(n) or {'suite': n, 'status': 'pass'})
@@ -154,3 +154,16 @@ def test_pin_changes_refuses_an_uncommitted_submodule_bump(tmp_path):
     assert gate.pin_changes(top) == ['third_party/sub']
     _git(top, 'commit', '-qm', 'bump')
     assert gate.pin_changes(top) == []
+
+
+def test_prepare_refuses_a_moved_pin_only_in_the_gated_source(tmp_path, monkeypatch):
+    """The --base worktree is the gate's own: re-detached at each base, its submodule still
+    sits at the previous base's pin, which `submodule update` then fixes. Refusing there broke
+    every second --base run; the gated source is still checked."""
+    monkeypatch.setattr(gate, 'pin_changes', lambda source: ['third_party/sparkinfer'])
+    calls = []
+    monkeypatch.setattr(gate, 'checked', lambda cmd, **k: calls.append(cmd) or '')
+    with pytest.raises(SystemExit, match='submodule pins differ'):
+        gate.prepare(tmp_path, tmp_path / 'head')
+    gate.prepare(tmp_path, tmp_path / 'base', owned=True)
+    assert any('submodule' in cmd for cmd in calls)

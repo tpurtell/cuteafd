@@ -45,7 +45,7 @@ def main():
     if arguments is None or re.sub(r"\s+", "", arguments[1]) != ",".join("&"+x for x in pointers+["rows", "stream", "ret"]):
         raise ValueError("unexpected native attention generated argument order")
     artifacts = {p.name: hashlib.sha256(p.read_bytes()).hexdigest()
-                 for p in destination.glob(stem+".*") if p.is_file() and p != manifest_path}
+                 for p in sorted(destination.glob(stem+".*")) if p.is_file() and p != manifest_path}
     manifest = dict(schema=1, sparkinfer_revision=_pinned_sparkinfer.REVISION,
                     source_tree_sha256=_pinned_sparkinfer.LOCK_DATA["source_tree_sha256"],
                     capability=[12, 0], geometry=dict(heads=args.heads, head_dim=512, window=128, selected=512, splits=10),

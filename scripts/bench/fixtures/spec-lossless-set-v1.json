@@ -1,0 +1,54 @@
+[
+  {
+    "id": "glmf-v19-base",
+    "prompt": "Write a complete Python module that implements a thread-safe LRU cache with per-entry TTL expiry, a background janitor thread, hit/miss statistics and a full pytest test suite. Output only the code.",
+    "nonce": "7ec2b2071ff95934-0000000026",
+    "source": "drafter-efficiency-serving-v19 (GLM Flash EXL3, 2 RTX, 0 Sparks): nonce_seed 7ec2b2071ff95934, request 26",
+    "reconstructed": true
+  },
+  {
+    "id": "code-1",
+    "prompt": "Write a complete Python module that implements a thread-safe LRU cache with per-entry TTL expiry, a background janitor thread, hit/miss statistics and a full pytest test suite. Output only the code.",
+    "nonce": "10ddc87bef"
+  },
+  {
+    "id": "code-2",
+    "prompt": "Write a complete Python module that implements a thread-safe LRU cache with per-entry TTL expiry, a background janitor thread, hit/miss statistics and a full pytest test suite. Output only the code.",
+    "nonce": "002888898b"
+  },
+  {
+    "id": "code-3",
+    "prompt": "Write a complete Python module that implements a thread-safe LRU cache with per-entry TTL expiry, a background janitor thread, hit/miss statistics and a full pytest test suite. Output only the code.",
+    "nonce": "118558162a"
+  },
+  {
+    "id": "code-4",
+    "prompt": "Write a complete Python module that implements a thread-safe LRU cache with per-entry TTL expiry, a background janitor thread, hit/miss statistics and a full pytest test suite. Output only the code.",
+    "nonce": "53610d4f52"
+  },
+  {
+    "id": "code-5",
+    "prompt": "Write a complete Python module that implements a thread-safe LRU cache with per-entry TTL expiry, a background janitor thread, hit/miss statistics and a full pytest test suite. Output only the code.",
+    "nonce": "f09fbe8f0e"
+  },
+  {
+    "id": "code-6",
+    "prompt": "Write a complete Python module that implements a thread-safe LRU cache with per-entry TTL expiry, a background janitor thread, hit/miss statistics and a full pytest test suite. Output only the code.",
+    "nonce": "62bdafaa0a"
+  },
+  {
+    "id": "code-7",
+    "prompt": "Write a complete Python module that implements a thread-safe LRU cache with per-entry TTL expiry, a background janitor thread, hit/miss statistics and a full pytest test suite. Output only the code.",
+    "nonce": "605e6d54bd"
+  },
+  {
+    "id": "prose-1",
+    "prompt": "Write a long, richly detailed short story about a lighthouse keeper on a remote northern island who finds a message in a bottle that seems to predict the weather. Use vivid description and dialogue.",
+    "nonce": "b998e92c43"
+  },
+  {
+    "id": "json-1",
+    "prompt": "Output a JSON array of 40 fictional customer records. Each record has: id (integer), name, email, city, country, signup_date (YYYY-MM-DD), plan (free, pro or team), monthly_spend (number) and tags (an array of two to four strings). Output only the JSON array.",
+    "nonce": "b365efba4a"
+  }
+]

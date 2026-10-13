@@ -62,6 +62,10 @@ pub(crate) struct RunArgs {
     /// Passes per panel, e.g. tool_eval=3 (the only way to repeat a panel).
     #[arg(long)]
     pub(crate) passes: Option<String>,
+    /// Cases for the spec_lossless_set panel (JSON: [{id, prompt, nonce}]); default: the shipped
+    /// scripts/bench/fixtures/spec-lossless-set-v1.json.
+    #[arg(long, value_name = "FILE")]
+    pub(crate) lossless_set: Option<PathBuf>,
     /// Exports to write: svg (report, card, panels), png (report, card), json.
     #[arg(long, value_delimiter = ',', default_value = "svg,png,json")]
     pub(crate) export: Vec<String>,
@@ -114,8 +118,10 @@ pub(crate) fn run(args: BenchArgs) -> Result<()> {
                 Some(text) => cuteafd_bench::profiles::parse_passes(text).map_err(anyhow::Error::msg)?,
                 None => Vec::new(),
             };
+            let lossless_set = run.lossless_set.as_deref().map(cuteafd_bench::panels::lossless::CaseSet::load).transpose()?;
             let options = cuteafd_bench::cli::RunOptions { url: run.url, profile: run.profile, panels: run.panels,
-                passes, baseline: None, export: run.export, out: run.out, label: None, root: run.root, api_key: run.api_key, quiet: false, deadline: None };
+                passes, baseline: None, export: run.export, out: run.out, label: None, root: run.root, api_key: run.api_key, quiet: false, deadline: None,
+                lossless_set };
             let (report, dir) = cuteafd_bench::cli::run(&options)?;
             println!("{}", dir.display());
             if report.quality_failed() {

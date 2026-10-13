@@ -29,7 +29,7 @@ else:
 
 class PlacementHandoffTest(unittest.TestCase):
     def run_startup(self, gpus, plan, options=(), spark_count=4, local_layers="auto", encoder=None):
-        source=(ROOT/'run.sh').read_text()
+        source=(ROOT/'scripts/launch/run-family.sh').read_text()
         block=source[source.index('placement_directory='):source.index('api_url=')]
         with tempfile.TemporaryDirectory() as directory:
             root=Path(directory); (root/'plan').write_text(json.dumps(plan))
@@ -94,6 +94,14 @@ expert_capacity=4096
 spark_first_layer=0
 wip_layout=
 wip_slot=
+# Shared launch features (run-family.sh helpers) at their defaults.
+bench_dir="$HOME/.cache/cuteafd/bench"
+api_args=() api_mount_args=() probe_args=() trace_args=() bench_nonce_env_args=() graph_census_args=()
+profile_args=() profile_wrapper=() profile_wrapper_args=()
+shared_env_args=(-e CUTEAFD_SPARK_INTAKE=auto -e CUTEAFD_CONSOLE_TEXT=true -e CUTEAFD_ATTENTION_PLACEMENT=auto -e CUTEAFD_FP8_EXPERT_PREFILL=auto)
+shared_worker_env_args=(-e CUTEAFD_FP8_EXPERT_PREFILL=auto -e CUTEAFD_THERMAL=on)
+thermal_args=(-e CUTEAFD_THERMAL=on)
+v41_fp8_head_args=()
 '''
             if encoder is not None:
                 setup+='\nVISION=auto\ncount_plan="$ENCODER_PLAN"\n'
@@ -117,7 +125,14 @@ wip_slot=
         three optional RDMA env values. Index from the `--` separator so the
         optional tail does not shift the assertions.
         """
-        return args[args.index('--') + 1:]
+        tail = args[args.index('--') + 1:]
+        # Worker docker options (the shared worker environment, PROFILE switches)
+        # follow the positional contract behind a --profile-args sentinel.
+        if '--profile-args' in tail:
+            options = tail[tail.index('--profile-args') + 1:]
+            assert 'CUTEAFD_THERMAL=on' in options, options
+            tail = tail[:tail.index('--profile-args')]
+        return tail
 
     def test_dual_starts_coordinator_then_correct_workers_then_acknowledges(self):
         for layers in [1,17,20,40]:
@@ -165,7 +180,7 @@ wip_slot=
         self.assertEqual(len(tails),4)
         self.assertTrue(all(tail[18:]==['2','19541','ab'*32,
             '0123456789012345678901234567890123456789'] for tail in tails))
-        self.assertIn('if [[ "$rank" == "${19:--1}" ]]', (ROOT/'run.sh').read_text())
+        self.assertIn('if [[ "$rank" == "${19:--1}" ]]', (ROOT/'scripts/launch/run-family.sh').read_text())
 
     def test_compact_starts_exactly_two_workers_and_passes_ceiling(self):
         result,events=self.run_startup(1,dict(version=1,rtx_gpus=1,nonce="fresh",rtx_expert_layers=0,spark_first_layer=0),spark_count=2)
@@ -197,21 +212,28 @@ wip_slot=
         self.assertTrue(all(a=='--host' for a in drops[0][1::2]),drops)
 
     def test_cli_tp2_overrides_and_invalid_config(self):
-        source=(ROOT/'run.sh').read_text()
-        block=source[source.index('config="$repo_root/cuteafd.config"'):source.index('for tool in docker ssh')]
-        setup='repo_root="$1"; shift; source "$repo_root/scripts/lib/release-common.sh"\n'
+        """The former --tp2-* flags are configuration keys: run.sh --set reaches the
+        loader as the file would, and the loader rejects a bad value."""
+        source=(ROOT/'scripts/launch/run-family.sh').read_text()
+        block=source[source.index('# The release loader validates every key'):source.index('release_validate_tp2_options\n')]
         finish='\nprintf "%s\\n" "$TP2_ATTENTION" "$TP2_QUERY_PROJECTION" "$TP2_OUTPUT_PROJECTION" "$TP2_DSPARK_EXPERTS"\n'
         with tempfile.TemporaryDirectory() as directory:
             config=Path(directory)/'recipe.config'
-            config.write_text((ROOT/'cuteafd.config').read_text()+'\nTP2_ATTENTION=on\nTP2_DSPARK_EXPERTS=on\n')
-            args=['bash','-c',setup+block+finish,'test',str(ROOT),'--config',str(config)]
-            result=subprocess.run(args+['--no-tp2-attention','--tp2-query-projection','--no-tp2-dspark-experts'],capture_output=True,text=True,cwd=ROOT)
+            config.write_text((ROOT/'cuteafd.config').read_text()+'\nTP2_ATTENTION=on\nTP2_DSPARK_EXPERTS=on\n'
+                              '\n# run.sh --set\nTP2_ATTENTION=off\nTP2_DSPARK_EXPERTS=off\nTP2_QUERY_PROJECTION=on\n')
+            setup='set -euo pipefail; source scripts/lib/release-common.sh; config="$1"; wip_slot=\n'
+            result=subprocess.run(['bash','-c',setup+block+finish,'test',str(config)],capture_output=True,text=True,cwd=ROOT)
             self.assertEqual(result.returncode,0,result.stderr)
             self.assertEqual(result.stdout.splitlines(),['off','on','off','off'])
             config.write_text((ROOT/'cuteafd.config').read_text()+'\nTP2_OUTPUT_PROJECTION=invalid\n')
-            result=subprocess.run(args,capture_output=True,text=True,cwd=ROOT)
+            result=subprocess.run(['bash','-c',setup+block+finish,'test',str(config)],capture_output=True,text=True,cwd=ROOT)
             self.assertNotEqual(result.returncode,0)
             self.assertIn('TP2_OUTPUT_PROJECTION must be on or off',result.stderr)
+        # The removed flags name the key that replaced them.
+        for flag in ['--tp2-attention','--no-tp2-query-projection','--dspark']:
+            result=subprocess.run(['./run.sh',flag],capture_output=True,text=True,cwd=ROOT)
+            self.assertEqual(result.returncode,2)
+            self.assertIn('--set',result.stderr)
 
     def test_tp2_options_reach_coordinator_independently(self):
         options=['ATTENTION','QUERY_PROJECTION','OUTPUT_PROJECTION','DSPARK_EXPERTS']
