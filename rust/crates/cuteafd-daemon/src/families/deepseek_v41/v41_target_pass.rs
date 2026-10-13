@@ -392,6 +392,8 @@ impl<'w, 'a> TargetPass<'w, 'a> {
         let id = batch.cache()?.identity();
         let rows = batch.cache()?.positions().len();
         let stage = batch.cache()?.stage();
+        let diagnostic = super::v41_lossless_diag::Snapshot::begin(batch)?;
+        self.lane.diagnostic_begin(diagnostic.clone());
         let activation_trace = if tracing::enabled!(target: "cuteafd::activation_trace", tracing::Level::DEBUG) {
             let position: u64 = std::env::var("CUTEAFD_ACTIVATION_TRACE_POSITION")?.parse()?;
             if batch.cache()?.positions().first() == Some(&position) {
@@ -580,6 +582,10 @@ impl<'w, 'a> TargetPass<'w, 'a> {
                     };
                     self.sampled = Some(sampled);
                 }
+            }
+            if let Some(snapshot) = &diagnostic {
+                let logits = self.head.output()?;
+                snapshot.logits(self.upload.library(), logits.logits, logits.selected_rows)?;
             }
             self.state = State::Ready(id);
         }

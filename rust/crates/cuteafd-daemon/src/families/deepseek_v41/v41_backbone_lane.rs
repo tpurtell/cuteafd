@@ -518,6 +518,7 @@ pub(crate) struct BackboneLane<'w, 'a> {
     router: BackboneRouterWave<'w, 'a>,
     layer: usize,
     phase: Phase,
+    diagnostic: Option<super::v41_lossless_diag::Snapshot>,
     capture_routes: bool,
     route_capture: Vec<Vec<[u32; 6]>>,
     /// Host FFN stage times summed over the captured pass.
@@ -579,6 +580,7 @@ impl<'w, 'a> BackboneLane<'w, 'a> {
             router: first.router.wave(capacity, sizes[5])?,
             layer: first_layer,
             phase: Phase::Idle,
+            diagnostic: None,
             capture_routes: false,
             route_capture: Vec::new(),
             ffn_split: FfnSplit::default(),
@@ -595,6 +597,26 @@ impl<'w, 'a> BackboneLane<'w, 'a> {
     }
     /// Cancel or start another wave. External consumers must have finished;
     /// borrowed outputs prevent safe callers from restarting during consumption.
+    pub(super) fn diagnostic_begin(&mut self, snapshot: Option<super::v41_lossless_diag::Snapshot>) {
+        self.diagnostic = snapshot;
+    }
+    fn diagnostic_layer(&self, result: CuteafdDeviceBuffer) -> Result<()> {
+        if let Some(snapshot) = &self.diagnostic {
+            let attention = self.projection.diagnostic_projected();
+            let attention_residual = self.block.diagnostic_attention_residual();
+            snapshot.dump(self.weights.library, self.layer, "attention", attention, 10240)?;
+            snapshot.dump(self.weights.library, self.layer, "attention-residual", attention_residual, 40960)?;
+            snapshot.dump(self.weights.library, self.layer, "moe-combined", result, 10240)?;
+
+        }
+        Ok(())
+    }
+    fn diagnostic_residual(&self) -> Result<()> {
+        if let Some(snapshot) = &self.diagnostic {
+            snapshot.dump(self.weights.library, self.layer, "residual", self.block.output()?.residual, 40960)?;
+        }
+        Ok(())
+    }
     pub fn invalidate(&mut self) {
         self.phase = Phase::Invalid;
         self.block.reset();
@@ -894,7 +916,9 @@ impl<'w, 'a> BackboneLane<'w, 'a> {
         result: CuteafdDeviceBuffer,
     ) -> Result<BlockOutput<'_>> {
         self.enter(Phase::SharedReady)?;
+        self.diagnostic_layer(result)?;
         unsafe { self.block.finish_ffn(binding, result)?; }
+        self.diagnostic_residual()?;
         self.record_layer_finish();
         self.phase = Phase::Complete;
         self.block.output()
@@ -905,10 +929,12 @@ impl<'w, 'a> BackboneLane<'w, 'a> {
     pub async unsafe fn finish_ffn_cooperative(&mut self, binding: QueryBinding,
         result: CuteafdDeviceBuffer) -> Result<BlockOutput<'_>> {
         self.enter(Phase::SharedReady)?;
+        self.diagnostic_layer(result)?;
         let handoff=self.weights.placement.is_some() && self.layer<39
             && self.weights.layers[self.layer+1].device.id != self.block.inputs()[0].device_id;
         unsafe { if handoff { self.block.finish_ffn_for_handoff_cooperative(binding,result).await?; }
             else { self.block.finish_ffn_cooperative(binding, result).await?; } }
+        self.diagnostic_residual()?;
         self.record_layer_finish();
         self.phase = Phase::Complete;
         self.block.output()

@@ -552,6 +552,7 @@ impl AttentionOutputWave<'_, '_> {
     pub fn chain_graph_identity(&self) -> [usize; 2] {
         [self.b(0).ptr as usize, self.weights as *const _ as usize]
     }
+    pub(super) fn diagnostic_projected(&self) -> CuteafdDeviceBuffer { self.b(2) }
     pub fn output(&self) -> Result<AttentionOutput<'_>> {
         let rows = self.ready.context("attention output unpublished")? as usize;
         let b = |i| {
