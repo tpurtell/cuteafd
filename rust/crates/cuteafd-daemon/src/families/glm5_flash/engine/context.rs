@@ -32,7 +32,7 @@
 //! **Tables.** A step's per-rank tables are built on the host and uploaded once at the step's
 //! start, after both streams drained, so no queued kernel reads a table the host rewrites.
 use super::*;
-use crate::shared::peer_split::context::{commit_blocks, local_pages, page_owner, pick_partial, partial_programs,
+use crate::shared::peer_split::context::{commit_blocks, local_pages, page_owner, partial_program,
     CommitPlane, ContextExchange};
 use cuteafd_ffi::CuteafdDeviceBuffer;
 use cuteafd_loader::placement::families::glm5_flash::{context_buffers, context_commit_units, context_workspace,
@@ -74,20 +74,11 @@ pub(super) struct GlmfContextSplit<'a> {
     pub exchange: ContextExchange<'a>,
     /// Logical units one staging view holds: the compiled extent's.
     staging_units: usize,
-    /// Per GPU, the partial program of heads `[0, H/2)` and `[H/2, H)`: one split plan for every
-    /// decode and verify row count ([`PARTIAL_ROWS`]).
+    /// Per GPU, one immutable startup recipe for heads `[0, H/2)` and `[H/2, H)`.
     partial: [[String; 2]; 2],
     /// `lse_combine2`'s sink operand (never read: GLM Flash has no sink).
     sink: [Dev<'a>; 2],
 }
-
-/// The row cap whose split plan every decode and verify step runs. Speculation must be lossless:
-/// a k-row verify and k single-row decodes of the same tokens must compute the same attention,
-/// and the partial's split count changes the LSE grouping and its BF16 partial roundings. A row
-/// bucket per step (GLM 5.3's C1 speedup) let a 1-row decode (33 splits) and a verify of up to 8
-/// rows (11 at 188 SMs) diverge by up to 0.13 nats a row and flip greedy tokens. The 8-row plan
-/// keeps a C1 verify's CTAs filling the GPU and serves 64-row steps too.
-pub(super) const PARTIAL_ROWS: usize = 8;
 
 /// A view of `bytes` at `offset` inside `dev`.
 fn view(dev: &Dev<'_>, offset: usize, bytes: usize) -> Result<CuteafdDeviceBuffer> {
@@ -113,11 +104,8 @@ impl<'a> GlmfContextSplit<'a> {
         let rank = |rank: usize| -> Result<(ContextRank<'a>, Dev<'a>, [String; 2])> {
             engine.on(rank, || {
                 let sms = engine.library.sm_count()?;
-                // The one row-independent split-plan choice (lossless speculation). Interim GLMF pin:
-                // becomes the shared row-independent choice when work/context-split-lossless lands
-                // in shared/peer_split/context.rs.
-                let partial = [0, cfg.heads / 2].map(|begin| partial_programs(manifest, "glmf", begin, DECODE_ROWS, sms)
-                    .map(|variants| pick_partial(&variants, PARTIAL_ROWS).to_string()));
+                let partial = [0, cfg.heads / 2].map(|begin| partial_program(
+                    manifest, "glmf", begin, DECODE_ROWS, sms, &engine.attention_plan));
                 let [a, b] = partial;
                 let partial = [a?, b?];
                 let _scope = cuteafd_ffi::memory_ledger::scope("context-workspace");

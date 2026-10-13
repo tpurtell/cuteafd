@@ -1551,7 +1551,31 @@ impl Opened {
             "KDA partial/expanded options require native head-split programs (missing glmf2_kda_m64)");
         // The MLA placement: auto is context on two GPUs where this build carries its programs
         // (with the compact index cache), else heads (whose split keeps the token keys).
-        let attention = resolve_attention(args, &programs, split_device.is_some())?;
+        let mut attention = resolve_attention(args, &programs, split_device.is_some())?;
+        let context_manifest = if attention.mode == cuteafd_loader::placement::AttentionPlacement::Context {
+            let fallback = args.manifest.with_file_name("DSV4_PROGRAMS.json");
+            let path = if !args.manifest.exists()
+                && args.manifest.file_name() == Some("PROGRAMS.json".as_ref()) && fallback.exists() {
+                &fallback
+            } else { &args.manifest };
+            let manifest: serde_json::Value = serde_json::from_slice(&std::fs::read(path)?)?;
+            let mut scratch = 0;
+            for device in std::iter::once(args.device).chain(split_device) {
+                let bytes = crate::shared::peer_split::on_device(&self.library, device, args.device, || {
+                    let sms = self.library.sm_count()?;
+                    let mut bytes = 0;
+                    for begin in [0, self.cfg.heads / 2] {
+                        let name = crate::shared::peer_split::context::partial_program(
+                            &manifest, "glmf", begin, engine::DECODE_ROWS, sms, &attention_plan)?;
+                        bytes = bytes.max(programs.spec(&name)?.scratch.get("scratch").copied().unwrap_or(0));
+                    }
+                    Ok(bytes)
+                })?;
+                scratch = scratch.max(bytes);
+            }
+            attention.partial_scratch = scratch;
+            Some(manifest)
+        } else { None };
         let context_mode = (attention.mode == cuteafd_loader::placement::AttentionPlacement::Context).then_some(attention);
         let index_cache = if context_mode.is_some() { engine::IndexCache::Compact }
             else { served_index_cache(args.index_cache, split_device.is_some()) };
@@ -1704,10 +1728,9 @@ impl Opened {
             tracing::info!(device = args.device, split_device = device, attention = %attention.mode,
                 "GLM 5.3 Flash head split over two GPUs");
         }
-        if context_mode.is_some() {
-            // The solver charged the staging over the compiled extent it was given.
-            let manifest: serde_json::Value = serde_json::from_slice(&std::fs::read(&args.manifest)?)?;
-            engine.attach_context(args.max_context, &manifest)?;
+        if let Some(manifest) = &context_manifest {
+            // The solver charged selected partial scratch and full-extent staging.
+            engine.attach_context(args.max_context, manifest)?;
         }
         probe("peer-exchanges")?;
         engine.set_graph_budget(args.graph_budget_mib.map(|mib| mib << 20));
