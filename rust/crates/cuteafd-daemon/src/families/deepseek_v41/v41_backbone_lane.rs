@@ -602,6 +602,7 @@ impl<'w, 'a> BackboneLane<'w, 'a> {
     }
     fn diagnostic_layer(&self, result: CuteafdDeviceBuffer) -> Result<()> {
         if let Some(snapshot) = &self.diagnostic {
+            snapshot.dump(self.weights.library, self.layer, "input-residual", self.block.inputs()[0], 40960)?;
             let attention = self.projection.diagnostic_projected();
             let attention_residual = self.block.diagnostic_attention_residual();
             snapshot.dump(self.weights.library, self.layer, "attention", attention, 10240)?;

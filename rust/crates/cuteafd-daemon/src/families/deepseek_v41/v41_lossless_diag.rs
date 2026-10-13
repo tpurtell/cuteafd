@@ -18,9 +18,15 @@ fn config() -> Option<&'static Config> {
         Some(Config { directory: directory.into(), prompt, requests: Mutex::new(BTreeSet::new()) })
     }).as_ref()
 }
+fn matches_prompt(prompt: &[u32], position: u64, tokens: &[u32]) -> bool {
+    position == 0 && !prompt.is_empty() && tokens == prompt
+}
+fn selected_position(prompt_len: usize, position: u64) -> bool {
+    prompt_len > 0 && (prompt_len as u64 - 1..prompt_len as u64 + 6).contains(&position)
+}
 pub(super) fn observe_prompt(id: u64, position: u64, tokens: &[u32]) {
     if let Some(config) = config() {
-        if position == 0 && tokens == config.prompt {
+        if matches_prompt(&config.prompt, position, tokens) {
             config.requests.lock().unwrap().insert(id);
         }
     }
@@ -37,9 +43,8 @@ impl Snapshot {
         let rows = batch.cache()?.expert_rows();
         if rows.len() > 80 { return Ok(None); }
         let ids = config.requests.lock().unwrap();
-        let first = config.prompt.len() as u64 - 1;
         let selected: Vec<_> = rows.iter().enumerate().filter_map(|(i, row)|
-            (ids.contains(&row.request_id) && row.kind != cuteafd_transport::ExpertV2SourceKind::Prefill && (first..first + 7).contains(&row.position)).then_some(i)).collect();
+            (ids.contains(&row.request_id) && row.kind != cuteafd_transport::ExpertV2SourceKind::Prefill && selected_position(config.prompt.len(), row.position)).then_some(i)).collect();
         if selected.is_empty() { return Ok(None); }
         let directory = config.directory.join(format!("batch{}-{:?}-{}rows", batch.cache()?.identity(), batch.cache()?.stage(), rows.len()));
         std::fs::create_dir_all(&directory)?;
@@ -73,5 +78,25 @@ impl Snapshot {
             std::fs::write(self.directory.join(format!("logits-row{row}.bin")), &bytes[index * row_bytes..(index + 1) * row_bytes])?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn exact_prompt_excludes_other_requests_and_continuations() {
+        assert!(matches_prompt(&[1, 2, 3], 0, &[1, 2, 3]));
+        assert!(!matches_prompt(&[1, 2, 3], 0, &[1, 2]));
+        assert!(!matches_prompt(&[1, 2, 3], 0, &[1, 2, 4]));
+        assert!(!matches_prompt(&[1, 2, 3], 1, &[1, 2, 3]));
+        assert!(!matches_prompt(&[], 0, &[]));
+    }
+    #[test]
+    fn snapshots_are_bounded_to_first_matching_verify_rows() {
+        for position in 0..80 {
+            assert_eq!(selected_position(52, position), (51..58).contains(&position));
+        }
+        assert!(!selected_position(0, 0));
     }
 }
