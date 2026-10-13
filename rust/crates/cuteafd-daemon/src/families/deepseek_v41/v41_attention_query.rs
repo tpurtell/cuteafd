@@ -120,7 +120,7 @@ impl<'a> AttentionQueryWeights<'a> {
             buffers: ROW_BYTES
                 .into_iter().enumerate()
                 .map(|(i, n)| {
-                    if i == 4 && !cfg!(test) { Ok(None) }
+                    if i == 4 && !cfg!(test) && !super::v41_lossless_diag::enabled() { Ok(None) }
                     else { DeviceAllocation::new(self.library, n * capacity as usize).map(Some) }
                 })
                 .collect::<Result<Vec<_>>>()?,
@@ -217,7 +217,7 @@ impl AttentionQueryWave<'_, '_> {
     }
     pub fn device_bytes_with_split(library:&NativeLibrary,capacity:u32,split_query_b:bool)->Result<usize> {
         let mut bytes = 4 + capacity as usize * ROW_BYTES.iter().enumerate()
-            .filter(|(i, _)| *i != 4 || cfg!(test)).map(|(_, bytes)| bytes).sum::<usize>();
+            .filter(|(i, _)| *i != 4 || cfg!(test) || super::v41_lossless_diag::enabled()).map(|(_, bytes)| bytes).sum::<usize>();
         for (k, n) in MATRICES.into_iter().take(if split_query_b {1} else {2}) {
             bytes += library.v41_fp8_matrix_plan_info(capacity, k, n)?.scratch_bytes as usize;
         }
@@ -232,6 +232,7 @@ impl AttentionQueryWave<'_, '_> {
     pub fn input(&self) -> CuteafdDeviceBuffer {
         self.b(0)
     }
+    pub(super) fn diagnostic_projected(&self) -> CuteafdDeviceBuffer { self.b(4) }
     pub fn positions(&self) -> CuteafdDeviceBuffer {
         self.b(5)
     }
@@ -293,12 +294,11 @@ impl AttentionQueryWave<'_, '_> {
                 rows,
                 self.stream.raw,
             )?;
-            // Preserve the pre-RoPE tensor only for numerical trace fixtures.
-            // Serving rotates the completed projection in place, saving one
-            // 64-head BF16 buffer per lane without changing the kernel math.
-            #[cfg(test)]
-            self.stream.library.copy_d2d_async(self.b(4), self.b(3),
-                rows as usize * ROW_BYTES[3], self.stream.raw)?;
+            // Preserve pre-RoPE only for fixtures or the private diagnostic.
+            if cfg!(test) || super::v41_lossless_diag::enabled() {
+                self.stream.library.copy_d2d_async(self.b(4), self.b(3),
+                    rows as usize * ROW_BYTES[3], self.stream.raw)?;
+            }
             self.norm.rope(
                 self.b(3),
                 self.b(6),
@@ -542,8 +542,9 @@ impl AttentionQueryWave<'_, '_> {
                 rows as usize, graph.map(|(raw, _)| raw), || self.enqueue_rank(rows))?;
             projection.execute_after(self.weights.layer,rows,self.b(2),Some(self.stream.raw),|projected,stream| {
                 self.stream.library.copy_d2d_async(self.b(3),projected,rows as usize*ROW_BYTES[3],stream)?;
-                #[cfg(test)]
-                self.stream.library.copy_d2d_async(self.b(4),projected,rows as usize*ROW_BYTES[3],stream)?;
+                if cfg!(test) || super::v41_lossless_diag::enabled() {
+                    self.stream.library.copy_d2d_async(self.b(4),projected,rows as usize*ROW_BYTES[3],stream)?;
+                }
                 self.norm.rope(self.b(3),self.b(6),self.b(3),rows,64,false,stream)
             }).await?;
         }

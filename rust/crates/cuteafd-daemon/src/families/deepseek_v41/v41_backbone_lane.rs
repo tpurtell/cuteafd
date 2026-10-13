@@ -602,6 +602,14 @@ impl<'w, 'a> BackboneLane<'w, 'a> {
     }
     fn diagnostic_layer(&self, result: CuteafdDeviceBuffer) -> Result<()> {
         if let Some(snapshot) = &self.diagnostic {
+            let query = self.query.output()?;
+            snapshot.dump(self.weights.library, self.layer, "query-input", query.hidden, 10240)?;
+            snapshot.dump(self.weights.library, self.layer, "q-a", query.raw_rank, 2560)?;
+            snapshot.dump(self.weights.library, self.layer, "q-a-normalized", query.normalized_rank, 2560)?;
+            snapshot.dump(self.weights.library, self.layer, "q-b", self.query.diagnostic_projected(), 65536)?;
+            snapshot.dump(self.weights.library, self.layer, "q-b-rotated", query.rotated, 65536)?;
+            snapshot.dump(self.weights.library, self.layer, "o-input", self.projection.diagnostic_input(), 65536)?;
+            snapshot.dump(self.weights.library, self.layer, "o-a", self.projection.diagnostic_grouped(), 16384)?;
             snapshot.dump(self.weights.library, self.layer, "input-residual", self.block.inputs()[0], 40960)?;
             let attention = self.projection.diagnostic_projected();
             let attention_residual = self.block.diagnostic_attention_residual();
@@ -609,6 +617,14 @@ impl<'w, 'a> BackboneLane<'w, 'a> {
             snapshot.dump(self.weights.library, self.layer, "attention-residual", attention_residual, 40960)?;
             snapshot.dump(self.weights.library, self.layer, "moe-combined", result, 10240)?;
 
+        }
+        Ok(())
+    }
+    pub(super) fn diagnostic_active(&self) -> bool { self.diagnostic.is_some() }
+    pub(super) fn diagnostic_window(&self, window: &super::v41_window::WindowOutput<'_>) -> Result<()> {
+        if let Some(snapshot) = &self.diagnostic {
+            snapshot.dump(self.weights.library, self.layer, "kv-projected", window.projected, 1024)?;
+            snapshot.dump(self.weights.library, self.layer, "kv-normalized", window.normalized, 1024)?;
         }
         Ok(())
     }

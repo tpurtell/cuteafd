@@ -553,6 +553,8 @@ impl AttentionOutputWave<'_, '_> {
         [self.b(0).ptr as usize, self.weights as *const _ as usize]
     }
     pub(super) fn diagnostic_projected(&self) -> CuteafdDeviceBuffer { self.b(2) }
+    pub(super) fn diagnostic_grouped(&self) -> CuteafdDeviceBuffer { self.b(1) }
+    pub(super) fn diagnostic_input(&self) -> CuteafdDeviceBuffer { self.b(0) }
     pub fn output(&self) -> Result<AttentionOutput<'_>> {
         let rows = self.ready.context("attention output unpublished")? as usize;
         let b = |i| {

@@ -647,6 +647,9 @@ impl<'w, 'a> BackboneExecution<'w, 'a> {
             }
         }
         let produced_us = queued_production.map_or_else(|| timing.elapsed().as_micros() as u64, |p| p.producer_us);
+        if lane.diagnostic_active() {
+            lane.diagnostic_window(&self.windows[layer].output(bank.bank().window(batch, layer)?)?)?;
+        }
         let source = SOURCES
             .iter()
             .rposition(|&l| l <= layer)
