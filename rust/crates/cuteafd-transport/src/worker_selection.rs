@@ -456,7 +456,13 @@ mod tests {
         assert_eq!(report.group_rows(1).unwrap(), 1);
         assert_eq!(report.group_rows(2).unwrap(), 64);
         assert_eq!(report.group_rows(16).unwrap(), 64);
-        assert!(InstalledExpertGrouping::new(loaded, 0, 16, ExpertGroupingSelector::Exl3Nearest, variants).is_err());
+        let nearest = InstalledExpertGrouping::new(loaded.clone(), 0, 16,
+            ExpertGroupingSelector::Exl3Nearest, variants.clone()).unwrap();
+        assert_eq!(nearest.group_rows(0).unwrap(), 64);
+        assert_eq!(nearest.group_rows(2).unwrap(), 16);
+        assert_eq!(nearest.group_rows(16).unwrap(), 16);
+        assert!(InstalledExpertGrouping::new(loaded, 0, 16,
+            ExpertGroupingSelector::Exl3Nearest, variants[..2].to_vec()).is_err());
     }
 
     #[test]

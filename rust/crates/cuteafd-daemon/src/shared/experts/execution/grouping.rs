@@ -324,6 +324,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         exl3_fixture(root.path(), 1, None, Exl3Schedule::Default);
         exl3_fixture(root.path(), 16, Some(16), Exl3Schedule::Default);
+        exl3_fixture(root.path(), 80, Some(32), Exl3Schedule::Default);
         let installed = InstalledExpertGrouping::exl3(
             root.path(),
             16,
@@ -332,7 +333,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(installed.group_rows(1).unwrap(), 8);
-        assert_eq!(installed.group_rows(0).unwrap(), 16);
+        assert_eq!(installed.group_rows(0).unwrap(), 32);
         assert_eq!(installed.group_rows(2).unwrap(), 16);
         assert_eq!(installed.group_rows(16).unwrap(), 16);
     }
