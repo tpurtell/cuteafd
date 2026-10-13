@@ -58,7 +58,8 @@ typedef struct cuteafd_expert_info_t {
 } cuteafd_expert_info_t;
 
 /* Additive numerical attestation; the existing 64-byte expert info ABI is unchanged.
- * Fold: 1 ascending FP32 slice planes, 2 atomic tokens. Implementation: 1 slices,
+ * Fold: 1 ascending FP32 slice planes, 2 atomic tokens, 3 live-row hybrid.
+ * Implementation: 1 slices,
  * 2 hybrid. Generated from the same recipe as the compiled AOT variant. */
 typedef struct cuteafd_expert_reduction_t {
   uint32_t version, slice_width, fc2_k_steps, plane_count, plane_fold;

@@ -126,10 +126,11 @@ impl V41ExpertReduction {
             && self.plane_count.checked_mul(self.slice_width)
                 .is_some_and(|extent| extent <= info.kernel_intermediate),
             "native expert slice/fold geometry differs from compiled expert info");
-        ensure!(matches!(self.plane_fold, 1 | 2) && matches!(self.implementation, 1 | 2),
+        ensure!(matches!(self.plane_fold, 1 | 2 | 3) && matches!(self.implementation, 1 | 2),
             "unknown native expert plane fold or implementation");
-        ensure!((self.plane_fold == 1 && info.abi_version == 2)
-            || (self.plane_fold == 2 && info.abi_version == 3),
+        ensure!((self.plane_fold == 1 && self.implementation == 1 && info.abi_version == 2)
+            || (self.plane_fold == 2 && self.implementation == 1 && info.abi_version == 3)
+            || (self.plane_fold == 3 && self.implementation == 2 && info.abi_version == 2),
             "native expert plane fold disagrees with output ABI");
         Ok(())
     }

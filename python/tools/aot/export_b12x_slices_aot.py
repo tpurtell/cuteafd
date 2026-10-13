@@ -98,7 +98,7 @@ def numerical_recipe(width: int, intermediate: int, *, atomic: bool, compact: bo
         fc2_k_steps=width // 32,
         block_threads=128,
         plane_count=(intermediate + width - 1) // width,
-        plane_fold="atomic_tokens" if atomic else "ascending_fp32",
+        plane_fold="hybrid_live_rows" if compact else "atomic_tokens" if atomic else "ascending_fp32",
         implementation="hybrid" if compact else "slices",
         output_kind="fp32_tokens" if atomic else "fp32_routes",
     )
@@ -369,7 +369,7 @@ def export(output, capacities, width, atomic_min_capacity=None, role="spark", *,
         recipe = numerical_recipe(selected_width, intermediate, atomic=atomic, compact=compact)
         reductions.append(
             f"case {capacity}: *out = {{1,{selected_width},{recipe['fc2_k_steps']},"
-            f"{planes},{2 if atomic else 1},{2 if compact else 1},32,128,128}}; return 0;")
+            f"{planes},{3 if compact else 2 if atomic else 1},{2 if compact else 1},32,128,128}}; return 0;")
         manifest["variants"].append(
             dict(
                 name=label,

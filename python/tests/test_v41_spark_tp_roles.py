@@ -406,7 +406,9 @@ def test_native_manifest_records_inner_accumulation_and_outer_fold() -> None:
         assert prefill["plane_fold"] == "atomic_tokens"
         assert prefill["output_kind"] == "fp32_tokens"
         assert prefill != serial
-    assert recipe(64, 576, atomic=False, compact=True)["implementation"] == "hybrid"
+    hybrid = recipe(64, 576, atomic=False, compact=True)
+    assert hybrid["implementation"] == "hybrid"
+    assert hybrid["plane_fold"] == "hybrid_live_rows"
     source = SLICES.read_text()
     assert "numerical_recipe=numerical_recipe(selected_width, intermediate," in source
 
@@ -415,7 +417,7 @@ def test_compiled_numerical_attestation_is_additive_and_role_scoped() -> None:
     source = SLICES.read_text()
     assert "#define CUTEAFD_EXPERT_REDUCTION_CASES " in source
     assert "recipe['fc2_k_steps']" in source
-    assert "{planes},{2 if atomic else 1},{2 if compact else 1},32,128,128" in source
+    assert "{planes},{3 if compact else 2 if atomic else 1},{2 if compact else 1},32,128,128" in source
     native = (ROOT / "native/shared/src/v41_experts.cc").read_text()
     assert "CUTEAFD_JOIN(cuteafd_expert_info, _reduction)" in native
     assert "static_assert(sizeof(cuteafd_expert_info_t) == 64)" in native
