@@ -147,6 +147,32 @@ impl std::fmt::Display for MissingCoordinatorProgram {
 
 impl std::error::Error for MissingCoordinatorProgram {}
 
+/// Charge only the selected numerical recipe at full execution capacity.
+/// Export geometry owns recipe scratch; this helper is independent of family names.
+pub fn attention_plan_scratch(geometry: &serde_json::Value, plan: AttentionReductionPlan)
+    -> Result<Option<u64>, AttentionScratchError> {
+    let Some(recipes) = geometry.get("attention_plan_scratch") else { return Ok(None) };
+    let invalid = || AttentionScratchError;
+    let capacity = geometry["attention_plan_capacity_rows"].as_u64().ok_or_else(invalid)?;
+    if capacity != plan.capacity_rows() as u64 { return Err(invalid()); }
+    let recipes = recipes.as_array().ok_or_else(invalid)?;
+    let mut previous = 0;
+    let mut selected = None;
+    for recipe in recipes {
+        let cap = recipe["rows_cap"].as_u64().ok_or_else(invalid)?;
+        let bytes = recipe["scratch"].as_u64().ok_or_else(invalid)?;
+        if cap <= previous || cap > capacity { return Err(invalid()); }
+        previous = cap;
+        if selected.is_none() && cap >= plan.rows() as u64 { selected = Some(bytes); }
+    }
+    if previous != capacity { return Err(invalid()); }
+    selected.map(Some).ok_or_else(invalid)
+}
+
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+#[error("invalid attention recipe scratch contract or numerical domain mismatch")]
+pub struct AttentionScratchError;
+
 /// Select the same 170/188-SM program recipe as native load, before admission.
 /// The retained plans allow another device to select its own scratch envelope.
 pub fn select_card_plans(manifest: &mut serde_json::Value, sms: u32) -> Result<(), CardPlanError> {
@@ -216,6 +242,29 @@ mod tests {
             }));
         }
         assert!(AttentionReductionPlan::new(64, None, None).unwrap().validate_loaded(Some(0)).is_err());
+    }
+
+    #[test]
+    fn attention_scratch_reserves_selected_recipe_at_full_capacity() {
+        let geometry = serde_json::json!({"attention_plan_capacity_rows": 64,
+            "attention_plan_scratch": [{"rows_cap": 1, "scratch": 67371008},
+                {"rows_cap": 8, "scratch": 23158784}, {"rows_cap": 64, "scratch": 8421376}]});
+        for (rows, bytes) in [(1, 67371008), (8, 23158784), (9, 8421376), (64, 8421376)] {
+            let plan = AttentionReductionPlan::new(64, None, Some(rows)).unwrap();
+            assert_eq!(attention_plan_scratch(&geometry, plan).unwrap(), Some(bytes));
+        }
+        let plan = AttentionReductionPlan::new(64, Some(7), None).unwrap();
+        assert_eq!(attention_plan_scratch(&serde_json::json!({}), plan).unwrap(), None);
+        for defect in 0..4 {
+            let mut bad = geometry.clone();
+            match defect {
+                0 => bad["attention_plan_capacity_rows"] = 128.into(),
+                1 => bad["attention_plan_scratch"][1]["rows_cap"] = 1.into(),
+                2 => bad["attention_plan_scratch"][2]["rows_cap"] = 63.into(),
+                _ => bad["attention_plan_scratch"][0]["scratch"] = (-1).into(),
+            }
+            assert!(attention_plan_scratch(&bad, plan).is_err());
+        }
     }
 
     fn dual_manifest() -> serde_json::Value {
