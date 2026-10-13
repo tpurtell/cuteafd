@@ -654,6 +654,62 @@ fn resume(args: &GoldenArgs, engine: &engine::Qwen4Engine<'_>) -> Result<()> {
     Ok(())
 }
 
+// Private, eager boundary snapshots only; never a production losslessness gate.
+fn diagnostic_geometry(args: &GoldenArgs, engine: &engine::Qwen4Engine<'_>, dir: &std::path::Path) -> Result<()> {
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+    let rows = args.step_rows;
+    ensure!((2..=engine::DECODE_ROWS).contains(&rows), "diagnostic needs 2..=64 step rows");
+    let raw = std::fs::read(args.golden.join("tokens.bin"))?;
+    ensure!(raw.len() % 4 == 0, "diagnostic tokens are not u32 aligned");
+    let tokens: Vec<u32> = raw.chunks_exact(4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).collect();
+    let prefill = args.prefill.context("diagnostic needs --prefill")?;
+    ensure!(prefill > 0 && prefill.checked_add(rows).is_some_and(|n| n <= tokens.len()),
+        "diagnostic needs a prompt and a complete fixed-token step");
+    match std::fs::symlink_metadata(dir) {
+        Ok(meta) => ensure!(meta.is_dir() && meta.permissions().mode() & 0o077 == 0,
+            "diagnostic dump must be a private, non-symlink directory"),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            std::fs::DirBuilder::new().mode(0o700).create(dir)?;
+        }
+        Err(e) => return Err(e.into()),
+    }
+    let write = |name: &str, bytes: &[u8]| -> Result<()> {
+        use std::io::Write;
+        std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600)
+            .open(dir.join(name))?.write_all(bytes)?;
+        Ok(())
+    };
+    let mut allocator = engine::Allocator::new(engine.pages, engine.slots, &engine.cfg);
+    let mut serial = allocator.admit(prefill + rows)?;
+    let mut wide = allocator.admit(prefill + rows)?;
+    engine.prefill(&mut serial, &tokens[..prefill])?;
+    engine.prefill(&mut wide, &tokens[..prefill])?;
+    let mut serial_logits = Vec::new();
+    for row in 0..rows {
+        let input = &tokens[prefill + row..prefill + row + 1];
+        let mut snapshot = |layer: usize, streams: &[u8]| {
+            write(&format!("serial-row{row:02}-layer{layer:02}.bin"), streams)
+        };
+        serial_logits.extend(engine.verify(&mut [(&mut serial, input)], Some(&mut snapshot))?
+            .context("diagnostic needs every target layer")?);
+    }
+    let input = &tokens[prefill..prefill + rows];
+    let mut snapshot = |layer: usize, streams: &[u8]| write(&format!("wide-layer{layer:02}.bin"), streams);
+    let wide_logits = if args.spec_keep.is_some() {
+        engine.verify_spec(&mut [(&mut wide, input)], Some(&mut snapshot))?
+    } else {
+        engine.verify(&mut [(&mut wide, input)], Some(&mut snapshot))?
+    }.context("diagnostic needs every target layer")?;
+    ensure!(serial_logits.iter().chain(&wide_logits).all(|v| v.is_finite()), "non-finite diagnostic logits");
+    for (name, logits) in [("serial-logits.bin", &serial_logits), ("wide-logits.bin", &wide_logits)] {
+        write(name, &logits.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>())?;
+    }
+    println!("Qwen diagnostic: {rows} rows after {prefill} fixed tokens; wide spec={}; logits exact={}; plan_rows={}",
+        args.spec_keep.is_some(), serial_logits.iter().zip(&wide_logits).all(|(a, b)| a.to_bits() == b.to_bits()),
+        engine.attention_plan.rows());
+    Ok(())
+}
+
 /// Mean NLL of `logits` rows against the next tokens, and top-1 agreements.
 fn score(logits: &[f32], golden: &[f32], tokens: &[u32], first: usize, vocab: usize) -> (usize, usize, usize, f64, usize) {
     let argmax = |l: &[f32]| l.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).map_or(0, |(i, _)| i);
@@ -674,6 +730,9 @@ fn score(logits: &[f32], golden: &[f32], tokens: &[u32], first: usize, vocab: us
 }
 
 fn golden_run(args: &GoldenArgs, opened: &Opened, engine: &engine::Qwen4Engine<'_>) -> Result<()> {
+    if let Some(dir) = std::env::var_os("CUTEAFD_DIAG_QWEN_GEOMETRY") {
+        return diagnostic_geometry(args, engine, std::path::Path::new(&dir));
+    }
     let cfg = &opened.cfg;
     let layers = engine.weights.layers.len();
     let tokens: Vec<u32> = std::fs::read(args.golden.join("tokens.bin"))?
