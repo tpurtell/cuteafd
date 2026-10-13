@@ -145,9 +145,40 @@ impl<'a> Engine<'a> {
         crate::shared::decode_graph::fatal_drain(home.run(|| self.publish_tp2_abort()), "V4 RTX enqueue abort");
     }
 
+    pub(crate) fn require_live(&self) -> Result<()> {
+        use crate::shared::peer_split::{TerminalPeerError, TerminalState};
+        let state = self.terminal.get();
+        if state != TerminalState::Active { return Err(TerminalPeerError::Closed(state).into()); }
+        if let Some(exchange) = &self.exchange { exchange.require_live()?; }
+        if let Some(tp2) = &self.tp2 { tp2.routes.require_live()?; }
+        Ok(())
+    }
+
+    pub(super) fn shutdown_submission(&self, transports: &[SparkLink<'_>]) -> Result<()> {
+        self.terminal.set(crate::shared::peer_split::TerminalState::Aborting);
+        let result = (|| {
+            if self.tp2.is_some() { self.retire_tp2()?; }
+            else {
+                for rank in 0..(1 + usize::from(self.peer.is_some())) {
+                    // SAFETY: all queued operands remain owned through shutdown.
+                    self.on(rank, || unsafe { self.library.cuda_stream_synchronize(self.stream_of(rank)) })?;
+                }
+            }
+            for link in transports { link.intake.terminal_drain_copies()?; }
+            if let Some(link) = &self.device_link { link.terminal_drain_copies()?; }
+            Ok(())
+        })();
+        crate::shared::decode_graph::fatal_drain(result, "V4 submission shutdown");
+        self.terminal.set(crate::shared::peer_split::TerminalState::Drained);
+        Ok(())
+    }
+
     /// Both abort words precede either drain; graphs and backend owners remain live.
     pub fn retire_tp2(&self) -> Result<()> {
         if self.tp2.is_none() { return Ok(()); }
+        if self.tp2.as_ref().unwrap().routes.terminal_state() == crate::shared::peer_split::TerminalState::Drained {
+            return Ok(());
+        }
         let home = crate::shared::memory::device::Device { library: self.library, id: self.device };
         home.run(|| {
             self.publish_tp2_abort()?;
@@ -510,9 +541,9 @@ mod tests {
             for local in 1..=layers {
                 for broadcast in [false, true] {
                     for lanes in [1, 2] {
-                        assert_eq!(order::check(&schedule(layers, local, lanes, false, broadcast)), Ok(()));
+                        assert_eq!(order::check_submission_faults(&schedule(layers, local, lanes, false, broadcast)), Ok(()));
                     }
-                    assert_eq!(order::check(&schedule(layers, local, 1, true, broadcast)), Ok(()));
+                    assert_eq!(order::check_submission_faults(&schedule(layers, local, 1, true, broadcast)), Ok(()));
                 }
             }
         }

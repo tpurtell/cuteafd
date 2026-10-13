@@ -1124,6 +1124,10 @@ pub(crate) fn written_responses() -> bool {
 }
 
 impl<'a> SparkDeviceLink<'a> {
+    pub(crate) fn terminal_drain_copies(&self) -> Result<()> {
+        self.intake.terminal_drain_copies()
+    }
+
     /// Connects the proxy's transport (`capacity` rows of `topk` routes and
     /// `wire_row_bytes` per wave; partial rows of `row_bytes`) on `device`.
     /// Needs GPU landing (the probed intake mode must be `gpu`).

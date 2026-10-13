@@ -163,7 +163,19 @@ impl<'a> RemoteDflash<'a> {
     /// No owner is released on an unproved drain; the engine's fatal-drain
     /// boundary also retains every target graph and peer-exchange operand.
     pub fn synchronize(&self) -> Result<()> {
-        self.stream.drain()
+        // Consume the final context acknowledgement at this drained boundary,
+        // not only on the next update. Aborted waits also retire here.
+        if self.update_pending.get() && self.exchange.terminal_state() == TerminalState::Active {
+            self.exchange.wait(0, TAPS)?;
+            self.target.device.run(|| {
+                // SAFETY: the target stream and all context operands remain owned.
+                unsafe { self.draft.device.library.cuda_stream_synchronize(self.exchange.stream(0)) }
+            })?;
+            self.update_pending.set(false);
+        }
+        self.stream.drain()?;
+        if self.exchange.terminal_state() == TerminalState::Aborting { self.update_pending.set(false); }
+        Ok(())
     }
 
     pub fn finish_terminal(&self, drained: bool) {
@@ -333,7 +345,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "#151: final TAPS acknowledgement remains pending until another update"]
     fn repeated_context_and_head_bridges_have_no_wait_cycle() {
         for rounds in [1, 2, 8, 32] {
             let mut schedule = Schedule::default();
@@ -342,6 +353,8 @@ mod tests {
                 // Target-only rounds still update the drafter's context.
                 if round % 3 != 1 { draft(&mut schedule); }
             }
+            schedule.wait(0, "draft", TAPS, "request boundary context readers");
+            schedule.end_request();
             assert_eq!(order::check(&schedule), Ok(()));
         }
     }

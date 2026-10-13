@@ -888,7 +888,10 @@ impl<'a> GlmEngine<'a> {
         experts: Option<(&mut SparkLink<'_>, &tokio::runtime::Runtime)>,
         on_layer: Option<&mut dyn FnMut(usize, &[u8]) -> Result<()>>) -> Result<Option<DeviceLogits>> {
         crate::shared::experts::rtx::pair::submit(
-            || self.require_live(), || self.retire_tp2(),
+            || self.require_live(), || {
+                crate::shared::decode_graph::fatal_drain(self.retire_tp2(), "GLM submission shutdown");
+                Ok(())
+            },
             || self.step_inner(tables, tokens, logit_rows, experts, on_layer))
     }
 
@@ -1596,7 +1599,10 @@ impl<'a> GlmEngine<'a> {
     /// lanes' GPU layers. Returns the last `logit_rows` rows' logits.
     fn step_lanes(&self, lanes: &[StepTables], chunks: &[&[u32]], logit_rows: usize) -> Result<Option<StepLogits>> {
         crate::shared::experts::rtx::pair::submit(
-            || self.require_live(), || self.retire_tp2(),
+            || self.require_live(), || {
+                crate::shared::decode_graph::fatal_drain(self.retire_tp2(), "GLM submission shutdown");
+                Ok(())
+            },
             || self.step_lanes_inner(lanes, chunks, logit_rows))
     }
 

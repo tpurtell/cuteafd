@@ -1310,6 +1310,7 @@ pub(crate) struct GlmfEngine<'a> {
     /// The head split's second GPU and the exchange between the two.
     peer: Option<GlmfPeer<'a>>,
     exchange: Option<PeerExchange<'a>>,
+    terminal: Cell<crate::shared::peer_split::TerminalState>,
     tp2: Option<Tp2Experts<'a>>,
     local: Option<(std::ops::Range<usize>, Experts<'a>)>,
     /// The drafter (DFlash2 or dSpark): every step taps its target layers.
@@ -1676,6 +1677,7 @@ impl<'a> GlmfEngine<'a> {
             replay_rows: std::cell::Cell::new(DECODE_ROWS),
             kda_ordinal, mla_ordinal, index_cache, replay_records, records: RecordGuard::new(replay_records), caches,
             device, context_mode, context: None, context_units: RefCell::new(Vec::new()),
+            terminal: Cell::new(crate::shared::peer_split::TerminalState::Active),
             peer: None, exchange: None, drafter: None, pool_logical_host: RefCell::new(vec![0; pool_pages]), pool_pages,
             table_pages, table_pool_pages, decode_workspace: RefCell::new(None),
             lane_workspaces: RefCell::new(Vec::new()),
@@ -1901,6 +1903,38 @@ impl<'a> GlmfEngine<'a> {
         self.tp2 = Some(Tp2Experts { layers, ranks: ranks.map(RefCell::new), combine, routes,
             source: Cell::new(RouteSource::Replicated), checking: Cell::new(false), checks: RefCell::new(Default::default()),
             interval, steps: Cell::new(0), schedule: RefCell::new(None) });
+        Ok(())
+    }
+
+    pub(crate) fn require_live(&self) -> Result<()> {
+        use crate::shared::peer_split::{TerminalPeerError, TerminalState};
+        let state = self.terminal.get();
+        if state != TerminalState::Active { return Err(TerminalPeerError::Closed(state).into()); }
+        if let Some(exchange) = &self.exchange { exchange.require_live()?; }
+        if let Some(tp2) = &self.tp2 { tp2.routes.require_live()?; }
+        if let Some(drafter) = &self.drafter { drafter.require_live()?; }
+        Ok(())
+    }
+
+    fn shutdown_submission(&self) -> Result<()> {
+        self.terminal.set(crate::shared::peer_split::TerminalState::Aborting);
+        let result = (|| {
+            let home = crate::shared::memory::device::Device { library: self.library, id: self.device };
+            if self.peer.is_some() { home.run(|| self.publish_tp2_abort())?; }
+            self.synchronize()?;
+            if let Some(Experts::Spark { transports, .. }) = &self.experts {
+                for link in transports.borrow().iter() { link.intake.terminal_drain_copies()?; }
+            }
+            for rank in 0..self.ranks() {
+                self.on(rank, || { *self.graphs_of(rank).borrow_mut() = GraphBank::new(None); Ok(()) })?;
+            }
+            Ok(())
+        })();
+        crate::shared::decode_graph::fatal_drain(result, "GLM Flash submission shutdown");
+        self.terminal.set(crate::shared::peer_split::TerminalState::Drained);
+        for exchange in self.exchange.iter().chain(self.tp2.iter().map(|tp2| &tp2.routes)) {
+            exchange.finish_terminal(true);
+        }
         Ok(())
     }
 
@@ -3435,6 +3469,14 @@ impl<'a> GlmfEngine<'a> {
     fn step(&self, tables: &StepTables, tokens: &[u32], logit_rows: usize,
         mut on_layer: Option<&mut dyn FnMut(usize, &[u8]) -> Result<()>>,
         forced: Option<&dyn Fn(usize) -> Option<Vec<u8>>>, trace: Option<&std::path::Path>, media: Option<&cuteafd_engine::media::RequestMedia>) -> Result<Option<DeviceLogits>> {
+        crate::shared::experts::rtx::pair::submit(
+            || self.require_live(), || self.shutdown_submission(),
+            || self.step_inner(tables, tokens, logit_rows, on_layer, forced, trace, media))
+    }
+
+    fn step_inner(&self, tables: &StepTables, tokens: &[u32], logit_rows: usize,
+        mut on_layer: Option<&mut dyn FnMut(usize, &[u8]) -> Result<()>>,
+        forced: Option<&dyn Fn(usize) -> Option<Vec<u8>>>, trace: Option<&std::path::Path>, media: Option<&cuteafd_engine::media::RequestMedia>) -> Result<Option<DeviceLogits>> {
         let (h, t) = (self.cfg.hidden, tables.kv_slots.len());
         // Decode runs in its own workspace, a serial prefill in the first prefill lane.
         let (decode_workspace, prefill_lanes);
@@ -3817,6 +3859,7 @@ impl<'a> GlmfEngine<'a> {
     /// executable's device bytes (free memory before the capture and after its instantiation);
     /// executables evicted past the graph budget retire until the next decode step.
     fn replay_on(&self, rank: usize, key: GraphKey, segment: impl FnOnce() -> Result<()>) -> Result<()> {
+        self.require_live()?;
         let graphs = self.graphs_of(rank);
         let stream = self.stream_of(rank);
         let cached = graphs.borrow_mut().launch(&key).map(|graph| graph.raw);
@@ -4645,6 +4688,13 @@ impl<'a> GlmfEngine<'a> {
     /// one. Returns the logits of the last `logit_rows` rows across the lanes.
     fn step_lanes(&self, lanes: &[(StepTables, &[u32])], logit_rows: usize, device: bool, media: Option<&cuteafd_engine::media::RequestMedia>)
         -> Result<Option<StepLogits>> {
+        crate::shared::experts::rtx::pair::submit(
+            || self.require_live(), || self.shutdown_submission(),
+            || self.step_lanes_inner(lanes, logit_rows, device, media))
+    }
+
+    fn step_lanes_inner(&self, lanes: &[(StepTables, &[u32])], logit_rows: usize, device: bool, media: Option<&cuteafd_engine::media::RequestMedia>)
+        -> Result<Option<StepLogits>> {
         let Some(Experts::Spark { transports, runtime }) = &self.experts else {
             anyhow::bail!("pipelined prefill needs Spark experts");
         };
@@ -5059,7 +5109,7 @@ mod tp2_tests {
             assert!(check_tp2_lanes(lanes).is_ok());
             for local in [0..0, 1..4, 0..5, 4..5] {
                 for broadcast in [false, true] {
-                    assert_eq!(order::check(&order::glmf_tp2_fixture(5, local.clone(), lanes, broadcast, true)), Ok(()));
+                    assert_eq!(order::check_submission_faults(&order::glmf_tp2_fixture(5, local.clone(), lanes, broadcast, true)), Ok(()));
                 }
             }
         }

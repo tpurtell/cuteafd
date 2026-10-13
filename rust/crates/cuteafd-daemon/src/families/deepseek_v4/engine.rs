@@ -7,7 +7,7 @@
 //! post) and each stage's buffers are sized for the prompt.
 use super::metadata::{self, StepTables, INDEX_PAGE_BYTES, MAIN_PAGE_BYTES};
 use super::pool::{Placement, PoolShape};
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use super::weights::{LayerWeights, ModelWeights};
 use crate::shared::launch_grid::Fp8QuantizeGrid;
 use crate::shared::memory::{DeviceAllocation, HostAllocation};
@@ -75,6 +75,7 @@ pub(crate) struct Engine<'a> {
     peer: Option<V4Peer<'a>>,
     exchange: Option<PeerExchange<'a>>,
     tp2: Option<Tp2State<'a>>,
+    terminal: Cell<crate::shared::peer_split::TerminalState>,
     exchange_policy: ExchangePolicy,
     /// C4 token-split attention (#58): the build's programs, set at construction (each GPU's C4
     /// pools then hold half the units, plus per-layer scratch pages), and once the peer is
@@ -493,6 +494,7 @@ impl<'a> Engine<'a> {
             device: parts.library.cuda_get_device()?,
             split_family,
             peer: None,
+            terminal: Cell::new(crate::shared::peer_split::TerminalState::Active),
             exchange: None,
             tp2: None,
             context_mode: parts.context,
@@ -852,10 +854,25 @@ impl<'a> Engine<'a> {
         mut on_layer: Option<&mut dyn FnMut(usize, &[u8]) -> Result<()>>,
         download: bool,
     ) -> Result<Logits> {
+        let transports = RefCell::new(transports);
+        crate::shared::experts::rtx::pair::submit(
+            || self.require_live(), || self.shutdown_submission(&transports.borrow()),
+            || self.step_inner(lanes, &mut transports.borrow_mut(), runtime, logit_rows, on_layer, download))
+    }
+
+    fn step_inner(
+        &self,
+        lanes: &[LaneStep<'_>],
+        transports: &mut [SparkLink<'_>],
+        runtime: &tokio::runtime::Runtime,
+        logit_rows: usize,
+        mut on_layer: Option<&mut dyn FnMut(usize, &[u8]) -> Result<()>>,
+        download: bool,
+    ) -> Result<Logits> {
         self.begin_route_step();
         let h = self.cfg.dim;
-        let decode = lanes[0].tables.decode;
         ensure!(!lanes.is_empty(), "a step needs a lane");
+        let decode = lanes[0].tables.decode;
         let total: usize = lanes.iter().map(|l| l.tables.rows).sum();
         ensure!(logit_rows <= total && (on_layer.is_none() || lanes.len() == 1)
             && lanes.iter().all(|l| l.tokens.len() == l.tables.rows)
@@ -1194,6 +1211,7 @@ impl<'a> Engine<'a> {
 
     /// [`Self::replay`] on rank `rank`'s stream (its own graphs).
     fn replay_on(&self, rank: usize, key: GraphKey, segment: impl FnOnce() -> Result<()>) -> Result<()> {
+        self.require_live()?;
         let mut key = key;
         if let Some(tp2) = &self.tp2 {
             key.tp2_broadcast = tp2.broadcast();

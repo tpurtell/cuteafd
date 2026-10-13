@@ -151,6 +151,48 @@ pub(crate) fn check_terminal(schedule: &Schedule, aborted: bool) -> Result<(), D
     }
 }
 
+/// Exercise the shared submission boundary at every recorded enqueue prefix.
+/// The other stream may already be fully queued when its producer fails.
+/// Healthy requests remain strictly balanced; only terminal abort discards
+/// unfinished generations and releases waits for producers never enqueued.
+#[cfg(test)]
+pub(crate) fn check_submission_faults(schedule: &Schedule) -> Result<(), Deadlock> {
+    use crate::shared::experts::rtx::pair::{submit, TerminalStepError};
+    use std::cell::Cell;
+    check(schedule)?;
+    for rank in 0..2 {
+        for at in 0..=schedule.streams[rank].len() {
+            let mut prefix = schedule.clone();
+            prefix.requests.clear();
+            prefix.streams[rank].truncate(at);
+            for cancellation in [false, true] {
+                let live = Cell::new(true);
+                let drained = Cell::new(false);
+                let result: anyhow::Result<()> = submit(
+                    || { anyhow::ensure!(live.get(), "retired engine"); Ok(()) },
+                    || {
+                        live.set(false); // Both exchange abort words precede drainage.
+                        check_terminal(&prefix, true).map_err(|e| anyhow::anyhow!(e))?;
+                        drained.set(true);
+                        Ok(())
+                    },
+                    || anyhow::bail!("rank {rank} enqueue {at}, cancellation={cancellation}"),
+                );
+                assert!(result.unwrap_err().downcast_ref::<TerminalStepError>().is_some());
+                assert!(drained.get());
+                let replayed = Cell::new(false);
+                let replay = submit(
+                    || { anyhow::ensure!(live.get(), "retired engine"); Ok(()) },
+                    || panic!("retired engine drained twice"),
+                    || { replayed.set(true); Ok(()) },
+                );
+                assert!(replay.is_err() && !replayed.get());
+            }
+        }
+    }
+    Ok(())
+}
+
 /// GLM Flash layer-major TP2/Spark exchange fixture, including route broadcast.
 #[cfg(test)]
 pub(crate) fn glmf_tp2_fixture(layers: usize, local: std::ops::Range<usize>, lanes: usize, broadcast: bool,
@@ -393,7 +435,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "#151: remote draft design fixture leaves terminal acknowledgement generations unconsumed"]
     fn glmf_tp2_then_remote_draft_ack_schedule_drains_reused_slots() {
         // Design fixture only: the remote executor must record this ordering
         // from its real enqueue paths before enabling GPU1 placement.
@@ -405,6 +446,11 @@ mod tests {
                     for (stream, next) in schedule.streams.iter_mut().zip(target.streams) { stream.extend(next); }
                     glmf_remote_draft_round(&mut schedule, round > 0, false);
                 }
+                schedule.wait(0, "draft-taps-ack", 0, "request final context acknowledgement");
+                schedule.wait(0, "draft-input-ack", 0, "request final input acknowledgement");
+                schedule.wait(1, "draft-hidden-ack", 0, "request final hidden acknowledgement");
+                schedule.wait(0, "draft-logits-ack", 0, "request final logits acknowledgement");
+                schedule.end_request();
                 assert_eq!(check(&schedule), Ok(()));
             }
         }

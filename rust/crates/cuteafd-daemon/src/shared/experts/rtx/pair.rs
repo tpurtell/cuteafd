@@ -18,7 +18,16 @@ use std::{
 
 /// Full submission boundary, including captured graph replays and caller-side
 /// exchanges. Shutdown must publish aborts before draining and retire the engine;
-/// failure to prove drainage is fatal, never returned to owner-releasing callers.
+/// A failed drain may return only if the caller retains every queued owner;
+/// callers without quarantine ownership must terminate in shutdown instead.
+#[derive(Debug, thiserror::Error)]
+#[error("submission failed permanently: {cause}; {drain}")]
+pub(crate) struct TerminalStepError {
+    #[source]
+    cause: anyhow::Error,
+    drain: String,
+}
+
 pub(crate) fn submit<T>(
     require_live: impl FnOnce() -> Result<()>,
     shutdown: impl FnOnce() -> Result<()>,
@@ -28,8 +37,11 @@ pub(crate) fn submit<T>(
     match body() {
         Ok(value) => Ok(value),
         Err(cause) => {
-            crate::shared::decode_graph::fatal_drain(shutdown(), "RTX submission shutdown");
-            Err(cause.context("submission drained; terminal engine cannot be reused"))
+            let drain = match shutdown() {
+                Ok(()) => "queued streams drained; engine cannot be reused".to_string(),
+                Err(error) => format!("queued owners retained: {error:#}"),
+            };
+            Err(TerminalStepError { cause, drain }.into())
         }
     }
 }
@@ -445,6 +457,38 @@ mod tests {
                 assert!(!replayed.get());
             }
         }
+    }
+
+    #[test]
+    fn submission_preserves_primary_cause_and_reports_retained_owners() {
+        let error = submit(
+            || Ok(()), || anyhow::bail!("copy drain failed; owners quarantined"),
+            || -> Result<()> { anyhow::bail!("projection enqueue failed") },
+        ).unwrap_err();
+        assert!(error.downcast_ref::<TerminalStepError>().is_some());
+        assert!(format!("{error:#}").contains("copy drain failed; owners quarantined"));
+        assert!(error.chain().any(|cause| cause.to_string() == "projection enqueue failed"));
+    }
+
+    #[test]
+    fn family_submission_and_graph_entrypoints_use_the_shared_boundary() {
+        for (source, step, graph) in [
+            (include_str!("../../../families/deepseek_v4/engine.rs"), "step", "replay_on"),
+            (include_str!("../../../families/glm5_flash/engine.rs"), "step", "replay_on"),
+            (include_str!("../../../families/glm5_flash/engine.rs"), "step_lanes", "replay_on"),
+            (include_str!("../../../families/glm5/engine.rs"), "step", "replay_on"),
+            (include_str!("../../../families/glm5/engine.rs"), "step_lanes", "replay_on"),
+        ] {
+            let start = source.find(&format!("    fn {step}(")).unwrap();
+            let end = source[start..].find(&format!("    fn {step}_inner(")).unwrap() + start;
+            assert!(source[start..end].contains("crate::shared::experts::rtx::pair::submit("));
+            let start = source.find(&format!("    fn {graph}(")).unwrap();
+            let body = &source[start..source[start..].find("let graphs").unwrap() + start];
+            assert!(body.contains("self.require_live()?;"), "{graph} bypasses liveness");
+        }
+        let mimo = include_str!("../../../families/mimo_v2/engine.rs");
+        assert!(mimo.contains("crate::shared::experts::rtx::pair::submit("));
+        assert!(!mimo.contains("pub(crate) struct TerminalStepError"));
     }
 
     #[test]

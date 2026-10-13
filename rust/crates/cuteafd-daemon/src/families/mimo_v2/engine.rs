@@ -125,13 +125,7 @@ struct SentWave {
     sent: std::time::Instant,
 }
 
-#[derive(Debug, thiserror::Error)]
-#[error("MiMo head-split submission failed permanently: {cause}; {drain}")]
-pub(crate) struct TerminalStepError {
-    #[source]
-    cause: anyhow::Error,
-    drain: String,
-}
+pub(crate) use crate::shared::experts::rtx::pair::TerminalStepError;
 
 /// Fewest rows per lane of a pipelined prefill: at least the DFlash tap ring
 /// (1024 rows) and the MTP hidden ring, which the last lane alone feeds.
@@ -795,22 +789,10 @@ impl<'a> MimoEngine<'a> {
     /// queues; serving also retains its sampler/prefix/host owners independently.
     /// A terminal engine can never execute another submission.
     pub(super) fn submit<T>(&self, body: impl FnOnce() -> Result<T>) -> Result<T> {
-        if let Err(error) = self.require_live() {
-            self.submission_failed.set(true);
-            return Err(error);
-        }
-        let result = body();
-        match result {
-            Err(cause) => {
-                self.submission_failed.set(true);
-                let drain = match self.terminal_shutdown() {
-                    Ok(()) => "queued streams drained; engine cannot be reused".to_string(),
-                    Err(error) => format!("queued owners retained: {error:#}"),
-                };
-                Err(TerminalStepError { cause, drain }.into())
-            }
-            result => result,
-        }
+        let result = crate::shared::experts::rtx::pair::submit(
+            || self.require_live(), || self.terminal_shutdown(), body);
+        if result.is_err() { self.submission_failed.set(true); }
+        result
     }
 
     /// Close the complete engine before its buffers are released, including
@@ -1927,6 +1909,7 @@ impl<'a> MimoEngine<'a> {
     /// Launches `segment` on rank `rank`'s stream through the graph captured for `key`,
     /// capturing it first when `key` is new; `launch` false only captures.
     fn graph(&self, rank: usize, key: GraphKey, launch: bool, segment: impl FnOnce() -> Result<()>) -> Result<()> {
+        self.require_live()?;
         let graphs = match (rank, &self.peer) {
             (1, Some(peer)) => &peer.graphs,
             _ => &self.graphs,
