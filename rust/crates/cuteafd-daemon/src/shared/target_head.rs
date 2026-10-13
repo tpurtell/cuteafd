@@ -3,11 +3,11 @@
 //! One route for all families (GLM 5.3, GLM 5.3 Flash, MiMo, Qwen, DeepSeek V4 and V4.1): a BF16
 //! head's logits run as a BF16 tensor-core GEMM with FP32 accumulation and FP32 logits at every
 //! row count ([`TargetHead::Tensor`], the default). Their reference implementations compute the
-//! head as BF16 products with FP32 sums, and on the checkpoints' real heads (RTX PRO 6000, 16
-//! final-norm-shaped rows against an FP64 product of the same BF16 operands) it kept top-1 on
-//! every row with KL(FP64 || tensor) at most 1.6e-11 nats (largest |error| / |logit| 6.9e-6,
-//! Qwen 3.8 27B). It is never slower than the pedantic FP32 GEMM: equal at 1 row, 2.5x at 8,
-//! about 4.5x at 16 (`native/tests/target_head_selftest.py`).
+//! head as BF16 products with FP32 sums. On five real heads (RTX PRO 6000,
+//! final-norm-shaped rows), the fixed route is byte-identical for batches of
+//! 1..64 versus serial rows, with FP64-reference mean KL at most 1.46e-11 nats.
+//! It is faster than pedantic at all tested shapes (1, 4, 8, 16 and 64 rows);
+//! `native/tests/target_head_selftest.py` also checks capacity and graph stability.
 //!
 //! [`TargetHead::Exact`] is a diagnostic: the pedantic FP32 cuBLAS GEMM (FP32 products and sums on
 //! CUDA cores) at every row count. FP8 heads run their own programs and ignore the setting.
@@ -15,6 +15,8 @@
 //!
 //! Selected by `CUTEAFD_TARGET_HEAD` (`tensor` or `exact`; launcher key `TARGET_HEAD`), read once
 //! per process before the first launch: decode graphs capture the head's launch.
+//! The tensor route pins one cuBLASLt algorithm/tile with split-K disabled at load;
+//! decode and verify must not choose different reductions based on row count.
 
 use anyhow::{bail, Result};
 use cuteafd_ffi::programs::VocabularyHead;
@@ -72,7 +74,7 @@ pub(crate) unsafe fn launch(mode: TargetHead, head: &VocabularyHead<'_>, x: *con
     // SAFETY: the caller's contract.
     unsafe {
         if mode.tensor_cores() {
-            head.launch_tensor_op(x.cast(), weight.cast(), logits, rows, stream)
+            head.launch_tensor_invariant(x.cast(), weight.cast(), logits, rows, stream)
         } else {
             head.launch(x.cast(), weight.cast(), logits, rows, stream)
         }
@@ -119,7 +121,7 @@ mod tests {
         }
         let v41 = include_str!("../families/deepseek_v41/v41_tensors.rs");
         let target = &v41[v41.find("fn project_target_vocabulary").unwrap()..];
-        assert!(target.contains("TargetHead::configured().tensor_cores()") && target.contains("launch_tensor_op("));
+        assert!(target.contains("TargetHead::configured().tensor_cores()") && target.contains("launch_tensor_invariant("));
         // The old direct pedantic launches of the BF16 target heads are gone.
         for (name, source, old) in [
             ("glm5/engine.rs", include_str!("../families/glm5/engine.rs"), "super::launch_head(self.library"),

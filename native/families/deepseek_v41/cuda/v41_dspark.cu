@@ -83,11 +83,98 @@ extern "C" int32_t cuteafd_v41_dspark_confidence(const uint16_t* hidden,
 }
 
 #include <cublas_v2.h>
+#include <cublasLt.h>
 #include <new>
 namespace {
-struct MarkovHandle { cublasHandle_t blas; int device; void* workspace; int width; int max_rows; int vocab_rows; };
+struct TensorHeadPlan {
+  cublasLtHandle_t blas = nullptr;
+  cublasLtMatmulDesc_t operation = nullptr;
+  cublasLtMatrixLayout_t weight = nullptr, input = nullptr, output = nullptr;
+  cublasLtMatmulAlgo_t algorithm{};
+  cublasStatus_t status = CUBLAS_STATUS_NOT_SUPPORTED;
+  ~TensorHeadPlan() {
+    if (output) cublasLtMatrixLayoutDestroy(output);
+    if (input) cublasLtMatrixLayoutDestroy(input);
+    if (weight) cublasLtMatrixLayoutDestroy(weight);
+    if (operation) cublasLtMatmulDescDestroy(operation);
+    if (blas) cublasLtDestroy(blas);
+  }
+};
+struct MarkovHandle {
+  cublasHandle_t blas; int device; void* workspace; int width; int max_rows; int vocab_rows;
+  TensorHeadPlan tensor;
+};
 constexpr uint64_t kMarkovWorkspace = 4 * 1024 * 1024;
 int32_t blas_status(cublasStatus_t status) { return status == CUBLAS_STATUS_SUCCESS ? 0 : -int32_t(status); }
+// Choose once for a canonical 16-row shape, then reuse exactly the same tile
+// and reduction for decode/verify/prefill. No current-row-count heuristics.
+static cublasStatus_t create_tensor_plan(MarkovHandle* handle) {
+  auto& plan = handle->tensor;
+  const int width = handle->width, vocab = handle->vocab_rows;
+  auto status = cublasLtCreate(&plan.blas);
+  if (status != CUBLAS_STATUS_SUCCESS) return status;
+  status = cublasLtMatmulDescCreate(&plan.operation, CUBLAS_COMPUTE_32F, CUDA_R_32F);
+  if (status != CUBLAS_STATUS_SUCCESS) return status;
+  const cublasOperation_t transpose = CUBLAS_OP_T;
+  status = cublasLtMatmulDescSetAttribute(plan.operation, CUBLASLT_MATMUL_DESC_TRANSA,
+                                        &transpose, sizeof(transpose));
+  if (status != CUBLAS_STATUS_SUCCESS) return status;
+  status = cublasLtMatrixLayoutCreate(&plan.weight, CUDA_R_16BF, width, vocab, width);
+  if (status != CUBLAS_STATUS_SUCCESS) return status;
+  status = cublasLtMatrixLayoutCreate(&plan.input, CUDA_R_16BF, width, 16, width);
+  if (status != CUBLAS_STATUS_SUCCESS) return status;
+  status = cublasLtMatrixLayoutCreate(&plan.output, CUDA_R_32F, vocab, 16, vocab);
+  if (status != CUBLAS_STATUS_SUCCESS) return status;
+  cublasLtMatmulPreference_t preference = nullptr;
+  status = cublasLtMatmulPreferenceCreate(&preference);
+  if (status != CUBLAS_STATUS_SUCCESS) return status;
+  const size_t workspace_bytes = kMarkovWorkspace;
+  status = cublasLtMatmulPreferenceSetAttribute(preference,
+      CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &workspace_bytes, sizeof(workspace_bytes));
+  cublasLtMatmulHeuristicResult_t results[32]{};
+  int count = 0;
+  if (status == CUBLAS_STATUS_SUCCESS)
+    status = cublasLtMatmulAlgoGetHeuristic(plan.blas, plan.operation, plan.weight,
+        plan.input, plan.output, plan.output, preference, 32, results, &count);
+  cublasLtMatmulPreferenceDestroy(preference);
+  if (status != CUBLAS_STATUS_SUCCESS) return status;
+  // Candidate selection must not depend on a decode/prefill handle's capacity.
+  const uint64_t rows = 64;
+  status = cublasLtMatrixLayoutSetAttribute(plan.input, CUBLASLT_MATRIX_LAYOUT_COLS, &rows, sizeof(rows));
+  if (status != CUBLAS_STATUS_SUCCESS) return status;
+  status = cublasLtMatrixLayoutSetAttribute(plan.output, CUBLASLT_MATRIX_LAYOUT_COLS, &rows, sizeof(rows));
+  if (status != CUBLAS_STATUS_SUCCESS) return status;
+  for (int i = 0; i < count; ++i) {
+    if (results[i].state != CUBLAS_STATUS_SUCCESS) continue;
+    auto algorithm = results[i].algo;
+    const uint32_t split_k = 0, reduction = CUBLASLT_REDUCTION_SCHEME_NONE;
+    if (cublasLtMatmulAlgoConfigSetAttribute(&algorithm, CUBLASLT_ALGO_CONFIG_SPLITK_NUM,
+          &split_k, sizeof(split_k)) != CUBLAS_STATUS_SUCCESS ||
+        cublasLtMatmulAlgoConfigSetAttribute(&algorithm, CUBLASLT_ALGO_CONFIG_REDUCTION_SCHEME,
+          &reduction, sizeof(reduction)) != CUBLAS_STATUS_SUCCESS) continue;
+    cublasLtMatmulHeuristicResult_t checked{};
+    if (cublasLtMatmulAlgoCheck(plan.blas, plan.operation, plan.weight, plan.input,
+          plan.output, plan.output, &algorithm, &checked) == CUBLAS_STATUS_SUCCESS &&
+        checked.state == CUBLAS_STATUS_SUCCESS && checked.workspaceSize <= kMarkovWorkspace) {
+      plan.algorithm = algorithm;
+      const uint64_t capacity = handle->max_rows;
+      status = cublasLtMatrixLayoutSetAttribute(plan.input, CUBLASLT_MATRIX_LAYOUT_COLS,
+                                               &capacity, sizeof(capacity));
+      if (status != CUBLAS_STATUS_SUCCESS) return status;
+      status = cublasLtMatrixLayoutSetAttribute(plan.output, CUBLASLT_MATRIX_LAYOUT_COLS,
+                                               &capacity, sizeof(capacity));
+      if (status != CUBLAS_STATUS_SUCCESS) return status;
+      // Unsupported capacities fail closed, never select a different reduction.
+      status = cublasLtMatmulAlgoCheck(plan.blas, plan.operation, plan.weight,
+          plan.input, plan.output, plan.output, &plan.algorithm, &checked);
+      if (status != CUBLAS_STATUS_SUCCESS) return status;
+      return checked.state == CUBLAS_STATUS_SUCCESS && checked.workspaceSize <= kMarkovWorkspace
+          ? CUBLAS_STATUS_SUCCESS : CUBLAS_STATUS_NOT_SUPPORTED;
+    }
+  }
+  return CUBLAS_STATUS_NOT_SUPPORTED;
+}
+
 }
 static int32_t create_head(void* workspace, uint64_t bytes, void** output, int width, int max_rows, int vocab_rows = 129280) {
   if (!output) return cudaErrorInvalidValue;
@@ -104,6 +191,7 @@ static int32_t create_head(void* workspace, uint64_t bytes, void** output, int w
   handle->width = width;
   handle->max_rows = max_rows;
   handle->vocab_rows = vocab_rows;
+  if (width >= 1024) handle->tensor.status = create_tensor_plan(handle);
   *output = handle;
   return 0;
 }
@@ -125,7 +213,7 @@ extern "C" int32_t cuteafd_v41_markov_destroy(void* opaque) {
   return blas_status(status);
 }
 static int32_t launch_head(void* opaque, const uint16_t* embedding,
-    const uint16_t* weight, float* logits, int32_t rows, void* stream, int width, bool tensor_op = false) {
+    const uint16_t* weight, float* logits, int32_t rows, void* stream, int width, int tensor_op = 0) {
   if (!opaque || rows < 1) return cudaErrorInvalidValue;
   auto* handle = static_cast<MarkovHandle*>(opaque);
   if (handle->width != width || rows > handle->max_rows) return cudaErrorInvalidValue;
@@ -148,24 +236,30 @@ static int32_t launch_head(void* opaque, const uint16_t* embedding,
     return cudaGetLastError();
   }
 #endif
+  if (tensor_op == 2) {
+    auto& plan = handle->tensor;
+    if (plan.status != CUBLAS_STATUS_SUCCESS) return blas_status(plan.status);
+    const uint64_t columns = rows;
+    auto result = cublasLtMatrixLayoutSetAttribute(plan.input, CUBLASLT_MATRIX_LAYOUT_COLS,
+                                                  &columns, sizeof(columns));
+    if (result != CUBLAS_STATUS_SUCCESS) return blas_status(result);
+    result = cublasLtMatrixLayoutSetAttribute(plan.output, CUBLASLT_MATRIX_LAYOUT_COLS,
+                                             &columns, sizeof(columns));
+    if (result != CUBLAS_STATUS_SUCCESS) return blas_status(result);
+    const float alpha = 1, beta = 0;
+    return blas_status(cublasLtMatmul(plan.blas, plan.operation, &alpha, weight,
+        plan.weight, embedding, plan.input, &beta, logits, plan.output, logits,
+        plan.output, &plan.algorithm, handle->workspace, kMarkovWorkspace,
+        reinterpret_cast<cudaStream_t>(stream)));
+  }
   auto result = cublasSetStream(handle->blas, reinterpret_cast<cudaStream_t>(stream));
   if (result != CUBLAS_STATUS_SUCCESS) return blas_status(result);
   // SetStream resets the workspace: rebind this wave's owned storage afterward.
   result = cublasSetWorkspace(handle->blas, handle->workspace, kMarkovWorkspace);
   if (result != CUBLAS_STATUS_SUCCESS) return blas_status(result);
   const float alpha = 1, beta = 0;
-  // Without `tensor_op`, model-width heads (4096 and wider) run cuBLAS with
-  // pedantic FP32 accumulation (FP32 products and sums on CUDA cores): the
-  // target-head diagnostic `exact` (CUTEAFD_TARGET_HEAD=exact). `tensor_op`
-  // (cuteafd_vocabulary_head_launch_tensor_op), every family's default target
-  // head (rust shared::target_head), runs BF16 tensor cores with FP32
-  // accumulation. An earlier note that the tensor-op path exceeds its error
-  // bound on real head weights did not reproduce (2026-10-13, RTX PRO 6000,
-  // native/tests/target_head_selftest.py, 16 final-norm-shaped rows against an
-  // FP64 product of the same BF16 operands): DeepSeek V4 Flash head max
-  // |error| / max |logit| 5.1e-7 (pedantic 1.8e-7), V4.1 6.5e-7 (1.9e-7), every
-  // other family at most 6.9e-6; top-1 identical on every row, KL(FP64 ||
-  // tensor) at most 2.7e-11 nats.
+  // Diagnostic exact mode uses FP32 CUDA-core math at model widths. Drafters
+  // retain the heuristic tensor GEMM; target tensors took the fixed Lt path above.
   const bool pedantic = width >= 4096 && !tensor_op;
   const auto compute = pedantic ? CUBLAS_COMPUTE_32F_PEDANTIC : CUBLAS_COMPUTE_32F;
   const auto algorithm = pedantic ? CUBLAS_GEMM_DEFAULT : CUBLAS_GEMM_DEFAULT_TENSOR_OP;
@@ -210,6 +304,13 @@ extern "C" int32_t cuteafd_vocabulary_head_launch_tensor_op(void* handle, const 
   if (!handle) return cudaErrorInvalidValue;
   return launch_head(handle, input, weight, output, rows, stream,
                      static_cast<MarkovHandle*>(handle)->width, true);
+}
+// The target-only route: drafters retain their original heuristic GEMM.
+extern "C" int32_t cuteafd_vocabulary_head_launch_tensor_invariant(void* handle, const uint16_t* input,
+    const uint16_t* weight, float* output, int32_t rows, void* stream) {
+  if (!handle) return cudaErrorInvalidValue;
+  return launch_head(handle, input, weight, output, rows, stream,
+                     static_cast<MarkovHandle*>(handle)->width, 2);
 }
 extern "C" int32_t cuteafd_v41_vocabulary_head_launch(void* handle, const uint16_t* input,
     const uint16_t* weight, float* output, int32_t rows, void* stream) {

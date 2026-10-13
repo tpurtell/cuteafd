@@ -375,6 +375,7 @@ pub struct VocabularyHead<'a> {
     launch: HeadLaunchFn,
     /// `cuteafd_vocabulary_head_launch_tensor_op`, when the native library has it.
     launch_tensor_op: Option<HeadLaunchFn>,
+    launch_tensor_invariant: Option<HeadLaunchFn>,
 }
 
 /// Bytes of caller-owned cuBLAS workspace the head needs.
@@ -389,12 +390,15 @@ impl NativeLibrary {
         let create = *unsafe { self.lib.get::<Create>(b"cuteafd_vocabulary_head_create") }?;
         let launch = *unsafe { self.lib.get(b"cuteafd_vocabulary_head_launch_width") }?;
         let launch_tensor_op = unsafe { self.lib.get(b"cuteafd_vocabulary_head_launch_tensor_op") }.ok().map(|f| *f);
+        // SAFETY: this optional symbol has the same ABI as the other head launches.
+        let launch_tensor_invariant = unsafe { self.lib.get(b"cuteafd_vocabulary_head_launch_tensor_invariant") }
+            .ok().map(|f| *f);
         let mut handle = std::ptr::null_mut();
         let status = unsafe {
             create(workspace, VOCABULARY_HEAD_WORKSPACE as u64, i32::try_from(width)?, i32::try_from(max_rows)?, &mut handle)
         };
         ensure!(status == 0, "vocabulary head creation failed with {status}");
-        Ok(VocabularyHead { library: self, handle, launch, launch_tensor_op })
+        Ok(VocabularyHead { library: self, handle, launch, launch_tensor_op, launch_tensor_invariant })
     }
 }
 
@@ -608,17 +612,36 @@ impl NativeLibrary {
         let create = *unsafe { self.lib.get::<Create>(b"cuteafd_vocabulary_head_create_vocab") }?;
         let launch = *unsafe { self.lib.get(b"cuteafd_vocabulary_head_launch_width") }?;
         let launch_tensor_op = unsafe { self.lib.get(b"cuteafd_vocabulary_head_launch_tensor_op") }.ok().map(|f| *f);
+        // SAFETY: this optional symbol has the same ABI as the other head launches.
+        let launch_tensor_invariant = unsafe { self.lib.get(b"cuteafd_vocabulary_head_launch_tensor_invariant") }
+            .ok().map(|f| *f);
         let mut handle = std::ptr::null_mut();
         let status = unsafe {
             create(workspace, VOCABULARY_HEAD_WORKSPACE as u64, i32::try_from(width)?, i32::try_from(max_rows)?,
                 i32::try_from(vocab)?, &mut handle)
         };
         ensure!(status == 0, "vocabulary head creation failed with {status}");
-        Ok(VocabularyHead { library: self, handle, launch, launch_tensor_op })
+        Ok(VocabularyHead { library: self, handle, launch, launch_tensor_op, launch_tensor_invariant })
     }
 }
 
 impl VocabularyHead<'_> {
+    /// BF16 target projection with one fixed cuBLASLt tile and reduction per head.
+    /// Unlike the drafter's heuristic route, row count never selects another algorithm.
+    ///
+    /// # Safety
+    /// As [`Self::launch`]. Serialize handle/workspace use; both must outlive all
+    /// captured graphs and pending launches.
+    pub unsafe fn launch_tensor_invariant(&self, input: *const u16, weight: *const u16,
+        logits: *mut f32, rows: u32, stream: *mut c_void) -> Result<()> {
+        let launch = self.launch_tensor_invariant.context(
+            "this native library has no fixed tensor vocabulary head (rebuild it with this checkout)")?;
+        // SAFETY: the caller guarantees buffer, device and stream lifetimes.
+        let status = unsafe { launch(self.handle, input, weight, logits, i32::try_from(rows)?, stream) };
+        ensure!(status == 0, "fixed tensor vocabulary head launch of {rows} rows failed with {status}");
+        Ok(())
+    }
+
     /// # Safety
     /// `input` BF16 [rows, width], `weight` BF16 [vocab, width] and `logits`
     /// FP32 [rows, vocab] must be live device memory on the head's device.

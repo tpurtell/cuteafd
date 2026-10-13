@@ -478,7 +478,7 @@ if(CUTEAFD_ENABLE_CUDA)
   if(CUTEAFD_V41_VOCAB_ROW_EXPERIMENT)
     target_compile_definitions(cuteafd_native PRIVATE CUTEAFD_V41_VOCAB_ROW_EXPERIMENT=1)
   endif()
-  target_link_libraries(cuteafd_native PUBLIC CUDA::cudart CUDA::cublas CUDA::cuda_driver)
+  target_link_libraries(cuteafd_native PUBLIC CUDA::cudart CUDA::cublas CUDA::cublasLt CUDA::cuda_driver)
   set_target_properties(cuteafd_native PROPERTIES
     CUDA_ARCHITECTURES "${CUTEAFD_CUDA_ARCHITECTURES}"
   )
