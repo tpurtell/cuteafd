@@ -46,7 +46,7 @@ fn real_registered_output_matches_device_compaction_and_preserves_guards() -> Re
         // expert execution can change summation order in this exact comparison.
         let device = execution.compact_output.as_ref().unwrap().buffer;
         let reducer = execution.compact_reducer.as_ref().unwrap();
-        let (kernel, slots, _) = execution.execution_state(rows);
+        let (kernel, slots, _) = execution.execution_state(rows)?;
         unsafe {
             if kernel.accumulates_tokens() {
                 reducer.compact_tokens(slots[41].cast(), device.ptr.cast(), rows, execution.stream.raw)?;
