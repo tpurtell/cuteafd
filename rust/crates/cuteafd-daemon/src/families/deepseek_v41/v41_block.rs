@@ -68,6 +68,7 @@ impl<'w, 'a> BackboneBlockWave<'w, 'a> {
     pub fn trace_stream(&self) -> *mut std::ffi::c_void { self.ffn.stream_raw() }
     /// The stream carrying each layer's FFN finish (mHC post, next inputs).
     pub(crate) fn finish_stream(&self) -> *mut std::ffi::c_void { self.ffn.stream_raw() }
+    pub(super) fn diagnostic_attention_residual(&self) -> CuteafdDeviceBuffer { self.ffn.inputs()[0] }
     /// Reuse this lane's two mHC workspaces for the adjacent layer. Completed
     /// residual/pre values are copied before installing both validated bindings.
     /// No device allocation or graph capture occurs here.

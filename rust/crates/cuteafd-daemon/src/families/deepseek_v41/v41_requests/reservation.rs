@@ -50,6 +50,7 @@ impl Requests<'_> {
             ensure!(live.history.position() == self.cache.committed_end(r.lease)?,
                 "encoder accepted histories differ");
             let history = live.prefill.as_ref().map_or(&live.history, |p| p.history());
+            super::super::v41_lossless_diag::observe_prompt(self.cache.request_id(r.lease)?, history.position(), r.tokens);
             ensure!(history.position() == self.cache.encoder_prepared_end(r.lease)?,
                 "encoder preparation frontiers differ");
             prepared.push(history.prefill_cursor());

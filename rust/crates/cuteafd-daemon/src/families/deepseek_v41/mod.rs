@@ -10,6 +10,7 @@ pub(crate) mod v41_backbone_lane;
 pub(crate) mod v41_backbone_router;
 pub(crate) mod v41_backbone_shared;
 pub(crate) mod v41_block;
+mod v41_lossless_diag;
 pub(crate) mod v41_compressor;
 pub(crate) mod v41_dspark_cache;
 pub(crate) mod v41_engram;

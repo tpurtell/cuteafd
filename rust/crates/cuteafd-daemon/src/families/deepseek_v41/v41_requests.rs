@@ -47,6 +47,7 @@ impl RequestBatch {
         ensure!(!self.finished, "request batch finished");
         Ok(&self.cache)
     }
+    pub(super) fn diagnostic_tokens(&self) -> &[u32] { &self.tokens }
     pub fn image_mask(&self) -> &[u8] {
         &self.image_mask
     }
@@ -342,6 +343,7 @@ impl<'a> Requests<'a> {
             let request = self.request(r.lease)?;
             ensure!(request.prefill.is_none(), "reserved encoder requires reservation preparation");
             let history = &request.history;
+            super::v41_lossless_diag::observe_prompt(self.cache.request_id(r.lease)?, history.position(), r.tokens);
             ensure!(
                 history.position() == self.cache.history_end(r.lease)?,
                 "request histories differ"
