@@ -109,6 +109,8 @@ struct Manifest {
     /// `null` for an unclamped SwiGLU (GLM).
     swiglu_limit: Option<f32>,
     direct: bool,
+    #[serde(default = "default_route_block")]
+    route_block: usize,
     sms: usize,
     blocks_per_sm: usize,
     buffers: BTreeMap<String, Buffer>,
@@ -123,7 +125,14 @@ struct Manifest {
     #[serde(default)]
     input_format: Option<String>,
 }
+fn default_route_block() -> usize { 8 }
+
 impl Manifest {
+    fn group_rows(&self) -> Result<usize> {
+        ensure!(matches!(self.route_block, 8 | 16 | 32 | 64), "unknown EXL3 route_block {}", self.route_block);
+        ensure!(!self.direct || self.route_block == 8, "direct EXL3 requires route_block 8");
+        Ok(self.route_block)
+    }
     fn wire_input(&self) -> Result<bool> {
         match self.input_format.as_deref() {
             None | Some("bf16") => Ok(false),
@@ -303,6 +312,7 @@ pub(crate) struct Exl3Execution<'a> {
     device: i32,
     hidden: usize,
     capacity: usize,
+    group_rows: usize,
     topk: usize,
     library: &'a NativeLibrary,
 }
@@ -363,6 +373,7 @@ impl<'a> Exl3Execution<'a> {
     ) -> Result<Self> {
         let meta: Manifest =
             serde_json::from_slice(&std::fs::read(directory.join("v41_exl3.json"))?)?;
+        let group_rows = meta.group_rows()?;
         let core_reads_wire = meta.wire_input()?;
         ensure!(!core_reads_wire || format == Exl3InputFormat::Fp8K32,
             "EXL3 wire-input export requires FP8 K32 expert inputs");
@@ -646,10 +657,13 @@ impl<'a> Exl3Execution<'a> {
             device,
             hidden: meta.hidden,
             capacity: meta.capacity,
+            group_rows,
             topk: meta.top_k,
             library,
         })
     }
+
+    pub(crate) fn group_rows(&self) -> usize { self.group_rows }
 
     pub(crate) fn capacity(&self) -> usize {
         self.capacity
@@ -872,6 +886,29 @@ mod tests {
         assert!(Exl3Workspace::plan(&directories(Exl3RowPolicy::GlmFlashK64, 16)?, Exl3InputFormat::Fp8K32).is_err());
         assert!(Exl3Workspace::plan(&directories(Exl3RowPolicy::Nearest, 16)?, Exl3InputFormat::Fp8K32).is_ok());
         Ok(())
+    }
+
+    #[test]
+    fn grouping_retains_legacy_route_block_and_refuses_unknown_tiles() {
+        let original = serde_json::json!({
+            "schema":"cuteafd.v41-exl3-aot.v1", "output_dtype":"bf16", "sparkinfer_revision":"test",
+            "hidden":5120,"intermediate":640,"experts":384,"capacity":80,"top_k":6,
+            "bits":[3,4],"swiglu_limit":10.0,"direct":false,"sms":48,"blocks_per_sm":1,
+            "buffers":{},"objects":[],"trellis_lut":{"file":"lut","bytes":16,"sha256":"test"}
+        });
+        let parse = |value| serde_json::from_value::<Manifest>(value).unwrap();
+        assert_eq!(parse(original.clone()).group_rows().unwrap(), 8);
+        for block in [8, 16, 32, 64] {
+            let mut value = original.clone();
+            value["route_block"] = block.into();
+            assert_eq!(parse(value).group_rows().unwrap(), block as usize);
+        }
+        for (block, direct) in [(0, false), (128, false), (16, true)] {
+            let mut value = original.clone();
+            value["route_block"] = block.into();
+            value["direct"] = direct.into();
+            assert!(parse(value).group_rows().is_err());
+        }
     }
 
     #[test]

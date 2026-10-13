@@ -56,6 +56,10 @@ int main() {{
   assert(cuteafd_expert_shared_input() == -1);
 #endif
 #endif
+  uint32_t group=999;
+  // Stale exports lack the additive field and must never guess a tile.
+  assert(cuteafd_v41_expert_group_rows(16,0,&group) == cudaErrorInvalidValue);
+  assert(group == 999);
   void* kernel=nullptr;
   assert(cuteafd_v41_expert_initialize(16, &kernel) == 0);
   cuteafd_expert_launch_t args{{}};

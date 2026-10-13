@@ -17,6 +17,7 @@ import re
 from pathlib import Path
 
 from v41_spark_tp3_launch_geometry import launch_geometry
+from expert_grouping import native_group_macros, slice_group_rows
 
 os.environ["B12X_COMPILE_DISK_CACHE"] = "0"
 os.environ["B12X_COMPILE_MEMORY_CACHE"] = "0"
@@ -150,6 +151,7 @@ def export(output, capacities, width, atomic_min_capacity=None, role="spark", *,
         variants=[],
     )
     includes, entries = [], []
+    group_rows = slice_group_rows(_pinned_sparkinfer.SOURCE)
     for capacity in capacities:
         compact = compact_max_capacity is not None and capacity <= compact_max_capacity
         atomic = not compact and atomic_min_capacity is not None and capacity >= atomic_min_capacity
@@ -352,6 +354,8 @@ def export(output, capacities, width, atomic_min_capacity=None, role="spark", *,
             dict(
                 name=label,
                 implementation="hybrid" if compact else "slices",
+                group_rows=group_rows,
+                compact_group_rows=1 if compact else None,
                 compact_live_rows=min(capacity, compact_live_rows) if compact else None,
                 width=selected_width,
                 output_kind="fp32_tokens" if atomic else "fp32_routes",
@@ -373,6 +377,7 @@ def export(output, capacities, width, atomic_min_capacity=None, role="spark", *,
                 f"#define CUTEAFD_V41_CC_MINOR {props.minor}",
                 f"#define CUTEAFD_V41_SMS {workspace_sms}",
                 "#define CUTEAFD_V41_VARIANTS " + ",".join(entries),
+                *native_group_macros(manifest["variants"]),
                 "#define CUTEAFD_V41_OUTPUT_KIND(capacity) (" +
                 (" || ".join(f"((capacity)=={v['capacity_rows']})" for v in manifest['variants']
                              if v['output_kind'] == 'fp32_tokens') or "0") + " ? 1u : 0u)",

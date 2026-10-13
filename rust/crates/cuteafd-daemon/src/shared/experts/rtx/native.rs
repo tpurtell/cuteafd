@@ -359,6 +359,14 @@ impl RtxExpertLayer for NativeTp2<'_> {
     fn workspace_bytes(&self) -> usize {
         self.workspace_bytes
     }
+    fn group_rows(&self, rows: usize) -> Result<usize> {
+        if rows == 0 {
+            return Ok(self.states.last().context("no installed TP2 expert capacity")?.kernel.group_rows());
+        }
+        ensure!(rows <= self.max_rows, "invalid TP2 grouping row count");
+        self.states.iter().find(|s| s.kernel.info().capacity_rows as usize >= rows)
+            .context("no TP2 expert capacity for this many rows")?.kernel.group_rows_for(rows)
+    }
     fn output(&self) -> *mut c_void {
         self.output.buffer.ptr
     }

@@ -280,6 +280,14 @@ impl RtxExpertLayer for Exl3Tp2<'_> {
     fn workspace_bytes(&self) -> usize {
         self.workspace_bytes
     }
+    fn group_rows(&self, rows: usize) -> Result<usize> {
+        ensure!(rows <= self.max_rows, "invalid EXL3 TP2 grouping row count");
+        let executions = self.executions.as_ref().context("uninitialized EXL3 rank")?;
+        let selected = if rows == 0 { executions.last() } else {
+            executions.iter().find(|e| e.capacity() >= self.row_policy.required_capacity(rows))
+        };
+        Ok(selected.context("no EXL3 TP2 capacity for this many rows")?.group_rows())
+    }
     fn output(&self) -> *mut c_void {
         self.output
             .as_ref()

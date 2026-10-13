@@ -34,6 +34,7 @@ import re
 from pathlib import Path
 
 import _pinned_sparkinfer
+from expert_grouping import native_group_macros
 
 # role -> (experts, intermediate, topk, capability)
 ROLES = {
@@ -368,6 +369,7 @@ def export(
                 "route_mode": route_mode,
                 "output_shards": output_shards if route_mode == "direct" or output_shards == 0 else 1,
                 "tile_m": plan.execution.tile_m,
+                "group_rows": 1 if route_mode == "direct" else plan.execution.tile_m,
                 "output_kind": 2,
                 "output_format": "bf16_routes",
                 "requested_rows": requested_rows,
@@ -394,6 +396,7 @@ def export(
                 "// Deterministic dynamic NVFP4 publishes BF16 per-route rows.",
                 "#define CUTEAFD_V41_OUTPUT_KIND(capacity) 2",
                 "#define CUTEAFD_V41_VARIANTS " + ",".join(entries),
+                *native_group_macros(manifest["variants"]),
                 "",
             ]
         )

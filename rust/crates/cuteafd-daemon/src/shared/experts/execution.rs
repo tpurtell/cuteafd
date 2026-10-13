@@ -8,6 +8,8 @@ use cuteafd_ffi::{
 };
 use std::ffi::c_void;
 pub(crate) mod timing;
+mod grouping;
+pub(crate) use grouping::{ExpertGroupingError, InstalledExpertGrouping};
 use timing::ExpertTiming;
 
 /// Native roles that publish token-major FP32 routed partials and therefore
@@ -362,6 +364,14 @@ impl<'weights, 'library> ExpertExecution<'weights, 'library> {
             }
         }
         (&self.kernel, &self.slots, &self.scratch)
+    }
+
+    /// Zero queries the main compiled tile; positive rows follow the launch selector.
+    pub fn group_rows(&self, rows: usize) -> Result<usize> {
+        if rows == 0 { return Ok(self.kernel.group_rows()); }
+        ensure!(rows <= self.kernel.info().capacity_rows as usize,
+            "invalid expert grouping row count {rows}");
+        self.execution_state(u32::try_from(rows)?).0.group_rows_for(rows)
     }
 
     pub fn synchronize(&self) -> Result<()> {

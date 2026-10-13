@@ -1,5 +1,6 @@
 """Execute the real native bridges against stubbed CUDA/AOT launch entries."""
 import importlib.util
+import os
 from pathlib import Path
 import sys
 from types import ModuleType
@@ -10,7 +11,7 @@ import tempfile
 import pytest
 
 ROOT = Path(__file__).resolve().parents[2]
-BUILD_ROOT = Path.home() / ".cache/cuteafd/builds/plat1-sm120/native-host-tests"
+BUILD_ROOT = Path(os.environ.get("CUTEAFD_TEST_BUILD_ROOT", Path.home() / ".cache/cuteafd/builds/plat1-sm120/native-host-tests"))
 
 CUDA = r"""
 #pragma once
@@ -89,7 +90,10 @@ EXPERT_HEADER = r"""
 #pragma once
 #define CUTEAFD_V41_SMS 188
 #define CUTEAFD_V41_CC_MINOR 0
-#define CUTEAFD_V41_VARIANTS {{2,0,1,5120,2304,2304,3,1,64,1,1,1,1,188,1},init,load,expert_launch,{}}
+#define CUTEAFD_V41_GROUP_ROWS(capacity, rows) ((capacity)==80 ? ((rows)>0 && (rows)<=8 ? 1u : 16u) : ((capacity)==1 ? 16u : 0u))
+#define CUTEAFD_V41_VARIANTS \
+ {{2,0,1,5120,2304,2304,3,1,64,1,1,1,1,188,1},init,load,expert_launch,{}}, \
+ {{2,0,1,5120,2304,2304,3,80,64,80,80,80,80,188,1},init,load,expert_launch,{}}
 """
 
 INPUT_QUANT_HEADER = r"""
@@ -105,6 +109,17 @@ EXPERT_MAIN = r"""
 #include "SOURCE"
 extern "C" int32_t cuteafd_initialize_scratch_storage_async(void*,uint64_t,uint64_t,uint64_t,uint32_t,void*) { return 0; }
 int main() {
+ uint32_t group=999;
+ attribute_error=101;
+ assert(cuteafd_v41_expert_group_rows(1,0,&group)==0 && group==16);
+ assert(cuteafd_v41_expert_group_rows(1,1,&group)==0 && group==16);
+ assert(cuteafd_v41_expert_group_rows(80,0,&group)==0 && group==16);
+ for (int rows : {1,8}) assert(cuteafd_v41_expert_group_rows(80,rows,&group)==0 && group==1);
+ for (int rows : {9,80}) assert(cuteafd_v41_expert_group_rows(80,rows,&group)==0 && group==16);
+ for (int rows : {-1,81}) assert(cuteafd_v41_expert_group_rows(80,rows,&group)==cudaErrorInvalidValue);
+ assert(cuteafd_v41_expert_group_rows(16,0,&group)==cudaErrorInvalidValue);
+ assert(cuteafd_v41_expert_group_rows(80,0,nullptr)==cudaErrorInvalidValue);
+ attribute_error=0;
  void* h=nullptr;
  minor=1;
  assert(cuteafd_v41_expert_initialize(1,&h)==cudaErrorInvalidDevice && h==nullptr);
