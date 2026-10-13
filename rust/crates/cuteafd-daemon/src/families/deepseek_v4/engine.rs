@@ -28,6 +28,8 @@ use std::time::Instant;
 
 mod dspark;
 mod tp2;
+mod diagnostic;
+pub(super) use diagnostic::{DiagnosticConfig, private_write};
 pub(crate) use tp2::ExchangePolicy;
 use tp2::Tp2State;
 pub(crate) use dspark::DraftRequest;
@@ -78,6 +80,7 @@ pub(crate) struct Engine<'a> {
     capture_only: std::cell::Cell<bool>,
     graph_captures: std::cell::Cell<usize>,
     expert_graph_captures: std::cell::Cell<usize>,
+    boundaries: RefCell<Option<diagnostic::Boundaries<'a>>>,
 }
 
 /// The second GPU of a two-GPU head split (rank 1): its share of every
@@ -474,6 +477,7 @@ impl<'a> Engine<'a> {
             capture_only: std::cell::Cell::new(false),
             graph_captures: std::cell::Cell::new(0),
             expert_graph_captures: std::cell::Cell::new(0),
+            boundaries: RefCell::new(None),
             rope_window: table(false)?,
             rope_compressed: table(true)?,
             pools,
@@ -973,6 +977,7 @@ impl<'a> Engine<'a> {
                     link.expect(1);
                 }
                 self.replay_on(0, key, segment)?;
+                self.snapshot_front(layer, t, w, lane)?;
                 if let Some(w1) = w1 {
                     // Rank 1's segments: layer 0 after rank 0's, then each next one before the
                     // host waits in this layer's exchange.
@@ -988,6 +993,7 @@ impl<'a> Engine<'a> {
                     Some(link) if layer >= local_layers => link.world_size(),
                     _ => self.decode_experts(layer, t, w, lane, cap, transports.first_mut(), runtime)?,
                 };
+                self.snapshot_shared(layer, t, lane)?;
                 crate::shared::console::layer_mark(layer);
             }
             // The tail: the last post, its taps and the drafter's KV, then the head.
@@ -1002,6 +1008,7 @@ impl<'a> Engine<'a> {
                 self.write_draft_kv(w, lane, t, cap)?;
                 self.head_launch(&lane.stream_a, t, t, 0, w)
             })?;
+            self.snapshot_tail(t, w, lane)?;
             self.finish_route_step()?;
             return Ok(Logits::Device(Some(self.device_logits(w, t))));
         } else {

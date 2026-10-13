@@ -348,6 +348,70 @@ fn select_rows(selector: &mut TokenSelector<'_>, logits: &crate::shared::token_i
     Ok((selector.select(logits, &batch)?, poisoned))
 }
 
+struct VerifyDiagnostic<'e, 'a> {
+    config: super::engine::DiagnosticConfig,
+    marks: Dsv4Prefix<'e, 'a>,
+    done: bool,
+}
+
+impl<'e, 'a> VerifyDiagnostic<'e, 'a> {
+    fn new(engine: &'e super::engine::Engine<'a>) -> Result<Option<Self>> {
+        let Some(config) = super::engine::DiagnosticConfig::from_env()? else { return Ok(None) };
+        ensure!(config.prompt.iter().all(|&id| (id as usize) < engine.cfg.vocab_size), "invalid diagnostic token");
+        let marks = Dsv4Prefix::new(engine, |_| 1)?;
+        engine.enable_boundaries()?;
+        Ok(Some(Self { config, marks, done: false }))
+    }
+
+    fn matches(&self, active: &[Active<'_>]) -> bool {
+        !self.done && active.len() == 1 && active[0].generated == self.config.generated
+            && active[0].history.starts_with(&self.config.prompt)
+            && active[0].history.len() == self.config.prompt.len() + self.config.generated
+    }
+
+    fn prepare(&mut self, engine: &super::engine::Engine<'_>, request: &Active<'_>, tokens: &[u32]) -> Result<()> {
+        ensure!(tokens.len() > 1 && tokens.len() <= 8, "private replay requires 2..=8 verifier rows");
+        self.done = true;
+        engine.replay_pages(&request.placement, request.placement.len, tokens.len(), true)?;
+        self.marks.capture(cuteafd_engine::prefix::MarkSlot(0), &request.placement, request.placement.len)
+            .map_err(|e| anyhow::anyhow!("diagnostic capture: {e}"))?;
+        super::engine::private_write(&self.config.output.join("production.json"), &serde_json::to_vec_pretty(&serde_json::json!({
+            "history": request.history, "input": tokens, "start": request.placement.len,
+            "generated": request.generated, "graph_captures_before": engine.graph_capture_counts(),
+            "method": "production verify, restore exact committed mark, serial same-input replay; request then aborts"
+        }))?)?;
+        engine.boundary_row(Some(0))
+    }
+
+    fn replay(&self, engine: &super::engine::Engine<'_>, request: &mut Active<'_>, tokens: &[u32], start: usize,
+        transports: &mut [crate::shared::spark_intake::SparkLink<'_>], runtime: &tokio::runtime::Runtime) -> Result<()> {
+        engine.dump_boundaries(&self.config.output.join("verify"), tokens.len())?;
+        engine.boundary_row(None)?;
+        // Restore whole touched compressed units as well as positional state, including
+        // any pre-existing rejected suffix, rather than relying on future-row masking.
+        engine.replay_pages(&request.placement, start, tokens.len(), false)?;
+        self.marks.restore(Some(cuteafd_engine::prefix::MarkSlot(0)), &mut request.placement, start)
+            .map_err(|e| anyhow::anyhow!("diagnostic restore: {e}"))?;
+        self.marks.drain().map_err(|e| anyhow::anyhow!("diagnostic restore drain: {e}"))?;
+        let captures = engine.graph_capture_counts();
+        let result = (|| -> Result<()> {
+            for (row, &token) in tokens.iter().enumerate() {
+                engine.boundary_row(Some(row))?;
+                engine.decode_device(&mut [(&mut request.placement, token)], transports.first_mut(), runtime)?;
+            }
+            engine.dump_boundaries(&self.config.output.join("serial"), tokens.len())?;
+            super::engine::private_write(&self.config.output.join("complete.json"), &serde_json::to_vec_pretty(&serde_json::json!({
+                "rows": tokens.len(), "start": start, "end": request.placement.len,
+                "captures_before_serial": captures, "captures_after_serial": engine.graph_capture_counts()
+            }))?)?;
+            Ok(())
+        })();
+        engine.boundary_row(None)?;
+        result?;
+        anyhow::bail!("private V4 verify/serial diagnostic complete; deliberately aborting selected request")
+    }
+}
+
 /// Drafts after every active sequence's next token, verifies `[next, drafts]`
 /// in one step and accepts each sequence's longest matching prefix plus the
 /// verifier's own token after it. Returns which requests finished.
@@ -362,6 +426,7 @@ fn speculative_step(
     selector: &mut TokenSelector<'_>,
     caching: bool,
     shape: &mut StepShape,
+    diagnostic: &mut Option<VerifyDiagnostic<'_, '_>>,
 ) -> Result<Vec<bool>> {
     let noise = engine.cfg.dspark_noise_token_id as u32;
     let draft_indices: Vec<usize> = active.iter().enumerate()
@@ -391,11 +456,19 @@ fn speculative_step(
         }
         Ok(rows)
     }).collect::<Result<_>>()?;
+    let diagnose = diagnostic.as_ref().is_some_and(|d| d.matches(active));
+    if diagnose { diagnostic.as_mut().unwrap().prepare(engine, &active[0], &sequences[0])?; }
     let starts: Vec<usize> = active.iter().map(|a| a.placement.len).collect();
     let mut rows: Vec<(&mut Placement, &[u32])> = active.iter_mut().zip(&sequences)
         .map(|(a, tokens)| (&mut a.placement, tokens.as_slice())).collect();
     let timer = Instant::now();
-    let logits = engine.verify_device(&mut rows, transports, runtime)?;
+    let verification = engine.verify_device(&mut rows, transports, runtime);
+    if diagnose && verification.is_err() { engine.boundary_row(None)?; }
+    let logits = verification?;
+    if diagnose {
+        engine.boundary_row(None)?;
+        diagnostic.as_ref().unwrap().replay(engine, &mut active[0], &sequences[0], starts[0], transports, runtime)?;
+    }
     let (selected, mut poisoned) = select_rows(selector, &logits, active, &sequences, &starts)?;
     engine.check_device()?;
     shape.verify_us = console::us(timer);
@@ -501,6 +574,7 @@ fn schedule(
     prefix: &PrefixArgs,
     selector: &mut TokenSelector<'_>,
 ) -> Result<()> {
+    let mut diagnostic = VerifyDiagnostic::new(engine)?;
     let (family, mut cache) = prefix_cache(engine, prefix)?;
     let markers = crate::shared::prefix::marker_ids(&loaded.snapshot, &MESSAGE_STARTS)?;
     let mut states: Vec<usize> = (0..engine.shape.sequences).rev().collect();
@@ -790,7 +864,7 @@ fn schedule(
             && active.len() * (block + 1) <= engine.decode_rows
             && active.iter().any(|a| !probe::no_speculation(&a.job.probe));
         let step = if speculate {
-            speculative_step(engine, &mut active, block, eos, transports, runtime, selector, caching, &mut shape)
+            speculative_step(engine, &mut active, block, eos, transports, runtime, selector, caching, &mut shape, &mut diagnostic)
         } else {
             let sequences: Vec<Vec<u32>> = active.iter().map(|a| vec![a.next]).collect();
             let starts: Vec<usize> = active.iter().map(|a| a.placement.len).collect();
