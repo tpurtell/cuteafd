@@ -1,6 +1,6 @@
 //! Official dSpark confidence is a raw FP32 projection, without sigmoid.
 use crate::{CuteafdDeviceBuffer, NativeLibrary};
-use anyhow::{ensure, Result};
+use anyhow::{ensure, Context, Result};
 use std::ffi::c_void;
 
 type ConfidenceFn =
@@ -70,6 +70,8 @@ pub struct V41VocabularyProjection<'a> {
     _library: &'a NativeLibrary,
     handle: *mut c_void,
     launch: MarkovLaunch,
+    /// `cuteafd_vocabulary_head_launch_tensor_op` on this handle, when the native library has it.
+    launch_tensor_op: Option<MarkovLaunch>,
     destroy: MarkovDestroy,
     width: usize,
     max_rows: usize,
@@ -111,7 +113,9 @@ impl NativeLibrary {
         let mut handle = std::ptr::null_mut();
         let status = unsafe { create(workspace.ptr, workspace.bytes as u64, vocab_rows as i32, &mut handle) };
         ensure!(status == 0 && !handle.is_null(), "vocabulary shard initialization status {status}");
-        Ok(V41VocabularyProjection { _library: self, handle, launch, destroy,
+        let launch_tensor_op = unsafe { self.lib.get::<MarkovLaunch>(b"cuteafd_vocabulary_head_launch_tensor_op") }
+            .ok().map(|f| *f);
+        Ok(V41VocabularyProjection { _library: self, handle, launch, launch_tensor_op, destroy,
             width: 5120, max_rows: 128, vocab_rows })
     }
     /// Merge local greedy candidates after the peer candidates arrive.
@@ -169,10 +173,13 @@ impl NativeLibrary {
             status == 0 && !handle.is_null(),
             "Markov initialization status {status}"
         );
+        let launch_tensor_op = unsafe { self.lib.get::<MarkovLaunch>(b"cuteafd_vocabulary_head_launch_tensor_op") }
+            .ok().map(|f| *f);
         Ok(V41VocabularyProjection {
             _library: self,
             handle,
             launch,
+            launch_tensor_op,
             destroy,
             width: if full { 5120 } else { 256 },
             max_rows: if full { 128 } else { 16 },
@@ -193,10 +200,44 @@ impl V41VocabularyProjection<'_> {
         rows: usize,
         stream: *mut c_void,
     ) -> Result<()> {
+        unsafe { self.launch_with(embedding, weight, logits, rows, stream, false) }
+    }
+    /// [`Self::launch`] as a BF16 tensor-core GEMM with FP32 accumulation and FP32 logits
+    /// (`cuteafd_vocabulary_head_launch_tensor_op` on the same handle and workspace), for the
+    /// model-width heads (`v41_vocabulary_head`, `v41_vocabulary_shard`).
+    ///
+    /// # Safety
+    /// As [`Self::launch`].
+    pub unsafe fn launch_tensor_op(
+        &self,
+        embedding: CuteafdDeviceBuffer,
+        weight: CuteafdDeviceBuffer,
+        logits: CuteafdDeviceBuffer,
+        rows: usize,
+        stream: *mut c_void,
+    ) -> Result<()> {
+        unsafe { self.launch_with(embedding, weight, logits, rows, stream, true) }
+    }
+    unsafe fn launch_with(
+        &self,
+        embedding: CuteafdDeviceBuffer,
+        weight: CuteafdDeviceBuffer,
+        logits: CuteafdDeviceBuffer,
+        rows: usize,
+        stream: *mut c_void,
+        tensor_op: bool,
+    ) -> Result<()> {
         ensure!(
             (1..=self.max_rows).contains(&rows),
             "invalid vocabulary projection rows"
         );
+        let launch = if tensor_op {
+            ensure!(self.width == 5120, "the tensor-op launch takes the model-width vocabulary head");
+            self.launch_tensor_op.context(
+                "this native library has no cuteafd_vocabulary_head_launch_tensor_op (rebuild it with this checkout)")?
+        } else {
+            self.launch
+        };
         for (buffer, bytes) in [
             (embedding, rows * self.width * 2),
             (weight, self.vocab_rows * self.width * 2),
@@ -208,7 +249,7 @@ impl V41VocabularyProjection<'_> {
             );
         }
         let status = unsafe {
-            (self.launch)(
+            launch(
                 self.handle,
                 embedding.ptr.cast(),
                 weight.ptr.cast(),

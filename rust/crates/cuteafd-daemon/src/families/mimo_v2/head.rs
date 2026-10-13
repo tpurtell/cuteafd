@@ -52,8 +52,9 @@ impl BorrowedHead<'_, '_> {
             MimoHead::Bf16(w) => {
                 // SAFETY: checked input/output extents and the model-owned BF16
                 // matrix remain live until the owner's stream drain.
-                unsafe { bf16.context("BF16 LM head workspace")?.launch(x.ptr.cast(), w.buffer.ptr.cast(),
-                    logits.ptr.cast(), rows as u32, stream) }
+                unsafe { crate::shared::target_head::launch(crate::shared::target_head::TargetHead::configured(),
+                    bf16.context("BF16 LM head workspace")?, x.ptr.cast_const(), w.buffer.ptr.cast_const(),
+                    logits.ptr.cast(), rows, stream) }
             }
             MimoHead::Fp8 { values, scales } => {
                 let program = self.programs.program(&format!("{}_head_fp8", self.family),

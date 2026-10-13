@@ -195,15 +195,13 @@ pub(crate) struct EngineArgs {
     #[arg(long, default_value_t = false, num_args = 0..=1, default_missing_value = "true",
         action = clap::ArgAction::Set)]
     pub fp8_head: bool,
-    /// The target's logits through the BF16 head. `tensor` (the default with the BF16 head): steps
-    /// of up to 8 rows (one sequence) on the pedantic FP32 cuBLAS GEMM, wider ones (verify steps of
-    /// two or more sequences, prefill-path scoring, --nll) as a BF16 tensor-core GEMM with FP32
-    /// accumulation, which reads the head once (KL-gated against `exact`: 1.24e-10 nats over 2,048
-    /// full-prefill rows). `exact` (diagnostic): the pedantic GEMM on CUDA cores at every row count
-    /// (127 verify rows at 16 sequences: about 4.5 ms on an RTX 5090). Unset with --fp8-head, the
-    /// FP8 head's own program runs; an explicit `tensor` with --fp8-head is refused.
+    /// The target's logits through the BF16 head (the shared route, `crate::shared::target_head`):
+    /// `tensor`, a BF16 tensor-core GEMM with FP32 accumulation at every row count, or `exact`
+    /// (diagnostic), the pedantic FP32 cuBLAS GEMM on CUDA cores. Unset: CUTEAFD_TARGET_HEAD
+    /// (tensor by default). Unset with --fp8-head, the FP8 head's own program runs; an explicit
+    /// `tensor` with --fp8-head is refused.
     #[arg(long, value_enum, env = "CUTEAFD_GLMF_TARGET_HEAD")]
-    pub target_head: Option<head::TargetHeadMode>,
+    pub target_head: Option<head::TargetHead>,
     /// Numerics gate only: round the KDA projections through NVFP4 (group 16,
     /// E4M3 scales) at load and run them as BF16: `rtn` (amax/6) or `search`.
     #[arg(long, hide = true)]
@@ -544,17 +542,17 @@ mod draft_cli_tests {
         assert!(error.to_string().contains("aliases its storage"));
     }
 
-    /// `--target-head`: unset resolves to tensor over the BF16 head and stays inert over the FP8
-    /// head; exact on request; an explicit tensor with the FP8 head is refused.
+    /// `--target-head`: unset follows the shared setting (tensor by default) and stays inert over
+    /// the FP8 head; exact on request; an explicit tensor with the FP8 head is refused.
     #[test]
-    fn target_head_defaults_to_tensor_over_the_bf16_head_and_refuses_explicit_tensor_with_fp8() {
-        use head::TargetHeadMode::{Exact, Tensor};
+    fn target_head_defaults_to_the_shared_route_and_refuses_explicit_tensor_with_fp8() {
+        use head::TargetHead::{Exact, Tensor};
         let unset = parse(&[]);
         assert_eq!(unset.target_head, None);
-        assert_eq!(unset.resolved_target_head(), Tensor);
+        assert_eq!(unset.resolved_target_head(), head::TargetHead::configured());
         check_options(&unset).unwrap();
         let fp8 = parse(&["--fp8-head"]);
-        assert_eq!((fp8.target_head, fp8.resolved_target_head()), (None, Exact));
+        assert_eq!(fp8.target_head, None);
         check_options(&fp8).unwrap();
         assert_eq!(parse(&["--target-head", "exact"]).resolved_target_head(), Exact);
         let tensor = parse(&["--target-head", "tensor"]);
@@ -1101,16 +1099,16 @@ fn check_options(args: &EngineArgs) -> Result<()> {
     ensure!(args.decode_rows == engine::DECODE_ROWS || args.split_device.is_none(),
         "--decode-rows {} runs the wide decode programs on one GPU: a head split (--split-device) takes \
         --decode-rows {}", args.decode_rows, engine::DECODE_ROWS);
-    ensure!(args.target_head != Some(head::TargetHeadMode::Tensor) || !args.fp8_head,
+    ensure!(args.target_head != Some(head::TargetHead::Tensor) || !args.fp8_head,
         "--target-head tensor runs the BF16 head; the FP8 head (--fp8-head) has its own program");
     Ok(())
 }
 
 impl EngineArgs {
-    /// The target head's mode for this head: explicit `--target-head`, else tensor over the BF16
-    /// head (exact, which the FP8 head's program ignores, over --fp8-head).
-    pub fn resolved_target_head(&self) -> head::TargetHeadMode {
-        head::TargetHeadMode::resolve(self.target_head, self.fp8_head)
+    /// The target head's mode: explicit `--target-head`, else the shared setting (tensor by
+    /// default). The FP8 head's own program ignores it.
+    pub fn resolved_target_head(&self) -> head::TargetHead {
+        head::resolve(self.target_head)
     }
 
     /// Whether serving captures every decode graph at startup (`CUTEAFD_GLMF_STARTUP_GRAPHS`, on unless
@@ -1662,8 +1660,8 @@ impl Opened {
         engine.kda_prefill_expanded = args.kda_prefill_expanded;
         engine.mark_slots = mark_slots;
         engine.target_head = args.resolved_target_head();
-        tracing::info!(target_head = ?engine.target_head, requested = ?args.target_head,
-            tensor_from_rows = head::TARGET_HEAD_TENSOR_ROWS, fp8_head = args.fp8_head, "GLM 5.3 Flash target head");
+        tracing::info!(target_head = ?engine.target_head, requested = ?args.target_head, fp8_head = args.fp8_head,
+            "GLM 5.3 Flash target head");
         if let Some((device, peer_stream)) = peer_stream {
             engine.attach_peer(device, peer_stream, shares.pop().context("head-split shares")?)?;
             tracing::info!(device = args.device, split_device = device, attention = %attention.mode,

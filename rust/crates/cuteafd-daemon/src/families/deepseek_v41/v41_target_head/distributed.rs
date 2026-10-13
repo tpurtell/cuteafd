@@ -44,7 +44,7 @@ impl<'w, 'a> Rank<'w, 'a> {
     unsafe fn enqueue(&self, rows: usize, greedy: bool) -> Result<()> {
         let lib = self.stream.library;
         unsafe {
-            crate::families::deepseek_v41::v41_tensors::project_vocabulary(lib, &self.projection, self.weights.weight(),
+            crate::families::deepseek_v41::v41_tensors::project_target_vocabulary(lib, &self.projection, self.weights.weight(),
                 self.weights.fp8().zip(self.fp8_scratch.as_ref()), self.input.buffer, self.logits.buffer, rows,
                 self.stream.raw)?;
             if greedy {

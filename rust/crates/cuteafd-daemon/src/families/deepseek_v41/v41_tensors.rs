@@ -176,6 +176,23 @@ pub(crate) unsafe fn project_vocabulary(library: &NativeLibrary, projection: &cu
     }
 }
 
+/// [`project_vocabulary`] for target logits: the BF16 head takes the shared target-head route
+/// ([`crate::shared::target_head`], tensor cores by default); the FP8 copy is unchanged.
+///
+/// # Safety
+/// As [`project_vocabulary`].
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn project_target_vocabulary(library: &NativeLibrary,
+    projection: &cuteafd_ffi::V41VocabularyProjection<'_>, bf16: Option<CuteafdDeviceBuffer>,
+    fp8: Option<(&crate::shared::fp8_linear::Fp8Weight<'_>, &DeviceAllocation<'_>)>, input: CuteafdDeviceBuffer,
+    logits: CuteafdDeviceBuffer, rows: usize, stream: *mut std::ffi::c_void) -> Result<()> {
+    if fp8.is_none() && crate::shared::target_head::TargetHead::configured().tensor_cores() {
+        let weight = bf16.context("BF16 vocabulary is not resident; FP8 scratch required")?;
+        return unsafe { projection.launch_tensor_op(input, weight, logits, rows, stream) };
+    }
+    unsafe { project_vocabulary(library, projection, bf16, fp8, input, logits, rows, stream) }
+}
+
 /// GEMV scratch for `rows` rows of an FP8 head copy, when `site` uses one.
 pub(crate) fn fp8_scratch<'a>(library: &'a NativeLibrary, fp8: Option<&crate::shared::fp8_linear::Fp8Weight<'_>>,
     rows: usize, site: Fp8Head) -> Result<Option<DeviceAllocation<'a>>> {

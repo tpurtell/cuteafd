@@ -154,11 +154,18 @@ static int32_t launch_head(void* opaque, const uint16_t* embedding,
   result = cublasSetWorkspace(handle->blas, handle->workspace, kMarkovWorkspace);
   if (result != CUBLAS_STATUS_SUCCESS) return blas_status(result);
   const float alpha = 1, beta = 0;
-  // Vocabulary logits follow the reference's FP32-promoted projection. The
-  // default BF16 tensor-op path exceeds its error bound on real head weights;
-  // require pedantic FP32 accumulation while retaining BF16 resident storage.
-  // `tensor_op` (cuteafd_vocabulary_head_launch_tensor_op) takes the tensor-op
-  // path at every width, for callers whose logits need not follow it.
+  // Without `tensor_op`, model-width heads (4096 and wider) run cuBLAS with
+  // pedantic FP32 accumulation (FP32 products and sums on CUDA cores): the
+  // target-head diagnostic `exact` (CUTEAFD_TARGET_HEAD=exact). `tensor_op`
+  // (cuteafd_vocabulary_head_launch_tensor_op), every family's default target
+  // head (rust shared::target_head), runs BF16 tensor cores with FP32
+  // accumulation. An earlier note that the tensor-op path exceeds its error
+  // bound on real head weights did not reproduce (2026-10-13, RTX PRO 6000,
+  // native/tests/target_head_selftest.py, 16 final-norm-shaped rows against an
+  // FP64 product of the same BF16 operands): DeepSeek V4 Flash head max
+  // |error| / max |logit| 5.1e-7 (pedantic 1.8e-7), V4.1 6.5e-7 (1.9e-7), every
+  // other family at most 6.9e-6; top-1 identical on every row, KL(FP64 ||
+  // tensor) at most 2.7e-11 nats.
   const bool pedantic = width >= 4096 && !tensor_op;
   const auto compute = pedantic ? CUBLAS_COMPUTE_32F_PEDANTIC : CUBLAS_COMPUTE_32F;
   const auto algorithm = pedantic ? CUBLAS_GEMM_DEFAULT : CUBLAS_GEMM_DEFAULT_TENSOR_OP;

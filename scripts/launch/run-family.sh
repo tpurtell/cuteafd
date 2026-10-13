@@ -1522,6 +1522,15 @@ served="$(get SERVED_MODEL_ID)"
 [[ -z "$served" ]] || served_args=(--model-id "$served")
 shared_probe_args
 shared_trace_args
+# TARGET_HEAD: every family's BF16 target vocabulary head (rust shared::target_head). Unset or
+# tensor (default) runs BF16 tensor cores with FP32 accumulation at every row count; exact is a
+# diagnostic (the pedantic FP32 GEMM on CUDA cores). FP8 heads run their own programs. Forwarded
+# only when set, so default launch lines are unchanged.
+case "$(get TARGET_HEAD)" in
+  "") ;;
+  tensor|exact) trace_args+=(-e "CUTEAFD_TARGET_HEAD=$(get TARGET_HEAD)") ;;
+  *) echo "TARGET_HEAD must be tensor or exact" >&2; exit 2 ;;
+esac
 # Qwen serving defaults to qualified startup graphs; preserve explicit overrides.
 if [[ $family == qwen4 ]]; then
   case "$(get QWEN_STARTUP_GRAPHS)" in
@@ -1730,12 +1739,10 @@ if [[ $family == glm5_flash ]]; then
     wide|w8a8) family_args+=(--draft-linear "$draft_linear") ;;
     *) echo "GLM5_FLASH_DRAFT_LINEAR must be w8a16, wide or w8a8" >&2; exit 2 ;;
   esac
-  # GLM5_FLASH_TARGET_HEAD: the target's logits through the BF16 head. auto (default) forwards
-  # nothing and the engine resolves it: tensor with the BF16 head (GLM5_FLASH_FP8_HEAD=off; steps of
-  # up to 8 rows on the pedantic FP32 GEMM, wider ones on BF16 tensor cores with FP32 accumulation,
-  # KL-gated against exact), not applicable with the FP8 head (its own program). exact
-  # (diagnostic) keeps the pedantic GEMM at every row count; an explicit tensor with the FP8 head
-  # is refused.
+  # GLM5_FLASH_TARGET_HEAD: GLM 5.3 Flash's own spelling of TARGET_HEAD (--target-head). auto
+  # (default) forwards nothing: the shared setting applies (tensor cores at every row count over the
+  # BF16 head; the FP8 head runs its own program). exact (diagnostic) keeps the pedantic GEMM; an
+  # explicit tensor with the FP8 head is refused.
   target_head="$(get GLM5_FLASH_TARGET_HEAD auto)"
   case "$target_head" in
     ""|auto) ;;

@@ -1830,8 +1830,10 @@ impl<'a> Engine<'a> {
         // SAFETY: input, weights and logits are live buffers of the head's
         // shape; the last `n` rows start `t - n` rows into `y`.
         unsafe {
-            w.head.as_ref().context("LM head")?.launch(w.y.buffer.ptr.cast::<u8>().add((t - n) * h * 2).cast(), self.weights.head.buffer.ptr.cast(),
-                w.vocab_logits.buffer.ptr.cast::<f32>().add(at * vocab), n as u32, self.stream)
+            crate::shared::target_head::launch(crate::shared::target_head::TargetHead::configured(),
+                w.head.as_ref().context("LM head")?, w.y.buffer.ptr.cast::<u8>().add((t - n) * h * 2).cast(),
+                self.weights.head.buffer.ptr.cast_const(), w.vocab_logits.buffer.ptr.cast::<f32>().add(at * vocab), n,
+                self.stream)
         }
     }
 }

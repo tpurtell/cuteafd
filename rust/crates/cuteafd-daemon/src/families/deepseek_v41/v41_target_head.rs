@@ -198,7 +198,7 @@ impl TargetHeadWave<'_, '_> {
                 1e-20,
                 self.stream.raw,
             )?;
-            crate::families::deepseek_v41::v41_tensors::project_vocabulary(self.stream.library, &self.projection,
+            crate::families::deepseek_v41::v41_tensors::project_target_vocabulary(self.stream.library, &self.projection,
                 self.head.weight(), self.head.fp8().zip(self.fp8_scratch.as_ref()), self.b(3), self.b(4), rows,
                 self.stream.raw)?;
             Ok(())

@@ -886,8 +886,8 @@ GLMF_TWO_LAYER = {"model_type": "glm5_next", "num_hidden_layers": 2, "mlp_layer_
 
 
 @pytest.mark.parametrize("keys,forwarded", [
-    # auto (unset) forwards nothing: the engine resolves tensor over the BF16 head and leaves the FP8 head's
-    # own program alone, so both default launch lines are unchanged.
+    # auto (unset) forwards nothing: the shared setting applies (tensor over the BF16 head; the FP8 head's
+    # own program otherwise), so both default launch lines are unchanged.
     ("", None), ("GLM5_FLASH_TARGET_HEAD=auto\n", None), ("GLM5_FLASH_FP8_HEAD=off\n", None),
     ("GLM5_FLASH_FP8_HEAD=off\nGLM5_FLASH_TARGET_HEAD=auto\n", None),
     # Explicit settings are forwarded; exact stays an explicit diagnostic.
@@ -928,6 +928,26 @@ def test_glmf_fp8_head_launch_is_identical_with_and_without_the_target_head_key(
 def test_glmf_target_head_rejects_bad_values_and_explicit_tensor_with_the_fp8_head(tmp_path, keys, message):
     result = _family_launch_result(tmp_path, GLMF_TWO_LAYER, "test/glmf", "GLM5_FLASH_FP8_MODEL_ID=off\n" + keys)
     assert result.returncode == 2 and message in result.stderr, result.stderr
+    assert not any(line.startswith(("docker ", "ssh ", "nest ")) for line in result.stderr.splitlines())
+
+
+@pytest.mark.parametrize("keys,forwarded", [("", None), ("TARGET_HEAD=tensor\n", "tensor"),
+                                           ("TARGET_HEAD=exact\n", "exact")])
+def test_target_head_key_is_forwarded_to_the_coordinator_only_when_set(tmp_path, keys, forwarded):
+    """TARGET_HEAD (every family's BF16 target head) reaches the coordinator as CUTEAFD_TARGET_HEAD only
+    when set: unset launch lines are unchanged and the engine's default (tensor) applies."""
+    result = _family_launch_result(tmp_path, GLMF_TWO_LAYER, "test/glmf",
+                                  "GLM5_FLASH_FP8_MODEL_ID=off\nRTX_GPUS=1\n" + keys)
+    assert result.returncode == 0, result.stderr
+    launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-glmf" in line)
+    assert ("CUTEAFD_TARGET_HEAD" in launch) == (forwarded is not None), launch
+    if forwarded:
+        assert f"CUTEAFD_TARGET_HEAD={forwarded}" in launch, launch
+
+
+def test_target_head_key_rejects_bad_values_before_launch(tmp_path):
+    result = _family_launch_result(tmp_path, GLMF_TWO_LAYER, "test/glmf", "GLM5_FLASH_FP8_MODEL_ID=off\nTARGET_HEAD=fp8\n")
+    assert result.returncode == 2 and "TARGET_HEAD must be tensor or exact" in result.stderr, result.stderr
     assert not any(line.startswith(("docker ", "ssh ", "nest ")) for line in result.stderr.splitlines())
 
 

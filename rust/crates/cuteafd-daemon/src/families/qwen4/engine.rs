@@ -2756,7 +2756,8 @@ impl<'a> Qwen4Engine<'a> {
         match &self.weights.head {
             // SAFETY: `x` holds `rows` head inputs; the head and the logits rows are live buffers of these shapes.
             Qwen4Head::Bf16(head) => unsafe {
-                w.head.launch(x.cast(), head.buffer.ptr.cast(), w.logits.buffer.ptr.cast(), rows as u32, self.execution_stream())
+                crate::shared::target_head::launch(crate::shared::target_head::TargetHead::configured(), &w.head,
+                    x.cast_const(), head.buffer.ptr.cast_const(), w.logits.buffer.ptr.cast(), rows, self.execution_stream())
             },
             Qwen4Head::Fp8 { values, scales } => {
                 for (first, n) in fp8_head_spans(rows) {

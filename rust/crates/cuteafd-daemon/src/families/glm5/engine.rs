@@ -1000,13 +1000,15 @@ impl<'a> GlmEngine<'a> {
         Ok(Some(self.device_logits(w, logit_rows, false)))
     }
 
-    /// Logits of the last `n` of `t` rows of the final norm's output into the workspace's logits.
+    /// Logits of the last `n` of `t` rows of the final norm's output into the workspace's logits,
+    /// through the shared BF16 target-head route ([`crate::shared::target_head`]).
     fn launch_head(&self, w: &Workspace<'_>, t: usize, n: usize) -> Result<()> {
         let h = self.cfg.hidden;
         // SAFETY: the final norm's output and the head operands are live buffers of these shapes.
         unsafe {
-            super::launch_head(self.library, w.head.as_ref().context("LM head")?, w.x.buffer.ptr.cast::<u8>().add((t - n) * h * 2).cast(),
-                self.weights.head.buffer.ptr, w.logits.buffer.ptr.cast(), n, h, self.cfg.vocab_size, self.stream)
+            crate::shared::target_head::launch(crate::shared::target_head::TargetHead::configured(),
+                w.head.as_ref().context("LM head")?, w.x.buffer.ptr.cast::<u8>().add((t - n) * h * 2).cast(),
+                self.weights.head.buffer.ptr.cast_const(), w.logits.buffer.ptr.cast(), n, self.stream)
         }
     }
 

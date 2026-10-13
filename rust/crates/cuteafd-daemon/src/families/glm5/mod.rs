@@ -495,9 +495,10 @@ impl Opened {
     }
 }
 
-/// Vocabulary head of `rows` rows: 2..=24 rows on the few-row FP32 kernel
-/// (one read of the head per 8 rows), others on the pedantic cuBLAS head;
-/// CUTEAFD_GLM_HEAD=cublas keeps every row count on cuBLAS.
+/// The drafters' exact vocabulary head (`--draft-head exact`) of `rows` rows: 2..=24 rows on the
+/// few-row FP32 kernel (one read of the head per 8 rows), others on the pedantic cuBLAS head;
+/// CUTEAFD_GLM_HEAD=cublas keeps every row count on cuBLAS. Target logits take
+/// [`crate::shared::target_head`] instead.
 ///
 /// # Safety
 /// `x` [rows, width] BF16, `weight` [vocab, width] BF16 and `logits` [rows,

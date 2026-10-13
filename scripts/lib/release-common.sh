@@ -641,6 +641,7 @@ release_known_key() {
     GLM5_FLASH_DRAFT_HEAD) return 0 ;;
     GLM5_FLASH_DRAFT_LINEAR) return 0 ;;
     GLM5_FLASH_TARGET_HEAD) return 0 ;;
+    TARGET_HEAD) return 0 ;;
     GLM5_FLASH_EXL3_SCHEDULE) return 0 ;;
     RDMA_BOND_BALANCE) return 0 ;;
     GLM5_FLASH_KDA_STATE) return 0 ;;
