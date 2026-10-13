@@ -16,6 +16,7 @@ mod shared {
     pub(crate) mod decode_graph;
     pub(crate) mod fp8_linear;
     pub(crate) mod memory;
+    pub(crate) mod target_head;
 }
 use families::deepseek_v41::{v41_attention_query, v41_hc, v41_tensors};
 use anyhow::{ensure, Result};
