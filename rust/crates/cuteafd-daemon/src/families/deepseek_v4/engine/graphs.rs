@@ -41,18 +41,19 @@ mod tests {
     use crate::shared::decode_graph::GraphPolicy;
 
     #[test]
-    fn startup_rows_cover_measured_c8_c16_lane_widths_without_padding() -> Result<()> {
-        let measured = [17, 18, 19, 20, 21, 22, 23, 26, 28, 31, 33];
+    fn startup_buckets_cover_every_eligible_lane_width_without_new_captures() -> Result<()> {
+        let measured = 1..=64;
         assert!(STARTUP_ROWS.windows(2).all(|rows| rows[0] < rows[1]));
-        assert_eq!(STARTUP_ROWS.len(), 33);
+        assert_eq!(STARTUP_ROWS.len(), 22);
         let mut bank = GraphBank::with_policy(GraphPolicy::FixedStartup);
         bank.warm(&STARTUP_ROWS, |&rows| Ok((rows, None)))?;
         for rows in measured {
-            let (decision, stored) = bank.enqueue(&rows);
+            let bucket = metadata::owner_row_bucket(rows);
+            let (decision, stored) = bank.enqueue(&bucket);
             assert_eq!(decision, GraphDecision::Replay);
-            assert_eq!(stored.copied(), Some(rows));
+            assert_eq!(stored.copied(), Some(bucket));
         }
-        for rows in [25, 27, 29, 30, 34, 63] {
+        for rows in [65, 80, 128] {
             assert_eq!(bank.enqueue(&rows).0, GraphDecision::Eager);
         }
         assert_eq!(bank.stats().captures, STARTUP_ROWS.len() as u64);
@@ -82,10 +83,8 @@ mod tests {
     }
 }
 
-// Exact rows preserve arithmetic routes. Add only lane widths observed in
-// C8/C16 census; unlisted widths and mixed C128 ranges remain eager.
-const STARTUP_ROWS: [usize; 33] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16,
-    17, 18, 19, 20, 21, 22, 23, 24, 26, 28, 31, 32, 33, 40, 48, 56, 64];
+// Fixed execution buckets preserve the registered projection crossovers.
+const STARTUP_ROWS: [usize; 22] = metadata::OWNER_ROWS;
 
 impl Engine<'_> {
     fn owner_key(&self, rank: usize, layer: usize, index: usize, tables: &StepTables,
@@ -127,9 +126,10 @@ impl Engine<'_> {
                 for weight in &draft.stages { bindings.extend(weight.graph_bindings()); }
             }
         }
-        if segment == Segment::Partial { bindings.extend(self.tp2_graph_bindings(rank, layer, tables.rows)?); }
+        let rows = self.owner_rows(tables, self.decode_rows);
+        if segment == Segment::Partial { bindings.extend(self.tp2_graph_bindings(rank, layer, rows)?); }
         Ok(OwnerKey { rank, device: if rank == 0 { self.device } else { self.peer()?.device },
-            stream: self.stream_of(rank) as usize, layer, lane: index, rows: tables.rows,
+            stream: self.stream_of(rank) as usize, layer, lane: index, rows,
             cap: self.decode_rows, chunked: segment == Segment::Front && tables.chunked,
             attention: if segment == Segment::Front { self.attention_kind(weights.ratio, tables) } else { "none" },
             width: if segment == Segment::Front { tables.c4_table_width } else { 0 },
@@ -200,6 +200,7 @@ impl Engine<'_> {
     }
 
     pub(super) fn warm_owner_graphs(&self) -> Result<()> {
+        metadata::check_owner_buckets()?;
         let binding = self.dev_layers.as_ref().context("owner startup")?;
         let w0 = self.decode_workspace.borrow();
         let w1 = self.peer()?.decode_workspace.borrow();

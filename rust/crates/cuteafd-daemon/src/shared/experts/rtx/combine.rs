@@ -62,6 +62,14 @@ impl<'a> FusedCombine<'a> {
         unsafe { self.kernels.partial(routed, shared, out, rows * hidden, self.exchange, stream) }
     }
 
+    /// V4 owner decode masks padded rows before either peer payload is read.
+    /// # Safety
+    /// Payloads cover the live rows, metadata/output cover the fixed execution grid.
+    pub(crate) unsafe fn dsv4_sum_masked(&self, rank0: *const c_void, rank1: *const c_void,
+        out: *mut u16, slots: *const i64, rows: usize, hidden: usize, stream: *mut c_void) -> Result<()> {
+        unsafe { self.kernels.dsv4_sum_masked(rank0, rank1, out, slots, rows, hidden, self.exchange, stream) }
+    }
+
     /// Both payloads summed in rank order into BF16 `out`.
     /// # Safety
     /// As [`RtxTp2Combine::sum`], on the current device.

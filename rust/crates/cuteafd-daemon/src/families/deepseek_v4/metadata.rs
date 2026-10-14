@@ -7,6 +7,23 @@ pub(crate) const SOURCE_PAGE_TOKENS: usize = 256;
 pub(crate) const MAIN_PAGE_BYTES: usize = 149_760;
 pub(crate) const INDEX_PAGE_BYTES: usize = 8_448;
 
+pub(crate) const OWNER_ROWS: [usize; 22] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16,
+    24, 32, 40, 48, 56, 64];
+
+pub(crate) fn check_owner_buckets() -> anyhow::Result<()> {
+    use crate::shared::decode_graph::{check_bucket_thresholds, ProjectionThreshold};
+    check_bucket_thresholds(&OWNER_ROWS, &[
+        ProjectionThreshold { name: "v4.compressor.c4", skinny_rows: 24 },
+        ProjectionThreshold { name: "v4.compressor.c128", skinny_rows: 64 },
+        ProjectionThreshold { name: "v4.router", skinny_rows: 32 },
+        ProjectionThreshold { name: "v4.projection", skinny_rows: 160 },
+    ])
+}
+
+pub(crate) fn owner_row_bucket(rows: usize) -> usize {
+    OWNER_ROWS.into_iter().find(|&bucket| bucket >= rows).unwrap_or(rows)
+}
+
 pub(crate) fn compressed_page_rows(ratio: usize) -> usize {
     SOURCE_PAGE_TOKENS / ratio
 }
@@ -131,6 +148,93 @@ impl StepTables {
         self.c4_table_width = width;
         self.c4_table_stride = width;
         Ok(())
+    }
+}
+
+/// Upload storage may include masked execution rows; canonical requests never do.
+pub(crate) struct StepUpload {
+    pub positions: Vec<i64>,
+    pub main_slots: Vec<i64>,
+    pub swa_indices: Vec<i32>,
+    pub swa_lengths: Vec<i32>,
+    pub c4_tables: Vec<(&'static str, Vec<i32>)>,
+    pub c128_tables: Vec<(&'static str, Vec<i32>)>,
+    pub c4_page_table: Vec<i32>,
+    pub c4_visible: Vec<i32>,
+    pub c4_indexed_lengths: Vec<i32>,
+    pub c128_indices: Vec<i32>,
+    pub c128_lengths: Vec<i32>,
+}
+
+impl StepTables {
+    pub(crate) fn upload(&self, rows: usize, sentinel: usize) -> anyhow::Result<StepUpload> {
+        anyhow::ensure!(self.rows > 0 && rows >= self.rows
+            && (rows == self.rows || (self.decode && rows <= 64)), "invalid execution upload extent");
+        let pad = |values: &[i32], width: usize, value: i32| -> anyhow::Result<Vec<i32>> {
+            anyhow::ensure!(values.len() == self.rows.checked_mul(width)
+                .ok_or_else(|| anyhow::anyhow!("upload row extent overflow"))?, "upload table shape mismatch");
+            let mut out = values.to_vec();
+            out.resize(rows.checked_mul(width).ok_or_else(|| anyhow::anyhow!("upload extent overflow"))?, value);
+            Ok(out)
+        };
+        let compressor = |entries: &[(&'static str, Vec<i32>)]| -> anyhow::Result<Vec<(&'static str, Vec<i32>)>> {
+            let mut out = entries.to_vec();
+            if rows == self.rows { return Ok(out); }
+            if !self.chunked {
+                for (name, values) in &mut out {
+                    anyhow::ensure!(values.len() == self.rows, "decode compressor table shape mismatch");
+                    values.resize(rows, if *name == "positions" { 0 } else { -1 });
+                }
+                return Ok(out);
+            }
+            let active = |name| -> anyhow::Result<usize> {
+                let values = entries.iter().find(|(field, _)| *field == name)
+                    .ok_or_else(|| anyhow::anyhow!("missing compressor {name}"))?;
+                anyhow::ensure!(values.1.len() == 1, "invalid compressor active count");
+                let count = usize::try_from(values.1[0])?;
+                anyhow::ensure!(count <= self.rows, "compressor active count exceeds real rows");
+                Ok(count)
+            };
+            let groups = active("active_groups")?;
+            let sequences = active("active_sequences")?;
+            for (name, values) in &mut out {
+                let (live, size, masked) = match *name {
+                    "active_groups" | "active_sequences" => continue,
+                    "group_sequence_slots" | "compressed_slots" => (groups, rows, -1),
+                    "group_source_positions" | "group_rope_positions" => (groups, rows, 0),
+                    "state_sequence_ids" => (sequences, rows, -1),
+                    "sequence_start_positions" => (sequences, rows, 0),
+                    "sequence_offsets" => (sequences + 1, rows + 1, i32::try_from(self.rows)?),
+                    _ => anyhow::bail!("unknown continuation compressor field {name}"),
+                };
+                anyhow::ensure!(values.len() >= live && values.len() <= size, "continuation upload shape mismatch");
+                values.resize(size, masked);
+                values[live..].fill(masked);
+            }
+            Ok(out)
+        };
+        anyhow::ensure!(self.positions.len() == self.rows && self.main_slots.len() == self.rows,
+            "producer metadata shape mismatch");
+        let mut positions = self.positions.clone();
+        let mut main_slots = self.main_slots.clone();
+        // RoPE always receives a valid position; only state destinations are negative.
+        positions.resize(rows, 0);
+        main_slots.resize(rows, -1);
+        anyhow::ensure!(self.c128_indices.len() % self.rows == 0, "C128 upload shape mismatch");
+        let c4_page_table = if self.decode { pad(&self.c4_page_table, self.c4_table_stride, i32::try_from(sentinel)?)? }
+            else { self.c4_page_table.clone() };
+        Ok(StepUpload {
+            positions, main_slots,
+            swa_indices: pad(&self.swa_indices, WINDOW, -1)?,
+            swa_lengths: pad(&self.swa_lengths, 1, 0)?,
+            c4_tables: compressor(&self.c4_tables)?,
+            c128_tables: compressor(&self.c128_tables)?,
+            c4_page_table,
+            c4_visible: pad(&self.c4_visible, 1, 0)?,
+            c4_indexed_lengths: pad(&self.c4_indexed_lengths, 1, 0)?,
+            c128_indices: pad(&self.c128_indices, self.c128_indices.len() / self.rows, -1)?,
+            c128_lengths: pad(&self.c128_lengths, 1, 0)?,
+        })
     }
 }
 
@@ -311,6 +415,95 @@ pub(crate) fn decode_step(
 mod tests {
     use super::super::pool::{PoolAllocator, PoolShape};
     use super::*;
+
+    #[test]
+    fn owner_buckets_preserve_projection_arithmetic_routes() -> anyhow::Result<()> {
+        use crate::shared::decode_graph::{check_bucket_thresholds, ProjectionThreshold};
+        let thresholds = [ProjectionThreshold { name: "v4.compressor.c4", skinny_rows: 24 },
+            ProjectionThreshold { name: "v4.compressor.c128", skinny_rows: 64 },
+            ProjectionThreshold { name: "v4.router", skinny_rows: 32 },
+            ProjectionThreshold { name: "v4.projection", skinny_rows: 160 }];
+        check_bucket_thresholds(&OWNER_ROWS, &thresholds)?;
+        assert_eq!(OWNER_ROWS.len(), 22);
+        for rows in 1..=64 {
+            let bucket = owner_row_bucket(rows);
+            assert!(bucket >= rows && OWNER_ROWS.contains(&bucket));
+            for threshold in thresholds { assert_eq!(rows <= threshold.skinny_rows, bucket <= threshold.skinny_rows); }
+        }
+        assert_eq!(owner_row_bucket(65), 65);
+        Ok(())
+    }
+
+    #[test]
+    fn bucket_upload_preserves_real_rows_and_masks_all_state_destinations() -> anyhow::Result<()> {
+        use super::super::pool::Placement;
+        let shape = PoolShape::new(64, 4096, 32);
+        let placements = (0..64).map(|state| Placement::new(state, vec![3, 7, 11]))
+            .collect::<Vec<_>>();
+        let ladder = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16,
+            24, 32, 40, 48, 56, 64];
+        for rows in 1usize..=64 {
+            let bucket = ladder.into_iter().find(|&width| width >= rows).unwrap();
+            for chunked in [false, true] {
+                let mut tables = if chunked {
+                    let first = rows.div_ceil(2);
+                    let mut requests = vec![(&placements[0], 253, first)];
+                    if first < rows { requests.push((&placements[1], 381, rows - first)); }
+                    verify_step(&requests, &shape, 512, 8)?
+                } else {
+                    decode_step(&placements[..rows].iter().enumerate()
+                        .map(|(row, p)| (p, 253 + row)).collect::<Vec<_>>(), &shape, 512, 8)?
+                };
+                tables.pad_c4(8, shape.units)?;
+                let before = tables.clone();
+                let upload = tables.upload(bucket, shape.units)?;
+                assert_eq!(tables.rows, rows);
+                assert_eq!(tables.positions, before.positions);
+                assert_eq!(tables.c4_tables, before.c4_tables);
+                assert_eq!(tables.c128_tables, before.c128_tables);
+                assert_eq!(tables.c128_lengths, before.c128_lengths);
+                assert_eq!(&upload.positions[..rows], tables.positions);
+                assert_eq!(&upload.main_slots[..rows], tables.main_slots);
+                assert!(upload.positions[rows..].iter().all(|&value| value == 0));
+                assert!(upload.main_slots[rows..].iter().all(|&value| value == -1));
+                for (real, padded, width, mask) in [
+                    (&tables.swa_indices, &upload.swa_indices, WINDOW, -1),
+                    (&tables.swa_lengths, &upload.swa_lengths, 1, 0),
+                    (&tables.c4_page_table, &upload.c4_page_table, 8, shape.units as i32),
+                    (&tables.c4_visible, &upload.c4_visible, 1, 0),
+                    (&tables.c4_indexed_lengths, &upload.c4_indexed_lengths, 1, 0),
+                    (&tables.c128_indices, &upload.c128_indices, 8, -1),
+                    (&tables.c128_lengths, &upload.c128_lengths, 1, 0),
+                ] {
+                    assert_eq!(&padded[..real.len()], real);
+                    assert_eq!(padded.len(), bucket * width);
+                    assert!(padded[real.len()..].iter().all(|&value| value == mask));
+                }
+                for (real, padded) in [(&tables.c4_tables, &upload.c4_tables), (&tables.c128_tables, &upload.c128_tables)] {
+                    let field = |entries: &Vec<(&str, Vec<i32>)>, name| entries.iter()
+                        .find(|(key, _)| *key == name).unwrap().1.clone();
+                    if !chunked {
+                        for ((name, values), (_, actual)) in real.iter().zip(padded) {
+                            assert_eq!(&actual[..rows], values);
+                            assert!(actual[rows..].iter().all(|&value| value == if *name == "positions" { 0 } else { -1 }));
+                        }
+                    } else {
+                        let groups = field(real, "active_groups")[0] as usize;
+                        let sequences = field(real, "active_sequences")[0] as usize;
+                        for name in ["active_groups", "active_sequences"] { assert_eq!(field(real, name), field(padded, name)); }
+                        for (name, live) in [("state_sequence_ids", sequences), ("group_sequence_slots", groups), ("compressed_slots", groups)] {
+                            let actual = field(padded, name);
+                            assert_eq!(&actual[..live], &field(real, name)[..live]);
+                            if bucket > rows { assert!(actual[live..].iter().all(|&value| value == -1)); }
+                        }
+                        assert_eq!(&field(padded, "sequence_offsets")[..=sequences], &field(real, "sequence_offsets")[..=sequences]);
+                    }
+                }
+                assert!(tables.upload(rows - 1, shape.units).is_err());
+            }
+        }
+        Ok(())
+    }
 
     #[test]
     fn fixed_c4_padding_uses_only_nonlive_sentinel_and_preserves_visibility() -> anyhow::Result<()> {

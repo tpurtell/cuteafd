@@ -101,6 +101,36 @@ def test_qwen_bucket_projection_registry_matches_pinned_fork():
     assert "pub const QWEN_SPEC_BUCKETS: &[usize] = &[2, 4, 8, 16, 24, 32, 64];" in graphs
 
 
+def test_v4_owner_bucket_registry_matches_pinned_projection_routes():
+    fork = ROOT / "third_party/sparkinfer/b12x"
+    source = (ROOT / "rust/crates/cuteafd-daemon/src/families/deepseek_v4/metadata.rs").read_text()
+    registry = dict((name, int(rows)) for name, rows in re.findall(
+        r'ProjectionThreshold \{ name: "([^"]+)", skinny_rows: (\d+) \}', source))
+    skinny = ast.parse((fork / "gemm/bf16_gemv/_skinny.py").read_text())
+    rule = next(node for node in skinny.body if isinstance(node, ast.FunctionDef) and node.name == "skinny_max_rows")
+    scope = {}
+    exec(compile(ast.Module(body=[rule], type_ignores=[]), "pinned V4 skinny rule", "exec"), scope)
+    ffn = ast.parse((fork / "integration/cuteafd/dsv4_ffn.py").read_text())
+    router = next(ast.literal_eval(node.value) for node in ffn.body if isinstance(node, ast.Assign)
+                  and any(isinstance(target, ast.Name) and target.id == "ROUTER_SKINNY_MAX_ROWS" for target in node.targets))
+    scalar_rule = scope["skinny_max_rows"]
+    for hidden in (4096, 7168):
+        assert registry == {
+            "v4.compressor.c4": scalar_rule(2560, hidden),
+            "v4.compressor.c128": scalar_rule(1024, hidden),
+            "v4.router": router,
+            "v4.projection": scalar_rule(64, hidden),
+        }
+    compressor = (fork / "integration/cuteafd/dsv4_compressor.py").read_text()
+    index = (fork / "integration/cuteafd/dsv4_producer.py").read_text()
+    assert "self.gemm = RoutedBf16Projection(self.w, self.h)" in compressor
+    assert "self.proj = RoutedBf16Projection(64, self.h)" in index
+    assert "if live_rows <= Int32(ROUTER_SKINNY_MAX_ROWS):" in (fork / "integration/cuteafd/dsv4_ffn.py").read_text()
+    graphs = (ROOT / "rust/crates/cuteafd-daemon/src/families/deepseek_v4/engine/graphs.rs").read_text()
+    assert "metadata::check_owner_buckets()?;" in graphs
+    assert "const STARTUP_ROWS: [usize; 22] = metadata::OWNER_ROWS;" in graphs
+
+
 def test_head72_uses_the_b12x_le128_tile():
     export = module("python/tools/aot/export_b12x_vision_attention_aot.py", "vision_export")
     assert export.tile_for_head_dim(64) == (128,128)

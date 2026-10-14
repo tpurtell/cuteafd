@@ -323,7 +323,7 @@ impl<'a> Engine<'a> {
         }
         let routes = Routes { ids: lane.route_ids.buffer.ptr, weights: lane.route_weights.buffer.ptr };
         self.owner_segment(rank, layer, index, tables, w, cap, super::graphs::Segment::Partial, std::ptr::null_mut(),
-            || self.tp2_compute(rank, layer, index, w, tables.rows, routes))?;
+            || self.tp2_compute(rank, layer, index, w, self.owner_rows(tables, cap), routes))?;
         if rank == 1 || layer + 1 < self.cfg.n_layers {
             self.record_peer(rank, "ffn", slot(layer, true, index), true, layer, index);
             self.exchange()?.push(rank, slot(layer, true, index), lane.payload.as_ref().context("owner payload")?.buffer.ptr,
@@ -365,7 +365,14 @@ impl<'a> Engine<'a> {
         self.on(rank, || {
             // SAFETY: the caller orders both payloads after their publication;
             // capture keeps the peer wait outside this device-only segment.
-            unsafe { self.combine(rows)?.sum(rank0, rank1, w.sum.buffer.ptr.cast(), rows, self.cfg.dim, self.stream_of(rank)) }
+            unsafe {
+                if self.owner_graph_mode() {
+                    self.combine(rows)?.dsv4_sum_masked(rank0, rank1, w.sum.buffer.ptr.cast(),
+                        lane.tables.main_slots.buffer.ptr.cast(), rows, self.cfg.dim, self.stream_of(rank))
+                } else {
+                    self.combine(rows)?.sum(rank0, rank1, w.sum.buffer.ptr.cast(), rows, self.cfg.dim, self.stream_of(rank))
+                }
+            }
         })?;
         self.run_on(rank, false, "mhc_post", &[
             ("x", w.sum.buffer.ptr), ("residual", lane.stream_b.buffer.ptr), ("prev_post", lane.post.buffer.ptr),
