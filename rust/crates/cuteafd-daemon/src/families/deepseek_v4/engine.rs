@@ -256,6 +256,16 @@ fn c4_units(shape: PoolShape, context: bool) -> usize {
     if context { shape.units / 2 + metadata::C4_SCRATCH_UNITS } else { shape.units }
 }
 
+pub(super) fn validate_peer_layer(mode: cuteafd_loader::placement::LayerMode,
+    ffn_split: bool, attention_split: bool) -> Result<()> {
+    let owned = matches!(mode, cuteafd_loader::placement::LayerMode::Whole { .. });
+    ensure!(ffn_split && attention_split != owned,
+        "rank-1 layer disagrees with its frozen attention/FFN mode");
+    ensure!(!owned || cfg!(feature = "dev-v4-layers"),
+        "owned V4 attention requires the dev-v4-layers Cargo feature");
+    Ok(())
+}
+
 fn cache_resident(modes: &[cuteafd_loader::placement::LayerMode], layer: usize, rank: usize) -> bool {
     use cuteafd_loader::placement::LayerMode;
     match modes.get(layer) {
@@ -430,11 +440,8 @@ impl<'a> Engine<'a> {
         ensure!(self.split_family.is_some() && layers.len() == self.cfg.n_layers,
             "attach_peer needs every backbone layer's rank-1 share");
         for (layer, weights) in layers.iter().enumerate() {
-            let owned = matches!(self.modes[layer], cuteafd_loader::placement::LayerMode::Whole { .. });
-            ensure!(weights.ffn_split && weights.attention_split != owned,
-                "rank-1 layer {layer} disagrees with its frozen attention/FFN mode");
-            ensure!(!owned || (cfg!(feature = "dev-v4-layers") && self.skip_routed),
-                "owned V4 attention is golden-dev-only");
+            validate_peer_layer(self.modes[layer], weights.ffn_split, weights.attention_split)
+                .with_context(|| format!("rank-1 layer {layer}"))?;
         }
         let slot_bytes = if parts.tp2 || self.exchange_policy == ExchangePolicy::F32 {
             self.exchange_policy.slot_bytes(self.prefill_rows, self.decode_rows, self.cfg.dim)

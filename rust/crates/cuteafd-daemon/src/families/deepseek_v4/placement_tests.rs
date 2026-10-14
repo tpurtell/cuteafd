@@ -40,6 +40,35 @@ fn serving_layers_requires_compile_time_feature_not_runtime_opt_in() {
     assert!(super::serving_dev_layers(&args).is_err(), "drafter binding not yet qualified");
 }
 
+#[test]
+fn owned_peer_attachment_allows_routed_and_skipped_experts_only_with_dev_feature() {
+    use cuteafd_loader::placement::{FfnMode, LayerMode};
+    let cli = Cli::try_parse_from(["serve", "--snapshot", "fixture", "--native-lib", "none"]).unwrap();
+    let mut args = cli.engine;
+    args.attention_placement = "layers".into();
+    args.split_device = Some(1);
+    for skip_routed in [false, true] {
+        args.skip_routed_experts = skip_routed;
+        assert_eq!(super::serving_dev_layers(&args).is_ok(), cfg!(feature = "dev-v4-layers"));
+        for gpu in [0, 1] {
+            let mode = LayerMode::Whole { gpu, ffn: FfnMode::Split };
+            assert_eq!(super::engine::validate_peer_layer(mode, true, false).is_ok(),
+                cfg!(feature = "dev-v4-layers"), "owner {gpu}, skip_routed {skip_routed}");
+            assert!(super::engine::validate_peer_layer(mode, true, true).is_err());
+            assert!(super::engine::validate_peer_layer(mode, false, false).is_err());
+        }
+        for mode in [LayerMode::HeadSplit, LayerMode::ContextSplit] {
+            assert!(super::engine::validate_peer_layer(mode, true, true).is_ok());
+            assert!(super::engine::validate_peer_layer(mode, true, false).is_err());
+        }
+    }
+    let source = include_str!("engine.rs");
+    let attachment = source.split("pub fn attach_peer(").nth(1).unwrap()
+        .split("fn selected_programs(").next().unwrap();
+    assert!(attachment.contains("validate_peer_layer(self.modes[layer], weights.ffn_split, weights.attention_split)"));
+    assert!(!attachment.contains("skip_routed"), "peer attachment must not require skipping routed experts");
+}
+
 #[derive(Parser)]
 struct Cli {
     #[command(flatten)]
