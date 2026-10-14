@@ -37,9 +37,9 @@ use cuteafd_core::DType;
 use cuteafd_ffi::{CuteafdDeviceBuffer, NativeLibrary};
 use cuteafd_loader::families::glm5_flash::{GlmNextAttention, GlmNextConfig};
 use cuteafd_loader::plan::checkpoint::{Checkpoint, CheckpointTensor};
+use cuteafd_loader::plan::ShardReader;
 use std::collections::HashMap;
 use std::ffi::c_void;
-use std::os::unix::fs::FileExt;
 
 pub(crate) const PREFIX: &str = "model.language_model.";
 
@@ -129,6 +129,9 @@ pub(crate) struct GlmfLoader<'a> {
     pub library: &'a NativeLibrary,
     pub checkpoint: &'a Checkpoint,
     pub stream: *mut c_void,
+    /// One open handle per shard, reused across tensors: the dense/lead read
+    /// would otherwise pay a FUSE metadata round trip per tensor.
+    pub reader: ShardReader,
     /// The official FP8 release: MLA/dense/shared weights (their only copies,
     /// 128x128 blocks) come from it when given, else from primary native FP8.
     pub fp8_source: Option<&'a Checkpoint>,
@@ -207,8 +210,7 @@ impl<'a> GlmfLoader<'a> {
     fn raw(&self, name: &str) -> Result<(Vec<u8>, DType, Vec<usize>)> {
         let tensor = self.tensor(name)?;
         let mut bytes = vec![0u8; tensor.meta.byte_length as usize];
-        std::fs::File::open(self.checkpoint.snapshot.join(&tensor.shard))?
-            .read_exact_at(&mut bytes, tensor.meta.byte_offset)
+        self.reader.read_exact_at(&self.checkpoint.snapshot.join(&tensor.shard), tensor.meta.byte_offset, &mut bytes)
             .with_context(|| format!("reading {name}"))?;
         Ok((bytes, tensor.meta.dtype.clone(), tensor.meta.shape.clone()))
     }
@@ -343,16 +345,14 @@ impl<'a> GlmfLoader<'a> {
                 ensure!(shape[1] == tensors[0].meta.shape[1] && (i + 1 == names.len() || shape[0] % 128 == 0),
                     "{names:?}: FP8 rows must share columns and fill whole 128-row blocks but the last");
                 let length = tensor.meta.byte_length as usize;
-                std::fs::File::open(checkpoint.snapshot.join(&tensor.shard))?
-                    .read_exact_at(&mut values[at..at + length], tensor.meta.byte_offset)
-                    .with_context(|| format!("reading {name}"))?;
+                self.reader.read_exact_at(&checkpoint.snapshot.join(&tensor.shard), tensor.meta.byte_offset,
+                    &mut values[at..at + length]).with_context(|| format!("reading {name}"))?;
                 at += length;
                 let scale = find(&format!("{name}_scale_inv"))?;
                 ensure!(scale.meta.dtype == DType::F32 && scale.meta.shape == [shape[0] / 128, shape[1].div_ceil(128)],
                     "{name}: expected FP32 128x128 block scales, found {:?} {:?}", scale.meta.dtype, scale.meta.shape);
                 let mut bytes = vec![0u8; scale.meta.byte_length as usize];
-                std::fs::File::open(checkpoint.snapshot.join(&scale.shard))?
-                    .read_exact_at(&mut bytes, scale.meta.byte_offset)?;
+                self.reader.read_exact_at(&checkpoint.snapshot.join(&scale.shard), scale.meta.byte_offset, &mut bytes)?;
                 grid.extend_from_slice(&bytes);
             }
             Ok(Some((self.upload(values)?, self.upload(&grid)?)))
@@ -380,8 +380,8 @@ impl<'a> GlmfLoader<'a> {
                         .map_err(|_| anyhow::anyhow!("FP8 checkpoint has no tensor {name}"))?;
                     let tensor = &checkpoint.tensors[at];
                     let mut bytes = vec![0u8; tensor.meta.byte_length as usize];
-                    std::fs::File::open(checkpoint.snapshot.join(&tensor.shard))?
-                        .read_exact_at(&mut bytes, tensor.meta.byte_offset)?;
+                    self.reader.read_exact_at(&checkpoint.snapshot.join(&tensor.shard), tensor.meta.byte_offset,
+                        &mut bytes)?;
                     Ok((bytes, tensor.meta.dtype.clone(), tensor.meta.shape.clone()))
                 }
                 None => self.raw(name),
@@ -657,15 +657,15 @@ impl<'a> GlmfLoader<'a> {
 
     /// The selected source's 2-D `name` as E4M3 blocks, quantized from BF16
     /// when necessary: values, FP32 scale grid, rows, cols.
-    fn fp8_block_host(checkpoint: &Checkpoint, name: &str, scales: crate::shared::fp8_linear::Fp8Scales)
-        -> Result<(Vec<u8>, Vec<u8>, usize, usize)> {
+    fn fp8_block_host(reader: &ShardReader, checkpoint: &Checkpoint, name: &str,
+        scales: crate::shared::fp8_linear::Fp8Scales) -> Result<(Vec<u8>, Vec<u8>, usize, usize)> {
         let read = |name: &str| -> Result<(Vec<u8>, DType, Vec<usize>)> {
             let at = checkpoint.tensors.binary_search_by(|t| t.meta.name.as_str().cmp(name))
                 .map_err(|_| anyhow::anyhow!("FP8 checkpoint has no tensor {name}"))?;
             let tensor = &checkpoint.tensors[at];
             let mut bytes = vec![0u8; tensor.meta.byte_length as usize];
-            std::fs::File::open(checkpoint.snapshot.join(&tensor.shard))?
-                .read_exact_at(&mut bytes, tensor.meta.byte_offset).with_context(|| format!("reading {name}"))?;
+            reader.read_exact_at(&checkpoint.snapshot.join(&tensor.shard), tensor.meta.byte_offset, &mut bytes)
+                .with_context(|| format!("reading {name}"))?;
             Ok((bytes, tensor.meta.dtype.clone(), tensor.meta.shape.clone()))
         };
         let (values, dtype, shape) = read(name)?;
@@ -694,8 +694,8 @@ impl<'a> GlmfLoader<'a> {
         ensure!(axis == Axis::Rows || names.len() == 1, "{names:?}: concatenated weights split by rows");
         let (mut values, mut grids) = (vec![Vec::new(); ranks], vec![Vec::new(); ranks]);
         for name in names {
-            let (v, g, rows, cols) = Self::fp8_block_host(self.fp8_source.unwrap_or(self.checkpoint), name,
-                self.fp8_scales)?;
+            let (v, g, rows, cols) = Self::fp8_block_host(&self.reader, self.fp8_source.unwrap_or(self.checkpoint),
+                name, self.fp8_scales)?;
             let along = if axis == Axis::Rows { rows } else { cols };
             ensure!(along % (128 * ranks) == 0, "{name}: [{rows}, {cols}] does not split into whole 128 blocks over \
                 {ranks} GPUs");
@@ -893,8 +893,8 @@ mod tests {
             tensors: vec![CheckpointTensor { shard: "weights.bin".into(), meta: SafetensorsTensorMetadata {
                 name: "projection.weight".into(), dtype: cuteafd_core::DType::Bf16, shape: vec![256, 256],
                 byte_offset: 0, byte_length: bytes.len() as u64 } }] };
-        let (values, grid, rows, cols) = super::GlmfLoader::fp8_block_host(&checkpoint, "projection.weight",
-            crate::shared::fp8_linear::Fp8Scales::Amax).unwrap();
+        let (values, grid, rows, cols) = super::GlmfLoader::fp8_block_host(&cuteafd_loader::plan::ShardReader::new(),
+            &checkpoint, "projection.weight", crate::shared::fp8_linear::Fp8Scales::Amax).unwrap();
         assert_eq!((rows, cols), (256, 256));
         assert_eq!(values, vec![0x7e; 256 * 256]);
         let grid: Vec<f32> = grid.chunks_exact(4)
