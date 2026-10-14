@@ -280,7 +280,7 @@ impl<'a> Engine<'a> {
                 // this GPU's pool, the peer's into its scratch rows.
                 e.attention_produce(rank, self.layer, self.weights, self.lane, w, self.rows, self.cap)?;
                 let cache = e.cache_on(rank, self.layer)?;
-                e.compress_records(rank, self.layer, self.weights, cache, None, self.tables, &self.lane.tables, w,
+                e.compress_records(rank, self.layer, self.weights, cache, None, self.tables, self.lane, w,
                     e.attention_rope(rank, 4), self.rows, self.cap)?;
                 Ok(Query { values: w.query.buffer.ptr, row_pitch: e.cfg.n_heads / 2 * 512 * 2 })
             }
@@ -288,7 +288,7 @@ impl<'a> Engine<'a> {
                 let (e, w, rank) = (self.engine, self.w, self.rank);
                 if self.tables.c4_groups == 0 { return Ok(None); }
                 let m = &self.lane.tables;
-                e.index_produce(rank, self.weights, m, w, e.attention_rope(rank, 4), self.rows, self.cap)?;
+                e.index_produce(rank, self.weights, self.lane, w, e.attention_rope(rank, 4), self.rows, self.cap)?;
                 let own = &e.context()?.ranks[rank];
                 let k = e.cfg.index_topk;
                 let indices = view(&own.candidates, e.decode_rows * k * 4, self.t * k * 4)?.ptr;
@@ -381,7 +381,7 @@ impl<'a> Engine<'a> {
         let cache = self.cache_on(rank, layer)?;
         let rope = self.attention_rope(rank, 4);
         let (_, indexed_cache, indexed_indices, indexed_lengths) = self.compress(rank, layer, weights, cache,
-            Some((records.ptr, keys.ptr)), tables, &lane.tables, w, rope, rows, cap)?;
+            Some((records.ptr, keys.ptr)), tables, lane, w, rope, rows, cap)?;
         self.attention_sparse(rank, weights, tables, lane, w, rows, cap, cache.main.buffer.ptr, indexed_cache,
             indexed_indices, indexed_lengths)?;
         self.attention_project(rank, weights, lane, w, rows, cap)?;

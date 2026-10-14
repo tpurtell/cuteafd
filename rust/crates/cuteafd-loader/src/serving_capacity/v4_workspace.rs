@@ -223,6 +223,10 @@ fn step(
         .checked_add(2)
         .ok_or(CacheGeometryError::Overflow("V4 metadata rows"))?;
     let lane_allocations = [
+        mul(&[rows, h, 2])?, // FFN hidden rows retained through this lane's close.
+        mul(&[rows, topk, 4])?,
+        mul(&[rows, topk, 4])?,
+        mul(&[rows, h + h / 32])?,
         mul(&[rows, 4, h, 2])?,
         mul(&[rows, 4, h, 2])?,
         mul(&[rows, 4, 4])?,
@@ -253,7 +257,6 @@ fn step(
         ],
     )?;
     let fixed_allocations = [
-        mul(&[rows, h, 2])?,
         mul(&[rows, heads, 512, 2])?,
         mul(&[rows, cfg.q_lora_rank as u64, 2])?,
         mul(&[rows, heads, 512, 2])?,
@@ -263,9 +266,6 @@ fn step(
         mul(&[rows, cfg.index_topk as u64, 4])?,
         scratch.index_topk_bytes,
         mul(&[rows, cfg.n_routed_experts as u64, 4])?,
-        mul(&[rows, topk, 4])?,
-        mul(&[rows, topk, 4])?,
-        mul(&[rows, h + h / 32])?,
         scratch.shared_bytes,
         4096,
         lead(mul(&[rows.min(64), cfg.vocab_size as u64, 4])?),
@@ -366,8 +366,9 @@ mod tests {
         };
         let flash =
             deepseek_v4_workspace_geometry(&config(false), 4096, 64, 131072, 2, scratch).unwrap();
-        assert_eq!(flash[0].device_bytes(1032).unwrap(), 3_711_427_504);
-        assert_eq!(flash[1].device_bytes(1032).unwrap(), 3_364_218_800);
+        let retained = |hidden: u64| 4096 * (2 * hidden + 6 * 8 + hidden + hidden / 32);
+        assert_eq!(flash[0].device_bytes(1032).unwrap(), 3_711_427_504 + retained(4096));
+        assert_eq!(flash[1].device_bytes(1032).unwrap(), 3_364_218_800 + retained(4096));
         assert_eq!(flash[0].pool_unit_device_bytes, (4096 * 2 + 64) * 4);
         let pro = deepseek_v4_workspace_geometry(
             &config(true),
@@ -381,8 +382,8 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(pro[0].device_bytes(1032).unwrap(), 4_940_200_880);
-        assert_eq!(pro[1].device_bytes(1032).unwrap(), 4_320_362_416);
+        assert_eq!(pro[0].device_bytes(1032).unwrap(), 4_940_200_880 + retained(7168));
+        assert_eq!(pro[1].device_bytes(1032).unwrap(), 4_320_362_416 + retained(7168));
         assert_eq!(
             pro[0].device_bytes(1033).unwrap() - pro[0].device_bytes(1032).unwrap(),
             pro[0].pool_unit_device_bytes
@@ -394,6 +395,34 @@ mod tests {
             tiny.device_bytes(1).unwrap() - tiny.fixed_device_bytes,
             3 * 256
         );
+    }
+
+    #[test]
+    fn retained_ffn_operands_have_exact_lane_slopes_and_allocation_floors() {
+        for pro in [false, true] {
+            let cfg = config(pro);
+            for rows in [1, 16, 64, 4096] {
+                for ranks in [1, 2] {
+                    for rank in 0..ranks {
+                        let one = step(&cfg, rows, 1, 8192, rank, ranks, V4WorkspaceScratch::default()).unwrap();
+                        let two = step(&cfg, rows, 2, 8192, rank, ranks, V4WorkspaceScratch::default()).unwrap();
+                        let h = cfg.dim as u64;
+                        let retained: u64 = [rows * h * 2, rows * cfg.n_activated_experts as u64 * 4,
+                            rows * cfg.n_activated_experts as u64 * 4, rows * (h + h / 32)]
+                            .into_iter().map(|bytes| bytes.max(256)).sum();
+                        let lane = [rows * 4 * h * 2, rows * 4 * h * 2, rows * 4 * 4,
+                            rows * 16 * 4, rows * 4, rows * h * 2, 0, rows * 8,
+                            rows * 8, rows * 128 * 4, rows * 8192 * 4]
+                            .into_iter().map(|bytes| bytes.max(256)).sum::<u64>()
+                            + if ranks == 2 { (rows * h * 4).max(256) } else { 0 }
+                            + 18 * ((rows + 2) * 4).max(256) + 4 * (rows * 4).max(256);
+                        assert_eq!(two.0 - one.0, lane + retained);
+                        assert_eq!(two.1 - one.1, rows * 4);
+                        assert_eq!(two.2, one.2, "router staging is consumed before another unit");
+                    }
+                }
+            }
+        }
     }
 
     #[test]
