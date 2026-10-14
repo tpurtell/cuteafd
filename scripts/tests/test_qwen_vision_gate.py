@@ -64,8 +64,8 @@ def test_qwen_bucket_projection_registry_matches_pinned_fork():
     init = next(n for n in projection_class.body if isinstance(n, ast.FunctionDef) and n.name == "__init__")
     defaults = {arg.arg: ast.literal_eval(default) for arg, default in zip(init.args.kwonlyargs, init.args.kw_defaults)
                 if arg.arg in ("gemv_rows", "wide_rows")}
-    assert defaults["gemv_rows"] == rust("FP8_PROJECTION_SKINNY_ROWS")
-    assert defaults["wide_rows"] == 0
+    assert defaults["gemv_rows"] == 16
+    assert defaults["wide_rows"] == rust("FP8_PROJECTION_SKINNY_ROWS")
     for filename, contracts in {
         "qwen4_gdn.py": ("self.in_proj = projection(p, g.hidden, self.fp8)", "self.o_proj = projection(g.hidden, v, self.fp8)"),
         "qwen4_attention.py": ("self.proj = projection(g.attn_in_width, g.hidden, self.fp8)",

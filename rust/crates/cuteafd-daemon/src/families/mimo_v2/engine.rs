@@ -175,9 +175,9 @@ pub(super) fn attention_workspace_geometry(rank: usize, ranks: usize, decode: bo
 pub(crate) const FP8_ROWS: i32 = 16;
 
 /// Most rows a decode program reads the E4M3 qkv / o / dense FFN copies for
-/// (sparkinfer `MIMO_FP8_ROWS`: one 16-row GEMV tile up to 16 rows, two above),
-/// so DFlash verify steps of up to 32 rows stay off the BF16 projections.
-pub(crate) const FP8_DECODE_ROWS: i32 = 32;
+/// (sparkinfer `MIMO_FP8_ROWS`: 1/2/4 16-row GEMV tiles up to 64 rows),
+/// so DFlash verify steps up to 64 rows stay off the BF16 projections.
+pub(crate) const FP8_DECODE_ROWS: i32 = 64;
 
 /// Most rows of one sequence an MTP drafting pass takes (older true rows
 /// catch up in passes of their own first).

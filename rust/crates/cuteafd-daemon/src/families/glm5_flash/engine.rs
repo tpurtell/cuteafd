@@ -85,7 +85,7 @@ const PREFILL_CAP: &str = "m4096";
 /// Selected-slot row width of the sparse MLA programs (2048 + 3, padded to 64).
 pub(crate) const SPARSE_TOPK: usize = 2112;
 /// Most decode rows the FP8 GEMVs take (the programs' FP8_ROWS).
-const FP8_ROWS: i32 = 16;
+const FP8_ROWS: i32 = 64;
 /// FP8 latent record bytes (512 E4M3 + 4 FP32 group scales).
 pub(crate) const RECORD_BYTES: usize = 528;
 
@@ -1412,13 +1412,13 @@ const DECODE_PROJECTION_THRESHOLDS: &[ProjectionThreshold] = &[
     ProjectionThreshold { name: "index.ik[288,4096].bf16", skinny_rows: 0 },
     ProjectionThreshold { name: "kda.in[24896|12576,4096].bf16", skinny_rows: 0 },
     ProjectionThreshold { name: "kda.out[4096,8192|4096].bf16", skinny_rows: 0 },
-    ProjectionThreshold { name: "kda.in.out.fp8", skinny_rows: 16 },
-    ProjectionThreshold { name: "kda.half.in.out.fp8.wide", skinny_rows: 32 },
-    ProjectionThreshold { name: "mla.qkv_a[2048,4096].fp8", skinny_rows: 16 },
-    ProjectionThreshold { name: "mla.q_b[16384|8192,1536].fp8", skinny_rows: 16 },
-    ProjectionThreshold { name: "mla.out[4096,16384|8192].fp8", skinny_rows: 16 },
-    ProjectionThreshold { name: "dense.gate_up[24576|12288,4096].fp8", skinny_rows: 16 },
-    ProjectionThreshold { name: "dense.down[4096,12288|6144].fp8", skinny_rows: 16 },
+    ProjectionThreshold { name: "kda.in.out.fp8", skinny_rows: DECODE_ROWS },
+    ProjectionThreshold { name: "kda.half.in.out.fp8.wide", skinny_rows: DECODE_ROWS },
+    ProjectionThreshold { name: "mla.qkv_a[2048,4096].fp8", skinny_rows: DECODE_ROWS },
+    ProjectionThreshold { name: "mla.q_b[16384|8192,1536].fp8", skinny_rows: DECODE_ROWS },
+    ProjectionThreshold { name: "mla.out[4096,16384|8192].fp8", skinny_rows: DECODE_ROWS },
+    ProjectionThreshold { name: "dense.gate_up[24576|12288,4096].fp8", skinny_rows: DECODE_ROWS },
+    ProjectionThreshold { name: "dense.down[4096,12288|6144].fp8", skinny_rows: DECODE_ROWS },
 ];
 
 // `--decode-rows 128`: a step of 65 to 128 rows runs the `_m128` programs. They keep the `_m64`
@@ -4189,7 +4189,7 @@ impl<'a> GlmfEngine<'a> {
             ("w_o_fp8", layer.ptr("w_o_fp8")?), ("w_o_kscale", layer.ptr("w_o_kscale")?), ("conv_state", conv_state),
             ("state", state), ("slots", slots), ("seq_first", seq_first), ("out", out)];
         let mut scalars = vec![rows, Scalar::I32(if decode {
-            if layer.split { 32 } else { FP8_ROWS }
+            replay_rows_of(cap) as i32
         } else { self.fp8_prefill.kda_bits })];
         if decode {
             pointers.push(("replay", replay));
@@ -5268,10 +5268,10 @@ mod prefill_lane_tests {
         // Any exporter change requires re-auditing shapes and arithmetic routes.
         for (path, expected) in [
             // 0a27858b opts W8/S16 decode into canonical W8A16; mixed defaults stay unchanged.
-            ("integration/cuteafd/glmf.py", 0x6a8b_4bde_c8ae_1ce0_u64),
+            ("integration/cuteafd/glmf.py", 0xe09b_6e76_c028_f691_u64),
             // b729115b uses canonical BF16 MMA at every positive row count.
             ("integration/cuteafd/_glm_kernels.py", 0x8b85_3785_9223_9a99),
-            ("integration/cuteafd/_fp8_weights.py", 0x9f8c_fcd2_54c6_4033),
+            ("integration/cuteafd/_fp8_weights.py", 0xa2c8_96b5_e1b4_4105),
             // 5dcdd837 opts decode mHC into partial-group fusion; projection thresholds and arithmetic stay unchanged.
             ("integration/cuteafd/dsv4_mhc.py", 0x978a_179d_ef8c_2101),
             // b629baef adds Qwen4Geometry::kv_record_bytes only; GLM projection routes are unchanged.
@@ -5286,7 +5286,7 @@ mod prefill_lane_tests {
             assert_eq!(hash, expected, "re-audit GLM decode projection thresholds after {path} source drift");
         }
         assert_eq!(super::DECODE_PROJECTION_THRESHOLDS.iter().map(|p| p.skinny_rows).collect::<Vec<_>>(),
-            [0, 0, 0, 0, 16, 32, 16, 16, 16, 16, 16]);
+            [0, 0, 0, 0, 64, 64, 64, 64, 64, 64, 64]);
         // The 64-row sets, and with the wide programs the speculative set ending at the verify budget (127 on
         // 170 SMs, 128 on 188, 99 on 132), pass at every serving width; the `_m128` programs add only
         // their capacity (`WIDE_DECODE_THRESHOLDS`).
@@ -5301,21 +5301,18 @@ mod prefill_lane_tests {
                 super::check_decode_thresholds(&buckets, sequences, true).unwrap();
             }
         }
-        // BF16 no longer crosses arithmetic routes at M8/M9; FP8 M16/M17 and M32/M33 still do.
-        super::check_bucket_thresholds(&[1, 4, 16], super::DECODE_PROJECTION_THRESHOLDS).unwrap();
-        let error = super::check_bucket_thresholds(&[1, 4, 8, 32], super::DECODE_PROJECTION_THRESHOLDS)
+        // BF16 and FP8 decode projections stay on one canonical reduction order across M1..=64.
+        super::check_bucket_thresholds(&[1, 4, 8, 16, 32, 64], super::DECODE_PROJECTION_THRESHOLDS).unwrap();
+        let error = super::check_bucket_thresholds(&[1, 4, 8, 32, 72], super::DECODE_PROJECTION_THRESHOLDS)
             .unwrap_err().to_string();
         assert!(error.contains("kda.in.out.fp8"), "{error}");
-        let error = super::check_bucket_thresholds(&[1, 4, 8, 16, 64], super::DECODE_PROJECTION_THRESHOLDS)
-            .unwrap_err().to_string();
-        assert!(error.contains("kda.half.in.out.fp8.wide"), "{error}");
         // A set that pads a step of up to 64 rows into the `_m128` programs is refused.
         let error = super::check_bucket_thresholds(&[32, 72], super::WIDE_DECODE_THRESHOLDS).unwrap_err().to_string();
         assert!(error.contains("m64|m128"), "{error}");
         let crossing = super::DecodeBuckets { plain: super::PLAIN_DECODE_BUCKETS.to_vec(),
             spec: vec![2, 4, 8, 16, 32, 72, 127] };
         let error = super::check_decode_thresholds(&crossing, 16, true).unwrap_err().to_string();
-        assert!(error.contains("m64|m128"), "{error}");
+        assert!(error.contains("kda.in.out.fp8") || error.contains("m64|m128"), "{error}");
     }
 
     #[test]

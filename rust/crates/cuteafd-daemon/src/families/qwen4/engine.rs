@@ -52,7 +52,7 @@ const GLM_BF16_SKINNY_ROWS: usize = 0;
 const QWEN_WIDE_SKINNY_ROWS: usize = 24;
 const QWEN_MEDIUM_SKINNY_ROWS: usize = 64;
 const QWEN_SMALL_SKINNY_ROWS: usize = 160;
-const FP8_PROJECTION_SKINNY_ROWS: usize = 16;
+const FP8_PROJECTION_SKINNY_ROWS: usize = 64;
 const DECODE_PROJECTION_THRESHOLDS: &[ProjectionThreshold] = &[
     ProjectionThreshold { name: "gdn.in_projection.bf16", skinny_rows: GLM_BF16_SKINNY_ROWS },
     ProjectionThreshold { name: "gdn.out_projection.bf16", skinny_rows: GLM_BF16_SKINNY_ROWS },
