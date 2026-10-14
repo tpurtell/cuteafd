@@ -103,6 +103,37 @@ pub(crate) struct C4Shard {
     pub c4_visible: Vec<i32>,
 }
 
+/// Fixed decode extent is a per-request limit, never the aggregate pool size.
+pub(crate) fn c4_fixed_width(max_context: usize, units: usize, export_pages: usize) -> anyhow::Result<usize> {
+    let width = max_context.div_ceil(SOURCE_PAGE_TOKENS).min(units).min(export_pages);
+    anyhow::ensure!(width > 0, "empty C4 graph table extent");
+    Ok(width)
+}
+
+impl StepTables {
+    /// Only visible logical pages survive; every masked entry names immutable
+    /// storage outside RefPagePool, not the last real page of another request.
+    pub(crate) fn pad_c4(&mut self, width: usize, sentinel: usize) -> anyhow::Result<()> {
+        anyhow::ensure!(self.decode && width > 0 && self.c4_table_stride > 0, "invalid C4 fixed table");
+        anyhow::ensure!(self.c4_page_table.len() == self.rows * self.c4_table_stride
+            && self.c4_visible.len() == self.rows, "C4 table shape mismatch");
+        let sentinel = i32::try_from(sentinel)?;
+        let mut padded = vec![sentinel; self.rows.checked_mul(width).ok_or_else(|| anyhow::anyhow!("C4 table overflow"))?];
+        for (row, &visible) in self.c4_visible.iter().enumerate() {
+            anyhow::ensure!(visible >= 0, "negative C4 visibility");
+            let pages = (visible as usize).div_ceil(compressed_page_rows(4));
+            anyhow::ensure!(pages <= width && pages <= self.c4_table_stride, "C4 request exceeds fixed extent");
+            let source = &self.c4_page_table[row * self.c4_table_stride..][..pages];
+            anyhow::ensure!(source.iter().all(|&page| page >= 0 && page < sentinel), "C4 visible page aliases sentinel");
+            padded[row * width..][..pages].copy_from_slice(source);
+        }
+        self.c4_page_table = padded;
+        self.c4_table_width = width;
+        self.c4_table_stride = width;
+        Ok(())
+    }
+}
+
 impl C4Shard {
     fn of(tables: &StepTables) -> Self {
         Self { c4_tables: tables.c4_tables.clone(), c4_page_table: Vec::new(), c4_table_width: tables.c4_table_width,
@@ -280,6 +311,33 @@ pub(crate) fn decode_step(
 mod tests {
     use super::super::pool::{PoolAllocator, PoolShape};
     use super::*;
+
+    #[test]
+    fn fixed_c4_padding_uses_only_nonlive_sentinel_and_preserves_visibility() -> anyhow::Result<()> {
+        use super::super::pool::{Placement, PoolShape};
+        let shape = PoolShape::new(4, 256, 16);
+        let a = Placement::new(0, vec![3, 9, 12]);
+        let b = Placement::new(1, vec![5, 11]);
+        let mut tables = decode_step(&[(&a, 512), (&b, 0)], &shape, 512, 16)?;
+        let visible = tables.c4_visible.clone();
+        let metadata = tables.c4_tables.clone();
+        tables.pad_c4(8, shape.units)?;
+        assert_eq!(tables.c4_visible, visible);
+        assert_eq!(tables.c4_tables, metadata);
+        assert_eq!((tables.c4_table_width, tables.c4_table_stride), (8, 8));
+        assert_eq!(&tables.c4_page_table[..8], &[3, 9, 16, 16, 16, 16, 16, 16]);
+        assert_eq!(&tables.c4_page_table[8..], &[16; 8]);
+        assert!(tables.c4_page_table.iter().all(|&page| page == 16 || page == 3 || page == 9));
+        let mut overflow = decode_step(&[(&a, 512)], &shape, 512, 16)?;
+        assert!(overflow.pad_c4(1, shape.units).is_err());
+        let mut alias = decode_step(&[(&a, 512)], &shape, 512, 16)?;
+        assert!(alias.pad_c4(8, 9).is_err());
+        assert_eq!(c4_fixed_width(1 << 20, 8208, 4096)?, 4096);
+        assert_eq!(c4_fixed_width(1 << 20, 16, 4096)?, 16);
+        assert_eq!(c4_fixed_width(1024, 8208, 4096)?, 4);
+        assert!(c4_fixed_width(1024, 0, 4096).is_err());
+        Ok(())
+    }
 
     #[test]
     fn c4_context_planar_commits_cover_owned_pages_byte_exactly() -> anyhow::Result<()> {

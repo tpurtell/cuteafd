@@ -22,6 +22,8 @@ pub const PREFILL_LANES: u64 = 2;
 /// smoke run). Reserved as growth beside the pool, never part of the ready
 /// ledger (`inventory::GraphSet::budget`).
 pub const GRAPH_BYTES: [u64; 3] = [gib(35), gib(40), gib(25)];
+/// One immutable compressed page and matching index page, outside the live pool.
+pub const C4_SENTINEL_BYTES: u64 = 37_440 + 8_448;
 /// Step workspace allowance per role at 4096 prefill rows, used only when no
 /// program manifest gives the exact geometry.
 pub const WORKSPACE_BYTES: [u64; 3] = [gib(480), gib(414), gib(355)];
@@ -372,7 +374,13 @@ pub fn bind_owned_attention(request: &mut PlacementRequest, cfg: &DeepseekV4Conf
     request.executor = ExecutorModes { modes: &MODES, hops: true, ..request.executor };
     request.policy.ownership = LayerOwnership::NonemptyRanges;
     for (layer, &ratio) in request.layers.iter_mut().zip(&cfg.compress_ratios) {
-        if ratio == 4 { layer.modes = MODES.to_vec(); }
+        if ratio == 4 {
+            layer.modes = MODES.to_vec();
+            if !layer.extra.iter().any(|extra| extra.group == "C4 sentinel") {
+                layer.extra.push(LayerExtraDemand::new(Category::Kv, "C4 sentinel", C4_SENTINEL_BYTES,
+                    LayerResidency::Owner, Basis::Formula));
+            }
+        }
     }
 }
 
@@ -492,6 +500,7 @@ mod default_tests {
                                 assert_eq!(bytes(&heads, rank, Category::Kv, "state"),
                                     cache.active_state_per_sequence_bytes * sequences + tables);
                                 assert_eq!(bytes(&heads, rank, Category::Prefix, "marks"), cache.retained_mark_bytes * slots);
+                                assert_eq!(bytes(&heads, rank, Category::Kv, "C4 sentinel"), 0);
                             }
                             assert!(req.layers.iter().zip(&cfg.compress_ratios)
                                 .all(|(layer, &ratio)| (ratio == 4) == !layer.extra.is_empty()));
@@ -499,7 +508,8 @@ mod default_tests {
                             let context = solve(&request(&V4Inputs { attention: Some(AttentionPlacement::Context),
                                 ..inputs }).unwrap()).unwrap();
                             for rank in 0..2 {
-                                for (category, group) in [(Category::Kv, "state"), (Category::Prefix, "marks")] {
+                                for (category, group) in [(Category::Kv, "state"), (Category::Prefix, "marks"),
+                                    (Category::Kv, "C4 sentinel")] {
                                     assert_eq!(bytes(&context, rank, category, group), bytes(&heads, rank, category, group));
                                 }
                             }
@@ -513,7 +523,11 @@ mod default_tests {
                             owned.executor = ExecutorModes { modes: &WHOLE, hops: true, ..owned.executor };
                             owned.policy.ownership = LayerOwnership::NonemptyRanges;
                             for (layer, &ratio) in owned.layers.iter_mut().zip(&cfg.compress_ratios) {
-                                if ratio == 4 { layer.modes = WHOLE.to_vec(); }
+                                if ratio == 4 {
+                                    layer.modes = WHOLE.to_vec();
+                                    layer.extra.push(LayerExtraDemand::new(Category::Kv, "C4 sentinel", C4_SENTINEL_BYTES,
+                                        LayerResidency::Owner, Basis::Formula));
+                                }
                             }
                             let placed = solve(&owned).unwrap();
                             let (active, mark) = crate::serving_capacity::deepseek_v4_layer_state_geometry(4, prefill).unwrap();
@@ -525,6 +539,8 @@ mod default_tests {
                                     missing * active * sequences);
                                 assert_eq!(bytes(&heads, rank, Category::Prefix, "marks") - bytes(&placed, rank, Category::Prefix, "marks"),
                                     missing * mark * slots);
+                                assert_eq!(bytes(&placed, rank, Category::Kv, "C4 sentinel"),
+                                    (2 - missing) * C4_SENTINEL_BYTES);
                             }
                             for (layer, &ratio) in placed.layers.iter().zip(&cfg.compress_ratios) {
                                 if ratio != 4 { assert_eq!(layer.mode, LayerMode::HeadSplit); }

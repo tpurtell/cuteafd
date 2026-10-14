@@ -89,6 +89,11 @@ pub(crate) trait RtxExpertLayer {
     /// valid after the last [`Self::enqueue`] completes on its stream and
     /// until the next one.
     fn output(&self) -> *mut c_void;
+    /// Stable captured storage; unsupported backends fail closed rather than
+    /// pretending an output address proves all native weight/scratch bindings.
+    fn graph_bindings(&self, _layer: usize, _rows: usize) -> Result<Vec<(usize, usize)>> {
+        anyhow::bail!("expert backend does not expose graph storage bindings")
+    }
     /// Initialize first-use kernels before queuing any peer waits. Native and
     /// EXL3 callers already prewarm their step packages; FP8 primes capacities.
     ///

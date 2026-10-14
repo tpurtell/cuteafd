@@ -130,6 +130,10 @@ fn budget(catalog: &OfficialV41Catalog, plan: &V41Exl3Residency) -> Result<Exper
 }
 
 impl<'a> Exl3Weights<'a> {
+    pub(crate) fn graph_bindings(&self) -> Vec<(usize, usize)> {
+        self.buffers.iter().map(|b| (b.buffer.ptr as usize, b.buffer.bytes)).collect()
+    }
+
     pub(crate) fn plan(
         catalog: &OfficialV41Catalog,
         layer: ExpertLayer,

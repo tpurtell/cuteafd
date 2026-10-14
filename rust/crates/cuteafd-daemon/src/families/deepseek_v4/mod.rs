@@ -660,6 +660,7 @@ fn with_engine_mode<T>(
         if args.full_prefill_logits { engine.prepare_scoring_prefill()?; }
         engine.warm_local_graphs()?;
         engine.check_routes(&mut transports, &runtime)?;
+        let _capture_session = crate::shared::decode_graph::CaptureWatch::session();
         body(&engine, &mut transports, &runtime)
     })();
     crate::shared::decode_graph::fatal_drain(engine.shutdown_submission(&mut transports), "V4 RTX engine retirement");

@@ -367,6 +367,11 @@ impl RtxExpertLayer for NativeTp2<'_> {
             self.states.iter().map(|s| s.kernel.info().capacity_rows as usize))?;
         self.states[selected].kernel.group_rows_for(rows)
     }
+    fn graph_bindings(&self, layer: usize, _rows: usize) -> Result<Vec<(usize, usize)>> {
+        ensure!(self.layers.contains(&layer), "native graph layer not resident");
+        Ok(self.weights[layer - self.layers.start].buffers.iter().map(|a| (a.buffer.ptr as usize, a.buffer.bytes))
+            .chain([(&self._scratch.buffer), (&self.output.buffer)].into_iter().map(|b| (b.ptr as usize, b.bytes))).collect())
+    }
     fn output(&self) -> *mut c_void {
         self.output.buffer.ptr
     }

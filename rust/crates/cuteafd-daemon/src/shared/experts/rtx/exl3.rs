@@ -292,6 +292,14 @@ impl RtxExpertLayer for Exl3Tp2<'_> {
         };
         Ok(selected.context("no EXL3 TP2 capacity for this many rows")?.group_rows())
     }
+    fn graph_bindings(&self, layer: usize, rows: usize) -> Result<Vec<(usize, usize)>> {
+        ensure!(self.layers.contains(&layer), "EXL3 graph layer not resident");
+        let executions = self.executions.as_ref().context("EXL3 graph executions")?;
+        let selected = self.reduction_plan.execution_index(rows, self.row_policy.required_capacity(rows),
+            executions.iter().map(|e| e.capacity()))?;
+        Ok(executions[selected].graph_bindings(layer - self.layers.start)?.into_iter()
+            .chain(self.output.iter().map(|a| (a.buffer.ptr as usize, a.buffer.bytes))).collect())
+    }
     fn output(&self) -> *mut c_void {
         self.output
             .as_ref()
