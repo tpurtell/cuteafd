@@ -255,7 +255,7 @@ impl<'a> Engine<'a> {
         debug_assert!(!tp2.output_pending[rank].get(), "previous routed output was not copied to its lane payload");
         self.collect_routes(rank, layer, index, rows, w)?;
         self.on(rank, || {
-            let mut routes = Routes { ids: w.route_ids.buffer.ptr, weights: w.route_weights.buffer.ptr };
+            let mut routes = Routes { ids: lane.route_ids.buffer.ptr, weights: lane.route_weights.buffer.ptr };
             if tp2.source.get() == RouteSource::Broadcast {
                 let slot = 2 * index + layer % 2;
                 let packed = PackedRoutes::new(rows, self.cfg.n_activated_experts);
@@ -265,11 +265,11 @@ impl<'a> Engine<'a> {
                     // SAFETY: both sections fit the rank's logits allocation; zero padding and copies precede the push.
                     unsafe {
                         self.library.cuda_zero_bytes_async(w.logits.buffer, packed.push_bytes, stream)?;
-                        self.library.copy_d2d_async(w.logits.buffer, w.route_ids.buffer, packed.section_bytes, stream)?;
+                        self.library.copy_d2d_async(w.logits.buffer, lane.route_ids.buffer, packed.section_bytes, stream)?;
                         self.library.copy_d2d_async(cuteafd_ffi::CuteafdDeviceBuffer {
                             ptr: w.logits.buffer.ptr.cast::<u8>().add(packed.weights_at).cast(),
                             bytes: w.logits.buffer.bytes - packed.weights_at, ..w.logits.buffer
-                        }, w.route_weights.buffer, packed.section_bytes, stream)?;
+                        }, lane.route_weights.buffer, packed.section_bytes, stream)?;
                     }
                     self.record_peer(0, "routes", slot, true, layer, index);
                     tp2.routes.push(0, slot, w.logits.buffer.ptr, packed.push_bytes)?;
@@ -285,7 +285,7 @@ impl<'a> Engine<'a> {
             ensure!(combine.payload_bytes(rows, self.cfg.dim) <= payload.buffer.bytes, "TP2 payload exceeds admission");
             let mut experts = tp2.ranks[rank].borrow_mut();
             // SAFETY: routes and locally quantized wire rows are complete on this rank's stream.
-            unsafe { experts.enqueue(layer, rows, ExpertInput::Fp8K32(w.wire.buffer.ptr), routes, stream,
+            unsafe { experts.enqueue(layer, rows, ExpertInput::Fp8K32(lane.wire.buffer.ptr), routes, stream,
                 &mut || self.abort_tp2_or_terminate())?; }
             tp2.output_pending[rank].set(true);
             // SAFETY: owned FP32 output and shared BF16 rows remain live through this stream-ordered copy.
@@ -340,21 +340,22 @@ impl<'a> Engine<'a> {
         Ok(())
     }
 
-    fn collect_routes(&self, rank: usize, layer: usize, lane: usize, rows: usize, w: &Workspace<'_>) -> Result<()> {
+    fn collect_routes(&self, rank: usize, layer: usize, index: usize, rows: usize, w: &Workspace<'_>) -> Result<()> {
         let tp2 = self.tp2.as_ref().context("TP2 experts")?;
         if !tp2.checking.get() || self.capture_only.get() { return Ok(()); }
         self.on(rank, || {
             let bytes = rows * self.cfg.n_activated_experts * 4;
             let checks = tp2.checks.borrow();
-            let check = checks.get(&(layer, lane)).context("route diagnostic storage not prepared")?;
+            let lane = &w.lanes[index];
+            let check = checks.get(&(layer, index)).context("route diagnostic storage not prepared")?;
             ensure!(check.rows == rows, "route-check rows changed");
             let host = check.ranks[rank].as_ref().context("route diagnostic rank buffer")?;
             // SAFETY: pinned host storage is retained until both streams drain in finish_route_step.
             unsafe {
-                self.library.copy_d2h_host_buffer_async(host.buffer, w.route_ids.buffer, bytes, self.stream_of(rank))?;
+                self.library.copy_d2h_host_buffer_async(host.buffer, lane.route_ids.buffer, bytes, self.stream_of(rank))?;
                 self.library.copy_d2h_host_buffer_async(cuteafd_ffi::CuteafdHostBuffer {
                     ptr: host.buffer.ptr.cast::<u8>().add(bytes).cast(), bytes, ..host.buffer
-                }, w.route_weights.buffer, bytes, self.stream_of(rank))?;
+                }, lane.route_weights.buffer, bytes, self.stream_of(rank))?;
             }
             Ok(())
         })
@@ -467,22 +468,22 @@ impl<'a> Engine<'a> {
             self.on(rank, || {
                 // CUDA runtime kernels load lazily, which may synchronize the device.
                 // Load both router branches and combine dtypes before any unmatched wait.
-                for allocation in [&w.y, &lane.tokens, &lane.shared] {
+                for allocation in [&lane.y, &lane.tokens, &lane.shared] {
                     self.library.cuda_zero_bytes(allocation.buffer, allocation.buffer.bytes)?;
                 }
                 for hash in [true, false] {
                     let Some(weights) = layers.iter().find(|w| w.hash == hash) else { continue };
                     self.run_on(rank, false, "router_scores", &[
-                        ("x", w.y.buffer.ptr), ("w", weights.ptr("gate")?), ("logits", w.logits.buffer.ptr),
+                        ("x", lane.y.buffer.ptr), ("w", weights.ptr("gate")?), ("logits", w.logits.buffer.ptr),
                     ], &[Scalar::I32(1)])?;
                     let (bias, table) = if hash { (std::ptr::null_mut(), weights.ptr("gate.tid2eid")?) }
                         else { (weights.ptr("gate.bias")?, std::ptr::null_mut()) };
                     // SAFETY: initialized persistent rows and rank-local route buffers, no peer work queued.
                     unsafe { self.library.dsv4_router_select(w.logits.buffer.ptr, bias, table, lane.tokens.buffer.ptr,
-                        w.route_ids.buffer.ptr, w.route_weights.buffer.ptr, 1, self.cfg.n_routed_experts,
+                        lane.route_ids.buffer.ptr, lane.route_weights.buffer.ptr, 1, self.cfg.n_routed_experts,
                         self.cfg.n_activated_experts, self.cfg.route_scale as f32, self.stream_of(rank))?; }
                 }
-                self.quantize_input(rank, w, 1)?;
+                self.quantize_input(rank, w, lane, 1)?;
                 let payload = lane.payload.as_ref().context("combine warm-up payload")?;
                 for combine in &tp2.combine {
                     // SAFETY: zero shared rows, persistent payload and disjoint output, all on this rank.

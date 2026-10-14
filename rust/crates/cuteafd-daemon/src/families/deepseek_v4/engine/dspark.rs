@@ -157,10 +157,10 @@ impl<'a> Engine<'a> {
             self.run("mhc_pre", &[
                 ("residual", a.buffer.ptr), ("fn", weights.ptr("attn.fn")?), ("scale", weights.ptr("attn.scale")?),
                 ("base", weights.ptr("attn.base")?), ("norm", weights.ptr("attn.norm")?), ("post", lane.post.buffer.ptr),
-                ("comb", lane.comb.buffer.ptr), ("y", w.y.buffer.ptr), ("scratch", w.scratch.buffer.ptr),
+                ("comb", lane.comb.buffer.ptr), ("y", lane.y.buffer.ptr), ("scratch", w.scratch.buffer.ptr),
             ], &[scalar])?;
             self.run(&format!("producer_m{cap}"), &[
-                ("hidden", w.y.buffer.ptr), ("positions", m.positions.buffer.ptr), ("main_slots", m.main_slots.buffer.ptr),
+                ("hidden", lane.y.buffer.ptr), ("positions", m.positions.buffer.ptr), ("main_slots", m.main_slots.buffer.ptr),
                 ("cos_sin", self.rope_window.buffer.ptr), ("w_qkv", weights.ptr("w_qkv")?),
                 ("w_qkv_scale", weights.ptr("w_qkv_scale")?), ("w_q", weights.ptr("w_q")?),
                 ("w_q_scale", weights.ptr("w_q_scale")?), ("q_norm", weights.ptr("q_norm")?),
@@ -184,22 +184,22 @@ impl<'a> Engine<'a> {
                 ("x", w.delta.buffer.ptr), ("residual", a.buffer.ptr), ("prev_post", lane.post.buffer.ptr),
                 ("prev_comb", lane.comb.buffer.ptr), ("fn", weights.ptr("ffn.fn")?), ("scale", weights.ptr("ffn.scale")?),
                 ("base", weights.ptr("ffn.base")?), ("norm", weights.ptr("ffn.norm")?), ("residual_out", b.buffer.ptr),
-                ("post", lane.post.buffer.ptr), ("comb", lane.comb.buffer.ptr), ("y", w.y.buffer.ptr),
+                ("post", lane.post.buffer.ptr), ("comb", lane.comb.buffer.ptr), ("y", lane.y.buffer.ptr),
                 ("scratch", w.scratch.buffer.ptr),
             ], &[scalar])?;
             self.run("router_scores", &[
-                ("x", w.y.buffer.ptr), ("w", weights.ptr("gate")?), ("logits", w.logits.buffer.ptr),
+                ("x", lane.y.buffer.ptr), ("w", weights.ptr("gate")?), ("logits", w.logits.buffer.ptr),
             ], &[scalar])?;
             // SAFETY: logits, bias and route outputs are live buffers of `rows` rows.
             unsafe {
                 self.library.dsv4_router_select(w.logits.buffer.ptr, weights.ptr("gate.bias")?, std::ptr::null_mut(),
-                    std::ptr::null_mut(), w.route_ids.buffer.ptr, w.route_weights.buffer.ptr, rows,
+                    std::ptr::null_mut(), lane.route_ids.buffer.ptr, lane.route_weights.buffer.ptr, rows,
                     self.cfg.n_routed_experts, self.cfg.n_activated_experts, self.cfg.route_scale as f32, self.stream)?;
             }
             let grid = self.quantize_grid.blocks(rows, h);
             self.run("expert_input_quant", &[
-                ("source_ptr", w.y.buffer.ptr), ("values_ptr", w.wire.buffer.ptr),
-                ("scale_rows_ptr", offset(&w.wire, h)), ("scale_mma_ptr", w.dummy.buffer.ptr),
+                ("source_ptr", lane.y.buffer.ptr), ("values_ptr", lane.wire.buffer.ptr),
+                ("scale_rows_ptr", offset(&lane.wire, h)), ("scale_mma_ptr", w.dummy.buffer.ptr),
             ], &[scalar, Scalar::I32(grid as i32)])?;
             self.shared_ffn(layer, w, lane, scalar, cap, weights)?;
             {
@@ -207,8 +207,8 @@ impl<'a> Engine<'a> {
                 let local = local.as_mut().context("local experts")?;
                 // SAFETY: wire, routes and shared rows are complete in stream order.
                 unsafe {
-                    local.run(LocalLayer::Stage(stage), rows, w.wire.buffer.ptr, w.route_ids.buffer.ptr,
-                        w.route_weights.buffer.ptr, lane.shared.buffer.ptr, self.stream)?;
+                    local.run(LocalLayer::Stage(stage), rows, lane.wire.buffer.ptr, lane.route_ids.buffer.ptr,
+                        lane.route_weights.buffer.ptr, lane.shared.buffer.ptr, self.stream)?;
                 }
             }
             self.post(w, lane, LOCAL_EXPERTS, [std::ptr::null(); crate::shared::spark_intake::MAX_INTAKE_RANKS], scalar, layer)?;
@@ -216,13 +216,13 @@ impl<'a> Engine<'a> {
         self.run("mhc_head", &[
             ("residual", lane.stream_a.buffer.ptr), ("fn", dspark.head_fn.buffer.ptr),
             ("scale", dspark.head_scale.buffer.ptr), ("base", dspark.head_base.buffer.ptr),
-            ("norm", dspark.norm.buffer.ptr), ("collapsed", w.delta.buffer.ptr), ("out", w.y.buffer.ptr),
+            ("norm", dspark.norm.buffer.ptr), ("collapsed", w.delta.buffer.ptr), ("out", lane.y.buffer.ptr),
         ], &[scalar])?;
         let rank = self.cfg.dspark_markov_rank;
         // SAFETY: y, head weights, logits, Markov weights, tokens and the
         // argmax workspace are live buffers of these shapes.
         unsafe {
-            w.head.as_ref().context("LM head")?.launch(w.y.buffer.ptr.cast(), self.weights.head.buffer.ptr.cast(),
+            w.head.as_ref().context("LM head")?.launch(lane.y.buffer.ptr.cast(), self.weights.head.buffer.ptr.cast(),
                 w.vocab_logits.buffer.ptr.cast(), rows as u32, self.stream)?;
             self.library.dsv4_markov_drafts(w.vocab_logits.buffer.ptr, dspark.markov_w1.buffer.ptr,
                 dspark.markov_w2.buffer.ptr, w.first_tokens.buffer.ptr, w.drafts.buffer.ptr, w.markov.buffer.ptr,

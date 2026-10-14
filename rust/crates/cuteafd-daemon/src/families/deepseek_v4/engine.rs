@@ -280,6 +280,12 @@ struct Lane<'a> {
     stream_b: Dev<'a>,
     post: Dev<'a>,
     comb: Dev<'a>,
+    /// Retained FFN input and routes, private until this lane's FFN closes.
+    y: Dev<'a>,
+    /// Expert IDs (U32) and weights (FP32), [rows, topk].
+    route_ids: Dev<'a>,
+    route_weights: Dev<'a>,
+    wire: Dev<'a>,
     /// Token ids (hash-layer routing).
     tokens: Dev<'a>,
     /// Shared-expert output of the lane's current layer (its post reads it
@@ -297,7 +303,6 @@ struct Lane<'a> {
 /// consumed within one (layer, lane) unit and shared.
 struct Workspace<'a> {
     lanes: Vec<Lane<'a>>,
-    y: Dev<'a>,
     query: Dev<'a>,
     q_rank: Dev<'a>,
     attn_out: Dev<'a>,
@@ -307,10 +312,6 @@ struct Workspace<'a> {
     selected: Dev<'a>,
     topk_scratch: Dev<'a>,
     logits: Dev<'a>,
-    /// Routes: expert ids (U32) and weights (FP32), [rows, topk].
-    route_ids: Dev<'a>,
-    route_weights: Dev<'a>,
-    wire: Dev<'a>,
     scratch: Dev<'a>,
     dummy: Dev<'a>,
     vocab_logits: Dev<'a>,
@@ -611,6 +612,10 @@ impl<'a> Engine<'a> {
         let lane = |index: usize| -> Result<Lane<'a>> {
             Ok(Lane {
                 index,
+                y: self.alloc(t * h * 2)?,
+                route_ids: self.alloc(t * topk * 4)?,
+                route_weights: self.alloc(t * topk * 4)?,
+                wire: self.alloc(t * (h + h / 32))?,
                 payload: if self.split_family.is_some() { Some(self.alloc(t * h * 4)?) } else { None },
                 stream_a: self.alloc(t * 4 * h * 2)?,
                 stream_b: self.alloc(t * 4 * h * 2)?,
@@ -624,7 +629,6 @@ impl<'a> Engine<'a> {
         };
         Ok(Workspace {
             lanes: (0..lanes).map(lane).collect::<Result<_>>()?,
-            y: self.alloc(t * h * 2)?,
             query: self.alloc(t * heads * 512 * 2)?,
             q_rank: self.alloc(t * self.cfg.q_lora_rank * 2)?,
             attn_out: self.alloc(t * heads * 512 * 2)?,
@@ -634,9 +638,6 @@ impl<'a> Engine<'a> {
             selected: self.alloc(t * self.cfg.index_topk * 4)?,
             topk_scratch: self.zeroed(topk_scratch)?,
             logits: self.alloc(t * experts * 4)?,
-            route_ids: self.alloc(t * topk * 4)?,
-            route_weights: self.alloc(t * topk * 4)?,
-            wire: self.alloc(t * (h + h / 32))?,
             scratch: self.alloc(self.scratch_bytes()?)?,
             dummy: self.zeroed(4096)?,
             vocab_logits: self.alloc(lead_only(t.min(LOGIT_ROWS) * self.cfg.vocab_size * 4))?,
@@ -1108,7 +1109,7 @@ impl<'a> Engine<'a> {
                     self.tap(w, lane, last, t)?;
                 }
                 self.write_draft_kv(w, lane, t, cap)?;
-                self.head_launch(&lane.stream_a, t, t, 0, w)
+                self.head_launch(lane, t, t, 0, w)
             })?;
             self.finish_route_step()?;
             return Ok(Logits::Device(Some(self.device_logits(w, t))));
@@ -1154,7 +1155,7 @@ impl<'a> Engine<'a> {
                         post(unit, LOCAL_EXPERTS)?;
                     } else {
                         let slot = if pipelined { lane } else { 0 };
-                        let request = self.stage_request(layer, t, w, ExpertV2SourceKind::Prefill,
+                        let request = self.stage_request(layer, t, w, &w.lanes[lane], ExpertV2SourceKind::Prefill,
                             &mut transports[slot])?;
                         let wave = transports[slot].dispatch(&request)?;
                         // The shared expert runs on the GPU while the Sparks compute.
@@ -1209,7 +1210,7 @@ impl<'a> Engine<'a> {
                     let chunk = (wanted - done).min(LOGIT_ROWS);
                     // Rows `rows - wanted + done ..+ chunk` are the last `chunk` of the first `end`.
                     let end = rows - wanted + done + chunk;
-                    self.head_launch(&lane.stream_a, end, chunk, 0, w)?;
+                    self.head_launch(lane, end, chunk, 0, w)?;
                     let timer = Instant::now();
                     let bytes = self.download(&w.vocab_logits, chunk * self.cfg.vocab_size * 4)?;
                     self.profile.borrow_mut().add(Phase::Head, timer);
@@ -1220,7 +1221,7 @@ impl<'a> Engine<'a> {
                 // Lanes land their rows one after the other in the logits buffer.
                 let capacity = w.vocab_logits.buffer.bytes / (self.cfg.vocab_size * 4);
                 ensure!(landed + wanted <= capacity, "{logit_rows} device logit rows exceed the workspace's {capacity}");
-                self.head_launch(&lane.stream_a, rows, wanted, landed, w)?;
+                self.head_launch(lane, rows, wanted, landed, w)?;
                 landed += wanted;
             }
             first += rows;
@@ -1419,7 +1420,7 @@ impl<'a> Engine<'a> {
         self.attention_sum(1, layer, index, w, rows)?;
         self.attention_back(1, weights, lane, w, rows, cap, w.sum.buffer.ptr)?;
         self.run_on(1, weights.ffn_split, &format!("shared_ffn_m{cap}"), &[
-            ("x", w.y.buffer.ptr), ("w13", weights.ptr("w13")?), ("w13_scale", weights.ptr("w13_scale")?),
+            ("x", lane.y.buffer.ptr), ("w13", weights.ptr("w13")?), ("w13_scale", weights.ptr("w13_scale")?),
             ("w2", weights.ptr("w2")?), ("w2_scale", weights.ptr("w2_scale")?), ("out", lane.shared.buffer.ptr),
             ("scratch", w.scratch.buffer.ptr),
         ], &[rows]).with_context(|| format!("layer {layer} shared expert (rank 1)"))?;
@@ -1540,7 +1541,7 @@ impl<'a> Engine<'a> {
         let cache = self.cache_on(rank, layer)?;
         let rope = self.attention_rope(rank, weights.ratio);
         let (attention, indexed_cache, indexed_indices, indexed_lengths) =
-            self.compress(rank, layer, weights, cache, None, tables, &lane.tables, w, rope, rows, cap)?;
+            self.compress(rank, layer, weights, cache, None, tables, lane, w, rope, rows, cap)?;
         debug_assert_eq!(attention, self.attention_kind(weights.ratio, tables));
         self.attention_sparse(rank, weights, tables, lane, w, rows, cap,
             cache.main.buffer.ptr, indexed_cache, indexed_indices, indexed_lengths)?;
@@ -1561,22 +1562,17 @@ impl<'a> Engine<'a> {
     fn attention_produce(&self, rank: usize, layer: usize, weights: &LayerWeights<'_>,
         lane: &Lane<'_>, w: &Workspace<'_>, rows: Scalar, cap: usize) -> Result<()> {
         let m = &lane.tables;
-        let (pools, rope_window, rope_compressed) = match (rank, &self.peer) {
-            (1, Some(peer)) => (&peer.pools, &peer.rope_window, &peer.rope_compressed),
-            _ => (&self.pools, &self.rope_window, &self.rope_compressed),
-        };
-        let cache = &pools[layer];
-        let ratio = weights.ratio;
-        let rope = if ratio == 0 { rope_window } else { rope_compressed };
+        let cache = self.cache_on(rank, layer)?;
+        let rope = self.attention_rope(rank, weights.ratio);
         let split = weights.attention_split;
         let a = &lane.stream_a;
         self.run_on(rank, false, "mhc_pre", &[
             ("residual", a.buffer.ptr), ("fn", weights.ptr("attn.fn")?), ("scale", weights.ptr("attn.scale")?),
             ("base", weights.ptr("attn.base")?), ("norm", weights.ptr("attn.norm")?), ("post", lane.post.buffer.ptr),
-            ("comb", lane.comb.buffer.ptr), ("y", w.y.buffer.ptr), ("scratch", w.scratch.buffer.ptr),
+            ("comb", lane.comb.buffer.ptr), ("y", lane.y.buffer.ptr), ("scratch", w.scratch.buffer.ptr),
         ], &[rows])?;
         self.run_on(rank, split, &format!("producer_m{cap}"), &[
-            ("hidden", w.y.buffer.ptr), ("positions", m.positions.buffer.ptr), ("main_slots", m.main_slots.buffer.ptr),
+            ("hidden", lane.y.buffer.ptr), ("positions", m.positions.buffer.ptr), ("main_slots", m.main_slots.buffer.ptr),
             ("cos_sin", rope.buffer.ptr), ("w_qkv", weights.ptr("w_qkv")?), ("w_qkv_scale", weights.ptr("w_qkv_scale")?),
             ("w_q", weights.ptr("w_q")?), ("w_q_scale", weights.ptr("w_q_scale")?), ("q_norm", weights.ptr("q_norm")?),
             ("kv_norm", weights.ptr("kv_norm")?), ("main_kv_cache", cache.main.buffer.ptr), ("query", w.query.buffer.ptr),
@@ -1649,14 +1645,14 @@ impl<'a> Engine<'a> {
             ("x", x), ("residual", a.buffer.ptr), ("prev_post", lane.post.buffer.ptr),
             ("prev_comb", lane.comb.buffer.ptr), ("fn", weights.ptr("ffn.fn")?), ("scale", weights.ptr("ffn.scale")?),
             ("base", weights.ptr("ffn.base")?), ("norm", weights.ptr("ffn.norm")?), ("residual_out", b.buffer.ptr),
-            ("post", lane.post.buffer.ptr), ("comb", lane.comb.buffer.ptr), ("y", w.y.buffer.ptr), ("scratch", w.scratch.buffer.ptr),
+            ("post", lane.post.buffer.ptr), ("comb", lane.comb.buffer.ptr), ("y", lane.y.buffer.ptr), ("scratch", w.scratch.buffer.ptr),
         ], &[rows])?;
         if rank != 0 && !self.tp2_layer_weights(weights) {
             return Ok(());
         }
         let Scalar::I32(t) = rows else { unreachable!() };
         self.run_on(rank, false, "router_scores", &[
-            ("x", w.y.buffer.ptr), ("w", weights.ptr("gate")?), ("logits", w.logits.buffer.ptr),
+            ("x", lane.y.buffer.ptr), ("w", weights.ptr("gate")?), ("logits", w.logits.buffer.ptr),
         ], &[rows])?;
         let (bias, tid2eid) = if weights.hash {
             (std::ptr::null_mut(), weights.ptr("gate.tid2eid")?)
@@ -1667,22 +1663,22 @@ impl<'a> Engine<'a> {
         // device buffers sized for this step's rows.
         self.on(rank, || unsafe {
             self.library.dsv4_router_select(w.logits.buffer.ptr, bias, tid2eid, lane.tokens.buffer.ptr,
-                w.route_ids.buffer.ptr, w.route_weights.buffer.ptr, t as usize, self.cfg.n_routed_experts,
+                lane.route_ids.buffer.ptr, lane.route_weights.buffer.ptr, t as usize, self.cfg.n_routed_experts,
                 self.cfg.n_activated_experts, self.cfg.route_scale as f32, self.stream_of(rank))?;
             Ok(())
         })?;
-        self.quantize_input(rank, w, t as usize)
+        self.quantize_input(rank, w, lane, t as usize)
     }
 
-    fn quantize_input(&self, rank: usize, w: &Workspace<'_>, t: usize) -> Result<()> {
-        self.quantize_to(rank, w, &w.wire, t)
+    fn quantize_input(&self, rank: usize, w: &Workspace<'_>, lane: &Lane<'_>, t: usize) -> Result<()> {
+        self.quantize_to(rank, w, lane, &lane.wire, t)
     }
 
-    fn quantize_to(&self, rank: usize, w: &Workspace<'_>, wire: &Dev<'_>, t: usize) -> Result<()> {
+    fn quantize_to(&self, rank: usize, w: &Workspace<'_>, lane: &Lane<'_>, wire: &Dev<'_>, t: usize) -> Result<()> {
         let h = self.cfg.dim;
         let grid = self.quantize_grid.blocks(t, h);
         self.run_on(rank, false, "expert_input_quant", &[
-            ("source_ptr", w.y.buffer.ptr), ("values_ptr", wire.buffer.ptr),
+            ("source_ptr", lane.y.buffer.ptr), ("values_ptr", wire.buffer.ptr),
             // SAFETY: scale rows follow the payload inside each wire row.
             ("scale_rows_ptr", unsafe { wire.buffer.ptr.cast::<u8>().add(h) }.cast()),
             ("scale_mma_ptr", w.dummy.buffer.ptr),
@@ -1698,19 +1694,20 @@ impl<'a> Engine<'a> {
         cache: &LayerCache<'_>,
         staged: Option<(*mut c_void, *mut c_void)>,
         tables: &StepTables,
-        m: &StepBuffers<'_>,
+        lane: &Lane<'_>,
         w: &Workspace<'_>,
         rope: &Dev<'_>,
         rows: Scalar,
         cap: usize,
     ) -> Result<(&'static str, *mut c_void, *mut c_void, *mut c_void)> {
+        let m = &lane.tables;
         let dummy = w.dummy.buffer.ptr;
         let window = ("win", dummy, dummy, dummy);
         let ratio = weights.ratio;
         if ratio == 0 {
             return Ok(window);
         }
-        self.compress_records(rank, layer, weights, cache, staged, tables, m, w, rope, rows, cap)?;
+        self.compress_records(rank, layer, weights, cache, staged, tables, lane, w, rope, rows, cap)?;
         let groups = if ratio == 4 { tables.c4_groups } else { tables.c128_groups };
         let (compressed, index) = match staged {
             Some(views) => views,
@@ -1723,7 +1720,7 @@ impl<'a> Engine<'a> {
         if ratio == 128 {
             return Ok(("c128", compressed, m.c128_indices.buffer.ptr, m.c128_lengths.buffer.ptr));
         }
-        self.index_produce(rank, weights, m, w, rope, rows, cap)?;
+        self.index_produce(rank, weights, lane, w, rope, rows, cap)?;
         let mode = if tables.decode { "decode" } else { "prefill" };
         self.run_on(rank, false, &format!("index_topk_{mode}_m{cap}"), &[
             ("q_fp8", w.index_query.buffer.ptr), ("weights", w.index_weights.buffer.ptr),
@@ -1738,15 +1735,16 @@ impl<'a> Engine<'a> {
     /// gathered context prefill's C4 record and index views (logical slots) instead of the pools.
     #[allow(clippy::too_many_arguments)]
     fn compress_records(&self, rank: usize, layer: usize, weights: &LayerWeights<'_>, cache: &LayerCache<'_>,
-        staged: Option<(*mut c_void, *mut c_void)>, tables: &StepTables, m: &StepBuffers<'_>, w: &Workspace<'_>,
+        staged: Option<(*mut c_void, *mut c_void)>, tables: &StepTables, lane: &Lane<'_>, w: &Workspace<'_>,
         rope: &Dev<'_>, rows: Scalar, cap: usize) -> Result<()> {
+        let m = &lane.tables;
         let ratio = weights.ratio;
         ensure!(matches!(ratio, 4 | 128), "compressor requires C4 or C128");
         ensure!(staged.is_none() || ratio == 4, "only C4 records are staged");
         let (metadata, names) = if ratio == 4 { (&m.c4, &tables.c4_tables) } else { (&m.c128, &tables.c128_tables) };
         let compressed = match staged { Some((records, _)) => records,
             None => cache.compressed.as_ref().context("compressed cache")?.buffer.ptr };
-        let mut pointers: Vec<(&str, *mut c_void)> = vec![("hidden", w.y.buffer.ptr)];
+        let mut pointers: Vec<(&str, *mut c_void)> = vec![("hidden", lane.y.buffer.ptr)];
         pointers.extend(names.iter().zip(metadata).map(|((name, _), buffer)| (*name, buffer.buffer.ptr)));
         pointers.extend([
             ("cos_sin", rope.buffer.ptr), ("joint_projection", weights.ptr("joint_projection")?),
@@ -1779,10 +1777,11 @@ impl<'a> Engine<'a> {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn index_produce(&self, rank: usize, weights: &LayerWeights<'_>, m: &StepBuffers<'_>, w: &Workspace<'_>,
+    fn index_produce(&self, rank: usize, weights: &LayerWeights<'_>, lane: &Lane<'_>, w: &Workspace<'_>,
         rope: &Dev<'_>, rows: Scalar, cap: usize) -> Result<()> {
+        let m = &lane.tables;
         self.run_on(rank, false, &format!("index_producer_m{cap}"), &[
-            ("q_rank", w.q_rank.buffer.ptr), ("hidden", w.y.buffer.ptr), ("positions", m.positions.buffer.ptr),
+            ("q_rank", w.q_rank.buffer.ptr), ("hidden", lane.y.buffer.ptr), ("positions", m.positions.buffer.ptr),
             ("cos_sin", rope.buffer.ptr), ("w_q", weights.ptr("index_w_q")?), ("w_q_scale", weights.ptr("index_w_q_scale")?),
             ("w_proj", weights.ptr("index_w_proj")?), ("query", w.index_query.buffer.ptr),
             ("head_weights", w.index_weights.buffer.ptr), ("scratch", w.scratch.buffer.ptr),
@@ -1809,8 +1808,8 @@ impl<'a> Engine<'a> {
         // segment's router ran before); the previous wave on this link was
         // collected and reduced earlier on the stream.
         unsafe {
-            link.dispatch(layer, t, DEVICE_DECODE, sized(&w.route_ids, t * topk * 4),
-                sized(&w.route_weights, t * topk * 4), sized(&w.wire, t * (h + h / 32)), self.stream)?;
+            link.dispatch(layer, t, DEVICE_DECODE, sized(&lane.route_ids, t * topk * 4),
+                sized(&lane.route_weights, t * topk * 4), sized(&lane.wire, t * (h + h / 32)), self.stream)?;
         }
         self.shared_ffn(layer, w, lane, Scalar::I32(t as i32), cap, &self.weights.layers[layer])?;
         // SAFETY: the dispatch above is this wait's wave.
@@ -1922,7 +1921,7 @@ impl<'a> Engine<'a> {
         weights: &LayerWeights<'_>) -> Result<()> {
         // A head split's layers hold half the shared expert (its program family's share).
         self.run_on(0, weights.ffn_split, &format!("shared_ffn_m{cap}"), &[
-            ("x", w.y.buffer.ptr), ("w13", weights.ptr("w13")?), ("w13_scale", weights.ptr("w13_scale")?),
+            ("x", lane.y.buffer.ptr), ("w13", weights.ptr("w13")?), ("w13_scale", weights.ptr("w13_scale")?),
             ("w2", weights.ptr("w2")?), ("w2_scale", weights.ptr("w2_scale")?), ("out", lane.shared.buffer.ptr),
             ("scratch", w.scratch.buffer.ptr),
         ], &[rows]).with_context(|| format!("layer {layer} shared expert"))
@@ -1942,8 +1941,8 @@ impl<'a> Engine<'a> {
                 let mut local = self.local.borrow_mut();
                 let local = local.as_mut().context("local experts")?;
                 // SAFETY: wire, routes and shared rows are complete in stream order.
-                unsafe { local.run(super::local::LocalLayer::Backbone(layer), t, w.wire.buffer.ptr,
-                    w.route_ids.buffer.ptr, w.route_weights.buffer.ptr, lane.shared.buffer.ptr, self.stream)?; }
+                unsafe { local.run(super::local::LocalLayer::Backbone(layer), t, lane.wire.buffer.ptr,
+                    lane.route_ids.buffer.ptr, lane.route_weights.buffer.ptr, lane.shared.buffer.ptr, self.stream)?; }
             }
             Ok(())
         };
@@ -1988,7 +1987,7 @@ impl<'a> Engine<'a> {
     }
 
     /// Waits for the unit's routes and wire rows and builds its Spark request.
-    fn stage_request(&self, layer: usize, t: usize, w: &Workspace<'_>, kind: ExpertV2SourceKind,
+    fn stage_request(&self, layer: usize, t: usize, w: &Workspace<'_>, lane: &Lane<'_>, kind: ExpertV2SourceKind,
         transport: &mut SparkLink<'_>) -> Result<ExpertProtocolV2Request> {
         let (h, topk) = (self.cfg.dim, self.cfg.n_activated_experts);
         let timer = Instant::now();
@@ -2005,10 +2004,10 @@ impl<'a> Engine<'a> {
         let egress = transport.egress(wire_bytes)?;
         // SAFETY: the pinned regions are large enough; the sync below completes them.
         unsafe {
-            self.library.copy_d2h_host_buffer_async(at(0), w.route_ids.buffer, route_bytes, self.stream)?;
-            self.library.copy_d2h_host_buffer_async(at(route_bytes), w.route_weights.buffer, route_bytes, self.stream)?;
+            self.library.copy_d2h_host_buffer_async(at(0), lane.route_ids.buffer, route_bytes, self.stream)?;
+            self.library.copy_d2h_host_buffer_async(at(route_bytes), lane.route_weights.buffer, route_bytes, self.stream)?;
             let target = egress.unwrap_or(at(2 * route_bytes));
-            self.library.copy_d2h_host_buffer_async(target, w.wire.buffer, wire_bytes, self.stream)?;
+            self.library.copy_d2h_host_buffer_async(target, lane.wire.buffer, wire_bytes, self.stream)?;
         }
         self.sync()?;
         self.profile.borrow_mut().add(Phase::RouterSync, timer);
@@ -2065,7 +2064,7 @@ impl<'a> Engine<'a> {
         }
         let transport = transport.context("no transport")?;
         // Decode rows poll without the prefill spin quantum.
-        let request = self.stage_request(layer, t, w, ExpertV2SourceKind::Decode, transport)?;
+        let request = self.stage_request(layer, t, w, lane, ExpertV2SourceKind::Decode, transport)?;
         let wave = transport.dispatch(&request)?;
         // The shared expert runs on the GPU while the Sparks compute.
         self.shared_ffn(layer, w, lane, Scalar::I32(t as i32), cap, &self.weights.layers[layer])?;
@@ -2073,19 +2072,19 @@ impl<'a> Engine<'a> {
     }
 
     /// Logits of the last `n` of `t` rows into vocabulary logits rows `at..at + n`.
-    fn head_launch(&self, stream: &Dev<'_>, t: usize, n: usize, at: usize, w: &Workspace<'_>) -> Result<()> {
+    fn head_launch(&self, lane: &Lane<'_>, t: usize, n: usize, at: usize, w: &Workspace<'_>) -> Result<()> {
         let h = self.cfg.dim;
         let vocab = self.cfg.vocab_size;
         self.run("mhc_head", &[
-            ("residual", stream.buffer.ptr), ("fn", self.weights.head_fn.buffer.ptr),
+            ("residual", lane.stream_a.buffer.ptr), ("fn", self.weights.head_fn.buffer.ptr),
             ("scale", self.weights.head_scale.buffer.ptr), ("base", self.weights.head_base.buffer.ptr),
-            ("norm", self.weights.norm.buffer.ptr), ("collapsed", w.delta.buffer.ptr), ("out", w.y.buffer.ptr),
+            ("norm", self.weights.norm.buffer.ptr), ("collapsed", w.delta.buffer.ptr), ("out", lane.y.buffer.ptr),
         ], &[Scalar::I32(t as i32)])?;
         // SAFETY: input, weights and logits are live buffers of the head's
         // shape; the last `n` rows start `t - n` rows into `y`.
         unsafe {
             crate::shared::target_head::launch(crate::shared::target_head::TargetHead::configured(),
-                w.head.as_ref().context("LM head")?, w.y.buffer.ptr.cast::<u8>().add((t - n) * h * 2).cast(),
+                w.head.as_ref().context("LM head")?, lane.y.buffer.ptr.cast::<u8>().add((t - n) * h * 2).cast(),
                 self.weights.head.buffer.ptr.cast_const(), w.vocab_logits.buffer.ptr.cast::<f32>().add(at * vocab), n,
                 self.stream)
         }
