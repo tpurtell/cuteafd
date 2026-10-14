@@ -52,7 +52,7 @@ def test_real_pro_attention_layouts_against_fp64():
     assert raw["compress_ratios"][2] == 4
     cfg = Config.from_snapshot(official)
     assert cfg.dim == raw["hidden_size"] and cfg.n_heads == raw["num_attention_heads"]
-    cfg.index_topk = raw["index_topk"]
+    assert cfg.index_topk == raw["index_topk"]
     text = ("Implement a bounded asynchronous queue in Rust. Preserve cancellation, "
             "backpressure and FIFO ordering. Include tests for partial failure and shutdown. ") * 10
     from tokenizers import Tokenizer
