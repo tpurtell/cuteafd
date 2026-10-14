@@ -234,10 +234,17 @@ fn dev_golden_layers(args: &EngineArgs) -> Result<bool> {
 
 fn validate_dev_layers(enabled: bool, args: &EngineArgs) -> Result<()> {
     ensure!(!enabled || cfg!(feature = "dev-v4-layers"), "dev V4 layers feature is absent");
-    ensure!(!enabled || (args.skip_routed_experts && args.split_device.is_some() && !args.dspark
+    ensure!(!enabled || (args.split_device.is_some() && !args.dspark
         && args.attention_placement == "layers"),
-        "dev V4 layers needs layers, two GPUs, --skip-routed-experts and no dSpark");
+        "dev V4 layers needs layers, two GPUs and no dSpark");
     Ok(())
+}
+
+fn serving_dev_layers(args: &EngineArgs) -> Result<bool> {
+    if args.attention_placement != "layers" { return Ok(false); }
+    ensure!(cfg!(feature = "dev-v4-layers"), "V4 layers serving requires the dev-v4-layers Cargo feature");
+    validate_dev_layers(true, args)?;
+    Ok(true)
 }
 
 fn dev_layer_request(enabled: bool, request: &mut cuteafd_loader::placement::PlacementRequest,
@@ -359,7 +366,7 @@ pub(crate) fn with_engine<T>(
     held: impl FnOnce(&engine::Engine<'_>) -> Result<usize>,
     body: impl FnOnce(&engine::Engine<'_>, &mut [SparkLink<'_>], &tokio::runtime::Runtime) -> Result<T>,
 ) -> Result<T> {
-    with_engine_mode(loaded, args, prefix, false, held, body)
+    with_engine_mode(loaded, args, prefix, serving_dev_layers(args)?, held, body)
 }
 
 fn with_engine_mode<T>(
@@ -651,7 +658,7 @@ fn with_engine_mode<T>(
             } else { installed = Some(reports); }
         }
         tracing::info!(elapsed_ms = started.elapsed().as_millis() as u64, "Spark expert transport warm");
-        if crate::shared::spark_intake::device_exchange_enabled() && !skip
+        if !dev_layers && crate::shared::spark_intake::device_exchange_enabled() && !skip
             && crate::shared::spark_intake::device_exchange_available(&loaded.library)? {
             let started = Instant::now();
             engine.attach_device_link(&peers, &executors,

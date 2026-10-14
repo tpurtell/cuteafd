@@ -100,6 +100,7 @@ pub(crate) struct Engine<'a> {
 struct DevLayers<'a> {
     plan: cuteafd_loader::placement::LayerExecutionPlan,
     hops: crate::shared::peer_split::hop::HopLink<'a>,
+    waves: RefCell<crate::shared::peer_split::attention::FfnWaveBank<SparkExpertWave>>,
 }
 
 /// The second GPU of a two-GPU head split (rank 1): its share of every
@@ -829,8 +830,7 @@ impl<'a> Engine<'a> {
     #[cfg(feature = "dev-v4-layers")]
     pub fn attach_dev_layers(&mut self, placement: &cuteafd_loader::placement::Placement,
         spec: cuteafd_loader::placement::HopSpec) -> Result<()> {
-        ensure!(self.skip_routed && self.weights.dspark.is_none() && self.tp2.is_none()
-            && self.context.is_none(), "dev layers is shared-expert-only and eager");
+        ensure!(self.weights.dspark.is_none() && self.context.is_none(), "dev layers is eager without drafter");
         let plan = cuteafd_loader::placement::LayerExecutionPlan::new(placement, spec)?;
         ensure!(plan.modes() == self.modes, "dev layers differs from loaded modes");
         let peer = self.peer()?;
@@ -844,7 +844,8 @@ impl<'a> Engine<'a> {
         let charged = cuteafd_loader::placement::hop_storage_bytes(plan.hops(), &spec, 2)
             .context("dev hop admission")?;
         for rank in 0..2 { ensure!(hops.fixed_bytes(rank) == charged[rank], "dev hop allocation differs from admission"); }
-        self.dev_layers = Some(DevLayers { plan, hops });
+        self.dev_layers = Some(DevLayers { plan, hops, waves: RefCell::new(
+            crate::shared::peer_split::attention::FfnWaveBank::new(PREFILL_LANES)) });
         Ok(())
     }
 
@@ -1083,11 +1084,17 @@ impl<'a> Engine<'a> {
             // SAFETY: all previous rank-1 reads drain before its tables change.
             self.on(1, || unsafe { self.library.cuda_stream_synchronize(self.stream_of(1)) })?;
             for (step, lane) in lanes.iter().zip(&w1.lanes) {
-                self.on(1, || self.fill(&lane.tables, step.tables))?;
+                self.on(1, || {
+                    self.fill(&lane.tables, step.tables)?;
+                    self.library.copy_h2d(cuteafd_ffi::CuteafdDeviceBuffer {
+                        bytes: step.tokens.len() * 4, ..lane.tokens.buffer
+                    }, bytes_of(step.tokens))
+                })?;
             }
             if gather && decode { self.gather_streams(&w.lanes[0], lanes[0].tables.rows)?; }
+            let links = RefCell::new(transports);
             let mut kernels = lanes.iter().enumerate().map(|(index, step)|
-                DevLayerKernels::new(self, binding, [w, w1], index, step.tables, cap))
+                DevLayerKernels::new(self, binding, [w, w1], index, step.tables, cap, &links, runtime))
                 .collect::<Result<Vec<_>>>()?;
             crate::shared::peer_split::attention::layer_pipeline(_scope, &binding.plan, self.exchange()?,
                 &binding.hops, crate::shared::peer_split::attention::LaneOrder::OrderedChunks,
@@ -1778,9 +1785,16 @@ impl<'a> Engine<'a> {
             ("base", weights.ptr("ffn.base")?), ("norm", weights.ptr("ffn.norm")?), ("residual_out", b.buffer.ptr),
             ("post", lane.post.buffer.ptr), ("comb", lane.comb.buffer.ptr), ("y", lane.y.buffer.ptr), ("scratch", w.scratch.buffer.ptr),
         ], &[rows])?;
+        #[cfg(feature = "dev-v4-layers")]
+        if self.dev_layers.is_some() { return Ok(()); }
         if self.skip_routed || (rank != 0 && !self.tp2_layer_weights(weights)) {
             return Ok(());
         }
+        self.route_input(rank, weights, lane, w, rows)
+    }
+
+    fn route_input(&self, rank: usize, weights: &LayerWeights<'_>, lane: &Lane<'_>, w: &Workspace<'_>, rows: Scalar)
+        -> Result<()> {
         let Scalar::I32(t) = rows else { unreachable!() };
         self.run_on(rank, false, "router_scores", &[
             ("x", lane.y.buffer.ptr), ("w", weights.ptr("gate")?), ("logits", w.logits.buffer.ptr),
@@ -2098,6 +2112,8 @@ impl<'a> Engine<'a> {
             }
         }
         self.warm_tp2_routers()?;
+        #[cfg(feature = "dev-v4-layers")]
+        if self.dev_layers.is_some() { self.warm_dev_tp2()?; return Ok(()); }
         self.capture_only.set(true);
         let result = (|| {
             let work = self.decode_workspace.borrow();
@@ -2170,6 +2186,16 @@ impl<'a> Engine<'a> {
         transport.receive(wave, t, self.stream).await?;
         self.profile.borrow_mut().add(Phase::Experts, timer);
         Ok(transport.world_size())
+    }
+
+    #[cfg(feature = "dev-v4-layers")]
+    fn runtime_land_reduce(&self, runtime: &tokio::runtime::Runtime, transport: &mut SparkLink<'_>,
+        wave: SparkExpertWave, rows: usize, workspace: &Workspace<'_>, lane: &Lane<'_>) -> Result<()> {
+        runtime.block_on(self.land(transport, wave, rows, workspace))?;
+        let payload = lane.payload.as_ref().context("dev retained Spark sum")?;
+        // SAFETY: same reducer/order as heads/context, with a persistent lane destination.
+        // reduce records consumption before this transport can reuse its planes.
+        unsafe { transport.reduce(lane.shared.buffer.ptr.cast(), payload.buffer.ptr.cast(), rows, self.stream) }
     }
 
     /// A decode unit's experts; returns the rank count its post needs
@@ -2258,13 +2284,23 @@ impl Logits {
 }
 
 #[cfg(feature = "dev-v4-layers")]
-struct DevLayerKernels<'e, 'a, 's> {
+#[derive(Clone, Copy)]
+enum DevFfnTicket {
+    Shared,
+    Local,
+    Spark(crate::shared::peer_split::attention::FfnWaveTicket),
+}
+
+#[cfg(feature = "dev-v4-layers")]
+struct DevLayerKernels<'e, 'a, 's, 't, 'l, 'p> {
     engine: &'e Engine<'a>,
     binding: &'e DevLayers<'a>,
     workspaces: [&'e Workspace<'a>; 2],
     lane: usize,
     tables: &'s StepTables,
     cap: usize,
+    transports: &'t RefCell<&'l mut [SparkLink<'p>]>,
+    runtime: &'t tokio::runtime::Runtime,
     weights: Vec<Vec<u8>>,
     kv: Vec<Vec<u8>>,
     indexer: Vec<Vec<u8>>,
@@ -2272,10 +2308,11 @@ struct DevLayerKernels<'e, 'a, 's> {
 }
 
 #[cfg(feature = "dev-v4-layers")]
-impl<'e, 'a, 's> DevLayerKernels<'e, 'a, 's> {
+impl<'e, 'a, 's, 't, 'l, 'p> DevLayerKernels<'e, 'a, 's, 't, 'l, 'p> {
     fn new(engine: &'e Engine<'a>, binding: &'e DevLayers<'a>,
-        workspaces: [&'e Workspace<'a>; 2], lane: usize, tables: &'s StepTables, cap: usize) -> Result<Self> {
-        let mut result = Self { engine, binding, workspaces, lane, tables, cap,
+        workspaces: [&'e Workspace<'a>; 2], lane: usize, tables: &'s StepTables, cap: usize,
+        transports: &'t RefCell<&'l mut [SparkLink<'p>]>, runtime: &'t tokio::runtime::Runtime) -> Result<Self> {
+        let mut result = Self { engine, binding, workspaces, lane, tables, cap, transports, runtime,
             weights: vec![vec![]; engine.cfg.n_layers], kv: vec![vec![]; engine.cfg.n_layers],
             indexer: vec![vec![]; engine.cfg.n_layers], compressor: vec![vec![]; engine.cfg.n_layers] };
         for layer in 0..engine.cfg.n_layers {
@@ -2317,7 +2354,7 @@ impl<'e, 'a, 's> DevLayerKernels<'e, 'a, 's> {
 }
 
 #[cfg(feature = "dev-v4-layers")]
-impl crate::shared::peer_split::attention::LayerKernels for DevLayerKernels<'_, '_, '_> {
+impl crate::shared::peer_split::attention::LayerKernels for DevLayerKernels<'_, '_, '_, '_, '_, '_> {
     fn pack(&mut self, hop: cuteafd_loader::placement::Hop) -> Result<*const c_void> {
         self.engine.pack_attention_handoff(&self.binding.hops, hop, self.lane(usize::from(hop.from)), self.tables.rows)
     }
@@ -2355,8 +2392,8 @@ impl crate::shared::peer_split::attention::LayerKernels for DevLayerKernels<'_, 
 }
 
 #[cfg(feature = "dev-v4-layers")]
-impl crate::shared::peer_split::attention::PipelineKernels for DevLayerKernels<'_, '_, '_> {
-    type FfnTicket = usize;
+impl crate::shared::peer_split::attention::PipelineKernels for DevLayerKernels<'_, '_, '_, '_, '_, '_> {
+    type FfnTicket = DevFfnTicket;
     fn state_owners(&self, layer: usize) -> Result<crate::shared::peer_split::attention::AttentionStateOwners<'_>> {
         let ratio = self.engine.cfg.compress_ratios[layer];
         Ok(crate::shared::peer_split::attention::AttentionStateOwners {
@@ -2364,34 +2401,87 @@ impl crate::shared::peer_split::attention::PipelineKernels for DevLayerKernels<'
             indexer: (ratio == 4).then_some(&self.indexer[layer][..]),
             compressor: (ratio != 0).then_some(&self.compressor[layer][..]) })
     }
-    fn begin_ffn(&mut self, layer: usize, owner: Option<usize>) -> Result<usize> {
-        ensure!(owner.is_none() && self.engine.skip_routed, "dev FFN must be split shared-only");
+    fn begin_ffn(&mut self, layer: usize, owner: Option<usize>) -> Result<DevFfnTicket> {
+        ensure!(owner.is_none(), "dev FFN must be split");
+        let engine = self.engine;
+        let rows = self.tables.rows;
+        if !engine.skip_routed {
+            // An owned layer's complete y is adopted before either router runs.
+            engine.route_input(0, self.weights(0, layer)?, self.lane(0), self.workspaces[0], Scalar::I32(rows as i32))?;
+            if engine.tp2_layer(layer) {
+                engine.route_input(1, self.weights(1, layer)?, self.lane(1), self.workspaces[1], Scalar::I32(rows as i32))?;
+            }
+            engine.probe_ring(layer, self.lane(0), rows, !engine.tp2_layer(layer))?;
+            engine.count_route_fallback(layer);
+        }
+        let ticket = if engine.skip_routed { DevFfnTicket::Shared }
+            else if engine.tp2_layer(layer) { DevFfnTicket::Local }
+            else {
+                ensure!(layer >= engine.local_layers(), "dev layers does not permit TP1 backbone experts");
+                let mut links = self.transports.borrow_mut();
+                let link = links.get_mut(self.lane).context("dev Spark lane transport missing")?;
+                let kind = if self.tables.decode { ExpertV2SourceKind::Decode } else { ExpertV2SourceKind::Prefill };
+                let request = engine.stage_request(layer, rows, self.workspaces[0], self.lane(0), kind, link)?;
+                DevFfnTicket::Spark(self.binding.waves.borrow_mut().begin(self.lane, layer, || link.dispatch(&request))?)
+            };
         let at = slot(layer, true, self.lane);
         for rank in 0..2 {
             let weights = self.weights(rank, layer)?;
             let lane = self.lane(rank);
-            self.engine.run_on(rank, weights.ffn_split, &format!("shared_ffn_m{}", self.cap), &[
+            engine.run_on(rank, weights.ffn_split, &format!("shared_ffn_m{}", self.cap), &[
                 ("x", lane.y.buffer.ptr), ("w13", weights.ptr("w13")?), ("w13_scale", weights.ptr("w13_scale")?),
                 ("w2", weights.ptr("w2")?), ("w2_scale", weights.ptr("w2_scale")?),
                 ("out", lane.shared.buffer.ptr), ("scratch", self.workspaces[rank].scratch.buffer.ptr),
-            ], &[Scalar::I32(self.tables.rows as i32)])?;
-            self.engine.exchange()?.push(rank, at, lane.shared.buffer.ptr, self.tables.rows * self.engine.cfg.dim * 2)?;
+            ], &[Scalar::I32(rows as i32)])?;
+            match ticket {
+                DevFfnTicket::Local => engine.tp2_experts(rank, layer, self.lane, self.workspaces[rank], rows)?,
+                _ if rank == 1 || matches!(ticket, DevFfnTicket::Shared) => {
+                    if rank == 0 && layer + 1 == engine.cfg.n_layers { continue; }
+                    engine.record_peer(rank, "ffn", at, true, layer, self.lane);
+                    engine.exchange()?.push(rank, at, lane.shared.buffer.ptr, rows * engine.cfg.dim * 2)?;
+                }
+                _ => {},
+            }
         }
-        Ok(at)
+        Ok(ticket)
     }
-    fn finish_ffn(&mut self, layer: usize, ticket: usize) -> Result<()> {
+    fn finish_ffn(&mut self, layer: usize, ticket: DevFfnTicket) -> Result<()> {
+        let engine = self.engine;
+        let rows = self.tables.rows;
+        let at = slot(layer, true, self.lane);
+        if let DevFfnTicket::Spark(ticket) = ticket {
+            let wave = self.binding.waves.borrow_mut().take(ticket, self.lane, layer)?;
+            let mut links = self.transports.borrow_mut();
+            let link = links.get_mut(self.lane).context("dev Spark lane transport missing")?;
+            engine.runtime_land_reduce(self.runtime, link, wave, rows, self.workspaces[0], self.lane(0))?;
+            if layer + 1 < engine.cfg.n_layers {
+                engine.record_peer(0, "ffn", at, true, layer, self.lane);
+                engine.exchange()?.push(0, at, self.lane(0).payload.as_ref().context("dev FFN payload")?.buffer.ptr,
+                    rows * engine.cfg.dim * 2)?;
+            }
+        }
         for rank in 0..2 {
-            self.engine.exchange()?.wait(rank, ticket)?;
-            if rank == 1 && layer + 1 == self.engine.cfg.n_layers { continue; }
+            if rank == 1 && layer + 1 == engine.cfg.n_layers { continue; }
             let lane = self.lane(rank);
             let workspace = self.workspaces[rank];
-            self.engine.add(rank, lane.shared.buffer.ptr, self.engine.exchange()?.recv(rank, ticket)?,
-                workspace.sum.buffer.ptr, self.tables.rows)?;
-            self.engine.run_on(rank, false, "mhc_post", &[
+            if matches!(ticket, DevFfnTicket::Local) {
+                engine.tp2_post(rank, layer, self.lane, workspace, lane, rows)?;
+                continue;
+            }
+            engine.record_peer(rank, "ffn", at, false, layer, self.lane);
+            engine.exchange()?.wait(rank, at)?;
+            let received = engine.exchange()?.recv(rank, at)?;
+            let own = if rank == 0 && matches!(ticket, DevFfnTicket::Spark(_)) {
+                lane.payload.as_ref().context("dev FFN payload")?.buffer.ptr
+            } else { lane.shared.buffer.ptr };
+            let (rank0, rank1) = if rank == 0 { (own, received) } else { (received, own) };
+            engine.add(rank, rank0, rank1, workspace.sum.buffer.ptr, rows)?;
+            engine.run_on(rank, false, "mhc_post", &[
                 ("x", workspace.sum.buffer.ptr), ("residual", lane.stream_b.buffer.ptr),
                 ("prev_post", lane.post.buffer.ptr), ("prev_comb", lane.comb.buffer.ptr), ("out", lane.stream_a.buffer.ptr),
-            ], &[Scalar::I32(self.tables.rows as i32)])?;
+            ], &[Scalar::I32(rows as i32)])?;
         }
-        Ok(())
+        engine.tap(self.workspaces[0], self.lane(0), layer, rows)?;
+        engine.probe_mark(layer)
     }
 }

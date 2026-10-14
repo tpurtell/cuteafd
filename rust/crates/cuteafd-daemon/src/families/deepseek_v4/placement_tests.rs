@@ -13,17 +13,31 @@ use cuteafd_loader::plan::{layout::LayoutOptions, plan, ExpertPlacement, PlanOpt
 use std::path::{Path, PathBuf};
 
 #[test]
-fn dev_layer_opt_in_requires_feature_and_diagnostic_arguments() {
+fn dev_layer_opt_in_requires_feature_and_supported_arguments() {
     let cli = Cli::try_parse_from(["serve", "--snapshot", "fixture", "--native-lib", "none"]).unwrap();
     assert!(super::validate_dev_layers(false, &cli.engine).is_ok());
     assert!(super::validate_dev_layers(true, &cli.engine).is_err());
     let mut args = cli.engine;
-    args.skip_routed_experts = true;
     args.split_device = Some(1);
     args.attention_placement = "layers".into();
     assert_eq!(super::validate_dev_layers(true, &args).is_ok(), cfg!(feature = "dev-v4-layers"));
     args.dspark = true;
     assert!(super::validate_dev_layers(true, &args).is_err());
+}
+
+#[test]
+fn serving_layers_requires_compile_time_feature_not_runtime_opt_in() {
+    let cli = Cli::try_parse_from(["serve", "--snapshot", "fixture", "--native-lib", "none"]).unwrap();
+    let mut args = cli.engine;
+    assert!(!super::serving_dev_layers(&args).unwrap());
+    args.attention_placement = "layers".into();
+    assert!(super::serving_dev_layers(&args).is_err(), "two GPUs required");
+    args.split_device = Some(1);
+    assert_eq!(super::serving_dev_layers(&args).is_ok(), cfg!(feature = "dev-v4-layers"));
+    #[cfg(not(feature = "dev-v4-layers"))]
+    assert!(super::serving_dev_layers(&args).unwrap_err().to_string().contains("Cargo feature"));
+    args.dspark = true;
+    assert!(super::serving_dev_layers(&args).is_err(), "drafter binding not yet qualified");
 }
 
 #[derive(Parser)]

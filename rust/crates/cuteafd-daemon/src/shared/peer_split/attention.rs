@@ -132,6 +132,42 @@ pub(crate) struct AttentionStateOwners<'a> {
     pub compressor: Option<&'a [u8]>,
 }
 
+/// Copy handles identify retained work without owning its resources.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FfnWaveTicket {
+    lane: usize,
+    layer: usize,
+    generation: u64,
+}
+
+pub(crate) struct FfnWaveBank<W> {
+    lanes: Vec<Option<(FfnWaveTicket, W)>>,
+    generation: u64,
+}
+
+impl<W> FfnWaveBank<W> {
+    pub fn new(lanes: usize) -> Self { Self { lanes: (0..lanes).map(|_| None).collect(), generation: 0 } }
+    pub fn begin(&mut self, lane: usize, layer: usize, dispatch: impl FnOnce() -> Result<W>) -> Result<FfnWaveTicket> {
+        let slot = self.lanes.get_mut(lane).ok_or_else(|| anyhow::anyhow!("FFN lane outside admission"))?;
+        ensure!(slot.is_none(), "previous FFN wave not closed");
+        let generation = self.generation.checked_add(1).ok_or_else(|| anyhow::anyhow!("FFN ticket overflow"))?;
+        // Dispatch returns its owner directly into the engine bank before any next enqueue.
+        let wave = dispatch()?;
+        let ticket = FfnWaveTicket { lane, layer, generation };
+        *slot = Some((ticket, wave));
+        self.generation = generation;
+        Ok(ticket)
+    }
+    pub fn take(&mut self, ticket: FfnWaveTicket, lane: usize, layer: usize) -> Result<W> {
+        ensure!(ticket.lane == lane && ticket.layer == layer, "FFN ticket binding differs");
+        let slot = self.lanes.get_mut(lane).ok_or_else(|| anyhow::anyhow!("FFN lane outside admission"))?;
+        ensure!(slot.as_ref().is_some_and(|(bound, _)| *bound == ticket), "stale FFN ticket");
+        Ok(slot.take().expect("validated FFN owner").1)
+    }
+    /// Call only after the submission owner proves rank/link/copy drainage.
+    pub fn retire(&mut self) { for slot in &mut self.lanes { *slot = None; } }
+}
+
 pub(crate) trait PipelineKernels: LayerKernels {
     type FfnTicket: Copy;
     /// Describe actual allocated state, including prefix-cache bindings, not
@@ -395,6 +431,51 @@ fn validate_stack(placement: &Placement) -> Result<()> {
 mod tests {
     use super::*;
     use std::cell::RefCell;
+
+    #[test]
+    fn ffn_wave_tickets_do_not_release_owners_and_reject_stale_bindings() {
+        use std::rc::Rc;
+        use std::cell::Cell;
+        struct Owner(Rc<Cell<usize>>);
+        impl Drop for Owner { fn drop(&mut self) { self.0.set(self.0.get() + 1); } }
+        let drops = Rc::new(Cell::new(0));
+        let mut bank = FfnWaveBank::new(2);
+        let ticket = bank.begin(0, 3, || Ok(Owner(drops.clone()))).unwrap();
+        let _copy = ticket;
+        assert_eq!(drops.get(), 0);
+        assert!(bank.take(ticket, 1, 3).is_err());
+        assert!(bank.take(ticket, 0, 4).is_err());
+        assert!(bank.begin(0, 4, || panic!("must refuse before dispatch")).is_err());
+        drop(bank.take(ticket, 0, 3).unwrap());
+        let next = bank.begin(0, 3, || Ok(Owner(drops.clone()))).unwrap();
+        assert_ne!(ticket, next);
+        assert!(bank.take(ticket, 0, 3).is_err());
+        assert_eq!(drops.get(), 1);
+        assert!(bank.begin(1, 4, || anyhow::bail!("dispatch failed")).is_err());
+        bank.retire();
+        assert_eq!(drops.get(), 2);
+    }
+
+    #[test]
+    fn failed_pipeline_submission_retires_wave_after_rank_link_and_copy_drain() {
+        use std::rc::Rc;
+        struct Owner(Rc<RefCell<Vec<&'static str>>>);
+        impl Drop for Owner { fn drop(&mut self) { self.0.borrow_mut().push("drop"); } }
+        let trace = Rc::new(RefCell::new(Vec::new()));
+        let bank = RefCell::new(FfnWaveBank::new(2));
+        crate::shared::experts::rtx::pair::submit_scoped(|| Ok(()),
+            || crate::shared::experts::rtx::pair::teardown(&mut crate::shared::experts::rtx::pair::Teardown {
+                abort: || { trace.borrow_mut().push("abort"); Ok(()) },
+                ranks: || { trace.borrow_mut().push("ranks"); Ok(()) },
+                links: || { trace.borrow_mut().push("links"); Ok(()) },
+                copies: || { trace.borrow_mut().push("copies"); Ok(()) },
+                graphs: || { bank.borrow_mut().retire(); Ok(()) }, finish: |_| {},
+            }), |_| -> Result<()> {
+                let _ticket = bank.borrow_mut().begin(0, 1, || Ok(Owner(trace.clone())))?;
+                anyhow::bail!("next lane enqueue failed")
+            }).unwrap_err();
+        assert_eq!(*trace.borrow(), ["abort", "ranks", "links", "copies", "drop"]);
+    }
 
     struct Recorder {
         calls: RefCell<Vec<String>>,
