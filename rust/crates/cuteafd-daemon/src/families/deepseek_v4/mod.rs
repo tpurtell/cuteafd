@@ -486,6 +486,7 @@ pub(crate) fn with_engine<T>(
         stream,
         sms: args.sms,
         shape,
+        modes: placement.layers.iter().map(|layer| layer.mode).collect(),
         embedding,
         skip_routed: skip,
         context: context_mode,

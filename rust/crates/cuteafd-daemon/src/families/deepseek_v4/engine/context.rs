@@ -259,7 +259,7 @@ impl<'a> Engine<'a> {
     /// Rank `rank`'s C4 record and index pools of layer `layer` (its local units, then the scratch
     /// pages its non-owner compressor rows write).
     fn c4_pools(&self, rank: usize, layer: usize) -> Result<(*mut c_void, *mut c_void)> {
-        let cache = &self.caches_on(rank)[layer];
+        let cache = self.cache_on(rank, layer)?;
         Ok((cache.compressed.as_ref().context("C4 pool")?.buffer.ptr, cache.index.as_ref().context("C4 index")?.buffer.ptr))
     }
 
@@ -279,7 +279,7 @@ impl<'a> Engine<'a> {
                 // both GPUs' assembled query), then the replicated compressor: owned groups into
                 // this GPU's pool, the peer's into its scratch rows.
                 e.attention_produce(rank, self.layer, self.weights, self.lane, w, self.rows, self.cap)?;
-                let cache = &e.caches_on(rank)[self.layer];
+                let cache = e.cache_on(rank, self.layer)?;
                 e.compress_records(rank, self.layer, self.weights, cache, None, self.tables, &self.lane.tables, w,
                     e.attention_rope(rank, 4), self.rows, self.cap)?;
                 Ok(Query { values: w.query.buffer.ptr, row_pitch: e.cfg.n_heads / 2 * 512 * 2 })
@@ -325,7 +325,7 @@ impl<'a> Engine<'a> {
                 // Before the first completed group nothing is selected: an empty C4 list.
                 let selected = if self.tables.c4_groups == 0 { own.empty_window.buffer.ptr } else { own.local_lengths.buffer.ptr };
                 e.run_on(rank, false, &split.partial[rank][heads_rank], &[
-                    ("q", query), ("cache", e.caches_on(rank)[self.layer].main.buffer.ptr),
+                    ("q", query), ("cache", e.cache_on(rank, self.layer)?.main.buffer.ptr),
                     ("indices", m.swa_indices.buffer.ptr), ("lengths", window), ("extra_cache", records),
                     ("extra_indices", w.selected.buffer.ptr), ("extra_lengths", selected), ("out", out.buffer.ptr),
                     ("lse", lse), ("scratch", own.partial_scratch.buffer.ptr)], &[self.rows])?;
@@ -378,7 +378,7 @@ impl<'a> Engine<'a> {
         // The unchanged head-split layer over the staging view: the compressor writes the chunk's
         // groups at their logical rows, the top-k and sparse MLA read it through an identity table.
         self.attention_produce(rank, layer, weights, lane, w, rows, cap)?;
-        let cache = &self.caches_on(rank)[layer];
+        let cache = self.cache_on(rank, layer)?;
         let rope = self.attention_rope(rank, 4);
         let (_, indexed_cache, indexed_indices, indexed_lengths) = self.compress(rank, layer, weights, cache,
             Some((records.ptr, keys.ptr)), tables, &lane.tables, w, rope, rows, cap)?;

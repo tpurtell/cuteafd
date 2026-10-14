@@ -84,7 +84,7 @@ impl<'a> Engine<'a> {
         }
         let first = t - n;
         for (stage, weights) in dspark.stages.iter().enumerate() {
-            let cache = &self.pools[self.cfg.n_layers + stage];
+            let cache = self.cache_on(0, self.cfg.n_layers + stage)?;
             self.run(&format!("producer_m{cap}"), &[
                 ("hidden", w.main_x.buffer.ptr), ("positions", offset(&lane.tables.positions, first * 8)),
                 ("main_slots", offset(&lane.tables.main_slots, first * 8)), ("cos_sin", self.rope_window.buffer.ptr),
@@ -152,7 +152,7 @@ impl<'a> Engine<'a> {
         let scalar = Scalar::I32(rows as i32);
         for (stage, weights) in dspark.stages.iter().enumerate() {
             let layer = self.cfg.n_layers + stage;
-            let cache = &self.pools[layer];
+            let cache = self.cache_on(0, layer)?;
             let (a, b) = (&lane.stream_a, &lane.stream_b);
             self.run("mhc_pre", &[
                 ("residual", a.buffer.ptr), ("fn", weights.ptr("attn.fn")?), ("scale", weights.ptr("attn.scale")?),

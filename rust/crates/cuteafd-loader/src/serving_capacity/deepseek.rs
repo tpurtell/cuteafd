@@ -20,6 +20,20 @@ pub fn deepseek_v4_layer_unit_bytes(ratio: usize) -> u64 {
     }
 }
 
+/// One layer's window, carry, partial-unit reservation and exact retained mark.
+/// The same bytes follow its attention owner under layer placement.
+pub fn deepseek_v4_layer_state_geometry(ratio: usize, prefill_rows: u64) -> Result<(u64, u64), CacheGeometryError> {
+    if !matches!(ratio, 0 | 4 | 128) || prefill_rows == 0 {
+        return Err(CacheGeometryError::Unsupported { family: "deepseek_v4", what: "layer state geometry" });
+    }
+    let carry = match ratio { 4 => 2 * 16 * (1024 + 256) * 4, 128 => 2 * 256 * 512 * 4, _ => 0 };
+    let ring_pages = prefill_rows.checked_add(128).ok_or(CacheGeometryError::Overflow("V4 ring rows"))?.div_ceil(256);
+    let active = sum("V4 layer active state", &[product("V4 window ring", &[ring_pages, 149_760])?,
+        carry, deepseek_v4_layer_unit_bytes(ratio)])?;
+    let mark = sum("V4 layer mark", &[128 * 584, carry])?;
+    Ok((active, mark))
+}
+
 pub fn deepseek_v4_cache_geometry(
     cfg: &DeepseekV4Config,
     ranks: usize,
@@ -45,41 +59,29 @@ pub fn deepseek_v4_cache_geometry(
             what: "window/compressor record, prefill, drafter or coordinator rank geometry",
         });
     }
-    let c4 = cfg.compress_ratios.iter().filter(|&&r| r == 4).count() as u64;
-    let c128 = cfg.compress_ratios.iter().filter(|&&r| r == 128).count() as u64;
     let pages = cfg.compress_ratios.iter().try_fold(0u64, |total, &ratio| {
         sum("V4 compressed units", &[total, deepseek_v4_layer_unit_bytes(ratio)])
     })?;
-    // engine::pool_layer_for: four FP32 carry arrays on C4; two on C128.
-    let carry = sum(
-        "V4 compressor carry",
-        &[
-            product("V4 C4 carry", &[c4, 2 * 16 * (1024 + 256) * 4])?,
-            product("V4 C128 carry", &[c128, 2 * 256 * 512 * 4])?,
-        ],
-    )?;
-    let ring_pages = prefill_rows
-        .checked_add(128)
-        .ok_or(CacheGeometryError::Overflow("V4 ring rows"))?
-        .div_ceil(256);
-    let window = product("V4 window ring", &[ring_pages, 149_760])?;
+    let (active, mark) = cfg.compress_ratios.iter().try_fold((0u64, 0u64), |(active, mark), &ratio| {
+        let (a, m) = deepseek_v4_layer_state_geometry(ratio, prefill_rows)?;
+        Ok::<_, CacheGeometryError>((sum("V4 active state", &[active, a])?, sum("V4 marks", &[mark, m])?))
+    })?;
+    let (draft_active, draft_mark) = deepseek_v4_layer_state_geometry(0, prefill_rows)?;
     let mut costs = Vec::with_capacity(ranks);
     for rank in 0..ranks {
         // The peer allocates backbone caches only. The lead also holds the
         // drafter stages' window rings, even though their experts are separate.
-        let layers = (cfg.n_layers as u64)
-            .checked_add(if rank == 0 { draft_stages as u64 } else { 0 })
-            .ok_or(CacheGeometryError::Overflow("V4 cached layers"))?;
+        let stages = if rank == 0 { draft_stages as u64 } else { 0 };
         costs.push(RankCacheGeometry {
             persistent_unit_bytes: pages,
             // PoolShape::units_for adds one partial compressed unit per slot.
             active_state_per_sequence_bytes: sum(
                 "V4 active state",
-                &[product("V4 window rings", &[layers, window])?, carry, pages],
+                &[active, product("V4 draft windows", &[stages, draft_active])?],
             )?,
             retained_mark_bytes: sum(
                 "V4 prefix mark",
-                &[product("V4 prefix windows", &[layers, 128, 584])?, carry],
+                &[mark, product("V4 draft marks", &[stages, draft_mark])?],
             )?,
             context_table_bytes_per_token: 2 * 64 * 4,
             ..Default::default()
