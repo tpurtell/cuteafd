@@ -112,6 +112,7 @@ impl Engine<'_> {
         if matches!(segment, Segment::DraftKv | Segment::Head) {
             for allocation in [&w.vocab_logits, &w._head_workspace, &w.main_x, &w.main_work,
                 &self.weights.head, &self.weights.head_fn, &self.weights.head_scale, &self.weights.head_base, &self.weights.norm] { bind(allocation); }
+            if let Some(staging) = &w.staged_head { bind(staging); }
             bind(&self.rope_window);
             if let Some(draft) = &self.weights.dspark {
                 for allocation in [&draft.main_proj, &draft.main_proj_scale, &draft.main_norm] { bind(allocation); }
@@ -287,17 +288,13 @@ impl Engine<'_> {
                                 // these initialized residuals never enter model state.
                                 if capturing {
                                     self.library.cuda_zero_bytes(lane.stream_a.buffer, lane.stream_a.buffer.bytes)?;
-                                    self.head_launch(lane, rows, rows, 0, w)?;
+                                    self.staged_head_launch(lane, rows, w)?;
                                     self.sync()?;
                                 }
-                                // Lane1's output offset is the exact row count of
-                                // lane0, not its own row count. Capture all bounded
-                                // contiguous placements, retaining exact scalars.
-                                let offsets = if index == 0 { vec![0] } else { (1..=self.decode_rows - rows).collect::<Vec<_>>() };
-                                for at in offsets {
-                                    let key = self.owner_key(rank, layer, index, tables, w, Segment::Head, at as *mut c_void)?;
-                                    record(key, &|| self.head_launch(lane, rows, rows, at, w))?;
-                                }
+                                // Projection always uses the private origin. The live
+                                // packed offset and real-row copy stay outside capture.
+                                let key = self.owner_key(rank, layer, index, tables, w, Segment::Head, std::ptr::null_mut())?;
+                                record(key, &|| self.staged_head_launch(lane, rows, w))?;
                             }
                         }
                     }

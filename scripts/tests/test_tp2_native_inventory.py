@@ -274,3 +274,39 @@ def test_inventory_signature_matches_installed_toolkit_without_cuda_initializati
     subprocess.run([compiler, "-std=c++17", "-I", str(tmp_path),
                     "-I", str(header.parents[1]), "-fsyntax-only", str(SOURCE)],
                    check=True, capture_output=True)
+
+
+def test_v4_bucket_masks_are_fused_and_leave_shared_consumers_unmasked():
+    router = (ROOT / "native/shared/cuda/expert_router.cu").read_text()
+    reduce = (ROOT / "native/shared/cuda/route_reduce.cu").read_text()
+    masked_router = router.split('extern "C" int32_t cuteafd_dsv4_router_select_masked(', 1)[1].split(
+        'extern "C" int32_t cuteafd_router_select_softmax(', 1)[0]
+    assert "select_hash_kernel<true><<<rows,32" in masked_router
+    assert "select_fast_kernel<true,false,true><<<rows,512" in masked_router
+    assert "uint64_t(rows)*8" in masked_router
+    assert "cudaMemcpy" not in masked_router and "cudaMemset" not in masked_router
+    unmasked = router.split('extern "C" int32_t cuteafd_router_select(', 1)[1].split(
+        '// Fixed bucket launches', 1)[0]
+    assert "select_hash_kernel<false><<<" in unmasked
+    assert "select_fast_kernel<true><<<" in unmasked
+    assert "main_slots" not in unmasked
+    for kernel in ["select_fast_kernel", "select_hash_kernel"]:
+        body = router.split(f"void {'__launch_bounds__(512) ' if kernel == 'select_fast_kernel' else ''}{kernel}(", 1)[1]
+        body = body.split("template<", 1)[0]
+        assert body.index("routing[row*topk+tid]=") < body.index("if constexpr (Masked)")
+        assert "ids[row*topk+tid]=UINT32_MAX;routing[row*topk+tid]=0.0f" in body
+    body = reduce.split("__global__ void rtx_tp2_sum(", 1)[1].split("unsigned rtx_tp2_blocks", 1)[0]
+    assert "if constexpr (Masked)" in body
+    assert body.index("main_slots[i / hidden] < 0") < body.index("tp2_value(rank0[i])")
+    assert "continue;" in body
+    assert "__float2bfloat16_rn(__fadd_rn(tp2_value(rank0[i]), tp2_value(rank1[i])))" in body
+    original = reduce.split('extern "C" int32_t cuteafd_rtx_tp2_sum_async(', 1)[1].split(
+        'extern "C" int32_t cuteafd_dsv4_rtx_tp2_sum_masked_async(', 1)[0]
+    assert "rtx_tp2_sum<float><<<" in original and "rtx_tp2_sum<__nv_bfloat16><<<" in original
+    assert "main_slots" not in original
+    masked_sum = reduce.split('extern "C" int32_t cuteafd_dsv4_rtx_tp2_sum_masked_async(', 1)[1]
+    assert "rtx_tp2_sum<float,true><<<" in masked_sum
+    assert "rtx_tp2_sum<__nv_bfloat16,true><<<" in masked_sum
+    assert "cudaMemcpy" not in masked_sum and "cudaMemset" not in masked_sum
+    for source in [masked_router, masked_sum, body]:
+        assert not re.search(r"\b(188|170)\b|multi_processor_count|L2_CACHE_SIZE|l2_bytes", source)

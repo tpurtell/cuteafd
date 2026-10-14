@@ -416,6 +416,8 @@ struct Workspace<'a> {
     scratch: Dev<'a>,
     dummy: Dev<'a>,
     vocab_logits: Dev<'a>,
+    /// Owner graphs project here; only real rows are copied into packed logits.
+    staged_head: Option<Dev<'a>>,
     /// dSpark: projected taps (BF16) and the projection's FP32 rows, first
     /// tokens and drafts (U32), Markov argmax partials.
     main_x: Dev<'a>,
@@ -754,6 +756,11 @@ impl<'a> Engine<'a> {
             scratch: self.alloc(self.scratch_bytes()?)?,
             dummy: self.zeroed(4096)?,
             vocab_logits: self.alloc(lead_only(t.min(LOGIT_ROWS) * self.cfg.vocab_size * 4))?,
+            staged_head: {
+                let bytes = cuteafd_loader::serving_capacity::deepseek_v4_staged_head_bytes(
+                    self.cfg.vocab_size as u64, t as u64, self.decode_rows as u64, rank, self.owner_graph_mode())?;
+                if bytes > 0 { Some(self.alloc(usize::try_from(bytes)?)?) } else { None }
+            },
             main_x: self.alloc(draft_bytes(t.min(TAP_ROWS) * h * 2))?,
             main_work: self.alloc(draft_bytes(t.min(TAP_ROWS) * h * 4))?,
             first_tokens: self.alloc(draft_bytes(t * 4))?,
@@ -1518,7 +1525,8 @@ impl<'a> Engine<'a> {
                 #[cfg(feature = "dev-v4-layers")]
                 let graphed = if self.owner_graph_mode() && wanted == rows {
                     self.owner_segment(0, self.cfg.n_layers - 1, lane.index, step.tables, w, cap,
-                        graphs::Segment::Head, landed as *mut c_void, || self.head_launch(lane, rows, wanted, landed, w))?;
+                        graphs::Segment::Head, std::ptr::null_mut(), || self.staged_head_launch(lane, rows, w))?;
+                    self.land_staged_head(w, wanted, landed)?;
                     true
                 } else { false };
                 #[cfg(not(feature = "dev-v4-layers"))]
@@ -2427,10 +2435,41 @@ impl<'a> Engine<'a> {
         runtime.block_on(self.land(transport, wave, t, w))
     }
 
+    /// Fixed-origin owner projection; its real-row landing is stream ordered.
+    #[cfg(feature = "dev-v4-layers")]
+    fn staged_head_launch(&self, lane: &Lane<'_>, rows: usize, w: &Workspace<'_>) -> Result<()> {
+        let staging = w.staged_head.as_ref().context("owner staged head")?;
+        self.head_launch_into(lane, rows, rows, staging.buffer.ptr.cast(), w)
+    }
+
+    #[cfg(feature = "dev-v4-layers")]
+    fn land_staged_head(&self, w: &Workspace<'_>, rows: usize, at: usize) -> Result<()> {
+        let staging = w.staged_head.as_ref().context("owner staged head")?;
+        let row_bytes = self.cfg.vocab_size.checked_mul(4).context("head row bytes overflow")?;
+        let bytes = rows.checked_mul(row_bytes).context("head copy bytes overflow")?;
+        let offset = at.checked_mul(row_bytes).context("head copy offset overflow")?;
+        ensure!(offset <= w.vocab_logits.buffer.bytes && bytes <= w.vocab_logits.buffer.bytes - offset,
+            "staged head copy exceeds packed logits");
+        // SAFETY: bounds are checked; the private staging and packed destination
+        // are disjoint and retained. Rank-zero stream orders the copy before reuse.
+        unsafe {
+            let dst = cuteafd_ffi::CuteafdDeviceBuffer {
+                ptr: w.vocab_logits.buffer.ptr.cast::<u8>().add(offset).cast(),
+                bytes: w.vocab_logits.buffer.bytes - offset, ..w.vocab_logits.buffer
+            };
+            self.library.copy_d2d_async(dst, staging.buffer, bytes, self.stream)
+        }
+    }
+
     /// Logits of the last `n` of `t` rows into vocabulary logits rows `at..at + n`.
     fn head_launch(&self, lane: &Lane<'_>, t: usize, n: usize, at: usize, w: &Workspace<'_>) -> Result<()> {
+        // SAFETY: callers check the packed destination extent before launch.
+        let output = unsafe { w.vocab_logits.buffer.ptr.cast::<f32>().add(at * self.cfg.vocab_size) };
+        self.head_launch_into(lane, t, n, output, w)
+    }
+
+    fn head_launch_into(&self, lane: &Lane<'_>, t: usize, n: usize, output: *mut f32, w: &Workspace<'_>) -> Result<()> {
         let h = self.cfg.dim;
-        let vocab = self.cfg.vocab_size;
         self.run("mhc_head", &[
             ("residual", lane.stream_a.buffer.ptr), ("fn", self.weights.head_fn.buffer.ptr),
             ("scale", self.weights.head_scale.buffer.ptr), ("base", self.weights.head_base.buffer.ptr),
@@ -2441,7 +2480,7 @@ impl<'a> Engine<'a> {
         unsafe {
             crate::shared::target_head::launch(crate::shared::target_head::TargetHead::configured(),
                 w.head.as_ref().context("LM head")?, lane.y.buffer.ptr.cast::<u8>().add((t - n) * h * 2).cast(),
-                self.weights.head.buffer.ptr.cast_const(), w.vocab_logits.buffer.ptr.cast::<f32>().add(at * vocab), n,
+                self.weights.head.buffer.ptr.cast_const(), output, n,
                 self.stream)
         }
     }

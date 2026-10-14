@@ -23,7 +23,7 @@ pub mod qwen_graphs;
 mod v4_placement;
 pub use v4_placement::{deepseek_v4_expert_cost, deepseek_v4_native_workspace, deepseek_v4_tp2_expert_cost, deepseek_v4_tp2_native_workspace, deepseek_v4_tp2_workspace, V4ExpertCost};
 mod v4_workspace;
-pub use v4_workspace::{deepseek_v4_decode_lanes, compiled_c128_width, deepseek_v4_expert_exchange_bytes, deepseek_v4_headroom_bytes, deepseek_v4_peer_exchange_bytes, deepseek_v4_workspace_geometry, deepseek_v4_workspace_geometry_for_attention, deepseek_v4_workspace_heads, deepseek_v4_workspace_scratch, V4WorkspaceRank, V4WorkspaceScratch};
+pub use v4_workspace::{deepseek_v4_staged_head_bytes, deepseek_v4_decode_lanes, compiled_c128_width, deepseek_v4_expert_exchange_bytes, deepseek_v4_headroom_bytes, deepseek_v4_peer_exchange_bytes, deepseek_v4_workspace_geometry, deepseek_v4_workspace_geometry_for_attention, deepseek_v4_workspace_heads, deepseek_v4_workspace_scratch, V4WorkspaceRank, V4WorkspaceScratch};
 pub use deepseek::{deepseek_v41_cache_bytes, deepseek_v41_cache_geometry, deepseek_v41_pool_groups,
     deepseek_v4_cache_geometry, deepseek_v4_layer_state_geometry, deepseek_v4_layer_unit_bytes};
 

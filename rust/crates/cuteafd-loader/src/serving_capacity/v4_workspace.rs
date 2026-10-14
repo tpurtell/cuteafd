@@ -184,6 +184,14 @@ pub fn deepseek_v4_decode_lanes(requested: Option<AttentionPlacement>, modes: Op
     if layers { 2 } else { 1 }
 }
 
+/// Private rank-zero vocabulary rows used by owner-mode decode graphs.
+pub fn deepseek_v4_staged_head_bytes(vocab: u64, rows: u64, decode_rows: u64,
+    rank: usize, owner: bool) -> Result<u64, CacheGeometryError> {
+    if owner && rank == 0 && rows == decode_rows {
+        product("V4 staged head", &[rows.min(64), vocab, 4])
+    } else { Ok(0) }
+}
+
 pub fn deepseek_v4_workspace_geometry(
     cfg: &DeepseekV4Config,
     prefill_rows: u64,
@@ -231,7 +239,9 @@ pub fn deepseek_v4_workspace_geometry_for_attention(
             let prefill = step_with_heads(cfg, prefill_rows, 2, width, rank, ranks, scratch, heads[rank] as u64)?;
             let decode = step_with_heads(cfg, decode_rows, decode_lanes, width, rank, ranks, scratch, heads[rank] as u64)?;
             Ok(V4WorkspaceRank {
-                fixed_device_bytes: sum("V4 prefill/decode workspaces", &[prefill.0, decode.0])?,
+                fixed_device_bytes: sum("V4 prefill/decode workspaces", &[prefill.0, decode.0,
+                    deepseek_v4_staged_head_bytes(cfg.vocab_size as u64, prefill_rows, decode_rows, rank, decode_lanes == 2)?,
+                    deepseek_v4_staged_head_bytes(cfg.vocab_size as u64, decode_rows, decode_rows, rank, decode_lanes == 2)?])?,
                 pool_unit_device_bytes: sum(
                     "V4 prefill/decode table slope",
                     &[prefill.1, decode.1],
@@ -485,6 +495,17 @@ mod tests {
     }
 
     #[test]
+    fn staged_head_is_admitted_only_on_owner_decode_rank_zero() {
+        for rows in 1..=64 {
+            assert_eq!(deepseek_v4_staged_head_bytes(129280, rows, rows, 0, true).unwrap(), rows * 129280 * 4);
+            assert_eq!(deepseek_v4_staged_head_bytes(129280, rows, rows, 1, true).unwrap(), 0);
+            assert_eq!(deepseek_v4_staged_head_bytes(129280, rows, rows, 0, false).unwrap(), 0);
+        }
+        assert_eq!(deepseek_v4_staged_head_bytes(129280, 4096, 64, 0, true).unwrap(), 0);
+        assert!(deepseek_v4_staged_head_bytes(u64::MAX, 64, 64, 0, true).is_err());
+    }
+
+    #[test]
     fn attention_owner_widths_pin_heads_context_and_layers_bytes() {
         use crate::placement::FfnMode;
         for pro in [false, true] {
@@ -509,7 +530,8 @@ mod tests {
                     full / if rank == 0 { 1 } else { 2 }).unwrap();
                 let wider_prefill = if rank == 0 { 0 } else { 4096 * full / 2 * 512 * 2 * 2 };
                 assert_eq!(layers[rank].fixed_device_bytes - baseline[rank].fixed_device_bytes,
-                    wider_prefill + owner_decode.0 - base_decode.0);
+                    wider_prefill + owner_decode.0 - base_decode.0
+                        + deepseek_v4_staged_head_bytes(cfg.vocab_size as u64, 64, 64, rank, true).unwrap());
                 assert_eq!(layers[rank].pool_unit_device_bytes - baseline[rank].pool_unit_device_bytes, 64 * 4);
                 assert_eq!(layers[rank].decode_lanes, 2);
                 assert_eq!(layers[rank].pinned_host_bytes, baseline[rank].pinned_host_bytes);

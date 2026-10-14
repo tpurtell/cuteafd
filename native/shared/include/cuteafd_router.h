@@ -24,6 +24,12 @@ int32_t cuteafd_v41_router_select_logits(float* scores,const float* bias,
 int32_t cuteafd_dsv4_router_select(float* logits,const float* bias,const int32_t* tid2eid,
     const uint32_t* tokens,uint32_t* ids,float* routing,int32_t rows,int32_t experts,int32_t topk,
     float route_scale,void* stream);
+// Bucket variant: I64 main_slots [rows] is disjoint from outputs/logits.
+// Negative slots produce UINT32_MAX IDs and positive-zero weights. Padded
+// logits/biases and hash tokens must still be finite/valid for normal routing.
+int32_t cuteafd_dsv4_router_select_masked(float* logits,const float* bias,const int32_t* tid2eid,
+    const uint32_t* tokens,const int64_t* main_slots,uint32_t* ids,float* routing,int32_t rows,
+    int32_t experts,int32_t topk,float route_scale,void* stream);
 // Same, with `sigmoid` != 0 selecting GLM's sigmoid scores (noaux_tc, bias
 // only for the choice); hash tables need sqrtsoftplus.
 int32_t cuteafd_router_select(float* logits,const float* bias,const int32_t* tid2eid,
