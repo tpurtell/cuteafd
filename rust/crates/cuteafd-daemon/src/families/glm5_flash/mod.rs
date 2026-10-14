@@ -1777,7 +1777,7 @@ impl Opened {
                 expert_args.peers = None;
                 if let Some(experts) = self.experts_range(&expert_args, Some(range.clone()), Some(budget))? {
                     if let engine::Experts::LocalExl3(local) = &experts { local.ensure(range.start, stream)?; }
-                    engine.install_local(range, experts);
+                    engine.install_local(range, experts)?;
                 }
             }
             if spark || args.skip_experts {

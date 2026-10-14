@@ -817,10 +817,62 @@ struct Temporaries<'a> {
     scratch: Dev<'a>,
     /// The pool top-k's scratch: zeroed once, restored by every launch.
     topk_scratch: Dev<'a>,
+    /// The local expert layers' scratch, used while they run on their own stream
+    /// ([`ExpertScope`]): the other lane's attention is using the shared `scratch` then.
+    expert_scratch: Dev<'a>,
     logits: Dev<'a>,
     /// The LM head (rank 0 only).
     head: Option<VocabularyHead<'a>>,
     _head_workspace: Dev<'a>,
+}
+
+/// The stream and the scratch the engine's launches of a prefill unit go to while it is queuing a
+/// unit whose routed experts run locally ([`GlmfEngine::expert_scope`]). Those layers' FFN — their
+/// shared expert and the routed add that consumes the experts' output — goes on the expert stream
+/// ([`crate::shared::experts::rtx::ExpertStream`]) so the other lane's attention, which the engine
+/// stream queues next, overlaps it; its scratch is then [`Temporaries::expert_scratch`], never the
+/// lanes' shared one, which that attention is using. Null (`ExpertScope::OFF`) is the engine's own
+/// stream and the shared scratch: decode steps, serial prefills and every Spark or TP2 layer run
+/// that way.
+#[derive(Debug, Clone, Copy)]
+struct ExpertScope {
+    stream: *mut c_void,
+    scratch: *mut c_void,
+}
+
+impl ExpertScope {
+    const OFF: Self = Self { stream: std::ptr::null_mut(), scratch: std::ptr::null_mut() };
+
+    /// Rank 0's stream for the engine's launches: the expert stream under a scope, else `engine`.
+    fn stream(self, engine: *mut c_void) -> *mut c_void {
+        if self.stream.is_null() { engine } else { self.stream }
+    }
+
+    /// The scratch an FFN launch uses: the expert layers' own under a scope, else the lane's.
+    fn scratch(self, shared: *mut c_void) -> *mut c_void {
+        if self.scratch.is_null() { shared } else { self.scratch }
+    }
+}
+
+/// [`GlmfEngine::expert_scope`] set for one block of launches, restored on drop (including an
+/// error's, so a failed unit never leaves the scope behind).
+struct ExpertScopeGuard<'c> {
+    cell: &'c Cell<ExpertScope>,
+    previous: ExpertScope,
+}
+
+impl<'c> ExpertScopeGuard<'c> {
+    fn enter(cell: &'c Cell<ExpertScope>, stream: *mut c_void, scratch: *mut c_void) -> Self {
+        let guard = Self { cell, previous: cell.get() };
+        cell.set(ExpertScope { stream, scratch });
+        guard
+    }
+}
+
+impl Drop for ExpertScopeGuard<'_> {
+    fn drop(&mut self) {
+        self.cell.set(self.previous);
+    }
 }
 
 impl<'a> std::ops::Deref for Workspace<'a> {
@@ -1029,6 +1081,7 @@ impl<'a> StepPlan<'_, 'a> {
             lengths: self.alloc(bytes.lengths)?,
             scratch: self.alloc(bytes.scratch)?,
             topk_scratch: self.zeroed(bytes.topk_scratch)?,
+            expert_scratch: self.alloc(bytes.expert_scratch)?,
             logits: self.alloc(bytes.logits)?,
             // SAFETY: the workspace buffer lives in the same struct and drops after the head.
             head: if shape.lead {
@@ -1266,6 +1319,10 @@ pub(crate) struct GlmfEngine<'a> {
     pub cfg: GlmNextConfig,
     pub weights: GlmfWeights<'a>,
     pub stream: *mut c_void,
+    /// The local expert layers' own stream, once this GPU holds any (`install_local`). Declared
+    /// with the engine's stream, before every buffer it serves, so it drops first and its queued
+    /// launches drain while their operands are alive.
+    expert_stream: Option<crate::shared::experts::rtx::ExpertStream<'a>>,
     pub max_context: usize,
     /// Rows of one prefill lane (and of a serial prefill chunk).
     pub prefill_rows: usize,
@@ -1317,6 +1374,9 @@ pub(crate) struct GlmfEngine<'a> {
     terminal: Cell<crate::shared::peer_split::TerminalState>,
     tp2: Option<Tp2Experts<'a>>,
     local: Option<(std::ops::Range<usize>, Experts<'a>)>,
+    /// The stream and scratch of the local expert layer being queued: [`ExpertScope`]. Off outside
+    /// a prefill lane's local unit.
+    expert_scope: Cell<ExpertScope>,
     /// The drafter (DFlash2 or dSpark): every step taps its target layers.
     pub drafter: Option<super::dspark::Drafter<'a>>,
     /// L2 prefetch of the next layer's weights during decode exchanges.
@@ -1674,7 +1734,8 @@ impl<'a> GlmfEngine<'a> {
         let device = library.cuda_get_device()?;
         let (table_pages, table_pool_pages) = glmf_table_pages(max_context as u64);
         let (table_pages, table_pool_pages) = (usize::try_from(table_pages)?, usize::try_from(table_pool_pages)?);
-        Ok(Self { quantize_grid, library, programs, cfg, weights, stream, max_context, prefill_rows, prefill_lane_count,
+        Ok(Self { quantize_grid, library, programs, cfg, weights, stream, expert_stream: None, max_context,
+            prefill_rows, prefill_lane_count,
             pages, slots, decode_rows, verify_rows,
             attention_plan: cuteafd_core::coordinator_programs::AttentionReductionPlan::new(DECODE_ROWS, None, None)?,
             buckets: DecodeBuckets::new(verify_rows),
@@ -1685,7 +1746,8 @@ impl<'a> GlmfEngine<'a> {
             peer: None, exchange: None, drafter: None, pool_logical_host: RefCell::new(vec![0; pool_pages]), pool_pages,
             table_pages, table_pool_pages, decode_workspace: RefCell::new(None),
             lane_workspaces: RefCell::new(Vec::new()),
-            experts: None, tp2: None, local: None, dense_nvfp4: None, profile: RefCell::new([0.0; 3]), graphs: RefCell::new(GraphBank::new(None)),
+            experts: None, tp2: None, local: None, expert_scope: Cell::new(ExpertScope::OFF), dense_nvfp4: None,
+            profile: RefCell::new([0.0; 3]), graphs: RefCell::new(GraphBank::new(None)),
             use_graphs: std::env::var("CUTEAFD_GLMF_GRAPHS").map_or(true, |v| v != "0"),
             startup_graphs: startup_graphs_enabled(),
             warming_graphs: std::cell::Cell::new(false), logged_graph_shapes: RefCell::new(std::collections::HashSet::new()),
@@ -2060,8 +2122,17 @@ impl<'a> GlmfEngine<'a> {
         self.synchronize()
     }
 
-    pub(crate) fn install_local(&mut self, range: std::ops::Range<usize>, experts: Experts<'a>) {
+    /// Install layer range `range`'s locally resident routed experts, on the engine's device. A
+    /// range of [`Experts::Local`] layers also gets a stream of its own ([`ExpertStream`]), so
+    /// their FFN overlaps the other prefill lane's attention instead of serializing on the engine
+    /// stream; [`Experts::LocalExl3`] layers keep running inline on it.
+    pub(crate) fn install_local(&mut self, range: std::ops::Range<usize>, experts: Experts<'a>) -> Result<()> {
+        if matches!(experts, Experts::Local(_)) {
+            let library = self.library;
+            self.expert_stream = Some(self.on(0, || crate::shared::experts::rtx::ExpertStream::new(library))?);
+        }
         self.local = Some((range, experts));
+        Ok(())
     }
 
     fn routed_experts(&self, layer: usize) -> Option<&Experts<'a>> {
@@ -2406,11 +2477,11 @@ impl<'a> GlmfEngine<'a> {
         self.exchange.as_ref().context("no head-split exchange")
     }
 
-    /// The stream of rank `rank`.
+    /// The stream of rank `rank`: under an [`ExpertScope`], rank 0's is the local expert layers'.
     pub(crate) fn stream_of(&self, rank: usize) -> *mut c_void {
         match (rank, &self.peer) {
             (1, Some(peer)) => peer.stream,
-            _ => self.stream,
+            _ => self.expert_scope.get().stream(self.stream),
         }
     }
 
@@ -2710,7 +2781,7 @@ impl<'a> GlmfEngine<'a> {
         if rank == 0 { self.timed(&name, launch) } else { launch() }
     }
 
-    /// Runs `body` (stream work) between two timing events when profiling ops.
+    /// Runs `body` (rank 0's stream work) between two timing events when profiling ops.
     fn timed<T>(&self, label: &str, body: impl FnOnce() -> Result<T>) -> Result<T> {
         let Some(ops) = &self.ops else { return body() };
         let event = |ops: &mut OpTimes| -> Result<*mut c_void> {
@@ -2724,10 +2795,10 @@ impl<'a> GlmfEngine<'a> {
             (event(&mut ops)?, event(&mut ops)?)
         };
         // SAFETY: both events are live timing events; the engine owns the stream.
-        unsafe { self.library.cuda_event_record(start, self.stream)? };
+        unsafe { self.library.cuda_event_record(start, self.stream_of(0))? };
         let out = body()?;
         // SAFETY: as above.
-        unsafe { self.library.cuda_event_record(end, self.stream)? };
+        unsafe { self.library.cuda_event_record(end, self.stream_of(0))? };
         ops.borrow_mut().pending.push((label.to_owned(), start, end));
         Ok(out)
     }
@@ -4217,6 +4288,13 @@ impl<'a> GlmfEngine<'a> {
         })]
     }
 
+    /// The scratch an FFN launch of `w` uses: the local expert layers' own while they run on their
+    /// own stream (the lane's shared scratch belongs to the other lane's attention then), else the
+    /// lane's shared one.
+    fn ffn_scratch(&self, w: &Workspace<'_>) -> *mut c_void {
+        self.expert_scope.get().scratch(w.scratch.buffer.ptr)
+    }
+
     /// SwiGLU MLP (dense layer or shared expert) of intermediate `inter` into `out`.
     fn ffn(&self, w: &Workspace<'_>, layer: &GlmfLayer<'_>, inter: usize, cap: &str, out: *mut c_void, rows: Scalar)
         -> Result<()> {
@@ -4239,13 +4317,13 @@ impl<'a> GlmfEngine<'a> {
             // (the expert rows: the widest prefill lane or decode step), the output and the
             // scratch are live device buffers used on the engine stream.
             return self.timed("ffn (NVFP4 dense)", || unsafe {
-                dense.module.launch(&pointers, usize::try_from(rows)?, self.stream)
+                dense.module.launch(&pointers, usize::try_from(rows)?, self.stream_of(0))
             });
         }
         let decode = is_decode(cap);
         let pointers = [("x", w.x.buffer.ptr), ("w_gate_up_fp8", layer.ptr("w_gate_up_fp8")?),
             ("w_gate_up_scale", layer.ptr("w_gate_up_scale")?), ("w_down_fp8", layer.ptr("w_down_fp8")?),
-            ("w_down_scale", layer.ptr("w_down_scale")?), ("out", out), ("scratch", w.scratch.buffer.ptr)];
+            ("w_down_scale", layer.ptr("w_down_scale")?), ("out", out), ("scratch", self.ffn_scratch(w))];
         // FP8-only weights: decode rows up to `fp8_rows` on the GEMV; prefill W8A8 or W8A16.
         let inter = inter / if layer.split { 2 } else { 1 };
         self.run_on(rank, layer.split, &format!("ffn_i{inter}_{cap}"), &pointers,
@@ -4576,14 +4654,51 @@ impl<'a> GlmfEngine<'a> {
         if !decode {
             return Ok(());
         }
-        let mark = if local { crate::shared::l2_prefetch::exchange_mark(self.library, self.stream)? } else { None };
+        let mark = if local { crate::shared::l2_prefetch::exchange_mark(self.library, self.stream_of(0))? } else { None };
         if local && mark.is_none() {
             return Ok(());
         }
         if let Some(l2) = &self.l2 {
-            l2.issue(self.library, index, self.stream)?;
+            l2.issue(self.library, index, self.stream_of(0))?;
         }
         crate::shared::l2_prefetch::exchange_wait(self.library, mark)
+    }
+
+    /// A prefill unit's local routed experts on the engine's expert stream: the scope sends the
+    /// unit's shared expert and the routed add that consumes them there too, over
+    /// [`Temporaries::expert_scratch`], so the whole FFN overlaps the other lane's attention, which
+    /// the engine stream queues next. [`Self::experts_out`] is where the engine stream reaches
+    /// their output; the kernels, their order and their arithmetic are unchanged.
+    #[allow(clippy::too_many_arguments)]
+    fn local_experts(&self, w: &Workspace<'_>, index: usize, prepared_peer: Option<&Workspace<'_>>, t: usize,
+        rows: Scalar, cap: &str) -> Result<()> {
+        let layer = &self.weights.layers[index];
+        let Some(stream) = &self.expert_stream else {
+            return self.moe_experts(w, index, layer, t, rows, cap, false, prepared_peer);
+        };
+        stream.begin(self.stream)?;
+        let queued = {
+            let _scope = ExpertScopeGuard::enter(&self.expert_scope, stream.stream(), w.expert_scratch.buffer.ptr);
+            self.moe_experts(w, index, layer, t, rows, cap, false, prepared_peer)
+        };
+        if queued.is_err() {
+            // A failure can leave part of the unit queued, and this path never reaches
+            // [`Self::experts_out`]: drain it, since nothing may outlive the step's own drain.
+            if let Err(error) = stream.synchronize() {
+                tracing::error!(%error, "draining a failed local expert unit");
+            }
+        }
+        queued
+    }
+
+    /// Order the engine stream after the local experts queued since [`Self::local_experts`]: the
+    /// unit's post reads their output. Queued after the next unit's attention, which runs while
+    /// they do.
+    fn experts_out(&self) -> Result<()> {
+        match &self.expert_stream {
+            Some(stream) => stream.end(self.stream),
+            None => Ok(()),
+        }
     }
 
     /// The routed experts of layer `index` (the front ran); leaves
@@ -4611,28 +4726,29 @@ impl<'a> GlmfEngine<'a> {
                 let fp8 = local.experts.borrow();
                 ensure!(!fp8.wire_input(), "the coordinator FP8 package takes BF16 rows");
                 // SAFETY: input rows, route ids, weights and the output are live
-                // buffers of `t` rows on this engine's stream.
+                // buffers of `t` rows on the stream ordering every launch of this block
+                // (`stream_of`, the expert stream under an [`ExpertScope`]).
                 unsafe {
                     fp8.run(resident, t, w.x.buffer.ptr, w.route_ids.buffer.ptr, w.route_weights.buffer.ptr,
-                        w.routed_ptr()?, self.stream)?;
+                        w.routed_ptr()?, self.stream_of(0))?;
                 }
                 if local.window.is_some() {
                     // Diagnostic paging may drop this layer before the stream drains.
                     // SAFETY: the engine owns this stream.
-                    unsafe { self.library.cuda_stream_synchronize(self.stream)? };
+                    unsafe { self.library.cuda_stream_synchronize(self.stream_of(0))? };
                 }
             }
             Experts::LocalExl3(local) => {
                 shared()?;
-                local.ensure(index, self.stream)?;
+                local.ensure(index, self.stream_of(0))?;
                 let mut resident = local.resident.borrow_mut();
                 let (_, experts) = resident.as_mut().context("EXL3 window")?;
                 // SAFETY: wire rows, routes and the shared-expert rows are complete in
                 // stream order; the output is copied before the window can change.
                 unsafe {
                     experts.run(crate::families::deepseek_v4::local::LocalLayer::Backbone(index), t, w.wire.buffer.ptr,
-                        w.route_ids.buffer.ptr, w.route_weights.buffer.ptr, w.shared.buffer.ptr, self.stream)?;
-                    self.library.copy_d2d_async(w.delta.buffer, experts.output.buffer, t * h * 2, self.stream)?;
+                        w.route_ids.buffer.ptr, w.route_weights.buffer.ptr, w.shared.buffer.ptr, self.stream_of(0))?;
+                    self.library.copy_d2d_async(w.delta.buffer, experts.output.buffer, t * h * 2, self.stream_of(0))?;
                 }
                 return Ok(());
             }
@@ -4912,12 +5028,15 @@ impl<'a> GlmfEngine<'a> {
                 let local_post = || -> Result<()> {
                     peer_next(unit)?;
                     if early_next { attention(next.context("independent next unit")?)?; }
+                    // A local unit's experts ran on their own stream, in parallel with that
+                    // attention; the post below is the engine stream's first reader of their output.
+                    self.experts_out()?;
                     post(unit)
                 };
                 if layers[layer].dense {
                     local_post()?;
                 } else if self.local.as_ref().is_some_and(|(range, _)| range.contains(&layer)) {
-                    self.moe_experts(w, layer, &layers[layer], count_of(lane), rows_of(lane), cap, false, w1)?;
+                    self.local_experts(w, layer, w1, count_of(lane), rows_of(lane), cap)?;
                     local_post()?;
                 } else if self.tp2_layer(layer) {
                     self.tp2_pair(layer, lane, w, w1, count_of(lane), rows_of(lane), cap)?;
@@ -5464,8 +5583,8 @@ mod prefill_lane_tests {
             kda_heads: 64, kda_head_dim: 128, heads: 64, q_lora_rank: 1536, kv_lora_rank: 512,
             qk_nope_dim: 256, v_head_dim: 256, index_topk: 2048, index_kpool: 4, eos: vec![] };
         // Frozen99c PROGRAMS.json capacities; actual ledger counts, not scaled guesses.
-        let decode = GlmfScratch { programs: 26_214_400, topk: 8_653_824 };
-        let prefill = GlmfScratch { programs: 782_236_672, topk: 558_007_296 };
+        let decode = GlmfScratch { programs: 26_214_400, topk: 8_653_824, expert: 786_432 };
+        let prefill = GlmfScratch { programs: 782_236_672, topk: 558_007_296, expert: 67_633_152 };
         let shape = GlmfStepShape { lead: true, split: false, tp2_experts: false, local_experts: true, spark: false, partial_bytes: 2,
             output_shard: false, full_prefill_logits: false, table_pages: 32768, table_pool_pages: 8192 };
         // A whole workspace per lane, with the head-split rows every workspace used to hold: the
@@ -5475,16 +5594,19 @@ mod prefill_lane_tests {
             (lane.zero, lane.sum) = (Some(rows * 4096 * 2), Some(rows * 4096 * 2));
             lane.device_bytes() + glmf_temporary_bytes(&cfg, rows, step_decode, &shape, scratch).device_bytes()
         };
-        assert_eq!(whole(4096, false, prefill), 2_486_583_296);
-        assert_eq!(whole(64, true, decode), 106_421_504);
+        assert_eq!(whole(4096, false, prefill), 2_554_216_448);
+        assert_eq!(whole(64, true, decode), 106_421_760);
         let tracked = 2 * whole(4096, false, prefill) + whole(64, true, decode);
-        assert_eq!(tracked, 5_079_588_096);
-        assert_eq!(tracked - 5_068_061_409, 11_526_687);
+        assert_eq!(tracked, 5_214_854_656);
+        // The frozen ledger gains the same terms the model does — one expert scratch per prefill
+        // lane, and the decode lane's floored 256 B like every other allocation — so the WP9
+        // two-lane+decode deficit is unchanged.
+        assert_eq!(tracked - 5_068_061_409 - 2 * 67_633_152 - 256, 11_526_687);
         // Two lanes over one set of temporaries, without a head split's rows: 2.13 GB less.
         let shared = glmf_step_workspaces(&cfg, 2, 4096, 64, &shape, decode, prefill).device_bytes();
-        assert_eq!(shared, 2_950_470_912);
+        assert_eq!(shared, 3_018_104_320);
         let spark = GlmfStepShape { local_experts: false, spark: true, ..shape };
-        assert_eq!(glmf_step_workspaces(&cfg, 2, 4096, 64, &spark, decode, prefill).device_bytes(), 2_882_837_760);
+        assert_eq!(glmf_step_workspaces(&cfg, 2, 4096, 64, &spark, decode, prefill).device_bytes(), 2_882_838_272);
         let reserve = super::workspace_reserve_bytes(shared, 2, true);
         assert_eq!(reserve, shared + 4 * super::WORKSPACE_RUNTIME_OVERHEAD_BYTES);
         assert!(reserve >= shared + 3 * 71_942_144 + 68_269_888);

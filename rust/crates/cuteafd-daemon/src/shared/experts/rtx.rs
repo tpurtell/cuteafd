@@ -16,6 +16,8 @@
 //!   runs the fused all-reduce's two kernels.
 //! - [`routes::RouteIdentity`]: replicated routers are checked byte-for-byte
 //!   at startup, with the broadcast fallback.
+//! - [`stream::ExpertStream`]: a stream of its own for local experts whose
+//!   engine queues other work behind them on one stream.
 use anyhow::Result;
 use std::ffi::c_void;
 
@@ -25,9 +27,11 @@ pub(crate) mod fp8moe;
 pub(crate) mod native;
 pub(crate) mod pair;
 pub(crate) mod routes;
+pub(crate) mod stream;
 
 pub(crate) use combine::{Combine, ExchangeDtype, FusedCombine};
 pub(crate) use routes::{RouteCheck, RouteIdentity, RouteSource};
+pub(crate) use stream::ExpertStream;
 
 /// Which part of each routed expert a resident layer set holds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

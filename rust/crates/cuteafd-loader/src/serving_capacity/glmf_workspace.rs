@@ -10,8 +10,11 @@
 //! index rows, the programs' scratch, the logits and the vocabulary head).
 //! Prefill lanes run on one stream and use the temporaries only inside one
 //! unit's attention call, so a GPU's lanes share one set; decode keeps its own,
-//! since its captured graphs hold its pointers. Allocations are floored at 256
-//! bytes, as in the engine.
+//! since its captured graphs hold its pointers. The one exception is a lane's
+//! local expert layers, which run on a stream of their own so the other lane's
+//! attention overlaps them: the shared expert they run there writes
+//! [`GlmfTemporaryBytes::expert_scratch`], never the lanes' shared scratch.
+//! Allocations are floored at 256 bytes, as in the engine.
 use crate::families::glm5_flash::GlmNextConfig;
 
 /// Rows of the decode-route programs (`_m64`).
@@ -112,11 +115,16 @@ impl GlmfKdaState {
 }
 
 /// A step's scratch: the largest of its programs' (with the KDA output shard's
-/// joined heads after it), and the index top-k's own, which stays zeroed.
+/// joined heads after it), the index top-k's own, which stays zeroed, and the
+/// local expert layers' shared expert, which runs on a stream of its own
+/// (`GlmfTemporaryBytes::expert_scratch`).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct GlmfScratch {
     pub programs: u64,
     pub topk: u64,
+    /// The layered FFN of a routed layer (`ffn_i{moe_intermediate}_{cap}`), the one program the
+    /// local expert layers' shared expert launches.
+    pub expert: u64,
 }
 
 /// A program a step launches that the build lacks.
@@ -145,7 +153,8 @@ pub fn glmf_step_scratch(lookup: impl Fn(&str) -> Option<u64>, cfg: &GlmNextConf
         return Ok(narrow);
     }
     let wide = glmf_cap_scratch(&lookup, cfg, options, rows, &format!("m{GLMF_WIDE_DECODE_ROWS}"), "decode")?;
-    Ok(GlmfScratch { programs: narrow.programs.max(wide.programs), topk: narrow.topk.max(wide.topk) })
+    Ok(GlmfScratch { programs: narrow.programs.max(wide.programs), topk: narrow.topk.max(wide.topk),
+        expert: narrow.expert.max(wide.expert) })
 }
 
 /// [`glmf_step_scratch`] of the programs of one capacity `cap` (`m64`, `m128`, `m4096`) and route
@@ -165,6 +174,9 @@ fn glmf_cap_scratch(lookup: &impl Fn(&str) -> Option<u64>, cfg: &GlmNextConfig, 
         // The step's key | gate rows follow the compact producer's query and projection scratch.
         scratch = scratch.max(required(format!("glmf_index_producer_c_{cap}"))?);
     }
+    // The local expert layers' shared expert: their own layers always run the whole
+    // intermediate (a head split runs none of them), so this is the program they launch.
+    let expert = required(format!("glmf_ffn_i{}_{cap}", cfg.moe_intermediate))?;
     if options.split {
         // The head split's share programs (those this build has).
         for name in [format!("kda_{cap}"), format!("mla_producer_{cap}"), format!("sparse_mla_{mode}_{cap}"),
@@ -184,7 +196,7 @@ fn glmf_cap_scratch(lookup: &impl Fn(&str) -> Option<u64>, cfg: &GlmNextConfig, 
             scratch = scratch.max(required(format!("glmf2_kda_output_rows{expanded}_{cap}"))? + output);
         }
     }
-    Ok(GlmfScratch { programs: scratch, topk: required(format!("glmf_index_topk_{mode}_{cap}"))? })
+    Ok(GlmfScratch { programs: scratch, topk: required(format!("glmf_index_topk_{mode}_{cap}"))?, expert })
 }
 
 /// `glmf_step_scratch`'s lookup over an exported `PROGRAMS.json`.
@@ -253,6 +265,9 @@ pub struct GlmfTemporaryBytes {
     pub lengths: u64,
     pub scratch: u64,
     pub topk_scratch: u64,
+    /// The local expert layers' shared expert, which a prefill lane runs on a stream of its own so
+    /// the other lane's attention overlaps it (their own programs' scratch is elsewhere).
+    pub expert_scratch: u64,
     pub logits: u64,
     pub head_workspace: u64,
 }
@@ -261,7 +276,7 @@ impl GlmfTemporaryBytes {
     /// Device bytes, every allocation floored as the engine allocates it.
     pub fn device_bytes(&self) -> u64 {
         [self.query, self.q_resid, self.latent, self.q_fp8, self.head_weights, self.pools, self.indices,
-            self.lengths, self.scratch, self.topk_scratch, self.logits, self.head_workspace]
+            self.lengths, self.scratch, self.topk_scratch, self.expert_scratch, self.logits, self.head_workspace]
             .into_iter().map(|bytes| bytes.max(FLOOR)).sum()
     }
 }
@@ -317,6 +332,8 @@ pub fn glmf_temporary_bytes(cfg: &GlmNextConfig, rows: u64, decode: bool, shape:
         lengths: t * 4,
         scratch: scratch.programs,
         topk_scratch: scratch.topk,
+        // A decode step runs its local expert layers inline, in its own stream's order.
+        expert_scratch: if shape.local_experts && !decode { scratch.expert } else { 0 },
         logits: lead(logit_rows * cfg.vocab_size as u64 * 4),
         head_workspace: lead(GLMF_HEAD_WORKSPACE),
     }
@@ -430,11 +447,12 @@ mod tests {
     fn the_scratch_selection_takes_the_largest_program_of_each_step_shape() {
         let cfg = glm53_flash();
         // mhc_pre's prefill-capacity scratch is the largest a decode step launches.
-        assert_eq!(scratch(&cfg, 64, true), GlmfScratch { programs: 26_214_400, topk: 8_653_824 });
+        assert_eq!(scratch(&cfg, 64, true), GlmfScratch { programs: 26_214_400, topk: 8_653_824, expert: 786_432 });
         // The KDA programs' (their chunked recurrence workspace at 4,096 rows) for prefill,
         // whatever the lane's rows: the programs lay it out for their capacity.
         for rows in [2048, 4096] {
-            assert_eq!(scratch(&cfg, rows, false), GlmfScratch { programs: 782_236_672, topk: 558_007_296 });
+            assert_eq!(scratch(&cfg, rows, false),
+                GlmfScratch { programs: 782_236_672, topk: 558_007_296, expert: 67_633_152 });
         }
         let error = glmf_step_scratch(|name| lookup(name).filter(|_| name != "glmf_o_m4096"), &cfg,
             GlmfScratchOptions::default(), 4096, false).unwrap_err();
@@ -464,7 +482,9 @@ mod tests {
             lane.device_bytes() + glmf_temporary_bytes(&cfg, rows, decode, &shape, scratch(&cfg, rows, decode))
                 .device_bytes()
         };
-        assert_eq!(unshared(64, true) + 2 * unshared(4096, false), 5_069_385_816);
+        // The three workspaces' temporaries each hold the local expert layers' scratch allocation
+        // now, floored at 256 B in a shape that runs none of them (`spark_shape`): +768.
+        assert_eq!(unshared(64, true) + 2 * unshared(4096, false), 5_069_385_816 + 3 * 256);
     }
 
     #[test]
@@ -474,14 +494,37 @@ mod tests {
         let workspaces = |lanes: usize, rows: u64| glmf_step_workspaces(&cfg, lanes, rows, GLMF_DECODE_ROWS, &shape,
             scratch(&cfg, 64, true), scratch(&cfg, rows, false));
         let two = workspaces(2, 4096);
-        assert_eq!((two.decode, two.lane, two.prefill_temporaries), (94_955_520, 391_914_540, 1_993_850_880));
-        assert_eq!(two.device_bytes(), 2_872_635_480);
+        assert_eq!((two.decode, two.lane, two.prefill_temporaries), (94_955_776, 391_914_540, 1_993_851_136));
+        assert_eq!(two.device_bytes(), 2_872_635_992);
         // Four lanes of 2,048 rows hold the same rows in flight; the per-row temporaries halve,
         // the programs' scratch (laid out for 4,096 rows) does not.
         let four = workspaces(4, 2048);
-        assert_eq!((four.lane, four.prefill_temporaries), (195_961_900, 1_688_969_216));
-        assert_eq!(four.device_bytes(), 2_567_772_336);
+        assert_eq!((four.lane, four.prefill_temporaries), (195_961_900, 1_688_969_472));
+        assert_eq!(four.device_bytes(), 2_567_772_848);
         assert_eq!(workspaces(1, 4096).device_bytes(), two.device_bytes() - two.lane);
+    }
+
+    /// A GPU with local experts runs their shared expert on its own stream, over its own scratch:
+    /// the prefill lanes' shared temporaries grow by exactly that program's scratch, once whatever
+    /// the lanes are, and the decode workspace's local experts (inline, engine-stream ordered) take
+    /// none.
+    #[test]
+    fn local_experts_charge_one_expert_scratch_to_the_prefill_lanes() {
+        let cfg = glm53_flash();
+        let local = GlmfStepShape { local_experts: true, ..spark_shape() };
+        let ffn = lookup("glmf_ffn_i2048_m4096").unwrap();
+        assert_eq!(scratch(&cfg, 4096, false).expert, ffn);
+        assert_eq!(glmf_temporary_bytes(&cfg, 4096, false, &local, scratch(&cfg, 4096, false)).expert_scratch, ffn);
+        assert_eq!(glmf_temporary_bytes(&cfg, 4096, false, &spark_shape(), scratch(&cfg, 4096, false)).expert_scratch, 0);
+        assert_eq!(glmf_temporary_bytes(&cfg, 64, true, &local, scratch(&cfg, 64, true)).expert_scratch, 0);
+        let lanes = |shape: &GlmfStepShape| glmf_step_workspaces(&cfg, 2, 4096, GLMF_DECODE_ROWS, shape,
+            scratch(&cfg, 64, true), scratch(&cfg, 4096, false));
+        // The scratch a local shape runs replaces the 256 B floor a shape without one pays.
+        assert_eq!(lanes(&local).prefill_temporaries, lanes(&spark_shape()).prefill_temporaries - FLOOR + ffn);
+        // No part of it leaks into a lane's own buffers: the one a local experts shape holds and a
+        // Spark shape's does not is the routed add's output (4,096 rows x 4,096 x 2), and the lane's
+        // temporaries are charged where they always were.
+        assert_eq!(lanes(&local).lane - lanes(&spark_shape()).lane, 4_096 * 4_096 * 2);
     }
 
     #[test]
@@ -626,7 +669,7 @@ mod tests {
         let wide = |rows| glmf_step_scratch(wide_lookup, &cfg, GlmfScratchOptions::default(), rows, true);
         // mhc_pre's 26,214,400 B stays the largest program scratch (the one-split sparse MLA is
         // 16,809,984 B); the wide top-k's 17,304,576 B replaces the 64-row one's 8,653,824 B.
-        assert_eq!(wide(128).unwrap(), GlmfScratch { programs: 26_214_400, topk: 17_304_576 });
+        assert_eq!(wide(128).unwrap(), GlmfScratch { programs: 26_214_400, topk: 17_304_576, expert: 1_572_864 });
         assert_eq!(wide(64).unwrap(), scratch(&cfg, 64, true));
         assert_eq!(glmf_step_scratch(lookup, &cfg, GlmfScratchOptions::default(), 64, true).unwrap(),
             scratch(&cfg, 64, true));
@@ -637,7 +680,7 @@ mod tests {
         let compact = GlmfScratchOptions { index_compact: true, kda_state: GlmfKdaState::Bf16, kda_w8: true,
             ..Default::default() };
         assert_eq!(glmf_step_scratch(wide_lookup, &cfg, compact, 128, true).unwrap(),
-            GlmfScratch { programs: 26_214_400, topk: 17_304_576 });
+            GlmfScratch { programs: 26_214_400, topk: 17_304_576, expert: 1_572_864 });
         let without = |name: &str| wide_lookup(name).filter(|_| name != "glmf_index_producer_c_m128");
         assert_eq!(glmf_step_scratch(without, &cfg, compact, 128, true).unwrap_err(),
             GlmfMissingProgram("glmf_index_producer_c_m128".into()));
@@ -662,7 +705,7 @@ mod tests {
         let (narrow, broad) = (at(GLMF_DECODE_ROWS), at(GLMF_WIDE_DECODE_ROWS));
         assert_eq!((broad.lane, broad.lanes, broad.prefill_temporaries), (narrow.lane, narrow.lanes, narrow.prefill_temporaries));
         let rows = |decode_rows| glmf_lane_bytes(&cfg, decode_rows, true, &shape).device_bytes()
-            + glmf_temporary_bytes(&cfg, decode_rows, true, &shape, GlmfScratch { programs: 0, topk: 0 }).device_bytes()
+            + glmf_temporary_bytes(&cfg, decode_rows, true, &shape, GlmfScratch { programs: 0, topk: 0, expert: 0 }).device_bytes()
             - 2 * FLOOR;
         assert_eq!(rows(128) - rows(64), 55_955_712);
         assert_eq!(broad.decode - narrow.decode, 55_955_712 + (17_304_576 - 8_653_824));
