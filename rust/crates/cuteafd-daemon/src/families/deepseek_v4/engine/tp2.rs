@@ -199,6 +199,8 @@ impl<'a> Engine<'a> {
                 ensure!(failures.is_empty(), "{}", failures.join("; ")); Ok(())
             },
             graphs: || {
+                #[cfg(feature = "dev-v4-layers")]
+                if let Some(binding) = &self.dev_layers { binding.waves.borrow_mut().retire(); }
                 for link in transports.borrow_mut().iter_mut() { link.terminal_release()?; }
                 for rank in 0..(1 + usize::from(self.peer.is_some())) {
                     self.on(rank, || {
@@ -247,6 +249,11 @@ impl<'a> Engine<'a> {
     /// expert output from the next lane. All three use the executor's one stream.
     pub(super) fn tp2_experts(&self, rank: usize, layer: usize, index: usize, w: &Workspace<'_>, rows: usize)
         -> Result<()> {
+        self.tp2_partial(rank, layer, index, w, rows, true)
+    }
+
+    fn tp2_partial(&self, rank: usize, layer: usize, index: usize, w: &Workspace<'_>, rows: usize, publish: bool)
+        -> Result<()> {
         let tp2 = self.tp2.as_ref().context("TP2 experts")?;
         let lane = &w.lanes[index];
         let payload = lane.payload.as_ref().context("TP2 lane payload")?;
@@ -256,7 +263,7 @@ impl<'a> Engine<'a> {
         self.collect_routes(rank, layer, index, rows, w)?;
         self.on(rank, || {
             let mut routes = Routes { ids: lane.route_ids.buffer.ptr, weights: lane.route_weights.buffer.ptr };
-            if tp2.source.get() == RouteSource::Broadcast {
+            if publish && tp2.source.get() == RouteSource::Broadcast {
                 let slot = 2 * index + layer % 2;
                 let packed = PackedRoutes::new(rows, self.cfg.n_activated_experts);
                 if rank == 0 {
@@ -294,7 +301,7 @@ impl<'a> Engine<'a> {
             copied?;
             tp2.output_pending[rank].set(false);
             // Publish before either stream queues its matching wait; no wait in the local expert path.
-            if rank == 1 || layer + 1 < self.cfg.n_layers {
+            if publish && (rank == 1 || layer + 1 < self.cfg.n_layers) {
                 self.record_peer(rank, "ffn", slot(layer, true, index), true, layer, index);
                 self.exchange()?.push(rank, slot(layer, true, index), payload.buffer.ptr,
                     combine.payload_bytes(rows, self.cfg.dim))?;
@@ -448,6 +455,8 @@ impl<'a> Engine<'a> {
         self.decode(&mut [(&mut placement, 1)], transports.first_mut(), runtime)?;
         allocator.release(placement);
         // Cache/state writes were to scratch placement; released slots are overwritten on admission.
+        #[cfg(feature = "dev-v4-layers")]
+        if self.dev_layers.is_some() { self.publish_route_source(); return Ok(()); }
         self.warm_broadcast_graphs()?;
         self.publish_route_source();
         Ok(())
@@ -495,6 +504,39 @@ impl<'a> Engine<'a> {
                     }
                 }
                 // SAFETY: startup-only independent work; neither stream has a peer wait yet.
+                unsafe { self.library.cuda_stream_synchronize(self.stream_of(rank)) }
+            })?;
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "dev-v4-layers")]
+    pub(super) fn warm_dev_tp2(&self) -> Result<()> {
+        let Some(tp2) = &self.tp2 else { return Ok(()) };
+        if self.prefill_workspace.borrow().is_none() {
+            *self.prefill_workspace.borrow_mut() = Some(self.workspace(self.prefill_rows, PREFILL_LANES)?);
+        }
+        let peer = self.peer()?;
+        if peer.prefill_workspace.borrow().is_none() {
+            *peer.prefill_workspace.borrow_mut() = Some(self.workspace_on(1, self.prefill_rows, PREFILL_LANES)?);
+        }
+        for rank in 0..2 {
+            let workspace = if rank == 0 { self.prefill_workspace.borrow() } else { peer.prefill_workspace.borrow() };
+            let w = workspace.as_ref().context("dev prime workspace")?;
+            let lane = &w.lanes[0];
+            self.on(rank, || {
+                // SAFETY: startup buffers are initialized while both rank streams have no peer waits.
+                unsafe {
+                    for buffer in [&lane.wire, &lane.route_ids, &lane.route_weights, &lane.shared] {
+                        self.library.cuda_zero_bytes(buffer.buffer, buffer.buffer.bytes)?;
+                    }
+                    tp2.ranks[rank].borrow_mut().prime(ExpertInput::Fp8K32(lane.wire.buffer.ptr),
+                        Routes { ids: lane.route_ids.buffer.ptr, weights: lane.route_weights.buffer.ptr }, self.stream_of(rank))?;
+                }
+                for rows in [1, 16, 64, 80, 256, 1024, 4096] {
+                    if rows <= self.prefill_rows { self.tp2_partial(rank, tp2.layers.start, 0, w, rows, false)?; }
+                }
+                // SAFETY: no peer publications/waits were queued by startup partials.
                 unsafe { self.library.cuda_stream_synchronize(self.stream_of(rank)) }
             })?;
         }
