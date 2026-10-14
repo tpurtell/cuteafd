@@ -16,6 +16,46 @@ fn fixture_library() -> Result<NativeLibrary> {
     unsafe { NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?) }
 }
 
+fn validate_fp32_output(bytes: &[u8], label: &str, name: &str, rows: usize) -> Result<()> {
+    let carry = if label.contains("compressor_continuation_c4") && name.ends_with("_score_state") {
+        Some((16, if name == "index_score_state" { 256 } else { 1024 }, 3))
+    } else if label.contains("compressor_continuation_c128") && name == "main_score_state" {
+        Some((256, 512, 127))
+    } else { None };
+    // Each fixture sequence contributes one row starting at ratio-1. The
+    // finalizer requires -inf exactly where no carry position exists yet.
+    for (index, word) in bytes.chunks_exact(4).enumerate() {
+        let value = f32::from_ne_bytes(word.try_into().unwrap());
+        let sentinel = carry.is_some_and(|(state_rows, width, last)|
+            index / (state_rows * width) < rows && (index / width) % state_rows > last);
+        ensure!(if sentinel { value.to_bits() == f32::NEG_INFINITY.to_bits() } else { value.is_finite() },
+            "{label} rows={rows} {name} FP32 element={index} invalid value {value}; sentinel={sentinel}");
+    }
+    Ok(())
+}
+
+#[test]
+fn owner_bucket_fixture_score_sentinels_are_coordinate_exact() -> Result<()> {
+    for (ratio, state_rows, width, name) in [(4, 16, 1024, "main_score_state"),
+        (4, 16, 256, "index_score_state"), (128, 256, 512, "main_score_state")] {
+        let label = format!("dsv4f_compressor_continuation_c{ratio}");
+        let mut words = vec![0.25f32; 2 * state_rows * width];
+        for row in ratio..state_rows { words[row * width..(row + 1) * width].fill(f32::NEG_INFINITY); }
+        validate_fp32_output(&f32_bytes(words.iter().copied()), &label, name, 1)?;
+        for invalid in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            words[0] = invalid;
+            assert!(validate_fp32_output(&f32_bytes(words.iter().copied()), &label, name, 1).is_err());
+        }
+        words[0] = 0.25;
+        words[state_rows * width] = f32::NEG_INFINITY;
+        assert!(validate_fp32_output(&f32_bytes(words.iter().copied()), &label, name, 1).is_err());
+        words[state_rows * width] = 0.25;
+        words[ratio * width] = 0.0;
+        assert!(validate_fp32_output(&f32_bytes(words.iter().copied()), &label, name, 1).is_err());
+    }
+    Ok(())
+}
+
 struct Tensor<'a> {
     dev: Dev<'a>,
     initial: Vec<u8>,
@@ -85,8 +125,7 @@ impl<'a> Fixture<'a> {
             let actual = self.read(name, bytes)?;
             let expected = reference.read(name, bytes)?;
             match tensor.dtype.as_deref() {
-                Some("float32") => ensure!(actual.chunks_exact(4).all(|b|
-                    f32::from_ne_bytes(b.try_into().unwrap()).is_finite()), "{label} {name} nonfinite FP32 output"),
+                Some("float32") => validate_fp32_output(&actual, label, name, rows)?,
                 Some("bfloat16") => ensure!(actual.chunks_exact(2).all(|b|
                     u16::from_ne_bytes(b.try_into().unwrap()) & 0x7f80 != 0x7f80), "{label} {name} nonfinite BF16 output"),
                 Some("float8_e4m3fn") => ensure!(actual.iter().all(|b| b & 0x7f != 0x7f), "{label} {name} NaN FP8 output"),
