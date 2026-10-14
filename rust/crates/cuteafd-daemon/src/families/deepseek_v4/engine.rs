@@ -92,6 +92,14 @@ pub(crate) struct Engine<'a> {
     graph_captures: std::cell::Cell<usize>,
     expert_graph_captures: std::cell::Cell<usize>,
     draft_probe: RefCell<Option<crate::shared::draft::probe::RoundProbe<'a>>>,
+    #[cfg(feature = "dev-v4-layers")]
+    dev_layers: Option<DevLayers<'a>>,
+}
+
+#[cfg(feature = "dev-v4-layers")]
+struct DevLayers<'a> {
+    plan: cuteafd_loader::placement::LayerExecutionPlan,
+    hops: crate::shared::peer_split::hop::HopLink<'a>,
 }
 
 /// The second GPU of a two-GPU head split (rank 1): its share of every
@@ -418,8 +426,15 @@ impl<'a> Engine<'a> {
     pub fn attach_peer(&mut self, device: i32, stream: *mut c_void, layers: Vec<LayerWeights<'a>>, parts: PeerParts)
         -> Result<()> {
         let _memory_scope = cuteafd_ffi::memory_ledger::scope("peer-split");
-        ensure!(self.split_family.is_some() && layers.len() == self.cfg.n_layers && layers.iter().all(|l| l.attention_split && l.ffn_split),
-            "attach_peer needs the head-split shares of every backbone layer");
+        ensure!(self.split_family.is_some() && layers.len() == self.cfg.n_layers,
+            "attach_peer needs every backbone layer's rank-1 share");
+        for (layer, weights) in layers.iter().enumerate() {
+            let owned = matches!(self.modes[layer], cuteafd_loader::placement::LayerMode::Whole { .. });
+            ensure!(weights.ffn_split && weights.attention_split != owned,
+                "rank-1 layer {layer} disagrees with its frozen attention/FFN mode");
+            ensure!(!owned || (cfg!(feature = "dev-v4-layers") && self.skip_routed),
+                "owned V4 attention is golden-dev-only");
+        }
         let slot_bytes = if parts.tp2 || self.exchange_policy == ExchangePolicy::F32 {
             self.exchange_policy.slot_bytes(self.prefill_rows, self.decode_rows, self.cfg.dim)
         } else { self.prefill_rows.max(self.decode_rows) * self.cfg.dim * 2 };
@@ -542,6 +557,8 @@ impl<'a> Engine<'a> {
             graph_captures: std::cell::Cell::new(0),
             expert_graph_captures: std::cell::Cell::new(0),
             draft_probe: RefCell::new(None),
+            #[cfg(feature = "dev-v4-layers")]
+            dev_layers: None,
             rope_window: table(false)?,
             rope_compressed: table(true)?,
             pools,
@@ -742,6 +759,95 @@ impl<'a> Engine<'a> {
             .with_context(|| format!("layer {layer} has no attention cache on rank {rank}"))
     }
 
+    /// The four post-attention operands stay native and are copied row-wise
+    /// into admitted persistent storage; stream order protects sender reuse.
+    fn pack_attention_handoff(&self, hops: &crate::shared::peer_split::hop::HopLink<'_>,
+        hop: cuteafd_loader::placement::Hop, lane: &Lane<'_>, rows: usize) -> Result<*const c_void> {
+        use cuteafd_loader::placement::{families::deepseek_v4::V4AttentionHandoff, HopPoint};
+        if hop.at == HopPoint::Entry { return Ok(lane.stream_a.buffer.ptr.cast_const()); }
+        let rank = usize::from(hop.from);
+        let sender = hops.sender(rank, lane.index)?;
+        let geometry = V4AttentionHandoff::new(self.cfg.dim as u64).context("V4 handoff geometry")?;
+        let after = matches!(hop.at, HopPoint::AfterAttention(_));
+        ensure!(hop.row_bytes == if after { geometry.row_bytes } else { 8 * self.cfg.dim as u64 },
+            "V4 handoff payload differs from admitted hop");
+        let sections = if after {
+            vec![(geometry.residual, &lane.stream_b, self.cfg.dim * 8),
+                (geometry.y, &lane.y, self.cfg.dim * 2), (geometry.post, &lane.post, 16),
+                (geometry.comb, &lane.comb, 64)]
+        } else { vec![(0, &lane.stream_a, self.cfg.dim * 8)] };
+        self.on(rank, || {
+            for (offset, source, width) in sections {
+                let offset = usize::try_from(offset)?;
+                ensure!(offset <= sender.bytes, "handoff offset exceeds packing buffer");
+                // SAFETY: source and persistent sender cover the pitched row spans;
+                // they do not overlap and the rank stream consumes before reuse.
+                unsafe {
+                    let destination = cuteafd_ffi::CuteafdDeviceBuffer {
+                        ptr: sender.ptr.cast::<u8>().add(offset).cast(), bytes: sender.bytes - offset, ..sender };
+                    self.library.copy_d2d_2d_async(destination, hop.row_bytes as usize,
+                        source.buffer, width, width, rows, self.stream_of(rank))?;
+                }
+            }
+            Ok(())
+        })?;
+        Ok(sender.ptr.cast_const())
+    }
+
+    fn adopt_attention_handoff(&self, hop: cuteafd_loader::placement::Hop, source: *mut c_void,
+        lane: &Lane<'_>, rows: usize) -> Result<()> {
+        use cuteafd_loader::placement::{families::deepseek_v4::V4AttentionHandoff, HopPoint};
+        ensure!(hop.at != HopPoint::Entry, "entry already lands in the step input");
+        let rank = usize::from(hop.to);
+        let geometry = V4AttentionHandoff::new(self.cfg.dim as u64).context("V4 handoff geometry")?;
+        let after = matches!(hop.at, HopPoint::AfterAttention(_));
+        ensure!(hop.row_bytes == if after { geometry.row_bytes } else { 8 * self.cfg.dim as u64 },
+            "V4 handoff payload differs from admitted hop");
+        let sections = if after {
+            vec![(geometry.residual, &lane.stream_b, self.cfg.dim * 8),
+                (geometry.y, &lane.y, self.cfg.dim * 2), (geometry.post, &lane.post, 16),
+                (geometry.comb, &lane.comb, 64)]
+        } else { vec![(0, &lane.stream_a, self.cfg.dim * 8)] };
+        let bytes = rows.checked_mul(usize::try_from(hop.row_bytes)?).context("V4 handoff span overflow")?;
+        self.on(rank, || {
+            for (offset, destination, width) in sections {
+                let offset = usize::try_from(offset)?;
+                ensure!(offset <= bytes, "handoff offset exceeds received payload");
+                // SAFETY: the shared hop wait precedes these copies on the receiving
+                // stream. Both pitched spans are live until the lane closes its FFN.
+                unsafe {
+                    let input = cuteafd_ffi::CuteafdDeviceBuffer { ptr: source.cast::<u8>().add(offset).cast(),
+                        bytes: bytes - offset, device_id: destination.buffer.device_id, flags: 0 };
+                    self.library.copy_d2d_2d_async(destination.buffer, width, input,
+                        hop.row_bytes as usize, width, rows, self.stream_of(rank))?;
+                }
+            }
+            Ok(())
+        })
+    }
+
+    #[cfg(feature = "dev-v4-layers")]
+    pub fn attach_dev_layers(&mut self, placement: &cuteafd_loader::placement::Placement,
+        spec: cuteafd_loader::placement::HopSpec) -> Result<()> {
+        ensure!(self.skip_routed && self.weights.dspark.is_none() && self.tp2.is_none()
+            && self.context.is_none(), "dev layers is shared-expert-only and eager");
+        let plan = cuteafd_loader::placement::LayerExecutionPlan::new(placement, spec)?;
+        ensure!(plan.modes() == self.modes, "dev layers differs from loaded modes");
+        let peer = self.peer()?;
+        let mut hops = crate::shared::peer_split::hop::HopLink::new(self.library,
+            [RankDevice { device: self.device, stream: self.stream },
+                RankDevice { device: peer.device, stream: peer.stream }], plan.hops(), spec)?;
+        let exchange = self.exchange()?;
+        hops.attach_abort([exchange.abort_word(0)?.context("rank0 abort")?,
+            exchange.abort_word(1)?.context("rank1 abort")?])?;
+        hops.validate_binding(&plan, exchange)?;
+        let charged = cuteafd_loader::placement::hop_storage_bytes(plan.hops(), &spec, 2)
+            .context("dev hop admission")?;
+        for rank in 0..2 { ensure!(hops.fixed_bytes(rank) == charged[rank], "dev hop allocation differs from admission"); }
+        self.dev_layers = Some(DevLayers { plan, hops });
+        Ok(())
+    }
+
     /// Longest chunk one [`Self::prefill`] call takes.
     pub fn prefill_capacity(&self) -> usize {
         PREFILL_LANES * self.prefill_rows
@@ -901,13 +1007,14 @@ impl<'a> Engine<'a> {
         download: bool,
     ) -> Result<Logits> {
         let transports = RefCell::new(transports);
-        crate::shared::experts::rtx::pair::submit(
+        crate::shared::experts::rtx::pair::submit_scoped(
             || self.require_live(), || self.shutdown_submission(&mut transports.borrow_mut()),
-            || self.step_inner(lanes, &mut transports.borrow_mut(), runtime, logit_rows, on_layer, download))
+            |scope| self.step_inner(scope, lanes, &mut transports.borrow_mut(), runtime, logit_rows, on_layer, download))
     }
 
     fn step_inner(
         &self,
+        _scope: &crate::shared::experts::rtx::pair::SubmissionScope<'_>,
         lanes: &[LaneStep<'_>],
         transports: &mut [SparkLink<'_>],
         runtime: &tokio::runtime::Runtime,
@@ -969,6 +1076,25 @@ impl<'a> Engine<'a> {
             Some(ws) => Some(ws.as_ref().context("peer workspace")?),
             None => None,
         };
+        #[cfg(feature = "dev-v4-layers")]
+        if let Some(binding) = &self.dev_layers {
+            ensure!(on_layer.is_none(), "dev layers gate supports logits/cache, not per-layer downloads");
+            let w1 = w1.context("dev layers peer workspace")?;
+            // SAFETY: all previous rank-1 reads drain before its tables change.
+            self.on(1, || unsafe { self.library.cuda_stream_synchronize(self.stream_of(1)) })?;
+            for (step, lane) in lanes.iter().zip(&w1.lanes) {
+                self.on(1, || self.fill(&lane.tables, step.tables))?;
+            }
+            if gather && decode { self.gather_streams(&w.lanes[0], lanes[0].tables.rows)?; }
+            let mut kernels = lanes.iter().enumerate().map(|(index, step)|
+                DevLayerKernels::new(self, binding, [w, w1], index, step.tables, cap))
+                .collect::<Result<Vec<_>>>()?;
+            crate::shared::peer_split::attention::layer_pipeline(_scope, &binding.plan, self.exchange()?,
+                &binding.hops, crate::shared::peer_split::attention::LaneOrder::OrderedChunks,
+                &lanes.iter().map(|step| step.tables.rows).collect::<Vec<_>>(), &mut kernels)?;
+            drop(kernels);
+            return self.finish_step(lanes, w, logit_rows, cap, total, download);
+        }
         if let Some(w1) = w1 {
             // SAFETY: the engine owns the peer stream; every wait on it was matched by a
             // push rank 0 queued, so it drains before its tables are rewritten.
@@ -1188,6 +1314,11 @@ impl<'a> Engine<'a> {
                 anyhow::Ok(())
             })?;
         }
+        self.finish_step(lanes, w, logit_rows, cap, total, download)
+    }
+
+    fn finish_step(&self, lanes: &[LaneStep<'_>], w: &Workspace<'_>, logit_rows: usize,
+        cap: usize, total: usize, download: bool) -> Result<Logits> {
         for (index, step) in lanes.iter().enumerate() {
             self.write_draft_kv(w, &w.lanes[index], step.tables.rows, cap)?;
         }
@@ -1647,7 +1778,7 @@ impl<'a> Engine<'a> {
             ("base", weights.ptr("ffn.base")?), ("norm", weights.ptr("ffn.norm")?), ("residual_out", b.buffer.ptr),
             ("post", lane.post.buffer.ptr), ("comb", lane.comb.buffer.ptr), ("y", lane.y.buffer.ptr), ("scratch", w.scratch.buffer.ptr),
         ], &[rows])?;
-        if rank != 0 && !self.tp2_layer_weights(weights) {
+        if self.skip_routed || (rank != 0 && !self.tp2_layer_weights(weights)) {
             return Ok(());
         }
         let Scalar::I32(t) = rows else { unreachable!() };
@@ -2123,5 +2254,144 @@ impl Logits {
             Logits::Device(Some(logits)) => Ok(logits),
             _ => anyhow::bail!("the step left no device logits"),
         }
+    }
+}
+
+#[cfg(feature = "dev-v4-layers")]
+struct DevLayerKernels<'e, 'a, 's> {
+    engine: &'e Engine<'a>,
+    binding: &'e DevLayers<'a>,
+    workspaces: [&'e Workspace<'a>; 2],
+    lane: usize,
+    tables: &'s StepTables,
+    cap: usize,
+    weights: Vec<Vec<u8>>,
+    kv: Vec<Vec<u8>>,
+    indexer: Vec<Vec<u8>>,
+    compressor: Vec<Vec<u8>>,
+}
+
+#[cfg(feature = "dev-v4-layers")]
+impl<'e, 'a, 's> DevLayerKernels<'e, 'a, 's> {
+    fn new(engine: &'e Engine<'a>, binding: &'e DevLayers<'a>,
+        workspaces: [&'e Workspace<'a>; 2], lane: usize, tables: &'s StepTables, cap: usize) -> Result<Self> {
+        let mut result = Self { engine, binding, workspaces, lane, tables, cap,
+            weights: vec![vec![]; engine.cfg.n_layers], kv: vec![vec![]; engine.cfg.n_layers],
+            indexer: vec![vec![]; engine.cfg.n_layers], compressor: vec![vec![]; engine.cfg.n_layers] };
+        for layer in 0..engine.cfg.n_layers {
+            for rank in 0..2 {
+                let weights = if rank == 0 { &engine.weights.layers[layer] } else { &engine.peer()?.layers[layer] };
+                if weights.ptr("w_q").is_ok() {
+                    for source in cuteafd_loader::families::deepseek_v4::resident::layer_sources(&engine.cfg, weights.ratio) {
+                        if !cuteafd_loader::families::deepseek_v4::resident::ffn_operand(source.operand) {
+                            weights.ptr(source.operand)?;
+                        }
+                    }
+                    result.weights[layer].push(rank as u8);
+                }
+                if let Ok(cache) = engine.cache_on(rank, layer) {
+                    ensure!(!cache.main.buffer.ptr.is_null(), "dev KV allocation absent");
+                    result.kv[layer].push(rank as u8);
+                    if weights.ratio == 4 {
+                        ensure!(cache.index.is_some() && cache.states.len() == 4, "dev C4 state incomplete");
+                        result.indexer[layer].push(rank as u8);
+                    }
+                    if weights.ratio != 0 {
+                        ensure!(cache.compressed.is_some() && cache.states.len() >= 2, "dev compressor incomplete");
+                        result.compressor[layer].push(rank as u8);
+                    }
+                }
+            }
+        }
+        Ok(result)
+    }
+
+    fn lane(&self, rank: usize) -> &Lane<'a> { &self.workspaces[rank].lanes[self.lane] }
+    fn weights(&self, rank: usize, layer: usize) -> Result<&LayerWeights<'a>> {
+        Ok(if rank == 0 { &self.engine.weights.layers[layer] } else { &self.engine.peer()?.layers[layer] })
+    }
+    fn back(&self, rank: usize, layer: usize, output: *mut c_void) -> Result<()> {
+        self.engine.attention_back(rank, self.weights(rank, layer)?, self.lane(rank),
+            self.workspaces[rank], Scalar::I32(self.tables.rows as i32), self.cap, output)
+    }
+}
+
+#[cfg(feature = "dev-v4-layers")]
+impl crate::shared::peer_split::attention::LayerKernels for DevLayerKernels<'_, '_, '_> {
+    fn pack(&mut self, hop: cuteafd_loader::placement::Hop) -> Result<*const c_void> {
+        self.engine.pack_attention_handoff(&self.binding.hops, hop, self.lane(usize::from(hop.from)), self.tables.rows)
+    }
+    fn entry_destination(&mut self, rank: usize) -> Result<*mut c_void> {
+        Ok(self.lane(rank).stream_a.buffer.ptr)
+    }
+    fn adopt(&mut self, hop: cuteafd_loader::placement::Hop, residual: *mut c_void) -> Result<()> {
+        if hop.at == cuteafd_loader::placement::HopPoint::Entry { return Ok(()); }
+        self.engine.adopt_attention_handoff(hop, residual, self.lane(usize::from(hop.to)), self.tables.rows)
+    }
+    fn heads(&mut self, layer: usize) -> Result<()> {
+        let engine = self.engine;
+        let exchange = engine.exchange()?;
+        let at = slot(layer, false, self.lane);
+        for rank in 0..2 {
+            engine.attention_front(rank, layer, self.weights(rank, layer)?, self.tables, self.lane(rank),
+                self.workspaces[rank], Scalar::I32(self.tables.rows as i32), self.cap)?;
+            exchange.push(rank, at, self.workspaces[rank].delta.buffer.ptr, self.tables.rows * engine.cfg.dim * 2)?;
+        }
+        for rank in 0..2 {
+            exchange.wait(rank, at)?;
+            engine.add(rank, self.workspaces[rank].delta.buffer.ptr, exchange.recv(rank, at)?,
+                self.workspaces[rank].sum.buffer.ptr, self.tables.rows)?;
+            self.back(rank, layer, self.workspaces[rank].sum.buffer.ptr)?;
+        }
+        Ok(())
+    }
+    fn context(&mut self, _: usize, _: usize) -> Result<()> { anyhow::bail!("dev layers never binds context") }
+    fn owned(&mut self, layer: usize, rank: usize) -> Result<()> {
+        self.engine.attention_front(rank, layer, self.weights(rank, layer)?, self.tables, self.lane(rank),
+            self.workspaces[rank], Scalar::I32(self.tables.rows as i32), self.cap)?;
+        self.back(rank, layer, self.workspaces[rank].delta.buffer.ptr)
+    }
+    fn ffn(&mut self, _: usize, _: Option<usize>) -> Result<()> { anyhow::bail!("dev layers uses deferred FFN") }
+}
+
+#[cfg(feature = "dev-v4-layers")]
+impl crate::shared::peer_split::attention::PipelineKernels for DevLayerKernels<'_, '_, '_> {
+    type FfnTicket = usize;
+    fn state_owners(&self, layer: usize) -> Result<crate::shared::peer_split::attention::AttentionStateOwners<'_>> {
+        let ratio = self.engine.cfg.compress_ratios[layer];
+        Ok(crate::shared::peer_split::attention::AttentionStateOwners {
+            weights: &self.weights[layer], kv: &self.kv[layer],
+            indexer: (ratio == 4).then_some(&self.indexer[layer][..]),
+            compressor: (ratio != 0).then_some(&self.compressor[layer][..]) })
+    }
+    fn begin_ffn(&mut self, layer: usize, owner: Option<usize>) -> Result<usize> {
+        ensure!(owner.is_none() && self.engine.skip_routed, "dev FFN must be split shared-only");
+        let at = slot(layer, true, self.lane);
+        for rank in 0..2 {
+            let weights = self.weights(rank, layer)?;
+            let lane = self.lane(rank);
+            self.engine.run_on(rank, weights.ffn_split, &format!("shared_ffn_m{}", self.cap), &[
+                ("x", lane.y.buffer.ptr), ("w13", weights.ptr("w13")?), ("w13_scale", weights.ptr("w13_scale")?),
+                ("w2", weights.ptr("w2")?), ("w2_scale", weights.ptr("w2_scale")?),
+                ("out", lane.shared.buffer.ptr), ("scratch", self.workspaces[rank].scratch.buffer.ptr),
+            ], &[Scalar::I32(self.tables.rows as i32)])?;
+            self.engine.exchange()?.push(rank, at, lane.shared.buffer.ptr, self.tables.rows * self.engine.cfg.dim * 2)?;
+        }
+        Ok(at)
+    }
+    fn finish_ffn(&mut self, layer: usize, ticket: usize) -> Result<()> {
+        for rank in 0..2 {
+            self.engine.exchange()?.wait(rank, ticket)?;
+            if rank == 1 && layer + 1 == self.engine.cfg.n_layers { continue; }
+            let lane = self.lane(rank);
+            let workspace = self.workspaces[rank];
+            self.engine.add(rank, lane.shared.buffer.ptr, self.engine.exchange()?.recv(rank, ticket)?,
+                workspace.sum.buffer.ptr, self.tables.rows)?;
+            self.engine.run_on(rank, false, "mhc_post", &[
+                ("x", workspace.sum.buffer.ptr), ("residual", lane.stream_b.buffer.ptr),
+                ("prev_post", lane.post.buffer.ptr), ("prev_comb", lane.comb.buffer.ptr), ("out", lane.stream_a.buffer.ptr),
+            ], &[Scalar::I32(self.tables.rows as i32)])?;
+        }
+        Ok(())
     }
 }

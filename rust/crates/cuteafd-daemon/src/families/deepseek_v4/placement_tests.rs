@@ -12,6 +12,20 @@ use cuteafd_loader::placement::{solve, Baseline, Onboard, Placement};
 use cuteafd_loader::plan::{layout::LayoutOptions, plan, ExpertPlacement, PlanOptions};
 use std::path::{Path, PathBuf};
 
+#[test]
+fn dev_layer_opt_in_requires_feature_and_diagnostic_arguments() {
+    let cli = Cli::try_parse_from(["serve", "--snapshot", "fixture", "--native-lib", "none"]).unwrap();
+    assert!(super::validate_dev_layers(false, &cli.engine).is_ok());
+    assert!(super::validate_dev_layers(true, &cli.engine).is_err());
+    let mut args = cli.engine;
+    args.skip_routed_experts = true;
+    args.split_device = Some(1);
+    args.attention_placement = "layers".into();
+    assert_eq!(super::validate_dev_layers(true, &args).is_ok(), cfg!(feature = "dev-v4-layers"));
+    args.dspark = true;
+    assert!(super::validate_dev_layers(true, &args).is_err());
+}
+
 #[derive(Parser)]
 struct Cli {
     #[command(flatten)]
@@ -425,7 +439,7 @@ fn inputs_dir() -> Option<PathBuf> {
 
 /// Header-only max-card admission pin with real program/package inventories.
 /// The test-only executor proves the workspace/state envelope, not serving
-/// support; complete handoff, graph and decode-lane charges are still pending.
+/// support; graph and independent decode-lane charges are still pending.
 #[test]
 fn planner_v4_max_owner_workspace_pool_regression() {
     use cuteafd_loader::placement::{AttentionPlacement, LayerMode};
@@ -461,12 +475,24 @@ fn planner_v4_max_owner_workspace_pool_regression() {
             assert_eq!(steps(&layers) - steps(&heads), if rank == 0 { 0 } else { extra });
             assert!(layers.layers.iter().any(|layer| matches!(layer.mode,
                 LayerMode::Whole { gpu, .. } if usize::from(gpu) == rank)));
+            let payload = cuteafd_loader::placement::families::deepseek_v4::V4AttentionHandoff::new(cfg.dim as u64).unwrap();
+            let expected = 2 * 3 * 4096 * payload.row_bytes + 256;
+            assert_eq!(layers.items[rank].iter().filter(|item| item.group == "residual hops")
+                .map(|item| item.bytes).sum::<u64>(), expected);
+            eprintln!("{model}-max rank{rank}: full handoff storage={expected} B");
         }
         eprintln!("{model}-max: heads={} context={} test-only layers={}; extra workspace=[0,{extra}] B",
             heads.pool_tokens, context.pool_tokens, layers.pool_tokens);
         assert_eq!(heads.pool_tokens, 2 << 20);
         assert_eq!(context.pool_tokens, 2 << 20);
         assert_eq!(layers.pool_tokens, 2 << 20);
+        assert!(super::check_modes(&layers, true, &cfg).is_err(), "production rejects dev owners");
+        #[cfg(feature = "dev-v4-layers")]
+        {
+            assert!(!super::checked_engine_modes(true, &layers, true, &cfg).unwrap());
+            let spec = super::dev_layer_hop_spec(&cfg, 4096, 64).unwrap();
+            assert!(cuteafd_loader::placement::LayerExecutionPlan::new(&layers, spec).is_ok());
+        }
         let refused = plan(snapshot, &PlanOptions {
             placement: ExpertPlacement::from_spark_ranks(sparks),
             layout: Some(LayoutOptions { rtx_bytes: vec![budget; 2], context_tokens: 1_048_576,

@@ -221,6 +221,71 @@ fn check_modes(placement: &cuteafd_loader::placement::Placement, split: bool, cf
     Ok(context)
 }
 
+fn dev_golden_layers(args: &EngineArgs) -> Result<bool> {
+    let enabled = match std::env::var("CUTEAFD_DEV_V4_LAYERS") {
+        Err(std::env::VarError::NotPresent) => false,
+        Ok(value) if value == "1" => true,
+        _ => anyhow::bail!("CUTEAFD_DEV_V4_LAYERS must be absent or 1"),
+    };
+    ensure!(!enabled || cfg!(feature = "dev-v4-layers"), "dev V4 layers feature is absent");
+    validate_dev_layers(enabled, args)?;
+    Ok(enabled)
+}
+
+fn validate_dev_layers(enabled: bool, args: &EngineArgs) -> Result<()> {
+    ensure!(!enabled || cfg!(feature = "dev-v4-layers"), "dev V4 layers feature is absent");
+    ensure!(!enabled || (args.skip_routed_experts && args.split_device.is_some() && !args.dspark
+        && args.attention_placement == "layers"),
+        "dev V4 layers needs layers, two GPUs, --skip-routed-experts and no dSpark");
+    Ok(())
+}
+
+fn dev_layer_request(enabled: bool, request: &mut cuteafd_loader::placement::PlacementRequest,
+    cfg: &DeepseekV4Config) -> Result<()> {
+    if !enabled { return Ok(()); }
+    ensure!(cfg!(feature = "dev-v4-layers") && request.inventory.gpus.len() == 2,
+        "dev V4 layers needs the compile-time feature and two admitted GPUs");
+    use cuteafd_loader::placement::{ExecutorModes, FfnMode, LayerMode, LayerOwnership};
+    const MODES: [LayerMode; 3] = [LayerMode::HeadSplit,
+        LayerMode::Whole { gpu: 0, ffn: FfnMode::Split },
+        LayerMode::Whole { gpu: 1, ffn: FfnMode::Split }];
+    request.executor = ExecutorModes { modes: &MODES, hops: true, ..request.executor };
+    request.policy.ownership = LayerOwnership::NonemptyRanges;
+    for (layer, &ratio) in request.layers.iter_mut().zip(&cfg.compress_ratios) {
+        if ratio == 4 { layer.modes = MODES.to_vec(); }
+    }
+    Ok(())
+}
+
+fn checked_engine_modes(dev: bool, placement: &cuteafd_loader::placement::Placement, split: bool,
+    cfg: &DeepseekV4Config) -> Result<bool> {
+    if !dev { return check_modes(placement, split, cfg); }
+    ensure!(cfg!(feature = "dev-v4-layers") && split && placement.layers.len() == cfg.n_layers,
+        "invalid dev V4 layers binding");
+    use cuteafd_loader::placement::{FfnMode, LayerMode};
+    let mut owners = [false; 2];
+    for (layer, &ratio) in placement.layers.iter().zip(&cfg.compress_ratios) {
+        match (ratio, layer.mode) {
+            (4, LayerMode::Whole { gpu, ffn: FfnMode::Split }) if gpu < 2 => owners[usize::from(gpu)] = true,
+            (4, _) => anyhow::bail!("dev V4 C4 must be owned with split FFN"),
+            (_, LayerMode::HeadSplit) => {},
+            _ => anyhow::bail!("dev V4 non-C4 must remain head split"),
+        }
+    }
+    ensure!(owners == [true; 2], "dev V4 layers requires both owners");
+    Ok(false)
+}
+
+#[cfg(feature = "dev-v4-layers")]
+fn dev_layer_hop_spec(cfg: &DeepseekV4Config, prefill: usize, decode: usize)
+    -> Result<cuteafd_loader::placement::HopSpec> {
+    use cuteafd_loader::placement::{families::deepseek_v4::V4AttentionHandoff, HopSpec, TerminalHome};
+    Ok(HopSpec { row_bytes: 8 * cfg.dim as u64,
+        after_attention_row_bytes: Some(V4AttentionHandoff::new(cfg.dim as u64).context("V4 handoff geometry")?.row_bytes),
+        packed_sender: true, rows: prefill.max(decode) as u64, lanes: engine::PREFILL_LANES as u64,
+        entry_gpu: 0, head_gpu: 0, terminal: TerminalHome::Head })
+}
+
 fn f32s(bytes: &[u8]) -> Vec<f32> {
     bytes.chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect()
 }
@@ -294,6 +359,18 @@ pub(crate) fn with_engine<T>(
     held: impl FnOnce(&engine::Engine<'_>) -> Result<usize>,
     body: impl FnOnce(&engine::Engine<'_>, &mut [SparkLink<'_>], &tokio::runtime::Runtime) -> Result<T>,
 ) -> Result<T> {
+    with_engine_mode(loaded, args, prefix, false, held, body)
+}
+
+fn with_engine_mode<T>(
+    loaded: &Loaded,
+    args: &EngineArgs,
+    prefix: Option<&crate::shared::prefix::PrefixArgs>,
+    dev_layers: bool,
+    held: impl FnOnce(&engine::Engine<'_>) -> Result<usize>,
+    body: impl FnOnce(&engine::Engine<'_>, &mut [SparkLink<'_>], &tokio::runtime::Runtime) -> Result<T>,
+) -> Result<T> {
+    validate_dev_layers(dev_layers, args)?;
     let programs = loaded.library.programs()?.with_manifest(&args.manifest)?;
     let caps = &loaded.manifest["capacities"];
     let stream = loaded.library.cuda_stream_create()?;
@@ -398,10 +475,11 @@ pub(crate) fn with_engine<T>(
             family: loaded.family, gpus, loaded_modes: None, cache_stages,
             prefill_rows, decode_rows, max_context, prefix,
             expert_workspace, tp2_workspace, exchange_f32 };
-        let request = admission::request(args, &inputs)?;
+        let mut request = admission::request(args, &inputs)?;
+        dev_layer_request(dev_layers, &mut request, &loaded.cfg)?;
         let placement = cuteafd_loader::placement::solve(&request)
             .map_err(|error| anyhow::anyhow!("DeepSeek V4 admission: {error}"))?;
-        check_modes(&placement, split_device.is_some(), &loaded.cfg)?;
+        checked_engine_modes(dev_layers, &placement, split_device.is_some(), &loaded.cfg)?;
         let loaded_modes = placement.layers.iter().map(|layer| layer.mode).collect::<Vec<_>>();
         let started = Instant::now();
         let loader = weights::WeightLoader {
@@ -429,6 +507,7 @@ pub(crate) fn with_engine<T>(
             Baseline::Measured { free_bytes } => *free_bytes, Baseline::Planned { .. } => 0 }).collect::<Vec<_>>());
         let measured_inputs = admission::Inputs { gpus: measured_gpus, loaded_modes: Some(&loaded_modes), ..inputs };
         let mut measured_request = admission::request(args, &measured_inputs)?;
+        dev_layer_request(dev_layers, &mut measured_request, &loaded.cfg)?;
         measured_request.pool.requested = Some(placement.pool_tokens);
         measured_request.pool.floor = placement.pool_tokens;
         measured_request.onboard = cuteafd_loader::placement::Onboard::Layers(placement.onboard_layers);
@@ -449,7 +528,7 @@ pub(crate) fn with_engine<T>(
         (placement, embedding, model, shares)
     };
     let (placement, embedding, model, mut shares) = placement;
-    let context_mode = if check_modes(&placement, split_device.is_some(), &loaded.cfg)? {
+    let context_mode = if checked_engine_modes(dev_layers, &placement, split_device.is_some(), &loaded.cfg)? {
         Some(cuteafd_loader::placement::families::deepseek_v4::manifest_context(&loaded.manifest, loaded.family,
             loaded.cfg.n_heads, caps["decode_rows"].as_u64().context("decode_rows")?)
             .context("context placement without the build's C4 context programs")?)
@@ -498,6 +577,10 @@ pub(crate) fn with_engine<T>(
     let result = (|| -> Result<T> {
         if let Some((device, stream)) = peer_stream {
             engine.attach_peer(device, stream, shares.pop().context("head-split shares")?, engine::PeerParts { shape, tp2: placement.tp2.as_ref().is_some_and(|t| t.layers > 0) })?;
+        }
+        #[cfg(feature = "dev-v4-layers")]
+        if dev_layers {
+            engine.attach_dev_layers(&placement, dev_layer_hop_spec(&loaded.cfg, prefill_rows, decode_rows)?)?;
         }
         let held = held(&engine)?;
         let _ = held; // Prefix bytes were reserved before placement.
@@ -602,9 +685,10 @@ pub(crate) fn with_engine<T>(
 
 fn golden(args: GoldenArgs) -> Result<()> {
     let started = Instant::now();
+    let dev_layers = dev_golden_layers(&args.engine)?;
     let loaded = load(&args.engine)?;
     let cfg = loaded.cfg.clone();
-    with_engine(&loaded, &args.engine, None, |_| Ok(0), |engine, transports, runtime| {
+    with_engine_mode(&loaded, &args.engine, None, dev_layers, |_| Ok(0), |engine, transports, runtime| {
         let before = engine.graph_capture_counts();
         println!("golden ready: {:.3} s | graph captures {} | TP2 expert graph captures {}",
             started.elapsed().as_secs_f64(), before.0, before.1);

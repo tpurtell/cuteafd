@@ -1,7 +1,7 @@
 //! Per-layer ownership (PLAN "v3 placement: design", section 3): where the
 //! residual lives at each layer boundary, and the hops that move it when the
 //! owner changes. The solver derives [`Hop`]s from the chosen [`LayerMode`]s
-//! and charges their receive buffers as fixed demands; executors follow the
+//! and charges their persistent transport storage as fixed demands; executors follow the
 //! same list (the daemon's hop primitive, `shared::peer_split::HopLink`).
 use super::{FfnMode, LayerMode, Placement};
 use thiserror::Error;
@@ -80,8 +80,12 @@ pub enum TerminalHome {
 /// What the family's executor moves per hop; part of the request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HopSpec {
-    /// Bytes per row of one hop (0: the family has no hops to charge).
+    /// Bytes per row at entry, ownership boundaries and exit.
     pub row_bytes: u64,
+    /// Complete FFN handoff width; None uses the residual width.
+    pub after_attention_row_bytes: Option<u64>,
+    /// The family packs into one persistent sender buffer per lane/rank.
+    pub packed_sender: bool,
     /// Rows a hop carries at most (the larger of prefill and decode rows).
     pub rows: u64,
     /// Lanes that can have a hop in flight at once (prefill lanes).
@@ -95,6 +99,12 @@ pub struct HopSpec {
 }
 
 impl HopSpec {
+    pub fn row_bytes_at(&self, point: HopPoint) -> u64 {
+        if matches!(point, HopPoint::AfterAttention(_)) {
+            self.after_attention_row_bytes.unwrap_or(self.row_bytes)
+        } else { self.row_bytes }
+    }
+
     fn terminal_home(&self, mode: LayerMode) -> Result<ResidualHome, LayerPlanError> {
         match (self.terminal, mode) {
             (TerminalHome::AttentionOwner, LayerMode::Whole { gpu, ffn: FfnMode::Owner }) => Ok(ResidualHome::Owned(gpu)),
@@ -188,7 +198,7 @@ impl ResidualHome {
 /// `spec.entry_gpu` to the head on `spec.head_gpu`. One GPU never hops.
 pub fn plan_hops(modes: &[LayerMode], spec: &HopSpec) -> Result<Vec<Hop>, LayerPlanError> {
     let homes = residual_homes(modes, spec)?;
-    let hop = |at, (from, to, kind)| Hop { at, from, to, kind, row_bytes: spec.row_bytes };
+    let hop = |at, (from, to, kind)| Hop { at, from, to, kind, row_bytes: spec.row_bytes_at(at) };
     let mut hops = Vec::new();
     let mut home = ResidualHome::Owned(spec.entry_gpu);
     for (layer, &mode) in modes.iter().enumerate() {
@@ -253,7 +263,7 @@ impl LayerExecutionPlan {
         let homes = residual_homes(&modes, &spec)?;
         if placement.residual != homes { return Err(LayerPlanError::Residual); }
         let hops = plan_hops(&modes, &spec)?;
-        if placement.hops != hops || (!hops.is_empty() && (spec.row_bytes == 0 || spec.row_bytes % 16 != 0)) {
+        if placement.hops != hops || hops.iter().any(|hop| hop.row_bytes == 0 || hop.row_bytes % 16 != 0) {
             return Err(LayerPlanError::Hops);
         }
         Ok(Self { modes, hops, homes, spec })
@@ -287,13 +297,61 @@ impl LayerExecutionPlan {
     }
 }
 
-/// Receive-buffer bytes `hops` need on each of `gpus` GPUs: `lanes` x
-/// [`HOP_SLOTS`] (or fewer, when fewer hops land there) x `rows` x the row
-/// bytes, for every charged hop into that GPU.
-pub fn hop_buffer_bytes(hops: &[Hop], spec: &HopSpec, gpus: usize) -> Option<Vec<u64>> {
+/// Persistent transport allocations, shared by admission and HopLink.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HopRankGeometry {
+    /// Each slot is the maximum width of hops that reuse its parity index.
+    pub receive_slot_bytes: Vec<u64>,
+    pub sender_lane_bytes: u64,
+    pub control_bytes: u64,
+    pub lanes: u64,
+}
+
+impl HopRankGeometry {
+    pub fn receive_bytes(&self) -> Option<u64> {
+        self.receive_slot_bytes.iter().try_fold(0u64, |n, bytes| n.checked_add(*bytes))?
+            .checked_mul(self.lanes)
+    }
+
+    pub fn fixed_bytes(&self) -> Option<u64> {
+        self.receive_bytes()?.checked_add(self.sender_lane_bytes.checked_mul(self.lanes)?)?
+            .checked_add(self.control_bytes)
+    }
+}
+
+pub fn hop_storage_geometry(hops: &[Hop], spec: &HopSpec, gpus: usize) -> Option<Vec<HopRankGeometry>> {
+    if hops.iter().any(|hop| usize::from(hop.from) >= gpus || usize::from(hop.to) >= gpus
+        || hop.from == hop.to || hop.row_bytes != spec.row_bytes_at(hop.at)
+        || hop.row_bytes % 16 != 0) { return None; }
+    // Zero extents remain the planner's explicit no-storage contract. The
+    // executable LayerExecutionPlan and HopLink require positive geometry.
+    let active = spec.rows > 0 && spec.lanes > 0 && hops.iter().any(|hop| hop.charged() && hop.row_bytes > 0);
+    let control_bytes = if active {
+        spec.lanes.checked_mul(HOP_SLOTS)?.checked_add(1)?.checked_mul(16)?.max(256)
+    } else { 0 };
     (0..gpus).map(|gpu| {
-        let into = hops.iter().filter(|h| h.charged() && usize::from(h.to) == gpu).count() as u64;
-        let slots = into.min(HOP_SLOTS);
-        spec.lanes.checked_mul(slots)?.checked_mul(spec.rows)?.checked_mul(spec.row_bytes)
+        let incoming: Vec<_> = hops.iter().filter(|hop| active && hop.charged() && usize::from(hop.to) == gpu).collect();
+        let mut slots = vec![0; incoming.len().min(HOP_SLOTS as usize)];
+        for (ordinal, hop) in incoming.iter().enumerate() {
+            let slot = ordinal % slots.len();
+            slots[slot] = slots[slot].max(spec.rows.checked_mul(hop.row_bytes)?.max(256));
+        }
+        let sender = if active && spec.packed_sender {
+            hops.iter().filter(|hop| hop.charged() && usize::from(hop.from) == gpu)
+                .map(|hop| hop.row_bytes).max().unwrap_or(0)
+        } else { 0 };
+        Some(HopRankGeometry { receive_slot_bytes: slots,
+            sender_lane_bytes: if sender > 0 { spec.rows.checked_mul(sender)?.max(256) } else { 0 },
+            control_bytes, lanes: spec.lanes })
     }).collect()
+}
+
+/// Receive bytes only; useful for validating landed payload storage.
+pub fn hop_buffer_bytes(hops: &[Hop], spec: &HopSpec, gpus: usize) -> Option<Vec<u64>> {
+    hop_storage_geometry(hops, spec, gpus)?.iter().map(HopRankGeometry::receive_bytes).collect()
+}
+
+/// Full solver charge: receive slots, persistent packing senders and controls.
+pub fn hop_storage_bytes(hops: &[Hop], spec: &HopSpec, gpus: usize) -> Option<Vec<u64>> {
+    hop_storage_geometry(hops, spec, gpus)?.iter().map(HopRankGeometry::fixed_bytes).collect()
 }

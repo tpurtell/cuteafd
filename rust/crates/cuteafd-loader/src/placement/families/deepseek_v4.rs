@@ -33,6 +33,27 @@ pub const RESERVE_BYTES: u64 = 10 << 30;
 
 const fn gib(hundredths: u64) -> u64 { hundredths * (1 << 30) / 100 }
 
+/// Packed row offsets for owned attention's complete split-FFN handoff.
+/// mHC post reads all four operands; none may be reconstructed on the peer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct V4AttentionHandoff {
+    pub residual: u64,
+    pub y: u64,
+    pub post: u64,
+    pub comb: u64,
+    pub row_bytes: u64,
+}
+
+impl V4AttentionHandoff {
+    pub fn new(hidden: u64) -> Option<Self> {
+        let y = hidden.checked_mul(8)?;
+        let post = y.checked_add(hidden.checked_mul(2)?)?;
+        let comb = post.checked_add(16)?;
+        let row_bytes = comb.checked_add(64)?;
+        (hidden > 0 && row_bytes % 16 == 0).then_some(Self { residual: 0, y, post, comb, row_bytes })
+    }
+}
+
 /// Everything V4 admission depends on, gathered by the caller from the
 /// checkpoint, the program manifest and the CLI.
 #[derive(Debug, Clone)]
@@ -321,9 +342,12 @@ pub fn request(inputs: &V4Inputs<'_>) -> Result<PlacementRequest, PlacementError
         policy: LayerPolicy { default: vec![LayerMode::HeadSplit, LayerMode::Whole { gpu: 0, ffn: FfnMode::Owner }],
             by_kind: Vec::new(), attention: if context.is_some() { vec![(AttentionClass::Csa, AttentionPlacement::Heads)] }
                 else { Vec::new() }, ..LayerPolicy::default() },
-        // The mHC streams `[T,4,H]` BF16; V4's only hop is the entry
-        // broadcast of the embedding rows into GPU1's step input.
-        hops: HopSpec { row_bytes: 4 * inputs.cfg.dim as u64 * 2, rows: inputs.prefill_rows.max(inputs.decode_rows),
+        // Boundaries carry mHC streams. Owned attention also hands off the
+        // complete FFN input and post/comb operands to its split peer.
+        hops: HopSpec { row_bytes: 4 * inputs.cfg.dim as u64 * 2,
+            after_attention_row_bytes: Some(V4AttentionHandoff::new(inputs.cfg.dim as u64)
+                .ok_or(PlacementError::Overflow("V4 attention handoff geometry"))?.row_bytes),
+            packed_sender: true, rows: inputs.prefill_rows.max(inputs.decode_rows),
             lanes: PREFILL_LANES, entry_gpu: 0, head_gpu: 0, terminal: TerminalHome::Head },
         // A build without the C4 context programs runs heads only.
         executor: if context.is_some() { super::DEEPSEEK_V4 }

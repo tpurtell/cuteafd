@@ -77,7 +77,7 @@ pub fn request(inputs: &QwenInputs<'_>, graph_bytes: u64) -> anyhow::Result<Plac
         expert_workspace: 0, tp2_workspace: [0; 2], onboard: Onboard::Auto, expert_gpus: 0,
         policy: LayerPolicy { default: vec![whole], by_kind: Vec::new(), ..LayerPolicy::default() },
         hops: HopSpec { row_bytes: inputs.admission.cfg.hc_count as u64 * inputs.admission.cfg.hidden as u64 * 2,
-            rows: inputs.admission.prefill_rows.max(64), lanes: 1, entry_gpu: 0, head_gpu: 0, terminal: TerminalHome::AttentionOwner },
+            after_attention_row_bytes: None, packed_sender: false, rows: inputs.admission.prefill_rows.max(64), lanes: 1, entry_gpu: 0, head_gpu: 0, terminal: TerminalHome::AttentionOwner },
         executor: super::QWEN4,
     })
 }
@@ -496,7 +496,7 @@ pub fn dual_request(inputs: &QwenDualInputs<'_>, graph_bytes: [u64; 2]) -> anyho
         tp2_workspace: inputs.tp2_workspace, onboard: inputs.onboard, expert_gpus: 2,
         policy: LayerPolicy { default: DUAL_WHOLE.to_vec(), by_kind: Vec::new(),
             ownership: LayerOwnership::NonemptyRanges, ..LayerPolicy::default() },
-        hops: HopSpec { row_bytes: a.cfg.hc_width() as u64 * 2, rows: a.prefill_rows.max(64), lanes: 1,
+        hops: HopSpec { row_bytes: a.cfg.hc_width() as u64 * 2, after_attention_row_bytes: None, packed_sender: false, rows: a.prefill_rows.max(64), lanes: 1,
             entry_gpu: 0, head_gpu: 0, terminal: TerminalHome::AttentionOwner },
         executor: ExecutorModes { family: "qwen4", modes: &DUAL_WHOLE, hops: true,
             attention: AttentionPlacement::Heads },

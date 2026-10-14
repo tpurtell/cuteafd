@@ -21,7 +21,7 @@ use super::{on_device, End, RankDevice};
 use crate::shared::memory::DeviceAllocation;
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::NativeLibrary;
-use cuteafd_loader::placement::{hop_buffer_bytes, Hop, HopSpec, HOP_SLOTS};
+use cuteafd_loader::placement::{hop_storage_geometry, Hop, HopSpec, HOP_SLOTS};
 use std::ffi::c_void;
 
 /// Both GPUs' hop receive slots and control words.
@@ -34,6 +34,7 @@ pub(crate) struct HopLink<'a> {
     hops: Vec<Hop>,
     /// Receive slots per lane on each GPU (`min(hops into it, HOP_SLOTS)`).
     per_lane: [usize; 2],
+    senders: [Vec<DeviceAllocation<'a>>; 2],
     abort: Option<[*const u32; 2]>,
 }
 
@@ -47,21 +48,15 @@ pub(crate) struct HopTicket {
 }
 
 impl<'a> HopLink<'a> {
-    /// Allocates the receive slots `hops` need on each destination (exactly
-    /// [`hop_buffer_bytes`]) and the control words on both GPUs; `ranks[0]`'s
-    /// device must be current, and is again on return.
+    /// Allocates the admitted receive slots, packing senders and controls from
+    /// shared hop geometry. `ranks[0]`'s device is current again on return.
     pub fn new(library: &'a NativeLibrary, ranks: [RankDevice; 2], hops: &[Hop], spec: HopSpec) -> Result<Self> {
         let _memory_scope = cuteafd_ffi::memory_ledger::scope("residual-hops");
         ensure!(ranks[0].device != ranks[1].device, "a hop moves between two GPUs");
-        ensure!(spec.row_bytes % 16 == 0 && spec.lanes > 0, "hop rows must be 16-byte multiples over at least one lane");
-        ensure!(hops.iter().all(|h| h.from != h.to && h.from < 2 && h.to < 2 && h.row_bytes == spec.row_bytes),
-            "hops must move between GPU0 and GPU1 at the spec's row bytes");
-        hop_buffer_bytes(hops, &spec, 2).context("hop buffer bytes overflow")?;
-        let slot_bytes = usize::try_from(spec.rows * spec.row_bytes)?;
-        let flags = usize::try_from(spec.lanes * HOP_SLOTS)?;
-        let per_lane = [0u8, 1].map(|gpu| hops.iter().filter(|h| h.charged() && h.to == gpu).count()
-            .min(HOP_SLOTS as usize));
-        let end = |rank: usize| -> Result<End<'a>> {
+        let geometry = hop_storage_geometry(hops, &spec, 2).context("invalid hop storage geometry")?;
+        ensure!(geometry.iter().all(|rank| rank.control_bytes > 0), "HopLink needs charged hops");
+        let per_lane = [geometry[0].receive_slot_bytes.len(), geometry[1].receive_slot_bytes.len()];
+        let end = |rank: usize| -> Result<(End<'a>, Vec<DeviceAllocation<'a>>)> {
             on_device(library, ranks[rank].device, ranks[0].device, || {
                 library.cuda_enable_peer(ranks[1 - rank].device)?;
                 library.peer_exchange_initialize()?;
@@ -70,15 +65,21 @@ impl<'a> HopLink<'a> {
                     library.cuda_zero_bytes(allocation.buffer, allocation.buffer.bytes)?;
                     Ok(allocation)
                 };
-                let slots = usize::try_from(spec.lanes)? * per_lane[rank];
-                Ok(End {
-                    recv: (0..slots).map(|_| zeroed(slot_bytes)).collect::<Result<_>>()?,
-                    control: zeroed((flags + 1) * 16)?,
-                    progress: None,
-                })
+                let mut recv = Vec::new();
+                let mut senders = Vec::new();
+                for _ in 0..spec.lanes {
+                    for &bytes in &geometry[rank].receive_slot_bytes { recv.push(zeroed(usize::try_from(bytes)?)?); }
+                    if geometry[rank].sender_lane_bytes > 0 {
+                        senders.push(zeroed(usize::try_from(geometry[rank].sender_lane_bytes)?)?);
+                    }
+                }
+                Ok((End { recv, control: zeroed(usize::try_from(geometry[rank].control_bytes)?)?, progress: None }, senders))
             })
         };
-        Ok(Self { library, ranks, ends: [end(0)?, end(1)?], spec, hops: hops.to_vec(), per_lane, abort: None })
+        let (end0, send0) = end(0)?;
+        let (end1, send1) = end(1)?;
+        Ok(Self { library, ranks, ends: [end0, end1], senders: [send0, send1], spec,
+            hops: hops.to_vec(), per_lane, abort: None })
     }
 
     /// Startup-only borrowing of the routed exchange's abort words. The
@@ -103,9 +104,20 @@ impl<'a> HopLink<'a> {
         peer.require_live()
     }
 
-    /// Receive bytes held on `rank` (the solver charged exactly this).
+    /// Receive-only bytes held on `rank`; admission also includes senders/controls.
     pub fn receive_bytes(&self, rank: usize) -> u64 {
         self.ends[rank].recv.iter().map(|r| r.buffer.bytes as u64).sum()
+    }
+
+    pub fn fixed_bytes(&self, rank: usize) -> u64 {
+        self.receive_bytes(rank) + self.ends[rank].control.buffer.bytes as u64
+            + self.senders[rank].iter().map(|sender| sender.buffer.bytes as u64).sum::<u64>()
+    }
+
+    /// Persistent packing storage, private until the source stream's push consumes it.
+    pub fn sender(&self, rank: usize, lane: usize) -> Result<cuteafd_ffi::CuteafdDeviceBuffer> {
+        self.senders.get(rank).and_then(|senders| senders.get(lane))
+            .map(|sender| sender.buffer).context("hop sender outside admitted rank/lane")
     }
 
     /// The slot (per lane) hop `index` lands in: its ordinal among the hops
@@ -128,7 +140,7 @@ impl<'a> HopLink<'a> {
         let (flag, recv) = (lane * HOP_SLOTS as usize + slot, lane * self.per_lane[to] + slot);
         let from = 1 - to;
         let destination = self.ends[to].recv.get(recv).context("hop receive slot")?.buffer.ptr;
-        let bytes = rows * usize::try_from(self.spec.row_bytes)?;
+        let bytes = rows.checked_mul(usize::try_from(self.hops[index].row_bytes)?).context("hop bytes overflow")?;
         let (mine, theirs) = (&self.ends[from], &self.ends[to]);
         // SAFETY: peer access is enabled both ways (new); `source` is final on
         // the sender's stream and unchanged until later work on it; the
@@ -171,7 +183,7 @@ mod cuda_tests {
         // SAFETY: every CUDA owner below is dropped before the library.
         let library = unsafe { NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? };
         let (w0, w1) = (LayerMode::Whole { gpu: 0, ffn: FfnMode::Owner }, LayerMode::Whole { gpu: 1, ffn: FfnMode::Owner });
-        let spec = HopSpec { row_bytes: 4 * 64 * 2, rows: 32, lanes: 2, entry_gpu: 0, head_gpu: 0, terminal: cuteafd_loader::placement::TerminalHome::AttentionOwner };
+        let spec = HopSpec { row_bytes: 4 * 64 * 2, after_attention_row_bytes: None, packed_sender: false, rows: 32, lanes: 2, entry_gpu: 0, head_gpu: 0, terminal: cuteafd_loader::placement::TerminalHome::AttentionOwner };
         let hops = plan_hops(&[w0, w0, w1, w1], &spec).unwrap();
         assert_eq!(hops.len(), 2);
         library.cuda_set_device(0)?;
@@ -181,8 +193,10 @@ mod cuda_tests {
         }
         let result = (|| -> Result<()> {
             let link = HopLink::new(&library, ranks, &hops, spec)?;
-            let charged = hop_buffer_bytes(&hops, &spec, 2).unwrap();
-            assert_eq!([link.receive_bytes(0), link.receive_bytes(1)], [charged[0], charged[1]]);
+            let received = cuteafd_loader::placement::hop_buffer_bytes(&hops, &spec, 2).unwrap();
+            let charged = cuteafd_loader::placement::hop_storage_bytes(&hops, &spec, 2).unwrap();
+            assert_eq!([link.receive_bytes(0), link.receive_bytes(1)], [received[0], received[1]]);
+            assert_eq!([link.fixed_bytes(0), link.fixed_bytes(1)], [charged[0], charged[1]]);
             let rows = 17;
             let bytes = rows * spec.row_bytes as usize;
             for lane in 0..2 {

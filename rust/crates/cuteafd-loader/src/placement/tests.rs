@@ -29,7 +29,7 @@ fn request(gpus: usize, free: u64, layers: usize, sparks: usize, onboard: Onboar
         onboard,
         expert_gpus: gpus,
         policy: LayerPolicy { default: vec![LayerMode::HeadSplit], by_kind: Vec::new(), ..LayerPolicy::default() },
-        hops: HopSpec { row_bytes: 0, rows: 0, lanes: 0, entry_gpu: 0, head_gpu: 0,
+        hops: HopSpec { row_bytes: 0, after_attention_row_bytes: None, packed_sender: false, rows: 0, lanes: 0, entry_gpu: 0, head_gpu: 0,
             terminal: if gpus == 2 { TerminalHome::Replicated } else { TerminalHome::AttentionOwner } },
         executor: V4_HEADS,
     }
@@ -170,7 +170,7 @@ const W1: LayerMode = LayerMode::Whole { gpu: 1, ffn: FfnMode::Owner };
 const S0: LayerMode = LayerMode::Whole { gpu: 0, ffn: FfnMode::Split };
 const S1: LayerMode = LayerMode::Whole { gpu: 1, ffn: FfnMode::Split };
 /// V4/V4.1-sized mHC hop: `[4096,4,4096]` BF16 per lane slot = 128 MiB.
-const MHC: HopSpec = HopSpec { row_bytes: 4 * 4096 * 2, rows: 4096, lanes: 2, entry_gpu: 0, head_gpu: 0, terminal: TerminalHome::AttentionOwner };
+const MHC: HopSpec = HopSpec { row_bytes: 4 * 4096 * 2, after_attention_row_bytes: None, packed_sender: false, rows: 4096, lanes: 2, entry_gpu: 0, head_gpu: 0, terminal: TerminalHome::AttentionOwner };
 const ANY: ExecutorModes = ExecutorModes { family: "test", modes: &[LayerMode::HeadSplit, W0, W1, S0, S1], hops: true, attention: AttentionPlacement::Heads };
 
 #[test]
@@ -247,13 +247,13 @@ fn placement_records_residual_homes_and_charges_hops_as_fixed_demands() {
         ResidualHome::Owned(1), ResidualHome::Owned(1)]);
     assert_eq!(ranges.hops.len(), 2);
     for gpu in 0..2 {
-        assert!(ranges.items[gpu].iter().any(|i| i.group == "residual hops" && i.bytes == 256 << 20), "gpu{gpu}");
+        assert!(ranges.items[gpu].iter().any(|i| i.group == "residual hops" && i.bytes == (256 << 20) + 256), "gpu{gpu}");
     }
     assert!(ranges.summary().ends_with("; 2 residual hops"));
-    // The hop buffers come out of the pool: 256 MiB = 64 units of 4 MiB fewer.
+    // The full storage charge includes controls and rounds up one extra pool unit.
     let mut split = req.clone();
-    split.hops = HopSpec { row_bytes: 0, rows: 0, lanes: 0, ..req.hops };
-    assert_eq!(solve(&split).unwrap().pool_tokens - ranges.pool_tokens, 64 * 256);
+    split.hops = HopSpec { rows: 0, lanes: 0, ..req.hops };
+    assert_eq!(solve(&split).unwrap().pool_tokens - ranges.pool_tokens, 65 * 256);
     // Today's V4 request: head split, the residual replicated after layer 0, nothing charged.
     let v4 = solve(&request(2, 44 * GIB, 4, 4, Onboard::Auto)).unwrap();
     assert_eq!(v4.residual[0], ResidualHome::Owned(0));
@@ -564,7 +564,7 @@ fn section_6_glm_memory_uses_one_latent_and_charges_every_exchange_slot() {
         req.pool.unit_rows = 64;
         req.fixed = fixed.into_iter().enumerate().map(|(gpu, bytes)| Demand::new(gpu as u8, Category::Workspace,
             "P2 fixed", bytes + if nvfp4 { 8_685_388_318 } else { 0 }, Basis::Estimated)).collect();
-        req.hops = HopSpec { row_bytes: 12_288, rows: 4096, lanes: 4, entry_gpu: 0, head_gpu: 0, terminal: TerminalHome::Replicated };
+        req.hops = HopSpec { row_bytes: 12_288, after_attention_row_bytes: None, packed_sender: false, rows: 4096, lanes: 4, entry_gpu: 0, head_gpu: 0, terminal: TerminalHome::Replicated };
         req.attention_placement = Some(AttentionPlacement::Heads);
         let heads = solve(&req).unwrap();
         print_attention_fixture(if nvfp4 { "GLM 5.3 NVFP4" } else { "GLM 5.3 EXL3" }, AttentionPlacement::Heads, &heads);
@@ -647,7 +647,7 @@ fn section_6_tp2_counts_use_exact_pages_and_real_layer_ownership() {
             partial_row_bytes: if dim == 4096 { 32_896 } else { 65_792 },
             candidate_row_bytes: if dim == 4096 { 4_096 } else { 8_192 },
             compiled_extent: 1 << 20, decode_rows: 64, lanes: 2, workspace_bytes: 0 };
-        req.hops = HopSpec { row_bytes: 4 * dim * 2 + 16, rows: 4096, lanes: 2, entry_gpu: 0, head_gpu: 0, terminal: TerminalHome::Replicated };
+        req.hops = HopSpec { row_bytes: 4 * dim * 2 + 16, after_attention_row_bytes: None, packed_sender: false, rows: 4096, lanes: 2, entry_gpu: 0, head_gpu: 0, terminal: TerminalHome::Replicated };
         let half = (half * GIB as f64) as u64;
         let state_unit = (state * GIB as f64 / count as f64) as u64;
         for (i, layer) in req.layers.iter_mut().enumerate() {
@@ -691,7 +691,7 @@ fn section_6_tp2_counts_use_exact_pages_and_real_layer_ownership() {
     req.context_buffers = ContextBuffers { staging_unit_bytes: 256 * 528 + 64 * 132, staging_unit_rows: 256,
         query_row_bytes: 32_768, partial_row_bytes: 32_896, candidate_row_bytes: 4_096,
         compiled_extent: 1 << 20, decode_rows: 64, lanes: 2, workspace_bytes: 0 };
-    req.hops = HopSpec { row_bytes: 32_784, rows: 4096, lanes: 2, entry_gpu: 0, head_gpu: 0, terminal: TerminalHome::Replicated };
+    req.hops = HopSpec { row_bytes: 32_784, after_attention_row_bytes: None, packed_sender: false, rows: 4096, lanes: 2, entry_gpu: 0, head_gpu: 0, terminal: TerminalHome::Replicated };
     for (i, layer) in req.layers.iter_mut().enumerate() {
         let mla = i % 4 == 3;
         layer.kind = if mla { AttentionClass::Mla } else { AttentionClass::Kda };
@@ -1285,4 +1285,41 @@ fn terminal_home_is_explicit_and_validated_for_every_final_mode() {
     one.hops.terminal = TerminalHome::Head;
     let p = solve(&one).unwrap();
     assert!(p.residual.iter().all(|home| *home == Owned(0)));
+}
+
+#[test]
+fn full_hop_geometry_pins_payload_sender_controls_and_parity_slots() {
+    use families::deepseek_v4::V4AttentionHandoff;
+    for hidden in [4096u64, 7168] {
+        let payload = V4AttentionHandoff::new(hidden).unwrap();
+        assert_eq!((payload.residual, payload.y, payload.post, payload.comb, payload.row_bytes),
+            (0, 8 * hidden, 10 * hidden, 10 * hidden + 16, 10 * hidden + 80));
+        let spec = HopSpec { row_bytes: 8 * hidden, after_attention_row_bytes: Some(payload.row_bytes),
+            packed_sender: true, terminal: TerminalHome::Head, ..MHC };
+        let modes = [LayerMode::HeadSplit, S0, S1, S0, S1, LayerMode::HeadSplit];
+        let hops = plan_hops(&modes, &spec).unwrap();
+        for hop in &hops {
+            assert_eq!(hop.row_bytes, if matches!(hop.at, HopPoint::AfterAttention(_)) {
+                payload.row_bytes } else { 8 * hidden });
+        }
+        let geometry = hop_storage_geometry(&hops, &spec, 2).unwrap();
+        for rank in &geometry {
+            assert_eq!(rank.receive_slot_bytes, vec![4096 * payload.row_bytes; 2]);
+            assert_eq!(rank.sender_lane_bytes, 4096 * payload.row_bytes);
+            assert_eq!(rank.control_bytes, 256);
+            assert_eq!(rank.fixed_bytes(), Some(6 * 4096 * payload.row_bytes + 256));
+        }
+        assert_eq!(hop_storage_bytes(&hops, &spec, 2),
+            Some(vec![6 * 4096 * payload.row_bytes + 256; 2]));
+        let small = HopSpec { rows: 1, lanes: 1, row_bytes: 16,
+            after_attention_row_bytes: Some(32), ..spec };
+        let small_hops = plan_hops(&modes, &small).unwrap();
+        assert_eq!(hop_storage_bytes(&small_hops, &small, 2), Some(vec![1024; 2]));
+        assert!(hop_storage_geometry(&hops, &HopSpec { rows: u64::MAX, ..spec }, 2).is_none());
+        let mixed = plan_hops(&[W0, W1, S1], &spec).unwrap();
+        assert_eq!(hop_storage_geometry(&mixed, &spec, 2).unwrap()[1].receive_slot_bytes,
+            vec![4096 * 8 * hidden]);
+    }
+    assert!(V4AttentionHandoff::new(u64::MAX).is_none());
+    assert!(V4AttentionHandoff::new(0).is_none());
 }
