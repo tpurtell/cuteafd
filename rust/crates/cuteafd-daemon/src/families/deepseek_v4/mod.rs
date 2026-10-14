@@ -661,6 +661,7 @@ fn with_engine_mode<T>(
         engine.warm_local_graphs()?;
         engine.check_routes(&mut transports, &runtime)?;
         let _capture_session = crate::shared::decode_graph::CaptureWatch::session();
+        let _coverage_session = engine.graph_coverage.session();
         body(&engine, &mut transports, &runtime)
     })();
     crate::shared::decode_graph::fatal_drain(engine.shutdown_submission(&mut transports), "V4 RTX engine retirement");
