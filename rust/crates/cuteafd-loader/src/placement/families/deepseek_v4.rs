@@ -183,6 +183,11 @@ pub fn fixed_demands(inputs: &V4Inputs<'_>) -> Result<(Vec<Demand>, Vec<u64>, Ve
         .map_err(|_| PlacementError::Inventory("V4 cache geometry"))?;
     let hidden = inputs.cfg.dim as u64;
     let topk = inputs.cfg.n_activated_experts as u64;
+    let c4_layers = inputs.cfg.compress_ratios.iter().filter(|&&ratio| ratio == 4).count() as u64;
+    let (c4_active, c4_mark) = crate::serving_capacity::deepseek_v4_layer_state_geometry(4, inputs.prefill_rows)
+        .map_err(|_| PlacementError::Inventory("V4 C4 state geometry"))?;
+    let c4_active = c4_active.checked_mul(c4_layers).ok_or(PlacementError::Overflow("V4 C4 active state"))?;
+    let c4_mark = c4_mark.checked_mul(c4_layers).ok_or(PlacementError::Overflow("V4 C4 marks"))?;
     let tables = PREFILL_LANES * inputs.prefill_rows + inputs.decode_rows;
     let table_bytes = tables.checked_mul(4).ok_or(PlacementError::Overflow("V4 lane tables"))?;
     let mut demands = Vec::new();
@@ -192,7 +197,11 @@ pub fn fixed_demands(inputs: &V4Inputs<'_>) -> Result<(Vec<Demand>, Vec<u64>, Ve
         let gpu = rank as u8;
         let role = if gpus == 1 { 0 } else if rank == 0 { 1 } else { 2 };
         let mul = |a: u64, b: u64, what| a.checked_mul(b).ok_or(PlacementError::Overflow(what));
-        let state = mul(cache.active_state_per_sequence_bytes, inputs.sequences, "V4 state")?
+        let fixed_active = cache.active_state_per_sequence_bytes.checked_sub(c4_active)
+            .ok_or(PlacementError::Inventory("V4 C4 active geometry exceeds rank state"))?;
+        let fixed_mark = cache.retained_mark_bytes.checked_sub(c4_mark)
+            .ok_or(PlacementError::Inventory("V4 C4 mark geometry exceeds rank marks"))?;
+        let state = mul(fixed_active, inputs.sequences, "V4 state")?
             + cache.fixed_state_bytes + cache.speculative_replay_bytes + mul(table_bytes, inputs.sequences, "V4 tables")?;
         let context = mul(cache.context_table_bytes_per_token, inputs.max_context, "V4 RoPE tables")?;
         let intake = if rank == 0 && inputs.spark_ranks > 0 {
@@ -215,9 +224,9 @@ pub fn fixed_demands(inputs: &V4Inputs<'_>) -> Result<(Vec<Demand>, Vec<u64>, Ve
         let basis = if inputs.workspace.is_some() { Basis::Formula } else { Basis::Estimated };
         demands.push(Demand::new(gpu, Category::Kv, "state", state, Basis::Formula));
         demands.push(Demand::new(gpu, Category::Kv, "RoPE context tables", context, Basis::Formula));
-        if inputs.mark_slots > 0 && cache.retained_mark_bytes > 0 {
+        if inputs.mark_slots > 0 && fixed_mark > 0 {
             demands.push(Demand::new(gpu, Category::Prefix, "marks",
-                mul(cache.retained_mark_bytes, inputs.mark_slots, "V4 marks")?, Basis::Formula));
+                mul(fixed_mark, inputs.mark_slots, "V4 marks")?, Basis::Formula));
         }
         demands.push(Demand::new(gpu, Category::Workspace, "steps", workspace, basis));
         demands.push(GraphSet::budget(&[GRAPH_BYTES[role]]).demand(0).on(gpu));
@@ -253,6 +262,14 @@ pub fn request(inputs: &V4Inputs<'_>) -> Result<PlacementRequest, PlacementError
         GpuBudget { capacity_bytes, headroom_bytes, baseline }).collect::<Vec<_>>();
     let first = inputs.first_routed;
     let context = inputs.context.filter(|_| gpus == 2);
+    let (active, mark) = crate::serving_capacity::deepseek_v4_layer_state_geometry(4, inputs.prefill_rows)
+        .map_err(|_| PlacementError::Inventory("V4 C4 state geometry"))?;
+    let c4_extra = vec![
+        LayerExtraDemand::new(Category::Kv, "state", active.checked_mul(inputs.sequences)
+            .ok_or(PlacementError::Overflow("V4 C4 state"))?, LayerResidency::Replicated, Basis::Formula),
+        LayerExtraDemand::new(Category::Prefix, "marks", mark.checked_mul(inputs.mark_slots)
+            .ok_or(PlacementError::Overflow("V4 C4 marks"))?, LayerResidency::Replicated, Basis::Formula),
+    ];
     let layers = (0..inputs.cfg.n_layers).map(|layer| {
         let unit = deepseek_v4_layer_unit_bytes(inputs.cfg.compress_ratios[layer]);
         let experts = layer.checked_sub(first).and_then(|i| inputs.experts.get(i)).map(|cost| ExpertCost {
@@ -264,7 +281,8 @@ pub fn request(inputs: &V4Inputs<'_>) -> Result<PlacementRequest, PlacementError
             weights: inputs.weights.c4_attention[layer],
             kv_unit: KvDemand { unit_bytes_whole: unit, unit_bytes_split: [unit; 2],
                 unit_bytes_context: (inputs.cfg.compress_ratios[layer] == 4).then_some([unit.div_ceil(2), unit / 2]) },
-            colocate: None, fixed_bytes: ModeBytes::default(), extra: Vec::new(),
+            colocate: None, fixed_bytes: ModeBytes::default(),
+            extra: if inputs.cfg.compress_ratios[layer] == 4 { c4_extra.clone() } else { Vec::new() },
             context_indexer: inputs.cfg.compress_ratios[layer] == 4,
             experts,
             // Only C4 layers token-split; C128 and window-only layers stay head-split.
@@ -395,6 +413,83 @@ mod default_tests {
         }
         assert_eq!(context_commit_units(1), 1);
         assert_eq!(context_commit_units(257), 2);
+    }
+
+    #[test]
+    fn c4_state_and_marks_follow_modes_without_changing_split_totals() {
+        let mut cfg = context_cfg();
+        cfg.n_layers = 4;
+        cfg.compress_ratios = vec![0, 4, 128, 4];
+        cfg.n_mtp_layers = 3;
+        let bytes = |p: &Placement, rank: usize, category: Category, group: &str| p.items[rank].iter()
+            .filter(|item| item.category == category && item.group == group).map(|item| item.bytes).sum::<u64>();
+        for ranks in [1, 2] {
+            for stages in [0, 3] {
+                for prefill in [256, 4096] {
+                    for sequences in [1, 16] {
+                        for slots in [0, 7] {
+                            let inputs = V4Inputs { cfg: &cfg,
+                                weights: crate::families::deepseek_v4::resident::WeightInventory {
+                                    c4_attention: vec![ModeBytes::default(); cfg.n_layers], fixed: Vec::new() },
+                                cache_stages: stages,
+                                gpus: vec![(96 << 30, Baseline::Measured { free_bytes: 96 << 30 }); ranks],
+                                headroom_floor: 0, spark_ranks: 2, sequences, prefill_rows: prefill,
+                                decode_rows: 64, max_context: 1 << 20, reserve_bytes: RESERVE_BYTES,
+                                mark_slots: slots, workspace: None, experts: Vec::new(), draft: Vec::new(),
+                                experts_half: Vec::new(), tp2_workspace: [0; 2], exchange_f32: false,
+                                expert_workspace: 0, first_routed: 0, requested_pool: Some(1 << 20),
+                                onboard: Onboard::Layers(0), full_prefill_logits: 0, code_bytes: vec![0; ranks],
+                                context: Some(V4Context::default()), attention: Some(AttentionPlacement::Heads) };
+                            let req = request(&inputs).unwrap();
+                            let heads = solve(&req).unwrap();
+                            let geometry = deepseek_v4_cache_geometry(&cfg, ranks, prefill, stages).unwrap();
+                            let tables = (PREFILL_LANES * prefill + 64) * 4 * sequences;
+                            for (rank, cache) in geometry.ranks.iter().enumerate() {
+                                assert_eq!(bytes(&heads, rank, Category::Kv, "state"),
+                                    cache.active_state_per_sequence_bytes * sequences + tables);
+                                assert_eq!(bytes(&heads, rank, Category::Prefix, "marks"), cache.retained_mark_bytes * slots);
+                            }
+                            assert!(req.layers.iter().zip(&cfg.compress_ratios)
+                                .all(|(layer, &ratio)| (ratio == 4) == !layer.extra.is_empty()));
+                            if ranks == 1 { continue; }
+                            let context = solve(&request(&V4Inputs { attention: Some(AttentionPlacement::Context),
+                                ..inputs }).unwrap()).unwrap();
+                            for rank in 0..2 {
+                                for (category, group) in [(Category::Kv, "state"), (Category::Prefix, "marks")] {
+                                    assert_eq!(bytes(&context, rank, category, group), bytes(&heads, rank, category, group));
+                                }
+                            }
+                            let mut owned = req.clone();
+                            owned.attention_placement = Some(AttentionPlacement::Layers);
+                            assert!(solve(&owned).is_err(), "production layers remains fail-closed");
+                            // Test-only runtime capabilities: production enables none of these yet.
+                            const WHOLE: [LayerMode; 3] = [LayerMode::HeadSplit,
+                                LayerMode::Whole { gpu: 0, ffn: FfnMode::Split },
+                                LayerMode::Whole { gpu: 1, ffn: FfnMode::Split }];
+                            owned.executor = ExecutorModes { modes: &WHOLE, hops: true, ..owned.executor };
+                            owned.policy.ownership = LayerOwnership::NonemptyRanges;
+                            for (layer, &ratio) in owned.layers.iter_mut().zip(&cfg.compress_ratios) {
+                                if ratio == 4 { layer.modes = WHOLE.to_vec(); }
+                            }
+                            let placed = solve(&owned).unwrap();
+                            let (active, mark) = crate::serving_capacity::deepseek_v4_layer_state_geometry(4, prefill).unwrap();
+                            for rank in 0..2 {
+                                let missing = placed.layers.iter().filter(|layer| matches!(layer.mode,
+                                    LayerMode::Whole { gpu, .. } if usize::from(gpu) != rank)).count() as u64;
+                                assert_eq!(missing, 1, "both C4 owners must be nonempty");
+                                assert_eq!(bytes(&heads, rank, Category::Kv, "state") - bytes(&placed, rank, Category::Kv, "state"),
+                                    missing * active * sequences);
+                                assert_eq!(bytes(&heads, rank, Category::Prefix, "marks") - bytes(&placed, rank, Category::Prefix, "marks"),
+                                    missing * mark * slots);
+                            }
+                            for (layer, &ratio) in placed.layers.iter().zip(&cfg.compress_ratios) {
+                                if ratio != 4 { assert_eq!(layer.mode, LayerMode::HeadSplit); }
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]

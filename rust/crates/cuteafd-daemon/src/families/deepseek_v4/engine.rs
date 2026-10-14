@@ -53,6 +53,7 @@ pub(crate) struct Engine<'a> {
     attention_reduction: AttentionReductionPlan,
     pub shape: PoolShape,
     pools: Vec<LayerCache<'a>>,
+    modes: Vec<cuteafd_loader::placement::LayerMode>,
     rope_window: Dev<'a>,
     rope_compressed: Dev<'a>,
     /// Prefill and decode workspaces, reused across steps.
@@ -196,6 +197,22 @@ impl Profile {
     }
 }
 
+#[cfg(test)]
+mod cache_tests {
+    use super::cache_resident;
+    use cuteafd_loader::placement::{FfnMode, LayerMode};
+
+    #[test]
+    fn owned_cache_residency_preserves_c128_window_and_draft_replicas() {
+        let modes = [LayerMode::Whole { gpu: 0, ffn: FfnMode::Split }, LayerMode::HeadSplit,
+            LayerMode::Whole { gpu: 1, ffn: FfnMode::Split }, LayerMode::ContextSplit];
+        for rank in [0, 1] {
+            let ids = (0..6).filter(|&layer| cache_resident(&modes, layer, rank)).collect::<Vec<_>>();
+            assert_eq!(ids, if rank == 0 { vec![0, 1, 3, 4, 5] } else { vec![1, 2, 3] });
+        }
+    }
+}
+
 /// What [`Engine::attach_peer`] sizes the second GPU's caches with.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct PeerParts {
@@ -217,6 +234,7 @@ pub(crate) struct EngineParts<'a> {
     pub stream: *mut c_void,
     pub sms: Option<usize>,
     pub shape: PoolShape,
+    pub modes: Vec<cuteafd_loader::placement::LayerMode>,
     pub embedding: TokenEmbedding<'a>,
     pub skip_routed: bool,
     /// C4 token-split attention's programs (`Some` only when the placement chose `context`).
@@ -227,6 +245,15 @@ pub(crate) struct EngineParts<'a> {
 /// pages non-owner compressor rows write (one 64-row page per 64 decode/verify rows).
 fn c4_units(shape: PoolShape, context: bool) -> usize {
     if context { shape.units / 2 + metadata::C4_SCRATCH_UNITS } else { shape.units }
+}
+
+fn cache_resident(modes: &[cuteafd_loader::placement::LayerMode], layer: usize, rank: usize) -> bool {
+    use cuteafd_loader::placement::LayerMode;
+    match modes.get(layer) {
+        Some(LayerMode::Whole { gpu, .. }) => usize::from(*gpu) == rank,
+        Some(LayerMode::HeadSplit | LayerMode::ContextSplit) => rank < 2,
+        None => rank == 0, // dSpark stages follow the backbone on rank0.
+    }
 }
 
 fn bytes_of<T: Copy>(values: &[T]) -> &[u8] {
@@ -407,8 +434,9 @@ impl<'a> Engine<'a> {
                 self.library.copy_h2d(allocation.buffer, bytes_of(&values))?;
                 Ok(allocation)
             };
-            let pools = (0..self.cfg.n_layers).map(|l| Self::pool_layer_for(self.library, &self.cfg, parts.shape, l,
-                self.context_mode.is_some())).collect::<Result<Vec<_>>>()?;
+            let pools = (0..self.cfg.n_layers).filter(|&layer| cache_resident(&self.modes, layer, 1))
+                .map(|l| Self::pool_layer_for(self.library, &self.cfg, parts.shape, l,
+                    self.context_mode.is_some())).collect::<Result<Vec<_>>>()?;
             Ok(V4Peer { device, stream, layers, pools, rope_window: table(false)?, rope_compressed: table(true)?,
                 prefill_workspace: RefCell::new(None), decode_workspace: RefCell::new(None),
                 graphs: RefCell::new(std::collections::HashMap::new()) })
@@ -481,7 +509,9 @@ impl<'a> Engine<'a> {
         let stages = parts.weights.dspark.as_ref().map_or(0, |d| d.stages.len());
         let attention_reduction = AttentionReductionPlan::new(parts.decode_rows,
             (stages > 0).then_some(parts.cfg.dspark_block_size), None)?;
-        let pools = (0..parts.cfg.n_layers + stages).map(|l| Self::pool_layer(&parts, l)).collect::<Result<Vec<_>>>()?;
+        ensure!(parts.modes.len() == parts.cfg.n_layers, "cache modes must cover every backbone layer");
+        let pools = (0..parts.cfg.n_layers + stages).filter(|&layer| cache_resident(&parts.modes, layer, 0))
+            .map(|l| Self::pool_layer(&parts, l)).collect::<Result<Vec<_>>>()?;
         let table = |compressed: bool| -> Result<Dev<'a>> {
             let values = metadata::rope_table(&parts.cfg, compressed, parts.max_context.max(metadata::WINDOW));
             let allocation = DeviceAllocation::new(parts.library, values.len() * 4)?;
@@ -514,6 +544,7 @@ impl<'a> Engine<'a> {
             rope_window: table(false)?,
             rope_compressed: table(true)?,
             pools,
+            modes: parts.modes,
             library: parts.library,
             programs: parts.programs,
             cfg: parts.cfg,
@@ -702,6 +733,12 @@ impl<'a> Engine<'a> {
             (1, Some(peer)) => &peer.pools,
             _ => &self.pools,
         }
+    }
+
+    fn cache_on(&self, rank: usize, layer: usize) -> Result<&LayerCache<'a>> {
+        let caches = self.caches_on(rank);
+        caches.binary_search_by_key(&layer, |cache| cache.layer).ok().and_then(|index| caches.get(index))
+            .with_context(|| format!("layer {layer} has no attention cache on rank {rank}"))
     }
 
     /// Longest chunk one [`Self::prefill`] call takes.
@@ -1500,7 +1537,7 @@ impl<'a> Engine<'a> {
             return self.context_prefill_front(rank, layer, weights, tables, lane, lane.index, w, rows, cap, &unit);
         }
         self.attention_produce(rank, layer, weights, lane, w, rows, cap)?;
-        let cache = &self.caches_on(rank)[layer];
+        let cache = self.cache_on(rank, layer)?;
         let rope = self.attention_rope(rank, weights.ratio);
         let (attention, indexed_cache, indexed_indices, indexed_lengths) =
             self.compress(rank, layer, weights, cache, None, tables, &lane.tables, w, rope, rows, cap)?;
