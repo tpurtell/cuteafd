@@ -827,6 +827,334 @@ mod terminal_ownership_tests {
     }
 }
 
+/// CPU model of streaming pinned-lane uploads (#180). Not wired into
+/// [`SparkIntake::submit_lane`]: that path still retains every chunk and
+/// uploads only after the wave. A fake copy stream completes a prefix of
+/// its log, so a later event cannot pass an earlier copy.
+#[cfg(test)]
+mod lane_upload_contract {
+    use anyhow::{ensure, Context, Result};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    struct Owner(Arc<AtomicUsize>);
+    impl Drop for Owner {
+        fn drop(&mut self) { self.0.fetch_add(1, Ordering::SeqCst); }
+    }
+
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    enum Step { Copy, Event }
+
+    /// Ordered device stream. `done` is a prefix: step `i` is complete only
+    /// after every step before it.
+    struct Stream {
+        steps: Vec<Step>,
+        done: usize,
+    }
+    impl Stream {
+        fn push_copy(&mut self) { self.steps.push(Step::Copy); }
+        fn push_event(&mut self) -> usize {
+            self.steps.push(Step::Event);
+            self.steps.len() - 1
+        }
+        fn complete_through(&mut self, index: usize) {
+            assert!(index < self.steps.len(), "no such stream step");
+            self.done = self.done.max(index + 1);
+        }
+        fn event_complete(&self, index: usize) -> bool {
+            self.done > index && self.steps.get(index) == Some(&Step::Event)
+        }
+        fn idle(&self) -> bool { self.done == self.steps.len() }
+        fn sync_all(&mut self) { self.done = self.steps.len(); }
+    }
+
+    struct Slot {
+        /// Retained so `Drop` runs when the slot is removed. Not read.
+        #[allow(dead_code)]
+        owner: Owner,
+        /// Event recorded after this slot's copy. `None` means the copy was
+        /// not paired with an event (enqueue failed after the memcpy, or no
+        /// memcpy was queued).
+        event: Option<usize>,
+        copied: bool,
+    }
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Fault { None, BeforeCopy, AfterCopy }
+
+    struct LaneUpload {
+        device: i32,
+        bound: Option<i32>,
+        copy: Stream,
+        compute: Stream,
+        /// Wave event on the copy stream, recorded after every chunk copy.
+        wave_event: Option<usize>,
+        /// Consumer event on the compute stream, recorded after the reduce.
+        consumed: Option<usize>,
+        held: Vec<Slot>,
+        copies_queued: bool,
+        drained: bool,
+        fault: Fault,
+    }
+
+    impl LaneUpload {
+        fn new(device: i32) -> Self {
+            Self {
+                device, bound: None,
+                copy: Stream { steps: Vec::new(), done: 0 },
+                compute: Stream { steps: Vec::new(), done: 0 },
+                wave_event: None, consumed: None, held: Vec::new(),
+                copies_queued: false, drained: false, fault: Fault::None,
+            }
+        }
+
+        fn bind(&mut self, device: i32) { self.bound = Some(device); }
+
+        /// Retain `owner`, then queue its copy. A failure after the retain
+        /// keeps the owner. A failure after the memcpy keeps it until the
+        /// copy stream is synchronized: there is no per-chunk event to wait on.
+        fn accept(&mut self, owner: Owner) -> Result<()> {
+            self.held.push(Slot { owner, event: None, copied: false });
+            let slot = self.held.len() - 1;
+            ensure!(self.bound == Some(self.device), "lane thread has not bound the intake device");
+            if self.fault == Fault::BeforeCopy {
+                self.fault = Fault::None;
+                anyhow::bail!("injected enqueue failure before the copy");
+            }
+            self.copy.push_copy();
+            self.held[slot].copied = true;
+            self.copies_queued = true;
+            if self.fault == Fault::AfterCopy {
+                self.fault = Fault::None;
+                anyhow::bail!("injected enqueue failure after the copy");
+            }
+            self.held[slot].event = Some(self.copy.push_event());
+            Ok(())
+        }
+
+        /// Drop owners whose own copy event has completed. An orphan copy
+        /// (memcpy queued, event not recorded) stays until a stream sync.
+        fn reclaim_completed(&mut self) -> usize {
+            let mut released = 0;
+            let done = self.copy.done;
+            let steps = self.copy.steps.clone();
+            self.held.retain(|slot| {
+                let finished = slot.copied && slot.event.is_some_and(|event| {
+                    done > event && steps.get(event) == Some(&Step::Event)
+                });
+                if finished { released += 1; }
+                !finished
+            });
+            released
+        }
+
+        /// Record the consumer's ordering event after every copy queued so far.
+        fn join_consumer(&mut self) {
+            self.wave_event = Some(self.copy.push_event());
+        }
+
+        fn consumer_can_read(&self) -> bool {
+            self.wave_event.is_some_and(|event| self.copy.event_complete(event))
+        }
+
+        fn reduce(&mut self) -> Result<()> {
+            ensure!(self.consumer_can_read(), "reduce ran before the wave copy event");
+            self.consumed = Some(self.compute.push_event());
+            Ok(())
+        }
+
+        fn complete_reduce(&mut self) {
+            if let Some(event) = self.consumed { self.compute.complete_through(event); }
+        }
+
+        /// Next wave. Planes stay until the consumer event completes. Sources
+        /// stay until the copy stream has retired every memcpy, including a
+        /// copy whose event was never recorded.
+        fn before_dispatch(&mut self) -> Result<()> {
+            if let Some(event) = self.consumed {
+                ensure!(self.compute.event_complete(event), "planes are still being read");
+            }
+            if self.copies_queued { self.copy.sync_all(); }
+            self.release_sources()?;
+            self.copies_queued = false;
+            self.wave_event = None;
+            self.consumed = None;
+            self.drained = false;
+            Ok(())
+        }
+
+        fn release_sources(&mut self) -> Result<()> {
+            let idle = self.copy.idle();
+            let done = self.copy.done;
+            let steps = self.copy.steps.clone();
+            let releasable = |slot: &Slot| {
+                if !slot.copied { return true; }
+                match slot.event {
+                    Some(event) => done > event && steps.get(event) == Some(&Step::Event),
+                    None => idle,
+                }
+            };
+            ensure!(self.held.iter().all(releasable), "a source would be released before its copy finished");
+            self.held.clear();
+            Ok(())
+        }
+
+        fn terminal_drain_copies(&mut self) {
+            self.copy.sync_all();
+            self.drained = true;
+        }
+
+        /// #159 release: only after a successful copy drain. Does not itself
+        /// synchronize, so a skipped drain leaves every owner in place.
+        fn terminal_release(&mut self) -> Result<()> {
+            ensure!(self.drained, "terminal release before the copy stream drained");
+            self.release_sources().context("terminal release")?;
+            Ok(())
+        }
+    }
+
+    fn owner(drops: &Arc<AtomicUsize>) -> Owner { Owner(Arc::clone(drops)) }
+    fn dropped(drops: &Arc<AtomicUsize>) -> usize { drops.load(Ordering::SeqCst) }
+
+    #[test]
+    fn reclaim_leaves_a_source_until_its_event_completes() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let mut lane = LaneUpload::new(0);
+        lane.bind(0);
+        lane.accept(owner(&drops)).unwrap();
+        assert_eq!(lane.reclaim_completed(), 0);
+        assert_eq!(dropped(&drops), 0);
+        assert!(lane.terminal_release().is_err());
+        assert_eq!(dropped(&drops), 0);
+        let event = lane.held[0].event.unwrap();
+        lane.copy.complete_through(event);
+        assert_eq!(lane.reclaim_completed(), 1);
+        assert_eq!(dropped(&drops), 1);
+        assert!(lane.held.is_empty());
+    }
+
+    #[test]
+    fn an_earlier_chunk_can_release_while_a_later_copy_is_outstanding() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let mut lane = LaneUpload::new(0);
+        lane.bind(0);
+        lane.accept(owner(&drops)).unwrap();
+        lane.accept(owner(&drops)).unwrap();
+        let first = lane.held[0].event.unwrap();
+        let second = lane.held[1].event.unwrap();
+        assert!(first < second);
+        lane.copy.complete_through(first);
+        assert!(!lane.copy.event_complete(second));
+        assert_eq!(lane.reclaim_completed(), 1);
+        assert_eq!(dropped(&drops), 1);
+        assert_eq!(lane.held.len(), 1);
+        assert_eq!(lane.held[0].event, Some(second));
+        lane.copy.complete_through(second);
+        assert_eq!(lane.reclaim_completed(), 1);
+        assert_eq!(dropped(&drops), 2);
+    }
+
+    #[test]
+    fn the_consumer_waits_for_an_event_recorded_after_every_copy() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let mut lane = LaneUpload::new(0);
+        lane.bind(0);
+        lane.accept(owner(&drops)).unwrap();
+        lane.accept(owner(&drops)).unwrap();
+        lane.join_consumer();
+        let wave = lane.wave_event.unwrap();
+        assert_eq!(lane.copy.steps.last(), Some(&Step::Event));
+        assert_eq!(lane.copy.steps.iter().filter(|step| **step == Step::Copy).count(), 2);
+        assert!(wave > lane.held[1].event.unwrap());
+        assert!(!lane.consumer_can_read());
+        assert!(lane.reduce().is_err());
+        lane.copy.complete_through(lane.held[0].event.unwrap());
+        assert!(!lane.consumer_can_read(), "the first chunk's event does not order the reduce");
+        lane.copy.complete_through(wave);
+        assert!(lane.consumer_can_read());
+        lane.reduce().unwrap();
+        assert_eq!(dropped(&drops), 0, "the reduce does not free host sources");
+    }
+
+    #[test]
+    fn before_dispatch_does_not_release_while_the_consumer_still_reads_the_planes() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let mut lane = LaneUpload::new(0);
+        lane.bind(0);
+        lane.accept(owner(&drops)).unwrap();
+        lane.join_consumer();
+        lane.copy.sync_all();
+        lane.reduce().unwrap();
+        assert!(lane.before_dispatch().is_err());
+        assert_eq!(dropped(&drops), 0);
+        assert_eq!(lane.held.len(), 1);
+        lane.complete_reduce();
+        lane.before_dispatch().unwrap();
+        assert_eq!(dropped(&drops), 1);
+        assert!(lane.held.is_empty());
+    }
+
+    #[test]
+    fn a_failed_enqueue_keeps_its_source_and_dispatch_syncs_orphan_copies() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let mut lane = LaneUpload::new(0);
+        lane.bind(0);
+        lane.accept(owner(&drops)).unwrap();
+        lane.fault = Fault::BeforeCopy;
+        assert!(lane.accept(owner(&drops)).is_err());
+        lane.fault = Fault::AfterCopy;
+        assert!(lane.accept(owner(&drops)).is_err());
+        assert_eq!(lane.held.len(), 3);
+        assert_eq!(dropped(&drops), 0);
+        let first = lane.held[0].event.unwrap();
+        lane.copy.complete_through(first);
+        assert_eq!(lane.reclaim_completed(), 1, "only the completed event releases");
+        assert_eq!(dropped(&drops), 1);
+        assert!(lane.held.iter().any(|slot| slot.copied && slot.event.is_none()));
+        // No consumer was recorded: the failed wave still has to retire the
+        // memcpy that was queued without an event before the next dispatch.
+        lane.before_dispatch().unwrap();
+        assert!(lane.copy.idle());
+        assert_eq!(dropped(&drops), 3);
+        assert!(lane.held.is_empty());
+    }
+
+    #[test]
+    fn terminal_release_before_drain_keeps_every_source() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let mut lane = LaneUpload::new(0);
+        lane.bind(0);
+        lane.accept(owner(&drops)).unwrap();
+        lane.fault = Fault::AfterCopy;
+        assert!(lane.accept(owner(&drops)).is_err());
+        assert!(lane.terminal_release().is_err());
+        assert_eq!(dropped(&drops), 0);
+        assert_eq!(lane.held.len(), 2);
+        lane.terminal_drain_copies();
+        lane.terminal_release().unwrap();
+        assert_eq!(dropped(&drops), 2);
+        assert!(lane.held.is_empty());
+    }
+
+    #[test]
+    fn the_lane_thread_must_bind_the_intake_device_before_a_copy() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let mut lane = LaneUpload::new(1);
+        assert!(lane.accept(owner(&drops)).is_err());
+        assert_eq!(dropped(&drops), 0);
+        assert_eq!(lane.held.len(), 1);
+        assert!(!lane.held[0].copied);
+        assert!(!lane.copies_queued);
+        lane.bind(0);
+        assert!(lane.accept(owner(&drops)).is_err(), "a different device is not the intake's");
+        lane.bind(1);
+        lane.accept(owner(&drops)).unwrap();
+        assert!(lane.held.last().unwrap().copied);
+        assert_eq!(lane.held.iter().filter(|slot| slot.copied).count(), 1);
+        assert_eq!(dropped(&drops), 0);
+    }
+}
+
 impl Drop for SparkIntake<'_> {
     fn drop(&mut self) {
         // SAFETY: the handles were created by this intake; queued copies drain first.
