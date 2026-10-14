@@ -587,7 +587,8 @@ fn planner_v4_flash_remote_c4_owner_pool_regression() {
         draft_ownership: Some(cuteafd_loader::plan::spec::DraftOwnership::selected("deepseek_v4", "off")),
         placement: ExpertPlacement::from_spark_ranks(4),
         layout: Some(LayoutOptions { rtx_bytes: vec![budget; 2], pool_tokens: Some(2 << 20),
-            context_tokens: case.context, workspace_manifest: Some(manifest.clone()),
+            // Match the direct EngineArgs C8 default used by runtime_with_pool.
+            concurrency: 8, context_tokens: case.context, workspace_manifest: Some(manifest.clone()),
             onboard: case.onboard, native_mtp_layers: 0, headroom_bytes: 0, ..Default::default() }),
         attention_placement: case.attention, ..Default::default() }).unwrap();
     if !cfg!(feature = "dev-v4-layers") {
