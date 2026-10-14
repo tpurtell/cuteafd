@@ -236,6 +236,8 @@ fn bytes_of<T: Copy>(values: &[T]) -> &[u8] {
 
 /// Per-layer caches and compressor state for one sequence.
 pub(crate) struct LayerCache<'a> {
+    /// Stable logical identity, independent of this rank's resident cache order.
+    pub layer: usize,
     pub main: Dev<'a>,
     pub compressed: Option<Dev<'a>>,
     pub index: Option<Dev<'a>>,
@@ -466,7 +468,7 @@ impl<'a> Engine<'a> {
             ),
             _ => (None, None, Vec::new()),
         };
-        Ok(LayerCache { main, compressed, index, states })
+        Ok(LayerCache { layer, main, compressed, index, states })
     }
 
     /// Allocates the cache pools and RoPE tables for `parts.shape`.
