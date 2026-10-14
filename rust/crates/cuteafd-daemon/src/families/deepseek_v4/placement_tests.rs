@@ -132,15 +132,7 @@ fn runtime_with_test_owners(case: &Case<'_>, layout: &MemoryLayout, tp1_availabl
         exchange_f32: case.exchange_f32 };
     let mut request = admission::request(&cli.engine, &inputs)?;
     if owned {
-        use cuteafd_loader::placement::{ExecutorModes, FfnMode, LayerMode, LayerOwnership};
-        const MODES: [LayerMode; 3] = [LayerMode::HeadSplit,
-            LayerMode::Whole { gpu: 0, ffn: FfnMode::Split },
-            LayerMode::Whole { gpu: 1, ffn: FfnMode::Split }];
-        request.executor = ExecutorModes { modes: &MODES, hops: true, ..request.executor };
-        request.policy.ownership = LayerOwnership::NonemptyRanges;
-        for (layer, &ratio) in request.layers.iter_mut().zip(&cfg.compress_ratios) {
-            if ratio == 4 { layer.modes = MODES.to_vec(); }
-        }
+        cuteafd_loader::placement::families::deepseek_v4::bind_owned_attention(&mut request, &cfg);
     }
     assert_eq!(request.hops.terminal, cuteafd_loader::placement::TerminalHome::Head);
     let placement = solve(&request)?;
@@ -507,17 +499,28 @@ fn planner_v4_max_owner_workspace_pool_regression() {
             let spec = super::dev_layer_hop_spec(&cfg, 4096, 64).unwrap();
             assert!(cuteafd_loader::placement::LayerExecutionPlan::new(&layers, spec).is_ok());
         }
-        let refused = plan(snapshot, &PlanOptions {
+        let report = plan(snapshot, &PlanOptions {
             placement: ExpertPlacement::from_spark_ranks(sparks),
             layout: Some(LayoutOptions { rtx_bytes: vec![budget; 2], context_tokens: 1_048_576,
                 workspace_manifest: Some(manifest.clone()), onboard: Some(Onboard::Auto),
                 native_mtp_layers: 3, headroom_bytes: 0, ..Default::default() }),
             attention_placement: Some(AttentionPlacement::Layers), ..Default::default() }).unwrap();
-        assert!(!refused.executable(), "production dual-rank layers must remain unsupported");
-        let error = refused.config_error.as_deref().expect("unsupported executor must explain refusal");
-        assert!(error.contains("executor not implemented"), "unexpected refusal: {error}");
-        assert!(runtime(&case(AttentionPlacement::Layers), &layout).is_err(),
-            "production runtime must refuse dual-rank layers without test capabilities");
+        if cfg!(feature = "dev-v4-layers") {
+            assert!(report.placement_supported && report.executable(), "{}", cuteafd_loader::plan::render(&report));
+            let planned_layers = report.memory_layout.as_ref().unwrap();
+            assert_eq!(planned_layers.pool_tokens, 2 << 20);
+            let admitted = runtime(&case(AttentionPlacement::Layers), &layout).unwrap();
+            assert_eq!(admitted, layers, "dev admission must use the same owner request");
+            for (device, items) in planned_layers.devices.iter().zip(&layers.items) {
+                for item in items { assert!(device.items.contains(item), "missing admitted item {item:?}"); }
+            }
+        } else {
+            assert!(!report.executable(), "default dual-rank layers must remain unsupported");
+            let error = report.config_error.as_deref().expect("unsupported executor must explain refusal");
+            assert!(error.contains("executor not implemented"), "unexpected refusal: {error}");
+            assert!(runtime(&case(AttentionPlacement::Layers), &layout).is_err(),
+                "default runtime must refuse dual-rank layers without test capabilities");
+        }
     }
 }
 

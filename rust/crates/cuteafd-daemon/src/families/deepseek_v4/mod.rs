@@ -252,15 +252,7 @@ fn dev_layer_request(enabled: bool, request: &mut cuteafd_loader::placement::Pla
     if !enabled { return Ok(()); }
     ensure!(cfg!(feature = "dev-v4-layers") && request.inventory.gpus.len() == 2,
         "dev V4 layers needs the compile-time feature and two admitted GPUs");
-    use cuteafd_loader::placement::{ExecutorModes, FfnMode, LayerMode, LayerOwnership};
-    const MODES: [LayerMode; 3] = [LayerMode::HeadSplit,
-        LayerMode::Whole { gpu: 0, ffn: FfnMode::Split },
-        LayerMode::Whole { gpu: 1, ffn: FfnMode::Split }];
-    request.executor = ExecutorModes { modes: &MODES, hops: true, ..request.executor };
-    request.policy.ownership = LayerOwnership::NonemptyRanges;
-    for (layer, &ratio) in request.layers.iter_mut().zip(&cfg.compress_ratios) {
-        if ratio == 4 { layer.modes = MODES.to_vec(); }
-    }
+    cuteafd_loader::placement::families::deepseek_v4::bind_owned_attention(request, cfg);
     Ok(())
 }
 
