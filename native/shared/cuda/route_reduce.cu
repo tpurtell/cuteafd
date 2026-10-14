@@ -568,11 +568,17 @@ __global__ void rtx_tp2_partial(const float* routed, const __nv_bfloat16* shared
 }
 __device__ float tp2_value(float value) { return value; }
 __device__ float tp2_value(__nv_bfloat16 value) { return __bfloat162float(value); }
-template<typename In>
-__global__ void rtx_tp2_sum(const In* rank0, const In* rank1, __nv_bfloat16* out, uint64_t count) {
+template<typename In, bool Masked = false>
+__global__ void rtx_tp2_sum(const In* rank0, const In* rank1, __nv_bfloat16* out, uint64_t count,
+    const int64_t* main_slots=nullptr, uint32_t hidden=0) {
   for (uint64_t i = uint64_t(blockIdx.x) * blockDim.x + threadIdx.x;
-       i < count; i += uint64_t(gridDim.x) * blockDim.x)
+       i < count; i += uint64_t(gridDim.x) * blockDim.x) {
+    if constexpr (Masked) {
+      // Peer exchange publishes real rows only; never load stale peer tails.
+      if (main_slots[i / hidden] < 0) { out[i] = __float2bfloat16_rn(0.0f); continue; }
+    }
     out[i] = __float2bfloat16_rn(__fadd_rn(tp2_value(rank0[i]), tp2_value(rank1[i])));
+  }
 }
 unsigned rtx_tp2_blocks(uint64_t count) {
   const uint64_t blocks = (count + 255) / 256;
@@ -624,5 +630,30 @@ extern "C" int32_t cuteafd_rtx_tp2_sum_async(const void* rank0, const void* rank
   else
     rtx_tp2_sum<__nv_bfloat16><<<rtx_tp2_blocks(count), 256, 0, cuda_stream>>>(
         static_cast<const __nv_bfloat16*>(rank0), static_cast<const __nv_bfloat16*>(rank1), output, count);
+  return cudaGetLastError();
+}
+
+extern "C" int32_t cuteafd_dsv4_rtx_tp2_sum_masked_async(const void* rank0, const void* rank1,
+    uint16_t* out, const int64_t* main_slots, uint32_t rows, uint32_t hidden, uint32_t dtype, void* stream) {
+  if (!rows || rows > 4096 || !hidden || hidden > 16384) return cudaErrorInvalidValue;
+  const uint64_t count = uint64_t(rows) * hidden, slot_bytes = uint64_t(rows) * 8;
+  const uint64_t element = dtype ? 4 : 2;
+  if (dtype > 1 || !rank0 || !rank1 || !out || !main_slots ||
+      reinterpret_cast<uintptr_t>(rank0) % element || reinterpret_cast<uintptr_t>(rank1) % element ||
+      reinterpret_cast<uintptr_t>(out) % 2 || reinterpret_cast<uintptr_t>(main_slots) % 8 ||
+      reinterpret_cast<uintptr_t>(out) > UINTPTR_MAX - count * 2 ||
+      reinterpret_cast<uintptr_t>(rank0) > UINTPTR_MAX - count * element ||
+      reinterpret_cast<uintptr_t>(rank1) > UINTPTR_MAX - count * element ||
+      reinterpret_cast<uintptr_t>(main_slots) > UINTPTR_MAX - slot_bytes ||
+      overlaps(rank0, count * element, out, count * 2) || overlaps(rank1, count * element, out, count * 2) ||
+      overlaps(main_slots, slot_bytes, out, count * 2)) return cudaErrorInvalidValue;
+  auto cuda_stream = static_cast<cudaStream_t>(stream);
+  auto output = reinterpret_cast<__nv_bfloat16*>(out);
+  if (dtype)
+    rtx_tp2_sum<float,true><<<rtx_tp2_blocks(count), 256, 0, cuda_stream>>>(static_cast<const float*>(rank0),
+        static_cast<const float*>(rank1), output, count, main_slots, hidden);
+  else
+    rtx_tp2_sum<__nv_bfloat16,true><<<rtx_tp2_blocks(count), 256, 0, cuda_stream>>>(
+        static_cast<const __nv_bfloat16*>(rank0), static_cast<const __nv_bfloat16*>(rank1), output, count, main_slots, hidden);
   return cudaGetLastError();
 }

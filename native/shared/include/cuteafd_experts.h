@@ -227,6 +227,12 @@ int32_t cuteafd_rtx_tp2_partial_async(const float* routed, const uint16_t* share
     void* out, uint64_t count, uint32_t dtype, void* stream);
 int32_t cuteafd_rtx_tp2_sum_async(const void* rank0, const void* rank1, uint16_t* out,
     uint64_t count, uint32_t dtype, void* stream);
+// V4 bucket sum: negative I64 main_slots [rows] writes +0 without reading
+// either input row. Live rows retain the unmasked rank-ordered arithmetic.
+// All buffers stay live for the fixed bucket extent; out is disjoint from
+// both payloads and main_slots. No allocation, host validity read or sync.
+int32_t cuteafd_dsv4_rtx_tp2_sum_masked_async(const void* rank0, const void* rank1,
+    uint16_t* out, const int64_t* main_slots, uint32_t rows, uint32_t hidden, uint32_t dtype, void* stream);
 #ifdef __cplusplus
 }
 #endif

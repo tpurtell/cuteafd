@@ -69,9 +69,9 @@ __global__ void __launch_bounds__(256) score_rows_kernel(const __nv_bfloat16* hi
 // Top-k with warp-shuffle argmax rounds. The winner of each round is the
 // largest corrected score with the lowest expert index on ties, exactly as in
 // the shared-memory tree of `select_kernel`, so selections are identical.
-template<bool TransformLogits = false,bool Sigmoid = false>
+template<bool TransformLogits = false,bool Sigmoid = false,bool Masked = false>
 __global__ void __launch_bounds__(512) select_fast_kernel(float* scores,const float* bias,const float* bias_vl,
-    const uint8_t* image_mask,uint32_t* ids,float* routing,int experts,int topk,float scale=1.5f) {
+    const uint8_t* image_mask,uint32_t* ids,float* routing,int experts,int topk,float scale=1.5f,const int64_t* main_slots=nullptr) {
   const uint64_t row=blockIdx.x;const int tid=threadIdx.x;const int lane=tid&31,warp=tid>>5;
   if constexpr (TransformLogits) {
     if(tid<experts) {
@@ -109,12 +109,16 @@ __global__ void __launch_bounds__(512) select_fast_kernel(float* scores,const fl
   if(tid<topk) {
     float total=0;for(int j=0;j<topk;++j) total+=selected[j];
     routing[row*topk+tid]=(selected[tid]/(total+1e-20f))*scale;
+    if constexpr (Masked) {
+      if(main_slots[row]<0) {ids[row*topk+tid]=UINT32_MAX;routing[row*topk+tid]=0.0f;}
+    }
   }
 }
 // DeepSeek V4 hash layers: experts come from tid2eid[token]; weights are the
 // sqrtsoftplus scores at those experts, normalized, times the route scale.
+template<bool Masked = false>
 __global__ void select_hash_kernel(const float* logits,const int32_t* tid2eid,const uint32_t* tokens,
-    uint32_t* ids,float* routing,int experts,int topk,float scale) {
+    uint32_t* ids,float* routing,int experts,int topk,float scale,const int64_t* main_slots=nullptr) {
   const uint64_t row=blockIdx.x;const int tid=threadIdx.x;
   __shared__ float selected[8];
   if(tid<topk) {
@@ -127,6 +131,9 @@ __global__ void select_hash_kernel(const float* logits,const int32_t* tid2eid,co
   if(tid<topk) {
     float total=0;for(int j=0;j<topk;++j) total+=selected[j];
     routing[row*topk+tid]=(selected[tid]/(total+1e-20f))*scale;
+    if constexpr (Masked) {
+      if(main_slots[row]<0) {ids[row*topk+tid]=UINT32_MAX;routing[row*topk+tid]=0.0f;}
+    }
   }
 }
 template<bool TransformLogits = false>
@@ -291,11 +298,32 @@ extern "C" int32_t cuteafd_router_select(float* logits,const float* bias,const i
   auto s=reinterpret_cast<cudaStream_t>(stream);
   if(tid2eid && sigmoid) return cudaErrorInvalidValue;
   if(tid2eid) {
-    select_hash_kernel<<<rows,32,0,s>>>(logits,tid2eid,tokens,ids,routing,experts,topk,route_scale);
+    select_hash_kernel<false><<<rows,32,0,s>>>(logits,tid2eid,tokens,ids,routing,experts,topk,route_scale);
   } else if(sigmoid) {
     select_fast_kernel<true,true><<<rows,512,0,s>>>(logits,bias,bias,nullptr,ids,routing,experts,topk,route_scale);
   } else {
     select_fast_kernel<true><<<rows,512,0,s>>>(logits,bias,bias,nullptr,ids,routing,experts,topk,route_scale);
+  }
+  return cudaGetLastError();
+}
+// Fixed bucket launches read validity from uploaded device metadata. Selection
+// and normalization on live rows keep the unmasked arithmetic and tie order.
+extern "C" int32_t cuteafd_dsv4_router_select_masked(float* logits,const float* bias,const int32_t* tid2eid,
+    const uint32_t* tokens,const int64_t* main_slots,uint32_t* ids,float* routing,int32_t rows,
+    int32_t experts,int32_t topk,float route_scale,void* stream) {
+  if(rows<1 || rows>4096 || experts<1 || experts>512 || topk<1 || topk>8 || topk>experts ||
+      (tid2eid==nullptr)==(bias==nullptr) || (tid2eid && !tokens)) return cudaErrorInvalidValue;
+  const void* p[]={logits,ids,routing,main_slots};
+  const uint64_t n[]={uint64_t(rows)*experts*4,uint64_t(rows)*topk*4,
+      uint64_t(rows)*topk*4,uint64_t(rows)*8};
+  for(int i=0;i<4;++i) if(!span(p[i],n[i],i==3?8:4)) return cudaErrorInvalidValue;
+  for(int i=0;i<4;++i) for(int j=0;j<i;++j)
+    if(!disjoint(p[i],n[i],p[j],n[j])) return cudaErrorInvalidValue;
+  auto s=reinterpret_cast<cudaStream_t>(stream);
+  if(tid2eid) {
+    select_hash_kernel<true><<<rows,32,0,s>>>(logits,tid2eid,tokens,ids,routing,experts,topk,route_scale,main_slots);
+  } else {
+    select_fast_kernel<true,false,true><<<rows,512,0,s>>>(logits,bias,bias,nullptr,ids,routing,experts,topk,route_scale,main_slots);
   }
   return cudaGetLastError();
 }

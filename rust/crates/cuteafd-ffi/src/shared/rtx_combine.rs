@@ -77,4 +77,26 @@ impl RtxTp2Combine<'_> {
         ensure!(status == 0, "TP2 combine sum failed with CUDA status {status}");
         Ok(())
     }
+    /// V4 fixed-bucket sum; rows with a negative device slot produce +0 and
+    /// never read either rank payload. Other sum consumers use [`Self::sum`].
+    /// # Safety
+    /// As [`Self::sum`] for `rows * hidden` elements; `main_slots` is live
+    /// I64 [rows] on the same device/stream, disjoint from `out`.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn dsv4_sum_masked(&self, rank0: *const c_void, rank1: *const c_void,
+        out: *mut u16, main_slots: *const i64, rows: usize, hidden: usize,
+        dtype: RtxPartialDtype, stream: *mut c_void) -> Result<()> {
+        ensure!((1..=4096).contains(&rows) && (1..=16384).contains(&hidden),
+            "invalid V4 masked sum geometry");
+        type MaskedSum = unsafe extern "C" fn(*const c_void, *const c_void, *mut u16,
+            *const i64, u32, u32, u32, *mut c_void) -> i32;
+        // SAFETY: the new V4-only symbol matches cuteafd_experts.h; shared construction is unchanged.
+        let sum = *unsafe { self._library.lib.get::<MaskedSum>(b"cuteafd_dsv4_rtx_tp2_sum_masked_async") }
+            .context("native library lacks cuteafd_dsv4_rtx_tp2_sum_masked_async")?;
+        // SAFETY: caller retains and orders all device arrays through completion.
+        let status = unsafe { sum(rank0, rank1, out, main_slots, rows as u32, hidden as u32, dtype as u32, stream) };
+        ensure!(status == 0, "V4 masked TP2 combine sum failed with CUDA status {status}");
+        Ok(())
+    }
+
 }

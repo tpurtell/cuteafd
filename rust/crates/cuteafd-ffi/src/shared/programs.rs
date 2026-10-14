@@ -448,6 +448,30 @@ impl NativeLibrary {
         Ok(())
     }
 
+    /// V4 bucket routing: negative device `main_slots` invalidate route IDs
+    /// and zero their weights after the unchanged selection arithmetic.
+    ///
+    /// # Safety
+    /// As [`Self::dsv4_router_select`]; `main_slots` is I64 [rows], disjoint
+    /// from logits/outputs. Padded hash tokens and logits are initialized.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn dsv4_router_select_masked(&self, logits: *mut c_void, bias: *const c_void,
+        tid2eid: *const c_void, tokens: *const c_void, main_slots: *const i64, ids: *mut c_void,
+        routing: *mut c_void, rows: usize, experts: usize, topk: usize, route_scale: f32,
+        stream: *mut c_void) -> Result<()> {
+        type Select = unsafe extern "C" fn(*mut c_void, *const c_void, *const c_void, *const c_void,
+            *const i64, *mut c_void, *mut c_void, i32, i32, i32, f32, *mut c_void) -> i32;
+        // SAFETY: symbol signature matches cuteafd_router.h; caller retains every device buffer.
+        let select = *unsafe { self.lib.get::<Select>(b"cuteafd_dsv4_router_select_masked") }?;
+        // SAFETY: caller supplies initialized, disjoint device arrays ordered on stream.
+        let status = unsafe {
+            select(logits, bias, tid2eid, tokens, main_slots, ids, routing, i32::try_from(rows)?,
+                i32::try_from(experts)?, i32::try_from(topk)?, route_scale, stream)
+        };
+        ensure!(status == 0, "DeepSeek V4 masked router select failed with {status}");
+        Ok(())
+    }
+
     /// [`Self::dsv4_router_select`] with `sigmoid` selecting GLM's sigmoid
     /// scores (noaux_tc) instead of sqrtsoftplus.
     ///
