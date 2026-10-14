@@ -217,8 +217,9 @@ def test_real_pro_attention_layouts_against_fp64():
     head_query = torch.cat((h0["query"], h1["query"]), 1)
     metric("q_projection_norm_rope", full["query"], head_query, qref)
     kvref = rope(norm(full["raw_qkv"][:, 1536:], kvn).bfloat16(), meta.positions)
-    main_kv = torch.cat(unpack(full["main_kv_cache"], page_size=256, n_tokens=rows), -1)
-    head_kv = torch.cat(unpack(h0["main_kv_cache"], page_size=256, n_tokens=rows), -1)
+    # The cache helper returns full K and V views, not NoPE/RoPE halves.
+    main_kv, _ = unpack(full["main_kv_cache"], page_size=256, n_tokens=rows)
+    head_kv, _ = unpack(h0["main_kv_cache"], page_size=256, n_tokens=rows)
     metric("kv_norm_rope_cache", main_kv, head_kv, kvref)
     assert torch.equal(full["main_kv_cache"], h0["main_kv_cache"]) and torch.equal(h0["main_kv_cache"], h1["main_kv_cache"])
 
@@ -253,7 +254,7 @@ def test_real_pro_attention_layouts_against_fp64():
         pooled = (vv * ss.softmax(1)).sum(1).bfloat16()
         return rope(norm(pooled, weight).bfloat16(), torch.arange(groups, dtype=torch.int64)*4)
 
-    comp_kv = torch.cat(unpack(comp["compressed_cache"], page_size=64, n_tokens=c["groups"]), -1)
+    comp_kv, _ = unpack(comp["compressed_cache"], page_size=64, n_tokens=c["groups"])
     cref = pool_reference(projected[:, :1024], projected[:, 1024:2048], comp["main_ape"], comp["main_norm"], 512)
     metric("compressor_pool_norm_rope_cache_shared", comp_kv, comp_kv, cref, shared=True)
     iref = pool_reference(projected[:, 2048:2304], projected[:, 2304:], comp["index_ape"], comp["index_norm"], 128).bfloat16()
