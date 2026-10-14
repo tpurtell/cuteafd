@@ -112,13 +112,13 @@ impl<'a> Engine<'a> {
         let rows = draft_rows(requests.len(), block, self.cfg.dspark_block_size, self.decode_rows, inputs.len())?;
         let slot = &self.decode_workspace;
         if slot.borrow().is_none() {
-            *slot.borrow_mut() = Some(self.workspace(self.decode_rows, 1)?);
+            *slot.borrow_mut() = Some(self.workspace(self.decode_rows, self.decode_lanes())?);
         }
         let workspace = slot.borrow();
         let w = workspace.as_ref().context("workspace")?;
         // Target and draft steps share one stream and the workspace's query,
-        // scratch and logits buffers. Reuse the first lane too: target-only
-        // decoding may have initialized this workspace with just one lane.
+        // scratch and logits buffers. Drafting reuses the first lane after
+        // the independent target lanes have completed.
         let lane = w.lanes.first().context("dSpark decode workspace has no lane")?;
         let (mut positions, mut slots) = (Vec::with_capacity(rows), Vec::with_capacity(rows));
         let (mut indices, mut lengths) = (vec![-1i32; rows * WINDOW], Vec::with_capacity(rows));

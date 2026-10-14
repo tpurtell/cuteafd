@@ -452,7 +452,7 @@ impl<'a> Engine<'a> {
         self.prefill(&mut placement, &tokens, transports, runtime, 0, None)?;
         tp2.checking.set(true);
         *tp2.schedule.borrow_mut() = Some(Schedule::default());
-        self.decode(&mut [(&mut placement, 1)], transports.first_mut(), runtime)?;
+        self.decode(&mut [(&mut placement, 1)], transports, runtime)?;
         allocator.release(placement);
         // Cache/state writes were to scratch placement; released slots are overwritten on admission.
         #[cfg(feature = "dev-v4-layers")]

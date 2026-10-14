@@ -507,7 +507,7 @@ impl Runner<'_, '_, '_> {
     }
 
     fn decode(&mut self, placement: &mut Placement, token: u32) -> Result<Vec<f32>> {
-        self.engine.decode(&mut [(placement, token)], self.transports.first_mut(), self.runtime)
+        self.engine.decode(&mut [(placement, token)], self.transports, self.runtime)
     }
 }
 

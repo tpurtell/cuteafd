@@ -914,7 +914,7 @@ fn schedule(
             let starts: Vec<usize> = active.iter().map(|a| a.placement.len).collect();
             let mut rows: Vec<(&mut Placement, u32)> = active.iter_mut().map(|a| (&mut a.placement, a.next)).collect();
             let timer = Instant::now();
-            engine.decode_device(&mut rows, transports.first_mut(), runtime).and_then(|logits| {
+            engine.decode_device(&mut rows, transports, runtime).and_then(|logits| {
                 let (selected, mut poisoned) = select_rows(selector, &logits, &active, &sequences, &starts)?;
                 engine.check_device()?;
                 shape.verify_us = console::us(timer);

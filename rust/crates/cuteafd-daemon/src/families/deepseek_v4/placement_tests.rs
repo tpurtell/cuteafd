@@ -22,7 +22,7 @@ fn dev_layer_opt_in_requires_feature_and_supported_arguments() {
     args.attention_placement = "layers".into();
     assert_eq!(super::validate_dev_layers(true, &args).is_ok(), cfg!(feature = "dev-v4-layers"));
     args.dspark = true;
-    assert!(super::validate_dev_layers(true, &args).is_err());
+    assert_eq!(super::validate_dev_layers(true, &args).is_ok(), cfg!(feature = "dev-v4-layers"));
 }
 
 #[test]
@@ -37,7 +37,7 @@ fn serving_layers_requires_compile_time_feature_not_runtime_opt_in() {
     #[cfg(not(feature = "dev-v4-layers"))]
     assert!(super::serving_dev_layers(&args).unwrap_err().to_string().contains("Cargo feature"));
     args.dspark = true;
-    assert!(super::serving_dev_layers(&args).is_err(), "drafter binding not yet qualified");
+    assert_eq!(super::serving_dev_layers(&args).is_ok(), cfg!(feature = "dev-v4-layers"));
 }
 
 #[test]
@@ -480,7 +480,7 @@ fn inputs_dir() -> Option<PathBuf> {
 
 /// Header-only max-card admission pin with real program/package inventories.
 /// The test-only executor proves the workspace/state envelope, not serving
-/// support; graph and independent decode-lane charges are still pending.
+/// support; fixed graph qualification is still pending.
 #[test]
 fn planner_v4_max_owner_workspace_pool_regression() {
     use cuteafd_loader::placement::{AttentionPlacement, LayerMode};
@@ -490,8 +490,7 @@ fn planner_v4_max_owner_workspace_pool_regression() {
         return;
     };
     let budget = (95.5 * (1u64 << 30) as f64) as u64;
-    for (model, snapshot, sparks, extra) in [("flash", &flash, 4, 272_629_760u64),
-        ("pro", &pro, 6, 545_259_520u64)] {
+    for (model, snapshot, sparks) in [("flash", &flash, 4), ("pro", &pro, 6)] {
         let manifest = inputs.join(format!("{model}-2-1048576/PROGRAMS.json"));
         let inventory: serde_json::Value = serde_json::from_slice(&std::fs::read(&manifest).unwrap()).unwrap();
         let cfg = cuteafd_loader::families::deepseek_v4::DeepseekV4Config::read(snapshot, 3).unwrap();
@@ -513,7 +512,15 @@ fn planner_v4_max_owner_workspace_pool_regression() {
                 .filter(|item| item.category == Category::Workspace && item.group == "steps")
                 .map(|item| item.bytes).sum::<u64>();
             assert_eq!(steps(&context), steps(&heads));
-            assert_eq!(steps(&layers) - steps(&heads), if rank == 0 { 0 } else { extra });
+            let scratch = cuteafd_loader::serving_capacity::deepseek_v4_workspace_scratch(
+                &inventory, family, true, 4096, 64).unwrap();
+            let geometry = |attention| cuteafd_loader::serving_capacity::deepseek_v4_workspace_geometry_for_attention(
+                &cfg, 4096, 64, 1048576, 2, scratch, Some(attention), None).unwrap();
+            let base = geometry(AttentionPlacement::Heads);
+            let owner = geometry(AttentionPlacement::Layers);
+            assert_eq!(steps(&layers) - steps(&heads),
+                owner[rank].fixed_device_bytes - base[rank].fixed_device_bytes);
+            assert_eq!(owner[rank].pool_unit_device_bytes - base[rank].pool_unit_device_bytes, 64 * 4);
             assert!(layers.layers.iter().any(|layer| matches!(layer.mode,
                 LayerMode::Whole { gpu, .. } if usize::from(gpu) == rank)));
             let payload = cuteafd_loader::placement::families::deepseek_v4::V4AttentionHandoff::new(cfg.dim as u64).unwrap();
@@ -522,7 +529,7 @@ fn planner_v4_max_owner_workspace_pool_regression() {
                 .map(|item| item.bytes).sum::<u64>(), expected);
             eprintln!("{model}-max rank{rank}: full handoff storage={expected} B");
         }
-        eprintln!("{model}-max: heads={} context={} test-only layers={}; extra workspace=[0,{extra}] B",
+        eprintln!("{model}-max: heads={} context={} test-only layers={}; independent decode lanes charged",
             heads.pool_tokens, context.pool_tokens, layers.pool_tokens);
         assert_eq!(heads.pool_tokens, 2 << 20);
         assert_eq!(context.pool_tokens, 2 << 20);

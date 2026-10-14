@@ -234,9 +234,9 @@ fn dev_golden_layers(args: &EngineArgs) -> Result<bool> {
 
 fn validate_dev_layers(enabled: bool, args: &EngineArgs) -> Result<()> {
     ensure!(!enabled || cfg!(feature = "dev-v4-layers"), "dev V4 layers feature is absent");
-    ensure!(!enabled || (args.split_device.is_some() && !args.dspark
+    ensure!(!enabled || (args.split_device.is_some()
         && args.attention_placement == "layers"),
-        "dev V4 layers needs layers, two GPUs and no dSpark");
+        "dev V4 layers needs layers and two GPUs");
     Ok(())
 }
 
@@ -850,7 +850,7 @@ fn golden_run(
         logits.extend(if args.verify_rows.is_some() {
             engine.verify(&mut [(&mut placement, &tokens[position..end])], transports, runtime)?
         } else {
-            engine.decode(&mut [(&mut placement, tokens[position])], transports.first_mut(), runtime)?
+            engine.decode(&mut [(&mut placement, tokens[position])], transports, runtime)?
         });
         position = end;
     }
@@ -937,7 +937,7 @@ fn token_check(args: &GoldenArgs, loaded: &Loaded, engine: &engine::Engine<'_>, 
     let last = last.context("prefill produced no logits")?.row_host(&loaded.library, 0)?;
     let first = cuteafd_core::TargetSamplingParams::greedy().select_token(&last, None, 0)? as u32;
     let result = crate::shared::token_io::gate(&loaded.library, &engine.embedding, first, steps, |token| {
-        engine.decode_device(&mut [(&mut placement, token)], transports.first_mut(), runtime)
+        engine.decode_device(&mut [(&mut placement, token)], transports, runtime)
     });
     allocator.release(placement);
     result

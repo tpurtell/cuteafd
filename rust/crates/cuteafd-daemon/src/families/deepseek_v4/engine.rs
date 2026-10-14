@@ -607,6 +607,10 @@ impl<'a> Engine<'a> {
         Ok(())
     }
 
+    fn decode_lanes(&self) -> usize {
+        cuteafd_loader::serving_capacity::deepseek_v4_decode_lanes(None, Some(&self.modes))
+    }
+
     fn workspace(&self, t: usize, lanes: usize) -> Result<Workspace<'a>> {
         self.workspace_on(0, t, lanes)
     }
@@ -837,7 +841,7 @@ impl<'a> Engine<'a> {
     #[cfg(feature = "dev-v4-layers")]
     pub fn attach_dev_layers(&mut self, placement: &cuteafd_loader::placement::Placement,
         spec: cuteafd_loader::placement::HopSpec) -> Result<()> {
-        ensure!(self.weights.dspark.is_none() && self.context.is_none(), "dev layers is eager without drafter");
+        ensure!(self.context.is_none(), "dev layers cannot bind context exchange");
         let plan = cuteafd_loader::placement::LayerExecutionPlan::new(placement, spec)?;
         ensure!(plan.modes() == self.modes, "dev layers differs from loaded modes");
         let peer = self.peer()?;
@@ -929,10 +933,10 @@ impl<'a> Engine<'a> {
     pub fn decode(
         &self,
         rows: &mut [(&mut Placement, u32)],
-        transport: Option<&mut SparkLink<'_>>,
+        transports: &mut [SparkLink<'_>],
         runtime: &tokio::runtime::Runtime,
     ) -> Result<Vec<f32>> {
-        let logits = self.decode_device(rows, transport, runtime)?.to_host(self.library)?;
+        let logits = self.decode_device(rows, transports, runtime)?.to_host(self.library)?;
         self.check_device()?;
         Ok(logits)
     }
@@ -941,7 +945,7 @@ impl<'a> Engine<'a> {
     pub fn decode_device(
         &self,
         rows: &mut [(&mut Placement, u32)],
-        transport: Option<&mut SparkLink<'_>>,
+        transports: &mut [SparkLink<'_>],
         runtime: &tokio::runtime::Runtime,
     ) -> Result<DeviceLogits> {
         ensure!(!rows.is_empty() && rows.len() <= self.decode_rows, "decode batch of {} rows", rows.len());
@@ -950,13 +954,12 @@ impl<'a> Engine<'a> {
         }
         let tokens: Vec<u32> = rows.iter().map(|(_, token)| *token).collect();
         let steps: Vec<(&Placement, usize)> = rows.iter().map(|(p, _)| (&**p, p.len)).collect();
-        let tables = metadata::decode_step(&steps, &self.shape, self.cfg.index_topk, self.c128_width)?;
-        let step = LaneStep { tables: &tables, tokens: &tokens, units: &[] };
-        let transports = match transport {
-            Some(transport) => std::slice::from_mut(transport),
-            None => &mut [],
-        };
-        let logits = self.step(&[step], transports, runtime, tokens.len(), None, false)?;
+        let ranges = self.request_lanes(&steps.iter().map(|(placement, start)| (*placement, *start, 1)).collect::<Vec<_>>())?;
+        let tables = ranges.iter().map(|range| metadata::decode_step(&steps[range.clone()],
+            &self.shape, self.cfg.index_topk, self.c128_width)).collect::<Result<Vec<_>>>()?;
+        let lanes = tables.iter().zip(&ranges).map(|(tables, range)|
+            LaneStep { tables, tokens: &tokens[range.clone()], units: &[] }).collect::<Vec<_>>();
+        let logits = self.step(&lanes, transports, runtime, tokens.len(), None, false)?;
         for (placement, _) in rows.iter_mut() {
             placement.len += 1;
         }
@@ -993,16 +996,33 @@ impl<'a> Engine<'a> {
                 "verify of {} rows at {} outside the context", tokens.len(), placement.len);
         }
         let spans: Vec<(&Placement, usize, usize)> = sequences.iter().map(|(p, t)| (&**p, p.len, t.len())).collect();
-        let tables = metadata::verify_step(&spans, &self.shape, self.cfg.index_topk, self.c128_width)?;
-        let step = LaneStep { tables: &tables, tokens: &tokens, units: &[] };
-        let logits = self.step(&[step], transports, runtime, tokens.len(), None, false)?;
+        let ranges = self.request_lanes(&spans)?;
+        let tables = ranges.iter().map(|range| metadata::verify_step(&spans[range.clone()],
+            &self.shape, self.cfg.index_topk, self.c128_width)).collect::<Result<Vec<_>>>()?;
+        let mut first = 0;
+        let lanes = tables.iter().map(|tables| {
+            let end = first + tables.rows;
+            let lane = LaneStep { tables, tokens: &tokens[first..end], units: &[] };
+            first = end;
+            lane
+        }).collect::<Vec<_>>();
+        let logits = self.step(&lanes, transports, runtime, tokens.len(), None, false)?;
         for (placement, tokens) in sequences.iter_mut() {
             placement.len += tokens.len();
         }
         logits.device()
     }
 
-    /// Runs every layer for `lanes` (one decode lane, or prefill lanes of
+    fn request_lanes(&self, requests: &[(&Placement, usize, usize)]) -> Result<Vec<std::ops::Range<usize>>> {
+        if self.decode_lanes() == 1 { return Ok(vec![0..requests.len()]); }
+        use crate::shared::peer_split::attention::{independent_request_lanes, RequestSpan};
+        let spans = requests.iter().map(|(placement, start, rows)| RequestSpan {
+            state: placement.state, pages: &placement.units, start: *start, rows: *rows,
+        }).collect::<Vec<_>>();
+        independent_request_lanes(&spans, metadata::SOURCE_PAGE_TOKENS, self.decode_lanes(), self.decode_rows)
+    }
+
+    /// Runs every layer for `lanes` (independent requests, or prefill lanes of
     /// consecutive rows of one sequence) and returns the logits of the last
     /// `logit_rows` rows across the lanes.
     fn step(
@@ -1037,10 +1057,15 @@ impl<'a> Engine<'a> {
         let total: usize = lanes.iter().map(|l| l.tables.rows).sum();
         ensure!(logit_rows <= total && (on_layer.is_none() || lanes.len() == 1)
             && lanes.iter().all(|l| l.tokens.len() == l.tables.rows)
-            && (!decode || lanes.len() == 1), "step lanes disagree");
+            && lanes.iter().all(|lane| lane.tables.decode == decode)
+            && (!decode || lanes.len() <= self.decode_lanes()), "step lanes disagree");
+        #[cfg(feature = "dev-v4-layers")]
+        if self.dev_layers.is_some() && !self.skip_routed && self.local_layers() < self.cfg.n_layers {
+            ensure!(transports.len() >= lanes.len(), "independent Spark lanes need one transport each");
+        }
         let slot = if decode { &self.decode_workspace } else { &self.prefill_workspace };
         if slot.borrow().is_none() {
-            let (rows, count) = if decode { (self.decode_rows, 1) } else { (self.prefill_rows, PREFILL_LANES) };
+            let (rows, count) = if decode { (self.decode_rows, self.decode_lanes()) } else { (self.prefill_rows, PREFILL_LANES) };
             *slot.borrow_mut() = Some(self.workspace(rows, count)?);
         }
         let workspace = slot.borrow();
@@ -1073,7 +1098,7 @@ impl<'a> Engine<'a> {
             Some(peer) => {
                 let cell = if decode { &peer.decode_workspace } else { &peer.prefill_workspace };
                 if cell.borrow().is_none() {
-                    let (rows, count) = if decode { (self.decode_rows, 1) } else { (self.prefill_rows, PREFILL_LANES) };
+                    let (rows, count) = if decode { (self.decode_rows, self.decode_lanes()) } else { (self.prefill_rows, PREFILL_LANES) };
                     *cell.borrow_mut() = Some(self.workspace_on(1, rows, count)?);
                 }
                 Some(cell.borrow())
@@ -1098,13 +1123,16 @@ impl<'a> Engine<'a> {
                     }, bytes_of(step.tokens))
                 })?;
             }
-            if gather && decode { self.gather_streams(&w.lanes[0], lanes[0].tables.rows)?; }
+            if gather && decode {
+                for (step, lane) in lanes.iter().zip(&w.lanes) { self.gather_streams(lane, step.tables.rows)?; }
+            }
             let links = RefCell::new(transports);
             let mut kernels = lanes.iter().enumerate().map(|(index, step)|
                 DevLayerKernels::new(self, binding, [w, w1], index, step.tables, cap, &links, runtime))
                 .collect::<Result<Vec<_>>>()?;
             crate::shared::peer_split::attention::layer_pipeline(_scope, &binding.plan, self.exchange()?,
-                &binding.hops, crate::shared::peer_split::attention::LaneOrder::OrderedChunks,
+                &binding.hops, if decode { crate::shared::peer_split::attention::LaneOrder::Independent }
+                    else { crate::shared::peer_split::attention::LaneOrder::OrderedChunks },
                 &lanes.iter().map(|step| step.tables.rows).collect::<Vec<_>>(), &mut kernels)?;
             drop(kernels);
             return self.finish_step(lanes, w, logit_rows, cap, total, download);
@@ -2111,11 +2139,11 @@ impl<'a> Engine<'a> {
     pub fn warm_local_graphs(&self) -> Result<()> {
         if self.local_layers() == 0 { return Ok(()); }
         if self.decode_workspace.borrow().is_none() {
-            *self.decode_workspace.borrow_mut() = Some(self.workspace(self.decode_rows, 1)?);
+            *self.decode_workspace.borrow_mut() = Some(self.workspace(self.decode_rows, self.decode_lanes())?);
         }
         if let Some(peer) = &self.peer {
             if peer.decode_workspace.borrow().is_none() {
-                *peer.decode_workspace.borrow_mut() = Some(self.workspace_on(1, self.decode_rows, 1)?);
+                *peer.decode_workspace.borrow_mut() = Some(self.workspace_on(1, self.decode_rows, self.decode_lanes())?);
             }
         }
         self.warm_tp2_routers()?;
