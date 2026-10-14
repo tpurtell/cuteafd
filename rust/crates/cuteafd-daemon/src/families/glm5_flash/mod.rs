@@ -1598,6 +1598,7 @@ impl Opened {
         let mark_slots = args.mark_arena.slots_placed(&self.cfg, layers, index_cache, args.kda_state,
             context_mode.is_some())?;
         let loader = weights::GlmfLoader { library: &self.library, checkpoint: &self.checkpoint, stream,
+            reader: cuteafd_loader::plan::ShardReader::new(),
             fp8_source: self.fp8_checkpoint.as_ref(), kda_fp8: args.kda_fp8, kda_output_shard: args.kda_output_shard,
             fp8_head: args.fp8_head, kda_nvfp4: args.kda_nvfp4_gate.as_deref().map(|mode| mode == "search"),
             fp8_scales: args.fp8_scales, device: args.device,
@@ -1739,6 +1740,10 @@ impl Opened {
         engine.fp8_prefill = engine::Fp8Prefill { mla: group(Fp8PrefillGroup::Mla), ffn: group(Fp8PrefillGroup::Ffn),
             kda_bits: i32::from(kda && group(Fp8PrefillGroup::KdaIn))
                 | (i32::from(kda && group(Fp8PrefillGroup::KdaO)) << 1) };
+        // Start the drafter's checkpoint read (a 2.3 GB snapshot) before the
+        // expert packages: it then runs under the routed-expert exchange
+        // instead of adding its whole duration to readiness after it.
+        let draft_read = args.draft.as_deref().map(dspark::DraftRead::start).transpose()?;
         let tp2_range = if args.skip_experts { None } else { admitted_tp2_range(&placement)? };
         if let Some(range) = tp2_range {
             ensure!(startup_graphs, "GLM Flash TP2 experts require startup graphs; remove --graph-budget-mib and \
@@ -1788,7 +1793,7 @@ impl Opened {
                 }
             }
         }
-        engine.drafter = self.load_drafter(args, stream, &engine.embedding, prepared_draft.take())?;
+        engine.drafter = self.load_drafter(args, stream, &engine.embedding, prepared_draft.take(), draft_read)?;
         engine.attention_plan = attention_plan.validate_loaded(engine.drafter.as_ref().map(dspark::Drafter::drafts))?;
         tracing::info!(plan_rows = engine.attention_plan.rows(), active_drafts = ?engine.attention_plan.active_drafts(),
             "GLM Flash immutable attention reduction plan");
@@ -1832,10 +1837,12 @@ impl Opened {
     }
 
     /// The drafter `--draft` names, on `stream` (it reads only the mask token's embedding row).
+    /// `read` is the checkpoint read started before the expert load ([`dspark::DraftRead`]).
     fn load_drafter<'s>(&'s self, args: &EngineArgs, stream: *mut std::ffi::c_void,
-        embedding: &crate::shared::token_io::TokenEmbedding<'_>, prepared: Option<remote_dflash::Prepared<'s>>)
-        -> Result<Option<dspark::Drafter<'s>>> {
+        embedding: &crate::shared::token_io::TokenEmbedding<'_>, prepared: Option<remote_dflash::Prepared<'s>>,
+        read: Option<dspark::DraftRead>) -> Result<Option<dspark::Drafter<'s>>> {
         let Some(snapshot) = &args.draft else { return Ok(None) };
+        let read = read.context("the drafter read was not started with --draft")?;
         let started = Instant::now();
         let representation = cuteafd_loader::families::glm5::draft_representation::GlmDraftRepresentation
             ::from_fp8_option(args.draft_fp8);
@@ -1846,8 +1853,7 @@ impl Opened {
             ensure!(cfg.hidden == self.cfg.hidden && cfg.vocab == self.cfg.vocab_size
                 && cfg.taps.iter().all(|&l| l < self.cfg.layers), "DFlash2 does not fit this target");
             let mask = embedding.host_rows(&[cfg.mask_token])?;
-            let file = crate::families::glm5::dflash::prefetch(snapshot).join()
-                .map_err(|_| anyhow::anyhow!("drafter read panicked"))??;
+            let file = read.join_dflash()?;
             let device = prepared.stream.device;
             let draft = device.own(|| GlmDrafter::load(&self.library, snapshot, file, prepared.stream.raw,
                 slots, args.draft_sequences.min(slots), mask, true, representation, args.fp8_scales, args.draft_linear))?;
@@ -1855,7 +1861,7 @@ impl Opened {
         } else {
             dspark::Drafter::load(&self.library, snapshot, stream, slots, args.draft_sequences.min(slots),
                 embedding, self.cfg.hidden, self.cfg.vocab_size, self.cfg.layers, representation, args.fp8_scales,
-                args.draft_linear)?
+                args.draft_linear, read)?
         };
         drafter.set_draft_head(args.draft_head);
         tracing::info!(elapsed_ms = started.elapsed().as_millis() as u64, draft_head = ?args.draft_head,
