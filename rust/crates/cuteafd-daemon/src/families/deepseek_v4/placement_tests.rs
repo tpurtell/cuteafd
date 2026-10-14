@@ -121,6 +121,11 @@ fn runtime_with_upload_check(case: &Case<'_>, layout: &MemoryLayout, tp1_availab
 /// Test-only capability injection: production remains fail-closed for layers.
 fn runtime_with_test_owners(case: &Case<'_>, layout: &MemoryLayout, tp1_available: bool,
     check_upload: bool, owned: bool) -> anyhow::Result<Placement> {
+    runtime_with_pool(case, layout, tp1_available, check_upload, owned, None)
+}
+
+fn runtime_with_pool(case: &Case<'_>, layout: &MemoryLayout, tp1_available: bool,
+    check_upload: bool, owned: bool, pool_tokens: Option<u64>) -> anyhow::Result<Placement> {
     let mut manifest: serde_json::Value = serde_json::from_slice(&std::fs::read(case.manifest)?)?;
     // Mirror production load(): admission sees the selected card plan, not the export envelope.
     cuteafd_core::coordinator_programs::select_card_plans(&mut manifest,
@@ -133,6 +138,7 @@ fn runtime_with_test_owners(case: &Case<'_>, layout: &MemoryLayout, tp1_availabl
     let peers = (0..case.sparks).map(|r| format!("10.0.0.{}:1970{r}", r + 1)).collect::<Vec<_>>().join(",");
     let mut argv = vec!["serve".to_string(), "--snapshot".into(), case.snapshot.display().to_string(),
         "--native-lib".into(), "/nonexistent/libcuteafd.so".into(), "--peers".into(), peers];
+    if let Some(tokens) = pool_tokens { argv.extend(["--pool-tokens".into(), tokens.to_string()]); }
     if let Some(onboard) = case.onboard { argv.extend(["--rtx-expert-layers".into(), onboard.to_string()]); }
     if case.rtx == 2 { argv.extend(["--split-device".into(), "1".into()]); }
     if case.dspark { argv.push("--dspark".into()); }
@@ -551,6 +557,50 @@ fn planner_v4_max_owner_workspace_pool_regression() {
                 "default runtime must refuse dual-rank layers without test capabilities");
         }
     }
+}
+
+/// Keep the final C4 layer remote: the auto Flash plan can onboard every
+/// backbone layer and therefore cannot qualify routed Spark inference.
+#[test]
+fn planner_v4_flash_remote_c4_owner_pool_regression() {
+    use cuteafd_loader::placement::{AttentionPlacement, FfnMode, LayerMode};
+    let (Some(snapshot), Some(inputs)) = (snapshot("deepseek-ai/DeepSeek-V4-Flash-0731"), inputs_dir()) else {
+        eprintln!("V4 remote C4 owner regression: snapshot or manifest absent; skipped");
+        return;
+    };
+    let manifest = inputs.join("flash-2-1048576/PROGRAMS.json");
+    let cfg = cuteafd_loader::families::deepseek_v4::DeepseekV4Config::read(&snapshot, 0).unwrap();
+    assert_eq!(cfg.n_layers, 43);
+    assert_eq!(cfg.compress_ratios[42], 4);
+    let budget = (95.5 * (1u64 << 30) as f64) as u64;
+    let case = Case { snapshot: &snapshot, manifest: &manifest, rtx: 2, sparks: 4,
+        context: 1_048_576, budget, onboard: Some(Onboard::Layers(42)), dspark: false,
+        exchange_f32: false, peer_budget: None, attention: Some(AttentionPlacement::Layers) };
+    let report = plan(&snapshot, &PlanOptions {
+        draft_ownership: Some(cuteafd_loader::plan::spec::DraftOwnership::selected("deepseek_v4", "off")),
+        placement: ExpertPlacement::from_spark_ranks(4),
+        layout: Some(LayoutOptions { rtx_bytes: vec![budget; 2], pool_tokens: Some(2 << 20),
+            context_tokens: case.context, workspace_manifest: Some(manifest.clone()),
+            onboard: case.onboard, native_mtp_layers: 0, headroom_bytes: 0, ..Default::default() }),
+        attention_placement: case.attention, ..Default::default() }).unwrap();
+    if !cfg!(feature = "dev-v4-layers") {
+        assert!(!report.executable());
+        assert!(report.config_error.unwrap().contains("executor not implemented"));
+        return;
+    }
+    assert!(report.executable(), "{}", cuteafd_loader::plan::render(&report));
+    let layout = report.memory_layout.unwrap();
+    let placement = runtime_with_pool(&case, &layout, true, false, false, Some(2 << 20)).unwrap();
+    assert_eq!(placement.pool_tokens, 2 << 20);
+    assert_eq!(placement.onboard_layers, 42);
+    let tp2 = placement.tp2.unwrap();
+    assert_eq!((tp2.first, tp2.layers), (0, 42));
+    assert_eq!(placement.layers[42].mode, LayerMode::Whole { gpu: 1, ffn: FfnMode::Split });
+    for (device, items) in layout.devices.iter().zip(&placement.items) {
+        for item in items { assert!(device.items.contains(item), "missing admitted item {item:?}"); }
+    }
+    eprintln!("flash-max: pool={} local TP2=0..42 remote C4 layer42 owner=rank1",
+        placement.pool_tokens);
 }
 
 /// The real checkpoints (headers only) with the release image's program and
