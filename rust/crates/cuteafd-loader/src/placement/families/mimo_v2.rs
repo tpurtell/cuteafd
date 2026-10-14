@@ -452,7 +452,7 @@ pub fn request(inputs: &MimoInputs<'_>) -> Result<PlacementRequest, CacheGeometr
         attention_placement: None, context_buffers: Default::default(), layers_first_gpu: 0,
         expert_workspace: inputs.expert_workspace, tp2_workspace,
         onboard, expert_gpus: 1, policy: LayerPolicy::default(),
-        hops: HopSpec { row_bytes: inputs.cfg.hidden as u64 * 2, rows: inputs.rows, lanes: inputs.lanes,
+        hops: HopSpec { row_bytes: inputs.cfg.hidden as u64 * 2, after_attention_row_bytes: None, packed_sender: false, rows: inputs.rows, lanes: inputs.lanes,
             entry_gpu: 0, head_gpu: 0, terminal: if ranks == 2 { TerminalHome::Replicated } else { TerminalHome::AttentionOwner } },
         executor: super::MIMO_V2,
     })

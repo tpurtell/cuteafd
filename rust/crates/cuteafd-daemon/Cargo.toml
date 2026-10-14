@@ -9,6 +9,9 @@ repository.workspace = true
 name = "cuteafd"
 path = "src/main.rs"
 
+[features]
+dev-v4-layers = []
+
 [dependencies]
 anyhow.workspace = true
 axum.workspace = true

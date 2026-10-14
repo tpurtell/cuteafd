@@ -256,8 +256,8 @@ fn solve_once(request: &PlacementRequest, flips: &[(AttentionClass, AttentionPla
             }
         }
     }
-    // Hop receive buffers are fixed demands of the modes (charged before the pool).
-    let hop_bytes = hop_buffer_bytes(&hops, &request.hops, gpus).ok_or(Overflow("hop buffers"))?;
+    // Full hop storage is charged before the pool, matching runtime allocation.
+    let hop_bytes = hop_storage_bytes(&hops, &request.hops, gpus).ok_or(Overflow("hop buffers"))?;
     for (gpu, &bytes) in hop_bytes.iter().enumerate() {
         if bytes > 0 { charge(&mut items, &mut used, gpu, Item::new(Category::Transport, "residual hops", "", bytes, Basis::Formula))?; }
     }
