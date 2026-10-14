@@ -975,6 +975,25 @@ mod program_selection_tests {
         assert_eq!(AttentionReductionPlan::new(64, None, None).unwrap().rows(), 1);
     }
 
+    fn dispatch_arguments(line: &str) -> Option<&str> {
+        ["self.run", "engine.run"].into_iter().find_map(|receiver| {
+            let (_, args) = line.split_once(receiver)?;
+            (args.starts_with('(') || args.starts_with("_on(")).then_some(args)
+        })
+    }
+
+    #[test]
+    fn dispatch_scanner_matches_exact_kernel_entrypoints() {
+        for call in ["self.run(\"x\")", "self.run_on(rank, false, \"x\")",
+            "engine.run_on(rank, weights.ffn_split, \"x\")"] {
+            assert!(dispatch_arguments(call).is_some(), "missed {call}");
+        }
+        for call in ["engine.runtime_land_reduce(self.runtime, link)", "self.runtime.block_on(task)",
+            "self.run_other(name)"] {
+            assert!(dispatch_arguments(call).is_none(), "not a dispatch: {call}");
+        }
+    }
+
     #[test]
     fn every_v4_dispatch_template_is_selected_and_required_at_startup() {
         let sources = [include_str!("engine.rs"), include_str!("engine/dspark.rs"), include_str!("weights.rs")];
@@ -985,9 +1004,8 @@ mod program_selection_tests {
                 let required = selected.v4_required(4096, 64);
                 let mut checked = 0;
                 for source in sources {
-                    for line in source.lines().filter(|line| line.contains("self.run")) {
+                    for (line, args) in source.lines().filter_map(|line| dispatch_arguments(line).map(|args| (line, args))) {
                         // The only nonliteral route is run -> run_on forwarding `name`.
-                        let args = line.split("self.run").nth(1).unwrap();
                         let Some(start) = args.find('"') else {
                             assert!(args.trim() == "_on(0, false, name, pointers, scalars)",
                                 "unrecognized nonliteral dispatch: {line}");
@@ -1007,7 +1025,8 @@ mod program_selection_tests {
                                         assert!(required.contains(&name), "startup misses dispatch {name}");
                                         if split && (args.starts_with("_on(1, true,") || args.starts_with("_on(rank, split,")
                                             || args.starts_with("_on(rank, weights.attention_split,")
-                                            || args.starts_with("_on(0, weights.ffn_split,") || args.starts_with("_on(1, weights.ffn_split,")) {
+                                            || args.starts_with("_on(0, weights.ffn_split,") || args.starts_with("_on(1, weights.ffn_split,")
+                                            || args.starts_with("_on(rank, weights.ffn_split,")) {
                                             let name = format!("{split_family}_{suffix}");
                                             assert!(selected.contains(&name) && required.contains(&name),
                                                 "startup misses split dispatch {name}");

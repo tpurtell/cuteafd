@@ -2405,6 +2405,7 @@ impl crate::shared::peer_split::attention::PipelineKernels for DevLayerKernels<'
         ensure!(owner.is_none(), "dev FFN must be split");
         let engine = self.engine;
         let rows = self.tables.rows;
+        let cap = self.cap;
         if !engine.skip_routed {
             // An owned layer's complete y is adopted before either router runs.
             engine.route_input(0, self.weights(0, layer)?, self.lane(0), self.workspaces[0], Scalar::I32(rows as i32))?;
@@ -2428,7 +2429,7 @@ impl crate::shared::peer_split::attention::PipelineKernels for DevLayerKernels<'
         for rank in 0..2 {
             let weights = self.weights(rank, layer)?;
             let lane = self.lane(rank);
-            engine.run_on(rank, weights.ffn_split, &format!("shared_ffn_m{}", self.cap), &[
+            engine.run_on(rank, weights.ffn_split, &format!("shared_ffn_m{cap}"), &[
                 ("x", lane.y.buffer.ptr), ("w13", weights.ptr("w13")?), ("w13_scale", weights.ptr("w13_scale")?),
                 ("w2", weights.ptr("w2")?), ("w2_scale", weights.ptr("w2_scale")?),
                 ("out", lane.shared.buffer.ptr), ("scratch", self.workspaces[rank].scratch.buffer.ptr),
