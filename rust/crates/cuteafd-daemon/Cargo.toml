@@ -10,7 +10,7 @@ name = "cuteafd"
 path = "src/main.rs"
 
 [features]
-dev-v4-layers = []
+dev-v4-layers = ["cuteafd-loader/dev-v4-layers"]
 
 [dependencies]
 anyhow.workspace = true

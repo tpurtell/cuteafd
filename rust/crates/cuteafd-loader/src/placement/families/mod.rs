@@ -26,6 +26,13 @@ const WHOLE1: LayerMode = LayerMode::Whole { gpu: 1, ffn: FfnMode::Owner };
 /// recorded default until `context` passes its gates.
 pub const DEEPSEEK_V4: ExecutorModes = ExecutorModes { family: "deepseek_v4",
     modes: &[LayerMode::HeadSplit, LayerMode::ContextSplit, WHOLE0], hops: false, attention: AttentionPlacement::Heads };
+/// Explicit development-only C4 owners; auto remains heads and other layers
+/// keep their qualified modes. The request builder restricts ownership to C4.
+pub const DEV_DEEPSEEK_V4: ExecutorModes = ExecutorModes {
+    modes: &[LayerMode::HeadSplit, LayerMode::ContextSplit, WHOLE0,
+        LayerMode::Whole { gpu: 0, ffn: FfnMode::Split },
+        LayerMode::Whole { gpu: 1, ffn: FfnMode::Split }],
+    hops: true, ..DEEPSEEK_V4 };
 /// V4.1: layer ranges, layers 0-19 / 20-39 whole on each GPU with one boundary
 /// hop (`BlockTransfer`) and the owner-reduce FFN.
 pub const DEEPSEEK_V41: ExecutorModes = ExecutorModes { family: "deepseek_v41", modes: &[WHOLE0, WHOLE1], hops: true, attention: AttentionPlacement::Heads };
@@ -55,5 +62,8 @@ pub const QWEN4: ExecutorModes = ExecutorModes { family: "qwen4", modes: &[WHOLE
 pub const EXECUTORS: [ExecutorModes; 6] = [DEEPSEEK_V4, DEEPSEEK_V41, GLM5, GLM5_FLASH, MIMO_V2, QWEN4];
 
 pub fn executor(family: &str) -> Option<ExecutorModes> {
+    if family == "deepseek_v4" && cfg!(feature = "dev-v4-layers") {
+        return Some(DEV_DEEPSEEK_V4);
+    }
     EXECUTORS.into_iter().find(|e| e.family == family)
 }

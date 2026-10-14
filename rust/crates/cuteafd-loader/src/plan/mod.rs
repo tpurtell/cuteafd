@@ -436,6 +436,7 @@ pub fn plan(snapshot: &Path, options: &PlanOptions) -> Result<PlanReport, PlanEr
         match executor.check_attention(options.attention_placement, gpus, peer) {
             Ok(mode) => report.attention_placement = mode,
             Err(error) => {
+                report.placement_supported = false;
                 report.config_error = Some(error.to_string());
                 report.hints.push(Hint { what: error.to_string(),
                     how: format!("Implement the {} attention executor before enabling this placement; use --attention-placement heads today.", family.id()) });

@@ -319,7 +319,7 @@ pub fn request(inputs: &V4Inputs<'_>) -> Result<PlacementRequest, PlacementError
             parts: inputs.draft.iter().map(|c| Bytes2 { resident: c.resident_bytes, staging: c.staging_bytes }).collect() }]
     };
     let geometry_unit = 256;
-    Ok(PlacementRequest {
+    let mut request = PlacementRequest {
         attention_placement: inputs.attention,
         layers_first_gpu: 0,
         // Exactly what the engine allocates under context (charged only when a layer runs it).
@@ -353,7 +353,24 @@ pub fn request(inputs: &V4Inputs<'_>) -> Result<PlacementRequest, PlacementError
         executor: if context.is_some() { super::DEEPSEEK_V4 }
             else { ExecutorModes { modes: &[LayerMode::HeadSplit, LayerMode::Whole { gpu: 0, ffn: FfnMode::Owner }],
                 attention: AttentionPlacement::Heads, ..super::DEEPSEEK_V4 } },
-    })
+    };
+    if cfg!(feature = "dev-v4-layers") && inputs.attention == Some(AttentionPlacement::Layers) && gpus == 2 {
+        bind_owned_attention(&mut request, inputs.cfg);
+    }
+    Ok(request)
+}
+
+/// Bind the admitted C4 owner envelope once for planner, runtime and CPU
+/// diagnostics. Callers gate execution; C128 and window-only stay head-split.
+pub fn bind_owned_attention(request: &mut PlacementRequest, cfg: &DeepseekV4Config) {
+    const MODES: [LayerMode; 3] = [LayerMode::HeadSplit,
+        LayerMode::Whole { gpu: 0, ffn: FfnMode::Split },
+        LayerMode::Whole { gpu: 1, ffn: FfnMode::Split }];
+    request.executor = ExecutorModes { modes: &MODES, hops: true, ..request.executor };
+    request.policy.ownership = LayerOwnership::NonemptyRanges;
+    for (layer, &ratio) in request.layers.iter_mut().zip(&cfg.compress_ratios) {
+        if ratio == 4 { layer.modes = MODES.to_vec(); }
+    }
 }
 
 /// The `LoadedCode::experts` key of a V4 catalog: EXL3 packages load their own modules (the

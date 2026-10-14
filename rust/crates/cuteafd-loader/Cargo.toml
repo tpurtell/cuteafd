@@ -5,6 +5,9 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+dev-v4-layers = []
+
 [dependencies]
 anyhow.workspace = true
 libc.workspace = true

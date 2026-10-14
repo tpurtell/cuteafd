@@ -1142,6 +1142,35 @@ fn deepseek_v4_plan_reads_the_runtime_config_source() {
 }
 
 #[test]
+fn v4_layers_plan_is_executable_only_with_dev_feature() {
+    use crate::placement::AttentionPlacement;
+    let dir = v4_snapshot();
+    let report = plan(dir.path(), &PlanOptions {
+        attention_placement: Some(AttentionPlacement::Layers),
+        layout: Some(layout::LayoutOptions {
+            rtx_bytes: vec![crate::placement::inventory::PRO_TOTAL_BYTES; 2],
+            context_tokens: 131072, pool_tokens: Some(2 << 20),
+            native_mtp_layers: 0, onboard: Some(crate::placement::Onboard::Layers(0)),
+            workspace_manifest: Some(dir.path().join("absent.json")), ..Default::default()
+        }), ..sparks(4)
+    }).unwrap();
+    if cfg!(feature = "dev-v4-layers") {
+        assert!(report.placement_supported && report.executable(), "{}", render(&report));
+        assert!(report.config_error.is_none());
+        assert_eq!(report.attention_placement, AttentionPlacement::Layers);
+        let layout = report.memory_layout.unwrap();
+        assert_eq!(layout.pool_tokens, 2 << 20);
+        for rank in 0..2 {
+            assert!(layout.devices[rank].items.iter().any(|item| item.group == "residual hops" && item.bytes > 0));
+        }
+    } else {
+        assert!(!report.placement_supported && !report.executable());
+        assert!(report.config_error.unwrap().contains("executor not implemented"));
+        assert!(report.memory_layout.is_none());
+    }
+}
+
+#[test]
 fn v4_workspace_plan_matches_runtime_below_compiled_context() {
     use crate::serving_capacity::{compiled_c128_width, deepseek_v4_workspace_geometry,
         deepseek_v4_workspace_scratch};
