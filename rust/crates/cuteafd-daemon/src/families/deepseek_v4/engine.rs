@@ -93,6 +93,7 @@ pub(crate) struct Engine<'a> {
     capture_only: std::cell::Cell<bool>,
     graph_captures: std::cell::Cell<usize>,
     expert_graph_captures: std::cell::Cell<usize>,
+    pub(super) graph_coverage: crate::shared::decode_graph::census::LaunchCoverage,
     draft_probe: RefCell<Option<crate::shared::draft::probe::RoundProbe<'a>>>,
     #[cfg(feature = "dev-v4-layers")]
     dev_layers: Option<DevLayers<'a>>,
@@ -169,6 +170,37 @@ struct GraphKey {
     exchange_f32: bool,
 }
 
+impl GraphKey {
+    fn coverage_segments(self, rank: usize, skip_routed: bool, tp2_layer: bool,
+        device_exchange: bool, draft_ready: bool, last_layer: usize, tap_layers: &[usize],
+        mut record: impl FnMut(usize, &'static str)) {
+        let lane = if self.attention == "local-experts" || self.attention.starts_with("tp2-") { self.previous } else { 0 };
+        let tap = |layer, record: &mut dyn FnMut(usize, &'static str)| {
+            if rank == 0 && draft_ready && tap_layers.contains(&layer) { record(lane, "tap"); }
+        };
+        match self.attention {
+            "tail" => {
+                if self.previous > 0 { record(lane, "post"); tap(last_layer, &mut record); }
+                if draft_ready { record(lane, "draft-kv"); }
+                record(lane, "head");
+            }
+            "local-experts" | "tp2-replicated" | "tp2-broadcast" => {
+                if rank == 0 { record(lane, "shared"); }
+                record(lane, "partial");
+            }
+            _ => {
+                if (rank == 0 && self.previous > 0) || (rank == 1 && self.layer > 0) {
+                    record(lane, "post");
+                    if self.layer > 0 { tap(self.layer - 1, &mut record); }
+                }
+                record(lane, "front"); record(lane, "back");
+                if !skip_routed && (rank == 0 || tp2_layer) { record(lane, "router"); }
+                if rank == 1 || device_exchange { record(lane, "shared"); }
+            }
+        }
+    }
+}
+
 /// The decode step's tail (last post, taps, drafter KV, head) as a graph key layer.
 const TAIL_SEGMENT: usize = usize::MAX;
 
@@ -213,6 +245,35 @@ impl Profile {
 mod cache_tests {
     use super::{cache_resident, c4_sentinel};
     use cuteafd_loader::placement::{FfnMode, LayerMode};
+
+    #[test]
+    fn legacy_coverage_matches_attention_expert_and_tail_composition() {
+        let base = super::GraphKey { layer: 3, rows: 33, chunked: true, attention: "c4",
+            table_width: 8, table_stride: 8, previous: 4, tp2_broadcast: false, exchange_f32: false };
+        let segments = |key: super::GraphKey, rank, skip, tp2, device, draft| {
+            let mut out = Vec::new();
+            key.coverage_segments(rank, skip, tp2, device, draft, 7, &[2, 7],
+                |lane, segment| out.push((lane, segment)));
+            out
+        };
+        assert_eq!(segments(base, 0, false, true, false, true),
+            vec![(0, "post"), (0, "tap"), (0, "front"), (0, "back"), (0, "router")]);
+        assert_eq!(segments(base, 1, false, true, false, true),
+            vec![(0, "post"), (0, "front"), (0, "back"), (0, "router"), (0, "shared")]);
+        assert_eq!(segments(base, 1, true, false, false, true),
+            vec![(0, "post"), (0, "front"), (0, "back"), (0, "shared")]);
+        assert_eq!(segments(super::GraphKey { layer: 0, previous: 0, ..base }, 0, false, false, true, false),
+            vec![(0, "front"), (0, "back"), (0, "router"), (0, "shared")]);
+        for attention in ["local-experts", "tp2-replicated", "tp2-broadcast"] {
+            let key = super::GraphKey { attention, previous: 1, ..base };
+            assert_eq!(segments(key, 0, false, true, false, true), vec![(1, "shared"), (1, "partial")]);
+            assert_eq!(segments(key, 1, false, true, false, true), vec![(1, "partial")]);
+        }
+        let tail = super::GraphKey { attention: "tail", ..base };
+        assert_eq!(segments(tail, 0, false, true, false, true),
+            vec![(0, "post"), (0, "tap"), (0, "draft-kv"), (0, "head")]);
+        assert_eq!(segments(super::GraphKey { previous: 0, ..tail }, 0, true, false, false, false), vec![(0, "head")]);
+    }
 
     #[test]
     fn c4_sentinel_is_only_for_frozen_owner_split_modes() {
@@ -586,6 +647,7 @@ impl<'a> Engine<'a> {
             capture_only: std::cell::Cell::new(false),
             graph_captures: std::cell::Cell::new(0),
             expert_graph_captures: std::cell::Cell::new(0),
+            graph_coverage: crate::shared::decode_graph::census::LaunchCoverage::new(),
             draft_probe: RefCell::new(None),
             #[cfg(feature = "dev-v4-layers")]
             dev_layers: None,
@@ -931,6 +993,7 @@ impl<'a> Engine<'a> {
         on_layer: Option<&mut dyn FnMut(usize, &[u8]) -> Result<()>>,
         download: bool,
     ) -> Result<Logits> {
+        let _coverage_step = self.graph_coverage.step("prefill", 1, tokens.len());
         let start = placement.len;
         let t = tokens.len();
         let lanes = if on_layer.is_none() && t >= PREFILL_LANES * MIN_LANE_ROWS { PREFILL_LANES } else { 1 };
@@ -971,6 +1034,7 @@ impl<'a> Engine<'a> {
         transports: &mut [SparkLink<'_>],
         runtime: &tokio::runtime::Runtime,
     ) -> Result<DeviceLogits> {
+        let _coverage_step = self.graph_coverage.step("decode", rows.len(), rows.len());
         ensure!(!rows.is_empty() && rows.len() <= self.decode_rows, "decode batch of {} rows", rows.len());
         for (placement, _) in rows.iter() {
             ensure!(placement.len > 0 && placement.len < self.max_context, "decode at {} outside the context", placement.len);
@@ -1015,6 +1079,7 @@ impl<'a> Engine<'a> {
     ) -> Result<DeviceLogits> {
         let _capture_round = crate::shared::decode_graph::CaptureWatch::round();
         let tokens: Vec<u32> = sequences.iter().flat_map(|(_, tokens)| tokens.iter().copied()).collect();
+        let _coverage_step = self.graph_coverage.step("verify", sequences.len(), tokens.len());
         ensure!(!tokens.is_empty() && tokens.len() <= self.decode_rows, "verify step of {} rows", tokens.len());
         for (placement, tokens) in sequences.iter() {
             ensure!(!tokens.is_empty() && placement.len > 0 && placement.len + tokens.len() <= self.max_context,
@@ -1287,8 +1352,10 @@ impl<'a> Engine<'a> {
                     // Announced before the replay can publish it: the proxy spins for it.
                     link.expect(1);
                 }
-                if self.mixed_attention(weights.ratio, tables) { segment()?; }
-                else { self.replay_on(0, key, segment)?; }
+                if self.mixed_attention(weights.ratio, tables) {
+                    self.coverage_legacy(0, key, crate::shared::decode_graph::census::Launch::Eager, "mixed-c128");
+                    segment()?;
+                } else { self.replay_on(0, key, segment)?; }
                 // Preserve owner routes outside capture before another router reuses them.
                 self.probe_ring(layer, lane, t, device.is_none() && layer >= local_layers)?;
                 if let Some(w1) = w1 {
@@ -1410,6 +1477,10 @@ impl<'a> Engine<'a> {
                     graphs::Segment::DraftKv, std::ptr::null_mut(), || self.write_draft_kv(w, &w.lanes[index], step.tables.rows, cap))?;
                 continue;
             }
+            if self.draft_ready() {
+                self.coverage_launch("draft-kv", 0, index, step.tables.rows,
+                    crate::shared::decode_graph::census::Launch::Eager, "prefill");
+            }
             self.write_draft_kv(w, &w.lanes[index], step.tables.rows, cap)?;
         }
         if logit_rows == 0 {
@@ -1431,6 +1502,8 @@ impl<'a> Engine<'a> {
                     let chunk = (wanted - done).min(LOGIT_ROWS);
                     // Rows `rows - wanted + done ..+ chunk` are the last `chunk` of the first `end`.
                     let end = rows - wanted + done + chunk;
+                    self.coverage_launch("head", 0, lane.index, end,
+                        crate::shared::decode_graph::census::Launch::Eager, "download");
                     self.head_launch(lane, end, chunk, 0, w)?;
                     let timer = Instant::now();
                     let bytes = self.download(&w.vocab_logits, chunk * self.cfg.vocab_size * 4)?;
@@ -1450,7 +1523,11 @@ impl<'a> Engine<'a> {
                 } else { false };
                 #[cfg(not(feature = "dev-v4-layers"))]
                 let graphed = false;
-                if !graphed { self.head_launch(lane, rows, wanted, landed, w)?; }
+                if !graphed {
+                    self.coverage_launch("head", 0, lane.index, rows,
+                        crate::shared::decode_graph::census::Launch::Eager, "partial-or-prefill");
+                    self.head_launch(lane, rows, wanted, landed, w)?;
+                }
                 landed += wanted;
             }
             first += rows;
@@ -1486,6 +1563,26 @@ impl<'a> Engine<'a> {
         }
     }
 
+    fn coverage_launch(&self, segment: &'static str, rank: usize, lane: usize, rows: usize,
+        launch: crate::shared::decode_graph::census::Launch, reason: &'static str) {
+        if !self.graph_coverage.enabled() { return; }
+        let mode = if self.owner_graph_mode() { "layers" }
+            else if self.context.is_some() { "context" }
+            else if self.peer.is_some() { "heads" } else { "single" };
+        self.graph_coverage.record(mode, segment, rank, lane, rows, launch, reason);
+    }
+
+    // Legacy graphs combine logical segments. Count their actual composition,
+    // not only the containing graph, for comparison with the owner bank.
+    fn coverage_legacy(&self, rank: usize, key: GraphKey,
+        launch: crate::shared::decode_graph::census::Launch, reason: &'static str) {
+        if !self.graph_coverage.enabled() { return; }
+        key.coverage_segments(rank, self.skip_routed, self.tp2_layer(key.layer),
+            self.device_link.is_some() && !self.skip_routed && key.layer >= self.local_layers(),
+            self.draft_ready(), self.cfg.n_layers - 1, &self.cfg.dspark_target_layer_ids,
+            |lane, segment| self.coverage_launch(segment, rank, lane, key.rows, launch, reason));
+    }
+
     /// Launches `segment` through a captured graph for `key`, capturing it the
     /// first time.
     fn replay(&self, key: GraphKey, segment: impl FnOnce() -> Result<()>) -> Result<()> {
@@ -1502,6 +1599,7 @@ impl<'a> Engine<'a> {
         }
         // Diagnostic copies must never become permanent graph nodes.
         if self.tp2.as_ref().is_some_and(|t| t.checking.get()) && !self.capture_only.get() {
+            self.coverage_legacy(rank, key, crate::shared::decode_graph::census::Launch::Eager, "route-check");
             return segment();
         }
         let graphs = match (rank, &self.peer) {
@@ -1511,6 +1609,7 @@ impl<'a> Engine<'a> {
         let stream = self.stream_of(rank);
         if let Some(graph) = graphs.borrow().get(&key) {
             if self.capture_only.get() { return Ok(()); }
+            self.coverage_legacy(rank, key, crate::shared::decode_graph::census::Launch::Replay, "hit");
             // SAFETY: the graph's pointers are persistent engine buffers of that rank.
             return self.on(rank, || unsafe { self.library.cuda_graph_launch(graph.0, stream) });
         }
@@ -1521,7 +1620,10 @@ impl<'a> Engine<'a> {
         let exec = self.on(rank, || unsafe { self.library.cuda_graph_end_capture(stream) });
         captured?;
         let exec = exec?;
-        if !self.capture_only.get() { self.on(rank, || unsafe { self.library.cuda_graph_launch(exec, stream) })?; }
+        if !self.capture_only.get() {
+            self.coverage_legacy(rank, key, crate::shared::decode_graph::census::Launch::CaptureLaunch, "first-miss");
+            self.on(rank, || unsafe { self.library.cuda_graph_launch(exec, stream) })?;
+        }
         self.graph_captures.set(self.graph_captures.get() + 1);
         if key.attention.starts_with("tp2-") {
             self.expert_graph_captures.set(self.expert_graph_captures.get() + 1);
@@ -1544,8 +1646,10 @@ impl<'a> Engine<'a> {
         let key = GraphKey { layer, rows: t, chunked: tables.chunked,
             attention: self.attention_kind(self.peer()?.layers[layer].ratio, tables),
             table_width: tables.c4_table_width, table_stride: tables.c4_table_stride, previous: usize::from(layer > 0), tp2_broadcast: false, exchange_f32: false };
-        if self.mixed_attention(self.peer()?.layers[layer].ratio, tables) { segment() }
-        else { self.replay_on(1, key, segment) }
+        if self.mixed_attention(self.peer()?.layers[layer].ratio, tables) {
+            self.coverage_legacy(1, key, crate::shared::decode_graph::census::Launch::Eager, "mixed-c128");
+            segment()
+        } else { self.replay_on(1, key, segment) }
     }
 
     /// The layer's routed partials + shared expert, reduced, then mHC post
@@ -2303,6 +2407,8 @@ impl<'a> Engine<'a> {
         runtime: &tokio::runtime::Runtime,
     ) -> Result<usize> {
         if self.skip_routed {
+            self.coverage_launch("shared", 0, lane.index, t,
+                crate::shared::decode_graph::census::Launch::Eager, "skip-routed");
             self.shared_ffn(layer, w, lane, Scalar::I32(t as i32), cap, &self.weights.layers[layer])?;
             return Ok(SKIPPED_EXPERTS);
         }
@@ -2315,6 +2421,8 @@ impl<'a> Engine<'a> {
         let request = self.stage_request(layer, t, w, lane, ExpertV2SourceKind::Decode, transport)?;
         let wave = transport.dispatch(&request)?;
         // The shared expert runs on the GPU while the Sparks compute.
+        self.coverage_launch("shared", 0, lane.index, t,
+            crate::shared::decode_graph::census::Launch::Eager, "spark-host");
         self.shared_ffn(layer, w, lane, Scalar::I32(t as i32), cap, &self.weights.layers[layer])?;
         runtime.block_on(self.land(transport, wave, t, w))
     }
@@ -2573,6 +2681,8 @@ impl crate::shared::peer_split::attention::PipelineKernels for DevLayerKernels<'
                 lane.payload.as_ref().context("dev FFN payload")?.buffer.ptr
             } else { lane.shared.buffer.ptr };
             let (rank0, rank1) = if rank == 0 { (own, received) } else { (received, own) };
+            engine.coverage_launch("post", rank, self.lane, rows,
+                crate::shared::decode_graph::census::Launch::Eager, "spark-post");
             engine.add(rank, rank0, rank1, workspace.sum.buffer.ptr, rows)?;
             engine.run_on(rank, false, "mhc_post", &[
                 ("x", workspace.sum.buffer.ptr), ("residual", lane.stream_b.buffer.ptr),

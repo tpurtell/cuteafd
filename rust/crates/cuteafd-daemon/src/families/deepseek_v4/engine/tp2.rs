@@ -315,6 +315,10 @@ impl<'a> Engine<'a> {
         let tp2 = self.tp2.as_ref().context("owner TP2")?;
         let lane = &w.lanes[index];
         if !tables.decode || cap != self.decode_rows || tp2.broadcast() || tp2.checking.get() {
+            let reason = if !tables.decode || cap != self.decode_rows { "prefill" }
+                else if tp2.checking.get() { "route-check" } else { "broadcast" };
+            self.coverage_launch("partial", rank, index, tables.rows,
+                crate::shared::decode_graph::census::Launch::Eager, reason);
             return self.tp2_experts(rank, layer, index, w, tables.rows);
         }
         let routes = Routes { ids: lane.route_ids.buffer.ptr, weights: lane.route_weights.buffer.ptr };

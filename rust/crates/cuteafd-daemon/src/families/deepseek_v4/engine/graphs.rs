@@ -5,6 +5,16 @@ use crate::shared::decode_graph::{GraphBank, GraphDecision, GraphOwner};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(super) enum Segment { Front, Back, Router, Shared, Partial, Post, Tap, DraftKv, Head }
 
+impl Segment {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Front => "front", Self::Back => "back", Self::Router => "router",
+            Self::Shared => "shared", Self::Partial => "partial", Self::Post => "post",
+            Self::Tap => "tap", Self::DraftKv => "draft-kv", Self::Head => "head",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(super) struct OwnerKey {
     rank: usize,
@@ -111,9 +121,15 @@ impl Engine<'_> {
         self.require_live()?;
         if (segment == Segment::Tap && (!self.draft_ready() || !self.cfg.dspark_target_layer_ids.contains(&layer)))
             || (segment == Segment::DraftKv && !self.draft_ready()) { return run(); }
-        if !tables.decode || cap != self.decode_rows
-            || (segment == Segment::Front && self.mixed_attention(self.cfg.compress_ratios[layer], tables))
-            || self.tp2.as_ref().is_some_and(|tp2| tp2.checking.get()) { return run(); }
+        let bypass = if !tables.decode || cap != self.decode_rows { Some("prefill") }
+            else if segment == Segment::Front && self.mixed_attention(self.cfg.compress_ratios[layer], tables) { Some("mixed-c128") }
+            else if self.tp2.as_ref().is_some_and(|tp2| tp2.checking.get()) { Some("route-check") }
+            else { None };
+        if let Some(reason) = bypass {
+            self.coverage_launch(segment.name(), rank, index, tables.rows,
+                crate::shared::decode_graph::census::Launch::Eager, reason);
+            return run();
+        }
         let binding = self.dev_layers.as_ref().context("owner graph binding")?;
         let key = self.owner_key(rank, layer, index, tables, w, segment, output)?;
         let raw = {
@@ -125,6 +141,10 @@ impl Engine<'_> {
                 GraphDecision::Capture => anyhow::bail!("owner bank permits live capture"),
             }
         };
+        self.coverage_launch(segment.name(), rank, index, tables.rows,
+            if raw.is_some() { crate::shared::decode_graph::census::Launch::Replay }
+            else { crate::shared::decode_graph::census::Launch::Eager },
+            if raw.is_some() { "hit" } else { "unknown-key" });
         match raw {
             Some(raw) => self.on(rank, || {
                 // SAFETY: exact key matches every retained allocation and shape;
