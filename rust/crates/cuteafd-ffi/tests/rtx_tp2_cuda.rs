@@ -373,3 +373,160 @@ fn rtx_combine_and_geometry_route_sums_match_exact_formula() -> Result<()> {
     println!("BF16/F32 combine exact on both GPUs; geometry sums top-6/8/10 exact, legacy V4.1 byte-exact");
     Ok(())
 }
+
+struct Captured<'a> {
+    library: &'a NativeLibrary,
+    stream: *mut c_void,
+    exec: *mut c_void,
+}
+impl Drop for Captured<'_> {
+    fn drop(&mut self) {
+        // SAFETY: the fixture retains its arena until the graph is drained and destroyed.
+        unsafe {
+            let _ = self.library.cuda_stream_synchronize(self.stream);
+            let _ = self.library.cuda_graph_exec_destroy(self.exec);
+        }
+    }
+}
+
+fn read_bytes(lib: &NativeLibrary, buffer: CuteafdDeviceBuffer, bytes: usize) -> Result<Vec<u8>> {
+    let mut value = vec![0; bytes];
+    lib.copy_d2h(&mut value, CuteafdDeviceBuffer { bytes, ..buffer })?;
+    Ok(value)
+}
+
+#[test]
+#[ignore = "requires CUDA and V4 masked native exports; exhaustive fixed-bucket replay gate"]
+fn v4_masked_router_and_sum_are_bitwise_at_every_width() -> Result<()> {
+    use cuteafd_ffi::RtxPartialDtype;
+    const BUCKETS: [usize; 22] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16,
+        24, 32, 40, 48, 56, 64];
+    let lib = library()?;
+    let combine = lib.rtx_tp2_combine()?;
+    for device in 0..2 {
+        lib.cuda_set_device(device)?;
+        lib.tp2_native_initialize()?;
+        for geometry in [ExpertGeometry::DEEPSEEK_V4_FLASH, ExpertGeometry::DEEPSEEK_V4_PRO] {
+            let (hidden, experts, topk) = (geometry.hidden as usize, geometry.experts as usize, geometry.topk as usize);
+            for hash in [false, true] {
+                for dtype in [RtxPartialDtype::Bf16, RtxPartialDtype::F32] {
+                    let mut arena = Arena::new(&lib, device)?;
+                    let logits = arena.alloc(64 * experts * 4)?;
+                    let reference_logits = arena.alloc(logits.bytes)?;
+                    let ids = arena.alloc(64 * topk * 4)?;
+                    let weights = arena.alloc(ids.bytes)?;
+                    let reference_ids = arena.alloc(ids.bytes)?;
+                    let reference_weights = arena.alloc(ids.bytes)?;
+                    let slots = arena.alloc(64 * 8)?;
+                    let tokens = arena.upload(&(0..64u32).flat_map(|i| (i % 7).to_ne_bytes()).collect::<Vec<_>>())?;
+                    let table = arena.upload(&(0..7 * topk).flat_map(|i| ((i * 37 % experts) as i32).to_ne_bytes()).collect::<Vec<_>>())?;
+                    let bias = arena.upload(&(0..experts).flat_map(|i| (((i % 5) as f32 - 2.0) * 0.0625).to_ne_bytes()).collect::<Vec<_>>())?;
+                    let (bias_ptr, table_ptr) = if hash { (std::ptr::null(), table.ptr.cast_const()) }
+                        else { (bias.ptr.cast_const(), std::ptr::null()) };
+                    let payload: [Vec<u8>; 2] = std::array::from_fn(|rank| (0..64 * hidden).flat_map(|i| {
+                        let value = match i % 9 {
+                            0 => if rank == 0 { -0.0 } else { 0.0 },
+                            1 => if rank == 0 { 16_777_216.0 } else { -16_777_216.0 },
+                            _ => ((i % 53) as f32 - 26.0) * if rank == 0 { 0.015625 } else { -0.0078125 },
+                        };
+                        match dtype { RtxPartialDtype::Bf16 => bf16(value).to_ne_bytes().to_vec(),
+                            RtxPartialDtype::F32 => value.to_ne_bytes().to_vec() }
+                    }).collect());
+                    let rank0 = arena.upload(&payload[0])?;
+                    let rank1 = arena.upload(&payload[1])?;
+                    let output = arena.alloc(64 * hidden * 2)?;
+                    let reference_sum = arena.alloc(output.bytes)?;
+                    for bucket in BUCKETS {
+                        let init_logits = vec![0; logits.bytes];
+                        let init_slots: Vec<u8> = (0..64i64).flat_map(|i| i.to_ne_bytes()).collect();
+                        lib.copy_h2d(logits, &init_logits)?;
+                        lib.copy_h2d(slots, &init_slots)?;
+                        // SAFETY: warm lazy kernels first; arena-owned arrays have the fixed bucket extents.
+                        unsafe {
+                            lib.dsv4_router_select_masked(logits.ptr, bias_ptr, table_ptr, tokens.ptr,
+                                slots.ptr.cast(), ids.ptr, weights.ptr, bucket, experts, topk, 1.5, arena.stream)?;
+                            combine.dsv4_sum_masked(rank0.ptr, rank1.ptr, output.ptr.cast(), slots.ptr.cast(),
+                                bucket, hidden, dtype, arena.stream)?;
+                            lib.cuda_stream_synchronize(arena.stream)?;
+                            lib.cuda_graph_begin_capture(arena.stream)?;
+                            lib.dsv4_router_select_masked(logits.ptr, bias_ptr, table_ptr, tokens.ptr,
+                                slots.ptr.cast(), ids.ptr, weights.ptr, bucket, experts, topk, 1.5, arena.stream)?;
+                            combine.dsv4_sum_masked(rank0.ptr, rank1.ptr, output.ptr.cast(), slots.ptr.cast(),
+                                bucket, hidden, dtype, arena.stream)?;
+                        }
+                        // SAFETY: this stream owns the just-started capture, all arrays stay retained.
+                        let graph = Captured { library: &lib, stream: arena.stream,
+                            exec: unsafe { lib.cuda_graph_end_capture(arena.stream)? } };
+                        for rows in (1..=64).filter(|&rows| BUCKETS.iter().copied().find(|&b| b >= rows) == Some(bucket)) {
+                            // Repeated values exercise ties; +/- large logits exercise both transform branches.
+                            let input: Vec<u8> = (0..64 * experts).flat_map(|i| {
+                                let value: f32 = if i / experts >= rows { 0.0 } else { match i % 11 {
+                                    0 => 30.0, 1 => -30.0, _ => ((i % 7) as f32 - 3.0) * 0.25,
+                                }};
+                                value.to_ne_bytes()
+                            }).collect();
+                            lib.copy_h2d(reference_logits, &input)?;
+                            lib.copy_h2d(rank0, &payload[0])?;
+                            lib.copy_h2d(rank1, &payload[1])?;
+                            // SAFETY: unmasked exact-width oracle uses the same initialized operands and row-local arithmetic.
+                            unsafe {
+                                lib.dsv4_router_select(reference_logits.ptr, bias_ptr, table_ptr, tokens.ptr,
+                                    reference_ids.ptr, reference_weights.ptr, rows, experts, topk, 1.5, arena.stream)?;
+                                combine.sum(rank0.ptr, rank1.ptr, reference_sum.ptr.cast(), rows * hidden, dtype, arena.stream)?;
+                                lib.cuda_stream_synchronize(arena.stream)?;
+                            }
+                            let expected_ids = read_bytes(&lib, reference_ids, rows * topk * 4)?;
+                            let expected_weights = read_bytes(&lib, reference_weights, rows * topk * 4)?;
+                            let expected_logits = read_bytes(&lib, reference_logits, rows * experts * 4)?;
+                            let expected_sum = read_bytes(&lib, reference_sum, rows * hidden * 2)?;
+                            for holes in [false, true] {
+                                let valid: Vec<bool> = (0..64).map(|row| row < rows && (!holes || row % 3 != 1)).collect();
+                                let metadata: Vec<u8> = valid.iter().enumerate().flat_map(|(row, &live)|
+                                    (if live { row as i64 } else { -(1i64 << 62) }).to_ne_bytes()).collect();
+                                lib.copy_h2d(slots, &metadata)?;
+                                lib.copy_h2d(logits, &input)?;
+                                for (buffer, bytes) in [(rank0, &payload[0]), (rank1, &payload[1])] {
+                                    let mut poison = bytes.clone();
+                                    for row in 0..64 {
+                                        if !valid[row] {
+                                            let nan = match dtype { RtxPartialDtype::Bf16 => 0x7fc1u16.to_ne_bytes().to_vec(),
+                                                RtxPartialDtype::F32 => f32::NAN.to_ne_bytes().to_vec() };
+                                            for element in poison[row * hidden * nan.len()..(row + 1) * hidden * nan.len()].chunks_exact_mut(nan.len()) {
+                                                element.copy_from_slice(&nan);
+                                            }
+                                        }
+                                    }
+                                    lib.copy_h2d(buffer, &poison)?;
+                                }
+                                // SAFETY: same executable/grid/pointers; only uploaded validity and input bytes change.
+                                unsafe { lib.cuda_graph_launch(graph.exec, arena.stream)?; lib.cuda_stream_synchronize(arena.stream)?; }
+                                let actual_ids = read_bytes(&lib, ids, bucket * topk * 4)?;
+                                let actual_weights = read_bytes(&lib, weights, bucket * topk * 4)?;
+                                let actual_logits = read_bytes(&lib, logits, rows * experts * 4)?;
+                                let actual_sum = read_bytes(&lib, output, bucket * hidden * 2)?;
+                                ensure!(actual_logits == expected_logits, "router logits differ {geometry:?} rows={rows} hash={hash}");
+                                for row in 0..bucket {
+                                    let route = row * topk * 4..(row + 1) * topk * 4;
+                                    let sum = row * hidden * 2..(row + 1) * hidden * 2;
+                                    if valid[row] {
+                                        ensure!(actual_ids[route.clone()] == expected_ids[route.clone()] &&
+                                            actual_weights[route.clone()] == expected_weights[route],
+                                            "live router bits differ device={device} {geometry:?} rows={rows} bucket={bucket} hash={hash}");
+                                        ensure!(actual_sum[sum.clone()] == expected_sum[sum],
+                                            "live sum bits differ device={device} {geometry:?} rows={rows} bucket={bucket} dtype={dtype:?}");
+                                    } else {
+                                        ensure!(actual_ids[route.clone()].iter().all(|&v| v == 255) &&
+                                            actual_weights[route].iter().all(|&v| v == 0) && actual_sum[sum].iter().all(|&v| v == 0),
+                                            "dummy row is not invalid/+0 device={device} rows={rows} bucket={bucket} holes={holes}");
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    println!("V4 fixed-bucket mask bytes passed device={device} {geometry:?} hash={hash} dtype={dtype:?} widths=1..64");
+                }
+            }
+        }
+    }
+    Ok(())
+}
