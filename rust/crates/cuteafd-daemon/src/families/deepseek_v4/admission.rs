@@ -63,8 +63,10 @@ pub(crate) fn request(args: &EngineArgs, inputs: &Inputs<'_>) -> Result<Placemen
     };
     let scratch = cuteafd_loader::serving_capacity::deepseek_v4_workspace_scratch(
         inputs.manifest, inputs.family, gpus == 2, prefill, decode)?;
-    let workspace = cuteafd_loader::serving_capacity::deepseek_v4_workspace_geometry(&cache_cfg, prefill, decode,
-        cuteafd_loader::serving_capacity::compiled_c128_width(inputs.manifest, inputs.family)? * 128, gpus, scratch)?;
+    let workspace = cuteafd_loader::serving_capacity::deepseek_v4_workspace_geometry_for_attention(&cache_cfg, prefill, decode,
+        cuteafd_loader::serving_capacity::compiled_c128_width(inputs.manifest, inputs.family)? * 128, gpus, scratch,
+        cuteafd_loader::placement::attention::parse(&args.attention_placement).map_err(anyhow::Error::msg)?,
+        inputs.loaded_modes)?;
     let onboard = args.onboard()?;
     let stages = if args.dspark && !args.skip_routed_experts { inputs.cache_stages } else { 0 };
     let routed = *inputs.catalog.routed_experts();

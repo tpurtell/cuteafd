@@ -5,6 +5,7 @@ use super::{product, sum, CacheGeometryError};
 use crate::families::deepseek_v4::DeepseekV4Config;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use crate::placement::{AttentionPlacement, LayerMode};
 
 /// Small cards reserve workspaces and graphs explicitly, with the shared
 /// free-memory floor. PRO cards retain the historical total reserve envelope.
@@ -156,6 +157,28 @@ pub fn deepseek_v4_workspace_scratch(
     })
 }
 
+/// Admission reserves both possible owners before solving. Frozen modes select
+/// actual owners afterward; rank 0 retains full heads for target/draft programs.
+pub fn deepseek_v4_workspace_heads(
+    heads: usize,
+    ranks: usize,
+    requested: Option<AttentionPlacement>,
+    modes: Option<&[LayerMode]>,
+) -> Result<Vec<usize>, CacheGeometryError> {
+    if ![1, 2].contains(&ranks) || heads == 0 || heads % ranks != 0
+        || modes.is_some_and(|modes| modes.iter().any(|mode|
+            matches!(mode, LayerMode::Whole { gpu, .. } if usize::from(*gpu) >= ranks))) {
+        return Err(CacheGeometryError::Unsupported { family: "deepseek_v4",
+            what: "workspace attention owners or head geometry" });
+    }
+    Ok((0..ranks).map(|rank| {
+        let owner = modes.map_or(requested == Some(AttentionPlacement::Layers), |modes|
+            modes.iter().any(|mode| matches!(mode, LayerMode::Whole { gpu, .. }
+                if usize::from(*gpu) == rank)));
+        if rank == 0 || owner { heads } else { heads / 2 }
+    }).collect())
+}
+
 pub fn deepseek_v4_workspace_geometry(
     cfg: &DeepseekV4Config,
     prefill_rows: u64,
@@ -164,6 +187,21 @@ pub fn deepseek_v4_workspace_geometry(
     ranks: usize,
     scratch: V4WorkspaceScratch,
 ) -> Result<Vec<V4WorkspaceRank>, CacheGeometryError> {
+    deepseek_v4_workspace_geometry_for_attention(cfg, prefill_rows, decode_rows, max_context,
+        ranks, scratch, None, None)
+}
+
+pub fn deepseek_v4_workspace_geometry_for_attention(
+    cfg: &DeepseekV4Config,
+    prefill_rows: u64,
+    decode_rows: u64,
+    max_context: u64,
+    ranks: usize,
+    scratch: V4WorkspaceScratch,
+    requested: Option<AttentionPlacement>,
+    modes: Option<&[LayerMode]>,
+) -> Result<Vec<V4WorkspaceRank>, CacheGeometryError> {
+    let heads = deepseek_v4_workspace_heads(cfg.n_heads, ranks, requested, modes)?;
     if ![1, 2].contains(&ranks)
         || prefill_rows == 0
         || decode_rows == 0
@@ -184,8 +222,8 @@ pub fn deepseek_v4_workspace_geometry(
         .ok_or(CacheGeometryError::Overflow("V4 C128 table extent"))?;
     (0..ranks)
         .map(|rank| {
-            let prefill = step(cfg, prefill_rows, 2, width, rank, ranks, scratch)?;
-            let decode = step(cfg, decode_rows, 1, width, rank, ranks, scratch)?;
+            let prefill = step_with_heads(cfg, prefill_rows, 2, width, rank, ranks, scratch, heads[rank] as u64)?;
+            let decode = step_with_heads(cfg, decode_rows, 1, width, rank, ranks, scratch, heads[rank] as u64)?;
             Ok(V4WorkspaceRank {
                 fixed_device_bytes: sum("V4 prefill/decode workspaces", &[prefill.0, decode.0])?,
                 pool_unit_device_bytes: sum(
@@ -203,6 +241,7 @@ pub fn deepseek_v4_workspace_geometry(
         .collect()
 }
 
+#[cfg(test)]
 fn step(
     cfg: &DeepseekV4Config,
     rows: u64,
@@ -212,9 +251,22 @@ fn step(
     ranks: usize,
     scratch: V4WorkspaceScratch,
 ) -> Result<(u64, u64, u64), CacheGeometryError> {
+    step_with_heads(cfg, rows, lanes, c128_width, rank, ranks, scratch,
+        cfg.n_heads as u64 / if rank == 1 { 2 } else { 1 })
+}
+
+fn step_with_heads(
+    cfg: &DeepseekV4Config,
+    rows: u64,
+    lanes: u64,
+    c128_width: u64,
+    rank: usize,
+    ranks: usize,
+    scratch: V4WorkspaceScratch,
+    heads: u64,
+) -> Result<(u64, u64, u64), CacheGeometryError> {
     let mul = |values: &[u64]| product("V4 workspace allocation", values);
     let h = cfg.dim as u64;
-    let heads = cfg.n_heads as u64 / if rank == 1 { 2 } else { 1 };
     let topk = cfg.n_activated_experts as u64;
     let lead = |bytes: u64| if rank == 0 { bytes } else { 256 };
     let draft = |bytes: u64| if rank == 0 && cfg.n_mtp_layers > 0 { bytes } else { 0 };
@@ -423,6 +475,36 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn attention_owner_widths_pin_heads_context_and_layers_bytes() {
+        use crate::placement::FfnMode;
+        for pro in [false, true] {
+            let cfg = config(pro);
+            let scratch = V4WorkspaceScratch::default();
+            let geometry = |attention, modes: Option<&[LayerMode]>|
+                deepseek_v4_workspace_geometry_for_attention(&cfg, 4096, 64, 1048576,
+                    2, scratch, attention, modes).unwrap();
+            let baseline = geometry(None, None);
+            for attention in [AttentionPlacement::Heads, AttentionPlacement::Context] {
+                assert_eq!(geometry(Some(attention), None), baseline);
+                assert_eq!(geometry(Some(attention), Some(&[LayerMode::HeadSplit, LayerMode::ContextSplit])), baseline);
+            }
+            let modes = [LayerMode::Whole { gpu: 0, ffn: FfnMode::Split },
+                LayerMode::HeadSplit, LayerMode::Whole { gpu: 1, ffn: FfnMode::Split }];
+            let layers = geometry(Some(AttentionPlacement::Layers), None);
+            assert_eq!(geometry(None, Some(&modes)), layers);
+            assert_eq!(layers[0], baseline[0]);
+            let extra = (4096 + 64) * cfg.n_heads as u64 / 2 * 512 * 2 * 2;
+            assert_eq!(extra, if pro { 545_259_520 } else { 272_629_760 });
+            assert_eq!(layers[1].fixed_device_bytes - baseline[1].fixed_device_bytes, extra);
+            assert_eq!(layers[1].pool_unit_device_bytes, baseline[1].pool_unit_device_bytes);
+            assert_eq!(layers[1].pinned_host_bytes, baseline[1].pinned_host_bytes);
+            assert_eq!(geometry(None, Some(&modes[..2])), baseline);
+        }
+        assert!(deepseek_v4_workspace_heads(64, 1, None,
+            Some(&[LayerMode::Whole { gpu: 1, ffn: FfnMode::Owner }])).is_err());
     }
 
     #[test]
