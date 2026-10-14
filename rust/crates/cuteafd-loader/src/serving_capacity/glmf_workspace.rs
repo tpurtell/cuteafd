@@ -100,6 +100,15 @@ impl GlmfKdaState {
             _ => format!("kda_s16_{cap}"),
         }
     }
+
+    /// Single-copy FP8 projections with an independently selected state dtype.
+    pub fn w8_program(self, cap: &str) -> String {
+        match (self, cap) {
+            (Self::F32, _) => format!("kda_w8_{cap}"),
+            (Self::Bf16Tile, "m4096") => format!("kda_w8_s16t_{cap}"),
+            _ => format!("kda_w8_s16_{cap}"),
+        }
+    }
 }
 
 /// A step's scratch: the largest of its programs' (with the KDA output shard's
@@ -146,7 +155,8 @@ fn glmf_cap_scratch(lookup: &impl Fn(&str) -> Option<u64>, cfg: &GlmNextConfig, 
     let decode = mode == "decode";
     let required = |name: String| lookup(&name).ok_or(GlmfMissingProgram(name));
     let mut scratch = 0;
-    for name in [format!("mhc_post_pre_{cap}"), options.kda_state.program(cap), format!("mla_producer_{cap}"),
+    for name in [format!("mhc_post_pre_{cap}"), if options.kda_w8 { options.kda_state.w8_program(cap) } else { options.kda_state.program(cap) },
+        format!("mla_producer_{cap}"),
         format!("sparse_mla_{mode}_{cap}"), format!("o_{cap}"), format!("ffn_i2048_{cap}"),
         format!("ffn_i12288_{cap}"), format!("index_producer_{cap}"), "mhc_pre".into()] {
         scratch = scratch.max(required(format!("glmf_{name}"))?);
@@ -162,9 +172,6 @@ fn glmf_cap_scratch(lookup: &impl Fn(&str) -> Option<u64>, cfg: &GlmNextConfig, 
             format!("ffn_i{}_{cap}", cfg.dense_intermediate / 2), format!("kda_w8_{cap}")] {
             scratch = scratch.max(lookup(&format!("glmf2_{name}")).unwrap_or(0));
         }
-    }
-    if options.kda_w8 {
-        scratch = scratch.max(required(format!("glmf_kda_w8_{cap}"))?);
     }
     if options.kda_fp32_partials || options.kda_output_shard || options.kda_prefill_expanded {
         let dtype = if options.kda_output_shard { "_norm" } else if options.kda_fp32_partials { "_f32" } else { "" };
@@ -478,6 +485,22 @@ mod tests {
     }
 
     #[test]
+    fn w8_bf16_state_charges_only_the_selected_projection_program() {
+        let cfg = glm53_flash();
+        for state in [GlmfKdaState::Bf16, GlmfKdaState::Bf16Tile] {
+            let options = GlmfScratchOptions { kda_w8: true, kda_state: state, ..Default::default() };
+            for (rows, decode, cap) in [(64, true, "m64"), (4096, false, "m4096")] {
+                let selected = format!("glmf_{}", state.w8_program(cap));
+                let with = |name: &str| if name == selected { Some(900_000_000) }
+                    else if name.starts_with("glmf_kda_") { None } else { lookup(name) };
+                assert_eq!(glmf_step_scratch(with, &cfg, options, rows, decode).unwrap().programs, 900_000_000);
+                assert_eq!(glmf_step_scratch(lookup, &cfg, options, rows, decode).unwrap_err(),
+                    GlmfMissingProgram(selected));
+            }
+        }
+    }
+
+    #[test]
     fn a_bf16_kda_state_charges_its_programs_and_needs_them() {
         let cfg = glm53_flash();
         let bf16 = GlmfScratchOptions { kda_state: GlmfKdaState::Bf16, ..Default::default() };
@@ -580,13 +603,14 @@ mod tests {
     /// The wide decode programs' scratch at capacity in the offline SM 12.0 export of SparkInfer
     /// 1ce62d27 at 170 SMs (the sparse MLA with `full_launch_splits=1`), and the same export's
     /// BF16-state and compact-index decode programs of 64 rows.
-    const WIDE_SCRATCH: [(&str, u64); 14] = [
+    const WIDE_SCRATCH: [(&str, u64); 16] = [
         ("glmf_index_producer_m128", 1_122_304), ("glmf_index_producer_c_m128", 1_187_840),
         ("glmf_index_topk_decode_m128", 17_304_576), ("glmf_mhc_post_pre_m128", 819_200),
         ("glmf_kda_m128", 21_053_440), ("glmf_kda_w8_m128", 21_053_440), ("glmf_kda_s16_m128", 21_053_440),
         ("glmf_mla_producer_m128", 4_718_592), ("glmf_o_m128", 4_194_304),
         ("glmf_sparse_mla_decode_m128", 16_809_984), ("glmf_ffn_i2048_m128", 1_572_864),
         ("glmf_ffn_i12288_m128", 9_437_184), ("glmf_kda_s16_m64", 10_526_720), ("glmf_index_producer_c_m64", 593_920),
+        ("glmf_kda_w8_s16_m64", 10_526_720), ("glmf_kda_w8_s16_m128", 21_053_440),
     ];
 
     fn wide_lookup(name: &str) -> Option<u64> {

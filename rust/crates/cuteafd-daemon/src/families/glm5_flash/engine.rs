@@ -229,6 +229,10 @@ impl KdaState {
         }
     }
 
+    pub(crate) fn w8_program(self, cap: &str) -> String {
+        GlmfKdaState::from(self).w8_program(cap)
+    }
+
     /// The verify-by-replay commit program for this state.
     pub(crate) fn commit_program(self) -> &'static str {
         if self == Self::F32 { "kda_commit" } else { "kda_commit_s16" }
@@ -4197,7 +4201,8 @@ impl<'a> GlmfEngine<'a> {
         let dtype = if self.output_shard_attention(layer) { "_norm" }
             else if self.precise_attention(layer) { "_f32" } else { "" };
         let expanded = if self.kda_prefill_expanded && !is_decode(cap) { "_expanded" } else { "" };
-        let name = format!("kda_w8{dtype}{expanded}_{cap}");
+        let name = if self.kda_state == KdaState::F32 { format!("kda_w8{dtype}{expanded}_{cap}") }
+            else { self.kda_state.w8_program(cap) };
         self.run_on(rank, layer.split, &name, &pointers, &scalars)
     }
 
@@ -5239,6 +5244,8 @@ mod prefill_lane_tests {
         // The loader's step scratch (`GlmfScratchOptions::kda_state`) charges the programs the steps launch.
         for state in [KdaState::F32, KdaState::Bf16, KdaState::Bf16Tile] {
             let loader = super::GlmfKdaState::from(state);
+            assert_eq!(loader.w8_program("m64"), state.w8_program("m64"));
+            assert_eq!(loader.w8_program("m4096"), state.w8_program("m4096"));
             assert_eq!((loader.program("m64"), loader.program("m4096"), loader.bytes()),
                 (state.program("m64"), state.program("m4096"), state.bytes() as u64));
         }
@@ -5260,11 +5267,11 @@ mod prefill_lane_tests {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../third_party/sparkinfer/b12x");
         // Any exporter change requires re-auditing shapes and arithmetic routes.
         for (path, expected) in [
-            // b729115b separates unchanged W8A8 activation admission from BF16 routing.
-            ("integration/cuteafd/glmf.py", 0x22ff_3e9c_9277_c5b0_u64),
+            // 0a27858b opts W8/S16 decode into canonical W8A16; mixed defaults stay unchanged.
+            ("integration/cuteafd/glmf.py", 0x6a8b_4bde_c8ae_1ce0_u64),
             // b729115b uses canonical BF16 MMA at every positive row count.
             ("integration/cuteafd/_glm_kernels.py", 0x8b85_3785_9223_9a99),
-            ("integration/cuteafd/_fp8_weights.py", 0xb186_4a9c_36b1_7b30),
+            ("integration/cuteafd/_fp8_weights.py", 0x9f8c_fcd2_54c6_4033),
             // 5dcdd837 opts decode mHC into partial-group fusion; projection thresholds and arithmetic stay unchanged.
             ("integration/cuteafd/dsv4_mhc.py", 0x978a_179d_ef8c_2101),
             // b629baef adds Qwen4Geometry::kv_record_bytes only; GLM projection routes are unchanged.

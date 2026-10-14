@@ -179,7 +179,7 @@ pub(crate) struct EngineArgs {
     /// verify committed at k rows stores the bits of k serial steps) and where each chunked-prefill
     /// window stores it; `bf16-tile` rounds the chunked prefill after every 16-row tile instead.
     /// Half the state and prefix-mark bytes (34 layers: 136 -> 68 MiB per sequence). Runs the
-    /// BF16-projection KDA programs on one GPU (with --kda-fp8 off, no --split-device).
+    /// BF16 or single-copy FP8 KDA projections on one GPU (no --split-device).
     #[arg(long, value_enum, default_value = "f32")]
     pub kda_state: engine::KdaState,
     /// Keep FP8 KDA output partials in FP32 until the two-GPU sum.
@@ -299,10 +299,8 @@ pub(crate) fn wide_decode_programs(args: &EngineArgs, cfg: &GlmNextConfig) -> Ve
         "sparse_mla_decode".into(), "index_producer".into(), "index_topk_decode".into(),
         format!("ffn_i{}", cfg.moe_intermediate), format!("ffn_i{}", cfg.dense_intermediate)]
         .into_iter().map(|name| format!("glmf_{name}_{cap}")).collect();
-    names.push(format!("glmf_{}", args.kda_state.program(&cap)));
-    if args.kda_fp8 != fp8::KdaFp8::Off {
-        names.push(format!("glmf_kda_w8_{cap}"));
-    }
+    names.push(format!("glmf_{}", if args.kda_fp8 == fp8::KdaFp8::Off { args.kda_state.program(&cap) }
+        else { args.kda_state.w8_program(&cap) }));
     if compact {
         names.push(format!("glmf_index_producer_c_{cap}"));
     }
@@ -617,7 +615,7 @@ mod draft_cli_tests {
     }
 
     #[test]
-    fn bf16_kda_state_runs_the_bf16_projection_programs_on_one_gpu() {
+    fn bf16_kda_state_runs_either_projection_storage_on_one_gpu() {
         assert_eq!(parse(&[]).kda_state, engine::KdaState::F32);
         for (value, state) in [("f32", engine::KdaState::F32), ("bf16", engine::KdaState::Bf16),
             ("bf16-tile", engine::KdaState::Bf16Tile)] {
@@ -626,7 +624,11 @@ mod draft_cli_tests {
             check_options(&args).unwrap();
         }
         for extra in [&["--kda-state", "bf16", "--kda-fp8", "row128"][..],
-            &["--kda-state", "bf16-tile", "--kda-fp8", "channel"][..], &["--kda-state", "bf16", "--split-device", "1"][..]] {
+            &["--kda-state", "bf16-tile", "--kda-fp8", "channel"][..]] {
+            check_options(&parse(extra)).unwrap();
+        }
+        for extra in [&["--kda-state", "bf16", "--split-device", "1"][..],
+            &["--kda-state", "bf16", "--kda-fp8", "row128", "--split-device", "1"][..]] {
             let error = check_options(&parse(extra)).unwrap_err().to_string();
             assert!(error.contains("--kda-state bf16"), "{error}");
         }
@@ -672,14 +674,15 @@ mod draft_cli_tests {
         assert_eq!(wide_decode_programs(&parse(&["--decode-rows", "128"]), &cfg),
             with(&["glmf_kda_m128", "glmf_kda_commit_m128"]));
         assert_eq!(wide_decode_programs(&parse(&["--decode-rows", "128", "--kda-fp8", "row128"]), &cfg),
-            with(&["glmf_kda_m128", "glmf_kda_w8_m128", "glmf_kda_commit_m128"]));
+            with(&["glmf_kda_w8_m128", "glmf_kda_commit_m128"]));
         assert_eq!(wide_decode_programs(&parse(&["--decode-rows", "128", "--kda-state", "bf16", "--index-cache",
             "compact"]), &cfg), with(&["glmf_kda_s16_m128", "glmf_index_producer_c_m128", "glmf_kda_commit_c_s16_m128"]));
         // Every name is one of the exporter's 16 wide stems.
         let stems = ["index_producer", "index_producer_c", "index_topk_decode", "mhc_post_pre", "kda", "kda_w8",
-            "kda_s16", "mla_producer", "o", "sparse_mla_decode", "ffn_i2048", "ffn_i12288", "kda_commit",
+            "kda_s16", "kda_w8_s16", "mla_producer", "o", "sparse_mla_decode", "ffn_i2048", "ffn_i12288", "kda_commit",
             "kda_commit_s16", "kda_commit_c", "kda_commit_c_s16"].map(|stem| format!("glmf_{stem}_m128"));
-        for flags in [&["--kda-fp8", "row128", "--index-cache", "compact"][..], &["--kda-state", "bf16-tile"][..]] {
+        for flags in [&["--kda-fp8", "row128", "--index-cache", "compact"][..], &["--kda-state", "bf16-tile"][..],
+            &["--kda-state", "bf16", "--kda-fp8", "row128"][..]] {
             let args = parse(&[&["--decode-rows", "128"][..], flags].concat());
             assert!(wide_decode_programs(&args, &cfg).iter().all(|name| stems.contains(name)), "{flags:?}");
         }
@@ -1105,9 +1108,8 @@ fn check_options(args: &EngineArgs) -> Result<()> {
         "--fp8-prefill none takes no other group");
     ensure!(args.kda_nvfp4_gate.is_none() || args.kda_fp8 == fp8::KdaFp8::Off,
         "--kda-nvfp4-gate rounds the BF16 KDA projections; it takes --kda-fp8 off");
-    ensure!(args.kda_state == engine::KdaState::F32 || (args.kda_fp8 == fp8::KdaFp8::Off && args.split_device.is_none()),
-        "--kda-state bf16 runs the BF16-projection KDA programs on one GPU: it takes --kda-fp8 off and no \
-        --split-device (the FP8-KDA and head-split programs keep an FP32 state)");
+    ensure!(args.kda_state == engine::KdaState::F32 || args.split_device.is_none(),
+        "--kda-state bf16 takes no --split-device (head-split BF16 state is not yet qualified)");
     ensure!(args.replay_records == engine::ReplayRecords::Own || args.split_device.is_none(),
         "--replay-records shared keeps the records in one GPU's prefill scratch: it takes no --split-device");
     ensure!(args.decode_rows == engine::DECODE_ROWS || args.split_device.is_none(),
@@ -1473,7 +1475,7 @@ impl Opened {
         programs.capacities().require_context("glm5_flash", args.max_context)?;
         // The single-copy FP8 consumers of the selected representations, before any weight loads.
         let mut needed = Vec::new();
-        if args.kda_fp8 != fp8::KdaFp8::Off {
+        if args.kda_fp8 != fp8::KdaFp8::Off && args.kda_state == engine::KdaState::F32 {
             needed.extend(["glmf_kda_w8_m64", "glmf_kda_w8_m4096"]);
         }
         if args.fp8_head {
@@ -1487,7 +1489,8 @@ impl Opened {
             // The state's KDA programs and the commit a speculative verify runs: the state's, or with
             // the compact index cache the one that also rebuilds the tails (`kda_commit_c[_s16]`).
             let kda: Vec<String> = if args.kda_state == engine::KdaState::F32 { Vec::new() }
-                else { ["m64", "m4096"].iter().map(|cap| args.kda_state.program(cap)).collect() };
+                else { ["m64", "m4096"].iter().map(|cap| if args.kda_fp8 == fp8::KdaFp8::Off { args.kda_state.program(cap) }
+                    else { args.kda_state.w8_program(cap) }).collect() };
             let commit = if compact { args.kda_state.compact_commit_program() }
                 else { args.kda_state.commit_program() };
             for name in kda.into_iter().chain([commit.to_string()]) {

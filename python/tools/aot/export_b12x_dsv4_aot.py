@@ -346,6 +346,13 @@ def glmf_programs(g, decode_rows: int, prefill_rows: int, max_context: int):
                     {"max_rows": rows, "fp8": f8, "state_dtype": "bfloat16", "state_rounding": rounding, **kda_decode},
                     lambda r=rows, f=f8, sr=rounding, kd=kda_decode: glmf.compile_glmf_kda_aot(
                         g, max_rows=r, fp8=f, state_dtype="bfloat16", state_rounding=sr, **kd)))
+    for rows, mode, tag, rounding in ((decode_rows, "decode", "s16", "window"),
+                                      (prefill_rows, "prefill", "s16", "window"),
+                                      (prefill_rows, "prefill", "s16t", "tile")):
+        params = {"max_rows": rows, "fp8_only": mode, "state_dtype": "bfloat16",
+                  "state_rounding": rounding, **({"decode_recipe": "w8a16"} if mode == "decode" else {})}
+        out.append((f"kda_w8_{tag}_m{rows}", "kda", params,
+                    lambda kw=params: glmf.compile_glmf_kda_aot(g, **kw)))
     out.append(("kda_commit_s16", "kda_commit", {"state_dtype": "bfloat16"},
                 lambda: glmf.compile_glmf_kda_commit_aot(g, state_dtype="bfloat16")))
     # Both: the compact index cache's commit (state and index tails in one launch) over a BF16 state.
@@ -391,6 +398,10 @@ def glmf_wide_decode_programs(g, decode_rows: int, wide_rows: int, max_context: 
                                  "seq_ctas": 8, "decode_tiles": True},
          lambda: glmf.compile_glmf_kda_aot(g, max_rows=r, fp8=True, state_dtype="bfloat16", state_rounding="window",
                                          seq_ctas=8, decode_tiles=True)),
+        (f"kda_w8_s16_m{r}", "kda", {"max_rows": r, "fp8_only": "decode", "state_dtype": "bfloat16",
+                                     "state_rounding": "window", "decode_recipe": "w8a16"},
+         lambda: glmf.compile_glmf_kda_aot(g, max_rows=r, fp8_only="decode", state_dtype="bfloat16",
+                                         state_rounding="window", decode_recipe="w8a16")),
         (f"mla_producer_m{r}", "mla_producer", {"max_rows": r, "fp8_only": "decode"},
          lambda: glmf.compile_glmf_mla_producer_aot(g, max_rows=r, fp8_only="decode")),
         (f"o_m{r}", "o", {"max_rows": r, "fp8_only": "decode"},

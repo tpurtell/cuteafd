@@ -1298,9 +1298,10 @@ def test_glmf_draft_policy_keys_reject_bad_values_before_launch(tmp_path, keys, 
 @pytest.mark.parametrize("keys,forwarded", [("", None), ("GLM5_FLASH_KDA_STATE=f32\n", None),
                                              ("GLM5_FLASH_KDA_STATE=bf16\n", "bf16"),
                                              ("GLM5_FLASH_KDA_STATE=bf16-tile\n", "bf16-tile")])
-def test_glmf_kda_state_is_forwarded_with_bf16_kda_projections(tmp_path, keys, forwarded):
+@pytest.mark.parametrize("projection", ("off", "row128", "channel"))
+def test_glmf_kda_state_is_forwarded_with_either_kda_storage(tmp_path, keys, forwarded, projection):
     result = _family_launch_result(tmp_path, SPLIT_CONFIGS["glm5_flash"], "test/glmf",
-                                  "GLM5_FLASH_FP8_MODEL_ID=off\nRTX_GPUS=1\nGLM5_FLASH_KDA_FP8=off\n" + keys)
+                                  f"GLM5_FLASH_FP8_MODEL_ID=off\nRTX_GPUS=1\nGLM5_FLASH_KDA_FP8={projection}\n" + keys)
     assert result.returncode == 0, result.stderr
     launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-glmf" in line)
     if forwarded is None:
@@ -1310,7 +1311,6 @@ def test_glmf_kda_state_is_forwarded_with_bf16_kda_projections(tmp_path, keys, f
 
 
 @pytest.mark.parametrize("keys,message", [
-    ("RTX_GPUS=1\nGLM5_FLASH_KDA_STATE=bf16\n", "GLM5_FLASH_KDA_FP8=off"),
     ("RTX_GPUS=2\nGLM5_FLASH_KDA_FP8=off\nGLM5_FLASH_KDA_STATE=bf16\n", "without a head split"),
     ("RTX_GPUS=1\nGLM5_FLASH_KDA_FP8=off\nGLM5_FLASH_KDA_STATE=fp16\n", "GLM5_FLASH_KDA_STATE must be"),
 ])

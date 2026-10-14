@@ -16,7 +16,7 @@ EXPORTER = ROOT / "python" / "tools" / "aot" / "export_b12x_dsv4_aot.py"
 GEOMETRY = types.SimpleNamespace(moe_inter=2048, dense_inter=12288, index_kpool=4, kda_width=8192, hidden=4096)
 WIDE_STEMS = {
     "index_producer_m128", "index_producer_c_m128", "index_topk_decode_m128", "mhc_post_pre_m128", "kda_m128",
-    "kda_w8_m128", "kda_s16_m128", "mla_producer_m128", "o_m128", "sparse_mla_decode_m128", "ffn_i2048_m128",
+    "kda_w8_m128", "kda_s16_m128", "kda_w8_s16_m128", "mla_producer_m128", "o_m128", "sparse_mla_decode_m128", "ffn_i2048_m128",
     "ffn_i12288_m128", "kda_commit_m128", "kda_commit_s16_m128", "kda_commit_c_m128", "kda_commit_c_s16_m128",
 }
 
@@ -297,3 +297,17 @@ def test_context_split_programs_append_after_every_other_program_when_switched_o
     assert 'context_split_programs(\n                bases[name], args.decode_rows, geometry_context(name, args.max_context))' in source
     # glmf2's compact commit (context keeps the compact index cache on two GPUs) comes last too.
     assert source.index('work.append(("glmf2", "kda_commit_c", "kda_commit"') > appended
+
+
+def test_glmf_w8_state_is_orthogonal_and_canonical(exporter):
+    programs = exporter.glmf_programs(GEOMETRY, 64, 4096, 131072)
+    programs += exporter.glmf_wide_decode_programs(GEOMETRY, 64, 128, 131072)
+    calls = {stem: (params, thunk()[3]) for stem, _, params, thunk in programs}
+    for cap, mode in ((64, "decode"), (128, "decode"), (4096, "prefill")):
+        params, kw = calls[f"kda_w8_s16_m{cap}"]
+        expected = {"max_rows": cap, "fp8_only": mode, "state_dtype": "bfloat16", "state_rounding": "window"}
+        if mode == "decode":
+            expected["decode_recipe"] = "w8a16"
+        assert params == kw == expected
+        assert "decode_recipe" not in calls[f"kda_w8_m{cap}"][1]
+    assert calls["kda_w8_s16t_m4096"][1]["state_rounding"] == "tile"
