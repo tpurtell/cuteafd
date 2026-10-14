@@ -28,10 +28,23 @@ the fix):
   Production FP8 checkpoints use the ``fp8_only`` path; these two shapes are
   the unmeasured equivalent, not a second copy of every BF16 projection.
 
+The structural check does not freeze the 16 or 32 cap. A compiled GEMV must
+use more than one warp, and a wide GEMV must keep that tile's
+``(warps, groups)``. A same-order GEMV through 64 and TMA at every width
+both satisfy the bit contract. The colours above are the prediction for
+this pin.
+
+This file passes ``fp8_rows`` from the projection's own cap
+(``max_gemv_rows``, or ``max_fp8_rows`` for the switch). It does not execute
+the Rust scalar, the baked ``Int32(FP8_GEMV_ROWS)``, or the output-row
+wrappers. Those stay on TMA at M=32 until they move with the cap; a
+kernel-only change goes green here while serving still switches.
+
 Serving pads 17 up to a bucket (GLM Flash 32, GLM short-context 20, Qwen
 speculative 24). The kernel still branches on the live ``rows`` scalar, so
 the bucket above 16 is the other kernel. M=17 is the first integer past the
-switch that #173 measured.
+switch that #173 measured. The file stops at 64. The ``_m128`` program is a
+separate compile and is not launched.
 """
 
 from __future__ import annotations
@@ -190,7 +203,11 @@ def _scale_kind(proj, kind):
 
 
 def _cap(proj, kind):
-    """Production fp8_rows. A constant cap matches the baked decode scalar at every width here."""
+    """The projection's own cap, passed as ``fp8_rows``.
+
+    On this pin that equals the baked decode scalar at the four widths.
+    The test does not execute the Rust scalar or the output-row wrappers.
+    """
     if kind == "routed":
         return None
     if kind == "switch":
@@ -198,20 +215,24 @@ def _cap(proj, kind):
     return int(proj.max_gemv_rows)
 
 
-def _check_shape(proj, tag, kind):
+def _check_shape(proj, kind):
+    """A wide GEMV must split K the same way as the thin tile.
+
+    The integer-bit compare is the contract. Today's 16/32 cap is not
+    frozen, so a same-order GEMV through the verify range and a single
+    TMA route both stay green. A mixed switch stays red.
+    """
     if kind in ("routed", "switch"):
-        gemv = proj.fp8
+        gemv = getattr(proj, "fp8", None)
         wide = getattr(proj, "fp8_wide", None) if kind == "switch" else None
-        assert gemv.warps > 1
-        assert wide is None
-        return
-    assert proj.gemv.warps > 1
-    wide = proj.gemv_wide
-    if tag == "s16":
-        assert wide is None and proj.max_gemv_rows == 16
     else:
-        assert wide is not None and proj.max_gemv_rows == 32
-        assert (wide.warps, wide.groups) == (proj.gemv.warps, proj.gemv.groups)
+        gemv = getattr(proj, "gemv", None)
+        wide = getattr(proj, "gemv_wide", None)
+    if gemv is not None:
+        assert gemv.warps > 1
+    if wide is not None:
+        assert gemv is not None
+        assert (wide.warps, wide.groups) == (gemv.warps, gemv.groups)
 
 
 def _compile(case_id, kind, n, k, proj):
@@ -343,7 +364,7 @@ def test_fp8_projection_row_invariance(case, rows):
     import torch
     case_id, tag, kind, n, k = case
     proj = _build(kind, n, k)
-    _check_shape(proj, tag, kind)
+    _check_shape(proj, kind)
     program = _compile(case_id, kind, n, k, proj)
     scale_kind = _scale_kind(proj, kind)
     cap = _cap(proj, kind)

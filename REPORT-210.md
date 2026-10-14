@@ -165,11 +165,11 @@ Drop it in as `third_party/sparkinfer/tests/integration/test_fp8_projection_row_
 One pytest, parametrized by every certain and maybe consumer above and by M in `{16, 17, 32, 64}`:
 
 * Build the production object (`_w8`, `mimo_w8`, `Fp8Projection`, `GlmfOutputRows` / `GlmfOutputShard`, the half-head in-proj constructor, `RoutedFp8Projection`, `_Fp8Switch`).
-* Assert the structural claim before any compare: `s16` has no wide GEMV and `max_gemv_rows == 16`; `s32` has a wide GEMV at 32 with the same `(warps, groups)`; dual-copy has no wide GEMV.
+* Before the compare, require that a compiled GEMV has `warps > 1`, and that a wide GEMV, when one is compiled, uses the same `(warps, groups)`. The 16/32 cap is not frozen. A same-order GEMV through 64 and a TMA route at every M both reach the bit compare. A mixed switch stays red.
 * Same E4M3 weight and scales at every M. Dual-copy also builds `bf16(w * s)` and feeds it to the large path, so both routes are the same product.
 * Row 0 is one BF16 vector. Other rows are a finite poison (not NaN, not a copy of row 0).
 * Output buffer filled with `int16` `0x7FFF` before each launch. Decode `qscratch` is `Int64(0)`, as in `test_fp8_projection_decode_matches_routed`.
-* `fp8_rows` is the production cap (`max_gemv_rows`, or `max_fp8_rows` for the switch). At these four widths that cap selects the same kernel as the baked scalar and as the output-row wrapper (a constant 16 and a 0-above-16 agree once `rows > 16`; a constant 32 and a 0-above-32 agree once `rows > 32`).
+* `fp8_rows` is the projection's own cap (`max_gemv_rows`, or `max_fp8_rows` for the switch). On this pin that cap selects the same kernel as the baked scalar and as the output-row wrapper (a constant 16 and a 0-above-16 agree once `rows > 16`; a constant 32 and a 0-above-32 agree once `rows > 32`). The pytest does not execute the Rust scalar, the baked `Int32(FP8_GEMV_ROWS)`, or those wrappers. Raising only `wide_rows` makes this file go green while those callers still pass 16 or 0 and serving stays on TMA.
 * Compare row 0 with `view(torch.int16)`. Assert the sentinel was overwritten on row 0 and on every other live row.
 
 No xfail. 43 cases, 39 compiles (the four shared shapes above), 172 launches. On pin `91b104db` the expected colours are:
@@ -190,6 +190,22 @@ For every M in the verify range (1..64, and 128 on the wide Flash program), use 
 1. Keep today's thin GEMV for `rows ≤ 16`, with today's `(warps, groups)`.
 2. Add a wide GEMV through the verify cap with **those same** `(warps, groups)`. `_w8`'s hardcoded `wide_warps=8, wide_groups=2` must not apply to a shape whose narrow pair is different. The half-head in-proj override `(8, 2)` stays: it is a warp config, so head-split partials keep the full-head fold. It is not a route.
 3. Stop calling decode `TmaFp8Gemm` inside that range.
+
+The fat tile's `max_rows` is that program's compile capacity, not one global 64. A program compiled at 64 rows cannot launch 128. `--decode-rows 128` is a separate compile: `verify_budget` (`glmf_graphs.rs:19`) appends 128 on 188 SMs, 127 on 170, and 99 on 132 after the 64-row bucket. This pytest stops at 64 and does not launch the `_m128` program.
+
+### Raising `wide_rows` is not the route
+
+`limit = min(fp8_rows, max_gemv_rows)` (`_fp8_weights.py:183`). `_Fp8Switch` clamps the same way (`glmf.py:218`). A fatter GEMV never runs while the scalar stays at 16, or at 0:
+
+* GLM Flash full-head KDA and the non-KDA projections pass Rust `FP8_ROWS` (`engine.rs:88`, value 16) from `kda_w8` (`:4187`) and `fp8_scalars` (`:4208`). Half-head KDA passes 32.
+* GLM 5.3 decode bakes `Int32(FP8_GEMV_ROWS)` in the kernel: `_ProducerW8Decode` `glm_attention.py:361`, `_IndexProducerW8Decode` `:416`, `_OutputW8Decode` `:461`, `_FfnW8Decode` `glm_ffn.py:194`. Changing the Rust scalar does not move these.
+* Qwen decode bakes the same constant: `_GdnW8Decode` `qwen4_gdn.py:373`, `_ProducerW8Decode` `qwen4_attention.py:277`, `_AttnOW8Decode` `:683`.
+* MiMo decode passes runtime `FP8_DECODE_ROWS` (`mimo_v2/engine.rs:180`, value 32) from `w8_scalars` (`:2561`) and the o_proj launch (`:2537`).
+* `GlmfOutputRows` (`_glmf_output_rows.py:41`) passes 32 only while `total_rows <= 32`, else 0. `GlmfOutputShard` (`_glmf_output_shard.py:66`) always passes 32. `GlmfMlaOutputRows` (`_glmf_mla_output_rows.py:57`) passes `FP8_ROWS` only while `total_rows <= 16`, else 0.
+
+Each of those scalars has to become that program's capacity, together with `wide_rows`. The half-head `(8, 2)` warp override stays.
+
+`check_bucket_thresholds` (`decode_graph.rs:36`) rejects a threshold that sits strictly between two buckets (`previous < threshold && threshold < bucket`). A threshold equal to 64 does not straddle `[1, 4, 8, 16, 32, 64]`, and it does not straddle the wide speculative set that appends 128 after 64: `64 < 64` is false. The set that fails is one that jumps over 64. `[32, 72]` and `[..., 32, 72, 127]` already do, for `glmf.decode_capacity[m64|m128]` (`engine.rs:5305`). Register each program's crossover at that program's own capacity: 64 on the `_m64` programs, the verify budget on the `_m128` programs. Leave the old 16/32 entries behind only while the kernel still switches there. Raising the registry while the scalar is still 16 would claim one kernel across a launch that still switches.
 
 C1 stays on the thin GEMV (no change at M=1) only if the new test shows the thin and wide tiles match. That is the reason `s32` is in the test at M=17 and M=32.
 
@@ -213,6 +229,6 @@ Flash has tuned GEMV times and no paired TMA (`FP8_GEMV_CONFIG`, `glmf.py:235`):
 
 ## Gates
 
-* CPU: `python -m py_compile` on the test, and a loose import that executes the case-table checks. Both passed.
+* CPU: `python -m py_compile` on the test, and a loose import that executes the case-table checks (43 cases, s16=28, s32=13, copy=2). Both passed again after the structural assert stopped freezing the 16/32 cap.
 * GPU pytest: not run. The file skips without SM120/SM121.
 * No defaults changed. No submodule pointer change. No image. Not merged.
