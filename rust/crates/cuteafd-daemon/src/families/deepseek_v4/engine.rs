@@ -276,6 +276,17 @@ mod cache_tests {
     }
 
     #[test]
+    fn owner_staged_head_is_decode_only_even_when_all_prefill_rows_are_scored() {
+        for cap in [1, 64, 4096] {
+            assert!(!super::owner_decode_step(false, cap, 64));
+        }
+        assert!(!super::owner_decode_step(true, 4096, 64));
+        assert!(super::owner_decode_step(true, 64, 64));
+        assert_eq!(cuteafd_loader::serving_capacity::deepseek_v4_staged_head_bytes(
+            129280, 4096, 64, 0, true).unwrap(), 0);
+    }
+
+    #[test]
     fn c4_sentinel_is_only_for_frozen_owner_split_modes() {
         for gpu in [0, 1] {
             assert!(c4_sentinel(Some(LayerMode::Whole { gpu, ffn: FfnMode::Split })));
@@ -331,6 +342,10 @@ pub(crate) struct EngineParts<'a> {
 /// pages non-owner compressor rows write (one 64-row page per 64 decode/verify rows).
 fn c4_units(shape: PoolShape, context: bool) -> usize {
     if context { shape.units / 2 + metadata::C4_SCRATCH_UNITS } else { shape.units }
+}
+
+fn owner_decode_step(decode: bool, cap: usize, decode_rows: usize) -> bool {
+    decode && cap == decode_rows
 }
 
 fn c4_sentinel(mode: Option<cuteafd_loader::placement::LayerMode>) -> bool {
@@ -1523,7 +1538,10 @@ impl<'a> Engine<'a> {
                 let capacity = w.vocab_logits.buffer.bytes / (self.cfg.vocab_size * 4);
                 ensure!(landed + wanted <= capacity, "{logit_rows} device logit rows exceed the workspace's {capacity}");
                 #[cfg(feature = "dev-v4-layers")]
-                let graphed = if self.owner_graph_mode() && wanted == rows {
+                // Prefill/scoring has no admitted staging allocation, even when
+                // every real row needs logits; keep its projection eager and packed.
+                let graphed = if self.owner_graph_mode()
+                    && owner_decode_step(step.tables.decode, cap, self.decode_rows) && wanted == rows {
                     self.owner_segment(0, self.cfg.n_layers - 1, lane.index, step.tables, w, cap,
                         graphs::Segment::Head, std::ptr::null_mut(), || self.staged_head_launch(lane, rows, w))?;
                     self.land_staged_head(w, wanted, landed)?;

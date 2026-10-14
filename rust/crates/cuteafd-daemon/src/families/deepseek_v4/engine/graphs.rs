@@ -142,7 +142,7 @@ impl Engine<'_> {
         self.require_live()?;
         if (segment == Segment::Tap && (!self.draft_ready() || !self.cfg.dspark_target_layer_ids.contains(&layer)))
             || (segment == Segment::DraftKv && !self.draft_ready()) { return run(); }
-        let bypass = if !tables.decode || cap != self.decode_rows { Some("prefill") }
+        let bypass = if !owner_decode_step(tables.decode, cap, self.decode_rows) { Some("prefill") }
             else if segment == Segment::Front && self.mixed_attention(self.cfg.compress_ratios[layer], tables) { Some("mixed-c128") }
             else if self.tp2.as_ref().is_some_and(|tp2| tp2.checking.get()) { Some("route-check") }
             else { None };
