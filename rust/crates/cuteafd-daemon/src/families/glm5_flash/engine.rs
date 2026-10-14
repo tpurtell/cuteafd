@@ -5271,7 +5271,7 @@ mod prefill_lane_tests {
             ("integration/cuteafd/glmf.py", 0xe09b_6e76_c028_f691_u64),
             // b729115b uses canonical BF16 MMA at every positive row count.
             ("integration/cuteafd/_glm_kernels.py", 0x8b85_3785_9223_9a99),
-            ("integration/cuteafd/_fp8_weights.py", 0xa2c8_96b5_e1b4_4105),
+            ("integration/cuteafd/_fp8_weights.py", 0xe240_eb86_d0f9_3218),
             // 5dcdd837 opts decode mHC into partial-group fusion; projection thresholds and arithmetic stay unchanged.
             ("integration/cuteafd/dsv4_mhc.py", 0x978a_179d_ef8c_2101),
             // b629baef adds Qwen4Geometry::kv_record_bytes only; GLM projection routes are unchanged.
