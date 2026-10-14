@@ -177,7 +177,11 @@ impl GlmDraftRuntimeLayout {
     }
 }
 
-/// Native fp8_gemv.cu scratch contract; SM count affects the split partial arena.
+/// Native fp8_gemv.cu scratch contract. W8A16 and the 128-row passes size a
+/// split-K partial arena from `sms`. W8A8 past 64 rows sizes one activation
+/// tile (rows rounded up to 128, one byte per element, plus the block scales)
+/// and keeps the split-K arena when that is larger, so an admitted W8A8
+/// buffer still covers the earlier modes.
 pub fn draft_fp8_scratch_bytes(rows: u64, k: u64, n: u64, sms: u64, mode: u8) -> u64 {
     let align = |bytes: u64| bytes.div_ceil(256) * 256;
     if n < 16 || k < 128 || sms == 0 || mode > 2 { return 0; }
@@ -186,9 +190,13 @@ pub fn draft_fp8_scratch_bytes(rows: u64, k: u64, n: u64, sms: u64, mode: u8) ->
     let wanted = (sms * 16).div_ceil(tiles).clamp(1, blocks);
     let splits = blocks.div_ceil(blocks.div_ceil(wanted));
     let capacity = if mode == 0 { 64 } else { 128 };
-    align(2 * capacity * 4) + align(k.div_ceil(256) * capacity * 4) + align(k * capacity * 2)
+    let legacy = align(2 * capacity * 4) + align(k.div_ceil(256) * capacity * 4) + align(k * capacity * 2)
         + if mode == 2 { align(k / 128 * capacity * 4) } else { 0 }
-        + if splits > 1 { align(splits * rows.min(capacity) * n * 4) } else { 0 }
+        + if splits > 1 { align(splits * rows.min(capacity) * n * 4) } else { 0 };
+    if mode != 2 || rows <= 64 { return legacy; }
+    let stride = rows.div_ceil(128) * 128;
+    let single = align(k * stride) + align(k / 128 * stride * 4);
+    single.max(legacy)
 }
 
 /// SM-independent owned arenas and candidate-local linear/attention scratch at readiness.
@@ -336,8 +344,8 @@ mod tests {
             2056, 128, 188).unwrap();
         assert_eq!(layout.weights.resident_bytes().unwrap() + arenas,
             1_835_700_096 - old_attention);
-        // The shared fc arena adds 128 rows * (20480 / 256) K tiles * 4 B.
-        assert_eq!(scratch,30_491_648 + 128 * 80 * 4 + new_attention);
+        // Wide W8A8 fc scratch is the single-pass arena: 20480*2048 + 160*2048*4.
+        assert_eq!(scratch, 43_253_760 + new_attention);
         let mut invalid = g; invalid.conv_group = 0;
         assert!(draft_workspace_bytes(invalid,capacity,8,true,188,2).is_err());
     }
@@ -404,6 +412,12 @@ mod tests {
         assert_eq!(wide, 1024 + 16 * 128 * 4 + 4096 * 128 * 2);
         assert_eq!(draft_fp8_scratch_bytes(128, 4096, 65536, 188, 2),
             wide + 32 * 128 * 4);
+        // The Flash fc shape at 2048 rows is the single-pass arena, on either SM count.
+        assert_eq!(draft_fp8_scratch_bytes(2048, 20480, 4096, 188, 2), 43_253_760);
+        assert_eq!(draft_fp8_scratch_bytes(2048, 20480, 4096, 170, 2), 43_253_760);
+        assert!(draft_fp8_scratch_bytes(64, 20480, 4096, 188, 2) < 43_253_760);
+        assert_ne!(draft_fp8_scratch_bytes(64, 20480, 4096, 188, 2),
+            draft_fp8_scratch_bytes(64, 20480, 4096, 170, 2));
     }
 
     #[test]

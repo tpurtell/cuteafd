@@ -1011,10 +1011,12 @@ mod tests {
         let attention: Vec<_> = [188, 170].into_iter().map(|sms|
             cache::draft_attention_workspace_bytes(8, 8, 2, 2056, 128, sms).unwrap()).collect();
         assert_eq!(owned, 1_835_700_096 - old_attention);
-        // The shared fc arena adds 128 rows * (20480 / 256) K tiles * 4 B.
+        // Wide W8A8 fc scratch is the single-pass arena (20480*2048 + 160*2048*4),
+        // the same on both SM counts. A 40,960-byte delta (one fc row-max arena)
+        // must not move admission except when GPU0's budget is exactly full.
+        let fp8_scratch = 43_253_760u64;
         let row_max_bytes = 128 * 80 * 4;
-        assert_eq!(scratch, [30_491_648 + row_max_bytes + attention[0],
-            28_394_496 + row_max_bytes + attention[1]]);
+        assert_eq!(scratch, [fp8_scratch + attention[0], fp8_scratch + attention[1]]);
         let cfg = GlmNextConfig::from_hf(&crate::plan::testing::glm5_flash_config(2)).unwrap();
         let mut input = inputs(&cfg, 2, inventory::PRO_TOTAL_BYTES);
         input.drafter_bytes = owned;
@@ -1023,13 +1025,13 @@ mod tests {
         assert_eq!(req.movables[0].allowed, [0]);
         assert_eq!(req.movables[0].conditional.iter().map(|c| (c.placement_gpu, c.demands[0].gpu,
             c.demands[0].category, c.demands[0].bytes, c.demands[0].basis)).collect::<Vec<_>>(),
-            [(0, 0, Category::Workspace, 30_491_648 + row_max_bytes + attention[0], Basis::Formula),
-             (1, 1, Category::Workspace, 28_394_496 + row_max_bytes + attention[1], Basis::Formula)]);
+            [(0, 0, Category::Workspace, fp8_scratch + attention[0], Basis::Formula),
+             (1, 1, Category::Workspace, fp8_scratch + attention[1], Basis::Formula)]);
         let actual = solve(&req).unwrap();
         assert_eq!(actual.movables, [(MovableId::Drafter, 0)]);
         assert_eq!(actual.items[0].iter().filter(|d| d.category == Category::Drafter).map(|d| d.bytes).sum::<u64>(), owned);
         assert_eq!(actual.items[0].iter().find(|d| d.group == "DFlash linear/attention scratch").unwrap().bytes,
-            30_491_648 + row_max_bytes + attention[0]);
+            fp8_scratch + attention[0]);
         assert!(actual.items[1].iter().all(|d| d.category != Category::Drafter && d.group != "DFlash linear/attention scratch"));
         let mut previous = req.clone();
         for candidate in &mut previous.movables[0].conditional {

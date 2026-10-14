@@ -21,12 +21,17 @@
 // f16 path at twice the rate. Its B fragments follow the packed weights' K
 // order, so the weights are read as packed: a lane's 16 bytes of a 16 x 32
 // tile hold k c, c + 1, c + 8, c + 9 (+16) of rows g and g + 8, which byte
-// permutes turn into the k32 A fragment of the same K order.
+// permutes turn into the k32 A fragment of the same K order. Past 64 rows that
+// W8A8 path is one 2D CTA grid over the M and N tiles with a single K split,
+// writing BF16 (or FP32) directly; 64 rows and below keep the split-K passes.
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
 #include <stdint.h>
+
+// Host-side launch counter for the wide single-pass path (the harness reads it).
+static int g_fp8_linear_launches = 0;
 
 namespace {
 
@@ -470,6 +475,89 @@ __global__ void __launch_bounds__(kWarps * 32) gemv_w8a8_kernel(
   }
 }
 
+// gemv_w8a8_kernel<16> over every M tile at once. One CTA owns kWarps N-tiles
+// of 16 rows and one 128-row M tile (GROUPS groups of 8). Grid (m_tiles,
+// n_ctas) so blockIdx.x walks M first: the CTAs that share an N tile, and
+// therefore the same streamed weights, are neighbors. K is not split; the
+// FP32 tile is the output.
+template <int GROUPS>
+__global__ void __launch_bounds__(kWarps * 32) gemv_w8a8_wide_kernel(
+    const uint4* __restrict__ wp, const float* __restrict__ scale, const uint2* __restrict__ xq,
+    const float* __restrict__ sxa, void* __restrict__ out, int out_f32, int rows, int n, int k, int stride,
+    int groups) {
+  const int lane = threadIdx.x & 31;
+  const int warp = threadIdx.x >> 5;
+  const int rt = int(blockIdx.y) * kWarps + warp;
+  const int tiles = n / 16;
+  if (rt >= tiles) return;
+  const int m_tile = int(blockIdx.x);
+  const int row_base = m_tile * (GROUPS * 8);
+  const int group_base = m_tile * GROUPS;
+  const int kbs = k / 128;
+  const int g = lane / 4, c = (lane % 4) * 2;
+  float acc[GROUPS][4];
+#pragma unroll
+  for (int i = 0; i < GROUPS; ++i) acc[i][0] = acc[i][1] = acc[i][2] = acc[i][3] = 0.0f;
+  const uint4* wrow = wp + size_t(rt) * (k / 32) * 32 + lane;
+  const float* s_lo = scale + size_t(rt * 16 + g) * kbs;
+  const float* s_hi = scale + size_t(rt * 16 + g + 8) * kbs;
+  uint4 a[4];
+  if (kbs > 0) {
+#pragma unroll
+    for (int kt = 0; kt < 4; ++kt) a[kt] = load_stream(wrow + size_t(kt) * 32);
+  }
+  for (int kb = 0; kb < kbs; ++kb) {
+    uint4 next[4];
+    if (kb + 1 < kbs) {
+#pragma unroll
+      for (int kt = 0; kt < 4; ++kt) next[kt] = load_stream(wrow + size_t((kb + 1) * 4 + kt) * 32);
+    }
+    float blk[GROUPS][4];
+#pragma unroll
+    for (int i = 0; i < GROUPS; ++i) blk[i][0] = blk[i][1] = blk[i][2] = blk[i][3] = 0.0f;
+#pragma unroll
+    for (int kt = 0; kt < 4; ++kt) {
+      const uint32_t af[4] = {__byte_perm(a[kt].x, a[kt].y, 0x5410), __byte_perm(a[kt].x, a[kt].y, 0x7632),
+                              __byte_perm(a[kt].z, a[kt].w, 0x5410), __byte_perm(a[kt].z, a[kt].w, 0x7632)};
+      const uint2* b = xq + (size_t(kb * 4 + kt) * groups + group_base) * 32 + lane;
+#pragma unroll
+      for (int i = 0; i < GROUPS; ++i) {
+        const uint2 bv = __ldg(b + i * 32);
+        mma_e4m3(blk[i], af, bv.x, bv.y);
+      }
+    }
+    const float lo = __ldg(s_lo + kb), hi = __ldg(s_hi + kb);
+    const float* sk = sxa + size_t(kb) * stride + row_base + c;
+#pragma unroll
+    for (int i = 0; i < GROUPS; ++i) {
+      const float2 sa = __ldg(reinterpret_cast<const float2*>(sk + i * 8));
+      acc[i][0] += blk[i][0] * (lo * sa.x);
+      acc[i][1] += blk[i][1] * (lo * sa.y);
+      acc[i][2] += blk[i][2] * (hi * sa.x);
+      acc[i][3] += blk[i][3] * (hi * sa.y);
+    }
+    if (kb + 1 < kbs) {
+#pragma unroll
+      for (int kt = 0; kt < 4; ++kt) a[kt] = next[kt];
+    }
+  }
+  const int row_lo = rt * 16 + g, row_hi = row_lo + 8;
+#pragma unroll
+  for (int i = 0; i < GROUPS; ++i) {
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+      const int m = row_base + i * 8 + c + (j & 1);
+      const int col = j < 2 ? row_lo : row_hi;
+      if (m >= rows) continue;
+      if (out_f32) {
+        static_cast<float*>(out)[size_t(m) * n + col] = acc[i][j];
+      } else {
+        static_cast<__nv_bfloat16*>(out)[size_t(m) * n + col] = __float2bfloat16(acc[i][j]);
+      }
+    }
+  }
+}
+
 // reduce_kernel for W8A8 partials, which carry their scales: the K splits'
 // sum in split order.
 __global__ void reduce_w8a8_kernel(const float* __restrict__ partial, void* __restrict__ out, int out_f32, int rows,
@@ -498,6 +586,25 @@ size_t wide_bytes(int rows, int k, int n, bool w8a8) {
          align256(size_t(k) * kWideRows * 2) +
          (w8a8 ? align256(size_t(k / 128) * kWideRows * sizeof(float)) : 0) +
          (splits > 1 ? align256(size_t(splits) * m * n * sizeof(float)) : 0);
+}
+
+// Rows of the single-pass W8A8 activation arena: one byte of E4M3 per element,
+// padded to a whole 128-row tile so the last tile's GROUPS=16 reads stay in range.
+int w8a8_stride(int rows) { return ((rows + kWideRows - 1) / kWideRows) * kWideRows; }
+
+size_t w8a8_single_bytes(int rows, int k) {
+  const size_t stride = size_t(w8a8_stride(rows));
+  return align256(size_t(k) * stride) + align256(size_t(k / 128) * stride * sizeof(float));
+}
+
+// Rows <= 64 keep the split-K arena. Wider W8A8 takes the single-pass arena,
+// or the split-K one when that is larger, so a buffer admitted for W8A8 still
+// covers the wide and W8A16 modes on the same shape.
+size_t w8a8_workspace(int rows, int k, int n) {
+  const size_t legacy = wide_bytes(rows, k, n, true);
+  if (rows <= kMaxRows) return legacy;
+  const size_t single = w8a8_single_bytes(rows, k);
+  return single > legacy ? single : legacy;
 }
 
 // cuteafd_fp8_linear's modes.
@@ -574,12 +681,41 @@ extern "C" int32_t cuteafd_fp8_w8a16_linear(const void* x, const void* packed, c
 
 namespace {
 
+// W8A8 past 64 rows: one pack of every row (padded to 128) and one GEMM.
+// The split-K scratch is not touched. Rows <= 64 do not call this.
+int32_t run_w8a8_single(const void* x, const void* packed, const void* scale, void* out, int32_t out_f32,
+                        int32_t rows, int32_t k, int32_t n, void* workspace, size_t workspace_bytes, void* stream) {
+  if (rows <= kMaxRows || n < 16 || n % 16 || k < 128 || k % 128) return cudaErrorInvalidValue;
+  if (workspace_bytes < w8a8_workspace(rows, k, n)) return cudaErrorInvalidValue;
+  const int stride = w8a8_stride(rows);
+  const int groups = stride / 8;
+  const int m_tiles = stride / kWideRows;
+  const int n_ctas = (n / 16 + kWarps - 1) / kWarps;
+  if (m_tiles > 65535 || groups > 65535 || n_ctas > 65535) return cudaErrorInvalidValue;
+  const cudaStream_t s = static_cast<cudaStream_t>(stream);
+  uint8_t* ws = static_cast<uint8_t*>(workspace);
+  uint2* xq = reinterpret_cast<uint2*>(ws);
+  float* sxa = reinterpret_cast<float*>(ws + align256(size_t(k) * size_t(stride)));
+  ++g_fp8_linear_launches;
+  pack_x_e4m3_kernel<<<dim3(k / 128, groups), 32, 0, s>>>(
+      static_cast<const __nv_bfloat16*>(x), xq, sxa, rows, k, groups, stride);
+  ++g_fp8_linear_launches;
+  gemv_w8a8_wide_kernel<16><<<dim3(m_tiles, n_ctas), kWarps * 32, 0, s>>>(
+      static_cast<const uint4*>(packed), static_cast<const float*>(scale), xq, sxa, out, out_f32, rows, n, k, stride,
+      groups);
+  return cudaGetLastError();
+}
+
 // out = x @ W^T in passes of kWideRows rows; with `w8a8`, a pass of more than
 // kW8a16Rows rows takes E4M3 activations. A pass of up to kMaxRows rows on the
 // f16 path is one chunk of cuteafd_fp8_w8a16_linear and runs there (the same
 // kernels and bits); the wide passes launch the kernels above at 16 groups.
+// W8A8 with more than kMaxRows rows is one split-free 2D grid instead.
 int32_t run_wide(const void* x, const void* packed, const void* scale, void* out, int32_t out_f32, int32_t rows,
                  int32_t k, int32_t n, bool w8a8, void* workspace, size_t workspace_bytes, void* stream) {
+  if (w8a8 && rows > kMaxRows) {
+    return run_w8a8_single(x, packed, scale, out, out_f32, rows, k, n, workspace, workspace_bytes, stream);
+  }
   if (rows < 1 || n < 16 || n % 16 || k < 128 || k % 128) return cudaErrorInvalidValue;
   if (workspace_bytes < wide_bytes(rows, k, n, w8a8)) return cudaErrorInvalidValue;
   const cudaStream_t s = static_cast<cudaStream_t>(stream);
@@ -647,16 +783,22 @@ int32_t run_wide(const void* x, const void* packed, const void* scale, void* out
 // Scratch bytes cuteafd_fp8_linear needs in `mode`: 0 the W8A16 passes of 64
 // rows above (cuteafd_fp8_w8a16_workspace), 1 wide: passes of 128 rows with
 // the same bits, 2 W8A8: the f16 path up to 8 rows (the same bits), E4M3
-// activations past them, in passes of 128 rows; 0 for an unknown mode or shape.
+// activations past them. Past 64 rows mode 2 is one split-free pass and its
+// arena is the larger of that pass and the split-K pass. 0 for an unknown
+// mode or shape.
 extern "C" size_t cuteafd_fp8_linear_workspace(int32_t rows, int32_t k, int32_t n, int32_t mode) {
   if (n < 16 || k < 128) return 0;
   switch (mode) {
     case kModeW8a16: return cuteafd_fp8_w8a16_workspace(rows, k, n);
     case kModeWide: return wide_bytes(rows, k, n, false);
-    case kModeW8a8: return wide_bytes(rows, k, n, true);
+    case kModeW8a8: return w8a8_workspace(rows, k, n);
     default: return 0;
   }
 }
+
+extern "C" void cuteafd_fp8_linear_reset_launches(void) { g_fp8_linear_launches = 0; }
+
+extern "C" int32_t cuteafd_fp8_linear_launch_count(void) { return g_fp8_linear_launches; }
 
 // cuteafd_fp8_w8a16_linear in `mode` (see cuteafd_fp8_linear_workspace); mode
 // 0 is cuteafd_fp8_w8a16_linear.
