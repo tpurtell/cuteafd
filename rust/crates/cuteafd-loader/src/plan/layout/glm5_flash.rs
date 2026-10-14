@@ -34,8 +34,8 @@ pub(super) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
         }
         let representation = options.glmf_representation;
         let state = options.glmf_kda_state;
-        anyhow::ensure!(state == crate::serving_capacity::GlmfKdaState::F32 || (!representation.kda_fp8 && ranks == 1),
-            "BF16 KDA state needs BF16 projections (--kda-fp8 off) on one GPU; W8+S16 needs a new export");
+        anyhow::ensure!(state == crate::serving_capacity::GlmfKdaState::F32 || ranks == 1,
+            "BF16 KDA state needs one GPU; head-split BF16 state is not yet qualified");
         notes.push(format!("KDA projections: {}, state: {state:?}; shared target/draft head: {}",
             if representation.kda_fp8 { "FP8" } else { "BF16" }, if representation.fp8_head { "FP8" } else { "BF16" }));
         let mut resident = resident::resident_weights(checkpoint, &cfg, cfg.layers, ranks, representation)

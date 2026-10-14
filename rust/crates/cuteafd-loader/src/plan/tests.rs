@@ -1459,7 +1459,8 @@ fn glm5_flash_layout_charges_the_engine_step_workspaces_and_headroom() {
     };
     let mut s16 = manifest.clone();
     for (name, bytes) in [("glmf_kda_s16_m64", 10_526_720), ("glmf_kda_s16_m4096", 782_236_672),
-        ("glmf_kda_s16t_m4096", 782_236_672)] {
+        ("glmf_kda_s16t_m4096", 782_236_672), ("glmf_kda_w8_s16_m64", 10_526_720),
+        ("glmf_kda_w8_s16_m4096", 782_236_672), ("glmf_kda_w8_s16t_m4096", 782_236_672)] {
         s16["programs"].as_array_mut().unwrap().push(json!({"name":name,"scratch_bytes_at_capacity":{"scratch":bytes}}));
     }
     let s16_path = dir.path().join("S16.json");
@@ -1472,7 +1473,18 @@ fn glm5_flash_layout_charges_the_engine_step_workspaces_and_headroom() {
         .filter(|i| i.category == Category::Kv && i.group != "MLA pools").map(|i| i.bytes).sum::<u64>();
     assert!(state_bytes(&f32) > state_bytes(&bf16));
     assert_eq!(state_bytes(&bf16), state_bytes(&tile));
-    assert!(planned(GlmfKdaState::Bf16, true, &s16_path).notes.iter().any(|n| n.contains("W8+S16")));
+    let w8_s16 = planned(GlmfKdaState::Bf16, true, &s16_path);
+    assert!(!w8_s16.devices[0].items.is_empty(), "{:?}", w8_s16.notes);
+    assert_eq!(state_bytes(&w8_s16), state_bytes(&bf16));
+    let weights = |m: &cuteafd_core::memory_layout::MemoryLayout| m.devices[0].items.iter()
+        .filter(|i| i.category == Category::Weights).map(|i| i.bytes).sum::<u64>();
+    assert!(weights(&w8_s16) < weights(&bf16));
+    let mut missing_s16 = s16.clone();
+    missing_s16["programs"].as_array_mut().unwrap().retain(|p| p["name"] != "glmf_kda_w8_s16_m4096");
+    let missing_s16_path = dir.path().join("MISSING-W8-S16.json");
+    std::fs::write(&missing_s16_path, missing_s16.to_string()).unwrap();
+    assert!(planned(GlmfKdaState::Bf16, true, &missing_s16_path).notes.iter()
+        .any(|n| n.contains("lacks the requested step scratch")));
     let mut missing = s16.clone();
     missing["programs"].as_array_mut().unwrap().retain(|p| p["name"] != "glmf_kda_w8_m4096");
     let missing_path = dir.path().join("MISSING-W8.json");
