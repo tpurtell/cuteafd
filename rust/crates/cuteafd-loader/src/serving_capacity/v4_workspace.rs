@@ -1,6 +1,6 @@
 //! Header/geometry-only counterpart of V4 `workspace_here`/`step_buffers`.
 //! Device allocations are rounded to at least 256 bytes exactly as in the
-//! engine. Prefill has two lanes and decode one; both arenas stay resident.
+//! engine. Layer-owned attention also retains two independent decode lanes.
 use super::{product, sum, CacheGeometryError};
 use crate::families::deepseek_v4::DeepseekV4Config;
 use serde::{Deserialize, Serialize};
@@ -77,6 +77,7 @@ pub struct V4WorkspaceRank {
     /// custom manifests with fewer than 64 rows.
     pub prefill_lane_table_unit_bytes: u64,
     pub decode_lane_table_unit_bytes: u64,
+    pub decode_lanes: u64,
 }
 
 impl V4WorkspaceRank {
@@ -96,11 +97,8 @@ impl V4WorkspaceRank {
                         .max(256),
                     ],
                 )?,
-                product(
-                    "V4 decode pool table",
-                    &[units, self.decode_lane_table_unit_bytes],
-                )?
-                .max(256),
+                product("V4 decode pool tables", &[self.decode_lanes,
+                    product("V4 decode lane table", &[units, self.decode_lane_table_unit_bytes])?.max(256)])?,
             ],
         )
     }
@@ -179,6 +177,13 @@ pub fn deepseek_v4_workspace_heads(
     }).collect())
 }
 
+/// One shared selector for admission and every target/draft workspace initializer.
+pub fn deepseek_v4_decode_lanes(requested: Option<AttentionPlacement>, modes: Option<&[LayerMode]>) -> usize {
+    let layers = modes.map_or(requested == Some(AttentionPlacement::Layers), |modes|
+        modes.iter().any(|mode| matches!(mode, LayerMode::Whole { ffn: crate::placement::FfnMode::Split, .. })));
+    if layers { 2 } else { 1 }
+}
+
 pub fn deepseek_v4_workspace_geometry(
     cfg: &DeepseekV4Config,
     prefill_rows: u64,
@@ -202,6 +207,7 @@ pub fn deepseek_v4_workspace_geometry_for_attention(
     modes: Option<&[LayerMode]>,
 ) -> Result<Vec<V4WorkspaceRank>, CacheGeometryError> {
     let heads = deepseek_v4_workspace_heads(cfg.n_heads, ranks, requested, modes)?;
+    let decode_lanes = deepseek_v4_decode_lanes(requested, modes) as u64;
     if ![1, 2].contains(&ranks)
         || prefill_rows == 0
         || decode_rows == 0
@@ -223,7 +229,7 @@ pub fn deepseek_v4_workspace_geometry_for_attention(
     (0..ranks)
         .map(|rank| {
             let prefill = step_with_heads(cfg, prefill_rows, 2, width, rank, ranks, scratch, heads[rank] as u64)?;
-            let decode = step_with_heads(cfg, decode_rows, 1, width, rank, ranks, scratch, heads[rank] as u64)?;
+            let decode = step_with_heads(cfg, decode_rows, decode_lanes, width, rank, ranks, scratch, heads[rank] as u64)?;
             Ok(V4WorkspaceRank {
                 fixed_device_bytes: sum("V4 prefill/decode workspaces", &[prefill.0, decode.0])?,
                 pool_unit_device_bytes: sum(
@@ -236,6 +242,7 @@ pub fn deepseek_v4_workspace_geometry_for_attention(
                     &[prefill_rows, 4],
                 )?,
                 decode_lane_table_unit_bytes: product("V4 decode table slope", &[decode_rows, 4])?,
+                decode_lanes,
             })
         })
         .collect()
@@ -495,16 +502,57 @@ mod tests {
                 LayerMode::HeadSplit, LayerMode::Whole { gpu: 1, ffn: FfnMode::Split }];
             let layers = geometry(Some(AttentionPlacement::Layers), None);
             assert_eq!(geometry(None, Some(&modes)), layers);
-            assert_eq!(layers[0], baseline[0]);
-            let extra = (4096 + 64) * cfg.n_heads as u64 / 2 * 512 * 2 * 2;
-            assert_eq!(extra, if pro { 545_259_520 } else { 272_629_760 });
-            assert_eq!(layers[1].fixed_device_bytes - baseline[1].fixed_device_bytes, extra);
-            assert_eq!(layers[1].pool_unit_device_bytes, baseline[1].pool_unit_device_bytes);
-            assert_eq!(layers[1].pinned_host_bytes, baseline[1].pinned_host_bytes);
-            assert_eq!(geometry(None, Some(&modes[..2])), baseline);
+            for rank in 0..2 {
+                let full = cfg.n_heads as u64;
+                let owner_decode = step_with_heads(&cfg, 64, 2, 8192, rank, 2, scratch, full).unwrap();
+                let base_decode = step_with_heads(&cfg, 64, 1, 8192, rank, 2, scratch,
+                    full / if rank == 0 { 1 } else { 2 }).unwrap();
+                let wider_prefill = if rank == 0 { 0 } else { 4096 * full / 2 * 512 * 2 * 2 };
+                assert_eq!(layers[rank].fixed_device_bytes - baseline[rank].fixed_device_bytes,
+                    wider_prefill + owner_decode.0 - base_decode.0);
+                assert_eq!(layers[rank].pool_unit_device_bytes - baseline[rank].pool_unit_device_bytes, 64 * 4);
+                assert_eq!(layers[rank].decode_lanes, 2);
+                assert_eq!(layers[rank].pinned_host_bytes, baseline[rank].pinned_host_bytes);
+                assert_eq!(layers[rank].device_bytes(1).unwrap() - layers[rank].fixed_device_bytes,
+                    2 * 4096 * 4 + 2 * 256);
+            }
+            let first_owner = geometry(None, Some(&modes[..2]));
+            assert_eq!(first_owner[0], layers[0]);
+            assert!(first_owner[1].fixed_device_bytes < layers[1].fixed_device_bytes);
         }
         assert!(deepseek_v4_workspace_heads(64, 1, None,
             Some(&[LayerMode::Whole { gpu: 1, ffn: FfnMode::Owner }])).is_err());
+    }
+
+    #[test]
+    fn owner_decode_lane_selector_and_draft_taps_match_allocation_floors() {
+        use crate::placement::FfnMode;
+        assert_eq!(deepseek_v4_decode_lanes(None, None), 1);
+        assert_eq!(deepseek_v4_decode_lanes(Some(AttentionPlacement::Heads), None), 1);
+        assert_eq!(deepseek_v4_decode_lanes(Some(AttentionPlacement::Context), None), 1);
+        assert_eq!(deepseek_v4_decode_lanes(Some(AttentionPlacement::Layers), None), 2);
+        let owner = [LayerMode::Whole { gpu: 0, ffn: FfnMode::Split }];
+        assert_eq!(deepseek_v4_decode_lanes(None, Some(&owner)), 2);
+        assert_eq!(deepseek_v4_decode_lanes(Some(AttentionPlacement::Layers),
+            Some(&[LayerMode::HeadSplit])), 1, "frozen modes win over the requested mode");
+        assert_eq!(deepseek_v4_decode_lanes(None,
+            Some(&[LayerMode::Whole { gpu: 0, ffn: FfnMode::Owner }])), 1);
+        for pro in [false, true] {
+            let mut cfg = config(pro);
+            let scratch = V4WorkspaceScratch::default();
+            let geometry = |cfg: &DeepseekV4Config| deepseek_v4_workspace_geometry_for_attention(
+                cfg, 1, 1, 128, 2, scratch, Some(AttentionPlacement::Layers), None).unwrap();
+            let off = geometry(&cfg);
+            cfg.n_mtp_layers = 3;
+            let on = geometry(&cfg);
+            let taps = cfg.dspark_target_layer_ids.len() as u64 * cfg.dim as u64 * 2;
+            let shared = [cfg.dim as u64 * 2, cfg.dim as u64 * 4, 4, 4, 256 * 8, 4];
+            let extra = 4 * (taps.max(256) - 256)
+                + 2 * shared.into_iter().map(|bytes| bytes.max(256) - 256).sum::<u64>();
+            assert_eq!(on[0].device_bytes(1).unwrap() - off[0].device_bytes(1).unwrap(), extra);
+            assert_eq!(on[1], off[1], "draft workspace remains rank0-only");
+            assert_eq!(on[0].device_bytes(1).unwrap() - on[0].fixed_device_bytes, 4 * 256);
+        }
     }
 
     #[test]

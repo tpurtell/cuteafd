@@ -2,9 +2,51 @@
 //! not their own ordering of peer pushes, waits or LSE operands.
 use super::context::{combine_order, slot, ContextExchange};
 use super::{hop::HopLink, PeerExchange, DIRECT};
-use anyhow::{ensure, Result};
+use anyhow::{ensure, Context, Result};
 use cuteafd_loader::placement::{FfnMode, Hop, HopPoint, LayerExecutionPlan, LayerMode, Placement};
 use std::ffi::c_void;
+
+/// Private recurrent state and paged cache at a request's append frontier.
+/// Full prefix pages may be shared; writable pages may not alias any other
+/// request's cache, including its read-only prefix.
+pub(crate) struct RequestSpan<'a> {
+    pub state: usize,
+    pub pages: &'a [u32],
+    pub start: usize,
+    pub rows: usize,
+}
+
+/// Bind whole requests to contiguous lanes, preserving caller row/logit order.
+pub(crate) fn independent_request_lanes(spans: &[RequestSpan<'_>], page_rows: usize,
+    lanes: usize, capacity: usize) -> Result<Vec<std::ops::Range<usize>>> {
+    ensure!(!spans.is_empty() && page_rows > 0 && (1..=2).contains(&lanes),
+        "independent requests need positive page geometry and one or two lanes");
+    let mut total = 0usize;
+    for (index, span) in spans.iter().enumerate() {
+        ensure!(span.rows > 0, "independent request {index} has no rows");
+        let end = span.start.checked_add(span.rows).context("request frontier overflow")?;
+        let writes = span.pages.get(span.start / page_rows..end.div_ceil(page_rows))
+            .context("request has no writable cache tail")?;
+        total = total.checked_add(span.rows).context("request row extent overflow")?;
+        for (other_index, other) in spans.iter().enumerate() {
+            if index == other_index { continue; }
+            ensure!(span.state != other.state, "independent requests share recurrent state");
+            ensure!(!writes.iter().any(|page| other.pages.contains(page)),
+                "independent requests alias a writable cache page");
+        }
+    }
+    ensure!(total <= capacity, "independent request rows exceed admitted capacity");
+    if lanes == 1 || spans.len() == 1 { return Ok(vec![0..spans.len()]); }
+    let mut prefix = 0usize;
+    let mut split = 1;
+    let mut imbalance = usize::MAX;
+    for (index, span) in spans[..spans.len() - 1].iter().enumerate() {
+        prefix += span.rows;
+        let delta = prefix.abs_diff(total - prefix);
+        if delta < imbalance { split = index + 1; imbalance = delta; }
+    }
+    Ok(vec![0..split, split..spans.len()])
+}
 
 #[derive(Clone, Copy)]
 pub(crate) struct Query {
@@ -431,6 +473,33 @@ fn validate_stack(placement: &Placement) -> Result<()> {
 mod tests {
     use super::*;
     use std::cell::RefCell;
+
+    #[test]
+    fn independent_requests_preserve_order_and_allow_only_read_only_aliases() {
+        let a = [3, 7, 11];
+        let b = [3, 9, 13];
+        let c = [17, 19];
+        let spans = [RequestSpan { state: 2, pages: &a, start: 256, rows: 2 },
+            RequestSpan { state: 7, pages: &b, start: 258, rows: 5 },
+            RequestSpan { state: 9, pages: &c, start: 3, rows: 1 }];
+        assert_eq!(independent_request_lanes(&spans, 256, 2, 8).unwrap(), vec![0..1, 1..3]);
+        assert_eq!(independent_request_lanes(&spans, 256, 1, 8).unwrap(), vec![0..3]);
+        assert!(independent_request_lanes(&spans, 256, 2, 7).is_err());
+        let ordered: Vec<_> = independent_request_lanes(&spans, 256, 2, 8).unwrap()
+            .into_iter().flat_map(|range| range.flat_map(|i| std::iter::repeat_n(i, spans[i].rows))).collect();
+        assert_eq!(ordered, vec![0, 0, 1, 1, 1, 1, 1, 2]);
+        assert!(independent_request_lanes(&[RequestSpan { state: 2, pages: &a, start: 256, rows: 1 },
+            RequestSpan { state: 2, pages: &b, start: 258, rows: 1 }], 256, 2, 8).is_err());
+        // A write crossing into page11 must not collide with another request's
+        // read-only page11. Merely comparing the two writable tails misses it.
+        let other = [11, 9];
+        assert!(independent_request_lanes(&[RequestSpan { state: 2, pages: &a, start: 511, rows: 2 },
+            RequestSpan { state: 7, pages: &other, start: 256, rows: 1 }], 256, 2, 8).is_err());
+        assert!(independent_request_lanes(&[RequestSpan { state: 2, pages: &a, start: 255, rows: 2 },
+            RequestSpan { state: 7, pages: &b, start: 258, rows: 1 }], 256, 2, 8).is_err());
+        assert!(independent_request_lanes(&[RequestSpan { state: 2, pages: &a, start: usize::MAX, rows: 1 }],
+            256, 2, 8).is_err());
+    }
 
     #[test]
     fn ffn_wave_tickets_do_not_release_owners_and_reject_stale_bindings() {

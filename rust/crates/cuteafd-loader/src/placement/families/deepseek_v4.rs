@@ -209,13 +209,16 @@ pub fn fixed_demands(inputs: &V4Inputs<'_>) -> Result<(Vec<Demand>, Vec<u64>, Ve
         .map_err(|_| PlacementError::Inventory("V4 C4 state geometry"))?;
     let c4_active = c4_active.checked_mul(c4_layers).ok_or(PlacementError::Overflow("V4 C4 active state"))?;
     let c4_mark = c4_mark.checked_mul(c4_layers).ok_or(PlacementError::Overflow("V4 C4 marks"))?;
-    let tables = PREFILL_LANES * inputs.prefill_rows + inputs.decode_rows;
-    let table_bytes = tables.checked_mul(4).ok_or(PlacementError::Overflow("V4 lane tables"))?;
+    let decode_lanes = crate::serving_capacity::deepseek_v4_decode_lanes(inputs.attention, None) as u64;
+    let tables = PREFILL_LANES * inputs.prefill_rows + decode_lanes * inputs.decode_rows;
+    let fallback_table_bytes = tables.checked_mul(4).ok_or(PlacementError::Overflow("V4 lane tables"))?;
     let mut demands = Vec::new();
     let mut overhead = Vec::new();
     let mut reserves = Vec::new();
     for (rank, cache) in geometry.ranks.iter().enumerate() {
         let gpu = rank as u8;
+        let table_bytes = inputs.workspace.as_ref().and_then(|w| w.get(rank))
+            .map_or(fallback_table_bytes, |w| w.pool_unit_device_bytes);
         let role = if gpus == 1 { 0 } else if rank == 0 { 1 } else { 2 };
         let mul = |a: u64, b: u64, what| a.checked_mul(b).ok_or(PlacementError::Overflow(what));
         let fixed_active = cache.active_state_per_sequence_bytes.checked_sub(c4_active)

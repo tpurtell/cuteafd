@@ -389,6 +389,46 @@ mod tests {
     }
 
     #[test]
+    fn independent_target_lanes_keep_frontiers_rings_and_private_tails() -> anyhow::Result<()> {
+        use crate::shared::peer_split::attention::{independent_request_lanes, RequestSpan};
+        use super::super::pool::Placement;
+        let shape = PoolShape::new(16, 4096, 32);
+        let mut a = Placement::new(2, vec![3, 7, 11]);
+        let mut b = Placement::new(7, vec![3, 9, 13]);
+        a.len = 256;
+        b.len = 258;
+        let requests = [(&a, a.len, 2), (&b, b.len, 5)];
+        let spans = requests.iter().map(|(p, start, rows)| RequestSpan {
+            state: p.state, pages: &p.units, start: *start, rows: *rows,
+        }).collect::<Vec<_>>();
+        let ranges = independent_request_lanes(&spans, SOURCE_PAGE_TOKENS, 2, 64)?;
+        assert_eq!(ranges, vec![0..1, 1..2]);
+        let whole = verify_step(&requests, &shape, 512, 8)?;
+        let separate = ranges.iter().map(|range| verify_step(&requests[range.clone()], &shape, 512, 8))
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        assert_eq!(separate.iter().flat_map(|t| t.positions.iter().copied()).collect::<Vec<_>>(), whole.positions);
+        assert_eq!(separate.iter().flat_map(|t| t.main_slots.iter().copied()).collect::<Vec<_>>(), whole.main_slots);
+        assert_eq!(separate.iter().flat_map(|t| t.c4_page_table.iter().copied()).collect::<Vec<_>>(), whole.c4_page_table);
+        assert_eq!(separate[0].c4_page_table, [3, 7, 11].repeat(2));
+        assert_eq!(separate[1].c4_page_table, [3, 9, 13].repeat(5));
+        assert!(separate[0].main_slots.iter().all(|slot| !separate[1].main_slots.contains(slot)));
+        let values = |t: &StepTables, field| t.c4_tables.iter().find(|(name, _)| *name == field).unwrap().1.clone();
+        for field in ["compressed_slots", "group_source_positions"] {
+            let active = |t: &StepTables| values(t, field)[..values(t, "active_groups")[0] as usize].to_vec();
+            assert_eq!(separate.iter().flat_map(active).collect::<Vec<_>>(), active(&whole));
+        }
+        assert_eq!(values(&separate[0], "state_sequence_ids")[0], 2);
+        assert_eq!(values(&separate[1], "state_sequence_ids")[0], 7);
+        assert_eq!(&values(&separate[0], "sequence_offsets")[..2], &[0, 2]);
+        assert_eq!(&values(&separate[1], "sequence_offsets")[..2], &[0, 5]);
+        let decoded = decode_step(&[(&a, a.len), (&b, b.len)], &shape, 512, 8)?;
+        let lane0 = decode_step(&[(&a, a.len)], &shape, 512, 8)?;
+        let lane1 = decode_step(&[(&b, b.len)], &shape, 512, 8)?;
+        assert_eq!([lane0.main_slots, lane1.main_slots].concat(), decoded.main_slots);
+        Ok(())
+    }
+
+    #[test]
     fn c4_context_decode_and_verify_tables_preserve_replicated_state() -> anyhow::Result<()> {
         let shape = PoolShape::new(2, 4096, 16);
         let placement = super::super::pool::Placement::new(0, vec![4, 9, 0, 3]);
