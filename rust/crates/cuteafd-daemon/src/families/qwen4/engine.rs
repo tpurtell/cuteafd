@@ -1257,7 +1257,7 @@ impl<'a> Qwen4Engine<'a> {
             "Qwen Spark-free dual execution requires TP2 halves at every routed layer");
         ensure!(placement.layers.iter().map(|layer| layer.mode).eq(modes.iter().copied()),
             "Qwen executor attention owners disagree with placement");
-        let hops = cuteafd_loader::placement::plan_hops(&modes, &spec);
+        let hops = cuteafd_loader::placement::plan_hops(&modes, &spec)?;
         ensure!(placement.hops == hops && hops.len() == 2, "Qwen placement must charge cutover and exit");
         let _scope = self.gdn_banks[0].device.enter()?;
         for bank in &self.gdn_banks {

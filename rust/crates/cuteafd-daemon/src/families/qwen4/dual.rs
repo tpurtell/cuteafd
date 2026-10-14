@@ -136,7 +136,7 @@ impl Opened {
         engine.w8a8_prefill = args.fp8_prefill_w8a8;
         if args.planner_graph_modes.is_some() { engine.enable_startup_graphs(); }
         engine.set_tp2(pair, experts.wire, draft, &placement, cuteafd_loader::placement::HopSpec {
-            row_bytes: self.cfg.hc_width() as u64 * 2, rows: rows as u64, lanes: 1, entry_gpu: 0, head_gpu: 0 })?;
+            row_bytes: self.cfg.hc_width() as u64 * 2, rows: rows as u64, lanes: 1, entry_gpu: 0, head_gpu: 0, terminal: cuteafd_loader::placement::TerminalHome::AttentionOwner })?;
         if let Some(budget) = args.l2.budget(&self.library, crate::shared::l2_prefetch::OTHER_DEFAULT)? {
             engine.l2 = Some(crate::shared::l2_prefetch::L2Prefetch::new(&self.library, budget, &engine.decode_read_order())?);
         }

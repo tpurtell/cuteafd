@@ -342,7 +342,7 @@ pub fn request(inputs: &GlmInputs<'_>) -> Result<PlacementRequest, PlacementErro
         onboard: inputs.onboard, expert_gpus: usize::from(!inputs.experts.is_empty()),
         policy: LayerPolicy { default: vec![LayerMode::HeadSplit, LayerMode::Whole { gpu: 0, ffn: FfnMode::Owner }], by_kind: Vec::new(), ..LayerPolicy::default() },
         hops: HopSpec { row_bytes: cfg.hidden as u64 * 2, rows: inputs.prefill_rows.max(DECODE_ROWS),
-            lanes: inputs.prefill_lanes, entry_gpu: 0, head_gpu: 0 },
+            lanes: inputs.prefill_lanes, entry_gpu: 0, head_gpu: 0, terminal: if gpus == 2 { TerminalHome::Replicated } else { TerminalHome::AttentionOwner } },
         // `context` is the recorded default where the build carries its programs.
         executor: if inputs.context.is_some() { super::GLM5 }
             else { ExecutorModes { attention: AttentionPlacement::Heads, ..super::GLM5 } },

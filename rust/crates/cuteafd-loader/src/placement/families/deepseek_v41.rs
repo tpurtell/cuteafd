@@ -64,7 +64,7 @@ pub fn request(
         onboard,
         expert_gpus: gpus,
         policy: LayerPolicy::default(),
-        hops: HopSpec::default(),
+        hops: HopSpec { row_bytes: 0, rows: 0, lanes: 0, entry_gpu: 0, head_gpu: 0, terminal: TerminalHome::AttentionOwner },
         executor: super::DEEPSEEK_V41,
     }
 }

@@ -171,8 +171,8 @@ mod cuda_tests {
         // SAFETY: every CUDA owner below is dropped before the library.
         let library = unsafe { NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? };
         let (w0, w1) = (LayerMode::Whole { gpu: 0, ffn: FfnMode::Owner }, LayerMode::Whole { gpu: 1, ffn: FfnMode::Owner });
-        let spec = HopSpec { row_bytes: 4 * 64 * 2, rows: 32, lanes: 2, entry_gpu: 0, head_gpu: 0 };
-        let hops = plan_hops(&[w0, w0, w1, w1], &spec);
+        let spec = HopSpec { row_bytes: 4 * 64 * 2, rows: 32, lanes: 2, entry_gpu: 0, head_gpu: 0, terminal: cuteafd_loader::placement::TerminalHome::AttentionOwner };
+        let hops = plan_hops(&[w0, w0, w1, w1], &spec).unwrap();
         assert_eq!(hops.len(), 2);
         library.cuda_set_device(0)?;
         let mut ranks = [RankDevice { device: 0, stream: std::ptr::null_mut() }, RankDevice { device: 1, stream: std::ptr::null_mut() }];

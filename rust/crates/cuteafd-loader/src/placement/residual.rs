@@ -66,8 +66,19 @@ impl Hop {
     }
 }
 
+/// Explicit final-layer output contract, before any exit hop to the head.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TerminalHome {
+    /// Split FFN postprocessing produces both residual copies.
+    Replicated,
+    /// Split FFN postprocessing runs only on the head GPU.
+    Head,
+    /// Owner FFN postprocessing leaves the residual on the last attention owner.
+    AttentionOwner,
+}
+
 /// What the family's executor moves per hop; part of the request.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HopSpec {
     /// Bytes per row of one hop (0: the family has no hops to charge).
     pub row_bytes: u64,
@@ -79,6 +90,37 @@ pub struct HopSpec {
     pub entry_gpu: u8,
     /// The GPU the head runs on after the last layer.
     pub head_gpu: u8,
+    /// Required even when no hop storage is needed; no inferred terminal default.
+    pub terminal: TerminalHome,
+}
+
+impl HopSpec {
+    fn terminal_home(&self, mode: LayerMode) -> Result<ResidualHome, LayerPlanError> {
+        match (self.terminal, mode) {
+            (TerminalHome::AttentionOwner, LayerMode::Whole { gpu, ffn: FfnMode::Owner }) => Ok(ResidualHome::Owned(gpu)),
+            (TerminalHome::Head, LayerMode::Whole { gpu, ffn: FfnMode::Owner }) if gpu == self.head_gpu => Ok(ResidualHome::Owned(gpu)),
+            (TerminalHome::Replicated, LayerMode::HeadSplit | LayerMode::ContextSplit
+                | LayerMode::Whole { ffn: FfnMode::Split, .. }) => Ok(ResidualHome::Replicated),
+            (TerminalHome::Head, LayerMode::HeadSplit | LayerMode::ContextSplit
+                | LayerMode::Whole { ffn: FfnMode::Split, .. }) => Ok(ResidualHome::Owned(self.head_gpu)),
+            _ => Err(LayerPlanError::Terminal { contract: self.terminal, mode }),
+        }
+    }
+}
+
+/// The same boundary homes are validated by admission and the runtime binding.
+pub fn residual_homes(modes: &[LayerMode], spec: &HopSpec) -> Result<Vec<ResidualHome>, LayerPlanError> {
+    if spec.entry_gpu >= 2 || spec.head_gpu >= 2 { return Err(LayerPlanError::Geometry); }
+    let mut homes = vec![ResidualHome::Owned(spec.entry_gpu)];
+    for (layer, &mode) in modes.iter().enumerate() {
+        if let LayerMode::Whole { gpu, .. } = mode {
+            if gpu >= 2 { return Err(LayerPlanError::Owner { layer, gpu }); }
+        }
+        let home = if layer + 1 == modes.len() { spec.terminal_home(mode)? }
+            else { homes.last().expect("seeded").transition(mode).home };
+        homes.push(home);
+    }
+    Ok(homes)
 }
 
 /// Receive slots per lane on a destination GPU: hops alternate between two
@@ -144,7 +186,8 @@ impl ResidualHome {
 
 /// Every hop of a stack of `modes` (in layer order), from the embedding on
 /// `spec.entry_gpu` to the head on `spec.head_gpu`. One GPU never hops.
-pub fn plan_hops(modes: &[LayerMode], spec: &HopSpec) -> Vec<Hop> {
+pub fn plan_hops(modes: &[LayerMode], spec: &HopSpec) -> Result<Vec<Hop>, LayerPlanError> {
+    let homes = residual_homes(modes, spec)?;
     let hop = |at, (from, to, kind)| Hop { at, from, to, kind, row_bytes: spec.row_bytes };
     let mut hops = Vec::new();
     let mut home = ResidualHome::Owned(spec.entry_gpu);
@@ -156,14 +199,14 @@ pub fn plan_hops(modes: &[LayerMode], spec: &HopSpec) -> Vec<Hop> {
         if let Some((from, to)) = step.after_attention {
             hops.push(hop(HopPoint::AfterAttention(layer), (from, to, HopKind::Broadcast)));
         }
-        home = step.home;
+        home = homes[layer + 1];
     }
     if !home.holds(spec.head_gpu) {
         if let ResidualHome::Owned(owner) = home {
             hops.push(hop(HopPoint::Exit, (owner, spec.head_gpu, HopKind::Boundary)));
         }
     }
-    hops
+    Ok(hops)
 }
 
 /// Invalid runtime binding of the solver's ownership decision.
@@ -173,6 +216,8 @@ pub enum LayerPlanError {
     Geometry,
     #[error("layer {layer} has invalid owner {gpu}")]
     Owner { layer: usize, gpu: u8 },
+    #[error("terminal residual contract {contract:?} is incompatible with final mode {mode:?}")]
+    Terminal { contract: TerminalHome, mode: LayerMode },
     #[error("runtime residual homes differ from the planner")]
     Residual,
     #[error("runtime residual hops differ from the planner")]
@@ -205,12 +250,9 @@ impl LayerExecutionPlan {
                 if gpu >= 2 { return Err(LayerPlanError::Owner { layer, gpu }); }
             }
         }
-        let mut homes = vec![ResidualHome::Owned(spec.entry_gpu)];
-        for &mode in &modes {
-            homes.push(homes.last().expect("seeded").transition(mode).home);
-        }
+        let homes = residual_homes(&modes, &spec)?;
         if placement.residual != homes { return Err(LayerPlanError::Residual); }
-        let hops = plan_hops(&modes, &spec);
+        let hops = plan_hops(&modes, &spec)?;
         if placement.hops != hops || (!hops.is_empty() && (spec.row_bytes == 0 || spec.row_bytes % 16 != 0)) {
             return Err(LayerPlanError::Hops);
         }
