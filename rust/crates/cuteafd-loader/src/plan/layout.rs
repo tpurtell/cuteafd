@@ -809,9 +809,9 @@ pub(super) fn layout_with_weight_budget(report: &mut PlanReport, model: &dyn sup
             let cfg = crate::families::deepseek_v4::DeepseekV4Config::read(&checkpoint.snapshot, cache_native_layers).ok()?;
             let id = if cfg.dim == 4096 { "dsv4f" } else { "dsv4p" };
             let scratch = crate::serving_capacity::deepseek_v4_workspace_scratch(manifest, id, split, prefill_rows, decode_rows).ok()?;
-            crate::serving_capacity::deepseek_v4_workspace_geometry(&cfg, prefill_rows, decode_rows,
+            crate::serving_capacity::deepseek_v4_workspace_geometry_for_attention(&cfg, prefill_rows, decode_rows,
                 crate::serving_capacity::compiled_c128_width(manifest, id).ok()?.checked_mul(128)?,
-                active_gpus, scratch).ok()
+                active_gpus, scratch, report.requested_attention, None).ok()
         })()
     } else { None };
     if family == "deepseek_v4" && v4_workspace.is_none() {

@@ -599,9 +599,9 @@ impl<'a> Engine<'a> {
         let h = self.cfg.dim;
         let draft = lead && self.weights.dspark.is_some();
         let draft_bytes = |bytes| if draft { bytes } else { 0 };
-        // Rank 1 runs only its head-split share; rank 0 keeps every head for
-        // the unsplit dSpark stages.
-        let heads = if rank == 1 { self.cfg.n_heads / 2 } else { self.cfg.n_heads };
+        // Use the frozen owners; rank 0 also retains full-head draft programs.
+        let heads = cuteafd_loader::serving_capacity::deepseek_v4_workspace_heads(
+            self.cfg.n_heads, if self.peer.is_some() { 2 } else { 1 }, None, Some(&self.modes))?[rank];
         let (experts, topk) = (self.cfg.n_routed_experts, self.cfg.n_activated_experts);
         let head_workspace = self.alloc(lead_only(cuteafd_ffi::programs::VOCABULARY_HEAD_WORKSPACE))?;
         let mut topk_scratch = 0usize;
@@ -1080,7 +1080,7 @@ impl<'a> Engine<'a> {
                 if self.mixed_attention(weights.ratio, tables) { segment()?; }
                 else { self.replay_on(0, key, segment)?; }
                 // Preserve owner routes outside capture before another router reuses them.
-                self.probe_ring(layer, w, t, device.is_none() && layer >= local_layers)?;
+                self.probe_ring(layer, lane, t, device.is_none() && layer >= local_layers)?;
                 if let Some(w1) = w1 {
                     // Rank 1's segments: layer 0 after rank 0's, then each next one before the
                     // host waits in this layer's exchange.
@@ -1905,11 +1905,11 @@ impl<'a> Engine<'a> {
         Ok(())
     }
 
-    fn probe_ring(&self, layer: usize, w: &Workspace<'_>, rows: usize, staged: bool) -> Result<()> {
+    fn probe_ring(&self, layer: usize, lane: &Lane<'_>, rows: usize, staged: bool) -> Result<()> {
         let mut probe = self.draft_probe.borrow_mut();
         let Some(probe) = probe.as_mut().filter(|probe| probe.wants_ring(staged)) else { return Ok(()) };
         // SAFETY: the owner router just completed in stream order; no graph captures this copy.
-        unsafe { probe.ring(self.library, layer, w.route_ids.buffer, rows, self.stream) }
+        unsafe { probe.ring(self.library, layer, lane.route_ids.buffer, rows, self.stream) }
     }
 
     fn local_output(&self, _layer: usize, _index: usize) -> Result<*mut c_void> {

@@ -44,7 +44,7 @@ fn planned(case: &Case<'_>) -> (MemoryLayout, bool, Vec<String>) {
             native_mtp_layers: if case.dspark { 3 } else { 0 }, headroom_bytes: 0, ..Default::default() }),
         attention_placement: case.attention, ..Default::default() }).unwrap();
     let hints = report.hints.iter().map(|h| h.what.clone()).collect();
-    (report.memory_layout.unwrap(), report.placement_supported, hints)
+    (report.memory_layout.unwrap_or_else(|| panic!("missing layout: supported={} hints={hints:?}", report.placement_supported)), report.placement_supported, hints)
 }
 
 /// serve-dsv4's admission over the planner's own loaded bytes as the sample.
@@ -58,7 +58,16 @@ fn runtime_with_tp1(case: &Case<'_>, layout: &MemoryLayout, tp1_available: bool)
 
 fn runtime_with_upload_check(case: &Case<'_>, layout: &MemoryLayout, tp1_available: bool, check_upload: bool)
     -> anyhow::Result<Placement> {
-    let manifest: serde_json::Value = serde_json::from_slice(&std::fs::read(case.manifest)?)?;
+    runtime_with_test_owners(case, layout, tp1_available, check_upload, false)
+}
+
+/// Test-only capability injection: production remains fail-closed for layers.
+fn runtime_with_test_owners(case: &Case<'_>, layout: &MemoryLayout, tp1_available: bool,
+    check_upload: bool, owned: bool) -> anyhow::Result<Placement> {
+    let mut manifest: serde_json::Value = serde_json::from_slice(&std::fs::read(case.manifest)?)?;
+    // Mirror production load(): admission sees the selected card plan, not the export envelope.
+    cuteafd_core::coordinator_programs::select_card_plans(&mut manifest,
+        cuteafd_loader::placement::ArchContext::for_device("sm_120", case.budget).sms)?;
     let mut catalog = cuteafd_loader::read_expert_catalog(case.snapshot)?;
     catalog.select_draft(cuteafd_loader::plan::spec::DraftOwnership::selected("deepseek_v4",
         if case.dspark { "dspark" } else { "off" }))?;
@@ -93,7 +102,18 @@ fn runtime_with_upload_check(case: &Case<'_>, layout: &MemoryLayout, tp1_availab
             &catalog, Some(case.manifest), manifest["capacities"]["prefill_rows"].as_u64().unwrap()
                 .max(manifest["capacities"]["decode_rows"].as_u64().unwrap())).ok().map(|b| [b; 2]) } else { None },
         exchange_f32: case.exchange_f32 };
-    let request = admission::request(&cli.engine, &inputs)?;
+    let mut request = admission::request(&cli.engine, &inputs)?;
+    if owned {
+        use cuteafd_loader::placement::{ExecutorModes, FfnMode, LayerMode, LayerOwnership};
+        const MODES: [LayerMode; 3] = [LayerMode::HeadSplit,
+            LayerMode::Whole { gpu: 0, ffn: FfnMode::Split },
+            LayerMode::Whole { gpu: 1, ffn: FfnMode::Split }];
+        request.executor = ExecutorModes { modes: &MODES, hops: true, ..request.executor };
+        request.policy.ownership = LayerOwnership::NonemptyRanges;
+        for (layer, &ratio) in request.layers.iter_mut().zip(&cfg.compress_ratios) {
+            if ratio == 4 { layer.modes = MODES.to_vec(); }
+        }
+    }
     assert_eq!(request.hops.terminal, cuteafd_loader::placement::TerminalHome::Head);
     let placement = solve(&request)?;
     assert_eq!(placement.residual.last(), Some(&cuteafd_loader::placement::ResidualHome::Owned(0)),
@@ -153,7 +173,8 @@ fn assert_equal(case: &Case<'_>, label: &str) -> Placement {
     for (gpu, items) in runtime.items.iter().enumerate() {
         let device = &layout.devices[gpu];
         for item in items {
-            assert!(device.items.contains(item), "{label}: rtx{gpu} lacks {item:?}");
+            assert!(device.items.contains(item), "{label}: rtx{gpu} lacks {item:?}; planned group: {:?}",
+                device.items.iter().filter(|planned| planned.group == item.group).collect::<Vec<_>>());
         }
         let budget = if gpu == 1 { case.peer_budget.unwrap_or(case.budget) } else { case.budget };
         let reserve = budget - device.capacity_bytes;
@@ -245,6 +266,31 @@ fn planner_equals_runtime_deepseek_v4_fixture_context() {
     refused.manifest = &plain;
     let (layout, _, _) = planned(&refused);
     assert!(runtime(&refused, &layout).is_err(), "explicit context without its programs");
+}
+
+#[test]
+fn planner_equals_runtime_deepseek_v4_fixture_card_plans() {
+    use cuteafd_loader::placement::AttentionPlacement;
+    let dir = tempfile::tempdir().unwrap();
+    let manifest = synthetic_context(dir.path());
+    let mut inventory: serde_json::Value = serde_json::from_slice(&std::fs::read(&manifest).unwrap()).unwrap();
+    inventory["programs"].as_array_mut().unwrap().push(serde_json::json!({
+        "name": "dsv4f_sparse_mla_decode_c128_m64",
+        "scratch_bytes_at_capacity": {"scratch": 1_094_778_880u64}, "geometry": {},
+        "card_plans": [
+            {"sm_count": 170, "scratch_bytes_at_capacity": {"scratch": 1_094_778_880u64}, "geometry": {}},
+            {"sm_count": 188, "scratch_bytes_at_capacity": {"scratch": 8_421_376u64}, "geometry": {}}
+        ]
+    }));
+    std::fs::write(&manifest, inventory.to_string()).unwrap();
+    for budget in [32u64 << 30, 96 << 30] {
+        for attention in [AttentionPlacement::Heads, AttentionPlacement::Context] {
+            let case = Case { snapshot: dir.path(), manifest: &manifest, rtx: 2, sparks: 2,
+                context: 1_048_576, budget, onboard: None, dspark: false,
+                exchange_f32: false, peer_budget: None, attention: Some(attention) };
+            assert_equal(&case, &format!("card-plan fixture budget={budget} attention={attention}"));
+        }
+    }
 }
 
 #[test]
@@ -375,6 +421,64 @@ fn inputs_dir() -> Option<PathBuf> {
     let dir = std::env::var_os("CUTEAFD_V4_PLACEMENT_INPUTS").map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache/cuteafd/builds/v4-placement/plans-input")))?;
     dir.is_dir().then_some(dir)
+}
+
+/// Header-only max-card admission pin with real program/package inventories.
+/// The test-only executor proves the workspace/state envelope, not serving
+/// support; complete handoff, graph and decode-lane charges are still pending.
+#[test]
+fn planner_v4_max_owner_workspace_pool_regression() {
+    use cuteafd_loader::placement::{AttentionPlacement, LayerMode};
+    let (Some(flash), Some(pro), Some(inputs)) = (snapshot("deepseek-ai/DeepSeek-V4-Flash-0731"),
+        snapshot("wrldsuksgo2mars/DeepSeek-V4-Pro-0813-EXL3-K2-calibrated-v1"), inputs_dir()) else {
+        eprintln!("V4 owner pool regression: snapshots or manifests absent; skipped");
+        return;
+    };
+    let budget = (95.5 * (1u64 << 30) as f64) as u64;
+    for (model, snapshot, sparks, extra) in [("flash", &flash, 4, 272_629_760u64),
+        ("pro", &pro, 6, 545_259_520u64)] {
+        let manifest = inputs.join(format!("{model}-2-1048576/PROGRAMS.json"));
+        let inventory: serde_json::Value = serde_json::from_slice(&std::fs::read(&manifest).unwrap()).unwrap();
+        let cfg = cuteafd_loader::families::deepseek_v4::DeepseekV4Config::read(snapshot, 3).unwrap();
+        let family = if model == "flash" { "dsv4f" } else { "dsv4p" };
+        if cuteafd_loader::placement::families::deepseek_v4::manifest_context(&inventory, family, cfg.n_heads, 64).is_none() {
+            eprintln!("{model}: context-capable inventory absent; skipped");
+            continue;
+        }
+        let case = |attention| Case { snapshot, manifest: &manifest, rtx: 2, sparks, context: 1_048_576,
+            budget, onboard: Some(Onboard::Auto), dspark: true, exchange_f32: false,
+            peer_budget: None, attention: Some(attention) };
+        let (layout, supported, hints) = planned(&case(AttentionPlacement::Heads));
+        assert!(supported, "{model}: {:?} {hints:?}", layout.notes);
+        let heads = runtime(&case(AttentionPlacement::Heads), &layout).unwrap();
+        let context = assert_equal(&case(AttentionPlacement::Context), model);
+        let layers = runtime_with_test_owners(&case(AttentionPlacement::Layers), &layout, true, false, true).unwrap();
+        for rank in 0..2 {
+            let steps = |placement: &Placement| placement.items[rank].iter()
+                .filter(|item| item.category == Category::Workspace && item.group == "steps")
+                .map(|item| item.bytes).sum::<u64>();
+            assert_eq!(steps(&context), steps(&heads));
+            assert_eq!(steps(&layers) - steps(&heads), if rank == 0 { 0 } else { extra });
+            assert!(layers.layers.iter().any(|layer| matches!(layer.mode,
+                LayerMode::Whole { gpu, .. } if usize::from(gpu) == rank)));
+        }
+        eprintln!("{model}-max: heads={} context={} test-only layers={}; extra workspace=[0,{extra}] B",
+            heads.pool_tokens, context.pool_tokens, layers.pool_tokens);
+        assert_eq!(heads.pool_tokens, 2 << 20);
+        assert_eq!(context.pool_tokens, 2 << 20);
+        assert_eq!(layers.pool_tokens, 2 << 20);
+        let refused = plan(snapshot, &PlanOptions {
+            placement: ExpertPlacement::from_spark_ranks(sparks),
+            layout: Some(LayoutOptions { rtx_bytes: vec![budget; 2], context_tokens: 1_048_576,
+                workspace_manifest: Some(manifest.clone()), onboard: Some(Onboard::Auto),
+                native_mtp_layers: 3, headroom_bytes: 0, ..Default::default() }),
+            attention_placement: Some(AttentionPlacement::Layers), ..Default::default() }).unwrap();
+        assert!(!refused.executable(), "production dual-rank layers must remain unsupported");
+        let error = refused.config_error.as_deref().expect("unsupported executor must explain refusal");
+        assert!(error.contains("executor not implemented"), "unexpected refusal: {error}");
+        assert!(runtime(&case(AttentionPlacement::Layers), &layout).is_err(),
+            "production runtime must refuse dual-rank layers without test capabilities");
+    }
 }
 
 /// The real checkpoints (headers only) with the release image's program and
