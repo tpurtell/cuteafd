@@ -48,7 +48,7 @@ pub(crate) const PAGE_ROWS: usize = 64;
 pub(crate) const DECODE_ROWS: usize = 64;
 use cuteafd_loader::serving_capacity::qwen_graphs::{QWEN_PLAIN_BUCKETS as PLAIN_BUCKETS, QWEN_SPEC_BUCKETS as SPEC_BUCKETS};
 // Keep this registry aligned with the pinned fork; script contracts check its source thresholds.
-const GLM_BF16_SKINNY_ROWS: usize = 8;
+const GLM_BF16_SKINNY_ROWS: usize = 0;
 const QWEN_WIDE_SKINNY_ROWS: usize = 24;
 const QWEN_MEDIUM_SKINNY_ROWS: usize = 64;
 const QWEN_SMALL_SKINNY_ROWS: usize = 160;
@@ -1597,8 +1597,9 @@ impl<'a> Qwen4Engine<'a> {
         resource::geometry_with_grouping(&self.draft_homes(snapshot)?, self.cfg.experts, self.cfg.topk,
             DECODE_ROWS, width, resource::COPY_EXTENSION, |layer, rows| match &self.experts {
                 Some(Experts::Local(local)) => Ok(local.experts.borrow().weight_read_group(rows, true)?.0),
-                Some(Experts::LocalExl3(local)) => local.resident.borrow().as_ref()
-                    .context("Qwen installed EXL3 window missing")?.1.group_rows(rows),
+                Some(Experts::LocalExl3(local)) => crate::families::deepseek_v4::local::installed_window_group_rows(
+                    &local.resident, || local.ensure(layer, self.execution_stream()), rows,
+                    |experts, rows| experts.group_rows(rows)),
                 Some(Experts::Tp2 { routed, .. }) => {
                     let routed = routed.borrow();
                     let group = routed.experts[0].group_rows(rows)?;

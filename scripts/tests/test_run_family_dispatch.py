@@ -2883,3 +2883,16 @@ def test_deepseek_v4_layers_is_dev_only_from_a_wip_slot(tmp_path, wip):
     else:
         assert result.returncode != 0
         assert "dev-only executor" in result.stderr and "dev-v4-layers" in result.stderr
+
+
+@pytest.mark.parametrize("keys,expected", [
+    ("SPECULATOR=off\n", "off"),
+    ("SPECULATOR=dspark\n", "dspark"),
+])
+def test_family_plan_charges_the_speculator_this_launch_serves(tmp_path, keys, expected):
+    # A launch with SPECULATOR=off must not be planned as if it carried the family's
+    # default drafter (V4 would otherwise charge an unused MTP stage and refuse layouts).
+    result = _family_launch_result(tmp_path, {"model_type": "deepseek_v4"}, "test/dsv4", keys)
+    assert result.returncode == 0, result.stderr
+    plan = next(line for line in result.stderr.splitlines() if "cuteafd plan" in line)
+    assert f"--speculator {expected}" in plan

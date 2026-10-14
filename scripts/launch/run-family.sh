@@ -2116,6 +2116,8 @@ audio_encoder_hash=""
   fi
   count_args=(--available-sparks "$available_sparks")
   if ((count_explicit)) || [[ "$backend" == local ]]; then count_args+=(--spark-ranks "$ranks"); fi
+  # The plan charges the drafter this launch actually serves (SPECULATOR=off charges none).
+  count_args+=(--speculator "$speculator")
   for pair in 'CONCURRENCY:--concurrency' 'PREFIX_CACHE_ENTRIES:--prefix-cache-entries' \
     'MAX_CONTEXT_TOKENS:--context-tokens' 'PREFILL_BATCH_TOKENS:--prefill-rows' \
     'RTX_EXPERT_LAYERS:--rtx-expert-layers'; do

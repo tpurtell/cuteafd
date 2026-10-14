@@ -1404,10 +1404,10 @@ use cuteafd_loader::serving_capacity::glmf_graphs::{graph_geometries, graph_rese
 // Inclusive arithmetic crossovers audited against the pinned AOT exporter.
 // Full/half-head shapes share these thresholds; MoE projections use real rows.
 const DECODE_PROJECTION_THRESHOLDS: &[ProjectionThreshold] = &[
-    ProjectionThreshold { name: "index.iq[4096,1536].bf16", skinny_rows: 8 },
-    ProjectionThreshold { name: "index.ik[288,4096].bf16", skinny_rows: 160 },
-    ProjectionThreshold { name: "kda.in[24896|12576,4096].bf16", skinny_rows: 8 },
-    ProjectionThreshold { name: "kda.out[4096,8192|4096].bf16", skinny_rows: 8 },
+    ProjectionThreshold { name: "index.iq[4096,1536].bf16", skinny_rows: 0 },
+    ProjectionThreshold { name: "index.ik[288,4096].bf16", skinny_rows: 0 },
+    ProjectionThreshold { name: "kda.in[24896|12576,4096].bf16", skinny_rows: 0 },
+    ProjectionThreshold { name: "kda.out[4096,8192|4096].bf16", skinny_rows: 0 },
     ProjectionThreshold { name: "kda.in.out.fp8", skinny_rows: 16 },
     ProjectionThreshold { name: "kda.half.in.out.fp8.wide", skinny_rows: 32 },
     ProjectionThreshold { name: "mla.qkv_a[2048,4096].fp8", skinny_rows: 16 },
@@ -1418,9 +1418,9 @@ const DECODE_PROJECTION_THRESHOLDS: &[ProjectionThreshold] = &[
 ];
 
 // `--decode-rows 128`: a step of 65 to 128 rows runs the `_m128` programs. They keep the `_m64`
-// programs' arithmetic crossovers above (the same `_Fp8Switch` and BF16 projection routes, the
-// 128 x 128 prefill route only from 512 rows, the decode KDA structures, the index producers' 8 and
-// 160 rows), so their capacity is the one new threshold: no bucket may pad a step of up to 64 rows
+// programs' arithmetic crossovers above (the same `_Fp8Switch`, canonical BF16 MMA projections,
+// 128 x 128 prefill route only from 512 rows and decode KDA structures), so their capacity is
+// the one new threshold: no bucket may pad a step of up to 64 rows
 // into them, whose sparse MLA plans its rows as its own bucket (FR-G.6).
 const WIDE_DECODE_THRESHOLDS: &[ProjectionThreshold] = &[
     ProjectionThreshold { name: "glmf.decode_capacity[m64|m128]", skinny_rows: DECODE_ROWS },
@@ -2118,8 +2118,9 @@ impl<'a> GlmfEngine<'a> {
                 }
                 match self.routed_experts(layer) {
                     Some(Experts::Local(local)) => Ok(local.experts.borrow().weight_read_group(rows, true)?.0),
-                    Some(Experts::LocalExl3(local)) => local.resident.borrow().as_ref()
-                        .context("GLM Flash installed EXL3 window missing")?.1.group_rows(rows),
+                    Some(Experts::LocalExl3(local)) => crate::families::deepseek_v4::local::installed_window_group_rows(
+                        &local.resident, || local.ensure(layer, self.stream), rows,
+                        |experts, rows| experts.group_rows(rows)),
                     Some(Experts::Spark { .. }) => resource::worker_group_rows_for_input(&remote, layer, rows, self.spark_bf16),
                     _ => anyhow::bail!("GLM Flash layer {layer} has no installed expert grouping"),
                 }
@@ -5259,12 +5260,10 @@ mod prefill_lane_tests {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../third_party/sparkinfer/b12x");
         // Any exporter change requires re-auditing shapes and arithmetic routes.
         for (path, expected) in [
-            // 09f29429 adds opt-in recurrence seq_ctas; 34698ec2 adds opt-in KDA
-            // decode_tiles. Defaults retain the projection shapes/routes and thresholds.
-            ("integration/cuteafd/glmf.py", 0xc821_9987_07e9_af1f_u64),
-            // 34698ec2 forwards an empty-by-default tiles_by_rows table; the GLM
-            // skinny crossover and default TMA projection remain unchanged.
-            ("integration/cuteafd/_glm_kernels.py", 0xe0ff_fc34_61c4_e6fb),
+            // b729115b separates unchanged W8A8 activation admission from BF16 routing.
+            ("integration/cuteafd/glmf.py", 0x22ff_3e9c_9277_c5b0_u64),
+            // b729115b uses canonical BF16 MMA at every positive row count.
+            ("integration/cuteafd/_glm_kernels.py", 0x8b85_3785_9223_9a99),
             ("integration/cuteafd/_fp8_weights.py", 0xb186_4a9c_36b1_7b30),
             ("integration/cuteafd/dsv4_mhc.py", 0x6b2a_c5a5_1dfa_46c5),
             // b629baef adds Qwen4Geometry::kv_record_bytes only; GLM projection routes are unchanged.
@@ -5279,7 +5278,7 @@ mod prefill_lane_tests {
             assert_eq!(hash, expected, "re-audit GLM decode projection thresholds after {path} source drift");
         }
         assert_eq!(super::DECODE_PROJECTION_THRESHOLDS.iter().map(|p| p.skinny_rows).collect::<Vec<_>>(),
-            [8, 160, 8, 8, 16, 32, 16, 16, 16, 16, 16]);
+            [0, 0, 0, 0, 16, 32, 16, 16, 16, 16, 16]);
         // The 64-row sets, and with the wide programs the speculative set ending at the verify budget (127 on
         // 170 SMs, 128 on 188, 99 on 132), pass at every serving width; the `_m128` programs add only
         // their capacity (`WIDE_DECODE_THRESHOLDS`).
@@ -5294,10 +5293,14 @@ mod prefill_lane_tests {
                 super::check_decode_thresholds(&buckets, sequences, true).unwrap();
             }
         }
-        let error = super::check_bucket_thresholds(&[1, 4, 16], super::DECODE_PROJECTION_THRESHOLDS)
+        // BF16 no longer crosses arithmetic routes at M8/M9; FP8 M16/M17 and M32/M33 still do.
+        super::check_bucket_thresholds(&[1, 4, 16], super::DECODE_PROJECTION_THRESHOLDS).unwrap();
+        let error = super::check_bucket_thresholds(&[1, 4, 8, 32], super::DECODE_PROJECTION_THRESHOLDS)
             .unwrap_err().to_string();
-        assert!(error.contains("index.iq"));
-        assert!(super::check_bucket_thresholds(&[1, 4, 8, 16, 64], super::DECODE_PROJECTION_THRESHOLDS).is_err());
+        assert!(error.contains("kda.in.out.fp8"), "{error}");
+        let error = super::check_bucket_thresholds(&[1, 4, 8, 16, 64], super::DECODE_PROJECTION_THRESHOLDS)
+            .unwrap_err().to_string();
+        assert!(error.contains("kda.half.in.out.fp8.wide"), "{error}");
         // A set that pads a step of up to 64 rows into the `_m128` programs is refused.
         let error = super::check_bucket_thresholds(&[32, 72], super::WIDE_DECODE_THRESHOLDS).unwrap_err().to_string();
         assert!(error.contains("m64|m128"), "{error}");

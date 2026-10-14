@@ -84,6 +84,22 @@ pub(crate) struct LocalPlan {
     pub peak_bytes: usize,
 }
 
+/// Policy setup may precede a lazy window's first execution. Install through
+/// its admitted loader before querying the package; reuse any resident window
+/// because execution grouping is package-wide, not layer-specific.
+pub(crate) fn installed_window_group_rows<T>(
+    resident: &std::cell::RefCell<Option<(std::ops::Range<usize>, T)>>,
+    install: impl FnOnce() -> Result<()>,
+    rows: usize,
+    group: impl FnOnce(&T, usize) -> Result<usize>,
+) -> Result<usize> {
+    let missing = resident.borrow().is_none();
+    if missing { install()?; }
+    let window = resident.borrow();
+    let (_, experts) = window.as_ref().context("installed expert window missing after installation")?;
+    group(experts, rows)
+}
+
 fn require_exl3_manifest(directory: &Path) -> Result<()> {
     let manifest = directory.join("v41_exl3.json");
     ensure!(manifest.is_file(), "EXL3 package manifest not found: {}", manifest.display());
@@ -471,6 +487,67 @@ impl<'a> LocalExperts<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn installed_window_grouping_installs_once_before_geometry_queries() -> Result<()> {
+        use crate::shared::draft::resource::{geometry_with_grouping, LayerHome};
+        use std::cell::{Cell, RefCell};
+        let resident = RefCell::new(None);
+        let installs = Cell::new(0);
+        let queries = Cell::new(0);
+        let homes = [LayerHome::Dense, LayerHome::Local { slice_bytes: 10. },
+            LayerHome::Local { slice_bytes: 20. }];
+        let geometry = geometry_with_grouping(&homes, 288, 8, 64, 3, 0, |layer, rows| {
+            installed_window_group_rows(&resident, || {
+                assert_eq!((layer, rows), (1, 0));
+                installs.set(installs.get() + 1);
+                // A one-layer window still shares its actual package grouping.
+                *resident.borrow_mut() = Some((layer..layer + 1, vec![(1, 3), (16, 5), (80, 7)]));
+                Ok(())
+            }, rows, |variants, rows| {
+                assert_eq!(installs.get(), 1);
+                queries.set(queries.get() + 1);
+                Ok(if rows == 0 { variants.last().unwrap().1 } else {
+                    variants.iter().find(|(capacity, _)| *capacity >= rows).unwrap().1
+                })
+            })
+        })?;
+        assert_eq!((installs.get(), queries.get()), (1, 65 * 2));
+        assert_eq!(resident.borrow().as_ref().unwrap().0, 1..2);
+        for rows in 0..=64 {
+            let expected = match rows { 0 => 7, 1 => 3, 2..=16 => 5, _ => 7 };
+            assert_eq!(geometry.group_rows(0, rows), 1);
+            assert_eq!(geometry.group_rows(1, rows), expected);
+            assert_eq!(geometry.group_rows(2, rows), expected);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn installed_window_grouping_reuses_existing_window() -> Result<()> {
+        let resident = std::cell::RefCell::new(Some((12..16, 11)));
+        let group = installed_window_group_rows(&resident, || panic!("resident window must not reload"),
+            23, |group, rows| { assert_eq!(rows, 23); Ok(*group) })?;
+        assert_eq!(group, 11);
+        assert_eq!(*resident.borrow(), Some((12..16, 11)));
+        Ok(())
+    }
+
+    #[test]
+    fn installed_window_grouping_propagates_install_and_query_errors() {
+        let resident = std::cell::RefCell::<Option<(std::ops::Range<usize>, usize)>>::new(None);
+        let error = installed_window_group_rows(&resident, || anyhow::bail!("admitted window does not fit"),
+            0, |_, _| panic!("failed install must not query")).unwrap_err();
+        assert_eq!(error.to_string(), "admitted window does not fit");
+        assert!(resident.borrow().is_none());
+        let error = installed_window_group_rows(&resident, || Ok(()), 0,
+            |_, _| panic!("missing install must not query")).unwrap_err();
+        assert_eq!(error.to_string(), "installed expert window missing after installation");
+        *resident.borrow_mut() = Some((0..1, 8));
+        let error = installed_window_group_rows(&resident, || panic!("resident window must not reload"),
+            129, |_, _| anyhow::bail!("no installed capacity")).unwrap_err();
+        assert_eq!(error.to_string(), "no installed capacity");
+    }
 
     #[test]
     fn missing_exl3_manifest_names_the_resolved_path() -> Result<()> {
