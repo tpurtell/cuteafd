@@ -200,7 +200,12 @@ impl<'a> Engine<'a> {
             },
             graphs: || {
                 #[cfg(feature = "dev-v4-layers")]
-                if let Some(binding) = &self.dev_layers { binding.waves.borrow_mut().retire(); }
+                if let Some(binding) = &self.dev_layers {
+                    binding.waves.borrow_mut().retire();
+                    let mut graphs = binding.graphs.borrow_mut();
+                    graphs.retire_all();
+                    drop(graphs.drain_retired(|| Ok(()))?);
+                }
                 for link in transports.borrow_mut().iter_mut() { link.terminal_release()?; }
                 for rank in 0..(1 + usize::from(self.peer.is_some())) {
                     self.on(rank, || {
@@ -288,6 +293,50 @@ impl<'a> Engine<'a> {
                     routes = Routes { ids: received, weights: unsafe { received.cast::<u8>().add(packed.weights_at).cast() } };
                 }
             }
+            self.tp2_compute(rank, layer, index, w, rows, routes)?;
+            // Publish before either stream queues its matching wait; no wait in the local expert path.
+            if publish && (rank == 1 || layer + 1 < self.cfg.n_layers) {
+                self.record_peer(rank, "ffn", slot(layer, true, index), true, layer, index);
+                self.exchange()?.push(rank, slot(layer, true, index), payload.buffer.ptr,
+                    self.combine(rows)?.payload_bytes(rows, self.cfg.dim))?;
+            }
+            Ok(())
+        })
+    }
+
+    #[cfg(feature = "dev-v4-layers")]
+    pub(super) fn tp2_graph_bindings(&self, rank: usize, layer: usize, rows: usize) -> Result<Vec<(usize, usize)>> {
+        self.tp2.as_ref().context("TP2 graph backend")?.ranks[rank].borrow().graph_bindings(layer, rows)
+    }
+
+    #[cfg(feature = "dev-v4-layers")]
+    pub(super) fn owner_tp2_compute(&self, rank: usize, layer: usize, index: usize, tables: &StepTables,
+        w: &Workspace<'_>, cap: usize) -> Result<()> {
+        let tp2 = self.tp2.as_ref().context("owner TP2")?;
+        let lane = &w.lanes[index];
+        if !tables.decode || cap != self.decode_rows || tp2.broadcast() || tp2.checking.get() {
+            return self.tp2_experts(rank, layer, index, w, tables.rows);
+        }
+        let routes = Routes { ids: lane.route_ids.buffer.ptr, weights: lane.route_weights.buffer.ptr };
+        self.owner_segment(rank, layer, index, tables, w, cap, super::graphs::Segment::Partial, std::ptr::null_mut(),
+            || self.tp2_compute(rank, layer, index, w, tables.rows, routes))?;
+        if rank == 1 || layer + 1 < self.cfg.n_layers {
+            self.record_peer(rank, "ffn", slot(layer, true, index), true, layer, index);
+            self.exchange()?.push(rank, slot(layer, true, index), lane.payload.as_ref().context("owner payload")?.buffer.ptr,
+                self.combine(tables.rows)?.payload_bytes(tables.rows, self.cfg.dim))?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn tp2_compute(&self, rank: usize, layer: usize, index: usize, w: &Workspace<'_>, rows: usize,
+        routes: Routes) -> Result<()> {
+        let tp2 = self.tp2.as_ref().context("TP2 compute")?;
+        let lane = &w.lanes[index];
+        let payload = lane.payload.as_ref().context("TP2 payload")?;
+        let stream = self.stream_of(rank);
+        ensure!(stream == tp2.streams[rank], "TP2 executor moved streams; per-lane scratch ownership is required");
+        debug_assert!(!tp2.output_pending[rank].get(), "previous routed output was not copied to its lane payload");
+        self.on(rank, || {
             let combine = self.combine(rows)?;
             ensure!(combine.payload_bytes(rows, self.cfg.dim) <= payload.buffer.bytes, "TP2 payload exceeds admission");
             let mut experts = tp2.ranks[rank].borrow_mut();
@@ -300,14 +349,24 @@ impl<'a> Engine<'a> {
                 payload.buffer.ptr, rows, self.cfg.dim, stream) };
             copied?;
             tp2.output_pending[rank].set(false);
-            // Publish before either stream queues its matching wait; no wait in the local expert path.
-            if publish && (rank == 1 || layer + 1 < self.cfg.n_layers) {
-                self.record_peer(rank, "ffn", slot(layer, true, index), true, layer, index);
-                self.exchange()?.push(rank, slot(layer, true, index), payload.buffer.ptr,
-                    combine.payload_bytes(rows, self.cfg.dim))?;
-            }
             Ok(())
         })
+    }
+
+    pub(super) fn tp2_combine_post(&self, rank: usize, index: usize, w: &Workspace<'_>, rows: usize,
+        received: *mut c_void) -> Result<()> {
+        let lane = &w.lanes[index];
+        let payload = lane.payload.as_ref().context("TP2 lane payload")?;
+        let (rank0, rank1) = if rank == 0 { (payload.buffer.ptr, received) } else { (received, payload.buffer.ptr) };
+        self.on(rank, || {
+            // SAFETY: the caller orders both payloads after their publication;
+            // capture keeps the peer wait outside this device-only segment.
+            unsafe { self.combine(rows)?.sum(rank0, rank1, w.sum.buffer.ptr.cast(), rows, self.cfg.dim, self.stream_of(rank)) }
+        })?;
+        self.run_on(rank, false, "mhc_post", &[
+            ("x", w.sum.buffer.ptr), ("residual", lane.stream_b.buffer.ptr), ("prev_post", lane.post.buffer.ptr),
+            ("prev_comb", lane.comb.buffer.ptr), ("out", lane.stream_a.buffer.ptr),
+        ], &[Scalar::I32(rows as i32)])
     }
 
     pub(super) fn tp2_post(&self, rank: usize, layer: usize, index: usize, w: &Workspace<'_>, lane: &Lane<'_>, rows: usize)
@@ -317,16 +376,8 @@ impl<'a> Engine<'a> {
         self.record_peer(rank, "ffn", at, false, layer, index);
         exchange.wait(rank, at)?;
         let received = exchange.recv(rank, at)?;
-        let payload = lane.payload.as_ref().context("TP2 lane payload")?;
-        let (rank0, rank1) = if rank == 0 { (payload.buffer.ptr, received) } else { (received, payload.buffer.ptr) };
-        self.on(rank, || {
-            // SAFETY: both payloads are complete, same dtype, summed rank0 first on both GPUs.
-            unsafe { self.combine(rows)?.sum(rank0, rank1, w.sum.buffer.ptr.cast(), rows, self.cfg.dim, self.stream_of(rank)) }
-        })?;
-        self.run_on(rank, false, "mhc_post", &[
-            ("x", w.sum.buffer.ptr), ("residual", lane.stream_b.buffer.ptr), ("prev_post", lane.post.buffer.ptr),
-            ("prev_comb", lane.comb.buffer.ptr), ("out", lane.stream_a.buffer.ptr),
-        ], &[Scalar::I32(rows as i32)])
+        debug_assert!(std::ptr::eq(lane, &w.lanes[index]));
+        self.tp2_combine_post(rank, index, w, rows, received)
     }
 
     pub(super) fn prepare_route_checks(&self, rows: &[usize]) -> Result<()> {

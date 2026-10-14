@@ -30,6 +30,8 @@ use std::time::Instant;
 mod context;
 mod dspark;
 mod tp2;
+#[cfg(feature = "dev-v4-layers")]
+mod graphs;
 pub(crate) use tp2::ExchangePolicy;
 use tp2::Tp2State;
 pub(crate) use dspark::DraftRequest;
@@ -101,6 +103,7 @@ struct DevLayers<'a> {
     plan: cuteafd_loader::placement::LayerExecutionPlan,
     hops: crate::shared::peer_split::hop::HopLink<'a>,
     waves: RefCell<crate::shared::peer_split::attention::FfnWaveBank<SparkExpertWave>>,
+    graphs: RefCell<graphs::OwnerGraphs<'a>>,
 }
 
 /// The second GPU of a two-GPU head split (rank 1): its share of every
@@ -208,8 +211,21 @@ impl Profile {
 
 #[cfg(test)]
 mod cache_tests {
-    use super::cache_resident;
+    use super::{cache_resident, c4_sentinel};
     use cuteafd_loader::placement::{FfnMode, LayerMode};
+
+    #[test]
+    fn c4_sentinel_is_only_for_frozen_owner_split_modes() {
+        for gpu in [0, 1] {
+            assert!(c4_sentinel(Some(LayerMode::Whole { gpu, ffn: FfnMode::Split })));
+            assert!(!c4_sentinel(Some(LayerMode::Whole { gpu, ffn: FfnMode::Owner })));
+        }
+        for mode in [None, Some(LayerMode::HeadSplit), Some(LayerMode::ContextSplit)] {
+            assert!(!c4_sentinel(mode));
+        }
+        assert_eq!(cuteafd_loader::placement::families::deepseek_v4::C4_SENTINEL_BYTES as usize,
+            super::metadata::compressed_page_bytes(4) + super::INDEX_PAGE_BYTES);
+    }
 
     #[test]
     fn owned_cache_residency_preserves_c128_window_and_draft_replicas() {
@@ -254,6 +270,11 @@ pub(crate) struct EngineParts<'a> {
 /// pages non-owner compressor rows write (one 64-row page per 64 decode/verify rows).
 fn c4_units(shape: PoolShape, context: bool) -> usize {
     if context { shape.units / 2 + metadata::C4_SCRATCH_UNITS } else { shape.units }
+}
+
+fn c4_sentinel(mode: Option<cuteafd_loader::placement::LayerMode>) -> bool {
+    use cuteafd_loader::placement::{FfnMode, LayerMode};
+    matches!(mode, Some(LayerMode::Whole { ffn: FfnMode::Split, .. }))
 }
 
 pub(super) fn validate_peer_layer(mode: cuteafd_loader::placement::LayerMode,
@@ -460,7 +481,7 @@ impl<'a> Engine<'a> {
             };
             let pools = (0..self.cfg.n_layers).filter(|&layer| cache_resident(&self.modes, layer, 1))
                 .map(|l| Self::pool_layer_for(self.library, &self.cfg, parts.shape, l,
-                    self.context_mode.is_some())).collect::<Result<Vec<_>>>()?;
+                    self.context_mode.is_some(), c4_sentinel(self.modes.get(l).copied()))).collect::<Result<Vec<_>>>()?;
             Ok(V4Peer { device, stream, layers, pools, rope_window: table(false)?, rope_compressed: table(true)?,
                 prefill_workspace: RefCell::new(None), decode_workspace: RefCell::new(None),
                 graphs: RefCell::new(std::collections::HashMap::new()) })
@@ -486,14 +507,15 @@ impl<'a> Engine<'a> {
     }
 
     fn pool_layer(parts: &EngineParts<'a>, layer: usize) -> Result<LayerCache<'a>> {
-        Self::pool_layer_for(parts.library, &parts.cfg, parts.shape, layer, parts.context.is_some())
+        Self::pool_layer_for(parts.library, &parts.cfg, parts.shape, layer, parts.context.is_some(),
+            c4_sentinel(parts.modes.get(layer).copied()))
     }
 
     /// Layer `layer`'s zeroed caches and compressor state on the current device. Under `context`
     /// the C4 pools hold this GPU's half of the units (local page `id >> 1`); C128 pools, window
     /// rings and carry stay whole on both GPUs.
     fn pool_layer_for(library: &'a NativeLibrary, cfg: &DeepseekV4Config, shape: PoolShape, layer: usize,
-        context: bool) -> Result<LayerCache<'a>> {
+        context: bool, sentinel: bool) -> Result<LayerCache<'a>> {
         let _memory_scope = cuteafd_ffi::memory_ledger::scope("kv");
         let zeroed = |bytes: usize| -> Result<Dev<'a>> {
             let allocation = DeviceAllocation::new(library, bytes.max(256))?;
@@ -504,8 +526,8 @@ impl<'a> Engine<'a> {
         let main = zeroed(shape.window_pages() * MAIN_PAGE_BYTES)?;
         let (compressed, index, states) = match cfg.compress_ratios.get(layer).copied().unwrap_or(0) {
             4 => (
-                Some(zeroed(c4_units(shape, context) * metadata::compressed_page_bytes(4))?),
-                Some(zeroed(c4_units(shape, context) * INDEX_PAGE_BYTES)?),
+                Some(zeroed((c4_units(shape, context) + usize::from(sentinel)) * metadata::compressed_page_bytes(4))?),
+                Some(zeroed((c4_units(shape, context) + usize::from(sentinel)) * INDEX_PAGE_BYTES)?),
                 vec![
                     zeroed(sequences * 16 * 1024 * 4)?,
                     zeroed(sequences * 16 * 1024 * 4)?,
@@ -856,7 +878,8 @@ impl<'a> Engine<'a> {
             .context("dev hop admission")?;
         for rank in 0..2 { ensure!(hops.fixed_bytes(rank) == charged[rank], "dev hop allocation differs from admission"); }
         self.dev_layers = Some(DevLayers { plan, hops, waves: RefCell::new(
-            crate::shared::peer_split::attention::FfnWaveBank::new(PREFILL_LANES)) });
+            crate::shared::peer_split::attention::FfnWaveBank::new(PREFILL_LANES)),
+            graphs: RefCell::new(graphs::OwnerGraphs::with_policy(crate::shared::decode_graph::GraphPolicy::FixedStartup)) });
         Ok(())
     }
 
@@ -955,8 +978,9 @@ impl<'a> Engine<'a> {
         let tokens: Vec<u32> = rows.iter().map(|(_, token)| *token).collect();
         let steps: Vec<(&Placement, usize)> = rows.iter().map(|(p, _)| (&**p, p.len)).collect();
         let ranges = self.request_lanes(&steps.iter().map(|(placement, start)| (*placement, *start, 1)).collect::<Vec<_>>())?;
-        let tables = ranges.iter().map(|range| metadata::decode_step(&steps[range.clone()],
+        let mut tables = ranges.iter().map(|range| metadata::decode_step(&steps[range.clone()],
             &self.shape, self.cfg.index_topk, self.c128_width)).collect::<Result<Vec<_>>>()?;
+        self.fixed_owner_tables(&mut tables)?;
         let lanes = tables.iter().zip(&ranges).map(|(tables, range)|
             LaneStep { tables, tokens: &tokens[range.clone()], units: &[] }).collect::<Vec<_>>();
         let logits = self.step(&lanes, transports, runtime, tokens.len(), None, false)?;
@@ -989,6 +1013,7 @@ impl<'a> Engine<'a> {
         transports: &mut [SparkLink<'_>],
         runtime: &tokio::runtime::Runtime,
     ) -> Result<DeviceLogits> {
+        let _capture_round = crate::shared::decode_graph::CaptureWatch::round();
         let tokens: Vec<u32> = sequences.iter().flat_map(|(_, tokens)| tokens.iter().copied()).collect();
         ensure!(!tokens.is_empty() && tokens.len() <= self.decode_rows, "verify step of {} rows", tokens.len());
         for (placement, tokens) in sequences.iter() {
@@ -997,8 +1022,9 @@ impl<'a> Engine<'a> {
         }
         let spans: Vec<(&Placement, usize, usize)> = sequences.iter().map(|(p, t)| (&**p, p.len, t.len())).collect();
         let ranges = self.request_lanes(&spans)?;
-        let tables = ranges.iter().map(|range| metadata::verify_step(&spans[range.clone()],
+        let mut tables = ranges.iter().map(|range| metadata::verify_step(&spans[range.clone()],
             &self.shape, self.cfg.index_topk, self.c128_width)).collect::<Result<Vec<_>>>()?;
+        self.fixed_owner_tables(&mut tables)?;
         let mut first = 0;
         let lanes = tables.iter().map(|tables| {
             let end = first + tables.rows;
@@ -1011,6 +1037,22 @@ impl<'a> Engine<'a> {
             placement.len += tokens.len();
         }
         logits.device()
+    }
+
+    fn owner_graph_mode(&self) -> bool {
+        #[cfg(feature = "dev-v4-layers")]
+        { self.dev_layers.is_some() }
+        #[cfg(not(feature = "dev-v4-layers"))]
+        { false }
+    }
+
+    fn fixed_owner_tables(&self, tables: &mut [StepTables]) -> Result<()> {
+        if !self.owner_graph_mode() { return Ok(()); }
+        let export = self.programs.spec(&format!("{}_index_topk_decode_m{}", self.family, self.decode_rows))?
+            .geometry.get("max_pages").and_then(serde_json::Value::as_u64).context("C4 export max_pages")?;
+        let width = metadata::c4_fixed_width(self.max_context, self.shape.units, usize::try_from(export)?)?;
+        for table in tables { table.pad_c4(width, c4_units(self.shape, false))?; }
+        Ok(())
     }
 
     fn request_lanes(&self, requests: &[(&Placement, usize, usize)]) -> Result<Vec<std::ops::Range<usize>>> {
@@ -1362,6 +1404,12 @@ impl<'a> Engine<'a> {
     fn finish_step(&self, lanes: &[LaneStep<'_>], w: &Workspace<'_>, logit_rows: usize,
         cap: usize, total: usize, download: bool) -> Result<Logits> {
         for (index, step) in lanes.iter().enumerate() {
+            #[cfg(feature = "dev-v4-layers")]
+            if self.owner_graph_mode() {
+                self.owner_segment(0, self.cfg.n_layers - 1, index, step.tables, w, cap,
+                    graphs::Segment::DraftKv, std::ptr::null_mut(), || self.write_draft_kv(w, &w.lanes[index], step.tables.rows, cap))?;
+                continue;
+            }
             self.write_draft_kv(w, &w.lanes[index], step.tables.rows, cap)?;
         }
         if logit_rows == 0 {
@@ -1394,7 +1442,15 @@ impl<'a> Engine<'a> {
                 // Lanes land their rows one after the other in the logits buffer.
                 let capacity = w.vocab_logits.buffer.bytes / (self.cfg.vocab_size * 4);
                 ensure!(landed + wanted <= capacity, "{logit_rows} device logit rows exceed the workspace's {capacity}");
-                self.head_launch(lane, rows, wanted, landed, w)?;
+                #[cfg(feature = "dev-v4-layers")]
+                let graphed = if self.owner_graph_mode() && wanted == rows {
+                    self.owner_segment(0, self.cfg.n_layers - 1, lane.index, step.tables, w, cap,
+                        graphs::Segment::Head, landed as *mut c_void, || self.head_launch(lane, rows, wanted, landed, w))?;
+                    true
+                } else { false };
+                #[cfg(not(feature = "dev-v4-layers"))]
+                let graphed = false;
+                if !graphed { self.head_launch(lane, rows, wanted, landed, w)?; }
                 landed += wanted;
             }
             first += rows;
@@ -2137,7 +2193,7 @@ impl<'a> Engine<'a> {
     /// Every local-expert row shape is captured at startup, without executing
     /// uninitialized routes or unmatched peer waits. Pointer ownership is fixed.
     pub fn warm_local_graphs(&self) -> Result<()> {
-        if self.local_layers() == 0 { return Ok(()); }
+        if self.local_layers() == 0 && !self.owner_graph_mode() { return Ok(()); }
         if self.decode_workspace.borrow().is_none() {
             *self.decode_workspace.borrow_mut() = Some(self.workspace(self.decode_rows, self.decode_lanes())?);
         }
@@ -2148,7 +2204,7 @@ impl<'a> Engine<'a> {
         }
         self.warm_tp2_routers()?;
         #[cfg(feature = "dev-v4-layers")]
-        if self.dev_layers.is_some() { self.warm_dev_tp2()?; return Ok(()); }
+        if self.dev_layers.is_some() { self.warm_dev_tp2()?; return self.warm_owner_graphs(); }
         self.capture_only.set(true);
         let result = (|| {
             let work = self.decode_workspace.borrow();
@@ -2383,8 +2439,9 @@ impl<'e, 'a, 's, 't, 'l, 'p> DevLayerKernels<'e, 'a, 's, 't, 'l, 'p> {
         Ok(if rank == 0 { &self.engine.weights.layers[layer] } else { &self.engine.peer()?.layers[layer] })
     }
     fn back(&self, rank: usize, layer: usize, output: *mut c_void) -> Result<()> {
-        self.engine.attention_back(rank, self.weights(rank, layer)?, self.lane(rank),
-            self.workspaces[rank], Scalar::I32(self.tables.rows as i32), self.cap, output)
+        self.engine.owner_segment(rank, layer, self.lane, self.tables, self.workspaces[rank], self.cap,
+            graphs::Segment::Back, output, || self.engine.attention_back(rank, self.weights(rank, layer)?, self.lane(rank),
+                self.workspaces[rank], Scalar::I32(self.tables.rows as i32), self.cap, output))
     }
 }
 
@@ -2405,8 +2462,9 @@ impl crate::shared::peer_split::attention::LayerKernels for DevLayerKernels<'_, 
         let exchange = engine.exchange()?;
         let at = slot(layer, false, self.lane);
         for rank in 0..2 {
-            engine.attention_front(rank, layer, self.weights(rank, layer)?, self.tables, self.lane(rank),
-                self.workspaces[rank], Scalar::I32(self.tables.rows as i32), self.cap)?;
+            engine.owner_segment(rank, layer, self.lane, self.tables, self.workspaces[rank], self.cap,
+                graphs::Segment::Front, std::ptr::null_mut(), || engine.attention_front(rank, layer, self.weights(rank, layer)?, self.tables, self.lane(rank),
+                    self.workspaces[rank], Scalar::I32(self.tables.rows as i32), self.cap))?;
             exchange.push(rank, at, self.workspaces[rank].delta.buffer.ptr, self.tables.rows * engine.cfg.dim * 2)?;
         }
         for rank in 0..2 {
@@ -2419,8 +2477,9 @@ impl crate::shared::peer_split::attention::LayerKernels for DevLayerKernels<'_, 
     }
     fn context(&mut self, _: usize, _: usize) -> Result<()> { anyhow::bail!("dev layers never binds context") }
     fn owned(&mut self, layer: usize, rank: usize) -> Result<()> {
-        self.engine.attention_front(rank, layer, self.weights(rank, layer)?, self.tables, self.lane(rank),
-            self.workspaces[rank], Scalar::I32(self.tables.rows as i32), self.cap)?;
+        self.engine.owner_segment(rank, layer, self.lane, self.tables, self.workspaces[rank], self.cap,
+            graphs::Segment::Front, std::ptr::null_mut(), || self.engine.attention_front(rank, layer, self.weights(rank, layer)?, self.tables, self.lane(rank),
+                self.workspaces[rank], Scalar::I32(self.tables.rows as i32), self.cap))?;
         self.back(rank, layer, self.workspaces[rank].delta.buffer.ptr)
     }
     fn ffn(&mut self, _: usize, _: Option<usize>) -> Result<()> { anyhow::bail!("dev layers uses deferred FFN") }
@@ -2443,9 +2502,11 @@ impl crate::shared::peer_split::attention::PipelineKernels for DevLayerKernels<'
         let cap = self.cap;
         if !engine.skip_routed {
             // An owned layer's complete y is adopted before either router runs.
-            engine.route_input(0, self.weights(0, layer)?, self.lane(0), self.workspaces[0], Scalar::I32(rows as i32))?;
+            engine.owner_segment(0, layer, self.lane, self.tables, self.workspaces[0], cap,
+                graphs::Segment::Router, std::ptr::null_mut(), || engine.route_input(0, self.weights(0, layer)?, self.lane(0), self.workspaces[0], Scalar::I32(rows as i32)))?;
             if engine.tp2_layer(layer) {
-                engine.route_input(1, self.weights(1, layer)?, self.lane(1), self.workspaces[1], Scalar::I32(rows as i32))?;
+                engine.owner_segment(1, layer, self.lane, self.tables, self.workspaces[1], cap,
+                graphs::Segment::Router, std::ptr::null_mut(), || engine.route_input(1, self.weights(1, layer)?, self.lane(1), self.workspaces[1], Scalar::I32(rows as i32)))?;
             }
             engine.probe_ring(layer, self.lane(0), rows, !engine.tp2_layer(layer))?;
             engine.count_route_fallback(layer);
@@ -2464,13 +2525,10 @@ impl crate::shared::peer_split::attention::PipelineKernels for DevLayerKernels<'
         for rank in 0..2 {
             let weights = self.weights(rank, layer)?;
             let lane = self.lane(rank);
-            engine.run_on(rank, weights.ffn_split, &format!("shared_ffn_m{cap}"), &[
-                ("x", lane.y.buffer.ptr), ("w13", weights.ptr("w13")?), ("w13_scale", weights.ptr("w13_scale")?),
-                ("w2", weights.ptr("w2")?), ("w2_scale", weights.ptr("w2_scale")?),
-                ("out", lane.shared.buffer.ptr), ("scratch", self.workspaces[rank].scratch.buffer.ptr),
-            ], &[Scalar::I32(rows as i32)])?;
+            engine.owner_segment(rank, layer, self.lane, self.tables, self.workspaces[rank], cap,
+                graphs::Segment::Shared, std::ptr::null_mut(), || engine.owner_shared(rank, weights, lane, self.workspaces[rank], rows, cap))?;
             match ticket {
-                DevFfnTicket::Local => engine.tp2_experts(rank, layer, self.lane, self.workspaces[rank], rows)?,
+                DevFfnTicket::Local => engine.owner_tp2_compute(rank, layer, self.lane, self.tables, self.workspaces[rank], cap)?,
                 _ if rank == 1 || matches!(ticket, DevFfnTicket::Shared) => {
                     if rank == 0 && layer + 1 == engine.cfg.n_layers { continue; }
                     engine.record_peer(rank, "ffn", at, true, layer, self.lane);
@@ -2501,7 +2559,11 @@ impl crate::shared::peer_split::attention::PipelineKernels for DevLayerKernels<'
             let lane = self.lane(rank);
             let workspace = self.workspaces[rank];
             if matches!(ticket, DevFfnTicket::Local) {
-                engine.tp2_post(rank, layer, self.lane, workspace, lane, rows)?;
+                engine.record_peer(rank, "ffn", at, false, layer, self.lane);
+                engine.exchange()?.wait(rank, at)?;
+                let received = engine.exchange()?.recv(rank, at)?;
+                engine.owner_segment(rank, layer, self.lane, self.tables, workspace, self.cap,
+                    graphs::Segment::Post, received, || engine.tp2_combine_post(rank, self.lane, workspace, rows, received))?;
                 continue;
             }
             engine.record_peer(rank, "ffn", at, false, layer, self.lane);
@@ -2517,7 +2579,8 @@ impl crate::shared::peer_split::attention::PipelineKernels for DevLayerKernels<'
                 ("prev_post", lane.post.buffer.ptr), ("prev_comb", lane.comb.buffer.ptr), ("out", lane.stream_a.buffer.ptr),
             ], &[Scalar::I32(rows as i32)])?;
         }
-        engine.tap(self.workspaces[0], self.lane(0), layer, rows)?;
+        engine.owner_segment(0, layer, self.lane, self.tables, self.workspaces[0], self.cap,
+            graphs::Segment::Tap, std::ptr::null_mut(), || engine.tap(self.workspaces[0], self.lane(0), layer, rows))?;
         engine.probe_mark(layer)
     }
 }

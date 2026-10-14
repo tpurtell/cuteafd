@@ -47,7 +47,7 @@ impl<'a> Engine<'a> {
     }
 
     /// Stages whose experts are resident here (drafting needs all of them).
-    fn draft_ready(&self) -> bool {
+    pub(super) fn draft_ready(&self) -> bool {
         let stages = self.weights.dspark.as_ref().map_or(0, |d| d.stages.len());
         stages > 0 && self.local.borrow().as_ref().is_some_and(|l| l.stages() == stages)
     }

@@ -28,6 +28,13 @@ pub(crate) struct LayerWeights<'a> {
 }
 
 impl LayerWeights<'_> {
+    #[cfg(feature = "dev-v4-layers")]
+    pub(super) fn graph_bindings(&self) -> Vec<(usize, usize)> {
+        let mut operands = self.operands.iter().collect::<Vec<_>>();
+        operands.sort_unstable_by_key(|(name, _)| **name);
+        operands.into_iter().map(|(_, value)| (value.buffer.ptr as usize, value.buffer.bytes)).collect()
+    }
+
     pub fn ptr(&self, operand: &str) -> Result<*mut c_void> {
         Ok(self.operands.get(operand).with_context(|| format!("layer has no weight {operand}"))?.buffer.ptr)
     }

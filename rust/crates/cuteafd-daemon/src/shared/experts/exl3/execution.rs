@@ -393,6 +393,13 @@ pub(crate) enum Exl3InputFormat {
 }
 
 impl<'a> Exl3Execution<'a> {
+    pub(crate) fn graph_bindings(&self, layer: usize) -> Result<Vec<(usize, usize)>> {
+        Ok(self._storage.iter().map(|a| (a.buffer.ptr as usize, a.buffer.bytes))
+            .chain(self._shared_workspace.iter().flat_map(|w| w.allocations.values().map(|a| (a.buffer.ptr as usize, a.buffer.bytes))))
+            .chain(self.wire.iter().map(|(_, a)| (a.buffer.ptr as usize, a.buffer.bytes)))
+            .chain(self._weights.get(layer).context("EXL3 graph layer")?.graph_bindings()).collect())
+    }
+
     pub(crate) fn artifact_layout(directory: &Path) -> Result<V41Exl3Layout> {
         let meta: Manifest = serde_json::from_slice(&std::fs::read(directory.join("v41_exl3.json"))?)?;
         meta.native_layout()
