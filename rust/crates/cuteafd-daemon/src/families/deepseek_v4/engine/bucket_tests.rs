@@ -7,6 +7,15 @@ use std::collections::BTreeMap;
 const ROWS: usize = 64;
 const VOCAB: usize = 129_280;
 
+fn fixture_library() -> Result<NativeLibrary> {
+    // NativeLibrary::load fixes the geometry used by native routed helpers.
+    // Pro AOT programs carry their own shape; the routed oracle is Flash only.
+    cuteafd_core::set_expert_geometry(cuteafd_core::ExpertGeometry::DEEPSEEK_V4_FLASH)
+        .map_err(|g| anyhow::anyhow!("fixture geometry already fixed to {g:?}"))?;
+    // SAFETY: matching sealed ABI; every fixture drains before library unload.
+    unsafe { NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?) }
+}
+
 struct Tensor<'a> {
     dev: Dev<'a>,
     initial: Vec<u8>,
@@ -250,16 +259,14 @@ fn manifest_fixture<'a>(library: &'a NativeLibrary, entry: &serde_json::Value) -
     Ok(f)
 }
 
-fn mask_metadata(f: &mut Fixture<'_>, entry: &serde_json::Value, rows: usize) -> Result<()> {
-    let name = entry["name"].as_str().context("fixture name")?;
-    let ratio = if name.contains("c128") { 128 } else { 4 };
+fn fixture_tables(name: &str, rows: usize) -> StepTables {
     let chunked = name.contains("continuation");
     let fields: &[&'static str] = if chunked {
         &["active_groups", "active_sequences", "group_sequence_slots", "compressed_slots",
             "group_source_positions", "group_rope_positions", "state_sequence_ids",
             "sequence_start_positions", "sequence_offsets"]
     } else { &["positions", "sequence_ids", "compressed_slots"] };
-    let compressor = if name.contains("compressor") {
+    let compressor = |ratio: usize| if name.contains("compressor") {
         fields.iter().map(|&field| {
             let values = match field {
                 "active_groups" | "active_sequences" => vec![rows as i32],
@@ -272,22 +279,47 @@ fn mask_metadata(f: &mut Fixture<'_>, entry: &serde_json::Value, rows: usize) ->
             (field, values)
         }).collect()
     } else { Vec::new() };
-    // Exercise the same canonical-to-upload conversion as Engine::fill. Real
-    // requests stay narrow while every device metadata plane has masked tails.
-    let tables = StepTables {
+    // Real steps carry metadata for both ratios, even in a single-ratio launch.
+    StepTables {
         decode: true, chunked, start: 0, rows,
         positions: vec![127; rows],
         main_slots: (0..rows).map(|i| (i * 256 + 127) as i64).collect(),
         swa_indices: (0..rows * metadata::WINDOW).map(|i| if i % metadata::WINDOW == 0 { 0 } else { -1 }).collect(),
         swa_lengths: vec![1; rows],
-        c4_tables: if ratio == 4 { compressor.clone() } else { Vec::new() },
-        c128_tables: if ratio == 128 { compressor } else { Vec::new() },
+        c4_tables: compressor(4),
+        c128_tables: compressor(128),
         c4_groups: rows, c128_groups: rows,
         c4_page_table: (0..rows * 8).map(|i| (i % 8) as i32).collect(),
         c4_table_width: 8, c4_table_stride: 8,
         c4_visible: vec![512; rows], c4_indexed_lengths: vec![1; rows],
         c128_indices: vec![0; rows], c128_lengths: vec![1; rows],
-    };
+    }
+}
+
+#[test]
+fn owner_bucket_fixture_continuation_metadata_covers_both_ratios() -> Result<()> {
+    for rows in 1..=ROWS {
+        let tables = fixture_tables("dsv4f_compressor_continuation_c4", rows);
+        let upload = tables.upload(ROWS, 64)?;
+        for (ratio, entries) in [(4, &upload.c4_tables), (128, &upload.c128_tables)] {
+            let field = |name| &entries.iter().find(|(key, _)| *key == name).unwrap().1;
+            assert_eq!(field("active_groups"), &[rows as i32]);
+            assert_eq!(field("active_sequences"), &[rows as i32]);
+            assert_eq!(&field("sequence_start_positions")[..rows], &vec![ratio - 1; rows]);
+            assert!(field("state_sequence_ids")[rows..].iter().all(|&id| id == -1));
+            assert!(field("compressed_slots")[rows..].iter().all(|&slot| slot == -1));
+            assert!(field("sequence_offsets")[rows..].iter().all(|&offset| offset == rows as i32));
+        }
+    }
+    Ok(())
+}
+
+fn mask_metadata(f: &mut Fixture<'_>, entry: &serde_json::Value, rows: usize) -> Result<()> {
+    let name = entry["name"].as_str().context("fixture name")?;
+    let ratio = if name.contains("c128") { 128 } else { 4 };
+    // Exercise the same canonical-to-upload conversion as Engine::fill. Real
+    // requests stay narrow while every device metadata plane has masked tails.
+    let tables = fixture_tables(name, rows);
     let upload = tables.upload(ROWS, 64)?;
     for operand in entry["pointers"].as_array().context("fixture pointers")? {
         let field = operand["name"].as_str().unwrap();
@@ -307,7 +339,7 @@ fn mask_metadata(f: &mut Fixture<'_>, entry: &serde_json::Value, rows: usize) ->
                 let stride = f.tensors[field].initial.len() / (ROWS * 4);
                 Some((0..ROWS * stride).map(|i| if i / stride < rows && i % stride == 0 { 0 } else { -1 }).collect())
             }
-            _ => upload.c4_tables.iter().chain(&upload.c128_tables)
+            _ => (if ratio == 128 { &upload.c128_tables } else { &upload.c4_tables }).iter()
                 .find(|(key, _)| *key == field).map(|(_, values)| values.clone()),
         };
         if let Some(values) = values { f.set(field, i32_bytes(values))?; }
@@ -339,7 +371,7 @@ fn owner_bucket_aot_segments_are_byte_exact_at_every_width() -> Result<()> {
     let path = std::env::var("CUTEAFD_TEST_PROGRAMS")?;
     let manifest: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path)?)?;
     // SAFETY: matching sealed ABI; all fixture storage/graphs drain before unload.
-    let library = unsafe { NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? };
+    let library = fixture_library()?;
     for device in 0..2 {
         library.cuda_set_device(device)?;
         let programs = library.programs()?.with_manifest(std::path::Path::new(&path))?;
@@ -405,7 +437,7 @@ fn owner_bucket_head_tap_and_draft_kv_are_byte_exact_at_every_width() -> Result<
     let path = std::env::var("CUTEAFD_TEST_PROGRAMS")?;
     let manifest: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path)?)?;
     // SAFETY: the matching sealed ABI remains loaded until all fixtures drain.
-    let library = unsafe { NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? };
+    let library = fixture_library()?;
     for device in 0..2 {
         library.cuda_set_device(device)?;
         let programs = library.programs()?.with_manifest(std::path::Path::new(&path))?;
@@ -627,10 +659,8 @@ impl Drop for ExpertVariant<'_> {
 #[test]
 #[ignore = "two RTX GPUs and sealed native Flash MXFP4 TP2 experts"]
 fn owner_bucket_flash_routed_tp2_is_byte_exact_at_every_width() -> Result<()> {
-    cuteafd_core::set_expert_geometry(cuteafd_core::ExpertGeometry::DEEPSEEK_V4_FLASH)
-        .map_err(|g| anyhow::anyhow!("fixture geometry already fixed to {g:?}"))?;
     // SAFETY: the matching sealed ABI outlives every retained variant/graph.
-    let library = unsafe { NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? };
+    let library = fixture_library()?;
     for device in 0..2 {
         library.cuda_set_device(device)?;
         let mut exact = [1, 16, 80].into_iter().map(|c| ExpertVariant::new(&library, c)).collect::<Result<Vec<_>>>()?;
