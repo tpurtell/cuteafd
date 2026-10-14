@@ -479,7 +479,7 @@ mod tests {
             attention_by_kind: vec![], peer_row_bytes: 0, onboard_layers: 0,
             layers: modes.iter().map(|&mode| LayerAssignment { mode, experts: ExpertHome::Dense }).collect(),
             movables: vec![], expert_ranges: vec![], residual: vec![], tp2: None, items: vec![],
-            hops: plan_hops(modes, &HopSpec { row_bytes: 32, rows: 6, lanes: 2, entry_gpu: 0, head_gpu: 0 }),
+            hops: plan_hops(modes, &HopSpec { row_bytes: 32, rows: 6, lanes: 2, entry_gpu: 0, head_gpu: 0, terminal: match modes.last() { Some(LayerMode::Whole { ffn: FfnMode::Owner, .. }) => cuteafd_loader::placement::TerminalHome::AttentionOwner, _ => cuteafd_loader::placement::TerminalHome::Replicated } }).unwrap(),
         }
     }
 
@@ -522,9 +522,9 @@ mod tests {
 
     fn execution_plan(modes: &[LayerMode], entry: u8, head: u8) -> LayerExecutionPlan {
         use cuteafd_loader::placement::{plan_hops, HopSpec, ResidualHome};
-        let spec = HopSpec { row_bytes: 32, rows: 6, lanes: 2, entry_gpu: entry, head_gpu: head };
+        let spec = HopSpec { row_bytes: 32, rows: 6, lanes: 2, entry_gpu: entry, head_gpu: head, terminal: match modes.last() { Some(LayerMode::Whole { ffn: FfnMode::Owner, .. }) => cuteafd_loader::placement::TerminalHome::AttentionOwner, _ => cuteafd_loader::placement::TerminalHome::Replicated } };
         let mut p = placement(modes);
-        p.hops = plan_hops(modes, &spec);
+        p.hops = plan_hops(modes, &spec).unwrap();
         p.residual = vec![ResidualHome::Owned(entry)];
         for &mode in modes {
             p.residual.push(p.residual.last().unwrap().transition(mode).home);

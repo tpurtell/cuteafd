@@ -422,7 +422,7 @@ pub fn request_for_working_set(i: &GlmfInputs<'_>, working: &GlmfWorkingSet) -> 
             vec![LayerMode::Whole { gpu: 0, ffn: FfnMode::Owner }] }, by_kind: vec![],
             ownership: LayerOwnership::Alternating, ..LayerPolicy::default() },
         hops: HopSpec { row_bytes: 4 * i.cfg.hidden as u64 * 2, rows: i.prefill_rows.max(i.decode_rows),
-            lanes: working.prefill_lanes, entry_gpu: 0, head_gpu: 0 }, executor: super::GLM5_FLASH,
+            lanes: working.prefill_lanes, entry_gpu: 0, head_gpu: 0, terminal: if ranks == 2 { TerminalHome::Replicated } else { TerminalHome::AttentionOwner } }, executor: super::GLM5_FLASH,
     })
 }
 

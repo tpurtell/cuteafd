@@ -93,7 +93,12 @@ fn runtime_with_upload_check(case: &Case<'_>, layout: &MemoryLayout, tp1_availab
             &catalog, Some(case.manifest), manifest["capacities"]["prefill_rows"].as_u64().unwrap()
                 .max(manifest["capacities"]["decode_rows"].as_u64().unwrap())).ok().map(|b| [b; 2]) } else { None },
         exchange_f32: case.exchange_f32 };
-    let placement = solve(&admission::request(&cli.engine, &inputs)?)?;
+    let request = admission::request(&cli.engine, &inputs)?;
+    assert_eq!(request.hops.terminal, cuteafd_loader::placement::TerminalHome::Head);
+    let placement = solve(&request)?;
+    assert_eq!(placement.residual.last(), Some(&cuteafd_loader::placement::ResidualHome::Owned(0)),
+        "V4 final residual must live on the rank0 head, not on both ranks");
+    cuteafd_loader::placement::LayerExecutionPlan::new(&placement, request.hops)?;
     if check_upload {
         let modes = placement.layers.iter().map(|layer| layer.mode).collect::<Vec<_>>();
         let weights = cuteafd_loader::families::deepseek_v4::resident::WeightInventory::from_headers(
@@ -158,8 +163,8 @@ fn assert_equal(case: &Case<'_>, label: &str) -> Placement {
         format!("rtx{gpu}: {} local expert layers ({}..{})", r.layers, r.first, r.first + r.layers)).collect::<Vec<_>>();
     for note in notes { assert!(layout.notes.contains(&note), "{label}: planner lacks {note}"); }
     // Per-layer ownership: today's V4 is all head split (2 RTX) or all GPU0,
-    // the residual replicated after layer 0 under the split, no charged hop,
-    // and the engine accepts the placement.
+    // intermediate residuals replicated under the split, terminal on rank0,
+    // no charged hop, and the engine accepts the placement.
     assert_eq!(runtime.residual.len(), runtime.layers.len() + 1, "{label}: residual homes");
     assert!(runtime.hops.iter().all(|h| !h.charged()), "{label}: V4 hops");
     assert!(runtime.items.iter().flatten().all(|i| i.group != "residual hops"), "{label}: hop buffers");

@@ -128,6 +128,9 @@ fn solve_once(request: &PlacementRequest, flips: &[(AttentionClass, AttentionPla
     use PlacementError::Overflow;
     let gpus = request.inventory.gpus.len();
     if !(1..=2).contains(&gpus) { return Err(PlacementError::Inventory("one or two coordinator GPUs")); }
+    if usize::from(request.hops.entry_gpu) >= gpus || usize::from(request.hops.head_gpu) >= gpus {
+        return Err(PlacementError::Inventory("residual entry or head on an absent GPU"));
+    }
     if request.layers_first_gpu > 1 { return Err(PlacementError::Inventory("layers first GPU must be 0 or 1")); }
     if request.pool.unit_rows == 0 { return Err(PlacementError::Inventory("zero pool unit rows")); }
     if request.pool_overhead.len() != gpus { return Err(PlacementError::Inventory("pool overhead per GPU")); }
@@ -202,7 +205,7 @@ fn solve_once(request: &PlacementRequest, flips: &[(AttentionClass, AttentionPla
         }
     }
     // Residual homes and the hops the modes imply (one GPU never hops).
-    let (residual, hops) = residual_plan(&modes, &request.hops, gpus);
+    let (residual, hops) = residual_plan(&modes, &request.hops, gpus)?;
     if let Some(hop) = hops.iter().find(|h| h.at != HopPoint::Entry).filter(|_| !executor.hops) {
         return Err(PlacementError::UnsupportedHop { family: executor.family, hop: *hop });
     }
@@ -615,16 +618,12 @@ fn mandatory_tp2_arenas(request: &PlacementRequest) -> Result<[Arena; 2], Placem
 
 /// The residual's home at every layer boundary (`[0]`: the embedding's GPU,
 /// `[i + 1]`: after layer `i`) and the hops between them.
-fn residual_plan(modes: &[LayerMode], spec: &HopSpec, gpus: usize) -> (Vec<ResidualHome>, Vec<Hop>) {
-    let entry = if gpus == 2 { spec.entry_gpu } else { 0 };
-    let mut homes = Vec::with_capacity(modes.len() + 1);
-    homes.push(ResidualHome::Owned(entry));
-    for &mode in modes {
-        let home = *homes.last().expect("seeded");
-        homes.push(home.transition(mode).home);
-    }
-    let hops = if gpus == 2 { plan_hops(modes, spec) } else { Vec::new() };
-    (homes, hops)
+fn residual_plan(modes: &[LayerMode], spec: &HopSpec, gpus: usize) -> Result<(Vec<ResidualHome>, Vec<Hop>), PlacementError> {
+    let homes = residual_homes(modes, spec)
+        .map_err(|_| PlacementError::Inventory("invalid terminal residual contract"))?;
+    let hops = if gpus == 2 { plan_hops(modes, spec)
+        .map_err(|_| PlacementError::Inventory("invalid residual hop contract"))? } else { Vec::new() };
+    Ok((homes, hops))
 }
 
 /// Try cross-device reservations before selecting a movable's home. Ordinary
