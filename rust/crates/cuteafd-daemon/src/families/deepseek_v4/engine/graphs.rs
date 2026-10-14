@@ -41,6 +41,25 @@ mod tests {
     use crate::shared::decode_graph::GraphPolicy;
 
     #[test]
+    fn startup_rows_cover_measured_c8_c16_lane_widths_without_padding() -> Result<()> {
+        let measured = [17, 18, 19, 20, 21, 22, 23, 26, 28, 31, 33];
+        assert!(STARTUP_ROWS.windows(2).all(|rows| rows[0] < rows[1]));
+        assert_eq!(STARTUP_ROWS.len(), 33);
+        let mut bank = GraphBank::with_policy(GraphPolicy::FixedStartup);
+        bank.warm(&STARTUP_ROWS, |&rows| Ok((rows, None)))?;
+        for rows in measured {
+            let (decision, stored) = bank.enqueue(&rows);
+            assert_eq!(decision, GraphDecision::Replay);
+            assert_eq!(stored.copied(), Some(rows));
+        }
+        for rows in [25, 27, 29, 30, 34, 63] {
+            assert_eq!(bank.enqueue(&rows).0, GraphDecision::Eager);
+        }
+        assert_eq!(bank.stats().captures, STARTUP_ROWS.len() as u64);
+        Ok(())
+    }
+
+    #[test]
     fn fixed_owner_bank_never_replays_changed_pointers_extents_or_shapes() -> Result<()> {
         let key = OwnerKey { rank: 0, device: 0, stream: 11, layer: 42, lane: 1,
             rows: 8, cap: 64, chunked: true, attention: "c4", width: 4096, stride: 4096,
@@ -63,9 +82,10 @@ mod tests {
     }
 }
 
-// Exact row counts preserve the projection's arithmetic routes. Misses stay
-// eager, including unlisted speculative widths and mixed C128 row ranges.
-const STARTUP_ROWS: [usize; 22] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 24, 32, 40, 48, 56, 64];
+// Exact rows preserve arithmetic routes. Add only lane widths observed in
+// C8/C16 census; unlisted widths and mixed C128 ranges remain eager.
+const STARTUP_ROWS: [usize; 33] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16,
+    17, 18, 19, 20, 21, 22, 23, 24, 26, 28, 31, 32, 33, 40, 48, 56, 64];
 
 impl Engine<'_> {
     fn owner_key(&self, rank: usize, layer: usize, index: usize, tables: &StepTables,
