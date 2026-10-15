@@ -70,9 +70,17 @@ def test_qwen_bucket_projection_registry_matches_pinned_fork():
     assert defaults["gemv_rows"] == int(re.search(r"FP8_GEMV_ROWS = (\d+)", fp8).group(1))
     assert defaults["wide_rows"] == 0
     for filename, contracts in {
-        "qwen4_gdn.py": ("self.in_proj = projection(p, g.hidden, self.fp8)", "self.o_proj = projection(g.hidden, v, self.fp8)"),
-        "qwen4_attention.py": ("self.proj = projection(g.attn_in_width, g.hidden, self.fp8)",
-                               "self.o_proj = projection(g.hidden, g.heads * g.head_dim, self.fp8)"),
+        # The qwen4 decode programs retile their BF16 projections by live rows through the family's
+        # own wrapper (qwen4_tiles.qwen4_projection): without a table it returns the audited
+        # projection() unchanged, and the FP8 routes (their own decode schedule) never take it.
+        "qwen4_gdn.py": ('self.in_proj = qwen4_projection(p, g.hidden, self.fp8, self.decode_tiles.get("in", ()))',
+                         'self.o_proj = qwen4_projection(g.hidden, v, self.fp8, self.decode_tiles.get("out", ()))'),
+        "qwen4_attention.py": ('self.proj = qwen4_projection(g.attn_in_width, g.hidden, self.fp8, '
+                               'self.decode_tiles.get("in", ()))',
+                               'self.o_proj = qwen4_projection(g.hidden, g.heads * g.head_dim, self.fp8,',
+                               'self.decode_tiles.get("out", ()))'),
+        "qwen4_tiles.py": ('return projection(n, k, fp8)',
+                           'raise ValueError("tiles_by_rows is the BF16 projection\'s (fp8=False)")'),
         "glmf.py": ("self.proj = RoutedBf16Projection(e, h, out_dtype=cutlass.Float32)",),
     }.items():
         source = (fork / "integration/cuteafd" / filename).read_text()

@@ -497,15 +497,20 @@ def qwen4_programs(g, decode_rows: int, prefill_rows: int, max_context: int):
 
     out.append(("index_expand", "index_expand", {}, lambda: attn.compile_qwen4_index_expand_aot(g)))
     for mode, rows in (("decode", decode_rows), ("prefill", prefill_rows)):
+        # The decode GDN/attention projections retile their BF16 TMA tiles by live rows
+        # (b12x .../qwen4_tiles.py); the prefill arms keep prefill_config.
+        tiles = {"decode_tiles": True} if mode == "decode" else {}
         out += [
-            (f"gdn_m{rows}", "gdn", {"max_rows": rows}, lambda r=rows: qwen4_gdn.compile_qwen4_gdn_aot(g, max_rows=r)),
-            (f"attn_producer_m{rows}", "attn_producer", {"max_rows": rows},
-             lambda r=rows: attn.compile_qwen4_attn_producer_aot(g, max_rows=r)),
+            (f"gdn_m{rows}", "gdn", {"max_rows": rows, **tiles},
+             lambda r=rows, t=bool(tiles): qwen4_gdn.compile_qwen4_gdn_aot(g, max_rows=r, decode_tiles=t)),
+            (f"attn_producer_m{rows}", "attn_producer", {"max_rows": rows, **tiles},
+             lambda r=rows, t=bool(tiles): attn.compile_qwen4_attn_producer_aot(g, max_rows=r, decode_tiles=t)),
             (f"index_topk_m{rows}", "index_topk", {"max_rows": rows, "max_context": max_context},
              lambda r=rows: attn.compile_qwen4_index_topk_aot(g, max_rows=r, max_context=max_context)),
             (f"sparse_gqa_m{rows}", "sparse_gqa", {"max_rows": rows, "route": mode},
              lambda r=rows, m=mode: attn.compile_qwen4_sparse_gqa_aot(g, max_rows=r, route=m)),
-            (f"attn_o_m{rows}", "attn_o", {"max_rows": rows}, lambda r=rows: attn.compile_qwen4_attn_o_aot(g, max_rows=r)),
+            (f"attn_o_m{rows}", "attn_o", {"max_rows": rows, **tiles},
+             lambda r=rows, t=bool(tiles): attn.compile_qwen4_attn_o_aot(g, max_rows=r, decode_tiles=t)),
         ]
     # Decode programs over E4M3 copies of the large projections (<= 16 live rows).
     rows = decode_rows
