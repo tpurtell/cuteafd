@@ -5273,17 +5273,17 @@ mod prefill_lane_tests {
         // Any exporter change requires re-auditing shapes and arithmetic routes.
         for (path, expected) in [
             // canon-fp8-decode: the threshold is the programs' capacity, not the thin tile.
-            ("integration/cuteafd/glmf.py", 0x9293_d116_a183_8b50_u64),
+            ("integration/cuteafd/glmf.py", 0x80a2_3e92_49ed_5766_u64),
             // b729115b uses canonical BF16 MMA at every positive row count.
             ("integration/cuteafd/_glm_kernels.py", 0x8b85_3785_9223_9a99),
-            ("integration/cuteafd/_fp8_weights.py", 0x8740_5e09_7e17_662f),
+            ("integration/cuteafd/_fp8_weights.py", 0x622a_1b45_96e9_71da),
             // 5dcdd837 opts decode mHC into partial-group fusion; projection thresholds and arithmetic stay unchanged.
             ("integration/cuteafd/dsv4_mhc.py", 0x978a_179d_ef8c_2101),
             // b629baef adds Qwen4Geometry::kv_record_bytes only; GLM projection routes are unchanged.
             ("integration/cuteafd/_common.py", 0x86ea_ace0_6ff1_26ca),
             // 34698ec2's RowTiledBf16Projection is opt-in; skinny_config,
-            // skinny_max_rows and the default RoutedBf16Projection paths are unchanged.
-            ("gemm/bf16_gemv/_skinny.py", 0xc52c_5862_a23d_41f0),
+            // skinny_max_rows and the default GLM RoutedBf16Projection paths are unchanged.
+            ("gemm/bf16_gemv/_skinny.py", 0x3351_3301_8c37_3f8f),
         ] {
             let bytes = std::fs::read(root.join(path)).unwrap();
             let hash = bytes.iter().fold(0xcbf2_9ce4_8422_2325_u64,

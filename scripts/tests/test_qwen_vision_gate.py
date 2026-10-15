@@ -102,6 +102,15 @@ def test_qwen_bucket_projection_registry_matches_pinned_fork():
     assert "QWEN_PLAIN_BUCKETS as PLAIN_BUCKETS, QWEN_SPEC_BUCKETS as SPEC_BUCKETS" in engine
     assert "pub const QWEN_PLAIN_BUCKETS: &[usize] = &[1, 4, 8, 16];" in graphs
     assert "pub const QWEN_SPEC_BUCKETS: &[usize] = &[2, 4, 8, 16, 24, 32, 64];" in graphs
+    assert int(re.search(r"pub\(crate\) const FP8_HEAD_ROWS: usize = (\d+);", engine).group(1)) == rust("FP8_PROJECTION_SKINNY_ROWS")
+    assert "_HeadFp8(vocab, h, max_rows=FP8_DECODE_ROWS)" in qwen
+    tables = {node.targets[0].id: ast.literal_eval(node.value) for node in skinny.body
+              if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name)
+              and node.targets[0].id in ("DECODE_TMA_TILES", "SKINNY_TILES_BY_ROWS")}
+    assert set(tables["DECODE_TMA_TILES"]) == {(2560, 6144), (16480, 2560), (13952, 2560), (2560, 640), (10240, 320)}
+    for (n, k), entries in tables["SKINNY_TILES_BY_ROWS"].items():
+        assert len({t for _, _, _, t in entries}) == 1
+        assert entries[-1][0] == scalar_rule(n, k)
 
 
 def test_head72_uses_the_b12x_le128_tile():

@@ -102,7 +102,7 @@ pub(crate) const UNIT_ROWS: usize = POOL_PAGE_TOKENS;
 const PLE_STATE_ROWS: usize = 9;
 /// Most rows one launch of the E4M3 head (`qwen4_head_fp8`) takes; wider
 /// logits calls run it in spans of this many rows.
-pub(crate) const FP8_HEAD_ROWS: usize = 16;
+pub(crate) const FP8_HEAD_ROWS: usize = 64;
 
 /// `(first row, rows)` spans of at most [`FP8_HEAD_ROWS`] covering `rows` logits rows.
 pub(crate) fn fp8_head_spans(rows: usize) -> impl Iterator<Item = (usize, usize)> {
