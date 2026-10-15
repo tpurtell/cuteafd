@@ -163,6 +163,10 @@ release_stop_wip_containers
         self.assertEqual(result.returncode, 2, result.stderr)   # native-only guard
         self.assertIn('native topology', result.stderr)
 
+    def test_explicit_compact_tp3_exl3_is_admitted(self):
+        result = self.config('SPARK_COUNT=3\nSPARK_TP=3\nSPARK_EP=1\nEXPERT_FORMAT=exl3\nSPARKINFER_EXL3=auto')
+        self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_malformed_partial_three_rank_topologies_are_rejected(self):
         for settings, message in [
             ('SPARK_COUNT=3\nSPARK_TP=3', 'set together or omitted together'),
@@ -170,8 +174,6 @@ release_stop_wip_containers
             ('SPARK_COUNT=3\nSPARK_TP=3\nSPARK_EP=2', 'must equal SPARK_COUNT'),
             ('SPARK_COUNT=3\nSPARK_TP=1\nSPARK_EP=3', 'unsupported native Spark topology TP1EP3'),
             ('SPARK_COUNT=3\nSPARK_TP=2\nSPARK_EP=1', 'must equal SPARK_COUNT'),
-            ('SPARK_COUNT=3\nSPARK_TP=3\nSPARK_EP=1\nEXPERT_FORMAT=exl3\nSPARKINFER_EXL3=auto',
-             'requires EXPERT_FORMAT=native'),
             ('SPARK_COUNT=9', 'SPARK_COUNT must be in 0..8'),
         ]:
             with self.subTest(settings=settings):
