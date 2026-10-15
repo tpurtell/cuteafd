@@ -1,6 +1,6 @@
 //! One lane's local routed-expert scratch; both lanes share immutable weights.
 use super::exl3::{
-    execution::{Exl3Execution, Exl3InputFormat, Exl3Workspace},
+    execution::{Exl3Modules, Exl3Execution, Exl3InputFormat, Exl3Workspace},
     Exl3Weights,
 };
 use super::layer::{ExpertLayer, ExpertWeights};
@@ -231,6 +231,17 @@ impl<'a> LocalExpertWave<'a> {
         budget: usize,
         geometry: ExpertGeometry,
     ) -> Result<Self> {
+        // SAFETY: forwards the trusted native package and lane lifetime contract.
+        unsafe { Self::new_exl3_with_modules(library, weights, directory, capacity, budget, geometry, None) }
+    }
+
+    /// # Safety
+    /// Trusted package; preloaded modules are exclusive to this serialized lane.
+    pub(crate) unsafe fn new_exl3_with_modules(
+        library: &'a NativeLibrary, weights: Rc<Vec<Exl3Weights<'a>>>,
+        directory: &Path, capacity: u32, budget: usize, geometry: ExpertGeometry,
+        modules: Option<Vec<Exl3Modules<'a>>>,
+    ) -> Result<Self> {
         Self::require_geometry(geometry)?;
         ensure!(
             !weights.is_empty() && weights.len() <= geometry.layers as usize,
@@ -259,15 +270,18 @@ impl<'a> LocalExpertWave<'a> {
             .map(|c| directory.join(format!("m{c}")))
             .collect();
         let arena = Exl3Workspace::new(library, &directories)?;
-        for c in capacities {
+        let modules = match modules {
+            Some(modules) => modules,
+            None => directories.iter().map(|path| {
+                // SAFETY: the caller trusts the native package.
+                unsafe { Exl3Modules::load(library, path, Exl3InputFormat::Fp8K32) }
+            }).collect::<Result<Vec<_>>>()?,
+        };
+        ensure!(modules.len() == capacities.len(), "local EXL3 preload capacity count differs");
+        for (c, modules) in capacities.into_iter().zip(modules) {
+            // SAFETY: each state owns its modules and serializes on the lane stream.
             let state = unsafe {
-                Exl3Execution::with_shared_workspace(
-                    library,
-                    weights.clone(),
-                    &directory.join(format!("m{c}")),
-                    Exl3InputFormat::Fp8K32,
-                    Some(arena.clone()),
-                )?
+                Exl3Execution::with_modules(library, weights.clone(), modules, Some(arena.clone()))?
             };
             ensure!(
                 state.capacity() == c as usize && state.output_element_bytes() == 4,

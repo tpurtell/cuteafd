@@ -116,6 +116,16 @@ impl Fixture {
         Ok(fs::read_to_string(&self.events)?)
     }
 
+    pub fn configure_memory(&self, library: &NativeLibrary, device: i32, total: usize) -> Result<()> {
+        // SAFETY: this export belongs to the CPU-only fixture loaded above.
+        unsafe {
+            let configure: Symbol<unsafe extern "C" fn(i32, usize, usize, usize)> =
+                library.lib.get(b"fixture_configure_memory")?;
+            configure(device, total, 0, 0);
+        }
+        Ok(())
+    }
+
     pub fn configure_pack(&self, library: &NativeLibrary, pack: i32, drain: i32) -> Result<()> {
         // SAFETY: this export belongs to the CPU-only fixture loaded above.
         unsafe {

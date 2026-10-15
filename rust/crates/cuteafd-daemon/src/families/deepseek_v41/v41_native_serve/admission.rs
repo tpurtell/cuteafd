@@ -639,11 +639,26 @@ pub(super) fn admission_memory(
         .collect()
 }
 
-/// Bind the target FP8 modules before the inventory sample and the first
-/// immutable weight upload. This is outside request execution and captures.
-/// EXL3 modules are owned by execution today: their footprint is measured at
-/// the hardware gate, not inferred from these workspace manifests. Retained
-/// admission-to-execution handles are the separate stage-3b lifetime change.
+/// Retain both independent lane contexts while RuntimeInventory samples CUDA.
+/// Weight and scratch allocations happen only after the resulting admission.
+pub(super) fn preload_exl3<'a>(
+    lib: &'a cuteafd_ffi::NativeLibrary, directory: &std::path::Path,
+    capacity: u32, ranks: usize,
+) -> Result<[Vec<crate::shared::experts::exl3::execution::Exl3Modules<'a>>; 2]> {
+    use crate::shared::experts::exl3::execution::{Exl3InputFormat, Exl3Modules};
+    let capacities = families::deepseek_v41::expert_capacities(capacity as u64, ranks == 1)?;
+    let mut lanes = [Vec::new(), Vec::new()];
+    for lane in &mut lanes {
+        for &capacity in &capacities {
+            // SAFETY: operator-selected pinned native exports, owned on the current device.
+            lane.push(unsafe { Exl3Modules::load(lib, &directory.join(format!("m{capacity}")), Exl3InputFormat::Fp8K32)? });
+        }
+    }
+    Ok(lanes)
+}
+
+/// Bind target modules before the inventory sample and first immutable weight
+/// upload. EXL3 contexts are retained separately by `preload_exl3`.
 pub(super) fn preload(
     lib: &cuteafd_ffi::NativeLibrary,
     rows: u32,

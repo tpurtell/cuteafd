@@ -1117,7 +1117,7 @@ mod tests {
         )?;
         let mut transport =
             devices[1].own(|| NativeTp4Wave::new(&lib, roce, NativeTp4Wave::device_bytes(16)?))?;
-        transport.install_tp2(tp2_ffn::Wave::new(routed.clone(), shared.clone(), 20, 16)?)?;
+        transport.install_tp2(tp2_ffn::Wave::new(routed.clone(), shared.clone(), 20, 16, [None, None])?)?;
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()?;
@@ -1312,7 +1312,7 @@ mod tests {
                 NativeTp4Wave::device_bytes(16)?,
             )
         })?;
-        other_transport.install_tp2(tp2_ffn::Wave::new(routed, shared, 20, 16)?)?;
+        other_transport.install_tp2(tp2_ffn::Wave::new(routed, shared, 20, 16, [None, None])?)?;
         for chunk_rows in [3, 16] {
             let reference_lease = requests.admit(0, 92900 + chunk_rows as u64)?;
             requests.begin_encoder(reference_lease, prompt.len() as u64)?;

@@ -79,9 +79,22 @@ pub(super) fn worker(mut args: crate::cli::NativeServeArgs, mut receive: mpsc::R
         let per_lane = crate::shared::experts::rtx::pair::OwnerPair::device_bytes(&lib, capacity, true, cuteafd_core::ExpertGeometry::DEEPSEEK_V41)?;
         tracing::info!(per_gpu_per_lane_bytes=per_lane, capacity, "NVFP4 W4A4 TP2 expert workspace plan");
     }
-    let inventory = crate::shared::inventory::RuntimeInventory::measure(&lib,&[0,1], |_| {
-        admission::preload(&lib,capacity,2,catalog.nvfp4().is_some(),compressed)
+    let mut exl3_modules = [None, None];
+    let inventory = crate::shared::inventory::RuntimeInventory::measure(&lib,&[0,1], |gpu| {
+        admission::preload(&lib,capacity,2,catalog.nvfp4().is_some(),compressed)?;
+        if compressed {
+            exl3_modules[gpu as usize] = Some(admission::preload_exl3(&lib, &exl3_directory, capacity, 2)?);
+        }
+        Ok(())
     })?;
+    let [mut decode_modules, mut prefill_modules] = [0, 1].map(|_| [None, None]);
+    for (rank, modules) in exl3_modules.into_iter().enumerate() {
+        if let Some([decode, prefill]) = modules {
+            decode_modules[rank] = Some(decode);
+            prefill_modules[rank] = Some(prefill);
+        }
+    }
+    let mut lane_modules = [decode_modules, prefill_modules].into_iter();
     let expert_demands=admission::expert_demands(&lib,&catalog,capacity,2)?;
     let weights = BackboneLaneWeights::load_distributed_with_split(
         &lib,
@@ -329,14 +342,14 @@ pub(super) fn worker(mut args: crate::cli::NativeServeArgs, mut receive: mpsc::R
     if let Some(handoff)=placement_handoff {
         handoff.wait_ready(Duration::from_secs(900))?;
     }
-    let make_transport = || {
+    let mut make_transport = || {
         let timing = crate::families::deepseek_v41::v41_native_serve::protocol_v2_timing();
         let mut transport = devices[1].own(|| {
             let roce = super::spark_transport(&args.peers, capacity, timing, topology)?;
             NativeTp4Wave::new(&lib, roce, wave_bytes)
         })?;
         if let Some(profile) = &paired_profile { transport.install_paired(profile.clone())?; }
-        transport.install_tp2(tp2_ffn::Wave::new(routed.clone(), shared.clone(), expert_layers, capacity)?)?;
+        transport.install_tp2(tp2_ffn::Wave::new(routed.clone(), shared.clone(), expert_layers, capacity, lane_modules.next().context("missing admitted TP2 lane")?)?)?;
         if crate::shared::memory::chain::device_exchange_enabled() && paired_profile.is_none() && topology.is_none()
             && format == crate::families::deepseek_v41::v41_experts::ExpertFormat::Native {
             // Verification waves (up to 80 rows) on the device-driven exchange.

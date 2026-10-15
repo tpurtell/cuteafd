@@ -54,16 +54,18 @@ impl<'a> LocalExpertWave<'a> {
         directory: &Path,
         capacity: u32,
         budget: usize,
+        modules: Vec<crate::shared::experts::exl3::execution::Exl3Modules<'a>>,
     ) -> Result<Self> {
         // SAFETY: the adapter forwards the trusted-package contract unchanged.
         Ok(Self(unsafe {
-            Execution::new_exl3(
+            Execution::new_exl3_with_modules(
                 library,
                 weights,
                 directory,
                 capacity,
                 budget,
                 cuteafd_core::ExpertGeometry::DEEPSEEK_V41,
+                Some(modules),
             )?
         }))
     }

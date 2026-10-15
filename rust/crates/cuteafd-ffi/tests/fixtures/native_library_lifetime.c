@@ -256,3 +256,50 @@ int cuteafd_last_error(char *out, size_t bytes) {
     snprintf(out, bytes, "injected CPU fixture failure");
     return 0;
 }
+
+/* EXL3 contexts model untracked driver residency and device-bound destruction. */
+struct exl3_context { int device; size_t bytes; };
+static int exl3_create(void **out, size_t bytes, char marker) {
+    struct exl3_context *context = malloc(sizeof(*context));
+    if (!context) return 1;
+    context->device = current_device;
+    context->bytes = bytes;
+    memory_used[current_device] += bytes;
+    *out = context;
+    event(marker);
+    return 0;
+}
+static void exl3_destroy(void *handle, char marker) {
+    struct exl3_context *context = handle;
+    if (context->device != current_device) abort();
+    memory_used[current_device] -= context->bytes;
+    event(marker);
+    free(context);
+}
+int cuteafd_exl3_info(uint32_t *out, uint32_t count) {
+    const uint32_t words[16] = {2,5120,1152,6,1,6,2,1,1,1,1,3,4,0,0,4};
+    if (count != 16) return 1;
+    memcpy(out, words, sizeof(words));
+    return 0;
+}
+int cuteafd_exl3_create(void **out) { return exl3_create(out, 4096, 'K'); }
+void cuteafd_exl3_destroy(void *handle) { exl3_destroy(handle, 'k'); }
+int cuteafd_exl3_core(void *handle, void *const *ptrs, const int *scalars, void *stream) {
+    (void)handle; (void)ptrs; (void)scalars; (void)stream; return 0;
+}
+int cuteafd_exl3_sum(void *handle, void *const *ptrs, const int *scalars, void *stream) {
+    return cuteafd_exl3_core(handle, ptrs, scalars, stream);
+}
+int cuteafd_exl3_routes_create(void **out) { return exl3_create(out, 1024, 'R'); }
+int cuteafd_exl3_routes_destroy(void *handle) { exl3_destroy(handle, 'r'); return 0; }
+int cuteafd_exl3_routes_launch(void *handle, void *const *ptrs,
+                             const uint64_t *bytes, int rows, void *stream) {
+    (void)handle; (void)ptrs; (void)bytes; (void)rows; (void)stream; return 0;
+}
+int cuteafd_exl3_wire_initialize(void **out) { return exl3_create(out, 512, 'W'); }
+void cuteafd_exl3_wire_destroy(void *handle) { exl3_destroy(handle, 'w'); }
+int cuteafd_exl3_wire_decode(void *handle, const uint8_t *input, uint64_t in_bytes,
+                           uint16_t *output, uint64_t out_bytes, uint32_t rows, void *stream) {
+    (void)handle; (void)input; (void)in_bytes; (void)output;
+    (void)out_bytes; (void)rows; (void)stream; return 0;
+}

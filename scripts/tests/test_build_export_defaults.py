@@ -48,3 +48,20 @@ def test_seed_admission_after_reuse_and_no_gpu_queue():
     assert 'wip_hwlock' not in dispatch and 'wait-remote)' in dispatch
     assert '[[ "$seed_host" != kakapo ]]' not in capped
     assert text.index('distribute_expert_slot\nwip_resource_complete=1') < text.rindex('wip_build_resource_release')
+
+
+def test_every_fingerprinted_build_input_reaches_both_build_containers():
+    # A key in the slot fingerprint that never reaches the build would seal a
+    # slot whose name claims inputs it was not built with (EXL3_BITS did).
+    text = (ROOT / 'wip.sh').read_text()
+    keys = text.split('for key in EXL3_AOT', 1)[1].split('; do', 1)[0].replace('\\', ' ').split()
+    keys = ['EXL3_AOT', *keys]
+    coordinator = text.split('local -a coordinator_build=(docker exec', 1)[1].split('"$coordinator_container"', 1)[0]
+    spark = text.split('build_command="docker exec', 1)[1].split('\n', 1)[0]
+    consumed = (ROOT / 'scripts/build/build-wip-artifacts.sh').read_text()
+    for key in keys:
+        name = 'CUTEAFD_WIP_' + key
+        if name not in consumed:
+            continue
+        assert name in coordinator, f'{name} is fingerprinted but not passed to the coordinator build'
+    assert 'CUTEAFD_WIP_EXL3_BITS' in spark

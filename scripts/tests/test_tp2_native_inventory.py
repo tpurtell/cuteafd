@@ -214,7 +214,7 @@ def test_owner_pair_diagnostic_timing_waits_for_end_before_elapsed_query():
     assert re.search(r"timing:\s*timing\s*\.then\(\|\|", constructor)
     assert "CUTEAFD_TP2_TIMING" not in source
     capacity_check = constructor.index("weight.max_rows() == max_rows as usize")
-    assert capacity_check < constructor.index("weights[rank].execution()?")
+    assert capacity_check < constructor.index("weights[rank].execution(modules[rank].take())?")
     launcher = (ROOT / "scripts/launch/run-family.sh").read_text()
     assert "CUTEAFD_TP2_TOKEN_SUMS" not in launcher
     execute = owner.split("pub(crate) async unsafe fn execute(", 1)[1].split(

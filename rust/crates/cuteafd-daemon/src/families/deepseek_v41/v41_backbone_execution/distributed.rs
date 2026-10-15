@@ -522,7 +522,7 @@ mod tests {
             },
         )?;
         let mut transport = NativeTp4Wave::new(&lib, roce, NativeTp4Wave::device_bytes(16)?)?;
-        transport.install_tp2(tp2_ffn::Wave::new(routed, shared, 1, 16)?)?;
+        transport.install_tp2(tp2_ffn::Wave::new(routed, shared, 1, 16, [None, None])?)?;
         let mut handoff = crate::families::deepseek_v41::v41_block::BlockTransfer::new(devices[1], devices[0])?;
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()

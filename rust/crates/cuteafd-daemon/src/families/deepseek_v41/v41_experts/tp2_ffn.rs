@@ -197,6 +197,7 @@ impl<'a> Wave<'a> {
         shared: [Rc<Vec<SharedWeights<'a>>>; 2],
         layers: usize,
         capacity: u32,
+        modules: [Option<Vec<crate::shared::experts::exl3::execution::Exl3Modules<'a>>>; 2],
     ) -> Result<Self> {
         let devices = [routed[0].device(), routed[1].device()];
         ensure!(
@@ -229,11 +230,12 @@ impl<'a> Wave<'a> {
                 PeerInputs::new(devices[1], capacity)?,
             ],
             shared: SharedWave::new(shared, capacity)?,
-            routed: OwnerPair::new(
+            routed: OwnerPair::with_modules(
                 routed,
                 capacity,
                 cuteafd_core::ExpertGeometry::DEEPSEEK_V41,
                 std::env::var_os("CUTEAFD_TP2_TIMING").is_some(),
+                modules,
             )?,
             output: [
                 Allocation::new(devices[0], capacity as usize * 10240)?,
@@ -534,8 +536,8 @@ mod tests {
             .ok()
             .expect("two shared ranks");
         let mut lanes = [
-            Wave::new(routed.clone(), shared.clone(), 1, 16)?,
-            Wave::new(routed.clone(), shared.clone(), 1, 16)?,
+            Wave::new(routed.clone(), shared.clone(), 1, 16, [None, None])?,
+            Wave::new(routed.clone(), shared.clone(), 1, 16, [None, None])?,
         ];
         let mut reference_routed = OwnerPair::new(
             routed,

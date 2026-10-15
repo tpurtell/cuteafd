@@ -86,3 +86,110 @@ fn shared_capacity_scratch_matches_private_and_graph_replay() -> Result<()> {
     }
     Ok(())
 }
+
+#[test]
+#[ignore = "requires an allocated CPU build slot and explicit NVMe fixture directory"]
+fn retained_modules_are_measured_once_and_consumed_without_reload() -> Result<()> {
+    use cuteafd_ffi::native_library_lifetime_fixture::Fixture;
+    use cuteafd_loader::{V41Exl3Layer, V41Exl3Partition, V41Exl3Residency, V41Exl3ResidentBuffer};
+    use crate::shared::experts::exl3::WeightBuffer;
+    use crate::shared::experts::layer::ExpertLoadBudget;
+    let fixture = Fixture::build()?;
+    let library = fixture.load()?;
+    fixture.configure_memory(&library, 1, 1 << 30)?;
+    let directory = fixture.directory();
+    let native = directory.join("liblifetime_fixture.so");
+    for name in ["libcuteafd_exl3.so", "libv41_exl3_routes.so"] {
+        std::os::unix::fs::symlink(&native, directory.join(name))?;
+    }
+    std::fs::write(directory.join("routes.json"), b"{}")?;
+    std::fs::write(directory.join("lut"), [0u8; 16])?;
+    let lock: serde_json::Value = serde_json::from_str(include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"), "/../../../third_party/sparkinfer.lock.json")))?;
+    let mut buffers = serde_json::Map::new();
+    for (name, bytes, dtype) in [("output", 5120*4, "torch.float32"), ("fc2", 16, "torch.float32"),
+        ("packed_route_indices", 16, "torch.int32"), ("block_expert_ids", 16, "torch.int32"),
+        ("packed_route_count", 16, "torch.int32"), ("expert_offsets", 16, "torch.int32"),
+        ("expert_counts", 16, "torch.int32")] {
+        buffers.insert(name.into(), serde_json::json!({"bytes":bytes,"dtype":dtype,"allocation":name,"zero_on_create":false}));
+    }
+    let meta = serde_json::json!({
+        "schema":"cuteafd.v41-exl3-aot.v1", "output_dtype":"fp32", "sparkinfer_revision":lock["revision"],
+        "hidden":5120,"intermediate":1152,"experts":6,"capacity":1,"top_k":6,"bits":[3,4],
+        "swiglu_limit":cuteafd_core::expert_geometry().swiglu_limit(),"direct":false,"sms":1,"blocks_per_sm":1,
+        "buffers":buffers,"objects":[
+            {"label":"v41_exl3_core","pointer_slots":["rotation_input_ptr"],"scalar_slots":["active_m"]},
+            {"label":"v41_exl3_sum","pointer_slots":["output_ptr"],"scalar_slots":["active_m"]}],
+        "trellis_lut":{"file":"lut","bytes":16,"sha256":format!("{:x}", Sha256::digest([0u8;16]))},
+        "route_preparation":{"manifest":"routes.json","sha256":format!("{:x}",Sha256::digest(b"{}"))}
+    });
+    std::fs::write(directory.join("v41_exl3.json"), serde_json::to_vec(&meta)?)?;
+    library.cuda_set_device(0)?;
+    let mut lanes = Vec::new();
+    let inventory = crate::shared::inventory::RuntimeInventory::measure(&library, &[1], |_| {
+        for _ in 0..2 {
+            // SAFETY: CPU-only fixture implements the trusted module ABI.
+            lanes.push(unsafe { Exl3Modules::load(&library, directory, Exl3InputFormat::Fp8K32)? });
+        }
+        Ok(())
+    })?;
+    assert_eq!(library.cuda_get_device()?, 0);
+    assert_eq!(inventory.gpus[0].module_bytes, 2*(4096+1024+512));
+    assert_eq!(fixture.events()?, "KRWKRW", "inventory must retain every context");
+    library.cuda_set_device(1)?;
+    let mut names: Vec<String> = ["descriptor_map", "global_to_combined", "intermediate_rotations", "gate_suh", "up_suh", "down_svh", "dummy_scales", "unit_scales"]
+        .into_iter().map(str::to_owned).collect();
+    for tier in 0..2 { for suffix in ["w13", "w2"] { names.push(format!("tier{tier}_{suffix}")); } }
+    let specs: Vec<_> = names.into_iter().map(|name| V41Exl3ResidentBuffer {
+        bytes: if name == "descriptor_map" {3*6*2*4} else {16}, name, initial_words: vec![] }).collect();
+    let arena = DeviceAllocation::new(&library, 1024)?;
+    let weights = Rc::new(vec![Exl3Weights {
+        buffers: specs.iter().map(|s| WeightBuffer { buffer: CuteafdDeviceBuffer { bytes:s.bytes, ..arena.buffer } }).collect(),
+        _arena: arena,
+        layout: V41Exl3Residency { layer:V41Exl3Layer::Backbone(0),world:2,rank:1,layout:V41Exl3Partition::Disjoint,
+            intermediate_start:1152,experts:6,intermediate:1152,tiers:vec![3,4],projection_counts:vec![[0;3];2],buffers:specs,loads:vec![] },
+        budget: ExpertLoadBudget { resident_bytes:1024,device_staging_bytes:0,pinned_host_bytes:0,read_scratch_bytes:0 },
+    }]);
+    let mut executions = Vec::new();
+    for modules in lanes {
+        // SAFETY: private scratch, no queued work or graphs in the CPU fixture.
+        executions.push(unsafe { Exl3Execution::with_modules(&library, weights.clone(), modules, None)? });
+    }
+    assert_eq!(fixture.events()?.chars().filter(|c| "KRW".contains(*c)).collect::<String>(), "KRWKRW",
+        "execution must consume the measured handles, never reload");
+    // Dropping retained native contexts restores their own device even from a peer.
+    library.cuda_set_device(0)?;
+    drop(executions);
+    assert_eq!(library.cuda_get_device()?, 0);
+    assert_eq!(fixture.events()?.chars().filter(|c| "krw".contains(*c)).collect::<String>(), "krwkrw");
+    library.cuda_set_device(1)?;
+    drop(weights);
+    assert_eq!(library.cuda_memory_info()?, (1 << 30, 1 << 30));
+
+    // An admission that never constructs execution still owns device-correct cleanup.
+    let before = fixture.events()?.len();
+    // SAFETY: CPU-only fixture implements the trusted module ABI.
+    let unused = unsafe { Exl3Modules::load(&library, directory, Exl3InputFormat::Fp8K32)? };
+    library.cuda_set_device(0)?;
+    drop(unused);
+    assert_eq!(library.cuda_get_device()?, 0);
+    assert_eq!(&fixture.events()?[before..], "KRWkrw");
+
+    // A later module failure releases the already loaded core before inventory exits.
+    let mut invalid = meta;
+    invalid["route_preparation"]["sha256"] = serde_json::json!("invalid");
+    std::fs::write(directory.join("v41_exl3.json"), serde_json::to_vec(&invalid)?)?;
+    let before = fixture.events()?.len();
+    let error = crate::shared::inventory::RuntimeInventory::measure(&library, &[1], |_| {
+        // SAFETY: the trusted fixture intentionally carries a failing route hash.
+        let _modules = unsafe { Exl3Modules::load(&library, directory, Exl3InputFormat::Fp8K32)? };
+        Ok(())
+    }).expect_err("invalid route hash must fail admission");
+    assert!(format!("{error:#}").contains("EXL3 route export hash mismatch"));
+    assert_eq!(library.cuda_get_device()?, 0);
+    assert_eq!(&fixture.events()?[before..], "Kk");
+    library.cuda_set_device(1)?;
+    assert_eq!(library.cuda_memory_info()?, (1 << 30, 1 << 30));
+    library.cuda_set_device(0)?;
+    Ok(())
+}

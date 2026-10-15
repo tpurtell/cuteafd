@@ -4,7 +4,7 @@ use super::{ExpertInput, PartialDtype, Routes, RtxExpertLayer, RtxSelectionPolic
 use crate::shared::experts::{
     exl3::{
         execution::{
-            Exl3Execution, Exl3InputFormat, Exl3ReductionPlan, Exl3RowPolicy, Exl3Workspace,
+            Exl3Modules, Exl3Execution, Exl3InputFormat, Exl3ReductionPlan, Exl3RowPolicy, Exl3Workspace,
         },
         Exl3Weights,
     },
@@ -64,6 +64,9 @@ impl<'a> Exl3Tp2Weights<'a> {
         self.max_rows
     }
     pub(crate) fn execution(&self) -> Result<Exl3Tp2<'a>> {
+        self.execution_with_modules(None)
+    }
+    pub(crate) fn execution_with_modules(&self, modules: Option<Vec<Exl3Modules<'a>>>) -> Result<Exl3Tp2<'a>> {
         let reduction_plan = match self.selection {
             RtxSelectionPolicy::FirstCapacity => None,
             RtxSelectionPolicy::CanonicalDecode => Some(Exl3ReductionPlan::new(&directories(
@@ -88,7 +91,7 @@ impl<'a> Exl3Tp2Weights<'a> {
             weights: self.weights.clone(),
             output: None,
         };
-        lane.initialize_lane()?;
+        lane.initialize_lane(modules)?;
         Ok(lane)
     }
 }
@@ -415,7 +418,7 @@ impl<'a> Exl3Tp2<'a> {
         Ok(ranks)
     }
 
-    fn initialize_lane(&mut self) -> Result<()> {
+    fn initialize_lane(&mut self, modules: Option<Vec<Exl3Modules<'a>>>) -> Result<()> {
         let paths = selected_directories(
             &self.package,
             self.max_rows,
@@ -424,21 +427,27 @@ impl<'a> Exl3Tp2<'a> {
         )?;
         self.executions = Some(self.device.own(|| {
             let arena = Exl3Workspace::new(self.device.library, &paths)?;
-            paths
-                .iter()
+            let modules = match modules {
+                Some(modules) => modules,
+                None => paths.iter().map(|path| {
+                    // SAFETY: these are the same trusted pinned packages used for binding.
+                    unsafe { Exl3Modules::load(self.device.library, path, Self::INPUT_FORMAT) }
+                }).collect::<Result<Vec<_>>>()?,
+            };
+            ensure!(modules.len() == paths.len(), "EXL3 TP2 preload capacity count differs");
+            modules.into_iter()
                 .zip(selected_capacities(
                     self.max_rows,
                     self.row_policy,
                     self.selection,
                 )?)
-                .map(|(path, capacity)| {
+                .map(|(modules, capacity)| {
                     // SAFETY: trusted pinned packages; capacities serialize on the rank stream.
                     let execution = unsafe {
-                        Exl3Execution::with_shared_workspace(
+                        Exl3Execution::with_modules(
                             self.device.library,
                             self.weights.get().clone(),
-                            path,
-                            Self::INPUT_FORMAT,
+                            modules,
                             Some(arena.clone()),
                         )?
                     };

@@ -1,4 +1,5 @@
 //! Paired routed execution, canonical routes and fused payloads on serialized rank streams.
+use crate::shared::experts::exl3::execution::Exl3Modules;
 use super::{
     ExchangeDtype, ExpertInput, FusedCombine, PartialDtype, RouteCheck, RouteIdentity, RouteSource,
     Routes, RtxExpertLayer, RtxShard,
@@ -604,10 +605,13 @@ impl<'a> OwnerWeights<'a> {
             Self::Exl3(w) => w.max_rows(),
         }
     }
-    fn execution(&self) -> Result<OwnerExecution<'a>> {
+    fn execution(&self, modules: Option<Vec<Exl3Modules<'a>>>) -> Result<OwnerExecution<'a>> {
         Ok(match self {
-            Self::Native(w) => OwnerExecution::Native(w.execution()?),
-            Self::Exl3(w) => OwnerExecution::Exl3(w.execution()?),
+            Self::Native(w) => {
+                ensure!(modules.is_none(), "native owner received EXL3 modules");
+                OwnerExecution::Native(w.execution()?)
+            }
+            Self::Exl3(w) => OwnerExecution::Exl3(w.execution_with_modules(modules)?),
         })
     }
 }
@@ -711,6 +715,14 @@ impl<'a> OwnerPair<'a> {
         geometry: cuteafd_core::ExpertGeometry,
         timing: bool,
     ) -> Result<Self> {
+        Self::with_modules(weights, max_rows, geometry, timing, [None, None])
+    }
+
+    pub(crate) fn with_modules(
+        weights: [OwnerWeights<'a>; 2], max_rows: u32,
+        geometry: cuteafd_core::ExpertGeometry, timing: bool,
+        mut modules: [Option<Vec<Exl3Modules<'a>>>; 2],
+    ) -> Result<Self> {
         use crate::shared::memory::device::{Event, Stream};
         let devices = [weights[0].device(), weights[1].device()];
         cuteafd_ffi::V41Tp2ExpertReducer::require_owner_geometry(geometry)?;
@@ -730,8 +742,8 @@ impl<'a> OwnerPair<'a> {
                 && weights[0].uses_bf16_input() == weights[1].uses_bf16_input(),
             "owner pair layer/input contract differs"
         );
-        let make_rank = |rank: usize| -> Result<OwnerRank<'a>> {
-            let execution = weights[rank].execution()?;
+        let mut make_rank = |rank: usize| -> Result<OwnerRank<'a>> {
+            let execution = weights[rank].execution(modules[rank].take())?;
             ensure!(
                 execution.backend().shard() == RtxShard::Tp2 { rank: rank as u8 },
                 "owner pair rank identity differs"

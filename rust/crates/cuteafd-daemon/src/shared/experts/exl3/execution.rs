@@ -363,10 +363,92 @@ struct LayerBinding {
     output_slot: usize,
 }
 
-pub(crate) struct Exl3Execution<'a> {
+/// Native contexts retained from inventory through the last execution/graph.
+/// Each capacity and independently scheduled lane owns a distinct instance.
+pub(crate) struct Exl3Modules<'a> {
+    owner: crate::shared::memory::device::DeviceOwner<'a, LoadedModules<'a>>,
+}
+struct LoadedModules<'a> {
+    directory: PathBuf,
+    meta: Manifest,
+    format: Exl3InputFormat,
     kernel: V41Exl3Kernel,
     routes: Option<V41Exl3Routes>,
-    wire: Option<(cuteafd_ffi::V41Exl3Wire<'a>, DeviceAllocation<'a>)>,
+    wire: Option<cuteafd_ffi::V41Exl3Wire<'a>>,
+}
+impl<'a> Exl3Modules<'a> {
+    /// # Safety
+    /// The directory contains trusted native code for the current CUDA device.
+    pub(crate) unsafe fn load(
+        library: &'a NativeLibrary, directory: &Path, format: Exl3InputFormat,
+    ) -> Result<Self> {
+        let device = crate::shared::memory::device::Device { library, id: library.cuda_get_device()? };
+        let owner = device.own(|| {
+            let meta: Manifest = serde_json::from_slice(&std::fs::read(directory.join("v41_exl3.json"))?)?;
+            meta.group_rows()?;
+            let core_reads_wire = meta.wire_input()?;
+            ensure!(!core_reads_wire || format == Exl3InputFormat::Fp8K32,
+                "EXL3 wire-input export requires FP8 K32 expert inputs");
+            let lock: serde_json::Value = serde_json::from_str(include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../../third_party/sparkinfer.lock.json"
+            )))?;
+            ensure!(
+                meta.schema == "cuteafd.v41-exl3-aot.v1"
+                    && meta.sparkinfer_revision == lock["revision"].as_str().unwrap_or(""),
+                "EXL3 export/source mismatch"
+            );
+
+            let expected_layout = meta.native_layout()?;
+            // SAFETY: the caller trusts this native package; the device owner scopes destruction.
+            let kernel = unsafe { V41Exl3Kernel::load_with_layout(directory.join("libcuteafd_exl3.so"), expected_layout)? };
+            let info = kernel.info();
+            ensure!(
+                info.hidden == meta.hidden
+                    && info.intermediate == meta.intermediate
+                    && info.experts == meta.experts
+                    && info.capacity == meta.capacity
+                    && info.topk == meta.top_k
+                    && info.bits[..info.tier_count]
+                        .iter()
+                        .map(|b| *b as usize)
+                        .eq(meta.bits.iter().copied()),
+                "EXL3 binary/manifest mismatch"
+            );
+            let output_dtype = match info.output_element_bytes {
+                2 => ("bf16", "torch.bfloat16"),
+                4 => ("fp32", "torch.float32"),
+                _ => anyhow::bail!("unsupported EXL3 output precision"),
+            };
+            let output_spec = meta.buffers.get("output").context("missing EXL3 output")?;
+            ensure!(
+                meta.output_dtype == output_dtype.0
+                    && output_spec.dtype == output_dtype.1
+                    && output_spec.bytes == meta.capacity * meta.hidden * info.output_element_bytes,
+                "EXL3 output precision/size mismatch"
+            );
+
+            let routes = if meta.direct { None } else {
+                let route = meta.route_preparation.as_ref().context("missing EXL3 packed route export")?;
+                let path = directory.join(&route.manifest);
+                let bytes = std::fs::read(&path)?;
+                ensure!(format!("{:x}", Sha256::digest(&bytes)) == route.sha256,
+                    "EXL3 route export hash mismatch");
+                // SAFETY: the caller trusts this package and its referenced route library.
+                Some(unsafe { V41Exl3Routes::load(path.parent().unwrap().join("libv41_exl3_routes.so"))? })
+            };
+            let wire = if format == Exl3InputFormat::Fp8K32 && !core_reads_wire {
+                Some(library.v41_exl3_wire()?)
+            } else { None };
+            Ok(LoadedModules { directory: directory.to_owned(), meta, format, kernel, routes, wire })
+        })?;
+        Ok(Self { owner })
+    }
+}
+
+pub(crate) struct Exl3Execution<'a> {
+    modules: Exl3Modules<'a>,
+    wire: Option<DeviceAllocation<'a>>,
     /// Inputs arrive as wire rows (decoded by `wire`, or read by the core).
     wire_rows: bool,
     _storage: Vec<DeviceAllocation<'a>>,
@@ -440,21 +522,28 @@ impl<'a> Exl3Execution<'a> {
         format: Exl3InputFormat,
         shared: Option<Rc<Exl3Workspace<'a>>>,
     ) -> Result<Self> {
-        let meta: Manifest =
-            serde_json::from_slice(&std::fs::read(directory.join("v41_exl3.json"))?)?;
+        // SAFETY: forwards the trusted-package contract; scratch remains lane-local.
+        let modules = unsafe { Exl3Modules::load(library, directory, format)? };
+        // SAFETY: the caller serializes all users of the shared workspace.
+        unsafe { Self::with_modules(library, weights, modules, shared) }
+    }
+
+    /// # Safety
+    /// All executions sharing the arena serialize, including graph replays.
+    /// Referencing graphs must be retired before this execution is destroyed.
+    pub(crate) unsafe fn with_modules(
+        library: &'a NativeLibrary,
+        weights: Rc<Vec<Exl3Weights<'a>>>,
+        modules: Exl3Modules<'a>,
+        shared: Option<Rc<Exl3Workspace<'a>>>,
+    ) -> Result<Self> {
+        ensure!(std::ptr::eq(library, modules.owner.device.library)
+            && library.cuda_get_device()? == modules.owner.device.id,
+            "EXL3 preload library/device mismatch");
+        let meta = &modules.owner.meta;
+        let directory = &modules.owner.directory;
+        let format = modules.owner.format;
         let group_rows = meta.group_rows()?;
-        let core_reads_wire = meta.wire_input()?;
-        ensure!(!core_reads_wire || format == Exl3InputFormat::Fp8K32,
-            "EXL3 wire-input export requires FP8 K32 expert inputs");
-        let lock: serde_json::Value = serde_json::from_str(include_str!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../../third_party/sparkinfer.lock.json"
-        )))?;
-        ensure!(
-            meta.schema == "cuteafd.v41-exl3-aot.v1"
-                && meta.sparkinfer_revision == lock["revision"].as_str().unwrap_or(""),
-            "EXL3 export/source mismatch"
-        );
         ensure!(
             !weights.is_empty(),
             "EXL3 execution requires resident layers"
@@ -499,32 +588,7 @@ impl<'a> Exl3Execution<'a> {
                 };
             ensure!(meta.top_k == expected_topk, "EXL3 expert top-k mismatch");
         }
-        let kernel = V41Exl3Kernel::load_with_layout(directory.join("libcuteafd_exl3.so"), expected_layout)?;
-        let info = kernel.info();
-        ensure!(
-            info.hidden == meta.hidden
-                && info.intermediate == meta.intermediate
-                && info.experts == meta.experts
-                && info.capacity == meta.capacity
-                && info.topk == meta.top_k
-                && info.bits[..info.tier_count]
-                    .iter()
-                    .map(|b| *b as usize)
-                    .eq(meta.bits.iter().copied()),
-            "EXL3 binary/manifest mismatch"
-        );
-        let output_dtype = match info.output_element_bytes {
-            2 => ("bf16", "torch.bfloat16"),
-            4 => ("fp32", "torch.float32"),
-            _ => anyhow::bail!("unsupported EXL3 output precision"),
-        };
-        let output_spec = meta.buffers.get("output").context("missing EXL3 output")?;
-        ensure!(
-            meta.output_dtype == output_dtype.0
-                && output_spec.dtype == output_dtype.1
-                && output_spec.bytes == meta.capacity * meta.hidden * info.output_element_bytes,
-            "EXL3 output precision/size mismatch"
-        );
+        let info = modules.owner.kernel.info();
         let mut storage = Vec::new();
         let mut pointers = BTreeMap::new();
         // Never resize to the current device's SM count: compiled grid barriers
@@ -662,18 +726,7 @@ impl<'a> Exl3Execution<'a> {
         }
         let mut route_pointers = [std::ptr::null_mut(); 7];
         let mut route_bytes = [0; 7];
-        let routes = if meta.direct {
-            None
-        } else {
-            let route = meta
-                .route_preparation
-                .context("missing EXL3 packed route export")?;
-            let path = directory.join(route.manifest);
-            let bytes = std::fs::read(&path)?;
-            ensure!(
-                format!("{:x}", Sha256::digest(&bytes)) == route.sha256,
-                "EXL3 route export hash mismatch"
-            );
+        if modules.owner.routes.is_some() {
             for (index, name) in [
                 "global_to_combined_ptr",
                 "packed_route_indices",
@@ -695,24 +748,11 @@ impl<'a> Exl3Execution<'a> {
                 route_pointers[index + 1] = buffer.ptr;
                 route_bytes[index + 1] = buffer.bytes as u64;
             }
-            Some(V41Exl3Routes::load(
-                path.parent().unwrap().join("libv41_exl3_routes.so"),
-            )?)
-        };
-        let wire = if format == Exl3InputFormat::Fp8K32 && !core_reads_wire {
-            // The router's hidden-wide wire row is replicated across TP ranks;
-            // only intermediate expert weights are sliced. Local RTX TP1/TP2
-            // therefore use the same decoder as Spark TP4.
-            Some((
-                library.v41_exl3_wire()?,
-                DeviceAllocation::new(library, meta.capacity * meta.hidden * 2)?,
-            ))
-        } else {
-            None
-        };
+        }
+        let wire = if modules.owner.wire.is_some() {
+            Some(DeviceAllocation::new(library, meta.capacity * meta.hidden * 2)?)
+        } else { None };
         Ok(Self {
-            kernel,
-            routes,
             wire,
             wire_rows: format == Exl3InputFormat::Fp8K32,
             _storage: storage,
@@ -728,6 +768,7 @@ impl<'a> Exl3Execution<'a> {
             capacity: meta.capacity,
             group_rows,
             topk: meta.top_k,
+            modules,
             library,
         })
     }
@@ -749,7 +790,7 @@ impl<'a> Exl3Execution<'a> {
     /// Privately allocated payload; shared arenas are counted once by their planner.
     pub(crate) fn workspace_bytes(&self) -> usize {
         self._storage.iter().map(|b| b.buffer.bytes).sum::<usize>()
-            + self.wire.as_ref().map_or(0, |(_, b)| b.buffer.bytes)
+            + self.wire.as_ref().map_or(0, |b| b.buffer.bytes)
     }
 
     /// # Safety
@@ -852,11 +893,11 @@ impl<'a> Exl3Execution<'a> {
                 "EXL3 ownership device row mismatch");
             self.library.copy_d2d_async(destination, source, destination.bytes, stream)?;
         }
-        if let Some((wire, decoded)) = &self.wire {
-            wire.decode(inputs[0], decoded.buffer, rows, stream)?;
+        if let Some(decoded) = &self.wire {
+            self.modules.owner.wire.as_ref().context("missing retained EXL3 wire decoder")?.decode(inputs[0], decoded.buffer, rows, stream)?;
             inputs[0] = decoded.buffer;
         }
-        if let Some(routes) = &self.routes {
+        if let Some(routes) = &self.modules.owner.routes {
             self.route_pointers[0] = inputs[1].ptr;
             self.route_pointers[1] = binding.expert_map.ptr;
             self.route_bytes[1] = binding.expert_map.bytes as u64;
@@ -874,9 +915,9 @@ impl<'a> Exl3Execution<'a> {
         // Every resident peer waiter on this device must run on this producer
         // stream or behind its completion event; one independent spinner can
         // prevent the entire cooperative grid from becoming resident forever.
-        self.kernel
+        self.modules.owner.kernel
             .launch_core(&binding.core.pointers, &binding.core.scalars, stream)?;
-        self.kernel
+        self.modules.owner.kernel
             .launch_sum(&binding.sum.pointers, &binding.sum.scalars, stream)?;
         output.bytes = rows * self.hidden * self.output_element_bytes;
         Ok(output)

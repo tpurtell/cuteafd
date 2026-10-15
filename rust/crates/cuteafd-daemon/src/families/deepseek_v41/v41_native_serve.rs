@@ -363,8 +363,15 @@ fn worker(
          a native three-rank group must pass --spark-tp 3 --spark-ep 1"
     );
     let paired_profile = crate::families::deepseek_v41::v41_experts::paired::PairedProfile::for_serving(&catalog, args.exl3_paired_tp4)?;
+    let local_exl3_directory = crate::families::deepseek_v41::v41_experts::exl3::aot_layout_directory(
+        &args.native_lib, catalog.exl3().map(|m| m.decoder_tiers()).unwrap_or(&[]), "rtx-tp1");
+    let mut exl3_modules = None;
     let inventory = crate::shared::inventory::RuntimeInventory::measure(&lib, &[lib.cuda_get_device()?], |_| {
-        admission::preload(&lib, capacity, 1, catalog.nvfp4().is_some(), catalog.exl3().is_some())
+        admission::preload(&lib, capacity, 1, catalog.nvfp4().is_some(), catalog.exl3().is_some())?;
+        if catalog.exl3().is_some() && args.rtx_expert_layers != admission::LocalLayers::Count(0) {
+            exl3_modules = Some(admission::preload_exl3(&lib, &local_exl3_directory, aot_capacity, 1)?);
+        }
+        Ok(())
     })?;
     admission::admit_startup(&lib, &catalog, &args)?;
     let start = Instant::now();
@@ -608,10 +615,11 @@ fn worker(
                     budgets[layer].peak_device_bytes()?)?);
             }
             let weights = std::rc::Rc::new(loaded);
+            let [decode_modules, prefill_modules] = exl3_modules.take().context("missing admitted EXL3 modules")?;
             transport.install_local(unsafe { LocalExpertWave::new_exl3(&lib, weights.clone(),
-                &exl3_directory, aot_capacity, per_lane)? })?;
+                &exl3_directory, aot_capacity, per_lane, decode_modules)? })?;
             prefill_transport.install_local(unsafe { LocalExpertWave::new_exl3(&lib, weights,
-                &exl3_directory, aot_capacity, per_lane)? })?;
+                &exl3_directory, aot_capacity, per_lane, prefill_modules)? })?;
         } else if local_layers > 0 {
             let mut loaded = Vec::with_capacity(local_layers);
             for layer in 0..local_layers {
