@@ -10,6 +10,7 @@ pub mod format;
 pub mod launch;
 pub mod layout;
 pub mod names;
+pub mod reader;
 pub mod spec;
 #[doc(hidden)]
 pub mod testing;
@@ -20,6 +21,7 @@ use std::path::Path;
 use std::sync::OnceLock;
 
 pub use checkpoint::Checkpoint;
+pub use reader::ShardReader;
 pub use family::{ConfigError, ExpertContract, Family, FamilyModel, Hint, RuntimeStatus};
 pub use format::{Encoding, Malformed, QuantOperand, RowTiling, ScaleEncoding};
 pub use spec::{AttentionKind, Component, FfnKind, ModelSpec, TensorRole};
