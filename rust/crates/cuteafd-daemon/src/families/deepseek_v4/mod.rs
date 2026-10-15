@@ -583,6 +583,7 @@ pub(crate) fn with_engine<T>(
         if args.full_prefill_logits { engine.prepare_scoring_prefill()?; }
         engine.warm_local_graphs()?;
         engine.check_routes(&mut transports, &runtime)?;
+        let _capture_session = crate::shared::decode_graph::CaptureWatch::session();
         let _coverage_session = engine.graph_coverage.session();
         body(&engine, &mut transports, &runtime)
     })();
@@ -956,5 +957,16 @@ mod program_selection_tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn v4_decode_graph_bank_uses_fixed_startup_and_seals_inventory() {
+        let engine = include_str!("engine.rs");
+        assert!(!engine.contains("HashMap<GraphKey"));
+        assert!(engine.contains("type GraphExec<'a> = crate::shared::decode_graph::GraphOwner<'a, ()>;"));
+        assert_eq!(engine.matches("GraphPolicy::FixedStartup").count(), 2);
+        assert!(engine.contains("self.graphs.borrow_mut().seal_startup(&keys0)?"));
+        assert!(engine.contains("peer.graphs.borrow_mut().seal_startup(&keys1)?"));
+        assert!(engine.contains("tables.pad_c4_decode(self.c4_supertile_pages());"));
     }
 }

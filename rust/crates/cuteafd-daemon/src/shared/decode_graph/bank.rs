@@ -83,6 +83,8 @@ impl<K: Hash + Eq + Clone + std::fmt::Debug, E> GraphBank<K, E> {
         Ok(())
     }
 
+    pub fn is_sealed(&self) -> bool { self.startup.is_some() }
+
     pub fn enqueue(&mut self, key: &K) -> (GraphDecision, Option<&E>) {
         let decision = if self.entries.contains_key(key) { GraphDecision::Replay }
             else if self.policy == GraphPolicy::FixedStartup { GraphDecision::Eager }

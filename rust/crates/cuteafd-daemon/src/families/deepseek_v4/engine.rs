@@ -59,7 +59,7 @@ pub(crate) struct Engine<'a> {
     prefill_workspace: RefCell<Option<Workspace<'a>>>,
     decode_workspace: RefCell<Option<Workspace<'a>>>,
     pub profile: RefCell<Profile>,
-    graphs: RefCell<std::collections::HashMap<GraphKey, GraphExec<'a>>>,
+    graphs: RefCell<crate::shared::decode_graph::GraphBank<GraphKey, GraphExec<'a>>>,
     /// Expert layers resident on this GPU (they skip the Spark exchange).
     pub local: RefCell<Option<super::local::LocalExperts<'a>>>,
     /// The token embedding table (resident on this GPU or read from its shard).
@@ -92,6 +92,7 @@ pub(crate) struct Engine<'a> {
     expert_graph_captures: std::cell::Cell<usize>,
     pub(super) graph_coverage: crate::shared::decode_graph::census::LaunchCoverage,
     draft_probe: RefCell<Option<crate::shared::draft::probe::RoundProbe<'a>>>,
+    decode_transport: Cell<Option<([*const u16; crate::shared::spark_intake::MAX_INTAKE_RANKS], usize)>>,
 }
 
 /// The second GPU of a two-GPU head split (rank 1): its share of every
@@ -108,7 +109,7 @@ pub(crate) struct V4Peer<'a> {
     rope_compressed: Dev<'a>,
     prefill_workspace: RefCell<Option<Workspace<'a>>>,
     decode_workspace: RefCell<Option<Workspace<'a>>>,
-    graphs: RefCell<std::collections::HashMap<GraphKey, GraphExec<'a>>>,
+    graphs: RefCell<crate::shared::decode_graph::GraphBank<GraphKey, GraphExec<'a>>>,
 }
 
 /// Exchange slot of layer `layer`, lane `lane`: its attention partials (`ffn`
@@ -191,14 +192,7 @@ impl GraphKey {
 /// The decode step's tail (last post, taps, drafter KV, head) as a graph key layer.
 const TAIL_SEGMENT: usize = usize::MAX;
 
-struct GraphExec<'a>(*mut c_void, &'a NativeLibrary);
-
-impl Drop for GraphExec<'_> {
-    fn drop(&mut self) {
-        // SAFETY: the exec came from end_capture and is destroyed once.
-        let _ = unsafe { self.1.cuda_graph_exec_destroy(self.0) };
-    }
-}
+type GraphExec<'a> = crate::shared::decode_graph::GraphOwner<'a, ()>;
 
 /// Host-visible phases of a step, for profiling.
 #[derive(Debug, Clone, Copy)]
@@ -441,12 +435,15 @@ impl<'a> Engine<'a> {
                 self.context_mode.is_some())).collect::<Result<Vec<_>>>()?;
             Ok(V4Peer { device, stream, layers, pools, rope_window: table(false)?, rope_compressed: table(true)?,
                 prefill_workspace: RefCell::new(None), decode_workspace: RefCell::new(None),
-                graphs: RefCell::new(std::collections::HashMap::new()) })
+                graphs: RefCell::new(crate::shared::decode_graph::GraphBank::with_policy(
+                    crate::shared::decode_graph::GraphPolicy::FixedStartup,
+                )) })
         })?;
         self.peer = Some(peer);
         self.exchange = Some(exchange);
         Ok(())
     }
+
 
     fn selected_programs(&self) -> cuteafd_core::coordinator_programs::CoordinatorPrograms<'_> {
         cuteafd_core::coordinator_programs::CoordinatorPrograms { family: self.family, split_family: self.split_family }
@@ -542,6 +539,7 @@ impl<'a> Engine<'a> {
             expert_graph_captures: std::cell::Cell::new(0),
             graph_coverage: crate::shared::decode_graph::census::LaunchCoverage::new(),
             draft_probe: RefCell::new(None),
+            decode_transport: Cell::new(None),
             rope_window: table(false)?,
             rope_compressed: table(true)?,
             pools,
@@ -562,7 +560,9 @@ impl<'a> Engine<'a> {
             prefill_workspace: RefCell::new(None),
             decode_workspace: RefCell::new(None),
             profile: RefCell::new(Profile::default()),
-            graphs: RefCell::new(std::collections::HashMap::new()),
+            graphs: RefCell::new(crate::shared::decode_graph::GraphBank::with_policy(
+                crate::shared::decode_graph::GraphPolicy::FixedStartup,
+            )),
             local: RefCell::new(None),
             embedding: parts.embedding,
             skip_routed: parts.skip_routed,
@@ -772,6 +772,13 @@ impl<'a> Engine<'a> {
         }
     }
 
+    /// Single-supertile C4 page-table width (`512` pages = `131,072` source tokens, clipped to
+    /// `max_context` and `shape.units`).
+    pub(crate) fn c4_supertile_pages(&self) -> usize {
+        512.min(self.max_context.div_ceil(metadata::SOURCE_PAGE_TOKENS).max(1))
+            .min(self.shape.units.max(1))
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn prefill_step(
         &self,
@@ -831,12 +838,14 @@ impl<'a> Engine<'a> {
         }
         let tokens: Vec<u32> = rows.iter().map(|(_, token)| *token).collect();
         let steps: Vec<(&Placement, usize)> = rows.iter().map(|(p, _)| (&**p, p.len)).collect();
-        let tables = metadata::decode_step(&steps, &self.shape, self.cfg.index_topk, self.c128_width)?;
+        let mut tables = metadata::decode_step(&steps, &self.shape, self.cfg.index_topk, self.c128_width)?;
+        tables.pad_c4_decode(self.c4_supertile_pages());
         let step = LaneStep { tables: &tables, tokens: &tokens, units: &[] };
         let transports = match transport {
             Some(transport) => std::slice::from_mut(transport),
             None => &mut [],
         };
+        let _capture_round = crate::shared::decode_graph::CaptureWatch::round();
         let logits = self.step(&[step], transports, runtime, tokens.len(), None, false)?;
         for (placement, _) in rows.iter_mut() {
             placement.len += 1;
@@ -875,14 +884,17 @@ impl<'a> Engine<'a> {
                 "verify of {} rows at {} outside the context", tokens.len(), placement.len);
         }
         let spans: Vec<(&Placement, usize, usize)> = sequences.iter().map(|(p, t)| (&**p, p.len, t.len())).collect();
-        let tables = metadata::verify_step(&spans, &self.shape, self.cfg.index_topk, self.c128_width)?;
+        let mut tables = metadata::verify_step(&spans, &self.shape, self.cfg.index_topk, self.c128_width)?;
+        tables.pad_c4_decode(self.c4_supertile_pages());
         let step = LaneStep { tables: &tables, tokens: &tokens, units: &[] };
+        let _capture_round = crate::shared::decode_graph::CaptureWatch::round();
         let logits = self.step(&[step], transports, runtime, tokens.len(), None, false)?;
         for (placement, tokens) in sequences.iter_mut() {
             placement.len += tokens.len();
         }
         logits.device()
     }
+
 
     /// Runs every layer for `lanes` (one decode lane, or prefill lanes of
     /// consecutive rows of one sequence) and returns the logits of the last
@@ -1013,7 +1025,7 @@ impl<'a> Engine<'a> {
         };
         if decode {
             let (tables, lane) = (lanes[0].tables, &w.lanes[0]);
-            let (t, rows) = (tables.rows, rows_of(0));
+            let t = tables.rows;
             // Decode waves go to the first transport; its planes are baked into
             // the replayed graphs (they never move).
             let device = self.device_link.as_ref().filter(|_| !self.skip_routed);
@@ -1031,52 +1043,19 @@ impl<'a> Engine<'a> {
             let mut ranks = 0usize;
             for (layer, weights) in self.weights.layers.iter().enumerate() {
                 let previous = ranks;
-                // One segment: the previous layer's FFN reduce + mHC post, then
-                // this layer's attention, router and expert input quantization,
-                // replayed as a CUDA graph keyed by everything it bakes in.
-                let segment = || -> Result<()> {
-                    if layer == 0 && gather {
-                        self.gather_streams(lane, t)?;
-                    }
-                    if let (0, Some(w1)) = (layer, w1) {
-                        self.record_peer(0, "entry", DIRECT, true, 0, 0);
-                        self.exchange()?.push_to(0, DIRECT, lane.stream_a.buffer.ptr, w1.lanes[0].stream_a.buffer.ptr,
-                            t * 4 * h * 2)?;
-                    }
-                    if previous > 0 {
-                        self.post_layer(w, lane, 0, previous, decode_planes, rows, layer - 1)?;
-                        self.tap(w, lane, layer - 1, t)?;
-                    }
-                    if w1.is_some() {
-                        self.attention_split(layer, weights, tables, lane, 0, w, rows, cap)?;
-                    } else {
-                        self.attention(layer, weights, tables, lane, w, rows, cap)?;
-                    }
-                    // Device exchange: the layer's Spark wave, the shared expert while the
-                    // Sparks compute, and the wait for its partials join the segment.
-                    match device {
-                        Some(link) if layer >= local_layers => self.device_experts(link, layer, t, w, lane, cap),
-                        _ => Ok(()),
-                    }
-                };
-                let key = GraphKey {
-                    layer,
-                    rows: t,
-                    chunked: tables.chunked,
-                    attention: self.attention_kind(weights.ratio, tables),
-                    table_width: tables.c4_table_width,
-                    table_stride: tables.c4_table_stride,
-                    previous,
-                    tp2_broadcast: false, exchange_f32: false,
-                };
+                let key = self.layer_key(layer, weights.ratio, tables, t, previous);
                 if let Some(link) = device.filter(|_| layer >= local_layers) {
                     // Announced before the replay can publish it: the proxy spins for it.
                     link.expect(1);
                 }
-                if self.mixed_attention(weights.ratio, tables) {
+                if !self.capture_only.get() && self.mixed_attention(weights.ratio, tables) {
                     self.coverage_legacy(0, key, crate::shared::decode_graph::census::Launch::Eager, "mixed-c128");
-                    segment()?;
-                } else { self.replay_on(0, key, segment)?; }
+                    self.decode_layer_segment(layer, weights, tables, w, w1, previous, decode_planes, t, cap, gather)?;
+                } else {
+                    self.replay_on(0, key, || {
+                        self.decode_layer_segment(layer, weights, tables, w, w1, previous, decode_planes, t, cap, gather)
+                    })?;
+                }
                 // Preserve owner routes outside capture before another router reuses them.
                 self.probe_ring(layer, w, t, device.is_none() && layer >= local_layers)?;
                 if let Some(w1) = w1 {
@@ -1098,17 +1077,12 @@ impl<'a> Engine<'a> {
                 crate::shared::console::layer_mark(layer);
             }
             // The tail: the last post, its taps and the drafter's KV, then the head.
-            let last = self.weights.layers.len() - 1;
-            let key = GraphKey { layer: TAIL_SEGMENT, rows: t, chunked: false, attention: "tail", table_width: 0,
+            let mut key = GraphKey { layer: TAIL_SEGMENT, rows: t, chunked: false, attention: "tail", table_width: 0,
                 table_stride: 0, previous: ranks, tp2_broadcast: false, exchange_f32: false };
-            self.replay(key, || -> Result<()> {
-                if ranks > 0 {
-                    self.post_layer(w, lane, 0, ranks, decode_planes, rows, last)?;
-                    self.tap(w, lane, last, t)?;
-                }
-                self.write_draft_kv(w, lane, t, cap)?;
-                self.head_launch(&lane.stream_a, t, t, 0, w)
-            })?;
+            if self.tp2.is_some() {
+                key.exchange_f32 = self.exchange_policy.is_f32(t, self.decode_rows);
+            }
+            self.replay(key, || self.decode_tail_segment(w, ranks, decode_planes, t, cap))?;
             self.finish_route_step()?;
             return Ok(Logits::Device(Some(self.device_logits(w, t))));
         } else {
@@ -1236,6 +1210,88 @@ impl<'a> Engine<'a> {
         Ok(if download { Logits::Host(logits) } else { Logits::Device(Some(self.device_logits(w, landed))) })
     }
 
+    fn layer_key(&self, layer: usize, ratio: usize, tables: &StepTables, t: usize, previous: usize) -> GraphKey {
+        let mut key = GraphKey {
+            layer,
+            rows: t,
+            chunked: tables.chunked,
+            attention: self.attention_kind(ratio, tables),
+            table_width: tables.c4_table_width,
+            table_stride: tables.c4_table_stride,
+            previous,
+            tp2_broadcast: false,
+            exchange_f32: false,
+        };
+        if self.tp2.is_some() {
+            key.exchange_f32 = self.exchange_policy.is_f32(t, self.decode_rows);
+        }
+        key
+    }
+
+    /// One rank-0 decode layer segment: previous layer's FFN reduce + mHC post,
+    /// then this layer's attention, router and expert input quantization.
+    #[allow(clippy::too_many_arguments)]
+    fn decode_layer_segment(
+        &self,
+        layer: usize,
+        weights: &LayerWeights<'_>,
+        tables: &StepTables,
+        w: &Workspace<'_>,
+        w1: Option<&Workspace<'_>>,
+        previous: usize,
+        decode_planes: [*const u16; crate::shared::spark_intake::MAX_INTAKE_RANKS],
+        t: usize,
+        cap: usize,
+        gather: bool,
+    ) -> Result<()> {
+        let h = self.cfg.dim;
+        let lane = &w.lanes[0];
+        let rows = Scalar::I32(t as i32);
+        let device = self.device_link.as_ref().filter(|_| !self.skip_routed);
+        let local_layers = self.local_layers();
+        if layer == 0 && gather {
+            self.gather_streams(lane, t)?;
+        }
+        if let (0, Some(w1)) = (layer, w1) {
+            self.record_peer(0, "entry", DIRECT, true, 0, 0);
+            self.exchange()?.push_to(0, DIRECT, lane.stream_a.buffer.ptr, w1.lanes[0].stream_a.buffer.ptr,
+                t * 4 * h * 2)?;
+        }
+        if previous > 0 {
+            self.post_layer(w, lane, 0, previous, decode_planes, rows, layer - 1)?;
+            self.tap(w, lane, layer - 1, t)?;
+        }
+        if w1.is_some() {
+            self.attention_split(layer, weights, tables, lane, 0, w, rows, cap)?;
+        } else {
+            self.attention(layer, weights, tables, lane, w, rows, cap)?;
+        }
+        match device {
+            Some(link) if layer >= local_layers => self.device_experts(link, layer, t, w, lane, cap),
+            _ => Ok(()),
+        }
+    }
+
+    /// Rank-0 decode tail segment: last layer's FFN post + tap, drafter KV write, and LM head.
+    fn decode_tail_segment(
+        &self,
+        w: &Workspace<'_>,
+        ranks: usize,
+        decode_planes: [*const u16; crate::shared::spark_intake::MAX_INTAKE_RANKS],
+        t: usize,
+        cap: usize,
+    ) -> Result<()> {
+        let lane = &w.lanes[0];
+        let rows = Scalar::I32(t as i32);
+        let last = self.weights.layers.len() - 1;
+        if ranks > 0 {
+            self.post_layer(w, lane, 0, ranks, decode_planes, rows, last)?;
+            self.tap(w, lane, last, t)?;
+        }
+        self.write_draft_kv(w, lane, t, cap)?;
+        self.head_launch(&lane.stream_a, t, t, 0, w)
+    }
+
     /// The step's token embeddings, four copies per row, into the lane's streams.
     fn gather_streams(&self, lane: &Lane<'_>, rows: usize) -> Result<()> {
         // SAFETY: the lane's token ids are copied in before the stream reaches
@@ -1282,8 +1338,8 @@ impl<'a> Engine<'a> {
             |lane, segment| self.coverage_launch(segment, rank, lane, key.rows, launch, reason));
     }
 
-    /// Launches `segment` through a captured graph for `key`, capturing it the
-    /// first time.
+    /// Launches `segment` through the startup-sealed graph bank for `key` (or
+    /// executes eagerly when `key` is outside the startup inventory).
     fn replay(&self, key: GraphKey, segment: impl FnOnce() -> Result<()>) -> Result<()> {
         self.replay_on(0, key, segment)
     }
@@ -1293,7 +1349,9 @@ impl<'a> Engine<'a> {
         self.require_live()?;
         let mut key = key;
         if let Some(tp2) = &self.tp2 {
-            key.tp2_broadcast = tp2.broadcast();
+            if key.attention.starts_with("tp2-") {
+                key.tp2_broadcast = tp2.broadcast();
+            }
             key.exchange_f32 = self.exchange_policy.is_f32(key.rows, self.decode_rows);
         }
         // Diagnostic copies must never become permanent graph nodes.
@@ -1305,30 +1363,67 @@ impl<'a> Engine<'a> {
             (1, Some(peer)) => &peer.graphs,
             _ => &self.graphs,
         };
+        let rank_device = match (rank, &self.peer) {
+            (1, Some(peer)) => peer.device,
+            _ => self.device,
+        };
         let stream = self.stream_of(rank);
-        if let Some(graph) = graphs.borrow().get(&key) {
-            if self.capture_only.get() { return Ok(()); }
-            self.coverage_legacy(rank, key, crate::shared::decode_graph::census::Launch::Replay, "hit");
-            // SAFETY: the graph's pointers are persistent engine buffers of that rank.
-            return self.on(rank, || unsafe { self.library.cuda_graph_launch(graph.0, stream) });
+        if self.capture_only.get() {
+            if graphs.borrow().contains(&key) {
+                return Ok(());
+            }
+            // SAFETY: capture records launches on that rank's stream; nothing in the
+            // segment synchronizes the host.
+            self.on(rank, || unsafe { self.library.cuda_graph_begin_capture(stream) })?;
+            let captured = segment();
+            let exec = self.on(rank, || unsafe { self.library.cuda_graph_end_capture(stream) });
+            captured?;
+            let exec = exec?;
+            // SAFETY: exec was instantiated on rank_device and is drained before Engine/V4Peer drop.
+            let owner = unsafe { crate::shared::decode_graph::GraphOwner::new(self.library, rank_device, exec, ())? };
+            self.graph_captures.set(self.graph_captures.get() + 1);
+            if key.attention.starts_with("tp2-") {
+                self.expert_graph_captures.set(self.expert_graph_captures.get() + 1);
+            }
+            graphs.borrow_mut().insert(key, owner, None);
+            return Ok(());
         }
-        // SAFETY: capture records launches on that rank's stream; nothing in the
-        // segment synchronizes the host.
-        self.on(rank, || unsafe { self.library.cuda_graph_begin_capture(stream) })?;
-        let captured = segment();
-        let exec = self.on(rank, || unsafe { self.library.cuda_graph_end_capture(stream) });
-        captured?;
-        let exec = exec?;
-        if !self.capture_only.get() {
-            self.coverage_legacy(rank, key, crate::shared::decode_graph::census::Launch::CaptureLaunch, "first-miss");
-            self.on(rank, || unsafe { self.library.cuda_graph_launch(exec, stream) })?;
+        let (decision, exec) = {
+            let mut bank = graphs.borrow_mut();
+            let (decision, owner) = bank.enqueue(&key);
+            (decision, owner.map(|o| o.raw))
+        };
+        match decision {
+            crate::shared::decode_graph::GraphDecision::Replay => {
+                self.coverage_legacy(rank, key, crate::shared::decode_graph::census::Launch::Replay, "hit");
+                let exec = exec.expect("replay decision requires cached graph");
+                // SAFETY: the graph's pointers are persistent engine buffers of that rank.
+                self.on(rank, || unsafe { self.library.cuda_graph_launch(exec, stream) })
+            }
+            crate::shared::decode_graph::GraphDecision::Eager => {
+                self.coverage_legacy(rank, key, crate::shared::decode_graph::census::Launch::Eager, "unknown-key");
+                segment()
+            }
+            crate::shared::decode_graph::GraphDecision::Capture => {
+                // SAFETY: capture records launches on that rank's stream; nothing in the
+                // segment synchronizes the host.
+                self.on(rank, || unsafe { self.library.cuda_graph_begin_capture(stream) })?;
+                let captured = segment();
+                let exec = self.on(rank, || unsafe { self.library.cuda_graph_end_capture(stream) });
+                captured?;
+                let exec = exec?;
+                self.coverage_legacy(rank, key, crate::shared::decode_graph::census::Launch::CaptureLaunch, "first-miss");
+                self.on(rank, || unsafe { self.library.cuda_graph_launch(exec, stream) })?;
+                // SAFETY: exec was instantiated on rank_device and is drained before Engine/V4Peer drop.
+                let owner = unsafe { crate::shared::decode_graph::GraphOwner::new(self.library, rank_device, exec, ())? };
+                self.graph_captures.set(self.graph_captures.get() + 1);
+                if key.attention.starts_with("tp2-") {
+                    self.expert_graph_captures.set(self.expert_graph_captures.get() + 1);
+                }
+                graphs.borrow_mut().insert(key, owner, None);
+                Ok(())
+            }
         }
-        self.graph_captures.set(self.graph_captures.get() + 1);
-        if key.attention.starts_with("tp2-") {
-            self.expert_graph_captures.set(self.expert_graph_captures.get() + 1);
-        }
-        graphs.borrow_mut().insert(key, GraphExec(exec, self.library));
-        Ok(())
     }
 
     /// Rank 1's decode segment of `layer`: the previous layer's FFN close, then this
@@ -1342,14 +1437,16 @@ impl<'a> Engine<'a> {
             }
             self.peer_front(layer, tables, lane, 0, w1, rows, cap)
         };
-        let key = GraphKey { layer, rows: t, chunked: tables.chunked,
-            attention: self.attention_kind(self.peer()?.layers[layer].ratio, tables),
-            table_width: tables.c4_table_width, table_stride: tables.c4_table_stride, previous: usize::from(layer > 0), tp2_broadcast: false, exchange_f32: false };
-        if self.mixed_attention(self.peer()?.layers[layer].ratio, tables) {
+        let ratio = self.peer()?.layers[layer].ratio;
+        let key = self.layer_key(layer, ratio, tables, t, usize::from(layer > 0));
+        if !self.capture_only.get() && self.mixed_attention(ratio, tables) {
             self.coverage_legacy(1, key, crate::shared::decode_graph::census::Launch::Eager, "mixed-c128");
             segment()
-        } else { self.replay_on(1, key, segment) }
+        } else {
+            self.replay_on(1, key, segment)
+        }
     }
+
 
     /// The layer's routed partials + shared expert, reduced, then mHC post
     /// into stream a.
@@ -1894,6 +1991,7 @@ impl<'a> Engine<'a> {
         let request = self.warm_request()?;
         let wave = transport.dispatch(&request)?;
         runtime.block_on(transport.receive(wave, rows, self.stream))?;
+        self.decode_transport.set(Some((transport.intake.pointers(), transport.world_size())));
         self.sync()
     }
 
@@ -1996,10 +2094,78 @@ impl<'a> Engine<'a> {
         Ok(())
     }
 
-    /// Every local-expert row shape is captured at startup, without executing
-    /// uninitialized routes or unmatched peer waits. Pointer ownership is fixed.
+    /// Prime 1-row native runtime kernels outside stream capture so lazy CUDA module
+    /// initialization (`OnceLock` / `cuModuleLoadData`) never occurs during capture.
+    fn prime_decode_runtime_for_capture(
+        &self,
+        w: &Workspace<'_>,
+        decode_planes: [*const u16; crate::shared::spark_intake::MAX_INTAKE_RANKS],
+        spark_ranks: usize,
+    ) -> Result<()> {
+        let lane = &w.lanes[0];
+        if self.embedding.device_gather() {
+            self.gather_streams(lane, 1)?;
+        }
+        if let Some(weights) = self.weights.layers.first() {
+            let (bias, tid2eid) = if weights.hash {
+                (std::ptr::null_mut(), weights.ptr("gate.tid2eid")?)
+            } else {
+                (weights.ptr("gate.bias")?, std::ptr::null_mut())
+            };
+            // SAFETY: workspace buffers are live and zero-initialized for 1 row.
+            unsafe {
+                self.library.dsv4_router_select(
+                    w.logits.buffer.ptr,
+                    bias,
+                    tid2eid,
+                    lane.tokens.buffer.ptr,
+                    w.route_ids.buffer.ptr,
+                    w.route_weights.buffer.ptr,
+                    1,
+                    self.cfg.n_routed_experts,
+                    self.cfg.n_activated_experts,
+                    self.cfg.route_scale as f32,
+                    self.stream,
+                )?;
+            }
+        }
+        if !self.skip_routed && self.local_layers() < self.weights.layers.len() && spark_ranks > 0 {
+            let reducer = self.library.v41_compact_reducer()?;
+            // SAFETY: intake planes, shared, and delta are live device buffers for 1 row.
+            unsafe {
+                reducer.reduce_planes(
+                    decode_planes,
+                    spark_ranks as u32,
+                    lane.shared.buffer.ptr.cast(),
+                    w.delta.buffer.ptr.cast(),
+                    1,
+                    self.stream,
+                )?;
+            }
+        }
+        if self.draft_ready() {
+            if let Some(&tap_layer) = self.cfg.dspark_target_layer_ids.first() {
+                self.tap(w, lane, tap_layer, 1)?;
+            }
+            self.write_draft_kv(w, lane, 1, self.decode_rows)?;
+        }
+        self.head_launch(&lane.stream_a, 1, 1, 0, w)?;
+        self.sync()?;
+        if self.peer.is_some() {
+            self.on(1, || unsafe { self.library.cuda_stream_synchronize(self.stream_of(1)) })?;
+        }
+        Ok(())
+    }
+
+    /// Captures and seals the complete `FixedStartup` decode/verify graph bank
+    /// (layer segments, tail segments, and local/TP2 expert segments) on rank 0
+    /// and rank 1 before readiness, without executing uninitialized routes or
+    /// unmatched peer waits. Pointer ownership is fixed.
     pub fn warm_local_graphs(&self) -> Result<()> {
-        if self.local_layers() == 0 { return Ok(()); }
+        if self.graphs.borrow().is_sealed() {
+            return Ok(());
+        }
+        let started = Instant::now();
         if self.decode_workspace.borrow().is_none() {
             *self.decode_workspace.borrow_mut() = Some(self.workspace(self.decode_rows, 1)?);
         }
@@ -2008,25 +2174,237 @@ impl<'a> Engine<'a> {
                 *peer.decode_workspace.borrow_mut() = Some(self.workspace_on(1, self.decode_rows, 1)?);
             }
         }
-        self.warm_tp2_routers()?;
+        let device = self.device_link.as_ref().filter(|_| !self.skip_routed);
+        let (decode_planes, spark_ranks) = match (device, self.decode_transport.get()) {
+            (Some(link), _) => (link.pointers(), link.world_size()),
+            (None, Some((planes, ranks))) => (planes, ranks),
+            (None, None) if self.skip_routed || self.local_layers() == self.weights.layers.len() => (
+                [std::ptr::null(); crate::shared::spark_intake::MAX_INTAKE_RANKS],
+                0,
+            ),
+            (None, None) => anyhow::bail!("warm_local_graphs requires warm_transport or device_link first"),
+        };
+        let supertile_pages = self.c4_supertile_pages();
+        {
+            let work0 = self.decode_workspace.borrow();
+            let w = work0.as_ref().context("decode workspace")?;
+            let peer_work = match &self.peer {
+                Some(peer) => Some(peer.decode_workspace.borrow()),
+                None => None,
+            };
+            let w1 = match &peer_work {
+                Some(ws) => Some(ws.as_ref().context("peer decode workspace")?),
+                None => None,
+            };
+            let init_tables = metadata::warm_step_tables(
+                self.decode_rows,
+                false,
+                1,
+                1,
+                supertile_pages,
+                self.c128_width,
+            );
+            self.fill(&w.lanes[0].tables, &init_tables)?;
+            self.library.cuda_zero_bytes(w.lanes[0].tokens.buffer, w.lanes[0].tokens.buffer.bytes)?;
+            if let Some(w1) = w1 {
+                self.on(1, || {
+                    self.fill(&w1.lanes[0].tables, &init_tables)?;
+                    self.library.cuda_zero_bytes(w1.lanes[0].tokens.buffer, w1.lanes[0].tokens.buffer.bytes)
+                })?;
+                if self.context.is_some() {
+                    let u0 = self.put_context_tables(0, &w.lanes[0].tables, &init_tables, 0, false, &[])?;
+                    let u1 = self.put_context_tables(1, &w1.lanes[0].tables, &init_tables, 0, false, &[])?;
+                    *self.context_units.borrow_mut() = vec![[u0, u1]];
+                }
+            }
+            if self.local_layers() > 0 {
+                self.warm_tp2_routers()?;
+            }
+            self.prime_decode_runtime_for_capture(w, decode_planes, spark_ranks)?;
+        }
+        let mut keys0 = Vec::new();
+        let mut keys1 = Vec::new();
         self.capture_only.set(true);
-        let result = (|| {
-            let work = self.decode_workspace.borrow();
-            let w = work.as_ref().context("decode workspace")?;
+        let result: Result<()> = (|| {
+            let work0 = self.decode_workspace.borrow();
+            let w = work0.as_ref().context("decode workspace")?;
+            let peer_work = match &self.peer {
+                Some(peer) => Some(peer.decode_workspace.borrow()),
+                None => None,
+            };
+            let w1 = match &peer_work {
+                Some(ws) => Some(ws.as_ref().context("peer decode workspace")?),
+                None => None,
+            };
+            let gather = self.embedding.device_gather();
+            let cap = self.decode_rows;
+            let local_layers = self.local_layers();
+            let ranks_for_layer = |layer: usize| -> usize {
+                if self.skip_routed {
+                    SKIPPED_EXPERTS
+                } else if layer < local_layers {
+                    LOCAL_EXPERTS
+                } else {
+                    spark_ranks
+                }
+            };
             for t in 1..=self.decode_rows {
-                for layer in 0..self.local_layers() {
-                    self.local_experts(layer, t, w, &w.lanes[0], self.decode_rows, 0)?;
-                    if self.tp2_layer(layer) {
-                        let work = self.peer()?.decode_workspace.borrow();
-                        self.peer_experts(layer, 0, work.as_ref().context("peer decode workspace")?, t, true)?;
+                for chunked in [false, true] {
+                    let tables_long = metadata::warm_step_tables(t, chunked, 1, 1, supertile_pages, self.c128_width);
+                    let tables_short = metadata::warm_step_tables(t, chunked, 1, 0, supertile_pages, self.c128_width);
+                    let tables_tiny = (t <= 8)
+                        .then(|| metadata::warm_step_tables(t, chunked, 0, 0, supertile_pages, self.c128_width));
+                    let mut ranks = 0usize;
+                    for (layer, weights) in self.weights.layers.iter().enumerate() {
+                        let previous = ranks;
+                        let key_long = self.layer_key(layer, weights.ratio, &tables_long, t, previous);
+                        self.replay_on(0, key_long, || {
+                            self.decode_layer_segment(
+                                layer,
+                                weights,
+                                &tables_long,
+                                w,
+                                w1,
+                                previous,
+                                decode_planes,
+                                t,
+                                cap,
+                                gather,
+                            )
+                        })?;
+                        keys0.push(key_long);
+                        if weights.ratio == 128 {
+                            let key_short = self.layer_key(layer, weights.ratio, &tables_short, t, previous);
+                            self.replay_on(0, key_short, || {
+                                self.decode_layer_segment(
+                                    layer,
+                                    weights,
+                                    &tables_short,
+                                    w,
+                                    w1,
+                                    previous,
+                                    decode_planes,
+                                    t,
+                                    cap,
+                                    gather,
+                                )
+                            })?;
+                            keys0.push(key_short);
+                        }
+                        if weights.ratio == 4 {
+                            if let Some(ref tiny) = tables_tiny {
+                                let key_tiny = self.layer_key(layer, weights.ratio, tiny, t, previous);
+                                self.replay_on(0, key_tiny, || {
+                                    self.decode_layer_segment(
+                                        layer,
+                                        weights,
+                                        tiny,
+                                        w,
+                                        w1,
+                                        previous,
+                                        decode_planes,
+                                        t,
+                                        cap,
+                                        gather,
+                                    )
+                                })?;
+                                keys0.push(key_tiny);
+                            }
+                        }
+                        if let Some(w1) = w1 {
+                            let peer_ratio = self.peer()?.layers[layer].ratio;
+                            let peer_prev = usize::from(layer > 0);
+                            self.peer_segment(layer, &tables_long, w1, t, cap)?;
+                            keys1.push(self.layer_key(layer, peer_ratio, &tables_long, t, peer_prev));
+                            if peer_ratio == 128 {
+                                self.peer_segment(layer, &tables_short, w1, t, cap)?;
+                                keys1.push(self.layer_key(layer, peer_ratio, &tables_short, t, peer_prev));
+                            }
+                            if peer_ratio == 4 {
+                                if let Some(ref tiny) = tables_tiny {
+                                    self.peer_segment(layer, tiny, w1, t, cap)?;
+                                    keys1.push(self.layer_key(layer, peer_ratio, tiny, t, peer_prev));
+                                }
+                            }
+                        }
+                        ranks = ranks_for_layer(layer);
                     }
                 }
+                for layer in 0..local_layers {
+                    if self.tp2_layer(layer) {
+                        let tp2 = self.tp2.as_ref().context("TP2 state")?;
+                        for source in [
+                            crate::shared::experts::rtx::RouteSource::Replicated,
+                            crate::shared::experts::rtx::RouteSource::Broadcast,
+                        ] {
+                            let prev_source = tp2.source.replace(source);
+                            let step_res = (|| -> Result<()> {
+                                self.local_experts(layer, t, w, &w.lanes[0], cap, 0)?;
+                                let mut key0 = self.tp2_key(layer, t, 0);
+                                key0.tp2_broadcast = tp2.broadcast();
+                                key0.exchange_f32 = self.exchange_policy.is_f32(t, self.decode_rows);
+                                keys0.push(key0);
+                                let w1 = w1.context("peer decode workspace")?;
+                                self.peer_experts(layer, 0, w1, t, true)?;
+                                let mut key1 = self.tp2_key(layer, t, 0);
+                                key1.tp2_broadcast = tp2.broadcast();
+                                key1.exchange_f32 = self.exchange_policy.is_f32(t, self.decode_rows);
+                                keys1.push(key1);
+                                Ok(())
+                            })();
+                            tp2.source.set(prev_source);
+                            step_res?;
+                        }
+                    } else {
+                        self.local_experts(layer, t, w, &w.lanes[0], cap, 0)?;
+                        let mut key0 = Self::expert_key(layer, t, 0);
+                        if self.tp2.is_some() {
+                            key0.exchange_f32 = self.exchange_policy.is_f32(t, self.decode_rows);
+                        }
+                        keys0.push(key0);
+                    }
+                }
+                let last_ranks = self
+                    .weights
+                    .layers
+                    .len()
+                    .checked_sub(1)
+                    .map_or(0, ranks_for_layer);
+                let mut tail_key = GraphKey {
+                    layer: TAIL_SEGMENT,
+                    rows: t,
+                    chunked: false,
+                    attention: "tail",
+                    table_width: 0,
+                    table_stride: 0,
+                    previous: last_ranks,
+                    tp2_broadcast: false,
+                    exchange_f32: false,
+                };
+                if self.tp2.is_some() {
+                    tail_key.exchange_f32 = self.exchange_policy.is_f32(t, self.decode_rows);
+                }
+                self.replay(tail_key, || self.decode_tail_segment(w, last_ranks, decode_planes, t, cap))?;
+                keys0.push(tail_key);
             }
             Ok(())
         })();
         self.capture_only.set(false);
-        result
+        result?;
+        self.graphs.borrow_mut().seal_startup(&keys0)?;
+        if let Some(peer) = &self.peer {
+            peer.graphs.borrow_mut().seal_startup(&keys1)?;
+        }
+        tracing::info!(
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            rank0_graphs = keys0.len(),
+            rank1_graphs = keys1.len(),
+            expert_graphs = self.expert_graph_captures.get(),
+            "sealed FixedStartup V4 decode/verify graph bank"
+        );
+        Ok(())
     }
+
 
     /// Waits for the unit's routes and wire rows and builds its Spark request.
     fn stage_request(&self, layer: usize, t: usize, w: &Workspace<'_>, kind: ExpertV2SourceKind,

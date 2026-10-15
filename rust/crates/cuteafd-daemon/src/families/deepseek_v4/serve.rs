@@ -646,6 +646,8 @@ fn schedule(
                 cuteafd_engine::prefix::AdmissionPoll::Empty => {
                     if !busy {
                         // Idle: publish the state the server waits in (captures and releases done).
+                        crate::shared::decode_graph::CaptureWatch::flush();
+                        engine.graph_coverage.flush();
                         cache.tick();
                         publish(stats, requests, generated_total, 0, 0, &cache);
                         console::gauges_now(|| console::Gauges::prefix_cache(&cache, 0, 0, 0));

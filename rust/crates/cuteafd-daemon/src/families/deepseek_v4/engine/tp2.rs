@@ -72,7 +72,7 @@ pub(super) struct Tp2State<'a> {
     ranks: [RefCell<Box<dyn RtxExpertLayer + 'a>>; 2],
     combine: [FusedCombine<'a>; 2],
     routes: PeerExchange<'a>,
-    source: Cell<RouteSource>,
+    pub(super) source: Cell<RouteSource>,
     pub(super) checking: Cell<bool>,
     checks: RefCell<BTreeMap<(usize, usize), PendingCheck<'a>>>,
     schedule: RefCell<Option<Schedule>>,
@@ -202,8 +202,10 @@ impl<'a> Engine<'a> {
                 for link in transports.borrow_mut().iter_mut() { link.terminal_release()?; }
                 for rank in 0..(1 + usize::from(self.peer.is_some())) {
                     self.on(rank, || {
-                        if rank == 0 { self.graphs.borrow_mut().clear(); }
-                        else { self.peer()?.graphs.borrow_mut().clear(); }
+                        let graphs = if rank == 0 { &self.graphs } else { &self.peer()?.graphs };
+                        let mut bank = graphs.borrow_mut();
+                        bank.retire_all();
+                        drop(bank.drain_retired(|| Ok(()))?);
                         Ok(())
                     })?;
                 }
@@ -502,6 +504,7 @@ impl<'a> Engine<'a> {
 
     fn warm_broadcast_graphs(&self) -> Result<()> {
         let Some(tp2) = &self.tp2 else { return Ok(()) };
+        if self.graphs.borrow().is_sealed() { return Ok(()); }
         let source = tp2.source.replace(RouteSource::Broadcast);
         let result = self.warm_local_graphs();
         tp2.source.set(source);

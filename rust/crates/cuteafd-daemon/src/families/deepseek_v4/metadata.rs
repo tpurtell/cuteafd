@@ -92,6 +92,35 @@ pub(crate) struct StepTables {
     pub c128_lengths: Vec<i32>,
 }
 
+impl StepTables {
+    /// Normalize decode/verify C4 page-table width and stride to a single supertile
+    /// (`supertile_pages = 512`, 131,072 source tokens) whenever `c4_table_width <= supertile_pages`.
+    /// Both `index_topk_decode` and `scored_index_topk_decode` clip each row's work to
+    /// `c4_visible[row]`, so padding the page-table stride within a single supertile does
+    /// zero extra GPU work while collapsing all C4 `(table_width, table_stride)` graph keys
+    /// up to 131K context into one fixed startup key.
+    pub(crate) fn pad_c4_decode(&mut self, supertile_pages: usize) {
+        let rows = self.c4_visible.len();
+        let target = supertile_pages.max(1);
+        if rows == 0 || self.c4_table_width > target || self.c4_table_stride > target {
+            return;
+        }
+        let old_stride = self.c4_table_stride;
+        if old_stride < target {
+            let mut padded = Vec::with_capacity(rows * target);
+            for row in 0..rows {
+                let slice = &self.c4_page_table[row * old_stride..(row + 1) * old_stride];
+                let pad = slice.last().copied().unwrap_or(0);
+                padded.extend_from_slice(slice);
+                padded.resize((row + 1) * target, pad);
+            }
+            self.c4_page_table = padded;
+            self.c4_table_stride = target;
+        }
+        self.c4_table_width = target;
+    }
+}
+
 /// One rank's C4 fields of a step under token-split (`context`) attention: everything else
 /// in [`StepTables`] (window, C128, positions, carry) stays replicated and is uploaded as is.
 #[derive(Debug, Clone, PartialEq)]
@@ -276,10 +305,115 @@ pub(crate) fn decode_step(
     Ok(tables)
 }
 
+/// Synthetic [`StepTables`] for startup CUDA graph capture (`Engine::warm_local_graphs`).
+/// Uses safe page/slot 0 indices while exercising the exact `(chunked, c4_groups, c128_groups)`
+/// regime and normalized C4 supertile page-table dimensions (`supertile_pages`).
+pub(crate) fn warm_step_tables(
+    rows: usize,
+    chunked: bool,
+    c4_groups: usize,
+    c128_groups: usize,
+    supertile_pages: usize,
+    c128_width: usize,
+) -> StepTables {
+    let stride = supertile_pages.max(1);
+    let c4_vis = c4_groups.min(stride * compressed_page_rows(4)) as i32;
+    let c128_vis = c128_groups.min(c128_width.max(1)) as i32;
+    let compressor_tables = || {
+        if chunked {
+            vec![
+                ("active_groups", vec![0]),
+                ("group_sequence_slots", vec![0; rows.max(1)]),
+                ("group_source_positions", vec![0; rows.max(1)]),
+                ("group_rope_positions", vec![0; rows.max(1)]),
+                ("compressed_slots", vec![0; rows.max(1)]),
+                ("active_sequences", vec![1]),
+                ("sequence_offsets", vec![0; rows + 1]),
+                ("sequence_start_positions", vec![0; rows.max(1)]),
+                ("state_sequence_ids", vec![0; rows.max(1)]),
+            ]
+        } else {
+            vec![
+                ("positions", vec![0; rows]),
+                ("sequence_ids", vec![0; rows]),
+                ("compressed_slots", vec![0; rows]),
+            ]
+        }
+    };
+    StepTables {
+        decode: true,
+        chunked,
+        start: 0,
+        rows,
+        positions: vec![0; rows],
+        main_slots: vec![0; rows],
+        swa_indices: vec![0; rows * WINDOW],
+        swa_lengths: vec![1; rows],
+        c4_tables: compressor_tables(),
+        c128_tables: compressor_tables(),
+        c4_groups,
+        c128_groups,
+        c4_page_table: vec![0; rows * stride],
+        c4_table_width: stride,
+        c4_table_stride: stride,
+        c4_visible: vec![c4_vis; rows],
+        c4_indexed_lengths: vec![c4_vis.min(512); rows],
+        c128_indices: vec![0; rows * c128_width.max(1)],
+        c128_lengths: vec![c128_vis; rows],
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::pool::{PoolAllocator, PoolShape};
     use super::*;
+
+    #[test]
+    fn pad_c4_decode_normalizes_width_and_stride_within_supertile_and_preserves_context_tables() -> anyhow::Result<()> {
+        let shape = PoolShape::new(4, 4096, 16);
+        let mut pool = PoolAllocator::new(shape);
+        let seq0 = pool.admit(1000)?;
+        let seq1 = pool.admit(1000)?;
+        let mut raw = decode_step(&[(&seq0, 200), (&seq1, 600)], &shape, 512, 8)?;
+        assert!(raw.c4_table_width < 16);
+        assert!(raw.c4_table_stride < 16);
+        let mut padded = raw.clone();
+        padded.pad_c4_decode(16);
+        assert_eq!(padded.c4_table_width, 16);
+        assert_eq!(padded.c4_table_stride, 16);
+        assert_eq!(padded.c4_page_table.len(), 2 * 16);
+        assert_eq!(padded.c4_visible, raw.c4_visible);
+        for rank in 0..2 {
+            let shard = c4_context_tables(&padded, rank, shape.units)?;
+            let raw_shard = c4_context_tables(&raw, rank, shape.units)?;
+            assert_eq!(shard.c4_visible, raw_shard.c4_visible);
+            assert_eq!(shard.c4_tables, raw_shard.c4_tables);
+            assert_eq!(shard.c4_table_width, 8);
+            assert_eq!(shard.c4_table_stride, 8);
+            let used0 = (raw_shard.c4_visible[0] as usize).div_ceil(compressed_page_rows(4));
+            let used1 = (raw_shard.c4_visible[1] as usize).div_ceil(compressed_page_rows(4));
+            assert_eq!(
+                &shard.c4_page_table[..used0],
+                &raw_shard.c4_page_table[..used0],
+            );
+            assert_eq!(
+                &shard.c4_page_table[8..8 + used1],
+                &raw_shard.c4_page_table[raw_shard.c4_table_stride..raw_shard.c4_table_stride + used1],
+            );
+        }
+        for chunked in [false, true] {
+            let warm = warm_step_tables(4, chunked, 1, 1, 8, 8);
+            for rank in 0..2 {
+                let shard = c4_context_tables(&warm, rank, shape.units)?;
+                assert_eq!(shard.c4_table_width, 4);
+                assert_eq!(shard.c4_table_stride, 4);
+            }
+        }
+        raw.pad_c4_decode(1);
+        assert!(raw.c4_table_width > 1);
+        Ok(())
+    }
+
 
     #[test]
     fn c4_context_planar_commits_cover_owned_pages_byte_exactly() -> anyhow::Result<()> {
