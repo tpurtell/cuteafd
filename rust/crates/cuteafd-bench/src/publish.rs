@@ -210,20 +210,31 @@ fn column_name(class: u8) -> &'static str {
     match class { 0 => "5090", 1 => "1× RTX", _ => "2× RTX" }
 }
 
-fn quality_cell(b: &crate::report::Baseline) -> String {
-    match b.quality.status {
-        CheckStatus::Fail => format!("⚠ **FAILED** {}", crate::render::bodies::quality_line(b)),
-        CheckStatus::Pass => format!("✓ {}", b.quality.badge()),
-        _ => b.quality.badge(),
+fn quality_cell(report: &Report) -> String {
+    let shown = crate::quality::shown(report, "quality");
+    match shown.status {
+        CheckStatus::Fail => format!("⚠ **FAILED** {}", if shown.fail_line.is_empty() { shown.verdict } else { shown.fail_line }),
+        CheckStatus::Pass => format!("✓ {}", shown.verdict),
+        _ => shown.verdict,
     }
 }
 
-// Publication notes are report data; escape text and restrict links to archived reports.
+// The caption is the policy's displayed caveat, not the stored qualification note.
+// Escape text and restrict links to archived reports.
 fn caveat(p: &Placed) -> String {
-    let Some(note) = p.report.server.setting("qualification.caveat") else { return String::new() };
-    let escaped = crate::render::svg::escape(note);
-    let mut text = escaped.strip_prefix("FAIL: not recommended.").map_or_else(|| escaped.clone(),
-        |rest| format!("<b>FAIL: not recommended.</b>{rest}"));
+    let shown = crate::quality::shown(&p.report, "quality");
+    if shown.caveat.is_empty() { return String::new(); }
+    let escaped = crate::render::svg::escape(&shown.caveat);
+    let mut text = match shown.caveat_lead.as_deref() {
+        Some(lead) => {
+            let lead = crate::render::svg::escape(lead);
+            match escaped.strip_prefix(&lead) {
+                Some(rest) => format!("<b>{lead}</b>{rest}"),
+                None => escaped,
+            }
+        }
+        None => escaped,
+    };
     if let (Some(href), Some(label)) = (p.report.server.setting("qualification.caveat-link"),
         p.report.server.setting("qualification.caveat-link-label")) {
         if href.starts_with("benchmarks/") && !href.split('/').any(|part| part == "..") {
@@ -313,7 +324,7 @@ pub fn results(placed: &[Placed]) -> String {
             .unwrap_or_else(|| format!("{} ({label})", short_hardware(r)));
         out.push_str(&format!("| [{}](docs/models/{family}.md) | {name} | {hardware} | {} | {} | {concurrent} | {} | {} | {prefill} | {ttft} | {} | \
             [{} · {}]({}) |\n", family_title(family), r.capacity().compact(), decode("code"), decode("prose"),
-            decode("json"), quality_cell(b), crate::render::date(&r.created), r.server.build.label(),
+            decode("json"), quality_cell(r), crate::render::date(&r.created), r.server.build.label(),
             link(&p.dir, "report.svg")));
     }
     out.push_str("\ntok/s; C1 decode and concurrent code aggregate with thinking off (C1/C4/C8/C16 on PRO 6000; through C8 at ≤32 GiB, within server admission), \
@@ -348,7 +359,7 @@ pub fn index(placed: &[Placed]) -> String {
                 r.server.hardware_line(), r.server.build.label(), link(relative, "report.svg"));
             if let Some(reason) = r.no_fit_reason() {
                 line.push_str(&format!(" · doesn't fit: {reason}"));
-            } else if r.quality_failed() {
+            } else if crate::quality::shown(r, "quality").status == CheckStatus::Fail {
                 line.push_str(" · ⚠ quality gate failed");
             }
             out.push_str(&line);
@@ -438,6 +449,66 @@ const INDEX_HEADER: &str = "# Benchmarks\n\nReports from `cuteafd bench` (profil
     when asked). Each directory holds `report.svg`, `report.json` and the share card; `cuteafd bench publish` \
     rebuilds this index and the root README's table.\n\n";
 
+/// Rewrites card and report images already on disk when the displayed verdict
+/// differs from the status stored in `report.json`. Missing images stay
+/// missing, and the export itself is not edited.
+fn refresh_changed_cards(root: &Path, placed: &[Placed]) -> Result<()> {
+    for p in placed {
+        let dir = root.join(&p.dir);
+        let json_path = dir.join("report.json");
+        let Ok(text) = std::fs::read_to_string(&json_path) else { continue };
+        let raw: Report = serde_json::from_str(&text).with_context(|| format!("{}", json_path.display()))?;
+        if !verdict_changed(&raw) { continue; }
+        let report = &p.report;
+        if dir.join("card.svg").is_file() {
+            let svg = crate::render::card::card_svg(report);
+            write_if_different(&dir.join("card.svg"), svg.as_bytes())?;
+            if dir.join("card.png").is_file() {
+                let png = crate::render::png::png(&svg, 1.0)?;
+                write_if_different(&dir.join("card.png"), &png)?;
+            }
+        } else if dir.join("card.png").is_file() {
+            let svg = crate::render::card::card_svg(report);
+            let png = crate::render::png::png(&svg, 1.0)?;
+            write_if_different(&dir.join("card.png"), &png)?;
+        }
+        if dir.join("report.svg").is_file() {
+            let svg = crate::render::report::report_svg(report);
+            write_if_different(&dir.join("report.svg"), svg.as_bytes())?;
+        }
+        let mut panels = Vec::new();
+        for entry in std::fs::read_dir(&dir).with_context(|| format!("{}", dir.display()))? {
+            let name = entry?.file_name();
+            let name = name.to_string_lossy();
+            if let Some(id) = name.strip_prefix("panel-").and_then(|rest| rest.strip_suffix(".svg")) {
+                panels.push(id.to_string());
+            }
+        }
+        for id in panels {
+            let svg = crate::render::report::panel_svg(report, &id);
+            write_if_different(&dir.join(format!("panel-{id}.svg")), svg.as_bytes())?;
+        }
+    }
+    Ok(())
+}
+
+fn verdict_changed(raw: &Report) -> bool {
+    let view = crate::quality::shown(raw, "quality");
+    let Some(baseline) = &raw.baseline else {
+        return raw.server.setting("qualification.caveat").unwrap_or("") != view.caveat;
+    };
+    baseline.quality.status != view.status
+        || baseline.quality.badge() != view.verdict
+        || raw.server.setting("qualification.caveat").unwrap_or("") != view.caveat
+}
+
+fn write_if_different(path: &Path, bytes: &[u8]) -> Result<()> {
+    if std::fs::read(path).ok().as_deref() == Some(bytes) {
+        return Ok(());
+    }
+    std::fs::write(path, bytes).with_context(|| format!("writing {}", path.display()))
+}
+
 /// Checks `dirs` are placed for publication and rebuilds both documents.
 pub fn publish(root: &Path, dirs: &[PathBuf]) -> Result<(PathBuf, PathBuf, usize)> {
     let mut releases = std::collections::BTreeSet::new();
@@ -466,6 +537,7 @@ pub fn publish(root: &Path, dirs: &[PathBuf]) -> Result<(PathBuf, PathBuf, usize
         bail!("publish reports from one release at a time, or set CUTEAFD_RELEASE_ROW");
     }
     let placed = scan(root)?;
+    refresh_changed_cards(root, &placed)?;
     let release = releases.into_iter().next().or_else(|| {
         dirs.is_empty().then(|| placed.iter().find_map(report_release)).flatten()
     });
@@ -902,5 +974,52 @@ mod tests {
         let stray = root.path().join("elsewhere");
         crate::cli::write_exports(&ok, &stray, &["json".into()]).unwrap();
         assert!(publish(root.path(), &[stray]).is_err());
+    }
+
+    /// A stored FAIL on a calibrated W4A4 export is rewritten into the images
+    /// that already exist. Missing images stay missing, and report.json is
+    /// left as measured.
+    #[test]
+    fn publish_rerenders_existing_images_only_when_the_displayed_verdict_changes() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("README.md"), format!("{RESULTS_BEGIN}\n{RESULTS_END}\n")).unwrap();
+        let snap = root.path().join("models--nvidia--Qwen3.8-Flash-Next-NVFP4/snapshots/2061e0b0");
+        std::fs::create_dir_all(&snap).unwrap();
+        std::fs::write(snap.join("config.json"),
+            r#"{"quantization_config":{"quant_method":"modelopt","quant_algo":"NVFP4","group_size":16,"quantized_layers":{"model.language_model.layers.0.mlp.experts":{"quant_algo":"NVFP4"}}}}"#)
+            .unwrap();
+        let mut report = crate::sample::report(true);
+        report.server.model = "nvidia/Qwen3.8-Flash-Next-NVFP4".into();
+        report.server.family = Some("qwen4".into());
+        report.server.configuration.snapshot = Some(snap.display().to_string());
+        report.server.configuration.settings.push(crate::report::Setting {
+            name: "qualification.caveat".into(),
+            value: Some("FAIL: not recommended. Fails the calibrated check.".into()),
+            default: None, source: "publication".into(),
+        });
+        let dir = root.path().join("benchmarks/qwen4/2026-10-14-smoke-qwen-nvfp4-max");
+        std::fs::create_dir_all(&dir).unwrap();
+        let json = serde_json::to_vec_pretty(&report).unwrap();
+        std::fs::write(dir.join("report.json"), &json).unwrap();
+        std::fs::write(dir.join("card.svg"), "QUALITY GATE FAILED").unwrap();
+        std::fs::write(dir.join("panel-baseline.svg"), "FIDELITY FAILURE").unwrap();
+        publish(root.path(), &[dir.clone()]).unwrap();
+        let card = std::fs::read_to_string(dir.join("card.svg")).unwrap();
+        assert!(card.contains("info: calibrated W4A4"), "{card}");
+        assert!(!card.contains("QUALITY GATE FAILED"), "{card}");
+        let panel = std::fs::read_to_string(dir.join("panel-baseline.svg")).unwrap();
+        assert!(!panel.contains("FIDELITY FAILURE"), "{panel}");
+        assert!(!dir.join("card.png").exists());
+        assert!(!dir.join("report.svg").exists());
+        assert!(!dir.join("report.png").exists());
+        assert_eq!(std::fs::read(dir.join("report.json")).unwrap(), json);
+        let readme = std::fs::read_to_string(root.path().join("README.md")).unwrap();
+        assert!(readme.contains("info: calibrated W4A4"), "{readme}");
+        assert!(readme.contains("Informational"), "{readme}");
+        assert!(!readme.contains("FAIL: not recommended"), "{readme}");
+        let again = std::fs::read(dir.join("card.svg")).unwrap();
+        publish(root.path(), &[]).unwrap();
+        assert_eq!(std::fs::read(dir.join("card.svg")).unwrap(), again);
+        assert_eq!(std::fs::read(dir.join("report.json")).unwrap(), json);
     }
 }

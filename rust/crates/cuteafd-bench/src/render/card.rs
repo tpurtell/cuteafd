@@ -11,7 +11,8 @@ pub const WIDTH: f64 = 1200.0;
 pub const HEIGHT: f64 = 675.0;
 
 pub fn card_svg(report: &Report) -> String {
-    let t = Theme::for_report(report.quality_failed());
+    let shown = crate::quality::shown(report, "quality");
+    let t = Theme::for_report(shown.status == crate::report::CheckStatus::Fail);
     let r = report;
     let mut doc = Doc::new(WIDTH, HEIGHT);
     doc.defs(&t.defs());
@@ -132,10 +133,7 @@ pub fn card_svg(report: &Report) -> String {
     if let Some(remote) = &b.remote {
         build.push_str(&format!(" · {}", remote.trim_start_matches("https://")));
     }
-    let (badge, status) = match baseline {
-        Some(b) => (b.quality.badge(), b.quality.status),
-        None => ("quality not verified".to_string(), crate::report::CheckStatus::Pending),
-    };
+    let (badge, status) = (shown.verdict, shown.status);
     let color = t.status(status);
     let width = (text_width(&badge, 14.0) + 36.0).min(520.0);
     doc.text(pad, HEIGHT - 28.0, Font::new(13.0, t.muted), &fit(&build, 13.0, WIDTH - 2.0 * pad - width - 24.0));

@@ -26,6 +26,9 @@ pub fn shown(report: &Report) -> Vec<String> {
 
 /// One panel as a standalone SVG (fixed width, its own footer).
 pub fn panel_svg(report: &Report, id: &str) -> String {
+    let mut reconciled = report.clone();
+    crate::quality::reconcile(&mut reconciled);
+    let report = &reconciled;
     let view = View::new(report);
     let t = view.theme;
     let (title, hint) = bodies::panel_title(id);
@@ -45,6 +48,9 @@ pub fn panel_svg(report: &Report, id: &str) -> String {
 /// A panel's body alone (no frame, title or footer) `width` wide on a
 /// transparent background: the dashboard's chart view of the panel.
 pub fn panel_body_svg(report: &Report, id: &str, width: f64) -> String {
+    let mut reconciled = report.clone();
+    crate::quality::reconcile(&mut reconciled);
+    let report = &reconciled;
     let view = View::new(report);
     let t = view.theme;
     let (body, height) = view.body(id, width);
@@ -57,6 +63,10 @@ pub fn panel_body_svg(report: &Report, id: &str, width: f64) -> String {
 
 /// The whole report: header, failure banner, the panels that ran, footer.
 pub fn report_svg(report: &Report) -> String {
+    let policy = crate::quality::shown(report, "quality");
+    let mut reconciled = report.clone();
+    crate::quality::reconcile(&mut reconciled);
+    let report = &reconciled;
     let view = View::new(report);
     let t = view.theme;
     let w = REPORT_WIDTH;
@@ -84,9 +94,9 @@ pub fn report_svg(report: &Report) -> String {
     let profile = crate::profiles::title_of(&r.profile);
     let sub = format!("{profile} · {} · {}", super::date(&r.created), r.server.hardware_line());
     doc.text(x, 108.0, Font::new(11.5, t.ink2), &fit(&sub, 11.5, w - 300.0));
-    if let Some(baseline) = &r.baseline {
-        let badge = baseline.quality.badge();
-        let color = t.status(baseline.quality.status);
+    if r.baseline.is_some() {
+        let badge = policy.verdict;
+        let color = t.status(policy.status);
         let bw = (badge.chars().count() as f64 * 6.6 + 28.0).min(380.0);
         doc.rect_attrs(w - 24.0 - bw, 30.0, bw, 26.0, 13.0, &format!(r#"fill="{}" stroke="{color}""#, t.panel2));
         doc.text(w - 24.0 - bw / 2.0, 47.5, Font::new(11.0, color).anchor(Anchor::Middle).weight(600),
