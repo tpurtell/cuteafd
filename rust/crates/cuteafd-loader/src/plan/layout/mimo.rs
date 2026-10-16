@@ -4,9 +4,12 @@ use crate::families::mimo_v2::{admission::*, capacity::*, resident::MimoResident
     projection::MimoProjectionRepresentation as R, weight_policy::*, *};
 use anyhow::{Context, Result};
 
-pub(super) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyModel,
-    input: &super::super::PlanInput, options: &LayoutOptions, rows: u64,
-    concurrency: u64, context: u64, manifest: Option<&serde_json::Value>) -> MemoryLayout {
+pub(crate) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyModel,
+    input: &super::super::PlanInput, options: &LayoutOptions) -> MemoryLayout {
+    let shape = Shape::resolve(report, model, options,
+        ShapePolicy { context: ContextPolicy::Checkpoint, ..ShapePolicy::manifest_bounded() });
+    let (rows, concurrency, context, manifest) = (shape.prefill_rows, shape.concurrency, shape.context_tokens,
+        shape.manifest.as_ref());
     let checkpoint = input.checkpoint();
     let ranks = if options.head_split { options.rtx_bytes.len().clamp(1, 2) } else { 1 };
     let spark_ranks = match report.placement { ExpertPlacement::Sparks { ranks } => ranks, _ => 0 };
@@ -86,8 +89,10 @@ pub(super) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
         }
     }
     let mut pool_tokens = 0;
+    let mut waste = Vec::new();
     match apply(input, options, &mut devices, spark_ranks, rows, concurrency, context, manifest) {
         Ok(placement) => {
+            waste = replicated_weights(&placement);
             report.solver_placement = Some(placement.clone());
             pool_tokens = placement.pool_tokens;
             notes.push(format!("placement: {}", placement.summary()));
@@ -113,7 +118,19 @@ pub(super) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
     }
     if manifest.is_none() { notes.push("MiMo native scratch needs --workspace-manifest; native scratch is not qualified without it".into()); }
     devices.extend(sparks);
-    MemoryLayout { devices, pool_tokens, waste: Vec::new(), notes }
+    MemoryLayout { devices, pool_tokens, waste, notes }
+}
+
+/// GQA/SWA cache records and projection shards are partitioned, but the
+/// head-split executor still keeps a whole router and layer norms per rank.
+fn replicated_weights(placement: &crate::placement::Placement) -> Vec<Waste> {
+    let Some(peer) = placement.items.get(1) else { return Vec::new(); };
+    let bytes = peer.iter().filter(|item| item.category == Category::Weights
+        && (item.group.contains("layernorm") || item.group.contains(".mlp.gate."))
+        && placement.items[0].contains(item)).map(|item| item.bytes).sum();
+    if bytes == 0 { Vec::new() } else {
+        vec![Waste { device: "rtx1".into(), what: "router and layer norms replicated under the head split".into(), bytes }]
+    }
 }
 
 fn spark_experts(input: &super::super::PlanInput, _options: &LayoutOptions,
@@ -418,7 +435,20 @@ mod tests {
                         kind: DeviceKind::Rtx, index: rank as u32, capacity_bytes: 95 * GIB,
                         items: vec![], kv_tokens: 0,
                     }).collect();
-                    assert_eq!(apply(&input, &opts, &mut devices, 4, 4096, 4, 32768, None).unwrap().pool_tokens, 32768);
+                    let placement = apply(&input, &opts, &mut devices, 4, 4096, 4, 32768, None).unwrap();
+                    assert_eq!(placement.pool_tokens, 32768);
+                    let waste = replicated_weights(&placement);
+                    if ranks == 1 {
+                        assert!(waste.is_empty());
+                    } else {
+                        let replica: u64 = admitted.steady.devices[1].reservations.iter()
+                            .filter(|r| r.name.contains("layernorm") || r.name.contains(".mlp.gate."))
+                            .map(|r| r.bytes).sum();
+                        assert!(replica > 0);
+                        assert_eq!(waste.len(), 1);
+                        assert_eq!(waste[0].bytes, replica);
+                        assert_eq!(waste[0].device, "rtx1");
+                    }
                     for rank in 0..ranks {
                         let total: u64 = admitted.steady.devices[rank].reservations.iter().map(|r| r.bytes).sum::<u64>()
                             + (32768 / admitted.steady.pool_unit_rows) * admitted.steady.devices[rank].pool_unit_bytes;

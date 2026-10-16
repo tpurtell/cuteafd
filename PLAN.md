@@ -2034,7 +2034,7 @@ value (the measured GLM Flash regression and V4's 603K pool first).
 | 10 | `S3` `GraphBank` (`FixedStartup`), GLM Flash `GraphCache` as `Budgeted`, V4.1 banks onto it | S | M | 7 | `CaptureWatch` = 0 steady-state captures over C16 |
 | 11 | `P4` `shared/experts/rtx` (`NativeTp2` from V4.1 `RankWave`, `Combine`, `RouteIdentity`), dsv4 `rtx_tp2` CMake, V4 wiring | P | L | 2, 3 | V4 Pro EXL3 K2 KL no worse than rc1; route check; A/B min/max; V4.1 byte-exact through `NativeTp2` |
 | 12 | `D3` global row budget and copy competition on GLM Flash | D | M | 6 | same card; C16 heterogeneous prompts is the metric; C1 unchanged |
-| 13 | `S1b` decode share on V4.1 (`--prefill-chunk-s`, `--decode-share`) | S | M | 8 | stream KL <= 2x batch envelope; long-prompt greedy-16 exact; decode gaps |
+| 13 | `S1b` removed for v3 (#346): unqualified V4.1 interleaving | S | - | - | whole-prompt admission retained |
 | 14 | `P5` V4 drafter as a `Movable` on GPU1, terminal close, marks, `ShardedVocabulary` | P | M | 11 | lossless spec; C1 at max |
 | 15 | `P6` GLM Flash solver port, coordinator tp2 packages, `Fp8MoeTp2`/`Exl3Tp2`, router replica, DFlash2 on GPU1 | P | M | 11 | golden NLL 2.4054; A/B min/max at 2M |
 | 16 | `D4` MiMo, GLM 5.3, Qwen (chain depth as the pre-draft action), V4 (fixed-width binding) onto the shared policy | D | M, S, M, S | 6 | the D2 card per family on its min/max |
@@ -2448,16 +2448,9 @@ The default stays share 0 through the static bypass.
   share 0 (decode-share saw a -5.3% median it could not explain).
 - **Leaves the family:** ~3.5-5K. Net deletion ~1-1.5K.
 
-**Stage 1b: decode share on V4.1 (M).** Time-sized units via
-`--prefill-chunk-s` and `--decode-share 0.2`.
-- **Gate.**
-  - The fidelity envelope: stream KL ≤2x the batch-mix envelope.
-    Decode-share passed at 0.2 and failed at 0.4.
-  - Long-prompt greedy-16 exact.
-  - Decode gaps measured with
-    `scripts/bench/deepseek_v41/bench-prefill-interference.py`, ported from
-    the closed branch.
-- **Default.** Set by TJ from the measured gap/TTFT trade (open question 3).
+**Stage 1b: removed for v3 (#346).** The unqualified V4.1 interleaving
+branch is deleted. V4.1 keeps whole-prompt prefill at admission. Other
+families retain the qualified shared prefill queue and its existing defaults.
 
 **Stage 2: prefix cache (L).**
 - The engine grows restore plans, snapshot metadata, pending capture and
@@ -6250,7 +6243,7 @@ Ideas TJ wants kept for later; not v2 work.
   - MiMo prefill chunk and snapshot wait (C16 TTFT 91 -> 67 ms);
   - GLM Flash BF16 KDA state and pool prefix marks (memory to KV);
   - MiMo warm drafter marks and host tier;
-  - GLM Flash packed admission and chain verify.
+  - GLM Flash packed admission (the private likelihood policy was removed for v3, #346).
   Also: revive the deterministic Spark prefill reducer; delete
   `work/mxfp4-tails` and `work/v41-exact`, and the old draft-policy switches
   once shared drafting covers every family.

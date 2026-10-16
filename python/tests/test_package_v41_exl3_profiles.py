@@ -95,11 +95,16 @@ class PackageProfileTests(unittest.TestCase):
         return list(POLICY_TILE(None, hidden_size=5120, intermediate_size=variant['intermediate'],
                                 token_count=variant['capacity'], direct_topk_routes=direct))
 
+    @staticmethod
+    def pinned_tile(variant):
+        """The package's own answer for a variant: the pin, or the planner's value."""
+        return package.decode_tile('v41', variant['intermediate'], variant['capacity'])
+
     # How many ranks share one export per width, from the layout contract.
     expected_rank_count = {'tp2-rank': 2, 'tp3-rank': 3}
 
-    def build_fixture(self, root, role, bits, require=(), tiles=(), geometry='v41'):
-        capacities = (1, 80)
+    def build_fixture(self, root, role, bits, require=(), tiles=(), geometry='v41',
+                      capacities=(1, 80)):
         args = argparse.Namespace(
             output=root / 'package', build_dir=root / 'build', role=role, geometry=geometry,
             bits=list(bits), capacities=','.join(map(str, capacities)),
@@ -393,11 +398,18 @@ class PackageProfileTests(unittest.TestCase):
         """
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            output, manifest, _calls, _ = self.build_fixture(root, 'spark', (2, 3))
+            output, manifest, _calls, _ = self.build_fixture(root, 'spark', (2, 3), capacities=(1, 16, 80))
+            pinned = [v for v in manifest['variants'] if self.pinned_tile(v)]
+            self.assertTrue(pinned, 'the fixture must carry a capacity the planner widens')
             for variant in manifest['variants']:
                 with self.subTest(directory=variant['directory']):
-                    self.assertEqual(variant['tile'], self.expected_policy_tile(variant))
+                    pin = self.pinned_tile(variant)
+                    self.assertEqual(variant['tile'],
+                                     list(pin) if pin else self.expected_policy_tile(variant))
                     self.assertNotIn('tile_requested', variant)
+                    if pin:
+                        self.assertNotEqual(variant['tile'], self.expected_policy_tile(variant),
+                                            'the pin exists because the planner widens this capacity')
                     self.assertEqual(package.verify(output, 'fixture-revision')['variants'],
                                      manifest['variants'])
 
@@ -479,6 +491,48 @@ class PackageProfileTests(unittest.TestCase):
                 self.assertFalse(any(w(geometry, 'coordinator', width, c) for c in (256, 1024, 4096)))
         for geometry in ('v41', 'dsv4f', 'qwen4'):
             self.assertFalse(any(w(geometry, 'spark', 512, c) for c in (256, 1024, 4096)))
+
+    def test_decode_capacities_ship_the_canonical_tile(self):
+        """A decode capacity the B12x planner widens is pinned to m1's tile (#309).
+
+        The widened (128,128,128,128) export is a different K partition, so the
+        decode plan cannot admit it and rows in its range fall through to the next
+        capacity: V4.1's m16 is the capacity in that window. The pin is per width
+        (the tile is a whole 256-wide rank slice or 128) and only where the
+        geometry is enabled.
+        """
+        d = package.decode_tile
+        for width, expected in ((2304, (64, 256, 64, 256)), (1152, (64, 128, 64, 128)),
+                                (768, (64, 256, 64, 256)), (640, (64, 128, 64, 128))):
+            with self.subTest(width=width):
+                self.assertEqual(d('v41', width, 16), expected)
+        for capacity in (1, 9, 33, 80, 256, 4096):
+            self.assertIsNone(d('v41', 2304, capacity))
+        for geometry in ('dsv4f', 'dsv4p', 'glm', 'glmf', 'qwen4'):
+            self.assertIsNone(d(geometry, 512, 16))
+
+    def test_explicit_tile_overrides_the_decode_pin_without_leaking_requests(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            output, manifest, calls, _ = self.build_fixture(
+                root, 'spark', (2, 3), capacities=(1, 16, 80),
+                tiles=['tp3-width768=16:64,128,64,128'])
+            requested = {v['directory'] for v in manifest['variants'] if 'tile_requested' in v}
+            self.assertEqual(requested, {f'tp3-rank{rank}/m16' for rank in range(3)})
+            for variant in manifest['variants']:
+                if variant['directory'] in requested:
+                    self.assertEqual(variant['tile_requested'], [64, 128, 64, 128])
+                    self.assertEqual(variant['tile'], variant['tile_requested'])
+                elif variant['capacity'] == 16:
+                    self.assertEqual(variant['tile'], list(self.pinned_tile(variant)))
+            for call in calls:
+                if call.args[3] == 16:
+                    width = call.args[1]
+                    tile = ((64, 128, 64, 128) if width == 768 else
+                            package.decode_tile('v41', width, 16))
+                    self.assertEqual(call.kwargs['tile'], tile)
+                    self.assertIn('+tile' + '-'.join(map(str, tile)), str(call.args[0]))
+            self.assertEqual(package.verify(output, 'fixture-revision'), manifest)
 
     def test_route_blocks_widen_only_for_dsv4p_prefill(self):
         """V4.1 and V4 Flash keep 8-row blocks; V4 Pro prefill widens (Spark and RTX)."""

@@ -26,7 +26,6 @@
 //! the cache's counters.
 use super::engine::{GlmfEngine, GlmfPlacement, DECODE_ROWS, WIDE_DECODE_ROWS};
 use super::prefix::{GlmfPrefix, PrefixMarks};
-use super::verify::{self, VerifyPolicy};
 use super::packing;
 use cuteafd_engine::media::{EmbeddingCache, MediaAdmission, MediaPoll, MediaReady, MediaWaiter, RequestMedia, MediaKeys};
 use crate::shared::prefix::CudaCopyEngine;
@@ -74,16 +73,6 @@ pub(crate) struct ServeArgs {
     /// (within the rows) instead of the adaptive policy.
     #[arg(long)]
     pub draft_fixed: Option<usize>,
-    /// Which drafts a speculative step verifies under the verify budget (64 rows, or the GPU's
-    /// whole sparse MLA waves with --decode-rows 128): `cost` (every sequence the same room,
-    /// budget / sequences - 1 drafts, the cost model's depth within it) or `chain` (each
-    /// sequence's drafts cut where the product of the drafter's probabilities falls below
-    /// --spec-tau, then the least likely drafts across sequences dropped first).
-    #[arg(long, value_enum, env = "CUTEAFD_GLMF_VERIFY_POLICY", default_value = "cost")]
-    pub verify_policy: VerifyPolicy,
-    /// The chain cut of --verify-policy chain (0 < tau <= 1).
-    #[arg(long, env = "CUTEAFD_GLMF_SPEC_TAU", default_value_t = verify::DEFAULT_TAU)]
-    pub spec_tau: f64,
     /// Prefill the prompts that wait together in one pass: each prompt's next chunk, up to the first
     /// prefill lane's rows, every per-sequence program over its own rows and one Spark wave per MoE
     /// layer for all of them. Off: one pass per prompt.
@@ -118,12 +107,15 @@ pub(crate) struct ServeArgs {
     pub api: crate::shared::api::ApiArgs,
 }
 
-/// Fixed neural count, verify-row policy and chain cut, and packed admission prefill.
+/// Even per-sequence room when a fixed count bypasses the shared draft policy.
+fn verify_room(verify_rows: usize, sequences: usize) -> usize {
+    (verify_rows / sequences.max(1)).max(1) - 1
+}
+
+/// Fixed neural count and packed admission prefill.
 #[derive(Debug, Clone, Copy)]
 struct Policy {
     fixed: Option<usize>,
-    verify: VerifyPolicy,
-    tau: f64,
     batch: bool,
 }
 
@@ -175,9 +167,7 @@ pub(crate) async fn run_serve(args: ServeArgs) -> Result<()> {
     (engine_args.draft_context_slots, engine_args.draft_sequences) = draft_capacity(args.max_sequences,
         engine_args.draft_sequences, engine_args.draft_context_slots);
     let (worker_stats, max_sequences, decode_share) = (stats.clone(), args.max_sequences, args.decode_share);
-    anyhow::ensure!(args.spec_tau > 0.0 && args.spec_tau <= 1.0, "--spec-tau must be in (0, 1], got {}", args.spec_tau);
-    let policy = Policy { fixed: args.draft_fixed,
-        verify: args.verify_policy, tau: args.spec_tau, batch: args.prefill_batch };
+    let policy = Policy { fixed: args.draft_fixed, batch: args.prefill_batch };
     let prefix = args.prefix.clone();
     let hub = console::hub(args.console.console_text, || console_layout(&args, &profile.id));
     let vision = args.vision;
@@ -217,10 +207,9 @@ fn console_layout(args: &ServeArgs, model: &str) -> Result<console::Layout> {
         args.engine.local_experts);
     layout.split = args.engine.split_device.map(|_| "head split".into());
     layout.concurrency = args.max_sequences.min(DECODE_ROWS);
-    let policy = match (args.draft_fixed, args.verify_policy) {
-        (Some(n), _) => format!("fixed {n}"),
-        (None, VerifyPolicy::Chain) => format!("chain tau {}", args.spec_tau),
-        (None, VerifyPolicy::Cost) => "adaptive".to_string(),
+    let policy = match args.draft_fixed {
+        Some(n) => format!("fixed {n}"),
+        None => "adaptive".to_string(),
     };
     let drafter = args.engine.draft.as_deref()
         .map(|snapshot| super::dspark::is_dspark(snapshot).map(|dspark| if dspark { "dSpark" } else { "DFlash2" }))
@@ -568,16 +557,6 @@ fn digest(state: u64, token: u32) -> u64 {
     (state ^ u64::from(token)).wrapping_mul(0x0100_0000_01b3)
 }
 
-/// The drafter's probability of each of a draft's tokens: a dSpark confidence head's predicted
-/// acceptance, else the DFlash2 selector's probability of the chosen candidate.
-fn draft_probs(draft: &Draft) -> Vec<f32> {
-    if draft.confidence.is_empty() {
-        draft.features.iter().map(|f| f[1]).collect()
-    } else {
-        draft.confidence.clone()
-    }
-}
-
 fn media_digest(tokens: &[u32], spans: &[cuteafd_loader::media::MediaSpan]) -> u64 {
     let mut state = tokens.iter().fold(DIGEST_SEED, |d, &t| digest(d, t));
     // Radix hints truncate image identity; speculative grouping must see every key byte.
@@ -916,10 +895,10 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
     // A verify step schedules up to `verify_rows` rows (64, or the GPU's whole sparse MLA waves with
     // `--decode-rows 128`).
     let verify_rows = engine.verify_rows;
-    // The resource-priced shared draft policy (v3 D2/D3) chooses DFlash2/dSpark verify lengths under the
-    // cost verify policy; a fixed count and the chain cut keep their own.
+    // The resource-priced shared draft policy (v3 D2/D3) chooses DFlash2/dSpark verify lengths under
+    // the verify-row budget; a fixed count keeps its own.
     let mut shared = match drafter {
-        Some(drafter) if policy.fixed.is_none() && policy.verify == VerifyPolicy::Cost =>
+        Some(drafter) if policy.fixed.is_none() =>
             Some(SharedPolicy::new(engine, opened, drafter, ranks)?),
         _ => None,
     };
@@ -1258,18 +1237,16 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
         let mut tally = console::Step::begin(0);
         let (draft0, verify0, emit0) = (draft_s, verify_s, emit_s);
         let engine_before = tally.live().then(|| *engine.profile.borrow());
-        // Rows each sequence may add after its next token: an even share of the verify budget (cost),
-        // or the whole budget, the step's rows budgeted after drafting (chain).
+        // Rows each sequence may add after its next token: an even share of the verify budget.
         // The shared policy spends one budget across the round (D3): each sequence's room is the whole budget
         // less the other anchors, and the selection keeps the step within `verify_rows`.
         let room = if shared.is_some() { verify_rows.saturating_sub(active.len()) }
-            else { policy.verify.room(verify_rows, active.len()) };
+            else { verify_room(verify_rows, active.len()) };
         let mut limits: Vec<usize> = active.iter().map(|a| if probe::no_speculation(&a.job.probe) { 0 } else {
             room.min(a.job.max_tokens - a.generated - 1).min(a.capacity - a.placement.len - 1) }).collect();
         // With the wide programs the rows the even share leaves over go to the first sequences that can
         // draft once more (127 rows at 16 sequences: 15 draft 7, one 6); 64 rows keep the even share.
-        // Under chain the room is the whole budget: nothing is left over.
-        if policy.verify == VerifyPolicy::Cost && shared.is_none() && engine.decode_rows > DECODE_ROWS {
+        if shared.is_none() && engine.decode_rows > DECODE_ROWS {
             super::engine::hand_out_remainder(&mut limits, room, verify_rows, |i| {
                 let a = &active[i];
                 !probe::no_speculation(&a.job.probe)
@@ -1338,13 +1315,10 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
                 _ => None,
             }).collect();
         let mut predicted = None;
-        let mut planned = match (policy.verify, policy.fixed, shared.as_mut()) {
-            // The chain cut on the drafter's own probabilities.
-            (VerifyPolicy::Chain, None, _) => drafted.iter().zip(&limits).map(|(draft, &limit)| draft.as_ref()
-                .map_or(0, |d| verify::chain_length(&draft_probs(d), limit, policy.tau))).collect(),
+        let planned = match (policy.fixed, shared.as_mut()) {
             // No draft pass ran: every sequence verifies its next token alone.
-            (_, None, Some(_)) if drafted_width == 0 => vec![0; active.len()],
-            (_, None, Some(shared)) => {
+            (None, Some(_)) if drafted_width == 0 => vec![0; active.len()],
+            (None, Some(shared)) => {
                 let candidates: Vec<_> = active.iter().zip(&shared_priors).zip(&limits).zip(&drafted)
                     .map(|(((a, prior), &limit), draft)| super::draft_binding::Candidate { id: a.ticket.id(), prior,
                         limit, selector: draft.as_ref().is_some_and(|d| d.confidence.is_empty()), cold: a.drafts.cold() })
@@ -1358,13 +1332,13 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
                 selection.lengths
             }
             // A fixed count within each sequence's room.
-            (_, Some(fixed), _) => drafted.iter().zip(&limits).map(|(draft, &limit)| draft.as_ref()
+            (Some(fixed), _) => drafted.iter().zip(&limits).map(|(draft, &limit)| draft.as_ref()
                 .map_or(0, |d| fixed.min(limit).min(d.tokens.len()))).collect(),
             // No neural drafter means no speculative proposal.
-            (VerifyPolicy::Cost, None, None) => vec![0; active.len()],
+            (None, None) => vec![0; active.len()],
         };
         // A history continuation never competes with or replaces the confident prefix.
-        let mut sequences: Vec<Vec<u32>> = active.iter().enumerate().map(|(i, a)| {
+        let sequences: Vec<Vec<u32>> = active.iter().enumerate().map(|(i, a)| {
             let full = drafted[i].as_ref().map_or(&[][..], |d| d.tokens.as_slice());
             let proposal = copies[i].as_ref().map_or(full, |c| c.tokens.as_slice());
             let draft = proposal.iter().take(planned[i]).copied();
@@ -1375,17 +1349,6 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
             }
             Ok(rows)
         }).collect::<Result<_>>()?;
-        if policy.verify == VerifyPolicy::Chain {
-            // The step under the verify budget: the least likely drafts across sequences go first (a
-            // copy-window token the drafter also proposed keeps the drafter's probability).
-            let probs: Vec<Vec<f32>> = drafted.iter().map(|draft|
-                draft.as_ref().map(draft_probs).unwrap_or_default()).collect();
-            let drafts: Vec<usize> = sequences.iter().map(|rows| rows.len() - 1).collect();
-            for (i, kept) in verify::budget(&probs, &drafts, verify_rows).into_iter().enumerate() {
-                sequences[i].truncate(kept + 1);
-                planned[i] = planned[i].min(kept);
-            }
-        }
         let copy_windows = trace.as_ref().map(|_| active.iter().zip(&drafted).map(|(a, d)| {
             let (start, suffix, tokens) = crate::shared::draft::copy::trace_window(&a.history,
                 d.as_ref().map_or(0, |d| d.tokens.len()) + crate::shared::draft::copy::COPY_EXTENSION);
@@ -1884,26 +1847,14 @@ mod serve_cli_tests {
     }
 
     #[test]
-    fn admission_and_verify_rows_default_to_todays_policies() {
+    fn admission_defaults_to_one_prefill_pass_per_prompt() {
         let defaults = parse(&[]).unwrap();
-        assert_eq!((defaults.verify_policy, defaults.spec_tau, defaults.prefill_batch),
-            (VerifyPolicy::Cost, verify::DEFAULT_TAU, false));
-        let chain = parse(&["--verify-policy", "chain", "--spec-tau", "0.5", "--prefill-batch"]).unwrap();
-        assert_eq!((chain.verify_policy, chain.spec_tau, chain.prefill_batch), (VerifyPolicy::Chain, 0.5, true));
+        assert!(!defaults.prefill_batch);
         assert!(parse(&["--prefill-batch", "true"]).unwrap().prefill_batch);
         assert!(!parse(&["--prefill-batch", "false"]).unwrap().prefill_batch);
         assert!(parse(&["--prefill-batch", "sometimes"]).is_err());
-        assert!(parse(&["--verify-policy", "greedy"]).is_err());
     }
 
-    #[test]
-    fn draft_probabilities_come_from_the_selector_or_the_confidence_head() {
-        let dflash = Draft { tokens: vec![1, 2], features: vec![[0.5, 0.9, 0.1, 0.0], [0.2, 0.6, 0.3, 1.0]],
-            confidence: Vec::new() };
-        assert_eq!(draft_probs(&dflash), vec![0.9, 0.6]);
-        let dspark = Draft { tokens: vec![1, 2], features: vec![[0.0; 4]; 2], confidence: vec![0.8, 0.4] };
-        assert_eq!(draft_probs(&dspark), vec![0.8, 0.4]);
-    }
 }
 
 #[cfg(test)]
@@ -2052,7 +2003,7 @@ mod censor_tests {
 }
 
 #[cfg(test)]
-mod verify_policy_tests {
+mod verify_rows_tests {
     use super::*;
 
     const VOCAB: u32 = 16;
@@ -2069,7 +2020,7 @@ mod verify_policy_tests {
         context.iter().fold(0x9e37_79b9_7f4a_7c15, |h, &t| mix(h ^ u64::from(t)))
     }
 
-    /// The target's logits for the row after `context`: the same for both policies.
+    /// The target's logits for the row after `context`.
     fn target_logits(context: &[u32]) -> Vec<f32> {
         let h = digest(context);
         (0..VOCAB).map(|t| (mix(h ^ u64::from(t)) % 1000) as f32 / 100.0).collect()
@@ -2097,10 +2048,10 @@ mod verify_policy_tests {
         (tokens, probs)
     }
 
-    /// `streams` sequences decoded by speculative steps under `policy` and a 64-row budget until
+    /// `streams` sequences decoded by speculative steps under a 64-row budget until
     /// each has `tokens` tokens: the emitted tokens (rows from [`accept_rows`], every row's
     /// selection the target's greedy token) and the rows verified.
-    fn decode(policy: VerifyPolicy, streams: usize, tokens: usize) -> (Vec<Vec<u32>>, usize) {
+    fn decode(streams: usize, tokens: usize) -> (Vec<Vec<u32>>, usize) {
         let mut history: Vec<Vec<u32>> = (0..streams as u32).map(|s| vec![s, s * 7 % VOCAB]).collect();
         // The prefill's first token, then every step's.
         let mut next: Vec<u32> = history.iter().map(|h| greedy(h)).collect();
@@ -2111,14 +2062,8 @@ mod verify_policy_tests {
                 h.push(n);
             }
             let proposals: Vec<(Vec<u32>, Vec<f32>)> = history.iter().map(|h| drafts(h)).collect();
-            let room = policy.room(64, streams);
-            let mut ks: Vec<usize> = proposals.iter().map(|(_, probs)| match policy {
-                VerifyPolicy::Cost => room.min(7),
-                VerifyPolicy::Chain => verify::chain_length(probs, room, verify::DEFAULT_TAU),
-            }).collect();
-            if policy == VerifyPolicy::Chain {
-                ks = verify::budget(&proposals.iter().map(|(_, p)| p.clone()).collect::<Vec<_>>(), &ks, 64);
-            }
+            let room = verify_room(64, streams);
+            let ks = vec![room.min(7); streams];
             for (i, ((tokens_i, _), &k)) in proposals.iter().zip(&ks).enumerate() {
                 let rows: Vec<u32> = std::iter::once(next[i]).chain(tokens_i[..k].iter().copied()).collect();
                 verified += rows.len();
@@ -2137,20 +2082,21 @@ mod verify_policy_tests {
     }
 
     #[test]
-    fn cost_and_chain_emit_identical_tokens_from_identical_target_logits() {
-        let (cost, cost_rows) = decode(VerifyPolicy::Cost, 16, 48);
-        let (chain, chain_rows) = decode(VerifyPolicy::Chain, 16, 48);
-        // The policies verify different rows (the test would prove nothing otherwise) ...
-        assert_ne!(cost_rows, chain_rows);
-        // ... and emit the same tokens: the target's own greedy decode, row by row.
-        assert_eq!(cost, chain);
-        for (s, emitted) in cost.iter().enumerate() {
+    fn even_room_verification_emits_target_greedy_tokens() {
+        let (emissions, _) = decode(16, 48);
+        for (s, emitted) in emissions.iter().enumerate() {
             let mut context = vec![s as u32, s as u32 * 7 % VOCAB];
             for &token in emitted {
                 assert_eq!(token, greedy(&context), "stream {s}");
                 context.push(token);
             }
         }
+    }
+
+    #[test]
+    fn room_is_the_even_share_of_the_verify_budget() {
+        assert_eq!([1, 2, 9, 16, 64, 65].map(|s| verify_room(64, s)), [63, 31, 6, 3, 0, 0]);
+        assert_eq!([1, 16, 17].map(|s| verify_room(127, s)), [126, 6, 6]);
     }
 
     #[test]

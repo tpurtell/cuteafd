@@ -938,12 +938,13 @@ def _family_launch_lines(tmp_path: Path, family_config: dict, model: str, keys: 
 @pytest.mark.parametrize("value", [None, "auto", "0", "5", "50%", "all", "max"])
 def test_deepseek_v4_honors_explicit_local_expert_limit(tmp_path, value):
     keys = "" if value is None else f"RTX_EXPERT_LAYERS={value}\n"
-    result = _family_launch_result(tmp_path, {"model_type": "deepseek_v4"}, "test/dsv4", keys)
+    result = _family_launch_result(tmp_path, {"model_type": "deepseek_v4", "num_hidden_layers": 61}, "test/dsv4", keys)
     assert result.returncode == 0, result.stderr
     launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-dsv4" in line)
     if value is None:
         assert "--local-expert-layers" not in launch and "--rtx-expert-layers" not in launch
-    elif value.isdigit():
+    elif value not in ("auto", "max"):
+        value = {"all": "61", "50%": "31"}.get(value, value)
         # Whole layer counts keep the flag older images accept.
         assert f"--local-expert-layers {value}" in launch
     else:
@@ -954,7 +955,7 @@ def test_deepseek_v4_honors_explicit_local_expert_limit(tmp_path, value):
 def test_glm53_honors_explicit_tp2_expert_limit(tmp_path, value):
     keys = "" if value is None else f"RTX_EXPERT_LAYERS={value}\n"
     result = _family_launch_result(tmp_path, {
-        "model_type": "glm_moe_dsa", "num_hidden_layers": 4, "first_k_dense_replace": 3,
+        "model_type": "glm_moe_dsa", "num_hidden_layers": 9, "first_k_dense_replace": 3,
     }, "test/glm", keys)
     assert result.returncode == 0, result.stderr
     launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-glm " in line)
@@ -962,7 +963,8 @@ def test_glm53_honors_explicit_tp2_expert_limit(tmp_path, value):
     if value is None:
         assert "--rtx-expert-layers" not in launch
     else:
-        assert f"--rtx-expert-layers {value}" in launch
+        expected = {"all": "6", "50%": "3"}.get(value, value)
+        assert f"--rtx-expert-layers {expected}" in launch
 
 
 def test_glm53_all_local_two_rtx_launch_has_no_spark_peers(tmp_path):
@@ -972,7 +974,7 @@ def test_glm53_all_local_two_rtx_launch_has_no_spark_peers(tmp_path):
     assert result.returncode == 0, result.stderr
     launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-glm " in line)
     assert "--split-device 1" in launch
-    assert "--rtx-expert-layers all" in launch
+    assert "--rtx-expert-layers 1" in launch
     assert "--peers" not in launch
     assert "cuteafd expertd-native" not in result.stderr
     assert "--local-experts" not in launch
@@ -980,7 +982,7 @@ def test_glm53_all_local_two_rtx_launch_has_no_spark_peers(tmp_path):
     assert "--rdma-endpoints" not in result.stderr
 
 
-@pytest.mark.parametrize("value", [None, "auto", "0", "5", "50%", "all", "max"])
+@pytest.mark.parametrize("value", [None, "auto", "0", "2", "50%", "all", "max"])
 def test_glm_flash_forwards_explicit_rtx_expert_onboarding(tmp_path, value):
     keys = "SPECULATOR=off\nGLM5_FLASH_FP8_MODEL_ID=off\n"
     if value is not None:
@@ -995,7 +997,8 @@ def test_glm_flash_forwards_explicit_rtx_expert_onboarding(tmp_path, value):
     if value is None:
         assert "--rtx-expert-layers" not in launch
     else:
-        assert f"--rtx-expert-layers {value}" in launch
+        expected = {"all": "2", "50%": "1"}.get(value, value)
+        assert f"--rtx-expert-layers {expected}" in launch
 
 
 @pytest.mark.parametrize("value", ["-1", "101%", "half", "5x"])
@@ -1373,26 +1376,19 @@ GLMF_CONFIG = {"model_type": "glm5_next", "num_hidden_layers": 2, "mlp_layer_typ
                "layer_types": ["linear_attention", "deepseek_sparse_attention"]}
 
 
-def test_glmf_default_launch_passes_no_admission_or_verify_option(tmp_path):
-    """Packed admission prefill and the chain verify policy are opt-in: a launch without their
-    keys passes none of their options (one prefill pass per prompt, the cost verify policy)."""
+def test_glmf_default_launch_passes_no_admission_option(tmp_path):
+    """Packed admission prefill is opt-in; the default keeps one pass per prompt."""
     result = _family_launch_result(tmp_path, GLMF_CONFIG, "test/glmf", "GLM5_FLASH_FP8_MODEL_ID=off\n")
     assert result.returncode == 0, result.stderr
     launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-glmf" in line)
-    for option in ("--prefill-batch", "--verify-policy", "--spec-tau"):
-        assert option not in launch, (option, launch)
+    assert "--prefill-batch" not in launch, launch
 
 
 @pytest.mark.parametrize("keys,expected,absent", [
     ("GLM5_FLASH_PREFILL_BATCH=off\n", (), ("--prefill-batch",)),
     ("GLM5_FLASH_PREFILL_BATCH=on\n", ("--prefill-batch",), ()),
-    ("GLM5_FLASH_VERIFY_POLICY=cost\n", (), ("--verify-policy",)),
-    ("GLM5_FLASH_VERIFY_POLICY=chain\n", ("--verify-policy chain",), ("--spec-tau",)),
-    ("GLM5_FLASH_VERIFY_POLICY=chain\nGLM5_FLASH_SPEC_TAU=0.5\n", ("--verify-policy chain", "--spec-tau 0.5"), ()),
-    ("GLM5_FLASH_SPEC_TAU=1\n", ("--spec-tau 1",), ("--verify-policy",)),
-    ("GLM5_FLASH_PREFILL_BATCH=on\nGLM5_FLASH_VERIFY_POLICY=chain\n", ("--prefill-batch", "--verify-policy chain"), ()),
 ])
-def test_glmf_admission_and_verify_keys_are_forwarded(tmp_path, keys, expected, absent):
+def test_glmf_admission_keys_are_forwarded(tmp_path, keys, expected, absent):
     result = _family_launch_result(tmp_path, GLMF_CONFIG, "test/glmf", f"GLM5_FLASH_FP8_MODEL_ID=off\n{keys}")
     assert result.returncode == 0, result.stderr
     launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-glmf" in line)
@@ -1404,13 +1400,8 @@ def test_glmf_admission_and_verify_keys_are_forwarded(tmp_path, keys, expected, 
 
 @pytest.mark.parametrize("keys,message", [
     ("GLM5_FLASH_PREFILL_BATCH=yes\n", "GLM5_FLASH_PREFILL_BATCH must be"),
-    ("GLM5_FLASH_VERIFY_POLICY=greedy\n", "GLM5_FLASH_VERIFY_POLICY must be"),
-    ("GLM5_FLASH_SPEC_TAU=0\n", "GLM5_FLASH_SPEC_TAU must be"),
-    ("GLM5_FLASH_SPEC_TAU=0.0\n", "GLM5_FLASH_SPEC_TAU must be"),
-    ("GLM5_FLASH_SPEC_TAU=1.5\n", "GLM5_FLASH_SPEC_TAU must be"),
-    ("GLM5_FLASH_SPEC_TAU=abc\n", "GLM5_FLASH_SPEC_TAU must be"),
 ])
-def test_glmf_admission_and_verify_keys_reject_bad_values_before_launch(tmp_path, keys, message):
+def test_glmf_admission_keys_reject_bad_values_before_launch(tmp_path, keys, message):
     result = _family_launch_result(tmp_path, GLMF_CONFIG, "test/glmf", f"GLM5_FLASH_FP8_MODEL_ID=off\n{keys}")
     assert result.returncode == 2 and message in result.stderr, result.stderr
     assert not any(line.startswith(("docker ", "ssh ", "nest ")) for line in result.stderr.splitlines())
@@ -1988,7 +1979,8 @@ def test_qwen_dual_forwards_shared_onboard_policy(tmp_path: Path, onboard: str) 
                                   f"RTX_GPUS=2\nSPARK_COUNT=0\nEXPERT_BACKEND=local\nSPECULATOR=off\nRTX_EXPERT_LAYERS={onboard}\n")
     assert result.returncode == 0, result.stderr
     launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-qwen4" in line)
-    assert f"--rtx-expert-layers {onboard}" in launch
+    expected = {"all": "2", "100%": "2"}.get(onboard, onboard)
+    assert f"--rtx-expert-layers {expected}" in launch
     assert "CUTEAFD_ATTENTION_PLACEMENT=layers" in launch
 
 
@@ -2478,7 +2470,7 @@ def test_mimo_media_plan_keeps_ingress_onboarding_and_graph_contract(tmp_path, i
     preflight = next(line for line in result.stderr.splitlines() if "cuteafd plan" in line)
     launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-mimo" in line)
     assert f"--expert-input {ingress}" in preflight and f"--expert-input {ingress}" in launch
-    assert "--rtx-expert-layers 25%" in preflight and "--onboard 25%" in launch
+    assert "--rtx-expert-layers 0" in preflight and "--onboard 0" in launch
     assert "--context-tokens 262144" in preflight and "--max-context 262144" in launch
     assert "--mimo-decode-graphs" in preflight and "--decode-graphs true" in launch
     assert "--full-prefill-logits" in preflight and "--full-prefill-logits" in launch
@@ -3104,3 +3096,22 @@ def test_v41_rejects_noncanonical_speculator(tmp_path: Path, keys: str, error: s
     assert result.returncode == 2, result.stderr
     assert error in result.stderr
     assert "docker run -d" not in result.stderr
+
+
+@pytest.mark.parametrize("value,expected", [("48", "48"), ("all", "60"), ("50%", "30")])
+def test_expert_onboarding_uses_checkpoint_count_above_forty(tmp_path, value, expected):
+    result = _family_launch_result(tmp_path, {
+        "model_type": "glm_moe_dsa", "num_hidden_layers": 63, "first_k_dense_replace": 3,
+    }, "test/glm", f"RTX_EXPERT_LAYERS={value}\nSPECULATOR=off\n")
+    assert result.returncode == 0, result.stderr
+    launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-glm " in line)
+    assert f"--rtx-expert-layers {expected}" in launch
+
+
+def test_expert_onboarding_rejects_more_than_checkpoint_routed_layers(tmp_path):
+    result = _family_launch_result(tmp_path, {
+        "model_type": "glm_moe_dsa", "num_hidden_layers": 63, "first_k_dense_replace": 3,
+    }, "test/glm", "RTX_EXPERT_LAYERS=61\nSPECULATOR=off\n")
+    assert result.returncode == 2
+    assert "checkpoint has 60 routed layers" in result.stderr
+    assert "docker run" not in result.stderr

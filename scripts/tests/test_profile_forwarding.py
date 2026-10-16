@@ -1,5 +1,6 @@
 """PROFILE=... forwards one set of profiling switches to the coordinator and every
 Spark worker in every family (run-family.sh) and on the V4.1 path (run.sh)."""
+import shutil
 import socket
 import subprocess
 from pathlib import Path
@@ -59,7 +60,7 @@ def test_existing_switches_are_unchanged_and_add_no_wrapper():
     out = _helper('census,transport-timing,expert-timing', '/data/prof', 'kiwi')
     assert out.stdout.split('\n')[:-1] == [
         '-e', 'CUTEAFD_GRAPH_CENSUS=1', '-e', 'RUST_LOG=info,cuteafd::graph_capture=debug',
-        '-e', 'CUTEAFD_PROTOCOL_V2_TCP_TIMING=1', '-e', 'CUTEAFD_EXPERT_TIMING=1',
+        '-e', 'CUTEAFD_STARTUP_MEMORY_PROBE=1', '-e', 'CUTEAFD_PROTOCOL_V2_TCP_TIMING=1', '-e', 'CUTEAFD_EXPERT_TIMING=1',
         '-e', 'CUTEAFD_PROFILE_HOST=kiwi', '-v', '/data/prof:/data/prof', '-e', 'CUTEAFD_PROFILE_DIR=/data/prof']
     for profile in ('', 'census,transport-timing,expert-timing,draft-timing'):
         out, wrapper, docker = _wrapper(profile, '/data/prof', 'raptor', 'coordinator')
@@ -67,6 +68,80 @@ def test_existing_switches_are_unchanged_and_add_no_wrapper():
         assert wrapper == [] and docker == []
         out, wrapper, docker = _wrapper(profile, '/data/prof', 'kiwi', 'spark')
         assert out.returncode == 0 and wrapper == [] and docker == []
+
+
+def test_census_carries_the_startup_memory_probe_and_nothing_else_does():
+    out = _helper('census', '/data/prof', 'kiwi')
+    assert out.returncode == 0, out.stderr
+    assert out.stdout.split('\n')[:-1] == [
+        '-e', 'CUTEAFD_GRAPH_CENSUS=1', '-e', 'RUST_LOG=info,cuteafd::graph_capture=debug',
+        '-e', 'CUTEAFD_STARTUP_MEMORY_PROBE=1',
+        '-e', 'CUTEAFD_PROFILE_HOST=kiwi', '-v', '/data/prof:/data/prof', '-e', 'CUTEAFD_PROFILE_DIR=/data/prof']
+    for profile in ('transport-timing,expert-timing,draft-timing', 'nsys', 'ncu'):
+        out = _helper(profile, '/data/prof', 'kiwi')
+        assert out.returncode == 0, out.stderr
+        assert 'CUTEAFD_STARTUP_MEMORY_PROBE' not in out.stdout
+    assert _helper('', '', 'kiwi').stdout == '\n'
+
+
+def test_family_launch_census_probe_reaches_coordinator_and_workers_only_when_asked(tmp_path):
+    prof = tmp_path / 'prof'
+    config = 'GLM5_FLASH_FP8_MODEL_ID=off\n'
+    (tmp_path / 'plain').mkdir()
+    (tmp_path / 'census').mkdir()
+    plain = _family_launch_result(tmp_path / 'plain', GLMF_TWO_LAYER, 'test/glmf', config)
+    assert plain.returncode == 0, plain.stderr
+    assert 'CUTEAFD_STARTUP_MEMORY_PROBE' not in plain.stderr
+    assert 'CUTEAFD_PROFILE' not in plain.stderr
+    census = _family_launch_result(tmp_path / 'census', GLMF_TWO_LAYER, 'test/glmf',
+                                   config + f'PROFILE=census\nPROFILE_DIR={prof}\n')
+    assert census.returncode == 0, census.stderr
+    lines = census.stderr.splitlines()
+    coordinator = next(line for line in lines if 'cuteafd serve-glmf' in line)
+    workers = [line for line in lines if 'cuteafd expertd-native' in line]
+    assert workers
+    for line in [coordinator, *workers]:
+        for flag in ('CUTEAFD_GRAPH_CENSUS=1', 'CUTEAFD_STARTUP_MEMORY_PROBE=1', f'CUTEAFD_PROFILE_DIR={prof}'):
+            assert flag in line, (flag, line)
+
+
+CAPTURE_PATH_CASES = r'''
+#include "graph_census_path.h"
+#include <cstdio>
+int main() {
+  const char* cases[][3] = {
+    {nullptr, "raptor", "/tmp/cuteafd-graph-census-captures.jsonl"},
+    {"", "raptor", "/tmp/cuteafd-graph-census-captures.jsonl"},
+    {"relative/dir", "raptor", "/tmp/cuteafd-graph-census-captures.jsonl"},
+    {"/data/prof", "raptor", "/data/prof/graph-census-captures-raptor.jsonl"},
+    {"/data/prof/", "kiwi", "/data/prof/graph-census-captures-kiwi.jsonl"},
+    {"/data/prof", "a.b/../c", "/data/prof/graph-census-captures-a_b____c.jsonl"},
+    {"/data/prof", nullptr, "/data/prof/graph-census-captures-unknown.jsonl"},
+    {"/data/prof", "", "/data/prof/graph-census-captures-unknown.jsonl"},
+  };
+  int failed = 0;
+  for (auto& c : cases) {
+    const std::string got = cuteafd_graph_census_captures_path(c[0], c[1]);
+    if (got != c[2]) { std::printf("%s -> %s\n", c[2], got.c_str()); failed = 1; }
+  }
+  return failed;
+}
+'''
+
+
+def test_graph_census_captures_follow_the_profile_dir(tmp_path):
+    compiler = shutil.which('g++')
+    if not compiler:
+        pytest.skip('C++ compiler unavailable')
+    (tmp_path / 'cases.cc').write_text(CAPTURE_PATH_CASES)
+    executable = tmp_path / 'cases'
+    subprocess.run([compiler, '-std=c++17', '-I', str(ROOT / 'native/shared/src'), str(tmp_path / 'cases.cc'),
+                    '-o', str(executable)], check=True, capture_output=True)
+    result = subprocess.run([str(executable)], capture_output=True, text=True)
+    assert result.returncode == 0, result.stdout
+    native = (ROOT / 'native/shared/src/cuteafd_native.cc').read_text()
+    assert 'cuteafd_graph_census_captures_path(std::getenv("CUTEAFD_PROFILE_DIR"), host)' in native
+    assert 'std::fopen("/tmp/cuteafd-graph-census-captures.jsonl"' not in native
 
 
 def test_nsys_wraps_the_coordinator_paused_into_profile_dir():

@@ -1,0 +1,1331 @@
+{
+  "build": "REPLACE-ME-v3-rc",
+  "profile": "smoke",
+  "defaults": {
+    "timeout_s": 1200,
+    "run_timeout_s": 1800,
+    "set": {
+      "ENABLE_BENCH": "on",
+      "COORDINATOR_DOCKER_INFERENCE": "ghcr.io/tpurtell/cuteafd-coordinator:REPLACE-ME-v3-rc",
+      "SPARK_EXPERT_DOCKER_INFERENCE": "ghcr.io/tpurtell/cuteafd-spark-expert:REPLACE-ME-v3-rc"
+    },
+    "fabric": true
+  },
+  "entries": [
+    {
+      "name": "v41-flash-min",
+      "family": "deepseek_v41",
+      "config": "examples/configs/deepseek-v41-mxfp4-min.config",
+      "gpus": [
+        1
+      ],
+      "sparks": [
+        "REPLACE-ME-spark-0",
+        "REPLACE-ME-spark-1",
+        "REPLACE-ME-spark-2"
+      ],
+      "set": {
+        "RTX_GPUS": "1",
+        "COORDINATOR_GPU": "1",
+        "SPARK_COUNT": "3",
+        "ADDR": "0.0.0.0:8800",
+        "EXPERT_PORT": "19900",
+        "SPARK_0_HOST": "REPLACE-ME-spark-0",
+        "SPARK_0_LANE_A": "192.0.2.1",
+        "SPARK_0_LANE_B": "198.51.100.1",
+        "SPARK_1_HOST": "REPLACE-ME-spark-1",
+        "SPARK_1_LANE_A": "192.0.2.2",
+        "SPARK_1_LANE_B": "198.51.100.2",
+        "SPARK_2_HOST": "REPLACE-ME-spark-2",
+        "SPARK_2_LANE_A": "192.0.2.3",
+        "SPARK_2_LANE_B": "198.51.100.3",
+        "SPECULATOR": "dspark"
+      }
+    },
+    {
+      "name": "v41-flash-max",
+      "family": "deepseek_v41",
+      "config": "examples/configs/deepseek-v41-mxfp4-max.config",
+      "gpus": [
+        0,
+        1
+      ],
+      "sparks": [
+        "REPLACE-ME-spark-0",
+        "REPLACE-ME-spark-1",
+        "REPLACE-ME-spark-2",
+        "REPLACE-ME-spark-3"
+      ],
+      "set": {
+        "RTX_GPUS": "2",
+        "COORDINATOR_GPU": "0",
+        "SPARK_COUNT": "4",
+        "ADDR": "0.0.0.0:8801",
+        "EXPERT_PORT": "19901",
+        "SPARK_0_HOST": "REPLACE-ME-spark-0",
+        "SPARK_0_LANE_A": "192.0.2.1",
+        "SPARK_0_LANE_B": "198.51.100.1",
+        "SPARK_1_HOST": "REPLACE-ME-spark-1",
+        "SPARK_1_LANE_A": "192.0.2.2",
+        "SPARK_1_LANE_B": "198.51.100.2",
+        "SPARK_2_HOST": "REPLACE-ME-spark-2",
+        "SPARK_2_LANE_A": "192.0.2.3",
+        "SPARK_2_LANE_B": "198.51.100.3",
+        "SPARK_3_HOST": "REPLACE-ME-spark-3",
+        "SPARK_3_LANE_A": "192.0.2.4",
+        "SPARK_3_LANE_B": "198.51.100.4",
+        "SPECULATOR": "dspark"
+      }
+    },
+    {
+      "name": "v41-flash-nvfp4-min",
+      "family": "deepseek_v41",
+      "config": "examples/configs/deepseek-v41-nvfp4-min.config",
+      "gpus": [
+        1
+      ],
+      "sparks": [
+        "REPLACE-ME-spark-0",
+        "REPLACE-ME-spark-1",
+        "REPLACE-ME-spark-2",
+        "REPLACE-ME-spark-3"
+      ],
+      "set": {
+        "RTX_GPUS": "1",
+        "COORDINATOR_GPU": "1",
+        "SPARK_COUNT": "4",
+        "ADDR": "0.0.0.0:8802",
+        "EXPERT_PORT": "19902",
+        "SPARK_0_HOST": "REPLACE-ME-spark-0",
+        "SPARK_0_LANE_A": "192.0.2.1",
+        "SPARK_0_LANE_B": "198.51.100.1",
+        "SPARK_1_HOST": "REPLACE-ME-spark-1",
+        "SPARK_1_LANE_A": "192.0.2.2",
+        "SPARK_1_LANE_B": "198.51.100.2",
+        "SPARK_2_HOST": "REPLACE-ME-spark-2",
+        "SPARK_2_LANE_A": "192.0.2.3",
+        "SPARK_2_LANE_B": "198.51.100.3",
+        "SPARK_3_HOST": "REPLACE-ME-spark-3",
+        "SPARK_3_LANE_A": "192.0.2.4",
+        "SPARK_3_LANE_B": "198.51.100.4",
+        "SPECULATOR": "dspark"
+      }
+    },
+    {
+      "name": "v41-flash-nvfp4-max",
+      "family": "deepseek_v41",
+      "config": "examples/configs/deepseek-v41-nvfp4-max.config",
+      "gpus": [
+        0,
+        1
+      ],
+      "sparks": [
+        "REPLACE-ME-spark-0",
+        "REPLACE-ME-spark-1",
+        "REPLACE-ME-spark-2",
+        "REPLACE-ME-spark-3"
+      ],
+      "set": {
+        "RTX_GPUS": "2",
+        "COORDINATOR_GPU": "0",
+        "SPARK_COUNT": "4",
+        "ADDR": "0.0.0.0:8803",
+        "EXPERT_PORT": "19903",
+        "SPARK_0_HOST": "REPLACE-ME-spark-0",
+        "SPARK_0_LANE_A": "192.0.2.1",
+        "SPARK_0_LANE_B": "198.51.100.1",
+        "SPARK_1_HOST": "REPLACE-ME-spark-1",
+        "SPARK_1_LANE_A": "192.0.2.2",
+        "SPARK_1_LANE_B": "198.51.100.2",
+        "SPARK_2_HOST": "REPLACE-ME-spark-2",
+        "SPARK_2_LANE_A": "192.0.2.3",
+        "SPARK_2_LANE_B": "198.51.100.3",
+        "SPARK_3_HOST": "REPLACE-ME-spark-3",
+        "SPARK_3_LANE_A": "192.0.2.4",
+        "SPARK_3_LANE_B": "198.51.100.4",
+        "SPECULATOR": "dspark"
+      }
+    },
+    {
+      "name": "v4-flash-min",
+      "family": "deepseek_v4",
+      "config": "examples/configs/deepseek-v4-flash-mxfp4-min.config",
+      "gpus": [
+        1
+      ],
+      "sparks": [
+        "REPLACE-ME-spark-0",
+        "REPLACE-ME-spark-1"
+      ],
+      "set": {
+        "RTX_GPUS": "1",
+        "COORDINATOR_GPU": "1",
+        "SPARK_COUNT": "2",
+        "ADDR": "0.0.0.0:8804",
+        "EXPERT_PORT": "19904",
+        "SPARK_0_HOST": "REPLACE-ME-spark-0",
+        "SPARK_0_LANE_A": "192.0.2.1",
+        "SPARK_1_HOST": "REPLACE-ME-spark-1",
+        "SPARK_1_LANE_A": "192.0.2.2",
+        "SPECULATOR": "dspark"
+      }
+    },
+    {
+      "name": "v4-flash-max",
+      "family": "deepseek_v4",
+      "config": "examples/configs/deepseek-v4-flash-mxfp4-max.config",
+      "gpus": [
+        0,
+        1
+      ],
+      "sparks": [
+        "REPLACE-ME-spark-0",
+        "REPLACE-ME-spark-1",
+        "REPLACE-ME-spark-2",
+        "REPLACE-ME-spark-3"
+      ],
+      "set": {
+        "RTX_GPUS": "2",
+        "COORDINATOR_GPU": "0",
+        "SPARK_COUNT": "4",
+        "ADDR": "0.0.0.0:8805",
+        "EXPERT_PORT": "19905",
+        "SPARK_0_HOST": "REPLACE-ME-spark-0",
+        "SPARK_0_LANE_A": "192.0.2.1",
+        "SPARK_1_HOST": "REPLACE-ME-spark-1",
+        "SPARK_1_LANE_A": "192.0.2.2",
+        "SPARK_2_HOST": "REPLACE-ME-spark-2",
+        "SPARK_2_LANE_A": "192.0.2.3",
+        "SPARK_3_HOST": "REPLACE-ME-spark-3",
+        "SPARK_3_LANE_A": "192.0.2.4",
+        "SPECULATOR": "dspark"
+      }
+    },
+    {
+      "name": "v4-pro-exl3-min",
+      "family": "deepseek_v4",
+      "config": "examples/configs/deepseek-v4-pro-exl3-min.config",
+      "gpus": [
+        1
+      ],
+      "sparks": [
+        "REPLACE-ME-spark-0",
+        "REPLACE-ME-spark-1",
+        "REPLACE-ME-spark-2",
+        "REPLACE-ME-spark-3"
+      ],
+      "set": {
+        "RTX_GPUS": "1",
+        "COORDINATOR_GPU": "1",
+        "SPARK_COUNT": "4",
+        "ADDR": "0.0.0.0:8806",
+        "EXPERT_PORT": "19906",
+        "SPARK_0_HOST": "REPLACE-ME-spark-0",
+        "SPARK_0_LANE_A": "192.0.2.1",
+        "SPARK_1_HOST": "REPLACE-ME-spark-1",
+        "SPARK_1_LANE_A": "192.0.2.2",
+        "SPARK_2_HOST": "REPLACE-ME-spark-2",
+        "SPARK_2_LANE_A": "192.0.2.3",
+        "SPARK_3_HOST": "REPLACE-ME-spark-3",
+        "SPARK_3_LANE_A": "192.0.2.4",
+        "SPECULATOR": "dspark"
+      }
+    },
+    {
+      "name": "v4-pro-exl3-max",
+      "family": "deepseek_v4",
+      "config": "examples/configs/deepseek-v4-pro-exl3-max.config",
+      "gpus": [
+        0,
+        1
+      ],
+      "sparks": [
+        "REPLACE-ME-spark-0",
+        "REPLACE-ME-spark-1",
+        "REPLACE-ME-spark-2",
+        "REPLACE-ME-spark-3",
+        "REPLACE-ME-spark-4",
+        "REPLACE-ME-spark-5"
+      ],
+      "set": {
+        "RTX_GPUS": "2",
+        "COORDINATOR_GPU": "0",
+        "SPARK_COUNT": "6",
+        "ADDR": "0.0.0.0:8807",
+        "EXPERT_PORT": "19907",
+        "SPARK_0_HOST": "REPLACE-ME-spark-0",
+        "SPARK_0_LANE_A": "192.0.2.1",
+        "SPARK_1_HOST": "REPLACE-ME-spark-1",
+        "SPARK_1_LANE_A": "192.0.2.2",
+        "SPARK_2_HOST": "REPLACE-ME-spark-2",
+        "SPARK_2_LANE_A": "192.0.2.3",
+        "SPARK_3_HOST": "REPLACE-ME-spark-3",
+        "SPARK_3_LANE_A": "192.0.2.4",
+        "SPARK_4_HOST": "REPLACE-ME-spark-4",
+        "SPARK_4_LANE_A": "192.0.2.5",
+        "SPARK_5_HOST": "REPLACE-ME-spark-5",
+        "SPARK_5_LANE_A": "192.0.2.6",
+        "SPECULATOR": "dspark"
+      }
+    },
+    {
+      "name": "glm53f-fp8-min",
+      "family": "glm5_flash",
+      "config": "examples/configs/glm53-flash-fp8-min.config",
+      "gpus": [
+        1
+      ],
+      "sparks": [
+        "REPLACE-ME-spark-0",
+        "REPLACE-ME-spark-1",
+        "REPLACE-ME-spark-2",
+        "REPLACE-ME-spark-3"
+      ],
+      "set": {
+        "RTX_GPUS": "1",
+        "COORDINATOR_GPU": "1",
+        "SPARK_COUNT": "4",
+        "ADDR": "0.0.0.0:8808",
+        "EXPERT_PORT": "19908",
+        "SPARK_0_HOST": "REPLACE-ME-spark-0",
+        "SPARK_0_LANE_A": "192.0.2.1",
+        "SPARK_1_HOST": "REPLACE-ME-spark-1",
+        "SPARK_1_LANE_A": "192.0.2.2",
+        "SPARK_2_HOST": "REPLACE-ME-spark-2",
+        "SPARK_2_LANE_A": "192.0.2.3",
+        "SPARK_3_HOST": "REPLACE-ME-spark-3",
+        "SPARK_3_LANE_A": "192.0.2.4",
+        "SPECULATOR": "dflash2"
+      }
+    },
+    {
+      "name": "glm53f-fp8-max",
+      "family": "glm5_flash",
+      "config": "examples/configs/glm53-flash-fp8-max.config",
+      "gpus": [
+        0,
+        1
+      ],
+      "sparks": [
+        "REPLACE-ME-spark-0",
+        "REPLACE-ME-spark-1",
+        "REPLACE-ME-spark-2",
+        "REPLACE-ME-spark-3"
+      ],
+      "set": {
+        "RTX_GPUS": "2",
+        "COORDINATOR_GPU": "0",
+        "SPARK_COUNT": "4",
+        "ADDR": "0.0.0.0:8809",
+        "EXPERT_PORT": "19909",
+        "SPARK_0_HOST": "REPLACE-ME-spark-0",
+        "SPARK_0_LANE_A": "192.0.2.1",
+        "SPARK_1_HOST": "REPLACE-ME-spark-1",
+        "SPARK_1_LANE_A": "192.0.2.2",
+        "SPARK_2_HOST": "REPLACE-ME-spark-2",
+        "SPARK_2_LANE_A": "192.0.2.3",
+        "SPARK_3_HOST": "REPLACE-ME-spark-3",
+        "SPARK_3_LANE_A": "192.0.2.4",
+        "SPECULATOR": "dflash2"
+      }
+    },
+    {
+      "name": "glm53f-exl3-min",
+      "family": "glm5_flash",
+      "config": "examples/configs/glm53-flash-exl3-min.config",
+      "gpus": [
+        1
+      ],
+      "sparks": [
+        "REPLACE-ME-spark-0",
+        "REPLACE-ME-spark-1"
+      ],
+      "set": {
+        "RTX_GPUS": "1",
+        "COORDINATOR_GPU": "1",
+        "SPARK_COUNT": "2",
+        "ADDR": "0.0.0.0:8810",
+        "EXPERT_PORT": "19910",
+        "SPARK_0_HOST": "REPLACE-ME-spark-0",
+        "SPARK_0_LANE_A": "192.0.2.1",
+        "SPARK_1_HOST": "REPLACE-ME-spark-1",
+        "SPARK_1_LANE_A": "192.0.2.2",
+        "SPECULATOR": "dflash2"
+      }
+    },
+    {
+      "name": "glm53f-exl3-max",
+      "family": "glm5_flash",
+      "config": "examples/configs/glm53-flash-exl3-max.config",
+      "gpus": [
+        0,
+        1
+      ],
+      "sparks": [],
+      "set": {
+        "RTX_GPUS": "2",
+        "COORDINATOR_GPU": "0",
+        "SPARK_COUNT": "0",
+        "ADDR": "0.0.0.0:8811",
+        "EXPERT_PORT": "19911",
+        "EXPERT_BACKEND": "local",
+        "SPECULATOR": "dflash2"
+      }
+    },
+    {
+      "name": "glm53f-nvfp4-min",
+      "family": "glm5_flash",
+      "config": "examples/configs/glm53-flash-nvfp4-min.config",
+      "gpus": [
+        1
+      ],
+      "sparks": [
+        "REPLACE-ME-spark-0",
+        "REPLACE-ME-spark-1"
+      ],
+      "set": {
+        "RTX_GPUS": "1",
+        "COORDINATOR_GPU": "1",
+        "SPARK_COUNT": "2",
+        "ADDR": "0.0.0.0:8812",
+        "EXPERT_PORT": "19912",
+        "SPARK_0_HOST": "REPLACE-ME-spark-0",
+        "SPARK_0_LANE_A": "192.0.2.1",
+        "SPARK_1_HOST": "REPLACE-ME-spark-1",
+        "SPARK_1_LANE_A": "192.0.2.2",
+        "SPECULATOR": "dflash2"
+      }
+    },
+    {
+      "name": "glm53f-nvfp4-max",
+      "family": "glm5_flash",
+      "config": "examples/configs/glm53-flash-nvfp4-max.config",
+      "gpus": [
+        0,
+        1
+      ],
+      "sparks": [
+        "REPLACE-ME-spark-0",
+        "REPLACE-ME-spark-1"
+      ],
+      "set": {
+        "RTX_GPUS": "2",
+        "COORDINATOR_GPU": "0",
+        "ADDR": "0.0.0.0:8813",
+        "EXPERT_PORT": "19913",
+        "EXPERT_BACKEND": "spark",
+        "SPECULATOR": "dflash2",
+        "SPARK_COUNT": "2",
+        "SPARK_0_HOST": "REPLACE-ME-spark-0",
+        "SPARK_0_LANE_A": "192.0.2.1",
+        "SPARK_1_HOST": "REPLACE-ME-spark-1",
+        "SPARK_1_LANE_A": "192.0.2.2"
+      }
+    },
+    {
+      "name": "glm53f-tr3-min",
+      "family": "glm5_flash",
+      "config": "examples/configs/glm53-flash-tr3-min.config",
+      "gpus": [
+        1
+      ],
+      "sparks": [
+        "REPLACE-ME-spark-0",
+        "REPLACE-ME-spark-1"
+      ],
+      "set": {
+        "RTX_GPUS": "1",
+        "COORDINATOR_GPU": "1",
+        "SPARK_COUNT": "2",
+        "ADDR": "0.0.0.0:8814",
+        "EXPERT_PORT": "19914",
+        "SPARK_0_HOST": "REPLACE-ME-spark-0",
+        "SPARK_0_LANE_A": "192.0.2.1",
+        "SPARK_1_HOST": "REPLACE-ME-spark-1",
+        "SPARK_1_LANE_A": "192.0.2.2",
+        "SPECULATOR": "dflash2"
+      }
+    },
+    {
+      "name": "glm53f-tr3-max",
+      "family": "glm5_flash",
+      "config": "examples/configs/glm53-flash-tr3-max.config",
+      "gpus": [
+        0,
+        1
+      ],
+      "sparks": [
+        "REPLACE-ME-spark-0",
+        "REPLACE-ME-spark-1"
+      ],
+      "set": {
+        "RTX_GPUS": "2",
+        "COORDINATOR_GPU": "0",
+        "ADDR": "0.0.0.0:8815",
+        "EXPERT_PORT": "19915",
+        "EXPERT_BACKEND": "spark",
+        "SPECULATOR": "dflash2",
+        "SPARK_COUNT": "2",
+        "SPARK_0_HOST": "REPLACE-ME-spark-0",
+        "SPARK_0_LANE_A": "192.0.2.1",
+        "SPARK_1_HOST": "REPLACE-ME-spark-1",
+        "SPARK_1_LANE_A": "192.0.2.2"
+      }
+    },
+    {
+      "name": "mimo26-flash-min",
+      "family": "mimo_v2",
+      "config": "examples/configs/mimo-v26-flash-mxfp4-min.config",
+      "gpus": [
+        1
+      ],
+      "sparks": [
+        "REPLACE-ME-spark-0",
+        "REPLACE-ME-spark-1"
+      ],
+      "set": {
+        "RTX_GPUS": "1",
+        "COORDINATOR_GPU": "1",
+        "SPARK_COUNT": "2",
+        "ADDR": "0.0.0.0:8816",
+        "EXPERT_PORT": "19916",
+        "SPARK_0_HOST": "REPLACE-ME-spark-0",
+        "SPARK_0_LANE_A": "192.0.2.1",
+        "SPARK_1_HOST": "REPLACE-ME-spark-1",
+        "SPARK_1_LANE_A": "192.0.2.2",
+        "SPECULATOR": "dflash2"
+      }
+    },
+    {
+      "name": "mimo26-flash-max",
+      "family": "mimo_v2",
+      "config": "examples/configs/mimo-v26-flash-mxfp4-max.config",
+      "gpus": [
+        0,
+        1
+      ],
+      "sparks": [
+        "REPLACE-ME-spark-0",
+        "REPLACE-ME-spark-1",
+        "REPLACE-ME-spark-2",
+        "REPLACE-ME-spark-3"
+      ],
+      "set": {
+        "RTX_GPUS": "2",
+        "COORDINATOR_GPU": "0",
+        "SPARK_COUNT": "4",
+        "ADDR": "0.0.0.0:8817",
+        "EXPERT_PORT": "19917",
+        "SPARK_0_HOST": "REPLACE-ME-spark-0",
+        "SPARK_0_LANE_A": "192.0.2.1",
+        "SPARK_1_HOST": "REPLACE-ME-spark-1",
+        "SPARK_1_LANE_A": "192.0.2.2",
+        "SPARK_2_HOST": "REPLACE-ME-spark-2",
+        "SPARK_2_LANE_A": "192.0.2.3",
+        "SPARK_3_HOST": "REPLACE-ME-spark-3",
+        "SPARK_3_LANE_A": "192.0.2.4",
+        "SPECULATOR": "dflash2"
+      }
+    },
+    {
+      "name": "mimo-pro-min",
+      "family": "mimo_v2",
+      "config": "examples/configs/mimo-v26-pro-mxfp4-min.config",
+      "gpus": [
+        1
+      ],
+      "sparks": [
+        "REPLACE-ME-spark-0",
+        "REPLACE-ME-spark-1",
+        "REPLACE-ME-spark-2",
+        "REPLACE-ME-spark-3",
+        "REPLACE-ME-spark-4",
+        "REPLACE-ME-spark-5"
+      ],
+      "set": {
+        "RTX_GPUS": "1",
+        "COORDINATOR_GPU": "1",
+        "SPARK_COUNT": "6",
+        "ADDR": "0.0.0.0:8818",
+        "EXPERT_PORT": "19918",
+        "SPARK_0_HOST": "REPLACE-ME-spark-0",
+        "SPARK_0_LANE_A": "192.0.2.1",
+        "SPARK_1_HOST": "REPLACE-ME-spark-1",
+        "SPARK_1_LANE_A": "192.0.2.2",
+        "SPARK_2_HOST": "REPLACE-ME-spark-2",
+        "SPARK_2_LANE_A": "192.0.2.3",
+        "SPARK_3_HOST": "REPLACE-ME-spark-3",
+        "SPARK_3_LANE_A": "192.0.2.4",
+        "SPARK_4_HOST": "REPLACE-ME-spark-4",
+        "SPARK_4_LANE_A": "192.0.2.5",
+        "SPARK_5_HOST": "REPLACE-ME-spark-5",
+        "SPARK_5_LANE_A": "192.0.2.6",
+        "SPECULATOR": "dflash2"
+      }
+    },
+    {
+      "name": "mimo-pro-max",
+      "family": "mimo_v2",
+      "config": "examples/configs/mimo-v26-pro-mxfp4-max.config",
+      "gpus": [
+        0,
+        1
+      ],
+      "sparks": [
+        "REPLACE-ME-spark-0",
+        "REPLACE-ME-spark-1",
+        "REPLACE-ME-spark-2",
+        "REPLACE-ME-spark-3",
+        "REPLACE-ME-spark-4",
+        "REPLACE-ME-spark-5"
+      ],
+      "set": {
+        "RTX_GPUS": "2",
+        "COORDINATOR_GPU": "0",
+        "SPARK_COUNT": "6",
+        "ADDR": "0.0.0.0:8819",
+        "EXPERT_PORT": "19919",
+        "SPARK_0_HOST": "REPLACE-ME-spark-0",
+        "SPARK_0_LANE_A": "192.0.2.1",
+        "SPARK_1_HOST": "REPLACE-ME-spark-1",
+        "SPARK_1_LANE_A": "192.0.2.2",
+        "SPARK_2_HOST": "REPLACE-ME-spark-2",
+        "SPARK_2_LANE_A": "192.0.2.3",
+        "SPARK_3_HOST": "REPLACE-ME-spark-3",
+        "SPARK_3_LANE_A": "192.0.2.4",
+        "SPARK_4_HOST": "REPLACE-ME-spark-4",
+        "SPARK_4_LANE_A": "192.0.2.5",
+        "SPARK_5_HOST": "REPLACE-ME-spark-5",
+        "SPARK_5_LANE_A": "192.0.2.6",
+        "SPECULATOR": "dflash2"
+      }
+    },
+    {
+      "name": "qwen38-exl3-min",
+      "family": "qwen4",
+      "config": "examples/configs/qwen38-exl3-min.config",
+      "gpus": [
+        1
+      ],
+      "sparks": [],
+      "set": {
+        "RTX_GPUS": "1",
+        "COORDINATOR_GPU": "1",
+        "SPARK_COUNT": "0",
+        "ADDR": "0.0.0.0:8820",
+        "EXPERT_PORT": "19920",
+        "EXPERT_BACKEND": "local",
+        "SPECULATOR": "mtp"
+      }
+    },
+    {
+      "name": "qwen38-exl3-max",
+      "family": "qwen4",
+      "config": "examples/configs/qwen38-exl3-min.config",
+      "gpus": [
+        0,
+        1
+      ],
+      "sparks": [],
+      "set": {
+        "RTX_GPUS": "2",
+        "COORDINATOR_GPU": "0",
+        "SPARK_COUNT": "0",
+        "ADDR": "0.0.0.0:8821",
+        "EXPERT_PORT": "19921",
+        "EXPERT_BACKEND": "local",
+        "SPECULATOR": "mtp"
+      }
+    },
+    {
+      "name": "qwen38-nvfp4-min",
+      "family": "qwen4",
+      "config": "examples/configs/qwen38-nvfp4-min.config",
+      "gpus": [
+        1
+      ],
+      "sparks": [
+        "REPLACE-ME-spark-0",
+        "REPLACE-ME-spark-1"
+      ],
+      "set": {
+        "RTX_GPUS": "1",
+        "COORDINATOR_GPU": "1",
+        "SPARK_COUNT": "2",
+        "ADDR": "0.0.0.0:8822",
+        "EXPERT_PORT": "19922",
+        "EXPERT_BACKEND": "spark",
+        "SPARK_0_HOST": "REPLACE-ME-spark-0",
+        "SPARK_0_LANE_A": "192.0.2.1",
+        "SPARK_1_HOST": "REPLACE-ME-spark-1",
+        "SPARK_1_LANE_A": "192.0.2.2",
+        "SPECULATOR": "mtp"
+      }
+    },
+    {
+      "name": "qwen38-nvfp4-max",
+      "family": "qwen4",
+      "config": "examples/configs/qwen38-nvfp4-min.config",
+      "gpus": [
+        0,
+        1
+      ],
+      "sparks": [],
+      "set": {
+        "RTX_GPUS": "2",
+        "COORDINATOR_GPU": "0",
+        "SPARK_COUNT": "0",
+        "ADDR": "0.0.0.0:8823",
+        "EXPERT_PORT": "19923",
+        "EXPERT_BACKEND": "local",
+        "SPECULATOR": "mtp"
+      }
+    },
+    {
+      "name": "glm53-exl3-min",
+      "family": "glm5",
+      "config": "examples/configs/glm53-exl3-min.config",
+      "gpus": [
+        1
+      ],
+      "sparks": [
+        "REPLACE-ME-spark-0",
+        "REPLACE-ME-spark-1",
+        "REPLACE-ME-spark-2",
+        "REPLACE-ME-spark-3"
+      ],
+      "set": {
+        "RTX_GPUS": "1",
+        "COORDINATOR_GPU": "1",
+        "SPARK_COUNT": "4",
+        "ADDR": "0.0.0.0:8824",
+        "EXPERT_PORT": "19924",
+        "SPARK_0_HOST": "REPLACE-ME-spark-0",
+        "SPARK_0_LANE_A": "192.0.2.1",
+        "SPARK_1_HOST": "REPLACE-ME-spark-1",
+        "SPARK_1_LANE_A": "192.0.2.2",
+        "SPARK_2_HOST": "REPLACE-ME-spark-2",
+        "SPARK_2_LANE_A": "192.0.2.3",
+        "SPARK_3_HOST": "REPLACE-ME-spark-3",
+        "SPARK_3_LANE_A": "192.0.2.4",
+        "SPECULATOR": "dflash2"
+      }
+    },
+    {
+      "name": "glm53-exl3-max",
+      "family": "glm5",
+      "config": "examples/configs/glm53-exl3-max.config",
+      "gpus": [
+        0,
+        1
+      ],
+      "sparks": [
+        "REPLACE-ME-spark-0",
+        "REPLACE-ME-spark-1",
+        "REPLACE-ME-spark-2",
+        "REPLACE-ME-spark-3",
+        "REPLACE-ME-spark-4",
+        "REPLACE-ME-spark-5"
+      ],
+      "set": {
+        "RTX_GPUS": "2",
+        "COORDINATOR_GPU": "0",
+        "SPARK_COUNT": "6",
+        "ADDR": "0.0.0.0:8825",
+        "EXPERT_PORT": "19925",
+        "SPARK_0_HOST": "REPLACE-ME-spark-0",
+        "SPARK_0_LANE_A": "192.0.2.1",
+        "SPARK_1_HOST": "REPLACE-ME-spark-1",
+        "SPARK_1_LANE_A": "192.0.2.2",
+        "SPARK_2_HOST": "REPLACE-ME-spark-2",
+        "SPARK_2_LANE_A": "192.0.2.3",
+        "SPARK_3_HOST": "REPLACE-ME-spark-3",
+        "SPARK_3_LANE_A": "192.0.2.4",
+        "SPARK_4_HOST": "REPLACE-ME-spark-4",
+        "SPARK_4_LANE_A": "192.0.2.5",
+        "SPARK_5_HOST": "REPLACE-ME-spark-5",
+        "SPARK_5_LANE_A": "192.0.2.6",
+        "SPECULATOR": "dflash2"
+      }
+    },
+    {
+      "name": "glm53-nvfp4-min",
+      "family": "glm5",
+      "config": "examples/configs/glm53-nvfp4-min.config",
+      "gpus": [
+        1
+      ],
+      "sparks": [
+        "REPLACE-ME-spark-0",
+        "REPLACE-ME-spark-1",
+        "REPLACE-ME-spark-2",
+        "REPLACE-ME-spark-3"
+      ],
+      "set": {
+        "RTX_GPUS": "1",
+        "COORDINATOR_GPU": "1",
+        "SPARK_COUNT": "4",
+        "ADDR": "0.0.0.0:8826",
+        "EXPERT_PORT": "19926",
+        "SPARK_0_HOST": "REPLACE-ME-spark-0",
+        "SPARK_0_LANE_A": "192.0.2.1",
+        "SPARK_1_HOST": "REPLACE-ME-spark-1",
+        "SPARK_1_LANE_A": "192.0.2.2",
+        "SPARK_2_HOST": "REPLACE-ME-spark-2",
+        "SPARK_2_LANE_A": "192.0.2.3",
+        "SPARK_3_HOST": "REPLACE-ME-spark-3",
+        "SPARK_3_LANE_A": "192.0.2.4",
+        "SPECULATOR": "dflash2"
+      }
+    },
+    {
+      "name": "glm53-nvfp4-max",
+      "family": "glm5",
+      "config": "examples/configs/glm53-nvfp4-max.config",
+      "gpus": [
+        0,
+        1
+      ],
+      "sparks": [
+        "REPLACE-ME-spark-0",
+        "REPLACE-ME-spark-1",
+        "REPLACE-ME-spark-2",
+        "REPLACE-ME-spark-3",
+        "REPLACE-ME-spark-4",
+        "REPLACE-ME-spark-5"
+      ],
+      "set": {
+        "RTX_GPUS": "2",
+        "COORDINATOR_GPU": "0",
+        "SPARK_COUNT": "6",
+        "ADDR": "0.0.0.0:8827",
+        "EXPERT_PORT": "19927",
+        "SPARK_0_HOST": "REPLACE-ME-spark-0",
+        "SPARK_0_LANE_A": "192.0.2.1",
+        "SPARK_1_HOST": "REPLACE-ME-spark-1",
+        "SPARK_1_LANE_A": "192.0.2.2",
+        "SPARK_2_HOST": "REPLACE-ME-spark-2",
+        "SPARK_2_LANE_A": "192.0.2.3",
+        "SPARK_3_HOST": "REPLACE-ME-spark-3",
+        "SPARK_3_LANE_A": "192.0.2.4",
+        "SPARK_4_HOST": "REPLACE-ME-spark-4",
+        "SPARK_4_LANE_A": "192.0.2.5",
+        "SPARK_5_HOST": "REPLACE-ME-spark-5",
+        "SPARK_5_LANE_A": "192.0.2.6",
+        "SPECULATOR": "dflash2"
+      }
+    },
+    {
+      "name": "v41-flash-reference-tp4",
+      "family": "deepseek_v41",
+      "config": "examples/configs/deepseek-v41-mxfp4-min.config",
+      "gpus": [
+        1
+      ],
+      "sparks": [
+        "REPLACE-ME-spark-0",
+        "REPLACE-ME-spark-1",
+        "REPLACE-ME-spark-2",
+        "REPLACE-ME-spark-3"
+      ],
+      "set": {
+        "RTX_GPUS": "1",
+        "COORDINATOR_GPU": "1",
+        "SPARK_COUNT": "4",
+        "ADDR": "0.0.0.0:8828",
+        "EXPERT_PORT": "19928",
+        "SPARK_0_HOST": "REPLACE-ME-spark-0",
+        "SPARK_0_LANE_A": "192.0.2.1",
+        "SPARK_0_LANE_B": "198.51.100.1",
+        "SPARK_1_HOST": "REPLACE-ME-spark-1",
+        "SPARK_1_LANE_A": "192.0.2.2",
+        "SPARK_1_LANE_B": "198.51.100.2",
+        "SPARK_2_HOST": "REPLACE-ME-spark-2",
+        "SPARK_2_LANE_A": "192.0.2.3",
+        "SPARK_2_LANE_B": "198.51.100.3",
+        "SPECULATOR": "dspark",
+        "SPARK_3_HOST": "REPLACE-ME-spark-3",
+        "SPARK_3_LANE_A": "192.0.2.4",
+        "SPARK_3_LANE_B": "198.51.100.4"
+      }
+    },
+    {
+      "name": "v41-flash-reference-tp6",
+      "family": "deepseek_v41",
+      "config": "examples/configs/deepseek-v41-mxfp4-max.config",
+      "gpus": [
+        0,
+        1
+      ],
+      "sparks": [
+        "REPLACE-ME-spark-0",
+        "REPLACE-ME-spark-1",
+        "REPLACE-ME-spark-2",
+        "REPLACE-ME-spark-3",
+        "REPLACE-ME-spark-4",
+        "REPLACE-ME-spark-5"
+      ],
+      "set": {
+        "RTX_GPUS": "2",
+        "COORDINATOR_GPU": "0",
+        "SPARK_COUNT": "6",
+        "ADDR": "0.0.0.0:8829",
+        "EXPERT_PORT": "19929",
+        "SPARK_0_HOST": "REPLACE-ME-spark-0",
+        "SPARK_0_LANE_A": "192.0.2.1",
+        "SPARK_0_LANE_B": "198.51.100.1",
+        "SPARK_1_HOST": "REPLACE-ME-spark-1",
+        "SPARK_1_LANE_A": "192.0.2.2",
+        "SPARK_1_LANE_B": "198.51.100.2",
+        "SPARK_2_HOST": "REPLACE-ME-spark-2",
+        "SPARK_2_LANE_A": "192.0.2.3",
+        "SPARK_2_LANE_B": "198.51.100.3",
+        "SPARK_3_HOST": "REPLACE-ME-spark-3",
+        "SPARK_3_LANE_A": "192.0.2.4",
+        "SPARK_3_LANE_B": "198.51.100.4",
+        "SPECULATOR": "dspark",
+        "SPARK_4_HOST": "REPLACE-ME-spark-4",
+        "SPARK_4_LANE_A": "192.0.2.5",
+        "SPARK_4_LANE_B": "198.51.100.5",
+        "SPARK_5_HOST": "REPLACE-ME-spark-5",
+        "SPARK_5_LANE_A": "192.0.2.6",
+        "SPARK_5_LANE_B": "198.51.100.6"
+      }
+    },
+    {
+      "name": "glm53f-exl3-reference-all-spark",
+      "family": "glm5_flash",
+      "config": "examples/configs/glm53-flash-exl3-min.config",
+      "gpus": [
+        0,
+        1
+      ],
+      "sparks": [
+        "REPLACE-ME-spark-0",
+        "REPLACE-ME-spark-1"
+      ],
+      "set": {
+        "RTX_GPUS": "2",
+        "COORDINATOR_GPU": "0",
+        "SPARK_COUNT": "2",
+        "ADDR": "0.0.0.0:8830",
+        "EXPERT_PORT": "19930",
+        "SPARK_0_HOST": "REPLACE-ME-spark-0",
+        "SPARK_0_LANE_A": "192.0.2.1",
+        "SPARK_1_HOST": "REPLACE-ME-spark-1",
+        "SPARK_1_LANE_A": "192.0.2.2",
+        "SPECULATOR": "dflash2",
+        "RTX_EXPERT_LAYERS": "0",
+        "EXPERT_BACKEND": "spark"
+      }
+    },
+    {
+      "name": "glm53f-exl3-reference-half",
+      "family": "glm5_flash",
+      "config": "examples/configs/glm53-flash-exl3-min.config",
+      "gpus": [
+        0,
+        1
+      ],
+      "sparks": [
+        "REPLACE-ME-spark-0",
+        "REPLACE-ME-spark-1"
+      ],
+      "set": {
+        "RTX_GPUS": "2",
+        "COORDINATOR_GPU": "0",
+        "SPARK_COUNT": "2",
+        "ADDR": "0.0.0.0:8831",
+        "EXPERT_PORT": "19931",
+        "SPARK_0_HOST": "REPLACE-ME-spark-0",
+        "SPARK_0_LANE_A": "192.0.2.1",
+        "SPARK_1_HOST": "REPLACE-ME-spark-1",
+        "SPARK_1_LANE_A": "192.0.2.2",
+        "SPECULATOR": "dflash2",
+        "RTX_EXPERT_LAYERS": "22",
+        "EXPERT_BACKEND": "spark",
+        "POOL_TOKENS": "2097152",
+        "CONCURRENCY": "16"
+      }
+    },
+    {
+      "name": "v41-flash-5090",
+      "family": "deepseek_v41",
+      "config": "examples/configs/deepseek-v41-mxfp4-min.config",
+      "gpus": [
+        0
+      ],
+      "sparks": [
+        "REPLACE-ME-spark-0",
+        "REPLACE-ME-spark-1",
+        "REPLACE-ME-spark-2"
+      ],
+      "set": {
+        "RTX_GPUS": "1",
+        "COORDINATOR_GPU": "0",
+        "SPARK_COUNT": "3",
+        "ADDR": "0.0.0.0:8832",
+        "EXPERT_PORT": "19932",
+        "SPARK_0_HOST": "REPLACE-ME-spark-0",
+        "SPARK_0_LANE_A": "192.0.2.1",
+        "SPARK_0_LANE_B": "198.51.100.1",
+        "SPARK_1_HOST": "REPLACE-ME-spark-1",
+        "SPARK_1_LANE_A": "192.0.2.2",
+        "SPARK_1_LANE_B": "198.51.100.2",
+        "SPARK_2_HOST": "REPLACE-ME-spark-2",
+        "SPARK_2_LANE_A": "192.0.2.3",
+        "SPARK_2_LANE_B": "198.51.100.3",
+        "SPECULATOR": "dspark",
+        "COORDINATOR_GPU_BUDGET_GIB": "31.8",
+        "EXPERT_BACKEND": "spark",
+        "BENCH_HARDWARE_CLASS": "5090"
+      },
+      "precheck": {
+        "argv": [
+          "sh",
+          "-c",
+          "nvidia-smi --query-gpu=name --format=csv,noheader --id=0 | grep -q 'RTX 5090'"
+        ],
+        "timeout_s": 30,
+        "required": true
+      }
+    },
+    {
+      "name": "v41-flash-nvfp4-5090",
+      "family": "deepseek_v41",
+      "config": "examples/configs/deepseek-v41-nvfp4-min.config",
+      "gpus": [
+        0
+      ],
+      "sparks": [
+        "REPLACE-ME-spark-0",
+        "REPLACE-ME-spark-1",
+        "REPLACE-ME-spark-2",
+        "REPLACE-ME-spark-3"
+      ],
+      "set": {
+        "RTX_GPUS": "1",
+        "COORDINATOR_GPU": "0",
+        "SPARK_COUNT": "4",
+        "ADDR": "0.0.0.0:8833",
+        "EXPERT_PORT": "19933",
+        "SPARK_0_HOST": "REPLACE-ME-spark-0",
+        "SPARK_0_LANE_A": "192.0.2.1",
+        "SPARK_0_LANE_B": "198.51.100.1",
+        "SPARK_1_HOST": "REPLACE-ME-spark-1",
+        "SPARK_1_LANE_A": "192.0.2.2",
+        "SPARK_1_LANE_B": "198.51.100.2",
+        "SPARK_2_HOST": "REPLACE-ME-spark-2",
+        "SPARK_2_LANE_A": "192.0.2.3",
+        "SPARK_2_LANE_B": "198.51.100.3",
+        "SPARK_3_HOST": "REPLACE-ME-spark-3",
+        "SPARK_3_LANE_A": "192.0.2.4",
+        "SPARK_3_LANE_B": "198.51.100.4",
+        "SPECULATOR": "dspark",
+        "COORDINATOR_GPU_BUDGET_GIB": "31.8",
+        "EXPERT_BACKEND": "spark",
+        "BENCH_HARDWARE_CLASS": "5090"
+      },
+      "precheck": {
+        "argv": [
+          "sh",
+          "-c",
+          "nvidia-smi --query-gpu=name --format=csv,noheader --id=0 | grep -q 'RTX 5090'"
+        ],
+        "timeout_s": 30,
+        "required": true
+      }
+    },
+    {
+      "name": "v4-flash-5090",
+      "family": "deepseek_v4",
+      "config": "examples/configs/deepseek-v4-flash-mxfp4-min.config",
+      "gpus": [
+        0
+      ],
+      "sparks": [
+        "REPLACE-ME-spark-0",
+        "REPLACE-ME-spark-1"
+      ],
+      "set": {
+        "RTX_GPUS": "1",
+        "COORDINATOR_GPU": "0",
+        "SPARK_COUNT": "2",
+        "ADDR": "0.0.0.0:8834",
+        "EXPERT_PORT": "19934",
+        "SPARK_0_HOST": "REPLACE-ME-spark-0",
+        "SPARK_0_LANE_A": "192.0.2.1",
+        "SPARK_1_HOST": "REPLACE-ME-spark-1",
+        "SPARK_1_LANE_A": "192.0.2.2",
+        "SPECULATOR": "dspark",
+        "COORDINATOR_GPU_BUDGET_GIB": "31.8",
+        "EXPERT_BACKEND": "spark",
+        "BENCH_HARDWARE_CLASS": "5090"
+      },
+      "precheck": {
+        "argv": [
+          "sh",
+          "-c",
+          "nvidia-smi --query-gpu=name --format=csv,noheader --id=0 | grep -q 'RTX 5090'"
+        ],
+        "timeout_s": 30,
+        "required": true
+      }
+    },
+    {
+      "name": "glm53f-fp8-5090",
+      "family": "glm5_flash",
+      "config": "examples/configs/glm53-flash-fp8-min.config",
+      "gpus": [
+        0
+      ],
+      "sparks": [
+        "REPLACE-ME-spark-0",
+        "REPLACE-ME-spark-1",
+        "REPLACE-ME-spark-2",
+        "REPLACE-ME-spark-3"
+      ],
+      "set": {
+        "RTX_GPUS": "1",
+        "COORDINATOR_GPU": "0",
+        "SPARK_COUNT": "4",
+        "ADDR": "0.0.0.0:8835",
+        "EXPERT_PORT": "19935",
+        "SPARK_0_HOST": "REPLACE-ME-spark-0",
+        "SPARK_0_LANE_A": "192.0.2.1",
+        "SPARK_1_HOST": "REPLACE-ME-spark-1",
+        "SPARK_1_LANE_A": "192.0.2.2",
+        "SPARK_2_HOST": "REPLACE-ME-spark-2",
+        "SPARK_2_LANE_A": "192.0.2.3",
+        "SPARK_3_HOST": "REPLACE-ME-spark-3",
+        "SPARK_3_LANE_A": "192.0.2.4",
+        "SPECULATOR": "dflash2",
+        "COORDINATOR_GPU_BUDGET_GIB": "31.8",
+        "EXPERT_BACKEND": "spark",
+        "BENCH_HARDWARE_CLASS": "5090"
+      },
+      "precheck": {
+        "argv": [
+          "sh",
+          "-c",
+          "nvidia-smi --query-gpu=name --format=csv,noheader --id=0 | grep -q 'RTX 5090'"
+        ],
+        "timeout_s": 30,
+        "required": true
+      }
+    },
+    {
+      "name": "glm53f-exl3-5090",
+      "family": "glm5_flash",
+      "config": "examples/configs/glm53-flash-exl3-min.config",
+      "gpus": [
+        0
+      ],
+      "sparks": [
+        "REPLACE-ME-spark-0",
+        "REPLACE-ME-spark-1"
+      ],
+      "set": {
+        "RTX_GPUS": "1",
+        "COORDINATOR_GPU": "0",
+        "SPARK_COUNT": "2",
+        "ADDR": "0.0.0.0:8836",
+        "EXPERT_PORT": "19936",
+        "SPARK_0_HOST": "REPLACE-ME-spark-0",
+        "SPARK_0_LANE_A": "192.0.2.1",
+        "SPARK_1_HOST": "REPLACE-ME-spark-1",
+        "SPARK_1_LANE_A": "192.0.2.2",
+        "SPECULATOR": "dflash2",
+        "COORDINATOR_GPU_BUDGET_GIB": "31.8",
+        "EXPERT_BACKEND": "spark",
+        "BENCH_HARDWARE_CLASS": "5090"
+      },
+      "precheck": {
+        "argv": [
+          "sh",
+          "-c",
+          "nvidia-smi --query-gpu=name --format=csv,noheader --id=0 | grep -q 'RTX 5090'"
+        ],
+        "timeout_s": 30,
+        "required": true
+      }
+    },
+    {
+      "name": "glm53f-nvfp4-5090",
+      "family": "glm5_flash",
+      "config": "examples/configs/glm53-flash-nvfp4-min.config",
+      "gpus": [
+        0
+      ],
+      "sparks": [
+        "REPLACE-ME-spark-0",
+        "REPLACE-ME-spark-1"
+      ],
+      "set": {
+        "RTX_GPUS": "1",
+        "COORDINATOR_GPU": "0",
+        "SPARK_COUNT": "2",
+        "ADDR": "0.0.0.0:8837",
+        "EXPERT_PORT": "19937",
+        "SPARK_0_HOST": "REPLACE-ME-spark-0",
+        "SPARK_0_LANE_A": "192.0.2.1",
+        "SPARK_1_HOST": "REPLACE-ME-spark-1",
+        "SPARK_1_LANE_A": "192.0.2.2",
+        "SPECULATOR": "dflash2",
+        "COORDINATOR_GPU_BUDGET_GIB": "31.8",
+        "EXPERT_BACKEND": "spark",
+        "BENCH_HARDWARE_CLASS": "5090"
+      },
+      "precheck": {
+        "argv": [
+          "sh",
+          "-c",
+          "nvidia-smi --query-gpu=name --format=csv,noheader --id=0 | grep -q 'RTX 5090'"
+        ],
+        "timeout_s": 30,
+        "required": true
+      }
+    },
+    {
+      "name": "glm53f-tr3-5090",
+      "family": "glm5_flash",
+      "config": "examples/configs/glm53-flash-tr3-min.config",
+      "gpus": [
+        0
+      ],
+      "sparks": [
+        "REPLACE-ME-spark-0",
+        "REPLACE-ME-spark-1"
+      ],
+      "set": {
+        "RTX_GPUS": "1",
+        "COORDINATOR_GPU": "0",
+        "SPARK_COUNT": "2",
+        "ADDR": "0.0.0.0:8838",
+        "EXPERT_PORT": "19938",
+        "SPARK_0_HOST": "REPLACE-ME-spark-0",
+        "SPARK_0_LANE_A": "192.0.2.1",
+        "SPARK_1_HOST": "REPLACE-ME-spark-1",
+        "SPARK_1_LANE_A": "192.0.2.2",
+        "SPECULATOR": "dflash2",
+        "COORDINATOR_GPU_BUDGET_GIB": "31.8",
+        "EXPERT_BACKEND": "spark",
+        "BENCH_HARDWARE_CLASS": "5090"
+      },
+      "precheck": {
+        "argv": [
+          "sh",
+          "-c",
+          "nvidia-smi --query-gpu=name --format=csv,noheader --id=0 | grep -q 'RTX 5090'"
+        ],
+        "timeout_s": 30,
+        "required": true
+      }
+    },
+    {
+      "name": "mimo26-flash-5090",
+      "family": "mimo_v2",
+      "config": "examples/configs/mimo-v26-flash-mxfp4-min.config",
+      "gpus": [
+        0
+      ],
+      "sparks": [
+        "REPLACE-ME-spark-0",
+        "REPLACE-ME-spark-1"
+      ],
+      "set": {
+        "RTX_GPUS": "1",
+        "COORDINATOR_GPU": "0",
+        "SPARK_COUNT": "2",
+        "ADDR": "0.0.0.0:8839",
+        "EXPERT_PORT": "19939",
+        "SPARK_0_HOST": "REPLACE-ME-spark-0",
+        "SPARK_0_LANE_A": "192.0.2.1",
+        "SPARK_1_HOST": "REPLACE-ME-spark-1",
+        "SPARK_1_LANE_A": "192.0.2.2",
+        "SPECULATOR": "dflash2",
+        "COORDINATOR_GPU_BUDGET_GIB": "31.8",
+        "EXPERT_BACKEND": "spark",
+        "BENCH_HARDWARE_CLASS": "5090"
+      },
+      "precheck": {
+        "argv": [
+          "sh",
+          "-c",
+          "nvidia-smi --query-gpu=name --format=csv,noheader --id=0 | grep -q 'RTX 5090'"
+        ],
+        "timeout_s": 30,
+        "required": true
+      }
+    },
+    {
+      "name": "qwen38-exl3-5090",
+      "family": "qwen4",
+      "config": "examples/configs/qwen38-exl3-min.config",
+      "gpus": [
+        0
+      ],
+      "sparks": [
+        "REPLACE-ME-spark-0"
+      ],
+      "set": {
+        "RTX_GPUS": "1",
+        "COORDINATOR_GPU": "0",
+        "SPARK_COUNT": "1",
+        "ADDR": "0.0.0.0:8840",
+        "EXPERT_PORT": "19940",
+        "EXPERT_BACKEND": "spark",
+        "SPECULATOR": "mtp",
+        "COORDINATOR_GPU_BUDGET_GIB": "31.8",
+        "SPARK_0_HOST": "REPLACE-ME-spark-0",
+        "SPARK_0_LANE_A": "192.0.2.1",
+        "BENCH_HARDWARE_CLASS": "5090"
+      },
+      "precheck": {
+        "argv": [
+          "sh",
+          "-c",
+          "nvidia-smi --query-gpu=name --format=csv,noheader --id=0 | grep -q 'RTX 5090'"
+        ],
+        "timeout_s": 30,
+        "required": true
+      }
+    },
+    {
+      "name": "qwen38-nvfp4-5090",
+      "family": "qwen4",
+      "config": "examples/configs/qwen38-nvfp4-min.config",
+      "gpus": [
+        0
+      ],
+      "sparks": [
+        "REPLACE-ME-spark-0",
+        "REPLACE-ME-spark-1"
+      ],
+      "set": {
+        "RTX_GPUS": "1",
+        "COORDINATOR_GPU": "0",
+        "SPARK_COUNT": "2",
+        "ADDR": "0.0.0.0:8841",
+        "EXPERT_PORT": "19941",
+        "EXPERT_BACKEND": "spark",
+        "SPARK_0_HOST": "REPLACE-ME-spark-0",
+        "SPARK_0_LANE_A": "192.0.2.1",
+        "SPARK_1_HOST": "REPLACE-ME-spark-1",
+        "SPARK_1_LANE_A": "192.0.2.2",
+        "SPECULATOR": "mtp",
+        "COORDINATOR_GPU_BUDGET_GIB": "31.8",
+        "BENCH_HARDWARE_CLASS": "5090"
+      },
+      "precheck": {
+        "argv": [
+          "sh",
+          "-c",
+          "nvidia-smi --query-gpu=name --format=csv,noheader --id=0 | grep -q 'RTX 5090'"
+        ],
+        "timeout_s": 30,
+        "required": true
+      }
+    }
+  ]
+}

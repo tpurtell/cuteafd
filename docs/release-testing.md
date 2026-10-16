@@ -18,12 +18,11 @@ matched pair, or a median more than 5% slower.
 
 ## The 5090 column
 
-Unless a cell is marked real, it is a memory-only simulation:
-**simulated 5090: RTX PRO 6000 (188 SMs) capped at 31.8 GiB**. SM count
-(188 vs 170), L2, clocks and power are not emulated, so speed is indicative and
-likely optimistic. Real 5090 cards replace these cells when they arrive;
-simulations stay in history. Planner-only no-fit cells link the planner's
-reason and contain no performance.
+Only real RTX 5090 measurements fill this column. Until real exports arrive,
+cells stay pending; a hardware-class marker alone is not proof of hardware.
+Older memory-capped PRO 6000 simulations remain archived in benchmark history,
+not published as current 5090 cards. Planner-only no-fit reports contain no
+performance.
 
 ## Context
 

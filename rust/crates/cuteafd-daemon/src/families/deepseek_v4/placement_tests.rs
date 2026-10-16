@@ -50,7 +50,11 @@ struct Shared {
 
 impl Shared {
     fn open(snapshot: &Path) -> anyhow::Result<Self> {
-        Ok(Self { input: PlanInput::open(snapshot)?, draft_off: OnceLock::new() })
+        let input = PlanInput::open(snapshot)?;
+        anyhow::ensure!(input.checkpoint().missing_shards.is_empty(),
+            "incomplete V4 checkpoint {}: unreadable shards {:?}", snapshot.display(), input.checkpoint().missing_shards);
+        input.expert_catalog()?;
+        Ok(Self { input, draft_off: OnceLock::new() })
     }
 
     /// serve-dsv4's own catalog for this launch shape: the planner's, when the
@@ -406,8 +410,54 @@ fn snapshot(model: &str) -> Option<PathBuf> {
     let hub = std::env::var_os("HF_HOME").map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("/mnt/sparknest/hf-home")).join("hub")
         .join(format!("models--{}", model.replace('/', "--"))).join("snapshots");
-    std::fs::read_dir(hub).ok()?.filter_map(|e| e.ok()).map(|e| e.path())
-        .find(|p| p.join("model.safetensors.index.json").is_file())
+    selected_snapshot(&hub)
+}
+
+fn selected_snapshot(hub: &Path) -> Option<PathBuf> {
+    // The published revision wins; directory iteration order is not a pin.
+    if let Ok(revision) = std::fs::read_to_string(hub.parent()?.join("refs/main")) {
+        let selected = hub.join(revision.trim());
+        return selected.join("model.safetensors.index.json").is_file().then_some(selected);
+    }
+    let mut candidates: Vec<_> = std::fs::read_dir(hub).ok()?.filter_map(|e| e.ok())
+        .map(|e| e.path()).filter(|p| p.join("model.safetensors.index.json").is_file()).collect();
+    candidates.sort();
+    candidates.into_iter().next()
+}
+
+#[test]
+fn live_snapshot_selection_is_pinned_and_deterministic() {
+    let dir = tempfile::tempdir().unwrap();
+    let hub = dir.path().join("snapshots");
+    for revision in ["z", "a"] {
+        std::fs::create_dir_all(hub.join(revision)).unwrap();
+        std::fs::write(hub.join(revision).join("model.safetensors.index.json"), "{}").unwrap();
+    }
+    assert_eq!(selected_snapshot(&hub), Some(hub.join("a")));
+    std::fs::create_dir_all(dir.path().join("refs")).unwrap();
+    std::fs::write(dir.path().join("refs/main"), "z\n").unwrap();
+    assert_eq!(selected_snapshot(&hub), Some(hub.join("z")));
+    std::fs::write(dir.path().join("refs/main"), "missing").unwrap();
+    assert_eq!(selected_snapshot(&hub), None);
+}
+
+#[test]
+fn equality_input_refuses_missing_or_truncated_shards() {
+    for truncated in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        cuteafd_loader::plan::testing::write_v4_snapshot(dir.path());
+        let shard = dir.path().join("model-00001-of-00001.safetensors");
+        if truncated {
+            std::fs::OpenOptions::new().write(true).open(&shard).unwrap().set_len(9).unwrap();
+        } else {
+            std::fs::remove_file(&shard).unwrap();
+        }
+        let error = match Shared::open(dir.path()) {
+            Ok(_) => panic!("partial checkpoint was accepted"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("incomplete V4 checkpoint"), "{error:#}");
+    }
 }
 
 fn inputs_dir() -> Option<PathBuf> {
@@ -423,6 +473,24 @@ fn inputs_dir() -> Option<PathBuf> {
 /// or manifests are not on this host.
 #[test]
 fn planner_equals_runtime_deepseek_v4() {
+    const CHILD: &str = "CUTEAFD_V4_EQUALITY_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        // Bound real-checkpoint/FUSE work without dropping any of the 80 cases.
+        let started = std::time::Instant::now();
+        let output = std::process::Command::new("timeout").args(["--kill-after=5s", "300s"])
+            .arg(std::env::current_exe().unwrap())
+            .args(["--exact", "families::deepseek_v4::placement_tests::planner_equals_runtime_deepseek_v4",
+                "--nocapture", "--test-threads=1"])
+            .env(CHILD, "1").output().unwrap();
+        assert!(output.status.success(),
+            "V4 equality gate failed after {:?}: status={} HOME={:?} HF_HOME={:?} CUTEAFD_V4_PLACEMENT_INPUTS={:?}\n{}\n{}",
+            started.elapsed(), output.status, std::env::var_os("HOME"), std::env::var_os("HF_HOME"),
+            std::env::var_os("CUTEAFD_V4_PLACEMENT_INPUTS"), String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr));
+        eprintln!("V4 equality sweep: {:?}\n{}{}", started.elapsed(),
+            String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+        return;
+    }
     let (Some(flash), Some(pro), Some(inputs)) = (snapshot("deepseek-ai/DeepSeek-V4-Flash-0731"),
         snapshot("wrldsuksgo2mars/DeepSeek-V4-Pro-0813-EXL3-K2-calibrated-v1"), inputs_dir()) else {
         eprintln!("planner_equals_runtime_deepseek_v4: V4 snapshots or manifests absent; skipped");
@@ -431,8 +499,13 @@ fn planner_equals_runtime_deepseek_v4() {
     let budget = (95.5 * (1u64 << 30) as f64) as u64;
     // One open per checkpoint for all 40 of its cases: the plan and the runtime
     // admission both read its shard headers and routed-expert catalog.
+    let sweep_started = std::time::Instant::now();
+    eprintln!("live V4 equality: opening Flash checkpoint {}", flash.display());
     let flash = Shared::open(&flash).unwrap();
+    eprintln!("live V4 equality: opening Pro checkpoint {} after {:?}", pro.display(), sweep_started.elapsed());
     let pro = Shared::open(&pro).unwrap();
+    eprintln!("live V4 equality: checkpoints ready after {:?}", sweep_started.elapsed());
+    let mut cases = 0;
     for context in [131_072u64, 1_048_576] {
         for (model, shared, rtx, sparks) in [("flash", &flash, 1, 2), ("flash", &flash, 2, 4),
             ("pro", &pro, 1, 4), ("pro", &pro, 2, 6)] {
@@ -444,7 +517,10 @@ fn planner_equals_runtime_deepseek_v4() {
                     let case = Case { snapshot, manifest: &manifest, rtx, sparks, context, budget,
                         onboard, dspark: true, exchange_f32: asymmetric,
                         peer_budget: asymmetric.then_some(budget - (2 << 30)), attention: None };
+                    eprintln!("live V4 equality: starting case {} after {:?}: {model} rtx{rtx} {context} {onboard:?} asym={asymmetric}",
+                        cases + 1, sweep_started.elapsed());
                     let placement = assert_equal(shared, &case, &format!("{model} rtx{rtx} {context} {onboard:?} asym={asymmetric}"));
+                    cases += 1;
                     if rtx == 2 {
                         assert!(placement.expert_ranges.iter().all(|r| r.layers == 0));
                         assert_eq!(placement.tp2.unwrap().layers, placement.onboard_layers);
@@ -456,6 +532,8 @@ fn planner_equals_runtime_deepseek_v4() {
             }
         }
     }
+    assert_eq!(cases, 80);
+    eprintln!("live V4 equality: {cases} cases in {:?}", sweep_started.elapsed());
 }
 
 #[test]

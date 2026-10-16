@@ -3,9 +3,11 @@ use super::*;
 use crate::placement::{self, families::glm5_flash as glmf, Baseline, Onboard};
 use crate::families::glm5_flash::{GlmNextConfig, resident};
 
-pub(super) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyModel,
-    input: &super::super::PlanInput, options: &LayoutOptions, manifest: Option<&serde_json::Value>,
-    rows: u64, sequences: u64, context: u64, weight_budget: u64) -> MemoryLayout {
+pub(crate) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyModel,
+    input: &super::super::PlanInput, options: &LayoutOptions) -> MemoryLayout {
+    let shape = Shape::resolve(report, model, options, ShapePolicy::manifest_bounded());
+    let (manifest, rows, sequences, context, weight_budget) = (shape.manifest.as_ref(), shape.prefill_rows,
+        shape.concurrency, shape.context_tokens, options.weight_budget_bytes);
     let checkpoint = input.checkpoint();
     let mut notes = vec![format!("resolved context {context} tokens")];
     let ranks = if options.head_split && options.rtx_bytes.len() >= 2 { 2 } else { 1 };

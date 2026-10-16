@@ -1,4 +1,5 @@
 #include "cuteafd_native.h"
+#include "graph_census_path.h"
 
 #include <algorithm>
 #include <atomic>
@@ -703,7 +704,12 @@ void record_graph_census(cudaGraph_t graph, cudaGraphExec_t exec,
   const int64_t delta = bytes_valid ? static_cast<int64_t>(before_free) - static_cast<int64_t>(after_free) : 0;
   // Docker multiplexes stdout/stderr in 16 KiB chunks. Long node records
   // need a dedicated file so Rust tracing cannot split their JSON framing.
-  static FILE* captures = std::fopen("/tmp/cuteafd-graph-census-captures.jsonl", "a");
+  // PROFILE=census runs pass CUTEAFD_PROFILE_DIR; the records land there per host.
+  static FILE* captures = [] {
+    const char* host = std::getenv("CUTEAFD_PROFILE_HOST");
+    if (host == nullptr || host[0] == '\0') { host = std::getenv("HOSTNAME"); }
+    return std::fopen(cuteafd_graph_census_captures_path(std::getenv("CUTEAFD_PROFILE_DIR"), host).c_str(), "a");
+  }();
   const uint64_t id = serial.fetch_add(1) + 1;
   if (captures == nullptr) {
     std::fprintf(stderr, "CUTEAFD_GRAPH_CENSUS {\"event\":\"capture_write_failed\",\"id\":%llu}\n",

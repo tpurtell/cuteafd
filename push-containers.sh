@@ -6,10 +6,12 @@ source "$repo_root/scripts/lib/release-common.sh"
 
 usage() {
   cat <<'EOF'
-Usage: ./push-containers.sh [--config FILE] TAG
+Usage: ./push-containers.sh [--config FILE] [--no-latest | --latest] TAG
 
 Tags and pushes the current coordinator and Spark inference images to GHCR.
-The supplied release tag and latest are published for both images. The
+The supplied release tag is published for both images. Stable tags also update
+latest; release-candidate tags (rc, case-insensitive) never update latest.
+--latest is refused for release candidates. --no-latest disables latest for any tag. The
 coordinator image is local; the Spark image is published from SPARK_0_HOST.
 The Spark image must advertise the V41 expert roles it carries (./build.sh bakes
 the universal tp2;tp3;tp6 set by default); a role-less legacy build is rejected.
@@ -38,8 +40,17 @@ EOF
 
 config="$repo_root/cuteafd.config"
 tag=
+latest=auto
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    --no-latest|--latest)
+      requested=on
+      [[ "$1" != --no-latest ]] || requested=off
+      [[ "$latest" == auto || "$latest" == "$requested" ]] ||
+        release_die "--latest and --no-latest conflict"
+      latest="$requested"
+      shift
+      ;;
     --config)
       [[ $# -ge 2 && -n "$2" ]] || release_die "--config requires a configuration file"
       config="$2"
@@ -70,7 +81,13 @@ done
 [[ "$tag" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$ ]] ||
   release_die "invalid Docker tag: $tag"
 [[ "$tag" != latest ]] ||
-  release_die "provide a version tag; latest is published automatically"
+  release_die "provide a version tag, not latest"
+if [[ "${tag,,}" == *rc* ]]; then
+  [[ "$latest" != on ]] || release_die "release-candidate tags cannot update latest"
+  latest=off
+elif [[ "$latest" == auto ]]; then
+  latest=on
+fi
 
 release_load_config "$config"
 release_need docker
@@ -178,16 +195,19 @@ REMOTE
 docker push "$coordinator_repository:$tag"
 release_ssh "$spark_host" docker push "$spark_repository:$tag"
 
-docker tag "$COORDINATOR_DOCKER_INFERENCE" "$coordinator_repository:latest"
-release_ssh "$spark_host" bash -s -- \
-  "$SPARK_EXPERT_DOCKER_INFERENCE" "$spark_repository:latest" <<'REMOTE'
+if [[ "$latest" == on ]]; then
+  docker tag "$COORDINATOR_DOCKER_INFERENCE" "$coordinator_repository:latest"
+  release_ssh "$spark_host" bash -s -- \
+    "$SPARK_EXPERT_DOCKER_INFERENCE" "$spark_repository:latest" <<'REMOTE'
 set -euo pipefail
 docker tag "$1" "$2"
 REMOTE
 
-docker push "$coordinator_repository:latest"
-release_ssh "$spark_host" docker push "$spark_repository:latest"
-
-echo "Published both $tag and latest:"
+  docker push "$coordinator_repository:latest"
+  release_ssh "$spark_host" docker push "$spark_repository:latest"
+  echo "Published both $tag and latest:"
+else
+  echo "Published $tag only (latest unchanged):"
+fi
 echo "  docker pull $coordinator_repository:$tag"
 echo "  docker pull $spark_repository:$tag"

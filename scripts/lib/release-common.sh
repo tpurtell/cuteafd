@@ -591,7 +591,8 @@ release_profile_docker_args() {
   IFS=, read -ra switches <<<"$profile"
   for switch in "${switches[@]}"; do
     case "$switch" in
-      census) RELEASE_PROFILE_ARGS+=(-e CUTEAFD_GRAPH_CENSUS=1 -e 'RUST_LOG=info,cuteafd::graph_capture=debug') ;;
+      census) RELEASE_PROFILE_ARGS+=(-e CUTEAFD_GRAPH_CENSUS=1 -e 'RUST_LOG=info,cuteafd::graph_capture=debug'
+        -e CUTEAFD_STARTUP_MEMORY_PROBE=1) ;;
       transport-timing) RELEASE_PROFILE_ARGS+=(-e CUTEAFD_PROTOCOL_V2_TCP_TIMING=1) ;;
       expert-timing) RELEASE_PROFILE_ARGS+=(-e CUTEAFD_EXPERT_TIMING=1) ;;
       draft-timing) RELEASE_PROFILE_ARGS+=(-e CUTEAFD_DRAFT_TIMING=1) ;;
@@ -765,7 +766,7 @@ release_known_key() {
     GLM5_FLASH_REPLAY_RECORDS) return 0 ;;
     GLM5_FLASH_DECODE_ROWS) return 0 ;;
     GLM5_FLASH_PREFILL_BATCH) return 0 ;;
-    GLM5_FLASH_VERIFY_POLICY|GLM5_FLASH_SPEC_TAU|GLM5_FLASH_ROUTE_RING_CHECK|GLM5_FLASH_REMOTE_DRAFTER) return 0 ;;
+    GLM5_FLASH_ROUTE_RING_CHECK|GLM5_FLASH_REMOTE_DRAFTER) return 0 ;;
     PROBE_DUMP_ROOT|ATTENTION_PLACEMENT|ATTENTION_PLAN_ROWS) return 0 ;;
     PROFILE|PROFILE_DIR|PROFILE_NCU_KERNEL|PROFILE_NCU_COUNT|PROFILE_NCU_SET|PROFILE_NSYS_GPU_METRICS) return 0 ;;
     HTTP_QUEUE_DEPTH|HTTP_QUEUE_WAIT_MS|MODEL_ID|MODEL_VARIANT|MODEL_REVISION|EXPERT_FORMAT|DSPARK_DRAFT_POLICY|DSPARK_DRAFT_LIMIT|V41_FP8_HEAD|RTX_GPUS|RTX_EXPERT_LAYERS|RTX_EXPERT_PEER|COORDINATOR_GPU|COORDINATOR_GPU_UUID|COORDINATOR_GPU_PCI_BUS_ID|COORDINATOR_GPU_HEADROOM_GIB|KV_POOL_TOKENS|KV_POOL_SIZE|HOST_CACHE_BYTES|MEMORY_RESERVATION|MAX_CONTEXT_TOKENS|MAX_OUTPUT_TOKENS|CONCURRENCY|PREFIX_CACHE_ENTRIES|PREFILL_BATCH_TOKENS|SPARK_DEVICE_BUDGET_BYTES|SPARK_REDUCTION_MIN_ROWS|SPARKINFER_EXL3|SPARK_COUNT|SPARK_TP|SPARK_EP|ADDR|EXPERT_PORT|SPARK_[0-7]_HOST|SPARK_[0-7]_LANE_A|SPARK_[0-7]_LANE_B|CUTEAFD_EXPORT_HOST|WIP_BUILD_SEED|COORDINATOR_DOCKER_DEV|COORDINATOR_DOCKER_INFERENCE|SPARK_EXPERT_DOCKER_DEV|SPARK_EXPERT_DOCKER_INFERENCE|COORDINATOR_GPU_BUDGET_GIB|SPARK_HOSTS)
@@ -928,6 +929,17 @@ except (OSError, ValueError):
     qualified = False
 print("auto" if qualified else "off")
 PY
+}
+
+# Resolve fixed onboarding from the checkpoint's sparse layers.
+release_onboard() {
+  local value="$1" model="$2" revision="${3:-}" hub snapshot
+  hub="${HF_HOME:-$HOME/.cache/huggingface}/hub/models--${model//\//--}"
+  [[ -n "$revision" || ! -f "$hub/refs/main" ]] || revision="$(<"$hub/refs/main")"
+  snapshot="$hub/snapshots/$revision/config.json"
+  local -a args=(--onboard "$value")
+  [[ ! -f "$snapshot" ]] || args+=("$snapshot")
+  python3 "$(dirname "${BASH_SOURCE[0]}")/checkpoint-family.py" "${args[@]}"
 }
 
 release_load_config() {
@@ -1113,11 +1125,9 @@ release_load_config() {
       release_die "SPARKINFER_EXL3=force requires EXPERT_FORMAT=exl3"
   fi
   if [[ "$mode" == stop ]]; then
-    [[ "$RTX_EXPERT_LAYERS" == auto || "$RTX_EXPERT_LAYERS" =~ ^[0-9]+$ ]] ||
-      release_die "RTX_EXPERT_LAYERS must be auto or a non-negative integer"
+    RTX_EXPERT_LAYERS="$(python3 "$(dirname "${BASH_SOURCE[0]}")/checkpoint-family.py" --onboard "$RTX_EXPERT_LAYERS")" || return 2
   else
-    [[ "$RTX_EXPERT_LAYERS" == auto || "$RTX_EXPERT_LAYERS" =~ ^([0-9]|[1-3][0-9]|40)$ ]] ||
-      release_die "RTX_EXPERT_LAYERS must be auto or 0..40"
+    RTX_EXPERT_LAYERS="$(release_onboard "$RTX_EXPERT_LAYERS" "$MODEL_ID" "$MODEL_REVISION")" || return 2
   fi
   case "$RTX_GPUS" in auto|1|2) ;; *) release_die "RTX_GPUS must be auto, 1, or 2" ;; esac
   [[ "$COORDINATOR_GPU" =~ ^[0-9]+$ ]] || release_die "COORDINATOR_GPU must be a non-negative host GPU index"

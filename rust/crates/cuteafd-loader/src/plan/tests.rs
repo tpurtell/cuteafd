@@ -40,9 +40,10 @@ fn snapshot_tp(config: Value, tensors: &[Tensor], tp: Option<usize>) -> tempfile
 
 /// One Qwen layer with all 512 EXL3 experts and its storage map.
 fn qwen_snapshot(bits: usize) -> tempfile::TempDir {
-    let (tensors, manifest) = qwen4_exl3(1, bits);
+    let (mut tensors, manifest) = qwen4_exl3(1, bits);
     let mut config = qwen4_config(1);
     config["quantization_config"] = exl3_compact(bits);
+    tensors.extend(qwen4_coordinator(&config, false));
     let dir = snapshot(config, &tensors);
     write_quantize_config(dir.path(), &manifest);
     dir
@@ -214,7 +215,7 @@ fn deepseek_v41_components_formats_and_placement() {
     assert_eq!(component(&report, Component::SpeculatorExpert).owner, Owner::Rtx);
     assert_eq!(report.experts.as_ref().unwrap().spark_worlds, [2, 3, 4, 6]);
     assert!(!report.executable());
-    assert!(report.hints.iter().any(|h| h.what.contains("cache geometry admission")));
+    assert!(report.hints.iter().any(|h| h.what.contains("native placement refused")));
 }
 
 #[test]
@@ -1411,6 +1412,7 @@ fn qwen_nvfp4_legacy_tp6_remains_valid_but_new_empty_h128_ranks_do_not() {
             ]);
         }
     }
+    tensors.extend(qwen4_coordinator(&config, false));
     let dir = snapshot(config, &tensors);
     let legacy = plan(dir.path(), &sparks(6)).unwrap();
     assert!(legacy.placement_supported && legacy.fits && legacy.executable(), "{}", render(&legacy));
@@ -2471,11 +2473,14 @@ fn v41_small_card_graph_envelope_preserves_pro_allowance() {
     let dir = strict_v41_snapshot(false);
     for (gib, expected) in [(32, 2u64 << 30), (96, 3264u64 << 20)] {
         let options = PlanOptions {
-            layout: Some(layout::LayoutOptions { rtx_bytes: vec![gib << 30], workspace_manifest: v41_workspace(dir.path()), ..Default::default() }),
+            layout: Some(layout::LayoutOptions { rtx_bytes: vec![gib << 30], prefill_rows: 256, local_expert_layers: Some(0),
+                pool_tokens: Some(262_144), workspace_manifest: v41_workspace(dir.path()), ..Default::default() }),
             ..sparks(4)
         };
-        let memory = plan(dir.path(), &options).unwrap().memory_layout.unwrap();
-        let graph = memory.devices[0].items.iter().find(|item| item.group == "graph allowance").unwrap();
+        let report = plan(dir.path(), &options).unwrap();
+        assert!(report.executable(), "{}", render(&report));
+        let memory = report.memory_layout.unwrap();
+        let graph = memory.devices[0].items.iter().find(|item| item.group == "graph growth").unwrap();
         assert_eq!(graph.bytes, expected);
     }
 }
@@ -2488,7 +2493,8 @@ fn v41_auto_layout_honors_occupancy_and_disabled_prefix_arenas() {
     options.layout = Some(layout::LayoutOptions { rtx_bytes: vec![96 << 30], pool_tokens: Some(0),
         prefix_slots: Some(0), native_mtp_layers: 0, workspace_manifest: v41_workspace(dir.path()), ..Default::default() });
     let automatic = plan(dir.path(), &options).unwrap().memory_layout.unwrap();
-    assert_eq!(automatic.devices[0].capacity_bytes, (96u64 << 30) * 97 / 100 - (3 << 30));
+    assert_eq!(automatic.devices[0].capacity_bytes, (96u64 << 30) * 97 / 100);
+    assert_eq!(automatic.devices[0].items.iter().find(|i| i.group == "runtime growth").unwrap().bytes, 3 << 30);
     assert_eq!(automatic.devices[0].by_category().get(&Category::Prefix).copied().unwrap_or(0), 0);
     let state = automatic.devices[0].items.iter().find(|i| i.group == "window state, table headers and compressor carry").unwrap().bytes;
     let cache = crate::serving_capacity::deepseek_v41_cache_geometry(&serde_json::from_reader::<_, Value>(
@@ -2497,26 +2503,18 @@ fn v41_auto_layout_honors_occupancy_and_disabled_prefix_arenas() {
     assert_eq!(state, (rank.active_state_per_sequence_bytes - 4 * 4096 * 4) * 16);
     options.layout.as_mut().unwrap().pool_tokens = Some(512);
     let explicit = plan(dir.path(), &options).unwrap().memory_layout.unwrap();
-    assert_eq!(explicit.devices[0].capacity_bytes, (96u64 << 30) - (2 << 30));
+    assert_eq!(explicit.devices[0].capacity_bytes, 96u64 << 30);
+    assert_eq!(explicit.devices[0].items.iter().find(|i| i.group == "runtime growth").unwrap().bytes, 2 << 30);
 }
 
 #[test]
 fn v41_vision_off_removes_only_the_tower_from_fixed_layout() {
-    let mut config = v41_config();
-    let text = &mut config["text_config"];
-    text["num_hidden_layers"] = json!(40);
-    text["head_dim"] = json!(512);
-    text["qk_rope_head_dim"] = json!(64);
-    text["sliding_window"] = json!(128);
-    text["kv_source_layer_ids"] = json!([2, 8, 14, 20]);
-    text["compress_ratios"] = json!((0..40).map(|l| if l < 2 { 0 } else if l < 20 { 2 } else { 1 }).collect::<Vec<_>>());
-    let dir = snapshot(config, &[t("embed.weight", "BF16", &[128, 5120]),
-        t("head.weight", "BF16", &[128, 5120]),
-        t("vision.patch_embed.proj.weight", "BF16", &[16, 3, 14, 14])]);
+    let dir = strict_v41_snapshot(false);
     let mut options = sparks(4);
     options.vision = MediaMode::Auto;
     options.layout = Some(layout::LayoutOptions { rtx_bytes: vec![32 << 30], pool_tokens: Some(512),
-        local_expert_layers: Some(0), native_mtp_layers: 0, ..Default::default() });
+        local_expert_layers: Some(0), native_mtp_layers: 0, prefill_rows: 256,
+        workspace_manifest: v41_workspace(dir.path()), ..Default::default() });
     use super::encoder::EncoderKind;
     let auto_report = plan(dir.path(), &options).unwrap();
     assert_eq!(auto_report.encoder.as_ref().unwrap().kind, EncoderKind::Spark { rank: 0 });
@@ -2542,7 +2540,8 @@ fn v41_vision_off_removes_only_the_tower_from_fixed_layout() {
     options.layout.as_mut().unwrap().force_gpu_embedding = true;
     let gpu = plan(dir.path(), &options).unwrap().memory_layout.unwrap();
     assert!(gpu.devices[0].by_category()[&Category::Embedding] > 0);
-    assert_eq!(gpu.devices[0].used_bytes() - off.devices[0].used_bytes(), 128 * 5120 * 2);
+    let embedding = component(&plan(dir.path(), &options).unwrap(), Component::Embedding).bytes;
+    assert_eq!(gpu.devices[0].used_bytes() - off.devices[0].used_bytes(), embedding);
     options.layout.as_mut().unwrap().force_gpu_embedding = false;
     options.layout.as_mut().unwrap().rtx_bytes = vec![96 << 30];
     let pro = plan(dir.path(), &options).unwrap().memory_layout.unwrap();
@@ -2688,7 +2687,7 @@ fn v41_32gib_mxfp4_default_prefill_solves_1024_and_exact_2048_refuses() {
     assert!(!refused.executable());
     assert_eq!(refused.prefill_rows, Some(2048));
     assert!(refused.prefill_selection.is_none());
-    assert!(refused.hints.iter().any(|hint| hint.what.contains("V4.1 shared admission")));
+    assert!(refused.hints.iter().any(|hint| hint.what.contains("native placement refused")));
     assert!(refused.hints.iter().any(|hint| hint.what.contains("explicit V4.1 prefill capacity 2048 refused")));
 }
 
@@ -2720,9 +2719,12 @@ fn qwen_spark_layout_keeps_only_native_mtp_experts_on_coordinator() {
     tensors.extend(draft);
     let mut config = qwen4_config(1);
     config["text_config"]["mtp_num_hidden_layers"] = json!(1);
+    tensors.extend(qwen4_coordinator(&config, true));
     let dir = snapshot(config, &tensors);
+    let manifest = write_qwen4_exl3_capacities(dir.path(), "45");
     let mut options = PlanOptions { layout: Some(layout::LayoutOptions {
-        rtx_bytes: vec![32 << 30], pool_tokens: Some(32768), native_mtp_layers: 1, ..Default::default()
+        rtx_bytes: vec![32 << 30], pool_tokens: Some(32768), native_mtp_layers: 1,
+        workspace_manifest: Some(manifest), ..Default::default()
     }), ..sparks(1) };
     let with_mtp = plan(dir.path(), &options).unwrap().memory_layout.unwrap();
     let lead = &with_mtp.devices[0];
@@ -2780,14 +2782,10 @@ fn media_off_is_disabled_and_saves_checkpoint_bytes() {
 fn v41_encoder_preserves_experts_and_falls_back_at_runtime_budget() {
     use super::encoder::EncoderKind;
     use cuteafd_core::memory_layout::{Category, DeviceKind};
-    let dir = snapshot(v41_config(), &[
-        t("embed.weight", "BF16", &[128, 5120]),
-        t("layers.0.ffn.experts.0.w1.weight", "I8", &[2304, 2560]),
-        t("layers.0.ffn.experts.0.w1.scale", "F8_E8M0", &[2304, 160]),
-        t("vision.embeddings.patch_embedding.weight", "BF16", &[1152, 3, 14, 14]),
-    ]);
+    let dir = strict_v41_snapshot(false);
     let options = PlanOptions { layout: Some(layout::LayoutOptions {
-        rtx_bytes: vec![96 << 30], local_expert_layers: Some(0), target_pool_tokens: 32768,
+        rtx_bytes: vec![96 << 30], local_expert_layers: Some(0), pool_tokens: Some(32768),
+        prefill_rows: 256, workspace_manifest: v41_workspace(dir.path()),
         spark_allocation_budget_bytes: Some(100 << 30), ..Default::default()
     }), ..Default::default() };
     let auto = plan(dir.path(), &options).unwrap();

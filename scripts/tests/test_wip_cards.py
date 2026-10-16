@@ -707,9 +707,9 @@ def test_arm_overrides_only_selected_arm_and_card(entry, tmp_path, monkeypatch, 
     state = tmp_path / 'state'
     monkeypatch.setattr(sys, 'argv', ['wip-cards', '--kit', str(kit), '--cards', 'v41-min', 'other',
         '--interleave', '--repeats', '1', '--arm', 'off=b:s', '--arm', 'on=c:s', '--state', str(state),
-        '--set', 'v41-min:GLM5_FLASH_PREFILL_BATCH=off', '--set', 'v41-min:GLM5_FLASH_VERIFY_POLICY=cost',
+        '--set', 'v41-min:GLM5_FLASH_PREFILL_BATCH=off',
         '--arm-set', 'on:v41-min:GLM5_FLASH_PREFILL_BATCH=on',
-        '--arm-set', 'on:v41-min:GLM5_FLASH_VERIFY_POLICY=chain', '--dry-run'])
+        '--dry-run'])
     assert cards.main() == 0
     jobs = json.loads((state / 'plan.json').read_text())['jobs']
     for job in jobs:
@@ -720,9 +720,8 @@ def test_arm_overrides_only_selected_arm_and_card(entry, tmp_path, monkeypatch, 
         else:
             enabled = job['arm'] == 'on'
             assert settings['GLM5_FLASH_PREFILL_BATCH'] == ('on' if enabled else 'off')
-            assert settings['GLM5_FLASH_VERIFY_POLICY'] == ('chain' if enabled else 'cost')
-            assert base['GLM5_FLASH_VERIFY_POLICY'] == settings['GLM5_FLASH_VERIFY_POLICY']
-    assert '"GLM5_FLASH_VERIFY_POLICY": "chain"' in capsys.readouterr().out
+            assert base['GLM5_FLASH_PREFILL_BATCH'] == settings['GLM5_FLASH_PREFILL_BATCH']
+    assert '"GLM5_FLASH_PREFILL_BATCH": "on"' in capsys.readouterr().out
 
 
 @pytest.mark.parametrize('override,match', [('foreign:v41-min:MODEL_ID=x', 'unknown override arm'),

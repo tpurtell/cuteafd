@@ -255,6 +255,7 @@ def test_multitier_exports_do_not_use_two_tier_only_schedules(tmp_path, monkeypa
         route_block=lambda *_: 8, swiglu_limit=lambda *_: 10.0,
         wire_input=lambda *_: False, ws_input_stages=lambda *_: None,
         ws_dynamic_tiles=lambda *_: False, ws_tile=lambda *_: None,
+        decode_tile=lambda *_: None,
     )
     for name in ("warp_specialized", "fused_input_rotation", "token_major_rotation"):
         setattr(package, name, lambda *_, name=name: name == rotation)

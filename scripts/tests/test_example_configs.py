@@ -241,6 +241,89 @@ def test_release_smoke_matrix_covers_owned_columns_with_current_defaults() -> No
     assert all(columns == {1, 2} for columns in models.values())
 
 
+def test_v3_release_matrix_covers_shipped_quants_reference_layouts_and_real_5090() -> None:
+    matrix = json.loads((ROOT / "scripts/bench/release-smoke-v3.json").read_text())
+    assert matrix["profile"] == "smoke"
+    assert matrix["build"] == "REPLACE-ME-v3-rc"
+    defaults = matrix["defaults"]["set"]
+    assert all("REPLACE-ME-v3-rc" in defaults[key] for key in
+               ("COORDINATOR_DOCKER_INFERENCE", "SPARK_EXPERT_DOCKER_INFERENCE"))
+    entries = {entry["name"]: entry for entry in matrix["entries"]}
+    assert len(entries) == len(matrix["entries"]) == 42
+    columns = {}
+    ports = set()
+    for name, entry in entries.items():
+        values = {**keys(ROOT / entry["config"]), **defaults, **entry["set"]}
+        assert values["MODEL_ID"] in CHECKPOINTS
+        assert entry["family"] in FAMILY_DOCS
+        assert "BENCH_SIMULATED" not in values
+        assert int(values["RTX_GPUS"]) == len(entry["gpus"])
+        assert int(values["COORDINATOR_GPU"]) == entry["gpus"][0]
+        assert int(values["SPARK_COUNT"]) == len(entry["sparks"])
+        assert values["SPECULATOR"] in {"dspark", "dflash2", "mtp"}
+        assert values["POOL_TOKENS"] in {"auto", "2097152"}
+        for rank, host in enumerate(entry["sparks"]):
+            assert host == values[f"SPARK_{rank}_HOST"] == f"REPLACE-ME-spark-{rank}"
+            assert values[f"SPARK_{rank}_LANE_A"] == f"192.0.2.{rank + 1}"
+        for key in ("ADDR", "EXPERT_PORT"):
+            assert values[key] not in ports
+            ports.add(values[key])
+        if name.endswith(("-min", "-max")):
+            columns.setdefault(values["MODEL_ID"], set()).add(name.rsplit("-", 1)[1])
+        if name.endswith("-5090"):
+            assert values["BENCH_HARDWARE_CLASS"] == "5090"
+            assert len(entry["gpus"]) == 1
+            assert "BENCH_SIMULATED" not in entry["set"]
+    assert len(columns) == 14
+    assert all(columns == {"min", "max"} for columns in columns.values())
+    assert len([name for name in entries if name.endswith("-5090")]) == 10
+    assert len(entries["v41-flash-reference-tp4"]["sparks"]) == 4
+    assert len(entries["v41-flash-reference-tp6"]["sparks"]) == 6
+    for name in ("glm53f-exl3-max", "qwen38-exl3-min", "qwen38-exl3-max", "qwen38-nvfp4-max"):
+        assert not entries[name]["sparks"]
+        assert entries[name]["set"]["EXPERT_BACKEND"] == "local"
+    for name in ("glm53f-nvfp4-max", "glm53f-tr3-max"):
+        assert len(entries[name]["sparks"]) == 2
+        assert entries[name]["set"]["EXPERT_BACKEND"] == "spark"
+    assert entries["glm53f-exl3-reference-all-spark"]["set"]["RTX_EXPERT_LAYERS"] == "0"
+    half = entries["glm53f-exl3-reference-half"]["set"]
+    assert half["RTX_EXPERT_LAYERS"] == "22"
+    assert half["POOL_TOKENS"] == "2097152"
+    assert half["CONCURRENCY"] == "16"
+    text = json.dumps(matrix)
+    assert not any(private in text for private in PRIVATE)
+
+
+@pytest.mark.parametrize("gpu_name,expected", [
+    ("NVIDIA GeForce RTX 5090", 0),
+    ("NVIDIA RTX PRO 6000 Blackwell Workstation Edition", 1),
+])
+def test_v3_5090_precheck_requires_real_hardware(tmp_path: Path, gpu_name: str, expected: int) -> None:
+    matrix = json.loads((ROOT / "scripts/bench/release-smoke-v3.json").read_text())
+    probe = tmp_path / "nvidia-smi"
+    probe.write_text(f"#!/bin/sh\nprintf '%s\\n' '{gpu_name}'\n")
+    probe.chmod(0o755)
+    for entry in matrix["entries"]:
+        if not entry["name"].endswith("-5090"):
+            continue
+        hook = entry["precheck"]
+        assert hook["required"]
+        result = subprocess.run(hook["argv"], env={**os.environ, "PATH": f"{tmp_path}:{os.environ['PATH']}"},
+                                timeout=hook["timeout_s"], check=False)
+        assert result.returncode == expected, entry["name"]
+
+
+def test_published_matrix_pins_current_reports_and_keeps_5090_pending() -> None:
+    matrix = json.loads((ROOT / "benchmarks/current-matrix.json").read_text())
+    for row in matrix["cells"]:
+        assert row["5090"]["status"] == "pending"
+        for column in ("1rtx", "2rtx"):
+            cell = row[column]
+            assert cell["status"] == "current"
+            assert (ROOT / cell["report"] / "report.json").is_file()
+    assert "simulated-5090" not in json.dumps(matrix)
+
+
 @pytest.mark.parametrize("path", starting_configs(), ids=lambda p: p.name)
 def test_starting_config_has_no_private_detail_and_names_the_release_pair(path: Path) -> None:
     text = path.read_text()
@@ -349,3 +432,40 @@ def test_v41_starting_config_matches_the_launcher_defaults(path: Path, tmp_path:
 
 def test_tp_ep_examples_are_left_alone() -> None:
     assert TP_EP <= {p.name for p in EXAMPLES.glob("*.config")}
+
+
+@pytest.mark.parametrize("config,count", [
+    ({"model_type": "deepseek_v41", "text_config": {"num_hidden_layers": 40}}, 40),
+    ({"model_type": "deepseek_v4", "n_layers": 61}, 61),
+    ({"model_type": "qwen4_exp", "text_config": {"num_hidden_layers": 48}}, 48),
+    ({"model_type": "glm_moe_dsa", "num_hidden_layers": 78, "first_k_dense_replace": 3}, 75),
+    ({"model_type": "glm5_next", "num_hidden_layers": 4,
+      "layer_types": ["linear_attention"] * 4,
+      "mlp_layer_types": ["sparse", "dense", "sparse", "dense"]}, 2),
+    ({"model_type": "mimo_v2", "num_hidden_layers": 5, "moe_layer_freq": [0, 1, 0, 1, 1]}, 3),
+    ({"model_type": "mimo_v2_flash", "num_hidden_layers": 48}, 47),
+])
+@pytest.mark.parametrize("value", ["auto", "max", "all", "50%", "100%", "0"])
+def test_checkpoint_onboarding_count_and_rounding(tmp_path, config, count, value):
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps(config))
+    result = subprocess.run(["python3", str(ROOT / "scripts/lib/checkpoint-family.py"),
+                             "--onboard", value, str(path)], capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    expected = {"all": str(count), "100%": str(count), "50%": str(int(count * 0.5 + 0.5))}.get(value, value)
+    assert result.stdout.strip() == expected
+    bounded = subprocess.run(["bash", "-c", 'source "$1"; release_onboard "$2" test/model pinned',
+                              "test", str(ROOT / "scripts/lib/release-common.sh"), value],
+                             env={**os.environ, "HF_HOME": str(tmp_path / "hf")},
+                             capture_output=True, text=True)
+    # With no cached checkpoint, validate grammar without inventing a family limit.
+    assert bounded.returncode == 0, bounded.stderr
+    assert bounded.stdout.strip() == value
+
+
+@pytest.mark.parametrize("value", ["-1", "101%", "NaN%", "inf%", "half", "5x", ""])
+def test_checkpoint_onboarding_rejects_invalid_grammar(value):
+    result = subprocess.run(["python3", str(ROOT / "scripts/lib/checkpoint-family.py"),
+                             "--onboard", value], capture_output=True, text=True)
+    assert result.returncode != 0
+    assert "RTX_EXPERT_LAYERS must be" in result.stderr

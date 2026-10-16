@@ -17,7 +17,7 @@ def fixture_repo(tmp_path):
     repo = tmp_path / 'repo'
     for name in ('scripts/build/build-dev-images.sh', 'scripts/build/dev-toolchain.py',
                  'scripts/build/install-dev-cache-tools.sh', 'scripts/build/assert-build-filesystem.py',
-                 'scripts/lib/release-common.sh', 'scripts/lib/cdi-gpus.sh', 'scripts/lib/build-supervision.sh', 'docker/Dockerfile.dev', 'docker/entrypoint.sh', '.dockerignore'):
+                 'scripts/lib/release-common.sh', 'scripts/lib/checkpoint-family.py', 'scripts/lib/cdi-gpus.sh', 'scripts/lib/build-supervision.sh', 'docker/Dockerfile.dev', 'docker/entrypoint.sh', '.dockerignore'):
         dest = repo / name
         dest.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy(ROOT / name, dest)

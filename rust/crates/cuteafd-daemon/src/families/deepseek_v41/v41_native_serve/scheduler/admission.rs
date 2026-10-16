@@ -233,13 +233,8 @@ pub(super) struct Wake<'p> {
     pub host_pending: bool,
     /// The deferred request and the release epoch it waits past.
     pub retry: Option<(&'p NativeRequest, u64)>,
-    /// Shared prefill: lanes stop at a completed round once this decode debt is paid.
-    pub prefill_deadline: Option<Instant>,
 }
 impl Wake<'_> {
-    pub fn prefill_due(self, completed_rounds: u64) -> bool {
-        completed_rounds > 0 && self.prefill_deadline.is_some_and(|deadline| Instant::now() >= deadline)
-    }
     pub fn poll_media(self, completed_rounds: u64) -> bool {
         self.media_pending && completed_rounds > 0
     }

@@ -203,6 +203,11 @@ def _export_exl3(extra, output):
                 options["fused_input_rotation"] = True
             elif len(bits) == 2 and package.token_major_rotation(geometry, rows):
                 options["token_major_rotation"] = True
+            # The package pins its decode capacities to the canonical tile (#309);
+            # compare the geometry that ships, not the planner's widened default.
+            tile = package.decode_tile(geometry, width, rows)
+            if tile is not None:
+                options["tile"] = tile
             options.update(route_block=block, swiglu_limit=package.swiglu_limit(geometry))
             export(output / profile / f"m{rows}", width, experts, rows, bits, "auto", topk, dtype, **options)
 

@@ -1,19 +1,229 @@
 {
   "schema": "cuteafd.bench.matrix/1",
   "cells": [
-    {"family": "deepseek_v41", "checkpoint": "deepseek-ai/DeepSeek-V4.1-Flash", "5090": "simulated-5090", "1rtx": "current", "2rtx": "current"},
-    {"family": "deepseek_v41", "checkpoint": "nvidia/DeepSeek-V4.1-Flash-NVFP4", "5090": "simulated-5090", "1rtx": "current", "2rtx": "current"},
-    {"family": "deepseek_v4", "checkpoint": "deepseek-ai/DeepSeek-V4-Flash-0731", "5090": "simulated-5090", "1rtx": "current", "2rtx": "current"},
-    {"family": "deepseek_v4", "checkpoint": "wrldsuksgo2mars/DeepSeek-V4-Pro-0813-EXL3-K2-calibrated-v1", "5090": "simulated-5090", "1rtx": "current", "2rtx": "current"},
-    {"family": "glm5", "checkpoint": "wrldsuksgo2mars/GLM-5.3-EXL3-K4-v1", "5090": "simulated-5090", "1rtx": "current", "2rtx": "current"},
-    {"family": "glm5", "checkpoint": "nvidia/GLM-5.3-NVFP4", "5090": "simulated-5090", "1rtx": "current", "2rtx": "current"},
-    {"family": "glm5_flash", "checkpoint": "zai-org/GLM-5.3-Flash", "5090": "simulated-5090", "1rtx": "current", "2rtx": "current"},
-    {"family": "glm5_flash", "checkpoint": "wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K3.25-v1", "5090": "simulated-5090", "1rtx": "current", "2rtx": "current"},
-    {"family": "glm5_flash", "checkpoint": "nvidia/GLM-5.3-Flash-NVFP4", "5090": "simulated-5090", "1rtx": "current", "2rtx": "current"},
-    {"family": "glm5_flash", "checkpoint": "brandonmusic/GLM-5.3-Flash-tr3-4bpw", "5090": "simulated-5090", "1rtx": "current", "2rtx": "current"},
-    {"family": "mimo_v2", "checkpoint": "XiaomiMiMo/MiMo-V2.6-Flash-MOPD", "5090": "simulated-5090", "1rtx": "current", "2rtx": "current"},
-    {"family": "mimo_v2", "checkpoint": "XiaomiMiMo/MiMo-V2.6-Pro-MOPD", "5090": "simulated-5090", "1rtx": "current", "2rtx": "current"},
-    {"family": "qwen4", "checkpoint": "wrldsuksgo2mars/Qwen3.8-Flash-Next-EXL3-K4.25-PLE-FP8-v1", "5090": "simulated-5090", "1rtx": "current", "2rtx": "current"},
-    {"family": "qwen4", "checkpoint": "nvidia/Qwen3.8-Flash-Next-NVFP4", "5090": "simulated-5090", "1rtx": "current", "2rtx": "current"}
+    {
+      "family": "deepseek_v41",
+      "checkpoint": "deepseek-ai/DeepSeek-V4.1-Flash",
+      "5090": {
+        "status": "pending",
+        "reason": "Awaiting real RTX 5090 exports; simulations are archived only."
+      },
+      "1rtx": {
+        "status": "current",
+        "report": "benchmarks/deepseek_v41/2026-10-14-smoke-deepseek-v4-1-flash-1rtx-3spark-v41-flash-min"
+      },
+      "2rtx": {
+        "status": "current",
+        "report": "benchmarks/deepseek_v41/2026-10-14-smoke-deepseek-v4-1-flash-2rtx-4spark-v41-flash-max"
+      }
+    },
+    {
+      "family": "deepseek_v41",
+      "checkpoint": "nvidia/DeepSeek-V4.1-Flash-NVFP4",
+      "5090": {
+        "status": "pending",
+        "reason": "Awaiting real RTX 5090 exports; simulations are archived only."
+      },
+      "1rtx": {
+        "status": "current",
+        "report": "benchmarks/deepseek_v41/2026-10-15-smoke-deepseek-v4-1-flash-nvfp4-1rtx-4spark-v41-flash-nvfp4-min"
+      },
+      "2rtx": {
+        "status": "current",
+        "report": "benchmarks/deepseek_v41/2026-10-15-smoke-deepseek-v4-1-flash-nvfp4-2rtx-4spark-v41-flash-nvfp4-max"
+      }
+    },
+    {
+      "family": "deepseek_v4",
+      "checkpoint": "deepseek-ai/DeepSeek-V4-Flash-0731",
+      "5090": {
+        "status": "pending",
+        "reason": "Awaiting real RTX 5090 exports; simulations are archived only."
+      },
+      "1rtx": {
+        "status": "current",
+        "report": "benchmarks/deepseek_v4/2026-10-14-smoke-deepseek-v4-flash-0731-1rtx-2spark-v4-flash-min"
+      },
+      "2rtx": {
+        "status": "current",
+        "report": "benchmarks/deepseek_v4/2026-10-14-smoke-deepseek-v4-flash-0731-2rtx-4spark-v4-flash-max"
+      }
+    },
+    {
+      "family": "deepseek_v4",
+      "checkpoint": "wrldsuksgo2mars/DeepSeek-V4-Pro-0813-EXL3-K2-calibrated-v1",
+      "5090": {
+        "status": "pending",
+        "reason": "Awaiting real RTX 5090 exports; simulations are archived only."
+      },
+      "1rtx": {
+        "status": "current",
+        "report": "benchmarks/deepseek_v4/2026-10-14-smoke-deepseek-v4-pro-0813-exl3-k2-calibrated-v1-1rtx-4spark-v4-pro-exl3-min"
+      },
+      "2rtx": {
+        "status": "current",
+        "report": "benchmarks/deepseek_v4/2026-10-14-smoke-deepseek-v4-pro-0813-exl3-k2-calibrated-v1-2rtx-6spark-v4-pro-exl3-max"
+      }
+    },
+    {
+      "family": "glm5",
+      "checkpoint": "wrldsuksgo2mars/GLM-5.3-EXL3-K4-v1",
+      "5090": {
+        "status": "pending",
+        "reason": "Awaiting real RTX 5090 exports; simulations are archived only."
+      },
+      "1rtx": {
+        "status": "current",
+        "report": "benchmarks/glm5/2026-10-14-smoke-glm-5-3-exl3-k4-v1-1rtx-4spark-glm53-exl3-min"
+      },
+      "2rtx": {
+        "status": "current",
+        "report": "benchmarks/glm5/2026-10-14-smoke-glm-5-3-exl3-k4-v1-2rtx-6spark-glm53-exl3-max"
+      }
+    },
+    {
+      "family": "glm5",
+      "checkpoint": "nvidia/GLM-5.3-NVFP4",
+      "5090": {
+        "status": "pending",
+        "reason": "Awaiting real RTX 5090 exports; simulations are archived only."
+      },
+      "1rtx": {
+        "status": "current",
+        "report": "benchmarks/glm5/2026-10-15-smoke-glm-5-3-nvfp4-1rtx-4spark-glm53-nvfp4-min"
+      },
+      "2rtx": {
+        "status": "current",
+        "report": "benchmarks/glm5/2026-10-15-smoke-glm-5-3-nvfp4-2rtx-6spark-glm53-nvfp4-max"
+      }
+    },
+    {
+      "family": "glm5_flash",
+      "checkpoint": "zai-org/GLM-5.3-Flash",
+      "5090": {
+        "status": "pending",
+        "reason": "Awaiting real RTX 5090 exports; simulations are archived only."
+      },
+      "1rtx": {
+        "status": "current",
+        "report": "benchmarks/glm5_flash/2026-10-14-smoke-glm-5-3-flash-1rtx-4spark-glm53f-fp8-min"
+      },
+      "2rtx": {
+        "status": "current",
+        "report": "benchmarks/glm5_flash/2026-10-14-smoke-glm-5-3-flash-2rtx-4spark-glm53f-fp8-max"
+      }
+    },
+    {
+      "family": "glm5_flash",
+      "checkpoint": "wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K3.25-v1",
+      "5090": {
+        "status": "pending",
+        "reason": "Awaiting real RTX 5090 exports; simulations are archived only."
+      },
+      "1rtx": {
+        "status": "current",
+        "report": "benchmarks/glm5_flash/2026-10-14-smoke-glm-5-3-flash-exl3-k3-25-v1-1rtx-2spark-glm53f-exl3-min"
+      },
+      "2rtx": {
+        "status": "current",
+        "report": "benchmarks/glm5_flash/2026-10-14-smoke-glm-5-3-flash-exl3-k3-25-v1-2rtx-glm53f-exl3-max"
+      }
+    },
+    {
+      "family": "glm5_flash",
+      "checkpoint": "nvidia/GLM-5.3-Flash-NVFP4",
+      "5090": {
+        "status": "pending",
+        "reason": "Awaiting real RTX 5090 exports; simulations are archived only."
+      },
+      "1rtx": {
+        "status": "current",
+        "report": "benchmarks/glm5_flash/2026-10-14-smoke-glm-5-3-flash-nvfp4-1rtx-2spark-glm53f-nvfp4-min"
+      },
+      "2rtx": {
+        "status": "current",
+        "report": "benchmarks/glm5_flash/2026-10-14-smoke-glm-5-3-flash-nvfp4-2rtx-2spark-glm53f-nvfp4-max"
+      }
+    },
+    {
+      "family": "glm5_flash",
+      "checkpoint": "brandonmusic/GLM-5.3-Flash-tr3-4bpw",
+      "5090": {
+        "status": "pending",
+        "reason": "Awaiting real RTX 5090 exports; simulations are archived only."
+      },
+      "1rtx": {
+        "status": "current",
+        "report": "benchmarks/glm5_flash/2026-10-14-smoke-glm-5-3-flash-tr3-4bpw-1rtx-2spark-glm53f-tr3-min"
+      },
+      "2rtx": {
+        "status": "current",
+        "report": "benchmarks/glm5_flash/2026-10-14-smoke-glm-5-3-flash-tr3-4bpw-2rtx-2spark-glm53f-tr3-max"
+      }
+    },
+    {
+      "family": "mimo_v2",
+      "checkpoint": "XiaomiMiMo/MiMo-V2.6-Flash-MOPD",
+      "5090": {
+        "status": "pending",
+        "reason": "Awaiting real RTX 5090 exports; simulations are archived only."
+      },
+      "1rtx": {
+        "status": "current",
+        "report": "benchmarks/mimo_v2/2026-10-14-smoke-mimo-v2-6-flash-mopd-1rtx-2spark-mimo26-flash-min"
+      },
+      "2rtx": {
+        "status": "current",
+        "report": "benchmarks/mimo_v2/2026-10-14-smoke-mimo-v2-6-flash-mopd-2rtx-4spark-mimo26-flash-max"
+      }
+    },
+    {
+      "family": "mimo_v2",
+      "checkpoint": "XiaomiMiMo/MiMo-V2.6-Pro-MOPD",
+      "5090": {
+        "status": "pending",
+        "reason": "Awaiting real RTX 5090 exports; simulations are archived only."
+      },
+      "1rtx": {
+        "status": "current",
+        "report": "benchmarks/mimo_v2/2026-10-14-smoke-mimo-v2-6-pro-mopd-1rtx-6spark-mimo-pro-min"
+      },
+      "2rtx": {
+        "status": "current",
+        "report": "benchmarks/mimo_v2/2026-10-14-smoke-mimo-v2-6-pro-mopd-2rtx-6spark-mimo-pro-max"
+      }
+    },
+    {
+      "family": "qwen4",
+      "checkpoint": "wrldsuksgo2mars/Qwen3.8-Flash-Next-EXL3-K4.25-PLE-FP8-v1",
+      "5090": {
+        "status": "pending",
+        "reason": "Awaiting real RTX 5090 exports; simulations are archived only."
+      },
+      "1rtx": {
+        "status": "current",
+        "report": "benchmarks/qwen4/2026-10-14-smoke-qwen3-8-flash-next-exl3-k4-25-ple-fp8-v1-1rtx-qwen38-exl3-min"
+      },
+      "2rtx": {
+        "status": "current",
+        "report": "benchmarks/qwen4/2026-10-14-smoke-qwen3-8-flash-next-exl3-k4-25-ple-fp8-v1-2rtx-qwen38-exl3-max"
+      }
+    },
+    {
+      "family": "qwen4",
+      "checkpoint": "nvidia/Qwen3.8-Flash-Next-NVFP4",
+      "5090": {
+        "status": "pending",
+        "reason": "Awaiting real RTX 5090 exports; simulations are archived only."
+      },
+      "1rtx": {
+        "status": "current",
+        "report": "benchmarks/qwen4/2026-10-15-smoke-qwen3-8-flash-next-nvfp4-1rtx-2spark-qwen38-nvfp4-min"
+      },
+      "2rtx": {
+        "status": "current",
+        "report": "benchmarks/qwen4/2026-10-14-smoke-qwen3-8-flash-next-nvfp4-2rtx-qwen38-nvfp4-max"
+      }
+    }
   ]
 }

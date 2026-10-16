@@ -395,6 +395,32 @@ def ws_tile(geometry: str, role: str, width: int, capacity: int) -> tuple[int, .
     return TILE_384
 
 
+# Decode capacities ship the tile m1 ships. B12x's mixed-Trellis planner widens
+# the tile of 10..32-row batches to (128,128,128,128) (`_projection_mixed_tile_config`
+# with no direct top-k routes, which no packaged EXL3 geometry uses). The tile is
+# part of the reduction signature a decode plan admits, so a widened decode export
+# can never be selected: rows in its range fall through to the next capacity, and
+# the export ships as dead weight (#309). Re-exporting it with the canonical tile is
+# what makes the capacity selectable again. Enabled for the geometry whose decode
+# capacities are measured; the other geometries carry the same B12x policy and can
+# be added here with their own gate run.
+DECODE_TILE_PIN = ('v41',)
+
+
+def decode_tile(geometry: str, width: int, capacity: int) -> tuple[int, ...] | None:
+    """Canonical m1 tile for a decode capacity the B12x planner would widen.
+
+    The canonical tile is the planner's own prefill/default answer at this width,
+    which is what m1 and every capacity above the widened window already compile:
+    tile_n is 256 when both the rank's intermediate width and the geometry's hidden
+    size are whole 256 tiles, 128 otherwise.
+    """
+    if geometry not in DECODE_TILE_PIN or not 10 <= capacity <= 32:
+        return None
+    tile_n = 256 if width % 256 == 0 and GEOMETRIES[geometry][0] % 256 == 0 else 128
+    return (64, tile_n, 64, tile_n)
+
+
 # Decode-schedule variants: a capacity directory m<capacity>-<name> beside the
 # default m<capacity>, exported with per-capacity options (bit-identical; the
 # worker's --exl3-schedule NAME selects it). gb10 is the DGX Spark schedule of
@@ -695,10 +721,17 @@ def build(args: argparse.Namespace) -> None:
         pending = []
         for profile, width, experts, topk, dtype, destinations in profiles:
             for capacity in capacities:
-                tile = tiles.get(profile, {}).get(capacity)
+                requested = tiles.get(profile, {}).get(capacity)
+                tile = requested
+                if tile is None:
+                    # A decode capacity the B12x policy widens is pinned back to the
+                    # canonical tile (an explicit override above still wins).
+                    tile = decode_tile(geometry, width, capacity)
                 # Content-keyed: an override changes the compiled geometry, so it
-                # must never land in (or be read from) the policy-keyed export.
-                # Without an override the path is what every existing build used.
+                # must never land in (or be read from) the policy-keyed export, and
+                # neither may a pinned capacity: a build tree that predates the pin
+                # holds the widened export under the policy key. Without either the
+                # path is what every existing build used.
                 profile_dir = (args.build_dir / profile if tile is None else
                                args.build_dir / f"{profile}+tile{'-'.join(map(str, tile))}")
                 raw = profile_dir / f'm{capacity}'  # one capacity, one directory
@@ -739,14 +772,14 @@ def build(args: argparse.Namespace) -> None:
                                     / raw.name, {**options, **schedule_options}))
                 for schedule, raw, run_options in exports:
                     pending.append((raw, width, experts, capacity, topk, dtype, run_options,
-                                    destinations, schedule, tile))
+                                    destinations, schedule, requested))
         from _export_jobs import export_jobs
         jobs = min(export_jobs(), len(pending))
         print(f'EXL3 variants: {len(pending)} independent exports, {jobs} workers', flush=True)
         payloads = [(args, expected_compute, *item[:7]) for item in pending]
         # Spawn never inherits a CUDA context; successful manifests retain order.
         for item, (meta, runtime_files) in zip(pending, compile_variants(payloads, jobs)):
-            raw, width, experts, capacity, topk, dtype, run_options, destinations, schedule, tile = item
+            raw, width, experts, capacity, topk, dtype, run_options, destinations, schedule, requested = item
             for destination in destinations:
                 directory = f'{destination}/m{capacity}' + ('' if schedule is None else f'-{schedule}')
                 for name in runtime_files:
@@ -760,10 +793,13 @@ def build(args: argparse.Namespace) -> None:
                     # policy varies per capacity (m16 is the known special case),
                     # so a build without an override still has a real tile.
                     variant['tile'] = meta['tile']
-                if tile is not None and schedule is None:
+                if requested is not None and schedule is None:
                     # An A/B tile override applies to the default export; a
-                    # schedule variant brings its own options.
-                    variant['tile_requested'] = list(tile)
+                    # schedule variant brings its own options. A capacity the
+                    # packaging pins itself is not a request: the field records
+                    # what an operator asked for, so that a package can be told
+                    # apart from one whose policy resolved the tile.
+                    variant['tile_requested'] = list(requested)
                 if 'route_block' in meta:
                     variant['route_block'] = meta['route_block']
                 if meta.get('token_major_rotation'):

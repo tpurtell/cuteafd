@@ -369,6 +369,51 @@ pub fn qwen4_config(layers: usize) -> Value {
     })
 }
 
+/// Qwen's coordinator headers for `layers` target layers (and one native MTP
+/// layer with `mtp`): exactly what `checkpoint_resident_bytes` packs, so a
+/// fixture's plan charges the serve-qwen4 resident inventory.
+pub fn qwen4_coordinator(config: &Value, mtp: bool) -> Vec<Tensor> {
+    use crate::families::qwen4::{resident::layer_projections, Qwen4Attention, Qwen4Config};
+    let cfg = Qwen4Config::from_hf(config).unwrap();
+    let h = cfg.hidden;
+    let mut out = vec![t("model.language_model.embed_tokens.weight", "BF16", &[cfg.vocab_size, h]),
+        t("lm_head.weight", "BF16", &[cfg.vocab_size, h])];
+    let layer = |out: &mut Vec<Tensor>, p: String, attention: Qwen4Attention| {
+        // Both selectable projections as one BF16 matrix each, at their packed shapes.
+        for projection in layer_projections(&cfg, attention, None) {
+            out.push(t(format!("{p}.self_attn.{}.weight", projection.operand), "BF16", &[projection.rows, projection.cols]));
+        }
+        let s = cfg.shared_intermediate;
+        out.extend([t(format!("{p}.mlp.shared_expert.gate_proj.weight"), "BF16", &[s, h]),
+            t(format!("{p}.mlp.shared_expert.up_proj.weight"), "BF16", &[s, h]),
+            t(format!("{p}.mlp.shared_expert_gate.weight"), "BF16", &[1, h]),
+            t(format!("{p}.mlp.shared_expert.down_proj.weight"), "BF16", &[h, s])]);
+    };
+    for l in 0..cfg.layers {
+        layer(&mut out, format!("model.language_model.layers.{l}"), cfg.attention[l]);
+    }
+    if mtp { layer(&mut out, "mtp.layers.0".into(), Qwen4Attention::Full); }
+    out
+}
+
+/// TP1 EXL3 capacity manifests for Qwen's routed geometry under `share/exl3`,
+/// as images bundle them beside PROGRAMS.json; returns that PROGRAMS.json.
+pub fn write_qwen4_exl3_capacities(dir: &Path, tiers: &str) -> std::path::PathBuf {
+    let share = dir.join("share");
+    for capacity in crate::placement::inventory::exl3_capacities(4096) {
+        let path = share.join("exl3").join(format!("exl3-qwen4-k{tiers}")).join(format!("rtx-tp1/m{capacity}"));
+        fs::create_dir_all(&path).unwrap();
+        fs::write(path.join("v41_exl3.json"), serde_json::to_vec(&json!({
+            "capacity": capacity, "hidden": 2560, "experts": 512, "intermediate": 640, "top_k": 10,
+            "input_format": "e4m3_k32", "trellis_lut": {"bytes": 32}, "buffers": {
+                "scratch": {"allocation": "scratch", "dtype": "f32", "bytes": capacity * 8, "zero_on_create": false}}
+        })).unwrap()).unwrap();
+    }
+    let programs = share.join("PROGRAMS.json");
+    fs::write(&programs, b"{}").unwrap();
+    programs
+}
+
 /// Every Qwen routed expert of every layer as complete EXL3 projections at
 /// `bits`, a BF16 router per layer, and the storage map.
 pub fn qwen4_exl3(layers: usize, bits: usize) -> (Vec<Tensor>, Value) {
@@ -580,10 +625,19 @@ pub fn write_v41_workspaces(dir: &Path) -> std::path::PathBuf {
             }
         }
     }
-    let variants = [(5120,1152),(1152,5120)].into_iter().flat_map(|(k,n)|
-        [1,16,80,256,1024,4096].map(|c| json!({"capacity":c,"input_dim":k,
-            "output_dim":n,"label":format!("shared_{k}_{n}_m{c}"),"scratch_bytes":c+1}))).collect::<Vec<_>>();
+    let matrices = [(5120,1152),(1152,5120),(5120,1280),(1280,32768),
+        (32768,8192),(8192,5120),(5120,2304),(2304,5120),(5120,512),
+        (1280,4096),(6144,25600),(15360,5120)];
+    let variants = matrices.into_iter().flat_map(|(k,n)|
+        [1,16,80,256,1024,4096].map(move |c| json!({"capacity":c,"input_dim":k,
+            "output_dim":n,"label":format!("matrix_{k}_{n}_m{c}"),"scratch_bytes":c+1,
+            "expected_m":if c<=80 {16}else{c},"split_k_slices":1,"all_rows":c<=80}))).collect::<Vec<_>>();
     fs::write(share.join("V41_FP8_AOT.json"), serde_json::to_vec(&json!({"variants":variants})).unwrap()).unwrap();
+    fs::write(share.join("V41_EXPERT_AOT.json"), serde_json::to_vec(&json!({
+        "role":"coordinator","input_format":"bf16","geometry":{"hidden":5120,
+            "intermediate":2304,"kernel_intermediate":2304,"experts":128,"topk":3},
+        "variants":([16,40,80,256].map(|c|json!({"capacity_rows":c,"core_scratch_nbytes":c*7})))
+    })).unwrap()).unwrap();
     programs
 }
 

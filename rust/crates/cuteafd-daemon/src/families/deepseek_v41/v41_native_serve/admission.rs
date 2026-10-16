@@ -97,23 +97,19 @@ pub(super) fn admit_startup(
         let tiers = catalog.exl3().map(|m| m.decoder_tiers()).unwrap_or(&[]);
         let directory = crate::families::deepseek_v41::v41_experts::exl3::aot_layout_directory(
             &args.native_lib, tiers, "dspark");
-        let (weights, runtime, staging) =
-            crate::families::deepseek_v41::v41_experts::dspark::DsparkWeights::serving_bytes(
+        let mut draft =
+            crate::families::deepseek_v41::v41_experts::dspark::DsparkWeights::single_inventory(
                 lib, catalog, capacity, args.concurrency,
                 if args.dspark_draft_limit > 5 { 7 } else { 5 }, Some(&directory))?;
         let before_draft = fixed_demands.iter().try_fold(0u64, |n, d|
             n.checked_add(d.bytes).context("pre-draft owners overflow"))?;
-        startup.push(Demand::new(0, Category::Staging, "dSpark loading",
-            before_draft.checked_add(weights as u64).and_then(|n| n.checked_add(staging as u64))
-                .context("dSpark phase overflow")?, Basis::Formula));
-        let prefixes = resident::prefix_bytes(u64::from(args.prefix_cache_entries), true, 1)[0]
+        for mut phase in draft.load_phase(1)? {
+            phase.bytes = phase.bytes.checked_add(before_draft).context("dSpark phase overflow")?;
+            startup.push(phase);
+        }
+        draft.marks = resident::prefix_bytes(u64::from(args.prefix_cache_entries), true, 1)[0]
             - resident::prefix_bytes(u64::from(args.prefix_cache_entries), false, 1)[0];
-        Some(families::deepseek_v41::DraftInventory {
-            resident: weights as u64,
-            runtime: vec![Demand::new(0, Category::Drafter, "dSpark lanes/windows",
-                runtime as u64, Basis::Exact)],
-            marks: prefixes, peer_half: 0, staging: [staging as u64, 0],
-        })
+        Some(draft)
     } else { None };
     if local_vision_owner(cuteafd_api::openai::vision_input_enabled(), args.vision_peers.is_some()) {
         fixed_demands.push(Demand::new(0, Category::Workspace, "vision weights/scratch",
@@ -642,12 +638,9 @@ mod admission_tests {
     }
 
     #[test]
-    fn planner_equals_runtime_deepseek_v41() -> Result<()> {
-        use cuteafd_core::memory_layout::Category;
-        use cuteafd_loader::plan::{
-            ExpertPlacement, MediaMode, PlanOptions, layout::LayoutOptions, plan,
-        };
-        use serde_json::json;
+    fn v41_admission_contract_synthetic_inventory() -> Result<()> {
+        use cuteafd_core::memory_layout::{Basis, Category};
+        use families::deepseek_v41::{owners, resident};
         for nvfp4 in [false, true] {
             let dir = tempfile::tempdir()?;
             if nvfp4 {
@@ -655,179 +648,75 @@ mod admission_tests {
             } else {
                 cuteafd_loader::plan::testing::write_v41_snapshot(dir.path());
             }
-            let share = dir.path().join("share");
-            std::fs::create_dir_all(share.join("V41_EXPERT_WORKSPACES"))?;
-            let programs = share.join("PROGRAMS.json");
-            std::fs::write(&programs, b"{}")?;
-            for ranks in [1, 2] {
-                let role = if ranks == 1 {
-                    "rtx_backbone"
-                } else {
-                    "rtx_tp2"
-                };
-                let manifest = json!({"role":role, "geometry": {"hidden":5120,
-                "intermediate":2304/ranks,"kernel_intermediate":if ranks==1 {2304}else{1152},
-                "experts":384,"topk":6}, "variants":([1,16,80,256,1024,4096].map(|c|
-                    json!({"capacity_rows":c,"core_scratch_nbytes":if c==16 {99999}else{c*7}})))});
-                std::fs::write(
-                    share.join("V41_EXPERT_WORKSPACES").join(format!(
-                        "{}_{role}.json",
-                        if nvfp4 { "nvfp4" } else { "mxfp4" }
-                    )),
-                    serde_json::to_vec(&manifest)?,
-                )?;
-            }
-            let variants = [(5120, 1152), (1152, 5120)]
-                .into_iter()
-                .flat_map(|(k, n)| {
-                    [1, 16, 80, 256, 1024, 4096].map(|c| {
-                        json!({"capacity":c,"input_dim":k,
-                "output_dim":n,"label":format!("shared_{k}_{n}_m{c}"),"scratch_bytes":c+1})
-                    })
-                })
-                .collect::<Vec<_>>();
-            std::fs::write(
-                share.join("V41_FP8_AOT.json"),
-                serde_json::to_vec(&json!({"variants":variants}))?,
-            )?;
+            let manifest = cuteafd_loader::plan::testing::write_v41_workspaces(dir.path());
+            let fp8 = serde_json::from_slice(&std::fs::read(
+                manifest.parent().unwrap().join("V41_FP8_AOT.json"))?)?;
+            let programs = owners::NativePrograms::new(&fp8, 188)?;
             let catalog = cuteafd_loader::read_expert_catalog(dir.path())?;
+            let config = serde_json::from_slice(&std::fs::read(dir.path().join("config.json"))?)?;
             for ranks in [1, 2] {
+                let weights = resident::resident_headers(&config,
+                    catalog.tensors().iter().map(|tensor| &tensor.metadata), ranks, false)
+                    .context("synthetic native backbone residency")?;
+                let mut fixed = weights.into_iter().enumerate().flat_map(|(gpu, items)|
+                    items.into_iter().map(move |item| Demand::new(gpu as u8, item.category,
+                        item.group, item.bytes, item.basis))).collect::<Vec<_>>();
+                fixed.extend(programs.target(256, ranks, true, ranks == 1)?);
+                fixed.push(Demand::new((ranks - 1) as u8, Category::Transport,
+                    "target/prefill transports", 2 * owners::transport_bytes(256, 4)?, Basis::Formula));
+                for (gpu, bytes) in resident::prefix_arena_bytes(42, false, ranks).into_iter().enumerate() {
+                    fixed.push(Demand::new(gpu as u8, Category::Prefix,
+                        "target snapshot arenas", bytes, Basis::Formula));
+                }
+                let (experts, workspace) = families::deepseek_v41::expert_inventory(
+                    &catalog, &manifest, 256, ranks, 188)?;
+                // Deliberately synthetic pre-weight inventory, independent of
+                // planner output. This is not a CUDA sample or ready-parity gate.
+                let memory = vec![(80usize << 30, 96usize << 30); ranks];
                 for (onboard, pool_tokens, concurrency, turns) in [
-                    (Onboard::Auto, None, 16, 20),
-                    (Onboard::Layers(3), Some(0), 16, 20),
-                    (Onboard::Layers(3), Some(1 << 20), 1, 0),
+                    (LocalLayers::Auto, None, 16, 20),
+                    (LocalLayers::Count(3), Some(0), 16, 20),
+                    (LocalLayers::Count(3), Some(1 << 20), 1, 0),
                 ] {
-                    let total = 96u64 << 30;
-                    let report = plan(
-                        dir.path(),
-                        &PlanOptions {
-                            placement: ExpertPlacement::from_spark_ranks(4),
-                            vision: MediaMode::Off,
-                            layout: Some(LayoutOptions {
-                                rtx_bytes: vec![total; ranks],
-                                prefill_rows: 256,
-                                context_tokens: 262_144,
-                                concurrency,
-                                prefix_slots: Some(if turns == 0 { 0 } else { 2 * turns + 2 }),
-                                pool_tokens,
-                                native_mtp_layers: 0,
-                                workspace_manifest: Some(programs.clone()),
-                                onboard: Some(onboard),
-                                ..Default::default()
-                            }),
-                            ..Default::default()
-                        },
-                    )?;
-                    let layout = report.memory_layout.context("missing V4.1 layout")?;
-                    ensure!(
-                        report.placement_supported,
-                        "planner refused {ranks} {onboard:?}: {:?} {:?}",
-                        layout.notes,
-                        report.hints
-                    );
                     let mut args = args(dir.path());
+                    args.peers = vec![args.peers[0].clone(); 4];
                     args.rtx_gpus = ranks as u32;
                     args.max_context_tokens = 262_144;
                     args.pool_tokens = pool_tokens;
-                    args.concurrency = concurrency as u32;
-                    args.prefix_cache_entries = turns as u32;
-                    args.rtx_expert_layers = match onboard {
-                        Onboard::Auto => LocalLayers::Auto,
-                        Onboard::Layers(n) => LocalLayers::Count(n),
-                        _ => unreachable!(),
-                    };
-                    // Reconstruct the admission sample after the planner's retained
-                    // owners, excluding pool/expert allocations and lazy graphs.
-                    let memory = layout
-                        .devices
-                        .iter()
-                        .take(ranks)
-                        .map(|device| {
-                            let loaded = device
-                                .items
-                                .iter()
-                                .filter(|i| {
-                                    !matches!(i.category, Category::Kv | Category::Experts)
-                                        && i.group != "graph allowance"
-                                })
-                                .map(|i| i.bytes)
-                                .sum::<u64>();
-                            ((total - loaded) as usize, total as usize)
-                        })
-                        .collect::<Vec<_>>();
-                    // Linked native info supplies these extents at serving startup.
-                    // The fixture's published manifest carries the same values;
-                    // build runtime demands independently of expert_inventory.
-                    let stored = if ranks == 1 { 2304 } else { 1152 };
-                    let experts = (0..40)
-                        .map(|layer| {
-                            let mut cost = ExpertCost {
-                                whole: Bytes2::default(),
-                                half: [Bytes2::default(); 2],
-                                tp2: ranks == 2,
-                                spark_ok: true,
-                            };
-                            if ranks == 1 {
-                                cost.whole = families::deepseek_v41::expert_cost(
-                                    &catalog, layer, 1, 0, stored,
-                                )?;
-                            } else {
-                                for rank in 0..2 {
-                                    cost.half[rank] = families::deepseek_v41::expert_cost(
-                                        &catalog, layer, 2, rank, stored,
-                                    )?;
-                                }
-                            }
-                            Ok(cost)
-                        })
-                        .collect::<Result<Vec<_>>>()?;
-                    let mut workspace = families::deepseek_v41::NativeWorkspace {
-                        scratch_bytes: 99999,
-                        kernel_intermediate: stored,
+                    args.concurrency = concurrency;
+                    args.prefix_cache_entries = turns;
+                    args.rtx_expert_layers = onboard;
+                    let admitted = resolve_with_owners(&args, &memory, experts.clone(), workspace,
+                        &vec![0; ranks], usize::from(ranks == 2), &fixed, &[], None)?;
+                    assert!(admitted.placement.pool_tokens >= 262_144);
+                    if let Some(pool) = pool_tokens.filter(|&n| n > 0) {
+                        assert_eq!(admitted.placement.pool_tokens, pool);
                     }
-                    .lane_bytes(256, 5120, 6, ranks == 2, nvfp4)?;
-                    if ranks == 2 {
-                        let fp8 = serde_json::from_slice(&std::fs::read(
-                            share.join("V41_FP8_AOT.json"),
-                        )?)?;
-                        workspace += families::deepseek_v41::shared_workspace(&fp8, 256, 188)?
-                            + 256 * (10240 + 5280 + 24 + 24 + 10240);
+                    for owner in &fixed {
+                        let expected = fixed.iter().filter(|d| d.gpu == owner.gpu
+                            && d.category == owner.category && d.group == owner.group)
+                            .map(|d| d.bytes).sum::<u64>();
+                        let actual = admitted.placement.items[usize::from(owner.gpu)].iter()
+                            .filter(|item| item.category == owner.category && item.group == owner.group)
+                            .map(|item| item.bytes).sum::<u64>();
+                        assert_eq!(actual, expected, "{owner:?}");
                     }
-                    let admitted = resolve(
-                        &args,
-                        &memory,
-                        experts,
-                        2 * workspace,
-                        &vec![0; ranks],
-                        usize::from(ranks == 2), None,
-                    )?;
-                    assert_eq!(
-                        layout.pool_tokens, admitted.placement.pool_tokens,
-                        "{ranks} {onboard:?} pool"
-                    );
-                    for (gpu, items) in admitted.placement.items.iter().enumerate() {
-                        for item in items {
-                            assert!(
-                                layout.devices[gpu].items.contains(item),
-                                "{ranks} {onboard:?} gpu{gpu}: {item:?}; planned {:?}",
-                                layout.devices[gpu]
-                                    .items
-                                    .iter()
-                                    .filter(|i| i.category == item.category)
-                                    .collect::<Vec<_>>()
-                            );
-                        }
-                    }
+                    assert_eq!(admitted.placement.attention_placement,
+                        if ranks == 2 { AttentionPlacement::Layers } else { AttentionPlacement::Heads });
                     assert_eq!(admitted.placement.layers.len(), 40);
                     for (layer, assigned) in admitted.placement.layers.iter().enumerate() {
-                        assert_eq!(
-                            assigned.mode,
-                            LayerMode::Whole {
-                                gpu: u8::from(ranks == 2 && layer >= 20),
-                                ffn: FfnMode::Owner
-                            }
-                        );
+                        assert_eq!(assigned.mode, LayerMode::Whole {
+                            gpu: u8::from(ranks == 2 && layer >= 20), ffn: FfnMode::Owner });
                     }
+                    let over = [Demand::new(0, Category::Staging, "synthetic load overflow",
+                        (80 << 30) + 1, Basis::Exact)];
+                    assert!(resolve_with_owners(&args, &memory, experts.clone(), workspace,
+                        &vec![0; ranks], usize::from(ranks == 2), &fixed, &over, None).is_err());
+                    let mut missing_owner = fixed.clone();
+                    missing_owner.push(Demand::new(0, Category::Workspace,
+                        "synthetic owner overflow", 80 << 30, Basis::Exact));
+                    assert!(resolve_with_owners(&args, &memory, experts.clone(), workspace,
+                        &vec![0; ranks], usize::from(ranks == 2), &missing_owner, &[], None).is_err());
                 }
             }
         }

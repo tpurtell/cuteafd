@@ -220,6 +220,45 @@ def test_usage_errors_exit_two_without_contact(harness, args):
 
 
 
+@pytest.mark.parametrize("tag,option,latest", [
+    ("v3.0.0-rc1", None, False),
+    ("v3.0.0-rc1", "--no-latest", False),
+    ("v3.0.0-RC1", None, False),
+    ("v3.0.0rc1", None, False),
+    ("v3.0.0", None, True),
+    ("v3.0.0", "--no-latest", False),
+])
+def test_latest_is_opt_in_for_release_candidates(harness, tag, option, latest):
+    run, docker_calls, _, _ = harness
+    result = run(tag, *([option] if option else []), config=V10_CONFIG)
+    assert result.returncode == 0, result.stdout + result.stderr
+    expected = {f"{COORDINATOR}:{tag}", f"{SPARK}:{tag}"}
+    if latest:
+        expected |= {f"{COORDINATOR}:latest", f"{SPARK}:latest"}
+    assert set(_pushed_refs(docker_calls())) == expected
+    assert set(_tagged_destinations(docker_calls())) == expected
+
+
+@pytest.mark.parametrize("tag", ["v3.0.0-rc1", "v3.0.0-RC1", "v3.0.0rc1"])
+def test_release_candidates_refuse_latest_before_contact(harness, tag):
+    run, docker_calls, ssh_calls, _ = harness
+    result = run(tag, "--latest", config=V10_CONFIG)
+    assert result.returncode == 2
+    assert "release-candidate tags cannot update latest" in result.stderr
+    assert docker_calls() == []
+    assert ssh_calls() == []
+
+
+@pytest.mark.parametrize("options", [("--latest", "--no-latest"), ("--no-latest", "--latest")])
+def test_conflicting_latest_options_fail_before_contact(harness, options):
+    run, docker_calls, ssh_calls, _ = harness
+    result = run(*options, "v3.0.0-rc1", config=V10_CONFIG)
+    assert result.returncode == 2
+    assert "conflict" in result.stderr
+    assert docker_calls() == []
+    assert ssh_calls() == []
+
+
 def test_options_may_precede_or_follow_the_tag(harness):
     run, docker_calls, _, _ = harness
     result = run("v10", "--config", str(V10_CONFIG))
