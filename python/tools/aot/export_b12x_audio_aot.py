@@ -8845,6 +8845,8 @@ def capture_rotary(snapshot, destination):
     qwen_sha = "34390fea7648b444d5727abef0b85acceba28f856aedec6c335d51253806bfee"
     ref.checked_source(qwen_source, qwen_sha)
     ns = ref.definitions(source, ["AudioTokenizerRotaryEmbedding"], {"torch": torch, "nn": nn}, "official snapshot")
+    # The checked pinned source above, not an installed distribution (the dev image ships none).
+    sys.path.insert(0, str(root / "third_party/transformers/src"))
     from transformers.models.qwen2.configuration_qwen2 import Qwen2Config
     from transformers.models.qwen2.modeling_qwen2 import Qwen2RotaryEmbedding
     cfg = json.loads((snapshot / "audio_tokenizer/config.json").read_text())

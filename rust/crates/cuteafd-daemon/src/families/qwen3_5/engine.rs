@@ -44,9 +44,10 @@ fn weight_demand(group: &str, bytes: u64, category: Category) -> Demand {
 impl<'a> DenseEngine<'a> {
     pub(crate) fn new(library: &'a NativeLibrary, programs: &'a Programs<'a>, checkpoint: &'a Checkpoint,
         cfg: Qwen35Config, requested_pool: Option<u64>) -> Result<Self> {
-        let admitted = DensePrograms::new(&cfg, programs)?;
         let reader = WeightReader { library, checkpoint };
-        let weight_bytes = reader.dense_bf16_bytes(&cfg, admitted.norm_dtype.clone())?;
+        let format = super::weights::DenseFormat::detect(&reader)?;
+        let admitted = DensePrograms::new(&cfg, programs, format)?;
+        let weight_bytes = reader.dense_bytes(&cfg, admitted.norm_dtype.clone(), format)?;
         programs.load_matching(|name| name.starts_with(&format!("{}_", admitted.prefix)))?;
         let device = Device { library, id: library.cuda_get_device()? };
         let stream = Stream::new(device)?;
@@ -89,7 +90,7 @@ impl<'a> DenseEngine<'a> {
         let tensor = reader.tensor(&format!("{PREFIX}embed_tokens.weight"))?;
         let source = EmbedSource::new(&checkpoint.snapshot, &tensor.shard, &tensor.meta, cfg.hidden)?;
         let (embedding, weights) = TokenEmbedding::load(library, source, EmbedPlacement::Gpu,
-            || reader.dense_bf16(&cfg, admitted.norm_dtype.clone()))?;
+            || reader.dense_native(&cfg, admitted.norm_dtype.clone(), format))?;
         let mut allocated = sizes.into_iter().map(|bytes| Allocation::new(device, alloc_bytes(bytes)))
             .collect::<Result<Vec<_>>>()?;
         let buffers: Vec<_> = allocated.iter().map(|allocation| allocation.buffer).collect();
