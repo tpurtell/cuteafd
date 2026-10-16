@@ -36,7 +36,7 @@ fn fixture(kind: &str) -> (Value, Vec<FixtureTensor>) {
     (config,tensors)
 }
 
-fn snapshot(kind: &str) -> tempfile::TempDir {
+pub(super) fn snapshot(kind: &str) -> tempfile::TempDir {
     let dir = tempfile::tempdir().unwrap();
     let (config,tensors) = fixture(kind);
     testing::write_snapshot(dir.path(), &config, &tensors, None);

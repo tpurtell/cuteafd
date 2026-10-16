@@ -5,6 +5,7 @@ use super::projection::{MimoProjectionLayout, MimoProjectionRepresentation};
 use super::{FusedQkvLayout, MimoAttention, MimoV2Config};
 use crate::plan::checkpoint::{Checkpoint, CheckpointTensor};
 use crate::serving_capacity::CacheGeometryError;
+use crate::formats::native_dense::tensor;
 use cuteafd_core::{serving_capacity::MemoryReservation, DType};
 use std::collections::BTreeMap;
 
@@ -37,54 +38,6 @@ fn mul(label: &'static str, dims: &[u64]) -> Result<u64, CacheGeometryError> {
         .ok_or(CacheGeometryError::Overflow(label))
 }
 
-fn tensor<'a>(
-    checkpoint: &'a Checkpoint,
-    name: &str,
-    shape: &[usize],
-    dtypes: &[DType],
-) -> Result<&'a CheckpointTensor, CacheGeometryError> {
-    let at = checkpoint
-        .tensors
-        .binary_search_by(|t| t.meta.name.as_str().cmp(name))
-        .map_err(|_| CacheGeometryError::ResidentTensor {
-            name: name.into(),
-            what: "missing from checkpoint headers".into(),
-        })?;
-    let t = &checkpoint.tensors[at];
-    if t.meta.shape != shape || !dtypes.contains(&t.meta.dtype) {
-        return Err(CacheGeometryError::ResidentTensor {
-            name: name.into(),
-            what: format!(
-                "expected {dtypes:?} {shape:?}, found {:?} {:?}",
-                t.meta.dtype, t.meta.shape
-            ),
-        });
-    }
-    let element_bytes = match t.meta.dtype {
-        DType::Bf16 => 2,
-        DType::F32 => 4,
-        DType::F8E4M3 => 1,
-        _ => {
-            return Err(CacheGeometryError::ResidentTensor {
-                name: name.into(),
-                what: "resident size requires BF16, FP32 or E4M3".into(),
-            })
-        }
-    };
-    let expected = shape
-        .iter()
-        .try_fold(element_bytes, |bytes: u64, &dim| {
-            bytes.checked_mul(dim as u64)
-        })
-        .ok_or(CacheGeometryError::Overflow("MiMo source tensor extent"))?;
-    if t.meta.byte_length != expected {
-        return Err(CacheGeometryError::ResidentTensor {
-            name: name.into(),
-            what: format!("expected {expected} bytes, found {}", t.meta.byte_length),
-        });
-    }
-    Ok(t)
-}
 
 fn push(costs: &mut Vec<MemoryReservation>, name: impl Into<String>, bytes: u64) {
     costs.push(MemoryReservation {
