@@ -106,7 +106,11 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
     config.topology = crate::shared::spark_topology::for_checkpoint(
         config.topology, config.world, v41 && catalog.exl3().is_some());
     let geometry = catalog.routed_experts().geometry()?;
-    config.bf16_ingress |= inventory.spark_input_is_bf16();
+    config.bf16_ingress |= inventory.spark_input_is_bf16()
+        || catalog.fp8().is_some_and(|tensors| (tensors.shape().first_layer..tensors.shape().layers)
+            .any(|layer| tensors.layer_format(layer).is_ok_and(|format| matches!(format,
+                cuteafd_loader::formats::fp8_experts::ExpertFormat::Bf16
+                    | cuteafd_loader::formats::fp8_experts::ExpertFormat::Nvfp4))));
     config.native_spark_tp2 = config.world == 2 && geometry.family() == Some("dsv4f")
         && catalog.exl3().is_none() && catalog.nvfp4().is_none() && catalog.fp8().is_none();
     cuteafd_core::set_expert_geometry(geometry).map_err(|fixed| {

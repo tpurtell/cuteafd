@@ -237,3 +237,60 @@ fn unknown_tensor_and_context_ownership_fail_closed() {
     assert!(!r.placement_supported);
     assert!(r.hints.iter().any(|h|h.what.contains("context/layer ownership")));
 }
+
+#[test]
+fn routed_catalog_preserves_native_formats_activation_and_target_bounds() {
+    use crate::formats::fp8_experts::{ExpertFormat, Fp8Projection};
+    for kind in ["fp8", "nvfp4", "bf16"] {
+        let dir = snapshot(kind);
+        let mut catalog = crate::read_expert_catalog(dir.path()).unwrap();
+        let tensors = catalog.fp8().unwrap();
+        assert_eq!(catalog.routed_experts().first_layer, 3);
+        assert_eq!(catalog.routed_experts().layers, 91);
+        assert_eq!(catalog.routed_experts().draft_stages, 0);
+        assert!(!tensors.has_layer(91) && !tensors.has_layer(92));
+        assert_eq!(tensors.layer_format(3).unwrap(), match kind {
+            "fp8" => ExpertFormat::Fp8Block128, "nvfp4" => ExpertFormat::Nvfp4, _ => ExpertFormat::Bf16 });
+        for layer in [88,89,90] {
+            let tail = tensors.for_layer(layer).unwrap();
+            assert_eq!(tail.format(), ExpertFormat::Bf16);
+            assert_eq!(tail.slice_bytes(Fp8Projection::Gate,6).unwrap(), (256*4096*2,0));
+            assert_eq!(tail.activation(layer), Some(FfnActivation::SiluPostClampFp32Product { limit: 7.0 }));
+        }
+        catalog.select_draft(crate::plan::spec::DraftOwnership::None).unwrap();
+    }
+}
+
+#[test]
+fn official_nvfp4_layer30_headers_keep_router_and_stacked_parameters_distinct() {
+    use crate::formats::fp8_experts::{ExpertFormat, Fp8ExpertTensors};
+    use crate::families::deepseek_v41::v41_catalog::RoutedExpertShape;
+    use crate::plan::checkpoint::ModuleNumerics;
+    let source: Value = serde_json::from_str(include_str!("fixtures/official-nvfp4-layer30.json")).unwrap();
+    let config: Value = serde_json::from_str(include_str!("fixtures/official-nvfp4-config.json")).unwrap();
+    let tensors: Vec<_> = source["tensors"].as_object().unwrap().iter().map(|(name, meta)| {
+        let dtype = match meta["dtype"].as_str().unwrap() {
+            "U8" => "U8", "BF16" => "BF16", "F8_E4M3" => "F8_E4M3", "F32" => "F32", other => panic!("{other}")
+        };
+        testing::t(name, dtype, &meta["shape"].as_array().unwrap().iter().map(|x| x.as_u64().unwrap() as usize).collect::<Vec<_>>())
+    }).collect();
+    let dir = tempfile::tempdir().unwrap();
+    testing::write_snapshot(dir.path(), &config, &tensors, None);
+    let shape = RoutedExpertShape { layers:91, first_layer:30, experts:352, topk:8,
+        hidden:4096, intermediate:1536, draft_stages:0, draft_experts:0 };
+    let selected = [30].into_iter().collect();
+    let catalog = Fp8ExpertTensors::read_layers(dir.path(), shape, &selected).unwrap();
+    assert_eq!(catalog.format(), ExpertFormat::Nvfp4);
+    let cp = Checkpoint::open(dir.path()).unwrap();
+    assert_eq!(cp.module_numerics("model.layers.30.moe.gate").unwrap(), ModuleNumerics::CheckpointPrecision);
+    assert_eq!(cp.module_numerics("model.layers.30.moe.gate_proj").unwrap(), ModuleNumerics::W4A4);
+    // Genuine owner exclusions still reject contradictory packed headers.
+    let mut excluded = config.clone();
+    excluded["quantization_config"]["ignore"] = serde_json::json!(["*layers.30.moe"]);
+    std::fs::write(dir.path().join("config.json"), serde_json::to_vec(&excluded).unwrap()).unwrap();
+    assert!(Fp8ExpertTensors::read_layers(dir.path(), shape, &selected).unwrap_err().to_string().contains("declared CheckpointPrecision"));
+    // A missing companion must not be reinterpreted as checkpoint precision.
+    let partial: Vec<_> = tensors.into_iter().filter(|(name, ..)| name != "model.layers.30.moe.gate_proj.input_scale").collect();
+    testing::write_snapshot(dir.path(), &config, &partial, None);
+    assert!(Fp8ExpertTensors::read_layers(dir.path(), shape, &selected).unwrap_err().to_string().contains("input_scale"));
+}

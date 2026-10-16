@@ -1,0 +1,159 @@
+{
+  "revision": "bc246cc2848e17b37f377eda8fd825c5b3018d1f",
+  "shard": "model-layer-030.safetensors",
+  "tensors": {
+    "model.layers.30.moe.down_proj.input_scale": {
+      "dtype": "F32",
+      "shape": [
+        352
+      ],
+      "data_offsets": [
+        16384,
+        17792
+      ]
+    },
+    "model.layers.30.moe.down_proj.weight_scale_2": {
+      "dtype": "F32",
+      "shape": [
+        352
+      ],
+      "data_offsets": [
+        17792,
+        19200
+      ]
+    },
+    "model.layers.30.moe.gate_proj.input_scale": {
+      "dtype": "F32",
+      "shape": [
+        352
+      ],
+      "data_offsets": [
+        19200,
+        20608
+      ]
+    },
+    "model.layers.30.moe.gate_proj.weight_scale_2": {
+      "dtype": "F32",
+      "shape": [
+        352
+      ],
+      "data_offsets": [
+        20608,
+        22016
+      ]
+    },
+    "model.layers.30.moe.router_bias": {
+      "dtype": "F32",
+      "shape": [
+        352
+      ],
+      "data_offsets": [
+        22016,
+        23424
+      ]
+    },
+    "model.layers.30.moe.up_proj.input_scale": {
+      "dtype": "F32",
+      "shape": [
+        352
+      ],
+      "data_offsets": [
+        23424,
+        24832
+      ]
+    },
+    "model.layers.30.moe.up_proj.weight_scale_2": {
+      "dtype": "F32",
+      "shape": [
+        352
+      ],
+      "data_offsets": [
+        24832,
+        26240
+      ]
+    },
+    "model.layers.30.moe.gate.weight": {
+      "dtype": "BF16",
+      "shape": [
+        352,
+        4096
+      ],
+      "data_offsets": [
+        44160,
+        2927744
+      ]
+    },
+    "model.layers.30.moe.down_proj.weight_scale": {
+      "dtype": "F8_E4M3",
+      "shape": [
+        352,
+        4096,
+        96
+      ],
+      "data_offsets": [
+        255110272,
+        393522304
+      ]
+    },
+    "model.layers.30.moe.gate_proj.weight_scale": {
+      "dtype": "F8_E4M3",
+      "shape": [
+        352,
+        1536,
+        256
+      ],
+      "data_offsets": [
+        393522304,
+        531934336
+      ]
+    },
+    "model.layers.30.moe.up_proj.weight_scale": {
+      "dtype": "F8_E4M3",
+      "shape": [
+        352,
+        1536,
+        256
+      ],
+      "data_offsets": [
+        531934336,
+        670346368
+      ]
+    },
+    "model.layers.30.moe.down_proj.weight": {
+      "dtype": "U8",
+      "shape": [
+        352,
+        4096,
+        768
+      ],
+      "data_offsets": [
+        670346368,
+        1777642624
+      ]
+    },
+    "model.layers.30.moe.gate_proj.weight": {
+      "dtype": "U8",
+      "shape": [
+        352,
+        1536,
+        2048
+      ],
+      "data_offsets": [
+        1777642624,
+        2884938880
+      ]
+    },
+    "model.layers.30.moe.up_proj.weight": {
+      "dtype": "U8",
+      "shape": [
+        352,
+        1536,
+        2048
+      ],
+      "data_offsets": [
+        2884938880,
+        3992235136
+      ]
+    }
+  }
+}

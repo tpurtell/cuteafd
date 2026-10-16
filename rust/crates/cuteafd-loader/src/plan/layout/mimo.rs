@@ -267,6 +267,7 @@ fn expert_costs(input: &super::super::PlanInput, cfg: &MimoV2Config,
             let expected_weights = match tensors.format() {
                 crate::formats::fp8_experts::ExpertFormat::Fp8Block128 => "fp8",
                 crate::formats::fp8_experts::ExpertFormat::Mxfp4 => "mxfp4",
+                crate::formats::fp8_experts::ExpertFormat::Bf16 => "bf16",
                 crate::formats::fp8_experts::ExpertFormat::Nvfp4 => "nvfp4",
             };
             anyhow::ensure!(info["input"] == "bf16" && info["tp"].as_u64() == Some(ranks as u64)
