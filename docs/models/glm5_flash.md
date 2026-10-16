@@ -22,7 +22,11 @@ The earlier three sessions are superseded for default selection: they ran
 with GPU persistence off and the powersave CPU governor. The new set uses
 persistence on, the performance governor and a quiet host. These conditions
 matter to Context's per-layer peer-exchange latency, so the two sets are not
-pooled. Two further quiet sessions are pending after the first quiet pair.
+pooled. The clean three-session median paired C1 ratio is **0.778**
+(Layers / Context), a 22.2% loss: **Context stays the GLM Flash default**.
+The spread matters: one session favored Layers (1.094), while the other
+two favored Context (0.778 and 0.764). No additional session is needed
+under the agreed greater-than-10% C1-loss stop bar.
 
 All sessions compare Context (`d8700da1`) with explicit Layers (`153bbd69`)
 on two RTX PRO 6000 cards, EXL3 K3.25, DFlash2, a 2,097,152-token pool and
@@ -34,6 +38,8 @@ emitted tokens/s, Context -> Layers; post-load C1 follows the sweep.
 | Quiet session | Warmed C1 | Layers / Context | Warmed C8 | Warmed C16 | Post-load C1 |
 | --- | ---: | ---: | ---: | ---: | ---: |
 | 1 | 239.031 -> 182.655 | 0.764 | 554.177 -> 440.396 | 730.503 -> 635.618 | 227.039 -> 164.460 |
+| 2 | 186.914 -> 204.519 | 1.094 | 542.529 -> 497.375 | 726.788 -> 730.267 | 179.181 -> 218.895 |
+| 3 | 198.999 -> 154.785 | 0.778 | 529.822 -> 532.282 | 728.194 -> 756.751 | 183.348 -> 187.381 |
 
 Superseded history (not inputs to the new decision):
 
@@ -69,7 +75,10 @@ serving conditions, not normalized away. Layers naturally gives GPU1 six
 whole MLA layers (3, 11, 19, 27, 35, 43) versus five on GPU0 (7, 15, 23,
 31, 39); KDA and expert FFNs remain split. The larger MLA share on the
 thermally constrained GPU1 plausibly contributes to its throughput deficit.
-No fixed-cap or alternate-owner experiment was run.
+No fixed-cap or alternate-owner experiment was run. Quiet sessions 2/3
+show no GPU1 software-cap samples in their timed windows, including the
+session where Layers won C1; the quiet-1 thermal observation is not proof
+that caps explain all of the session spread.
 
 Each GPU cell below is mean draw W / software-power-cap samples / mean,max
 temperature C. Cap counts are samples, not seconds. Telemetry is sampled
@@ -83,20 +92,39 @@ at about 1 Hz, so short C1 windows have few samples.
 | 1 / Layers / C8 | 440.396 | 334.5 / 0/6 / 57.5,61 | 250.2 / 4/6 / 57.2,59 |
 | 1 / Context / C16 | 730.503 | 448.5 / 1/6 / 61.2,63 | 437.3 / 0/6 / 65.5,68 |
 | 1 / Layers / C16 | 635.618 | 391.5 / 0/7 / 62.7,65 | 290.4 / 6/7 / 61.7,63 |
+| 2 / Context / C1 | 186.914 | 370.4 / 0/2 / 52.5,56 | 303.8 / 0/2 / 55.5,59 |
+| 2 / Context / C8 | 542.529 | 414.2 / 2/4 / 58,59 | 405.4 / 0/4 / 61.3,64 |
+| 2 / Context / C16 | 726.788 | 404.6 / 2/6 / 60.8,63 | 395.6 / 0/6 / 66.3,69 |
+| 2 / Context / post C1 | 179.181 | 269.9 / 0/2 / 57.5,61 | 272.7 / 0/2 / 62,66 |
+| 2 / Layers / C1 | 204.519 | 385.6 / 0/2 / 55.5,56 | 316.7 / 0/2 / 56,60 |
+| 2 / Layers / C8 | 497.375 | 428.2 / 0/4 / 59,60 | 402.6 / 0/4 / 62,65 |
+| 2 / Layers / C16 | 730.267 | 407.6 / 1/6 / 61.5,64 | 402.6 / 0/6 / 65.5,68 |
+| 2 / Layers / post C1 | 218.895 | 263.9 / 0/2 / 57.5,61 | 264.2 / 0/2 / 62,66 |
+| 3 / Layers / C1 | 154.785 | 288.8 / 0/2 / 52.5,56 | 274.8 / 0/2 / 56,60 |
+| 3 / Layers / C8 | 532.282 | 422.2 / 0/4 / 59.5,62 | 409.2 / 0/4 / 63.5,66 |
+| 3 / Layers / C16 | 756.751 | 412.5 / 1/6 / 62.3,65 | 391.1 / 0/6 / 66.8,70 |
+| 3 / Layers / post C1 | 187.381 | 314.0 / 0/3 / 60.3,63 | 307.5 / 0/3 / 64,67 |
+| 3 / Context / C1 | 198.999 | 317.7 / 0/2 / 54,58 | 291.4 / 0/2 / 57.5,59 |
+| 3 / Context / C8 | 529.822 | 383.2 / 1/4 / 59.5,62 | 388.2 / 0/4 / 65,67 |
+| 3 / Context / C16 | 728.194 | 445.2 / 1/6 / 63.8,65 | 436.9 / 0/6 / 68,70 |
+| 3 / Context / post C1 | 183.348 | 322.1 / 0/3 / 62,64 | 317.2 / 0/3 / 67.3,68 |
 
-**Decision versus configuration:** Context remains the default while the
-clean three-session set completes. The mixed 50%-RTX/four-Spark comparison
-is blocked by a P7 Context prefill panic, fixed separately in
-[#350](https://github.com/tpurtell/cuteafd/pull/350). Layers alone passed
-its mixed full-panel run at 2M; no paired speed ratio is claimed. Any
-per-layout default change would be a separate PR after complete evidence.
+**Decision versus configuration:** D-GLMF is closed as Context stays
+default; Layers remains explicit and non-default. The mixed
+50%-RTX/four-Spark comparison still needs qualification on the landed
+P7 Context prefill fix, [#350](https://github.com/tpurtell/cuteafd/pull/350)
+(`b4b8a54d`) and subsequent integration changes. Layers alone passed its
+original mixed full-panel run at 2M; no paired speed ratio is claimed.
+Any per-layout default change would be a separate PR after complete evidence.
 The mixed card uses `RTX_EXPERT_LAYERS=21`: this checkpoint's backbone has
 45 layers, the first three dense, leaving 42 routed expert layers (3..44).
 The separate nextn layer 45 is not part of that backbone count.
 
 Reproduction/results: `p7-whole-run2` (session 1),
 `p7-dglmf-nospark2` (historical sessions 2/3),
-`p7-dglmf-nospark-clean` (quiet session 1), and `p7-context-parity2` under
+`p7-dglmf-nospark-clean` (quiet session 1),
+`p7-dglmf-nospark-quiet2-clean` (quiet sessions 2/3, all four jobs passed),
+and `p7-context-parity2` under
 `~/.cache/cuteafd/builds/`; commands and sealed revisions are recorded in
 [#287](https://github.com/tpurtell/cuteafd/pull/287). No default or performance
 claim is extended to unmeasured checkpoints or layouts.
