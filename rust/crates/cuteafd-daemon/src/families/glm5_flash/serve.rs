@@ -694,7 +694,6 @@ fn prefix_cache<'e, 'a>(engine: &'e GlmfEngine<'a>, args: &PrefixArgs, (marks, a
     let family = GlmfPrefix::new(engine, marks, |mark| arena.slots(mark))?;
     anyhow::ensure!(family.slots() == engine.mark_slots, "the prefix mark arena holds {} marks of {} B, the KV \
         admission reserved {}", family.slots(), family.mark_bytes(), engine.mark_slots);
-    let template = engine.paged_buffers().first().map(|b| b.records).context("GLM 5.3 Flash has no MLA layer")?;
     // The pinned host tier copies through one GPU's copy engine; a head split keeps its pages
     // and marks on both GPUs, so it keeps device-resident snapshots only.
     let host = if engine.ranks() > 1 {
@@ -703,6 +702,7 @@ fn prefix_cache<'e, 'a>(engine: &'e GlmfEngine<'a>, args: &PrefixArgs, (marks, a
         }
         None
     } else {
+        let template = engine.paged_buffers().first().map(|b| b.records).context("GLM 5.3 Flash has no MLA layer")?;
         args.host_tier(engine.library, template, family.layout(), engine.max_context)?
     };
     let host_bytes = host.as_ref().map_or(0, |(config, _)| config.bytes);

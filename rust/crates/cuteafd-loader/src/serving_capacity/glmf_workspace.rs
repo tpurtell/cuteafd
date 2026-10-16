@@ -427,6 +427,34 @@ mod tests {
     }
 
     #[test]
+    fn whole_dsa_with_split_ffn_keeps_full_attention_workspace_on_each_owner() {
+        use crate::placement::{FfnMode, LayerMode};
+        let cfg = glm53_flash();
+        for owner in 0..2 {
+            let mode = LayerMode::Whole { gpu: owner, ffn: FfnMode::Split };
+            // Whole attention does not turn off split-FFN storage. The shared
+            // arena conservatively covers full and split programs on both ranks.
+            let options = GlmfScratchOptions { split: matches!(mode,
+                LayerMode::Whole { ffn: FfnMode::Split, .. }), ..Default::default() };
+            for (rows, decode, cap) in [(64, true, "m64"), (128, true, "m128"), (4096, false, "m4096")] {
+                let full = format!("glmf_mla_producer_{cap}");
+                let partial = format!("glmf2_mla_producer_{cap}");
+                let lookup = |name: &str| Some(if name == full { 900_000_000 }
+                    else if name == partial { 450_000_000 } else { 0 });
+                let scratch = glmf_step_scratch(lookup, &cfg, options, rows, decode).unwrap();
+                assert_eq!(scratch.programs, 900_000_000);
+                for rank in 0..2 {
+                    let shape = GlmfStepShape { lead: rank == 0, split: true, ..spark_shape() };
+                    let temps = glmf_temporary_bytes(&cfg, rows, decode, &shape, scratch);
+                    let expected = rows * cfg.heads as u64 * cfg.kv_lora_rank as u64 * 2;
+                    assert_eq!((temps.query, temps.latent, temps.scratch), (expected, expected, 900_000_000));
+                    assert!(glmf_lane_bytes(&cfg, rows, decode, &shape).sum.is_some());
+                }
+            }
+        }
+    }
+
+    #[test]
     fn the_scratch_selection_takes_the_largest_program_of_each_step_shape() {
         let cfg = glm53_flash();
         // mhc_pre's prefill-capacity scratch is the largest a decode step launches.

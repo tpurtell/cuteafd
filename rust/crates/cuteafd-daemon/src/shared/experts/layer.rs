@@ -497,7 +497,7 @@ impl<'a> ExpertWeights<'a> {
     pub(crate) fn load_tp2_pair(
         devices: [crate::shared::memory::device::Device<'a>; 2],
         catalog: &OfficialV41Catalog,
-        layers: std::ops::Range<usize>,
+        layers: &[usize],
         available: [usize; 2],
     ) -> Result<[crate::shared::memory::device::DeviceOwner<'a, Vec<Self>>; 2]> {
         use super::paired_load::{self, Projection, Fences};
@@ -508,7 +508,7 @@ impl<'a> ExpertWeights<'a> {
         let mut pinned_admitted = 0;
         let mut full_bytes = 0;
         let mut remaining = available;
-        for layer in layers.clone() {
+        for &layer in layers {
             let full = catalog.expert_staging(V41ExpertSelection::BackboneFull { layer, expert: 0 })?;
             full_bytes = full_bytes.max(full.staging_bytes());
             let mut pinned = 0;
@@ -537,7 +537,7 @@ impl<'a> ExpertWeights<'a> {
         let streams = paired_load::streams(devices)?;
         let allocation_seconds = started.elapsed().as_secs_f64();
         let mut group = 0;
-        for (index, layer) in layers.enumerate() {
+        for (index, &layer) in layers.iter().enumerate() {
             let layer_started = std::time::Instant::now();
             let experts = weights[0][index].experts;
             let mut storage_bytes_read = 0;

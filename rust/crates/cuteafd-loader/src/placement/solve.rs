@@ -349,11 +349,12 @@ fn solve_once(request: &PlacementRequest, flips: &[(AttentionClass, AttentionPla
                     trial.pool.floor = pool_floor;
                     solve_once(&trial, flips, frozen).is_ok()
                 };
-                if !fallback { return Err(match request.pool.requested {
-                    Some(requested) => PlacementError::PoolDoesNotFit { requested, fit: 0 },
-                    None => PlacementError::Mandatory { gpu: 0,
-                        what: format!("a {floor}-token pool beside {}", describe(&selected_fixed, 0, &movables)) },
-                }); }
+                if !fallback {
+                    let mut trial = request.clone();
+                    trial.onboard = Onboard::Layers(0);
+                    trial.pool.floor = floor;
+                    return solve_once(&trial, flips, frozen);
+                }
                 let mut trial = request.clone();
                 trial.onboard = Onboard::Layers(0);
                 trial.pool.floor = pool_floor;
@@ -371,11 +372,12 @@ fn solve_once(request: &PlacementRequest, flips: &[(AttentionClass, AttentionPla
         return Err(PlacementError::Inventory("invalid mandatory expert prefix"));
     }
     let experts_first = matches!(request.onboard, Onboard::ExpertsFirst { .. });
-    let (units, ranges, homes, tp2_range) = match fixed_layers {
+    let (units, ranges, homes, tp2_range, limits) = match fixed_layers {
         // Pool first: reserve the target, then fill each GPU's arena in order.
         None => {
-            let fit = if request.minimum_expert_layers == 0 {
-                pool_fit(request, &available, &used, &arenas, &unit_bytes)
+            let (fit, limits) = if request.minimum_expert_layers == 0 {
+                (pool_fit(request, &available, &used, &arenas, &unit_bytes),
+                    pool_limits(request, &available, &used, &arenas, &unit_bytes))
             } else {
                 let count = request.minimum_expert_layers;
                 let end = nth_moe_end(request, first_moe, count);
@@ -394,24 +396,29 @@ fn solve_once(request: &PlacementRequest, flips: &[(AttentionClass, AttentionPla
                     most = most.max(placed);
                     if next >= end && placed >= count {
                         let fit = pool_fit(request, &available, &used, &mandatory, &unit_bytes);
-                        best = Some(best.map_or(fit, |prior: u64| prior.max(fit)));
+                        if best.as_ref().is_none_or(|(prior, _)| fit > *prior) {
+                            best = Some((fit, pool_limits(request, &available, &used, &mandatory, &unit_bytes)));
+                        }
                     }
                 }
                 best.ok_or(PlacementError::ExpertLayers { requested: count, placed: most })?
             };
-            let units = pool_units(request, if context { fit / 2 * 2 } else { fit })?;
-            let used = with_pool(request, &used, &unit_bytes, units)?;
+            let units = pool_units(request, if context { fit / 2 * 2 } else { fit }, &limits)?;
+            let pool_used = with_pool(request, &used, &unit_bytes, units)?;
             let caps = [if request.expert_gpus > 0 { usize::MAX } else { 0 }, if request.expert_gpus > 1 { usize::MAX } else { 0 }];
-            let (ranges, homes, _, tp2_range) = place_experts(request, &available, &used, &mut arenas, first_moe,
+            let (ranges, homes, _, tp2_range) = place_experts(request, &available, &pool_used, &mut arenas, first_moe,
                 request.layers.len(), &caps)?;
-            (units, ranges, homes, tp2_range)
+            // Successful diagnostics describe installed experts, not the larger
+            // pre-onboarding capacity used to choose the pool-first reservation.
+            let limits = pool_limits(request, &available, &used, &arenas, &unit_bytes);
+            (units, ranges, homes, tp2_range, limits)
         }
         // Fixed onboard: exactly `n` routed layers (the contiguous prefix the
         // executors run), split over the GPUs where the pool is largest; the
         // pool is the output.
         Some(n) => {
             let end = nth_moe_end(request, first_moe, n);
-            let mut best: Option<(u64, Vec<ExpertRange>, Vec<ExpertHome>, Option<Tp2Range>)> = None;
+            let mut best: Option<(u64, Vec<ExpertRange>, Vec<ExpertHome>, Option<Tp2Range>, PoolLimits)> = None;
             let splits: Vec<usize> = if tp2 || gpus == 1 || request.expert_gpus < 2 { vec![n] } else { (0..=n).rev().collect() };
             let mut most = 0;
             for on_first in splits {
@@ -422,15 +429,17 @@ fn solve_once(request: &PlacementRequest, flips: &[(AttentionClass, AttentionPla
                 most = most.max(placed);
                 if next < end || placed < n { continue; }
                 let fit = pool_fit(request, &available, &used, &trial, &unit_bytes);
-                if best.as_ref().is_none_or(|(units, ..)| fit > *units) { best = Some((fit, ranges, homes, tp2_range)); }
+                if best.as_ref().is_none_or(|(units, ..)| fit > *units) {
+                    best = Some((fit, ranges, homes, tp2_range,
+                        pool_limits(request, &available, &used, &trial, &unit_bytes)));
+                }
             }
-            let Some((fit, ranges, homes, tp2_range)) = best else {
+            let Some((fit, ranges, homes, tp2_range, limits)) = best else {
                 return Err(if spark_free { PlacementError::SparkFree { layers: routed, placed: most } }
                     else { PlacementError::ExpertLayers { requested: n, placed: most } });
             };
             let units = match request.pool.requested {
-                Some(requested) => pool_units(request, fit).map_err(|_| PlacementError::PoolDoesNotFit { requested,
-                    fit: fit.saturating_mul(request.pool.unit_rows) })?,
+                Some(_) => pool_units(request, fit, &limits)?,
                 // Experts first keeps v2's automatic ceiling: the target.
                 None if experts_first => fit.min(request.pool.wanted_units()),
                 None => fit.min(request.pool.ceiling_units()),
@@ -438,9 +447,9 @@ fn solve_once(request: &PlacementRequest, flips: &[(AttentionClass, AttentionPla
             let tokens = units.saturating_mul(request.pool.unit_rows);
             if tokens < request.pool.floor {
                 return Err(PlacementError::BelowFloor { pool: tokens, floor: request.pool.floor, layers: n,
-                    short: request.pool.floor - tokens });
+                    short: request.pool.floor - tokens, limits });
             }
-            (units, ranges, homes, tp2_range)
+            (units, ranges, homes, tp2_range, limits)
         }
     };
     if units == 0 {
@@ -455,7 +464,7 @@ fn solve_once(request: &PlacementRequest, flips: &[(AttentionClass, AttentionPla
     if context && (units == 0 || units.saturating_mul(request.pool.unit_rows) < request.pool.floor) {
         let pool = units.saturating_mul(request.pool.unit_rows);
         return Err(PlacementError::BelowFloor { pool, floor: request.pool.floor, layers: 0,
-            short: request.pool.floor.saturating_sub(pool) });
+            short: request.pool.floor.saturating_sub(pool), limits });
     }
     let onboard_layers = homes.iter().filter(|h| matches!(h, ExpertHome::RtxWhole { .. } | ExpertHome::RtxTp2)).count();
 
@@ -489,6 +498,7 @@ fn solve_once(request: &PlacementRequest, flips: &[(AttentionClass, AttentionPla
         .map(|(layer, home)| if layer.experts.is_none() { ExpertHome::Dense } else { home }).collect::<Vec<_>>();
     Ok(Placement {
         pool_tokens,
+        pool_limits: limits,
         attention_placement: if context { AttentionPlacement::Context }
             else if request.layers.iter().any(&layer_selected) {
                 AttentionPlacement::Layers
@@ -706,12 +716,13 @@ fn conditional_movable(request: &PlacementRequest, movable: &Movable, available:
         let required = request.pool.requested.map_or(request.pool.floor, |n| n.max(request.pool.floor))
             .div_ceil(request.pool.unit_rows);
         if fit < required {
+            let limits = pool_limits(request, available, &trial_used, &trial_arenas, unit_bytes);
             refusal.get_or_insert_with(|| match request.pool.requested {
                 Some(requested) => PlacementError::PoolDoesNotFit { requested,
-                    fit: fit.saturating_mul(request.pool.unit_rows) },
+                    fit: fit.saturating_mul(request.pool.unit_rows), limits },
                 None => PlacementError::BelowFloor { pool: fit.saturating_mul(request.pool.unit_rows),
                     floor: request.pool.floor, layers: 0,
-                    short: request.pool.floor.saturating_sub(fit.saturating_mul(request.pool.unit_rows)) },
+                    short: request.pool.floor.saturating_sub(fit.saturating_mul(request.pool.unit_rows)), limits },
             });
             continue;
         }
@@ -726,22 +737,41 @@ fn conditional_movable(request: &PlacementRequest, movable: &Movable, available:
 
 /// Whole units every KV-owning GPU holds beside what is charged and its arena.
 fn pool_fit(request: &PlacementRequest, available: &[u64], used: &[u64], arenas: &[Arena], unit_bytes: &[u64]) -> u64 {
-    let upper = (0..available.len()).filter(|&gpu| unit_bytes[gpu] > 0)
-        .map(|gpu| available[gpu].saturating_sub(used[gpu] + arenas[gpu].peak) / unit_bytes[gpu])
-        .min().unwrap_or(u64::MAX);
-    if request.pool_bounded.is_empty() { return upper; }
-    let fits = |units| (0..available.len()).all(|gpu| {
+    (0..available.len()).map(|gpu| pool_rank_fit(request, gpu,
+        available[gpu].saturating_sub(used[gpu] + arenas[gpu].peak), unit_bytes[gpu])).min().unwrap_or(u64::MAX)
+}
+
+fn pool_rank_fit(request: &PlacementRequest, gpu: usize, available: u64, unit_bytes: u64) -> u64 {
+    let upper = if unit_bytes > 0 { available / unit_bytes } else { u64::MAX };
+    if !request.pool_bounded.iter().any(|d| usize::from(d.gpu) == gpu) { return upper; }
+    let fits = |units| {
         let bounded = request.pool_bounded.iter().filter(|d| usize::from(d.gpu) == gpu)
             .try_fold(0u64, |sum, d| sum.checked_add(d.bytes(units).ok()?));
-        bounded.and_then(|b| unit_bytes[gpu].checked_mul(units)?.checked_add(b))
-            .is_some_and(|bytes| bytes <= available[gpu].saturating_sub(used[gpu] + arenas[gpu].peak))
-    });
+        bounded.and_then(|b| unit_bytes.checked_mul(units)?.checked_add(b))
+            .is_some_and(|bytes| bytes <= available)
+    };
     let (mut lo, mut hi) = (0, upper);
     while lo < hi {
         let mid = lo + (hi - lo) / 2 + (hi - lo) % 2;
         if fits(mid) { lo = mid; } else { hi = mid - 1; }
     }
     lo
+}
+
+fn pool_limits(request: &PlacementRequest, available: &[u64], used: &[u64], arenas: &[Arena], unit_bytes: &[u64]) -> PoolLimits {
+    PoolLimits((0..available.len()).map(|gpu| {
+        let available_bytes = available[gpu].saturating_sub(used[gpu] + arenas[gpu].peak);
+        let mut demands = Vec::new();
+        if unit_bytes[gpu] > 0 {
+            demands.push(PoolUnitDemand { group: "KV records and metadata".into(), bytes_per_unit: unit_bytes[gpu],
+                offset_units: 0, cap_units: u64::MAX });
+        }
+        demands.extend(request.pool_bounded.iter().filter(|d| usize::from(d.gpu) == gpu).map(|d|
+            PoolUnitDemand { group: d.group.clone(), bytes_per_unit: d.bytes_per_unit,
+                offset_units: d.offset_units, cap_units: d.cap_units }));
+        PoolRankLimit { gpu: gpu as u8, available_bytes,
+            max_units: pool_rank_fit(request, gpu, available_bytes, unit_bytes[gpu]), demands }
+    }).collect())
 }
 
 fn with_pool(request: &PlacementRequest, used: &[u64], unit_bytes: &[u64], units: u64) -> Result<Vec<u64>, PlacementError> {
@@ -756,12 +786,12 @@ fn with_pool(request: &PlacementRequest, used: &[u64], unit_bytes: &[u64], units
 }
 
 /// Automatic pools stop at the target; an explicit pool is strict.
-fn pool_units(request: &PlacementRequest, fit: u64) -> Result<u64, PlacementError> {
+fn pool_units(request: &PlacementRequest, fit: u64, limits: &PoolLimits) -> Result<u64, PlacementError> {
     let fit = fit.min(request.pool.ceiling_units());
     let wanted = request.pool.wanted_units();
     match request.pool.requested {
         Some(requested) if wanted > fit => Err(PlacementError::PoolDoesNotFit { requested,
-            fit: fit.saturating_mul(request.pool.unit_rows) }),
+            fit: fit.saturating_mul(request.pool.unit_rows), limits: limits.clone() }),
         Some(_) => Ok(wanted),
         None => Ok(wanted.min(fit)),
     }

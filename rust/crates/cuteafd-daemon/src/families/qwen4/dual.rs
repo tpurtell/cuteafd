@@ -117,12 +117,12 @@ impl Opened {
         let rows = args.prefill_rows.max(engine::DECODE_ROWS);
         let pair: [Box<dyn RtxExpertLayer + '_>; 2] = if catalog.exl3().is_some() {
             Exl3Tp2::load_pair_with_packages(devices, catalog, cuteafd_core::ExpertGeometry::QWEN4,
-                experts.packages.each_ref().map(|p| p.as_path()), 0..layers, rows, budgets)?.map(|e| Box::new(e) as _)
+                experts.packages.each_ref().map(|p| p.as_path()), (0..layers).collect(), rows, budgets)?.map(|e| Box::new(e) as _)
         } else {
             let tensors = catalog.fp8().context("Qwen native TP2 tensors")?;
             let directory = args.fp8_package.clone().unwrap_or_else(||
                 crate::shared::experts::fp8::package_directory(&args.native_lib, 2, tensors.format()));
-            Fp8MoeTp2::load_pair(devices, tensors, &directory, 0..layers, rows, budgets)?.map(|e| Box::new(e) as _)
+            Fp8MoeTp2::load_pair(devices, tensors, &directory, (0..layers).collect(), rows, budgets)?.map(|e| Box::new(e) as _)
         };
         for rank in 0..2 { ensure!(pair[rank].workspace_bytes() as u64 == experts.workspace[rank],
             "Qwen allocated TP2 workspace disagrees with admission"); }

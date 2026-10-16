@@ -33,13 +33,18 @@ RUN KACHE_VERSION=${KACHE_VERSION} SCCACHE_VERSION=${SCCACHE_VERSION} bash /opt/
 
 ENV UV_SYSTEM_PYTHON=1
 
+# Transformers itself comes from the mounted checkout
+# (third_party/transformers/src, put on the path by its importers); the image
+# installs only that pinned source's runtime dependencies. tokenizers is pinned
+# to the version the checkout requires, never the one a PyPI Transformers drags in.
 RUN --mount=type=cache,target=/root/.cache/pip,id=cuteafd-pip-${TARGETARCH},sharing=locked \
     --mount=type=cache,target=/root/.cache/uv,id=cuteafd-uv-${TARGETARCH},sharing=locked \
     python3 -m pip install "uv==0.12.23" && \
     uv pip install --system --break-system-packages \
       "pytest==9.1.1" \
       "safetensors==0.8.0" \
-      "huggingface-hub==1.14.0" && \
+      "huggingface-hub==1.14.0" \
+      "tokenizers==0.23.1" && \
     uv pip install --system --break-system-packages \
       "nvidia-cutlass-dsl[cu13]==4.6.2" \
       "apache-tvm-ffi==0.1.12" \
@@ -50,7 +55,6 @@ RUN --mount=type=cache,target=/root/.cache/pip,id=cuteafd-pip-${TARGETARCH},shar
       "nvidia-ml-py==13.610.43" \
       "pillow==12.2.0" \
       "tabulate==0.10.0" \
-      "transformers==5.13.0" \
       "rich==15.0.0" && \
     uv pip install --system --break-system-packages --no-deps \
       "flashinfer-python==0.6.14"

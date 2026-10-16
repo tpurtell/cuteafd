@@ -977,7 +977,7 @@ impl Opened {
                 let pair = Fp8MoeTp2::load_pair([Device { library: &self.library, id: args.device },
                     Device { library: &self.library, id: peer.0 }], tensors,
                     preflight.expert_directory.as_deref().context("MiMo expert package")?,
-                    tp2.first..tp2.first + tp2.layers, args.prefill_rows.max(engine::DECODE_ROWS),
+                    (tp2.first..tp2.first + tp2.layers).collect(), args.prefill_rows.max(engine::DECODE_ROWS),
                     tp2.peak_bytes.map(|bytes| bytes as usize))?;
                 engine.install_tp2(pair)?;
             } else if preflight.placement.onboard_layers > 0 {

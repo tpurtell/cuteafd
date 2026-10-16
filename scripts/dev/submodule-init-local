@@ -1,0 +1,157 @@
+#!/usr/bin/env bash
+# Initialize a worktree's submodules at their pinned commits without cloning over
+# the WAN, then restore the upstream URLs the source locks are checked against.
+#
+# Usage: scripts/dev/submodule-init-local [WORKTREE]   (default: current repo root)
+#
+# Every submodule in .gitmodules is cloned from a bare mirror kept per path in a
+# shared object store, so a fresh worktree copies objects from the local
+# filesystem. The mirror lives at
+#   ${CUTEAFD_GIT_MIRRORS:-$HOME/.cache/cuteafd/git-mirrors}/<path>.git
+# with slashes in the submodule path replaced by '-'. It is created with
+# `git clone --mirror <upstream url>` when missing and fetched only when the
+# pinned commit is not already in it. Nested submodules are handled the same way.
+#
+# Opt-in with a fallback: CUTEAFD_GIT_MIRRORS=off, or a store that cannot be
+# created or fetched, warns and runs a plain `git submodule update --init --recursive`.
+set -euo pipefail
+
+warn() { printf 'submodule-init-local: %s\n' "$*" >&2; }
+
+if [ "$#" -gt 1 ]; then
+  warn "usage: ${0##*/} [WORKTREE]"
+  exit 2
+fi
+
+root="${1:-}"
+if [ -z "$root" ]; then
+  root="$(git rev-parse --show-toplevel 2>/dev/null)" ||
+    { warn "not inside a git repository and no WORKTREE given"; exit 2; }
+fi
+cd "$root"
+
+mirrors="${CUTEAFD_GIT_MIRRORS:-$HOME/.cache/cuteafd/git-mirrors}"
+store_ready=0
+if [ "$mirrors" = off ]; then
+  warn "CUTEAFD_GIT_MIRRORS=off: using upstream URLs"
+elif mkdir -p "$mirrors"; then
+  store_ready=1
+else
+  warn "cannot create the mirror store $mirrors: using upstream URLs"
+fi
+degraded=$((1 - store_ready))
+
+# Only a .gitmodules holding a local path needs the file transport allowed, and
+# -c reaches the clones nested under the update it is passed to.
+allow_args=()
+if git config -f .gitmodules --get-regexp '^submodule\..*\.url$' 2>/dev/null |
+  awk '{print $2}' | grep -qE '^(/|\.\.?/|file://)'; then
+  allow_args=(-c protocol.file.allow=always)
+fi
+
+mirror_path() { printf '%s/%s.git\n' "$mirrors" "$(printf '%s' "$1" | tr '/' '-')"; }
+
+# ensure_mirror PATH URL PIN: leave a bare mirror of URL holding PIN, reusing the
+# store's copy and fetching only when the pin is not already in it.
+ensure_mirror() {
+  local path="$1" url="$2" pin="$3" dir
+  dir="$(mirror_path "$path")"
+  if [ ! -d "$dir" ]; then
+    git clone --quiet --mirror "$url" "$dir" || { rm -rf "$dir"; return 1; }
+  fi
+  if ! git -C "$dir" cat-file -e "${pin}^{commit}" 2>/dev/null; then
+    git -C "$dir" fetch --quiet || return 1
+  fi
+  git -C "$dir" cat-file -e "${pin}^{commit}" 2>/dev/null
+}
+
+# init_repo REPO PREFIX: clone every submodule recorded in REPO's .gitmodules from
+# its mirror, then recurse. PREFIX is the path of REPO within the worktree (empty
+# for the worktree itself), which is what names a nested submodule's mirror.
+init_repo() {
+  local repo="$1" prefix="$2" key name path url pin full
+  while read -r key path; do
+    name="${key#submodule.}"
+    name="${name%.path}"
+    full="$prefix$path"
+    url="$(git -C "$repo" config -f .gitmodules --get "submodule.$name.url")"
+    pin="$(git -C "$repo" rev-parse "HEAD:$path")"
+    if ! ensure_mirror "$full" "$url" "$pin"; then
+      warn "no usable mirror for $full: leaving it to the upstream clone"
+      degraded=1
+      continue
+    fi
+    # The mirror is a local path, so this clone needs the file transport allowed.
+    git -C "$repo" config "submodule.$name.url" "$(mirror_path "$full")"
+    if [ -e "$repo/$path/.git" ]; then
+      # An initialized submodule fetches the pin from its own origin, not from
+      # the recorded URL, so point origin at the mirror too; restore_urls puts
+      # the upstream back afterwards.
+      git -C "$repo/$path" remote set-url origin "$(mirror_path "$full")"
+    fi
+    git -C "$repo" -c protocol.file.allow=always submodule update --init \
+      --reference "$(mirror_path "$full")" -- "$path"
+    # Restore the upstream URL as soon as this submodule is done: the clone that
+    # just ran recorded the mirror as origin, and a failure later in the walk
+    # must not leave it there.
+    git -C "$repo" config "submodule.$name.url" "$url"
+    if [ -e "$repo/$path/.git" ]; then
+      git -C "$repo/$path" remote set-url origin "$url"
+    fi
+    init_repo "$repo/$path" "$full/"
+  done < <(git -C "$repo" config -f .gitmodules --get-regexp '^submodule\..*\.path$')
+}
+
+# restore_urls REPO: .gitmodules' upstream URL becomes both the recorded submodule
+# URL and the submodule's own origin remote, at every level.
+restore_urls() {
+  local repo="$1" key name path url
+  while read -r key path; do
+    name="${key#submodule.}"
+    name="${name%.path}"
+    url="$(git -C "$repo" config -f .gitmodules --get "submodule.$name.url")"
+    git -C "$repo" config "submodule.$name.url" "$url"
+    # A checked-out submodule keeps a .git file; without it the path is empty (or
+    # missing) and rev-parse would fall back to the superproject's repository.
+    if [ -e "$repo/$path/.git" ]; then
+      git -C "$repo/$path" remote set-url origin "$url"
+      restore_urls "$repo/$path"
+    fi
+  done < <(git -C "$repo" config -f .gitmodules --get-regexp '^submodule\..*\.path$')
+}
+
+# A failure or a signal partway through leaves the submodules walked so far, and
+# anything this run cloned, pointing at the store, so restore every upstream URL
+# on the way out as well.
+restored=0
+restore_on_exit() {
+  local status=$?
+  if [ "$restored" -eq 0 ]; then
+    restore_urls "$root" || warn "some submodule URLs could not be restored"
+  fi
+  exit "$status"
+}
+trap restore_on_exit EXIT
+# A signal must report the signal, not whatever the interrupted command returned,
+# and exiting here still runs the restore above.
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+if [ "$store_ready" -eq 1 ]; then
+  init_repo "$root" ""
+fi
+if [ "$degraded" -eq 1 ]; then
+  [ "$store_ready" -eq 0 ] || warn "falling back to a plain submodule update"
+  git ${allow_args[@]+"${allow_args[@]}"} submodule update --init --recursive
+fi
+restore_urls "$root"
+restored=1
+
+# A leading '-', '+' or 'U' means uninitialized, wrong commit, or conflicted.
+unpinned="$(git submodule status --recursive | grep -E '^[-+U]' || true)"
+if [ -n "$unpinned" ]; then
+  warn "submodules are not at their pins:"
+  printf '%s\n' "$unpinned" >&2
+  exit 1
+fi
+echo "submodules at pins; upstream URLs restored"

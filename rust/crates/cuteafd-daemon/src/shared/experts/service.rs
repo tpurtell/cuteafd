@@ -111,7 +111,8 @@ pub(crate) struct NativeExpertServiceConfig {
 }
 
 fn admit_worker_peak(library: &NativeLibrary, load_peak: usize, serve_peak: usize) -> Result<()> {
-    let available = library.cuda_memory_info()?.0;
+    let available = library.cuda_allocatable_memory_info()
+        .context("query worker allocatable memory for admission")?.0;
     ensure!(load_peak <= available && serve_peak <= available,
         "Spark worker needs {load_peak} bytes at load / {serve_peak} at serve but only {available} bytes are available");
     Ok(())
@@ -192,7 +193,7 @@ fn load_weights<'a>(
         // by construction; page-cache bytes are reclaimable and are not added.
         // This is a safety gate, so a failed query fails closed instead of
         // silently skipping the real-availability check.
-        let free = library.cuda_memory_info().context("query Spark memory for admission")?.0;
+        let free = library.cuda_allocatable_memory_info().context("query Spark memory for admission")?.0;
         ensure!(
             budget.load_peak <= free && budget.serve_peak <= free,
             "explicit replicated Spark admission needs {} bytes at load / {} at serve \

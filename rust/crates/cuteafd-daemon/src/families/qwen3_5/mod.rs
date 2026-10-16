@@ -2,7 +2,7 @@
 mod programs;
 mod weights;
 mod block;
-mod engine;
+pub(crate) mod engine;
 use anyhow::{ensure, Context, Result};
 use std::path::PathBuf;
 use cuteafd_loader::families::qwen3_5::Qwen35Checkpoint;
@@ -37,6 +37,9 @@ pub(crate) struct GoldenArgs {
     /// Input chunk size, including serial decode-shaped qualification.
     #[arg(long, default_value_t = 4096)]
     pub prefill_chunk: usize,
+    /// Check block verify padding, taps, exact restore and accepted-input replay before scoring.
+    #[arg(long)]
+    pub verify_check: bool,
     /// Maximum absolute mean-NLL difference from the supplied reference.
     #[arg(long, default_value_t = 0.01)]
     pub nll_tolerance: f64,
@@ -71,7 +74,8 @@ pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
     let library = unsafe { cuteafd_ffi::NativeLibrary::load(native)? };
     library.cuda_set_device(args.device)?;
     let programs = library.programs()?.with_manifest(&args.manifest)?;
-    let mut engine = engine::DenseEngine::new(&library, &programs, &checkpoint, cfg.clone(), args.pool_tokens)?;
+    let mut engine = engine::DenseEngine::new(&library, &programs, &checkpoint, cfg.clone(), args.pool_tokens, None)?;
+    if args.verify_check { engine.verify_check(&tokens)?; }
     let mut logits = Vec::with_capacity(tokens.len() * cfg.vocab);
     let mut first = 0;
     for chunk in tokens.chunks(args.prefill_chunk) {

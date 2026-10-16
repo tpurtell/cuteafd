@@ -311,7 +311,7 @@ fn executors_refuse_modes_they_cannot_run_at_plan_time() {
     assert_eq!(families::DEEPSEEK_V4.check(&handed),
         Err(PlacementError::UnsupportedMode { family: "deepseek_v4", layer: 1, mode: S1 }));
     assert!(families::DEEPSEEK_V41.runs(W1) && !families::QWEN4.runs(LayerMode::HeadSplit));
-    assert_eq!(families::executor("glm5_flash").map(|e| e.hops), Some(false));
+    assert_eq!(families::executor("glm5_flash").map(|e| e.hops), Some(true));
 }
 
 fn tp2_request(free: [u64; 2], onboard: Onboard) -> PlacementRequest {
@@ -1325,6 +1325,60 @@ fn bounded_pool_demands_grow_then_saturate_and_reserve_before_experts() {
     assert_eq!(solve(&req).unwrap().onboard_layers, 0);
     req.layers[0].experts.as_mut().unwrap().whole.resident = 120;
     assert_eq!(solve(&req).unwrap().onboard_layers, 1);
+}
+
+#[test]
+fn pool_failures_name_rank_demands_and_retain_selected_expert_arena() {
+    for onboard in [Onboard::Auto, Onboard::Layers(0)] {
+        let mut req = request(2, 100, 0, 4, onboard);
+        req.pool = PoolPolicy { requested: Some(6), target: 6, floor: 1, ceiling: 100, unit_rows: 1 };
+        req.pool_overhead = vec![1, 2];
+        req.pool_bounded = vec![BoundedDemand { gpu: 1, category: Category::Prefix,
+            group: "recurrent marks".into(), bytes_per_unit: 20, offset_units: 1,
+            cap_units: u64::MAX, basis: Basis::Formula }];
+        let error = solve(&req).unwrap_err();
+        let PlacementError::PoolDoesNotFit { fit, ref limits, .. } = error else { panic!("{error}") };
+        assert_eq!(fit, 3);
+        assert_eq!(limits.0[0].max_units, 100);
+        assert_eq!(limits.0[1].max_units, 3);
+        let text = error.to_string();
+        assert!(text.contains("rtx1 limiting fits 3 units"), "{text}");
+        assert!(text.contains("recurrent marks 20 bytes/unit (offset 1"), "{text}");
+        assert!(text.contains("KV records and metadata 2 bytes/unit"), "{text}");
+        req.onboard = Onboard::Layers(0);
+        req.pool.requested = None;
+        req.pool.floor = 4;
+        let error = solve(&req).unwrap_err();
+        assert!(matches!(error, PlacementError::BelowFloor { pool: 3, .. }));
+        assert!(error.to_string().contains("recurrent marks 20 bytes/unit"));
+    }
+    let mut req = request(2, 44 * GIB, 60, 4, Onboard::Layers(10));
+    req.pool.requested = Some(4 << 20);
+    let error = solve(&req).unwrap_err();
+    let PlacementError::PoolDoesNotFit { limits, .. } = error else { panic!("{error}") };
+    for rank in limits.0 {
+        assert_eq!(rank.available_bytes, 44 * GIB - (5 * GIB + GIB / 2));
+    }
+}
+
+#[test]
+fn successful_pool_limits_retain_auto_onboarded_arenas() {
+    for gpus in [1, 2] {
+        let mut req = request(gpus, 44 * GIB, 60, 4, Onboard::Auto);
+        let automatic = solve(&req).unwrap();
+        assert!(automatic.onboard_layers > 0);
+        for rank in &automatic.pool_limits.0 {
+            let gpu = usize::from(rank.gpu);
+            let arena = automatic.expert_ranges[gpu].peak_bytes
+                + automatic.tp2.map_or(0, |range| range.peak_bytes[gpu]);
+            assert!(arena > 0);
+            assert_eq!(rank.available_bytes, req.inventory.gpus[gpu].available() - arena);
+        }
+        req.onboard = Onboard::Layers(automatic.onboard_layers);
+        req.pool.requested = Some(automatic.pool_tokens);
+        let fixed = solve_frozen(&req, &automatic).unwrap();
+        assert_eq!(fixed.pool_limits, automatic.pool_limits);
+    }
 }
 
 #[test]

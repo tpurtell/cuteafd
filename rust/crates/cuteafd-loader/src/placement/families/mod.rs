@@ -44,9 +44,11 @@ pub const GLM5: ExecutorModes = ExecutorModes { family: "glm5",
 /// `context` is the recorded default on two GPUs (TJ: no context-scaling KV replicated; pool
 /// first); a build without its programs fails a chosen `context` closed
 /// (`glm5_flash::resolve_attention`, #202), and `heads` stays an explicit option. Owned MLA
-/// layers (`layers`) have no executor yet.
+/// layers (`layers`) are an explicit per-layer option with split FFNs; auto stays context.
 pub const GLM5_FLASH: ExecutorModes = ExecutorModes { family: "glm5_flash",
-    modes: &[LayerMode::HeadSplit, LayerMode::ContextSplit, WHOLE0], hops: false, attention: AttentionPlacement::Context };
+    modes: &[LayerMode::HeadSplit, LayerMode::ContextSplit, WHOLE0,
+        LayerMode::Whole { gpu: 0, ffn: FfnMode::Split },
+        LayerMode::Whole { gpu: 1, ffn: FfnMode::Split }], hops: true, attention: AttentionPlacement::Context };
 /// MiMo: `attach_peer` requires every layer split.
 pub const MIMO_V2: ExecutorModes = ExecutorModes { family: "mimo_v2", modes: &[LayerMode::HeadSplit, WHOLE0],
     hops: false, attention: AttentionPlacement::Heads };

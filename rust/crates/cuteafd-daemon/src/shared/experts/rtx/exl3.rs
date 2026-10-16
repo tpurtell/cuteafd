@@ -16,7 +16,6 @@ use cuteafd_core::{expert_geometry, ExpertGeometry};
 use cuteafd_ffi::CuteafdDeviceBuffer;
 use std::{
     ffi::c_void,
-    ops::Range,
     path::{Path, PathBuf},
     rc::Rc,
 };
@@ -26,7 +25,7 @@ pub(crate) struct Exl3Tp2<'a> {
     completion: RankCompletion<Event<'a>>,
     device: Device<'a>,
     rank: u8,
-    layers: Range<usize>,
+    layers: Vec<usize>,
     geometry: ExpertGeometry,
     row_policy: Exl3RowPolicy,
     selection: RtxSelectionPolicy,
@@ -43,7 +42,7 @@ pub(crate) struct Exl3Tp2<'a> {
 pub(crate) struct Exl3Tp2Weights<'a> {
     device: Device<'a>,
     rank: u8,
-    layers: Range<usize>,
+    layers: Vec<usize>,
     geometry: ExpertGeometry,
     row_policy: Exl3RowPolicy,
     selection: RtxSelectionPolicy,
@@ -57,8 +56,8 @@ impl<'a> Exl3Tp2Weights<'a> {
     pub(crate) fn device(&self) -> Device<'a> {
         self.device
     }
-    pub(crate) fn layers(&self) -> Range<usize> {
-        self.layers.clone()
+    pub(crate) fn layers(&self) -> &[usize] {
+        &self.layers
     }
     pub(crate) fn max_rows(&self) -> usize {
         self.max_rows
@@ -98,7 +97,7 @@ impl<'a> Exl3Tp2Weights<'a> {
 
 fn load_layer_pairs<T, W>(
     mut ranks: [T; 2],
-    layers: Range<usize>,
+    layers: Vec<usize>,
     mut load: impl FnMut(usize) -> Result<[W; 2]>,
     mut publish: impl FnMut(&mut T, W, usize) -> Result<()>,
 ) -> Result<[T; 2]> {
@@ -214,7 +213,7 @@ impl<'a> Exl3Tp2<'a> {
         devices: [Device<'a>; 2],
         catalog: &cuteafd_loader::OfficialV41Catalog,
         package: &Path,
-        layers: Range<usize>,
+        layers: Vec<usize>,
         max_rows: usize,
         budgets: [usize; 2],
     ) -> Result<[Self; 2]> {
@@ -235,7 +234,7 @@ impl<'a> Exl3Tp2<'a> {
         catalog: &cuteafd_loader::OfficialV41Catalog,
         geometry: ExpertGeometry,
         packages: [&Path; 2],
-        layers: Range<usize>,
+        layers: Vec<usize>,
         max_rows: usize,
         budgets: [usize; 2],
     ) -> Result<[Self; 2]> {
@@ -256,7 +255,7 @@ impl<'a> Exl3Tp2<'a> {
         catalog: &cuteafd_loader::OfficialV41Catalog,
         geometry: ExpertGeometry,
         packages: [&Path; 2],
-        layers: Range<usize>,
+        layers: Vec<usize>,
         max_rows: usize,
         budgets: [usize; 2],
         selection: RtxSelectionPolicy,
@@ -272,15 +271,14 @@ impl<'a> Exl3Tp2<'a> {
         catalog: &cuteafd_loader::OfficialV41Catalog,
         geometry: ExpertGeometry,
         packages: [&Path; 2],
-        layers: Range<usize>,
+        layers: Vec<usize>,
         max_rows: usize,
         budgets: [usize; 2],
         selection: RtxSelectionPolicy,
     ) -> Result<[Exl3Tp2Weights<'a>; 2]> {
         let started = std::time::Instant::now();
         let label = format!(
-            "experts/TP2 expert layer halves {}..{}",
-            layers.start, layers.end
+            "experts/TP2 expert layer halves {layers:?}"
         );
         let _memory_scope = cuteafd_ffi::memory_ledger::scope_owned(&label);
         validate_layers(&layers, 0)?;
@@ -315,7 +313,7 @@ impl<'a> Exl3Tp2<'a> {
                 .checked_sub(workspace_bytes[rank])
                 .context("EXL3 TP2 workspace exceeds budget")?;
             let mut used = workspace_bytes[rank];
-            for layer in layers.clone() {
+            for &layer in &layers {
                 let plan = Exl3Weights::plan(catalog, ExpertLayer::BackboneTp2 { layer, rank })?;
                 used = used
                     .checked_add(plan.resident_bytes)
@@ -384,7 +382,7 @@ impl<'a> Exl3Tp2<'a> {
                 },
             )?
         } else {
-            let pair = Exl3Weights::load_tp2_pair(devices, catalog, layers.clone(), remaining)?;
+            let pair = Exl3Weights::load_tp2_pair(devices, catalog, &layers, remaining)?;
             let mut ranks = ranks;
             for (rank, mut loaded) in pair.into_iter().enumerate() {
                 devices[rank].run(|| {
@@ -502,7 +500,7 @@ impl<'a> Exl3Tp2<'a> {
             self.layers.contains(&layer),
             "EXL3 TP2 weight metadata layer unavailable"
         );
-        let weight = &self.weights[layer - self.layers.start];
+        let weight = &self.weights[super::resident_index(&self.layers, layer)?];
         Ok(weight.budget.resident_bytes / weight.layout.experts)
     }
 
@@ -544,8 +542,8 @@ impl RtxExpertLayer for Exl3Tp2<'_> {
     fn partial(&self) -> PartialDtype {
         PartialDtype::F32
     }
-    fn layers(&self) -> Range<usize> {
-        self.layers.clone()
+    fn layers(&self) -> &[usize] {
+        &self.layers
     }
     fn device(&self) -> i32 {
         self.device.id
@@ -616,7 +614,7 @@ impl RtxExpertLayer for Exl3Tp2<'_> {
                 // SAFETY: caller owns rank-local inputs and exclusive stream/arena/output use through completion.
                 unsafe {
                     execution.launch_layer_into(
-                        layer - self.layers.start,
+                        super::resident_index(&self.layers, layer)?,
                         inputs,
                         rows,
                         stream,
@@ -658,7 +656,7 @@ mod tests {
         let ranks = [Vec::new(), Vec::new()];
         let result = load_layer_pairs(
             ranks,
-            0..3,
+            vec![0, 2, 4],
             |layer| {
                 let pair = std::array::from_fn(|rank| {
                     order.push((layer, rank));
@@ -669,7 +667,7 @@ mod tests {
                         released: released.clone(),
                     }
                 });
-                ensure!(layer != 1, "injected rank1 mid-load failure");
+                ensure!(layer != 2, "injected rank1 mid-load failure");
                 Ok(pair)
             },
             |owner, weight, _| {
@@ -678,7 +676,7 @@ mod tests {
             },
         );
         assert!(result.is_err());
-        assert_eq!(order, [(0, 0), (0, 1), (1, 0), (1, 1)]);
+        assert_eq!(order, [(0, 0), (0, 1), (2, 0), (2, 1)]);
         assert_eq!(live.get(), 0);
         let mut freed = released.borrow().clone();
         freed.sort();

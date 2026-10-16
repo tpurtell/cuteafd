@@ -200,11 +200,14 @@ def test_glm_serving_admits_and_precreates_all_reachable_workspaces():
     assert "kda.in[24896|12576,4096]" in source
     module = (root / "glm5_flash/mod.rs").read_text()
     gathering = module.split("fn admit(", 1)[1].split("pub fn with_engine", 1)[0]
-    admission = gathering.index("admission::solve_working_set_with_graphs(")
+    admission = gathering.index("admission::solve_attention_working_set_with_graphs(")
     for required in ("RuntimeInventory::measure(", "pending_code(", "resident_weights(",
                      "admission::step_workspace_demands(", "admission::startup_graphs("):
         assert gathering.index(required) < admission
-    assert "representation, resident, router_replica_bytes, workspace, local_workspace, graphs" in gathering
+    assert "representation, resident, workspace, local_workspace, graphs" in gathering
+    assert "alternate_resident.as_deref()" in gathering
+    assert '"attention_first_owner": attention.first_owner' in gathering
+    assert "placed_attention(attention, &placement)" in gathering
     opening = module.split("pub fn with_engine", 1)[1]
     assert opening.index("self.admit(") < opening.index("TokenEmbedding::load(")
     assert "admitted_graphs.lifetime" in opening

@@ -8,8 +8,7 @@
 //! [`check_host`] replays the host's issue order: each queued op joins its
 //! GPU's stream; at a [`HostOp::Sync`] both streams run as far as they can with
 //! what is queued, and the sync must find its GPU's stream empty.
-use super::{check, Deadlock, Flag, Op, Schedule};
-use std::collections::HashMap;
+use super::{check, Deadlock, Flag, Op, Publications, Schedule};
 
 /// One step of the host's issue order.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -78,30 +77,22 @@ impl std::fmt::Display for HostDeadlock {
 struct Streams {
     queued: [Vec<(Op, String)>; 2],
     at: [usize; 2],
-    pushed: [HashMap<Flag, usize>; 2],
-    waited: [HashMap<Flag, usize>; 2],
+    publications: Publications,
 }
 
 impl Streams {
-    fn run(&mut self) {
+    fn run(&mut self) -> Result<(), String> {
         loop {
             let mut progressed = false;
             for gpu in 0..2 {
                 while let Some((op, _)) = self.queued[gpu].get(self.at[gpu]) {
-                    match *op {
-                        Op::Push(flag) => *self.pushed[gpu].entry(flag).or_default() += 1,
-                        Op::Wait(flag) => {
-                            let have = self.pushed[1 - gpu].get(&flag).copied().unwrap_or(0);
-                            let used = self.waited[gpu].entry(flag).or_default();
-                            if *used >= have { break; }
-                            *used += 1;
-                        }
-                    }
+                    if !self.publications.advance(gpu, *op)? { break; }
                     self.at[gpu] += 1;
                     progressed = true;
+                    break;
                 }
             }
-            if !progressed { return; }
+            if !progressed { return Ok(()); }
         }
     }
 
@@ -117,7 +108,9 @@ pub(crate) fn check_host(schedule: &HostSchedule) -> Result<(), HostDeadlock> {
         match op {
             HostOp::Queue { gpu, op, label } => streams.queued[*gpu].push((*op, label.clone())),
             HostOp::Sync { gpu, label } => {
-                streams.run();
+                streams.run().map_err(|reason| HostDeadlock {
+                    sync: format!("{label}: {reason}"), blocked: streams.blocked(),
+                })?;
                 if streams.at[*gpu] < streams.queued[*gpu].len() {
                     return Err(HostDeadlock { sync: label.clone(), blocked: streams.blocked() });
                 }
@@ -130,6 +123,17 @@ pub(crate) fn check_host(schedule: &HostSchedule) -> Result<(), HostDeadlock> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn host_sync_rejects_crossed_direct_destinations() {
+        let mut s = HostSchedule::default();
+        s.push_to(0, "main", super::super::super::DIRECT, 0, "lane zero");
+        s.push_to(0, "main", super::super::super::DIRECT, 1, "lane one");
+        s.wait_for(1, "main", super::super::super::DIRECT, 1, "crossed lane one");
+        s.sync(1, "consume lane one");
+        s.wait_for(1, "main", super::super::super::DIRECT, 0, "crossed lane zero");
+        assert!(check_host(&s).unwrap_err().sync.contains("crossed destination wait"));
+    }
 
     #[test]
     fn a_sync_waits_for_progress_the_queued_pushes_allow() {

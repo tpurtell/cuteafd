@@ -27,7 +27,7 @@ pub(super) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
         report.attention_placement = attention.mode;
         let index = match attention.mode {
             placement::AttentionPlacement::Context => crate::serving_capacity::GlmfIndexCache::Compact,
-            _ if ranks == 2 => crate::serving_capacity::GlmfIndexCache::Keys,
+            placement::AttentionPlacement::Heads if ranks == 2 => crate::serving_capacity::GlmfIndexCache::Keys,
             _ => options.glmf_index,
         };
         if decode_rows > 64 && manifest.is_some_and(|m| crate::serving_capacity::glmf_manifest_scratch(m)("glmf_mhc_post_pre_m128").is_none()) {
@@ -39,7 +39,8 @@ pub(super) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
             "BF16 KDA state needs one GPU; head-split BF16 state is not yet qualified");
         notes.push(format!("KDA projections: {}, state: {state:?}; shared target/draft head: {}",
             if representation.kda_fp8 { "FP8" } else { "BF16" }, if representation.fp8_head { "FP8" } else { "BF16" }));
-        let mut resident = resident::resident_weights(checkpoint, &cfg, cfg.layers, ranks, representation)
+        let mut resident = resident::resident_weights_placed(checkpoint, &cfg, cfg.layers, ranks, representation,
+            attention.mode, attention.first_owner as usize)
             .map_err(anyhow::Error::msg)?;
         let host_embedding = options.host_embedding || (options.rtx_bytes[0] <= 32 * GIB && !options.force_gpu_embedding);
         if host_embedding {
@@ -47,7 +48,12 @@ pub(super) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
             resident[0].embedding = 0;
             notes.push("embedding placement: host (single pinned mapped copy)".into());
         }
-        let router = if ranks == 2 { resident::router_replica_bytes(checkpoint, &cfg, cfg.layers).map_err(anyhow::Error::msg)? } else { 0 };
+        let alternate_resident = (attention.mode == placement::AttentionPlacement::Layers).then(|| {
+            let mut ranks = resident::resident_weights_placed(checkpoint, &cfg, cfg.layers, ranks, representation,
+                attention.mode, 1 - attention.first_owner as usize).map_err(anyhow::Error::msg)?;
+            if host_embedding { ranks[0].embedding = 0; }
+            Ok::<_, anyhow::Error>(ranks)
+        }).transpose()?;
         let catalog = input.expert_catalog()?;
         let shape = catalog.routed_experts();
         let onboard = options.onboard.or_else(|| options.local_expert_layers.map(|n| Onboard::Layers(n.saturating_sub(shape.first_layer))))
@@ -70,7 +76,7 @@ pub(super) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
                 index == crate::serving_capacity::GlmfIndexCache::Compact,
                 ranks == 2, representation, options.glmf_prefill_expanded, available.is_some() && (ranks == 2 || catalog.fp8().is_some()), options.glmf_kda_fp32_partials, state));
         let mut workspace = step_workspace(&report.placement, lanes);
-        let mut local_workspace = step_workspace(&ExpertPlacement::Local, 1);
+        let mut local_workspace = step_workspace(&ExpertPlacement::Local, lanes);
         if (workspace.is_none() || local_workspace.is_none()) && manifest.is_some() {
             anyhow::bail!("GLM Flash program manifest lacks the requested step scratch geometry");
         }
@@ -81,7 +87,7 @@ pub(super) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
                 (if ranks == 1 { gib(268) } else { gib(472) }) * (lanes * rows).max(8192) / 8192,
                 Basis::Calibrated)).collect();
             workspace = Some(estimate(lanes));
-            local_workspace = Some(estimate(1));
+            local_workspace = Some(estimate(lanes));
         }
         let mut workspace = workspace.unwrap();
         let mut local_workspace = local_workspace.unwrap();
@@ -142,21 +148,24 @@ pub(super) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
             decode_rows, partial_bytes: if options.glmf_kda_fp32_partials { 4 } else { 2 }, max_context: context, sequences, speculation: draft > 0, state_slots: options.state_slots.unwrap_or(sequences.max(8)),
             mark_slots: marks, pool_marks: options.glmf_pool_marks && options.mimo_prefix_entries > 0,
             index, kda_state_bytes: state.bytes(), shared_replay: options.glmf_shared_replay, representation,
-            resident, router_replica_bytes: router, workspace, local_workspace, graphs, experts,
+            resident, workspace, local_workspace, graphs, experts,
             expert_workspace: if ranks == 1 { available.unwrap_or(0) } else { 0 },
             tp2_workspace: if ranks == 2 { [available.unwrap_or(0); 2] } else { [0; 2] },
             drafter_bytes: draft, drafter_scratch, drafter_bridge, requested_pool: options.pool_tokens.filter(|&n| n > 0), onboard,
             full_prefill_logits: if options.full_prefill_logits { full_prefill_logits_bytes("glm5_flash", rows, cfg.vocab_size as u64) } else { 0 } };
-        let (placed, _, working) = glmf::solve_working_set_with_graphs(&inputs, target, options.context_tokens == 0,
+        let (placed, _, working) = glmf::solve_attention_working_set_with_graphs(&inputs,
+            alternate_resident.as_deref(), target, options.context_tokens == 0,
             options.physical_sms.unwrap_or(placement::ArchContext::coordinator(options.rtx_bytes[0], None).sms) as usize,
             available.is_some())?;
+        let chosen_attention = glmf::placed_attention(attention, &placed);
+        let chosen_resident = if chosen_attention.first_owner == attention.first_owner { &inputs.resident }
+            else { alternate_resident.as_ref().expect("solved alternate MLA inventory") };
+        if chosen_attention.mode == placement::AttentionPlacement::Layers {
+            notes.push(format!("first MLA owner: rtx{}", chosen_attention.first_owner));
+        }
         if spark_ranks == 0 {
-            let mut weights: Vec<_> = inputs.resident.iter().map(|rank| rank.embedding.checked_add(rank.weights)
+            let mut weights: Vec<_> = chosen_resident.iter().map(|rank| rank.embedding.checked_add(rank.weights)
                 .ok_or_else(|| anyhow::anyhow!("GLM Flash resident weight overflow"))).collect::<anyhow::Result<_>>()?;
-            if ranks == 2 {
-                weights[1] = weights[1].checked_add(router)
-                    .ok_or_else(|| anyhow::anyhow!("GLM Flash router replica overflow"))?;
-            }
             for ((layer, _), cost) in cfg.dense.iter().enumerate().filter(|(_, dense)| !**dense).zip(&inputs.experts) {
                 for (rank, bytes) in weights.iter_mut().enumerate() {
                     let resident = match placed.layers[layer].experts {

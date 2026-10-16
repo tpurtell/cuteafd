@@ -31,7 +31,7 @@ def test_lazy_exl3_draft_grouping_uses_the_shared_installed_window_order():
     # GLM Flash already installs TP1 windows during admitted onboarding; the
     # shared helper reuses these without changing their stream or load timing.
     glm = (daemon / "glm5_flash/mod.rs").read_text()
-    assert glm.index("local.ensure(range.start, stream)?;") < glm.index("engine.install_local(range, experts);")
+    assert glm.index("local.ensure(local_layers[0], stream)?;") < glm.index("engine.install_local(local_layers, experts)?;")
 
 
 def test_qwen_bucket_projection_registry_matches_pinned_fork():

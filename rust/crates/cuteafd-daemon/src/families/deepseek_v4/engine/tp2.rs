@@ -68,7 +68,7 @@ impl PackedRoutes {
 }
 
 pub(super) struct Tp2State<'a> {
-    pub(super) layers: Range<usize>,
+    pub(super) layers: Vec<usize>,
     ranks: [RefCell<Box<dyn RtxExpertLayer + 'a>>; 2],
     combine: [FusedCombine<'a>; 2],
     routes: PeerExchange<'a>,
@@ -98,17 +98,17 @@ impl<'a> Engine<'a> {
     pub fn install_tp2(&mut self, ranks: [Box<dyn RtxExpertLayer + 'a>; 2]) -> Result<()> {
         ensure!(self.tp2.is_none(), "TP2 experts already installed");
         let peer = self.peer()?;
-        let layers = ranks[0].layers();
-        ensure!(layers == ranks[1].layers() && !layers.is_empty() && layers.end <= self.cfg.n_layers,
+        let layers = ranks[0].layers().to_vec();
+        ensure!(layers == ranks[1].layers() && !layers.is_empty() && layers.iter().all(|&id| id < self.cfg.n_layers),
             "TP2 ranks must hold the same nonempty backbone prefix");
-        ensure!(layers.start == 0, "V4 TP2 currently requires a prefix starting at layer 0");
+        ensure!(layers.iter().copied().eq(0..layers.len()), "V4 TP2 currently requires a prefix starting at layer 0");
         for (rank, experts) in ranks.iter().enumerate() {
             ensure!(experts.shard() == RtxShard::Tp2 { rank: rank as u8 }
                 && experts.partial() == PartialDtype::F32
                 && experts.device() == if rank == 0 { self.device } else { peer.device },
                 "TP2 rank {rank} shard, dtype or device differs from head split");
         }
-        ensure!(self.local.borrow().as_ref().is_none_or(|l| l.layers() == 0),
+        ensure!(self.local.borrow().as_ref().is_none_or(|l| l.layers().is_empty()),
             "TP1 backbone experts cannot coexist with TP2");
         let rows = self.prefill_rows.max(self.decode_rows);
         let routes = PeerExchange::new_abortable(self.library,
@@ -126,7 +126,7 @@ impl<'a> Engine<'a> {
             interval, steps: Cell::new(0), fallbacks: Cell::new(0),
             streams: [self.stream, peer.stream], output_pending: [Cell::new(false), Cell::new(false)] });
         tracing::info!(layers = ?layers, "V4 RTX TP2 expert halves resident on both GPUs");
-        cuteafd_bench::context::set_resolved("rtx-tp2-layers", &format!("{}..{}", layers.start, layers.end));
+        cuteafd_bench::context::set_resolved("rtx-tp2-layers", &format!("{layers:?}"));
         Ok(())
     }
 
@@ -329,7 +329,7 @@ impl<'a> Engine<'a> {
         // never from a layer whose matching push has not been enqueued yet.
         let mut checks = tp2.checks.borrow_mut();
         ensure!(checks.is_empty(), "previous route diagnostics did not drain");
-        for layer in tp2.layers.clone() {
+        for &layer in &tp2.layers {
             for (lane, &rows) in rows.iter().enumerate() {
                 let bytes = rows * self.cfg.n_activated_experts * 8;
                 let ranks = [Some(self.on(0, || HostAllocation::new(self.library, bytes))?),

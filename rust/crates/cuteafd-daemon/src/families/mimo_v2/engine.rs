@@ -315,7 +315,7 @@ impl Allocator {
 }
 
 struct Tp2<'a> {
-    layers: std::ops::Range<usize>,
+    layers: Vec<usize>,
     ranks: [RefCell<Fp8MoeTp2<'a>>; 2],
     combine: FusedCombine<'a>,
     routes: PeerExchange<'a>,

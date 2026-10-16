@@ -52,7 +52,7 @@ mod tests {
             &catalog,
             cuteafd_core::expert_geometry(),
             [&package; 2],
-            0..1,
+            vec![0],
             16,
             [4_000_000_000; 2],
             RtxSelectionPolicy::FirstCapacity,

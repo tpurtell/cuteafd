@@ -10,7 +10,7 @@ use cuteafd_ffi::{
     CuteafdDeviceBuffer, NativeLibrary, V41ExpertKernel, V41ExpertLaunchArgs, V41ExpertOutputKind,
     V41Tp2ExpertReducer,
 };
-use std::{ffi::c_void, ops::Range, rc::Rc};
+use std::{ffi::c_void, rc::Rc};
 
 pub(crate) fn kernel_capacities(max_rows: usize) -> Result<Vec<u32>> {
     ensure!((1..=4096).contains(&max_rows), "invalid TP2 rank capacity");
@@ -28,10 +28,12 @@ pub(super) fn output_bytes(geometry: ExpertGeometry, rows: usize) -> Result<usiz
         .context("TP2 output extent overflow")
 }
 
-pub(super) fn validate_layers(layers: &Range<usize>, rank: u8) -> Result<()> {
+pub(super) fn validate_layers(layers: &[usize], rank: u8) -> Result<()> {
     ensure!(
-        rank < 2 && !layers.is_empty() && layers.end <= expert_geometry().layers as usize,
-        "invalid TP2 rank/layer range"
+        rank < 2 && !layers.is_empty()
+            && layers.windows(2).all(|ids| ids[0] < ids[1])
+            && layers.iter().all(|&layer| layer < expert_geometry().layers as usize),
+        "invalid TP2 rank or ordered absolute layer IDs"
     );
     Ok(())
 }
@@ -125,7 +127,7 @@ pub(crate) struct NativeTp2<'a> {
     completion: RankCompletion<Event<'a>>,
     device: Device<'a>,
     rank: u8,
-    layers: Range<usize>,
+    layers: Vec<usize>,
     geometry: ExpertGeometry,
     max_rows: usize,
     workspace_bytes: usize,
@@ -144,7 +146,7 @@ pub(crate) struct NativeTp2<'a> {
 pub(crate) struct NativeTp2Weights<'a> {
     device: Device<'a>,
     rank: u8,
-    layers: Range<usize>,
+    layers: Vec<usize>,
     max_rows: usize,
     workspace_bytes: usize,
     weights: Rc<DeviceOwner<'a, Vec<ExpertWeights<'a>>>>,
@@ -168,8 +170,8 @@ impl<'a> NativeTp2Weights<'a> {
     pub(crate) fn device(&self) -> Device<'a> {
         self.device
     }
-    pub(crate) fn layers(&self) -> Range<usize> {
-        self.layers.clone()
+    pub(crate) fn layers(&self) -> &[usize] {
+        &self.layers
     }
     pub(crate) fn max_rows(&self) -> usize {
         self.max_rows
@@ -189,7 +191,7 @@ impl<'a> NativeTp2<'a> {
         rank: u8,
     ) -> Result<ExpertLoadBudget> {
         validate_layers(
-            &(layer..layer.checked_add(1).context("TP2 layer overflow")?),
+            &[layer],
             rank,
         )?;
         ensure!(
@@ -285,7 +287,7 @@ impl<'a> NativeTp2<'a> {
         device: Device<'a>,
         catalog: &cuteafd_loader::OfficialV41Catalog,
         rank: u8,
-        layers: &Range<usize>,
+        layers: &[usize],
         max_rows: usize,
         budget: usize,
         selection: RtxSelectionPolicy,
@@ -302,7 +304,7 @@ impl<'a> NativeTp2<'a> {
             format.is_nvfp4(),
         )?;
         let mut resident = workspace;
-        for layer in layers.clone() {
+        for &layer in layers {
             let plan = ExpertWeights::plan(
                 device.library,
                 catalog,
@@ -330,7 +332,7 @@ impl<'a> NativeTp2<'a> {
     pub(crate) fn load_pair(
         devices: [Device<'a>; 2],
         catalog: &cuteafd_loader::OfficialV41Catalog,
-        layers: Range<usize>,
+        layers: Vec<usize>,
         max_rows: usize,
         budgets: [usize; 2],
     ) -> Result<[Self; 2]> {
@@ -347,7 +349,7 @@ impl<'a> NativeTp2<'a> {
     pub(crate) fn load_pair_with_selection(
         devices: [Device<'a>; 2],
         catalog: &cuteafd_loader::OfficialV41Catalog,
-        layers: Range<usize>,
+        layers: Vec<usize>,
         max_rows: usize,
         budgets: [usize; 2],
         selection: RtxSelectionPolicy,
@@ -370,7 +372,7 @@ impl<'a> NativeTp2<'a> {
     pub(crate) fn load_pair_with_output(
         devices: [Device<'a>; 2],
         catalog: &cuteafd_loader::OfficialV41Catalog,
-        layers: Range<usize>,
+        layers: Vec<usize>,
         max_rows: usize,
         budgets: [usize; 2],
         selection: RtxSelectionPolicy,
@@ -391,7 +393,7 @@ impl<'a> NativeTp2<'a> {
     pub(crate) fn load_pair_weights(
         devices: [Device<'a>; 2],
         catalog: &cuteafd_loader::OfficialV41Catalog,
-        layers: Range<usize>,
+        layers: Vec<usize>,
         max_rows: usize,
         budgets: [usize; 2],
         selection: RtxSelectionPolicy,
@@ -402,8 +404,7 @@ impl<'a> NativeTp2<'a> {
             "invalid native TP2 device pair"
         );
         let label = format!(
-            "experts/TP2 expert layer halves {}..{}",
-            layers.start, layers.end
+            "experts/TP2 expert layer halves {layers:?}"
         );
         let _memory_scope = cuteafd_ffi::memory_ledger::scope_owned(&label);
         let workspaces = [
@@ -438,7 +439,7 @@ impl<'a> NativeTp2<'a> {
                 devices[0].own(|| Ok(Vec::new()))?,
                 devices[1].own(|| Ok(Vec::new()))?,
             ];
-            for layer in layers.clone() {
+            for &layer in &layers {
                 // SAFETY: fresh, unaliased GPU owners only; both workers drain
                 // before returning and DeviceOwner destroys on its owning GPU.
                 let pair = unsafe {
@@ -464,7 +465,7 @@ impl<'a> NativeTp2<'a> {
             }
             weights
         } else {
-            ExpertWeights::load_tp2_pair(devices, catalog, layers.clone(), available)?
+            ExpertWeights::load_tp2_pair(devices, catalog, &layers, available)?
         };
         let [left, right] = weights;
         let owners = [Rc::new(left), Rc::new(right)];
@@ -484,13 +485,12 @@ impl<'a> NativeTp2<'a> {
         device: Device<'a>,
         catalog: &cuteafd_loader::OfficialV41Catalog,
         rank: u8,
-        layers: Range<usize>,
+        layers: Vec<usize>,
         max_rows: usize,
         budget: usize,
     ) -> Result<Self> {
         let _memory_scope = cuteafd_ffi::memory_ledger::scope_owned(&format!(
-            "experts/TP2 expert layer halves {}..{}",
-            layers.start, layers.end
+            "experts/TP2 expert layer halves {layers:?}"
         ));
         ensure!(
             ExpertFormat::of(catalog) == ExpertFormat::Native,
@@ -509,7 +509,7 @@ impl<'a> NativeTp2<'a> {
         let weights = device.own(|| {
             let mut loaded = Vec::with_capacity(layers.len());
             let mut remaining = budget - workspace_bytes;
-            for layer in layers.clone() {
+            for &layer in &layers {
                 let weight = ExpertWeights::load(
                     device.library,
                     catalog,
@@ -539,7 +539,7 @@ impl<'a> NativeTp2<'a> {
     fn finish_load(
         device: Device<'a>,
         rank: u8,
-        layers: Range<usize>,
+        layers: Vec<usize>,
         max_rows: usize,
         workspace_bytes: usize,
         weights: DeviceOwner<'a, Vec<ExpertWeights<'a>>>,
@@ -576,7 +576,7 @@ impl<'a> NativeTp2<'a> {
     pub(crate) fn execution(
         device: Device<'a>,
         rank: u8,
-        layers: Range<usize>,
+        layers: Vec<usize>,
         max_rows: usize,
         workspace_bytes: usize,
         weights: Rc<DeviceOwner<'a, Vec<ExpertWeights<'a>>>>,
@@ -607,7 +607,7 @@ impl<'a> NativeTp2<'a> {
                 .into_iter()
                 .map(|c| {
                     ExpertLayer::BackboneTp2 {
-                        layer: layers.start,
+                        layer: layers[0],
                         rank: rank as usize,
                     }
                     .select_kernel(device.library, c, nvfp4)
@@ -716,7 +716,7 @@ impl<'a> NativeTp2<'a> {
             self.layers.contains(&layer),
             "TP2 weight metadata layer unavailable"
         );
-        Ok(self.weights[layer - self.layers.start]
+        Ok(self.weights[super::resident_index(&self.layers, layer)?]
             .budget()
             .resident_bytes
             / self.geometry.experts as usize)
@@ -776,8 +776,8 @@ impl RtxExpertLayer for NativeTp2<'_> {
             },
         )
     }
-    fn layers(&self) -> Range<usize> {
-        self.layers.clone()
+    fn layers(&self) -> &[usize] {
+        &self.layers
     }
     fn device(&self) -> i32 {
         self.device.id
@@ -828,7 +828,7 @@ impl RtxExpertLayer for NativeTp2<'_> {
                 let state = &mut self.states[selected];
                 // SAFETY: caller retains complete rank-local inputs and owns exclusive stream/output use.
                 unsafe {
-                    self.weights[layer - self.layers.start]
+                    self.weights[super::resident_index(&self.layers, layer)?]
                         .bind(&state.kernel, &mut state.slots)?;
                     state.slots[0] = wire;
                     state.slots[1] = routes.ids;
@@ -904,6 +904,17 @@ impl RtxExpertLayer for NativeTp2<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn ordered_absolute_inventory_accepts_sparse_ids_and_rejects_aliases() {
+        for rank in 0..2 {
+            assert!(validate_layers(&[0, 2, 4], rank).is_ok());
+            for invalid in [&[][..], &[2, 2], &[3, 1], &[expert_geometry().layers as usize]] {
+                assert!(validate_layers(invalid, rank).is_err());
+            }
+        }
+        assert!(validate_layers(&[0], 2).is_err());
+    }
+
     #[test]
     fn queued_drop_waits_before_releasing_storage() -> Result<()> {
         use std::sync::{

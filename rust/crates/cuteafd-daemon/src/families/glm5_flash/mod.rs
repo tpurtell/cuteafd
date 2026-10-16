@@ -50,8 +50,8 @@ pub(crate) struct EngineArgs {
     /// MLA attention over the two GPUs of a head split: auto (context where this build carries its
     /// programs), context (records and pool keys by 256-token unit on one GPU each, a q /
     /// candidate / partial exchange per MLA layer, the compact index cache), or heads (replicated
-    /// latent and token keys, head-split attention). KDA layers are always head-split; owned MLA
-    /// layers (`layers`) have no executor yet.
+    /// latent and token keys, head-split attention), or explicit layers (complete MLA operands
+    /// and caches on alternating owners, split FFNs). KDA layers are always head-split.
     #[arg(long, env = "CUTEAFD_ATTENTION_PLACEMENT", default_value = "auto")]
     pub attention_placement: String,
     /// Run only the first N layers (layers 0-2 are the dense ones).
@@ -493,13 +493,16 @@ mod draft_cli_tests {
                 check_options(&args).unwrap();
             }
         }
-        // context runs on a head split (#57); one GPU, owned layers and unknown modes are refused.
+        // context and explicit owned layers need two GPUs; unknown modes are refused.
         let mut args = parse(&["--attention-placement", "context"]);
         args.split_device = Some(1);
         check_options(&args).unwrap();
         args.prefix_marks = prefix::PrefixMarks::Pool;
         assert!(check_options(&args).unwrap_err().to_string().contains("prefix marks"));
-        for (mode, peers) in [("context", &[false][..]), ("layers", &[false, true]), ("unknown", &[false, true])] {
+        let mut layers = parse(&["--attention-placement", "layers"]);
+        layers.split_device = Some(1);
+        check_options(&layers).unwrap();
+        for (mode, peers) in [("context", &[false][..]), ("layers", &[false]), ("unknown", &[false, true])] {
             for &peer in peers {
                 let mut args = parse(&["--attention-placement", mode]);
                 args.split_device = peer.then_some(1);
@@ -536,22 +539,44 @@ mod draft_cli_tests {
         for ranks in [1, 2] {
             for fp8_head in [false, true] {
                 let representation = GlmfRepresentation { fp8_head, ..Default::default() };
-                let gpu = runtime_resident_weights(&checkpoint, &cfg, cfg.layers, ranks, representation, EmbedPlacement::Gpu).unwrap();
-                let host = runtime_resident_weights(&checkpoint, &cfg, cfg.layers, ranks, representation, EmbedPlacement::Host).unwrap();
+                let gpu = runtime_resident_weights(&checkpoint, &cfg, cfg.layers, ranks, representation, EmbedPlacement::Gpu, Default::default()).unwrap();
+                let host = runtime_resident_weights(&checkpoint, &cfg, cfg.layers, ranks, representation, EmbedPlacement::Host, Default::default()).unwrap();
                 assert_eq!((gpu[0].embedding, host[0].embedding), (524_288, 0));
                 assert!(gpu[0].weights > 0);
                 assert_eq!(gpu.iter().map(|r| r.weights).collect::<Vec<_>>(), host.iter().map(|r| r.weights).collect::<Vec<_>>());
                 if ranks == 2 { assert_eq!(host[1].embedding, 0); assert!(host[1].weights > 0); }
             }
         }
+        for first_owner in [0, 1] {
+            let attention = engine::GlmfAttention { mode: cuteafd_loader::placement::AttentionPlacement::Layers,
+                first_owner, ..Default::default() };
+            let actual = runtime_resident_weights(&checkpoint, &cfg, cfg.layers, 2,
+                Default::default(), EmbedPlacement::Gpu, attention).unwrap();
+            let expected = cuteafd_loader::families::glm5_flash::resident::resident_weights_placed(
+                &checkpoint, &cfg, cfg.layers, 2, Default::default(), attention.mode, first_owner as usize).unwrap();
+            assert_eq!(actual.iter().map(|r| (r.embedding, r.weights)).collect::<Vec<_>>(),
+                expected.iter().map(|r| (r.embedding, r.weights)).collect::<Vec<_>>());
+        }
         checkpoint.config["tie_word_embeddings"] = serde_json::json!(true);
-        let error = runtime_resident_weights(&checkpoint, &cfg, 0, 2, Default::default(), EmbedPlacement::Host).unwrap_err();
+        let error = runtime_resident_weights(&checkpoint, &cfg, 0, 2, Default::default(), EmbedPlacement::Host, Default::default()).unwrap_err();
         assert!(error.to_string().contains("tie_word_embeddings=true"));
-        assert!(runtime_resident_weights(&checkpoint, &cfg, 0, 2, Default::default(), EmbedPlacement::Gpu).is_ok());
+        assert!(runtime_resident_weights(&checkpoint, &cfg, 0, 2, Default::default(), EmbedPlacement::Gpu, Default::default()).is_ok());
         checkpoint.config["tie_word_embeddings"] = serde_json::json!(false);
         checkpoint.tensors[2].meta.byte_offset = 0;
-        let error = runtime_resident_weights(&checkpoint, &cfg, 0, 2, Default::default(), EmbedPlacement::Host).unwrap_err();
+        let error = runtime_resident_weights(&checkpoint, &cfg, 0, 2, Default::default(), EmbedPlacement::Host, Default::default()).unwrap_err();
         assert!(error.to_string().contains("aliases its storage"));
+    }
+
+    #[test]
+    fn served_index_cache_preserves_whole_owner_compact_state_without_changing_heads() {
+        use cuteafd_loader::placement::AttentionPlacement::{Context, Heads, Layers};
+        use engine::IndexCache::{Compact, Keys};
+        for requested in [Compact, Keys] {
+            assert_eq!(served_index_cache(requested, true, Heads), Keys);
+            assert_eq!(served_index_cache(requested, true, Context), Compact);
+            assert_eq!(served_index_cache(requested, true, Layers), requested);
+            assert_eq!(served_index_cache(requested, false, Heads), requested);
+        }
     }
 
     /// `--target-head`: unset follows the shared setting (tensor by default) and stays inert over
@@ -758,7 +783,7 @@ mod draft_cli_tests {
             let rest = &source[start..];
             &rest[..rest.find("\n    }\n").unwrap()]
         };
-        let (dense, experts) = (body("load_dense"), body("experts_range"));
+        let (dense, experts) = (body("load_dense"), body("experts_for_layers"));
         let sized = ["args.expert", "_rows()"].concat();
         assert!(dense.contains(&["DenseNvfp4::load(&self.library, &directory, &self.cfg, ", &sized, ")?"].concat()));
         // FP8 experts, EXL3 experts and the Spark transports, each with the rows among its arguments.
@@ -854,9 +879,50 @@ mod draft_cli_tests {
         assert!(admitted_spark_layers(&cfg, &assignments[..3], false).unwrap().is_empty());
         assignments[24].experts = ExpertHome::Spark;
         assignments[26].experts = ExpertHome::Spark;
-        assert!(admitted_spark_layers(&cfg, &assignments, false).unwrap_err().to_string().contains("contiguous"));
+        assert_eq!(admitted_spark_layers(&cfg, &assignments, false).unwrap(), vec![24, 26]);
+        assert_eq!(admitted_expert_layers(&cfg, &assignments, ExpertHome::RtxTp2, false).unwrap(),
+            (3..24).collect::<Vec<_>>());
+        assert_eq!(admitted_expert_layers(&cfg, &assignments, ExpertHome::RtxWhole { gpu: 0 }, false).unwrap(),
+            (25..45).filter(|&layer| layer != 26).collect::<Vec<_>>());
+        for invalid in [&[24, 24][..], &[26, 24], &[2], &[45]] {
+            assert!(validate_expert_layers(&cfg, 45, invalid).is_err());
+        }
+        assert!(validate_expert_layers(&cfg, 26, &[24, 26]).is_err());
+        validate_expert_layers(&cfg, 45, &[24, 26]).unwrap();
         assignments.push(assignments[0]);
         assert!(admitted_spark_layers(&cfg, &assignments, false).is_err());
+    }
+
+    #[test]
+    fn sparse_admission_partitions_backends_without_loading_gaps() -> Result<()> {
+        use crate::shared::placement::layers::{BackendLayers, ExpertRouting};
+        use cuteafd_loader::placement::{ExpertHome, LayerAssignment, LayerMode};
+        let mut cfg = GlmNextConfig::from_hf(&cuteafd_loader::plan::testing::glm5_flash_config(18))?;
+        cfg.dense = (0..18).map(|layer| layer < 3).collect();
+        let mut assignments = vec![LayerAssignment { mode: LayerMode::HeadSplit, experts: ExpertHome::Spark }; 18];
+        let local_home = ExpertHome::RtxWhole { gpu: 0 };
+        for layer in [3, 7] { assignments[layer].experts = local_home; }
+        for layer in [13, 15] { assignments[layer].experts = ExpertHome::RtxTp2; }
+        let local = admitted_expert_layers(&cfg, &assignments, local_home, false)?;
+        let tp2 = admitted_expert_layers(&cfg, &assignments, ExpertHome::RtxTp2, false)?;
+        let spark = admitted_spark_layers(&cfg, &assignments, false)?;
+        assert_eq!(local, vec![3, 7]);
+        assert_eq!(tp2, vec![13, 15]);
+        assert_eq!(spark, vec![4, 5, 6, 8, 9, 10, 11, 12, 14, 16, 17]);
+        let bind = |tp2: &[usize]| ExpertRouting::bind(&assignments, &cfg.dense, &[
+            BackendLayers { home: local_home, layers: &local },
+            BackendLayers { home: ExpertHome::RtxTp2, layers: tp2 },
+            BackendLayers { home: ExpertHome::Spark, layers: &spark },
+        ]);
+        let routes = bind(&tp2)?;
+        assert_ne!(routes.route(13), routes.route(14));
+        assert_eq!(routes.route(13), routes.route(15));
+        assert!(bind(&[13]).is_err());
+        assert!(bind(&[13, 14, 15]).is_err());
+        for home in [local_home, ExpertHome::RtxTp2, ExpertHome::Spark] {
+            assert!(admitted_expert_layers(&cfg, &assignments, home, true)?.is_empty());
+        }
+        Ok(())
     }
 
     /// Local onboarding and Spark transports coexist: the admitted layer home selects each.
@@ -1182,10 +1248,10 @@ fn parse_onboard(text: &str) -> std::result::Result<cuteafd_loader::placement::O
 
 fn runtime_resident_weights(checkpoint: &Checkpoint, cfg: &GlmNextConfig, layers: usize, ranks: usize,
     representation: cuteafd_loader::families::glm5_flash::resident::GlmfRepresentation,
-    embedding: crate::shared::token_io::EmbedPlacement)
+    embedding: crate::shared::token_io::EmbedPlacement, attention: engine::GlmfAttention)
     -> Result<Vec<cuteafd_loader::families::glm5_flash::resident::GlmfResidentRank>> {
-    let mut resident = cuteafd_loader::families::glm5_flash::resident::resident_weights(
-        checkpoint, cfg, layers, ranks, representation).map_err(anyhow::Error::msg)?;
+    let mut resident = cuteafd_loader::families::glm5_flash::resident::resident_weights_placed(
+        checkpoint, cfg, layers, ranks, representation, attention.mode, attention.first_owner as usize).map_err(anyhow::Error::msg)?;
     if embedding == crate::shared::token_io::EmbedPlacement::Host {
         checkpoint.require_untied_embedding("model.language_model.embed_tokens.weight")?;
         resident[0].embedding = 0;
@@ -1193,26 +1259,28 @@ fn runtime_resident_weights(checkpoint: &Checkpoint, cfg: &GlmNextConfig, layers
     Ok(resident)
 }
 
-fn admitted_spark_layers(cfg: &GlmNextConfig, layers: &[cuteafd_loader::placement::LayerAssignment],
-    skip: bool) -> Result<Vec<usize>> {
-    ensure!(layers.len() <= cfg.layers && cfg.dense.len() == cfg.layers,
-        "GLM Flash Spark selection has invalid layer bounds");
+fn validate_expert_layers(cfg: &GlmNextConfig, served: usize, layers: &[usize]) -> Result<()> {
+    ensure!(served <= cfg.layers && cfg.dense.len() == cfg.layers
+        && layers.windows(2).all(|ids| ids[0] < ids[1])
+        && layers.iter().all(|&layer| layer < served && !cfg.dense[layer]),
+        "GLM Flash expert inventory must contain ordered unique served routed layers: {layers:?}");
+    Ok(())
+}
+
+fn admitted_expert_layers(cfg: &GlmNextConfig, assignments: &[cuteafd_loader::placement::LayerAssignment],
+    home: cuteafd_loader::placement::ExpertHome, skip: bool) -> Result<Vec<usize>> {
+    ensure!(assignments.len() <= cfg.layers && cfg.dense.len() == cfg.layers,
+        "GLM Flash expert selection has invalid layer bounds");
     // Dense assignments may carry the solver's default Spark home but own no routed experts.
-    let selected: Vec<_> = layers.iter().enumerate().filter_map(|(layer, assigned)|
-        (!skip && !cfg.dense[layer] && assigned.experts == cuteafd_loader::placement::ExpertHome::Spark)
-            .then_some(layer)).collect();
-    ensure!(selected.windows(2).all(|pair| pair[1] == pair[0] + 1),
-        "GLM Flash Spark selection requires a contiguous routed range");
+    let selected = assignments.iter().enumerate().filter_map(|(layer, assigned)|
+        (!skip && !cfg.dense[layer] && assigned.experts == home).then_some(layer)).collect::<Vec<_>>();
+    validate_expert_layers(cfg, assignments.len(), &selected)?;
     Ok(selected)
 }
 
-fn admitted_tp2_range(placement: &cuteafd_loader::placement::Placement) -> Result<Option<std::ops::Range<usize>>> {
-    let selected: Vec<_> = placement.layers.iter().enumerate().filter_map(|(i, l)|
-        (l.experts == cuteafd_loader::placement::ExpertHome::RtxTp2).then_some(i)).collect();
-    let Some(&first) = selected.first() else { return Ok(None) };
-    let end = selected.last().copied().unwrap() + 1;
-    ensure!(selected.len() == end - first, "GLM Flash TP2 currently requires a contiguous routed range");
-    Ok(Some(first..end))
+fn admitted_spark_layers(cfg: &GlmNextConfig, layers: &[cuteafd_loader::placement::LayerAssignment],
+    skip: bool) -> Result<Vec<usize>> {
+    admitted_expert_layers(cfg, layers, cuteafd_loader::placement::ExpertHome::Spark, skip)
 }
 
 /// The checkpoint and native library, opened on the calling thread.
@@ -1275,10 +1343,16 @@ pub(crate) fn open(args: &EngineArgs) -> Result<Opened> {
     Ok(Opened { checkpoint, fp8_checkpoint, cfg, library, experts })
 }
 
-/// The DSA index cache an engine builds for `requested`: both GPUs of a head split run the indexer,
-/// and their index tails are not built yet, so a head split keeps the token keys.
-pub(crate) fn served_index_cache(requested: engine::IndexCache, head_split: bool) -> engine::IndexCache {
-    if head_split { engine::IndexCache::Keys } else { requested }
+/// Heads on two GPUs needs token keys; context needs compact pools. Whole MLA
+/// owners can serve either cache, with compact tails only on the actual owner.
+pub(crate) fn served_index_cache(requested: engine::IndexCache, split: bool,
+    attention: cuteafd_loader::placement::AttentionPlacement) -> engine::IndexCache {
+    use cuteafd_loader::placement::AttentionPlacement;
+    match attention {
+        AttentionPlacement::Context => engine::IndexCache::Compact,
+        AttentionPlacement::Heads if split => engine::IndexCache::Keys,
+        _ => requested,
+    }
 }
 
 /// The MLA placement an engine serves (`glm5_flash::resolve_attention` over the requested mode and
@@ -1306,7 +1380,7 @@ impl Opened {
         -> Result<(cuteafd_loader::placement::Placement, cuteafd_loader::placement::GraphSet,
             cuteafd_loader::placement::families::glm5_flash::GlmfWorkingSet)> {
         use cuteafd_loader::placement::{self, families::glm5_flash as admission};
-        use cuteafd_loader::families::glm5_flash::resident::{router_replica_bytes, GlmfRepresentation};
+        use cuteafd_loader::families::glm5_flash::resident::GlmfRepresentation;
         use cuteafd_loader::serving_capacity::{glmf_step_scratch, glmf_table_pages,
             GlmfScratchOptions, GlmfStepShape};
         ensure!(args.expert_window.is_none(), "solver admission does not support diagnostic expert paging");
@@ -1326,10 +1400,13 @@ impl Opened {
         let representation = GlmfRepresentation { kda_fp8: args.kda_fp8 != fp8::KdaFp8::Off,
             fp8_head: args.fp8_head, output_shard: args.kda_output_shard };
         let resident = runtime_resident_weights(&headers, &self.cfg, layers, devices.len(), representation,
-            args.token_io.embed_placement)?;
-        let router_replica_bytes = router_replica_bytes(&headers, &self.cfg, layers).map_err(anyhow::Error::msg)?;
+            args.token_io.embed_placement, attention)?;
+        let alternate_resident = (attention.mode == placement::AttentionPlacement::Layers).then(||
+            runtime_resident_weights(&headers, &self.cfg, layers, devices.len(), representation,
+                args.token_io.embed_placement, engine::GlmfAttention { first_owner: 1 - attention.first_owner, ..attention }))
+            .transpose()?;
         let spark_ranks = args.peers.as_deref().map_or(0, |p| p.split(',').count());
-        let lanes = engine::configured_prefill_lanes(spark_ranks > 0, layers == self.cfg.layers, args.prefill_lanes);
+        let lanes = engine::configured_prefill_lanes(layers == self.cfg.layers, args.prefill_lanes);
         let lookup = |name: &str| programs.spec(name).ok().map(|p| p.scratch.get("scratch").copied().unwrap_or(0));
         let scratch = GlmfScratchOptions { split, kda_w8: representation.kda_fp8,
             kda_fp32_partials: args.kda_fp32_partials, kda_output_shard: args.kda_output_shard,
@@ -1348,7 +1425,7 @@ impl Opened {
         let workspaces = |spark, lanes| admission::step_workspace_demands(&self.cfg, lanes,
             args.prefill_rows as u64, args.decode_rows as u64, GlmfStepShape { spark, ..shape }, decode, prefill);
         let workspace = workspaces(spark_ranks > 0, lanes);
-        let local_workspace = workspaces(false, 1);
+        let local_workspace = workspaces(false, lanes);
         let mut experts = self.experts.as_ref().map(|c| admission::expert_costs(c, split)).transpose()?.unwrap_or_default();
         experts.truncate(self.cfg.dense[..layers].iter().filter(|&&d| !d).count());
         if args.skip_experts { for cost in &mut experts { cost.whole = Default::default(); cost.half = Default::default(); } }
@@ -1399,17 +1476,20 @@ impl Opened {
             sequences: sequences.min(args.decode_rows) as u64, speculation, state_slots: args.slots as u64,
             mark_slots: marks as u64, pool_marks: args.prefix_marks == prefix::PrefixMarks::Pool, index: index.into(),
             kda_state_bytes: args.kda_state.bytes() as u64, shared_replay: args.replay_records == engine::ReplayRecords::Shared,
-            representation, resident, router_replica_bytes, workspace, local_workspace, graphs, experts, expert_workspace, tp2_workspace,
+            representation, resident, workspace, local_workspace, graphs, experts, expert_workspace, tp2_workspace,
             drafter_bytes, drafter_scratch, drafter_bridge, requested_pool: (args.pool_tokens > 0).then_some(args.pool_tokens as u64), onboard,
             full_prefill_logits: 0 };
         let target = placement::PoolPolicy::resolve(&inputs.gpus.iter().map(|g| g.0).collect::<Vec<_>>(),
             args.max_context as u64, inputs.requested_pool, 256, spark_ranks == 0).target;
-        let (placement, graphs, working) = admission::solve_working_set_with_graphs(&inputs, target, automatic_context, sms, true)?;
+        let (placement, graphs, working) = admission::solve_attention_working_set_with_graphs(&inputs,
+            alternate_resident.as_deref(), target, automatic_context, sms, true)?;
+        let attention = admission::placed_attention(attention, &placement);
         ensure!(placement.movables.iter().all(|(id, gpu)| *gpu == 0
             || (*id == placement::MovableId::Drafter && *gpu == 1 && prepared_draft.is_some())),
             "GLM Flash placement has no matching movable executor");
         tracing::info!(placement = %placement.summary(), spark_ranks = working.spark_ranks,
-            prefill_lanes = working.prefill_lanes, spark_layers = ?working.spark_layers, "GLM Flash admission before weights");
+            prefill_lanes = working.prefill_lanes, spark_layers = ?working.spark_layers,
+            attention_first_owner = attention.first_owner, "GLM Flash admission before weights");
         let devices: Vec<_> = placement.items.iter().zip(&inventory.gpus).enumerate().map(|(rank, (items, gpu))| {
             let mut items = items.clone();
             items.push(cuteafd_core::memory_layout::Item::new(
@@ -1421,6 +1501,8 @@ impl Opened {
             "memory_layout": {"devices": devices, "pool_tokens": placement.pool_tokens},
             "graph_shapes": graphs.shapes, "graphs": graphs.ranks.iter().map(|r| r.executables).collect::<Vec<_>>(),
             "speculation": speculation, "sequences": sequences,
+            "attention_first_owner": attention.first_owner,
+            "layer_modes": placement.layers.iter().map(|layer| layer.mode).collect::<Vec<_>>(),
         }), "GLM Flash startup plan");
         cuteafd_bench::context::set_resolved("rtx-expert-layers", &placement.onboard_layers.to_string());
         Ok((placement, graphs, working))
@@ -1575,8 +1657,7 @@ impl Opened {
             Some(manifest)
         } else { None };
         let context_mode = (attention.mode == cuteafd_loader::placement::AttentionPlacement::Context).then_some(attention);
-        let index_cache = if context_mode.is_some() { engine::IndexCache::Compact }
-            else { served_index_cache(args.index_cache, split_device.is_some()) };
+        let index_cache = served_index_cache(args.index_cache, split_device.is_some(), attention.mode);
         if let (Some(device), true, None) = (split_device, index_cache != args.index_cache, context_mode) {
             tracing::warn!(device, "--index-cache compact is single-GPU under heads; the head split keeps the token keys");
         }
@@ -1616,8 +1697,9 @@ impl Opened {
         let (placement, admitted_graphs, working) = self.admit(args, &programs, layers, index_cache, mark_slots,
             split_device, automatic_context, prepared_draft.as_ref(), attention)?;
         cuteafd_loader::placement::families::GLM5_FLASH.check(&placement)?;
-        ensure!((placement.attention_placement == cuteafd_loader::placement::AttentionPlacement::Context)
-            == context_mode.is_some(), "GLM Flash admission placed {} attention, the engine serves {}",
+        let attention = cuteafd_loader::placement::families::glm5_flash::placed_attention(attention, &placement);
+        ensure!(placement.attention_placement == attention.mode,
+            "GLM Flash admission placed {} attention, the engine serves {}",
             placement.attention_placement, attention.mode);
         let draft_gpu = placement.movables.iter().find(|(id, _)| *id == cuteafd_loader::placement::MovableId::Drafter)
             .map_or(0, |(_, gpu)| *gpu);
@@ -1628,9 +1710,16 @@ impl Opened {
         let args = &selected_args;
         if !args.skip_experts && placement.tp2.is_some() { engine::check_tp2_lanes(args.prefill_lanes)?; }
         let spark_layers = admitted_spark_layers(&self.cfg, &placement.layers, args.skip_experts)?;
-        if !args.skip_experts { ensure!(spark_layers == working.spark_layers,
-            "GLM Flash runtime Spark selection disagrees with admitted working set"); }
-        let spark_range = spark_layers.first().map(|&first| first..spark_layers.last().copied().unwrap() + 1);
+        if !args.skip_experts {
+            ensure!(spark_layers == working.spark_layers,
+                "GLM Flash runtime Spark selection disagrees with admitted working set");
+            let rtx_layers = placement.layers.iter().enumerate().filter_map(|(layer, assigned)|
+                (!self.cfg.dense[layer] && matches!(assigned.experts,
+                    cuteafd_loader::placement::ExpertHome::RtxWhole { .. }
+                    | cuteafd_loader::placement::ExpertHome::RtxTp2)).then_some(layer)).collect::<Vec<_>>();
+            ensure!(rtx_layers == working.rtx_layers,
+                "GLM Flash runtime RTX selection disagrees with admitted working set");
+        }
         if args.placement_handshake {
             let peers = args.peers.as_deref().context("worker placement handshake needs Spark peers")?
                 .split(',').map(str::parse).collect::<std::result::Result<Vec<std::net::SocketAddr>, _>>()?;
@@ -1647,11 +1736,21 @@ impl Opened {
             tracing::info!(layers = ?spark_layers, digest = %selection.digest()?,
                 "GLM Flash Spark solved layer set acknowledged before lanes");
         }
+        let execution = cuteafd_loader::placement::LayerExecutionPlan::new(&placement,
+            cuteafd_loader::placement::HopSpec {
+                storage: cuteafd_loader::placement::HopStorage::ReceiveSlots,
+                row_bytes: 4 * self.cfg.hidden as u64 * 2,
+                rows: args.prefill_rows.max(args.decode_rows) as u64,
+                lanes: working.prefill_lanes,
+                entry_gpu: 0, head_gpu: 0,
+                terminal: if peer_stream.is_some() { cuteafd_loader::placement::TerminalHome::Replicated }
+                    else { cuteafd_loader::placement::TerminalHome::AttentionOwner },
+            })?;
         let source = self.embed_source()?;
         let (embedding, (model, mut shares)) = crate::shared::token_io::TokenEmbedding::load(&self.library, source,
             args.token_io.embed_placement, || {
                 let _memory_scope = cuteafd_ffi::memory_ledger::scope("weights");
-                loader.model(&self.cfg, layers)
+                loader.model(&self.cfg, &execution)
             })?;
         probe("target-weights")?;
         let resident: usize = model.layers.iter().map(weights::GlmfLayer::bytes).sum();
@@ -1660,15 +1759,19 @@ impl Opened {
         // Header-only resident inventory uses the actual loader flags, not launcher defaults.
         if args.kda_nvfp4_gate.is_none() {
             let headers = cuteafd_loader::plan::Checkpoint::coordinator(&args.snapshot, false, false)?;
-            let expected = cuteafd_loader::families::glm5_flash::resident::resident_weights(
+            let expected = cuteafd_loader::families::glm5_flash::resident::resident_weights_placed(
                 &headers, &self.cfg, layers, 1 + usize::from(peer_stream.is_some()),
                 cuteafd_loader::families::glm5_flash::resident::GlmfRepresentation {
                     kda_fp8: args.kda_fp8 != fp8::KdaFp8::Off, fp8_head: args.fp8_head,
                     output_shard: args.kda_output_shard,
-                }).map_err(anyhow::Error::msg)?;
+                }, attention.mode, attention.first_owner as usize).map_err(anyhow::Error::msg)?;
             let actual = resident + model.norm.buffer.bytes + model.head.bytes();
+            let peer_expected = expected.get(1).map_or(0, |r| r.weights);
+            ensure!(expected[0].weights == actual as u64 && peer_expected == peer_resident as u64,
+                "GLM Flash uploaded weights differ from admission: lead {} versus {} bytes; peer {} versus {} bytes",
+                actual, expected[0].weights, peer_resident, peer_expected);
             tracing::info!(planned_lead_bytes = expected[0].weights, resident_lead_bytes = actual,
-                planned_peer_bytes = expected.get(1).map_or(0, |r| r.weights), resident_peer_bytes = peer_resident,
+                planned_peer_bytes = peer_expected, resident_peer_bytes = peer_resident,
                 "GLM Flash shared resident inventory versus uploaded operands");
         }
 
@@ -1698,7 +1801,7 @@ impl Opened {
             let tp2 = !args.skip_experts && placement.tp2.is_some();
             let plan = engine::StepPlan::new(&self.library, &programs, &self.cfg, &model.layers, None, settings)
                 .with_experts(local, spark, tp2);
-            let lanes = engine::configured_prefill_lanes(spark, layers == self.cfg.layers, args.prefill_lanes);
+            let lanes = engine::configured_prefill_lanes(layers == self.cfg.layers, args.prefill_lanes);
             Some(engine::StepWorkspaces::allocate(&plan, args.prefill_rows, lanes)?)
         } else { None };
         let records = early_workspaces.as_ref().map(|w| w.prefill_scratch()
@@ -1706,7 +1809,7 @@ impl Opened {
         let pages = (pool_tokens + reserved_units as usize * engine::UNIT_ROWS).div_ceil(engine::PAGE_ROWS);
         let mut engine = engine::GlmfEngine::new(&self.library, &programs, self.cfg.clone(), model, stream,
             max_context, args.prefill_rows, args.prefill_lanes, pages, args.slots, embedding, index_cache,
-            args.kda_state, args.decode_rows, records, context_mode)?;
+            args.kda_state, args.decode_rows, records, context_mode, args.prefix_marks == prefix::PrefixMarks::Pool, &execution)?;
         engine.attention_plan = attention_plan;
         engine.spark_bf16 = self.checkpoint.spark_input_is_bf16();
 
@@ -1722,9 +1825,13 @@ impl Opened {
         tracing::info!(target_head = ?engine.target_head, requested = ?args.target_head, fp8_head = args.fp8_head,
             "GLM 5.3 Flash target head");
         if let Some((device, peer_stream)) = peer_stream {
-            engine.attach_peer(device, peer_stream, shares.pop().context("head-split shares")?)?;
+            engine.attach_peer(device, peer_stream, shares.pop().context("head-split shares")?, &execution)?;
             tracing::info!(device = args.device, split_device = device, attention = %attention.mode,
                 "GLM 5.3 Flash head split over two GPUs");
+        }
+        engine.validate_attention_homes(&execution)?;
+        if attention.mode == cuteafd_loader::placement::AttentionPlacement::Layers {
+            engine.bind_layer_execution(execution)?;
         }
         if let Some(manifest) = &context_manifest {
             // The solver charged selected partial scratch and full-extent staging.
@@ -1739,8 +1846,9 @@ impl Opened {
         engine.fp8_prefill = engine::Fp8Prefill { mla: group(Fp8PrefillGroup::Mla), ffn: group(Fp8PrefillGroup::Ffn),
             kda_bits: i32::from(kda && group(Fp8PrefillGroup::KdaIn))
                 | (i32::from(kda && group(Fp8PrefillGroup::KdaO)) << 1) };
-        let tp2_range = if args.skip_experts { None } else { admitted_tp2_range(&placement)? };
-        if let Some(range) = tp2_range {
+        let tp2_layers = admitted_expert_layers(&self.cfg, &placement.layers,
+            cuteafd_loader::placement::ExpertHome::RtxTp2, args.skip_experts)?;
+        if !tp2_layers.is_empty() {
             ensure!(startup_graphs, "GLM Flash TP2 experts require startup graphs; remove --graph-budget-mib and \
                 set CUTEAFD_GLMF_STARTUP_GRAPHS=1 (post-ready captures are not admitted)");
             let peer = peer_stream.context("TP2 placement without peer device")?;
@@ -1753,13 +1861,13 @@ impl Opened {
             let ranks: [Box<dyn RtxExpertLayer + '_>; 2] = if let Some(manifest) = catalog.exl3() {
                 let package = crate::shared::experts::exl3::aot_layout_directory(&args.native_lib,
                     manifest.decoder_tiers(), "rtx-tp2");
-                Exl3Tp2::load_pair(devices, catalog, &package, range, args.expert_rows(), budgets)?
+                Exl3Tp2::load_pair(devices, catalog, &package, tp2_layers.clone(), args.expert_rows(), budgets)?
                     .map(|r| Box::new(r) as Box<dyn RtxExpertLayer>)
             } else {
                 let tensors = catalog.fp8().context("FP8 TP2 tensors")?;
                 let package = args.fp8_package.clone().unwrap_or_else(||
                     crate::shared::experts::fp8::package_directory(&args.native_lib, 2, tensors.format()));
-                Fp8MoeTp2::load_pair(devices, tensors, &package, range, args.expert_rows(), budgets)?
+                Fp8MoeTp2::load_pair(devices, tensors, &package, tp2_layers, args.expert_rows(), budgets)?
                     .map(|r| Box::new(r) as Box<dyn RtxExpertLayer>)
             };
             probe("expert-packages")?;
@@ -1769,25 +1877,27 @@ impl Opened {
         // Spark links remain available for every layer whose admitted home is Spark.
         let spark = !spark_layers.is_empty();
         if moe {
-            if let Some(range) = placement.expert_ranges.first().filter(|r| r.layers > 0) {
-                let budget = usize::try_from(range.peak_bytes)?;
-                let range = range.first..range.first + range.layers;
+            let local_layers = admitted_expert_layers(&self.cfg, &placement.layers,
+                cuteafd_loader::placement::ExpertHome::RtxWhole { gpu: 0 }, args.skip_experts)?;
+            if !local_layers.is_empty() {
+                let budget = usize::try_from(placement.expert_ranges.first().context("local expert arena admission")?.peak_bytes)?;
                 let mut expert_args = args.clone();
                 expert_args.local_experts = true;
                 expert_args.peers = None;
-                if let Some(experts) = self.experts_range(&expert_args, Some(range.clone()), Some(budget))? {
-                    if let engine::Experts::LocalExl3(local) = &experts { local.ensure(range.start, stream)?; }
-                    engine.install_local(range, experts);
-                }
+                let experts = self.experts_for_layers(&expert_args, &local_layers, Some(budget))?
+                    .context("admitted local expert backend is missing")?;
+                if let engine::Experts::LocalExl3(local) = &experts { local.ensure(local_layers[0], stream)?; }
+                engine.install_local(local_layers, experts)?;
             }
             if spark || args.skip_experts {
                 let mut expert_args = args.clone();
                 expert_args.local_experts = false;
-                if let Some(experts) = self.experts_range(&expert_args, spark_range.clone(), None)? {
-                    engine.set_experts(experts);
+                if let Some(experts) = self.experts_for_layers(&expert_args, &spark_layers, None)? {
+                    engine.set_experts(experts)?;
                 }
             }
         }
+        engine.bind_expert_homes(&placement, &spark_layers, args.skip_experts)?;
         engine.drafter = self.load_drafter(args, stream, &engine.embedding, prepared_draft.take())?;
         engine.attention_plan = attention_plan.validate_loaded(engine.drafter.as_ref().map(dspark::Drafter::drafts))?;
         tracing::info!(plan_rows = engine.attention_plan.rows(), active_drafts = ?engine.attention_plan.active_drafts(),
@@ -1875,22 +1985,21 @@ impl Opened {
         Ok(Some(dense))
     }
 
-    fn experts_range<'s>(&'s self, args: &EngineArgs, range: Option<std::ops::Range<usize>>, budget: Option<usize>) -> Result<Option<engine::Experts<'s>>> {
+    fn experts_for_layers<'s>(&'s self, args: &EngineArgs, selected: &[usize], budget: Option<usize>) -> Result<Option<engine::Experts<'s>>> {
         if args.skip_experts {
             return Ok(Some(engine::Experts::Skip));
         }
+        let served = args.layers.unwrap_or(self.cfg.layers).min(self.cfg.layers);
+        validate_expert_layers(&self.cfg, served, selected)?;
+        if selected.is_empty() { return Ok(None); }
         if let Some(tensors) = self.fp8().filter(|_| args.local_experts) {
             let directory = args.fp8_package.clone()
                 .unwrap_or_else(|| crate::shared::experts::fp8::package_directory(&args.native_lib, 1, tensors.format()));
             let budget = match budget { Some(bytes) => bytes, None => self.library.cuda_memory_info()?.0
                 .saturating_sub(args.expert_reserve_gib.saturating_mul(1 << 30)) };
             ensure!(args.expert_window != Some(0), "--expert-window must be at least 1");
-            let layers = args.layers.unwrap_or(self.cfg.layers).min(self.cfg.layers);
-            let first = (0..layers).find(|&layer| !self.cfg.dense[layer]).unwrap_or(layers);
-            let resident = range.clone().unwrap_or_else(|| if args.expert_window.is_some() { 0..0 } else { first..layers });
-            let layer_ids: Vec<_> = resident.collect();
             let started = Instant::now();
-            let experts = crate::shared::experts::fp8::Fp8Experts::load(&self.library, tensors, &directory, &layer_ids, 1, 0,
+            let experts = crate::shared::experts::fp8::Fp8Experts::load(&self.library, tensors, &directory, selected, 1, 0,
                 args.expert_rows(), budget)
                 .context("local routed experts must fit with step and prefix-cache reservations; use --peers for Sparks, \
                     or --expert-window N for diagnostic paging")?;
@@ -1907,18 +2016,14 @@ impl Opened {
                 None => self.library.cuda_memory_info()?.0.saturating_sub(12 << 30) };
             return Ok(Some(engine::Experts::LocalExl3(engine::LocalExl3 {
                 library: &self.library, native_lib: args.native_lib.clone(), catalog,
-                resident: std::cell::RefCell::new(None), window: range.as_ref().map_or(args.exl3_window.max(1), |r| r.len()),
-                layers: range.as_ref().map_or(args.layers.unwrap_or(self.cfg.layers).min(self.cfg.layers), |r| r.end), max_rows: args.expert_rows(),
+                resident: std::cell::RefCell::new(None), window: selected.len(),
+                layers: selected.to_vec(), max_rows: args.expert_rows(),
                 // Room for the step workspace (logits alone are 2.4 GiB at 4096 rows).
                 budget, loads: std::cell::RefCell::new(0),
             })));
         }
         let Some(peers) = args.peers.as_deref() else { return Ok(None) };
-        let layers = args.layers.unwrap_or(self.cfg.layers).min(self.cfg.layers);
-        let remote = range.context("GLM Flash Spark transport needs an admitted routed range")?;
-        if remote.is_empty() { return Ok(None); }
-        ensure!(remote.end <= layers && self.cfg.dense[remote.clone()].iter().all(|&dense| !dense),
-            "GLM Flash Spark transport range must contain only served routed layers");
+        let remote = selected;
         let peers = peers.split(',').map(str::parse).collect::<std::result::Result<Vec<std::net::SocketAddr>, _>>()?;
         let executors: Vec<u64> = (0..peers.len())
             .map(|rank| cuteafd_transport::expert::v41_spark_executor_id(peers.len(), rank))
@@ -1938,9 +2043,9 @@ impl Opened {
         // prompt would reconnect four ranks mid-prefill, and the first request would open transport 0.
         // Every transport a prefill runs on (transport 0 also carries decode, verify and serial chunks)
         // is warmed with `expert_rows` rows, the most any of its waves carries.
-        let warmed = engine::configured_prefill_lanes(true, layers == self.cfg.layers, transports.len());
+        let warmed = engine::configured_prefill_lanes(served == self.cfg.layers, transports.len());
         let warm_rows = args.expert_rows();
-        let warm = engine::spark_warmup_request(&self.cfg, warm_rows, remote.start, self.checkpoint.spark_input_is_bf16())?;
+        let warm = engine::spark_warmup_request(&self.cfg, warm_rows, remote[0], self.checkpoint.spark_input_is_bf16())?;
         // Connect every warmed rank now and publish its installed expert
         // grouping: the draft planner prices the workers before any wave opens a
         // session, and the warm-up below then reuses these sessions.

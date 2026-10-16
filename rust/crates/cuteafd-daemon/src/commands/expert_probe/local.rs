@@ -28,16 +28,15 @@ pub(super) fn run(
     let stream = library.cuda_stream_create()?;
     let (free, _) = library.cuda_memory_info()?;
     let (stages, backbone, layer) = match args.stage {
-        Some(stage) => (stage + 1, 0..0, LocalLayer::Stage(stage)),
-        None => (0, args.layer..args.layer + 1, LocalLayer::Backbone(args.layer)),
+        Some(stage) => (stage + 1, Vec::new(), LocalLayer::Stage(stage)),
+        None => (0, vec![args.layer], LocalLayer::Backbone(args.layer)),
     };
-    let layers = backbone.len();
     let started = Instant::now();
-    let mut local = LocalExperts::load_range(&library, native_lib, catalog, stages, backbone, rows,
+    let mut local = LocalExperts::load(&library, native_lib, catalog, stages, &backbone, rows,
         free.saturating_sub(4 << 30), stream)?
         .context("no coordinator expert kernels or package for this checkpoint")?;
-    anyhow::ensure!(local.stages() == stages && local.layers() == layers,
-        "only {} stages and {} layers fit on this GPU", local.stages(), local.layers());
+    anyhow::ensure!(local.stages() == stages && local.layers() == backbone,
+        "only {} stages and {:?} backbone layers fit on this GPU", local.stages(), local.layers());
     eprintln!("resident in {:.1} s", started.elapsed().as_secs_f64());
 
     let upload = |bytes: &[u8]| -> Result<DeviceAllocation<'_>> {

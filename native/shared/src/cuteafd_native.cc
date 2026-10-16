@@ -813,7 +813,10 @@ extern "C" cuteafd_status_t cuteafd_cuda_device_info(int device_id, cuteafd_cuda
   out->cuda_available = 1;
   out->compute_capability_major = props.major;
   out->compute_capability_minor = props.minor;
-  out->integrated = props.integrated;
+  err = cudaDeviceGetAttribute(&out->integrated, cudaDevAttrIntegrated, device_id);
+  if (err != cudaSuccess) {
+    return fail_cuda(CUTEAFD_STATUS_CUDA_UNAVAILABLE, "cudaDevAttrIntegrated query failed", err);
+  }
   out->can_map_host_memory = props.canMapHostMemory;
   out->unified_addressing = props.unifiedAddressing;
   out->total_memory_bytes = props.totalGlobalMem;

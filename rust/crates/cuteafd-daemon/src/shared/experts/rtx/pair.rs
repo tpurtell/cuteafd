@@ -14,7 +14,6 @@ use std::{
     cell::{Cell, RefCell},
     collections::BTreeMap,
     ffi::c_void,
-    ops::Range,
 };
 
 /// Full submission boundary, including captured graph replays and caller-side
@@ -203,7 +202,7 @@ impl PackedRoutes {
 }
 
 pub(crate) struct Pair<'a> {
-    pub layers: Range<usize>,
+    pub layers: Vec<usize>,
     ranks: [RefCell<Box<dyn RtxExpertLayer + 'a>>; 2],
     pub combine: FusedCombine<'a>,
     pub routes: PeerExchange<'a>,
@@ -229,10 +228,11 @@ impl<'a> Pair<'a> {
         lanes: usize,
         exchange: ExchangeDtype,
     ) -> Result<Self> {
-        let layers = ranks[0].layers();
+        let layers = ranks[0].layers().to_vec();
         ensure!(
-            !layers.is_empty() && layers == ranks[1].layers(),
-            "TP2 layer ranges differ"
+            !layers.is_empty() && layers.windows(2).all(|ids| ids[0] < ids[1])
+                && layers == ranks[1].layers(),
+            "TP2 ordered layer inventories differ"
         );
         for (rank, backend) in ranks.iter().enumerate() {
             ensure!(
@@ -313,7 +313,7 @@ impl<'a> Pair<'a> {
         }
         let mut checks = self.checks.borrow_mut();
         ensure!(checks.is_empty(), "undrained TP2 route diagnostics");
-        for layer in self.layers.clone() {
+        for &layer in &self.layers {
             for (lane, &rows) in rows.iter().enumerate() {
                 let hosts = (0..2)
                     .map(|rank| {
@@ -396,7 +396,7 @@ impl<'a> Pair<'a> {
                 for capacity in [1, 16, 80, 256, 1024, 4096] {
                     if capacity <= rows || capacity == 4096 {
                         backend.enqueue(
-                            self.layers.start,
+                            self.layers[0],
                             capacity.min(rows),
                             input,
                             routes,
@@ -590,7 +590,7 @@ impl<'a> OwnerWeights<'a> {
             Self::Exl3(w) => w.device(),
         }
     }
-    pub(crate) fn layers(&self) -> Range<usize> {
+    pub(crate) fn layers(&self) -> &[usize] {
         match self {
             Self::Native(w) => w.layers(),
             Self::Exl3(w) => w.layers(),

@@ -1390,8 +1390,6 @@ fn glmf_step_workspace(manifest: &serde_json::Value, checkpoint: &super::Checkpo
     let mut prefill = glmf_step_scratch(&lookup, &cfg, options, rows, false).ok()?;
     // Shared replay records live in the prefill scratch.
     prefill.programs = prefill.programs.max(shared_records);
-    // A lane needs a Spark transport of its own: local experts prefill in one.
-    let lanes = if spark { lanes } else { 1 };
     Some(crate::placement::families::glm5_flash::step_workspace_demands(&cfg,
         usize::try_from(lanes).ok()?, rows, decode_rows, shape, decode, prefill))
 }

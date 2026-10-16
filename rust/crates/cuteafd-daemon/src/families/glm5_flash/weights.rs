@@ -25,7 +25,8 @@
 //! `r * N / 2 ..` (their in-projection, conv, gate, decay and state rows, q_b rows, W_UK / W_UV
 //! heads and o_proj columns) and the matching half of the dense and shared-expert intermediate;
 //! every rank the mHC weights, norms, the replicated low-rank KDA gates (`f_a`, `g_a`), the MLA
-//! latent projection (`q_a | kv_a`) and the DSA indexer; rank 0 the router. A ModelOpt NVFP4
+//! latent projection (`q_a | kv_a`), DSA indexer and router. Under explicit `layers`, MLA
+//! operands and caches reside only on their selected owner. A ModelOpt NVFP4
 //! dense MLP stays whole on rank 0 (its package has no half geometry).
 //! With `kda_output_shard`, the output projection instead splits live token rows:
 //! each rank owns one full FP8 `[H, D]` matrix and consumes complete gathered
@@ -41,13 +42,17 @@ use std::collections::HashMap;
 use std::ffi::c_void;
 use std::os::unix::fs::FileExt;
 
+use crate::shared::placement::layers::AttentionShare;
+use cuteafd_loader::placement::{FfnMode, LayerExecutionPlan, LayerMode};
+
 pub(crate) const PREFIX: &str = "model.language_model.";
 
 pub(crate) struct GlmfLayer<'a> {
     pub attention: GlmNextAttention,
     pub dense: bool,
-    /// One GPU's share of a head split: it runs the split (`glmf2`) programs.
+    /// FFN width; whole attention still retains a split FFN on two GPUs.
     pub split: bool,
+    pub attention_share: AttentionShare,
     operands: HashMap<&'static str, DeviceAllocation<'a>>,
 }
 
@@ -125,6 +130,7 @@ impl GlmfWeights<'_> {
     }
 }
 
+#[derive(Clone)]
 pub(crate) struct GlmfLoader<'a> {
     pub library: &'a NativeLibrary,
     pub checkpoint: &'a Checkpoint,
@@ -471,6 +477,34 @@ impl<'a> GlmfLoader<'a> {
         Ok((uk, uv))
     }
 
+    fn mla_operands(&self, cfg: &GlmNextConfig, prefix: &str,
+        ops: &mut HashMap<&'static str, DeviceAllocation<'a>>) -> Result<()> {
+        let a = |name: &str| format!("{prefix}.self_attn.{name}");
+        ops.insert("q_a_norm", self.one(&a("q_a_layernorm.weight"))?);
+        ops.insert("kv_a_norm", self.one(&a("kv_a_layernorm.weight"))?);
+        let (uk, uv) = self.absorbed(cfg, &a("kv_b_proj.weight"))?;
+        ops.insert("w_uk", uk);
+        ops.insert("w_uv", uv);
+        let block = super::fp8::Layout::Block;
+        let (q, s) = self.fp8(&[a("q_a_proj.weight"), a("kv_a_proj_with_mqa.weight")], block)?;
+        ops.insert("w_qkv_a_fp8", q);
+        ops.insert("w_qkv_a_scale", s);
+        let (q, s) = self.fp8(&[a("q_b_proj.weight")], block)?;
+        ops.insert("w_q_b_fp8", q);
+        ops.insert("w_q_b_scale", s);
+        let (q, s) = self.fp8(&[a("o_proj.weight")], block)?;
+        ops.insert("w_o_fp8", q);
+        ops.insert("w_o_scale", s);
+        let i = |name: &str| a(&format!("indexer.{name}"));
+        ops.insert("w_iq", self.one(&i("wq_b.weight"))?);
+        ops.insert("w_ik", self.rows(&[i("wk.weight"), i("weights_proj.weight"),
+            i("index_kpool_compress_gate")])?);
+        ops.insert("k_norm_w", self.one(&i("k_norm.weight"))?);
+        ops.insert("k_norm_b", self.one(&i("k_norm.bias"))?);
+        ops.insert("ape", self.one(&i("index_kpool_compress_ape"))?);
+        Ok(())
+    }
+
     pub fn layer(&self, cfg: &GlmNextConfig, layer: usize) -> Result<GlmfLayer<'a>> {
         ensure!(!self.kda_output_shard, "KDA output sharding loads through the two-GPU layer shares");
         let p = format!("{PREFIX}layers.{layer}");
@@ -538,30 +572,7 @@ impl<'a> GlmfLoader<'a> {
                     ops.insert("w_o", w_o);
                 }
             }
-            GlmNextAttention::Mla => {
-                ops.insert("q_a_norm", self.one(&a("q_a_layernorm.weight"))?);
-                ops.insert("kv_a_norm", self.one(&a("kv_a_layernorm.weight"))?);
-                let (uk, uv) = self.absorbed(cfg, &a("kv_b_proj.weight"))?;
-                ops.insert("w_uk", uk);
-                ops.insert("w_uv", uv);
-                let block = super::fp8::Layout::Block;
-                let (q, s) = self.fp8(&[a("q_a_proj.weight"), a("kv_a_proj_with_mqa.weight")], block)?;
-                ops.insert("w_qkv_a_fp8", q);
-                ops.insert("w_qkv_a_scale", s);
-                let (q, s) = self.fp8(&[a("q_b_proj.weight")], block)?;
-                ops.insert("w_q_b_fp8", q);
-                ops.insert("w_q_b_scale", s);
-                let (q, s) = self.fp8(&[a("o_proj.weight")], block)?;
-                ops.insert("w_o_fp8", q);
-                ops.insert("w_o_scale", s);
-                let i = |name: &str| a(&format!("indexer.{name}"));
-                ops.insert("w_iq", self.one(&i("wq_b.weight"))?);
-                ops.insert("w_ik", self.rows(&[i("wk.weight"), i("weights_proj.weight"),
-                    i("index_kpool_compress_gate")])?);
-                ops.insert("k_norm_w", self.one(&i("k_norm.weight"))?);
-                ops.insert("k_norm_b", self.one(&i("k_norm.bias"))?);
-                ops.insert("ape", self.one(&i("index_kpool_compress_ape"))?);
-            }
+            GlmNextAttention::Mla => self.mla_operands(cfg, &p, &mut ops)?,
         }
         let mlp = if dense { format!("{p}.mlp") } else { format!("{p}.mlp.shared_experts") };
         if !(dense && self.nvfp4_dense(cfg, &mlp, &mut ops)?) {
@@ -577,7 +588,7 @@ impl<'a> GlmfLoader<'a> {
             ops.insert("gate", self.one(&format!("{p}.mlp.gate.weight"))?);
             ops.insert("gate.bias", self.f32(&[format!("{p}.mlp.gate.e_score_correction_bias")])?);
         }
-        Ok(GlmfLayer { attention, dense, split: false, operands: ops })
+        Ok(GlmfLayer { attention, dense, split: false, attention_share: AttentionShare::Whole, operands: ops })
     }
 
     /// GPUs of the head split this loader fills (1: no split).
@@ -710,8 +721,13 @@ impl<'a> GlmfLoader<'a> {
 
     /// Layer `layer`, one share per rank of this loader's head split (see the module
     /// docstring); without a split, [`Self::layer`] alone.
-    pub fn layer_shares(&self, cfg: &GlmNextConfig, layer: usize) -> Result<Vec<GlmfLayer<'a>>> {
+    pub fn layer_shares(&self, cfg: &GlmNextConfig, layer: usize, mode: LayerMode) -> Result<Vec<GlmfLayer<'a>>> {
         let ranks = self.ranks();
+        let attention_shares = AttentionShare::bind(mode, ranks)?;
+        ensure!(ranks == 1 || !matches!(mode, LayerMode::Whole { ffn: FfnMode::Owner, .. }),
+            "GLM Flash two-rank layers retain split FFNs");
+        ensure!(ranks == 1 || cfg.attention[layer] == GlmNextAttention::Mla
+            || mode == LayerMode::HeadSplit, "GLM Flash KDA layers must remain head-split");
         validate_kda_output_shard(ranks, self.kda_fp8, self.kda_output_shard)?;
         if ranks == 1 {
             return Ok(vec![self.layer(cfg, layer)?]);
@@ -795,6 +811,20 @@ impl<'a> GlmfLoader<'a> {
                     put(&mut ops, "w_o", self.upload_ranks(w_o)?);
                 }
             }
+            GlmNextAttention::Mla if matches!(mode, LayerMode::Whole { .. }) => {
+                let LayerMode::Whole { gpu, .. } = mode else { unreachable!() };
+                let rank = usize::from(gpu);
+                self.on_rank(rank, || {
+                    // FP8 source conversions enqueue on the owning device's stream.
+                    let mut loader = self.clone();
+                    if rank > 0 {
+                        loader.device = self.peers[rank - 1].device;
+                        loader.stream = self.peers[rank - 1].stream;
+                    }
+                    loader.peers.clear();
+                    loader.mla_operands(cfg, &p, &mut ops[rank])
+                })?;
+            }
             GlmNextAttention::Mla => {
                 put(&mut ops, "q_a_norm", self.replicate(self.one(&a("q_a_layernorm.weight"))?)?);
                 put(&mut ops, "kv_a_norm", self.replicate(self.one(&a("kv_a_layernorm.weight"))?)?);
@@ -838,17 +868,19 @@ impl<'a> GlmfLoader<'a> {
             put(&mut ops, "gate", self.replicate(self.one(&format!("{p}.mlp.gate.weight"))?)?);
             put(&mut ops, "gate.bias", self.replicate(self.f32(&[format!("{p}.mlp.gate.e_score_correction_bias")])?)?);
         }
-        Ok(ops.into_iter().map(|operands| GlmfLayer { attention, dense, split: true, operands }).collect())
+        Ok(ops.into_iter().zip(attention_shares).map(|(operands, attention_share)|
+            GlmfLayer { attention, dense, split: true, attention_share, operands }).collect())
     }
 
-    /// Layers `0..layers` (all of them unless the caller stops early): rank 0's weights (its
+    /// The admitted layer plan: rank 0's weights (its
     /// layer shares, the norm and head) and with a head split the other rank's layer shares.
     #[allow(clippy::type_complexity)]
-    pub fn model(&self, cfg: &GlmNextConfig, layers: usize) -> Result<(GlmfWeights<'a>, Vec<Vec<GlmfLayer<'a>>>)> {
+    pub fn model(&self, cfg: &GlmNextConfig, plan: &LayerExecutionPlan) -> Result<(GlmfWeights<'a>, Vec<Vec<GlmfLayer<'a>>>)> {
         validate_kda_output_shard(self.ranks(), self.kda_fp8, self.kda_output_shard)?;
         let mut shares: Vec<Vec<GlmfLayer<'a>>> = (0..self.ranks()).map(|_| Vec::new()).collect();
-        for layer in 0..layers.min(cfg.layers) {
-            for (share, part) in shares.iter_mut().zip(self.layer_shares(cfg, layer)?) {
+        ensure!(plan.modes().len() <= cfg.layers, "attention plan exceeds checkpoint layers");
+        for (layer, &mode) in plan.modes().iter().enumerate() {
+            for (share, part) in shares.iter_mut().zip(self.layer_shares(cfg, layer, mode)?) {
                 share.push(part);
             }
         }

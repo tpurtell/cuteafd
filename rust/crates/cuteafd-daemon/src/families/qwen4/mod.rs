@@ -497,13 +497,13 @@ impl Opened {
             if let Some(engine::Experts::LocalExl3(local)) = &experts {
                 ensure!(local.window >= layers,
                     "Qwen automatic KV admission requires all EXL3 backbone experts resident; use --exl3-window at least {layers}, a fixed pool, or Sparks");
-                let expected = local.window.min(layers);
+                let expected: Vec<_> = (0..local.window.min(layers)).collect();
                 let plan = crate::families::deepseek_v4::local::plan(&self.library, &local.native_lib,
-                    local.catalog, usize::from(local.mtp), expected, local.max_rows, local.budget)?;
+                    local.catalog, usize::from(local.mtp), &expected, local.max_rows, local.budget)?;
                 ensure!(plan.layers == expected,
                     "Qwen automatic KV admission requires the complete requested EXL3 expert window to fit");
                 future_expert_bytes = u64::try_from(plan.peak_bytes)?;
-                tracing::info!(layers=plan.layers, peak_bytes=plan.peak_bytes,
+                tracing::info!(layers=?plan.layers, peak_bytes=plan.peak_bytes,
                     "Qwen planner reserved the lazy EXL3 expert window");
             }
             Some(experts)
@@ -628,10 +628,10 @@ impl Opened {
         let catalog = self.experts.as_ref().context("--mtp needs the local draft expert catalog")?;
         let started = Instant::now();
         let mtp = if catalog.exl3().is_some() {
-            let experts = crate::families::deepseek_v4::local::LocalExperts::load_range(&self.library,
-                &args.native_lib, catalog, 1, 0..0, args.prefill_rows, budget, stream)?
+            let experts = crate::families::deepseek_v4::local::LocalExperts::load(&self.library,
+                &args.native_lib, catalog, 1, &[], args.prefill_rows, budget, stream)?
                 .context("coordinator-local MTP needs exl3-qwen4-k45/rtx-tp1/m* packages")?;
-            ensure!(experts.layers() == 0 && experts.stages() == 1,
+            ensure!(experts.layers().is_empty() && experts.stages() == 1,
                 "local draft executor must keep exactly the MTP expert layer, no backbone layers");
             engine::MtpExperts::Exl3(std::cell::RefCell::new(experts))
         } else {

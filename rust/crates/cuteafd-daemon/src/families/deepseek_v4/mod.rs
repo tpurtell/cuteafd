@@ -506,18 +506,19 @@ pub(crate) fn with_engine<T>(
         let range = &placement.expert_ranges[0];
         ensure!(split_device.is_none() || range.layers == 0,
             "TP1 backbone layers are forbidden under a head split");
-        let local = if skip { None } else { local::LocalExperts::load_range(&loaded.library, &args.native_lib,
-            &loaded.catalog, stages, range.first..range.first + range.layers,
+        let layers: Vec<_> = (range.first..range.first + range.layers).collect();
+        let local = if skip { None } else { local::LocalExperts::load(&loaded.library, &args.native_lib,
+            &loaded.catalog, stages, &layers,
             max_rows, usize::try_from(range.peak_bytes)?, stream)? };
-        ensure!(local.as_ref().map_or(0, |l| l.layers()) == range.layers,
+        ensure!(local.as_ref().map_or(&[][..], |l| l.layers()) == layers,
             "DeepSeek V4 TP1 allocation differs from admitted placement");
-        engine.install_local(local);
+        engine.install_local(local)?;
         if let Some(tp2) = placement.tp2.as_ref().filter(|t| t.layers > 0 && !skip) {
             use crate::shared::experts::rtx::{native::NativeTp2, exl3::Exl3Tp2, RtxExpertLayer};
             use crate::shared::memory::device::Device;
             let devices = [Device { library: &loaded.library, id: args.device },
                 Device { library: &loaded.library, id: split_device.context("TP2 needs a head split")? }];
-            let layers = tp2.first..tp2.first + tp2.layers;
+            let layers: Vec<_> = (tp2.first..tp2.first + tp2.layers).collect();
             let budgets = [usize::try_from(tp2.peak_bytes[0])?, usize::try_from(tp2.peak_bytes[1])?];
             let ranks: [Box<dyn RtxExpertLayer>; 2] = if let Some(manifest) = loaded.catalog.exl3() {
                 let package = crate::shared::experts::exl3::aot_layout_directory(&args.native_lib,

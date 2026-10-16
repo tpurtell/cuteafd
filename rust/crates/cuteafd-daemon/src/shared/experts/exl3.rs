@@ -160,7 +160,7 @@ impl<'a> Exl3Weights<'a> {
     pub(crate) fn load_tp2_pair(
         devices: [crate::shared::memory::device::Device<'a>; 2],
         catalog: &OfficialV41Catalog,
-        layers: std::ops::Range<usize>,
+        layers: &[usize],
         available: [usize; 2],
     ) -> Result<[crate::shared::memory::device::DeviceOwner<'a, Vec<Self>>; 2]> {
         use super::paired_load::{self, Fences, Projection};
@@ -169,7 +169,7 @@ impl<'a> Exl3Weights<'a> {
         let mut remaining = available;
         let mut full_bytes = 0;
         let mut pinned_admitted = 0;
-        for layer in layers.clone() {
+        for &layer in layers {
             let mut pinned = 0;
             for rank in 0..2 {
                 let plan = layout(catalog, ExpertLayer::BackboneTp2 { layer, rank }, V41Exl3Partition::Disjoint)?;
@@ -226,7 +226,7 @@ impl<'a> Exl3Weights<'a> {
             paired_load::drain(&streams)?;
         }
         let mut group = 0;
-        for (index, layer) in layers.enumerate() {
+        for (index, &layer) in layers.iter().enumerate() {
             let layer_started = std::time::Instant::now();
             let experts = weights[0][index].layout.experts;
             let mut storage_bytes_read = 0;

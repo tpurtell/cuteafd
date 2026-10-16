@@ -5,7 +5,7 @@ use super::*;
 impl<'a> MimoEngine<'a> {
     pub(in crate::families::mimo_v2) fn install_tp2(&mut self, ranks: [Fp8MoeTp2<'a>; 2]) -> Result<()> {
         ensure!(self.tp2.is_none() && self.peer.is_some(), "MiMo TP2 requires a head-split peer");
-        let layers = ranks[0].layers();
+        let layers = ranks[0].layers().to_vec();
         ensure!(layers == ranks[1].layers() && !layers.is_empty(), "MiMo TP2 halves disagree");
         let rows = self.prefill_rows.max(DECODE_ROWS);
         let route_bytes = (rows * self.cfg.topk * 4).next_multiple_of(16) * 2;
@@ -138,7 +138,7 @@ impl<'a> MimoEngine<'a> {
         let mut checks = tp2.checks.borrow_mut();
         ensure!(checks.is_empty(), "previous MiMo route diagnostics did not drain");
         // Pinned allocations can synchronize; reserve them before peer waits.
-        for layer in tp2.layers.clone().filter(|&layer| self.tp2_layer(layer)) {
+        for layer in tp2.layers.iter().copied().filter(|&layer| self.tp2_layer(layer)) {
             for (lane, &rows) in rows.iter().enumerate() {
                 let bytes = rows * self.cfg.topk * 8;
                 checks.insert((layer, lane), PendingRouteCheck { rows, ranks: [

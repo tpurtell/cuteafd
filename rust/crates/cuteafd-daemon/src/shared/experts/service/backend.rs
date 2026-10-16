@@ -233,7 +233,7 @@ pub(super) fn load_fp8<'a>(
     admit_worker_peak(library, peak.load_peak, peak.serve_peak)?;
     // Loading buffers are gone before package scratch and worker storage exist;
     // admit their peak above, rather than subtracting both lifetimes here.
-    let actual_budget = fp8_resident_budget(library.cuda_memory_info()?.0, resident, peak.serve_peak);
+    let actual_budget = fp8_resident_budget(library.cuda_allocatable_memory_info()?.0, resident, peak.serve_peak);
     let budget = budget.min(actual_budget);
     let layer_ids: Vec<_> = layers.collect();
     let experts = Fp8Experts::load_with_bf16(library, tensors, &directory, bf16.as_deref(), &layer_ids,

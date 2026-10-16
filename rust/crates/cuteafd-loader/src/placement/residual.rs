@@ -220,11 +220,25 @@ pub fn plan_hops(modes: &[LayerMode], spec: &HopSpec) -> Result<Vec<Hop>, LayerP
     Ok(hops)
 }
 
+/// The shared layer pipeline owns at most two simultaneously active lanes.
+pub const LAYER_PIPELINE_MAX_LANES: u64 = 2;
+
+/// Validate the configured runtime lane inventory, not the active lanes of a
+/// short final chunk. Admission chooses the count; execution never clamps it.
+pub fn validate_layer_pipeline_lanes(admitted: u64, runtime: usize) -> Result<(), LayerPlanError> {
+    if admitted == 0 || admitted > LAYER_PIPELINE_MAX_LANES || admitted != runtime as u64 {
+        return Err(LayerPlanError::Lanes { admitted, runtime });
+    }
+    Ok(())
+}
+
 /// Invalid runtime binding of the solver's ownership decision.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum LayerPlanError {
     #[error("layer execution needs a nonempty stack and logical GPUs 0/1")]
     Geometry,
+    #[error("layer pipeline needs matching admitted/runtime lanes in 1..=2, got {admitted}/{runtime}")]
+    Lanes { admitted: u64, runtime: usize },
     #[error("layer {layer} has invalid owner {gpu}")]
     Owner { layer: usize, gpu: u8 },
     #[error("terminal residual contract {contract:?} is incompatible with final mode {mode:?}")]
@@ -307,4 +321,20 @@ pub fn hop_buffer_bytes(hops: &[Hop], spec: &HopSpec, gpus: usize) -> Option<Vec
         let slots = into.min(HOP_SLOTS);
         spec.lanes.checked_mul(slots)?.checked_mul(spec.rows)?.checked_mul(spec.row_bytes)
     }).collect()
+}
+
+#[cfg(test)]
+mod pipeline_lane_tests {
+    use super::*;
+
+    #[test]
+    fn admitted_pipeline_lanes_are_exact_and_never_silently_capped() {
+        for lanes in 1..=2 {
+            assert_eq!(validate_layer_pipeline_lanes(lanes, lanes as usize), Ok(()));
+        }
+        for (admitted, runtime) in [(0, 0), (1, 2), (2, 1), (3, 3), (4, 4), (4, 2), (u64::MAX, 2)] {
+            assert_eq!(validate_layer_pipeline_lanes(admitted, runtime),
+                Err(LayerPlanError::Lanes { admitted, runtime }));
+        }
+    }
 }

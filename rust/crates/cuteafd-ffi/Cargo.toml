@@ -13,5 +13,6 @@ anyhow.workspace = true
 libloading.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
+thiserror.workspace = true
 # Process-wide expert geometry. `cuteafd-core` does not depend on `cuteafd-ffi`.
 cuteafd-core = { path = "../cuteafd-core" }

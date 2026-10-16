@@ -103,7 +103,12 @@ pub(crate) struct Routes {
     pub weights: *mut c_void,
 }
 
-/// One rank's routed half of a contiguous set of backbone layers.
+/// Resident slot of an absolute backbone ID; gaps are never resident layers.
+pub(super) fn resident_index(layers: &[usize], layer: usize) -> Result<usize> {
+    layers.binary_search(&layer).map_err(|_| anyhow::anyhow!("TP2 layer {layer} not resident in {layers:?}"))
+}
+
+/// One rank's routed half of an exact ordered set of backbone layers.
 pub(crate) trait RtxExpertLayer {
     fn shard(&self) -> RtxShard;
     /// Element type of [`Self::output`].
@@ -111,8 +116,8 @@ pub(crate) trait RtxExpertLayer {
     fn partial_layout(&self, _rows: usize) -> Result<PartialLayout> {
         Ok(PartialLayout::Tokens)
     }
-    /// Backbone layers `first..first + count` this rank holds.
-    fn layers(&self) -> std::ops::Range<usize>;
+    /// Strictly increasing absolute backbone layer IDs this rank holds.
+    fn layers(&self) -> &[usize];
     /// The device this rank executes on.
     fn device(&self) -> i32;
     /// Exact device bytes of the execution workspace (scratch and the routed
@@ -170,6 +175,19 @@ pub(crate) trait RtxExpertLayer {
 #[cfg(test)]
 mod selection_tests {
     use super::*;
+
+    #[test]
+    fn sparse_inventory_maps_absolute_ids_without_filling_gaps() -> Result<()> {
+        let ids = [2, 5, 9];
+        for (index, layer) in ids.into_iter().enumerate() {
+            assert_eq!(resident_index(&ids, layer)?, index);
+        }
+        for missing in [0, 1, 3, 4, 6, 8, 10] {
+            assert!(resident_index(&ids, missing).is_err());
+        }
+        assert!(resident_index(&[], 0).is_err());
+        Ok(())
+    }
 
     #[test]
     fn nearest_capacity_never_consults_canonical_reduction() -> Result<()> {

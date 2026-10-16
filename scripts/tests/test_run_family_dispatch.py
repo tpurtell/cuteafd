@@ -318,16 +318,32 @@ def test_glmf_selection_is_sealed_after_solve_before_loading_or_opening_lanes() 
     source = (ROOT / "rust/crates/cuteafd-daemon/src/families/glm5_flash/mod.rs").read_text()
     body = source[source.index("    pub fn with_engine<"):source.index("    /// The drafter `--draft`")]
     assert body.index("self.admit(") < body.index("admitted_spark_layers(") < body.index("select_worker_layers(")
-    assert body.index("select_worker_layers(") < body.index("TokenEmbedding::load(") < body.index("self.experts_range(")
+    assert body.index("select_worker_layers(") < body.index("TokenEmbedding::load(") < body.index("self.experts_for_layers(")
     assert "args.experts_snapshot.as_deref().unwrap_or(&args.snapshot)" in body
     assert "WorkerSelection::new(identity, &spark_layers)" in body
     assert "let spark = !spark_layers.is_empty();" in body
     assert "selected_args.prefill_lanes = usize::try_from(working.prefill_lanes)?;" in body
     assert body.index("working.prefill_lanes") < body.index("TokenEmbedding::load(")
     assert "spark_layers == working.spark_layers" in body
+    assert "rtx_layers == working.rtx_layers" in body
+    assert "admitted_tp2_range" not in source and "spark_range" not in body
+    assert "&local_layers, Some(budget)" in body and "&spark_layers, None" in body
+    assert "tensors, &package, tp2_layers, args.expert_rows(), budgets" in body
     admission = source[source.index("    fn admit("):source.index("    pub fn with_engine<")]
-    assert "solve_working_set_with_graphs(" in admission
-    assert "let local_workspace = workspaces(false, 1);" in admission
+    assert "solve_attention_working_set_with_graphs(" in admission
+    assert "let local_workspace = workspaces(false, lanes);" in admission
+    assert "configured_prefill_lanes(layers == self.cfg.layers, args.prefill_lanes)" in admission
+    engine = (ROOT / "rust/crates/cuteafd-daemon/src/families/glm5_flash/engine.rs").read_text()
+    pipeline = engine.split("    fn pipelined(&self)", 1)[1].split("    /// Longest chunk", 1)[0]
+    assert "prefill_pipeline_available(" in pipeline and "_ => None" in pipeline
+    lane_step = engine.split("    fn step_lanes_inner(", 1)[1].split("    ///", 1)[0]
+    assert "pipelined prefill needs Spark experts" not in lane_step
+    assert "self.spark_land_lane(" in lane_step
+    assert "Some(Experts::Skip)" in lane_step
+    layout = (ROOT / "rust/crates/cuteafd-loader/src/plan/layout/glm5_flash.rs").read_text()
+    assert "step_workspace(&ExpertPlacement::Local, lanes)" in layout
+    assert "local_workspace = Some(estimate(lanes))" in layout
+
     assert "admission::step_workspace_demands(" in admission
     normalization = body.split("let mut selected_args = args.clone();", 1)[1].split("let args = &selected_args;", 1)[0]
     assert "if " not in normalization, "zero-peer exchanges must also use admitted effective lanes"
@@ -340,9 +356,12 @@ def test_glmf_selection_is_sealed_after_solve_before_loading_or_opening_lanes() 
     assert "SparkWorkingSet as GlmfWorkingSet" in loader
     assert "GlmfComponent::RtxExperts, gpu, Category::Transport, \"route exchange\"" in request
     assert "GlmfComponent::SparkExperts, gpu, Category::Transport, \"Spark intake\"" in request
-    expert = source[source.index("    fn experts_range<"):source.index("impl Opened {\n    /// The checkpoint's `embed_tokens`")]
-    assert expert.index("if remote.is_empty() { return Ok(None); }") < expert.index("SparkLink::new(")
-    assert "spark_warmup_request(&self.cfg, warm_rows, remote.start, self.checkpoint.spark_input_is_bf16())" in expert
+    expert = source[source.index("    fn experts_for_layers<"):source.index("impl Opened {\n    /// The checkpoint's `embed_tokens`")]
+    assert expert.index("validate_expert_layers(&self.cfg, served, selected)?;") < expert.index("if selected.is_empty() { return Ok(None); }")
+    assert expert.index("if selected.is_empty() { return Ok(None); }") < expert.index("Fp8Experts::load(") < expert.index("SparkLink::new(")
+    assert "tensors, &directory, selected, 1, 0," in expert
+    assert "layers: selected.to_vec()" in expert
+    assert "spark_warmup_request(&self.cfg, warm_rows, remote[0], self.checkpoint.spark_input_is_bf16())" in expert
 
 
 def test_family_table_matches_the_rust_launch_fixtures(tmp_path: Path) -> None:

@@ -456,10 +456,10 @@ impl Opened {
             use crate::shared::experts::rtx::{exl3::Exl3Tp2, fp8moe::Fp8MoeTp2, RtxExpertLayer};
             let ranks: [Box<dyn RtxExpertLayer + '_>; 2] = match local.format {
                 glm::GlmLocalFormat::Exl3 => Exl3Tp2::load_pair(devices, &self.catalog, &local.package,
-                    range, max_rows, budgets)?.map(|r| Box::new(r) as Box<dyn RtxExpertLayer>),
+                    range.collect(), max_rows, budgets)?.map(|r| Box::new(r) as Box<dyn RtxExpertLayer>),
                 glm::GlmLocalFormat::Nvfp4 { .. } => Fp8MoeTp2::load_pair(devices,
                     self.catalog.fp8().context("NVFP4 tensors")?, &local.package,
-                    range, max_rows, budgets)?.map(|r| Box::new(r) as Box<dyn RtxExpertLayer>),
+                    range.collect(), max_rows, budgets)?.map(|r| Box::new(r) as Box<dyn RtxExpertLayer>),
             };
             for rank in &ranks { ensure!(rank.workspace_bytes() as u64 == local.backend_workspace,
                 "GLM loaded TP2 workspace differs from admission"); }

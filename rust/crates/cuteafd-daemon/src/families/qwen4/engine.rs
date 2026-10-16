@@ -175,7 +175,7 @@ pub(crate) struct LocalExl3<'a> {
     pub library: &'a NativeLibrary,
     pub native_lib: std::path::PathBuf,
     pub catalog: &'a cuteafd_loader::OfficialV41Catalog,
-    pub resident: RefCell<Option<(std::ops::Range<usize>, crate::families::deepseek_v4::local::LocalExperts<'a>)>>,
+    pub resident: RefCell<Option<(Vec<usize>, crate::families::deepseek_v4::local::LocalExperts<'a>)>>,
     pub window: usize,
     pub layers: usize,
     /// The MTP layer's experts (draft stage 0) stay resident with every window;
@@ -188,7 +188,7 @@ pub(crate) struct LocalExl3<'a> {
 
 impl LocalExl3<'_> {
     pub(super) fn ensure(&self, layer: usize, stream: *mut c_void) -> Result<()> {
-        if self.resident.borrow().as_ref().is_some_and(|(range, _)| range.contains(&layer) || layer == self.layers) {
+        if self.resident.borrow().as_ref().is_some_and(|(layers, _)| layers.binary_search(&layer).is_ok() || layer == self.layers) {
             ensure!(layer < self.layers || self.mtp, "MTP experts are not loaded");
             return Ok(());
         }
@@ -196,16 +196,16 @@ impl LocalExl3<'_> {
         // SAFETY: the engine owns this stream; the old window's launches drain first.
         unsafe { self.library.cuda_stream_synchronize(stream)? };
         *self.resident.borrow_mut() = None;
-        let range = layer..(layer + self.window).min(self.layers);
+        let layers: Vec<_> = (layer..layer + self.window.min(self.layers.saturating_sub(layer))).collect();
         let started = std::time::Instant::now();
-        let local = crate::families::deepseek_v4::local::LocalExperts::load_range(self.library, &self.native_lib, self.catalog,
-            usize::from(self.mtp), range.clone(), self.max_rows, self.budget, stream)?
+        let local = crate::families::deepseek_v4::local::LocalExperts::load(self.library, &self.native_lib, self.catalog,
+            usize::from(self.mtp), &layers, self.max_rows, self.budget, stream)?
             .context("no coordinator EXL3 package for this checkpoint (build qwen4:exl3-k45)")?;
-        let range = layer..layer + local.layers();
-        ensure!(range.contains(&layer), "EXL3 expert layer {layer} does not fit the budget");
-        *self.loads.borrow_mut() += range.len();
-        tracing::debug!(?range, elapsed_ms = started.elapsed().as_millis() as u64, "EXL3 expert window resident");
-        *self.resident.borrow_mut() = Some((range, local));
+        let layers = local.layers().to_vec();
+        ensure!(layers.binary_search(&layer).is_ok(), "EXL3 expert layer {layer} does not fit the budget");
+        *self.loads.borrow_mut() += layers.len();
+        tracing::debug!(?layers, elapsed_ms = started.elapsed().as_millis() as u64, "EXL3 expert window resident");
+        *self.resident.borrow_mut() = Some((layers, local));
         Ok(())
     }
 }

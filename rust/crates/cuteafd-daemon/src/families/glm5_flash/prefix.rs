@@ -136,6 +136,7 @@ pub(crate) struct GlmfPrefix<'e, 'a> {
     /// Per rank and MLA layer: records, token keys (`--index-cache keys`), pool keys.
     paged: Vec<(usize, PagedLayer)>,
     mark_bytes: usize,
+    page_bytes: usize,
     /// Per rank: its part of every mark (its KDA heads' state) and the arena of those parts.
     arenas: Vec<(usize, Option<DeviceAllocation<'a>>)>,
     slots: usize,
@@ -164,12 +165,18 @@ impl<'e, 'a> GlmfPrefix<'e, 'a> {
         let parts: Vec<usize> = (0..engine.ranks())
             .map(|rank| engine.slot_regions_on(rank, 0).iter().map(|r| r.bytes).sum()).collect();
         let mark_bytes = parts.iter().sum();
+        let page_bytes = paged.iter().filter(|(rank, _)| !engine.context_kv() || *rank == 0)
+            .map(|(_, layer)| UNIT_ROWS * (RECORD_BYTES + layer.keys.map_or(0, |_| KEY_BYTES)) + POOL_PAGE_BYTES).sum::<usize>()
+            + (0..engine.ranks()).map(|rank| engine.pool_mark_unit(rank, 0).map(|b| b.map_or(0, |b| b.bytes)))
+                .collect::<Result<Vec<_>>>()?.into_iter().sum::<usize>();
         let (slots, mark_units) = match marks {
             PrefixMarks::Arena => (slots(mark_bytes), 0),
             // Every rank's part fills whole units of its own copy of the pool.
             PrefixMarks::Pool => (0, parts.iter().enumerate().map(|(rank, &part)| -> Result<usize> {
-                let unit: usize = unit_ranges(&paged, rank, 0)?.iter().map(|b| b.bytes).sum();
-                ensure!(unit > 0, "GLM 5.3 Flash has no MLA layer to hold pool marks");
+                if part == 0 { return Ok(0); }
+                let unit: usize = unit_ranges(&paged, rank, 0)?.iter()
+                    .chain(engine.pool_mark_unit(rank, 0)?.iter()).map(|b| b.bytes).sum();
+                ensure!(unit > 0, "GLM 5.3 Flash rank {rank} has no admitted pool-mark backing");
                 Ok(part.div_ceil(unit))
             }).try_fold(0, |units, rank| rank.map(|rank| units.max(rank)))?),
         };
@@ -188,7 +195,7 @@ impl<'e, 'a> GlmfPrefix<'e, 'a> {
                 copy = if runtime.is_some() { "cuda-memcpy-batch" } else { "per-segment" },
                 "GLM 5.3 Flash prefix marks in pool units");
         }
-        Ok(Self { engine, paged, mark_bytes, arenas, slots, mark_units, runtime })
+        Ok(Self { engine, paged, mark_bytes, page_bytes, arenas, slots, mark_units, runtime })
     }
 
     pub fn mark_bytes(&self) -> usize {
@@ -196,9 +203,7 @@ impl<'e, 'a> GlmfPrefix<'e, 'a> {
     }
 
     pub fn page_bytes(&self) -> usize {
-        // Under context a unit lives on one GPU: one rank's layers.
-        self.paged.iter().filter(|(rank, _)| !self.parity() || *rank == 0)
-            .map(|(_, layer)| UNIT_ROWS * (RECORD_BYTES + layer.keys.map_or(0, |_| KEY_BYTES)) + POOL_PAGE_BYTES).sum()
+        self.page_bytes
     }
 
     /// Whether units are partitioned by parity (context attention).
@@ -248,7 +253,9 @@ impl<'e, 'a> GlmfPrefix<'e, 'a> {
     /// The device ranges of one unit on rank `rank`, per MLA layer: records, token keys
     /// (`--index-cache keys`), pool keys.
     fn unit_ranges_on(&self, rank: usize, unit: u32) -> Result<Vec<CuteafdDeviceBuffer>> {
-        unit_ranges(&self.paged, rank, unit)
+        let mut ranges = unit_ranges(&self.paged, rank, unit)?;
+        ranges.extend(self.engine.pool_mark_unit(rank, unit)?);
+        Ok(ranges)
     }
 
     /// Where rank `rank`'s part of the pool mark in `pages` lies ([`mark_runs`] over the units).
@@ -256,6 +263,7 @@ impl<'e, 'a> GlmfPrefix<'e, 'a> {
         ensure!(self.mark_units > 0 && pages.len() == self.mark_units, "a pool mark of {} units, not {}",
             self.mark_units, pages.len());
         let part = self.arenas.get(rank).map(|(part, _)| *part).context("no such rank")?;
+        if part == 0 { return Ok(Vec::new()); }
         let units = pages.iter().map(|&unit| self.unit_ranges_on(rank, unit)).collect::<Result<Vec<_>>>()?;
         let template = *units[0].first().context("units without buffers")?;
         let spans: Vec<Vec<Span>> = units.iter().map(|unit| unit.iter().map(|b| (b.ptr as usize, b.bytes)).collect())
@@ -275,7 +283,8 @@ impl<'e, 'a> GlmfPrefix<'e, 'a> {
             let regions: Vec<Span> = self.engine.slot_regions_on(rank, kda as usize).iter()
                 .map(|r| (r.ptr as usize, r.bytes)).collect();
             let runs = self.mark_runs_on(rank, pages)?;
-            let template = runs[0];
+            if regions.is_empty() { continue; }
+            let template = *runs.first().context("nonempty owner state has no pool-mark runs")?;
             let runs: Vec<Span> = runs.iter().map(|b| (b.ptr as usize, b.bytes)).collect();
             let copies = if capture { gather_scatter(&regions, &runs) } else { gather_scatter(&runs, &regions) };
             ensure!(copies.iter().map(|c| c.bytes).sum::<usize>() == regions.iter().map(|&(_, b)| b).sum::<usize>(),
@@ -981,6 +990,48 @@ mod tests {
         (parts, mark)
     }
 
+    #[test]
+    fn whole_mla_owner_marks_equal_admission_on_both_first_owners() {
+        use super::super::engine::{self, IndexCache, KdaState};
+        use cuteafd_loader::families::glm5_flash::{GlmNextAttention, GlmNextConfig};
+        use cuteafd_loader::placement::AttentionPlacement;
+        use cuteafd_loader::serving_capacity::glm_flash_placed_cache_geometry_rows;
+        for layers in [2, 6] {
+        let cfg = GlmNextConfig::from_hf(&cuteafd_loader::plan::testing::glm5_flash_config(layers)).unwrap();
+        for index in [IndexCache::Keys, IndexCache::Compact] {
+            for first_owner in [0, 1] {
+                let geometry = glm_flash_placed_cache_geometry_rows(&cfg, cfg.layers, 2, index.into(),
+                    KdaState::F32.bytes() as u64, engine::DECODE_ROWS as u64,
+                    AttentionPlacement::Layers, first_owner).unwrap();
+                let (state, conv, _) = engine::kda_layer_bytes(&cfg, cfg.kda_heads / 2,
+                    KdaState::F32, engine::DECODE_ROWS);
+                let mut parts = [0; 2];
+                let mut owner = first_owner;
+                for kind in &cfg.attention {
+                    match kind {
+                        GlmNextAttention::Kda => parts.iter_mut().for_each(|part| *part += state + conv),
+                        GlmNextAttention::Mla => {
+                            if index == IndexCache::Compact { parts[owner] += engine::TAIL_BYTES; }
+                            owner ^= 1;
+                        }
+                    }
+                }
+                assert_eq!(geometry.ranks.iter().map(|rank| rank.retained_mark_bytes).collect::<Vec<_>>(),
+                    parts.map(|part| part as u64));
+                let total = parts.iter().sum::<usize>();
+                // Whole MLA ownership partitions the tails; KDA partitions heads, so
+                // aggregate mark size stays identical to the existing single-rank rule.
+                let budget = 14 * total as u64;
+                let arena = super::ArenaMarks::Rule(crate::shared::prefix::MarkRule {
+                    lanes: 5, entries: 20, budget_bytes: budget });
+                assert_eq!(arena.slots_placed(&cfg, cfg.layers, index, KdaState::F32, false).unwrap(),
+                    arena.slots(total));
+                assert_eq!(arena.slots(total), 14);
+            }
+        }
+        }
+    }
+
     /// The prefix mark arena under a head split with `--index-cache compact`: the engine keeps
     /// the token keys (`served_index_cache`), so its marks have no index tails and are 17,072 B
     /// smaller. With a 1,971 MiB budget, at most 5 lanes and at least 6 entries, the budget holds
@@ -993,8 +1044,8 @@ mod tests {
         use super::super::served_index_cache;
         use cuteafd_loader::serving_capacity::glm_flash_rank_cache_geometry;
         let cfg = glm53_flash();
-        let served = served_index_cache(IndexCache::Compact, true);
-        assert_eq!((served, served_index_cache(IndexCache::Compact, false)), (IndexCache::Keys, IndexCache::Compact));
+        let served = served_index_cache(IndexCache::Compact, true, cuteafd_loader::placement::AttentionPlacement::Heads);
+        assert_eq!((served, served_index_cache(IndexCache::Compact, false, cuteafd_loader::placement::AttentionPlacement::Heads)), (IndexCache::Keys, IndexCache::Compact));
         let (parts, mark) = engine_mark(&cfg, 2, served, KdaState::F32);
         let compact = engine_mark(&cfg, 1, IndexCache::Compact, KdaState::F32).1;
         assert_eq!((parts[0], mark, compact), (73_809_920, 147_619_840, 147_636_912));
@@ -1029,7 +1080,7 @@ mod tests {
         let mut binding = 0;
         for split in [false, true] {
             for requested in [IndexCache::Keys, IndexCache::Compact] {
-                let served = super::super::served_index_cache(requested, split);
+                let served = super::super::served_index_cache(requested, split, cuteafd_loader::placement::AttentionPlacement::Heads);
                 let ranks = if split { 2 } else { 1 };
                 for state in [KdaState::F32, KdaState::Bf16] {
                     let (parts, mark) = engine_mark(&cfg, ranks, served, state);
@@ -1140,6 +1191,39 @@ mod tests {
         assert!(consecutive < scattered, "{consecutive} vs {scattered}");
         // One unit holds less than a mark (the family refuses that, never truncates the state).
         assert_eq!(mark_runs(&[unit(1)], part).iter().map(|&(_, n)| n).sum::<usize>(), 140);
+    }
+
+    #[test]
+    fn pool_marks_keep_kda_only_and_mla_owners_byte_exact() {
+        use super::{gather_scatter, mark_runs};
+        // Run both all-MLA-on-one-rank directions and a split MLA inventory.
+        for mla in [[0usize, 2], [2, 0], [1, 1]] {
+            for (rank, layers) in mla.into_iter().enumerate() {
+                let part = 59 + layers * 7; // recurrent state + conv + compact tails
+                let backing = if layers == 0 { part } else { layers * 40 };
+                let mut memory = (0..1024).map(|i| ((i * 37 + rank * 61) % 251) as u8).collect::<Vec<_>>();
+                let original = memory.clone();
+                let from = [(600, 50), (700, 9), (750, layers * 7)];
+                let to = [(800, 50), (900, 9), (950, layers * 7)];
+                let units = vec![vec![(backing, backing)], vec![(3 * backing, backing)]];
+                let runs = mark_runs(&units, part);
+                assert_eq!(runs.iter().map(|&(_, n)| n).sum::<usize>(), part);
+                for copy in gather_scatter(&from, &runs) {
+                    memory.copy_within(copy.src..copy.src + copy.bytes, copy.dst);
+                }
+                for copy in gather_scatter(&runs, &to) {
+                    memory.copy_within(copy.src..copy.src + copy.bytes, copy.dst);
+                }
+                for ((src, len), (dst, _)) in from.into_iter().zip(to) {
+                    assert_eq!(memory[dst..dst + len], original[src..src + len], "rank {rank}, MLA {mla:?}");
+                }
+                for i in 0..memory.len() {
+                    if !runs.iter().chain(&to).any(|&(at, len)| (at..at + len).contains(&i)) {
+                        assert_eq!(memory[i], original[i]);
+                    }
+                }
+            }
+        }
     }
 
     /// Pool marks keep unit 0 out of every allocation: the decode sparse MLA reads its first record

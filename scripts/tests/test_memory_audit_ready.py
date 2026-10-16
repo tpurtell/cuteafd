@@ -171,13 +171,21 @@ def test_pool_following_v4_page_tables_use_the_planners_kv_records_scope(tmp_pat
     assert categories.get("workspace", 0) == 0
 
 
+def test_glmf_kda_only_pool_backing_uses_the_planners_prefix_scope():
+    source = (Path(__file__).parents[2] / "rust/crates/cuteafd-daemon/src/families/glm5_flash/engine.rs").read_text()
+    allocation = source.split("let pool_mark_backing = if pool_mark_unit_bytes > 0 {", 1)[1].split("} else { None };", 1)[0]
+    assert 'scope("prefix/KDA-only pool marks")' in allocation.split("Some(zeroed(", 1)[0]
+    assert 'pool_pages.checked_mul(pool_mark_unit_bytes)' in allocation
+    assert memory_audit.category("prefix/KDA-only pool marks") == "prefix"
+
+
 def test_tp2_expert_loaders_scope_both_parent_and_parallel_rank_allocations():
     root = Path(__file__).parents[2] / "rust/crates/cuteafd-daemon/src/shared/experts/rtx"
     for name in ["native.rs", "exl3.rs"]:
         source = (root / name).read_text()
         parent = source.split("pub(crate) fn load_pair_weights(", 1)[1]
-        assert '"experts/TP2 expert layer halves {}..{}"' in parent
-        assert "layers.start, layers.end" in parent
+        assert '"experts/TP2 expert layer halves {layers:?}"' in parent
+        assert "layers.start, layers.end" not in parent
         assert 'scope_owned(&label)' in parent.split("synchronized_load::load_pair", 1)[0]
         parallel = parent.split("synchronized_load::load_pair", 1)[1]
         assert 'scope_owned(&label)' in parallel.split("Ok(vec![", 1)[0]

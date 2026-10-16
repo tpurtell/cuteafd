@@ -20,6 +20,7 @@ pub fn validate_pool_floor(pool: &PoolPolicy, placement: &Placement) -> Result<(
             floor: pool.floor,
             layers: placement.onboard_layers,
             short: pool.floor - placement.pool_tokens,
+            limits: placement.pool_limits.clone(),
         });
     }
     Ok(())

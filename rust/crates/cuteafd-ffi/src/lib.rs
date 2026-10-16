@@ -48,19 +48,39 @@ pub fn coordinator_gpu_budget() -> Option<cuteafd_core::serving_capacity::GpuMem
     let bytes = COORDINATOR_GPU_BUDGET.load(Ordering::Relaxed);
     (bytes != 0).then_some(cuteafd_core::serving_capacity::GpuMemoryBudget(bytes))
 }
-/// Select the allocatable bytes without treating GB10's reclaimable cache as
-/// device usage. Fail closed if the unified-memory availability cannot be read.
-fn allocatable_bytes(major: i32, minor: i32, cuda_free: usize,
-    meminfo: impl FnOnce() -> Result<String>) -> Result<usize> {
-    if (major, minor) != (12, 1) { return Ok(cuda_free); }
-    let text = meminfo()?;
-    let value = text.lines().find_map(|line| line.strip_prefix("MemAvailable:"))
-        .context("/proc/meminfo has no MemAvailable")?;
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+enum MemAvailableError {
+    #[error("meminfo has no MemAvailable field")]
+    Missing,
+    #[error("meminfo has duplicate MemAvailable fields")]
+    Duplicate,
+    #[error("MemAvailable must contain an unsigned integer followed by kB")]
+    Malformed,
+    #[error("MemAvailable exceeds the addressable byte count")]
+    Overflow,
+}
+
+fn parse_mem_available(text: &str) -> std::result::Result<usize, MemAvailableError> {
+    let mut values = text.lines().filter_map(|line| line.strip_prefix("MemAvailable:"));
+    let value = values.next().ok_or(MemAvailableError::Missing)?;
+    if values.next().is_some() { return Err(MemAvailableError::Duplicate); }
     let mut fields = value.split_whitespace();
-    let kib: usize = fields.next().context("missing MemAvailable value")?
-        .parse().context("invalid MemAvailable value")?;
-    anyhow::ensure!(fields.next() == Some("kB") && fields.next().is_none(), "invalid MemAvailable units");
-    kib.checked_mul(1024).context("MemAvailable byte overflow")
+    let value = fields.next().ok_or(MemAvailableError::Malformed)?;
+    if !value.bytes().all(|byte| byte.is_ascii_digit())
+        || fields.next() != Some("kB") || fields.next().is_some() {
+        return Err(MemAvailableError::Malformed);
+    }
+    let kib: usize = value.parse().map_err(|_| MemAvailableError::Overflow)?;
+    kib.checked_mul(1024).ok_or(MemAvailableError::Overflow)
+}
+
+/// Integrated devices can reclaim Linux file cache on allocation. Do not add
+/// cache or existing allocations: MemAvailable already measures new headroom.
+fn allocatable_bytes(integrated: bool, cuda_free: usize,
+    meminfo: impl FnOnce() -> Result<String>) -> Result<usize> {
+    if !integrated { return Ok(cuda_free); }
+    let text = meminfo()?;
+    parse_mem_available(&text).context("integrated-device admission requires valid MemAvailable")
 }
 
 fn cgroup_allocatable_bytes(mut available: usize, membership: &str,
@@ -102,7 +122,7 @@ fn cgroup_memory_headroom(available: usize) -> Result<usize> {
 
 #[cfg(test)]
 mod allocatable_memory_tests {
-    use super::{allocatable_bytes, cgroup_allocatable_bytes};
+    use super::{allocatable_bytes, cgroup_allocatable_bytes, parse_mem_available, MemAvailableError};
 
     #[test]
     fn gb10_respects_nested_cgroup_headroom_and_namespace_root() {
@@ -138,15 +158,15 @@ mod allocatable_memory_tests {
 
     #[test]
     fn gb10_uses_memavailable_including_reclaimable_cache() {
-        assert_eq!(allocatable_bytes(12, 1, 1 << 30,
+        assert_eq!(allocatable_bytes(true, 1 << 30,
             || Ok("MemFree: 1024 kB\nMemAvailable: 47185920 kB\nCached: 41943040 kB\n".into())).unwrap(), 45usize << 30);
-        assert_eq!(allocatable_bytes(12, 1, 123, || Ok("MemAvailable: 0 kB\n".into())).unwrap(), 0);
+        assert_eq!(allocatable_bytes(true, 123, || Ok("MemAvailable: 0 kB\n".into())).unwrap(), 0);
     }
 
     #[test]
     fn logical_ceiling_charges_non_reclaimable_gb10_usage() {
         let total = 64u64 << 30;
-        let available = allocatable_bytes(12, 1, 1 << 30,
+        let available = allocatable_bytes(true, 1 << 30,
             || Ok("MemAvailable: 47185920 kB\n".into())).unwrap();
         let sample = cuteafd_core::serving_capacity::DeviceMemory {
             device: 0, total_bytes: total, baseline_free_bytes: available as u64,
@@ -161,16 +181,35 @@ mod allocatable_memory_tests {
 
     #[test]
     fn discrete_rtx_keeps_cuda_free_without_reading_meminfo() {
-        assert_eq!(allocatable_bytes(12, 0, 123, || panic!("RTX must not read meminfo")).unwrap(), 123);
+        assert_eq!(allocatable_bytes(false, 123, || panic!("RTX must not read meminfo")).unwrap(), 123);
     }
 
     #[test]
     fn gb10_fails_closed_on_unreadable_or_invalid_meminfo() {
-        assert!(allocatable_bytes(12, 1, 123, || anyhow::bail!("read failed")).is_err());
+        assert!(allocatable_bytes(true, 123, || anyhow::bail!("read failed")).is_err());
         for text in ["MemFree: 1 kB", "MemAvailable: nope kB", "MemAvailable: 42 MB",
-            "MemAvailable: 42", "MemAvailable: 42 kB extra", &format!("MemAvailable: {} kB", usize::MAX)] {
-            assert!(allocatable_bytes(12, 1, 123, || Ok(text.into())).is_err(), "{text}");
+            "MemAvailable: 42", "MemAvailable: 42 kB extra", "MemAvailable: -1 kB",
+            "MemAvailable: +1 kB", "MemAvailable: 1 kB\nMemAvailable: 2 kB",
+            &format!("MemAvailable: {} kB", usize::MAX)] {
+            let error = allocatable_bytes(true, 123, || Ok(text.into())).unwrap_err();
+            assert!(error.downcast_ref::<MemAvailableError>().is_some(), "{error:#}");
+            assert!(error.to_string().contains("admission requires valid MemAvailable"));
         }
+        assert_eq!(parse_mem_available("MemFree: 1 kB"), Err(MemAvailableError::Missing));
+        assert_eq!(parse_mem_available("MemAvailable: 1 MB"), Err(MemAvailableError::Malformed));
+    }
+
+    #[test]
+    fn large_page_cache_does_not_refuse_valid_worker_residency() {
+        let cuda_free = 8usize << 30;
+        let resident = 69_520_000_000usize;
+        let peak = resident + (4usize << 30);
+        let available = allocatable_bytes(true, cuda_free, || Ok(
+            "MemTotal: 126877696 kB\nMemFree: 8388608 kB\nMemAvailable: 83886080 kB\nCached: 75497472 kB\n".into()
+        )).unwrap();
+        assert!(peak > cuda_free);
+        assert!(peak <= available);
+        assert_eq!(available, 80usize << 30, "do not add Cached a second time");
     }
 }
 
@@ -1879,15 +1918,15 @@ impl NativeLibrary {
     }
 
     /// Allocatable free/total bytes on the current device, before logical budgets.
-    /// GB10 (SM121) allocations reclaim Linux page cache, so MemAvailable is the
+    /// Integrated-device allocations reclaim Linux page cache, so MemAvailable is the
     /// shared device/host headroom, bounded by cgroup hard-limit headroom.
-    /// Discrete RTX (SM120) keeps cudaMemGetInfo.
+    /// Discrete devices keep cudaMemGetInfo, regardless of compute capability.
     pub fn cuda_allocatable_memory_info(&self) -> Result<(usize, usize)> {
         let (free, total) = self.cuda_physical_memory_info()?;
         let info = self.cuda_device_info(self.cuda_get_device()?)?;
-        let available = allocatable_bytes(info.compute_capability_major, info.compute_capability_minor, free,
+        let available = allocatable_bytes(info.integrated != 0, free,
             || std::fs::read_to_string("/proc/meminfo").context("reading device allocatable memory"))?;
-        let available = if (info.compute_capability_major, info.compute_capability_minor) == (12, 1) {
+        let available = if info.integrated != 0 {
             cgroup_memory_headroom(available)?
         } else { available };
         Ok((available.min(total), total))

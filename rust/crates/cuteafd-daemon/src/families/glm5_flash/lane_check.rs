@@ -12,23 +12,24 @@ use anyhow::{ensure, Context, Result};
 pub(crate) fn unit_bytes(engine: &GlmfEngine<'_>, placement: &GlmfPlacement) -> Result<Vec<u8>> {
     engine.synchronize()?;
     let mut out = Vec::new();
-    for layer in engine.paged_buffers() {
-        // Records, token keys (`--index-cache keys` only) and pool keys.
-        for buffer in std::iter::once(layer.records).chain(layer.keys).chain([layer.pools]) {
-            ensure!(buffer.bytes % engine.pool_pages == 0, "a paged buffer that is not whole units");
-            let per_unit = buffer.bytes / engine.pool_pages;
-            for &unit in &placement.units {
-                let mut bytes = vec![0u8; per_unit];
-                let unit = cuteafd_ffi::CuteafdDeviceBuffer {
-                    // SAFETY: unit < pool pages, so the slice lies inside the buffer.
-                    ptr: unsafe { buffer.ptr.cast::<u8>().add(unit as usize * per_unit) }.cast(),
-                    bytes: per_unit,
-                    ..buffer
-                };
-                engine.library.copy_d2h(&mut bytes, unit)?;
-                out.extend(bytes);
+    for rank in 0..engine.ranks() {
+        engine.on(rank, || {
+            for layer in engine.paged_buffers_on(rank) {
+                for buffer in std::iter::once(layer.records).chain(layer.keys).chain([layer.pools]) {
+                    let units = engine.local_units();
+                    ensure!(units > 0 && buffer.bytes % units == 0, "a paged buffer that is not whole units");
+                    let per_unit = buffer.bytes / units;
+                    for &global in &placement.units {
+                        let Some(unit) = local_unit(global, rank, engine.context_kv()) else { continue };
+                        let unit = crate::shared::prefix::view(buffer, unit as usize * per_unit, per_unit)?;
+                        let mut bytes = vec![0u8; per_unit];
+                        engine.library.copy_d2h(&mut bytes, unit)?;
+                        out.extend(bytes);
+                    }
+                }
             }
-        }
+            Ok(())
+        })?;
     }
     Ok(out)
 }
@@ -40,7 +41,7 @@ pub(crate) fn lane_check(engine: &GlmfEngine<'_>, tokens: &[u32]) -> Result<()> 
     let n = tokens.len().min(engine.prefill_capacity());
     let cuts = engine.prefill_cuts(n)?;
     ensure!(engine.prefill_capacity() > engine.prefill_rows || engine.prefill_lane_count == 1,
-        "--lane-check needs pipelined Spark prefill lanes (--peers, every layer)");
+        "--lane-check needs admitted pipelined prefill lanes (every layer)");
     let mut allocator = Allocator::for_engine(engine);
     let (mut lanes, mut serial) = (allocator.admit(n)?, allocator.admit(n)?);
     let started = std::time::Instant::now();
@@ -68,4 +69,24 @@ pub(crate) fn lane_check(engine: &GlmfEngine<'_>, tokens: &[u32]) -> Result<()> 
     allocator.release(lanes);
     ensure!(logits && state && paged, "the lanes differ from serial passes over the same cuts");
     Ok(())
+}
+
+/// Context units live on one rank; whole/head-owned layers use the global unit ID.
+fn local_unit(global: u32, rank: usize, context: bool) -> Option<u32> {
+    if !context { Some(global) } else { ((global & 1) as usize == rank).then_some(global / 2) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn diagnostics_visit_each_owner_local_unit_once() {
+        for global in 0..8 {
+            assert_eq!(local_unit(global, 0, false), Some(global));
+            assert_eq!(local_unit(global, 1, false), Some(global));
+            let owners: Vec<_> = (0..2).filter_map(|rank| local_unit(global, rank, true)
+                .map(|local| (rank, local))).collect();
+            assert_eq!(owners, [((global & 1) as usize, global / 2)]);
+        }
+    }
 }

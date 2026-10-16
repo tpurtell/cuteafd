@@ -333,7 +333,7 @@ impl<'a> GlmfEngine<'a> {
         }
         let t = tables.positions.len();
         ensure!(t <= DECODE_ROWS, "a context decode step of {t} rows (the exchange holds {DECODE_ROWS})");
-        let ordinal = self.mla_ordinal[index].context("MLA layer without an ordinal")?;
+        let ordinal = self.caches_of(rank).mla_ordinal[index].context("MLA layer without an ordinal")?;
         let split = self.context.as_ref().context("context split")?;
         context_decode(&split.exchange, rank, ordinal, 0, t,
             &mut Bindings { engine: self, w, layer, tables, rank, index, rows, cap, t })?;
@@ -350,7 +350,7 @@ impl<'a> GlmfEngine<'a> {
         -> Result<()> {
         let split = self.context.as_ref().context("context split")?;
         let own = &split.ranks[rank];
-        let ordinal = self.mla_ordinal[index].context("MLA layer without an ordinal")?;
+        let ordinal = self.caches_of(rank).mla_ordinal[index].context("MLA layer without an ordinal")?;
         let staging = &own.staging[ordinal % 2];
         let records = view(staging, 0, split.staging_units * UNIT_RECORD_BYTES)?;
         let pools = view(staging, records.bytes, split.staging_units * POOL_PAGE_BYTES)?;

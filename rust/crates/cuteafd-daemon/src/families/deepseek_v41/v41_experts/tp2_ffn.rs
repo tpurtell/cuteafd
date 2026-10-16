@@ -47,7 +47,7 @@ pub(crate) fn load_routed_weights<'a>(
             catalog,
             cuteafd_core::expert_geometry(),
             [package; 2],
-            0..layers,
+            (0..layers).collect(),
             capacity as usize,
             budgets,
             selection,
@@ -86,7 +86,7 @@ pub(crate) fn load_routed_weights<'a>(
     Ok(NativeTp2::load_pair_weights(
         devices,
         catalog,
-        0..layers,
+        (0..layers).collect(),
         capacity as usize,
         budgets,
         selection,
@@ -217,8 +217,7 @@ impl<'a> Wave<'a> {
         );
         for rank in 0..2 {
             ensure!(
-                routed[rank].layers().start == 0
-                    && routed[rank].layers().end >= layers
+                routed[rank].layers().get(..layers).is_some_and(|ids| ids.iter().copied().eq(0..layers))
                     && shared[rank].len() >= layers
                     && shared[rank][0].device().id == devices[rank].id
                     && std::ptr::eq(shared[rank][0].device().library, devices[rank].library),

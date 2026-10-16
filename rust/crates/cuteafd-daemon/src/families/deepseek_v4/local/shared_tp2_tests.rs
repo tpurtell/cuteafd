@@ -74,12 +74,12 @@ fn compare(exl3: bool) -> Result<()> {
         })
         .collect::<Result<Vec<_>>>()?;
     let mut local = devices[0].own(|| {
-        LocalExperts::load_range(
+        LocalExperts::load(
             &lib,
             &native,
             &catalog,
             0,
-            0..1,
+            &[0],
             capacity,
             16_000_000_000,
             inputs[0].1.raw,
@@ -91,7 +91,7 @@ fn compare(exl3: bool) -> Result<()> {
             devices,
             &catalog,
             Path::new(&std::env::var("CUTEAFD_EXL3_AOT")?),
-            0..1,
+            vec![0],
             capacity,
             [10_000_000_000; 2],
         )?;
@@ -102,7 +102,7 @@ fn compare(exl3: bool) -> Result<()> {
                 devices[0],
                 &catalog,
                 0,
-                0..1,
+                vec![0],
                 capacity,
                 10_000_000_000,
             )?),
@@ -110,7 +110,7 @@ fn compare(exl3: bool) -> Result<()> {
                 devices[1],
                 &catalog,
                 1,
-                0..1,
+                vec![0],
                 capacity,
                 10_000_000_000,
             )?),

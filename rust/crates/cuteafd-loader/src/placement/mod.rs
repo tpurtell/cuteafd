@@ -30,7 +30,7 @@ mod tests;
 
 pub use inventory::{loaded_code, ArchContext, GraphRank, GraphSet, Lifetime, LoadedCode, ProgramSet, RuntimeSample, ARCH_CONTEXTS};
 pub use pool::PoolPolicy;
-pub use residual::{hop_buffer_bytes, plan_hops, residual_homes, Hop, HopKind, HopPoint, HopSpec, HopStorage, LayerExecutionPlan, LayerPlanError, ResidualHome, TerminalHome, Transition, HOP_SLOTS};
+pub use residual::{validate_layer_pipeline_lanes, LAYER_PIPELINE_MAX_LANES, hop_buffer_bytes, plan_hops, residual_homes, Hop, HopKind, HopPoint, HopSpec, HopStorage, LayerExecutionPlan, LayerPlanError, ResidualHome, TerminalHome, Transition, HOP_SLOTS};
 pub use solve::{solve, solve_frozen};
 pub use attention::{AttentionPlacement, ContextBuffers, ContextExchangeLayout, KvDemand, LayerOwnership, CONTEXT_EXCHANGES};
 
@@ -420,6 +420,8 @@ impl std::str::FromStr for Onboard {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Placement {
     pub pool_tokens: u64,
+    /// Per-rank pool demands beside the selected fixed and expert allocations.
+    pub pool_limits: PoolLimits,
     pub attention_placement: AttentionPlacement,
     /// Resolved modes by attention kind, including mixed step-seven flips.
     pub attention_by_kind: Vec<(AttentionClass, AttentionPlacement)>,
@@ -508,18 +510,57 @@ impl Placement {
     }
 }
 
+/// Pool costs on each rank, retained with the exact candidate that was fitted.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PoolLimits(pub Vec<PoolRankLimit>);
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PoolRankLimit {
+    pub gpu: u8,
+    pub available_bytes: u64,
+    pub max_units: u64,
+    pub demands: Vec<PoolUnitDemand>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PoolUnitDemand {
+    pub group: String,
+    pub bytes_per_unit: u64,
+    pub offset_units: u64,
+    pub cap_units: u64,
+}
+
+impl std::fmt::Display for PoolLimits {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let fit = self.0.iter().map(|rank| rank.max_units).min().unwrap_or(u64::MAX);
+        for (index, rank) in self.0.iter().enumerate() {
+            if index > 0 { write!(f, "; ")?; }
+            write!(f, "rtx{}{} fits {} units in {} bytes: ", rank.gpu,
+                if rank.max_units == fit { " limiting" } else { "" }, rank.max_units, rank.available_bytes)?;
+            for (index, demand) in rank.demands.iter().enumerate() {
+                if index > 0 { write!(f, ", ")?; }
+                write!(f, "{} {} bytes/unit", demand.group, demand.bytes_per_unit)?;
+                if demand.offset_units > 0 || demand.cap_units < u64::MAX {
+                    write!(f, " (offset {}, cap {})", demand.offset_units, demand.cap_units)?;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum PlacementError {
     #[error("placement inventory is invalid: {0}")]
     Inventory(&'static str),
-    #[error("explicit KV pool of {requested} tokens does not fit before local experts (fits {fit})")]
-    PoolDoesNotFit { requested: u64, fit: u64 },
+    #[error("explicit KV pool of {requested} tokens does not fit beside admitted demands (fits {fit}); {limits}")]
+    PoolDoesNotFit { requested: u64, fit: u64, limits: PoolLimits },
     #[error("KV pool and mandatory {what} do not fit on rtx{gpu}")]
     Mandatory { gpu: u8, what: String },
     #[error("{requested} RTX expert layers do not fit beside the fixed demands (at most {placed})")]
     ExpertLayers { requested: usize, placed: usize },
-    #[error("KV pool of {pool} tokens is below the {floor}-token floor after {layers} RTX expert layers (short {short} tokens)")]
-    BelowFloor { pool: u64, floor: u64, layers: usize, short: u64 },
+    #[error("KV pool of {pool} tokens is below the {floor}-token floor after {layers} RTX expert layers (short {short} tokens); {limits}")]
+    BelowFloor { pool: u64, floor: u64, layers: usize, short: u64, limits: PoolLimits },
     #[error("Spark-free layout needs every routed layer on RTX: {placed} of {layers} fit")]
     SparkFree { layers: usize, placed: usize },
     #[error("layer {layer} has no mode this build executes (allowed {allowed:?})")]

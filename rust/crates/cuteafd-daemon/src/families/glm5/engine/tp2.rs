@@ -8,11 +8,11 @@ impl<'a> GlmEngine<'a> {
 
     pub(crate) fn install_tp2(&mut self, ranks: [Box<dyn RtxExpertLayer + 'a>; 2]) -> Result<()> {
         let peer = self.peer()?;
-        let layers = ranks[0].layers();
+        let layers = ranks[0].layers().to_vec();
         ensure!(
-            layers.start == self.cfg.first_moe_layer
-                && layers.end <= self.weights.layers.len()
-                && self.weights.layers[layers.clone()].iter().all(|l| !l.dense),
+            !layers.is_empty()
+                && layers.iter().enumerate().all(|(slot, &id)| id.checked_sub(self.cfg.first_moe_layer) == Some(slot))
+                && layers.iter().all(|&id| self.weights.layers.get(id).is_some_and(|l| !l.dense)),
             "invalid GLM TP2 routed prefix"
         );
         ensure!(
@@ -49,7 +49,7 @@ impl<'a> GlmEngine<'a> {
         )?);
         cuteafd_bench::context::set_resolved(
             "rtx-tp2-layers",
-            &format!("{}..{}", layers.start, layers.end),
+            &format!("{layers:?}"),
         );
         Ok(())
     }
@@ -57,8 +57,8 @@ impl<'a> GlmEngine<'a> {
     pub(crate) fn has_tp2(&self) -> bool {
         self.tp2.is_some()
     }
-    pub(crate) fn tp2_layers(&self) -> Option<std::ops::Range<usize>> {
-        self.tp2.as_ref().map(|pair| pair.layers.clone())
+    pub(crate) fn tp2_layers(&self) -> Option<&[usize]> {
+        self.tp2.as_ref().map(|pair| pair.layers.as_slice())
     }
 
     pub(crate) fn draft_group_rows(&self, layer: usize, rows: usize,
@@ -183,9 +183,9 @@ impl<'a> GlmEngine<'a> {
                     )?;
                 }
                 let layer = if rank == 0 {
-                    &self.weights.layers[pair.layers.start]
+                    &self.weights.layers[pair.layers[0]]
                 } else {
-                    &self.peer()?.layers[pair.layers.start]
+                    &self.peer()?.layers[pair.layers[0]]
                 };
                 self.moe_front_on(rank, w, layer, w.rows)?;
                 let cap = if self.prefill_rows >= DECODE_ROWS {

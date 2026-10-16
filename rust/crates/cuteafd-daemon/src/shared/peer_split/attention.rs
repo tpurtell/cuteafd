@@ -6,6 +6,106 @@ use anyhow::{ensure, Result};
 use cuteafd_loader::placement::{FfnMode, Hop, HopPoint, LayerExecutionPlan, LayerMode, Placement};
 use std::ffi::c_void;
 
+/// Replicate the producer's already-rounded residual into existing peer storage.
+/// Call outside graph capture, after all producers needed by the receiving stream
+/// have been queued. Stream order puts the copy after mHC; the landing is device-only.
+pub(crate) fn replicate_terminal(exchange: &PeerExchange<'_>, source: cuteafd_ffi::CuteafdDeviceBuffer,
+    destination: cuteafd_ffi::CuteafdDeviceBuffer, bytes: usize) -> Result<()> {
+    replicate_terminal_with(exchange, source, destination, bytes)
+}
+
+trait TerminalProtocol {
+    fn device(&self, rank: usize) -> i32;
+    fn publish(&self, source: *const c_void, destination: *mut c_void, bytes: usize) -> Result<()>;
+    fn land(&self) -> Result<()>;
+}
+
+impl TerminalProtocol for PeerExchange<'_> {
+    fn device(&self, rank: usize) -> i32 { self.device(rank) }
+    fn publish(&self, source: *const c_void, destination: *mut c_void, bytes: usize) -> Result<()> {
+        self.push_to(0, DIRECT, source, destination, bytes)
+    }
+    fn land(&self) -> Result<()> { self.wait(1, DIRECT) }
+}
+
+fn replicate_terminal_with(exchange: &impl TerminalProtocol, source: cuteafd_ffi::CuteafdDeviceBuffer,
+    destination: cuteafd_ffi::CuteafdDeviceBuffer, bytes: usize) -> Result<()> {
+    ensure!(bytes > 0 && bytes <= source.bytes && bytes <= destination.bytes,
+        "terminal residual copy exceeds live source or destination storage");
+    ensure!(!source.ptr.is_null() && !destination.ptr.is_null()
+        && source.device_id == exchange.device(0) && destination.device_id == exchange.device(1)
+        && source.device_id != destination.device_id, "terminal residual copy has invalid rank storage");
+    exchange.publish(source.ptr, destination.ptr, bytes)?;
+    exchange.land()
+}
+
+#[cfg(test)]
+mod terminal_tests {
+    use super::*;
+    use std::cell::RefCell;
+    use cuteafd_ffi::CuteafdDeviceBuffer;
+
+    struct CopyProtocol {
+        source: Vec<u8>,
+        destination: RefCell<Vec<u8>>,
+        calls: RefCell<Vec<&'static str>>,
+        fail_publish: bool,
+    }
+
+    impl TerminalProtocol for CopyProtocol {
+        fn device(&self, rank: usize) -> i32 { [3, 7][rank] }
+        fn publish(&self, source: *const c_void, destination: *mut c_void, bytes: usize) -> Result<()> {
+            assert_eq!((source as usize, destination as usize), (1, 2));
+            self.calls.borrow_mut().push("publish");
+            ensure!(!self.fail_publish, "injected terminal publication failure");
+            self.destination.borrow_mut()[..bytes].copy_from_slice(&self.source[..bytes]);
+            Ok(())
+        }
+        fn land(&self) -> Result<()> {
+            self.calls.borrow_mut().push("land");
+            Ok(())
+        }
+    }
+
+    fn buffers(bytes: usize) -> [CuteafdDeviceBuffer; 2] {
+        [CuteafdDeviceBuffer { ptr: 1usize as *mut c_void, bytes, device_id: 3, flags: 0 },
+            CuteafdDeviceBuffer { ptr: 2usize as *mut c_void, bytes, device_id: 7, flags: 0 }]
+    }
+
+    #[test]
+    fn terminal_replication_preserves_every_bf16_bit_pattern_without_rerounding() {
+        // Signed zeros, infinities, NaN payloads and all finite encodings survive.
+        let source: Vec<u8> = (0..=u16::MAX).flat_map(u16::to_le_bytes).collect();
+        let bytes = source.len();
+        let exchange = CopyProtocol { source, destination: RefCell::new(vec![0xa5; bytes + 16]),
+            calls: RefCell::new(Vec::new()), fail_publish: false };
+        let [source, destination] = buffers(bytes);
+        replicate_terminal_with(&exchange, source, destination, bytes).unwrap();
+        assert_eq!(&exchange.destination.borrow()[..bytes], exchange.source.as_slice());
+        assert_eq!(&exchange.destination.borrow()[bytes..], &[0xa5; 16]);
+        assert_eq!(*exchange.calls.borrow(), ["publish", "land"]);
+    }
+
+    #[test]
+    fn invalid_terminal_storage_and_failed_publish_never_queue_a_wait() {
+        let mut exchange = CopyProtocol { source: vec![1; 8], destination: RefCell::new(vec![0; 8]),
+            calls: RefCell::new(Vec::new()), fail_publish: false };
+        let [source, destination] = buffers(8);
+        for bytes in [0, 9] {
+            assert!(replicate_terminal_with(&exchange, source, destination, bytes).is_err());
+        }
+        for invalid in [CuteafdDeviceBuffer { bytes: 7, ..destination },
+            CuteafdDeviceBuffer { device_id: 3, ..destination },
+            CuteafdDeviceBuffer { ptr: std::ptr::null_mut(), ..destination }] {
+            assert!(replicate_terminal_with(&exchange, source, invalid, 8).is_err());
+        }
+        assert!(exchange.calls.borrow().is_empty());
+        exchange.fail_publish = true;
+        assert!(replicate_terminal_with(&exchange, source, destination, 8).is_err());
+        assert_eq!(*exchange.calls.borrow(), ["publish"]);
+    }
+}
+
 #[derive(Clone, Copy)]
 pub(crate) struct Query {
     pub values: *const c_void,
@@ -112,7 +212,7 @@ pub(crate) trait LayerKernels {
     fn ffn(&mut self, layer: usize, owner: Option<usize>) -> Result<()>;
 }
 
-trait LayerProtocol {
+pub(crate) trait LayerProtocol {
     type Ticket;
     fn require_live(&self) -> Result<()>;
     fn push_entry(&self, from: usize, source: *const c_void, destination: *mut c_void, bytes: usize) -> Result<()>;
@@ -295,10 +395,12 @@ fn pipeline_attention(exchange: &impl LayerProtocol, plan: &LayerExecutionPlan, 
     Ok(owner)
 }
 
-fn layer_pipeline_with<K: PipelineKernels>(_scope: &crate::shared::experts::rtx::pair::SubmissionScope<'_>,
+pub(crate) fn layer_pipeline_with<K: PipelineKernels>(_scope: &crate::shared::experts::rtx::pair::SubmissionScope<'_>,
     plan: &LayerExecutionPlan, exchange: &impl LayerProtocol,
     order: LaneOrder, rows: &[usize], kernels: &mut [K]) -> Result<()> {
-    ensure!(!kernels.is_empty() && kernels.len() <= 2 && kernels.len() == rows.len()
+    cuteafd_loader::placement::validate_layer_pipeline_lanes(plan.spec().lanes,
+        usize::try_from(plan.spec().lanes)?)?;
+    ensure!(!kernels.is_empty() && kernels.len() == rows.len()
         && kernels.len() as u64 <= plan.spec().lanes, "layer pipeline needs one or two admitted lanes");
     ensure!(rows.iter().all(|&rows| rows > 0 && rows as u64 <= plan.spec().rows),
         "layer pipeline rows outside admission");
@@ -475,7 +577,7 @@ mod tests {
     fn placement(modes: &[LayerMode]) -> Placement {
         use cuteafd_loader::placement::{plan_hops, ExpertHome, HopSpec, LayerAssignment};
         Placement {
-            pool_tokens: 0, attention_placement: cuteafd_loader::placement::AttentionPlacement::Layers,
+            pool_tokens: 0, pool_limits: cuteafd_loader::placement::PoolLimits(vec![]), attention_placement: cuteafd_loader::placement::AttentionPlacement::Layers,
             attention_by_kind: vec![], peer_row_bytes: 0, onboard_layers: 0,
             layers: modes.iter().map(|&mode| LayerAssignment { mode, experts: ExpertHome::Dense }).collect(),
             movables: vec![], expert_ranges: vec![], residual: vec![], tp2: None, items: vec![],

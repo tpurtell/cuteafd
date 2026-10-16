@@ -51,6 +51,14 @@ pub struct RankCacheGeometry {
     pub context_table_bytes_per_token: u64,
 }
 
+impl RankCacheGeometry {
+    /// A KDA-only owner has no MLA pages in which to retain recurrent marks.
+    /// Pool marks reserve its full state beside each logical allocation unit.
+    pub fn glmf_pool_mark_backing_unit_bytes(&self, pool_marks: bool) -> u64 {
+        if pool_marks && self.persistent_unit_bytes == 0 { self.retained_mark_bytes } else { 0 }
+    }
+}
+
 /// GLM 5.3 Flash's DSA index cache layout.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -909,6 +917,25 @@ mod tests {
         assert_eq!(both.ranks[0].active_state_per_sequence_bytes, both.ranks[0].retained_mark_bytes);
         assert_eq!((both.ranks[0].persistent_unit_bytes, both.ranks[0].speculative_replay_bytes),
             (compact.ranks[0].persistent_unit_bytes, compact.ranks[0].speculative_replay_bytes));
+    }
+
+    #[test]
+    fn flash_kda_only_owner_reserves_full_state_per_pool_mark_unit() {
+        use crate::placement::AttentionPlacement::Layers;
+        let cfg = GlmNextConfig::from_hf(&glm5_flash_config(2)).unwrap();
+        for first in [0, 1] {
+            let geometry = glm_flash_placed_cache_geometry_rows(&cfg, 2, 2,
+                GlmfIndexCache::Compact, 4, 64, Layers, first).unwrap();
+            let owner = &geometry.ranks[first];
+            let kda_only = &geometry.ranks[1 - first];
+            assert!(owner.persistent_unit_bytes > 0);
+            assert_eq!(owner.glmf_pool_mark_backing_unit_bytes(true), 0);
+            assert_eq!(kda_only.persistent_unit_bytes, 0);
+            assert!(kda_only.retained_mark_bytes > 0);
+            assert_eq!(kda_only.glmf_pool_mark_backing_unit_bytes(true), kda_only.retained_mark_bytes);
+            assert_eq!(kda_only.glmf_pool_mark_backing_unit_bytes(false), 0);
+            assert_eq!(owner.retained_mark_bytes - kda_only.retained_mark_bytes, GLMF_INDEX_TAIL_BYTES);
+        }
     }
 
     #[test]

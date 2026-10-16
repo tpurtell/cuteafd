@@ -20,6 +20,21 @@ pub struct LayerBytes {
     pub prefix: u64,
 }
 
+/// Drafter-owned allocations, excluding the target embedding and vocabulary head.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DrafterBytes {
+    pub owned: u64,
+    pub scratch: u64,
+}
+
+impl DrafterBytes {
+    fn movable(self) -> Movable {
+        Movable { id: MovableId::Drafter, allowed: vec![0], expert_arena: false,
+            parts: vec![Bytes2 { resident: self.owned, staging: 0 },
+                Bytes2 { resident: self.scratch, staging: 0 }], conditional: vec![] }
+    }
+}
+
 pub struct DenseInputs<'a> {
     pub cfg: &'a Qwen35Config,
     pub gpu: GpuBudget,
@@ -27,6 +42,7 @@ pub struct DenseInputs<'a> {
     /// Embedding, head, native norm, workspaces, graphs and pending loaded code.
     /// Callers retain the categories and names of their actual allocations.
     pub fixed: Vec<Demand>,
+    pub drafter: Option<DrafterBytes>,
     pub requested_pool: Option<u64>,
     pub max_context: u64,
     /// Checkpoint/export-native K|V record width (BF16 initially, native FP8 later).
@@ -74,7 +90,8 @@ pub fn request(inputs: DenseInputs<'_>) -> Result<PlacementRequest> {
         pool: PoolPolicy::resolve(&[inputs.gpu.capacity_bytes], inputs.max_context,
             inputs.requested_pool, PAGE_ROWS, true),
         layers, pool_overhead: vec![inputs.pool_overhead], pool_bounded: inputs.pool_bounded,
-        fixed: inputs.fixed, movables: Vec::new(), expert_workspace: 0, tp2_workspace: [0; 2],
+        fixed: inputs.fixed, movables: inputs.drafter.map(DrafterBytes::movable).into_iter().collect(),
+        expert_workspace: 0, tp2_workspace: [0; 2],
         onboard: Onboard::Auto, expert_gpus: 0, minimum_expert_layers: 0,
         policy: LayerPolicy { default: vec![WHOLE], ..Default::default() },
         hops: HopSpec { storage: HopStorage::ReceiveSlots, row_bytes: inputs.cfg.hidden as u64 * 2,
@@ -100,7 +117,7 @@ mod tests {
         DenseInputs { cfg, layers, gpu: GpuBudget { capacity_bytes: 96 << 30, headroom_bytes: 1 << 30,
             baseline: Baseline::Measured { free_bytes: 14 << 30 } },
             fixed: vec![Demand::new(0, Category::Workspace, "native AOT scratch", scratch, Basis::Exact)],
-            requested_pool: None, max_context: 262144, record_bytes: 4096,
+            drafter: None, requested_pool: None, max_context: 262144, record_bytes: 4096,
             pool_overhead: 4, pool_bounded: Vec::new() }
     }
 
@@ -122,6 +139,30 @@ mod tests {
         let mut explicit = inputs(&cfg, &layers, 5 << 30);
         explicit.requested_pool = Some(2 << 20);
         assert!(solve(&request(explicit)?).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn drafter_owned_and_scratch_are_charged_once_before_pool_admission() -> Result<()> {
+        let cfg = cfg();
+        let layers = [LayerBytes { weights: 1 << 30, state: 1 << 20, replay: 1 << 20, prefix: 0 },
+            LayerBytes { weights: 1 << 30, state: 0, replay: 0, prefix: 0 }];
+        let base = solve(&request(inputs(&cfg, &layers, 2 << 30))?)?;
+        let mut with_draft = inputs(&cfg, &layers, 2 << 30);
+        with_draft.drafter = Some(DrafterBytes { owned: 3 << 30, scratch: 1 << 30 });
+        let placement = solve(&request(with_draft)?)?;
+        assert_eq!(placement.movables, [(MovableId::Drafter, 0)]);
+        assert!(placement.pool_tokens < base.pool_tokens && placement.pool_tokens >= 262144);
+        let charged: u64 = placement.items[0].iter().filter(|item| item.category == Category::Drafter)
+            .map(|item| item.bytes).sum();
+        assert_eq!(charged, 4 << 30);
+        let mut explicit = inputs(&cfg, &layers, 2 << 30);
+        explicit.drafter = Some(DrafterBytes { owned: 3 << 30, scratch: 1 << 30 });
+        explicit.requested_pool = Some(base.pool_tokens);
+        assert!(solve(&request(explicit)?).is_err());
+        let mut overflow = inputs(&cfg, &layers, 0);
+        overflow.drafter = Some(DrafterBytes { owned: u64::MAX, scratch: 1 });
+        assert!(solve(&request(overflow)?).is_err());
         Ok(())
     }
 

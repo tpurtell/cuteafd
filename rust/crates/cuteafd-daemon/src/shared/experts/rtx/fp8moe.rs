@@ -6,7 +6,7 @@ use crate::shared::memory::device::{Allocation, Device, DeviceOwner, Event};
 use anyhow::{bail, ensure, Context, Result};
 use cuteafd_ffi::fp8_moe::{Fp8MoeInfo, Fp8MoeMetadata, Fp8MoeWeights};
 use cuteafd_loader::formats::fp8_experts::{ExpertFormat, Fp8ExpertTensors, Slicing};
-use std::{ffi::c_void, ops::Range, path::{Path, PathBuf}};
+use std::{ffi::c_void, path::{Path, PathBuf}};
 
 #[derive(Debug, Clone)]
 pub(crate) struct Fp8MoeTp2Plan {
@@ -36,6 +36,19 @@ fn validate_info(info: &Fp8MoeInfo, tensors: &Fp8ExpertTensors, rank: usize, sli
     Ok(())
 }
 
+fn validate_layers(layers: &[usize], shape: &cuteafd_loader::RoutedExpertShape, rank: usize) -> Result<()> {
+    ensure!(rank < 2 && !layers.is_empty() && layers.windows(2).all(|ids| ids[0] < ids[1])
+        && layers.iter().all(|&id| (shape.first_layer..shape.layers).contains(&id)),
+        "invalid FP8 MoE TP2 rank {rank} or ordered backbone inventory {layers:?}");
+    Ok(())
+}
+
+fn validate_installed(layers: &[usize], installed: impl Iterator<Item = usize>) -> Result<()> {
+    ensure!(installed.eq(layers.iter().copied()),
+        "FP8 MoE TP2 installed inventory differs from admitted {layers:?}");
+    Ok(())
+}
+
 fn workspace(scratch: usize, hidden: usize, rows: usize) -> Result<(usize, usize, usize)> {
     ensure!(rows > 0 && hidden > 0, "invalid FP8 MoE TP2 output geometry");
     let output = rows.checked_mul(hidden).and_then(|n| n.checked_mul(2))
@@ -51,7 +64,7 @@ pub(crate) struct Fp8MoeTp2<'a> {
     completion: RankCompletion<Event<'a>>,
     device: Device<'a>,
     rank: u8,
-    layers: Range<usize>,
+    layers: Vec<usize>,
     max_rows: usize,
     workspace_bytes: usize,
     experts: DeviceOwner<'a, Fp8Experts<'a>>,
@@ -77,9 +90,8 @@ impl<'a> Fp8MoeTp2<'a> {
     }
 
     pub(crate) fn load(device: Device<'a>, tensors: &Fp8ExpertTensors, directory: &Path,
-        layers: Range<usize>, rank: usize, max_rows: usize, budget: usize) -> Result<Self> {
-        ensure!(rank < 2 && !layers.is_empty() && layers.start >= tensors.shape().first_layer
-            && layers.end <= tensors.shape().layers, "invalid FP8 MoE TP2 rank/layer range");
+        layers: Vec<usize>, rank: usize, max_rows: usize, budget: usize) -> Result<Self> {
+        validate_layers(&layers, tensors.shape(), rank)?;
         let plan = Self::plan(tensors, directory, rank, max_rows)?;
         let resident = plan.resident_layer_bytes.checked_mul(layers.len())
             .context("FP8 MoE TP2 resident size overflow")?;
@@ -88,9 +100,9 @@ impl<'a> Fp8MoeTp2<'a> {
             plan.workspace_bytes);
         let _scope = cuteafd_ffi::memory_ledger::scope("experts/TP2 FP8 expert layer halves");
         let completion = RankCompletion::new(Event::new(device)?);
-        let layer_ids: Vec<_> = layers.clone().collect();
-        let experts = device.own(|| Fp8Experts::load(device.library, tensors, &plan.directory, &layer_ids,
+        let experts = device.own(|| Fp8Experts::load(device.library, tensors, &plan.directory, &layers,
             2, rank, max_rows, budget - plan.output_bytes))?;
+        validate_installed(&layers, experts.layers.iter().map(|layer| layer.layer))?;
         ensure!(experts.resident_bytes() == resident && experts.scratch_bytes() == plan.scratch_bytes,
             "FP8 MoE TP2 static allocation plan disagrees with runtime");
         let output = Allocation::new(device, plan.output_bytes)?;
@@ -101,11 +113,10 @@ impl<'a> Fp8MoeTp2<'a> {
     /// Both halves are admitted before either allocates; P4's shared pinned
     /// banks read each source projection once for both rank windows.
     pub(crate) fn load_pair(devices: [Device<'a>; 2], tensors: &Fp8ExpertTensors, directory: &Path,
-        layers: Range<usize>, max_rows: usize, budgets: [usize; 2]) -> Result<[Self; 2]> {
+        layers: Vec<usize>, max_rows: usize, budgets: [usize; 2]) -> Result<[Self; 2]> {
         ensure!(devices[0].id != devices[1].id && std::ptr::eq(devices[0].library, devices[1].library),
             "invalid FP8 MoE TP2 device pair");
-        ensure!(!layers.is_empty() && layers.start >= tensors.shape().first_layer
-            && layers.end <= tensors.shape().layers, "invalid FP8 MoE TP2 layer range");
+        validate_layers(&layers, tensors.shape(), 0)?;
         let started = std::time::Instant::now();
         let _scope = cuteafd_ffi::memory_ledger::scope("experts/TP2 FP8 expert layer halves");
         let plans = [Self::plan(tensors, directory, 0, max_rows)?, Self::plan(tensors, directory, 1, max_rows)?];
@@ -123,11 +134,11 @@ impl<'a> Fp8MoeTp2<'a> {
             return Ok(ranks);
         }
         let completions = [RankCompletion::new(Event::new(devices[0])?), RankCompletion::new(Event::new(devices[1])?)];
-        let layer_ids: Vec<_> = layers.clone().collect();
         let experts = Fp8Experts::load_pair(devices, tensors, [&plans[0].directory, &plans[1].directory],
-            plans.each_ref().map(|p| p.slicing), &layer_ids, max_rows,
+            plans.each_ref().map(|p| p.slicing), &layers, max_rows,
             [budgets[0] - plans[0].output_bytes, budgets[1] - plans[1].output_bytes])?;
         let make = |rank: usize, completion, experts: DeviceOwner<'a, Fp8Experts<'a>>| -> Result<Self> {
+            validate_installed(&layers, experts.layers.iter().map(|layer| layer.layer))?;
             ensure!(experts.resident_bytes() == plans[rank].resident_layer_bytes * layers.len()
                 && experts.scratch_bytes() == plans[rank].scratch_bytes,
                 "FP8 MoE TP2 static pair allocation plan disagrees with runtime");
@@ -175,7 +186,7 @@ impl<'a> Fp8MoeTp2<'a> {
         for capacity in capacities {
             // SAFETY: caller supplies retained rows/routes for every startup bucket;
             // startup streams carry no peer waits, so a failed launch has nothing to abort.
-            unsafe { self.enqueue(self.layers.start, capacity.min(self.max_rows), input, routes, stream, &mut || {})?; }
+            unsafe { self.enqueue(self.layers[0], capacity.min(self.max_rows), input, routes, stream, &mut || {})?; }
             self.device.run(|| {
                 // SAFETY: this rank owns the startup stream, with no peer waits.
                 unsafe { self.device.library.cuda_stream_synchronize(stream) }
@@ -188,7 +199,7 @@ impl<'a> Fp8MoeTp2<'a> {
 impl RtxExpertLayer for Fp8MoeTp2<'_> {
     fn shard(&self) -> RtxShard { RtxShard::Tp2 { rank: self.rank } }
     fn partial(&self) -> PartialDtype { PartialDtype::Bf16 }
-    fn layers(&self) -> Range<usize> { self.layers.clone() }
+    fn layers(&self) -> &[usize] { &self.layers }
     fn device(&self) -> i32 { self.device.id }
     fn workspace_bytes(&self) -> usize { self.workspace_bytes }
     fn output(&self) -> *mut c_void { self.output.buffer.ptr }
@@ -220,6 +231,27 @@ impl RtxExpertLayer for Fp8MoeTp2<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sparse_backbone_inventory_preserves_ids_and_rejects_gaps() -> Result<()> {
+        let shape = cuteafd_loader::RoutedExpertShape { layers: 18, first_layer: 3,
+            experts: 1, topk: 1, hidden: 256, intermediate: 256, draft_stages: 1, draft_experts: 1 };
+        let layers = [3, 13, 15];
+        for rank in 0..2 {
+            validate_layers(&layers, &shape, rank)?;
+            for invalid in [&[][..], &[3, 3], &[13, 3], &[2], &[18]] {
+                assert!(validate_layers(invalid, &shape, rank).is_err());
+            }
+            validate_installed(&layers, layers.into_iter())?;
+            for installed in [&[3, 13][..], &[3, 13, 14, 15], &[3, 15, 13], &[3, 13, 15, 18]] {
+                assert!(validate_installed(&layers, installed.iter().copied()).is_err());
+            }
+        }
+        assert!(validate_layers(&layers, &shape, 2).is_err());
+        assert_eq!(super::super::resident_index(&layers, 13)?, 1);
+        assert!(super::super::resident_index(&layers, 14).is_err());
+        Ok(())
+    }
 
     #[test]
     fn package_contract_is_geometry_generic_and_rejects_wire_or_wrong_rank() -> Result<()> {

@@ -14,10 +14,10 @@ Run inside the coordinator dev image (CPU only):
 import argparse
 import json
 import pathlib
+import sys
 
-from transformers.utils.chat_template_utils import render_jinja_template
-
-FIXTURES = pathlib.Path(__file__).resolve().parents[3] / "rust/crates/cuteafd-api/src/openai/chat/glm5/fixtures"
+ROOT = pathlib.Path(__file__).resolve().parents[3]
+FIXTURES = ROOT / "rust/crates/cuteafd-api/src/openai/chat/glm5/fixtures"
 TEMPLATES = {"exl3_k4": "glm53_exl3_k4.jinja", "zai": "glm53_zai.jinja"}
 
 WEATHER = {
@@ -177,6 +177,15 @@ CASES = {
 
 
 def main():
+    # Render with the checkout's pinned source, not an installed distribution:
+    # the pinned revision's chat-template helpers are what the Rust renderer is
+    # checked against, and no transformers wheel ships in the dev image.
+    pinned = (ROOT / "third_party/transformers/src/transformers").resolve()
+    sys.path.insert(0, str(pinned.parent))
+    import transformers
+    from transformers.utils.chat_template_utils import render_jinja_template
+    if pathlib.Path(transformers.__file__).resolve().parent != pinned:
+        raise SystemExit(f"import transformers from the pinned checkout: {pinned}")
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--out", default=str(FIXTURES / "glm53_template_goldens.json"))
     args = parser.parse_args()

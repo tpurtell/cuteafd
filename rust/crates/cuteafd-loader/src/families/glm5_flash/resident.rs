@@ -28,7 +28,7 @@ pub fn resident_weights(checkpoint: &Checkpoint, cfg: &GlmNextConfig, layers: us
 }
 
 /// Candidate MLA ownership with KDA and FFN operands still head-split. This
-/// inventory does not advertise support for an unqualified executor.
+/// inventory includes each rank's router replica and does not advertise an unqualified executor.
 pub fn resident_weights_placed(checkpoint: &Checkpoint, cfg: &GlmNextConfig, layers: usize, ranks: usize,
     repr: GlmfRepresentation, attention: crate::placement::AttentionPlacement, first_owner: usize)
     -> Result<Vec<GlmfResidentRank>, String> {
@@ -128,7 +128,7 @@ pub fn resident_weights_placed(checkpoint: &Checkpoint, cfg: &GlmNextConfig, lay
                 bytes += fp8(&[gate, format!("{mlp}.up_proj.weight")], ranks > 1, false)?;
                 bytes += fp8(&[format!("{mlp}.down_proj.weight")], ranks > 1, false)?;
             }
-            if !cfg.dense[layer] && rank == 0 {
+            if !cfg.dense[layer] {
                 bytes += one(&format!("{p}.mlp.gate.weight"))?;
                 bytes += f32(&[format!("{p}.mlp.gate.e_score_correction_bias")], false)?;
             }
@@ -234,7 +234,8 @@ mod tests {
             let single = resident_weights(&checkpoint, &cfg, cfg.layers, 1, Default::default()).unwrap();
             assert_eq!((single[0].embedding, single[0].weights), (1_268_776_960, 8_956_184_320), "{model}");
             let split = resident_weights(&checkpoint, &cfg, cfg.layers, 2, Default::default()).unwrap();
-            assert_eq!((split[0].weights, split[1].weights), (5_660_947_200, 4_907_587_072), "{model}");
+            assert_eq!((split[0].weights, split[1].weights),
+                (5_660_947_200, 4_907_587_072 + router_replica_bytes(&checkpoint, &cfg, cfg.layers).unwrap()), "{model}");
             assert_eq!(split[1].embedding, 0);
         }
     }

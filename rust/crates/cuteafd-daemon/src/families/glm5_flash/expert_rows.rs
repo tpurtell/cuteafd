@@ -24,12 +24,12 @@ pub(super) fn check(args: &EngineArgs, opened: &Opened, max_rows: usize) -> Resu
     };
     let (free, _) = library.cuda_memory_info()?;
     let layer = shape.first_layer;
-    let mut experts = LocalExperts::load_range(
+    let mut experts = LocalExperts::load(
         library,
         &args.native_lib,
         catalog,
         0,
-        layer..layer + 1,
+        &[layer],
         max_rows,
         free.saturating_sub(4 << 30),
         stream.raw,

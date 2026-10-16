@@ -2075,16 +2075,19 @@ release cards:
 
 The draft-policy steps (`D2`, `D3`, `D4`) gate on the GLM Flash edge cards
 as well as min/max.
-- GLM Flash today runs all-local or all-Spark experts per process
-  (`--peers` conflicts with `--local-experts`).
+- P6 permits GLM Flash local RTX (TP1/TP2) and Spark expert backends in
+  one process; `--peers` and `--local-experts` no longer conflict. Its
+  executable layer selection is still a local prefix and Spark suffix.
   - The **all-Spark** card: min/max as shipped.
   - The all-Spark card runs now and gates `D2`. There is no one-RTX
     all-local card: the K3.25 routed experts are 115.6 GiB (K3 106.7 GiB),
     over one 95.6 GiB RTX, so all-local GLM Flash is the 2× RTX no-Spark
     card below.
-- The **mixed, about half onboarded** card needs a per-layer expert backend
-  (local fp8moe/EXL3 layers plus Spark layers in one process). That is
-  `P6`/`P7` placement work, and it gates `D3`/`D4` once it lands.
+- The **mixed, about half onboarded** card needs P7's non-contiguous
+  per-layer expert ownership and explicit backend dispatch, alongside whole
+  DSA ownership with owner-local weights, cache and index. It gates `D3`/`D4`
+  once qualified; P6 already supplies the coexistence of local and Spark
+  backends in one process.
 - The **2× RTX no-Spark** card needs TP2 RTX experts (`P6`). It joins the
   set then. The placement steps (`P1`–`P12`) and ds41rt stages
 gate on the cards their family touches.
