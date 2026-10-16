@@ -89,6 +89,17 @@ impl<'a> Arenas<'a> {
         };
         Ok(Self { target, draft, slots })
     }
+    /// Draft marks allocated after admission placed the drafter (two-RTX
+    /// dSpark loads after the solve, so its marks are admitted, not sampled).
+    pub fn with_draft(mut self, draft: Device<'a>) -> Result<Self> {
+        ensure!(self.draft.is_none(), "draft mark arena already allocated");
+        if self.slots > 0 {
+            let _scope = cuteafd_ffi::memory_ledger::scope("prefix/snapshot");
+            self.draft = Some(std::rc::Rc::new(Allocation::new(draft, self.slots * super::speculative::DRAFT_MARK_BYTES)?));
+        }
+        Ok(self)
+    }
+    pub fn draft_mark_bytes(slots: usize) -> usize { slots * super::speculative::DRAFT_MARK_BYTES }
     pub fn device_bytes(slots: usize, draft: bool) -> usize {
         slots * (BackboneMark::BYTES + if draft { super::speculative::DRAFT_MARK_BYTES } else { 0 })
     }

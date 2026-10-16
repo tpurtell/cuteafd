@@ -559,6 +559,32 @@ pub struct DraftInventory {
     /// Largest transient load staging on the home and on the peer half; the
     /// caller folds it into the full dSpark load-phase peak.
     pub staging: [u64; 2],
+    /// Routed-expert bytes resident while that staging is live, [home, GPU0
+    /// TP2 half]: experts load first, serially, before anything else.
+    pub loading_experts: [u64; 2],
+    /// The loader's own pre-load fit check per GPU [home, GPU0 TP2 half]
+    /// (`DsparkBudget::peak_device_bytes`, conservative wave and window
+    /// terms). It is a transient check, so it joins the load phase, never the
+    /// retained owners.
+    pub loader_peak: [u64; 2],
+}
+
+impl DraftInventory {
+    /// The full dSpark load phase above a pre-draft sample: experts plus their
+    /// transient staging on each GPU that loads them (`request.startup`).
+    pub fn load_phase(&self, ranks: usize) -> Result<Vec<Demand>, PlacementError> {
+        if !(1..=2).contains(&ranks) { return Err(PlacementError::Inventory("V4.1 dSpark draft ranks")); }
+        let home = (ranks - 1) as u8;
+        let peak = |gpu: usize| self.loading_experts[gpu].checked_add(self.staging[gpu])
+            .map(|bytes| bytes.max(self.loader_peak[gpu]))
+            .ok_or(PlacementError::Overflow("V4.1 dSpark load phase"));
+        let mut phases = vec![Demand::new(home, Category::Staging, "dSpark load phase", peak(0)?, Basis::Exact)];
+        if self.peer_half > 0 {
+            phases.push(Demand::new(0, Category::Staging, "dSpark TP2 load phase", peak(1)?, Basis::Exact));
+        }
+        phases.retain(|d| d.bytes > 0);
+        Ok(phases)
+    }
 }
 
 /// The dSpark drafter as one itemized shared drafter Movable at the head GPU
@@ -843,7 +869,7 @@ mod tests {
             Demand::new(1, Category::Drafter, "dSpark windows", 9 << 20, Basis::Formula)];
         for peer_half in [0, 3 << 30] {
             let inventory = DraftInventory { resident: if peer_half > 0 { 4 << 30 } else { 7 << 30 }, runtime: runtime.clone(),
-                marks: 64 << 20, peer_half, staging: [512 << 20, if peer_half > 0 { 256 << 20 } else { 0 }] };
+                marks: 64 << 20, peer_half, staging: [512 << 20, if peer_half > 0 { 256 << 20 } else { 0 }], loading_experts: [6 << 30, peer_half], loader_peak: [0; 2] };
             let movable = drafter(&inventory, 2).unwrap();
             assert_eq!((movable.id, movable.allowed.clone(), movable.parts.len()), (MovableId::Drafter, vec![1], 0));
             assert_eq!(movable.conditional.len(), 1);
@@ -854,7 +880,7 @@ mod tests {
             assert_eq!(on(0), (7 << 20) + peer_half);
         }
         let one = DraftInventory { resident: 7 << 30, runtime: runtime.iter().filter(|d| d.gpu == 1)
-            .cloned().map(|d| d.on(0)).collect(), marks: 0, peer_half: 0, staging: [1, 0] };
+            .cloned().map(|d| d.on(0)).collect(), marks: 0, peer_half: 0, staging: [1, 0], loading_experts: [0; 2], loader_peak: [0; 2] };
         let movable = drafter(&one, 1).unwrap();
         assert_eq!(movable.allowed, [0]);
         assert!(movable.conditional[0].demands.iter().all(|d| d.gpu == 0));
@@ -872,7 +898,7 @@ mod tests {
         let base = request(inventory, pool, vec![1 << 20; 2], vec![cost; 40], 64 << 20, Onboard::Layers(4));
         let movable = drafter(&DraftInventory { resident: 6 << 30,
             runtime: vec![Demand::new(1, Category::Drafter, "dSpark request lanes", 1 << 30, Basis::Formula)],
-            marks: 0, peer_half: 2 << 30, staging: [1 << 30, 1 << 29] }, 2).unwrap();
+            marks: 0, peer_half: 2 << 30, staging: [1 << 30, 1 << 29], loading_experts: [4 << 30, 2 << 30], loader_peak: [0; 2] }, 2).unwrap();
         let mut with = base.clone();
         with.movables = vec![movable];
         let (a, b) = (solve(&base).unwrap(), solve(&with).unwrap());
@@ -880,5 +906,17 @@ mod tests {
         let units = |p: &Placement| p.pool_tokens / 512;
         assert!(units(&b) < units(&a), "the drafter's bytes come out of the pool, not after it");
         crate::placement::draft::assert_same_as_fixed(&with);
+    }
+
+    #[test]
+    fn dspark_load_phase_is_experts_plus_staging_or_the_loader_check() {
+        let mut d = DraftInventory { staging: [1 << 30, 1 << 29], loading_experts: [6 << 30, 2 << 30],
+            peer_half: 2 << 30, ..Default::default() };
+        let phase = |d: &DraftInventory| d.load_phase(2).unwrap().iter().map(|p| (p.gpu, p.bytes)).collect::<Vec<_>>();
+        assert_eq!(phase(&d), [(1, 7 << 30), (0, (2 << 30) + (1 << 29))]);
+        d.loader_peak = [9 << 30, 0];
+        assert_eq!(phase(&d), [(1, 9 << 30), (0, (2 << 30) + (1 << 29))]);
+        d.peer_half = 0;
+        assert_eq!(d.load_phase(1).unwrap()[0].gpu, 0);
     }
 }

@@ -17,15 +17,7 @@ pub(crate) struct DsparkStage<'weights, 'library> {
     ready: bool,
 }
 impl<'library> DsparkWeights<'library> {
-    pub fn stage_bytes(&self, requests: u32) -> Result<usize> {
-        let capacity = DsparkAttentionWave::projection_capacity_with_width(requests, self.draft_width)?;
-        let library = self.library;
-        let attention = DsparkAttentionWave::device_bytes_with_width(library, requests, self.draft_width)?;
-        self.ffn_bytes(capacity)?
-            .checked_add(HcSublayer::device_bytes(capacity as usize)?)
-            .and_then(|v| v.checked_add(attention))
-            .context("dSpark combined stage budget overflow")
-    }
+    pub fn stage_bytes(&self, requests: u32) -> Result<usize> { self.shape().stage_bytes(requests) }
     /// Replaces the separate attention/mHC/FFN owners already in the wave budget.
     pub fn stage(
         &self,

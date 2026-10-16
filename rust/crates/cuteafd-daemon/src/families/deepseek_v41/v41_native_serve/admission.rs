@@ -989,6 +989,8 @@ mod admission_tests {
                 peer_half: if ranks == 2 { 512 << 20 } else { 0 },
                 // Staging is not a retained owner or a complete startup phase.
                 staging: [100 << 30; 2],
+                loading_experts: [0; 2],
+                loader_peak: [0; 2],
             };
             let memory = vec![(80usize << 30, 96usize << 30); ranks];
             let moved = resolve(&args, &memory, vec![], 0, &vec![0; ranks], 0, Some(&draft))?;

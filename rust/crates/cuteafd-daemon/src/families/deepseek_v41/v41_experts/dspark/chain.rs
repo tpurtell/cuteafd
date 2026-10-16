@@ -97,12 +97,7 @@ impl<'library> DsparkWeights<'library> {
         Ok(chain)
     }
 
-    pub fn chain_bytes(&self, requests: u32) -> Result<usize> {
-        self.stage_bytes(requests)?
-            .checked_mul(3)
-            .and_then(|bytes| bytes.checked_add(requests as usize * 4))
-            .context("dSpark chain budget overflow")
-    }
+    pub fn chain_bytes(&self, requests: u32) -> Result<usize> { self.shape().chain_bytes(requests) }
     pub fn chain(&self, requests: u32, budget: usize) -> Result<DsparkChain<'_, 'library>> {
         ensure!(
             self.chain_bytes(requests)? <= budget,

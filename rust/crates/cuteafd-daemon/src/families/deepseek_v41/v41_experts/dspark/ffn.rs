@@ -17,20 +17,7 @@ pub(crate) struct DsparkFfn<'weights, 'library> {
     graph: BindingGraphs<'library, u32>,
 }
 impl<'library> DsparkWeights<'library> {
-    pub fn ffn_bytes(&self, capacity: u32) -> Result<usize> {
-        let library = self.library;
-        let experts = self.expert_bytes(capacity)?;
-        let hc = HcSublayer::device_bytes(capacity as usize)?;
-        let router = DsparkRouter::device_bytes(capacity as usize)?;
-        let shared = DsparkSharedFfn::device_bytes(library, capacity)?;
-        [hc, router, shared]
-            .into_iter()
-            .try_fold(experts, |bytes, next| {
-                bytes
-                    .checked_add(next)
-                    .context("dSpark FFN combined budget overflow")
-            })
-    }
+    pub fn ffn_bytes(&self, capacity: u32) -> Result<usize> { self.shape().ffn_bytes(capacity) }
     /// Replaces one stage's separate FFN mHC/router/shared/expert wave owners.
     /// These allocations are already included in DsparkBudget, not additional.
     pub fn ffn(
