@@ -5,6 +5,7 @@ use cuteafd_core::{DType, FfnActivation};
 use crate::plan::{checkpoint::Checkpoint, family::*, format::QuantOperand, names::indexed, spec::*};
 
 mod placement;
+pub mod coordinator;
 #[cfg(test)]
 mod tests;
 
@@ -13,6 +14,7 @@ pub static STEP5: Step5 = Step5;
 
 #[derive(Debug, Clone)]
 pub struct Config {
+    pub norm_eps: f32,
     pub hidden: usize,
     pub vocab: usize,
     pub layers: usize,
@@ -88,7 +90,11 @@ impl Config {
             ("sparse_indexer_num_k_heads", 1), ("num_provider_groups", 4), ("topk", 512), ("region_block_size", 8)] {
             ensure!(sparse[key].as_u64() == Some(expected), "unsupported Step-5 sparse_config.{key}: {}", sparse[key]);
         }
-        let cfg = Self { hidden: int("hidden_size")?, vocab: int("vocab_size")?, layers, mtp,
+        let norm_eps = v["rms_norm_eps"].as_f64().filter(|v| v.is_finite() && *v > 0.0)
+            .context("Step-5 requires positive finite rms_norm_eps")? as f32;
+        ensure!(norm_eps.is_finite() && norm_eps > 0.0 && v["norm_dtype"] == "float32",
+            "Step-5 requires representable positive epsilon and norm_dtype=float32");
+        let cfg = Self { norm_eps, hidden: int("hidden_size")?, vocab: int("vocab_size")?, layers, mtp,
             dense: int("intermediate_size")?, experts: int("moe_num_experts")?, intermediate: int("moe_intermediate_size")?,
             shared: int("share_expert_dim")?, topk: int("moe_top_k")?, heads: int("num_attention_heads")?,
             groups: int("num_attention_groups")?, dim, window: int("sliding_window")?,
