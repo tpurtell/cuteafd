@@ -323,6 +323,49 @@ mod tests {
     }
 
     #[test]
+    fn drafter_movable_places_exactly_like_the_former_fixed_demands() {
+        use cuteafd_core::serving_capacity::{ContextLimits, DeviceCosts};
+        let mut cfg = MimoV2Config::from_hf(&crate::plan::testing::mimo_pro_config()).unwrap();
+        cfg.layers = 4;
+        cfg.dense = vec![true, false, false, false];
+        cfg.attention = vec![MimoAttention::Full; 4];
+        for ranks in [1, 2] {
+            let cache = mimo_cache_geometry(&cfg, 4, ranks, MimoKvCache::Int8, 0).unwrap();
+            let mut drafts = vec![("draft.weights.fp8_values", 1400u64 << 20), ("draft.fp8_scratch", 16 << 20),
+                ("draft.layer0.k_ring", 32 << 20), ("workspace.local", 1 << 30)];
+            let profile = CapacityProfile {
+                context: ContextLimits { checkpoint_max_tokens: 1 << 20, compiled_index_max_tokens: None },
+                pool_unit_rows: cache.logical_unit_rows, host_prefix_bytes: 0,
+                devices: cache.ranks.iter().enumerate().map(|(rank, storage)| DeviceCosts {
+                    device: rank as u32, pool_unit_bytes: storage.persistent_unit_bytes + 256,
+                    reservations: drafts.iter().filter(|(name, _)| rank == 0 || !name.starts_with("draft."))
+                        .map(|&(name, bytes)| MemoryReservation { name: name.into(), bytes }).collect(),
+                }).collect(),
+            };
+            let cost = ExpertCost { whole: Bytes2 { resident: 1 << 30, staging: 0 },
+                half: [Bytes2 { resident: 512 << 20, staging: 0 }; 2], tp2: ranks == 2, spark_ok: true };
+            for onboard in [Onboard::Auto, Onboard::Layers(2)] {
+                let inputs = MimoInputs { cfg: &cfg, profile: &profile, layers: 4, kv: MimoKvCache::Int8,
+                    mtp_stages: 0, gpus: vec![(96 << 30, Baseline::Measured { free_bytes: 90 << 30 }); ranks],
+                    headroom_floor: 0, spark_ranks: 6, startup_probe_bytes: 64 << 20, context: 256 << 10,
+                    requested_pool: None, pool_ceiling_at_target: false, onboard,
+                    experts: vec![None, Some(cost), Some(cost), Some(cost)],
+                    expert_workspace: if ranks == 1 { 1 << 20 } else { 0 },
+                    tp2_workspace: if ranks == 2 { [1 << 20; 2] } else { [0; 2] }, rows: 4096, lanes: 3 };
+                let req = request(&inputs).unwrap();
+                assert_eq!(req.movables.len(), 1);
+                assert!(req.fixed.iter().all(|d| !d.group.starts_with("draft.")));
+                assert_eq!(req.movables[0].conditional[0].demands.iter()
+                    .map(|d| (d.category, d.group.as_str())).collect::<Vec<_>>(),
+                    [(Category::Drafter, "draft.weights.fp8_values"), (Category::Workspace, "draft.fp8_scratch"),
+                        (Category::Drafter, "draft.layer0.k_ring")]);
+                crate::placement::draft::assert_same_as_fixed(&req);
+            }
+            drafts.retain(|(name, _)| !name.starts_with("draft."));
+        }
+    }
+
+    #[test]
     fn implicit_missing_explicit_and_malformed_package_contract() {
         let dir = tempfile::tempdir().unwrap();
         let layout = dir.path().join("tp2");
@@ -387,11 +430,14 @@ pub fn request(inputs: &MimoInputs<'_>) -> Result<PlacementRequest, CacheGeometr
         return Err(PlacementError::Inventory("MiMo pool quantum").into());
     }
     let mut fixed = Vec::new();
+    let mut drafter = Vec::new();
     let mut pool_overhead = Vec::new();
     for (rank, costs) in profile.devices.iter().enumerate() {
         for reservation in &costs.reservations {
-            fixed.push(Demand::new(rank as u8, reservation_category(&reservation.name),
-                reservation_group(&reservation.name), reservation.bytes, Basis::Formula));
+            let demand = Demand::new(rank as u8, reservation_category(&reservation.name),
+                reservation_group(&reservation.name), reservation.bytes, Basis::Formula);
+            // The external drafter's own allocations form the shared drafter Movable.
+            if reservation.name.starts_with("draft.") { drafter.push(demand) } else { fixed.push(demand) }
         }
         pool_overhead.push(costs.pool_unit_bytes.checked_sub(cache.ranks[rank].persistent_unit_bytes)
             .ok_or(PlacementError::Inventory("MiMo pool tables omit layer records"))?);
@@ -439,6 +485,14 @@ pub fn request(inputs: &MimoInputs<'_>) -> Result<PlacementRequest, CacheGeometr
                 else { vec![LayerMode::Whole { gpu: 0, ffn: FfnMode::Owner }] },
         }
     }).collect();
+    // DFlash reads GPU0's taps and borrows its head; the shared Movable keeps it
+    // there until a measured bridge binding allows the other GPU.
+    if drafter.iter().any(|d| d.gpu != 0) {
+        return Err(PlacementError::Inventory("MiMo drafter allocations outside the head GPU").into());
+    }
+    let movables = if drafter.is_empty() { Vec::new() } else {
+        vec![draft::DrafterDemand::itemized(drafter, 0).movable(ranks)?]
+    };
     let gpus = inputs.gpus.iter().enumerate().map(|(rank, &(capacity_bytes, baseline))| GpuBudget {
         capacity_bytes, baseline,
         headroom_bytes: headroom_bytes(capacity_bytes, false)
@@ -449,7 +503,7 @@ pub fn request(inputs: &MimoInputs<'_>) -> Result<PlacementRequest, CacheGeometr
         pool_bounded: Vec::new(),
         inventory: Inventory { gpus, spark_ranks: inputs.spark_ranks, peer_access: ranks == 2 },
         pool,
-        layers: demands, pool_overhead, fixed, startup: Vec::new(), movables: Vec::new(),
+        layers: demands, pool_overhead, fixed, startup: Vec::new(), movables,
         attention_placement: None, context_buffers: Default::default(), layers_first_gpu: 0,
         expert_workspace: inputs.expert_workspace, tp2_workspace,
         minimum_expert_layers: 0,

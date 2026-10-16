@@ -301,17 +301,19 @@ pub fn request(inputs: &GlmInputs<'_>) -> Result<PlacementRequest, PlacementErro
                 rows.push(GlmBufferRow::new(GlmComponent::SparkExperts, Demand::new(gpu, Category::Transport, "Spark intake planes",
                     endpoints * inputs.spark_ranks as u64 * 4096 * cfg.hidden as u64 * 2, Basis::Formula)));
             }
-            if inputs.drafter_bytes > 0 {
-                rows.push(GlmBufferRow::new(GlmComponent::Always, Demand::new(gpu, Category::Drafter, "drafter owned storage",
-                    inputs.drafter_bytes, Basis::Formula)));
-                rows.push(GlmBufferRow::new(GlmComponent::Always, Demand::new(gpu, Category::Drafter, "drafter load staging",
-                    inputs.drafter_staging, Basis::Formula)));
-            }
         }
         pool_overhead.push(table_bytes);
     }
     let fixed = rows.into_iter().filter(|row| row.component.selected(rtx, inputs.spark_ranks > 0))
         .map(|row| row.demand).collect();
+    // DFlash2 reads GPU0's taps and borrows its head; the shared Movable keeps
+    // it there until a measured bridge binding allows the other GPU.
+    let movables = if inputs.drafter_bytes == 0 { Vec::new() } else {
+        vec![draft::DrafterDemand::itemized(vec![
+            Demand::new(0, Category::Drafter, "drafter owned storage", inputs.drafter_bytes, Basis::Formula),
+            Demand::new(0, Category::Drafter, "drafter load staging", inputs.drafter_staging, Basis::Formula)], 0)
+            .movable(gpus)?]
+    };
     let layers = (0..inputs.layers).map(|layer| LayerDemand {
         kind: AttentionClass::Dsa,
         weights: ModeBytes::default(),
@@ -347,7 +349,7 @@ pub fn request(inputs: &GlmInputs<'_>) -> Result<PlacementRequest, PlacementErro
             spark_ranks: inputs.spark_ranks, peer_access: gpus == 2 },
         pool: PoolPolicy { ceiling: 1 << 31, ..PoolPolicy::resolve(&cards, inputs.max_context,
             inputs.requested_pool, PAGE_ROWS, inputs.spark_ranks == 0) },
-        layers, pool_overhead, fixed, startup: Vec::new(), movables: Vec::new(),
+        layers, pool_overhead, fixed, startup: Vec::new(), movables,
         expert_workspace: if GlmComponent::RtxExperts.selected(rtx, inputs.spark_ranks > 0) { inputs.expert_workspace } else { 0 },
         tp2_workspace: if GlmComponent::RtxExperts.selected(rtx, inputs.spark_ranks > 0) { inputs.tp2_workspace } else { [0; 2] },
         minimum_expert_layers: 0,
@@ -837,6 +839,23 @@ mod tests {
                     if onboard == Onboard::Layers(2) { assert_eq!(p.tp2.unwrap().layers, 2); }
                 }
                 eprintln!("GLM {cards:?} {onboard}: {}", p.summary());
+            }
+        }
+    }
+
+    #[test]
+    fn drafter_movable_places_exactly_like_the_former_fixed_demands() {
+        let cfg = config();
+        for cards in [vec![96 * GIB], vec![96 * GIB; 2], vec![96 * GIB, 80 * GIB]] {
+            for onboard in [Onboard::Auto, Onboard::Layers(2)] {
+                let mut i = GlmInputs { onboard, ..inputs(&cfg, &cards) };
+                i.drafter_staging = 1 << 28;
+                let mut req = request(&i).unwrap();
+                req.attention_placement = HEADS;
+                assert_eq!(req.movables.len(), 1);
+                assert_eq!(req.movables[0].allowed, [0]);
+                crate::placement::draft::assert_same_as_fixed(&req);
+                assert_eq!(crate::placement::draft::home(&solve(&req).unwrap()), Some(0));
             }
         }
     }

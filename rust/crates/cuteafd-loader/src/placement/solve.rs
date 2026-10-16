@@ -298,7 +298,8 @@ fn solve_once(request: &PlacementRequest, flips: &[(AttentionClass, AttentionPla
                 request, movable, &available, &used, &arenas, &unit_bytes, context)?;
             used = candidate_used;
             arenas = candidate_arenas;
-            if !movable.expert_arena {
+            // An itemized movable (every byte in its conditional demands) has no opaque item.
+            if !movable.expert_arena && totals[index] > 0 {
                 items[gpu].push(Item::new(Category::Drafter, format!("{:?}", movable.id), "",
                     totals[index], Basis::Exact));
             }

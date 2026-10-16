@@ -23,7 +23,11 @@ pub struct DrafterDemand {
     /// into the home's TP1 expert arena.
     pub id: MovableId,
     /// Loaded in order wherever the drafter lives; staging is transient.
+    /// Charged as one `Drafter` (or arena) item on the home.
     pub parts: Vec<Bytes2>,
+    /// Named allocations that follow the home (their `gpu` is rewritten to
+    /// each candidate home), for families whose ledger itemizes the drafter.
+    pub owned: Vec<Demand>,
     /// Shares the home's local expert arena (workspace and load peak).
     pub expert_arena: bool,
     /// The GPU whose target head, embedding and taps the drafter reads.
@@ -38,13 +42,20 @@ pub struct DrafterDemand {
 impl DrafterDemand {
     /// A drafter that always lives beside the target head.
     pub fn local(id: MovableId, parts: Vec<Bytes2>, target_gpu: u8) -> Self {
-        Self { id, parts, expert_arena: id == MovableId::DsparkExperts, target_gpu, per_home: Vec::new(), bridge: None }
+        Self { id, parts, owned: Vec::new(), expert_arena: id == MovableId::DsparkExperts, target_gpu,
+            per_home: Vec::new(), bridge: None }
+    }
+
+    /// A drafter beside the target head whose ledger itemizes every allocation.
+    pub fn itemized(owned: Vec<Demand>, target_gpu: u8) -> Self {
+        Self { owned, ..Self::local(MovableId::Drafter, Vec::new(), target_gpu) }
     }
 
     /// The solver's view on `gpus` coordinator GPUs. Candidate homes are the
     /// target GPU, plus the other GPU when a bridge exists. Each home's
-    /// conditional demands are its bridge (remote homes only) followed by its
-    /// own per-home demands; a home with neither carries no entry.
+    /// conditional demands are its bridge (remote homes only), the owned
+    /// demands placed on it, then its own per-home demands; a home with none
+    /// carries no entry.
     pub fn movable(&self, gpus: usize) -> Result<Movable, PlacementError> {
         let target = usize::from(self.target_gpu);
         if !(1..=2).contains(&gpus) || target >= gpus {
@@ -67,6 +78,9 @@ impl DrafterDemand {
         let remote = (self.bridge.is_some()).then(|| 1 - self.target_gpu);
         let conditional = (0..gpus as u8).filter_map(|home| {
             let mut demands = if Some(home) == remote { self.bridge.clone().unwrap_or_default() } else { Vec::new() };
+            if home == self.target_gpu || Some(home) == remote {
+                demands.extend(self.owned.iter().cloned().map(|d| d.on(home)));
+            }
             if let Some(own) = self.per_home.iter().find(|d| d.placement_gpu == home) {
                 demands.extend(own.demands.iter().cloned());
             }
@@ -76,6 +90,43 @@ impl DrafterDemand {
         allowed.sort_unstable();
         Ok(Movable { id: self.id, parts: self.parts.clone(), allowed, expert_arena: self.expert_arena, conditional })
     }
+}
+
+/// Test oracle: the same request with every movable charged as fixed demands
+/// on its first allowed GPU (how families charged drafters before #65).
+#[cfg(test)]
+pub(crate) fn as_fixed(mut request: super::PlacementRequest) -> super::PlacementRequest {
+    use cuteafd_core::memory_layout::{Basis, Category};
+    for movable in std::mem::take(&mut request.movables) {
+        let home = movable.allowed[0];
+        let total: u64 = movable.parts.iter().map(|p| p.resident).sum();
+        if total > 0 {
+            request.fixed.push(Demand::new(home, Category::Drafter, format!("{:?}", movable.id), total, Basis::Exact));
+        }
+        if let Some(own) = movable.conditional.into_iter().find(|c| c.placement_gpu == home) {
+            request.fixed.extend(own.demands);
+        }
+    }
+    request
+}
+
+/// Placement equality with [`as_fixed`]: everything but the movable list and
+/// the per-GPU item order, which the drafter's own items move to the end.
+#[cfg(test)]
+pub(crate) fn assert_same_as_fixed(request: &super::PlacementRequest) {
+    let moved = super::solve(request).unwrap();
+    let fixed = super::solve(&as_fixed(request.clone())).unwrap();
+    assert_eq!((moved.pool_tokens, &moved.layers, moved.tp2, &moved.expert_ranges, moved.onboard_layers),
+        (fixed.pool_tokens, &fixed.layers, fixed.tp2, &fixed.expert_ranges, fixed.onboard_layers));
+    for (a, b) in moved.items.iter().zip(&fixed.items) {
+        let key = |items: &[cuteafd_core::memory_layout::Item]| {
+            let mut v: Vec<_> = items.iter().map(|i| (i.category, i.group.clone(), i.bytes)).collect();
+            v.sort_by(|x, y| format!("{x:?}").cmp(&format!("{y:?}")));
+            v
+        };
+        assert_eq!(key(a), key(b));
+    }
+    assert!(moved.movables.iter().all(|(_, gpu)| request.movables.iter().any(|m| m.allowed[0] == *gpu)));
 }
 
 /// The GPU the solver gave the drafter (`Drafter` or `DsparkExperts`), if any.
@@ -127,6 +178,21 @@ mod tests {
         d.target_gpu = 1;
         assert_eq!(d.movable(2).unwrap().allowed, [0, 1]);
         assert!(d.movable(1).is_err());
+    }
+
+    #[test]
+    fn itemized_demands_follow_every_candidate_home_and_keep_their_names() {
+        let mut d = DrafterDemand::itemized(vec![Demand::new(0, Category::Drafter, "draft.weights", 11, Basis::Exact),
+            Demand::new(0, Category::Workspace, "draft.scratch", 2, Basis::Formula)], 0);
+        let m = d.movable(2).unwrap();
+        assert_eq!((m.allowed.clone(), m.parts.len()), (vec![0], 0));
+        assert_eq!(m.conditional.len(), 1);
+        assert_eq!(m.conditional[0].demands.iter().map(|d| (d.gpu, d.group.as_str())).collect::<Vec<_>>(),
+            [(0, "draft.weights"), (0, "draft.scratch")]);
+        d.bridge = Some(vec![Demand::new(0, Category::Transport, "bridge", 1, Basis::Formula)]);
+        let m = d.movable(2).unwrap();
+        assert_eq!(m.conditional[1].demands.iter().map(|d| (d.gpu, d.group.as_str())).collect::<Vec<_>>(),
+            [(0, "bridge"), (1, "draft.weights"), (1, "draft.scratch")]);
     }
 
     #[test]
