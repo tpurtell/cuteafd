@@ -81,6 +81,23 @@ def load_lossless_set(path):
     return str(path)
 
 
+def parse_lossless_dump(text, set_path=None):
+    """`CASE[,CASE...]:START-END` for the spec_lossless_set panel's full-vocabulary row dumps:
+    both arms, rows predicting generated tokens START..END (inclusive, 0..127)."""
+    match = re.fullmatch(r'([A-Za-z0-9_.,-]+):(\d+)-(\d+)', text.strip())
+    if not match:
+        raise ValueError(f'{text!r}: expected CASE[,CASE...]:START-END, e.g. code-2:70-80')
+    cases = match.group(1).split(',')
+    start, end = int(match.group(2)), int(match.group(3))
+    if not all(cases) or len(set(cases)) != len(cases) or not start <= end <= 127:
+        raise ValueError(f'{text!r}: distinct case ids and a window 0 <= START <= END <= 127')
+    known = {c['id'] for c in json.loads(Path(set_path or REPO / 'scripts/bench/fixtures/spec-lossless-set-v1.json').read_text())}
+    unknown = [c for c in cases if c not in known]
+    if unknown:
+        raise ValueError(f"{text!r}: cases not in the lossless set: {', '.join(unknown)}")
+    return dict(cases=cases, start=start, end=end)
+
+
 def requested_panels(profile):
     if not profile.startswith('panels:'):
         return []
@@ -307,6 +324,12 @@ def generate(entry, arm_name, arm, state, key_file, overrides, probes, expected_
         entry['window'] = dict(open=dict(argv=['true'], timeout_s=10, required=True),
                                close=dict(argv=['sh', '-c', 'exec "$@" --resume-url "$CUTEAFD_SMOKE_URL"', 'exact-state', *argv],
                                           timeout_s=3600, required=True))
+    if entry.get('lossless_dump'):
+        # The server writes each dumped probe under this job's directory (mounted at the same path).
+        if values.get('PROBE_DUMP_ROOT'):
+            raise ValueError(card + ': --dump-lossless-rows owns PROBE_DUMP_ROOT; drop the explicit setting')
+        values['PROBE_DUMP_ROOT'] = str(dest / 'lossless-rows')
+        (dest / 'lossless-rows').mkdir(exist_ok=True)
     if trace:
         if values.get('SPECULATION_TRACE'):
             raise ValueError(card + ': --trace owns SPECULATION_TRACE; drop the explicit setting')
@@ -924,6 +947,10 @@ def summarize_job(job, exit_code):
             row['lossless_set'] = lossless
             if lossless['status'] == 'fail':
                 fail(row, 'quality: spec_lossless_set: ' + lossless['summary'][:400], 'quality')
+            if job['entry'].get('lossless_dump') and lossless['status'] != 'skipped' and not lossless.get('row_dump'):
+                # A server image without the option ignores it; the requested rows must exist.
+                fail(row, 'spec_lossless_set: lossless_dump requested but the server wrote no row dump '
+                     '(build the serving arm with row-dump support)', 'measurement')
     if job.get('correctness_parallel'):
         for metric in ('C1', 'C8', '8K'):
             row[metric] = None
@@ -1010,9 +1037,12 @@ def lossless_set_result(report):
     if not passes:
         return {'status': 'fail', 'summary': panel.get('error') or 'no pass recorded'}
     last = passes[-1]
-    return {'status': 'pass' if last.get('gate') == 'pass' else 'fail', 'summary': last.get('summary', ''),
-            'passed': last.get('passed'), 'total': last.get('total'), 'set': last.get('set'),
-            'failing': [r['id'] for r in last.get('rows', []) if not r.get('pass')]}
+    result = {'status': 'pass' if last.get('gate') == 'pass' else 'fail', 'summary': last.get('summary', ''),
+              'passed': last.get('passed'), 'total': last.get('total'), 'set': last.get('set'),
+              'failing': [r['id'] for r in last.get('rows', []) if not r.get('pass')]}
+    if last.get('row_dump'):
+        result['row_dump'] = last['row_dump']
+    return result
 
 
 # A matched pair compares the prompts its inputs decide. A prompt that
@@ -1680,6 +1710,9 @@ def main():
                         '(comma list; "baseline" for the basic card + quick quality alone; "none" for no server profile)')
     parser.add_argument('--lossless-set', type=Path, metavar='FILE', help='case file for the spec_lossless_set panel '
                         '(JSON [{id, prompt, nonce}]); default: the shipped scripts/bench/fixtures/spec-lossless-set-v1.json')
+    parser.add_argument('--dump-lossless-rows', metavar='CASES:START-END', help='spec_lossless_set: dump full-vocabulary F32 '
+                        'log-prob rows of both arms for these cases over generated tokens START..END (e.g. code-2,code-5:70-90) '
+                        'to <job>/lossless-rows/spec-lossless-rows-*/ with a manifest.json; needs --panels with spec_lossless_set')
     parser.add_argument('--levels', metavar='C,C', help='client-side code-decode sweep at these concurrency levels after the profile, e.g. 1,16')
     parser.add_argument('--post-load-c1', action='store_true', help='re-measure C1 after the widest --levels level')
     parser.add_argument('--post-load-repeat', action='store_true', help='make that post-load C1 re-send the levels C1 prompts '
@@ -1821,6 +1854,14 @@ def main():
         lossless_set = load_lossless_set(args.lossless_set)
         if not any('spec_lossless_set' in requested_panels(card.get('profile', 'smoke')) for card in cards):
             parser.error('--lossless-set needs --panels with spec_lossless_set')
+    lossless_dump = None
+    if args.dump_lossless_rows is not None:
+        try:
+            lossless_dump = parse_lossless_dump(args.dump_lossless_rows, lossless_set)
+        except ValueError as error:
+            parser.error(f'--dump-lossless-rows: {error}')
+        if not any('spec_lossless_set' in requested_panels(card.get('profile', 'smoke')) for card in cards):
+            parser.error('--dump-lossless-rows needs --panels with spec_lossless_set')
     for card in cards:
         if context_lengths is not None:
             card['context_lengths'] = context_lengths
@@ -1828,6 +1869,8 @@ def main():
             card['context_levels'] = context_levels
         if lossless_set:
             card['lossless_set'] = lossless_set
+        if lossless_dump:
+            card['lossless_dump'] = lossless_dump
         if prefill_lengths:
             card['prefill_lengths'] = prefill_lengths
         if levels:
@@ -1954,6 +1997,7 @@ def main():
         (['baseline'] if any(job['entry'].get('baseline') is False for job in jobs) else []) + \
         (['window'] if any(job['entry'].get('window') for job in jobs) else []) + \
         (['lossless_set'] if any(job['entry'].get('lossless_set') for job in jobs) else []) + \
+        (['lossless_dump'] if any(job['entry'].get('lossless_dump') for job in jobs) else []) + \
         (['context_lengths'] if context_lengths is not None else []) + (['context_levels'] if context_levels is not None else [])
     for job in {j['launcher']['repo']: j for j in reversed(jobs)}.values():
         binary_supports(args.binary, job['launcher']['repo'], job, fields)

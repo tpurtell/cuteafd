@@ -15,7 +15,7 @@
 # both built by cmake/shared/fp8_moe.cmake; this file builds only the native families.
 set(CUTEAFD_NATIVE_EXPERT_FAMILIES)
 foreach(entry IN LISTS CUTEAFD_EXPERT_FAMILIES)
-  if(entry MATCHES ":(fp8|nvfp4|nvfp4a4)$")
+  if(entry MATCHES ":(fp8|nvfp4|nvfp4a4)$" OR entry STREQUAL "step5:bf16")
     continue()
   endif()
   if(NOT entry MATCHES ":exl3-k")

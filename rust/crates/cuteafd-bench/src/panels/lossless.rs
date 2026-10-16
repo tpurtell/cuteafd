@@ -127,6 +127,66 @@ fn validate(cases: &[Case]) -> Result<(), String> {
     Ok(())
 }
 
+/// Opt-in full-vocabulary row dumps: selected cases, both arms, rows predicting
+/// generated tokens `start..=end`. Written under the server's
+/// `CUTEAFD_PROBE_DUMP_ROOT` (launch key `PROBE_DUMP_ROOT`) in a new
+/// `spec-lossless-rows-<id>/<case>/{on,off}` leaf per probe, beside a
+/// `manifest.json` naming each arm's positions and row hashes.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RowDump {
+    pub cases: Vec<String>,
+    /// First and last generated-token offset dumped (inclusive).
+    pub start: usize,
+    pub end: usize,
+}
+
+impl RowDump {
+    pub fn validate(&self, set: &CaseSet) -> Result<(), String> {
+        if self.cases.is_empty() || self.cases.len() > MAX_CASES {
+            return Err(format!("row dumps name 1 to {MAX_CASES} cases"));
+        }
+        let mut seen = std::collections::HashSet::new();
+        for id in &self.cases {
+            if !seen.insert(id.as_str()) || !set.cases.iter().any(|c| &c.id == id) {
+                return Err(format!("row dump case {id:?} is duplicated or not in set {}", set.name));
+            }
+        }
+        if self.start > self.end || self.end >= TOKENS as usize {
+            return Err(format!("row dump window {}-{} must lie within generated tokens 0-{}", self.start, self.end,
+                TOKENS - 1));
+        }
+        Ok(())
+    }
+
+    /// `CASE[,CASE...]:START-END`, e.g. `code-1,code-2:45-64`.
+    pub fn parse(text: &str) -> Result<Self, String> {
+        let bad = || format!("{text:?}: expected CASE[,CASE...]:START-END, e.g. code-1,code-2:45-64");
+        let (cases, window) = text.rsplit_once(':').ok_or_else(bad)?;
+        let (start, end) = window.split_once('-').ok_or_else(bad)?;
+        let cases: Vec<String> = cases.split(',').map(|c| c.trim().to_string()).collect();
+        if cases.iter().any(String::is_empty) { return Err(bad()); }
+        Ok(Self { cases, start: start.trim().parse().map_err(|_| bad())?, end: end.trim().parse().map_err(|_| bad())? })
+    }
+
+    /// The dump's root on the serving host.
+    pub fn root() -> Result<std::path::PathBuf, String> {
+        std::env::var_os("CUTEAFD_PROBE_DUMP_ROOT").filter(|r| !r.is_empty()).map(std::path::PathBuf::from)
+            .ok_or_else(|| "lossless row dumps need the server launched with PROBE_DUMP_ROOT".into())
+    }
+}
+
+/// One dumped arm's manifest entry: its leaf, position range and the hashes of the rows it holds.
+fn dumped_arm(leaf: &str, record: &ProbeRecord, dump: &RowDump) -> Value {
+    let prompt = record.prompt_ids.len();
+    let rows: Vec<Value> = record.rows.iter().filter(|r| r.position >= prompt
+        && (dump.start..=dump.end).contains(&(r.position - prompt))).map(|r| json!({"position": r.position,
+            "offset": r.position - prompt, "hash": r.hash, "token": record.generated.get(r.position - prompt)}))
+        .collect();
+    json!({"dir": leaf, "positions": [prompt + dump.start, prompt + dump.end], "offsets": [dump.start, dump.end],
+        "rows": rows, "error": record.error})
+}
+
 /// One case's verdict from its drafts-on and drafts-off records.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Verdict {
@@ -272,38 +332,74 @@ impl Panel for LosslessSet {
         info.configuration.speculator.is_none().then(|| "no speculator: nothing to check".into())
     }
     fn run(&self, ctx: &Ctx<'_>) -> Result<Value> {
-        let default;
-        let set = match ctx.lossless_set {
-            Some(set) => set,
-            None => { default = CaseSet::default_set(); &default }
-        };
-        let speculator = ctx.info.configuration.speculator.clone().unwrap_or_default();
-        let spec = |off: bool| ProbeSpec { cold: true, no_speculation: off, record_rows: TOKENS as usize, top_k: 2,
-            ..ProbeSpec::default() };
-        let mut verdicts = Vec::new();
-        let mut kept = serde_json::Map::new();
-        for (i, case) in set.cases.iter().enumerate() {
-            ctx.progress.step(i as f64 / set.cases.len() as f64, format!("lossless {} ({}/{})", case.id, i + 1,
-                set.cases.len()));
-            let text = case.text();
-            let on = ctx.client.chat(plain(&text, TOKENS), Some(spec(false)))
-                .with_context(|| format!("{} drafts on", case.id))?;
-            let on = probe_of(&on)?.clone();
-            anyhow::ensure!(honoured(&on), "this engine does not run benchmark probes");
-            let off = ctx.client.chat(plain(&text, TOKENS), Some(spec(true)))
-                .with_context(|| format!("{} drafts off", case.id))?;
-            let off = probe_of(&off)?.clone();
-            let mut verdict = judge(&case.id, &on, &off);
-            if verdict.pass && !(on.cold && off.cold && off.no_speculation && !on.no_speculation) {
-                verdict.pass = false;
-                verdict.reason = "the engine did not honour cold / drafts-off as asked".into();
-            }
-            kept.insert(case.id.clone(), evidence(case, &on, &off));
-            verdicts.push(verdict);
-            ctx.progress.partial(aggregate(set, &speculator, &verdicts, serde_json::Map::new()));
-        }
-        Ok(aggregate(set, &speculator, &verdicts, kept))
+        let root = ctx.lossless_dump.map(|_| RowDump::root().map_err(anyhow::Error::msg)).transpose()?;
+        run_cases(ctx, ctx.lossless_dump.zip(root.as_deref()))
     }
+}
+
+fn run_cases(ctx: &Ctx<'_>, dump: Option<(&RowDump, &std::path::Path)>) -> Result<Value> {
+    let default;
+    let set = match ctx.lossless_set {
+        Some(set) => set,
+        None => { default = CaseSet::default_set(); &default }
+    };
+    let speculator = ctx.info.configuration.speculator.clone().unwrap_or_default();
+    let spec = |off: bool| ProbeSpec { cold: true, no_speculation: off, record_rows: TOKENS as usize, top_k: 2,
+        ..ProbeSpec::default() };
+    // A new run directory: the probes' leaves are exclusive and never overwrite an earlier run.
+    let run_dir = dump.map(|(_, root)| -> Result<std::path::PathBuf> {
+        let dir = root.join(format!("spec-lossless-rows-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir(&dir).with_context(|| format!("creating {}", dir.display()))?;
+        Ok(dir)
+    }).transpose()?;
+    let mut dumped = Vec::new();
+    let mut verdicts = Vec::new();
+    let mut kept = serde_json::Map::new();
+    for (i, case) in set.cases.iter().enumerate() {
+        ctx.progress.step(i as f64 / set.cases.len() as f64, format!("lossless {} ({}/{})", case.id, i + 1,
+            set.cases.len()));
+        let text = case.text();
+        let selected = dump.filter(|(d, _)| d.cases.contains(&case.id)).map(|(d, _)| d);
+        let arm = |off: bool| {
+            let mut spec = spec(off);
+            if let (Some(d), Some(dir)) = (selected, &run_dir) {
+                spec.dump_rows = Some(dir.join(&case.id).join(if off { "off" } else { "on" }));
+                spec.dump_window = Some([d.start, d.end]);
+            }
+            spec
+        };
+        let on = ctx.client.chat(plain(&text, TOKENS), Some(arm(false)))
+            .with_context(|| format!("{} drafts on", case.id))?;
+        let on = probe_of(&on)?.clone();
+        anyhow::ensure!(honoured(&on), "this engine does not run benchmark probes");
+        let off = ctx.client.chat(plain(&text, TOKENS), Some(arm(true)))
+            .with_context(|| format!("{} drafts off", case.id))?;
+        let off = probe_of(&off)?.clone();
+        let mut verdict = judge(&case.id, &on, &off);
+        if verdict.pass && !(on.cold && off.cold && off.no_speculation && !on.no_speculation) {
+            verdict.pass = false;
+            verdict.reason = "the engine did not honour cold / drafts-off as asked".into();
+        }
+        if let (Some(d), Some(dir)) = (selected, &run_dir) {
+            dumped.push(json!({"id": case.id, "nonce": case.nonce, "prompt_tokens": off.prompt_ids.len(),
+                "first_token_divergence": verdict.first_token_divergence,
+                "first_row_divergence": verdict.first_row_divergence,
+                "on": dumped_arm(&format!("{}/on", case.id), &on, d),
+                "off": dumped_arm(&format!("{}/off", case.id), &off, d)}));
+            let manifest = json!({"set": {"name": set.name, "sha256": set.sha256}, "speculator": speculator,
+                "window": {"start": d.start, "end": d.end}, "hash": "FNV-1a 64 of the raw f32 logits row",
+                "cases": dumped});
+            std::fs::write(dir.join("manifest.json"), serde_json::to_vec_pretty(&manifest)?)?;
+        }
+        kept.insert(case.id.clone(), evidence(case, &on, &off));
+        verdicts.push(verdict);
+        ctx.progress.partial(aggregate(set, &speculator, &verdicts, serde_json::Map::new()));
+    }
+    let mut value = aggregate(set, &speculator, &verdicts, kept);
+    if let Some(dir) = run_dir {
+        value["row_dump"] = json!({"dir": dir, "manifest": dir.join("manifest.json")});
+    }
+    Ok(value)
 }
 
 #[cfg(test)]
@@ -323,6 +419,126 @@ mod tests {
     fn set(n: usize) -> CaseSet {
         CaseSet::new("t", (0..n).map(|i| Case { id: format!("c{i}"), prompt: "p".into(), nonce: format!("n{i}"),
             source: None, reconstructed: false }).collect()).unwrap()
+    }
+
+    /// A CPU engine on loopback: claims each probe, records 128 rows over a 4-token vocabulary
+    /// (drafts on differs from offset 50), and streams one SSE answer.
+    fn fake_engine(requests: usize) -> (String, std::thread::JoinHandle<Vec<ProbeSpec>>) {
+        use std::io::{BufRead, Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let worker = std::thread::spawn(move || (0..requests).map(|_| {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut reader = std::io::BufReader::new(socket.try_clone().unwrap());
+            let (mut id, mut length) = (String::new(), 0usize);
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line == "\r\n" { break; }
+                let lower = line.to_lowercase();
+                if let Some(v) = lower.strip_prefix(&format!("{}:", cuteafd_api::openai::probe::HEADER)) { id = v.trim().into(); }
+                if let Some(v) = lower.strip_prefix("content-length:") { length = v.trim().parse().unwrap(); }
+            }
+            reader.read_exact(&mut vec![0; length]).unwrap();
+            let probe = cuteafd_api::openai::probe::registry().claim(&id).expect("registered probe");
+            probe.admitted("fake", &[9; 10], 0);
+            for i in 0..TOKENS as usize {
+                let lift = if !probe.spec.no_speculation && i >= 50 { 1e-3 } else { 0.0 };
+                probe.row(10 + i, &[2.0 + lift, 1.0, 0.5, i as f32 * 1e-3]);
+                probe.token(0);
+            }
+            let event = json!({"choices": [{"delta": {"content": "x"}, "finish_reason": "stop"}]});
+            write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n\
+                data: {event}\n\ndata: [DONE]\n\n").unwrap();
+            probe.spec.clone()
+        }).collect());
+        (base, worker)
+    }
+
+    fn run_fake(set: &CaseSet, dump: Option<(&RowDump, &std::path::Path)>) -> (Value, Vec<ProbeSpec>) {
+        let (base, engine) = fake_engine(set.cases.len() * 2);
+        let mut client = crate::client::Client::new(&base, None, std::sync::Arc::new(Default::default()));
+        client.model = "fake".into();
+        let mut info = ServerInfo::default();
+        info.configuration.speculator = Some("dflash".into());
+        let progress = crate::panels::Progress::default();
+        let context_load = crate::panels::context_load::Options::default();
+        let ctx = Ctx { client: &client, info: &info, baseline: None, rates: Rates::default(), progress: &progress,
+            pass: 1, history: &[], max_context: 8192, max_output: 4096, lossless_set: Some(set),
+            lossless_dump: dump.map(|(d, _)| d), context_load: &context_load };
+        let value = run_cases(&ctx, dump).unwrap();
+        (value, engine.join().unwrap())
+    }
+
+    #[test]
+    fn row_dumps_hold_exactly_the_requested_window_of_both_arms() {
+        let s = set(3);
+        let root = tempfile::tempdir().unwrap();
+        let dump = RowDump::parse("c0,c2:48-52").unwrap();
+        dump.validate(&s).unwrap();
+        let (value, specs) = run_fake(&s, Some((&dump, root.path())));
+        assert_eq!(value["gate"], "fail");
+        let dir = std::path::PathBuf::from(value["row_dump"]["dir"].as_str().unwrap());
+        assert!(dir.starts_with(root.path()) && dir.file_name().unwrap().to_str().unwrap().starts_with("spec-lossless-rows-"));
+        // Only the selected cases carry a dump leaf, on both arms.
+        let dumped: Vec<(bool, bool)> = specs.iter().map(|s| (s.dump_rows.is_some(), s.no_speculation)).collect();
+        assert_eq!(dumped, [(true, false), (true, true), (false, false), (false, true), (true, false), (true, true)]);
+        let mut entries: Vec<String> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).collect();
+        entries.sort();
+        assert_eq!(entries, ["c0", "c2", "manifest.json"]);
+        let manifest: Value = serde_json::from_slice(&std::fs::read(dir.join("manifest.json")).unwrap()).unwrap();
+        assert_eq!(manifest["window"], json!({"start": 48, "end": 52}));
+        assert_eq!(manifest["cases"].as_array().unwrap().len(), 2);
+        let case = &manifest["cases"][0];
+        assert_eq!((case["id"].as_str(), case["first_row_divergence"].as_u64()), (Some("c0"), Some(50)));
+        for arm in ["on", "off"] {
+            let leaf = dir.join("c0").join(arm);
+            let lines: Vec<Value> = std::fs::read_to_string(leaf.join("manifest.jsonl")).unwrap().lines()
+                .map(|l| serde_json::from_str(l).unwrap()).collect();
+            let positions: Vec<u64> = lines.iter().map(|l| l["position"].as_u64().unwrap()).collect();
+            assert_eq!(positions, [58, 59, 60, 61, 62], "{arm}");
+            assert_eq!(std::fs::read_dir(&leaf).unwrap().count(), 6);
+            let rows = case[arm]["rows"].as_array().unwrap();
+            assert_eq!(case[arm]["positions"], json!([58, 62]));
+            assert_eq!(rows.iter().map(|r| r["offset"].as_u64().unwrap()).collect::<Vec<_>>(), [48, 49, 50, 51, 52]);
+            // The manifest's hashes are the in-band hashes the verdict compared.
+            let evidence = &value["evidence"]["c0"][arm]["rows"];
+            for row in rows {
+                let offset = row["offset"].as_u64().unwrap() as usize;
+                assert_eq!(row["hash"], evidence[offset]["hash"]);
+            }
+        }
+        let (on, off) = (&case["on"]["rows"], &case["off"]["rows"]);
+        assert_eq!(on[1]["hash"], off[1]["hash"]);
+        assert_ne!(on[2]["hash"], off[2]["hash"]);
+    }
+
+    #[test]
+    fn without_row_dumps_the_probes_and_record_are_unchanged() {
+        let s = set(2);
+        let root = tempfile::tempdir().unwrap();
+        let (value, specs) = run_fake(&s, None);
+        assert!(specs.iter().all(|s| s.dump_rows.is_none() && s.dump_window.is_none()));
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
+        let mut keys: Vec<&String> = value.as_object().unwrap().keys().collect();
+        keys.sort();
+        assert_eq!(keys, ["evidence", "gate", "passed", "rows", "set", "speculator", "summary", "table", "total"]);
+        // The default probe serializes exactly as before.
+        let spec = serde_json::to_value(&specs[0]).unwrap();
+        assert!(spec.get("dump_window").is_none() && spec["dump_rows"].is_null());
+    }
+
+    #[test]
+    fn row_dump_options_parse_and_validate() {
+        let s = set(2);
+        assert_eq!(RowDump::parse("c0, c1:0-127").unwrap(), RowDump { cases: vec!["c0".into(), "c1".into()], start: 0, end: 127 });
+        for bad in ["c0", "c0:5", ":1-2", "c0,:1-2", "c0:a-2"] {
+            assert!(RowDump::parse(bad).is_err(), "{bad}");
+        }
+        for (text, why) in [("c9:1-2", "not in set"), ("c0,c0:1-2", "duplicated"), ("c0:5-4", "window"), ("c0:0-128", "window")] {
+            let error = RowDump::parse(text).unwrap().validate(&s).unwrap_err();
+            assert!(error.contains(why), "{text}: {error}");
+        }
     }
 
     #[test]

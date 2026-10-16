@@ -310,7 +310,7 @@ impl<'a> Fp8Experts<'a> {
         let weights = match tensors.format() {
             ExpertFormat::Fp8Block128 => Fp8MoeWeights::Fp8,
             ExpertFormat::Mxfp4 => Fp8MoeWeights::Mxfp4,
-            ExpertFormat::Nvfp4 => Fp8MoeWeights::Nvfp4 { w4a4: true },
+            ExpertFormat::Nvfp4 => Fp8MoeWeights::Nvfp4,
         };
         ensure!(info.hidden == shape.hidden && info.experts == shape.experts && info.topk == shape.topk
             && info.intermediate == shape.intermediate && info.tp == tp && info.weights == weights
@@ -727,7 +727,7 @@ mod tests {
     #[test]
     fn bf16_sibling_must_share_weight_layout_arithmetic_and_capacity() {
         let primary = Fp8MoeInfo { hidden: 6144, slice: 512, experts: 256, topk: 8, intermediate: 2048, tp: 4,
-            wire_input: true, swiglu_limit: 10.0, capacities: vec![64, 4096], weights: Fp8MoeWeights::Fp8 };
+            wire_input: true, swiglu_limit: 10.0, activation: cuteafd_ffi::fp8_moe::Fp8MoeActivation::SiluBf16Product, projection: cuteafd_ffi::fp8_moe::Fp8MoeProjection::Bf16, capacities: vec![64, 4096], weights: Fp8MoeWeights::Fp8 };
         let mut bf16 = primary.clone();
         bf16.wire_input = false;
         // A sibling may compile different capacities; its own scratch uses its own top.

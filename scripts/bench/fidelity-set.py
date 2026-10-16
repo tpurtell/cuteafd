@@ -15,6 +15,7 @@ import hashlib
 import importlib.util
 import json
 import pathlib
+import re
 import sys
 import urllib.error
 import urllib.request
@@ -23,7 +24,7 @@ ROOT = pathlib.Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "python/reference"))
 from fidelity_windows import MAX_TOKENS, SET_SCHEMA, bucket, canonical, set_hash, validate_set
 
-FAMILIES = ("deepseek_v41", "mimo_v2", "qwen4", "qwen3_5", "glm5_flash", "deepseek_v4", "glm5")
+FAMILIES = ("deepseek_v41", "mimo_v2", "qwen4", "qwen3_5", "glm5_flash", "deepseek_v4", "glm5", "step5")
 REPO_FILES = ["rust/crates/cuteafd-api/src/openai/probe.rs", "scripts/bench/bench-agentic-session.py",
               "python/reference/families/deepseek_v41/golden.py", "rust/crates/cuteafd-bench/src/client.rs",
               "scripts/bench/make-fidelity-reference.py", "rust/crates/cuteafd-bench/src/reference.rs",
@@ -441,6 +442,161 @@ def rebind_text_set(source, source_tokenizer, tokenizer, *, family, model, versi
     return validate_set(manifest)
 
 
+
+def decoded_role_spans(tokenizer, tokens, roles):
+    """Decode boundaries, refusing byte-fragment or non-prefix tokenizer decodes."""
+    text = tokenizer.decode(tokens, skip_special_tokens=False)
+    boundaries = [0] + [i for i in range(1, len(tokens)) if roles[i] != roles[i - 1]] + [len(tokens)]
+    spans = []
+    for first, last in zip(boundaries, boundaries[1:]):
+        left = tokenizer.decode(tokens[:first], skip_special_tokens=False)
+        right = tokenizer.decode(tokens[:last], skip_special_tokens=False)
+        if not text.startswith(left) or not text.startswith(right):
+            raise ValueError("lossy source role boundary decode")
+        spans.append((len(left), len(right), roles[first]))
+    return text, spans
+
+
+def render_retokenized_window(window, source_tokenizer, tokenizer, *, legacy_source=None):
+    """Re-render ChatML messages, carrying payload roles through character spans.
+
+    Chat delimiters are conditioning, not generated content. A new token crossing
+    a ctx/gen boundary is conservatively ctx; no partly-context token is scored
+    as a generation. Plain-code and legacy windows stay plain text.
+    """
+    text, spans = decoded_role_spans(source_tokenizer, window["tokens"], window["roles"])
+    extension = None
+    if (window["id"] == "legacy" and legacy_source is not None
+            and len(tokenizer(text, add_special_tokens=False)["input_ids"]) < 513):
+        source_text, source_identity = legacy_source
+        if set(window["roles"]) != {"ctx"} or not source_text.startswith(text):
+            raise ValueError("legacy extension source does not match the original context prefix")
+        original_end = len(text)
+        for end in range(original_end + 1, len(source_text) + 1):
+            candidate = source_text[:end]
+            ids = tokenizer(candidate, add_special_tokens=False)["input_ids"]
+            if len(ids) >= 513 and tokenizer.decode(ids, skip_special_tokens=False) == candidate:
+                text, spans = candidate, [(0, end, "ctx")]
+                extension = dict(**source_identity, original_span=[0, original_end], extended_span=[0, end],
+                                 span_unit="Unicode characters", reason="extended for tokenizer length",
+                                 caveat="Window 0 is not byte-comparable with other families' legacy window.")
+                break
+        else:
+            raise ValueError("legacy source cannot supply a lossless 513-token prefix")
+    char_roles = ["ctx"] * len(text)
+    for first, last, role in spans:
+        char_roles[first:last] = [role] * (last - first)
+    matches = list(re.finditer(r"<\|im_start\|>(system|user|assistant|tool)\n", text))
+    if not matches:
+        if any(role == "gen" for role in window["roles"]):
+            raise ValueError("generated text lacks a recoverable chat envelope")
+        rendered, mapped = text, char_roles
+    else:
+        if text[:matches[0].start()].strip():
+            raise ValueError("unrecognized source chat prefix")
+        messages, payloads, trailing, continuation = [], [], "", False
+        for i, match in enumerate(matches):
+            end = matches[i + 1].start() if i + 1 < len(matches) else len(text)
+            close = text.find("<|im_end|>", match.end(), end)
+            stop = close if close >= 0 else end
+            body = text[match.end():stop]
+            message = dict(role=match.group(1), content=body)
+            parts = []
+            if message["role"] == "assistant" and "</think>" in body:
+                split = body.index("</think>")
+                reasoning_start = body.rfind("<think>", 0, split)
+                reasoning_start = reasoning_start + len("<think>") if reasoning_start >= 0 else 0
+                reason = body[reasoning_start:split].strip("\n")
+                content = body[split + len("</think>"):].lstrip("\n")
+                message.update(content=content, reasoning_content=reason)
+                if reason:
+                    pos = body.index(reason, reasoning_start)
+                    parts.append((reason, match.end() + pos))
+                if content:
+                    parts.append((content, match.end() + len(body) - len(content)))
+            elif message["role"] == "assistant" and body.startswith("<think>"):
+                if close >= 0 or i + 1 != len(matches):
+                    raise ValueError("unfinished reasoning is not the final source message")
+                reason = body[len("<think>"):]
+                message.update(content="", reasoning_content=reason)
+                if reason:
+                    parts.append((reason, match.end() + len("<think>")))
+                continuation = "reasoning_content"
+            elif body:
+                parts.append((body, match.end()))
+            if i + 1 == len(matches) and close < 0 and not continuation:
+                continuation = "content"
+            messages.append(message)
+            payloads.extend(parts)
+            if close >= 0:
+                suffix = text[close + len("<|im_end|>"):end]
+                if i + 1 < len(matches) and suffix.strip():
+                    raise ValueError("non-chat text between source messages")
+                if i + 1 == len(matches):
+                    trailing = suffix
+                    trailing_start = close + len("<|im_end|>")
+        rendered = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=False,
+                                                 preserve_thinking=True, continue_final_message=continuation)
+        mapped = ["ctx"] * len(rendered)
+        cursor = 0
+        for payload, original in payloads:
+            found = rendered.find(payload, cursor)
+            if found < 0:
+                raise ValueError("chat template loses source payload text")
+            mapped[found:found + len(payload)] = char_roles[original:original + len(payload)]
+            cursor = found + len(payload)
+        if trailing:
+            rendered += trailing
+            mapped += char_roles[trailing_start:]
+    encoded = tokenizer(rendered, add_special_tokens=False, return_offsets_mapping=True)
+    tokens = encoded["input_ids"]
+    if tokenizer.decode(tokens, skip_special_tokens=False) != rendered:
+        raise ValueError("lossy target tokenizer round trip")
+    roles = []
+    for first, last in encoded["offset_mapping"]:
+        if not 0 <= first < last <= len(rendered):
+            raise ValueError("invalid target character offsets")
+        roles.append("gen" if all(role == "gen" for role in mapped[first:last]) else "ctx")
+    if not 513 <= len(tokens) <= MAX_TOKENS:
+        raise ValueError("retokenized window cannot supply 512 scores within the context cap")
+    result = copy.deepcopy(window)
+    start = len(tokens) - 512
+    result.update(tokens=tokens, roles=roles, score_from=start, bucket=bucket(start))
+    if extension is not None:
+        result["tokenizer_length_extension"] = extension
+    return result
+
+
+def retokenize_text_set(source, source_tokenizer, tokenizer, *, family, model, version, arm,
+                        source_sha256, source_tokenizer_sha256, template_sha256, legacy_source=None):
+    if hashlib.sha256(source.read_bytes()).hexdigest() != source_sha256:
+        raise ValueError("published text source hash mismatch")
+    manifest = json.loads(source.read_text())
+    source_set = manifest["set_sha256"]
+    if manifest.get("tokenizer_sha256") != source_tokenizer_sha256:
+        raise ValueError("source tokenizer differs from published text")
+    manifest["set_sha256"] = set_hash(manifest)
+    validate_set(manifest)
+    if any(w.get("media") for w in manifest["windows"]):
+        raise ValueError("retokenization does not support media")
+    if not tokenizer.chat_template:
+        raise ValueError("target checkpoint has no chat template")
+    result = copy.deepcopy(manifest)
+    result["windows"] = [render_retokenized_window(w, source_tokenizer, tokenizer, legacy_source=legacy_source)
+                         for w in manifest["windows"]]
+    generation = manifest["generation_arm"]["checkpoint"]
+    result["retokenized_text_source"] = dict(
+        sha256=source_sha256, set_sha256=source_set, family=manifest["family"],
+        generation_checkpoint=generation, chat_template_sha256=template_sha256,
+        status="reference-only/provisional; replace with Step-5-generated v2 panel",
+        caveat=f"Text from {generation} generations, not Step-5's own greedy path; model-generated-span property does not hold.",
+        role_mapping="character spans; chat envelopes and mixed-boundary tokens are ctx")
+    result.update(family=family, model=model, checkpoint=model, version=version, reference_snapshot=arm,
+                  tokenizer_sha256=arm["tokenizer_sha256"])
+    result["set_sha256"] = set_hash(result)
+    return validate_set(result)
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--family", required=True, choices=FAMILIES)
@@ -451,9 +607,13 @@ def main(argv=None):
     p.add_argument("--checkpoint", required=True)
     p.add_argument("--tokenizer", required=True, type=pathlib.Path)
     p.add_argument("--arm-manifest", required=True, type=pathlib.Path)
+    p.add_argument("--retokenize-text", type=pathlib.Path, help="provisional reference-only panel from foreign text")
     p.add_argument("--pinned-text", type=pathlib.Path, help="reuse an existing text set without generation")
     p.add_argument("--source-tokenizer", type=pathlib.Path, help="verify every reused token against this tokenizer")
     p.add_argument("--source-sha256", help="immutable published windows file hash")
+    p.add_argument("--legacy-source", type=pathlib.Path, help="pinned public text for a short legacy prefix")
+    p.add_argument("--legacy-source-sha256")
+    p.add_argument("--legacy-source-revision", help="public source commit for PLAN.md")
     p.add_argument("--recording", action="append", type=pathlib.Path, default=[])
     p.add_argument("--media-fixtures", type=pathlib.Path, help="build a separate 8-window vision panel from fixtures.json")
     p.add_argument("--file-list", type=pathlib.Path, help="JSON array of first-party repo-relative paths")
@@ -472,10 +632,41 @@ def main(argv=None):
             p.error("--file-list may contain only tracked first-party Rust, Python or CUDA files")
         if any(path.startswith("third_party/") for path in files):
             p.error("third-party sources are not part of the fidelity recipe")
-    if not a.media_fixtures and not a.legacy_reference and not a.pinned_text:
+    if not a.media_fixtures and not a.legacy_reference and not a.pinned_text and not a.retokenize_text:
         p.error("text recipe requires --legacy-reference; use the sealed legacy window from a published manifest")
+    if not a.retokenize_text and any((a.legacy_source, a.legacy_source_sha256, a.legacy_source_revision)):
+        p.error("legacy extension inputs require --retokenize-text")
     from tokenizers import Tokenizer
-    if a.pinned_text:
+    if a.retokenize_text:
+        if (not a.source_tokenizer or not a.source_sha256 or a.pinned_text or a.media_fixtures
+                or a.recording or a.file_list or a.legacy_reference or a.family != "step5"):
+            p.error("--retokenize-text requires Step-5, source tokenizer/hash and no generation inputs")
+        arm = json.loads(a.arm_manifest.read_text())
+        if a.checkpoint != a.model or arm.get("checkpoint") != a.checkpoint:
+            p.error("retokenized reference checkpoint must match the requested root and snapshot")
+        if arm.get("tokenizer_sha256") != hashlib.sha256(a.tokenizer.read_bytes()).hexdigest():
+            p.error("retokenized reference tokenizer differs from the snapshot identity")
+        from transformers import PreTrainedTokenizerFast
+        template = a.tokenizer.parent / "chat_template.jinja"
+        if not template.is_file():
+            p.error("retokenization requires the checkpoint's own chat_template.jinja")
+        # Match the official inference loader: AutoTokenizer rewrites this BPE
+        # into a Llama tokenizer and can silently discard whitespace.
+        target = PreTrainedTokenizerFast.from_pretrained(a.tokenizer.parent, local_files_only=True)
+        legacy_source = None
+        if any((a.legacy_source, a.legacy_source_sha256, a.legacy_source_revision)):
+            if (not all((a.legacy_source, a.legacy_source_sha256, a.legacy_source_revision))
+                    or not re.fullmatch(r"[0-9a-f]{40}", a.legacy_source_revision)
+                    or hashlib.sha256(a.legacy_source.read_bytes()).hexdigest() != a.legacy_source_sha256):
+                p.error("legacy extension requires its public revision and matching source hash")
+            legacy_source = (a.legacy_source.read_text(), dict(path="PLAN.md", revision=a.legacy_source_revision,
+                                                              sha256=a.legacy_source_sha256))
+        manifest = retokenize_text_set(a.retokenize_text, Tokenizer.from_file(str(a.source_tokenizer)), target,
+            family=a.family, model=a.model, version=a.version, arm=arm,
+            source_sha256=a.source_sha256,
+            source_tokenizer_sha256=hashlib.sha256(a.source_tokenizer.read_bytes()).hexdigest(),
+            template_sha256=hashlib.sha256(template.read_bytes()).hexdigest(), legacy_source=legacy_source)
+    elif a.pinned_text:
         if not a.source_tokenizer or not a.source_sha256 or a.media_fixtures or a.recording or a.file_list or a.legacy_reference:
             p.error("--pinned-text requires --source-tokenizer and no generation/media inputs")
         if a.checkpoint != a.model:

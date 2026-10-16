@@ -22,6 +22,7 @@ pub const PUBLICATIONS: &[Publication] = &[
     Publication { root: "Qwen/Qwen3.8-Flash-Next", siblings: &["Qwen/Qwen3.8-Flash-Next", "Qwen/Qwen3.8-Flash-Next-FP8"], revision: dataset::QWEN_REVISION, config: dataset::QWEN_CONFIG },
     Publication { root: "Qwen/Qwen3.5-9B", siblings: &["Qwen/Qwen3.5-9B"], revision: dataset::QWEN_DENSE_REVISION, config: dataset::QWEN35_9B_CONFIG },
     Publication { root: "Qwen/Qwen3.8-27B", siblings: &["Qwen/Qwen3.8-27B", "Qwen/Qwen3.8-27B-FP8"], revision: dataset::QWEN_DENSE_REVISION, config: dataset::QWEN38_27B_CONFIG },
+    Publication { root: "stepfun-ai/Step-5-Preview-BF16", siblings: &["stepfun-ai/Step-5-Preview-BF16", "stepfun-ai/Step-5-Preview", "stepfun-ai/Step-5-Preview-NVFP4"], revision: dataset::STEP5_REVISION, config: dataset::STEP5_CONFIG },
     Publication { root: "deepseek-ai/DeepSeek-V4.1-Flash", siblings: &["deepseek-ai/DeepSeek-V4.1-Flash"], revision: dataset::REVISION, config: dataset::CONFIG },
     Publication { root: "deepseek-ai/DeepSeek-V4-Flash-0731", siblings: &["deepseek-ai/DeepSeek-V4-Flash-0731"], revision: dataset::V4FLASH_REVISION, config: dataset::V4FLASH_CONFIG },
     Publication { root: "deepseek-ai/DeepSeek-V4-Pro-0813", siblings: &["deepseek-ai/DeepSeek-V4-Pro-0813"], revision: dataset::V4PRO_REVISION, config: dataset::V4PRO_CONFIG },
@@ -30,9 +31,10 @@ pub const PUBLICATIONS: &[Publication] = &[
 ];
 
 /// Official precision identities can exist before their datasets are published
-/// (now every entry here has a PUBLICATIONS row; the table stays separate).
+/// (unpublished roots deliberately have no PUBLICATIONS row).
 /// An instruct root's pretraining ancestry is not a precision upgrade.
 pub const OFFICIAL_ROOTS: &[(&str, &[&str])] = &[
+    ("stepfun-ai/Step-5-Preview-BF16", &["stepfun-ai/Step-5-Preview-BF16", "stepfun-ai/Step-5-Preview", "stepfun-ai/Step-5-Preview-NVFP4"]),
     ("Qwen/Qwen3.5-9B", &["Qwen/Qwen3.5-9B"]),
     ("Qwen/Qwen3.8-27B", &["Qwen/Qwen3.8-27B", "Qwen/Qwen3.8-27B-FP8"]),
 ];
@@ -269,10 +271,39 @@ mod tests {
         let r = resolve_in("Qwen/Qwen3.8-27B-FP8", None, tmp.path()).unwrap();
         assert_eq!((r.reference_root.as_str(), r.config.as_str()), ("Qwen/Qwen3.8-27B", dataset::QWEN38_27B_CONFIG));
         for (root, siblings) in OFFICIAL_ROOTS {
-            assert!(official(root).is_some_and(|p| p.root == *root && p.siblings == *siblings), "{root}");
+            if let Some(p) = official(root) {
+                assert_eq!((p.root, p.siblings), (*root, *siblings));
+            }
+            for sibling in *siblings { assert_eq!(official_root(sibling), Some(*root)); }
         }
         assert_eq!(official_root("Qwen/Qwen3.8-27B-FP8"), Some("Qwen/Qwen3.8-27B"));
         assert_eq!(official_root("Qwen/Qwen3.5-9B-FP8"), None);
+    }
+
+    #[test]
+    fn step5_official_roots_resolve_to_pinned_provisional_reference() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = "stepfun-ai/Step-5-Preview-BF16";
+        add(tmp.path(), root, "base_model: stepfun-ai/Step-5-Base");
+        for model in [root, "stepfun-ai/Step-5-Preview", "stepfun-ai/Step-5-Preview-NVFP4"] {
+            assert_eq!(official_root(model), Some(root));
+            let publication = official(model).unwrap();
+            assert_eq!((publication.root, publication.revision, publication.config),
+                (root, dataset::STEP5_REVISION, dataset::STEP5_CONFIG));
+            let r = resolve_in(model, None, tmp.path()).unwrap();
+            assert_eq!(r.reference_root, root);
+            assert_eq!((r.revision.as_str(), r.config.as_str()), (dataset::STEP5_REVISION, dataset::STEP5_CONFIG));
+            assert_eq!(r.resolved_chain[0].last().unwrap(), root);
+        }
+        for model in ["someone/Step-5-Preview-NVFP4", "stepfun-ai/Step-5-Preview-FP8"] {
+            assert_eq!(official_root(model), None);
+            assert!(resolve_in(model, None, tmp.path()).is_err());
+        }
+        let path = add(tmp.path(), "test/step5-quant", "base_model: stepfun-ai/Step-5-Preview-NVFP4\nbase_model_relation: quantized");
+        let r = resolve_in("test/step5-quant", Some(&path), tmp.path()).unwrap();
+        assert_eq!(r.reference_match, "base_model");
+        assert_eq!(r.reference_root, root);
+        assert_eq!(r.resolved_chain[0], vec!["test/step5-quant", "stepfun-ai/Step-5-Preview-NVFP4", root]);
     }
 
     #[test]

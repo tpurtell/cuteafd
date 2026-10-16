@@ -13,7 +13,9 @@ use super::{Bytes2, Demand, Movable, MovableDemands, MovableId, Placement, Place
 /// Controls a device-driven draft bridge owns on each GPU: four zero-payload
 /// receive slots (256 B each), the control block and the abort word. No
 /// duplicate payload destination is allocated.
-pub const BRIDGE_EXCHANGE_BYTES: u64 = 4 * 256 + 256 + 256;
+pub const BRIDGE_EXCHANGE_BYTES: u64 = BRIDGE_SLOTS * 256 + 256 + 256;
+/// Receive slots of a draft bridge: context, input rows, hidden rows, logits.
+pub const BRIDGE_SLOTS: u64 = 4;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DrafterDemand {
@@ -137,7 +139,7 @@ pub fn home(placement: &Placement) -> Option<u8> {
 pub fn require_home(placement: &Placement, family: &'static str, executable: &[u8]) -> Result<Option<u8>, PlacementError> {
     match home(placement) {
         Some(gpu) if !executable.contains(&gpu) =>
-            Err(PlacementError::Mandatory { gpu, what: format!("{family} drafter has no executor on this GPU") }),
+            Err(PlacementError::DrafterHome { family, gpu }),
         home => Ok(home),
     }
 }

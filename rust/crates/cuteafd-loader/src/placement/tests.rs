@@ -1504,3 +1504,14 @@ fn pool_ceiling_is_strict_for_automatic_and_explicit_pools() {
     req.pool.requested = Some(1024);
     assert!(matches!(solve(&req),Err(PlacementError::PoolDoesNotFit {..})));
 }
+
+#[test]
+fn drafter_home_refusal_names_the_family_and_gpu() {
+    let mut req = conditional_request();
+    req.movables[0].allowed = vec![1];
+    let placed = solve(&req).unwrap();
+    assert_eq!(draft::require_home(&placed, "GLM Flash", &[0, 1]), Ok(Some(1)));
+    let error = draft::require_home(&placed, "GLM Flash", &[0]).unwrap_err();
+    assert_eq!(error, PlacementError::DrafterHome { family: "GLM Flash", gpu: 1 });
+    assert_eq!(error.to_string(), "GLM Flash drafter was placed on rtx1, where this build has no executor for it");
+}

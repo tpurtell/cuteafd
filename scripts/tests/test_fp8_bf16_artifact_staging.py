@@ -66,6 +66,42 @@ def test_cmake_requested_counts_preserve_defaults_and_select_both_input_forms(tm
     assert source.count('${exact_slices} ${requested_layouts}') >= 2
 
 
+def test_step5_nvfp4_has_one_package_not_an_a4_alias(tmp_path):
+    source = (REPO / "native/cmake/shared/fp8_moe.cmake").read_text()
+    body = source.split("set(CUTEAFD_FP8_MOE_ENTRIES)\n", 1)[1].split(
+        "foreach(entry IN LISTS CUTEAFD_FP8_MOE_ENTRIES)", 1)[0]
+    script = tmp_path / "entries.cmake"
+    script.write_text('set(CUTEAFD_EXPERT_FAMILIES step5:nvfp4 glm:nvfp4)\n' + body
+                      + '\nmessage("ENTRIES=${CUTEAFD_FP8_MOE_ENTRIES}")\n')
+    result = subprocess.run(["cmake", "-P", str(script)], capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0, result.stderr
+    assert "ENTRIES=step5:nvfp4;glm:nvfp4;glm:nvfp4a4" in result.stderr
+    assert "step5_nvfp4a4" not in TOOL.read_text()
+
+
+def test_step5_bf16_alone_enables_package_exporter(tmp_path):
+    source = (REPO / "native/CMakeLists.txt").read_text()
+    body = source.split("set(CUTEAFD_FP8_EXPERT_FAMILIES OFF)", 1)[1].split("endif()", 1)[0]
+    script = tmp_path / "bf16.cmake"
+    script.write_text('cmake_minimum_required(VERSION 3.24)\n'
+                      'set(CUTEAFD_EXPERT_FAMILIES step5:bf16)\n' + body + 'endif()\n'
+                      'message("ENABLED=${CUTEAFD_FP8_EXPERT_FAMILIES}")\n')
+    result = subprocess.run(["cmake", "-P", str(script)], capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0, result.stderr
+    assert "ENABLED=ON" in result.stderr
+
+
+def test_step5_bf16_bypasses_native_slice_exporter(tmp_path):
+    source = REPO / "native/cmake/shared/expert_families.cmake"
+    script = tmp_path / "native.cmake"
+    script.write_text('set(CUTEAFD_EXPERT_FAMILIES step5:bf16 step5:fp8 step5:nvfp4)\n'
+                      f'include("{source}")\n'
+                      'message("NATIVE=${CUTEAFD_NATIVE_EXPERT_FAMILIES}")\n')
+    result = subprocess.run(["cmake", "-P", str(script)], capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0, result.stderr
+    assert "NATIVE=\n" in result.stderr
+
+
 @pytest.mark.parametrize("counts", ["0", "9", "5;bad"])
 def test_cmake_requested_counts_fail_before_compilation(tmp_path, counts):
     source = (REPO / "native/cmake/shared/fp8_moe.cmake").read_text()
@@ -133,7 +169,7 @@ def test_capacity_scratch_reserves_largest_retained_form_like_runtime_abi():
 
 
 @pytest.mark.parametrize("geometry", [
-    "mimo", "mimop", "mimof", "glm", "glmf", "qwen4",
+    "mimo", "mimop", "mimof", "glm", "glmf", "qwen4", "step5_bf16",
     "glm_nvfp4", "glmf_nvfp4", "qwen4_nvfp4", "glmfdense_nvfp4",
     "glm_nvfp4a4", "glmf_nvfp4a4", "qwen4_nvfp4a4", "glmfdense_nvfp4a4",
 ])
@@ -187,7 +223,7 @@ static void mock_launch(void** args, int) {{
               "segments": [{"end_rows": 80, "group_rows": 1}]} if "nvfp4" in geometry else
               {"contract": "exact_grouping", "segments": [
                   {"end_rows": 16, "group_rows": 16}, {"end_rows": 80, "group_rows": 64}]})}],
-        [4 if "nvfp4" in geometry else 1, 6144, 1024, 384, 8, 2048, 2, 1, 0, 1, 80, 0, 0, 0, 0, 0])
+        [5 | (5 if geometry == "step5_bf16" else 4 if "nvfp4" in geometry else 1) << 8 | 1 << 16 | 1 << 24, 6144, 1024, 384, 8, 2048, 2, 1, 0, 1, 80, 0, 0, 0, 0, 0])
     (tmp_path / "bridge.cc").write_text(source)
     library = tmp_path / "bridge.so"
     compiled = subprocess.run([compiler, "-shared", "-fPIC", "-std=c++17", "-pthread",
@@ -218,6 +254,11 @@ static void mock_launch(void** args, int) {{
     for rank in (0, 1):
         lib.mock_device(rank)
         assert lib.cuteafd_fp8moe_launch(contexts[rank], 80, pointers, 80, None) == 0
+    for index in range(11):
+        pointers[index] = None
+        status = lib.cuteafd_fp8moe_launch(contexts[1], 80, pointers, 80, None)
+        assert (status == 0) == (geometry == "step5_bf16" and index in (4, 6, 8))
+        pointers[index] = 1
     lib.cuteafd_fp8moe_destroy(contexts[0])
     assert lib.mock_unloaded() == 0
     lib.mock_fail(2)
@@ -251,7 +292,8 @@ def write_package(path: Path, *, input_kind="wire", role="spark", revision=REVIS
         "sparkinfer_revision": revision,
         "compute": [12, 1],
         "layouts": {layout: {"input": input_kind, "capacities": [{"capacity": 80}],
-                             "weights": weights, "hidden": 4096, "experts": 256, "top_k": 8,
+                             "weights": weights, "abi_version": 5, "activation": "silu_bf16_product",
+                             "projection": "bf16", "hidden": 4096, "experts": 256, "top_k": 8,
                              "intermediate": 2048, "tp": 4, "slice": 512, "swiglu_limit": 0.0}},
         "files": {str(library.relative_to(path)): {
             "bytes": library.stat().st_size, "sha256": hashlib.sha256(library.read_bytes()).hexdigest()}},
@@ -273,6 +315,9 @@ def stage(tmp_path: Path, kind: str, *, requested="mimo", role="expert", revisio
     write_package(native / "fp8-mimo", input_kind=wire, role=owner)
     for name in ("fp8-glm-nvfp4", "fp8-glm-nvfp4a4", "fp8-qwen4-nvfp4", "fp8-qwen4-nvfp4a4"):
         write_package(native / name, input_kind="bf16", role=owner, weights="nvfp4")
+    write_package(native / "fp8-step5", input_kind=wire, role=owner)
+    write_package(native / "fp8-step5-bf16-weights", input_kind="bf16", role=owner, weights="bf16")
+    write_package(native / "fp8-step5-nvfp4", input_kind="bf16", role=owner, weights="nvfp4")
     if role == "coordinator":
         write_package(native / "fp8-qwen4", input_kind=wire, role=owner)
     write_package(native / "fp8-mimo-bf16", input_kind="bf16", revision=revision)
@@ -289,6 +334,18 @@ def stage(tmp_path: Path, kind: str, *, requested="mimo", role="expert", revisio
                                  "expert_families": families, "bf16_families": requested},
                             timeout=30)
     return result, output / "fp8"
+
+
+@pytest.mark.parametrize("kind", ["release", "wip"])
+@pytest.mark.parametrize("role", ["coordinator", "expert"])
+def test_step5_stages_native_weights_and_one_nvfp4_package(tmp_path, kind, role):
+    result, output = stage(tmp_path, kind, requested="", role=role,
+                           families="step5:fp8;step5:bf16;step5:nvfp4")
+    assert result.returncode == 0, result.stderr
+    assert {p.name for p in output.iterdir()} == {
+        "fp8-step5", "fp8-step5-bf16-weights", "fp8-step5-nvfp4", "fp8-mimo-bf16"}
+    package_tool.verify(output / "fp8-step5-bf16-weights", revision=REVISION,
+                        role=role, input_kind="bf16")
 
 
 @pytest.mark.parametrize("role", ["spark", "coordinator"])
@@ -465,3 +522,46 @@ def test_cmake_fp8_family_counts_only_apply_to_their_family(tmp_path):
         result = subprocess.run(["cmake", "-P", str(script)], capture_output=True, text=True, timeout=30)
         assert result.returncode == 0, result.stderr
         assert expected in result.stderr and (family != "mimof" or "tp" not in result.stderr)
+
+
+@pytest.mark.parametrize("kind,storage", [("fp8", 1), ("mxfp4", 2), ("nvfp4a4", 4), ("bf16", 5)])
+@pytest.mark.parametrize("activation,code", [("silu_bf16_product", 1), ("silu_post_clamp_fp32_product", 2)])
+def test_explicit_activation_info_words(kind, storage, activation, code):
+    from types import SimpleNamespace
+    g = SimpleNamespace(kind=kind, weights="nvfp4" if kind == "nvfp4a4" else kind,
+                        activation=activation, projection="bf16", swiglu_limit=7.0,
+                        hidden=4096, slice=256, experts=352, top_k=8, intermediate=1536, tp=6)
+    if kind == "mxfp4" and code == 2:
+        with pytest.raises(ValueError, match="MXFP4"):
+            package_tool.info_words(g, [16], False)
+        return
+    words = package_tool.info_words(g, [1, 16, 80, 256, 1024, 4096], False)
+    assert len(words) == 16
+    assert words[0] == 5 | storage << 8 | code << 16 | 1 << 24
+    assert words[9:] == [6, 1, 16, 80, 256, 1024, 4096]
+    assert words[0] not in (1, 2, 3, 4)  # old runtimes reject rather than guess
+    for field, value in [("activation", "unknown"), ("projection", "fp32"), ("swiglu_limit", float("nan"))]:
+        bad = SimpleNamespace(**vars(g))
+        setattr(bad, field, value)
+        with pytest.raises(ValueError):
+            package_tool.info_words(bad, [16], False)
+
+
+def test_mxfp4_package_rejects_post_activation(tmp_path):
+    path = write_package(tmp_path / "package", weights="mxfp4")
+    manifest = json.loads((path / "manifest.json").read_text())
+    manifest["layouts"]["tp4"]["activation"] = "silu_post_clamp_fp32_product"
+    (path / "manifest.json").write_text(json.dumps(manifest))
+    with pytest.raises(ValueError, match="MXFP4 supports only"):
+        package_tool.verify(path)
+
+
+@pytest.mark.parametrize("field,value", [("activation", None), ("activation", "unknown"),
+                                         ("projection", "fp32"), ("abi_version", 4)])
+def test_package_requires_explicit_activation_contract(tmp_path, field, value):
+    path = write_package(tmp_path / "package")
+    manifest = json.loads((path / "manifest.json").read_text())
+    manifest["layouts"]["tp4"][field] = value
+    (path / "manifest.json").write_text(json.dumps(manifest))
+    with pytest.raises(ValueError, match="activation/projection ABI"):
+        package_tool.verify(path)

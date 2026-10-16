@@ -750,7 +750,7 @@ fn local_expert_reservations(
         (tensors.format(), info.weights),
         (ExpertFormat::Fp8Block128, Fp8MoeWeights::Fp8)
             | (ExpertFormat::Mxfp4, Fp8MoeWeights::Mxfp4)
-            | (ExpertFormat::Nvfp4, Fp8MoeWeights::Nvfp4 { .. })
+            | (ExpertFormat::Nvfp4, Fp8MoeWeights::Nvfp4)
     );
     ensure!(
         info.tp == 1

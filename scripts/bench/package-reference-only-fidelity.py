@@ -18,7 +18,7 @@ sys.path.insert(0, str(REPO / 'python/reference'))
 from fidelity_windows import canonical, validate_public_metadata, validate_public_text
 
 QUICK = ['legacy', 'a00', 'a04', 'a08', 'a20', 'c00', 'd00', 'e00']
-CAVEAT = ('The unchanged shared text panel contains repeated unrelated source-text splices in 33 scored suffixes; '
+CAVEAT = ('The source shared text panel contains repeated unrelated source-text splices in 33 scored suffixes; '
           'see cuteafd issue #302. These are teacher-forced reference rows, '
           'not evidence of coherent free-running generation. NLL is not a cross-model quality ranking.')
 
@@ -78,6 +78,27 @@ def compact_tensors(full, window):
                 next_token_log_prob=next_lps)
 
 
+def panel_caveat(panel):
+    caveat = CAVEAT
+    if panel.get('retokenized_text_source'):
+        caveat += ' ' + panel['retokenized_text_source']['caveat']
+        caveat += ' Provisional chat windows were re-rendered with the target chat template; all windows were retokenized. This is not a Step-5-generated panel.'
+    if any(w.get('tokenizer_length_extension') for w in panel['windows']):
+        caveat += ' Legacy window: extended for tokenizer length. Window 0 is not byte-comparable with other families legacy windows.'
+    return caveat
+
+
+def sparse_launch_note(meta):
+    launch = meta.get('sparse_attention_launch')
+    if launch is None:
+        return ''
+    if (launch.get('official_launch_configuration') is not False or launch.get('num_stages') != 1
+            or launch.get('block_regions') != 16 or launch.get('kernel') != '_sparse_attn_prefill_kernel'):
+        raise ValueError('unsupported sparse reference launch configuration')
+    return ('This is not the official sparse-attention launch configuration: the adapter sets num_stages=1; '
+            'official region/head/dimension tiles and region-loop order remain unchanged.\n')
+
+
 def public_panel(panel):
     public = copy.deepcopy(panel)
     # Keep immutable generation identity, not deployment arguments or local paths.
@@ -100,6 +121,10 @@ def package(source, out, config, tokenizer_path, license_path):
     validation, seal, full_seal = read('reference-validation.json'), read('golden-seal.json'), read('full.sha256.json')
     rows = read('full/rows.json')
     set_id = panel['set_sha256']
+    caveat = panel_caveat(panel)
+    launch_note = sparse_launch_note(meta)
+    if panel['family'] == 'step5' and not launch_note:
+        raise ValueError('Step-5 reference must disclose its sparse launch configuration')
     if not (validation['passed'] is True and validation['engine_parity'] is False
             and validation['set_sha256'] == seal['set_sha256'] == full_seal['set_sha256'] == meta['set_sha256'] == rows['set_sha256'] == set_id
             and validation['golden_seal_sha256'] == digest(source / 'golden-seal.json')
@@ -161,16 +186,21 @@ def package(source, out, config, tokenizer_path, license_path):
         print(f'packaged {config}/{wid}', flush=True)
     provenance = {k: meta[k] for k in ('snapshot_identity', 'source_pin', 'platform', 'tokenizers', 'torch',
                                       'transformers', 'attention', 'mtp', 'use_cache', 'gates', 'native_fp32_parameters')}
+    if launch_note:
+        provenance['sparse_attention_launch'] = meta['sparse_attention_launch']
     if digest(source / 'platform.json') != inventory['platform.json']['sha256']:
         raise ValueError('sealed runtime provenance differs')
     runtime = read('platform.json')
     provenance['runtime'] = {k: runtime[k] for k in ('image', 'image_sha256', 'compute_capability',
                                                    'tokenizers_wheel_sha256', 'dependency_install')}
+    for key in ('tokenizers_native_sha256', 'tokenizers_record_sha256'):
+        if key in runtime:
+            provenance['runtime'][key] = runtime[key]
     qualification = dict(schema='cuteafd.fidelity.qualification/1', kind='reference_only', qualifies=True,
                          engine_parity=False, qualification_scope='reference-only qualified; no paired engine calibration or precision-default verdict',
                          set_sha256=set_id, nll=meta['nll'], scored_tokens=meta['scored_tokens'],
                          prefix_qualification=meta['prefix_qualification'], reference_validation=validation,
-                         reference_provenance=provenance, panel_caveat=CAVEAT)
+                         reference_provenance=provenance, panel_caveat=caveat)
     validate_public_metadata(qualification)
     (destination / 'qualification.json').write_bytes(canonical(qualification) + b'\n')
     snapshot = meta['snapshot_identity']
@@ -181,20 +211,29 @@ def package(source, out, config, tokenizer_path, license_path):
                     windows_sha256=digest(destination / 'windows.json'), qualification_sha256=digest(destination / 'qualification.json'),
                     files=files, licence_files=[dict(path='LICENSE', sha256=digest(destination / 'LICENSE'))],
                     packaging_source_commit=subprocess.check_output(['git', '-C', str(REPO), 'rev-parse', 'HEAD'], text=True).strip(),
-                    packaging_source_sha256=digest(Path(__file__)), publication_status='REFERENCE-ONLY QUALIFIED; coordinator review/upload required',
-                    text_checkpoint=panel['generation_arm']['checkpoint'], panel_caveat=CAVEAT)
+                    packaging_source_sha256=digest(Path(__file__)),
+                    publication_status=('PROVISIONAL; REFERENCE-ONLY QUALIFIED; coordinator review/upload required'
+                                        if panel.get('retokenized_text_source') else
+                                        'REFERENCE-ONLY QUALIFIED; coordinator review/upload required'),
+                    text_checkpoint=panel['generation_arm']['checkpoint'], panel_caveat=caveat)
+    if launch_note:
+        manifest['reference_execution'] = dict(sparse_attention_launch=meta['sparse_attention_launch'])
     manifest['reference_sha256'] = hashlib.sha256(canonical(manifest)).hexdigest()
     validate_public_metadata(manifest)
     (destination / 'manifest.json').write_bytes(canonical(manifest) + b'\n')
+    panel_description = ('Provisional foreign-text panel: chat windows use the target chat template; all 64 windows were retokenized with character-span roles.\n'
+                         if panel.get('retokenized_text_source') else
+                         'All 64 windows, tokens, roles and score geometry are unchanged from the pinned shared panel.\n')
     card = (f'# {config}\n\nReference-only qualified numerical fidelity panel, not a training corpus or a general quality ranking.\n\n'
             f'Official BF16 root: `{snapshot["checkpoint"]}` at `{snapshot["snapshot_revision"]}`.\n'
-            f'Text was generated by `{panel["generation_arm"]["checkpoint"]}`, not by the dense BF16 root.\n'
-            'All 64 windows, tokens, roles and score geometry are unchanged from the pinned shared panel.\n'
+            f'Text was generated by `{panel["generation_arm"]["checkpoint"]}`, not by the BF16 root.\n'
+            f'{panel_description}'
             'The bench quick subset is legacy,a00,a04,a08,a20,c00,d00,e00 (4,096 rows).\n\n'
             '## Qualification\n\n'
             f'32,768 scored positions; reference NLL {meta["nll"]:.15f} nat/token.\n'
             'The 576/640-token prefix probes have 512 byte-identical common F32 rows and zero argmax disagreements.\n'
-            'Checkpoint-native BF16/F32 tensors, FP32 GDN SiLU, eager attention, fixed GEMM rows 128, MTP/cache off.\n'
+            'Checkpoint-native BF16/F32 tensors and family activation arithmetic, bounded attention, fixed GEMM rows 128, MTP/cache off.\n'
+            f'{launch_note}'
             'Pinned Transformers source, tokenizer runtime, platform and oracle seal hashes are in qualification.json.\n'
             'No engine parity, paired compact/full-engine calibration, dense baseline calibration, or precision-default verdict is claimed.\n'
             'The common top-1/KL policy floor in the manifest is not a measured dense-engine baseline.\n\n'
@@ -202,7 +241,7 @@ def package(source, out, config, tokenizer_path, license_path):
             'One safetensors file per window: U32 positions, next_token_ids and top_ids; U8 roles; F16 top_log_probs; '
             'F32 tail_log_mass and next_token_log_prob. Top-1024 selection uses the sealed full F16 rows with lower-ID boundary ties.\n'
             'Tail and target masses normalize the F16 oracle; no paired engine equivalence is asserted.\n\n'
-            f'## Panel Caveat\n\n{CAVEAT}\n\n'
+            f'## Panel Caveat\n\n{caveat}\n\n'
             '## Provenance And Privacy\n\n'
             f'Source set: `{set_id}`. Raw deployment settings and local paths are omitted.\n'
             'Public text and metadata pass credential/private-key/personal-data screening. Original public MIT notice is preserved verbatim.\n'

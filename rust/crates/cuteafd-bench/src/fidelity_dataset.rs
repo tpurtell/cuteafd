@@ -34,6 +34,9 @@ pub const QWEN35_9B_CONFIG: &str = "qwen35-9b-v1_20261015_bf16";
 pub const QWEN35_9B_MANIFEST_SHA256: &str = "205f00fb9267c6a3c6db0324f8263ac61163cd237e926d8f7ffc49df0a01d8b3";
 pub const QWEN38_27B_CONFIG: &str = "qwen38-27b-v1_20261015_bf16";
 pub const QWEN38_27B_MANIFEST_SHA256: &str = "4b1ba4f3eea0557c7f985f0bf0ad7b6fdcc89f74b87033fae08eedef0c7c5d57";
+pub const STEP5_REVISION: &str = "f9cecb776d4e47f05738369e7e157122f3e0b473";
+pub const STEP5_CONFIG: &str = "step5-v1_20261017_bf16_provisional";
+pub const STEP5_MANIFEST_SHA256: &str = "dd0f964a891e24570bcbf5840f6398a06c9dd037926d7e240a4a2dff29e17af7";
 
 /// Sealed bench subset v1: agentic A at three context lengths, human code C,
 /// structured/tool D, plain E and the frozen context anchor. Never resample.
@@ -241,6 +244,7 @@ pub fn download(agent: &ureq::Agent, cache: &Path, repo: &str, commit: &str, con
             (MIMO_PRO_REVISION, MIMO_PRO_CONFIG) => Some(MIMO_PRO_MANIFEST_SHA256),
             (QWEN_DENSE_REVISION, QWEN35_9B_CONFIG) => Some(QWEN35_9B_MANIFEST_SHA256),
             (QWEN_DENSE_REVISION, QWEN38_27B_CONFIG) => Some(QWEN38_27B_MANIFEST_SHA256),
+            (STEP5_REVISION, STEP5_CONFIG) => Some(STEP5_MANIFEST_SHA256),
             (MIMO_PRO_MEDIA_REVISION, MIMO_PRO_MEDIA_CONFIG) => Some(MIMO_PRO_MEDIA_MANIFEST_SHA256),
             (GLM_REVISION, GLM_CONFIG) => Some("cc973cec8df82119ccd53367d014c73b271808a561f81d3629b06093de3b00e0"),
             (V4PRO_REVISION, V4PRO_CONFIG) => Some("7b4fd7b51670ff03fbfab6a21b72d999163ddee9bd3eec34c89f1d6c2f83488f"),
@@ -370,9 +374,21 @@ fn qualification_label(qualification: &Value, manifest: &Value) -> Result<&'stat
             && provenance["snapshot_identity"]["checkpoint"] == manifest["root_checkpoint"]["id"],
             "invalid reference-only prefix evidence");
         let hash = |v: &Value, n| v.as_str().is_some_and(|s| s.len() == n && s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)));
-        ensure!(hash(&provenance["source_pin"]["modeling_sha256"], 64)
-            && hash(&provenance["source_pin"]["source_tree_sha256"], 64)
-            && hash(&provenance["source_pin"]["revision"], 40)
+        let source = &provenance["source_pin"];
+        let source_valid = if manifest["family"] == "step5" {
+            let launch = &provenance["sparse_attention_launch"];
+            manifest["root_checkpoint"]["id"] == "stepfun-ai/Step-5-Preview-BF16"
+                && source["revision"] == manifest["root_checkpoint"]["revision"]
+                && ["model_sha256", "kernel_sha256", "vision_encoder_sha256", "transformers_source_tree_sha256"]
+                    .iter().all(|key| hash(&source[key], 64))
+                && hash(&source["transformers_revision"], 40)
+                && launch["official_launch_configuration"] == false && launch["num_stages"] == 1
+                && launch["block_regions"] == 16 && launch["kernel"] == "_sparse_attn_prefill_kernel"
+                && manifest["reference_execution"]["sparse_attention_launch"] == *launch
+        } else {
+            hash(&source["modeling_sha256"], 64) && hash(&source["source_tree_sha256"], 64)
+        };
+        ensure!(source_valid && hash(&source["revision"], 40)
             && provenance["tokenizers"].as_str().is_some_and(|s| !s.is_empty())
             && provenance["platform"]["gpu"].as_str().is_some_and(|s| !s.is_empty())
             && provenance["mtp"] == false && provenance["use_cache"] == false
@@ -586,17 +602,18 @@ mod tests {
     }
 
     #[test]
-    fn pro_manifest_pins_reject_even_self_consistent_cached_indexes() {
+    fn manifest_pins_reject_even_self_consistent_cached_indexes() {
         let temporary = tempfile::tempdir().unwrap();
-        let root = temporary.path().join("wrldsuksgo2mars--cuteafd-fidelity").join(MIMO_PRO_REVISION);
-        for config in [MIMO_PRO_CONFIG, MIMO_PRO_MEDIA_CONFIG] {
+        for (revision, config) in [(MIMO_PRO_REVISION, MIMO_PRO_CONFIG),
+            (MIMO_PRO_MEDIA_REVISION, MIMO_PRO_MEDIA_CONFIG), (STEP5_REVISION, STEP5_CONFIG)] {
+            let root = temporary.path().join("wrldsuksgo2mars--cuteafd-fidelity").join(revision);
             std::fs::create_dir_all(root.join(config)).unwrap();
             let manifest = b"{}";
             std::fs::write(root.join(config).join("manifest.json"), manifest).unwrap();
             let index = json!({"schema":"cuteafd.fidelity.configs/1","configs":[{
                 "name":config,"path":format!("{config}/manifest.json"),"sha256":digest(manifest)}]});
             std::fs::write(root.join("configs.json"), serde_json::to_vec(&index).unwrap()).unwrap();
-            let error = download(&ureq::Agent::new(),temporary.path(),REPOSITORY,MIMO_PRO_REVISION,config).unwrap_err();
+            let error = download(&ureq::Agent::new(),temporary.path(),REPOSITORY,revision,config).unwrap_err();
             assert!(error.to_string().contains("pinned manifest checksum differs"), "{config}: {error}");
         }
     }
@@ -614,6 +631,15 @@ mod tests {
         assert_eq!(reference.windows.len(), 64);
         assert_eq!(reference.windows.iter().map(|w| w.positions.len()).sum::<usize>(), 32768);
         assert_eq!(hash, expected_hash);
+        if commit == STEP5_REVISION && config == STEP5_CONFIG {
+            assert_eq!(reference.checkpoint, "stepfun-ai/Step-5-Preview-BF16");
+            assert_eq!(identity["qualification"], "reference-only qualified");
+            assert_eq!(identity["text_checkpoint"], "Qwen/Qwen3.8-Flash-Next-FP8");
+            assert_eq!((reference.expect.top1_min, reference.expect.kl_max), (0.90, 0.06));
+            let balance = standard_balance(&reference);
+            assert_eq!(balance["decode"]["generated_positions"], 8089);
+            assert_eq!(balance["prefill"]["generated_positions"], 7591);
+        }
         assert_eq!(quick_windows(&reference).unwrap().len(),8);
         assert_eq!(standard_windows(&reference,"decode",true).unwrap().len(),32);
         assert_eq!(standard_windows(&reference,"prefill",true).unwrap().len(),32);
@@ -634,8 +660,13 @@ mod tests {
                 assert_eq!(w.positions.iter().filter(|p| w.roles[p.pos] == "gen").count() as u64, row[4].as_u64().unwrap());
             }
         }
-        assert_eq!(identity, json!({"repository": REPOSITORY, "revision": commit, "config": config}));
+        assert_eq!(identity["repository"], REPOSITORY);
+        assert_eq!(identity["revision"], commit);
+        assert_eq!(identity["config"], config);
+        assert!(matches!(identity["qualification"].as_str(), Some("reference-only qualified" | "paired qualified")));
+        assert!(identity["text_checkpoint"].as_str().is_some_and(|s| !s.is_empty()));
         let again = download(&ureq::Agent::new(), &cache, REPOSITORY, &commit, &config).unwrap();
+        assert_eq!(identity, again.2);
         assert_eq!(hash, again.1);
         assert_eq!(serde_json::to_value(reference).unwrap(), serde_json::to_value(again.0).unwrap());
     }
@@ -728,6 +759,9 @@ mod tests {
             let reference = load(&root, &manifest).unwrap();
             assert_eq!(reference.windows.len(), 64);
             assert_eq!(quick_windows(&reference).unwrap().len(), 8);
+            for shape in ["decode", "prefill"] {
+                assert_eq!(standard_windows(&reference, shape, true).unwrap().len(), 32);
+            }
             let qualification: Value = serde_json::from_slice(&std::fs::read(root.join("qualification.json")).unwrap()).unwrap();
             assert_eq!(qualification_label(&qualification, &manifest).unwrap(), "reference-only qualified");
             let cache = tempfile::tempdir().unwrap();
@@ -810,6 +844,34 @@ mod tests {
                 "source_pin":{"revision":"1".repeat(40),"source_tree_sha256":"2".repeat(64),"modeling_sha256":"3".repeat(64)},
                 "tokenizers":"0.23.1","platform":{"gpu":"NVIDIA GB10"},"mtp":false,"use_cache":false,"attention":"eager"}});
         assert_eq!(qualification_label(&qualification, &manifest).unwrap(), "reference-only qualified");
+        let mut native_manifest = manifest.clone();
+        native_manifest["family"] = json!("step5");
+        native_manifest["root_checkpoint"]["id"] = json!("stepfun-ai/Step-5-Preview-BF16");
+        let mut native = qualification.clone();
+        native["reference_provenance"]["snapshot_identity"]["checkpoint"] = native_manifest["root_checkpoint"]["id"].clone();
+        native["prefix_qualification"]["snapshot_identity"] = native["reference_provenance"]["snapshot_identity"].clone();
+        native["reference_provenance"]["source_pin"] = json!({"revision":"a".repeat(40),
+            "model_sha256":"1".repeat(64),"kernel_sha256":"2".repeat(64),"vision_encoder_sha256":"3".repeat(64),
+            "transformers_revision":"4".repeat(40),"transformers_source_tree_sha256":"5".repeat(64)});
+        let launch = json!({"official_launch_configuration":false,"num_stages":1,"block_regions":16,
+            "kernel":"_sparse_attn_prefill_kernel"});
+        native["reference_provenance"]["sparse_attention_launch"] = launch.clone();
+        native_manifest["reference_execution"]["sparse_attention_launch"] = launch;
+        assert_eq!(qualification_label(&native, &native_manifest).unwrap(), "reference-only qualified");
+        for key in ["revision", "model_sha256", "kernel_sha256", "vision_encoder_sha256",
+            "transformers_revision", "transformers_source_tree_sha256"] {
+            let mut bad = native.clone(); bad["reference_provenance"]["source_pin"][key] = Value::Null;
+            assert!(qualification_label(&bad, &native_manifest).is_err(), "{key}");
+        }
+        for (key, value) in [("official_launch_configuration", json!(true)), ("num_stages", json!(3)),
+            ("block_regions", json!(8)), ("kernel", json!("other"))] {
+            let mut bad = native.clone(); bad["reference_provenance"]["sparse_attention_launch"][key] = value;
+            assert!(qualification_label(&bad, &native_manifest).is_err(), "{key}");
+        }
+        let mut bad = native.clone(); bad["reference_provenance"]["source_pin"]["revision"] = json!("9".repeat(40));
+        assert!(qualification_label(&bad, &native_manifest).is_err());
+        let mut bad = native_manifest.clone(); bad["reference_execution"]["sparse_attention_launch"]["num_stages"] = json!(3);
+        assert!(qualification_label(&native, &bad).is_err());
         let mut rounded = qualification.clone(); rounded["reference_validation"]["nll"] = json!(1.2 + 1e-15);
         assert!(qualification_label(&rounded, &manifest).is_ok());
         rounded["reference_validation"]["nll"] = json!(1.21);

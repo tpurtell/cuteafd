@@ -1110,7 +1110,7 @@ impl<'a> DenseNvfp4<'a> {
         let info = module.info().clone();
         ensure!(info.experts == 1 && info.topk == 1 && info.hidden == cfg.hidden
             && info.intermediate == cfg.dense_intermediate && !info.wire_input
-            && matches!(info.weights, cuteafd_ffi::fp8_moe::Fp8MoeWeights::Nvfp4 { .. }),
+            && matches!(info.weights, cuteafd_ffi::fp8_moe::Fp8MoeWeights::Nvfp4),
             "{} ({info:?}) is not the dense NVFP4 MLP package", directory.display());
         let top = info.capacity_for(rows).with_context(|| format!("dense NVFP4 package has no capacity for {rows} rows"))?;
         let scratch = crate::shared::memory::DeviceAllocation::new(library, module.scratch_bytes(top)?.max(256))?;

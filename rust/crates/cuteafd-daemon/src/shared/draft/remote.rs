@@ -21,7 +21,7 @@ pub(crate) const CONTEXT: usize = 0;
 pub(crate) const INPUT: usize = 1;
 pub(crate) const HIDDEN: usize = 2;
 pub(crate) const LOGITS: usize = 3;
-const SLOTS: usize = 4;
+const SLOTS: usize = cuteafd_loader::placement::draft::BRIDGE_SLOTS as usize;
 
 /// The bridge's sampled controls on each GPU: four zero-payload receive slots
 /// (256 B each), the control block and the abort word. The solver charges the

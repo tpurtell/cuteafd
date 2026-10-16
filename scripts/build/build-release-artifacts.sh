@@ -312,7 +312,8 @@ fp8_revision="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))[
 for release_family in "${release_family_list[@]}"; do
   case "$release_family" in
     *:fp8) release_package="fp8-${release_family%%:*}" ;;
-    # ModelOpt NVFP4 (W4A16 / W4A4 large-row steps) share the fp8_moe programs.
+    step5:bf16) release_package="fp8-step5-bf16-weights" ;;
+    # ModelOpt NVFP4 calibrated W4A4 share the fp8_moe programs.
     *:nvfp4|*:nvfp4a4) release_package="fp8-${release_family%%:*}-${release_family#*:}" ;;
     *) continue ;;
   esac
@@ -328,7 +329,7 @@ for release_family in "${release_family_list[@]}"; do
     [[ ";$bf16_families;" != *";${release_family%%:*};"* ]] ||
       release_packages+=("${release_package}-bf16")
   fi
-  [[ "$release_family" == *:nvfp4 ]] && release_packages+=("${release_package}a4")
+  [[ "$release_family" == *:nvfp4 && "$release_family" != step5:nvfp4 ]] && release_packages+=("${release_package}a4")
   for release_package in "${release_packages[@]}"; do
     rm -rf "$output_dir/fp8/$release_package"
     cp -a "$build_root/native/fp8/$release_package" "$output_dir/fp8/$release_package"

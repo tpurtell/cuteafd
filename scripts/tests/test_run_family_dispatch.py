@@ -288,7 +288,9 @@ def test_glmf_remote_dflash_metadata_and_terminal_ownership_ordering() -> None:
     assert release.index("family.finish_request()") < release.index("cache.release(")
     publish = bridge.split("    pub fn publish_context(", 1)[1].split("    pub fn acknowledge_context(", 1)[0]
     assert publish.index("self.exchange.wait(0, CONTEXT)") < publish.index("self.exchange.push_planes(0, CONTEXT")
-    assert publish.index("self.exchange.wait(1, CONTEXT)") < bridge.index("self.exchange.signal(1, CONTEXT)")
+    acknowledge = bridge.split("    pub fn acknowledge_context(", 1)[1].split("\n    }", 1)[0]
+    assert "self.exchange.wait(1, CONTEXT)" in publish and "self.exchange.signal(1, CONTEXT)" in acknowledge
+    assert bridge.index("    pub fn publish_context(") < bridge.index("    pub fn acknowledge_context(")
     assert transport.index("self.bridge.publish_context(") < transport.index("self.bridge.acknowledge_context()")
     taps = remote.split("    pub fn tap_streams_at(", 1)[1].split("    pub fn update(", 1)[0]
     assert "self.target.taps.buffer.ptr" in taps and "push_planes" not in taps

@@ -12,15 +12,33 @@ pub const FP8_MOE_LIBRARY: &str = "libcuteafd_fp8moe.so";
 /// The expert weight format a package reads (ABI word 0).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Fp8MoeWeights {
-    /// ABI 1: E4M3 with FP32 128x128 block scales.
+    /// Storage 1: E4M3 with FP32 128x128 block scales.
     Fp8,
-    /// ABI 2: packed E2M1 with UE8M0 scales per 32.
+    /// Storage 2: packed E2M1 with UE8M0 scales per 32.
     Mxfp4,
-    /// ABI 3 / 4: ModelOpt NVFP4: packed E2M1, E4M3 scales per 16, each
+    /// Storage 4: ModelOpt NVFP4: packed E2M1, E4M3 scales per 16, each
     /// scale region followed by the experts' FP32 `weight_scale_2` and
-    /// `input_scale`. Serving requires ABI 4: calibrated W4A4 at every row count;
-    /// ABI 3 is decoded only to identify and reject stale A16 packages.
-    Nvfp4 { w4a4: bool },
+    /// `input_scale`. ABI v5 accepts calibrated W4A4 only, at every row count.
+    Nvfp4,
+    /// Native BF16 row-major matrices; scale pointers are unused.
+    Bf16,
+}
+
+/// Clamp order and intermediate rounding, independent of projection precision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum Fp8MoeActivation {
+    /// Clamp gate before SiLU, round SiLU to BF16, multiply, then round to BF16.
+    SiluBf16Product = 1,
+    /// Clamp FP32 SiLU, multiply in FP32, then round once to BF16.
+    SiluPostClampFp32Product = 2,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum Fp8MoeProjection {
+    /// Gate/up round before activation; down rounds before the FP32 route sum.
+    Bf16 = 1,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -34,6 +52,8 @@ pub struct Fp8MoeInfo {
     /// Input rows are FP8 K32 wire rows (Spark) rather than BF16 (coordinator).
     pub wire_input: bool,
     pub swiglu_limit: f32,
+    pub activation: Fp8MoeActivation,
+    pub projection: Fp8MoeProjection,
     pub capacities: Vec<usize>,
     /// The weight format; packed FP4 slices are zero-padded to 128.
     pub weights: Fp8MoeWeights,
@@ -42,7 +62,10 @@ pub struct Fp8MoeInfo {
 impl Fp8MoeInfo {
     fn from_words(words: [u32; 16]) -> Result<Self> {
         let count = words[9] as usize;
-        ensure!(matches!(words[0], 1..=4) && matches!(words[7], 1 | 7) && (1..=6).contains(&count),
+        let [version, format, activation, projection] = words[0].to_le_bytes();
+        ensure!(version == 5 && matches!(format, 1 | 2 | 4 | 5)
+            && matches!(activation, 1 | 2) && !(format == 2 && activation == 2) && projection == 1
+            && matches!(words[7], 1 | 7) && (1..=6).contains(&count),
             "unsupported FP8 expert package ABI {words:?}");
         let info = Self {
             hidden: words[1] as usize,
@@ -53,11 +76,17 @@ impl Fp8MoeInfo {
             tp: words[6] as usize,
             wire_input: words[7] == 7,
             swiglu_limit: f32::from_bits(words[8]),
+            activation: match activation {
+                1 => Fp8MoeActivation::SiluBf16Product,
+                _ => Fp8MoeActivation::SiluPostClampFp32Product,
+            },
+            projection: Fp8MoeProjection::Bf16,
             capacities: words[10..10 + count].iter().map(|&c| c as usize).collect(),
-            weights: match words[0] {
+            weights: match format {
                 1 => Fp8MoeWeights::Fp8,
                 2 => Fp8MoeWeights::Mxfp4,
-                w => Fp8MoeWeights::Nvfp4 { w4a4: w == 4 },
+                4 => Fp8MoeWeights::Nvfp4,
+                _ => Fp8MoeWeights::Bf16,
             },
         };
         // Slices are the widest rank range, zero-padded to 128 (MXFP4 32-blocks
@@ -69,9 +98,24 @@ impl Fp8MoeInfo {
             && (info.slice == blocks / info.tp * 128 || info.slice == blocks.div_ceil(info.tp) * 128);
         let sliced = info.slice % 128 == 0 && info.slice >= 128 && (exact || (info.slice * info.tp >= info.intermediate
             && (info.slice - 128) * info.tp < info.intermediate));
-        ensure!(info.tp > 0 && sliced && info.capacities.windows(2).all(|w| w[0] < w[1]),
+        ensure!(info.tp > 0 && sliced && info.hidden > 0 && info.hidden % 128 == 0
+            && info.experts > 0 && (1..=16).contains(&info.topk)
+            && info.swiglu_limit.is_finite() && info.swiglu_limit >= 0.0
+            && info.capacities[0] > 0 && info.capacities.iter().all(|&c| c <= i32::MAX as usize)
+            && info.capacities.windows(2).all(|w| w[0] < w[1])
+            && (!matches!(info.weights, Fp8MoeWeights::Bf16 | Fp8MoeWeights::Nvfp4) || !info.wire_input),
             "inconsistent FP8 expert package info {info:?}");
         Ok(info)
+    }
+
+    /// Check checkpoint semantics on static metadata before allocating device storage.
+    pub fn validate_activation(&self, activation: Fp8MoeActivation, limit: f32,
+        projection: Fp8MoeProjection) -> Result<()> {
+        ensure!(limit.is_finite() && limit >= 0.0 && self.activation == activation
+            && self.swiglu_limit == limit && self.projection == projection,
+            "expert package activation/projection contract disagrees with checkpoint: package {:?}/{:?} limit {}, requested {:?}/{:?} limit {}",
+            self.activation, self.projection, self.swiglu_limit, activation, projection, limit);
+        Ok(())
     }
 
     /// Wire row bytes: hidden E4M3 values then hidden/32 UE8M0 scales.
@@ -330,8 +374,42 @@ mod metadata_tests {
     use super::*;
 
     fn words() -> [u32; 16] {
-        // ABI 2, BF16 input, TP1 MXFP4 with two compiled capacities.
-        [2, 6144, 2048, 256, 8, 2048, 1, 1, 0, 2, 16, 4096, 0, 0, 0, 0]
+        // ABI 5, MXFP4, pre-SiLU clamp, BF16 projection and input.
+        [0x01010205, 6144, 2048, 256, 8, 2048, 1, 1, 0, 2, 16, 4096, 0, 0, 0, 0]
+    }
+
+    #[test]
+    fn activation_contract_is_explicit_and_fail_closed() {
+        for format in [1, 2, 4, 5] {
+            for activation in [1, 2] {
+                let mut w = words();
+                w[0] = 5 | format << 8 | activation << 16 | 1 << 24;
+                w[8] = 7.0f32.to_bits();
+                if format == 2 && activation == 2 {
+                    assert!(Fp8MoeInfo::from_words(w).is_err());
+                    continue;
+                }
+                let info = Fp8MoeInfo::from_words(w).unwrap();
+                let requested = if activation == 1 { Fp8MoeActivation::SiluBf16Product }
+                    else { Fp8MoeActivation::SiluPostClampFp32Product };
+                info.validate_activation(requested, 7.0, Fp8MoeProjection::Bf16).unwrap();
+                assert!(info.validate_activation(requested, 2.0, Fp8MoeProjection::Bf16).is_err());
+                if activation == 1 {
+                    assert!(info.validate_activation(Fp8MoeActivation::SiluPostClampFp32Product,
+                        7.0, Fp8MoeProjection::Bf16).is_err());
+                }
+            }
+        }
+        for abi in [1, 2, 3, 4, 0x01000105, 0x01030105, 0x02010105, 0x01010305] {
+            let mut w = words();
+            w[0] = abi;
+            assert!(Fp8MoeMetadata::from_words_and_scratch(w, |_| panic!("invalid contract queried scratch")).is_err());
+        }
+        for limit in [f32::NAN, f32::INFINITY, -1.0] {
+            let mut w = words();
+            w[8] = limit.to_bits();
+            assert!(Fp8MoeInfo::from_words(w).is_err());
+        }
     }
 
     #[test]

@@ -83,6 +83,17 @@ fn allocatable_bytes(integrated: bool, cuda_free: usize,
     parse_mem_available(&text).context("integrated-device admission requires valid MemAvailable")
 }
 
+fn device_allocatable_memory(info: &CuteafdCudaDeviceInfo,
+    physical: impl FnOnce() -> Result<(usize, usize)>,
+    integrated_headroom: impl FnOnce() -> Result<usize>) -> Result<(usize, usize)> {
+    if info.integrated == 0 { return physical(); }
+    let total = usize::try_from(info.total_memory_bytes).context("device memory exceeds addressable bytes")?;
+    anyhow::ensure!(total > 0, "invalid integrated-device total memory");
+    // A raw CUDA query may initialize a context and fail under reclaimable-cache
+    // pressure. Integrated admission needs only properties and OS headroom.
+    Ok((integrated_headroom()?.min(total), total))
+}
+
 fn cgroup_allocatable_bytes(mut available: usize, membership: &str,
     read: impl Fn(&Path) -> Result<Option<String>>) -> Result<usize> {
     for line in membership.lines() {
@@ -122,7 +133,45 @@ fn cgroup_memory_headroom(available: usize) -> Result<usize> {
 
 #[cfg(test)]
 mod allocatable_memory_tests {
-    use super::{allocatable_bytes, cgroup_allocatable_bytes, parse_mem_available, MemAvailableError};
+    use super::{allocatable_bytes, cgroup_allocatable_bytes, device_allocatable_memory,
+        parse_mem_available, CuteafdCudaDeviceInfo, MemAvailableError};
+
+    #[test]
+    fn integrated_admission_never_calls_failing_physical_query() {
+        let info = CuteafdCudaDeviceInfo { integrated: 1, total_memory_bytes: 128 << 30,
+            ..Default::default() };
+        let queried = std::cell::Cell::new(false);
+        let result = device_allocatable_memory(&info, || {
+            queried.set(true);
+            anyhow::bail!("cudaMemGetInfo failed: out of memory")
+        }, || cgroup_allocatable_bytes(
+            allocatable_bytes(true, 0, || Ok("MemAvailable: 112197632 kB\n".into()))?,
+            "0::/", |path| Ok(match path.to_str().unwrap() {
+                "/sys/fs/cgroup/memory.max" => Some((100u64 << 30).to_string()),
+                "/sys/fs/cgroup/memory.current" => Some((4u64 << 30).to_string()),
+                _ => None,
+            }))).unwrap();
+        assert_eq!(result, (96usize << 30, 128usize << 30));
+        assert!(!queried.get());
+        assert_eq!(device_allocatable_memory(&info, || panic!("raw query"),
+            || Ok(200usize << 30)).unwrap(), (128usize << 30, 128usize << 30));
+        assert!(device_allocatable_memory(&info, || panic!("raw query"),
+            || anyhow::bail!("invalid headroom")).is_err());
+        let invalid = CuteafdCudaDeviceInfo { total_memory_bytes: 0, ..info };
+        assert!(device_allocatable_memory(&invalid, || panic!("raw query"),
+            || panic!("invalid total must fail first")).is_err());
+    }
+
+    #[test]
+    fn discrete_admission_requires_physical_query_and_propagates_errors() {
+        let info = CuteafdCudaDeviceInfo::default();
+        assert_eq!(device_allocatable_memory(&info, || Ok((123, 456)),
+            || panic!("discrete device must not read OS headroom")).unwrap(), (123, 456));
+        let error = device_allocatable_memory(&info,
+            || anyhow::bail!("cudaMemGetInfo failed: out of memory"),
+            || panic!("discrete device must not read OS headroom")).unwrap_err();
+        assert!(error.to_string().contains("cudaMemGetInfo failed"));
+    }
 
     #[test]
     fn gb10_respects_nested_cgroup_headroom_and_namespace_root() {
@@ -1920,16 +1969,16 @@ impl NativeLibrary {
     /// Allocatable free/total bytes on the current device, before logical budgets.
     /// Integrated-device allocations reclaim Linux page cache, so MemAvailable is the
     /// shared device/host headroom, bounded by cgroup hard-limit headroom.
+    /// Integrated devices do not query cudaMemGetInfo: even that query can fail
+    /// before reclaiming page cache. Raw samples remain available for diagnostics.
     /// Discrete devices keep cudaMemGetInfo, regardless of compute capability.
     pub fn cuda_allocatable_memory_info(&self) -> Result<(usize, usize)> {
-        let (free, total) = self.cuda_physical_memory_info()?;
         let info = self.cuda_device_info(self.cuda_get_device()?)?;
-        let available = allocatable_bytes(info.integrated != 0, free,
-            || std::fs::read_to_string("/proc/meminfo").context("reading device allocatable memory"))?;
-        let available = if info.integrated != 0 {
-            cgroup_memory_headroom(available)?
-        } else { available };
-        Ok((available.min(total), total))
+        device_allocatable_memory(&info, || self.cuda_physical_memory_info(), || {
+            let available = allocatable_bytes(true, 0,
+                || std::fs::read_to_string("/proc/meminfo").context("reading device allocatable memory"))?;
+            cgroup_memory_headroom(available)
+        })
     }
 
     /// Effective free/total bytes under the coordinator's logical ceiling.

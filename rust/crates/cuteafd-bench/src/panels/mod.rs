@@ -118,6 +118,8 @@ pub struct Ctx<'a> {
     pub max_output: u64,
     /// The run's lossless case set, when the client sent one (else the shipped default).
     pub lossless_set: Option<&'a lossless::CaseSet>,
+    /// Opt-in full-vocabulary row dumps for selected lossless cases.
+    pub lossless_dump: Option<&'a lossless::RowDump>,
     pub context_load: &'a context_load::Options,
 }
 

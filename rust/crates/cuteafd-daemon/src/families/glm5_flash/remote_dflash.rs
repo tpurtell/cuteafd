@@ -2,15 +2,14 @@
 //! GLM Flash's binding of the shared device-driven draft bridge
 //! (`shared::draft::remote`): taps, input rows, hidden rows and logits.
 use crate::families::glm5::dflash::{ContextRow, Draft, DraftSeq, GlmDrafter, ReplayDrafter, TargetHead, TAP_ROWS};
-use crate::shared::draft::remote::{RemoteBridge, CONTEXT as TAPS};
-pub(crate) use crate::shared::draft::remote::Prepared;
+use crate::shared::draft::remote::{Prepared, RemoteBridge};
 use crate::shared::memory::device::{Allocation, Device, DeviceOwner};
 use crate::shared::peer_split::RankDevice;
 use crate::shared::token_io::TokenEmbedding;
 use anyhow::{ensure, Result};
 use cuteafd_ffi::peer_exchange::PeerPlane;
 use cuteafd_ffi::programs::VocabularyHead;
-use cuteafd_ffi::{CuteafdDeviceBuffer, NativeLibrary};
+use cuteafd_ffi::CuteafdDeviceBuffer;
 use std::ffi::c_void;
 
 pub(crate) const IDENTITY: &str = "glmf-remote-dflash:taps,input,hidden,logits";
@@ -232,6 +231,7 @@ mod tests {
     use crate::shared::draft::remote::{HIDDEN, INPUT};
     use crate::shared::memory::device::Stream;
     use crate::shared::peer_split::TerminalState;
+    use cuteafd_ffi::NativeLibrary;
 
     fn row(tap_row: usize) -> ContextRow { ContextRow { tap_row, slot: 0, position: tap_row } }
 
