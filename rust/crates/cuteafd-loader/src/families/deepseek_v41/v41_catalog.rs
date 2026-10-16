@@ -813,6 +813,20 @@ pub fn read_expert_catalog(snapshot: &Path) -> Result<OfficialV41Catalog> {
     if config.get("model_type").and_then(serde_json::Value::as_str) == Some("qwen4_exp") {
         return read_qwen4_expert_catalog(snapshot, &config);
     }
+    if matches!(config["model_type"].as_str(), Some("step5" | "step5_vl")) {
+        let checkpoint = crate::plan::Checkpoint::inventory(snapshot)?;
+        let cfg = crate::plan::families::step5::Config::parse(&checkpoint)?;
+        // The final target layer is dense; bundled MTP stages are separately owned.
+        let first_layer = cfg.moe[..cfg.layers].iter().position(|&moe| moe).context("Step-5 has no routed layers")?;
+        let end = cfg.moe[..cfg.layers].iter().rposition(|&moe| moe).unwrap() + 1;
+        ensure!(cfg.moe[first_layer..end].iter().all(|&moe| moe), "Step-5 routed layer set is not contiguous");
+        let shape = RoutedExpertShape { layers: end, first_layer, experts: cfg.experts,
+            topk: cfg.topk, hidden: cfg.hidden, intermediate: cfg.intermediate, draft_stages: 0, draft_experts: 0 };
+        let fp8 = crate::formats::fp8_experts::Fp8ExpertTensors::read_layers(snapshot, shape,
+            &(first_layer..end).collect())?;
+        return Ok(OfficialV41Catalog { config: None, experts: shape, snapshot: snapshot.to_path_buf(),
+            tensors: Vec::new(), exl3: None, nvfp4: None, fp8: Some(fp8) });
+    }
     if config.get("text_config").is_some() {
         return read_official_v41_catalog(crate::OFFICIAL_V41_MODEL_ID, snapshot);
     }

@@ -206,6 +206,7 @@ pub fn dual_draft_demands(catalog: &crate::OfficialV41Catalog, native_lib: &std:
         let weights = match tensors.format() {
             ExpertFormat::Fp8Block128 => info["weights"].as_str() == Some("fp8"),
             ExpertFormat::Mxfp4 => info["weights"].as_str() == Some("mxfp4"),
+            ExpertFormat::Bf16 => info["weights"].as_str() == Some("bf16"),
             ExpertFormat::Nvfp4 => matches!(info["weights"].as_str(), Some("nvfp4" | "nvfp4a4")),
         };
         anyhow::ensure!(info["tp"].as_u64() == Some(1)
@@ -266,6 +267,7 @@ pub fn dual_expert_workspace(catalog: &crate::OfficialV41Catalog,
             let weights = match tensors.format() {
                 ExpertFormat::Fp8Block128 => info["weights"].as_str() == Some("fp8"),
                 ExpertFormat::Mxfp4 => info["weights"].as_str() == Some("mxfp4"),
+            ExpertFormat::Bf16 => info["weights"].as_str() == Some("bf16"),
                 ExpertFormat::Nvfp4 => matches!(info["weights"].as_str(), Some("nvfp4" | "nvfp4a4")),
             };
             anyhow::ensure!(info["tp"].as_u64() == Some(2)

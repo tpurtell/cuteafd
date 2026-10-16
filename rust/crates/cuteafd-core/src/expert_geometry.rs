@@ -33,6 +33,9 @@ impl ExpertGeometry {
     /// Qwen 3.8 Flash Next (qwen4_exp): 48 routed layers, softmax top-10, SiLU unclamped.
     pub const QWEN4: Self = Self { hidden: 2560, experts: 512, topk: 10, intermediate: 640, layers: 48 };
 
+    /// Step-5 routed target layers 3..91 (layer 91 is dense).
+    pub const STEP5: Self = Self { hidden: 4096, experts: 352, topk: 8, intermediate: 1536, layers: 91 };
+
     /// BF16 bytes of one hidden-width row (a routed input or a rank partial).
     pub const fn row_bytes(&self) -> u32 {
         self.hidden * 2
@@ -77,21 +80,28 @@ impl ExpertGeometry {
             (Self::MIMO_V26_PRO, "mimop"),
             (Self::GLM5_FLASH, "glmf"),
             (Self::QWEN4, "qwen4"),
+            (Self::STEP5, "step5"),
         ]
         .into_iter()
         .find_map(|(shape, family)| self.same_shape(&shape).then_some(family))
     }
 
     /// Routed-expert SwiGLU clamp: DeepSeek and GLM 5.3 Flash clamp gate/up at
-    /// 10; GLM 5.x's, MiMo's and Qwen 3.8 Flash Next's SwiGLU are unclamped (`None`).
+    /// 10; Step-5 clamps post-SiLU at 7 (see `activation`). GLM 5.x, MiMo
+    /// and Qwen 3.8 Flash Next are unclamped (`None`).
     pub fn swiglu_limit(&self) -> Option<f32> {
+        if self.same_shape(&Self::STEP5) { return Some(7.0); }
         (!self.same_shape(&Self::GLM5) && !self.same_shape(&Self::MIMO_V2_FLASH)
             && !self.same_shape(&Self::MIMO_V26_PRO) && !self.same_shape(&Self::QWEN4)).then_some(10.0)
     }
 
-    /// Legacy expert arithmetic, unchanged for all currently executable shapes.
+    /// Expert arithmetic; existing families retain their legacy rounding exactly.
     pub fn activation(&self) -> crate::FfnActivation {
-        crate::FfnActivation::SiluBf16Product { limit: self.swiglu_limit() }
+        if self.same_shape(&Self::STEP5) {
+            crate::FfnActivation::SiluPostClampFp32Product { limit: 7.0 }
+        } else {
+            crate::FfnActivation::SiluBf16Product { limit: self.swiglu_limit() }
+        }
     }
 
     /// Equal kernel shape (hidden, experts, top-k, intermediate), any layer bound.

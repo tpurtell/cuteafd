@@ -36,7 +36,7 @@ pub struct Config {
 }
 
 impl Config {
-    fn parse(checkpoint: &Checkpoint) -> Result<Self> {
+    pub(crate) fn parse(checkpoint: &Checkpoint) -> Result<Self> {
         let v = checkpoint.config.get("text_config").unwrap_or(&checkpoint.config);
         ensure!(v["model_type"] == "step5", "expected nested text_config.model_type=step5");
         let int = |key: &str| -> Result<usize> {

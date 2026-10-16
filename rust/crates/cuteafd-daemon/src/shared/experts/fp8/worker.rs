@@ -26,6 +26,7 @@ pub(crate) struct Fp8Worker<'a> {
 }
 
 impl<'a> Fp8Worker<'a> {
+    pub(crate) fn capacity(&self) -> usize { self.capacity }
     /// Device bytes the worker adds to its resident layers for `capacity`.
     /// (Input rows are sized for BF16, the larger of the two representations.)
     pub(crate) fn workspace_bytes(capacity: usize) -> usize {
@@ -42,8 +43,8 @@ impl<'a> Fp8Worker<'a> {
         ensure!(experts.layers.windows(2).all(|w| w[1].layer == w[0].layer + 1), "FP8 worker layers must be contiguous");
         ensure!(experts.module.info().capacity_for(capacity).is_some(), "FP8 package lacks capacity {capacity}");
         ensure!(experts.wire_input() || matches!(experts.module.info().weights,
-            cuteafd_ffi::fp8_moe::Fp8MoeWeights::Nvfp4 { .. }),
-            "Spark workers need a wire-input package, or native BF16-input NVFP4");
+            cuteafd_ffi::fp8_moe::Fp8MoeWeights::Nvfp4 { .. } | cuteafd_ffi::fp8_moe::Fp8MoeWeights::Bf16),
+            "Spark workers need a wire-input package, or native BF16-input weights");
         let inputs = [
             DeviceAllocation::new(library, capacity * if !experts.wire_input() || experts.bf16_module.is_some() { hidden * 2 }
                 else { hidden + hidden / 32 })?,
@@ -93,7 +94,7 @@ impl<'a> Fp8Worker<'a> {
             request.require_input_dtype(ExpertV2Dtype::Bf16 as u32)?;
         }
         ensure!(bf16 || self.experts.wire_input(),
-            "NVFP4 Spark input must be BF16, not FP8 K32");
+            "native BF16/NVFP4 Spark input must be BF16, not FP8 K32");
         ensure!(request.hidden().len() <= self.inputs[0].buffer.bytes, "FP8 request rows exceed the input buffer");
         let bytes = request.plane_bytes()?;
         let routes = rows * cuteafd_core::expert_geometry().topk as usize;

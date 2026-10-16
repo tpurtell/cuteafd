@@ -26,12 +26,15 @@ fn validate_info(info: &Fp8MoeInfo, tensors: &Fp8ExpertTensors, rank: usize, sli
     let shape = tensors.shape();
     let weights_match = matches!((tensors.format(), info.weights),
         (ExpertFormat::Fp8Block128, Fp8MoeWeights::Fp8)
+        | (ExpertFormat::Bf16, Fp8MoeWeights::Bf16)
         | (ExpertFormat::Mxfp4, Fp8MoeWeights::Mxfp4)
         | (ExpertFormat::Nvfp4, Fp8MoeWeights::Nvfp4 { .. }));
     ensure!(!info.wire_input && info.tp == 2 && info.hidden == shape.hidden
         && info.intermediate == shape.intermediate && info.experts == shape.experts
         && info.topk == shape.topk && info.slice == tensors.rank_width(2, rank, slicing)? && weights_match,
         "FP8 MoE TP2 package does not serve this checkpoint with BF16 input: {info:?}");
+    let layers = (shape.first_layer..shape.layers).filter(|&layer| tensors.has_layer(layer)).collect::<Vec<_>>();
+    super::super::fp8::validate_checkpoint_contract(info, tensors, &layers, 2, rank, slicing)?;
     ensure!(info.capacity_for(max_rows).is_some(), "FP8 MoE TP2 package has no capacity for {max_rows} rows");
     Ok(())
 }
@@ -271,6 +274,7 @@ mod tests {
                 weights.extend(match format {
                     ExpertFormat::Fp8Block128 => fp8(&name, n, k, None),
                     ExpertFormat::Mxfp4 => mxfp4(&name, n, k),
+                    ExpertFormat::Bf16 => vec![cuteafd_loader::plan::testing::t(format!("{name}.weight"), "BF16", &[n,k])],
                     ExpertFormat::Nvfp4 => nvfp4(&name, n, k),
                 });
             }
@@ -279,9 +283,11 @@ mod tests {
                 experts: 1, topk, hidden, intermediate, draft_stages: 0, draft_experts: 0 })?;
             for rank in 0..2 {
                 let mut info = Fp8MoeInfo { hidden, intermediate, slice: tensors.rank_width(2, rank, Slicing::Blocks(128))?,
-                    experts: 1, topk, tp: 2, wire_input: false, swiglu_limit: 0.0, activation: cuteafd_ffi::fp8_moe::Fp8MoeActivation::SiluBf16Product, projection: cuteafd_ffi::fp8_moe::Fp8MoeProjection::Bf16, capacities: vec![1, 16, 4096],
+                    experts: 1, topk, tp: 2, wire_input: false,
+                    swiglu_limit: tensors.shape().geometry()?.swiglu_limit().unwrap_or(0.0), activation: cuteafd_ffi::fp8_moe::Fp8MoeActivation::SiluBf16Product, projection: cuteafd_ffi::fp8_moe::Fp8MoeProjection::Bf16, capacities: vec![1, 16, 4096],
                     weights: match format { ExpertFormat::Fp8Block128 => Fp8MoeWeights::Fp8,
                         ExpertFormat::Mxfp4 => Fp8MoeWeights::Mxfp4,
+                        ExpertFormat::Bf16 => Fp8MoeWeights::Bf16,
                         ExpertFormat::Nvfp4 => Fp8MoeWeights::Nvfp4 { w4a4: true } } };
                 validate_info(&info, &tensors, rank, Slicing::Blocks(128), 4096)?;
                 assert!(validate_info(&info, &tensors, 2, Slicing::Blocks(128), 16).is_err());
