@@ -91,7 +91,8 @@ class PackageProfileTests(unittest.TestCase):
         direct = (False if DIRECT_ROUTES is None else bool(DIRECT_ROUTES(
             variant['capacity'], variant['top_k'], direct_exl3=True)))
         return list(POLICY_TILE(None, hidden_size=5120, intermediate_size=variant['intermediate'],
-                                token_count=variant['capacity'], direct_topk_routes=direct))
+                                token_count=variant['capacity'], direct_topk_routes=direct,
+                                canonical_k=variant['capacity'] <= 80))
 
     # How many ranks share one export per width, from the layout contract.
     expected_rank_count = {'tp2-rank': 2, 'tp3-rank': 3}
@@ -157,7 +158,7 @@ class PackageProfileTests(unittest.TestCase):
             else:
                 meta['tile'] = list(POLICY_TILE(None, hidden_size=package.GEOMETRIES[geometry][0],
                     intermediate_size=width, token_count=capacity,
-                    direct_topk_routes=direct))
+                    direct_topk_routes=direct, canonical_k=capacity <= 80))
             if meta['requires_route_preparation']:
                 routes = raw / 'routes'
                 routes.mkdir()

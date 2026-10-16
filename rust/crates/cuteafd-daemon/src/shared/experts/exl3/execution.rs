@@ -1011,6 +1011,25 @@ mod tests {
             // No compatible grouped export: refuse before any allocation or module load.
             let narrow = [root.path().join("m1"), root.path().join("m16")];
             assert!(Exl3ReductionPlan::new(&narrow).is_err());
+
+            // When m16 is exported with the canonical reduction tile, rows 2..=16 select m16.
+            std::fs::write(root.path().join("m16/v41_exl3.json"), serde_json::to_vec(&serde_json::json!({
+                "capacity": 16, "tile": tile, "bits": [3, 4],
+                "output_dtype": "fp32", "direct": false
+            }))?)?;
+            let narrow_plan = Exl3ReductionPlan::new(&narrow)?;
+            for rows in 1..=16 {
+                assert_eq!(narrow_plan.execution_index(rows, rows, [1, 16].into_iter())?,
+                    if rows == 1 { 0 } else { 1 });
+            }
+            let full_paths: Vec<_> = [1, 16, 80, 256].into_iter()
+                .map(|c| root.path().join(format!("m{c}"))).collect();
+            let full_plan = Exl3ReductionPlan::new(&full_paths)?;
+            for rows in 1..=80 {
+                let index = full_plan.execution_index(rows, rows, [1, 16, 80, 256].into_iter())?;
+                assert_eq!([1, 16, 80, 256][index],
+                    if rows == 1 { 1 } else if rows <= 16 { 16 } else { 80 });
+            }
         }
         Ok(())
     }
