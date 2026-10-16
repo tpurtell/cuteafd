@@ -562,10 +562,9 @@ pub struct DraftInventory {
     /// Routed-expert bytes resident while that staging is live, [home, GPU0
     /// TP2 half]: experts load first, serially, before anything else.
     pub loading_experts: [u64; 2],
-    /// The loader's own pre-load fit check per GPU [home, GPU0 TP2 half]
-    /// (`DsparkBudget::peak_device_bytes`, conservative wave and window
-    /// terms). It is a transient check, so it joins the load phase, never the
-    /// retained owners.
+    /// The loaders' exact device load bound per GPU [home, GPU0 TP2 half]:
+    /// max(experts + their staging, all retained weights). Runtime owners
+    /// (lanes, windows, main contexts) are not part of loading.
     pub loader_peak: [u64; 2],
 }
 
