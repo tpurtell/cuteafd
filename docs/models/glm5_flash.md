@@ -15,6 +15,57 @@ Attention (KDA), a minority run MLA + DSA.
 **Starting configs** (v2.0.0 release cards, natural minimum and maximum; replace the
 placeholder Spark hosts and addresses): Official FP8 [min](../../examples/configs/glm53-flash-fp8-min.config) · [max](../../examples/configs/glm53-flash-fp8-max.config); EXL3 K3.25 [min](../../examples/configs/glm53-flash-exl3-min.config) · [max](../../examples/configs/glm53-flash-exl3-max.config); NVFP4 [min](../../examples/configs/glm53-flash-nvfp4-min.config) · [max](../../examples/configs/glm53-flash-nvfp4-max.config); tr3 4bpw [min](../../examples/configs/glm53-flash-tr3-min.config) · [max](../../examples/configs/glm53-flash-tr3-max.config).
 
+## Attention placement decision (D-GLMF, 2026-10-16)
+
+**Two RTX, zero Sparks: Layers wins.** Three interleaved sessions compare
+Context (`d8700da1`) with explicit Layers (`153bbd69`) on two RTX PRO 6000
+cards, EXL3 K3.25, DFlash2, a 2,097,152-token pool and Compact index cache.
+These are the same sealed builds across sessions; the subsequent P7
+integration preserves their GLM Flash execution behavior. Each concurrency
+level has an untimed warm batch. Values are aggregate emitted tokens/s,
+Context -> Layers; post-load C1 follows the concurrency sweep.
+
+| Session | Warmed C1 | Layers / Context | Warmed C8 | Warmed C16 | Post-load C1 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 1 | 183.546 -> 189.711 | 1.034 | not measured | 622.492 -> 632.716 | 183.428 -> 193.500 |
+| 2 | 182.518 -> 198.014 | 1.085 | 493.414 -> 546.983 | 716.442 -> 747.369 | 169.328 -> 185.626 |
+| 3 | 167.050 -> 166.103 | 0.994 | 539.946 -> 545.408 | 708.709 -> 718.856 | 186.237 -> 183.727 |
+
+The median paired C1 ratio is **1.034**, outside the decision rule's 1%
+band, so three sessions decide this layout without escalation. Layers wins
+C1 in two sessions, C16 in all three and C8 in both measured sessions.
+Session 3 spans a coordinator reboot: its Layers arm completed before the
+reboot and only the missing Context arm resumed afterward. The negative
+C1 result and this condition are retained, not discarded or presented as a
+same-boot pair. Session 1 ran the full correctness panels; sessions 2/3
+ran only the warmed concurrency sweep and post-load C1. Their C16 values
+are therefore not pooled into one throughput estimate across sessions.
+Session 1's basic-panel C8 (490.368 -> 485.839) is not a warmed C8 sweep.
+
+Session 1 also measured 8K prefill 6,483 -> 7,491 tokens/s, readiness
+61.93 -> 63.61 s, fidelity KL 0.03501 -> 0.03652 and top-1
+95.67% -> 95.78%. Both arms passed fidelity, prefix cache and the strict
+10/10 set (not a general row-invariance proof). Layers naturally selected
+first MLA owner 1 with all 42 expert layers local TP2; planned/uploaded
+resident operands matched exactly on both ranks, and both held the 2M
+pool. The unchanged default Context path also passed a full-model,
+real-expert saved-logit golden: all 198 rows byte-identical between builds
+(maximum difference and KL zero).
+
+**Decision versus configuration:** Layers is the selected default for this
+measured zero-Spark layout, but this record does not change the configured
+default. The mixed 50%-RTX/four-Spark decision is pending; any per-layout
+default flip follows in a separate small PR after that evidence is in.
+The mixed card uses `RTX_EXPERT_LAYERS=21`: this checkpoint's backbone has
+45 layers, the first three dense, leaving 42 routed expert layers (3..44).
+The separate nextn layer 45 is not part of that backbone count.
+
+Reproduction/results: `p7-whole-run2` (session 1),
+`p7-dglmf-nospark2` (sessions 2/3), and `p7-context-parity2` under
+`~/.cache/cuteafd/builds/`; commands and sealed revisions are recorded in
+[#287](https://github.com/tpurtell/cuteafd/pull/287). No default or performance
+claim is extended to unmeasured checkpoints or layouts.
+
 ## Engineering summary
 
 - Attention: hybrid — Kimi Delta Attention (token-sequential linear
