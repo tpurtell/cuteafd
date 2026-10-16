@@ -1,4 +1,5 @@
 //! Fail-closed checkpoint/AOT agreement, before weight or workspace admission.
+use super::weights::DenseFormat;
 use anyhow::{ensure, Context, Result};
 use cuteafd_core::DType;
 use cuteafd_ffi::programs::{ProgramSpec, Programs};
@@ -6,6 +7,7 @@ use cuteafd_loader::families::qwen3_5::Qwen35Config;
 
 pub(crate) struct DensePrograms {
     pub(crate) prefix: &'static str,
+    pub(crate) format: DenseFormat,
     pub(crate) norm_dtype: DType,
     pub(crate) scratch_bytes: usize,
 }
@@ -49,8 +51,13 @@ fn validate(cfg: &Qwen35Config, op: &str, rows: usize, spec: &ProgramSpec) -> Re
             integer(spec, "head_dim", cfg.gdn.key_dim)?;
             integer(spec, "in_width", cfg.gdn.conv_width() + cfg.gdn.value_width() + 2 * cfg.gdn.value_heads)?;
             number(spec, "eps", cfg.rms_norm_eps)?;
-            ensure!(spec.geometry["output_gate"] == "silu" && spec.geometry["fp8_weights"] == false,
-                "{}: dense BF16 GDN needs SiLU and native BF16 projections", spec.name);
+            ensure!(spec.geometry["output_gate"] == "silu" &&
+                (spec.geometry["fp8_weights"] == false || spec.geometry["fp8_weights"] == "only"),
+                "{}: dense GDN needs SiLU and native checkpoint projections", spec.name);
+            if spec.geometry["fp8_weights"] == "only" {
+                ensure!(spec.geometry["gate_weights"] == "bf16" && spec.geometry["gate_order"] == serde_json::json!(["b", "a"]),
+                    "{}: native FP8 GDN gates must remain BF16 in b/a order", spec.name);
+            }
             norm_dtype(spec)?;
         }
         "gdn_commit" => {
@@ -79,7 +86,8 @@ fn validate(cfg: &Qwen35Config, op: &str, rows: usize, spec: &ProgramSpec) -> Re
         }
         "attn_o" => {
             integer(spec, "width", cfg.heads * cfg.head_dim)?;
-            ensure!(spec.geometry["fp8_weights"] == false, "{}: expected native BF16 output projection", spec.name);
+            ensure!(spec.geometry["fp8_weights"] == false || spec.geometry["fp8_weights"] == "only",
+                "{}: expected native checkpoint output projection", spec.name);
         }
         "ffn" => integer(spec, "intermediate", cfg.intermediate)?,
         "add" => (),
@@ -102,6 +110,18 @@ fn validate_abi(op: &str, rows: usize, spec: &ProgramSpec) -> Result<()> {
         "ffn" => vec!["x", "w_gate_up", "w_down", "out", "scratch"],
         _ => anyhow::bail!("unknown dense Qwen ABI {op}"),
     };
+    let fp8 = spec.geometry["fp8_weights"] == "only";
+    if fp8 {
+        pointers = match op {
+            "gdn" => vec!["x", "w_qkvz_fp8", "w_qkvz_scale", "w_ba", "conv_w", "a_log", "dt_bias", "norm_w",
+                "w_out_fp8", "w_out_scale", "conv_state", "state", "slots", "seq_first", "out"],
+            "attn_producer" => vec!["x", "w_in_fp8", "w_in_scale", "q_norm", "k_norm", "rope_positions", "kv_slots",
+                "kv_cache", "query", "gate", "scratch"],
+            "attn_o" => vec!["attn", "gate", "w_o_fp8", "w_o_scale", "out", "scratch"],
+            "ffn" => vec!["x", "w_gate_up_fp8", "w_gate_up_scale", "w_down_fp8", "w_down_scale", "out", "scratch"],
+            _ => anyhow::bail!("unexpected native FP8 ABI {op}"),
+        };
+    }
     if op == "gdn" {
         if rows == crate::shared::qwen::REPLAY_ROWS { pointers.push("replay"); }
         pointers.push("scratch");
@@ -110,6 +130,7 @@ fn validate_abi(op: &str, rows: usize, spec: &ProgramSpec) -> Result<()> {
     let scalars = match op {
         "gdn_commit" | "full_gqa" => 3,
         "gdn" if rows == crate::shared::qwen::REPLAY_ROWS => 2,
+        "attn_o" if fp8 && rows > crate::shared::qwen::REPLAY_ROWS => 2,
         _ => 1,
     };
     ensure!(spec.scalar_kinds == vec![b'i'; scalars], "{}: dense scalar ABI differs", spec.name);
@@ -121,7 +142,7 @@ fn validate_abi(op: &str, rows: usize, spec: &ProgramSpec) -> Result<()> {
 }
 
 impl DensePrograms {
-    pub(crate) fn new(cfg: &Qwen35Config, programs: &Programs<'_>) -> Result<Self> {
+    pub(crate) fn new(cfg: &Qwen35Config, programs: &Programs<'_>, format: DenseFormat) -> Result<Self> {
         // These are actual exported geometries, not aliases for Flash Next.
         let prefix = match (cfg.hidden, cfg.intermediate, cfg.heads, cfg.gdn.value_heads) {
             (4096, 12288, 16, 32) => "qwen35",
@@ -136,8 +157,18 @@ impl DensePrograms {
         for (op, rows) in [("norm", 0), ("add", 0), ("gdn_commit", 0)].into_iter().chain(
             [64, 4096].into_iter().flat_map(|rows|
                 ["gdn", "attn_producer", "full_gqa", "attn_o", "ffn"].map(|op| (op, rows)))) {
-            let name = if rows == 0 { format!("{prefix}_{op}") } else { format!("{prefix}_{op}_m{rows}") };
+            let quantized = format.fp8() && matches!(op, "gdn" | "attn_producer" | "attn_o" | "ffn");
+            let suffix = if quantized { "_fp8" } else { "" };
+            let name = if rows == 0 { format!("{prefix}_{op}") } else { format!("{prefix}_{op}{suffix}_m{rows}") };
             let spec = programs.spec(&name)?;
+            if matches!(op, "gdn" | "attn_producer" | "attn_o" | "ffn") {
+                ensure!((spec.geometry["fp8_weights"] == "only") == quantized,
+                    "{name}: projection format disagrees with checkpoint");
+                if quantized {
+                    ensure!(spec.geometry["weight_block"] == serde_json::json!([128, 128]),
+                        "{name}: expected checkpoint 128x128 FP8 block scales");
+                }
+            }
             validate(cfg, op, rows, spec)?;
             validate_abi(op, rows, spec)?;
             if op == "gdn" {
@@ -149,7 +180,7 @@ impl DensePrograms {
                 scratch_bytes = scratch_bytes.max(usize::try_from(bytes).context("dense Qwen scratch exceeds usize")?);
             }
         }
-        Ok(Self { prefix, norm_dtype: norm.context("dense Qwen GDN norm ABI missing")?, scratch_bytes })
+        Ok(Self { prefix, format, norm_dtype: norm.context("dense Qwen GDN norm ABI missing")?, scratch_bytes })
     }
 }
 
@@ -207,6 +238,37 @@ mod tests {
         validate(&cfg, "gdn_commit", 0, &spec)?;
         spec.geometry["replay_bytes"] = json!(0);
         assert!(validate(&cfg, "gdn_commit", 0, &spec).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn native_fp8_projection_abis_preserve_scales_bf16_gates_and_prefill_threshold() -> Result<()> {
+        for rows in [64, 4096] {
+            for (op, pointers) in [
+                ("gdn", vec!["x", "w_qkvz_fp8", "w_qkvz_scale", "w_ba", "conv_w", "a_log", "dt_bias", "norm_w",
+                    "w_out_fp8", "w_out_scale", "conv_state", "state", "slots", "seq_first", "out"]),
+                ("attn_producer", vec!["x", "w_in_fp8", "w_in_scale", "q_norm", "k_norm", "rope_positions", "kv_slots",
+                    "kv_cache", "query", "gate", "scratch"]),
+                ("attn_o", vec!["attn", "gate", "w_o_fp8", "w_o_scale", "out", "scratch"]),
+                ("ffn", vec!["x", "w_gate_up_fp8", "w_gate_up_scale", "w_down_fp8", "w_down_scale", "out", "scratch"]),
+            ] {
+                let mut pointers: Vec<String> = pointers.into_iter().map(str::to_owned).collect();
+                if op == "gdn" {
+                    if rows == 64 { pointers.push("replay".into()); }
+                    pointers.push("scratch".into());
+                }
+                let scalars = if (op == "gdn" && rows == 64) || (op == "attn_o" && rows == 4096) { 2 } else { 1 };
+                let mut spec = ProgramSpec { name: format!("{op}_fp8_m{rows}"), pointers,
+                    scalar_kinds: vec![b'i'; scalars], scratch: [("scratch".into(), 1024)].into(),
+                    capacity_rows: rows as u32, geometry: json!({"fp8_weights":"only"}) };
+                validate_abi(op, rows, &spec)?;
+                spec.pointers.swap(1, 2);
+                assert!(validate_abi(op, rows, &spec).is_err(), "{op} rows={rows}: reordered native operands");
+                spec.pointers.swap(1, 2);
+                spec.scalar_kinds.push(b'i');
+                assert!(validate_abi(op, rows, &spec).is_err(), "{op} rows={rows}: wrong threshold scalar");
+            }
+        }
         Ok(())
     }
 

@@ -11,6 +11,9 @@ use cuteafd_loader::families::qwen3_5::Qwen35Checkpoint;
 pub(crate) struct GoldenArgs {
     #[arg(long)]
     pub snapshot: PathBuf,
+    /// Hugging Face identity for a snapshot outside the standard hub layout.
+    #[arg(long)]
+    pub model_id: Option<String>,
     #[arg(long, env = "CUTEAFD_NATIVE_LIB")]
     pub native_lib: Option<PathBuf>,
     #[arg(long, default_value = "/opt/cuteafd/share/PROGRAMS.json")]
@@ -51,7 +54,8 @@ pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
     ensure!((1..=4096).contains(&args.prefill_chunk), "prefill chunk must be 1..4096");
     ensure!(args.nll_tolerance.is_finite() && args.nll_tolerance >= 0.0, "invalid NLL tolerance");
     let golden = args.golden.as_ref().context("dense golden requires --golden reference directory")?;
-    let (directory, positions) = reference_window(golden, &args.window, &args.snapshot, cfg.vocab)?;
+    let reference = reference_snapshot(&args.snapshot, args.model_id.as_deref(), &cuteafd_bench::fidelity_match::hub())?;
+    let (directory, positions) = reference_window(golden, &args.window, &args.snapshot, &reference, cfg.vocab)?;
     let token_bytes = std::fs::read(directory.join("tokens.bin"))?;
     ensure!(token_bytes.len() >= 8 && token_bytes.len() % 4 == 0, "invalid reference token payload");
     let tokens: Vec<_> = token_bytes.chunks_exact(4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).collect();
@@ -105,7 +109,30 @@ pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
     Ok(())
 }
 
-fn reference_window(root: &std::path::Path, window: &str, snapshot: &std::path::Path, vocab: usize)
+fn reference_snapshot(snapshot: &std::path::Path, model: Option<&str>, hub: &std::path::Path) -> Result<PathBuf> {
+    use cuteafd_bench::fidelity_match;
+    let inferred = snapshot.ancestors().find_map(|path| {
+        let name = path.file_name()?.to_str()?.strip_prefix("models--")?;
+        let (organization, model) = name.split_once("--")?;
+        Some(format!("{organization}/{model}"))
+    });
+    ensure!(model.zip(inferred.as_deref()).is_none_or(|(given, inferred)| given == inferred),
+        "dense golden model identity disagrees with snapshot repository");
+    let model = model.or(inferred.as_deref()).context("dense golden requires --model-id outside an HF snapshot repository")?;
+    let resolution = fidelity_match::resolve_in(model, Some(snapshot), hub)?;
+    ensure!(matches!(resolution.reference_root.as_str(), "Qwen/Qwen3.5-9B" | "Qwen/Qwen3.8-27B"),
+        "dense reference resolves to an unsupported official root");
+    let root = if resolution.reference_root == model { snapshot.to_owned() } else {
+        fidelity_match::local_snapshot(hub, &resolution.reference_root)
+            .context("mapped highest-precision reference snapshot is not available locally")?
+    };
+    tracing::info!(model, reference_root = resolution.reference_root, reference_match = resolution.reference_match,
+        "dense golden resolved official fidelity root");
+    Ok(root)
+}
+
+fn reference_window(root: &std::path::Path, window: &str, snapshot: &std::path::Path,
+    reference: &std::path::Path, vocab: usize)
     -> Result<(PathBuf, Option<Vec<usize>>)> {
     use sha2::{Digest, Sha256};
     let metadata: serde_json::Value = serde_json::from_slice(&std::fs::read(root.join("meta.json"))?)?;
@@ -115,9 +142,12 @@ fn reference_window(root: &std::path::Path, window: &str, snapshot: &std::path::
     let sealed = root.join("windows.json").is_file();
     let identity = if sealed { &metadata["snapshot_identity"] } else { &metadata };
     for (file, key) in [("config.json", "config_sha256"), ("tokenizer.json", "tokenizer_sha256")] {
-        let hash = format!("{:x}", Sha256::digest(std::fs::read(snapshot.join(file))?));
-        ensure!(identity[key].as_str() == Some(hash.as_str()), "dense reference {key} differs from checkpoint");
+        let hash = format!("{:x}", Sha256::digest(std::fs::read(reference.join(file))?));
+        ensure!(identity[key].as_str() == Some(hash.as_str()), "dense reference {key} differs from mapped official root");
     }
+    let tokenizer = format!("{:x}", Sha256::digest(std::fs::read(snapshot.join("tokenizer.json"))?));
+    ensure!(identity["tokenizer_sha256"].as_str() == Some(tokenizer.as_str()),
+        "dense reference tokenizer differs from target checkpoint");
     if !sealed { return Ok((root.to_owned(), None)); }
     ensure!(metadata["schema"] == "cuteafd.fidelity.golden/2"
         && metadata["prefix_qualification"]["passed"] == true, "unqualified fidelity golden");
@@ -234,18 +264,54 @@ mod tests {
         std::fs::write(root.path().join("windows.json"), br#"{"set_sha256":"panel"}"#)?;
         let write = |metadata: &serde_json::Value| std::fs::write(root.path().join("meta.json"), metadata.to_string());
         write(&metadata)?;
-        let (path, positions) = super::reference_window(root.path(), "a00", snapshot.path(), 2)?;
+        let (path, positions) = super::reference_window(root.path(), "a00", snapshot.path(), snapshot.path(), 2)?;
         assert_eq!(path, root.path().join("windows/a00"));
         assert_eq!(positions, Some(vec![64,65]));
-        assert!(super::reference_window(root.path(), "missing", snapshot.path(), 2).is_err());
-        assert!(super::reference_window(root.path(), "a00", snapshot.path(), 3).is_err());
+        assert!(super::reference_window(root.path(), "missing", snapshot.path(), snapshot.path(), 2).is_err());
+        assert!(super::reference_window(root.path(), "a00", snapshot.path(), snapshot.path(), 3).is_err());
         metadata["windows"][0]["path"] = json!("../escape");
         write(&metadata)?;
-        assert!(super::reference_window(root.path(), "a00", snapshot.path(), 2).is_err());
+        assert!(super::reference_window(root.path(), "a00", snapshot.path(), snapshot.path(), 2).is_err());
         metadata["windows"][0]["path"] = json!("windows/a00");
         metadata["snapshot_identity"]["config_sha256"] = json!("different");
         write(&metadata)?;
-        assert!(super::reference_window(root.path(), "a00", snapshot.path(), 2).is_err());
+        assert!(super::reference_window(root.path(), "a00", snapshot.path(), snapshot.path(), 2).is_err());
+        Ok(())
+    }
+    #[test]
+    fn quant_reference_uses_shared_ancestry_and_keeps_root_config_and_target_tokenizer_checks() -> anyhow::Result<()> {
+        use serde_json::json;
+        use sha2::{Digest, Sha256};
+        let hub = tempfile::tempdir()?;
+        let make = |model: &str, config: &str| -> anyhow::Result<std::path::PathBuf> {
+            let path = hub.path().join(format!("models--{}/snapshots/abcdef", model.replace('/', "--")));
+            std::fs::create_dir_all(&path)?;
+            std::fs::write(path.join("config.json"), config)?;
+            std::fs::write(path.join("tokenizer.json"), "{}")?;
+            Ok(path)
+        };
+        let official = make("Qwen/Qwen3.8-27B", "{}")?;
+        let quant = make("Qwen/Qwen3.8-27B-FP8", r#"{"quantization_config":{"quant_method":"fp8"}}"#)?;
+        assert_eq!(super::reference_snapshot(&quant, None, hub.path())?, official);
+        assert!(super::reference_snapshot(&quant, Some("Qwen/Qwen3.5-9B"), hub.path()).is_err());
+        let community = make("test/quant", "{}")?;
+        assert!(super::reference_snapshot(&community, None, hub.path()).is_err());
+        std::fs::write(community.join("README.md"), "---\nbase_model: Qwen/Qwen3.8-27B\nbase_model_relation: quantized\n---\n")?;
+        assert_eq!(super::reference_snapshot(&community, None, hub.path())?, official);
+        std::fs::write(community.join("README.md"), "---\nbase_model: Qwen/Qwen3.5-9B\nbase_model_relation: finetune\n---\n")?;
+        assert!(super::reference_snapshot(&community, None, hub.path()).is_err());
+        let golden = tempfile::tempdir()?;
+        let hash = format!("{:x}", Sha256::digest(b"{}"));
+        let metadata = json!({"family":"qwen3_5", "mtp":false,
+            "reference_sha256":"7788020ca357c6c8fb6e750fd847dd80ac77625902213b47f4949c8085344a58",
+            "config_sha256":hash,"tokenizer_sha256":hash});
+        std::fs::write(golden.path().join("meta.json"), metadata.to_string())?;
+        assert!(super::reference_window(golden.path(), "legacy", &quant, &official, 2).is_ok());
+        std::fs::write(official.join("config.json"), r#"{"changed":true}"#)?;
+        assert!(super::reference_window(golden.path(), "legacy", &quant, &official, 2).is_err());
+        std::fs::write(official.join("config.json"), "{}")?;
+        std::fs::write(quant.join("tokenizer.json"), r#"{"changed":true}"#)?;
+        assert!(super::reference_window(golden.path(), "legacy", &quant, &official, 2).is_err());
         Ok(())
     }
     #[test]

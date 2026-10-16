@@ -551,7 +551,7 @@ def qwen4_programs(g, decode_rows: int, prefill_rows: int, max_context: int):
 
 
 def qwen_dense_programs(g, decode_rows: int, prefill_rows: int, max_context: int, *, norm_dtype):
-    """Ordinary residual, dense BF16 FFN and unrestricted causal hybrid attention."""
+    """Ordinary residual, native checkpoint projections and unrestricted full attention."""
     from b12x.integration.cuteafd import qwen_dense as dense
 
     out = [
@@ -572,6 +572,16 @@ def qwen_dense_programs(g, decode_rows: int, prefill_rows: int, max_context: int
             (f"ffn_m{rows}", "ffn", {"max_rows": rows},
              lambda r=rows: dense.compile_qwen_dense_ffn_aot(g, max_rows=r)),
         ]
+        if g.name == "qwen38_27b":
+            from b12x.integration.cuteafd import qwen_dense_fp8 as native
+            for op, compile_fn in [
+                ("gdn", native.compile_qwen_dense_gdn_fp8_aot),
+                ("attn_producer", native.compile_qwen_dense_producer_fp8_aot),
+                ("attn_o", native.compile_qwen_dense_attn_o_fp8_aot),
+                ("ffn", native.compile_qwen_dense_ffn_fp8_aot),
+            ]:
+                out.append((f"{op}_fp8_m{rows}", op, {"max_rows": rows, "fp8_weights": "only"},
+                            lambda r=rows, fn=compile_fn: fn(g, max_rows=r)))
     return out
 
 

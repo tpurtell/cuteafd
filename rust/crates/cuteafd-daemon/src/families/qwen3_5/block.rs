@@ -56,7 +56,9 @@ pub(crate) struct Blocks<'p, 'a> {
 impl Blocks<'_, '_> {
     fn launch(&self, op: &str, capacity: Option<usize>, pointers: &[(&str, *mut c_void)], scalars: &[Scalar]) -> Result<()> {
         let prefix = self.admitted.prefix;
-        let name = match capacity { Some(rows) => format!("{prefix}_{op}_m{rows}"), None => format!("{prefix}_{op}") };
+        let quantized = self.admitted.format.fp8() && matches!(op, "gdn" | "attn_producer" | "attn_o" | "ffn");
+        let suffix = if quantized { "_fp8" } else { "" };
+        let name = match capacity { Some(rows) => format!("{prefix}_{op}{suffix}_m{rows}"), None => format!("{prefix}_{op}") };
         let names: Vec<_> = pointers.iter().map(|&(name, _)| name).collect();
         let values: Vec<_> = pointers.iter().map(|&(_, ptr)| ptr).collect();
         let program = self.programs.program(&name, &names)?;
@@ -106,11 +108,16 @@ impl Blocks<'_, '_> {
         match layer.attention {
             HybridAttention::Gdn => {
                 let [conv, state, replay] = self.bank.pools(home.gdn_ordinal.unwrap())?;
-                let mut pointers = vec![("x", p.norm.ptr), ("w_in", layer.ptr("w_in")?),
-                    ("conv_w", layer.ptr("conv_w")?), ("a_log", layer.ptr("a_log")?),
-                    ("dt_bias", layer.ptr("dt_bias")?), ("norm_w", layer.ptr("norm_w")?),
-                    ("w_out", layer.ptr("w_out")?), ("conv_state", conv), ("state", state),
-                    ("slots", p.slots.ptr), ("seq_first", p.seq_first.ptr), ("out", p.delta.ptr)];
+                let mut pointers = vec![("x", p.norm.ptr)];
+                if self.admitted.format.fp8() {
+                    for name in ["w_qkvz_fp8", "w_qkvz_scale", "w_ba"] { pointers.push((name, layer.ptr(name)?)); }
+                } else { pointers.push(("w_in", layer.ptr("w_in")?)); }
+                for name in ["conv_w", "a_log", "dt_bias", "norm_w"] { pointers.push((name, layer.ptr(name)?)); }
+                if self.admitted.format.fp8() {
+                    for name in ["w_out_fp8", "w_out_scale"] { pointers.push((name, layer.ptr(name)?)); }
+                } else { pointers.push(("w_out", layer.ptr("w_out")?)); }
+                pointers.extend([("conv_state", conv), ("state", state), ("slots", p.slots.ptr),
+                    ("seq_first", p.seq_first.ptr), ("out", p.delta.ptr)]);
                 let mut scalars = rows.to_vec();
                 if step.capacity == REPLAY_ROWS {
                     pointers.push(("replay", replay));
@@ -121,23 +128,41 @@ impl Blocks<'_, '_> {
             }
             HybridAttention::Full => {
                 let kv = kv.unwrap();
-                self.launch("attn_producer", Some(step.capacity), &[("x", p.norm.ptr),
-                    ("w_in", layer.ptr("w_in")?), ("q_norm", layer.ptr("q_norm")?),
-                    ("k_norm", layer.ptr("k_norm")?), ("rope_positions", p.rope_positions.ptr),
-                    ("kv_slots", p.kv_slots.ptr), ("kv_cache", kv.ptr), ("query", p.query.ptr),
-                    ("gate", p.gate.ptr), ("scratch", p.scratch.ptr)], &rows)?;
+                let mut pointers = vec![("x", p.norm.ptr)];
+                if self.admitted.format.fp8() {
+                    for name in ["w_in_fp8", "w_in_scale"] { pointers.push((name, layer.ptr(name)?)); }
+                } else { pointers.push(("w_in", layer.ptr("w_in")?)); }
+                pointers.extend([("q_norm", layer.ptr("q_norm")?), ("k_norm", layer.ptr("k_norm")?),
+                    ("rope_positions", p.rope_positions.ptr), ("kv_slots", p.kv_slots.ptr), ("kv_cache", kv.ptr),
+                    ("query", p.query.ptr), ("gate", p.gate.ptr), ("scratch", p.scratch.ptr)]);
+                self.launch("attn_producer", Some(step.capacity), &pointers, &rows)?;
                 self.launch("full_gqa", Some(step.capacity), &[("query", p.query.ptr), ("kv_cache", kv.ptr),
                     ("positions", p.positions.ptr), ("page_table", p.page_table.ptr),
                     ("out", p.attention.ptr), ("scratch", p.scratch.ptr)],
                     &[rows[0], Scalar::I32(i32::try_from(step.table_stride)?), Scalar::I32(i32::try_from(step.splits)?)])?;
-                self.launch("attn_o", Some(step.capacity), &[("attn", p.attention.ptr), ("gate", p.gate.ptr),
-                    ("w_o", layer.ptr("w_o")?), ("out", p.delta.ptr), ("scratch", p.scratch.ptr)], &rows)?;
+                let mut pointers = vec![("attn", p.attention.ptr), ("gate", p.gate.ptr)];
+                if self.admitted.format.fp8() {
+                    for name in ["w_o_fp8", "w_o_scale"] { pointers.push((name, layer.ptr(name)?)); }
+                } else { pointers.push(("w_o", layer.ptr("w_o")?)); }
+                pointers.extend([("out", p.delta.ptr), ("scratch", p.scratch.ptr)]);
+                let mut scalars = rows.to_vec();
+                if self.admitted.format.fp8() && step.capacity > REPLAY_ROWS { scalars.push(Scalar::I32(255)); }
+                self.launch("attn_o", Some(step.capacity), &pointers, &scalars)?;
             }
         }
         self.launch("add", None, &[("a", p.residual.ptr), ("b", p.delta.ptr), ("out", p.residual.ptr)], &rows)?;
         self.launch("norm", None, &[("x", p.residual.ptr), ("weight", layer.ptr("ffn.norm")?), ("out", p.norm.ptr)], &rows)?;
-        self.launch("ffn", Some(step.capacity), &[("x", p.norm.ptr), ("w_gate_up", layer.ptr("ffn.w_gate_up")?),
-            ("w_down", layer.ptr("ffn.w_down")?), ("out", p.delta.ptr), ("scratch", p.scratch.ptr)], &rows)?;
+        let mut pointers = vec![("x", p.norm.ptr)];
+        if self.admitted.format.fp8() {
+            for (name, operand) in [("w_gate_up_fp8", "ffn.w_gate_up_fp8"), ("w_gate_up_scale", "ffn.w_gate_up_scale"),
+                ("w_down_fp8", "ffn.w_down_fp8"), ("w_down_scale", "ffn.w_down_scale")] {
+                pointers.push((name, layer.ptr(operand)?));
+            }
+        } else {
+            pointers.extend([("w_gate_up", layer.ptr("ffn.w_gate_up")?), ("w_down", layer.ptr("ffn.w_down")?)]);
+        }
+        pointers.extend([("out", p.delta.ptr), ("scratch", p.scratch.ptr)]);
+        self.launch("ffn", Some(step.capacity), &pointers, &rows)?;
         self.launch("add", None, &[("a", p.residual.ptr), ("b", p.delta.ptr), ("out", p.residual.ptr)], &rows)
     }
 }
