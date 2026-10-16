@@ -5,7 +5,7 @@
 use crate::families::qwen4::Qwen4Attention;
 use crate::placement::*;
 use crate::serving_capacity::qwen_graphs::{qwen_admission, qwen_startup_graphs, QwenAdmissionInputs, QWEN_UNIT_ROWS};
-use cuteafd_core::memory_layout::{Basis, Category};
+use cuteafd_core::memory_layout::{Basis, Category, ItemLifetime};
 
 pub const DEFAULT_MARK_SLOTS: u64 = 18;
 pub const LAZY_GRAPH_BYTES: u64 = (1 << 30) / 2;
@@ -91,7 +91,10 @@ pub fn placement(inputs: &QwenInputs<'_>) -> anyhow::Result<Placement> {
     let Some((sequences, speculation)) = inputs.startup_graph_modes else {
         let mut result = solve(&request(inputs, LAZY_GRAPH_BYTES)?)?;
         for item in &mut result.items[0] {
-            if item.group == "startup graphs" { item.group = "graph growth".into(); }
+            if item.group == "startup graphs" {
+                item.group = "graph growth".into();
+                item.lifetime = ItemLifetime::PostReadyReserve;
+            }
         }
         return Ok(result);
     };
@@ -532,7 +535,12 @@ pub fn dual_placement(inputs: &QwenDualInputs<'_>) -> anyhow::Result<Placement> 
         let mut result = solve(&dual_request(inputs, [LAZY_GRAPH_BYTES; 2])?)?;
         check_dual_layer_owners(&owners(&result)?)?;
         for rank in &mut result.items {
-            for item in rank { if item.group == "startup graphs" { item.group = "graph growth".into(); } }
+            for item in rank {
+                if item.group == "startup graphs" {
+                    item.group = "graph growth".into();
+                    item.lifetime = ItemLifetime::PostReadyReserve;
+                }
+            }
         }
         return Ok(result);
     };
@@ -853,6 +861,12 @@ mod tests {
                 tp2_workspace: [128 << 20; 2], pending_code_bytes: [64 << 20; 2], mark_slots: 0,
                 max_context: 131072, requested_pool: None, spark_ranks: 0, onboard: Onboard::Auto,
                 startup_graph_modes: None };
+            let lazy = dual_placement(&inputs).unwrap();
+            for rank in &lazy.items {
+                let graph = rank.iter().find(|item| item.group == "graph growth").unwrap();
+                assert_eq!(graph.lifetime, ItemLifetime::PostReadyReserve);
+                assert_eq!(graph.bytes, LAZY_GRAPH_BYTES);
+            }
             let req = dual_request(&inputs, [256 << 20; 2]).unwrap();
             assert_eq!(req.movables.len(), usize::from(mtp));
             if mtp {
@@ -1015,6 +1029,10 @@ mod tests {
                 pending_code_bytes: 780_221_844, max_context: 131072, requested_pool: None,
                 spark_ranks: 0, startup_graph_modes: None,
             };
+            let lazy = placement(&inputs).unwrap();
+            let graph = lazy.items[0].iter().find(|item| item.group == "graph growth").unwrap();
+            assert_eq!(graph.lifetime, ItemLifetime::PostReadyReserve);
+            assert_eq!(graph.bytes, LAZY_GRAPH_BYTES);
             let req = request(&inputs, LAZY_GRAPH_BYTES).unwrap();
             let admission = qwen_admission(&inputs.admission).unwrap();
             assert_eq!(req.layers.iter().map(|l| l.kv_unit.unit_bytes_whole).sum::<u64>() + req.pool_overhead[0],

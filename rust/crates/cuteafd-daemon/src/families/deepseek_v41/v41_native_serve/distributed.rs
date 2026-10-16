@@ -41,6 +41,7 @@ pub(super) fn worker(mut args: crate::cli::NativeServeArgs, mut receive: mpsc::R
             .into_iter().collect::<Result<Vec<_>>>()?;
         tracing::info!(stage, occupied_bytes=?occupied, "dual RTX startup memory");
         cuteafd_ffi::memory_ledger::relabel_other(cuteafd_ffi::memory_ledger::intern(&format!("v41/{stage}")));
+        crate::shared::inventory::startup_probe(&lib, &[0, 1], &format!("v41/{stage}"))?;
         Ok(())
     };
     memory_checkpoint("CUDA contexts and peer access")?;
@@ -81,6 +82,7 @@ pub(super) fn worker(mut args: crate::cli::NativeServeArgs, mut receive: mpsc::R
         tracing::info!(per_gpu_per_lane_bytes=per_lane, capacity, "NVFP4 W4A4 TP2 expert workspace plan");
     }
     let mut exl3_modules = [None, None];
+    memory_checkpoint("before native preload")?;
     let inventory = crate::shared::inventory::RuntimeInventory::measure(&lib,&[0,1], |gpu| {
         admission::preload(&lib,capacity,2,catalog.nvfp4().is_some(),compressed)?;
         if compressed {
@@ -88,6 +90,7 @@ pub(super) fn worker(mut args: crate::cli::NativeServeArgs, mut receive: mpsc::R
         }
         Ok(())
     })?;
+    memory_checkpoint("after native preload")?;
     let [mut decode_modules, mut prefill_modules] = [0, 1].map(|_| [None, None]);
     for (rank, modules) in exl3_modules.into_iter().enumerate() {
         if let Some([decode, prefill]) = modules {
@@ -423,6 +426,7 @@ pub(super) fn worker(mut args: crate::cli::NativeServeArgs, mut receive: mpsc::R
     scheduler::publish_capacity(&requests, &prefixes);
     tracing::info!(elapsed_ms=started.elapsed().as_millis(), "dual RTX serving owners ready");
     vision.connect()?;
+    memory_checkpoint("ready")?;
     ready.take().context("startup readiness missing")?.send(Ok(vision.health_handle()))
         .map_err(|_| anyhow::anyhow!("API startup cancelled"))?;
     scheduler::serve(&lib, &args, &runtime, &mut receive, &mut pass, &mut second, &mut requests,

@@ -20,11 +20,13 @@ pub fn growth_demands(total: u64, ranks: usize, automatic: bool, gpu: u8) -> Vec
     let runtime = runtime_reserve(total, ranks, automatic);
     if runtime > 0 {
         demands.push(Demand::new(gpu, cuteafd_core::memory_layout::Category::Reserved,
-            "runtime growth", runtime, cuteafd_core::memory_layout::Basis::Calibrated));
+            "runtime growth", runtime, cuteafd_core::memory_layout::Basis::Calibrated)
+            .with_lifetime(ItemLifetime::PostReadyReserve));
     }
     if total <= 32 << 30 {
         demands.push(Demand::new(gpu, cuteafd_core::memory_layout::Category::Reserved,
-            "memory sample margin", 32 << 20, cuteafd_core::memory_layout::Basis::Calibrated));
+            "memory sample margin", 32 << 20, cuteafd_core::memory_layout::Basis::Calibrated)
+            .with_lifetime(ItemLifetime::PostReadyReserve));
     }
     demands
 }
@@ -621,6 +623,25 @@ pub fn drafter(inventory: &DraftInventory, ranks: usize) -> Result<Movable, Plac
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn growth_owners_are_post_ready_reserves_on_every_card_and_policy() {
+        for total in [32 << 30, 96 << 30] {
+            for ranks in [1, 2] {
+                for automatic in [false, true] {
+                    for gpu in 0..ranks {
+                        let demands = growth_demands(total, ranks, automatic, gpu as u8);
+                        assert!(demands.iter().all(|d| d.gpu == gpu as u8
+                            && d.lifetime == ItemLifetime::PostReadyReserve
+                            && d.item().lifetime == ItemLifetime::PostReadyReserve));
+                        assert_eq!(demands.iter().map(|d| d.bytes).sum::<u64>(),
+                            graph_reserve(total, ranks) + runtime_reserve(total, ranks, automatic)
+                                + if total <= 32 << 30 { 32 << 20 } else { 0 });
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn ced_ownership_and_tp2_loading_peak_are_preserved() {

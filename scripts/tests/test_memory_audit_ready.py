@@ -31,8 +31,8 @@ def write(tmp_path, items):
     return log, plan
 
 
-def item(category, group, mib):
-    return {"category": category, "group": group, "bytes": mib * MIB}
+def item(category, group, mib, lifetime="ready_resident"):
+    return {"category": category, "group": group, "bytes": mib * MIB, "lifetime": lifetime}
 
 
 def run(log, plan, strict=False, mapping="rtx0=0", tolerance=64.0):
@@ -54,7 +54,7 @@ def test_ready_ledger_takes_settled_tracked_bytes_and_untracked_at_ready(tmp_pat
 
 def test_ready_gate_ignores_growth_items_and_enforces_tolerance(tmp_path):
     fit = [item("weights", "w", 1000), item("kv", "records", 500), item("workspace", "steps", 300),
-           item("runtime", "context+modules", 200), item("runtime", "graph growth", 900)]
+           item("runtime", "context+modules", 200), item("runtime", "graph growth", 900, "post_ready_reserve")]
     log, plan = write(tmp_path, fit)
     assert run(log, plan) == 0
     log, plan = write(tmp_path, fit[:-1] + [item("kv", "state", 100)])
@@ -84,7 +84,7 @@ def tagged_ready():
 
 def test_strict_ready_uses_one_snapshot_not_later_tracked_allocations(tmp_path):
     fit = [item("weights", "w", 1000), item("kv", "records", 500),
-           item("runtime", "context+modules+graphs", 100), item("runtime", "graph growth", 900)]
+           item("runtime", "context+modules+graphs", 100), item("runtime", "graph growth", 900, "post_ready_reserve")]
     log, plan = write(tmp_path, fit)
     log.write_text(tagged_ready() + report(2900 * MIB, 1800 * MIB,
                                          {"weights": 1000 * MIB, "kv": 500 * MIB, "workspace": 300 * MIB}))
@@ -95,6 +95,38 @@ def test_strict_ready_uses_one_snapshot_not_later_tracked_allocations(tmp_path):
     plan.write_text(json.dumps({"memory_layout": {"devices": [{"kind": "rtx", "index": 0,
                            "items": fit[:-1] + [item("kv", "extra", 65)]}]}}))
     assert run(log, plan, strict=True) == 1
+
+
+def test_strict_ready_compares_only_structurally_resident_items(tmp_path, capsys):
+    fit = [item("runtime", "graph growth", 900, "post_ready_reserve"),
+           item("reserved", "runtime growth", 300, "post_ready_reserve"),
+           item("reserved", "memory sample margin", 32, "post_ready_reserve"),
+           item("runtime", "resident context", 100)]
+    log, plan = write(tmp_path, fit)
+    log.write_text(report(100 * MIB, 0, {}).replace('"stage": "coordinator"', '"stage": "ready"'))
+    assert run(log, plan, strict=True, tolerance=0) == 0
+    assert "planned 100 MiB, ledger 100 MiB" in capsys.readouterr().out
+    # Labels and categories never determine residency.
+    fit[-1]["group"] = "graph growth"
+    fit[0]["group"] = "ordinary runtime"
+    plan.write_text(json.dumps({"memory_layout": {"devices": [{"kind": "rtx", "index": 0, "items": fit}]}}))
+    assert run(log, plan, strict=True, tolerance=0) == 0
+    fit[-1]["bytes"] += MIB
+    plan.write_text(json.dumps({"memory_layout": {"devices": [{"kind": "rtx", "index": 0, "items": fit}]}}))
+    assert run(log, plan, strict=True, tolerance=0) == 1
+
+
+@pytest.mark.parametrize("strict", [False, True])
+@pytest.mark.parametrize("lifetime", [None, "growth", "", 1])
+def test_ready_gate_rejects_missing_or_invalid_lifetime(tmp_path, strict, lifetime):
+    resident = item("runtime", "context", 100)
+    if lifetime is None:
+        del resident["lifetime"]
+    else:
+        resident["lifetime"] = lifetime
+    log, plan = write(tmp_path, [resident])
+    log.write_text(tagged_ready())
+    assert run(log, plan, strict=strict) == 2
 
 
 def test_startup_plan_uses_serving_admission_and_rejects_missing_duplicate(tmp_path):

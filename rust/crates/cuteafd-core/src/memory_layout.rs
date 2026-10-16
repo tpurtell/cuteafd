@@ -115,6 +115,15 @@ pub enum Basis {
     Estimated,
 }
 
+/// Whether admission reserves bytes already resident when serving becomes ready.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ItemLifetime {
+    ReadyResident,
+    /// Lazy allocations or safety headroom; charged to admission, not ready residency.
+    PostReadyReserve,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Item {
     pub category: Category,
@@ -124,12 +133,16 @@ pub struct Item {
     pub format: String,
     pub bytes: u64,
     pub basis: Basis,
+    pub lifetime: ItemLifetime,
 }
 
 impl Item {
     pub fn new(category: Category, group: impl Into<String>, format: impl Into<String>, bytes: u64, basis: Basis) -> Self {
-        Self { category, group: group.into(), format: format.into(), bytes, basis }
+        Self { category, group: group.into(), format: format.into(), bytes, basis,
+            lifetime: ItemLifetime::ReadyResident }
     }
+
+    pub fn with_lifetime(self, lifetime: ItemLifetime) -> Self { Self { lifetime, ..self } }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -286,6 +299,18 @@ pub fn size_pool(free: &[i64], per_token: &[u64], unit_tokens: u64, target: u64)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn item_lifetime_is_explicit_and_survives_serialization() {
+        let resident = Item::new(Category::Runtime, "context", "", 100, Basis::Calibrated);
+        assert_eq!(resident.lifetime, ItemLifetime::ReadyResident);
+        for lifetime in [ItemLifetime::ReadyResident, ItemLifetime::PostReadyReserve] {
+            let item = resident.clone().with_lifetime(lifetime);
+            let encoded = serde_json::to_value(&item).unwrap();
+            assert_eq!(encoded["lifetime"], serde_json::to_value(lifetime).unwrap());
+            assert_eq!(serde_json::from_value::<Item>(encoded).unwrap(), item);
+        }
+    }
 
     #[test]
     fn scopes_map_onto_categories() {

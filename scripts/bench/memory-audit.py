@@ -141,7 +141,6 @@ def render(path, summary):
         print(f"DUAL device {dual['device']}: {dual['tensor']} resident as {', '.join(dual['formats'])}")
 
 
-GROWTH_GROUPS = {"graph growth"}
 READY = re.compile(r"API is ready|is ready listen=")
 
 
@@ -257,8 +256,22 @@ def ready_gate(args):
             raise ValueError("strict ready requires logs and distinct, present planner/device mappings")
         if strict and (not 0 <= args.tolerance_mib < float("inf")):
             raise ValueError("strict ready requires a finite nonnegative tolerance")
+        ready_items = {}
+        for planned in mapping:
+            if planned not in names:
+                continue
+            predicted, reserve = defaultdict(int), 0
+            for item in names[planned]["items"]:
+                lifetime = item.get("lifetime")
+                if lifetime == "post_ready_reserve":
+                    reserve += item["bytes"]
+                elif lifetime == "ready_resident":
+                    predicted[item["category"]] += item["bytes"]
+                else:
+                    raise ValueError(f"{planned} item {item.get('group')!r} has missing or invalid lifetime")
+            ready_items[planned] = predicted, reserve
     except ValueError as error:
-        print(f"invalid device mapping or tolerance: {error}", file=sys.stderr)
+        print(f"invalid ready comparison: {error}", file=sys.stderr)
         return 2
     worst = 0.0
     missing = False
@@ -275,18 +288,13 @@ def ready_gate(args):
                     print(f"{path}: no ready evidence for {planned} (ledger device {ledger_id})", file=sys.stderr)
                     missing = True
                 continue
-            predicted, growth = defaultdict(int), 0
-            for item in names[planned]["items"]:
-                if item["group"] in GROWTH_GROUPS:
-                    growth += item["bytes"]
-                else:
-                    predicted[item["category"]] += item["bytes"]
+            predicted, reserve = ready_items[planned]
             measured = ledger[ledger_id]
             total_p, total_m = sum(predicted.values()), sum(measured.values())
             diff = (total_p - total_m) / (1 << 20)
             worst = max(worst, abs(diff))
             print(f"== {path} {planned} (ledger device {ledger_id}) at ready: planned {total_p / (1 << 20):.0f} MiB, "
-                  f"ledger {total_m / (1 << 20):.0f} MiB, diff {diff:+.0f} MiB (growth items {growth / (1 << 20):.0f} MiB)")
+                  f"ledger {total_m / (1 << 20):.0f} MiB, diff {diff:+.0f} MiB (post-ready reserves {reserve / (1 << 20):.0f} MiB)")
             for cat in sorted(set(predicted) | set(measured)):
                 p_, m_ = predicted.get(cat, 0), measured.get(cat, 0)
                 print(f"   {cat:<12} {p_ / (1 << 20):9.0f} {m_ / (1 << 20):9.0f} {(p_ - m_) / (1 << 20):+8.0f}")
@@ -305,7 +313,7 @@ def main():
     parser.add_argument("--device-map", default="rtx0=0,rtx1=1",
                         help="planner device=ledger device pairs for the logs given (e.g. spark0=0)")
     parser.add_argument("--ready", action="store_true",
-                        help="placement gate: the ledger at ready vs the plan without its growth items; exit 1 when a "
+                        help="placement gate: the ledger at ready vs ready-resident plan items (explicit lifetime required); exit 1 when a "
                              "device differs by more than --tolerance-mib. Tracked bytes come from the last report (fixed-"
                              "size buffers some families allocate on their first request, e.g. prefill workspaces, count: "
                              "admission must have reserved them); untracked (context, modules, graphs) from the first "

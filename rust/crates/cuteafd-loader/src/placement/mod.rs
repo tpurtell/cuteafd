@@ -13,7 +13,7 @@
 //! mode set; hop receive buffers are fixed demands. Peer-accessible two-GPU
 //! builds use a contiguous TP2 expert prefix with no additional residual hop;
 //! TP1 arena-sharing movables retain a separate arena and workspace.
-use cuteafd_core::memory_layout::{Basis, Category, Item};
+use cuteafd_core::memory_layout::{Basis, Category, Item, ItemLifetime};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -314,11 +314,18 @@ pub struct Demand {
     pub group: String,
     pub bytes: u64,
     pub basis: Basis,
+    pub lifetime: ItemLifetime,
 }
 
 impl Demand {
     pub fn new(gpu: u8, category: Category, group: impl Into<String>, bytes: u64, basis: Basis) -> Self {
-        Self { gpu, category, group: group.into(), bytes, basis }
+        Self { gpu, category, group: group.into(), bytes, basis, lifetime: ItemLifetime::ReadyResident }
+    }
+
+    pub fn with_lifetime(self, lifetime: ItemLifetime) -> Self { Self { lifetime, ..self } }
+
+    pub fn item(&self) -> Item {
+        Item::new(self.category, self.group.clone(), "", self.bytes, self.basis).with_lifetime(self.lifetime)
     }
 
     /// This demand on `gpu`.

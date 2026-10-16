@@ -105,6 +105,30 @@ def test_family_launch_census_probe_reaches_coordinator_and_workers_only_when_as
             assert flag in line, (flag, line)
 
 
+def test_v41_native_census_probes_cover_all_card_sizes():
+    family = ROOT / 'rust/crates/cuteafd-daemon/src/families/deepseek_v41'
+    single = (family / 'v41_native_serve.rs').read_text()
+    admission = (family / 'v41_native_serve/admission.rs').read_text()
+    dual = (family / 'v41_native_serve/distributed.rs').read_text()
+    phase = admission.split('pub(super) fn startup_phase(', 1)[1].split('\n/// Startup admission', 1)[0]
+    assert phase.index('crate::shared::inventory::startup_probe(') < phase.index('if device_total <= 32usize << 30')
+    assert 'if small_card { admission::startup_phase(' not in single
+    for stage in ('context', 'before native preload', 'after native preload', 'startup',
+                  'workspace:backbone-lanes', 'weights:head', 'drafter', 'vision',
+                  'prefix-snapshots', 'kv', 'local-experts', 'ready'):
+        assert f'admission::startup_phase(&lib, "v41/{stage}", device_total)?;' in single
+    assert single.index('"v41/before native preload"') < single.index('RuntimeInventory::measure(')
+    assert single.index('RuntimeInventory::measure(') < single.index('"v41/after native preload"')
+    assert single.index('"v41/after native preload"') < single.index('admission::admit_startup(')
+    assert single.index('"v41/ready"') < single.index('.send(Ok(vision.health_handle()))')
+    checkpoint = dual.split('let memory_checkpoint = ', 1)[1].split('memory_checkpoint("CUDA contexts', 1)[0]
+    assert 'crate::shared::inventory::startup_probe(&lib, &[0, 1],' in checkpoint
+    assert dual.index('memory_checkpoint("before native preload")') < dual.index('RuntimeInventory::measure(')
+    assert dual.index('RuntimeInventory::measure(') < dual.index('memory_checkpoint("after native preload")')
+    assert dual.index('memory_checkpoint("after native preload")') < dual.index('BackboneLaneWeights::load_distributed')
+    assert dual.index('memory_checkpoint("ready")') < dual.index('.send(Ok(vision.health_handle()))')
+
+
 CAPTURE_PATH_CASES = r'''
 #include "graph_census_path.h"
 #include <cstdio>

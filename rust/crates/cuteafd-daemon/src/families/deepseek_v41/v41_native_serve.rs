@@ -309,6 +309,7 @@ fn worker(
     let lib = unsafe { NativeLibrary::load(&args.native_lib)? };
     let (_, device_total) = lib.cuda_memory_info()?;
     let small_card = device_total <= 32usize << 30;
+    admission::startup_phase(&lib, "v41/context", device_total)?;
     if small_card {
         let explicit = std::env::var("CUTEAFD_V41_FIXED_GRAPH_ROWS").ok();
         if let Some(shapes) = super::graph_policy::profile_fixed_shapes(device_total, explicit.as_deref())? {
@@ -358,6 +359,7 @@ fn worker(
     let local_exl3_directory = crate::families::deepseek_v41::v41_experts::exl3::aot_layout_directory(
         &args.native_lib, catalog.exl3().map(|m| m.decoder_tiers()).unwrap_or(&[]), "rtx-tp1");
     let mut exl3_modules = None;
+    admission::startup_phase(&lib, "v41/before native preload", device_total)?;
     let inventory = crate::shared::inventory::RuntimeInventory::measure(&lib, &[lib.cuda_get_device()?], |_| {
         admission::preload(&lib, capacity, 1, catalog.nvfp4().is_some(), catalog.exl3().is_some())?;
         if catalog.exl3().is_some() && args.rtx_expert_layers != admission::LocalLayers::Count(0) {
@@ -365,10 +367,11 @@ fn worker(
         }
         Ok(())
     })?;
+    admission::startup_phase(&lib, "v41/after native preload", device_total)?;
     admission::admit_startup(&lib, &catalog, &args)?;
     let start = Instant::now();
     cuteafd_ffi::memory_ledger::relabel_other("v41/startup");
-    if small_card { admission::startup_phase(&lib, "v41/startup", device_total)?; }
+    admission::startup_phase(&lib, "v41/startup", device_total)?;
     let weights = BackboneLaneWeights::load(
         &lib,
         &catalog,
@@ -396,7 +399,7 @@ fn worker(
     let embedding =
         TargetEmbeddingWave::new(&lib, &table, rows, TargetEmbeddingWave::device_bytes(rows)?)?;
     cuteafd_ffi::memory_ledger::relabel_other("v41/weights:backbone,cache-producers,index,embedding");
-    if small_card { admission::startup_phase(&lib, "v41/weights:backbone,cache-producers,index,embedding", device_total)?; }
+    admission::startup_phase(&lib, "v41/weights:backbone,cache-producers,index,embedding", device_total)?;
     let attention_plan = cuteafd_core::coordinator_programs::AttentionReductionPlan::new(
         cuteafd_core::V41_VERIFY_ROWS, args.dspark.then_some(usize::from(args.dspark_draft_limit)),
         args.attention_plan_rows)?;
@@ -416,7 +419,7 @@ fn worker(
         BackboneExecution::workspace_bytes(&lib, capacity)?,
     )?;
     cuteafd_ffi::memory_ledger::relabel_other("v41/workspace:backbone-lanes");
-    if small_card { admission::startup_phase(&lib, "v41/workspace:backbone-lanes", device_total)?; }
+    admission::startup_phase(&lib, "v41/workspace:backbone-lanes", device_total)?;
     let map = cuteafd_loader::EngramTokenMap::from_file(&&args.snapshot.join("tokenizer.json"))?;
     // Both Engram layers retain their staging leases until consumed. Reserve
     // both layers for both active lanes so the second lane can gather early.
@@ -433,7 +436,7 @@ fn worker(
     ];
     let upload = EngramDeviceRows::new(&lib, rows, EngramDeviceRows::device_bytes(rows)?)?;
     cuteafd_ffi::memory_ledger::relabel_other("v41/engram");
-    if small_card { admission::startup_phase(&lib, "v41/engram", device_total)?; }
+    admission::startup_phase(&lib, "v41/engram", device_total)?;
     let vocabulary = VocabularyHead::load(
         &lib,
         &catalog,
@@ -448,7 +451,7 @@ fn worker(
     )?;
     let head = head_weights.wave(&vocabulary, cuteafd_core::V41_VERIFY_ROWS, TargetHeadWave::device_bytes(cuteafd_core::V41_VERIFY_ROWS)?)?;
     cuteafd_ffi::memory_ledger::relabel_other("v41/weights:head");
-    if small_card { admission::startup_phase(&lib, "v41/weights:head", device_total)?; }
+    admission::startup_phase(&lib, "v41/weights:head", device_total)?;
     let mut pass = TargetPass::new(
         embedding,
         lane,
@@ -465,7 +468,7 @@ fn worker(
         Duration::from_secs(120),
     )?;
     cuteafd_ffi::memory_ledger::relabel_other("v41/workspace:target-pass");
-    if small_card { admission::startup_phase(&lib, "v41/workspace:target-pass", device_total)?; }
+    admission::startup_phase(&lib, "v41/workspace:target-pass", device_total)?;
     let protocol_v2_timing = protocol_v2_timing();
     // Every replicated layout reserves its exact physical rank plane count; the
     // legacy 4-rank forecast is no longer reused for six ranks.
@@ -473,7 +476,7 @@ fn worker(
     let roce = spark_transport(&args.peers, capacity, protocol_v2_timing, topology)?;
     let mut transport = NativeTp4Wave::new(&lib, roce, wave_bytes)?;
     cuteafd_ffi::memory_ledger::relabel_other("v41/transport");
-    if small_card { admission::startup_phase(&lib, "v41/transport", device_total)?; }
+    admission::startup_phase(&lib, "v41/transport", device_total)?;
     let mut prefill_pass = TargetPass::new(
         TargetEmbeddingWave::new(&lib, &table, rows, TargetEmbeddingWave::device_bytes(rows)?)?,
         BackboneLane::new(&weights, capacity, BackboneLane::workspace_bytes(&lib, capacity)?.into_iter().sum())?,
@@ -487,11 +490,11 @@ fn worker(
         Duration::from_secs(120),
     )?;
     cuteafd_ffi::memory_ledger::relabel_other("v41/workspace:prefill-pass");
-    if small_card { admission::startup_phase(&lib, "v41/workspace:prefill-pass", device_total)?; }
+    admission::startup_phase(&lib, "v41/workspace:prefill-pass", device_total)?;
     let prefill_roce = spark_transport(&args.peers, capacity, protocol_v2_timing, topology)?;
     let mut prefill_transport = NativeTp4Wave::new(&lib, prefill_roce, wave_bytes)?;
     cuteafd_ffi::memory_ledger::relabel_other("v41/transport");
-    if small_card { admission::startup_phase(&lib, "v41/transport", device_total)?; }
+    admission::startup_phase(&lib, "v41/transport", device_total)?;
     pass.install_attention_plan(attention_plan)?;
     prefill_pass.install_attention_plan(attention_plan)?;
     let exl3_tiers: &[usize] = catalog.exl3().map(|m| m.decoder_tiers()).unwrap_or(&[]);
@@ -522,7 +525,7 @@ fn worker(
     tracing::info!(plan_rows=attention_plan.rows(), capacity=attention_plan.capacity_rows(),
         "V4.1 fixed BF16 AOT compressed/native FP32 window attention plan");
     cuteafd_ffi::memory_ledger::relabel_other("v41/drafter");
-    if small_card { admission::startup_phase(&lib, "v41/drafter", device_total)?; }
+    admission::startup_phase(&lib, "v41/drafter", device_total)?;
     let vision_free_before = if small_card { lib.cuda_memory_info()?.0 } else { 0 };
     let dspark_bytes = draft_free_before.saturating_sub(vision_free_before);
     let mut vision = crate::families::deepseek_v41::v41_vision_encoder::Encoder::load(&args, &catalog)?;
@@ -531,7 +534,7 @@ fn worker(
     // allocations are counted before choosing KV capacity and local expert layers.
     ensure!(args.prefix_cache_entries <= 128, "invalid retained-turn limit");
     cuteafd_ffi::memory_ledger::relabel_other("v41/vision");
-    if small_card { admission::startup_phase(&lib, "v41/vision", device_total)?; }
+    admission::startup_phase(&lib, "v41/vision", device_total)?;
     let snapshot_slots = if args.prefix_cache_entries == 0 { 0 } else {
         (args.prefix_cache_entries as usize).checked_mul(2).and_then(|n| n.checked_add(2))
             .context("snapshot slot count overflow")?
@@ -542,7 +545,7 @@ fn worker(
     let snapshot_bytes = prefix::Arenas::device_bytes(snapshot_slots, draft.is_some());
     tracing::info!(snapshot_slots, snapshot_bytes, "snapshot arenas reserved before serving");
     cuteafd_ffi::memory_ledger::relabel_other("v41/prefix-snapshots");
-    if small_card { admission::startup_phase(&lib, "v41/prefix-snapshots", device_total)?; }
+    admission::startup_phase(&lib, "v41/prefix-snapshots", device_total)?;
     // Size after vision, both lanes, transports and optional draft allocations are live.
     let experts = if args.rtx_expert_layers == admission::LocalLayers::Count(0) { Vec::new() }
         else { admission::expert_demands(&lib, &catalog, aot_capacity, 1)? };
@@ -558,7 +561,7 @@ fn worker(
         "shared V4.1 cache and expert admission");
     let mut requests = Requests::new(&lib, pipeline, args.concurrency as usize, pool.pages, pool.cache_bytes[0])?;
     cuteafd_ffi::memory_ledger::relabel_other("v41/kv");
-    if small_card { admission::startup_phase(&lib, "v41/kv", device_total)?; }
+    admission::startup_phase(&lib, "v41/kv", device_total)?;
     requests.use_engine_pages()?;
     let mut local_layers = 0usize;
     // Published only on the single-RTX path; the 2-RTX distributed worker owns
@@ -566,7 +569,7 @@ fn worker(
     // launch unpublished, which the launcher treats as a failure.
     let mut placement_handoff: Option<PlacementHandoff<PlacementPlan>> = None;
     cuteafd_ffi::memory_ledger::relabel_other("v41/kv-prefix-install");
-    if small_card { admission::startup_phase(&lib, "v41/kv-prefix-install", device_total)?; }
+    admission::startup_phase(&lib, "v41/kv-prefix-install", device_total)?;
     if args.rtx_expert_layers != admission::LocalLayers::Count(0) {
         use crate::families::deepseek_v41::v41_experts::{ExpertLayer, ExpertWeights, local::LocalExpertWave};
         let local_started = Instant::now();
@@ -642,7 +645,7 @@ fn worker(
     let (free, total) = lib.cuda_memory_info()?;
     let occupied = total - free;
     cuteafd_ffi::memory_ledger::relabel_other("v41/local-experts");
-    if small_card { admission::startup_phase(&lib, "v41/local-experts", device_total)?; }
+    admission::startup_phase(&lib, "v41/local-experts", device_total)?;
     crate::shared::memory_report::release_load_staging(&lib);
     tracing::info!(rtx_layers=local_layers, first_remote_dispatch_layer=local_layers,
         remote_dispatch_layers=40-local_layers, spark_world=args.peers.len(),
@@ -656,6 +659,7 @@ fn worker(
     let prefixes = scheduler::prepare_prefix_cache(&lib, &args, &requests, prefix_arenas, draft.is_some())?;
     scheduler::publish_capacity(&requests, &prefixes);
     vision.connect()?;
+    admission::startup_phase(&lib, "v41/ready", device_total)?;
     ready
         .take()
         .context("startup readiness missing")?

@@ -344,8 +344,7 @@ impl ProgramSet {
     }
 }
 
-/// The planner item group of reserved bytes allocated only after ready (lazy
-/// graph captures, graph margins): outside the ready-ledger compare.
+/// Display group for graph reserves; ready comparison uses each item's lifetime.
 pub const GRAPH_GROWTH: &str = "graph growth";
 
 /// When an item exists relative to readiness.
@@ -474,20 +473,27 @@ impl GraphSet {
         self.bytes(rank) - self.at_ready(rank)
     }
 
-    /// The solver demand for this set on `rank` (Runtime "graphs"; growth sets
-    /// are labelled so the ledger compare can leave them out).
+    /// The solver demand for this set on `rank`; lazy budgets are post-ready reserves.
     pub fn demand(&self, rank: usize) -> super::Demand {
+        use cuteafd_core::memory_layout::ItemLifetime;
         let group = match self.lifetime { Lifetime::Startup => "graphs", Lifetime::Growth => "graph growth" };
         super::Demand::new(rank as u8, Category::Runtime, group, self.bytes(rank), Basis::Formula)
+            .with_lifetime(match self.lifetime {
+                Lifetime::Startup => ItemLifetime::ReadyResident,
+                Lifetime::Growth => ItemLifetime::PostReadyReserve,
+            })
     }
 
     /// The planner items for `rank`: the captured estimate at ready ("graphs")
     /// and the margin (or a lazy set's budget) as "graph growth".
     pub fn items(&self, rank: usize) -> Vec<cuteafd_core::memory_layout::Item> {
-        use cuteafd_core::memory_layout::Item;
+        use cuteafd_core::memory_layout::{Item, ItemLifetime};
         if rank >= self.ranks.len() { return Vec::new() }
-        [("graphs", self.at_ready(rank)), (GRAPH_GROWTH, self.growth(rank))].into_iter().filter(|(_, b)| *b > 0)
-            .map(|(group, bytes)| Item::new(Category::Runtime, group, "", bytes, Basis::Formula)).collect()
+        [("graphs", self.at_ready(rank), ItemLifetime::ReadyResident),
+            (GRAPH_GROWTH, self.growth(rank), ItemLifetime::PostReadyReserve)]
+            .into_iter().filter(|(_, bytes, _)| *bytes > 0)
+            .map(|(group, bytes, lifetime)| Item::new(Category::Runtime, group, "", bytes, Basis::Formula)
+                .with_lifetime(lifetime)).collect()
     }
 }
 
@@ -641,8 +647,13 @@ mod tests {
         assert_eq!(set.bytes(0), 1_855_979_664 + (256 << 20));
         assert_eq!(set.items(0).iter().map(|i| (i.group.as_str(), i.bytes)).collect::<Vec<_>>(),
             [("graphs", 1_855_979_664), ("graph growth", 256 << 20)]);
-        assert_eq!(set.demand(0).group, "graphs");
-        assert_eq!(GraphSet::budget(&[1 << 30]).demand(0).group, "graph growth");
+        use cuteafd_core::memory_layout::ItemLifetime::{PostReadyReserve, ReadyResident};
+        assert_eq!(set.items(0).iter().map(|i| i.lifetime).collect::<Vec<_>>(),
+            [ReadyResident, PostReadyReserve]);
+        assert_eq!((set.demand(0).group.as_str(), set.demand(0).lifetime), ("graphs", ReadyResident));
+        let lazy = GraphSet::budget(&[1 << 30]);
+        assert_eq!((lazy.demand(0).group.as_str(), lazy.demand(0).lifetime), ("graph growth", PostReadyReserve));
+        assert_eq!(lazy.items(0)[0].lifetime, PostReadyReserve);
     }
 
     #[test]

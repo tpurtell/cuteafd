@@ -373,8 +373,11 @@ pub fn request_for_working_set(i: &GlmfInputs<'_>, working: &GlmfWorkingSet) -> 
                 (g.persistent_unit_bytes + g.pool_metadata_unit_bytes
                     + g.glmf_pool_mark_backing_unit_bytes(i.pool_marks)) * cache::GLMF_POOL_MARK_RESERVED_UNITS, Basis::Formula));
         }
-        fixed.extend(i.graphs.items(rank).into_iter().map(|item|
-            GlmfBufferDemand::new(GlmfComponent::Always, gpu, item.category, &item.group, item.bytes, item.basis)));
+        fixed.extend(i.graphs.items(rank).into_iter().map(|item| GlmfBufferDemand {
+            component: GlmfComponent::Always,
+            demand: Demand::new(gpu, item.category, item.group, item.bytes, item.basis)
+                .with_lifetime(item.lifetime),
+        }));
         if ranks == 2 {
             fixed.push(GlmfBufferDemand::new(GlmfComponent::Always, gpu, Category::Transport, "peer exchange",
                 glmf_graphs::peer_exchange_bytes(working.prefill_lanes, i.prefill_rows.max(i.decode_rows),
@@ -909,6 +912,14 @@ mod tests {
                 }
                 assert_eq!(bytes(&p, "graphs"), admitted_graphs.at_ready(rank));
                 assert_eq!(bytes(&p, inventory::GRAPH_GROWTH), admitted_graphs.growth(rank));
+                for placed in [&p, &r] {
+                    for item in placed.items[rank].iter().filter(|item|
+                        item.group == "graphs" || item.group == inventory::GRAPH_GROWTH) {
+                        assert_eq!(item.lifetime, if item.group == "graphs" {
+                            cuteafd_core::memory_layout::ItemLifetime::ReadyResident
+                        } else { cuteafd_core::memory_layout::ItemLifetime::PostReadyReserve });
+                    }
+                }
                 let charged = |placed: &Placement| placed.items[rank].iter().map(|i| i.bytes).sum::<u64>();
                 let baseline = |input: &GlmfInputs<'_>| capacity - GpuBudget {
                     capacity_bytes: capacity, headroom_bytes: 0, baseline: input.gpus[rank].1 }.available();

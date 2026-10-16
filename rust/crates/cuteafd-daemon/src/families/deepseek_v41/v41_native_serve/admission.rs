@@ -34,6 +34,9 @@ pub(super) fn startup_phase(
     phase: &str,
     device_total: usize,
 ) -> Result<()> {
+    if std::env::var("CUTEAFD_STARTUP_MEMORY_PROBE").as_deref() == Ok("1") {
+        crate::shared::inventory::startup_probe(lib, &[lib.cuda_get_device()?], phase)?;
+    }
     if device_total <= 32usize << 30 {
         let (free, total) = lib.cuda_memory_info()?;
         let device = lib.cuda_get_device()?;

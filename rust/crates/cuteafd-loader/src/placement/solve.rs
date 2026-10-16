@@ -244,8 +244,7 @@ fn solve_once(request: &PlacementRequest, flips: &[(AttentionClass, AttentionPla
     let context = modes.contains(&LayerMode::ContextSplit);
     let context_demands = if context { request.context_buffers.demands()? } else { Vec::new() };
     for demand in request.fixed.iter().chain(&context_demands) {
-        charge(&mut items, &mut used, usize::from(demand.gpu),
-            Item::new(demand.category, demand.group.clone(), "", demand.bytes, demand.basis))?;
+        charge(&mut items, &mut used, usize::from(demand.gpu), demand.item())?;
     }
     let mut layer_weights = vec![0u64; gpus];
     let mut unit_bytes = request.pool_overhead.clone();
@@ -309,7 +308,7 @@ fn solve_once(request: &PlacementRequest, flips: &[(AttentionClass, AttentionPla
             }
             selected_fixed.extend(demands.iter().cloned());
             for demand in demands {
-                items[usize::from(demand.gpu)].push(Item::new(demand.category, demand.group, "", demand.bytes, demand.basis));
+                items[usize::from(demand.gpu)].push(demand.item());
             }
             movables.push((movable.id, gpu as u8));
             continue;

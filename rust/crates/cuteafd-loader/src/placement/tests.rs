@@ -1005,6 +1005,32 @@ fn group_bytes(p: &Placement, gpu: usize, group: &str) -> u64 {
 }
 
 #[test]
+fn fixed_and_conditional_lifetimes_survive_without_changing_admission() {
+    use cuteafd_core::memory_layout::ItemLifetime::{PostReadyReserve, ReadyResident};
+    let mut req = conditional_request();
+    req.movables[0].allowed = vec![1];
+    req.fixed.push(Demand::new(0, Category::Reserved, "fixed reserve", 20 * GIB, Basis::Formula));
+    let resident = solve(&req).unwrap();
+    req.fixed[0].lifetime = PostReadyReserve;
+    req.movables[0].conditional[0].demands[0].lifetime = PostReadyReserve;
+    let reserved = solve(&req).unwrap();
+    assert_eq!(reserved.pool_tokens, resident.pool_tokens);
+    assert!(reserved.pool_tokens < solve(&conditional_request()).unwrap().pool_tokens);
+    for (gpu, group, lifetime) in [(0, "fixed reserve", PostReadyReserve),
+            (0, "bridge", PostReadyReserve), (1, "controls", ReadyResident)] {
+        let item = reserved.items[gpu].iter().find(|i| i.group == group).unwrap();
+        assert_eq!(item.lifetime, lifetime);
+    }
+    let mut normalized = reserved;
+    for items in &mut normalized.items {
+        for item in items { item.lifetime = ReadyResident; }
+    }
+    assert_eq!(normalized, resident);
+    req.fixed[0].bytes = 45 * GIB;
+    assert!(matches!(solve(&req), Err(PlacementError::Mandatory { gpu: 0, .. })));
+}
+
+#[test]
 fn conditional_movable_charges_only_selected_home_and_all_affected_devices() {
     let mut req = conditional_request();
     req.movables[0].allowed = vec![0]; // Dormant GPU1 inventory is legal.
