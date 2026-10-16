@@ -9,6 +9,49 @@ use crate::placement::{Demand, ProgramSet};
 const BLAS: u64 = 4 << 20;
 const VOCAB: u64 = 129280;
 
+/// Sealed WIP artifacts sit beside the library; installed images keep their
+/// manifests in share/, including when the library is a host-ISA variant.
+pub fn native_manifest(library: &std::path::Path, name: &str) -> Result<Value> {
+    let directory = library.parent().context("V4.1 native library has no parent")?;
+    let candidates = [Some(directory.join(name)),
+        directory.parent().map(|root| root.join("share").join(name)),
+        directory.parent().and_then(std::path::Path::parent)
+            .map(|root| root.join("share").join(name))];
+    let path = candidates.into_iter().flatten().find(|path| path.is_file())
+        .with_context(|| format!("missing V4.1 native manifest {name} beside the library or in its image share directory"))?;
+    serde_json::from_slice(&std::fs::read(&path)
+        .with_context(|| format!("reading V4.1 native manifest {}", path.display()))?)
+        .with_context(|| format!("parsing V4.1 native manifest {}", path.display()))
+}
+
+/// Single-RTX cache execution retains a per-layer descriptor/destination table.
+/// Placed two-RTX producers use their own publication storage instead.
+pub fn window_batch_bytes(rows: u64) -> Result<u64> {
+    ensure!((1..=4096).contains(&rows), "invalid V4.1 window batch rows");
+    Ok(40 * (64 + rows * 8 + 16 * 16))
+}
+
+/// Coordinator-owned Spark wave planes. Pinned intake belongs to its own domain.
+pub fn transport_bytes(rows: u64, ranks: usize) -> Result<u64> {
+    ensure!((1..=4096).contains(&rows) && matches!(ranks, 2 | 3 | 4 | 6),
+        "invalid V4.1 transport geometry");
+    Ok(rows * (ranks as u64 * 5120 * 2 + 2 * 5120 * 2))
+}
+
+/// Full vocabulary packing peak above the pre-weight sample. The first lane's
+/// backbone/cache/index/embedding/Engram owners already exist; heads, taps,
+/// transports, the second lane, draft, vision and marks do not.
+pub fn vocabulary_load_phase(weights: &[Demand], target: &[Demand], packing: u64) -> Result<Demand> {
+    ensure!(weights.iter().chain(target).all(|d| d.gpu == 0),
+        "vocabulary startup phase requires the single-RTX owners");
+    let retained = weights.iter().filter(|d| !matches!(d.group.as_str(), "lm_head" | "norm"));
+    let lane = target.iter().filter(|d| d.group.starts_with("lane 0 ")
+        && !matches!(d.group.as_str(), "lane 0 target head" | "lane 0 target taps"));
+    let bytes = retained.chain(lane).try_fold(packing, |sum, d|
+        sum.checked_add(d.bytes).context("V4.1 vocabulary phase overflow"))?;
+    Ok(Demand::new(0, Category::Staging, "vocabulary packing", bytes, Basis::Formula))
+}
+
 pub struct NativePrograms<'a> {
     manifest: &'a Value,
     sms: u32,
@@ -58,9 +101,10 @@ impl<'a> NativePrograms<'a> {
     /// Target/prefill lanes, excluding conditional local expert/TP2 FFN arenas,
     /// weights, cache/prefix banks, vision, and decoder-owned Spark transports.
     /// Both physical lanes remain allocated even at concurrency one.
-    pub fn target(&self, rows: u64, ranks: usize, fp8_head: bool) -> Result<Vec<Demand>> {
-        ensure!((1..=4096).contains(&rows) && matches!(ranks, 1 | 2),
-            "invalid V4.1 target owner geometry");
+    pub fn target(&self, rows: u64, ranks: usize, fp8_head: bool,
+        window_batch: bool) -> Result<Vec<Demand>> {
+        ensure!((1..=4096).contains(&rows) && matches!(ranks, 1 | 2)
+            && (!window_batch || ranks == 1), "invalid V4.1 target owner geometry");
         let mut out = Vec::new();
         for rank in 0..ranks {
             for lane in 0..2 {
@@ -82,6 +126,9 @@ impl<'a> NativePrograms<'a> {
                 add(&mut out, "cache producers", window * if ranks == 1 { 40 } else { 20 }
                     + if rank == 0 { 3 * compressor(true) } else { 0 }
                     + if rank == ranks - 1 { compressor(false) } else { 0 });
+                if window_batch {
+                    add(&mut out, "window batch table", window_batch_bytes(rows)?);
+                }
                 let index_rows = if ranks == 2 && rank == 1 && lane == 1 { 80 } else { rows };
                 let index_query = BLAS + self.scratch(index_rows, 1280, 4096)? + 4 + index_rows * 23560;
                 let topk = 16384u64.div_ceil(2 * 512) * 512 * 8 * 2;
@@ -202,12 +249,55 @@ mod tests {
     }
 
     #[test]
+    fn vocabulary_phase_charges_only_the_first_lanes_live_owners() -> Result<()> {
+        let demand = |group: &str, bytes| Demand::new(0, Category::Workspace, group, bytes, Basis::Formula);
+        let weights = vec![demand("attention", 100), demand("engram-projections", 20),
+            demand("embedding", 50), demand("lm_head", 300), demand("norm", 10)];
+        let target = vec![demand("lane 0 backbone", 40), demand("lane 0 engram", 30),
+            demand("lane 0 window batch table", 5), demand("lane 0 target head", 60),
+            demand("lane 0 target taps", 70), demand("lane 1 backbone", 80)];
+        let phase = vocabulary_load_phase(&weights, &target, 400)?;
+        assert_eq!(phase.bytes, 400 + 100 + 20 + 50 + 40 + 30 + 5);
+        assert_eq!(phase.category, Category::Staging);
+        assert!(vocabulary_load_phase(&[demand("attention", u64::MAX)], &target, 400).is_err());
+        assert!(vocabulary_load_phase(&[demand("attention", 1).on(1)], &target, 400).is_err());
+        for ranks in [2, 3, 4, 6] {
+            assert_eq!(transport_bytes(1024, ranks)?, 1024 * (ranks as u64 + 2) * 10240);
+        }
+        assert!(transport_bytes(0, 4).is_err());
+        assert!(transport_bytes(4097, 4).is_err());
+        assert!(transport_bytes(1024, 5).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn native_manifest_uses_the_matching_artifact_layout_and_refuses_bad_json() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let lib = root.path().join("lib");
+        let share = root.path().join("share");
+        let variant = lib.join("x86-64-v4");
+        std::fs::create_dir_all(&variant)?;
+        std::fs::create_dir(&share)?;
+        let name = "V41_FP8_AOT.json";
+        assert!(native_manifest(&lib.join("native.so"), name).is_err());
+        std::fs::write(share.join(name), br#"{"source":"installed"}"#)?;
+        for directory in [&lib, &variant] {
+            assert_eq!(native_manifest(&directory.join("native.so"), name)?["source"], "installed");
+        }
+        std::fs::write(lib.join(name), br#"{"source":"sealed"}"#)?;
+        assert_eq!(native_manifest(&lib.join("native.so"), name)?["source"], "sealed");
+        std::fs::write(lib.join(name), b"invalid")?;
+        assert!(native_manifest(&lib.join("native.so"), name).is_err());
+        Ok(())
+    }
+
+    #[test]
     fn target_retains_two_lanes_and_the_decoder_replay_extent() -> Result<()> {
         let manifest = manifest();
         let programs = NativePrograms::new(&manifest, 188)?;
         for ranks in [1, 2] {
-            let narrow = programs.target(256, ranks, false)?;
-            let wide = programs.target(1024, ranks, false)?;
+            let narrow = programs.target(256, ranks, false, ranks == 1)?;
+            let wide = programs.target(1024, ranks, false, ranks == 1)?;
             for rank in 0..ranks as u8 {
                 assert_eq!(owner(&narrow, rank, "lane 0 target head"),
                     owner(&wide, rank, "lane 1 target head"));
@@ -225,7 +315,7 @@ mod tests {
             }
             assert!(wide.iter().all(|d| d.category == Category::Workspace));
             assert!(!wide.iter().any(|d| d.gpu != 0 && d.group.ends_with("engram")));
-            let fp8 = programs.target(1024, ranks, true)?;
+            let fp8 = programs.target(1024, ranks, true, ranks == 1)?;
             for rank in 0..ranks as u8 {
                 for lane in 0..2 {
                     let group = format!("lane {lane} target head");
@@ -233,9 +323,19 @@ mod tests {
                 }
             }
         }
-        assert!(programs.target(0, 1, true).is_err());
-        assert!(programs.target(4097, 2, true).is_err());
-        assert!(programs.target(256, 3, true).is_err());
+        assert!(programs.target(0, 1, true, false).is_err());
+        assert!(programs.target(4097, 2, true, false).is_err());
+        assert!(programs.target(256, 3, true, false).is_err());
+        assert!(programs.target(256, 2, true, true).is_err());
+        let off = programs.target(1024, 1, false, false)?;
+        let on = programs.target(1024, 1, false, true)?;
+        assert_eq!(on.iter().map(|d| d.bytes).sum::<u64>()
+            - off.iter().map(|d| d.bytes).sum::<u64>(), 2 * 340480);
+        for rows in [1, 80, 256, 1024, 4096] {
+            assert_eq!(window_batch_bytes(rows)?, 40 * (320 + 8 * rows));
+        }
+        assert!(window_batch_bytes(0).is_err());
+        assert!(window_batch_bytes(4097).is_err());
         Ok(())
     }
 

@@ -32,7 +32,7 @@ pub(super) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
             crate::placement::PoolPolicy::resolve(&options.rtx_bytes, context, None, 256, true).target));
         match apply(input, &reserved, &mut media, rows, concurrency, context, mtp, manifest) {
             Ok(_) => {
-                resolve_encoder(checkpoint, report, model, &mut media, &mut [], &[0; 2], options, &mut notes);
+                resolve_encoder(report, &qwen_towers(report), &mut media, &mut [], &[0; 2], options, &mut notes);
                 for (device, admitted) in devices.iter_mut().zip(media) {
                     device.items.extend(admitted.items.into_iter().filter(|item|
                         item.group.starts_with("vision") || item.group.starts_with("audio")));

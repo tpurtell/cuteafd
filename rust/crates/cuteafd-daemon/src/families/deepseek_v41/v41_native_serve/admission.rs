@@ -61,164 +61,69 @@ pub(super) fn admit_startup(
     let (_, total) = lib.cuda_memory_info()?;
     let capacity = cuteafd_core::coordinator_programs::v41_live_rows(args.prefill_batch_tokens)
         .context("invalid V4.1 prefill batch")?;
-    let rows = capacity as usize;
-    let head_rows = cuteafd_core::V41_VERIFY_ROWS;
-    let mut owners: Vec<(&str, usize)> = vec![
-        (
-            "backbone weights/load bound",
-            BackboneLaneWeights::device_bytes(lib, catalog)?,
-        ),
-        (
-            "cache producer weights",
-            CacheProducerWeights::device_bytes(lib, catalog)?,
-        ),
-        (
-            "index weights",
-            IndexLaneWeights::device_bytes(lib, catalog)?,
-        ),
-        (
-            "embedding",
-            if embedding_placement(args.embedding_placement, total)
-                == crate::shared::memory::EmbedPlacement::Gpu
-            {
-                NativeRtxTensors::plan(catalog, &["embed.weight".into()])?
-            } else {
-                0
-            },
-        ),
-        (
-            "vocabulary resident",
-            VocabularyHead::resident_bytes(catalog)?,
-        ),
-        ("head weights", TargetHeadWeights::device_bytes(catalog)?),
-        (
-            "engram weights",
-            EngramLayerWeights::device_bytes(lib, catalog, 0)?
-                + EngramLayerWeights::device_bytes(lib, catalog, 1)?,
-        ),
-        (
-            "vision",
-            if local_vision_owner(
-                cuteafd_api::openai::vision_input_enabled(),
-                args.vision_peers.is_some(),
-            ) {
-                crate::families::deepseek_v41::v41_vision::VisionRuntime::device_bytes(
-                    catalog, 9216,
-                )?
-            } else {
-                0
-            },
-        ),
-    ];
-    let weight_bytes = owners.iter().take(4).try_fold(0usize, |n, (_, b)| {
-        n.checked_add(*b).context("startup weights overflow")
-    })?;
-    let engram_bytes = owners
-        .iter()
-        .find(|(name, _)| *name == "engram weights")
-        .unwrap()
-        .1;
-    let vocabulary_peak = VocabularyHead::plan(catalog)?;
-    let lane = [
-        TargetEmbeddingWave::device_bytes(rows)?,
-        BackboneLane::workspace_bytes(lib, capacity)?
-            .into_iter()
-            .sum(),
-        IndexLane::workspace_bytes(lib, capacity)?.into_iter().sum(),
-        BackboneExecution::workspace_bytes(lib, capacity)?,
-        EngramDeviceRows::device_bytes(rows)?,
-        EngramGate::device_bytes(lib, rows)? * 2,
-        TargetHeadWave::device_bytes(head_rows)?,
-        crate::families::deepseek_v41::v41_target_pass::TargetTapWave::device_bytes(rows)?,
-    ]
-    .into_iter()
-    .try_fold(0usize, |n, b| {
-        n.checked_add(b).context("target lane admission overflow")
-    })?;
-    let mut loading_peaks = vec![(
-        "vocabulary packing",
-        weight_bytes
-            .checked_add(engram_bytes)
-            .and_then(|n| n.checked_add(lane))
-            .and_then(|n| n.checked_add(vocabulary_peak))
-            .context("vocabulary phase overflow")?,
-    )];
-    owners.push((
-        "target/prefill lanes",
-        lane.checked_mul(2).context("lane admission overflow")?,
-    ));
-    if crate::families::deepseek_v41::v41_tensors::fp8_head()
-        == crate::families::deepseek_v41::v41_tensors::Fp8Head::All
-    {
-        owners.push((
-            "target vocabulary FP8 scratch",
-            lib.fp8_w8a16_workspace(head_rows, 5120, 129280)?
-                .max(256)
-                .checked_mul(2)
-                .context("target FP8 scratch overflow")?,
-        ));
+    use cuteafd_core::memory_layout::{Basis, Category};
+    use families::deepseek_v41::{owners, resident};
+    let config = serde_json::from_slice(&std::fs::read(catalog.snapshot().join("config.json"))?)?;
+    let retained = resident::resident_headers(&config,
+        catalog.tensors().iter().map(|tensor| &tensor.metadata), 1, false)
+        .context("unsupported V4.1 native backbone residency")?;
+    let weights = retained.into_iter().next().unwrap().into_iter()
+        .filter(|item| item.category != Category::Embedding
+            || embedding_placement(args.embedding_placement, total)
+                == crate::shared::memory::EmbedPlacement::Gpu)
+        .map(|item| Demand::new(0, item.category, item.group, item.bytes, item.basis))
+        .collect::<Vec<_>>();
+    let manifest = owners::native_manifest(&args.native_lib, "V41_FP8_AOT.json")?;
+    let programs = owners::NativePrograms::new(&manifest, u32::try_from(lib.sm_count()?)?)?;
+    let mut target = programs.target(u64::from(capacity), 1,
+        crate::families::deepseek_v41::v41_tensors::fp8_head()
+            == crate::families::deepseek_v41::v41_tensors::Fp8Head::All,
+        BackboneExecution::window_batch_enabled())?;
+    // Test builds retain the materialized query reference buffer; production
+    // intentionally has no such owner.
+    #[cfg(test)]
+    for lane in 0..2 {
+        target.push(Demand::new(0, Category::Workspace,
+            format!("lane {lane} test query reference"), u64::from(capacity) * 65536, Basis::Formula));
     }
-    owners.push((
-        "target/prefill transports",
-        NativeTp4Wave::device_bytes_for(capacity, args.peers.len())?
-            .checked_mul(2)
-            .context("transport admission overflow")?,
-    ));
-    if args.dspark {
+    let mut startup = vec![owners::vocabulary_load_phase(&weights, &target,
+        VocabularyHead::plan(catalog)? as u64)?];
+    let mut fixed_demands = weights;
+    fixed_demands.append(&mut target);
+    fixed_demands.push(Demand::new(0, Category::Transport, "target/prefill transports",
+        2 * owners::transport_bytes(u64::from(capacity), args.peers.len())?, Basis::Formula));
+    ensure!(args.prefix_cache_entries <= 128, "invalid retained-turn limit");
+    let draft = if args.dspark {
         let tiers = catalog.exl3().map(|m| m.decoder_tiers()).unwrap_or(&[]);
         let directory = crate::families::deepseek_v41::v41_experts::exl3::aot_layout_directory(
-            &args.native_lib,
-            tiers,
-            "dspark",
-        );
+            &args.native_lib, tiers, "dspark");
         let (weights, runtime, staging) =
             crate::families::deepseek_v41::v41_experts::dspark::DsparkWeights::serving_bytes(
-                lib,
-                catalog,
-                capacity,
-                args.concurrency,
-                if args.dspark_draft_limit > 5 { 7 } else { 5 },
-                Some(&directory),
-            )?;
-        // Expert staging drains before auxiliary tensors and serving waves are allocated.
-        let before_draft = owners
-            .iter()
-            .filter(|(name, _)| *name != "vision")
-            .try_fold(0usize, |n, (_, b)| {
-                n.checked_add(*b).context("pre-draft owners overflow")
-            })?;
-        loading_peaks.push((
-            "dSpark loading",
-            before_draft
-                .checked_add(weights)
-                .and_then(|n| n.checked_add(staging))
-                .context("dSpark phase overflow")?,
-        ));
-        owners.extend([
-            ("dSpark weights", weights),
-            ("dSpark lanes/windows", runtime),
-        ]);
+                lib, catalog, capacity, args.concurrency,
+                if args.dspark_draft_limit > 5 { 7 } else { 5 }, Some(&directory))?;
+        let before_draft = fixed_demands.iter().try_fold(0u64, |n, d|
+            n.checked_add(d.bytes).context("pre-draft owners overflow"))?;
+        startup.push(Demand::new(0, Category::Staging, "dSpark loading",
+            before_draft.checked_add(weights as u64).and_then(|n| n.checked_add(staging as u64))
+                .context("dSpark phase overflow")?, Basis::Formula));
+        let prefixes = resident::prefix_bytes(u64::from(args.prefix_cache_entries), true, 1)[0]
+            - resident::prefix_bytes(u64::from(args.prefix_cache_entries), false, 1)[0];
+        Some(families::deepseek_v41::DraftInventory {
+            resident: weights as u64,
+            runtime: vec![Demand::new(0, Category::Drafter, "dSpark lanes/windows",
+                runtime as u64, Basis::Exact)],
+            marks: prefixes, peer_half: 0, staging: [staging as u64, 0],
+        })
+    } else { None };
+    if local_vision_owner(cuteafd_api::openai::vision_input_enabled(), args.vision_peers.is_some()) {
+        fixed_demands.push(Demand::new(0, Category::Workspace, "vision weights/scratch",
+            crate::families::deepseek_v41::v41_vision::VisionRuntime::device_bytes(catalog, 9216)? as u64,
+            Basis::Formula));
     }
-    ensure!(
-        args.prefix_cache_entries <= 128,
-        "invalid retained-turn limit"
-    );
-    let snapshot_slots = if args.prefix_cache_entries == 0 {
-        0
-    } else {
-        2 * args.prefix_cache_entries as usize + 2
-    };
-    let snapshots = snapshot_slots
-        * (crate::families::deepseek_v41::v41_backbone_cache::BackboneMark::BYTES
-            + if args.dspark { 3 * 128 * 528 } else { 0 });
-    owners.push(("snapshot arenas", snapshots));
-    let fixed = owners.iter().try_fold(0usize, |n, (_, b)| {
-        n.checked_add(*b).context("startup fixed-owner overflow")
-    })?;
-    let peak = startup_peak(fixed, &loading_peaks)?;
-    // Geometry queries initialize native modules; sample their real CUDA cost
-    // now, before reading weights, rather than using a card/driver constant.
-    let (free, total) = measured_pool_memory(lib)?;
+    fixed_demands.push(Demand::new(0, Category::Prefix, "target snapshot arenas",
+        resident::prefix_bytes(u64::from(args.prefix_cache_entries), false, 1)[0], Basis::Formula));
+    let fixed = fixed_demands.iter().try_fold(0u64, |n, d|
+        n.checked_add(d.bytes).context("startup fixed-owner overflow"))?;
     let expert_rows = cuteafd_core::coordinator_programs::v41_aot_rows(capacity)
         .context("invalid local expert capacity")?;
     let experts = if args.rtx_expert_layers == LocalLayers::Count(0) {
@@ -227,17 +132,15 @@ pub(super) fn admit_startup(
         expert_demands(lib, catalog, expert_rows, 1)?
     };
     let workspace = local_workspace(lib, catalog, args, expert_rows)?;
-    let fixed_demands = owners.iter().map(|(name, bytes)| Demand::new(0,
-        cuteafd_core::memory_layout::Category::Workspace, *name, *bytes as u64,
-        cuteafd_core::memory_layout::Basis::Formula)).collect::<Vec<_>>();
-    let startup = loading_peaks.iter().map(|(name, bytes)| Demand::new(0,
-        cuteafd_core::memory_layout::Category::Staging, *name, *bytes as u64,
-        cuteafd_core::memory_layout::Basis::Formula)).collect::<Vec<_>>();
+    // Native geometry queries may initialize modules. Observe that CUDA cost
+    // only after every query, still before payloads or retained device owners.
+    let (free, total) = measured_pool_memory(lib)?;
     let pool = resolve_with_owners(args, &[(free, total)], experts, workspace, &[0], 0,
-        &fixed_demands, &startup, None)
-        .with_context(|| format!("V4.1 startup refused before weights: fixed-owner bound {fixed}, owners {owners:?}; use --prefill-batch-tokens 256 or increase coordinator memory"))?;
-    tracing::info!(fixed_owner_bound_bytes=fixed, startup_peak_bound_bytes=peak, loading_phases=?loading_peaks, owners=?owners, admitted_cache_bytes=?pool.cache_bytes,
-        "V4.1 complete startup admission before weight loads");
+        &fixed_demands, &startup, draft.as_ref())
+        .with_context(|| format!("V4.1 startup refused before weights: fixed owners {fixed}; reduce the prefill batch or increase coordinator memory"))?;
+    tracing::info!(fixed_owner_bytes=fixed, loading_phases=?startup, owners=?fixed_demands,
+        draft=?draft, admitted_cache_bytes=?pool.cache_bytes,
+        "V4.1 allocation-owner startup admission before weight loads");
     Ok(())
 }
 

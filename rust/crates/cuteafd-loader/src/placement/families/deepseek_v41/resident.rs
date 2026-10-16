@@ -55,7 +55,8 @@ pub fn resident_headers<'a>(config: &serde_json::Value,
             let name = &t.name;
             let backbone_expert = name.starts_with("layers.") && name.contains(".ffn.experts.")
                 || name.starts_with("model.layers.") && name.contains(".mlp.experts.");
-            !backbone_expert && !name.contains(".engram.embed.")
+            !backbone_expert && (dspark || !name.starts_with("mtp."))
+                && !name.contains(".engram.embed.")
                 && (name.ends_with("weight_scale_2") || name.contains(".qweight") || name.ends_with(".trellis"))
         }) {
         return None;
@@ -207,6 +208,7 @@ mod tests {
             "mtp.0.attn.wq_a.trellis"] {
             let checkpoint = checkpoint(vec![tensor(name, DType::U8, &[64], 64)]);
             assert!(resident_weights(&checkpoint, 1, true).is_none(), "{name}");
+            assert_eq!(resident_weights(&checkpoint, 1, false).is_some(), name.starts_with("mtp."), "{name}");
         }
     }
 

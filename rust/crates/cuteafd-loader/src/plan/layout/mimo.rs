@@ -41,6 +41,7 @@ pub(super) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
     // Media sees fixed target/pool demands and mandatory experts, not the
     // optional Auto prefix. Spark-free admission must reserve every expert.
     if report.encoder.is_none() {
+        let towers = mimo_towers(report, checkpoint, model.spec().hidden as u64);
         let mut media_options = options.clone();
         if spark_ranks > 0 && options.onboard.unwrap_or_else(|| options.local_expert_layers
             .map(crate::placement::Onboard::Layers).unwrap_or(crate::placement::Onboard::Auto))
@@ -57,7 +58,7 @@ pub(super) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
                 if let Err(error) = spark_experts(input, options, &mut sparks, placement.onboard_layers) {
                     report.placement_supported = false; notes.push(format!("MiMo Spark slices: {error:#}"));
                 }
-                resolve_encoder(checkpoint, report, model, &mut admission, &mut sparks,
+                resolve_encoder(report, &towers, &mut admission, &mut sparks,
                     &vec![0; ranks], options, &mut notes);
                 for (device, admitted) in devices.iter_mut().zip(admission) {
                     device.items.extend(admitted.items.into_iter().filter(|item|
@@ -78,7 +79,7 @@ pub(super) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
                         device.capacity_bytes, Basis::Formula));
                 }
                 let _ = spark_experts(input, options, &mut sparks, 0);
-                resolve_encoder(checkpoint, report, model, &mut admission, &mut sparks,
+                resolve_encoder(report, &towers, &mut admission, &mut sparks,
                     &vec![0; ranks], options, &mut notes);
                 for spark in &mut sparks { spark.items.retain(|item| item.group != "routed_expert"); }
             }

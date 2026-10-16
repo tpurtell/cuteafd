@@ -239,7 +239,7 @@ pub(super) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
                     u32::try_from(options.spark_capacity_rows)
                         .map_err(|_| placement::PlacementError::Overflow("Spark capacity"))
                         .and_then(|capacity| charge_spark_io(&mut device, &working, geometry, capacity,
-                            checkpoint.spark_input_is_bf16(), spark_ring_geometry("glm5_flash", working.prefill_lanes),
+                            checkpoint.spark_input_is_bf16(), spark_ring_geometry(spark_endpoints("glm5_flash", working.prefill_lanes)),
                             gib(56) * options.spark_capacity_rows / 4096))
                 });
             if let Err(error) = io {
@@ -251,7 +251,7 @@ pub(super) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
     }
     // Media placement is still the shared planner path, outside the coordinator solver port.
     let mut sparks = devices.split_off(ranks);
-    resolve_encoder(checkpoint, report, model, &mut devices, &mut sparks, &vec![0; ranks], options, &mut notes);
+    resolve_encoder(report, &glm_flash_towers(report, checkpoint), &mut devices, &mut sparks, &vec![0; ranks], options, &mut notes);
     devices.extend(sparks);
     MemoryLayout { devices, pool_tokens: pool, waste, notes }
 }

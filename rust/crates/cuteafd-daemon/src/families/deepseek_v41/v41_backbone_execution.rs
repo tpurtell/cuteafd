@@ -392,6 +392,9 @@ impl Drop for PendingProduction<'_, '_, '_> {
     }
 }
 impl<'w, 'a> BackboneExecution<'w, 'a> {
+    pub fn window_batch_enabled() -> bool {
+        std::env::var("CUTEAFD_WINDOW_BATCH").map_or(true, |v| v != "0")
+    }
     pub fn workspace_bytes(library: &NativeLibrary, capacity: u32) -> Result<usize> {
         let mut total = WindowWave::device_bytes(library, capacity)?
             .checked_mul(40)
@@ -400,6 +403,10 @@ impl<'w, 'a> BackboneExecution<'w, 'a> {
             total = total
                 .checked_add(CompressorWave::device_bytes(layer, capacity as usize)?)
                 .context("source workspace budget overflow")?;
+        }
+        if Self::window_batch_enabled() {
+            total = total.checked_add(WindowBatch::bytes(capacity as usize))
+                .context("window batch table budget overflow")?;
         }
         Ok(total)
     }
@@ -438,7 +445,7 @@ impl<'w, 'a> BackboneExecution<'w, 'a> {
                 )
             })
             .collect::<Result<Vec<_>>>()?;
-        let window_batch = std::env::var("CUTEAFD_WINDOW_BATCH").map_or(true, |v| v != "0")
+        let window_batch = Self::window_batch_enabled()
             .then(|| WindowBatch::new(weights.library, capacity as usize)).transpose()?;
         Ok(Self {
             weights,
@@ -773,6 +780,14 @@ mod tests {
         }
         for capacity in [0, 4097, u32::MAX] {
             assert!(BackboneExecution::workspace_bytes(&library, capacity).is_err());
+        }
+        Ok(())
+    }
+    #[test]
+    fn window_batch_inventory_matches_device_descriptor_storage() -> Result<()> {
+        for rows in [1, 80, 256, 1024, 4096] {
+            assert_eq!(WindowBatch::bytes(rows) as u64,
+                cuteafd_loader::placement::families::deepseek_v41::owners::window_batch_bytes(rows as u64)?);
         }
         Ok(())
     }
