@@ -130,6 +130,9 @@ pub struct Entry {
     /// A `spec_lossless_set` case file (absolute, or relative to --repo); default: the shipped set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lossless_set: Option<String>,
+    /// Opt-in full-vocabulary row dumps for selected lossless cases (needs PROBE_DUMP_ROOT).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lossless_dump: Option<crate::panels::lossless::RowDump>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_lengths: Option<Vec<u64>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -256,6 +259,7 @@ impl Entry {
             baseline: self.baseline.or(defaults.baseline),
             window: self.window.clone().or_else(|| defaults.window.clone()),
             lossless_set: self.lossless_set.clone().or_else(|| defaults.lossless_set.clone()),
+            lossless_dump: self.lossless_dump.clone().or_else(|| defaults.lossless_dump.clone()),
             context_lengths: self.context_lengths.clone().or_else(|| defaults.context_lengths.clone()),
             context_levels: self.context_levels.clone().or_else(|| defaults.context_levels.clone()),
         }
@@ -718,8 +722,11 @@ pub fn run(args: SmokeArgs) -> Result<()> {
         if entry.window.is_some() && entry.levels.is_none() && entry.prefill_lengths.is_none() {
             bail!("{}: window needs levels or prefill_lengths (it frames the sweep's timed requests)", entry.name);
         }
-        if let Some(path) = &entry.lossless_set {
-            crate::panels::lossless::CaseSet::load(&args.repo.join(path)).with_context(|| format!("{}: lossless_set", entry.name))?;
+        let set = entry.lossless_set.as_ref().map(|path| crate::panels::lossless::CaseSet::load(&args.repo.join(path))
+            .with_context(|| format!("{}: lossless_set", entry.name))).transpose()?;
+        if let Some(dump) = &entry.lossless_dump {
+            dump.validate(&set.unwrap_or_else(crate::panels::lossless::CaseSet::default_set))
+                .map_err(|e| anyhow::anyhow!("{}: lossless_dump: {e}", entry.name))?;
         }
         let defaults = crate::panels::context_load::Options::default();
         crate::panels::context_load::Options {
@@ -739,10 +746,10 @@ pub fn run(args: SmokeArgs) -> Result<()> {
     eprintln!("{} entries, {} to run, build {build}, up to {} at once", entries.len(), pending.len(), args.parallel);
     if args.dry_run {
         for e in &pending {
-            eprintln!("  {} family={} gpus={:?} sparks={:?} locks={:?} levels={:?} post_load_c1={} post_load_repeat={} prefill_lengths={:?} baseline={} window={} lossless_set={} context_lengths={:?} context_levels={:?} fabric={} set={:?}",
+            eprintln!("  {} family={} gpus={:?} sparks={:?} locks={:?} levels={:?} post_load_c1={} post_load_repeat={} prefill_lengths={:?} baseline={} window={} lossless_set={} lossless_dump={:?} context_lengths={:?} context_levels={:?} fabric={} set={:?}",
                 e.name, e.family.as_deref().unwrap_or("?"), e.gpus, e.sparks, locks_for(e), e.levels,
                 e.post_load_c1.unwrap_or(false), e.post_load_repeat.unwrap_or(false), e.prefill_lengths, e.baseline.unwrap_or(true), e.window.is_some(),
-                e.lossless_set.as_deref().unwrap_or("default"), e.context_lengths, e.context_levels, e.fabric.unwrap_or(true), e.set);
+                e.lossless_set.as_deref().unwrap_or("default"), e.lossless_dump, e.context_lengths, e.context_levels, e.fabric.unwrap_or(true), e.set);
         }
         return Ok(());
     }
@@ -1046,7 +1053,7 @@ fn run_entry(entry: &Entry, repo: &Path, out_root: &Path, configs: &Path, logs: 
             api_key: api_key.clone(), quiet: true,
             deadline: Some(Duration::from_secs(entry.run_timeout_s.unwrap_or(900))),
             lossless_set: entry.lossless_set.as_ref().map(|p| crate::panels::lossless::CaseSet::load(&repo.join(p)))
-                .transpose()?, context_lengths: entry.context_lengths.clone(), context_levels: entry.context_levels.clone() };
+                .transpose()?, lossless_dump: entry.lossless_dump.clone(), context_lengths: entry.context_lengths.clone(), context_levels: entry.context_levels.clone() };
         let (mut report, dir) = crate::cli::run(&options)?;
         // Publication markers are runner metadata, not serving defaults. This
         // also works against images built before these markers existed.

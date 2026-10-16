@@ -63,6 +63,10 @@ pub struct ProbeSpec {
     /// are rejected rather than overwritten. No dump is written when absent.
     #[serde(default)]
     pub dump_rows: Option<PathBuf>,
+    /// With `dump_rows`: dump only the rows predicting generated tokens `[start, end]`
+    /// (inclusive offsets from the prompt end). Every row is still recorded and hashed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dump_window: Option<[usize; 2]>,
     /// Record (and dump) only the rows predicting these positions: a scorer whose reference
     /// holds a subsample of a window's rows. Absent, every row is recorded.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -371,7 +375,7 @@ impl Probe {
         let want = self.spec.want.get(&position).map(Vec::as_slice).unwrap_or(&[]);
         let softmax = LogSoftmax::new(logits);
         let row = summarize_with(position, logits, self.spec.top_k.max(1), want, &softmax);
-        if self.spec.dump_rows.is_some() {
+        if self.spec.dump_rows.is_some() && self.dumps(position) {
             let result = self.dump.lock().map_err(|_| "row dump lock poisoned".to_owned()).and_then(|mut dump| {
                 dump.as_mut().expect("dump configured").write(position, logits, &softmax).map_err(|e| e.to_string())
             });
@@ -385,6 +389,13 @@ impl Probe {
                 r.scored += 1;
             }
         });
+    }
+
+    /// Whether the row predicting `position` falls inside `dump_window` (always, without one).
+    fn dumps(&self, position: usize) -> bool {
+        let Some([start, end]) = self.spec.dump_window else { return true };
+        let prompt = self.record.lock().map(|r| r.prompt_ids.len()).unwrap_or(usize::MAX);
+        position.checked_sub(prompt).is_some_and(|offset| (start..=end).contains(&offset))
     }
 
     /// Records a generated token.

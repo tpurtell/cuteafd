@@ -1420,6 +1420,42 @@ def test_lossless_set_panel_and_file_reach_the_smoke_entry(entry, tmp_path, monk
         cards.main()
 
 
+def test_lossless_row_dumps_reach_the_smoke_entry_only_when_asked(entry, tmp_path, monkeypatch):
+    kit = _kit(tmp_path, entry)
+    argv = ['wip-cards', '--kit', str(kit), '--cards', 'v41-min', '--matrix', '--arm', 'a=b:s',
+            '--panels', 'spec_lossless_set', '--dry-run']
+    monkeypatch.setattr(sys, 'argv', argv + ['--state', str(tmp_path / 'plain')])
+    assert cards.main() == 0
+    job = next((tmp_path / 'plain').glob('*/matrix.json')).parent
+    plain = json.loads((job / 'matrix.json').read_text())['entries'][0]
+    assert 'lossless_dump' not in plain and 'PROBE_DUMP_ROOT' not in plain['set']
+    assert 'PROBE_DUMP_ROOT' not in (job / 'base.config').read_text() and not (job / 'lossless-rows').exists()
+    monkeypatch.setattr(sys, 'argv', argv + ['--state', str(tmp_path / 'dump'), '--dump-lossless-rows', 'code-2,code-5:70-90'])
+    assert cards.main() == 0
+    job = next((tmp_path / 'dump').glob('*/matrix.json')).parent
+    e = json.loads((job / 'matrix.json').read_text())['entries'][0]
+    assert e['lossless_dump'] == {'cases': ['code-2', 'code-5'], 'start': 70, 'end': 90}
+    assert e['set']['PROBE_DUMP_ROOT'] == str(job / 'lossless-rows') and (job / 'lossless-rows').is_dir()
+    # Apart from the dump itself, the entry is the plain one.
+    e.pop('lossless_dump')
+    assert {k for k in e if e[k] != plain[k]} <= {'set', 'config', 'prelaunch'}
+    e['set'].pop('PROBE_DUMP_ROOT')
+    assert {k for k in e['set'] if e['set'][k] != plain['set'][k]} == {'API_KEY_FILE'}
+    monkeypatch.setattr(sys, 'argv', ['wip-cards', '--kit', str(kit), '--cards', 'v41-min', '--matrix', '--arm', 'a=b:s',
+        '--state', str(tmp_path / 's2'), '--panels', 'baseline', '--dump-lossless-rows', 'code-2:1-2', '--dry-run'])
+    with pytest.raises(SystemExit):
+        cards.main()
+
+
+@pytest.mark.parametrize('text, message', [
+    ('code-2', 'expected CASE'), ('code-2:5', 'expected CASE'), ('code-2:9-3', 'window'), ('code-2:0-128', 'window'),
+    ('code-2,code-2:1-2', 'distinct'), ('nope:1-2', 'not in the lossless set: nope'),
+])
+def test_malformed_lossless_row_dumps_are_refused(text, message):
+    with pytest.raises(ValueError, match=message):
+        cards.parse_lossless_dump(text)
+
+
 @pytest.mark.parametrize('cases, message', [
     ([], '1 to 64 cases'),
     ({'id': 'a'}, '1 to 64 cases'),
@@ -1464,6 +1500,17 @@ def test_lossless_set_gate_fails_the_row_and_names_failing_cases(entry, tmp_path
     (report_dir / 'report.json').write_text(json.dumps(report))
     row = cards.summarize_job(job, 0)
     assert row['status'] == 'pass' and row['lossless_set']['status'] == 'pass'
+    assert 'row_dump' not in row['lossless_set']
+    panel['passes'][0]['row_dump'] = {'dir': '/d', 'manifest': '/d/manifest.json'}
+    (report_dir / 'report.json').write_text(json.dumps(report))
+    assert cards.summarize_job(job, 0)['lossless_set']['row_dump']['manifest'] == '/d/manifest.json'
+    # A requested dump the server never wrote fails the job instead of passing silently.
+    job['entry']['lossless_dump'] = {'cases': ['code-2'], 'start': 1, 'end': 2}
+    assert cards.summarize_job(job, 0)['status'] == 'pass'
+    del panel['passes'][0]['row_dump']
+    (report_dir / 'report.json').write_text(json.dumps(report))
+    row = cards.summarize_job(job, 0)
+    assert row['status'] == 'failed' and 'wrote no row dump' in row['error']
     # A panel that errored before any pass is a failure, not a silent skip.
     panel.update(status='failed', passes=[], error='drafts on: HTTP 500')
     (report_dir / 'report.json').write_text(json.dumps(report))
