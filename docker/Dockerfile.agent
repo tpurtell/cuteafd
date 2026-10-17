@@ -15,7 +15,7 @@ COPY scripts/build/verify-dsh-source.py scripts/build/verify-sparkinfer-source.p
 RUN python3 /opt/verify/verify-dsh-source.py --source /opt/dsh --lock /opt/source-lock.json \
  && python3 -c 'import json,os; lock=json.load(open("/opt/source-lock.json")); assert os.environ["DSH_SOURCE_COMMIT"] == lock["revision"]; assert os.environ["DSH_SOURCE_DIRTY"] == "false"'
 RUN DSH_CLIENT_COMMIT_HASH="$DSH_SOURCE_COMMIT" pnpm install --frozen-lockfile \
- && DSH_CLIENT_COMMIT_HASH="$DSH_SOURCE_COMMIT" pnpm run build --artifacts-only
+ && DSH_CLIENT_COMMIT_HASH="$DSH_SOURCE_COMMIT" pnpm run build --scope artifacts
 # Source-built helper carries its own Node runtime and private workers.
 RUN pnpm exec tsx scripts/build-exe-for-ssh-helper.ts --target node24-linux-x64 --output /opt/helpers/linux-x64 \
  && tar -xzf /opt/helpers/linux-x64/*.tar.gz -C /opt/helpers/linux-x64 \
