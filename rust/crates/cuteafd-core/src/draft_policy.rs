@@ -39,8 +39,8 @@
 use std::collections::{BTreeMap, VecDeque};
 #[path = "simple_draft.rs"]
 mod simple_draft;
-pub use simple_draft::{DraftMode, RowPrice, SimpleDecision, SimpleRound, SimpleSample, SIMPLE_THRESHOLD, THRESHOLD_CEILING,
-    THRESHOLD_FLOOR, WASTE_CEILING, WASTE_FLOOR};
+pub use simple_draft::{Cutoff, DraftMode, Reliability, SimpleDecision, SimpleRound, SimpleSelection, CUTOFF_CEILING,
+    CUTOFF_FLOOR, OFFSET_PRIOR, REPORT_GROUPS, SIMPLE_CUTOFF};
 use simple_draft::SimpleDraft;
 
 /// Committed tokens retained per request.
@@ -871,6 +871,7 @@ impl DraftPolicy {
             return Err(DraftPolicyError::Geometry("invalid native confidence extent or policy already observed"));
         }
         self.native_confidence_positions = positions;
+        if let Some(simple) = &mut self.simple { simple.set_native(positions.max(*self.geometry.widths.last().unwrap())); }
         Ok(())
     }
     /// Choose lengths by calibrated survival (draft while at least one half)
@@ -885,10 +886,21 @@ impl DraftPolicy {
     /// selection, width and action choice and calibration; the priced fits
     /// keep running for reports only.
     pub fn set_draft_mode(&mut self, mode: DraftMode) {
-        self.simple = (mode != DraftMode::Shared).then(|| SimpleDraft::new(mode, self.geometry.max_positions));
+        let native = self.native_confidence_positions.max(*self.geometry.widths.last().unwrap());
+        self.simple = (mode != DraftMode::Shared)
+            .then(|| SimpleDraft::new(mode, self.geometry.max_positions, native));
     }
     pub fn draft_mode(&self) -> DraftMode {
         self.simple.as_ref().map_or(DraftMode::Shared, SimpleDraft::mode)
+    }
+    /// The simple rule's per-position predicted against realized acceptance,
+    /// `[group][native, tail][position]` with groups [`REPORT_GROUPS`].
+    pub fn simple_reliability(&self) -> Option<&[[Vec<Reliability>; 2]; 4]> {
+        self.simple.as_ref().map(SimpleDraft::reliability)
+    }
+    /// The simple rule's cutoff now, for reports.
+    pub fn simple_cutoff(&self) -> Option<Cutoff> {
+        self.simple.as_ref().map(SimpleDraft::cutoff)
     }
     /// The simple rule's latest observed round (samples, costs, row price and
     /// the decisions behind it), for traces.
@@ -981,7 +993,7 @@ impl DraftPolicy {
     pub fn probabilities(&self, requests: usize, candidate: DraftCandidate<'_>) -> Vec<f64> {
         if let Some(simple) = &self.simple {
             let positions = candidate.confidence.len().min(self.geometry.max_positions);
-            return simple.probabilities(&candidate.confidence[..positions]);
+            return simple.probabilities(candidate.id, &candidate.confidence[..positions]);
         }
         let bucket = draft_concurrency_bucket(requests);
         candidate.confidence.iter().enumerate().take(self.geometry.max_positions)

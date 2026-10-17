@@ -543,7 +543,7 @@ pub(crate) fn publish(policy: &DraftPolicy, observed: u64, skipped: u64, ring: O
     let value = serde_json::json!({
         "mode": if policy.draft_mode() != cuteafd_core::DraftMode::Shared { policy.draft_mode().label() }
             else if policy.survival_lengths() { "survival" } else { "shared" },
-        "simple_calibration": policy.simple_calibration(),
+        "simple": binding::simple_reliability(policy),
         "concurrency_buckets": buckets,
         "warm": policy.warm(false, 1),
         "engaged": policy.engaged(false, 1),
@@ -810,12 +810,12 @@ mod tests {
             cuteafd_core::PolicySeed::weak(7), false).unwrap();
         policy.set_draft_mode(cuteafd_core::DraftMode::Simple);
         let low = [0.1; 7];
-        let high = [0.9, 0.9, 0.3, 0.9, 0.9, 0.9, 0.9];
+        let high = [0.9, 0.9, 0.9, 0.3, 0.9, 0.9, 0.9];
         let candidates = [Candidate { id: 1, prior: &low, limit: 7, selector: true, cold: true },
             Candidate { id: 2, prior: &high, limit: 7, selector: true, cold: false }];
         let selection = select(&mut policy, &candidates, 7, 64);
-        // No cold DFlash2 five-draft floor; the half rule stops at the first failure.
-        assert_eq!(selection.lengths, [0, 2]);
+        // No cold DFlash2 five-draft floor; joint acceptance 0.9, 0.81, 0.73, 0.22 passes three.
+        assert_eq!(selection.lengths, [0, 3]);
         assert_eq!(selection.predicted, None);
         // The pre-draft action always drafts while any request has room.
         assert!(choose_block(&mut policy, &[(1, 7), (2, 7)], 7, 2, 64, false).unwrap());

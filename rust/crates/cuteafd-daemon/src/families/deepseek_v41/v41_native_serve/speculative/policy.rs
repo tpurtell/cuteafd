@@ -182,7 +182,7 @@ pub(super) fn publish(policy: &DraftPolicy, draft_limit: usize) {
     let value = serde_json::json!({
         "mode": if policy.fixed() { "fixed" } else if policy.draft_mode() != cuteafd_core::DraftMode::Shared {
             policy.draft_mode().label() } else if policy.survival_lengths() { "survival" } else { "bandwidth" },
-        "simple_calibration": policy.simple_calibration(),
+        "simple": crate::shared::draft::binding::simple_reliability(policy),
         "draft_limit": draft_limit,
         "local_layers": local_layers(geometry),
         "remote_expert_bytes": remote_expert_bytes(geometry),

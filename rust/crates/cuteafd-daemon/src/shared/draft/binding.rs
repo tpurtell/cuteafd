@@ -142,39 +142,52 @@ pub(crate) fn observe(policy: &mut DraftPolicy, record: &RoundRecord<'_>) -> Res
     Ok(())
 }
 
-/// The simple rule's round: each request's cost sample, windowed cost per
-/// token, threshold and chosen width, with the row price behind them.
+/// The simple rule's round: the cutoff with its row price and token cost,
+/// each request's joint probabilities and chosen length, and what it accepted.
 fn trace_simple(policy: &DraftPolicy) {
     let Some(round) = policy.simple_round() else { return };
     if tracing::enabled!(target: "cuteafd::draft_policy", tracing::Level::DEBUG) {
+        let selection = round.selection.as_ref();
         tracing::debug!(target: "cuteafd::draft_policy", mode = policy.draft_mode().label(), total_us = round.total_us,
-            rows = round.rows, global_cost_us = round.global_cost_us, row_price_us = round.row_price.used,
-            chosen = ?round.requests.iter().map(|r| r.decision.as_ref().map(|d| d.chosen)).collect::<Vec<_>>(),
-            accepted = ?round.requests.iter().map(|r| r.accepted).collect::<Vec<_>>(),
-            cost_us = ?round.requests.iter().map(|r| r.cost_us).collect::<Vec<_>>(),
-            waste = ?round.requests.iter().map(|r| r.decision.as_ref().map(|d| d.waste)).collect::<Vec<_>>(),
-            threshold = ?round.requests.iter().map(|r| r.decision.as_ref().map(|d| d.threshold)).collect::<Vec<_>>(),
-            "simple draft round");
+            rows = round.rows, accepted = round.accepted, cutoff = selection.map(|s| s.cutoff.value),
+            row_us = selection.and_then(|s| s.cutoff.row_us), token_us = selection.and_then(|s| s.cutoff.token_us),
+            chosen = ?selection.map(|s| s.requests.iter().map(|d| d.chosen).collect::<Vec<_>>()),
+            scarce = selection.map(|s| s.scarce), "simple draft round");
     }
     let Some(trace) = replay_trace() else { return };
     if let Err(error) = trace.write(&simple_trace_value(policy, round)) { tracing::warn!(%error, "simple draft trace failed"); }
 }
 
+fn cutoff_value(cutoff: &cuteafd_core::Cutoff) -> serde_json::Value {
+    serde_json::json!({"value": cutoff.value, "row_us": cutoff.row_us, "row_short_us": cutoff.row_short_us,
+        "row_pooled_us": cutoff.row_pooled_us, "token_us": cutoff.token_us, "fallback": cutoff.fallback})
+}
+
 fn simple_trace_value(policy: &DraftPolicy, round: &cuteafd_core::SimpleRound) -> serde_json::Value {
-    let price = |p: &cuteafd_core::RowPrice| serde_json::json!({"short_us": p.short, "pooled_us": p.pooled, "used_us": p.used});
     serde_json::json!({"type": "simple_draft_round", "round": policy.stats().rounds, "mode": policy.draft_mode().label(),
-        "total_us": round.total_us, "rows": round.rows, "global_cost_us": round.global_cost_us,
-        "row_price": price(&round.row_price),
-        "threshold_bounds": [cuteafd_core::THRESHOLD_FLOOR, cuteafd_core::THRESHOLD_CEILING],
-        "waste_bounds": [cuteafd_core::WASTE_FLOOR, cuteafd_core::WASTE_CEILING],
-        "requests": round.requests.iter().map(|r| serde_json::json!({"id": r.id, "rows": r.rows,
-            "accepted": r.accepted, "share_us": r.share_us, "sample_us": r.sample_us, "cost_us": r.cost_us,
-            "decision": r.decision.as_ref().map(|d| serde_json::json!({"cost_us": d.cost_us,
-                "batch_cost_us": d.batch_cost_us, "waste": d.waste, "base": d.base, "threshold": d.threshold,
-                "joint_rule": d.joint_rule, "conditional": d.conditional,
-                "joint": d.joint, "passing": d.passing, "chosen": d.chosen, "explore": d.explore,
-                "scarce": d.scarce, "budget": d.budget, "row_price": price(&d.row_price)}))
-        })).collect::<Vec<_>>()})
+        "total_us": round.total_us, "rows": round.rows, "accepted": round.accepted, "requests": round.requests,
+        "cutoff_bounds": [cuteafd_core::CUTOFF_FLOOR, cuteafd_core::CUTOFF_CEILING],
+        "after": cutoff_value(&round.after),
+        "selection": round.selection.as_ref().map(|s| serde_json::json!({"cutoff": cutoff_value(&s.cutoff),
+            "budget": s.budget, "scarce": s.scarce,
+            "requests": s.requests.iter().map(|d| serde_json::json!({"id": d.id, "offset": d.offset, "conditional": d.conditional,
+                "joint": d.joint, "passing": d.passing, "chosen": d.chosen, "explore": d.explore})).collect::<Vec<_>>()}))})
+}
+
+/// The simple rule's predicted against realized acceptance per position, by
+/// concurrency group and native head or copy tail, for `/v1/stats`.
+pub(crate) fn simple_reliability(policy: &DraftPolicy) -> serde_json::Value {
+    let Some(groups) = policy.simple_reliability() else { return serde_json::Value::Null };
+    let segment = |cells: &[cuteafd_core::Reliability]| cells.iter().enumerate().filter(|(_, c)| c.verified > 0)
+        .map(|(position, c)| serde_json::json!({"position": position + 1,
+            "reached": c.reached, "predicted_conditional": c.predicted_conditional / c.reached.max(1) as f64,
+            "realized_conditional": c.accepted as f64 / c.reached.max(1) as f64,
+            "verified": c.verified, "predicted_joint": c.predicted_joint / c.verified as f64,
+            "realized_joint": c.realized_joint as f64 / c.verified as f64})).collect::<Vec<_>>();
+    serde_json::json!({"cutoff": policy.simple_cutoff().as_ref().map(cutoff_value),
+        "calibration": policy.simple_calibration(),
+        "groups": cuteafd_core::REPORT_GROUPS.iter().zip(groups).map(|(label, [native, tail])| serde_json::json!({
+            "group": label, "native": segment(native), "tail": segment(tail)})).collect::<Vec<_>>()})
 }
 
 /// Opt-in complete observation capture, including dSpark head evidence. The
