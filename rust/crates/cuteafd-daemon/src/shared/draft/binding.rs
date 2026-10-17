@@ -159,7 +159,8 @@ fn trace_simple(policy: &DraftPolicy) {
 }
 
 fn cutoff_value(cutoff: &cuteafd_core::Cutoff) -> serde_json::Value {
-    serde_json::json!({"value": cutoff.value, "row_us": cutoff.row_us, "row_short_us": cutoff.row_short_us,
+    serde_json::json!({"value": cutoff.value, "raw": cutoff.raw, "clamped": cutoff.clamped,
+        "at_floor": cutoff.value == cuteafd_core::CUTOFF_FLOOR, "group": cutoff.group, "row_us": cutoff.row_us, "row_short_us": cutoff.row_short_us,
         "row_pooled_us": cutoff.row_pooled_us, "token_us": cutoff.token_us, "fallback": cutoff.fallback})
 }
 
@@ -184,7 +185,8 @@ pub(crate) fn simple_reliability(policy: &DraftPolicy) -> serde_json::Value {
             "realized_conditional": c.accepted as f64 / c.reached.max(1) as f64,
             "verified": c.verified, "predicted_joint": c.predicted_joint / c.verified as f64,
             "realized_joint": c.realized_joint as f64 / c.verified as f64})).collect::<Vec<_>>();
-    serde_json::json!({"cutoff": policy.simple_cutoff().as_ref().map(cutoff_value),
+    let cutoffs: Vec<_> = [1, 4, 8, 16].iter().map(|&requests| policy.simple_cutoff(requests).as_ref().map(cutoff_value)).collect();
+    serde_json::json!({"cutoff": cutoffs,
         "calibration": policy.simple_calibration(),
         "groups": cuteafd_core::REPORT_GROUPS.iter().zip(groups).map(|(label, [native, tail])| serde_json::json!({
             "group": label, "native": segment(native), "tail": segment(tail)})).collect::<Vec<_>>()})

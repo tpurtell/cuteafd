@@ -114,7 +114,7 @@ fn replay_simple_rules_against_recorded_choices() {
                 Some(policy) => {
                     let candidates: Vec<_> = ids.iter().zip(&raw).map(|(&id, c)| DraftCandidate { id, confidence: c }).collect();
                     let selection = policy.select_drafted_within(false, &candidates, native, max_rows, ids.len()).unwrap();
-                    if let Some(c) = policy.simple_cutoff() {
+                    if let Some(c) = policy.simple_cutoff(ids.len()) {
                         cutoffs[arm][g].push(c.value);
                         if let (Some(r), Some(t)) = (c.row_us, c.token_us) { row_token[arm][g].push((r, t)); }
                     }

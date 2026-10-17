@@ -16,9 +16,12 @@
 //! random request with room verify one position past its cutoff, so the
 //! calibration keeps seeing outcomes there.
 //!
-//! **Arms.** `simple`: cutoff 0.5. `simple-rc`: the derived cutoff alone, no
-//! offset and no exploration. `simple-derived`: the derived cutoff with the
-//! offset and exploration.
+//! **Arms.** `simple`: cutoff 0.5. `simple-rc`: `r / c` with `r` the pooled
+//! slope of round time on verified rows among rounds at the selection's exact
+//! request count (the nearest count with enough row variation when that one
+//! has too little), so a concurrency ramp cannot leak into the slope; no
+//! offset and no exploration. `simple-derived`: `r / c` with the
+//! short-window `r` shrunk to the pooled one, plus the offset and exploration.
 //!
 //! **Cutoff.** `simple`: 0.5. `simple-rc` and `simple-derived`: `r / c`, clamped to
 //! [[`CUTOFF_FLOOR`], [`CUTOFF_CEILING`]], where `r` is the marginal round
@@ -146,7 +149,14 @@ fn solve3(mut m: [[f64; 3]; 3], mut y: [f64; 3]) -> Option<[f64; 3]> {
 /// The cutoff of one selection and what it came from.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Cutoff {
+    /// What the rule compares `q` against (one half, or `r / c` clamped).
     pub value: f64,
+    /// `r / c` before the clamp, when both were known.
+    pub raw: Option<f64>,
+    /// `r / c` hit [`CUTOFF_FLOOR`] or [`CUTOFF_CEILING`].
+    pub clamped: bool,
+    /// Request count whose pooled `r` `simple-rc` used.
+    pub group: Option<usize>,
     /// Marginal µs per verified row: short window alone, pooled, and the
     /// short window shrunk to the pooled value (what the rule uses).
     pub row_short_us: Option<f64>,
@@ -235,6 +245,8 @@ pub(crate) struct SimpleDraft {
     native: usize,
     short: RoundFit,
     pooled: RoundFit,
+    /// Pooled fits per exact request count (`simple-rc`'s `r`), index `C - 1`.
+    by_requests: Vec<RoundFit>,
     rng: u64,
     pending: Option<SimpleSelection>,
     last: Option<SimpleRound>,
@@ -245,7 +257,7 @@ pub(crate) struct SimpleDraft {
 impl SimpleDraft {
     pub fn new(mode: DraftMode, positions: usize, native: usize) -> Self {
         Self { mode, outcomes: Default::default(), calibration: vec![Platt::new(); positions], native, short: RoundFit::default(),
-            pooled: RoundFit::default(), rng: 0x9e37_79b9_7f4a_7c15, pending: None, last: None,
+            pooled: RoundFit::default(), by_requests: Vec::new(), rng: 0x9e37_79b9_7f4a_7c15, pending: None, last: None,
             reliability: std::array::from_fn(|_| std::array::from_fn(|_| vec![Reliability::default(); positions])) }
     }
     pub fn mode(&self) -> DraftMode { self.mode }
@@ -273,17 +285,38 @@ impl SimpleDraft {
             .map(|p| if offset == 0. { p } else { sigmoid(logit(p.clamp(1e-6, 1. - 1e-6)) + offset) }).collect()
     }
     pub fn release(&mut self, id: u64) { self.outcomes.remove(&id); }
-    pub fn cutoff(&self) -> Cutoff {
+    /// The cutoff for a selection over `requests` requests.
+    pub fn cutoff(&self, requests: usize) -> Cutoff {
         let usable = |fit: &RoundFit| fit.row_variance() >= MIN_ROW_VARIANCE;
         let short = usable(&self.short).then(|| self.short.slope(0., 0.)).flatten();
-        let pooled = usable(&self.pooled).then(|| self.pooled.slope(0., 0.)).flatten();
-        let row_us = pooled.and_then(|pooled| self.short.slope(pooled, SLOPE_PRIOR)).map(|r| r.max(0.));
+        let (pooled_fit, group) = match self.mode {
+            DraftMode::SimpleRc => {
+                // The nearest request count with enough row variation, ties to the larger.
+                let nearest = (0..self.by_requests.len()).filter(|&i| usable(&self.by_requests[i]))
+                    .min_by_key(|&i| ((i + 1).abs_diff(requests), usize::MAX - i));
+                match nearest { Some(i) => (&self.by_requests[i], Some(i + 1)), None => (&self.pooled, None) }
+            }
+            _ => (&self.pooled, None),
+        };
+        let pooled = match self.mode {
+            DraftMode::SimpleRc => group.and_then(|_| pooled_fit.slope(0., 0.)),
+            _ => usable(pooled_fit).then(|| pooled_fit.slope(0., 0.)).flatten(),
+        };
+        let row_us = match self.mode {
+            DraftMode::SimpleRc => pooled,
+            _ => pooled.and_then(|pooled| self.short.slope(pooled, SLOPE_PRIOR)),
+        }.map(|r| r.max(0.));
         let token_us = self.short.cost_per_token();
-        let mut cutoff = Cutoff { value: SIMPLE_CUTOFF, row_short_us: short, row_pooled_us: pooled, row_us, token_us,
-            fallback: false };
+        let mut cutoff = Cutoff { value: SIMPLE_CUTOFF, raw: None, clamped: false, group, row_short_us: short,
+            row_pooled_us: pooled, row_us, token_us, fallback: false };
         if matches!(self.mode, DraftMode::SimpleRc | DraftMode::SimpleDerived) {
             match (row_us, token_us) {
-                (Some(r), Some(c)) if c > 0. => cutoff.value = (r / c).clamp(CUTOFF_FLOOR, CUTOFF_CEILING),
+                (Some(r), Some(c)) if c > 0. => {
+                    let raw = r / c;
+                    cutoff.raw = Some(raw);
+                    cutoff.value = raw.clamp(CUTOFF_FLOOR, CUTOFF_CEILING);
+                    cutoff.clamped = cutoff.value != raw;
+                }
                 _ => cutoff.fallback = true,
             }
         }
@@ -300,7 +333,7 @@ impl SimpleDraft {
 
     /// Lengths under `max_rows` verifier rows (anchors included).
     pub fn select(&mut self, candidates: &[DraftCandidate<'_>], max_rows: usize) -> DraftSelection {
-        let cutoff = self.cutoff();
+        let cutoff = self.cutoff(candidates.len());
         let mut decisions: Vec<SimpleDecision> = candidates.iter().map(|candidate| {
             let conditional = self.probabilities(candidate.id, candidate.confidence);
             let mut product = 1.;
@@ -373,9 +406,12 @@ impl SimpleDraft {
             let requests = round.requests.len() as f64;
             self.short.add(SHORT_DECAY, requests, rows as f64, round.total_us, accepted as f64);
             self.pooled.add(POOLED_DECAY, requests, rows as f64, round.total_us, accepted as f64);
+            let count = round.requests.len();
+            if self.by_requests.len() < count { self.by_requests.resize(count, RoundFit::default()); }
+            self.by_requests[count - 1].add(POOLED_DECAY, requests, rows as f64, round.total_us, accepted as f64);
         }
         self.last = Some(SimpleRound { total_us: round.total_us, rows, accepted, requests: round.requests.len(),
-            selection: self.pending.take(), after: self.cutoff() });
+            selection: self.pending.take(), after: self.cutoff(round.requests.len()) });
     }
 }
 
@@ -475,7 +511,7 @@ mod tests {
             let rows = (requests * per) as f64;
             observe(&mut policy, &observed, 5_000. + 1_000. * requests as f64 + 2_000. * rows);
         }
-        let cutoff = policy.cutoff();
+        let cutoff = policy.cutoff(1);
         assert!((cutoff.row_pooled_us.unwrap() - 2_000.).abs() < 5., "{cutoff:?}");
         assert!((cutoff.row_us.unwrap() - 2_000.).abs() < 5., "{cutoff:?}");
         let token = cutoff.token_us.unwrap();
@@ -499,8 +535,16 @@ mod tests {
             let observed = [ObservedDraftRequest { id: 1, rows: per, accepted: per, confidence: Some(&raw[..per - 1]) }];
             for policy in [&mut rc, &mut derived] { observe(policy, &observed, 5_000. + 2_000. * per as f64); }
         }
-        assert_eq!(rc.cutoff(), derived.cutoff());
-        assert!(!rc.cutoff().fallback);
+        // One concurrency group: the group's pooled r equals the pooled r.
+        let (a, b) = (rc.cutoff(1), derived.cutoff(1));
+        assert_eq!((a.row_pooled_us, a.token_us), (b.row_pooled_us, b.token_us));
+        assert_eq!(a.row_us, a.row_pooled_us);
+        assert_eq!(a.group, Some(1));
+        assert!(!a.fallback);
+        assert_eq!(a.raw.map(|raw| raw.clamp(CUTOFF_FLOOR, CUTOFF_CEILING)), Some(a.value));
+        // C16 borrows the nearest request count with row variation (C1 here).
+        assert_eq!(rc.cutoff(16).group, Some(1));
+        assert_eq!(rc.cutoff(16).row_us, a.row_us);
         assert_eq!(rc.offset(1), 0.);
         assert!(derived.offset(1) > 0.);
         let p = [0.9, 0.8, 0.8, 0.8, 0.5, 0.5, 0.5];
@@ -516,7 +560,7 @@ mod tests {
         let mut policy = SimpleDraft::new(DraftMode::SimpleDerived, 6, 5);
         let requests = [ObservedDraftRequest { id: 1, rows: 3, accepted: 2, confidence: None }];
         for _ in 0..30 { observe(&mut policy, &requests, 9_000.); }
-        let cutoff = policy.cutoff();
+        let cutoff = policy.cutoff(1);
         assert!(cutoff.fallback && cutoff.row_us.is_none());
         assert_eq!(cutoff.value, SIMPLE_CUTOFF);
         assert!((cutoff.token_us.unwrap() - 4_500.).abs() < 1e-6);

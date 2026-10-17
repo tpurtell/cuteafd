@@ -898,9 +898,9 @@ impl DraftPolicy {
     pub fn simple_reliability(&self) -> Option<&[[Vec<Reliability>; 2]; 4]> {
         self.simple.as_ref().map(SimpleDraft::reliability)
     }
-    /// The simple rule's cutoff now, for reports.
-    pub fn simple_cutoff(&self) -> Option<Cutoff> {
-        self.simple.as_ref().map(SimpleDraft::cutoff)
+    /// The simple rule's cutoff now for a selection over `requests`, for reports.
+    pub fn simple_cutoff(&self, requests: usize) -> Option<Cutoff> {
+        self.simple.as_ref().map(|simple| simple.cutoff(requests))
     }
     /// The simple rule's latest observed round (samples, costs, row price and
     /// the decisions behind it), for traces.
