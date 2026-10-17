@@ -443,8 +443,8 @@ esac
 # Experimental simple draft policy (cuteafd_core::DraftMode); forwarded only when set.
 case "$(get DRAFT_POLICY)" in
   "") ;;
-  shared|simple|simple-derived) trace_args+=(-e "CUTEAFD_DRAFT_POLICY=$(get DRAFT_POLICY)") ;;
-  *) echo "DRAFT_POLICY must be shared, simple or simple-derived" >&2; exit 2 ;;
+  shared|simple|simple-rc|simple-derived) trace_args+=(-e "CUTEAFD_DRAFT_POLICY=$(get DRAFT_POLICY)") ;;
+  *) echo "DRAFT_POLICY must be shared, simple, simple-rc or simple-derived" >&2; exit 2 ;;
 esac
 trace="$(get SPECULATION_TRACE)"
 if [[ -n "$trace" ]]; then

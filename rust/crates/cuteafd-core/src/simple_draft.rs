@@ -16,7 +16,11 @@
 //! random request with room verify one position past its cutoff, so the
 //! calibration keeps seeing outcomes there.
 //!
-//! **Cutoff.** `simple`: 0.5. `simple-derived`: `r / c`, clamped to
+//! **Arms.** `simple`: cutoff 0.5. `simple-rc`: the derived cutoff alone, no
+//! offset and no exploration. `simple-derived`: the derived cutoff with the
+//! offset and exploration.
+//!
+//! **Cutoff.** `simple`: 0.5. `simple-rc` and `simple-derived`: `r / c`, clamped to
 //! [[`CUTOFF_FLOOR`], [`CUTOFF_CEILING`]], where `r` is the marginal round
 //! time of one more verified row (from `T = a0 + a1 * C + r * rows` over a
 //! short window) and `c` is the batch cost per committed token (`T / sum
@@ -33,6 +37,8 @@ pub enum DraftMode {
     /// Joint acceptance above one half.
     Simple,
     /// Joint acceptance above the measured row price over cost per token.
+    SimpleRc,
+    /// [`SimpleRc`](Self::SimpleRc) plus per-request offsets and exploration.
     SimpleDerived,
 }
 
@@ -41,12 +47,16 @@ impl DraftMode {
         match value {
             "" | "shared" => Some(Self::Shared),
             "simple" => Some(Self::Simple),
+            "simple-rc" => Some(Self::SimpleRc),
             "simple-derived" => Some(Self::SimpleDerived),
             _ => None,
         }
     }
     pub fn label(self) -> &'static str {
-        match self { Self::Shared => "shared", Self::Simple => "simple", Self::SimpleDerived => "simple-derived" }
+        match self {
+            Self::Shared => "shared", Self::Simple => "simple", Self::SimpleRc => "simple-rc",
+            Self::SimpleDerived => "simple-derived",
+        }
     }
 }
 
@@ -271,7 +281,7 @@ impl SimpleDraft {
         let token_us = self.short.cost_per_token();
         let mut cutoff = Cutoff { value: SIMPLE_CUTOFF, row_short_us: short, row_pooled_us: pooled, row_us, token_us,
             fallback: false };
-        if self.mode == DraftMode::SimpleDerived {
+        if matches!(self.mode, DraftMode::SimpleRc | DraftMode::SimpleDerived) {
             match (row_us, token_us) {
                 (Some(r), Some(c)) if c > 0. => cutoff.value = (r / c).clamp(CUTOFF_FLOOR, CUTOFF_CEILING),
                 _ => cutoff.fallback = true,
@@ -477,6 +487,28 @@ mod tests {
         let passing = pending.requests[0].joint.iter().take_while(|&&q| q > cutoff.value).count();
         assert_eq!(pending.requests[0].passing, passing);
         assert_eq!(selection.lengths, [(passing + 1).min(7)]);
+    }
+
+    #[test]
+    fn rc_uses_the_derived_cutoff_without_offsets_or_exploration() {
+        let mut rc = SimpleDraft::new(DraftMode::SimpleRc, 8, 5);
+        let mut derived = SimpleDraft::new(DraftMode::SimpleDerived, 8, 5);
+        let raw = [0.7; 7];
+        for round in 0..200 {
+            let per = 1 + round % 5;
+            let observed = [ObservedDraftRequest { id: 1, rows: per, accepted: per, confidence: Some(&raw[..per - 1]) }];
+            for policy in [&mut rc, &mut derived] { observe(policy, &observed, 5_000. + 2_000. * per as f64); }
+        }
+        assert_eq!(rc.cutoff(), derived.cutoff());
+        assert!(!rc.cutoff().fallback);
+        assert_eq!(rc.offset(1), 0.);
+        assert!(derived.offset(1) > 0.);
+        let p = [0.9, 0.8, 0.8, 0.8, 0.5, 0.5, 0.5];
+        let selection = rc.select(&[DraftCandidate { id: 9, confidence: &p }], 64);
+        let pending = rc.pending.as_ref().unwrap();
+        assert!(!pending.requests[0].explore);
+        assert_eq!(selection.lengths, [pending.requests[0].passing]);
+        assert_eq!(DraftMode::parse("simple-rc"), Some(DraftMode::SimpleRc));
     }
 
     #[test]

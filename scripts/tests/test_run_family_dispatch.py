@@ -201,7 +201,7 @@ def test_shared_draft_policy_rejects_unknown_switch_value(tmp_path: Path) -> Non
     assert "DRAFT_SURVIVAL_LENGTHS must be on or off" in result.stderr
 
 
-@pytest.mark.parametrize("value", [None, "shared", "simple", "simple-derived"])
+@pytest.mark.parametrize("value", [None, "shared", "simple", "simple-rc", "simple-derived"])
 def test_simple_draft_policy_is_forwarded_only_when_set(tmp_path: Path, value) -> None:
     keys = f"DRAFT_POLICY={value}\n" if value else ""
     result = _family_launch_result(tmp_path, {"model_type": "mimo_v2_flash", "num_hidden_layers": 2,
@@ -218,7 +218,7 @@ def test_simple_draft_policy_rejects_unknown_value(tmp_path: Path) -> None:
                                             "moe_layer_freq": [0, 1]}, "XiaomiMiMo/MiMo-V2-Flash",
                                   "DRAFT_POLICY=clever\n")
     assert result.returncode != 0
-    assert "DRAFT_POLICY must be shared, simple or simple-derived" in result.stderr
+    assert "DRAFT_POLICY must be shared, simple, simple-rc or simple-derived" in result.stderr
 
 
 def test_family_table_names_every_launchable_family() -> None:

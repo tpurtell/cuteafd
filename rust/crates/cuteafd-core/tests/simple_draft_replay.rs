@@ -86,13 +86,15 @@ fn replay_simple_rules_against_recorded_choices() {
         (relative RMS residual {residual:.3})", records.len(), theta[0], theta[1], theta[2]);
     let time = |c: usize, rows: usize| theta[0] + theta[1] * c as f64 + theta[2] * rows as f64;
     let mut arms: Vec<(&str, Option<DraftPolicy>)> = vec![("recorded", None)];
-    for (label, mode) in [("simple", DraftMode::Simple), ("simple-derived", DraftMode::SimpleDerived)] {
+    for (label, mode) in [("simple", DraftMode::Simple), ("simple-rc", DraftMode::SimpleRc),
+        ("simple-derived", DraftMode::SimpleDerived)] {
         let mut policy = DraftPolicy::new(geometry(&records[0], positions, native), PolicySeed::weak(native), false).unwrap();
         policy.set_draft_mode(mode);
         arms.push((label, Some(policy)));
     }
     let mut scores = vec![[Score::default(); 4]; arms.len()];
-    let mut cutoffs: Vec<Vec<f64>> = vec![Vec::new(); arms.len()];
+    let mut cutoffs: Vec<[Vec<f64>; 4]> = vec![Default::default(); arms.len()];
+    let mut row_token: Vec<[Vec<(f64, f64)>; 4]> = vec![Default::default(); arms.len()];
     for record in &records {
         let requests = record["requests"].as_array().unwrap();
         let ids: Vec<u64> = requests.iter().map(|q| q["id"].as_u64().unwrap()).collect();
@@ -112,7 +114,10 @@ fn replay_simple_rules_against_recorded_choices() {
                 Some(policy) => {
                     let candidates: Vec<_> = ids.iter().zip(&raw).map(|(&id, c)| DraftCandidate { id, confidence: c }).collect();
                     let selection = policy.select_drafted_within(false, &candidates, native, max_rows, ids.len()).unwrap();
-                    if let Some(c) = policy.simple_cutoff() { cutoffs[arm].push(c.value); }
+                    if let Some(c) = policy.simple_cutoff() {
+                        cutoffs[arm][g].push(c.value);
+                        if let (Some(r), Some(t)) = (c.row_us, c.token_us) { row_token[arm][g].push((r, t)); }
+                    }
                     selection.map_or_else(|| vec![0; ids.len()], |s| s.lengths)
                 }
             };
@@ -163,10 +168,13 @@ fn replay_simple_rules_against_recorded_choices() {
     }
     let labels = ["c1", "c2-4", "c5-8", "c9+"];
     for (arm, (label, _)) in arms.iter().enumerate() {
-        let mut sorted = cutoffs[arm].clone();
-        sorted.sort_by(f64::total_cmp);
-        let median = sorted.get(sorted.len() / 2).copied();
         for (g, score) in scores[arm].iter().enumerate().filter(|(_, s)| s.rounds > 0) {
+            let mut sorted = cutoffs[arm][g].clone();
+            sorted.sort_by(f64::total_cmp);
+            let median = sorted.get(sorted.len() / 2).copied();
+            let quantile = |q: f64| sorted.get(((sorted.len() as f64 * q) as usize).min(sorted.len().saturating_sub(1))).copied();
+            let n = row_token[arm][g].len().max(1) as f64;
+            let (r, c) = row_token[arm][g].iter().fold((0., 0.), |(a, b), (r, c)| (a + r / n, b + c / n));
             let base = scores[0][g];
             let tok_s = score.tokens / score.time_us * 1e6;
             eprintln!("{}", serde_json::json!({"arm": label, "group": labels[g], "rounds": score.rounds,
@@ -179,7 +187,8 @@ fn replay_simple_rules_against_recorded_choices() {
                 "tok_per_s_floor": (score.tokens - score.censored) / score.time_us * 1e6,
                 "vs_recorded_floor": (score.tokens - score.censored) / score.time_us * 1e6 / (base.tokens / base.time_us * 1e6),
                 "wasted_drafts_per_round": (score.drafts - (score.tokens - score.rounds_requests)) / score.rounds as f64,
-                "censored_share": score.censored / score.tokens, "median_cutoff": median}));
+                "censored_share": score.censored / score.tokens, "median_cutoff": median,
+                "cutoff_p10": quantile(0.1), "cutoff_p90": quantile(0.9), "mean_row_us": r, "mean_token_us": c}));
         }
     }
 }
