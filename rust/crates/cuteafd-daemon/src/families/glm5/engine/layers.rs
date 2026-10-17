@@ -235,6 +235,7 @@ impl PipelineKernels for Bindings<'_, '_, '_, '_, '_> {
         let rows = Scalar::I32(self.rows() as i32);
         if !layer.dense && e.tp2_layer(index) {
             e.moe_front(w, layer, self.rows())?;
+            e.ring_local_routes(index, w, self.rows())?;
             e.ffn(w, layer, e.cfg.moe_intermediate, self.cap(), w.shared.buffer.ptr, rows)?;
             e.moe_front_on(1, w1, self.layer(1, index), self.rows())?;
             e.ffn_on(1, w1, self.layer(1, index), e.cfg.moe_intermediate, self.cap(), w1.shared.buffer.ptr, rows)?;

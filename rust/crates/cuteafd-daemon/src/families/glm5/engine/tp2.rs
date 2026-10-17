@@ -246,17 +246,25 @@ impl<'a> GlmEngine<'a> {
             Scalar::I32(rows as i32),
         )?;
         self.moe_front_on(1, w1, &self.peer()?.layers[layer], rows)?;
-        if let Some(probe) = self.draft_probe.borrow_mut().as_mut().filter(|p| p.wants_ring(false)) {
-            // SAFETY: rank0's router ids are live on its stream until the next layer;
-            // the shared probe downloads once before the verifier's normal sync.
-            unsafe { probe.ring(self.library, layer, w.route_ids.buffer, rows, self.stream)?; }
-        }
+        self.ring_local_routes(layer, w, rows)?;
         self.tp2_rank(pair, 0, layer, lane, w, rows)?;
         self.tp2_rank(pair, 1, layer, lane, w1, rows)?;
         // Rank1 has no final norm/head, but must consume every publication
         // so the next request cannot observe this step's stale FFN sequence.
         if layer + 1 == self.weights.layers.len() {
             self.exchange()?.wait(1, slot(layer, true, lane))?;
+        }
+        Ok(())
+    }
+
+    /// Rank 0's router ids of local expert `layer` into the draft probe's ring
+    /// (every executor's TP2 layers: without them the round's routes are
+    /// incomplete and the draft policy never observes a round).
+    pub(super) fn ring_local_routes(&self, layer: usize, w: &Workspace<'_>, rows: usize) -> Result<()> {
+        if let Some(probe) = self.draft_probe.borrow_mut().as_mut().filter(|p| p.wants_ring(false)) {
+            // SAFETY: rank0's router ids are live on its stream until the next layer;
+            // the shared probe downloads once before the verifier's normal sync.
+            unsafe { probe.ring(self.library, layer, w.route_ids.buffer, rows, self.stream)?; }
         }
         Ok(())
     }
