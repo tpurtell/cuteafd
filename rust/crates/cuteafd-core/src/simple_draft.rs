@@ -12,16 +12,18 @@
 //! **Selection.** Anchors are always verified, and the drafter always runs.
 //! Every `(i, k)` with `q_ik > cutoff` is a candidate; when the candidates
 //! exceed the row budget the largest `q` win (`q` never rises along a
-//! request, so each request keeps a prefix). `simple-derived` then lets one
-//! random request with room verify one position past its cutoff, so the
-//! calibration keeps seeing outcomes there.
+//! request, so each request keeps a prefix). Otherwise one random request
+//! with room verifies one position past its cutoff, so the calibration keeps
+//! seeing outcomes there: without it a position whose raw confidence starts
+//! below the cutoff is never verified, so never calibrated (V4.1's dSpark
+//! head stayed at depth one).
 //!
 //! **Arms.** `simple`: cutoff 0.5. `simple-rc`: `r / c` with `r` the pooled
 //! slope of round time on verified rows among rounds at the selection's exact
 //! request count (the nearest count with enough row variation when that one
 //! has too little), so a concurrency ramp cannot leak into the slope; no
-//! offset and no exploration. `simple-derived`: `r / c` with the
-//! short-window `r` shrunk to the pooled one, plus the offset and exploration.
+//! offset. `simple-derived`: `r / c` with the short-window `r` shrunk to the
+//! pooled one, plus the per-request offset.
 //!
 //! **Cutoff.** `simple`: 0.5. `simple-rc` and `simple-derived`: `r / c`, clamped to
 //! [[`CUTOFF_FLOOR`], [`CUTOFF_CEILING`]], where `r` is the marginal round
@@ -351,7 +353,7 @@ impl SimpleDraft {
             positions.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2)));
             for decision in &mut decisions { decision.chosen = 0; }
             for &(_, _, index) in positions.iter().take(budget) { decisions[index].chosen += 1; }
-        } else if wanted < budget && self.mode == DraftMode::SimpleDerived {
+        } else if wanted < budget {
             let open: Vec<usize> = (0..decisions.len()).filter(|&i| decisions[i].chosen < decisions[i].joint.len()).collect();
             if !open.is_empty() {
                 let index = open[self.random(open.len())];
@@ -434,27 +436,40 @@ mod tests {
     }
 
     #[test]
-    fn simple_verifies_while_joint_acceptance_exceeds_half_and_never_explores() {
-        let mut policy = SimpleDraft::new(DraftMode::Simple, 6, 5);
-        // Joint 0.9, 0.72, 0.58, 0.46: every conditional passes one half, the fourth joint does not.
-        let p = [0.9, 0.8, 0.8, 0.8, 0.99];
-        let selection = policy.select(&[DraftCandidate { id: 1, confidence: &p }], 64);
-        assert_eq!(selection.lengths, [3]);
-        let pending = policy.pending.as_ref().unwrap();
-        assert_eq!((pending.requests[0].passing, pending.requests[0].explore, pending.requests[0].offset), (3, false, 0.));
-        assert_eq!(pending.cutoff.value, SIMPLE_CUTOFF);
+    fn simple_verifies_while_joint_acceptance_exceeds_half_then_explores_one_row() {
+        for mode in [DraftMode::Simple, DraftMode::SimpleRc, DraftMode::SimpleDerived] {
+            let mut policy = SimpleDraft::new(mode, 6, 5);
+            // Joint 0.9, 0.72, 0.58, 0.46: every conditional passes one half, the fourth joint does not.
+            // No row price yet, so every arm holds one half; one exploration row follows.
+            let p = [0.9, 0.8, 0.8, 0.8, 0.99];
+            let selection = policy.select(&[DraftCandidate { id: 1, confidence: &p }], 64);
+            assert_eq!(selection.lengths, [4], "{mode:?}");
+            let pending = policy.pending.as_ref().unwrap();
+            assert_eq!((pending.requests[0].passing, pending.requests[0].explore, pending.requests[0].offset), (3, true, 0.));
+            assert_eq!(pending.cutoff.value, SIMPLE_CUTOFF);
+            // A request that verifies everything leaves nothing to explore.
+            let all = [0.99; 3];
+            assert_eq!(policy.select(&[DraftCandidate { id: 1, confidence: &all }], 64).lengths, [3]);
+        }
     }
 
     #[test]
-    fn derived_explores_one_row_past_the_cutoff() {
-        let mut policy = SimpleDraft::new(DraftMode::SimpleDerived, 6, 5);
-        let p = [0.9, 0.8, 0.8, 0.8, 0.99];
-        // No row price yet: the derived cutoff holds one half, plus one exploration row.
-        assert_eq!(policy.select(&[DraftCandidate { id: 1, confidence: &p }], 64).lengths, [4]);
-        assert!(policy.pending.as_ref().unwrap().requests[0].explore);
-        // A request that verifies everything leaves nothing to explore.
-        let all = [0.99; 3];
-        assert_eq!(policy.select(&[DraftCandidate { id: 1, confidence: &all }], 64).lengths, [3]);
+    fn exploration_escapes_an_uncalibrated_low_second_position() {
+        // V4.1-like: raw position 2 confidence 0.16, truly accepted 80% of the time.
+        let mut policy = SimpleDraft::new(DraftMode::Simple, 5, 5);
+        let raw = [0.9, 0.16, 0.16, 0.16, 0.16];
+        let mut state = 7u64;
+        for _ in 0..400 {
+            let lengths = policy.select(&[DraftCandidate { id: 1, confidence: &raw }], 64).lengths;
+            let mut accepted = 1;
+            for _ in 0..lengths[0] {
+                state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                if (state >> 33) % 10 < 8 { accepted += 1 } else { break }
+            }
+            observe(&mut policy, &[ObservedDraftRequest { id: 1, rows: lengths[0] + 1, accepted, confidence: Some(&raw) }], 5_000.);
+        }
+        assert!(policy.probabilities(1, &raw)[1] > 0.6, "{:?}", policy.probabilities(1, &raw));
+        assert!(policy.select(&[DraftCandidate { id: 1, confidence: &raw }], 64).lengths[0] >= 3);
     }
 
     #[test]
@@ -526,7 +541,7 @@ mod tests {
     }
 
     #[test]
-    fn rc_uses_the_derived_cutoff_without_offsets_or_exploration() {
+    fn rc_uses_the_derived_cutoff_without_offsets() {
         let mut rc = SimpleDraft::new(DraftMode::SimpleRc, 8, 5);
         let mut derived = SimpleDraft::new(DraftMode::SimpleDerived, 8, 5);
         let raw = [0.7; 7];
@@ -550,8 +565,8 @@ mod tests {
         let p = [0.9, 0.8, 0.8, 0.8, 0.5, 0.5, 0.5];
         let selection = rc.select(&[DraftCandidate { id: 9, confidence: &p }], 64);
         let pending = rc.pending.as_ref().unwrap();
-        assert!(!pending.requests[0].explore);
-        assert_eq!(selection.lengths, [pending.requests[0].passing]);
+        assert!(pending.requests[0].explore);
+        assert_eq!(selection.lengths, [pending.requests[0].passing + 1]);
         assert_eq!(DraftMode::parse("simple-rc"), Some(DraftMode::SimpleRc));
     }
 

@@ -814,8 +814,9 @@ mod tests {
         let candidates = [Candidate { id: 1, prior: &low, limit: 7, selector: true, cold: true },
             Candidate { id: 2, prior: &high, limit: 7, selector: true, cold: false }];
         let selection = select(&mut policy, &candidates, 7, 64);
-        // No cold DFlash2 five-draft floor; joint acceptance 0.9, 0.81, 0.73, 0.22 passes three.
-        assert_eq!(selection.lengths, [0, 3]);
+        // No cold DFlash2 five-draft floor; joint acceptance 0.9, 0.81, 0.73, 0.22 passes three,
+        // and one request explores one row past its cutoff.
+        assert!(selection.lengths == [1, 3] || selection.lengths == [0, 4], "{:?}", selection.lengths);
         assert_eq!(selection.predicted, None);
         // The pre-draft action always drafts while any request has room.
         assert!(choose_block(&mut policy, &[(1, 7), (2, 7)], 7, 2, 64, false).unwrap());
