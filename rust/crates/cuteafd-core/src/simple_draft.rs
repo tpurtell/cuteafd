@@ -22,16 +22,18 @@
 //! slope of round time on verified rows among rounds at the selection's exact
 //! request count (the nearest count with enough row variation when that one
 //! has too little), so a concurrency ramp cannot leak into the slope; no
-//! offset. `simple-derived`: `r / c` with the short-window `r` shrunk to the
-//! pooled one, plus the per-request offset.
+//! offset. `simple-derived`: the same `r / c`, plus the per-request offset.
+//! (A short-window `r` shrunk to one pooled fit underpriced rows by 25-85%
+//! against the slope measured directly at fixed concurrency: it inherited
+//! concurrency ramps.)
 //!
 //! **Cutoff.** `simple`: 0.5. `simple-rc` and `simple-derived`: `r / c`, clamped to
 //! [[`CUTOFF_FLOOR`], [`CUTOFF_CEILING`]], where `r` is the marginal round
-//! time of one more verified row (from `T = a0 + a1 * C + r * rows` over a
-//! short window) and `c` is the batch cost per committed token (`T / sum
-//! accepted`, same window): adding a row raises tokens per second iff
-//! `q * T > r * E`, i.e. `q > r / c`. Until the pooled window has varied its
-//! rows enough to fit `r`, the cutoff is 0.5.
+//! time of one more verified row (the pooled slope of `T` on rows at the
+//! selection's request count, see Arms) and `c` is the batch cost per
+//! committed token (`T / sum accepted` over a short window): adding a row
+//! raises tokens per second iff `q * T > r * E`, i.e. `q > r / c`. Until some
+//! request count has varied its rows enough to fit `r`, the cutoff is 0.5.
 use super::{DraftCandidate, DraftRoundObservation, DraftSelection, Platt};
 
 /// Which length rule a [`DraftPolicy`](super::DraftPolicy) follows.
@@ -70,13 +72,11 @@ pub const SIMPLE_CUTOFF: f64 = 0.5;
 /// Bounds of the derived cutoff.
 pub const CUTOFF_FLOOR: f64 = 0.1;
 pub const CUTOFF_CEILING: f64 = 0.9;
-/// Per-round decay of the short window (about ten rounds) for `r` and `c`.
+/// Per-round decay of the short window (about ten rounds) for `c`.
 const SHORT_DECAY: f64 = 0.9;
 /// Per-round decay of the pooled window (about a hundred rounds) that the
 /// short `r` shrinks toward.
 const POOLED_DECAY: f64 = 0.99;
-/// Ridge strength, in rows², pulling the short `r` to the pooled one.
-const SLOPE_PRIOR: f64 = 4.;
 /// Least pooled row variance, net of concurrency (rows², weighted), for a usable `r`.
 const MIN_ROW_VARIANCE: f64 = 4.;
 /// Ridge on the concurrency coefficient, so a window at one concurrency is solvable.
@@ -159,8 +159,8 @@ pub struct Cutoff {
     pub clamped: bool,
     /// Request count whose pooled `r` `simple-rc` used.
     pub group: Option<usize>,
-    /// Marginal µs per verified row: short window alone, pooled, and the
-    /// short window shrunk to the pooled value (what the rule uses).
+    /// Marginal µs per verified row: the short window alone (reported only),
+    /// the pooled fit at the request count used, and what the rule uses.
     pub row_short_us: Option<f64>,
     pub row_pooled_us: Option<f64>,
     pub row_us: Option<f64>,
@@ -270,7 +270,6 @@ impl SimpleDraft {
     pub fn last_round(&self) -> Option<&SimpleRound> { self.last.as_ref() }
     /// `[group][native, tail][position]`, groups as [`REPORT_GROUPS`].
     pub fn reliability(&self) -> &[[Vec<Reliability>; 2]; 4] { &self.reliability }
-    pub fn native_positions(&self) -> usize { self.native }
     /// Platt-calibrated conditional acceptance per position.
     fn platt(&self, confidence: &[f64]) -> Vec<f64> {
         confidence.iter().zip(&self.calibration).map(|(&p, platt)| platt.apply(p)).collect()
@@ -292,7 +291,7 @@ impl SimpleDraft {
         let usable = |fit: &RoundFit| fit.row_variance() >= MIN_ROW_VARIANCE;
         let short = usable(&self.short).then(|| self.short.slope(0., 0.)).flatten();
         let (pooled_fit, group) = match self.mode {
-            DraftMode::SimpleRc => {
+            DraftMode::SimpleRc | DraftMode::SimpleDerived => {
                 // The nearest request count with enough row variation, ties to the larger.
                 let nearest = (0..self.by_requests.len()).filter(|&i| usable(&self.by_requests[i]))
                     .min_by_key(|&i| ((i + 1).abs_diff(requests), usize::MAX - i));
@@ -301,13 +300,10 @@ impl SimpleDraft {
             _ => (&self.pooled, None),
         };
         let pooled = match self.mode {
-            DraftMode::SimpleRc => group.and_then(|_| pooled_fit.slope(0., 0.)),
+            DraftMode::SimpleRc | DraftMode::SimpleDerived => group.and_then(|_| pooled_fit.slope(0., 0.)),
             _ => usable(pooled_fit).then(|| pooled_fit.slope(0., 0.)).flatten(),
         };
-        let row_us = match self.mode {
-            DraftMode::SimpleRc => pooled,
-            _ => pooled.and_then(|pooled| self.short.slope(pooled, SLOPE_PRIOR)),
-        }.map(|r| r.max(0.));
+        let row_us = pooled.map(|r| r.max(0.));
         let token_us = self.short.cost_per_token();
         let mut cutoff = Cutoff { value: SIMPLE_CUTOFF, raw: None, clamped: false, group, row_short_us: short,
             row_pooled_us: pooled, row_us, token_us, fallback: false };
@@ -550,9 +546,9 @@ mod tests {
             let observed = [ObservedDraftRequest { id: 1, rows: per, accepted: per, confidence: Some(&raw[..per - 1]) }];
             for policy in [&mut rc, &mut derived] { observe(policy, &observed, 5_000. + 2_000. * per as f64); }
         }
-        // One concurrency group: the group's pooled r equals the pooled r.
+        // Both arms price rows the same way.
         let (a, b) = (rc.cutoff(1), derived.cutoff(1));
-        assert_eq!((a.row_pooled_us, a.token_us), (b.row_pooled_us, b.token_us));
+        assert_eq!(a, b);
         assert_eq!(a.row_us, a.row_pooled_us);
         assert_eq!(a.group, Some(1));
         assert!(!a.fallback);
