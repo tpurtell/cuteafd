@@ -177,6 +177,7 @@ PREFILL_BATCH_TOKENS
 RTX_EXPERT_LAYERS
 PROBE_DUMP_ROOT
 DRAFT_SURVIVAL_LENGTHS
+DRAFT_POLICY
 SPECULATION_TRACE
 TARGET_HEAD
 SPARK_INTAKE
@@ -321,6 +322,7 @@ COORDINATOR_GPU_BUDGET_GIB
 COORDINATOR_GPU_HEADROOM_GIB
 COORDINATOR_GPU_PCI_BUS_ID
 COORDINATOR_GPU_UUID
+DRAFT_POLICY
 DRAFT_SURVIVAL_LENGTHS
 DSPARK_DRAFT_LIMIT
 DSPARK_DRAFT_POLICY
@@ -437,6 +439,12 @@ case "$(get DRAFT_SURVIVAL_LENGTHS off)" in
   on) trace_args+=(-e CUTEAFD_DRAFT_SURVIVAL_LENGTHS=1) ;;
   off) trace_args+=(-e CUTEAFD_DRAFT_SURVIVAL_LENGTHS=0) ;;
   *) echo "DRAFT_SURVIVAL_LENGTHS must be on or off" >&2; exit 2 ;;
+esac
+# Experimental simple draft policy (cuteafd_core::DraftMode); forwarded only when set.
+case "$(get DRAFT_POLICY)" in
+  "") ;;
+  shared|simple|simple-derived) trace_args+=(-e "CUTEAFD_DRAFT_POLICY=$(get DRAFT_POLICY)") ;;
+  *) echo "DRAFT_POLICY must be shared, simple or simple-derived" >&2; exit 2 ;;
 esac
 trace="$(get SPECULATION_TRACE)"
 if [[ -n "$trace" ]]; then
@@ -1080,7 +1088,7 @@ if ((SPARK_COUNT == 0)); then
 else
   peers="$(jq -er '.peers | join(",")' <<<"$count_plan")"
 fi
-fingerprint="$(printf '%s\n' "$engine_commit" "$RELEASE_MODEL_ID" "$RELEASE_MODEL_REVISION" "$ADDR" "$RELEASE_RTX_GPUS" "$gpu_uuid_csv" "$gpu_pci_csv" "$CONCURRENCY" "${HTTP_QUEUE_DEPTH:-$CONCURRENCY}" "$HTTP_QUEUE_WAIT_MS" "$HOST_CACHE_BYTES" "$RTX_EXPERT_LAYERS" "${KV_POOL_SIZE}${POOL_TOKENS:+:planner=$POOL_TOKENS}" "$EMBEDDING" "$VISION" "$AUDIO" "$MEMORY_RESERVATION" "$PREFIX_CACHE_ENTRIES" "$MAX_CONTEXT_TOKENS" "$MAX_OUTPUT_TOKENS" "$PREFILL_BATCH_TOKENS" "$SPECULATOR" "$DSPARK_DRAFT_POLICY" "${DRAFT_SURVIVAL_LENGTHS:-off}" "${dspark_draft_limit:-auto}" "$TP2_ATTENTION" "$TP2_QUERY_PROJECTION" "$TP2_OUTPUT_PROJECTION" "$TP2_DSPARK_EXPERTS" "${CUTEAFD_PROTOCOL_V2_VERBS_HOST_DEVICE_MAP:-}" "${CUTEAFD_VERBS_APP_IB_PORT_NUM:-}" "${CUTEAFD_PROTOCOL_V2_VERBS_HOST_EXECUTION_LANES:-}" "$SPARK_DEVICE_BUDGET_BYTES" "$SPARK_COUNT" "$(release_hosts_csv)" "$peers" "$spark_exl3_identity" "spark-topology=${spark_tp}x${spark_ep}:explicit=${topology_explicit}" "v41-spark-tp-roles=${spark_tp_roles_required}" | sha256sum | awk '{print $1}')"
+fingerprint="$(printf '%s\n' "$engine_commit" "$RELEASE_MODEL_ID" "$RELEASE_MODEL_REVISION" "$ADDR" "$RELEASE_RTX_GPUS" "$gpu_uuid_csv" "$gpu_pci_csv" "$CONCURRENCY" "${HTTP_QUEUE_DEPTH:-$CONCURRENCY}" "$HTTP_QUEUE_WAIT_MS" "$HOST_CACHE_BYTES" "$RTX_EXPERT_LAYERS" "${KV_POOL_SIZE}${POOL_TOKENS:+:planner=$POOL_TOKENS}" "$EMBEDDING" "$VISION" "$AUDIO" "$MEMORY_RESERVATION" "$PREFIX_CACHE_ENTRIES" "$MAX_CONTEXT_TOKENS" "$MAX_OUTPUT_TOKENS" "$PREFILL_BATCH_TOKENS" "$SPECULATOR" "$DSPARK_DRAFT_POLICY" "${DRAFT_SURVIVAL_LENGTHS:-off}" "${DRAFT_POLICY:-}" "${dspark_draft_limit:-auto}" "$TP2_ATTENTION" "$TP2_QUERY_PROJECTION" "$TP2_OUTPUT_PROJECTION" "$TP2_DSPARK_EXPERTS" "${CUTEAFD_PROTOCOL_V2_VERBS_HOST_DEVICE_MAP:-}" "${CUTEAFD_VERBS_APP_IB_PORT_NUM:-}" "${CUTEAFD_PROTOCOL_V2_VERBS_HOST_EXECUTION_LANES:-}" "$SPARK_DEVICE_BUDGET_BYTES" "$SPARK_COUNT" "$(release_hosts_csv)" "$peers" "$spark_exl3_identity" "spark-topology=${spark_tp}x${spark_ep}:explicit=${topology_explicit}" "v41-spark-tp-roles=${spark_tp_roles_required}" | sha256sum | awk '{print $1}')"
 spark_prefix="$RELEASE_SPARK_CONTAINER_PREFIX"
 # Launch features shared with every family, validated before a dry run returns
 # and before any service is stopped.

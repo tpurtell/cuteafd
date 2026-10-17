@@ -8,7 +8,8 @@ mod draft_policy;
 pub use draft_policy::{
     draft_expected_tokens, DraftAction, DraftCandidate, DraftCostSnapshot, DraftPolicy, DraftPolicyError, DraftPolicyStats,
     DraftRoundObservation, DraftSelection, LayerResource, ObservedDraftRequest, PolicyGeometry, PolicySeed, ResourceClass,
-    draft_concurrency_bucket, CLASS_PRIOR_ROUNDS, CONCURRENCY_BUCKETS, MAX_RESOURCE_CLASSES, SURVIVAL_FLOOR,
+    draft_concurrency_bucket, DraftMode, RowPrice, SimpleDecision, SimpleRound, SimpleSample, SIMPLE_THRESHOLD,
+    THRESHOLD_CEILING, THRESHOLD_FLOOR, WASTE_CEILING, WASTE_FLOOR, CLASS_PRIOR_ROUNDS, CONCURRENCY_BUCKETS, MAX_RESOURCE_CLASSES, SURVIVAL_FLOOR,
 };
 mod dspark_rng;
 pub use dspark_rng::{DsparkRng, DsparkRngReservation};

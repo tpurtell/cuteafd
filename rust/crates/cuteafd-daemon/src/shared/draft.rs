@@ -26,13 +26,31 @@ pub(crate) mod routes;
 pub(crate) mod runtime;
 pub(crate) mod timing;
 
-/// Apply the opt-in length rule (`CUTEAFD_DRAFT_SURVIVAL_LENGTHS`, launcher key
-/// `DRAFT_SURVIVAL_LENGTHS`): verify drafts while their calibrated survival is
-/// at least one half, with width, skip and copy actions still resource priced.
+/// Apply the opt-in length rules: `CUTEAFD_DRAFT_SURVIVAL_LENGTHS` (launcher
+/// key `DRAFT_SURVIVAL_LENGTHS`) verifies drafts while their calibrated
+/// survival is at least one half, with width, skip and copy actions still
+/// resource priced; `CUTEAFD_DRAFT_POLICY` (launcher key `DRAFT_POLICY`,
+/// `shared` by default) selects the experimental simple rules
+/// (`cuteafd_core::DraftMode`).
 pub(crate) fn apply_length_rule(policy: &mut cuteafd_core::DraftPolicy) {
     let survival = super::draft_policy::enabled("CUTEAFD_DRAFT_SURVIVAL_LENGTHS");
     if survival { tracing::info!("draft lengths follow calibrated survival >= 0.5"); }
     policy.set_survival_lengths(survival);
+    policy.set_draft_mode(draft_mode());
+}
+
+/// The configured draft mode; an unknown value keeps the shared policy.
+pub(crate) fn draft_mode() -> cuteafd_core::DraftMode {
+    static MODE: std::sync::OnceLock<cuteafd_core::DraftMode> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| {
+        let value = std::env::var("CUTEAFD_DRAFT_POLICY").unwrap_or_default();
+        let mode = cuteafd_core::DraftMode::parse(&value).unwrap_or_else(|| {
+            tracing::warn!(value, "unknown CUTEAFD_DRAFT_POLICY; using the shared policy");
+            cuteafd_core::DraftMode::Shared
+        });
+        if mode != cuteafd_core::DraftMode::Shared { tracing::info!(mode = mode.label(), "simple draft policy selected"); }
+        mode
+    })
 }
 
 /// BF16 drafter proposals use tensor cores at every row count, borrowing the

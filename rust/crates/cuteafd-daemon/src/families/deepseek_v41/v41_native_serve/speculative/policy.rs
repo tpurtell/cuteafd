@@ -180,7 +180,9 @@ pub(super) fn publish(policy: &DraftPolicy, draft_limit: usize) {
             stats.position_accepted[p] as f64 / stats.position_reached[p] as f64 } else { 0. },
     })).collect();
     let value = serde_json::json!({
-        "mode": if policy.fixed() { "fixed" } else if policy.survival_lengths() { "survival" } else { "bandwidth" },
+        "mode": if policy.fixed() { "fixed" } else if policy.draft_mode() != cuteafd_core::DraftMode::Shared {
+            policy.draft_mode().label() } else if policy.survival_lengths() { "survival" } else { "bandwidth" },
+        "simple_calibration": policy.simple_calibration(),
         "draft_limit": draft_limit,
         "local_layers": local_layers(geometry),
         "remote_expert_bytes": remote_expert_bytes(geometry),

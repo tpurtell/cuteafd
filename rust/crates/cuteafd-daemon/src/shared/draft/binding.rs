@@ -137,7 +137,44 @@ pub(crate) fn observe(policy: &mut DraftPolicy, record: &RoundRecord<'_>) -> Res
     let observation = build(record, policy.widths()[0])?;
     trace_round(policy, record);
     let _timing = super::clock::HostSpan::new(super::clock::HostStage::Observe);
-    Ok(policy.observe(observation.view())?)
+    policy.observe(observation.view())?;
+    trace_simple(policy);
+    Ok(())
+}
+
+/// The simple rule's round: each request's cost sample, windowed cost per
+/// token, threshold and chosen width, with the row price behind them.
+fn trace_simple(policy: &DraftPolicy) {
+    let Some(round) = policy.simple_round() else { return };
+    if tracing::enabled!(target: "cuteafd::draft_policy", tracing::Level::DEBUG) {
+        tracing::debug!(target: "cuteafd::draft_policy", mode = policy.draft_mode().label(), total_us = round.total_us,
+            rows = round.rows, global_cost_us = round.global_cost_us, row_price_us = round.row_price.used,
+            chosen = ?round.requests.iter().map(|r| r.decision.as_ref().map(|d| d.chosen)).collect::<Vec<_>>(),
+            accepted = ?round.requests.iter().map(|r| r.accepted).collect::<Vec<_>>(),
+            cost_us = ?round.requests.iter().map(|r| r.cost_us).collect::<Vec<_>>(),
+            waste = ?round.requests.iter().map(|r| r.decision.as_ref().map(|d| d.waste)).collect::<Vec<_>>(),
+            threshold = ?round.requests.iter().map(|r| r.decision.as_ref().map(|d| d.threshold)).collect::<Vec<_>>(),
+            "simple draft round");
+    }
+    let Some(trace) = replay_trace() else { return };
+    if let Err(error) = trace.write(&simple_trace_value(policy, round)) { tracing::warn!(%error, "simple draft trace failed"); }
+}
+
+fn simple_trace_value(policy: &DraftPolicy, round: &cuteafd_core::SimpleRound) -> serde_json::Value {
+    let price = |p: &cuteafd_core::RowPrice| serde_json::json!({"short_us": p.short, "pooled_us": p.pooled, "used_us": p.used});
+    serde_json::json!({"type": "simple_draft_round", "round": policy.stats().rounds, "mode": policy.draft_mode().label(),
+        "total_us": round.total_us, "rows": round.rows, "global_cost_us": round.global_cost_us,
+        "row_price": price(&round.row_price),
+        "threshold_bounds": [cuteafd_core::THRESHOLD_FLOOR, cuteafd_core::THRESHOLD_CEILING],
+        "waste_bounds": [cuteafd_core::WASTE_FLOOR, cuteafd_core::WASTE_CEILING],
+        "requests": round.requests.iter().map(|r| serde_json::json!({"id": r.id, "rows": r.rows,
+            "accepted": r.accepted, "share_us": r.share_us, "sample_us": r.sample_us, "cost_us": r.cost_us,
+            "decision": r.decision.as_ref().map(|d| serde_json::json!({"cost_us": d.cost_us,
+                "batch_cost_us": d.batch_cost_us, "waste": d.waste, "base": d.base, "threshold": d.threshold,
+                "joint_rule": d.joint_rule, "conditional": d.conditional,
+                "joint": d.joint, "passing": d.passing, "chosen": d.chosen, "explore": d.explore,
+                "scarce": d.scarce, "budget": d.budget, "row_price": price(&d.row_price)}))
+        })).collect::<Vec<_>>()})
 }
 
 /// Opt-in complete observation capture, including dSpark head evidence. The
@@ -243,7 +280,8 @@ fn round_trace_value(policy: &DraftPolicy, record: &RoundRecord<'_>) -> serde_js
         "total_us": record.times.total_us, "draft_us": record.times.draft_us,
         "draft_width": record.draft.map(|d| d.width), "drafted_requests": record.draft.and_then(|d| d.requests),
         "predicted_us": record.predicted, "bucket": cuteafd_core::draft_concurrency_bucket(record.requests.len()),
-        "selected": selected, "length_rule": if policy.survival_lengths() { "survival" } else { "priced" },
+        "selected": selected, "length_rule": if policy.draft_mode() != cuteafd_core::DraftMode::Shared {
+            policy.draft_mode().label() } else if policy.survival_lengths() { "survival" } else { "priced" },
         "cost": fit.to_json(&labels)})
 }
 
