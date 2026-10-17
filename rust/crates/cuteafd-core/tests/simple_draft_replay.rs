@@ -36,11 +36,16 @@ fn geometry(record: &Value, max_positions: usize, native: usize) -> PolicyGeomet
 }
 
 /// Least squares `T = a0 + a1 * C + r * rows` and its relative RMS residual.
-fn cost_truth(rounds: &[(f64, f64, f64)]) -> ([f64; 3], f64) {
+fn transform(exponent: f64, rows: f64) -> f64 {
+    if exponent == 0. { rows.ln_1p() } else { rows.powf(exponent) }
+}
+
+/// Least squares `T = a0 + a1 * C + b * f(rows)`, `f` per `exponent` (0: log).
+fn cost_truth(rounds: &[(f64, f64, f64)], exponent: f64) -> ([f64; 3], f64) {
     let mut m = [[0.; 3]; 3];
     let mut y = [0.; 3];
     for &(c, rows, t) in rounds {
-        let x = [1., c, rows];
+        let x = [1., c, transform(exponent, rows)];
         for i in 0..3 { for j in 0..3 { m[i][j] += x[i] * x[j]; } y[i] += x[i] * t; }
     }
     m[1][1] += 1e-6;
@@ -56,7 +61,7 @@ fn cost_truth(rounds: &[(f64, f64, f64)]) -> ([f64; 3], f64) {
     let theta = [y[0] / m[0][0], y[1] / m[1][1], y[2] / m[2][2]];
     let (mut err, mut sum) = (0., 0.);
     for &(c, rows, t) in rounds {
-        let p = theta[0] + theta[1] * c + theta[2] * rows;
+        let p = theta[0] + theta[1] * c + theta[2] * transform(exponent, rows);
         err += (p - t) * (p - t);
         sum += t * t;
     }
@@ -81,20 +86,35 @@ fn replay_simple_rules_against_recorded_choices() {
     let native = records.iter().filter_map(|r| r["draft_width"].as_u64()).max().unwrap_or(positions as u64) as usize;
     let truth: Vec<(f64, f64, f64)> = records.iter().filter_map(|r| r["total_us"].as_f64()
         .map(|t| (r["requests"].as_array().unwrap().len() as f64, r["rows"].as_f64().unwrap(), t))).collect();
-    let (theta, residual) = cost_truth(&truth);
+    // Time truth: CUTEAFD_SIMPLE_REPLAY_TRUTH=linear|log|power (default power,
+    // its exponent the best of a 0.05 grid over the whole trace).
+    let truth_model = std::env::var("CUTEAFD_SIMPLE_REPLAY_TRUTH").unwrap_or_else(|_| "power".into());
+    let exponent = match truth_model.as_str() {
+        "linear" => 1.,
+        "log" => 0.,
+        _ => (1..=20).map(|i| i as f64 * 0.05)
+            .min_by(|&a, &b| cost_truth(&truth, a).1.total_cmp(&cost_truth(&truth, b).1)).unwrap(),
+    };
+    let (theta, residual) = cost_truth(&truth, exponent);
     eprintln!("{path}: {} rounds, {positions} positions, native {native}; cost truth T = {:.0} + {:.0} C + {:.0} rows µs \
         (relative RMS residual {residual:.3})", records.len(), theta[0], theta[1], theta[2]);
-    let time = |c: usize, rows: usize| theta[0] + theta[1] * c as f64 + theta[2] * rows as f64;
+    let time = |c: usize, rows: usize| theta[0] + theta[1] * c as f64 + theta[2] * transform(exponent, rows as f64);
+    eprintln!("time truth {truth_model} exponent {exponent:.2}");
     let mut arms: Vec<(&str, Option<DraftPolicy>)> = vec![("recorded", None)];
-    for (label, mode) in [("simple", DraftMode::Simple), ("simple-rc", DraftMode::SimpleRc),
-        ("simple-derived", DraftMode::SimpleDerived)] {
+    use cuteafd_core::RowCost;
+    for (label, mode, cost) in [("simple", DraftMode::Simple, RowCost::Linear),
+        ("derived-linear", DraftMode::SimpleDerived, RowCost::Linear),
+        ("derived-power", DraftMode::SimpleDerived, RowCost::Power),
+        ("derived-log", DraftMode::SimpleDerived, RowCost::Log)] {
         let mut policy = DraftPolicy::new(geometry(&records[0], positions, native), PolicySeed::weak(native), false).unwrap();
         policy.set_draft_mode(mode);
+        policy.set_row_cost(cost);
         arms.push((label, Some(policy)));
     }
     let mut scores = vec![[Score::default(); 4]; arms.len()];
     let mut cutoffs: Vec<[Vec<f64>; 4]> = vec![Default::default(); arms.len()];
     let mut row_token: Vec<[Vec<(f64, f64)>; 4]> = vec![Default::default(); arms.len()];
+    let mut depth_cutoffs: Vec<[[Vec<f64>; 8]; 4]> = vec![Default::default(); arms.len()];
     for record in &records {
         let requests = record["requests"].as_array().unwrap();
         let ids: Vec<u64> = requests.iter().map(|q| q["id"].as_u64().unwrap()).collect();
@@ -117,6 +137,13 @@ fn replay_simple_rules_against_recorded_choices() {
                     if let Some(c) = policy.simple_cutoff(ids.len()) {
                         cutoffs[arm][g].push(c.value);
                         if let (Some(r), Some(t)) = (c.row_us, c.token_us) { row_token[arm][g].push((r, t)); }
+                    }
+                    if let Some(pending) = policy.simple_pending() {
+                        for decision in &pending.requests {
+                            for (k, &cutoff) in decision.cutoffs.iter().enumerate().take(8) {
+                                depth_cutoffs[arm][g][k].push(cutoff);
+                            }
+                        }
                     }
                     selection.map_or_else(|| vec![0; ids.len()], |s| s.lengths)
                 }
@@ -188,6 +215,11 @@ fn replay_simple_rules_against_recorded_choices() {
                 "vs_recorded_floor": (score.tokens - score.censored) / score.time_us * 1e6 / (base.tokens / base.time_us * 1e6),
                 "wasted_drafts_per_round": (score.drafts - (score.tokens - score.rounds_requests)) / score.rounds as f64,
                 "censored_share": score.censored / score.tokens, "median_cutoff": median,
+                "cutoff_by_position": depth_cutoffs[arm][g].iter().map(|v| {
+                    let mut v = v.clone();
+                    v.sort_by(f64::total_cmp);
+                    v.get(v.len() / 2).copied()
+                }).collect::<Vec<_>>(),
                 "cutoff_p10": quantile(0.1), "cutoff_p90": quantile(0.9), "mean_row_us": r, "mean_token_us": c}));
         }
     }

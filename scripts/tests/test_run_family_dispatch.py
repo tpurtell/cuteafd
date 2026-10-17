@@ -213,6 +213,15 @@ def test_simple_draft_policy_is_forwarded_only_when_set(tmp_path: Path, value) -
         assert "CUTEAFD_DRAFT_POLICY" not in result.stderr
 
 
+@pytest.mark.parametrize("value", ["linear", "power", "log"])
+def test_simple_draft_row_cost_is_forwarded(tmp_path: Path, value) -> None:
+    result = _family_launch_result(tmp_path, {"model_type": "mimo_v2_flash", "num_hidden_layers": 2,
+                                            "moe_layer_freq": [0, 1]}, "XiaomiMiMo/MiMo-V2-Flash",
+                                  f"DRAFT_POLICY=simple-derived\nDRAFT_ROW_COST={value}\n")
+    assert result.returncode == 0, result.stderr
+    assert f"CUTEAFD_DRAFT_ROW_COST={value}" in result.stderr
+
+
 def test_simple_draft_policy_rejects_unknown_value(tmp_path: Path) -> None:
     result = _family_launch_result(tmp_path, {"model_type": "mimo_v2_flash", "num_hidden_layers": 2,
                                             "moe_layer_freq": [0, 1]}, "XiaomiMiMo/MiMo-V2-Flash",

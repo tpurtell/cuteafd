@@ -160,18 +160,21 @@ fn trace_simple(policy: &DraftPolicy) {
 
 fn cutoff_value(cutoff: &cuteafd_core::Cutoff) -> serde_json::Value {
     serde_json::json!({"value": cutoff.value, "raw": cutoff.raw, "clamped": cutoff.clamped,
-        "at_floor": cutoff.value == cuteafd_core::CUTOFF_FLOOR, "group": cutoff.group, "row_us": cutoff.row_us, "row_short_us": cutoff.row_short_us,
-        "row_pooled_us": cutoff.row_pooled_us, "token_us": cutoff.token_us, "fallback": cutoff.fallback})
+        "at_floor": cutoff.value == cuteafd_core::CUTOFF_FLOOR, "row_us": cutoff.row_us,
+        "token_us": cutoff.token_us, "fallback": cutoff.fallback,
+        "curve": cutoff.curve.map(|(exponent, b)| serde_json::json!({"exponent": exponent, "b": b}))})
 }
 
 fn simple_trace_value(policy: &DraftPolicy, round: &cuteafd_core::SimpleRound) -> serde_json::Value {
     serde_json::json!({"type": "simple_draft_round", "round": policy.stats().rounds, "mode": policy.draft_mode().label(),
+        "row_cost": policy.row_cost().label(),
         "total_us": round.total_us, "rows": round.rows, "accepted": round.accepted, "requests": round.requests,
         "cutoff_bounds": [cuteafd_core::CUTOFF_FLOOR, cuteafd_core::CUTOFF_CEILING],
         "after": cutoff_value(&round.after),
         "selection": round.selection.as_ref().map(|s| serde_json::json!({"cutoff": cutoff_value(&s.cutoff),
             "budget": s.budget, "scarce": s.scarce,
-            "requests": s.requests.iter().map(|d| serde_json::json!({"id": d.id, "offset": d.offset, "conditional": d.conditional,
+            "requests": s.requests.iter().map(|d| serde_json::json!({"id": d.id, "offset": d.offset, "cutoffs": d.cutoffs,
+                "conditional": d.conditional,
                 "joint": d.joint, "passing": d.passing, "chosen": d.chosen, "explore": d.explore})).collect::<Vec<_>>()}))})
 }
 

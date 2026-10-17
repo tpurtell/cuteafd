@@ -37,6 +37,20 @@ pub(crate) fn apply_length_rule(policy: &mut cuteafd_core::DraftPolicy) {
     if survival { tracing::info!("draft lengths follow calibrated survival >= 0.5"); }
     policy.set_survival_lengths(survival);
     policy.set_draft_mode(draft_mode());
+    policy.set_row_cost(row_cost());
+}
+
+/// How the simple rules price rows (`CUTEAFD_DRAFT_ROW_COST`, launcher key
+/// `DRAFT_ROW_COST`: linear by default, power or log).
+pub(crate) fn row_cost() -> cuteafd_core::RowCost {
+    static COST: std::sync::OnceLock<cuteafd_core::RowCost> = std::sync::OnceLock::new();
+    *COST.get_or_init(|| {
+        let value = std::env::var("CUTEAFD_DRAFT_ROW_COST").unwrap_or_default();
+        cuteafd_core::RowCost::parse(&value).unwrap_or_else(|| {
+            tracing::warn!(value, "unknown CUTEAFD_DRAFT_ROW_COST; using linear");
+            cuteafd_core::RowCost::Linear
+        })
+    })
 }
 
 /// The configured draft mode; an unknown value keeps the shared policy.

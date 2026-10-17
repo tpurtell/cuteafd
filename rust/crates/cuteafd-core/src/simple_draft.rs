@@ -18,22 +18,18 @@
 //! below the cutoff is never verified, so never calibrated (V4.1's dSpark
 //! head stayed at depth one).
 //!
-//! **Arms.** `simple`: cutoff 0.5. `simple-rc`: `r / c` with `r` the pooled
-//! slope of round time on verified rows among rounds at the selection's exact
-//! request count (the nearest count with enough row variation when that one
-//! has too little), so a concurrency ramp cannot leak into the slope; no
-//! offset. `simple-derived`: the same `r / c`, plus the per-request offset.
-//! (A short-window `r` shrunk to one pooled fit underpriced rows by 25-85%
-//! against the slope measured directly at fixed concurrency: it inherited
-//! concurrency ramps.)
+//! **Arms.** `simple`: cutoff 0.5. `simple-rc`: row `n + 1` is verified while
+//! `q > (T(n + 1) - T(n)) / c`, `T` the pooled row-cost surface
+//! ([`RowCost`]); no offset. `simple-derived`: the same, plus the
+//! per-request offset.
 //!
 //! **Cutoff.** `simple`: 0.5. `simple-rc` and `simple-derived`: `r / c`, clamped to
 //! [[`CUTOFF_FLOOR`], [`CUTOFF_CEILING`]], where `r` is the marginal round
-//! time of one more verified row (the pooled slope of `T` on rows at the
-//! selection's request count, see Arms) and `c` is the batch cost per
-//! committed token (`T / sum accepted` over a short window): adding a row
-//! raises tokens per second iff `q * T > r * E`, i.e. `q > r / c`. Until some
-//! request count has varied its rows enough to fit `r`, the cutoff is 0.5.
+//! time of the next verified row on the surface at the rows already taken
+//! and `c` is the batch cost per committed token (`T / sum accepted` over a
+//! short window): adding a row raises tokens per second iff `q * T > r * E`,
+//! i.e. `q > r / c`. Until the rounds have varied their rows enough to fit
+//! the surface, the cutoff is 0.5.
 use super::{DraftCandidate, DraftRoundObservation, DraftSelection, Platt};
 
 /// Which length rule a [`DraftPolicy`](super::DraftPolicy) follows.
@@ -67,6 +63,104 @@ impl DraftMode {
     }
 }
 
+/// How `simple-rc` and `simple-derived` price one more verified row: one
+/// pooled surface over every round, `T = a + k * C + b * f(n)` with `C` the
+/// request count and `n` the round's verified rows (unique experts touched
+/// follow the rows, concave and shared across requests; attention and
+/// per-request work follow `C`). `f(n)` is `n` (linear), `n^alpha` (power,
+/// alpha fitted on a grid in (0, 1]) or `ln(1 + n)` (log). Row `n + 1` costs
+/// `b * (f(n + 1) - f(n))`, so a concave fit's cutoff falls with depth.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RowCost {
+    Linear,
+    Power,
+    Log,
+}
+
+impl RowCost {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "" | "linear" => Some(Self::Linear),
+            "power" => Some(Self::Power),
+            "log" => Some(Self::Log),
+            _ => None,
+        }
+    }
+    pub fn label(self) -> &'static str {
+        match self { Self::Linear => "linear", Self::Power => "power", Self::Log => "log" }
+    }
+}
+
+/// Exponents the power model chooses among.
+const ALPHAS: [f64; 20] = [0.05, 0.1, 0.15, 0.2, 0.25, 0.3, 0.35, 0.4, 0.45, 0.5, 0.55, 0.6, 0.65, 0.7, 0.75,
+    0.8, 0.85, 0.9, 0.95, 1.];
+
+/// Decayed least squares of `T = a + k * C + b * f(n)` for one transform `f`.
+#[derive(Clone, Copy, Debug, Default)]
+struct Surface { xx: [[f64; 3]; 3], xy: [f64; 3], tt: f64 }
+
+impl Surface {
+    fn add(&mut self, decay: f64, requests: f64, f: f64, t: f64) {
+        let x = [1., requests, f];
+        for i in 0..3 {
+            for j in 0..3 { self.xx[i][j] = decay * self.xx[i][j] + x[i] * x[j]; }
+            self.xy[i] = decay * self.xy[i] + x[i] * t;
+        }
+        self.tt = decay * self.tt + t * t;
+    }
+    /// `f` variance left after the intercept and concurrency explain what they can.
+    fn row_variance(&self) -> f64 {
+        let [a, b, c] = [self.xx[0][0], self.xx[0][1], self.xx[1][1] + CONCURRENCY_RIDGE];
+        let det = a * c - b * b;
+        if det.partial_cmp(&0.) != Some(std::cmp::Ordering::Greater) { return 0.; }
+        let (u, v) = (self.xx[0][2], self.xx[1][2]);
+        self.xx[2][2] - (c * u * u - 2. * b * u * v + a * v * v) / det
+    }
+    /// `(b, residual sum of squares)`.
+    fn fit(&self) -> Option<(f64, f64)> {
+        let mut m = self.xx;
+        m[1][1] += CONCURRENCY_RIDGE;
+        let theta = solve3(m, self.xy)?;
+        let explained: f64 = (0..3).map(|i| theta[i] * self.xy[i]).sum();
+        Some((theta[2], (self.tt - explained).max(0.)))
+    }
+}
+
+/// One pooled surface over every round: round time against the request
+/// count and a transform of the verified rows, for each row-cost model.
+#[derive(Clone, Debug)]
+struct CurveFit { rows: Surface, log: Surface, power: [Surface; ALPHAS.len()] }
+
+impl Default for CurveFit {
+    fn default() -> Self { Self { rows: Surface::default(), log: Surface::default(), power: [Surface::default(); ALPHAS.len()] } }
+}
+
+impl CurveFit {
+    fn add(&mut self, decay: f64, requests: f64, rows: f64, total: f64) {
+        self.rows.add(decay, requests, rows, total);
+        self.log.add(decay, requests, rows.ln_1p(), total);
+        for (surface, alpha) in self.power.iter_mut().zip(ALPHAS) { surface.add(decay, requests, rows.powf(alpha), total); }
+    }
+    fn usable(&self) -> bool { self.rows.row_variance() >= MIN_ROW_VARIANCE }
+    /// `(exponent, b)` of the chosen model; exponent 0 means log, 1 linear.
+    fn model(&self, cost: RowCost) -> Option<(f64, f64)> {
+        if !self.usable() { return None; }
+        match cost {
+            RowCost::Linear => self.rows.fit().map(|(b, _)| (1., b)),
+            RowCost::Log => self.log.fit().map(|(b, _)| (0., b)),
+            RowCost::Power => self.power.iter().zip(ALPHAS)
+                .filter_map(|(surface, alpha)| surface.fit().map(|(b, sse)| (alpha, b, sse)))
+                .min_by(|a, b| a.2.total_cmp(&b.2)).map(|(alpha, b, _)| (alpha, b)),
+        }
+    }
+}
+
+/// `T(n + 1) - T(n)` of a fitted model, nonnegative.
+fn marginal((exponent, slope): (f64, f64), n: f64) -> f64 {
+    let f = |x: f64| if exponent == 0. { x.ln_1p() } else { x.powf(exponent) };
+    (slope * (f(n + 1.) - f(n))).max(0.)
+}
+
 /// The `simple` cutoff, and the derived one's fallback.
 pub const SIMPLE_CUTOFF: f64 = 0.5;
 /// Bounds of the derived cutoff.
@@ -93,44 +187,6 @@ fn report_group(requests: usize) -> usize {
     match requests { 0..=1 => 0, 2..=4 => 1, 5..=8 => 2, _ => 3 }
 }
 
-/// Decayed weighted least squares of `T = a0 + a1 * C + r * rows`, with the
-/// window's committed tokens and time.
-#[derive(Clone, Copy, Debug, Default)]
-struct RoundFit { xx: [[f64; 3]; 3], xy: [f64; 3], tokens: f64, time: f64 }
-
-impl RoundFit {
-    fn add(&mut self, decay: f64, requests: f64, rows: f64, total: f64, tokens: f64) {
-        let x = [1., requests, rows];
-        for i in 0..3 {
-            for j in 0..3 { self.xx[i][j] = decay * self.xx[i][j] + x[i] * x[j]; }
-            self.xy[i] = decay * self.xy[i] + x[i] * total;
-        }
-        self.tokens = decay * self.tokens + tokens;
-        self.time = decay * self.time + total;
-    }
-    /// Row variance left after the intercept and concurrency explain what they can.
-    fn row_variance(&self) -> f64 {
-        let [a, b, c] = [self.xx[0][0], self.xx[0][1], self.xx[1][1] + CONCURRENCY_RIDGE];
-        let det = a * c - b * b;
-        if det.partial_cmp(&0.) != Some(std::cmp::Ordering::Greater) { return 0.; }
-        let (u, v) = (self.xx[0][2], self.xx[1][2]);
-        self.xx[2][2] - (c * u * u - 2. * b * u * v + a * v * v) / det
-    }
-    /// The row coefficient with a ridge of `strength` toward `prior`, if the
-    /// window varied its rows enough (or the ridge carries it).
-    fn slope(&self, prior: f64, strength: f64) -> Option<f64> {
-        let mut m = self.xx;
-        let mut y = self.xy;
-        m[1][1] += CONCURRENCY_RIDGE;
-        m[2][2] += strength;
-        y[2] += strength * prior;
-        solve3(m, y).map(|theta| theta[2])
-    }
-    fn cost_per_token(&self) -> Option<f64> {
-        (self.tokens > 0.).then(|| self.time / self.tokens)
-    }
-}
-
 fn solve3(mut m: [[f64; 3]; 3], mut y: [f64; 3]) -> Option<[f64; 3]> {
     for col in 0..3 {
         let pivot = (col..3).max_by(|&a, &b| m[a][col].abs().total_cmp(&m[b][col].abs()))?;
@@ -151,23 +207,22 @@ fn solve3(mut m: [[f64; 3]; 3], mut y: [f64; 3]) -> Option<[f64; 3]> {
 /// The cutoff of one selection and what it came from.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Cutoff {
-    /// What the rule compares `q` against (one half, or `r / c` clamped).
+    /// What the rule compares `q` against: one half, or `r / c` clamped for
+    /// the first draft row.
     pub value: f64,
     /// `r / c` before the clamp, when both were known.
     pub raw: Option<f64>,
     /// `r / c` hit [`CUTOFF_FLOOR`] or [`CUTOFF_CEILING`].
     pub clamped: bool,
-    /// Request count whose pooled `r` `simple-rc` used.
-    pub group: Option<usize>,
-    /// Marginal µs per verified row: the short window alone (reported only),
-    /// the pooled fit at the request count used, and what the rule uses.
-    pub row_short_us: Option<f64>,
-    pub row_pooled_us: Option<f64>,
+    /// Marginal µs of the first draft row, `T(C + 1) - T(C)` on the surface.
     pub row_us: Option<f64>,
     /// Batch µs per committed token over the short window.
     pub token_us: Option<f64>,
     /// The derived rule wanted `r / c` but held one half.
     pub fallback: bool,
+    /// The surface's `(exponent, b)` (exponent 0 is log, 1 linear) whose
+    /// marginal `T(n + 1) - T(n)` prices each row.
+    pub curve: Option<(f64, f64)>,
 }
 
 /// One request's decision, kept for the round's trace.
@@ -182,6 +237,8 @@ pub struct SimpleDecision {
     pub passing: usize,
     pub chosen: usize,
     pub explore: bool,
+    /// Concave row cost: the cutoff each chosen position cleared (or failed).
+    pub cutoffs: Vec<f64>,
 }
 
 /// One selection: the cutoff, the draft-row budget and each request's decision.
@@ -245,10 +302,12 @@ pub(crate) struct SimpleDraft {
     calibration: Vec<Platt>,
     /// First copy-tail position: the drafter's widest native block.
     native: usize,
-    short: RoundFit,
-    pooled: RoundFit,
-    /// Pooled fits per exact request count (`simple-rc`'s `r`), index `C - 1`.
-    by_requests: Vec<RoundFit>,
+    /// Short-window committed tokens and round time, for `c`.
+    tokens: f64,
+    time: f64,
+    /// The pooled row-cost surface.
+    curve: CurveFit,
+    row_cost: RowCost,
     rng: u64,
     pending: Option<SimpleSelection>,
     last: Option<SimpleRound>,
@@ -258,16 +317,20 @@ pub(crate) struct SimpleDraft {
 
 impl SimpleDraft {
     pub fn new(mode: DraftMode, positions: usize, native: usize) -> Self {
-        Self { mode, outcomes: Default::default(), calibration: vec![Platt::new(); positions], native, short: RoundFit::default(),
-            pooled: RoundFit::default(), by_requests: Vec::new(), rng: 0x9e37_79b9_7f4a_7c15, pending: None, last: None,
+        Self { mode, outcomes: Default::default(), calibration: vec![Platt::new(); positions], native, tokens: 0., time: 0.,
+            curve: CurveFit::default(), row_cost: RowCost::Linear, rng: 0x9e37_79b9_7f4a_7c15, pending: None, last: None,
             reliability: std::array::from_fn(|_| std::array::from_fn(|_| vec![Reliability::default(); positions])) }
     }
     pub fn mode(&self) -> DraftMode { self.mode }
+    pub fn row_cost(&self) -> RowCost { self.row_cost }
+    pub fn set_row_cost(&mut self, cost: RowCost) { self.row_cost = cost; }
     pub fn set_native(&mut self, native: usize) { self.native = native; }
     pub fn calibration(&self) -> Vec<(f64, f64)> {
         self.calibration.iter().map(|platt| (platt.theta[0], platt.theta[1])).collect()
     }
     pub fn last_round(&self) -> Option<&SimpleRound> { self.last.as_ref() }
+    /// The selection awaiting its round's observation.
+    pub fn pending(&self) -> Option<&SimpleSelection> { self.pending.as_ref() }
     /// `[group][native, tail][position]`, groups as [`REPORT_GROUPS`].
     pub fn reliability(&self) -> &[[Vec<Reliability>; 2]; 4] { &self.reliability }
     /// Platt-calibrated conditional acceptance per position.
@@ -286,27 +349,15 @@ impl SimpleDraft {
             .map(|p| if offset == 0. { p } else { sigmoid(logit(p.clamp(1e-6, 1. - 1e-6)) + offset) }).collect()
     }
     pub fn release(&mut self, id: u64) { self.outcomes.remove(&id); }
-    /// The cutoff for a selection over `requests` requests.
+    /// The cutoff of the first draft row of a selection over `requests`
+    /// requests (`n` = the anchors). Deeper rows are priced in the selection.
     pub fn cutoff(&self, requests: usize) -> Cutoff {
-        let usable = |fit: &RoundFit| fit.row_variance() >= MIN_ROW_VARIANCE;
-        let short = usable(&self.short).then(|| self.short.slope(0., 0.)).flatten();
-        let (pooled_fit, group) = match self.mode {
-            DraftMode::SimpleRc | DraftMode::SimpleDerived => {
-                // The nearest request count with enough row variation, ties to the larger.
-                let nearest = (0..self.by_requests.len()).filter(|&i| usable(&self.by_requests[i]))
-                    .min_by_key(|&i| ((i + 1).abs_diff(requests), usize::MAX - i));
-                match nearest { Some(i) => (&self.by_requests[i], Some(i + 1)), None => (&self.pooled, None) }
-            }
-            _ => (&self.pooled, None),
-        };
-        let pooled = match self.mode {
-            DraftMode::SimpleRc | DraftMode::SimpleDerived => group.and_then(|_| pooled_fit.slope(0., 0.)),
-            _ => usable(pooled_fit).then(|| pooled_fit.slope(0., 0.)).flatten(),
-        };
-        let row_us = pooled.map(|r| r.max(0.));
-        let token_us = self.short.cost_per_token();
-        let mut cutoff = Cutoff { value: SIMPLE_CUTOFF, raw: None, clamped: false, group, row_short_us: short,
-            row_pooled_us: pooled, row_us, token_us, fallback: false };
+        let token_us = self.cost_per_token();
+        let curve = matches!(self.mode, DraftMode::SimpleRc | DraftMode::SimpleDerived)
+            .then(|| self.curve.model(self.row_cost)).flatten();
+        let row_us = curve.map(|model| marginal(model, requests as f64));
+        let mut cutoff = Cutoff { value: SIMPLE_CUTOFF, raw: None, clamped: false, row_us, token_us, fallback: false,
+            curve };
         if matches!(self.mode, DraftMode::SimpleRc | DraftMode::SimpleDerived) {
             match (row_us, token_us) {
                 (Some(r), Some(c)) if c > 0. => {
@@ -315,10 +366,13 @@ impl SimpleDraft {
                     cutoff.value = raw.clamp(CUTOFF_FLOOR, CUTOFF_CEILING);
                     cutoff.clamped = cutoff.value != raw;
                 }
-                _ => cutoff.fallback = true,
+                _ => { cutoff.fallback = true; cutoff.curve = None; }
             }
         }
         cutoff
+    }
+    fn cost_per_token(&self) -> Option<f64> {
+        (self.tokens > 0.).then(|| self.time / self.tokens)
     }
     fn random(&mut self, below: usize) -> usize {
         // splitmix64: deterministic, so replays and tests repeat.
@@ -338,7 +392,7 @@ impl SimpleDraft {
             let joint: Vec<f64> = conditional.iter().map(|p| { product *= p; product }).collect();
             let passing = joint.iter().take_while(|&&q| q > cutoff.value).count();
             SimpleDecision { id: candidate.id, offset: self.offset(candidate.id), conditional, joint, passing,
-                chosen: passing, explore: false }
+                chosen: passing, explore: false, cutoffs: Vec::new() }
         }).collect();
         let budget = max_rows.saturating_sub(candidates.len());
         let wanted: usize = decisions.iter().map(|d| d.passing).sum();
@@ -357,11 +411,45 @@ impl SimpleDraft {
                 decisions[index].explore = true;
             }
         }
+        if let (Some(model), Some(token)) = (cutoff.curve, cutoff.token_us.filter(|&c| c > 0.)) {
+            self.price_by_depth(&mut decisions, model, token, candidates.len(), budget);
+        }
+        let scarce = scarce || decisions.iter().any(|d| d.chosen < d.passing);
         let lengths: Vec<usize> = decisions.iter().map(|d| d.chosen).collect();
         let expected = candidates.len() as f64
             + decisions.iter().map(|d| d.joint[..d.chosen].iter().sum::<f64>()).sum::<f64>();
         self.pending = Some(SimpleSelection { cutoff, budget, scarce, requests: decisions });
         DraftSelection { lengths, expected_tokens: expected, predicted_us: 0., evaluated: 1 }
+    }
+
+    /// Concave row cost: take positions in descending `q` (each request's in
+    /// prefix order), each while its `q` clears `T(n + 1) - T(n)` over the
+    /// cost per token at the rows already taken, then explore one past.
+    fn price_by_depth(&mut self, decisions: &mut [SimpleDecision], model: (f64, f64), token: f64, anchors: usize,
+        budget: usize) {
+        let mut positions: Vec<(f64, usize, usize)> = decisions.iter().enumerate()
+            .flat_map(|(index, d)| (0..d.joint.len()).map(move |k| (d.joint[k], k, index))).collect();
+        positions.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2)));
+        for decision in decisions.iter_mut() { decision.chosen = 0; decision.passing = 0; decision.explore = false; }
+        let mut blocked = vec![false; decisions.len()];
+        let mut rows = anchors;
+        for (q, k, index) in positions {
+            if blocked[index] || k != decisions[index].chosen { continue; }
+            let cutoff = (marginal(model, rows as f64) / token).clamp(CUTOFF_FLOOR, CUTOFF_CEILING);
+            decisions[index].cutoffs.push(cutoff);
+            if q <= cutoff { blocked[index] = true; continue; }
+            decisions[index].passing += 1;
+            if rows - anchors >= budget { continue; }
+            decisions[index].chosen += 1;
+            rows += 1;
+        }
+        let open: Vec<usize> = (0..decisions.len()).filter(|&i| decisions[i].chosen < decisions[i].joint.len()
+            && decisions[i].chosen == decisions[i].passing).collect();
+        if rows - anchors < budget && !open.is_empty() {
+            let index = open[self.random(open.len())];
+            decisions[index].chosen += 1;
+            decisions[index].explore = true;
+        }
     }
 
     /// Learn the calibration, `r` and `c` from one completed round.
@@ -401,12 +489,9 @@ impl SimpleDraft {
             }
         }
         if round.total_us.is_finite() && round.total_us > 0. && rows > 0 {
-            let requests = round.requests.len() as f64;
-            self.short.add(SHORT_DECAY, requests, rows as f64, round.total_us, accepted as f64);
-            self.pooled.add(POOLED_DECAY, requests, rows as f64, round.total_us, accepted as f64);
-            let count = round.requests.len();
-            if self.by_requests.len() < count { self.by_requests.resize(count, RoundFit::default()); }
-            self.by_requests[count - 1].add(POOLED_DECAY, requests, rows as f64, round.total_us, accepted as f64);
+            self.tokens = SHORT_DECAY * self.tokens + accepted as f64;
+            self.time = SHORT_DECAY * self.time + round.total_us;
+            self.curve.add(POOLED_DECAY, round.requests.len() as f64, rows as f64, round.total_us);
         }
         self.last = Some(SimpleRound { total_us: round.total_us, rows, accepted, requests: round.requests.len(),
             selection: self.pending.take(), after: self.cutoff(round.requests.len()) });
@@ -522,8 +607,9 @@ mod tests {
             let rows = (requests * per) as f64;
             observe(&mut policy, &observed, 5_000. + 1_000. * requests as f64 + 2_000. * rows);
         }
+        // One surface over both concurrencies recovers the row price and the per-request term.
         let cutoff = policy.cutoff(1);
-        assert!((cutoff.row_pooled_us.unwrap() - 2_000.).abs() < 5., "{cutoff:?}");
+        assert_eq!(cutoff.curve.map(|c| c.0), Some(1.));
         assert!((cutoff.row_us.unwrap() - 2_000.).abs() < 5., "{cutoff:?}");
         let token = cutoff.token_us.unwrap();
         assert!(!cutoff.fallback);
@@ -549,13 +635,10 @@ mod tests {
         // Both arms price rows the same way.
         let (a, b) = (rc.cutoff(1), derived.cutoff(1));
         assert_eq!(a, b);
-        assert_eq!(a.row_us, a.row_pooled_us);
-        assert_eq!(a.group, Some(1));
         assert!(!a.fallback);
         assert_eq!(a.raw.map(|raw| raw.clamp(CUTOFF_FLOOR, CUTOFF_CEILING)), Some(a.value));
-        // C16 borrows the nearest request count with row variation (C1 here).
-        assert_eq!(rc.cutoff(16).group, Some(1));
-        assert_eq!(rc.cutoff(16).row_us, a.row_us);
+        // A linear surface prices every row the same at any concurrency.
+        assert!((rc.cutoff(16).row_us.unwrap() - a.row_us.unwrap()).abs() < 1e-6);
         assert_eq!(rc.offset(1), 0.);
         assert!(derived.offset(1) > 0.);
         let p = [0.9, 0.8, 0.8, 0.8, 0.5, 0.5, 0.5];
@@ -564,6 +647,32 @@ mod tests {
         assert!(pending.requests[0].explore);
         assert_eq!(selection.lengths, [pending.requests[0].passing + 1]);
         assert_eq!(DraftMode::parse("simple-rc"), Some(DraftMode::SimpleRc));
+    }
+
+    #[test]
+    fn concave_row_cost_raises_the_cutoff_for_shallow_rows() {
+        for cost in [RowCost::Power, RowCost::Log] {
+            let mut policy = SimpleDraft::new(DraftMode::SimpleDerived, 8, 8);
+            policy.set_row_cost(cost);
+            // T = 10 ms + 8 ms * sqrt(rows): marginal row cost falls with depth.
+            for round in 0..300 {
+                let rows = 1 + round % 8;
+                let observed = [ObservedDraftRequest { id: 1, rows, accepted: rows.min(3), confidence: None }];
+                observe(&mut policy, &observed, 10_000. + 8_000. * (rows as f64).sqrt());
+            }
+            let cutoff = policy.cutoff(1);
+            let model = cutoff.curve.unwrap();
+            if cost == RowCost::Power { assert!((model.0 - 0.5).abs() < 0.051, "{model:?}"); }
+            assert!(marginal(model, 1.) > marginal(model, 6.));
+            let p = [0.95; 7];
+            policy.select(&[DraftCandidate { id: 9, confidence: &p }], 64);
+            let decision = &policy.pending.as_ref().unwrap().requests[0];
+            // Each successive position faces a lower (or equal, once clamped) cutoff.
+            assert!(decision.cutoffs.windows(2).all(|w| w[1] <= w[0] + 1e-12), "{:?}", decision.cutoffs);
+            assert_eq!(decision.cutoffs[0], cutoff.value);
+        }
+        assert_eq!(RowCost::parse("power"), Some(RowCost::Power));
+        assert_eq!(RowCost::parse(""), Some(RowCost::Linear));
     }
 
     #[test]

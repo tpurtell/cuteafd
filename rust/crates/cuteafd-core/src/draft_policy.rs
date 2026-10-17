@@ -39,7 +39,7 @@
 use std::collections::{BTreeMap, VecDeque};
 #[path = "simple_draft.rs"]
 mod simple_draft;
-pub use simple_draft::{Cutoff, DraftMode, Reliability, SimpleDecision, SimpleRound, SimpleSelection, CUTOFF_CEILING,
+pub use simple_draft::{Cutoff, DraftMode, Reliability, RowCost, SimpleDecision, SimpleRound, SimpleSelection, CUTOFF_CEILING,
     CUTOFF_FLOOR, OFFSET_PRIOR, REPORT_GROUPS, SIMPLE_CUTOFF};
 use simple_draft::SimpleDraft;
 
@@ -861,6 +861,7 @@ impl DraftPolicy {
         let mut policy = Self::build(self.geometry.clone(), fixed, self.seed.clone());
         policy.survival_lengths = self.survival_lengths;
         policy.set_draft_mode(self.draft_mode());
+        policy.set_row_cost(self.row_cost());
         policy.native_confidence_positions = self.native_confidence_positions;
         policy
     }
@@ -890,6 +891,13 @@ impl DraftPolicy {
         self.simple = (mode != DraftMode::Shared)
             .then(|| SimpleDraft::new(mode, self.geometry.max_positions, native));
     }
+    /// How the simple rules price rows (default linear).
+    pub fn set_row_cost(&mut self, cost: RowCost) {
+        if let Some(simple) = &mut self.simple { simple.set_row_cost(cost); }
+    }
+    pub fn row_cost(&self) -> RowCost {
+        self.simple.as_ref().map_or(RowCost::Linear, SimpleDraft::row_cost)
+    }
     pub fn draft_mode(&self) -> DraftMode {
         self.simple.as_ref().map_or(DraftMode::Shared, SimpleDraft::mode)
     }
@@ -906,6 +914,10 @@ impl DraftPolicy {
     /// the decisions behind it), for traces.
     pub fn simple_round(&self) -> Option<&SimpleRound> {
         self.simple.as_ref().and_then(SimpleDraft::last_round)
+    }
+    /// The simple rule's latest selection, before its round is observed.
+    pub fn simple_pending(&self) -> Option<&SimpleSelection> {
+        self.simple.as_ref().and_then(SimpleDraft::pending)
     }
     /// The simple rule's per-position (slope, offset) calibration.
     pub fn simple_calibration(&self) -> Option<Vec<(f64, f64)>> {
