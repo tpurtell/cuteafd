@@ -12,8 +12,7 @@ fn real_registered_output_matches_device_compaction_and_preserves_guards() -> Re
     let Some(path) = std::env::var_os("CUTEAFD_MAPPED_EXPERT_LIBRARY") else { return Ok(()); };
     let lib = unsafe { NativeLibrary::load(std::path::Path::new(&path)) }?;
     let snapshot = std::env::var_os("CUTEAFD_MAPPED_EXPERT_MODEL").context("missing model")?;
-    let catalog = cuteafd_loader::read_official_v41_catalog(cuteafd_loader::OFFICIAL_V41_MODEL_ID,
-        std::path::Path::new(&snapshot))?;
+    let catalog = cuteafd_loader::read_official_v41_catalog(std::path::Path::new(&snapshot))?;
     let weights = ExpertWeights::load(&lib, &catalog, ExpertLayer::Backbone { layer: 0, rank: 0 }, 16 << 30)?;
     let mut execution = weights.execution(4096, 4096, 16 << 30)?;
     let mut exchange = HostExpertExchange::new(4096)?;

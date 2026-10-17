@@ -305,7 +305,7 @@ mod tests {
     fn real_snapshot_stages_tp4_tp2_tp3_and_tp6_experts() {
         let path = std::env::var_os("CUTEAFD_NVFP4_SNAPSHOT").expect("CUTEAFD_NVFP4_SNAPSHOT");
         let catalog =
-            crate::read_official_v41_catalog("nvidia/DeepSeek-V4.1-Flash-NVFP4", Path::new(&path))
+            crate::read_official_v41_catalog(Path::new(&path))
                 .unwrap();
         for selection in [
             V41ExpertSelection::Backbone { layer: 0, expert: 0, rank: 0 },
@@ -344,8 +344,7 @@ mod tests {
     #[ignore = "requires CUTEAFD_NVFP4_SNAPSHOT pointing to a local ModelOpt NVFP4 publication"]
     fn real_snapshot_tp3_tp6_regions_match_full() {
         let path = std::env::var_os("CUTEAFD_NVFP4_SNAPSHOT").expect("CUTEAFD_NVFP4_SNAPSHOT");
-        let catalog = crate::read_official_v41_catalog(
-            "nvidia/DeepSeek-V4.1-Flash-NVFP4", Path::new(&path),
+        let catalog = crate::read_official_v41_catalog(Path::new(&path)
         ).unwrap();
         let full = catalog.nvfp4_expert_staging(
             V41ExpertSelection::BackboneFull { layer: 0, expert: 0 },

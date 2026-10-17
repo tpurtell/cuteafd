@@ -118,6 +118,8 @@ def main():
             indices = ns['get_window_topk_idxs'](128,16,5,0)
             attention = torch.cat([ref.sparse_attn(q[:,:,h:h+16].contiguous(),kv,sink[h:h+16].contiguous(),indices,512**-.5) for h in range(0,64,16)],dim=2)
             ns['apply_rotary_emb'](attention[..., -64:],frequencies,True)
+            # DeepSeek-V4.1-Flash-1017 model.py: MXFP8-quantize o before the grouped wo_a einsum.
+            attention = ref.act_quant(attention, 32, 'ue8m0', torch.float8_e8m0fnu, True)
             grouped = torch.einsum('bsgd,grd->bsgr',attention.reshape(16,5,8,4096),grouped_weight)
             projected = fp8(grouped.flatten(2),'layers.0.attn.wo_b')
             after_attention = ns['hc_post'](obj,projected,residual,post,comb)

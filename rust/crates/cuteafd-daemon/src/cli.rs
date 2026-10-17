@@ -991,6 +991,8 @@ pub(crate) struct NativeServeArgs {
     pub api: crate::shared::api::ApiArgs,
 
     #[arg(long)] pub snapshot: PathBuf,
+    /// Public model id; defaults to the snapshot's Hugging Face id.
+    #[arg(long)] pub model_id: Option<String>,
     #[arg(long)] pub native_lib: PathBuf,
     #[arg(long,value_delimiter=',',num_args=1..)] pub peers: Vec<std::net::SocketAddr>,
     #[arg(long,default_value="127.0.0.1:8000")] pub listen: String,

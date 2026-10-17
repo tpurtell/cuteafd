@@ -208,8 +208,7 @@ mod tests {
         let capacity: u32 = std::env::var("CUTEAFD_TP2_TEST_CAPACITY").unwrap_or_else(|_| "16".into()).parse()?;
         ensure!((1..=4096).contains(&capacity), "invalid fixture capacity");
         let lib = unsafe { cuteafd_ffi::NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? };
-        let catalog = cuteafd_loader::read_official_v41_catalog(cuteafd_loader::OFFICIAL_V41_MODEL_ID,
-            std::path::Path::new(&std::env::var("CUTEAFD_SNAPSHOT")?))?;
+        let catalog = cuteafd_loader::read_official_v41_catalog(std::path::Path::new(&std::env::var("CUTEAFD_SNAPSHOT")?))?;
         lib.cuda_set_device(0)?;
         let devices = [Device { library: &lib, id: 0 }, Device { library: &lib, id: 1 }];
         let weights = [
@@ -258,8 +257,7 @@ mod tests {
     #[ignore = "requires shared TP2 CUTEAFD_NATIVE_LIB, CUTEAFD_SNAPSHOT, two GPUs"]
     fn real_shared_tp2_rank_loading_and_execution() -> Result<()> {
         let lib = unsafe { cuteafd_ffi::NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? };
-        let catalog = cuteafd_loader::read_official_v41_catalog(cuteafd_loader::OFFICIAL_V41_MODEL_ID,
-            std::path::Path::new(&std::env::var("CUTEAFD_SNAPSHOT")?))?;
+        let catalog = cuteafd_loader::read_official_v41_catalog(std::path::Path::new(&std::env::var("CUTEAFD_SNAPSHOT")?))?;
         lib.cuda_set_device(0)?;
         let mut ranks = Vec::new();
         for id in 0..2 {

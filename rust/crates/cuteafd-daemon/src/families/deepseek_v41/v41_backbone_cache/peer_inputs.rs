@@ -23,8 +23,7 @@ mod tests {
     #[ignore = "requires compact attention, SM peer copy, CUTEAFD_SNAPSHOT and two CUDA GPUs"]
     fn checkpoint_private_inputs_reach_peer_with_original_bindings()->Result<()> {
         let lib=unsafe { NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? };
-        let catalog=cuteafd_loader::read_official_v41_catalog(cuteafd_loader::OFFICIAL_V41_MODEL_ID,
-            std::path::Path::new(&std::env::var("CUTEAFD_SNAPSHOT")?))?;
+        let catalog=cuteafd_loader::read_official_v41_catalog(std::path::Path::new(&std::env::var("CUTEAFD_SNAPSHOT")?))?;
         let map=CachePlacement::encoder_decoder();
         for layer in [2,20] {
             let source=Device { library:&lib,id:map.attention(layer)? as i32 };

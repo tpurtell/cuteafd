@@ -217,9 +217,7 @@ mod tests {
     #[ignore = "requires CUTEAFD_NATIVE_LIB, CUTEAFD_SNAPSHOT, and two CUDA GPUs"]
     fn placed_index_queries_and_retained_decoder_candidates_match_direct() -> Result<()> {
         let lib = unsafe { NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? };
-        let catalog = cuteafd_loader::read_official_v41_catalog(
-            cuteafd_loader::OFFICIAL_V41_MODEL_ID,
-            std::path::Path::new(&std::env::var("CUTEAFD_SNAPSHOT")?),
+        let catalog = cuteafd_loader::read_official_v41_catalog(std::path::Path::new(&std::env::var("CUTEAFD_SNAPSHOT")?),
         )?;
         lib.cuda_set_device(0)?;
         let placement = CachePlacement::new(std::array::from_fn(|layer| usize::from(layer >= 14)))?;

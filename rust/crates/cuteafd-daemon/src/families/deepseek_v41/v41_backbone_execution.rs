@@ -761,9 +761,7 @@ mod tests {
         let model = std::env::var_os("CUTEAFD_LANE_PLAN_MODEL")
             .context("CUTEAFD_LANE_PLAN_MODEL required")?;
         let library = unsafe { NativeLibrary::load(path)? };
-        let catalog = cuteafd_loader::read_official_v41_catalog(
-            cuteafd_loader::OFFICIAL_V41_MODEL_ID,
-            std::path::Path::new(&model),
+        let catalog = cuteafd_loader::read_official_v41_catalog(std::path::Path::new(&model),
         )?;
         let bytes = CacheProducerWeights::device_bytes(&library, &catalog)?;
         assert_eq!(bytes, 145_517_568);

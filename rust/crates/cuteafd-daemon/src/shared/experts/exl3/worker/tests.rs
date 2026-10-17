@@ -184,9 +184,7 @@ fn exl3_worker_capacity_bounds() -> Result<()> {
 fn exl3_worker_mapped_and_chunked_responses_match_reference() -> Result<()> {
     let lib = unsafe { NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? };
     lib.cuda_set_device(0)?;
-    let catalog = cuteafd_loader::read_official_v41_catalog(
-        cuteafd_loader::OFFICIAL_V41_MODEL_ID,
-        Path::new(&std::env::var("CUTEAFD_EXL3_SNAPSHOT")?),
+    let catalog = cuteafd_loader::read_official_v41_catalog(Path::new(&std::env::var("CUTEAFD_EXL3_SNAPSHOT")?),
     )?;
     let aot = std::path::PathBuf::from(std::env::var("CUTEAFD_EXL3_AOT")?);
     let fixture = std::path::PathBuf::from(std::env::var("CUTEAFD_EXL3_FIXTURE")?);

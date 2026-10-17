@@ -297,7 +297,7 @@ impl V41Exl3Manifest {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{OfficialV41Config, V41Exl3Projection, OFFICIAL_V41_MODEL_ID};
+    use crate::{OfficialV41Config, V41Exl3Projection};
     use std::collections::BTreeMap;
 
     #[test]
@@ -317,9 +317,7 @@ mod tests {
     }
 
     fn fixture(tiers: &[usize]) -> V41Exl3Manifest {
-        let config = OfficialV41Config::from_json(
-            OFFICIAL_V41_MODEL_ID,
-            include_bytes!("official-v41-config.json"),
+        let config = OfficialV41Config::from_json(include_bytes!("official-v41-config.json"),
         )
         .unwrap();
         let mut projections = BTreeMap::new();

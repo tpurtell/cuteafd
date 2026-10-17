@@ -180,9 +180,7 @@ mod tests {
     #[ignore = "requires CUTEAFD_EXL3_SNAPSHOT pointing to a published local snapshot"]
     fn published_projection_reads_match_full_checkpoint_bytes() {
         let path = std::env::var_os("CUTEAFD_EXL3_SNAPSHOT").expect("CUTEAFD_EXL3_SNAPSHOT");
-        let catalog = crate::read_official_v41_catalog(
-            crate::OFFICIAL_V41_MODEL_ID,
-            std::path::Path::new(&path),
+        let catalog = crate::read_official_v41_catalog(std::path::Path::new(&path),
         )
         .unwrap();
         for kind in [

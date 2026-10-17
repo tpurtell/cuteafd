@@ -143,7 +143,7 @@ impl RouterOutput<'_> {
 #[cfg(test)]
 mod reuse_tests {
     use super::*;
-    use cuteafd_loader::{read_official_v41_catalog, OFFICIAL_V41_MODEL_ID};
+    use cuteafd_loader::read_official_v41_catalog;
 
     #[test]
     fn expert_request_wire_format_tracks_nvfp4_checkpoint() {
@@ -175,7 +175,7 @@ mod reuse_tests {
         };
         let model = std::env::var_os("CUTEAFD_ROUTER_REUSE_MODEL").context("CUTEAFD_ROUTER_REUSE_MODEL required")?;
         let library = unsafe { NativeLibrary::load(path)? };
-        let catalog = read_official_v41_catalog(OFFICIAL_V41_MODEL_ID, std::path::Path::new(&model))?;
+        let catalog = read_official_v41_catalog(std::path::Path::new(&model))?;
         let weights = (0..2).map(|layer| BackboneRouterWeights::load(&library, &catalog, layer, 1 << 30, 16 << 20))
             .collect::<Result<Vec<_>>>()?;
         for rows in [1, 16, 80, 256] {
@@ -236,7 +236,7 @@ mod reuse_tests {
             .context("CUTEAFD_ROUTER_REUSE_MODEL required")?;
         let library = unsafe { NativeLibrary::load(path)? };
         let catalog =
-            read_official_v41_catalog(OFFICIAL_V41_MODEL_ID, std::path::Path::new(&model))?;
+            read_official_v41_catalog(std::path::Path::new(&model))?;
         let weights = (0..40)
             .map(|layer| {
                 BackboneRouterWeights::load(&library, &catalog, layer, 3_935_232, 1024 * 1024)

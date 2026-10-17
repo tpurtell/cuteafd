@@ -12,7 +12,7 @@ fn exl3_dspark_resident_stages_match_b12x() -> Result<()> {
     let package = PathBuf::from(std::env::var("CUTEAFD_EXL3_AOT")?);
     let fixtures = PathBuf::from(std::env::var("CUTEAFD_EXL3_FIXTURE")?);
     let catalog =
-        cuteafd_loader::read_official_v41_catalog(cuteafd_loader::OFFICIAL_V41_MODEL_ID, &snapshot)?;
+        cuteafd_loader::read_official_v41_catalog(&snapshot)?;
     for device in [0, 1] {
         lib.cuda_set_device(device)?;
         let owner = DsparkWeights::load_with_width(

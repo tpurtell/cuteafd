@@ -120,9 +120,7 @@ impl LocalEncoder {
                     // SAFETY: selected architecture-matching native library; all CUDA owners live on this thread.
                     let lib = unsafe { cuteafd_ffi::NativeLibrary::load(&library) }?;
                     lib.cuda_set_device(device)?;
-                    let catalog = cuteafd_loader::read_official_v41_catalog(
-                        cuteafd_loader::OFFICIAL_V41_MODEL_ID,
-                        &snapshot,
+                    let catalog = cuteafd_loader::read_official_v41_catalog(&snapshot,
                     )?;
                     let bytes = VisionRuntime::device_bytes(&catalog, CAPACITY)?;
                     let info = lib.cuda_device_info(device)?;
@@ -381,7 +379,7 @@ pub(crate) fn start_worker(
     let sm = crate::shared::vision::worker::architecture(&library)?;
     ensure!(sm == 121, "V4.1 Spark worker requires SM121, got SM{sm}");
     let catalog =
-        cuteafd_loader::read_official_v41_catalog(cuteafd_loader::OFFICIAL_V41_MODEL_ID, snapshot)?;
+        cuteafd_loader::read_official_v41_catalog(snapshot)?;
     let mut encoder =
         LocalEncoder::start(snapshot.to_owned(), library, 0, usize::try_from(budget)?)?;
     let bytes = encoder.bytes as u64;
@@ -417,9 +415,7 @@ mod tests {
         let output = PathBuf::from(std::env::var_os("CUTEAFD_VISION_OUTPUT").context("output")?);
         ensure!(!output.exists(), "preserve qualification evidence");
         std::fs::create_dir_all(&output)?;
-        let catalog = cuteafd_loader::read_official_v41_catalog(
-            cuteafd_loader::OFFICIAL_V41_MODEL_ID,
-            &snapshot,
+        let catalog = cuteafd_loader::read_official_v41_catalog(&snapshot,
         )?;
         let sm = crate::shared::vision::worker::architecture(&library)?;
         let identity = handshake(

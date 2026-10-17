@@ -621,18 +621,18 @@ fn placement(name: &str) -> V41TensorPlacement {
 }
 
 /// Header-only inspection: never reads or eagerly allocates checkpoint tensor payloads.
-pub fn read_official_v41_catalog(model_id: &str, snapshot: &Path) -> Result<OfficialV41Catalog> {
-    read_official_v41_catalog_filtered(model_id, snapshot, None)
+pub fn read_official_v41_catalog(snapshot: &Path) -> Result<OfficialV41Catalog> {
+    read_official_v41_catalog_filtered(snapshot, None)
 }
 
 /// Official-format worker inventory, without opening coordinator-only shards.
 pub fn read_official_v41_spark_catalog(snapshot: &Path, rank: usize, world: usize) -> Result<OfficialV41Catalog> {
     ensure!(rank < world, "Spark rank {rank} outside TP{world}");
-    read_official_v41_catalog_filtered(crate::OFFICIAL_V41_MODEL_ID, snapshot,
+    read_official_v41_catalog_filtered(snapshot,
         Some(format!("spark{rank} (TP{world})")))
 }
 
-fn read_official_v41_catalog_filtered(model_id: &str, snapshot: &Path, spark_role: Option<String>) -> Result<OfficialV41Catalog> {
+fn read_official_v41_catalog_filtered(snapshot: &Path, spark_role: Option<String>) -> Result<OfficialV41Catalog> {
     let raw_config: serde_json::Value = crate::families::deepseek_v41::v41_exl3::read_json(&snapshot.join("config.json"), 1024 * 1024)?;
     let exl3 = if raw_config["quantization_config"]["quant_method"] == "exl3" {
         Some(crate::read_v41_exl3_manifest(snapshot)?)
@@ -646,7 +646,7 @@ fn read_official_v41_catalog_filtered(model_id: &str, snapshot: &Path, spark_rol
             .clone()
             .context("V4.1 EXL3 manifest lacks the official configuration")?,
         (None, Some(contract)) => contract.config.clone(),
-        (None, None) => read_official_v41_config(model_id, snapshot)?,
+        (None, None) => read_official_v41_config(snapshot)?,
     };
     #[derive(Deserialize)]
     struct Index {
@@ -814,7 +814,7 @@ pub fn read_expert_catalog(snapshot: &Path) -> Result<OfficialV41Catalog> {
         return read_qwen4_expert_catalog(snapshot, &config);
     }
     if config.get("text_config").is_some() {
-        return read_official_v41_catalog(crate::OFFICIAL_V41_MODEL_ID, snapshot);
+        return read_official_v41_catalog(snapshot);
     }
     match config.get("model_type").and_then(serde_json::Value::as_str) {
         Some("deepseek_v4") => read_deepseek_v4_expert_catalog(snapshot),
@@ -1346,7 +1346,7 @@ fn apply_nvfp4_expert_contract(
 mod tests {
     use super::*;
     pub(super) fn official_config() -> OfficialV41Config {
-        OfficialV41Config::from_json(crate::OFFICIAL_V41_MODEL_ID, include_bytes!("official-v41-config.json"))
+        OfficialV41Config::from_json(include_bytes!("official-v41-config.json"))
             .unwrap()
     }
     #[test]
@@ -1552,7 +1552,7 @@ mod tests {
     fn nvfp4_catalog_keeps_native_draft_experts() {
         let path = std::env::var_os("CUTEAFD_NVFP4_SNAPSHOT").expect("CUTEAFD_NVFP4_SNAPSHOT");
         let catalog =
-            read_official_v41_catalog("nvidia/DeepSeek-V4.1-Flash-NVFP4", Path::new(&path))
+            read_official_v41_catalog(Path::new(&path))
                 .unwrap();
         let contract = catalog.nvfp4().expect("NVFP4 contract");
         assert_eq!(contract.group_size, 16);
@@ -1593,7 +1593,7 @@ mod tests {
     fn raw_publication_catalog_keeps_native_draft_experts() {
         let path = std::env::var_os("CUTEAFD_EXL3_RAW_SNAPSHOT").expect("CUTEAFD_EXL3_RAW_SNAPSHOT");
         let catalog =
-            read_official_v41_catalog("diffbot/DeepSeek-V4.1-Flash-EXL3-2.0bpw-2x-RTX-PRO-6000", Path::new(&path))
+            read_official_v41_catalog(Path::new(&path))
                 .unwrap();
         assert!(catalog.exl3().is_some());
         assert!(catalog.native_dspark_experts());

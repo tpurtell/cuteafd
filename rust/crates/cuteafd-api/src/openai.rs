@@ -14,7 +14,7 @@ use deepseek_recipe::{
     response::ProtocolResponse,
     util::append_delta::AppendDelta,
 };
-use deepseek_recipe_encoding::{v4::dsv4::DeepseekV4Encoding, v4::dsv41::DeepseekV41Encoding, PromptEncoding};
+use deepseek_recipe_encoding::{v4::dsv4::DeepseekV4Encoding, PromptEncoding};
 use deepseek_recipe_core::conversation::ReasoningEffort;
 use cuteafd_core::TargetSamplingParams;
 use futures::StreamExt;
@@ -23,7 +23,19 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 
+/// The original V4.1 checkpoint's id: the served name when no snapshot names one.
 pub const MODEL: &str = "deepseek-ai/DeepSeek-V4.1-Flash";
+pub use chat::deepseek::v41_turns::V41Turns;
+
+/// The Hugging Face repository id a hub snapshot path names
+/// (`.../models--ORG--NAME/snapshots/REV`).
+pub fn snapshot_model_id(snapshot: &std::path::Path) -> Option<String> {
+    snapshot.ancestors().find_map(|dir| {
+        let name = dir.file_name()?.to_str()?.strip_prefix("models--")?;
+        let (org, model) = name.split_once("--")?;
+        Some(format!("{org}/{model}"))
+    })
+}
 
 /// DeepSeek V4/V4.1 `<｜end▁of▁sentence｜>`.
 pub const DEEPSEEK_EOS_TOKEN_ID: u32 = 1;
@@ -96,6 +108,8 @@ pub struct ModelProfile {
     pub eos_token_ids: Vec<u32>,
     /// Mount the API gateway (Messages, Responses, Realtime) over this engine.
     pub gateway: Option<Arc<GatewayMount>>,
+    /// V4.1 thinking-history rule, chosen from the served checkpoint's lineage.
+    pub v41_turns: V41Turns,
 }
 
 /// How the serving router mounts the gateway front ends over its engine.
@@ -125,7 +139,13 @@ impl ModelProfile {
         let eos_token_ids = encoding.eos_token_ids();
         let capabilities = MediaCapabilities { vision: matches!(encoding, ModelEncoding::DeepseekV41), audio: false };
         Self { id: id.into(), encoding, eos_token_ids, capabilities, engine_health: None, media_preparer: None, vision_health: None,
-            audio_preparer: None, audio_health: None, gateway: None }
+            audio_preparer: None, audio_health: None, gateway: None, v41_turns: V41Turns::default() }
+    }
+
+    /// Select the V4.1 history rule from the checkpoint's own lineage.
+    pub fn with_v41_turns(mut self, turns: V41Turns) -> Self {
+        self.v41_turns = turns;
+        self
     }
 
     /// Install only after the matching encoder is loaded and ready. A processor
@@ -814,7 +834,8 @@ pub(crate) fn build(profile: &ModelProfile, limits: NativeLimits, headers: &axum
             let rendered = if matches!(profile.encoding, ModelEncoding::DeepseekV4) {
                 DeepseekV4Encoding::new().render_conversation(&converted.conversation)
             } else {
-                let mut rendered = DeepseekV41Encoding::new().render_conversation(&converted.conversation);
+                let mut rendered = deepseek::v41_turns::render(&converted.conversation, profile.v41_turns)
+                    .map_err(Rejection::bad)?;
                 if converted.conversation.thinking_mode {
                     let budget = v41_budget.unwrap_or_else(|| v41_effort_budget(converted.conversation.reasoning_effort));
                     rendered.prompt = v41_set_effort_budget(rendered.prompt, budget);
@@ -1277,7 +1298,7 @@ fn v41_numeric_effort(body: &mut Value, encoding: &ModelEncoding) -> Result<Opti
 }
 
 /// Rewrites the budget in the rendered `Reasoning Effort: N (range 1-100` prefix.
-fn v41_set_effort_budget(prompt: String, budget: u8) -> String {
+pub(crate) fn v41_set_effort_budget(prompt: String, budget: u8) -> String {
     const PREFIX: &str = "Reasoning Effort: ";
     let Some(start) = prompt.find(PREFIX).map(|i| i + PREFIX.len()) else { return prompt };
     let digits = prompt[start..].bytes().take_while(u8::is_ascii_digit).count();

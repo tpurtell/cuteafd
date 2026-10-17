@@ -1,7 +1,7 @@
 //! Temporary Goal-1 check for the nonzero sparse-header fixture; see TO_DELETE_SCAFFOLDING.md.
 use anyhow::{ensure, Context, Result};
 use cuteafd_loader::{
-    read_official_v41_catalog, EngramPrefetcher, PrefetchOutcome, OFFICIAL_V41_MODEL_ID,
+    read_official_v41_catalog, EngramPrefetcher, PrefetchOutcome,
 };
 use std::{path::PathBuf, sync::Arc};
 fn main() -> Result<()> {
@@ -10,7 +10,7 @@ fn main() -> Result<()> {
             .nth(1)
             .context("expected immutable fixture directory")?,
     );
-    let catalog = read_official_v41_catalog(OFFICIAL_V41_MODEL_ID, &snapshot)?;
+    let catalog = read_official_v41_catalog(&snapshot)?;
     let prefetch = EngramPrefetcher::new(4, 24, 16)?;
     for &layer in &catalog.config().text().engram_layer_ids {
         // SAFETY: the qualification harness exclusively owns this immutable fixture

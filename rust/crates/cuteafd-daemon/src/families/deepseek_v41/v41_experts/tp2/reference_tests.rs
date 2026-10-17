@@ -111,9 +111,7 @@ fn exl3_tp2_rank_outputs_and_peer_sums_match_b12x() -> Result<()> {
             }
         }
     }
-    let catalog = cuteafd_loader::read_official_v41_catalog(
-        cuteafd_loader::OFFICIAL_V41_MODEL_ID,
-        &snapshot,
+    let catalog = cuteafd_loader::read_official_v41_catalog(&snapshot,
     )?;
     let weights = super::super::tp2_ffn::load_routed_weights(
         devices,

@@ -39,9 +39,7 @@ fn local_activation_contract_selects_bf16_only_for_nvfp4() -> Result<()> {
 fn exl3_local_capacity_lanes_and_shared_sum_match_reference() -> Result<()> {
     let lib = unsafe { NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? };
     lib.cuda_set_device(0)?;
-    let catalog = cuteafd_loader::read_official_v41_catalog(
-        cuteafd_loader::OFFICIAL_V41_MODEL_ID,
-        Path::new(&std::env::var("CUTEAFD_EXL3_SNAPSHOT")?),
+    let catalog = cuteafd_loader::read_official_v41_catalog(Path::new(&std::env::var("CUTEAFD_EXL3_SNAPSHOT")?),
     )?;
     let directory = std::path::PathBuf::from(std::env::var("CUTEAFD_EXL3_AOT")?);
     let fixture = std::path::PathBuf::from(std::env::var("CUTEAFD_EXL3_FIXTURE")?);

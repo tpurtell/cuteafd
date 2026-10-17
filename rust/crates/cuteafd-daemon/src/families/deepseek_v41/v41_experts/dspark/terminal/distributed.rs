@@ -192,8 +192,7 @@ mod tests {
     }
     fn check_terminal_width(width: usize) -> Result<()> {
         let lib = unsafe { cuteafd_ffi::NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? };
-        let catalog = cuteafd_loader::read_official_v41_catalog(cuteafd_loader::OFFICIAL_V41_MODEL_ID,
-            std::path::Path::new(&std::env::var("CUTEAFD_SNAPSHOT")?))?;
+        let catalog = cuteafd_loader::read_official_v41_catalog(std::path::Path::new(&std::env::var("CUTEAFD_SNAPSHOT")?))?;
         lib.cuda_set_device(0)?;
         let devices = [Device { library: &lib, id: 0 }, Device { library: &lib, id: 1 }];
         let shards = [devices[0].own(|| VocabularyShard::load(&lib, &catalog, 0..64640, 1 << 30, 16 << 20))?,

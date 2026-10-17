@@ -593,15 +593,21 @@ spark_tp_roles=
                              'the config path must not appear in the remote command line')
             self.assertEqual(result.stdout.splitlines(), ['', ''])
 
-    def test_native_api_identity_is_independent_of_checkpoint_repository(self) -> None:
-        for model, expected in [('deepseek-ai/DeepSeek-V4.1-Flash', 0),
-                                ('wrldsuksgo2mars/DeepSeek-V4.1-EXL3-K3.25-v1', 1)]:
-            with self.subTest(model=model):
+    def test_native_api_identity_is_the_launched_checkpoint(self) -> None:
+        cases = [('deepseek-ai/DeepSeek-V4.1-Flash', '', 'deepseek-ai/DeepSeek-V4.1-Flash'),
+                 ('deepseek-ai/DeepSeek-V4.1-Flash-1017', '', 'deepseek-ai/DeepSeek-V4.1-Flash-1017'),
+                 ('wrldsuksgo2mars/DeepSeek-V4.1-EXL3-K3.25-v1', '', 'wrldsuksgo2mars/DeepSeek-V4.1-EXL3-K3.25-v1'),
+                 ('deepseek-ai/DeepSeek-V4.1-Flash-1017', 'deepseek-ai/DeepSeek-V4.1-Flash', 'deepseek-ai/DeepSeek-V4.1-Flash')]
+        for model, served, expected in cases:
+            with self.subTest(model=model, served=served), tempfile.TemporaryDirectory() as tmp:
+                config = Path(tmp) / 'cuteafd.config'
+                config.write_text(f'MODEL_ID={model}\nMODEL_REVISION={"a" * 40}\n' + (f'SERVED_MODEL_ID={served}\n' if served else ''))
                 result = subprocess.run(
-                    ['bash', '-c', 'source scripts/lib/release-common.sh; release_native_model_list_matches "$RELEASE_NATIVE_API_MODEL_ID"'],
-                    cwd=ROOT, input=json.dumps({'object': 'list', 'data': [{'id': model}]}),
-                    text=True, capture_output=True)
-                self.assertEqual(result.returncode, expected, result.stderr)
+                    ['bash', '-c', 'source scripts/lib/release-common.sh; release_load_config "$1" stop >/dev/null; '
+                     'printf %s "$RELEASE_NATIVE_API_MODEL_ID"', '_', str(config)],
+                    cwd=ROOT, text=True, capture_output=True)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout, expected)
 
     def package_identity(self, manifest: dict) -> subprocess.CompletedProcess:
         return subprocess.run(

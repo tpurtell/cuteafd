@@ -6,7 +6,7 @@
 //! per-tensor FP32 activation scale (the W4A4 indication). Attention,
 //! shared experts, embeddings, head, vision and the MTP draft experts stay
 //! on the official FP8/MXFP4 layout, so the MTP path is unchanged.
-use crate::{OfficialV41Config, OFFICIAL_V41_MODEL_ID};
+use crate::OfficialV41Config;
 use anyhow::{ensure, Context, Result};
 use serde_json::Value;
 use std::path::Path;
@@ -134,7 +134,7 @@ fn parse_v41_nvfp4_contract(mut config: Value) -> Result<V41Nvfp4Contract> {
         "expert_dtype": "fp4",
     });
     let validated =
-        OfficialV41Config::from_json(OFFICIAL_V41_MODEL_ID, &serde_json::to_vec(&config)?)?;
+        OfficialV41Config::from_json(&serde_json::to_vec(&config)?)?;
     let text = validated.text();
     ensure!(
         quantized_layers.len() == text.num_hidden_layers,

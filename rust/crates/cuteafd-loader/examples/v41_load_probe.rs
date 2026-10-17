@@ -1,6 +1,6 @@
 //! Measure bounded real-checkpoint TP4 staging without loading a GPU or the full model.
 use anyhow::{ensure, Context, Result};
-use cuteafd_loader::{read_official_v41_catalog, V41ExpertSelection, OFFICIAL_V41_MODEL_ID};
+use cuteafd_loader::{read_official_v41_catalog, V41ExpertSelection};
 use sha2::{Digest, Sha256};
 use std::os::fd::AsRawFd;
 use std::{collections::BTreeMap, path::PathBuf, time::Instant};
@@ -42,7 +42,7 @@ fn main() -> Result<()> {
         "invalid probe extent"
     );
     let started = Instant::now();
-    let catalog = read_official_v41_catalog(OFFICIAL_V41_MODEL_ID, &snapshot)?;
+    let catalog = read_official_v41_catalog(&snapshot)?;
     let catalog_seconds = started.elapsed().as_secs_f64();
     let first = catalog.expert_staging(V41ExpertSelection::Backbone {
         layer,

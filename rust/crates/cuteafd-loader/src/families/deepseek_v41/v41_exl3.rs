@@ -3,7 +3,7 @@ use crate::formats::exl3_storage::{
     check_quantization_config, derive_storage_map, mcg_marker_shape, parse_storage_map, verify_storage_map,
     Exl3Module, Exl3StorageMap, Exl3StorageSource,
 };
-use crate::{OfficialV41Config, SafetensorsTensorMetadata, OFFICIAL_V41_MODEL_ID};
+use crate::{OfficialV41Config, SafetensorsTensorMetadata};
 use anyhow::{ensure, Context, Result};
 use cuteafd_core::DType;
 use serde_json::Value;
@@ -408,7 +408,7 @@ fn parse_raw_publication(mut config: Value) -> Result<V41Exl3Manifest> {
         "expert_dtype": "fp4",
     });
     let validated =
-        OfficialV41Config::from_json(OFFICIAL_V41_MODEL_ID, &serde_json::to_vec(&config)?)?;
+        OfficialV41Config::from_json(&serde_json::to_vec(&config)?)?;
     let text = validated.text();
     if let Some(start_layer) = mtp_start_layer {
         ensure!(
@@ -745,7 +745,7 @@ fn parse_manifest(mut config: Value, manifest: &Value) -> Result<V41Exl3Manifest
         .context("config must be an object")?
         .remove("cuteafd_ple_quantization");
     let validated =
-        OfficialV41Config::from_json(OFFICIAL_V41_MODEL_ID, &serde_json::to_vec(&config)?)?;
+        OfficialV41Config::from_json(&serde_json::to_vec(&config)?)?;
     let text = validated.text();
     let storage = manifest["tensor_storage"]
         .as_object()

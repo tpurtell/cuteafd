@@ -38,7 +38,7 @@ use tokio::sync::{mpsc, oneshot};
 
 pub(crate) async fn run(args: crate::cli::NativeServeArgs) -> Result<()> {
     let Started { send, readiness, worker_thread, stats, http } = start(args, true)?;
-    let Http { api, listen, snapshot, limits, http_queue_wait, console_hub } = http.expect("serving start loads the API");
+    let Http { api, listen, snapshot, model_id, limits, http_queue_wait, console_hub } = http.expect("serving start loads the API");
     let vision_health = readiness
         .await
         .context("native target startup stopped")?
@@ -47,7 +47,7 @@ pub(crate) async fn run(args: crate::cli::NativeServeArgs) -> Result<()> {
     let listener = tokio::net::TcpListener::bind(&listen).await?;
     cuteafd_bench::ready(&listener);
     tracing::info!(%listen,"native V4.1 target API ready");
-    let mut profile = cuteafd_api::openai::ModelProfile::default();
+    let mut profile = served_profile(model_id, &snapshot);
     profile.vision_health = vision_health;
     let router = cuteafd_api::openai::router_for_model(send, limits, stats, http_queue_wait, console_hub.clone(),
         api.serve(profile, &snapshot)?);
@@ -65,6 +65,18 @@ pub(crate) async fn run(args: crate::cli::NativeServeArgs) -> Result<()> {
     Ok(())
 }
 
+/// The served profile: the public id is `--model-id`, else the snapshot's own
+/// Hugging Face id (the original checkpoint's id when the path names none),
+/// and the history rule follows the checkpoint's lineage, not the public alias.
+fn served_profile(model_id: Option<String>, snapshot: &std::path::Path) -> cuteafd_api::openai::ModelProfile {
+    use cuteafd_api::openai::{snapshot_model_id, ModelEncoding, ModelProfile, V41Turns, MODEL};
+    let checkpoint = snapshot_model_id(snapshot).unwrap_or_else(|| MODEL.to_owned());
+    let lineage = cuteafd_bench::fidelity_match::lineage(&checkpoint, Some(snapshot));
+    let turns = V41Turns::for_lineage(lineage.iter().map(String::as_str));
+    tracing::info!(checkpoint, ?lineage, ?turns, "V4.1 prompt history rule from the checkpoint lineage");
+    ModelProfile::new(model_id.unwrap_or(checkpoint), ModelEncoding::DeepseekV41).with_v41_turns(turns)
+}
+
 type Readiness = std::result::Result<Option<std::sync::Arc<std::sync::atomic::AtomicBool>>, String>;
 type Stats = std::sync::Arc<std::sync::Mutex<serde_json::Value>>;
 
@@ -74,6 +86,8 @@ struct Http {
     listen: String,
     /// Tokenizer snapshot for the gateway's exact `count_tokens`.
     snapshot: std::path::PathBuf,
+    /// `--model-id`, when the launch names the public id explicitly.
+    model_id: Option<String>,
     limits: cuteafd_api::openai::NativeLimits,
     http_queue_wait: Duration,
     console_hub: std::sync::Arc<cuteafd_api::openai::ConsoleHub>,
@@ -140,7 +154,7 @@ fn start(mut args: crate::cli::NativeServeArgs, http: bool) -> Result<Started> {
         Some(api) => {
             let console_hub = cuteafd_api::openai::ConsoleHub::new(args.console_text);
             console::install(console_hub.clone(), console::layout(&args))?;
-            Some(Http { api, listen, snapshot, limits, http_queue_wait, console_hub })
+            Some(Http { api, listen, snapshot, model_id: args.model_id.clone(), limits, http_queue_wait, console_hub })
         }
         None => None,
     };
@@ -256,9 +270,7 @@ fn worker(
     let capacity = cuteafd_core::coordinator_programs::v41_live_rows(args.prefill_batch_tokens)
         .context("invalid V4.1 prefill batch")?;
     let rows = capacity as usize;
-    let mut catalog = cuteafd_loader::read_official_v41_catalog(
-        cuteafd_loader::OFFICIAL_V41_MODEL_ID,
-        &args.snapshot,
+    let mut catalog = cuteafd_loader::read_official_v41_catalog(&args.snapshot,
     )?;
     catalog.select_draft(cuteafd_loader::plan::spec::DraftOwnership::selected("deepseek_v41",
         if args.dspark { "dspark" } else { "off" }))?;

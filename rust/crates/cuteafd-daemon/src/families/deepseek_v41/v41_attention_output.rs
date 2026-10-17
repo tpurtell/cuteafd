@@ -603,8 +603,7 @@ mod tp2_tests {
     #[ignore = "requires checkpoint, two GPUs and projection shard AOT"]
     fn checkpoint_tp2_output_preserves_grouped_rotary() -> Result<()> {
         let library=unsafe { NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? };
-        let catalog=cuteafd_loader::read_official_v41_catalog(cuteafd_loader::OFFICIAL_V41_MODEL_ID,
-            std::path::Path::new(&std::env::var("CUTEAFD_SNAPSHOT")?))?;
+        let catalog=cuteafd_loader::read_official_v41_catalog(std::path::Path::new(&std::env::var("CUTEAFD_SNAPSHOT")?))?;
         let devices=[Device {library:&library,id:0},Device {library:&library,id:1}];
         let runtime=tokio::runtime::Builder::new_current_thread().build()?;
         for (owner,layer) in [(0,2),(1,20)] {

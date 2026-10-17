@@ -1086,9 +1086,7 @@ mod tests {
         let library = unsafe { NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? };
         library.cuda_set_device(0)?;
         let snapshot = std::path::PathBuf::from(std::env::var("CUTEAFD_EXL3_SNAPSHOT")?);
-        let catalog = cuteafd_loader::read_official_v41_catalog(
-            cuteafd_loader::OFFICIAL_V41_MODEL_ID,
-            &snapshot,
+        let catalog = cuteafd_loader::read_official_v41_catalog(&snapshot,
         )?;
         let aot = std::path::PathBuf::from(std::env::var("CUTEAFD_EXL3_AOT")?);
         let manifest: serde_json::Value =

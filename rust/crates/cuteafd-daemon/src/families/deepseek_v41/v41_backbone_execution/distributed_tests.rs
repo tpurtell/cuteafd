@@ -123,9 +123,7 @@ fn real_layer_zero_executes_embedding_attention_tp4_and_mhc() -> Result<()> {
         .try_into()
         .map_err(|_| anyhow::anyhow!("four test peers required"))?;
     let lib = unsafe { NativeLibrary::load(path)? };
-    let catalog = cuteafd_loader::read_official_v41_catalog(
-        cuteafd_loader::OFFICIAL_V41_MODEL_ID,
-        std::path::Path::new(&model),
+    let catalog = cuteafd_loader::read_official_v41_catalog(std::path::Path::new(&model),
     )?;
     let start = Instant::now();
     let weights = BackboneLaneWeights::load(

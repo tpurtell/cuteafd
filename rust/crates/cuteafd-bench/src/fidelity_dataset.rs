@@ -37,6 +37,9 @@ pub const QWEN38_27B_MANIFEST_SHA256: &str = "4b1ba4f3eea0557c7f985f0bf0ad7b6fdc
 pub const STEP5_REVISION: &str = "f9cecb776d4e47f05738369e7e157122f3e0b473";
 pub const STEP5_CONFIG: &str = "step5-v1_20261017_bf16_provisional";
 pub const STEP5_MANIFEST_SHA256: &str = "dd0f964a891e24570bcbf5840f6398a06c9dd037926d7e240a4a2dff29e17af7";
+pub const V41_1017_REVISION: &str = "9fc394f9b7e847cedb49578072082e9a56ba8e57";
+pub const V41_1017_CONFIG: &str = "deepseek_v41-v2_20261017_1017";
+pub const V41_1017_MANIFEST_SHA256: &str = "0eb4afedef4561ac86876d6c8285e2e0ab73a2643eb08d0efc6547fb4a0c65bd";
 
 /// Sealed bench subset v1: agentic A at three context lengths, human code C,
 /// structured/tool D, plain E and the frozen context anchor. Never resample.
@@ -148,7 +151,9 @@ pub fn unavailable(model: &str) -> Option<String> {
 fn base_model(model: &str) -> Option<&'static str> {
     // Served IDs may retain the HF namespace or its cache-directory spelling.
     let name = model.rsplit('/').next()?.rsplit("--").next()?;
-    for base in ["Qwen3.8-Flash-Next", "GLM-5.3-Flash", "DeepSeek-V4.1-Flash", "DeepSeek-V4-Flash-0731", "DeepSeek-V4-Pro-0813", "GLM-5.3"] {
+    // Longer bases first: a DeepSeek-V4.1-Flash-1017 quant is not an original-V4.1 quant.
+    for base in ["Qwen3.8-Flash-Next", "GLM-5.3-Flash", "DeepSeek-V4.1-Flash-1017", "DeepSeek-V4.1-Flash",
+        "DeepSeek-V4-Flash-0731", "DeepSeek-V4-Pro-0813", "GLM-5.3"] {
         if name == base || name.strip_prefix(base).is_some_and(|suffix|
             suffix.starts_with('-') && !suffix.starts_with("-BF16") && !suffix.starts_with("-FP8")
                 && !(base == "GLM-5.3" && suffix.starts_with("-Flash")) && !suffix.to_ascii_lowercase().contains("speculator")
@@ -172,6 +177,9 @@ pub fn default_publication(model: &str) -> Option<(&'static str, &'static str)> 
         Some("DeepSeek-V4-Pro-0813") => return Some((V4PRO_REVISION, V4PRO_CONFIG)),
         Some("GLM-5.3") => return Some((GLM_REVISION, GLM_CONFIG)),
         Some("DeepSeek-V4.1-Flash") => return Some((REVISION, CONFIG)),
+        // Its own published reference, once pinned in PUBLICATIONS; never the original's.
+        Some("DeepSeek-V4.1-Flash-1017") => return crate::fidelity_match::official("deepseek-ai/DeepSeek-V4.1-Flash-1017")
+            .map(|p| (p.revision, p.config)),
         _ => {},
     }
     match model {
@@ -245,6 +253,7 @@ pub fn download(agent: &ureq::Agent, cache: &Path, repo: &str, commit: &str, con
             (QWEN_DENSE_REVISION, QWEN35_9B_CONFIG) => Some(QWEN35_9B_MANIFEST_SHA256),
             (QWEN_DENSE_REVISION, QWEN38_27B_CONFIG) => Some(QWEN38_27B_MANIFEST_SHA256),
             (STEP5_REVISION, STEP5_CONFIG) => Some(STEP5_MANIFEST_SHA256),
+            (V41_1017_REVISION, V41_1017_CONFIG) => Some(V41_1017_MANIFEST_SHA256),
             (MIMO_PRO_MEDIA_REVISION, MIMO_PRO_MEDIA_CONFIG) => Some(MIMO_PRO_MEDIA_MANIFEST_SHA256),
             (GLM_REVISION, GLM_CONFIG) => Some("cc973cec8df82119ccd53367d014c73b271808a561f81d3629b06093de3b00e0"),
             (V4PRO_REVISION, V4PRO_CONFIG) => Some("7b4fd7b51670ff03fbfab6a21b72d999163ddee9bd3eec34c89f1d6c2f83488f"),
@@ -385,6 +394,11 @@ fn qualification_label(qualification: &Value, manifest: &Value) -> Result<&'stat
                 && launch["official_launch_configuration"] == false && launch["num_stages"] == 1
                 && launch["block_regions"] == 16 && launch["kernel"] == "_sparse_attn_prefill_kernel"
                 && manifest["reference_execution"]["sparse_attention_launch"] == *launch
+        } else if manifest["family"] == "deepseek_v41" {
+            // The checkpoint's own inference/model.py, the kernel emulation and the harness.
+            source["revision"] == manifest["root_checkpoint"]["revision"]
+                && ["model_py_sha256", "kernel_torch_sha256", "golden_sha256", "inference_config_sha256"]
+                    .iter().all(|key| hash(&source[key], 64))
         } else {
             hash(&source["modeling_sha256"], 64) && hash(&source["source_tree_sha256"], 64)
         };
@@ -445,6 +459,12 @@ mod tests {
         for quant in ["deepseek-ai/DeepSeek-V4.1-Flash", "nvidia/DeepSeek-V4.1-Flash-NVFP4",
             "nvidia--DeepSeek-V4.1-Flash-NVFP4", "wrldsuksgo2mars/DeepSeek-V4.1-Flash-EXL3-K3.25-v1"] {
             assert_eq!(default_publication(quant), Some((REVISION, CONFIG)), "{quant}");
+        }
+        // 1017 and 1017-named quants map to 1017's own publication, never the original's.
+        for quant in ["deepseek-ai/DeepSeek-V4.1-Flash-1017", "org/DeepSeek-V4.1-Flash-1017-EXL3"] {
+            assert_eq!(default_publication(quant), crate::fidelity_match::official("deepseek-ai/DeepSeek-V4.1-Flash-1017")
+                .map(|p| (p.revision, p.config)), "{quant}");
+            assert_ne!(default_publication(quant), Some((REVISION, CONFIG)), "{quant}");
         }
         for other in ["deepseek-ai/DeepSeek-V4.1-Flashlight", "deepseek-ai/DeepSeek-V4.1",
             "other/DeepSeek-V4.1-Flash-speculator", "other/DeepSeek-V4.1-Flash-DFlash2"] {
@@ -605,7 +625,8 @@ mod tests {
     fn manifest_pins_reject_even_self_consistent_cached_indexes() {
         let temporary = tempfile::tempdir().unwrap();
         for (revision, config) in [(MIMO_PRO_REVISION, MIMO_PRO_CONFIG),
-            (MIMO_PRO_MEDIA_REVISION, MIMO_PRO_MEDIA_CONFIG), (STEP5_REVISION, STEP5_CONFIG)] {
+            (MIMO_PRO_MEDIA_REVISION, MIMO_PRO_MEDIA_CONFIG), (STEP5_REVISION, STEP5_CONFIG),
+            (V41_1017_REVISION, V41_1017_CONFIG)] {
             let root = temporary.path().join("wrldsuksgo2mars--cuteafd-fidelity").join(revision);
             std::fs::create_dir_all(root.join(config)).unwrap();
             let manifest = b"{}";
@@ -639,6 +660,12 @@ mod tests {
             let balance = standard_balance(&reference);
             assert_eq!(balance["decode"]["generated_positions"], 8089);
             assert_eq!(balance["prefill"]["generated_positions"], 7591);
+        }
+        if commit == V41_1017_REVISION && config == V41_1017_CONFIG {
+            assert_eq!(reference.checkpoint, "deepseek-ai/DeepSeek-V4.1-Flash-1017");
+            assert_eq!(identity["qualification"], "reference-only qualified");
+            assert_eq!(identity["text_checkpoint"], "deepseek-ai/DeepSeek-V4.1-Flash");
+            assert_eq!((reference.expect.top1_min, reference.expect.kl_max), (0.90, 0.06));
         }
         assert_eq!(quick_windows(&reference).unwrap().len(),8);
         assert_eq!(standard_windows(&reference,"decode",true).unwrap().len(),32);
@@ -872,6 +899,22 @@ mod tests {
         assert!(qualification_label(&bad, &native_manifest).is_err());
         let mut bad = native_manifest.clone(); bad["reference_execution"]["sparse_attention_launch"]["num_stages"] = json!(3);
         assert!(qualification_label(&native, &bad).is_err());
+        // V4.1 pins the checkpoint's own model.py, the kernel emulation and the harness.
+        let mut v41_manifest = manifest.clone();
+        v41_manifest["family"] = json!("deepseek_v41");
+        v41_manifest["root_checkpoint"]["id"] = json!("deepseek-ai/DeepSeek-V4.1-Flash-1017");
+        let mut v41 = qualification.clone();
+        v41["reference_provenance"]["snapshot_identity"]["checkpoint"] = v41_manifest["root_checkpoint"]["id"].clone();
+        v41["prefix_qualification"]["snapshot_identity"] = v41["reference_provenance"]["snapshot_identity"].clone();
+        v41["reference_provenance"]["source_pin"] = json!({"revision":"a".repeat(40), "model_py_sha256":"1".repeat(64),
+            "kernel_torch_sha256":"2".repeat(64), "golden_sha256":"3".repeat(64), "inference_config_sha256":"4".repeat(64)});
+        assert_eq!(qualification_label(&v41, &v41_manifest).unwrap(), "reference-only qualified");
+        for key in ["revision", "model_py_sha256", "kernel_torch_sha256", "golden_sha256", "inference_config_sha256"] {
+            let mut bad = v41.clone(); bad["reference_provenance"]["source_pin"][key] = Value::Null;
+            assert!(qualification_label(&bad, &v41_manifest).is_err(), "{key}");
+        }
+        let mut bad = v41.clone(); bad["reference_provenance"]["source_pin"]["revision"] = json!("9".repeat(40));
+        assert!(qualification_label(&bad, &v41_manifest).is_err(), "pinned source must be the root revision");
         let mut rounded = qualification.clone(); rounded["reference_validation"]["nll"] = json!(1.2 + 1e-15);
         assert!(qualification_label(&rounded, &manifest).is_ok());
         rounded["reference_validation"]["nll"] = json!(1.21);

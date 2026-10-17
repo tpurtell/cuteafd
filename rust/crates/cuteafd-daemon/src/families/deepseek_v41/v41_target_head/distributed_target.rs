@@ -319,8 +319,7 @@ mod tests {
     #[ignore = "requires CUTEAFD_NATIVE_LIB, CUTEAFD_SNAPSHOT and two CUDA GPUs"]
     fn distributed_target_head_matches_full_selection_and_publication() -> Result<()> {
         let lib = unsafe { NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? };
-        let catalog = cuteafd_loader::read_official_v41_catalog(cuteafd_loader::OFFICIAL_V41_MODEL_ID,
-            std::path::Path::new(&std::env::var("CUTEAFD_SNAPSHOT")?))?;
+        let catalog = cuteafd_loader::read_official_v41_catalog(std::path::Path::new(&std::env::var("CUTEAFD_SNAPSHOT")?))?;
         lib.cuda_set_device(0)?;
         let devices = [Device { library: &lib, id: 0 }, Device { library: &lib, id: 1 }];
         let norm = devices[1].own(|| TargetHeadWeights::load(&lib, &catalog, 10240, 10240))?;

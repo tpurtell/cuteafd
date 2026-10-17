@@ -37,7 +37,7 @@ pub(super) fn worker(args: crate::cli::NativeServeArgs, mut receive: mpsc::Recei
         Ok(())
     };
     memory_checkpoint("CUDA contexts and peer access")?;
-    let catalog = cuteafd_loader::read_official_v41_catalog(cuteafd_loader::OFFICIAL_V41_MODEL_ID, &args.snapshot)?;
+    let catalog = cuteafd_loader::read_official_v41_catalog(&args.snapshot)?;
     let topology = crate::shared::spark_topology::resolve(
         args.spark_tp,
         args.spark_ep,

@@ -229,9 +229,7 @@ mod tests {
         ensure!(matches!(device, 0 | 1), "invalid dSpark test device");
         lib.cuda_set_device(device)?;
         println!("dSpark test device={device}");
-        let catalog = cuteafd_loader::read_official_v41_catalog(
-            cuteafd_loader::OFFICIAL_V41_MODEL_ID,
-            Path::new(&std::env::var("CUTEAFD_SNAPSHOT")?),
+        let catalog = cuteafd_loader::read_official_v41_catalog(Path::new(&std::env::var("CUTEAFD_SNAPSHOT")?),
         )?;
         let directory = std::path::PathBuf::from(std::env::var("CUTEAFD_EXL3_AOT")?);
         let weights = DsparkWeights::load_with_width(

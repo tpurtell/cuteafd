@@ -526,9 +526,7 @@ mod tests {
         use crate::families::deepseek_v41::v41_backbone_cache::CacheWork;
         use cuteafd_transport::ExpertV2SourceKind;
         let lib = unsafe { NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? };
-        let catalog = cuteafd_loader::read_official_v41_catalog(
-            cuteafd_loader::OFFICIAL_V41_MODEL_ID,
-            std::path::Path::new(&std::env::var("CUTEAFD_SNAPSHOT")?),
+        let catalog = cuteafd_loader::read_official_v41_catalog(std::path::Path::new(&std::env::var("CUTEAFD_SNAPSHOT")?),
         )?;
         lib.cuda_set_device(0)?;
         let placement = CachePlacement::new(std::array::from_fn(|layer| usize::from(layer >= 14)))?;
@@ -669,9 +667,7 @@ mod tests {
     #[ignore = "requires CUTEAFD_NATIVE_LIB, CUTEAFD_SNAPSHOT, and two CUDA GPUs"]
     fn real_placed_producers_and_window_graphs_match_across_devices() -> Result<()> {
         let lib = unsafe { NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? };
-        let catalog = cuteafd_loader::read_official_v41_catalog(
-            cuteafd_loader::OFFICIAL_V41_MODEL_ID,
-            std::path::Path::new(&std::env::var("CUTEAFD_SNAPSHOT")?),
+        let catalog = cuteafd_loader::read_official_v41_catalog(std::path::Path::new(&std::env::var("CUTEAFD_SNAPSHOT")?),
         )?;
         lib.cuda_set_device(0)?;
         let placement = CachePlacement::encoder_decoder();

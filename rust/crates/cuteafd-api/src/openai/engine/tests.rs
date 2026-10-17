@@ -34,6 +34,8 @@ fn families() -> Vec<Family> {
     let mut out = vec![
         Family { name: "v41", profile: ModelProfile::new("deepseek-ai/DeepSeek-V4.1-Flash", ModelEncoding::DeepseekV41),
             snapshot: hub("models--deepseek-ai--DeepSeek-V4.1-Flash") },
+        Family { name: "v41-1017", profile: ModelProfile::new("deepseek-ai/DeepSeek-V4.1-Flash-1017", ModelEncoding::DeepseekV41)
+            .with_v41_turns(crate::openai::V41Turns::DropCompleted), snapshot: hub("models--deepseek-ai--DeepSeek-V4.1-Flash-1017") },
         Family { name: "v4", profile: ModelProfile::new("deepseek-ai/DeepSeek-V4-Flash-0731", ModelEncoding::DeepseekV4),
             snapshot: hub("models--deepseek-ai--DeepSeek-V4-Flash-0731") },
         Family { name: "glm-fixture", profile: ModelProfile::new("test-glm", ModelEncoding::Glm(Arc::new(glm5::fixtures::encoding()))),
@@ -749,4 +751,42 @@ async fn cross_origin_sockets_need_the_key_or_an_allowed_origin() {
         assert!(tokio_tungstenite::connect_async(format!("ws://{addr}{path}")).await.is_ok(), "{path}: no Origin admitted");
     }
     server.abort();
+}
+
+/// DeepSeek-V4.1-Flash-1017's thinking-history rule on the Responses route
+/// (the agent path): a reasoning item before a tool-result-only turn is kept,
+/// one before a real user turn is dropped when no tools are declared, and the
+/// prompt equals 1017's own encoding.py rendering of the same history.
+#[tokio::test]
+async fn responses_history_follows_the_1017_drop_thinking_rule() {
+    use crate::openai::chat::deepseek::v41_turns::{V41Turns, V41_1017_MODEL_ID};
+    let fixture: Value = serde_json::from_slice(&std::fs::read(std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/v41-encoding/deepseek-v4.1-flash-1017.json")).unwrap()).unwrap();
+    let expected = |id: &str| fixture["cases"].as_array().unwrap().iter().find(|c| c["id"] == id).unwrap()["prompt"]
+        .as_str().unwrap().to_owned();
+    let user = |text: &str| json!({"type":"message","role":"user","content":[{"type":"input_text","text":text}]});
+    let reasoning = |text: &str| json!({"type":"reasoning","summary":[],"content":[{"type":"reasoning_text","text":text}]});
+    let assistant = |text: &str| json!({"type":"message","role":"assistant","content":[{"type":"output_text","text":text}]});
+    let tool_turn = vec![user("q1"), reasoning("r1"), assistant("a1"), user("q2"), reasoning("r2"),
+        json!({"type":"function_call","call_id":"c1","name":"lookup","arguments":"{}"}),
+        json!({"type":"function_call_output","call_id":"c1","output":"value"})];
+    let mut next_user = tool_turn.clone();
+    next_user.extend([reasoning("r3"), assistant("a3"), user("q3")]);
+    let profile = ModelProfile::new(V41_1017_MODEL_ID, ModelEncoding::DeepseekV41).with_v41_turns(V41Turns::DropCompleted);
+    // reasoning.effort "high" renders V4.1's budget 50, the fixture cases' explicit budget.
+    for (input, case) in [(tool_turn, "drop_thinking_tool_result_continues_turn"), (next_user, "drop_thinking_next_user_turn")] {
+        let (app, worker) = serve(profile.clone(), None, vec![], false);
+        let (status, text) = post(&app, "/v1/responses", json!({"model":V41_1017_MODEL_ID,"input":input,"stream":false,
+            "store":false,"max_output_tokens":8,"reasoning":{"effort":"high"}})).await;
+        assert_eq!(status, StatusCode::OK, "{text}");
+        let prompt = worker.prompts.lock().unwrap()[0].clone();
+        assert_eq!(prompt, expected(case), "{case}");
+    }
+    // The original checkpoint's profile keeps every turn's reasoning on the same history.
+    let (app, worker) = serve(ModelProfile::new("deepseek-ai/DeepSeek-V4.1-Flash", ModelEncoding::DeepseekV41), None, vec![], false);
+    let (status, text) = post(&app, "/v1/responses", json!({"model":"deepseek-ai/DeepSeek-V4.1-Flash",
+        "input":[user("q1"), reasoning("r1"), assistant("a1"), user("q2")],"stream":false,"store":false,
+        "max_output_tokens":8,"reasoning":{"effort":"high"}})).await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    assert!(worker.prompts.lock().unwrap()[0].contains("<think>r1</think>a1"));
 }

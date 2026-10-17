@@ -12,8 +12,7 @@ fn distributed_dspark_tp2_chain_matches_full_experts() -> Result<()> { check_cha
 fn distributed_dspark_tp2_chain_independent_lanes() -> Result<()> { check_chain(true,false) }
 fn check_chain(tp2:bool,full_reference:bool) -> Result<()> {
     let lib = unsafe { cuteafd_ffi::NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? };
-    let catalog = cuteafd_loader::read_official_v41_catalog(cuteafd_loader::OFFICIAL_V41_MODEL_ID,
-        std::path::Path::new(&std::env::var("CUTEAFD_SNAPSHOT")?))?;
+    let catalog = cuteafd_loader::read_official_v41_catalog(std::path::Path::new(&std::env::var("CUTEAFD_SNAPSHOT")?))?;
     lib.cuda_set_device(0)?;
     let devices = [Device { library: &lib, id: 0 }, Device { library: &lib, id: 1 }];
     let names = ["embed.weight".to_string()];

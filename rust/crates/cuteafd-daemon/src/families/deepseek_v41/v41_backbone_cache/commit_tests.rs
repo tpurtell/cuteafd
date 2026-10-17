@@ -8,8 +8,7 @@ use cuteafd_ffi::CuteafdDeviceBuffer;
 fn placed_cache_commits_match_direct_and_preserve_peer_requests() -> Result<()> {
     use crate::families::deepseek_v41::v41_backbone_execution::{CacheProducerWeights,PlacedProducerWaves};
     let lib = unsafe { NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? };
-    let catalog = cuteafd_loader::read_official_v41_catalog(cuteafd_loader::OFFICIAL_V41_MODEL_ID,
-        std::path::Path::new(&std::env::var("CUTEAFD_SNAPSHOT")?))?;
+    let catalog = cuteafd_loader::read_official_v41_catalog(std::path::Path::new(&std::env::var("CUTEAFD_SNAPSHOT")?))?;
     lib.cuda_set_device(0)?;
     // Move source 14 with its consumers, exercising ratio-two compression on
     // GPU1 as well as the decoder's ratio-one source 20.
@@ -395,9 +394,7 @@ fn real_all_cache_commits_preserve_prefixes_and_revoke_partial_failure() -> Resu
     let model = std::env::var_os("CUTEAFD_CACHE_COMMIT_MODEL")
         .context("CUTEAFD_CACHE_COMMIT_MODEL required")?;
     let lib = unsafe { NativeLibrary::load(path)? };
-    let catalog = cuteafd_loader::read_official_v41_catalog(
-        cuteafd_loader::OFFICIAL_V41_MODEL_ID,
-        std::path::Path::new(&model),
+    let catalog = cuteafd_loader::read_official_v41_catalog(std::path::Path::new(&model),
     )?;
     let weights = (0..40)
         .map(|l| {

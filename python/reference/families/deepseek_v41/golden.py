@@ -140,6 +140,67 @@ def run_windows(a, ref, args, backend, weights):
         reference="official inference/model.py (kernel_torch, mapped engram tables; official math, order/shape-invariant top-k)",
         seconds=time.time() - started, seconds_per_layer=times, snapshot_identity=identity,
         prefix_qualification=proof)
+    if not getattr(a, "_prefix_probe", False):
+        write_reference_meta(a.out, a.snapshot)
+
+
+def _lse(row: np.ndarray) -> float:
+    # The reference-only validator's float64 log-sum-exp, so NLL agrees to 1e-8.
+    peak = np.max(row)
+    return float(peak + np.log(np.exp(row - peak).sum(dtype=np.float64)))
+
+
+def write_reference_meta(out: Path, snapshot: Path, run_platform: dict | None = None) -> dict:
+    """Add the reference-only publication fields to a finished window golden.
+
+    Per-window and aggregate NLL come from the saved f32 scored logits and
+    pinned tokens (no model run), so a finished golden can be backfilled.
+    Execution policy and source pins describe this harness: official
+    inference/model.py block by block, kernel_torch, MTP and caches off.
+    """
+    import hashlib
+    import platform
+    import tokenizers
+    meta = json.loads((out / "meta.json").read_text())
+    total, count = 0.0, 0
+    for entry in meta["windows"]:
+        folder = (out / entry["path"]).resolve()
+        if not folder.is_relative_to(out.resolve()):
+            raise ValueError("golden path escapes its directory")
+        tokens = np.fromfile(folder / "tokens.bin", dtype="<i4")
+        logits = np.memmap(folder / "logits.bin", dtype="<f4", mode="r", shape=(len(entry["positions"]), entry["vocab"]))
+        loss = 0.0
+        for row, position in zip(logits, entry["positions"]):
+            values = row.astype(np.float64)
+            if not np.isfinite(values).all():
+                raise ValueError("non-finite golden logits")
+            loss -= float(values[tokens[position]]) - _lse(values)
+        entry.update(nll=loss / len(entry["positions"]), scored_tokens=len(entry["positions"]))
+        (folder / "meta.json").write_text(json.dumps(entry, sort_keys=True) + "\n")
+        total, count = total + loss, count + len(entry["positions"])
+    digest = lambda path: hashlib.sha256(path.read_bytes()).hexdigest()
+    gpu = torch.cuda.get_device_name(0) if torch.cuda.is_available() else None
+    run_platform = run_platform or dict(machine=platform.machine(), gpu=gpu,
+                                        capability=list(torch.cuda.get_device_capability(0)) if gpu else None)
+    meta.update(
+        nll=total / count, scored_tokens=count, mtp=False, use_cache=False, attention="eager", dtype="checkpoint-native",
+        source_pin={"revision": snapshot.name,
+                    "model_py_sha256": digest(snapshot / "inference" / "model.py"),
+                    "kernel_torch_sha256": digest(HERE / "kernel_torch.py"),
+                    "golden_sha256": digest(Path(__file__)),
+                    "inference_config_sha256": digest(snapshot / "inference" / "config.json")},
+        gates={"wo_a": "MXFP8 o before grouped einsum (as model.py)", "experts": "MXFP4 E2M1, UE8M0 per 32"},
+        native_fp32_parameters="checkpoint F32 tensors (attention sinks, router bias, mHC) kept F32",
+        root_arithmetic={"arithmetic": "Official inference/model.py block by block with a torch emulation of kernel.py "
+                                       "(FP8 block dense, MXFP4 experts, FP4 compressed KV); Engram tables row-gathered "
+                                       "from the checkpoint shards; MTP and caches off.",
+                         "source": "official inference/model.py and kernel emulation"},
+        tokenizers=tokenizers.__version__, torch=torch.__version__, transformers="not used",
+        platform=run_platform)
+    from fidelity_windows import canonical
+    (out / "meta.json").write_bytes(canonical(meta) + b"\n")
+    print(f"reference meta: {len(meta['windows'])} windows, {count} scored, NLL {meta['nll']:.9f}", flush=True)
+    return meta
 
 
 def import_reference(snapshot: Path):
@@ -253,7 +314,16 @@ def main() -> None:
     p.add_argument("--prefix-only", action="store_true", help="qualify reference prefix arithmetic without running the full panel")
     p.add_argument("--out", type=Path, required=True)
     p.add_argument("--device", type=int, default=0)
+    p.add_argument("--backfill-meta", action="store_true",
+                   help="add reference-only fields to a finished --windows golden in --out, from its saved logits")
+    p.add_argument("--run-platform", type=json.loads,
+                   help='with --backfill-meta: the golden run\'s platform, e.g. {"machine":"x86_64","gpu":"...","capability":[12,0]}')
     a = p.parse_args()
+    if a.backfill_meta:
+        if not a.run_platform:
+            p.error("--backfill-meta needs --run-platform: the golden run's own machine and GPU")
+        write_reference_meta(a.out, a.snapshot, a.run_platform)
+        return
     if a.prefix_only and not a.windows:
         p.error("--prefix-only requires --windows")
 

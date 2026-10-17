@@ -928,9 +928,7 @@ mod tests {
         use crate::families::deepseek_v41::v41_experts::dspark::{DsparkChain, DsparkWeights};
         let lib = unsafe { NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? };
         let snapshot = std::env::var("CUTEAFD_SNAPSHOT")?;
-        let catalog = cuteafd_loader::read_official_v41_catalog(
-            cuteafd_loader::OFFICIAL_V41_MODEL_ID,
-            std::path::Path::new(&snapshot),
+        let catalog = cuteafd_loader::read_official_v41_catalog(std::path::Path::new(&snapshot),
         )?;
         lib.cuda_set_device(0)?;
         let devices = [

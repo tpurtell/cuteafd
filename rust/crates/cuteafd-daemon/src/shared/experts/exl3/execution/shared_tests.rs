@@ -16,8 +16,7 @@ impl Drop for Graph<'_> {
 #[ignore = "requires EXL3 snapshot, TP2 package, native library and two CUDA devices"]
 fn shared_capacity_scratch_matches_private_and_graph_replay() -> Result<()> {
     let library = unsafe { NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? };
-    let catalog = cuteafd_loader::read_official_v41_catalog(
-        cuteafd_loader::OFFICIAL_V41_MODEL_ID, Path::new(&std::env::var("CUTEAFD_SNAPSHOT")?))?;
+    let catalog = cuteafd_loader::read_official_v41_catalog(Path::new(&std::env::var("CUTEAFD_SNAPSHOT")?))?;
     let root = PathBuf::from(std::env::var("CUTEAFD_EXL3_AOT")?);
     let tp1 = std::env::var_os("CUTEAFD_EXL3_TEST_TP1").is_some();
     let capacities = [1usize, 16, 80, 256, 1024, 4096];

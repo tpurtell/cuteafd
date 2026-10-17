@@ -40,6 +40,7 @@ MIMO = {"model_type": "mimo_v2", "num_hidden_layers": 2, "moe_layer_freq": [0, 1
 NVFP4_GROUPS = {"config_groups": {"group_0": {"weights": {"num_bits": 4, "type": "float", "group_size": 16}}}}
 CHECKPOINTS = {
     "deepseek-ai/DeepSeek-V4.1-Flash": {"model_type": "deepseek_v41"},
+    "deepseek-ai/DeepSeek-V4.1-Flash-1017": {"model_type": "deepseek_v41"},
     "nvidia/DeepSeek-V4.1-Flash-NVFP4": {"model_type": "deepseek_v41",
                                          "quantization_config": {"moe_quant_algo": "NVFP4"}},
     "deepseek-ai/DeepSeek-V4-Flash-0731": DSV4,

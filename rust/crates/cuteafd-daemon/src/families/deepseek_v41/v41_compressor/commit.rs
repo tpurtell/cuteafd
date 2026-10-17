@@ -245,8 +245,7 @@ mod tests {
     fn source_commits(replicated: bool) -> Result<()> {
         let lib = unsafe { NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? };
         let model = std::env::var("CUTEAFD_CACHE_COMMIT_MODEL")?;
-        let catalog = cuteafd_loader::read_official_v41_catalog(
-            cuteafd_loader::OFFICIAL_V41_MODEL_ID, std::path::Path::new(&model))?;
+        let catalog = cuteafd_loader::read_official_v41_catalog(std::path::Path::new(&model))?;
         for layer in [2, 20] {
             let weights = CompressorWeights::load(&lib, &catalog, layer,
                 CompressorWeights::device_bytes(&catalog, layer)?, 1024*1024)?;

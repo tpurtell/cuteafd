@@ -10,7 +10,7 @@ fn native_image_replacement_and_reuse() -> Result<()> {
     let model =
         std::path::PathBuf::from(std::env::var_os("CUTEAFD_VISION_MODEL").context("vision model")?);
     let catalog =
-        cuteafd_loader::read_official_v41_catalog(cuteafd_loader::OFFICIAL_V41_MODEL_ID, &model)?;
+        cuteafd_loader::read_official_v41_catalog(&model)?;
     let names = vec!["embed.weight".to_owned()];
     let table = NativeRtxTensors::load(
         &lib,
@@ -113,7 +113,7 @@ fn native_host_embedding_exact_512() -> Result<()> {
     // SAFETY: the test's native library remains alive after all of its owners.
     let lib = unsafe { NativeLibrary::load(std::env::var_os("CUTEAFD_VISION_LIBRARY").context("library")?)? };
     let model = std::path::PathBuf::from(std::env::var_os("CUTEAFD_VISION_MODEL").context("model")?);
-    let catalog = cuteafd_loader::read_official_v41_catalog(cuteafd_loader::OFFICIAL_V41_MODEL_ID, &model)?;
+    let catalog = cuteafd_loader::read_official_v41_catalog(&model)?;
     let tokens: Vec<u32> = (0..512).map(|i| ((i * 7919) % 129280) as u32).collect();
     let positions: Vec<u64> = (0..512).collect();
     let copy = |output: TargetEmbedding<'_>| -> Result<(Vec<u8>, Vec<u8>)> {

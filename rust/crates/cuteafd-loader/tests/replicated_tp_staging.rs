@@ -189,7 +189,7 @@ fn generic_selection_is_rejected_for_exl3_and_nvfp4_publications() {
     let mut checked = 0usize;
 
     if let Some(snapshot) = cached_snapshot(EXL3_MODEL_ID) {
-        if let Ok(catalog) = read_official_v41_catalog(EXL3_MODEL_ID, &snapshot) {
+        if let Ok(catalog) = read_official_v41_catalog(&snapshot) {
             assert!(catalog.exl3().is_some(), "expected an EXL3 manifest");
             assert!(
                 catalog.expert_staging(selection).is_err(),
@@ -200,7 +200,7 @@ fn generic_selection_is_rejected_for_exl3_and_nvfp4_publications() {
         }
     }
     if let Some(snapshot) = cached_snapshot(NVFP4_MODEL_ID) {
-        if let Ok(catalog) = read_official_v41_catalog(NVFP4_MODEL_ID, &snapshot) {
+        if let Ok(catalog) = read_official_v41_catalog(&snapshot) {
             assert!(catalog.nvfp4().is_some(), "expected an NVFP4 contract");
             assert!(
                 catalog.expert_staging(selection).is_err(),
@@ -314,7 +314,7 @@ fn generic_world_shards_match_raw_official_source_bytes() {
         );
         return;
     };
-    let catalog = read_official_v41_catalog(OFFICIAL_V41_MODEL_ID, &snapshot)
+    let catalog = read_official_v41_catalog(&snapshot)
         .expect("official V4.1 catalog");
     assert!(catalog.exl3().is_none(), "official checkpoint is not EXL3");
     assert!(

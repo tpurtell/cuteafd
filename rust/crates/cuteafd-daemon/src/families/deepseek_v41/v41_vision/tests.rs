@@ -33,7 +33,7 @@ fn native_full_vision_vectors() -> Result<()> {
     std::fs::create_dir_all(&output)?;
     let lib = unsafe { NativeLibrary::load(library)? };
     let catalog =
-        cuteafd_loader::read_official_v41_catalog(cuteafd_loader::OFFICIAL_V41_MODEL_ID, &model)?;
+        cuteafd_loader::read_official_v41_catalog(&model)?;
     let bytes = VisionRuntime::device_bytes(&catalog, 9216)?;
     assert!(VisionRuntime::new(&lib, &catalog, 9216, bytes - 1).is_err());
     let free_before = lib.cuda_memory_info()?.0;

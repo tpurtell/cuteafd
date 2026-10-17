@@ -1016,8 +1016,9 @@ if name == "ssh":
         status_for(remote)
     sys.exit(0)
 if name == "curl":
-    # Health and model-list probes both succeed; the model id matches.
-    print('{"object":"list","data":[{"id":"deepseek-ai/DeepSeek-V4.1-Flash"}]}')
+    # Health and model-list probes both succeed; the model id matches the
+    # example config's checkpoint (the native API advertises the launched id).
+    print('{"object":"list","data":[{"id":"deepseek-ai/DeepSeek-V4.1-Flash-1017"}]}')
     sys.exit(0)
 if args[:1] == ["inspect"]:
     print("true"); sys.exit(0)

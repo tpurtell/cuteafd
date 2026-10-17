@@ -310,9 +310,7 @@ fn v41_equality(exl3: bool) -> Result<()> {
             id: 1,
         },
     ];
-    let catalog = cuteafd_loader::read_official_v41_catalog(
-        cuteafd_loader::OFFICIAL_V41_MODEL_ID,
-        Path::new(&std::env::var("CUTEAFD_SNAPSHOT")?),
+    let catalog = cuteafd_loader::read_official_v41_catalog(Path::new(&std::env::var("CUTEAFD_SNAPSHOT")?),
     )?;
     let diagnostic_layer = std::env::var("CUTEAFD_TP2_FIXTURE_LAYER")
         .ok()

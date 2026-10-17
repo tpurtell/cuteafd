@@ -497,9 +497,7 @@ mod tests {
     fn real_tp2_ffn_broadcast_and_combine_independent_lanes() -> Result<()> {
         let lib =
             unsafe { cuteafd_ffi::NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? };
-        let catalog = cuteafd_loader::read_official_v41_catalog(
-            cuteafd_loader::OFFICIAL_V41_MODEL_ID,
-            std::path::Path::new(&std::env::var("CUTEAFD_SNAPSHOT")?),
+        let catalog = cuteafd_loader::read_official_v41_catalog(std::path::Path::new(&std::env::var("CUTEAFD_SNAPSHOT")?),
         )?;
         lib.cuda_set_device(0)?;
         let devices = [

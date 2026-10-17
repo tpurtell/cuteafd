@@ -29,8 +29,10 @@ from launcher_sandbox import copy_tree
 ROOT = Path(__file__).resolve().parents[2]
 FIXTURES = ROOT / "scripts" / "tests" / "fixtures" / "v41-launch"
 REVISIONS = {"deepseek-ai/DeepSeek-V4.1-Flash": "dba1be0a40aa45a94ad051997016db3960a90277",
+             "deepseek-ai/DeepSeek-V4.1-Flash-1017": "1bae0e1088993b9b82de08f59de5be5a34e42170",
              "nvidia/DeepSeek-V4.1-Flash-NVFP4": "3431dde3247c13b5957f682b1e3c6fcae2566079"}
 CHECKPOINTS = {"deepseek-ai/DeepSeek-V4.1-Flash": {"model_type": "deepseek_v41"},
+               "deepseek-ai/DeepSeek-V4.1-Flash-1017": {"model_type": "deepseek_v41"},
                "nvidia/DeepSeek-V4.1-Flash-NVFP4": {"model_type": "deepseek_v41",
                                                     "quantization_config": {"moe_quant_algo": "NVFP4"}}}
 GPU_UUIDS = ("GPU-00000000-0000-0000-0000-000000000000", "GPU-11111111-1111-1111-1111-111111111111")
@@ -86,7 +88,9 @@ if tool == "nvidia-smi":
         print("0\n1")
     sys.exit(0)
 if tool == "curl":
-    print(json.dumps({"object": "list", "data": [{"id": "deepseek-ai/DeepSeek-V4.1-Flash"}, {"id": "test/model"}]}))
+    # The native API advertises the launched checkpoint's id.
+    served = os.environ.get("CAPTURE_SERVED_MODEL", "deepseek-ai/DeepSeek-V4.1-Flash")
+    print(json.dumps({"object": "list", "data": [{"id": served}, {"id": "test/model"}]}))
     sys.exit(0)
 if tool in ("ss", "nest"):
     sys.exit(0)
@@ -368,6 +372,8 @@ def capture(launcher_root: Path, case: str, *, release_entry: dict | None = None
             config = kit_config(case, directory) if case in KIT_CARDS else example_config(case, directory)
         text = config.read_text()
         sparks = next(int(line.split("=", 1)[1]) for line in text.splitlines() if line.startswith("SPARK_COUNT="))
+        values = dict(line.split("=", 1) for line in text.splitlines() if "=" in line and not line.startswith("#"))
+        served = values.get("SERVED_MODEL_ID") or values.get("MODEL_ID") or "deepseek-ai/DeepSeek-V4.1-Flash-1017"
         rtx = next(int(line.split("=", 1)[1]) for line in text.splitlines() if line.startswith("RTX_GPUS="))
         spec = root / "nvidia.yaml"
         spec.write_text("devices:\n" + "".join(f"  - name: {name}\n" for name in (*GPU_UUIDS, "0", "1", "all")))
@@ -378,6 +384,7 @@ def capture(launcher_root: Path, case: str, *, release_entry: dict | None = None
                "CAPTURE_FAMILY": release_entry["family"] if release_entry else "deepseek_v41",
                "CAPTURE_EXL3": "1" if release_values.get("EXPERT_FORMAT") == "exl3" else "0",
                "CAPTURE_FIRST_LAYER": first, "CAPTURE_LAST_LAYER": last, "CAPTURE_RELEASE": "1" if release_entry else "",
+               "CAPTURE_SERVED_MODEL": served,
                "CUTEAFD_CDI_CHECK": "on", "CUTEAFD_CDI_SPECS": str(spec),
                "CUTEAFD_RELEASE_READY_TIMEOUT_SECONDS": "30", "TMPDIR": str(root),
                "LANG": "C.UTF-8", "USER": "test-user" if release_entry else "tj", "LOGNAME": "test-user" if release_entry else "tj"}

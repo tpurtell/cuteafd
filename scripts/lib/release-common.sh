@@ -1,8 +1,5 @@
 #!/usr/bin/env bash
 
-# The native API uses the recipe model identity for every supported checkpoint.
-# MODEL_ID selects Hugging Face storage and may name a routed-only quant.
-RELEASE_NATIVE_API_MODEL_ID=deepseek-ai/DeepSeek-V4.1-Flash
 RELEASE_COORDINATOR_CONTAINER_NAME=cuteafd-coordinator
 RELEASE_SPARK_CONTAINER_PREFIX=cuteafd-spark-expert
 
@@ -951,12 +948,13 @@ release_load_config() {
   esac
   [[ -f "$config" ]] || release_die "configuration file not found: $config"
 
-  local default_model_id=deepseek-ai/DeepSeek-V4.1-Flash
+  local default_model_id=deepseek-ai/DeepSeek-V4.1-Flash-1017
   MODEL_ID="$default_model_id"
   MODEL_VARIANT=flash
   VISION=auto
   AUDIO=auto
-  MODEL_REVISION=dba1be0a40aa45a94ad051997016db3960a90277
+  MODEL_REVISION=1bae0e1088993b9b82de08f59de5be5a34e42170
+  SERVED_MODEL_ID=
   EXPERT_FORMAT=native
   SPECULATOR=dspark
   TP2_ATTENTION=off
@@ -1225,6 +1223,9 @@ release_load_config() {
   RELEASE_CONFIG="$(realpath "$config")"
   RELEASE_MODEL_ID="$MODEL_ID"
   RELEASE_MODEL_REVISION="$MODEL_REVISION"
+  # The native API advertises the launched checkpoint's id (the daemon derives
+  # it from the snapshot path), or SERVED_MODEL_ID when the config names one.
+  RELEASE_NATIVE_API_MODEL_ID="${SERVED_MODEL_ID:-$MODEL_ID}"
   # INSTANCE names a launch that runs beside others on disjoint hardware: its
   # coordinator container is cuteafd-coordinator-INSTANCE, exactly the suffix
   # scripts/launch/run-family.sh derives from the same key, so pickers and stops

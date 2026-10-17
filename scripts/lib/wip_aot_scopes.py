@@ -12,6 +12,10 @@ import sys
 SPEC = importlib.util.spec_from_file_location('checkpoint_family', Path(__file__).with_name('checkpoint-family.py'))
 checkpoint_family = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(checkpoint_family)
+# The launcher's default checkpoint when a config names none (release-common.sh).
+DEFAULT_MODEL_ID = 'deepseek-ai/DeepSeek-V4.1-Flash-1017'
+# Official V4.1 releases, for builds whose checkpoint metadata is not local.
+V41_RELEASES = ('deepseek-ai/DeepSeek-V4.1-Flash', 'deepseek-ai/DeepSeek-V4.1-Flash-1017')
 PROGRAM_SWITCHES = dict(deepseek_v4='DSV4', glm5='GLM', glm5_flash='GLMF', mimo_v2='MIMO', qwen4='QWEN4',
                         qwen3_5='QWEN_DENSE')
 
@@ -22,7 +26,7 @@ def require_mapping(family):
 
 
 def checkpoint_config(values):
-    model = values.get('MODEL_ID', 'deepseek-ai/DeepSeek-V4.1-Flash')
+    model = values.get('MODEL_ID', DEFAULT_MODEL_ID)
     hub = Path(os.environ.get('HF_HOME', Path.home() / '.cache/huggingface')) / 'hub'
     root = hub / ('models--' + model.replace('/', '--'))
     revision = values.get('MODEL_REVISION', '')
@@ -123,7 +127,7 @@ def config_family(values):
     declared = values.get('FAMILY', '')
     if declared:
         require_mapping(declared)
-    model = values.get('MODEL_ID', 'deepseek-ai/DeepSeek-V4.1-Flash')
+    model = values.get('MODEL_ID', DEFAULT_MODEL_ID)
     config = checkpoint_config(values)
     if config is not None:
         detected = checkpoint_family.describe(config)[0]
@@ -133,7 +137,7 @@ def config_family(values):
         return detected
     if declared:
         return declared
-    if model == 'deepseek-ai/DeepSeek-V4.1-Flash':
+    if model in V41_RELEASES:
         return 'deepseek_v41'
     raise ValueError(f'cannot derive WIP AOT family for {model}: checkpoint config.json is missing; '
                      'download its metadata or set FAMILY in the build config')

@@ -1,6 +1,6 @@
 //! Inspect the official catalog and fixed storage placement without loading weights.
 use anyhow::{Context, Result};
-use cuteafd_loader::{read_official_v41_catalog, OFFICIAL_V41_MODEL_ID};
+use cuteafd_loader::read_official_v41_catalog;
 use std::path::PathBuf;
 fn main() -> Result<()> {
     let snapshot = PathBuf::from(
@@ -8,7 +8,7 @@ fn main() -> Result<()> {
             .nth(1)
             .context("usage: v41_catalog SNAPSHOT")?,
     );
-    let catalog = read_official_v41_catalog(OFFICIAL_V41_MODEL_ID, &snapshot)?;
+    let catalog = read_official_v41_catalog(&snapshot)?;
     let budget = catalog.storage_budget()?;
     println!(
         "{}",

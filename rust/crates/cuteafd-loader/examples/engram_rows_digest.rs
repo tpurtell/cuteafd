@@ -10,7 +10,7 @@ fn main() -> Result<()> {
     let args: Vec<_> = std::env::args().collect();
     let snapshot = Path::new(args.get(1).context("missing snapshot")?);
     let waves: usize = args.get(2).map_or(Ok(24), |w| w.parse())?;
-    let catalog = read_official_v41_catalog("deepseek-ai/DeepSeek-V4.1-Flash", snapshot)?;
+    let catalog = read_official_v41_catalog(snapshot)?;
     let map = EngramTokenMap::from_file(&snapshot.join("tokenizer.json"))?;
     // SAFETY: the checkpoint snapshot is immutable while this process runs.
     let pipeline = unsafe { EngramPipeline::new(&catalog, map, 256, 4, 256 * 64 * 1024)? };

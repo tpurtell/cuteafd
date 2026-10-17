@@ -472,9 +472,7 @@ mod tests {
     fn compressed_layer_uploads_match_staged_bytes() -> Result<()> {
         let library = unsafe { NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? };
         library.cuda_set_device(0)?;
-        let catalog = cuteafd_loader::read_official_v41_catalog(
-            cuteafd_loader::OFFICIAL_V41_MODEL_ID,
-            std::path::Path::new(&std::env::var("CUTEAFD_EXL3_SNAPSHOT")?),
+        let catalog = cuteafd_loader::read_official_v41_catalog(std::path::Path::new(&std::env::var("CUTEAFD_EXL3_SNAPSHOT")?),
         )?;
         let rank = std::env::var("CUTEAFD_EXL3_TEST_RANK").unwrap_or_else(|_| "2".into()).parse()?;
         let layer = ExpertLayer::Backbone { layer: 0, rank };

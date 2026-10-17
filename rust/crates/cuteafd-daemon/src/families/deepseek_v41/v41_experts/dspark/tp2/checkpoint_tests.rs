@@ -30,9 +30,7 @@ fn cuda_dspark_tp2_checkpoint_experts_and_graph() -> Result<()> {
         },
     ];
     let owner = devices[1];
-    let catalog = cuteafd_loader::read_official_v41_catalog(
-        cuteafd_loader::OFFICIAL_V41_MODEL_ID,
-        std::path::Path::new(&std::env::var("CUTEAFD_SNAPSHOT")?),
+    let catalog = cuteafd_loader::read_official_v41_catalog(std::path::Path::new(&std::env::var("CUTEAFD_SNAPSHOT")?),
     )?;
     let weights = Weights::load_pair(devices, &catalog, [16usize << 30; 2], super::LAYOUT)?;
     eprintln!(

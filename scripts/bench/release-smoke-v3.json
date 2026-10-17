@@ -25,6 +25,8 @@
         "REPLACE-ME-spark-2"
       ],
       "set": {
+        "MODEL_ID": "deepseek-ai/DeepSeek-V4.1-Flash-1017",
+        "MODEL_REVISION": "1bae0e1088993b9b82de08f59de5be5a34e42170",
         "RTX_GPUS": "1",
         "COORDINATOR_GPU": "1",
         "SPARK_COUNT": "3",
@@ -57,6 +59,8 @@
         "REPLACE-ME-spark-3"
       ],
       "set": {
+        "MODEL_ID": "deepseek-ai/DeepSeek-V4.1-Flash-1017",
+        "MODEL_REVISION": "1bae0e1088993b9b82de08f59de5be5a34e42170",
         "RTX_GPUS": "2",
         "COORDINATOR_GPU": "0",
         "SPARK_COUNT": "4",
@@ -829,6 +833,8 @@
         "REPLACE-ME-spark-3"
       ],
       "set": {
+        "MODEL_ID": "deepseek-ai/DeepSeek-V4.1-Flash-1017",
+        "MODEL_REVISION": "1bae0e1088993b9b82de08f59de5be5a34e42170",
         "RTX_GPUS": "1",
         "COORDINATOR_GPU": "1",
         "SPARK_COUNT": "4",
@@ -868,6 +874,8 @@
         "REPLACE-ME-spark-5"
       ],
       "set": {
+        "MODEL_ID": "deepseek-ai/DeepSeek-V4.1-Flash-1017",
+        "MODEL_REVISION": "1bae0e1088993b9b82de08f59de5be5a34e42170",
         "RTX_GPUS": "2",
         "COORDINATOR_GPU": "0",
         "SPARK_COUNT": "6",
@@ -963,6 +971,8 @@
         "REPLACE-ME-spark-2"
       ],
       "set": {
+        "MODEL_ID": "deepseek-ai/DeepSeek-V4.1-Flash-1017",
+        "MODEL_REVISION": "1bae0e1088993b9b82de08f59de5be5a34e42170",
         "RTX_GPUS": "1",
         "COORDINATOR_GPU": "0",
         "SPARK_COUNT": "3",

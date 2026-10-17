@@ -1,4 +1,8 @@
-//! Strict contract for the pinned official checkpoint; no legacy defaults.
+//! Strict contract for the official checkpoint layout; no legacy defaults.
+//!
+//! The family and its validity come from the snapshot's own `config.json`
+//! (and, in the catalog, its tensor headers), never from the repository id:
+//! every official V4.1 release that ships this exact architecture loads.
 use anyhow::{ensure, Context, Result};
 use serde::Deserialize;
 use serde_json::Value;
@@ -14,11 +18,7 @@ const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
 pub struct OfficialV41Config(V41CheckpointConfig);
 
 impl OfficialV41Config {
-    pub fn from_json(model_id: &str, bytes: &[u8]) -> Result<Self> {
-        ensure!(
-            model_id == OFFICIAL_V41_MODEL_ID,
-            "only {OFFICIAL_V41_MODEL_ID} is supported, got {model_id}"
-        );
+    pub fn from_json(bytes: &[u8]) -> Result<Self> {
         ensure!(
             bytes.len() as u64 <= MAX_CONFIG_BYTES,
             "V4.1 config exceeds one MiB"
@@ -74,14 +74,14 @@ impl OfficialV41Config {
     }
 }
 
-pub fn read_official_v41_config(model_id: &str, snapshot: &Path) -> Result<OfficialV41Config> {
+pub fn read_official_v41_config(snapshot: &Path) -> Result<OfficialV41Config> {
     let path = snapshot.join("config.json");
     let mut bytes = Vec::new();
     File::open(&path)
         .with_context(|| format!("opening {}", path.display()))?
         .take(MAX_CONFIG_BYTES + 1)
         .read_to_end(&mut bytes)?;
-    OfficialV41Config::from_json(model_id, &bytes)
+    OfficialV41Config::from_json(&bytes)
 }
 
 fn validate_fields(path: &str, expected: &Value, actual: &Value) -> Result<()> {
@@ -236,7 +236,7 @@ mod tests {
     #[test]
     fn official_nested_architecture_has_distinct_dspark_and_ced_geometry() {
         let config =
-            OfficialV41Config::from_json(OFFICIAL_V41_MODEL_ID, OFFICIAL_CONFIG.as_bytes())
+            OfficialV41Config::from_json(OFFICIAL_CONFIG.as_bytes())
                 .unwrap();
         let text = config.text();
         assert_eq!((text.n_routed_experts, text.num_experts_per_tok), (384, 6));
@@ -280,9 +280,7 @@ mod tests {
             let mut value: Value = serde_json::from_str(OFFICIAL_CONFIG).unwrap();
             *value.pointer_mut(pointer).unwrap() = replacement;
             assert!(
-                OfficialV41Config::from_json(
-                    OFFICIAL_V41_MODEL_ID,
-                    &serde_json::to_vec(&value).unwrap()
+                OfficialV41Config::from_json(&serde_json::to_vec(&value).unwrap()
                 )
                 .is_err(),
                 "{pointer}"
@@ -293,18 +291,11 @@ mod tests {
             .as_object_mut()
             .unwrap()
             .remove("candidate_source_layer_id");
-        let error = OfficialV41Config::from_json(
-            OFFICIAL_V41_MODEL_ID,
-            &serde_json::to_vec(&value).unwrap(),
+        let error = OfficialV41Config::from_json(&serde_json::to_vec(&value).unwrap(),
         )
         .unwrap_err();
         assert!(error
             .to_string()
             .contains("config.text_config.candidate_source_layer_id"));
-        assert!(OfficialV41Config::from_json(
-            "deepseek-ai/DeepSeek-V4-Flash",
-            OFFICIAL_CONFIG.as_bytes()
-        )
-        .is_err());
     }
 }

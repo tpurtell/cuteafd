@@ -283,8 +283,7 @@ mod tests {
     #[ignore = "requires checkpoint, projection shard AOT and two CUDA GPUs"]
     fn checkpoint_dual_projection_lanes_match_full() -> Result<()> {
         let lib=unsafe { cuteafd_ffi::NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? };
-        let catalog=cuteafd_loader::read_official_v41_catalog(cuteafd_loader::OFFICIAL_V41_MODEL_ID,
-            std::path::Path::new(&std::env::var("CUTEAFD_SNAPSHOT")?))?;
+        let catalog=cuteafd_loader::read_official_v41_catalog(std::path::Path::new(&std::env::var("CUTEAFD_SNAPSHOT")?))?;
         let devices=[Device { library:&lib,id:0 },Device { library:&lib,id:1 }];
         let runtime=tokio::runtime::Builder::new_current_thread().build()?;
         for kind in [Kind::QueryB,Kind::OutputB] {

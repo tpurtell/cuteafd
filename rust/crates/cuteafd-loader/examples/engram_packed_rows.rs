@@ -7,7 +7,7 @@ fn main() -> Result<()> {
     let args: Vec<_> = std::env::args().collect();
     let snapshot = Path::new(args.get(1).context("missing snapshot")?);
     let output = Path::new(args.get(2).context("missing output directory")?);
-    let catalog = read_official_v41_catalog("deepseek-ai/DeepSeek-V4.1-Flash", snapshot)?;
+    let catalog = read_official_v41_catalog(snapshot)?;
     std::fs::create_dir_all(output)?;
     let history = cuteafd_core::EngramHistory::new(0)?;
     let batch = history.prepare(0, &[Some(7), None, Some(31), Some(9182)], 4)?;

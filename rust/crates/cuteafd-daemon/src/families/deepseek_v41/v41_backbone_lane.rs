@@ -1042,7 +1042,7 @@ impl<'w, 'a> BackboneLane<'w, 'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cuteafd_loader::{read_official_v41_catalog, OFFICIAL_V41_MODEL_ID};
+    use cuteafd_loader::read_official_v41_catalog;
 
     #[test]
     fn lane_ffn_cancellation_and_failure_do_not_publish_completion() {
@@ -1104,7 +1104,7 @@ mod tests {
             .ok_or_else(|| anyhow::anyhow!("CUTEAFD_LANE_PLAN_MODEL required"))?;
         let library = unsafe { NativeLibrary::load(path)? };
         let catalog =
-            read_official_v41_catalog(OFFICIAL_V41_MODEL_ID, std::path::Path::new(&model))?;
+            read_official_v41_catalog(std::path::Path::new(&model))?;
         // Checkpoint payload extents plus the native AOT packed-scale metadata.
         let weight_bytes = BackboneLaneWeights::device_bytes(&library, &catalog)?;
         assert_eq!(weight_bytes, 6_896_423_360);

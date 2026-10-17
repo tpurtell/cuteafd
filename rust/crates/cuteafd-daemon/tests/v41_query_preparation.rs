@@ -21,7 +21,7 @@ mod shared {
 use families::deepseek_v41::{v41_attention_query, v41_hc, v41_tensors};
 use anyhow::{ensure, Result};
 use cuteafd_ffi::{CuteafdDeviceBuffer, NativeLibrary};
-use cuteafd_loader::{read_official_v41_catalog, OFFICIAL_V41_MODEL_ID};
+use cuteafd_loader::read_official_v41_catalog;
 fn read(lib: &NativeLibrary, b: CuteafdDeviceBuffer) -> Result<Vec<u8>> {
     let mut v = vec![0; b.bytes];
     lib.copy_d2h(&mut v, b)?;
@@ -31,9 +31,7 @@ fn read(lib: &NativeLibrary, b: CuteafdDeviceBuffer) -> Result<Vec<u8>> {
 #[ignore = "requires the official V4.1 snapshot and a CUDA native library"]
 fn query_preparation_preserves_values_and_drains_producer_errors() -> Result<()> {
     let lib = unsafe { NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? };
-    let cat = read_official_v41_catalog(
-        OFFICIAL_V41_MODEL_ID,
-        std::path::Path::new(&std::env::var("CUTEAFD_V41_SNAPSHOT")?),
+    let cat = read_official_v41_catalog(std::path::Path::new(&std::env::var("CUTEAFD_V41_SNAPSHOT")?),
     )?;
     let runtime = tokio::runtime::Builder::new_current_thread().build()?;
     let mut cases = 0;

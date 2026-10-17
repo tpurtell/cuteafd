@@ -54,7 +54,9 @@ def main():
                     torch.testing.assert_close(tensors['freq'],torch.view_as_real(freq),rtol=0,atol=0)
                     rotated=tensors['input'].clone();ns['apply_rotary_emb'](rotated[None,...,-64:],freq,True)
                     torch.testing.assert_close(tensors['rotated'],rotated,rtol=0,atol=0)
-                    grouped=torch.einsum('sgd,grd->sgr',tensors['rotated'].reshape(rows,8,4096),grouped_weight)
+                    # DeepSeek-V4.1-Flash-1017 model.py: MXFP8-quantize o before the grouped wo_a einsum.
+                    quantized=ref.act_quant(tensors['rotated'].clone(),32,'ue8m0',torch.float8_e8m0fnu,True)
+                    grouped=torch.einsum('sgd,grd->sgr',quantized.reshape(rows,8,4096),grouped_weight)
                     torch.testing.assert_close(tensors['grouped'],grouped,rtol=.008,atol=.002)
                     bq,bs=ref.act_quant(tensors['grouped'].reshape(rows,8192),32,'ue8m0',torch.float8_e8m0fnu)
                     projected=ref.fp8_gemm(bq,bs,wb,sb,torch.float8_e8m0fnu,block_size=32)

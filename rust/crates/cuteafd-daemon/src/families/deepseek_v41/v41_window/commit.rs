@@ -236,8 +236,7 @@ mod tests {
     fn queued_windows(replicated: bool) -> Result<()> {
         let lib = unsafe { NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? };
         let model = std::env::var("CUTEAFD_CACHE_COMMIT_MODEL")?;
-        let catalog = cuteafd_loader::read_official_v41_catalog(
-            cuteafd_loader::OFFICIAL_V41_MODEL_ID, std::path::Path::new(&model))?;
+        let catalog = cuteafd_loader::read_official_v41_catalog(std::path::Path::new(&model))?;
         let weights = WindowWeights::load(&lib, &catalog, 0,
             WindowWeights::device_bytes(&lib, &catalog, 0)?, 1024*1024)?;
         let mut state = WindowState::new(&lib, 0, 2, usize::MAX)?;
