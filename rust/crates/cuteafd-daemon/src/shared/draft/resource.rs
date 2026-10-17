@@ -116,7 +116,7 @@ const REFERENCE_MARGIN: f64 = 1.02;
 pub(crate) fn choose_block(policy: &mut DraftPolicy, requests: &[(u64, usize)], width: usize,
     drafted_requests: usize, rows: usize, cold: bool) -> Result<bool> {
     if drafted_requests == 0 || !requests.iter().any(|&(_, room)| room > 0) { return Ok(false); }
-    if cold { return Ok(true); }
+    if cold || policy.draft_mode() != cuteafd_core::DraftMode::Shared { return Ok(true); }
     let actions = [cuteafd_core::DraftAction { width: 0, draft_us: 0. }, cuteafd_core::DraftAction {
         width, draft_us: policy.draft_cost_drafted(false, requests.len(), drafted_requests, width) }];
     let chosen = policy.choose_action(false, requests, &actions, rows)?;
@@ -340,6 +340,14 @@ pub(crate) fn select_drafted(policy: &mut DraftPolicy, candidates: &[Candidate<'
         .map(|c| &c.prior[..c.prior.len().min(c.limit).min(positions)]).collect();
     let cores: Vec<DraftCandidate<'_>> = candidates.iter().zip(&confidence)
         .map(|(c, &confidence)| DraftCandidate { id: c.id, confidence }).collect();
+    if policy.draft_mode() != cuteafd_core::DraftMode::Shared {
+        // The simple rule owns every length: no cold floor, no lone-request reference.
+        let mut lengths = policy.select_drafted_within(false, &cores, width, max_rows, drafted_requests).ok().flatten()
+            .map_or_else(|| vec![0; cores.len()], |selection| selection.lengths);
+        fit_budget(&mut lengths, max_rows);
+        binding::trace_selection(policy, &cores, width, drafted_requests, max_rows, &lengths);
+        return Selection { lengths, predicted: None };
+    }
     let minimum = |c: &Candidate<'_>, available: usize| if c.selector && c.cold { START_DRAFTS.min(available) } else { 0 };
     // Until the bucket engages, each request verifies its calibrated-survival
     // drafts (at most the seed's cold drafts), not a fixed count.
@@ -533,7 +541,9 @@ pub(crate) fn publish(policy: &DraftPolicy, observed: u64, skipped: u64, ring: O
             "platt": policy.calibration(requests)})
     }).collect();
     let value = serde_json::json!({
-        "mode": if policy.survival_lengths() { "survival" } else { "shared" },
+        "mode": if policy.draft_mode() != cuteafd_core::DraftMode::Shared { policy.draft_mode().label() }
+            else if policy.survival_lengths() { "survival" } else { "shared" },
+        "simple": binding::simple_reliability(policy),
         "concurrency_buckets": buckets,
         "warm": policy.warm(false, 1),
         "engaged": policy.engaged(false, 1),
@@ -792,6 +802,25 @@ mod tests {
         }
         assert!(policy.warm(false, 1));
         policy
+    }
+
+    #[test]
+    fn simple_mode_owns_lengths_without_glm_floors_and_always_drafts() {
+        let mut policy = DraftPolicy::new(geometry(&homes(true), 288, 8, 64, 7, 0).unwrap(),
+            cuteafd_core::PolicySeed::weak(7), false).unwrap();
+        policy.set_draft_mode(cuteafd_core::DraftMode::Simple);
+        let low = [0.1; 7];
+        let high = [0.9, 0.9, 0.9, 0.3, 0.9, 0.9, 0.9];
+        let candidates = [Candidate { id: 1, prior: &low, limit: 7, selector: true, cold: true },
+            Candidate { id: 2, prior: &high, limit: 7, selector: true, cold: false }];
+        let selection = select(&mut policy, &candidates, 7, 64);
+        // No cold DFlash2 five-draft floor; joint acceptance 0.9, 0.81, 0.73, 0.22 passes three,
+        // and one request explores one row past its cutoff.
+        assert!(selection.lengths == [1, 3] || selection.lengths == [0, 4], "{:?}", selection.lengths);
+        assert_eq!(selection.predicted, None);
+        // The pre-draft action always drafts while any request has room.
+        assert!(choose_block(&mut policy, &[(1, 7), (2, 7)], 7, 2, 64, false).unwrap());
+        assert!(!choose_block(&mut policy, &[(1, 0)], 7, 0, 64, false).unwrap());
     }
 
     #[test]

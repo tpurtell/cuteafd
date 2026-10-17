@@ -37,6 +37,11 @@
 //!
 //! This module performs no device work.
 use std::collections::{BTreeMap, VecDeque};
+#[path = "simple_draft.rs"]
+mod simple_draft;
+pub use simple_draft::{Cutoff, DraftMode, Reliability, RowCost, SimpleDecision, SimpleRound, SimpleSelection, CUTOFF_CEILING,
+    CUTOFF_FLOOR, OFFSET_PRIOR, REPORT_GROUPS, SIMPLE_CUTOFF};
+use simple_draft::SimpleDraft;
 
 /// Committed tokens retained per request.
 const HISTORY: usize = 24;
@@ -806,7 +811,8 @@ pub struct DraftPolicy {
     /// Eligibility is recorded by selection, but skips age only on observation.
     selected_draft_room: BTreeMap<u64, bool>,
     skipped: BTreeMap<u64, u64>,
-
+    /// The opt-in simple length rule; `None` is the shared priced policy.
+    simple: Option<SimpleDraft>,
 }
 
 impl DraftPolicy {
@@ -837,7 +843,7 @@ impl DraftPolicy {
             selected_requests: BTreeMap::new(),
             selected_rows: BTreeMap::new(),
             selected_draft_room: BTreeMap::new(), skipped: BTreeMap::new(),
-            action_age: BTreeMap::new(),
+            action_age: BTreeMap::new(), simple: None,
             seed, priced, fixed,
             history: BTreeMap::new(),
             novelty: std::array::from_fn(|_| vec![2.5; geometry.layers.len()]),
@@ -854,6 +860,8 @@ impl DraftPolicy {
     pub fn restarted(&self, fixed: bool) -> Self {
         let mut policy = Self::build(self.geometry.clone(), fixed, self.seed.clone());
         policy.survival_lengths = self.survival_lengths;
+        policy.set_draft_mode(self.draft_mode());
+        policy.set_row_cost(self.row_cost());
         policy.native_confidence_positions = self.native_confidence_positions;
         policy
     }
@@ -864,6 +872,7 @@ impl DraftPolicy {
             return Err(DraftPolicyError::Geometry("invalid native confidence extent or policy already observed"));
         }
         self.native_confidence_positions = positions;
+        if let Some(simple) = &mut self.simple { simple.set_native(positions.max(*self.geometry.widths.last().unwrap())); }
         Ok(())
     }
     /// Choose lengths by calibrated survival (draft while at least one half)
@@ -873,6 +882,46 @@ impl DraftPolicy {
     }
     pub fn survival_lengths(&self) -> bool {
         self.survival_lengths
+    }
+    /// Switch the length rule. The simple modes (`simple_draft`) replace
+    /// selection, width and action choice and calibration; the priced fits
+    /// keep running for reports only.
+    pub fn set_draft_mode(&mut self, mode: DraftMode) {
+        let native = self.native_confidence_positions.max(*self.geometry.widths.last().unwrap());
+        self.simple = (mode != DraftMode::Shared)
+            .then(|| SimpleDraft::new(mode, self.geometry.max_positions, native));
+    }
+    /// How the simple rules price rows (default linear).
+    pub fn set_row_cost(&mut self, cost: RowCost) {
+        if let Some(simple) = &mut self.simple { simple.set_row_cost(cost); }
+    }
+    pub fn row_cost(&self) -> RowCost {
+        self.simple.as_ref().map_or(RowCost::Linear, SimpleDraft::row_cost)
+    }
+    pub fn draft_mode(&self) -> DraftMode {
+        self.simple.as_ref().map_or(DraftMode::Shared, SimpleDraft::mode)
+    }
+    /// The simple rule's per-position predicted against realized acceptance,
+    /// `[group][native, tail][position]` with groups [`REPORT_GROUPS`].
+    pub fn simple_reliability(&self) -> Option<&[[Vec<Reliability>; 2]; 4]> {
+        self.simple.as_ref().map(SimpleDraft::reliability)
+    }
+    /// The simple rule's cutoff now for a selection over `requests`, for reports.
+    pub fn simple_cutoff(&self, requests: usize) -> Option<Cutoff> {
+        self.simple.as_ref().map(|simple| simple.cutoff(requests))
+    }
+    /// The simple rule's latest observed round (samples, costs, row price and
+    /// the decisions behind it), for traces.
+    pub fn simple_round(&self) -> Option<&SimpleRound> {
+        self.simple.as_ref().and_then(SimpleDraft::last_round)
+    }
+    /// The simple rule's latest selection, before its round is observed.
+    pub fn simple_pending(&self) -> Option<&SimpleSelection> {
+        self.simple.as_ref().and_then(SimpleDraft::pending)
+    }
+    /// The simple rule's per-position (slope, offset) calibration.
+    pub fn simple_calibration(&self) -> Option<Vec<(f64, f64)>> {
+        self.simple.as_ref().map(SimpleDraft::calibration)
     }
     pub fn fixed(&self) -> bool {
         self.fixed
@@ -921,6 +970,7 @@ impl DraftPolicy {
         self.selected_rows.remove(&id);
         self.selected_draft_room.remove(&id);
         self.skipped.remove(&id);
+        if let Some(simple) = &mut self.simple { simple.release(id); }
         for confidence in &mut self.confidence {
             confidence.recent.remove(&id);
             confidence.outcomes.remove(&id);
@@ -953,6 +1003,10 @@ impl DraftPolicy {
     /// Conditional acceptance used for one request, exposed for opt-in decision
     /// diagnostics. This does not advance calibration or route history.
     pub fn probabilities(&self, requests: usize, candidate: DraftCandidate<'_>) -> Vec<f64> {
+        if let Some(simple) = &self.simple {
+            let positions = candidate.confidence.len().min(self.geometry.max_positions);
+            return simple.probabilities(candidate.id, &candidate.confidence[..positions]);
+        }
         let bucket = draft_concurrency_bucket(requests);
         candidate.confidence.iter().enumerate().take(self.geometry.max_positions)
             .map(|(position, &p)| self.request_probability(bucket, candidate.id, position, self.calibrated(bucket, position, p)))
@@ -1109,6 +1163,14 @@ impl DraftPolicy {
         if self.fixed {
             return Ok(None);
         }
+        if let Some(simple) = &mut self.simple {
+            let selection = simple.select(candidates, max_rows.min(self.geometry.verify_capacity()));
+            for (c, &length) in candidates.iter().zip(&selection.lengths) {
+                self.selected_requests.insert(c.id, candidates.len());
+                self.selected_rows.insert(c.id, length + 1);
+            }
+            return Ok(Some(selection));
+        }
         let Some(bucket) = self.usable(candidates.len()) else { return Ok(None) };
         self.selected_cell = Some((bucket, shared));
         // Survival of row k: the product of calibrated conditional acceptance
@@ -1150,7 +1212,7 @@ impl DraftPolicy {
     pub fn choose_width(&mut self, shared: bool, requests: &[(u64, usize)]) -> usize {
         let (narrow, wide) = self.geometry.narrow_wide();
         if narrow == wide || requests.is_empty() { return narrow; }
-        if self.fixed { return wide; }
+        if self.fixed || self.simple.is_some() { return wide; }
         let _ = shared;
         let bucket = draft_concurrency_bucket(requests.len());
         if !self.engaged[bucket] || !self.cost.widths_warm(bucket) {
@@ -1224,7 +1286,8 @@ impl DraftPolicy {
         let eligible: Vec<_> = actions.iter().enumerate().map(|(index, action)|
             max_rows > requests.len() && action.width > 0
                 && (0..requests.len()).any(|request| room(index, request) > 0)).collect();
-        if self.fixed { return Ok(actions.iter().enumerate()
+        // The simple rule always drafts at the widest eligible width.
+        if self.fixed || self.simple.is_some() { return Ok(actions.iter().enumerate()
             .filter(|&(index, action)| action_rooms.is_none() || action.width == 0 || eligible[index])
             .max_by_key(|(_, action)| action.width).map(|(index, _)| index)); }
         let _ = shared;
@@ -1695,6 +1758,7 @@ impl DraftPolicy {
                 }
             }
         }
+        if let Some(simple) = &mut self.simple { simple.observe(&round); }
         self.stats.rounds += 1;
         self.stats.verified_rows += rows as u64;
         if let Some(predicted) = round.predicted_us {
