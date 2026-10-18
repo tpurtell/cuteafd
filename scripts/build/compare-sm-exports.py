@@ -122,6 +122,7 @@ def jobs(scope):
                    ["--geometry", geometry, "--capacities", CAPACITIES])
                   for geometry in EXL3_GEOMETRIES)
     result.extend([
+        ("exlr8", "export_b12x_dsv4_aot.py", ["--geometry", "exlr8"]),
         ("audio", "export_b12x_audio_aot.py", ["--capability", "120"]),
         ("vision-attention", "export_b12x_vision_attention_aot.py", ["--capability", "120"]),
     ])

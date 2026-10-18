@@ -211,6 +211,14 @@ impl<'a> Programs<'a> {
                 }
                 self.card_specs.insert(name.to_string(), specs);
             }
+            if name.starts_with("exlr8_") {
+                super::exlr8::validate_entry(spec, entry)?;
+                let expected = [("rows", "int32"), ("groups", "int32"), ("cta_limit", "int32")];
+                let scalars = entry["scalars"].as_array().context("EXLR8 scalar ABI missing")?;
+                ensure!(scalars.len() == expected.len() && scalars.iter().zip(expected).all(
+                    |(s, (n, t))| s["name"].as_str() == Some(n) && s["type"].as_str() == Some(t)),
+                    "EXLR8 scalar names or types disagree with ABI v1");
+            }
         }
         Ok(self)
     }
