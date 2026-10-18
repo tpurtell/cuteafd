@@ -189,6 +189,9 @@ impl ExpertGeometry {
     pub const GLM5_FLASH: Self = Self { hidden: 4096, experts: 288, topk: 8, intermediate: 2048, layers: 45 };
     /// Qwen 3.8 Flash Next (qwen4_exp): 48 routed layers, softmax top-10, SiLU unclamped.
     pub const QWEN4: Self = Self { hidden: 2560, experts: 512, topk: 10, intermediate: 640, layers: 48 };
+    /// Kimi K3 latent MoE: experts see the 3584-wide `routed_expert_down_proj`
+    /// output (not the 7168 residual); routed layers 1..93, sigmoid top-16, Situ.
+    pub const KIMI_K3: Self = Self { hidden: 3584, experts: 896, topk: 16, intermediate: 3072, layers: 93 };
 
     /// BF16 bytes of one hidden-width row (a routed input or a rank partial).
     pub const fn row_bytes(&self) -> u32 {
@@ -241,6 +244,7 @@ impl ExpertGeometry {
             (Self::MIMO_V26_PRO, "mimop"),
             (Self::GLM5_FLASH, "glmf"),
             (Self::QWEN4, "qwen4"),
+            (Self::KIMI_K3, "kimi"),
         ]
         .into_iter()
         .find_map(|(shape, family)| self.same_shape(&shape).then_some(family))
@@ -250,11 +254,16 @@ impl ExpertGeometry {
     /// 10; GLM 5.x's, MiMo's and Qwen 3.8 Flash Next's SwiGLU are unclamped (`None`).
     pub fn swiglu_limit(&self) -> Option<f32> {
         (!self.same_shape(&Self::GLM5) && !self.same_shape(&Self::MIMO_V2_FLASH)
-            && !self.same_shape(&Self::MIMO_V26_PRO) && !self.same_shape(&Self::QWEN4)).then_some(10.0)
+            && !self.same_shape(&Self::MIMO_V26_PRO) && !self.same_shape(&Self::QWEN4)
+            && !self.same_shape(&Self::KIMI_K3)).then_some(10.0)
     }
 
-    /// Legacy expert arithmetic, unchanged for all currently executable shapes.
+    /// Routed-expert arithmetic. Kimi K3 is Situ (beta 4, linear beta 25);
+    /// every other executable shape keeps its legacy SiLU product.
     pub fn activation(&self) -> crate::FfnActivation {
+        if self.same_shape(&Self::KIMI_K3) {
+            return crate::FfnActivation::Situ { beta: 4.0, linear_beta: Some(25.0) };
+        }
         crate::FfnActivation::SiluBf16Product { limit: self.swiglu_limit() }
     }
 
@@ -358,6 +367,14 @@ mod tests {
         assert_eq!(glm_with_mtp.swiglu_limit(), None);
         assert_eq!(ExpertGeometry::QWEN4.family(), Some("qwen4"));
         assert_eq!(ExpertGeometry::QWEN4.swiglu_limit(), None);
+        let kimi = ExpertGeometry::KIMI_K3;
+        assert_eq!(kimi.family(), Some("kimi"));
+        assert_eq!(kimi.swiglu_limit(), None);
+        assert_eq!(kimi.activation(), crate::FfnActivation::Situ { beta: 4.0, linear_beta: Some(25.0) });
+        assert_eq!(kimi.slice(6), Some(512));
+        // Latent rows: BF16 ingress is sized from 3584, not the 7168 residual.
+        assert_eq!(kimi.row_bytes(), 7168);
+        assert_eq!(kimi.compact_wire_bytes(1, true), Some((40 + 16 * 12 + 3584 * 2 + 96, 4 + 3584 * 2 + 96)));
         assert_eq!(ExpertGeometry::QWEN4.slice(4), Some(160));
     }
 }
