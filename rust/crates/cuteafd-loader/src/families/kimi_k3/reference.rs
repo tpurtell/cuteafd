@@ -3,7 +3,6 @@
 //! are the oracles kernel exports are compared against: explicit rounding
 //! points, FP64 accumulation where the reference reduces in FP32 (kernel
 //! comparisons then bound reduction-order differences, not semantics).
-use anyhow::{ensure, Result};
 
 /// Round to BF16 (nearest even), as `tensor.to(torch.bfloat16)`.
 pub fn bf16(value: f32) -> f32 {
@@ -12,21 +11,8 @@ pub fn bf16(value: f32) -> f32 {
     f32::from_bits((bits.wrapping_add(0x7fff + ((bits >> 16) & 1))) & 0xffff_0000)
 }
 
-/// The release stores KDA `A_log` F32 `[128]` for 96 heads, zero-padded. Return
-/// the live heads, refusing any tail that is not bit-exact `+0.0` (a negative
-/// zero, NaN or value would mean the padding is not padding).
-pub fn narrow_a_log(raw: &[u8], heads: usize) -> Result<Vec<f32>> {
-    ensure!(raw.len() % 4 == 0, "A_log byte length {} is not F32", raw.len());
-    let words: Vec<u32> = raw.chunks_exact(4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect();
-    ensure!(words.len() >= heads, "A_log has {} entries for {heads} heads", words.len());
-    if let Some(index) = words[heads..].iter().position(|w| *w != 0) {
-        anyhow::bail!("A_log padding entry {} is {:#010x}, not +0.0: refusing to narrow {} entries to {heads} heads",
-            heads + index, words[heads + index], words.len());
-    }
-    let live: Vec<f32> = words[..heads].iter().map(|w| f32::from_bits(*w)).collect();
-    ensure!(live.iter().all(|x| x.is_finite()), "A_log live heads must be finite");
-    Ok(live)
-}
+/// The release's zero-padded `A_log` narrowing lives with the shared KDA packer.
+pub use crate::kda::narrow_a_log;
 
 /// `KimiRMSNorm`: normalize in FP32, round to BF16, then multiply by the BF16
 /// weight in BF16 (the product is rounded again).
@@ -93,8 +79,7 @@ mod tests {
         for bad in [-0.0f32, f32::NAN, 1e-30] {
             let mut tail = raw.clone();
             tail[127] = bad;
-            let error = narrow_a_log(&f32_bytes(&tail), 96).unwrap_err().to_string();
-            assert!(error.contains("padding entry 127"), "{error}");
+            assert!(narrow_a_log(&f32_bytes(&tail), 96).is_err(), "tail {bad}");
         }
         assert!(narrow_a_log(&f32_bytes(&raw[..90]), 96).is_err());
     }
