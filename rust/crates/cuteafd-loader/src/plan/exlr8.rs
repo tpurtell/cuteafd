@@ -16,6 +16,128 @@ use super::format::{
 
 pub mod residency;
 
+/// Native selection is distinct from the ordinary GLM launch description.
+#[derive(Debug, Clone, Serialize)]
+pub struct NativeSelection {
+    pub manifest: String,
+    pub set_id: String,
+    pub dense_from: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SparkRequirements {
+    pub resident_bytes_per_rank: Vec<u64>,
+    pub k1_workspace: &'static str,
+}
+
+/// Metadata-only execution arena; allocation uses the same checked layout helper.
+pub fn shared_workspace(manifest: &Value) -> Result<u64> {
+    let spec = manifest["programs"].as_array().context("PROGRAMS.json programs must be an array")?
+        .iter().find(|p| p["name"] == "exlr8_shared_a16_serving")
+        .context("PROGRAMS.json lacks exlr8_shared_a16_serving")?;
+    ensure!(spec["geometry"]["abi_version"] == 2 && spec["capacity_rows"].as_u64() == Some(64),
+        "EXLR8 shared workspace requires ABI v2 and 64-row capacity");
+    let n = |group: &str, key: &str| -> Result<usize> {
+        usize::try_from(spec[group][key].as_u64().with_context(|| format!("EXLR8 missing {group}.{key}"))?)
+            .context("EXLR8 metadata exceeds address space")
+    };
+    ensure!(n("geometry", "hidden")? == 6144 && n("geometry", "top_k")? == 1
+        && n("geometry", "units")? == 16 && n("geometry", "max_groups")? == 4,
+        "EXLR8 shared geometry must be hidden6144/top1/units16/groups4");
+    Ok(residency::execution_workspace_layout(64, n("geometry", "hidden")?, n("geometry", "top_k")?,
+        n("geometry", "max_groups")?, n("scratch_bytes_at_capacity", "fc1")?,
+        n("scratch_bytes_at_capacity", "intermediate")?, n("scratch_bytes_at_capacity", "fc2")?)?.1 as u64)
+}
+
+pub struct NativePlan {
+    pub report: super::PlanReport,
+    pub selection: NativeSelection,
+    pub sparks: SparkRequirements,
+}
+
+/// Full-forward native admission, deliberately narrower than format inventory.
+pub fn native_plan(snapshot: &Path, selected: &str, dense: &Path,
+    options: &super::PlanOptions, speculator: &str) -> Result<NativePlan> {
+    use super::{ExpertPlacement, Status, RuntimeStatus, spec::Component};
+    ensure!(matches!(selected, "up1" | "bit325"), "EXLR8 native manifest must be up1 or bit325");
+    ensure!(options.placement == ExpertPlacement::Sparks { ranks: 4 }, "EXLR8 native deployment requires canonical TP4 Sparks");
+    ensure!(speculator == "off", "EXLR8 native deployment requires --speculator off");
+    ensure!(matches!(options.attention_placement, None | Some(crate::placement::AttentionPlacement::Context)),
+        "EXLR8 native deployment requires context attention");
+    let layout = options.layout.as_ref().context("EXLR8 native deployment requires --layout")?;
+    ensure!(layout.rtx_bytes.len() == 2, "EXLR8 native deployment requires two RTX GPUs");
+    ensure!(layout.prefill_lanes <= 1, "EXLR8 native deployment requires one serial prefill lane");
+    ensure!(layout.local_expert_layers.is_none_or(|n| n == 0)
+        && layout.onboard.is_none_or(|n| n == crate::placement::Onboard::Layers(0)),
+        "EXLR8 native deployment cannot onboard routed experts");
+    ensure!(!layout.host_embedding && layout.drafter_bytes == 0, "EXLR8 requires GPU embedding and no drafter");
+    validate_dense_source(snapshot, dense)?;
+    let checkpoint = super::Checkpoint::coordinator(dense, false, false)?;
+    ensure!(checkpoint.config["quantization_config"]["quant_method"] == "fp8"
+        && checkpoint.config["quantization_config"]["weight_block_size"] == serde_json::json!([128,128]),
+        "EXLR8 dense source requires official compatible GLM-5.3 block-FP8 [128,128]");
+    let cfg = crate::families::glm5::GlmDsaConfig::from_hf(&checkpoint.config)?;
+    ensure!(cfg.hidden == 6144 && cfg.layers == 78 && cfg.first_moe_layer == 3,
+        "EXLR8 native full-forward requires GLM-5.3 78 layers/hidden6144/first routed3");
+    let (_, set_id) = manifest_identity(snapshot, selected)?;
+    let mut shared = 0u64;
+    let mut residents = vec![0u64; 4];
+    for layer in cfg.first_moe_layer..cfg.layers {
+        let plan = residency::Residency::plan(snapshot, selected, layer, 1, 0, residency::ExpertSet::Shared)?;
+        shared = shared.checked_add(plan.resident_bytes as u64).context("EXLR8 shared residency overflow")?;
+        for (rank, resident) in residents.iter_mut().enumerate() {
+            let plan = residency::Residency::plan(snapshot, selected, layer, 4, rank, residency::ExpertSet::Routed)?;
+            *resident = resident.checked_add(plan.resident_bytes as u64).context("EXLR8 routed residency overflow")?;
+        }
+    }
+    ensure!(residents.iter().all(|&bytes| bytes <= options.spark_budget_bytes),
+        "EXLR8 routed resident bytes exceed Spark budget before live workspace admission");
+    let programs = read_json(layout.workspace_manifest.as_deref()
+        .unwrap_or_else(|| Path::new("/opt/cuteafd/share/PROGRAMS.json")))?;
+    let workspace = shared_workspace(&programs)?;
+    let (memory, placement) = super::layout::glm5::native_layout(&checkpoint, layout, shared, workspace, &programs)?;
+    let mut dense_options = options.clone();
+    dense_options.layout = None;
+    dense_options.draft_ownership = Some(super::spec::DraftOwnership::selected("glm5", "off"));
+    let mut report = super::plan(dense, &dense_options)?;
+    ensure!(report.config_error.is_none() && report.unclassified.is_empty()
+        && report.missing_shards.is_empty(), "EXLR8 dense source is not fully recognized: {:?}", report.hints);
+    for component in &mut report.components {
+        if matches!(component.component, Component::RoutedExpert | Component::SharedExpert) {
+            component.status = Status::Planned;
+            component.rejected = 0;
+            component.rejections.clear();
+            component.bytes = if component.component == Component::SharedExpert { shared } else { residents.iter().sum() };
+            component.formats = BTreeMap::from([("exlr8".into(), component.tensors)]);
+        }
+    }
+    ensure!(report.components.iter().filter(|c| !matches!(c.component, Component::RoutedExpert | Component::SharedExpert))
+        .all(|c| matches!(c.status, Status::Ready | Status::Unused | Status::Disabled)),
+        "EXLR8 dense source has unsupported coordinator operands");
+    report.snapshot = snapshot.display().to_string();
+    report.runtime = Some(RuntimeStatus::Planned);
+    report.native_serving_admitted = true;
+    report.placement_supported = true;
+    report.fits = true;
+    report.attention_placement = crate::placement::AttentionPlacement::Context;
+    report.prefill_rows = Some(if layout.prefill_rows == 0 { 4096 } else { layout.prefill_rows });
+    report.experts = Some(super::family::ExpertContract { package: "glm:exlr8".into(), block: 128,
+        spark_worlds: vec![4], local: Err("EXLR8 coordinator-local routed experts are unsupported".into()) });
+    report.hints = vec![super::Hint { what: "EXLR8 native runtime is WIP admitted, not quality-qualified".into(),
+        how: "Spark resident bytes are exact; K1 workspace/host staging and rings are checked by worker live admission before loading weights.".into() }];
+    report.min_spark_ranks = Some(4);
+    report.spark_rank_share = 0.25;
+    report.bytes_by_owner = BTreeMap::from([("spark x4".into(), residents.iter().sum()),
+        ("rtx".into(), memory.devices.iter().flat_map(|d| &d.items)
+            .filter(|i| matches!(i.category, cuteafd_core::memory_layout::Category::Weights
+                | cuteafd_core::memory_layout::Category::Embedding)).map(|i| i.bytes).sum())]);
+    report.memory_layout = Some(memory);
+    report.solver_placement = Some(placement);
+    Ok(NativePlan { report, selection: NativeSelection { manifest: selected.into(), set_id,
+        dense_from: dense.display().to_string() }, sparks: SparkRequirements { resident_bytes_per_rank: residents,
+        k1_workspace: "checked_by_worker_live_admission" } })
+}
+
 const FORMAT: &str = "exlr8-v2";
 const SCHEME: &str = "exlr8-e4m3-v2";
 
@@ -934,6 +1056,51 @@ mod tests {
     }
     fn metadata() -> Value {
         json!({"format":FORMAT,"scheme":SCHEME})
+    }
+
+    #[test]
+    fn native_shared_workspace_uses_published_scratch_and_checked_arena() {
+        let entry = json!({"name":"exlr8_shared_a16_serving", "capacity_rows":64,
+            "geometry":{"abi_version":2,"hidden":6144,"top_k":1,"units":16,"max_groups":4},
+            "scratch_bytes_at_capacity":{"fc1":6291456,"intermediate":262144,"fc2":1572864}});
+        let mut manifest = json!({"programs":[entry]});
+        let bytes = shared_workspace(&manifest).unwrap();
+        assert_eq!(bytes, residency::execution_workspace_layout(64,6144,1,4,
+            6291456,262144,1572864).unwrap().1 as u64);
+        for (field, value) in [("abi_version", 1), ("hidden", 128), ("top_k", 8), ("units", 0), ("max_groups", 512)] {
+            let mut invalid = manifest.clone();
+            invalid["programs"][0]["geometry"][field] = json!(value);
+            assert!(shared_workspace(&invalid).is_err(), "{field}");
+        }
+        manifest["programs"][0]["scratch_bytes_at_capacity"]["fc2"] = json!(u64::MAX);
+        assert!(shared_workspace(&manifest).is_err());
+        assert!(shared_workspace(&json!({"programs":[]})).is_err());
+    }
+
+    #[test]
+    fn native_refuses_unqualified_combinations_before_checkpoint_reads() {
+        let mut options = super::super::PlanOptions { placement: super::super::ExpertPlacement::Sparks { ranks:4 },
+            layout: Some(super::super::layout::LayoutOptions { rtx_bytes: vec![96 << 30;2], ..Default::default() }),
+            ..Default::default() };
+        let missing = Path::new("/no-native-checkpoint");
+        let error = |o: &super::super::PlanOptions, manifest, draft| native_plan(missing, manifest, missing, o, draft)
+            .err().unwrap().to_string();
+        assert!(error(&options,"other","off").contains("manifest"));
+        assert!(error(&options,"up1","dflash2").contains("speculator off"));
+        options.placement = super::super::ExpertPlacement::Sparks { ranks:6 };
+        assert!(error(&options,"up1","off").contains("TP4"));
+        options.placement = super::super::ExpertPlacement::Sparks { ranks:4 };
+        options.layout.as_mut().unwrap().rtx_bytes.truncate(1);
+        assert!(error(&options,"up1","off").contains("two RTX"));
+        options.layout.as_mut().unwrap().rtx_bytes.push(96 << 30);
+        options.layout.as_mut().unwrap().prefill_lanes = 2;
+        assert!(error(&options,"up1","off").contains("serial"));
+        options.layout.as_mut().unwrap().prefill_lanes = 1;
+        options.layout.as_mut().unwrap().onboard = Some(crate::placement::Onboard::Layers(1));
+        assert!(error(&options,"up1","off").contains("onboard"));
+        options.layout.as_mut().unwrap().onboard = Some(crate::placement::Onboard::Layers(0));
+        options.attention_placement = Some(crate::placement::AttentionPlacement::Heads);
+        assert!(error(&options,"up1","off").contains("context"));
     }
 
     #[test]

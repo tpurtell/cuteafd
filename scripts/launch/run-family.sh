@@ -215,6 +215,8 @@ EOF
       ;;
     glm5)
       cat <<'EOF'
+EXLR8_MANIFEST
+EXLR8_DENSE_FROM
 RTX_EXPERT_PEER
 L2_PREFETCH
 FP8_SCALES
@@ -1555,6 +1557,35 @@ snapshot_of() {
   [[ -d "$dir/snapshots/$rev" ]] || { echo "missing snapshot $id@$rev" >&2; return 1; }
   printf '%s' "/hf/hub/models--${id//\//--}/snapshots/$rev"
 }
+exlr8_manifest="$(get EXLR8_MANIFEST)"
+exlr8_dense="$(get EXLR8_DENSE_FROM)"
+exlr8_plan_args=() exlr8_mounts=()
+if [[ -n "$exlr8_manifest$exlr8_dense" ]]; then
+  [[ "$family" == glm5 ]] || release_die "EXLR8 is supported only for glm5"
+  [[ "$exlr8_manifest" == up1 || "$exlr8_manifest" == bit325 ]] || release_die "EXLR8_MANIFEST must be up1 or bit325"
+  [[ -n "$exlr8_dense" ]] || release_die "EXLR8_DENSE_FROM must name the compatible official GLM-5.3 FP8 snapshot"
+  [[ "$(get RTX_GPUS 1)" == 2 && "$ranks" == 4 ]] || release_die "EXLR8 requires two RTX GPUs and canonical TP4 Sparks"
+  [[ "$(get SPECULATOR off)" == off ]] || release_die "EXLR8 requires SPECULATOR=off"
+  [[ "$(get RTX_EXPERT_LAYERS 0)" == 0 ]] || release_die "EXLR8 cannot onboard routed experts"
+  [[ "$attention_placement" == auto || "$attention_placement" == context ]] || release_die "EXLR8 requires context attention"
+  if [[ -d "$exlr8_dense" ]]; then
+    exlr8_dense="$(readlink -f "$exlr8_dense")"
+    release_validate_path_setting EXLR8_DENSE_FROM "$exlr8_dense"
+    if release_path_within "$exlr8_dense" "$hub"; then
+      exlr8_dense="/hf/hub${exlr8_dense#"$hub"}"
+    else
+      exlr8_mounts=(-v "$exlr8_dense:$exlr8_dense:ro")
+    fi
+  else
+    [[ "$exlr8_dense" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] && release_path_has_no_dot_segment "$exlr8_dense" ||
+      release_die "EXLR8_DENSE_FROM must be an existing snapshot or ORG/MODEL HF id"
+    exlr8_dense="$(snapshot_of "$exlr8_dense" "")" || exit 2
+  fi
+  exlr8_plan_args=(--exlr8-manifest "$exlr8_manifest" --exlr8-dense-from "$exlr8_dense")
+  spark_worker_args+=" --exlr8-manifest $exlr8_manifest"
+  cfg[SPECULATOR]=off
+  cfg[RTX_EXPERT_LAYERS]=0
+fi
 # SPECULATOR picks the drafter. Unset, each family takes the speculator its
 # release card ran (examples/configs/*.config; scripts/tests/test_example_configs.py
 # keeps the two in step): GLM 5.3 DFlash2; GLM 5.3 Flash its measured best;
@@ -1648,7 +1679,7 @@ if [[ "$family" == mimo_v2 ]]; then
 fi
 case "$embedding" in host|gpu) ;; *) echo "EMBEDDING must be host or gpu" >&2; exit 2 ;; esac
 [[ "$family" != qwen3_5 || "$embedding" == gpu ]] || release_die "dense Qwen requires device token embedding"
-family_args=(--embedding-placement "$embedding")
+family_args=(--embedding-placement "$embedding" "${exlr8_plan_args[@]}")
 chat_template_mounts=()
 # Vision-only override: no template inference and no changes to text-only prompts.
 # Without it, VISION=auto serves a GLM Flash checkpoint whose own chat template cannot mark images
@@ -2279,6 +2310,10 @@ case "$family" in
   deepseek_v4) ;;
   glm5)
     selected_lanes="${CUTEAFD_GLM_PREFILL_LANES:-3}"
+    if [[ -n "$exlr8_manifest" ]]; then
+      [[ -z "${CUTEAFD_GLM_PREFILL_LANES:-}" || "$CUTEAFD_GLM_PREFILL_LANES" == 1 ]] || release_die "EXLR8 requires one serial prefill lane"
+      selected_lanes=1
+    fi
     [[ "$selected_lanes" =~ ^[1-4]$ ]] || { echo "CUTEAFD_GLM_PREFILL_LANES must be 1 to 4" >&2; exit 2; }
     if [[ "$ranks" == 0 ]]; then
       selected_lanes=1
@@ -2422,9 +2457,9 @@ audio_encoder_hash=""
   readiness_args=(--require-ready)
   [[ -z "$wip_slot" ]] || readiness_args=()
   # HF_HOME=/hf: the planner resolves draft snapshots under it, like serving.
-  plan_json="$(docker run --rm --network none "${lane_env_args[@]}" -e HF_HOME=/hf -v "$hub:/hf/hub:ro" "${wip_mount_args[@]}" \
+  plan_json="$(docker run --rm --network none "${lane_env_args[@]}" -e HF_HOME=/hf -v "$hub:/hf/hub:ro" "${wip_mount_args[@]}" "${exlr8_mounts[@]}" \
     "$coordinator_image" cuteafd plan "$snapshot" --attention-placement "$attention_placement" --vision "$vision" --audio "$audio" --deployment "${readiness_args[@]}" \
-    "${deployment_args[@]}" "${count_args[@]}" --spark-budget-gib "$(python3 -c 'import sys;print(int(sys.argv[1])/2**30)' "$budget")" \
+    "${deployment_args[@]}" "${count_args[@]}" "${exlr8_plan_args[@]}" --spark-budget-gib "$(python3 -c 'import sys;print(int(sys.argv[1])/2**30)' "$budget")" \
     --rtx "$plan_rtx" --coordinator-gpu-budget-gib "$plan_gib" --coordinator-weight-budget-gib "$plan_gib" --pool-tokens "$plan_pool" --vision-replicas "$vision_replicas" "${plan_draft_args[@]}")"
   release_validate_deployment "$plan_json" "$family"
   selected_ranks="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["spark_ranks"])' <<<"$plan_json")"
@@ -2709,7 +2744,7 @@ docker run -d "${RELEASE_SERVING_ARGS[@]}" --name "$coordinator_name" --restart 
   "${bond_args[@]}" "${bench_nonce_env_args[@]}" "${tp2_env_args[@]}" "${graph_census_args[@]}" "${lane_env_args[@]}" "${thermal_args[@]}" \
   "${shared_env_args[@]:4}" -e "CUTEAFD_IMAGE=$coordinator_image" "${wip_mount_args[@]}" "${device_map_args[@]}" \
   -v "$hub:/hf/hub:ro" -v "$bench_dir:/run/cuteafd/bench" -v "$fidelity_cache:/run/cuteafd/fidelity" -e CUTEAFD_FIDELITY_CACHE=/run/cuteafd/fidelity \
-  "${api_mount_args[@]}" "${chat_template_mounts[@]}" "${trace_args[@]}" "${probe_args[@]}" ${profile_args[@]+"${profile_args[@]}"} ${profile_wrapper_args[@]+"${profile_wrapper_args[@]}"} "$coordinator_image" ${profile_wrapper[@]+"${profile_wrapper[@]}"} cuteafd "${coordinator_budget_args[@]}" $serve --snapshot "$snapshot" \
+  "${api_mount_args[@]}" "${chat_template_mounts[@]}" "${exlr8_mounts[@]}" "${trace_args[@]}" "${probe_args[@]}" ${profile_args[@]+"${profile_args[@]}"} ${profile_wrapper_args[@]+"${profile_wrapper_args[@]}"} "$coordinator_image" ${profile_wrapper[@]+"${profile_wrapper[@]}"} cuteafd "${coordinator_budget_args[@]}" $serve --snapshot "$snapshot" \
   --native-lib /opt/cuteafd/lib/libcuteafd_native.so "${peer_args[@]}" --listen "$addr" \
   --max-sequences "$effective_concurrency" "${context_args[@]}" \
   --max-output "$(get MAX_OUTPUT_TOKENS 4096)" "${dspark_args[@]}" \

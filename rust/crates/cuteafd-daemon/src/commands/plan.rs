@@ -171,14 +171,37 @@ pub(crate) fn run_plan(mut args: PlanArgs) -> Result<()> {
             .with_context(|| format!("no snapshot of {} under {}", args.model, hf_home.display()))?
     };
     if cuteafd_loader::plan::exlr8::recognizes(&snapshot)? {
-        anyhow::ensure!(!(args.files || args.fetch || args.role.is_some() || args.deployment),
-            "EXLR8 is planner-only: file/deployment manifests and fetching are not supported");
+        anyhow::ensure!(!(args.files || args.fetch || args.role.is_some()),
+            "EXLR8 file manifests and fetching are not supported");
         let dense = args.exlr8_dense_from.as_deref().map(|source| -> Result<PathBuf> {
             if PathBuf::from(source).is_dir() { return Ok(PathBuf::from(source)); }
             let home = args.hf_home.clone().unwrap_or_else(default_hf_home);
             resolve_snapshot_at_revision(source, Some(&home), None)?.snapshot_path
                 .with_context(|| format!("no local snapshot for dense source {source}"))
         }).transpose()?;
+        if args.layout {
+            use cuteafd_loader::plan::deployment::{AdmissionArgs, DeploymentOptions, DeploymentSpec};
+            anyhow::ensure!(args.spark_tp.is_none() && args.spark_ep.is_none(),
+                "EXLR8 requires canonical TP4, not explicit ownership topology");
+            let dense = dense.as_deref().context("EXLR8 native layout requires --exlr8-dense-from")?;
+            let mut native_options = options.clone();
+            native_options.placement = ExpertPlacement::from_spark_ranks(args.spark_ranks.unwrap_or(args.available_sparks));
+            let native = cuteafd_loader::plan::exlr8::native_plan(&snapshot,
+                args.exlr8_manifest.as_deref().context("EXLR8 native layout requires --exlr8-manifest up1|bit325")?,
+                dense, &native_options, &args.speculator)?;
+            if args.deployment {
+                let deployment = DeploymentOptions { rtx_gpus: args.rtx, spark_tp: None, spark_ep: None,
+                    peers: args.deployment_peers.clone(), speculator: args.speculator.clone(),
+                    admission: AdmissionArgs { kv_pool_size: args.kv_pool_size.clone(),
+                        memory_reservation: args.memory_reservation.clone(), pool_tokens: args.pool_tokens } };
+                println!("{}", serde_json::to_string_pretty(&DeploymentSpec::from_exlr8(&native, &deployment)?)?);
+            } else if args.json { println!("{}", serde_json::to_string_pretty(&native.report)?); }
+            else { print!("{}", render(&native.report));
+                if let Some(layout) = &native.report.memory_layout { print!("{}", layout.render()); }
+            }
+            anyhow::ensure!(!args.require_ready, "EXLR8 native runtime remains WIP-only pending full quality gates");
+            return Ok(());
+        }
         let report = cuteafd_loader::plan::exlr8::inspect(&snapshot,
             args.exlr8_manifest.as_deref().unwrap_or("bit325"), dense.as_deref(),
             args.spark_ranks.unwrap_or(args.available_sparks), args.rtx,

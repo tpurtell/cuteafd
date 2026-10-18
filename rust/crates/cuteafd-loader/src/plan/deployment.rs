@@ -78,6 +78,10 @@ pub struct DeploymentSpec<'a> {
     pub admission: &'a AdmissionArgs,
     pub spark_admission: SparkAdmission,
     pub launch: Option<&'a super::launch::LaunchDescription>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exlr8: Option<&'a super::exlr8::NativeSelection>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub spark_requirements: Option<&'a super::exlr8::SparkRequirements>,
     pub estimated_placement: Option<&'a Placement>,
     pub memory_layout: &'a cuteafd_core::memory_layout::MemoryLayout,
     pub encoder: Option<&'a EncoderPlacement>,
@@ -93,6 +97,17 @@ pub struct DeploymentSpec<'a> {
 
 impl<'a> DeploymentSpec<'a> {
     pub fn from_report(report: &'a PlanReport, options: &'a DeploymentOptions) -> Result<Self> {
+        Self::build(report, options, None)
+    }
+
+    pub fn from_exlr8(native: &'a super::exlr8::NativePlan, options: &'a DeploymentOptions) -> Result<Self> {
+        ensure!(options.rtx_gpus == 2 && options.spark_tp.is_none() && options.spark_ep.is_none()
+            && options.speculator == "off", "EXLR8 deployment requires two RTX, canonical TP4 and no speculator");
+        Self::build(&native.report, options, Some(native))
+    }
+
+    fn build(report: &'a PlanReport, options: &'a DeploymentOptions,
+        native: Option<&'a super::exlr8::NativePlan>) -> Result<Self> {
         let family = report.family.as_deref().context("deployment requires a recognized family")?;
         let memory_layout = report.memory_layout.as_ref().context("deployment requires a memory layout")?;
         ensure!((1..=2).contains(&options.rtx_gpus), "deployment requires one or two RTX GPUs");
@@ -127,7 +142,9 @@ impl<'a> DeploymentSpec<'a> {
             let experts = report.experts.as_ref().context("Spark deployment requires an expert package")?;
             let intermediate = report.spec.as_ref().and_then(|spec| spec.moe.as_ref())
                 .context("Spark deployment requires routed expert geometry")?.intermediate;
-            super::experts::spark_recipe(&experts.package, intermediate, topology.tp)?;
+            if native.is_none() { super::experts::spark_recipe(&experts.package, intermediate, topology.tp)?; }
+            else { ensure!(family == "glm5" && ranks == 4 && experts.package == "glm:exlr8",
+                "EXLR8 deployment requires GLM native TP4"); }
         }
         ensure!(options.peers.is_empty() || options.peers.len() >= ranks,
             "deployment peer inventory does not cover selected Spark ranks");
@@ -147,7 +164,9 @@ impl<'a> DeploymentSpec<'a> {
             prefill_rows: report.prefill_rows.unwrap_or(0), topology, roles, peers,
             speculator: &options.speculator, admission: &options.admission,
             spark_admission: SparkAdmission::CoordinatorAuthoritative,
-            launch: report.launch.as_ref(), estimated_placement: report.solver_placement.as_ref(), memory_layout,
+            launch: report.launch.as_ref(), exlr8: native.map(|n| &n.selection),
+            spark_requirements: native.map(|n| &n.sparks),
+            estimated_placement: report.solver_placement.as_ref(), memory_layout,
             encoder: report.encoder.as_ref(), audio_encoder: report.audio_encoder.as_ref(),
             encoder_plan_hash: &report.encoder_plan_hash,
             artifact_requirements: ArtifactRequirements { verify_live_identity: true,
