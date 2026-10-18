@@ -36,7 +36,11 @@ def validate_reference_only(root, *, seal=False):
         if meta.get(key) != manifest[key]:
             raise ValueError(f'golden/set {key} mismatch')
     identity = meta['snapshot_identity']
-    if any(identity.get(key) != value for key, value in manifest['reference_snapshot'].items()):
+    snapshot = manifest.get('reference_snapshot', {
+        key: manifest['generation_arm'][key] for key in
+        ('checkpoint', 'snapshot_revision', 'config_sha256', 'tokenizer_sha256')
+        if key in manifest['generation_arm']})
+    if any(identity.get(key) != value for key, value in snapshot.items()):
         raise ValueError('golden snapshot identity mismatch')
     proof = meta.get('prefix_qualification')
     validate_qualification(proof, manifest, identity)

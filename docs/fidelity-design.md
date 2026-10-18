@@ -497,12 +497,17 @@ Replacement reference gates are: (1) the actual finite, bit-exact
 common-prefix proof bound to the family, snapshot and set; (2) conversion
 of the old raw logits reproduces the old JSON, retaining converter
 compatibility; and (3) a newly generated qualified legacy window is
-published as window 0 of schema 2. Publish schema-2 replacements only
-after qualified baseline calibration. Regenerate the old schema-1 V4.1
+published as window 0 of schema 2. Publish schema-2 replacements after
+reference validation, without engine calibration. Regenerate the old schema-1 V4.1
 JSON from qualified logits when the bench switches over; retain the old
 raw evidence for diagnosis, not as a certification target.
 
-## 10. Implementation plan (brief for a Codex agent)
+## 10. Historical implementation plan (2026-10-05)
+
+This records the original implementation campaign, not the current publication
+workflow. The 2026-10-18 policy supersedes its engine-calibration steps. Current
+workflow: generate own text, build original-quality logits, convert, validate/seal,
+finalize using declared policy floors, review, publish and re-pin. No engine run.
 
 Branch `work/fidelity-v2` from `origin/work/p0`, worktree, no GPU until step 5. Follow
 AGENTS.md (builds under `~/.cache/cuteafd/builds/fidelity-v2`, locks around

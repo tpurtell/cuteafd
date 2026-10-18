@@ -76,6 +76,20 @@ def test_own_model_text_has_no_borrowed_panel_caveat():
     assert '#302' in packager.panel_caveat(panel)
 
 
+def test_text_checkpoint_guard_accepts_only_same_model_or_declared_higher_fidelity():
+    from fidelity_windows import validate_text_source
+    panel = dict(checkpoint='quant', generation_arm=dict(checkpoint='original'))
+    with pytest.raises(ValueError, match='borrowed window text'):
+        validate_text_source(panel)
+    panel['text_source_declaration'] = dict(scored_checkpoint='quant', text_checkpoint='original',
+        relationship='higher_fidelity_same_model', source_kind='original_checkpoint', evidence='vendor base_model mapping')
+    validate_text_source(panel)
+    assert packager.own_text(panel)
+    panel['text_source_declaration']['scored_checkpoint'] = 'other'
+    with pytest.raises(ValueError, match='borrowed window text'):
+        validate_text_source(panel)
+
+
 def test_sparse_launch_disclosure_preserves_tiles_and_rejects_missing_parameters():
     launch = dict(official_launch_configuration=False, num_stages=1, block_regions=16,
                   kernel='_sparse_attn_prefill_kernel')

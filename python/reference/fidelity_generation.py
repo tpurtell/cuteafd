@@ -173,6 +173,7 @@ class APIClient(TextGenerator):
             "usage": raw.get("usage"), "finish_reason": choice.get("finish_reason"),
             "reasoning_content": reasoning, "content": message.get("content") or "",
             "tool_calls": message.get("tool_calls") or [], "recipe_options": self.extra_body,
+            "raw_response_sha256": hashlib.sha256(canonical(raw)).hexdigest(),
             "reconstructed_tokens": len(generated), "retokenization": "lossless; checkpoint chat template"})
 
 
@@ -220,6 +221,12 @@ class HFClient(TextGenerator):
             spec = importlib.util.spec_from_file_location("qwen35_generation_reference", path)
             module = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(module)
+            golden_path = Path(__file__).resolve().parent / "families/qwen3_5/golden.py"
+            golden_spec = importlib.util.spec_from_file_location("qwen35_generation_golden", golden_path)
+            golden = importlib.util.module_from_spec(golden_spec)
+            golden_spec.loader.exec_module(golden)
+            _, _, _, source = module.reference_identity(self.snapshot)
+            golden.verify_reference_source(source)
             torch.manual_seed(0)
             torch.backends.cuda.matmul.allow_tf32 = False
             torch.backends.cudnn.allow_tf32 = False
@@ -249,5 +256,6 @@ class HFClient(TextGenerator):
         return self.result(body, generated, message, {
             **self.identity, "date": record["date"], "reasoning_content": message["reasoning_content"],
             "content": message["content"], "tool_calls": message["tool_calls"],
+            "raw_response_sha256": hashlib.sha256(canonical(record["response"])).hexdigest(),
             "recipe_deviations": ["JSON response_format is an instruction, not a constrained decoder"]
                 if body.get("response_format") else [], "retokenization": "lossless; native generated IDs"})
