@@ -30,11 +30,11 @@ pub const GLM_CONFIG: &str = "glm5-v2_20261006_exl3k4_bf16root";
 pub const V4PRO_REVISION: &str = "5528730649150b8d8753e052f001f203b36ca12f";
 pub const V4PRO_CONFIG: &str = "deepseek_v4-v2_20261005_v4pro";
 pub const QWEN35_9B_REVISION: &str = "cec5bd5800a814c785d391b62041b7e67c6b21a9";
-pub const QWEN38_27B_REVISION: &str = "5242b6006b22b488d71b6695fb449221baeb54ff";
+pub const QWEN38_27B_REVISION: &str = "8dcac4fd5cf00e2189f798cb18e4a50f0bb6b775";
 pub const QWEN35_9B_CONFIG: &str = "qwen35-9b-v1_20261018_own-text-bf16";
 pub const QWEN35_9B_MANIFEST_SHA256: &str = "5ab4523a069cbdf9f3b25adaec0ef6a08ee2db181cac73dfd5e2be360419da07";
-pub const QWEN38_27B_CONFIG: &str = "qwen38-27b-v1_20261015_bf16";
-pub const QWEN38_27B_MANIFEST_SHA256: &str = "4b1ba4f3eea0557c7f985f0bf0ad7b6fdcc89f74b87033fae08eedef0c7c5d57";
+pub const QWEN38_27B_CONFIG: &str = "qwen38-27b-v1_20261018_own-text-bf16";
+pub const QWEN38_27B_MANIFEST_SHA256: &str = "aac84d441de74e34759b18aa3ace78f99784842becfa94986b77eac5c2ff8d67";
 pub const STEP5_REVISION: &str = "f9cecb776d4e47f05738369e7e157122f3e0b473";
 pub const STEP5_CONFIG: &str = "step5-v1_20261017_bf16_provisional";
 pub const STEP5_MANIFEST_SHA256: &str = "dd0f964a891e24570bcbf5840f6398a06c9dd037926d7e240a4a2dff29e17af7";
@@ -640,7 +640,8 @@ mod tests {
     fn manifest_pins_reject_even_self_consistent_cached_indexes() {
         let temporary = tempfile::tempdir().unwrap();
         for (revision, config) in [(MIMO_PRO_REVISION, MIMO_PRO_CONFIG),
-            (MIMO_PRO_MEDIA_REVISION, MIMO_PRO_MEDIA_CONFIG), (QWEN35_9B_REVISION, QWEN35_9B_CONFIG), (STEP5_REVISION, STEP5_CONFIG),
+            (MIMO_PRO_MEDIA_REVISION, MIMO_PRO_MEDIA_CONFIG), (QWEN35_9B_REVISION, QWEN35_9B_CONFIG),
+            (QWEN38_27B_REVISION, QWEN38_27B_CONFIG), (STEP5_REVISION, STEP5_CONFIG),
             (V41_1017_REVISION, V41_1017_CONFIG)] {
             let root = temporary.path().join("wrldsuksgo2mars--cuteafd-fidelity").join(revision);
             std::fs::create_dir_all(root.join(config)).unwrap();
@@ -675,6 +676,15 @@ mod tests {
             let balance = standard_balance(&reference);
             assert_eq!(balance["decode"]["generated_positions"], 13824);
             assert_eq!(balance["prefill"]["generated_positions"], 13168);
+        }
+        if commit == QWEN38_27B_REVISION && config == QWEN38_27B_CONFIG {
+            assert_eq!(reference.checkpoint, "Qwen/Qwen3.8-27B");
+            assert_eq!(identity["qualification"], "reference");
+            assert_eq!(identity["text_checkpoint"], "Qwen/Qwen3.8-27B");
+            assert_eq!((reference.expect.top1_min, reference.expect.kl_max), (0.90, 0.06));
+            let balance = standard_balance(&reference);
+            assert_eq!(balance["decode"]["generated_positions"], 8306);
+            assert_eq!(balance["prefill"]["generated_positions"], 7065);
         }
         if commit == STEP5_REVISION && config == STEP5_CONFIG {
             assert_eq!(reference.checkpoint, "stepfun-ai/Step-5-Preview-BF16");
