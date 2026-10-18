@@ -18,7 +18,8 @@ from fidelity_windows import canonical
 
 
 def token_ids(tokenizer, text):
-    encoded = tokenizer.encode(text, add_special_tokens=False)
+    encoded = (tokenizer.encode(text) if getattr(tokenizer, "_fidelity_identity", None)
+               else tokenizer.encode(text, add_special_tokens=False))
     return encoded.ids if hasattr(encoded, "ids") else list(encoded)
 
 
@@ -35,10 +36,15 @@ def normalized_messages(messages):
 class ChatRenderer:
     def __init__(self, tokenizer):
         self.tokenizer = tokenizer
-        template = tokenizer.get_chat_template()
-        if not template:
-            raise ValueError("generation requires the checkpoint's own chat template")
-        self.identity = {"chat_template_sha256": hashlib.sha256(template.encode()).hexdigest()}
+        self.native = getattr(tokenizer, "_fidelity_identity", None)
+        if self.native:
+            self.identity = {**self.native, "chat_template_kind": "checkpoint_python",
+                             "chat_template_sha256": self.native["tokenizer_sha256"]}
+        else:
+            template = tokenizer.get_chat_template()
+            if not template:
+                raise ValueError("generation requires the checkpoint's own chat template")
+            self.identity = {"chat_template_sha256": hashlib.sha256(template.encode()).hexdigest()}
 
     def render(self, body, assistant=None):
         messages = normalized_messages(body["messages"])
@@ -49,6 +55,10 @@ class ChatRenderer:
             add_generation_prompt=assistant is None)
 
     def prompt(self, body):
+        if self.native:
+            return list(self.tokenizer.apply_chat_template(
+                normalized_messages(body["messages"]), tools=body.get("tools"),
+                tokenize=True, add_generation_prompt=True))
         return token_ids(self.tokenizer, self.render(body))
 
     def completion(self, body, assistant):
@@ -56,13 +66,23 @@ class ChatRenderer:
         if not full.startswith(prompt):
             raise ValueError("checkpoint template rewrites the generation prefix; cannot reconstruct API span")
         text = full[len(prompt):]
-        generated = token_ids(self.tokenizer, text)
-        decoded = self.tokenizer.decode(generated, skip_special_tokens=False, clean_up_tokenization_spaces=False)
+        prompt_ids = self.prompt(body)
+        if self.native:
+            full_ids = list(self.tokenizer.apply_chat_template(
+                normalized_messages(body["messages"] + [assistant]), tools=body.get("tools"),
+                tokenize=True, add_generation_prompt=False))
+            if full_ids[:len(prompt_ids)] != prompt_ids:
+                raise ValueError("checkpoint tokenizer rewrites the generation prefix")
+            generated = full_ids[len(prompt_ids):]
+        else:
+            full_ids = token_ids(self.tokenizer, full)
+            generated = token_ids(self.tokenizer, text)
+        decoded = (self.tokenizer.decode(generated) if self.native else
+                   self.tokenizer.decode(generated, skip_special_tokens=False, clean_up_tokenization_spaces=False))
         if decoded != text:
             raise ValueError("generated span does not re-tokenize losslessly")
-        prompt_ids = self.prompt(body)
         # Do not accept a token crossing the conditioning/generated boundary.
-        if token_ids(self.tokenizer, full) != prompt_ids + generated:
+        if full_ids != prompt_ids + generated:
             raise ValueError("generated span crosses the prompt token boundary")
         return generated
 

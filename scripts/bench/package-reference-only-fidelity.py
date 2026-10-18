@@ -11,11 +11,11 @@ import sys
 
 import numpy as np
 from safetensors.numpy import save_file
-from tokenizers import Tokenizer
 
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO / 'python/reference'))
 from fidelity_windows import canonical, validate_public_metadata, validate_public_text, validate_text_source
+from checkpoint_tokenizer import load_tokenizer, tokenizer_identity
 
 QUICK = ['legacy', 'a00', 'a04', 'a08', 'a20', 'c00', 'd00', 'e00']
 POLICY_EXPECT = dict(top1_min=.90, kl_max=.06,
@@ -198,13 +198,17 @@ def package(source, out, config, tokenizer_path, license_path):
             raise ValueError('invalid source pin')
     if rows['dtype'] != '<f2' or rows['kind'] != 'log_softmax':
         raise ValueError('unsupported oracle rows')
-    tokenizer = Tokenizer.from_file(str(tokenizer_path))
-    if digest(tokenizer_path) != meta['snapshot_identity']['tokenizer_sha256']:
+    tokenizer = load_tokenizer(tokenizer_path)
+    tokenizer_pin = tokenizer_identity(tokenizer_path.parent)
+    if (tokenizer_pin['tokenizer_sha256'] != meta['snapshot_identity']['tokenizer_sha256']
+            or tokenizer_pin.get('tokenizer_files') != meta['snapshot_identity'].get('tokenizer_files')):
         raise ValueError('reference tokenizer differs')
     for window in panel['windows']:
         if window.get('media') or len(window['tokens']) - window['score_from'] != 512:
             raise ValueError('only the sealed text panel is supported')
-        validate_public_text(tokenizer.decode(window['tokens'], skip_special_tokens=False), scored_text=True)
+        text = (tokenizer.decode(window['tokens']) if tokenizer_pin.get('tokenizer_kind') else
+                tokenizer.decode(window['tokens'], skip_special_tokens=False))
+        validate_public_text(text, scored_text=True)
     public = public_panel(panel)
     destination = out / config
     destination.mkdir(parents=True)

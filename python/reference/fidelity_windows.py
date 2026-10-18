@@ -382,11 +382,17 @@ def bucket(position: int) -> str:
 
 def verify_snapshot(manifest: dict, snapshot: Path) -> dict:
     """Check cheap, stable identities without hashing hundreds of GB of weights."""
-    tokenizer_sha = hashlib.sha256((snapshot / "tokenizer.json").read_bytes()).hexdigest()
+    from checkpoint_tokenizer import tokenizer_identity
+    tokenizer = tokenizer_identity(snapshot)
+    tokenizer_sha = tokenizer["tokenizer_sha256"]
     config_sha = hashlib.sha256((snapshot / "config.json").read_bytes()).hexdigest()
     if manifest.get("tokenizer_sha256") not in (None, tokenizer_sha):
         raise ValueError("snapshot tokenizer differs from the pinned fidelity set")
     arm = manifest.get("reference_snapshot", manifest.get("generation_arm", {}))
+    if tokenizer.get("tokenizer_kind") == "checkpoint_python":
+        for source in (arm, manifest.get("generation_arm", {})):
+            if source.get("tokenizer_files") != tokenizer["tokenizer_files"]:
+                raise ValueError("snapshot native tokenizer source/resource hashes differ")
     revision = arm.get("snapshot_revision")
     if revision is not None and snapshot.name != revision:
         raise ValueError("snapshot revision differs from the pinned reference identity")
@@ -396,7 +402,7 @@ def verify_snapshot(manifest: dict, snapshot: Path) -> dict:
             not revision or arm.get("config_sha256") != config_sha
             or arm.get("tokenizer_sha256") != tokenizer_sha):
         raise ValueError("explicit reference snapshot requires all identity hashes")
-    identity = {"snapshot_revision": snapshot.name, "tokenizer_sha256": tokenizer_sha,
+    identity = {"snapshot_revision": snapshot.name, **tokenizer,
                 "config_sha256": config_sha}
     for field in ("checkpoint", "precision"):
         if field in arm:

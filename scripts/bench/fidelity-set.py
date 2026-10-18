@@ -23,8 +23,10 @@ import urllib.request
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "python/reference"))
 from fidelity_windows import MAX_TOKENS, SET_SCHEMA, bucket, canonical, set_hash, validate_set
+from checkpoint_tokenizer import load_tokenizer, tokenizer_identity
+from fidelity_generation import token_ids
 
-FAMILIES = ("deepseek_v41", "mimo_v2", "qwen4", "qwen3_5", "glm5_flash", "deepseek_v4", "glm5", "step5")
+FAMILIES = ("deepseek_v41", "mimo_v2", "qwen4", "qwen3_5", "glm5_flash", "deepseek_v4", "glm5", "step5", "kimi_k3")
 REPO_FILES = ["rust/crates/cuteafd-api/src/openai/probe.rs", "scripts/bench/bench-agentic-session.py",
               "python/reference/families/deepseek_v41/golden.py", "rust/crates/cuteafd-bench/src/client.rs",
               "scripts/bench/make-fidelity-reference.py", "rust/crates/cuteafd-bench/src/reference.rs",
@@ -146,7 +148,7 @@ def build_set(*, family: str, model: str, checkpoint: str, version: str, arm: di
     files = files or REPO_FILES
     sources = [source(root, path) for path in files]
     corpus = "\n\n".join(f"File: {path}\n{(root / path).read_text()}" for path in files)
-    corpus_ids = tokenizer.encode(corpus, add_special_tokens=False).ids
+    corpus_ids = token_ids(tokenizer, corpus)
     if len(corpus_ids) < 4096:
         raise ValueError("repository source list needs at least 4096 tokens")
     if (legacy_reference is None) != (legacy_provenance is None):
@@ -307,7 +309,7 @@ def build_set(*, family: str, model: str, checkpoint: str, version: str, arm: di
     for i in range(12):
         generate(f"b{i:02d}", "B", [{"role": "user", "content": f"Explain invariants and propose a small safe modification to {files[i % len(files)]}.\n" + (root / files[i % len(files)]).read_text()}], 10240 + (i % 3) * 1024)
     for i in range(10):
-        ids = tokenizer.encode((root / files[i % len(files)]).read_text(), add_special_tokens=False).ids
+        ids = token_ids(tokenizer, (root / files[i % len(files)]).read_text())
         if len(ids) < 1024:
             raise ValueError(f"{files[i % len(files)]}: plain code needs >=1024 tokens; choose a longer file")
         start = min(len(ids) - 512, 512 + (i % 4) * 512)
@@ -339,6 +341,9 @@ def build_set(*, family: str, model: str, checkpoint: str, version: str, arm: di
     if getattr(probe, "identity", {}).get("text_source") in ("api", "hf"):
         manifest["reference_snapshot"] = {
             key: arm[key] for key in ("checkpoint", "snapshot_revision", "config_sha256", "tokenizer_sha256")}
+        for key in ("tokenizer_kind", "tokenizer_files"):
+            if key in arm:
+                manifest["reference_snapshot"][key] = arm[key]
         manifest["precision_policy"] = "own text; generation backend recorded separately from reference arithmetic"
     manifest["set_sha256"] = set_hash(manifest)
     validate_set(manifest)
@@ -709,14 +714,14 @@ def main(argv=None):
             if not a.response_cache or a.checkpoint != a.model:
                 p.error("own-text backends require --response-cache and --checkpoint equal to --model")
             from fidelity_generation import APIClient, ChatRenderer, HFClient
-            from transformers import PreTrainedTokenizerFast
             snapshot = a.snapshot or a.tokenizer.parent
-            if (snapshot / "tokenizer.json").read_bytes() != a.tokenizer.read_bytes():
+            tokenizer_pin = tokenizer_identity(snapshot)
+            if tokenizer_identity(a.tokenizer.parent) != tokenizer_pin:
                 p.error("--tokenizer must match the generation snapshot")
             config = json.loads((snapshot / "config.json").read_text())
-            tokenizer = PreTrainedTokenizerFast.from_pretrained(snapshot, local_files_only=True)
+            tokenizer = load_tokenizer(a.tokenizer, chat=True)
             renderer = ChatRenderer(tokenizer)
-            identity = {"tokenizer_sha256": hashlib.sha256(a.tokenizer.read_bytes()).hexdigest(),
+            identity = {**tokenizer_pin,
                         "config_sha256": hashlib.sha256((snapshot / "config.json").read_bytes()).hexdigest(),
                         "snapshot_revision": snapshot.name,
                         "generator_sha256": hashlib.sha256((ROOT / "python/reference/fidelity_generation.py").read_bytes()).hexdigest()}
@@ -734,13 +739,13 @@ def main(argv=None):
             arm = {"checkpoint": a.checkpoint, **probe.identity,
                    "speculation": False, "prefix_cache": False}
         manifest = build_set(family=a.family, model=a.model, checkpoint=a.checkpoint, version=a.version,
-            arm=arm, tokenizer=Tokenizer.from_file(str(a.tokenizer)), probe=probe,
+            arm=arm, tokenizer=load_tokenizer(a.tokenizer), probe=probe,
             recordings=[json.loads(path.read_text()) for path in a.recording],
             files=json.loads(a.file_list.read_text()) if a.file_list else None,
             legacy_reference=json.loads(a.legacy_reference.read_bytes()),
             legacy_provenance={"path": a.legacy_reference.name,
                 "sha256": hashlib.sha256(a.legacy_reference.read_bytes()).hexdigest()})
-    manifest["tokenizer_sha256"] = hashlib.sha256(a.tokenizer.read_bytes()).hexdigest()
+    manifest["tokenizer_sha256"] = tokenizer_identity(a.tokenizer.parent)["tokenizer_sha256"]
     manifest["set_sha256"] = set_hash(manifest)
     out = a.out or ROOT / "set" / a.family / a.version / "windows.json"
     if out.exists():
