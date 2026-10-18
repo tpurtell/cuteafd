@@ -83,6 +83,21 @@ impl KdaGeometry {
         Ok(())
     }
 
+    pub fn roles(&self, operand: KdaOperand) -> Vec<KdaRole> {
+        use KdaOperand as Op;
+        use KdaRole as R;
+        let full = self.output_gate == KdaOutputGate::FullRank;
+        match operand {
+            Op::WIn if full => vec![R::Q, R::K, R::V, R::Fa, R::G, R::Beta],
+            Op::WIn => vec![R::Q, R::K, R::V, R::Fa, R::Ga, R::Beta],
+            Op::WFg if full => vec![R::Fb],
+            Op::WFg => vec![R::Fb, R::Gb],
+            Op::ConvW => vec![R::ConvQ, R::ConvK, R::ConvV],
+            Op::ALog => vec![R::ALog], Op::DtBias => vec![R::DtBias], Op::ONorm => vec![R::ONorm],
+            Op::WO => vec![R::O],
+        }
+    }
+
     /// Read each tensor role once, preserving BF16/F32 bytes and head order.
     /// Only the operand being packed is materialized, not a second whole layer.
     /// Input projections split rows, o_proj splits columns, low-rank inputs
@@ -95,15 +110,7 @@ impl KdaGeometry {
         use KdaOperand as Op;
         use KdaRole as R;
         let full = self.output_gate == KdaOutputGate::FullRank;
-        let roles = match operand {
-            Op::WIn if full => vec![R::Q, R::K, R::V, R::Fa, R::G, R::Beta],
-            Op::WIn => vec![R::Q, R::K, R::V, R::Fa, R::Ga, R::Beta],
-            Op::WFg if full => vec![R::Fb],
-            Op::WFg => vec![R::Fb, R::Gb],
-            Op::ConvW => vec![R::ConvQ, R::ConvK, R::ConvV],
-            Op::ALog => vec![R::ALog], Op::DtBias => vec![R::DtBias], Op::ONorm => vec![R::ONorm],
-            Op::WO => vec![R::O],
-        };
+        let roles = self.roles(operand);
         let d = self.heads * self.head_dim;
         let local_d = d / ranks;
         let dtype = match operand {
