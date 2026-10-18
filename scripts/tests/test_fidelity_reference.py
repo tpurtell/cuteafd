@@ -16,11 +16,14 @@ sys.path.insert(0, str(ROOT / "python/reference"))
 from fidelity_windows import (canonical, finish_golden, load_set, set_hash, validate_set,
                               write_scored_logits, verify_snapshot, prefix_comparison,
                               qualify_prefix, validate_qualification, CheckpointStorage,
-                              release_checkpoint)
+                              release_checkpoint, scored_logits_nll)
 
 spec = importlib.util.spec_from_file_location("make_fidelity_reference", ROOT / "scripts/bench/make-fidelity-reference.py")
 converter = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(converter)
+spec = importlib.util.spec_from_file_location("backfill_fidelity_nll", ROOT / "scripts/bench/backfill-fidelity-nll.py")
+backfiller = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(backfiller)
 
 
 @pytest.mark.parametrize("tail_logit", [-25.0, -100.0])
@@ -30,6 +33,45 @@ def test_compact_tail_retains_mass_below_top_probability_resolution(tail_logit):
     expected = max(tail_logit + np.log(2) - np.log(np.exp(values).sum()), np.log(1e-30))
     assert converter.tail_log_mass(logp, np.array([0])) == pytest.approx(expected, abs=1e-12)
     assert converter.tail_log_mass(logp, np.arange(3)) == pytest.approx(np.log(1e-30))
+
+
+def test_scored_logits_nll_chunks_use_stored_f32_and_pinned_targets(tmp_path):
+    window = dict(id="chunked", tokens=[3, 2, 1, 0, 3, 1, 2], score_from=2)
+    logits = np.random.default_rng(17).normal(size=(5, 4)) + 1000.00001
+    stored = logits.astype("<f4").astype(np.float64)
+    logp = stored - np.logaddexp.reduce(stored, axis=1)[:, None]
+    expected = -logp[np.arange(5), window["tokens"][2:]].mean()
+    entry = write_scored_logits(tmp_path, window, logits)
+    assert entry["nll"] == pytest.approx(expected, abs=1e-12)
+    assert entry["scored_tokens"] == 5
+    for size in (1, 2, 32):
+        assert scored_logits_nll(logits, window["tokens"], entry["positions"], chunk_rows=size) == pytest.approx(
+            dict(nll=expected, scored_tokens=5), abs=1e-12)
+    assert np.array_equal(np.fromfile(tmp_path / entry["path"] / "logits.bin", dtype="<f4").reshape(5, 4),
+                          logits.astype("<f4"))
+    with pytest.raises(ValueError, match="non-finite"):
+        write_scored_logits(tmp_path, window, np.full((5, 4), np.nan))
+    with pytest.raises(ValueError, match="outside vocabulary"):
+        write_scored_logits(tmp_path, {**window, "tokens": [9] * 7}, logits)
+    with pytest.raises(ValueError, match="invalid scored logits geometry"):
+        scored_logits_nll(logits, window["tokens"], entry["positions"], chunk_rows=0)
+
+
+def test_backfill_checks_weighted_aggregate_before_metadata_writes(tmp_path):
+    entries = []
+    for name, count, shift in (("a", 3, 1.0), ("b", 7, -2.0)):
+        window = dict(id=name, tokens=[0] * (count + 1), score_from=1)
+        entry = write_scored_logits(tmp_path, window, np.tile([shift, 0.0], (count, 1)))
+        entries.append(entry)
+    nll = sum(entry["nll"] * entry["scored_tokens"] for entry in entries) / 10
+    meta = dict(windows=entries, nll=nll, scored_tokens=10)
+    (tmp_path / "meta.json").write_bytes(canonical(meta))
+    assert backfiller.backfill(tmp_path) == dict(windows=2, nll=nll, scored_tokens=10)
+    before = (tmp_path / "meta.json").read_bytes()
+    (tmp_path / entries[-1]["path"] / "logits.bin").write_bytes(b"short")
+    with pytest.raises(ValueError, match="extent mismatch"):
+        backfiller.backfill(tmp_path)
+    assert (tmp_path / "meta.json").read_bytes() == before
 
 
 def test_dense_golden_requires_pinned_imported_source():
@@ -61,7 +103,6 @@ def test_reference_only_validator_seals_and_rejects_mutation(tmp_path):
     logits = np.zeros((512, 2), dtype=np.float32)
     golden = tmp_path / "golden"
     entry = write_scored_logits(golden, window, logits)
-    entry.update(nll=float(np.log(2)), scored_tokens=512)
     folder = golden / entry["path"]
     (folder / "meta.json").write_bytes(canonical(entry))
     # Keep raw common-prefix evidence, not just a self-attested pass flag.
@@ -70,14 +111,21 @@ def test_reference_only_validator_seals_and_rejects_mutation(tmp_path):
     manifest["set_sha256"] = set_hash(manifest)
     proof.update(source_window="w", set_sha256=manifest["set_sha256"])
     # The main fixture also uses 576 scored rows after this extension.
-    logits = np.zeros((576, 2), dtype=np.float32)
+    source["tokens"] = (np.arange(640) % 2).tolist()
+    manifest["set_sha256"] = set_hash(manifest)
+    proof["set_sha256"] = manifest["set_sha256"]
+    logits = np.random.default_rng(42).normal(size=(576, 2)) * 12 + 1000
     entry = write_scored_logits(golden, source, logits)
-    entry.update(nll=float(np.log(2)), scored_tokens=576)
+    values = logits.astype("<f4").astype(np.float64)
+    logp = values - np.logaddexp.reduce(values, axis=1)[:, None]
+    expected_nll = -logp[np.arange(576), source["tokens"][64:]].mean()
+    assert entry["nll"] == pytest.approx(expected_nll, abs=1e-12)
+    assert entry["scored_tokens"] == 576
     (folder / "meta.json").write_bytes(canonical(entry))
     probe_root = golden / "prefix-gate-test"
     probe_windows, probe_entries, hashes = [], [], []
     for length, name in zip((576, 640), ("prefix_short", "prefix_extended")):
-        probe_window = {**source, "id": name, "tokens": [0] * length, "roles": ["ctx"] * length}
+        probe_window = {**source, "id": name, "tokens": source["tokens"][:length], "roles": ["ctx"] * length}
         probe_entry = write_scored_logits(probe_root, probe_window, np.zeros((length - 64, 2), dtype=np.float32))
         probe_windows.append(probe_window)
         probe_entries.append(probe_entry)
@@ -87,15 +135,46 @@ def test_reference_only_validator_seals_and_rejects_mutation(tmp_path):
     finish_golden(probe_root, panel, probe_entries, snapshot_identity=identity)
     proof["logits_sha256"] = hashes
     finish_golden(golden, manifest, [entry], snapshot_identity=identity, prefix_qualification=proof,
-                  mtp=False, use_cache=False, attention="eager", nll=float(np.log(2)), scored_tokens=576)
+                  mtp=False, use_cache=False, attention="eager", nll=entry["nll"], scored_tokens=576)
+    before = {name: (folder / name).read_bytes() for name in ("tokens.bin", "logits.bin")}
+    meta_path = golden / "meta.json"
+    original_meta = json.loads(meta_path.read_text())
+    legacy_meta = json.loads(meta_path.read_text())
+    for key in ("nll", "scored_tokens"):
+        legacy_meta["windows"][0].pop(key)
+    meta_path.write_bytes(canonical({**legacy_meta, "nll": entry["nll"] + 0.1}))
+    legacy_bytes = meta_path.read_bytes()
+    window_bytes = (folder / "meta.json").read_bytes()
+    with pytest.raises(ValueError, match="aggregate NLL"):
+        backfiller.backfill(golden)
+    assert meta_path.read_bytes() == legacy_bytes
+    assert (folder / "meta.json").read_bytes() == window_bytes
+    meta_path.write_bytes(canonical(legacy_meta))
+    (folder / "meta.json").write_bytes(canonical(legacy_meta["windows"][0]))
+    subprocess.run([sys.executable, str(ROOT / "scripts/bench/backfill-fidelity-nll.py"),
+                    "--golden", str(golden)], check=True)
+    assert json.loads(meta_path.read_text()) == original_meta
+    assert json.loads((folder / "meta.json").read_text()) == entry
+    assert backfiller.backfill(golden)["nll"] == entry["nll"]
+    assert before == {name: (folder / name).read_bytes() for name in before}
     args = SimpleNamespace(windows=golden / "windows.json", golden=golden, rows_dir=tmp_path / "full",
                            out=tmp_path / "reference.json", top_k=2, model=["official"], name=None,
                            kl_max=None, top1_min=None, quick_out=None)
     converter.convert_windows(args)
+    bad_meta = json.loads(meta_path.read_text())
+    bad_meta["windows"][0]["scored_tokens"] -= 1
+    meta_path.write_bytes(canonical(bad_meta))
+    (folder / "meta.json").write_bytes(canonical(bad_meta["windows"][0]))
+    with pytest.raises(ValueError, match="window NLL/scored_tokens"):
+        validator.validate_reference_only(tmp_path)
+    backfiller.backfill(golden)
     result = validator.validate_reference_only(tmp_path, seal=True)
     assert result["passed"] and not result["engine_parity"]
     assert result["scored_tokens"] == 576
+    assert result["nll"] == pytest.approx(entry["nll"], abs=1e-12)
     assert validator.validate_reference_only(tmp_path) == result
+    with pytest.raises(ValueError, match="sealed or validated"):
+        backfiller.backfill(golden)
     compact_path = tmp_path / "reference.json"
     original = compact_path.read_bytes()
     compact = json.loads(original)

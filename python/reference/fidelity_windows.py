@@ -509,17 +509,44 @@ def validate_qualification(proof: dict | None, manifest: dict, identity: dict) -
         raise ValueError("reference prefix-invariance qualification failed or mismatched provenance")
 
 
+def scored_logits_nll(logits: np.ndarray, tokens, positions, *, chunk_rows: int = 32) -> dict:
+    """Score stored F32 rows in FP64 with a bounded log-softmax workspace."""
+    if (logits.ndim != 2 or logits.shape[0] != len(positions)
+            or not len(positions) or not logits.shape[1] or chunk_rows <= 0):
+        raise ValueError("invalid scored logits geometry")
+    tokens = np.asarray(tokens)
+    positions = np.asarray(positions)
+    if (not np.issubdtype(positions.dtype, np.integer)
+            or np.any(positions < 0) or np.any(positions >= len(tokens))):
+        raise ValueError("scored position outside tokens")
+    targets = tokens[positions]
+    if (not np.issubdtype(targets.dtype, np.integer)
+            or np.any(targets < 0) or np.any(targets >= logits.shape[1])):
+        raise ValueError("scored target outside vocabulary")
+    loss = 0.0
+    for start in range(0, len(positions), chunk_rows):
+        values = np.asarray(logits[start:start + chunk_rows], dtype="<f4").astype(np.float64)
+        if not np.isfinite(values).all():
+            raise ValueError("non-finite golden logits")
+        peak = values.max(axis=1)
+        normalizer = peak + np.log(np.exp(values - peak[:, None]).sum(axis=1, dtype=np.float64))
+        loss += float((normalizer - values[np.arange(len(values)), targets[start:start + len(values)]]).sum())
+    return {"nll": loss / len(positions), "scored_tokens": len(positions)}
+
+
 def write_scored_logits(out: Path, window: dict, logits: np.ndarray) -> dict:
     """Rows are already selected: row i predicts token score_from + i."""
     positions = list(range(window["score_from"], len(window["tokens"])))
     if logits.ndim != 2 or logits.shape[0] != len(positions):
         raise ValueError("scored logits shape does not match window positions")
+    stored = np.asarray(logits, dtype="<f4")
+    score = scored_logits_nll(stored, window["tokens"], positions)
     folder = out / "windows" / window["id"]
     folder.mkdir(parents=True, exist_ok=True)
     np.asarray(window["tokens"], dtype="<i4").tofile(folder / "tokens.bin")
-    np.asarray(logits, dtype="<f4").tofile(folder / "logits.bin")
+    stored.tofile(folder / "logits.bin")
     return {"id": window["id"], "path": str(folder.relative_to(out)),
-            "positions": positions, "vocab": logits.shape[1],
+            "positions": positions, "vocab": stored.shape[1], **score,
             **({"media": window["media"]} if window.get("media") else {})}
 
 

@@ -473,17 +473,13 @@ def run_windows(args, ref, kernel, config, weights, extent):
             logits = torch.nn.functional.linear(norm(hidden), head).float()
             if not torch.isfinite(logits).all():
                 raise ValueError("non-finite Step-5 golden logits")
-            targets = torch.tensor(window["tokens"][start:], device="cuda")
-            nll = sum(torch.nn.functional.cross_entropy(logits[j:j + 32].double(), targets[j:j + 32],
-                                                       reduction="sum").item()
-                      for j in range(0, len(logits), 32))
-            entry = write_scored_logits(args.out, window, logits.cpu().numpy().astype(np.float32))
-            entry["nll"] = nll / len(logits)
+            entry = write_scored_logits(args.out, window, logits.cpu().numpy())
             (args.out / entry["path"] / "meta.json").write_text(json.dumps(entry, sort_keys=True) + "\n")
             entries.append(entry)
-            loss, total = loss + nll, total + len(logits)
+            loss += entry["nll"] * entry["scored_tokens"]
+            total += entry["scored_tokens"]
             states[i] = None
-            del logits, hidden, targets
+            del logits, hidden
     finish_golden(args.out, manifest, entries, snapshot_identity=identity, prefix_qualification=proof,
                   reference=("DIAGNOSTIC official Step-5 native FP8 target decoder; act_quant and block-scaled fp8_gemm"
                              if args.fp8_diagnostic else

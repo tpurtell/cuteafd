@@ -157,8 +157,9 @@ def validate_reference_only(root, *, seal=False):
             if record['pos'] != pos or record['next'] != target or abs(record['next_lp'] - logp[target]) > 0.000006:
                 raise ValueError('compact next-token probability mismatch')
             loss -= float(logp[target])
-        if not math.isclose(entry['nll'], loss / len(positions), abs_tol=1e-8):
-            raise ValueError('window NLL mismatch')
+        if (entry['scored_tokens'] != len(positions)
+                or not math.isclose(entry['nll'], loss / len(positions), abs_tol=1e-8)):
+            raise ValueError('window NLL/scored_tokens mismatch')
         total += loss
         count += len(positions)
     if count != meta['scored_tokens'] or not math.isclose(meta['nll'], total / count, abs_tol=1e-8):
