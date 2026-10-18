@@ -334,3 +334,18 @@ def test_glmf_w8_state_is_orthogonal_and_canonical(exporter):
         # load covers the whole decode range, so no recipe key selects a second one.
         assert "decode_recipe" not in params
     assert calls["kda_w8_s16t_m4096"][1]["state_rounding"] == "tile"
+
+
+@pytest.mark.parametrize("decode_rows,prefill_rows", [(64, 4096), (64, 64)])
+def test_kimi_kda_exports_share_glmf_program_and_native_tp2_abi(exporter, decode_rows, prefill_rows):
+    programs = exporter.kimi_kda_programs(GEOMETRY, decode_rows, prefill_rows, 1048576)
+    calls = {stem: (op, params, thunk()) for stem, op, params, thunk in programs}
+    assert len(calls) == len(programs) == 1 + len({decode_rows, prefill_rows})
+    for stem, (op, params, call) in calls.items():
+        module, function, args, kwargs = call
+        assert module == "glmf" and args == (GEOMETRY,)
+        assert function == f"compile_glmf_{op}_aot"
+        assert params == kwargs
+        if op == "kda":
+            assert kwargs["output_kind"] == "norm"
+            assert kwargs["decode"] == (kwargs["max_rows"] == decode_rows)

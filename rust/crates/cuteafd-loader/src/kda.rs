@@ -226,6 +226,59 @@ mod tests {
     }
 
     #[test]
+    fn all_glmf_operands_preserve_legacy_bytes() {
+        use KdaOperand as Op;
+        use KdaRole as R;
+        let g = KdaGeometry { o_norm_dtype: DType::Bf16, ..geometry(KdaOutputGate::LowRank) };
+        let d = g.heads * g.head_dim;
+        for ranks in [1, 2] {
+            for native_conv in [DType::Bf16, DType::F32] {
+                for operand in [Op::WIn, Op::WFg, Op::ConvW, Op::ALog, Op::DtBias, Op::ONorm, Op::WO] {
+                    let mut legacy = vec![Vec::new(); ranks];
+                    let packed = g.pack(operand, ranks, |role| {
+                        let shape = match role {
+                            R::Q | R::K | R::V => vec![d, g.hidden],
+                            R::Fa | R::Ga => vec![128, g.hidden],
+                            R::Fb | R::Gb => vec![d, 128],
+                            R::Beta => vec![g.heads, g.hidden],
+                            R::ConvQ | R::ConvK | R::ConvV => vec![d, 1, 4],
+                            R::ALog => vec![g.heads], R::DtBias => vec![d],
+                            R::ONorm => vec![128], R::O => vec![g.hidden, d],
+                            R::G => unreachable!(),
+                        };
+                        let dtype = match role {
+                            R::ALog | R::DtBias => DType::F32,
+                            R::ConvQ | R::ConvK | R::ConvV => native_conv.clone(),
+                            _ => DType::Bf16,
+                        };
+                        let count = shape.iter().product::<usize>();
+                        let values: Vec<u16> = (0..count).map(|i| 0x3f00 + ((i + role as usize * 17) % 128) as u16).collect();
+                        let widened: Vec<u8> = values.iter().flat_map(|v| f32::from_bits(u32::from(*v) << 16).to_le_bytes()).collect();
+                        let bytes = if dtype == DType::F32 { widened.clone() }
+                            else { values.iter().flat_map(|v| v.to_le_bytes()).collect() };
+                        let expected = if matches!(operand, Op::ConvW | Op::ALog | Op::DtBias) { &widened } else { &bytes };
+                        for (rank, dest) in legacy.iter_mut().enumerate() {
+                            match role {
+                                R::Fa | R::Ga | R::ONorm => dest.extend_from_slice(expected),
+                                R::O => {
+                                    for row in expected.chunks_exact(d * 2) {
+                                        dest.extend_from_slice(&row[rank * d * 2 / ranks..(rank + 1) * d * 2 / ranks]);
+                                    }
+                                }
+                                _ => dest.extend_from_slice(&expected[rank * expected.len() / ranks..(rank + 1) * expected.len() / ranks]),
+                            }
+                        }
+                        Ok(KdaTensor { dtype, shape, bytes })
+                    }).unwrap();
+                    for (rank, tensor) in packed.iter().enumerate() {
+                        assert_eq!(tensor.bytes, legacy[rank], "{operand:?}, ranks={ranks}, native_conv={native_conv:?}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn norm_preserves_f32_bits_and_replicates() {
         let g = geometry(KdaOutputGate::FullRank);
         let bytes: Vec<u8> = (0..128).flat_map(|i| (1.0 + i as f32 / 12345.).to_le_bytes()).collect();

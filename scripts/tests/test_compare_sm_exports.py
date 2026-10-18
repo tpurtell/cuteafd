@@ -205,6 +205,14 @@ def test_catalog_includes_all_geometries_and_fused_suspects():
             assert args[args.index("--atomic-min-capacity") + 1] == "256"
 
 
+@pytest.mark.parametrize("geometry", ["glmf", "glmf2", "kimik3"])
+@pytest.mark.parametrize("label,stem", [("decode", "kda_m64"), ("prefill", "kda_m4096"), ("commit", "kda_commit")])
+def test_kda_groups_export_only_the_shared_kda_programs(geometry, label, stem):
+    job = next(job for job in compare_sm.jobs("suspects") if job[0] == f"kda-{geometry}-{label}")
+    assert job == (f"kda-{geometry}-{label}", "export_b12x_dsv4_aot.py",
+                   ["--geometry", geometry, "--only", stem])
+
+
 def test_hybrid_group_covers_compact_and_grouped_live_rows():
     _, exporter, args = next(job for job in compare_sm.jobs("all")
                              if job[0] == "v41-slices-rtx_tp2-hybrid")
