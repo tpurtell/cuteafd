@@ -111,7 +111,9 @@ def source(root: pathlib.Path, path: str) -> dict:
 
 
 def legacy_window(reference: dict) -> dict:
-    if reference.get("schema") == "cuteafd.fidelity.reference/2":
+    if reference.get("schema") in (SET_SCHEMA, "cuteafd.fidelity.reference/2"):
+        # Published sets omit deployment metadata, retaining the original set id.
+        # The caller binds these frozen bytes with legacy_provenance.sha256.
         matches = [w for w in reference.get("windows", []) if w.get("id") == "legacy"]
         if len(matches) != 1:
             raise ValueError("schema 2 reference needs exactly one legacy window")
@@ -334,6 +336,10 @@ def build_set(*, family: str, model: str, checkpoint: str, version: str, arm: di
                     "context_cap": MAX_TOKENS, "temperature": 0, "seed": 0, "reasoning_effort": "high",
                     "blocks": {"A": 26, "B": 12, "C": 10, "D": 6, "E": 10},
                     "prompt_roles": "conditioning history ctx; current assistant span gen"}, "windows": windows}
+    if getattr(probe, "identity", {}).get("text_source") in ("api", "hf"):
+        manifest["reference_snapshot"] = {
+            key: arm[key] for key in ("checkpoint", "snapshot_revision", "config_sha256", "tokenizer_sha256")}
+        manifest["precision_policy"] = "own text; generation backend recorded separately from reference arithmetic"
     manifest["set_sha256"] = set_hash(manifest)
     validate_set(manifest)
     return manifest

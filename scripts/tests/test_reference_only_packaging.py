@@ -65,6 +65,17 @@ def test_retokenized_panel_caveat_discloses_provisional_legacy_extension():
     assert '#302' in caveat
 
 
+def test_own_model_text_has_no_borrowed_panel_caveat():
+    panel = dict(checkpoint='official', generation_arm=dict(checkpoint='official', text_source='hf'), windows=[])
+    assert packager.own_text(panel)
+    assert packager.panel_caveat(panel) == ''
+    panel['generation_arm']['text_source'] = 'api'
+    assert packager.panel_caveat(panel) == ''
+    panel['generation_arm']['checkpoint'] = 'borrowed'
+    assert not packager.own_text(panel)
+    assert '#302' in packager.panel_caveat(panel)
+
+
 def test_sparse_launch_disclosure_preserves_tiles_and_rejects_missing_parameters():
     launch = dict(official_launch_configuration=False, num_stages=1, block_regions=16,
                   kernel='_sparse_attn_prefill_kernel')

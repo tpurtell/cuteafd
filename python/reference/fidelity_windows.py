@@ -70,6 +70,23 @@ def validate_public_metadata(value, *, synthetic_exemption: bool = False) -> Non
                 validate_public_metadata(item)
 
 
+def validate_text_source(panel: dict) -> None:
+    """Only own-model text or an explicitly declared higher-fidelity source may ship."""
+    scored = panel.get("checkpoint")
+    arm = panel.get("generation_arm", {})
+    source = arm.get("checkpoint")
+    if not scored or not source:
+        raise ValueError("fidelity text source and scored checkpoint are required")
+    if source == scored:
+        return
+    declaration = panel.get("text_source_declaration", {})
+    if (declaration.get("scored_checkpoint") != scored or declaration.get("text_checkpoint") != source
+            or declaration.get("relationship") != "higher_fidelity_same_model"
+            or declaration.get("source_kind") not in ("official_api", "original_checkpoint")
+            or not declaration.get("evidence")):
+        raise ValueError("borrowed window text is not a declared higher-fidelity source of the scored model")
+
+
 def rss_bytes() -> int:
     """Current Linux RSS, not ru_maxrss's irreversible peak."""
     return int(Path("/proc/self/statm").read_text().split()[1]) * os.sysconf("SC_PAGE_SIZE")

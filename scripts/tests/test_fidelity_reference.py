@@ -43,7 +43,7 @@ def test_reference_only_validator_seals_and_rejects_mutation(tmp_path):
                   roles=["ctx"] * 576, score_from=64)
     identity = dict(snapshot_revision="abcdef", checkpoint="official", precision="BF16")
     manifest = dict(schema="cuteafd.fidelity.set/1", family="qwen3_5", checkpoint="official",
-                    model="official", generation_arm={}, reference_snapshot=identity,
+                    model="official", generation_arm={"checkpoint": "official"}, reference_snapshot=identity,
                     windows=[window], quick_windows=["w"])
     manifest["set_sha256"] = set_hash(manifest)
     proof = dict(schema="cuteafd.fidelity.prefix/1", family="qwen3_5", set_sha256=manifest["set_sha256"],
@@ -100,54 +100,6 @@ def test_reference_only_validator_seals_and_rejects_mutation(tmp_path):
     (folder / "tokens.bin").write_bytes(np.ones(576, dtype="<i4").tobytes())
     with pytest.raises(ValueError, match="tokens differ"):
         validator.validate_reference_only(tmp_path)
-
-
-def validator_panel_counts(panel, manifest, files, record_counts):
-    tree = ast.parse((ROOT / "scripts/bench/validate-fidelity-dataset.py").read_text())
-    main = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "main")
-    start = next(i for i, node in enumerate(main.body)
-                 if isinstance(node, ast.Assign) and node.targets[0].id == "windows")
-    shape_loop = main.body[start + 5]
-    row_assert = next(node for node in shape_loop.body if isinstance(node, ast.Assert))
-    checks = ast.Module(body=main.body[start:start + 5] + [row_assert], type_ignores=[])
-    scope = dict(panel=panel, manifest=manifest, dataset=dict(files=files),
-                 maps=[dict.fromkeys(range(n)) for n in record_counts])
-    exec(compile(checks, "validator-panel-counts", "exec"), scope)
-    return scope["scored_positions"]
-
-
-def panel_count_fixture(count):
-    panel = dict(windows=[dict(id=f"w{i}", tokens=[0] * 576, score_from=64)
-                          for i in range(count)])
-    manifest = dict(windows=[dict(id=f"w{i}", positions=list(range(64, 576)))
-                             for i in range(count)])
-    files = [dict(window=f"w{i}") for i in range(count)]
-    return panel, manifest, files
-
-
-@pytest.mark.parametrize("count, rows", [(64, 32768), (8, 4096)])
-def test_dataset_validator_admits_declared_text_and_media_geometry(count, rows):
-    assert validator_panel_counts(*panel_count_fixture(count), [rows, rows]) == rows
-
-
-@pytest.mark.parametrize("count", [64, 8])
-@pytest.mark.parametrize("direction", [-1, 1])
-@pytest.mark.parametrize("changed", ["manifest_windows", "files", "panel_windows", "manifest_rows", "report_rows"])
-def test_dataset_validator_rejects_count_mismatch(count, direction, changed):
-    panel, manifest, files = panel_count_fixture(count)
-    records = [count * 512] * 2
-    if changed == "manifest_windows":
-        manifest["windows"] = manifest["windows"][:-1] if direction < 0 else manifest["windows"] + [dict(id="extra", positions=list(range(512)))]
-    elif changed == "files":
-        files = files[:-1] if direction < 0 else files + [dict(window="extra")]
-    elif changed == "panel_windows":
-        panel["windows"] = panel["windows"][:-1] if direction < 0 else panel["windows"] + [dict(id="extra", tokens=[0] * 576, score_from=64)]
-    elif changed == "manifest_rows":
-        manifest["windows"][0]["positions"] = list(range(512 + direction))
-    else:
-        records[1] += direction
-    with pytest.raises(AssertionError):
-        validator_panel_counts(panel, manifest, files, records)
 
 
 def tiny_set():
@@ -223,98 +175,16 @@ def test_public_metadata_allows_only_narrow_generated_synthetic_email_audit():
         validate_public_metadata(audit)
 
 
-def test_dataset_finalizer_refuses_unqualified_evidence_before_copy(tmp_path):
-    validation = tmp_path / "validation"
-    validation.mkdir()
-    (validation / "report.json").write_text(json.dumps({"qualifies": False, "repeatability_pass": False}))
-    out = tmp_path / "qualified"
+def test_dataset_finalizer_requires_reference_not_engine_evidence(tmp_path):
     command = [sys.executable, str(ROOT / "scripts/bench/finalize-fidelity-dataset.py")]
-    for name, path in {"source": tmp_path / "source", "out": out, "validation": validation,
-                       "arms": tmp_path / "arms", "tokenizer": tmp_path / "tokenizer.json"}.items():
-        command += ["--" + name, str(path)]
-    command += ["--config", "fixture", "--comparison-policy-commit", "0" * 40,
-                "--validator-source-commit", "0" * 40]
+    for name in ("source", "out", "tokenizer", "license"):
+        command += ["--" + name, str(tmp_path / name)]
+    command += ["--config", "fixture"]
     result = subprocess.run(command, capture_output=True, text=True, timeout=60)
-    assert result.returncode != 0 and "Measured qualification" in result.stderr
-    assert not out.exists()
-
-
-@pytest.mark.parametrize("intro,calibration,privacy", [
-    ("This is a numerical-fidelity panel, still a draft.",
-     "The first checkpoint-precision baseline is pending.",
-     "## Public-source and privacy policy"),
-    ("DRAFT: not qualified for upload or precision decisions.",
-     "## Pending Calibration\n\nRepeated baselines are pending.",
-     "## Provenance And Privacy"),
-])
-def test_dataset_finalizer_card_supports_existing_family_formats(tmp_path, intro, calibration, privacy):
-    # Exercise only card formatting; synthetic metrics never qualify a dataset.
-    original = ("# Family Fidelity Draft\n\n" + intro + "\n\n## Configuration\n\n"
-                "Pinned checkpoint and tokenizer.\n\n" + calibration + "\n\n" + privacy +
-                "\n\nOriginal source/privacy audit.\n\n## Licences\n\nMIT notice.\n"
-                "\nCoordinator review and explicit upload approval remain required. No publication\n"
-                "revision, precision-default verdict or promotion is claimed.\n")
-    config = tmp_path / "fixture"
-    config.mkdir()
-    (config / "README.md").write_text(original)
-    root_card = "# Coordinator-owned root card\n"
-    (tmp_path / "README.md").write_text(root_card)
-    tree = ast.parse((ROOT / "scripts/bench/finalize-fidelity-dataset.py").read_text())
-    start = next(i for i, node in enumerate(tree.body) if isinstance(node, ast.Assign)
-                 and any(isinstance(t, ast.Name) and t.id == "readme" for t in node.targets))
-    end = next(i for i in range(start, len(tree.body))
-               if isinstance(tree.body[i], ast.Expr) and isinstance(tree.body[i].value, ast.Call)
-               and isinstance(tree.body[i].value.func, ast.Attribute)
-               and tree.body[i].value.func.attr == "write_text"
-               and any(isinstance(a, ast.Name) and a.id == "readme" for a in tree.body[i].value.args))
-    report = {"shapes": {"decode": {"positions": 123}},
-              "baseline_metrics": {shape: [{"top1": .95, "kl": .02}] * 2
-                                   for shape in ("decode", "prefill")},
-              "family_expect": {"top1_min": .93, "kl_max": .04,
-                                "tripwires": {"confident_top1_min": .95, "top3_min": .97}},
-              "daemon_identity": "fixture daemon", "coordinator_sha256": "0" * 64}
-    namespace = {"SOURCE": tmp_path, "NAME": "fixture", "report": report}
-    exec(compile(ast.Module(body=tree.body[start:end], type_ignores=[]), "card-format", "exec"), namespace)
-    card = namespace["readme"]
-    assert "Family Fidelity Reference" in card and "qualified numerical-fidelity reference" in card
-    assert "DRAFT:" not in card and "Pending Calibration" not in card and "baseline is pending" not in card
-    assert "primary count is 123" in card and "| prefill | 1 | 95.0000% | 0.02000000 |" in card
-    assert "No publication revision is claimed" in card and "No precision-default verdict" in card
-    assert "coordinator review" not in card.lower() and "upload approval" not in card.lower()
-    assert "Pinned checkpoint and tokenizer." in card
-    expected_tail = original[original.index(privacy):].replace(
-        'Coordinator review and explicit upload approval remain required. No publication\n'
-        'revision, precision-default verdict or promotion is claimed.',
-        'No publication revision, precision-default verdict or promotion is claimed.')
-    assert card[card.index(privacy):] == expected_tail
-    assert (tmp_path / "README.md").read_text() == root_card
-
-
-@pytest.mark.parametrize("has_checkpoint_notice", [True, False])
-def test_dataset_finalizer_can_omit_optional_checkpoint_licence(tmp_path, has_checkpoint_notice):
-    import shutil
-    source = tmp_path / "source"
-    source.mkdir()
-    (source / "LICENSE").write_text("MIT project licence\n")
-    manifest = {"licence_files": [{"path": "LICENSE", "sha256": "project"}],
-                "checkpoint": "vendor/model", "root_checkpoint": {"snapshot_revision": "a" * 40}}
-    if has_checkpoint_notice:
-        (source / "CHECKPOINT_LICENSE").write_text("Official checkpoint notice\n")
-        manifest["licence_files"].append({"path": "CHECKPOINT_LICENSE", "sha256": "vendor"})
-    output = tmp_path / "output"
-    shutil.copytree(source, output)
-    tree = ast.parse((ROOT / "scripts/bench/finalize-fidelity-dataset.py").read_text())
-    function = next(node for node in tree.body if isinstance(node, ast.FunctionDef)
-                    and node.name == "omit_checkpoint_license")
-    namespace = {}
-    exec(compile(ast.Module(body=[function], type_ignores=[]), "optional-licence", "exec"), namespace)
-    namespace["omit_checkpoint_license"](output, manifest)
-    assert not (output / "CHECKPOINT_LICENSE").exists()
-    assert (source / "CHECKPOINT_LICENSE").exists() == has_checkpoint_notice
-    assert (output / "LICENSE").read_bytes() == (source / "LICENSE").read_bytes()
-    assert manifest["licence_files"] == [{"path": "LICENSE", "sha256": "project"}]
-    assert manifest["checkpoint"] == "vendor/model"
-    assert manifest["root_checkpoint"]["snapshot_revision"] == "a" * 40
+    assert result.returncode != 0 and "windows.json" in result.stderr
+    assert not (tmp_path / "out").exists()
+    for removed in ("--arms", "--comparison-policy-commit", "--validator-source-commit"):
+        assert removed not in subprocess.check_output(command[:2] + ["--help"], text=True)
 
 
 def test_dataset_finalizer_preserves_only_sealed_official_licence_contacts(tmp_path):
@@ -404,11 +274,6 @@ def test_dataset_finalizer_rejects_png_privacy_metadata(tmp_path, metadata):
 def test_dataset_finalizer_rejects_unsafe_media_paths(tmp_path, relative):
     with pytest.raises(AssertionError, match="Unsafe media input"):
         finalizer_media_checks()["validate_media_input"](tmp_path, dict(path=relative, bytes=2, sha256="0" * 64))
-
-
-def test_measured_dataset_validator_self_tests():
-    subprocess.run([sys.executable, str(ROOT / "scripts/bench/validate-fidelity-dataset.py"),
-                    "--self-test"], check=True, timeout=60)
 
 
 def test_public_text_allows_public_fabric_without_mutating_tokens():

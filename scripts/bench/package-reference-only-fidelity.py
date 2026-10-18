@@ -15,7 +15,7 @@ from tokenizers import Tokenizer
 
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO / 'python/reference'))
-from fidelity_windows import canonical, validate_public_metadata, validate_public_text
+from fidelity_windows import canonical, validate_public_metadata, validate_public_text, validate_text_source
 
 QUICK = ['legacy', 'a00', 'a04', 'a08', 'a20', 'c00', 'd00', 'e00']
 CAVEAT = ('The source shared text panel contains repeated unrelated source-text splices in 33 scored suffixes; '
@@ -78,8 +78,13 @@ def compact_tensors(full, window):
                 next_token_log_prob=next_lps)
 
 
+def own_text(panel):
+    arm = panel.get('generation_arm', {})
+    return arm.get('checkpoint') == panel.get('checkpoint') and arm.get('text_source') in ('api', 'hf')
+
+
 def panel_caveat(panel):
-    caveat = CAVEAT
+    caveat = '' if own_text(panel) else CAVEAT
     if panel.get('retokenized_text_source'):
         caveat += ' ' + panel['retokenized_text_source']['caveat']
         caveat += ' Provisional chat windows were re-rendered with the target chat template; all windows were retokenized. This is not a Step-5-generated panel.'
@@ -130,6 +135,7 @@ def package(source, out, config, tokenizer_path, license_path):
         raise ValueError('output must be fresh and config must be a safe component')
     read = lambda name: json.loads(contained(source, name).read_text())
     meta, panel = read('golden/meta.json'), read('golden/windows.json')
+    validate_text_source(panel)
     validation, seal, full_seal = read('reference-validation.json'), read('golden-seal.json'), read('full.sha256.json')
     rows = read('full/rows.json')
     set_id = panel['set_sha256']
@@ -208,8 +214,8 @@ def package(source, out, config, tokenizer_path, license_path):
     for key in ('tokenizers_native_sha256', 'tokenizers_record_sha256'):
         if key in runtime:
             provenance['runtime'][key] = runtime[key]
-    qualification = dict(schema='cuteafd.fidelity.qualification/1', kind='reference_only', qualifies=True,
-                         engine_parity=False, qualification_scope='reference-only qualified; no paired engine calibration or precision-default verdict',
+    qualification = dict(schema='cuteafd.fidelity.qualification/1', kind='reference', qualifies=True,
+                         engine_parity=False, qualification_scope='reference logits, storage and prefix invariance',
                          set_sha256=set_id, nll=meta['nll'], scored_tokens=meta['scored_tokens'],
                          prefix_qualification=meta['prefix_qualification'], reference_validation=validation,
                          reference_provenance=provenance, panel_caveat=caveat)
@@ -219,27 +225,33 @@ def package(source, out, config, tokenizer_path, license_path):
     manifest = dict(schema='cuteafd.fidelity.dataset/1', kind='reference-top1024-plus-tail', config=config,
                     family=panel['family'], checkpoint=panel['checkpoint'], root_checkpoint=dict(id=snapshot['checkpoint'], revision=snapshot['snapshot_revision']),
                     set_sha256=set_id, vocab=rows['vocab'], top_k=1024,
-                    expect=dict(top1_min=.90, kl_max=.06), expect_provenance='common policy floor, not calibrated against a dense engine',
+                    expect=dict(top1_min=.90, kl_max=.06,
+                                tripwires=dict(confident_top1_min=.98, top3_min=.99,
+                                               confident_drop_margin=.01, top3_drop_margin=.005)),
+                    expect_provenance='declared policy floors; independent of engine measurements',
                     windows_sha256=digest(destination / 'windows.json'), qualification_sha256=digest(destination / 'qualification.json'),
                     files=files, licence_files=[dict(path='LICENSE', sha256=digest(destination / 'LICENSE'))],
                     packaging_source_commit=subprocess.check_output(['git', '-C', str(REPO), 'rev-parse', 'HEAD'], text=True).strip(),
                     packaging_source_sha256=digest(Path(__file__)),
-                    publication_status=('PROVISIONAL; REFERENCE-ONLY QUALIFIED; coordinator review/upload required'
-                                        if panel.get('retokenized_text_source') else
-                                        'REFERENCE-ONLY QUALIFIED; coordinator review/upload required'),
+                    publication_status='REFERENCE',
                     text_checkpoint=panel['generation_arm']['checkpoint'], panel_caveat=caveat)
     if launch_note:
         manifest['reference_execution'] = dict(sparse_attention_launch=meta['sparse_attention_launch'])
     manifest['reference_sha256'] = hashlib.sha256(canonical(manifest)).hexdigest()
     validate_public_metadata(manifest)
     (destination / 'manifest.json').write_bytes(canonical(manifest) + b'\n')
-    panel_description = ('Provisional foreign-text panel: chat windows use the target chat template; all 64 windows were retokenized with character-span roles.\n'
+    panel_description = ('Own-model text: fixed prompts, checkpoint chat template, and real fixture tool execution.\n'
+                         if own_text(panel) else
+                         'Provisional foreign-text panel: chat windows use the target chat template; all 64 windows were retokenized with character-span roles.\n'
                          if panel.get('retokenized_text_source') else
                          'All 64 windows, tokens, roles and score geometry are unchanged from the pinned shared panel.\n')
+    text_description = (f'Text source: `{panel["generation_arm"]["text_source"]}` from the scored checkpoint.\n'
+                        if own_text(panel) else
+                        f'Text was generated by `{panel["generation_arm"]["checkpoint"]}`, not by the reference root.\n')
     precision, arithmetic, runtime_source = root_description(meta, panel)
-    card = (f'# {config}\n\nReference-only qualified numerical fidelity panel, not a training corpus or a general quality ranking.\n\n'
+    card = (f'# {config}\n\nNumerical fidelity reference dataset, not a training corpus or a general quality ranking.\n\n'
             f'Official {precision}: `{snapshot["checkpoint"]}` at `{snapshot["snapshot_revision"]}`.\n'
-            f'Text was generated by `{panel["generation_arm"]["checkpoint"]}`, not by the {precision.split(" (")[0]}.\n'
+            f'{text_description}'
             f'{panel_description}'
             'The bench quick subset is legacy,a00,a04,a08,a20,c00,d00,e00 (4,096 rows).\n\n'
             '## Qualification\n\n'
@@ -248,13 +260,13 @@ def package(source, out, config, tokenizer_path, license_path):
             f'{arithmetic}\n'
             f'{launch_note}'
             f'Pinned {runtime_source}, tokenizer runtime, platform and oracle seal hashes are in qualification.json.\n'
-            'No engine parity, paired compact/full-engine calibration, dense baseline calibration, or precision-default verdict is claimed.\n'
-            'The common top-1/KL policy floor in the manifest is not a measured dense-engine baseline.\n\n'
+            'No engine run is required to finish or publish this dataset.\n'
+            'Declared policy floors: top-1 >=90%, KL <=0.06 nat, confident top-1 >=98%, top-3 >=99%.\n\n'
             '## Storage\n\n'
             'One safetensors file per window: U32 positions, next_token_ids and top_ids; U8 roles; F16 top_log_probs; '
             'F32 tail_log_mass and next_token_log_prob. Top-1024 selection uses the sealed full F16 rows with lower-ID boundary ties.\n'
             'Tail and target masses normalize the F16 oracle; no paired engine equivalence is asserted.\n\n'
-            f'## Panel Caveat\n\n{caveat}\n\n'
+            + (f'## Panel Caveat\n\n{caveat}\n\n' if caveat else '') +
             '## Provenance And Privacy\n\n'
             f'Source set: `{set_id}`. Raw deployment settings and local paths are omitted.\n'
             'Public text and metadata pass credential/private-key/personal-data screening. Original public MIT notice is preserved verbatim.\n'

@@ -223,6 +223,9 @@ class HFClient(TextGenerator):
             torch.manual_seed(0)
             torch.backends.cuda.matmul.allow_tf32 = False
             torch.backends.cudnn.allow_tf32 = False
+            from transformers.models.qwen3_5 import modeling_qwen3_5 as reference
+            from shape_invariant import install_eager
+            install_eager(reference)
             self.model, _ = module.load_reference(self.snapshot)
             self.model.eval()
         prompt = self.renderer.prompt(body)
