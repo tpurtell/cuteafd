@@ -59,8 +59,6 @@ pub fn quick_windows(reference: &Reference) -> Result<Vec<Window>> {
 pub const STANDARD_TIER: &str = "standard-v2";
 pub const STANDARD_SPLIT_SHA256: &str = "2af36f78359d9ce7f37d0d2d4740c57ca11f0a77734bc13e774d37e416eee65b";
 pub const STANDARD_FALLBACK: &str = "decode only; prefill not admitted";
-// Pro's sealed split has a 1.1218 gen-row ratio; each half has its own verdict and bootstrap.
-const STANDARD_GEN_ROW_RATIO_MAX: f64 = 1.15;
 // Window ids, positions and blocks are model-independent; buckets/gen rows depend on tokenization/generations.
 const STANDARD_BUCKET_DIFF_MAX: i32 = 3;
 
@@ -108,7 +106,6 @@ pub fn standard_windows(reference: &Reference, path: &str, admitted: bool) -> Re
     let halves: Vec<Vec<_>> = [STANDARD_DECODE, STANDARD_PREFILL].iter().map(|ids|
         ids.iter().map(|id| reference.windows.iter().find(|w| w.id == *id).unwrap()).collect()).collect();
     let mut buckets = Vec::new();
-    let mut generated = Vec::new();
     for half in &halves {
         let mut blocks = BTreeMap::new();
         let mut counts = BTreeMap::new();
@@ -122,14 +119,11 @@ pub fn standard_windows(reference: &Reference, path: &str, admitted: bool) -> Re
             "standard-v2 block stratification differs");
         ensure!(roles.get("ctx").copied().unwrap_or(0) > 0 && roles.get("gen").copied().unwrap_or(0) > 0,
             "standard-v2 requires context and generated rows in each half");
-        generated.push(roles["gen"]);
         buckets.push(counts);
     }
     ensure!(buckets[0].keys().chain(buckets[1].keys()).all(|k|
         (buckets[0].get(k).copied().unwrap_or(0) - buckets[1].get(k).copied().unwrap_or(0)).abs() <= STANDARD_BUCKET_DIFF_MAX),
         "standard-v2 context buckets are not balanced");
-    ensure!(*generated.iter().max().unwrap() as f64 <= STANDARD_GEN_ROW_RATIO_MAX * *generated.iter().min().unwrap() as f64,
-        "standard-v2 generated row counts differ by more than 15%");
     ensure!(matches!(path, "decode" | "prefill") && (admitted || path == "decode"),
         "standard-v2 prefill scoring not admitted");
     if !admitted { return Ok(reference.windows.clone()); }
@@ -572,7 +566,8 @@ mod tests {
         for w in &mut reference.windows {
             if STANDARD_DECODE.contains(&w.id.as_str()) && w.block != "C" { w.roles.fill("gen".into()); }
         }
-        assert!(standard_windows(&reference,"decode",true).unwrap_err().to_string().contains("more than 15%"));
+        assert!(standard_windows(&reference,"decode",true).is_ok());
+        assert!(standard_windows(&reference,"prefill",true).is_ok());
         reference = saved;
         for w in &mut reference.windows {
             if STANDARD_DECODE.contains(&w.id.as_str()) { w.bucket = "2-8K".into(); }
@@ -585,7 +580,7 @@ mod tests {
     }
 
     #[test]
-    fn published_text_tiers_preserve_sealed_windows_and_generated_balance() {
+    fn published_text_tiers_preserve_sealed_windows_and_generated_counts() {
         let publications = [
             (REVISION, CONFIG, 8998, 8658), (FLASH_REVISION, FLASH_CONFIG, 7169, 6838),
             (GLMF_REVISION, GLMF_CONFIG, 7500, 7604), (QWEN_REVISION, QWEN_CONFIG, 8351, 7902),
@@ -629,7 +624,6 @@ mod tests {
                     - balance["prefill"]["context_buckets"][bucket].as_i64().unwrap()).abs()).max().unwrap();
             assert!(bucket_difference <= i64::from(STANDARD_BUCKET_DIFF_MAX), "{config}");
             let ratio = decode_gen.max(prefill_gen) as f64 / decode_gen.min(prefill_gen) as f64;
-            assert!(ratio <= STANDARD_GEN_ROW_RATIO_MAX, "{config}: {ratio}");
             if config == MIMO_PRO_CONFIG {
                 assert_eq!(decode_gen + prefill_gen, 16618);
                 assert!((ratio - 1.1218).abs() < 0.0001);
@@ -637,7 +631,6 @@ mod tests {
                 assert_eq!(balance["prefill"]["context_buckets"], json!({"0-2K":16,"2-8K":7,"8-16K":9}));
                 assert_eq!(standard_windows(&reference,"decode",false).unwrap().len(),64);
             } else {
-                assert!(ratio <= 1.1, "{config}: {ratio}");
                 assert!(bucket_difference <= 1, "{config}: {bucket_difference}");
             }
         }

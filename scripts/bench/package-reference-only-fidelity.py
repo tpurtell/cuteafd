@@ -5,6 +5,7 @@ import copy
 import hashlib
 import json
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import sys
@@ -79,6 +80,30 @@ def compact_tensors(full, window):
                 roles=np.array([r == 'gen' for r in window['roles'][start:]], dtype='u1'),
                 top_ids=ids, top_log_probs=probabilities, tail_log_mass=tails,
                 next_token_log_prob=next_lps)
+
+
+def standard_generated_rows(panel):
+    """Report natural row counts using the consumer's fixed split, never resample."""
+    source = (REPO / 'rust/crates/cuteafd-bench/src/fidelity_dataset.rs').read_text()
+    windows = {window['id']: window for window in panel['windows']}
+    counts = {}
+    for name in ('decode', 'prefill'):
+        match = re.search(r'pub const STANDARD_' + name.upper() + r':[^=]+=\s*\[(.*?)\];', source, re.S)
+        ids = re.findall(r'"([a-e][0-9]{2}|legacy)"', match.group(1))
+        counts[name] = sum(window['roles'][window['score_from']:].count('gen')
+                           for window in (windows[wid] for wid in ids))
+    small, large = min(counts.values()), max(counts.values())
+    return dict(tier='standard-v2', decode_generated_positions=counts['decode'],
+                prefill_generated_positions=counts['prefill'],
+                max_min_ratio=large / small if small else None, informational_only=True)
+
+
+def standard_generated_note(counts):
+    ratio = counts['max_min_ratio']
+    ratio_text = f'{ratio:.6f}' if ratio is not None else 'undefined (zero generated rows)'
+    return (f'Standard-v2 generated scored positions: decode {counts["decode_generated_positions"]:,}; '
+            f'prefill {counts["prefill_generated_positions"]:,}; max/min ratio {ratio_text}. '
+            'Informational only: fixed window IDs are not resampled; each half reports per-position rates.\n')
 
 
 def own_text(panel):
@@ -244,7 +269,9 @@ def package(source, out, config, tokenizer_path, license_path):
         raise ValueError('sealed runtime provenance differs')
     runtime = read('platform.json')
     provenance['runtime'] = validate_runtime_platform(runtime)
+    generated_rows = standard_generated_rows(panel)
     qualification = dict(schema='cuteafd.fidelity.qualification/1', kind='reference', qualifies=True,
+                         standard_generated_rows=generated_rows,
                          engine_parity=False, qualification_scope='reference logits, storage and prefix invariance',
                          set_sha256=set_id, nll=meta['nll'], scored_tokens=meta['scored_tokens'],
                          prefix_qualification=meta['prefix_qualification'], reference_validation=validation,
@@ -284,6 +311,7 @@ def package(source, out, config, tokenizer_path, license_path):
             'The bench quick subset is legacy,a00,a04,a08,a20,c00,d00,e00 (4,096 rows).\n\n'
             '## Qualification\n\n'
             f'32,768 scored positions; reference NLL {meta["nll"]:.15f} nat/token.\n'
+            f'{standard_generated_note(generated_rows)}'
             'The 576/640-token prefix probes have 512 byte-identical common F32 rows and zero argmax disagreements.\n'
             f'{arithmetic}\n'
             f'{launch_note}'

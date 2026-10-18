@@ -172,6 +172,29 @@ def test_sparse_launch_disclosure_preserves_tiles_and_rejects_missing_parameters
             packager.sparse_launch_note(dict(sparse_attention_launch={**launch, key: wrong}))
 
 
+@pytest.mark.parametrize('decode_gen,prefill_gen', [(8306, 7065), (16000, 1000)])
+def test_standard_generated_rows_are_informational_for_every_panel(decode_gen, prefill_gen):
+    import re
+    source = (ROOT / 'rust/crates/cuteafd-bench/src/fidelity_dataset.rs').read_text()
+    windows = []
+    for half, total in [('DECODE', decode_gen), ('PREFILL', prefill_gen)]:
+        ids = re.findall(r'"([a-e][0-9]{2}|legacy)"', re.search(
+            r'pub const STANDARD_' + half + r':[^=]+=\s*\[(.*?)\];', source, re.S).group(1))
+        for index, wid in enumerate(ids):
+            count = min(512, max(0, total - index * 512))
+            windows.append(dict(id=wid, roles=['gen'] + ['ctx'] * (512 - count) + ['gen'] * count,
+                                score_from=1))
+    result = packager.standard_generated_rows(dict(windows=windows))
+    assert result == dict(tier='standard-v2', decode_generated_positions=decode_gen,
+                          prefill_generated_positions=prefill_gen,
+                          max_min_ratio=max(decode_gen, prefill_gen) / min(decode_gen, prefill_gen),
+                          informational_only=True)
+    note = packager.standard_generated_note(result)
+    assert f'decode {decode_gen:,}; prefill {prefill_gen:,}' in note
+    assert 'Informational only' in note and 'not resampled' in note
+    assert 'per-position rates' in note
+
+
 def test_dense_root_wording_is_unchanged_and_v41_root_comes_from_the_manifest():
     # Dense/Step-5 goldens record no root arithmetic: their cards keep the original text byte for byte.
     assert packager.root_description({}, {'reference_snapshot': {'precision': 'official BF16'}}) == (
