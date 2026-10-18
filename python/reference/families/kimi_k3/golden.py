@@ -372,6 +372,8 @@ def main():
     parser.add_argument("--layers", type=int, default=None)
     parser.add_argument("--diagnose-layer", type=int, default=None,
                         help="compare native/fixed sub-ops at layer 1 without running a golden")
+    parser.add_argument("--diagnose-official-noise", action="store_true",
+                        help="compare unmodified native batch 2 with retained batch-1 probe states")
     parser.add_argument("--diagnose-blas", choices=("cublas", "cublaslt"),
                         help="select a native Torch BLAS backend for both diagnostic arms")
     parser.add_argument("--diagnose-linear-variants", action="store_true",
@@ -381,6 +383,13 @@ def main():
     args = parser.parse_args()
     if args.layers is not None:
         raise ValueError("partial layers cannot qualify a Kimi reference")
+    if args.diagnose_official_noise:
+        if args.diagnose_layer is not None or args.diagnose_linear_variants or args.diagnose_blas:
+            raise ValueError("official noise diagnosis uses only native cuBLAS batch geometry")
+        from families.kimi_k3.diagnostic import diagnose_official_noise
+        diagnose_official_noise(args, native_layer=native_layer, atomic_json=atomic_json,
+                                digest=digest, state_type=LayerState, official_mask=official_mask)
+        return
     if args.diagnose_layer is not None:
         from families.kimi_k3.diagnostic import diagnose
         diagnose(args, native_layer=native_layer, atomic_json=atomic_json, digest=digest,

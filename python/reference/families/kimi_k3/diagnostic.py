@@ -173,6 +173,168 @@ def linear_variants(trace, *, device):
     return summaries
 
 
+def duplicate_probe(embedding):
+    if embedding.ndim != 3 or embedding.shape[0] != 1 or embedding.shape[1] != 128:
+        raise ValueError("official noise diagnosis requires one 128-token probe")
+    return embedding.repeat(2, 1, 1)
+
+
+def logit_metrics(native, candidate):
+    import numpy as np
+    a, b = np.asarray(native, dtype=np.float64), np.asarray(candidate, dtype=np.float64)
+    if a.shape != b.shape or a.ndim != 2 or not a.size:
+        raise ValueError("noise comparison logit geometry differs")
+    if not np.isfinite(a).all() or not np.isfinite(b).all():
+        raise ValueError("non-finite noise comparison logits")
+    logp = a - np.logaddexp.reduce(a, axis=-1, keepdims=True)
+    logq = b - np.logaddexp.reduce(b, axis=-1, keepdims=True)
+    return {"tokens": len(a), "top1": float(np.mean(a.argmax(-1) == b.argmax(-1))),
+            "kl": float((np.exp(logp) * (logp - logq)).sum(-1).mean()),
+            "relative_logit_l2": float(np.linalg.norm(a - b) / max(np.linalg.norm(a), 1e-30)),
+            "max_abs_logit_difference": float(np.abs(a - b).max())}
+
+
+def diagnose_official_noise(a, *, native_layer, atomic_json, digest, state_type, official_mask):
+    """Change batch geometry only; never turn a diagnostic into qualification."""
+    import time
+    import numpy as np
+    import torch
+    import fla
+    import transformers
+    import compressed_tensors
+    from fidelity_windows import load_set, verify_snapshot
+    from families.kimi_k3.model import LayerWeights, load_official, package_source_identity, source_identity
+    from shape_invariant import linear
+
+    if a.probe_state is None:
+        raise ValueError("official noise diagnosis requires --probe-state")
+    started = time.monotonic()
+    torch.set_default_dtype(torch.bfloat16)
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = False
+    torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = False
+    torch.backends.cuda.preferred_blas_library("cublas")
+    torch.manual_seed(0)
+    manifest = load_set(a.windows)
+    snapshot = verify_snapshot(manifest, a.snapshot)
+    latest = json.loads((a.probe_state / "latest.json").read_bytes())
+    binding = latest["binding"]
+    runtime = {"torch": torch.__version__, "fla": fla.__version__,
+               "transformers": transformers.__version__, "compressed_tensors": compressed_tensors.__version__,
+               "image_sha256": os.environ.get("CUTEAFD_REFERENCE_IMAGE_SHA256", ""),
+               "compute_capability": list(torch.cuda.get_device_capability())}
+    if (binding["snapshot_identity"] != snapshot or binding["set_sha256"] != manifest["set_sha256"]
+            or any(binding[key] != value for key, value in runtime.items())):
+        raise ValueError("noise source/set/runtime differs from retained probe")
+    pins = source_identity(a.snapshot)
+    for package, key in ((fla, "fla"), (transformers, "transformers"), (compressed_tensors, "compressed_tensors")):
+        pins[key + "_source_sha256"] = package_source_identity(package)
+    pins["reference_adapter_sha256"] = digest(Path(__file__).with_name("model.py"))
+    if any(binding["source_pin"][key] != value for key, value in pins.items()):
+        raise ValueError("noise native modeling/package sources differ from retained probe")
+    reference, config, quantization = load_official(a.snapshot)
+    if latest["layer"] != config.num_hidden_layers - 1:
+        raise ValueError("noise comparison requires completed native batch-1 decoder states")
+    retained = state_type(a.probe_state, binding)
+    blob = latest["windows"]["official_short"]["blocks"][0]
+    if blob["sha256"] != latest["windows"]["adapted_short"]["blocks"][0]["sha256"]:
+        raise ValueError("retained official/candidate initial embeddings differ")
+    a.out.mkdir(parents=True, exist_ok=True)
+    noise_binding = {"role": "official-batch-noise-diagnostic-only", "source_pin": pins,
+                     "parent_probe_manifest_sha256": digest(a.probe_state / "latest.json"),
+                     "diagnostic_sha256": digest(__file__), "runtime": runtime,
+                     "blas": str(torch.backends.cuda.preferred_blas_library()),
+                     "embedding_sha256": blob["sha256"], "batch": 2, "tokens_per_copy": 128,
+                     "state_bytes_per_layer": 2 * 128 * config.hidden_size * 2}
+    state = state_type(a.out / "layer-state", noise_binding)
+    weights = LayerWeights(a.snapshot, quantization,
+                           kda_num_heads=config.linear_attn_config["num_heads"])
+    with torch.inference_mode():
+        if state.latest is None:
+            embedding = torch.from_numpy(np.fromfile(retained.verify(blob), dtype="<u2")).view(torch.bfloat16)
+            embedding = embedding.reshape(1, -1, config.hidden_size).cuda()
+            pending = state.begin(-1)
+            state.save(pending, "official_b2", duplicate_probe(embedding))
+            state.commit(pending)
+            del embedding
+        for index in range(state.latest["layer"] + 1, config.num_hidden_layers):
+            tick = time.monotonic()
+            layer = native_layer(reference, config, weights, index)
+            pending = state.begin(index)
+            hidden, blocks = state.load("official_b2", config.hidden_size)
+            hidden = hidden.reshape(2, 128, config.hidden_size)
+            mask = None if layer.is_linear_attn else official_mask(hidden)
+            result, history = layer(hidden, attention_mask=mask, block_residual=blocks,
+                                    use_cache=False, output_attentions=False)
+            append = index % config.attn_res_block_size == 0
+            if history.shape[1] != blocks.shape[1] + int(append):
+                raise ValueError("noise official block-residual count differs")
+            if append and not torch.equal(history[:, -1], hidden.reshape(-1, config.hidden_size)):
+                raise ValueError("noise official block-residual state differs")
+            state.save(pending, "official_b2", result, append_block=append)
+            difference = result[0].float() - result[1].float()
+            pending["checks"].append({"layer": index, "duplicate_copy_max_abs": float(difference.abs().max()),
+                                      "duplicate_copy_relative_l2": float(difference.norm() / result[0].float().norm().clamp_min(1e-30))})
+            state.commit(pending)
+            del layer, hidden, blocks, result, history, difference
+            torch.cuda.empty_cache()
+            print(f"official B2 layer {index + 1}/{config.num_hidden_layers} committed; {time.monotonic() - tick:.1f}s; read {weights.bytes_read / 1e9:.3f} GB", flush=True)
+        with torch.device("meta"):
+            norm = reference.KimiRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+            output_norm = reference.KimiRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+            output_proj = torch.nn.Linear(config.hidden_size, 1, bias=False)
+        weights.load_module(norm, "language_model.model.norm")
+        weights.load_module(output_norm, "language_model.model.output_attn_res_norm")
+        weights.load_module(output_proj, "language_model.model.output_attn_res_proj")
+        head = weights.weight("language_model.lm_head.weight").float()
+        weights.close()
+        arrays, artifacts = {}, {}
+        for source, wid, batch in ((retained, "official_short", 1), (retained, "adapted_short", 1),
+                                   (state, "official_b2", 2)):
+            hidden, blocks = source.load(wid, config.hidden_size)
+            hidden = reference._apply_attn_res(hidden[0], blocks, output_proj, output_norm)
+            hidden = norm(hidden.reshape(batch, 128, config.hidden_size))
+            for copy in range(batch):
+                key = wid + "_copy" + str(copy)
+                logits = linear(hidden[copy, :127].float(), head).float().cpu().numpy()
+                if not np.isfinite(logits).all():
+                    raise ValueError("non-finite official noise logits")
+                arrays[key] = logits
+                path = a.out / (key + "-logits.npy")
+                temporary = path.with_suffix(".pending")
+                with temporary.open("wb") as stream:
+                    np.save(stream, logits, allow_pickle=False)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                temporary.replace(path)
+                artifacts[key] = {"path": path.name, "sha256": digest(path)}
+            del hidden, blocks
+        baseline = arrays["official_short_copy0"]
+        comparisons = {"official_b1_vs_b2_copy" + str(copy): logit_metrics(baseline, arrays["official_b2_copy" + str(copy)])
+                       for copy in range(2)}
+        candidate = logit_metrics(baseline, arrays["adapted_short_copy0"])
+        comparisons["official_b1_vs_fixed_M128_cublas"] = candidate
+        comparisons["official_b2_copy0_vs_copy1"] = logit_metrics(arrays["official_b2_copy0"], arrays["official_b2_copy1"])
+        noise = [comparisons["official_b1_vs_b2_copy" + str(copy)] for copy in range(2)]
+        envelope = {key: (min if key == "top1" else max)(row[key] for row in noise)
+                    for key in ("top1", "kl", "relative_logit_l2", "max_abs_logit_difference")}
+        within = {"top1": candidate["top1"] >= envelope["top1"],
+                  "kl": candidate["kl"] <= envelope["kl"],
+                  "relative_logit_l2": candidate["relative_logit_l2"] <= envelope["relative_logit_l2"]}
+        report = {"schema": "cuteafd.kimi.official-noise/1", "binding": noise_binding,
+                  "seconds": time.monotonic() - started, "bytes_read": weights.bytes_read,
+                  "comparison": "unchanged native 128-token forward, B1 versus two independent duplicate prompts at B2; 127 prediction rows per copy; no sequence split, cache or causal changes",
+                  "head": "same widened F32 head and fixed-M128 projection as the retained probe",
+                  "metric_precision": "float64 from stored float32 logits",
+                  "comparisons": comparisons, "observed_noise_envelope": envelope,
+                  "candidate_within_observed_noise": within, "artifacts": artifacts,
+                  "qualification": "diagnostic only; original numerical and byte-exact-prefix gates remain unchanged",
+                  "layers": state.latest["checks"]}
+        atomic_json(a.out / "official-noise.json", report)
+        print(json.dumps({"comparisons": comparisons, "observed_noise_envelope": envelope,
+                          "candidate_within_observed_noise": within}, sort_keys=True), flush=True)
+
+
 def diagnose(a, *, native_layer, atomic_json, digest, state_type, official_mask):
     import numpy as np
     import torch

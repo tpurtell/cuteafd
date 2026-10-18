@@ -200,6 +200,109 @@ def test_diagnostic_linear_variants_preserve_native_output_geometry():
     assert all(report["compared"] == 1 and report["over_1e-5"] == 0 for report in reports.values())
 
 
+def test_noise_probe_preserves_independent_batch_geometry():
+    torch = pytest.importorskip("torch")
+    from families.kimi_k3.diagnostic import duplicate_probe
+    source = torch.arange(128 * 4).reshape(1, 128, 4).bfloat16()
+    copies = duplicate_probe(source)
+    assert copies.shape == (2, 128, 4)
+    assert torch.equal(copies[0], source[0]) and torch.equal(copies[1], source[0])
+    copies[0, 0, 0] = -1
+    assert copies[1, 0, 0] == 0 and source[0, 0, 0] == 0
+    with pytest.raises(ValueError, match="128-token"):
+        duplicate_probe(source[:, :127])
+
+
+def test_noise_metrics_are_diagnostic_not_a_gate():
+    from families.kimi_k3.diagnostic import logit_metrics
+    native = np.array([[4., 0., -1.], [0., 4., -1.]], dtype=np.float32)
+    exact = logit_metrics(native, native.copy())
+    assert exact["top1"] == 1 and exact["kl"] == 0 and exact["relative_logit_l2"] == 0
+    divergent = logit_metrics(native, native[:, ::-1].copy())
+    assert divergent["top1"] == .5 and divergent["kl"] > .1
+    assert "passed" not in divergent
+    with pytest.raises(ValueError, match="geometry"):
+        logit_metrics(native, native[:1])
+    with pytest.raises(ValueError, match="non-finite"):
+        logit_metrics(native, np.full_like(native, np.nan))
+
+
+def test_official_noise_streams_native_b2_and_resumes(tmp_path, monkeypatch):
+    torch = pytest.importorskip("torch")
+    from families.kimi_k3.diagnostic import diagnose_official_noise
+    for name in ("fla", "transformers", "compressed_tensors"):
+        module = types.ModuleType(name)
+        module.__version__ = "fixture"
+        monkeypatch.setitem(sys.modules, name, module)
+    monkeypatch.setattr(torch.Tensor, "cuda", lambda self: self)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda: (12, 0))
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+    monkeypatch.setattr(torch.backends.cuda, "preferred_blas_library", lambda *args: "fixture-cublas")
+    monkeypatch.setenv("CUTEAFD_REFERENCE_IMAGE_SHA256", "fixture-image")
+    manifest = {"set_sha256": "fixture-set"}
+    monkeypatch.setattr("fidelity_windows.load_set", lambda path: manifest)
+    monkeypatch.setattr("fidelity_windows.verify_snapshot", lambda *args: "fixture-snapshot")
+    monkeypatch.setattr(model, "source_identity", lambda path: {"revision": "fixture"})
+    monkeypatch.setattr(model, "package_source_identity", lambda package: "fixture-package")
+    pins = {"revision": "fixture", "reference_adapter_sha256": golden.digest(Path(model.__file__))}
+    pins.update({name + "_source_sha256": "fixture-package" for name in ("fla", "transformers", "compressed_tensors")})
+    binding = {"snapshot_identity": "fixture-snapshot", "set_sha256": "fixture-set", "source_pin": pins,
+               "torch": torch.__version__, "fla": "fixture", "transformers": "fixture", "compressed_tensors": "fixture",
+               "image_sha256": "fixture-image", "compute_capability": [12, 0]}
+    config = types.SimpleNamespace(hidden_size=4, num_hidden_layers=3, attn_res_block_size=12,
+                                   rms_norm_eps=1e-6, linear_attn_config={"num_heads": 96})
+    reference = types.SimpleNamespace(KimiRMSNorm=torch.nn.Identity,
+                                     _apply_attn_res=lambda hidden, blocks, proj, norm: hidden)
+    monkeypatch.setattr(model, "load_official", lambda path: (reference, config, None))
+    class Weights:
+        def __init__(self, *args, **kwargs):
+            self.bytes_read = 0
+        def load_module(self, module, prefix):
+            return module.to_empty(device="cpu")
+        def weight(self, name):
+            return torch.arange(12).reshape(3, 4).bfloat16() / 16
+        def close(self):
+            pass
+    monkeypatch.setattr(model, "LayerWeights", Weights)
+    source = torch.arange(128 * 4).reshape(1, 128, 4).bfloat16() / 512
+    retained = golden.LayerState(tmp_path / "retained", binding)
+    pending = retained.begin(-1)
+    for wid in ("official_short", "adapted_short"):
+        retained.save(pending, wid, source)
+    retained.commit(pending)
+    for index in range(3):
+        pending = retained.begin(index)
+        for wid in ("official_short", "adapted_short"):
+            hidden, blocks = retained.load(wid, 4)
+            retained.save(pending, wid, hidden + (index + 1) / 8, append_block=index == 0)
+        retained.commit(pending)
+    calls = []
+    def native_layer(reference, config, weights, index):
+        def forward(hidden, *, attention_mask, block_residual, use_cache, output_attentions):
+            assert hidden.shape == (2, 128, 4) and attention_mask is None and not use_cache
+            calls.append(index)
+            history = block_residual
+            if index == 0:
+                history = torch.cat((history, hidden.reshape(-1, 4)[:, None]), dim=1)
+            return hidden + (index + 1) / 8, history
+        forward.is_linear_attn = True
+        return forward
+    args = types.SimpleNamespace(probe_state=retained.root, out=tmp_path / "noise", windows=tmp_path / "input.json",
+                                  snapshot=tmp_path / "snapshot")
+    kwargs = dict(native_layer=native_layer, atomic_json=golden.atomic_json, digest=golden.digest,
+                  state_type=golden.LayerState, official_mask=golden.official_mask)
+    diagnose_official_noise(args, **kwargs)
+    report = json.loads((args.out / "official-noise.json").read_bytes())
+    assert calls == [0, 1, 2]
+    assert all(row["top1"] == 1 and row["relative_logit_l2"] == 0 for row in report["comparisons"].values())
+    assert report["qualification"].startswith("diagnostic only")
+    assert len(report["layers"]) == 3 and len(report["artifacts"]) == 4
+    calls.clear()
+    diagnose_official_noise(args, **kwargs)
+    assert calls == []
+    assert golden.digest(retained.root / "latest.json") == report["binding"]["parent_probe_manifest_sha256"]
+
+
 def test_diagnostic_hooks_are_removed_after_failure():
     torch = pytest.importorskip("torch")
     from families.kimi_k3.diagnostic import Trace
