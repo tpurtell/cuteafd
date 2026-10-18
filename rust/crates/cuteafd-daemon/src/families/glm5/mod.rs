@@ -106,6 +106,36 @@ pub(crate) struct EngineArgs {
     pub attention_plan_rows: Option<usize>,
 }
 
+fn native_activation(args: &EngineArgs, first_moe: usize, layers: usize, serving: bool) -> Result<()> {
+    use cuteafd_loader::placement::{AttentionPlacement, Onboard};
+    ensure!(args.draft.is_none() && !args.skip_routed_experts,
+        "EXLR8 requires no drafter and real Spark experts");
+    ensure!(matches!(args.rtx_expert_layers, Onboard::Auto | Onboard::Layers(0)),
+        "EXLR8 requires no coordinator-local routed experts");
+    let peers = args.peers.as_deref().context("EXLR8 requires Spark peers")?;
+    ensure!(!peers.is_empty() && peers.split(',').all(|peer| !peer.trim().is_empty()),
+        "EXLR8 requires nonempty Spark peers");
+    let partial = args.layers.is_some_and(|count| count > first_moe && count < layers);
+    if !serving && args.split_device.is_none() && partial { return Ok(()); }
+    ensure!(matches!(args.exlr8_manifest.as_deref(), Some("up1" | "bit325")),
+        "EXLR8 full execution currently admits up1 or bit325 only");
+    ensure!(args.split_device.is_some_and(|device| device != args.device)
+        && peers.split(',').count() == 4 && args.layers.is_none_or(|count| count == layers),
+        "EXLR8 full execution requires two coordinators, TP4 and all backbone layers");
+    let attention = cuteafd_loader::placement::attention::parse(&args.attention_placement)
+        .map_err(anyhow::Error::msg)?;
+    ensure!(attention.is_none_or(|placement| placement == AttentionPlacement::Context),
+        "EXLR8 full execution requires context attention placement");
+    Ok(())
+}
+
+fn native_dense_format(config: &serde_json::Value) -> Result<()> {
+    let quant = &config["quantization_config"];
+    ensure!(quant["quant_method"] == "fp8" && quant["weight_block_size"] == serde_json::json!([128, 128]),
+        "EXLR8 dense-from currently requires official block-FP8 GLM dense operands");
+    Ok(())
+}
+
 fn spark_model(lanes: usize, bf16: bool, native: bool) -> Result<cuteafd_transport::worker_selection::ModelAdmission> {
     ensure!(lanes > 0, "GLM Spark admission requires at least one prefill lane");
     ensure!(!native || lanes == 1, "EXLR8 currently requires serial prefill");
@@ -164,6 +194,48 @@ mod draft_cli_tests {
         assert_eq!(args.exlr8_dense_from, Some(PathBuf::from("/official")));
         assert!(Parse::try_parse_from(["test", "--snapshot", "/native", "--native-lib", "/library",
             "--exlr8-dense-from", "/official"]).is_err());
+    }
+
+    #[test]
+    fn native_full_activation_is_narrow_and_preserves_component_goldens() {
+        let args = Parse::try_parse_from(["test", "--snapshot", "/native", "--native-lib", "/library",
+            "--exlr8-manifest", "up1", "--exlr8-dense-from", "/official", "--split-device", "1",
+            "--peers", "a:1,b:1,c:1,d:1", "--attention-placement", "context", "--rtx-expert-layers", "0"])
+            .unwrap().engine;
+        for manifest in ["up1", "bit325"] {
+            let mut candidate = args.clone();
+            candidate.exlr8_manifest = Some(manifest.into());
+            assert!(native_activation(&candidate, 3, 78, true).is_ok());
+            candidate.attention_placement = "auto".into();
+            assert!(native_activation(&candidate, 3, 78, false).is_ok());
+        }
+        for bad in 0..9 {
+            let mut candidate = args.clone();
+            match bad {
+                0 => candidate.exlr8_manifest = Some("home".into()),
+                1 => candidate.split_device = None,
+                2 => candidate.split_device = Some(0),
+                3 => candidate.peers = Some("a:1,b:1,c:1,d:1,e:1,f:1".into()),
+                4 => candidate.layers = Some(4),
+                5 => candidate.attention_placement = "heads".into(),
+                6 => candidate.draft = Some("/draft".into()),
+                7 => candidate.skip_routed_experts = true,
+                _ => candidate.rtx_expert_layers = cuteafd_loader::placement::Onboard::Layers(1),
+            }
+            assert!(native_activation(&candidate, 3, 78, true).is_err(), "case {bad}");
+        }
+        let mut component = args;
+        component.split_device = None;
+        component.layers = Some(4);
+        assert!(native_activation(&component, 3, 78, false).is_ok());
+        assert!(native_activation(&component, 3, 78, true).is_err());
+        assert!(native_dense_format(&serde_json::json!({"quantization_config": {
+            "quant_method": "fp8", "weight_block_size": [128, 128]}})).is_ok());
+        for config in [serde_json::json!({}), serde_json::json!({"quantization_config": {
+            "quant_method": "nvfp4", "weight_block_size": [128, 128]}}),
+            serde_json::json!({"quantization_config": {"quant_method": "fp8"}})] {
+            assert!(native_dense_format(&config).is_err());
+        }
     }
 
     #[test]
@@ -320,11 +392,9 @@ pub(crate) fn open(args: &EngineArgs) -> Result<Opened> {
         let dense = args.exlr8_dense_from.as_deref()
             .context("native EXLR8 dense execution is not qualified; pass --exlr8-dense-from with the official snapshot")?;
         cuteafd_loader::plan::exlr8::validate_dense_source(&args.snapshot, dense)?;
-        ensure!(args.split_device.is_none() && args.draft.is_none() && !args.skip_routed_experts,
-            "EXLR8 activation currently requires one coordinator, no drafter and real Spark experts");
-        ensure!(args.layers.is_some_and(|layers| layers > cfg.first_moe_layer && layers < cfg.layers),
-            "EXLR8 activation currently requires a partial routed-layer golden (--layers)");
-        ensure!(args.peers.as_deref().is_some_and(|peers| !peers.is_empty()), "EXLR8 requires Spark peers");
+        native_activation(args, cfg.first_moe_layer, cfg.layers, false)?;
+        let dense_config: serde_json::Value = serde_json::from_slice(&std::fs::read(dense.join("config.json"))?)?;
+        native_dense_format(&dense_config)?;
         Some(cuteafd_loader::read_expert_catalog(dense)?)
     } else {
         ensure!(args.exlr8_manifest.is_none() && args.exlr8_dense_from.is_none(),
@@ -388,6 +458,8 @@ impl Opened {
             None => None,
         };
         let split_device = crate::shared::peer_split::probed_device(&self.library, args.device, split_device)?;
+        ensure!(!native || args.split_device.is_none() || split_device.is_some(),
+            "EXLR8 two-coordinator execution cannot fall back to one GPU");
         let peer_stream = match split_device {
             Some(device) => {
                 ensure!(device != args.device, "--split-device must differ from --device");
@@ -515,6 +587,9 @@ impl Opened {
             onboard: if args.skip_routed_experts { cuteafd_loader::placement::Onboard::Layers(0) }
                 else { args.rtx_expert_layers }, full_prefill_logits: args.full_prefill_logits, context };
         let (placement, working) = glm::solve_working_set(&inputs, serial_workspace, requested)?;
+        ensure!(!native || devices.len() != 2
+            || placement.attention_placement == cuteafd_loader::placement::AttentionPlacement::Context,
+            "EXLR8 two-coordinator admission requires context attention programs");
         let prefill_lanes = usize::try_from(working.spark.prefill_lanes)?;
         let selected_peers = if working.spark.spark_ranks > 0 { args.peers.as_deref() } else { None };
         cuteafd_loader::placement::families::GLM5.check(&placement)?;

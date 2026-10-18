@@ -82,9 +82,10 @@ fn model_id(snapshot: &std::path::Path) -> Option<String> {
 }
 
 pub(crate) async fn run_serve(args: ServeArgs) -> Result<()> {
-    anyhow::ensure!(args.engine.exlr8_manifest.is_none() && args.engine.exlr8_dense_from.is_none()
-        && !cuteafd_loader::plan::exlr8::recognizes(&args.engine.snapshot)?,
-        "native EXLR8 serving awaits its golden execution and deployment gates; use glm-golden");
+    if cuteafd_loader::plan::exlr8::recognizes(&args.engine.snapshot)? {
+        let cfg = cuteafd_loader::families::glm5::GlmDsaConfig::read(&args.engine.snapshot)?;
+        super::native_activation(&args.engine, cfg.first_moe_layer, cfg.layers, true)?;
+    }
     let api = args.api.load()?;
     let snapshot: PathBuf = args.engine.snapshot.clone();
     let encoding = GlmEncoding::from_snapshot(&snapshot)?.with_thinking_off(args.thinking_off);

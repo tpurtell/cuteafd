@@ -45,8 +45,9 @@ pub(super) fn load<'a>(library: &'a NativeLibrary, catalog: &OfficialV41Catalog,
     let rows = (config.capacity as usize).min(K1_ROWS);
     let fallback_staging = rows.checked_mul(catalog.routed_experts().geometry()?.hidden as usize)
         .and_then(|bytes| bytes.checked_mul(2)).context("EXLR8 fallback staging overflow")?;
-    let workspace = Exlr8Execution::workspace_bytes(programs, rows, ExpertSet::Routed)?
-        .checked_add(fallback_staging).context("EXLR8 workspace admission overflow")?;
+    let k1_workspace_bytes = Exlr8Execution::workspace_bytes(programs, rows, ExpertSet::Routed)?;
+    let workspace = k1_workspace_bytes.checked_add(fallback_staging)
+        .context("EXLR8 workspace admission overflow")?;
     let plans = config.resident_layers(catalog.routed_experts().layers)?.into_iter()
         .map(|layer| Residency::plan(&config.snapshot, manifest, layer, config.world,
             config.rank, ExpertSet::Routed).map_err(anyhow::Error::from))
@@ -73,7 +74,7 @@ pub(super) fn load<'a>(library: &'a NativeLibrary, catalog: &OfficialV41Catalog,
         weights.push(Exlr8Weights::load(library, plan, remaining - workspace)?);
         remaining = remaining.checked_sub(bytes).context("EXLR8 resident budget exhausted")?;
     }
-    tracing::info!(rank = config.rank, resident, workspace, retained_host,
+    tracing::info!(rank = config.rank, resident, workspace, k1_workspace_bytes, fallback_staging, retained_host,
         load_peak = peak.load_peak, serve_peak = peak.serve_peak, "EXLR8 worker admitted");
     Ok((backend::Weights::Exlr8(weights), remaining - retained_host))
 }

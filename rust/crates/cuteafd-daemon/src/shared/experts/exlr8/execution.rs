@@ -89,38 +89,13 @@ impl Workspace {
         let top_k = dimension("top_k")?;
         let max_groups = dimension("max_groups")?;
         let units = dimension("units")?;
-        let product = |a: usize, b: usize| a.checked_mul(b).context("EXLR8 workspace overflow");
-        let routes = product(rows, top_k)?;
         let scratch = |name: &str| -> Result<usize> {
             usize::try_from(*spec.scratch.get(name).context("missing K1 scratch")?)
                 .context("K1 scratch exceeds address space")
         };
-        // x, ids, route weights, output, then the four graph-stable route tables,
-        // and the K1 intermediate planes. All are admitted in one allocation.
-        let sizes = [
-            product(product(rows, hidden)?, 2)?,
-            product(routes, 4)?,
-            product(routes, 4)?,
-            product(product(rows, hidden)?, 4)?,
-            product(max_groups, 4)?,
-            product(product(max_groups, 16)?, 4)?,
-            product(routes, 4)?,
-            4,
-            scratch("fc1")?,
-            scratch("intermediate")?
-                .checked_add(scratch("fc2")?)
-                .context("K1 scratch overflow")?,
-        ];
-        let mut bytes = 0usize;
-        let mut ranges = [(0, 0); 10];
-        for (range, size) in ranges.iter_mut().zip(sizes) {
-            let start = bytes
-                .checked_add(255)
-                .context("workspace alignment overflow")?
-                & !255;
-            bytes = start.checked_add(size).context("workspace size overflow")?;
-            *range = (start, size);
-        }
+        let (ranges, bytes) = cuteafd_loader::plan::exlr8::residency::execution_workspace_layout(
+            rows, hidden, top_k, max_groups, scratch("fc1")?,
+            scratch("intermediate")?, scratch("fc2")?)?;
         Ok(Self {
             ranges,
             bytes,
