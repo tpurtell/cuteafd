@@ -298,7 +298,7 @@ def test_format_counts_reach_nvfp4_but_not_exl3(fixture_repo, tmp_path):
         ('fp8_moe.cmake', '    foreach(count IN LISTS CUTEAFD_GENERIC_SPARK_COUNTS)',
          '    if(requested_layouts)', 'set(count_family qwen4)\nset(entry qwen4:nvfp4)', 'requested_layouts'),
         ('exl3.cmake', '  foreach(count IN LISTS CUTEAFD_GENERIC_SPARK_COUNTS)',
-         '  if(CUTEAFD_EXL3_ROLE', 'set(CUTEAFD_EXL3_GEOMETRY qwen4)', 'requested_counts'),
+         '\n  if(CUTEAFD_EXL3_ROLE STREQUAL "spark" AND', 'set(CUTEAFD_EXL3_GEOMETRY qwen4)', 'requested_counts'),
     ]:
         source = (REPO / 'native/cmake/shared' / filename).read_text()
         block = start + source.split(start, 1)[1].split(end, 1)[0]
