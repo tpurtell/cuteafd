@@ -73,7 +73,7 @@ def main():
     gate = official_gate(args.official_model, SimpleNamespace(**config), torch)
     index = json.loads((args.snapshot / "model.safetensors.index.json").read_text())["weight_map"]
     prefix = next(name.removesuffix(".weight") for name in sorted(index)
-                  if name.endswith(".mlp.gate.weight") and ".layers.1." in name)
+                  if name.endswith(".block_sparse_moe.gate.weight") and ".layers.1." in name)
     tensors, hashes = {}, {}
     for suffix in ("weight", "e_score_correction_bias"):
         name = prefix + "." + suffix
