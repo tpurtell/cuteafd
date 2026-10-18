@@ -36,6 +36,51 @@ def test_policy_tripwires_do_not_newly_fail_current_cards():
     assert checked == len(reports)
 
 
+def test_golden_runtime_producer_passes_packager_validator(tmp_path, monkeypatch):
+    import base64
+    import hashlib
+    import importlib.metadata
+    import json
+    import sys
+    from types import SimpleNamespace
+    from fidelity_windows import collect_runtime_platform, finish_golden
+
+    files = {'tokenizers/fake.so': b'native', 'tokenizers-1.dist-info/WHEEL': b'Wheel-Version: 1.0\n'}
+    rows = []
+    for name, content in files.items():
+        path = tmp_path / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(content)
+        encoded = base64.urlsafe_b64encode(hashlib.sha256(content).digest()).decode().rstrip('=')
+        rows.append(f'{name},sha256={encoded},{len(content)}\n')
+    record = ''.join(rows)
+    metadata = {'RECORD': record}
+    dist = SimpleNamespace(read_text=lambda name: metadata.get(name), locate_file=lambda name: tmp_path / name)
+    monkeypatch.setattr(importlib.metadata, 'distribution', lambda name: dist)
+    monkeypatch.setitem(sys.modules, 'torch', SimpleNamespace(cuda=SimpleNamespace(get_device_capability=lambda _: (12, 1))))
+    monkeypatch.setenv('CUTEAFD_REFERENCE_IMAGE', 'reference:test')
+    monkeypatch.setenv('CUTEAFD_REFERENCE_IMAGE_SHA256', 'sha256:' + 'a' * 64)
+    runtime = collect_runtime_platform()
+    assert packager.validate_runtime_platform(runtime) == runtime
+    assert 'tokenizers_wheel_archive_sha256' not in runtime
+    assert 'tokenizers_wheel_sha256' not in runtime
+    metadata['direct_url.json'] = json.dumps({'url': 'https://example.org/tokenizers.whl',
+                                            'archive_info': {'hashes': {'sha256': 'b' * 64}}})
+    runtime = collect_runtime_platform()
+    assert runtime['tokenizers_wheel_archive_sha256'] == 'b' * 64
+    assert packager.validate_runtime_platform(runtime) == runtime
+    out = tmp_path / 'golden'
+    out.mkdir()
+    finish_golden(out, dict(set_sha256='test', family='test', checkpoint='test'), [])
+    assert packager.validate_runtime_platform(json.loads((tmp_path / 'platform.json').read_text())) == runtime
+    assert (out / 'platform.json').read_bytes() == (tmp_path / 'platform.json').read_bytes()
+    with pytest.raises(ValueError, match='schema'):
+        packager.validate_runtime_platform({**runtime, 'tokenizers_wheel_sha256': 'c' * 64})
+    (tmp_path / 'tokenizers/fake.so').write_bytes(b'tampered')
+    with pytest.raises(ValueError, match='differs from RECORD'):
+        collect_runtime_platform()
+
+
 def test_top1024_storage_uses_stable_f16_ties_and_normalized_target():
     rows = np.full((2, 1100), -8., dtype='<f2')
     rows[:, 1099] = -1.

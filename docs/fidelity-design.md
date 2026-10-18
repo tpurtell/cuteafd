@@ -23,6 +23,14 @@ consumer-side evidence, not prerequisites for publishing a dataset.
   Foreign-model borrowed text is rejected, not published provisionally.
 - Reference finite-logit, snapshot/hash, byte-identical common-prefix and compact
   storage checks gate publication. No engine run is part of validate or finalize.
+- Golden runtime provenance is collected by the shared golden finalizer into
+  `golden/platform.json` and its parent `platform.json`. Launch containers with
+  `CUTEAFD_REFERENCE_IMAGE`, `CUTEAFD_REFERENCE_IMAGE_SHA256` (Docker image content
+  digest), and optionally `CUTEAFD_REFERENCE_DEPENDENCY_INSTALL`. The collector
+  obtains compute capability from Torch and verifies installed tokenizers files
+  against RECORD. `tokenizers_dist_sha256` hashes their canonical inventory;
+  `tokenizers_hash_kind` states that meaning. A wheel archive hash is recorded
+  separately only when installed direct-url metadata actually supplies one.
 - New own-text sets use declared policy floors: top-1 >=90%, KL <=0.06 nat,
   confident top-1 >=96%, top-3 >=97%; paired loss margins remain 1 point and
   0.5 point respectively. These are policy, not values inferred from reference

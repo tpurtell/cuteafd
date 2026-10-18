@@ -122,6 +122,30 @@ def root_description(meta, panel):
     return (f'root ({panel["reference_snapshot"]["precision"]})', root['arithmetic'], root['source'])
 
 
+def validate_runtime_platform(runtime):
+    required = {'schema', 'image', 'image_sha256', 'compute_capability',
+                'tokenizers_dist_sha256', 'tokenizers_hash_kind', 'dependency_install',
+                'tokenizers_native_sha256', 'tokenizers_record_sha256'}
+    optional = {'tokenizers_wheel_archive_sha256'}
+    if (not required <= runtime.keys() or runtime.keys() - required - optional
+            or runtime['schema'] != 'cuteafd.fidelity.platform/1'
+            or runtime['tokenizers_hash_kind'] != 'sha256 of canonical RECORD-verified installed file inventory'):
+        raise ValueError('invalid reference runtime schema')
+    for key in required | optional:
+        if key.endswith('_sha256') and key in runtime:
+            value = runtime[key]
+            if not isinstance(value, str) or len(value) != 64 or any(c not in '0123456789abcdef' for c in value):
+                raise ValueError('invalid reference runtime digest')
+    capability = runtime['compute_capability']
+    if (not isinstance(capability, list) or len(capability) != 2
+            or any(type(v) is not int or v < 0 for v in capability)
+            or not isinstance(runtime['image'], str) or not runtime['image']
+            or not isinstance(runtime['dependency_install'], str) or not runtime['dependency_install']):
+        raise ValueError('invalid reference runtime identity')
+    validate_public_metadata(runtime)
+    return copy.deepcopy(runtime)
+
+
 def public_panel(panel):
     public = copy.deepcopy(panel)
     # Keep immutable generation identity, not deployment arguments or local paths.
@@ -215,11 +239,7 @@ def package(source, out, config, tokenizer_path, license_path):
     if digest(source / 'platform.json') != inventory['platform.json']['sha256']:
         raise ValueError('sealed runtime provenance differs')
     runtime = read('platform.json')
-    provenance['runtime'] = {k: runtime[k] for k in ('image', 'image_sha256', 'compute_capability',
-                                                   'tokenizers_wheel_sha256', 'dependency_install')}
-    for key in ('tokenizers_native_sha256', 'tokenizers_record_sha256'):
-        if key in runtime:
-            provenance['runtime'][key] = runtime[key]
+    provenance['runtime'] = validate_runtime_platform(runtime)
     qualification = dict(schema='cuteafd.fidelity.qualification/1', kind='reference', qualifies=True,
                          engine_parity=False, qualification_scope='reference logits, storage and prefix invariance',
                          set_sha256=set_id, nll=meta['nll'], scored_tokens=meta['scored_tokens'],

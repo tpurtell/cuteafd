@@ -538,7 +538,67 @@ def write_scored_logits(out: Path, window: dict, logits: np.ndarray) -> dict:
             **({"media": window["media"]} if window.get("media") else {})}
 
 
+def collect_runtime_platform() -> dict:
+    """Describe the running image and verify installed tokenizers against RECORD."""
+    import base64
+    import csv
+    import importlib.metadata
+    import io
+    import torch
+
+    image = os.environ.get('CUTEAFD_REFERENCE_IMAGE', '')
+    image_sha = os.environ.get('CUTEAFD_REFERENCE_IMAGE_SHA256', '').removeprefix('sha256:')
+    if not image or not re.fullmatch(r'[0-9a-f]{64}', image_sha):
+        raise ValueError('golden requires CUTEAFD_REFERENCE_IMAGE and CUTEAFD_REFERENCE_IMAGE_SHA256')
+    dist = importlib.metadata.distribution('tokenizers')
+    record = dist.read_text('RECORD')
+    if not record:
+        raise ValueError('installed tokenizers lacks RECORD')
+    files, native = [], []
+    for name, encoded, size in csv.reader(io.StringIO(record)):
+        if not encoded:
+            continue
+        algorithm, expected = encoded.split('=', 1)
+        if algorithm != 'sha256':
+            raise ValueError('unsupported tokenizers RECORD digest')
+        path = Path(dist.locate_file(name))
+        raw = path.read_bytes()
+        digest = hashlib.sha256(raw).hexdigest()
+        if (base64.urlsafe_b64encode(bytes.fromhex(digest)).decode().rstrip('=') != expected
+                or len(raw) != int(size)):
+            raise ValueError('installed tokenizers differs from RECORD')
+        files.append(dict(path=name, sha256=digest, bytes=len(raw)))
+        if name.startswith('tokenizers/') and path.suffix in ('.so', '.pyd'):
+            native.append(digest)
+    if not files or len(native) != 1 or not any(f['path'].endswith('.dist-info/WHEEL') for f in files):
+        raise ValueError('tokenizers RECORD lacks wheel/native evidence')
+    runtime = dict(schema='cuteafd.fidelity.platform/1', image=image, image_sha256=image_sha,
+                   compute_capability=list(torch.cuda.get_device_capability(0)),
+                   tokenizers_dist_sha256=hashlib.sha256(canonical(sorted(files, key=lambda f: f['path']))).hexdigest(),
+                   tokenizers_hash_kind='sha256 of canonical RECORD-verified installed file inventory',
+                   tokenizers_record_sha256=hashlib.sha256(record.encode()).hexdigest(),
+                   tokenizers_native_sha256=native[0],
+                   dependency_install=os.environ.get('CUTEAFD_REFERENCE_DEPENDENCY_INSTALL',
+                       'Pinned Transformers source; installed tokenizers files verified against dist-info/RECORD'))
+    direct = json.loads(dist.read_text('direct_url.json') or '{}')
+    archive = direct.get('archive_info', {})
+    archive_sha = archive.get('hashes', {}).get('sha256')
+    if archive_sha is None and archive.get('hash', '').startswith('sha256='):
+        archive_sha = archive['hash'].split('=', 1)[1]
+    if archive_sha is not None and direct.get('url', '').split('?', 1)[0].endswith('.whl'):
+        if not re.fullmatch(r'[0-9a-f]{64}', archive_sha):
+            raise ValueError('invalid tokenizers wheel archive digest')
+        runtime['tokenizers_wheel_archive_sha256'] = archive_sha
+    validate_public_metadata(runtime)
+    return runtime
+
+
 def finish_golden(out: Path, manifest: dict, rows: list[dict], **meta) -> None:
+    if os.environ.get('CUTEAFD_REFERENCE_IMAGE') or meta.get('platform', {}).get('capability') is not None:
+        runtime = collect_runtime_platform()
+        (out / 'platform.json').write_bytes(canonical(runtime) + b'\n')
+        if out.name == 'golden':
+            (out.parent / 'platform.json').write_bytes(canonical(runtime) + b'\n')
     (out / "windows.json").write_bytes(canonical(manifest) + b"\n")
     (out / "meta.json").write_bytes(canonical({"schema": "cuteafd.fidelity.golden/2",
         "set_sha256": manifest["set_sha256"], "family": manifest["family"],
