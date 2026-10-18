@@ -103,16 +103,35 @@ class LayerWeights:
             raise ValueError("non-finite checkpoint-native MXFP4 dequantization")
         return value
 
-    def load_module(self, module, prefix):
-        import torch
+    def validate_module(self, module, prefix):
         entries = []
         for name, parameter in module.named_parameters():
             full = prefix + "." + name
-            stored = full if full in self.index else full.removesuffix(".weight") + ".weight_packed"
+            packed = full not in self.index
+            stored = full.removesuffix(".weight") + ".weight_packed" if packed else full
+            if stored not in self.index:
+                raise ValueError("missing native parameter: " + full)
             shard, descriptor = self.descriptor(stored)
+            shape = list(descriptor["shape"])
+            if packed:
+                if len(shape) != 2 or descriptor["dtype"] != "U8":
+                    raise ValueError("unsupported native packed layout: " + full)
+                shape[-1] *= 2
+                _, scale = self.descriptor(full.removesuffix(".weight") + ".weight_scale")
+                if scale["dtype"] != "U8" or scale["shape"] != [shape[0], shape[1] // 32]:
+                    raise ValueError("native MXFP4 scale layout differs: " + full)
+            elif descriptor["dtype"] not in ("BF16", "F32"):
+                raise ValueError("unsupported native dense dtype: " + full)
+            if shape != list(parameter.shape):
+                raise ValueError(f"native tensor shape differs: {full}; checkpoint {shape}, official model {list(parameter.shape)}")
             entries.append((shard, descriptor["data_offsets"][0], full, name, parameter))
+        return sorted(entries, key=lambda entry: entry[:2])
+
+    def load_module(self, module, prefix):
+        import torch
+        entries = self.validate_module(module, prefix)
         # Native parameters are materialized once, not as an extra whole-layer copy.
-        for _, _, full, name, parameter in sorted(entries, key=lambda entry: entry[:2]):
+        for _, _, full, name, parameter in entries:
             value = self.weight(full)
             if tuple(value.shape) != tuple(parameter.shape):
                 raise ValueError("native tensor shape differs: " + full)

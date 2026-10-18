@@ -91,6 +91,9 @@ class LayerState:
         return hidden, history
 
     def begin(self, layer):
+        required = self.binding.get("state_bytes_per_layer", 0) + 100 * 1024 ** 3
+        if shutil.disk_usage(self.root).free < required:
+            raise ValueError("reference state write would violate 100 GiB NVMe headroom")
         pending = self.root / ("layer%03d" % layer)
         if pending.exists():
             shutil.rmtree(pending)
@@ -209,13 +212,25 @@ def execute(a):
         raise ValueError("Kimi oracle supports only its own text panel")
     snapshot = verify_snapshot(manifest, a.snapshot)
     reference, config, quantization = load_official(a.snapshot)
+    weights = LayerWeights(a.snapshot, quantization)
+    # Reject an inconsistent release before embeddings, GPU admission or shard payload reads.
+    with torch.device("meta"):
+        first = reference.KimiDecoderLayer(config, 0)
+    weights.validate_module(first, "language_model.model.layers.0")
+    del first
     pins = {**source_identity(a.snapshot), "fla_source_sha256": package_source_identity(fla),
+            "transformers_source_sha256": package_source_identity(transformers),
             "compressed_tensors_source_sha256": package_source_identity(compressed_tensors),
             "reference_adapter_sha256": digest(Path(__file__).with_name("model.py")),
             "reference_runner_sha256": digest(Path(__file__))}
     checking = getattr(a, "_prefix_probe", False)
     if not checking:
-        a._kimi_probe_state = a.out / "prefix-state"
+        a._kimi_probe_state = a.out.parent / (a.out.name + "-prefix-state")
+        # Keep interrupted evidence, but leave exactly one raw probe in the seal.
+        for previous in a.out.glob("prefix-gate-*"):
+            archive = a.out.parent / "prefix-history"
+            archive.mkdir(exist_ok=True)
+            previous.rename(archive / previous.name)
     proof = qualify(a, manifest, execute)
     windows = copy.deepcopy(manifest["windows"])
     if checking:
@@ -229,9 +244,10 @@ def execute(a):
                "compressed_tensors": compressed_tensors.__version__,
                "compute_capability": list(torch.cuda.get_device_capability()),
                "image_sha256": os.environ.get("CUTEAFD_REFERENCE_IMAGE_SHA256", ""),
+               "state_bytes_per_layer": sum(len(w["tokens"]) * config.hidden_size * 2 for w in windows),
                "windows": {w["id"]: hashlib.sha256(canonical(w["tokens"])).hexdigest() for w in windows}}
-    state = LayerState(a._kimi_probe_state if checking else a.out / "layer-state", binding)
-    weights = LayerWeights(a.snapshot, quantization)
+    state = LayerState(a._kimi_probe_state if checking else
+                       a.out.parent / (a.out.name + "-layer-state"), binding)
     with torch.inference_mode():
         if state.latest is None:
             embedding = weights.weight("language_model.model.embed_tokens.weight")
@@ -303,7 +319,9 @@ def execute(a):
             if wid in ("official_short", "adapted_short"):
                 short_logits[wid] = logits
             else:
-                entries.append(write_scored_logits(a.out, window, logits))
+                entry = write_scored_logits(a.out, window, logits)
+                atomic_json(a.out / entry["path"] / "meta.json", entry)
+                entries.append(entry)
                 targets = torch.tensor(window["tokens"][start:], dtype=torch.long)
                 total_nll += F.cross_entropy(torch.from_numpy(logits).double(), targets, reduction="sum").item()
                 total_rows += len(logits)

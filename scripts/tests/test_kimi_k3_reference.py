@@ -12,6 +12,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "python/reference")
 from families.kimi_k3 import model, golden
 
 
+@pytest.fixture(autouse=True)
+def nvme_budget(monkeypatch):
+    monkeypatch.setattr(golden.shutil, "disk_usage", lambda path: types.SimpleNamespace(free=2 ** 40))
+
+
 def test_source_identity_fails_closed(tmp_path, monkeypatch):
     snapshot = tmp_path / ("a" * 40)
     snapshot.mkdir()
@@ -23,6 +28,18 @@ def test_source_identity_fails_closed(tmp_path, monkeypatch):
     source.write_text("# changed\n")
     with pytest.raises(ValueError, match="source differs"):
         model.source_identity(snapshot)
+
+
+def test_native_shape_disagreement_stops_before_payload_read():
+    weights = model.LayerWeights.__new__(model.LayerWeights)
+    name = "language_model.model.layers.0.self_attn.A_log"
+    weights.index = {name: "fixture.safetensors"}
+    weights.descriptor = lambda key: ("fixture.safetensors", {
+        "dtype": "F32", "shape": [128], "data_offsets": [0, 512]})
+    module = types.SimpleNamespace(named_parameters=lambda: [
+        ("self_attn.A_log", types.SimpleNamespace(shape=(96,)))])
+    with pytest.raises(ValueError, match=r"checkpoint \[128\], official model \[96\]"):
+        weights.validate_module(module, "language_model.model.layers.0")
 
 
 def blob(root, pending, wid, data=b"\0\0\0\0"):
@@ -60,6 +77,13 @@ def test_resume_rejects_changed_binding_or_blob(tmp_path):
     (tmp_path / entry["path"]).write_bytes(b"bad")
     with pytest.raises(ValueError, match="blob differs"):
         golden.LayerState(tmp_path, {"set": "fixture"})
+
+
+def test_layer_write_reserves_nvme_headroom(tmp_path, monkeypatch):
+    state = golden.LayerState(tmp_path, {"state_bytes_per_layer": 1024})
+    monkeypatch.setattr(golden.shutil, "disk_usage", lambda path: types.SimpleNamespace(free=2 ** 30))
+    with pytest.raises(ValueError, match="headroom"):
+        state.begin(0)
 
 
 def test_resume_rejects_escaping_paths(tmp_path):
