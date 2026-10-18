@@ -52,6 +52,25 @@ pub(super) struct Model {
     complete: bool,
     /// Routed formats observed (`exl3-k2`, ...).
     expert_formats: Vec<String>,
+    /// Coordinator text bytes by TP2 residency (embedding and head excluded).
+    coordinator: Residency,
+}
+
+/// Coordinator text weights by how a two-GPU head split holds them.
+#[derive(Debug, Default, Clone, Copy)]
+pub(super) struct Residency {
+    /// Head/column/intermediate-sharded: half on each GPU.
+    pub(super) split: u64,
+    /// Whole on each GPU: low-rank A projections, routers, latent projections,
+    /// norms and residual-mix vectors.
+    pub(super) replicated: u64,
+}
+
+/// Whether a coordinator tensor (`layers.N.` remainder) is whole on each GPU of a head split.
+pub(super) fn replicated(rest: &str) -> bool {
+    !rest.starts_with("self_attn.") && !rest.starts_with("block_sparse_moe.shared_experts.") && !rest.starts_with("mlp.")
+        || ["self_attn.f_a_proj.", "self_attn.o_norm.", "self_attn.q_a_proj.", "self_attn.q_a_layernorm.",
+            "self_attn.kv_a_proj_with_mqa.", "self_attn.kv_a_layernorm."].iter().any(|p| rest.starts_with(p))
 }
 
 /// Strip the text prefix: `language_model.model.layers.3.x` -> `layers.3.x`.
@@ -120,7 +139,8 @@ impl Model {
             }
         }
         let spec = spec(&cfg, checkpoint);
-        let mut model = Self { cfg, spec, tensors, bytes: BTreeMap::new(), complete: true, expert_formats: Vec::new() };
+        let mut model = Self { cfg, spec, tensors, bytes: BTreeMap::new(), complete: true, expert_formats: Vec::new(),
+            coordinator: Residency::default() };
         let mut headers = BTreeMap::new();
         for tensor in &checkpoint.tensors { headers.insert(tensor.meta.name.as_str(), &tensor.meta); }
         for (name, expected) in &model.tensors {
@@ -135,6 +155,13 @@ impl Model {
         for tensor in &checkpoint.tensors {
             if let Some(role) = KIMI_K3.classify(&model.spec, &tensor.meta.name) {
                 *model.bytes.entry(role.component).or_default() += tensor.meta.byte_length;
+                if let Some((_, rest)) = text(&tensor.meta.name).and_then(|r| indexed(r, "layers."))
+                    .filter(|_| role.component != Component::RoutedExpert) {
+                    let bucket = if replicated(rest) { &mut model.coordinator.replicated } else { &mut model.coordinator.split };
+                    *bucket += tensor.meta.byte_length;
+                } else if matches!(role.component, Component::Norm | Component::ResidualMix) {
+                    model.coordinator.replicated += tensor.meta.byte_length;
+                }
             }
         }
         let mut formats = std::collections::BTreeSet::new();

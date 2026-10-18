@@ -142,22 +142,42 @@ fn header_contract_refuses_other_shapes_and_dtypes() {
     }
 }
 
+fn device<'m>(memory: &'m cuteafd_core::memory_layout::MemoryLayout, kind: cuteafd_core::memory_layout::DeviceKind)
+    -> Vec<&'m cuteafd_core::memory_layout::DeviceLayout> { memory.devices.iter().filter(|d| d.kind == kind).collect() }
+
+fn category(d: &cuteafd_core::memory_layout::DeviceLayout, c: cuteafd_core::memory_layout::Category) -> u64 {
+    d.items.iter().filter(|i| i.category == c).map(|i| i.bytes).sum()
+}
+
 #[test]
-fn max_card_places_experts_at_the_family_budget_and_refuses_the_shared_default() {
+fn max_card_charges_spark_runtime_and_onboards_layers_as_the_fallback() {
+    use cuteafd_core::memory_layout::{Category, DeviceKind};
     let dir = snapshot(true);
+    let gib = |b: u64| b as f64 / super::GIB as f64;
+    // Default: no routed expert on RTX. Weights fit the 108 GiB family budget,
+    // but weights + runtime residual + latent I/O + EXL3 workspace do not fit
+    // the device: an honest refusal naming the shortfall.
     let report = plan::plan(dir.path(), &with_layout(6, None)).unwrap();
     let memory = report.memory_layout.as_ref().unwrap();
-    let sparks: Vec<_> = memory.devices.iter().filter(|d| d.kind == cuteafd_core::memory_layout::DeviceKind::Spark).collect();
+    let sparks = device(memory, DeviceKind::Spark);
     assert_eq!(sparks.len(), 6);
-    let per_rank = sparks[0].items.iter().map(|i| i.bytes).sum::<u64>();
-    // 107.54 GiB: 1/6 of trellis and 3072-wide rotations, whole 3584-wide rotations.
-    assert!((per_rank as f64 / super::GIB as f64 - 107.544).abs() < 0.01, "{per_rank}");
-    assert!(per_rank <= SPARK_BUDGET_BYTES);
-    assert!(!report.hints.iter().any(|h| h.what.contains("over the")), "{:#?}", report.hints);
-    // No routed expert is resident on the coordinators by default.
-    for rtx in memory.devices.iter().filter(|d| d.kind == cuteafd_core::memory_layout::DeviceKind::Rtx) {
-        assert!(rtx.items.iter().all(|i| i.category != cuteafd_core::memory_layout::Category::Experts));
+    assert!((gib(category(sparks[0], Category::Experts)) - 107.544).abs() < 0.01);
+    assert!(category(sparks[0], Category::Runtime) > 0 && category(sparks[0], Category::Transport) > 0);
+    assert!(!report.hints.iter().any(|h| h.what.contains("over the 108.00 GiB Spark budget")), "{:#?}", report.hints);
+    assert!(report.hints.iter().any(|h| h.what.starts_with("spark0 full memory layout needs")), "{:#?}", report.hints);
+    for rtx in device(memory, DeviceKind::Rtx) {
+        assert_eq!(category(rtx, Category::Experts), 0);
+        // Replicated text weights are charged whole on each GPU, not halved.
+        assert!(gib(category(rtx, Category::Weights) + category(rtx, Category::Embedding)) > 55.0);
     }
+    // Four onboarded layers (two per GPU, 6.92 GiB each) bring the Sparks under the device and keep >= 256K KV.
+    let mut options = with_layout(6, None);
+    options.layout.as_mut().unwrap().onboard = Some(crate::placement::Onboard::Layers(4));
+    let report = plan::plan(dir.path(), &options).unwrap();
+    let memory = report.memory_layout.as_ref().unwrap();
+    assert!(!report.hints.iter().any(|h| h.what.contains("full memory layout needs")), "{:#?}", report.hints);
+    for rtx in device(memory, DeviceKind::Rtx) { assert!((gib(category(rtx, Category::Experts)) - 13.848).abs() < 0.01); }
+    assert!((gib(category(device(memory, DeviceKind::Spark)[0], Category::Experts)) - 102.869).abs() < 0.01);
     assert!(memory.pool_tokens >= 262_144, "pool {}", memory.pool_tokens);
     // The shared 100 GiB budget refuses with the exact per-rank shortfall.
     let report = plan::plan(dir.path(), &with_layout(6, Some(100 << 30))).unwrap();

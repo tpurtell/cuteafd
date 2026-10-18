@@ -44,8 +44,9 @@ pub fn residual_mix(candidates: &[&[f32]], norm: &[f32], proj: &[f32], eps: f64)
 
 /// `KimiMoEGate`: FP32 logits, sigmoid scores, selection on `score + bias`,
 /// weights from the unbiased scores renormalized by `sum + 1e-20`, times
-/// `scale`. Ties in the biased score choose the lower expert id (torch.topk
-/// leaves tie order unspecified; kernels must use this rule).
+/// `scale`. Output is in descending biased-score order, ties to the lower id
+/// (the native selector's order); the official `torch.topk(sorted=False)`
+/// order is arbitrary, so comparisons against it use sets.
 pub fn route(logits: &[f32], bias: &[f32], topk: usize, scale: f32) -> Vec<(usize, f32)> {
     let scores: Vec<f32> = logits.iter().map(|x| 1.0 / (1.0 + (-x).exp())).collect();
     let mut order: Vec<usize> = (0..scores.len()).collect();
