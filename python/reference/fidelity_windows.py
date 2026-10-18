@@ -393,6 +393,15 @@ def verify_snapshot(manifest: dict, snapshot: Path) -> dict:
         for source in (arm, manifest.get("generation_arm", {})):
             if source.get("tokenizer_files") != tokenizer["tokenizer_files"]:
                 raise ValueError("snapshot native tokenizer source/resource hashes differ")
+    generation = manifest.get("generation_arm", {})
+    if generation.get("chat_template_kind") == "checkpoint_encoder":
+        encoder_file = generation.get("chat_encoder_file")
+        if encoder_file != "encoding/encoding.py":
+            raise ValueError("unsupported checkpoint chat encoder path")
+        encoder = snapshot / encoder_file
+        if (not encoder.is_file() or hashlib.sha256(encoder.read_bytes()).hexdigest()
+                != generation.get("chat_template_sha256")):
+            raise ValueError("snapshot checkpoint chat encoder differs")
     revision = arm.get("snapshot_revision")
     if revision is not None and snapshot.name != revision:
         raise ValueError("snapshot revision differs from the pinned reference identity")

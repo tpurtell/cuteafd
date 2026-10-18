@@ -106,6 +106,48 @@ def test_native_fixture_roundtrips_shipped_python_chat(native):
     assert renderer.identity["chat_template_kind"] == "checkpoint_python"
 
 
+def test_official_checkpoint_encoder_is_used_without_a_jinja_template(tmp_path):
+    pytest.importorskip("transformers")
+    from tokenizers import decoders, trainers
+    tokenizer = Tokenizer(models.BPE(unk_token="[UNK]"))
+    tokenizer.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
+    tokenizer.decoder = decoders.ByteLevel()
+    tokenizer.train_from_iterator(["system user assistant reason answer"],
+        trainers.BpeTrainer(vocab_size=300, initial_alphabet=pre_tokenizers.ByteLevel.alphabet(),
+                            special_tokens=["[UNK]"]))
+    tokenizer.save(str(tmp_path / "tokenizer.json"))
+    (tmp_path / "config.json").write_text('{"model_type":"deepseek_v41"}')
+    (tmp_path / "tokenizer_config.json").write_text('{"tokenizer_class":"PreTrainedTokenizerFast"}')
+    encoding = tmp_path / "encoding/encoding.py"
+    encoding.parent.mkdir()
+    encoding.write_text('''def encode_messages(messages, *, thinking_mode, reasoning_effort):
+    assert thinking_mode == "thinking" and reasoning_effort == "high"
+    assert messages[0]["tools"][0]["function"]["name"] == "read_file"
+    return "".join(m["role"] + ":" + (m.get("reasoning_content") or "") +
+                   (m.get("content") or "") + "|" for m in messages) + (
+                       "assistant:" if messages[-1]["role"] != "assistant" else "")
+''')
+    renderer = ChatRenderer(load_tokenizer(tmp_path, chat=True))
+    body = {"messages": [{"role": "system", "content": "system"}, {"role": "user", "content": "user"}],
+            "tools": [{"type": "function", "function": {"name": "read_file"}}]}
+    assistant = {"role": "assistant", "reasoning_content": "reason", "content": "answer"}
+    ids = renderer.prompt(body) + renderer.completion(body, assistant)
+    assert renderer.tokenizer.decode(ids, clean_up_tokenization_spaces=False) == renderer.render(body, assistant)
+    assert "tools" not in body["messages"][0]
+    assert renderer.identity == {"chat_template_kind": "checkpoint_encoder",
+        "chat_template_sha256": hashlib.sha256(encoding.read_bytes()).hexdigest(),
+        "chat_encoder_file": "encoding/encoding.py"}
+    panel = manifest(tmp_path)
+    panel["generation_arm"].update(renderer.identity)
+    verify_snapshot(panel, tmp_path)
+    encoding.write_text(encoding.read_text() + "\n")
+    with pytest.raises(ValueError, match="checkpoint chat encoder differs"):
+        verify_snapshot(panel, tmp_path)
+    encoding.unlink()
+    with pytest.raises(ValueError, match="official encoding/encoding.py"):
+        load_tokenizer(tmp_path, chat=True)
+
+
 def test_native_mapping_cannot_load_another_repository(native):
     path = native / "tokenizer_config.json"
     path.write_text(json.dumps({"auto_map": {"AutoTokenizer": ["other/repo--module.Tokenizer", None]}}))

@@ -37,7 +37,10 @@ class ChatRenderer:
     def __init__(self, tokenizer):
         self.tokenizer = tokenizer
         self.native = getattr(tokenizer, "_fidelity_identity", None)
-        if self.native:
+        self.encoder = getattr(tokenizer, "_fidelity_encode_messages", None)
+        if self.encoder:
+            self.identity = tokenizer._fidelity_chat_identity
+        elif self.native:
             self.identity = {**self.native, "chat_template_kind": "checkpoint_python",
                              "chat_template_sha256": self.native["tokenizer_sha256"]}
         else:
@@ -50,6 +53,14 @@ class ChatRenderer:
         messages = normalized_messages(body["messages"])
         if assistant is not None:
             messages += normalized_messages([assistant])
+        if self.encoder:
+            if body.get("tools"):
+                if not messages or messages[0]["role"] != "system":
+                    messages.insert(0, {"role": "system", "content": ""})
+                messages[0]["tools"] = copy.deepcopy(body["tools"])
+            mode = "chat" if body.get("thinking", {}).get("type") == "disabled" else "thinking"
+            return self.encoder(messages, thinking_mode=mode,
+                                reasoning_effort=body.get("reasoning_effort", "high"))
         return self.tokenizer.apply_chat_template(
             messages, tools=body.get("tools"), tokenize=False,
             add_generation_prompt=assistant is None)

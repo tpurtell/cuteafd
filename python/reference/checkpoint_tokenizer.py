@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import ast
 import hashlib
+import importlib.util
 import json
 from pathlib import Path
 import re
@@ -73,6 +74,23 @@ def load_tokenizer(path, *, chat=False):
         raise ValueError("tokenizer path differs from checkpoint tokenizer.json")
     if chat:
         from transformers import PreTrainedTokenizerFast
-        return PreTrainedTokenizerFast.from_pretrained(snapshot, local_files_only=True)
+        tokenizer = PreTrainedTokenizerFast.from_pretrained(snapshot, local_files_only=True)
+        config = json.loads((snapshot / "config.json").read_text())
+        if config.get("model_type") == "deepseek_v41":
+            encoder = snapshot / "encoding/encoding.py"
+            if not encoder.is_file():
+                raise ValueError("DeepSeek checkpoint requires its official encoding/encoding.py")
+            encoder_hash = _digest(encoder)
+            spec = importlib.util.spec_from_file_location("fidelity_checkpoint_encoding_" + encoder_hash, encoder)
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            if _digest(encoder) != encoder_hash:
+                raise ValueError("checkpoint chat encoder changed while loading")
+            tokenizer._fidelity_encode_messages = module.encode_messages
+            tokenizer._fidelity_chat_identity = {
+                "chat_template_kind": "checkpoint_encoder",
+                "chat_template_sha256": encoder_hash,
+                "chat_encoder_file": "encoding/encoding.py"}
+        return tokenizer
     from tokenizers import Tokenizer
     return Tokenizer.from_file(str(snapshot / "tokenizer.json"))
