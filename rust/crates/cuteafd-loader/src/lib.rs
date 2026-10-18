@@ -1,3 +1,4 @@
+pub mod kda;
 pub mod families;
 pub mod media;
 pub mod formats;
