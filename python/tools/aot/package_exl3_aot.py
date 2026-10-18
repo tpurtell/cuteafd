@@ -232,10 +232,15 @@ GEOMETRIES = {
     'glmf': (4096, 2048, 288, 8),
     # Qwen 3.8 Flash Next (qwen4_exp): 512 experts, softmax top-10, unclamped SiLU.
     'qwen4': (2560, 640, 512, 10),
+    'kimik3': (3584, 3072, 896, 16),
 }
 # SwiGLU clamp per geometry; None is the unclamped SwiGLU (b12x const-expr
 # elides the clamp). DeepSeek clamps at 10.
-SWIGLU_LIMITS = {'glm': None, 'qwen4': None}
+SWIGLU_LIMITS = {'glm': None, 'qwen4': None, 'kimik3': None}
+
+
+def activation(geometry: str) -> str:
+    return 'situ' if geometry == 'kimik3' else 'silu'
 
 
 def swiglu_limit(geometry: str) -> float | None:
@@ -500,6 +505,9 @@ def profiles_for_role(role: str, geometry: str = 'v41') -> list[tuple]:
     split exactly, each compiling one export per capacity shared by its ranks.
     Other geometries derive the same H128 split from their own intermediate.
     """
+    if geometry == 'kimik3':
+        return [profile for profile in shard_profiles(geometry, role)
+                if profile[0] == ('tp6-width512' if role == 'spark' else 'rtx-tp1')]
     if geometry != 'v41':
         return shard_profiles(geometry, role)
     if role == 'spark':
@@ -745,6 +753,8 @@ def build(args: argparse.Namespace) -> None:
                                args.build_dir / f"{profile}+tile{'-'.join(map(str, tile))}")
                 raw = profile_dir / f'm{capacity}'  # one capacity, one directory
                 options = {}
+                if activation(geometry) != 'silu':
+                    options['activation'] = activation(geometry)
                 if tile is not None:
                     options['tile'] = tile
                 if geometry != 'v41':

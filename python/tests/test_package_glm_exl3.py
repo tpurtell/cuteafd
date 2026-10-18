@@ -16,6 +16,21 @@ class GlmExl3PackageTest(unittest.TestCase):
         self.assertEqual(tool.swiglu_limit('dsv4p'), 10.0)
         self.assertEqual(tool.package_name('glm', [4, 5]), 'exl3-glm-k45')
 
+    def test_kimi_geometry_activation_and_profiles(self):
+        self.assertEqual(tool.GEOMETRIES["kimik3"], (3584, 3072, 896, 16))
+        self.assertEqual(tool.activation("kimik3"), "situ")
+        self.assertIsNone(tool.swiglu_limit("kimik3"))
+        self.assertEqual(tool.package_name("kimik3", [2, 3]), "exl3-kimik3-k23")
+        spark = {p[0]: p[1:] for p in tool.profiles_for_role("spark", "kimik3")}
+        self.assertEqual(set(spark), {"tp6-width512"})
+        self.assertEqual(spark["tp6-width512"],
+                         (512, 896, 16, "bf16", [f"tp6-rank{i}" for i in range(6)]))
+        coordinator = {p[0]: p[1:] for p in tool.profiles_for_role("coordinator", "kimik3")}
+        self.assertEqual(set(coordinator), {"rtx-tp1"})
+        self.assertEqual(coordinator["rtx-tp1"], (3072, 896, 16, "fp32", ["rtx-tp1"]))
+        for geometry in set(tool.GEOMETRIES) - {"kimik3"}:
+            self.assertEqual(tool.activation(geometry), "silu")
+
     def test_profiles(self):
         coordinator = {p[0]: p[1:] for p in tool.profiles_for_role('coordinator', 'glm')}
         self.assertEqual(coordinator['rtx-tp1'], (2048, 256, 8, 'fp32', ['rtx-tp1']))

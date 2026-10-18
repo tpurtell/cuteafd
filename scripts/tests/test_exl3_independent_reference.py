@@ -13,7 +13,7 @@ REF = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(REF)
 
 
-@pytest.mark.parametrize('bits', [3, 4])
+@pytest.mark.parametrize('bits', [2, 3, 4])
 def test_tail_biting_unpack_matches_scalar_bitstream(bits):
     symbols = np.random.default_rng(270 + bits).integers(0, 1 << bits, 256)
     words = []
@@ -39,7 +39,7 @@ def test_tail_biting_unpack_matches_scalar_bitstream(bits):
     np.testing.assert_array_equal(actual, expected)
 
 
-@pytest.mark.parametrize('bits', [3, 4])
+@pytest.mark.parametrize('bits', [2, 3, 4])
 def test_effective_weight_includes_both_normalized_rotations(bits):
     packed = np.zeros((8, 8, 16 * bits), dtype=np.uint16)
     suh, svh = np.linspace(0.5, 1.5, 128), np.linspace(0.25, 1.25, 128)
@@ -78,4 +78,14 @@ def test_comparison_rejects_numerical_bug_not_just_bad_cosine():
     with pytest.raises(ValueError, match='nonfinite'):
         REF.comparison(values * np.nan, values)
     with pytest.raises(ValueError, match='K3/K4'):
-        REF.decode_inner(np.zeros((8, 8, 32), dtype=np.uint16))
+        REF.decode_inner(np.zeros((8, 8, 16), dtype=np.uint16))
+
+
+def test_situ_reference_matches_trained_unclamped_formula(monkeypatch):
+    monkeypatch.setattr(REF, 'dequantize', lambda *args: np.eye(128))
+    tensors = {(p, s): None for p in ('w1', 'w3', 'w2') for s in ('trellis', 'suh', 'svh')}
+    x = np.linspace(-30, 30, 128)[None, :]
+    expected = 4 * np.tanh(x / 4) / (1 + np.exp(-x)) * 25 * np.tanh(x / 25)
+    np.testing.assert_allclose(REF.expert_output(tensors, x, None, activation='situ'), expected)
+    with pytest.raises(ValueError, match='unclamped'):
+        REF.expert_output(tensors, x, activation='situ')

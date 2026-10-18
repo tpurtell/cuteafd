@@ -118,7 +118,7 @@ def export(output: Path, intermediate: int, experts: int, capacity: int,
            fused_input_rotation: bool = False, warp_specialized: bool = False,
            wire_input: bool = False, ws_input_stages: int | None = None,
            ws_dynamic_tiles: bool = False, decode_schedule: str | None = None,
-           compile_only: bool = False) -> dict:
+           compile_only: bool = False, activation: str = "silu") -> dict:
     # The (fc1_tile_k, fc1_tile_n, fc2_tile_k, fc2_tile_n) tuple is b12x's own
     # geometry vocabulary: _projection_mixed_tile_config()/the compile path reject a
     # thread-count mismatch or a tile that does not fit the problem, so the pinned
@@ -126,6 +126,10 @@ def export(output: Path, intermediate: int, experts: int, capacity: int,
     # Packed routes are grouped into M blocks of route_block rows per expert; each
     # block decodes its expert's Trellis tiles once, so larger blocks amortize the
     # decode over more rows once many rows share an expert (large prefill).
+    if activation not in ("silu", "situ"):
+        raise ValueError("EXL3 activation must be silu or situ")
+    if activation == "situ" and swiglu_limit is not None:
+        raise ValueError("Situ does not use a SwiGLU clamp")
     if route_block not in (8, 16, 32, 64):
         raise ValueError("EXL3 route block must be 8, 16, 32 or 64 rows")
     # Token-major input rotation reads each token's input block once for all of
@@ -185,7 +189,7 @@ def export(output: Path, intermediate: int, experts: int, capacity: int,
     # swiglu_limit None is b12x's unclamped SwiGLU (GLM); DeepSeek clamps at 10.
     if swiglu_limit is not None and not swiglu_limit > 0:
         raise ValueError("SwiGLU limit must be positive or None (no clamp)")
-    if not 1 <= capacity <= 4096 or not 1 <= topk <= 16 or experts < topk or experts > 512:
+    if not 1 <= capacity <= 4096 or not 1 <= topk <= 16 or experts < topk or experts > 1024:
         raise ValueError("invalid EXL3 capacity, top-k or expert count")
     # Whole H128 rotation blocks on both projection axes.
     if hidden < 128 or hidden % 128 or intermediate < 128 or intermediate % 128:
@@ -214,6 +218,8 @@ def export(output: Path, intermediate: int, experts: int, capacity: int,
         tier0_bits=bits[0], tier1_bits=bits[1], trellis_codebook="mcg", swiglu_limit=swiglu_limit,
         moe_block_size=block_m, rotation_input_dtype="bf16", full_rotation_output_dtype=output_dtype,
         route_ids_dtype=torch.int32)
+    if activation != "silu":
+        options["activation"] = activation
     if len(bits) == 2:
         rotation = {"token_major_rotation": True} if token_major_rotation and not direct else {}
         if fused_input_rotation and not direct:
@@ -288,6 +294,10 @@ def export(output: Path, intermediate: int, experts: int, capacity: int,
         "trellis_lut": {"file": "trellis_lut.bin", "bytes": len(lut_bytes),
             "sha256": hashlib.sha256(lut_bytes).hexdigest()},
         "native_execution_verified": False}
+    if activation != "silu":
+        manifest["activation"] = activation
+    if experts > 512:
+        manifest["descriptor_bits"] = 10
     if block_m != 8:
         # Recorded only when it differs, so 8-row manifests stay byte-identical.
         manifest["route_block"] = block_m
@@ -333,6 +343,7 @@ def main() -> None:
     parser.add_argument("--topk", type=int, choices=range(1, 17), metavar="1..16", default=6)
     parser.add_argument("--swiglu-limit", default="10",
                         help="SwiGLU clamp limit, or none for an unclamped SwiGLU (GLM)")
+    parser.add_argument("--activation", choices=("silu", "situ"), default="silu")
     parser.add_argument("--output-dtype", choices=("bf16", "fp32"), default="bf16")
     parser.add_argument("--blocks-per-sm", type=int, choices=(1, 2), help="Offline residency override; default uses B12x policy")
     parser.add_argument("--route-block", type=int, choices=(8, 16, 32, 64), default=8,
@@ -363,6 +374,7 @@ def main() -> None:
            warp_specialized=args.warp_specialized, wire_input=args.wire_input,
            ws_input_stages=args.ws_input_stages, ws_dynamic_tiles=args.ws_dynamic_tiles,
            swiglu_limit=None if args.swiglu_limit.lower() == "none" else float(args.swiglu_limit),
+           activation=args.activation,
            decode_schedule=args.decode_schedule)
 
 
