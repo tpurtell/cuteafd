@@ -8,7 +8,9 @@ use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
-const MAX_JSON_BYTES: u64 = 64 * 1024 * 1024;
+/// Bounds a metadata read, not tensor data. Kimi K3 EXL3 K2's index names
+/// 991,812 tensors (~100 MiB) and its GPTQModel storage map is ~141 MiB.
+const MAX_JSON_BYTES: u64 = 512 * 1024 * 1024;
 
 /// Arithmetic declared by the checkpoint, independent of optional load optimizations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
