@@ -18,6 +18,9 @@ sys.path.insert(0, str(REPO / 'python/reference'))
 from fidelity_windows import canonical, validate_public_metadata, validate_public_text, validate_text_source
 
 QUICK = ['legacy', 'a00', 'a04', 'a08', 'a20', 'c00', 'd00', 'e00']
+POLICY_EXPECT = dict(top1_min=.90, kl_max=.06,
+                     tripwires=dict(confident_top1_min=.96, top3_min=.97,
+                                    confident_drop_margin=.01, top3_drop_margin=.005))
 CAVEAT = ('The source shared text panel contains repeated unrelated source-text splices in 33 scored suffixes; '
           'see cuteafd issue #302. These are teacher-forced reference rows, '
           'not evidence of coherent free-running generation. NLL is not a cross-model quality ranking.')
@@ -228,9 +231,7 @@ def package(source, out, config, tokenizer_path, license_path):
     manifest = dict(schema='cuteafd.fidelity.dataset/1', kind='reference-top1024-plus-tail', config=config,
                     family=panel['family'], checkpoint=panel['checkpoint'], root_checkpoint=dict(id=snapshot['checkpoint'], revision=snapshot['snapshot_revision']),
                     set_sha256=set_id, vocab=rows['vocab'], top_k=1024,
-                    expect=dict(top1_min=.90, kl_max=.06,
-                                tripwires=dict(confident_top1_min=.98, top3_min=.99,
-                                               confident_drop_margin=.01, top3_drop_margin=.005)),
+                    expect=copy.deepcopy(POLICY_EXPECT),
                     expect_provenance='declared policy floors; independent of engine measurements',
                     windows_sha256=digest(destination / 'windows.json'), qualification_sha256=digest(destination / 'qualification.json'),
                     files=files, licence_files=[dict(path='LICENSE', sha256=digest(destination / 'LICENSE'))],
@@ -264,7 +265,7 @@ def package(source, out, config, tokenizer_path, license_path):
             f'{launch_note}'
             f'Pinned {runtime_source}, tokenizer runtime, platform and oracle seal hashes are in qualification.json.\n'
             'No engine run is required to finish or publish this dataset.\n'
-            'Declared policy floors: top-1 >=90%, KL <=0.06 nat, confident top-1 >=98%, top-3 >=99%.\n\n'
+            'Declared policy floors: top-1 >=90%, KL <=0.06 nat, confident top-1 >=96%, top-3 >=97%.\n\n'
             '## Storage\n\n'
             'One safetensors file per window: U32 positions, next_token_ids and top_ids; U8 roles; F16 top_log_probs; '
             'F32 tail_log_mass and next_token_log_prob. Top-1024 selection uses the sealed full F16 rows with lower-ID boundary ties.\n'

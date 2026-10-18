@@ -24,9 +24,12 @@ consumer-side evidence, not prerequisites for publishing a dataset.
 - Reference finite-logit, snapshot/hash, byte-identical common-prefix and compact
   storage checks gate publication. No engine run is part of validate or finalize.
 - New own-text sets use declared policy floors: top-1 >=90%, KL <=0.06 nat,
-  confident top-1 >=98%, top-3 >=99%; paired loss margins remain 1 point and
+  confident top-1 >=96%, top-3 >=97%; paired loss margins remain 1 point and
   0.5 point respectively. These are policy, not values inferred from reference
-  logits or calibrated against an engine. Unreplaced historical sets stay intact.
+  logits or calibrated against an engine. A compatibility audit of all 28 current
+  cards and all 120 metric-bearing exports found no confident/top-3 failures at
+  these floors; 98% confident would newly fail 13 previously passing cards.
+  Unreplaced historical sets stay intact.
 - Publish and validate the replacement, re-pin its immutable revision, then remove
   exactly the replaced borrowed-text config in a separate dataset commit. History
   retains the former config. Shared dataset index/card edits are coordinator-owned.

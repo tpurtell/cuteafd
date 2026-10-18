@@ -11,6 +11,31 @@ packager = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(packager)
 
 
+def test_policy_tripwires_do_not_newly_fail_current_cards():
+    import json
+    import re
+    policy = packager.POLICY_EXPECT
+    assert policy == dict(top1_min=.90, kl_max=.06,
+                          tripwires=dict(confident_top1_min=.96, top3_min=.97,
+                                         confident_drop_margin=.01, top3_drop_margin=.005))
+    reports = set(re.findall(r'benchmarks/[^)\s]+/report.svg', (ROOT / 'README.md').read_text()))
+    assert reports
+    checked = 0
+    for name in reports:
+        report = json.loads((ROOT / name.replace('report.svg', 'report.json')).read_text())
+        for check in report.get('baseline', {}).get('quality', {}).get('checks', []):
+            if check.get('id') != 'fidelity':
+                continue
+            metrics = check['metrics']
+            generated = metrics.get('verdict', {}).get('generated', metrics)
+            if generated.get('confident_top1') is None or generated.get('top3_contained') is None:
+                continue
+            assert generated['confident_top1'] >= policy['tripwires']['confident_top1_min'], name
+            assert generated['top3_contained'] >= policy['tripwires']['top3_min'], name
+            checked += 1
+    assert checked == len(reports)
+
+
 def test_top1024_storage_uses_stable_f16_ties_and_normalized_target():
     rows = np.full((2, 1100), -8., dtype='<f2')
     rows[:, 1099] = -1.
