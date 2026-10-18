@@ -12,11 +12,18 @@ pub(crate) struct Plane {
     pub(crate) width: usize,
 }
 
+/// The exported KDA programs (fork #29, exporter geometry `kimik3`, 48 heads
+/// per TP2 rank): `kda_m{rows}` writes the head-local `o_norm(o, g)` output;
+/// `o_proj` is not part of the program (`w_o` stays in the packed operand set
+/// for the binding).
+pub(crate) const KDA_PROGRAMS: [&str; 3] = ["kimik3_kda_m64", "kimik3_kda_m4096", "kimik3_kda_commit"];
+
 /// Which export each op waits on.
 pub(crate) const PENDING: &[(&str, &str)] = &[
     ("residual_mix", "W8 shared residual mixer"),
     ("norm", "W8/W9 RMSNorm at hidden 7168 (fused with the residual mix)"),
-    ("kda", "W6 KDA programs at hidden 7168, 48 heads per GPU, full-rank gate"),
+    ("kda", "W6 exports kimik3_kda_m64 (decode/verify, replay), kimik3_kda_m4096 (prefill) and kimik3_kda_commit; \
+        their output is the head-local gated norm, then o_proj by columns and the TP2 partial-sum meet (W9 binding)"),
     ("mla", "W7 full-causal NoPE MLA (dense_mla AOT) with sigmoid output gate"),
     ("dense_ffn", "W8 Situ dense FFN"),
     ("route", "W5 sigmoid router E896/K16, scale 1.0"),
