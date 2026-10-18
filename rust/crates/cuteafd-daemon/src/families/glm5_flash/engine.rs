@@ -5630,7 +5630,7 @@ mod prefill_lane_tests {
             ("integration/cuteafd/dsv4_mhc.py", 0x978a_179d_ef8c_2101),
             // Dense Qwen geometry only: glmf/glmf2 retain all 88 objects and 90 headers
             // byte-identically against 515a0b94 at both 188 and 170 SMs (2b792f04 export gate).
-            // Fork #29 adds the Kimi KDA geometry only (same export gate).
+            // Fork #29 exports KDAGeometry only; GLMFGeometry and projection routes are unchanged.
             ("integration/cuteafd/_common.py", 0xa13f_44c0_514d_ab99),
             // 34698ec2's RowTiledBf16Projection is opt-in; skinny_config,
             // skinny_max_rows and the default GLM RoutedBf16Projection paths are unchanged.
