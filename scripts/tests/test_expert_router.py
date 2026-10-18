@@ -1,7 +1,7 @@
 """CPU contracts for the ungrouped Kimi gate and native wide dispatch."""
+import hashlib
 import importlib.util
 from pathlib import Path
-import subprocess
 
 import numpy as np
 
@@ -33,21 +33,12 @@ def test_kimi_gate_zero_scores_and_low_id_ties():
 
 
 def test_existing_kernel_definitions_are_unchanged():
-    # The branch base is deliberately pinned, not the moving family branch.
-    baseline = subprocess.check_output(
-        ["git", "-C", str(ROOT), "show", "f53efea7:native/shared/cuda/expert_router.cu"], text=True)
-    current = (ROOT / "native/shared/cuda/expert_router.cu").read_text()
-    for start, end in (("__global__ void score_kernel", "// Decode-sized batches:"),
-                       ("constexpr int kScoreRowsMax", "// Top-k with warp-shuffle"),
-                       ("template<bool TransformLogits = false,bool Sigmoid = false>", "// DeepSeek V4 hash layers:"),
-                       ("__global__ void select_hash_kernel", "template<bool TransformLogits = false>"),
-                       ("template<bool TransformLogits = false>", "// Qwen-style softmax routing:"),
-                       ("constexpr int kSoftmaxTopkMax", "bool span(")):
-        old = baseline[baseline.index(start):baseline.index(end)]
-        new = current[current.index(start):current.index(end)]
-        if end == "bool span(":
-            new = new.split("// Wide sigmoid/sqrtsoftplus routing")[0]
-        assert old == new
+    # Pin the original kernel bodies without depending on Git history in a source archive.
+    source = (ROOT / "native/shared/cuda/expert_router.cu").read_text()
+    existing = source[source.index("__global__ void score_kernel"):
+                      source.index("// Wide sigmoid/sqrtsoftplus routing")]
+    assert hashlib.sha256(existing.encode()).hexdigest() == (
+        "bcc1c81b94e131be8b640c248d1e31fb5dda48869ca7a9fc7d343994efb9b4f1")
 
 
 def test_native_wide_dispatch_and_reducer_width():
