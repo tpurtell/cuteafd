@@ -84,8 +84,39 @@ mod tests {
             scratch: HashMap::from([("fc1".into(), 805306368),
                 ("intermediate".into(),33554432),("fc2".into(),201326592)]) }
     }
+    fn entry() -> serde_json::Value {
+        let shapes = ["[rows,6144]", "[E,16,3,3]", "[E,16,3]", "[512]", "[512,16]",
+            "[rows,8]", "[rows,8]", "[512,16,2,6,16,128]", "[512,16,16,128]",
+            "[512,16,6144]", "[rows,6144]"];
+        let dtypes = ["float16", "int64", "int32", "int32", "int32", "int32",
+            "float32", "float32", "float16", "float32", "float32"];
+        let pointers: Vec<_> = shapes.iter().enumerate().map(|(i, shape)| serde_json::json!({
+            "shape": shape, "dtype": dtypes[i],
+            "role": if (7..=9).contains(&i) { "scratch" } else if i == 10 { "out" } else { "in" }
+        })).collect();
+        serde_json::json!({"capacity_rows":64,"pointers":pointers,
+            "scratch_bytes_at_capacity": {"fc1":805306368,"intermediate":33554432,"fc2":201326592}})
+    }
     #[test]
-    fn accepts_v1() { validate(&spec()).unwrap(); }
+    fn accepts_v1() { validate(&spec()).unwrap(); validate_entry(&spec(), &entry()).unwrap(); }
+    #[test]
+    fn rejects_malformed_entry() {
+        let mutations = [
+            ("/capacity_rows", serde_json::json!(4294967360u64)),
+            ("/pointers/0/dtype", serde_json::json!("bfloat16")),
+            ("/pointers/1/shape", serde_json::json!("[E,16,3,2]")),
+            ("/pointers/7/role", serde_json::json!("out")),
+            ("/scratch_bytes_at_capacity/fc1", serde_json::json!("805306368")),
+        ];
+        for (path, value) in mutations {
+            let mut e = entry(); *e.pointer_mut(path).unwrap() = value;
+            assert!(validate_entry(&spec(), &e).is_err(), "{path}");
+        }
+        let mut e = entry(); e["card_plans"] = serde_json::json!([]);
+        assert!(validate_entry(&spec(), &e).is_err());
+        let mut e = entry(); e["scratch_bytes_at_capacity"]["extra"] = serde_json::json!(0);
+        assert!(validate_entry(&spec(), &e).is_err());
+    }
     #[test]
     fn rejects_stale_geometry() {
         for key in ["abi_version", "hidden", "units", "top_k", "max_groups", "max_rows",
