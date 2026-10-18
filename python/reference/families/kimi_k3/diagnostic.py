@@ -139,6 +139,40 @@ def first_difference(rows, field):
                  or item.get("structure_mismatch")), None)
 
 
+def linear_variants(trace, *, device):
+    """Locate GEMV/GEMM rounding changes on identical native expert inputs."""
+    import torch
+    from shape_invariant import _linear
+    strategies = {"native_M1": (1, False), "native_M32": (32, False), "F32_M128_native_output": (128, True)}
+    summaries = {name: {"compared": 0, "over_1e-5": 0, "max_relative_l2": 0., "first_difference": None}
+                 for name in strategies}
+    for key, call in trace.calls.items():
+        if ".experts." not in key or not isinstance(call["function"], torch.nn.Linear):
+            continue
+        x = call["args"][0].to(device)
+        module = call["function"]
+        for name, (width, widen) in strategies.items():
+            dtype = x.dtype
+            weight = module.weight.float() if widen else module.weight
+            values = x.float() if widen else x
+            result = []
+            for start in range(0, len(values), width):
+                part = values[start:start + width]
+                padded = part.new_zeros((width, part.shape[-1]))
+                padded[:len(part)].copy_(part)
+                result.append(_linear(padded, weight, module.bias)[:len(part)])
+            output = torch.cat(result).to(dtype).cpu()
+            metric = differences(call["output"], output)[0]
+            summary = summaries[name]
+            summary["compared"] += 1
+            summary["max_relative_l2"] = max(summary["max_relative_l2"], metric["relative_l2"])
+            if metric["relative_l2"] > 1e-5:
+                summary["over_1e-5"] += 1
+                if summary["first_difference"] is None:
+                    summary["first_difference"] = {"op": key, **metric}
+    return summaries
+
+
 def diagnose(a, *, native_layer, atomic_json, digest, state_type, official_mask):
     import numpy as np
     import torch
@@ -252,6 +286,9 @@ def diagnose(a, *, native_layer, atomic_json, digest, state_type, official_mask)
                   "first_propagated_difference": first_difference(rows, "propagated"),
                   "first_controlled_difference": first_difference(rows, "controlled_input"),
                   "subops": rows}
+        if a.diagnose_linear_variants:
+            report["linear_variants"] = linear_variants(traces[0], device="cuda")
+            print(json.dumps({"linear_variants": report["linear_variants"]}, sort_keys=True), flush=True)
         atomic_json(a.out / "layer-diagnostic.json", report)
         print(json.dumps({key: report[key] for key in ("first_propagated_difference", "first_controlled_difference", "router")}, sort_keys=True), flush=True)
         del layer, traces

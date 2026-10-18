@@ -128,6 +128,78 @@ def test_diagnostic_hooks_distinguish_local_error_from_propagation(monkeypatch):
     assert all(not module._forward_hooks and not module._forward_pre_hooks for module in layer.modules())
 
 
+def test_diagnostic_function_boundaries_restore_originals(monkeypatch):
+    torch = pytest.importorskip("torch")
+    import torch.nn.functional as F
+    from families.kimi_k3.diagnostic import Trace
+    for name in ("fla", "fla.ops", "fla.ops.kda", "fla.ops.kda.gate"):
+        monkeypatch.setitem(sys.modules, name, types.ModuleType(name))
+    def lower_gate(g, A_log, dt_bias, lower_bound):
+        return lower_bound * (A_log.exp() * (g + dt_bias)).sigmoid()
+    sys.modules["fla.ops.kda.gate"].naive_kda_lowerbound_gate = lower_gate
+    def chunk(**kwargs):
+        return kwargs["q"] + kwargs["v"], None
+    reference = types.SimpleNamespace(chunk_kda=chunk, fused_recurrent_kda=chunk)
+    class Attention(torch.nn.Module):
+        def forward(self, value):
+            return reference.chunk_kda(q=value, k=value, v=value, g=value,
+                                      beta=value, A_log=torch.zeros_like(value),
+                                      dt_bias=torch.zeros_like(value), lower_bound=-5.,
+                                      safe_gate=True, use_gate_in_kernel=True,
+                                      use_beta_sigmoid_in_kernel=True)[0]
+    class Gate(torch.nn.Module):
+        def forward(self, value):
+            logits = F.linear(value.float(), torch.eye(2))
+            return logits.topk(1).indices, logits
+    class MoE(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.gate = Gate()
+        def moe_infer(self, value, indices, weights):
+            return value * weights
+        def forward(self, value):
+            indices, weights = self.gate(value)
+            return self.moe_infer(value, indices, weights)
+    class Layer(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.self_attn, self.block_sparse_moe = Attention(), MoE()
+        def forward(self, value):
+            return self.block_sparse_moe(self.self_attn(value))
+    layer, trace, original_linear = Layer(), Trace(), F.linear
+    with trace.modules(layer), trace.functions(reference, layer):
+        layer(torch.ones(2, 2))
+    assert "block_sparse_moe.gate.router_logits#0" in trace.calls
+    assert "block_sparse_moe.combine#0" in trace.calls
+    assert "self_attn.effective_gate#0" in trace.calls
+    assert "self_attn.beta_sigmoid#0" in trace.calls
+    assert trace.calls["self_attn.chunk_kda#0"]["kwargs"]["safe_gate"] is True
+    assert reference.chunk_kda is chunk and reference.fused_recurrent_kda is chunk
+    assert F.linear is original_linear
+    assert "moe_infer" not in layer.block_sparse_moe.__dict__
+
+
+def test_diagnostic_linear_variants_preserve_native_output_geometry():
+    torch = pytest.importorskip("torch")
+    from families.kimi_k3.diagnostic import Trace, linear_variants
+    class Layer(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.block_sparse_moe = torch.nn.Module()
+            self.block_sparse_moe.experts = torch.nn.ModuleList([torch.nn.Linear(2, 2, bias=False)])
+        def forward(self, value):
+            return self.block_sparse_moe.experts[0](value)
+    layer = Layer()
+    with torch.no_grad():
+        layer.block_sparse_moe.experts[0].weight.fill_(1.)
+        trace = Trace()
+        with trace.modules(layer):
+            layer(torch.ones(3, 2))
+        reports = linear_variants(trace, device="cpu")
+    assert set(reports) == {"native_M1", "native_M32", "F32_M128_native_output"}
+    assert all(report["compared"] == 1 and report["over_1e-5"] == 0 for report in reports.values())
+
+
 def test_diagnostic_hooks_are_removed_after_failure():
     torch = pytest.importorskip("torch")
     from families.kimi_k3.diagnostic import Trace
