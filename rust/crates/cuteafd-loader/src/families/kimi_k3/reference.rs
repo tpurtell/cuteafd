@@ -14,6 +14,10 @@ pub fn bf16(value: f32) -> f32 {
 /// The release's zero-padded `A_log` narrowing lives with the shared KDA packer.
 pub use crate::kda::narrow_a_log;
 
+/// MLA rank norms omit `eps` in the official constructor. All other Kimi
+/// norms explicitly use `config.rms_norm_eps` instead.
+pub const MLA_RANK_NORM_EPS: f64 = 1e-6;
+
 /// `KimiRMSNorm`: normalize in FP32, round to BF16, then multiply by the BF16
 /// weight in BF16 (the product is rounded again).
 pub fn rms_norm(x: &[f32], weight: &[f32], eps: f64) -> Vec<f32> {

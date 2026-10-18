@@ -61,6 +61,14 @@ def jobs(scope):
         for label, names in (("decode", "kda_m64"), ("prefill", "kda_m4096"), ("commit", "kda_commit")):
             result.append((f"kda-{geometry}-{label}", "export_b12x_dsv4_aot.py",
                            ["--geometry", geometry, "--only", names]))
+    for heads in (48, 96):
+        suffix = "" if heads == 48 else "_h96"
+        names = [f"{op}{suffix}_m{rows}" for rows in (64, 4096)
+                 for op in ("mla_producer", "mla_output")]
+        names += [f"dense_mla_{mode}{suffix}_m{rows}"
+                  for mode, rows in (("decode", 64), ("verify", 64), ("extend", 4096))]
+        result.append((f"kimi-mla-h{heads}", "export_b12x_dsv4_aot.py",
+                       ["--geometry", "kimik3", "--only", ",".join(names)]))
     if scope == "suspects":
         return result
     result.extend((geometry, "export_b12x_dsv4_aot.py", ["--geometry", geometry])

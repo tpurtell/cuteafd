@@ -473,8 +473,8 @@ def glmf_head_split_programs(g, decode_rows: int, prefill_rows: int, max_context
 
 
 def kimi_kda_programs(g, decode_rows: int, prefill_rows: int, max_context: int):
-    """Kimi's native BF16 KDA; norm output is head-local for TP2 exchange."""
-    from b12x.integration.cuteafd import glmf
+    """Kimi KDA plus NoPE MLA at 48 heads/rank and 96 heads/context rank."""
+    from b12x.integration.cuteafd import glmf, kimi_mla
 
     out = [("kda_commit", "kda_commit", {}, lambda: glmf.compile_glmf_kda_commit_aot(g))]
     for rows in sorted({decode_rows, prefill_rows}):
@@ -482,6 +482,19 @@ def kimi_kda_programs(g, decode_rows: int, prefill_rows: int, max_context: int):
         params = {"max_rows": rows, "output_kind": "norm", "decode": decode}
         out.append((f"kda_m{rows}", "kda", params,
                     lambda kw=params: glmf.compile_glmf_kda_aot(g, **kw)))
+    for heads in (48, 96):
+        mla = kimi_mla.KimiMlaGeometry(heads=heads)
+        suffix = "" if heads == 48 else "_h96"
+        for rows in sorted({decode_rows, prefill_rows}):
+            for op, fn in (("mla_producer", kimi_mla.compile_kimi_mla_producer_aot),
+                           ("mla_output", kimi_mla.compile_kimi_mla_output_aot)):
+                out.append((f"{op}{suffix}_m{rows}", op, {"max_rows": rows, "heads": heads},
+                            lambda r=rows, g=mla, fn=fn: fn(g, max_rows=r)))
+        for mode, rows in (("decode", decode_rows), ("verify", decode_rows), ("extend", prefill_rows)):
+            out.append((f"dense_mla_{mode}{suffix}_m{rows}", "dense_mla",
+                        {"mode": mode, "max_rows": rows, "heads": heads},
+                        lambda m=mode, r=rows, g=mla: kimi_mla.compile_kimi_dense_mla_aot(
+                            g, max_rows=r, max_context=max_context, mode=m)))
     return out
 
 

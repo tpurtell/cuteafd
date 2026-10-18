@@ -108,7 +108,7 @@ impl Ops for Reference<'_> {
     fn mla(&mut self, layer: usize, x: &Rows) -> Result<Rows> {
         let cfg = &self.cfg;
         let (heads, nope, rope, v_dim) = (cfg.heads, cfg.qk_nope_dim, cfg.qk_rope_dim, cfg.v_head_dim);
-        let eps = cfg.rms_norm_eps;
+        let eps = contract::MLA_RANK_NORM_EPS;
         let mla = self.layers[layer].mla.clone().context("MLA weights")?;
         let scale = ((nope + rope) as f64).powf(-0.5);
         let mut out = Vec::with_capacity(x.len());
@@ -266,6 +266,18 @@ mod tests {
             for (s, v) in s.iter_mut().zip(row) { *s = contract::bf16(0.5 * *s + v); }
             s.clone()
         }).collect()))
+    }
+
+    #[test]
+    fn mla_rank_norms_do_not_inherit_decoder_epsilon() {
+        let (mut cfg, layers, norm, mix, mut rows) = model(19);
+        for value in rows.iter_mut().flatten() { *value = contract::bf16(*value * 0.001); }
+        let mut base = Reference::new(cfg.clone(), layers.clone(), norm.clone(), mix.clone(), running_sum());
+        let expected = base.mla(1, &rows).unwrap();
+        cfg.rms_norm_eps = 0.1;
+        let mut changed = Reference::new(cfg, layers, norm, mix, running_sum());
+        assert_eq!(expected, changed.mla(1, &rows).unwrap());
+        assert_ne!(base.norm(Some(1), true, &rows).unwrap(), changed.norm(Some(1), true, &rows).unwrap());
     }
 
     #[test]
