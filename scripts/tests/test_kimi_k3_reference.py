@@ -227,8 +227,13 @@ def test_noise_metrics_are_diagnostic_not_a_gate():
         logit_metrics(native, np.full_like(native, np.nan))
 
 
-def test_official_noise_streams_native_b2_and_resumes(tmp_path, monkeypatch):
+def test_official_noise_streams_native_b2_and_resumes(tmp_path, monkeypatch, request):
     torch = pytest.importorskip("torch")
+    original_dtype = torch.get_default_dtype()
+    request.addfinalizer(lambda: torch.set_default_dtype(original_dtype))
+    for backend, name in ((torch.backends.cuda.matmul, "allow_tf32"), (torch.backends.cudnn, "allow_tf32"),
+                          (torch.backends.cuda.matmul, "allow_bf16_reduced_precision_reduction")):
+        monkeypatch.setattr(backend, name, getattr(backend, name))
     from families.kimi_k3.diagnostic import diagnose_official_noise
     for name in ("fla", "transformers", "compressed_tensors"):
         module = types.ModuleType(name)
