@@ -1,4 +1,4 @@
-//! EXLR8 v2 inventory and weight-only fit, from FORMAT.md, never a serving claim.
+//! EXLR8 v2 inventory, weight-only fit and narrow native WIP admission.
 //! Unit payloads are range-readable; a selected projection's block scales are
 //! charged once per expert/width/rank, not once per owned unit.
 use anyhow::{bail, ensure, Context, Result};
@@ -32,9 +32,24 @@ pub struct SparkRequirements {
 
 /// Metadata-only execution arena; allocation uses the same checked layout helper.
 pub fn shared_workspace(manifest: &Value) -> Result<u64> {
-    let spec = manifest["programs"].as_array().context("PROGRAMS.json programs must be an array")?
-        .iter().find(|p| p["name"] == "exlr8_shared_a16_serving")
-        .context("PROGRAMS.json lacks exlr8_shared_a16_serving")?;
+    let programs = manifest["programs"].as_array().context("PROGRAMS.json programs must be an array")?;
+    let entry = |name: &str| -> Result<&Value> {
+        let matches = programs.iter().filter(|p| p["name"] == name).collect::<Vec<_>>();
+        ensure!(matches.len() == 1, "PROGRAMS.json requires one {name}");
+        Ok(matches[0])
+    };
+    let group = entry("exlr8_shared_group")?;
+    ensure!(group["geometry"]["abi_version"] == 1 && group["capacity_rows"] == 64
+        && group["geometry"]["experts"] == 1 && group["geometry"]["top_k"] == 1
+        && group["geometry"]["max_groups"] == 4, "EXLR8 shared grouping geometry differs");
+    for name in ["exlr8_rotate", "exlr8_reduce"] {
+        let program = entry(name)?;
+        ensure!(program["geometry"]["abi_version"] == 1 && program["geometry"]["hidden"] == 6144
+            && program["capacity_rows"].as_u64().is_some_and(|n| n >= 64)
+            && (name != "exlr8_reduce" || program["geometry"]["max_ranks"].as_u64().is_some_and(|n| n >= 4)),
+            "EXLR8 transform {name} cannot execute native TP4 rows");
+    }
+    let spec = entry("exlr8_shared_a16_serving")?;
     ensure!(spec["geometry"]["abi_version"] == 2 && spec["capacity_rows"].as_u64() == Some(64),
         "EXLR8 shared workspace requires ABI v2 and 64-row capacity");
     let n = |group: &str, key: &str| -> Result<usize> {
@@ -44,9 +59,12 @@ pub fn shared_workspace(manifest: &Value) -> Result<u64> {
     ensure!(n("geometry", "hidden")? == 6144 && n("geometry", "top_k")? == 1
         && n("geometry", "units")? == 16 && n("geometry", "max_groups")? == 4,
         "EXLR8 shared geometry must be hidden6144/top1/units16/groups4");
+    let scratch = [n("scratch_bytes_at_capacity", "fc1")?,
+        n("scratch_bytes_at_capacity", "intermediate")?, n("scratch_bytes_at_capacity", "fc2")?];
+    ensure!(scratch == [6_291_456, 262_144, 1_572_864],
+        "EXLR8 shared scratch capacities differ from the native ABI");
     Ok(residency::execution_workspace_layout(64, n("geometry", "hidden")?, n("geometry", "top_k")?,
-        n("geometry", "max_groups")?, n("scratch_bytes_at_capacity", "fc1")?,
-        n("scratch_bytes_at_capacity", "intermediate")?, n("scratch_bytes_at_capacity", "fc2")?)?.1 as u64)
+        n("geometry", "max_groups")?, scratch[0], scratch[1], scratch[2])?.1 as u64)
 }
 
 pub struct NativePlan {
@@ -98,6 +116,8 @@ pub fn native_plan(snapshot: &Path, selected: &str, dense: &Path,
     let (memory, placement) = super::layout::glm5::native_layout(&checkpoint, layout, shared, workspace, &programs)?;
     let mut dense_options = options.clone();
     dense_options.layout = None;
+    // This pass classifies dense operands only; native_layout already admitted context TP2.
+    dense_options.attention_placement = None;
     dense_options.draft_ownership = Some(super::spec::DraftOwnership::selected("glm5", "off"));
     let mut report = super::plan(dense, &dense_options)?;
     ensure!(report.config_error.is_none() && report.unclassified.is_empty()
@@ -1063,8 +1083,19 @@ mod tests {
         let entry = json!({"name":"exlr8_shared_a16_serving", "capacity_rows":64,
             "geometry":{"abi_version":2,"hidden":6144,"top_k":1,"units":16,"max_groups":4},
             "scratch_bytes_at_capacity":{"fc1":6291456,"intermediate":262144,"fc2":1572864}});
-        let mut manifest = json!({"programs":[entry]});
+        let mut manifest = json!({"programs":[entry,
+            {"name":"exlr8_shared_group","capacity_rows":64,
+                "geometry":{"abi_version":1,"experts":1,"top_k":1,"max_groups":4}},
+            {"name":"exlr8_rotate","capacity_rows":4096,
+                "geometry":{"abi_version":1,"hidden":6144}},
+            {"name":"exlr8_reduce","capacity_rows":4096,
+                "geometry":{"abi_version":1,"hidden":6144,"max_ranks":6}}]});
         let bytes = shared_workspace(&manifest).unwrap();
+        for missing in 0..4 {
+            let mut invalid = manifest.clone();
+            invalid["programs"].as_array_mut().unwrap().remove(missing);
+            assert!(shared_workspace(&invalid).is_err());
+        }
         assert_eq!(bytes, residency::execution_workspace_layout(64,6144,1,4,
             6291456,262144,1572864).unwrap().1 as u64);
         for (field, value) in [("abi_version", 1), ("hidden", 128), ("top_k", 8), ("units", 0), ("max_groups", 512)] {
@@ -1072,8 +1103,10 @@ mod tests {
             invalid["programs"][0]["geometry"][field] = json!(value);
             assert!(shared_workspace(&invalid).is_err(), "{field}");
         }
-        manifest["programs"][0]["scratch_bytes_at_capacity"]["fc2"] = json!(u64::MAX);
-        assert!(shared_workspace(&manifest).is_err());
+        for bytes in [0, 1_572_863, u64::MAX] {
+            manifest["programs"][0]["scratch_bytes_at_capacity"]["fc2"] = json!(bytes);
+            assert!(shared_workspace(&manifest).is_err());
+        }
         assert!(shared_workspace(&json!({"programs":[]})).is_err());
     }
 

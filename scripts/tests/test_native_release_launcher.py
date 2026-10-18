@@ -430,7 +430,7 @@ printf '%s\0' "${RELEASE_SERVING_ARGS[@]}"
         native = v41_source()
         generic = (ROOT / 'scripts/launch/run-family.sh').read_text()
         self.assertIn('--embedding-placement "$EMBEDDING"', native)
-        self.assertIn('family_args=(--embedding-placement "$embedding")', generic)
+        self.assertIn('family_args=(--embedding-placement "$embedding" "${exlr8_plan_args[@]}")', generic)
         self.assertIn('cfg_overrides[EMBEDDING]="$embedding_override"', generic)
 
     def test_small_card_embedding_default_and_explicit_overrides(self) -> None:

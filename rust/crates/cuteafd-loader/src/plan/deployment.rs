@@ -228,6 +228,40 @@ mod tests {
     }
 
     #[test]
+    fn native_deployment_preserves_selection_and_live_worker_boundary() {
+        use crate::plan::{exlr8::{NativePlan, NativeSelection, SparkRequirements}, RuntimeStatus, Status};
+        let (_dir, mut report) = fixture(2, 4);
+        report.family = Some("glm5".into());
+        report.experts.as_mut().unwrap().package = "glm:exlr8".into();
+        report.runtime = Some(RuntimeStatus::Planned);
+        report.native_serving_admitted = true;
+        for component in &mut report.components {
+            if component.status == Status::Ready { component.status = Status::Planned; }
+        }
+        let native = NativePlan { report, selection: NativeSelection {
+            manifest: "up1".into(), set_id: "checkpoint-set".into(), dense_from: "official-fp8".into() },
+            sparks: SparkRequirements { resident_bytes_per_rank: vec![100; 4],
+                k1_workspace: "checked_by_worker_live_admission" } };
+        let mut options = DeploymentOptions { rtx_gpus: 2, speculator: "off".into(), ..Default::default() };
+        let deployment = DeploymentSpec::from_exlr8(&native, &options).unwrap();
+        assert!(!deployment.executable && deployment.wip_launchable);
+        let value = serde_json::to_value(deployment).unwrap();
+        assert_eq!(value["version"], 1);
+        assert_eq!(value["exlr8"]["manifest"], "up1");
+        assert_eq!(value["exlr8"]["set_id"], "checkpoint-set");
+        assert_eq!(value["exlr8"]["dense_from"], "official-fp8");
+        assert_eq!(value["spark_requirements"]["resident_bytes_per_rank"], serde_json::json!([100, 100, 100, 100]));
+        assert_eq!(value["spark_requirements"]["k1_workspace"], "checked_by_worker_live_admission");
+        options.spark_tp = Some(4);
+        options.spark_ep = Some(1);
+        assert!(DeploymentSpec::from_exlr8(&native, &options).is_err());
+        options.spark_tp = None;
+        options.spark_ep = None;
+        options.speculator = "auto".into();
+        assert!(DeploymentSpec::from_exlr8(&native, &options).is_err());
+    }
+
+    #[test]
     fn wip_readiness_preserves_release_and_hard_admission_guards() {
         use crate::plan::{ComponentPlan, Rejection, RoleReadiness, RuntimeStatus, Status, spec::Component};
         let (_dir, mut report) = fixture(1, 3);
