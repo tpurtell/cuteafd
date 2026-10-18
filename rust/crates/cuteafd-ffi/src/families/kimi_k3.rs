@@ -1,6 +1,6 @@
 //! Kimi NoPE MLA programs, resolved once before graph capture. The engine owns
 //! weights, page tables, cache, outputs and scratch through stream completion.
-use crate::programs::{Program, Programs, Scalar};
+use crate::programs::{Program, ProgramSpec, Programs, Scalar};
 use crate::CuteafdDeviceBuffer as Buffer;
 use std::ffi::c_void;
 use thiserror::Error;
@@ -60,27 +60,15 @@ pub struct KimiMla<'a> {
 
 impl<'a> KimiMla<'a> {
     pub fn load(programs: &'a Programs<'a>, heads: usize, rows: usize, mode: KimiMlaMode) -> Result<Self> {
-        if !matches!(heads, 48 | 96) || rows == 0 || rows > i32::MAX as usize {
+        if !matches!(heads, 48 | 96) || !(1..=4096).contains(&rows) {
             return Err(KimiMlaError::Invalid("head/row geometry"));
         }
         let suffix = if heads == 48 { "" } else { "_h96" };
         let producer = programs.program(&format!("kimik3_mla_producer{suffix}_m{rows}"), PRODUCER)?;
         let attention = programs.program(&format!("kimik3_dense_mla_{}{suffix}_m{rows}", mode.name()), ATTENTION)?;
         let output = programs.program(&format!("kimik3_mla_output{suffix}_m{rows}"), OUTPUT)?;
-        for p in [&producer, &attention, &output] {
-            if p.spec().capacity_rows as usize != rows || p.spec().geometry["heads"].as_u64() != Some(heads as u64) {
-                return Err(KimiMlaError::Invalid("manifest geometry/capacity"));
-            }
-        }
-        let context = attention.spec().geometry["max_context"].as_u64()
-            .filter(|&n| n > 0 && n <= 1048576).ok_or(KimiMlaError::Invalid("manifest context"))? as usize;
-        let splits = attention.spec().geometry["num_splits"].as_u64()
-            .filter(|&n| n > 0 && n <= 16).ok_or(KimiMlaError::Invalid("manifest split count"))? as usize;
-        let scratch = [&producer, &attention, &output].map(|p| p.spec().scratch.get("scratch")
-            .copied().and_then(|n| usize::try_from(n).ok()).ok_or(KimiMlaError::Invalid("manifest scratch")));
-        let scratch = [scratch[0].as_ref().map_err(|_| KimiMlaError::Invalid("producer scratch"))?,
-                       scratch[1].as_ref().map_err(|_| KimiMlaError::Invalid("attention scratch"))?,
-                       scratch[2].as_ref().map_err(|_| KimiMlaError::Invalid("output scratch"))?].map(|n| *n);
+        let (context, splits, scratch) = validate_manifest(
+            [producer.spec(), attention.spec(), output.spec()], heads, rows, mode)?;
         Ok(Self { producer, attention, output, heads, rows, context, splits, scratch })
     }
 
@@ -133,6 +121,40 @@ impl<'a> KimiMla<'a> {
     }
 }
 
+fn validate_manifest(specs: [&ProgramSpec; 3], heads: usize, rows: usize, mode: KimiMlaMode)
+    -> Result<(usize, usize, [usize; 3])> {
+    for (i, spec) in specs.iter().enumerate() {
+        let geometry = &spec.geometry;
+        if spec.capacity_rows as usize != rows || geometry["heads"].as_u64() != Some(heads as u64)
+            || [("hidden", 7168), ("q_lora_rank", 1536), ("kv_lora_rank", 512),
+                ("qk_nope_dim", 128), ("qk_rope_dim", 64), ("v_head_dim", 128), ("page_rows", 64)]
+                .iter().any(|&(key, n)| geometry[key].as_u64() != Some(n))
+            || geometry["norm_eps"].as_f64() != Some(1e-6)
+            || spec.scalar_kinds.as_slice() != if i == 1 { b"iili" } else { b"i" } {
+            return Err(KimiMlaError::Invalid("manifest geometry/capacity/scalars"));
+        }
+    }
+    let attention = &specs[1].geometry;
+    let context = attention["max_context"].as_u64().filter(|&n| n > 0 && n <= 1048576)
+        .ok_or(KimiMlaError::Invalid("manifest context"))? as usize;
+    let splits = if mode == KimiMlaMode::Extend { 1 } else { context.div_ceil(64).min(16) };
+    let chunks = context.div_ceil(64).div_ceil(splits);
+    if attention["mode"].as_str() != Some(mode.name()) || attention["num_splits"].as_u64() != Some(splits as u64)
+        || attention["chunks_per_split"].as_u64() != Some(chunks as u64) {
+        return Err(KimiMlaError::Invalid("manifest traversal"));
+    }
+    let align = |n: usize| n.div_ceil(1024) * 1024;
+    let expected = [align(rows * 2112 * 2) + align(rows * heads * 192 * 2),
+        if splits > 1 { align(rows * heads * splits * 512 * 2) + align(rows * heads * splits * 4) } else { 0 },
+        2 * align(rows * heads * 128 * 2)];
+    for (spec, bytes) in specs.iter().zip(expected) {
+        if spec.scratch.get("scratch").copied() != Some(bytes as u64) {
+            return Err(KimiMlaError::Invalid("manifest scratch"));
+        }
+    }
+    Ok((context, splits, expected))
+}
+
 fn validate_buffers(requirements: &[(Buffer, usize)], device: i32) -> Result<()> {
     if device < 0 { return Err(KimiMlaError::Invalid("device")); }
     for (buffer, bytes) in requirements {
@@ -147,6 +169,53 @@ fn validate_buffers(requirements: &[(Buffer, usize)], device: i32) -> Result<()>
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn specs(heads: usize, rows: usize, mode: KimiMlaMode) -> [ProgramSpec; 3] {
+        let context: usize = 1048576;
+        let splits = if mode == KimiMlaMode::Extend { 1 } else { 16 };
+        let align = |n: usize| n.div_ceil(1024) * 1024;
+        let scratch = [align(rows * 2112 * 2) + align(rows * heads * 192 * 2),
+            if splits > 1 { align(rows * heads * splits * 512 * 2) + align(rows * heads * splits * 4) } else { 0 },
+            2 * align(rows * heads * 128 * 2)];
+        std::array::from_fn(|i| ProgramSpec {
+            name: format!("test{i}"), pointers: Vec::new(),
+            scalar_kinds: if i == 1 { b"iili".to_vec() } else { b"i".to_vec() },
+            scratch: [("scratch".to_string(), scratch[i] as u64)].into_iter().collect(),
+            capacity_rows: rows as u32,
+            geometry: serde_json::json!({"heads": heads, "hidden": 7168, "q_lora_rank": 1536,
+                "kv_lora_rank": 512, "qk_nope_dim": 128, "qk_rope_dim": 64, "v_head_dim": 128,
+                "page_rows": 64, "norm_eps": 1e-6, "max_context": context,
+                "num_splits": splits, "chunks_per_split": context.div_ceil(64).div_ceil(splits), "mode": mode.name()}),
+        })
+    }
+
+    #[test]
+    fn manifest_rejects_stale_geometry_traversal_and_scratch_before_launch() {
+        for heads in [48, 96] {
+            for mode in [KimiMlaMode::Decode, KimiMlaMode::Verify, KimiMlaMode::Extend] {
+                let entries = specs(heads, 64, mode);
+                assert!(validate_manifest(entries.each_ref(), heads, 64, mode).is_ok());
+                for index in 0..3 {
+                    for (key, bad) in [("heads", serde_json::json!(32)), ("hidden", serde_json::json!(4096)),
+                        ("page_rows", serde_json::json!(128)), ("norm_eps", serde_json::json!(1e-5))] {
+                        let mut wrong = entries.clone(); wrong[index].geometry[key] = bad;
+                        assert!(validate_manifest(wrong.each_ref(), heads, 64, mode).is_err());
+                    }
+                    let mut wrong = entries.clone(); wrong[index].scratch.clear();
+                    assert!(validate_manifest(wrong.each_ref(), heads, 64, mode).is_err());
+                    let mut wrong = entries.clone(); wrong[index].scalar_kinds = b"iii".to_vec();
+                    assert!(validate_manifest(wrong.each_ref(), heads, 64, mode).is_err());
+                    let mut wrong = entries.clone(); wrong[index].capacity_rows = 4096;
+                    assert!(validate_manifest(wrong.each_ref(), heads, 64, mode).is_err());
+                }
+                for (key, bad) in [("max_context", serde_json::json!(0)), ("num_splits", serde_json::json!(0)),
+                    ("chunks_per_split", serde_json::json!(1)), ("mode", serde_json::json!("wrong"))] {
+                    let mut wrong = entries.clone(); wrong[1].geometry[key] = bad;
+                    assert!(validate_manifest(wrong.each_ref(), heads, 64, mode).is_err());
+                }
+            }
+        }
+    }
+
     #[test]
     fn native_bf16_record_geometry_and_buffer_validation() {
         assert_eq!(MLA_RECORD_BYTES, 576 * 2);
