@@ -140,6 +140,22 @@ class Exl3CmakeOptionsTests(unittest.TestCase):
                 if architecture != '121':
                     self.assertNotIn('tp1-rank0', stamp)
 
+    def test_kimi_only_declares_qualified_roles(self):
+        for architecture, layouts in (('120', ['rtx-tp1']),
+                                      ('121', [f'tp6-rank{i}' for i in range(6)])):
+            with self.subTest(architecture=architecture):
+                result, rules = self.configure(f'-DCUTEAFD_CUDA_ARCHITECTURES={architecture}',
+                                               '-DCUTEAFD_EXPERT_FAMILIES=kimik3:exl3-k23')
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn('--geometry kimik3', rules)
+                self.assertIn('--require-layout ' + ','.join(layouts), rules)
+                if architecture == '121':
+                    self.assertIn('--profile tp6-width512', rules)
+        result, _ = self.configure('-DCUTEAFD_EXPERT_FAMILIES=kimik3:exl3-k23',
+                                   '-DCUTEAFD_GENERIC_SPARK_COUNTS=kimik3:exl3=4')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('supports TP6 only', result.stderr)
+
     def test_tile_override_reaches_export_and_is_a_build_dependency(self):
         """An A/B override is a dependency, not just a command-line detail.
 

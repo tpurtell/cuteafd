@@ -13,8 +13,8 @@ import numpy as np
 def decode_inner(trellis):
     """Decode checkpoint [K/16,N/16,16*bits] words to float64 [K,N]."""
     words = np.asarray(trellis).astype(np.uint16)
-    if words.ndim != 3 or words.shape[-1] not in (48, 64):
-        raise ValueError('reference supports native K3/K4 trellis tensors only')
+    if words.ndim != 3 or words.shape[-1] not in (32, 48, 64):
+        raise ValueError('reference supports native K2/K3/K4 trellis tensors only')
     bits = words.shape[-1] // 16
     words = words.reshape(*words.shape[:-1], -1, 2)[..., ::-1].reshape(words.shape)
     words = words.reshape(*words.shape[:-1], 16, bits).astype(np.uint32)
@@ -80,8 +80,10 @@ def dequantize(trellis, suh, svh):
     return hadamard128(weight) * np.asarray(svh, dtype=np.float64)[None, :]
 
 
-def expert_output(tensors, inputs, limit=10.0):
-    """Dense FP64 dequant/matmul/SwiGLU reference for one real expert slice."""
+def expert_output(tensors, inputs, limit=10.0, *, activation='silu'):
+    """Dense FP64 dequant/matmul/activation reference for one real expert slice."""
+    if activation not in ('silu', 'situ') or (activation == 'situ' and limit is not None):
+        raise ValueError('expected silu or unclamped situ activation')
     x = np.asarray(inputs, dtype=np.float64)
     projections = {}
     for projection in ('w1', 'w3'):
@@ -91,7 +93,11 @@ def expert_output(tensors, inputs, limit=10.0):
     if limit is not None:
         gate = np.minimum(gate, limit)
         up = np.clip(up, -limit, limit)
-    hidden = gate / (1 + np.exp(-np.clip(gate, -700, 700))) * up
+    sigmoid = 1 / (1 + np.exp(-np.clip(gate, -700, 700)))
+    if activation == 'situ':
+        hidden = 4.0 * np.tanh(gate / 4.0) * sigmoid * (25.0 * np.tanh(up / 25.0))
+    else:
+        hidden = gate * sigmoid * up
     down = dequantize(*(tensors['w2', suffix] for suffix in ('trellis', 'suh', 'svh')))
     return hidden @ down
 

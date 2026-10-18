@@ -150,6 +150,10 @@ impl V41Exl3Manifest {
                 (true, stage, shape.draft_experts)
             }
         };
+        ensure!(
+            (1..=1024).contains(&experts),
+            "EXL3 supports 1..1024 routed experts"
+        );
         let mut projections = Vec::with_capacity(experts);
         for expert in 0..experts {
             let mut row = Vec::new();
@@ -178,6 +182,7 @@ impl V41Exl3Manifest {
         let hidden = shape.hidden;
         let mut counts = vec![[0; 3]; tiers.len()];
         let stride = experts * tiers.len();
+        let descriptor_bits = if experts <= 512 { 9 } else { 10 };
         let mut descriptor = vec![-1; 3 * stride];
         let mut locals = vec![[0; 3]; experts];
         for (expert, row) in projections.iter().enumerate() {
@@ -190,9 +195,13 @@ impl V41Exl3Manifest {
                     anyhow::anyhow!("projection decoder absent from checkpoint family")
                 })?;
                 let local = counts[tier][projection];
-                ensure!(local < 512, "EXL3 descriptor local exceeds nine bits");
+                ensure!(
+                    local < (1 << descriptor_bits),
+                    "EXL3 descriptor local exceeds its width"
+                );
                 locals[expert][projection] = local;
-                descriptor[projection * stride + expert] = ((tier << 9) | local) as i32;
+                descriptor[projection * stride + expert] =
+                    ((tier << descriptor_bits) | local) as i32;
                 counts[tier][projection] += 1;
             }
         }
@@ -352,6 +361,61 @@ mod tests {
             ple_quantization: None,
             mtp_experts: crate::families::deepseek_v41::v41_exl3::V41Exl3MtpExperts::Exl3,
             storage: crate::formats::exl3_storage::Exl3StorageSource::GptqModel,
+        }
+    }
+
+    #[test]
+    fn kimi_descriptors_preserve_high_expert_ids_in_both_tiers() {
+        for tier in 0..2 {
+            let mut manifest = fixture(&[2, 3]);
+            manifest.experts.experts = 896;
+            manifest.experts.hidden = 3584;
+            manifest.experts.intermediate = 3072;
+            manifest.experts.topk = 16;
+            manifest.projections.clear();
+            for expert in 0..896 {
+                for (suffix, kind) in [
+                    ("w1", V41Exl3ProjectionKind::Gate),
+                    ("w3", V41Exl3ProjectionKind::Up),
+                    ("w2", V41Exl3ProjectionKind::Down),
+                ] {
+                    let name = format!("layers.0.ffn.experts.{expert}.{suffix}");
+                    let down = suffix == "w2";
+                    manifest.projections.insert(
+                        name.clone(),
+                        V41Exl3Projection {
+                            name,
+                            kind,
+                            bits: 2 + tier,
+                            input_features: if down { 3072 } else { 3584 },
+                            output_features: if down { 3584 } else { 3072 },
+                        },
+                    );
+                }
+            }
+            for (world, rank) in [(1, 0), (6, 0), (6, 5)] {
+                let plan = manifest
+                    .residency(V41Exl3Layer::Backbone(0), world, rank)
+                    .unwrap();
+                assert_eq!(plan.intermediate, 3072 / world);
+                let descriptor = &plan
+                    .buffers
+                    .iter()
+                    .find(|b| b.name == "descriptor_map")
+                    .unwrap()
+                    .initial_words;
+                for projection in 0..3 {
+                    for expert in [0, 511, 512, 895] {
+                        assert_eq!(
+                            descriptor[projection * 1792 + expert],
+                            ((tier << 10) | expert) as i32
+                        );
+                    }
+                    assert!(descriptor[projection * 1792 + 896..(projection + 1) * 1792]
+                        .iter()
+                        .all(|&v| v == -1));
+                }
+            }
         }
     }
 

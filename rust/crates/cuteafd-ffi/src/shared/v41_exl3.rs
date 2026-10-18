@@ -40,13 +40,16 @@ pub fn exl3_shard_widths(geometry: cuteafd_core::ExpertGeometry) -> Vec<u32> {
 
 impl V41Exl3Info {
     fn from_words(words: [u32; 16]) -> Result<Self> {
-        let geometry = cuteafd_core::expert_geometry();
+        Self::from_words_for_geometry(words, cuteafd_core::expert_geometry())
+    }
+
+    fn from_words_for_geometry(words: [u32; 16], geometry: cuteafd_core::ExpertGeometry) -> Result<Self> {
         ensure!(
             words[0] == 2
                 && matches!(words[15], 2 | 4)
                 && words[1] == geometry.hidden
                 && exl3_shard_widths(geometry).contains(&words[2])
-                && words[3] <= 512
+                && words[3] <= 1024
                 && words[3] >= words[5]
                 && words[4] > 0
                 && (1..=16).contains(&words[5])
@@ -355,6 +358,31 @@ mod info_tests {
         assert_eq!(info.topk, 6);
         assert_eq!(info.output_element_bytes, 2);
         assert_eq!(info.bits, [2, 3, 0, 0]);
+    }
+
+    #[test]
+    fn native_info_accepts_e896_with_explicit_kimi_geometry() {
+        let geometry = cuteafd_core::ExpertGeometry::KIMI_K3;
+        for width in [512, 3072] {
+            for capacity in [1, 16] {
+                let words = [2, 3584, width, 896, capacity, 16, 2, 32, 11, 6, 3, 2, 3, 0, 0, 4];
+                let info = V41Exl3Info::from_words_for_geometry(words, geometry).unwrap();
+                assert_eq!(info.experts, 896);
+                assert_eq!(info.intermediate, width as usize);
+                assert!(V41Exl3Info::from_words_for_geometry(
+                    words, cuteafd_core::ExpertGeometry::DEEPSEEK_V41).is_err());
+                for experts in [512, 1024] {
+                    let mut valid = words;
+                    valid[3] = experts;
+                    assert!(V41Exl3Info::from_words_for_geometry(valid, geometry).is_ok());
+                }
+                for experts in [0, 15, 1025, u32::MAX] {
+                    let mut invalid = words;
+                    invalid[3] = experts;
+                    assert!(V41Exl3Info::from_words_for_geometry(invalid, geometry).is_err());
+                }
+            }
+        }
     }
 
     #[test]

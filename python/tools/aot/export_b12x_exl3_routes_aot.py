@@ -24,7 +24,7 @@ def export(output: Path, capacity: int, experts: int, topk: int, block_size: int
     import torch
     from b12x.moe._shared.kernels.w4a16.route_pack import compile_w4a16_route_pack_launches
 
-    if not 1 <= capacity <= 4096 or not 1 <= topk <= min(experts, 16) or experts > 512:
+    if not 1 <= capacity <= 4096 or not 1 <= topk <= min(experts, 16) or experts > 1024:
         raise ValueError('invalid EXL3 route capacity, top-k or expert count')
     props = torch.cuda.get_device_properties(0)
     if (props.major, props.minor) not in ((12, 0), (12, 1)):
