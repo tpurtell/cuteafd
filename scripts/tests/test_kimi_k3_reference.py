@@ -99,6 +99,50 @@ def test_module_loader_checks_and_narrows_only_zero_a_log():
         weights.load_module(module, "language_model.model.layers.0")
 
 
+def test_diagnostic_hooks_distinguish_local_error_from_propagation(monkeypatch):
+    torch = pytest.importorskip("torch")
+    from families.kimi_k3.diagnostic import Trace, first_difference
+    import torch.nn.functional as F
+    layer = torch.nn.Sequential(torch.nn.Linear(2, 2, bias=False), torch.nn.ReLU())
+    with torch.no_grad():
+        layer[0].weight.fill_(1.)
+    value = torch.ones(2, 2)
+    official = Trace()
+    with official.modules(layer):
+        layer(value)
+    original = F.linear
+    monkeypatch.setattr(F, "linear", lambda *args, **kwargs: original(*args, **kwargs) + .25)
+    candidate = Trace()
+    with candidate.modules(layer):
+        layer(value)
+    with torch.no_grad():
+        rows = official.compare(candidate, device="cpu")
+    rows_by_op = {row["op"]: row for row in rows}
+    assert first_difference(rows, "controlled_input")["op"] == "0#0"
+    assert rows_by_op["0#0"]["controlled_input"][0]["relative_l2"] == pytest.approx(.125)
+    assert rows_by_op["1#0"]["propagated"][0]["relative_l2"] == pytest.approx(.125)
+    assert rows_by_op["1#0"]["controlled_input"][0]["relative_l2"] == 0
+    value.add_(20)
+    assert torch.equal(official.calls["0#0"]["args"][0], torch.ones(2, 2))
+    assert not official.stack and not candidate.stack
+    assert all(not module._forward_hooks and not module._forward_pre_hooks for module in layer.modules())
+
+
+def test_diagnostic_hooks_are_removed_after_failure():
+    torch = pytest.importorskip("torch")
+    from families.kimi_k3.diagnostic import Trace
+    class Broken(torch.nn.Module):
+        def forward(self, value):
+            raise RuntimeError("fixture interruption")
+    layer = torch.nn.Sequential(torch.nn.Identity(), Broken())
+    trace = Trace()
+    with pytest.raises(RuntimeError, match="fixture interruption"):
+        with trace.modules(layer):
+            layer(torch.ones(1))
+    assert not trace.stack
+    assert all(not module._forward_hooks and not module._forward_pre_hooks for module in layer.modules())
+
+
 def blob(root, pending, wid, data=b"\0\0\0\0"):
     path = root / ("layer%03d" % pending["layer"]) / (wid + ".bin")
     path.write_bytes(data)

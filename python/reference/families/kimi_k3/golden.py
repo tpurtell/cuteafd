@@ -370,10 +370,21 @@ def main():
     for name in ("snapshot", "windows", "out"):
         parser.add_argument("--" + name, type=Path, required=True)
     parser.add_argument("--layers", type=int, default=None)
+    parser.add_argument("--diagnose-layer", type=int, default=None,
+                        help="compare native/fixed sub-ops at layer 1 without running a golden")
+    parser.add_argument("--probe-state", type=Path,
+                        help="saved probe state containing exact block000 short-stream embeddings")
     args = parser.parse_args()
     if args.layers is not None:
         raise ValueError("partial layers cannot qualify a Kimi reference")
-    execute(args)
+    if args.diagnose_layer is not None:
+        from families.kimi_k3.diagnostic import diagnose
+        diagnose(args, native_layer=native_layer, atomic_json=atomic_json, digest=digest,
+                 state_type=LayerState, official_mask=official_mask)
+    else:
+        if args.probe_state is not None:
+            raise ValueError("--probe-state is only supported with --diagnose-layer")
+        execute(args)
 
 
 if __name__ == "__main__":
