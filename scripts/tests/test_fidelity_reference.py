@@ -23,6 +23,15 @@ converter = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(converter)
 
 
+@pytest.mark.parametrize("tail_logit", [-25.0, -100.0])
+def test_compact_tail_retains_mass_below_top_probability_resolution(tail_logit):
+    values = np.array([0.0, tail_logit, tail_logit], dtype=np.float64)
+    logp = values - np.log(np.exp(values).sum())
+    expected = max(tail_logit + np.log(2) - np.log(np.exp(values).sum()), np.log(1e-30))
+    assert converter.tail_log_mass(logp, np.array([0])) == pytest.approx(expected, abs=1e-12)
+    assert converter.tail_log_mass(logp, np.arange(3)) == pytest.approx(np.log(1e-30))
+
+
 def test_dense_golden_requires_pinned_imported_source():
     spec = importlib.util.spec_from_file_location("dense_golden", ROOT / "python/reference/families/qwen3_5/golden.py")
     golden = importlib.util.module_from_spec(spec)
@@ -93,6 +102,12 @@ def test_reference_only_validator_seals_and_rejects_mutation(tmp_path):
     compact["windows"][0]["positions"][0]["top"][0]["lp"] += 0.01
     compact_path.write_bytes(canonical(compact))
     with pytest.raises(ValueError, match="top probabilities"):
+        validator.validate_reference_only(tmp_path)
+    compact_path.write_bytes(original)
+    compact = json.loads(original)
+    compact["windows"][0]["positions"][0]["tail_lp"] += 0.01
+    compact_path.write_bytes(canonical(compact))
+    with pytest.raises(ValueError, match="tail probability"):
         validator.validate_reference_only(tmp_path)
     compact_path.write_bytes(original)
     with pytest.raises(ValueError, match="overwrite"):

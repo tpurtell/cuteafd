@@ -148,7 +148,9 @@ def validate_reference_only(root, *, seal=False):
             order = order[np.lexsort((order, -values[order]))].tolist()
             if [item['id'] for item in top] != order or any(abs(item['lp'] - logp[item['id']]) > 0.000006 for item in top):
                 raise ValueError('compact top probabilities mismatch')
-            tail = math.log(max(1.0 - float(np.exp(logp[order]).sum()), 1e-30))
+            omitted = np.ones(vocab, dtype=bool)
+            omitted[order] = False
+            tail = math.log(max(float(np.exp(logp[omitted]).sum(dtype=np.float64)), 1e-30))
             if abs(record['tail_lp'] - tail) > 0.000006:
                 raise ValueError('compact tail probability mismatch')
             target = window['tokens'][pos]
