@@ -35,6 +35,7 @@ use crate::shared::memory::DeviceAllocation;
 use crate::shared::peer_split::{slice_2d, Axis, RankDevice};
 use anyhow::{ensure, Context, Result};
 use cuteafd_core::DType;
+use cuteafd_loader::kda::{KdaGeometry, KdaOutputGate, KdaRole, KdaOperand, KdaTensor, KdaError};
 use cuteafd_ffi::{CuteafdDeviceBuffer, NativeLibrary};
 use cuteafd_loader::families::glm5_flash::{GlmNextAttention, GlmNextConfig};
 use cuteafd_loader::plan::checkpoint::{Checkpoint, CheckpointTensor};
@@ -526,7 +527,8 @@ impl<'a> GlmfLoader<'a> {
         let a = |name: &str| format!("{p}.self_attn.{name}");
         match attention {
             GlmNextAttention::Kda => {
-                let w_in = ["q_proj", "k_proj", "v_proj", "f_a_proj", "g_a_proj", "b_proj"].map(|n| a(&format!("{n}.weight")));
+                let w_in: Vec<_> = Self::kda_geometry(cfg).roles(KdaOperand::WIn).into_iter()
+                    .map(|role| Self::kda_name(&p, role)).collect();
                 let kda_layout = match self.kda_fp8 {
                     super::fp8::KdaFp8::Off => None,
                     super::fp8::KdaFp8::Channel => Some(super::fp8::Layout::Channel),
@@ -556,14 +558,12 @@ impl<'a> GlmfLoader<'a> {
                     }
                     ops.insert("w_in", self.upload(&bytes)?);
                 } else {
-                    ops.insert("w_in", self.rows(&w_in)?);
+                    ops.insert("w_in", self.upload(&self.kda_parts(cfg, &p, KdaOperand::WIn, 1)?.remove(0))?);
                 }
-                ops.insert("w_fg", self.rows(&[a("f_b_proj.weight"), a("g_b_proj.weight")])?);
-                // [3D, 1, 4] each -> FP32 [3D, 4].
-                ops.insert("conv_w", self.f32(&["q", "k", "v"].map(|n| a(&format!("{n}_conv1d.weight"))))?);
-                ops.insert("a_log", self.f32(&[a("A_log")])?);
-                ops.insert("dt_bias", self.f32(&[a("dt_bias")])?);
-                ops.insert("o_norm", self.one(&a("o_norm.weight"))?);
+                for operand in [KdaOperand::WFg, KdaOperand::ConvW, KdaOperand::ALog,
+                    KdaOperand::DtBias, KdaOperand::ONorm] {
+                    ops.insert(operand.name(), self.upload(&self.kda_parts(cfg, &p, operand, 1)?.remove(0))?);
+                }
                 if kda_layout.is_none() {
                     let w_o = match ops.remove("w_o_nvfp4") {
                         Some(rounded) => rounded,
@@ -629,41 +629,30 @@ impl<'a> GlmfLoader<'a> {
         parts.into_iter().enumerate().map(|(rank, bytes)| self.on_rank(rank, || self.upload(&bytes))).collect()
     }
 
-    /// The row-concatenation of BF16 matrices `parts`, each either split into `ranks`
-    /// contiguous row blocks (`true`: rank `r` takes block `r`) or whole on every rank.
-    fn bf16_parts(&self, parts: &[(String, bool)], ranks: usize) -> Result<Vec<Vec<u8>>> {
-        let mut out = vec![Vec::new(); ranks];
-        for (name, split) in parts {
-            let (bytes, dtype, shape) = self.raw(name)?;
-            ensure!(dtype == DType::Bf16 && shape.len() == 2, "{name}: a head split slices BF16 matrices, found \
-                {dtype:?} {shape:?}");
-            ensure!(!split || shape[0] % ranks == 0, "{name}: {} rows do not split over {ranks} GPUs", shape[0]);
-            for (rank, share) in out.iter_mut().enumerate() {
-                share.extend_from_slice(if *split { &bytes[rank * bytes.len() / ranks..(rank + 1) * bytes.len() / ranks] }
-                    else { &bytes[..] });
-            }
-        }
-        Ok(out)
+    fn kda_geometry(cfg: &GlmNextConfig) -> KdaGeometry {
+        KdaGeometry { hidden: cfg.hidden, heads: cfg.kda_heads, head_dim: cfg.kda_head_dim,
+            conv_kernel: 4, output_gate: KdaOutputGate::LowRank, o_norm_dtype: DType::Bf16 }
     }
 
-    /// BF16 / FP32 tensors `names` widened to FP32, each split into `ranks` contiguous
-    /// blocks along its first dimension; per rank its blocks back to back.
-    fn f32_parts(&self, names: &[String], ranks: usize) -> Result<Vec<Vec<u8>>> {
-        let mut out = vec![Vec::new(); ranks];
-        for name in names {
-            let (bytes, dtype, _) = self.raw(name)?;
-            let values = match dtype {
-                DType::Bf16 => bf16_to_f32(&bytes),
-                DType::F32 => bytes.chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect(),
-                other => anyhow::bail!("{name}: expected BF16 or FP32, found {other:?}"),
-            };
-            ensure!(values.len() % ranks == 0, "{name}: {} values do not split over {ranks} GPUs", values.len());
-            let share = values.len() / ranks;
-            for (rank, part) in out.iter_mut().enumerate() {
-                part.extend(f32_bytes(&values[rank * share..(rank + 1) * share]));
-            }
-        }
-        Ok(out)
+    fn kda_name(prefix: &str, role: KdaRole) -> String {
+        use KdaRole as R;
+        let name = match role {
+            R::Q => "q_proj.weight", R::K => "k_proj.weight", R::V => "v_proj.weight",
+            R::Fa => "f_a_proj.weight", R::Fb => "f_b_proj.weight", R::Ga => "g_a_proj.weight",
+            R::Gb => "g_b_proj.weight", R::G => "g_proj.weight", R::Beta => "b_proj.weight",
+            R::ConvQ => "q_conv1d.weight", R::ConvK => "k_conv1d.weight", R::ConvV => "v_conv1d.weight",
+            R::ALog => "A_log", R::DtBias => "dt_bias", R::ONorm => "o_norm.weight", R::O => "o_proj.weight",
+        };
+        format!("{prefix}.self_attn.{name}")
+    }
+
+    fn kda_parts(&self, cfg: &GlmNextConfig, prefix: &str, operand: KdaOperand, ranks: usize)
+        -> Result<Vec<Vec<u8>>> {
+        Ok(Self::kda_geometry(cfg).pack(operand, ranks, |role| {
+            let name = Self::kda_name(prefix, role);
+            let (bytes, dtype, shape) = self.raw(&name).map_err(|error| KdaError::Source(error.to_string()))?;
+            Ok(KdaTensor { dtype, shape, bytes })
+        })?.into_iter().map(|tensor| tensor.bytes).collect())
     }
 
     /// The selected source's 2-D `name` as E4M3 blocks, quantized from BF16
@@ -756,10 +745,7 @@ impl<'a> GlmfLoader<'a> {
         match attention {
             GlmNextAttention::Kda => {
                 // [q; k; v; f_a; g_a; b]: q, k, v and b by head, the low-rank f_a and g_a whole.
-                let w_in: Vec<(String, bool)> = [("q_proj", true), ("k_proj", true), ("v_proj", true),
-                    ("f_a_proj", false), ("g_a_proj", false), ("b_proj", true)].iter()
-                    .map(|(n, split)| (a(&format!("{n}.weight")), *split)).collect();
-                let w_in = self.bf16_parts(&w_in, ranks)?;
+                let w_in = self.kda_parts(cfg, &p, KdaOperand::WIn, ranks)?;
                 let (bytes, dtype, shape) = self.raw(&a("o_proj.weight"))?;
                 ensure!(dtype == DType::Bf16,
                     "{}: a head split requires a BF16 [H, D] o_proj source, found {dtype:?} {shape:?}", a("o_proj.weight"));
@@ -800,13 +786,10 @@ impl<'a> GlmfLoader<'a> {
                 } else {
                     put(&mut ops, "w_in", self.upload_ranks(w_in)?);
                 }
-                put(&mut ops, "w_fg", self.upload_ranks(self.bf16_parts(&[(a("f_b_proj.weight"), true),
-                    (a("g_b_proj.weight"), true)], ranks)?)?);
-                put(&mut ops, "conv_w", self.upload_ranks(self.f32_parts(&["q", "k", "v"]
-                    .map(|n| a(&format!("{n}_conv1d.weight"))), ranks)?)?);
-                put(&mut ops, "a_log", self.upload_ranks(self.f32_parts(&[a("A_log")], ranks)?)?);
-                put(&mut ops, "dt_bias", self.upload_ranks(self.f32_parts(&[a("dt_bias")], ranks)?)?);
-                put(&mut ops, "o_norm", self.replicate(self.one(&a("o_norm.weight"))?)?);
+                for operand in [KdaOperand::WFg, KdaOperand::ConvW, KdaOperand::ALog,
+                    KdaOperand::DtBias, KdaOperand::ONorm] {
+                    put(&mut ops, operand.name(), self.upload_ranks(self.kda_parts(cfg, &p, operand, ranks)?)?);
+                }
                 if layout.is_none() {
                     put(&mut ops, "w_o", self.upload_ranks(w_o)?);
                 }
