@@ -15,6 +15,9 @@ consumer-side evidence, not prerequisites for publishing a dataset.
   deviations, checkpoint/tokenizer/template hashes and cached response identity.
   Render fixed conversations with the checkpoint's own chat template; reconstructed
   generated spans must re-tokenize losslessly. Execute tools in the same fixture.
+  New own-text sets record recipe `own-text-v2-reserved-contacts`; invented people
+  and orders request only reserved example domains and 555-01xx phone numbers.
+  Cached responses from older prompts remain private history, never rewritten.
 - Logits come from the original-quality model run locally, layer-streamed where
   necessary. An explicitly chosen quant of a very large model is an acceptable
   reference; record its exact checkpoint and arithmetic rather than implying BF16.

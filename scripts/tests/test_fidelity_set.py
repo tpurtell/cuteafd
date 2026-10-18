@@ -115,6 +115,13 @@ def test_new_backend_sizes_locally_and_records_reference_snapshot(fake_server):
             {'id': 'legacy', 'score_from': 64, 'tokens': list(range(576))}]},
         legacy_provenance={'path': 'legacy.json', 'sha256': 'c' * 64})
     assert len(fake_server['requests']) == 53
+    assert manifest['recipe']['version'] == 'own-text-v2-reserved-contacts'
+    structured = [request['body'] for request in fake_server['requests']
+                  if request['body'].get('response_format') == {'type': 'json_object'}]
+    assert len(structured) == 3
+    for request in structured[:2]:
+        prompt = request['messages'][-1]['content']
+        assert 'example.com/.org/.net' in prompt and '555-01xx' in prompt
     assert manifest['reference_snapshot']['tokenizer_sha256'] == 'a' * 64
     assert manifest['windows'][1]['provenance']['generation']['text_source'] == 'hf'
 

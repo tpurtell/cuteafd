@@ -42,8 +42,11 @@ MATH = ["Explain and prove why binary search terminates, including the integer b
         "Derive the variance of a paired difference of two Bernoulli outcomes.",
         "Prove an amortized bound for a dynamic array that doubles capacity.",
         "Explain the log-sum-exp identity and derive its numerically stable implementation."]
-STRUCTURED = ["Invent a fictional person and describe them.",
-              "Create an example e-commerce order with several line items.",
+RECIPE_VERSION = "own-text-v2-reserved-contacts"
+RESERVED_CONTACTS = (" Use only reserved example domains (example.com/.org/.net) and "
+                     "555-01xx phone numbers for any contact details.")
+STRUCTURED = ["Invent a fictional person and describe them." + RESERVED_CONTACTS,
+              "Create an example e-commerce order with several line items." + RESERVED_CONTACTS,
               "Classify this support message: 'My invoice shows a double charge for March and I need a refund before Friday.' Give category, priority, a summary and follow-up actions."]
 
 
@@ -332,7 +335,7 @@ def build_set(*, family: str, model: str, checkpoint: str, version: str, arm: di
                 "sources": sources + [source(root, "scripts/bench/bench-agentic-session.py"),
                     source(root, "rust/crates/cuteafd-bench/src/panels/quality.rs")],
                 "recording_sha256": [hashlib.sha256(canonical(r)).hexdigest() for r in recordings or []],
-                "recipe": {"windows": 64, "positions_per_window": 512, "max_tokens": 1024,
+                "recipe": {"version": RECIPE_VERSION, "windows": 64, "positions_per_window": 512, "max_tokens": 1024,
                     "context_cap": MAX_TOKENS, "temperature": 0, "seed": 0, "reasoning_effort": "high",
                     "blocks": {"A": 26, "B": 12, "C": 10, "D": 6, "E": 10},
                     "prompt_roles": "conditioning history ctx; current assistant span gen"}, "windows": windows}
