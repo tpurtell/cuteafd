@@ -195,6 +195,28 @@ impl<'a> NativeExperts<'a> {
         Ok(())
     }
 
+    pub(crate) fn bind_planes(
+        &self,
+        library: &NativeLibrary,
+        w: &Workspace<'_>,
+        planes: [*const u16; MAX_RANKS],
+        ranks: usize,
+    ) -> Result<()> {
+        ensure!((1..=6).contains(&ranks), "EXLR8 requires 1..=6 F32 rank planes");
+        ensure!(planes[..ranks].iter().all(|ptr| !ptr.is_null()), "EXLR8 null rank plane");
+        let addresses = planes.map(|ptr| ptr as usize);
+        match *w.native_plane_identity.borrow() {
+            Some(bound) => ensure!(bound == (addresses, ranks), "EXLR8 intake pointers changed while retained"),
+            None => {
+                let table = w.native_planes.as_ref().context("EXLR8 rank pointer storage")?;
+                let pointers: Vec<u64> = addresses[..ranks].iter().map(|&ptr| ptr as u64).collect();
+                library.copy_h2d(table.buffer, bytes_of(&pointers))?;
+            }
+        }
+        *w.native_plane_identity.borrow_mut() = Some((addresses, ranks));
+        Ok(())
+    }
+
     pub(crate) fn reduce(
         &self,
         library: &NativeLibrary,
@@ -205,26 +227,8 @@ impl<'a> NativeExperts<'a> {
         rows: usize,
         stream: *mut c_void,
     ) -> Result<()> {
-        ensure!(
-            (1..=6).contains(&ranks),
-            "EXLR8 requires 1..=6 F32 rank planes"
-        );
-        let addresses = planes.map(|ptr| ptr as usize);
-        let table = w
-            .native_planes
-            .as_ref()
-            .context("EXLR8 rank pointer storage")?;
-        match *w.native_plane_identity.borrow() {
-            Some(bound) => ensure!(
-                bound == (addresses, ranks),
-                "EXLR8 intake pointers changed while retained"
-            ),
-            None => {
-                let pointers: Vec<u64> = addresses[..ranks].iter().map(|&ptr| ptr as u64).collect();
-                library.copy_h2d(table.buffer, bytes_of(&pointers))?;
-            }
-        }
-        *w.native_plane_identity.borrow_mut() = Some((addresses, ranks));
+        self.bind_planes(library, w, planes, ranks)?;
+        let table = w.native_planes.as_ref().context("EXLR8 rank pointer storage")?;
         // SAFETY: intake completion precedes this call. Each thread reads its own
         // residual before writing the same element, so in-place residual is safe.
         unsafe {

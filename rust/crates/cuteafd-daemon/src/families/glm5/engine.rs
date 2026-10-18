@@ -73,6 +73,8 @@ enum Previous {
     First,
     Delta,
     Planes(usize),
+    NativePlanes(usize),
+    Residual,
 }
 
 /// Everything a captured decode segment bakes in.
@@ -664,8 +666,8 @@ impl<'a> GlmEngine<'a> {
             route_ids: self.alloc(if lead || self.tp2.is_some() { t * self.cfg.topk * 4 } else { 256 })?,
             route_weights: self.alloc(if lead || self.tp2.is_some() { t * self.cfg.topk * 4 } else { 256 })?,
             wire: self.alloc(if lead || self.tp2.is_some() { t * if self.native_experts.is_some() { h * 2 } else { h + h / 32 } } else { 256 })?,
-            shared: self.alloc(t * h * if self.native_experts.is_some() { 4 } else { 2 })?,
-            native_planes: self.native_experts.as_ref().map(|_| self.alloc(256)).transpose()?,
+            shared: self.alloc(t * h * if lead && self.native_experts.is_some() { 4 } else { 2 })?,
+            native_planes: self.native_experts.as_ref().filter(|_| lead).map(|_| self.alloc(256)).transpose()?,
             native_plane_identity: RefCell::new(None),
             payload: self.tp2.as_ref().map(|tp2| self.alloc(tp2.combine.payload_bytes(t, h))).transpose()?,
             router_host: RefCell::new(HostAllocation::new(self.library, lead_only(t * (self.cfg.topk * 8 + if self.spark_bf16 || self.native_experts.is_some() { h * 2 } else { h + h / 32 })))?),
@@ -1009,7 +1011,7 @@ impl<'a> GlmEngine<'a> {
                     self.exchange()?.wait(0, attended)?;
                     self.norm_full(0, w, layer.ptr("post_norm")?, 2, rows, w.delta.buffer.ptr, self.recv(0, attended)?)?;
                     // Rank 1: this layer's FFN side, then the next layer's attention.
-                    if !self.tp2_layer(index) {
+                    if !self.tp2_layer(index) && !(self.native_experts.is_some() && !layer.dense) {
                         self.peer_post(index, 0, w1, rows, bytes)?;
                         if index + 1 < layers.len() {
                             self.peer_attention(index + 1, 0, w1, rows, cap, &ranked[0], bytes)?;
@@ -1054,6 +1056,11 @@ impl<'a> GlmEngine<'a> {
                 self.run("glm_norm", &[("residual", w.h.buffer.ptr), ("delta0", w.delta.buffer.ptr),
                     ("delta1", w.delta.buffer.ptr), ("weight", weight), ("out", w.x.buffer.ptr)],
                     &[rows, Scalar::I32(0)])?;
+                if let Some(w1) = w1.filter(|_| index + 1 < layers.len()) {
+                    self.exchange()?.push(0, ffn, w.h.buffer.ptr, bytes)?;
+                    self.peer_post(index, 0, w1, rows, bytes)?;
+                    self.peer_attention(index + 1, 0, w1, rows, cap, &ranked[0], bytes)?;
+                }
             } else if w1.is_some() {
                 if !layer.dense && !self.tp2_layer(index) && index + 1 < layers.len() {
                     self.exchange()?.push(0, ffn, w.delta.buffer.ptr, bytes)?;
@@ -1151,6 +1158,8 @@ impl<'a> GlmEngine<'a> {
         if layer.dense {
             self.ffn_on(1, w1, layer, self.cfg.dense_intermediate, cap, w1.delta.buffer.ptr, rows)?;
             exchange.push(1, ffn, w1.delta.buffer.ptr, bytes)
+        } else if self.native_experts.is_some() {
+            Ok(())
         } else {
             self.ffn_on(1, w1, layer, self.cfg.moe_intermediate, cap, w1.shared.buffer.ptr, rows)?;
             if self.tp2_layer(index) { Ok(()) } else { exchange.push(1, ffn, w1.shared.buffer.ptr, bytes) }
@@ -1162,12 +1171,22 @@ impl<'a> GlmEngine<'a> {
     /// the last layer). The norm adds the same two operands in the same order as
     /// rank 0's.
     fn peer_post(&self, index: usize, lane: usize, w1: &Workspace<'_>, rows: Scalar, bytes: usize) -> Result<()> {
-        let _ = bytes;
         let peer = self.peer()?;
         let Some(next) = peer.layers.get(index + 1) else { return Ok(()) };
         let ffn = slot(index, true, lane);
         self.exchange()?.wait(1, ffn)?;
         let received = self.recv(1, ffn)?;
+        if self.native_experts.is_some() && !peer.layers[index].dense {
+            // SAFETY: the slot holds the owner's completed BF16 residual;
+            // the peer stream consumes it before the exchange slot is reused.
+            self.on(1, || unsafe {
+                self.library.copy_d2d_async(w1.h.buffer,
+                    cuteafd_ffi::CuteafdDeviceBuffer { ptr: received, bytes, ..w1.h.buffer },
+                    bytes, self.stream_of(1))
+            })?;
+            return self.norm_full(1, w1, next.ptr("input_norm")?, 0, rows,
+                w1.delta.buffer.ptr, w1.delta.buffer.ptr);
+        }
         let (first, second) = if peer.layers[index].dense { (w1.delta.buffer.ptr, received) }
             else { (received, w1.shared.buffer.ptr) };
         if self.tp2_layer(index) {
@@ -1227,6 +1246,10 @@ impl<'a> GlmEngine<'a> {
             (Some((transport, _)), None) => transport.intake.pointers(),
             (None, None) => [std::ptr::null(); MAX_RANKS],
         };
+        if let Some(native) = &self.native_experts {
+            native.bind_planes(self.library, w, planes, experts.as_ref()
+                .context("native decode requires Spark transport")?.0.world_size())?;
+        }
         // Previous layer's FFN output: none (first layer), in `delta`, or Spark planes.
         let mut previous = Previous::First;
         for index in 0..=layers.len() {
@@ -1242,6 +1265,13 @@ impl<'a> GlmEngine<'a> {
                 }
                 if let Previous::Planes(ranks) = previous {
                     self.reduce(planes, w, ranks, t)?;
+                }
+                if let Previous::NativePlanes(ranks) = previous {
+                    self.native_experts.as_ref().context("native decode owner")?.reduce(
+                        self.library, index - 1, w, planes, ranks, t, self.stream)?;
+                    if w1.is_some() && layer.is_some() {
+                        self.exchange()?.push(0, slot(index - 1, true, 0), w.h.buffer.ptr, bytes)?;
+                    }
                 }
                 let weight = match layer {
                     Some(layer) => layer.ptr("input_norm")?,
@@ -1260,7 +1290,7 @@ impl<'a> GlmEngine<'a> {
                         else { self.norm_full(0, w, weight, 2, rows, w.delta.buffer.ptr, self.recv(0, ffn)?)?; }
                     }
                     _ => {
-                        let deltas = if matches!(previous, Previous::First) { 0 } else { 1 };
+                        let deltas = if matches!(previous, Previous::First | Previous::NativePlanes(_)) { 0 } else { 1 };
                         self.run("glm_norm", &[("residual", w.h.buffer.ptr), ("delta0", w.delta.buffer.ptr),
                             ("delta1", w.delta.buffer.ptr), ("weight", weight), ("out", w.x.buffer.ptr)],
                             &[rows, Scalar::I32(deltas)])?;
@@ -1311,7 +1341,9 @@ impl<'a> GlmEngine<'a> {
                     self.tp2_pair(index, 0, w, w1, t, "m64")?;
                 }
                 if let Some(layer) = layer.filter(|_| index + 1 < layers.len()) {
-                    let kind = if layer.dense || self.tp2_layer(index) { Previous::Delta } else { Previous::Planes(0) };
+                    let kind = if layer.dense || self.tp2_layer(index) { Previous::Delta }
+                        else if self.native_experts.is_some() { Previous::Residual }
+                        else { Previous::Planes(0) };
                     // Rank 1's next weights into L2 while rank 0 waits in this layer's exchange.
                     if let (false, Some(l2)) = (layer.dense, self.peer()?.l2.as_ref()) {
                         self.on(1, || l2.issue(self.library, index, self.stream_of(1)))?;
@@ -1329,8 +1361,10 @@ impl<'a> GlmEngine<'a> {
                 Some(layer) => {
                     let (transport, runtime) = experts.as_mut()
                         .with_context(|| format!("layer {index} is an MoE layer; pass Spark peers for its routed experts"))?;
-                    Previous::Planes(self.moe_exchange(w, index, layer, tables.exchange_rows, "m64", true, transport,
-                        runtime)?)
+                    let ranks = self.moe_exchange(w, index, layer, tables.exchange_rows, "m64", true, transport,
+                        runtime)?;
+                    if self.native_experts.is_some() { Previous::NativePlanes(ranks) }
+                        else { Previous::Planes(ranks) }
                 }
             };
             if let Some(probe) = self.draft_probe.borrow_mut().as_mut() {
@@ -1355,6 +1389,19 @@ impl<'a> GlmEngine<'a> {
             let exchange = self.exchange()?;
             let layer = &peer.layers[index];
             match (previous, index.checked_sub(1)) {
+                (Previous::Residual, Some(before)) => {
+                    let ffn = slot(before, true, 0);
+                    exchange.wait(1, ffn)?;
+                    // SAFETY: the peer slot holds the completed residual and
+                    // stream ordering protects it until this copy finishes.
+                    self.on(1, || unsafe {
+                        self.library.copy_d2d_async(w1.h.buffer,
+                            cuteafd_ffi::CuteafdDeviceBuffer { ptr: self.recv(1, ffn)?, bytes, ..w1.h.buffer },
+                            bytes, self.stream_of(1))
+                    })?;
+                    self.norm_full(1, w1, layer.ptr("input_norm")?, 0, rows,
+                        w1.delta.buffer.ptr, w1.delta.buffer.ptr)?;
+                }
                 (Previous::Delta | Previous::Planes(_), Some(before)) => {
                     let ffn = slot(before, true, 0);
                     exchange.wait(1, ffn)?;
@@ -1374,6 +1421,7 @@ impl<'a> GlmEngine<'a> {
             exchange.push(1, attended, w1.delta.buffer.ptr, bytes)?;
             exchange.wait(1, attended)?;
             self.norm_full(1, w1, layer.ptr("post_norm")?, 2, rows, w1.delta.buffer.ptr, self.recv(1, attended)?)?;
+            if self.native_experts.is_some() && !layer.dense { return Ok(()); }
             let out = if layer.dense { w1.delta.buffer.ptr } else { w1.shared.buffer.ptr };
             let intermediate = if layer.dense { self.cfg.dense_intermediate } else { self.cfg.moe_intermediate };
             self.ffn_on(1, w1, layer, intermediate, "m64", out, rows)?;
@@ -2257,6 +2305,38 @@ mod long_graph_tests {
     use super::*;
 
     #[test]
+    fn native_peer_residual_schedule_has_no_partial_roundtrip() {
+        use crate::shared::peer_split::order::{check, Schedule};
+        for repeats in [1, 3] {
+            let mut schedule = Schedule::default();
+            for _ in 0..repeats {
+                schedule.push_to(0, "main", DIRECT, 0, "embedding");
+                schedule.wait_for(1, "main", DIRECT, 0, "embedding");
+                for layer in 0..8 {
+                    for rank in 0..2 {
+                        schedule.push(rank, "main", slot(layer, false, 0), "attention");
+                        schedule.wait(rank, "main", slot(layer, false, 0), "attention received");
+                    }
+                    let ffn = slot(layer, true, 0);
+                    if layer < 3 {
+                        for rank in 0..2 { schedule.push(rank, "main", ffn, "dense partial"); }
+                        for rank in 0..2 { schedule.wait(rank, "main", ffn, "dense sum"); }
+                    } else if layer < 7 {
+                        schedule.push(0, "main", ffn, "completed native residual");
+                        schedule.wait(1, "main", ffn, "native residual copied");
+                    }
+                }
+                schedule.end_request();
+            }
+            check(&schedule).unwrap();
+            assert_eq!(schedule.streams[0].iter().filter(|(_, label)|
+                label == "completed native residual").count(), repeats * 4);
+            assert!(!schedule.streams[1].iter().any(|(_, label)|
+                label == "completed native residual"));
+        }
+    }
+
+    #[test]
     fn native_expert_request_preserves_f16_rows_and_rotated_only_contract() -> Result<()> {
         for rows in [1, 8, 64, 65] {
             let (hidden, topk) = (128, 2);
@@ -2336,8 +2416,9 @@ mod long_graph_tests {
 
 impl Drop for GlmEngine<'_> {
     fn drop(&mut self) {
-        if self.tp2.is_some() || self.layer_execution.is_some() {
-            crate::shared::decode_graph::fatal_drain(self.retire_tp2(), "GLM TP2 engine retirement");
+        if self.tp2.is_some() || self.layer_execution.is_some()
+            || (self.native_experts.is_some() && self.peer.is_some()) {
+            crate::shared::decode_graph::fatal_drain(self.retire_tp2(), "GLM peer engine retirement");
         }
         if self.native_experts.is_some() {
             // SAFETY: native shared execution and workspace owners remain live until this drain.

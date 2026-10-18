@@ -252,11 +252,12 @@ pub fn request(inputs: &GlmInputs<'_>) -> Result<PlacementRequest, PlacementErro
         || inputs.prefill_rows == 0 || inputs.prefill_rows > 4096 || inputs.max_context == 0 {
         return Err(PlacementError::Inventory("GLM rank/lane/step/context geometry"));
     }
-    if inputs.native_experts && (gpus != 1 || inputs.prefill_lanes != 1
+    if inputs.native_experts && (inputs.prefill_lanes != 1
         || inputs.spark_ranks == 0 || inputs.spark_ranks > 6 || inputs.skip_routed_experts
+        || (gpus == 2 && inputs.spark_ranks != 4)
         || !inputs.experts.is_empty() || inputs.drafter_bytes != 0 || inputs.scratch.is_none()
-        || inputs.context.is_some() || inputs.native_workspace == 0) {
-        return Err(PlacementError::Inventory("EXLR8 requires one coordinator, serial measured workspaces and real Spark experts"));
+        || inputs.native_workspace == 0) {
+        return Err(PlacementError::Inventory("EXLR8 requires serial measured workspaces, real Spark experts and TP4 on two coordinators"));
     }
     let geometry = glm_cache_geometry(cfg, inputs.layers, gpus)
         .map_err(|_| PlacementError::Inventory("GLM cache geometry"))?;
@@ -937,7 +938,9 @@ mod tests {
         assert!(request(&invalid).is_err());
         let mut invalid = native.clone(); invalid.spark_ranks = 0;
         assert!(request(&invalid).is_err());
-        let mut invalid = native; invalid.gpus.push(invalid.gpus[0]);
+        let mut pair = native.clone(); pair.gpus.push(pair.gpus[0]);
+        assert!(request(&pair).is_ok());
+        let mut invalid = pair; invalid.spark_ranks = 6;
         assert!(request(&invalid).is_err());
     }
 
