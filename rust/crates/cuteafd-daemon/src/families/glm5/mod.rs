@@ -529,7 +529,10 @@ impl Opened {
             args.draft_context_slots.unwrap_or(20.max(args.draft_sequences)), args.draft_sequences,
             args.draft_fp8 == Some(false))).transpose()?.unwrap_or(0);
         let pending_code = devices.iter().enumerate().map(|(rank, &device)|
-            crate::shared::inventory::pending_code(&self.library, device, rank, devices.len() == 2, "glm", "*"))
+            crate::shared::inventory::pending_code(&self.library, device, rank, devices.len() == 2, "glm", "*",
+                &cuteafd_loader::placement::ProgramSet::from_names(
+                    if native && rank == 0 { &["glm", "glm2", "exlr8"] } else { &["glm", "glm2"] },
+                    programs.names())))
             .collect::<Result<Vec<_>>>()?;
         let spark_ranks = args.peers.as_deref().map_or(0, |p| p.split(',').count());
         // Token-split attention: the build's programs (GPU0's table; both GPUs load the same).
