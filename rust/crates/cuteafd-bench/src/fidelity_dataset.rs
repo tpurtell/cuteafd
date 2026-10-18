@@ -29,9 +29,10 @@ pub const GLM_REVISION: &str = "581cdf3b5ee5a63dd5a7726b9d33ea16cf105b0d";
 pub const GLM_CONFIG: &str = "glm5-v2_20261006_exl3k4_bf16root";
 pub const V4PRO_REVISION: &str = "5528730649150b8d8753e052f001f203b36ca12f";
 pub const V4PRO_CONFIG: &str = "deepseek_v4-v2_20261005_v4pro";
-pub const QWEN_DENSE_REVISION: &str = "5242b6006b22b488d71b6695fb449221baeb54ff";
-pub const QWEN35_9B_CONFIG: &str = "qwen35-9b-v1_20261015_bf16";
-pub const QWEN35_9B_MANIFEST_SHA256: &str = "205f00fb9267c6a3c6db0324f8263ac61163cd237e926d8f7ffc49df0a01d8b3";
+pub const QWEN35_9B_REVISION: &str = "9f4909c696924dd468662be6ab46195fa98e62e6";
+pub const QWEN38_27B_REVISION: &str = "5242b6006b22b488d71b6695fb449221baeb54ff";
+pub const QWEN35_9B_CONFIG: &str = "qwen35-9b-v1_20261018_own-text-bf16";
+pub const QWEN35_9B_MANIFEST_SHA256: &str = "8eaaefad78bbea0e53f0d94ac5bf5c6ef851375a4388eccfdb82bdad6948112e";
 pub const QWEN38_27B_CONFIG: &str = "qwen38-27b-v1_20261015_bf16";
 pub const QWEN38_27B_MANIFEST_SHA256: &str = "4b1ba4f3eea0557c7f985f0bf0ad7b6fdcc89f74b87033fae08eedef0c7c5d57";
 pub const STEP5_REVISION: &str = "f9cecb776d4e47f05738369e7e157122f3e0b473";
@@ -261,8 +262,8 @@ pub fn download(agent: &ureq::Agent, cache: &Path, repo: &str, commit: &str, con
         let expected = match (commit, config) {
             (FLASH_REVISION, FLASH_CONFIG) => Some(FLASH_MANIFEST_SHA256),
             (MIMO_PRO_REVISION, MIMO_PRO_CONFIG) => Some(MIMO_PRO_MANIFEST_SHA256),
-            (QWEN_DENSE_REVISION, QWEN35_9B_CONFIG) => Some(QWEN35_9B_MANIFEST_SHA256),
-            (QWEN_DENSE_REVISION, QWEN38_27B_CONFIG) => Some(QWEN38_27B_MANIFEST_SHA256),
+            (QWEN35_9B_REVISION, QWEN35_9B_CONFIG) => Some(QWEN35_9B_MANIFEST_SHA256),
+            (QWEN38_27B_REVISION, QWEN38_27B_CONFIG) => Some(QWEN38_27B_MANIFEST_SHA256),
             (STEP5_REVISION, STEP5_CONFIG) => Some(STEP5_MANIFEST_SHA256),
             (V41_1017_REVISION, V41_1017_CONFIG) => Some(V41_1017_MANIFEST_SHA256),
             (MIMO_PRO_MEDIA_REVISION, MIMO_PRO_MEDIA_CONFIG) => Some(MIMO_PRO_MEDIA_MANIFEST_SHA256),
@@ -646,7 +647,7 @@ mod tests {
     fn manifest_pins_reject_even_self_consistent_cached_indexes() {
         let temporary = tempfile::tempdir().unwrap();
         for (revision, config) in [(MIMO_PRO_REVISION, MIMO_PRO_CONFIG),
-            (MIMO_PRO_MEDIA_REVISION, MIMO_PRO_MEDIA_CONFIG), (STEP5_REVISION, STEP5_CONFIG),
+            (MIMO_PRO_MEDIA_REVISION, MIMO_PRO_MEDIA_CONFIG), (QWEN35_9B_REVISION, QWEN35_9B_CONFIG), (STEP5_REVISION, STEP5_CONFIG),
             (V41_1017_REVISION, V41_1017_CONFIG)] {
             let root = temporary.path().join("wrldsuksgo2mars--cuteafd-fidelity").join(revision);
             std::fs::create_dir_all(root.join(config)).unwrap();
@@ -673,6 +674,15 @@ mod tests {
         assert_eq!(reference.windows.len(), 64);
         assert_eq!(reference.windows.iter().map(|w| w.positions.len()).sum::<usize>(), 32768);
         assert_eq!(hash, expected_hash);
+        if commit == QWEN35_9B_REVISION && config == QWEN35_9B_CONFIG {
+            assert_eq!(reference.checkpoint, "Qwen/Qwen3.5-9B");
+            assert_eq!(identity["qualification"], "reference");
+            assert_eq!(identity["text_checkpoint"], "Qwen/Qwen3.5-9B");
+            assert_eq!((reference.expect.top1_min, reference.expect.kl_max), (0.90, 0.06));
+            let balance = standard_balance(&reference);
+            assert_eq!(balance["decode"]["generated_positions"], 13824);
+            assert_eq!(balance["prefill"]["generated_positions"], 13168);
+        }
         if commit == STEP5_REVISION && config == STEP5_CONFIG {
             assert_eq!(reference.checkpoint, "stepfun-ai/Step-5-Preview-BF16");
             assert_eq!(identity["qualification"], "reference-only qualified");
