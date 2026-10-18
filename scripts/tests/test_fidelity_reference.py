@@ -112,6 +112,7 @@ def test_reference_only_validator_seals_and_rejects_mutation(tmp_path):
     proof.update(source_window="w", set_sha256=manifest["set_sha256"])
     # The main fixture also uses 576 scored rows after this extension.
     source["tokens"] = (np.arange(640) % 2).tolist()
+    source["roles"] = ['ctx'] * 64 + ['gen', 'ctx'] * 288
     manifest["set_sha256"] = set_hash(manifest)
     proof["set_sha256"] = manifest["set_sha256"]
     logits = np.random.default_rng(42).normal(size=(576, 2)) * 12 + 1000
@@ -172,6 +173,10 @@ def test_reference_only_validator_seals_and_rejects_mutation(tmp_path):
     assert result["passed"] and not result["engine_parity"]
     assert result["scored_tokens"] == 576
     assert result["nll"] == pytest.approx(entry["nll"], abs=1e-12)
+    assert result['scored_tokens_gen'] == result['scored_tokens_ctx'] == 288
+    assert result['nll_gen'] == pytest.approx(-logp[::2, 0].mean(), abs=1e-12)
+    assert result['nll_ctx'] == pytest.approx(-logp[1::2, 1].mean(), abs=1e-12)
+    assert result['gen_top1'] == pytest.approx((values[::2].argmax(axis=1) == 0).mean())
     assert validator.validate_reference_only(tmp_path) == result
     with pytest.raises(ValueError, match="sealed or validated"):
         backfiller.backfill(golden)

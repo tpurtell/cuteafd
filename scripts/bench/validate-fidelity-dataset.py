@@ -105,6 +105,9 @@ def validate_reference_only(root, *, seal=False):
             raise ValueError('dataset path escapes its root')
         return path
     total, count = 0.0, 0
+    role_losses = {'ctx': 0.0, 'gen': 0.0}
+    role_counts = {'ctx': 0, 'gen': 0}
+    gen_matches = 0
     for window in manifest['windows']:
         entry, full, summary = entries[window['id']], row_entries[window['id']], compact_entries[window['id']]
         positions = list(range(window['score_from'], len(window['tokens'])))
@@ -156,7 +159,13 @@ def validate_reference_only(root, *, seal=False):
             target = window['tokens'][pos]
             if record['pos'] != pos or record['next'] != target or abs(record['next_lp'] - logp[target]) > 0.000006:
                 raise ValueError('compact next-token probability mismatch')
-            loss -= float(logp[target])
+            row_loss = -float(logp[target])
+            loss += row_loss
+            role = window['roles'][pos]
+            role_losses[role] += row_loss
+            role_counts[role] += 1
+            if role == 'gen':
+                gen_matches += int(np.argmax(values)) == target
         if (entry['scored_tokens'] != len(positions)
                 or not math.isclose(entry['nll'], loss / len(positions), abs_tol=1e-8)):
             raise ValueError('window NLL/scored_tokens mismatch')
@@ -188,6 +197,10 @@ def validate_reference_only(root, *, seal=False):
         raise ValueError('dataset seal mismatch')
     return dict(schema='cuteafd.fidelity.reference-validation/1', passed=True, engine_parity=False,
                 windows=len(entries), scored_tokens=count, nll=total / count,
+                nll_gen=role_losses['gen'] / role_counts['gen'] if role_counts['gen'] else None,
+                nll_ctx=role_losses['ctx'] / role_counts['ctx'] if role_counts['ctx'] else None,
+                gen_top1=gen_matches / role_counts['gen'] if role_counts['gen'] else None,
+                scored_tokens_gen=role_counts['gen'], scored_tokens_ctx=role_counts['ctx'],
                 set_sha256=manifest['set_sha256'], golden_seal_sha256=digest(root / 'golden-seal.json'),
                 full_seal_sha256=digest(root / 'full.sha256.json'))
 

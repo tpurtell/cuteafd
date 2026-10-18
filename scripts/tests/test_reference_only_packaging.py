@@ -206,3 +206,28 @@ def test_dense_root_wording_is_unchanged_and_v41_root_comes_from_the_manifest():
     precision, arithmetic, source = packager.root_description(meta, panel)
     assert precision == 'root (official FP8 block dense + MXFP4 experts (no vendor BF16 master))'
     assert (arithmetic, source) == ('Official inference/model.py block by block.', 'official inference/model.py')
+
+
+def test_reference_role_metrics_and_card_explain_aggregate_nll():
+    validation = dict(nll=3.4, scored_tokens=10, nll_gen=.2, nll_ctx=8.2,
+                      gen_top1=.95, scored_tokens_gen=6, scored_tokens_ctx=4)
+    metrics = packager.reference_role_metrics(validation)
+    assert metrics == {key: value for key, value in validation.items() if key not in ('nll', 'scored_tokens')}
+    note = packager.reference_role_note(metrics)
+    assert 'Generated-row NLL 0.200000000' in note
+    assert 'context-row NLL 8.200000000' in note
+    assert '95.0000%' in note
+    assert 'Aggregate NLL includes trailing-context rows' in note
+    assert 'engine and reference score the same tokens' in note
+    with pytest.raises(ValueError, match='aggregate NLL'):
+        packager.reference_role_metrics({**validation, 'nll': 4})
+    with pytest.raises(ValueError, match='counts mismatch'):
+        packager.reference_role_metrics({**validation, 'scored_tokens_gen': 7})
+    with pytest.raises(ValueError, match='generated top-1'):
+        packager.reference_role_metrics({**validation, 'gen_top1': 1.1})
+
+
+def test_reference_role_metrics_without_generated_rows():
+    metrics = packager.reference_role_metrics(dict(nll=.5, scored_tokens=10,
+        nll_gen=None, nll_ctx=.5, gen_top1=None, scored_tokens_gen=0, scored_tokens_ctx=10))
+    assert 'n/a (no rows)' in packager.reference_role_note(metrics)

@@ -106,6 +106,40 @@ def standard_generated_note(counts):
             'Informational only: fixed window IDs are not resampled; each half reports per-position rates.\n')
 
 
+def reference_role_metrics(validation):
+    counts = [validation['scored_tokens_' + role] for role in ('gen', 'ctx')]
+    if (any(not isinstance(count, int) or count < 0 for count in counts)
+            or sum(counts) != validation['scored_tokens']):
+        raise ValueError('reference role counts mismatch')
+    for role, count in zip(('gen', 'ctx'), counts):
+        value = validation['nll_' + role]
+        if (count and (value is None or not np.isfinite(value) or value < 0)
+                or not count and value is not None):
+            raise ValueError('reference role NLL mismatch')
+    top1 = validation['gen_top1']
+    if (counts[0] and (top1 is None or not np.isfinite(top1) or not 0 <= top1 <= 1)
+            or not counts[0] and top1 is not None):
+        raise ValueError('reference generated top-1 mismatch')
+    weighted = sum((validation['nll_' + role] or 0) * count
+                   for role, count in zip(('gen', 'ctx'), counts)) / sum(counts)
+    if not np.isclose(weighted, validation['nll'], rtol=1e-9, atol=1e-8):
+        raise ValueError('reference role aggregate NLL mismatch')
+    return {key: validation[key] for key in
+            ('nll_gen', 'nll_ctx', 'gen_top1', 'scored_tokens_gen', 'scored_tokens_ctx')}
+
+
+def reference_role_note(metrics):
+    def number(value):
+        return f'{value:.9f}' if value is not None else 'n/a (no rows)'
+    top1 = f'{100 * metrics["gen_top1"]:.4f}%' if metrics['gen_top1'] is not None else 'n/a (no rows)'
+    return (f'Generated-row NLL {number(metrics["nll_gen"])} nat/token '
+            f'({metrics["scored_tokens_gen"]:,} rows); context-row NLL {number(metrics["nll_ctx"])} nat/token '
+            f'({metrics["scored_tokens_ctx"]:,} rows); reference top-1 agreement with generated text {top1}.\n'
+            'Aggregate NLL includes trailing-context rows appended after short completions; '
+            'these can be out-of-distribution and make aggregate NLL non-comparable across models. '
+            'They remain valid teacher-forced fidelity probes: engine and reference score the same tokens.\n')
+
+
 def own_text(panel):
     try:
         validate_text_source(panel)
@@ -270,8 +304,9 @@ def package(source, out, config, tokenizer_path, license_path):
     runtime = read('platform.json')
     provenance['runtime'] = validate_runtime_platform(runtime)
     generated_rows = standard_generated_rows(panel)
+    role_metrics = reference_role_metrics(validation)
     qualification = dict(schema='cuteafd.fidelity.qualification/1', kind='reference', qualifies=True,
-                         standard_generated_rows=generated_rows,
+                         **role_metrics, standard_generated_rows=generated_rows,
                          engine_parity=False, qualification_scope='reference logits, storage and prefix invariance',
                          set_sha256=set_id, nll=meta['nll'], scored_tokens=meta['scored_tokens'],
                          prefix_qualification=meta['prefix_qualification'], reference_validation=validation,
@@ -311,6 +346,7 @@ def package(source, out, config, tokenizer_path, license_path):
             'The bench quick subset is legacy,a00,a04,a08,a20,c00,d00,e00 (4,096 rows).\n\n'
             '## Qualification\n\n'
             f'32,768 scored positions; reference NLL {meta["nll"]:.15f} nat/token.\n'
+            f'{reference_role_note(role_metrics)}'
             f'{standard_generated_note(generated_rows)}'
             'The 576/640-token prefix probes have 512 byte-identical common F32 rows and zero argmax disagreements.\n'
             f'{arithmetic}\n'
