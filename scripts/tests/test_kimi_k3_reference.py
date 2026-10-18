@@ -229,8 +229,9 @@ def test_noise_metrics_are_diagnostic_not_a_gate():
 
 def test_official_noise_streams_native_b2_and_resumes(tmp_path, monkeypatch, request):
     torch = pytest.importorskip("torch")
-    original_dtype = torch.get_default_dtype()
+    original_dtype, original_rng = torch.get_default_dtype(), torch.get_rng_state()
     request.addfinalizer(lambda: torch.set_default_dtype(original_dtype))
+    request.addfinalizer(lambda: torch.set_rng_state(original_rng))
     for backend, name in ((torch.backends.cuda.matmul, "allow_tf32"), (torch.backends.cudnn, "allow_tf32"),
                           (torch.backends.cuda.matmul, "allow_bf16_reduced_precision_reduction")):
         monkeypatch.setattr(backend, name, getattr(backend, name))
