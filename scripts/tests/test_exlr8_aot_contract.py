@@ -27,7 +27,8 @@ def test_capacity_scratch_matches_native_v1():
 
 
 @pytest.mark.parametrize("kwargs", [dict(hidden=127), dict(units=0), dict(top_k=-1),
-    dict(max_groups=2**31), dict(hidden=True), dict(units=2**31-1,max_groups=2**31-1)])
+    dict(max_groups=2**31), dict(hidden=True), dict(units=2**31-1,max_groups=2**31-1),
+    dict(top_k=2**26), dict(max_groups=2**27), dict(units=2**24), dict(hidden=2**30)])
 def test_invalid_geometry_rejected(kwargs):
     with pytest.raises(ValueError):
         contract()["geometry"](**kwargs)

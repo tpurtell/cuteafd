@@ -31,8 +31,14 @@ pub fn validate(spec: &ProgramSpec) -> Result<(), ManifestError> {
     let product = |factors: &[u64]| factors.iter().try_fold(1u64, |a, &b|
         a.checked_mul(b).filter(|&v| v <= i64::MAX as u64))
         .ok_or_else(|| invalid("scratch size overflow"));
-    // Validate route/index addressing too, even though these are caller-owned inputs.
-    product(&[64, t])?;
+    // Leave headroom for the final grid-stride increment before loop exit.
+    let tasks = [product(&[g, u, 2, h.div_ceil(1024)])?, product(&[g, u])?,
+        product(&[g, h / 128])?, product(&[64, h / 128])?];
+    if tasks.iter().any(|&n| n > i32::MAX as u64 / 2)
+        || product(&[64, t])? > i32::MAX as u64
+        || product(&[g, 16])? > i32::MAX as u64 {
+        return Err(invalid("task or route indexing exceeds signed int32"));
+    }
     let sizes = HashMap::from([
         ("fc1".to_string(), product(&[g, u, 2, h.div_ceil(1024), 16, 128, 4])?),
         ("intermediate".to_string(), product(&[g, u, 16, 128, 2])?),
@@ -123,6 +129,20 @@ mod tests {
                     "split_k_blocks", "fc1_splits"] {
             let mut s = spec(); s.geometry[key] = serde_json::json!(0);
             assert!(validate(&s).is_err(), "{key}");
+        }
+    }
+    #[test]
+    fn rejects_int32_task_and_route_overflow() {
+        for (key, value) in [("top_k", 1u64 << 26), ("max_groups", 1 << 27),
+            ("units", 1 << 24), ("hidden", 1 << 30)] {
+            let mut s = spec(); s.geometry[key] = serde_json::json!(value);
+            let h = s.geometry["hidden"].as_u64().unwrap();
+            let u = s.geometry["units"].as_u64().unwrap();
+            let g = s.geometry["max_groups"].as_u64().unwrap();
+            s.geometry["fc1_splits"] = serde_json::json!(h.div_ceil(1024));
+            s.scratch = HashMap::from([("fc1".into(), g*u*2*h.div_ceil(1024)*16*128*4),
+                ("intermediate".into(), g*u*16*128*2), ("fc2".into(),g*16*h*4)]);
+            assert!(validate(&s).unwrap_err().to_string().contains("int32"), "{key}");
         }
     }
     #[test]
