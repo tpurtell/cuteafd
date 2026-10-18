@@ -5,6 +5,7 @@ from contextlib import contextmanager
 import hashlib
 import importlib
 import json
+import os
 from pathlib import Path
 import re
 import struct
@@ -52,9 +53,49 @@ def package_source_identity(module):
     return hashlib.sha256(json.dumps(files, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 
+def configure_f32():
+    """Apply the same strict IEEE arithmetic to Torch and the official FLA kernels."""
+    import torch
+    os.environ["TRITON_F32_DEFAULT"] = "ieee"
+    os.environ["FLA_TRIL_PRECISION"] = "ieee"
+    torch.set_default_dtype(torch.float32)
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = False
+    torch.set_float32_matmul_precision("highest")
+    from triton import knobs
+    import triton.language as tl
+    import fla.ops.kda.chunk_intra as intra
+    # This pinned FLA kernel explicitly chooses TF32, independently of Torch.
+    knobs.language.fp32_default = "ieee"
+    intra.SOLVE_TRIL_DOT_PRECISION = tl.constexpr("ieee")
+    return {"dtype": "float32", "matmul_precision": torch.get_float32_matmul_precision(),
+            "torch_matmul_tf32": torch.backends.cuda.matmul.allow_tf32,
+            "cudnn_tf32": torch.backends.cudnn.allow_tf32,
+            "triton_dot_precision": knobs.language.fp32_default,
+            "kda_solve_tril_precision": intra.SOLVE_TRIL_DOT_PRECISION.value}
+
+
+def decompress_f32(packed, scales):
+    """Decode E2M1 and group-32 E8M0 directly in F32, without a BF16 intermediate."""
+    import torch
+    if (packed.dtype != torch.uint8 or scales.dtype != torch.uint8 or packed.ndim != 2
+            or scales.shape != (packed.shape[0], packed.shape[1] * 2 // 32)
+            or packed.shape[1] * 2 % 32 or torch.any(scales == 255)):
+        raise ValueError("unsupported native MXFP4 bytes or scales")
+    table = torch.tensor([0., .5, 1., 1.5, 2., 3., 4., 6.,
+                          -0., -.5, -1., -1.5, -2., -3., -4., -6.],
+                         device=packed.device, dtype=torch.float32)
+    codes = torch.stack((packed & 15, packed >> 4), dim=-1).reshape(packed.shape[0], -1)
+    values = table[codes.long()].reshape(packed.shape[0], -1, 32)
+    result = torch.ldexp(values, scales.to(torch.int32)[..., None] - 127).reshape(packed.shape[0], -1)
+    if not torch.isfinite(result).all():
+        raise ValueError("non-finite checkpoint-native MXFP4 F32 dequantization")
+    return result
+
+
 class LayerWeights:
-    """Map shards only while loading one layer; preserve each stored dense dtype."""
-    def __init__(self, snapshot, quantization, *, kda_num_heads):
+    """Map one layer's shards; F32 references cache packed experts, never all F32 experts."""
+    def __init__(self, snapshot, quantization, *, kda_num_heads, dtype=None):
         from compressed_tensors.quantization import QuantizationScheme
         self.snapshot = Path(snapshot)
         self.index = json.loads((self.snapshot / "model.safetensors.index.json").read_bytes())["weight_map"]
@@ -69,6 +110,8 @@ class LayerWeights:
         self.native_fp32 = set()
         self.kda_num_heads = kda_num_heads
         self.narrowed_a_log = {}
+        self.dtype = dtype
+        self.packed_cache = {}
 
     def padded_a_log(self, name, shape, expected_shape):
         return (self.kda_num_heads == 96 and list(shape) == [128]
@@ -119,13 +162,18 @@ class LayerWeights:
             value = self.tensor(name)
             if value.dtype == torch.float32:
                 self.native_fp32.add(name)
-            return value
+            return value.to(dtype=self.dtype) if self.dtype is not None else value
         if not name.endswith(".weight"):
             raise ValueError("missing native parameter: " + name)
         from compressed_tensors.compressors.mxfp4 import MXFP4PackedCompressor
         prefix = name.removesuffix(".weight")
-        packed = self.tensor(prefix + ".weight_packed")
-        scale = self.tensor(prefix + ".weight_scale")
+        if name in self.packed_cache:
+            packed, scale = self.packed_cache[name]
+        else:
+            packed = self.tensor(prefix + ".weight_packed")
+            scale = self.tensor(prefix + ".weight_scale")
+        if self.dtype == torch.float32:
+            return decompress_f32(packed, scale)
         value = MXFP4PackedCompressor.decompress(
             {"weight_packed": packed, "weight_scale": scale}, self.scheme)["weight"]
         if not torch.isfinite(value).all():
@@ -159,11 +207,42 @@ class LayerWeights:
             entries.append((shard, descriptor["data_offsets"][0], full, name, parameter))
         return sorted(entries, key=lambda entry: entry[:2])
 
-    def load_module(self, module, prefix):
+    def preload_experts(self, entries):
+        self.packed_cache.clear()
+        for _, _, full, _, _ in entries:
+            if ".experts." in full:
+                prefix = full.removesuffix(".weight")
+                self.packed_cache[full] = (self.tensor(prefix + ".weight_packed"),
+                                           self.tensor(prefix + ".weight_scale"))
+        self.close()
+
+    def release_experts(self):
+        self.packed_cache.clear()
+
+    def stream_parameter(self, module, leaf, full, shape):
+        import torch
+        def load(owner, args):
+            value = self.weight(full)
+            if value.dtype != torch.float32 or tuple(value.shape) != tuple(shape):
+                raise ValueError("streamed F32 expert parameter differs: " + full)
+            owner._parameters[leaf] = torch.nn.Parameter(value, requires_grad=False)
+        def release(owner, args, output):
+            owner._parameters[leaf] = torch.nn.Parameter(
+                torch.empty(shape, device="meta", dtype=torch.float32), requires_grad=False)
+        module.register_forward_pre_hook(load)
+        module.register_forward_hook(release, always_call=True)
+
+    def load_module(self, module, prefix, *, stream_experts=False):
         import torch
         entries = self.validate_module(module, prefix)
-        # Native parameters are materialized once, not as an extra whole-layer copy.
+        if stream_experts:
+            self.preload_experts(entries)
+        # Expert matrices live only during their own unchanged official Linear call.
         for _, _, full, name, parameter in entries:
+            if stream_experts and ".experts." in full:
+                parent, _, leaf = name.rpartition(".")
+                self.stream_parameter(module.get_submodule(parent), leaf, full, parameter.shape)
+                continue
             value = self.weight(full)
             if tuple(value.shape) != tuple(parameter.shape):
                 if self.padded_a_log(full, value.shape, parameter.shape):

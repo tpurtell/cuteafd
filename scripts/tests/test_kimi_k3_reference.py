@@ -449,3 +449,73 @@ def test_official_forward_gate_rejects_disagreement(tmp_path):
     with pytest.raises(ValueError, match="numerical check failed"):
         golden.official_check(tmp_path, [native, native[:, ::-1].copy()], [])
     assert json.loads((tmp_path / "official-forward.json").read_text())["passed"] is False
+
+
+@pytest.mark.parametrize("scale", [0, 1, 119, 127, 134, 252])
+def test_direct_f32_mxfp4_exact_codes_and_exponents(scale):
+    import math
+    torch = pytest.importorskip("torch")
+    packed = torch.arange(256).to(torch.uint8).reshape(16, 16)
+    scales = torch.full((16, 1), scale, dtype=torch.uint8)
+    result = model.decompress_f32(packed, scales)
+    table = [0., .5, 1., 1.5, 2., 3., 4., 6., -0., -.5, -1., -1.5, -2., -3., -4., -6.]
+    expected = np.asarray([math.ldexp(table[code], scale - 127)
+                           for byte in range(256) for code in (byte & 15, byte >> 4)], dtype=np.float32)
+    assert result.dtype == torch.float32
+    assert np.array_equal(result.numpy().reshape(-1).view(np.uint32), expected.view(np.uint32))
+    with pytest.raises(ValueError):
+        model.decompress_f32(packed, torch.full_like(scales, 255))
+
+
+def test_f32_expert_matrix_materializes_only_during_native_call():
+    torch = pytest.importorskip("torch")
+    weights = model.LayerWeights.__new__(model.LayerWeights)
+    value = torch.arange(6, dtype=torch.float32).reshape(2, 3)
+    calls = []
+    weights.weight = lambda name: calls.append(name) or value.clone()
+    layer = torch.nn.Linear(3, 2, bias=False, device="meta", dtype=torch.float32)
+    weights.stream_parameter(layer, "weight", "expert.weight", value.shape)
+    x = torch.ones(4, 3)
+    for _ in range(2):
+        assert torch.equal(layer(x), x @ value.T)
+        assert layer.weight.device.type == "meta"
+    assert calls == ["expert.weight", "expert.weight"]
+    with pytest.raises(RuntimeError):
+        layer(torch.ones(4, 7))
+    assert layer.weight.device.type == "meta"
+
+
+def test_f32_resume_preserves_non_bf16_values_and_signed_zero(tmp_path, monkeypatch):
+    torch = pytest.importorskip("torch")
+    monkeypatch.setattr(torch.Tensor, "cuda", lambda value: value)
+    state = golden.LayerState(tmp_path, {"state_dtype": "float32"})
+    values = torch.tensor([1.00001, -0., 0.1234567, -3.765432], dtype=torch.float32).reshape(1, 2, 2)
+    pending = state.begin(-1)
+    state.save(pending, "probe", values)
+    state.commit(pending)
+    restored, blocks = state.load("probe", 2)
+    assert restored.dtype == torch.float32 and blocks.dtype == torch.float32
+    assert torch.equal(restored.view(torch.int32), values.view(torch.int32))
+    assert state.latest["windows"]["probe"]["hidden"]["bytes"] == values.numel() * 4
+    with pytest.raises(ValueError, match="finite"):
+        state.save(state.begin(0), "probe", values.bfloat16())
+
+
+def test_strict_f32_configures_torch_and_explicit_kda_dot(monkeypatch, request):
+    import os
+    torch = pytest.importorskip("torch")
+    pytest.importorskip("fla")
+    from triton import knobs
+    import fla.ops.kda.chunk_intra as intra
+    dtype, precision = torch.get_default_dtype(), torch.get_float32_matmul_precision()
+    request.addfinalizer(lambda: torch.set_default_dtype(dtype))
+    request.addfinalizer(lambda: torch.set_float32_matmul_precision(precision))
+    monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", torch.backends.cuda.matmul.allow_tf32)
+    monkeypatch.setattr(torch.backends.cudnn, "allow_tf32", torch.backends.cudnn.allow_tf32)
+    monkeypatch.setattr(knobs.language, "fp32_default", knobs.language.fp32_default)
+    monkeypatch.setattr(intra, "SOLVE_TRIL_DOT_PRECISION", intra.SOLVE_TRIL_DOT_PRECISION)
+    for name in ("TRITON_F32_DEFAULT", "FLA_TRIL_PRECISION"):
+        monkeypatch.setenv(name, os.environ.get(name, ""))
+    policy = model.configure_f32()
+    assert policy == {"dtype": "float32", "matmul_precision": "highest", "torch_matmul_tf32": False,
+                      "cudnn_tf32": False, "triton_dot_precision": "ieee", "kda_solve_tril_precision": "ieee"}

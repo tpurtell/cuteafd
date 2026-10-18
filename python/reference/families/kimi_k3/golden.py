@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Official Kimi K3 MXFP4 text oracle, one native layer resident at a time.
 
-Block-residual history and current BF16 streams are durable NVMe files. Only an
+Block-residual history and current F32 streams are durable NVMe files. Only an
 atomic, fsynced layer manifest advances resume, so an interruption loses at most
 one layer. Prefix qualification includes an independent unmodified-decoder arm.
 """
@@ -21,7 +21,7 @@ ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(ROOT / "python/reference"))
 from fidelity_windows import (canonical, finish_golden, load_set, verify_snapshot,
                               write_scored_logits)
-from families.kimi_k3.model import (LayerWeights, geometry, load_official,
+from families.kimi_k3.model import (LayerWeights, configure_f32, geometry, load_official,
                                     package_source_identity, source_identity)
 
 
@@ -82,8 +82,12 @@ class LayerState:
         import torch
         entry = self.latest["windows"][wid]
         def read(blob):
-            raw = np.fromfile(self.contained(blob["path"]), dtype="<u2")
-            return torch.from_numpy(raw).view(torch.bfloat16).reshape(-1, hidden_size).cuda()
+            f32 = self.binding.get("state_dtype") == "float32"
+            raw = np.fromfile(self.contained(blob["path"]), dtype="<f4" if f32 else "<u2")
+            value = torch.from_numpy(raw)
+            if not f32:
+                value = value.view(torch.bfloat16)
+            return value.reshape(-1, hidden_size).cuda()
         hidden = read(entry["hidden"])[None]
         blocks = [read(blob) for blob in entry["blocks"]]
         history = (torch.stack(blocks, dim=1) if blocks else
@@ -105,10 +109,13 @@ class LayerState:
 
     def save(self, pending, wid, hidden, append_block=False):
         import torch
-        if hidden.dtype != torch.bfloat16 or not torch.isfinite(hidden).all():
-            raise ValueError("reference stream must remain finite native BF16")
+        f32 = self.binding.get("state_dtype") == "float32"
+        expected = torch.float32 if f32 else torch.bfloat16
+        if hidden.dtype != expected or not torch.isfinite(hidden).all():
+            raise ValueError("reference stream must remain finite " + str(expected))
         path = self.root / ("layer%03d" % pending["layer"]) / (wid + ".bin")
-        raw = hidden.detach().cpu().contiguous().view(torch.uint16).numpy()
+        value = hidden.detach().cpu().contiguous()
+        raw = (value if f32 else value.view(torch.uint16)).numpy()
         with path.open("wb") as stream:
             raw.tofile(stream)
             stream.flush()
@@ -142,6 +149,24 @@ def native_layer(reference, config, weights, index):
     with torch.device("meta"):
         layer = reference.KimiDecoderLayer(config, index)
     prefix = f"language_model.model.layers.{index}"
+    if getattr(weights, "dtype", None) == torch.float32:
+        weights.release_experts()
+        entries = weights.validate_module(layer, prefix)
+        required, largest = 0, 0
+        for _, _, full, _, parameter in entries:
+            if ".experts." in full:
+                stem = full.removesuffix(".weight")
+                for suffix in (".weight_packed", ".weight_scale"):
+                    _, descriptor = weights.descriptor(stem + suffix)
+                    required += descriptor["data_offsets"][1] - descriptor["data_offsets"][0]
+                largest = max(largest, parameter.numel() * 4)
+            else:
+                required += parameter.numel() * 4
+        free, _ = torch.cuda.mem_get_info()
+        # Admission covers all 16K-window state/combine/KDA buffers plus slack.
+        if required + largest * 5 + 64 * 1024 ** 3 > free:
+            raise ValueError("packed layer plus strict F32 execution reserve does not fit")
+        return weights.load_module(layer, prefix, stream_experts=True)
     required = 0
     for name, parameter in layer.named_parameters():
         full = prefix + "." + name
@@ -202,17 +227,14 @@ def execute(a):
 
     started = time.monotonic()
     a.out.mkdir(parents=True, exist_ok=True)
-    torch.set_default_dtype(torch.bfloat16)
-    torch.backends.cuda.matmul.allow_tf32 = False
-    torch.backends.cudnn.allow_tf32 = False
-    torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = False
+    arithmetic = configure_f32()
     torch.manual_seed(0)
     manifest = load_set(a.windows)
     if manifest["family"] != "kimi_k3" or any(w.get("media") for w in manifest["windows"]):
         raise ValueError("Kimi oracle supports only its own text panel")
     snapshot = verify_snapshot(manifest, a.snapshot)
     reference, config, quantization = load_official(a.snapshot)
-    weights = LayerWeights(a.snapshot, quantization,
+    weights = LayerWeights(a.snapshot, quantization, dtype=torch.float32,
                            kda_num_heads=config.linear_attn_config["num_heads"])
     # Check every layer shape and only the small A_log tails before GPU admission.
     for index in range(config.num_hidden_layers):
@@ -257,7 +279,9 @@ def execute(a):
                "compressed_tensors": compressed_tensors.__version__,
                "compute_capability": list(torch.cuda.get_device_capability()),
                "image_sha256": os.environ.get("CUTEAFD_REFERENCE_IMAGE_SHA256", ""),
-               "state_bytes_per_layer": sum(len(w["tokens"]) * config.hidden_size * 2 for w in windows),
+               "state_dtype": "float32", "arithmetic": arithmetic,
+               "expert_storage": "GPU packed cache; one F32 matrix resident per native Linear call",
+               "state_bytes_per_layer": sum(len(w["tokens"]) * config.hidden_size * 4 for w in windows),
                "windows": {w["id"]: hashlib.sha256(canonical(w["tokens"])).hexdigest() for w in windows}}
     state = LayerState(a._kimi_probe_state if checking else
                        a.out.parent / (a.out.name + "-layer-state"), binding)
@@ -306,6 +330,7 @@ def execute(a):
             pending["native_fp32_parameters"] = sorted(set(pending["native_fp32_parameters"]) | weights.native_fp32)
             state.commit(pending)
             del layer
+            weights.release_experts()
             torch.cuda.empty_cache()
             print(f"layer {index + 1}/{config.num_hidden_layers} committed; {time.monotonic() - tick:.1f}s; read {weights.bytes_read / 1e9:.3f} GB", flush=True)
         with torch.device("meta"):
@@ -357,9 +382,10 @@ def execute(a):
                              "situ_linear_beta": config.activation_situ_linear_beta,
                              "kda_gate_lower_bound": config.linear_attn_config["gate_lower_bound"],
                              "kda_a_log_zero_padding": weights.padding_provenance()},
-                      official_forward=comparison,
-                      root_arithmetic={"source": "official checkpoint Python decoder and compressed-tensors MXFP4 decompressor",
-                          "arithmetic": "Exact native group-32 MXFP4 dequantization; shipped dense dtypes; BF16 stream and full block-residual history; official Situ, latent MoE, bounded-gate FLA KDA and eager MLA; F32 accumulations and widened F32 head; fixed-M128 linears; MTP/cache off.\n\nCheckpoint-format note: the release zero-pads native KDA A_log from 96 active heads to 128. Each affected tensor is narrowed to the first 96 only after all 32 unused F32 values are verified bit-exact positive zero. Per-layer shapes and tail SHA256 checks are recorded in reference_provenance.gates.kda_a_log_zero_padding; all other tensor shapes remain strict."},
+                      official_forward=comparison, arithmetic=arithmetic,
+                      expert_storage=binding["expert_storage"],
+                      root_arithmetic={"source": "official checkpoint Python decoder; exact E2M1/E8M0 group-32 MXFP4 decoded directly to F32",
+                          "arithmetic": "Reference computed entirely in F32 from the native checkpoint: exact group-32 MXFP4 to F32; shipped BF16/F32 dense tensors upcast to F32; F32 activations, block history, router, norms, KDA recurrence and eager attention; TF32 disabled in Torch and Triton, highest matmul precision; one expert matrix dequantized at a time from a per-layer packed GPU cache; fixed-M128 linears; MTP/cache off.\n\nCheckpoint-format note: the release zero-pads native KDA A_log from 96 active heads to 128. Each affected tensor is narrowed to the first 96 only after all 32 unused F32 values are verified bit-exact positive zero. Per-layer shapes and tail SHA256 checks are recorded in reference_provenance.gates.kda_a_log_zero_padding; all other tensor shapes remain strict."},
                       platform={"capability": list(torch.cuda.get_device_capability()),
                                 "gpu": torch.cuda.get_device_name(), "cuda": torch.version.cuda})
     print(f"reference NLL {total_nll / total_rows:.12f}; {total_rows} scored rows", flush=True)

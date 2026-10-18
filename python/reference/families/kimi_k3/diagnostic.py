@@ -133,10 +133,10 @@ class Trace:
         return rows
 
 
-def first_difference(rows, field):
+def first_difference(rows, field, limit=1e-6):
     return next(({"op": row["op"], **item} for row in rows for item in row[field]
-                 if item.get("relative_l2", 0) > 1e-5 or item.get("shape_mismatch")
-                 or item.get("structure_mismatch")), None)
+                 if item.get("relative_l2", 0) > limit or item.get("shape_mismatch")
+                 or item.get("structure_mismatch") or item.get("missing")), None)
 
 
 def linear_variants(trace, *, device):
@@ -340,14 +340,11 @@ def diagnose(a, *, native_layer, atomic_json, digest, state_type, official_mask)
     import torch
     import fla
     from fidelity_windows import load_set, verify_snapshot
-    from families.kimi_k3.model import LayerWeights, geometry, load_official, source_identity
+    from families.kimi_k3.model import LayerWeights, configure_f32, geometry, load_official, source_identity
 
     if a.diagnose_layer != 1 or a.probe_state is None:
         raise ValueError("diagnosis currently requires --diagnose-layer 1 and --probe-state")
-    torch.set_default_dtype(torch.bfloat16)
-    torch.backends.cuda.matmul.allow_tf32 = False
-    torch.backends.cudnn.allow_tf32 = False
-    torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = False
+    arithmetic = configure_f32()
     torch.manual_seed(0)
     if a.diagnose_blas:
         torch.backends.cuda.preferred_blas_library(a.diagnose_blas)
@@ -366,26 +363,27 @@ def diagnose(a, *, native_layer, atomic_json, digest, state_type, official_mask)
     if blob["sha256"] != other["sha256"] or "block000" not in blob["path"]:
         raise ValueError("initial official/adapted embedding state differs")
     reference, config, quantization = load_official(a.snapshot)
-    weights = LayerWeights(a.snapshot, quantization,
+    weights = LayerWeights(a.snapshot, quantization, dtype=torch.float32,
                            kda_num_heads=config.linear_attn_config["num_heads"])
     if not config.linear_attn_config.get("gate_lower_bound") == -5.0:
         raise ValueError("diagnosis requires the pinned bounded-gate checkpoint")
     a.out.mkdir(parents=True, exist_ok=True)
     embedding = torch.from_numpy(np.fromfile(state.verify(blob), dtype="<u2")).view(torch.bfloat16)
-    embedding = embedding.reshape(1, -1, config.hidden_size).cuda()
+    embedding = embedding.reshape(1, -1, config.hidden_size).float().cuda()
     if embedding.shape[1] != 128:
         raise ValueError("diagnosis requires the saved 128-token short stream")
     input_path = a.out / "layer1-input.bin"
     stamp_path = a.out / "layer1-input.json"
     identity = {"embedding_sha256": blob["sha256"], "snapshot_identity": snapshot,
                 "torch": torch.__version__, "image_sha256": binding["image_sha256"],
+                "arithmetic": arithmetic, "adapter_sha256": digest(Path(__file__).with_name("model.py")),
                 "source": source_identity(a.snapshot)}
     with torch.inference_mode():
         if stamp_path.exists():
             stamp = json.loads(stamp_path.read_bytes())
             if stamp["identity"] != identity or digest(input_path) != stamp["sha256"]:
                 raise ValueError("persisted diagnostic input differs")
-            hidden = torch.from_numpy(np.fromfile(input_path, dtype="<u2")).view(torch.bfloat16)
+            hidden = torch.from_numpy(np.fromfile(input_path, dtype="<f4"))
             hidden = hidden.reshape_as(embedding).cuda()
         else:
             layer = native_layer(reference, config, weights, 0)
@@ -393,11 +391,11 @@ def diagnose(a, *, native_layer, atomic_json, digest, state_type, official_mask)
             mask = None if layer.is_linear_attn else official_mask(embedding)
             hidden, history = layer(embedding, attention_mask=mask, block_residual=blocks,
                                     use_cache=False, output_attentions=False)
-            if hidden.dtype != torch.bfloat16 or not torch.equal(history[:, 0], embedding[0]):
+            if hidden.dtype != torch.float32 or not torch.equal(history[:, 0], embedding[0]):
                 raise ValueError("reconstructed layer-0 state differs in structure")
             pending = input_path.with_suffix(".pending")
             with pending.open("wb") as stream:
-                hidden.cpu().contiguous().view(torch.uint16).numpy().tofile(stream)
+                hidden.cpu().contiguous().numpy().tofile(stream)
                 stream.flush()
                 os.fsync(stream.fileno())
             pending.replace(input_path)
@@ -439,7 +437,8 @@ def diagnose(a, *, native_layer, atomic_json, digest, state_type, official_mask)
                   "adapter_sha256": digest(Path(__file__).with_name("model.py")),
                   "image_sha256": binding["image_sha256"],
                   "torch": torch.__version__, "fla": fla.__version__, "blas": blas,
-                  "rows": int(hidden.shape[1]), "recurrence": "chunk", "recurrence_flags": flags,
+                  "rows": int(hidden.shape[1]), "arithmetic": arithmetic, "relative_l2_limit": 1e-6,
+                  "recurrence": "chunk", "recurrence_flags": flags,
                   "effective_gate_note": "diagnostic-only pinned FLA naive lower-bound formula; not a replacement for fused inference",
                   "a_log_first_96_exact": exact_heads,
                   "a_log_padding": weights.padding_provenance(),
@@ -451,10 +450,20 @@ def diagnose(a, *, native_layer, atomic_json, digest, state_type, official_mask)
                   "first_propagated_difference": first_difference(rows, "propagated"),
                   "first_controlled_difference": first_difference(rows, "controlled_input"),
                   "subops": rows}
+        float_dtypes = {item[key] for row in rows for field in ("propagated", "controlled_input")
+                        for item in row[field] for key in ("official_dtype", "adapted_dtype")
+                        if key in item and "float" in item[key]}
+        report["floating_dtypes"] = sorted(float_dtypes)
+        report["passed"] = (float_dtypes == {"torch.float32"} and exact_heads and flips == 0
+                            and report["first_propagated_difference"] is None
+                            and report["first_controlled_difference"] is None)
         if a.diagnose_linear_variants:
             report["linear_variants"] = linear_variants(traces[0], device="cuda")
             print(json.dumps({"linear_variants": report["linear_variants"]}, sort_keys=True), flush=True)
         atomic_json(a.out / "layer-diagnostic.json", report)
         print(json.dumps({key: report[key] for key in ("first_propagated_difference", "first_controlled_difference", "router")}, sort_keys=True), flush=True)
         del layer, traces
+        weights.release_experts()
         torch.cuda.empty_cache()
+        if not report["passed"]:
+            raise ValueError("F32 layer-1 qualification exceeds 1e-6 or changes dtype/routing")
