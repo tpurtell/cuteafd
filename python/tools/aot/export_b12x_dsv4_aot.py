@@ -472,6 +472,19 @@ def glmf_head_split_programs(g, decode_rows: int, prefill_rows: int, max_context
     return programs
 
 
+def kimi_kda_programs(g, decode_rows: int, prefill_rows: int, max_context: int):
+    """Kimi's native BF16 KDA; norm output is head-local for TP2 exchange."""
+    from b12x.integration.cuteafd import glmf
+
+    out = [("kda_commit", "kda_commit", {}, lambda: glmf.compile_glmf_kda_commit_aot(g))]
+    for rows in sorted({decode_rows, prefill_rows}):
+        decode = rows == decode_rows
+        params = {"max_rows": rows, "output_kind": "norm", "decode": decode}
+        out.append((f"kda_m{rows}", "kda", params,
+                    lambda kw=params: glmf.compile_glmf_kda_aot(g, **kw)))
+    return out
+
+
 def qwen4_programs(g, decode_rows: int, prefill_rows: int, max_context: int):
     """Qwen 3.8 Flash Next programs, same (stem suffix, op, params, thunk) shape as ``programs``.
     Hyper-connection, head, MoE-front and PLE programs serve any row count (their
@@ -638,7 +651,8 @@ def main() -> None:
                              "glm2 (GLM 5.x, one GPU of a two-GPU head split), mimo (MiMo V2 Flash), mimop (MiMo V2.6 Pro), "
                              "mimop2 (V2.6 Pro, one GPU of a two-GPU head split), mimof/mimof2 (V2.6 Flash MOPD), "
                              "glmf (GLM 5.3 Flash), glmf2 (GLM 5.3 Flash, one GPU of a two-GPU head split), "
-                             "qwen4 (Qwen 3.8 Flash Next), qwen35 (Qwen 3.5 9B), qwen38 (Qwen 3.8 27B)")
+                             "qwen4 (Qwen 3.8 Flash Next), qwen35 (Qwen 3.5 9B), qwen38 (Qwen 3.8 27B), "
+                             "kimik3 (Kimi K3 KDA, 48 heads per TP2 rank)")
     parser.add_argument("--decode-rows", type=int, default=64)
     parser.add_argument("--glmf-wide-decode-rows", type=int, default=128,
                         help="with glmf: also the decode and verify programs at this many rows (serve "
@@ -664,11 +678,15 @@ def main() -> None:
 
     geometries = [name.strip() for name in args.geometry.split(",") if name.strip()]
     if not geometries or any(name not in ("flash", "flash2", "pro", "pro2", "glm", "glm2", "mimo", "mimo2", "mimop",
-                                          "mimop2", "mimof", "mimof2", "glmf", "glmf2", "qwen4", "qwen35", "qwen38") for name in geometries):
+                                          "mimop2", "mimof", "mimof2", "glmf", "glmf2", "qwen4", "qwen35", "qwen38", "kimik3") for name in geometries):
         raise SystemExit("--geometry takes flash, flash2, pro, pro2, glm, glm2, mimo, mimo2, mimop, mimop2, mimof, mimof2, "
-                         "glmf, glmf2, qwen4, qwen35 and/or qwen38")
+                         "glmf, glmf2, qwen4, qwen35, qwen38 and/or kimik3")
     if args.context_split_only and any(name not in ("flash", "pro", "glm", "glmf") for name in geometries):
         raise SystemExit("--context-split-only takes flash, pro, glm and/or glmf")
+    kimi_kda = None
+    if "kimik3" in geometries:
+        from b12x.integration.cuteafd import KDAGeometry
+        kimi_kda = KDAGeometry(hidden=7168, kda_heads=96).head_split(2)
     props = torch.cuda.get_device_properties(0)
     if (props.major, props.minor) not in ((12, 0), (12, 1)) or (props.minor != 0 and not args.context_split_only):
         raise SystemExit("coordinator programs export on SM120 (K1 primitives also on SM121)")
@@ -719,10 +737,11 @@ def main() -> None:
         g = {"flash": FLASH, "flash2": dsv4_half["flash2"], "pro": PRO, "pro2": dsv4_half["pro2"], "glm": GLM53,
              "glm2": glm2, "mimo": MIMO_V2_FLASH, "mimop": MIMO_V26_PRO,
              "mimo2": mimo2, "mimop2": mimop2, "mimof": MIMO_V26_FLASH, "mimof2": mimof2, "glmf": GLM53_FLASH, "glmf2": glmf2, "qwen4": QWEN38_FLASH_NEXT,
-             "qwen35": QWEN35_9B, "qwen38": QWEN38_27B}[name]
+             "qwen35": QWEN35_9B, "qwen38": QWEN38_27B,
+             "kimik3": kimi_kda}[name]
         family = {"flash": "dsv4f", "flash2": "dsv4f2", "pro": "dsv4p", "pro2": "dsv4p2", "glm": "glm", "glm2": "glm2", "mimo": "mimo", "mimop": "mimop",
                   "mimo2": "mimo2", "mimop2": "mimop2", "mimof": "mimof", "mimof2": "mimof2", "glmf": "glmf", "glmf2": "glmf2", "qwen4": "qwen4",
-                  "qwen35": "qwen35", "qwen38": "qwen38"}[name]
+                  "qwen35": "qwen35", "qwen38": "qwen38", "kimik3": "kimik3"}[name]
         manifest["families"][family] = {k: v for k, v in vars(g).items()}
         extent = geometry_context(name, args.max_context)
         manifest["family_capacities"][family] = {"max_context": extent}
@@ -731,7 +750,7 @@ def main() -> None:
                 "mimo2": mimo_head_split_programs, "mimop2": mimo_head_split_programs,
                 "mimof": mimo_programs, "mimof2": mimo_head_split_programs,
                 "glmf": glmf_programs, "glmf2": glmf_head_split_programs,
-                "qwen4": qwen4_programs}.get(name, programs)
+                "qwen4": qwen4_programs, "kimik3": kimi_kda_programs}.get(name, programs)
         if name in ("qwen35", "qwen38"):
             # These exports target the named official checkpoints' native norm storage.
             norm_dtype = torch.float32 if name == "qwen35" else torch.bfloat16

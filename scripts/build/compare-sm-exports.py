@@ -57,6 +57,10 @@ def jobs(scope):
                for kind in (("_win", "_c4", "_c128") if geometry in ("flash", "pro") else ("",))]
         result.append((f"suspect-{geometry}-mla", "export_b12x_dsv4_aot.py",
                        ["--geometry", geometry, "--only", ",".join(mla)]))
+    for geometry in ("glmf", "glmf2", "kimik3"):
+        for label, names in (("decode", "kda_m64"), ("prefill", "kda_m4096"), ("commit", "kda_commit")):
+            result.append((f"kda-{geometry}-{label}", "export_b12x_dsv4_aot.py",
+                           ["--geometry", geometry, "--only", names]))
     if scope == "suspects":
         return result
     result.extend((geometry, "export_b12x_dsv4_aot.py", ["--geometry", geometry])

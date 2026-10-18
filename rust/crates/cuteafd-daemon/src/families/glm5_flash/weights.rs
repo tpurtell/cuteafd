@@ -558,11 +558,11 @@ impl<'a> GlmfLoader<'a> {
                     }
                     ops.insert("w_in", self.upload(&bytes)?);
                 } else {
-                    ops.insert("w_in", self.upload(&self.kda_parts(cfg, &p, KdaOperand::WIn, 1)?.remove(0))?);
+                    ops.insert("w_in", self.kda_upload(cfg, &p, KdaOperand::WIn)?);
                 }
                 for operand in [KdaOperand::WFg, KdaOperand::ConvW, KdaOperand::ALog,
                     KdaOperand::DtBias, KdaOperand::ONorm] {
-                    ops.insert(operand.name(), self.upload(&self.kda_parts(cfg, &p, operand, 1)?.remove(0))?);
+                    ops.insert(operand.name(), self.kda_upload(cfg, &p, operand)?);
                 }
                 if kda_layout.is_none() {
                     let w_o = match ops.remove("w_o_nvfp4") {
@@ -644,6 +644,16 @@ impl<'a> GlmfLoader<'a> {
             R::ALog => "A_log", R::DtBias => "dt_bias", R::ONorm => "o_norm.weight", R::O => "o_proj.weight",
         };
         format!("{prefix}.self_attn.{name}")
+    }
+
+    fn kda_upload(&self, cfg: &GlmNextConfig, prefix: &str, operand: KdaOperand) -> Result<DeviceAllocation<'a>> {
+        let names: Vec<_> = Self::kda_geometry(cfg).roles(operand).into_iter()
+            .map(|role| Self::kda_name(prefix, role)).collect();
+        // Native FP8 projections keep the existing device dequantization path.
+        let native_fp8 = matches!(operand, KdaOperand::WIn | KdaOperand::WFg)
+            && names.iter().any(|name| self.tensor(name).is_ok_and(|tensor| tensor.meta.dtype == DType::F8E4M3));
+        if native_fp8 { return self.rows(&names); }
+        self.upload(&self.kda_parts(cfg, prefix, operand, 1)?.remove(0))
     }
 
     fn kda_parts(&self, cfg: &GlmNextConfig, prefix: &str, operand: KdaOperand, ranks: usize)
