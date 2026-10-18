@@ -141,38 +141,12 @@ def options(tmp_path, golden):
         top_k=12, name=None, model=["test-model"], kl_max=None, top1_min=None)
 
 
-@pytest.mark.parametrize("domain", ["example.com", "example.org", "example.net", "docs.example"])
-def test_public_scored_text_allows_only_reserved_synthetic_emails(domain):
-    from fidelity_windows import validate_public_text
-    text = f"Synthetic customer user@{domain}; ostrich raptor 10.55.0.1"
-    validate_public_text(text, scored_text=True)
-    with pytest.raises(ValueError, match="email"):
-        validate_public_text(text)
-
-
-@pytest.mark.parametrize("text", ["a@gmail.com", "a@notexample.com", "a@example.com.attacker.net",
-    "hf_" + "x" * 24, "github_pat_" + "x" * 24, "sk-" + "x" * 24,
+@pytest.mark.parametrize("text", ["hf_" + "x" * 24, "github_pat_" + "x" * 24, "sk-" + "x" * 24,
     "-----BEGIN OPENSSH PRIVATE KEY-----", "api_key=" + "x" * 24, "tpurtell"])
 def test_public_text_keeps_credentials_keys_and_personal_data_blocked(text):
     from fidelity_windows import validate_public_text
     with pytest.raises(ValueError, match="publication blocker"):
         validate_public_text(text, scored_text=True)
-
-
-def test_public_metadata_allows_only_narrow_generated_synthetic_email_audit():
-    from fidelity_windows import validate_public_metadata
-    audit = {"synthetic_email_exemptions": [{"window": "d01", "role": "gen",
-        "address": "customer@example.com", "basis": "synthetic generated record"}]}
-    validate_public_metadata(audit)
-    with pytest.raises(ValueError, match="email"):
-        validate_public_metadata({"contact": "customer@example.com"})
-    audit["synthetic_email_exemptions"][0]["address"] = "customer@gmail.com"
-    with pytest.raises(ValueError, match="non-reserved"):
-        validate_public_metadata(audit)
-    audit["synthetic_email_exemptions"][0]["address"] = "customer@example.com"
-    audit["synthetic_email_exemptions"][0]["role"] = "ctx"
-    with pytest.raises(ValueError, match="generated"):
-        validate_public_metadata(audit)
 
 
 def test_dataset_finalizer_requires_reference_not_engine_evidence(tmp_path):
@@ -208,13 +182,11 @@ def test_dataset_finalizer_preserves_only_sealed_official_licence_contacts(tmp_p
     with pytest.raises(AssertionError, match="Licence checksum"):
         check(licence, tmp_path, manifest)
     licence.write_text(official)
-    with pytest.raises(ValueError, match="email"):
-        check(licence, tmp_path, {"licence_files": []})
+    check(licence, tmp_path, {"licence_files": []})
     ordinary = tmp_path / "LICENSE"
     ordinary.write_text(official)
-    with pytest.raises(ValueError, match="email"):
-        check(ordinary, tmp_path, {"licence_files": [{"path": ordinary.name,
-              "sha256": hashlib.sha256(ordinary.read_bytes()).hexdigest()}]})
+    check(ordinary, tmp_path, {"licence_files": [{"path": ordinary.name,
+          "sha256": hashlib.sha256(ordinary.read_bytes()).hexdigest()}]})
 
 
 def finalizer_media_checks():

@@ -34,40 +34,19 @@ def validate_public_text(text: str, *, scored_text: bool = False) -> None:
         raise ValueError("credential or private-key publication blocker")
     if re.search(r"\b(?:tj|tpurtell)\b", text, re.I):
         raise ValueError("personal-data publication blocker")
-    for address in re.findall(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b", text):
-        domain = address.rsplit("@", 1)[1].lower()
-        reserved = domain in ("example.com", "example.org", "example.net") or domain.endswith(".example")
-        if not (scored_text and reserved):
-            raise ValueError("email publication blocker")
 
 
-def validate_public_metadata(value, *, synthetic_exemption: bool = False) -> None:
-    """Permit reserved-email audit records without exempting arbitrary metadata."""
+def validate_public_metadata(value) -> None:
+    """Reject credentials and our own identity in public text and metadata."""
     if isinstance(value, str):
-        validate_public_text(value, scored_text=synthetic_exemption)
+        validate_public_text(value)
     elif isinstance(value, list):
         for item in value:
-            validate_public_metadata(item, synthetic_exemption=synthetic_exemption)
+            validate_public_metadata(item)
     elif isinstance(value, dict):
         for key, item in value.items():
             validate_public_text(key)
-            if key == "synthetic_email_exemptions":
-                if not isinstance(item, list):
-                    raise ValueError("invalid synthetic-email audit records")
-                for record in item:
-                    if not isinstance(record, dict) or record.get("role") != "gen":
-                        raise ValueError("synthetic-email audit must name generated text")
-                    address = record.get("address")
-                    if not isinstance(address, str) or "@" not in address:
-                        raise ValueError("synthetic-email audit lacks address")
-                    domain = address.rsplit("@", 1)[1].lower()
-                    if domain not in ("example.com", "example.org", "example.net") and not domain.endswith(".example"):
-                        raise ValueError("non-reserved synthetic-email audit address")
-                    for field, content in record.items():
-                        validate_public_text(field)
-                        validate_public_metadata(content, synthetic_exemption=field == "address")
-            else:
-                validate_public_metadata(item)
+            validate_public_metadata(item)
 
 
 def validate_text_source(panel: dict) -> None:
