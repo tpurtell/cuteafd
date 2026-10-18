@@ -699,13 +699,22 @@ def compile_variants(payloads, jobs):
         pool.shutdown(wait=True, cancel_futures=True)
 
 
+def package_capacities(geometry: str, requested: str) -> list[int]:
+    capacities = sorted(set(int(v) for v in requested.split(',')))
+    if not capacities or any(v < 1 or v > 4096 for v in capacities):
+        raise ValueError('EXL3 capacities must be in 1..4096')
+    if geometry == 'kimik3':
+        capacities = [v for v in capacities if v != 16]
+        if any(v not in (1, 80, 256, 1024, 4096) for v in capacities) or not capacities:
+            raise ValueError('Kimi EXL3 requires K64 capacities 1,80,256,1024,4096')
+    return capacities
+
+
 def build(args: argparse.Namespace) -> None:
     validate_destination(args.output)
     geometry = getattr(args, 'geometry', 'v41')
     hidden = GEOMETRIES[geometry][0]
-    capacities = sorted(set(int(v) for v in args.capacities.split(',')))
-    if not capacities or any(v < 1 or v > 4096 for v in capacities):
-        raise ValueError('EXL3 capacities must be in 1..4096')
+    capacities = package_capacities(geometry, args.capacities)
     all_counts = getattr(args, 'all_spark_counts', False)
     if all_counts and args.role != 'spark':
         raise ValueError('--all-spark-counts requires a Spark role')

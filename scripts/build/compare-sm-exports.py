@@ -186,7 +186,9 @@ def _export_exl3(extra, output):
     import package_exl3_aot as package
     from export_b12x_exl3_aot import export
     geometry = extra[extra.index("--geometry") + 1]
-    capacities = sorted({int(item) for item in extra[extra.index("--capacities") + 1].split(",")})
+    requested = extra[extra.index("--capacities") + 1]
+    capacities = (package.package_capacities(geometry, requested) if hasattr(package, "package_capacities")
+                  else sorted({int(item) for item in requested.split(",")}))
     bits = tuple(int(item) for item in extra[extra.index("--bits") + 1].split(",")) if "--bits" in extra else (3, 4)
     for profile, width, experts, topk, dtype, _ in package.profiles_for_role("coordinator", geometry):
         for rows in capacities:

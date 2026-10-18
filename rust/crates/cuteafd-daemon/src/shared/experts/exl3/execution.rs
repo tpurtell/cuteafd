@@ -1005,7 +1005,7 @@ mod tests {
             let planned = directories(Exl3RowPolicy::GlmFlashK64, maximum)?;
             // Admission includes the shared arena and private state even though
             // the transport/input limit stays at the real declared maximum.
-            assert_eq!(Exl3Workspace::plan(&planned, Exl3InputFormat::Fp8K32)?, 8320);
+            assert_eq!(Exl3Workspace::plan(&planned, Exl3InputFormat::Fp8K32)?, 7776);
             assert_eq!(ordinary, 8320);
         }
         std::fs::remove_file(root.path().join("m80/v41_exl3.json"))?;

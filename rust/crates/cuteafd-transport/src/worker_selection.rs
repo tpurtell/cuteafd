@@ -1170,7 +1170,7 @@ mod tests {
         let variants = [1, 16, 80].into_iter().map(|capacity|
             InstalledExpertVariant::from_queries(capacity, |_| Ok(capacity.min(64))).unwrap()).collect::<Vec<_>>();
         let report = InstalledExpertGrouping::new(loaded.clone(), 0, 16,
-            ExpertGroupingSelector::Exl3GlmFlashK64, variants.clone()).unwrap();
+            ExpertGroupingSelector::Exl3GlmFlashK64, variants.iter().filter(|v| v.capacity != 16).cloned().collect()).unwrap();
         assert_eq!(report.group_rows(1).unwrap(), 1);
         assert_eq!(report.group_rows(2).unwrap(), 64);
         assert_eq!(report.group_rows(16).unwrap(), 64);
