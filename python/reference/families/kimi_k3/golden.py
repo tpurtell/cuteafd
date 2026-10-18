@@ -372,6 +372,8 @@ def main():
     parser.add_argument("--layers", type=int, default=None)
     parser.add_argument("--diagnose-layer", type=int, default=None,
                         help="compare native/fixed sub-ops at layer 1 without running a golden")
+    parser.add_argument("--diagnose-blas", choices=("cublas", "cublaslt"),
+                        help="select a native Torch BLAS backend for both diagnostic arms")
     parser.add_argument("--diagnose-linear-variants", action="store_true",
                         help="compare fixed-row native/F32 expert arithmetic on controlled inputs")
     parser.add_argument("--probe-state", type=Path,
@@ -384,7 +386,7 @@ def main():
         diagnose(args, native_layer=native_layer, atomic_json=atomic_json, digest=digest,
                  state_type=LayerState, official_mask=official_mask)
     else:
-        if args.probe_state is not None or args.diagnose_linear_variants:
+        if args.probe_state is not None or args.diagnose_linear_variants or args.diagnose_blas:
             raise ValueError("diagnostic options are only supported with --diagnose-layer")
         execute(args)
 

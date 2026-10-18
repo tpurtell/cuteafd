@@ -187,6 +187,9 @@ def diagnose(a, *, native_layer, atomic_json, digest, state_type, official_mask)
     torch.backends.cudnn.allow_tf32 = False
     torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = False
     torch.manual_seed(0)
+    if a.diagnose_blas:
+        torch.backends.cuda.preferred_blas_library(a.diagnose_blas)
+    blas = str(torch.backends.cuda.preferred_blas_library())
     manifest = load_set(a.windows)
     snapshot = verify_snapshot(manifest, a.snapshot)
     latest = json.loads((a.probe_state / "latest.json").read_bytes())
@@ -273,7 +276,7 @@ def diagnose(a, *, native_layer, atomic_json, digest, state_type, official_mask)
                   "diagnostic_sha256": digest(__file__),
                   "adapter_sha256": digest(Path(__file__).with_name("model.py")),
                   "image_sha256": binding["image_sha256"],
-                  "torch": torch.__version__, "fla": fla.__version__,
+                  "torch": torch.__version__, "fla": fla.__version__, "blas": blas,
                   "rows": int(hidden.shape[1]), "recurrence": "chunk", "recurrence_flags": flags,
                   "effective_gate_note": "diagnostic-only pinned FLA naive lower-bound formula; not a replacement for fused inference",
                   "a_log_first_96_exact": exact_heads,
