@@ -125,7 +125,11 @@ fn selected_capacities(
     selection: RtxSelectionPolicy,
 ) -> Result<Vec<u32>> {
     if selection == RtxSelectionPolicy::FirstCapacity {
-        super::native::kernel_capacities(row_policy.required_capacity(max_rows))
+        let mut capacities = super::native::kernel_capacities(row_policy.required_capacity(max_rows))?;
+        if row_policy == Exl3RowPolicy::GlmFlashK64 {
+            capacities.retain(|&capacity| capacity != 16);
+        }
+        Ok(capacities)
     } else {
         Ok(row_policy.capacities(max_rows)?)
     }
@@ -744,7 +748,7 @@ mod tests {
                     rows,
                     Exl3RowPolicy::GlmFlashK64
                 )?,
-                2048 + 3 * (32 + 16) + (1 + 16 + 80) * 8 * 2 + rows * 8 * 4
+                2048 + 2 * (32 + 16) + (1 + 80) * 8 * 2 + rows * 8 * 4
             );
         }
         Ok(())
@@ -767,6 +771,26 @@ mod tests {
                     }
                     assert!(paths.contains(&Path::new("rtx-tp2").join(format!("m{selected}"))));
                 }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn first_capacity_preload_preserves_selection_without_dead_k64_m16() -> Result<()> {
+        for maximum in 1..=4096 {
+            let nearest = super::super::native::kernel_capacities(maximum)?;
+            assert_eq!(selected_capacities(maximum, Exl3RowPolicy::Nearest,
+                RtxSelectionPolicy::FirstCapacity)?, nearest);
+            let policy = Exl3RowPolicy::GlmFlashK64;
+            let before = super::super::native::kernel_capacities(policy.required_capacity(maximum))?;
+            let after = selected_capacities(maximum, policy, RtxSelectionPolicy::FirstCapacity)?;
+            assert_eq!(after, policy.capacities(maximum)?);
+            assert!(!after.contains(&16));
+            for live in [1, maximum.min(16), maximum] {
+                let required = policy.required_capacity(live);
+                assert_eq!(before.iter().find(|&&c| c as usize >= required),
+                    after.iter().find(|&&c| c as usize >= required));
             }
         }
         Ok(())

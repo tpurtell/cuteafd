@@ -777,11 +777,11 @@ fn glm5_flash_standard_exllamav3_checkpoint_is_ready() {
         }
         let scratch = crate::placement::families::glm5_flash::expert_workspace(&catalog,
             Some(&share.join("PROGRAMS.json")), 4096, tp).unwrap();
-        assert_eq!(scratch, 4096*16 + 6*(32+256) + 4096*4096*if tp == 2 {4} else {2});
+        assert_eq!(scratch, 4096*16 + 5*(32+256) + 4096*4096*if tp == 2 {4} else {2});
         for rows in [2, 4, 9, 16] {
             let scratch = crate::placement::families::glm5_flash::expert_workspace(&catalog,
                 Some(&share.join("PROGRAMS.json")), rows, tp).unwrap();
-            assert_eq!(scratch, 80*16 + 3*(32+256) + rows*4096*if tp == 2 {4} else {2});
+            assert_eq!(scratch, 80*16 + 2*(32+256) + rows*4096*if tp == 2 {4} else {2});
         }
         // Narrow admission must require m80 even though m16 fits the live rows.
         std::fs::remove_file(root.join(format!("rtx-tp{tp}/m80/v41_exl3.json"))).unwrap();

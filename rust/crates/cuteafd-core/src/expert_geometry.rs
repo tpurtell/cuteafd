@@ -279,7 +279,7 @@ impl ExpertGeometry {
 }
 
 /// Capacity selects the compiled reduction geometry, never the live row count.
-/// GLM Flash's m1/m80 use K64; m16 uses K128 and adds serial/verify drift.
+/// GLM Flash and Kimi use K64 at m1/m80; m16 uses K128 and causes drift.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Exl3RowPolicy {
     Nearest,
@@ -288,7 +288,9 @@ pub enum Exl3RowPolicy {
 
 impl Exl3RowPolicy {
     pub fn for_geometry(geometry: ExpertGeometry) -> Self {
-        if geometry.same_shape(&ExpertGeometry::GLM5_FLASH) { Self::GlmFlashK64 } else { Self::Nearest }
+        if geometry.same_shape(&ExpertGeometry::GLM5_FLASH)
+            || geometry.same_shape(&ExpertGeometry::KIMI_K3)
+        { Self::GlmFlashK64 } else { Self::Nearest }
     }
 
     pub fn active() -> Self { Self::for_geometry(expert_geometry()) }
@@ -306,7 +308,8 @@ impl Exl3RowPolicy {
         // Keep a canonical-reduction decode export available even at narrow admission.
         let required = max_live_rows.max(if max_live_rows > 1 { 80 } else { 1 });
         let maximum = CAPACITIES.into_iter().find(|&c| c as usize >= required).unwrap();
-        Ok(CAPACITIES.into_iter().filter(|&c| c <= maximum).collect())
+        Ok(CAPACITIES.into_iter().filter(|&c| c <= maximum
+            && (self != Self::GlmFlashK64 || c != 16)).collect())
     }
 }
 
@@ -340,10 +343,20 @@ mod tests {
         assert_eq!(policy.capacities(1).unwrap(), [1]);
         for rows in 2..=16 {
             assert_eq!(policy.required_capacity(rows), 80);
-            assert_eq!(policy.capacities(rows).unwrap(), [1, 16, 80]);
+            assert_eq!(policy.capacities(rows).unwrap(), [1, 80]);
             assert_eq!(Exl3RowPolicy::Nearest.capacities(rows).unwrap(), [1, 16, 80]);
         }
-        assert_eq!(policy.capacities(4096).unwrap(), [1, 16, 80, 256, 1024, 4096]);
+        assert_eq!(policy.capacities(4096).unwrap(), [1, 80, 256, 1024, 4096]);
+        assert_eq!(Exl3RowPolicy::for_geometry(ExpertGeometry::KIMI_K3), policy);
+        let old = [1, 16, 80, 256, 1024, 4096];
+        let new = policy.capacities(4096).unwrap();
+        for rows in 1..=4096 {
+            let required = policy.required_capacity(rows);
+            let before = old.iter().find(|&&c| c >= required).unwrap();
+            let after = new.iter().find(|&&c| c as usize >= required).unwrap();
+            assert_eq!(*before, *after as usize, "GLM Flash selection changed at {rows}");
+            assert_ne!(*after, 16);
+        }
     }
 
     #[test]

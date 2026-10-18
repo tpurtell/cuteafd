@@ -678,7 +678,7 @@ mod tests {
         })).unwrap();
         let loaded = WorkerSelection::new(identity, &[3, 4]).unwrap();
         let reports: Vec<_> = (0..2).map(|rank| InstalledExpertGrouping::new(loaded.clone(), rank, 256,
-            ExpertGroupingSelector::Exl3GlmFlashK64, [1, 16, 80, 256].into_iter().map(|capacity|
+            ExpertGroupingSelector::Exl3GlmFlashK64, [1, 80, 256].into_iter().map(|capacity|
                 InstalledExpertVariant::from_queries(capacity, |_| Ok(8)).unwrap()).collect()).unwrap()).collect();
         let homes = [LayerHome::Dense, LayerHome::Dense, LayerHome::Dense,
             LayerHome::Remote { slice_bytes: 1e6 }, LayerHome::Remote { slice_bytes: 1e6 }];
@@ -693,7 +693,7 @@ mod tests {
         assert!(worker_group_rows(&reports, 2, 16).is_err());
         let mut mixed = reports.clone();
         mixed[1] = InstalledExpertGrouping::new(loaded, 1, 256,
-            ExpertGroupingSelector::Exl3GlmFlashK64, [1, 16, 80, 256].into_iter().map(|capacity|
+            ExpertGroupingSelector::Exl3GlmFlashK64, [1, 80, 256].into_iter().map(|capacity|
                 InstalledExpertVariant::from_queries(capacity, |_| Ok(16)).unwrap()).collect()).unwrap();
         assert!(worker_group_rows(&mixed, 3, 16).is_err());
         assert!(geometry_with_grouping(&homes, 288, 8, 128, 7, COPY_EXTENSION, |_, _| Ok(0)).is_err());
