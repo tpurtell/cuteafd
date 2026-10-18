@@ -218,7 +218,7 @@ __global__ void __launch_bounds__(512) softmax_select_kernel(const float* logits
 // specializations byte-for-byte. One thread owns each expert (up to 1024).
 template<bool Sigmoid>
 __global__ void __launch_bounds__(1024) select_wide_kernel(float* scores,const float* bias,const float* bias_vl,
-    const uint8_t* image_mask,uint32_t* ids,float* routing,int experts,int topk,float scale=1.5f) {
+    const uint8_t* image_mask,uint32_t* ids,float* routing,int experts,int topk,float scale) {
   const uint64_t row=blockIdx.x;const int tid=threadIdx.x;const int lane=tid&31,warp=tid>>5;
   {
     if(tid<experts) {
