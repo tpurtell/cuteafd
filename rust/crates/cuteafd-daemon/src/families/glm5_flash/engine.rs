@@ -5620,7 +5620,9 @@ mod prefill_lane_tests {
         // Any exporter change requires re-auditing shapes and arithmetic routes.
         for (path, expected) in [
             // canon-fp8-decode: the threshold is the programs' capacity, not the thin tile.
-            ("integration/cuteafd/glmf.py", 0x80a2_3e92_49ed_5766_u64),
+            // Fork #29 (shared KDA for Kimi K3): all GLM glmf/glmf2 objects and headers byte-identical
+            // against 81c30fdb at 188 and 170 SMs.
+            ("integration/cuteafd/glmf.py", 0xb51f_2224_6aff_2bd4_u64),
             // b729115b uses canonical BF16 MMA at every positive row count.
             ("integration/cuteafd/_glm_kernels.py", 0x8b85_3785_9223_9a99),
             ("integration/cuteafd/_fp8_weights.py", 0x622a_1b45_96e9_71da),
@@ -5628,7 +5630,8 @@ mod prefill_lane_tests {
             ("integration/cuteafd/dsv4_mhc.py", 0x978a_179d_ef8c_2101),
             // Dense Qwen geometry only: glmf/glmf2 retain all 88 objects and 90 headers
             // byte-identically against 515a0b94 at both 188 and 170 SMs (2b792f04 export gate).
-            ("integration/cuteafd/_common.py", 0x9d74_ed3b_938b_e00a),
+            // Fork #29 adds the Kimi KDA geometry only (same export gate).
+            ("integration/cuteafd/_common.py", 0xa13f_44c0_514d_ab99),
             // 34698ec2's RowTiledBf16Projection is opt-in; skinny_config,
             // skinny_max_rows and the default GLM RoutedBf16Projection paths are unchanged.
             ("gemm/bf16_gemv/_skinny.py", 0x3351_3301_8c37_3f8f),
