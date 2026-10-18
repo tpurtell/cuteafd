@@ -37,10 +37,11 @@ def exporter(monkeypatch):
         monkeypatch.setenv(name, "1")
     monkeypatch.setitem(sys.modules, "_pinned_sparkinfer", types.SimpleNamespace(REVISION="test"))
     package = types.ModuleType("b12x.integration.cuteafd")
-    for name in ("glmf", "glm_ffn", "glm_attention", "glm_indexer", "dsv4_mhc", "glm_sparse_mla", "context_split", "qwen4", "qwen4_gdn", "qwen4_attention", "qwen_dense"):
+    for name in ("glmf", "glm_ffn", "glm_attention", "glm_indexer", "dsv4_mhc", "glm_sparse_mla", "context_split", "qwen4", "qwen4_gdn", "qwen4_attention", "qwen_dense", "kimi_mla"):
         module = _Compilers(f"b12x.integration.cuteafd.{name}")
         setattr(package, name, module)
         monkeypatch.setitem(sys.modules, module.__name__, module)
+    package.kimi_mla.KimiMlaGeometry = lambda **kw: types.SimpleNamespace(**kw)
     package.glmf.mhc_geometry = lambda g: ("mhc geometry", g)
     package.dsv4_mhc.mhc_post_pre_route = lambda rows: "decode" if rows < 96 else "block_m"
     # The real planner's shape at 32 heads: more splits for fewer rows (188 SMs: s32/s11/s4).
@@ -339,8 +340,9 @@ def test_glmf_w8_state_is_orthogonal_and_canonical(exporter):
 @pytest.mark.parametrize("decode_rows,prefill_rows", [(64, 4096), (64, 64)])
 def test_kimi_kda_exports_share_glmf_program_and_native_tp2_abi(exporter, decode_rows, prefill_rows):
     programs = exporter.kimi_kda_programs(GEOMETRY, decode_rows, prefill_rows, 1048576)
-    calls = {stem: (op, params, thunk()) for stem, op, params, thunk in programs}
-    assert len(calls) == len(programs) == 1 + len({decode_rows, prefill_rows})
+    kda = [p for p in programs if p[1] in ("kda", "kda_commit")]
+    calls = {stem: (op, params, thunk()) for stem, op, params, thunk in kda}
+    assert len(calls) == len(kda) == 1 + len({decode_rows, prefill_rows})
     for stem, (op, params, call) in calls.items():
         module, function, args, kwargs = call
         assert module == "glmf" and args == (GEOMETRY,)
@@ -349,3 +351,26 @@ def test_kimi_kda_exports_share_glmf_program_and_native_tp2_abi(exporter, decode
         if op == "kda":
             assert kwargs["output_kind"] == "norm"
             assert kwargs["decode"] == (kwargs["max_rows"] == decode_rows)
+
+
+@pytest.mark.parametrize("decode_rows,prefill_rows", [(64, 4096), (64, 64)])
+def test_kimi_nope_mla_exports_both_head_layouts_and_all_modes(exporter, decode_rows, prefill_rows):
+    programs = exporter.kimi_kda_programs(GEOMETRY, decode_rows, prefill_rows, 1048576)
+    calls = {stem: (op, params, thunk()) for stem, op, params, thunk in programs if op.startswith("mla_") or op == "dense_mla"}
+    assert len(calls) == 2 * (2 * len({decode_rows, prefill_rows}) + 3)
+    for heads in (48, 96):
+        suffix = "" if heads == 48 else "_h96"
+        for rows in {decode_rows, prefill_rows}:
+            for op in ("mla_producer", "mla_output"):
+                actual_op, params, (module, fn, args, kwargs) = calls[f"{op}{suffix}_m{rows}"]
+                assert actual_op == op and module == "kimi_mla"
+                assert fn == f"compile_kimi_{op}_aot"
+                assert vars(args[0]) == {"heads": heads}
+                assert kwargs == {"max_rows": rows}
+                assert params == {"max_rows": rows, "heads": heads}
+        for mode, rows in (("decode", decode_rows), ("verify", decode_rows), ("extend", prefill_rows)):
+            op, params, (module, fn, args, kwargs) = calls[f"dense_mla_{mode}{suffix}_m{rows}"]
+            assert op == "dense_mla" and module == "kimi_mla" and fn == "compile_kimi_dense_mla_aot"
+            assert vars(args[0]) == {"heads": heads}
+            assert kwargs == {"max_rows": rows, "max_context": 1048576, "mode": mode}
+            assert params == {"mode": mode, "max_rows": rows, "heads": heads}

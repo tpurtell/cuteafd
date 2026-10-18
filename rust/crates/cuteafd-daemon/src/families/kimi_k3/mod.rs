@@ -5,5 +5,6 @@
 #![allow(dead_code)]
 pub(crate) mod block;
 pub(crate) mod device;
+pub(crate) mod mla;
 #[cfg(test)]
 pub(crate) mod reference;

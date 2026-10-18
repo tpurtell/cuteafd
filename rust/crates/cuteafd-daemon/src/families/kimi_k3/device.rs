@@ -24,7 +24,7 @@ pub(crate) const PENDING: &[(&str, &str)] = &[
     ("norm", "W8/W9 RMSNorm at hidden 7168 (fused with the residual mix)"),
     ("kda", "W6 exports kimik3_kda_m64 (decode/verify, replay), kimik3_kda_m4096 (prefill) and kimik3_kda_commit; \
         their output is the head-local gated norm, then o_proj by columns and the TP2 partial-sum meet (W9 binding)"),
-    ("mla", "W7 full-causal NoPE MLA (dense_mla AOT) with sigmoid output gate"),
+    ("mla", "W7 NoPE MLA producer/dense attention/gated output exports and mla::Mla caller; W9 binds owned cache/weights and TP2 meet"),
     ("dense_ffn", "W8 Situ dense FFN"),
     ("route", "W5 sigmoid router E896/K16, scale 1.0"),
     ("latent_down", "W9 BF16 GEMM 7168->3584"),
