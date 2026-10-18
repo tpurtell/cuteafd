@@ -150,7 +150,7 @@ def test_docker_mounts_reach_each_entrypoint(tmp_path, entry, enabled):
             prefix += f'repo_root="{ROOT}"; release_build_root="{tmp_path}/build"; release_source_parent="$release_build_root"; release_toolchain_hash=abcd\n'
             prefix += 'release_die() { exit 2; }; release_build_container_home() { printf /container/home; }\n'
             body = text[text.index('compiler_cache_args=()\nmapfile'):] if 'compiler_cache_args=()\nmapfile' in text else text[text.index('compiler_cache_args=()\ncache_plan='):]
-            body = body[:body.index('timeout "$export_timeout"')]
+            body = body[:body.index('timeout --foreground "$export_timeout"')]
             prefix += body + '\ndocker run "${compiler_cache_args[@]}" image true\n'
         elif entry == "wip":
             prefix += f'coordinator_container=test; COORDINATOR_DOCKER_DEV=image; RELEASE_COORDINATOR_GPU_UUID=uuid; hf_home="{tmp_path}/hf"; wip_mount_root="{tmp_path}/build"; wip_toolchain_hash=abcd; WIP_ROOT="$wip_mount_root"\n'

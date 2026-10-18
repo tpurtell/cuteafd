@@ -485,7 +485,7 @@ RTX_EXPERT_LAYERS=auto
                 harness = f'''set -euo pipefail
 # The timed SSH leg joins arguments just as OpenSSH does. Preserve the
 # empty-argument elision regression while testing the new export phase fields.
-timeout() {{ shift 1; [[ $1 != --foreground ]] || shift; "$@"; }}
+timeout() {{ [[ $1 != --foreground ]] || shift; shift 1; "$@"; }}
 ssh() {{ shift 1; bash -c "$*"; }}
 release_ssh_opts=()
 export_timeout=60

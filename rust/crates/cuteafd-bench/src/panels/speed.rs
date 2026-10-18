@@ -118,8 +118,11 @@ impl Panel for Concurrency {
             let ok: Vec<_> = results.into_iter().filter_map(Result::ok).collect();
             let mut per: Vec<f64> = ok.iter().map(|r| r.chat.timing.decode_tok_s()).collect();
             let mut ttft: Vec<f64> = ok.iter().map(|r| r.chat.timing.ttft_s).collect();
+            // Emitted tokens over the measured interval: the exact denominator for
+            // per-token counters (mapped-table reads), since EOS can shorten requests.
+            let tokens: u64 = ok.iter().map(|r| r.chat.timing.completion_tokens).sum();
             points.push(json!({"c": c, "aggregate_tok_s": aggregate(&ok), "per_request_tok_s": common::median(&mut per),
-                "ttft_s": common::median(&mut ttft), "errors": errors,
+                "ttft_s": common::median(&mut ttft), "errors": errors, "tokens": tokens,
                 "mapped_tables": common::mapped_interval(&table_before, &common::mapped_counters(ctx.client)),
                 "fabric": ctx.client.fabric_since(fabric_mark, &format!("{}/{}", self.id(), i), true)}));
             ctx.progress.partial(json!({"points": points}));
