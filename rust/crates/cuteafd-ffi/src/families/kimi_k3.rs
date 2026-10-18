@@ -130,7 +130,7 @@ fn validate_manifest(specs: [&ProgramSpec; 3], heads: usize, rows: usize, mode: 
                 ("qk_nope_dim", 128), ("qk_rope_dim", 64), ("v_head_dim", 128), ("page_rows", 64)]
                 .iter().any(|&(key, n)| geometry[key].as_u64() != Some(n))
             || geometry["norm_eps"].as_f64() != Some(1e-6)
-            || spec.scalar_kinds.as_slice() != if i == 1 { b"iili" } else { b"i" } {
+            || spec.scalar_kinds.as_slice() != if i == 1 { &b"iili"[..] } else { &b"i"[..] } {
             return Err(KimiMlaError::Invalid("manifest geometry/capacity/scalars"));
         }
     }
