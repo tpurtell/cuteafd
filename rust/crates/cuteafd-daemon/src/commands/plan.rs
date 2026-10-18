@@ -26,7 +26,7 @@ fn options(args: &PlanArgs) -> Result<PlanOptions, PlanError> {
         vision: args.vision,
         audio: args.audio,
         placement: ExpertPlacement::from_spark_ranks(args.spark_ranks.unwrap_or(args.available_sparks)),
-        spark_budget_bytes: budget_bytes("--spark-budget-gib", args.spark_budget_gib)?,
+        spark_budget_bytes: args.spark_budget_gib.map(|gib| budget_bytes("--spark-budget-gib", gib)).transpose()?,
         coordinator_budget_bytes: budget_bytes("--coordinator-weight-budget-gib", args.coordinator_weight_budget_gib)?
             .min(if args.layout || args.coordinator_gpu_budget_gib.is_some() {
                 coordinator_bytes(args.coordinator_gpu_budget_gib)?
@@ -37,7 +37,8 @@ fn options(args: &PlanArgs) -> Result<PlanOptions, PlanError> {
             }
             Ok(cuteafd_loader::plan::layout::LayoutOptions {
                 rtx_bytes: vec![coordinator_bytes(args.coordinator_gpu_budget_gib)?; args.rtx],
-                spark_allocation_budget_bytes: Some(budget_bytes("--spark-budget-gib", args.spark_budget_gib)?),
+                spark_allocation_budget_bytes: args.spark_budget_gib
+                    .map(|gib| budget_bytes("--spark-budget-gib", gib)).transpose()?,
                 pool_tokens: args.pool_tokens,
                 qwen_kv: args.kv_format,
                 qwen_representation: cuteafd_loader::families::qwen4::resident::Qwen4Representation {
@@ -658,7 +659,7 @@ mod tests {
             hf_home: None,
             spark_ranks: Some(spark_ranks),
             available_sparks: 6,
-            spark_budget_gib: 100.0,
+            spark_budget_gib: Some(100.0),
             coordinator_weight_budget_gib: 80.0,
             json: true,
             deployment: false, spark_tp: None, spark_ep: None, deployment_peers: vec![],
@@ -1117,9 +1118,9 @@ mod tests {
     #[test]
     fn spark_encoder_admission_honors_runtime_budget() {
         let mut request = args(std::path::Path::new("/not-read"), 4, false);
-        request.spark_budget_gib = 82.0;
+        request.spark_budget_gib = Some(82.0);
         let options = options(&request).unwrap();
-        assert_eq!(options.spark_budget_bytes, 82 << 30);
+        assert_eq!(options.spark_budget_bytes, Some(82 << 30));
         assert_eq!(options.layout.unwrap().spark_allocation_budget_bytes, Some(82 << 30));
     }
 
@@ -1364,7 +1365,7 @@ mod tests {
         assert!(error.to_string().contains("is not servable by this build"), "{error:#}");
         // Options that describe no deployment fail before the checkpoint is read.
         for (ranks, budget) in [(9, 100.0), (4, f64::NAN), (4, 0.0), (4, -3.0)] {
-            let error = run_plan(PlanArgs { spark_budget_gib: budget, ..args(flash.path(), ranks, false) }).unwrap_err();
+            let error = run_plan(PlanArgs { spark_budget_gib: Some(budget), ..args(flash.path(), ranks, false) }).unwrap_err();
             assert!(matches!(error.downcast_ref::<PlanError>(), Some(PlanError::InvalidOption { .. })),
                 "{ranks} ranks, {budget} GiB: {error:#}");
         }

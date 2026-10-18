@@ -13,6 +13,8 @@ pub enum AttentionKind {
     Gqa { heads: usize, kv_heads: usize, head_dim: usize },
     /// Grouped-query sliding-window attention.
     SlidingGqa { heads: usize, kv_heads: usize, head_dim: usize, window: usize, sinks: bool },
+    /// Full causal MLA without an indexer (Kimi K3: no RoPE, sigmoid output gate).
+    Mla { rope: bool, output_gate: bool },
     /// Kimi Delta Attention (linear recurrent).
     Kda,
     /// Gated DeltaNet (linear recurrent).
@@ -131,9 +133,13 @@ pub enum Component {
     Indexer,
     Compressor,
     HyperConnection,
+    /// Attention-residual block mixing (Kimi K3), not a hyper-connection.
+    ResidualMix,
     Router,
     SharedExpert,
     RoutedExpert,
+    /// Latent-MoE projections around the routed experts (down, norm, up).
+    LatentProjection,
     DenseFfn,
     MappedTable,
     /// On-GPU projections that consume a mapped table (engram, PLE).
@@ -155,6 +161,8 @@ impl Component {
             Component::Indexer => "indexer",
             Component::Compressor => "compressor",
             Component::HyperConnection => "hyper_connection",
+            Component::ResidualMix => "residual_mix",
+            Component::LatentProjection => "latent_projection",
             Component::Router => "router",
             Component::SharedExpert => "shared_expert",
             Component::RoutedExpert => "routed_expert",

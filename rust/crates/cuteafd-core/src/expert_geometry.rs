@@ -244,7 +244,7 @@ impl ExpertGeometry {
             (Self::MIMO_V26_PRO, "mimop"),
             (Self::GLM5_FLASH, "glmf"),
             (Self::QWEN4, "qwen4"),
-            (Self::KIMI_K3, "kimi"),
+            (Self::KIMI_K3, "kimik3"),
         ]
         .into_iter()
         .find_map(|(shape, family)| self.same_shape(&shape).then_some(family))
@@ -368,7 +368,7 @@ mod tests {
         assert_eq!(ExpertGeometry::QWEN4.family(), Some("qwen4"));
         assert_eq!(ExpertGeometry::QWEN4.swiglu_limit(), None);
         let kimi = ExpertGeometry::KIMI_K3;
-        assert_eq!(kimi.family(), Some("kimi"));
+        assert_eq!(kimi.family(), Some("kimik3"));
         assert_eq!(kimi.swiglu_limit(), None);
         assert_eq!(kimi.activation(), crate::FfnActivation::Situ { beta: 4.0, linear_beta: Some(25.0) });
         assert_eq!(kimi.slice(6), Some(512));

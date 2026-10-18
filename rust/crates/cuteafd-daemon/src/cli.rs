@@ -169,9 +169,10 @@ pub(crate) struct PlanArgs {
     /// Spark inventory available to automatic selection.
     #[arg(long, default_value_t = 6)]
     pub(crate) available_sparks: usize,
-    /// Routed-expert weight budget per Spark rank, GiB.
-    #[arg(long, default_value_t = 100.0)]
-    pub(crate) spark_budget_gib: f64,
+    /// Routed-expert weight budget per Spark rank, GiB (unset: the family's
+    /// default, 100 GiB for most; Kimi K3 108 GiB).
+    #[arg(long)]
+    pub(crate) spark_budget_gib: Option<f64>,
     /// Weight budget of the coordinator GPU, GiB (its own tensors, plus every
     /// routed expert with --spark-ranks 0).
     #[arg(long, alias = "coordinator-budget-gib", default_value_t = 80.0)]

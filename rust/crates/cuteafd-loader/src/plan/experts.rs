@@ -170,7 +170,7 @@ pub fn spark_recipe(package: &str, intermediate: usize, world: usize) -> Result<
     let key = package.split_whitespace().next().unwrap_or(package);
     let (family, format) = key.split_once(':').ok_or_else(|| SparkRecipeRefusal::UnknownPackage(package.into()))?;
     let native = matches!(family, "v41" | "dsv4f" | "dsv4p");
-    let exl3 = format.starts_with("exl3-k") && matches!(family, "v41" | "dsv4f" | "dsv4p" | "glm" | "glmf" | "qwen4");
+    let exl3 = format.starts_with("exl3-k") && matches!(family, "v41" | "dsv4f" | "dsv4p" | "glm" | "glmf" | "qwen4" | "kimik3");
     let nvfp4 = matches!(format, "nvfp4" | "nvfp4a4") && matches!(family, "v41" | "glm" | "glmf" | "qwen4");
     let mxfp4 = (format == "mxfp4" && native) || (format == "fp8" && matches!(family, "mimof" | "mimop"));
     let fp8 = format == "fp8" && matches!(family, "mimo" | "glm" | "glmf" | "qwen4");
@@ -178,7 +178,8 @@ pub fn spark_recipe(package: &str, intermediate: usize, world: usize) -> Result<
         return Err(SparkRecipeRefusal::UnknownPackage(package.into()));
     }
     // V4.1 EXL3 TP6 remains unqualified pending a capped-local fidelity gate.
-    if family == "v41" && exl3 && world == 6 {
+    // Kimi K3's only Spark layout is TP6 width 512 (#273: TP4 needs 160 GiB/rank).
+    if (family == "v41" && exl3 && world == 6) || (family == "kimik3" && world != 6) {
         return Err(SparkRecipeRefusal::MissingPackage { package: key.into(), world });
     }
     let block = if nvfp4 && !native && !matches!(world, 1 | 5) { 16 } else { 128 };
