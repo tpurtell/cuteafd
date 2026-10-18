@@ -206,6 +206,19 @@ def test_dense_cards_and_direct_configs_use_checkpoint_geometry(tmp_path, monkey
         aot.config_scopes(values)
 
 
+@pytest.mark.parametrize('count', [0, 4])
+def test_kimi_k3_refuses_every_layout_but_tp6(count):
+    values = dict(MODEL_ID='test/Kimi-K3-EXL3-K2', SPARK_COUNT=str(count), RTX_GPUS='2')
+    with pytest.raises(ValueError, match='TP6 only'):
+        aot.family_scopes([dict(family='kimi_k3', name='kimi-k3-exl3-k2', config=None)], lambda _: values)
+
+
+def test_kimi_k3_routed_range_from_its_own_config():
+    config = dict(model_type='kimi_k3', text_config=dict(num_hidden_layers=93, first_k_dense_replace=1, moe_layer_freq=1))
+    assert aot.checkpoint_family.describe(config) == ('kimi_k3', 'kimi_k3', 1, 92)
+    assert aot.checkpoint_family.routed_layers(config) == 92
+
+
 @pytest.mark.parametrize('operation', ['card', 'config', 'seal'])
 def test_unknown_family_has_no_silent_empty_scope(operation, tmp_path):
     with pytest.raises(ValueError, match='no WIP AOT scope mapping for unknown'):
@@ -226,6 +239,7 @@ def test_unknown_family_has_no_silent_empty_scope(operation, tmp_path):
     ('mimo_v2', 'MiMo-V2.6-Pro', 6, 'MIMO', 'mimop:fp8', 'mimop:fp8', 'mimop=6', '',
      {'CUTEAFD_WIP_AUDIO_AOT': 'ON', 'CUTEAFD_WIP_MIMO_GEOMETRIES': 'mimop'}),
     ('qwen4', 'Qwen3.8-Flash-Next-EXL3', 0, 'QWEN4', 'qwen4:exl3-k45;qwen4:nvfp4', '', '', '', {}),
+    ('kimi_k3', 'Kimi-K3-EXL3-K2', 6, 'KIMIK3', 'kimik3:exl3-k23', 'kimik3:exl3-k23', 'kimik3=6', '', {}),
 ])
 def test_existing_family_scope_outputs_are_unchanged(family, model, count, program,
         coordinator, spark, counts, roles, extra):

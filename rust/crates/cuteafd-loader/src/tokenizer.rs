@@ -79,10 +79,15 @@ impl StreamingTokenDecoder {
 
 impl LoadedTokenizer {
     pub fn from_snapshot(snapshot_path: &Path) -> Result<Self> {
-        let tokenizer_path = snapshot_path.join("tokenizer.json");
-        let tokenizer = tokenizers::Tokenizer::from_file(&tokenizer_path).map_err(|err| {
-            anyhow::anyhow!("loading tokenizer {}: {err}", tokenizer_path.display())
-        })?;
+        let mut tokenizer_path = snapshot_path.join("tokenizer.json");
+        let tokenizer = if !tokenizer_path.is_file() && tiktoken::present(snapshot_path) {
+            tokenizer_path = snapshot_path.join("tiktoken.model");
+            tiktoken::load(snapshot_path)?
+        } else {
+            tokenizers::Tokenizer::from_file(&tokenizer_path).map_err(|err| {
+                anyhow::anyhow!("loading tokenizer {}: {err}", tokenizer_path.display())
+            })?
+        };
         let pieces = pieces::Pieces::new(&tokenizer);
         Ok(Self {
             tokenizer_path: tokenizer_path.display().to_string(),
@@ -209,6 +214,7 @@ pub fn streaming_token_decoder(
 }
 
 mod pieces;
+pub mod tiktoken;
 
 #[cfg(test)]
 mod tests;
