@@ -117,6 +117,26 @@ def test_geometry_restored_on_failure():
     assert (F.linear, torch.einsum, reference.eager_attention_forward) == (*original, eager)
 
 
+def test_native_mxfp4_packing_and_scale_values():
+    torch = pytest.importorskip("torch")
+    pytest.importorskip("compressed_tensors")
+    from compressed_tensors.compressors.mxfp4 import MXFP4PackedCompressor
+    from compressed_tensors.quantization import QuantizationScheme
+    scheme = QuantizationScheme.model_validate({"targets": ["Linear"], "weights": {
+        "num_bits": 4, "type": "float", "group_size": 32,
+        "strategy": "group", "symmetric": True}})
+    packed = torch.arange(256).to(torch.uint8).reshape(16, 16)
+    scale = torch.arange(119, 135).to(torch.uint8)[:, None]
+    native = MXFP4PackedCompressor.decompress(
+        {"weight_packed": packed, "weight_scale": scale}, scheme)["weight"]
+    codes = torch.stack((packed & 15, packed >> 4), dim=-1).reshape(16, 32).long()
+    table = torch.tensor([0., .5, 1., 1.5, 2., 3., 4., 6.,
+                          -0., -.5, -1., -1.5, -2., -3., -4., -6.])
+    expected = (table[codes] * torch.exp2(scale.float() - 127)).bfloat16()
+    assert native.dtype == torch.bfloat16
+    assert torch.equal(native.view(torch.uint16), expected.view(torch.uint16))
+
+
 def test_official_forward_gate_rejects_disagreement(tmp_path):
     native = np.array([[4., 0., -1.], [0., 4., -1.]], dtype=np.float32)
     assert golden.official_check(tmp_path, [native, native.copy()], [])["passed"]
