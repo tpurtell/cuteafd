@@ -6,6 +6,7 @@ import hashlib
 import importlib
 import json
 from pathlib import Path
+import re
 import struct
 import sys
 import types
@@ -53,7 +54,7 @@ def package_source_identity(module):
 
 class LayerWeights:
     """Map shards only while loading one layer; preserve each stored dense dtype."""
-    def __init__(self, snapshot, quantization):
+    def __init__(self, snapshot, quantization, *, kda_num_heads):
         from compressed_tensors.quantization import QuantizationScheme
         self.snapshot = Path(snapshot)
         self.index = json.loads((self.snapshot / "model.safetensors.index.json").read_bytes())["weight_map"]
@@ -66,6 +67,34 @@ class LayerWeights:
             raise ValueError("unsupported official Kimi expert quantization")
         self.scheme = schemes[0]
         self.native_fp32 = set()
+        self.kda_num_heads = kda_num_heads
+        self.narrowed_a_log = {}
+
+    def padded_a_log(self, name, shape, expected_shape):
+        return (self.kda_num_heads == 96 and list(shape) == [128]
+                and list(expected_shape) == [96]
+                and re.fullmatch(r"language_model\.model\.layers\.\d+\.self_attn\.A_log", name))
+
+    def narrow_a_log(self, name, value, expected_shape):
+        import torch
+        if (not self.padded_a_log(name, value.shape, expected_shape)
+                or value.dtype != torch.float32):
+            raise ValueError("unsupported native A_log padding: " + name)
+        tail = value[96:].detach().contiguous().view(torch.uint8).cpu().numpy().tobytes()
+        # The release pads unused heads with positive F32 zero, not learned values.
+        if any(tail):
+            raise ValueError("native A_log padding is not bit-exact zero: " + name)
+        self.narrowed_a_log[name] = {
+            "tensor": name, "stored_shape": [128], "loaded_shape": [96],
+            "tail_shape": [32], "tail_dtype": "F32", "tail_bitwise_zero": True,
+            "tail_sha256": hashlib.sha256(tail).hexdigest(),
+        }
+        return value[:96]
+
+    def padding_provenance(self):
+        return {"active_heads": self.kda_num_heads,
+                "rule": "narrow only native F32 [128] KDA A_log to 96 configured heads after every unused tail byte equals zero",
+                "layers": [self.narrowed_a_log[name] for name in sorted(self.narrowed_a_log)]}
 
     def descriptor(self, name):
         shard = self.index[name]
@@ -123,7 +152,10 @@ class LayerWeights:
             elif descriptor["dtype"] not in ("BF16", "F32"):
                 raise ValueError("unsupported native dense dtype: " + full)
             if shape != list(parameter.shape):
-                raise ValueError(f"native tensor shape differs: {full}; checkpoint {shape}, official model {list(parameter.shape)}")
+                if self.padded_a_log(full, shape, parameter.shape):
+                    self.narrow_a_log(full, self.tensor(full, device="cpu"), parameter.shape)
+                else:
+                    raise ValueError(f"native tensor shape differs: {full}; checkpoint {shape}, official model {list(parameter.shape)}")
             entries.append((shard, descriptor["data_offsets"][0], full, name, parameter))
         return sorted(entries, key=lambda entry: entry[:2])
 
@@ -134,7 +166,10 @@ class LayerWeights:
         for _, _, full, name, parameter in entries:
             value = self.weight(full)
             if tuple(value.shape) != tuple(parameter.shape):
-                raise ValueError("native tensor shape differs: " + full)
+                if self.padded_a_log(full, value.shape, parameter.shape):
+                    value = self.narrow_a_log(full, value, parameter.shape)
+                else:
+                    raise ValueError("native tensor shape differs: " + full)
             parent, _, leaf = name.rpartition(".")
             owner = module.get_submodule(parent) if parent else module
             owner._parameters[leaf] = torch.nn.Parameter(value, requires_grad=False)

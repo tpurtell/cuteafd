@@ -212,12 +212,25 @@ def execute(a):
         raise ValueError("Kimi oracle supports only its own text panel")
     snapshot = verify_snapshot(manifest, a.snapshot)
     reference, config, quantization = load_official(a.snapshot)
-    weights = LayerWeights(a.snapshot, quantization)
-    # Reject an inconsistent release before embeddings, GPU admission or shard payload reads.
+    weights = LayerWeights(a.snapshot, quantization,
+                           kda_num_heads=config.linear_attn_config["num_heads"])
+    # Check every layer shape and only the small A_log tails before GPU admission.
+    for index in range(config.num_hidden_layers):
+        with torch.device("meta"):
+            layer = reference.KimiDecoderLayer(config, index)
+        weights.validate_module(layer, f"language_model.model.layers.{index}")
+        weights.close()
+        del layer
     with torch.device("meta"):
-        first = reference.KimiDecoderLayer(config, 0)
-    weights.validate_module(first, "language_model.model.layers.0")
-    del first
+        outer = [(torch.nn.Embedding(config.vocab_size, config.hidden_size), "language_model.model.embed_tokens"),
+                 (torch.nn.Linear(config.hidden_size, config.vocab_size, bias=False), "language_model.lm_head"),
+                 (reference.KimiRMSNorm(config.hidden_size, eps=config.rms_norm_eps), "language_model.model.norm"),
+                 (reference.KimiRMSNorm(config.hidden_size, eps=config.rms_norm_eps), "language_model.model.output_attn_res_norm"),
+                 (torch.nn.Linear(config.hidden_size, 1, bias=False), "language_model.model.output_attn_res_proj")]
+    for module, prefix in outer:
+        weights.validate_module(module, prefix)
+    del outer, module
+    print(f"native shape preflight passed; {len(weights.narrowed_a_log)} zero-padded KDA A_log tensors", flush=True)
     pins = {**source_identity(a.snapshot), "fla_source_sha256": package_source_identity(fla),
             "transformers_source_sha256": package_source_identity(transformers),
             "compressed_tensors_source_sha256": package_source_identity(compressed_tensors),
@@ -342,10 +355,11 @@ def execute(a):
                       fixed_rows=128, native_fp32_parameters=sorted(set(state.latest["native_fp32_parameters"]) | weights.native_fp32),
                       gates={"situ_beta": config.activation_situ_beta,
                              "situ_linear_beta": config.activation_situ_linear_beta,
-                             "kda_gate_lower_bound": config.linear_attn_config["gate_lower_bound"]},
+                             "kda_gate_lower_bound": config.linear_attn_config["gate_lower_bound"],
+                             "kda_a_log_zero_padding": weights.padding_provenance()},
                       official_forward=comparison,
                       root_arithmetic={"source": "official checkpoint Python decoder and compressed-tensors MXFP4 decompressor",
-                          "arithmetic": "Exact native group-32 MXFP4 dequantization; shipped dense dtypes; BF16 stream and full block-residual history; official Situ, latent MoE, bounded-gate FLA KDA and eager MLA; F32 accumulations and widened F32 head; fixed-M128 linears; MTP/cache off."},
+                          "arithmetic": "Exact native group-32 MXFP4 dequantization; shipped dense dtypes; BF16 stream and full block-residual history; official Situ, latent MoE, bounded-gate FLA KDA and eager MLA; F32 accumulations and widened F32 head; fixed-M128 linears; MTP/cache off.\n\nCheckpoint-format note: the release zero-pads native KDA A_log from 96 active heads to 128. Each affected tensor is narrowed to the first 96 only after all 32 unused F32 values are verified bit-exact positive zero. Per-layer shapes and tail SHA256 checks are recorded in reference_provenance.gates.kda_a_log_zero_padding; all other tensor shapes remain strict."},
                       platform={"capability": list(torch.cuda.get_device_capability()),
                                 "gpu": torch.cuda.get_device_name(), "cuda": torch.version.cuda})
     print(f"reference NLL {total_nll / total_rows:.12f}; {total_rows} scored rows", flush=True)

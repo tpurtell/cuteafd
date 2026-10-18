@@ -32,14 +32,71 @@ def test_source_identity_fails_closed(tmp_path, monkeypatch):
 
 def test_native_shape_disagreement_stops_before_payload_read():
     weights = model.LayerWeights.__new__(model.LayerWeights)
-    name = "language_model.model.layers.0.self_attn.A_log"
+    name = "language_model.model.layers.0.self_attn.dt_bias"
+    weights.kda_num_heads = 96
     weights.index = {name: "fixture.safetensors"}
     weights.descriptor = lambda key: ("fixture.safetensors", {
         "dtype": "F32", "shape": [128], "data_offsets": [0, 512]})
     module = types.SimpleNamespace(named_parameters=lambda: [
-        ("self_attn.A_log", types.SimpleNamespace(shape=(96,)))])
+        ("self_attn.dt_bias", types.SimpleNamespace(shape=(96,)))])
     with pytest.raises(ValueError, match=r"checkpoint \[128\], official model \[96\]"):
         weights.validate_module(module, "language_model.model.layers.0")
+
+
+@pytest.mark.parametrize("bad_tail", [None, 1., -0., float("nan")])
+def test_native_a_log_padding_is_bit_exact_and_audited(bad_tail):
+    torch = pytest.importorskip("torch")
+    weights = model.LayerWeights.__new__(model.LayerWeights)
+    weights.kda_num_heads, weights.narrowed_a_log = 96, {}
+    name = "language_model.model.layers.0.self_attn.A_log"
+    value = torch.cat((torch.arange(96, dtype=torch.float32), torch.zeros(32)))
+    if bad_tail is not None:
+        value[-1] = bad_tail
+        with pytest.raises(ValueError, match="not bit-exact zero"):
+            weights.narrow_a_log(name, value, (96,))
+        assert not weights.narrowed_a_log
+    else:
+        narrowed = weights.narrow_a_log(name, value, (96,))
+        assert torch.equal(narrowed, value[:96])
+        assert narrowed.dtype == torch.float32
+        proof = weights.padding_provenance()["layers"][0]
+        assert proof["tail_bitwise_zero"] is True
+        assert proof["tail_sha256"] == hashlib.sha256(bytes(128)).hexdigest()
+
+
+@pytest.mark.parametrize("heads,name,shape,expected", [
+    (128, "language_model.model.layers.0.self_attn.A_log", (128,), (96,)),
+    (96, "language_model.model.layers.0.self_attn.dt_bias", (128,), (96,)),
+    (96, "language_model.model.layers.0.self_attn.A_log", (129,), (96,)),
+    (96, "language_model.model.layers.0.self_attn.A_log", (128,), (95,)),
+])
+def test_a_log_padding_exception_is_narrow(heads, name, shape, expected):
+    weights = model.LayerWeights.__new__(model.LayerWeights)
+    weights.kda_num_heads = heads
+    assert not weights.padded_a_log(name, shape, expected)
+
+
+def test_module_loader_checks_and_narrows_only_zero_a_log():
+    torch = pytest.importorskip("torch")
+    weights = model.LayerWeights.__new__(model.LayerWeights)
+    weights.kda_num_heads, weights.narrowed_a_log = 96, {}
+    name = "language_model.model.layers.0.self_attn.A_log"
+    weights.index = {name: "fixture.safetensors"}
+    weights.descriptor = lambda key: ("fixture.safetensors", {
+        "dtype": "F32", "shape": [128], "data_offsets": [0, 512]})
+    value = torch.cat((torch.arange(96, dtype=torch.float32), torch.zeros(32)))
+    weights.tensor = lambda key, device="cpu": value.clone()
+    weights.weight = lambda key: value.clone()
+    weights.close = lambda: None
+    module = torch.nn.Module()
+    module.self_attn = torch.nn.Module()
+    module.self_attn.A_log = torch.nn.Parameter(torch.empty(96, device="meta"))
+    weights.load_module(module, "language_model.model.layers.0")
+    assert torch.equal(module.self_attn.A_log, value[:96])
+    assert module.self_attn.A_log.dtype == torch.float32
+    value[-1] = 1
+    with pytest.raises(ValueError, match="not bit-exact zero"):
+        weights.load_module(module, "language_model.model.layers.0")
 
 
 def blob(root, pending, wid, data=b"\0\0\0\0"):
