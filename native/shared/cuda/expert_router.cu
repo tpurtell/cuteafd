@@ -214,6 +214,51 @@ __global__ void __launch_bounds__(512) softmax_select_kernel(const float* logits
     routing[row*topk+tid]=weight*scale;
   }
 }
+// Wide sigmoid/sqrtsoftplus routing is separate to preserve all existing kernel
+// specializations byte-for-byte. One thread owns each expert (up to 1024).
+template<bool Sigmoid>
+__global__ void __launch_bounds__(1024) select_wide_kernel(float* scores,const float* bias,const float* bias_vl,
+    const uint8_t* image_mask,uint32_t* ids,float* routing,int experts,int topk,float scale=1.5f) {
+  const uint64_t row=blockIdx.x;const int tid=threadIdx.x;const int lane=tid&31,warp=tid>>5;
+  {
+    if(tid<experts) {
+      const float logit=scores[row*experts+tid];
+      // DeepSeek sqrtsoftplus, or GLM's sigmoid (noaux_tc).
+      scores[row*experts+tid]=Sigmoid?1.0f/(1.0f+expf(-logit)):sqrtf(logit>20.0f?logit:log1pf(expf(logit)));
+    }
+    __syncthreads();
+  }
+  const float* correction=image_mask && image_mask[row]?bias_vl:bias;
+  float candidate=tid<experts?scores[row*experts+tid]+correction[tid]:-CUDART_INF_F;
+  __shared__ float warp_value[32],selected[16];__shared__ uint32_t warp_index[32],winner_index;
+  uint32_t index=tid<experts?uint32_t(tid):UINT32_MAX;
+  for(int rank=0;rank<topk;++rank) {
+    float v=candidate;uint32_t i=index;
+    for(int offset=16;offset;offset>>=1) {
+      const float ov=__shfl_down_sync(0xffffffffu,v,offset);
+      const uint32_t oi=__shfl_down_sync(0xffffffffu,i,offset);
+      if(ov>v || (ov==v && oi<i)) {v=ov;i=oi;}
+    }
+    if(lane==0) {warp_value[warp]=v;warp_index[warp]=i;}
+    __syncthreads();
+    if(warp==0) {
+      v=lane<32?warp_value[lane]:-CUDART_INF_F;i=lane<32?warp_index[lane]:UINT32_MAX;
+      for(int offset=16;offset;offset>>=1) {
+        const float ov=__shfl_down_sync(0xffffffffu,v,offset);
+        const uint32_t oi=__shfl_down_sync(0xffffffffu,i,offset);
+        if(ov>v || (ov==v && oi<i)) {v=ov;i=oi;}
+      }
+      if(lane==0) {winner_index=i;ids[row*topk+rank]=i;selected[rank]=scores[row*experts+i];}
+    }
+    __syncthreads();
+    if(uint32_t(tid)==winner_index) {candidate=-CUDART_INF_F;index=UINT32_MAX;}
+  }
+  __syncthreads();
+  if(tid<topk) {
+    float total=0;for(int j=0;j<topk;++j) total+=selected[j];
+    routing[row*topk+tid]=(selected[tid]/(total+1e-20f))*scale;
+  }
+}
 bool span(const void* p,uint64_t n,int alignment) {
   auto a=reinterpret_cast<uintptr_t>(p);return a && a%alignment==0 && a<=UINTPTR_MAX-n;
 }
@@ -282,16 +327,22 @@ extern "C" int32_t cuteafd_dsv4_router_select(float* logits,const float* bias,co
 extern "C" int32_t cuteafd_router_select(float* logits,const float* bias,const int32_t* tid2eid,
     const uint32_t* tokens,uint32_t* ids,float* routing,int32_t rows,int32_t experts,int32_t topk,
     float route_scale,int32_t sigmoid,void* stream) {
-  if(rows<1 || rows>4096 || experts<1 || experts>512 || topk<1 || topk>8 || topk>experts ||
+  if(rows<1 || rows>4096 || experts<1 || experts>1024 || topk<1 || topk>16 || topk>experts ||
       (tid2eid==nullptr)==(bias==nullptr) || (tid2eid && !tokens)) return cudaErrorInvalidValue;
   const void* p[]={logits,ids,routing};
   const uint64_t n[]={uint64_t(rows)*experts*4,uint64_t(rows)*topk*4,uint64_t(rows)*topk*4};
   for(int i=0;i<3;++i) if(!span(p[i],n[i],4)) return cudaErrorInvalidValue;
   for(int i=1;i<3;++i) for(int j=0;j<i;++j) if(!disjoint(p[i],n[i],p[j],n[j])) return cudaErrorInvalidValue;
   auto s=reinterpret_cast<cudaStream_t>(stream);
-  if(tid2eid && sigmoid) return cudaErrorInvalidValue;
+  if(tid2eid && (sigmoid || experts>512 || topk>8)) return cudaErrorInvalidValue;
   if(tid2eid) {
     select_hash_kernel<<<rows,32,0,s>>>(logits,tid2eid,tokens,ids,routing,experts,topk,route_scale);
+  } else if(experts>512 || topk>8) {
+    if(sigmoid) {
+      select_wide_kernel<true><<<rows,1024,0,s>>>(logits,bias,bias,nullptr,ids,routing,experts,topk,route_scale);
+    } else {
+      select_wide_kernel<false><<<rows,1024,0,s>>>(logits,bias,bias,nullptr,ids,routing,experts,topk,route_scale);
+    }
   } else if(sigmoid) {
     select_fast_kernel<true,true><<<rows,512,0,s>>>(logits,bias,bias,nullptr,ids,routing,experts,topk,route_scale);
   } else {

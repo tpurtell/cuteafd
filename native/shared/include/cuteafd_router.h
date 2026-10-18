@@ -24,8 +24,12 @@ int32_t cuteafd_v41_router_select_logits(float* scores,const float* bias,
 int32_t cuteafd_dsv4_router_select(float* logits,const float* bias,const int32_t* tid2eid,
     const uint32_t* tokens,uint32_t* ids,float* routing,int32_t rows,int32_t experts,int32_t topk,
     float route_scale,void* stream);
-// Same, with `sigmoid` != 0 selecting GLM's sigmoid scores (noaux_tc, bias
-// only for the choice); hash tables need sqrtsoftplus.
+// Same, with `sigmoid` != 0 selecting sigmoid scores (GLM/Kimi, bias only
+// for the choice). Bias routing supports experts <= 1024, topk <= 16; hash
+// tables need sqrtsoftplus and retain experts <= 512, topk <= 8. Kimi uses
+// experts=896, topk=16, route_scale=1 with no group filtering. Caller projects
+// FP32 logits; IDs/weights are row-major [rows,topk], descending corrected
+// score with lower expert ID on ties. Weights normalize uncorrected scores.
 int32_t cuteafd_router_select(float* logits,const float* bias,const int32_t* tid2eid,
     const uint32_t* tokens,uint32_t* ids,float* routing,int32_t rows,int32_t experts,int32_t topk,
     float route_scale,int32_t sigmoid,void* stream);
