@@ -92,14 +92,37 @@ class ResponseCache:
         self.directory, self.identity = Path(directory), identity
         self.directory.mkdir(parents=True, exist_ok=True, mode=0o700)
 
+    def binding_key(self, binding):
+        backend = binding["backend"]
+        if backend.get("text_source") == "api":
+            # Hosted responses depend on wire inputs, not local rendering code.
+            request = binding["request"]
+            return {"endpoint": backend["endpoint"], "model": request["model"],
+                    "provider": request.get("provider"), "request": request}
+        return binding
+
+    def find(self, body):
+        binding = {"backend": self.identity, "request": body}
+        expected = self.binding_key(binding)
+        path = self.directory / (hashlib.sha256(canonical(expected)).hexdigest() + ".json")
+        candidates = [path] if path.exists() else []
+        if self.identity.get("text_source") == "api" and not candidates:
+            # Read old source-bound records in place; never rewrite their dates or hashes.
+            candidates = sorted(self.directory.glob("*.json"))
+        for candidate in candidates:
+            record = json.loads(candidate.read_bytes())
+            if self.binding_key(record["binding"]) == expected:
+                return record
+            if candidate == path:
+                raise ValueError("cached generation binding mismatch")
+        return None
+
     def get(self, body, generate):
         binding = {"backend": self.identity, "request": body}
-        key = hashlib.sha256(canonical(binding)).hexdigest()
+        key = hashlib.sha256(canonical(self.binding_key(binding))).hexdigest()
         path = self.directory / (key + ".json")
-        if path.exists():
-            record = json.loads(path.read_bytes())
-            if record.get("binding") != binding:
-                raise ValueError("cached generation binding mismatch")
+        record = self.find(body)
+        if record is not None:
             return record
         response = generate()
         record = {"binding": binding, "response": response,
@@ -175,7 +198,16 @@ class APIClient(TextGenerator):
         request = copy.deepcopy(body)
         request["model"] = self.model
         request.update(self.extra_body)
-        record = self.cache.get(request, lambda: self.request(request))
+        record = self.cache.find(request)
+        if record is None:
+            if urllib.parse.urlsplit(self.endpoint).hostname == "openrouter.ai":
+                # Reuse old exact requests first; budget only newly purchased responses.
+                reasoning_options = copy.deepcopy(request.get("reasoning") or {})
+                reasoning_options.pop("effort", None)
+                reasoning_options["max_tokens"] = body["max_tokens"]
+                request["reasoning"] = reasoning_options
+                request.pop("reasoning_effort", None)
+            record = self.cache.get(request, lambda: self.request(request))
         raw = record["response"]
         if raw.get("error") or not raw.get("choices"):
             raise ValueError("API returned an error or no choices (raw response cached)")
@@ -186,15 +218,25 @@ class APIClient(TextGenerator):
         message["reasoning_content"] = reasoning
         if not message.get("content") and not reasoning and not message.get("tool_calls"):
             raise ValueError("API returned no accessible text or tool calls")
-        generated = self.renderer.completion(body, message)
-        return self.result(body, generated, message, {
+        generated_full = self.renderer.completion(body, message)
+        generated = generated_full[:body["max_tokens"]]
+        visible_message = message
+        if len(generated) < len(generated_full):
+            # A cut response is unfinished; never execute calls from its discarded suffix.
+            visible_message = {**message, "tool_calls": []}
+        return self.result(body, generated, visible_message, {
             **self.identity, "date": record["date"], "provider": raw.get("provider"),
             "response_model": raw.get("model"), "response_id": raw.get("id"),
             "usage": raw.get("usage"), "finish_reason": choice.get("finish_reason"),
             "reasoning_content": reasoning, "content": message.get("content") or "",
-            "tool_calls": message.get("tool_calls") or [], "recipe_options": self.extra_body,
+            "tool_calls": message.get("tool_calls") or [],
+            "recipe_options": {k: v for k, v in record["binding"]["request"].items()
+                               if k in self.extra_body or k == "reasoning"},
+            "cached_generator_sha256": record["binding"]["backend"].get("generator_sha256"),
+            "current_generator_sha256": self.identity.get("generator_sha256"),
             "raw_response_sha256": hashlib.sha256(canonical(raw)).hexdigest(),
-            "reconstructed_tokens": len(generated), "retokenization": "lossless; checkpoint chat template"})
+            "generated_ids_full": len(generated_full), "generated_ids_kept": len(generated),
+            "reconstructed_tokens": len(generated), "retokenization": "lossless full completion; checkpoint chat template; recipe ID prefix"})
 
 
 def parse_qwen_response(text, tools, *, thinking_prefix=False):

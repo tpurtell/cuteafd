@@ -1,5 +1,6 @@
 """Own-text backend contracts without credentials, CUDA or external APIs."""
 import copy
+import hashlib
 import json
 from pathlib import Path
 import sys
@@ -10,6 +11,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "python/reference"))
 from fidelity_generation import APIClient, ChatRenderer, HFClient, parse_qwen_response
+from fidelity_windows import canonical
 
 
 class Tokenizer:
@@ -87,11 +89,35 @@ def test_api_local_sizing_cache_split_and_provenance(api):
     assert result["content"] == "answer" and result["reasoning"] == "reason"
     assert result["generation_provenance"]["provider"] == "original"
     assert result["generation_provenance"]["usage"]["cost"] == .001
+    assert result["generation_provenance"]["generated_ids_full"] == len(result["probe"]["generated"])
+    assert result["generation_provenance"]["generated_ids_kept"] == len(result["probe"]["generated"])
     assert client(request) == result
     assert len(state["calls"]) == 1
     cached = next(client.cache.directory.glob("*.json")).read_text()
     assert "test-private-value" not in cached and "Authorization" not in cached
     assert next(client.cache.directory.glob("*.json")).stat().st_mode & 0o777 == 0o600
+
+
+@pytest.mark.parametrize("model", ["official-model", "another-model"])
+def test_api_caps_full_rendered_ids_and_preserves_raw_response(api, model):
+    client, state = api
+    client.model = model
+    call = {"id": "call0", "type": "function", "function": {"name": "read_file", "arguments": '{"path":"README.md"}'}}
+    state["message"] = {"role": "assistant", "content": "answer" * 300,
+                        "reasoning_content": "reason" * 300, "tool_calls": [call]}
+    request = body()
+    full = client.renderer.completion(request, state["message"])
+    result = client(request)
+    assert result["probe"]["generated"] == full[:1024]
+    assert result["tool_calls"] == []
+    provenance = result["generation_provenance"]
+    assert provenance["generated_ids_full"] == len(full)
+    assert provenance["generated_ids_kept"] == 1024
+    assert provenance["tool_calls"] == [call]
+    cached = json.loads(next(client.cache.directory.glob("*.json")).read_text())
+    assert cached["response"]["choices"][0]["message"] == state["message"]
+    assert client(request) == result
+    assert len(state["calls"]) == 1
 
 
 def test_roundtrip_reconstructed_span(api):
@@ -111,6 +137,53 @@ def test_api_native_tools_are_rendered_as_objects(api):
     result = client(body())
     assert result["tool_calls"] == [call]
     assert '"arguments": {"path": "README.md"}' in client.renderer.tokenizer.decode(result["probe"]["generated"])
+
+
+def test_api_cache_reuses_original_source_bound_response(api):
+    client, state = api
+    client.identity["generator_sha256"] = "old-source"
+    first = client(body())
+    path = next(client.cache.directory.glob("*.json"))
+    record = json.loads(path.read_bytes())
+    old_path = path.with_name(hashlib.sha256(canonical(record["binding"])).hexdigest() + ".json")
+    path.rename(old_path)
+    original = old_path.read_bytes()
+    client.identity["generator_sha256"] = "new-source"
+    replay = client(body())
+    assert replay["probe"] == first["probe"]
+    assert replay["generation_provenance"]["cached_generator_sha256"] == "old-source"
+    assert replay["generation_provenance"]["current_generator_sha256"] == "new-source"
+    assert replay["generation_provenance"]["date"] == first["generation_provenance"]["date"]
+    assert old_path.read_bytes() == original
+    assert len(state["calls"]) == 1
+    client.extra_body = {"provider": {"only": ["different"]}}
+    client(body())
+    assert len(state["calls"]) == 2
+
+
+def test_openrouter_reasoning_budget_only_on_uncached_requests(api, monkeypatch):
+    client, state = api
+    client(body())
+    record = json.loads(next(client.cache.directory.glob("*.json")).read_bytes())
+    client.endpoint = "https://openrouter.ai/api/v1/chat/completions"
+    client.identity["endpoint"] = client.endpoint
+    client.cache.get(body(), lambda: record["response"])
+
+    def request(payload):
+        state["calls"].append(copy.deepcopy(payload))
+        return copy.deepcopy(record["response"])
+
+    monkeypatch.setattr(client, "request", request)
+    original = client(body())
+    assert client(body()) == original
+    assert len(state["calls"]) == 1
+    changed = body()
+    changed["seed"] = 1
+    client(changed)
+    assert state["calls"][-1]["reasoning"] == {"max_tokens": 1024}
+    assert "reasoning_effort" not in state["calls"][-1]
+    client(changed)
+    assert len(state["calls"]) == 2
 
 
 def test_api_retry_and_request_identity(api, monkeypatch):
