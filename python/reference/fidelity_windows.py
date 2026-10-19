@@ -34,40 +34,36 @@ def validate_public_text(text: str, *, scored_text: bool = False) -> None:
         raise ValueError("credential or private-key publication blocker")
     if re.search(r"\b(?:tj|tpurtell)\b", text, re.I):
         raise ValueError("personal-data publication blocker")
-    for address in re.findall(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b", text):
-        domain = address.rsplit("@", 1)[1].lower()
-        reserved = domain in ("example.com", "example.org", "example.net") or domain.endswith(".example")
-        if not (scored_text and reserved):
-            raise ValueError("email publication blocker")
 
 
-def validate_public_metadata(value, *, synthetic_exemption: bool = False) -> None:
-    """Permit reserved-email audit records without exempting arbitrary metadata."""
+def validate_public_metadata(value) -> None:
+    """Reject credentials and our own identity in public text and metadata."""
     if isinstance(value, str):
-        validate_public_text(value, scored_text=synthetic_exemption)
+        validate_public_text(value)
     elif isinstance(value, list):
         for item in value:
-            validate_public_metadata(item, synthetic_exemption=synthetic_exemption)
+            validate_public_metadata(item)
     elif isinstance(value, dict):
         for key, item in value.items():
             validate_public_text(key)
-            if key == "synthetic_email_exemptions":
-                if not isinstance(item, list):
-                    raise ValueError("invalid synthetic-email audit records")
-                for record in item:
-                    if not isinstance(record, dict) or record.get("role") != "gen":
-                        raise ValueError("synthetic-email audit must name generated text")
-                    address = record.get("address")
-                    if not isinstance(address, str) or "@" not in address:
-                        raise ValueError("synthetic-email audit lacks address")
-                    domain = address.rsplit("@", 1)[1].lower()
-                    if domain not in ("example.com", "example.org", "example.net") and not domain.endswith(".example"):
-                        raise ValueError("non-reserved synthetic-email audit address")
-                    for field, content in record.items():
-                        validate_public_text(field)
-                        validate_public_metadata(content, synthetic_exemption=field == "address")
-            else:
-                validate_public_metadata(item)
+            validate_public_metadata(item)
+
+
+def validate_text_source(panel: dict) -> None:
+    """Only own-model text or an explicitly declared higher-fidelity source may ship."""
+    scored = panel.get("checkpoint")
+    arm = panel.get("generation_arm", {})
+    source = arm.get("checkpoint")
+    if not scored or not source:
+        raise ValueError("fidelity text source and scored checkpoint are required")
+    if source == scored:
+        return
+    declaration = panel.get("text_source_declaration", {})
+    if (declaration.get("scored_checkpoint") != scored or declaration.get("text_checkpoint") != source
+            or declaration.get("relationship") != "higher_fidelity_same_model"
+            or declaration.get("source_kind") not in ("official_api", "original_checkpoint")
+            or not declaration.get("evidence")):
+        raise ValueError("borrowed window text is not a declared higher-fidelity source of the scored model")
 
 
 def rss_bytes() -> int:
@@ -386,11 +382,26 @@ def bucket(position: int) -> str:
 
 def verify_snapshot(manifest: dict, snapshot: Path) -> dict:
     """Check cheap, stable identities without hashing hundreds of GB of weights."""
-    tokenizer_sha = hashlib.sha256((snapshot / "tokenizer.json").read_bytes()).hexdigest()
+    from checkpoint_tokenizer import tokenizer_identity
+    tokenizer = tokenizer_identity(snapshot)
+    tokenizer_sha = tokenizer["tokenizer_sha256"]
     config_sha = hashlib.sha256((snapshot / "config.json").read_bytes()).hexdigest()
     if manifest.get("tokenizer_sha256") not in (None, tokenizer_sha):
         raise ValueError("snapshot tokenizer differs from the pinned fidelity set")
     arm = manifest.get("reference_snapshot", manifest.get("generation_arm", {}))
+    if tokenizer.get("tokenizer_kind") == "checkpoint_python":
+        for source in (arm, manifest.get("generation_arm", {})):
+            if source.get("tokenizer_files") != tokenizer["tokenizer_files"]:
+                raise ValueError("snapshot native tokenizer source/resource hashes differ")
+    generation = manifest.get("generation_arm", {})
+    if generation.get("chat_template_kind") == "checkpoint_encoder":
+        encoder_file = generation.get("chat_encoder_file")
+        if encoder_file != "encoding/encoding.py":
+            raise ValueError("unsupported checkpoint chat encoder path")
+        encoder = snapshot / encoder_file
+        if (not encoder.is_file() or hashlib.sha256(encoder.read_bytes()).hexdigest()
+                != generation.get("chat_template_sha256")):
+            raise ValueError("snapshot checkpoint chat encoder differs")
     revision = arm.get("snapshot_revision")
     if revision is not None and snapshot.name != revision:
         raise ValueError("snapshot revision differs from the pinned reference identity")
@@ -400,7 +411,7 @@ def verify_snapshot(manifest: dict, snapshot: Path) -> dict:
             not revision or arm.get("config_sha256") != config_sha
             or arm.get("tokenizer_sha256") != tokenizer_sha):
         raise ValueError("explicit reference snapshot requires all identity hashes")
-    identity = {"snapshot_revision": snapshot.name, "tokenizer_sha256": tokenizer_sha,
+    identity = {"snapshot_revision": snapshot.name, **tokenizer,
                 "config_sha256": config_sha}
     for field in ("checkpoint", "precision"):
         if field in arm:
@@ -507,21 +518,108 @@ def validate_qualification(proof: dict | None, manifest: dict, identity: dict) -
         raise ValueError("reference prefix-invariance qualification failed or mismatched provenance")
 
 
+def scored_logits_nll(logits: np.ndarray, tokens, positions, *, chunk_rows: int = 32) -> dict:
+    """Score stored F32 rows in FP64 with a bounded log-softmax workspace."""
+    if (logits.ndim != 2 or logits.shape[0] != len(positions)
+            or not len(positions) or not logits.shape[1] or chunk_rows <= 0):
+        raise ValueError("invalid scored logits geometry")
+    tokens = np.asarray(tokens)
+    positions = np.asarray(positions)
+    if (not np.issubdtype(positions.dtype, np.integer)
+            or np.any(positions < 0) or np.any(positions >= len(tokens))):
+        raise ValueError("scored position outside tokens")
+    targets = tokens[positions]
+    if (not np.issubdtype(targets.dtype, np.integer)
+            or np.any(targets < 0) or np.any(targets >= logits.shape[1])):
+        raise ValueError("scored target outside vocabulary")
+    loss = 0.0
+    for start in range(0, len(positions), chunk_rows):
+        values = np.asarray(logits[start:start + chunk_rows], dtype="<f4").astype(np.float64)
+        if not np.isfinite(values).all():
+            raise ValueError("non-finite golden logits")
+        peak = values.max(axis=1)
+        normalizer = peak + np.log(np.exp(values - peak[:, None]).sum(axis=1, dtype=np.float64))
+        loss += float((normalizer - values[np.arange(len(values)), targets[start:start + len(values)]]).sum())
+    return {"nll": loss / len(positions), "scored_tokens": len(positions)}
+
+
 def write_scored_logits(out: Path, window: dict, logits: np.ndarray) -> dict:
     """Rows are already selected: row i predicts token score_from + i."""
     positions = list(range(window["score_from"], len(window["tokens"])))
     if logits.ndim != 2 or logits.shape[0] != len(positions):
         raise ValueError("scored logits shape does not match window positions")
+    stored = np.asarray(logits, dtype="<f4")
+    score = scored_logits_nll(stored, window["tokens"], positions)
     folder = out / "windows" / window["id"]
     folder.mkdir(parents=True, exist_ok=True)
     np.asarray(window["tokens"], dtype="<i4").tofile(folder / "tokens.bin")
-    np.asarray(logits, dtype="<f4").tofile(folder / "logits.bin")
+    stored.tofile(folder / "logits.bin")
     return {"id": window["id"], "path": str(folder.relative_to(out)),
-            "positions": positions, "vocab": logits.shape[1],
+            "positions": positions, "vocab": stored.shape[1], **score,
             **({"media": window["media"]} if window.get("media") else {})}
 
 
+def collect_runtime_platform() -> dict:
+    """Describe the running image and verify installed tokenizers against RECORD."""
+    import base64
+    import csv
+    import importlib.metadata
+    import io
+    import torch
+
+    image = os.environ.get('CUTEAFD_REFERENCE_IMAGE', '')
+    image_sha = os.environ.get('CUTEAFD_REFERENCE_IMAGE_SHA256', '').removeprefix('sha256:')
+    if not image or not re.fullmatch(r'[0-9a-f]{64}', image_sha):
+        raise ValueError('golden requires CUTEAFD_REFERENCE_IMAGE and CUTEAFD_REFERENCE_IMAGE_SHA256')
+    dist = importlib.metadata.distribution('tokenizers')
+    record = dist.read_text('RECORD')
+    if not record:
+        raise ValueError('installed tokenizers lacks RECORD')
+    files, native = [], []
+    for name, encoded, size in csv.reader(io.StringIO(record)):
+        if not encoded:
+            continue
+        algorithm, expected = encoded.split('=', 1)
+        if algorithm != 'sha256':
+            raise ValueError('unsupported tokenizers RECORD digest')
+        path = Path(dist.locate_file(name))
+        raw = path.read_bytes()
+        digest = hashlib.sha256(raw).hexdigest()
+        if (base64.urlsafe_b64encode(bytes.fromhex(digest)).decode().rstrip('=') != expected
+                or len(raw) != int(size)):
+            raise ValueError('installed tokenizers differs from RECORD')
+        files.append(dict(path=name, sha256=digest, bytes=len(raw)))
+        if name.startswith('tokenizers/') and path.suffix in ('.so', '.pyd'):
+            native.append(digest)
+    if not files or len(native) != 1 or not any(f['path'].endswith('.dist-info/WHEEL') for f in files):
+        raise ValueError('tokenizers RECORD lacks wheel/native evidence')
+    runtime = dict(schema='cuteafd.fidelity.platform/1', image=image, image_sha256=image_sha,
+                   compute_capability=list(torch.cuda.get_device_capability(0)),
+                   tokenizers_dist_sha256=hashlib.sha256(canonical(sorted(files, key=lambda f: f['path']))).hexdigest(),
+                   tokenizers_hash_kind='sha256 of canonical RECORD-verified installed file inventory',
+                   tokenizers_record_sha256=hashlib.sha256(record.encode()).hexdigest(),
+                   tokenizers_native_sha256=native[0],
+                   dependency_install=os.environ.get('CUTEAFD_REFERENCE_DEPENDENCY_INSTALL',
+                       'Pinned Transformers source; installed tokenizers files verified against dist-info/RECORD'))
+    direct = json.loads(dist.read_text('direct_url.json') or '{}')
+    archive = direct.get('archive_info', {})
+    archive_sha = archive.get('hashes', {}).get('sha256')
+    if archive_sha is None and archive.get('hash', '').startswith('sha256='):
+        archive_sha = archive['hash'].split('=', 1)[1]
+    if archive_sha is not None and direct.get('url', '').split('?', 1)[0].endswith('.whl'):
+        if not re.fullmatch(r'[0-9a-f]{64}', archive_sha):
+            raise ValueError('invalid tokenizers wheel archive digest')
+        runtime['tokenizers_wheel_archive_sha256'] = archive_sha
+    validate_public_metadata(runtime)
+    return runtime
+
+
 def finish_golden(out: Path, manifest: dict, rows: list[dict], **meta) -> None:
+    if os.environ.get('CUTEAFD_REFERENCE_IMAGE') or meta.get('platform', {}).get('capability') is not None:
+        runtime = collect_runtime_platform()
+        (out / 'platform.json').write_bytes(canonical(runtime) + b'\n')
+        if out.name == 'golden':
+            (out.parent / 'platform.json').write_bytes(canonical(runtime) + b'\n')
     (out / "windows.json").write_bytes(canonical(manifest) + b"\n")
     (out / "meta.json").write_bytes(canonical({"schema": "cuteafd.fidelity.golden/2",
         "set_sha256": manifest["set_sha256"], "family": manifest["family"],

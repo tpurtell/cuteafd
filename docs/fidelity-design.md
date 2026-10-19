@@ -1,10 +1,55 @@
 # Golden fidelity: metric, bar, set and harness (design, 2026-10-05)
 
-Working draft. Decides how a precision or kernel default (FP8 KDA/head, A8,
-W4A4, speculation paths) is judged against the checkpoint-precision engine,
-replacing the single 512-token PLAN.md passage. The qualified V4.1
-calibration and first paired decision are complete (see §8); other-family
-references and the independent agentic replay gate remain in progress.
+## Dataset policy (2026-10-18)
+
+A finished fidelity set contains own-model window text and locally measured
+original-quality reference logits. Dataset creation never requires engine
+qualification, paired serving runs, or engine-derived calibration. The
+historical engine comparison measurements later in this document are
+consumer-side evidence, not prerequisites for publishing a dataset.
+
+- Choose the highest-fidelity runnable text source, in this order: local BF16
+  greedy generation with the Transformers reference when the model fits a host;
+  our engine serving the official checkpoint format; the official API. Step-5
+  and Kimi use the API. Hosted generation requests temperature 0 but is not
+  claimed deterministic; record provider limitations explicitly.
+- Every set's README reports reference top-1 agreement with its generated-row
+  text tokens, alongside generated-row NLL and counts, so text quality stays
+  visible. This source-quality diagnostic is distinct from engine/reference
+  fidelity agreement and does not calibrate the publication policy floors.
+- Record endpoint/model/provider/date, reasoning/content/tool splits, recipe
+  deviations, checkpoint/tokenizer/template hashes and cached response identity.
+  Render fixed conversations with the checkpoint's own chat template; reconstructed
+  generated spans must re-tokenize losslessly. Execute tools in the same fixture.
+- Logits come from the original-quality model run locally, layer-streamed where
+  necessary. An explicitly chosen quant of a very large model is an acceptable
+  reference; record its exact checkpoint and arithmetic rather than implying BF16.
+- Text checkpoint equals the scored model, or a declared higher-fidelity source
+  of that same model (official API/original checkpoint with explicit evidence).
+  Foreign-model borrowed text is rejected, not published provisionally.
+- Reference finite-logit, snapshot/hash, byte-identical common-prefix and compact
+  storage checks gate publication. No engine run is part of validate or finalize.
+- Golden runtime provenance is collected by the shared golden finalizer into
+  `golden/platform.json` and its parent `platform.json`. Launch containers with
+  `CUTEAFD_REFERENCE_IMAGE`, `CUTEAFD_REFERENCE_IMAGE_SHA256` (Docker image content
+  digest), and optionally `CUTEAFD_REFERENCE_DEPENDENCY_INSTALL`. The collector
+  obtains compute capability from Torch and verifies installed tokenizers files
+  against RECORD. `tokenizers_dist_sha256` hashes their canonical inventory;
+  `tokenizers_hash_kind` states that meaning. A wheel archive hash is recorded
+  separately only when installed direct-url metadata actually supplies one.
+- New own-text sets use declared policy floors: top-1 >=90%, KL <=0.06 nat,
+  confident top-1 >=96%, top-3 >=97%; paired loss margins remain 1 point and
+  0.5 point respectively. These are policy, not values inferred from reference
+  logits or calibrated against an engine. A compatibility audit of all 28 current
+  cards and all 120 metric-bearing exports found no confident/top-3 failures at
+  these floors; 98% confident would newly fail 13 previously passing cards.
+  Unreplaced historical sets stay intact.
+- Publish and validate the replacement, re-pin its immutable revision, then remove
+  exactly the replaced borrowed-text config in a separate dataset commit. History
+  retains the former config. Shared dataset index/card edits are coordinator-owned.
+
+The numerical comparison design below describes how consumers can judge kernel
+changes using the fixed dataset; its old calibration campaigns are historical.
 
 ## 0. Recommendation in one box
 
@@ -159,7 +204,7 @@ window = 32,768 positions. A window is a token sequence with a role mask
 
 | Block | Windows | Context at first scored position | Content and source |
 |---|---:|---|---|
-| A. Agentic coding turns | 26 | 1K–16K (8 ≤ 2K, 12 in 2K–8K, 6 in 8K–16K) | chat-templated transcripts from `bench-agentic-session.py record` on the fixture repo (and 4–6 added tasks): system prompt, tools, prior turns with reasoning echoed, tool results; scored span = one assistant turn (reasoning, tool-call JSON, diff/content) generated greedily by the family's BF16 arm, thinking on |
+| A. Agentic coding turns | 26 | 1K–16K (8 ≤ 2K, 12 in 2K–8K, 6 in 8K–16K) | chat-templated transcripts from `bench-agentic-session.py record` on the fixture repo (and 4–6 added tasks): system prompt, tools, prior turns with reasoning echoed, tool results; scored span = one assistant turn (reasoning, tool-call JSON, diff/content) generated from the highest-fidelity runnable source in the dataset-policy order, thinking on |
 | B. Long-context code reading | 12 | 8K–16K (4 at 16K–32K once the reference supports it) | 1–3 files from this repository (Rust, Python, CUDA) as a user turn, the model asked to explain or modify; scored span = its answer |
 | C. Plain repository code | 10 | 0.5K–4K | human-written files from this repository, teacher-forced; all positions `ctx` but reported as the code-NLL tripwire; the only block that measures competence on text the model did not write |
 | D. JSON and tool grammar | 6 | 1K–4K | structured-output and tool-selection prompts (our `structured` and `tool_eval` panels' prompts, not the pinned benchmark's answers); scored span = the model's JSON |
@@ -170,22 +215,16 @@ contexts), 32,768 logit rows kept. Positions beyond 8K: ≈ 9,000 (blocks A
 and B), enough to show a long-context-only regression of ~1 point on its
 own bucket, and the bucket is printed separately (0–2K, 2–8K, 8–16K, 16K+).
 
-Why model-generated spans carry the bar: on the model's own greedy path the
-distributions are the ones that produced the text, so near-ties are rarer
-than on foreign prose, top-1 is high (projected 93–96% against the golden,
-calibrated on the first BF16 run), the content is exactly the token
-distribution the engine emits in service (reasoning traces, tool JSON,
-diffs), and the licence is the model's own. The reference's argmax is
-meaningful at every position: it is what the reference would have emitted
-there. The spans are generated by *our* BF16 arm (the layer-at-a-time golden
-cannot generate autoregressively; a full-model transformers run does not fit
-our hosts), so "agreement with the text token" is biased toward B; the bar
-is therefore on agreement with the *reference argmax*, which is symmetric
-between arms, and agreement with the text is printed as a diagnostic.
+Own-model spans represent the model's reasoning, tool JSON and code distribution,
+not another model's output. Official API output need not be exactly greedy or
+repeatable: text generation and reference scoring are separate steps. Once the
+text is frozen, downstream teacher-forced reference scoring is deterministic.
+The fidelity metric remains agreement with the reference argmax, not merely
+agreement with the generated text token.
 
-Generation recipe (part of the set manifest, deterministic): greedy, drafts
-off, thinking on at the family's default effort, `max_tokens` 1,024 per
-turn, the agentic loop's tools executed by the fixture runner. The prompt
+Generation recipe (pinned in the manifest): temperature 0, local greedy decoding,
+drafts off, thinking at the family's default, `max_tokens` 1,024 per turn, seed 0
+where supported, the agentic loop's tools executed by the fixture runner. The prompt
 side of every window is fixed text; only the model's spans differ per
 family. Window token ids are pinned in the reference file; the set is
 rebuilt only when the manifest version changes.
@@ -475,12 +514,17 @@ Replacement reference gates are: (1) the actual finite, bit-exact
 common-prefix proof bound to the family, snapshot and set; (2) conversion
 of the old raw logits reproduces the old JSON, retaining converter
 compatibility; and (3) a newly generated qualified legacy window is
-published as window 0 of schema 2. Publish schema-2 replacements only
-after qualified baseline calibration. Regenerate the old schema-1 V4.1
+published as window 0 of schema 2. Publish schema-2 replacements after
+reference validation, without engine calibration. Regenerate the old schema-1 V4.1
 JSON from qualified logits when the bench switches over; retain the old
 raw evidence for diagnosis, not as a certification target.
 
-## 10. Implementation plan (brief for a Codex agent)
+## 10. Historical implementation plan (2026-10-05)
+
+This records the original implementation campaign, not the current publication
+workflow. The 2026-10-18 policy supersedes its engine-calibration steps. Current
+workflow: generate own text, build original-quality logits, convert, validate/seal,
+finalize using declared policy floors, review, publish and re-pin. No engine run.
 
 Branch `work/fidelity-v2` from `origin/work/p0`, worktree, no GPU until step 5. Follow
 AGENTS.md (builds under `~/.cache/cuteafd/builds/fidelity-v2`, locks around

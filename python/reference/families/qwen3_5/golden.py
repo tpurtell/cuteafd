@@ -67,7 +67,6 @@ def capture_taps(model, layers, folder):
 
 
 def run_windows(args, model, identity, provenance):
-    import numpy as np
     import torch
     from shape_invariant import qualify
 
@@ -92,20 +91,15 @@ def run_windows(args, model, identity, provenance):
                     hook.remove()
             if not torch.isfinite(logits).all():
                 raise ValueError("non-finite golden logits")
-            # Bound the FP64 scoring workspace, independently of reference inference.
-            total = sum(torch.nn.functional.cross_entropy(
-                logits[i:i + 32].double(), ids[0, start + i:start + i + 32],
-                reduction="sum").item() for i in range(0, len(logits), 32))
-            entry = write_scored_logits(args.out, window, logits.cpu().numpy().astype(np.float32))
-            entry.update(nll=total / len(logits), scored_tokens=len(logits))
+            entry = write_scored_logits(args.out, window, logits.cpu().numpy())
             if taps:
                 entry.update(tap_layers=taps, tap_streams=1, hidden=model.config.text_config.hidden_size,
                              logits_start=start - 1, tap_dtype="bf16", tap_semantics="zero-based-post-block")
             folder = args.out / entry["path"]
             (folder / "meta.json").write_text(json.dumps(entry, sort_keys=True) + "\n")
             rows.append(entry)
-            loss += total
-            count += len(logits)
+            loss += entry["nll"] * entry["scored_tokens"]
+            count += entry["scored_tokens"]
             print(f"{window['id']}: {len(ids[0])} input, {len(logits)} scored, NLL {entry['nll']:.9f}", flush=True)
             del logits, ids, positions
     finish_golden(args.out, manifest, rows, snapshot=str(args.snapshot), snapshot_identity=identity,

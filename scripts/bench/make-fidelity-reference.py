@@ -23,6 +23,13 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2] / "python/ref
 from fidelity_windows import canonical, load_set, validate_qualification
 
 
+def tail_log_mass(logp, order):
+    # Sum the omitted probabilities directly: 1 - top_mass cancels for peaked rows.
+    omitted = np.ones(logp.size, dtype=bool)
+    omitted[order] = False
+    return float(np.log(max(np.exp(logp[omitted]).sum(dtype=np.float64), 1e-30)))
+
+
 def convert_windows(args) -> None:
     manifest = load_set(args.windows)
     meta = json.loads((args.golden / "meta.json").read_text())
@@ -77,13 +84,12 @@ def convert_windows(args) -> None:
                 ties = np.flatnonzero(row == threshold)[:k - len(better)]
                 order = np.concatenate((better, ties))
                 order = order[np.lexsort((order, -row[order]))]
-                mass = np.exp(logp[order]).sum()
                 nxt = w["tokens"][pos]
                 if nxt >= vocab:
                     raise ValueError("next token outside golden vocabulary")
                 compact.append({"pos": pos, "next": nxt, "next_lp": round(float(logp[nxt]), 5),
                     "top": [{"id": int(i), "lp": round(float(logp[i]), 5)} for i in order],
-                    "tail_lp": round(float(np.log(max(1.0 - mass, 1e-30))), 5)})
+                    "tail_lp": round(tail_log_mass(logp, order), 5)})
         if entry.get("media", []) != w.get("media", []):
             raise ValueError("golden media identity differs from pinned set")
         windows.append({**{key: w[key] for key in ("id", "block", "bucket", "tokens", "roles", "score_from")},
@@ -218,7 +224,8 @@ def main() -> None:
         mass = np.exp(logp[order]).sum()
         ids.append([int(i) for i in order])
         lps.append([round(float(v), 5) for v in logp[order]])
-        tail.append(round(float(np.log(max(1.0 - mass, 1e-30))), 5))
+        tail.append(round(tail_log_mass(logp, order) if args.legacy_window
+                          else float(np.log(max(1.0 - mass, 1e-30))), 5))
         nxt.append(round(float(logp[tokens[p]]), 5))
     reference = {
         "schema": "cuteafd.bench.reference/1",

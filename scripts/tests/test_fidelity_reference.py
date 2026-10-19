@@ -16,11 +16,62 @@ sys.path.insert(0, str(ROOT / "python/reference"))
 from fidelity_windows import (canonical, finish_golden, load_set, set_hash, validate_set,
                               write_scored_logits, verify_snapshot, prefix_comparison,
                               qualify_prefix, validate_qualification, CheckpointStorage,
-                              release_checkpoint)
+                              release_checkpoint, scored_logits_nll)
 
 spec = importlib.util.spec_from_file_location("make_fidelity_reference", ROOT / "scripts/bench/make-fidelity-reference.py")
 converter = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(converter)
+spec = importlib.util.spec_from_file_location("backfill_fidelity_nll", ROOT / "scripts/bench/backfill-fidelity-nll.py")
+backfiller = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(backfiller)
+
+
+@pytest.mark.parametrize("tail_logit", [-25.0, -100.0])
+def test_compact_tail_retains_mass_below_top_probability_resolution(tail_logit):
+    values = np.array([0.0, tail_logit, tail_logit], dtype=np.float64)
+    logp = values - np.log(np.exp(values).sum())
+    expected = max(tail_logit + np.log(2) - np.log(np.exp(values).sum()), np.log(1e-30))
+    assert converter.tail_log_mass(logp, np.array([0])) == pytest.approx(expected, abs=1e-12)
+    assert converter.tail_log_mass(logp, np.arange(3)) == pytest.approx(np.log(1e-30))
+
+
+def test_scored_logits_nll_chunks_use_stored_f32_and_pinned_targets(tmp_path):
+    window = dict(id="chunked", tokens=[3, 2, 1, 0, 3, 1, 2], score_from=2)
+    logits = np.random.default_rng(17).normal(size=(5, 4)) + 1000.00001
+    stored = logits.astype("<f4").astype(np.float64)
+    logp = stored - np.logaddexp.reduce(stored, axis=1)[:, None]
+    expected = -logp[np.arange(5), window["tokens"][2:]].mean()
+    entry = write_scored_logits(tmp_path, window, logits)
+    assert entry["nll"] == pytest.approx(expected, abs=1e-12)
+    assert entry["scored_tokens"] == 5
+    for size in (1, 2, 32):
+        assert scored_logits_nll(logits, window["tokens"], entry["positions"], chunk_rows=size) == pytest.approx(
+            dict(nll=expected, scored_tokens=5), abs=1e-12)
+    assert np.array_equal(np.fromfile(tmp_path / entry["path"] / "logits.bin", dtype="<f4").reshape(5, 4),
+                          logits.astype("<f4"))
+    with pytest.raises(ValueError, match="non-finite"):
+        write_scored_logits(tmp_path, window, np.full((5, 4), np.nan))
+    with pytest.raises(ValueError, match="outside vocabulary"):
+        write_scored_logits(tmp_path, {**window, "tokens": [9] * 7}, logits)
+    with pytest.raises(ValueError, match="invalid scored logits geometry"):
+        scored_logits_nll(logits, window["tokens"], entry["positions"], chunk_rows=0)
+
+
+def test_backfill_checks_weighted_aggregate_before_metadata_writes(tmp_path):
+    entries = []
+    for name, count, shift in (("a", 3, 1.0), ("b", 7, -2.0)):
+        window = dict(id=name, tokens=[0] * (count + 1), score_from=1)
+        entry = write_scored_logits(tmp_path, window, np.tile([shift, 0.0], (count, 1)))
+        entries.append(entry)
+    nll = sum(entry["nll"] * entry["scored_tokens"] for entry in entries) / 10
+    meta = dict(windows=entries, nll=nll, scored_tokens=10)
+    (tmp_path / "meta.json").write_bytes(canonical(meta))
+    assert backfiller.backfill(tmp_path) == dict(windows=2, nll=nll, scored_tokens=10)
+    before = (tmp_path / "meta.json").read_bytes()
+    (tmp_path / entries[-1]["path"] / "logits.bin").write_bytes(b"short")
+    with pytest.raises(ValueError, match="extent mismatch"):
+        backfiller.backfill(tmp_path)
+    assert (tmp_path / "meta.json").read_bytes() == before
 
 
 def test_dense_golden_requires_pinned_imported_source():
@@ -43,7 +94,7 @@ def test_reference_only_validator_seals_and_rejects_mutation(tmp_path):
                   roles=["ctx"] * 576, score_from=64)
     identity = dict(snapshot_revision="abcdef", checkpoint="official", precision="BF16")
     manifest = dict(schema="cuteafd.fidelity.set/1", family="qwen3_5", checkpoint="official",
-                    model="official", generation_arm={}, reference_snapshot=identity,
+                    model="official", generation_arm={"checkpoint": "official"}, reference_snapshot=identity,
                     windows=[window], quick_windows=["w"])
     manifest["set_sha256"] = set_hash(manifest)
     proof = dict(schema="cuteafd.fidelity.prefix/1", family="qwen3_5", set_sha256=manifest["set_sha256"],
@@ -52,7 +103,6 @@ def test_reference_only_validator_seals_and_rejects_mutation(tmp_path):
     logits = np.zeros((512, 2), dtype=np.float32)
     golden = tmp_path / "golden"
     entry = write_scored_logits(golden, window, logits)
-    entry.update(nll=float(np.log(2)), scored_tokens=512)
     folder = golden / entry["path"]
     (folder / "meta.json").write_bytes(canonical(entry))
     # Keep raw common-prefix evidence, not just a self-attested pass flag.
@@ -61,14 +111,22 @@ def test_reference_only_validator_seals_and_rejects_mutation(tmp_path):
     manifest["set_sha256"] = set_hash(manifest)
     proof.update(source_window="w", set_sha256=manifest["set_sha256"])
     # The main fixture also uses 576 scored rows after this extension.
-    logits = np.zeros((576, 2), dtype=np.float32)
+    source["tokens"] = (np.arange(640) % 2).tolist()
+    source["roles"] = ['ctx'] * 64 + ['gen', 'ctx'] * 288
+    manifest["set_sha256"] = set_hash(manifest)
+    proof["set_sha256"] = manifest["set_sha256"]
+    logits = np.random.default_rng(42).normal(size=(576, 2)) * 12 + 1000
     entry = write_scored_logits(golden, source, logits)
-    entry.update(nll=float(np.log(2)), scored_tokens=576)
+    values = logits.astype("<f4").astype(np.float64)
+    logp = values - np.logaddexp.reduce(values, axis=1)[:, None]
+    expected_nll = -logp[np.arange(576), source["tokens"][64:]].mean()
+    assert entry["nll"] == pytest.approx(expected_nll, abs=1e-12)
+    assert entry["scored_tokens"] == 576
     (folder / "meta.json").write_bytes(canonical(entry))
     probe_root = golden / "prefix-gate-test"
     probe_windows, probe_entries, hashes = [], [], []
     for length, name in zip((576, 640), ("prefix_short", "prefix_extended")):
-        probe_window = {**source, "id": name, "tokens": [0] * length, "roles": ["ctx"] * length}
+        probe_window = {**source, "id": name, "tokens": source["tokens"][:length], "roles": ["ctx"] * length}
         probe_entry = write_scored_logits(probe_root, probe_window, np.zeros((length - 64, 2), dtype=np.float32))
         probe_windows.append(probe_window)
         probe_entries.append(probe_entry)
@@ -78,15 +136,50 @@ def test_reference_only_validator_seals_and_rejects_mutation(tmp_path):
     finish_golden(probe_root, panel, probe_entries, snapshot_identity=identity)
     proof["logits_sha256"] = hashes
     finish_golden(golden, manifest, [entry], snapshot_identity=identity, prefix_qualification=proof,
-                  mtp=False, use_cache=False, attention="eager", nll=float(np.log(2)), scored_tokens=576)
+                  mtp=False, use_cache=False, attention="eager", nll=entry["nll"], scored_tokens=576)
+    before = {name: (folder / name).read_bytes() for name in ("tokens.bin", "logits.bin")}
+    meta_path = golden / "meta.json"
+    original_meta = json.loads(meta_path.read_text())
+    legacy_meta = json.loads(meta_path.read_text())
+    for key in ("nll", "scored_tokens"):
+        legacy_meta["windows"][0].pop(key)
+    meta_path.write_bytes(canonical({**legacy_meta, "nll": entry["nll"] + 0.1}))
+    legacy_bytes = meta_path.read_bytes()
+    window_bytes = (folder / "meta.json").read_bytes()
+    with pytest.raises(ValueError, match="aggregate NLL"):
+        backfiller.backfill(golden)
+    assert meta_path.read_bytes() == legacy_bytes
+    assert (folder / "meta.json").read_bytes() == window_bytes
+    meta_path.write_bytes(canonical(legacy_meta))
+    (folder / "meta.json").write_bytes(canonical(legacy_meta["windows"][0]))
+    subprocess.run([sys.executable, str(ROOT / "scripts/bench/backfill-fidelity-nll.py"),
+                    "--golden", str(golden)], check=True)
+    assert json.loads(meta_path.read_text()) == original_meta
+    assert json.loads((folder / "meta.json").read_text()) == entry
+    assert backfiller.backfill(golden)["nll"] == entry["nll"]
+    assert before == {name: (folder / name).read_bytes() for name in before}
     args = SimpleNamespace(windows=golden / "windows.json", golden=golden, rows_dir=tmp_path / "full",
                            out=tmp_path / "reference.json", top_k=2, model=["official"], name=None,
                            kl_max=None, top1_min=None, quick_out=None)
     converter.convert_windows(args)
+    bad_meta = json.loads(meta_path.read_text())
+    bad_meta["windows"][0]["scored_tokens"] -= 1
+    meta_path.write_bytes(canonical(bad_meta))
+    (folder / "meta.json").write_bytes(canonical(bad_meta["windows"][0]))
+    with pytest.raises(ValueError, match="window NLL/scored_tokens"):
+        validator.validate_reference_only(tmp_path)
+    backfiller.backfill(golden)
     result = validator.validate_reference_only(tmp_path, seal=True)
     assert result["passed"] and not result["engine_parity"]
     assert result["scored_tokens"] == 576
+    assert result["nll"] == pytest.approx(entry["nll"], abs=1e-12)
+    assert result['scored_tokens_gen'] == result['scored_tokens_ctx'] == 288
+    assert result['nll_gen'] == pytest.approx(-logp[::2, 0].mean(), abs=1e-12)
+    assert result['nll_ctx'] == pytest.approx(-logp[1::2, 1].mean(), abs=1e-12)
+    assert result['gen_top1'] == pytest.approx((values[::2].argmax(axis=1) == 0).mean())
     assert validator.validate_reference_only(tmp_path) == result
+    with pytest.raises(ValueError, match="sealed or validated"):
+        backfiller.backfill(golden)
     compact_path = tmp_path / "reference.json"
     original = compact_path.read_bytes()
     compact = json.loads(original)
@@ -95,59 +188,17 @@ def test_reference_only_validator_seals_and_rejects_mutation(tmp_path):
     with pytest.raises(ValueError, match="top probabilities"):
         validator.validate_reference_only(tmp_path)
     compact_path.write_bytes(original)
+    compact = json.loads(original)
+    compact["windows"][0]["positions"][0]["tail_lp"] += 0.01
+    compact_path.write_bytes(canonical(compact))
+    with pytest.raises(ValueError, match="tail probability"):
+        validator.validate_reference_only(tmp_path)
+    compact_path.write_bytes(original)
     with pytest.raises(ValueError, match="overwrite"):
         validator.validate_reference_only(tmp_path, seal=True)
     (folder / "tokens.bin").write_bytes(np.ones(576, dtype="<i4").tobytes())
     with pytest.raises(ValueError, match="tokens differ"):
         validator.validate_reference_only(tmp_path)
-
-
-def validator_panel_counts(panel, manifest, files, record_counts):
-    tree = ast.parse((ROOT / "scripts/bench/validate-fidelity-dataset.py").read_text())
-    main = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "main")
-    start = next(i for i, node in enumerate(main.body)
-                 if isinstance(node, ast.Assign) and node.targets[0].id == "windows")
-    shape_loop = main.body[start + 5]
-    row_assert = next(node for node in shape_loop.body if isinstance(node, ast.Assert))
-    checks = ast.Module(body=main.body[start:start + 5] + [row_assert], type_ignores=[])
-    scope = dict(panel=panel, manifest=manifest, dataset=dict(files=files),
-                 maps=[dict.fromkeys(range(n)) for n in record_counts])
-    exec(compile(checks, "validator-panel-counts", "exec"), scope)
-    return scope["scored_positions"]
-
-
-def panel_count_fixture(count):
-    panel = dict(windows=[dict(id=f"w{i}", tokens=[0] * 576, score_from=64)
-                          for i in range(count)])
-    manifest = dict(windows=[dict(id=f"w{i}", positions=list(range(64, 576)))
-                             for i in range(count)])
-    files = [dict(window=f"w{i}") for i in range(count)]
-    return panel, manifest, files
-
-
-@pytest.mark.parametrize("count, rows", [(64, 32768), (8, 4096)])
-def test_dataset_validator_admits_declared_text_and_media_geometry(count, rows):
-    assert validator_panel_counts(*panel_count_fixture(count), [rows, rows]) == rows
-
-
-@pytest.mark.parametrize("count", [64, 8])
-@pytest.mark.parametrize("direction", [-1, 1])
-@pytest.mark.parametrize("changed", ["manifest_windows", "files", "panel_windows", "manifest_rows", "report_rows"])
-def test_dataset_validator_rejects_count_mismatch(count, direction, changed):
-    panel, manifest, files = panel_count_fixture(count)
-    records = [count * 512] * 2
-    if changed == "manifest_windows":
-        manifest["windows"] = manifest["windows"][:-1] if direction < 0 else manifest["windows"] + [dict(id="extra", positions=list(range(512)))]
-    elif changed == "files":
-        files = files[:-1] if direction < 0 else files + [dict(window="extra")]
-    elif changed == "panel_windows":
-        panel["windows"] = panel["windows"][:-1] if direction < 0 else panel["windows"] + [dict(id="extra", tokens=[0] * 576, score_from=64)]
-    elif changed == "manifest_rows":
-        manifest["windows"][0]["positions"] = list(range(512 + direction))
-    else:
-        records[1] += direction
-    with pytest.raises(AssertionError):
-        validator_panel_counts(panel, manifest, files, records)
 
 
 def tiny_set():
@@ -189,17 +240,7 @@ def options(tmp_path, golden):
         top_k=12, name=None, model=["test-model"], kl_max=None, top1_min=None)
 
 
-@pytest.mark.parametrize("domain", ["example.com", "example.org", "example.net", "docs.example"])
-def test_public_scored_text_allows_only_reserved_synthetic_emails(domain):
-    from fidelity_windows import validate_public_text
-    text = f"Synthetic customer user@{domain}; ostrich raptor 10.55.0.1"
-    validate_public_text(text, scored_text=True)
-    with pytest.raises(ValueError, match="email"):
-        validate_public_text(text)
-
-
-@pytest.mark.parametrize("text", ["a@gmail.com", "a@notexample.com", "a@example.com.attacker.net",
-    "hf_" + "x" * 24, "github_pat_" + "x" * 24, "sk-" + "x" * 24,
+@pytest.mark.parametrize("text", ["hf_" + "x" * 24, "github_pat_" + "x" * 24, "sk-" + "x" * 24,
     "-----BEGIN OPENSSH PRIVATE KEY-----", "api_key=" + "x" * 24, "tpurtell"])
 def test_public_text_keeps_credentials_keys_and_personal_data_blocked(text):
     from fidelity_windows import validate_public_text
@@ -207,114 +248,16 @@ def test_public_text_keeps_credentials_keys_and_personal_data_blocked(text):
         validate_public_text(text, scored_text=True)
 
 
-def test_public_metadata_allows_only_narrow_generated_synthetic_email_audit():
-    from fidelity_windows import validate_public_metadata
-    audit = {"synthetic_email_exemptions": [{"window": "d01", "role": "gen",
-        "address": "customer@example.com", "basis": "synthetic generated record"}]}
-    validate_public_metadata(audit)
-    with pytest.raises(ValueError, match="email"):
-        validate_public_metadata({"contact": "customer@example.com"})
-    audit["synthetic_email_exemptions"][0]["address"] = "customer@gmail.com"
-    with pytest.raises(ValueError, match="non-reserved"):
-        validate_public_metadata(audit)
-    audit["synthetic_email_exemptions"][0]["address"] = "customer@example.com"
-    audit["synthetic_email_exemptions"][0]["role"] = "ctx"
-    with pytest.raises(ValueError, match="generated"):
-        validate_public_metadata(audit)
-
-
-def test_dataset_finalizer_refuses_unqualified_evidence_before_copy(tmp_path):
-    validation = tmp_path / "validation"
-    validation.mkdir()
-    (validation / "report.json").write_text(json.dumps({"qualifies": False, "repeatability_pass": False}))
-    out = tmp_path / "qualified"
+def test_dataset_finalizer_requires_reference_not_engine_evidence(tmp_path):
     command = [sys.executable, str(ROOT / "scripts/bench/finalize-fidelity-dataset.py")]
-    for name, path in {"source": tmp_path / "source", "out": out, "validation": validation,
-                       "arms": tmp_path / "arms", "tokenizer": tmp_path / "tokenizer.json"}.items():
-        command += ["--" + name, str(path)]
-    command += ["--config", "fixture", "--comparison-policy-commit", "0" * 40,
-                "--validator-source-commit", "0" * 40]
+    for name in ("source", "out", "tokenizer", "license"):
+        command += ["--" + name, str(tmp_path / name)]
+    command += ["--config", "fixture"]
     result = subprocess.run(command, capture_output=True, text=True, timeout=60)
-    assert result.returncode != 0 and "Measured qualification" in result.stderr
-    assert not out.exists()
-
-
-@pytest.mark.parametrize("intro,calibration,privacy", [
-    ("This is a numerical-fidelity panel, still a draft.",
-     "The first checkpoint-precision baseline is pending.",
-     "## Public-source and privacy policy"),
-    ("DRAFT: not qualified for upload or precision decisions.",
-     "## Pending Calibration\n\nRepeated baselines are pending.",
-     "## Provenance And Privacy"),
-])
-def test_dataset_finalizer_card_supports_existing_family_formats(tmp_path, intro, calibration, privacy):
-    # Exercise only card formatting; synthetic metrics never qualify a dataset.
-    original = ("# Family Fidelity Draft\n\n" + intro + "\n\n## Configuration\n\n"
-                "Pinned checkpoint and tokenizer.\n\n" + calibration + "\n\n" + privacy +
-                "\n\nOriginal source/privacy audit.\n\n## Licences\n\nMIT notice.\n"
-                "\nCoordinator review and explicit upload approval remain required. No publication\n"
-                "revision, precision-default verdict or promotion is claimed.\n")
-    config = tmp_path / "fixture"
-    config.mkdir()
-    (config / "README.md").write_text(original)
-    root_card = "# Coordinator-owned root card\n"
-    (tmp_path / "README.md").write_text(root_card)
-    tree = ast.parse((ROOT / "scripts/bench/finalize-fidelity-dataset.py").read_text())
-    start = next(i for i, node in enumerate(tree.body) if isinstance(node, ast.Assign)
-                 and any(isinstance(t, ast.Name) and t.id == "readme" for t in node.targets))
-    end = next(i for i in range(start, len(tree.body))
-               if isinstance(tree.body[i], ast.Expr) and isinstance(tree.body[i].value, ast.Call)
-               and isinstance(tree.body[i].value.func, ast.Attribute)
-               and tree.body[i].value.func.attr == "write_text"
-               and any(isinstance(a, ast.Name) and a.id == "readme" for a in tree.body[i].value.args))
-    report = {"shapes": {"decode": {"positions": 123}},
-              "baseline_metrics": {shape: [{"top1": .95, "kl": .02}] * 2
-                                   for shape in ("decode", "prefill")},
-              "family_expect": {"top1_min": .93, "kl_max": .04,
-                                "tripwires": {"confident_top1_min": .95, "top3_min": .97}},
-              "daemon_identity": "fixture daemon", "coordinator_sha256": "0" * 64}
-    namespace = {"SOURCE": tmp_path, "NAME": "fixture", "report": report}
-    exec(compile(ast.Module(body=tree.body[start:end], type_ignores=[]), "card-format", "exec"), namespace)
-    card = namespace["readme"]
-    assert "Family Fidelity Reference" in card and "qualified numerical-fidelity reference" in card
-    assert "DRAFT:" not in card and "Pending Calibration" not in card and "baseline is pending" not in card
-    assert "primary count is 123" in card and "| prefill | 1 | 95.0000% | 0.02000000 |" in card
-    assert "No publication revision is claimed" in card and "No precision-default verdict" in card
-    assert "coordinator review" not in card.lower() and "upload approval" not in card.lower()
-    assert "Pinned checkpoint and tokenizer." in card
-    expected_tail = original[original.index(privacy):].replace(
-        'Coordinator review and explicit upload approval remain required. No publication\n'
-        'revision, precision-default verdict or promotion is claimed.',
-        'No publication revision, precision-default verdict or promotion is claimed.')
-    assert card[card.index(privacy):] == expected_tail
-    assert (tmp_path / "README.md").read_text() == root_card
-
-
-@pytest.mark.parametrize("has_checkpoint_notice", [True, False])
-def test_dataset_finalizer_can_omit_optional_checkpoint_licence(tmp_path, has_checkpoint_notice):
-    import shutil
-    source = tmp_path / "source"
-    source.mkdir()
-    (source / "LICENSE").write_text("MIT project licence\n")
-    manifest = {"licence_files": [{"path": "LICENSE", "sha256": "project"}],
-                "checkpoint": "vendor/model", "root_checkpoint": {"snapshot_revision": "a" * 40}}
-    if has_checkpoint_notice:
-        (source / "CHECKPOINT_LICENSE").write_text("Official checkpoint notice\n")
-        manifest["licence_files"].append({"path": "CHECKPOINT_LICENSE", "sha256": "vendor"})
-    output = tmp_path / "output"
-    shutil.copytree(source, output)
-    tree = ast.parse((ROOT / "scripts/bench/finalize-fidelity-dataset.py").read_text())
-    function = next(node for node in tree.body if isinstance(node, ast.FunctionDef)
-                    and node.name == "omit_checkpoint_license")
-    namespace = {}
-    exec(compile(ast.Module(body=[function], type_ignores=[]), "optional-licence", "exec"), namespace)
-    namespace["omit_checkpoint_license"](output, manifest)
-    assert not (output / "CHECKPOINT_LICENSE").exists()
-    assert (source / "CHECKPOINT_LICENSE").exists() == has_checkpoint_notice
-    assert (output / "LICENSE").read_bytes() == (source / "LICENSE").read_bytes()
-    assert manifest["licence_files"] == [{"path": "LICENSE", "sha256": "project"}]
-    assert manifest["checkpoint"] == "vendor/model"
-    assert manifest["root_checkpoint"]["snapshot_revision"] == "a" * 40
+    assert result.returncode != 0 and "windows.json" in result.stderr
+    assert not (tmp_path / "out").exists()
+    for removed in ("--arms", "--comparison-policy-commit", "--validator-source-commit"):
+        assert removed not in subprocess.check_output(command[:2] + ["--help"], text=True)
 
 
 def test_dataset_finalizer_preserves_only_sealed_official_licence_contacts(tmp_path):
@@ -338,13 +281,11 @@ def test_dataset_finalizer_preserves_only_sealed_official_licence_contacts(tmp_p
     with pytest.raises(AssertionError, match="Licence checksum"):
         check(licence, tmp_path, manifest)
     licence.write_text(official)
-    with pytest.raises(ValueError, match="email"):
-        check(licence, tmp_path, {"licence_files": []})
+    check(licence, tmp_path, {"licence_files": []})
     ordinary = tmp_path / "LICENSE"
     ordinary.write_text(official)
-    with pytest.raises(ValueError, match="email"):
-        check(ordinary, tmp_path, {"licence_files": [{"path": ordinary.name,
-              "sha256": hashlib.sha256(ordinary.read_bytes()).hexdigest()}]})
+    check(ordinary, tmp_path, {"licence_files": [{"path": ordinary.name,
+          "sha256": hashlib.sha256(ordinary.read_bytes()).hexdigest()}]})
 
 
 def finalizer_media_checks():
@@ -404,11 +345,6 @@ def test_dataset_finalizer_rejects_png_privacy_metadata(tmp_path, metadata):
 def test_dataset_finalizer_rejects_unsafe_media_paths(tmp_path, relative):
     with pytest.raises(AssertionError, match="Unsafe media input"):
         finalizer_media_checks()["validate_media_input"](tmp_path, dict(path=relative, bytes=2, sha256="0" * 64))
-
-
-def test_measured_dataset_validator_self_tests():
-    subprocess.run([sys.executable, str(ROOT / "scripts/bench/validate-fidelity-dataset.py"),
-                    "--self-test"], check=True, timeout=60)
 
 
 def test_public_text_allows_public_fabric_without_mutating_tokens():

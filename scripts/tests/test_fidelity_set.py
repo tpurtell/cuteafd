@@ -97,6 +97,28 @@ def make(state, **kwargs):
         version="test1", arm=policy(), tokenizer=FakeTokenizer(), probe=state["client"], **kwargs)
 
 
+def test_new_backend_sizes_locally_and_records_reference_snapshot(fake_server):
+    client = fake_server['client']
+    class LocalBackend:
+        identity = {'text_source': 'hf'}
+        def prompt(self, body):
+            return {'probe': {'prompt_ids': FakeTokenizer().encode(json.dumps(body['messages'], sort_keys=True)).ids}}
+        def __call__(self, body):
+            assert body['max_tokens'] == 1024
+            result = client(body)
+            result['generation_provenance'] = {'text_source': 'hf', 'content': 'a fixture answer'}
+            return result
+    arm = {**policy(), 'tokenizer_sha256': 'a' * 64, 'config_sha256': 'b' * 64}
+    manifest = builder.build_set(family='deepseek_v41', model='test-model', checkpoint='test-model',
+        version='test', arm=arm, tokenizer=FakeTokenizer(), probe=LocalBackend(),
+        legacy_reference={'schema': 'cuteafd.fidelity.set/1', 'windows': [
+            {'id': 'legacy', 'score_from': 64, 'tokens': list(range(576))}]},
+        legacy_provenance={'path': 'legacy.json', 'sha256': 'c' * 64})
+    assert len(fake_server['requests']) == 53
+    assert manifest['reference_snapshot']['tokenizer_sha256'] == 'a' * 64
+    assert manifest['windows'][1]['provenance']['generation']['text_source'] == 'hf'
+
+
 def test_rebind_text_set_checks_published_hash_and_used_tokens(tmp_path):
     import hashlib
     from tokenizers import Tokenizer, models

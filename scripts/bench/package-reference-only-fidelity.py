@@ -5,19 +5,23 @@ import copy
 import hashlib
 import json
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import sys
 
 import numpy as np
 from safetensors.numpy import save_file
-from tokenizers import Tokenizer
 
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO / 'python/reference'))
-from fidelity_windows import canonical, validate_public_metadata, validate_public_text
+from fidelity_windows import canonical, validate_public_metadata, validate_public_text, validate_text_source
+from checkpoint_tokenizer import load_tokenizer, tokenizer_identity
 
 QUICK = ['legacy', 'a00', 'a04', 'a08', 'a20', 'c00', 'd00', 'e00']
+POLICY_EXPECT = dict(top1_min=.90, kl_max=.06,
+                     tripwires=dict(confident_top1_min=.96, top3_min=.97,
+                                    confident_drop_margin=.01, top3_drop_margin=.005))
 CAVEAT = ('The source shared text panel contains repeated unrelated source-text splices in 33 scored suffixes; '
           'see cuteafd issue #302. These are teacher-forced reference rows, '
           'not evidence of coherent free-running generation. NLL is not a cross-model quality ranking.')
@@ -78,8 +82,74 @@ def compact_tensors(full, window):
                 next_token_log_prob=next_lps)
 
 
+def standard_generated_rows(panel):
+    """Report natural row counts using the consumer's fixed split, never resample."""
+    source = (REPO / 'rust/crates/cuteafd-bench/src/fidelity_dataset.rs').read_text()
+    windows = {window['id']: window for window in panel['windows']}
+    counts = {}
+    for name in ('decode', 'prefill'):
+        match = re.search(r'pub const STANDARD_' + name.upper() + r':[^=]+=\s*\[(.*?)\];', source, re.S)
+        ids = re.findall(r'"([a-e][0-9]{2}|legacy)"', match.group(1))
+        counts[name] = sum(window['roles'][window['score_from']:].count('gen')
+                           for window in (windows[wid] for wid in ids))
+    small, large = min(counts.values()), max(counts.values())
+    return dict(tier='standard-v2', decode_generated_positions=counts['decode'],
+                prefill_generated_positions=counts['prefill'],
+                max_min_ratio=large / small if small else None, informational_only=True)
+
+
+def standard_generated_note(counts):
+    ratio = counts['max_min_ratio']
+    ratio_text = f'{ratio:.6f}' if ratio is not None else 'undefined (zero generated rows)'
+    return (f'Standard-v2 generated scored positions: decode {counts["decode_generated_positions"]:,}; '
+            f'prefill {counts["prefill_generated_positions"]:,}; max/min ratio {ratio_text}. '
+            'Informational only: fixed window IDs are not resampled; each half reports per-position rates.\n')
+
+
+def reference_role_metrics(validation):
+    counts = [validation['scored_tokens_' + role] for role in ('gen', 'ctx')]
+    if (any(not isinstance(count, int) or count < 0 for count in counts)
+            or sum(counts) != validation['scored_tokens']):
+        raise ValueError('reference role counts mismatch')
+    for role, count in zip(('gen', 'ctx'), counts):
+        value = validation['nll_' + role]
+        if (count and (value is None or not np.isfinite(value) or value < 0)
+                or not count and value is not None):
+            raise ValueError('reference role NLL mismatch')
+    top1 = validation['gen_top1']
+    if (counts[0] and (top1 is None or not np.isfinite(top1) or not 0 <= top1 <= 1)
+            or not counts[0] and top1 is not None):
+        raise ValueError('reference generated top-1 mismatch')
+    weighted = sum((validation['nll_' + role] or 0) * count
+                   for role, count in zip(('gen', 'ctx'), counts)) / sum(counts)
+    if not np.isclose(weighted, validation['nll'], rtol=1e-9, atol=1e-8):
+        raise ValueError('reference role aggregate NLL mismatch')
+    return {key: validation[key] for key in
+            ('nll_gen', 'nll_ctx', 'gen_top1', 'scored_tokens_gen', 'scored_tokens_ctx')}
+
+
+def reference_role_note(metrics):
+    def number(value):
+        return f'{value:.9f}' if value is not None else 'n/a (no rows)'
+    top1 = f'{100 * metrics["gen_top1"]:.4f}%' if metrics['gen_top1'] is not None else 'n/a (no rows)'
+    return (f'Generated-row NLL {number(metrics["nll_gen"])} nat/token '
+            f'({metrics["scored_tokens_gen"]:,} rows); context-row NLL {number(metrics["nll_ctx"])} nat/token '
+            f'({metrics["scored_tokens_ctx"]:,} rows); reference top-1 agreement with generated text {top1}.\n'
+            'Aggregate NLL includes trailing-context rows appended after short completions; '
+            'these can be out-of-distribution and make aggregate NLL non-comparable across models. '
+            'They remain valid teacher-forced fidelity probes: engine and reference score the same tokens.\n')
+
+
+def own_text(panel):
+    try:
+        validate_text_source(panel)
+    except ValueError:
+        return False
+    return True
+
+
 def panel_caveat(panel):
-    caveat = CAVEAT
+    caveat = '' if own_text(panel) else CAVEAT
     if panel.get('retokenized_text_source'):
         caveat += ' ' + panel['retokenized_text_source']['caveat']
         caveat += ' Provisional chat windows were re-rendered with the target chat template; all windows were retokenized. This is not a Step-5-generated panel.'
@@ -111,6 +181,30 @@ def root_description(meta, panel):
     return (f'root ({panel["reference_snapshot"]["precision"]})', root['arithmetic'], root['source'])
 
 
+def validate_runtime_platform(runtime):
+    required = {'schema', 'image', 'image_sha256', 'compute_capability',
+                'tokenizers_dist_sha256', 'tokenizers_hash_kind', 'dependency_install',
+                'tokenizers_native_sha256', 'tokenizers_record_sha256'}
+    optional = {'tokenizers_wheel_archive_sha256'}
+    if (not required <= runtime.keys() or runtime.keys() - required - optional
+            or runtime['schema'] != 'cuteafd.fidelity.platform/1'
+            or runtime['tokenizers_hash_kind'] != 'sha256 of canonical RECORD-verified installed file inventory'):
+        raise ValueError('invalid reference runtime schema')
+    for key in required | optional:
+        if key.endswith('_sha256') and key in runtime:
+            value = runtime[key]
+            if not isinstance(value, str) or len(value) != 64 or any(c not in '0123456789abcdef' for c in value):
+                raise ValueError('invalid reference runtime digest')
+    capability = runtime['compute_capability']
+    if (not isinstance(capability, list) or len(capability) != 2
+            or any(type(v) is not int or v < 0 for v in capability)
+            or not isinstance(runtime['image'], str) or not runtime['image']
+            or not isinstance(runtime['dependency_install'], str) or not runtime['dependency_install']):
+        raise ValueError('invalid reference runtime identity')
+    validate_public_metadata(runtime)
+    return copy.deepcopy(runtime)
+
+
 def public_panel(panel):
     public = copy.deepcopy(panel)
     # Keep immutable generation identity, not deployment arguments or local paths.
@@ -130,6 +224,7 @@ def package(source, out, config, tokenizer_path, license_path):
         raise ValueError('output must be fresh and config must be a safe component')
     read = lambda name: json.loads(contained(source, name).read_text())
     meta, panel = read('golden/meta.json'), read('golden/windows.json')
+    validate_text_source(panel)
     validation, seal, full_seal = read('reference-validation.json'), read('golden-seal.json'), read('full.sha256.json')
     rows = read('full/rows.json')
     set_id = panel['set_sha256']
@@ -162,13 +257,17 @@ def package(source, out, config, tokenizer_path, license_path):
             raise ValueError('invalid source pin')
     if rows['dtype'] != '<f2' or rows['kind'] != 'log_softmax':
         raise ValueError('unsupported oracle rows')
-    tokenizer = Tokenizer.from_file(str(tokenizer_path))
-    if digest(tokenizer_path) != meta['snapshot_identity']['tokenizer_sha256']:
+    tokenizer = load_tokenizer(tokenizer_path)
+    tokenizer_pin = tokenizer_identity(tokenizer_path.parent)
+    if (tokenizer_pin['tokenizer_sha256'] != meta['snapshot_identity']['tokenizer_sha256']
+            or tokenizer_pin.get('tokenizer_files') != meta['snapshot_identity'].get('tokenizer_files')):
         raise ValueError('reference tokenizer differs')
     for window in panel['windows']:
         if window.get('media') or len(window['tokens']) - window['score_from'] != 512:
             raise ValueError('only the sealed text panel is supported')
-        validate_public_text(tokenizer.decode(window['tokens'], skip_special_tokens=False), scored_text=True)
+        text = (tokenizer.decode(window['tokens']) if tokenizer_pin.get('tokenizer_kind') else
+                tokenizer.decode(window['tokens'], skip_special_tokens=False))
+        validate_public_text(text, scored_text=True)
     public = public_panel(panel)
     destination = out / config
     destination.mkdir(parents=True)
@@ -203,13 +302,12 @@ def package(source, out, config, tokenizer_path, license_path):
     if digest(source / 'platform.json') != inventory['platform.json']['sha256']:
         raise ValueError('sealed runtime provenance differs')
     runtime = read('platform.json')
-    provenance['runtime'] = {k: runtime[k] for k in ('image', 'image_sha256', 'compute_capability',
-                                                   'tokenizers_wheel_sha256', 'dependency_install')}
-    for key in ('tokenizers_native_sha256', 'tokenizers_record_sha256'):
-        if key in runtime:
-            provenance['runtime'][key] = runtime[key]
-    qualification = dict(schema='cuteafd.fidelity.qualification/1', kind='reference_only', qualifies=True,
-                         engine_parity=False, qualification_scope='reference-only qualified; no paired engine calibration or precision-default verdict',
+    provenance['runtime'] = validate_runtime_platform(runtime)
+    generated_rows = standard_generated_rows(panel)
+    role_metrics = reference_role_metrics(validation)
+    qualification = dict(schema='cuteafd.fidelity.qualification/1', kind='reference', qualifies=True,
+                         **role_metrics, standard_generated_rows=generated_rows,
+                         engine_parity=False, qualification_scope='reference logits, storage and prefix invariance',
                          set_sha256=set_id, nll=meta['nll'], scored_tokens=meta['scored_tokens'],
                          prefix_qualification=meta['prefix_qualification'], reference_validation=validation,
                          reference_provenance=provenance, panel_caveat=caveat)
@@ -219,42 +317,48 @@ def package(source, out, config, tokenizer_path, license_path):
     manifest = dict(schema='cuteafd.fidelity.dataset/1', kind='reference-top1024-plus-tail', config=config,
                     family=panel['family'], checkpoint=panel['checkpoint'], root_checkpoint=dict(id=snapshot['checkpoint'], revision=snapshot['snapshot_revision']),
                     set_sha256=set_id, vocab=rows['vocab'], top_k=1024,
-                    expect=dict(top1_min=.90, kl_max=.06), expect_provenance='common policy floor, not calibrated against a dense engine',
+                    expect=copy.deepcopy(POLICY_EXPECT),
+                    expect_provenance='declared policy floors; independent of engine measurements',
                     windows_sha256=digest(destination / 'windows.json'), qualification_sha256=digest(destination / 'qualification.json'),
                     files=files, licence_files=[dict(path='LICENSE', sha256=digest(destination / 'LICENSE'))],
                     packaging_source_commit=subprocess.check_output(['git', '-C', str(REPO), 'rev-parse', 'HEAD'], text=True).strip(),
                     packaging_source_sha256=digest(Path(__file__)),
-                    publication_status=('PROVISIONAL; REFERENCE-ONLY QUALIFIED; coordinator review/upload required'
-                                        if panel.get('retokenized_text_source') else
-                                        'REFERENCE-ONLY QUALIFIED; coordinator review/upload required'),
+                    publication_status='REFERENCE',
                     text_checkpoint=panel['generation_arm']['checkpoint'], panel_caveat=caveat)
     if launch_note:
         manifest['reference_execution'] = dict(sparse_attention_launch=meta['sparse_attention_launch'])
     manifest['reference_sha256'] = hashlib.sha256(canonical(manifest)).hexdigest()
     validate_public_metadata(manifest)
     (destination / 'manifest.json').write_bytes(canonical(manifest) + b'\n')
-    panel_description = ('Provisional foreign-text panel: chat windows use the target chat template; all 64 windows were retokenized with character-span roles.\n'
+    panel_description = ('Own-model text: fixed prompts, checkpoint chat template, and real fixture tool execution.\n'
+                         if own_text(panel) else
+                         'Provisional foreign-text panel: chat windows use the target chat template; all 64 windows were retokenized with character-span roles.\n'
                          if panel.get('retokenized_text_source') else
                          'All 64 windows, tokens, roles and score geometry are unchanged from the pinned shared panel.\n')
+    text_description = (f'Text source: `{panel["generation_arm"].get("text_source", "local")}` from the scored model.\n'
+                        if own_text(panel) else
+                        f'Text was generated by `{panel["generation_arm"]["checkpoint"]}`, not by the reference root.\n')
     precision, arithmetic, runtime_source = root_description(meta, panel)
-    card = (f'# {config}\n\nReference-only qualified numerical fidelity panel, not a training corpus or a general quality ranking.\n\n'
+    card = (f'# {config}\n\nNumerical fidelity reference dataset, not a training corpus or a general quality ranking.\n\n'
             f'Official {precision}: `{snapshot["checkpoint"]}` at `{snapshot["snapshot_revision"]}`.\n'
-            f'Text was generated by `{panel["generation_arm"]["checkpoint"]}`, not by the {precision.split(" (")[0]}.\n'
+            f'{text_description}'
             f'{panel_description}'
             'The bench quick subset is legacy,a00,a04,a08,a20,c00,d00,e00 (4,096 rows).\n\n'
             '## Qualification\n\n'
             f'32,768 scored positions; reference NLL {meta["nll"]:.15f} nat/token.\n'
+            f'{reference_role_note(role_metrics)}'
+            f'{standard_generated_note(generated_rows)}'
             'The 576/640-token prefix probes have 512 byte-identical common F32 rows and zero argmax disagreements.\n'
             f'{arithmetic}\n'
             f'{launch_note}'
             f'Pinned {runtime_source}, tokenizer runtime, platform and oracle seal hashes are in qualification.json.\n'
-            'No engine parity, paired compact/full-engine calibration, dense baseline calibration, or precision-default verdict is claimed.\n'
-            'The common top-1/KL policy floor in the manifest is not a measured dense-engine baseline.\n\n'
+            'No engine run is required to finish or publish this dataset.\n'
+            'Declared policy floors: top-1 >=90%, KL <=0.06 nat, confident top-1 >=96%, top-3 >=97%.\n\n'
             '## Storage\n\n'
             'One safetensors file per window: U32 positions, next_token_ids and top_ids; U8 roles; F16 top_log_probs; '
             'F32 tail_log_mass and next_token_log_prob. Top-1024 selection uses the sealed full F16 rows with lower-ID boundary ties.\n'
             'Tail and target masses normalize the F16 oracle; no paired engine equivalence is asserted.\n\n'
-            f'## Panel Caveat\n\n{caveat}\n\n'
+            + (f'## Panel Caveat\n\n{caveat}\n\n' if caveat else '') +
             '## Provenance And Privacy\n\n'
             f'Source set: `{set_id}`. Raw deployment settings and local paths are omitted.\n'
             'Public text and metadata pass credential/private-key/personal-data screening. Original public MIT notice is preserved verbatim.\n'

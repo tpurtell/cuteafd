@@ -272,8 +272,8 @@ fn fidelity(run: &mut Run<'_>, check: &mut Check) -> Result<()> {
     crate::quality::apply_fidelity(run.info, check);
     check.summary = format!("KL {:.3} · top-1 {:.1}% · {} generated / 4096 total rows · 8 windows",
         f.kl, 100.0 * f.top1, f.positions);
-    if scored.dataset.as_ref().is_some_and(|d| d["qualification"] == "reference-only qualified") {
-        check.summary.push_str(" · reference-only qualified");
+    if scored.dataset.as_ref().is_some_and(|d| d["qualification"] == "reference") {
+        check.summary.push_str(" · reference");
     }
     Ok(())
 }

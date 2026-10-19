@@ -367,9 +367,12 @@ def test_real_cpu_official_tower_output_selects_merged_pooler(tmp_path, monkeypa
     assert torch.equal(result, official.pooler_output)
 
 
-def test_qwen_media_prefix_adjusted_lengths_and_full_vocab_bits(tmp_path):
+def test_qwen_media_prefix_adjusted_lengths_and_full_vocab_bits(tmp_path, monkeypatch):
     from fidelity_windows import (SET_SCHEMA, bucket, finish_golden, qualify_prefix,
                                   set_hash, validate_qualification, write_scored_logits)
+    # Keep media targets in the toy vocabulary scored by the shared NLL writer.
+    for name, token_id in (("START_ID", 20), ("IMAGE_ID", 21), ("END_ID", 22)):
+        monkeypatch.setattr(media, name, token_id)
     w = window()
     w["tokens"] = [17] * 100 + w["tokens"] + [18] * 700
     w["roles"] = ["ctx"] * len(w["tokens"])

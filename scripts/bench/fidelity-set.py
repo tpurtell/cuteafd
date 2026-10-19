@@ -23,8 +23,10 @@ import urllib.request
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "python/reference"))
 from fidelity_windows import MAX_TOKENS, SET_SCHEMA, bucket, canonical, set_hash, validate_set
+from checkpoint_tokenizer import load_tokenizer, tokenizer_identity
+from fidelity_generation import token_ids
 
-FAMILIES = ("deepseek_v41", "mimo_v2", "qwen4", "qwen3_5", "glm5_flash", "deepseek_v4", "glm5", "step5")
+FAMILIES = ("deepseek_v41", "mimo_v2", "qwen4", "qwen3_5", "glm5_flash", "deepseek_v4", "glm5", "step5", "kimi_k3")
 REPO_FILES = ["rust/crates/cuteafd-api/src/openai/probe.rs", "scripts/bench/bench-agentic-session.py",
               "python/reference/families/deepseek_v41/golden.py", "rust/crates/cuteafd-bench/src/client.rs",
               "scripts/bench/make-fidelity-reference.py", "rust/crates/cuteafd-bench/src/reference.rs",
@@ -111,7 +113,9 @@ def source(root: pathlib.Path, path: str) -> dict:
 
 
 def legacy_window(reference: dict) -> dict:
-    if reference.get("schema") == "cuteafd.fidelity.reference/2":
+    if reference.get("schema") in (SET_SCHEMA, "cuteafd.fidelity.reference/2"):
+        # Published sets omit deployment metadata, retaining the original set id.
+        # The caller binds these frozen bytes with legacy_provenance.sha256.
         matches = [w for w in reference.get("windows", []) if w.get("id") == "legacy"]
         if len(matches) != 1:
             raise ValueError("schema 2 reference needs exactly one legacy window")
@@ -136,12 +140,15 @@ def build_set(*, family: str, model: str, checkpoint: str, version: str, arm: di
               tokenizer, probe, root: pathlib.Path = ROOT, recordings: list[dict] | None = None,
               files: list[str] | None = None, legacy_reference: dict | None = None,
               legacy_provenance: dict | None = None) -> dict:
-    arm_policy(arm, checkpoint)
+    if getattr(probe, "identity", {}).get("text_source") not in ("api", "hf"):
+        arm_policy(arm, checkpoint)
+    elif arm.get("checkpoint") != checkpoint:
+        raise ValueError("generation checkpoint differs from requested checkpoint")
     agentic = load_agentic()
     files = files or REPO_FILES
     sources = [source(root, path) for path in files]
     corpus = "\n\n".join(f"File: {path}\n{(root / path).read_text()}" for path in files)
-    corpus_ids = tokenizer.encode(corpus, add_special_tokens=False).ids
+    corpus_ids = token_ids(tokenizer, corpus)
     if len(corpus_ids) < 4096:
         raise ValueError("repository source list needs at least 4096 tokens")
     if (legacy_reference is None) != (legacy_provenance is None):
@@ -178,7 +185,7 @@ def build_set(*, family: str, model: str, checkpoint: str, version: str, arm: di
                 leading.append(body["messages"].pop(0)["content"])
             if leading:
                 body["messages"].insert(0, {"role": "system", "content": "\n\n".join(leading)})
-            sample = probe(body)
+            sample = probe.prompt(body) if hasattr(probe, "prompt") else probe(body)
             n = len(sample["probe"]["prompt_ids"])
             if target <= n < target + 384:
                 break
@@ -202,8 +209,11 @@ def build_set(*, family: str, model: str, checkpoint: str, version: str, arm: di
                 if setting.get("name") == "CUTEAFD_V41_FP8_HEAD" and str(setting.get("value")).lower() not in ("off", "false", "0", "none", "bf16"):
                     raise ValueError("server reports an enabled FP8 head, not the checkpoint-precision arm")
         prompt, generated = chat["probe"]["prompt_ids"], chat["probe"]["generated"]
-        if prompt != sample["probe"]["prompt_ids"] or len(generated) > 1024:
+        if (prompt != sample["probe"]["prompt_ids"]
+                or (len(generated) > 1024 and getattr(probe, "identity", {}).get("text_source") != "api")):
             raise ValueError("unstable prompt rendering or max_tokens was not honored")
+        if len(prompt) + len(generated) > MAX_TOKENS:
+            raise ContextCap(f"{name}: reconstructed assistant span exceeds 16K cap")
         tokens = prompt + generated
         roles = ["ctx"] * len(prompt) + ["gen"] * len(generated)
         start = len(prompt) + max(0, len(generated) - 512)
@@ -221,6 +231,9 @@ def build_set(*, family: str, model: str, checkpoint: str, version: str, arm: di
                                        "engine": chat["probe"]["engine"], "server": server,
                                        "generated_tokens": len(generated),
                                        "trailing_ctx": padding}})
+        if "generation_provenance" in chat:
+            windows[-1]["provenance"]["generation"] = chat["generation_provenance"]
+        print(f"{name}: prompt={len(prompt)} generated={len(generated)}", file=sys.stderr, flush=True)
         return chat
 
     def fresh_task(i):
@@ -296,7 +309,7 @@ def build_set(*, family: str, model: str, checkpoint: str, version: str, arm: di
     for i in range(12):
         generate(f"b{i:02d}", "B", [{"role": "user", "content": f"Explain invariants and propose a small safe modification to {files[i % len(files)]}.\n" + (root / files[i % len(files)]).read_text()}], 10240 + (i % 3) * 1024)
     for i in range(10):
-        ids = tokenizer.encode((root / files[i % len(files)]).read_text(), add_special_tokens=False).ids
+        ids = token_ids(tokenizer, (root / files[i % len(files)]).read_text())
         if len(ids) < 1024:
             raise ValueError(f"{files[i % len(files)]}: plain code needs >=1024 tokens; choose a longer file")
         start = min(len(ids) - 512, 512 + (i % 4) * 512)
@@ -325,6 +338,13 @@ def build_set(*, family: str, model: str, checkpoint: str, version: str, arm: di
                     "context_cap": MAX_TOKENS, "temperature": 0, "seed": 0, "reasoning_effort": "high",
                     "blocks": {"A": 26, "B": 12, "C": 10, "D": 6, "E": 10},
                     "prompt_roles": "conditioning history ctx; current assistant span gen"}, "windows": windows}
+    if getattr(probe, "identity", {}).get("text_source") in ("api", "hf"):
+        manifest["reference_snapshot"] = {
+            key: arm[key] for key in ("checkpoint", "snapshot_revision", "config_sha256", "tokenizer_sha256")}
+        for key in ("tokenizer_kind", "tokenizer_files"):
+            if key in arm:
+                manifest["reference_snapshot"][key] = arm[key]
+        manifest["precision_policy"] = "own text; generation backend recorded separately from reference arithmetic"
     manifest["set_sha256"] = set_hash(manifest)
     validate_set(manifest)
     return manifest
@@ -618,6 +638,13 @@ def main(argv=None):
     p.add_argument("--media-fixtures", type=pathlib.Path, help="build a separate 8-window vision panel from fixtures.json")
     p.add_argument("--file-list", type=pathlib.Path, help="JSON array of first-party repo-relative paths")
     p.add_argument("--base-url", default="http://127.0.0.1:8000")
+    p.add_argument("--backend", choices=("probe", "api", "hf"), default="probe")
+    p.add_argument("--api-base", help="OpenAI-compatible API base, including /v1 if required")
+    p.add_argument("--api-model")
+    p.add_argument("--api-key-file", type=pathlib.Path)
+    p.add_argument("--api-options", type=pathlib.Path, help="JSON provider controls/deviations, recorded in provenance")
+    p.add_argument("--response-cache", type=pathlib.Path, help="required resumable private cache for api/hf")
+    p.add_argument("--snapshot", type=pathlib.Path, help="local HF checkpoint for generation")
     p.add_argument("--bench-token")
     p.add_argument("--timeout", type=float, default=1800)
     p.add_argument("--out", type=pathlib.Path)
@@ -681,15 +708,44 @@ def main(argv=None):
             arm=json.loads(a.arm_manifest.read_text()), probe=ProbeClient(a.base_url, a.bench_token, a.timeout),
             fixtures=a.media_fixtures, tokenizer_sha256=hashlib.sha256(a.tokenizer.read_bytes()).hexdigest())
     else:
+        arm = json.loads(a.arm_manifest.read_text())
+        probe = ProbeClient(a.base_url, a.bench_token, a.timeout)
+        if a.backend != "probe":
+            if not a.response_cache or a.checkpoint != a.model:
+                p.error("own-text backends require --response-cache and --checkpoint equal to --model")
+            from fidelity_generation import APIClient, ChatRenderer, HFClient
+            snapshot = a.snapshot or a.tokenizer.parent
+            tokenizer_pin = tokenizer_identity(snapshot)
+            if tokenizer_identity(a.tokenizer.parent) != tokenizer_pin:
+                p.error("--tokenizer must match the generation snapshot")
+            config = json.loads((snapshot / "config.json").read_text())
+            tokenizer = load_tokenizer(a.tokenizer, chat=True)
+            renderer = ChatRenderer(tokenizer)
+            identity = {**tokenizer_pin,
+                        "config_sha256": hashlib.sha256((snapshot / "config.json").read_bytes()).hexdigest(),
+                        "snapshot_revision": snapshot.name,
+                        "generator_sha256": hashlib.sha256((ROOT / "python/reference/fidelity_generation.py").read_bytes()).hexdigest()}
+            if a.backend == "api":
+                if not all((a.api_base, a.api_model, a.api_key_file)):
+                    p.error("API backend requires --api-base, --api-model and --api-key-file")
+                probe = APIClient(renderer, a.response_cache, checkpoint=a.checkpoint, family=a.family,
+                    base=a.api_base, model=a.api_model, key_file=a.api_key_file, timeout=a.timeout,
+                    extra_body=json.loads(a.api_options.read_text()) if a.api_options else None, identity=identity)
+            else:
+                if a.family != "qwen3_5" or config.get("model_type") != "qwen3_5":
+                    p.error("HF backend requires the official dense Qwen3.5 reference")
+                probe = HFClient(renderer, a.response_cache, checkpoint=a.checkpoint, family=a.family,
+                                 snapshot=snapshot, identity=identity)
+            arm = {"checkpoint": a.checkpoint, **probe.identity,
+                   "speculation": False, "prefix_cache": False}
         manifest = build_set(family=a.family, model=a.model, checkpoint=a.checkpoint, version=a.version,
-            arm=json.loads(a.arm_manifest.read_text()), tokenizer=Tokenizer.from_file(str(a.tokenizer)),
-            probe=ProbeClient(a.base_url, a.bench_token, a.timeout),
+            arm=arm, tokenizer=load_tokenizer(a.tokenizer), probe=probe,
             recordings=[json.loads(path.read_text()) for path in a.recording],
             files=json.loads(a.file_list.read_text()) if a.file_list else None,
             legacy_reference=json.loads(a.legacy_reference.read_bytes()),
-            legacy_provenance={"path": str(a.legacy_reference),
+            legacy_provenance={"path": a.legacy_reference.name,
                 "sha256": hashlib.sha256(a.legacy_reference.read_bytes()).hexdigest()})
-    manifest["tokenizer_sha256"] = hashlib.sha256(a.tokenizer.read_bytes()).hexdigest()
+    manifest["tokenizer_sha256"] = tokenizer_identity(a.tokenizer.parent)["tokenizer_sha256"]
     manifest["set_sha256"] = set_hash(manifest)
     out = a.out or ROOT / "set" / a.family / a.version / "windows.json"
     if out.exists():

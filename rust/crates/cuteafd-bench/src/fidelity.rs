@@ -263,8 +263,8 @@ pub fn verdict(run: &Run) -> Verdict {
         }
     }
     generated.records.clear();
-    let label = if run.dataset.as_ref().is_some_and(|d| d["qualification"] == "reference-only qualified") {
-        Some("reference-only qualified; common policy floor, not engine calibration".into())
+    let label = if run.dataset.as_ref().is_some_and(|d| d["qualification"] == "reference") {
+        Some("reference; common policy floor, not engine calibration".into())
     } else {
         (run.tier == crate::fidelity_dataset::STANDARD_TIER).then(||
             run.dataset.as_ref().and_then(|d| d["standard_subset"]["mode"].as_str())
@@ -383,9 +383,6 @@ pub fn compare_paired(a: &Run, b: &Run, top1_margin: f64, kl_margin: f64, bootst
         "margins must be positive and finite");
     ensure!(bootstrap >= 100, "at least 100 bootstrap replicates required");
     for run in [a, b] {
-        ensure!(run.kl_kind != "reference-only-top1024-plus-tail"
-            && !run.dataset.as_ref().is_some_and(|d| d["qualification"] == "reference-only qualified"),
-            "reference-only qualified datasets lack paired engine calibration");
         if let Some(dataset) = &run.dataset {
             crate::fidelity_dataset::ensure_valid_publication(
                 dataset["repository"].as_str().unwrap_or(""),
@@ -418,7 +415,7 @@ pub fn compare_paired(a: &Run, b: &Run, top1_margin: f64, kl_margin: f64, bootst
         "Quick and legacy Standard must be decode-shaped");
     ensure!(matches!(a.tier.as_str(), "quick" | "standard" | "standard-v2" | "full"), "unknown tier");
     if a.tier != "quick" {
-        ensure!(a.kl_kind == "full-vocabulary" || (a.kl_kind == "qualified-top1024-plus-tail"
+        ensure!(a.kl_kind == "full-vocabulary" || (matches!(a.kl_kind.as_str(), "qualified-top1024-plus-tail" | "reference-top1024-plus-tail")
             && a.dataset.as_ref().is_some_and(|d| d["revision"].as_str().is_some_and(|r|
                 r.len() == 40 && r.bytes().all(|c| c.is_ascii_hexdigit())))),
             "full tier requires full-vocabulary or revision-pinned qualified top1024 KL");
@@ -608,15 +605,18 @@ mod tests {
     }
 
     #[test]
-    fn reference_only_scores_are_not_paired_calibration() {
+    fn reference_scores_use_policy_floors_and_support_paired_comparison() {
         for tier in ["quick", "full", crate::fidelity_dataset::STANDARD_TIER] {
             let mut scored = run(8, 512);
             scored.tier = tier.into();
-            scored.kl_kind = "reference-only-top1024-plus-tail".into();
-            scored.dataset = Some(serde_json::json!({"qualification":"reference-only qualified"}));
+            scored.kl_kind = "reference-top1024-plus-tail".into();
+            scored.dataset = Some(serde_json::json!({"qualification":"reference", "revision":"a".repeat(40)}));
             assert!(verdict(&scored).label.unwrap().contains("common policy floor"));
-            assert!(compare(&scored, &scored, 0.005, 0.005, 100, 1).unwrap_err()
-                .to_string().contains("lack paired engine calibration"));
+            assert!(compare(&scored, &scored, 0.005, 0.005, 100, 1).unwrap().pass);
+            if tier != "quick" {
+                scored.dataset.as_mut().unwrap()["revision"] = serde_json::Value::Null;
+                assert!(compare(&scored, &scored, 0.005, 0.005, 100, 1).is_err());
+            }
         }
     }
 
