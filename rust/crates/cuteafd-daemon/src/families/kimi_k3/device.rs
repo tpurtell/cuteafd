@@ -254,6 +254,8 @@ impl LaneLayout {
 
     pub(crate) fn rows(&self) -> usize { self.rows }
 
+    pub(crate) fn max_context(&self) -> usize { self.max_context }
+
     pub(crate) fn demand(&self, rank: u8, lane: usize) -> Result<Demand> {
         ensure!(rank < 2 && lane < 2, "Kimi lane rank/index outside TP2 two-lane executor");
         Ok(Demand::new(rank, Category::Workspace, format!("Kimi lane {lane} native operands"),
