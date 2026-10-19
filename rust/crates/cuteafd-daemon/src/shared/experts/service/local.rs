@@ -522,6 +522,7 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
         let mut index = 0;
         while index < connections.len() {
             let mut execution_failed = false;
+            let mut executed = false;
             let wait = (wait_index == Some(index)).then_some(idle_wait);
             let result = connections[index].poll(wait, |view, mapped, emit| {
                 // The wire parser has validated framing and identities. Reject
@@ -576,7 +577,9 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
                         Err(error) => { execution_failed = true; return Err(error); }
                     };
                     if let Some(response) = response {
-                        return emit(ProtocolV2ExecutorResponseRef::Device(response));
+                        emit(ProtocolV2ExecutorResponseRef::Device(response))?;
+                        executed = request.rows() > 0;
+                        return Ok(());
                     }
                 }
                 let mut emit_failed = false;
@@ -593,12 +596,21 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
                     },
                 );
                 execution_failed = result.is_err() && !emit_failed;
+                executed = result.is_ok() && request.rows() > 0;
                 result
             });
             match result {
                 Ok(processed) => {
                     progressed |= processed;
-                    if processed && pending_steady_log {
+                    if processed && executed && pending_steady_log {
+                        if census.enabled() {
+                            library.cuda_device_synchronize()?;
+                            census.sample("steady_after_first_expert_request", Some(&library))?;
+                            let retained = cuteafd_ffi::memory_ledger::snapshot();
+                            let detail = census.detail(&baseline, &retained, library.cuda_get_device()?)?;
+                            tracing::info!(target: "cuteafd::spark_memory", record = %serde_json::to_string(&detail)?,
+                                "Spark steady runtime census");
+                        }
                         log_spark_memory_if_enabled(
                             &library,
                             &config,

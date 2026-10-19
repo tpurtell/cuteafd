@@ -8,7 +8,7 @@ pub enum CensusDeviceKind { Integrated, Discrete }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum CensusDeviceWitness { SystemAvailableCgroup, CudaMappingPss }
+pub enum CensusDeviceWitness { SystemAvailable, CudaMappingPss }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 #[error("unqualified Spark census: {0}")]
@@ -24,7 +24,7 @@ pub struct SparkCensusDeltas {
 /// External quiet-host evidence is still required before publishing calibration.
 pub fn spark_census_deltas(samples: &[SparkProcessSample]) -> Result<SparkCensusDeltas, SparkCensusError> {
     use CensusDeviceKind::{Discrete, Integrated};
-    use CensusDeviceWitness::{CudaMappingPss, SystemAvailableCgroup};
+    use CensusDeviceWitness::{CudaMappingPss, SystemAvailable};
     let error = |message| SparkCensusError(message);
     let phase = |name: &str| {
         let mut found = samples.iter().filter(|s| s.phase == name);
@@ -38,9 +38,10 @@ pub fn spark_census_deltas(samples: &[SparkProcessSample]) -> Result<SparkCensus
     let ma = phase("after_expert_modules_before_weights")?;
     let host = phase("after_retained_arenas")?;
     let ready = phase("serve_owners_before_endpoint_rings")?;
-    let ordered = [cb, ca, mb, ma, host, ready];
+    let steady = phase("steady_after_first_expert_request")?;
+    let ordered = [cb, ca, mb, ma, host, ready, steady];
     let witness = match (cb.device_kind, cb.device_witness) {
-        (Some(Integrated), Some(SystemAvailableCgroup)) => SystemAvailableCgroup,
+        (Some(Integrated), Some(SystemAvailable)) => SystemAvailable,
         (Some(Discrete), Some(CudaMappingPss)) => CudaMappingPss,
         _ => return Err(error("unsupported device kind/witness combination")),
     };
@@ -62,6 +63,9 @@ pub fn spark_census_deltas(samples: &[SparkProcessSample]) -> Result<SparkCensus
             }
         };
         let available = growth(before.system_available_bytes, after.system_available_bytes)?;
+        // Unified CUDA allocations reclaim file cache. Cgroup headroom remains
+        // an admission constraint, not an independent residency witness.
+        if witness == SystemAvailable { return Ok(available); }
         let bounded = growth(before.system_headroom_bytes, after.system_headroom_bytes)?;
         if available.abs_diff(bounded) > available / 20 {
             return Err(error("MemAvailable/cgroup phase deltas disagree by more than 5%"));
@@ -74,7 +78,7 @@ pub fn spark_census_deltas(samples: &[SparkProcessSample]) -> Result<SparkCensus
             return Err(error("isolated context/module phase allocated payload storage"));
         }
         let sys = system(before, after, true)?;
-        if witness == SystemAvailableCgroup { return Ok(sys); }
+        if witness == SystemAvailable { return Ok(sys); }
         let maps = after.cuda_mapping_pss_bytes.checked_sub(before.cuda_mapping_pss_bytes)
             .ok_or_else(|| error("CUDA mapping PSS decreased"))?;
         if maps == 0 || maps.abs_diff(sys) > 16 << 20 {
@@ -85,19 +89,8 @@ pub fn spark_census_deltas(samples: &[SparkProcessSample]) -> Result<SparkCensus
     let context = isolated(cb, ca)?;
     if context == 0 { return Err(error("context phase has no measured growth")); }
     let modules = isolated(mb, ma)?;
-    let retained = host.tracked_device_bytes.checked_sub(ma.tracked_device_bytes)
-        .filter(|v| *v > 0).ok_or_else(|| error("missing retained device control"))?;
-    let visible = match witness {
-        SystemAvailableCgroup => system(ma, host, false)?,
-        CudaMappingPss => host.cuda_mapping_pss_bytes.checked_sub(ma.cuda_mapping_pss_bytes)
-            .ok_or_else(|| error("retained CUDA mapping PSS decreased"))?,
-    };
-    let pinned = host.tracked_pinned_bytes.checked_sub(ma.tracked_pinned_bytes)
-        .ok_or_else(|| error("retained pinned ledger decreased"))?;
-    let expected = if witness == SystemAvailableCgroup { retained.checked_add(pinned)
-        .ok_or_else(|| error("retained control overflow"))? } else { retained };
-    if visible == 0 || visible.abs_diff(expected) > expected / 20 {
-        return Err(error("retained device/system witness disagrees by more than 5%"));
+    if host.tracked_device_bytes <= ma.tracked_device_bytes {
+        return Err(error("missing retained device control"));
     }
     if host.tracked_device_bytes != ready.tracked_device_bytes
         || host.tracked_pinned_bytes != ready.tracked_pinned_bytes {
@@ -109,6 +102,25 @@ pub fn spark_census_deltas(samples: &[SparkProcessSample]) -> Result<SparkCensus
         .ok_or_else(|| error("host-only mapping PSS decreased"))?;
     if maps.abs_diff(system(host, ready, true)?) > 16 << 20 {
         return Err(error("host-only process-map/system phase disagrees by more than 16 MiB"));
+    }
+    // Include endpoint rings and lazy first-use owners without weakening the
+    // earlier isolated host-only control.
+    if steady.tracked_device_bytes < ready.tracked_device_bytes
+        || steady.tracked_pinned_bytes < ready.tracked_pinned_bytes {
+        return Err(error("steady retained owners decreased"));
+    }
+    let device = steady.tracked_device_bytes.checked_sub(ma.tracked_device_bytes)
+        .ok_or_else(|| error("steady device ledger decreased"))?;
+    let pinned = steady.tracked_pinned_bytes.checked_sub(ma.tracked_pinned_bytes)
+        .ok_or_else(|| error("steady pinned ledger decreased"))?;
+    let (visible, expected) = match witness {
+        SystemAvailable => (system(ma, steady, false)?, device.checked_add(pinned)
+            .ok_or_else(|| error("steady control overflow"))?),
+        CudaMappingPss => (steady.cuda_mapping_pss_bytes.checked_sub(ma.cuda_mapping_pss_bytes)
+            .ok_or_else(|| error("steady CUDA mapping PSS decreased"))?, device),
+    };
+    if expected == 0 || visible.abs_diff(expected) > expected / 20 {
+        return Err(error("steady device/system witness disagrees by more than 5%"));
     }
     Ok(SparkCensusDeltas { context, modules, witness })
 }

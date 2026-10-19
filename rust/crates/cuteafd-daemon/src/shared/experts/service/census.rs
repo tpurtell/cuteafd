@@ -38,11 +38,14 @@ impl Census {
         let available = kib_field(&meminfo, "MemAvailable:")?;
         let system_headroom = cuteafd_ffi::cgroup_memory_headroom(usize::try_from(available)?)? as u64;
         let witness = self.device_kind.map(|kind| match kind {
-            CensusDeviceKind::Integrated => CensusDeviceWitness::SystemAvailableCgroup,
+            CensusDeviceKind::Integrated => CensusDeviceWitness::SystemAvailable,
             CensusDeviceKind::Discrete => CensusDeviceWitness::CudaMappingPss,
         });
         let ledger = cuteafd_ffi::memory_ledger::snapshot();
         let device = library.map(|l| l.cuda_get_device()).transpose()?.unwrap_or(0);
+        if phase == "steady_after_first_expert_request" {
+            self.samples.retain(|sample| sample.phase != phase);
+        }
         self.samples.push(SparkProcessSample { phase: phase.into(), pid: std::process::id(),
             monotonic_ns: self.start.elapsed().as_nanos().min(u64::MAX as u128) as u64,
             rss_bytes: maps.rss, peak_rss_bytes: peak_rss, cgroup_memory,
@@ -57,7 +60,7 @@ impl Census {
             tracked_device_bytes: ledger.total(Space::Device, device) as u64,
             tracked_pinned_bytes: ledger.total(Space::Pinned, -1) as u64,
             raw_cuda_free_bytes: library.and_then(|l| l.cuda_physical_memory_info().ok()).map(|(free, _)| free as u64),
-            method: "same_pid_status VmHWM and raw memory-cgroup current/peak/max (lifetime peaks, not isolated attribution); same_pid_smaps (CUDA device mapping PSS, anonymous PSS, file PSS); independent MemAvailable/system and cgroup-bounded admission headroom; raw CUDA diagnostic only; device witness explicitly selected by integrated/discrete property; host-only maps/system agreement; quiet-host qualification external".into() });
+            method: "same_pid_status VmHWM and raw memory-cgroup current/peak/max (lifetime peaks, not isolated attribution); same_pid_smaps (CUDA device mapping PSS, anonymous PSS, file PSS); MemAvailable residency witness; cgroup-bounded headroom is an admission constraint only on unified devices; raw CUDA diagnostic only; device witness explicitly selected by integrated/discrete property; host-only maps/system agreement; quiet-host qualification external".into() });
         tracing::info!(target: "cuteafd::spark_memory", record = %serde_json::to_string(self.samples.last().unwrap())?,
             "Spark process census");
         Ok(())
@@ -143,6 +146,9 @@ fn parse_smaps(text: &str) -> Result<Maps> {
 }
 
 fn witness_verdict(samples: &[SparkProcessSample]) -> String {
+    if !samples.iter().any(|sample| sample.phase == "steady_after_first_expert_request") {
+        return "pending: endpoint rings and first completed expert request not sampled; unqualified".into();
+    }
     match spark_census_deltas(samples) {
         Ok(delta) => format!("witnesses consistent: {:?}; context_bytes={}; module_bytes={}; external quiet-host qualification required",
             delta.witness, delta.context, delta.modules),
@@ -165,10 +171,11 @@ mod tests {
 
     fn samples() -> Vec<SparkProcessSample> {
         let phases = ["before_context", "after_context_before_media", "before_expert_modules",
-            "after_expert_modules_before_weights", "after_retained_arenas", "serve_owners_before_endpoint_rings"];
+            "after_expert_modules_before_weights", "after_retained_arenas", "serve_owners_before_endpoint_rings",
+            "steady_after_first_expert_request"];
         phases.into_iter().enumerate().map(|(i, phase)| {
             let mib = 1 << 20;
-            let cuda = [0, 32, 32, 96, 1120, 1120][i] * mib;
+            let cuda = [0, 32, 32, 96, 1120, 1120, 1120][i] * mib;
             SparkProcessSample { phase: phase.into(), pid: 42, monotonic_ns: i as u64 + 1,
                 rss_bytes: cuda, peak_rss_bytes: Some(cuda), cgroup_memory: vec![], pss_bytes: cuda, private_bytes: 0,
                 tracked_device_bytes: if i >= 4 { 1024 * mib } else { 0 }, tracked_pinned_bytes: 0,
@@ -189,7 +196,7 @@ mod tests {
                 1 => s[2].monotonic_ns = s[1].monotonic_ns,
                 2 => s[1].tracked_device_bytes = 1,
                 3 => s[3].tracked_pinned_bytes = 1,
-                4 => s[4].cuda_mapping_pss_bytes = s[3].cuda_mapping_pss_bytes,
+                4 => s[6].cuda_mapping_pss_bytes = s[3].cuda_mapping_pss_bytes,
                 5 => s[1].cuda_mapping_pss_bytes = 0,
                 6 => s[3].system_available_bytes -= 32 << 20,
                 7 => s[1].system_total_bytes = 0,
@@ -204,17 +211,17 @@ mod tests {
         let mut data = samples();
         for s in &mut data {
             s.device_kind = Some(CensusDeviceKind::Integrated);
-            s.device_witness = Some(CensusDeviceWitness::SystemAvailableCgroup);
+            s.device_witness = Some(CensusDeviceWitness::SystemAvailable);
             s.cuda_mapping_pss_bytes = 0;
         }
         let delta = spark_census_deltas(&data).unwrap();
         assert_eq!(delta.context, 32 << 20);
         assert_eq!(delta.modules, 64 << 20);
-        assert_eq!(delta.witness, CensusDeviceWitness::SystemAvailableCgroup);
+        assert_eq!(delta.witness, CensusDeviceWitness::SystemAvailable);
         // An already resident code module can have a genuine zero delta.
         data[3].system_available_bytes = data[2].system_available_bytes;
         data[3].system_headroom_bytes = data[2].system_headroom_bytes;
-        for i in 4..6 {
+        for i in 4..data.len() {
             data[i].system_available_bytes += 64 << 20;
             data[i].system_headroom_bytes += 64 << 20;
         }
@@ -225,11 +232,11 @@ mod tests {
                 0 => d[0].device_witness = Some(CensusDeviceWitness::CudaMappingPss),
                 1 => d[1].device_kind = Some(CensusDeviceKind::Discrete),
                 2 => d[0].device_kind = None,
-                3 => d[4].system_available_bytes += 100 << 20,
-                4 => d[4].system_headroom_bytes += 100 << 20,
+                3 => d[6].system_available_bytes += 100 << 20,
+                4 => d[6].system_available_bytes += 100 << 20,
                 5 => d[5].anonymous_pss_bytes += 32 << 20,
                 6 => d[5].tracked_device_bytes += 1,
-                _ => d[0].system_headroom_bytes = 0,
+                _ => d[0].system_headroom_bytes = d[0].system_available_bytes + 1,
             }
             assert!(spark_census_deltas(&d).is_err(), "case {bad}");
         }
@@ -239,7 +246,7 @@ mod tests {
         let mut data = samples();
         for sample in &mut data {
             sample.device_kind = Some(CensusDeviceKind::Integrated);
-            sample.device_witness = Some(CensusDeviceWitness::SystemAvailableCgroup);
+            sample.device_witness = Some(CensusDeviceWitness::SystemAvailable);
             sample.cuda_mapping_pss_bytes = 0;
         }
         for phase in [3, 5] {
@@ -260,8 +267,7 @@ mod tests {
             for cgroup_only in [false, true] {
                 let mut noisy = data.clone();
                 if cgroup_only {
-                    noisy[phase].system_headroom_bytes = noisy[phase - 1].system_headroom_bytes + (16 << 20) + 1;
-                    noisy[phase].system_available_bytes = noisy[phase].system_headroom_bytes;
+                    noisy[phase].system_headroom_bytes = noisy[phase].system_available_bytes + 1;
                 } else {
                     noisy[phase].system_available_bytes = noisy[phase - 1].system_available_bytes + (16 << 20) + 1;
                 }
@@ -269,9 +275,35 @@ mod tests {
             }
         }
         // Retained payload control never uses the isolated-phase noise allowance.
-        data[4].system_available_bytes = data[3].system_available_bytes + 1;
-        data[4].system_headroom_bytes = data[3].system_headroom_bytes + 1;
+        data[6].system_available_bytes = data[3].system_available_bytes + 1;
+        data[6].system_headroom_bytes = data[3].system_headroom_bytes + 1;
         assert!(spark_census_deltas(&data).is_err());
+    }
+    #[test]
+    fn unified_steady_control_ignores_reclaimed_cache_and_requires_real_sample() {
+        let mut data = samples();
+        for sample in &mut data {
+            sample.device_kind = Some(CensusDeviceKind::Integrated);
+            sample.device_witness = Some(CensusDeviceWitness::SystemAvailable);
+            sample.raw_cuda_free_bytes = Some(1);
+            sample.cuda_mapping_pss_bytes = 0;
+            sample.system_headroom_bytes = 1; // Cache charge is not residency.
+        }
+        assert!(spark_census_deltas(&data).is_ok());
+        // Endpoint rings are retained payload and must appear in both controls.
+        data[6].tracked_pinned_bytes += 64 << 20;
+        data[6].system_available_bytes -= 64 << 20;
+        assert!(spark_census_deltas(&data).is_ok());
+        data[6].system_available_bytes -= 64 << 20;
+        assert!(spark_census_deltas(&data).is_err());
+        data.pop();
+        assert!(spark_census_deltas(&data).is_err());
+        let source = include_str!("local.rs");
+        let gate = source.find("if processed && executed && pending_steady_log").unwrap();
+        let tail = &source[gate..];
+        assert!(tail.find("cuda_device_synchronize()?").unwrap()
+            < tail.find("census.sample(\"steady_after_first_expert_request\"").unwrap());
+        assert!(source.find("if skip_compute").unwrap() < source.find("executed = request.rows() > 0").unwrap());
     }
     #[test]
     fn process_snapshot_requires_explicit_fields_and_units() {
