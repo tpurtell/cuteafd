@@ -75,8 +75,8 @@ ROLE_LAYOUTS = {"spark": ("tp4", "tp2", "tp6"), "coordinator": ("tp1", "tp2")}
 MXFP4_ROLE_LAYOUTS = {"spark": ("tp6", "tp2"), "coordinator": ("tp1", "tp2")}
 # NVFP4 slices own whole 16-value blocks: every Spark world the FP8 worker runs.
 NVFP4_ROLE_LAYOUTS = {"spark": ("tp4", "tp2", "tp3", "tp6"), "coordinator": ("tp1", "tp2")}
-ABI_VERSION = 5
-STORAGE = {"fp8": 1, "mxfp4": 2, "nvfp4a4": 4, "bf16": 5}
+ABI_VERSION = 6
+STORAGE = {"fp8": 1, "fp8a8": 1, "mxfp4": 2, "nvfp4a4": 4, "bf16": 5}
 ACTIVATION = {"silu_bf16_product": 1, "silu_post_clamp_fp32_product": 2}
 PROJECTION = {"bf16": 1}
 ROLE_COMPUTE = {"spark": (12, 1), "coordinator": (12, 0)}
@@ -95,7 +95,7 @@ def input_kind(role: str, weights: str, requested: str | None = None) -> str:
 
 LIBRARY = "libcuteafd_fp8moe.so"
 POINTERS = 11
-INFO_WORDS = 16
+INFO_WORDS = 17
 # Large-row program forms, in cuteafd_fp8moe_set_options order.
 FORMS = ("auto", "w8a16", "w8a8")
 
@@ -356,16 +356,16 @@ def info_words(g, capacities: list[int], wire: bool) -> list[int]:
         raise ValueError("unknown expert storage/activation/projection contract")
     if g.kind == "mxfp4" and g.activation != "silu_bf16_product":
         raise ValueError("MXFP4 supports only the pre-SiLU activation contract")
-    if wire and g.weights in ("nvfp4", "bf16"):
+    if wire and (g.weights in ("nvfp4", "bf16") or g.activations == "a8_k128_f32"):
         raise ValueError("NVFP4/BF16 packages require BF16 input")
     if not capacities or any(c <= 0 or c > 0x7fffffff for c in capacities) or capacities != sorted(set(capacities)):
         raise ValueError("capacities must be positive, strictly increasing int32 values")
     contract = ABI_VERSION | STORAGE[g.kind] << 8 | ACTIVATION[g.activation] << 16 | PROJECTION[g.projection] << 24
     words = [contract, g.hidden, g.slice, g.experts, g.top_k, g.intermediate, g.tp, 7 if wire else 1, limit,
              len(capacities), *capacities]
-    if len(words) > INFO_WORDS:
+    if len(words) > 16:
         raise ValueError(f"at most {INFO_WORDS - 10} capacities per package")
-    return words + [0] * (INFO_WORDS - len(words))
+    return words + [0] * (16 - len(words)) + [2 if g.activations == "a8_k128_f32" else 1]
 
 
 def build(args: argparse.Namespace) -> None:
@@ -385,6 +385,9 @@ def build(args: argparse.Namespace) -> None:
         raise SystemExit(f"{args.role} packages need compute {ROLE_COMPUTE[args.role]} "
                          f"(use --cross-sm121 on an SM120 host)")
     base = GEOMETRIES[args.geometry]
+    if getattr(args, "arithmetic", "existing") == "k128-f32-a8":
+        from dataclasses import replace
+        base = replace(base, activations="a8_k128_f32")
     capacities = sorted({int(v) for v in args.capacities.split(",")})
     layouts = args.layouts.split(",") if args.layouts else list(ROLE_LAYOUTS[args.role])
     if base.weights == "mxfp4" and not args.layouts:
@@ -423,7 +426,7 @@ def build(args: argparse.Namespace) -> None:
             widths = sorted(set(exact_widths(base.intermediate, tp)), reverse=True)
             if tp > 1 and widths and base.with_tp(tp).slice * tp > base.intermediate:
                 layouts += [f"tp{tp}-w{w}" for w in widths if f"tp{tp}-w{w}" not in layouts]
-    wire = input_kind(args.role, base.weights, args.input) == "wire"
+    wire = input_kind(args.role, "bf16" if base.activations == "a8_k128_f32" else base.weights, args.input) == "wire"
     if args.output.exists():
         raise SystemExit(f"{args.output} exists; remove it or choose another --output")
     args.output.parent.mkdir(parents=True, exist_ok=True)
@@ -466,6 +469,7 @@ def build(args: argparse.Namespace) -> None:
                 "tp": tp, "hidden": g.hidden, "slice": g.slice, "experts": g.experts, "top_k": g.top_k,
                 "intermediate": g.intermediate, "swiglu_limit": g.swiglu_limit, "input": "wire" if wire else "bf16",
                 "weights": g.weights, "activation": g.activation, "projection": g.projection, "abi_version": ABI_VERSION,
+                "arithmetic": "k128_f32_a8" if g.activations == "a8_k128_f32" else "existing",
                 "weight_read_grouping": [{"capacity": p["capacity"], "form": p["form"],
                                           **p["weight_read_grouping"]} for p in programs],
                 "capacities": capacity_scratch(programs),
@@ -501,6 +505,8 @@ def verify(package: Path, *, revision: str | None = None, role: str | None = Non
         raise ValueError(f"{package}: no {layout} layout (built: {sorted(layouts)})")
     for name in ([layout] if layout is not None else layouts):
         info = layouts[name]
+        if info.get("arithmetic") not in ("existing", "k128_f32_a8"):
+            raise ValueError(f"{package}/{name}: missing or unknown expert arithmetic")
         if info.get("abi_version") != ABI_VERSION or info.get("activation") not in ACTIVATION or info.get("projection") not in PROJECTION:
             raise ValueError(f"{package}/{name}: missing or unknown expert activation/projection ABI")
         if info.get("weights") == "mxfp4" and info["activation"] != "silu_bf16_product":
@@ -537,6 +543,7 @@ def main() -> None:
                         "tp1 for coordinator)")
     create.add_argument("--all-spark-counts", action="store_true",
                         help="build TP1..6 with at least one H128 block per rank, including unequal exact slices")
+    create.add_argument("--arithmetic", choices=("existing", "k128-f32-a8"), default="existing")
     create.add_argument("--capacities", default="1,16,80,256,1024,4096")
     create.add_argument("--exact-slices", action="store_true",
                         help="also build tp<n>-w<width> layouts: ranks own whole 128-row blocks, each stored at its "

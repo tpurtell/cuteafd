@@ -13,7 +13,7 @@ mod checkpoint_tests;
 
 use crate::shared::memory::DeviceAllocation;
 use anyhow::{ensure, Context, Result};
-use cuteafd_ffi::fp8_moe::{Fp8MoeActivation, Fp8MoeProjection, Fp8MoeMetadata, Fp8MoeInfo, Fp8MoeModule, Fp8MoePrefill, Fp8MoeWeights, FP8_MOE_POINTERS};
+use cuteafd_ffi::fp8_moe::{Fp8MoeArithmetic,Fp8MoeActivation, Fp8MoeProjection, Fp8MoeMetadata, Fp8MoeInfo, Fp8MoeModule, Fp8MoePrefill, Fp8MoeWeights, FP8_MOE_POINTERS};
 use cuteafd_ffi::NativeLibrary;
 use cuteafd_loader::formats::fp8_experts::{ExpertFormat, Fp8ExpertTensors, Fp8Projection, Slicing};
 use std::ffi::c_void;
@@ -32,6 +32,13 @@ pub(super) fn validate_checkpoint_contract(info: &Fp8MoeInfo, tensors: &Fp8Exper
         && info.intermediate == shape.intermediate && info.tp == tp && info.weights == weights
         && info.slice == tensors.rank_width(tp, rank, slicing)?,
         "expert package does not serve checkpoint geometry/storage at TP{tp}: {info:?}");
+    let arithmetic = match tensors.arithmetic() {
+        cuteafd_loader::formats::fp8_experts::ExpertArithmetic::Existing => Fp8MoeArithmetic::Existing,
+        cuteafd_loader::formats::fp8_experts::ExpertArithmetic::K128F32A8 => Fp8MoeArithmetic::K128F32A8,
+    };
+    ensure!(info.arithmetic == arithmetic, "expert package arithmetic disagrees with checkpoint");
+    ensure!(arithmetic != Fp8MoeArithmetic::K128F32A8 || !info.wire_input,
+        "native K128/F32 A8 requires original BF16 input");
     ensure!(!matches!(weights, Fp8MoeWeights::Bf16 | Fp8MoeWeights::Nvfp4) || !info.wire_input,
         "native BF16/NVFP4 weights require BF16 input");
     for &layer in layers {
@@ -693,7 +700,7 @@ mod tests {
             "/../cuteafd-loader/src/plan/families/step5/fixtures/official-fp8.json"))).unwrap();
         write_snapshot(dir.path(),&source["config"],&fixture,None);
         let tensors = Fp8ExpertTensors::read(dir.path(),shape).unwrap();
-        let info = Fp8MoeInfo {hidden:128,slice:256,experts:2,topk:1,intermediate:1536,tp:6,
+        let info = Fp8MoeInfo {arithmetic: cuteafd_ffi::fp8_moe::Fp8MoeArithmetic::Existing, hidden:128,slice:256,experts:2,topk:1,intermediate:1536,tp:6,
             wire_input:false,swiglu_limit:7.0,activation:Fp8MoeActivation::SiluPostClampFp32Product,
             projection:Fp8MoeProjection::Bf16,capacities:vec![16],weights:Fp8MoeWeights::Bf16};
         super::validate_checkpoint_contract(&info,&tensors,&[0],6,0,Slicing::Padded).unwrap();
@@ -855,7 +862,7 @@ mod tests {
 
     #[test]
     fn bf16_sibling_must_share_weight_layout_arithmetic_and_capacity() {
-        let primary = Fp8MoeInfo { hidden: 6144, slice: 512, experts: 256, topk: 8, intermediate: 2048, tp: 4,
+        let primary = Fp8MoeInfo { arithmetic: cuteafd_ffi::fp8_moe::Fp8MoeArithmetic::Existing, hidden: 6144, slice: 512, experts: 256, topk: 8, intermediate: 2048, tp: 4,
             wire_input: true, swiglu_limit: 10.0, activation: cuteafd_ffi::fp8_moe::Fp8MoeActivation::SiluBf16Product, projection: cuteafd_ffi::fp8_moe::Fp8MoeProjection::Bf16, capacities: vec![64, 4096], weights: Fp8MoeWeights::Fp8 };
         let mut bf16 = primary.clone();
         bf16.wire_input = false;

@@ -3046,7 +3046,7 @@ mod tests {
     #[test]
     fn narrow_prefill_expert_storage_covers_every_decode_descriptor_and_native_program() {
         use cuteafd_ffi::fp8_moe::{Fp8MoeInfo, Fp8MoeWeights};
-        let info = Fp8MoeInfo { hidden: 4096, slice: 2048, experts: 256, topk: 8,
+        let info = Fp8MoeInfo { arithmetic: cuteafd_ffi::fp8_moe::Fp8MoeArithmetic::Existing, hidden: 4096, slice: 2048, experts: 256, topk: 8,
             intermediate: 2048, tp: 1, wire_input: false, swiglu_limit: 0.0,
             activation: cuteafd_ffi::fp8_moe::Fp8MoeActivation::SiluBf16Product,
             projection: cuteafd_ffi::fp8_moe::Fp8MoeProjection::Bf16,
@@ -3065,7 +3065,7 @@ mod tests {
             if prefill >= DECODE_ROWS { assert_eq!(capacity, prefill); }
         }
         assert_eq!(expert_capacity(4096), 4096);
-        let narrow_only = Fp8MoeInfo { capacities: vec![16], ..info };
+        let narrow_only = Fp8MoeInfo {arithmetic: cuteafd_ffi::fp8_moe::Fp8MoeArithmetic::Existing,  capacities: vec![16], ..info };
         assert_eq!(narrow_only.capacity_for(expert_capacity(1)), None);
     }
 

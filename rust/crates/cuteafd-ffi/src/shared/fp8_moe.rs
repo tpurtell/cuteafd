@@ -41,6 +41,13 @@ pub enum Fp8MoeProjection {
     Bf16 = 1,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u32)]
+pub enum Fp8MoeArithmetic {
+    Existing = 1,
+    K128F32A8 = 2,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Fp8MoeInfo {
     pub hidden: usize,
@@ -54,16 +61,17 @@ pub struct Fp8MoeInfo {
     pub swiglu_limit: f32,
     pub activation: Fp8MoeActivation,
     pub projection: Fp8MoeProjection,
+    pub arithmetic: Fp8MoeArithmetic,
     pub capacities: Vec<usize>,
     /// The weight format; packed FP4 slices are zero-padded to 128.
     pub weights: Fp8MoeWeights,
 }
 
 impl Fp8MoeInfo {
-    fn from_words(words: [u32; 16]) -> Result<Self> {
+    fn from_words(words: [u32; 17]) -> Result<Self> {
         let count = words[9] as usize;
         let [version, format, activation, projection] = words[0].to_le_bytes();
-        ensure!(version == 5 && matches!(format, 1 | 2 | 4 | 5)
+        ensure!(version == 6 && matches!(format, 1 | 2 | 4 | 5)
             && matches!(activation, 1 | 2) && !(format == 2 && activation == 2) && projection == 1
             && matches!(words[7], 1 | 7) && (1..=6).contains(&count),
             "unsupported FP8 expert package ABI {words:?}");
@@ -81,6 +89,11 @@ impl Fp8MoeInfo {
                 _ => Fp8MoeActivation::SiluPostClampFp32Product,
             },
             projection: Fp8MoeProjection::Bf16,
+            arithmetic: match words[16] {
+                1 => Fp8MoeArithmetic::Existing,
+                2 => Fp8MoeArithmetic::K128F32A8,
+                other => anyhow::bail!("unknown expert arithmetic ID {other}"),
+            },
             capacities: words[10..10 + count].iter().map(|&c| c as usize).collect(),
             weights: match format {
                 1 => Fp8MoeWeights::Fp8,
@@ -89,6 +102,9 @@ impl Fp8MoeInfo {
                 _ => Fp8MoeWeights::Bf16,
             },
         };
+        ensure!(info.arithmetic != Fp8MoeArithmetic::K128F32A8
+            || (info.weights == Fp8MoeWeights::Fp8 && !info.wire_input),
+            "native K128/F32 A8 requires FP8 weights and original BF16 input");
         // Slices are the widest rank range, zero-padded to 128 (MXFP4 32-blocks
         // or FP8 128-blocks split unevenly, TP6 of 2048: 384).
         // The padded width every rank stores, or (exact layouts) one rank's own
@@ -236,9 +252,9 @@ impl Fp8MoeMetadata {
             (*library.get::<unsafe extern "C" fn(*mut u32, u32) -> i32>(b"cuteafd_fp8moe_info")?,
                 *library.get::<Scratch>(b"cuteafd_fp8moe_scratch_bytes")?)
         };
-        let mut words = [0u32; 16];
+        let mut words = [0u32; 17];
         // SAFETY: the query fills at most sixteen live words.
-        ensure!(unsafe { query(words.as_mut_ptr(), 16) } == 0,
+        ensure!(unsafe { query(words.as_mut_ptr(), 17) } == 0,
             "FP8 expert package info query failed");
         Self::from_words_and_scratch(words, |capacity| {
             let mut bytes = 0u64;
@@ -250,7 +266,7 @@ impl Fp8MoeMetadata {
         })
     }
 
-    fn from_words_and_scratch(words: [u32; 16], mut query: impl FnMut(usize) -> Result<u64>) -> Result<Self> {
+    fn from_words_and_scratch(words: [u32; 17], mut query: impl FnMut(usize) -> Result<u64>) -> Result<Self> {
         // Validate exactly the runtime's package contract before querying any
         // workspace extent; this helper does not create CUDA state.
         let info = Fp8MoeInfo::from_words(words)?;
@@ -373,9 +389,26 @@ impl Drop for Fp8MoeModule {
 mod metadata_tests {
     use super::*;
 
-    fn words() -> [u32; 16] {
+    fn words() -> [u32; 17] {
         // ABI 5, MXFP4, pre-SiLU clamp, BF16 projection and input.
-        [0x01010205, 6144, 2048, 256, 8, 2048, 1, 1, 0, 2, 16, 4096, 0, 0, 0, 0]
+        [0x01010206, 6144, 2048, 256, 8, 2048, 1, 1, 0, 2, 16, 4096, 0, 0, 0, 0, 1]
+    }
+
+    #[test]
+    fn native_a8_metadata_rejects_unknown_ids_wire_and_wrong_storage() {
+        let mut w = words();
+        w[0] = 0x01010106;
+        w[16] = 2;
+        assert_eq!(Fp8MoeInfo::from_words(w).unwrap().arithmetic, Fp8MoeArithmetic::K128F32A8);
+        w[7] = 7;
+        assert!(Fp8MoeInfo::from_words(w).is_err());
+        w[7] = 1;
+        w[0] = 0x01010506;
+        assert!(Fp8MoeInfo::from_words(w).is_err());
+        for arithmetic in [0, 3, u32::MAX] {
+            w[16] = arithmetic;
+            assert!(Fp8MoeInfo::from_words(w).is_err());
+        }
     }
 
     #[test]
@@ -383,7 +416,7 @@ mod metadata_tests {
         for format in [1, 2, 4, 5] {
             for activation in [1, 2] {
                 let mut w = words();
-                w[0] = 5 | format << 8 | activation << 16 | 1 << 24;
+                w[0] = 6 | format << 8 | activation << 16 | 1 << 24;
                 w[8] = 7.0f32.to_bits();
                 if format == 2 && activation == 2 {
                     assert!(Fp8MoeInfo::from_words(w).is_err());

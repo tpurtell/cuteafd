@@ -42,7 +42,7 @@ impl<'a> Fp8Worker<'a> {
         ensure!(!experts.layers.is_empty(), "FP8 worker has no layers");
         ensure!(experts.layers.windows(2).all(|w| w[1].layer == w[0].layer + 1), "FP8 worker layers must be contiguous");
         ensure!(experts.module.info().capacity_for(capacity).is_some(), "FP8 package lacks capacity {capacity}");
-        ensure!(experts.wire_input() || matches!(experts.module.info().weights,
+        ensure!(experts.wire_input() || experts.module.info().arithmetic == cuteafd_ffi::fp8_moe::Fp8MoeArithmetic::K128F32A8 || matches!(experts.module.info().weights,
             cuteafd_ffi::fp8_moe::Fp8MoeWeights::Nvfp4 | cuteafd_ffi::fp8_moe::Fp8MoeWeights::Bf16),
             "Spark workers need a wire-input package, or native BF16-input weights");
         let inputs = [

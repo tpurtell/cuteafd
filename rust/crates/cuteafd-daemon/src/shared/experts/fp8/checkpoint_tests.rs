@@ -30,6 +30,72 @@ fn nearest_e4m3(value: f32) -> f32 {
     e4m3(best.1)
 }
 
+// Exhaustive finite-code nearest search is intentionally independent of GPU casts.
+fn signed_e4m3_rne(value: f32) -> f32 {
+    nearest_e4m3(value.abs().min(448.0)).copysign(value)
+}
+
+fn a8(input: &[f32]) -> (Vec<f32>, Vec<f32>) {
+    let mut values = Vec::with_capacity(input.len());
+    let mut scales = Vec::new();
+    for block in input.chunks(128) {
+        let scale = block.iter().copied().map(f32::abs).fold(1e-10f32, f32::max) * (1.0 / 448.0);
+        let inverse = 1.0 / scale;
+        scales.push(scale);
+        values.extend(block.iter().map(|&x| signed_e4m3_rne((x * inverse).clamp(-448.0, 448.0))));
+    }
+    (values, scales)
+}
+
+fn a8_project(input: &[f32], weights: &[u8], scales: &[u8], n: usize, exact: bool) -> Vec<f32> {
+    let k = input.len();
+    let (q, a_scales) = a8(input);
+    (0..n).map(|row| {
+        let mut sum32 = 0.0f32;
+        let mut sum64 = 0.0f64;
+        for (kb, block) in q.chunks(128).enumerate() {
+            let offset = (row / 128 * k.div_ceil(128) + kb) * 4;
+            let ws = f32::from_le_bytes(scales[offset..offset + 4].try_into().unwrap());
+            let mut partial32 = 0.0f32;
+            let mut partial64 = 0.0f64;
+            for (j, &a) in block.iter().enumerate() {
+                let w = e4m3(weights[row * k + kb * 128 + j]);
+                partial32 += a * w;
+                partial64 += f64::from(a) * f64::from(w);
+            }
+            sum32 += (partial32 * a_scales[kb]) * ws;
+            sum64 += partial64 * f64::from(a_scales[kb]) * f64::from(ws);
+        }
+        bf16(if exact { sum64 as f32 } else { sum32 })
+    }).collect()
+}
+
+#[test]
+fn native_a8_signed_rne_and_ragged_blocks() {
+    for code in 0..126u8 {
+        let a = e4m3(code);
+        let b = e4m3(code + 1);
+        let tie = (a + b) * 0.5;
+        let expected = if code & 1 == 0 { a } else { b };
+        assert_eq!(signed_e4m3_rne(tie), expected);
+        assert_eq!(signed_e4m3_rne(-tie), -expected);
+    }
+    assert_eq!(signed_e4m3_rne(-0.0).to_bits(), (-0.0f32).to_bits());
+    assert_eq!(signed_e4m3_rne(1000.0), 448.0);
+    let mut x = vec![0.0; 129];
+    x[128] = -3e-12;
+    let (q, scales) = a8(&x);
+    assert_eq!(q.len(), 129);
+    assert_eq!(scales, vec![1e-10f32 * (1.0 / 448.0); 2]);
+    assert!(q[128] < 0.0);
+    x[0] = 3.25;
+    let (_, scales) = a8(&x);
+    assert_eq!(scales[0], 3.25f32 * (1.0 / 448.0));
+    let weights = vec![56u8; 129];
+    let scales = [0.0037f32.to_le_bytes(), 0.0013f32.to_le_bytes()].concat();
+    assert_eq!(a8_project(&x, &weights, &scales, 1, true), a8_project(&x, &weights, &scales, 1, false));
+}
+
 // Quantize without folding input_scale into each element; the native GEMM
 // applies that global factor once, after its FP32 accumulator.
 fn a4(input: &[f32], input_scale: f32) -> Vec<f32> {
@@ -62,6 +128,9 @@ fn project(tensors: &Fp8ExpertTensors, layer: usize, expert: usize, projection: 
     tensors.read_slice_with(layer, expert, projection, tp, rank, slicing,
         &mut weights, &mut scales, &mut Vec::new())?;
     let format = tensors.format();
+    if tensors.arithmetic() == cuteafd_loader::formats::fp8_experts::ExpertArithmetic::K128F32A8 {
+        return Ok(a8_project(input, &weights, &scales, n, true));
+    }
     let input_scale = tensors.read_input_scale(layer, expert, projection)?;
     let alpha = tensors.read_alpha(layer, expert, projection)?;
     let quantized = if format == ExpertFormat::Nvfp4 { a4(input, input_scale) } else { input.to_vec() };

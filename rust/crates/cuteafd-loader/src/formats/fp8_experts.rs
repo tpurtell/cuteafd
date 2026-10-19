@@ -117,6 +117,15 @@ fn input_scale_name(weight: &str) -> String {
     format!("{}.input_scale", weight.strip_suffix(".weight").unwrap_or(weight))
 }
 
+/// Projection arithmetic, independent of checkpoint storage and activation function.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ExpertArithmetic {
+    #[default]
+    Existing,
+    /// E4M3 activations, F32 scales per row/K128, fresh F32 partial per K128.
+    K128F32A8,
+}
+
 /// Where every routed FP8 expert tensor lives in the snapshot.
 #[derive(Debug, Clone)]
 pub struct Fp8ExpertTensors {
@@ -129,6 +138,8 @@ pub struct Fp8ExpertTensors {
     /// `shape.layers + s` names them.
     mtp_layers: bool,
     format: ExpertFormat,
+    arithmetic: ExpertArithmetic,
+    numerics: Arc<HashMap<String, ExpertArithmetic>>,
     tensors: Arc<HashMap<String, Located>>,
     activations: Vec<cuteafd_core::FfnActivation>,
 }
@@ -283,7 +294,8 @@ impl Fp8ExpertTensors {
             _ => Vec::new(),
         };
         let mut catalog = Self { snapshot: snapshot.to_path_buf(), shape, prefix: prefix.to_string(), mtp_layers,
-            format: ExpertFormat::Fp8Block128, tensors: Arc::new(tensors), activations };
+            format: ExpertFormat::Fp8Block128, arithmetic: ExpertArithmetic::Existing,
+            numerics: Arc::new(HashMap::new()), tensors: Arc::new(tensors), activations };
         let first_layer = layers.and_then(|selected| selected.first().copied()).unwrap_or(shape.first_layer);
         let first = catalog.name(first_layer, 0, Fp8Projection::Gate);
         if catalog.located(&first)?.dtype == DType::Bf16 {
@@ -295,13 +307,19 @@ impl Fp8ExpertTensors {
                 && catalog.tensors.contains_key(&format!("{first}_scale_2"));
             catalog.format = if nvfp4 { ExpertFormat::Nvfp4 } else { ExpertFormat::Mxfp4 };
         }
+        let mut contracts = HashMap::new();
         for name in catalog.tensors.keys().filter(|name| name.ends_with(".weight")) {
             use crate::plan::checkpoint::ModuleNumerics;
             let source = source_names.get(name).map(String::as_str).unwrap_or(name);
             let numerics = checkpoint.module_numerics_with_header(source, catalog.tensors[name].dtype.clone())?;
+            contracts.insert(name.clone(), if numerics == ModuleNumerics::W8A8K128F32 {
+                ExpertArithmetic::K128F32A8
+            } else { ExpertArithmetic::Existing });
             let nvfp4 = catalog.tensors.contains_key(&format!("{name}_scale_2"));
             match numerics {
                 ModuleNumerics::W4A4 => ensure!(nvfp4, "{name}: declared W4A4 needs native NVFP4 weights"),
+                ModuleNumerics::W8A8K128F32 => ensure!(!nvfp4 && catalog.tensors[name].dtype == DType::F8E4M3,
+                    "{name}: native K128/F32 A8 requires block-scaled E4M3 storage"),
                 ModuleNumerics::W8A8 => {
                     ensure!(!nvfp4, "{name}: declared W8A8 cannot execute as W4A4");
                     let qwen = checkpoint.model_type() == Some("qwen4_exp")
@@ -317,6 +335,8 @@ impl Fp8ExpertTensors {
                 }
             }
         }
+        catalog.numerics = Arc::new(contracts);
+        catalog.arithmetic = catalog.layer_arithmetic(first_layer);
         // One expert of the first routed layer fixes the format contract.
         for projection in Fp8Projection::ALL {
             catalog.check(first_layer, 0, projection)?;
@@ -331,6 +351,12 @@ impl Fp8ExpertTensors {
     /// Family-declared arithmetic, when it differs from the process geometry's legacy default.
     pub fn activation(&self, layer: usize) -> Option<cuteafd_core::FfnActivation> {
         self.activations.get(layer).copied()
+    }
+
+    pub fn arithmetic(&self) -> ExpertArithmetic { self.arithmetic }
+
+    pub fn layer_arithmetic(&self, layer: usize) -> ExpertArithmetic {
+        self.numerics.get(&self.name(layer, 0, Fp8Projection::Gate)).copied().unwrap_or_default()
     }
 
     pub fn format(&self) -> ExpertFormat {
@@ -361,6 +387,7 @@ impl Fp8ExpertTensors {
     pub fn for_layer(&self, layer: usize) -> Result<Self> {
         let mut view = self.clone();
         view.format = self.layer_format(layer)?;
+        view.arithmetic = self.layer_arithmetic(layer);
         view.validate_layer(layer)?;
         Ok(view)
     }
@@ -374,7 +401,7 @@ impl Fp8ExpertTensors {
         for &layer in layers {
             let format = self.layer_format(layer)?;
             if let Some((view, ids)) = groups.last_mut().filter(|(view, ids)|
-                view.format == format && view.activation(ids[0]) == self.activation(layer)
+                view.format == format && view.arithmetic == self.layer_arithmetic(layer) && view.activation(ids[0]) == self.activation(layer)
                     && ids.last().is_some_and(|last| last.checked_add(1) == Some(layer))) {
                 view.validate_layer(layer)?;
                 ids.push(layer);
@@ -394,6 +421,14 @@ impl Fp8ExpertTensors {
     /// memory to a resident layer set. Some checkpoints have an MTP layer in
     /// a different format from the backbone; one package cannot run both.
     pub fn validate_layer(&self, layer: usize) -> Result<()> {
+        for expert in 0..self.shape.experts {
+            for projection in Fp8Projection::ALL {
+                let name = self.name(layer, expert, projection);
+                ensure!(self.numerics.get(&name).copied().unwrap_or_default() == self.arithmetic,
+                    "{name}: expert arithmetic disagrees with homogeneous package");
+            }
+        }
+
         for expert in 0..self.shape.experts {
             for projection in Fp8Projection::ALL {
                 self.check(layer, expert, projection)?;
@@ -822,6 +857,7 @@ mod tests {
         let shape = RoutedExpertShape { layers: 78, first_layer: 3, experts: 256, topk: 8, hidden: 6144, intermediate,
             draft_stages: 0, draft_experts: 0 };
         Fp8ExpertTensors { snapshot: PathBuf::new(), shape, prefix: "model.".into(), mtp_layers: false, format,
+            arithmetic: ExpertArithmetic::Existing, numerics: Arc::new(HashMap::new()),
             tensors: Arc::new(HashMap::new()), activations: Vec::new() }
     }
 

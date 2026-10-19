@@ -31,7 +31,7 @@ impl CheckpointFormat {
 /// Arithmetic declared by the checkpoint, independent of optional load optimizations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
-pub enum ModuleNumerics { CheckpointPrecision, W4A4, W8A8, W8CheckpointActivations }
+pub enum ModuleNumerics { CheckpointPrecision, W4A4, W8A8, W8A8K128F32, W8CheckpointActivations }
 
 fn module_match(pattern: &str, module: &str) -> bool {
     if !pattern.contains('*') {
@@ -253,6 +253,15 @@ impl Checkpoint {
     pub fn module_numerics_with_header(&self, module: &str, dtype: cuteafd_core::DType) -> Result<ModuleNumerics> {
         let module = module.strip_suffix(".weight").unwrap_or(module);
         let declared = self.declared_numerics(module)?;
+        if declared == ModuleNumerics::W8A8K128F32 {
+            let scale = format!("{module}.weight_scale_inv");
+            if dtype == cuteafd_core::DType::Bf16 && !self.contains_tensor(&scale) {
+                return Ok(ModuleNumerics::CheckpointPrecision);
+            }
+            ensure!(dtype == cuteafd_core::DType::F8E4M3 && self.contains_tensor(&scale),
+                "{module}: native K128/F32 A8 requires E4M3 weights and weight_scale_inv");
+            return Ok(declared);
+        }
         if declared != ModuleNumerics::W4A4 { return Ok(declared); }
         let scales = ["weight_scale", "weight_scale_2", "input_scale"]
             .map(|suffix| self.contains_tensor(&format!("{module}.{suffix}")));
@@ -289,6 +298,19 @@ impl Checkpoint {
     fn declared_numerics_for_owner(&self, module: &str, owner: &str) -> Result<ModuleNumerics> {
         let Some(root) = self.quantization() else { return Ok(ModuleNumerics::CheckpointPrecision) };
         let q = root.get("quantization").unwrap_or(root);
+        if root.get("quant_method").and_then(Value::as_str) == Some("fp8") {
+            if ["ignore", "exclude_modules", "modules_to_not_convert"].iter().any(|key|
+                q.get(key).and_then(Value::as_array).is_some_and(|rules|
+                    rules.iter().filter_map(Value::as_str).any(|rule| module_match(rule, owner)))) {
+                return Ok(ModuleNumerics::CheckpointPrecision);
+            }
+            if q.get("activation_scheme").and_then(Value::as_str) == Some("dynamic")
+                && q.get("fmt").and_then(Value::as_str) == Some("e4m3")
+                && q.get("weight_block_size") == Some(&serde_json::json!([128, 128])) {
+                return Ok(ModuleNumerics::W8A8K128F32);
+            }
+            return Ok(ModuleNumerics::CheckpointPrecision);
+        }
         if root.get("quant_method").and_then(Value::as_str) != Some("modelopt")
             && root.pointer("/producer/name").and_then(Value::as_str) != Some("modelopt") {
             return Ok(ModuleNumerics::CheckpointPrecision);
@@ -352,6 +374,11 @@ impl Checkpoint {
     /// Use the complete index, never a role's local expert/MTP header subset.
     pub fn spark_input_is_bf16(&self) -> bool {
         let layers = opt_usize_field(self.text_config(), "num_hidden_layers");
+        if self.tensor_names().filter_map(|name| name.strip_suffix(".weight")).any(|stem|
+            (stem.contains(".experts.") || stem.contains(".moe."))
+                && self.declared_numerics(stem).ok() == Some(ModuleNumerics::W8A8K128F32)) {
+            return true;
+        }
         self.tensor_names().any(|name| {
             let Some(stem) = name.strip_suffix(".input_scale") else { return false };
             if !stem.contains(".experts.") || !self.contains_tensor(&format!("{stem}.weight_scale_2")) {
@@ -491,6 +518,32 @@ mod sliced_tests {
                     assert_eq!(coordinator.spark_input_is_bf16(), worker.spark_input_is_bf16());
                 }
             }
+        }
+    }
+
+    #[test]
+    fn fp8_k128_f32_contract_uses_headers_and_nested_config() {
+        for nested in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let q = json!({"quant_method":"fp8", "activation_scheme":"dynamic", "fmt":"e4m3",
+                "weight_block_size":[128,128], "modules_to_not_convert":["model.layers.2.*"]});
+            let config = if nested { json!({"text_config":{"quantization_config":q}}) }
+                else { json!({"quantization_config":q}) };
+            std::fs::write(dir.path().join("config.json"), serde_json::to_vec(&config).unwrap()).unwrap();
+            let fp8 = "model.layers.0.mlp.experts.0.gate_proj";
+            let bf16 = "model.layers.1.mlp.experts.0.gate_proj";
+            let excluded = "model.layers.2.mlp.experts.0.gate_proj";
+            write_safetensors(&dir.path().join("model.safetensors"), &[
+                t(format!("{fp8}.weight"), "F8_E4M3", &[128,128]),
+                t(format!("{fp8}.weight_scale_inv"), "F32", &[1,1]),
+                t(format!("{bf16}.weight"), "BF16", &[128,128]),
+                t(format!("{excluded}.weight"), "BF16", &[128,128])]);
+            let cp = Checkpoint::inventory(dir.path()).unwrap();
+            assert_eq!(cp.module_numerics(fp8).unwrap(), ModuleNumerics::W8A8K128F32);
+            assert_eq!(cp.module_numerics(bf16).unwrap(), ModuleNumerics::CheckpointPrecision);
+            assert_eq!(cp.module_numerics(excluded).unwrap(), ModuleNumerics::CheckpointPrecision);
+            assert!(cp.spark_input_is_bf16());
+            assert!(cp.module_numerics_with_header(fp8, cuteafd_core::DType::Bf16).is_err());
         }
     }
 
