@@ -166,6 +166,8 @@ impl Drop for KdaBank<'_> {
 }
 
 impl<'a> KdaBank<'a> {
+    pub(super) fn slots(&self) -> usize { self.layout.slots }
+
     pub(super) fn check_reader(&self, lane: usize, stream: &Rc<Stream<'a>>) -> Result<()> {
         ensure!(self.readers.get(lane).is_some_and(|reader| Rc::ptr_eq(reader, stream))
             && self.stream.device.id == stream.device.id

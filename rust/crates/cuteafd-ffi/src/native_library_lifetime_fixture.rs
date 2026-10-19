@@ -145,6 +145,10 @@ impl Fixture {
         Ok(())
     }
 
+    pub fn finish_ordered_uploads(&self, library: &NativeLibrary) -> Result<()> {
+        library.release_ordered_h2d_staging()
+    }
+
     pub fn configure_drain_after(&self, library: &NativeLibrary, completed: i32) -> Result<()> {
         // SAFETY: this export belongs to the CPU-only fixture loaded above.
         unsafe {
