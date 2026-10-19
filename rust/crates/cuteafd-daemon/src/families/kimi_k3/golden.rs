@@ -2,12 +2,15 @@
 use anyhow::{ensure, Context, Result};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use std::{net::SocketAddr, path::{Path, PathBuf}, rc::Rc, sync::Arc};
-use super::{admission, device::NativePrograms, engine::Engine};
-use crate::shared::{inventory::{InventoryPhase, RuntimeInventory}, memory::device::{Device, Stream},
-    peer_split::{hop::HopLink, PeerExchange, RankDevice}};
-use cuteafd_core::{ExpertGeometry, memory_layout::{Basis, Category}};
-use cuteafd_loader::{families::kimi_k3::config::KimiK3Config, placement::{Demand, GpuBudget, HOP_SLOTS}};
+use std::{net::SocketAddr, path::{Path, PathBuf}, sync::Arc};
+use super::{admission, engine::Engine};
+use crate::shared::inventory::{InventoryPhase, RuntimeInventory};
+use cuteafd_core::ExpertGeometry;
+#[cfg(test)]
+use cuteafd_core::memory_layout::Basis;
+use cuteafd_loader::families::kimi_k3::config::KimiK3Config;
+#[cfg(test)]
+use cuteafd_loader::placement::GpuBudget;
 
 const HIDDEN: usize = 7168;
 const REVISION: &str = "f831ab66814297da540d832a5235f8e904f29d06";
@@ -289,73 +292,18 @@ fn native(args: &GoldenArgs, checkpoint: &cuteafd_loader::plan::Checkpoint,
         .map_err(|_| anyhow::anyhow!("Kimi golden needs an isolated process"))?;
     // SAFETY: sealed runner supplies the DSO; all borrowing owners drop before it.
     let library = Arc::new(unsafe { cuteafd_ffi::NativeLibrary::load(args.native_lib.as_ref().context("--native-lib required")?)? });
-    ensure!(crate::shared::peer_split::probed_device(&library, args.device, Some(args.split_device))?
-        == Some(args.split_device), "Kimi TP2 requires bidirectional peer access");
-    let devices = [args.device, args.split_device].map(|id| Device { library: &library, id });
     let programs = library.programs()?.with_manifest(&args.manifest)?;
-    let native = devices.map(|device| NativePrograms::load(device, full, &programs, args.ffn_mode()).map(Rc::new));
-    let [zero, one] = native;
-    let native = [zero?, one?];
     let rows = scoring.map_or(reference.tokens.len(), |windows| windows.iter().map(|w| w.tokens.len() - 1)
         .max().unwrap_or(1).min(4096));
-    let rtx = if args.rtx_expert_layers == 0 { None } else {
-        let catalog = cuteafd_loader::read_expert_catalog(&checkpoint.snapshot)?;
-        let tiers = catalog.exl3().context("Kimi whole experts require EXL3 checkpoint")?.decoder_tiers();
-        let package = crate::shared::experts::exl3::aot_layout_directory(
-            args.native_lib.as_deref().context("--native-lib required")?, tiers, "rtx-tp1");
-        Some(admission::plan_rtx(cfg, &catalog, package, rows, args.rtx_expert_layers)?)
-    };
-    let expert_modules = if let Some(inventory) = &rtx {
-        use crate::shared::experts::rtx::{exl3::Exl3Tp2, RtxSelectionPolicy};
-        [Some(Exl3Tp2::preload_whole_modules(devices[0], &inventory.package, rows,
-            ExpertGeometry::KIMI_K3, RtxSelectionPolicy::FirstCapacity)?),
-         Some(Exl3Tp2::preload_whole_modules(devices[1], &inventory.package, rows,
-            ExpertGeometry::KIMI_K3, RtxSelectionPolicy::FirstCapacity)?)]
-    } else { [None, None] };
-    let diagnostics = std::env::var("CUTEAFD_PEER_WAIT_DIAGNOSTICS").is_ok_and(|v| v == "1");
-    let inventory = RuntimeInventory::measure(&library, &[args.device, args.split_device], InventoryPhase::PreWeight, |_| {
-        library.tp2_native_initialize()?;
-        library.peer_exchange_initialize()?;
-        library.peer_abort_initialize()?;
-        if diagnostics { library.peer_diagnostic_initialize()?; }
-        library.v41_compact_reducer()?.require_plane_reduction(6)?;
-        Ok(())
-    })?;
-    let lane_layouts = vec![[native[0].lane_layout(full, rows, 1_048_576)?,
-        native[1].lane_layout(full, rows, 1_048_576)?]];
-    let mut fixed = exchange_demands(rows, diagnostics)?;
-    let selected = cuteafd_loader::placement::ProgramSet::from_names(&["kimik3"], programs.names());
-    for (rank, sample) in inventory.gpus.iter().enumerate() {
-        let pending = crate::shared::inventory::pending_code(&library, sample.device, rank, true,
-            "kimik3", "exl3", &selected)?;
-        let arch = cuteafd_loader::placement::ArchContext::for_device(&sample.arch, sample.total_bytes);
-        fixed.push(code_demand(rank, pending, arch.cublas_bytes, 1)?);
-    }
-    let gpus = inventory.gpus.iter().map(|sample| {
-        let capacity = cuteafd_ffi::coordinator_gpu_budget().map_or(sample.total_bytes, |b| b.0.min(sample.total_bytes));
-        GpuBudget { capacity_bytes: capacity, headroom_bytes: 2 << 30,
-            baseline: cuteafd_loader::placement::Baseline::Measured { free_bytes: sample.free_bytes } }
-    }).collect::<Vec<_>>().try_into().map_err(|_| anyhow::anyhow!("Kimi GPU sample count"))?;
-    let admitted = admission::admit(admission::Inputs { cfg, gpus, devices: [args.device, args.split_device],
-        peer_access: true, spark_ranks: 6, attention: None, requested_pool: Some(262_144),
-        state_slots: 1, prefix_marks: 1, rows, lanes: 1, lane_layouts, fixed,
-        startup: vec![], pool_bounded: vec![], rtx })?;
-    ensure!(admitted.working_set().spark_layers == hosted_layers(&std::env::var("CUTEAFD_GOLDEN_EXPERT_LAYERS")?)?,
-        "Kimi worker layer subset differs from shared placement");
-    tracing::info!(placement = %admitted.placement.summary(), "Kimi admitted whole expert ownership");
-    let plan = admitted.execution_plan()?;
-    let admission_free = inventory.gpus.iter().map(|sample| sample.free_bytes).collect::<Vec<_>>();
-    let admitted_bytes = admitted.placement.items.iter().map(|items| items.iter().map(|item| item.bytes).sum::<u64>())
-        .collect::<Vec<_>>();
-    let pages = admitted.placement.pool_tokens as usize / cuteafd_ffi::MLA_PAGE_ROWS;
-    let streams = [Rc::new(Stream::new(devices[0])?), Rc::new(Stream::new(devices[1])?)];
-    let ranks = streams.each_ref().map(|s| RankDevice { device: s.device.id, stream: s.raw });
-    let peer = devices[0].run(|| PeerExchange::new_abortable(&library, ranks, 1, rows * HIDDEN * 2))?;
-    let mut hops = devices[0].run(|| HopLink::new(&library, ranks, plan.hops(), plan.spec()))?;
-    hops.attach_abort([peer.abort_word(0)?.context("Kimi missing abort owner")?,
-        peer.abort_word(1)?.context("Kimi missing abort owner")?])?;
-    let engine = Engine::load_admitted(&library, streams, admitted, checkpoint, native, peer, hops,
-        args.peers.clone(), cuteafd_transport::TcpTransportConfig::default(), 4096, expert_modules)?;
+    let super::startup::Loaded { engine, admission_free, admitted_bytes } = super::startup::load(
+        &library, &programs, checkpoint, full, cfg, super::startup::Options {
+            devices: [args.device, args.split_device], native_lib: args.native_lib.as_deref().context("--native-lib required")?,
+            peers: args.peers.clone(), rtx_expert_layers: args.rtx_expert_layers,
+            rows, slots: 1, marks: 1, max_context: 1_048_576, pool_tokens: Some(262_144), graphs: false,
+            ffn_mode: args.ffn_mode(), hosted_layers: Some(hosted_layers(&std::env::var("CUTEAFD_GOLDEN_EXPERT_LAYERS")?)?),
+        })?;
+    use cuteafd_engine::prefix::PrefixFamily;
+    let pages = engine.prefix_family()?.layout().pages;
     let loaded = RuntimeInventory::measure(&library, &[args.device, args.split_device], InventoryPhase::PostLoad, |_| Ok(()))?;
     loaded.record(if scoring.is_some() { "kimi_k3-full-loaded" } else { "kimi_k3-prefix-loaded" }, &admission_free);
     for (rank, sample) in loaded.gpus.iter().enumerate() {
@@ -385,26 +333,8 @@ fn native(args: &GoldenArgs, checkpoint: &cuteafd_loader::plan::Checkpoint,
     Ok(())
 }
 
-fn code_demand(rank: usize, pending: u64, cublas_bytes: u64, lanes: usize) -> Result<Demand> {
-    ensure!(rank < 2 && (1..=2).contains(&lanes), "Kimi code allowance rank/lane geometry");
-    // Shared allowance covers one thread-local handle per rank. Each head-rank
-    // lane owns an additional private handle beside its explicitly charged workspace.
-    let heads = if rank == 1 { lanes as u64 } else { 0 };
-    let bytes = heads.checked_mul(cublas_bytes).and_then(|extra| pending.checked_add(extra))
-        .context("Kimi future code/handle allowance overflow")?;
-    Ok(Demand::new(rank as u8, Category::Workspace, "Kimi future loaded code and private head handles",
-        bytes, Basis::Formula))
-}
-
-fn exchange_demands(rows: usize, diagnostics: bool) -> Result<Vec<Demand>> {
-    ensure!((1..=4096).contains(&rows), "Kimi exchange row capacity");
-    let recv = (rows * HIDDEN * 2).max(256);
-    let progress = if diagnostics { (2 * std::mem::size_of::<cuteafd_ffi::peer_exchange::PeerProgress>()).max(256) } else { 0 };
-    // Hop receive planes are charged by the shared solver; only controls are fixed.
-    let bytes = recv + 256 + 256 + (((HOP_SLOTS + 1) * 16) as usize).max(256) + progress;
-    Ok((0..2).map(|rank| Demand::new(rank, Category::Workspace, "Kimi peer/abort/hop controls",
-        bytes as u64, Basis::Exact)).collect())
-}
+#[cfg(test)]
+use super::startup::{code_demand, exchange_demands};
 
 #[cfg(test)]
 mod tests {
