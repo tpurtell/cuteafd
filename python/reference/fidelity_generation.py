@@ -49,6 +49,18 @@ class ChatRenderer:
                 raise ValueError("generation requires the checkpoint's own chat template")
             self.identity = {"chat_template_sha256": hashlib.sha256(template.encode()).hexdigest()}
 
+    def template_options(self, body):
+        effort = body.get("reasoning_effort")
+        nested = (body.get("reasoning") or {}).get("effort")
+        if effort is not None and nested is not None and effort != nested:
+            raise ValueError("conflicting reasoning efforts in generation request")
+        effort = nested if nested is not None else effort
+        if self.native:
+            return {"thinking_effort": effort} if effort is not None else {}
+        template = self.tokenizer.get_chat_template()
+        return {key: effort for key in ("thinking_effort", "reasoning_effort")
+                if effort is not None and re.search(r"\b" + key + r"\b", template)}
+
     def render(self, body, assistant=None):
         messages = normalized_messages(body["messages"])
         if assistant is not None:
@@ -63,13 +75,13 @@ class ChatRenderer:
                                 reasoning_effort=body.get("reasoning_effort", "high"))
         return self.tokenizer.apply_chat_template(
             messages, tools=body.get("tools"), tokenize=False,
-            add_generation_prompt=assistant is None)
+            add_generation_prompt=assistant is None, **self.template_options(body))
 
     def prompt(self, body):
         if self.native:
             return list(self.tokenizer.apply_chat_template(
                 normalized_messages(body["messages"]), tools=body.get("tools"),
-                tokenize=True, add_generation_prompt=True))
+                tokenize=True, add_generation_prompt=True, **self.template_options(body)))
         return token_ids(self.tokenizer, self.render(body))
 
     def completion(self, body, assistant):
@@ -81,7 +93,7 @@ class ChatRenderer:
         if self.native:
             full_ids = list(self.tokenizer.apply_chat_template(
                 normalized_messages(body["messages"] + [assistant]), tools=body.get("tools"),
-                tokenize=True, add_generation_prompt=False))
+                tokenize=True, add_generation_prompt=False, **self.template_options(body)))
             if full_ids[:len(prompt_ids)] != prompt_ids:
                 raise ValueError("checkpoint tokenizer rewrites the generation prefix")
             generated = full_ids[len(prompt_ids):]
@@ -205,20 +217,42 @@ class APIClient(TextGenerator):
                 time.sleep(min(60, 2 ** attempt))
         raise AssertionError("unreachable")
 
-    def __call__(self, body):
+    def resolved_request(self, body):
         request = copy.deepcopy(body)
         request["model"] = self.model
         request.update(self.extra_body)
         record = self.cache.find(request)
+        if record is None and urllib.parse.urlsplit(self.endpoint).hostname == "openrouter.ai":
+            # Reuse old exact requests first; budget only newly purchased responses.
+            reasoning_options = copy.deepcopy(request.get("reasoning") or {})
+            reasoning_options.pop("effort", None)
+            reasoning_options["max_tokens"] = body["max_tokens"]
+            request["reasoning"] = reasoning_options
+            request.pop("reasoning_effort", None)
+            record = self.cache.find(request)
+        return request, record
+
+    def rendering_body(self, request):
+        rendered = copy.deepcopy(request)
+        if self.family == "kimi_k3" and not (request.get("reasoning_effort")
+                or (request.get("reasoning") or {}).get("effort")):
+            # Official K3 API docs and native template both default to max.
+            rendered["reasoning_effort"] = "max"
+        return rendered
+
+    def prompt(self, body):
+        lookup = copy.deepcopy(body)
+        if lookup.get("max_tokens") == 1:
+            # The fixed recipe sizes locally before its 1024-token cached call.
+            lookup["max_tokens"] = 1024
+        request, _ = self.resolved_request(lookup)
+        return super().prompt(self.rendering_body(request))
+
+    def __call__(self, body):
+        request, record = self.resolved_request(body)
         if record is None:
-            if urllib.parse.urlsplit(self.endpoint).hostname == "openrouter.ai":
-                # Reuse old exact requests first; budget only newly purchased responses.
-                reasoning_options = copy.deepcopy(request.get("reasoning") or {})
-                reasoning_options.pop("effort", None)
-                reasoning_options["max_tokens"] = body["max_tokens"]
-                request["reasoning"] = reasoning_options
-                request.pop("reasoning_effort", None)
             record = self.cache.get(request, lambda: self.request(request))
+        rendered_body = self.rendering_body(record["binding"]["request"])
         raw = record["response"]
         if raw.get("error") or not raw.get("choices"):
             raise ValueError("API returned an error or no choices (raw response cached)")
@@ -229,14 +263,17 @@ class APIClient(TextGenerator):
         message["reasoning_content"] = reasoning
         if not message.get("content") and not reasoning and not message.get("tool_calls"):
             raise ValueError("API returned no accessible text or tool calls")
-        generated_full = self.renderer.completion(body, message)
+        generated_full = self.renderer.completion(rendered_body, message)
         generated = generated_full[:body["max_tokens"]]
         visible_message = message
         if len(generated) < len(generated_full):
             # A cut response is unfinished; never execute calls from its discarded suffix.
             visible_message = {**message, "tool_calls": []}
-        return self.result(body, generated, visible_message, {
+        return self.result(rendered_body, generated, visible_message, {
             **self.identity, "date": record["date"], "provider": raw.get("provider"),
+            "rendered_reasoning": {"template_options": self.renderer.template_options(rendered_body),
+                "source": "documented Kimi K3 provider default max" if self.family == "kimi_k3"
+                    and rendered_body != record["binding"]["request"] else "cached wire request"},
             "response_model": raw.get("model"), "response_id": raw.get("id"),
             "usage": raw.get("usage"), "finish_reason": choice.get("finish_reason"),
             "reasoning_content": reasoning, "content": message.get("content") or "",

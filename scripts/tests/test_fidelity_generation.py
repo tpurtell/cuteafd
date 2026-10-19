@@ -219,6 +219,57 @@ def test_hf_cache_and_tool_parser(tmp_path):
     assert client(request) == result
 
 
+class EffortTokenizer(Tokenizer):
+    def get_chat_template(self):
+        return "thinking_effort"
+
+    def apply_chat_template(self, messages, *, thinking_effort="max", **kwargs):
+        return "effort=" + thinking_effort + ":" + super().apply_chat_template(messages, **kwargs)
+
+
+def test_renderer_binds_effort_for_prompt_and_completion():
+    renderer = ChatRenderer(EffortTokenizer())
+    request = body()
+    assert renderer.render(request).startswith("effort=high:")
+    assert renderer.prompt(request) == list(renderer.render(request).encode())
+    assistant = {"role": "assistant", "content": "answer", "reasoning_content": "reason"}
+    generated = renderer.completion(request, assistant)
+    assert renderer.tokenizer.decode(renderer.prompt(request) + generated) == renderer.render(request, assistant)
+    request["reasoning"] = {"effort": "low"}
+    with pytest.raises(ValueError, match="conflicting reasoning efforts"):
+        renderer.prompt(request)
+
+
+def test_api_renders_cached_wire_effort_and_default_without_calls(api, monkeypatch):
+    client, state = api
+    client.family = "kimi_k3"
+    client.renderer = ChatRenderer(EffortTokenizer())
+    client.endpoint = "https://openrouter.ai/api/v1/chat/completions"
+    client.identity["endpoint"] = client.endpoint
+    request = body()
+    raw = {"choices": [{"message": {"content": "answer", "reasoning_content": "reason"}}]}
+    client.cache.get(request, lambda: raw)
+    original = next(client.cache.directory.glob("*.json")).read_bytes()
+    monkeypatch.setattr(client, "request", lambda _: pytest.fail("new API request"))
+    high = client(request)
+    assert client.renderer.tokenizer.decode(high["probe"]["prompt_ids"]).startswith("effort=high:")
+    assert high["generation_provenance"]["rendered_reasoning"]["template_options"] == {"thinking_effort": "high"}
+    changed = body()
+    changed["seed"] = 1
+    budget = copy.deepcopy(changed)
+    budget.pop("reasoning_effort")
+    budget["reasoning"] = {"max_tokens": 1024}
+    client.cache.get(budget, lambda: raw)
+    cached = client(changed)
+    sizing = {**changed, "max_tokens": 1}
+    assert client.prompt(sizing)["probe"]["prompt_ids"] == cached["probe"]["prompt_ids"]
+    assert client.prompt(changed)["probe"]["prompt_ids"] == cached["probe"]["prompt_ids"]
+    assert client.renderer.tokenizer.decode(cached["probe"]["prompt_ids"]).startswith("effort=max:")
+    assert cached["generation_provenance"]["rendered_reasoning"]["source"] == "documented Kimi K3 provider default max"
+    assert original in [p.read_bytes() for p in client.cache.directory.glob("*.json")]
+    assert state["calls"] == []
+
+
 def test_truncated_thinking_is_not_mistaken_for_final_content():
     message = parse_qwen_response("still thinking", [], thinking_prefix=True)
     assert message["reasoning_content"] == "still thinking" and message["content"] == ""
