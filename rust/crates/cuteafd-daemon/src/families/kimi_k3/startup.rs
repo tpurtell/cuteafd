@@ -49,16 +49,16 @@ pub(crate) fn load<'a>(library: &'a Arc<cuteafd_ffi::NativeLibrary>,
     let rows = options.rows;
     let rtx = if options.rtx_expert_layers == 0 { None } else {
         let catalog = cuteafd_loader::read_expert_catalog(&checkpoint.snapshot)?;
-        let tiers = catalog.exl3().context("Kimi whole experts require EXL3 checkpoint")?.decoder_tiers();
+        let tiers = catalog.exl3().context("Kimi TP2 experts require EXL3 checkpoint")?.decoder_tiers();
         let package = crate::shared::experts::exl3::aot_layout_directory(
-            options.native_lib, tiers, "rtx-tp1");
+            options.native_lib, tiers, "rtx-tp2");
         Some(admission::plan_rtx(cfg, &catalog, package, rows, options.rtx_expert_layers)?)
     };
     let expert_modules = if let Some(inventory) = &rtx {
         use crate::shared::experts::rtx::{exl3::Exl3Tp2, RtxSelectionPolicy};
-        [Some(Exl3Tp2::preload_whole_modules(devices[0], &inventory.package, rows,
+        [Some(Exl3Tp2::preload_tp2_modules(devices[0], &inventory.package, rows,
             ExpertGeometry::KIMI_K3, RtxSelectionPolicy::FirstCapacity)?),
-         Some(Exl3Tp2::preload_whole_modules(devices[1], &inventory.package, rows,
+         Some(Exl3Tp2::preload_tp2_modules(devices[1], &inventory.package, rows,
             ExpertGeometry::KIMI_K3, RtxSelectionPolicy::FirstCapacity)?)]
     } else { [None, None] };
     let diagnostics = std::env::var("CUTEAFD_PEER_WAIT_DIAGNOSTICS").is_ok_and(|v| v == "1");
@@ -100,7 +100,7 @@ pub(crate) fn load<'a>(library: &'a Arc<cuteafd_ffi::NativeLibrary>,
         tracing::info!(executables = set.keys.len(), bytes0 = set.inventory.bytes(0),
             bytes1 = set.inventory.bytes(1), reserve = "estimated", "Kimi startup graph inventory");
     }
-    tracing::info!(placement = %admitted.placement.summary(), marks = %admitted.mark_selection.summary(), "Kimi admitted whole expert ownership");
+    tracing::info!(placement = %admitted.placement.summary(), marks = %admitted.mark_selection.summary(), "Kimi admitted TP2 expert ownership");
     let plan = admitted.execution_plan()?;
     let admission_free = inventory.gpus.iter().map(|sample| sample.free_bytes).collect::<Vec<_>>();
     let admitted_bytes = admitted.placement.items.iter().map(|items| items.iter().map(|item| item.bytes).sum::<u64>())

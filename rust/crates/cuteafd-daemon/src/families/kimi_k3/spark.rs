@@ -24,7 +24,7 @@ const TOPK: usize = 16;
 /// Pinned route storage is host memory; all device planes precede admission.
 pub(crate) fn demand(rows: usize, lane: usize) -> Result<Demand> {
     ensure!((1..=4096).contains(&rows), "Kimi Spark row capacity");
-    Ok(Demand::new(0, Category::Workspace, format!("Kimi Spark lane {lane} latent intake"),
+    Ok(Demand::new(1, Category::Workspace, format!("Kimi Spark lane {lane} latent intake"),
         (RANKS * rows * LATENT * 2) as u64, Basis::Exact))
 }
 
@@ -63,10 +63,9 @@ impl<'a> RoutedLane<'a> {
             "Kimi Spark library owner differs from admitted device");
         ensure!(cuteafd_core::expert_geometry() == ExpertGeometry::KIMI_K3,
             "Kimi Spark helpers require the process latent expert geometry before native loading");
-        ensure!(peers.len() == RANKS && local.has_embedding(),
-            "Kimi routed exchange requires six real Spark ranks and the admitted entry rank");
+        ensure!(peers.len() == RANKS, "Kimi routed exchange requires six real Spark ranks");
         let charge = demand(local.rows(), local.lane_index())?;
-        let charges = placement.items[0].iter().filter(|item| item.group == charge.group).collect::<Vec<_>>();
+        let charges = placement.items[1].iter().filter(|item| item.group == charge.group).collect::<Vec<_>>();
         ensure!(charges.len() == 1 && charges[0].category == charge.category
             && charges[0].basis == charge.basis && charges[0].bytes == charge.bytes,
             "Kimi Spark intake differs from accepted admission");
@@ -120,11 +119,11 @@ impl<'a> RoutedLane<'a> {
     /// Route copies precede the shared FFN on this stream. Fence only the copy
     /// event so the host can parse ordinary protocol rows while the FFN runs.
     pub(crate) fn begin(&mut self, local: &mut LocalLane<'a>, layer: usize, rows: usize,
-        kind: ExpertV2SourceKind) -> Result<Ticket> {
+        kind: ExpertV2SourceKind, routes: cuteafd_ffi::KimiRoutes,
+        wire: cuteafd_ffi::CuteafdDeviceBuffer) -> Result<Ticket> {
         self.check(local, rows)?;
         ensure!(self.pending.is_none(), "Kimi routed lane already has an outstanding wave");
         let sequence = self.sequence.checked_add(1).context("Kimi Spark request sequence overflow")?;
-        let (routes, wire) = local.route(layer, rows)?;
         let layout = RouteStaging::new(rows, TOPK, KimiExpertInput::ROW_BYTES)?;
         self.stream.device.run(|| {
             // SAFETY: LocalLane and this engine-retained staging owner survive
@@ -135,7 +134,8 @@ impl<'a> RoutedLane<'a> {
         self.ready.record(&self.stream)?;
         local.ffn(layer, rows)?;
         self.stream.device.run(|| {
-            // SAFETY: this event covers only copies before the shared FFN;
+            // SAFETY: ordered copy fence, not a compute drain; this event
+            // covers only copies before the shared FFN;
             // pinned staging remains exclusively owned until this fence.
             unsafe { self.stream.device.library.cuda_event_synchronize(self.ready.raw) }
         })?;
@@ -230,6 +230,7 @@ mod tests {
             assert_eq!(request.hidden_payload.len(), rows * KimiExpertInput::ROW_BYTES);
             assert!(request.hidden_payload.iter().all(|byte| *byte == 0x71));
             assert_eq!(request.rows.last().unwrap().route_offset, ((rows - 1) * TOPK) as u32);
+            assert_eq!(demand(rows, 1)?.gpu, 1);
             assert_eq!(demand(rows, 1)?.bytes, (6 * rows * 3584 * 2) as u64);
         }
         Ok(())

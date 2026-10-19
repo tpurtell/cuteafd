@@ -41,7 +41,7 @@ pub(crate) struct GoldenArgs {
     #[arg(long, default_value_t = 0)] device: i32,
     #[arg(long, default_value_t = 1)] split_device: i32,
     #[arg(long)] check_headers: bool,
-    /// Complete routed layers on alternating coordinator GPUs (rtx-tp1).
+    /// Routed layers split across both coordinator GPUs (rtx-tp2).
     #[arg(long, default_value_t = 0)] rtx_expert_layers: usize,
     /// Informational F32 comparison only; direct gate/up is the speed-first default.
     #[arg(long, env = "CUTEAFD_KIMI_COMPENSATED_FFN")]
@@ -603,7 +603,7 @@ mod tests {
         let onboard = 5;
         let rtx = admission::plan_rtx(&cfg, &catalog,
             artifacts.join("exl3").join(crate::shared::experts::exl3::package_name("kimik3",
-                catalog.exl3().context("EXL3 manifest")?.decoder_tiers())).join("rtx-tp1"), rows, onboard)?;
+                catalog.exl3().context("EXL3 manifest")?.decoder_tiers())).join("rtx-tp2"), rows, onboard)?;
         let workspace = rtx.workspace;
         let admitted = admission::admit(admission::Inputs { cfg: &cfg, gpus: [GpuBudget {
             capacity_bytes: 96 << 30, headroom_bytes: 2 << 30,

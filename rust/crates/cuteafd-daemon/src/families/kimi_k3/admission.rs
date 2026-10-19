@@ -54,7 +54,7 @@ pub(crate) struct Inputs<'a> {
 /// CPU-planned native residency; no backend owner allocates before solve.
 pub(crate) struct RtxInventory {
     pub package: std::path::PathBuf,
-    pub costs: Vec<Bytes2>,
+    pub costs: Vec<[Bytes2; 2]>,
     pub workspace: usize,
     pub layers: usize,
 }
@@ -64,13 +64,18 @@ pub(crate) fn plan_rtx(cfg: &KimiK3Config, catalog: &cuteafd_loader::OfficialV41
     use crate::shared::experts::{exl3::Exl3Weights, layer::ExpertLayer,
         rtx::{exl3::Exl3Tp2, RtxSelectionPolicy}};
     ensure!(layers > 0 && layers <= cfg.dense.iter().filter(|dense| !**dense).count(),
-        "Kimi whole expert count outside routed inventory");
-    let workspace = Exl3Tp2::whole_workspace_bytes(&package, rows,
-        cuteafd_core::ExpertGeometry::KIMI_K3, RtxSelectionPolicy::FirstCapacity)?;
+        "Kimi TP2 expert count outside routed inventory");
+    let workspace = Exl3Tp2::workspace_bytes_for_selection(&package, cfg.latent, rows,
+        cuteafd_core::Exl3RowPolicy::for_geometry(cuteafd_core::ExpertGeometry::KIMI_K3),
+        RtxSelectionPolicy::FirstCapacity)?;
     let costs = cfg.dense.iter().enumerate().map(|(layer, dense)| {
-        if *dense { return Ok(Bytes2::default()); }
-        let plan = Exl3Weights::plan(catalog, ExpertLayer::BackboneFull { layer })?;
-        Ok(Bytes2 { resident: plan.resident_bytes as u64, staging: plan.device_staging_bytes as u64 })
+        if *dense { return Ok([Bytes2::default(); 2]); }
+        let mut costs = [Bytes2::default(); 2];
+        for (rank, cost) in costs.iter_mut().enumerate() {
+            let plan = Exl3Weights::plan(catalog, ExpertLayer::BackboneTp2 { layer, rank })?;
+            *cost = Bytes2 { resident: plan.resident_bytes as u64, staging: plan.device_staging_bytes as u64 };
+        }
+        Ok(costs)
     }).collect::<Result<Vec<_>>>()?;
     Ok(RtxInventory { package, costs, workspace, layers })
 }
@@ -120,7 +125,7 @@ impl<'a> Admission<'a> {
 
     pub(crate) fn working_set(&self) -> SparkWorkingSet {
         SparkWorkingSet { rtx_layers: self.placement.layers.iter().enumerate()
-            .filter_map(|(layer, assignment)| matches!(assignment.experts, ExpertHome::RtxWhole { .. }).then_some(layer)).collect(), spark_layers: self.placement.layers.iter().enumerate()
+            .filter_map(|(layer, assignment)| (assignment.experts == ExpertHome::RtxTp2).then_some(layer)).collect(), spark_layers: self.placement.layers.iter().enumerate()
             .filter_map(|(layer, assignment)| (assignment.experts == ExpertHome::Spark).then_some(layer)).collect(),
             spark_ranks: 6, prefill_lanes: self.lanes }
     }
@@ -129,23 +134,25 @@ impl<'a> Admission<'a> {
         catalog: &cuteafd_loader::OfficialV41Catalog)
         -> Result<[Option<crate::shared::experts::rtx::exl3::Exl3Tp2Weights<'a>>; 2]> {
         use crate::shared::experts::rtx::{exl3::Exl3Tp2, RtxSelectionPolicy};
-        ensure!(!self.rtx_loaded, "Kimi whole experts already loaded");
+        ensure!(!self.rtx_loaded, "Kimi TP2 experts already loaded");
         self.rtx_loaded = true;
         let mut owners = [None, None];
         let Some(inventory) = &self.rtx else { return Ok(owners); };
+        let layers = self.working_set().rtx_layers;
+        if layers.is_empty() { return Ok(owners); }
+        let mut budgets = [0; 2];
         for rank in 0..2 {
-            let layers = self.placement.layers.iter().enumerate().filter_map(|(layer, assignment)|
-                (assignment.experts == ExpertHome::RtxWhole { gpu: rank as u8 }).then_some(layer)).collect::<Vec<_>>();
-            if layers.is_empty() { continue; }
-            ensure!(devices[rank].id == self.devices[rank], "Kimi whole expert device differs from admission");
-            let charged = usize::try_from(self.placement.expert_ranges[rank].peak_bytes)?;
+            ensure!(devices[rank].id == self.devices[rank], "Kimi TP2 expert device differs from admission");
+            let charged = usize::try_from(self.placement.tp2.as_ref()
+                .context("Kimi missing admitted TP2 arena")?.peak_bytes[rank])?;
             let other_lanes = inventory.workspace.checked_mul(self.lanes as usize - 1)
-                .context("Kimi whole lane workspace overflow")?;
-            owners[rank] = Some(Exl3Tp2::load_whole_weights(devices[rank], catalog,
-                &inventory.package, layers, self.lane_layouts[0][rank].rows(),
-                charged.checked_sub(other_lanes).context("Kimi whole workspace exceeds charge")?,
-                RtxSelectionPolicy::FirstCapacity)?);
+                .context("Kimi TP2 lane workspace overflow")?;
+            budgets[rank] = charged.checked_sub(other_lanes).context("Kimi TP2 workspace exceeds charge")?;
         }
+        let pair = Exl3Tp2::load_pair_weights(devices, catalog, cuteafd_core::ExpertGeometry::KIMI_K3,
+            [&inventory.package, &inventory.package], layers, self.lane_layouts[0][0].rows(),
+            budgets, RtxSelectionPolicy::FirstCapacity)?;
+        owners = pair.map(Some);
         Ok(owners)
     }
 
@@ -158,7 +165,7 @@ impl<'a> Admission<'a> {
         config: cuteafd_transport::TcpTransportConfig) -> Result<super::spark::RoutedLane<'a>> {
         let lane = local.lane_index();
         let expected = self.check_spark(lane)?;
-        ensure!(Rc::ptr_eq(&expected, local.stream()), "Kimi Spark lane differs from admitted entry owner");
+        ensure!(Rc::ptr_eq(&expected, local.stream()), "Kimi Spark lane differs from admitted GPU1 intake owner");
         let routed = super::spark::RoutedLane::connect(library, local, &self.placement, world, peers, config)?;
         self.spark_connected[lane] = true;
         Ok(routed)
@@ -167,7 +174,7 @@ impl<'a> Admission<'a> {
     fn check_spark(&self, lane: usize) -> Result<Rc<Stream<'a>>> {
         ensure!(lane < self.spark_connected.len() && !self.spark_connected[lane],
             "Kimi Spark lane already connected or outside admission");
-        self.lane_readers[lane][0].upgrade().context("Kimi Spark requires admitted entry stream")
+        self.lane_readers[lane][1].upgrade().context("Kimi Spark requires admitted GPU1 intake stream")
     }
 
     /// Stream one packed layer pair at a time after shared admission. Each
@@ -227,7 +234,7 @@ impl<'a> Admission<'a> {
         let global = self.global_owners[rank].upgrade().context("Kimi local binding requires admitted global weights")?;
         let kda = self.kda_owners[rank].upgrade().context("Kimi local binding requires admitted KDA bank")?;
         let mla = self.mla_owners[rank].upgrade().context("Kimi local binding requires admitted MLA bank")?;
-        let binding = LocalLane::new(allocated, programs, self.cfg.clone(), layers, global, lane, kda, mla)?;
+        let binding = LocalLane::new(allocated, programs, self.cfg.clone(), layers, global, lane, rank, kda, mla)?;
         self.local_bound[lane][rank] = true;
         Ok(binding)
     }
@@ -359,14 +366,15 @@ pub(crate) fn admit<'a>(mut inputs: Inputs<'_>) -> Result<Admission<'a>> {
     let rtx = inputs.rtx.take();
     let mut request = request(inputs)?;
     if let Some(inventory) = &rtx {
-        ensure!(inventory.costs.len() == cfg.layers && inventory.layers > 0, "Kimi whole expert inventory extent");
+        ensure!(inventory.costs.len() == cfg.layers && inventory.layers > 0, "Kimi TP2 expert inventory extent");
         for (layer, cost) in request.layers.iter_mut().zip(&inventory.costs) {
-            if let Some(experts) = &mut layer.experts { experts.whole = *cost; }
+            if let Some(experts) = &mut layer.experts { experts.half = *cost; experts.tp2 = true; }
         }
-        request.expert_workspace = (inventory.workspace as u64).checked_mul(lanes).context("Kimi whole workspace overflow")?;
+        let workspace = (inventory.workspace as u64).checked_mul(lanes).context("Kimi TP2 workspace overflow")?;
+        request.tp2_workspace = [workspace; 2];
         request.onboard = Onboard::Layers(inventory.layers);
         request.expert_gpus = 2;
-        request.policy.expert_ownership = ExpertOwnership::AlternatingWhole;
+        request.policy.expert_ownership = ExpertOwnership::Contiguous;
     }
     let (placement, mark_selection) = solve_with_marks(&request, legacy_marks as u64, 1, &mark_demands)?;
     let kda_layout = KdaLayout::new(cfg, state_slots, usize::try_from(mark_selection.slots)?, lanes as usize)?;
@@ -506,7 +514,7 @@ fn request(i: Inputs<'_>) -> Result<PlacementRequest> {
             weights: ModeBytes { whole, split: split_attention },
             kv_unit: KvDemand { unit_bytes_whole: unit, unit_bytes_split: [unit; 2], unit_bytes_context: None },
             fixed_bytes: ModeBytes::default(), extra: vec![], context_indexer: false, colocate: None,
-            // admit() installs the checkpoint's whole-expert costs before solve.
+            // admit() installs the checkpoint's TP2 rank-slice costs before solve.
             experts: (!cfg.dense[layer]).then_some(ExpertCost { whole: Bytes2::default(),
                 half: [Bytes2::default(); 2], tp2: false, spark_ok: true }),
             modes: if mla { MODES.to_vec() } else { vec![LayerMode::HeadSplit] } });
@@ -551,20 +559,19 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn whole_experts_are_admitted_alternately_and_removed_from_spark_selection() -> Result<()> {
+    fn tp2_rank_slices_are_admitted_on_both_gpus_and_removed_from_spark_selection() -> Result<()> {
         let cfg = cfg();
         let mut i = inputs(&cfg);
-        i.rtx = Some(RtxInventory { package: "not-loaded".into(), costs: vec![Bytes2 {
-            resident: 1024 * 1024, staging: 4096 }; cfg.layers], workspace: 8192, layers: 3 });
+        i.rtx = Some(RtxInventory { package: "not-loaded".into(), costs: vec![[Bytes2 {
+            resident: 1024 * 1024, staging: 4096 }; 2]; cfg.layers], workspace: 8192, layers: 3 });
         let admitted = admit(i)?;
         let local = admitted.working_set();
         assert_eq!(local.rtx_layers, [1, 2, 3]);
         assert_eq!(local.spark_layers, [4]);
-        assert_eq!(admitted.placement.layers[1].experts, ExpertHome::RtxWhole { gpu: 0 });
-        assert_eq!(admitted.placement.layers[2].experts, ExpertHome::RtxWhole { gpu: 1 });
-        assert_eq!(admitted.placement.layers[3].experts, ExpertHome::RtxWhole { gpu: 0 });
-        assert_eq!(admitted.placement.expert_ranges[0].peak_bytes, 2 * 1024 * 1024 + 2 * 8192 + 4096);
-        assert_eq!(admitted.placement.expert_ranges[1].peak_bytes, 1024 * 1024 + 2 * 8192 + 4096);
+        for layer in 1..=3 { assert_eq!(admitted.placement.layers[layer].experts, ExpertHome::RtxTp2); }
+        for rank in 0..2 {
+            assert_eq!(admitted.placement.tp2.as_ref().unwrap().peak_bytes[rank], 3 * 1024 * 1024 + 2 * 8192 + 4096);
+        }
         Ok(())
     }
 
@@ -730,9 +737,9 @@ pub(super) mod tests {
         let mut admitted = admit(inputs(&cfg))?;
         assert!(admitted.check_spark(admitted.spark_connected.len()).is_err());
         for lane in 0..admitted.spark_connected.len() {
-            assert!(admitted.lane_readers[lane][0].upgrade().is_none());
+            assert!(admitted.lane_readers[lane][1].upgrade().is_none());
             let missing = admitted.check_spark(lane).err().unwrap().to_string();
-            assert!(missing.contains("requires admitted entry stream"));
+            assert!(missing.contains("requires admitted GPU1 intake stream"));
             admitted.spark_connected[lane] = true;
             let duplicate = admitted.check_spark(lane).err().unwrap().to_string();
             assert!(duplicate.contains("already connected"));
@@ -858,12 +865,12 @@ pub(super) mod tests {
         let admitted = admit(i)?;
         for lane in 0..lanes {
             let demand = super::super::spark::demand(rows, lane)?;
-            let items = admitted.placement.items[0].iter().filter(|item| item.group == demand.group).collect::<Vec<_>>();
+            let items = admitted.placement.items[1].iter().filter(|item| item.group == demand.group).collect::<Vec<_>>();
             assert_eq!(items.len(), 1);
             assert_eq!(items[0].bytes, (6 * rows * 3584 * 2) as u64);
             assert_eq!(items[0].basis, Basis::Exact);
             assert_eq!(items[0].category, Category::Workspace);
-            assert!(!admitted.placement.items[1].iter().any(|item| item.group == demand.group));
+            assert!(!admitted.placement.items[0].iter().any(|item| item.group == demand.group));
         }
         let mut duplicate = inputs(&cfg);
         duplicate.fixed.push(super::super::spark::demand(rows, 0)?);

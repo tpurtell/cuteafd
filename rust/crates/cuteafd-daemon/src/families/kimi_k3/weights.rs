@@ -9,6 +9,12 @@ use cuteafd_loader::{families::kimi_k3::{config::{KimiAttention, KimiK3Config}, 
     w8::{self, ResidualWeightSite}}, kda::{KdaOperand, KdaTensor}, placement::{Demand, LayerMode}, LoadedTensor};
 use std::{collections::BTreeMap, os::unix::fs::FileExt};
 
+/// One canonical front end per routed ordinal, independent of attention placement.
+pub(crate) fn routed_owner(cfg: &KimiK3Config, layer: usize) -> Result<usize> {
+    ensure!(cfg.dense.get(layer) == Some(&false), "Kimi front end requires a routed layer");
+    Ok(cfg.dense[..layer].iter().filter(|&&dense| !dense).count() % 2)
+}
+
 /// Reads only the coordinator's header-selected tensors through the standard
 /// checkpoint inventory. Routed payloads remain on the Spark loading path.
 pub(crate) fn read_tensor(checkpoint: &cuteafd_loader::plan::Checkpoint, name: &str) -> Result<LoadedTensor> {
@@ -146,12 +152,12 @@ impl LayerLayout {
         let local = intermediate / 2;
         let sum = |a: usize, b: usize| a.checked_add(b).context("Kimi weight extent overflow");
         let mut pair = std::array::from_fn(|rank| Self { operands: BTreeMap::new(), attention: shares[rank] });
-        for rank in &mut pair {
+        for (index, rank) in pair.iter_mut().enumerate() {
             for name in ["attention.score", "ffn.score"] { rank.insert(name, &[cfg.hidden, 4])?; }
             for name in ["attention.norm", "ffn.norm"] { rank.insert(name, &[cfg.hidden, 2])?; }
             rank.insert("ffn.gate_up", &[2, local, cfg.hidden, 2])?;
             rank.insert("ffn.down", &[cfg.hidden, local, 2])?;
-            if !cfg.dense[layer] {
+            if !cfg.dense[layer] && index == routed_owner(cfg, layer)? {
                 for name in ["latent.down", "latent.up"] { rank.insert(name, &[cfg.latent, cfg.hidden, 2])?; }
                 rank.insert("latent.norm", &[cfg.latent, 2])?;
                 rank.insert("router.weight", &[cfg.experts, cfg.hidden, 2])?;
@@ -264,11 +270,10 @@ impl PackedLayer {
             let bias = read(&format!("{base}.e_score_correction_bias"))?;
             check(&router, DType::Bf16, &[cfg.experts, cfg.hidden])?;
             check(&bias, DType::F32, &[cfg.experts])?;
-            for rank in &mut pair {
-                for (name, bytes) in [("latent.down", &latent.down.bytes), ("latent.norm", &latent.norm.bytes),
-                    ("latent.up", &latent.up.bytes), ("router.weight", &router.bytes), ("router.bias", &bias.bytes)] {
-                    rank.operands.insert(name, bytes.clone());
-                }
+            let rank = &mut pair[routed_owner(cfg, layer)?];
+            for (name, bytes) in [("latent.down", latent.down.bytes), ("latent.norm", latent.norm.bytes),
+                ("latent.up", latent.up.bytes), ("router.weight", router.bytes), ("router.bias", bias.bytes)] {
+                rank.operands.insert(name, bytes);
             }
         }
         match kind {
@@ -491,7 +496,33 @@ mod tests {
     }
 
     #[test]
-    fn owned_mla_omits_nonowner_attention_but_retains_tp_ffn_and_replicated_moe() -> Result<()> {
+    fn routed_frontends_follow_routed_ordinal_not_attention_or_dense_gaps() -> Result<()> {
+        let mut cfg = cfg();
+        cfg.layers = 7;
+        cfg.attention = vec![KimiAttention::Mla; 7];
+        cfg.dense = vec![true, false, true, false, false, true, false];
+        for (layer, owner) in [(1, 0), (3, 1), (4, 0), (6, 1)] {
+            assert_eq!(routed_owner(&cfg, layer)?, owner);
+            for mode in [LayerMode::HeadSplit,
+                LayerMode::Whole { gpu: 0, ffn: FfnMode::Split },
+                LayerMode::Whole { gpu: 1, ffn: FfnMode::Split }] {
+                let layouts = LayerLayout::pair(&cfg, layer, mode)?;
+                let packed = PackedLayer::pair(&cfg, layer, mode, tensor)?;
+                for rank in 0..2 {
+                    layouts[rank].check(&packed[rank])?;
+                    for key in ["router.weight", "router.bias", "latent.down", "latent.norm", "latent.up"] {
+                        assert_eq!(packed[rank].operands.contains_key(key), rank == owner);
+                        assert_eq!(layouts[rank].operands.contains_key(key), rank == owner);
+                    }
+                }
+            }
+        }
+        for layer in [0, 2, 5, 7, usize::MAX] { assert!(routed_owner(&cfg, layer).is_err()); }
+        Ok(())
+    }
+
+    #[test]
+    fn owned_mla_keeps_tp_ffn_and_only_one_canonical_moe_frontend() -> Result<()> {
         let cfg = cfg();
         for owner in 0..2 {
             let pair = PackedLayer::pair(&cfg, 3, LayerMode::Whole { gpu: owner, ffn: FfnMode::Split }, tensor)?;
@@ -502,9 +533,13 @@ mod tests {
             assert!(!absent.operands.keys().any(|key| key.starts_with("mla.")));
             assert_eq!(full.operands["mla.q_b"].len(), 12 * 3 * 2);
             assert_eq!(full.operands["mla.uk"].len(), 4 * 2 * 2 * 2);
-            for key in ["ffn.gate_up", "ffn.down", "attention.score", "ffn.norm", "router.weight", "router.bias",
-                "latent.down", "latent.norm", "latent.up"] {
+            for key in ["ffn.gate_up", "ffn.down", "attention.score", "ffn.norm"] {
                 assert_eq!(full.operands[key], absent.operands[key]);
+            }
+            let frontend = routed_owner(&cfg, 3)?;
+            for key in ["router.weight", "router.bias", "latent.down", "latent.norm", "latent.up"] {
+                assert!(pair[frontend].operands.contains_key(key));
+                assert!(!pair[1 - frontend].operands.contains_key(key));
             }
             assert_eq!(absent.operands["attention.score"].len(), 4 * 4);
             assert_eq!(absent.operands["ffn.gate_up"].len(), 2 * 4 * 4 * 2);
