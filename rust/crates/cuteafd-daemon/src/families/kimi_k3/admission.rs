@@ -1,7 +1,7 @@
 //! Native coordinator inventory passed to the shared startup solver, before
 //! weights, recurrent state or cache owners allocate. This is not the header
 //! lower bound exposed by `plan` and does not admit Spark workers by itself.
-use super::{device::{Lane, LaneLayout}, mla::{CacheBank, CacheLayout}, state::{KdaBank, KdaLayout}, weights::{LayerLayout, LayerWeights, PackedLayer}};
+use super::{device::{Lane, LaneLayout}, mla::{CacheBank, CacheLayout}, state::{KdaBank, KdaLayout}, weights::{GlobalLayout, GlobalWeights, PackedGlobal, LayerLayout, LayerWeights, PackedLayer}};
 use crate::shared::memory::device::{Device, Stream};
 use std::rc::{Rc, Weak};
 use anyhow::{ensure, Context, Result};
@@ -48,6 +48,8 @@ pub(crate) struct Admission<'a> {
     kda_allocated: [bool; 2],
     mla_layouts: [CacheLayout; 2],
     mla_allocated: [bool; 2],
+    global_layouts: [GlobalLayout; 2],
+    global_uploaded: [bool; 2],
 }
 
 /// The normal Spark lane consumes these selected layer IDs; selection still
@@ -67,6 +69,29 @@ impl<'a> Admission<'a> {
         ensure!(device.id == self.devices[rank], "Kimi upload device differs from admitted rank");
         let layout = &self.layouts.get(layer).context("Kimi upload layer outside admission")?[rank];
         LayerWeights::upload(device, packed, layout, layout.bytes()?)
+    }
+
+    pub(crate) fn upload_global(&mut self, device: Device<'a>, rank: usize, packed: PackedGlobal) -> Result<GlobalWeights<'a>> {
+        let layout = self.check_global(rank, device.id)?;
+        let weights = layout.upload(device, packed)?;
+        self.global_uploaded[rank] = true;
+        Ok(weights)
+    }
+
+    pub(crate) fn global_layout(&self, rank: usize) -> Result<&GlobalLayout> {
+        self.global_layouts.get(rank).context("Kimi global rank outside TP2")
+    }
+
+    fn check_global(&self, rank: usize, device: i32) -> Result<&GlobalLayout> {
+        ensure!(rank < 2 && device == self.devices[rank], "Kimi global upload differs from admitted device");
+        ensure!(!self.global_uploaded[rank], "Kimi global weights already uploaded");
+        let layout = &self.global_layouts[rank];
+        let demand = layout.demand()?;
+        let charges = self.placement.items[rank].iter().filter(|item| item.group == demand.group).collect::<Vec<_>>();
+        ensure!(charges.len() == 1 && charges[0].category == demand.category
+            && charges[0].basis == Basis::Exact && charges[0].bytes == demand.bytes,
+            "Kimi global allocation differs from accepted native weight charge");
+        Ok(layout)
     }
 
     pub(crate) fn allocate_lane(&mut self, device: Device<'a>, rank: usize, lane: usize) -> Result<Lane<'a>> {
@@ -139,6 +164,7 @@ pub(crate) fn admit<'a>(inputs: Inputs<'_>) -> Result<Admission<'a>> {
     let lanes = inputs.lanes as u64;
     let lane_layouts = inputs.lane_layouts.clone();
     let kda_layout = KdaLayout::new(cfg, inputs.state_slots, inputs.prefix_marks, inputs.lanes)?;
+    let global_layouts = GlobalLayout::pair(cfg)?;
     let request = request(inputs)?;
     let placement = solve(&request)?;
     EXECUTOR.check(&placement)?;
@@ -156,10 +182,12 @@ pub(crate) fn admit<'a>(inputs: Inputs<'_>) -> Result<Admission<'a>> {
     let lane_readers = (0..lane_layouts.len()).map(|_| std::array::from_fn(|_| Weak::new())).collect();
     let mla_layouts = [CacheLayout::new(cfg, &placement, 0)?, CacheLayout::new(cfg, &placement, 1)?];
     let admission = Admission { placement, layouts, devices, lanes, lane_layouts, lane_allocated, lane_readers,
-        kda_layout, kda_allocated: [false; 2], mla_layouts, mla_allocated: [false; 2] };
+        kda_layout, kda_allocated: [false; 2], mla_layouts, mla_allocated: [false; 2],
+        global_layouts, global_uploaded: [false; 2] };
     for rank in 0..2 {
         admission.check_kda(rank, devices[rank])?;
         admission.check_mla(rank, devices[rank])?;
+        admission.check_global(rank, devices[rank])?;
     }
     Ok(admission)
 }
@@ -186,6 +214,12 @@ fn request(i: Inputs<'_>) -> Result<PlacementRequest> {
     ensure!(i.lane_layouts.len() == i.lanes && i.lane_layouts.iter().flatten().all(|layout| layout.rows() == i.rows),
         "Kimi lane operand layouts differ from executor geometry");
     let mut fixed = i.fixed;
+    for layout in GlobalLayout::pair(cfg)? {
+        let demand = layout.demand()?;
+        ensure!(!fixed.iter().chain(&i.startup).any(|item| item.gpu == demand.gpu && item.group == demand.group),
+            "Kimi global weight charge supplied twice");
+        fixed.push(demand);
+    }
     for (lane, pair) in i.lane_layouts.iter().enumerate() {
         for (rank, layout) in pair.iter().enumerate() {
             let demand = layout.demand(rank as u8, lane)?;
@@ -375,6 +409,36 @@ mod tests {
             }
             assert!(admitted.check_mla(0, 0).is_err(), "case {case}");
         }
+        Ok(())
+    }
+
+    #[test]
+    fn global_weight_admission_rejects_duplicate_and_altered_inventory() -> Result<()> {
+        let cfg = cfg();
+        let mut admitted = admit(inputs(&cfg))?;
+        assert_eq!(admitted.global_layout(0)?.bytes()?, cfg.vocab_size * cfg.hidden * 2);
+        assert_eq!(admitted.global_layout(1)?.bytes()?, cfg.vocab_size * cfg.hidden * 2 + cfg.hidden * 6);
+        admitted.check_global(0, 0)?;
+        admitted.check_global(1, 1)?;
+        assert!(admitted.check_global(2, 0).is_err());
+        assert!(admitted.check_global(0, 1).is_err());
+        admitted.global_uploaded[0] = true;
+        assert!(admitted.check_global(0, 0).is_err());
+        for case in 0..5 {
+            let mut admitted = admit(inputs(&cfg))?;
+            let charge = admitted.placement.items[1].iter_mut().find(|item| item.group == "Kimi global weights").unwrap();
+            match case {
+                0 => charge.bytes -= 1,
+                1 => charge.category = Category::Workspace,
+                2 => charge.basis = Basis::Formula,
+                3 => { let duplicate = charge.clone(); admitted.placement.items[1].push(duplicate); }
+                _ => admitted.placement.items[1].retain(|item| item.group != "Kimi global weights"),
+            }
+            assert!(admitted.check_global(1, 1).is_err(), "case {case}");
+        }
+        let mut i = inputs(&cfg);
+        i.fixed.push(GlobalLayout::pair(&cfg)?[0].demand()?);
+        assert!(admit(i).is_err());
         Ok(())
     }
 

@@ -3,11 +3,93 @@
 //! placement admission and an exact comparison with that layer's charged bytes.
 use crate::shared::{memory::device::{Allocation, Device}, placement::layers::AttentionShare};
 use anyhow::{ensure, Context, Result};
-use cuteafd_core::DType;
+use cuteafd_core::{DType, memory_layout::{Basis, Category}};
 use cuteafd_ffi::{CuteafdDeviceBuffer, KimiKdaWeights, KimiMlaWeights};
 use cuteafd_loader::{families::kimi_k3::{config::{KimiAttention, KimiK3Config}, kda, mla::{self, MlaOperand},
-    w8::{self, ResidualWeightSite}}, kda::{KdaOperand, KdaTensor}, placement::LayerMode, LoadedTensor};
+    w8::{self, ResidualWeightSite}}, kda::{KdaOperand, KdaTensor}, placement::{Demand, LayerMode}, LoadedTensor};
 use std::collections::BTreeMap;
+
+/// Global tensors follow the shared entry/head ranks: one embedding on rank 0,
+/// one untied full vocabulary head and output mix/norm on rank 1.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GlobalLayout {
+    rank: usize,
+    hidden: usize,
+    vocab: usize,
+    operands: BTreeMap<&'static str, usize>,
+}
+
+impl GlobalLayout {
+    pub(crate) fn pair(cfg: &KimiK3Config) -> Result<[Self; 2]> {
+        ensure!(!cfg.tie_embeddings, "Kimi global weights require the checkpoint's untied head");
+        let matrix = extent(&[cfg.vocab_size, cfg.hidden, 2])?;
+        Ok([Self { rank: 0, hidden: cfg.hidden, vocab: cfg.vocab_size,
+                operands: BTreeMap::from([("embedding", matrix)]) },
+            Self { rank: 1, hidden: cfg.hidden, vocab: cfg.vocab_size,
+                operands: BTreeMap::from([("head", matrix), ("output.score", extent(&[cfg.hidden, 4])?),
+                    ("output.norm", extent(&[cfg.hidden, 2])?)]) }])
+    }
+
+    pub(crate) fn bytes(&self) -> Result<usize> {
+        self.operands.values().try_fold(0usize, |sum, bytes| sum.checked_add(*bytes)
+            .context("Kimi global weight extent overflow"))
+    }
+
+    pub(crate) fn demand(&self) -> Result<Demand> {
+        Ok(Demand::new(self.rank as u8, Category::Weights, "Kimi global weights", self.bytes()? as u64, Basis::Exact))
+    }
+
+    pub(crate) fn pack(&self, cfg: &KimiK3Config, mut read: impl FnMut(&str) -> Result<LoadedTensor>) -> Result<PackedGlobal> {
+        ensure!(Self::pair(cfg)?[self.rank] == *self, "Kimi global packing differs from admitted geometry");
+        let name = if self.rank == 0 { "language_model.model.embed_tokens.weight" } else { "language_model.lm_head.weight" };
+        let tensor = read(name)?;
+        check(&tensor, DType::Bf16, &[self.vocab, self.hidden])?;
+        let mut operands = BTreeMap::from([(if self.rank == 0 { "embedding" } else { "head" }, tensor.bytes)]);
+        if self.rank == 1 {
+            let output = w8::load_residual(cfg, ResidualWeightSite::Output, &mut read)?;
+            operands.insert("output.score", output.score);
+            operands.insert("output.norm", output.norm.bytes);
+        }
+        let packed = PackedGlobal { rank: self.rank, operands };
+        self.check(&packed)?;
+        Ok(packed)
+    }
+
+    fn check(&self, packed: &PackedGlobal) -> Result<()> {
+        ensure!(packed.rank == self.rank && packed.operands.len() == self.operands.len()
+            && self.operands.iter().all(|(name, bytes)| packed.operands.get(name).is_some_and(|data| data.len() == *bytes)),
+            "Kimi packed global operands differ from admission");
+        Ok(())
+    }
+
+    pub(super) fn upload<'a>(&self, device: Device<'a>, packed: PackedGlobal) -> Result<GlobalWeights<'a>> {
+        self.check(&packed)?;
+        let operands = packed.operands.into_iter().map(|(name, bytes)| {
+            let _scope = cuteafd_ffi::memory_ledger::scope("weights/kimi global weights");
+            let allocation = Allocation::new(device, bytes.len())?;
+            ensure!(allocation.buffer.bytes == bytes.len() && allocation.buffer.device_id == device.id,
+                "Kimi global allocation differs from admitted extent/device");
+            device.run(|| device.library.copy_h2d(allocation.buffer, &bytes))?;
+            Ok((name, allocation))
+        }).collect::<Result<_>>()?;
+        Ok(GlobalWeights { operands })
+    }
+}
+
+pub(crate) struct PackedGlobal {
+    rank: usize,
+    operands: BTreeMap<&'static str, Vec<u8>>,
+}
+
+pub(crate) struct GlobalWeights<'a> {
+    operands: BTreeMap<&'static str, Allocation<'a>>,
+}
+
+impl GlobalWeights<'_> {
+    pub(crate) fn buffer(&self, name: &str) -> Result<CuteafdDeviceBuffer> {
+        Ok(self.operands.get(name).with_context(|| format!("Kimi global operand {name} absent on this rank"))?.buffer)
+    }
+}
 
 /// Exact resident operand extents, computed without reading tensor payloads.
 /// Shared startup admission charges these bytes; packing independently checks
@@ -278,6 +360,75 @@ mod tests {
             byte_offset: 0, byte_length: bytes.len() as u64, role: TensorRole::Other, layer_id: None,
             expert_id: None, is_quantization_metadata: false }, source_path: "test".into(), bytes,
             elapsed_micros: 0, sha256: String::new() })
+    }
+
+    #[test]
+    fn global_native_extents_follow_entry_and_terminal_without_extra_copies() -> Result<()> {
+        let mut cfg = cfg();
+        cfg.vocab_size = 8;
+        let pair = GlobalLayout::pair(&cfg)?;
+        assert_eq!(pair[0].operands, BTreeMap::from([("embedding", 64)]));
+        assert_eq!(pair[1].operands, BTreeMap::from([("head", 64), ("output.score", 16), ("output.norm", 8)]));
+        let mut names = Vec::new();
+        for (rank, layout) in pair.iter().enumerate() {
+            let packed = layout.pack(&cfg, |name| {
+                names.push(name.to_string());
+                let mut value = tensor(name)?;
+                if name.ends_with("embed_tokens.weight") || name.ends_with("lm_head.weight") {
+                    value.info.shape = vec![8, 4];
+                    value.bytes = std::iter::repeat_n(0x3f80u16, 32).flat_map(u16::to_le_bytes).collect();
+                    value.info.byte_length = value.bytes.len() as u64;
+                }
+                Ok(value)
+            })?;
+            layout.check(&packed)?;
+            assert_eq!(layout.bytes()?, packed.operands.values().map(Vec::len).sum::<usize>());
+            let demand = layout.demand()?;
+            assert_eq!(demand.gpu, rank as u8);
+            assert_eq!(demand.category, Category::Weights);
+            assert_eq!(demand.basis, Basis::Exact);
+            assert_eq!(demand.bytes, layout.bytes()? as u64);
+            if rank == 1 {
+                let scores = packed.operands["output.score"].chunks_exact(4)
+                    .map(|bytes| f32::from_le_bytes(bytes.try_into().unwrap())).collect::<Vec<_>>();
+                assert_eq!(scores, vec![1.; 4]);
+            }
+            assert!(pair[1 - rank].check(&packed).is_err());
+        }
+        assert_eq!(names, ["language_model.model.embed_tokens.weight", "language_model.lm_head.weight",
+            "language_model.model.output_attn_res_norm.weight", "language_model.model.output_attn_res_proj.weight",
+            "language_model.model.norm.weight"]);
+        for invalid in 0..3 {
+            let mut broken = cfg.clone();
+            match invalid { 0 => broken.tie_embeddings = true, 1 => broken.hidden = usize::MAX, _ => broken.vocab_size = 0 }
+            assert!(GlobalLayout::pair(&broken).is_err());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn global_packing_rejects_bad_native_operands_even_with_equal_total_bytes() -> Result<()> {
+        let mut cfg = cfg();
+        cfg.vocab_size = 1;
+        let pair = GlobalLayout::pair(&cfg)?;
+        for case in 0..3 {
+            assert!(pair[0].pack(&cfg, |name| {
+                let mut value = tensor(name)?;
+                value.info.shape = vec![1, 4];
+                match case { 0 => value.info.dtype = DType::F32, 1 => value.info.shape = vec![4, 1], _ => { value.bytes.pop(); } }
+                Ok(value)
+            }).is_err());
+        }
+        let mut packed = pair[1].pack(&cfg, |name| {
+            let mut value = tensor(name)?;
+            if name.ends_with("lm_head.weight") { value.info.shape = vec![1, 4]; }
+            Ok(value)
+        })?;
+        packed.operands.get_mut("head").unwrap().pop();
+        packed.operands.get_mut("output.norm").unwrap().push(0);
+        assert_eq!(pair[1].bytes()?, packed.operands.values().map(Vec::len).sum::<usize>());
+        assert!(pair[1].check(&packed).is_err());
+        Ok(())
     }
 
     #[test]
