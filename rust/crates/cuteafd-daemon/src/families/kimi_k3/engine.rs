@@ -18,6 +18,7 @@ struct Lanes<'a> {
 pub(crate) struct Engine<'a> {
     execution: Execution<'a>,
     lanes: RefCell<Lanes<'a>>,
+    prefix: RefCell<Option<super::prefix::KimiPrefix<'a>>>,
     hops: HopLink<'a>,
     peer: PeerExchange<'a>,
     // PeerExchange and HopLink borrow raw handles; keep their exact streams
@@ -175,7 +176,19 @@ impl<'a> Engine<'a> {
         }
         let streams = local.iter().map(|pair| pair.each_ref().map(|local| local.stream().clone())).collect();
         let execution = Execution::new(plan, &peer, &hops, streams)?;
-        Ok(Self { execution, lanes: RefCell::new(Lanes { local, routed, io, experts }), hops, peer, exchange_streams })
+        Ok(Self { execution, lanes: RefCell::new(Lanes { local, routed, io, experts }),
+            prefix: RefCell::new(None), hops, peer, exchange_streams })
+    }
+
+    pub(crate) fn prefix_family(&self) -> Result<super::prefix::KimiPrefix<'a>> {
+        let mut prefix = self.prefix.try_borrow_mut()?;
+        if let Some(prefix) = prefix.as_ref() { return Ok(prefix.clone()); }
+        let lanes = self.lanes.try_borrow()?;
+        let [(kda0, mla0), (kda1, mla1)] = lanes.local[0].each_ref().map(|lane| lane.prefix_banks());
+        let family = super::prefix::KimiPrefix::new(lanes.local[0][0].config(), lanes.local[0][0].max_context(),
+            [kda0, kda1], [mla0, mla1])?;
+        *prefix = Some(family.clone());
+        Ok(family)
     }
 
     fn shutdown(&self) -> Result<()> {
