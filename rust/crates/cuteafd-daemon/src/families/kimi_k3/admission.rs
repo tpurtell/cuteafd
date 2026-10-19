@@ -1,11 +1,12 @@
 //! Native coordinator inventory passed to the shared startup solver, before
 //! weights, recurrent state or cache owners allocate. This is not the header
 //! lower bound exposed by `plan` and does not admit Spark workers by itself.
-use super::{device::{Lane, LaneLayout}, weights::{LayerLayout, LayerWeights, PackedLayer}};
-use crate::shared::memory::device::Device;
+use super::{device::{Lane, LaneLayout}, state::{KdaBank, KdaLayout}, weights::{LayerLayout, LayerWeights, PackedLayer}};
+use crate::shared::memory::device::{Device, Stream};
+use std::rc::{Rc, Weak};
 use anyhow::{ensure, Context, Result};
 use cuteafd_core::memory_layout::{Basis, Category};
-use cuteafd_ffi::{KimiKda, MLA_PAGE_ROWS, MLA_RECORD_BYTES};
+use cuteafd_ffi::{MLA_PAGE_ROWS, MLA_RECORD_BYTES};
 use cuteafd_loader::{families::kimi_k3::config::{KimiAttention, KimiK3Config}, placement::*};
 
 const MODES: &[LayerMode] = &[LayerMode::HeadSplit,
@@ -35,18 +36,21 @@ pub(crate) struct Inputs<'a> {
     pub pool_bounded: Vec<BoundedDemand>,
 }
 
-pub(crate) struct Admission {
+pub(crate) struct Admission<'a> {
     pub placement: Placement,
     layouts: Vec<[LayerLayout; 2]>,
     devices: [i32; 2],
     lanes: u64,
     lane_layouts: Vec<[LaneLayout; 2]>,
     lane_allocated: Vec<[bool; 2]>,
+    lane_readers: Vec<[Weak<Stream<'a>>; 2]>,
+    kda_layout: KdaLayout,
+    kda_allocated: [bool; 2],
 }
 
 /// The normal Spark lane consumes these selected layer IDs; selection still
 /// goes through shared `SparkAdmission` before any transport connects.
-impl Admission {
+impl<'a> Admission<'a> {
     pub(crate) fn working_set(&self) -> SparkWorkingSet {
         SparkWorkingSet { rtx_layers: vec![], spark_layers: self.placement.layers.iter().enumerate()
             .filter_map(|(layer, assignment)| (assignment.experts == ExpertHome::Spark).then_some(layer)).collect(),
@@ -55,7 +59,7 @@ impl Admission {
 
     /// No caller-supplied byte count: upload uses the immutable native layout
     /// reconciled against the shared solver's accepted weight ledger.
-    pub(crate) fn upload<'a>(&self, device: Device<'a>, rank: usize, layer: usize,
+    pub(crate) fn upload(&self, device: Device<'a>, rank: usize, layer: usize,
         packed: PackedLayer) -> Result<LayerWeights<'a>> {
         ensure!(rank < 2, "Kimi upload rank outside TP2");
         ensure!(device.id == self.devices[rank], "Kimi upload device differs from admitted rank");
@@ -63,11 +67,33 @@ impl Admission {
         LayerWeights::upload(device, packed, layout, layout.bytes()?)
     }
 
-    pub(crate) fn allocate_lane<'a>(&mut self, device: Device<'a>, rank: usize, lane: usize) -> Result<Lane<'a>> {
+    pub(crate) fn allocate_lane(&mut self, device: Device<'a>, rank: usize, lane: usize) -> Result<Lane<'a>> {
         let layout = self.check_lane(rank, lane, device.id)?;
         let allocated = layout.allocate(device)?;
+        self.lane_readers[lane][rank] = Rc::downgrade(&allocated.stream);
         self.lane_allocated[lane][rank] = true;
         Ok(allocated)
+    }
+
+    pub(crate) fn allocate_kda(&mut self, device: Device<'a>, rank: usize) -> Result<KdaBank<'a>> {
+        self.check_kda(rank, device.id)?;
+        let readers = self.lane_readers.iter().map(|pair| pair[rank].upgrade()
+            .context("Kimi KDA requires live admitted lane streams")).collect::<Result<Vec<_>>>()?;
+        let bank = self.kda_layout.allocate(device, readers)?;
+        self.kda_allocated[rank] = true;
+        Ok(bank)
+    }
+
+    fn check_kda(&self, rank: usize, device: i32) -> Result<()> {
+        ensure!(rank < 2 && device == self.devices[rank], "Kimi KDA allocation differs from admitted device");
+        ensure!(!self.kda_allocated[rank], "Kimi KDA bank already allocated");
+        for demand in self.kda_layout.demands(rank as u8)? {
+            let charges = self.placement.items[rank].iter().filter(|item| item.group == demand.group).collect::<Vec<_>>();
+            ensure!(charges.len() == 1 && charges[0].category == demand.category
+                && charges[0].basis == Basis::Exact && charges[0].bytes == demand.bytes,
+                "Kimi KDA allocation differs from accepted native pool charge");
+        }
+        Ok(())
     }
 
     fn check_lane(&self, rank: usize, lane: usize, device: i32) -> Result<&LaneLayout> {
@@ -84,11 +110,12 @@ impl Admission {
     }
 }
 
-pub(crate) fn admit(inputs: Inputs<'_>) -> Result<Admission> {
+pub(crate) fn admit<'a>(inputs: Inputs<'_>) -> Result<Admission<'a>> {
     let cfg = inputs.cfg;
     let devices = inputs.devices;
     let lanes = inputs.lanes as u64;
     let lane_layouts = inputs.lane_layouts.clone();
+    let kda_layout = KdaLayout::new(cfg, inputs.state_slots, inputs.prefix_marks, inputs.lanes)?;
     let request = request(inputs)?;
     let placement = solve(&request)?;
     EXECUTOR.check(&placement)?;
@@ -103,7 +130,11 @@ pub(crate) fn admit(inputs: Inputs<'_>) -> Result<Admission> {
         ensure!(native == charged, "Kimi rank {rank} native weights differ from shared admission: {native} != {charged}");
     }
     let lane_allocated = vec![[false; 2]; lane_layouts.len()];
-    Ok(Admission { placement, layouts, devices, lanes, lane_layouts, lane_allocated })
+    let lane_readers = (0..lane_layouts.len()).map(|_| std::array::from_fn(|_| Weak::new())).collect();
+    let admission = Admission { placement, layouts, devices, lanes, lane_layouts, lane_allocated, lane_readers,
+        kda_layout, kda_allocated: [false; 2] };
+    for rank in 0..2 { admission.check_kda(rank, devices[rank])?; }
+    Ok(admission)
 }
 
 fn request(i: Inputs<'_>) -> Result<PlacementRequest> {
@@ -136,10 +167,14 @@ fn request(i: Inputs<'_>) -> Result<PlacementRequest> {
             fixed.push(demand);
         }
     }
-    let state = KimiKda::state_bytes(i.state_slots)?.checked_add(KimiKda::conv_state_bytes(i.state_slots)?)
-        .context("Kimi state extent overflow")? as u64;
-    let mark = KimiKda::state_bytes(1)?.checked_add(KimiKda::conv_state_bytes(1)?)
-        .and_then(|n| n.checked_mul(i.prefix_marks)).context("Kimi prefix extent overflow")? as u64;
+    let kda = KdaLayout::new(cfg, i.state_slots, i.prefix_marks, i.lanes)?;
+    for rank in 0..2 {
+        for demand in kda.demands(rank)? {
+            ensure!(!fixed.iter().chain(&i.startup).any(|item| item.gpu == demand.gpu && item.group == demand.group),
+                "Kimi KDA pool charge supplied twice");
+            fixed.push(demand);
+        }
+    }
     let mut layers = Vec::with_capacity(cfg.layers);
     for layer in 0..cfg.layers {
         let split = LayerLayout::pair(cfg, layer, LayerMode::HeadSplit)?;
@@ -155,19 +190,11 @@ fn request(i: Inputs<'_>) -> Result<PlacementRequest> {
         }
         let mla = cfg.attention[layer] == KimiAttention::Mla;
         let whole = if mla { LayerLayout::pair(cfg, layer, MODES[1])?[0].attention_bytes()? as u64 } else { 0 };
-        let mut extra = vec![];
-        if !mla {
-            for (category, group, bytes) in [(Category::Kv, "Kimi KDA active state", state),
-                (Category::Workspace, "Kimi KDA replay", KimiKda::replay_bytes() as u64),
-                (Category::Prefix, "Kimi exact KDA marks", mark)] {
-                extra.push(LayerExtraDemand::new(category, group, bytes, LayerResidency::Replicated, Basis::Exact));
-            }
-        }
         let unit = if mla { (MLA_PAGE_ROWS * MLA_RECORD_BYTES) as u64 } else { 0 };
         layers.push(LayerDemand { kind: if mla { AttentionClass::Mla } else { AttentionClass::Kda },
             weights: ModeBytes { whole, split: split_attention },
             kv_unit: KvDemand { unit_bytes_whole: unit, unit_bytes_split: [unit; 2], unit_bytes_context: None },
-            fixed_bytes: ModeBytes::default(), extra, context_indexer: false, colocate: None,
+            fixed_bytes: ModeBytes::default(), extra: vec![], context_indexer: false, colocate: None,
             // RTX routed-expert onboarding is deliberately not executable yet.
             experts: (!cfg.dense[layer]).then_some(ExpertCost { whole: Bytes2::default(),
                 half: [Bytes2::default(); 2], tp2: false, spark_ok: true }),
@@ -271,6 +298,27 @@ mod tests {
         assert!(admit(i).is_err());
         let mut i = inputs(&cfg);
         i.lane_layouts.pop();
+        assert!(admit(i).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn kda_pool_allocation_requires_exact_accepted_lane_isolated_charges() -> Result<()> {
+        let cfg = cfg();
+        let mut admitted = admit(inputs(&cfg))?;
+        admitted.check_kda(0, 0)?;
+        admitted.check_kda(1, 1)?;
+        assert!(admitted.check_kda(2, 0).is_err());
+        assert!(admitted.check_kda(0, 1).is_err());
+        admitted.kda_allocated[0] = true;
+        assert!(admitted.check_kda(0, 0).is_err());
+        admitted.kda_allocated[0] = false;
+        let replay = admitted.placement.items[0].iter_mut().find(|item| item.group == "Kimi KDA replay").unwrap();
+        assert_eq!(replay.bytes, 3 * 2 * cuteafd_ffi::KimiKda::replay_bytes() as u64);
+        replay.bytes /= 2;
+        assert!(admitted.check_kda(0, 0).is_err());
+        let mut i = inputs(&cfg);
+        i.fixed.push(KdaLayout::new(&cfg, i.state_slots, i.prefix_marks, i.lanes)?.demands(0)?[0].clone());
         assert!(admit(i).is_err());
         Ok(())
     }

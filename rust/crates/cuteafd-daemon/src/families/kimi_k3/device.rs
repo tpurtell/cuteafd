@@ -253,16 +253,24 @@ impl LaneLayout {
                 "Kimi allocated lane operand {name} differs from admitted extent/device");
             Ok((*name, allocation))
         }).collect::<Result<BTreeMap<_, _>>>()?;
-        Ok(Lane { stream, operands, layout: self.clone() })
+        Ok(Lane { stream: std::rc::Rc::new(stream), operands, layout: self.clone() })
     }
 }
 
 /// Stream drops first and drains queued work before any operand is released,
 /// including cancellation/unwind. No allocation occurs during a lane launch.
 pub(crate) struct Lane<'a> {
-    pub stream: Stream<'a>,
+    pub stream: std::rc::Rc<Stream<'a>>,
     operands: BTreeMap<&'static str, Allocation<'a>>,
     layout: LaneLayout,
+}
+
+impl Drop for Lane<'_> {
+    fn drop(&mut self) {
+        // A shared state owner also retains the stream; do not defer the drain
+        // until its last reference drops while these operands are freed now.
+        self.stream.drain_or_abort("Kimi lane operands");
+    }
 }
 
 impl Lane<'_> {
