@@ -16,6 +16,16 @@ ROWS = (1, 7, 8, 9, 128, 513, 4105)
 
 
 def test_official_layer3_csa_fixtures():
+    generate_csa_fixtures(3)
+
+
+def test_official_layer91_saved_layer90_fixture():
+    if not os.environ.get("CUTEAFD_STEP5_LAYER90_REFERENCE"):
+        pytest.skip("set CUTEAFD_STEP5_LAYER90_REFERENCE for saved-input layer91")
+    generate_csa_fixtures(91)
+
+
+def generate_csa_fixtures(layer_id):
     destination = os.environ.get("CUTEAFD_STEP5_CSA_FIXTURE_DIR")
     if not destination:
         pytest.skip("set CUTEAFD_STEP5_CSA_FIXTURE_DIR for real-weight CUDA fixtures")
@@ -24,35 +34,72 @@ def test_official_layer3_csa_fixtures():
     assert root.is_relative_to(Path(os.environ["CARGO_TARGET_DIR"]).resolve())
     root.mkdir(parents=True, exist_ok=True)
     snapshot = Path(os.environ["STEP5_REFERENCE_SNAPSHOT"])
-    ref, kernel = golden.load_release(snapshot)
+    ref, kernel = golden.load_release(snapshot, fp8_diagnostic=layer_id == 91)
+    if layer_id == 91:
+        from shape_invariant import install
+        install()
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
+        total = torch.cuda.get_device_properties(0).total_memory
+        torch.cuda.set_per_process_memory_fraction(min(1., 8 * 2**30 / total))
+    rows_cases = (640,) if layer_id == 91 else ROWS
     values = json.loads((snapshot / "config.json").read_text())
     config_values = dict(values.get("text_config", values))
     config_values["tp_size"] = 1
     config = ref.Step5Config(**config_values)
     with torch.device("meta"):
-        attention = ref.Step5Attention(config, 3, dtype=torch.bfloat16)
-        norm = ref.Step5RMSNorm(config.hidden_size, config.rms_norm_eps)
+        if layer_id == 91:
+            layer = ref.Step5DecoderLayer(config, layer_id, dtype=torch.bfloat16)
+            attention, norm = layer.self_attn, layer.input_layernorm
+        else:
+            attention = ref.Step5Attention(config, layer_id, dtype=torch.bfloat16)
+            norm = ref.Step5RMSNorm(config.hidden_size, config.rms_norm_eps)
     attention.to_empty(device="cuda")
     norm.to_empty(device="cuda")
+    if layer_id == 91:
+        layer.post_attention_layernorm.to_empty(device="cuda")
+        layer.mlp.to_empty(device="cuda")
     reader = golden.Weights(snapshot)
     sources = {}
     with torch.no_grad():
-        for prefix, module in [("self_attn.", attention), ("input_layernorm.", norm)]:
+        modules = [("self_attn.", attention), ("input_layernorm.", norm)]
+        if layer_id == 91:
+            modules += [("post_attention_layernorm.", layer.post_attention_layernorm), ("mlp.", layer.mlp)]
+        for prefix, module in modules:
             for name, parameter in module.named_parameters():
-                key = "model.layers.3." + prefix + name
+                key = f"model.layers.{layer_id}." + prefix + name
                 value = reader.get(key)
                 assert value.dtype == parameter.dtype and value.shape == parameter.shape
                 sources[key] = hashlib.sha256(value.view(torch.uint8).numpy().tobytes()).hexdigest()
                 parameter.copy_(value)
     reader.files.clear()
-    attention.build_rope(max_position=max(ROWS), device=torch.device("cuda"))
+    attention.build_rope(max_position=max(rows_cases), device=torch.device("cuda"))
     generator = torch.Generator(device="cpu").manual_seed(274)
-    residual = torch.randn((max(ROWS), config.hidden_size), generator=generator).cuda()
-    manifest = {"schema": 1, "checkpoint": golden.CHECKPOINT, "revision": golden.REVISION,
-                "source_pins": golden.SOURCE_PINS, "seed": 274, "layer": 3,
-                "rows": list(ROWS), "epsilon": config.rms_norm_eps, "query_tile": 64,
+    residual = torch.randn((max(rows_cases), config.hidden_size), generator=generator).cuda()
+    provenance = None
+    if layer_id == 91:
+        reference = Path(os.environ["CUTEAFD_STEP5_LAYER90_REFERENCE"])
+        meta_bytes = (reference / "meta.json").read_bytes()
+        meta = json.loads(meta_bytes)
+        audit = json.loads((reference / "tail-diagnostic.json").read_text())
+        assert audit["source_meta_sha256"] == hashlib.sha256(meta_bytes).hexdigest()
+        assert audit["original_layer91_byte_exact"] is True
+        assert meta["source_pin"]["revision"] == golden.FP8_REVISION
+        window = meta["windows"][0]["path"]
+        path = f"{window}/layer90.bin"
+        payload = (reference / path).read_bytes()
+        assert hashlib.sha256(payload).hexdigest() == audit["files"][path]
+        assert len(payload) == 640 * config.hidden_size * 4
+        residual = torch.frombuffer(bytearray(payload), dtype=torch.float32).reshape(640, -1).cuda()
+        provenance = {"source_meta_sha256": hashlib.sha256(meta_bytes).hexdigest(),
+                      "layer90_sha256": audit["files"][path]}
+
+    manifest = {"schema": 1, "checkpoint": golden.FP8_CHECKPOINT if layer_id == 91 else golden.CHECKPOINT,
+                "revision": golden.FP8_REVISION if layer_id == 91 else golden.REVISION,
+                "source_pins": golden.SOURCE_PINS, "seed": 274, "layer": layer_id,
+                "rows": list(rows_cases), "saved_input": provenance, "epsilon": config.rms_norm_eps, "query_tile": 64,
                 "weights_sha256": sources, "torch": torch.__version__, "cuda": torch.version.cuda,
-                "files": {}, "cases": {}, "scope": "attention branch only; layer3 FFN is routed",
+                "files": {}, "cases": {}, "scope": "saved-input sparse+dense" if layer_id == 91 else "attention branch only; layer3 FFN is routed",
                 "attention_error_ratio_bound": 1.01, "gemm_error_ratio_bound": 1.01,
                 "norm_error_ratio_bound": 1.01, "norm_row_max_ulp_slack": 1,
                 "norm_oracle": "unrounded FP64 RMS/LayerNorm; native input/affine dtypes; BF16 normalization before RoPE",
@@ -67,7 +114,7 @@ def test_official_layer3_csa_fixtures():
                                    "bytes": len(data), "sha256": hashlib.sha256(data).hexdigest()}
 
     with torch.inference_mode():
-        for rows in ROWS:
+        for rows in rows_cases:
             start = rows - 1 if rows == 4105 else 0
             count = rows - start
             regions = rows // 8
@@ -140,8 +187,11 @@ def test_official_layer3_csa_fixtures():
                 assert (history >= 0).all() and (history < 513).all()
                 assert all(len(set(v.tolist())) == 512 for v in history)
                 assert torch.equal(selected[0, :, 4096], torch.full((4,), 4104, device=x.device))
-            output, _ = kernel.sparse_attention_prefill(query[start:], cache.key, cache.value,
-                packed, counts, num_kv_groups=4, region_size=8, softmax_scale=a.scaling)
+            if layer_id == 91:
+                output = golden.sparse_attention(a, kernel, query, key, value, hidden, positions, rows)
+            else:
+                output, _ = kernel.sparse_attention_prefill(query[start:], cache.key, cache.value,
+                    packed, counts, num_kv_groups=4, region_size=8, softmax_scale=a.scaling)
             gated = output * logits.sigmoid().unsqueeze(-1)
             delta = a.o_proj(gated.reshape(count, -1))
             post = x[start:] + delta.float()
@@ -153,6 +203,23 @@ def test_official_layer3_csa_fixtures():
                 "scores": scores, "selected": selected, "logits": logits,
                 "attention": output, "gated": gated, "delta": delta, "post": post}.items():
                 save(f"r{rows}_{name}", tensor)
+            if layer_id == 91:
+                ffn_norm = layer.post_attention_layernorm(post).to(torch.bfloat16)
+                gate = layer.mlp.gate_proj(ffn_norm)
+                up = layer.mlp.up_proj(ffn_norm)
+                activation = ref.clamped_swiglu(gate, up, layer.mlp.limit)
+                down = layer.mlp.down_proj(activation)
+                final = post + down.float()
+                assert torch.equal(down, layer._feed_forward(ffn_norm))
+                expected = (reference / window / "layer91.bin").read_bytes()
+                assert final.contiguous().cpu().view(torch.uint8).numpy().tobytes() == expected
+                for name, tensor in {"ffn_norm": ffn_norm, "gate_up": torch.cat((gate, up), -1),
+                        "activation": activation, "down": down, "output": final,
+                        "ffn_norm_fp64": golden.norm_accuracy_fp64(post, layer.post_attention_layernorm.weight, config.rms_norm_eps),
+                        "gate_up_fp64": torch.cat((torch.nn.functional.linear(ffn_norm.double(), layer.mlp.gate_proj.weight.double()),
+                            torch.nn.functional.linear(ffn_norm.double(), layer.mlp.up_proj.weight.double())), -1),
+                        "down_fp64": torch.nn.functional.linear(activation.double(), layer.mlp.down_proj.weight.double())}.items():
+                    save(f"r{rows}_{name}", tensor)
             # Bound projection oracles to live queries; history-only producer rows
             # are still recorded and checked for deterministic eager/replay execution.
             for name, operand, weight in [("qraw", hidden[start:], a.q_proj.weight),
