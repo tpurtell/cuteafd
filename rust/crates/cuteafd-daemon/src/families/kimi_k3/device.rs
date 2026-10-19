@@ -6,7 +6,10 @@ use anyhow::{bail, ensure, Result};
 use cuteafd_ffi::{programs::Programs, Bf16Add, KimiExpertInput, KimiFfn, KimiFfnBatch,
     KimiKda, KimiKdaCommit, KimiLatent, KimiMlaMode, KimiPrefixMode, KimiResidual,
     KimiResidualBatch, KimiResidualSite, KimiRmsNorm, KimiRouter};
-use crate::shared::memory::device::{Allocation, Device, Stream};
+use crate::shared::{memory::device::{Allocation, Device, DeviceOwner, Stream}, prefix::view};
+use cuteafd_ffi::{CuteafdDeviceBuffer, programs::{VocabularyHead, VOCABULARY_HEAD_WORKSPACE}};
+use std::rc::Rc;
+use super::weights::GlobalWeights;
 use cuteafd_core::memory_layout::{Basis, Category};
 use cuteafd_loader::{families::kimi_k3::config::KimiK3Config, placement::Demand};
 use std::collections::BTreeMap;
@@ -282,6 +285,132 @@ impl Lane<'_> {
     pub(crate) fn rows(&self) -> usize { self.layout.rows }
 }
 
+/// Head handles/workspaces are lane-local: independent compute streams must
+/// never enqueue concurrent work through the same cuBLAS handle or workspace.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct IoLayout {
+    rank: usize,
+    rows: usize,
+    hidden: usize,
+    vocab: usize,
+}
+
+impl IoLayout {
+    pub(crate) fn new(cfg: &KimiK3Config, rank: usize, rows: usize) -> Result<Self> {
+        ensure!(cfg.hidden == 7168 && cfg.vocab_size == 163840, "Kimi native IO hidden/vocabulary geometry");
+        ensure!(rank < 2 && (1..=4096).contains(&rows), "Kimi IO rank/row geometry");
+        Ok(Self { rank, rows, hidden: cfg.hidden, vocab: cfg.vocab_size })
+    }
+
+    fn extents(&self) -> [usize; 3] {
+        if self.rank == 0 { [self.rows * 4, 0, 0] }
+        else { [0, self.rows.min(64) * self.vocab * 4, VOCABULARY_HEAD_WORKSPACE] }
+    }
+
+    pub(crate) fn demand(&self, lane: usize) -> Result<Demand> {
+        ensure!(lane < 2, "Kimi IO lane outside admission");
+        Ok(Demand::new(self.rank as u8, Category::Workspace, format!("Kimi lane {lane} token IO"),
+            self.extents().into_iter().sum::<usize>() as u64, Basis::Exact))
+    }
+
+    pub(super) fn allocate<'a>(&self, device: Device<'a>, stream: Rc<Stream<'a>>,
+        weights: Rc<GlobalWeights<'a>>) -> Result<TokenIo<'a>> {
+        ensure!(stream.device.id == device.id && std::ptr::eq(stream.device.library, device.library),
+            "Kimi IO stream differs from admitted lane device");
+        weights.check_device(device)?;
+        weights.buffer(if self.rank == 0 { "embedding" } else { "head" })?;
+        let _scope = cuteafd_ffi::memory_ledger::scope("workspace/kimi token IO");
+        let [ids, logits, workspace] = self.extents();
+        let allocate = |bytes| -> Result<Option<Allocation<'a>>> {
+            if bytes == 0 { return Ok(None); }
+            let allocation = Allocation::new(device, bytes)?;
+            ensure!(allocation.buffer.bytes == bytes && allocation.buffer.device_id == device.id,
+                "Kimi IO allocation differs from admitted extent/device");
+            Ok(Some(allocation))
+        };
+        let ids = allocate(ids)?;
+        let logits = allocate(logits)?;
+        let workspace = allocate(workspace)?;
+        let head = workspace.as_ref().map(|workspace| device.own(|| {
+            // SAFETY: lane-local workspace remains after the head and all stream readers drain.
+            unsafe { device.library.vocabulary_head_rows(workspace.buffer.ptr, self.hidden as u32,
+                self.rows.min(64) as u32, self.vocab as u32) }
+        })).transpose()?;
+        Ok(TokenIo { stream, head, workspace, ids, logits, weights, layout: self.clone() })
+    }
+}
+
+pub(crate) struct TokenIo<'a> {
+    stream: Rc<Stream<'a>>,
+    head: Option<DeviceOwner<'a, VocabularyHead<'a>>>,
+    workspace: Option<Allocation<'a>>,
+    ids: Option<Allocation<'a>>,
+    logits: Option<Allocation<'a>>,
+    weights: Rc<GlobalWeights<'a>>,
+    layout: IoLayout,
+}
+
+impl Drop for TokenIo<'_> {
+    fn drop(&mut self) { self.stream.drain_or_abort("Kimi token IO readers"); }
+}
+
+impl TokenIo<'_> {
+    pub(crate) fn embed(&self, tokens: &[u32], output: CuteafdDeviceBuffer) -> Result<()> {
+        ensure!(self.layout.rank == 0 && !tokens.is_empty() && tokens.len() <= self.layout.rows
+            && tokens.iter().all(|&id| (id as usize) < self.layout.vocab), "Kimi embedding row/token outside admission");
+        let bytes = tokens.len() * self.layout.hidden * 2;
+        ensure!(output.device_id == self.stream.device.id && !output.ptr.is_null() && output.bytes >= bytes,
+            "Kimi embedding output extent/device");
+        let ids = self.ids.as_ref().ok_or_else(|| anyhow::anyhow!("Kimi entry token IDs absent"))?.buffer;
+        let table = self.weights.buffer("embedding")?;
+        let output = view(output, 0, bytes)?;
+        io_disjoint(output, ids)?;
+        io_disjoint(output, table)?;
+        let data = tokens.iter().flat_map(|id| id.to_le_bytes()).collect::<Vec<_>>();
+        self.stream.device.run(|| {
+            // SAFETY: ordered staging retains host data; this owner retains IDs, table and stream.
+            unsafe { self.stream.device.library.copy_h2d_ordered(view(ids, 0, data.len())?, &data, self.stream.raw)?; }
+            // SAFETY: checked IDs, table and output extents; caller retains output through the lane drain.
+            unsafe { self.stream.device.library.cuda_embedding_lookup_bf16_async(table, ids, output,
+                tokens.len(), self.layout.vocab, self.layout.hidden, self.stream.raw) }
+        })
+    }
+
+    /// Reuses at most 64 logits rows. Callers consume/download each span before
+    /// the next projection; wide prefill never allocates a full-context logit tensor.
+    pub(crate) fn project(&self, input: CuteafdDeviceBuffer, rows: usize) -> Result<CuteafdDeviceBuffer> {
+        ensure!(self.layout.rank == 1 && (1..=self.layout.rows.min(64)).contains(&rows),
+            "Kimi head rows exceed admitted IO capacity");
+        let head = self.head.as_ref().ok_or_else(|| anyhow::anyhow!("Kimi terminal head absent"))?;
+        let logits = self.logits.as_ref().ok_or_else(|| anyhow::anyhow!("Kimi terminal logits absent"))?.buffer;
+        ensure!(input.device_id == self.stream.device.id && !input.ptr.is_null()
+            && input.bytes >= rows * self.layout.hidden * 2, "Kimi head input extent/device");
+        let weight = self.weights.buffer("head")?;
+        let input = view(input, 0, rows * self.layout.hidden * 2)?;
+        io_disjoint(input, logits)?;
+        io_disjoint(input, weight)?;
+        let workspace = self.workspace.as_ref().ok_or_else(|| anyhow::anyhow!("Kimi terminal head workspace absent"))?;
+        io_disjoint(input, workspace.buffer)?;
+        self.stream.device.run(|| {
+            // SAFETY: checked live input and rank-local weight/logits; the lane-local handle
+            // and workspace remain owned until the stream drains. Caller retains input.
+            unsafe { crate::shared::target_head::launch(crate::shared::target_head::TargetHead::configured(),
+                head.get(), input.ptr.cast_const(), weight.ptr.cast_const(), logits.ptr.cast(), rows, self.stream.raw) }
+        })?;
+        view(logits, 0, rows * self.layout.vocab * 4)
+    }
+}
+
+fn io_disjoint(a: CuteafdDeviceBuffer, b: CuteafdDeviceBuffer) -> Result<()> {
+    let start_a = a.ptr as usize;
+    let start_b = b.ptr as usize;
+    let end_a = start_a.checked_add(a.bytes).ok_or_else(|| anyhow::anyhow!("Kimi IO address overflow"))?;
+    let end_b = start_b.checked_add(b.bytes).ok_or_else(|| anyhow::anyhow!("Kimi IO address overflow"))?;
+    ensure!(a.device_id == b.device_id && start_a != 0 && start_b != 0
+        && (end_a <= start_b || end_b <= start_a), "Kimi IO operands overlap or differ in device");
+    Ok(())
+}
+
 /// Which export each op waits on.
 pub(crate) const PENDING: &[(&str, &str)] = &[
     ("residual_mix", "W8 shared residual mixer"),
@@ -324,6 +453,85 @@ impl Ops for Pending {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "requires CUTEAFD_NATIVE_LIFETIME_FIXTURE_DIR; CPU-only fake DSO"]
+    fn entry_token_io_retains_weights_and_drains_before_storage() -> Result<()> {
+        use cuteafd_ffi::native_library_lifetime_fixture::Fixture;
+        use cuteafd_core::{DType, TensorInfo, TensorRole};
+        use cuteafd_loader::LoadedTensor;
+        use super::super::weights::GlobalLayout;
+        let fixture = Fixture::build()?;
+        let library = fixture.load()?;
+        let device = Device { library: &library, id: 1 };
+        let mut cfg = KimiK3Config::from_hf(&cuteafd_loader::plan::testing::kimi_k3_config())?;
+        cfg.hidden = 4;
+        cfg.vocab_size = 8;
+        let layout = GlobalLayout::pair(&cfg)?;
+        let packed = layout[0].pack(&cfg, |name| Ok(LoadedTensor {
+            info: TensorInfo { name: name.into(), file: "test".into(), dtype: DType::Bf16,
+                shape: vec![8, 4], byte_offset: 0, byte_length: 64, role: TensorRole::Other,
+                layer_id: None, expert_id: None, is_quantization_metadata: false },
+            source_path: "test".into(), bytes: vec![0; 64], elapsed_micros: 0, sha256: String::new(),
+        }))?;
+        let weights = Rc::new(layout[0].upload(device, packed)?);
+        let weak = Rc::downgrade(&weights);
+        let stream = Rc::new(Stream { device, raw: std::ptr::null_mut() });
+        let io = IoLayout { rank: 0, rows: 16, hidden: 4, vocab: 8 }
+            .allocate(device, stream.clone(), weights.clone())?;
+        drop(weights);
+        drop(stream);
+        assert!(weak.upgrade().is_some());
+        assert!(!fixture.events()?.contains('d'));
+        drop(io);
+        assert!(weak.upgrade().is_none());
+        let events = fixture.events()?;
+        let first_free = events.find('d').ok_or_else(|| anyhow::anyhow!("token IO released no storage"))?;
+        assert_eq!(events[..first_free].matches('S').count(), 2, "lane drains before IDs/weights free: {events}");
+        assert_eq!(events.matches('d').count(), 2, "one IDs and one embedding allocation: {events}");
+        Ok(())
+    }
+
+    #[test]
+    fn token_io_rejects_aliases_other_devices_and_wrapping_addresses() -> Result<()> {
+        let buffer = |ptr, bytes, device_id| CuteafdDeviceBuffer {
+            ptr: ptr as *mut std::ffi::c_void, bytes, device_id, flags: 0,
+        };
+        let a = buffer(4096usize, 128, 0);
+        io_disjoint(a, buffer(4224, 64, 0))?;
+        io_disjoint(buffer(4000, 96, 0), a)?;
+        for other in [a, buffer(4200, 64, 0), buffer(4095, 2, 0), buffer(8192, 64, 1),
+            buffer(0, 64, 0), buffer(usize::MAX - 16, 32, 0)] {
+            assert!(io_disjoint(a, other).is_err());
+            assert!(io_disjoint(other, a).is_err());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn token_io_extents_are_native_bounded_and_lane_private() -> Result<()> {
+        let cfg = KimiK3Config::from_hf(&cuteafd_loader::plan::testing::kimi_k3_config())?;
+        for rows in [1, 16, 64, 4096] {
+            let entry = IoLayout::new(&cfg, 0, rows)?;
+            let terminal = IoLayout::new(&cfg, 1, rows)?;
+            assert_eq!(entry.extents(), [rows * 4, 0, 0]);
+            assert_eq!(terminal.extents(), [0, rows.min(64) * 163840 * 4, VOCABULARY_HEAD_WORKSPACE]);
+            for rank in [&entry, &terminal] {
+                assert_ne!(rank.demand(0)?.group, rank.demand(1)?.group);
+                assert_eq!(rank.demand(0)?.bytes, rank.extents().into_iter().sum::<usize>() as u64);
+                assert!(rank.demand(2).is_err());
+            }
+        }
+        for (rank, rows) in [(2, 1), (0, 0), (1, 4097)] {
+            assert!(IoLayout::new(&cfg, rank, rows).is_err());
+        }
+        let source = include_str!("device.rs").split("#[cfg(test)]").next().unwrap();
+        assert!(source.contains(".vocabulary_head_rows("));
+        assert!(source.contains("crate::shared::target_head::launch("));
+        assert!(!source.contains(".vocab_head_rows("));
+        Ok(())
+    }
+
 
     #[test]
     fn fused_residual_schedule_matches_every_layer_and_output_frontier() {
