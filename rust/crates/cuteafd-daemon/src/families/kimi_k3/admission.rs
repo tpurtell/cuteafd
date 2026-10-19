@@ -59,6 +59,7 @@ pub(crate) struct Admission<'a> {
     global_owners: [Weak<GlobalWeights<'a>>; 2],
     io_layouts: [IoLayout; 2],
     io_allocated: Vec<[bool; 2]>,
+    spark_connected: Vec<bool>,
 }
 
 /// The normal Spark lane consumes these selected layer IDs; selection still
@@ -68,6 +69,26 @@ impl<'a> Admission<'a> {
         SparkWorkingSet { rtx_layers: vec![], spark_layers: self.placement.layers.iter().enumerate()
             .filter_map(|(layer, assignment)| (assignment.experts == ExpertHome::Spark).then_some(layer)).collect(),
             spark_ranks: 6, prefill_lanes: self.lanes }
+    }
+
+    /// The caller completes shared SparkAdmission reconciliation first. Keep
+    /// one transport/intake owner per admitted lane; expired owners cannot be
+    /// replaced by an uncharged second allocation.
+    pub(crate) fn connect_spark(&mut self, local: &LocalLane<'a>,
+        world: cuteafd_transport::expert::SparkWorld, peers: Vec<std::net::SocketAddr>,
+        config: cuteafd_transport::TcpTransportConfig) -> Result<super::spark::RoutedLane<'a>> {
+        let lane = local.lane_index();
+        let expected = self.check_spark(lane)?;
+        ensure!(Rc::ptr_eq(&expected, local.stream()), "Kimi Spark lane differs from admitted entry owner");
+        let routed = super::spark::RoutedLane::connect(local, &self.placement, world, peers, config)?;
+        self.spark_connected[lane] = true;
+        Ok(routed)
+    }
+
+    fn check_spark(&self, lane: usize) -> Result<Rc<Stream<'a>>> {
+        ensure!(lane < self.spark_connected.len() && !self.spark_connected[lane],
+            "Kimi Spark lane already connected or outside admission");
+        self.lane_readers[lane][0].upgrade().context("Kimi Spark requires admitted entry stream")
     }
 
     /// No caller-supplied byte count: upload uses the immutable native layout
@@ -252,7 +273,7 @@ pub(crate) fn admit<'a>(inputs: Inputs<'_>) -> Result<Admission<'a>> {
         kda_layout, kda_allocated: [false; 2], kda_owners: std::array::from_fn(|_| Weak::new()),
         mla_layouts, mla_allocated: [false; 2], mla_owners: std::array::from_fn(|_| Weak::new()),
         global_layouts, global_uploaded: [false; 2], global_owners: std::array::from_fn(|_| Weak::new()),
-        io_layouts, io_allocated };
+        io_layouts, io_allocated, spark_connected: vec![false; lanes as usize] };
     for rank in 0..2 {
         admission.check_kda(rank, devices[rank])?;
         admission.check_mla(rank, devices[rank])?;
@@ -297,6 +318,12 @@ fn request(i: Inputs<'_>) -> Result<PlacementRequest> {
                 "Kimi lane operand charge supplied twice");
             fixed.push(demand);
         }
+    }
+    for lane in 0..i.lanes {
+        let demand = super::spark::demand(i.rows, lane)?;
+        ensure!(!fixed.iter().chain(&i.startup).any(|item| item.gpu == demand.gpu && item.group == demand.group),
+            "Kimi Spark intake charge supplied twice");
+        fixed.push(demand);
     }
     for rank in 0..2 {
         let layout = IoLayout::new(cfg, rank, i.rows)?;
@@ -492,6 +519,22 @@ mod tests {
     }
 
     #[test]
+    fn spark_connections_cannot_replace_expired_admitted_owners() -> Result<()> {
+        let cfg = cfg();
+        let mut admitted = admit(inputs(&cfg))?;
+        assert!(admitted.check_spark(admitted.spark_connected.len()).is_err());
+        for lane in 0..admitted.spark_connected.len() {
+            assert!(admitted.lane_readers[lane][0].upgrade().is_none());
+            let missing = admitted.check_spark(lane).err().unwrap().to_string();
+            assert!(missing.contains("requires admitted entry stream"));
+            admitted.spark_connected[lane] = true;
+            let duplicate = admitted.check_spark(lane).err().unwrap().to_string();
+            assert!(duplicate.contains("already connected"));
+        }
+        Ok(())
+    }
+
+    #[test]
     fn native_layer_uploads_are_single_owner_per_rank_even_after_owner_release() -> Result<()> {
         let cfg = cfg();
         let mut admitted = admit(inputs(&cfg))?;
@@ -597,6 +640,28 @@ mod tests {
         let mut i = inputs(&cfg);
         i.lane_layouts.pop();
         assert!(admit(i).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn spark_intake_planes_are_charged_once_per_lane_before_allocation() -> Result<()> {
+        let cfg = cfg();
+        let i = inputs(&cfg);
+        let rows = i.rows;
+        let lanes = i.lanes;
+        let admitted = admit(i)?;
+        for lane in 0..lanes {
+            let demand = super::super::spark::demand(rows, lane)?;
+            let items = admitted.placement.items[0].iter().filter(|item| item.group == demand.group).collect::<Vec<_>>();
+            assert_eq!(items.len(), 1);
+            assert_eq!(items[0].bytes, (6 * rows * 3584 * 2) as u64);
+            assert_eq!(items[0].basis, Basis::Exact);
+            assert_eq!(items[0].category, Category::Workspace);
+            assert!(!admitted.placement.items[1].iter().any(|item| item.group == demand.group));
+        }
+        let mut duplicate = inputs(&cfg);
+        duplicate.fixed.push(super::super::spark::demand(rows, 0)?);
+        assert!(admit(duplicate).is_err());
         Ok(())
     }
 
