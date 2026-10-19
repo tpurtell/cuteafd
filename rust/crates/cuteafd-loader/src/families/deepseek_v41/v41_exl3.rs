@@ -125,7 +125,7 @@ pub enum V41Exl3MtpExperts {
 }
 
 /// How a checkpoint names its routed EXL3 projections.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum V41Exl3Naming {
     /// DeepSeek V4.1: `layers.{L}.ffn.experts.{E}.w1|w3|w2` and `mtp.{S}.ffn.experts...`.
     CheckpointNative,
@@ -141,11 +141,13 @@ pub enum V41Exl3Naming {
     /// Flash Next): backbone as [`Self::HfLanguageModel`], draft stage `S` at
     /// `mtp.layers.{S}.mlp.experts.{E}.gate_proj|up_proj|down_proj`.
     HfLanguageModelMtp,
+    /// Prefix and routed module discovered from safetensors projection names.
+    HeaderDerived { prefix: String, module: String },
 }
 
 impl V41Exl3Naming {
     /// The projection name (without the `.trellis`/`.suh`/... suffix).
-    pub fn projection(self, draft: bool, layer: usize, expert: usize, kind: V41Exl3ProjectionKind) -> String {
+    pub fn projection(&self, draft: bool, layer: usize, expert: usize, kind: V41Exl3ProjectionKind) -> String {
         match self {
             Self::CheckpointNative => {
                 let stem = match kind {
@@ -182,6 +184,15 @@ impl V41Exl3Naming {
                 };
                 let prefix = if draft { "mtp" } else { "model.language_model" };
                 format!("{prefix}.layers.{layer}.mlp.experts.{expert}.{stem}")
+            }
+            Self::HeaderDerived { prefix, module } => {
+                let stem = match kind {
+                    V41Exl3ProjectionKind::Gate => "gate_proj",
+                    V41Exl3ProjectionKind::Up => "up_proj",
+                    V41Exl3ProjectionKind::Down => "down_proj",
+                };
+                let prefix = if draft { "mtp" } else { prefix.as_str() };
+                format!("{prefix}.{layer}.{module}.experts.{expert}.{stem}")
             }
         }
     }
@@ -446,9 +457,25 @@ fn parse_raw_publication(mut config: Value) -> Result<V41Exl3Manifest> {
     V41Exl3Manifest::v41(validated, projections, None, V41Exl3MtpExperts::Source)
 }
 
-/// Hugging Face routed-expert modules (`*.mlp.experts.{E}.*` or `*.ffn.experts.{E}.*`).
+/// Routed projection names carry the module and expert ordinal in their headers.
 fn is_routed_module(name: &str) -> bool {
-    name.contains(".mlp.experts.") || name.contains(".ffn.experts.")
+    name.split_once(".experts.").is_some_and(|(_, tail)|
+        tail.split_once('.').is_some_and(|(expert, _)| expert.parse::<usize>().is_ok()))
+}
+
+fn header_naming(routed: &BTreeMap<&str, &Exl3Module>) -> Result<V41Exl3Naming> {
+    let mut layouts = BTreeSet::new();
+    for name in routed.keys().filter(|name| !name.starts_with("mtp.")) {
+        let (left, _) = name.split_once(".experts.").context("EXL3 expert ordinal absent")?;
+        let (layer, module) = left.rsplit_once('.').context("EXL3 expert module absent")?;
+        let (prefix, ordinal) = layer.rsplit_once('.').context("EXL3 layer prefix absent")?;
+        ordinal.parse::<usize>().context("EXL3 layer ordinal is not an integer")?;
+        ensure!(prefix.ends_with(".layers") || prefix == "layers", "EXL3 layer prefix lacks layers segment");
+        layouts.insert((prefix.to_owned(), module.to_owned()));
+    }
+    ensure!(layouts.len() == 1, "EXL3 headers must identify one backbone layer prefix/module: {layouts:?}");
+    let (prefix, module) = layouts.into_iter().next().unwrap();
+    Ok(V41Exl3Naming::HeaderDerived { prefix, module })
 }
 
 /// Routed EXL3 experts of a DeepSeek V4, GLM 5.x or Qwen 3.8 checkpoint with
@@ -615,8 +642,11 @@ fn build_deepseek_v4_manifest(
         V41Exl3Naming::HfLanguageModelMtp
     } else if language_model {
         V41Exl3Naming::HfLanguageModel { layers: backbone.layers }
-    } else {
+    } else if routed.keys().filter(|name| !name.starts_with("mtp."))
+        .all(|name| name.starts_with("model.layers.") && name.contains(".mlp.experts.")) {
         V41Exl3Naming::HfMlp
+    } else {
+        header_naming(&routed)?
     };
     // Draft stages: `mtp.{S}` or `mtp.layers.{S}` names, or language-model
     // layers past the backbone.
@@ -982,6 +1012,33 @@ mod tests {
     }
 
     #[test]
+    fn arbitrary_header_wrappers_and_expert_modules_drive_residency() -> Result<()> {
+        let (_, _, shape, headers) = deepseek_v4_publication();
+        let config = serde_json::json!({"quantization_config": {"quant_method": "exl3", "version": "0.0.43",
+            "bits": 2, "head_bits": 16, "codebook": "mcg", "scope": "routed_experts_only"}});
+        for prefix in ["language_model.model.layers", "custom.wrapper.decoder.layers"] {
+            let headers = headers.iter().filter(|tensor| tensor.name.starts_with("model.layers.")).cloned()
+                .map(|mut tensor| {
+                    tensor.name = tensor.name.replacen("model.layers", prefix, 1)
+                        .replace(".mlp.experts.", ".block_sparse_moe.experts.");
+                    tensor
+                }).collect::<Vec<_>>();
+            let parsed = read_publication(&config, &[], shape, &headers, &[2, 3])?;
+            assert_eq!(parsed.naming, V41Exl3Naming::HeaderDerived {
+                prefix: prefix.into(), module: "block_sparse_moe".into() });
+            assert_eq!(parsed.experts.draft_stages, 0);
+            assert_eq!(parsed.projections.len(), 2 * 3 * 3);
+            let plan = parsed.residency(crate::V41Exl3Layer::Backbone(1), 2, 1)?;
+            assert_eq!(plan.loads[0].tensor,
+                format!("{prefix}.1.block_sparse_moe.experts.0.gate_proj.trellis"));
+            let mut mixed = headers;
+            mixed[0].name = mixed[0].name.replacen(prefix, "different.layers", 1);
+            assert!(read_publication(&config, &[], shape, &mixed, &[2, 3]).is_err());
+        }
+        Ok(())
+    }
+
+    #[test]
     fn deepseek_v4_publication_reads_hf_named_experts_and_drafts() {
         let (config, manifest, shape, headers) = deepseek_v4_publication();
         let parsed = read_publication(&config, &[("quantize_config.json", &manifest)], shape, &headers, &[]).unwrap();
@@ -1018,7 +1075,7 @@ mod tests {
         let mapped = read_publication(&gptq_config, &[("quantize_config.json", &gptq_map)], shape, &scalar, &[]).unwrap();
         assert_eq!(standard.storage, Exl3StorageSource::Headers);
         assert_eq!(standard.projections, mapped.projections);
-        assert_eq!((standard.experts, standard.naming), (mapped.experts, mapped.naming));
+        assert_eq!((standard.experts, &standard.naming), (mapped.experts, &mapped.naming));
         assert_eq!(standard.decoder_tiers(), mapped.decoder_tiers());
         let mcg = vector.iter().find(|t| t.name.ends_with(".mcg")).unwrap();
         standard.projections[mcg.name.rsplit_once('.').unwrap().0].validate_tensor(mcg).unwrap();

@@ -6,6 +6,7 @@
 pub(crate) mod admission;
 pub(crate) mod block;
 pub(crate) mod device;
+pub(crate) mod engine;
 pub(crate) mod layers;
 pub(crate) mod spark;
 pub(crate) mod mla;

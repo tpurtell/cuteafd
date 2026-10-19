@@ -738,6 +738,13 @@ impl Drop for TokenIo<'_> {
 }
 
 impl TokenIo<'_> {
+    pub(super) fn check_lane(&self, local: &LocalLane<'_>, rank: usize) -> Result<()> {
+        ensure!(self.layout.rank == rank && self.layout.rows == local.rows()
+            && Rc::ptr_eq(&self.stream, local.stream()) && Rc::ptr_eq(&self.weights, &local.global),
+            "Kimi token IO differs from exact admitted local lane/global owner");
+        Ok(())
+    }
+
     pub(crate) fn embed(&self, tokens: &[u32], output: CuteafdDeviceBuffer) -> Result<()> {
         ensure!(self.layout.rank == 0 && !tokens.is_empty() && tokens.len() <= self.layout.rows
             && tokens.iter().all(|&id| (id as usize) < self.layout.vocab), "Kimi embedding row/token outside admission");

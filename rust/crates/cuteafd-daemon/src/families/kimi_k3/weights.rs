@@ -7,7 +7,30 @@ use cuteafd_core::{DType, memory_layout::{Basis, Category}};
 use cuteafd_ffi::{CuteafdDeviceBuffer, KimiKdaWeights, KimiMlaWeights};
 use cuteafd_loader::{families::kimi_k3::{config::{KimiAttention, KimiK3Config}, kda, mla::{self, MlaOperand},
     w8::{self, ResidualWeightSite}}, kda::{KdaOperand, KdaTensor}, placement::{Demand, LayerMode}, LoadedTensor};
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, os::unix::fs::FileExt};
+
+/// Reads only the coordinator's header-selected tensors through the standard
+/// checkpoint inventory. Routed payloads remain on the Spark loading path.
+pub(crate) fn read_tensor(checkpoint: &cuteafd_loader::plan::Checkpoint, name: &str) -> Result<LoadedTensor> {
+    let at = checkpoint.tensors.binary_search_by(|tensor| tensor.meta.name.as_str().cmp(name))
+        .map_err(|_| anyhow::anyhow!("Kimi coordinator checkpoint lacks {name}"))?;
+    let tensor = &checkpoint.tensors[at];
+    ensure!(checkpoint.weight_map.get(name) == Some(&tensor.shard),
+        "Kimi tensor header differs from checkpoint index: {name}");
+    let metadata = &tensor.meta;
+    let bytes = usize::try_from(metadata.byte_length).context("Kimi tensor extent exceeds host address space")?;
+    let source_path = checkpoint.snapshot.join(&tensor.shard);
+    cuteafd_ffi::memory_ledger::tensor(name);
+    let mut bytes = vec![0; bytes];
+    let started = std::time::Instant::now();
+    std::fs::File::open(&source_path)?.read_exact_at(&mut bytes, metadata.byte_offset)
+        .with_context(|| format!("reading Kimi coordinator tensor {name}"))?;
+    Ok(LoadedTensor { info: cuteafd_core::TensorInfo { name: name.into(), file: tensor.shard.clone(),
+        dtype: metadata.dtype.clone(), shape: metadata.shape.clone(), byte_offset: metadata.byte_offset,
+        byte_length: metadata.byte_length, role: cuteafd_core::TensorRole::Other, layer_id: None,
+        expert_id: None, is_quantization_metadata: false }, source_path, bytes,
+        elapsed_micros: started.elapsed().as_micros(), sha256: String::new() })
+}
 
 /// Global tensors follow the shared entry/head ranks: one embedding on rank 0,
 /// one untied full vocabulary head and output mix/norm on rank 1.
@@ -372,6 +395,30 @@ mod tests {
             byte_offset: 0, byte_length: bytes.len() as u64, role: TensorRole::Other, layer_id: None,
             expert_id: None, is_quantization_metadata: false }, source_path: "test".into(), bytes,
             elapsed_micros: 0, sha256: String::new() })
+    }
+
+    #[test]
+    fn checkpoint_reader_uses_header_offsets_and_refuses_index_mismatch() -> Result<()> {
+        use cuteafd_loader::plan::checkpoint::{Checkpoint, CheckpointTensor};
+        let directory = tempfile::tempdir()?;
+        std::fs::write(directory.path().join("weights.safetensors"), [9, 8, 7, 0x80, 0x3f, 0, 0x40])?;
+        let name = "language_model.model.norm.weight";
+        let mut checkpoint = Checkpoint { snapshot: directory.path().into(), config: serde_json::json!({}),
+            quantize_config: None, weight_map: BTreeMap::from([(name.into(), "weights.safetensors".into())]),
+            tensors: vec![CheckpointTensor { shard: "weights.safetensors".into(),
+                meta: cuteafd_loader::SafetensorsTensorMetadata { name: name.into(), dtype: DType::Bf16,
+                    shape: vec![2], byte_offset: 3, byte_length: 4 } }], missing_shards: vec![], shard_bytes: 7 };
+        let loaded = read_tensor(&checkpoint, name)?;
+        assert_eq!(loaded.bytes, [0x80, 0x3f, 0, 0x40]);
+        assert_eq!(loaded.info.shape, [2]);
+        assert_eq!(loaded.info.byte_offset, 3);
+        assert!(read_tensor(&checkpoint, "absent").is_err());
+        checkpoint.weight_map.insert(name.into(), "another.safetensors".into());
+        assert!(read_tensor(&checkpoint, name).is_err());
+        checkpoint.weight_map.insert(name.into(), "weights.safetensors".into());
+        checkpoint.tensors[0].meta.byte_length += 1;
+        assert!(read_tensor(&checkpoint, name).is_err());
+        Ok(())
     }
 
     #[test]

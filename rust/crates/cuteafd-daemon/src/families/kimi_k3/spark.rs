@@ -4,7 +4,7 @@ use super::device::LocalLane;
 use crate::shared::{
     experts::staging::RouteStaging,
     memory::{HostAllocation, device::{Event, Stream}},
-    spark_intake::SparkLane,
+    spark_intake::{SparkIntake, SparkLane},
 };
 use anyhow::{ensure, Context, Result};
 use cuteafd_core::{ExpertGeometry, memory_layout::{Basis, Category}};
@@ -36,7 +36,8 @@ pub(crate) struct Ticket { layer: usize, rows: usize, sequence: u64 }
 /// joins its transport thread before the intake's planes are released.
 pub(crate) struct RoutedLane<'a> {
     stream: Rc<Stream<'a>>,
-    link: SparkLane<'a>,
+    worker: Option<cuteafd_transport::expert::SparkExpertLane>,
+    intake: SparkIntake<'a>,
     staging: HostAllocation<'a>,
     ready: Event<'a>,
     capacity: usize,
@@ -69,11 +70,30 @@ impl<'a> RoutedLane<'a> {
                 HostAllocation::new(library, layout.bytes)?, Event::new(stream.device)?))
         })?;
         ensure!(link.world_size() == RANKS, "Kimi Spark transport world differs from admission");
-        Ok(Self { stream, link, staging, ready, capacity: local.rows(), sequence: 0, pending: None })
+        let SparkLane { lane, intake } = link;
+        Ok(Self { stream, worker: Some(lane), intake, staging, ready,
+            capacity: local.rows(), sequence: 0, pending: None })
+    }
+
+    /// Single terminal link boundary; planes and upload sources remain owned.
+    /// #511: replace drop-and-join with checked QP quiescence and retention.
+    pub(crate) fn quiesce_links(&mut self) -> Result<()> {
+        drop(self.worker.take());
+        Ok(())
+    }
+
+    pub(crate) fn drain_copies(&self) -> Result<()> {
+        self.stream.device.run(|| self.intake.terminal_drain_copies())
+    }
+
+    pub(crate) fn release_payloads(&self) -> Result<()> {
+        ensure!(self.worker.is_none(), "Kimi Spark sources still have a worker owner");
+        self.stream.device.run(|| self.intake.terminal_release_payloads())
     }
 
     fn check(&self, local: &LocalLane<'_>, rows: usize) -> Result<()> {
-        ensure!(Rc::ptr_eq(&self.stream, local.stream()) && (1..=self.capacity).contains(&rows),
+        ensure!(self.worker.is_some() && Rc::ptr_eq(&self.stream, local.stream())
+            && (1..=self.capacity).contains(&rows),
             "Kimi Spark wave differs from retained lane stream or capacity");
         Ok(())
     }
@@ -105,7 +125,9 @@ impl<'a> RoutedLane<'a> {
         // Retain the terminal wave identity before handing work to the lane.
         self.pending = Some(ticket);
         self.sequence = sequence;
-        self.stream.device.run(|| self.link.submit(rows, Box::new(move || Ok(request))))?;
+        let worker = self.worker.as_mut().context("Kimi Spark worker retired")?;
+        self.stream.device.run(|| self.intake.before_dispatch()
+            .and_then(|()| self.intake.submit_lane(worker, rows, Box::new(move || Ok(request)))))?;
         Ok(ticket)
     }
 
@@ -115,14 +137,16 @@ impl<'a> RoutedLane<'a> {
         self.check(local, ticket.rows)?;
         ensure!(self.pending == Some(ticket), "Kimi Spark completion differs from retained wave");
         let output = local.buffer("expert combined")?;
+        let worker = self.worker.as_mut().context("Kimi Spark worker retired")?;
         self.stream.device.run(|| {
-            self.link.wait(ticket.rows, Duration::from_secs(120), self.stream.raw)?;
+            let times = worker.wait(Duration::from_secs(120))?;
+            self.intake.after_lane(ticket.rows, times.landed, self.stream.raw)?;
             // SAFETY: wait orders all six live intake planes before this exact
             // lane stream; output is a disjoint admitted latent allocation.
             unsafe { self.stream.device.library.v41_compact_reducer()?.reduce_planes(
-                self.link.intake.pointers(), RANKS as u32, std::ptr::null(),
+                self.intake.pointers(), RANKS as u32, std::ptr::null(),
                 output.ptr.cast(), ticket.rows as u32, self.stream.raw)?; }
-            self.link.intake.consumed(self.stream.raw)
+            self.intake.consumed(self.stream.raw)
         })?;
         self.pending = None;
         Ok(())
