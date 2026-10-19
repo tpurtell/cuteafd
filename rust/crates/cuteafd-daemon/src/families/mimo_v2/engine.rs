@@ -3065,7 +3065,7 @@ mod tests {
             if prefill >= DECODE_ROWS { assert_eq!(capacity, prefill); }
         }
         assert_eq!(expert_capacity(4096), 4096);
-        let narrow_only = Fp8MoeInfo {arithmetic: cuteafd_ffi::fp8_moe::Fp8MoeArithmetic::Existing,  capacities: vec![16], ..info };
+        let narrow_only = Fp8MoeInfo { capacities: vec![16], ..info };
         assert_eq!(narrow_only.capacity_for(expert_capacity(1)), None);
     }
 

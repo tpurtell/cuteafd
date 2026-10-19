@@ -106,9 +106,13 @@ impl Checkpoint {
         let mut unscaled = BTreeMap::<String, BTreeSet<String>>::new();
         for (name, shard) in &checkpoint.weight_map {
             let Some(module) = name.strip_suffix(".weight") else { continue };
-            if checkpoint.declared_numerics(module)? == ModuleNumerics::W4A4
-                && ["weight_scale", "weight_scale_2", "input_scale"].iter()
-                    .all(|suffix| !checkpoint.contains_tensor(&format!("{module}.{suffix}"))) {
+            let lacks_scales = match checkpoint.declared_numerics(module)? {
+                ModuleNumerics::W4A4 => ["weight_scale", "weight_scale_2", "input_scale"].iter()
+                    .all(|suffix| !checkpoint.contains_tensor(&format!("{module}.{suffix}"))),
+                ModuleNumerics::W8A8K128F32 => !checkpoint.contains_tensor(&format!("{module}.weight_scale_inv")),
+                _ => false,
+            };
+            if lacks_scales {
                 unscaled.entry(shard.clone()).or_default().insert(name.clone());
             }
         }
@@ -255,7 +259,8 @@ impl Checkpoint {
         let declared = self.declared_numerics(module)?;
         if declared == ModuleNumerics::W8A8K128F32 {
             let scale = format!("{module}.weight_scale_inv");
-            if dtype == cuteafd_core::DType::Bf16 && !self.contains_tensor(&scale) {
+            if matches!(dtype, cuteafd_core::DType::Bf16 | cuteafd_core::DType::F16 | cuteafd_core::DType::F32)
+                && !self.contains_tensor(&scale) {
                 return Ok(ModuleNumerics::CheckpointPrecision);
             }
             ensure!(dtype == cuteafd_core::DType::F8E4M3 && self.contains_tensor(&scale),
@@ -299,6 +304,9 @@ impl Checkpoint {
         let Some(root) = self.quantization() else { return Ok(ModuleNumerics::CheckpointPrecision) };
         let q = root.get("quantization").unwrap_or(root);
         if root.get("quant_method").and_then(Value::as_str) == Some("fp8") {
+            if !(module.contains(".experts.") || owner.ends_with(".moe")) {
+                return Ok(ModuleNumerics::CheckpointPrecision);
+            }
             if ["ignore", "exclude_modules", "modules_to_not_convert"].iter().any(|key|
                 q.get(key).and_then(Value::as_array).is_some_and(|rules|
                     rules.iter().filter_map(Value::as_str).any(|rule| module_match(rule, owner)))) {
@@ -374,9 +382,16 @@ impl Checkpoint {
     /// Use the complete index, never a role's local expert/MTP header subset.
     pub fn spark_input_is_bf16(&self) -> bool {
         let layers = opt_usize_field(self.text_config(), "num_hidden_layers");
-        if self.tensor_names().filter_map(|name| name.strip_suffix(".weight")).any(|stem|
+        if self.tensor_names().filter_map(|name| name.strip_suffix(".weight")).any(|stem| {
+            let parts: Vec<_> = stem.split('.').collect();
+            let layer = parts.iter().position(|part| *part == "layers")
+                .and_then(|at| parts.get(at + 1)).and_then(|value| value.parse::<usize>().ok());
             (stem.contains(".experts.") || stem.contains(".moe."))
-                && self.declared_numerics(stem).ok() == Some(ModuleNumerics::W8A8K128F32)) {
+                && !parts.iter().any(|part| matches!(*part, "mtp" | "nextn"))
+                && layer.is_some_and(|layer| layers.is_none_or(|count| layer < count))
+                && self.contains_tensor(&format!("{stem}.weight_scale_inv"))
+                && self.declared_numerics(stem).ok() == Some(ModuleNumerics::W8A8K128F32)
+        }) {
             return true;
         }
         self.tensor_names().any(|name| {

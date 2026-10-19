@@ -24,13 +24,13 @@ capacity, and a verified ``manifest.json``:
 Library ABI (``native/shared/include/cuteafd_fp8_moe.h``)::
 
     int32_t cuteafd_fp8moe_info(uint32_t* words, uint32_t count);
-        words: [0] bytes [version=5, storage, activation, projection]. Storage:
+        words: [0] bytes [version=6, storage, activation, projection]. Storage:
         1 FP8 block128, 2 MXFP4, 4 NVFP4 W4A4, 5 BF16 (no scales).
         Activation: 1 pre-SiLU clamp/BF16 intermediate, 2 post-SiLU clamp/FP32
         product. Projection: 1 BF16 gate/up and down. All bytes are mandatory.
         [1] hidden, [2] slice, [3] experts, [4] top-k,
         [5] intermediate, [6] tp, [7] input dtype (7 = FP8 K32 wire rows, 1 = BF16 rows),
-        [8] SwiGLU limit (FP32 bits, 0 = none), [9] capacities n, [10..] capacities
+        [8] SwiGLU limit (FP32 bits, 0 = none), [9] capacities n, [10..15] capacities, [16] arithmetic (1 existing, 2 K128/F32 A8)
     int32_t cuteafd_fp8moe_scratch_bytes(uint32_t capacity, uint64_t* bytes);
     int32_t cuteafd_fp8moe_create(void** context);           // loads every program on the current device
     int32_t cuteafd_fp8moe_launch(void* context, uint32_t capacity, void* const* pointers,
@@ -364,7 +364,7 @@ def info_words(g, capacities: list[int], wire: bool) -> list[int]:
     words = [contract, g.hidden, g.slice, g.experts, g.top_k, g.intermediate, g.tp, 7 if wire else 1, limit,
              len(capacities), *capacities]
     if len(words) > 16:
-        raise ValueError(f"at most {INFO_WORDS - 10} capacities per package")
+        raise ValueError(f"at most {INFO_WORDS - 11} capacities per package")
     return words + [0] * (16 - len(words)) + [2 if g.activations == "a8_k128_f32" else 1]
 
 
@@ -507,6 +507,8 @@ def verify(package: Path, *, revision: str | None = None, role: str | None = Non
         info = layouts[name]
         if info.get("arithmetic") not in ("existing", "k128_f32_a8"):
             raise ValueError(f"{package}/{name}: missing or unknown expert arithmetic")
+        if info["arithmetic"] == "k128_f32_a8" and (info.get("weights") != "fp8" or info.get("input") != "bf16"):
+            raise ValueError(f"{package}/{name}: K128/F32 A8 requires FP8 weights and original BF16 input")
         if info.get("abi_version") != ABI_VERSION or info.get("activation") not in ACTIVATION or info.get("projection") not in PROJECTION:
             raise ValueError(f"{package}/{name}: missing or unknown expert activation/projection ABI")
         if info.get("weights") == "mxfp4" and info["activation"] != "silu_bf16_product":

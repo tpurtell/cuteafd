@@ -300,7 +300,7 @@ def write_package(path: Path, *, input_kind="wire", role="spark", revision=REVIS
         "sparkinfer_revision": revision,
         "compute": [12, 1],
         "layouts": {layout: {"input": input_kind, "capacities": [{"capacity": 80}],
-                             "weights": weights, "abi_version": 5, "activation": "silu_bf16_product",
+                             "weights": weights, "abi_version": 6, "arithmetic": "existing", "activation": "silu_bf16_product",
                              "projection": "bf16", "hidden": 4096, "experts": 256, "top_k": 8,
                              "intermediate": 2048, "tp": 4, "slice": 512, "swiglu_limit": 0.0}},
         "files": {str(library.relative_to(path)): {
@@ -537,16 +537,16 @@ def test_cmake_fp8_family_counts_only_apply_to_their_family(tmp_path):
 def test_explicit_activation_info_words(kind, storage, activation, code):
     from types import SimpleNamespace
     g = SimpleNamespace(kind=kind, weights="nvfp4" if kind == "nvfp4a4" else kind,
-                        activation=activation, projection="bf16", swiglu_limit=7.0,
+                        activations="a16", activation=activation, projection="bf16", swiglu_limit=7.0,
                         hidden=4096, slice=256, experts=352, top_k=8, intermediate=1536, tp=6)
     if kind == "mxfp4" and code == 2:
         with pytest.raises(ValueError, match="MXFP4"):
             package_tool.info_words(g, [16], False)
         return
     words = package_tool.info_words(g, [1, 16, 80, 256, 1024, 4096], False)
-    assert len(words) == 16
-    assert words[0] == 5 | storage << 8 | code << 16 | 1 << 24
-    assert words[9:] == [6, 1, 16, 80, 256, 1024, 4096]
+    assert len(words) == 17
+    assert words[0] == 6 | storage << 8 | code << 16 | 1 << 24
+    assert words[9:] == [6, 1, 16, 80, 256, 1024, 4096, 1]
     assert words[0] not in (1, 2, 3, 4)  # old runtimes reject rather than guess
     for field, value in [("activation", "unknown"), ("projection", "fp32"), ("swiglu_limit", float("nan"))]:
         bad = SimpleNamespace(**vars(g))
@@ -573,3 +573,24 @@ def test_package_requires_explicit_activation_contract(tmp_path, field, value):
     (path / "manifest.json").write_text(json.dumps(manifest))
     with pytest.raises(ValueError, match="activation/projection ABI"):
         package_tool.verify(path)
+
+
+@pytest.mark.parametrize("weights,input_kind", [("bf16", "bf16"), ("fp8", "wire")])
+def test_native_a8_metadata_rejects_incompatible_storage_or_ingress(tmp_path, weights, input_kind):
+    path = write_package(tmp_path / "package", weights=weights, input_kind=input_kind)
+    manifest = json.loads((path / "manifest.json").read_text())
+    manifest["layouts"]["tp4"]["arithmetic"] = "k128_f32_a8"
+    (path / "manifest.json").write_text(json.dumps(manifest))
+    with pytest.raises(ValueError, match="K128/F32 A8 requires"):
+        package_tool.verify(path)
+
+
+def test_native_a8_info_has_explicit_arithmetic_and_bf16_ingress():
+    from types import SimpleNamespace
+    g = SimpleNamespace(kind="fp8a8", weights="fp8", activations="a8_k128_f32",
+        activation="silu_post_clamp_fp32_product", projection="bf16", swiglu_limit=7.0,
+        hidden=4096, slice=256, experts=352, top_k=8, intermediate=1536, tp=6)
+    words = package_tool.info_words(g, [1, 16], False)
+    assert len(words) == 17 and words[16] == 2 and words[7] == 1
+    with pytest.raises(ValueError, match="BF16 input"):
+        package_tool.info_words(g, [1], True)

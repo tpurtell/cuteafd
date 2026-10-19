@@ -129,6 +129,9 @@ def jobs(scope):
     result.extend((f"routed-{geometry}-tp2", "package_fp8_moe_aot.py",
                    ["--geometry", geometry, "--capacities", CAPACITIES, "--layouts", "tp2", "--exact-slices"])
                   for geometry in ROUTED_GEOMETRIES if not geometry.startswith("glmfdense"))
+    result.append(("routed-native-a8", "package_fp8_moe_aot.py",
+                   ["--geometry", "step5", "--arithmetic", "k128-f32-a8",
+                    "--capacities", CAPACITIES, "--layouts", "tp4,tp6"]))
     result.extend((f"exl3-{geometry}", "package_exl3_aot.py",
                    ["--geometry", geometry, "--capacities", CAPACITIES])
                   for geometry in EXL3_GEOMETRIES)
@@ -175,6 +178,12 @@ def export_routed(extra, output):
     geometry = extra[extra.index("--geometry") + 1]
     capacities = sorted({int(item) for item in extra[extra.index("--capacities") + 1].split(",")})
     base = GEOMETRIES[geometry]
+    if "--arithmetic" in extra:
+        from dataclasses import replace
+        arithmetic = extra[extra.index("--arithmetic") + 1]
+        if arithmetic != "k128-f32-a8":
+            raise ValueError(f"unknown routed arithmetic {arithmetic}")
+        base = replace(base, activations="a8_k128_f32")
     layouts = extra[extra.index("--layouts") + 1].split(",") if "--layouts" in extra else ["tp1"]
     if "--exact-slices" in extra:
         for layout in list(layouts):

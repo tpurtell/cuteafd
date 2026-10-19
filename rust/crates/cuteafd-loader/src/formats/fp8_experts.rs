@@ -489,6 +489,10 @@ impl Fp8ExpertTensors {
         ensure!(weight.dtype == DType::F8E4M3 && weight.shape == [rows, cols],
             "{name}: expected E4M3 [{rows}, {cols}], found {:?} {:?}", weight.dtype, weight.shape);
         let scale = self.located(&format!("{name}_scale_inv"))?;
+        if self.arithmetic == ExpertArithmetic::K128F32A8 {
+            ensure!(scale.dtype == DType::F32,
+                "{name}_scale_inv: native K128/F32 A8 requires F32 scales");
+        }
         ensure!(matches!(scale.dtype, DType::F32 | DType::Bf16) && scale.shape == [rows.div_ceil(128), cols.div_ceil(128)],
             "{name}_scale_inv: expected FP32 or BF16 [{}, {}] 128x128 block scales, found {:?} {:?}",
             rows.div_ceil(128), cols.div_ceil(128), scale.dtype, scale.shape);
