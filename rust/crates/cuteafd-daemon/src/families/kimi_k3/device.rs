@@ -197,7 +197,19 @@ pub(crate) struct LaneLayout {
     rows: usize,
     max_context: usize,
     operands: BTreeMap<&'static str, usize>,
+    arena_offsets: BTreeMap<&'static str, usize>,
+    arena_bytes: usize,
 }
+
+// Each native call keeps its internal operands disjoint. Only different phases
+// alias, exclusively on the lane's exact compute stream, including graph replay.
+const SCRATCH_PHASES: [&[&str]; 3] = [
+    &["KDA normalized", "KDA scratch"],
+    &["MLA query", "MLA q residual", "MLA attention", "MLA LSE",
+        "MLA producer scratch", "MLA attention scratch", "MLA output scratch"],
+    &["gate-up", "activated"],
+];
+const ARENA_ALIGNMENT: usize = 1024;
 
 impl LaneLayout {
     pub(crate) fn new(cfg: &KimiK3Config, rows: usize, max_context: usize,
@@ -242,14 +254,29 @@ impl LaneLayout {
         plane("KDA scratch", &[scratch.kda])?;
         for (name, bytes) in ["MLA producer scratch", "MLA attention scratch", "MLA output scratch"]
             .into_iter().zip(scratch.mla) { plane(name, &[bytes])?; }
-        let layout = Self { rows, max_context, operands };
+        let mut arena_offsets = BTreeMap::new();
+        let mut arena_bytes = 0;
+        for phase in SCRATCH_PHASES {
+            let mut end = 0usize;
+            for &name in phase {
+                let offset = end.checked_add(ARENA_ALIGNMENT - 1)
+                    .map(|n| n / ARENA_ALIGNMENT * ARENA_ALIGNMENT)
+                    .ok_or_else(|| anyhow::anyhow!("Kimi phase alignment overflow"))?;
+                ensure!(arena_offsets.insert(name, offset).is_none(), "duplicate Kimi arena operand");
+                end = offset.checked_add(operands[name])
+                    .ok_or_else(|| anyhow::anyhow!("Kimi phase extent overflow"))?;
+            }
+            arena_bytes = arena_bytes.max(end);
+        }
+        let layout = Self { rows, max_context, operands, arena_offsets, arena_bytes };
         layout.bytes()?;
         Ok(layout)
     }
 
     pub(crate) fn bytes(&self) -> Result<usize> {
-        self.operands.values().try_fold(0usize, |sum, bytes| sum.checked_add(*bytes)
-            .ok_or_else(|| anyhow::anyhow!("Kimi lane total extent overflow")))
+        self.operands.iter().filter(|(name, _)| !self.arena_offsets.contains_key(*name))
+            .try_fold(self.arena_bytes, |sum, (_, bytes)| sum.checked_add(*bytes)
+                .ok_or_else(|| anyhow::anyhow!("Kimi lane total extent overflow")))
     }
 
     pub(crate) fn rows(&self) -> usize { self.rows }
@@ -265,13 +292,15 @@ impl LaneLayout {
     pub(super) fn allocate<'a>(&self, device: Device<'a>) -> Result<Lane<'a>> {
         let stream = Stream::new(device)?;
         let _scope = cuteafd_ffi::memory_ledger::scope("workspace/kimi lane");
-        let operands = self.operands.iter().map(|(name, bytes)| {
-            let allocation = Allocation::new(device, *bytes)?;
-            ensure!(allocation.buffer.bytes == *bytes && allocation.buffer.device_id == device.id,
-                "Kimi allocated lane operand {name} differs from admitted extent/device");
-            Ok((*name, allocation))
-        }).collect::<Result<BTreeMap<_, _>>>()?;
-        let lane = Lane { stream: std::rc::Rc::new(stream), operands, layout: self.clone() };
+        let arena = Allocation::new(device, self.arena_bytes)?;
+        let operands = self.operands.iter().filter(|(name, _)| !self.arena_offsets.contains_key(*name))
+            .map(|(name, bytes)| {
+                let allocation = Allocation::new(device, *bytes)?;
+                ensure!(allocation.buffer.bytes == *bytes && allocation.buffer.device_id == device.id,
+                    "Kimi allocated lane operand {name} differs from admitted extent/device");
+                Ok((*name, allocation))
+            }).collect::<Result<BTreeMap<_, _>>>()?;
+        let lane = Lane { stream: std::rc::Rc::new(stream), operands, arena: Some(arena), layout: self.clone() };
         lane.prime_attention()?;
         Ok(lane)
     }
@@ -282,6 +311,7 @@ impl LaneLayout {
 pub(crate) struct Lane<'a> {
     pub stream: std::rc::Rc<Stream<'a>>,
     operands: BTreeMap<&'static str, Allocation<'a>>,
+    arena: Option<Allocation<'a>>,
     layout: LaneLayout,
 }
 
@@ -295,6 +325,10 @@ impl Drop for Lane<'_> {
 
 impl Lane<'_> {
     pub(crate) fn buffer(&self, name: &str) -> Result<cuteafd_ffi::CuteafdDeviceBuffer> {
+        if let Some(&offset) = self.layout.arena_offsets.get(name) {
+            let arena = self.arena.as_ref().ok_or_else(|| anyhow::anyhow!("Kimi lane arena absent"))?;
+            return view(arena.buffer, offset, self.layout.operands[name]);
+        }
         self.operands.get(name).map(|allocation| allocation.buffer)
             .ok_or_else(|| anyhow::anyhow!("unknown Kimi lane operand {name}"))
     }
@@ -1038,9 +1072,11 @@ mod tests {
         let cfg = KimiK3Config::from_hf(&cuteafd_loader::plan::testing::kimi_k3_config())?;
         let mut layout = LaneLayout::new(&cfg, 64, 128, NativeScratch { kda: 16, mla: [16; 3] })?;
         layout.operands.retain(|name, _| ATTENTION_METADATA.contains(name));
+        layout.arena_offsets.clear();
+        layout.arena_bytes = 0;
         let operands = device.run(|| layout.operands.iter().map(|(&name, &bytes)|
             Ok((name, Allocation::new(device, bytes)?))).collect::<Result<BTreeMap<_, _>>>())?;
-        let lane = Lane { stream: Rc::new(Stream { device, raw: std::ptr::null_mut() }), operands, layout };
+        let lane = Lane { stream: Rc::new(Stream { device, raw: std::ptr::null_mut() }), operands, arena: None, layout };
         lane.prime_attention()?;
         let primed = fixture.events()?;
         assert_eq!(primed.matches('C').count(), 6);
@@ -1113,14 +1149,16 @@ mod tests {
         let stream = Rc::new(Stream { device, raw: std::ptr::null_mut() });
         let lane = Lane { stream: stream.clone(),
             operands: BTreeMap::from([("delta", Allocation::new(device, 16)?)]),
-            layout: LaneLayout { rows: 1, max_context: 64, operands: BTreeMap::from([("delta", 16)]) } };
+            arena: Some(Allocation::new(device, 32)?),
+            layout: LaneLayout { rows: 1, max_context: 64, operands: BTreeMap::from([("delta", 16)]),
+                arena_offsets: BTreeMap::new(), arena_bytes: 32 } };
         assert!(!fixture.events()?.contains('d'));
         drop(lane);
         let events = fixture.events()?;
         let first_free = events.find('d').ok_or_else(|| anyhow::anyhow!("lane released no storage"))?;
         assert_eq!(events[..first_free].matches('S').count(), 1,
             "lane teardown must drain even when another owner retains its stream: {events}");
-        assert_eq!(events.matches('d').count(), 1);
+        assert_eq!(events.matches('d').count(), 2);
         drop(stream);
         Ok(())
     }
@@ -1324,7 +1362,25 @@ mod tests {
             assert_eq!(layout.operands["MLA query"], rows * 96 * 576 * 2);
             assert_eq!(layout.operands["expert wire"], rows * KimiExpertInput::ROW_BYTES);
             assert_eq!(layout.operands["MLA attention scratch"], 16);
-            assert_eq!(layout.bytes()?, layout.operands.values().sum::<usize>());
+            let separate = layout.operands.iter().filter(|(name, _)| !layout.arena_offsets.contains_key(*name))
+                .map(|(_, bytes)| bytes).sum::<usize>();
+            assert_eq!(layout.bytes()?, separate + layout.arena_bytes);
+            assert!(layout.bytes()? < layout.operands.values().sum::<usize>());
+            for phase in SCRATCH_PHASES {
+                for (i, &a) in phase.iter().enumerate() {
+                    let start = layout.arena_offsets[a];
+                    assert_eq!(start % ARENA_ALIGNMENT, 0);
+                    assert!(start + layout.operands[a] <= layout.arena_bytes);
+                    for &b in &phase[..i] {
+                        assert!(start >= layout.arena_offsets[b] + layout.operands[b]);
+                    }
+                }
+            }
+            for name in ATTENTION_METADATA.into_iter().chain(["residual arena", "delta", "normalized",
+                "attention output", "ffn output", "shared output", "routed output", "combined output",
+                "route ids", "route weights", "expert wire", "expert combined", "latent normalized"]) {
+                assert!(!layout.arena_offsets.contains_key(name), "persistent/cross-stream operand {name}");
+            }
             assert_eq!(layout.demand(1, 0)?.bytes, layout.bytes()? as u64);
             assert!(layout.demand(2, 0).is_err());
             assert!(layout.demand(0, 2).is_err());
@@ -1333,6 +1389,100 @@ mod tests {
             assert!(LaneLayout::new(&cfg, rows, context, scratch).is_err());
         }
         assert!(LaneLayout::new(&cfg, 1, 1, NativeScratch { kda: usize::MAX, mla: [0; 3] }).is_err());
+        Ok(())
+    }
+
+    /// Vector-clock model: host enqueue order is not a completion dependency.
+    /// A phase's consumers retain all of its views conservatively until the last
+    /// native stage, even when an individual stage only touches a subset.
+    #[test]
+    fn phase_arena_layer_sequences_require_stream_order_or_event_join() -> Result<()> {
+        struct Use { phase: usize, clock: [usize; 2] }
+        struct Schedule<'l> {
+            layout: &'l LaneLayout,
+            clocks: [[usize; 2]; 2],
+            uses: Vec<Use>,
+        }
+        impl Schedule<'_> {
+            fn kernel(&mut self, stream: usize, phase: Option<usize>) -> Result<()> {
+                self.clocks[stream][stream] += 1;
+                let clock = self.clocks[stream];
+                if let Some(phase) = phase {
+                    for prior in &self.uses {
+                        let ordered = prior.clock.iter().zip(clock).all(|(&a, b)| a <= b);
+                        for &a in SCRATCH_PHASES[prior.phase] {
+                            for &b in SCRATCH_PHASES[phase] {
+                                let start_a = self.layout.arena_offsets[a];
+                                let start_b = self.layout.arena_offsets[b];
+                                let overlap = start_a < start_b + self.layout.operands[b]
+                                    && start_b < start_a + self.layout.operands[a];
+                                ensure!(!overlap || ordered, "unordered arena reuse: {a} -> {b}");
+                            }
+                        }
+                    }
+                    self.uses.push(Use { phase, clock });
+                }
+                Ok(())
+            }
+            fn record(&self, stream: usize) -> [usize; 2] { self.clocks[stream] }
+            fn wait(&mut self, stream: usize, event: [usize; 2]) {
+                for (clock, completed) in self.clocks[stream].iter_mut().zip(event) {
+                    *clock = (*clock).max(completed);
+                }
+            }
+        }
+        let cfg = KimiK3Config::from_hf(&cuteafd_loader::plan::testing::kimi_k3_config())?;
+        for rows in [1, 4, 16, 64, 4096] {
+            let layout = LaneLayout::new(&cfg, rows, 1_048_576,
+                NativeScratch { kda: 4096, mla: [1024, 8192, 4096] })?;
+            let make = || Schedule { layout: &layout, clocks: [[0; 2]; 2], uses: Vec::new() };
+            // Walk every layer, including both attention kinds, dense and routed
+            // FFNs. All actual arena-consuming launches use the retained lane stream.
+            let mut serial = make();
+            for layer in 0..cfg.layers {
+                serial.kernel(0, None)?; // attention residual mix
+                match cfg.attention[layer] {
+                    cuteafd_loader::families::kimi_k3::config::KimiAttention::Kda => {
+                        serial.kernel(0, Some(0))?; // recurrent producer
+                        serial.kernel(0, Some(0))?; // normalized output projection consumer
+                    }
+                    cuteafd_loader::families::kimi_k3::config::KimiAttention::Mla => {
+                        for _ in 0..3 { serial.kernel(0, Some(1))?; } // producer, attention, output
+                    }
+                }
+                serial.kernel(0, None)?; // attention publication + FFN residual mix
+                if !cfg.dense[layer] { serial.kernel(0, None)?; } // route/down/wire + expert enqueue/reduce
+                for _ in 0..3 { serial.kernel(0, Some(2))?; } // gate-up, activation, down
+                if !cfg.dense[layer] { serial.kernel(0, None)?; } // intake/reduce/latent-up/combine
+            }
+            // A consumer on a second stream extends the old phase lifetime.
+            // Waiting only for its producer does not permit arena reuse.
+            for attention in [0, 1] {
+                let mut asynchronous = make();
+                asynchronous.kernel(0, Some(attention))?;
+                let produced = asynchronous.record(0);
+                asynchronous.wait(1, produced);
+                asynchronous.kernel(1, Some(attention))?;
+                assert!(asynchronous.kernel(0, Some(2)).is_err());
+                let consumed = asynchronous.record(1);
+                asynchronous.wait(0, consumed);
+                asynchronous.kernel(0, Some(2))?;
+
+                let mut early_reuse = make();
+                early_reuse.kernel(0, Some(attention))?;
+                assert!(early_reuse.kernel(1, Some(2)).is_err());
+                early_reuse.wait(1, early_reuse.record(0));
+                early_reuse.kernel(1, Some(2))?;
+            }
+        }
+        // Production has no second-stream arena user; peer/intake operands are
+        // separate. Keep the native launch stream contract visible to this guard.
+        let source = include_str!("device.rs").split("#[cfg(test)]").next().unwrap();
+        let operators = source.split("pub(crate) fn attention(&mut self").nth(1).unwrap()
+            .split("/// A scheduler-owned sequence stretch").next().unwrap();
+        assert!(!operators.contains("Stream::new"));
+        assert!(!operators.contains("peer.stream"));
+        assert!(operators.contains("self.lane.stream.raw"));
         Ok(())
     }
 
