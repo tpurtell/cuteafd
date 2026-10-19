@@ -6,8 +6,10 @@ use anyhow::{bail, ensure, Result};
 use cuteafd_ffi::{programs::Programs, Bf16Add, KimiExpertInput, KimiFfn, KimiFfnBatch,
     KimiKda, KimiKdaCommit, KimiLatent, KimiMlaMode, KimiPrefixMode, KimiResidual,
     KimiResidualBatch, KimiResidualSite, KimiRmsNorm, KimiRouter};
-use crate::shared::memory::device::Device;
-use cuteafd_loader::families::kimi_k3::config::KimiK3Config;
+use crate::shared::memory::device::{Allocation, Device, Stream};
+use cuteafd_core::memory_layout::{Basis, Category};
+use cuteafd_loader::{families::kimi_k3::config::KimiK3Config, placement::Demand};
+use std::collections::BTreeMap;
 
 /// A device-resident batch: `rows` BF16 rows of `width` in one plane.
 #[derive(Clone, Copy, Debug)]
@@ -164,6 +166,112 @@ impl<'a> NativePrograms<'a> {
     }
 
     pub(crate) fn scratch(&self) -> NativeScratch { self.scratch }
+
+    pub(crate) fn lane_layout(&self, cfg: &KimiK3Config, rows: usize, max_context: usize) -> Result<LaneLayout> {
+        ensure!(self.mla.iter().all(|p| [p.decode.max_context(), p.verify.max_context(), p.extend.max_context()]
+            .into_iter().all(|capacity| max_context <= capacity)), "Kimi lane context exceeds native programs");
+        LaneLayout::new(cfg, rows, max_context, self.scratch)
+    }
+}
+
+/// Named storage for one lane, shared by its serialized layer operations.
+/// Cache/state pools, prefix marks, head I/O and peer/expert exchange are separate
+/// owners; these bytes must not be used as a total-engine allowance.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LaneLayout {
+    rows: usize,
+    operands: BTreeMap<&'static str, usize>,
+}
+
+impl LaneLayout {
+    pub(crate) fn new(cfg: &KimiK3Config, rows: usize, max_context: usize,
+        scratch: NativeScratch) -> Result<Self> {
+        cfg.release_geometry()?;
+        ensure!((1..=4096).contains(&rows) && (1..=1_048_576).contains(&max_context),
+            "Kimi lane row/context capacity");
+        let mut operands = BTreeMap::new();
+        let mut plane = |name, shape: &[usize]| -> Result<()> {
+            let bytes = shape.iter().try_fold(1usize, |n, size| n.checked_mul(*size)
+                .ok_or_else(|| anyhow::anyhow!("Kimi lane {name} extent overflow")))?;
+            ensure!(operands.insert(name, bytes.max(16)).is_none(), "duplicate Kimi lane operand");
+            Ok(())
+        };
+        let hidden = [rows, cfg.hidden, 2];
+        plane("residual arena", &[9, rows, cfg.hidden, 2])?;
+        for name in ["delta", "normalized", "attention output", "ffn output", "shared output", "routed output", "combined output"] {
+            plane(name, &hidden)?;
+        }
+        let intermediate = (cfg.dense_intermediate / 2).max(cfg.moe_intermediate * cfg.shared_experts / 2);
+        plane("gate-up", &[rows, 2, intermediate, 2])?;
+        plane("activated", &[rows, intermediate, 2])?;
+        for name in ["latent input", "expert combined", "latent normalized"] {
+            plane(name, &[rows, cfg.latent, 2])?;
+        }
+        plane("router logits", &[rows, cfg.experts, 4])?;
+        for name in ["route ids", "route weights"] { plane(name, &[rows, cfg.topk, 4])?; }
+        plane("expert wire", &[rows, KimiExpertInput::ROW_BYTES])?;
+        plane("KDA normalized", &[rows, 48, 128, 2])?;
+        for name in ["KDA slots", "KDA first"] { plane(name, &[rows, 4])?; }
+        plane("MLA slots", &[rows, 8])?;
+        plane("MLA query", &[rows, cfg.heads, 576, 2])?;
+        plane("MLA q residual", &[rows, cfg.q_lora_rank, 2])?;
+        plane("MLA attention", &[rows, cfg.heads, 512, 2])?;
+        plane("MLA LSE", &[rows, cfg.heads, 4])?;
+        // Decode/verify permits one request per row, at most the 64-row
+        // specialization. Wide prefill is one sequence. Cache pages live outside.
+        let requests = rows.min(64);
+        plane("MLA page table", &[requests, max_context.div_ceil(64), 4])?;
+        plane("MLA lengths", &[requests, 4])?;
+        plane("MLA query offsets", &[requests + 1, 4])?;
+        plane("KDA scratch", &[scratch.kda])?;
+        for (name, bytes) in ["MLA producer scratch", "MLA attention scratch", "MLA output scratch"]
+            .into_iter().zip(scratch.mla) { plane(name, &[bytes])?; }
+        let layout = Self { rows, operands };
+        layout.bytes()?;
+        Ok(layout)
+    }
+
+    pub(crate) fn bytes(&self) -> Result<usize> {
+        self.operands.values().try_fold(0usize, |sum, bytes| sum.checked_add(*bytes)
+            .ok_or_else(|| anyhow::anyhow!("Kimi lane total extent overflow")))
+    }
+
+    pub(crate) fn rows(&self) -> usize { self.rows }
+
+    pub(crate) fn demand(&self, rank: u8, lane: usize) -> Result<Demand> {
+        ensure!(rank < 2 && lane < 2, "Kimi lane rank/index outside TP2 two-lane executor");
+        Ok(Demand::new(rank, Category::Workspace, format!("Kimi lane {lane} native operands"),
+            u64::try_from(self.bytes()?)?, Basis::Exact))
+    }
+
+    pub(super) fn allocate<'a>(&self, device: Device<'a>) -> Result<Lane<'a>> {
+        let stream = Stream::new(device)?;
+        let _scope = cuteafd_ffi::memory_ledger::scope("workspace/kimi lane");
+        let operands = self.operands.iter().map(|(name, bytes)| {
+            let allocation = Allocation::new(device, *bytes)?;
+            ensure!(allocation.buffer.bytes == *bytes && allocation.buffer.device_id == device.id,
+                "Kimi allocated lane operand {name} differs from admitted extent/device");
+            Ok((*name, allocation))
+        }).collect::<Result<BTreeMap<_, _>>>()?;
+        Ok(Lane { stream, operands, layout: self.clone() })
+    }
+}
+
+/// Stream drops first and drains queued work before any operand is released,
+/// including cancellation/unwind. No allocation occurs during a lane launch.
+pub(crate) struct Lane<'a> {
+    pub stream: Stream<'a>,
+    operands: BTreeMap<&'static str, Allocation<'a>>,
+    layout: LaneLayout,
+}
+
+impl Lane<'_> {
+    pub(crate) fn buffer(&self, name: &str) -> Result<cuteafd_ffi::CuteafdDeviceBuffer> {
+        self.operands.get(name).map(|allocation| allocation.buffer)
+            .ok_or_else(|| anyhow::anyhow!("unknown Kimi lane operand {name}"))
+    }
+
+    pub(crate) fn rows(&self) -> usize { self.layout.rows }
 }
 
 /// Which export each op waits on.
@@ -233,6 +341,79 @@ mod tests {
     }
 
     #[test]
+    fn owned_mla_and_kda_keep_replicated_stored_residuals_bit_equal() -> Result<()> {
+        use cuteafd_loader::families::kimi_k3::{config::KimiAttention, reference::bf16};
+        let cfg = KimiK3Config::from_hf(&cuteafd_loader::plan::testing::kimi_k3_config())?;
+        let embedding = (0..32).map(|i| bf16((i as f32 - 15.0) / 13.0)).collect::<Vec<_>>();
+        let mut prefixes = [embedding.clone(), embedding.clone()];
+        let mut stored: [Vec<Vec<f32>>; 2] = [vec![], vec![]];
+        let mut hidden = embedding;
+        let mut expected_stored = vec![];
+        let mut previous_ffn = vec![0.0; hidden.len()];
+        let bits = |row: &[f32]| row.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+        let add = |a: &[f32], b: &[f32]| a.iter().zip(b).map(|(a, b)| bf16(a + b)).collect::<Vec<_>>();
+        let apply = |prefix: &mut Vec<f32>, blocks: &mut Vec<Vec<f32>>, site: KimiResidualSite, delta: &[f32]| {
+            *prefix = match site.prefix {
+                KimiPrefixMode::Keep => prefix.clone(),
+                KimiPrefixMode::Add => add(prefix, delta),
+                KimiPrefixMode::Replace => delta.to_vec(),
+            };
+            if site.append { blocks.push(prefix.clone()); }
+            assert_eq!(site.candidates, blocks.len() + usize::from(!site.append));
+        };
+        let mut mla_ordinal = 0;
+        for layer in 0..cfg.layers {
+            let attention = residual_site(&cfg, MixSite::Attention(layer))?;
+            for rank in 0..2 { apply(&mut prefixes[rank], &mut stored[rank], attention, &previous_ffn); }
+            if layer % cfg.residual_block == 0 { expected_stored.push(hidden.clone()); }
+            for rank in 0..2 {
+                assert_eq!(bits(&prefixes[rank]), bits(&hidden), "attention prefix layer {layer} rank {rank}");
+                assert_eq!(stored[rank].iter().map(|row| bits(row)).collect::<Vec<_>>(),
+                    expected_stored.iter().map(|row| bits(row)).collect::<Vec<_>>());
+            }
+            let partials: [Vec<f32>; 2] = std::array::from_fn(|rank| (0..hidden.len())
+                .map(|i| bf16(((layer * 17 + i * 3 + rank * 5) % 61) as f32 / 29.0 - 1.0)).collect());
+            let attended = match cfg.attention[layer] {
+                KimiAttention::Kda => {
+                    // Both ranks use the same operand order at the TP2 meet.
+                    let result = add(&partials[0], &partials[1]);
+                    [result.clone(), result]
+                }
+                KimiAttention::Mla => {
+                    let owner = mla_ordinal % 2;
+                    mla_ordinal += 1;
+                    let mut local = [vec![f32::NAN; hidden.len()], vec![f32::NAN; hidden.len()]];
+                    local[owner] = partials[owner].clone();
+                    // Model the shared after-attention hop: only the attended
+                    // BF16 delta moves, never the prefix or stored arena slots.
+                    local[1 - owner] = local[owner].clone();
+                    local
+                }
+            };
+            let ffn_site = residual_site(&cfg, MixSite::Ffn(layer))?;
+            for rank in 0..2 { apply(&mut prefixes[rank], &mut stored[rank], ffn_site, &attended[rank]); }
+            let expected_prefix = if layer % cfg.residual_block == 0 { attended[0].clone() }
+                else { add(&hidden, &attended[0]) };
+            for rank in 0..2 {
+                assert_eq!(bits(&prefixes[rank]), bits(&expected_prefix), "FFN prefix layer {layer} rank {rank}");
+                assert_eq!(stored[rank].iter().map(|row| bits(row)).collect::<Vec<_>>(),
+                    expected_stored.iter().map(|row| bits(row)).collect::<Vec<_>>());
+            }
+            previous_ffn = (0..hidden.len()).map(|i| bf16(((layer + i * 7) % 37) as f32 / 31.0 - 0.5)).collect();
+            hidden = add(&expected_prefix, &previous_ffn);
+        }
+        let output = residual_site(&cfg, MixSite::Output)?;
+        for rank in 0..2 {
+            apply(&mut prefixes[rank], &mut stored[rank], output, &previous_ffn);
+            assert_eq!(bits(&prefixes[rank]), bits(&hidden));
+        }
+        assert_eq!(mla_ordinal, 24);
+        assert_eq!(stored[0].iter().map(|row| bits(row)).collect::<Vec<_>>(),
+            stored[1].iter().map(|row| bits(row)).collect::<Vec<_>>());
+        Ok(())
+    }
+
+    #[test]
     fn native_scratch_uses_each_manifest_peak_and_checks_total_overflow() -> Result<()> {
         let scratch = NativeScratch::combine([1024, 4096],
             [[256, 1024, 4096], [512, 2048, 2048], [128, 8192, 1024]])?;
@@ -240,6 +421,31 @@ mod tests {
         assert_eq!(scratch.bytes()?, 16_896);
         assert!(NativeScratch::combine([usize::MAX, 1], [[1, 0, 0]]).is_err());
         assert!(NativeScratch::combine([0, 0], [[0, usize::MAX, 1]]).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn lane_layout_uses_native_extents_without_hidden_engine_allowances() -> Result<()> {
+        let cfg = KimiK3Config::from_hf(&cuteafd_loader::plan::testing::kimi_k3_config())?;
+        let scratch = NativeScratch { kda: 4096, mla: [512, 0, 1024] };
+        for rows in [1, 16, 4096] {
+            let layout = LaneLayout::new(&cfg, rows, 1_048_576, scratch)?;
+            assert_eq!(layout.operands["residual arena"], KimiResidual::arena_bytes(rows)?);
+            assert_eq!(layout.operands["gate-up"], rows * 2 * 16896 * 2);
+            assert_eq!(layout.operands["MLA page table"], rows.min(64) * 16384 * 4);
+            assert_eq!(layout.operands["KDA normalized"], rows * 6144 * 2);
+            assert_eq!(layout.operands["MLA query"], rows * 96 * 576 * 2);
+            assert_eq!(layout.operands["expert wire"], rows * KimiExpertInput::ROW_BYTES);
+            assert_eq!(layout.operands["MLA attention scratch"], 16);
+            assert_eq!(layout.bytes()?, layout.operands.values().sum::<usize>());
+            assert_eq!(layout.demand(1, 0)?.bytes, layout.bytes()? as u64);
+            assert!(layout.demand(2, 0).is_err());
+            assert!(layout.demand(0, 2).is_err());
+        }
+        for (rows, context) in [(0, 1), (4097, 1), (1, 0), (1, 1_048_577)] {
+            assert!(LaneLayout::new(&cfg, rows, context, scratch).is_err());
+        }
+        assert!(LaneLayout::new(&cfg, 1, 1, NativeScratch { kda: usize::MAX, mla: [0; 3] }).is_err());
         Ok(())
     }
 

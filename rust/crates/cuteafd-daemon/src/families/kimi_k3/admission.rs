@@ -1,7 +1,7 @@
 //! Native coordinator inventory passed to the shared startup solver, before
 //! weights, recurrent state or cache owners allocate. This is not the header
 //! lower bound exposed by `plan` and does not admit Spark workers by itself.
-use super::weights::{LayerLayout, LayerWeights, PackedLayer};
+use super::{device::{Lane, LaneLayout}, weights::{LayerLayout, LayerWeights, PackedLayer}};
 use crate::shared::memory::device::Device;
 use anyhow::{ensure, Context, Result};
 use cuteafd_core::memory_layout::{Basis, Category};
@@ -29,6 +29,7 @@ pub(crate) struct Inputs<'a> {
     pub prefix_marks: usize,
     pub rows: usize,
     pub lanes: usize,
+    pub lane_layouts: Vec<[LaneLayout; 2]>,
     pub fixed: Vec<Demand>,
     pub startup: Vec<Demand>,
     pub pool_bounded: Vec<BoundedDemand>,
@@ -39,6 +40,8 @@ pub(crate) struct Admission {
     layouts: Vec<[LayerLayout; 2]>,
     devices: [i32; 2],
     lanes: u64,
+    lane_layouts: Vec<[LaneLayout; 2]>,
+    lane_allocated: Vec<[bool; 2]>,
 }
 
 /// The normal Spark lane consumes these selected layer IDs; selection still
@@ -59,12 +62,33 @@ impl Admission {
         let layout = &self.layouts.get(layer).context("Kimi upload layer outside admission")?[rank];
         LayerWeights::upload(device, packed, layout, layout.bytes()?)
     }
+
+    pub(crate) fn allocate_lane<'a>(&mut self, device: Device<'a>, rank: usize, lane: usize) -> Result<Lane<'a>> {
+        let layout = self.check_lane(rank, lane, device.id)?;
+        let allocated = layout.allocate(device)?;
+        self.lane_allocated[lane][rank] = true;
+        Ok(allocated)
+    }
+
+    fn check_lane(&self, rank: usize, lane: usize, device: i32) -> Result<&LaneLayout> {
+        ensure!(rank < 2 && device == self.devices[rank] && lane < self.lanes as usize,
+            "Kimi lane allocation differs from admitted rank/device/index");
+        ensure!(!self.lane_allocated[lane][rank], "Kimi admitted lane already allocated");
+        let layout = &self.lane_layouts[lane][rank];
+        let demand = layout.demand(rank as u8, lane)?;
+        let charges = self.placement.items[rank].iter().filter(|item| item.group == demand.group).collect::<Vec<_>>();
+        ensure!(charges.len() == 1 && charges[0].category == demand.category
+            && charges[0].basis == Basis::Exact && charges[0].bytes == demand.bytes,
+            "Kimi lane allocation differs from accepted operand charge");
+        Ok(layout)
+    }
 }
 
 pub(crate) fn admit(inputs: Inputs<'_>) -> Result<Admission> {
     let cfg = inputs.cfg;
     let devices = inputs.devices;
     let lanes = inputs.lanes as u64;
+    let lane_layouts = inputs.lane_layouts.clone();
     let request = request(inputs)?;
     let placement = solve(&request)?;
     EXECUTOR.check(&placement)?;
@@ -78,7 +102,8 @@ pub(crate) fn admit(inputs: Inputs<'_>) -> Result<Admission> {
             .try_fold(0u64, |sum, item| sum.checked_add(item.bytes).context("Kimi weight charge overflow"))?;
         ensure!(native == charged, "Kimi rank {rank} native weights differ from shared admission: {native} != {charged}");
     }
-    Ok(Admission { placement, layouts, devices, lanes })
+    let lane_allocated = vec![[false; 2]; lane_layouts.len()];
+    Ok(Admission { placement, layouts, devices, lanes, lane_layouts, lane_allocated })
 }
 
 fn request(i: Inputs<'_>) -> Result<PlacementRequest> {
@@ -100,7 +125,17 @@ fn request(i: Inputs<'_>) -> Result<PlacementRequest> {
     ensure!(i.fixed.iter().chain(&i.startup).all(|d| d.gpu < 2 && d.basis != Basis::Estimated)
         && i.pool_bounded.iter().all(|d| d.gpu < 2 && d.basis != Basis::Estimated),
         "Kimi runtime admission cannot use estimated or out-of-rank demands");
+    ensure!(i.lane_layouts.len() == i.lanes && i.lane_layouts.iter().flatten().all(|layout| layout.rows() == i.rows),
+        "Kimi lane operand layouts differ from executor geometry");
     let mut fixed = i.fixed;
+    for (lane, pair) in i.lane_layouts.iter().enumerate() {
+        for (rank, layout) in pair.iter().enumerate() {
+            let demand = layout.demand(rank as u8, lane)?;
+            ensure!(!fixed.iter().chain(&i.startup).any(|item| item.gpu == demand.gpu && item.group == demand.group),
+                "Kimi lane operand charge supplied twice");
+            fixed.push(demand);
+        }
+    }
     let state = KimiKda::state_bytes(i.state_slots)?.checked_add(KimiKda::conv_state_bytes(i.state_slots)?)
         .context("Kimi state extent overflow")? as u64;
     let mark = KimiKda::state_bytes(1)?.checked_add(KimiKda::conv_state_bytes(1)?)
@@ -167,6 +202,9 @@ mod tests {
         Inputs { cfg, gpus: [GpuBudget { capacity_bytes: 96 << 30, headroom_bytes: 2 << 30,
             baseline: Baseline::Measured { free_bytes: 96 << 30 } }; 2], devices: [0, 1], peer_access: true, spark_ranks: 6,
             attention: None, requested_pool: None, state_slots: 2, prefix_marks: 2, rows: 4096, lanes: 2,
+            lane_layouts: vec![std::array::from_fn(|_| LaneLayout::new(
+                &KimiK3Config::from_hf(&cuteafd_loader::plan::testing::kimi_k3_config()).unwrap(), 4096, 1_048_576,
+                super::super::device::NativeScratch { kda: 1024, mla: [512, 0, 1024] }).unwrap()); 2],
             fixed: (0..2).map(|rank| Demand::new(rank, Category::Workspace, "native engine buffers", 1 << 20, Basis::Exact)).collect(),
             startup: vec![], pool_bounded: vec![] }
     }
@@ -210,6 +248,30 @@ mod tests {
                 assert_eq!(state(&heads), state(&owned));
             }
         }
+        Ok(())
+    }
+
+    #[test]
+    fn lane_allocations_require_immutable_accepted_rank_extents() -> Result<()> {
+        let cfg = cfg();
+        let mut admitted = admit(inputs(&cfg))?;
+        let expected = admitted.lane_layouts[0][0].bytes()?;
+        assert_eq!(admitted.check_lane(0, 0, 0)?.bytes()?, expected);
+        for (rank, lane, device) in [(2, 0, 0), (0, 2, 0), (0, 0, 1), (1, 0, -1)] {
+            assert!(admitted.check_lane(rank, lane, device).is_err());
+        }
+        admitted.lane_allocated[0][0] = true;
+        assert!(admitted.check_lane(0, 0, 0).is_err());
+        admitted.lane_allocated[0][0] = false;
+        let group = admitted.lane_layouts[0][0].demand(0, 0)?.group;
+        admitted.placement.items[0].iter_mut().find(|item| item.group == group).unwrap().bytes -= 1;
+        assert!(admitted.check_lane(0, 0, 0).is_err());
+        let mut i = inputs(&cfg);
+        i.fixed.push(i.lane_layouts[0][0].demand(0, 0)?);
+        assert!(admit(i).is_err());
+        let mut i = inputs(&cfg);
+        i.lane_layouts.pop();
+        assert!(admit(i).is_err());
         Ok(())
     }
 
