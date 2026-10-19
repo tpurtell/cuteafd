@@ -1,14 +1,14 @@
 //! Kimi K3 (`KimiK3ForConditionalGeneration`, text `kimi_linear`): KDA + NoPE
 //! MLA hybrid with attention-residual blocks, latent MoE and Situ FFNs. The
-//! planner validates the checkpoint's own config and tensor headers and names
-//! missing execution artifacts from the installed program and package inventory.
+//! planner validates only the checkpoint's own config and tensor headers.
+//! Runtime admission verifies installed native programs and expert packages.
 use std::collections::BTreeMap;
 
-use anyhow::{ensure, Context, Result};
+use anyhow::{ensure, Result};
 use cuteafd_core::{DType, FfnActivation};
 
 use crate::families::kimi_k3::config::{KimiAttention, KimiK3Config};
-use crate::plan::{checkpoint::Checkpoint, family::*, format::QuantOperand, names::indexed, spec::*};
+use crate::plan::{checkpoint::Checkpoint, family::*, format::{self, QuantOperand}, names::indexed, spec::*};
 
 mod placement;
 #[cfg(test)]
@@ -52,8 +52,6 @@ pub(super) struct Model {
     complete: bool,
     /// Routed formats observed (`exl3-k2`, ...).
     expert_formats: Vec<String>,
-    /// This process's sealed role artifacts, checked once rather than per operand.
-    installed_experts: Result<(), String>,
     /// Coordinator text bytes by TP2 residency (embedding, head and MLA excluded).
     coordinator: Residency,
     /// MLA operands by layer, held whole on the owner or head-split explicitly.
@@ -79,76 +77,6 @@ pub(super) fn replicated(rest: &str) -> bool {
 
 /// Strip the text prefix: `language_model.model.layers.3.x` -> `layers.3.x`.
 fn text(name: &str) -> Option<&str> { name.strip_prefix(TEXT) }
-
-fn installed_expert_inventory() -> Result<()> {
-    let path = std::env::var_os("CUTEAFD_PROGRAM_MANIFEST")
-        .context("Kimi K3 admission requires CUTEAFD_PROGRAM_MANIFEST from the sealed image")?;
-    validate_expert_inventory(std::path::Path::new(&path))
-}
-
-pub(crate) fn validate_expert_inventory(path: &std::path::Path) -> Result<()> {
-    use crate::plan::checkpoint::read_json;
-    let programs = read_json(path)?;
-    ensure!(programs["schema"] == 1 && programs["programs"].is_array(), "invalid PROGRAMS.json inventory");
-    let root = path.parent().context("program inventory has no parent")?.join("exl3/exl3-kimik3-k23");
-    let package = read_json(&root.join("manifest.json"))?;
-    ensure!(package["schema"] == "cuteafd.exl3-package.v1" && package["geometry"] == "kimik3",
-        "Kimi K3 EXL3 package schema/geometry mismatch");
-    let revision = package["sparkinfer_revision"].as_str().filter(|s| s.len() == 40)
-        .context("Kimi K3 package lacks source revision")?;
-    let lock: serde_json::Value = serde_json::from_str(include_str!(concat!(env!("CARGO_MANIFEST_DIR"),
-        "/../../../third_party/sparkinfer.lock.json")))?;
-    ensure!(lock["revision"] == revision, "Kimi K3 package/source revision mismatch");
-    let (layouts, width, output) = match package["role"].as_str() {
-        Some("spark") => ((0..6).map(|r| format!("tp6-rank{r}")).collect::<Vec<_>>(), 512, "bf16"),
-        Some("coordinator") => {
-            ensure!(programs["sparkinfer_revision"] == revision, "Kimi K3 program/package revision mismatch");
-            let inventory = programs["programs"].as_array().unwrap();
-            for name in ["kimik3_router_scores", "kimik3_expert_input_quant", "kimik3_latent_down",
-                "kimik3_latent_up", "kimik3_rmsnorm_h3584"] {
-                let entries = inventory.iter().filter(|p| p["name"] == name).collect::<Vec<_>>();
-                ensure!(entries.len() == 1 && entries[0]["object_sha256"].as_str().is_some_and(|s| s.len() == 64),
-                    "Kimi K3 program inventory requires one sealed {name}");
-                let geometry = &entries[0]["geometry"];
-                match name {
-                    "kimik3_router_scores" => ensure!(geometry["hidden"] == 7168 && geometry["experts"] == 896
-                        && geometry["top_k"] == 16, "Kimi router geometry mismatch"),
-                    "kimik3_latent_down" => ensure!(geometry["width"] == 7168 && geometry["outputs"] == 3584,
-                        "Kimi latent down geometry mismatch"),
-                    "kimik3_latent_up" => ensure!(geometry["width"] == 3584 && geometry["outputs"] == 7168,
-                        "Kimi latent up geometry mismatch"),
-                    _ => ensure!(geometry["hidden"] == 3584, "Kimi latent input geometry mismatch"),
-                }
-            }
-            (vec!["rtx-tp1".into()], 3072, "fp32")
-        }
-        _ => anyhow::bail!("Kimi K3 EXL3 package must declare coordinator or spark role"),
-    };
-    let variants = package["variants"].as_array().context("Kimi K3 package lacks variants")?;
-    for layout in layouts {
-        for capacity in cuteafd_core::Exl3RowPolicy::for_geometry(cuteafd_core::ExpertGeometry::KIMI_K3).capacities(4096)? {
-            let directory = format!("{layout}/m{capacity}");
-            let entries = variants.iter().filter(|v| v["directory"] == directory).collect::<Vec<_>>();
-            ensure!(entries.len() == 1, "Kimi K3 package requires one {directory}");
-            let meta = read_json(&root.join(&directory).join("v41_exl3.json"))?;
-            for entry in [entries[0], &meta] {
-                ensure!(entry["intermediate"] == width && entry["experts"] == 896 && entry["top_k"] == 16
-                    && entry["capacity"] == capacity && entry["bits"] == serde_json::json!([2, 3])
-                    && entry["output_dtype"] == output, "Kimi K3 package geometry mismatch: {directory}");
-            }
-            ensure!(meta["sparkinfer_revision"] == revision && meta["hidden"] == 3584
-                && meta["activation"] == "situ" && meta["descriptor_bits"] == 10
-                && meta["descriptor_rows"].as_u64().is_none_or(|n| n == 3)
-                && meta["native_info_version"].as_u64().is_none_or(|n| n == 2)
-                && meta["decode_schedule"].is_null(), "Kimi K3 EXL3 native contract mismatch: {directory}");
-            for artifact in ["libcuteafd_exl3.so", "routes/libv41_exl3_routes.so", "trellis_lut.bin"] {
-                ensure!(root.join(&directory).join(artifact).is_file(),
-                    "Kimi K3 package missing {directory}/{artifact}");
-            }
-        }
-    }
-    Ok(())
-}
 
 impl Model {
     fn open(checkpoint: &Checkpoint) -> Result<Self> {
@@ -215,8 +143,7 @@ impl Model {
         let spec = spec(&cfg, checkpoint);
         let mla = vec![Residency::default(); cfg.layers];
         let mut model = Self { cfg, spec, tensors, bytes: BTreeMap::new(), complete: true, expert_formats: Vec::new(),
-            coordinator: Residency::default(), mla, installed_experts: installed_expert_inventory()
-                .map_err(|error| format!("{error:#}")) };
+            coordinator: Residency::default(), mla };
         let mut headers = BTreeMap::new();
         for tensor in &checkpoint.tensors { headers.insert(tensor.meta.name.as_str(), &tensor.meta); }
         for (name, expected) in &model.tensors {
@@ -333,58 +260,50 @@ impl Family for KimiK3 {
         Some(TensorRole::layer(component, layer))
     }
     fn component_hint(&self, component: Component) -> Option<Hint> {
-        // Work items as posted on #273.
-        let (what, how) = match component {
-            Component::RoutedExpert => ("EXL3 K2 latent experts (H3584 E896 K16 I3072, Situ)",
-                "mixed_trellis expert ids above 512 (10-bit descriptors), Situ epilogue through compile_mixed_trellis, \
-                 package_exl3_aot.py GEOMETRIES (3584,3072,896,16) TP6 width 512; reducer width 3584 (W4/W5)"),
-            Component::Router => ("sigmoid noaux_tc router at E896/K16, scale 1.0",
-                "expert_router.cu caps E512/K8 and glm routes fix 2.5; add an FP32 E896 top-16 variant (W5)"),
-            Component::Attention => ("KDA 96x128 at hidden 7168 with a full-rank output gate; NoPE full-causal MLA 96 heads with sigmoid output gate",
-                "generalize glmf KDA programs (hidden 7168, 48 heads/GPU, g_proj in w_in, F32 conv/o_norm, A_log narrowed before split) (W6); \
-                 AOT-export b12x dense_mla (576/512 latent, scale 192^-0.5, unrotated rope slot), no-RoPE producer, gate before o_proj (W7)"),
-            Component::ResidualMix => ("attention-residual mixer (not mHC)",
-                "shared FP32 rmsnorm-score softmax mix over up to 9 BF16 candidates, fused with the following RMSNorm; block store scratch (W8)"),
-            Component::LatentProjection => ("latent MoE projections and post-combine RMSNorm(3584)",
-                "coordinator order: down_proj -> dispatch -> reduce at 3584 -> RMSNorm -> up_proj -> + shared (W9)"),
-            Component::DenseFfn | Component::SharedExpert => ("Situ dense/shared FFN",
-                "BF16 FFN programs with the Situ epilogue (FfnActivation::Situ) (W8)"),
-            Component::Vision => ("MoonViT3d tower + patchmergerv2 projector", "later step; text first"),
-            Component::Embedding | Component::LmHead | Component::Norm => ("Kimi K3 engine", "families/kimi_k3 engine (W9)"),
-            _ => return None,
-        };
-        Some(Hint { what: format!("Kimi K3 {}: {what} missing", component.label()), how: how.into() })
+        match component {
+            Component::Vision => Some(Hint {
+                what: "Kimi K3 vision execution is not implemented".into(),
+                how: "Add the bundled MoonViT3d tower and patchmergerv2 projector; serve text with --vision off today".into(),
+            }),
+            Component::Speculator | Component::SpeculatorExpert => Some(Hint {
+                what: "Kimi K3 draft execution is not implemented".into(),
+                how: "Serve text without speculation; a windowed external drafter needs a native integration".into(),
+            }),
+            _ => None,
+        }
     }
 }
 
 impl FamilyModel for Model {
     fn spec(&self) -> &ModelSpec { &self.spec }
+    fn native_serving_admission(&self) -> bool { true }
+    fn vision_mode(&self, mode: crate::plan::MediaMode) -> crate::plan::MediaMode {
+        if mode == crate::plan::MediaMode::Auto { crate::plan::MediaMode::Off } else { mode }
+    }
     fn spark_budget_bytes(&self) -> u64 { SPARK_BUDGET_BYTES }
     fn activation(&self, layer: usize, _shared: bool) -> Option<FfnActivation> {
         (layer < self.cfg.layers).then(|| self.cfg.activation())
     }
     fn accepts(&self, role: &TensorRole, stem: &str, operand: &mut QuantOperand) -> Result<(), String> {
-        let known = self.tensors.contains_key(stem) || self.tensors.contains_key(&format!("{stem}.weight"))
-            || (role.component == Component::RoutedExpert && operand.exl3_bits() == Some(2))
-            || role.component == Component::Vision;
-        if !known {
-            return Err(format!("{stem}: not in the Kimi K3 release tensor contract ({})", super::describe(operand)));
-        }
         if role.component == Component::RoutedExpert && operand.exl3_bits() == Some(2) {
             let expected = match stem.rsplit_once('.').map(|(_, name)| name) {
                 Some("w1" | "w3") => [self.cfg.moe_intermediate, self.cfg.latent],
                 Some("w2") => [self.cfg.latent, self.cfg.moe_intermediate],
                 _ => return Err(format!("{stem}: unknown Kimi routed projection")),
             };
-            if operand.logical != expected {
-                return Err(format!("{stem}: Kimi routed shape {:?}, expected {expected:?}", operand.logical));
-            }
-            return self.installed_experts.clone().map_err(|reason|
-                format!("{stem}: Kimi K3 routed expert artifacts unavailable: {reason}"));
+            return super::require(operand.logical == expected, ||
+                format!("{stem}: Kimi routed shape {:?}, expected {expected:?}", operand.logical));
         }
-        let hint = KIMI_K3.component_hint(role.component)
-            .unwrap_or(Hint { what: "Kimi K3 engine missing".into(), how: "families/kimi_k3 (W9)".into() });
-        Err(format!("{stem}: {}: {}", hint.what, hint.how))
+        let expected = self.tensors.get(stem).or_else(|| self.tensors.get(&format!("{stem}.weight")))
+            .ok_or_else(|| format!("{stem}: outside the Kimi K3 native text tensor contract ({})", super::describe(operand)))?;
+        let encoding = match expected.dtype {
+            DType::Bf16 => format::Encoding::Bf16,
+            DType::F32 => format::Encoding::F32,
+            _ => return Err(format!("{stem}: unsupported Kimi text dtype {:?}", expected.dtype)),
+        };
+        super::require(operand.logical == expected.shape && operand.is_plain(&[encoding])
+            && operand.input_scale.is_none() && operand.companions.is_empty(), ||
+            format!("{stem}: expected plain {:?} {:?}, found {}", expected.dtype, expected.shape, super::describe(operand)))
     }
     fn experts(&self, operand: &QuantOperand) -> Option<ExpertContract> {
         (operand.exl3_bits() == Some(2)).then(|| ExpertContract {

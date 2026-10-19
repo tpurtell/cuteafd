@@ -30,6 +30,11 @@ pub(crate) struct Loaded<'a> {
     pub admitted_bytes: Vec<u64>,
 }
 
+/// Run before loading native programs, whose card selection can query the GPU.
+pub(crate) fn preflight(manifest: &Path) -> Result<()> {
+    cuteafd_loader::families::kimi_k3::validate_expert_inventory(manifest)
+}
+
 pub(crate) fn load<'a>(library: &'a Arc<cuteafd_ffi::NativeLibrary>,
     programs: &'a cuteafd_ffi::programs::Programs<'a>,
     checkpoint: &cuteafd_loader::plan::Checkpoint, full: &KimiK3Config,
@@ -143,4 +148,13 @@ pub(super) fn exchange_demands(rows: usize, diagnostics: bool) -> Result<Vec<Dem
     let bytes = recv + 256 + 256 + (((HOP_SLOTS + 1) * 16) as usize).max(256) + progress;
     Ok((0..2).map(|rank| Demand::new(rank, Category::Workspace, "Kimi peer/abort/hop controls",
         bytes as u64, Basis::Exact)).collect())
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn missing_inventory_is_refused_without_native_or_device_access() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(super::preflight(&dir.path().join("absent.json")).is_err());
+    }
 }

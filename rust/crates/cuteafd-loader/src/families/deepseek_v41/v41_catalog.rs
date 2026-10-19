@@ -1499,7 +1499,7 @@ mod tests {
         let spark_manifest = std::env::var_os("CUTEAFD_KIMI_SPARK_PROGRAM_MANIFEST")
             .context("set CUTEAFD_KIMI_SPARK_PROGRAM_MANIFEST to the sealed Spark inventory")?;
         let spark_manifest = Path::new(&spark_manifest);
-        crate::plan::families::kimi::validate_expert_inventory(spark_manifest)?;
+        crate::families::kimi_k3::validate_expert_inventory(spark_manifest)?;
         let packages = spark_manifest.parent().unwrap().join("exl3/exl3-kimik3-k23");
         for rank in 0..6 {
             recipe.validate_installed(&packages, rank, recipe.slicing, 512)?;

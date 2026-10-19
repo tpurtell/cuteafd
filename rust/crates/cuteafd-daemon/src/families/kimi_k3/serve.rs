@@ -35,6 +35,8 @@ impl ServeArgs {
         ensure!(self.peers.len() == 6 && self.peers.iter().collect::<std::collections::HashSet<_>>().len() == 6,
             "Kimi serving requires six distinct real Spark endpoints");
         ensure!((1..=1_048_576).contains(&self.max_context), "Kimi context exceeds the compiled 1M extent");
+        ensure!(!self.prefix.host_cache_bytes.enabled(),
+            "Kimi host prefix-cache tier is not implemented: KDA recurrent state and MLA pages require byte-exact host snapshots; use --host-cache-bytes 0");
         ensure!(self.prefix.prefix_partial == crate::shared::prefix::Toggle::Off,
             "Kimi serving requires exact prefix frontiers");
         ensure!(matches!(self.token_io.embed_placement, crate::shared::token_io::EmbedPlacement::Gpu),
@@ -71,6 +73,7 @@ pub(crate) async fn run(args: ServeArgs) -> Result<()> {
             let mark_bytes = super::state::KdaLayout::new(&cfg, slots, 1, 1)?.mark_bytes()
                 .checked_mul(2).context("Kimi TP2 prefix mark extent overflow")?;
             let marks = worker_args.prefix.mark_rule(slots).slots(mark_bytes);
+            startup::preflight(&worker_args.manifest)?;
             // SAFETY: every native owner drops on this worker before the library.
             let library = Arc::new(unsafe { cuteafd_ffi::NativeLibrary::load(&worker_args.native_lib)? });
             let programs = library.programs()?.with_manifest(&worker_args.manifest)?;
@@ -152,6 +155,11 @@ mod tests {
             ["--embedding-placement", "host"], ["--prefix-partial", "on"]] {
             assert!(args(&["--peers", peers, extra[0], extra[1]])?.validate().is_err());
         }
+        for budget in ["auto", "1", "32GiB"] {
+            let error = args(&["--peers", peers, "--host-cache-bytes", budget])?.validate().unwrap_err();
+            assert!(error.to_string().contains("Kimi host prefix-cache tier is not implemented"));
+        }
+        args(&["--peers", peers, "--host-cache-bytes", "0"])?.validate()?;
         assert!(args(&["--max-sequences", "65"]).is_err());
         assert!(args(&["--speculator", "mtp"]).is_err());
         Ok(())
