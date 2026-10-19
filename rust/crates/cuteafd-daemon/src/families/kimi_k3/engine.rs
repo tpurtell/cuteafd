@@ -209,6 +209,21 @@ impl<'a> Engine<'a> {
         })
     }
 
+    /// Sequential cold diagnostics reuse a single recurrent slot. Each rank's
+    /// reset follows its own completed lane work; no binding/storage teardown.
+    pub(crate) fn reset_cold_state(&self) -> Result<()> {
+        let lanes = self.lanes.try_borrow()?;
+        ensure!(lanes.local.len() == 1, "Kimi cold diagnostic reset needs one lane");
+        for local in &lanes.local[0] {
+            local.stream().device.run(|| {
+                // SAFETY: retained lane stream and operands outlive synchronization.
+                unsafe { local.stream().device.library.cuda_stream_synchronize(local.stream().raw) }
+            })?;
+            local.reset_cold_state()?;
+        }
+        Ok(())
+    }
+
     /// Diagnostic embedding-to-logits path. No graph/replay or speculative
     /// transaction qualification is implied by this uncaptured forward.
     pub(crate) fn forward(&self, tokens: &[Vec<u32>], sequences: &[Vec<SequenceRows<'_>>],

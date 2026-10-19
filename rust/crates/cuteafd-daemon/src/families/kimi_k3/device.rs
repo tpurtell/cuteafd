@@ -410,6 +410,22 @@ impl<'a> LocalLane<'a> {
         })
     }
 
+    /// Cold diagnostic window reuse on the exact owner stream. The caller must
+    /// order prior consumers before resetting; this never releases state storage.
+    pub(crate) fn reset_cold_state(&self) -> Result<()> {
+        self.stream().device.run(|| {
+            for (layer, attention) in self.cfg.attention.iter().enumerate() {
+                if *attention != cuteafd_loader::families::kimi_k3::config::KimiAttention::Kda { continue; }
+                for buffer in self.kda.slot(layer, 0)? {
+                    // SAFETY: retained slot zero belongs to this lane and all
+                    // previous work is ordered before this exact stream.
+                    unsafe { self.stream().device.library.cuda_zero_bytes_async(buffer, buffer.bytes, self.stream().raw)?; }
+                }
+            }
+            Ok(())
+        })
+    }
+
     /// Outside capture: replace metadata contents, never the admitted addresses.
     /// The scheduler retains pages/slots and orders cross-lane users through
     /// completion; a graph's identity uses row shape, not sequence partitions.
