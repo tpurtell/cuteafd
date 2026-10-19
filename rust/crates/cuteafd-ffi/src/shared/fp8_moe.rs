@@ -390,7 +390,7 @@ mod metadata_tests {
     use super::*;
 
     fn words() -> [u32; 17] {
-        // ABI 5, MXFP4, pre-SiLU clamp, BF16 projection and input.
+        // ABI 6, MXFP4, pre-SiLU clamp, BF16 projection and input.
         [0x01010206, 6144, 2048, 256, 8, 2048, 1, 1, 0, 2, 16, 4096, 0, 0, 0, 0, 1]
     }
 

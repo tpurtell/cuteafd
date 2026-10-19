@@ -891,10 +891,15 @@ mod tests {
                 }
             }
         }
+        for projection in Fp8Projection::ALL {
+            let name = tensors.name(4, 0, projection);
+            Arc::make_mut(&mut tensors.numerics).insert(name, ExpertArithmetic::K128F32A8);
+        }
         let groups = tensors.homogeneous_layers(&[3, 4, 5, 6, 7])?;
         assert_eq!(groups.iter().map(|(_, ids)| ids.clone()).collect::<Vec<_>>(),
-            vec![vec![3, 4], vec![5], vec![6], vec![7]]);
-        assert_eq!(groups[2].0.format(), ExpertFormat::Bf16);
+            vec![vec![3], vec![4], vec![5], vec![6], vec![7]]);
+        assert_eq!(groups[1].0.arithmetic(), ExpertArithmetic::K128F32A8);
+        assert_eq!(groups[3].0.format(), ExpertFormat::Bf16);
         assert!(groups.iter().all(|(view, _)| Arc::ptr_eq(&view.tensors, &tensors.tensors)));
         assert_eq!(tensors.homogeneous_layers(&[3, 7])?.len(), 2);
         assert!(tensors.homogeneous_layers(&[]).is_err());

@@ -106,13 +106,9 @@ impl Checkpoint {
         let mut unscaled = BTreeMap::<String, BTreeSet<String>>::new();
         for (name, shard) in &checkpoint.weight_map {
             let Some(module) = name.strip_suffix(".weight") else { continue };
-            let lacks_scales = match checkpoint.declared_numerics(module)? {
-                ModuleNumerics::W4A4 => ["weight_scale", "weight_scale_2", "input_scale"].iter()
-                    .all(|suffix| !checkpoint.contains_tensor(&format!("{module}.{suffix}"))),
-                ModuleNumerics::W8A8K128F32 => !checkpoint.contains_tensor(&format!("{module}.weight_scale_inv")),
-                _ => false,
-            };
-            if lacks_scales {
+            if checkpoint.declared_numerics(module)? == ModuleNumerics::W4A4
+                && ["weight_scale", "weight_scale_2", "input_scale"].iter()
+                    .all(|suffix| !checkpoint.contains_tensor(&format!("{module}.{suffix}"))) {
                 unscaled.entry(shard.clone()).or_default().insert(name.clone());
             }
         }
@@ -263,7 +259,10 @@ impl Checkpoint {
                 && !self.contains_tensor(&scale) {
                 return Ok(ModuleNumerics::CheckpointPrecision);
             }
-            ensure!(dtype == cuteafd_core::DType::F8E4M3 && self.contains_tensor(&scale),
+            if dtype != cuteafd_core::DType::F8E4M3 {
+                return Ok(ModuleNumerics::CheckpointPrecision);
+            }
+            ensure!(self.contains_tensor(&scale),
                 "{module}: native K128/F32 A8 requires E4M3 weights and weight_scale_inv");
             return Ok(declared);
         }
@@ -303,8 +302,10 @@ impl Checkpoint {
     fn declared_numerics_for_owner(&self, module: &str, owner: &str) -> Result<ModuleNumerics> {
         let Some(root) = self.quantization() else { return Ok(ModuleNumerics::CheckpointPrecision) };
         let q = root.get("quantization").unwrap_or(root);
-        if root.get("quant_method").and_then(Value::as_str) == Some("fp8") {
-            if !(module.contains(".experts.") || owner.ends_with(".moe")) {
+        if root.get("quant_method").and_then(Value::as_str) == Some("fp8")
+            && root.pointer("/producer/name").and_then(Value::as_str) != Some("modelopt") {
+            if !(module.contains(".experts.") || owner.ends_with(".moe"))
+                || !self.contains_tensor(&format!("{module}.weight_scale_inv")) {
                 return Ok(ModuleNumerics::CheckpointPrecision);
             }
             if ["ignore", "exclude_modules", "modules_to_not_convert"].iter().any(|key|
@@ -382,18 +383,6 @@ impl Checkpoint {
     /// Use the complete index, never a role's local expert/MTP header subset.
     pub fn spark_input_is_bf16(&self) -> bool {
         let layers = opt_usize_field(self.text_config(), "num_hidden_layers");
-        if self.tensor_names().filter_map(|name| name.strip_suffix(".weight")).any(|stem| {
-            let parts: Vec<_> = stem.split('.').collect();
-            let layer = parts.iter().position(|part| *part == "layers")
-                .and_then(|at| parts.get(at + 1)).and_then(|value| value.parse::<usize>().ok());
-            (stem.contains(".experts.") || stem.contains(".moe."))
-                && !parts.iter().any(|part| matches!(*part, "mtp" | "nextn"))
-                && layer.is_some_and(|layer| layers.is_none_or(|count| layer < count))
-                && self.contains_tensor(&format!("{stem}.weight_scale_inv"))
-                && self.declared_numerics(stem).ok() == Some(ModuleNumerics::W8A8K128F32)
-        }) {
-            return true;
-        }
         self.tensor_names().any(|name| {
             let Some(stem) = name.strip_suffix(".input_scale") else { return false };
             if !stem.contains(".experts.") || !self.contains_tensor(&format!("{stem}.weight_scale_2")) {
@@ -557,8 +546,8 @@ mod sliced_tests {
             assert_eq!(cp.module_numerics(fp8).unwrap(), ModuleNumerics::W8A8K128F32);
             assert_eq!(cp.module_numerics(bf16).unwrap(), ModuleNumerics::CheckpointPrecision);
             assert_eq!(cp.module_numerics(excluded).unwrap(), ModuleNumerics::CheckpointPrecision);
-            assert!(cp.spark_input_is_bf16());
-            assert!(cp.module_numerics_with_header(fp8, cuteafd_core::DType::Bf16).is_err());
+            assert!(!cp.spark_input_is_bf16());
+            assert_eq!(cp.module_numerics_with_header(fp8, cuteafd_core::DType::Bf16).unwrap(), ModuleNumerics::CheckpointPrecision);
         }
     }
 

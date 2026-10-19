@@ -36,8 +36,12 @@ pub(super) fn validate_checkpoint_contract(info: &Fp8MoeInfo, tensors: &Fp8Exper
         cuteafd_loader::formats::fp8_experts::ExpertArithmetic::Existing => Fp8MoeArithmetic::Existing,
         cuteafd_loader::formats::fp8_experts::ExpertArithmetic::K128F32A8 => Fp8MoeArithmetic::K128F32A8,
     };
-    ensure!(info.arithmetic == arithmetic, "expert package arithmetic disagrees with checkpoint");
-    ensure!(arithmetic != Fp8MoeArithmetic::K128F32A8 || !info.wire_input,
+    if arithmetic == Fp8MoeArithmetic::K128F32A8 && info.arithmetic == Fp8MoeArithmetic::Existing {
+        tracing::warn!("checkpoint declares K128/F32 A8; using interim existing FP8 arithmetic until native performance qualifies");
+    } else {
+        ensure!(info.arithmetic == arithmetic, "expert package arithmetic disagrees with checkpoint");
+    }
+    ensure!(info.arithmetic != Fp8MoeArithmetic::K128F32A8 || !info.wire_input,
         "native K128/F32 A8 requires original BF16 input");
     ensure!(!matches!(weights, Fp8MoeWeights::Bf16 | Fp8MoeWeights::Nvfp4) || !info.wire_input,
         "native BF16/NVFP4 weights require BF16 input");
@@ -117,7 +121,8 @@ pub(super) fn validate_bf16_package(main: &Fp8MoeInfo, bf16: &Fp8MoeInfo, capaci
     ensure!(!bf16.wire_input && bf16.weights == main.weights && bf16.hidden == main.hidden
         && bf16.experts == main.experts && bf16.topk == main.topk && bf16.intermediate == main.intermediate
         && bf16.tp == main.tp && bf16.slice == main.slice && bf16.swiglu_limit == main.swiglu_limit
-        && bf16.activation == main.activation && bf16.projection == main.projection,
+        && bf16.activation == main.activation && bf16.projection == main.projection
+        && bf16.arithmetic == main.arithmetic,
         "{bf16:?} is not the BF16-input form of the primary FP8 package {main:?}");
     bf16.capacity_for(capacity)
         .with_context(|| format!("BF16-input FP8 package has no capacity for {capacity} rows"))
@@ -871,7 +876,7 @@ mod tests {
         assert_eq!(validate_bf16_package(&primary, &bf16, 64).unwrap(), 128);
         assert_eq!(validate_bf16_package(&primary, &bf16, 4096).unwrap(), 8192);
         assert!(validate_bf16_package(&primary, &bf16, 8193).is_err());
-        for variant in 0..6 {
+        for variant in 0..7 {
             let mut incompatible = bf16.clone();
             match variant {
                 0 => incompatible.wire_input = true,
@@ -879,6 +884,7 @@ mod tests {
                 2 => incompatible.swiglu_limit = f32::INFINITY,
                 3 => incompatible.tp = 2,
                 4 => incompatible.weights = Fp8MoeWeights::Mxfp4,
+                5 => incompatible.arithmetic = cuteafd_ffi::fp8_moe::Fp8MoeArithmetic::K128F32A8,
                 _ => incompatible.activation = cuteafd_ffi::fp8_moe::Fp8MoeActivation::SiluPostClampFp32Product,
             }
             assert!(validate_bf16_package(&primary, &incompatible, 64).is_err(), "{incompatible:?}");
