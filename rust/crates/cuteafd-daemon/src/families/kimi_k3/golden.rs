@@ -33,11 +33,27 @@ pub(crate) struct GoldenArgs {
     #[arg(long, default_value_t = 0)] device: i32,
     #[arg(long, default_value_t = 1)] split_device: i32,
     #[arg(long)] check_headers: bool,
+    /// Informational F32 comparison only; direct gate/up is the speed-first default.
+    #[arg(long, env = "CUTEAFD_KIMI_COMPENSATED_FFN")]
+    compensated_ffn: bool,
     /// Always refused: a residual prefix cannot score or qualify the model.
     #[arg(long)] nll: bool,
 }
 
 struct Reference { tokens: Vec<u32>, hidden: Vec<f32> }
+
+impl GoldenArgs {
+    fn ffn_mode(&self) -> cuteafd_ffi::KimiFfnMode {
+        if self.compensated_ffn { cuteafd_ffi::KimiFfnMode::Compensated }
+        else { cuteafd_ffi::KimiFfnMode::default() }
+    }
+
+    fn provenance(&self) -> Value {
+        serde_json::json!({"schema": "cuteafd.kimi.run/1", "ffn_mode": self.ffn_mode().name(),
+            "gate_up_programs": ([3072, 16896].map(|width| self.ffn_mode().gate_up_stem(width))),
+            "window": self.window, "last_layer": self.last_layer, "diagnostic_only": true})
+    }
+}
 
 fn digest(bytes: &[u8]) -> String { format!("{:x}", Sha256::digest(bytes)) }
 fn sha(value: &Value) -> bool {
@@ -124,6 +140,8 @@ fn hosted_layers(value: &str) -> Result<Vec<usize>> {
 
 pub(crate) fn run(args: GoldenArgs) -> Result<()> {
     ensure!(!args.nll, "Kimi residual prefix is diagnostic only; NLL/KL/publication unavailable");
+    tracing::info!(ffn_mode = args.ffn_mode().name(), "Kimi FFN numerics selection");
+    println!("Kimi run provenance: {}", args.provenance());
     let panel: Value = serde_json::from_slice(&std::fs::read(&args.windows)?)?;
     let reference = reference(&args.reference_state, &panel, &args.window, args.last_layer)?;
     let checkpoint = cuteafd_loader::plan::Checkpoint::coordinator(&args.snapshot, false, false)?;
@@ -152,7 +170,7 @@ fn native(args: &GoldenArgs, checkpoint: &cuteafd_loader::plan::Checkpoint,
         == Some(args.split_device), "Kimi TP2 requires bidirectional peer access");
     let devices = [args.device, args.split_device].map(|id| Device { library: &library, id });
     let programs = library.programs()?.with_manifest(&args.manifest)?;
-    let native = devices.map(|device| NativePrograms::load(device, full, &programs).map(Rc::new));
+    let native = devices.map(|device| NativePrograms::load(device, full, &programs, args.ffn_mode()).map(Rc::new));
     let [zero, one] = native;
     let native = [zero?, one?];
     let diagnostics = std::env::var("CUTEAFD_PEER_WAIT_DIAGNOSTICS").is_ok_and(|v| v == "1");
@@ -313,6 +331,36 @@ mod tests {
         let parsed = crate::cli::Cli::try_parse_from(args.into_iter().chain(["--nll"]))?;
         let crate::cli::Commands::KimiGolden(parsed) = parsed.command else { panic!("Kimi command"); };
         assert!(run(parsed).unwrap_err().to_string().contains("diagnostic only"));
+        Ok(())
+    }
+
+    #[test]
+    fn ffn_cli_and_env_opt_in_are_explicit_and_recorded() -> Result<()> {
+        use clap::{CommandFactory, FromArgMatches};
+        let args = ["cuteafd", "kimi-golden", "--snapshot", "/checkpoint", "--windows", "/panel",
+            "--reference-state", "/state", "--window", "w", "--last-layer", "3"];
+        // Remove the inherited environment from the command, without mutating
+        // process-global state shared with other CPU tests.
+        for (value, tail, expected) in [(None, vec![], "direct"),
+            (Some("true"), vec![], "compensated"),
+            (Some("false"), vec![], "direct"),
+            (Some("false"), vec!["--compensated-ffn"], "compensated")] {
+            let command = crate::cli::Cli::command().mut_subcommand("kimi-golden", |command|
+                command.mut_arg("compensated_ffn", |arg|
+                    arg.env(None::<&str>).default_value(value.unwrap_or("false"))));
+            let matches = command.try_get_matches_from(args.into_iter().chain(tail))?;
+            let parsed = crate::cli::Cli::from_arg_matches(&matches)?;
+            let crate::cli::Commands::KimiGolden(parsed) = parsed.command else { panic!("Kimi command"); };
+            assert_eq!(parsed.ffn_mode().name(), expected);
+            assert_eq!(parsed.provenance()["ffn_mode"], expected);
+            let suffix = if expected == "compensated" { "_comp" } else { "" };
+            assert_eq!(parsed.provenance()["gate_up_programs"], serde_json::json!([
+                format!("kimik3_ffn_gate_up_i3072{suffix}"), format!("kimik3_ffn_gate_up_i16896{suffix}")]));
+        }
+        let command = crate::cli::Cli::command();
+        let sub = command.get_subcommands().find(|command| command.get_name() == "kimi-golden").unwrap();
+        let arg = sub.get_arguments().find(|arg| arg.get_id() == "compensated_ffn").unwrap();
+        assert_eq!(arg.get_env().unwrap(), "CUTEAFD_KIMI_COMPENSATED_FFN");
         Ok(())
     }
 

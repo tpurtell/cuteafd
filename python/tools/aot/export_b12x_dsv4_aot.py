@@ -564,11 +564,14 @@ def kimi_w8_programs():
     for width in (3072, 6144, 16896, 33792):
         out.append((f"situ_i{width}", "situ", {"intermediate": width},
                     lambda w=width: build_situ(w)))
-        # Only gate/up needs bounded accumulation to meet the composed FP64 gate.
-        for op, params in (("gate_up", {"width": 7168, "outputs": 2 * width, "compensated": True}),
+        for op, params in (("gate_up", {"width": 7168, "outputs": 2 * width}),
                            ("down", {"width": width, "outputs": 7168})):
             out.append((f"ffn_{op}_i{width}", "bf16_projection", params,
                         lambda kw=params: build_projection(kw)))
+        # Speed-first default; compensation is for informational F32 comparisons.
+        params = {"width": 7168, "outputs": 2 * width, "compensated": True}
+        out.append((f"ffn_gate_up_i{width}_comp", "bf16_projection", params,
+                    lambda kw=params: build_projection(kw)))
     return out
 
 

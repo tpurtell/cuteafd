@@ -60,7 +60,7 @@ pub(crate) struct W8<'a> {
     cfg: KimiK3Config,
 }
 impl<'a> W8<'a> {
-    pub(crate) fn load(cfg: &KimiK3Config, programs: &'a Programs<'a>) -> Result<Self> {
+    pub(crate) fn load(cfg: &KimiK3Config, programs: &'a Programs<'a>, mode: cuteafd_ffi::KimiFfnMode) -> Result<Self> {
         ensure!(cfg.hidden == 7168 && cfg.dense_intermediate == 33792
             && cfg.moe_intermediate * cfg.shared_experts == 6144,
             "unsupported Kimi W8 hidden/dense/shared geometry");
@@ -72,8 +72,8 @@ impl<'a> W8<'a> {
                 residuals.push((key, KimiResidual::load(programs, key)?));
             }
         }
-        Ok(Self { residuals, dense: KimiFfn::load(programs, cfg.dense_intermediate / 2)?,
-            shared: KimiFfn::load(programs, cfg.moe_intermediate * cfg.shared_experts / 2)?, cfg: cfg.clone() })
+        Ok(Self { residuals, dense: KimiFfn::load(programs, cfg.dense_intermediate / 2, mode)?,
+            shared: KimiFfn::load(programs, cfg.moe_intermediate * cfg.shared_experts / 2, mode)?, cfg: cfg.clone() })
     }
 
     pub(crate) fn residual(&self, site: MixSite, batch: KimiResidualBatch,
@@ -145,7 +145,7 @@ impl NativeScratch {
 
 impl<'a> NativePrograms<'a> {
     pub(crate) fn load(device: Device<'a>, cfg: &KimiK3Config,
-        programs: &'a Programs<'a>) -> Result<Self> {
+        programs: &'a Programs<'a>, ffn_mode: cuteafd_ffi::KimiFfnMode) -> Result<Self> {
         ensure!(device.id >= 0 && std::ptr::eq(device.library, programs.library()),
             "Kimi programs and device must share their native library");
         device.run(|| {
@@ -162,7 +162,7 @@ impl<'a> NativePrograms<'a> {
             let mla = [load_mla(48)?, load_mla(96)?];
             let scratch = NativeScratch::combine(kda.each_ref().map(|p| p.scratch_bytes()),
                 mla.iter().flat_map(|p| [p.decode.scratch_bytes(), p.verify.scratch_bytes(), p.extend.scratch_bytes()]))?;
-            Ok(Self { device, w8: W8::load(cfg, programs)?, norm: KimiRmsNorm::load(programs, cfg.hidden)?,
+            Ok(Self { device, w8: W8::load(cfg, programs, ffn_mode)?, norm: KimiRmsNorm::load(programs, cfg.hidden)?,
                 kda, commit: KimiKdaCommit::load(programs)?, mla, latent: KimiLatent::load(programs)?,
                 router: KimiRouter::load(programs)?, wire: KimiExpertInput::load(programs)?,
                 add: device.library.bf16_add()?, scratch,
