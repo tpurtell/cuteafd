@@ -14,6 +14,7 @@ use cuteafd_hostcache::copy::CopyEngine;
 use std::{
     cell::{Cell, RefCell},
     collections::BTreeSet,
+    rc::Rc,
 };
 
 fn view(buffer: CuteafdDeviceBuffer, offset: usize, bytes: usize) -> Result<CuteafdDeviceBuffer> {
@@ -30,17 +31,21 @@ fn view(buffer: CuteafdDeviceBuffer, offset: usize, bytes: usize) -> Result<Cute
 
 /// One lane per rank, allocated before execution. CSA K/Z must survive until the
 /// acceptance count is known; projection and attention scratch can be reused.
-pub(super) struct Staging<'a> {
-    raw: Vec<(Allocation<'a>, Allocation<'a>)>,
+struct RegionScratch<'a> {
     starts: Allocation<'a>,
     counts: Allocation<'a>,
     unrounded: Allocation<'a>,
     compress: Program<'a>,
+}
+
+pub(super) struct Staging<'a> {
+    raw: Vec<(Allocation<'a>, Allocation<'a>)>,
+    sparse: Option<RegionScratch<'a>>,
     rows: usize,
     regions: usize,
     bytes: usize,
     busy: Cell<bool>,
-    cache_pages: usize,
+    cache_owner: usize,
     positions: Allocation<'a>,
     requests: Allocation<'a>,
     ring_table: Allocation<'a>,
@@ -99,8 +104,8 @@ impl<'a> Staging<'a> {
             .max(256);
         rows.checked_mul(256 * 2 * 2)
             .and_then(|n| n.checked_mul(layers))
-            .and_then(|n| n.checked_add(metadata.checked_mul(2)?))
-            .and_then(|n| n.checked_add(scratch))
+            .and_then(|n| n.checked_add(if layers == 0 { 0 } else { metadata.checked_mul(2)? }))
+            .and_then(|n| n.checked_add(if layers == 0 { 0 } else { scratch }))
             .and_then(|n| n.checked_add(step.checked_mul(8)?.max(256)))
             .and_then(|n| n.checked_add(step.checked_mul(4)?.max(256)))
             .and_then(|n| n.checked_add(table.checked_mul(2)?))
@@ -123,22 +128,22 @@ impl<'a> Staging<'a> {
             bytes <= available,
             "Step-5 staging needs {bytes} bytes, admitted only {available}"
         );
-        let spec = programs.spec("step5_region_compress")?;
-        ensure!(
-            spec.scalar_kinds == b"il"
-                && spec.scratch.is_empty()
-                && spec.geometry["region_tokens"] == 8
-                && spec.geometry["proxy_dim"] == 256,
-            "Step-5 region compression ABI"
-        );
-        let compress = device.run(|| {
-            programs.program(
-                "step5_region_compress",
-                &["keys", "logits", "starts", "counts", "output", "unrounded"],
-            )
-        })?;
         let rows = usize::try_from(cache.layout().ring.step)?;
         let regions = (rows + 7) / 8;
+        let sparse = if cache.layout().ranks[cache.rank()].regions.is_empty() { None } else {
+            let spec = programs.spec("step5_region_compress")?;
+            ensure!(spec.scalar_kinds == b"il" && spec.scratch.is_empty()
+                && spec.geometry["region_tokens"] == 8 && spec.geometry["proxy_dim"] == 256,
+                "Step-5 region compression ABI");
+            let compress = device.run(|| programs.program("step5_region_compress",
+                &["keys", "logits", "starts", "counts", "output", "unrounded"]))?;
+            Some(RegionScratch {
+                starts: Allocation::new(device, (regions * 4).max(256))?,
+                counts: Allocation::new(device, (regions * 4).max(256))?,
+                unrounded: Allocation::new(device, (regions * 256 * 4).max(256))?,
+                compress,
+            })
+        };
         let raw = cache.layout().ranks[cache.rank()]
             .regions
             .iter()
@@ -152,27 +157,26 @@ impl<'a> Staging<'a> {
         let table_width = usize::try_from(cache.layout().context.div_ceil(64))?;
         let owner = Self {
             raw,
-            starts: Allocation::new(device, (regions * 4).max(256))?,
-            counts: Allocation::new(device, (regions * 4).max(256))?,
-            unrounded: Allocation::new(device, (regions * 256 * 4).max(256))?,
+            sparse,
             positions: Allocation::new(device, (rows * 8).max(256))?,
             requests: Allocation::new(device, (rows * 4).max(256))?,
             ring_table: Allocation::new(device, (table_width * 4).max(256))?,
             page_table: Allocation::new(device, (table_width * 4).max(256))?,
             table_width,
-            compress,
             rows,
             regions,
             bytes,
             busy: Cell::new(false),
-            cache_pages: cache.page_pool().ptr as usize,
+            cache_owner: cache.identity(),
         };
         let starts: Vec<u8> = (0..regions as i32)
             .flat_map(|r| (r * 8).to_le_bytes())
             .collect();
         let counts: Vec<u8> = (0..regions).flat_map(|_| 8i32.to_le_bytes()).collect();
-        device.run(|| device.library.copy_h2d(owner.starts.buffer, &starts))?;
-        device.run(|| device.library.copy_h2d(owner.counts.buffer, &counts))?;
+        if let Some(sparse) = &owner.sparse {
+            device.run(|| device.library.copy_h2d(sparse.starts.buffer, &starts))?;
+            device.run(|| device.library.copy_h2d(sparse.counts.buffer, &counts))?;
+        }
         device.run(|| {
             device
                 .library
@@ -187,6 +191,13 @@ impl<'a> Staging<'a> {
     }
     pub fn allocation_bytes(&self) -> usize {
         self.bytes
+    }
+
+    pub fn owns_compressor(&self, cache: &CacheRank<'_>, layer: usize) -> bool {
+        self.cache_owner == cache.identity() && self.sparse.is_some()
+            && cache.layout().ranks[cache.rank()].regions.iter().position(|r| r.layer == layer)
+                .and_then(|index| self.raw.get(index))
+                .is_some_and(|(key, logits)| !key.buffer.ptr.is_null() && !logits.buffer.ptr.is_null())
     }
 }
 
@@ -205,9 +216,31 @@ pub(super) struct Step<'e, 'a, E: CopyEngine> {
     base: usize,
     failed: bool,
     inputs: Vec<&'e Allocation<'a>>,
+    submission: Rc<Cell<bool>>,
 }
 
 impl<'e, 'a, E: CopyEngine> Step<'e, 'a, E> {
+    pub fn validate_binding(&self, ranks: &[&RefCell<CacheRank<'a>>],
+        stages: &[&Staging<'a>], rows: usize) -> Result<()> {
+        ensure!(!self.failed && self.rows == rows && ranks.len() == self.ranks.len()
+            && stages.len() == self.staging.len()
+            && self.ranks.iter().zip(ranks).all(|(actual, expected)| std::ptr::eq(*actual, *expected))
+            && self.staging.iter().zip(stages).all(|(actual, expected)| std::ptr::eq(*actual, *expected)),
+            "Step-5 pipeline transaction owner/stream/row binding differs");
+        Ok(())
+    }
+
+    /// A whole-pipeline guard must publish peer aborts before any local drain.
+    pub fn in_submission<T>(&mut self,
+        _scope: &crate::shared::experts::rtx::pair::SubmissionScope<'_>,
+        work: impl FnOnce(&mut Self) -> Result<T>,
+    ) -> Result<T> {
+        let _mode = SubmissionMode::enter(self.submission.clone())?;
+        let result = work(self);
+        if result.is_err() { self.failed = true; }
+        result
+    }
+
     pub fn begin(
         ranks: Vec<&'e RefCell<CacheRank<'a>>>,
         staging: Vec<&'e Staging<'a>>,
@@ -237,7 +270,7 @@ impl<'e, 'a, E: CopyEngine> Step<'e, 'a, E> {
                 "Step-5 sequence or staging lane already in flight"
             );
             ensure!(
-                stage.cache_pages == cache.page_pool().ptr as usize,
+                stage.cache_owner == cache.identity(),
                 "Step-5 staging belongs to another cache owner"
             );
         }
@@ -260,6 +293,7 @@ impl<'e, 'a, E: CopyEngine> Step<'e, 'a, E> {
             base,
             failed: false,
             inputs: Vec::new(),
+            submission: Rc::new(Cell::new(false)),
         };
         let positions: Vec<u8> = (base..end).flat_map(|p| (p as i64).to_le_bytes()).collect();
         let table: Vec<u8> = step
@@ -328,6 +362,7 @@ impl<'e, 'a, E: CopyEngine> Step<'e, 'a, E> {
         let mut guard = cache
             .stream
             .cancellation_guard("Step-5 projection callback");
+        guard.complete = self.submission.get();
         let result = work(
             input_owner,
             StepInputs {
@@ -336,7 +371,7 @@ impl<'e, 'a, E: CopyEngine> Step<'e, 'a, E> {
                 requests: stage.requests.buffer,
                 rows: self.rows,
                 base: self.base,
-                heads: 64 / self.ranks.len(),
+                heads: cache.layout().query_heads(rank, layer)?,
             },
         );
         if result.is_ok() {
@@ -357,6 +392,7 @@ impl<'e, 'a, E: CopyEngine> Step<'e, 'a, E> {
         let cache = self.ranks.get(rank).context("Step-5 composition rank")?.borrow();
         self.failed = true;
         let mut guard = cache.stream.cancellation_guard("Step-5 composition callback");
+        guard.complete = self.submission.get();
         let stage = self.staging[rank];
         let result = work(owner, StepInputs {
             stream: &cache.stream,
@@ -421,6 +457,7 @@ impl<'e, 'a, E: CopyEngine> Step<'e, 'a, E> {
             };
         self.failed = true;
         let mut guard = cache.stream.cancellation_guard("Step-5 attention callback");
+        guard.complete = self.submission.get();
         let result = work(
             input_owner,
             AttentionRead {
@@ -430,7 +467,7 @@ impl<'e, 'a, E: CopyEngine> Step<'e, 'a, E> {
                     requests: stage.requests.buffer,
                     rows: self.rows,
                     base: self.base,
-                    heads: 64 / self.ranks.len(),
+                    heads: cache.layout().query_heads(rank, layer)?,
                 },
                 key,
                 value,
@@ -474,6 +511,7 @@ impl<'e, 'a, E: CopyEngine> Step<'e, 'a, E> {
         let state = &cache.layout().ranks[rank];
         let sequence = self.placement.sequence;
         let mut guard = cache.stream.cancellation_guard("Step-5 staged layer");
+        guard.complete = self.submission.get();
         if let Some(ring) = state.sliding.iter().find(|r| r.layer == layer && !r.mtp) {
             ensure!(index.is_none(), "SWA must not carry indexer state");
             let row = ring.key.bytes as usize / cache.layout().ring.rows as usize;
@@ -507,10 +545,7 @@ impl<'e, 'a, E: CopyEngine> Step<'e, 'a, E> {
                 .context("Step-5 target layer")?;
             let region = &state.regions[at];
             let stage = self.staging[rank];
-            let row = cache.layout().geometry.ranks[rank].persistent_unit_bytes as usize
-                / state.regions.len()
-                / 2
-                / 64;
+            let row = usize::try_from(region.page_bytes / 64)?;
             for source in [key, value] {
                 self.validate_source(&cache, source, self.rows * row)?;
             }
@@ -554,18 +589,19 @@ impl<'e, 'a, E: CopyEngine> Step<'e, 'a, E> {
                 ensure!(completed <= stage.regions, "Step-5 staged summary capacity");
                 let target = cache.request_component(summary, sequence)?;
                 let output = view(target, self.base / 8 * 256, completed * 256)?;
+                let sparse = stage.sparse.as_ref().context("Step-5 CSA compressor owner")?;
                 cache.stream.device.run(|| {
                     // SAFETY: admitted raw staging, immutable metadata, summary suffix and
                     // scratch belong to this lane; no old visible summary is overwritten.
                     unsafe {
-                        stage.compress.launch(
+                        sparse.compress.launch(
                             &[
                                 raw[0].ptr,
                                 raw[1].ptr,
-                                stage.starts.buffer.ptr,
-                                stage.counts.buffer.ptr,
+                                sparse.starts.buffer.ptr,
+                                sparse.counts.buffer.ptr,
                                 output.ptr,
-                                stage.unrounded.buffer.ptr,
+                                sparse.unrounded.buffer.ptr,
                             ],
                             &[
                                 Scalar::I32(completed as i32),
@@ -625,6 +661,7 @@ impl<'e, 'a, E: CopyEngine> Step<'e, 'a, E> {
             let mut guard = cache
                 .stream
                 .cancellation_guard("Step-5 prepare publication");
+            guard.complete = self.submission.get();
             let sequence = self.placement.sequence;
             let raw_offset = (self.base % 8 + accepted) / 8 * 8;
             let tail = end % 8;
@@ -671,6 +708,18 @@ impl<'e, 'a, E: CopyEngine> Step<'e, 'a, E> {
         self.placement.committed = end;
         Ok(())
     }
+}
+
+struct SubmissionMode(Rc<Cell<bool>>);
+impl SubmissionMode {
+    fn enter(active: Rc<Cell<bool>>) -> Result<Self> {
+        ensure!(!active.get(), "Step-5 nested submission scope");
+        active.set(true);
+        Ok(Self(active))
+    }
+}
+impl Drop for SubmissionMode {
+    fn drop(&mut self) { self.0.set(false); }
 }
 
 impl<E: CopyEngine> Drop for Step<'_, '_, E> {
@@ -736,6 +785,33 @@ pub(super) mod tests {
     use super::*;
     use cuteafd_engine::prefix::{BoxError, PrefixConfig, PrefixFamily};
     use cuteafd_hostcache::copy::StubCopyEngine;
+
+    #[test]
+    fn submission_mode_resets_on_success_error_and_unwind_without_nested_reset() {
+        let active = Rc::new(Cell::new(false));
+        for panic in [false, true] {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _scope = SubmissionMode::enter(active.clone()).unwrap();
+                assert!(active.get());
+                assert!(SubmissionMode::enter(active.clone()).is_err());
+                assert!(active.get());
+                if panic { panic!("partial pipeline enqueue"); }
+            }));
+            assert_eq!(result.is_err(), panic);
+            assert!(!active.get());
+        }
+    }
+
+    #[test]
+    fn peer_without_csa_has_no_compressor_workspace_charge() -> Result<()> {
+        let mut layout = super::super::cache::tests::layout_for(1024, 2, 0, 64);
+        layout.ranks[1].regions.clear();
+        layout.geometry.ranks[1].persistent_unit_bytes = 0;
+        // Positions, request ids and the two attention page tables only.
+        assert_eq!(Staging::bytes(&layout, 1)?, 64 * 8 + 256 + 2 * 256);
+        assert!(Staging::bytes(&layout, 0)? > Staging::bytes(&layout, 1)?);
+        Ok(())
+    }
 
     fn read(device: Device<'_>, buffer: CuteafdDeviceBuffer) -> Result<Vec<u8>> {
         let mut bytes = vec![0; buffer.bytes];

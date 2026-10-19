@@ -47,6 +47,22 @@ def test_preflight_fails_before_ticket(lockdir, gate):
 
 
 @pytest.mark.parametrize('gate', [False, True])
+def test_preflight_at_grant_skips_the_enqueue_check(lockdir, gate):
+    count = lockdir / 'checks'
+    marker = lockdir / 'command-ran'
+    code = (f'import pathlib; p=pathlib.Path({str(count)!r}); '
+            'p.write_text(str((int(p.read_text()) if p.exists() else 0)+1))')
+    import shlex
+    env = {**os.environ, 'CUTEAFD_LOCK_DIR': str(lockdir)}
+    result = subprocess.run([sys.executable, str(SCRIPT), '--locks', 'gpu1', '--preflight-at-grant',
+                             '--preflight', shlex.join([sys.executable, '-c', code]),
+                             *(['--gate'] if gate else []), '--', 'touch', str(marker)],
+                            env=env, capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    assert count.read_text() == '1' and marker.exists()
+
+
+@pytest.mark.parametrize('gate', [False, True])
 def test_preflight_fails_at_grant_releasing_ticket_and_locks(lockdir, gate):
     count = lockdir / 'checks'
     marker = lockdir / 'command-ran'

@@ -131,7 +131,10 @@ float f8e4m3_to_f32(uint8_t byte) {
 uint16_t f32_to_bf16(float value) {
   uint32_t bits = 0;
   std::memcpy(&bits, &value, sizeof(bits));
-  return static_cast<uint16_t>(bits >> 16);
+  if ((bits & 0x7fffffffu) > 0x7f800000u) {
+    return static_cast<uint16_t>((bits >> 16) | 0x0040u);
+  }
+  return static_cast<uint16_t>((bits + 0x7fffu + ((bits >> 16) & 1u)) >> 16);
 }
 
 uint16_t f32_to_bf16_rn(float value) {
@@ -1159,6 +1162,49 @@ void test_cuda_residual_add_shared_f32_delta_bf16_matches_ref() {
   free_buffer(&dshared);
   free_buffer(&drouted);
   free_buffer(&dout);
+}
+
+void test_cuda_f32_to_bf16_rounds_nearest_even() {
+  // Even/odd ties, non-ties, signs, subnormals, overflow, infinities and NaNs.
+  const std::vector<uint32_t> bits = {
+      0x4200dcc6u, 0xc200dcc6u, 0x3f808000u, 0x3f818000u,
+      0xbf808000u, 0xbf818000u, 0x3f807fffu, 0x3f808001u,
+      0x00000000u, 0x80000000u, 0x00000001u, 0x80000001u,
+      0x00008000u, 0x00008001u, 0x00018000u, 0x80018000u,
+      0x007fffffu, 0x7f7fffffu, 0xff7fffffu, 0x7f800000u,
+      0xff800000u, 0x7f800001u, 0xff800001u, 0x7fc12345u,
+      0x7fffffffu};
+  const std::vector<uint16_t> expected = {
+      0x4201u, 0xc201u, 0x3f80u, 0x3f82u, 0xbf80u, 0xbf82u,
+      0x3f80u, 0x3f81u, 0x0000u, 0x8000u, 0x0000u, 0x8000u,
+      0x0000u, 0x0001u, 0x0002u, 0x8002u, 0x0080u, 0x7f80u,
+      0xff80u, 0x7f80u, 0xff80u, 0x7fc0u, 0xffc0u, 0x7fc1u,
+      0x7fffu};
+  std::vector<float> values(bits.size());
+  std::memcpy(values.data(), bits.data(), bits.size() * sizeof(uint32_t));
+  auto src = device_buffer(values.size() * sizeof(float));
+  auto dst = device_buffer(values.size() * sizeof(uint16_t));
+  copy_h2d(src, values);
+  for (bool asynchronous : {false, true}) {
+    const auto status = asynchronous
+        ? cuteafd_cuda_f32_to_bf16_async(static_cast<float*>(src.ptr),
+                                        static_cast<uint16_t*>(dst.ptr), values.size(), nullptr)
+        : cuteafd_cuda_f32_to_bf16(static_cast<float*>(src.ptr),
+                                  static_cast<uint16_t*>(dst.ptr), values.size());
+    require_status(status, "F32-to-BF16 RNE");
+    require_cuda(cudaDeviceSynchronize(), "F32-to-BF16 RNE synchronize");
+    const auto actual = copy_d2h<uint16_t>(dst, values.size());
+    for (size_t i = 0; i < expected.size(); ++i) {
+      if (actual[i] != expected[i]) {
+        std::cerr << "F32-to-BF16 RNE mismatch index=" << i << " input=" << std::hex
+                  << bits[i] << " actual=" << actual[i] << " expected=" << expected[i]
+                  << std::dec << "\n";
+        std::abort();
+      }
+    }
+  }
+  free_buffer(&src);
+  free_buffer(&dst);
 }
 
 void test_cuda_accumulate_bf16_to_f32_preserves_launch_order() {
@@ -2830,7 +2876,12 @@ void test_cuda_generic_kv_page_table_init_base_is_exported_and_correct() {
 
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
+  if (argc == 2 && std::strcmp(argv[1], "--f32-to-bf16-only") == 0) {
+    test_cuda_f32_to_bf16_rounds_nearest_even();
+    std::cout << "test result: ok. 1 passed; 0 failed\n";
+    return 0;
+  }
   test_cuda_device_info();
   test_cuda_copy_d2d_completes_before_nonblocking_consumer();
   test_cuda_copy_d2d_2d_async_copies_active_row_prefixes();
@@ -2847,6 +2898,7 @@ int main() {
   test_cuda_residual_add_bf16_matches_ref();
   test_cuda_residual_add_f32_delta_bf16_matches_ref();
   test_cuda_residual_add_shared_f32_delta_bf16_matches_ref();
+  test_cuda_f32_to_bf16_rounds_nearest_even();
   test_cuda_accumulate_bf16_to_f32_preserves_launch_order();
   test_cuda_row_gather_scatter_add_matches_ref();
   test_cuda_row_gather_scatter_add_bf16_matches_ref();

@@ -12,10 +12,17 @@ import torch
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--native-lib', type=Path, required=True)
-    parser.add_argument('--reference-dir', type=Path, required=True)
+    parser.add_argument('--reference-dir', type=Path)
+    parser.add_argument('--partition-only', action='store_true',
+                        help='bitwise per-request versus batched launch and graph replay')
     parser.add_argument('--device', type=int, required=True)
     parser.add_argument('--output', type=Path, required=True)
     args = parser.parse_args()
+    if args.partition_only:
+        qualify_partitions(args)
+        return
+    if args.reference_dir is None:
+        parser.error('--reference-dir is required without --partition-only')
     root = Path(__file__).resolve().parents[3]
     lock = json.loads((root / 'scripts/fixtures/ds41-reference-lock.json').read_text())
     source = args.reference_dir / 'inference/model.py'
@@ -166,6 +173,151 @@ def main():
         'gpu':torch.cuda.get_device_name(args.device),'device':args.device,
         'reference_model_sha256':source_hash,'native_library_sha256':hashlib.sha256(args.native_lib.read_bytes()).hexdigest(),
         'cases':results},indent=2)+'\n')
+
+
+def qualify_partitions(args):
+    """Same row arithmetic, changing only slot addressing and launch partition."""
+    torch.cuda.set_device(args.device)
+    torch.manual_seed(500)
+    library = C.CDLL(str(args.native_lib))
+    score = library.cuteafd_v41_index_scores_overlay
+    score.argtypes = [C.c_void_p] * 12 + [C.c_int32] * 4 + [C.c_uint64, C.c_uint64, C.c_void_p]
+    score.restype = C.c_int32
+    stream = torch.cuda.Stream()
+    cases = []
+    with torch.cuda.stream(stream), torch.no_grad():
+        rows, slots, stride, capacity = 16, 16, 4, 16 * 4 * 256
+        q = torch.randint(256, (rows, 32, 64), device='cuda', dtype=torch.uint8)
+        qs = torch.randint(123, 128, (rows, 32, 4), device='cuda', dtype=torch.uint8)
+        weights = torch.randn(rows, 32, device='cuda').bfloat16()
+        keys = torch.randint(256, (capacity, 64), device='cuda', dtype=torch.uint8)
+        scales = torch.randint(123, 128, (capacity, 4), device='cuda', dtype=torch.uint8)
+        pages = torch.randperm(slots * stride, device='cuda').int().reshape(slots, stride)
+        lengths = torch.arange(slots, device='cuda', dtype=torch.int64) * 11 + 256
+        proposals = torch.randint(256, (64, 64), device='cuda', dtype=torch.uint8)
+        proposal_scales = torch.randint(123, 128, (64, 4), device='cuda', dtype=torch.uint8)
+        for width in [512, 1024, 16384]:
+            meta = torch.empty(rows, 6, device='cuda', dtype=torch.int64)
+            local_meta = torch.empty_like(meta)
+            positions = torch.empty(rows, width, device='cuda', dtype=torch.int64)
+            batched = torch.empty(rows, width, device='cuda')
+            separate = torch.empty_like(batched)
+
+            def launch(begin, count, table, published, descriptors, output, slot_count):
+                tensors = [q[begin:], qs[begin:], weights[begin:], keys, scales,
+                           table, published, descriptors[begin:], positions[begin:],
+                           output[begin:], proposals, proposal_scales]
+                assert score(*(t.data_ptr() for t in tensors), count, width, slot_count,
+                             stride, capacity, len(proposals), stream.cuda_stream) == 0
+
+            def batch():
+                launch(0, rows, pages, lengths, meta, batched, slots)
+
+            batch_graph = None
+            for partition in [[1] * 16, [8, 8], [1, 15], [15, 1], [3, 5, 2, 6], [16]]:
+                offset = 0
+                for request, count in enumerate(partition):
+                    slot = (request * 7 + 3) % slots
+                    end = int(lengths[slot].item())
+                    for row in range(offset, offset + count):
+                        step = 1 + row % 2
+                        proposal_count = min(3 + row % 5, (64 - row - 1) // step)
+                        meta[row] = torch.tensor([slot, end + proposal_count, end,
+                            proposal_count, row, step], device='cuda')
+                        positions[row] = torch.arange(width, device='cuda') + row % 7
+                        positions[row, :5] = torch.tensor([-1, end - 1, end,
+                            end + proposal_count - 1, end + proposal_count], device='cuda')
+                    offset += count
+                local_meta.copy_(meta)
+                local_meta[:, 0] = 0
+                separate.fill_(12345)
+                offset = 0
+                for request, count in enumerate(partition):
+                    slot = (request * 7 + 3) % slots
+                    launch(offset, count, pages[slot], lengths[slot:], local_meta, separate, 1)
+                    offset += count
+                if batch_graph is None:
+                    batch()
+                    batch_graph = torch.cuda.CUDAGraph()
+                    with torch.cuda.graph(batch_graph, stream=stream):
+                        batch()
+                batched.fill_(54321)
+                batch_graph.replay()
+                stream.synchronize()
+                assert torch.equal(separate.view(torch.int32), batched.view(torch.int32))
+                assert torch.isfinite(batched).any().item()
+                assert torch.isneginf(batched).any().item()
+                cases.append({'partition': partition, 'width': width,
+                              'score_bits_equal': True, 'replay_with_changed_metadata': True})
+            del batch_graph
+        qualify_long_prefill(score, stream, cases)
+        stream.synchronize()
+    args.output.write_text(json.dumps({'scope': 'bitwise partition invariance; committed and proposal rows',
+        'native_library_sha256': hashlib.sha256(args.native_lib.read_bytes()).hexdigest(),
+        'cases': cases}, indent=2) + '\n')
+    print(f'PASS {len(cases)} bitwise partition/replay cases', flush=True)
+
+
+def qualify_long_prefill(score, stream, cases):
+    """Exercise the full prefix wave, page crossings and mutable pooled tables."""
+    rows, slots, stride = 1436, 16, 8
+    capacity = slots * stride * 256
+    q = torch.randint(256, (rows, 32, 64), device='cuda', dtype=torch.uint8)
+    qs = torch.randint(123, 128, (rows, 32, 4), device='cuda', dtype=torch.uint8)
+    weights = torch.randn(rows, 32, device='cuda').bfloat16()
+    keys = torch.randint(256, (capacity, 64), device='cuda', dtype=torch.uint8)
+    scales = torch.randint(123, 128, (capacity, 4), device='cuda', dtype=torch.uint8)
+    proposals = torch.randint(256, (rows, 64), device='cuda', dtype=torch.uint8)
+    proposal_scales = torch.randint(123, 128, (rows, 4), device='cuda', dtype=torch.uint8)
+    pages = torch.empty(slots, stride, device='cuda', dtype=torch.int32)
+    lengths = torch.zeros(slots, device='cuda', dtype=torch.int64)
+    for step in [2, 1]:
+        width = ((rows // step + 511) // 512) * 512
+        positions = torch.arange(width, device='cuda', dtype=torch.int64).repeat(rows, 1)
+        meta = torch.empty(rows, 6, device='cuda', dtype=torch.int64)
+        local_meta = torch.empty_like(meta)
+        pooled = torch.empty(rows, width, device='cuda')
+        separate = torch.empty_like(pooled)
+
+        def launch(table, published, descriptors, output, slot_count):
+            tensors = [q, qs, weights, keys, scales, table, published, descriptors,
+                       positions, output, proposals, proposal_scales]
+            assert score(*(t.data_ptr() for t in tensors), rows, width, slot_count,
+                         stride, capacity, rows, stream.cuda_stream) == 0
+
+        graph = None
+        for committed in [False, True]:
+            for slot in [3, 11]:
+                # Install a replacement binding and publish its length before replay.
+                pages.copy_(torch.randperm(slots * stride, device='cuda').int().reshape(slots, stride))
+                lengths.zero_()
+                end = rows // step if committed else 0
+                lengths[slot] = end
+                meta[:, 0] = slot
+                meta[:, 1] = (torch.arange(rows, device='cuda') + 1) // step
+                meta[:, 2] = end
+                meta[:, 3] = 0 if committed else rows // step
+                meta[:, 4] = 0 if committed or step == 1 else 1
+                meta[:, 5] = step
+                local_meta.copy_(meta)
+                local_meta[:, 0] = 0
+                separate.fill_(12345)
+                launch(pages[slot], lengths[slot:], local_meta, separate, 1)
+                if graph is None:
+                    launch(pages, lengths, meta, pooled, slots)
+                    graph = torch.cuda.CUDAGraph()
+                    with torch.cuda.graph(graph, stream=stream):
+                        launch(pages, lengths, meta, pooled, slots)
+                pooled.fill_(54321)
+                graph.replay()
+                stream.synchronize()
+                assert torch.equal(separate.view(torch.int32), pooled.view(torch.int32))
+                assert torch.equal(torch.isfinite(pooled), positions < meta[:, 1, None])
+                cases.append({'kind': 'long_prefill', 'rows': rows, 'width': width,
+                              'step': step, 'committed': committed, 'slot': slot,
+                              'score_bits_equal': True, 'replaced_pool_metadata': True})
+                print(f'PASS long prefill rows={rows} step={step} committed={committed} slot={slot}', flush=True)
+        del graph
 
 
 if __name__ == '__main__':

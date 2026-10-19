@@ -4,10 +4,10 @@ on raptor's RTX GPUs, optionally against real expert workers on Sparks.
 
   scripts/bench/golden-run.py --task NAME --family dsv4|glm|glmf|mimo|qwen4|qwen35|step5 \\
       --model HF_ID_OR_SNAPSHOT_DIR --arm A=WIP_INSTANCE:SLOT [--arm B=...] \\
-      [--arm-env A:KEY=VALUE] [--env KEY=VALUE] [--gpus 0,1] [--repeats N] \\
+      [--arm-env A:KEY=VALUE] [--arm-arg A:TOKEN] [--env KEY=VALUE] [--gpus 0,1] [--repeats N] \\
       [--timeout SECONDS] [--preflight CMD] [--compare-logits A:B] \\
       [--native-test TEST_EXECUTABLE | --command] [--fixtures DIR [--fixtures-writable]] \\
-      [--spark-hosts H1,H2,... [--expert-layers 3,5-7] [--worker-env KEY=VALUE] [--worker-arg ARG]] \\
+      [--spark-hosts H1,H2,... [--expert-layers 3,5-7] [--worker-env KEY=VALUE] [--arm-worker-env A:KEY=VALUE] [--worker-arg ARG]] \\
       -- ARGS...
 
 Each arm runs its slot's `cuteafd`, `libcuteafd_native.so`, `PROGRAMS.json` and expert
@@ -166,7 +166,7 @@ def parse_arms(values):
             raise ValueError(f'invalid --arm {value!r} (NAME=WIP_INSTANCE:SLOT)')
         if name in arms:
             raise ValueError(f'duplicate arm {name}')
-        arms[name] = {'instance': instance, 'slot': slot, 'env': {}}
+        arms[name] = {'instance': instance, 'slot': slot, 'env': {}, 'args': []}
     return arms
 
 
@@ -458,7 +458,8 @@ def worker_command(state, arm, rank, record):
            'PYTHONPATH': '/source/third_party/sparkinfer', 'CUTEAFD_NATIVE_LIB': f'{SLOT_LIB}/libcuteafd_native.so',
            # As the coordinator gets it: workers resolve installed programs and packages from it.
            'CUTEAFD_PROGRAM_MANIFEST': f'{SLOT_SHARE}/PROGRAMS.json',
-           'RUST_LOG': 'info', **{k: os.environ[k] for k in RDMA_ENV if os.environ.get(k)}, **sparks['env']}
+           'RUST_LOG': 'info', **{k: os.environ[k] for k in RDMA_ENV if os.environ.get(k)}, **sparks['env'],
+           **sparks.get('arm_env', {}).get(arm, {})}
     for key, value in env.items():
         cmd += ['-e', f'{key}={value}']
     # Bounded by itself: a killed driver still frees the Spark after the run's budget.
@@ -884,15 +885,17 @@ class PowerSampler:
 
 # --------------------------------------------------------------------------- running
 
-def run_args(state):
-    return substitute(state['golden'], state['snapshot_container'], **placeholder_values(state))
+def run_args(state, arm=None):
+    """The golden argv, plus ARM's own --arm-arg tokens appended."""
+    return substitute(state['golden'] + (arm or {}).get('args', []), state['snapshot_container'],
+                      **placeholder_values(state))
 
 
 def run_arm(state, name, repeat, arms):
     arm, slot = arms[name], state['slots'][name]
     out_dir = Path(state['root']) / name / f'r{repeat}'
     out_dir.mkdir(parents=True, exist_ok=False)
-    golden = run_args(state)
+    golden = run_args(state, arm)
     packages, package_digests = spark_package_files(state, name, slot) if state.get('sparks') else (None, None)
     cmd, env = docker_command(state, name, arm, slot, out_dir, golden, packages)
     workers = [dict(host=host, rank=rank, container=worker_name(state['task'], name, rank),
@@ -906,7 +909,7 @@ def run_arm(state, name, repeat, arms):
                   image=slot['image'], image_id=slot['image_id'], image_tags=slot['image_record']['tags'],
                   seal_sha256=slot['seal_sha256'], artifact_manifest_sha256=slot['artifact_manifest_sha256'],
                   slot=f"{slot['instance']}:{slot['slot']}", slot_root=slot['root'], source_commit=slot['source_commit'],
-                  source_dirty=slot['source_dirty'], env=env, arm_env=arm['env'], gpus=state['gpus'],
+                  source_dirty=slot['source_dirty'], env=env, arm_env=arm['env'], arm_args=arm['args'], gpus=state['gpus'],
                   locks=state['locks'], snapshot=state['snapshot'], timeout_s=state['timeout'],
                   power_before=governor_summary())
     print(f"golden-run: {name} r{repeat} -> {out_dir}", flush=True)
@@ -1131,14 +1134,21 @@ def build_state(args, arms):
         for value in args.worker_env:
             key, val = parse_env(value)
             worker_env[key] = val
+        arm_worker_env = {name: {} for name in arms}
+        for value in args.arm_worker_env:
+            name, sep, setting = value.partition(':')
+            if not sep or name not in arms:
+                raise ValueError(f'--arm-worker-env {value!r} names no arm (ARM:KEY=VALUE)')
+            key, val = parse_env(setting)
+            arm_worker_env[name][key] = val
         sparks = dict(hosts=hosts, lanes=lanes, port=args.expert_port,
                       peers_csv=','.join(f'{lane}:{args.expert_port}' for lane in lanes),
                       layers=parse_layers(args.expert_layers) if args.expert_layers else [],
-                      env=worker_env, args=list(args.worker_arg), budget=args.worker_budget_bytes,
+                      env=worker_env, arm_env=arm_worker_env, args=list(args.worker_arg), budget=args.worker_budget_bytes,
                       memory=args.worker_memory_bytes,
                       ready_timeout=args.worker_ready_timeout, poll_s=args.worker_poll)
-    elif args.expert_layers or args.worker_env or args.worker_arg or args.worker_memory_bytes is not None:
-        raise ValueError('--expert-layers, --worker-env, --worker-arg and --worker-memory-bytes need --spark-hosts')
+    elif args.expert_layers or args.worker_env or args.arm_worker_env or args.worker_arg or args.worker_memory_bytes is not None:
+        raise ValueError('--expert-layers, --worker-env, --arm-worker-env, --worker-arg and --worker-memory-bytes need --spark-hosts')
     mode = 'native-test' if args.native_test else 'command' if args.command else 'golden'
     if mode == 'golden':
         golden = golden_args(args.family, args.golden, sparks=sparks is not None)
@@ -1159,7 +1169,8 @@ def build_state(args, arms):
                  fixtures_writable=bool(args.fixtures_writable), sparks=sparks)
     state['locks'] = locks_for(state['gpus'], sparks['hosts'] if sparks else ())
     state['vocab'] = args.vocab or (vocab_size(snapshot) if args.compare_logits else None)
-    run_args(state)  # every placeholder resolves
+    for arm in arms.values():
+        run_args(state, arm)  # every placeholder resolves, per arm
     for arm in arms.values():
         for value in arm['env'].values():
             substitute([value], container_path, **placeholder_values(state))
@@ -1184,6 +1195,8 @@ def main(argv=None):
     parser.add_argument('--model', required=True, help='HF id (ORG/NAME[@REV]) or snapshot directory; {snapshot} in ARGS')
     parser.add_argument('--arm', action='append', default=[], metavar='NAME=WIP_INSTANCE:SLOT')
     parser.add_argument('--arm-env', action='append', default=[], metavar='ARM:KEY=VALUE')
+    parser.add_argument('--arm-arg', action='append', default=[], metavar='ARM:TOKEN',
+                        help='one extra argv token appended for that arm only (repeatable, in order)')
     parser.add_argument('--env', action='append', default=[], metavar='KEY=VALUE', help='environment for every arm')
     parser.add_argument('--gpus', default='0,1', help='raptor GPUs, locked gpu0 then gpu1 (default 0,1)')
     raw = parser.add_mutually_exclusive_group()
@@ -1198,6 +1211,8 @@ def main(argv=None):
                         'CUTEAFD_GOLDEN_EXPERT_LAYERS and {expert_layers}')
     parser.add_argument('--expert-port', type=int, default=DEFAULT_EXPERT_PORT)
     parser.add_argument('--worker-env', action='append', default=[], metavar='KEY=VALUE', help='worker environment')
+    parser.add_argument('--arm-worker-env', action='append', default=[], metavar='ARM:KEY=VALUE',
+                        help='worker environment for one arm (repeatable; over --worker-env)')
     parser.add_argument('--worker-arg', action='append', default=[], metavar='ARG',
                         help='extra expertd-native argument (repeatable; e.g. --worker-arg=--exl3-schedule)')
     parser.add_argument('--worker-budget-bytes', type=int, default=DEFAULT_WORKER_BUDGET)
@@ -1213,6 +1228,8 @@ def main(argv=None):
     parser.add_argument('--wait', type=float, default=float(os.environ.get('CUTEAFD_HW_LOCK_WAIT_S', 21600)))
     parser.add_argument('--preflight', default='', help='shell check before enqueue and at grant (as hwlock)')
     parser.add_argument('--preflight-timeout', type=float, default=300)
+    parser.add_argument('--preflight-at-grant', action='store_true',
+                        help='run --preflight only once the locks are granted (free-memory floors and the like)')
     parser.add_argument('--compare-logits', action='append', default=[], metavar='A:B')
     parser.add_argument('--vocab', type=int, help='logits row width (default: the checkpoint config.json vocab_size)')
     parser.add_argument('--overwrite', action='store_true', help='replace an earlier golden/ of this task')
@@ -1233,6 +1250,11 @@ def main(argv=None):
         if not arms:
             raise ValueError('at least one --arm is required')
         apply_env(arms, args.env, args.arm_env)
+        for value in args.arm_arg:
+            name, sep, token = value.partition(':')
+            if not sep or name not in arms or not token or '\n' in token:
+                raise ValueError(f'--arm-arg {value!r} names no arm (ARM:TOKEN)')
+            arms[name]['args'].append(token)
         pairs = parse_pairs(args.compare_logits, arms)
         state = build_state(args, arms)
         for name in arms:
@@ -1240,7 +1262,8 @@ def main(argv=None):
                 raise ValueError('task and arm names make a container name over 128 characters')
         state['slots'] = preflight(state, arms, at_grant=False)
         state['serving_args'] = serving_args()
-        hwlock.check_preflight(args.preflight, args.preflight_timeout)
+        if not args.preflight_at_grant:
+            hwlock.check_preflight(args.preflight, args.preflight_timeout)
     except (ValueError, OSError, subprocess.SubprocessError, hwlock.PreflightFailed) as error:
         print(f'golden-run: {error}', file=sys.stderr)
         return 78 if isinstance(error, hwlock.PreflightFailed) else 2
@@ -1254,7 +1277,7 @@ def main(argv=None):
                 for rank, host in enumerate(state['sparks']['hosts'] if state.get('sparks') else ()):
                     print(f'# {name} r{repeat} expert rank {rank} on {host}\n'
                           f"ssh {host} {shlex.quote(shlex.join(worker_command(state, name, rank, state['slots'][name]['sparks'][host])))}")
-                cmd, _ = docker_command(state, name, arms[name], state['slots'][name], out, run_args(state), packages)
+                cmd, _ = docker_command(state, name, arms[name], state['slots'][name], out, run_args(state, arms[name]), packages)
                 print(f'# {name} r{repeat}\n{shlex.join(cmd)}')
         print('golden-run: preflight pass')
         return 0
@@ -1287,7 +1310,8 @@ def main(argv=None):
             body()  # an enclosing hwlock already holds our locks
         else:
             with hwlock.hold(state['locks'], args.wait, f'golden-run {args.task}', preflight=args.preflight,
-                             preflight_timeout=args.preflight_timeout):
+                             preflight_timeout=args.preflight_timeout,
+                             preflight_at_grant_only=args.preflight_at_grant):
                 body()
     except hwlock.PreflightFailed as error:
         print(f'golden-run: {error}', file=sys.stderr)

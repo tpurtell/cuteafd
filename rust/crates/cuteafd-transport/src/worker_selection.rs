@@ -75,6 +75,29 @@ pub struct ModelAdmission {
 }
 
 impl ModelAdmission {
+    /// Persistent clients retain endpoint leases between waves, even when their
+    /// requests never overlap. Admit one endpoint per client, not per live wave.
+    pub fn for_clients(geometry: cuteafd_core::ExpertGeometry,
+        endpoint: cuteafd_core::SparkEndpoint, compiled_capacity: u32,
+        rings: cuteafd_core::SparkRings, clients: usize) -> Result<Self> {
+        ensure!((1..=8).contains(&clients), "ModelAdmission requires 1..=8 persistent clients");
+        let model = Self { capacity: endpoint.capacity, compiled_capacity,
+            endpoints: vec![endpoint; clients], rings };
+        model.validate(geometry)?;
+        model.require_clients(endpoint, clients)?;
+        Ok(model)
+    }
+
+    /// Check the immutable worker contract before allocating or opening clients.
+    pub fn require_clients(&self, endpoint: cuteafd_core::SparkEndpoint, clients: usize) -> Result<()> {
+        ensure!((1..=8).contains(&clients), "ModelAdmission requires 1..=8 persistent clients");
+        let admitted = self.endpoints.iter().filter(|spec|
+            spec.capacity >= endpoint.capacity && spec.ingress == endpoint.ingress).count();
+        ensure!(admitted >= clients,
+            "ModelAdmission admits {admitted} matching endpoints for {clients} persistent clients ({endpoint:?})");
+        Ok(())
+    }
+
     pub fn validate(&self, geometry: cuteafd_core::ExpertGeometry) -> Result<()> {
         ensure!((1..=4096).contains(&self.capacity), "invalid ModelAdmission capacity");
         ensure!((self.capacity..=4096).contains(&self.compiled_capacity),
@@ -555,6 +578,19 @@ fn seals() -> &'static Mutex<BTreeMap<SocketAddr, PeerSeal>> {
 pub(crate) fn peer_selection_digest(peer: SocketAddr) -> Result<Option<String>> {
     Ok(seals().lock().map_err(|_| anyhow::anyhow!("worker selection seals poisoned"))?
         .get(&peer).map(|seal| seal.digest.clone()))
+}
+
+/// Refuse an undersized worker contract before constructing persistent clients.
+pub fn require_peer_clients(peers: &[SocketAddr], endpoint: cuteafd_core::SparkEndpoint,
+    clients: usize) -> Result<()> {
+    let seals = seals().lock().map_err(|_| anyhow::anyhow!("worker selection seals poisoned"))?;
+    for peer in peers {
+        seals.get(peer).and_then(|seal| seal.endpoints.selection.model())
+            .context("persistent clients require sealed ModelAdmission")?
+            .require_clients(endpoint, clients)
+            .with_context(|| format!("worker {peer} persistent-client admission"))?;
+    }
+    Ok(())
 }
 
 /// Claim one coordinator endpoint before allocating its native buffers. The
@@ -1107,6 +1143,112 @@ mod tests {
     }
 
     #[test]
+    fn step5_two_rank_clients_replay_admission_and_retained_endpoint_credit() -> Result<()> {
+        use cuteafd_core::{SparkEndpoint, SparkIngress, ExpertGeometry};
+        use std::sync::atomic::Ordering;
+        let geometry = ExpertGeometry::STEP5;
+        let endpoint = SparkEndpoint { capacity: 640, ingress: SparkIngress::Bf16 };
+        let rings = admission_selection().model().unwrap().rings;
+        for clients in [0, 9, usize::MAX] {
+            assert!(ModelAdmission::for_clients(geometry, endpoint, 4096, rings, clients).is_err());
+        }
+        for clients in [1, 2] {
+            let model = ModelAdmission::for_clients(geometry, endpoint, 4096, rings, clients)?;
+            assert_eq!(model.ring_bytes(geometry)?, clients * 134217728);
+            let selection = WorkerSelection::new(WorkerIdentity {
+                checkpoint: "0".repeat(64), manifest: None,
+                geometry: [4096, 352, 8, 1536, 91], world: 6,
+                topology: [6, 1], ownership_wire: false,
+            }, &(3..91).collect::<Vec<_>>())?.with_model(model)?;
+            let mut reports = Vec::new();
+            for rank in 0..6 {
+                let mut report = admission_report(&selection);
+                report.rank = rank;
+                report.resident_bytes = 100965469184;
+                report.runtime.workspace_bytes = 199584768;
+                report.slices = (3..91).map(|layer| cuteafd_core::SparkSlice {
+                    layer, first: rank * 256, width: 256, stored_width: 256,
+                    tiers: vec![], projection_counts: vec![],
+                }).collect();
+                report.host_exchange_bytes = 640 * (4096 * 2 + 8 * 8);
+                report.row_indices_bytes = 640 * 4;
+                reports.push(report);
+            }
+            let listeners = (0..6).map(|_| std::net::TcpListener::bind("127.0.0.1:0"))
+                .collect::<std::io::Result<Vec<_>>>()?;
+            let peers = listeners.iter().map(|l| l.local_addr()).collect::<std::io::Result<Vec<_>>>()?;
+            std::thread::scope(|scope| -> Result<()> {
+                let mut servers = Vec::new();
+                for (rank, (listener, report)) in listeners.into_iter().zip(reports).enumerate() {
+                    let selection = selection.clone();
+                    servers.push(scope.spawn(move || -> Result<()> {
+                        let installed = InstalledModelAdmission::new(rank, selection.clone(), Some(report))?;
+                        listener.set_nonblocking(true)?;
+                        for _ in 0..2 {
+                            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+                            let mut stream = loop {
+                                match listener.accept() {
+                                    Ok((stream, _)) => break stream,
+                                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                                        ensure!(std::time::Instant::now() < deadline, "test admission accept timed out");
+                                        std::thread::sleep(Duration::from_millis(10));
+                                    }
+                                    Err(error) => return Err(error.into()),
+                                }
+                            };
+                            assert_eq!(receive_worker_selection(&stream, rank, Duration::from_secs(5))?, selection);
+                            installed.acknowledge(&mut stream)?;
+                        }
+                        Ok(())
+                    }));
+                }
+                select_model_admission(&peers, &selection, Duration::from_secs(5))?;
+                assert_eq!(require_peer_clients(&peers, endpoint, 2).is_ok(), clients == 2);
+                for peer in &peers {
+                    assert_eq!(seals().lock().unwrap()[peer].endpoints.used.load(Ordering::Acquire), 0);
+                }
+                let mut header = crate::ExpertProtocolV2RequestHeader {
+                    request_id: 4, placement_version: 17, layer_id: 3, row_count: 640,
+                    hidden_dim: 4096, hidden_dtype: crate::ExpertV2Dtype::Bf16,
+                    hidden_row_stride_bytes: 8192, route_count: 5120,
+                    row_descriptor_bytes: 40, route_bytes: 12,
+                    hidden_payload_bytes: 640 * 8192,
+                    flags: crate::protocol_v2::EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16,
+                };
+                let first = peers.iter().map(|&peer| reserve_peer_endpoint(peer, &header, None)
+                    .map(|lease| lease.unwrap())).collect::<Result<Vec<_>>>()?;
+                // Rank0's layer3 wave has completed, but its persistent QPs live.
+                header.layer_id = 7;
+                header.request_id = 8;
+                select_model_admission(&peers, &selection, Duration::from_secs(5))?;
+                for &peer in &peers {
+                    let seals = seals().lock().unwrap();
+                    let endpoints = &seals[&peer].endpoints;
+                    assert_eq!(endpoints.used.load(Ordering::Acquire).count_ones(), 1);
+                    validate_endpoint_request(&selection, 0, &header)?;
+                }
+                let mut second = Vec::new();
+                for &peer in &peers {
+                    match reserve_peer_endpoint(peer, &header, None) {
+                        Ok(Some(lease)) => { assert_eq!(clients, 2); assert_eq!(lease.index(), 1); second.push(lease); }
+                        Err(error) => {
+                            assert_eq!(clients, 1);
+                            assert!(error.to_string().contains("has no free ModelAdmission endpoint for capacity None / Bf16"));
+                        }
+                        _ => panic!("typed endpoint lease missing"),
+                    }
+                }
+                for server in servers { server.join().unwrap()?; }
+                drop(second);
+                drop(first);
+                for peer in peers { seals().lock().unwrap().remove(&peer); }
+                Ok(())
+            })?;
+        }
+        Ok(())
+    }
+
+    #[test]
     fn installed_report_replay_preserves_measured_bytes() -> Result<()> {
         let selection = admission_selection();
         let report = admission_report(&selection);
@@ -1256,6 +1398,34 @@ mod tests {
             admission: Some(admission_report(&selection)) })?;
         assert!(pending.wait().is_err());
         assert!(peer_selection_digest(peer)?.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn reduced_worker_endpoints_or_ring_report_fail_before_peer_seal() -> Result<()> {
+        use cuteafd_core::{SparkEndpoint, SparkIngress};
+        let mut selection = admission_selection();
+        let geometry = selection.geometry();
+        selection.model = Some(ModelAdmission::for_clients(geometry,
+            SparkEndpoint { capacity: 640, ingress: SparkIngress::Bf16 }, 4096,
+            selection.model().unwrap().rings, 2)?);
+        for shrink_selection in [true, false] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+            let peer = listener.local_addr()?;
+            let pending = start_model_admission(&[peer], &selection, Duration::from_secs(3))?;
+            let (mut stream, _) = listener.accept()?;
+            receive_worker_selection(&stream, 0, Duration::from_secs(3))?;
+            let mut echoed = selection.clone();
+            let mut report = admission_report(&selection);
+            if shrink_selection {
+                echoed.model.as_mut().unwrap().endpoints.pop();
+                report.mapped_ring_bytes = echoed.model().unwrap().ring_bytes(geometry)? as u64;
+            } else { report.mapped_ring_bytes /= 2; }
+            write(&mut stream, &Ready { message: "worker_selection_ready".into(), rank: 0,
+                digest: echoed.digest()?, selection: echoed, admission: Some(report) })?;
+            assert!(pending.wait().is_err());
+            assert!(peer_selection_digest(peer)?.is_none());
+        }
         Ok(())
     }
 

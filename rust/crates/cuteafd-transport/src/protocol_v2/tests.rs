@@ -1105,6 +1105,40 @@ fn frame_prefix_encoders_match_full_wire_frames() -> Result<()> {
 }
 
 #[test]
+fn admitted_response_prefix_never_grows_and_rejects_oversized_rows() -> Result<()> {
+    use cuteafd_core::{SparkEndpoint, SparkIngress};
+    let endpoint = SparkEndpoint { capacity: 640, ingress: SparkIngress::Bf16 };
+    let mut buffer = ExpertProtocolV2FrameBuffer::for_endpoint_response(endpoint)?;
+    assert_eq!(buffer.capacity(), EXPERT_PROTOCOL_V2_RESPONSE_DEBUG_HEADER_LEN + 640 * 4);
+    assert_eq!(buffer.capacity(), endpoint.response_prefix_bytes().unwrap());
+    let pointer = buffer.as_ptr();
+    for rows in [1, 640, 16, 640, 641] {
+        let indices: Vec<_> = (0..rows).collect();
+        let response = ExpertProtocolV2Response::new(42, 7, 13, rows, 4096,
+            ExpertV2Dtype::Bf16, ExpertProtocolV2Status::Ok,
+            vec![0; rows as usize * 8192])?.with_debug_checksum()
+            .with_row_indices(indices.clone(), false)?;
+        let device = ExpertProtocolV2DeviceResponseRef::new_with_output_stride(42, 7, 13, rows,
+            4096, ExpertV2Dtype::Bf16, 8192, ExpertProtocolV2Status::Ok,
+            cuteafd_ffi::CuteafdDeviceBuffer { ptr: 0x10_0000_usize as *mut std::ffi::c_void,
+                bytes: rows as usize * 8192, device_id: 0, flags: 0 })?
+            .with_row_indices(&indices, false)?;
+        if rows > endpoint.capacity {
+            assert!(buffer.encode_response_prefix(&response).is_err());
+            assert!(buffer.encode_borrowed_response_prefix(&response.as_borrowed()).is_err());
+            assert!(buffer.encode_device_response_prefix(&device).is_err());
+        } else {
+            assert_eq!(buffer.encode_response_prefix(&response)?.len(), 128 + rows as usize * 4);
+            assert_eq!(buffer.encode_borrowed_response_prefix(&response.as_borrowed())?.len(), 128 + rows as usize * 4);
+            assert_eq!(buffer.encode_device_response_prefix(&device)?.len(), 96 + rows as usize * 4);
+        }
+        assert_eq!(buffer.as_ptr(), pointer);
+        assert_eq!(buffer.capacity(), 2688);
+    }
+    Ok(())
+}
+
+#[test]
 fn device_response_prefix_matches_host_response_metadata() -> Result<()> {
     let row_indices = [7_u32, 3_u32];
     let payload_bytes = 2 * DS4_FLASH_HIDDEN_BF16_BYTES;

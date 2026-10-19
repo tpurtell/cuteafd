@@ -28,6 +28,17 @@ struct Layer<'a> {
     attention: Attention<'a>,
     routed: Option<RoutedFfn<'a>>,
 }
+fn validate_ffn_ownership(
+    dense_planned: bool,
+    dense_owned: bool,
+    routed_owned: bool,
+) -> Result<()> {
+    ensure!(
+        dense_owned == dense_planned && routed_owned != dense_planned,
+        "Step-5 planned FFN must have exactly one matching executor: dense planned={dense_planned}, dense owned={dense_owned}, routed owned={routed_owned}"
+    );
+    Ok(())
+}
 impl Layer<'_> {
     fn input(&self) -> CuteafdDeviceBuffer {
         match &self.attention {
@@ -163,6 +174,16 @@ impl<'a> TargetChain<'a> {
             let routed = plan
                 .map(|p| RoutedFfn::load(device, programs, checkpoint, id, p))
                 .transpose()?;
+            let dense_owned = match &attention {
+                Attention::Sliding(owner) => owner.has_dense_ffn(),
+                Attention::Sparse(owner) => owner.has_dense_ffn(),
+            };
+            validate_ffn_ownership(
+                contract.layers[id].dense_activation.is_some(),
+                dense_owned,
+                routed.is_some(),
+            )
+            .with_context(|| format!("Step-5 layer {id} FFN ownership"))?;
             layers.push(Layer { attention, routed });
         }
         Ok(Self {
@@ -180,6 +201,12 @@ impl<'a> TargetChain<'a> {
             .get(layer)
             .context("Step-5 chain output layer")?
             .output())
+    }
+    pub(super) fn diagnostic_layer0(&self) -> Result<&SwaLayer<'a>> {
+        match &self.layers.first().context("Step-5 missing layer zero")?.attention {
+            Attention::Sliding(owner) => Ok(owner),
+            _ => anyhow::bail!("Step-5 layer zero must be SWA"),
+        }
     }
     pub fn enqueue_step<'e, E: CopyEngine>(
         &'e mut self,
@@ -293,6 +320,38 @@ mod tests {
 
     const H: usize = 4096;
     const REVISION: &str = "7734b7ffac118d70d8398bfa3eb0fab007eb45b1";
+
+    #[test]
+    fn every_planned_ffn_requires_one_matching_live_executor() -> Result<()> {
+        // Use the admission check applied to live owners, including sparse+dense.
+        let fixture: Value = serde_json::from_str(include_str!(
+            "../../../../cuteafd-loader/src/plan/families/step5/fixtures/official-fp8.json"
+        ))?;
+        let config = &fixture["config"]["text_config"];
+        let routed = config["moe_layer_list"]
+            .as_array()
+            .context("routed schedule")?;
+        for layer in 0..config["num_hidden_layers"]
+            .as_u64()
+            .context("target count")?
+        {
+            let dense = !routed.iter().any(|id| id.as_u64() == Some(layer));
+            validate_ffn_ownership(dense, dense, !dense)?;
+            assert!(
+                validate_ffn_ownership(dense, false, false).is_err(),
+                "layer {layer}: missing FFN"
+            );
+            assert!(
+                validate_ffn_ownership(dense, true, true).is_err(),
+                "layer {layer}: double FFN"
+            );
+            assert!(
+                validate_ffn_ownership(dense, !dense, dense).is_err(),
+                "layer {layer}: wrong FFN"
+            );
+        }
+        Ok(())
+    }
 
     fn fixture(
         root: &Path,
@@ -482,7 +541,7 @@ mod tests {
         Ok(request)
     }
 
-    fn link<'a>(device: Device<'a>, snapshot: &Path) -> Result<SparkDeviceLink<'a>> {
+    fn link<'a>(device: Device<'a>, snapshot: &Path, layers: &[usize]) -> Result<SparkDeviceLink<'a>> {
         use crate::shared::placement::{spark_rings, SparkAdmission};
         let peers = std::env::var("CUTEAFD_GOLDEN_PEERS")?
             .split(',')
@@ -493,10 +552,9 @@ mod tests {
             [4, 6].contains(&peers.len()) && world.supports_device_exchange(),
             "chain gate requires canonical TP4 or TP6"
         );
-        ensure!(
-            std::env::var("CUTEAFD_GOLDEN_EXPERT_LAYERS")? == "3",
-            "chain gate selects only layer 3"
-        );
+        let hosted = std::env::var("CUTEAFD_GOLDEN_EXPERT_LAYERS")?
+            .split(',').map(str::parse).collect::<std::result::Result<Vec<usize>, _>>()?;
+        ensure!(hosted == layers, "chain gate hosted layer selection differs");
         let catalog = cuteafd_loader::read_expert_catalog(snapshot)?;
         let config = TcpTransportConfig::default();
         // Read architecture-independent sealed package metadata: Spark libraries
@@ -535,7 +593,7 @@ mod tests {
             Some(&catalog),
             &cuteafd_loader::placement::SparkWorkingSet {
                 rtx_layers: vec![],
-                spark_layers: vec![3],
+                spark_layers: layers.to_vec(),
                 spark_ranks: peers.len(),
                 prefill_lanes: 1,
             },
@@ -553,7 +611,7 @@ mod tests {
         )?
         .select(&peers)?;
         let warm = request(
-            3,
+            layers[0],
             64,
             (0..64 * 8)
                 .map(|i| ExpertProtocolV2RouteEntry {
@@ -679,7 +737,7 @@ mod tests {
             verify_weights(&snapshot, hashes)?;
         }
         let link = if count > 3 {
-            Some(device.run(|| link(device, &snapshot))?)
+            Some(device.run(|| link(device, &snapshot, &[3]))?)
         } else {
             None
         };
@@ -854,6 +912,92 @@ mod tests {
     #[ignore = "requires golden-run real TP4/TP6 experts and same-quant fixtures"]
     fn native_step5_layer_chain() -> Result<()> {
         native(4)
+    }
+
+    #[test]
+    #[ignore = "requires golden-run real TP6 experts and native BF16 tail fixtures"]
+    fn native_step5_bf16_tails() -> Result<()> {
+        let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
+        cuteafd_core::set_expert_geometry(ExpertGeometry::STEP5)
+            .map_err(|_| anyhow::anyhow!("tail gate needs its own Step-5 process"))?;
+        let root = std::path::PathBuf::from(std::env::var("CUTEAFD_GOLDEN_FIXTURES")?);
+        let snapshot = std::path::PathBuf::from(std::env::var("CUTEAFD_GOLDEN_SNAPSHOT")?);
+        ensure!(snapshot.file_name().and_then(|s| s.to_str())
+            == Some("364b3b03fed2477aa0953fe855a2c4c8c48ee3cc"), "tail checkpoint pin");
+        // SAFETY: the supported runner verifies the native artifact and source seal.
+        let library = unsafe { cuteafd_ffi::NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? };
+        let device = crate::shared::memory::device::cache_test_device(&library)?;
+        let programs = library.programs()?.with_manifest(Path::new(&std::env::var("CUTEAFD_PROGRAM_MANIFEST")?))?;
+        let checkpoint = Checkpoint::coordinator(&snapshot, false, false)?;
+        let link = device.run(|| link(device, &snapshot, &[88, 89, 90]))?;
+        ensure!(link.world_size() == 6, "BF16 tail qualification requires TP6");
+        let read = |buffer, bytes| {
+            let mut result = vec![0; bytes];
+            device.run(|| library.copy_d2h(&mut result, buffer))?;
+            Ok::<_, anyhow::Error>(result)
+        };
+        for layer in 88..=90 {
+            let directory = root.join(format!("layer{layer}"));
+            let manifest: Value = serde_json::from_slice(&std::fs::read(directory.join("manifest.json"))?)?;
+            let identity = &manifest["same_quant"];
+            ensure!(manifest["schema"] == 1 && manifest["seed"] == 274
+                && manifest["source_pins"] == serde_json::json!({
+                    "model.py": "330a166878910b21e37f65669033a84fcaada3b58d7903fc16ef55c496cb1ea5",
+                    "kernel.py": "2cd01d57d2d135397d2fd36c203684af7564b5e6c6f5d3853b3d35bedeb548be",
+                    "vision_encoder.py": "8943ee555ffd2a32213f6f9f0a7146d1f49566c65c8b7691c37055208cdb6b53"
+                })
+                && manifest["rows"] == serde_json::json!([1,7,8,9,64])
+                && identity["checkpoint"] == "stepfun-ai/Step-5-Preview"
+                && identity["revision"].as_str() == snapshot.file_name().and_then(|s| s.to_str())
+                && identity["layer"] == layer && identity["storage"] == "bf16"
+                && identity["tp"] == 6 && identity["slice"] == 256
+                && identity["ingress"] == "bf16" && identity["maximum_rows"] == 64
+                && identity["error_ratio_bound"] == 1.01 && identity["router_relative_margin"] == 1e-3,
+                "native BF16 tail fixture identity");
+            let hashes = manifest["quant_weights_sha256"].as_object().context("tail source hashes")?;
+            let layout = RankWeightLayout::from_checkpoint(&checkpoint, 0, 1)?;
+            let mut expected: std::collections::BTreeSet<_> = layout.operands.iter()
+                .filter(|w| w.name.starts_with(&format!("model.layers.{layer}."))
+                    && (w.name.contains("post_attention_layernorm.") || w.name.contains("moe.gate.")
+                        || w.name.ends_with("moe.router_bias") || w.name.contains("share_expert.")))
+                .flat_map(|w| w.sources.iter().map(|s| s.meta.name.clone())).collect();
+            for projection in ["gate", "up", "down"] {
+                expected.insert(format!("model.layers.{layer}.moe.{projection}_proj.weight"));
+            }
+            ensure!(expected == hashes.keys().cloned().collect(), "tail source hash inventory");
+            verify_weights(&snapshot, hashes)?;
+            let plan = RoutedPlan::prepare(&programs, &checkpoint, layer, 64, u64::MAX, &[])?;
+            let ffn = RoutedFfn::load(device, &programs, &checkpoint, layer, plan)?;
+            let stream = crate::shared::memory::device::Stream::new(device)?;
+            for rows in [1,7,8,9,64] {
+                let load = |name: &str| {
+                    let (dtype, shape) = match name {
+                        "ids" => ("torch.int32", vec![rows,8]),
+                        "margin" => ("torch.float32", vec![rows]),
+                        "fp64_output" => ("torch.float64", vec![rows,H]),
+                        _ => ("torch.float32", vec![rows,H]),
+                    };
+                    fixture(&directory, &manifest, &format!("q_r{rows}_{name}"), dtype, &shape)
+                };
+                device.run(|| library.copy_h2d(ffn.input(), &load("residual")?))?;
+                let mut first = Vec::new();
+                for replay in 0..3 {
+                    link.arm()?;
+                    link.expect(1);
+                    ffn.enqueue_on(rows, 0, &link, &stream)?;
+                    stream.drain()?;
+                    link.check()?;
+                    let actual = read(ffn.output(), rows * H * 4)?;
+                    if replay == 0 {
+                        accuracy(&actual, &load("wiring_output")?, &load("fp64_output")?, H)?;
+                        selection(&read(ffn.route_ids(), rows * 8 * 4)?, &load("ids")?, &load("margin")?, rows)?;
+                        eprintln!("native BF16 tail layer={layer} rows={rows} qualified");
+                        first = actual;
+                    } else { ensure!(actual == first, "native BF16 tail replay drift"); }
+                }
+            }
+        }
+        Ok(())
     }
 
     #[test]

@@ -273,6 +273,34 @@
     "SPARK_0_HOST": "ostrich",
     "SPARK_1_HOST": "dodo"
    }
+  },
+  {
+   "name": "kimi-k3-max",
+   "family": "kimi_k3",
+   "config": "examples/configs/kimi-k3-exl3-max.config",
+   "gpus": [
+    0,
+    1
+   ],
+   "sparks": [
+    "ostrich",
+    "dodo",
+    "emu",
+    "kiwi",
+    "rhea",
+    "moa"
+   ],
+   "set": {
+    "ADDR": "0.0.0.0:8742",
+    "EXPERT_PORT": "19842",
+    "SPARK_COUNT": "6",
+    "SPARK_0_HOST": "ostrich",
+    "SPARK_1_HOST": "dodo",
+    "SPARK_2_HOST": "emu",
+    "SPARK_3_HOST": "kiwi",
+    "SPARK_4_HOST": "rhea",
+    "SPARK_5_HOST": "moa"
+   }
   }
  ]
 }

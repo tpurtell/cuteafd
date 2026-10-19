@@ -62,7 +62,13 @@ __device__ float bf16_to_f32(uint16_t value) {
 }
 
 __device__ uint16_t f32_to_bf16(float value) {
-  return static_cast<uint16_t>(__float_as_uint(value) >> 16);
+  const uint32_t bits = __float_as_uint(value);
+  // Preserve NaNs (including payloads in the discarded bits) as quiet NaNs.
+  if ((bits & 0x7fffffffu) > 0x7f800000u) {
+    return static_cast<uint16_t>((bits >> 16) | 0x0040u);
+  }
+  const uint32_t rounding_bias = 0x7fffu + ((bits >> 16) & 1u);
+  return static_cast<uint16_t>((bits + rounding_bias) >> 16);
 }
 
 __device__ float dot_packed_nvfp4_bf16(const uint16_t* input, const uint8_t* packed_row,

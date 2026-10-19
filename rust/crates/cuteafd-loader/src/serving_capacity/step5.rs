@@ -24,6 +24,7 @@ pub struct SnapshotCopy {
 pub struct SlidingState {
     pub layer: usize,
     pub mtp: bool,
+    pub query_heads: usize,
     pub key: ByteSpan,
     pub value: ByteSpan,
 }
@@ -31,12 +32,16 @@ pub struct SlidingState {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RegionState {
     pub layer: usize,
-    /// BF16 [8,256], including deterministic unused slots, on every head rank.
+    pub query_heads: usize,
+    /// One K or V plane's bytes per physical page on this layer's owner.
+    pub page_bytes: u64,
+    /// BF16 [8,256], including deterministic unused slots, on each owner.
     pub pending_key: ByteSpan,
     pub pending_z: ByteSpan,
     pub next_key: ByteSpan,
     pub next_z: ByteSpan,
-    /// Published complete-region summaries; only the lead rank owns the table.
+    /// Published complete-region summaries, colocated with owned CSA attention.
+    /// The diagnostic head-split layout retains its lead-rank-only table.
     pub summaries: Option<ByteSpan>,
 }
 
@@ -82,10 +87,10 @@ impl RankState {
         Ok(span)
     }
 
-    fn ring(&mut self, layer: usize, mtp: bool, bytes: u64) -> Result<(), CacheGeometryError> {
+    fn ring(&mut self, layer: usize, mtp: bool, query_heads: usize, bytes: u64) -> Result<(), CacheGeometryError> {
         let key = self.reserve(bytes)?;
         let value = self.reserve(bytes)?;
-        self.sliding.push(SlidingState { layer, mtp, key, value });
+        self.sliding.push(SlidingState { layer, mtp, query_heads, key, value });
         Ok(())
     }
 }
@@ -94,6 +99,19 @@ impl Step5CacheLayout {
     /// BF16 K/V, BF16 pending K/Z, E4M3-byte dense summaries. MTP is owned by
     /// rank 0 with all heads; target K/V is head-split. No 256-row MiMo limits.
     pub fn new(cfg: &Config, ranks: usize, context: u64, mtp: usize, max_step: u64) -> Result<Self, CacheGeometryError> {
+        Self::build(cfg, ranks, context, mtp, max_step, None)
+    }
+
+    /// The serving candidate uses the same validated ownership as its weights.
+    /// This storage contract alone does not admit execution or serving.
+    pub fn for_execution(cfg: &Config, ownership: &crate::plan::families::step5::ownership::ExecutionOwnership,
+        context: u64, mtp: usize, max_step: u64) -> Result<Self, CacheGeometryError> {
+        ownership.validate_config(cfg).map_err(|_| invalid("ownership/checkpoint geometry"))?;
+        Self::build(cfg, ownership.ranks(), context, mtp, max_step, Some(ownership))
+    }
+
+    fn build(cfg: &Config, ranks: usize, context: u64, mtp: usize, max_step: u64,
+        ownership: Option<&crate::plan::families::step5::ownership::ExecutionOwnership>) -> Result<Self, CacheGeometryError> {
         if ![1, 2].contains(&ranks) || cfg.groups % ranks != 0 || cfg.heads % ranks != 0
             || (cfg.window, cfg.groups, cfg.dim, cfg.hidden) != (512, 4, 192, 4096)
             || cfg.full.len() != cfg.layers + cfg.mtp || cfg.layers != 92
@@ -105,8 +123,7 @@ impl Step5CacheLayout {
             return Err(invalid("context outside checkpoint extent"));
         }
         let capacity = context.div_ceil(REGION_ROWS);
-        let full = cfg.full[..cfg.layers].iter().filter(|full| **full).count() as u64;
-        let half_record = mul(&[cfg.groups as u64 / ranks as u64, cfg.dim as u64, 2])?;
+        let mtp_owner = ownership.map_or(0, |o| usize::from(o.execution().spec().head_gpu));
         let window = cfg.window as u64;
         let ring = cuteafd_core::prefix::AppendRing::new(window, max_step, PAGE_ROWS)
             .ok_or_else(|| invalid("append-only ring step or extent"))?;
@@ -122,23 +139,34 @@ impl Step5CacheLayout {
             };
             state.length = state.reserve(8)?;
             state.next_length = state.reserve(8)?;
+            let mut page_bytes = 0u64;
             for layer in 0..cfg.layers {
+                let (heads, groups) = if let Some(ownership) = ownership {
+                    let local = ownership.layer(layer, rank).map_err(|_| invalid("layer owner"))?;
+                    (local.query_heads, local.kv_heads)
+                } else { (cfg.heads / ranks, cfg.groups / ranks) };
+                if heads == 0 { continue; }
+                let record = mul(&[groups as u64, cfg.dim as u64, 2])?;
                 if cfg.full[layer] {
+                    let plane = mul(&[PAGE_ROWS, record])?;
+                    page_bytes = page_bytes.checked_add(mul(&[plane, 2])?)
+                        .ok_or(CacheGeometryError::Overflow("Step-5 page layers"))?;
                     let pending_key = state.reserve(REGION_ROWS * PROXY_DIM * 2)?;
                     let pending_z = state.reserve(REGION_ROWS * PROXY_DIM * 2)?;
                     let next_key = state.reserve(REGION_ROWS * PROXY_DIM * 2)?;
                     let next_z = state.reserve(REGION_ROWS * PROXY_DIM * 2)?;
-                    let summaries = if rank == 0 {
+                    let summaries = if ownership.is_some() || rank == 0 {
                         Some(state.reserve(mul(&[capacity, PROXY_DIM])?)?)
                     } else { None };
-                    state.regions.push(RegionState { layer, pending_key, pending_z, next_key, next_z, summaries });
+                    state.regions.push(RegionState { layer, query_heads: heads, page_bytes: plane,
+                        pending_key, pending_z, next_key, next_z, summaries });
                 } else {
-                    state.ring(layer, false, mul(&[ring.rows, half_record])?)?;
+                    state.ring(layer, false, heads, mul(&[ring.rows, record])?)?;
                 }
             }
-            if rank == 0 && mtp > 0 {
+            if rank == mtp_owner && mtp > 0 {
                 for stage in 0..mtp {
-                    state.ring(cfg.layers + stage, true,
+                    state.ring(cfg.layers + stage, true, cfg.heads,
                         mul(&[ring.rows, cfg.groups as u64, cfg.dim as u64, 2])?)?;
                     let length = state.reserve(8)?;
                     state.mtp_lengths.push(length);
@@ -146,7 +174,7 @@ impl Step5CacheLayout {
                 state.mtp_hidden = Some(state.reserve(mul(&[mtp_hidden_rows, cfg.hidden as u64, 2])?)?);
             }
             costs.push(RankCacheGeometry {
-                persistent_unit_bytes: mul(&[PAGE_ROWS, full, half_record, 2])?,
+                persistent_unit_bytes: page_bytes,
                 active_state_per_sequence_bytes: state.bytes,
                 retained_mark_bytes: state.bytes,
                 // Staged proposals belong to the actual lane workspace, not committed state.
@@ -158,11 +186,20 @@ impl Step5CacheLayout {
             ranks: states,
             geometry: FamilyCacheGeometry {
                 logical_unit_rows: PAGE_ROWS,
-                placement: if ranks == 1 { KvPlacement::SingleDevice } else { KvPlacement::PartitionedHeads },
+                placement: if ranks == 1 { KvPlacement::SingleDevice }
+                    else if ownership.is_some() { KvPlacement::PartitionedLayers }
+                    else { KvPlacement::PartitionedHeads },
                 ranks: costs,
             },
             context, mtp_hidden_rows, ring, window,
         })
+    }
+
+    pub fn query_heads(&self, rank: usize, layer: usize) -> Result<usize, CacheGeometryError> {
+        let state = self.ranks.get(rank).ok_or_else(|| invalid("attention rank"))?;
+        state.sliding.iter().find(|s| !s.mtp && s.layer == layer).map(|s| s.query_heads)
+            .or_else(|| state.regions.iter().find(|s| s.layer == layer).map(|s| s.query_heads))
+            .ok_or_else(|| invalid("attention layer is not owned on rank"))
     }
 
     /// Canonical mark spans exclude target ring slack and the inactive pending

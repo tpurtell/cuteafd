@@ -168,6 +168,37 @@ EOF
     _spark_slot_keys HOST LANE_A
     return
   fi
+  # Kimi K3 (WIP slots only): the shared serve contract and Spark workers, with
+  # no speculator, media or family modes yet.
+  if [[ "$1" == kimi_k3 ]]; then
+    cat <<'EOF'
+ATTENTION_PLACEMENT
+SPARK_EXPERT_DOCKER_INFERENCE
+SPARK_EXPERT_DOCKER_DEV
+EXPERT_PORT
+SPARK_DEVICE_BUDGET_BYTES
+MAX_CONTEXT_TOKENS
+RDMA_BOND_BALANCE
+HOST_ISA
+PROBE_DUMP_ROOT
+TARGET_HEAD
+SPARK_INTAKE
+CONSOLE_TEXT
+FP8_EXPERT_PREFILL
+ATTENTION_PLAN_ROWS
+PROFILE
+PROFILE_DIR
+PROFILE_NCU_KERNEL
+PROFILE_NCU_COUNT
+PROFILE_NCU_SET
+PROFILE_NSYS_GPU_METRICS
+PROFILE_EXPERT_INPUT_SAMPLE
+PROFILE_EXPERT_ROUTE_WEIGHTS
+EOF
+    [[ "$1" != kimi_k3 ]] || echo RTX_EXPERT_LAYERS
+    _spark_slot_keys HOST LANE_A
+    return
+  fi
   cat <<'EOF'
 VISION_REPLICAS
 RDMA_BOND_BALANCE
@@ -1437,6 +1468,9 @@ attention_placement="$(get ATTENTION_PLACEMENT auto)"
 # carries its programs); the planner and the server resolve it. Explicit modes run only where an
 # executor exists.
 case "$attention_placement:$family" in
+  # Families under qualification run only their recorded automatic placement.
+  auto:kimi_k3) ;;
+  *:kimi_k3) release_die "$family supports only ATTENTION_PLACEMENT=auto" ;;
   auto:*|heads:*|context:glm5|context:glm5_flash|context:deepseek_v4|layers:qwen4) ;;
   # K4/P7 qualified explicit layers; context remains the recorded auto default.
   # The planner still requires the selected image's executor and native programs.
@@ -1452,8 +1486,19 @@ case "$family" in
   mimo_v2) serve=serve-mimo ;;
   qwen4) serve=serve-qwen4 ;;
   qwen3_5) serve=serve-qwen35 ;;
-  *) echo "run-family.sh serves DeepSeek V4, GLM 5.x, GLM 5.3 Flash, MiMo V2 and Qwen 3.8 checkpoints, not $family (./run.sh serves DeepSeek V4.1)" >&2; exit 2 ;;
+  kimi_k3) serve=serve-kimi ;;
+  *) echo "run-family.sh serves DeepSeek V4, GLM 5.x, GLM 5.3 Flash, MiMo V2, Qwen 3.8 and Kimi K3 checkpoints, not $family (./run.sh serves DeepSeek V4.1)" >&2; exit 2 ;;
 esac
+# Kimi K3 (#273) is under qualification: WIP slots only, automatic attention
+# placement, text only (its bundled vision tower is not in scope), GPU token
+# embeddings and no speculator (it ships no MTP head; the drafters are not wired).
+if [[ "$family" == kimi_k3 ]]; then
+  [[ -n "$wip_slot" ]] || release_die "$family serving is under qualification; run it from a WIP slot (--wip SLOT)"
+  case "$vision:$audio" in
+    auto:auto|auto:off|off:auto|off:off) vision=off; audio=off ;;
+    *) release_die "$family bundled media execution is not qualified; set VISION=off and AUDIO=off" ;;
+  esac
+fi
 if [[ "$family" == qwen3_5 ]]; then
   [[ -n "$wip_slot" ]] || release_die "dense Qwen serving is under qualification; run it from a WIP slot"
   [[ "$attention_placement" == auto ]] || release_die "dense Qwen currently supports only single-GPU automatic attention placement"
@@ -1504,6 +1549,10 @@ if [[ "$family" == qwen3_5 ]]; then
   ranks=0
   backend=local
 fi
+if [[ "$family" == kimi_k3 ]]; then
+  [[ "$backend" != local && "$ranks" == 6 ]] ||
+    release_die "Kimi K3 serves its routed experts on exactly six Spark ranks (TP6), not $ranks; set SPARK_COUNT=6"
+fi
 coordinator_image="$(get COORDINATOR_DOCKER_INFERENCE)"
 # --wip SLOT serves a ./wip.sh slot: the development images run its artifacts, staged from
 # the WIP containers into a release-shaped /opt/cuteafd layout per host (as ./run.sh --wip
@@ -1535,6 +1584,13 @@ if [[ -n "$wip_slot" ]]; then
     -v \$HOME/.cache/cuteafd/wip-run/$WIP_LAYOUT_SLOT/source:/source:ro -e PYTHONPATH=/source/third_party/sparkinfer \
     -e PATH=/opt/cuteafd/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
     -e CUTEAFD_NATIVE_LIB=/opt/cuteafd/lib/libcuteafd_native.so --entrypoint /opt/cuteafd/share/release-entrypoint.sh"
+fi
+# Families whose serve command lands on its own branch: refuse a slot whose
+# binary predates it before planning or touching any service.
+if [[ "$family" == kimi_k3 ]]; then
+  docker run --rm --network none --mount "type=bind,src=$wip_layout/bin/cuteafd,dst=/opt/cuteafd-serve-probe,readonly" \
+    --entrypoint /opt/cuteafd-serve-probe "$coordinator_image" "$serve" --help >/dev/null ||
+    release_die "WIP slot $wip_slot has no '$serve' command; build the slot from a commit that serves $family"
 fi
 
 qwen_exl3=0
@@ -1680,6 +1736,7 @@ if [[ "$family" == mimo_v2 ]]; then
 fi
 case "$embedding" in host|gpu) ;; *) echo "EMBEDDING must be host or gpu" >&2; exit 2 ;; esac
 [[ "$family" != qwen3_5 || "$embedding" == gpu ]] || release_die "dense Qwen requires device token embedding"
+[[ "$family" != kimi_k3 || "$embedding" == gpu ]] || release_die "Kimi K3 serves GPU token embeddings only (EMBEDDING=gpu)"
 family_args=(--embedding-placement "$embedding" "${exlr8_plan_args[@]}")
 chat_template_mounts=()
 # Vision-only override: no template inference and no changes to text-only prompts.
@@ -1703,7 +1760,8 @@ if [[ -n "$chat_template_from" && "$vision" != off ]]; then
   fi
   family_args+=(--chat-template-from "$chat_template_from")
 fi
-family_args+=(--vision "$vision" --audio "$audio")
+# Kimi K3 serves text only and its command takes no media options.
+[[ "$family" == kimi_k3 ]] || family_args+=(--vision "$vision" --audio "$audio")
 case "$(get FULL_PREFILL_LOGITS off)" in
   on) family_args+=(--full-prefill-logits) ;;
   off) ;;
@@ -1761,7 +1819,7 @@ fi
 # snapshots the device evicts (e.g. 64GiB; 0 = off). POOL_TOKENS: paged KV tokens shared by
 # live sequences and retained snapshots.
 case $family in
-  mimo_v2|glm5|glm5_flash|qwen4|qwen3_5|deepseek_v4)
+  mimo_v2|glm5|glm5_flash|qwen4|qwen3_5|deepseek_v4|kimi_k3)
     family_args+=(--prefix-cache-entries "$(get PREFIX_CACHE_ENTRIES 20)")
     [[ "$(get HOST_CACHE_BYTES 0)" == 0 ]] || family_args+=(--host-cache-bytes "$(get HOST_CACHE_BYTES)") ;;
 esac
@@ -1846,6 +1904,19 @@ if [[ $family =~ ^(glm5|qwen4|qwen3_5|deepseek_v4)$ ]]; then
     pool=0
   fi
   family_args+=(--pool-tokens "$pool")
+fi
+# Kimi K3: unset or auto POOL_TOKENS leaves the KV pool to serve-kimi's own
+# automatic admission (no --pool-tokens); RTX_EXPERT_LAYERS is the fixed count
+# of routed layers onboarded to the RTX pair (unset: serve-kimi's default).
+if [[ $family == kimi_k3 ]]; then
+  pool="$(get POOL_TOKENS auto)"
+  [[ "$pool" == auto ]] || family_args+=(--pool-tokens "$pool")
+  local_layers="$(get RTX_EXPERT_LAYERS)"
+  if [[ -n "$local_layers" ]]; then
+    [[ "$local_layers" =~ ^[0-9]+$ ]] ||
+      release_die "Kimi K3 RTX_EXPERT_LAYERS is a fixed routed-layer count (N, N% or all), not $local_layers"
+    family_args+=(--rtx-expert-layers "$local_layers")
+  fi
 fi
 # DECODE_SHARE: the share of the time running requests keep while prompts
 # prefill (the engine's default 0.2; 0 prefills whole prompts before the next
@@ -1932,7 +2003,13 @@ spark_image="$(get SPARK_EXPERT_DOCKER_INFERENCE)"
 [[ -z "$wip_slot" ]] || spark_image="$(get SPARK_EXPERT_DOCKER_DEV cuteafd-spark-expert-dev)"
 port="$(get EXPERT_PORT 19441)"
 addr="$(get ADDR 0.0.0.0:8000)"
-budget="$(get SPARK_DEVICE_BUDGET_BYTES 107374182400)"
+# Kimi K3 leaves an unset budget to the planner, which takes the family's own
+# (the plan's spark_budget_bytes then reaches every worker).
+budget_default=107374182400
+[[ "$family" != kimi_k3 ]] || budget_default=""
+budget="$(get SPARK_DEVICE_BUDGET_BYTES "$budget_default")"
+spark_budget_args=()
+[[ -z "$budget" ]] || spark_budget_args=(--spark-budget-gib "$(python3 -c 'import sys;print(int(sys.argv[1])/2**30)' "$budget")")
 gpu="$(get COORDINATOR_GPU 0)"
 # Two coordinator GPUs (RTX_GPUS=auto/2 with COORDINATOR_GPU as V4.1's two-RTX config picks
 # the other card, or an explicit COORDINATOR_GPUS=0,1): families with a
@@ -1981,7 +2058,7 @@ fi
 split_hint=""
 split_opt_in=""
 case "$family:$model_type" in
-  deepseek_v4:*|glm5:*|glm5_flash:*|mimo_v2:mimo_v2|mimo_v2:mimo_v2_flash) ;;
+  deepseek_v4:*|glm5:*|glm5_flash:*|mimo_v2:mimo_v2|mimo_v2:mimo_v2_flash|kimi_k3:*) ;;
   qwen4:*)
     if [[ "$ranks" == 0 ]]; then
       : # Qualified Spark-free pairs default to native TP2 and whole-layer ownership.
@@ -2024,6 +2101,8 @@ if [[ -n "$second" && "$split" != off ]]; then
     echo "note: $family ($model_type) has no head split; auto selected GPU $gpu alone" >&2
   fi
 fi
+[[ "$family" != kimi_k3 || "$head_split" == 1 ]] ||
+  release_die "Kimi K3 serves TP2 attention on two RTX GPUs; set RTX_GPUS=2"
 if [[ "$family" == qwen4 && "$attention_placement" == layers && "$head_split" != 1 ]]; then
   release_die "Qwen whole-layer attention requires a Spark-free coordinator pair"
 fi
@@ -2329,7 +2408,7 @@ case "$family" in
       off) lane_env_args+=(-e CUTEAFD_GLMF_REMOTE_DFLASH=0) ;;
       "") [[ -z "${CUTEAFD_GLMF_REMOTE_DFLASH:-}" ]] || lane_env_args+=(-e "CUTEAFD_GLMF_REMOTE_DFLASH=$CUTEAFD_GLMF_REMOTE_DFLASH") ;;
     esac ;;
-  qwen4|qwen3_5) ;;
+  qwen4|qwen3_5|kimi_k3) ;;
   mimo_v2)
     hidden="$(python3 -c 'import json,sys; c=json.load(open(sys.argv[1])); t=c.get("text_config", c); print(t.get("hidden_size", 4096 if t.get("model_type") == "mimo_v2_flash" else 6144))' "$root/snapshots/$revision/config.json")"
     selected_lanes="${CUTEAFD_MIMO_PREFILL_LANES:-$([[ "$hidden" == 4096 ]] && printf 2 || printf 3)}"
@@ -2467,7 +2546,7 @@ audio_encoder_hash=""
   # HF_HOME=/hf: the planner resolves draft snapshots under it, like serving.
   plan_json="$(docker run --rm --network none "${lane_env_args[@]}" -e HF_HOME=/hf -v "$hub:/hf/hub:ro" "${wip_mount_args[@]}" "${exlr8_mounts[@]}" \
     "$coordinator_image" cuteafd plan "$snapshot" --attention-placement "$attention_placement" --vision "$vision" --audio "$audio" --deployment "${readiness_args[@]}" \
-    "${deployment_args[@]}" "${count_args[@]}" "${exlr8_plan_args[@]}" --spark-budget-gib "$(python3 -c 'import sys;print(int(sys.argv[1])/2**30)' "$budget")" \
+    "${deployment_args[@]}" "${count_args[@]}" "${exlr8_plan_args[@]}" "${spark_budget_args[@]}" \
     --rtx "$plan_rtx" --coordinator-gpu-budget-gib "$plan_gib" --coordinator-weight-budget-gib "$plan_gib" --pool-tokens "$plan_pool" --vision-replicas "$vision_replicas" "${plan_draft_args[@]}")"
   release_validate_deployment "$plan_json" "$family"
   selected_ranks="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["spark_ranks"])' <<<"$plan_json")"
@@ -2484,6 +2563,8 @@ audio_encoder_hash=""
   # admission policy and endpoints come from the typed deployment above.
   deployment_json="$plan_json"
   plan_json="$(jq -c '.report' <<<"$deployment_json")"
+  [[ -n "$budget" ]] || budget="$(jq -er '.spark_budget_bytes | select(type == "number" and . > 0)' <<<"$plan_json")" ||
+    release_die "the deployment plan names no Spark budget"
 # Check the admitted count's images before --restart or weight loading. The worker's
 # resident admission validates the sibling for its full 4096-row workspace even
 # when only decode requests use BF16, so this preflight requires the same coverage.
@@ -2746,6 +2827,8 @@ release_serving_docker_args
 cuteafd_cdi_gpu_args "$gpus" || exit 2
 context_args=(--max-context "$(get MAX_CONTEXT_TOKENS "$default_context")")
 [[ "$family" != qwen3_5 ]] || context_args=()
+# Kimi K3: unset keeps serve-kimi's compiled context extent.
+[[ "$family" != kimi_k3 || -n "$(get MAX_CONTEXT_TOKENS)" ]] || context_args=()
 docker run -d "${RELEASE_SERVING_ARGS[@]}" --name "$coordinator_name" --restart no "${CUTEAFD_CDI_ARGS[@]}" --network host --ipc host \
   --security-opt "seccomp=$repo_root/docker/seccomp-code-bench.json" \
   --ulimit memlock=-1:-1 --device=/dev/infiniband -e RUST_LOG=info "${shared_env_args[@]:0:4}" \

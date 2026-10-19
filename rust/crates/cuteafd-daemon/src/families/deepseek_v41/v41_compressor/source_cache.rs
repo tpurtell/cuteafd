@@ -74,6 +74,10 @@ pub(crate) struct IndexCacheView<'a> {
     pub device_pages: CuteafdDeviceBuffer,
     /// U64 committed row count, published after accepted value/scale writes.
     pub device_rows: CuteafdDeviceBuffer,
+    /// Stable whole-pool tables for row-addressed batched index scoring.
+    pub pool_pages: CuteafdDeviceBuffer,
+    pub pool_rows: CuteafdDeviceBuffer,
+    pub slot: usize,
 }
 /// FP4 K16 serving KV shares physical pages and publication with index keys.
 pub(crate) struct KvCacheView<'a> {
@@ -129,6 +133,9 @@ impl<'a> SourceCache<'a> {
                 self.stride * 4,
             ),
             device_rows: slice(self.lengths.buffer, slot * 8, 8),
+            pool_pages: self.page_table.buffer,
+            pool_rows: self.lengths.buffer,
+            slot,
         }
     }
     pub fn kv_view(&self, slot: usize, rows: usize) -> KvCacheView<'_> {

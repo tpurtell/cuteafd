@@ -18,7 +18,8 @@ CMD that takes the locks itself (an older smoke binary, a driver script): once
 it is our turn the locks are left for CMD, and our ticket stays live until CMD
 exits, so later ticket holders still wait behind it.
 
---preflight runs a bounded shell check before enqueue and after grant, while
+--preflight runs a bounded shell check before enqueue and after grant (only
+after grant with --preflight-at-grant), while
 locks are still held even in --gate mode. Failure or timeout exits 78 without
 running CMD; --preflight-timeout defaults to 300 seconds per check.
 """
@@ -174,11 +175,14 @@ def check_preflight(command, timeout):
 
 @contextlib.contextmanager
 def hold(names, wait: float, label: str = '', gate: bool = False, preflight: str = '',
-         preflight_timeout: float = 300):
+         preflight_timeout: float = 300, preflight_at_grant_only: bool = False):
     """Hold `names` (canonical order) for the body; FIFO against other tickets.
     With `gate`, release the flocks at our turn and keep the ticket instead."""
     locks = canonical(names)
-    check_preflight(preflight, preflight_timeout)
+    # A check on state the queue itself changes (free memory on shared hosts) is
+    # meaningful only once our turn comes; such checks run at grant alone.
+    if not preflight_at_grant_only:
+        check_preflight(preflight, preflight_timeout)
     queue = _queue()
     if not gate and inside_live_gate(queue):
         # The --gate ancestor already won this job's turn; a new, younger
@@ -247,6 +251,8 @@ def main() -> int:
     parser.add_argument('--wait', type=float, default=float(os.environ.get('CUTEAFD_HW_LOCK_WAIT_S', 21600)))
     parser.add_argument('--preflight', default='', help='shell command checked before enqueue and at grant')
     parser.add_argument('--preflight-timeout', type=float, default=300, help='timeout per preflight in seconds (default 300)')
+    parser.add_argument('--preflight-at-grant', action='store_true',
+                        help='run --preflight only after the locks are granted (for checks on shared, queue-dependent state)')
     parser.add_argument('--gate', action='store_true', help='CMD takes the locks itself; keep only our turn')
     parser.add_argument('cmd', nargs=argparse.REMAINDER)
     args = parser.parse_args()
@@ -258,7 +264,8 @@ def main() -> int:
     try:
         locks = canonical(args.locks.split(','))
         with hold(locks, args.wait, ' '.join(cmd[:2]), gate=args.gate,
-                  preflight=args.preflight, preflight_timeout=args.preflight_timeout):
+                  preflight=args.preflight, preflight_timeout=args.preflight_timeout,
+                  preflight_at_grant_only=args.preflight_at_grant):
             env = dict(os.environ)
             if not args.gate:
                 env['CUTEAFD_HW_LOCKS_HELD'] = ','.join(locks)

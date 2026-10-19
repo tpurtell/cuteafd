@@ -1,5 +1,6 @@
 //! Layer-selected CSA branch over transaction-owned pages and summaries.
 use super::{
+    ffn::{DenseFfn, DensePlan},
     rope::TargetTables,
     transaction::{AttentionRead, Step, StepInputs},
     weights::load_operand,
@@ -209,6 +210,7 @@ const DEFS: [(&str, &[&str], &[u8]); 17] = [
 pub(super) struct CsaLayer<'a> {
     // Drain the complete staged branch before any pointer owner retires.
     stream: Stream<'a>,
+    ffn: Option<DenseFfn<'a>>,
     rope: std::rc::Rc<TargetTables<'a>>,
     layer: usize,
     weights: Vec<Allocation<'a>>,
@@ -232,6 +234,41 @@ impl<'a> CsaLayer<'a> {
         rope: Option<std::rc::Rc<TargetTables<'a>>>,
         available: u64,
         reservations: &[u64],
+    ) -> Result<Self> {
+        Self::load_layout(device, programs, checkpoint, layer_id, rows, rope, available,
+            reservations, RankWeightLayout::from_checkpoint(checkpoint, 0, 1)?, true)
+    }
+
+    pub fn for_execution(
+        device: Device<'a>,
+        programs: &'a Programs<'a>,
+        checkpoint: &'a Checkpoint,
+        layer: usize,
+        rows: usize,
+        rope: Option<std::rc::Rc<TargetTables<'a>>>,
+        available: u64,
+        reservations: &[u64],
+        rank: usize,
+        ownership: &cuteafd_loader::plan::families::step5::ownership::ExecutionOwnership,
+    ) -> Result<Self> {
+        let local = ownership.layer(layer, rank)?;
+        ensure!(local.query_heads == 64 && local.kv_heads == 4,
+            "Step-5 CSA needs a whole native attention owner");
+        Self::load_layout(device, programs, checkpoint, layer, rows, rope, available,
+            reservations, RankWeightLayout::for_execution(checkpoint, rank, ownership)?, false)
+    }
+
+    fn load_layout(
+        device: Device<'a>,
+        programs: &'a Programs<'a>,
+        checkpoint: &'a Checkpoint,
+        layer_id: usize,
+        rows: usize,
+        rope: Option<std::rc::Rc<TargetTables<'a>>>,
+        available: u64,
+        reservations: &[u64],
+        layout: RankWeightLayout,
+        include_dense: bool,
     ) -> Result<Self> {
         let contract = CoordinatorContract::from_checkpoint(checkpoint)?;
         let layer = contract
@@ -261,7 +298,6 @@ impl<'a> CsaLayer<'a> {
                 && layer.indexer_rope.is_some_and(|r| r.span == 32),
             "CSA layer geometry"
         );
-        let layout = RankWeightLayout::from_checkpoint(checkpoint, 0, 1)?;
         let suffixes = [
             "input_layernorm.weight",
             "self_attn.q_proj.weight",
@@ -312,11 +348,15 @@ impl<'a> CsaLayer<'a> {
                 w.name
             );
         }
+        let dense = layer.dense_activation.filter(|_| include_dense)
+            .map(|_| DensePlan::prepare(programs, checkpoint, layer_id, rows, u64::MAX, &[]))
+            .transpose()?;
         let admission = Admission::new(
             rows,
             &weights
                 .iter()
                 .map(|w| w.allocation_bytes)
+                .chain(dense.as_ref().map(DensePlan::bytes))
                 .collect::<Vec<_>>(),
             if rope.is_none() {
                 contract.rope_tables.allocation_bytes
@@ -464,6 +504,9 @@ impl<'a> CsaLayer<'a> {
                 &[],
             )?),
         };
+        let ffn = dense
+            .map(|plan| DenseFfn::load_plan(device, programs, checkpoint, plan))
+            .transpose()?;
         let weights = weights
             .into_iter()
             .map(|w| load_operand(device, checkpoint, &layout, w))
@@ -475,6 +518,7 @@ impl<'a> CsaLayer<'a> {
             .collect::<Result<Vec<_>>>()?;
         let owner = Self {
             stream: Stream::new(device)?,
+            ffn,
             rope,
             layer: layer_id,
             weights,
@@ -610,7 +654,7 @@ impl<'a> CsaLayer<'a> {
             self.attend(start, count)?;
             self.finish(start, count)?;
         }
-        Ok(())
+        self.finish_dense_on(query_start, rows - query_start, &self.stream)
     }
     fn project_on(
         &self,
@@ -700,7 +744,27 @@ impl<'a> CsaLayer<'a> {
             &self.planes[VALUE],
             Some((&self.planes[IK], &self.planes[IZ])),
         )?;
-        step.attend(rank, self.layer, &*self, |layer, read| layer.read_on(read))
+        step.attend(rank, self.layer, &*self, |layer, read| {
+            let rows = read.inputs.rows;
+            let stream = read.inputs.stream;
+            layer.read_attention_on(read)?;
+            layer.finish_dense_on(0, rows, stream)
+        })
+    }
+
+    pub fn enqueue_attention_step<'e, E: cuteafd_hostcache::copy::CopyEngine>(
+        &'e self,
+        step: &mut Step<'e, 'a, E>,
+        rank: usize,
+    ) -> Result<()> {
+        ensure!(self.ffn.is_none(), "shared CSA pipeline must own its FFN separately");
+        step.project(rank, self.layer, self, |layer, input| {
+            layer.check_input(&input)?;
+            layer.project_on(input.rows, input.positions, input.stream)
+        })?;
+        step.stage(rank, self.layer, &self.planes[KEY], &self.planes[VALUE],
+            Some((&self.planes[IK], &self.planes[IZ])))?;
+        step.attend(rank, self.layer, self, |layer, read| layer.read_attention_on(read))
     }
 
     fn check_input(&self, input: &StepInputs<'_, 'a>) -> Result<()> {
@@ -718,6 +782,13 @@ impl<'a> CsaLayer<'a> {
     }
 
     fn read_on(&self, read: AttentionRead<'_, 'a>) -> Result<()> {
+        let rows = read.inputs.rows;
+        let stream = read.inputs.stream;
+        self.read_attention_on(read)?;
+        self.finish_dense_on(0, rows, stream)
+    }
+
+    fn read_attention_on(&self, read: AttentionRead<'_, 'a>) -> Result<()> {
         self.check_input(&read.inputs)?;
         let summary = read
             .summaries
@@ -749,11 +820,47 @@ impl<'a> CsaLayer<'a> {
         Ok(())
     }
 
+    pub fn attention_output(&self) -> CuteafdDeviceBuffer {
+        self.planes[POST].buffer
+    }
+
+    fn finish_dense_on(&self, start: usize, rows: usize, stream: &Stream<'a>) -> Result<()> {
+        if let Some(ffn) = &self.ffn {
+            let view = |mut buffer: CuteafdDeviceBuffer| {
+                buffer.ptr = buffer.ptr.wrapping_byte_add(start * H * 4);
+                buffer.bytes -= start * H * 4;
+                buffer
+            };
+            stream.device.run(|| {
+                // SAFETY: disjoint admitted owners remain alive through this stream's drain.
+                unsafe {
+                    stream.device.library.copy_d2d_async(
+                        view(ffn.input()),
+                        view(self.planes[POST].buffer),
+                        rows * H * 4,
+                        stream.raw,
+                    )
+                }
+            })?;
+            ffn.enqueue_range_on(start, rows, stream)?;
+        }
+        Ok(())
+    }
+
+    pub fn validate_live_weights(&self, device: Device<'_>) -> Result<()> {
+        super::weights::validate_live_weights(device.id, &self.weights)
+    }
+
     pub fn input(&self) -> CuteafdDeviceBuffer {
         self.planes[X].buffer
     }
+    pub fn has_dense_ffn(&self) -> bool {
+        self.ffn.is_some()
+    }
     pub fn output(&self) -> CuteafdDeviceBuffer {
-        self.planes[POST].buffer
+        self.ffn
+            .as_ref()
+            .map_or(self.planes[POST].buffer, DenseFfn::output)
     }
 
     fn compress(&self, rows: usize) -> Result<()> {
@@ -1286,6 +1393,107 @@ mod tests {
             std::rc::Rc::ptr_eq(&other.rope, &chain.rope) && other.layer == 7,
             "CSA shared layer binding"
         );
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires saved layer90/layer91 fixtures, sealed native library and CUDA"]
+    fn native_sparse_dense_saved_layer90_component() -> Result<()> {
+        let root = std::path::PathBuf::from(std::env::var("CUTEAFD_STEP5_CSA_FIXTURE_DIR")?);
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(root.join("manifest.json"))?)?;
+        ensure!(
+            manifest["layer"] == 91
+                && manifest["rows"] == serde_json::json!([640])
+                && manifest["revision"] == "364b3b03fed2477aa0953fe855a2c4c8c48ee3cc"
+                && manifest["saved_input"]["layer90_sha256"]
+                    == "7b5651a0e86ade90a263ace415d9dc8e170ac99a0d026d7a91ed365a06cd56a6",
+            "saved-input component identity"
+        );
+        // SAFETY: the explicit GPU gate supplies a sealed native library.
+        let library =
+            unsafe { cuteafd_ffi::NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? };
+        let device = crate::shared::memory::device::cache_test_device(&library)?;
+        let programs = library
+            .programs()?
+            .with_manifest(std::path::Path::new(&std::env::var(
+                "CUTEAFD_PROGRAM_MANIFEST",
+            )?))?;
+        let checkpoint =
+            Checkpoint::open(std::path::Path::new(&std::env::var("CUTEAFD_SNAPSHOT")?))?;
+        ensure!(
+            checkpoint.snapshot.file_name().and_then(|s| s.to_str())
+                == manifest["revision"].as_str(),
+            "component snapshot"
+        );
+        let rows = 640;
+        let chain = CsaLayer::load(
+            device,
+            &programs,
+            &checkpoint,
+            91,
+            rows,
+            None,
+            u64::MAX,
+            &[],
+        )?;
+        ensure!(chain.has_dense_ffn(), "planned sparse+dense owner");
+        assert!(CsaLayer::load(
+            device,
+            &programs,
+            &checkpoint,
+            91,
+            rows,
+            None,
+            chain.admission.bytes - 1,
+            &[]
+        )
+        .is_err());
+        let load = |name: &str| fixture(&root, &manifest, &format!("r{rows}_{name}"));
+        upload(&chain, X, 0, &load("residual")?)?;
+        chain.enqueue(rows, 0)?;
+        chain.stream.drain()?;
+        for (name, plane, width, size) in [
+            ("norm", NORM, H, 2),
+            ("query", QUERY, Q, 2),
+            ("key", KEY, KV, 2),
+            ("attention", ATTN, Q, 2),
+            ("delta", DELTA, H, 2),
+            ("post", POST, H, 4),
+        ] {
+            eprintln!("layer91 attention boundary={name}");
+            ensure!(
+                metrics(
+                    &read(&chain, plane, 0, rows * width * size)?,
+                    &load(name)?,
+                    size,
+                    size,
+                    width
+                )? < 0.03,
+                "layer91 attention boundary {name}"
+            );
+        }
+        let mut output = vec![0; rows * H * 4];
+        device.run(|| library.copy_d2h(&mut output, chain.output()))?;
+        ensure!(
+            metrics(&output, &load("output")?, 4, 4, H)? < 0.03,
+            "layer91 full output"
+        );
+        chain
+            .ffn
+            .as_ref()
+            .context("dense owner")?
+            .qualify_saved_boundaries(&root, &manifest, rows)?;
+        // A suffix-only contiguous query must neither read nor overwrite prefix FFN rows.
+        upload(&chain, X, 0, &load("residual")?)?;
+        chain.enqueue(rows, 0)?;
+        chain.stream.drain()?;
+        device.run(|| library.copy_d2h(&mut output, chain.output()))?;
+        chain.enqueue(rows, rows - 7)?;
+        chain.stream.drain()?;
+        let mut suffix = vec![0; output.len()];
+        device.run(|| library.copy_d2h(&mut suffix, chain.output()))?;
+        ensure!(suffix == output, "dense suffix view changed output");
         Ok(())
     }
 

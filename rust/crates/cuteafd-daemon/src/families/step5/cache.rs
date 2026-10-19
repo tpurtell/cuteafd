@@ -21,7 +21,10 @@ impl Reservation {
         ensure!(sequences > 0 && pages > 0, "empty Step-5 cache capacity");
         let state = layout.ranks.get(rank).context("Step-5 cache rank")?;
         let geometry = layout.geometry.ranks.get(rank).context("Step-5 cache geometry rank")?;
-        ensure!(geometry.persistent_unit_bytes > 0, "Step-5 cache requires CSA page geometry");
+        let declared = state.regions.iter().try_fold(0u64, |sum, region|
+            sum.checked_add(region.page_bytes.checked_mul(2)?))
+            .context("Step-5 CSA page geometry overflow")?;
+        ensure!(geometry.persistent_unit_bytes == declared, "Step-5 inconsistent CSA page geometry");
         let bytes = |unit: u64, count: u64| -> Result<usize> {
             Ok(usize::try_from(unit.checked_mul(count).context("Step-5 cache allocation overflow")?)?)
         };
@@ -42,7 +45,8 @@ pub(super) struct CacheRank<'a> {
     pub stream: Stream<'a>,
     active: Allocation<'a>,
     marks: Option<Allocation<'a>>,
-    pages: Allocation<'a>,
+    pages: Option<Allocation<'a>>,
+    page_count: u64,
     layout: Step5CacheLayout,
     rank: usize,
     sequences: u64,
@@ -72,8 +76,9 @@ impl<'a> CacheRank<'a> {
         // cannot release an earlier plane still being initialized asynchronously.
         let active = Allocation::new(device, reservation.active)?;
         let marks = if reservation.marks > 0 { Some(Allocation::new(device, reservation.marks)?) } else { None };
-        let pages = Allocation::new(device, reservation.pages)?;
-        let owner = Self { stream, active, marks, pages, layout, rank, sequences, slots,
+        let page_count = pages;
+        let pages = if reservation.pages > 0 { Some(Allocation::new(device, reservation.pages)?) } else { None };
+        let owner = Self { stream, active, marks, pages, page_count, layout, rank, sequences, slots,
             marks_at, pending_bank: vec![Cell::new(false); usize::try_from(sequences)?], poisoned: Cell::new(false), busy: vec![Cell::new(false); usize::try_from(sequences)?], reservation };
         let mut guard = owner.stream.cancellation_guard("Step-5 cache initialization");
         device.run(|| {
@@ -88,26 +93,31 @@ impl<'a> CacheRank<'a> {
     }
 
     pub fn bytes(&self) -> usize { self.reservation.total }
-    pub fn page_pool(&self) -> CuteafdDeviceBuffer { self.pages.buffer }
+    pub fn identity(&self) -> usize { self.active.buffer.ptr as usize }
+    pub fn page_pool(&self) -> CuteafdDeviceBuffer {
+        self.pages.as_ref().map_or(CuteafdDeviceBuffer {
+            ptr: std::ptr::null_mut(), bytes: 0, ..self.active.buffer
+        }, |pages| pages.buffer)
+    }
     pub fn layout(&self) -> &Step5CacheLayout { &self.layout }
     pub fn rank(&self) -> usize { self.rank }
     pub fn sequences(&self) -> u64 { self.sequences }
     pub fn slots(&self) -> u64 { self.slots }
-    pub fn page_count(&self) -> u64 {
-        self.reservation.pages as u64 / self.layout.geometry.ranks[self.rank].persistent_unit_bytes
-    }
+    pub fn page_count(&self) -> u64 { self.page_count }
 
     /// Native selected-GQA planes: [physical_page,64,local_kv_heads,192].
     pub fn csa_planes(&self, layer: usize) -> Result<(CuteafdDeviceBuffer, CuteafdDeviceBuffer)> {
         let at = self.layout.ranks[self.rank].regions.iter().position(|r| r.layer == layer)
             .context("Step-5 layer is not CSA")?;
-        let layers = self.layout.ranks[self.rank].regions.len();
-        ensure!(layers > 0, "Step-5 has no CSA layers");
-        let bytes = self.reservation.pages / layers / 2;
-        let plane = |index: usize| view(self.pages.buffer, ByteSpan {
-            offset: (index * bytes) as u64, bytes: bytes as u64,
-        });
-        Ok((plane(at * 2)?, plane(at * 2 + 1)?))
+        let regions = &self.layout.ranks[self.rank].regions;
+        let bytes = regions[at].page_bytes.checked_mul(self.page_count)
+            .context("Step-5 CSA plane overflow")?;
+        let offset = regions[..at].iter().try_fold(0u64, |sum, r|
+            sum.checked_add(r.page_bytes.checked_mul(2)?.checked_mul(self.page_count)?))
+            .context("Step-5 CSA plane offset overflow")?;
+        let pool = self.pages.as_ref().context("Step-5 rank has no CSA storage")?.buffer;
+        Ok((view(pool, ByteSpan { offset, bytes })?,
+            view(pool, ByteSpan { offset: offset.checked_add(bytes).context("Step-5 V plane overflow")?, bytes })?))
     }
 
     pub fn page_views(&self, page: u32) -> Result<Vec<CuteafdDeviceBuffer>> {
@@ -319,6 +329,19 @@ pub(super) mod tests {
         assert!(Reservation::new(&layout, 0, 0, 34, 2, usize::MAX).is_err());
         assert!(Reservation::new(&layout, 0, 3, 34, 0, usize::MAX).is_err());
         assert_eq!(Reservation::new(&layout, 0, 3, 0, 2, usize::MAX).unwrap().marks, 0);
+    }
+
+    #[test]
+    fn peer_without_csa_reserves_no_physical_pages() {
+        let mut layout = layout_for(1024, 2, 0, 64);
+        layout.ranks[1].regions.clear();
+        layout.geometry.ranks[1].persistent_unit_bytes = 0;
+        let state = layout.ranks[1].bytes as usize;
+        let reservation = Reservation::new(&layout, 1, 3, 2, 16, state * 5).unwrap();
+        assert_eq!(reservation.pages, 0);
+        assert_eq!(reservation.total, state * 5);
+        layout.geometry.ranks[1].persistent_unit_bytes = 1;
+        assert!(Reservation::new(&layout, 1, 3, 2, 16, usize::MAX).is_err());
     }
 
     #[test]

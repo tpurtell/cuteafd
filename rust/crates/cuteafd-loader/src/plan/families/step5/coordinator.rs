@@ -159,6 +159,19 @@ pub struct RankWeightLayout {
 
 impl RankWeightLayout {
     pub fn from_checkpoint(checkpoint: &Checkpoint, rank: usize, ranks: usize) -> Result<Self> {
+        Self::build(checkpoint, rank, ranks, None)
+    }
+
+    /// Whole owners retain full native operands, and peers retain no private
+    /// attention or FFN weights. Diagnostic head splitting stays separate.
+    pub fn for_execution(checkpoint: &Checkpoint, rank: usize,
+        ownership: &super::ownership::ExecutionOwnership) -> Result<Self> {
+        ownership.validate_config(&Config::parse(checkpoint)?)?;
+        Self::build(checkpoint, rank, ownership.ranks(), Some(ownership))
+    }
+
+    fn build(checkpoint: &Checkpoint, rank: usize, ranks: usize,
+        ownership: Option<&super::ownership::ExecutionOwnership>) -> Result<Self> {
         ensure!(
             matches!(ranks, 1 | 2) && rank < ranks,
             "Step-5 coordinator rank geometry"
@@ -174,6 +187,24 @@ impl RankWeightLayout {
         let mut resident_bytes = 0u64;
         for source in &contract.weights.tensors {
             let name = &source.meta.name;
+            let mut split_ranks = ranks;
+            if let Some(ownership) = ownership {
+                if let Some(rest) = name.strip_prefix("model.layers.") {
+                    let (layer, operand) = rest.split_once('.')
+                        .ok_or_else(|| anyhow::anyhow!("Step-5 layer operand"))?;
+                    let local = ownership.layer(layer.parse()?, rank)?;
+                    let attention = operand.starts_with("self_attn.")
+                        || operand.starts_with("input_layernorm.");
+                    if (attention && local.query_heads == 0) || (!attention && !local.ffn) { continue; }
+                    split_ranks = if local.query_heads == 32 { 2 } else { 1 };
+                } else {
+                    let owner = if name == "model.embed_tokens.weight" {
+                        ownership.execution().spec().entry_gpu
+                    } else { ownership.execution().spec().head_gpu };
+                    if rank != usize::from(owner) { continue; }
+                    split_ranks = 1;
+                }
+            }
             if name.ends_with(".up_proj.weight") {
                 continue;
             }
@@ -208,7 +239,9 @@ impl RankWeightLayout {
             } else {
                 source.meta.dtype.clone()
             };
-            let slice = if [
+            let slice = if ownership.is_some() && split_ranks == 1 {
+                WeightSlice::Replicated
+            } else if [
                 ".self_attn.q_proj.weight",
                 ".self_attn.k_proj.weight",
                 ".self_attn.v_proj.weight",
@@ -228,8 +261,8 @@ impl RankWeightLayout {
             if slice != WeightSlice::Replicated {
                 ensure!(shape.len() == 2, "Step-5 split operand must be a matrix");
                 let axis = if slice == WeightSlice::Rows { 0 } else { 1 };
-                ensure!(shape[axis] % ranks == 0, "Step-5 uneven head split");
-                shape[axis] /= ranks;
+                ensure!(shape[axis] % split_ranks == 0, "Step-5 uneven head split");
+                shape[axis] /= split_ranks;
             }
             let element_bytes = match dtype {
                 DType::Bf16 => 2u64,

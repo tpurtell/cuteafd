@@ -167,6 +167,44 @@ def test_official_router_bias_selection_only_and_fp32_slot_sum(release):
     assert torch.equal(result.view(torch.int16), torch.ones_like(x).view(torch.int16))
 
 
+@pytest.mark.parametrize('bf16_boundaries', [False, True])
+def test_swa_head_partition_fp64_matches_unsplit_and_detects_rank1_wiring(bf16_boundaries):
+    import numpy as np
+    rng = np.random.default_rng(274)
+    width, dim, qh, kvh = 8, 192, 64, 4
+    weights = {name: rng.normal(0, .1, shape) for name, shape in dict(
+        input_norm=(width,), q=(qh * dim, width), k=(kvh * dim, width),
+        v=(kvh * dim, width), q_norm=(dim,), k_norm=(dim,),
+        g=(qh, width), o=(width, qh * dim)).items()}
+    hidden = rng.normal(size=(7, width))
+    positions = np.array([0, 1, 63, 64, 511, 512, 639])
+    args = dict(bf16_boundaries=bf16_boundaries)
+    full = golden.swa_head_partition_fp64(hidden, weights, positions, **args)
+    ranks = [golden.swa_head_partition_fp64(hidden, weights, positions,
+             rank=rank, ranks=2, **args) for rank in range(2)]
+    for rank, result in enumerate(ranks):
+        assert result['query_heads'].tolist() == list(range(rank * 32, (rank + 1) * 32))
+        assert result['kv_heads'].tolist() == list(range(rank * 2, (rank + 1) * 2))
+        for key in ('q', 'attention', 'gated'):
+            np.testing.assert_allclose(result[key], full[key][:, rank * 32:(rank + 1) * 32],
+                                       atol=1e-13, rtol=1e-12)
+        np.testing.assert_allclose(result['k'], full['k'][:, rank * 2:(rank + 1) * 2],
+                                   atol=1e-13, rtol=1e-12)
+    np.testing.assert_allclose(ranks[0]['partial'] + ranks[1]['partial'], full['partial'],
+                               atol=1e-12, rtol=1e-11)
+    wrong_rope = golden.swa_head_partition_fp64(hidden, weights, positions + 1,
+                 rank=1, ranks=2, **args)
+    # A common absolute rotary shift cancels in exact math; use a wrong Q
+    # head slice as an independently detectable rank-1 wiring error.
+    wrong_weights = dict(weights, q=np.roll(weights['q'].reshape(qh, dim, width), 16, axis=0)
+                         .reshape(qh * dim, width))
+    wrong_heads = golden.swa_head_partition_fp64(hidden, wrong_weights, positions,
+                  rank=1, ranks=2, **args)
+    assert np.max(np.abs(wrong_heads['partial'] - ranks[1]['partial'])) > .01
+    if not bf16_boundaries:
+        np.testing.assert_allclose(wrong_rope['partial'], ranks[1]['partial'], atol=1e-12, rtol=1e-11)
+
+
 def test_bounded_sliding_cpu_prefix_exact_and_matches_dense():
     torch = pytest.importorskip("torch")
     torch.manual_seed(17)
@@ -239,3 +277,123 @@ def test_official_target_norms_all_forward_checkpoint_epsilon(release, monkeypat
     assert decoder.input_layernorm.variance_epsilon == epsilon
     assert decoder.post_attention_layernorm.variance_epsilon == epsilon
     assert model.norm.variance_epsilon == epsilon
+
+
+def test_native_fp8_diagnostic_rebinds_identity_not_tokens(tmp_path, monkeypatch):
+    import copy
+    import hashlib
+    import json
+    snapshot = tmp_path / golden.FP8_REVISION
+    snapshot.mkdir()
+    (snapshot / "tokenizer.json").write_text("tokenizer")
+    (snapshot / "config.json").write_text("fp8 config")
+    manifest = dict(checkpoint=golden.CHECKPOINT, set_sha256="bf16-set",
+                    reference_snapshot=dict(snapshot_revision=golden.REVISION),
+                    tokenizer_sha256=hashlib.sha256(b"tokenizer").hexdigest(),
+                    windows=[dict(tokens=[1, 2, 3], score_from=1)])
+    original = copy.deepcopy(manifest)
+    monkeypatch.setattr(golden, "load_set", lambda *args: manifest)
+    args = SimpleNamespace(snapshot=snapshot, windows=tmp_path, fp8_diagnostic=True)
+    rebound = golden.reference_manifest(args)
+    assert manifest == original
+    assert rebound["windows"] == original["windows"]
+    assert rebound["checkpoint"] == golden.FP8_CHECKPOINT
+    assert rebound["diagnostic_bf16_set_sha256"] == "bf16-set"
+    assert rebound["reference_snapshot"]["snapshot_revision"] == golden.FP8_REVISION
+    assert rebound["set_sha256"] == golden.set_hash(rebound)
+    golden.verify_snapshot(rebound, snapshot)
+    # Nested prefix probes preserve the diagnostic parent identity.
+    monkeypatch.setattr(golden, "load_set", lambda *args: rebound)
+    assert golden.reference_manifest(args) == rebound
+    monkeypatch.setattr(golden, "load_set", lambda *args: manifest)
+    args.fp8_diagnostic = False
+    assert golden.reference_manifest(args) is manifest
+    args.fp8_diagnostic = True
+    manifest["reference_snapshot"]["snapshot_revision"] = "wrong"
+    with pytest.raises(ValueError, match="provenance"):
+        golden.reference_manifest(args)
+    manifest["reference_snapshot"]["snapshot_revision"] = golden.REVISION
+    manifest["tokenizer_sha256"] = "wrong"
+    with pytest.raises(ValueError, match="tokenizer"):
+        golden.reference_manifest(args)
+    with pytest.raises(ValueError, match="revision"):
+        golden.verify_source(snapshot)
+    with pytest.raises(ValueError, match="revision"):
+        golden.verify_source(tmp_path / golden.REVISION, True)
+
+
+def test_native_fp8_diagnostic_rejects_wrong_layer_formats():
+    config = SimpleNamespace(num_hidden_layers=92, tp=1, moe_layer_list=list(range(3, 91)),
+                             is_fp8_expert_layer=lambda i: i < 88)
+    golden.validate_config(config, True)
+    with pytest.raises(ValueError, match="format"):
+        golden.validate_config(config)
+    config.is_fp8_expert_layer = lambda i: i < 89
+    with pytest.raises(ValueError, match="format"):
+        golden.validate_config(config, True)
+    config.is_fp8_expert_layer = lambda i: False
+    golden.validate_config(config)
+    config.tp = 2
+    with pytest.raises(ValueError, match="geometry"):
+        golden.validate_config(config)
+
+
+def test_fixed_native_fp8_rows_preserves_official_dispatch():
+    torch = pytest.importorskip("torch")
+    calls = []
+    weight = torch.ones(3, 4)
+    scale = torch.ones(1, 1)
+    def official(x, w, s):
+        calls.append((len(x), w is weight, s is scale))
+        return x @ w.T
+    wrapped = golden.fixed_fp8_rows(official)
+    x = torch.arange(141 * 4).reshape(141, 4).float()
+    assert torch.equal(wrapped(x, weight, scale), official(x, weight, scale))
+    assert calls[:2] == [(128, True, True), (128, True, True)]
+    assert torch.equal(wrapped(x[:61], weight, scale), wrapped(x, weight, scale)[:61])
+    calls.clear()
+    assert torch.equal(wrapped(x, weight, None), x @ weight.T)
+    assert calls == [(141, True, False)]
+
+
+def test_native_fp8_diagnostic_consumes_top_level_quantization_metadata():
+    quant = dict(quant_method="fp8", weight_block_size=[128, 128])
+    payload = dict(text_config=dict(num_hidden_layers=92), quantization_config=quant)
+    assert golden.decoder_config(payload) == dict(num_hidden_layers=92, quantization_config=quant)
+    assert payload["text_config"] == dict(num_hidden_layers=92)
+    assert golden.decoder_config(dict(text_config=dict(tp=1))) == dict(tp=1)
+    payload["text_config"]["quantization_config"] = dict(quant_method="wrong")
+    with pytest.raises(ValueError, match="conflicting"):
+        golden.decoder_config(payload)
+
+
+def test_tail_diagnostic_requires_original_reference_identity_and_tokens(tmp_path, monkeypatch):
+    import hashlib
+    import json
+    identity = dict(snapshot_revision=golden.FP8_REVISION)
+    manifest = dict(set_sha256="a" * 64, windows=[dict(id="code-1", tokens=[1, 2])])
+    meta = dict(diagnostic_only=True, checkpoint=golden.FP8_CHECKPOINT,
+                source_pin=dict(revision=golden.FP8_REVISION), set_sha256="a" * 64,
+                snapshot_identity=identity,
+                prefix_qualification=dict(passed=True, finite=True, snapshot_identity=identity,
+                                          set_sha256="a" * 64),
+                windows=[dict(id="code-1", path="windows/code-1")])
+    monkeypatch.setattr(golden, "reference_manifest", lambda args: manifest)
+    monkeypatch.setattr(golden, "verify_snapshot", lambda *args: identity)
+    folder = tmp_path / "windows/code-1"
+    folder.mkdir(parents=True)
+    tokens = b"\x01\0\0\0\x02\0\0\0"
+    (folder / "tokens.bin").write_bytes(tokens)
+    args = SimpleNamespace(out=tmp_path, snapshot=tmp_path, fp8_diagnostic=True)
+    payload = json.dumps(meta).encode()
+    (tmp_path / "meta.json").write_bytes(payload)
+    assert golden.diagnostic_source(args) == (manifest, meta, hashlib.sha256(payload).hexdigest())
+    for field in ["diagnostic_only", "checkpoint", "source_pin", "set_sha256", "snapshot_identity", "prefix_qualification"]:
+        bad = dict(meta, **{field: None})
+        (tmp_path / "meta.json").write_text(json.dumps(bad))
+        with pytest.raises(ValueError, match="completed pinned"):
+            golden.diagnostic_source(args)
+    (tmp_path / "meta.json").write_bytes(payload)
+    (folder / "tokens.bin").write_bytes(tokens[:-1])
+    with pytest.raises(ValueError, match="tokens differ"):
+        golden.diagnostic_source(args)

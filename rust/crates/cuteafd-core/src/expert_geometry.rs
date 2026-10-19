@@ -166,6 +166,12 @@ pub struct SparkRings {
 }
 
 impl SparkEndpoint {
+    /// Retained response metadata per QP: largest header plus indexed rows.
+    pub fn response_prefix_bytes(self) -> Option<usize> {
+        if !(1..=4096).contains(&self.capacity) { return None; }
+        (self.capacity as usize).checked_mul(4)?.checked_add(128)
+    }
+
     pub fn wire_bytes(self, geometry: ExpertGeometry) -> Option<(usize, usize)> {
         if !(1..=4096).contains(&self.capacity) { return None; }
         if self.ingress == SparkIngress::Exlr8Rotated {
@@ -374,6 +380,16 @@ pub fn expert_geometry() -> ExpertGeometry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn endpoint_response_prefix_is_bounded_by_admitted_rows() {
+        for capacity in [0, 1, 640, 4096, 4097, u32::MAX] {
+            let endpoint = SparkEndpoint { capacity, ingress: SparkIngress::Bf16 };
+            assert_eq!(endpoint.response_prefix_bytes(), if (1..=4096).contains(&capacity) {
+                Some(128 + capacity as usize * 4)
+            } else { None });
+        }
+    }
 
     #[test]
     fn exl3_row_policy_preserves_glmf_k64_at_narrow_admission() {

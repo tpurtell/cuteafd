@@ -51,12 +51,6 @@ __global__ void rmsnorm_bf16_kernel(const uint16_t* x, const uint16_t* weight, u
   }
 }
 
-__device__ uint16_t f32_to_bf16_rne(float value) {
-  const uint32_t bits = __float_as_uint(value);
-  const uint32_t rounding_bias = 0x7fffu + ((bits >> 16) & 1u);
-  return static_cast<uint16_t>((bits + rounding_bias) >> 16);
-}
-
 __device__ __forceinline__ float fixed_tree_sum(float sum, float* scratch) {
   const int tid = threadIdx.x;
   scratch[tid] = sum;
@@ -103,7 +97,7 @@ __global__ void ds4_flash_rmsnorm_bf16_kernel(const uint16_t* x,
   for (int col = tid; col < hidden; col += blockDim.x) {
     const float value = bf16_to_f32(x[row * hidden + col]);
     out[row * hidden + col] =
-        f32_to_bf16_rne(value * inv * bf16_to_f32(weight[col]));
+        f32_to_bf16(value * inv * bf16_to_f32(weight[col]));
   }
 }
 
@@ -128,7 +122,7 @@ __global__ void ds41_rmsnorm_cached_bf16_kernel(const uint16_t* x,
 #pragma unroll
   for (int i = 0; i < Hidden / kBlock; ++i) {
     const int col = tid + i * kBlock;
-    out[row * Hidden + col] = f32_to_bf16_rne(values[i] * inv * bf16_to_f32(weight[col]));
+    out[row * Hidden + col] = f32_to_bf16(values[i] * inv * bf16_to_f32(weight[col]));
   }
 }
 

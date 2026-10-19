@@ -27,7 +27,7 @@ def decode_fp8(weight, scale):
     return weight.float() * expanded[:weight.shape[0], :weight.shape[1]]
 
 
-def same_quant_ffn(ref, layer, snapshot, captures, save, manifest):
+def same_quant_ffn(ref, layer, snapshot, captures, save, manifest, layer_id=3):
     """Bind official MoE control flow to checkpoint-decoded TP4/TP6 expert operands.
 
     The wiring arm reproduces the shared small-row BF16-input arithmetic. The
@@ -46,9 +46,10 @@ def same_quant_ffn(ref, layer, snapshot, captures, save, manifest):
     readers = {}
     decoded = {}
     for projection in ("gate", "up", "down"):
-        base = f"model.layers.3.moe.{projection}_proj"
+        base = f"model.layers.{layer_id}.moe.{projection}_proj"
         values = []
-        for suffix in ("weight", "weight_scale_inv"):
+        bf16 = 88 <= layer_id <= 90
+        for suffix in (("weight",) if bf16 else ("weight", "weight_scale_inv")):
             name = base + "." + suffix
             shard = index[name]
             if shard not in readers:
@@ -58,17 +59,21 @@ def same_quant_ffn(ref, layer, snapshot, captures, save, manifest):
             manifest["quant_weights_sha256"][name] = hashlib.sha256(data).hexdigest()
             values.append(tensor)
         # Decode one expert at a time; no BF16 roundtrip in this source operand.
-        decoded[projection] = [decode_fp8(w, s) for w, s in zip(*values)]
+        if bf16:
+            assert values[0].dtype == torch.bfloat16
+            decoded[projection] = list(values[0].unbind())
+        else:
+            decoded[projection] = [decode_fp8(w, s) for w, s in zip(*values)]
     readers.clear()
     # This FFN fixture must bind the serving router/shared weights, not assume
     # that the BF16 root carries byte-identical coordinator operands.
     quant_reader = golden.Weights(snapshot)
     for name, parameter in layer.named_parameters():
         if name.startswith(("post_attention_layernorm.", "moe.gate.", "moe.router_bias", "share_expert.")):
-            value = quant_reader.get("model.layers.3." + name)
+            value = quant_reader.get(f"model.layers.{layer_id}." + name)
             assert value.dtype == parameter.dtype and value.shape == parameter.shape
             data = value.contiguous().view(torch.uint8).numpy().tobytes()
-            manifest["quant_weights_sha256"]["model.layers.3." + name] = hashlib.sha256(data).hexdigest()
+            manifest["quant_weights_sha256"][f"model.layers.{layer_id}." + name] = hashlib.sha256(data).hexdigest()
             parameter.copy_(value)
     quant_reader.files.clear()
     moe = layer.moe
@@ -144,12 +149,63 @@ def same_quant_ffn(ref, layer, snapshot, captures, save, manifest):
                 save(f"q_r{rows}_combined", combined)
     manifest["same_quant"] = {
         "checkpoint": "stepfun-ai/Step-5-Preview", "revision": FP8_REVISION,
-        "layer": 3, "tp": tp, "slice": width, "ingress": "bf16", "maximum_rows": 64,
-        "wiring": "BF16(E4M3 * F32 block128 scale); F32 accumulate; BF16 per-rank output",
+        "layer": layer_id, "tp": tp, "slice": width, "ingress": "bf16", "maximum_rows": 64,
+        "storage": "bf16" if bf16 else "fp8-block128",
+        "wiring": "native BF16; F32 accumulate; BF16 per-rank output" if bf16 else
+                  "BF16(E4M3 * F32 block128 scale); F32 accumulate; BF16 per-rank output",
         "fp64": "same BF16 operands; unrounded FP64 projections, activation and sums",
         "exact_decode": "report-only E4M3 * F32 scale; F32 accumulate; BF16 boundaries",
         "error_ratio_bound": 1.01, "router_relative_margin": 1e-3,
     }
+
+
+def test_official_bf16_tail_fixtures(monkeypatch):
+    destination = os.environ.get("CUTEAFD_STEP5_TAIL_FIXTURE_DIR")
+    if not destination:
+        pytest.skip("set CUTEAFD_STEP5_TAIL_FIXTURE_DIR for native BF16 routed tails")
+    torch = pytest.importorskip("torch")
+    from shape_invariant import install
+
+    root = Path(destination).resolve()
+    assert root.is_relative_to(Path(os.environ["CARGO_TARGET_DIR"]).resolve())
+    snapshot = Path(os.environ["STEP5_QUANT_SNAPSHOT"])
+    ref, _ = golden.load_release(Path(os.environ["STEP5_REFERENCE_SNAPSHOT"]))
+    values = json.loads((snapshot / "config.json").read_text())
+    config_values = dict(values.get("text_config", values))
+    config_values["tp_size"] = 1
+    config = ref.Step5Config(**config_values)
+    monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", False)
+    monkeypatch.setattr(torch.backends.cudnn, "allow_tf32", False)
+    monkeypatch.setattr(torch.nn.functional, "linear", torch.nn.functional.linear)
+    monkeypatch.setattr(torch, "einsum", torch.einsum)
+    install()
+    generator = torch.Generator(device="cpu").manual_seed(SEED)
+    residual = torch.randn((max(ROWS), config.hidden_size), generator=generator)
+    captures = {rows: residual[:rows].clone() for rows in ROWS}
+    reader = golden.Weights(snapshot)
+    with torch.inference_mode():
+        for layer_id in (88, 89, 90):
+            target = root / f"layer{layer_id}"
+            target.mkdir(parents=True, exist_ok=True)
+            manifest = {"schema": 1, "seed": SEED, "source_pins": golden.SOURCE_PINS,
+                        "rows": list(ROWS), "files": {}, "quant_weights_sha256": {}}
+
+            def save(name, tensor):
+                value = tensor.detach().contiguous().cpu()
+                data = value.view(torch.uint8).numpy().tobytes()
+                (target / (name + ".bin")).write_bytes(data)
+                manifest["files"][name] = {
+                    "dtype": str(value.dtype), "shape": list(value.shape),
+                    "bytes": len(data), "sha256": hashlib.sha256(data).hexdigest(),
+                }
+
+            with torch.device("meta"):
+                layer = ref.Step5DecoderLayer(config, layer_id, dtype=torch.bfloat16)
+            layer = layer.to_empty(device="cuda").eval()
+            reader.load_layer(layer, layer_id)
+            same_quant_ffn(ref, layer, snapshot, captures, save, manifest, layer_id)
+            (target / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
+            del layer
 
 
 def test_official_first_four_layer_fixtures(monkeypatch):

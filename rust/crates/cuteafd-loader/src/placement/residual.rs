@@ -251,6 +251,19 @@ pub enum LayerPlanError {
     StateOwners { layer: usize, actual: Vec<u8>, expected: Vec<u8> },
     #[error("layer {0} is past the execution stack")]
     Layer(usize),
+    #[error("routed replication bindings do not match the execution stack")]
+    ReplicationBindings,
+    #[error("layer {layer} reuses routed replication storage or flag from layer {previous} without an intervening head exchange")]
+    ReplicationReuse { layer: usize, previous: usize },
+}
+
+/// One already-rounded result copy after a layer's FFN. Storage identifies the
+/// actual receiving allocation, independently of the publication flag slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RoutedReplication {
+    pub source: u8,
+    pub slot: usize,
+    pub storage: usize,
 }
 
 /// Immutable contract shared by execution, graph keys and prefix snapshots.
@@ -301,6 +314,36 @@ impl LayerExecutionPlan {
             LayerMode::Whole { gpu, .. } => vec![gpu],
             LayerMode::HeadSplit | LayerMode::ContextSplit => vec![0, 1],
         })
+    }
+
+    /// Prove repeated per-lane execution safe without a host drain or a copy
+    /// acknowledgement. The receiving FFN must queue its last read before the
+    /// next layer's attention. Only a bidirectional head exchange on those same
+    /// streams proves that read completed before the producer can reuse a flag
+    /// or destination. One-way hops and different flags do not prove it.
+    ///
+    /// Check two consecutive passes to include the request/chunk boundary.
+    /// Call again with actual allocation identities before enqueue; separate
+    /// lanes must own disjoint storage and flag namespaces.
+    pub fn validate_routed_replications(&self, copies: &[Option<RoutedReplication>])
+        -> Result<(), LayerPlanError> {
+        if copies.len() != self.modes.len() || copies.iter().flatten().any(|copy|
+            copy.source >= 2 || copy.slot == usize::MAX || copy.storage == 0) {
+            return Err(LayerPlanError::ReplicationBindings);
+        }
+        let mut pending: Vec<(usize, RoutedReplication)> = Vec::new();
+        for _ in 0..2 {
+            for (layer, (&mode, copy)) in self.modes.iter().zip(copies).enumerate() {
+                if mode == LayerMode::HeadSplit { pending.clear(); }
+                let Some(copy) = copy else { continue };
+                if let Some(&(previous, _)) = pending.iter().find(|(_, old)|
+                    old.source == copy.source && (old.slot == copy.slot || old.storage == copy.storage)) {
+                    return Err(LayerPlanError::ReplicationReuse { layer, previous });
+                }
+                pending.push((layer, *copy));
+            }
+        }
+        Ok(())
     }
 
     pub fn validate_state_owners(&self, layer: usize, actual: &[u8]) -> Result<(), LayerPlanError> {

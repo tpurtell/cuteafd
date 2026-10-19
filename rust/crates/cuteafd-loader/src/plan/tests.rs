@@ -1914,7 +1914,8 @@ fn glm5_flash_selected_working_set_drives_plan_request_and_runtime_buffers() {
                 placement::SparkRingGeometry { max_frame_bytes: 64 << 20, depth: 8, slot_bytes: 8 << 20,
                     alignment: 4096, endpoints: working.prefill_lanes as usize }).unwrap();
             for (group, bytes) in [("expert intake", io.intake), ("host expert exchange", io.host_exchange),
-                ("expert row indices", io.row_indices), ("rdma rings", io.mapped_rings)] {
+                ("expert row indices", io.row_indices), ("endpoint response prefixes", io.endpoint_staging),
+                ("rdma rings", io.mapped_rings)] {
                 let item = device.items.iter().find(|item| item.group == group).unwrap();
                 assert_eq!((item.bytes, item.basis), (bytes, cuteafd_core::memory_layout::Basis::Formula));
             }

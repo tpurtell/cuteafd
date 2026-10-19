@@ -55,6 +55,7 @@ impl SparkWorkingSet {
                     host_exchange: multiply(routes + hidden * 4)?,
                     row_indices: multiply(4)?,
                     mapped_rings: 0,
+                    endpoint_staging: 0,
                 }
             } else { self.rank_io(rank, geometry, endpoint.capacity, bf16, ring)? };
             bytes.intake = bytes.intake.max(io.intake);
@@ -64,6 +65,10 @@ impl SparkWorkingSet {
             }
             bytes.host_exchange = bytes.host_exchange.max(io.host_exchange);
             bytes.row_indices = bytes.row_indices.max(io.row_indices);
+            bytes.endpoint_staging = bytes.endpoint_staging.checked_add(
+                endpoint.response_prefix_bytes()
+                    .ok_or(PlacementError::Inventory("invalid Spark endpoint prefix capacity"))? as u64)
+                .ok_or(PlacementError::Overflow("Spark endpoint staging"))?;
             let mapped = endpoint.ring_bytes(geometry, rings)
                 .ok_or(PlacementError::Inventory("invalid Spark endpoint ring geometry"))? as u64;
             bytes.mapped_rings = bytes.mapped_rings.checked_add(mapped)
@@ -121,6 +126,10 @@ impl SparkWorkingSet {
             host_exchange: multiply(routes + hidden * 2)?,
             row_indices: multiply(4)?,
             mapped_rings: mapped as u64,
+            endpoint_staging: cuteafd_core::SparkEndpoint { capacity,
+                ingress: cuteafd_core::SparkIngress::Bf16 }.response_prefix_bytes()
+                .and_then(|bytes| bytes.checked_mul(rings.endpoints))
+                .ok_or(PlacementError::Overflow("Spark endpoint staging"))? as u64,
         })
     }
 }
@@ -174,8 +183,8 @@ impl SparkAssignment {
                     plan.device_arena_layout()?.1 as u64
                 }
                 SparkResidentLayout::Fp8 { world, rank, slicing } => {
-                    let tensors = catalog.fp8().context("Spark FP8-family layout needs checkpoint weight/scale headers")?;
-                    tensors.validate_layer(layer)?;
+                    let tensors = catalog.fp8().context("Spark FP8-family layout needs checkpoint weight/scale headers")?
+                        .for_layer(layer)?;
                     let (first, width) = tensors.rank_range_with(world, rank, slicing)?;
                     slice.first = u32::try_from(first)?;
                     slice.width = u32::try_from(width)?;
@@ -269,6 +278,8 @@ pub struct SparkIoBytes {
     pub host_exchange: u64,
     pub row_indices: u64,
     pub mapped_rings: u64,
+    /// Retained response prefixes are private to each persistent connection.
+    pub endpoint_staging: u64,
 }
 
 #[cfg(test)]
@@ -377,12 +388,63 @@ mod tests {
     }
 
     #[test]
+    fn header_assignment_uses_each_layers_native_storage_format() {
+        use crate::formats::fp8_experts::Slicing;
+        use crate::plan::testing::{fp8, t, mimo_flash_config, write_snapshot};
+        use cuteafd_core::{SparkEndpoint, SparkIngress, SparkRings};
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = mimo_flash_config();
+        config["num_hidden_layers"] = 3.into();
+        config["hybrid_layer_pattern"] = serde_json::json!([0, 1, 1]);
+        config["moe_layer_freq"] = serde_json::json!([0, 1, 1]);
+        config["n_routed_experts"] = 2.into();
+        config["num_experts_per_tok"] = 1.into();
+        let mut tensors = Vec::new();
+        for layer in [1, 2] {
+            for expert in 0..2 {
+                for (name, rows, cols) in [("gate", 2048, 4096), ("up", 2048, 4096), ("down", 4096, 2048)] {
+                    let prefix = format!("model.layers.{layer}.mlp.experts.{expert}.{name}_proj");
+                    if layer == 1 { tensors.extend(fp8(&prefix, rows, cols, None)); }
+                    else { tensors.push(t(format!("{prefix}.weight"), "BF16", &[rows, cols])); }
+                }
+            }
+        }
+        write_snapshot(dir.path(), &config, &tensors, None);
+        let catalog = crate::read_expert_catalog(dir.path()).unwrap();
+        let endpoints = [SparkEndpoint { capacity: 64, ingress: SparkIngress::Bf16 }];
+        let rings = SparkRings { max_frame_bytes: 64 << 20, depth: 8, slot_bytes: 8 << 20, alignment: 4096 };
+        for world in [4, 6] {
+            for rank in 0..world {
+                let layout = SparkResidentLayout::Fp8 { world, rank, slicing: Slicing::Blocks(128) };
+                let assign = |layers| SparkAssignment::from_catalog(&catalog,
+                    &SparkWorkingSet { spark_layers: layers, spark_ranks: world,
+                        prefill_lanes: 1, ..Default::default() }, rank, layout, &endpoints, rings).unwrap();
+                let fp8 = assign(vec![1]);
+                let original = catalog.fp8().unwrap();
+                original.validate_layer(1).unwrap();
+                assert_eq!(fp8.resident_bytes,
+                    (original.weight_read_bytes_with(world, rank, Slicing::Blocks(128)).unwrap()
+                        * original.shape().experts) as u64);
+                let bf16 = assign(vec![2]);
+                let mixed = assign(vec![1, 2]);
+                let slice = &bf16.slices[0];
+                assert_eq!(bf16.resident_bytes, 3 * 4096 * u64::from(slice.stored_width) * 2 * 2);
+                assert_eq!(mixed.resident_bytes, fp8.resident_bytes + bf16.resident_bytes);
+                assert_eq!(mixed.slices, [fp8.slices[0].clone(), slice.clone()]);
+                assert_eq!((slice.first, slice.width, slice.stored_width),
+                    (fp8.slices[0].first, fp8.slices[0].width, fp8.slices[0].stored_width));
+                assert_eq!(mixed.io, bf16.io);
+            }
+        }
+    }
+
+    #[test]
     fn assignment_reconciles_exact_bytes_and_worker_architecture() {
         use cuteafd_core::{ModelAdmissionResponse, RuntimeSample, SparkRuntimeInventory, SparkSlice};
         let assignment = SparkAssignment { rank: 2, resident_bytes: 1 << 30,
             slices: vec![SparkSlice { layer: 3, first: 768, width: 384, stored_width: 384,
                 tiers: vec![2, 3], projection_counts: vec![[10, 11, 12], [12, 11, 10]] }],
-            io: SparkIoBytes { intake: 100, host_exchange: 200, row_indices: 400, mapped_rings: 800 } };
+            io: SparkIoBytes { intake: 100, host_exchange: 200, row_indices: 400, mapped_rings: 800, endpoint_staging: 160 } };
         let report = ModelAdmissionResponse { rank: 2, resident_bytes: assignment.resident_bytes,
             slices: assignment.slices.clone(), mapped_ring_bytes: 800, host_exchange_bytes: 200,
             row_indices_bytes: 400, runtime: SparkRuntimeInventory { detail: Default::default(),
@@ -459,6 +521,9 @@ mod tests {
         assert_eq!(io.intake, full_fp8.intake);
         assert_eq!(io.host_exchange, full_fp8.host_exchange);
         assert_eq!(io.row_indices, full_fp8.row_indices);
+        assert_eq!(io.endpoint_staging, (main.response_prefix_bytes().unwrap()
+            + lane.response_prefix_bytes().unwrap()) as u64);
+        assert_ne!(io.endpoint_staging, full_fp8.endpoint_staging);
         assert!(main.ring_bytes(geometry, rings).unwrap()
             < SparkEndpoint { ingress: SparkIngress::Bf16, ..main }.ring_bytes(geometry, rings).unwrap());
         assert!(set.rank_endpoints_io(0, geometry, &[], rings).is_err());

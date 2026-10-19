@@ -55,6 +55,17 @@ release loader leaves the key empty when absent (the launch then resolves
 auto). V4.1 launches through `run-family.sh` like every family (#82); roadmap
 step S5 unifies this default with the other families'.
 
+## Families under qualification
+
+These have no release card yet. `run-family.sh` serves them only from a
+`./wip.sh` slot whose binary has the family's serve command (`--wip SLOT`),
+and refuses a release image or an older slot. Text only, no drafter, automatic
+attention placement.
+
+| Model · quant | Config | Layout |
+| --- | --- | --- |
+| Kimi K3 · EXL3 K2 (#273) | [max](kimi-k3-exl3-max.config) | 2 RTX (TP2 attention) + 6 Spark (TP6 experts), 5 routed layers on the RTX |
+
 ## TP x EP layout examples (DeepSeek V4.1)
 
 The remaining files are V4.1 Spark topology experiments.

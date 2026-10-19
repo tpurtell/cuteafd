@@ -546,7 +546,8 @@ def _family_launch_result(tmp_path: Path, family_config: dict, model: str, keys:
                           extra_env: dict[str, str] | None = None,
                           program_manifest: dict | None = None,
                           launcher_source: Path | None = None,
-                          deployment_overrides: dict | None = None) -> subprocess.CompletedProcess[str]:
+                          deployment_overrides: dict | None = None,
+                          probe_fails: bool = False) -> subprocess.CompletedProcess[str]:
     """Run the real run-family.sh up to its docker calls (docker/ssh/nest/curl are stubs
     that print their argv) and return what it would launch."""
     repo = tmp_path / "repo"
@@ -614,6 +615,9 @@ def _family_launch_result(tmp_path: Path, family_config: dict, model: str, keys:
         if tool == "docker":
             stub = (bin_dir / tool).read_text()
             intercept = 'case "$*" in *" plan "*"--deployment"*) exec python3 "$STUB_DEPLOYMENT" "$@" ;; esac\n'
+            if probe_fails:
+                # A slot binary that predates the family's serve command rejects it.
+                intercept += 'case "$*" in *"/opt/cuteafd-serve-probe"*) exit 2 ;; esac\n'
             stub = stub.replace('case "$*" in', intercept + 'case "$*" in', 1)
             if native_v41:
                 stub += ('case "$*" in container\\ inspect*|inspect\\ *) ' + ('if [[ "$*" == *-wip* ]]; then exit 0; else exit 1; fi' if wip else 'exit 1') + ' ;; image\\ inspect*) echo test-pin ;; esac\n'

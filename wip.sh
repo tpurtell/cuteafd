@@ -136,6 +136,11 @@ while IFS='=' read -r key value; do
 done <<<"$wip_scopes"
 audio_aot="${CUTEAFD_WIP_AUDIO_AOT:-OFF}"
 case "$audio_aot" in ON|OFF) ;; *) release_die "CUTEAFD_WIP_AUDIO_AOT must be ON or OFF, got: $audio_aot" ;; esac
+# Re-read after scope resolution, which derives it for families whose cards need
+# BF16-input FP8 siblings (#516); an explicit value set before resolution wins.
+bf16_families="${CUTEAFD_WIP_FP8_MOE_BF16_FAMILIES:-}"
+[[ -z "$bf16_families" || "$bf16_families" =~ $bf16_family_pattern ]] ||
+  release_die "CUTEAFD_WIP_FP8_MOE_BF16_FAMILIES must be a semicolon list of mimo, mimop, mimof, glm, glmf, qwen4 or step5"
 # EXLR8 programs (derived from EXLR8_MANIFEST, or an explicit ON/OFF): passed to both
 # legs only when on, so an OFF build's environment and native key are unchanged.
 case "${CUTEAFD_WIP_EXLR8_AOT:-OFF}" in ON|OFF) ;; *) release_die "CUTEAFD_WIP_EXLR8_AOT must be ON or OFF, got: $CUTEAFD_WIP_EXLR8_AOT" ;; esac
@@ -201,6 +206,7 @@ if ((dry_run)); then
   echo "  V41 Spark expert roles: ${wip_spark_tp_roles:-<legacy TP4 only>}"
   echo "  EXL3 AOT: ${CUTEAFD_WIP_EXL3_AOT:-ON}; NVFP4 AOT: ${CUTEAFD_WIP_NVFP4_AOT:-ON}"
   echo "  Audio AOT: $audio_aot"
+  echo "  FP8 BF16-input siblings: ${bf16_families:-<none>}"
   echo "  EXLR8 AOT: ${CUTEAFD_WIP_EXLR8_AOT:-OFF}"
   cuteafd_build_cache_docker_args "${WIP_ROOT:-$HOME/.cache/cuteafd/builds/wip${WIP_INSTANCE:+-$WIP_INSTANCE}}" /wip/home "$wip_toolchain_hash" dry >/dev/null
   echo "  Spark cache plan (host HOME template; states/admission and uid rechecked on each Spark, no SSH):"

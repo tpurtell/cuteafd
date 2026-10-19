@@ -298,11 +298,13 @@ pub struct QualifiedSparkRuntime {
 struct SparkHostOwners {
     exchange: u64,
     row_indices: u64,
+    endpoint_staging: u64,
     retained: Vec<Item>,
 }
 impl SparkHostOwners {
     fn new(assignment: &SparkAssignment, execution: &SparkExecutionInventory) -> Self {
         Self { exchange: assignment.io.host_exchange, row_indices: assignment.io.row_indices,
+            endpoint_staging: assignment.io.endpoint_staging,
             retained: execution.retained.host.clone() }
     }
 }
@@ -504,6 +506,7 @@ pub fn v41_spark_inventory(assignment: &SparkAssignment, execution: &SparkExecut
     // inside its manifest arena. Never add assignment.io.intake a second time.
     retained.host.push(item(Category::Transport, "expert_exchange", assignment.io.host_exchange, Basis::Formula));
     retained.host.push(item(Category::Transport, "expert_row_indices", assignment.io.row_indices, Basis::Formula));
+    retained.host.push(item(Category::Transport, "endpoint_response_prefixes", assignment.io.endpoint_staging, Basis::Formula));
     retained.pinned.push(item(Category::Transport, "mapped_endpoint_rings", assignment.io.mapped_rings, Basis::Formula));
     retained.device.extend(runtime.device.iter().map(|t| t.item.clone()));
     retained.pinned.extend(runtime.pinned.iter().map(|t| t.item.clone()));
@@ -560,7 +563,7 @@ mod tests {
     fn assignment() -> SparkAssignment {
         SparkAssignment { rank: 1, resident_bytes: 1000, slices: vec![cuteafd_core::SparkSlice {
             layer: 5, first: 768, width: 768, stored_width: 768, tiers: vec![], projection_counts: vec![] }],
-            io: crate::placement::SparkIoBytes { intake: u64::MAX, host_exchange: 111, row_indices: 222, mapped_rings: 333 } }
+            io: crate::placement::SparkIoBytes { intake: u64::MAX, host_exchange: 111, row_indices: 222, mapped_rings: 333, endpoint_staging: 444 } }
     }
     #[test]
     fn constructors_validate_before_publishing_read_only_proofs() {
@@ -672,6 +675,9 @@ mod tests {
         changed.io.row_indices -= 1;
         assert!(v41_spark_inventory(&changed, &e, &r, &sample).is_err());
         changed = a.clone();
+        changed.io.endpoint_staging += 1;
+        assert!(v41_spark_inventory(&changed, &e, &r, &sample).is_err());
+        changed = a.clone();
         changed.rank += 1;
         assert!(v41_spark_inventory(&changed, &e, &r, &sample).is_err());
         let mut changed_execution = e.clone();
@@ -724,7 +730,7 @@ mod tests {
         let r = runtime(&e);
         let result = v41_spark_inventory(&assignment(), &e, &r, &runtime_sample()).unwrap();
         assert_eq!(result.load_peak, 1000 + 60 + 100 + 200 + 300);
-        assert_eq!(result.serve_peak, 1000 + 60 + e.retained.total().unwrap() + 111 + 222 + 333);
+        assert_eq!(result.serve_peak, 1000 + 60 + e.retained.total().unwrap() + 111 + 222 + 333 + 444);
         assert!(!result.device.iter().any(|i| i.group == "intake"));
         assert_eq!(result.device.iter().chain(&result.pinned).chain(&result.host).map(|i| i.bytes).sum::<u64>(), result.serve_peak);
     }

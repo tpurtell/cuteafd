@@ -82,11 +82,13 @@ pub struct CrossCheckpoints {
 
 /// How two runs pair. `SameCheckpoint` is a precision switch on one checkpoint;
 /// `CrossCheckpoint` pairs two quants of one reference root on the same pinned set,
-/// resolving each checkpoint's ancestry through `fidelity_match` against `hub`.
+/// resolving each checkpoint's ancestry through `fidelity_match` against `hub`;
+/// `CodeChange` is a code A/B: one checkpoint and identical server settings on two builds.
 #[derive(Debug, Clone, Copy)]
 pub enum Pairing<'a> {
     SameCheckpoint,
     CrossCheckpoint { hub: &'a Path },
+    CodeChange,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -401,13 +403,19 @@ pub fn compare_paired(a: &Run, b: &Run, top1_margin: f64, kl_margin: f64, bootst
     }
     ensure!(a.tier == b.tier && a.path_shape == b.path_shape && a.kl_kind == b.kl_kind && a.verify_rows == b.verify_rows && a.dataset == b.dataset,
         "runs use different tiers, scoring shapes, KL estimators or verify widths");
-    ensure!(a.engine == b.engine && a.settings.get("build") == b.settings.get("build")
+    let code = matches!(pairing, Pairing::CodeChange);
+    ensure!(a.engine == b.engine && (code || a.settings.get("build") == b.settings.get("build"))
         && (cross || a.settings.get("snapshot") == b.settings.get("snapshot")), "runs use different engines, builds or snapshots");
     let checkpoints = match pairing {
-        Pairing::SameCheckpoint => None,
+        Pairing::SameCheckpoint | Pairing::CodeChange => None,
         Pairing::CrossCheckpoint { hub } => Some(cross_checkpoints(a, b, hub)?),
     };
-    ensure!(comparison_settings(&a.settings, cross)? == comparison_settings(&b.settings, cross)?, "{}",
+    let settings = |run: &Run| -> Result<serde_json::Value> {
+        let mut value = comparison_settings(&run.settings, cross)?;
+        if code { value.as_object_mut().unwrap().remove("build"); }
+        Ok(value)
+    };
+    ensure!(settings(a)? == settings(b)?, "{}",
         if cross { "runs use different server settings outside the precision and quant-selection lists" }
         else { "runs use different nonprecision server settings" });
     ensure!(matches!(a.path_shape.as_str(), "decode-shaped" | "prefill-shaped"), "unknown scoring shape");
@@ -692,6 +700,10 @@ mod tests {
         let b = run(3, 8);
         let mut a = b.clone(); a.settings = serde_json::json!({"build": {"commit": "other"}});
         assert!(compare(&a, &b, 0.01, 0.01, 100, 1).is_err());
+        a = b.clone(); a.settings = serde_json::json!({"build": {"commit": "other"}});
+        assert!(compare_paired(&a, &b, 0.01, 0.01, 100, 1, Pairing::CodeChange).is_ok());
+        a.settings = serde_json::json!({"build": {"commit": "other"}, "snapshot": "other"});
+        assert!(compare_paired(&a, &b, 0.01, 0.01, 100, 1, Pairing::CodeChange).is_err());
         a = b.clone(); a.path_shape = "unknown".into();
         assert!(compare(&a, &a, 0.01, 0.01, 100, 1).is_err());
         a = b.clone(); a.tier = "quick".into(); a.path_shape = "prefill-shaped".into();

@@ -1,4 +1,4 @@
-//! Native router and shared expert around the unchanged device expert link.
+//! Native router/shared expert bindings with transport-neutral wave boundaries.
 use super::weights::load_operand;
 use crate::shared::{
     memory::device::{Allocation, Device, Stream},
@@ -115,6 +115,34 @@ impl RoutedPlan {
         available: u64,
         reservations: &[u64],
     ) -> Result<Self> {
+        Self::prepare_layout(programs, checkpoint, layer, rows, available, reservations,
+            RankWeightLayout::from_checkpoint(checkpoint, 0, 1)?)
+    }
+
+    pub fn for_execution(
+        programs: &Programs<'_>,
+        checkpoint: &Checkpoint,
+        layer: usize,
+        rows: usize,
+        available: u64,
+        reservations: &[u64],
+        rank: usize,
+        ownership: &cuteafd_loader::plan::families::step5::ownership::ExecutionOwnership,
+    ) -> Result<Self> {
+        ensure!(ownership.layer(layer, rank)?.ffn, "Step-5 routed FFN is not owned by rank {rank}");
+        Self::prepare_layout(programs, checkpoint, layer, rows, available, reservations,
+            RankWeightLayout::for_execution(checkpoint, rank, ownership)?)
+    }
+
+    fn prepare_layout(
+        programs: &Programs<'_>,
+        checkpoint: &Checkpoint,
+        layer: usize,
+        rows: usize,
+        available: u64,
+        reservations: &[u64],
+        layout: RankWeightLayout,
+    ) -> Result<Self> {
         let contract = CoordinatorContract::from_checkpoint(checkpoint)?;
         ensure!(
             contract
@@ -133,7 +161,6 @@ impl RoutedPlan {
             "Step-5 unsupported shared clamp"
         );
         let activation = format!("step5_post_silu_w1536_c{}", limit as u32);
-        let layout = RankWeightLayout::from_checkpoint(checkpoint, 0, 1)?;
         let mut weights = Vec::new();
         for (suffix, dtype, shape) in [
             ("post_attention_layernorm.weight", DType::F32, vec![H]),
@@ -295,6 +322,10 @@ impl<'a> RoutedFfn<'a> {
             layer,
         })
     }
+    pub fn validate_live_weights(&self, device: Device<'_>) -> Result<()> {
+        super::weights::validate_live_weights(device.id, &self.weights)
+    }
+
     pub fn input(&self) -> CuteafdDeviceBuffer {
         self.planes[INPUT].buffer
     }
@@ -342,14 +373,54 @@ impl<'a> RoutedFfn<'a> {
                 && std::ptr::eq(stream.device.library, self.stream.device.library),
             "Step-5 routed stream mismatch"
         );
+        self.frontend_on(rows, stream)?;
+        stream.device.run(|| {
+            // SAFETY: the diagnostic owner retains normalized rows and routes through drainage.
+            unsafe {
+                link.dispatch(self.layer, rows, kind, self.planes[IDS].buffer,
+                    self.planes[ROUTES].buffer, self.planes[NORM].buffer, stream.raw)
+            }
+        })?;
+        self.shared_on(rows, stream)?;
+        stream.device.run(|| {
+            // SAFETY: the retained diagnostic link orders collection before reduction.
+            unsafe {
+                link.collect(stream.raw)?;
+                link.reduce(std::ptr::null(), self.planes[ROUTED].buffer.ptr.cast(), rows, stream.raw)
+            }
+        })?;
+        self.finish_on(rows, stream)
+    }
+
+    pub fn wave_inputs(&self) -> [CuteafdDeviceBuffer; 3] {
+        [self.planes[IDS].buffer, self.planes[ROUTES].buffer, self.planes[NORM].buffer]
+    }
+
+    pub fn routed_output(&self) -> CuteafdDeviceBuffer {
+        self.planes[ROUTED].buffer
+    }
+
+    fn check_stream(&self, rows: usize, stream: &Stream<'a>) -> Result<()> {
+        ensure!((1..=self.admission.rows).contains(&rows)
+            && stream.device.id == self.stream.device.id
+            && std::ptr::eq(stream.device.library, self.stream.device.library),
+            "Step-5 routed live rows/stream mismatch");
+        Ok(())
+    }
+
+    /// A receiving replica needs the native shared expert, not another router/wave.
+    pub fn normalize_on(&self, rows: usize, stream: &Stream<'a>) -> Result<()> {
+        self.check_stream(rows, stream)?;
+        let p = |i: usize| self.planes[i].buffer.ptr;
+        let weight = self.weights[0].buffer.ptr;
+        self.launch(0, &[p(INPUT), weight, weight, weight, weight, weight, p(NORM)], rows, stream)
+    }
+
+    /// Produce native BF16 wire rows and biased top-8 routes without choosing a transport.
+    pub fn frontend_on(&self, rows: usize, stream: &Stream<'a>) -> Result<()> {
+        self.normalize_on(rows, stream)?;
         let p = |i: usize| self.planes[i].buffer.ptr;
         let w = |i: usize| self.weights[i].buffer.ptr;
-        self.launch(
-            0,
-            &[p(INPUT), w(0), w(0), w(0), w(0), w(0), p(NORM)],
-            rows,
-            stream,
-        )?;
         self.launch(1, &[p(NORM), w(1), p(LOGITS)], rows, stream)?;
         stream.device.run(|| {
             // SAFETY: disjoint admitted logits planes and routes remain live through the stream drain.
@@ -378,30 +449,22 @@ impl<'a> RoutedFfn<'a> {
         })?;
         // The selector mutates only its copy. Recompute official (sigmoid+bias)-bias weights from raw logits.
         self.launch(2, &[p(LOGITS), w(2), p(IDS), p(ROUTES)], rows, stream)?;
-        stream.device.run(|| {
-            // SAFETY: this owner supplies BF16 normalized wire rows and keeps all wave inputs live.
-            unsafe {
-                link.dispatch(
-                    self.layer,
-                    rows,
-                    kind,
-                    self.planes[IDS].buffer,
-                    self.planes[ROUTES].buffer,
-                    self.planes[NORM].buffer,
-                    stream.raw,
-                )
-            }
-        })?;
+        Ok(())
+    }
+
+    pub fn shared_on(&self, rows: usize, stream: &Stream<'a>) -> Result<()> {
+        self.check_stream(rows, stream)?;
+        let p = |i: usize| self.planes[i].buffer.ptr;
+        let w = |i: usize| self.weights[i].buffer.ptr;
         self.launch(3, &[p(NORM), w(3), p(GATE_UP)], rows, stream)?;
         self.launch(4, &[p(GATE_UP), p(ACTIVATION)], rows, stream)?;
-        self.launch(5, &[p(ACTIVATION), w(4), p(SHARED)], rows, stream)?;
-        stream.device.run(|| {
-            // SAFETY: collect precedes reduction on the same stream; the link and output remain retained.
-            unsafe {
-                link.collect(stream.raw)?;
-                link.reduce(std::ptr::null(), p(ROUTED).cast(), rows, stream.raw)
-            }
-        })?;
+        self.launch(5, &[p(ACTIVATION), w(4), p(SHARED)], rows, stream)
+    }
+
+    /// The caller orders a completed BF16 routed reduction before this native join.
+    pub fn finish_on(&self, rows: usize, stream: &Stream<'a>) -> Result<()> {
+        self.check_stream(rows, stream)?;
+        let p = |i: usize| self.planes[i].buffer.ptr;
         // Match residual + (float(routed) + float(shared)), not (residual + routed) + shared.
         self.launch(6, &[p(ZERO), p(ROUTED), p(WIDE)], rows, stream)?;
         self.launch(6, &[p(WIDE), p(SHARED), p(COMBINED)], rows, stream)?;

@@ -257,7 +257,8 @@ def test_env_per_arm_and_container_mounts(env, monkeypatch):
     monkeypatch.setattr(golden.hwlock, 'hold', hold)
     argv = BASE + ['--arm', 'heads=i1:s1', '--arm', 'context=i1:s1', '--env', 'RUST_LOG=warn',
                    '--arm-env', 'heads:CUTEAFD_ATTENTION_PLACEMENT=heads',
-                   '--arm-env', 'context:CUTEAFD_ATTENTION_PLACEMENT=context', '--gpus', '1,0'] + GOLDEN
+                   '--arm-env', 'context:CUTEAFD_ATTENTION_PLACEMENT=context', '--arm-arg', 'heads:--trace',
+                   '--arm-arg', 'heads:{out}/t', '--gpus', '1,0'] + GOLDEN
     assert golden.main(argv) == 0
     assert order == [['gpu0', 'gpu1']]
     calls = runs(env)
@@ -278,11 +279,15 @@ def test_env_per_arm_and_container_mounts(env, monkeypatch):
         assert any(m.endswith(f'/gr/golden/{mode}/r1:/out') for m in mounts)
         assert IMAGE in call
         tail = call[call.index(IMAGE) + 1:]
+        assert (tail[-2:] == ['--trace', '/out/t']) == (mode == 'heads')
+        if mode == 'heads':
+            tail = tail[:-2]
         assert tail[-8:] == ['glm-golden', '--snapshot', '/hf/hub/models--org--model/snapshots/rev1', '--device', '0',
                              '--split-device', '1', '--skip-routed-experts', '--nll'][-8:]
     out = env['home'] / '.cache/cuteafd/builds/gr/golden'
     record = json.loads((out / 'heads/r1/argv.json').read_text())
     assert record['arm_env'] == {'RUST_LOG': 'warn', 'CUTEAFD_ATTENTION_PLACEMENT': 'heads'}
+    assert record['arm_args'] == ['--trace', '{out}/t']
     assert record['image_id'] == IMAGE and len(record['seal_sha256']) == 64
     assert record['source_commit'] == 'c0ffee'
     assert 'power_before' in record and 'power_samples' in record
@@ -532,7 +537,8 @@ def test_real_experts_start_before_and_stop_before_locks_release(spark_env, monk
             released.append(json.loads(env['state'].read_text()))
             return self.inner.__exit__(*exc)
     monkeypatch.setattr(golden.hwlock, 'hold', Hold)
-    assert golden.main(spark_argv(env, '--worker-ready-timeout', '2400', '--worker-memory-bytes', '115964116992')) == 0
+    assert golden.main(spark_argv(env, '--worker-ready-timeout', '2400', '--worker-memory-bytes', '115964116992',
+                                  '--worker-env', 'CUTEAFD_X=base', '--arm-worker-env', 'a:CUTEAFD_X=arm')) == 0
     assert order == [['sparks', 'gpu1', 'rhea', 'moa']]
     assert released == [{}]  # every worker and the coordinator removed before the locks went
     calls = docker_calls(env)
@@ -555,6 +561,7 @@ def test_real_experts_start_before_and_stop_before_locks_release(spark_env, monk
         assert any(m.endswith(':/opt/cuteafd/lib/fp8:ro') for m in mounts)
         assert 'CUTEAFD_PROGRAM_MANIFEST=/opt/cuteafd/share/PROGRAMS.json' in argv
         assert argv[argv.index('--memory') + 1] == argv[argv.index('--memory-swap') + 1] == '115964116992'
+        assert 'CUTEAFD_X=arm' in argv and 'CUTEAFD_X=base' not in argv
     run_env = json.loads((env['tmp'] / 'run-env.json').read_text())
     assert run_env['CUTEAFD_GOLDEN_PEERS'] == '10.9.0.1:19451,10.9.0.2:19451,10.9.0.3:19451,10.9.0.4:19451'
     assert run_env['CUTEAFD_GOLDEN_SPARK_WORLD'] == '4' and run_env['CUTEAFD_GOLDEN_EXPERT_LAYERS'] == '3'
@@ -725,7 +732,10 @@ def test_fixture_generation_command_mode(env, monkeypatch):
     (['--fixtures', 'TASK/golden/x', '--fixtures-writable'], 'outside golden/'),
     (['--fixtures', 'TASK/fx', '--fixtures-writable', '--spark-hosts', 'dodo'], 'GPU-only'),
     (['--expert-layers', '3'], 'need --spark-hosts'),
+    (['--arm-worker-env', 'a:K=V'], 'need --spark-hosts'),
+    (['--spark-hosts', 'dodo', '--arm-worker-env', 'zz:K=V'], 'names no arm'),
     (['--worker-memory-bytes', '115964116992'], 'need --spark-hosts'),
+    (['--arm-arg', 'zz:--x'], 'names no arm'),
     (['--spark-hosts', 'dodo', '--worker-memory-bytes', '1'], 'must exceed --worker-budget-bytes'),
     (['--fixtures', 'relative/dir'], 'absolute'),
 ])

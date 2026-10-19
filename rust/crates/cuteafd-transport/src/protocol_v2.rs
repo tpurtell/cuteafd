@@ -181,6 +181,7 @@ pub struct ExpertProtocolV2WireStats {
 #[derive(Debug, Default)]
 pub struct ExpertProtocolV2FrameBuffer {
     bytes: Vec<u8>,
+    response_row_capacity: Option<u32>,
 }
 
 impl ExpertProtocolV2FrameBuffer {
@@ -191,7 +192,23 @@ impl ExpertProtocolV2FrameBuffer {
     pub fn with_capacity(capacity: usize) -> Self {
         Self {
             bytes: Vec::with_capacity(capacity),
+            response_row_capacity: None,
         }
+    }
+
+    pub(crate) fn for_endpoint_response(endpoint: cuteafd_core::SparkEndpoint) -> Result<Self> {
+        let capacity = endpoint.response_prefix_bytes().context("invalid response prefix capacity")?;
+        let mut bytes = Vec::new();
+        bytes.try_reserve_exact(capacity)?;
+        anyhow::ensure!(bytes.capacity() == capacity, "response prefix allocation exceeds admission");
+        Ok(Self { bytes, response_row_capacity: Some(endpoint.capacity) })
+    }
+
+    fn check_response_rows(&self, rows: u32) -> Result<()> {
+        if let Some(capacity) = self.response_row_capacity {
+            anyhow::ensure!(rows <= capacity, "response rows {rows} exceed admitted prefix capacity {capacity}");
+        }
+        Ok(())
     }
 
     pub fn as_slice(&self) -> &[u8] {
@@ -245,6 +262,7 @@ impl ExpertProtocolV2FrameBuffer {
         &mut self,
         response: &ExpertProtocolV2Response,
     ) -> Result<&[u8]> {
+        self.check_response_rows(response.header.row_count)?;
         response.encode_prefix_into(&mut self.bytes)?;
         Ok(self.as_slice())
     }
@@ -253,6 +271,7 @@ impl ExpertProtocolV2FrameBuffer {
         &mut self,
         response: &ExpertProtocolV2ResponseRef<'_>,
     ) -> Result<&[u8]> {
+        self.check_response_rows(response.header.row_count)?;
         response.encode_prefix_into(&mut self.bytes)?;
         Ok(self.as_slice())
     }
@@ -261,6 +280,7 @@ impl ExpertProtocolV2FrameBuffer {
         &mut self,
         response: &ExpertProtocolV2DeviceResponseRef<'_>,
     ) -> Result<&[u8]> {
+        self.check_response_rows(response.header.row_count)?;
         response.encode_prefix_into(&mut self.bytes)?;
         Ok(self.as_slice())
     }

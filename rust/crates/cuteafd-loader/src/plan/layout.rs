@@ -327,7 +327,7 @@ pub(crate) fn charge_spark_io(device: &mut DeviceLayout, working: &crate::placem
         .and_then(|bytes| bytes.checked_add(legacy.row_indices))
         .ok_or(crate::placement::PlacementError::Overflow("Spark legacy I/O"))?;
     device.items.retain(|item| !matches!(item.group.as_str(), "expert waves" | "expert intake"
-        | "host expert exchange" | "expert row indices" | "rdma rings")
+        | "host expert exchange" | "expert row indices" | "endpoint response prefixes" | "rdma rings")
         && item.group != cuteafd_core::memory_layout::SPARK_RUNTIME_RESIDUAL_GROUP);
     if working.selected_ranks().contains(&rank) {
         device.items.push(cuteafd_core::memory_layout::spark_runtime_residual());
@@ -337,6 +337,7 @@ pub(crate) fn charge_spark_io(device: &mut DeviceLayout, working: &crate::placem
             io.intake, Basis::Formula));
         device.items.push(Item::new(Category::Workspace, "host expert exchange", "", io.host_exchange, Basis::Formula));
         device.items.push(Item::new(Category::Workspace, "expert row indices", "", io.row_indices, Basis::Formula));
+        device.items.push(Item::new(Category::Transport, "endpoint response prefixes", "", io.endpoint_staging, Basis::Formula));
         device.items.push(Item::new(Category::Transport, "rdma rings", "", io.mapped_rings, Basis::Formula));
     }
     Ok(())

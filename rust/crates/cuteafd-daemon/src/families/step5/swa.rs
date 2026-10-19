@@ -52,6 +52,21 @@ impl Admission {
         available: u64,
         reservations: &[u64],
     ) -> Result<Self> {
+        Self::for_heads(rows, 64, weights, dense, rope, available, reservations)
+    }
+
+    fn for_heads(
+        rows: usize,
+        heads: usize,
+        weights: &[u64],
+        dense: u64,
+        rope: u64,
+        available: u64,
+        reservations: &[u64],
+    ) -> Result<Self> {
+        ensure!(matches!(heads, 32 | 64), "SWA native query head count");
+        let q = heads * 192;
+        let kv = heads / 16 * 192;
         ensure!(
             (1..=4096).contains(&rows),
             "SWA row capacity must be 1..=4096"
@@ -60,15 +75,15 @@ impl Admission {
         let planes = [
             rows * H * 4,
             rows * H * 2,
-            rows * Q * 2,
-            rows * KV * 2,
-            pages * 64 * KV * 2,
-            rows * Q * 2,
-            pages * 64 * KV * 2,
-            rows * 64 * 2,
-            rows * Q * 2,
-            rows * Q * 2,
-            rows * H * 2,
+            rows * q * 2,
+            rows * kv * 2,
+            pages * 64 * kv * 2,
+            rows * q * 2,
+            pages * 64 * kv * 2,
+            rows * heads * 2,
+            rows * q * 2,
+            rows * q * 2,
+            rows * H * if heads == 32 { 4 } else { 2 },
             rows * 8,
             rows * 4,
             pages * 4,
@@ -100,7 +115,7 @@ impl Admission {
     }
 }
 
-const DEFS: [(&str, &[&str], &[u8]); 11] = [
+const DEFS: [(&str, &[&str], &[u8]); 12] = [
     (
         "step5_hidden_norm",
         &["x", "weight", "bias", "cos", "sin", "positions", "out"],
@@ -145,6 +160,7 @@ const DEFS: [(&str, &[&str], &[u8]); 11] = [
     ("step5_head_gate", &["x", "logits", "out"], b"i"),
     ("step5_attn_out", &["x", "w", "out"], b"i"),
     ("step5_residual_bf16", &["residual", "delta", "out"], b"i"),
+    ("step5_residual_f32", &["residual", "delta", "out"], b"i"),
 ];
 
 pub(super) struct SwaLayer<'a> {
@@ -158,11 +174,16 @@ pub(super) struct SwaLayer<'a> {
     programs: Vec<Program<'a>>,
     admission: Admission,
     epsilon: f32,
+    heads: usize,
 }
 
 impl<'a> SwaLayer<'a> {
     pub fn workspace_bytes(rows: usize) -> Result<u64> {
-        Ok(Admission::new(rows, &[], 0, 0, u64::MAX, &[])?.bytes)
+        Self::workspace_for_heads(rows, 64)
+    }
+
+    pub fn workspace_for_heads(rows: usize, heads: usize) -> Result<u64> {
+        Ok(Admission::for_heads(rows, heads, &[], 0, 0, u64::MAX, &[])?.bytes)
     }
 
     pub fn load(
@@ -175,6 +196,46 @@ impl<'a> SwaLayer<'a> {
         available: u64,
         reservations: &[u64],
     ) -> Result<Self> {
+        Self::load_layout(device, programs, checkpoint, layer_id, rows, rope, available,
+            reservations, RankWeightLayout::from_checkpoint(checkpoint, 0, 1)?, 64, true)
+    }
+
+    pub fn for_execution(
+        device: Device<'a>,
+        programs: &'a Programs<'a>,
+        checkpoint: &'a Checkpoint,
+        layer: usize,
+        rows: usize,
+        rope: Option<std::rc::Rc<TargetTables<'a>>>,
+        available: u64,
+        reservations: &[u64],
+        rank: usize,
+        ownership: &cuteafd_loader::plan::families::step5::ownership::ExecutionOwnership,
+    ) -> Result<Self> {
+        let heads = ownership.layer(layer, rank)?.query_heads;
+        ensure!(heads > 0, "Step-5 SWA is not owned by rank {rank}");
+        Self::load_layout(device, programs, checkpoint, layer, rows, rope, available,
+            reservations, RankWeightLayout::for_execution(checkpoint, rank, ownership)?, heads, false)
+    }
+
+    fn load_layout(
+        device: Device<'a>,
+        programs: &'a Programs<'a>,
+        checkpoint: &'a Checkpoint,
+        layer_id: usize,
+        rows: usize,
+        rope: Option<std::rc::Rc<TargetTables<'a>>>,
+        available: u64,
+        reservations: &[u64],
+        layout: RankWeightLayout,
+        heads: usize,
+        include_dense: bool,
+    ) -> Result<Self> {
+        let q = heads * 192;
+        let kv = heads / 16 * 192;
+        let name = |full: &str| if heads == 32 { full.replacen("step5_", "step52_", 1) }
+            else { full.to_owned() };
+        let output = if heads == 32 { "step52_attn_out_partial" } else { "step5_attn_out" };
         let contract = CoordinatorContract::from_checkpoint(checkpoint)?;
         let layer = contract
             .layers
@@ -202,7 +263,6 @@ impl<'a> SwaLayer<'a> {
                 && layer.rope.span == 192,
             "SWA geometry mismatch"
         );
-        let layout = RankWeightLayout::from_checkpoint(checkpoint, 0, 1)?;
         let suffixes = [
             "input_layernorm.weight",
             "self_attn.q_proj.weight",
@@ -225,25 +285,25 @@ impl<'a> SwaLayer<'a> {
             .collect::<Result<Vec<_>>>()?;
         for (weight, (dtype, shape)) in weights.iter().zip([
             (DType::F32, vec![H]),
-            (DType::Bf16, vec![Q, H]),
-            (DType::Bf16, vec![KV, H]),
-            (DType::Bf16, vec![KV, H]),
+            (DType::Bf16, vec![q, H]),
+            (DType::Bf16, vec![kv, H]),
+            (DType::Bf16, vec![kv, H]),
             (DType::F32, vec![192]),
             (DType::F32, vec![192]),
-            (DType::Bf16, vec![64, H]),
-            (DType::Bf16, vec![H, Q]),
+            (DType::Bf16, vec![heads, H]),
+            (DType::Bf16, vec![H, q]),
         ]) {
             ensure!(
                 weight.dtype == dtype && weight.shape == shape,
                 "SWA weight shape/dtype"
             );
         }
-        let dense = layer
-            .dense_activation
+        let dense = layer.dense_activation.filter(|_| include_dense)
             .map(|_| DensePlan::prepare(programs, checkpoint, layer_id, rows, u64::MAX, &[]))
             .transpose()?;
-        let admission = Admission::new(
+        let admission = Admission::for_heads(
             rows,
+            heads,
             &weights
                 .iter()
                 .map(|w| w.allocation_bytes)
@@ -257,8 +317,9 @@ impl<'a> SwaLayer<'a> {
             available,
             reservations,
         )?;
-        for (name, pointers, scalars) in DEFS {
-            let spec = programs.spec(name)?;
+        for (full, pointers, scalars) in DEFS {
+            let name = if full == "step5_attn_out" { output.to_owned() } else { name(full) };
+            let spec = programs.spec(&name)?;
             let scalars = scalars
                 .iter()
                 .copied()
@@ -272,23 +333,25 @@ impl<'a> SwaLayer<'a> {
                 "{name}: SWA ABI/capacity mismatch"
             );
         }
-        for (name, width, outputs) in [
-            ("step5_attn_q", H, Q),
-            ("step5_attn_kv", H, KV),
-            ("step5_attn_gate", H, 64),
-            ("step5_attn_out", Q, H),
+        for (full, width, outputs) in [
+            ("step5_attn_q", H, q),
+            ("step5_attn_kv", H, kv),
+            ("step5_attn_gate", H, heads),
+            ("step5_attn_out", q, H),
         ] {
-            let g = &programs.spec(name)?.geometry;
+            let is_partial = heads == 32 && full == "step5_attn_out";
+            let name = if is_partial { output.to_owned() } else { name(full) };
+            let g = &programs.spec(&name)?.geometry;
             ensure!(
                 g["width"] == width
                     && g["outputs"] == outputs
-                    && g["output_dtype"] == "torch.bfloat16"
+                    && g["output_dtype"] == if is_partial { "torch.float32" } else { "torch.bfloat16" }
                     && g["skinny_rows"] == 0,
                 "{name}: SWA projection geometry mismatch"
             );
         }
-        for (name, heads) in [("step5_swa_q_norm_rope", 64), ("step5_swa_k_norm_rope", 4)] {
-            let g = &programs.spec(name)?.geometry;
+        for (full, heads) in [("step5_swa_q_norm_rope", heads), ("step5_swa_k_norm_rope", heads / 16)] {
+            let g = &programs.spec(&name(full))?.geometry;
             ensure!(
                 g["width"] == 192
                     && g["heads"] == heads
@@ -300,28 +363,31 @@ impl<'a> SwaLayer<'a> {
                 "SWA Q/K norm geometry mismatch"
             );
         }
-        let g = &programs.spec("step5_swa_attention")?.geometry;
+        let g = &programs.spec(&name("step5_swa_attention"))?.geometry;
         ensure!(
-            g["query_heads"] == 64
-                && g["kv_heads"] == 4
+            g["query_heads"] == heads
+                && g["kv_heads"] == heads / 16
                 && g["page_rows"] == 64
                 && g["selection_width"] == 512
                 && g["selection_groups"] == 1
                 && g["head_dim"] == 192
-                && g["key_strides"] == serde_json::json!([49152, 768, 192])
-                && g["value_strides"] == serde_json::json!([49152, 768, 192]),
+                && g["key_strides"] == serde_json::json!([64 * kv, kv, 192])
+                && g["value_strides"] == serde_json::json!([64 * kv, kv, 192]),
             "SWA attention geometry"
         );
         ensure!(
-            programs.spec("step5_sliding_positions")?.geometry["window"] == 512
-                && programs.spec("step5_head_gate")?.geometry["heads"] == 64
-                && programs.spec("step5_head_gate")?.geometry["dim"] == 192,
+            programs.spec(&name("step5_sliding_positions"))?.geometry["window"] == 512
+                && programs.spec(&name("step5_head_gate"))?.geometry["heads"] == heads
+                && programs.spec(&name("step5_head_gate"))?.geometry["dim"] == 192,
             "SWA pointwise geometry"
         );
         // All composed contracts and aggregate bytes are checked before the first allocation.
         let resolved = DEFS
             .iter()
-            .map(|(name, pointers, _)| device.run(|| programs.program(name, pointers)))
+            .map(|(full, pointers, _)| {
+                let name = if *full == "step5_attn_out" { output.to_owned() } else { name(full) };
+                device.run(|| programs.program(&name, pointers))
+            })
             .collect::<Result<Vec<_>>>()?;
         let rope = match rope {
             Some(rope) => rope,
@@ -357,6 +423,7 @@ impl<'a> SwaLayer<'a> {
             programs: resolved,
             admission,
             epsilon: contract.norms.input,
+            heads,
         };
         // Immutable single-request metadata is initialized once, never on replay.
         for (plane, bytes) in [
@@ -414,7 +481,8 @@ impl<'a> SwaLayer<'a> {
             &[Scalar::I32(rows as i32)],
         )?;
         self.attend(rows)?;
-        self.finish_on(rows, &self.stream)
+        self.finish_on(rows, &self.stream)?;
+        self.dense_on(rows, &self.stream)
     }
 
     fn project_on(
@@ -479,15 +547,77 @@ impl<'a> SwaLayer<'a> {
         let scalars = [Scalar::I32(rows as i32)];
         self.launch_on(stream, 8, &[p(ATTN), p(LOGITS), p(GATED)], &scalars)?;
         self.launch_on(stream, 9, &[p(GATED), w(7), p(DELTA)], &scalars)?;
-        let post = self
-            .ffn
-            .as_ref()
-            .map_or(self.planes[POST].buffer, DenseFfn::input);
-        self.launch_on(stream, 10, &[p(X), p(DELTA), post.ptr], &scalars)?;
+        if self.heads == 64 {
+            self.launch_on(stream, 10, &[p(X), p(DELTA), p(POST)], &scalars)?;
+        }
+        Ok(())
+    }
+
+    fn dense_on(&self, rows: usize, stream: &Stream<'a>) -> Result<()> {
         if let Some(ffn) = &self.ffn {
+            stream.device.run(|| {
+                // SAFETY: admitted disjoint planes and the composed FFN survive stream drainage.
+                unsafe { stream.device.library.copy_d2d_async(ffn.input(), self.planes[POST].buffer,
+                    rows * H * 4, stream.raw) }
+            })?;
             ffn.enqueue_on(rows, stream)?;
         }
         Ok(())
+    }
+
+    pub fn attention_output(&self) -> CuteafdDeviceBuffer {
+        self.planes[POST].buffer
+    }
+
+    pub fn projection_partial(&self) -> Result<CuteafdDeviceBuffer> {
+        ensure!(self.heads == 32, "SWA F32 partial requires head split");
+        Ok(self.planes[DELTA].buffer)
+    }
+
+    pub(super) fn diagnostic_norm(&self) -> CuteafdDeviceBuffer {
+        self.planes[NORM].buffer
+    }
+
+    pub(super) fn diagnostic_attention(&self) -> [(CuteafdDeviceBuffer, bool); 2] {
+        // In head-split mode NORM holds the once-rounded merged O delta.
+        [(self.planes[if self.heads == 32 { NORM } else { DELTA }].buffer, true),
+            (self.planes[POST].buffer, false)]
+    }
+
+    pub(super) fn diagnostic_dense(&self) -> Result<&DenseFfn<'a>> {
+        self.ffn.as_ref().context("SWA diagnostic requires embedded dense FFN")
+    }
+
+    /// Ordered rank0 + rank1 projection, one BF16 narrowing, then F32 residual.
+    /// The caller retains the exchange and invokes this on its cache stream.
+    pub fn merge_partial_on(&self, rows: usize, values: [*const std::ffi::c_void; 2],
+        stream: &Stream<'a>) -> Result<()> {
+        self.merge_partial_capture_on(rows, values, stream, None)
+    }
+
+    pub(super) fn merge_partial_capture_on(&self, rows: usize, values: [*const std::ffi::c_void; 2],
+        stream: &Stream<'a>, capture: Option<(&std::path::Path, usize)>) -> Result<()> {
+        ensure!(self.heads == 32 && (1..=self.admission.rows).contains(&rows)
+            && values.iter().all(|value| !value.is_null())
+            && stream.device.id == self.stream.device.id
+            && std::ptr::eq(stream.device.library, self.stream.device.library),
+            "SWA partial merge geometry/device mismatch");
+        let p = |i: usize| self.planes[i].buffer.ptr;
+        // POST is scratch until the residual join; NORM is no longer read by
+        // attention and is large enough for the rounded hidden-width delta.
+        self.launch_on(stream, 11, &[values[0].cast_mut(), values[1].cast_mut(), p(POST)],
+            &[Scalar::I32(rows as i32)])?;
+        if let Some((directory, rank)) = capture {
+            stream.drain()?;
+            super::golden::dump_plane(directory, &format!("rank{rank}-merged_o_f32"),
+                stream.device, self.planes[POST].buffer, rows, false)?;
+        }
+        stream.device.run(|| {
+            // SAFETY: disjoint admitted same-device planes survive cache-stream drainage.
+            unsafe { stream.device.library.cuda_f32_to_bf16_async(self.planes[POST].buffer,
+                self.planes[NORM].buffer, rows * H, stream.raw) }
+        })?;
+        self.launch_on(stream, 10, &[p(X), p(NORM), p(POST)], &[Scalar::I32(rows as i32)])
     }
 
     pub fn enqueue_step<'e, E: cuteafd_hostcache::copy::CopyEngine>(
@@ -506,12 +636,31 @@ impl<'a> SwaLayer<'a> {
             &self.planes[VPAGES],
             None,
         )?;
-        step.attend(rank, self.layer, &*self, |layer, read| layer.read_on(read))
+        step.attend(rank, self.layer, &*self, |layer, read| {
+            let rows = read.inputs.rows;
+            let stream = read.inputs.stream;
+            layer.read_on(read)?;
+            layer.dense_on(rows, stream)
+        })
+    }
+
+    pub fn enqueue_attention_step<'e, E: cuteafd_hostcache::copy::CopyEngine>(
+        &'e self,
+        step: &mut Step<'e, 'a, E>,
+        rank: usize,
+    ) -> Result<()> {
+        ensure!(self.ffn.is_none(), "shared SWA pipeline must own its FFN separately");
+        step.project(rank, self.layer, self, |layer, input| {
+            layer.check_input(&input)?;
+            layer.project_on(input.rows, input.positions, input.stream)
+        })?;
+        step.stage(rank, self.layer, &self.planes[KPAGES], &self.planes[VPAGES], None)?;
+        step.attend(rank, self.layer, self, |layer, read| layer.read_on(read))
     }
 
     fn check_input(&self, input: &StepInputs<'_, 'a>) -> Result<()> {
         ensure!(
-            input.heads == 64
+            input.heads == self.heads
                 && input.stream.device.id == self.stream.device.id
                 && std::ptr::eq(input.stream.device.library, self.stream.device.library)
                 && input
@@ -605,8 +754,15 @@ impl<'a> SwaLayer<'a> {
         )
     }
 
+    pub fn validate_live_weights(&self, device: Device<'_>) -> Result<()> {
+        super::weights::validate_live_weights(device.id, &self.weights)
+    }
+
     pub fn input(&self) -> CuteafdDeviceBuffer {
         self.planes[X].buffer
+    }
+    pub fn has_dense_ffn(&self) -> bool {
+        self.ffn.is_some()
     }
     pub fn output(&self) -> CuteafdDeviceBuffer {
         self.ffn
@@ -618,6 +774,21 @@ impl<'a> SwaLayer<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn exact_head_workspace_charges_the_f32_partial_at_every_row_capacity() -> Result<()> {
+        for rows in 1..=4096 {
+            let split = Admission::for_heads(rows, 32, &[], 0, 0, u64::MAX, &[])?;
+            let whole = Admission::for_heads(rows, 64, &[], 0, 0, u64::MAX, &[])?;
+            assert_eq!(split.planes[DELTA], (rows * H * 4).max(256));
+            assert_eq!(SwaLayer::workspace_for_heads(rows, 32)?, split.bytes);
+            assert!(split.bytes <= whole.bytes);
+        }
+        assert!(SwaLayer::workspace_for_heads(0, 32).is_err());
+        assert!(SwaLayer::workspace_for_heads(4097, 32).is_err());
+        assert!(SwaLayer::workspace_for_heads(64, 16).is_err());
+        Ok(())
+    }
+
     fn fixture(root: &std::path::Path, manifest: &serde_json::Value, key: &str) -> Result<Vec<u8>> {
         use sha2::{Digest, Sha256};
         let bytes = std::fs::read(root.join(format!("{key}.bin")))?;
@@ -1175,6 +1346,24 @@ mod tests {
             std::rc::Rc::ptr_eq(&routed.rope, &chain.rope) && routed.ffn.is_none(),
             "SWA shared layer binding"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn swa_head_split_admits_native_half_heads_and_f32_projection() -> Result<()> {
+        for rows in [1, 7, 64, 65, 4096] {
+            let a = Admission::for_heads(rows, 32, &[], 0, 0, u64::MAX, &[])?;
+            assert_eq!(a.planes[QRAW], rows * 32 * 192 * 2);
+            assert_eq!(a.planes[KPAGES], rows.div_ceil(64) * 64 * 2 * 192 * 2);
+            assert_eq!(a.planes[DELTA], rows * H * 4);
+            assert_eq!(a.planes[NORM], rows * H * 2);
+            assert_eq!(a.planes[POST], rows * H * 4);
+            assert_eq!(a.bytes, a.planes.iter().sum::<usize>() as u64);
+            assert!(Admission::for_heads(rows, 32, &[], 0, 0, a.bytes - 1, &[]).is_err());
+        }
+        for heads in [0, 16, 48, 128] {
+            assert!(Admission::for_heads(1, heads, &[], 0, 0, u64::MAX, &[]).is_err());
+        }
         Ok(())
     }
 

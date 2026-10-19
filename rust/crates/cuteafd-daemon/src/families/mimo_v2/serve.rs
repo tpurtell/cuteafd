@@ -1093,6 +1093,7 @@ fn schedule_inner(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path
         // A sequence whose grammar fails is failed alone after the step; an
         // error inside `submit` would end the engine.
         let mut poisoned: Vec<Option<String>> = vec![None; active.len()];
+        cuteafd_transport::route_log::step(|| active.iter().zip(&sequences).map(|(a, s)| (a.ticket.id(), s.len() as u32)).collect());
         engine.probe_begin(tokens.len());
         let step = engine.submit(|| {
             let mut rows: Vec<(&mut MimoPlacement, usize)> = active.iter_mut().zip(&sequences)
@@ -1565,6 +1566,7 @@ fn prefill_one(engine: &MimoEngine<'_>, family: &MimoPrefix<'_, '_>,
     let end = p.plan.chunks.get(p.chunks).copied().unwrap_or(p.tokens.len());
     let count = end - p.done;
     let retain = cache.enabled() && !probe::cold(&p.job.probe);
+    cuteafd_transport::route_log::step(|| vec![(p.ticket.id(), count as u32)]);
     let (result, phases) = isolated_phases(&engine.profile, || engine.submit(|| -> Result<()> {
         let start = p.placement.len;
         let decode = p.job.probe.as_ref().and_then(|probe| probe.spec.cold_steps.get(p.chunks))
@@ -1645,6 +1647,7 @@ fn prefill_batch(engine: &MimoEngine<'_>, family: &MimoPrefix<'_, '_>,
     let ends = pair.each_ref().map(|p| p.plan.chunks.get(p.chunks).copied().unwrap_or(p.tokens.len()));
     let starts = pair.each_ref().map(|p| p.placement.len);
     let counts = [ends[0] - pair[0].done, ends[1] - pair[1].done];
+    cuteafd_transport::route_log::step(|| vec![(pair[0].ticket.id(), counts[0] as u32), (pair[1].ticket.id(), counts[1] as u32)]);
     let (result, phases) = isolated_phases(&engine.profile, || engine.submit(|| -> Result<()> {
         let [a, b] = &mut pair;
         let logits = engine.prefill_pair_media_device([

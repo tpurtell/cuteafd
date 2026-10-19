@@ -55,7 +55,55 @@ pub fn describe(config: &Value) -> Result<LaunchDescription> {
             let cfg = crate::families::qwen3_5::Qwen35Config::from_hf(config)?;
             ("qwen3_5", cfg.attention.len(), Some(cfg.attention.len() - 1))
         }
+        "step5_vl" | "step5" => {
+            let (first, last) = step5_routed(text_config(config))?;
+            ("step5", first, Some(last))
+        }
+        "kimi_k3" => {
+            let (first, last) = kimi_routed(text_config(config))?;
+            ("kimi_k3", first, Some(last))
+        }
         other => bail!("unsupported model_type {other:?}"),
     };
     Ok(LaunchDescription { family, model_type, first_expert_layer: first, last_expert_layer: last })
+}
+
+fn text_config(config: &Value) -> &Value {
+    config.get("text_config").unwrap_or(config)
+}
+
+/// Step-5's routed layers: exactly 3..=90 of its 92 decoder layers, from
+/// `moe_layer_list` (the full reader is `plan::families::step5::Config`).
+fn step5_routed(text: &Value) -> Result<(usize, usize)> {
+    let routed = text.get("moe_layer_list").and_then(Value::as_array)
+        .map(|layers| layers.iter().map(Value::as_u64).collect::<Option<Vec<_>>>());
+    let mut routed = match (text.get("model_type").and_then(Value::as_str), text.get("num_hidden_layers").and_then(Value::as_u64), routed) {
+        (Some("step5"), Some(92), Some(Some(routed))) => routed,
+        _ => bail!("unsupported Step-5 routed layer map"),
+    };
+    routed.sort_unstable();
+    if routed != (3..91).collect::<Vec<u64>>() {
+        bail!("unsupported Step-5 routed layer map");
+    }
+    Ok((3, 90))
+}
+
+/// Kimi K3's routed layers: a dense prefix (`first_k_dense_replace`), then every
+/// layer routed (`moe_layer_freq` 1), through the last decoder layer.
+fn kimi_routed(text: &Value) -> Result<(usize, usize)> {
+    let layers = match text.get("num_hidden_layers").and_then(Value::as_u64) {
+        Some(layers) if layers > 0 => layers as usize,
+        _ => bail!("config lacks num_hidden_layers"),
+    };
+    let first = match text.get("first_k_dense_replace") {
+        None => 0,
+        Some(value) => match value.as_u64() {
+            Some(first) if value.is_u64() && (first as usize) < layers => first as usize,
+            _ => bail!("unsupported kimi_k3 MoE layer pattern"),
+        },
+    };
+    if text.get("moe_layer_freq").is_some_and(|freq| freq.as_u64() != Some(1) || !freq.is_u64()) {
+        bail!("unsupported kimi_k3 MoE layer pattern");
+    }
+    Ok((first, layers - 1))
 }

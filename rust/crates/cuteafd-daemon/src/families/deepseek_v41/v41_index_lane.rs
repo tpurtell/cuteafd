@@ -115,6 +115,8 @@ impl<'w, 'a> IndexLane<'w, 'a> {
     fn restart_at(&mut self, first: usize) -> Result<()> {
         self.invalid = true;
         self.ready = None;
+        self.source.finish_audit()?;
+        if let Some(reindex) = &mut self.reindex { reindex.finish_audit()?; }
         self.source.restart()?;
         if let Some(reindex) = &mut self.reindex { reindex.restart()?; }
         let first = Self::next_owned(self.weights, self.device, first);

@@ -74,6 +74,14 @@ fn pack(
     Ok(packed)
 }
 
+pub(super) fn validate_live_weights(device: i32, weights: &[Allocation<'_>]) -> Result<()> {
+    ensure!(!weights.is_empty() && weights.iter().all(|weight| {
+        let buffer = weight.buffer;
+        !buffer.ptr.is_null() && buffer.device_id == device && buffer.bytes >= 256
+    }), "Step-5 live native weight allocation inventory");
+    Ok(())
+}
+
 pub(super) fn load_operand<'a>(
     device: Device<'a>,
     checkpoint: &'a Checkpoint,

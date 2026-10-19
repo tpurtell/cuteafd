@@ -219,6 +219,7 @@ fn load_weights<'a>(
             workspace_bytes = workspace,
             exchange_bytes = budget.exchange,
             row_indices_bytes = budget.row_indices,
+            endpoint_staging_bytes = budget.endpoint_staging,
             ring_bytes = budget.rings,
             runtime_headroom_bytes = budget.headroom,
             load_peak_bytes = budget.load_peak,
@@ -257,6 +258,7 @@ fn load_weights<'a>(
 struct SparkAdmissionBudget {
     exchange: usize,
     row_indices: usize,
+    endpoint_staging: usize,
     rings: usize,
     headroom: usize,
     load_peak: usize,
@@ -374,12 +376,19 @@ fn spark_admission_budget(
     read_scratch: usize,
     workspace: usize,
 ) -> Result<SparkAdmissionBudget> {
+    spark_admission_budget_for_geometry(config, cuteafd_core::expert_geometry(),
+        resident, staging, pinned_host, read_scratch, workspace)
+}
+
+fn spark_admission_budget_for_geometry(config: &NativeExpertServiceConfig,
+    geometry: cuteafd_core::ExpertGeometry, resident: usize, staging: usize,
+    pinned_host: usize, read_scratch: usize, workspace: usize) -> Result<SparkAdmissionBudget> {
+    let io = selected_spark_io(config, geometry, worker_ring_geometry(config)?)?;
     let (exchange, row_indices) = if config.bf16_ingress || config.exlr8_manifest.is_some() {
-        let io = selected_spark_io(config, cuteafd_core::expert_geometry(),
-            worker_ring_geometry(config)?)?;
         (usize::try_from(io.host_exchange)?, usize::try_from(io.row_indices)?)
     } else { (HostExpertExchange::bytes_for(config.capacity)?, config.capacity as usize * 4) };
-    let rings = spark_transport_bytes(config)?;
+    let rings = usize::try_from(io.mapped_rings)?;
+    let endpoint_staging = usize::try_from(io.endpoint_staging)?;
     let headroom = spark_runtime_headroom()?;
     // The loader's pinned buffers and read scratch live only for one layer load;
     // the exchange, row-index scratch and registered rings live while serving.
@@ -394,9 +403,10 @@ fn spark_admission_budget(
         .and_then(|bytes| bytes.checked_add(exchange))
         .and_then(|bytes| bytes.checked_add(row_indices))
         .and_then(|bytes| bytes.checked_add(rings))
+        .and_then(|bytes| bytes.checked_add(endpoint_staging))
         .and_then(|bytes| bytes.checked_add(headroom))
         .context("Spark serve peak overflow")?;
-    Ok(SparkAdmissionBudget { exchange, row_indices, rings, headroom, load_peak, serve_peak })
+    Ok(SparkAdmissionBudget { exchange, row_indices, endpoint_staging, rings, headroom, load_peak, serve_peak })
 }
 
 /// Startup/load/serve-milestone memory diagnostics: the actual CUDA free/total
@@ -882,7 +892,8 @@ mod tests {
         assert_eq!(budget.row_indices, 4096 * 4);
         assert_eq!(budget.rings, rings);
         assert_eq!(budget.load_peak, 10 + 1 + 2 + 3 + headroom);
-        assert_eq!(budget.serve_peak, 10 + 4 + exchange + 4096 * 4 + rings + headroom);
+        assert_eq!(budget.endpoint_staging, 2 * (128 + 4096 * 4));
+        assert_eq!(budget.serve_peak, 10 + 4 + exchange + 4096 * 4 + rings + budget.endpoint_staging + headroom);
         // The registered rings and the 40 MiB host exchange dominate the serve
         // peak at full capacity.
         assert!(budget.serve_peak > budget.load_peak);
@@ -953,6 +964,63 @@ mod tests {
                 capacity as usize * 6 * 8 + capacity as usize * 10240
             );
         }
+    }
+
+    #[test]
+    fn step5_two_rank_clients_admit_all_rings_and_shared_staging_before_allocation() -> Result<()> {
+        use cuteafd_core::{ExpertGeometry, SparkEndpoint, SparkIngress, SparkRings};
+        use cuteafd_loader::placement::SparkWorkingSet;
+        use cuteafd_transport::worker_selection::ModelAdmission;
+        let geometry = ExpertGeometry::STEP5;
+        let endpoint = SparkEndpoint { capacity: 640, ingress: SparkIngress::Bf16 };
+        let rings = SparkRings { max_frame_bytes: 64 << 20, depth: 8,
+            slot_bytes: 8 << 20, alignment: 4096 };
+        let working = SparkWorkingSet { spark_layers: (3..91).collect(), spark_ranks: 6,
+            prefill_lanes: 1, ..Default::default() };
+        for rank in 0..6 {
+            let mut config = config(6, rank, None);
+            config.capacity = 640;
+            config.bf16_ingress = true;
+            config.device_budget = 104 << 30;
+            let mut previous = None;
+            for clients in [1, 2] {
+                let model = ModelAdmission::for_clients(geometry, endpoint, 4096, rings, clients)?;
+                let forecast = working.rank_endpoints_io(rank, geometry, &model.endpoints, rings)?;
+                config.rdma_endpoints = clients;
+                config.model_admission = Some(model);
+                assert_eq!(selected_spark_io(&config, geometry, worker_ring_geometry(&config)?)?, forecast);
+                assert_eq!(forecast.intake, 640 * (4096 * 4 + 8 * 8));
+                assert_eq!(forecast.host_exchange, 640 * (4096 * 2 + 8 * 8));
+                assert_eq!(forecast.row_indices, 640 * 4);
+                assert_eq!(forecast.mapped_rings, clients as u64 * 134217728);
+                assert_eq!(forecast.endpoint_staging, clients as u64 * 2688);
+                // Retained bytes and maximum load transient from the first
+                // diagnostic; runtime residual remains an estimate, not a census.
+                let budget = spark_admission_budget_for_geometry(&config, geometry,
+                    100965469184, 0, 5033164800, 0, 199584768)?;
+                assert!(199584768 >= forecast.intake);
+                assert_eq!(budget.rings as u64, forecast.mapped_rings);
+                assert_eq!(budget.exchange as u64, forecast.host_exchange);
+                assert_eq!(budget.row_indices as u64, forecast.row_indices);
+                assert_eq!(budget.endpoint_staging as u64, forecast.endpoint_staging);
+                assert_eq!(budget.load_peak, 100965469184 + 5033164800 + budget.headroom);
+                assert!(budget.load_peak <= config.device_budget);
+                assert!(budget.serve_peak <= config.device_budget);
+                assert!(budget.load_peak < 108 << 30 && budget.serve_peak < 108 << 30);
+                if let Some(old) = previous {
+                    assert_eq!(budget.serve_peak - old, 134217728 + 2688);
+                }
+                previous = Some(budget.serve_peak);
+                let ring_budget = worker_ring_budget(&config, geometry)?;
+                let reservations = (0..clients).map(|_| ring_budget.reserve(134217728))
+                    .collect::<Result<Vec<_>>>()?;
+                assert_eq!(ring_budget.used(), budget.rings);
+                assert!(ring_budget.reserve(1).is_err());
+                drop(reservations);
+                assert_eq!(ring_budget.used(), 0);
+            }
+        }
+        Ok(())
     }
 
     #[test]

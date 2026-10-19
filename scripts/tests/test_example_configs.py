@@ -22,6 +22,9 @@ STARTING = re.compile(r"^(?P<model>[a-z0-9.-]+)-(?P<profile>min|max)\.config$")
 TP_EP = {"tp2ep2-native.config", "tp2ep3-native.config", "tp3ep1-native.config",
          "tp3ep2-native.config", "tp4ep1-explicit-native.config", "tp6ep1-native.config",
          "exl3-compact-tp3.config"}
+# WIP qualification configs for families without a release card yet (#273, #274):
+# served from ./wip.sh slots only, checked by test_serve_launch_new_families.py.
+QUALIFICATION = {"kimi-k3-exl3-max.config"}
 PRIVATE = ("raptor", "ostrich", "dodo", "emu", "kiwi", "rhea", "moa", "10.55.", "/home/", "/mnt/",
            "sparknest")
 
@@ -72,7 +75,7 @@ POOL_EXCEPTIONS = {("deepseek_v41", "POOL_TOKENS"): "auto"}
 
 
 def starting_configs() -> list[Path]:
-    return sorted(p for p in EXAMPLES.glob("*.config") if p.name not in TP_EP)
+    return sorted(p for p in EXAMPLES.glob("*.config") if p.name not in TP_EP | QUALIFICATION)
 
 
 def keys(path: Path) -> dict[str, str]:
@@ -462,6 +465,13 @@ def test_v41_starting_config_matches_the_launcher_defaults(path: Path, tmp_path:
 
 def test_tp_ep_examples_are_left_alone() -> None:
     assert TP_EP <= {p.name for p in EXAMPLES.glob("*.config")}
+
+
+def test_qualification_configs_exist_and_are_listed() -> None:
+    assert QUALIFICATION <= {p.name for p in EXAMPLES.glob("*.config")}
+    readme = (EXAMPLES / "README.md").read_text()
+    for name in QUALIFICATION:
+        assert f"({name})" in readme
 
 
 @pytest.mark.parametrize("config,count", [
