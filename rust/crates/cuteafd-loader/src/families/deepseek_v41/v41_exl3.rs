@@ -16,7 +16,8 @@ use std::{
 };
 
 pub const V41_EXL3_SCHEMA: &str = "cuteafd.v41-routed-exl3.v1";
-const MAX_MANIFEST_BYTES: u64 = 64 * 1024 * 1024;
+// Large MoE publications carry per-tensor maps exceeding 64 MiB.
+const MAX_MANIFEST_BYTES: u64 = 512 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum V41Exl3ProjectionKind {
@@ -281,16 +282,7 @@ pub(crate) fn decoder_family_preferring(
 }
 
 pub(crate) fn read_json(path: &Path, limit: u64) -> Result<Value> {
-    let mut bytes = Vec::new();
-    File::open(path)
-        .with_context(|| format!("opening {}", path.display()))?
-        .take(limit + 1)
-        .read_to_end(&mut bytes)?;
-    ensure!(
-        bytes.len() as u64 <= limit,
-        "{} exceeds metadata size limit",
-        path.display()
-    );
+    let bytes = read_bytes(path, limit)?;
     let mut value: Value = serde_json::from_slice(&bytes).with_context(|| format!("parsing {}", path.display()))?;
     normalize_legacy_names(&mut value);
     Ok(value)
@@ -542,11 +534,12 @@ fn check_storage_maps(snapshot: &Path, config: &Value, derived: &Exl3StorageMap)
 }
 
 fn read_bytes(path: &Path, limit: u64) -> Result<Vec<u8>> {
-    let mut bytes = Vec::new();
-    File::open(path)
-        .with_context(|| format!("opening {}", path.display()))?
-        .take(limit + 1)
-        .read_to_end(&mut bytes)?;
+    let file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
+    let size = file.metadata()?.len();
+    ensure!(size <= limit, "{} exceeds metadata size limit", path.display());
+    let mut bytes = Vec::with_capacity(usize::try_from(size).context("metadata size exceeds address space")?);
+    // Keep the bounded read too: the file may grow after the metadata check.
+    file.take(limit + 1).read_to_end(&mut bytes)?;
     ensure!(bytes.len() as u64 <= limit, "{} exceeds metadata size limit", path.display());
     Ok(bytes)
 }
@@ -1009,6 +1002,35 @@ mod tests {
             std::fs::write(dir.path().join(file), serde_json::to_vec(map).unwrap()).unwrap();
         }
         read_deepseek_v4_exl3_manifest(dir.path(), shape, headers, tiers)
+    }
+
+    #[test]
+    fn publication_manifest_over_64_mib_remains_bounded() -> Result<()> {
+        use std::io::Write;
+
+        let (config, manifest, shape, headers) = deepseek_v4_publication();
+        let dir = tempfile::tempdir()?;
+        std::fs::write(dir.path().join("config.json"), serde_json::to_vec(&config)?)?;
+        let path = dir.path().join("quantize_config.json");
+        let mut file = File::create(&path)?;
+        serde_json::to_writer(&mut file, &manifest)?;
+        let padding = [b' '; 1024 * 1024];
+        for _ in 0..65 {
+            file.write_all(&padding)?;
+        }
+        drop(file);
+        assert!(path.metadata()?.len() > 64 * 1024 * 1024);
+        let parsed = read_deepseek_v4_exl3_manifest(dir.path(), shape, &headers, &[])?;
+        assert_eq!(parsed.projections.len(), headers.len() / 4);
+        assert!(read_json(&path, MAX_MANIFEST_BYTES)?["tensor_storage"].is_object());
+
+        // A sparse oversized file exercises the ceiling without allocating its payload.
+        File::options().write(true).open(&path)?.set_len(MAX_MANIFEST_BYTES + 1)?;
+        let error = read_bytes(&path, MAX_MANIFEST_BYTES).unwrap_err();
+        assert!(error.to_string().contains("exceeds metadata size limit"));
+        assert!(read_json(&path, MAX_MANIFEST_BYTES)
+            .unwrap_err().to_string().contains("exceeds metadata size limit"));
+        Ok(())
     }
 
     #[test]
