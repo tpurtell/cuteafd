@@ -163,8 +163,8 @@ impl<'a> Engine<'a> {
                 Ok(())
             },
             links: || {
-                // #511: this single call site is drop-and-join until checked
-                // ordinary-lane QP quiescence and retention are implemented.
+                // #511: checked ordinary-lane QP quiescence; failure retains
+                // intake and library owners without entering copy/release phases.
                 for routed in &mut lanes.borrow_mut().routed { routed.quiesce_links()?; }
                 Ok(())
             },
