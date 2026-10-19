@@ -84,7 +84,7 @@ def device_is_integrated(cuda, device: int = 0) -> bool:
 
 
 def cuda_allocatable_memory_info(cuda, device: int | None = None, **host_paths) -> tuple[int, int, str]:
-    """Return free/total bytes and measure; UMA never calls mem_get_info."""
+    """Return device headroom; GB10 CUDA pages bypass the host-only memcg cap."""
     device = cuda.current_device() if device is None else device
     if not device_is_integrated(cuda, device):
         free, total = cuda.mem_get_info(device)
@@ -92,7 +92,9 @@ def cuda_allocatable_memory_info(cuda, device: int | None = None, **host_paths) 
     total = int(cuda.get_device_properties(device).total_memory)
     if total <= 0:
         raise ValueError('invalid integrated-device total memory')
-    return min(host_allocatable_memory(**host_paths), total), total, 'MemAvailable+cgroup'
+    # Keep cgroup bounds for host_allocatable_memory, not CUDA device admission.
+    meminfo = host_paths.get('meminfo', Path('/proc/meminfo'))
+    return min(mem_available_bytes(meminfo.read_text()), total), total, 'MemAvailable'
 
 
 if __name__ == '__main__':

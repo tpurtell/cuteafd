@@ -1,4 +1,4 @@
-"""UMA admission includes cache once and respects all visible cgroup limits."""
+"""UMA device admission uses MemAvailable; cgroup limits constrain host bytes."""
 import importlib.util
 from pathlib import Path
 from types import SimpleNamespace
@@ -37,7 +37,7 @@ def group(root, relative, limit, current, *, v1=False):
 
 def test_integrated_reclaims_cache_without_double_counting(host_paths):
     assert memory.cuda_allocatable_memory_info(device(True), **host_paths) == (
-        8 * 1024**2, 16 * 1024**2, 'MemAvailable+cgroup')
+        8 * 1024**2, 16 * 1024**2, 'MemAvailable')
 
 
 def test_integrated_headroom_bounded_by_device_total(host_paths):
@@ -56,7 +56,8 @@ def test_every_visible_ancestor_bounds_admission(host_paths, v1, limiting):
     root = host_paths['cgroup_root'] / 'memory' if v1 else host_paths['cgroup_root']
     for relative in ['parent/child', 'parent', '']:
         group(root, relative, 3000 if relative == limiting else 'max', 1000, v1=v1)
-    assert memory.cuda_allocatable_memory_info(device(True), **host_paths)[0] == 2000
+    assert memory.host_allocatable_memory(**host_paths) == 2000
+    assert memory.cuda_allocatable_memory_info(device(True), **host_paths)[0] == 8 * 1024**2
 
 
 @pytest.mark.parametrize('relative', ['/invisible/child', '/../../outside'])
