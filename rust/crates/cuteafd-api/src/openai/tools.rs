@@ -40,6 +40,8 @@ pub(super) enum ToolSyntax {
     /// Qwen3-Coder `<tool_call>\n<function=NAME>\n<parameter=KEY>\nVALUE\n</parameter>\n</function>\n</tool_call>`
     /// (XGrammar's `qwen_xml` style, as its `qwen_3_5` structural tag).
     QwenXml,
+    /// Kimi XTML; assisted decoding uses its native JSON-object call form.
+    KimiXtml,
 }
 
 pub(super) struct ToolConstraints {
@@ -69,6 +71,14 @@ impl ToolConstraints {
                 .with_context(|| format!("invalid parameters for tool {}", tool.name))?) } else { None };
             validators.insert(tool.name.clone(), validator);
             tags.push(match syntax {
+                ToolSyntax::KimiXtml => json!({"type":"tag",
+                    "begin":format!("<|open|>call tool=\"{}\" index=\"", tool.name.replace('&', "&amp;").replace('"', "&quot;")),
+                    "content":{"type":"sequence", "elements":[
+                        {"type":"regex", "pattern":"[1-9][0-9]*"},
+                        {"type":"const_string", "value":"\"<|sep|><|open|>json type=\"object\"<|sep|>"},
+                        {"type":"ds41_json_schema", "strict":strict, "json_schema":schema},
+                        {"type":"const_string", "value":"<|close|>json<|sep|>"}]},
+                    "end":"<|close|>call<|sep|>"}),
                 ToolSyntax::Dsml => json!({"type":"tag", "begin":format!("<｜DSML｜ invoke name=\"{}\">", tool.name),
                     "content":{"type":"ds41_tool_schema", "strict":strict, "json_schema":schema},
                     "end":"</｜DSML｜ invoke>"}),
@@ -91,6 +101,14 @@ impl ToolConstraints {
             return Ok(Some(Self { required, format: None, triggered: None, parallel, validators }));
         }
         let (format, triggered) = match syntax {
+            ToolSyntax::KimiXtml => {
+                let calls = json!({"type":"tag", "begin":"<|open|>tools<|sep|>",
+                    "content":{"type":"tags_with_separator", "tags":tags, "separator":"",
+                        "at_least_one":true, "stop_after_first":!parallel},
+                    "end":"<|close|>tools<|sep|>"});
+                // XTML response composition owns the optional/required branch.
+                (calls.clone(), calls)
+            }
             ToolSyntax::Dsml => {
                 let calls = json!({"type":"tag",
                     "begin":"<｜DSML｜ calls>",
@@ -183,7 +201,7 @@ impl CompletionValidator {
 
 // serde_json::Value normally keeps the last duplicate property. Reject duplicates
 // recursively, including escaped aliases, before validating argument schemas.
-fn unique_json(text: &str) -> Result<Value> {
+pub(super) fn unique_json(text: &str) -> Result<Value> {
     use serde::de::{self, Deserialize, Deserializer, MapAccess, SeqAccess, Visitor};
     struct Unique(Value);
     struct UniqueVisitor;

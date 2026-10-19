@@ -91,7 +91,7 @@ pub(crate) fn system_placement(profile: &ModelProfile) -> SystemPlacement {
             tool_names: Vec::new(), tool_choice: super::qwen4::prompt::QwenToolChoice::Auto, response_format: None }).is_err(),
         ModelEncoding::Glm(encoding) => encoding.render(&body, &super::glm5::GlmPromptOptions { thinking: false,
             reasoning_effort: None, tool_names: Vec::new(), tool_choice: super::glm5::GlmToolChoice::Auto, response_format: None }).is_err(),
-        ModelEncoding::DeepseekV4 | ModelEncoding::DeepseekV41 => false,
+        ModelEncoding::DeepseekV4 | ModelEncoding::DeepseekV41 | ModelEncoding::Kimi(_) => false,
     };
     if rejects { SystemPlacement::FirstOnly } else { SystemPlacement::Anywhere }
 }

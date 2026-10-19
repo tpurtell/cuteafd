@@ -47,6 +47,34 @@ pub(super) fn response_constraint(format: Option<Value>, thinking: bool, tools: 
     Ok(Some(NativeConstraint(serde_json::to_string(&json!({"type":"structural_tag", "format":format}))?)))
 }
 
+/// XTML starts inside think/response. Match the entire multi-token channel
+/// boundary as a string; `<|close|>` alone also closes arguments and calls.
+pub(super) fn kimi_response_constraint(format: Option<Value>, thinking: bool,
+    tools: Option<&super::tools::ToolConstraints>) -> Result<Option<NativeConstraint>> {
+    let answer = response_constraint(format, false, None, 0)?
+        .map(|constraint| serde_json::from_str::<Value>(&constraint.0).map(|mut v| v["format"].take()))
+        .transpose()?;
+    let tools = tools.filter(|tools| tools.format.is_some());
+    if answer.is_none() && tools.is_none() { return Ok(None); }
+    let close_response = "<|close|>response<|sep|>";
+    let response = answer.clone().unwrap_or_else(|| json!({"type":"any_text", "excludes":[close_response]}));
+    let text = |value: &str| json!({"type":"const_string", "value":value});
+    let plain = json!({"type":"sequence", "elements":[response, text(close_response)]});
+    let body = if let Some(tools) = tools {
+        let call_response = json!({"type":"any_text", "excludes":[close_response]});
+        let calls = json!({"type":"sequence", "elements":[call_response, text(close_response), tools.format]});
+        if tools.required { calls } else { json!({"type":"or", "elements":[plain, calls]}) }
+    } else { plain };
+    let wire = if thinking {
+        let begin = "<|close|>think<|sep|><|open|>response<|sep|>";
+        // Required triggered_tags starts at its tag, not at preceding free text.
+        json!({"type":"sequence", "elements":[
+            {"type":"any_text", "excludes":["<|close|>think<|sep|>"]},
+            {"type":"tag", "begin":begin, "content":body, "end":"<|close|>message<|sep|>"}]})
+    } else { json!({"type":"sequence", "elements":[body, text("<|close|>message<|sep|>")]}) };
+    Ok(Some(NativeConstraint(json!({"type":"structural_tag", "format":wire}).to_string())))
+}
+
 pub(super) fn response_validator(format: Option<&Value>) -> Result<Option<jsonschema::JSONSchema>> {
     let Some(format) = format else { return Ok(None); };
     let schema = match format.get("type").and_then(Value::as_str) {
