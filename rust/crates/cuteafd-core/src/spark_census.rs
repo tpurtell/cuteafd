@@ -63,8 +63,8 @@ pub fn spark_census_deltas(samples: &[SparkProcessSample]) -> Result<SparkCensus
             }
         };
         let available = growth(before.system_available_bytes, after.system_available_bytes)?;
-        // Unified CUDA allocations reclaim file cache. Cgroup headroom remains
-        // an admission constraint, not an independent residency witness.
+        // Unified CUDA allocations reclaim file cache and bypass memcg. Cgroup
+        // headroom constrains host bytes, not device admission or residency.
         if witness == SystemAvailable { return Ok(available); }
         let bounded = growth(before.system_headroom_bytes, after.system_headroom_bytes)?;
         if available.abs_diff(bounded) > available / 20 {

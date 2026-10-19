@@ -197,6 +197,90 @@ pub fn derive_storage_map<'a>(
     Ok(map)
 }
 
+/// Keep compact configuration fields, streaming the per-tensor map instead of
+/// retaining its million-node JSON tree. When supplied, headers remain the authority.
+pub(crate) fn read_storage_metadata(path: &std::path::Path, limit: u64,
+    derived: Option<&Exl3StorageMap>) -> anyhow::Result<Value> {
+    use anyhow::{ensure, Context};
+    use serde::de::{DeserializeSeed, IgnoredAny, MapAccess, Visitor, Error};
+    use std::io::Read;
+    struct Storage<'a> { file: &'a str, derived: &'a Exl3StorageMap }
+    impl<'de> DeserializeSeed<'de> for Storage<'_> {
+        type Value = ();
+        fn deserialize<D: serde::Deserializer<'de>>(self, de: D) -> Result<(), D::Error> {
+            de.deserialize_map(self)
+        }
+    }
+    impl<'de> Visitor<'de> for Storage<'_> {
+        type Value = ();
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result { f.write_str("EXL3 tensor_storage map") }
+        fn visit_map<M: MapAccess<'de>>(self, mut map: M) -> Result<(), M::Error> {
+            let mut seen = std::collections::BTreeSet::new();
+            let mut entries = 0;
+            while let Some(name) = map.next_key::<String>()? {
+                let entry: Value = map.next_value()?;
+                entries += 1;
+                let declared = parse_storage_map(self.file, &serde_json::json!({&name: entry}))
+                    .map_err(M::Error::custom)?;
+                if let Some(value) = declared.get(&name) {
+                    let Some((key, actual)) = self.derived.get_key_value(&name) else {
+                        return Err(M::Error::custom(format!("{} disagrees with the safetensors headers at {name}: the map lists this module; the checkpoint has no such EXL3 tensors", self.file)));
+                    };
+                    if !seen.insert(key.as_str()) { return Err(M::Error::custom(format!("duplicate EXL3 module {name}"))); }
+                    if value != actual {
+                        return Err(M::Error::custom(format!("{} disagrees with the safetensors headers at {name}: map {}, headers {}",
+                            self.file, describe_module(value), describe_module(actual))));
+                    }
+                }
+            }
+            if entries == 0 { return Err(M::Error::custom("tensor_storage missing or empty")); }
+            if let Some(name) = self.derived.keys().find(|name| !seen.contains(name.as_str())) {
+                return Err(M::Error::custom(format!("{} disagrees with the safetensors headers at {name}: the checkpoint stores this EXL3 module; the map does not list it", self.file)));
+            }
+            Ok(())
+        }
+    }
+    struct Metadata<'a> { file: &'a str, derived: Option<&'a Exl3StorageMap> }
+    impl<'de> Visitor<'de> for Metadata<'_> {
+        type Value = Value;
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result { f.write_str("quantization metadata object") }
+        fn visit_map<M: MapAccess<'de>>(self, mut map: M) -> Result<Value, M::Error> {
+            let mut fields = serde_json::Map::new();
+            let mut storage = false;
+            while let Some(key) = map.next_key::<String>()? {
+                if key == "tensor_storage" {
+                    if storage { return Err(M::Error::custom("duplicate tensor_storage")); }
+                    storage = true;
+                    if let Some(derived) = self.derived {
+                        map.next_value_seed(Storage { file: self.file, derived })?;
+                        fields.insert(key, Value::Bool(true));
+                    } else { map.next_value::<IgnoredAny>()?; }
+                } else {
+                    let value = map.next_value()?;
+                    if fields.insert(key.clone(), value).is_some() {
+                        return Err(M::Error::custom(format!("duplicate metadata key {key}")));
+                    }
+                }
+            }
+            if self.derived.is_some() && !storage { return Err(M::Error::custom("missing tensor_storage")); }
+            Ok(Value::Object(fields))
+        }
+    }
+    let file = std::fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
+    let size = file.metadata()?.len();
+    ensure!(size <= limit, "{} exceeds metadata size limit", path.display());
+    // Slice parsing avoids serde_json's per-byte Read adapter; no JSON tree is retained.
+    let mut bytes = Vec::with_capacity(usize::try_from(size)?.checked_add(1).context("metadata size overflow")?);
+    file.take(limit.checked_add(1).context("metadata limit overflow")?).read_to_end(&mut bytes)?;
+    ensure!(bytes.len() as u64 <= limit, "{} exceeds metadata size limit", path.display());
+    let mut de = serde_json::Deserializer::from_slice(&bytes);
+    let label = path.file_name().and_then(|s| s.to_str()).unwrap_or("metadata");
+    let result = serde::Deserializer::deserialize_map(&mut de, Metadata { file: label, derived })
+        .with_context(|| format!("parsing {}", path.display()))?;
+    de.end()?;
+    Ok(result)
+}
+
 fn dtype_from_map(value: &str) -> Option<DType> {
     Some(match value.strip_prefix("torch.").unwrap_or(value) {
         "int16" => DType::I16,
@@ -380,6 +464,34 @@ mod tests {
             header(&format!("{stem}.svh"), DType::F16, &[n]),
             header(&format!("{stem}.mcg"), DType::I32, mcg),
         ]
+    }
+
+    #[test]
+    fn streaming_metadata_checks_each_module_and_keeps_only_compact_fields() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("quantize_config.json");
+        let derived = derive_storage_map(&projection("m.up_proj", 256, 512, 4, &[1])).unwrap();
+        let document = serde_json::json!({"quant_method": "exl3", "bits": 4,
+            "tensor_storage": {"m.up_proj": gptqmodel_entry("m.up_proj", 4, 512, 256, serde_json::json!([1]))}});
+        std::fs::write(&path, serde_json::to_vec(&document).unwrap()).unwrap();
+        let compact = read_storage_metadata(&path, 1 << 20, None).unwrap();
+        assert_eq!(compact, serde_json::json!({"quant_method": "exl3", "bits": 4}));
+        let checked = read_storage_metadata(&path, 1 << 20, Some(&derived)).unwrap();
+        assert_eq!(checked["tensor_storage"], true);
+        assert!(read_storage_metadata(&path, 4, None).is_err());
+        for bad in [
+            serde_json::json!({"tensor_storage": {}}),
+            serde_json::json!({"quant_method": "exl3"}),
+            serde_json::json!({"tensor_storage": {"m.up_proj": gptqmodel_entry("m.up_proj", 3, 512, 256, serde_json::json!([1]))}}),
+            serde_json::json!({"tensor_storage": {"m.extra": gptqmodel_entry("m.extra", 4, 512, 256, serde_json::json!([1]))}}),
+        ] {
+            std::fs::write(&path, serde_json::to_vec(&bad).unwrap()).unwrap();
+            assert!(read_storage_metadata(&path, 1 << 20, Some(&derived)).is_err());
+        }
+        for bad in ["{\"bits\":4,\"bits\":3}", "{\"tensor_storage\":{},\"tensor_storage\":{}}", "{} trailing"] {
+            std::fs::write(&path, bad).unwrap();
+            assert!(read_storage_metadata(&path, 1 << 20, None).is_err());
+        }
     }
 
     #[test]

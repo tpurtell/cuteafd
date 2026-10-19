@@ -60,7 +60,7 @@ pub struct Checkpoint {
     pub snapshot: PathBuf,
     /// `config.json`, verbatim.
     pub config: Value,
-    /// Standard external quantization metadata (including ModelOpt's HF export), when present.
+    /// Standard external quantization metadata, without the separately validated tensor_storage map.
     pub quantize_config: Option<Value>,
     /// Authoritative inventory, including tensors whose shards are not local.
     pub weight_map: BTreeMap<String, String>,
@@ -140,18 +140,18 @@ impl Checkpoint {
             .iter()
             .map(|name| snapshot.join(name))
             .find(|path| path.is_file())
-            .map(|path| read_json(&path))
+            .map(|path| crate::formats::exl3_storage::read_storage_metadata(&path, MAX_JSON_BYTES, None))
             .transpose()?;
         let index_path = snapshot.join("model.safetensors.index.json");
         let weight_map: BTreeMap<String, String> = if index_path.is_file() {
-            let index = read_json(&index_path)?;
-            serde_json::from_value(
-                index
-                    .get("weight_map")
-                    .cloned()
-                    .context("index has no weight_map")?,
-            )
-            .context("decoding weight_map")?
+            #[derive(serde::Deserialize)]
+            struct Index { weight_map: BTreeMap<String, String> }
+            let file = File::open(&index_path)?;
+            ensure!(file.metadata()?.len() <= MAX_JSON_BYTES, "index exceeds metadata size limit");
+            let mut input = std::io::BufReader::new(file).take(MAX_JSON_BYTES + 1);
+            let index: Index = serde_json::from_reader(&mut input).context("decoding weight_map")?;
+            ensure!(MAX_JSON_BYTES + 1 - input.limit() <= MAX_JSON_BYTES, "index exceeds metadata size limit");
+            index.weight_map
         } else {
             let single = snapshot.join("model.safetensors");
             ensure!(

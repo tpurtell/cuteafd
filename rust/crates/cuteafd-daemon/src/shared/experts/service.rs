@@ -131,6 +131,8 @@ fn load_weights<'a>(
     ensure!(layers.iter().all(|&layer| layer >= first),
         "coordinator selected experts before this checkpoint's routed boundary {first}");
     validate_topology(config, catalog)?;
+    // Release metadata temporaries after the final topology recheck, before admission.
+    cuteafd_ffi::trim_startup_metadata();
     if catalog.format() == cuteafd_loader::plan::checkpoint::CheckpointFormat::Exlr8 {
         return exlr8::load(library, catalog, config, modules.exlr8()?);
     }
@@ -558,6 +560,46 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "CPU-only isolated metadata startup RSS; requires CUTEAFD_KIMI_EXL3_SNAPSHOT"]
+    fn mounted_worker_metadata_host_rss() -> Result<()> {
+        let snapshot = PathBuf::from(std::env::var_os("CUTEAFD_KIMI_EXL3_SNAPSHOT").context("checkpoint")?);
+        let sample = |phase: &str| -> Result<(usize, usize)> {
+            let status = std::fs::read_to_string("/proc/self/status")?;
+            let value = |key| -> Result<usize> {
+                Ok(status.lines().find_map(|line| line.strip_prefix(key)).context("missing RSS")?
+                    .split_whitespace().next().context("empty RSS")?.parse::<usize>()? * 1024)
+            };
+            let (rss, peak) = (value("VmRSS:")?, value("VmHWM:")?);
+            eprintln!("worker metadata CPU RSS: phase={phase} rss={rss} peak={peak}");
+            Ok((rss, peak))
+        };
+        sample("start")?;
+        let inventory = cuteafd_loader::plan::Checkpoint::inventory(&snapshot)?;
+        sample("inventory")?;
+        let mut catalog = cuteafd_loader::read_expert_catalog(&snapshot)?;
+        catalog.select_draft(cuteafd_loader::plan::spec::DraftOwnership::None)?;
+        let geometry = catalog.routed_experts().geometry()?;
+        cuteafd_core::set_expert_geometry(geometry).map_err(|_| anyhow::anyhow!("run alone"))?;
+        drop(inventory);
+        sample("catalog_before_native")?;
+        let _identity = cuteafd_transport::worker_selection::WorkerIdentity::from_snapshot(&snapshot,
+            geometry, SparkWorld::canonical(6)?)?;
+        sample("identity")?;
+        let mut worker = config(6, 0, None);
+        worker.snapshot = snapshot;
+        worker.selected_layers = Some((6..93).collect());
+        validate_topology(&worker, &catalog)?;
+        sample("topology")?;
+        // Worker selection validates once; load_weights validates again immediately before trimming.
+        validate_topology(&worker, &catalog)?;
+        cuteafd_ffi::trim_startup_metadata();
+        let (rss, peak) = sample("startup_complete_trimmed")?;
+        ensure!(peak < 2usize << 30, "worker metadata peak exceeds 2 GiB: {peak}");
+        ensure!(rss < 512usize << 20, "retained worker metadata exceeds 512 MiB: {rss}");
+        Ok(())
+    }
+
+    #[test]
     #[ignore = "CPU-only mounted Kimi checkpoint/package planning; run alone with CUTEAFD_KIMI_EXL3_SNAPSHOT and CUTEAFD_KIMI_SPARK_PACKAGE"]
     fn mounted_kimi_all_spark_golden_demand() -> Result<()> {
         use crate::shared::experts::exl3::{Exl3Weights, worker::Exl3Worker};
@@ -568,6 +610,8 @@ mod tests {
         let mut catalog = cuteafd_loader::read_expert_catalog(&snapshot)?;
         catalog.select_draft(cuteafd_loader::plan::spec::DraftOwnership::None)?;
         let available = std::env::var("CUTEAFD_KIMI_MIN_AVAILABLE").ok().map(|s| s.parse::<usize>()).transpose()?;
+        let measured_host = std::env::var("CUTEAFD_KIMI_MEASURED_HOST_BYTES").ok()
+            .map(|s| s.parse::<usize>()).transpose()?;
         let mut minimum_onboard = None;
         for onboard in 0..=6 {
             let layers = (1 + onboard..93).collect::<Vec<_>>();
@@ -595,11 +639,19 @@ mod tests {
                         scratch = scratch.max(plan.read_scratch_bytes);
                     }
                     let peak = spark_admission_budget(&worker, resident, staging, pinned, scratch, workspace)?;
-                    worst_peak = worst_peak.max(peak.serve_peak.max(peak.load_peak));
+                    let planned_peak = peak.serve_peak.max(peak.load_peak);
+                    let measured_host_peak = if let Some(host) = measured_host {
+                        planned_peak.checked_sub(peak.headroom).and_then(|bytes| bytes.checked_add(host))
+                            .context("measured host forecast overflow")?
+                    } else { planned_peak };
+                    worst_peak = worst_peak.max(measured_host_peak);
                     eprintln!("Kimi CPU golden demand: onboard={onboard} rank={rank} rows={capacity} layers={} resident={resident} workspace={workspace} exchange={} indices={} rings={} estimated_runtime={} load_peak={} serve_peak={} staging={staging} pinned={pinned} read_scratch={scratch}",
                         layers.len(), peak.exchange, peak.row_indices, peak.rings, peak.headroom, peak.load_peak, peak.serve_peak);
                     assert!(peak.serve_peak >= resident + workspace && peak.load_peak >= resident);
                 }
+            }
+            if let Some(host) = measured_host {
+                eprintln!("Kimi CPU measured-host forecast: onboard={onboard} host_bytes={host} worst_peak={worst_peak}");
             }
             if let Some(available) = available {
                 let fits = worst_peak.checked_add(4usize << 30).is_some_and(|required| required <= available);

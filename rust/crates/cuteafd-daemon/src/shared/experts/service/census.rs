@@ -60,7 +60,7 @@ impl Census {
             tracked_device_bytes: ledger.total(Space::Device, device) as u64,
             tracked_pinned_bytes: ledger.total(Space::Pinned, -1) as u64,
             raw_cuda_free_bytes: library.and_then(|l| l.cuda_physical_memory_info().ok()).map(|(free, _)| free as u64),
-            method: "same_pid_status VmHWM and raw memory-cgroup current/peak/max (lifetime peaks, not isolated attribution); same_pid_smaps (CUDA device mapping PSS, anonymous PSS, file PSS); MemAvailable residency witness; cgroup-bounded headroom is an admission constraint only on unified devices; raw CUDA diagnostic only; device witness explicitly selected by integrated/discrete property; host-only maps/system agreement; quiet-host qualification external".into() });
+            method: "same_pid_status VmHWM and raw memory-cgroup current/peak/max (lifetime peaks, not isolated attribution); same_pid_smaps (CUDA device mapping PSS, anonymous PSS, file PSS); MemAvailable residency witness; cgroup-bounded headroom constrains host-charged bytes only; GB10 device admission uses MemAvailable; raw CUDA diagnostic only; device witness explicitly selected by integrated/discrete property; host-only maps/system agreement; quiet-host qualification external".into() });
         tracing::info!(target: "cuteafd::spark_memory", record = %serde_json::to_string(self.samples.last().unwrap())?,
             "Spark process census");
         Ok(())

@@ -1434,6 +1434,40 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "CPU-only isolated startup RSS trace; requires CUTEAFD_KIMI_EXL3_SNAPSHOT"]
+    fn mounted_expert_startup_host_rss() -> Result<()> {
+        let snapshot = std::env::var_os("CUTEAFD_KIMI_EXL3_SNAPSHOT").context("checkpoint required")?;
+        let snapshot = Path::new(&snapshot);
+        let sample = |phase: &str| -> Result<()> {
+            let status = std::fs::read_to_string("/proc/self/status")?;
+            let fields = status.lines().filter(|line| line.starts_with("VmRSS:") || line.starts_with("VmHWM:"))
+                .collect::<Vec<_>>().join(" ");
+            eprintln!("expert startup CPU RSS: phase={phase} {fields}");
+            Ok(())
+        };
+        sample("start")?;
+        // Mirror the shared worker's host-only startup, stopping before native load.
+        let inventory = crate::plan::Checkpoint::inventory(snapshot)?;
+        sample("inventory")?;
+        let catalog = read_expert_catalog(snapshot)?;
+        sample("catalog_before_native")?;
+        let identity = crate::plan::checkpoint::identity::CheckpointIdentity::from_snapshot(snapshot, None)?;
+        assert!(!identity.fingerprint.is_empty());
+        sample("identity")?;
+        let status = std::fs::read_to_string("/proc/self/status")?;
+        let peak_kib: u64 = status.lines().find_map(|line| line.strip_prefix("VmHWM:"))
+            .context("peak RSS unavailable")?.split_whitespace().next().context("peak RSS empty")?.parse()?;
+        ensure!(peak_kib < 1536 * 1024, "metadata startup exceeded 1.5 GiB peak: {peak_kib} KiB");
+        assert_eq!(catalog.routed_experts().geometry()?.family(), Some("kimik3"));
+        assert!(inventory.weight_map.len() > 900_000);
+        drop(inventory);
+        sample("inventory_dropped")?;
+        drop(catalog);
+        sample("catalog_dropped")?;
+        Ok(())
+    }
+
+    #[test]
     #[ignore = "requires CUTEAFD_KIMI_EXL3_SNAPSHOT; reads headers and metadata, not weight payloads"]
     fn mounted_kimi_exl3_catalog_and_six_rank_residency() -> Result<()> {
         let snapshot = std::env::var_os("CUTEAFD_KIMI_EXL3_SNAPSHOT").context("Kimi snapshot not set")?;

@@ -182,6 +182,7 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
     cuteafd_core::set_expert_geometry(geometry).map_err(|fixed| {
         anyhow::anyhow!("expert geometry is already {fixed:?}; the checkpoint needs {geometry:?}")
     })?;
+    drop(inventory);
     let mut census = super::census::Census::new();
     census.sample("before_native_library", None)?;
     // SAFETY: this owner outlives media, weights, retained modules and executions.

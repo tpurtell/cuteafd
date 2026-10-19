@@ -1,6 +1,6 @@
 //! Validated routed-only EXL3 metadata for the native V4.1 engine.
 use crate::formats::exl3_storage::{
-    check_quantization_config, derive_storage_map, mcg_marker_shape, parse_storage_map, verify_storage_map,
+    check_quantization_config, derive_storage_map, mcg_marker_shape,
     Exl3Module, Exl3StorageMap, Exl3StorageSource,
 };
 use crate::{OfficialV41Config, SafetensorsTensorMetadata};
@@ -505,18 +505,11 @@ pub(crate) fn read_deepseek_v4_exl3_manifest<'a>(
 fn check_storage_maps(snapshot: &Path, config: &Value, derived: &Exl3StorageMap) -> Result<Exl3StorageSource> {
     let compact = config.get("quantization_config").context("config.json has no quantization_config")?;
     let mut source = None;
-    let mut first: Option<Vec<u8>> = None;
     for file in ["quantize_config.json", "quantization_config.json"] {
         let path = snapshot.join(file);
-        if !path.is_file() {
-            continue;
-        }
-        let bytes = read_bytes(&path, MAX_MANIFEST_BYTES)?;
-        if first.as_ref().is_some_and(|first| *first == bytes) {
-            continue;
-        }
-        let mut manifest: Value =
-            serde_json::from_slice(&bytes).with_context(|| format!("parsing {}", path.display()))?;
+        if !path.is_file() { continue; }
+        let mut manifest = crate::formats::exl3_storage::read_storage_metadata(
+            &path, MAX_MANIFEST_BYTES, Some(derived))?;
         normalize_legacy_names(&mut manifest);
         let flavor = if manifest.get("checkpoint_format").is_some() {
             check_gptqmodel_manifest(compact, &manifest).with_context(|| format!("checking {file}"))?;
@@ -525,10 +518,7 @@ fn check_storage_maps(snapshot: &Path, config: &Value, derived: &Exl3StorageMap)
             check_exllamav3_manifest(compact, &manifest).with_context(|| format!("checking {file}"))?;
             Exl3StorageSource::Exllamav3
         };
-        let declared = parse_storage_map(file, &manifest["tensor_storage"])?;
-        verify_storage_map(file, &declared, derived)?;
         source.get_or_insert(flavor);
-        first.get_or_insert(bytes);
     }
     match source {
         Some(source) => Ok(source),
@@ -1206,7 +1196,7 @@ mod tests {
         // The checkpoint's markers are [1]; the map says [].
         let (_, _, _, vector) = deepseek_v4_publication_with(|_| 2, &[1]);
         let error = format!("{:#}", read_publication(&config, &maps, shape, &vector, &[]).unwrap_err());
-        assert!(error.contains("quantize_config.json disagrees with the safetensors headers at model.layers.0.mlp.experts.0.down_proj")
+        assert!(error.contains("quantize_config.json disagrees with the safetensors headers at model.layers.0.mlp.experts.0.")
             && error.contains("mcg i32 []") && error.contains("mcg i32 [1]"), "{error}");
         // One projection quantized at K3 in the checkpoint, K2 in the map.
         let target = "model.layers.1.mlp.experts.2.up_proj";
