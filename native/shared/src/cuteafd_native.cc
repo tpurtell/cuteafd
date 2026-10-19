@@ -3709,10 +3709,17 @@ namespace {
 cuteafd_status_t register_device_dmabuf_current(ibv_pd* pd, void* ptr, size_t bytes, ibv_mr** out,
                                                 int access);
 
+// Keep the receive-only ordering experiment separate from host MRs and flag writes.
+int device_receive_access() {
+  const char* value = std::getenv("CUTEAFD_DIAG_LANDING_NO_RELAXED_ORDERING");
+  return IBV_ACCESS_LOCAL_WRITE |
+      (value && std::strcmp(value, "1") == 0 ? 0 : IBV_ACCESS_RELAXED_ORDERING);
+}
+
 // The export needs the owning device's context current; sessions may connect
 // on a thread (a prefill lane) that never selected it.
 cuteafd_status_t register_device_dmabuf(ibv_pd* pd, void* ptr, size_t bytes, ibv_mr** out,
-                                        int access = IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_RELAXED_ORDERING) {
+                                        int access) {
   int ordinal = -1;
   if (cuPointerGetAttribute(&ordinal, CU_POINTER_ATTRIBUTE_DEVICE_ORDINAL,
                             reinterpret_cast<CUdeviceptr>(ptr)) != CUDA_SUCCESS || ordinal < 0) {
@@ -3789,7 +3796,8 @@ extern "C" cuteafd_status_t cuteafd_rdma_rc_endpoint_set_recv_landing(
     return fail(CUTEAFD_STATUS_INVALID_ARGUMENT, "GPU landing extent is invalid");
   }
   ibv_mr* mr = nullptr;
-  const cuteafd_status_t status = register_device_dmabuf(endpoint->pd, device_ptr, bytes, &mr);
+  const cuteafd_status_t status = register_device_dmabuf(endpoint->pd, device_ptr, bytes, &mr,
+                                                         device_receive_access());
   if (status != CUTEAFD_STATUS_OK) {
     return status;
   }
@@ -3998,7 +4006,8 @@ extern "C" cuteafd_status_t cuteafd_rdma_gpu_landing_probe(
       cudaHostAlloc(reinterpret_cast<void**>(&recv), frame, cudaHostAllocPortable) != cudaSuccess) {
     return bail(CUTEAFD_STATUS_ALLOCATION_FAILED, "GPU landing probe allocation failed");
   }
-  const cuteafd_status_t registered = register_device_dmabuf(pd, gpu, bytes, &gpu_mr);
+  const cuteafd_status_t registered = register_device_dmabuf(pd, gpu, bytes, &gpu_mr,
+                                                             device_receive_access());
   if (registered != CUTEAFD_STATUS_OK) {
     const std::string message = g_last_error;
     return bail(registered, message);
