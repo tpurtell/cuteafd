@@ -568,13 +568,27 @@ pub(crate) fn layer_pipeline<K: PipelineKernels>(scope: &crate::shared::experts:
 pub(crate) fn layer_pipeline_lanes<K: PipelineKernels>(scope: &crate::shared::experts::rtx::pair::SubmissionScope<'_>,
     plan: &LayerExecutionPlan, instances: &[(&PeerExchange<'_>, &HopLink<'_>)],
     order: LaneOrder, rows: &[usize], kernels: &mut [K]) -> Result<()> {
-    let exchanges = instances.iter().enumerate().map(|(lane, &(peer, hops))| {
+    let lanes: Vec<_> = (0..kernels.len()).collect();
+    layer_pipeline_selected(scope, plan, instances, &lanes, order, rows, kernels)
+}
+
+/// Submit an active subset without renumbering its admitted transport slots.
+pub(crate) fn layer_pipeline_selected<K: PipelineKernels>(scope: &crate::shared::experts::rtx::pair::SubmissionScope<'_>,
+    plan: &LayerExecutionPlan, instances: &[(&PeerExchange<'_>, &HopLink<'_>)], lanes: &[usize],
+    order: LaneOrder, rows: &[usize], kernels: &mut [K]) -> Result<()> {
+    validate_pipeline_selection(plan, lanes, rows, kernels.len())?;
+    ensure!(instances.len() == 1 || instances.len() == kernels.len(),
+        "layer pipeline needs one shared exchange or one instance per lane");
+    let exchanges = instances.iter().map(|&(peer, hops)| {
         hops.validate_binding(plan, peer)?;
-        hops.validate_dispatch(lane, instances.len() == 1)?;
         Ok(LayerExchange { peer, hops })
     }).collect::<Result<Vec<_>>>()?;
+    for (index, &lane) in lanes.iter().enumerate() {
+        let instance = if instances.len() == 1 { 0 } else { index };
+        instances[instance].1.validate_dispatch(lane, instances.len() == 1 && lanes.len() > 1)?;
+    }
     let exchanges: Vec<_> = exchanges.iter().collect();
-    layer_pipeline_instances(scope, plan, &exchanges, order, rows, kernels)
+    layer_pipeline_selected_instances(scope, plan, &exchanges, lanes, order, rows, kernels)
 }
 
 fn pipeline_hops(exchange: &impl LayerProtocol, plan: &LayerExecutionPlan, point: HopPoint,
@@ -622,12 +636,29 @@ fn pipeline_instance<'e, P>(instances: &[&'e P], lane: usize) -> Result<&'e P> {
 fn layer_pipeline_instances<K: PipelineKernels>(_scope: &crate::shared::experts::rtx::pair::SubmissionScope<'_>,
     plan: &LayerExecutionPlan, exchanges: &[&impl LayerProtocol],
     order: LaneOrder, rows: &[usize], kernels: &mut [K]) -> Result<()> {
+    let lanes: Vec<_> = (0..kernels.len()).collect();
+    layer_pipeline_selected_instances(_scope, plan, exchanges, &lanes, order, rows, kernels)
+}
+
+fn validate_pipeline_selection(plan: &LayerExecutionPlan, lanes: &[usize], rows: &[usize], count: usize) -> Result<()> {
     cuteafd_loader::placement::validate_layer_pipeline_lanes(plan.spec().lanes,
         usize::try_from(plan.spec().lanes)?)?;
-    ensure!(!kernels.is_empty() && kernels.len() == rows.len()
-        && kernels.len() as u64 <= plan.spec().lanes, "layer pipeline needs one or two admitted lanes");
+    ensure!(!lanes.is_empty() && lanes.len() == count && lanes.len() == rows.len()
+        && lanes.len() as u64 <= plan.spec().lanes, "layer pipeline needs one or two admitted lanes");
+    ensure!(lanes.iter().enumerate().all(|(index, &lane)| (lane as u64) < plan.spec().lanes
+        && !lanes[..index].contains(&lane)), "layer pipeline duplicate or unadmitted lane");
     ensure!(rows.iter().all(|&rows| rows > 0 && rows as u64 <= plan.spec().rows),
         "layer pipeline rows outside admission");
+    Ok(())
+}
+
+/// Generic protocols retain admitted lane IDs, including single-device instances.
+/// Callers own protocol binding; selection, state owners and hop inventory are
+/// validated by the same pipeline used by peer-backed instances.
+pub(crate) fn layer_pipeline_selected_instances<K: PipelineKernels>(_scope: &crate::shared::experts::rtx::pair::SubmissionScope<'_>,
+    plan: &LayerExecutionPlan, exchanges: &[&impl LayerProtocol], lanes: &[usize],
+    order: LaneOrder, rows: &[usize], kernels: &mut [K]) -> Result<()> {
+    validate_pipeline_selection(plan, lanes, rows, kernels.len())?;
     ensure!(exchanges.len() == 1 || exchanges.len() == kernels.len(),
         "layer pipeline needs one shared exchange or one instance per lane");
     for exchange in exchanges { exchange.require_live()?; }
@@ -650,7 +681,7 @@ fn layer_pipeline_instances<K: PipelineKernels>(_scope: &crate::shared::experts:
             for layer in 0..count {
                 for lane in 0..kernels.len() {
                     let exchange = pipeline_instance(exchanges, lane)?;
-                    let owner = pipeline_attention(exchange, plan, layer, lane, rows[lane], &mut kernels[lane], &mut consumed[lane])?;
+                    let owner = pipeline_attention(exchange, plan, layer, lanes[lane], rows[lane], &mut kernels[lane], &mut consumed[lane])?;
                     let ticket = kernels[lane].begin_ffn(layer, owner)?;
                     exchange.require_live()?;
                     kernels[lane].finish_ffn(layer, ticket)?;
@@ -666,7 +697,7 @@ fn layer_pipeline_instances<K: PipelineKernels>(_scope: &crate::shared::experts:
                 for lane in 0..kernels.len() {
                     let Some(layer) = wave.checked_sub(lane).filter(|&layer| layer < count) else { continue };
                     let exchange = pipeline_instance(exchanges, lane)?;
-                    let owner = pipeline_attention(exchange, plan, layer, lane, rows[lane], &mut kernels[lane], &mut consumed[lane])?;
+                    let owner = pipeline_attention(exchange, plan, layer, lanes[lane], rows[lane], &mut kernels[lane], &mut consumed[lane])?;
                     pending.push((lane, layer, kernels[lane].begin_ffn(layer, owner)?));
                 }
                 for (lane, layer, ticket) in pending {
@@ -678,7 +709,7 @@ fn layer_pipeline_instances<K: PipelineKernels>(_scope: &crate::shared::experts:
     }
     for lane in 0..kernels.len() {
         let exchange = pipeline_instance(exchanges, lane)?;
-        pipeline_hops(exchange, plan, HopPoint::Exit, lane, rows[lane], &mut kernels[lane], &mut consumed[lane])?;
+        pipeline_hops(exchange, plan, HopPoint::Exit, lanes[lane], rows[lane], &mut kernels[lane], &mut consumed[lane])?;
     }
     validate_hop_inventory(plan, &consumed)
 }
@@ -1357,6 +1388,92 @@ mod tests {
             assert!(std::ptr::eq(pipeline_instance(&exchanges, 1).unwrap(), &traces[1]));
             assert!(std::ptr::eq(pipeline_instance(&exchanges[..1], 1).unwrap(), &traces[0]));
             assert!(pipeline_instance(&exchanges, 2).is_err());
+        }
+    }
+
+    #[test]
+    fn selected_pipeline_preserves_lane_ids_for_subsets_reordering_and_unequal_rows() {
+        use crate::shared::experts::rtx::pair::submit_scoped;
+        let plan = execution_plan(&[LayerMode::Whole { gpu: 1, ffn: FfnMode::Owner },
+            LayerMode::HeadSplit, LayerMode::ContextSplit,
+            LayerMode::Whole { gpu: 0, ffn: FfnMode::Owner }], 0, 1);
+        for order in [LaneOrder::Independent, LaneOrder::OrderedChunks] {
+            for selected in [&[0][..], &[1][..], &[0, 1][..], &[1, 0][..]] {
+                let traces: Vec<_> = selected.iter().map(|_| PipelineTrace::new(&plan)).collect();
+                let exchanges: Vec<_> = traces.iter().collect();
+                let mut kernels: Vec<_> = traces.iter().zip(selected)
+                    .map(|(shared, &lane)| PipelineRecorder { shared, lane }).collect();
+                let rows: Vec<_> = (1..=selected.len()).collect();
+                submit_scoped(|| Ok(()), || Ok(()), |scope|
+                    layer_pipeline_selected_instances(scope, &plan, &exchanges, selected,
+                        order, &rows, &mut kernels)).unwrap();
+                for (trace, &lane) in traces.iter().zip(selected) {
+                    let transfers = trace.transfers.borrow();
+                    assert_eq!(transfers.len(), plan.hops().len() * 2);
+                    for index in 0..plan.hops().len() {
+                        for pushed in [true, false] {
+                            assert_eq!(transfers.iter().filter(|&&event| event == (lane, index, pushed)).count(), 1);
+                        }
+                    }
+                    assert!(trace.calls.borrow().iter().all(|&(actual, _, _)| actual == lane));
+                    trace.schedule.borrow_mut().end_request();
+                    super::super::order::check(&trace.schedule.borrow()).unwrap();
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn selected_single_device_pipeline_never_calls_peer_protocol() {
+        use crate::shared::experts::rtx::pair::submit_scoped;
+        struct Local;
+        impl LayerProtocol for Local {
+            type Ticket = ();
+            fn require_live(&self) -> Result<()> { Ok(()) }
+            fn push_entry(&self, _: usize, _: *const c_void, _: *mut c_void, _: usize) -> Result<()> {
+                panic!("single-device pipeline must not push an entry hop")
+            }
+            fn wait_entry(&self, _: usize) -> Result<()> { panic!("single-device pipeline must not wait for a peer") }
+            fn send(&self, _: usize, _: usize, _: *const c_void, _: usize) -> Result<()> {
+                panic!("single-device pipeline must not send to a peer")
+            }
+            fn land(&self, _: ()) -> Result<*mut c_void> { panic!("single-device pipeline must not land a peer reply") }
+        }
+        let modes = [LayerMode::Whole { gpu: 0, ffn: FfnMode::Owner }; 3];
+        let plan = execution_plan(&modes, 0, 0);
+        assert!(plan.hops().is_empty());
+        for order in [LaneOrder::Independent, LaneOrder::OrderedChunks] {
+            for selected in [&[0][..], &[1][..], &[1, 0][..]] {
+                let traces: Vec<_> = selected.iter().map(|_| PipelineTrace::new(&plan)).collect();
+                let mut kernels: Vec<_> = traces.iter().zip(selected)
+                    .map(|(shared, &lane)| PipelineRecorder { shared, lane }).collect();
+                let rows = vec![1; selected.len()];
+                submit_scoped(|| Ok(()), || Ok(()), |scope|
+                    layer_pipeline_selected_instances(scope, &plan, &[&Local], selected,
+                        order, &rows, &mut kernels)).unwrap();
+                for (trace, &lane) in traces.iter().zip(selected) {
+                    assert!(trace.transfers.borrow().is_empty());
+                    let expected: Vec<_> = (0..modes.len()).flat_map(|layer|
+                        ["owned", "begin", "finish"].map(|call| (lane, layer, call))).collect();
+                    assert_eq!(*trace.calls.borrow(), expected);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn selected_pipeline_rejects_invalid_inventory_before_callbacks() {
+        use crate::shared::experts::rtx::pair::submit_scoped;
+        let plan = execution_plan(&[LayerMode::HeadSplit], 0, 0);
+        for (selected, rows, count) in [(vec![], vec![], 0), (vec![2], vec![1], 1),
+            (vec![0, 0], vec![1, 1], 2), (vec![1], vec![], 1),
+            (vec![1], vec![0], 1), (vec![1], vec![usize::MAX], 1), (vec![1], vec![1], 0)] {
+            let trace = PipelineTrace::new(&plan);
+            let mut kernels: Vec<_> = (0..count).map(|_| PipelineRecorder { shared: &trace, lane: 1 }).collect();
+            assert!(submit_scoped(|| Ok(()), || Ok(()), |scope|
+                layer_pipeline_selected_instances(scope, &plan, &[&trace], &selected,
+                    LaneOrder::Independent, &rows, &mut kernels)).is_err());
+            assert!(trace.callbacks.borrow().is_empty());
         }
     }
 

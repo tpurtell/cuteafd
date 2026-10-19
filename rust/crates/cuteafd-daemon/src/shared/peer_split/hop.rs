@@ -210,7 +210,8 @@ impl<'a> HopLink<'a> {
     }
 
     pub(crate) fn validate_dispatch(&self, lane: usize, shared: bool) -> Result<()> {
-        ensure!(self.private_lane.is_none_or(|owner| owner == lane && (!shared || self.spec.lanes == 1)),
+        ensure!((lane as u64) < self.spec.lanes, "hop dispatch lane outside admission");
+        ensure!(self.private_lane.is_none_or(|owner| owner == lane && !shared),
             "private hop instance differs from pipeline lane");
         Ok(())
     }
