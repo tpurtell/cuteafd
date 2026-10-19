@@ -35,8 +35,6 @@ impl ServeArgs {
         ensure!(self.peers.len() == 6 && self.peers.iter().collect::<std::collections::HashSet<_>>().len() == 6,
             "Kimi serving requires six distinct real Spark endpoints");
         ensure!((1..=1_048_576).contains(&self.max_context), "Kimi context exceeds the compiled 1M extent");
-        ensure!(!self.prefix.host_cache_bytes.enabled(),
-            "Kimi host prefix-cache tier is not implemented: KDA recurrent state and MLA pages require byte-exact host snapshots; use --host-cache-bytes 0");
         ensure!(self.prefix.prefix_partial == crate::shared::prefix::Toggle::Off,
             "Kimi serving requires exact prefix frontiers");
         ensure!(matches!(self.token_io.embed_placement, crate::shared::token_io::EmbedPlacement::Gpu),
@@ -155,11 +153,10 @@ mod tests {
             ["--embedding-placement", "host"], ["--prefix-partial", "on"]] {
             assert!(args(&["--peers", peers, extra[0], extra[1]])?.validate().is_err());
         }
-        for budget in ["auto", "1", "32GiB"] {
-            let error = args(&["--peers", peers, "--host-cache-bytes", budget])?.validate().unwrap_err();
-            assert!(error.to_string().contains("Kimi host prefix-cache tier is not implemented"));
+        assert!(!defaults.prefix.host_cache_bytes.enabled(), "host retention remains opt-in");
+        for budget in ["0", "auto", "1", "32GiB"] {
+            args(&["--peers", peers, "--host-cache-bytes", budget])?.validate()?;
         }
-        args(&["--peers", peers, "--host-cache-bytes", "0"])?.validate()?;
         assert!(args(&["--max-sequences", "65"]).is_err());
         assert!(args(&["--speculator", "mtp"]).is_err());
         Ok(())

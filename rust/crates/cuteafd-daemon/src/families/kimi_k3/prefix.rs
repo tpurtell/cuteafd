@@ -284,6 +284,177 @@ mod tests {
 
     #[test]
     #[ignore = "requires CUTEAFD_NATIVE_LIFETIME_FIXTURE_DIR; CPU-only fake DSO"]
+    fn host_spill_restores_exact_prompt_turn_and_resident_page_frontiers() -> Result<()> {
+        use crate::shared::prefix::CudaCopyEngine;
+        use cuteafd_engine::prefix::{After, PrefixCache, PrefixConfig, SnapshotKind};
+        use cuteafd_hostcache::{config::Config, copy::Stream as CopyStream};
+
+        for heads in [false, true] {
+            let fixture = Fixture::build()?;
+            let library = fixture.load()?;
+            fixture.immediate_copies(&library)?;
+            let mut cfg = KimiK3Config::from_hf(&cuteafd_loader::plan::testing::kimi_k3_config())?;
+            cfg.layers = 3;
+            cfg.attention = vec![KimiAttention::Kda, KimiAttention::Mla, KimiAttention::Mla];
+            cfg.dense.truncate(3);
+            let mut inputs = super::super::admission::tests::inputs(&cfg);
+            inputs.attention = heads.then_some(AttentionPlacement::Heads);
+            let mut placement = super::super::admission::admit(inputs)?.placement;
+            placement.pool_tokens = 512;
+            let bank = |rank| -> Result<_> {
+                let device = Device { library: &library, id: rank as i32 };
+                let readers = (0..2).map(|_| Stream::new(device).map(Rc::new)).collect::<Result<Vec<_>>>()?;
+                let kda = super::super::state::KdaLayout::new(&cfg, 2, 1, 2)?.allocate(device, readers.clone())?;
+                let mla = super::super::mla::CacheLayout::new(&cfg, &placement, rank)?.allocate(device, readers)?;
+                Ok((Rc::new(kda), Rc::new(mla)))
+            };
+            let (k0, m0) = bank(0)?;
+            let (k1, m1) = bank(1)?;
+            let family = KimiPrefix::new(&cfg, 512, [k0, k1], [m0, m1])?;
+            let boxed = |error: BoxError| anyhow::anyhow!("Kimi host fixture: {error}");
+            let read = |buffer: CuteafdDeviceBuffer| -> Result<Vec<u8>> {
+                let mut bytes = vec![0; buffer.bytes];
+                library.copy_d2h(&mut bytes, buffer)?;
+                Ok(bytes)
+            };
+            let fill = |buffer: CuteafdDeviceBuffer, seed: usize| -> Result<Vec<u8>> {
+                let bytes = (0..buffer.bytes).map(|i| (i.wrapping_mul(31) + seed) as u8).collect::<Vec<_>>();
+                library.copy_h2d(buffer, &bytes)?;
+                Ok(bytes)
+            };
+            let state = |slot| -> Result<Vec<Vec<u8>>> {
+                (0..2).flat_map(|rank| family.state_buffers(rank, slot).unwrap()).map(read).collect()
+            };
+            let pages = |p: &Placement| -> Result<Vec<Vec<u8>>> {
+                let mut result = Vec::new();
+                for rank in 0..2 {
+                    for (index, &page) in p.units.iter().take(p.len.div_ceil(64)).enumerate() {
+                        let rows = (p.len - index * 64).min(64);
+                        for buffer in family.page_buffers(rank, page, rows)? { result.push(read(buffer)?); }
+                    }
+                }
+                Ok(result)
+            };
+            let make_cache = || -> Result<PrefixCache<CudaCopyEngine<'_>>> {
+                let layout = family.layout();
+                let chunk = layout.mark_bytes.max(layout.page_bytes) as u64;
+                let copy = CudaCopyEngine::registered_owned(&library, family.snapshot_owners())?;
+                Ok(PrefixCache::new(layout, PrefixConfig { entries: 8, mark_slots: family.slots(),
+                    keep_logits: true, min_tokens: 1 }, Some((Config { bytes: chunk * 6, chunk_bytes: chunk,
+                        min_tokens: 1, ..Default::default() }, copy)))?)
+            };
+            let finish_store = |cache: &mut PrefixCache<CudaCopyEngine<'_>>| -> Result<()> {
+                cache.host_engine_mut().context("host tier missing")?.synchronize(CopyStream::Store)?;
+                cache.tick();
+                Ok(())
+            };
+            let build = |slot| move |units| Placement { units, slot, len: 0, state_len: 0 };
+            let mut cache = make_cache()?;
+            let tokens = (100..230).collect::<Vec<u32>>();
+            let mut original = cache.admit(&family, &tokens[..65], 131, false, build(0))?.placement;
+            let mut expected = Vec::new();
+            for (end, kind) in [(65, SnapshotKind::Prompt), (130, SnapshotKind::Turn)] {
+                let start = original.len;
+                for rank in 0..2 {
+                    for (i, buffer) in family.state_buffers(rank, 0)?.into_iter().enumerate() {
+                        fill(buffer, end + rank * 47 + i)?;
+                    }
+                    // Do not rewrite shared full pages while the prompt snapshot
+                    // is retained: only the newly appended rows change at turn end.
+                    for (index, &page) in original.units.iter().enumerate() {
+                        for buffer in family.page_buffers(rank, page, 64)? {
+                            let first = start.saturating_sub(index * 64).min(64);
+                            let last = end.saturating_sub(index * 64).min(64);
+                            if first < last {
+                                let offset = first * MLA_RECORD_BYTES;
+                                let bytes = (last - first) * MLA_RECORD_BYTES;
+                                let view = crate::shared::prefix::view(buffer, offset, bytes)?;
+                                fill(view, end + rank * 71 + index * 17)?;
+                            }
+                        }
+                    }
+                }
+                family.commit(&mut original, start, end - start)?;
+                expected.push((end, state(0)?, pages(&original)?));
+                assert!(cache.capture(&family, kind, &tokens[..end], &original,
+                    After::from_logits(&[1.0, 2.0], true))?);
+                finish_store(&mut cache)?;
+            }
+            cache.release(&family, &original.units)?;
+            cache.clear(&family)?;
+            // Every former device byte is poisoned before either host restore.
+            for rank in 0..2 {
+                for buffer in family.state_buffers(rank, 0)?.into_iter()
+                    .chain(family.mark_buffers(rank, MarkSlot(0))?) { fill(buffer, 249)?; }
+                for page in 0..family.layout().pages as u32 {
+                    for buffer in family.page_buffers(rank, page, 64)? { fill(buffer, 251)?; }
+                }
+            }
+            for (end, expected_state, expected_pages) in expected {
+                let hit = cache.admit(&family, &tokens[..end], end + 1, false, build(1))?;
+                assert_eq!(hit.resume, end);
+                assert!(hit.source.as_ref().is_some_and(|source| source.host));
+                let mut restored = hit.placement;
+                family.drain().map_err(boxed)?;
+                assert_eq!(state(1)?, expected_state, "both TP2 state/conv shards at {end}");
+                assert_eq!(pages(&restored)?, expected_pages, "owned/split MLA prefix and partial tail at {end}");
+                family.check_append(&restored, 1)?;
+                for rank in 0..2 {
+                    for buffer in family.state_buffers(rank, 1)? { fill(buffer, 243)?; }
+                    for buffer in family.page_buffers(rank, restored.units[end / 64], 64)? {
+                        fill(crate::shared::prefix::view(buffer, (end % 64) * MLA_RECORD_BYTES,
+                            MLA_RECORD_BYTES)?, 241)?;
+                    }
+                }
+                family.commit(&mut restored, end, 1)?;
+                assert_eq!(family.commit_point(&restored), end + 1);
+                // Appending mutates the fork's tail and recurrent state, never
+                // the snapshot's exact frontier or its private partial page.
+                let again = cache.admit(&family, &tokens[..end], end + 1, false, build(0))?;
+                assert_eq!(again.resume, end);
+                family.drain().map_err(boxed)?;
+                assert_eq!(state(0)?, expected_state);
+                assert_eq!(pages(&again.placement)?, expected_pages);
+                cache.release(&family, &again.placement.units)?;
+                cache.release(&family, &restored.units)?;
+                cache.clear(&family)?;
+            }
+            drop(cache);
+
+            // Keep a full-page snapshot resident. The shared working-set policy
+            // can spill only its mark; the page lease must remain identical.
+            let mut cache = make_cache()?;
+            let tokens = (500..564).collect::<Vec<u32>>();
+            let mut original = cache.admit(&family, &tokens, 65, false, build(0))?.placement;
+            for rank in 0..2 {
+                for buffer in family.state_buffers(rank, 0)? { fill(buffer, rank + 41)?; }
+                for buffer in family.page_buffers(rank, original.units[0], 64)? { fill(buffer, rank + 81)?; }
+            }
+            family.commit(&mut original, 0, 64)?;
+            let expected_state = state(0)?;
+            let expected_pages = pages(&original)?;
+            assert!(cache.capture(&family, SnapshotKind::Prompt, &tokens, &original,
+                After::from_logits(&[3.0, 1.0], true))?);
+            finish_store(&mut cache)?;
+            for rank in 0..2 {
+                for buffer in family.state_buffers(rank, 0)? { fill(buffer, 247)?; }
+            }
+            let hit = cache.admit(&family, &tokens, 65, false, build(1))?;
+            assert_eq!(hit.resume, 64);
+            assert_eq!(hit.placement.units[0], original.units[0], "resident full page must not be replaced");
+            family.drain().map_err(boxed)?;
+            assert_eq!(state(1)?, expected_state);
+            assert_eq!(pages(&hit.placement)?, expected_pages);
+            family.check_append(&hit.placement, 1)?;
+            cache.release(&family, &hit.placement.units)?;
+            cache.release(&family, &original.units)?;
+            cache.clear(&family)?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires CUTEAFD_NATIVE_LIFETIME_FIXTURE_DIR; CPU-only fake DSO"]
     fn exact_adapter_restores_both_kda_shards_and_full_partial_mla_pages() -> Result<()> {
         for heads in [false, true] {
             let fixture = Fixture::build()?;
