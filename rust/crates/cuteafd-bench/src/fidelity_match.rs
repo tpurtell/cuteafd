@@ -22,6 +22,7 @@ pub const PUBLICATIONS: &[Publication] = &[
     Publication { root: "Qwen/Qwen3.8-Flash-Next", siblings: &["Qwen/Qwen3.8-Flash-Next", "Qwen/Qwen3.8-Flash-Next-FP8"], revision: dataset::QWEN_REVISION, config: dataset::QWEN_CONFIG },
     Publication { root: "Qwen/Qwen3.5-9B", siblings: &["Qwen/Qwen3.5-9B"], revision: dataset::QWEN35_9B_REVISION, config: dataset::QWEN35_9B_CONFIG },
     Publication { root: "Qwen/Qwen3.8-27B", siblings: &["Qwen/Qwen3.8-27B", "Qwen/Qwen3.8-27B-FP8"], revision: dataset::QWEN38_27B_REVISION, config: dataset::QWEN38_27B_CONFIG },
+    Publication { root: "moonshotai/Kimi-K3", siblings: &["moonshotai/Kimi-K3"], revision: dataset::KIMI_K3_REVISION, config: dataset::KIMI_K3_CONFIG },
     Publication { root: "stepfun-ai/Step-5-Preview-BF16", siblings: &["stepfun-ai/Step-5-Preview-BF16", "stepfun-ai/Step-5-Preview", "stepfun-ai/Step-5-Preview-NVFP4"], revision: dataset::STEP5_REVISION, config: dataset::STEP5_CONFIG },
     Publication { root: "deepseek-ai/DeepSeek-V4.1-Flash", siblings: &["deepseek-ai/DeepSeek-V4.1-Flash"], revision: dataset::REVISION, config: dataset::CONFIG },
     Publication { root: "deepseek-ai/DeepSeek-V4.1-Flash-1017", siblings: &["deepseek-ai/DeepSeek-V4.1-Flash-1017"], revision: dataset::V41_1017_REVISION, config: dataset::V41_1017_CONFIG },
@@ -313,6 +314,25 @@ mod tests {
         }
         assert_eq!(official_root("Qwen/Qwen3.8-27B-FP8"), Some("Qwen/Qwen3.8-27B"));
         assert_eq!(official_root("Qwen/Qwen3.5-9B-FP8"), None);
+    }
+
+    #[test]
+    fn kimi_root_and_card_quant_resolve_to_effort_matched_f32_reference() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = "moonshotai/Kimi-K3";
+        add(tmp.path(), root, "base_model: moonshotai/Kimi-K3-Base");
+        let official = resolve_in(root, None, tmp.path()).unwrap();
+        assert_eq!(official.reference_root, root);
+        assert_eq!((official.revision.as_str(), official.config.as_str()),
+            (dataset::KIMI_K3_REVISION, dataset::KIMI_K3_CONFIG));
+        assert_eq!(official.resolved_chain, vec![vec![root.to_string()]]);
+        let quant = add(tmp.path(), "test/kimi-quant", "base_model: moonshotai/Kimi-K3\nbase_model_relation: quantized");
+        let r = resolve_in("test/kimi-quant", Some(&quant), tmp.path()).unwrap();
+        assert_eq!(r.reference_match, "base_model");
+        assert_eq!((r.reference_root.as_str(), r.revision.as_str(), r.config.as_str()),
+            (root, dataset::KIMI_K3_REVISION, dataset::KIMI_K3_CONFIG));
+        assert_eq!(r.resolved_chain, vec![vec!["test/kimi-quant".to_string(), root.to_string()]]);
+        assert!(resolve_in("someone/Kimi-K3-NVFP4", None, tmp.path()).is_err());
     }
 
     #[test]

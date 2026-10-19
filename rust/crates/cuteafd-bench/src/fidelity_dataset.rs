@@ -41,6 +41,9 @@ pub const STEP5_MANIFEST_SHA256: &str = "dd0f964a891e24570bcbf5840f6398a06c9dd03
 pub const V41_1017_REVISION: &str = "9fc394f9b7e847cedb49578072082e9a56ba8e57";
 pub const V41_1017_CONFIG: &str = "deepseek_v41-v2_20261017_1017";
 pub const V41_1017_MANIFEST_SHA256: &str = "0eb4afedef4561ac86876d6c8285e2e0ab73a2643eb08d0efc6547fb4a0c65bd";
+pub const KIMI_K3_REVISION: &str = "a98e1b9d6b622eec1ccc66fd21b5d48ff11d7c01";
+pub const KIMI_K3_CONFIG: &str = "kimi-k3-v2_20261019_own-text-effort-matched-mxfp4-f32";
+pub const KIMI_K3_MANIFEST_SHA256: &str = "815442612c25cd1fb5c3b1eb9dde2deb93e395b7d98bcbbdd5a52c829c9fd5cd";
 
 /// Sealed bench subset v1: agentic A at three context lengths, human code C,
 /// structured/tool D, plain E and the frozen context anchor. Never resample.
@@ -260,6 +263,7 @@ pub fn download(agent: &ureq::Agent, cache: &Path, repo: &str, commit: &str, con
             (QWEN38_27B_REVISION, QWEN38_27B_CONFIG) => Some(QWEN38_27B_MANIFEST_SHA256),
             (STEP5_REVISION, STEP5_CONFIG) => Some(STEP5_MANIFEST_SHA256),
             (V41_1017_REVISION, V41_1017_CONFIG) => Some(V41_1017_MANIFEST_SHA256),
+            (KIMI_K3_REVISION, KIMI_K3_CONFIG) => Some(KIMI_K3_MANIFEST_SHA256),
             (MIMO_PRO_MEDIA_REVISION, MIMO_PRO_MEDIA_CONFIG) => Some(MIMO_PRO_MEDIA_MANIFEST_SHA256),
             (GLM_REVISION, GLM_CONFIG) => Some("cc973cec8df82119ccd53367d014c73b271808a561f81d3629b06093de3b00e0"),
             (V4PRO_REVISION, V4PRO_CONFIG) => Some("7b4fd7b51670ff03fbfab6a21b72d999163ddee9bd3eec34c89f1d6c2f83488f"),
@@ -405,6 +409,28 @@ fn qualification_label(qualification: &Value, manifest: &Value) -> Result<&'stat
             source["revision"] == manifest["root_checkpoint"]["revision"]
                 && ["model_py_sha256", "kernel_torch_sha256", "golden_sha256", "inference_config_sha256"]
                     .iter().all(|key| hash(&source[key], 64))
+        } else if manifest["family"] == "kimi_k3" {
+            let padding = &provenance["gates"]["kda_a_log_zero_padding"];
+            // The native 93-layer decoder has 69 KDA layers with 32 unused F32 heads.
+            let expected: std::collections::BTreeSet<_> = (0..92).filter(|i| i % 4 != 3)
+                .map(|i| format!("language_model.model.layers.{i}.self_attn.A_log")).collect();
+            let padding_valid = padding["active_heads"] == 96
+                && padding["layers"].as_array().is_some_and(|layers| {
+                    let names: std::collections::BTreeSet<_> = layers.iter()
+                        .filter_map(|entry| entry["tensor"].as_str().map(str::to_owned)).collect();
+                    layers.len() == expected.len() && names == expected && layers.iter().all(|entry|
+                        entry["stored_shape"] == json!([128]) && entry["loaded_shape"] == json!([96])
+                        && entry["tail_shape"] == json!([32]) && entry["tail_dtype"] == "F32"
+                        && entry["tail_bitwise_zero"] == true
+                        && entry["tail_sha256"] == digest(&[0u8; 32 * 4]))
+                });
+            manifest["root_checkpoint"]["id"] == "moonshotai/Kimi-K3"
+                && source["revision"] == manifest["root_checkpoint"]["revision"]
+                && ["configuration_kimi_k3_sha256", "modeling_kimi_k3_sha256", "modeling_kimi_linear_sha256",
+                    "reference_adapter_sha256", "reference_runner_sha256", "fla_source_sha256",
+                    "transformers_source_sha256", "compressed_tensors_source_sha256"]
+                    .iter().all(|key| hash(&source[key], 64))
+                && padding_valid
         } else {
             hash(&source["modeling_sha256"], 64) && hash(&source["source_tree_sha256"], 64)
         };
@@ -457,6 +483,111 @@ mod tests {
     }
 
     use super::*;
+
+    fn kimi_reference_qualification() -> (Value, Value) {
+        let revision = "a".repeat(40);
+        let identity = json!({"checkpoint":"moonshotai/Kimi-K3", "snapshot_revision":revision,
+            "config_sha256":"b".repeat(64), "tokenizer_sha256":"c".repeat(64)});
+        let mut source = json!({"revision":revision});
+        for key in ["configuration_kimi_k3_sha256", "modeling_kimi_k3_sha256", "modeling_kimi_linear_sha256",
+            "reference_adapter_sha256", "reference_runner_sha256", "fla_source_sha256",
+            "transformers_source_sha256", "compressed_tensors_source_sha256"] {
+            source[key] = json!("d".repeat(64));
+        }
+        let padding: Vec<_> = (0..92).filter(|i| i % 4 != 3).map(|i| json!({
+            "tensor":format!("language_model.model.layers.{i}.self_attn.A_log"),
+            "stored_shape":[128], "loaded_shape":[96], "tail_shape":[32], "tail_dtype":"F32",
+            "tail_bitwise_zero":true, "tail_sha256":digest(&[0u8;128])})).collect();
+        let manifest = json!({"family":"kimi_k3", "set_sha256":"sealed", "vocab":163840,
+            "root_checkpoint":{"id":"moonshotai/Kimi-K3", "revision":revision}});
+        let qualification = json!({"schema":"cuteafd.fidelity.qualification/1", "kind":"reference",
+            "set_sha256":"sealed", "qualifies":true, "engine_parity":false, "nll":0.7, "scored_tokens":32768,
+            "reference_validation":{"passed":true,"engine_parity":false,"set_sha256":"sealed",
+                "scored_tokens":32768,"nll":0.7,"golden_seal_sha256":"e".repeat(64),"full_seal_sha256":"f".repeat(64)},
+            "prefix_qualification":{"passed":true,"finite":true,"rows":512,"different_rows":[],
+                "argmax_disagreements":0,"set_sha256":"sealed","snapshot_identity":identity,
+                "fixed_rows":128,"vocab":163840,"lengths":[576,640],"score_from":64,
+                "logits_sha256":["1".repeat(64),"2".repeat(64)]},
+            "reference_provenance":{"snapshot_identity":identity,"source_pin":source,
+                "tokenizers":"0.22.2","platform":{"gpu":"reference GPU"},"mtp":false,
+                "use_cache":false,"attention":"eager",
+                "gates":{"kda_a_log_zero_padding":{"active_heads":96,"layers":padding}}}});
+        (qualification, manifest)
+    }
+
+    #[test]
+    fn kimi_reference_native_source_and_padding_qualify() {
+        let (qualification, manifest) = kimi_reference_qualification();
+        assert_eq!(qualification_label(&qualification, &manifest).unwrap(), "reference");
+    }
+
+    macro_rules! kimi_hash_test {
+        ($name:ident, $key:literal) => {
+            #[test]
+            fn $name() {
+                let (qualification, manifest) = kimi_reference_qualification();
+                for invalid in [None, Some(json!("a".repeat(40))), Some(json!("g".repeat(64))),
+                    Some(json!("A".repeat(64))), Some(json!("a".repeat(63))), Some(json!(64))] {
+                    let mut changed = qualification.clone();
+                    let source = changed["reference_provenance"]["source_pin"].as_object_mut().unwrap();
+                    if let Some(value) = invalid { source.insert($key.into(), value); } else { source.remove($key); }
+                    assert!(qualification_label(&changed, &manifest).is_err(), "{}", $key);
+                }
+            }
+        };
+    }
+    kimi_hash_test!(kimi_configuration_hash_fails_closed, "configuration_kimi_k3_sha256");
+    kimi_hash_test!(kimi_modeling_hash_fails_closed, "modeling_kimi_k3_sha256");
+    kimi_hash_test!(kimi_linear_hash_fails_closed, "modeling_kimi_linear_sha256");
+    kimi_hash_test!(kimi_adapter_hash_fails_closed, "reference_adapter_sha256");
+    kimi_hash_test!(kimi_runner_hash_fails_closed, "reference_runner_sha256");
+    kimi_hash_test!(kimi_fla_hash_fails_closed, "fla_source_sha256");
+    kimi_hash_test!(kimi_transformers_hash_fails_closed, "transformers_source_sha256");
+    kimi_hash_test!(kimi_compressed_tensors_hash_fails_closed, "compressed_tensors_source_sha256");
+
+    #[test]
+    fn kimi_reference_wrong_root_fails_closed() {
+        let (mut qualification, mut manifest) = kimi_reference_qualification();
+        manifest["root_checkpoint"]["id"] = json!("other/checkpoint");
+        qualification["reference_provenance"]["snapshot_identity"]["checkpoint"] = json!("other/checkpoint");
+        qualification["prefix_qualification"]["snapshot_identity"]["checkpoint"] = json!("other/checkpoint");
+        assert!(qualification_label(&qualification, &manifest).is_err());
+    }
+
+    #[test]
+    fn kimi_reference_revision_mismatch_fails_closed() {
+        let (qualification, manifest) = kimi_reference_qualification();
+        for revision in [Value::Null, json!("b".repeat(40)), json!("g".repeat(40)), json!("a".repeat(64))] {
+            let mut changed = qualification.clone();
+            changed["reference_provenance"]["source_pin"]["revision"] = revision;
+            assert!(qualification_label(&changed, &manifest).is_err());
+        }
+    }
+
+    #[test]
+    fn kimi_reference_padding_fails_closed() {
+        let (qualification, manifest) = kimi_reference_qualification();
+        for (key, invalid) in [("tail_bitwise_zero", json!(false)), ("tail_dtype",json!("BF16")),
+            ("tail_sha256",json!("a".repeat(64))), ("tail_sha256",Value::Null),
+            ("stored_shape",json!([129])), ("loaded_shape",json!([95])), ("tail_shape",json!([33])),
+            ("tensor",json!("language_model.model.layers.3.self_attn.A_log"))] {
+            let mut changed = qualification.clone();
+            changed["reference_provenance"]["gates"]["kda_a_log_zero_padding"]["layers"][0][key] = invalid;
+            assert!(qualification_label(&changed, &manifest).is_err(), "{key}");
+        }
+        for mode in ["missing", "duplicate", "heads", "absent"] {
+            let mut changed = qualification.clone();
+            let padding = &mut changed["reference_provenance"]["gates"]["kda_a_log_zero_padding"];
+            match mode {
+                "missing" => { padding["layers"].as_array_mut().unwrap().pop(); }
+                "duplicate" => { padding["layers"][1] = padding["layers"][0].clone(); }
+                "heads" => { padding["active_heads"] = json!(128); }
+                _ => { *padding = Value::Null; }
+            }
+            assert!(qualification_label(&changed, &manifest).is_err(), "{mode}");
+        }
+    }
+
     #[test]
     fn publications_and_retired_mimo_fail_closed() {
         assert_eq!(default_publication("wrldsuksgo2mars/GLM-5.3-EXL3-K4-v1"), Some((GLM_REVISION, GLM_CONFIG)));
@@ -642,7 +773,7 @@ mod tests {
         for (revision, config) in [(MIMO_PRO_REVISION, MIMO_PRO_CONFIG),
             (MIMO_PRO_MEDIA_REVISION, MIMO_PRO_MEDIA_CONFIG), (QWEN35_9B_REVISION, QWEN35_9B_CONFIG),
             (QWEN38_27B_REVISION, QWEN38_27B_CONFIG), (STEP5_REVISION, STEP5_CONFIG),
-            (V41_1017_REVISION, V41_1017_CONFIG)] {
+            (V41_1017_REVISION, V41_1017_CONFIG), (KIMI_K3_REVISION, KIMI_K3_CONFIG)] {
             let root = temporary.path().join("wrldsuksgo2mars--cuteafd-fidelity").join(revision);
             std::fs::create_dir_all(root.join(config)).unwrap();
             let manifest = b"{}";
@@ -694,6 +825,15 @@ mod tests {
             let balance = standard_balance(&reference);
             assert_eq!(balance["decode"]["generated_positions"], 8089);
             assert_eq!(balance["prefill"]["generated_positions"], 7591);
+        }
+        if commit == KIMI_K3_REVISION && config == KIMI_K3_CONFIG {
+            assert_eq!(reference.checkpoint, "moonshotai/Kimi-K3");
+            assert_eq!(identity["qualification"], "reference");
+            assert_eq!(identity["text_checkpoint"], "moonshotai/Kimi-K3");
+            assert_eq!((reference.expect.top1_min, reference.expect.kl_max), (0.90, 0.06));
+            let balance = standard_balance(&reference);
+            assert_eq!(balance["decode"]["generated_positions"], 9371);
+            assert_eq!(balance["prefill"]["generated_positions"], 8838);
         }
         if commit == V41_1017_REVISION && config == V41_1017_CONFIG {
             assert_eq!(reference.checkpoint, "deepseek-ai/DeepSeek-V4.1-Flash-1017");
