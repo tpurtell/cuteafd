@@ -9,6 +9,107 @@ use cuteafd_loader::{families::kimi_k3::{config::{KimiAttention, KimiK3Config}, 
     w8::{self, ResidualWeightSite}}, kda::{KdaOperand, KdaTensor}, placement::LayerMode, LoadedTensor};
 use std::collections::BTreeMap;
 
+/// Exact resident operand extents, computed without reading tensor payloads.
+/// Shared startup admission charges these bytes; packing independently checks
+/// every operand before any device allocation can begin.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct LayerLayout {
+    operands: BTreeMap<&'static str, usize>,
+    pub(crate) attention: AttentionShare,
+}
+
+impl LayerLayout {
+    pub(crate) fn pair(cfg: &KimiK3Config, layer: usize, mode: LayerMode) -> Result<[Self; 2]> {
+        let kind = *cfg.attention.get(layer).context("Kimi attention layer out of range")?;
+        ensure!(cfg.layers == cfg.attention.len() && cfg.dense.len() == cfg.layers,
+            "Kimi dense/attention inventories differ");
+        ensure!(mode != LayerMode::ContextSplit, "Kimi context attention has no query/LSE exchange ABI");
+        ensure!(!matches!(mode, LayerMode::Whole { ffn: cuteafd_loader::placement::FfnMode::Owner, .. }),
+            "Kimi FFNs require TP2 intermediate slices");
+        ensure!(kind != KimiAttention::Kda || mode == LayerMode::HeadSplit,
+            "Kimi KDA requires TP2 head-split placement");
+        let shares = AttentionShare::bind(mode, 2)?;
+        let intermediate = if cfg.dense[layer] { cfg.dense_intermediate }
+            else { extent(&[cfg.moe_intermediate, cfg.shared_experts])? };
+        ensure!(intermediate > 0 && intermediate % 2 == 0, "Kimi FFN intermediate does not divide TP2");
+        let local = intermediate / 2;
+        let sum = |a: usize, b: usize| a.checked_add(b).context("Kimi weight extent overflow");
+        let mut pair = std::array::from_fn(|rank| Self { operands: BTreeMap::new(), attention: shares[rank] });
+        for rank in &mut pair {
+            for name in ["attention.score", "ffn.score"] { rank.insert(name, &[cfg.hidden, 4])?; }
+            for name in ["attention.norm", "ffn.norm"] { rank.insert(name, &[cfg.hidden, 2])?; }
+            rank.insert("ffn.gate_up", &[2, local, cfg.hidden, 2])?;
+            rank.insert("ffn.down", &[cfg.hidden, local, 2])?;
+            if !cfg.dense[layer] {
+                for name in ["latent.down", "latent.up"] { rank.insert(name, &[cfg.latent, cfg.hidden, 2])?; }
+                rank.insert("latent.norm", &[cfg.latent, 2])?;
+                rank.insert("router.weight", &[cfg.experts, cfg.hidden, 2])?;
+                rank.insert("router.bias", &[cfg.experts, 4])?;
+            }
+            match kind {
+                KimiAttention::Kda => {
+                    kda::geometry(cfg).validate(2)?;
+                    let heads = cfg.kda_heads / 2;
+                    let width = extent(&[heads, cfg.kda_head_dim])?;
+                    let input = sum(sum(extent(&[4, width])?, cfg.kda_head_dim)?, heads)?;
+                    rank.insert("kda.input", &[input, cfg.hidden, 2])?;
+                    rank.insert("kda.forget", &[width, cfg.kda_head_dim, 2])?;
+                    rank.insert("kda.conv", &[3, width, cfg.kda_conv, 4])?;
+                    rank.insert("kda.a_log", &[heads, 4])?;
+                    rank.insert("kda.dt_bias", &[width, 4])?;
+                    rank.insert("kda.norm", &[cfg.kda_head_dim, 4])?;
+                    rank.insert("kda.output", &[cfg.hidden, width, 2])?;
+                }
+                KimiAttention::Mla if rank.attention.present() => {
+                    ensure!(cfg.heads > 0 && cfg.heads % 2 == 0, "Kimi MLA heads do not divide TP2");
+                    let heads = if rank.attention == AttentionShare::Whole { cfg.heads } else { cfg.heads / 2 };
+                    let input = sum(cfg.q_lora_rank, sum(cfg.kv_lora_rank, cfg.qk_rope_dim)?)?;
+                    rank.insert("mla.qkv_a", &[input, cfg.hidden, 2])?;
+                    rank.insert("mla.q_norm", &[cfg.q_lora_rank, 2])?;
+                    rank.insert("mla.kv_norm", &[cfg.kv_lora_rank, 2])?;
+                    rank.insert("mla.q_b", &[heads, sum(cfg.qk_nope_dim, cfg.qk_rope_dim)?, cfg.q_lora_rank, 2])?;
+                    rank.insert("mla.uk", &[heads, cfg.kv_lora_rank, cfg.qk_nope_dim, 2])?;
+                    rank.insert("mla.uv", &[heads, cfg.v_head_dim, cfg.kv_lora_rank, 2])?;
+                    rank.insert("mla.gate", &[heads, cfg.v_head_dim, cfg.hidden, 2])?;
+                    rank.insert("mla.output", &[cfg.hidden, heads, cfg.v_head_dim, 2])?;
+                }
+                KimiAttention::Mla => {}
+            }
+        }
+        Ok(pair)
+    }
+
+    fn insert(&mut self, name: &'static str, dimensions: &[usize]) -> Result<()> {
+        ensure!(self.operands.insert(name, extent(dimensions)?).is_none(), "duplicate Kimi operand {name}");
+        Ok(())
+    }
+
+    pub(crate) fn bytes(&self) -> Result<usize> {
+        self.operands.values().try_fold(0usize, |n, size| n.checked_add(*size)
+            .context("Kimi layer admission extent overflow"))
+    }
+
+    pub(super) fn attention_bytes(&self) -> Result<usize> {
+        self.operands.iter().filter(|(name, _)| name.starts_with("mla.") || name.starts_with("kda."))
+            .try_fold(0usize, |n, (_, bytes)| n.checked_add(*bytes).context("Kimi attention extent overflow"))
+    }
+
+    fn check(&self, packed: &PackedLayer) -> Result<()> {
+        ensure!(self.attention == packed.attention && self.operands.len() == packed.operands.len(),
+            "Kimi packed operand inventory differs from native admission");
+        for (name, bytes) in &self.operands {
+            ensure!(packed.operands.get(name).is_some_and(|data| data.len() == *bytes),
+                "Kimi packed operand {name} differs from native admission");
+        }
+        Ok(())
+    }
+}
+
+fn extent(dimensions: &[usize]) -> Result<usize> {
+    ensure!(dimensions.iter().all(|n| *n > 0), "Kimi weight extent is empty");
+    dimensions.iter().try_fold(1usize, |n, dim| n.checked_mul(*dim)).context("Kimi weight extent overflow")
+}
+
 /// Byte counts describe the packed operands, not the checkpoint's pre-pack
 /// representation (the residual score product, for example, is F32).
 pub(crate) struct PackedLayer {
@@ -26,14 +127,9 @@ impl PackedLayer {
     /// than rereading every tensor separately for each coordinator GPU.
     pub(crate) fn pair(cfg: &KimiK3Config, layer: usize, mode: LayerMode,
         mut read: impl FnMut(&str) -> Result<LoadedTensor>) -> Result<[Self; 2]> {
-        let kind = *cfg.attention.get(layer).context("Kimi attention layer out of range")?;
-        ensure!(cfg.dense.len() == cfg.attention.len(), "Kimi dense/attention inventories differ");
-        ensure!(mode != LayerMode::ContextSplit, "Kimi context attention has no query/LSE exchange ABI");
-        ensure!(!matches!(mode, LayerMode::Whole { ffn: cuteafd_loader::placement::FfnMode::Owner, .. }),
-            "Kimi FFNs require TP2 intermediate slices");
-        ensure!(kind != KimiAttention::Kda || mode == LayerMode::HeadSplit,
-            "Kimi KDA requires TP2 head-split placement");
-        let shares = AttentionShare::bind(mode, 2)?;
+        let layouts = LayerLayout::pair(cfg, layer, mode)?;
+        let kind = cfg.attention[layer];
+        let shares = layouts.each_ref().map(|layout| layout.attention);
         let mut pair = std::array::from_fn(|rank| Self {
             operands: BTreeMap::new(), attention: shares[rank] });
         for (site, score, norm) in [
@@ -87,6 +183,7 @@ impl PackedLayer {
                 }
             }
         }
+        for (layout, packed) in layouts.iter().zip(&pair) { layout.check(packed)?; }
         Ok(pair)
     }
 }
@@ -109,11 +206,13 @@ impl<'a> LayerWeights<'a> {
     /// `charged_bytes` is the exact weight demand accepted by shared startup
     /// admission, not available CUDA bytes or an independent family budget.
     /// Uploads are synchronous; no queued work can outlive error cleanup here.
-    pub(crate) fn upload(device: Device<'a>, packed: PackedLayer, charged_bytes: usize) -> Result<Self> {
-        ensure!(packed.bytes()? == charged_bytes, "Kimi packed layer differs from admitted weight bytes");
+    pub(crate) fn upload(device: Device<'a>, packed: PackedLayer, layout: &LayerLayout,
+        charged_bytes: usize) -> Result<Self> {
+        layout.check(&packed)?;
+        ensure!(layout.bytes()? == charged_bytes, "Kimi layer layout differs from admitted weight bytes");
         let operands = packed.operands.into_iter().map(|(name, bytes)| {
             ensure!(!bytes.is_empty(), "Kimi operand {name} is empty");
-            let _scope = cuteafd_ffi::memory_ledger::scope("kimi layer weights");
+            let _scope = cuteafd_ffi::memory_ledger::scope("weights/kimi layer weights");
             let allocation = Allocation::new(device, bytes.len())?;
             device.run(|| device.library.copy_h2d(allocation.buffer, &bytes))?;
             Ok((name, allocation))
@@ -245,6 +344,34 @@ mod tests {
             assert_eq!(rank.operands["kda.dt_bias"].len(), width / 2 * 4);
             assert_eq!(rank.operands["kda.output"].len(), cfg.hidden * width / 2 * 2);
             assert!(!rank.operands.keys().any(|key| key.starts_with("latent.") || key.starts_with("router.")));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn admitted_extents_match_packing_and_reject_equal_total_operand_swaps() -> Result<()> {
+        let cfg = cfg();
+        let mode = LayerMode::Whole { gpu: 1, ffn: FfnMode::Split };
+        let layouts = LayerLayout::pair(&cfg, 3, mode)?;
+        let mut packed = PackedLayer::pair(&cfg, 3, mode, tensor)?;
+        for (layout, packed) in layouts.iter().zip(&packed) {
+            assert_eq!(layout.bytes()?, packed.bytes()?);
+            layout.check(packed)?;
+        }
+        let before = packed[0].bytes()?;
+        packed[0].operands.get_mut("ffn.gate_up").unwrap().pop();
+        packed[0].operands.get_mut("ffn.down").unwrap().push(0);
+        assert_eq!(before, packed[0].bytes()?);
+        assert!(layouts[0].check(&packed[0]).is_err());
+        for change in 0..3 {
+            let mut invalid = cfg.clone();
+            match change {
+                0 => invalid.hidden = usize::MAX,
+                1 => invalid.shared_experts = usize::MAX,
+                _ => invalid.moe_intermediate = 3,
+            }
+            if change == 2 { invalid.shared_experts = 1; }
+            assert!(PackedLayer::pair(&invalid, 3, mode, |_| unreachable!()).is_err());
         }
         Ok(())
     }
