@@ -152,20 +152,25 @@ fn selected_directories(
 
 fn validate_whole_package(package: &Path, rows: usize, policy: Exl3RowPolicy,
     selection: RtxSelectionPolicy, geometry: ExpertGeometry) -> Result<()> {
+    validate_shard_package(package, rows, policy, selection, geometry, geometry.intermediate as u64)
+}
+
+fn validate_shard_package(package: &Path, rows: usize, policy: Exl3RowPolicy,
+    selection: RtxSelectionPolicy, geometry: ExpertGeometry, intermediate: u64) -> Result<()> {
     for path in selected_directories(package, rows, policy, selection)? {
         let meta: serde_json::Value = serde_json::from_slice(&std::fs::read(path.join("v41_exl3.json"))?)?;
         ensure!(meta["hidden"].as_u64() == Some(geometry.hidden as u64)
-            && meta["intermediate"].as_u64() == Some(geometry.intermediate as u64)
+            && meta["intermediate"].as_u64() == Some(intermediate)
             && meta["experts"].as_u64() == Some(geometry.experts as u64)
             && meta["top_k"].as_u64() == Some(geometry.topk as u64)
             && meta["output_dtype"].as_str() == Some("fp32"),
-            "EXL3 whole package geometry/output differs from complete experts");
+            "EXL3 shard package geometry/output differs from selected experts");
         let activation = match geometry.activation() {
             cuteafd_core::FfnActivation::Situ { .. } => "situ",
             _ => "silu",
         };
         ensure!(meta["activation"].as_str() == Some(activation),
-            "EXL3 whole package activation differs from checkpoint geometry");
+            "EXL3 shard package activation differs from checkpoint geometry");
     }
     Ok(())
 }
@@ -444,16 +449,29 @@ impl<'a> Exl3Tp2<'a> {
         Ok(ranks)
     }
 
+    pub(crate) fn preload_tp2_modules(device: Device<'a>, package: &Path,
+        rows: usize, geometry: ExpertGeometry, selection: RtxSelectionPolicy)
+        -> Result<Vec<Exl3Modules<'a>>> {
+        let policy = Exl3RowPolicy::for_geometry(geometry);
+        ensure!(geometry.intermediate % 2 == 0, "EXL3 TP2 intermediate is odd");
+        validate_shard_package(package, rows, policy, selection, geometry, u64::from(geometry.intermediate / 2))?;
+        Self::preload_selected_modules(device, package, rows, policy, selection)
+    }
+
+    fn preload_selected_modules(device: Device<'a>, package: &Path, rows: usize,
+        policy: Exl3RowPolicy, selection: RtxSelectionPolicy) -> Result<Vec<Exl3Modules<'a>>> {
+        device.run(|| selected_directories(package, rows, policy, selection)?.iter().map(|path| {
+            // SAFETY: sealed modules remain retained until their execution owners retire.
+            unsafe { Exl3Modules::load(device.library, path, Self::INPUT_FORMAT) }
+        }).collect())
+    }
+
     pub(crate) fn preload_whole_modules(device: Device<'a>, package: &Path,
         rows: usize, geometry: ExpertGeometry, selection: RtxSelectionPolicy)
         -> Result<Vec<Exl3Modules<'a>>> {
         let policy = Exl3RowPolicy::for_geometry(geometry);
         validate_whole_package(package, rows, policy, selection, geometry)?;
-        device.run(|| selected_directories(package, rows, policy, selection)?.iter().map(|path| {
-            // SAFETY: caller supplies the same sealed package used by admission;
-            // retained module owners are transferred to the bound execution.
-            unsafe { Exl3Modules::load(device.library, path, Self::INPUT_FORMAT) }
-        }).collect())
+        Self::preload_selected_modules(device, package, rows, policy, selection)
     }
 
     pub(crate) fn whole_workspace_bytes(package: &Path, max_rows: usize,
@@ -751,6 +769,30 @@ mod tests {
         meta.as_object_mut().unwrap().remove("activation");
         write(&meta)?;
         assert!(validate().is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn tp2_package_requires_half_width_fp32_and_native_activation() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let directory = temp.path().join("m1");
+        std::fs::create_dir(&directory)?;
+        let geometry = ExpertGeometry::KIMI_K3;
+        let good = serde_json::json!({"hidden":3584, "intermediate":1536, "experts":896,
+            "top_k":16, "output_dtype":"fp32", "activation":"situ"});
+        let validate = |meta: &serde_json::Value| -> Result<()> {
+            std::fs::write(directory.join("v41_exl3.json"), serde_json::to_vec(meta)?)?;
+            validate_shard_package(temp.path(), 1, Exl3RowPolicy::for_geometry(geometry),
+                RtxSelectionPolicy::FirstCapacity, geometry, u64::from(geometry.intermediate / 2))
+        };
+        validate(&good)?;
+        for (key, value) in [("hidden", serde_json::json!(7168)), ("intermediate", serde_json::json!(3072)),
+            ("experts", serde_json::json!(448)), ("top_k", serde_json::json!(8)),
+            ("output_dtype", serde_json::json!("bf16")), ("activation", serde_json::json!("silu"))] {
+            let mut bad = good.clone();
+            bad[key] = value;
+            assert!(validate(&bad).is_err(), "accepted invalid {key}");
+        }
         Ok(())
     }
 

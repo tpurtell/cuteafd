@@ -10,13 +10,14 @@ use cuteafd_loader::placement::{FfnMode, Hop, HopPoint, LayerExecutionPlan, Laye
 use cuteafd_ffi::CuteafdDeviceBuffer;
 use crate::shared::peer_split::attention::{AttentionStateOwners, LayerKernels, PipelineKernels};
 use super::{block::MixSite, device::LocalLane, spark::RoutedLane};
-use crate::shared::experts::rtx::{exl3::Exl3Tp2, ExpertInput, Routes, RtxExpertLayer, RtxShard};
+use crate::shared::experts::rtx::{exl3::Exl3Tp2, ExpertInput, Routes, RtxExpertLayer, RtxShard, combine::TokenOwnerReduce, pair::SubmissionScope};
 use std::{cell::{Cell, RefCell}, ffi::c_void, rc::Rc};
 
 struct LaneJoins<'a> {
     streams: [Rc<Stream<'a>>; 2],
     produced: RefCell<[Event<'a>; 2]>,
     landed: RefCell<[Event<'a>; 2]>,
+    reducer: RefCell<TokenOwnerReduce<'a>>,
 }
 
 #[derive(Clone, Copy)]
@@ -51,7 +52,7 @@ pub(crate) struct Ticket {
 
 impl<'a> Execution<'a> {
     pub(crate) fn new(plan: LayerExecutionPlan, peer: &PeerExchange<'a>, hops: &HopLink<'a>,
-        streams: Vec<[Rc<Stream<'a>>; 2]>) -> Result<Self> {
+        exchange_streams: [Rc<Stream<'a>>; 2], streams: Vec<[Rc<Stream<'a>>; 2]>) -> Result<Self> {
         hops.validate_binding(&plan, peer)?;
         ensure!(streams.len() as u64 == plan.spec().lanes && !streams.is_empty(),
             "Kimi layer streams differ from admitted lanes");
@@ -66,17 +67,19 @@ impl<'a> Execution<'a> {
             state_ready.push(RefCell::new([Event::new(streams[0][0].device)?, Event::new(streams[0][1].device)?]));
             state_pending.push([Cell::new(false), Cell::new(false)]);
         }
-        let lanes = streams.into_iter().map(|streams| {
+        let lanes = streams.into_iter().enumerate().map(|(lane, streams)| {
             let produced = [Event::new(streams[0].device)?, Event::new(streams[1].device)?];
             let landed = [Event::new(streams[0].device)?, Event::new(streams[1].device)?];
-            Ok(LaneJoins { streams, produced: RefCell::new(produced), landed: RefCell::new(landed) })
+            let reducer = RefCell::new(TokenOwnerReduce::new(peer, exchange_streams.clone(),
+                streams.clone(), lane, plan.spec().rows as usize, 3584)?);
+            Ok(LaneJoins { streams, produced: RefCell::new(produced), landed: RefCell::new(landed), reducer })
         }).collect::<Result<_>>()?;
         Ok(Self { plan, lanes, entry_lane: Cell::new(None), state_ready, state_pending })
     }
 
     /// The family has no second scheduler: use the shared layer-major pipeline
     /// for chunks sharing recurrent history, then materialize the selected terminal view.
-    pub(crate) fn run<'e>(&'e self, scope: &crate::shared::experts::rtx::pair::SubmissionScope<'_>,
+    pub(crate) fn run<'e>(&'e self, scope: &'e SubmissionScope<'_>,
         peer: &'e PeerExchange<'a>, hops: &'e HopLink<'a>,
         locals: &'e mut [[LocalLane<'a>; 2]], routed: &'e mut [RoutedLane<'a>],
         experts: &'e mut [[Option<Exl3Tp2<'a>>; 2]], rows: &[usize], speculative: bool, output: Output) -> Result<Vec<CuteafdDeviceBuffer>> {
@@ -84,7 +87,7 @@ impl<'a> Execution<'a> {
             "Kimi shared pipeline needs matching local, Spark and row lanes");
         let protocol = self.protocol(peer, hops)?;
         let mut bindings = locals.iter_mut().zip(routed).zip(experts).zip(rows).enumerate().map(
-            |(lane, (((local, routed), experts), &rows))| Bindings::new(local, routed, experts, self, peer, hops, lane, rows, speculative)
+            |(lane, (((local, routed), experts), &rows))| Bindings::new(local, routed, experts, self, peer, hops, scope, lane, rows, speculative)
         ).collect::<Result<Vec<_>>>()?;
         crate::shared::peer_split::attention::layer_pipeline_with(scope, &self.plan, &protocol,
             crate::shared::peer_split::attention::LaneOrder::OrderedChunks, rows, &mut bindings)?;
@@ -264,7 +267,8 @@ mod tests {
 
 /// The shared pipeline owns layer/lane ordering; this binding supplies only
 /// arithmetic and the exact payload at each planned boundary.
-pub(crate) struct Bindings<'e, 'a> {
+pub(crate) struct Bindings<'e, 'a, 's> {
+    scope: &'e SubmissionScope<'s>,
     local: &'e mut [LocalLane<'a>; 2],
     routed: &'e mut RoutedLane<'a>,
     experts: &'e mut [Option<Exl3Tp2<'a>>; 2],
@@ -280,10 +284,10 @@ pub(crate) struct Bindings<'e, 'a> {
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) struct FfnTicket { layer: usize, spark: Option<super::spark::Ticket>, rtx: Option<usize> }
 
-impl<'e, 'a> Bindings<'e, 'a> {
+impl<'e, 'a, 's> Bindings<'e, 'a, 's> {
     pub(crate) fn new(local: &'e mut [LocalLane<'a>; 2], routed: &'e mut RoutedLane<'a>,
         experts: &'e mut [Option<Exl3Tp2<'a>>; 2], execution: &'e Execution<'a>, peer: &'e PeerExchange<'a>, hops: &'e HopLink<'a>,
-        lane: usize, rows: usize, speculative: bool) -> Result<Self> {
+        scope: &'e SubmissionScope<'s>, lane: usize, rows: usize, speculative: bool) -> Result<Self> {
         let protocol = execution.protocol(peer, hops)?;
         let joins = execution.lanes.get(lane).context("Kimi binding lane outside admission")?;
         ensure!((1..=execution.plan.spec().rows as usize).contains(&rows)
@@ -313,7 +317,7 @@ impl<'e, 'a> Bindings<'e, 'a> {
         }
         for rank in 0..2 { peer.recv(rank, lane)?; }
         ensure!(peer.slot_bytes() >= rows * 7168 * 2, "Kimi peer slot shorter than hidden rows");
-        Ok(Self { local, routed, experts, protocol, lane, rows, speculative, owners, completed: 0, pending: None })
+        Ok(Self { scope, local, routed, experts, protocol, lane, rows, speculative, owners, completed: 0, pending: None })
     }
 
     fn before_attention(&mut self, layer: usize) -> Result<()> {
@@ -364,6 +368,21 @@ impl<'e, 'a> Bindings<'e, 'a> {
         Ok(())
     }
 
+    /// Copies into retained lane operands, not a second exchange ring. Both
+    /// producer joins include previous readers before any destination overwrite.
+    fn transfer(&self, from: usize, name: &str, bytes: usize) -> Result<()> {
+        let to = 1 - from;
+        let source = self.local[from].buffer(name)?;
+        let destination = self.local[to].buffer(name)?;
+        ensure!(bytes <= source.bytes && bytes <= destination.bytes, "Kimi canonical transfer extent");
+        self.protocol.producers(self.lane, from)?;
+        self.protocol.peer.push_to(from, crate::shared::peer_split::DIRECT,
+            source.ptr, destination.ptr, bytes)?;
+        self.protocol.consumer(self.lane, from)?;
+        self.protocol.peer.wait(to, crate::shared::peer_split::DIRECT)?;
+        self.protocol.consumer(self.lane, to)
+    }
+
     /// Called after the shared pipeline, only on the head rank that owns the
     /// output score/norm weights. The other rank's stored history remains intact.
     pub(crate) fn output(&mut self, output: Output) -> Result<CuteafdDeviceBuffer> {
@@ -376,7 +395,7 @@ impl<'e, 'a> Bindings<'e, 'a> {
     }
 }
 
-impl LayerKernels for Bindings<'_, '_> {
+impl LayerKernels for Bindings<'_, '_, '_> {
     fn pack(&mut self, hop: Hop) -> Result<*const c_void> {
         ensure!(matches!(hop.at, HopPoint::Entry | HopPoint::AfterAttention(_)),
             "Kimi split-FFN plan cannot move a residual history arena");
@@ -419,7 +438,7 @@ impl LayerKernels for Bindings<'_, '_> {
     }
 }
 
-impl PipelineKernels for Bindings<'_, '_> {
+impl PipelineKernels for Bindings<'_, '_, '_> {
     type FfnTicket = FfnTicket;
     fn state_owners(&self, layer: usize) -> Result<AttentionStateOwners<'_>> {
         let owners = self.owners.get(layer).context("Kimi layer census outside inventory")?;
@@ -428,43 +447,66 @@ impl PipelineKernels for Bindings<'_, '_> {
     fn begin_ffn(&mut self, layer: usize, owner: Option<usize>) -> Result<FfnTicket> {
         ensure!(owner.is_none() && self.pending.is_none(), "Kimi FFN owner or unfinished wave");
         for local in self.local.iter_mut() { local.residual(MixSite::Ffn(layer), self.rows)?; }
-        let rtx = self.experts.iter().position(|expert| expert.as_ref().is_some_and(|e| e.layers().contains(&layer)));
-        let spark = if self.local[0].config().dense[layer] {
-            for local in self.local.iter_mut() { local.ffn(layer, self.rows)?; }
-            None
-        } else if let Some(rank) = rtx {
-            let (routes, wire) = self.local[rank].route(layer, self.rows)?;
-            let stream = self.local[rank].stream();
-            let expert = self.experts[rank].as_mut().context("Kimi missing whole expert owner")?;
-            ensure!(expert.shard() == RtxShard::Whole && expert.device() == stream.device.id,
-                "Kimi whole expert shard/device differs from lane");
-            // SAFETY: admitted route/wire/output owners live through engine
-            // teardown; this exact lane stream serializes scratch reuse.
-            unsafe { expert.enqueue(layer, self.rows, ExpertInput::Fp8K32(wire.ptr),
-                Routes { ids: routes.ids.ptr, weights: routes.weights.ptr }, stream.raw,
-                &mut || crate::shared::decode_graph::fatal_drain(self.protocol.peer.publish_abort(),
-                    "Kimi whole expert abort"))?; }
-            let output = CuteafdDeviceBuffer { ptr: expert.output(), bytes: self.rows * 3584 * 4,
-                device_id: stream.device.id, flags: 0 };
-            let combined = self.local[rank].buffer("expert combined")?;
-            stream.device.run(|| {
-                // SAFETY: conversion follows the full FP32 token sum on its
-                // exact producer stream, before latent-up consumes BF16.
-                unsafe { stream.device.library.cuda_f32_to_bf16_async(output, combined,
-                    self.rows * 3584, stream.raw) }
-            })?;
+        let dense = self.local[0].config().dense[layer];
+        let owner = if dense { 0 } else { super::weights::routed_owner(self.local[0].config(), layer)? };
+        let rtx = !dense && self.experts.iter().any(|expert|
+            expert.as_ref().is_some_and(|e| e.layers().contains(&layer)));
+        let spark = if dense {
             for local in self.local.iter_mut() { local.ffn(layer, self.rows)?; }
             None
         } else {
-            let kind = if self.speculative { cuteafd_transport::ExpertV2SourceKind::MtpVerify }
-                else if self.rows > 64 { cuteafd_transport::ExpertV2SourceKind::Prefill }
-                else { cuteafd_transport::ExpertV2SourceKind::Decode };
-            let ticket = self.routed.begin(&mut self.local[0], layer, self.rows, kind)?;
-            self.local[1].ffn(layer, self.rows)?;
-            Some(ticket)
+            let (canonical, wire) = self.local[owner].route(layer, self.rows)?;
+            if rtx || owner == 0 {
+                for (name, bytes) in [("route ids", canonical.ids.bytes),
+                    ("route weights", canonical.weights.bytes), ("expert wire", wire.bytes)] {
+                    self.transfer(owner, name, bytes)?;
+                }
+            }
+            if rtx {
+                for rank in 0..2 {
+                    let stream = self.local[rank].stream();
+                    let expert = self.experts[rank].as_mut().context("Kimi missing TP2 expert rank")?;
+                    ensure!(expert.shard() == (RtxShard::Tp2 { rank: rank as u8 })
+                        && expert.device() == stream.device.id && expert.layers().contains(&layer),
+                        "Kimi TP2 expert shard/device/layers differ from admission");
+                    // SAFETY: canonical input publication joins this exact lane;
+                    // weights and scratch survive replay and terminal teardown.
+                    unsafe { expert.enqueue(layer, self.rows,
+                        ExpertInput::Fp8K32(self.local[rank].buffer("expert wire")?.ptr),
+                        Routes { ids: self.local[rank].buffer("route ids")?.ptr,
+                            weights: self.local[rank].buffer("route weights")?.ptr }, stream.raw,
+                        &mut || crate::shared::decode_graph::fatal_drain(self.protocol.peer.publish_abort(),
+                            "Kimi TP2 expert abort"))?; }
+                }
+                let experts = self.experts.each_ref().map(|expert| expert.as_ref().unwrap());
+                ensure!(experts[0].partial() == experts[1].partial()
+                    && experts[0].partial_layout(self.rows)? == experts[1].partial_layout(self.rows)?,
+                    "Kimi TP2 partial contracts differ");
+                let partials = std::array::from_fn(|rank| CuteafdDeviceBuffer {
+                    ptr: experts[rank].output(), bytes: self.rows * 3584 * 4,
+                    device_id: experts[rank].device(), flags: 0 });
+                // SAFETY: both final FP32 token partials are on the retained
+                // producer streams; reduction completes before hidden-slot reuse.
+                unsafe { self.protocol.execution.lanes[self.lane].reducer.borrow_mut().reduce(
+                    self.scope, self.protocol.peer, owner, self.rows, partials,
+                    self.local[owner].buffer("expert combined")?, experts[0].partial(),
+                    experts[0].partial_layout(self.rows)?)?; }
+                for local in self.local.iter_mut() { local.ffn(layer, self.rows)?; }
+                None
+            } else {
+                let kind = if self.speculative { cuteafd_transport::ExpertV2SourceKind::MtpVerify }
+                    else if self.rows > 64 { cuteafd_transport::ExpertV2SourceKind::Prefill }
+                    else { cuteafd_transport::ExpertV2SourceKind::Decode };
+                let routes = cuteafd_ffi::KimiRoutes {
+                    ids: self.local[1].buffer("route ids")?, weights: self.local[1].buffer("route weights")? };
+                let wire = self.local[1].buffer("expert wire")?;
+                let ticket = self.routed.begin(&mut self.local[1], layer, self.rows, kind, routes, wire)?;
+                self.local[0].ffn(layer, self.rows)?;
+                Some(ticket)
+            }
         };
         self.publish("ffn output")?;
-        let ticket = FfnTicket { layer, spark, rtx };
+        let ticket = FfnTicket { layer, spark, rtx: rtx.then_some(owner) };
         self.pending = Some(ticket);
         Ok(ticket)
     }
@@ -472,8 +514,11 @@ impl PipelineKernels for Bindings<'_, '_> {
         ensure!(self.pending == Some(ticket) && ticket.layer == layer, "Kimi FFN ticket differs from pending layer");
         if ticket.spark.is_some() || ticket.rtx.is_some() {
             self.meet("ffn output", "shared output")?;
-            let rank = ticket.rtx.unwrap_or(0);
-            if let Some(spark) = ticket.spark { self.routed.finish(&self.local[0], spark)?; }
+            let rank = super::weights::routed_owner(self.local[0].config(), layer)?;
+            if let Some(spark) = ticket.spark {
+                self.routed.finish(&self.local[1], spark)?;
+                if rank == 0 { self.transfer(1, "expert combined", self.rows * 3584 * 2)?; }
+            }
             let output = self.local[rank].latent_up(layer, self.rows)?;
             let other = 1 - rank;
             self.protocol.producers(self.lane, rank)?;

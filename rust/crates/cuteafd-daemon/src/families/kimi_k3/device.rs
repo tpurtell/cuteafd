@@ -338,6 +338,7 @@ pub(crate) struct LocalLane<'a> {
     layers: Vec<Rc<super::weights::LayerWeights<'a>>>,
     global: Rc<GlobalWeights<'a>>,
     lane_index: usize,
+    rank: usize,
     kda: Rc<super::state::KdaBank<'a>>,
     mla: Rc<super::mla::CacheBank<'a>>,
     attention: Option<AttentionShape>,
@@ -355,7 +356,8 @@ impl Drop for LocalLane<'_> {
 impl<'a> LocalLane<'a> {
     pub(super) fn new(lane: Lane<'a>, programs: Rc<NativePrograms<'a>>, cfg: KimiK3Config,
         layers: Vec<Rc<super::weights::LayerWeights<'a>>>, global: Rc<GlobalWeights<'a>>,
-        lane_index: usize, kda: Rc<super::state::KdaBank<'a>>, mla: Rc<super::mla::CacheBank<'a>>) -> Result<Self> {
+        lane_index: usize, rank: usize, kda: Rc<super::state::KdaBank<'a>>, mla: Rc<super::mla::CacheBank<'a>>) -> Result<Self> {
+        ensure!(rank < 2, "Kimi local rank outside TP2 admission");
         let device = lane.stream.device;
         ensure!(programs.device.id == device.id && std::ptr::eq(programs.device.library, device.library),
             "Kimi local programs differ from admitted lane device");
@@ -365,7 +367,7 @@ impl<'a> LocalLane<'a> {
         global.check_device(device)?;
         kda.check_reader(lane_index, &lane.stream)?;
         mla.check_reader(lane_index, &lane.stream)?;
-        Ok(Self { lane, programs, cfg, layers, global, lane_index, kda, mla, attention: None, graphs: None, replay_enabled: true })
+        Ok(Self { lane, programs, cfg, layers, global, lane_index, rank, kda, mla, attention: None, graphs: None, replay_enabled: true })
     }
 
     fn layer(&self, layer: usize) -> Result<&super::weights::LayerWeights<'a>> {
@@ -384,7 +386,6 @@ impl<'a> LocalLane<'a> {
 
     pub(super) fn rows(&self) -> usize { self.lane.rows() }
     pub(super) fn lane_index(&self) -> usize { self.lane_index }
-    pub(super) fn has_embedding(&self) -> bool { self.global.buffer("embedding").is_ok() }
     pub(super) fn config(&self) -> &KimiK3Config { &self.cfg }
     pub(super) fn max_context(&self) -> usize { self.lane.layout.max_context() }
     pub(super) fn prefix_banks(&self) -> (Rc<super::state::KdaBank<'a>>, Rc<super::mla::CacheBank<'a>>) {
@@ -455,7 +456,7 @@ impl<'a> LocalLane<'a> {
     pub(crate) fn warm_graphs(&mut self, keys: &[super::graphs::Key], rank: usize) -> Result<()> {
         use super::graphs::Op;
         ensure!(self.graphs.is_none() && keys.iter().all(|key|
-            key.lane == self.lane_index && key.rank == rank && key.rows <= self.rows()),
+            rank == self.rank && key.lane == self.lane_index && key.rank == rank && key.rows <= self.rows()),
             "Kimi startup graph keys differ from local binding");
         let stream = self.stream().clone();
         let staged = self.attention.take();
@@ -479,7 +480,7 @@ impl<'a> LocalLane<'a> {
 
     fn replay(&mut self, rows: usize, op: super::graphs::Op) -> Result<bool> {
         if !self.replay_enabled { return Ok(false); }
-        let rank = usize::from(!self.has_embedding());
+        let rank = self.rank;
         let key = super::graphs::Key { lane: self.lane_index, rank, rows, op };
         let stream = self.stream().clone();
         self.graphs.as_mut().map_or(Ok(false), |graphs| graphs.launch(key, &stream))

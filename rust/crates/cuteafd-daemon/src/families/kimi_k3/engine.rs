@@ -51,9 +51,9 @@ fn check_exchange_handles(expected: [(i32, *mut std::ffi::c_void); 2],
 fn check_expert_owners(layers: &[cuteafd_loader::placement::LayerAssignment], owners: [&[usize]; 2]) -> Result<()> {
     for rank in 0..2 {
         let expected = layers.iter().enumerate().filter_map(|(layer, assignment)|
-            (assignment.experts == cuteafd_loader::placement::ExpertHome::RtxWhole { gpu: rank as u8 }).then_some(layer))
+            (assignment.experts == cuteafd_loader::placement::ExpertHome::RtxTp2).then_some(layer))
             .collect::<Vec<_>>();
-        ensure!(owners[rank] == expected, "Kimi whole expert owners differ from accepted per-layer placement");
+        ensure!(owners[rank] == expected, "Kimi TP2 expert owners differ from accepted per-layer placement");
     }
     Ok(())
 }
@@ -65,10 +65,10 @@ mod tests {
     #[test]
     fn whole_expert_bindings_require_exact_sparse_owner_sets() -> Result<()> {
         use cuteafd_loader::placement::{LayerAssignment, LayerMode, ExpertHome};
-        let layers = [ExpertHome::Dense, ExpertHome::RtxWhole { gpu: 0 },
-            ExpertHome::RtxWhole { gpu: 1 }, ExpertHome::RtxWhole { gpu: 0 }, ExpertHome::Spark]
+        let layers = [ExpertHome::Dense, ExpertHome::RtxTp2,
+            ExpertHome::RtxTp2, ExpertHome::RtxTp2, ExpertHome::Spark]
             .map(|experts| LayerAssignment { mode: LayerMode::HeadSplit, experts });
-        check_expert_owners(&layers, [&[1, 3], &[2]])?;
+        check_expert_owners(&layers, [&[1, 2, 3], &[1, 2, 3]])?;
         for wrong in [[&[1, 2, 3][..], &[2][..]], [&[1, 3][..], &[][..]],
             [&[2][..], &[1, 3][..]]] {
             assert!(check_expert_owners(&layers, wrong).is_err());
@@ -153,7 +153,7 @@ impl<'a> Engine<'a> {
         drop((weights, kda, mla));
         pending.wait()?;
         let world = SparkWorld::canonical(6)?;
-        let routed = local.iter().map(|pair| admission.connect_spark(library, &pair[0],
+        let routed = local.iter().map(|pair| admission.connect_spark(library, &pair[1],
             world, peers.clone(), config.clone())).collect::<Result<Vec<_>>>()?;
         Self::bind(exchange_streams, plan, peer, hops, local, routed, io, experts)
     }
@@ -176,7 +176,7 @@ impl<'a> Engine<'a> {
             }
         }
         let streams = local.iter().map(|pair| pair.each_ref().map(|local| local.stream().clone())).collect();
-        let execution = Execution::new(plan, &peer, &hops, streams)?;
+        let execution = Execution::new(plan, &peer, &hops, exchange_streams.clone(), streams)?;
         Ok(Self { execution, lanes: RefCell::new(Lanes { local, routed, io, experts }),
             prefix: RefCell::new(None), startup_captures: Cell::new(None), hops, peer, exchange_streams })
     }
