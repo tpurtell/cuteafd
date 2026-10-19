@@ -52,11 +52,14 @@ def atomic_json(path, value):
 
 
 class LayerState:
-    def __init__(self, root, binding):
+    def __init__(self, root, binding, *, diagnostic_prefix=None):
         self.root = root
         root.mkdir(parents=True, exist_ok=True)
         latest = root / "latest.json"
         self.latest = json.loads(latest.read_bytes()) if latest.exists() else None
+        self.diagnostic_prefix = diagnostic_prefix
+        if self.latest and self.latest.get("diagnostic_prefix") != diagnostic_prefix:
+            raise ValueError("diagnostic prefix state cannot qualify or change its stop layer")
         if self.latest and self.latest["binding"] != binding:
             raise ValueError("resume source, set, arithmetic or runtime differs")
         self.binding = binding
@@ -64,6 +67,10 @@ class LayerState:
             for entry in self.latest["windows"].values():
                 for blob in [entry["hidden"], *entry["blocks"]]:
                     self.verify(blob)
+
+    def require_scoring(self):
+        if self.latest and "diagnostic_prefix" in self.latest:
+            raise ValueError("diagnostic prefix state cannot be scored or published")
 
     def contained(self, name):
         path = self.root / name
@@ -102,7 +109,8 @@ class LayerState:
         if pending.exists():
             shutil.rmtree(pending)
         pending.mkdir()
-        return {"schema": "cuteafd.kimi.layer-state/1", "binding": self.binding,
+        flags = {} if self.diagnostic_prefix is None else {"diagnostic_prefix": self.diagnostic_prefix}
+        return {"schema": "cuteafd.kimi.layer-state/1", "binding": self.binding, **flags,
                 "layer": layer, "windows": {},
                 "checks": list(self.latest.get("checks", [])) if self.latest else [],
                 "native_fp32_parameters": list(self.latest.get("native_fp32_parameters", [])) if self.latest else []}
@@ -216,6 +224,15 @@ def official_check(out, arrays, per_layer):
 
 
 def execute(a):
+    stop = getattr(a, "stop_after_layer", None)
+    state_root = (a._kimi_probe_state if getattr(a, "_prefix_probe", False) else
+                  a.out.parent / (a.out.name + "-layer-state"))
+    latest = state_root / "latest.json"
+    if latest.exists() and "diagnostic_prefix" in json.loads(latest.read_bytes()) and stop is None:
+        raise ValueError("diagnostic prefix state cannot be scored or published")
+    if stop is not None and any((a.out / name).exists() for name in
+                               ("meta.json", "prefix-qualification.json", "golden-seal.json")):
+        raise ValueError("diagnostic prefix cannot reuse a qualified output directory")
     import numpy as np
     import torch
     import torch.nn.functional as F
@@ -234,6 +251,8 @@ def execute(a):
         raise ValueError("Kimi oracle supports only its own text panel")
     snapshot = verify_snapshot(manifest, a.snapshot)
     reference, config, quantization = load_official(a.snapshot)
+    if stop is not None and not 0 <= stop < config.num_hidden_layers:
+        raise ValueError("diagnostic stop layer is outside checkpoint")
     weights = LayerWeights(a.snapshot, quantization, dtype=torch.float32,
                            kda_num_heads=config.linear_attn_config["num_heads"])
     # Check every layer shape and only the small A_log tails before GPU admission.
@@ -259,14 +278,15 @@ def execute(a):
             "reference_adapter_sha256": digest(Path(__file__).with_name("model.py")),
             "reference_runner_sha256": digest(Path(__file__))}
     checking = getattr(a, "_prefix_probe", False)
-    if not checking:
+    if not checking and stop is None:
         a._kimi_probe_state = a.out.parent / (a.out.name + "-prefix-state")
         # Keep interrupted evidence, but leave exactly one raw probe in the seal.
         for previous in a.out.glob("prefix-gate-*"):
             archive = a.out.parent / "prefix-history"
             archive.mkdir(exist_ok=True)
             previous.rename(archive / previous.name)
-    proof = qualify(a, manifest, execute)
+    # A diagnostic prefix is never passed to qualification or output scoring.
+    proof = qualify(a, manifest, execute) if stop is None else None
     windows = copy.deepcopy(manifest["windows"])
     if checking:
         for name in ("official_short", "adapted_short"):
@@ -284,7 +304,8 @@ def execute(a):
                "state_bytes_per_layer": sum(len(w["tokens"]) * config.hidden_size * 4 for w in windows),
                "windows": {w["id"]: hashlib.sha256(canonical(w["tokens"])).hexdigest() for w in windows}}
     state = LayerState(a._kimi_probe_state if checking else
-                       a.out.parent / (a.out.name + "-layer-state"), binding)
+                       a.out.parent / (a.out.name + "-layer-state"), binding,
+                       diagnostic_prefix=stop)
     with torch.inference_mode():
         if state.latest is None:
             embedding = weights.weight("language_model.model.embed_tokens.weight")
@@ -296,7 +317,7 @@ def execute(a):
             state.commit(pending)
             del embedding
         print(f"resume after layer {state.latest['layer']}; {len(windows)} streams", flush=True)
-        for index in range(state.latest["layer"] + 1, config.num_hidden_layers):
+        for index in range(state.latest["layer"] + 1, config.num_hidden_layers if stop is None else stop + 1):
             tick = time.monotonic()
             layer = native_layer(reference, config, weights, index)
             pending = state.begin(index)
@@ -333,6 +354,11 @@ def execute(a):
             weights.release_experts()
             torch.cuda.empty_cache()
             print(f"layer {index + 1}/{config.num_hidden_layers} committed; {time.monotonic() - tick:.1f}s; read {weights.bytes_read / 1e9:.3f} GB", flush=True)
+        if stop is not None:
+            weights.close()
+            print(f"diagnostic only: retained layer {state.latest['layer']}; no scores or publication", flush=True)
+            return
+        state.require_scoring()
         with torch.device("meta"):
             norm = reference.KimiRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
             output_norm = reference.KimiRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -397,6 +423,8 @@ def main():
     for name in ("snapshot", "windows", "out"):
         parser.add_argument("--" + name, type=Path, required=True)
     parser.add_argument("--layers", type=int, default=None)
+    parser.add_argument("--stop-after-layer", type=int, default=None,
+                        help="diagnostic only: retain residual at this zero-based layer; never score or publish")
     parser.add_argument("--diagnose-layer", type=int, default=None,
                         help="compare native/fixed sub-ops at layer 1 without running a golden")
     parser.add_argument("--diagnose-official-noise", action="store_true",
@@ -410,6 +438,10 @@ def main():
     args = parser.parse_args()
     if args.layers is not None:
         raise ValueError("partial layers cannot qualify a Kimi reference")
+    if args.stop_after_layer is not None and (args.stop_after_layer < 0
+            or args.diagnose_layer is not None or args.diagnose_official_noise
+            or args.diagnose_linear_variants or args.diagnose_blas or args.probe_state):
+        raise ValueError("--stop-after-layer requires a nonnegative layer and no other diagnostic mode")
     if args.diagnose_official_noise:
         if args.diagnose_layer is not None or args.diagnose_linear_variants or args.diagnose_blas:
             raise ValueError("official noise diagnosis uses only native cuBLAS batch geometry")

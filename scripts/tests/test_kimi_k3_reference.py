@@ -349,6 +349,52 @@ def test_resume_advances_only_after_atomic_layer_commit(tmp_path):
     assert not (tmp_path / "layer-01").exists()
 
 
+@pytest.mark.parametrize("stop", [0, 2])
+def test_diagnostic_prefix_is_durable_and_cannot_score_or_resume_as_golden(tmp_path, stop):
+    state = golden.LayerState(tmp_path, {"state_dtype": "float32"}, diagnostic_prefix=stop)
+    for index in range(-1, stop + 1):
+        pending = state.begin(index)
+        blob(tmp_path, pending, "window")
+        state.commit(pending)
+        assert json.loads((tmp_path / "latest.json").read_bytes())["diagnostic_prefix"] == stop
+    resumed = golden.LayerState(tmp_path, state.binding, diagnostic_prefix=stop)
+    assert resumed.latest["layer"] == stop
+    with pytest.raises(ValueError, match="cannot be scored or published"):
+        resumed.require_scoring()
+    with pytest.raises(ValueError, match="cannot qualify"):
+        golden.LayerState(tmp_path, state.binding)
+    with pytest.raises(ValueError, match="cannot qualify"):
+        golden.LayerState(tmp_path, state.binding, diagnostic_prefix=stop + 1)
+
+
+def test_execute_refuses_diagnostic_state_before_runtime_or_scoring(tmp_path, monkeypatch):
+    out = tmp_path / "golden"
+    root = tmp_path / "golden-layer-state"
+    root.mkdir()
+    (root / "latest.json").write_text(json.dumps({"diagnostic_prefix": 0}))
+    monkeypatch.setattr(golden, "finish_golden", lambda *args, **kwargs: pytest.fail("published diagnostic"))
+    with pytest.raises(ValueError, match="cannot be scored or published"):
+        golden.execute(types.SimpleNamespace(out=out))
+
+
+def test_diagnostic_prefix_refuses_existing_scores(tmp_path):
+    out = tmp_path / "golden"
+    out.mkdir()
+    (out / "meta.json").write_text("{}")
+    with pytest.raises(ValueError, match="qualified output directory"):
+        golden.execute(types.SimpleNamespace(out=out, stop_after_layer=0))
+
+
+def test_unflagged_state_cannot_be_repurposed_as_diagnostic(tmp_path):
+    state = golden.LayerState(tmp_path, {})
+    pending = state.begin(-1)
+    blob(tmp_path, pending, "window")
+    state.commit(pending)
+    state.require_scoring()
+    with pytest.raises(ValueError, match="cannot qualify"):
+        golden.LayerState(tmp_path, {}, diagnostic_prefix=0)
+
+
 def test_resume_rejects_changed_binding_or_blob(tmp_path):
     state = golden.LayerState(tmp_path, {"set": "fixture"})
     pending = state.begin(-1)
