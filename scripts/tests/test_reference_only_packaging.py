@@ -208,6 +208,25 @@ def test_dense_root_wording_is_unchanged_and_v41_root_comes_from_the_manifest():
     assert (arithmetic, source) == ('Official inference/model.py block by block.', 'official inference/model.py')
 
 
+def test_sealed_f32_arithmetic_supplies_precision_without_mutating_panel():
+    import copy
+    panel = {'reference_snapshot': {}}
+    original = copy.deepcopy(panel)
+    meta = {'root_arithmetic': copy.deepcopy(packager.KIMI_F32_ROOT)}
+    precision, arithmetic, source = packager.root_description(meta, panel)
+    assert precision == 'root (native MXFP4 experts and shipped BF16/F32 dense tensors, computed in F32)'
+    assert arithmetic == packager.KIMI_F32_ROOT['arithmetic']
+    assert source == packager.KIMI_F32_ROOT['source']
+    assert panel == original
+    for key in ('arithmetic', 'source'):
+        changed = copy.deepcopy(meta)
+        changed['root_arithmetic'][key] += ' changed'
+        with pytest.raises(ValueError, match='missing reference precision'):
+            packager.root_description(changed, panel)
+    with pytest.raises(ValueError, match='missing reference precision'):
+        packager.root_description({'root_arithmetic': {'arithmetic': 'unknown', 'source': 'unknown'}}, panel)
+
+
 def test_reference_role_metrics_and_card_explain_aggregate_nll():
     validation = dict(nll=3.4, scored_tokens=10, nll_gen=.2, nll_ctx=8.2,
                       gen_top1=.95, scored_tokens_gen=6, scored_tokens_ctx=4)
