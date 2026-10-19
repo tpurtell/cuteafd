@@ -1,6 +1,4 @@
-//! TP2 RTX routed experts for every family (PLAN "v3 placement: design",
-//! section 2). In a 2-RTX layout the routed experts resident on the RTX cards
-//! are always TP2 halves: each GPU runs half of every resident expert (split on
+//! Shared whole-layer and TP2 RTX routed experts. For TP2 shards, each GPU runs half of every resident expert (split on
 //! the intermediate dimension) on its own bitwise-identical copy of the FFN
 //! input and routes, and the halves meet in the head split's existing FFN
 //! exchange ([`Combine::FusedAllReduce`]) or, for layer-range engines (V4.1),
@@ -33,7 +31,7 @@ pub(crate) use routes::{RouteCheck, RouteIdentity, RouteSource};
 /// Which part of each routed expert a resident layer set holds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RtxShard {
-    /// Complete experts on one GPU (single-RTX layouts).
+    /// Complete experts on one GPU, independent of the attention ownership.
     Whole,
     /// Half the intermediate dimension of every expert; rank 0 holds the
     /// first half of the gate/up rows and the matching down-projection columns.
