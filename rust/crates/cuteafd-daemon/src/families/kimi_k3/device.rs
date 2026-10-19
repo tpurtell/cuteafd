@@ -423,6 +423,105 @@ impl<'a> LocalLane<'a> {
     }
 }
 
+/// A scheduler-owned sequence stretch. Pages come from the shared RefPagePool;
+/// a copied partial tail must be private before any append targets it.
+pub(crate) struct SequenceRows<'p> {
+    pub slot: usize,
+    pub start: usize,
+    pub rows: usize,
+    pub pages: &'p [u32],
+}
+
+/// Host metadata is rebuilt outside capture, then copied into fixed lane buffers.
+/// For <=64 rows, MLA treats each query as one request with its own visible
+/// length, so the native request scalar depends only on rows, not partitions.
+struct AttentionRows {
+    rows: usize,
+    sequences: usize,
+    width: usize,
+    kda_slots: Vec<u8>,
+    kda_first: Vec<u8>,
+    mla_slots: Vec<u8>,
+    page_table: Vec<u8>,
+    lengths: Vec<u8>,
+    offsets: Vec<u8>,
+}
+
+impl AttentionRows {
+    fn new(sequences: &[SequenceRows<'_>], capacity: usize, slots: usize, max_context: usize,
+        pool: &cuteafd_engine::prefix::RefPagePool) -> Result<Self> {
+        ensure!((1..=4096).contains(&capacity) && (1..=64).contains(&slots)
+            && (1..=1_048_576).contains(&max_context), "Kimi row descriptor capacity");
+        ensure!(!pool.is_parity() && pool.page_rows() == 64, "Kimi rows require shared uniform 64-row pages");
+        ensure!(!sequences.is_empty() && sequences.len() <= slots, "Kimi row descriptor sequence count");
+        let rows = sequences.iter().try_fold(0usize, |n, sequence| n.checked_add(sequence.rows)
+            .ok_or_else(|| anyhow::anyhow!("Kimi row descriptor overflow")))?;
+        ensure!(rows > 0 && rows <= capacity && (rows <= 64 || sequences.len() == 1),
+            "Kimi wide prefill requires one sequence and admitted rows");
+        let width = max_context.div_ceil(64);
+        let requests = if rows <= 64 { rows } else { 1 };
+        let mut metadata = Self { rows, sequences: sequences.len(), width,
+            kda_slots: Vec::with_capacity(rows * 4), kda_first: Vec::with_capacity(rows * 4),
+            mla_slots: Vec::with_capacity(rows * 8), page_table: vec![0; requests * width * 4],
+            lengths: Vec::with_capacity(requests * 4), offsets: Vec::with_capacity((requests + 1) * 4) };
+        let mut used_slots = std::collections::BTreeSet::new();
+        let mut page_users = BTreeMap::<u32, (usize, bool)>::new();
+        let mut row = 0;
+        metadata.offsets.extend_from_slice(&0i32.to_le_bytes());
+        for (index, sequence) in sequences.iter().enumerate() {
+            ensure!(sequence.rows > 0 && sequence.slot < slots && used_slots.insert(sequence.slot),
+                "Kimi sequence slots repeat or exceed admission");
+            let end = sequence.start.checked_add(sequence.rows).ok_or_else(|| anyhow::anyhow!("Kimi row position overflow"))?;
+            ensure!(end <= max_context && sequence.pages.len() >= end.div_ceil(64),
+                "Kimi sequence context/pages too short");
+            let pages = &sequence.pages[..end.div_ceil(64)];
+            let mut unique = std::collections::BTreeSet::new();
+            for (position, &page) in pages.iter().enumerate() {
+                ensure!((page as usize) < pool.capacity() + pool.reserved() && page as usize >= pool.reserved()
+                    && unique.insert(page), "Kimi sequence page outside pool or repeated");
+                let writable = position >= sequence.start / 64;
+                ensure!(pool.refs(page) > 0 && (!writable || pool.refs(page) == 1),
+                    "Kimi write requires an allocated private page (copy shared tails first)");
+                if let Some(&(previous, previous_writable)) = page_users.get(&page) {
+                    ensure!(previous == index || (!writable && !previous_writable),
+                        "Kimi requests alias a writable page");
+                }
+                page_users.insert(page, (index, writable));
+            }
+            let first = row;
+            for offset in 0..sequence.rows {
+                metadata.kda_slots.extend_from_slice(&(sequence.slot as i32).to_le_bytes());
+                metadata.kda_first.extend_from_slice(&(first as i32).to_le_bytes());
+                let position = sequence.start + offset;
+                let physical = i64::from(pages[position / 64]) * 64 + (position % 64) as i64;
+                metadata.mla_slots.extend_from_slice(&physical.to_le_bytes());
+                if rows <= 64 {
+                    metadata.lengths.extend_from_slice(&((position + 1) as i32).to_le_bytes());
+                    metadata.offsets.extend_from_slice(&((row + 1) as i32).to_le_bytes());
+                    for (j, page) in pages.iter().enumerate() {
+                        let at = (row * width + j) * 4;
+                        metadata.page_table[at..at + 4].copy_from_slice(&page.to_le_bytes());
+                    }
+                }
+                row += 1;
+            }
+            if rows > 64 {
+                metadata.lengths.extend_from_slice(&(end as i32).to_le_bytes());
+                metadata.offsets.extend_from_slice(&(rows as i32).to_le_bytes());
+                for (j, page) in pages.iter().enumerate() {
+                    metadata.page_table[j * 4..j * 4 + 4].copy_from_slice(&page.to_le_bytes());
+                }
+            }
+        }
+        Ok(metadata)
+    }
+
+    fn uploads(&self) -> [(&'static str, &[u8]); 6] {
+        [("KDA slots", &self.kda_slots), ("KDA first", &self.kda_first), ("MLA slots", &self.mla_slots),
+            ("MLA page table", &self.page_table), ("MLA lengths", &self.lengths), ("MLA query offsets", &self.offsets)]
+    }
+}
+
 /// Head handles/workspaces are lane-local: independent compute streams must
 /// never enqueue concurrent work through the same cuBLAS handle or workspace.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -591,6 +690,92 @@ impl Ops for Pending {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn i32_metadata(bytes: &[u8]) -> Vec<i32> {
+        bytes.chunks_exact(4).map(|value| i32::from_le_bytes(value.try_into().unwrap())).collect()
+    }
+
+    #[test]
+    fn attention_rows_keep_mla_shape_independent_of_sequence_partition() -> Result<()> {
+        let mut pool = cuteafd_engine::prefix::RefPagePool::with_reserved(8, 64, 1);
+        let a = pool.alloc(2)?;
+        let b = pool.alloc(1)?;
+        let metadata = AttentionRows::new(&[
+            SequenceRows { slot: 3, start: 63, rows: 3, pages: &a },
+            SequenceRows { slot: 1, start: 7, rows: 2, pages: &b },
+        ], 64, 4, 256, &pool)?;
+        assert_eq!((metadata.rows, metadata.sequences, metadata.width), (5, 2, 4));
+        assert_eq!(i32_metadata(&metadata.kda_slots), [3, 3, 3, 1, 1]);
+        assert_eq!(i32_metadata(&metadata.kda_first), [0, 0, 0, 3, 3]);
+        assert_eq!(i32_metadata(&metadata.lengths), [64, 65, 66, 8, 9]);
+        assert_eq!(i32_metadata(&metadata.offsets), [0, 1, 2, 3, 4, 5]);
+        let physical = metadata.mla_slots.chunks_exact(8).map(|value|
+            i64::from_le_bytes(value.try_into().unwrap())).collect::<Vec<_>>();
+        assert_eq!(physical, [i64::from(a[0]) * 64 + 63, i64::from(a[1]) * 64,
+            i64::from(a[1]) * 64 + 1, i64::from(b[0]) * 64 + 7, i64::from(b[0]) * 64 + 8]);
+        let table = i32_metadata(&metadata.page_table);
+        for row in 0..3 { assert_eq!(&table[row * 4..row * 4 + 4], &[a[0] as i32, a[1] as i32, 0, 0]); }
+        for row in 3..5 { assert_eq!(&table[row * 4..row * 4 + 4], &[b[0] as i32, 0, 0, 0]); }
+        let cfg = cuteafd_loader::families::kimi_k3::config::KimiK3Config::from_hf(
+            &cuteafd_loader::plan::testing::kimi_k3_config())?;
+        let layout = LaneLayout::new(&cfg, 64, 256, NativeScratch { kda: 16, mla: [16; 3] })?;
+        for (name, bytes) in metadata.uploads() { assert!(bytes.len() <= layout.operands[name]); }
+        let single = AttentionRows::new(&[SequenceRows { slot: 0, start: 60, rows: 5, pages: &a }],
+            64, 4, 256, &pool)?;
+        assert_eq!(single.page_table.len(), metadata.page_table.len());
+        assert_eq!(single.offsets, metadata.offsets);
+        assert_eq!(single.lengths.len(), metadata.lengths.len());
+        Ok(())
+    }
+
+    #[test]
+    fn attention_rows_allow_shared_full_prefix_but_reject_shared_writes() -> Result<()> {
+        let mut pool = cuteafd_engine::prefix::RefPagePool::new(8, 64);
+        let prefix = pool.alloc(1)?;
+        pool.share(&prefix);
+        let a = [prefix[0], pool.alloc(1)?[0]];
+        let b = [prefix[0], pool.alloc(1)?[0]];
+        let rows = [SequenceRows { slot: 0, start: 64, rows: 1, pages: &a },
+            SequenceRows { slot: 1, start: 64, rows: 1, pages: &b }];
+        assert!(AttentionRows::new(&rows, 64, 2, 128, &pool).is_ok());
+        assert!(AttentionRows::new(&[SequenceRows { slot: 0, start: 63, rows: 1, pages: &a }],
+            64, 2, 128, &pool).is_err());
+        let aliased = [SequenceRows { slot: 0, start: 64, rows: 1, pages: &a },
+            SequenceRows { slot: 1, start: 64, rows: 1, pages: &a }];
+        assert!(AttentionRows::new(&aliased, 64, 2, 128, &pool).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn attention_rows_validate_slots_pool_pages_and_wide_prefill() -> Result<()> {
+        let mut pool = cuteafd_engine::prefix::RefPagePool::with_reserved(8, 64, 1);
+        let pages = pool.alloc(3)?;
+        for (slot, start, rows, ids) in [(0, 0, 0, pages.as_slice()), (2, 0, 1, &pages[..1]),
+            (0, 127, 2, pages.as_slice()), (0, 64, 1, &pages[..1]), (0, usize::MAX, 1, pages.as_slice()),
+            (0, 0, 1, &[0][..]), (0, 0, 1, &[7][..]), (0, 0, 1, &[8][..]),
+            (0, 63, 2, &[pages[0], pages[0]][..])] {
+            assert!(AttentionRows::new(&[SequenceRows { slot, start, rows, pages: ids }],
+                128, 2, 128, &pool).is_err());
+        }
+        let repeated = [SequenceRows { slot: 0, start: 0, rows: 1, pages: &pages[..1] },
+            SequenceRows { slot: 0, start: 0, rows: 1, pages: &pages[1..2] }];
+        assert!(AttentionRows::new(&repeated, 64, 2, 128, &pool).is_err());
+        let wide = AttentionRows::new(&[SequenceRows { slot: 0, start: 1, rows: 65, pages: &pages }],
+            128, 2, 128, &pool)?;
+        assert_eq!((wide.rows, wide.sequences, wide.width), (65, 1, 2));
+        assert_eq!(i32_metadata(&wide.lengths), [66]);
+        assert_eq!(i32_metadata(&wide.offsets), [0, 65]);
+        let multi_wide = [SequenceRows { slot: 0, start: 0, rows: 64, pages: &pages[..1] },
+            SequenceRows { slot: 1, start: 0, rows: 1, pages: &pages[1..2] }];
+        assert!(AttentionRows::new(&multi_wide, 128, 2, 128, &pool).is_err());
+        let parity = cuteafd_engine::prefix::RefPagePool::parity(8, 64, 0);
+        let sequence = [SequenceRows { slot: 0, start: 0, rows: 1, pages: &pages }];
+        assert!(AttentionRows::new(&sequence, 64, 2, 128, &parity).is_err());
+        let wrong_rows = cuteafd_engine::prefix::RefPagePool::new(8, 32);
+        assert!(AttentionRows::new(&sequence, 64, 2, 128, &wrong_rows).is_err());
+        assert!(AttentionRows::new(&[], 64, 2, 128, &pool).is_err());
+        Ok(())
+    }
 
     #[test]
     fn persistent_local_lane_never_drains_per_operator_and_keeps_device_routes() {
