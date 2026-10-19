@@ -235,11 +235,15 @@ impl LoadedCode {
 pub struct CodeAllowance {
     pub bytes: u64,
     pub basis: Basis,
+    /// Formula paths cannot attribute a large module sample to future BLAS handles.
+    future_library_bytes: u64,
 }
 
 impl CodeAllowance {
     pub fn pending(self, untracked_at_sample: u64, context_bytes: u64) -> u64 {
-        self.bytes.saturating_sub(untracked_at_sample.saturating_sub(context_bytes))
+        let resident_code = untracked_at_sample.saturating_sub(context_bytes);
+        self.future_library_bytes + self.bytes.saturating_sub(self.future_library_bytes)
+            .saturating_sub(resident_code)
     }
 }
 
@@ -248,10 +252,11 @@ impl CodeAllowance {
 pub fn loaded_code_allowance(program_family: &str, experts: &str, split: bool, rank: u8,
     arch: &ArchContext, programs: Option<&ProgramSet>) -> CodeAllowance {
     match loaded_code(program_family, experts, split, rank) {
-        Some(code) => CodeAllowance { bytes: code.bytes, basis: Basis::Calibrated },
+        Some(code) => CodeAllowance { bytes: code.bytes, basis: Basis::Calibrated, future_library_bytes: 0 },
         None => CodeAllowance { bytes: arch.cublas_bytes
             + programs.map_or(32 * MIB, ProgramSet::module_bytes)
-            + if split { arch.peer_context_bytes } else { 0 }, basis: Basis::Formula },
+            + if split { arch.peer_context_bytes } else { 0 }, basis: Basis::Formula,
+            future_library_bytes: arch.cublas_bytes },
     }
 }
 
@@ -627,7 +632,26 @@ mod tests {
         assert!(allowance.bytes > 0);
         assert_eq!(allowance.pending(arch.context_bytes, arch.context_bytes), allowance.bytes);
         assert_eq!(allowance.pending(arch.context_bytes + 100, arch.context_bytes), allowance.bytes - 100);
-        assert_eq!(allowance.pending(u64::MAX, arch.context_bytes), 0);
+        assert_eq!(allowance.pending(u64::MAX, arch.context_bytes), arch.cublas_bytes);
+    }
+
+    #[test]
+    fn loaded_modules_cannot_spend_a_future_library_reservation() {
+        let arch = &ARCH_CONTEXTS[1];
+        let programs = ProgramSet::from_names(&["unmeasured"], ["unmeasured_decode"]);
+        let allowance = loaded_code_allowance("unmeasured", "exl3", true, 0, arch, Some(&programs));
+        // Recorded prefix run: already-loaded modules exceeded the formula, but
+        // the thread-local BLAS and private head handles were still future owners.
+        for (rank, sampled, old_pending, admitted, steady) in [
+            (0, 672_399_360, 29_360_128, 8_129_791_636, 8_166_309_888),
+            (1, 680_787_968, 20_971_520, 7_457_793_680, 7_495_221_248),
+        ] {
+            let pending = allowance.pending(sampled, arch.context_bytes);
+            assert_eq!(pending, arch.cublas_bytes);
+            assert!(admitted + pending - old_pending >= steady, "rank {rank}");
+        }
+        let calibrated = loaded_code_allowance("mimo", "fp8", false, 0, arch, None);
+        assert_eq!(calibrated.pending(u64::MAX, arch.context_bytes), 0);
     }
 
     #[test]
