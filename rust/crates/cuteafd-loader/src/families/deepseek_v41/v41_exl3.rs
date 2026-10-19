@@ -142,8 +142,8 @@ pub enum V41Exl3Naming {
     /// Flash Next): backbone as [`Self::HfLanguageModel`], draft stage `S` at
     /// `mtp.layers.{S}.mlp.experts.{E}.gate_proj|up_proj|down_proj`.
     HfLanguageModelMtp,
-    /// Prefix and routed module discovered from safetensors projection names.
-    HeaderDerived { prefix: String, module: String },
+    /// Prefix, routed module and gate/up/down stems discovered from tensor names.
+    HeaderDerived { prefix: String, module: String, stems: [String; 3] },
 }
 
 impl V41Exl3Naming {
@@ -186,12 +186,12 @@ impl V41Exl3Naming {
                 let prefix = if draft { "mtp" } else { "model.language_model" };
                 format!("{prefix}.layers.{layer}.mlp.experts.{expert}.{stem}")
             }
-            Self::HeaderDerived { prefix, module } => {
-                let stem = match kind {
-                    V41Exl3ProjectionKind::Gate => "gate_proj",
-                    V41Exl3ProjectionKind::Up => "up_proj",
-                    V41Exl3ProjectionKind::Down => "down_proj",
-                };
+            Self::HeaderDerived { prefix, module, stems } => {
+                let stem = &stems[match kind {
+                    V41Exl3ProjectionKind::Gate => 0,
+                    V41Exl3ProjectionKind::Up => 1,
+                    V41Exl3ProjectionKind::Down => 2,
+                }];
                 let prefix = if draft { "mtp" } else { prefix.as_str() };
                 format!("{prefix}.{layer}.{module}.experts.{expert}.{stem}")
             }
@@ -457,6 +457,7 @@ fn is_routed_module(name: &str) -> bool {
 
 fn header_naming(routed: &BTreeMap<&str, &Exl3Module>) -> Result<V41Exl3Naming> {
     let mut layouts = BTreeSet::new();
+    let mut stems = BTreeSet::new();
     for name in routed.keys().filter(|name| !name.starts_with("mtp.")) {
         let (left, _) = name.split_once(".experts.").context("EXL3 expert ordinal absent")?;
         let (layer, module) = left.rsplit_once('.').context("EXL3 expert module absent")?;
@@ -464,10 +465,15 @@ fn header_naming(routed: &BTreeMap<&str, &Exl3Module>) -> Result<V41Exl3Naming> 
         ordinal.parse::<usize>().context("EXL3 layer ordinal is not an integer")?;
         ensure!(prefix.ends_with(".layers") || prefix == "layers", "EXL3 layer prefix lacks layers segment");
         layouts.insert((prefix.to_owned(), module.to_owned()));
+        stems.insert(name.rsplit_once('.').context("EXL3 projection stem absent")?.1);
     }
     ensure!(layouts.len() == 1, "EXL3 headers must identify one backbone layer prefix/module: {layouts:?}");
+    // Gate and up have identical shapes; their standard naming convention fixes the roles.
+    let roles = [["gate_proj", "up_proj", "down_proj"], ["w1", "w3", "w2"]]
+        .into_iter().find(|roles| roles.iter().copied().collect::<BTreeSet<_>>() == stems)
+        .with_context(|| format!("EXL3 headers have unsupported or mixed projection stems: {stems:?}"))?;
     let (prefix, module) = layouts.into_iter().next().unwrap();
-    Ok(V41Exl3Naming::HeaderDerived { prefix, module })
+    Ok(V41Exl3Naming::HeaderDerived { prefix, module, stems: roles.map(str::to_owned) })
 }
 
 /// Routed EXL3 experts of a DeepSeek V4, GLM 5.x or Qwen 3.8 checkpoint with
@@ -560,7 +566,8 @@ fn check_gptqmodel_manifest(compact: &Value, manifest: &Value) -> Result<()> {
             && matches!(manifest["out_scales"].as_str(), Some("never" | "auto"))
             && manifest["group_size"] == -1
             && manifest["desc_act"] == false
-            && manifest["pack_dtype"] == "int32"
+            // derive_storage_map already proved I16 trellis words, exact extents and I32 MCG markers.
+            && manifest.get("pack_dtype").is_none_or(|v| v == "int32")
             && manifest.get("lm_head").is_none_or(|v| v == false),
         "unsupported EXL3 storage contract"
     );
@@ -1034,6 +1041,62 @@ mod tests {
     }
 
     #[test]
+    fn publication_without_pack_hint_uses_native_header_stems_and_storage() -> Result<()> {
+        let (_, mut manifest, mut shape, headers) = deepseek_v4_publication();
+        shape.draft_stages = 0;
+        shape.draft_experts = 0;
+        manifest.as_object_mut().unwrap().remove("pack_dtype");
+        let config = serde_json::json!({"quantization_config": {
+            "bits": 2.0, "checkpoint_format": "exl3", "format": "exl3", "quant_method": "exl3"}});
+        let rename = |name: &str| name.replacen("model.layers", "language_model.model.layers", 1)
+            .replace(".mlp.experts.", ".block_sparse_moe.experts.")
+            .replace(".gate_proj", ".w1").replace(".up_proj", ".w3").replace(".down_proj", ".w2");
+        let headers = headers.into_iter().filter(|t| t.name.starts_with("model.layers.")).map(|mut t| {
+            t.name = rename(&t.name); t
+        }).collect::<Vec<_>>();
+        let storage = manifest["tensor_storage"].as_object().unwrap().iter()
+            .filter(|(name, _)| name.starts_with("model.layers.")).map(|(name, entry)| {
+                let mut entry = entry.clone();
+                entry["stored_tensors"] = Value::Object(entry["stored_tensors"].as_object().unwrap().iter()
+                    .map(|(name, tensor)| (rename(name), tensor.clone())).collect());
+                (rename(name), entry)
+            }).collect();
+        manifest["tensor_storage"] = Value::Object(storage);
+        manifest["module_include"] = serde_json::json!([
+            r"language_model\.model\.layers\.[0-9]+\.block_sparse_moe\.experts\.[0-9]+\.w[123]$"]);
+        let parsed = read_publication(&config, &[("quantize_config.json", &manifest)], shape, &headers, &[2, 3])?;
+        assert_eq!(parsed.naming, V41Exl3Naming::HeaderDerived {
+            prefix: "language_model.model.layers".into(), module: "block_sparse_moe".into(),
+            stems: ["w1", "w3", "w2"].map(str::to_owned) });
+        for (stem, kind) in [("w1", V41Exl3ProjectionKind::Gate), ("w3", V41Exl3ProjectionKind::Up),
+            ("w2", V41Exl3ProjectionKind::Down)] {
+            let name = format!("language_model.model.layers.1.block_sparse_moe.experts.2.{stem}");
+            assert_eq!(parsed.projections[&name].kind, kind);
+        }
+        let plan = parsed.residency(crate::V41Exl3Layer::Backbone(1), 2, 1)?;
+        assert_eq!(plan.loads[0].tensor, "language_model.model.layers.1.block_sparse_moe.experts.0.w1.trellis");
+        for hint in [Value::from("int16"), Value::Null] {
+            let mut wrong = manifest.clone();
+            wrong["pack_dtype"] = hint;
+            assert!(read_publication(&config, &[("quantize_config.json", &wrong)], shape, &headers, &[]).is_err());
+        }
+        let mut wrong_headers = headers.clone();
+        let trellis = wrong_headers.iter_mut().find(|t| t.name.ends_with(".trellis")).unwrap();
+        trellis.dtype = DType::I32;
+        trellis.byte_length *= 2;
+        let error = format!("{:#}", read_publication(&config, &[("quantize_config.json", &manifest)],
+            shape, &wrong_headers, &[]).unwrap_err());
+        assert!(error.contains("expected i16"), "{error}");
+        let mut mixed = headers;
+        for tensor in &mut mixed {
+            tensor.name = tensor.name.replace(".experts.0.w3.", ".experts.0.up_proj.");
+        }
+        let error = format!("{:#}", read_publication(&config, &[], shape, &mixed, &[]).unwrap_err());
+        assert!(error.contains("unsupported or mixed projection stems"), "{error}");
+        Ok(())
+    }
+
+    #[test]
     fn arbitrary_header_wrappers_and_expert_modules_drive_residency() -> Result<()> {
         let (_, _, shape, headers) = deepseek_v4_publication();
         let config = serde_json::json!({"quantization_config": {"quant_method": "exl3", "version": "0.0.43",
@@ -1047,7 +1110,8 @@ mod tests {
                 }).collect::<Vec<_>>();
             let parsed = read_publication(&config, &[], shape, &headers, &[2, 3])?;
             assert_eq!(parsed.naming, V41Exl3Naming::HeaderDerived {
-                prefix: prefix.into(), module: "block_sparse_moe".into() });
+                prefix: prefix.into(), module: "block_sparse_moe".into(),
+                stems: ["gate_proj", "up_proj", "down_proj"].map(str::to_owned) });
             assert_eq!(parsed.experts.draft_stages, 0);
             assert_eq!(parsed.projections.len(), 2 * 3 * 3);
             let plan = parsed.residency(crate::V41Exl3Layer::Backbone(1), 2, 1)?;

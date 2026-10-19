@@ -97,6 +97,82 @@ fn with_layout(ranks: usize, budget: Option<u64>) -> PlanOptions {
             spark_allocation_budget_bytes: budget, ..Default::default() }), ..Default::default() }
 }
 
+fn installed_inventory(root: &std::path::Path, spark: bool) -> std::path::PathBuf {
+    use serde_json::json;
+    let lock: Value = serde_json::from_str(include_str!(concat!(env!("CARGO_MANIFEST_DIR"),
+        "/../../../third_party/sparkinfer.lock.json"))).unwrap();
+    let revision = lock["revision"].as_str().unwrap();
+    let mut programs = Vec::new();
+    for (name, geometry) in [
+        ("kimik3_router_scores", json!({"hidden":7168,"experts":896,"top_k":16})),
+        ("kimik3_expert_input_quant", json!({"hidden":3584})),
+        ("kimik3_latent_down", json!({"width":7168,"outputs":3584})),
+        ("kimik3_latent_up", json!({"width":3584,"outputs":7168})),
+        ("kimik3_rmsnorm_h3584", json!({"hidden":3584})),
+    ] {
+        if !spark { programs.push(json!({"name":name,"geometry":geometry,"object_sha256":"b".repeat(64)})); }
+    }
+    let path = root.join("PROGRAMS.json");
+    std::fs::write(&path, json!({"schema":1,"sparkinfer_revision":revision,"programs":programs}).to_string()).unwrap();
+    let package = root.join("exl3/exl3-kimik3-k23");
+    let layouts = if spark { (0..6).map(|r| format!("tp6-rank{r}")).collect::<Vec<_>>() }
+        else { vec!["rtx-tp1".into()] };
+    let mut variants = Vec::new();
+    for layout in layouts {
+        for capacity in [1, 80, 256, 1024, 4096] {
+            let directory = format!("{layout}/m{capacity}");
+            let meta = json!({"directory":directory,"capacity":capacity,"intermediate":if spark {512} else {3072},
+                "experts":896,"top_k":16,"bits":[2,3],"output_dtype":if spark {"bf16"} else {"fp32"},
+                "hidden":3584,"activation":"situ","descriptor_bits":10,"sparkinfer_revision":revision});
+            let target = package.join(&directory);
+            std::fs::create_dir_all(target.join("routes")).unwrap();
+            std::fs::write(target.join("v41_exl3.json"), meta.to_string()).unwrap();
+            for file in ["libcuteafd_exl3.so", "routes/libv41_exl3_routes.so", "trellis_lut.bin"] {
+                std::fs::write(target.join(file), []).unwrap();
+            }
+            variants.push(meta);
+        }
+    }
+    std::fs::write(package.join("manifest.json"), json!({"schema":"cuteafd.exl3-package.v1",
+        "geometry":"kimik3","role":if spark {"spark"} else {"coordinator"},
+        "sparkinfer_revision":revision,"variants":variants}).to_string()).unwrap();
+    path
+}
+
+#[test]
+fn routed_acceptance_requires_the_installed_role_inventory() {
+    let snapshot = snapshot(false);
+    let checkpoint = Checkpoint::open(snapshot.path()).unwrap();
+    let trellis = checkpoint.tensors.iter().filter(|t| t.meta.name.contains(".experts.0.w1.")).cloned().collect::<Vec<_>>();
+    let mut operand = format::detect(format::group_by_stem(&trellis).values().next().unwrap()).unwrap();
+    let stem = format!("{TEXT}layers.1.block_sparse_moe.experts.0.w1");
+    let role = TensorRole::layer(Component::RoutedExpert, 1);
+    let mut model = Model::open(&checkpoint).unwrap();
+    for spark in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = installed_inventory(dir.path(), spark);
+        model.installed_experts = validate_expert_inventory(&path).map_err(|e| format!("{e:#}"));
+        model.accepts(&role, &stem, &mut operand).unwrap();
+        if spark {
+            let meta_path = dir.path().join("exl3/exl3-kimik3-k23/tp6-rank5/m4096/v41_exl3.json");
+            let mut meta: Value = serde_json::from_slice(&std::fs::read(&meta_path).unwrap()).unwrap();
+            meta["descriptor_bits"] = serde_json::json!(9);
+            std::fs::write(&meta_path, meta.to_string()).unwrap();
+        } else {
+            std::fs::remove_file(dir.path().join("exl3/exl3-kimik3-k23/rtx-tp1/m80/libcuteafd_exl3.so")).unwrap();
+        }
+        model.installed_experts = validate_expert_inventory(&path).map_err(|e| format!("{e:#}"));
+        assert!(model.accepts(&role, &stem, &mut operand).unwrap_err().contains("artifacts unavailable"));
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let path = installed_inventory(dir.path(), false);
+    let mut inventory: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    inventory["programs"] = serde_json::json!([]);
+    std::fs::write(&path, inventory.to_string()).unwrap();
+    assert!(validate_expert_inventory(&path).unwrap_err().to_string().contains("kimik3_router_scores"));
+    assert!(validate_expert_inventory(&dir.path().join("absent.json")).is_err());
+}
+
 #[test]
 fn release_headers_classify_and_name_every_missing_kernel() {
     let dir = snapshot(false);
