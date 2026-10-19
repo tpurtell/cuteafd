@@ -12,6 +12,7 @@ struct Lanes<'a> {
     local: Vec<[LocalLane<'a>; 2]>,
     routed: Vec<RoutedLane<'a>>,
     io: Vec<[TokenIo<'a>; 2]>,
+    experts: Vec<[Option<crate::shared::experts::rtx::exl3::Exl3Tp2<'a>>; 2]>,
 }
 
 pub(crate) struct Engine<'a> {
@@ -45,9 +46,33 @@ fn check_exchange_handles(expected: [(i32, *mut std::ffi::c_void); 2],
     Ok(())
 }
 
+fn check_expert_owners(layers: &[cuteafd_loader::placement::LayerAssignment], owners: [&[usize]; 2]) -> Result<()> {
+    for rank in 0..2 {
+        let expected = layers.iter().enumerate().filter_map(|(layer, assignment)|
+            (assignment.experts == cuteafd_loader::placement::ExpertHome::RtxWhole { gpu: rank as u8 }).then_some(layer))
+            .collect::<Vec<_>>();
+        ensure!(owners[rank] == expected, "Kimi whole expert owners differ from accepted per-layer placement");
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn whole_expert_bindings_require_exact_sparse_owner_sets() -> Result<()> {
+        use cuteafd_loader::placement::{LayerAssignment, LayerMode, ExpertHome};
+        let layers = [ExpertHome::Dense, ExpertHome::RtxWhole { gpu: 0 },
+            ExpertHome::RtxWhole { gpu: 1 }, ExpertHome::RtxWhole { gpu: 0 }, ExpertHome::Spark]
+            .map(|experts| LayerAssignment { mode: LayerMode::HeadSplit, experts });
+        check_expert_owners(&layers, [&[1, 3], &[2]])?;
+        for wrong in [[&[1, 2, 3][..], &[2][..]], [&[1, 3][..], &[][..]],
+            [&[2][..], &[1, 3][..]]] {
+            assert!(check_expert_owners(&layers, wrong).is_err());
+        }
+        Ok(())
+    }
 
     #[test]
     fn exchange_owners_require_exact_rank_device_and_stream() {
@@ -72,7 +97,8 @@ impl<'a> Engine<'a> {
         checkpoint: &cuteafd_loader::plan::Checkpoint,
         programs: [std::rc::Rc<super::device::NativePrograms<'a>>; 2],
         peer: PeerExchange<'a>, hops: HopLink<'a>, peers: Vec<std::net::SocketAddr>,
-        config: cuteafd_transport::TcpTransportConfig, compiled_rows: u32) -> Result<Self> {
+        config: cuteafd_transport::TcpTransportConfig, compiled_rows: u32,
+        mut expert_modules: [Option<Vec<crate::shared::experts::exl3::execution::Exl3Modules<'a>>>; 2]) -> Result<Self> {
         use crate::shared::placement::{spark_rings, SparkAdmission};
         use cuteafd_core::{ExpertGeometry, SparkEndpoint, SparkIngress};
         use cuteafd_transport::{expert::SparkWorld, worker_selection::ModelAdmission};
@@ -95,6 +121,7 @@ impl<'a> Engine<'a> {
         let catalog = cuteafd_loader::read_expert_catalog(&checkpoint.snapshot)?;
         let pending = SparkAdmission::plan(&checkpoint.snapshot, ExpertGeometry::KIMI_K3,
             Some(&catalog), &admission.working_set(), 6, None, model)?.start(&peers)?;
+        let expert_weights = admission.load_rtx(devices, &catalog)?;
         let weights = admission.load_weights(devices, checkpoint)?;
         let lanes = usize::try_from(plan.spec().lanes)?;
         let mut allocated = (0..lanes).map(|lane| Ok([
@@ -103,13 +130,21 @@ impl<'a> Engine<'a> {
         ])).collect::<Result<Vec<_>>>()?;
         let kda = [admission.allocate_kda(devices[0], 0)?, admission.allocate_kda(devices[1], 1)?];
         let mla = [admission.allocate_mla(devices[0], 0)?, admission.allocate_mla(devices[1], 1)?];
+        let mut experts = Vec::with_capacity(lanes);
         let mut local = Vec::with_capacity(lanes);
         let mut io = Vec::with_capacity(lanes);
         for (lane, [zero, one]) in allocated.drain(..).enumerate() {
+            experts.push([expert_weights[0].as_ref().map(|owner| owner.execution_with_modules(expert_modules[0].take())).transpose()?,
+                expert_weights[1].as_ref().map(|owner| owner.execution_with_modules(expert_modules[1].take())).transpose()?]);
             local.push([admission.bind_local(0, lane, zero, programs[0].clone())?,
                 admission.bind_local(1, lane, one, programs[1].clone())?]);
             io.push([admission.allocate_io(devices[0], 0, lane)?,
                 admission.allocate_io(devices[1], 1, lane)?]);
+        }
+        for pair in &experts {
+            use crate::shared::experts::rtx::RtxExpertLayer;
+            check_expert_owners(&admission.placement.layers,
+                std::array::from_fn(|rank| pair[rank].as_ref().map_or(&[][..], |e| e.layers())))?;
         }
         // Weak admission registries must not outlive these strong startup owners
         // until every persistent local binding has acquired the same operands.
@@ -118,7 +153,7 @@ impl<'a> Engine<'a> {
         let world = SparkWorld::canonical(6)?;
         let routed = local.iter().map(|pair| admission.connect_spark(library, &pair[0],
             world, peers.clone(), config.clone())).collect::<Result<Vec<_>>>()?;
-        Self::bind(exchange_streams, plan, peer, hops, local, routed, io)
+        Self::bind(exchange_streams, plan, peer, hops, local, routed, io, experts)
     }
 
     /// Bind only exact owners already allocated through Admission. No device
@@ -126,8 +161,9 @@ impl<'a> Engine<'a> {
     pub(crate) fn bind(exchange_streams: [Rc<Stream<'a>>; 2],
         plan: LayerExecutionPlan, peer: PeerExchange<'a>, hops: HopLink<'a>,
         local: Vec<[LocalLane<'a>; 2]>, routed: Vec<RoutedLane<'a>>,
-        io: Vec<[TokenIo<'a>; 2]>) -> Result<Self> {
-        ensure!(!local.is_empty() && local.len() == routed.len() && local.len() == io.len(),
+        io: Vec<[TokenIo<'a>; 2]>,
+        experts: Vec<[Option<crate::shared::experts::rtx::exl3::Exl3Tp2<'a>>; 2]>) -> Result<Self> {
+        ensure!(!local.is_empty() && local.len() == routed.len() && local.len() == io.len() && local.len() == experts.len(),
             "Kimi engine local, Spark and IO lane counts differ");
         check_exchange_streams(&peer, &exchange_streams)?;
         for (lane, pair) in local.iter().enumerate() {
@@ -139,7 +175,7 @@ impl<'a> Engine<'a> {
         }
         let streams = local.iter().map(|pair| pair.each_ref().map(|local| local.stream().clone())).collect();
         let execution = Execution::new(plan, &peer, &hops, streams)?;
-        Ok(Self { execution, lanes: RefCell::new(Lanes { local, routed, io }), hops, peer, exchange_streams })
+        Ok(Self { execution, lanes: RefCell::new(Lanes { local, routed, io, experts }), hops, peer, exchange_streams })
     }
 
     fn shutdown(&self) -> Result<()> {
@@ -192,9 +228,9 @@ impl<'a> Engine<'a> {
             let sequences = [SequenceRows { slot: 0, start: 0, rows: tokens.len(), pages }];
             for local in &mut lanes.local[0] { local.stage_attention(&sequences, pool)?; }
             lanes.io[0][0].embed(tokens, lanes.local[0][0].buffer("delta")?)?;
-            let Lanes { local, routed, .. } = &mut *lanes;
+            let Lanes { local, routed, experts, .. } = &mut *lanes;
             let outputs = self.execution.run(scope, &self.peer, &self.hops,
-                &mut local[..1], &mut routed[..1], &[tokens.len()], false,
+                &mut local[..1], &mut routed[..1], &mut experts[..1], &[tokens.len()], false,
                 super::layers::Output::Residual)?;
             let stream = local[0][1].stream();
             stream.device.run(|| {
@@ -245,9 +281,9 @@ impl<'a> Engine<'a> {
                 }
                 lanes.io[lane][0].embed(ids, lanes.local[lane][0].buffer("delta")?)?;
             }
-            let Lanes { local, routed, io } = &mut *lanes;
+            let Lanes { local, routed, io, experts } = &mut *lanes;
             let normalized = self.execution.run(scope, &self.peer, &self.hops,
-                &mut local[..tokens.len()], &mut routed[..tokens.len()], &rows, false,
+                &mut local[..tokens.len()], &mut routed[..tokens.len()], &mut experts[..tokens.len()], &rows, false,
                 super::layers::Output::Normalized)?;
             for (lane, normalized) in normalized.into_iter().enumerate() {
                 let stream = local[lane][1].stream();

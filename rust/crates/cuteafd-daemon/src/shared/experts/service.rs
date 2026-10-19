@@ -567,34 +567,50 @@ mod tests {
         let package = PathBuf::from(std::env::var_os("CUTEAFD_KIMI_SPARK_PACKAGE").context("Kimi Spark package")?);
         let mut catalog = cuteafd_loader::read_expert_catalog(&snapshot)?;
         catalog.select_draft(cuteafd_loader::plan::spec::DraftOwnership::None)?;
-        let layers = (1..93).collect::<Vec<_>>();
-        for rank in 0..6 {
-            for capacity in [512, 4096] {
-                let mut worker = config(6, rank, None);
-                worker.capacity = capacity;
-                worker.rdma_endpoints = 1;
-                worker.selected_layers = Some(layers.clone());
-                let model = worker.model_admission.as_mut().unwrap();
-                model.capacity = capacity;
-                model.compiled_capacity = 4096;
-                model.endpoints = vec![cuteafd_core::SparkEndpoint { capacity,
-                    ingress: cuteafd_core::SparkIngress::Fp8K32 }];
-                let workspace = Exl3Worker::plan(&package.join(format!("tp6-rank{rank}")), capacity,
-                    Default::default())?;
-                let mut resident = 0;
-                let (mut staging, mut pinned, mut scratch) = (0, 0, 0);
-                for &layer in &layers {
-                    let plan = Exl3Weights::plan(&catalog, worker.exl3_selection(layer)?)?;
-                    resident += plan.resident_bytes;
-                    staging = staging.max(plan.device_staging_bytes);
-                    pinned = pinned.max(plan.pinned_host_bytes);
-                    scratch = scratch.max(plan.read_scratch_bytes);
+        let available = std::env::var("CUTEAFD_KIMI_MIN_AVAILABLE").ok().map(|s| s.parse::<usize>()).transpose()?;
+        let mut minimum_onboard = None;
+        for onboard in 0..=6 {
+            let layers = (1 + onboard..93).collect::<Vec<_>>();
+            let mut worst_peak = 0;
+            for rank in 0..6 {
+                for capacity in [512, 4096] {
+                    let mut worker = config(6, rank, None);
+                    worker.capacity = capacity;
+                    worker.rdma_endpoints = 1;
+                    worker.selected_layers = Some(layers.clone());
+                    let model = worker.model_admission.as_mut().unwrap();
+                    model.capacity = capacity;
+                    model.compiled_capacity = 4096;
+                    model.endpoints = vec![cuteafd_core::SparkEndpoint { capacity,
+                        ingress: cuteafd_core::SparkIngress::Fp8K32 }];
+                    let workspace = Exl3Worker::plan(&package.join(format!("tp6-rank{rank}")), capacity,
+                        Default::default())?;
+                    let mut resident = 0;
+                    let (mut staging, mut pinned, mut scratch) = (0, 0, 0);
+                    for &layer in &layers {
+                        let plan = Exl3Weights::plan(&catalog, worker.exl3_selection(layer)?)?;
+                        resident += plan.resident_bytes;
+                        staging = staging.max(plan.device_staging_bytes);
+                        pinned = pinned.max(plan.pinned_host_bytes);
+                        scratch = scratch.max(plan.read_scratch_bytes);
+                    }
+                    let peak = spark_admission_budget(&worker, resident, staging, pinned, scratch, workspace)?;
+                    worst_peak = worst_peak.max(peak.serve_peak.max(peak.load_peak));
+                    eprintln!("Kimi CPU golden demand: onboard={onboard} rank={rank} rows={capacity} layers={} resident={resident} workspace={workspace} exchange={} indices={} rings={} estimated_runtime={} load_peak={} serve_peak={} staging={staging} pinned={pinned} read_scratch={scratch}",
+                        layers.len(), peak.exchange, peak.row_indices, peak.rings, peak.headroom, peak.load_peak, peak.serve_peak);
+                    assert!(peak.serve_peak >= resident + workspace && peak.load_peak >= resident);
                 }
-                let peak = spark_admission_budget(&worker, resident, staging, pinned, scratch, workspace)?;
-                eprintln!("Kimi CPU all-Spark golden demand: rank={rank} rows={capacity} layers={} resident={resident} workspace={workspace} exchange={} indices={} rings={} estimated_runtime={} load_peak={} serve_peak={} staging={staging} pinned={pinned} read_scratch={scratch}",
-                    layers.len(), peak.exchange, peak.row_indices, peak.rings, peak.headroom, peak.load_peak, peak.serve_peak);
-                assert!(peak.serve_peak >= resident + workspace && peak.load_peak >= resident);
             }
+            if let Some(available) = available {
+                let fits = worst_peak.checked_add(4usize << 30).is_some_and(|required| required <= available);
+                eprintln!("Kimi CPU fit: onboard={onboard} worst_peak={worst_peak} available={available} margin={} fits_4gib={fits}",
+                    available.saturating_sub(worst_peak));
+                if fits && minimum_onboard.is_none() { minimum_onboard = Some(onboard); }
+            }
+        }
+        if available.is_some() {
+            assert!(minimum_onboard.is_some(), "no proposed onboard count preserves 4 GiB");
+            eprintln!("Kimi CPU minimum onboard at sampled availability: {}", minimum_onboard.unwrap());
         }
         Ok(())
     }

@@ -10,6 +10,7 @@ use cuteafd_loader::placement::{FfnMode, Hop, HopPoint, LayerExecutionPlan, Laye
 use cuteafd_ffi::CuteafdDeviceBuffer;
 use crate::shared::peer_split::attention::{AttentionStateOwners, LayerKernels, PipelineKernels};
 use super::{block::MixSite, device::LocalLane, spark::RoutedLane};
+use crate::shared::experts::rtx::{exl3::Exl3Tp2, ExpertInput, Routes, RtxExpertLayer, RtxShard};
 use std::{cell::{Cell, RefCell}, ffi::c_void, rc::Rc};
 
 struct LaneJoins<'a> {
@@ -78,12 +79,12 @@ impl<'a> Execution<'a> {
     pub(crate) fn run<'e>(&'e self, scope: &crate::shared::experts::rtx::pair::SubmissionScope<'_>,
         peer: &'e PeerExchange<'a>, hops: &'e HopLink<'a>,
         locals: &'e mut [[LocalLane<'a>; 2]], routed: &'e mut [RoutedLane<'a>],
-        rows: &[usize], speculative: bool, output: Output) -> Result<Vec<CuteafdDeviceBuffer>> {
-        ensure!(!rows.is_empty() && rows.len() == locals.len() && rows.len() == routed.len(),
+        experts: &'e mut [[Option<Exl3Tp2<'a>>; 2]], rows: &[usize], speculative: bool, output: Output) -> Result<Vec<CuteafdDeviceBuffer>> {
+        ensure!(!rows.is_empty() && rows.len() == locals.len() && rows.len() == routed.len() && rows.len() == experts.len(),
             "Kimi shared pipeline needs matching local, Spark and row lanes");
         let protocol = self.protocol(peer, hops)?;
-        let mut bindings = locals.iter_mut().zip(routed).zip(rows).enumerate().map(
-            |(lane, ((local, routed), &rows))| Bindings::new(local, routed, self, peer, hops, lane, rows, speculative)
+        let mut bindings = locals.iter_mut().zip(routed).zip(experts).zip(rows).enumerate().map(
+            |(lane, (((local, routed), experts), &rows))| Bindings::new(local, routed, experts, self, peer, hops, lane, rows, speculative)
         ).collect::<Result<Vec<_>>>()?;
         crate::shared::peer_split::attention::layer_pipeline_with(scope, &self.plan, &protocol,
             crate::shared::peer_split::attention::LaneOrder::OrderedChunks, rows, &mut bindings)?;
@@ -266,6 +267,7 @@ mod tests {
 pub(crate) struct Bindings<'e, 'a> {
     local: &'e mut [LocalLane<'a>; 2],
     routed: &'e mut RoutedLane<'a>,
+    experts: &'e mut [Option<Exl3Tp2<'a>>; 2],
     protocol: Protocol<'e, 'a>,
     lane: usize,
     rows: usize,
@@ -276,11 +278,11 @@ pub(crate) struct Bindings<'e, 'a> {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) struct FfnTicket { layer: usize, spark: Option<super::spark::Ticket> }
+pub(crate) struct FfnTicket { layer: usize, spark: Option<super::spark::Ticket>, rtx: Option<usize> }
 
 impl<'e, 'a> Bindings<'e, 'a> {
     pub(crate) fn new(local: &'e mut [LocalLane<'a>; 2], routed: &'e mut RoutedLane<'a>,
-        execution: &'e Execution<'a>, peer: &'e PeerExchange<'a>, hops: &'e HopLink<'a>,
+        experts: &'e mut [Option<Exl3Tp2<'a>>; 2], execution: &'e Execution<'a>, peer: &'e PeerExchange<'a>, hops: &'e HopLink<'a>,
         lane: usize, rows: usize, speculative: bool) -> Result<Self> {
         let protocol = execution.protocol(peer, hops)?;
         let joins = execution.lanes.get(lane).context("Kimi binding lane outside admission")?;
@@ -311,7 +313,7 @@ impl<'e, 'a> Bindings<'e, 'a> {
         }
         for rank in 0..2 { peer.recv(rank, lane)?; }
         ensure!(peer.slot_bytes() >= rows * 7168 * 2, "Kimi peer slot shorter than hidden rows");
-        Ok(Self { local, routed, protocol, lane, rows, speculative, owners, completed: 0, pending: None })
+        Ok(Self { local, routed, experts, protocol, lane, rows, speculative, owners, completed: 0, pending: None })
     }
 
     fn before_attention(&mut self, layer: usize) -> Result<()> {
@@ -426,7 +428,31 @@ impl PipelineKernels for Bindings<'_, '_> {
     fn begin_ffn(&mut self, layer: usize, owner: Option<usize>) -> Result<FfnTicket> {
         ensure!(owner.is_none() && self.pending.is_none(), "Kimi FFN owner or unfinished wave");
         for local in self.local.iter_mut() { local.residual(MixSite::Ffn(layer), self.rows)?; }
+        let rtx = self.experts.iter().position(|expert| expert.as_ref().is_some_and(|e| e.layers().contains(&layer)));
         let spark = if self.local[0].config().dense[layer] {
+            for local in self.local.iter_mut() { local.ffn(layer, self.rows)?; }
+            None
+        } else if let Some(rank) = rtx {
+            let (routes, wire) = self.local[rank].route(layer, self.rows)?;
+            let stream = self.local[rank].stream();
+            let expert = self.experts[rank].as_mut().context("Kimi missing whole expert owner")?;
+            ensure!(expert.shard() == RtxShard::Whole && expert.device() == stream.device.id,
+                "Kimi whole expert shard/device differs from lane");
+            // SAFETY: admitted route/wire/output owners live through engine
+            // teardown; this exact lane stream serializes scratch reuse.
+            unsafe { expert.enqueue(layer, self.rows, ExpertInput::Fp8K32(wire.ptr),
+                Routes { ids: routes.ids.ptr, weights: routes.weights.ptr }, stream.raw,
+                &mut || crate::shared::decode_graph::fatal_drain(self.protocol.peer.publish_abort(),
+                    "Kimi whole expert abort"))?; }
+            let output = CuteafdDeviceBuffer { ptr: expert.output(), bytes: self.rows * 3584 * 4,
+                device_id: stream.device.id, flags: 0 };
+            let combined = self.local[rank].buffer("expert combined")?;
+            stream.device.run(|| {
+                // SAFETY: conversion follows the full FP32 token sum on its
+                // exact producer stream, before latent-up consumes BF16.
+                unsafe { stream.device.library.cuda_f32_to_bf16_async(output, combined,
+                    self.rows * 3584, stream.raw) }
+            })?;
             for local in self.local.iter_mut() { local.ffn(layer, self.rows)?; }
             None
         } else {
@@ -438,22 +464,24 @@ impl PipelineKernels for Bindings<'_, '_> {
             Some(ticket)
         };
         self.publish("ffn output")?;
-        let ticket = FfnTicket { layer, spark };
+        let ticket = FfnTicket { layer, spark, rtx };
         self.pending = Some(ticket);
         Ok(ticket)
     }
     fn finish_ffn(&mut self, layer: usize, ticket: FfnTicket) -> Result<()> {
         ensure!(self.pending == Some(ticket) && ticket.layer == layer, "Kimi FFN ticket differs from pending layer");
-        if let Some(spark) = ticket.spark {
+        if ticket.spark.is_some() || ticket.rtx.is_some() {
             self.meet("ffn output", "shared output")?;
-            self.routed.finish(&self.local[0], spark)?;
-            let output = self.local[0].latent_up(layer, self.rows)?;
-            self.protocol.producers(self.lane, 0)?;
-            self.protocol.peer.push_to(0, crate::shared::peer_split::DIRECT, output.ptr,
-                self.local[1].buffer("routed output")?.ptr, self.rows * 7168 * 2)?;
-            self.protocol.consumer(self.lane, 0)?;
-            self.protocol.peer.wait(1, crate::shared::peer_split::DIRECT)?;
-            self.protocol.consumer(self.lane, 1)?;
+            let rank = ticket.rtx.unwrap_or(0);
+            if let Some(spark) = ticket.spark { self.routed.finish(&self.local[0], spark)?; }
+            let output = self.local[rank].latent_up(layer, self.rows)?;
+            let other = 1 - rank;
+            self.protocol.producers(self.lane, rank)?;
+            self.protocol.peer.push_to(rank, crate::shared::peer_split::DIRECT, output.ptr,
+                self.local[other].buffer("routed output")?.ptr, self.rows * 7168 * 2)?;
+            self.protocol.consumer(self.lane, rank)?;
+            self.protocol.peer.wait(other, crate::shared::peer_split::DIRECT)?;
+            self.protocol.consumer(self.lane, other)?;
             for local in self.local.iter_mut() {
                 let combined = local.combine_moe(self.rows)?;
                 local.adopt("delta", combined, self.rows, 7168)?;

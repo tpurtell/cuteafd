@@ -160,6 +160,12 @@ fn validate_whole_package(package: &Path, rows: usize, policy: Exl3RowPolicy,
             && meta["top_k"].as_u64() == Some(geometry.topk as u64)
             && meta["output_dtype"].as_str() == Some("fp32"),
             "EXL3 whole package geometry/output differs from complete experts");
+        let activation = match geometry.activation() {
+            cuteafd_core::FfnActivation::Situ { .. } => "situ",
+            _ => "silu",
+        };
+        ensure!(meta["activation"].as_str() == Some(activation),
+            "EXL3 whole package activation differs from checkpoint geometry");
     }
     Ok(())
 }
@@ -438,6 +444,18 @@ impl<'a> Exl3Tp2<'a> {
         Ok(ranks)
     }
 
+    pub(crate) fn preload_whole_modules(device: Device<'a>, package: &Path,
+        rows: usize, geometry: ExpertGeometry, selection: RtxSelectionPolicy)
+        -> Result<Vec<Exl3Modules<'a>>> {
+        let policy = Exl3RowPolicy::for_geometry(geometry);
+        validate_whole_package(package, rows, policy, selection, geometry)?;
+        device.run(|| selected_directories(package, rows, policy, selection)?.iter().map(|path| {
+            // SAFETY: caller supplies the same sealed package used by admission;
+            // retained module owners are transferred to the bound execution.
+            unsafe { Exl3Modules::load(device.library, path, Self::INPUT_FORMAT) }
+        }).collect())
+    }
+
     pub(crate) fn whole_workspace_bytes(package: &Path, max_rows: usize,
         geometry: ExpertGeometry, selection: RtxSelectionPolicy) -> Result<usize> {
         let policy = Exl3RowPolicy::for_geometry(geometry);
@@ -711,7 +729,7 @@ mod tests {
         let geometry = ExpertGeometry::KIMI_K3;
         let mut meta = serde_json::json!({"hidden":geometry.hidden,
             "intermediate":geometry.intermediate,"experts":geometry.experts,
-            "top_k":geometry.topk,"output_dtype":"fp32"});
+            "top_k":geometry.topk,"output_dtype":"fp32","activation":"situ"});
         let write = |meta: &serde_json::Value| -> Result<()> {
             Ok(std::fs::write(directory.join("v41_exl3.json"), serde_json::to_vec(meta)?)?)
         };
@@ -724,6 +742,13 @@ mod tests {
         assert!(validate().is_err());
         meta["intermediate"] = geometry.intermediate.into();
         meta["output_dtype"] = "bf16".into();
+        write(&meta)?;
+        assert!(validate().is_err());
+        meta["output_dtype"] = "fp32".into();
+        meta["activation"] = "silu".into();
+        write(&meta)?;
+        assert!(validate().is_err());
+        meta.as_object_mut().unwrap().remove("activation");
         write(&meta)?;
         assert!(validate().is_err());
         Ok(())
