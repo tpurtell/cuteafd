@@ -9,7 +9,7 @@ from types import SimpleNamespace
 import pytest
 
 ROOT = Path(__file__).resolve().parents[2]
-ROWS = (1, 8, 64, 65)
+ROWS = (1, 8, 64, 65, 128)
 SEED = 408
 EXLR8_REVISION = "a2b599e06c59f2ccb01aaa44e6f182ba21e39f80"
 DENSE_REVISION = "aca966e4e02791568aa6a4ced368624b3d897f42"

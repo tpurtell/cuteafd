@@ -9,6 +9,7 @@ use std::{
 
 const REVISION: &str = "a2b599e06c59f2ccb01aaa44e6f182ba21e39f80";
 const DENSE_REVISION: &str = "aca966e4e02791568aa6a4ced368624b3d897f42";
+const ROWS: [usize; 5] = [1, 8, 64, 65, 128];
 const SOURCES: [&str; 4] = [
     "python/reference/exlr8.py",
     "python/reference/shape_invariant.py",
@@ -178,7 +179,7 @@ fn native_layer3_same_quant() -> Result<()> {
             && manifest["activation_wire"] == "fp8_e4m3_ue8m0_k32_amax_floor_1e-4_routed_only"
             && manifest["seed"] == 408
             && manifest["layer"] == 3
-            && manifest["rows"] == serde_json::json!([1, 8, 64, 65])
+            && manifest["rows"] == serde_json::json!(ROWS)
             && manifest["manifest"] == "up1"
             && manifest["revision"] == REVISION
             && manifest["dense_revision"] == DENSE_REVISION
@@ -277,7 +278,7 @@ fn native_layer3_same_quant() -> Result<()> {
         "--pool-tokens".into(),
         "256".into(),
         "--prefill-rows".into(),
-        "65".into(),
+        ROWS.last().unwrap().to_string().into(),
         "--rtx-expert-layers".into(),
         "0".into(),
         "--l2-prefetch".into(),
@@ -293,11 +294,11 @@ fn native_layer3_same_quant() -> Result<()> {
         // before with_engine drops transport or native owners.
         let mut workspaces = engine.lane_workspaces.borrow_mut();
         if workspaces.is_empty() {
-            workspaces.push(engine.workspace(65, false)?);
+            workspaces.push(engine.workspace(*ROWS.last().unwrap(), false)?);
         }
         let w = &workspaces[0];
         let result = (|| {
-            for rows in [1usize, 8, 64, 65] {
+            for rows in ROWS {
                 let h = engine.cfg.hidden;
                 let load = |suffix: &str, dtype: &str, shape: &[usize]| {
                     fixture(&root, &manifest, &format!("r{rows}_{suffix}"), dtype, shape)

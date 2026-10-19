@@ -92,11 +92,14 @@ def test_fp8_wire_floor_and_scale_boundary():
 
 
 def test_fp8_wire_quantization_is_row_independent():
-    hidden = np.random.default_rng(408).standard_normal((65, 128), dtype=np.float32)
+    hidden = np.random.default_rng(408).standard_normal((128, 128), dtype=np.float32)
     wire = REF.fp8_k32_wire(hidden)
-    for rows in (1, 8, 64, 65):
+    for rows in (1, 8, 64, 65, 128):
         np.testing.assert_array_equal(REF.fp8_k32_wire(hidden[:rows]), wire[:rows])
         np.testing.assert_array_equal(REF.fp8_k32_decode(wire[:rows]), REF.fp8_k32_decode(wire)[:rows])
+    for first in (1, 63, 64, 65):
+        np.testing.assert_array_equal(REF.fp8_k32_wire(hidden[first:]), wire[first:])
+        np.testing.assert_array_equal(REF.fp8_k32_decode(wire[first:]), REF.fp8_k32_decode(wire)[first:])
 
 
 @pytest.mark.parametrize("hidden", [np.zeros(32), np.zeros((0, 32)), np.zeros((1, 0)),
