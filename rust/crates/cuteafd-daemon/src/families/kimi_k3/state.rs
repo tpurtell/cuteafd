@@ -166,6 +166,14 @@ impl Drop for KdaBank<'_> {
 }
 
 impl<'a> KdaBank<'a> {
+    pub(super) fn check_reader(&self, lane: usize, stream: &Rc<Stream<'a>>) -> Result<()> {
+        ensure!(self.readers.get(lane).is_some_and(|reader| Rc::ptr_eq(reader, stream))
+            && self.stream.device.id == stream.device.id
+            && std::ptr::eq(self.stream.device.library, stream.device.library),
+            "Kimi KDA bank differs from admitted lane stream");
+        Ok(())
+    }
+
     pub(crate) fn layer(&self, layer: usize, lane: usize) -> Result<[CuteafdDeviceBuffer; 3]> {
         ensure!(lane < self.layout.lanes, "Kimi KDA replay lane outside admission");
         let ordinal = self.layout.ordinal(layer)?;
@@ -215,11 +223,27 @@ mod tests {
             state: allocation()?, conv: allocation()?, marks: allocation()?,
             replay: vec![allocation()?, allocation()?], tables: vec![allocation()?, allocation()?],
             layout: KdaLayout::new(&cfg, 1, 1, 2)? };
-        drop(readers);
+        for (lane, stream) in readers.iter().enumerate() {
+            bank.check_reader(lane, stream)?;
+            assert!(bank.check_reader(1 - lane, stream).is_err());
+        }
+        assert!(bank.check_reader(2, &readers[0]).is_err());
+        let impostor = reader();
+        assert!(bank.check_reader(0, &impostor).is_err());
+        drop(impostor);
+        let bank = Rc::new(bank);
+        let registered = Rc::downgrade(&bank);
+        let retained = bank.clone();
         drop(bank);
+        assert!(registered.upgrade().is_some());
+        let before = fixture.events()?;
+        assert!(!before.contains('d'));
+        drop(readers);
+        drop(retained);
+        assert!(registered.upgrade().is_none());
         let events = fixture.events()?;
         let first_free = events.find('d').context("Kimi KDA fixture released no storage")?;
-        assert_eq!(events[..first_free].matches('S').count(), 6,
+        assert_eq!(events[before.len()..first_free].matches('S').count(), 6,
             "bank drains both compute readers and copy stream, then stream drops drain again before first free: {events}");
         assert_eq!(events.matches('d').count(), 7);
         Ok(())

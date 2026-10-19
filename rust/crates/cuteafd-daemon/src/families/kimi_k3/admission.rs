@@ -50,8 +50,10 @@ pub(crate) struct Admission<'a> {
     lane_readers: Vec<[Weak<Stream<'a>>; 2]>,
     kda_layout: KdaLayout,
     kda_allocated: [bool; 2],
+    kda_owners: [Weak<KdaBank<'a>>; 2],
     mla_layouts: [CacheLayout; 2],
     mla_allocated: [bool; 2],
+    mla_owners: [Weak<CacheBank<'a>>; 2],
     global_layouts: [GlobalLayout; 2],
     global_uploaded: [bool; 2],
     global_owners: [Weak<GlobalWeights<'a>>; 2],
@@ -98,7 +100,9 @@ impl<'a> Admission<'a> {
         let layers = self.layer_owners.iter().map(|pair| pair[rank].upgrade()
             .context("Kimi local binding requires every admitted layer weight owner")).collect::<Result<Vec<_>>>()?;
         let global = self.global_owners[rank].upgrade().context("Kimi local binding requires admitted global weights")?;
-        let binding = LocalLane::new(allocated, programs, layers, global)?;
+        let kda = self.kda_owners[rank].upgrade().context("Kimi local binding requires admitted KDA bank")?;
+        let mla = self.mla_owners[rank].upgrade().context("Kimi local binding requires admitted MLA bank")?;
+        let binding = LocalLane::new(allocated, programs, layers, global, lane, kda, mla)?;
         self.local_bound[lane][rank] = true;
         Ok(binding)
     }
@@ -157,20 +161,22 @@ impl<'a> Admission<'a> {
         Ok(allocated)
     }
 
-    pub(crate) fn allocate_kda(&mut self, device: Device<'a>, rank: usize) -> Result<KdaBank<'a>> {
+    pub(crate) fn allocate_kda(&mut self, device: Device<'a>, rank: usize) -> Result<Rc<KdaBank<'a>>> {
         self.check_kda(rank, device.id)?;
         let readers = self.lane_readers.iter().map(|pair| pair[rank].upgrade()
             .context("Kimi KDA requires live admitted lane streams")).collect::<Result<Vec<_>>>()?;
-        let bank = self.kda_layout.allocate(device, readers)?;
+        let bank = Rc::new(self.kda_layout.allocate(device, readers)?);
+        self.kda_owners[rank] = Rc::downgrade(&bank);
         self.kda_allocated[rank] = true;
         Ok(bank)
     }
 
-    pub(crate) fn allocate_mla(&mut self, device: Device<'a>, rank: usize) -> Result<CacheBank<'a>> {
+    pub(crate) fn allocate_mla(&mut self, device: Device<'a>, rank: usize) -> Result<Rc<CacheBank<'a>>> {
         let layout = self.check_mla(rank, device.id)?;
         let readers = self.lane_readers.iter().map(|pair| pair[rank].upgrade()
             .context("Kimi MLA requires live admitted lane streams")).collect::<Result<Vec<_>>>()?;
-        let bank = layout.allocate(device, readers)?;
+        let bank = Rc::new(layout.allocate(device, readers)?);
+        self.mla_owners[rank] = Rc::downgrade(&bank);
         self.mla_allocated[rank] = true;
         Ok(bank)
     }
@@ -243,7 +249,8 @@ pub(crate) fn admit<'a>(inputs: Inputs<'_>) -> Result<Admission<'a>> {
     let mla_layouts = [CacheLayout::new(cfg, &placement, 0)?, CacheLayout::new(cfg, &placement, 1)?];
     let admission = Admission { placement, cfg: cfg.clone(), layouts, layer_owners, layer_uploaded, local_bound,
         devices, lanes, lane_layouts, lane_allocated, lane_readers,
-        kda_layout, kda_allocated: [false; 2], mla_layouts, mla_allocated: [false; 2],
+        kda_layout, kda_allocated: [false; 2], kda_owners: std::array::from_fn(|_| Weak::new()),
+        mla_layouts, mla_allocated: [false; 2], mla_owners: std::array::from_fn(|_| Weak::new()),
         global_layouts, global_uploaded: [false; 2], global_owners: std::array::from_fn(|_| Weak::new()),
         io_layouts, io_allocated };
     for rank in 0..2 {
@@ -503,7 +510,17 @@ mod tests {
         assert!(bind.contains("Rc::ptr_eq(&expected, &allocated.stream)"));
         assert!(bind.contains("self.layer_owners.iter()"));
         assert!(bind.contains("self.global_owners[rank].upgrade()"));
+        assert!(bind.contains("self.kda_owners[rank].upgrade()"));
+        assert!(bind.contains("self.mla_owners[rank].upgrade()"));
         assert!(bind.contains("!self.local_bound[lane][rank]"));
+        for rank in 0..2 {
+            assert!(admitted.kda_owners[rank].upgrade().is_none());
+            assert!(admitted.mla_owners[rank].upgrade().is_none());
+            admitted.kda_allocated[rank] = true;
+            admitted.mla_allocated[rank] = true;
+            assert!(admitted.check_kda(rank, rank as i32).is_err());
+            assert!(admitted.check_mla(rank, rank as i32).is_err());
+        }
         Ok(())
     }
 
