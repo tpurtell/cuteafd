@@ -1434,6 +1434,48 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires CUTEAFD_KIMI_EXL3_SNAPSHOT; reads headers and metadata, not weight payloads"]
+    fn mounted_kimi_exl3_catalog_and_six_rank_residency() -> Result<()> {
+        let snapshot = std::env::var_os("CUTEAFD_KIMI_EXL3_SNAPSHOT").context("Kimi snapshot not set")?;
+        let snapshot = Path::new(&snapshot);
+        let mut catalog = read_expert_catalog(snapshot)?;
+        catalog.select_draft(crate::plan::spec::DraftOwnership::None)?;
+        assert_eq!(catalog.routed_experts().geometry()?.family(), Some("kimik3"));
+        let manifest = catalog.exl3().context("Kimi EXL3 manifest absent")?;
+        assert_eq!(manifest.projections.len(), 92 * 896 * 3);
+        assert_eq!(manifest.decoder_tiers(), &[2, 3]);
+        for layer in 1..=4 {
+            for rank in 0..6 {
+                let plan = manifest.residency(crate::V41Exl3Layer::Backbone(layer), 6, rank)?;
+                assert_eq!((plan.experts, plan.intermediate, plan.intermediate_start), (896, 512, rank * 512));
+                plan.device_arena_layout()?;
+                for load in &plan.loads {
+                    let tensor = catalog.tensor(&load.tensor)?;
+                    ensure!(tensor.placement == V41TensorPlacement::BackboneExl3,
+                        "Kimi expert was not assigned to Spark residency");
+                    let stem = load.tensor.rsplit_once('.').context("missing tensor suffix")?.0;
+                    manifest.projections[stem].validate_tensor(&tensor.metadata)?;
+                    catalog.exl3_tensor_slice(&load.tensor, 6, rank)?;
+                }
+            }
+        }
+        let headers = crate::plan::files::open_role(snapshot, crate::plan::files::ReadRole::Spark { rank: 0, world: 6 })?;
+        let recipe = crate::plan::experts::checkpoint_spark_recipe(&headers, 6, &[1, 2, 3, 4])?;
+        assert_eq!(recipe.widths, vec![512; 6]);
+        let spark_manifest = std::env::var_os("CUTEAFD_KIMI_SPARK_PROGRAM_MANIFEST")
+            .context("set CUTEAFD_KIMI_SPARK_PROGRAM_MANIFEST to the sealed Spark inventory")?;
+        let spark_manifest = Path::new(&spark_manifest);
+        crate::plan::families::kimi::validate_expert_inventory(spark_manifest)?;
+        let packages = spark_manifest.parent().unwrap().join("exl3/exl3-kimik3-k23");
+        for rank in 0..6 {
+            recipe.validate_installed(&packages, rank, recipe.slicing, 512)?;
+        }
+        eprintln!("Kimi CPU startup gate: {} projections; six ranks x four hosted layers; recipe {:?}",
+            manifest.projections.len(), recipe.required_layouts);
+        Ok(())
+    }
+
+    #[test]
     fn layer_ordinals_follow_header_segments_not_a_wrapper_allowlist() {
         for prefix in ["model", "model.language_model", "language_model.model", "custom.encoder.text"] {
             assert_eq!(hf_layer(&format!("{prefix}.layers.17.block_sparse_moe.experts.895.gate_proj.trellis")), Some(17));
