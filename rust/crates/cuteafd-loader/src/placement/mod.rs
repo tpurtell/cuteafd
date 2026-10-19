@@ -321,6 +321,16 @@ pub struct LayerPolicy {
     /// overrides these; the solver's memory lever cannot replace them.
     pub attention: Vec<(AttentionClass, AttentionPlacement)>,
     pub ownership: LayerOwnership,
+    /// Whole-expert ownership, independent of the attention owner.
+    pub expert_ownership: ExpertOwnership,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ExpertOwnership {
+    #[default]
+    Contiguous,
+    /// Alternate complete routed layers by routed ordinal, starting on GPU 0.
+    AlternatingWhole,
 }
 
 impl LayerPolicy {
@@ -487,7 +497,8 @@ pub struct Placement {
     pub onboard_layers: usize,
     pub layers: Vec<LayerAssignment>,
     pub movables: Vec<(MovableId, u8)>,
-    /// Contiguous whole-layer RTX expert range per GPU (`layers == 0`: none).
+    /// Bounding whole-layer RTX expert range per GPU (`layers == 0`: none).
+    /// Per-layer `experts` homes are authoritative; alternating owners have gaps.
     /// Under TP2 every GPU's range is empty and [`Placement::tp2`] holds the layers.
     pub expert_ranges: Vec<ExpertRange>,
     /// The residual's home at each layer boundary: before layer `i` at `i`,
@@ -560,7 +571,9 @@ impl Placement {
                 t.peak_bytes[0], t.peak_bytes[1], self.expert_ranges[0].peak_bytes);
         }
         let ranges = self.expert_ranges.iter().enumerate()
-            .map(|(gpu, r)| format!("rtx{gpu} {}..{} ({} B)", r.first, r.first + r.layers, r.peak_bytes))
+            .map(|(gpu, r)| format!("rtx{gpu} layers {:?} ({} B)", self.layers.iter().enumerate()
+                .filter_map(|(layer, a)| (a.experts == ExpertHome::RtxWhole { gpu: gpu as u8 }).then_some(layer))
+                .collect::<Vec<_>>(), r.peak_bytes))
             .collect::<Vec<_>>().join(", ");
         format!("attention {attention}; pool {} tokens; onboard {} RTX expert layers: {ranges}{hops}", self.pool_tokens, self.onboard_layers)
     }

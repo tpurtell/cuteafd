@@ -1,5 +1,5 @@
 //! Deterministic placement in TJ's order: layer modes, fixed demands,
-//! mandatory movables, the KV pool, then contiguous RTX expert ranges.
+//! mandatory movables, the KV pool, then policy-owned RTX experts.
 use super::*;
 use cuteafd_core::memory_layout::{Basis, Category, Item};
 
@@ -7,6 +7,10 @@ use cuteafd_core::memory_layout::{Basis, Category, Item};
 /// runtime get the same answer for the same inputs.
 pub fn solve(request: &PlacementRequest) -> Result<Placement, PlacementError> {
     validate_attention(request)?;
+    if request.policy.expert_ownership == ExpertOwnership::AlternatingWhole
+        && request.layers.iter().any(|layer| layer.experts.is_some_and(|cost| cost.tp2)) {
+        return Err(PlacementError::Inventory("alternating whole ownership conflicts with TP2 experts"));
+    }
     let mut best = solve_once(request, &[], None);
     if request.attention_placement.is_some() || request.inventory.gpus.len() != 2 || !request.inventory.peer_access
         || best.as_ref().is_ok_and(|p| p.pool_tokens >= request.pool.target) { return best; }
@@ -508,7 +512,8 @@ fn solve_once(request: &PlacementRequest, flips: &[(AttentionClass, AttentionPla
         let range = ranges[gpu];
         if range.peak_bytes > 0 {
             items[gpu].push(Item::new(Category::Experts,
-                format!("resident routed layers {}..{}", range.first, range.first + range.layers),
+                format!("resident routed layers {:?}", homes.iter().enumerate().filter_map(|(layer, home)|
+                    (*home == ExpertHome::RtxWhole { gpu: gpu as u8 }).then_some(layer)).collect::<Vec<_>>()),
                 "local", range.peak_bytes, Basis::Formula));
         }
     }
@@ -833,6 +838,34 @@ fn place_experts(request: &PlacementRequest, available: &[u64], used: &[u64], ar
     if available.len() == 2 && request.inventory.peer_access
         && request.layers.iter().any(|l| l.experts.is_some_and(|c| c.tp2)) {
         return place_tp2(request, available, used, arenas, first_moe, limit, caps[0]);
+    }
+    if request.policy.expert_ownership == ExpertOwnership::AlternatingWhole {
+        let mut homes = vec![ExpertHome::Spark; request.layers.len()];
+        let mut ranges = arenas.iter().map(|arena| ExpertRange {
+            first: first_moe, layers: 0, peak_bytes: arena.peak,
+        }).collect::<Vec<_>>();
+        let mut counts = vec![0; arenas.len()];
+        let mut next = first_moe;
+        let mut ordinal = 0;
+        while next < limit {
+            let Some(cost) = request.layers[next].experts else { next += 1; continue; };
+            let gpu = ordinal % request.expert_gpus.max(1);
+            if gpu >= arenas.len() || counts[gpu] >= caps[gpu] { break; }
+            let mut candidate = arenas[gpu].clone();
+            candidate.open(request.expert_workspace);
+            candidate.add(cost.whole)?;
+            if candidate.peak > available[gpu].saturating_sub(used[gpu]) { break; }
+            arenas[gpu] = candidate;
+            let range = &mut ranges[gpu];
+            if counts[gpu] == 0 { range.first = next; }
+            range.layers = next + 1 - range.first;
+            range.peak_bytes = arenas[gpu].peak;
+            homes[next] = ExpertHome::RtxWhole { gpu: gpu as u8 };
+            counts[gpu] += 1;
+            ordinal += 1;
+            next += 1;
+        }
+        return Ok((ranges, homes, next, None));
     }
     let mut next = first_moe;
     let mut ranges = Vec::new();

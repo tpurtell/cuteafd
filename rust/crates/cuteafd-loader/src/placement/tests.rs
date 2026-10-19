@@ -1562,3 +1562,35 @@ fn alternating_owner_function_preserves_noncontiguous_colocate_groups() {
     }
     assert!(attention::alternating_owners([], 2).is_err());
 }
+
+#[test]
+fn alternating_whole_experts_keep_exact_homes_and_arena_charges() {
+    let mut req = request(2, 44 * GIB, 8, 6, Onboard::Layers(4));
+    req.policy.expert_ownership = ExpertOwnership::AlternatingWhole;
+    // A dense hole does not consume an ownership ordinal.
+    req.layers[1].experts = None;
+    let p = solve(&req).unwrap();
+    assert_eq!(p.onboard_layers, 4);
+    for (layer, gpu) in [(0, 0), (2, 1), (3, 0), (4, 1)] {
+        assert_eq!(p.layers[layer].experts, ExpertHome::RtxWhole { gpu });
+    }
+    assert_eq!(p.layers[1].experts, ExpertHome::Dense);
+    assert_eq!(p.layers[5].experts, ExpertHome::Spark);
+    for gpu in 0..2 {
+        assert_eq!(p.expert_ranges[gpu].peak_bytes, 2 * GIB + GIB / 2);
+        assert_eq!(p.items[gpu].iter().filter(|i| i.category == cuteafd_core::memory_layout::Category::Experts)
+            .map(|i| i.bytes).sum::<u64>(), p.expert_ranges[gpu].peak_bytes);
+    }
+    assert!(p.summary().contains("rtx0 layers [0, 3]"));
+    assert!(p.summary().contains("rtx1 layers [2, 4]"));
+}
+
+#[test]
+fn alternating_whole_refuses_owner_overflow_instead_of_moving_layers() {
+    let mut req = request(2, 44 * GIB, 8, 6, Onboard::Layers(4));
+    req.policy.expert_ownership = ExpertOwnership::AlternatingWhole;
+    req.inventory.gpus[1].baseline = Baseline::Measured { free_bytes: GIB };
+    assert!(matches!(solve(&req), Err(PlacementError::ExpertLayers { requested: 4, .. })));
+    req.layers[0].experts.as_mut().unwrap().tp2 = true;
+    assert!(matches!(solve(&req), Err(PlacementError::Inventory(_))));
+}
