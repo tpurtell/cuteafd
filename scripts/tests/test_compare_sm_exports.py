@@ -67,6 +67,8 @@ def test_two_target_counts():
                   "attn_res_c9_add", "attn_res_c9_replace", "attn_res_c9_keep"]),
     ("latent", ["rmsnorm_h3584", "rmsnorm_h7168", "latent_down", "latent_up"]),
     ("situ", [f"situ_i{width}" for width in (3072, 6144, 16896, 33792)]),
+    ("ffn", [f"ffn_{op}_i{width}" for width in (3072, 6144, 16896, 33792)
+             for op in ("gate_up", "down")]),
 ])
 def test_kimi_w8_cross_sm_groups(group, names):
     job = next(job for job in compare_sm.jobs("suspects") if job[0] == f"kimi-{group}")
