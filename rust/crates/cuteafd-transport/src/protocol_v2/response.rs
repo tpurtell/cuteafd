@@ -306,32 +306,17 @@ impl ExpertProtocolV2Response {
 
 impl ExpertProtocolV2ResponseHeader {
     pub(super) fn validate_row_capacity_error(&self) -> Result<()> {
-        let rotated = self.flags & super::EXPERT_PROTOCOL_V2_FLAG_EXLR8_ROTATED != 0;
-        if rotated
-            && (self.output_dtype != ExpertV2Dtype::F32
-                || self.output_dim.checked_mul(4) != Some(self.output_row_stride_bytes)
-                || (self.flags & super::EXPERT_PROTOCOL_V2_FLAG_RESPONSE_ROW_CAPACITY_ERROR == 0
-                    && (self.output_dim == 0 || self.output_dim % 128 != 0)))
-        {
-            bail!("EXLR8 rotated response requires contiguous F32 H128 rows");
-        }
         if self.flags & super::EXPERT_PROTOCOL_V2_FLAG_RESPONSE_ROW_CAPACITY_ERROR != 0 {
             let allowed = super::EXPERT_PROTOCOL_V2_FLAG_RESPONSE_ROW_CAPACITY_ERROR
                 | super::EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16
-                | super::EXPERT_PROTOCOL_V2_FLAG_EXLR8_ROTATED
                 | EXPERT_PROTOCOL_V2_FLAG_DEBUG_CHECKSUM;
             if self.status != ExpertProtocolV2Status::Error
                 || self.row_count != 0
                 || self.output_payload_bytes != 0
                 || self.flags & !allowed != 0
-                || self.output_dtype
-                    != if rotated {
-                        ExpertV2Dtype::F32
-                    } else {
-                        ExpertV2Dtype::Bf16
-                    }
+                || self.output_dtype != ExpertV2Dtype::Bf16
                 || self.output_dim == 0
-                || self.output_dim.checked_mul(if rotated { 4 } else { 2 })
+                || self.output_dim.checked_mul(2)
                     != Some(self.output_row_stride_bytes)
             {
                 bail!("invalid final row capacity error response");
@@ -366,28 +351,22 @@ impl<'a> ExpertProtocolV2ResponseRef<'a> {
         capacity: u32,
         executor_id: u64,
     ) -> Result<Self> {
-        let rotated = request.flags & super::EXPERT_PROTOCOL_V2_FLAG_EXLR8_ROTATED != 0;
         let mut response = Self::new_with_output_stride(
             request.request_id,
             request.placement_version,
             request.layer_id,
             0,
             capacity,
-            if rotated {
-                ExpertV2Dtype::F32
-            } else {
-                ExpertV2Dtype::Bf16
-            },
+            ExpertV2Dtype::Bf16,
             capacity
-                .checked_mul(if rotated { 4 } else { 2 })
+                .checked_mul(2)
                 .context("row capacity error stride overflow")?,
             ExpertProtocolV2Status::Error,
             &[],
         )?;
         response.header.executor_id = executor_id;
         response.header.flags = (request.flags
-            & (super::EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16
-                | super::EXPERT_PROTOCOL_V2_FLAG_EXLR8_ROTATED))
+            & super::EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16)
             | super::EXPERT_PROTOCOL_V2_FLAG_RESPONSE_ROW_CAPACITY_ERROR;
         response.validate()?;
         Ok(response)

@@ -53,8 +53,8 @@ impl SparkAdmission {
             crate::shared::spark_topology::require_world(
                 crate::shared::spark_topology::world(topology, world)?, catalog, &working.spark_layers)?;
             ensure!(model.endpoints.iter().all(|endpoint|
-                endpoint.ingress == cuteafd_core::SparkIngress::Exlr8Rotated),
-                "EXLR8 Spark admission requires rotated endpoints");
+                endpoint.ingress == cuteafd_core::SparkIngress::Fp8K32),
+                "EXLR8 Spark admission requires FP8 K32 endpoints");
             (0..world).map(|rank| {
                 let mut assignment = SparkAssignment { rank: u32::try_from(rank)?, resident_bytes: 0,
                     slices: vec![], io: working.rank_endpoints_io(rank, geometry, &model.endpoints, model.rings)? };
@@ -258,7 +258,7 @@ mod tests {
         let working = SparkWorkingSet { spark_layers: vec![catalog.routed_experts().first_layer],
             spark_ranks: 4, prefill_lanes: 1, ..Default::default() };
         let mut model = fixture_model();
-        model.endpoints.iter_mut().for_each(|endpoint| endpoint.ingress = SparkIngress::Exlr8Rotated);
+        model.endpoints.iter_mut().for_each(|endpoint| endpoint.ingress = SparkIngress::Fp8K32);
         let plan = SparkAdmission::plan_manifest(snapshot, geometry, Some(&catalog), &working,
             4, None, model.clone(), Some("up1"))?;
         assert_eq!(plan.selection.layers(), working.spark_layers);

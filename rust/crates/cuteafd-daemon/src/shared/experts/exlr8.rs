@@ -6,9 +6,7 @@ use cuteafd_ffi::{CuteafdDeviceBuffer, CuteafdHostBuffer, NativeLibrary};
 use cuteafd_loader::plan::exlr8::residency::Residency;
 
 mod execution;
-mod transforms;
 pub(crate) use execution::Exlr8Execution;
-pub(crate) use transforms::Exlr8Transforms;
 
 const BANKS: usize = 2;
 

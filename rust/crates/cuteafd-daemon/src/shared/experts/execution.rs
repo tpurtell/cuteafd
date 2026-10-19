@@ -563,22 +563,16 @@ pub(crate) struct HostExpertExchange {
 impl HostExpertExchange {
     /// Exact bytes owned by the reusable exchange at its admitted capacity.
     pub fn bytes_for(capacity: u32) -> Result<usize> {
-        Self::bytes_for_output(capacity, false)
-    }
-    pub(crate) fn bytes_for_output(capacity: u32, rotated: bool) -> Result<usize> {
         ensure!((1..=4096).contains(&capacity), "unsupported native host exchange capacity");
         let geometry = cuteafd_core::expert_geometry();
         let routes = capacity as usize * geometry.topk as usize;
-        let row_bytes = geometry.hidden as usize * if rotated { 4 } else { 2 };
+        let row_bytes = geometry.hidden as usize * 2;
         routes.checked_mul(8)
             .and_then(|routes| routes.checked_add(capacity as usize * row_bytes))
             .context("native host exchange size overflow")
     }
     pub fn new(capacity: u32) -> Result<Self> {
-        Self::with_output(capacity, false)
-    }
-    pub(crate) fn with_output(capacity: u32, rotated: bool) -> Result<Self> {
-        let bytes = Self::bytes_for_output(capacity, rotated)?;
+        let bytes = Self::bytes_for(capacity)?;
         let routes = capacity as usize * cuteafd_core::expert_geometry().topk as usize;
         Ok(Self {
             ids: vec![0; routes],
@@ -897,21 +891,19 @@ mod timing_role_tests {
 mod exchange_tests {
     use super::HostExpertExchange;
     #[test]
-    fn exlr8_exchange_charges_f32_rows_and_keeps_route_extents() {
+    fn exchange_charges_bf16_rows_and_route_extents() {
         let geometry = cuteafd_core::expert_geometry();
         for capacity in [1, 16, 64, 65, 4096] {
-            let ordinary = HostExpertExchange::new(capacity).unwrap();
-            let rotated = HostExpertExchange::with_output(capacity, true).unwrap();
-            assert_eq!(ordinary.ids.len(), rotated.ids.len());
-            assert_eq!(ordinary.routing.len(), rotated.routing.len());
-            assert_eq!(rotated.partials.len(), 2 * ordinary.partials.len());
-            assert_eq!(rotated.partials.len(), capacity as usize * geometry.hidden as usize * 4);
-            assert_eq!(HostExpertExchange::bytes_for_output(capacity, true).unwrap(),
-                rotated.ids.len() * 4 + rotated.routing.len() * 4 + rotated.partials.len());
+            let exchange = HostExpertExchange::new(capacity).unwrap();
+            assert_eq!(exchange.ids.len(), capacity as usize * geometry.topk as usize);
+            assert_eq!(exchange.routing.len(), exchange.ids.len());
+            assert_eq!(exchange.partials.len(), capacity as usize * geometry.hidden as usize * 2);
+            assert_eq!(HostExpertExchange::bytes_for(capacity).unwrap(),
+                exchange.ids.len() * 4 + exchange.routing.len() * 4 + exchange.partials.len());
         }
         for capacity in [0, 4097, u32::MAX] {
-            assert!(HostExpertExchange::with_output(capacity, true).is_err());
-            assert!(HostExpertExchange::bytes_for_output(capacity, false).is_err());
+            assert!(HostExpertExchange::new(capacity).is_err());
+            assert!(HostExpertExchange::bytes_for(capacity).is_err());
         }
     }
 }

@@ -38,8 +38,6 @@ pub const EXPERT_PROTOCOL_V2_FLAG_STREAM_FINAL: u32 = 1 << 8;
 pub const EXPERT_PROTOCOL_V2_FLAG_SPARK_REDUCTION: u32 = 1 << 9;
 // Native V4.1 compact BF16 rank partials; echoed in responses.
 pub const EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16: u32 = 1 << 16;
-// EXLR8 normalized H128 domain: contiguous F16 ingress and F32 rank partials.
-pub const EXPERT_PROTOCOL_V2_FLAG_EXLR8_ROTATED: u32 = 1 << 19;
 // Final empty Error: output_dim carries the worker's admitted row capacity.
 // Header-only metadata is also readable when the response lands on the GPU.
 pub const EXPERT_PROTOCOL_V2_FLAG_RESPONSE_ROW_CAPACITY_ERROR: u32 = 1 << 17;
@@ -291,21 +289,6 @@ pub struct ExpertProtocolV2RequestHeader {
     pub flags: u32,
 }
 
-impl ExpertProtocolV2RequestHeader {
-    fn validate_rotated(&self) -> Result<()> {
-        if self.flags & EXPERT_PROTOCOL_V2_FLAG_EXLR8_ROTATED != 0
-            && (self.hidden_dtype != ExpertV2Dtype::F16
-                || self.hidden_dim == 0
-                || self.hidden_dim % 128 != 0
-                || self.row_count == 0
-                || self.hidden_dim.checked_mul(2) != Some(self.hidden_row_stride_bytes))
-        {
-            bail!("EXLR8 rotated request requires contiguous F16 H128 rows");
-        }
-        Ok(())
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExpertProtocolV2RowDescriptor {
     pub row_id: u64,
@@ -509,7 +492,6 @@ fn validate_flags(flags: u32, label: &str) -> Result<()> {
             crate::expert::V41_NATIVE_GROUP_REQUEST_FLAG
                 | EXPERT_PROTOCOL_V2_FLAG_DEBUG_CHECKSUM
                 | EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16
-                | EXPERT_PROTOCOL_V2_FLAG_EXLR8_ROTATED
                 | EXPERT_PROTOCOL_V2_FLAG_PRECOMPILE_WARMUP
                 | EXPERT_PROTOCOL_V2_FLAG_RESPONSE_FP8_E4M3_ROW_SCALED
                 | EXPERT_PROTOCOL_V2_FLAG_RESPONSE_NVFP4_E2M1_FP8_E4M3
@@ -524,7 +506,6 @@ fn validate_flags(flags: u32, label: &str) -> Result<()> {
             EXPERT_PROTOCOL_V2_FLAG_RESPONSE_ROW_CAPACITY_ERROR
                 | EXPERT_PROTOCOL_V2_FLAG_DEBUG_CHECKSUM
                 | EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16
-                | EXPERT_PROTOCOL_V2_FLAG_EXLR8_ROTATED
                 | EXPERT_PROTOCOL_V2_FLAG_RESPONSE_ROW_INDICES
                 | EXPERT_PROTOCOL_V2_FLAG_RESPONSE_MORE_CHUNKS
         }
@@ -539,22 +520,6 @@ fn validate_flags(flags: u32, label: &str) -> Result<()> {
             | EXPERT_PROTOCOL_V2_FLAG_DEBUG_CHECKSUM;
         if flags & !native_allowed != 0 || flags & EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16 == 0 {
             bail!("native group ownership requires the native compact request contract");
-        }
-    }
-    if flags & EXPERT_PROTOCOL_V2_FLAG_EXLR8_ROTATED != 0 {
-        let rotated_allowed = EXPERT_PROTOCOL_V2_FLAG_EXLR8_ROTATED
-            | EXPERT_PROTOCOL_V2_FLAG_DEBUG_CHECKSUM
-            | if label == "response" {
-                EXPERT_PROTOCOL_V2_FLAG_RESPONSE_ROW_INDICES
-                    | EXPERT_PROTOCOL_V2_FLAG_RESPONSE_MORE_CHUNKS
-                    | EXPERT_PROTOCOL_V2_FLAG_RESPONSE_ROW_CAPACITY_ERROR
-            } else {
-                0
-            };
-        if flags & !rotated_allowed != 0 {
-            bail!(
-                "EXLR8 rotated frames cannot use compact, ownership, compression or reduction flags"
-            );
         }
     }
     let unknown = flags & !allowed;

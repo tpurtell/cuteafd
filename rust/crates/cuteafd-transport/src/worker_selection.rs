@@ -778,13 +778,7 @@ fn validate_endpoint_request(selection: &WorkerSelection, index: usize,
     let spec = selection.model().expect("typed endpoint").endpoints[index];
     ensure!(header.row_count <= spec.capacity,
         "endpoint {} rows {} exceed admitted capacity {}", index, header.row_count, spec.capacity);
-    let rotated = header.flags & crate::EXPERT_PROTOCOL_V2_FLAG_EXLR8_ROTATED != 0;
-    ensure!(rotated == (spec.ingress == SparkIngress::Exlr8Rotated),
-        "endpoint {} rejects a different activation domain", index);
     let ingress = match spec.ingress {
-        SparkIngress::Exlr8Rotated => header.hidden_dtype == ExpertV2Dtype::F16
-            && header.hidden_dim.checked_mul(2) == Some(header.hidden_row_stride_bytes)
-            && header.hidden_dim % 128 == 0,
         SparkIngress::Fp8K32 => header.hidden_dtype == ExpertV2Dtype::Fp8E4m3Ue8m0K32,
         SparkIngress::Bf16 => header.hidden_dtype == ExpertV2Dtype::Bf16,
         SparkIngress::Bf16Decode { rows } => header.hidden_dtype == ExpertV2Dtype::Fp8E4m3Ue8m0K32
@@ -1000,42 +994,6 @@ mod tests {
         assert!(lease.validate_request(&header).is_err());
         drop(lease);
         drop(installed.reserve_endpoint(Some(0))?);
-        Ok(())
-    }
-
-    #[test]
-    fn exlr8_rotated_endpoint_binds_domain_dtype_capacity_and_ring_extent() -> Result<()> {
-        let mut selection = admission_selection();
-        let model = selection.model.as_mut().unwrap();
-        model.capacity = 64;
-        model.compiled_capacity = 64;
-        model.endpoints[0] = cuteafd_core::SparkEndpoint {
-            capacity: 64, ingress: cuteafd_core::SparkIngress::Exlr8Rotated,
-        };
-        let mut report = admission_report(&selection);
-        report.host_exchange_bytes = 64 * (6144 * 4 + 8 * 8);
-        report.row_indices_bytes = 64 * 4;
-        let installed = InstalledModelAdmission::new(0, selection, Some(report))?;
-        let lease = installed.reserve_endpoint(Some(0))?.unwrap();
-        let mut header = crate::ExpertProtocolV2RequestHeader {
-            request_id: 1, placement_version: 1, layer_id: 13, row_count: 64,
-            hidden_dim: 6144, hidden_dtype: crate::ExpertV2Dtype::F16,
-            hidden_row_stride_bytes: 12288, route_count: 512, row_descriptor_bytes: 64 * 40,
-            route_bytes: 512 * 12, hidden_payload_bytes: 64 * 12288,
-            flags: crate::EXPERT_PROTOCOL_V2_FLAG_EXLR8_ROTATED,
-        };
-        lease.validate_request(&header)?;
-        header.flags = 0;
-        assert!(lease.validate_request(&header).is_err());
-        header.flags = crate::EXPERT_PROTOCOL_V2_FLAG_EXLR8_ROTATED;
-        header.hidden_dtype = crate::ExpertV2Dtype::Bf16;
-        assert!(lease.validate_request(&header).is_err());
-        header.hidden_dtype = crate::ExpertV2Dtype::F16;
-        header.hidden_row_stride_bytes += 2;
-        assert!(lease.validate_request(&header).is_err());
-        header.hidden_row_stride_bytes -= 2;
-        header.row_count = 65;
-        assert!(lease.validate_request(&header).is_err());
         Ok(())
     }
 

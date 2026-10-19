@@ -127,8 +127,8 @@ impl<'a> Weights<'a> {
     pub(super) fn validate_ingress(&self, library: &NativeLibrary,
         model: &cuteafd_transport::worker_selection::ModelAdmission) -> Result<()> {
         if matches!(self, Self::Exlr8(_)) {
-            ensure!(model.endpoints.iter().all(|endpoint| endpoint.ingress == cuteafd_core::SparkIngress::Exlr8Rotated),
-                "EXLR8 backend requires rotated ingress");
+            ensure!(model.endpoints.iter().all(|endpoint| endpoint.ingress == cuteafd_core::SparkIngress::Fp8K32),
+                "EXLR8 backend requires FP8 K32 ingress");
             return Ok(());
         }
         let (fp8, bf16) = match self {
@@ -402,8 +402,6 @@ impl<'w, 'a> Execution<'w, 'a> {
 
 fn supports_ingress(ingress: cuteafd_core::SparkIngress, fp8: bool, bf16: bool) -> bool {
     match ingress {
-        // Rotated-domain kernels are a distinct backend, never BF16 aliases.
-        cuteafd_core::SparkIngress::Exlr8Rotated => false,
         cuteafd_core::SparkIngress::Fp8K32 => fp8,
         cuteafd_core::SparkIngress::Bf16 => bf16,
         // FP8 remains legal at every row count, including the BF16 decode extent.

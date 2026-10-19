@@ -136,6 +136,7 @@ impl<'a> Exlr8Execution<'a> {
         available: usize,
         set: ExpertSet,
     ) -> Result<Self> {
+        cuteafd_loader::plan::exlr8::require_spark_rotation()?;
         let (k1_name, group_name) = program_names(set);
         let k1 = programs.program(k1_name, K1_POINTERS)?;
         let group = programs.program(

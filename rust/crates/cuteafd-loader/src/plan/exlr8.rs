@@ -16,6 +16,11 @@ use super::format::{
 
 pub mod residency;
 
+/// Fail closed until standard FP8 ingress and BF16 partials use the fused ABI.
+pub fn require_spark_rotation() -> Result<()> {
+    bail!("EXLR8 Spark-side rotation kernels not yet integrated")
+}
+
 /// Native selection is distinct from the ordinary GLM launch description.
 #[derive(Debug, Clone, Serialize)]
 pub struct NativeSelection {
@@ -42,13 +47,6 @@ pub fn shared_workspace(manifest: &Value) -> Result<u64> {
     ensure!(group["geometry"]["abi_version"] == 1 && group["capacity_rows"] == 64
         && group["geometry"]["experts"] == 1 && group["geometry"]["top_k"] == 1
         && group["geometry"]["max_groups"] == 4, "EXLR8 shared grouping geometry differs");
-    for name in ["exlr8_rotate", "exlr8_reduce"] {
-        let program = entry(name)?;
-        ensure!(program["geometry"]["abi_version"] == 1 && program["geometry"]["hidden"] == 6144
-            && program["capacity_rows"].as_u64().is_some_and(|n| n >= 64)
-            && (name != "exlr8_reduce" || program["geometry"]["max_ranks"].as_u64().is_some_and(|n| n >= 4)),
-            "EXLR8 transform {name} cannot execute native TP4 rows");
-    }
     let spec = entry("exlr8_shared_a16_serving")?;
     ensure!(spec["geometry"]["abi_version"] == 2 && spec["capacity_rows"].as_u64() == Some(64),
         "EXLR8 shared workspace requires ABI v2 and 64-row capacity");
@@ -89,6 +87,7 @@ pub fn native_plan(snapshot: &Path, selected: &str, dense: &Path,
         && layout.onboard.is_none_or(|n| n == crate::placement::Onboard::Layers(0)),
         "EXLR8 native deployment cannot onboard routed experts");
     ensure!(!layout.host_embedding && layout.drafter_bytes == 0, "EXLR8 requires GPU embedding and no drafter");
+    require_spark_rotation()?;
     validate_dense_source(snapshot, dense)?;
     let checkpoint = super::Checkpoint::coordinator(dense, false, false)?;
     ensure!(checkpoint.config["quantization_config"]["quant_method"] == "fp8"
@@ -98,11 +97,13 @@ pub fn native_plan(snapshot: &Path, selected: &str, dense: &Path,
     ensure!(cfg.hidden == 6144 && cfg.layers == 78 && cfg.first_moe_layer == 3,
         "EXLR8 native full-forward requires GLM-5.3 78 layers/hidden6144/first routed3");
     let (_, set_id) = manifest_identity(snapshot, selected)?;
-    let mut shared = 0u64;
+    let mut shared = vec![0u64; 2];
     let mut residents = vec![0u64; 4];
     for layer in cfg.first_moe_layer..cfg.layers {
-        let plan = residency::Residency::plan(snapshot, selected, layer, 1, 0, residency::ExpertSet::Shared)?;
-        shared = shared.checked_add(plan.resident_bytes as u64).context("EXLR8 shared residency overflow")?;
+        for (rank, resident) in shared.iter_mut().enumerate() {
+            let plan = residency::Residency::plan(snapshot, selected, layer, 2, rank, residency::ExpertSet::Shared)?;
+            *resident = resident.checked_add(plan.resident_bytes as u64).context("EXLR8 shared residency overflow")?;
+        }
         for (rank, resident) in residents.iter_mut().enumerate() {
             let plan = residency::Residency::plan(snapshot, selected, layer, 4, rank, residency::ExpertSet::Routed)?;
             *resident = resident.checked_add(plan.resident_bytes as u64).context("EXLR8 routed residency overflow")?;
@@ -113,7 +114,7 @@ pub fn native_plan(snapshot: &Path, selected: &str, dense: &Path,
     let programs = read_json(layout.workspace_manifest.as_deref()
         .unwrap_or_else(|| Path::new("/opt/cuteafd/share/PROGRAMS.json")))?;
     let workspace = shared_workspace(&programs)?;
-    let (memory, placement) = super::layout::glm5::native_layout(&checkpoint, layout, shared, workspace, &programs)?;
+    let (memory, placement) = super::layout::glm5::native_layout(&checkpoint, layout, &shared, workspace, &programs)?;
     let mut dense_options = options.clone();
     dense_options.layout = None;
     // This pass classifies dense operands only; native_layout already admitted context TP2.
@@ -127,7 +128,7 @@ pub fn native_plan(snapshot: &Path, selected: &str, dense: &Path,
             component.status = Status::Planned;
             component.rejected = 0;
             component.rejections.clear();
-            component.bytes = if component.component == Component::SharedExpert { shared } else { residents.iter().sum() };
+            component.bytes = if component.component == Component::SharedExpert { shared.iter().sum() } else { residents.iter().sum() };
             component.formats = BTreeMap::from([("exlr8".into(), component.tensors)]);
         }
     }
@@ -1039,7 +1040,7 @@ pub fn inspect(
             missing.insert(format!("exlr8_unit_experts_k{k}_a16_sm121_and_sm120"));
         }
     }
-    missing.extend(["exlr8_rotate_once_sm120", "exlr8_rotated_reduce_sm120"].map(str::to_string));
+    missing.extend(["exlr8_fused_group_ingress_sm121_and_sm120", "exlr8_fused_inverse_reduce_bf16_sm121_and_sm120"].map(str::to_string));
     Ok(Exlr8Plan { format:FORMAT.into(), scheme:SCHEME.into(), selected_manifest:selected.into(),
         manifest_choice:"bit325 is the 3.25-bpw evaluation choice: checkpoint held-out KL 0.147 vs home 0.149; golden pending. up1 is the 4.0-bpw arm.".into(),
         dense_source, dense, dense_bytes, manifests, fit, selected_weights_fit,
@@ -1086,13 +1087,9 @@ mod tests {
             "scratch_bytes_at_capacity":{"fc1":6291456,"intermediate":262144,"fc2":1572864}});
         let mut manifest = json!({"programs":[entry,
             {"name":"exlr8_shared_group","capacity_rows":64,
-                "geometry":{"abi_version":1,"experts":1,"top_k":1,"max_groups":4}},
-            {"name":"exlr8_rotate","capacity_rows":4096,
-                "geometry":{"abi_version":1,"hidden":6144}},
-            {"name":"exlr8_reduce","capacity_rows":4096,
-                "geometry":{"abi_version":1,"hidden":6144,"max_ranks":6}}]});
+                "geometry":{"abi_version":1,"experts":1,"top_k":1,"max_groups":4}}]});
         let bytes = shared_workspace(&manifest).unwrap();
-        for missing in 0..4 {
+        for missing in 0..2 {
             let mut invalid = manifest.clone();
             invalid["programs"].as_array_mut().unwrap().remove(missing);
             assert!(shared_workspace(&invalid).is_err());
@@ -1119,6 +1116,10 @@ mod tests {
         let missing = Path::new("/no-native-checkpoint");
         let error = |o: &super::super::PlanOptions, manifest, draft| native_plan(missing, manifest, missing, o, draft)
             .err().unwrap().to_string();
+        assert_eq!(error(&options,"up1","off"),
+            "EXLR8 Spark-side rotation kernels not yet integrated");
+        assert_eq!(require_spark_rotation().unwrap_err().to_string(),
+            "EXLR8 Spark-side rotation kernels not yet integrated");
         assert!(error(&options,"other","off").contains("manifest"));
         assert!(error(&options,"up1","dflash2").contains("speculator off"));
         options.placement = super::super::ExpertPlacement::Sparks { ranks:6 };

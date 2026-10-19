@@ -126,6 +126,9 @@ fn load_weights<'a>(
     config: &NativeExpertServiceConfig,
     modules: &mut modules::WarmModules<'a>,
 ) -> Result<(backend::Weights<'a>, usize)> {
+    if catalog.format() == cuteafd_loader::plan::checkpoint::CheckpointFormat::Exlr8 {
+        cuteafd_loader::plan::exlr8::require_spark_rotation()?;
+    }
     let layers = config.resident_layers(catalog.routed_experts().layers)?;
     let first = catalog.routed_experts().first_layer;
     ensure!(layers.iter().all(|&layer| layer >= first),
@@ -585,7 +588,7 @@ mod tests {
         worker.snapshot = snapshot.clone();
         worker.exlr8_manifest = Some("up1".into());
         for endpoint in &mut worker.model_admission.as_mut().unwrap().endpoints {
-            endpoint.ingress = cuteafd_core::SparkIngress::Exlr8Rotated;
+            endpoint.ingress = cuteafd_core::SparkIngress::Fp8K32;
         }
         let identity = WorkerIdentity::from_snapshot_manifest(&snapshot, shape.geometry()?,
             worker.spark_world()?, Some("up1"))?;

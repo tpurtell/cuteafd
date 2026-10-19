@@ -518,7 +518,6 @@ impl ExpertProtocolV2Request {
 
     pub fn validate(&self) -> Result<()> {
         validate_flags(self.header.flags, "request")?;
-        self.header.validate_rotated()?;
         let stream_plan = self.stream_plan_enabled();
         let stream_data = self.stream_data_enabled();
         if stream_data {

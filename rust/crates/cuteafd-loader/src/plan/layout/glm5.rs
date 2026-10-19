@@ -315,11 +315,11 @@ fn placement(report: &PlanReport, input: &crate::plan::PlanInput, options: &Layo
     Ok(glm::solve_working_set(&inputs, serial_workspace, report.requested_attention)?)
 }
 
-/// Native EXLR8 uses the ordinary GLM solver, with complete shared ownership on GPU0.
-pub fn native_layout(checkpoint: &Checkpoint, options: &LayoutOptions, shared_bytes: u64,
+/// Native EXLR8 uses the ordinary GLM solver, with ordinary per-GPU TP2 shared ownership.
+pub fn native_layout(checkpoint: &Checkpoint, options: &LayoutOptions, shared_bytes: &[u64],
     workspace: u64, manifest: &serde_json::Value) -> anyhow::Result<(MemoryLayout, crate::placement::Placement)> {
     use crate::placement::{families::glm5 as glm, Baseline, Onboard};
-    anyhow::ensure!(options.rtx_bytes.len() == 2, "EXLR8 requires two RTX GPUs");
+    anyhow::ensure!(options.rtx_bytes.len() == 2 && shared_bytes.len() == 2, "EXLR8 requires two RTX shared owners");
     let cfg = GlmDsaConfig::from_hf(&checkpoint.config)?;
     let rows = if options.prefill_rows == 0 { 4096 } else { options.prefill_rows };
     let context = if options.context_tokens == 0 { 1 << 20 } else { options.context_tokens };
@@ -342,12 +342,12 @@ pub fn native_layout(checkpoint: &Checkpoint, options: &LayoutOptions, shared_by
         let mut items: Vec<_> = groups.into_iter().filter(|(group, _, _)| group != "shared_expert")
             .map(|(group, format, bytes)| Item::new(if group == "embedding" { Category::Embedding }
                 else { Category::Weights }, group, format, bytes, Basis::Exact)).collect();
-        if rank == 0 { items.push(Item::new(Category::Weights, "shared_expert", "exlr8", shared_bytes, Basis::Exact)); }
+        items.push(Item::new(Category::Weights, "shared_expert", "exlr8", shared_bytes[rank], Basis::Exact));
         let mut programs = program_families("glm", true);
-        if rank == 0 { programs.push("exlr8".into()); }
+        programs.push("exlr8".into());
         let mut runtime = runtime_item(Some(&manifest), &programs, "glm:exlr8", true,
             rank, options.rtx_bytes[rank]);
-        if rank == 0 { runtime.group = "EXLR8 context+modules".into(); }
+        runtime.group = "EXLR8 context+modules".into();
         items.push(runtime);
         devices.push(DeviceLayout { kind: DeviceKind::Rtx, index: rank as u32,
             capacity_bytes: options.rtx_bytes[rank].saturating_sub(options.headroom_bytes), items, kv_tokens: 0 });
@@ -370,7 +370,7 @@ pub fn native_layout(checkpoint: &Checkpoint, options: &LayoutOptions, shared_by
         device.kv_tokens = placement.pool_tokens;
     }
     Ok((MemoryLayout { devices, pool_tokens: placement.pool_tokens, waste: vec![],
-        notes: vec![format!("EXLR8 serial native shared owner GPU0; context {context}; {}", placement.summary())] }, placement))
+        notes: vec![format!("EXLR8 serial native TP2 shared owners; context {context}; {}", placement.summary())] }, placement))
 }
 
 /// The planner's packed owners, excluding a host-mapped embedding when selected.

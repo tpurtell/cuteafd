@@ -1041,7 +1041,7 @@ pub(crate) fn charge_host(report: &mut PlanReport, options: &LayoutOptions, chec
             layers: u32::try_from(spec.layers.len())? };
         let endpoints = spark_endpoints(family, lanes);
         let bf16 = native || matches!(family, "glm5" | "qwen4");
-        let ingress = if native { SparkIngress::Exlr8Rotated } else if bf16 { SparkIngress::Bf16 }
+        let ingress = if native { SparkIngress::Fp8K32 } else if bf16 { SparkIngress::Bf16 }
             else { SparkIngress::Fp8K32 };
         let endpoint = SparkEndpoint { capacity: u32::try_from(rows)?, ingress };
         let (request, response) = endpoint.wire_bytes(geometry).context("host wire size overflow")?;

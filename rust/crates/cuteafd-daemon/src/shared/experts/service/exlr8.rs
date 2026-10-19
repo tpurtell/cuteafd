@@ -1,4 +1,4 @@
-//! Native rotated-domain Spark adapter; wider waves reuse one bounded K1 arena.
+//! Native FP8 K32 Spark adapter; wider waves reuse one bounded K1 arena.
 use super::*;
 use crate::shared::experts::exlr8::{Exlr8Execution, Exlr8Weights};
 use crate::shared::memory::LoadStream;
@@ -37,14 +37,14 @@ pub(super) struct Worker<'w, 'a> {
 pub(super) fn load<'a>(library: &'a NativeLibrary, catalog: &OfficialV41Catalog,
     config: &NativeExpertServiceConfig, programs: &'a Programs<'a>)
     -> Result<(backend::Weights<'a>, usize)> {
+    cuteafd_loader::plan::exlr8::require_spark_rotation()?;
     let manifest = config.exlr8_manifest.as_deref().context("EXLR8 worker requires a manifest")?;
     let model = config.model_admission.as_ref().context("EXLR8 requires model admission")?;
     ensure!(model.endpoints.iter().all(|endpoint|
-        endpoint.ingress == cuteafd_core::SparkIngress::Exlr8Rotated),
-        "EXLR8 worker requires rotated F16 ingress and F32 partials");
+        endpoint.ingress == cuteafd_core::SparkIngress::Fp8K32),
+        "EXLR8 worker requires standard FP8 K32 ingress and BF16 partials");
     let rows = (config.capacity as usize).min(K1_ROWS);
-    let fallback_staging = rows.checked_mul(catalog.routed_experts().geometry()?.hidden as usize)
-        .and_then(|bytes| bytes.checked_mul(2)).context("EXLR8 fallback staging overflow")?;
+    let fallback_staging = rows.checked_mul({ let h = catalog.routed_experts().geometry()?.hidden as usize; h + h / 32 }).context("EXLR8 fallback staging overflow")?;
     let k1_workspace_bytes = Exlr8Execution::workspace_bytes(programs, rows, ExpertSet::Routed)?;
     let workspace = k1_workspace_bytes.checked_add(fallback_staging)
         .context("EXLR8 workspace admission overflow")?;
@@ -108,16 +108,16 @@ impl<'w, 'a> Worker<'w, 'a> {
     fn execute(&mut self, request: &BackboneRequest<'_>, executor_id: u64,
         exchange: &mut HostExpertExchange, destination: Option<CuteafdDeviceBuffer>,
         mapped: Option<ProtocolV2RequestDevicePayload>) -> Result<()> {
-        ensure!(request.rotated() && !request.is_native_group(), "EXLR8 requires canonical rotated requests");
-        request.require_input_dtype(ExpertV2Dtype::F16 as u32)?;
+        ensure!(!request.is_native_group(), "EXLR8 requires canonical requests");
+        request.require_input_dtype(ExpertV2Dtype::Fp8E4m3Ue8m0K32 as u32)?;
         ensure!(request.rows() > 0 && request.rows() as usize <= self.capacity,
             "EXLR8 request exceeds admitted capacity");
         ensure!(executor_id == self.executor_id && request.layer() as usize == self.weights[self.selected].layout.layer,
             "EXLR8 request executor or resident layer mismatch");
-        ensure!(exchange.partials.len() >= request.plane_bytes()?, "EXLR8 F32 exchange is too small");
+        ensure!(exchange.partials.len() >= request.plane_bytes()?, "EXLR8 BF16 exchange is too small");
         let geometry = cuteafd_core::expert_geometry();
-        let input_stride = geometry.hidden as usize * 2;
-        let output_stride = geometry.hidden as usize * 4;
+        let input_stride = geometry.hidden as usize + geometry.hidden as usize / 32;
+        let output_stride = geometry.hidden as usize * 2;
         let topk = geometry.topk as usize;
         if mapped.is_none() {
             request.copy_routes_into(&mut exchange.ids, &mut exchange.routing)?;
@@ -195,7 +195,7 @@ impl<'w, 'a> Worker<'w, 'a> {
         let chunk_rows = request.response_chunk_rows(max_frame_bytes)? as usize;
         ensure!(row_indices.len() >= chunk_rows, "EXLR8 row-index scratch too short");
         self.execute(request, executor_id, exchange, None, None)?;
-        let stride = cuteafd_core::expert_geometry().hidden as usize * 4;
+        let stride = cuteafd_core::expert_geometry().hidden as usize * 2;
         for first in (0..request.rows() as usize).step_by(chunk_rows) {
             let end = (first + chunk_rows).min(request.rows() as usize);
             sink(request.response_chunk(executor_id, first as u32,
@@ -251,10 +251,12 @@ mod tests {
             for (first, count) in chunks(rows) {
                 assert_eq!(first, next);
                 assert!((1..=K1_ROWS).contains(&count));
-                let input = first * 6144 * 2..(first + count) * 6144 * 2;
-                let output = first * 6144 * 4..(first + count) * 6144 * 4;
+                let wire_stride = 6144 + 6144 / 32;
+                let input = first * wire_stride..(first + count) * wire_stride;
+                let output = first * 6144 * 2..(first + count) * 6144 * 2;
                 let routes = first * 8 * 12..(first + count) * 8 * 12;
-                assert_eq!(output.len(), 2 * input.len());
+                assert_eq!(input.len(), count * wire_stride);
+                assert_eq!(output.len(), count * 6144 * 2);
                 assert_eq!(routes.len(), count * 8 * 12);
                 next += count;
             }

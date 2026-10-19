@@ -1,6 +1,6 @@
 //! Native shared expert owner used by the ordinary GLM MoE execution path.
 use super::*;
-use crate::shared::experts::exlr8::{Exlr8Execution, Exlr8Transforms, Exlr8Weights, view};
+use crate::shared::experts::exlr8::{Exlr8Execution, Exlr8Weights, view};
 use cuteafd_loader::plan::exlr8::residency::{ExpertSet, Residency};
 
 const ROWS: usize = cuteafd_core::expert_geometry::EXLR8_EXECUTION_ROWS;
@@ -22,10 +22,12 @@ impl NativePlan {
         first: usize,
         layers: usize,
         programs: &Programs<'_>,
+        world: usize,
+        rank: usize,
     ) -> Result<Self> {
         let plans = (first..layers)
             .map(|layer| {
-                Residency::plan(snapshot, manifest, layer, 1, 0, ExpertSet::Shared)
+                Residency::plan(snapshot, manifest, layer, world, rank, ExpertSet::Shared)
                     .map_err(anyhow::Error::from)
             })
             .collect::<Result<Vec<_>>>()?;
@@ -91,7 +93,6 @@ impl NativePlan {
 
 pub(crate) struct NativeExperts<'a> {
     execution: Exlr8Execution<'a>,
-    transforms: Exlr8Transforms<'a>,
     weights: Vec<Exlr8Weights<'a>>,
     first: usize,
 }
@@ -117,7 +118,6 @@ impl<'a> NativeExperts<'a> {
                 .all(|(i, plan)| plan.layer == first + i),
             "EXLR8 shared residency must cover consecutive routed layers"
         );
-        let transforms = Exlr8Transforms::new(library, programs)?;
         let mut execution =
             Exlr8Execution::new(library, programs, ROWS, workspace, ExpertSet::Shared)?;
         library.copy_h2d(execution.ids()?, &vec![0; ROWS * 4])?;
@@ -132,7 +132,6 @@ impl<'a> NativeExperts<'a> {
             .collect::<Result<Vec<_>>>()?;
         Ok(Self {
             execution,
-            transforms,
             weights,
             first,
         })
@@ -151,25 +150,6 @@ impl<'a> NativeExperts<'a> {
             .context("EXLR8 shared layer is not resident")
     }
 
-    pub(crate) fn rotate(
-        &self,
-        layer: usize,
-        w: &Workspace<'_>,
-        rows: usize,
-        stream: *mut c_void,
-    ) -> Result<()> {
-        // SAFETY: workspace and native weights are engine-owned through stream drain.
-        unsafe {
-            self.transforms.rotate(
-                self.weights(layer)?,
-                rows,
-                w.x.buffer,
-                w.wire.buffer,
-                stream,
-            )
-        }
-    }
-
     pub(crate) fn shared(
         &self,
         library: &NativeLibrary,
@@ -182,8 +162,8 @@ impl<'a> NativeExperts<'a> {
         let stride = weights.layout.hidden * 2;
         for first in (0..rows).step_by(ROWS) {
             let count = (rows - first).min(ROWS);
-            let input = view(w.wire.buffer, first * stride, count * stride)?;
-            let output = view(w.shared.buffer, first * stride * 2, count * stride * 2)?;
+            let input = view(w.x.buffer, first * stride, count * stride)?;
+            let output = view(w.shared.buffer, first * stride, count * stride)?;
             // SAFETY: one stream orders copies, K1 and copies out before the next
             // chunk reuses the bounded arena; no host synchronization is needed.
             unsafe {
@@ -195,53 +175,4 @@ impl<'a> NativeExperts<'a> {
         Ok(())
     }
 
-    pub(crate) fn bind_planes(
-        &self,
-        library: &NativeLibrary,
-        w: &Workspace<'_>,
-        planes: [*const u16; MAX_RANKS],
-        ranks: usize,
-    ) -> Result<()> {
-        ensure!((1..=6).contains(&ranks), "EXLR8 requires 1..=6 F32 rank planes");
-        ensure!(planes[..ranks].iter().all(|ptr| !ptr.is_null()), "EXLR8 null rank plane");
-        let addresses = planes.map(|ptr| ptr as usize);
-        match *w.native_plane_identity.borrow() {
-            Some(bound) => ensure!(bound == (addresses, ranks), "EXLR8 intake pointers changed while retained"),
-            None => {
-                let table = w.native_planes.as_ref().context("EXLR8 rank pointer storage")?;
-                let pointers: Vec<u64> = addresses[..ranks].iter().map(|&ptr| ptr as u64).collect();
-                library.copy_h2d(table.buffer, bytes_of(&pointers))?;
-            }
-        }
-        *w.native_plane_identity.borrow_mut() = Some((addresses, ranks));
-        Ok(())
-    }
-
-    pub(crate) fn reduce(
-        &self,
-        library: &NativeLibrary,
-        layer: usize,
-        w: &Workspace<'_>,
-        planes: [*const u16; MAX_RANKS],
-        ranks: usize,
-        rows: usize,
-        stream: *mut c_void,
-    ) -> Result<()> {
-        self.bind_planes(library, w, planes, ranks)?;
-        let table = w.native_planes.as_ref().context("EXLR8 rank pointer storage")?;
-        // SAFETY: intake completion precedes this call. Each thread reads its own
-        // residual before writing the same element, so in-place residual is safe.
-        unsafe {
-            self.transforms.reduce(
-                self.weights(layer)?,
-                rows,
-                ranks,
-                table.buffer,
-                w.shared.buffer,
-                w.h.buffer,
-                w.h.buffer,
-                stream,
-            )
-        }
-    }
 }

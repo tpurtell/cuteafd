@@ -328,7 +328,6 @@ impl<'a> ExpertProtocolV2RequestView<'a> {
     }
 
     fn validate(&self) -> Result<()> {
-        self.header.validate_rotated()?;
         let stream_plan = self.stream_plan_enabled();
         let stream_data = self.stream_data_enabled();
         if stream_data {

@@ -98,6 +98,8 @@ pub fn validate(spec: &ProgramSpec) -> Result<(), ManifestError> {
     Ok(())
 }
 
+// Remove rotate/reduce validation when the fork pin drops those exports;
+// all manifest entries are validated even when EXLR8 serving is disabled.
 pub fn validate_entry(spec: &ProgramSpec, entry: &serde_json::Value) -> Result<(), ManifestError> {
     if matches!(
         spec.name.as_str(),

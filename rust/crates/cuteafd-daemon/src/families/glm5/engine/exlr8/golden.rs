@@ -334,7 +334,6 @@ fn native_layer3_same_quant() -> Result<()> {
                     engine.cfg.topk,
                     false,
                     engine.spark_bf16,
-                    engine.native_experts.is_some(),
                 )?;
                 ensure!(
                     request.header.hidden_dtype
@@ -350,6 +349,18 @@ fn native_layer3_same_quant() -> Result<()> {
                     "native request differs from NumPy FP8 K32 oracle at {rows} rows"
                 );
                 drop(staged);
+                // The ordinary reducer writes delta; norm applies the residual in place.
+                engine.run(
+                    "glm_norm",
+                    &[
+                        ("residual", w.h.buffer.ptr),
+                        ("delta0", w.delta.buffer.ptr),
+                        ("delta1", w.delta.buffer.ptr),
+                        ("weight", engine.weights.layers[3].ptr("post_norm")?),
+                        ("out", w.x.buffer.ptr),
+                    ],
+                    &[Scalar::I32(rows as i32), Scalar::I32(1)],
+                )?;
                 let actual = engine.download(&w.h, rows * h * 2)?;
                 let ids = engine.download(&w.route_ids, rows * engine.cfg.topk * 4)?;
                 let expected = load("ids", "torch.int32", &[rows, engine.cfg.topk])?;

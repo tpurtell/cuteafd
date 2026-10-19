@@ -158,6 +158,9 @@ impl Drop for Admission {
 }
 
 pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result<()> {
+    if config.exlr8_manifest.is_some() {
+        cuteafd_loader::plan::exlr8::require_spark_rotation()?;
+    }
     ensure!(
         config.rank < config.world && (1..=6).contains(&config.world),
         "native rank must be below the launched Spark world"
@@ -171,6 +174,9 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
     } else {
         cuteafd_loader::read_expert_catalog(&config.snapshot)?
     };
+    if catalog.format() == cuteafd_loader::plan::checkpoint::CheckpointFormat::Exlr8 {
+        cuteafd_loader::plan::exlr8::require_spark_rotation()?;
+    }
     catalog.select_draft(cuteafd_loader::plan::spec::DraftOwnership::None)?;
     let topology = crate::shared::spark_topology::for_checkpoint(
         config.declared_world.ownership_topology(), config.world, v41 && catalog.exl3().is_some());
@@ -324,7 +330,7 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
         }
     };
     census.sample("after_retained_arenas", Some(&library))?;
-    let mut exchange = HostExpertExchange::with_output(config.capacity, config.exlr8_manifest.is_some())?;
+    let mut exchange = HostExpertExchange::new(config.capacity)?;
     let mut row_indices = vec![0; config.capacity as usize];
     // Transport benchmarks only: answer each request with its response slot
     // as it is, without running the experts.

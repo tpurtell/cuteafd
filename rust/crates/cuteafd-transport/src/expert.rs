@@ -1,7 +1,7 @@
 //! Complete native backbone batches carried by revision-3 frames.
-//! Rank partials are compact BF16 or explicitly marked EXLR8 rotated F32.
+//! Rank partials are compact BF16.
 use crate::{
-    EXPERT_PROTOCOL_V2_FLAG_DEBUG_CHECKSUM, EXPERT_PROTOCOL_V2_FLAG_EXLR8_ROTATED,
+    EXPERT_PROTOCOL_V2_FLAG_DEBUG_CHECKSUM,
     ExpertProtocolV2RequestView, ExpertProtocolV2ResponseHeader, ExpertProtocolV2ResponseRef,
     ExpertProtocolV2ResponseView, ExpertProtocolV2Status, ExpertV2Dtype,
 };
@@ -33,12 +33,12 @@ pub const V41_HIDDEN: u32 = 5120;
 pub const V41_BACKBONE_TOPK: u32 = 6;
 pub const V41_PARTIAL_ROW_BYTES: u32 = V41_HIDDEN * 2;
 
-/// Per-endpoint ceiling for native frames, including indexed F32 rank partials.
+/// Per-endpoint ceiling for native frames, including indexed BF16 rank partials.
 /// Each peer carries one rank plane; rank count multiplies retained intake/rings,
 /// never this frame bound. Keep the ordinary transport default as the floor.
 pub fn native_frame_budget(geometry: cuteafd_core::ExpertGeometry, capacity: u32) -> Result<usize> {
     let endpoint = cuteafd_core::SparkEndpoint {
-        capacity, ingress: cuteafd_core::SparkIngress::Exlr8Rotated,
+        capacity, ingress: cuteafd_core::SparkIngress::Bf16,
     };
     let (request, response) = endpoint.wire_bytes(geometry)
         .context("invalid native frame capacity or geometry")?;
@@ -142,14 +142,8 @@ fn validate_canonical_body(
     );
     ensure!(
         header.hidden_dim == cuteafd_core::expert_geometry().hidden
-            && (if header.flags & EXPERT_PROTOCOL_V2_FLAG_EXLR8_ROTATED != 0 {
-                header.hidden_dtype == ExpertV2Dtype::F16
-            } else {
-                matches!(
-                    header.hidden_dtype,
-                    ExpertV2Dtype::Bf16 | ExpertV2Dtype::Fp8E4m3Ue8m0K32
-                )
-            })
+            && matches!(header.hidden_dtype,
+                ExpertV2Dtype::Bf16 | ExpertV2Dtype::Fp8E4m3Ue8m0K32)
             && header.hidden_row_stride_bytes as usize
                 == header
                     .hidden_dtype
@@ -202,23 +196,11 @@ fn validate_canonical(
     row_at: impl Fn(usize) -> Result<crate::ExpertProtocolV2RowDescriptor>,
     route_at: impl FnMut(usize) -> Result<crate::ExpertProtocolV2RouteEntry>,
 ) -> Result<()> {
-    ensure!(
-        matches!(
-            header.flags
-                & (EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16
-                    | EXPERT_PROTOCOL_V2_FLAG_EXLR8_ROTATED),
-            EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16 | EXPERT_PROTOCOL_V2_FLAG_EXLR8_ROTATED
-        ),
-        "native request requires exactly one partial-domain agreement"
-    );
-    ensure!(
-        header.flags
-            & !(EXPERT_PROTOCOL_V2_FLAG_DEBUG_CHECKSUM
-                | EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16
-                | EXPERT_PROTOCOL_V2_FLAG_EXLR8_ROTATED)
-            == 0,
-        "native complete batches cannot use legacy reduction/compression or stream flags"
-    );
+    ensure!(header.flags & EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16 != 0,
+        "native request requires compact BF16 response agreement");
+    ensure!(header.flags & !(EXPERT_PROTOCOL_V2_FLAG_DEBUG_CHECKSUM
+        | EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16) == 0,
+        "native complete batches cannot use legacy reduction/compression or stream flags");
     validate_canonical_body(header, max_rows, row_at, route_at)
 }
 
@@ -354,15 +336,8 @@ impl<'a> BackboneRequest<'a> {
     pub fn hidden(&self) -> &'a [u8] {
         self.view.hidden_payload()
     }
-    pub fn rotated(&self) -> bool {
-        self.view.header.flags & EXPERT_PROTOCOL_V2_FLAG_EXLR8_ROTATED != 0
-    }
     fn output_dtype(&self) -> ExpertV2Dtype {
-        if self.rotated() {
-            ExpertV2Dtype::F32
-        } else {
-            ExpertV2Dtype::Bf16
-        }
+        ExpertV2Dtype::Bf16
     }
     fn output_row_bytes(&self) -> Result<u32> {
         u32::try_from(
@@ -573,21 +548,9 @@ impl<'a> V41Tp4Planes<'a> {
             layer: h.layer_id,
             rows: h.row_count,
             executors: V41Executors::new(executors)?,
-            partial_flag: h.flags
-                & (EXPERT_PROTOCOL_V2_FLAG_EXLR8_ROTATED
-                    | EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16),
-            output_dtype: if h.flags & EXPERT_PROTOCOL_V2_FLAG_EXLR8_ROTATED != 0 {
-                ExpertV2Dtype::F32
-            } else {
-                ExpertV2Dtype::Bf16
-            },
-            output_row_bytes: cuteafd_core::expert_geometry()
-                .hidden
-                .checked_mul(if h.flags & EXPERT_PROTOCOL_V2_FLAG_EXLR8_ROTATED != 0 {
-                    4
-                } else {
-                    2
-                })
+            partial_flag: h.flags & EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16,
+            output_dtype: ExpertV2Dtype::Bf16,
+            output_row_bytes: cuteafd_core::expert_geometry().hidden.checked_mul(2)
                 .context("native output row bytes overflow")?,
             planes: [None; 8],
         })
@@ -611,9 +574,7 @@ impl<'a> V41Tp4Planes<'a> {
     }
     fn response_rank(&self, h: &ExpertProtocolV2ResponseHeader) -> Result<usize> {
         ensure!(
-            h.flags
-                & (EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16
-                    | EXPERT_PROTOCOL_V2_FLAG_EXLR8_ROTATED)
+            h.flags & EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16
                 == self.partial_flag,
             "native response partial domain differs from request agreement"
         );
@@ -681,23 +642,23 @@ mod tests {
         for geometry in [cuteafd_core::ExpertGeometry::GLM5, cuteafd_core::ExpertGeometry::DEEPSEEK_V41] {
             for capacity in [1, 64, 4096] {
                 let rows = capacity as usize;
-                let indexed_reply = 128 + rows * (geometry.hidden as usize * 4 + 4);
+                let indexed_reply = 128 + rows * (geometry.hidden as usize * 2 + 4);
                 let request = 128 + rows * (40 + geometry.topk as usize * 12 + geometry.hidden as usize * 2);
                 let budget = native_frame_budget(geometry, capacity)?;
                 assert_eq!(budget, indexed_reply.max(request).max(crate::DEFAULT_MAX_FRAME_BYTES));
                 let endpoint = cuteafd_core::SparkEndpoint { capacity,
-                    ingress: cuteafd_core::SparkIngress::Exlr8Rotated };
+                    ingress: cuteafd_core::SparkIngress::Bf16 };
                 let (input, output) = endpoint.wire_bytes(geometry).unwrap();
                 assert_eq!(output + 32, indexed_reply);
                 assert!(input + 32 <= budget && output + 32 <= budget);
                 // Rank aggregation belongs to retained storage, not a peer frame.
                 for ranks in [1, 4, 6] {
-                    assert_eq!(rows * geometry.hidden as usize * 4 * ranks,
+                    assert_eq!(rows * geometry.hidden as usize * 2 * ranks,
                         (output - 96 - rows * 4) * ranks);
                 }
             }
         }
-        assert_eq!(native_frame_budget(cuteafd_core::ExpertGeometry::GLM5, 4096)?, 100_679_808);
+        assert_eq!(native_frame_budget(cuteafd_core::ExpertGeometry::GLM5, 4096)?, 64 << 20);
         for capacity in [0, 4097, u32::MAX] {
             assert!(native_frame_budget(cuteafd_core::ExpertGeometry::GLM5, capacity).is_err());
         }
@@ -908,118 +869,6 @@ mod tests {
         request.header.flags |= EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16;
         request
     }
-    fn rotated_request(rows: u32) -> ExpertProtocolV2Request {
-        let mut input = request(rows);
-        input.header.flags = EXPERT_PROTOCOL_V2_FLAG_EXLR8_ROTATED;
-        input.header.hidden_dtype = ExpertV2Dtype::F16;
-        input
-    }
-
-    #[test]
-    fn exlr8_rotated_full_and_chunked_rank_planes_preserve_f32() -> Result<()> {
-        let input = rotated_request(3);
-        BackboneRequest::validate_owned(&input, 3)?;
-        let frame = input.encode()?;
-        let native = BackboneRequest::parse(&frame, 3)?;
-        assert!(native.rotated());
-        native.require_input_dtype(ExpertV2Dtype::F16 as u32)?;
-        assert!(native.require_input_dtype(ExpertV2Dtype::Bf16 as u32).is_err());
-        let row_bytes = 5120 * 4;
-        assert_eq!(native.plane_bytes()?, 3 * row_bytes);
-        let payload: Vec<u8> = (0..3 * 5120).flat_map(|i| {
-            // F32 mantissa bits that cannot survive a BF16 round trip.
-            (1.0f32 + (i as f32) * 0.000013).to_le_bytes()
-        }).collect();
-        let full = native.response(1, &payload)?.to_owned()?.encode()?;
-        let parsed = ExpertProtocolV2ResponseView::parse(&full)?;
-        assert_eq!(parsed.header.output_dtype, ExpertV2Dtype::F32);
-        assert_eq!(parsed.partial_output_payload(), payload);
-        let landed = ExpertProtocolV2ResponseView::parse_landed_header(&full[..96])?;
-        assert_eq!(landed.output_payload_bytes as usize, payload.len());
-        let mut planes = V41Tp4Planes::new_ranks(&native, &[1])?;
-        planes.insert(&full)?;
-        assert_eq!(planes.plane(0)?, payload);
-        let budget = 96 + 2 * (row_bytes + 4);
-        assert_eq!(native.response_chunk_rows(budget)?, 2);
-        let mut receiver = V41Tp4ChunkReceiver::new_ranks(&native, &[1], budget)?;
-        let mut owned = V41Tp4ChunkReceiver::from_owned_ranks(&input, 3, &[1], 200_000)?;
-        owned.push(&full, |_, _, bytes| { assert_eq!(bytes, payload); Ok(()) })?;
-        assert!(owned.complete());
-        let mut restored = Vec::new();
-        let mut indices = [0; 2];
-        for (start, end) in [(0, 2), (2, 3)] {
-            let chunk = native.response_chunk(1, start as u32,
-                &payload[start * row_bytes..end * row_bytes], &mut indices, budget)?
-                .to_owned()?.encode()?;
-            receiver.push(&chunk, |rank, first, bytes| {
-                assert_eq!((rank, first), (0, start as u32));
-                restored.extend_from_slice(bytes);
-                Ok(())
-            })?;
-        }
-        assert!(receiver.complete());
-        assert_eq!(restored, payload);
-        Ok(())
-    }
-
-    #[test]
-    fn exlr8_rotated_refuses_mixed_domains_and_malformed_frames() -> Result<()> {
-        let input = rotated_request(1);
-        let frame = input.encode()?;
-        let native = BackboneRequest::parse(&frame, 1)?;
-        for flag in [EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16,
-            EXPERT_PROTOCOL_V2_FLAG_RESPONSE_FP8_E4M3_ROW_SCALED,
-            crate::EXPERT_PROTOCOL_V2_FLAG_SPARK_REDUCTION,
-            crate::EXPERT_PROTOCOL_V2_FLAG_STREAM_PLAN, V41_NATIVE_GROUP_REQUEST_FLAG] {
-            let mut bad = input.clone();
-            bad.header.flags |= flag;
-            assert!(bad.validate().is_err(), "mixed flag {flag}");
-            let mut wire = frame.clone();
-            wire[84..88].copy_from_slice(&bad.header.flags.to_le_bytes());
-            assert!(ExpertProtocolV2RequestView::parse(&wire).is_err());
-        }
-        for dtype in [ExpertV2Dtype::Bf16, ExpertV2Dtype::F32,
-            ExpertV2Dtype::Fp8E4m3Ue8m0K32] {
-            let mut bad = input.clone();
-            bad.header.hidden_dtype = dtype;
-            assert!(bad.validate().is_err());
-            let mut wire = frame.clone();
-            wire[44..46].copy_from_slice(&(dtype as u16).to_le_bytes());
-            assert!(ExpertProtocolV2RequestView::parse(&wire).is_err());
-        }
-        let mut unmarked = input.clone();
-        unmarked.header.flags = EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16;
-        assert!(BackboneRequest::validate_owned(&unmarked, 1).is_err());
-        let payload = vec![0; native.plane_bytes()?];
-        let response = native.response(1, &payload)?.to_owned()?;
-        for dtype in [ExpertV2Dtype::Bf16, ExpertV2Dtype::F16] {
-            let mut bad = response.clone();
-            bad.header.output_dtype = dtype;
-            assert!(bad.validate().is_err());
-            let mut wire = response.encode()?;
-            wire[40..42].copy_from_slice(&(dtype as u16).to_le_bytes());
-            assert!(ExpertProtocolV2ResponseView::parse(&wire).is_err());
-            assert!(ExpertProtocolV2ResponseView::parse_landed_header(&wire[..96]).is_err());
-        }
-        let mut wrong_domain = response.clone();
-        wrong_domain.header.flags = EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16;
-        let wrong = wrong_domain.encode()?;
-        let mut planes = V41Tp4Planes::new_ranks(&native, &[1])?;
-        assert!(planes.insert(&wrong).is_err());
-        assert!(!planes.complete());
-        let valid = response.encode()?;
-        planes.insert(&valid)?;
-        assert!(planes.complete());
-        let rejection = ExpertProtocolV2ResponseRef::row_capacity_error(&input.header, 64, 1)?;
-        assert_eq!(rejection.header.output_dtype, ExpertV2Dtype::F32);
-        assert_ne!(rejection.header.flags & EXPERT_PROTOCOL_V2_FLAG_EXLR8_ROTATED, 0);
-        let rejection = rejection.to_owned()?.encode()?;
-        let mut receiver = V41Tp4ChunkReceiver::new_ranks(&native, &[1], 200_000)?;
-        assert!(receiver.push(&rejection, |_, _, _| panic!("rejection reached sink")).is_err());
-        assert!(!receiver.complete());
-        Ok(())
-    }
-
     #[test]
     fn fp8_k32_wire_roundtrip_preserves_rows_and_bf16_worker_rejects_it() {
         for rows in [1, 16, 80] {

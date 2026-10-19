@@ -19,7 +19,7 @@ use cuteafd_transport::expert::{
     SparkExpertWave, EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16,
 };
 use cuteafd_transport::{
-    EXPERT_PROTOCOL_V2_FLAG_EXLR8_ROTATED, ExpertProtocolV2Request, ExpertProtocolV2RowDescriptor, ExpertV2Dtype, ExpertV2SourceKind,
+    ExpertProtocolV2Request, ExpertProtocolV2RowDescriptor, ExpertV2Dtype, ExpertV2SourceKind,
 };
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::programs::{Programs, Scalar, VocabularyHead, VOCABULARY_HEAD_WORKSPACE};
@@ -73,8 +73,6 @@ enum Previous {
     First,
     Delta,
     Planes(usize),
-    NativePlanes(usize),
-    Residual,
 }
 
 /// Everything a captured decode segment bakes in.
@@ -212,8 +210,6 @@ struct Workspace<'a> {
     route_weights: Dev<'a>,
     wire: Dev<'a>,
     shared: Dev<'a>,
-    native_planes: Option<Dev<'a>>,
-    native_plane_identity: RefCell<Option<([usize; MAX_RANKS], usize)>>,
     payload: Option<Dev<'a>>,
     router_host: RefCell<HostAllocation<'a>>,
     /// The step's token ids (U32, gathered from the device embedding table).
@@ -275,7 +271,7 @@ enum StepLogits {
 
 pub(crate) struct GlmEngine<'a> {
     pub(crate) spark_bf16: bool,
-    pub(crate) native_experts: Option<exlr8::NativeExperts<'a>>,
+    pub(crate) native_experts: Vec<exlr8::NativeExperts<'a>>,
     quantize_grid: Fp8QuantizeGrid,
     pub library: &'a NativeLibrary,
     pub programs: &'a Programs<'a>,
@@ -398,7 +394,7 @@ impl<'a> GlmEngine<'a> {
         let local = if context_mode.is_some() { pages / 2 } else { pages };
         let (kv, index, cos_sin) = caches(library, &cfg, &weights.layers, local, max_context)?;
         let device = library.cuda_get_device()?;
-        Ok(Self { quantize_grid, device, native_experts: None, peer: None, exchange: None, tp2: None, tp2_exchange: ExchangeDtype::Bf16, force_route_check: Cell::new(false), context_mode, context: None, layer_execution: None,
+        Ok(Self { quantize_grid, device, native_experts: Vec::new(), peer: None, exchange: None, tp2: None, tp2_exchange: ExchangeDtype::Bf16, force_route_check: Cell::new(false), context_mode, context: None, layer_execution: None,
             context_units: RefCell::new(Vec::new()), library, programs, cfg, weights, stream, max_context, prefill_rows, pages, kv, index, cos_sin,
             decode_workspace: RefCell::new(None), lane_workspaces: RefCell::new(Vec::new()),
             prefill_lanes,
@@ -665,12 +661,10 @@ impl<'a> GlmEngine<'a> {
             router_logits: self.alloc(if lead || self.tp2.is_some() { t * self.cfg.experts * 4 } else { 256 })?,
             route_ids: self.alloc(if lead || self.tp2.is_some() { t * self.cfg.topk * 4 } else { 256 })?,
             route_weights: self.alloc(if lead || self.tp2.is_some() { t * self.cfg.topk * 4 } else { 256 })?,
-            wire: self.alloc(if lead || self.tp2.is_some() { t * if self.native_experts.is_some() { h * 2 } else { h + h / 32 } } else { 256 })?,
-            shared: self.alloc(t * h * if lead && self.native_experts.is_some() { 4 } else { 2 })?,
-            native_planes: self.native_experts.as_ref().filter(|_| lead).map(|_| self.alloc(256)).transpose()?,
-            native_plane_identity: RefCell::new(None),
+            wire: self.alloc(if lead || self.tp2.is_some() { t * (h + h / 32) } else { 256 })?,
+            shared: self.alloc(t * h * 2)?,
             payload: self.tp2.as_ref().map(|tp2| self.alloc(tp2.combine.payload_bytes(t, h))).transpose()?,
-            router_host: RefCell::new(HostAllocation::new(self.library, lead_only(t * (self.cfg.topk * 8 + if self.spark_bf16 || self.native_experts.is_some() { h * 2 } else { h + h / 32 })))?),
+            router_host: RefCell::new(HostAllocation::new(self.library, lead_only(t * (self.cfg.topk * 8 + if self.spark_bf16 { h * 2 } else { h + h / 32 })))?),
             ids: self.alloc(t * 4)?,
             select: self.alloc(t * 8)?,
             // SAFETY: the workspace buffer lives in the same struct and drops after the head.
@@ -1011,7 +1005,7 @@ impl<'a> GlmEngine<'a> {
                     self.exchange()?.wait(0, attended)?;
                     self.norm_full(0, w, layer.ptr("post_norm")?, 2, rows, w.delta.buffer.ptr, self.recv(0, attended)?)?;
                     // Rank 1: this layer's FFN side, then the next layer's attention.
-                    if !self.tp2_layer(index) && !(self.native_experts.is_some() && !layer.dense) {
+                    if !self.tp2_layer(index) {
                         self.peer_post(index, 0, w1, rows, bytes)?;
                         if index + 1 < layers.len() {
                             self.peer_attention(index + 1, 0, w1, rows, cap, &ranked[0], bytes)?;
@@ -1051,17 +1045,7 @@ impl<'a> GlmEngine<'a> {
                 Some(next) => next.ptr("input_norm")?,
                 None => self.weights.norm.buffer.ptr,
             };
-            if self.native_experts.is_some() && !layer.dense {
-                // Native reduce already includes the residual in h.
-                self.run("glm_norm", &[("residual", w.h.buffer.ptr), ("delta0", w.delta.buffer.ptr),
-                    ("delta1", w.delta.buffer.ptr), ("weight", weight), ("out", w.x.buffer.ptr)],
-                    &[rows, Scalar::I32(0)])?;
-                if let Some(w1) = w1.filter(|_| index + 1 < layers.len()) {
-                    self.exchange()?.push(0, ffn, w.h.buffer.ptr, bytes)?;
-                    self.peer_post(index, 0, w1, rows, bytes)?;
-                    self.peer_attention(index + 1, 0, w1, rows, cap, &ranked[0], bytes)?;
-                }
-            } else if w1.is_some() {
+            if w1.is_some() {
                 if !layer.dense && !self.tp2_layer(index) && index + 1 < layers.len() {
                     self.exchange()?.push(0, ffn, w.delta.buffer.ptr, bytes)?;
                 }
@@ -1158,10 +1142,8 @@ impl<'a> GlmEngine<'a> {
         if layer.dense {
             self.ffn_on(1, w1, layer, self.cfg.dense_intermediate, cap, w1.delta.buffer.ptr, rows)?;
             exchange.push(1, ffn, w1.delta.buffer.ptr, bytes)
-        } else if self.native_experts.is_some() {
-            Ok(())
         } else {
-            self.ffn_on(1, w1, layer, self.cfg.moe_intermediate, cap, w1.shared.buffer.ptr, rows)?;
+            self.shared_on(1, index, w1, layer, rows, cap)?;
             if self.tp2_layer(index) { Ok(()) } else { exchange.push(1, ffn, w1.shared.buffer.ptr, bytes) }
         }
     }
@@ -1176,17 +1158,6 @@ impl<'a> GlmEngine<'a> {
         let ffn = slot(index, true, lane);
         self.exchange()?.wait(1, ffn)?;
         let received = self.recv(1, ffn)?;
-        if self.native_experts.is_some() && !peer.layers[index].dense {
-            // SAFETY: the slot holds the owner's completed BF16 residual;
-            // the peer stream consumes it before the exchange slot is reused.
-            self.on(1, || unsafe {
-                self.library.copy_d2d_async(w1.h.buffer,
-                    cuteafd_ffi::CuteafdDeviceBuffer { ptr: received, bytes, ..w1.h.buffer },
-                    bytes, self.stream_of(1))
-            })?;
-            return self.norm_full(1, w1, next.ptr("input_norm")?, 0, rows,
-                w1.delta.buffer.ptr, w1.delta.buffer.ptr);
-        }
         let (first, second) = if peer.layers[index].dense { (w1.delta.buffer.ptr, received) }
             else { (received, w1.shared.buffer.ptr) };
         if self.tp2_layer(index) {
@@ -1246,10 +1217,6 @@ impl<'a> GlmEngine<'a> {
             (Some((transport, _)), None) => transport.intake.pointers(),
             (None, None) => [std::ptr::null(); MAX_RANKS],
         };
-        if let Some(native) = &self.native_experts {
-            native.bind_planes(self.library, w, planes, experts.as_ref()
-                .context("native decode requires Spark transport")?.0.world_size())?;
-        }
         // Previous layer's FFN output: none (first layer), in `delta`, or Spark planes.
         let mut previous = Previous::First;
         for index in 0..=layers.len() {
@@ -1265,13 +1232,6 @@ impl<'a> GlmEngine<'a> {
                 }
                 if let Previous::Planes(ranks) = previous {
                     self.reduce(planes, w, ranks, t)?;
-                }
-                if let Previous::NativePlanes(ranks) = previous {
-                    self.native_experts.as_ref().context("native decode owner")?.reduce(
-                        self.library, index - 1, w, planes, ranks, t, self.stream)?;
-                    if w1.is_some() && layer.is_some() {
-                        self.exchange()?.push(0, slot(index - 1, true, 0), w.h.buffer.ptr, bytes)?;
-                    }
                 }
                 let weight = match layer {
                     Some(layer) => layer.ptr("input_norm")?,
@@ -1290,7 +1250,7 @@ impl<'a> GlmEngine<'a> {
                         else { self.norm_full(0, w, weight, 2, rows, w.delta.buffer.ptr, self.recv(0, ffn)?)?; }
                     }
                     _ => {
-                        let deltas = if matches!(previous, Previous::First | Previous::NativePlanes(_)) { 0 } else { 1 };
+                        let deltas = if matches!(previous, Previous::First) { 0 } else { 1 };
                         self.run("glm_norm", &[("residual", w.h.buffer.ptr), ("delta0", w.delta.buffer.ptr),
                             ("delta1", w.delta.buffer.ptr), ("weight", weight), ("out", w.x.buffer.ptr)],
                             &[rows, Scalar::I32(deltas)])?;
@@ -1342,7 +1302,6 @@ impl<'a> GlmEngine<'a> {
                 }
                 if let Some(layer) = layer.filter(|_| index + 1 < layers.len()) {
                     let kind = if layer.dense || self.tp2_layer(index) { Previous::Delta }
-                        else if self.native_experts.is_some() { Previous::Residual }
                         else { Previous::Planes(0) };
                     // Rank 1's next weights into L2 while rank 0 waits in this layer's exchange.
                     if let (false, Some(l2)) = (layer.dense, self.peer()?.l2.as_ref()) {
@@ -1363,8 +1322,7 @@ impl<'a> GlmEngine<'a> {
                         .with_context(|| format!("layer {index} is an MoE layer; pass Spark peers for its routed experts"))?;
                     let ranks = self.moe_exchange(w, index, layer, tables.exchange_rows, "m64", true, transport,
                         runtime)?;
-                    if self.native_experts.is_some() { Previous::NativePlanes(ranks) }
-                        else { Previous::Planes(ranks) }
+                    Previous::Planes(ranks)
                 }
             };
             if let Some(probe) = self.draft_probe.borrow_mut().as_mut() {
@@ -1389,19 +1347,6 @@ impl<'a> GlmEngine<'a> {
             let exchange = self.exchange()?;
             let layer = &peer.layers[index];
             match (previous, index.checked_sub(1)) {
-                (Previous::Residual, Some(before)) => {
-                    let ffn = slot(before, true, 0);
-                    exchange.wait(1, ffn)?;
-                    // SAFETY: the peer slot holds the completed residual and
-                    // stream ordering protects it until this copy finishes.
-                    self.on(1, || unsafe {
-                        self.library.copy_d2d_async(w1.h.buffer,
-                            cuteafd_ffi::CuteafdDeviceBuffer { ptr: self.recv(1, ffn)?, bytes, ..w1.h.buffer },
-                            bytes, self.stream_of(1))
-                    })?;
-                    self.norm_full(1, w1, layer.ptr("input_norm")?, 0, rows,
-                        w1.delta.buffer.ptr, w1.delta.buffer.ptr)?;
-                }
                 (Previous::Delta | Previous::Planes(_), Some(before)) => {
                     let ffn = slot(before, true, 0);
                     exchange.wait(1, ffn)?;
@@ -1421,10 +1366,10 @@ impl<'a> GlmEngine<'a> {
             exchange.push(1, attended, w1.delta.buffer.ptr, bytes)?;
             exchange.wait(1, attended)?;
             self.norm_full(1, w1, layer.ptr("post_norm")?, 2, rows, w1.delta.buffer.ptr, self.recv(1, attended)?)?;
-            if self.native_experts.is_some() && !layer.dense { return Ok(()); }
             let out = if layer.dense { w1.delta.buffer.ptr } else { w1.shared.buffer.ptr };
             let intermediate = if layer.dense { self.cfg.dense_intermediate } else { self.cfg.moe_intermediate };
-            self.ffn_on(1, w1, layer, intermediate, "m64", out, rows)?;
+            if layer.dense { self.ffn_on(1, w1, layer, intermediate, "m64", out, rows)?; }
+            else { self.shared_on(1, index, w1, layer, rows, "m64")?; }
             if self.tp2_layer(index) { Ok(()) } else { exchange.push(1, ffn, out, bytes) }
         };
         let key = GraphKey { layer: index, rows: t, table_width: tables.table_width, table_stride: tables.table_stride,
@@ -1523,6 +1468,16 @@ impl<'a> GlmEngine<'a> {
         }
     }
 
+    fn shared_on(&self, rank: usize, index: usize, w: &Workspace<'_>, layer: &GlmLayer<'_>,
+        rows: Scalar, cap: &str) -> Result<()> {
+        if let Some(native) = self.native_experts.get(rank) {
+            let Scalar::I32(rows) = rows else { anyhow::bail!("EXLR8 shared rows must be I32"); };
+            self.on(rank, || native.shared(self.library, index, w, rows as usize, self.stream_of(rank)))
+        } else {
+            self.ffn_on(rank, w, layer, self.cfg.moe_intermediate, cap, w.shared.buffer.ptr, rows)
+        }
+    }
+
     /// Router, shared expert and the Spark routed experts; leaves
     /// routed + shared in `delta` for the next norm's residual add.
     #[allow(clippy::too_many_arguments)]
@@ -1531,9 +1486,7 @@ impl<'a> GlmEngine<'a> {
         transport: &mut SparkLink<'_>, runtime: &tokio::runtime::Runtime) -> Result<()> {
         self.moe_front(w, layer, t)?;
         let ranks = self.moe_exchange(w, index, layer, t, cap, decode, transport, runtime)?;
-        if let Some(native) = &self.native_experts {
-            native.reduce(self.library, index, w, transport.intake.pointers(), ranks, t, self.stream)
-        } else { self.reduce(transport.intake.pointers(), w, ranks, t) }
+        self.reduce(transport.intake.pointers(), w, ranks, t)
     }
 
     /// Router scores, the sigmoid top-k selection and the wire rows (device only).
@@ -1552,7 +1505,7 @@ impl<'a> GlmEngine<'a> {
                 std::ptr::null(), w.route_ids.buffer.ptr, w.route_weights.buffer.ptr, t, self.cfg.experts, topk,
                 self.cfg.routed_scale as f32, true, self.stream_of(rank))
         })?;
-        if self.native_experts.is_some() || (self.spark_bf16 && !self.tp2.as_ref().is_some_and(|p| p.partial() == PartialDtype::F32)) { return Ok(()); }
+        if self.spark_bf16 && !self.tp2.as_ref().is_some_and(|p| p.partial() == PartialDtype::F32) { return Ok(()); }
         let grid = self.quantize_grid.blocks(t, h);
         self.run_on(rank, "glm_expert_input_quant", &[("source_ptr", w.x.buffer.ptr), ("values_ptr", w.wire.buffer.ptr),
             // SAFETY: the scale rows follow the payload inside each wire row.
@@ -1597,10 +1550,8 @@ impl<'a> GlmEngine<'a> {
     /// request with [`Self::moe_send`].
     fn moe_stage(&self, w: &Workspace<'_>, layer_index: usize, layer: &GlmLayer<'_>, t: usize, cap: &str) -> Result<()> {
         let (h, topk) = (self.cfg.hidden, self.cfg.topk);
-        let native = self.native_experts.as_ref();
-        if let Some(native) = native { native.rotate(layer_index, w, t, self.stream)?; }
         let layout = crate::shared::experts::staging::RouteStaging::new(t, topk,
-            if self.spark_bf16 || native.is_some() { h * 2 } else { h + h / 32 })?;
+            if self.spark_bf16 { h * 2 } else { h + h / 32 })?;
         let route_bytes = layout.route_bytes;
         let staging = w.router_host.borrow_mut();
         let timer = std::time::Instant::now();
@@ -1621,7 +1572,7 @@ impl<'a> GlmEngine<'a> {
         unsafe {
             layout.enqueue(self.library, staging.buffer,
                 [w.route_ids.buffer, w.route_weights.buffer,
-                    if self.spark_bf16 && native.is_none() { w.x.buffer } else { w.wire.buffer }], self.stream)?;
+                    if self.spark_bf16 { w.x.buffer } else { w.wire.buffer }], self.stream)?;
             self.library.cuda_stream_synchronize(self.stream)?;
         }
         self.profile.borrow_mut()[0] += timer.elapsed().as_secs_f64();
@@ -1638,8 +1589,7 @@ impl<'a> GlmEngine<'a> {
             });
         }
         // The shared expert runs on the GPU while the host sends and the Sparks compute.
-        if let Some(native) = native { native.shared(self.library, layer_index, w, t, self.stream) }
-        else { self.ffn(w, layer, self.cfg.moe_intermediate, cap, w.shared.buffer.ptr, Scalar::I32(t as i32)) }
+        self.shared_on(0, layer_index, w, layer, Scalar::I32(t as i32), cap)
     }
 
     /// One request to every Spark rank from the staged routes and wire rows
@@ -1652,7 +1602,7 @@ impl<'a> GlmEngine<'a> {
             if let Some(probe) = self.draft_probe.borrow_mut().as_mut().filter(|p| p.active()) {
                 probe.staged(index, &staging.bytes()[..t * self.cfg.topk * 4]);
             }
-            expert_request(staging.bytes(), index, t, self.cfg.hidden, self.cfg.topk, decode, self.spark_bf16, self.native_experts.is_some())?
+            expert_request(staging.bytes(), index, t, self.cfg.hidden, self.cfg.topk, decode, self.spark_bf16)?
         };
         self.exchange_host.borrow_mut()[2] += timer.elapsed().as_secs_f64();
         let post = std::time::Instant::now();
@@ -1667,7 +1617,7 @@ impl<'a> GlmEngine<'a> {
     /// its rank partials gathered into the lane's intake, all off this
     /// thread; [`Self::lane_land`] waits for it.
     fn lane_send(&self, w: &Workspace<'_>, index: usize, t: usize, lane: &mut SparkLane<'_>) -> Result<()> {
-        ensure!(self.native_experts.is_none(), "EXLR8 currently requires serial prefill");
+        ensure!(self.native_experts.is_empty(), "EXLR8 currently requires serial prefill");
         let (h, topk) = (self.cfg.hidden, self.cfg.topk);
         let ranks = lane.world_size();
         ensure!(ranks <= MAX_RANKS, "{ranks} Spark ranks exceed the reduction planes");
@@ -1687,7 +1637,7 @@ impl<'a> GlmEngine<'a> {
             // writes it until this lane's next stage, which follows the wait
             // for this wave.
             let staged = unsafe { std::slice::from_raw_parts(staged as *const u8, staged_bytes) };
-            expert_request(staged, index, t, h, topk, false, bf16, false)
+            expert_request(staged, index, t, h, topk, false, bf16)
         });
         lane.submit(t, build)
     }
@@ -2239,22 +2189,21 @@ pub(crate) fn configured_lanes() -> usize {
 /// them out in the pinned router staging.
 #[allow(clippy::too_many_arguments)]
 fn expert_request(staged: &[u8], index: usize, t: usize, h: usize, topk: usize, decode: bool,
-    bf16: bool, native: bool) -> Result<ExpertProtocolV2Request> {
+    bf16: bool) -> Result<ExpertProtocolV2Request> {
     let kind = if decode { ExpertV2SourceKind::Decode } else { ExpertV2SourceKind::Prefill };
     let layout = crate::shared::experts::staging::RouteStaging::new(t, topk,
-        if bf16 || native { h * 2 } else { h + h / 32 })?;
+        if bf16 { h * 2 } else { h + h / 32 })?;
     let routes = layout.routes(staged)?;
     let mut wire = vec![0u8; layout.wire_bytes];
     copy_parallel(&mut wire, layout.wire(staged)?);
     let mut request = ExpertProtocolV2Request::new(index as u64 + 1, 17, index as u32, h as u32,
-        if native { ExpertV2Dtype::F16 } else if bf16 { ExpertV2Dtype::Bf16 } else { ExpertV2Dtype::Fp8E4m3Ue8m0K32 },
+        if bf16 { ExpertV2Dtype::Bf16 } else { ExpertV2Dtype::Fp8E4m3Ue8m0K32 },
         (0..t as u32).map(|row| ExpertProtocolV2RowDescriptor {
             row_id: u64::from(row), source_kind: kind, source_request_id: 1,
             token_position: u64::from(row), route_offset: row * topk as u32, route_count: topk as u32,
         }).collect(),
         routes, wire)?;
-    request.header.flags |= if native { EXPERT_PROTOCOL_V2_FLAG_EXLR8_ROTATED }
-        else { EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16 };
+    request.header.flags |= EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16;
     Ok(request)
 }
 
@@ -2297,54 +2246,22 @@ mod long_graph_tests {
     use super::*;
 
     #[test]
-    fn native_peer_residual_schedule_has_no_partial_roundtrip() {
-        use crate::shared::peer_split::order::{check, Schedule};
-        for repeats in [1, 3] {
-            let mut schedule = Schedule::default();
-            for _ in 0..repeats {
-                schedule.push_to(0, "main", DIRECT, 0, "embedding");
-                schedule.wait_for(1, "main", DIRECT, 0, "embedding");
-                for layer in 0..8 {
-                    for rank in 0..2 {
-                        schedule.push(rank, "main", slot(layer, false, 0), "attention");
-                        schedule.wait(rank, "main", slot(layer, false, 0), "attention received");
-                    }
-                    let ffn = slot(layer, true, 0);
-                    if layer < 3 {
-                        for rank in 0..2 { schedule.push(rank, "main", ffn, "dense partial"); }
-                        for rank in 0..2 { schedule.wait(rank, "main", ffn, "dense sum"); }
-                    } else if layer < 7 {
-                        schedule.push(0, "main", ffn, "completed native residual");
-                        schedule.wait(1, "main", ffn, "native residual copied");
-                    }
-                }
-                schedule.end_request();
-            }
-            check(&schedule).unwrap();
-            assert_eq!(schedule.streams[0].iter().filter(|(_, label)|
-                label == "completed native residual").count(), repeats * 4);
-            assert!(!schedule.streams[1].iter().any(|(_, label)|
-                label == "completed native residual"));
-        }
-    }
-
-    #[test]
-    fn native_expert_request_preserves_f16_rows_and_rotated_only_contract() -> Result<()> {
+    fn native_expert_request_preserves_fp8_rows_and_bf16_response_contract() -> Result<()> {
         for rows in [1, 8, 64, 65] {
             let (hidden, topk) = (128, 2);
             let routes = rows * topk;
             let mut staged = Vec::new();
             for id in 0..routes { staged.extend_from_slice(&((id % 256) as u32).to_le_bytes()); }
             for _ in 0..routes { staged.extend_from_slice(&0.5f32.to_le_bytes()); }
-            let wire = vec![0x3c; rows * hidden * 2];
+            let wire = vec![0x3c; rows * (hidden + hidden / 32)];
             staged.extend_from_slice(&wire);
-            let request = expert_request(&staged, 3, rows, hidden, topk, false, false, true)?;
-            assert_eq!(request.header.hidden_dtype, ExpertV2Dtype::F16);
-            assert_eq!(request.header.flags, EXPERT_PROTOCOL_V2_FLAG_EXLR8_ROTATED);
+            let request = expert_request(&staged, 3, rows, hidden, topk, false, false)?;
+            assert_eq!(request.header.hidden_dtype, ExpertV2Dtype::Fp8E4m3Ue8m0K32);
+            assert_eq!(request.header.flags, EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16);
             assert_eq!(request.hidden_payload.as_ref(), wire.as_slice());
             assert_eq!(request.routes.len(), routes);
             assert!(expert_request(&staged[..staged.len() - 1], 3, rows, hidden, topk,
-                false, false, true).is_err());
+                false, false).is_err());
         }
         Ok(())
     }
@@ -2409,10 +2326,10 @@ mod long_graph_tests {
 impl Drop for GlmEngine<'_> {
     fn drop(&mut self) {
         if self.tp2.is_some() || self.layer_execution.is_some()
-            || (self.native_experts.is_some() && self.peer.is_some()) {
+            || (!self.native_experts.is_empty() && self.peer.is_some()) {
             crate::shared::decode_graph::fatal_drain(self.retire_tp2(), "GLM peer engine retirement");
         }
-        if self.native_experts.is_some() {
+        if !self.native_experts.is_empty() {
             // SAFETY: native shared execution and workspace owners remain live until this drain.
             crate::shared::decode_graph::fatal_drain(unsafe {
                 self.library.cuda_stream_synchronize(self.stream)
