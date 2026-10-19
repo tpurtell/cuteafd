@@ -75,7 +75,7 @@ impl<'a> RoutedLane<'a> {
         let library = library_owner.as_ref();
         let (link, staging, ready) = stream.device.run(|| {
             library.v41_compact_reducer()?.require_plane_reduction(RANKS as u32)?;
-            Ok((SparkLane::new(library, world, peers, local.rows() as u32, config, LATENT * 2)?,
+            Ok((SparkLane::new(library_owner, world, peers, local.rows() as u32, config, LATENT * 2)?,
                 HostAllocation::new(library, layout.bytes)?, Event::new(stream.device)?))
         })?;
         ensure!(link.world_size() == RANKS, "Kimi Spark transport world differs from admission");
@@ -83,12 +83,10 @@ impl<'a> RoutedLane<'a> {
             terminal: false, staging, ready, capacity: local.rows(), sequence: 0, pending: None })
     }
 
-    /// #511: diagnostic-only successful-drain boundary, not failure-safe.
-    /// Keep the whole lane and its exact library owner until copies are drained.
+    /// Checked QP quiescence precedes copy drainage and owner release.
     pub(crate) fn quiesce_links(&mut self) -> Result<()> {
-        ensure!(self.pending.is_none(), "Kimi interim teardown cannot quiesce a failed wave (#511)");
+        if let Some(link) = &mut self.link { link.terminal_quiesce()?; }
         self.terminal = true;
-        tracing::warn!("Kimi diagnostic teardown: not failure-safe; #511 checked quiescence pending");
         Ok(())
     }
 
@@ -100,11 +98,15 @@ impl<'a> RoutedLane<'a> {
     }
 
     pub(crate) fn release_payloads(&mut self) -> Result<()> {
-        ensure!(self.terminal && self.pending.is_none(), "Kimi Spark sources are not terminal");
+        ensure!(self.terminal, "Kimi Spark sources are not terminal");
         self.drain_copies()?;
-        // #511: successful cold diagnostics only. Drop joins before intake release.
-        let link = self.link.take();
-        self.stream.device.run(|| { drop(link); Ok(()) })
+        self.stream.device.run(|| {
+            if let Some(link) = &mut self.link { link.terminal_release()?; }
+            drop(self.link.take());
+            Ok(())
+        })?;
+        self.pending = None;
+        Ok(())
     }
 
     fn check(&self, local: &LocalLane<'_>, rows: usize) -> Result<()> {
@@ -200,9 +202,11 @@ mod tests {
         assert!(!source.contains("let SparkLane {"));
         let release = source.split("pub(crate) fn release_payloads").nth(1).unwrap()
             .split("fn check").next().unwrap();
-        assert!(release.find("self.drain_copies()?").unwrap() < release.find("self.link.take()").unwrap());
-        assert!(release.contains("self.stream.device.run(|| { drop(link); Ok(()) })"));
-        assert!(source.contains("not failure-safe"));
+        assert!(release.find("self.drain_copies()?").unwrap() < release.find("link.terminal_release()?").unwrap());
+        assert!(release.find("link.terminal_release()?").unwrap() < release.find("self.link.take()").unwrap());
+        assert!(release.contains("self.stream.device.run(||"));
+        assert!(source.contains("link.terminal_quiesce()?"));
+        assert!(!source.contains("not failure-safe"));
     }
 
     #[test]

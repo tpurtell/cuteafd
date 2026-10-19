@@ -1261,6 +1261,44 @@ mod lane_owner_tests {
     impl Drop for Owner { fn drop(&mut self) { self.0.set(self.0.get() + 1); } }
 
     #[test]
+    #[ignore = "requires CUTEAFD_NATIVE_LIFETIME_FIXTURE_DIR; CPU-only fake DSO"]
+    fn quiesce_failure_keeps_fake_dso_and_real_intake_owned() -> Result<()> {
+        use crate::shared::experts::rtx::pair::{teardown, Teardown};
+        use cuteafd_ffi::native_library_lifetime_fixture::Fixture;
+        let fixture = Fixture::build()?;
+        let library = Arc::new(fixture.load()?);
+        let intake = std::rc::Rc::new(SparkIntake::new(&library, IntakeMode::Host, 1, 1, 2)?);
+        let intake_weak = std::rc::Rc::downgrade(&intake);
+        let library_weak = Arc::downgrade(&library);
+        let terminal = RefCell::new(LaneOwners(Some((intake.clone(), library.clone()))));
+        let copies = Cell::new(false);
+        let released = Cell::new(false);
+        let result = teardown(&mut Teardown {
+            abort: || Ok(()),
+            ranks: || Ok(()),
+            links: || anyhow::bail!("injected ordinary-lane quiesce failure"),
+            copies: || { copies.set(true); intake.terminal_drain_copies() },
+            graphs: || { released.set(true); terminal.borrow_mut().release(); Ok(()) },
+            finish: |drained: bool| assert!(!drained),
+        });
+        assert!(result.unwrap_err().to_string().contains("link quiescence"));
+        assert!(!copies.get() && !released.get());
+        assert!(terminal.borrow().0.is_some());
+        drop(intake);
+        drop(terminal);
+        // The same guard used by SparkLane retains the real allocations after
+        // the external intake owner disappears, and keeps the DSO loaded.
+        assert!(intake_weak.upgrade().is_some());
+        drop(intake_weak);
+        drop(library);
+        assert!(library_weak.upgrade().is_some());
+        assert!(fixture.resident()?);
+        let events = fixture.events()?;
+        assert!(!events.contains('d') && !events.contains('F') && !events.contains('U'));
+        Ok(())
+    }
+
+    #[test]
     fn unproved_lane_release_retains_intake_and_loaded_library() {
         let drops = std::rc::Rc::new(Cell::new(0));
         drop(LaneOwners(Some((Owner(drops.clone()), Owner(drops.clone())))));
