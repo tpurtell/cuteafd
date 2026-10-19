@@ -31,8 +31,9 @@ pub(crate) struct Loaded<'a> {
 }
 
 /// Run before loading native programs, whose card selection can query the GPU.
-pub(crate) fn preflight(manifest: &Path) -> Result<()> {
-    cuteafd_loader::families::kimi_k3::validate_expert_inventory(manifest)
+pub(crate) fn preflight(manifest: &Path, native_lib: &Path) -> Result<()> {
+    let package = crate::shared::experts::exl3::aot_layout_directory(native_lib, &[2, 3], "");
+    cuteafd_loader::families::kimi_k3::validate_expert_inventory(manifest, &package)
 }
 
 pub(crate) fn load<'a>(library: &'a Arc<cuteafd_ffi::NativeLibrary>,
@@ -153,8 +154,20 @@ pub(super) fn exchange_demands(rows: usize, diagnostics: bool) -> Result<Vec<Dem
 #[cfg(test)]
 mod tests {
     #[test]
+    #[ignore = "requires CUTEAFD_KIMI_RUNTIME_ROOT; validates real lib/share layout in an isolated process"]
+    fn mounted_runtime_artifact_preflight() -> anyhow::Result<()> {
+        let root = std::env::var_os("CUTEAFD_KIMI_RUNTIME_ROOT")
+            .ok_or_else(|| anyhow::anyhow!("Kimi runtime root required"))?;
+        let root = std::path::Path::new(&root);
+        cuteafd_core::set_expert_geometry(cuteafd_core::ExpertGeometry::KIMI_K3)
+            .map_err(|_| anyhow::anyhow!("run this mounted preflight test in an isolated process"))?;
+        assert!(!root.join("share/exl3").exists());
+        super::preflight(&root.join("share/PROGRAMS.json"), &root.join("lib/libcuteafd_native.so"))
+    }
+
+    #[test]
     fn missing_inventory_is_refused_without_native_or_device_access() {
         let dir = tempfile::tempdir().unwrap();
-        assert!(super::preflight(&dir.path().join("absent.json")).is_err());
+        assert!(super::preflight(&dir.path().join("share/absent.json"), &dir.path().join("lib/native.so")).is_err());
     }
 }

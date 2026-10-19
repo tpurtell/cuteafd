@@ -115,9 +115,10 @@ fn installed_inventory(root: &std::path::Path, spark: bool) -> std::path::PathBu
     ] {
         if !spark { programs.push(json!({"name":name,"geometry":geometry,"object_sha256":"b".repeat(64)})); }
     }
-    let path = root.join("PROGRAMS.json");
+    std::fs::create_dir_all(root.join("share")).unwrap();
+    let path = root.join("share/PROGRAMS.json");
     std::fs::write(&path, json!({"schema":1,"sparkinfer_revision":revision,"programs":programs}).to_string()).unwrap();
-    let package = root.join("exl3/exl3-kimik3-k23");
+    let package = root.join("lib/exl3/exl3-kimik3-k23");
     let layouts = if spark { (0..6).map(|r| format!("tp6-rank{r}")).collect::<Vec<_>>() }
         else { vec!["rtx-tp1".into()] };
     let mut variants = Vec::new();
@@ -163,17 +164,20 @@ fn header_acceptance_is_independent_of_runtime_inventory() {
     for spark in [false, true] {
         let dir = tempfile::tempdir().unwrap();
         let path = installed_inventory(dir.path(), spark);
-        validate_expert_inventory(&path).unwrap();
+        let package = dir.path().join("lib/exl3/exl3-kimik3-k23");
+        assert!(!path.parent().unwrap().join("exl3").exists());
+        validate_expert_inventory(&path, &package).unwrap();
+        assert!(validate_expert_inventory(&path, &dir.path().join("absent-package")).is_err());
         model.accepts(&role, &stem, &mut operand).unwrap();
         if spark {
-            let meta_path = dir.path().join("exl3/exl3-kimik3-k23/tp6-rank5/m4096/v41_exl3.json");
+            let meta_path = dir.path().join("lib/exl3/exl3-kimik3-k23/tp6-rank5/m4096/v41_exl3.json");
             let mut meta: Value = serde_json::from_slice(&std::fs::read(&meta_path).unwrap()).unwrap();
             meta["descriptor_bits"] = serde_json::json!(9);
             std::fs::write(&meta_path, meta.to_string()).unwrap();
         } else {
-            std::fs::remove_file(dir.path().join("exl3/exl3-kimik3-k23/rtx-tp1/m80/libcuteafd_exl3.so")).unwrap();
+            std::fs::remove_file(dir.path().join("lib/exl3/exl3-kimik3-k23/rtx-tp1/m80/libcuteafd_exl3.so")).unwrap();
         }
-        assert!(validate_expert_inventory(&path).is_err());
+        assert!(validate_expert_inventory(&path, &package).is_err());
         model.accepts(&role, &stem, &mut operand).unwrap();
         assert_eq!(model.experts(&operand).unwrap().package, PACKAGE);
     }
@@ -182,8 +186,9 @@ fn header_acceptance_is_independent_of_runtime_inventory() {
     let mut inventory: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
     inventory["programs"] = serde_json::json!([]);
     std::fs::write(&path, inventory.to_string()).unwrap();
-    assert!(validate_expert_inventory(&path).unwrap_err().to_string().contains("kimik3_router_scores"));
-    assert!(validate_expert_inventory(&dir.path().join("absent.json")).is_err());
+    let package = dir.path().join("lib/exl3/exl3-kimik3-k23");
+    assert!(validate_expert_inventory(&path, &package).unwrap_err().to_string().contains("kimik3_router_scores"));
+    assert!(validate_expert_inventory(&dir.path().join("absent.json"), &package).is_err());
 }
 
 #[test]
