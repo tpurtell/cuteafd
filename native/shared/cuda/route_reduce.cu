@@ -6,6 +6,9 @@
 #include <cuda_runtime.h>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
+#include <cstdio>
 
 namespace {
 std::atomic<uint32_t> expert_hidden_value{5120};
@@ -121,7 +124,20 @@ __global__ void reduce_compact(const __nv_bfloat16* p0,
   }
 }
 
-template<int Ranks>
+template<bool Diagnostic>
+__device__ __forceinline__ float landing_value(const __nv_bfloat16* plane, uint64_t offset, int rank) {
+  const __nv_bfloat16 value = plane[offset];
+  if constexpr (Diagnostic) {
+    const uint16_t bits = __bfloat16_as_ushort(value);
+    if ((bits & 0xffc1) == 0x7f81) {
+      printf("landing sentinel: rank=%d plane=%p offset=%llu bits=%04x\n",
+          rank, static_cast<const void*>(plane), static_cast<unsigned long long>(offset), bits);
+    }
+  }
+  return __bfloat162float(value);
+}
+
+template<int Ranks, bool Diagnostic = false>
 __global__ void reduce_compact_eight(const __nv_bfloat16* p0,
     const __nv_bfloat16* p1, const __nv_bfloat16* p2,
     const __nv_bfloat16* p3, const __nv_bfloat16* p4,
@@ -131,14 +147,14 @@ __global__ void reduce_compact_eight(const __nv_bfloat16* p0,
   for (uint64_t offset = uint64_t(blockIdx.x) * blockDim.x + threadIdx.x;
        offset < count; offset += uint64_t(gridDim.x) * blockDim.x) {
     // Keep the legacy rank order, FP32 additions and sole BF16 rounding.
-    float value = __bfloat162float(p0[offset]);
-    if constexpr (Ranks >= 2) value = __fadd_rn(value, __bfloat162float(p1[offset]));
-    if constexpr (Ranks >= 3) value = __fadd_rn(value, __bfloat162float(p2[offset]));
-    if constexpr (Ranks >= 4) value = __fadd_rn(value, __bfloat162float(p3[offset]));
-    if constexpr (Ranks >= 5) value = __fadd_rn(value, __bfloat162float(p4[offset]));
-    if constexpr (Ranks >= 6) value = __fadd_rn(value, __bfloat162float(p5[offset]));
-    if constexpr (Ranks >= 7) value = __fadd_rn(value, __bfloat162float(p6[offset]));
-    if constexpr (Ranks >= 8) value = __fadd_rn(value, __bfloat162float(p7[offset]));
+    float value = landing_value<Diagnostic>(p0, offset, 0);
+    if constexpr (Ranks >= 2) value = __fadd_rn(value, landing_value<Diagnostic>(p1, offset, 1));
+    if constexpr (Ranks >= 3) value = __fadd_rn(value, landing_value<Diagnostic>(p2, offset, 2));
+    if constexpr (Ranks >= 4) value = __fadd_rn(value, landing_value<Diagnostic>(p3, offset, 3));
+    if constexpr (Ranks >= 5) value = __fadd_rn(value, landing_value<Diagnostic>(p4, offset, 4));
+    if constexpr (Ranks >= 6) value = __fadd_rn(value, landing_value<Diagnostic>(p5, offset, 5));
+    if constexpr (Ranks >= 7) value = __fadd_rn(value, landing_value<Diagnostic>(p6, offset, 6));
+    if constexpr (Ranks >= 8) value = __fadd_rn(value, landing_value<Diagnostic>(p7, offset, 7));
     if (shared) value = __fadd_rn(value, __bfloat162float(shared[offset]));
     output[offset] = __float2bfloat16_rn(value);
   }
@@ -284,40 +300,49 @@ extern "C" int32_t cuteafd_reduce_compact_bf16_eight_planes_async(
   const auto* p7 = reinterpret_cast<const __nv_bfloat16*>(planes[7]);
   const auto* shared_bf16 = reinterpret_cast<const __nv_bfloat16*>(shared);
   auto* output_bf16 = reinterpret_cast<__nv_bfloat16*>(output);
+  static const bool diagnostic = [] {
+    const char* value = std::getenv("CUTEAFD_DIAG_LANDING_SENTINEL");
+    return value && std::strcmp(value, "1") == 0;
+  }();
+#define LANDING_REDUCE(RANKS, ...) do { \
+  if (diagnostic) reduce_compact_eight<RANKS, true><<<blocks, 256, 0, cuda_stream>>>(__VA_ARGS__); \
+  else reduce_compact_eight<RANKS, false><<<blocks, 256, 0, cuda_stream>>>(__VA_ARGS__); \
+} while (0)
   switch (ranks) {
     case 1:
-      reduce_compact_eight<1><<<blocks, 256, 0, cuda_stream>>>(p0, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+      LANDING_REDUCE(1, p0, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
           shared_bf16, output_bf16, count);
       break;
     case 2:
-      reduce_compact_eight<2><<<blocks, 256, 0, cuda_stream>>>(p0, p1, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+      LANDING_REDUCE(2, p0, p1, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
           shared_bf16, output_bf16, count);
       break;
     case 3:
-      reduce_compact_eight<3><<<blocks, 256, 0, cuda_stream>>>(p0, p1, p2, nullptr, nullptr, nullptr, nullptr, nullptr,
+      LANDING_REDUCE(3, p0, p1, p2, nullptr, nullptr, nullptr, nullptr, nullptr,
           shared_bf16, output_bf16, count);
       break;
     case 4:
-      reduce_compact_eight<4><<<blocks, 256, 0, cuda_stream>>>(p0, p1, p2, p3, nullptr, nullptr, nullptr, nullptr,
+      LANDING_REDUCE(4, p0, p1, p2, p3, nullptr, nullptr, nullptr, nullptr,
           shared_bf16, output_bf16, count);
       break;
     case 5:
-      reduce_compact_eight<5><<<blocks, 256, 0, cuda_stream>>>(p0, p1, p2, p3, p4, nullptr, nullptr, nullptr,
+      LANDING_REDUCE(5, p0, p1, p2, p3, p4, nullptr, nullptr, nullptr,
           shared_bf16, output_bf16, count);
       break;
     case 6:
-      reduce_compact_eight<6><<<blocks, 256, 0, cuda_stream>>>(p0, p1, p2, p3, p4, p5, nullptr, nullptr,
+      LANDING_REDUCE(6, p0, p1, p2, p3, p4, p5, nullptr, nullptr,
           shared_bf16, output_bf16, count);
       break;
     case 7:
-      reduce_compact_eight<7><<<blocks, 256, 0, cuda_stream>>>(p0, p1, p2, p3, p4, p5, p6, nullptr,
+      LANDING_REDUCE(7, p0, p1, p2, p3, p4, p5, p6, nullptr,
           shared_bf16, output_bf16, count);
       break;
     case 8:
-      reduce_compact_eight<8><<<blocks, 256, 0, cuda_stream>>>(p0, p1, p2, p3, p4, p5, p6, p7,
+      LANDING_REDUCE(8, p0, p1, p2, p3, p4, p5, p6, p7,
           shared_bf16, output_bf16, count);
       break;
   }
+  #undef LANDING_REDUCE
   return cudaGetLastError();
 }
 

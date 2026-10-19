@@ -357,6 +357,8 @@ pub(crate) struct SparkIntake<'a> {
     consumed: *mut c_void,
     consumed_pending: Cell<bool>,
     copies_pending: Cell<bool>,
+    diagnostic_generation: Cell<u16>,
+    diagnostic_sentinel: bool,
     /// Receive slots whose uploads are queued; released before the next wave.
     held: Arc<Mutex<Vec<(usize, u32, VerbsHostProtocolV2ResponsePayload)>>>,
 }
@@ -386,6 +388,8 @@ impl<'a> SparkIntake<'a> {
             consumed: library.cuda_event_create_ordering()?,
             consumed_pending: Cell::new(false),
             copies_pending: Cell::new(false),
+            diagnostic_generation: Cell::new(0),
+            diagnostic_sentinel: std::env::var("CUTEAFD_DIAG_LANDING_SENTINEL").is_ok_and(|v| v == "1"),
             held: Arc::new(Mutex::new(Vec::new())),
         })
     }
@@ -435,6 +439,25 @@ impl<'a> SparkIntake<'a> {
             self.copies_pending.set(false);
         }
         self.held.lock().map_err(|_| anyhow::anyhow!("intake slots poisoned"))?.clear();
+        if self.mode == IntakeMode::Gpu && self.diagnostic_sentinel {
+            // Finite worker responses must overwrite these NaN bit patterns.
+            // Poison after the previous consumer drained and before dispatch;
+            // the captured reducer checks its actual load values.
+            let generation = self.diagnostic_generation.get().wrapping_add(1);
+            self.diagnostic_generation.set(generation);
+            let sentinel = (0x7f81 | (generation & 0x3f)).to_ne_bytes().repeat(64);
+            for plane in &self.planes {
+                let offset = self.row_bytes.saturating_sub(sentinel.len());
+                let bytes = sentinel.len().min(self.row_bytes);
+                let destination = CuteafdDeviceBuffer {
+                    // SAFETY: this first-row tail lies inside the plane.
+                    ptr: unsafe { plane.buffer.ptr.cast::<u8>().add(offset) }.cast(),
+                    bytes,
+                    ..plane.buffer
+                };
+                self.library.copy_h2d(destination, &sentinel[..bytes])?;
+            }
+        }
         Ok(())
     }
 
