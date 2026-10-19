@@ -105,6 +105,12 @@ if [[ -n "${CUTEAFD_DEV_ARTIFACTS:-}" ]]; then
   docker_args+=(--mount "type=bind,src=$artifacts,dst=$artifacts,readonly"
                 -e CUTEAFD_DEV_ARTIFACTS="$artifacts")
 fi
+# Memory cap for the whole container (e.g. 16g), so a test on a shared Spark's
+# unified memory cannot crowd out the host's services; swap is capped equally.
+if [[ -n "${CUTEAFD_DEV_MEMORY:-}" ]]; then
+  [[ "$CUTEAFD_DEV_MEMORY" =~ ^[0-9]+[kmg]?$ ]] || { echo "CUTEAFD_DEV_MEMORY must be a docker size such as 16g: $CUTEAFD_DEV_MEMORY" >&2; exit 2; }
+  docker_args+=(--memory "$CUTEAFD_DEV_MEMORY" --memory-swap "$CUTEAFD_DEV_MEMORY")
+fi
 source "$repo_root/scripts/build/compiler-cache.sh"
 source "$repo_root/scripts/build/build-caches.sh"
 export CUTEAFD_KACHE="${CUTEAFD_KACHE-}" CUTEAFD_SCCACHE_CUDA="${CUTEAFD_SCCACHE_CUDA-0}"

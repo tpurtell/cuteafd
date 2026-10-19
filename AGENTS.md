@@ -196,7 +196,8 @@ before → after tables with conditions.
   execution caching stays off; Rust and native C/C++/CMake compiles are wrapped.
   CUDA launchers are wired but were not exercised by the CPU-only pilot.
   `CUTEAFD_DEV_ARTIFACTS=DIR` mounts a sealed WIP artifact tree read-only at its own
-  path for tests that need built native packages.
+  path for tests that need built native packages. `CUTEAFD_DEV_MEMORY=16g` caps the
+  container's memory and swap; use it for every test on a shared Spark.
   `scripts/build/cuteafd-dev.sh cpu -- COMMAND` runs CPU-only with the canonical
   `/workspace/cuteafd` source mount and passes optional cache mounts/setup. Container
   targets use `CUTEAFD_DEV_TARGET_DIR=$HOME/.cache/cuteafd/builds/<task>/target`
