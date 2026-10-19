@@ -608,6 +608,9 @@ impl<'a> SwaLayer<'a> {
     pub fn input(&self) -> CuteafdDeviceBuffer {
         self.planes[X].buffer
     }
+    pub fn has_dense_ffn(&self) -> bool {
+        self.ffn.is_some()
+    }
     pub fn output(&self) -> CuteafdDeviceBuffer {
         self.ffn
             .as_ref()

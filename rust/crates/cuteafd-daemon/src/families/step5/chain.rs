@@ -28,6 +28,17 @@ struct Layer<'a> {
     attention: Attention<'a>,
     routed: Option<RoutedFfn<'a>>,
 }
+fn validate_ffn_ownership(
+    dense_planned: bool,
+    dense_owned: bool,
+    routed_owned: bool,
+) -> Result<()> {
+    ensure!(
+        dense_owned == dense_planned && routed_owned != dense_planned,
+        "Step-5 planned FFN must have exactly one matching executor: dense planned={dense_planned}, dense owned={dense_owned}, routed owned={routed_owned}"
+    );
+    Ok(())
+}
 impl Layer<'_> {
     fn input(&self) -> CuteafdDeviceBuffer {
         match &self.attention {
@@ -163,6 +174,16 @@ impl<'a> TargetChain<'a> {
             let routed = plan
                 .map(|p| RoutedFfn::load(device, programs, checkpoint, id, p))
                 .transpose()?;
+            let dense_owned = match &attention {
+                Attention::Sliding(owner) => owner.has_dense_ffn(),
+                Attention::Sparse(owner) => owner.has_dense_ffn(),
+            };
+            validate_ffn_ownership(
+                contract.layers[id].dense_activation.is_some(),
+                dense_owned,
+                routed.is_some(),
+            )
+            .with_context(|| format!("Step-5 layer {id} FFN ownership"))?;
             layers.push(Layer { attention, routed });
         }
         Ok(Self {
@@ -293,6 +314,38 @@ mod tests {
 
     const H: usize = 4096;
     const REVISION: &str = "7734b7ffac118d70d8398bfa3eb0fab007eb45b1";
+
+    #[test]
+    fn every_planned_ffn_requires_one_matching_live_executor() -> Result<()> {
+        // Use the admission check applied to live owners, including sparse+dense.
+        let fixture: Value = serde_json::from_str(include_str!(
+            "../../../../cuteafd-loader/src/plan/families/step5/fixtures/official-fp8.json"
+        ))?;
+        let config = &fixture["config"]["text_config"];
+        let routed = config["moe_layer_list"]
+            .as_array()
+            .context("routed schedule")?;
+        for layer in 0..config["num_hidden_layers"]
+            .as_u64()
+            .context("target count")?
+        {
+            let dense = !routed.iter().any(|id| id.as_u64() == Some(layer));
+            validate_ffn_ownership(dense, dense, !dense)?;
+            assert!(
+                validate_ffn_ownership(dense, false, false).is_err(),
+                "layer {layer}: missing FFN"
+            );
+            assert!(
+                validate_ffn_ownership(dense, true, true).is_err(),
+                "layer {layer}: double FFN"
+            );
+            assert!(
+                validate_ffn_ownership(dense, !dense, dense).is_err(),
+                "layer {layer}: wrong FFN"
+            );
+        }
+        Ok(())
+    }
 
     fn fixture(
         root: &Path,

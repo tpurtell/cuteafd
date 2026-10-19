@@ -301,12 +301,16 @@ impl<'a> DenseFfn<'a> {
     // The containing layer owns this stream ahead of the FFN fields and drains
     // it before releasing us. Standalone callers keep using the owned stream.
     pub fn enqueue_on(&self, rows: usize, stream: &Stream<'a>) -> Result<()> {
+        self.enqueue_range_on(0, rows, stream)
+    }
+
+    pub fn enqueue_range_on(&self, start: usize, rows: usize, stream: &Stream<'a>) -> Result<()> {
         ensure!(
             stream.device.id == self.stream.device.id,
             "dense stream device mismatch"
         );
         for stage in 0..5 {
-            self.stage_on(stage, rows, stream)?;
+            self.stage_range_on(stage, start, rows, stream)?;
         }
         Ok(())
     }
@@ -316,11 +320,37 @@ impl<'a> DenseFfn<'a> {
     }
 
     fn stage_on(&self, stage: usize, rows: usize, stream: &Stream<'a>) -> Result<()> {
+        self.stage_range_on(stage, 0, rows, stream)
+    }
+
+    fn stage_range_on(
+        &self,
+        stage: usize,
+        start: usize,
+        rows: usize,
+        stream: &Stream<'a>,
+    ) -> Result<()> {
         ensure!(
-            stage < 5 && rows > 0 && rows <= self.admission.rows,
+            stage < 5
+                && rows > 0
+                && start
+                    .checked_add(rows)
+                    .is_some_and(|end| end <= self.admission.rows),
             "dense stage/capacity mismatch"
         );
-        let p = self.planes.iter().map(|a| a.buffer.ptr).collect::<Vec<_>>();
+        let p = self
+            .planes
+            .iter()
+            .zip([
+                HIDDEN * 4,
+                HIDDEN * 2,
+                2 * DENSE * 2,
+                DENSE * 2,
+                HIDDEN * 2,
+                HIDDEN * 4,
+            ])
+            .map(|(a, stride)| a.buffer.ptr.wrapping_byte_add(start * stride))
+            .collect::<Vec<_>>();
         let w = self
             .weights
             .iter()
@@ -416,6 +446,111 @@ mod tests {
             native_dense_component(layer)?;
         }
         Ok(())
+    }
+
+    impl DenseFfn<'_> {
+        pub(crate) fn qualify_saved_boundaries(
+            &self,
+            root: &std::path::Path,
+            manifest: &serde_json::Value,
+            rows: usize,
+        ) -> Result<()> {
+            let load = |name: &str| fixture(root, manifest, &format!("r{rows}_{name}"));
+            let read = |plane: usize, bytes: usize| -> Result<Vec<u8>> {
+                let mut output = vec![0; bytes];
+                self.stream.device.run(|| {
+                    self.stream
+                        .device
+                        .library
+                        .copy_d2h(&mut output, self.planes[plane].buffer)
+                })?;
+                Ok(output)
+            };
+            for (plane, name, width, size) in [
+                (1, "ffn_norm", HIDDEN, 2),
+                (2, "gate_up", 2 * DENSE, 2),
+                (3, "activation", DENSE, 2),
+                (4, "down", HIDDEN, 2),
+                (5, "output", HIDDEN, 4),
+            ] {
+                let actual = read(plane, rows * width * size)?;
+                let expected = load(name)?;
+                let a = values(&actual, size == 4)?;
+                let b = values(&expected, size == 4)?;
+                let rel = (a.iter().zip(&b).map(|(a, b)| (a - b).powi(2)).sum::<f64>()
+                    / b.iter().map(|v| v * v).sum::<f64>())
+                .sqrt();
+                eprintln!("layer91 chained boundary={name} rel_l2={rel:.12e}");
+                ensure!(rel < 0.03, "layer91 chained boundary {name}");
+            }
+            self.stream.device.run(|| {
+                self.stream
+                    .device
+                    .library
+                    .copy_h2d(self.input(), &load("post")?)
+            })?;
+            for (stage, input, name, plane) in [
+                (0, "post", "ffn_norm", 0),
+                (1, "ffn_norm", "gate_up", 1),
+                (2, "gate_up", "activation", 2),
+                (3, "activation", "down", 3),
+                (4, "down", "output", 4),
+            ] {
+                self.stream.device.run(|| {
+                    self.stream
+                        .device
+                        .library
+                        .copy_h2d(self.planes[plane].buffer, &load(input)?)
+                })?;
+                self.enqueue_stage(stage, rows)?;
+                self.stream.drain()?;
+                let official = load(name)?;
+                let actual = read(stage + 1, official.len())?;
+                if stage == 0 {
+                    super::super::norm_accuracy::check(
+                        &actual,
+                        &official,
+                        &load("ffn_norm_fp64")?,
+                        HIDDEN,
+                    )?;
+                } else if matches!(stage, 2 | 4) {
+                    ensure!(actual == official, "layer91 isolated pointwise {name}");
+                } else {
+                    let reference = load(&format!("{name}_fp64"))?;
+                    let reference = reference
+                        .chunks_exact(8)
+                        .map(|v| f64::from_le_bytes(v.try_into().unwrap()))
+                        .collect::<Vec<_>>();
+                    let error = |bytes: &[u8]| -> Result<f64> {
+                        Ok(values(bytes, false)?
+                            .iter()
+                            .zip(&reference)
+                            .map(|(a, b)| (a - b).powi(2))
+                            .sum::<f64>())
+                    };
+                    let native = error(&actual)?;
+                    let baseline = error(&official)?;
+                    eprintln!(
+                        "layer91 isolated projection={name} FP64_error_ratio={}",
+                        (native / baseline).sqrt()
+                    );
+                    ensure!(
+                        native <= baseline * 1.01f64.powi(2),
+                        "layer91 projection FP64 bar {name}"
+                    );
+                    let width = if stage == 1 { 2 * DENSE } else { HIDDEN };
+                    let actual = values(&actual, false)?;
+                    let official = values(&official, false)?;
+                    for (row, ((a, b), r)) in actual.chunks_exact(width)
+                        .zip(official.chunks_exact(width)).zip(reference.chunks_exact(width)).enumerate() {
+                        let error = |v: &[f64]| v.iter().zip(r).map(|(v, r)| (v-r).powi(2)).sum::<f64>();
+                        ensure!(error(a) <= error(b) * 1.01f64.powi(2),
+                            "layer91 projection per-row FP64 bar {name}, row {row}");
+                    }
+                }
+            }
+            Ok(())
+        }
     }
 
     fn native_dense_component(layer: usize) -> Result<()> {
