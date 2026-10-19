@@ -73,7 +73,7 @@ pub(crate) async fn run(args: ServeArgs) -> Result<()> {
             let mark_bytes = super::state::KdaLayout::new(&cfg, slots, 1, 1)?.mark_bytes()
                 .checked_mul(2).context("Kimi TP2 prefix mark extent overflow")?;
             let marks = worker_args.prefix.mark_rule(slots).slots(mark_bytes);
-            startup::preflight(&worker_args.manifest)?;
+            startup::preflight(&worker_args.manifest, &worker_args.native_lib)?;
             // SAFETY: every native owner drops on this worker before the library.
             let library = Arc::new(unsafe { cuteafd_ffi::NativeLibrary::load(&worker_args.native_lib)? });
             let programs = library.programs()?.with_manifest(&worker_args.manifest)?;

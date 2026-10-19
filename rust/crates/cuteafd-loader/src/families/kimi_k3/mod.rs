@@ -6,12 +6,11 @@ pub mod reference;
 pub mod w8;
 
 /// Validate sealed role artifacts at runtime, never during checkpoint planning.
-pub fn validate_expert_inventory(path: &std::path::Path) -> anyhow::Result<()> {
+pub fn validate_expert_inventory(path: &std::path::Path, root: &std::path::Path) -> anyhow::Result<()> {
     use crate::plan::checkpoint::read_json;
     use anyhow::{ensure, Context};
     let programs = read_json(path)?;
     ensure!(programs["schema"] == 1 && programs["programs"].is_array(), "invalid PROGRAMS.json inventory");
-    let root = path.parent().context("program inventory has no parent")?.join("exl3/exl3-kimik3-k23");
     let package = read_json(&root.join("manifest.json"))?;
     ensure!(package["schema"] == "cuteafd.exl3-package.v1" && package["geometry"] == "kimik3",
         "Kimi K3 EXL3 package schema/geometry mismatch");
