@@ -44,6 +44,8 @@ impl KdaLayout {
         Ok(layout)
     }
 
+    pub(crate) fn mark_bytes(&self) -> usize { self.mark }
+
     /// One contiguous pool for each native commit operand; only replay/tables
     /// are lane-local. The commit ABI strides state by slots and replay by 64 rows.
     fn extents(&self) -> Result<[usize; 4]> {

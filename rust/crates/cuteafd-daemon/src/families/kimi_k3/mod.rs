@@ -7,6 +7,8 @@ pub(crate) mod block;
 pub(crate) mod device;
 pub(crate) mod engine;
 pub(crate) mod golden;
+pub(crate) mod serve;
+pub(crate) mod startup;
 pub(crate) mod graphs;
 pub(crate) mod backend;
 pub(crate) mod layers;
