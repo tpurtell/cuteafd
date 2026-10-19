@@ -38,6 +38,8 @@ pub(crate) struct GoldenArgs {
     #[arg(long, default_value_t = 0)] device: i32,
     #[arg(long, default_value_t = 1)] split_device: i32,
     #[arg(long)] check_headers: bool,
+    /// Complete routed layers on alternating coordinator GPUs (rtx-tp1).
+    #[arg(long, default_value_t = 0)] rtx_expert_layers: usize,
     /// Informational F32 comparison only; direct gate/up is the speed-first default.
     #[arg(long, env = "CUTEAFD_KIMI_COMPENSATED_FFN")]
     compensated_ffn: bool,
@@ -56,7 +58,7 @@ impl GoldenArgs {
     fn provenance(&self) -> Value {
         serde_json::json!({"schema": "cuteafd.kimi.run/1", "ffn_mode": self.ffn_mode().name(),
             "gate_up_programs": ([3072, 16896].map(|width| self.ffn_mode().gate_up_stem(width))),
-            "window": self.window, "last_layer": self.last_layer, "diagnostic_only": !self.nll})
+            "rtx_expert_layers":self.rtx_expert_layers, "window": self.window, "last_layer": self.last_layer, "diagnostic_only": !self.nll})
     }
 }
 
@@ -157,7 +159,7 @@ pub(crate) fn run(args: GoldenArgs) -> Result<()> {
     let cfg = admission::prefix(&full, last.checked_add(1).context("Kimi last-layer overflow")?)?;
     let hosted = hosted_layers(&std::env::var("CUTEAFD_GOLDEN_EXPERT_LAYERS")?)?;
     ensure!(args.peers.len() == 6 && hosted == cfg.dense.iter().enumerate()
-        .filter_map(|(layer, dense)| (!dense).then_some(layer)).collect::<Vec<_>>(),
+        .filter_map(|(layer, dense)| (!dense).then_some(layer)).skip(args.rtx_expert_layers).collect::<Vec<_>>(),
         "Kimi diagnostic needs exactly the selected routed layers on six real ranks");
     if args.check_headers {
         println!("Kimi diagnostic reference/header binding valid: layers=0..{} rows={}; no numerical qualification",
@@ -195,8 +197,8 @@ fn full_run(args: GoldenArgs) -> Result<()> {
     cfg.release_geometry()?;
     let hosted = hosted_layers(&std::env::var("CUTEAFD_GOLDEN_EXPERT_LAYERS")?)?;
     ensure!(args.peers.len() == 6 && hosted == cfg.dense.iter().enumerate()
-        .filter_map(|(layer, dense)| (!dense).then_some(layer)).collect::<Vec<_>>(),
-        "Kimi full-forward needs every routed layer on six real ranks");
+        .filter_map(|(layer, dense)| (!dense).then_some(layer)).skip(args.rtx_expert_layers).collect::<Vec<_>>(),
+        "Kimi full-forward needs the planned Spark routed subset on six real ranks");
     println!("Kimi all-layer run provenance: {}", args.provenance());
     println!("Kimi F32 reference: config={} revision={} windows={} scored_rows={}",
         cuteafd_bench::fidelity_dataset::KIMI_K3_CONFIG, cuteafd_bench::fidelity_dataset::KIMI_K3_REVISION,
@@ -294,6 +296,22 @@ fn native(args: &GoldenArgs, checkpoint: &cuteafd_loader::plan::Checkpoint,
     let native = devices.map(|device| NativePrograms::load(device, full, &programs, args.ffn_mode()).map(Rc::new));
     let [zero, one] = native;
     let native = [zero?, one?];
+    let rows = scoring.map_or(reference.tokens.len(), |windows| windows.iter().map(|w| w.tokens.len() - 1)
+        .max().unwrap_or(1).min(4096));
+    let rtx = if args.rtx_expert_layers == 0 { None } else {
+        let catalog = cuteafd_loader::read_expert_catalog(&checkpoint.snapshot)?;
+        let tiers = catalog.exl3().context("Kimi whole experts require EXL3 checkpoint")?.decoder_tiers();
+        let package = crate::shared::experts::exl3::aot_layout_directory(
+            args.native_lib.as_deref().context("--native-lib required")?, tiers, "rtx-tp1");
+        Some(admission::plan_rtx(cfg, &catalog, package, rows, args.rtx_expert_layers)?)
+    };
+    let expert_modules = if let Some(inventory) = &rtx {
+        use crate::shared::experts::rtx::{exl3::Exl3Tp2, RtxSelectionPolicy};
+        [Some(Exl3Tp2::preload_whole_modules(devices[0], &inventory.package, rows,
+            ExpertGeometry::KIMI_K3, RtxSelectionPolicy::FirstCapacity)?),
+         Some(Exl3Tp2::preload_whole_modules(devices[1], &inventory.package, rows,
+            ExpertGeometry::KIMI_K3, RtxSelectionPolicy::FirstCapacity)?)]
+    } else { [None, None] };
     let diagnostics = std::env::var("CUTEAFD_PEER_WAIT_DIAGNOSTICS").is_ok_and(|v| v == "1");
     let inventory = RuntimeInventory::measure(&library, &[args.device, args.split_device], InventoryPhase::PreWeight, |_| {
         library.tp2_native_initialize()?;
@@ -303,8 +321,6 @@ fn native(args: &GoldenArgs, checkpoint: &cuteafd_loader::plan::Checkpoint,
         library.v41_compact_reducer()?.require_plane_reduction(6)?;
         Ok(())
     })?;
-    let rows = scoring.map_or(reference.tokens.len(), |windows| windows.iter().map(|w| w.tokens.len() - 1)
-        .max().unwrap_or(1).min(4096));
     let lane_layouts = vec![[native[0].lane_layout(full, rows, 1_048_576)?,
         native[1].lane_layout(full, rows, 1_048_576)?]];
     let mut fixed = exchange_demands(rows, diagnostics)?;
@@ -323,7 +339,10 @@ fn native(args: &GoldenArgs, checkpoint: &cuteafd_loader::plan::Checkpoint,
     let admitted = admission::admit(admission::Inputs { cfg, gpus, devices: [args.device, args.split_device],
         peer_access: true, spark_ranks: 6, attention: None, requested_pool: Some(262_144),
         state_slots: 1, prefix_marks: 1, rows, lanes: 1, lane_layouts, fixed,
-        startup: vec![], pool_bounded: vec![] })?;
+        startup: vec![], pool_bounded: vec![], rtx })?;
+    ensure!(admitted.working_set().spark_layers == hosted_layers(&std::env::var("CUTEAFD_GOLDEN_EXPERT_LAYERS")?)?,
+        "Kimi worker layer subset differs from shared placement");
+    tracing::info!(placement = %admitted.placement.summary(), "Kimi admitted whole expert ownership");
     let plan = admitted.execution_plan()?;
     let admission_free = inventory.gpus.iter().map(|sample| sample.free_bytes).collect::<Vec<_>>();
     let admitted_bytes = admitted.placement.items.iter().map(|items| items.iter().map(|item| item.bytes).sum::<u64>())
@@ -336,7 +355,7 @@ fn native(args: &GoldenArgs, checkpoint: &cuteafd_loader::plan::Checkpoint,
     hops.attach_abort([peer.abort_word(0)?.context("Kimi missing abort owner")?,
         peer.abort_word(1)?.context("Kimi missing abort owner")?])?;
     let engine = Engine::load_admitted(&library, streams, admitted, checkpoint, native, peer, hops,
-        args.peers.clone(), cuteafd_transport::TcpTransportConfig::default(), 4096)?;
+        args.peers.clone(), cuteafd_transport::TcpTransportConfig::default(), 4096, expert_modules)?;
     let loaded = RuntimeInventory::measure(&library, &[args.device, args.split_device], InventoryPhase::PostLoad, |_| Ok(()))?;
     loaded.record(if scoring.is_some() { "kimi_k3-full-loaded" } else { "kimi_k3-prefix-loaded" }, &admission_free);
     for (rank, sample) in loaded.gpus.iter().enumerate() {
@@ -616,6 +635,63 @@ mod tests {
         let mut changed = panel.clone();
         changed["tokenizer_sha256"] = serde_json::json!("e".repeat(64));
         assert!(reference(tmp.path(), &changed, "w", 3).is_err());
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires sealed Kimi checkpoint and coordinator artifact metadata; CPU only"]
+    fn mounted_whole_expert_coordinator_demand() -> Result<()> {
+        let snapshot = PathBuf::from(std::env::var_os("CUTEAFD_KIMI_EXL3_SNAPSHOT").context("snapshot")?);
+        let artifacts = PathBuf::from(std::env::var_os("CUTEAFD_KIMI_COORDINATOR_ARTIFACTS").context("artifacts")?);
+        let checkpoint = cuteafd_loader::plan::Checkpoint::coordinator(&snapshot, false, false)?;
+        let cfg = KimiK3Config::from_hf(&checkpoint.config)?;
+        let catalog = cuteafd_loader::read_expert_catalog(&snapshot)?;
+        let manifest: Value = serde_json::from_slice(&std::fs::read(artifacts.join("PROGRAMS.json"))?)?;
+        let programs = manifest["programs"].as_array().context("programs")?;
+        let scratch = |prefix: &str| -> Result<usize> {
+            programs.iter().filter(|p| p["name"].as_str().is_some_and(|name| name.starts_with(prefix)))
+                .map(|p| p["scratch_bytes_at_capacity"]["scratch"].as_u64()
+                    .map(|bytes| bytes as usize).context("sealed scratch extent"))
+                .collect::<Result<Vec<_>>>()?.into_iter().max().context("missing sealed scratch")
+        };
+        let native_scratch = super::super::device::NativeScratch { kda: scratch("kimik3_kda_m")?,
+            mla: [scratch("kimik3_mla_producer_")?, scratch("kimik3_dense_mla_")?, scratch("kimik3_mla_output_")?] };
+        let rows = 4096;
+        let arch = cuteafd_loader::placement::ArchContext::for_device("sm_120", 96 << 30);
+        let names = programs.iter().filter_map(|p| p["name"].as_str()).collect::<Vec<_>>();
+        let selected = cuteafd_loader::placement::ProgramSet::from_names(&["kimik3"], names);
+        let mut fixed = exchange_demands(rows, false)?;
+        for rank in 0..2 {
+            let code = cuteafd_loader::placement::inventory::loaded_code_allowance("kimik3", "exl3", true,
+                rank as u8, arch, Some(&selected));
+            fixed.push(code_demand(rank, code.bytes, arch.cublas_bytes, 1)?);
+        }
+        // No CUDA baseline is claimed: conservatively reserve context plus a
+        // separate 2 GiB module allowance in this CPU-only forecast.
+        let reserve = arch.context_bytes + (2u64 << 30);
+        let onboard = 5;
+        let rtx = admission::plan_rtx(&cfg, &catalog,
+            artifacts.join("exl3").join(crate::shared::experts::exl3::package_name("kimik3",
+                catalog.exl3().context("EXL3 manifest")?.decoder_tiers())).join("rtx-tp1"), rows, onboard)?;
+        let workspace = rtx.workspace;
+        let admitted = admission::admit(admission::Inputs { cfg: &cfg, gpus: [GpuBudget {
+            capacity_bytes: 96 << 30, headroom_bytes: 2 << 30,
+            baseline: cuteafd_loader::placement::Baseline::Measured { free_bytes: (96 << 30) - reserve } }; 2],
+            devices: [0, 1], peer_access: true, spark_ranks: 6, attention: None,
+            requested_pool: Some(262144), state_slots: 1, prefix_marks: 1, rows, lanes: 1,
+            lane_layouts: vec![std::array::from_fn(|_| super::super::device::LaneLayout::new(&cfg, rows,
+                1048576, native_scratch).unwrap())], fixed, startup: vec![], pool_bounded: vec![], rtx: Some(rtx) })?;
+        assert_eq!(admitted.working_set().rtx_layers, [1, 2, 3, 4, 5]);
+        assert_eq!(admitted.working_set().spark_layers, (6..93).collect::<Vec<_>>());
+        for rank in 0..2 {
+            let items = &admitted.placement.items[rank];
+            let total = items.iter().map(|i| i.bytes).sum::<u64>();
+            eprintln!("Kimi CPU coordinator forecast rank={rank} rows={rows} onboard={onboard} module_context_reserve={reserve} expert_workspace={workspace} admitted={total} expert_arena={} pool={}",
+                admitted.placement.expert_ranges[rank].peak_bytes, admitted.placement.pool_tokens);
+            for item in items { eprintln!("Kimi CPU coordinator rank={rank} category={:?} group={} bytes={}",
+                item.category, item.group, item.bytes); }
+            assert!(total + reserve + (2u64 << 30) < 96u64 << 30);
+        }
         Ok(())
     }
 
