@@ -302,6 +302,9 @@ pub(crate) struct LocalLane<'a> {
     programs: Rc<NativePrograms<'a>>,
     layers: Vec<Rc<super::weights::LayerWeights<'a>>>,
     global: Rc<GlobalWeights<'a>>,
+    lane_index: usize,
+    kda: Rc<super::state::KdaBank<'a>>,
+    mla: Rc<super::mla::CacheBank<'a>>,
 }
 
 impl Drop for LocalLane<'_> {
@@ -310,14 +313,17 @@ impl Drop for LocalLane<'_> {
 
 impl<'a> LocalLane<'a> {
     pub(super) fn new(lane: Lane<'a>, programs: Rc<NativePrograms<'a>>,
-        layers: Vec<Rc<super::weights::LayerWeights<'a>>>, global: Rc<GlobalWeights<'a>>) -> Result<Self> {
+        layers: Vec<Rc<super::weights::LayerWeights<'a>>>, global: Rc<GlobalWeights<'a>>,
+        lane_index: usize, kda: Rc<super::state::KdaBank<'a>>, mla: Rc<super::mla::CacheBank<'a>>) -> Result<Self> {
         let device = lane.stream.device;
         ensure!(programs.device.id == device.id && std::ptr::eq(programs.device.library, device.library),
             "Kimi local programs differ from admitted lane device");
         ensure!(layers.len() == programs.w8.cfg.layers, "Kimi local layer inventory differs from programs");
         for weights in &layers { weights.check_device(device)?; }
         global.check_device(device)?;
-        Ok(Self { lane, programs, layers, global })
+        kda.check_reader(lane_index, &lane.stream)?;
+        mla.check_reader(lane_index, &lane.stream)?;
+        Ok(Self { lane, programs, layers, global, lane_index, kda, mla })
     }
 
     fn layer(&self, layer: usize) -> Result<&super::weights::LayerWeights<'a>> {
@@ -783,6 +789,10 @@ mod tests {
         let owner = source.split("pub(crate) struct LocalLane").nth(1).unwrap().split("/// Head handles").next().unwrap();
         assert!(owner.contains("programs: Rc<NativePrograms"));
         assert!(owner.contains("layers: Vec<Rc<super::weights::LayerWeights"));
+        assert!(owner.contains("kda: Rc<super::state::KdaBank"));
+        assert!(owner.contains("mla: Rc<super::mla::CacheBank"));
+        assert!(owner.contains("kda.check_reader(lane_index, &lane.stream)?"));
+        assert!(owner.contains("mla.check_reader(lane_index, &lane.stream)?"));
         assert!(owner.contains("drain_or_abort(\"Kimi persistent local lane\")"));
         let methods = owner.split("impl<'a> LocalLane").nth(1).unwrap();
         for forbidden in [".drain(", "drain_or_abort", ".wait(", "synchronize", "Allocation::new", "sm_count()"] {

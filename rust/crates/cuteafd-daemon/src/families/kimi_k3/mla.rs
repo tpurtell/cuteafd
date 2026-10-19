@@ -119,6 +119,14 @@ impl Drop for CacheBank<'_> {
 }
 
 impl<'a> CacheBank<'a> {
+    pub(super) fn check_reader(&self, lane: usize, stream: &Rc<Stream<'a>>) -> Result<()> {
+        ensure!(self.readers.get(lane).is_some_and(|reader| Rc::ptr_eq(reader, stream))
+            && self.stream.device.id == stream.device.id
+            && std::ptr::eq(self.stream.device.library, stream.device.library),
+            "Kimi MLA bank differs from admitted lane stream");
+        Ok(())
+    }
+
     pub(crate) fn layer(&self, layer: usize) -> Result<CuteafdDeviceBuffer> {
         self.layers.get(layer).and_then(Option::as_ref).map(|owner| owner.buffer)
             .context("Kimi MLA cache absent on nonowner or non-MLA layer")
@@ -158,11 +166,27 @@ mod tests {
         assert_eq!(page.ptr, bank.layer(1)?.ptr);
         assert_eq!(page.bytes, bytes);
         assert!(bank.page(1, 1, 1).is_err());
-        drop(readers);
+        for (lane, stream) in readers.iter().enumerate() {
+            bank.check_reader(lane, stream)?;
+            assert!(bank.check_reader(1 - lane, stream).is_err());
+        }
+        assert!(bank.check_reader(2, &readers[0]).is_err());
+        let impostor = Rc::new(Stream { device, raw: std::ptr::null_mut() });
+        assert!(bank.check_reader(0, &impostor).is_err());
+        drop(impostor);
+        let bank = Rc::new(bank);
+        let registered = Rc::downgrade(&bank);
+        let retained = bank.clone();
         drop(bank);
+        assert!(registered.upgrade().is_some());
+        let before = fixture.events()?;
+        assert!(!before.contains('d'));
+        drop(readers);
+        drop(retained);
+        assert!(registered.upgrade().is_none());
         let events = fixture.events()?;
         let first_free = events.find('d').context("Kimi MLA fixture released no storage")?;
-        assert_eq!(events[..first_free].matches('S').count(), 6,
+        assert_eq!(events[before.len()..first_free].matches('S').count(), 6,
             "both compute readers and copy stream drain before the first page free: {events}");
         assert_eq!(events.matches('d').count(), 1);
         Ok(())
