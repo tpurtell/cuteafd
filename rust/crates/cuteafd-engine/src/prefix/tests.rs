@@ -451,6 +451,90 @@ fn prompt_repeat_is_an_exact_hit_with_its_logits_and_no_forward() {
 }
 
 #[test]
+fn eight_active_sequences_need_only_four_retained_marks_for_exact_restores() {
+    let slots = 4; // Capacity-constrained placement retains four complete TP2 marks.
+    let fake = Fake::new(128, 8, slots);
+    let mut cache = cache(&fake, 20, 0);
+    let mut active = Vec::new();
+    for ring in 0..8 {
+        let prompt = seq(100 + ring as u32 * 100, 12);
+        let (_, _, placement) = serve(&mut cache, &fake, ring, &prompt, &[], 16);
+        active.push((prompt, placement));
+        assert!(cache.arena().in_use() <= 4);
+    }
+    assert_eq!(cache.arena().in_use(), 4);
+    // Retention pressure does not change any running sequence's recurrent state.
+    for (tokens, placement) in &mut active {
+        tokens.push(900);
+        fake.forward(placement, tokens).unwrap();
+    }
+    let prompt = &active[7].0[..12];
+    let admitted = cache.admit(&fake, prompt, 16, false,
+        |pages| Placement { pages, ring: 0, len: 0, ring_from: 0 }).unwrap();
+    assert_eq!(admitted.resume, 12);
+    let mut restored = admitted.placement;
+    let mut longer = prompt.to_vec();
+    longer.push(901);
+    fake.forward(&mut restored, &longer).unwrap();
+    cache.release(&fake, &restored.pages).unwrap();
+    for (_, placement) in active { cache.release(&fake, &placement.pages).unwrap(); }
+    cache.clear(&fake).unwrap();
+    assert_eq!(cache.pool().free(), 128);
+    assert_eq!(cache.arena().in_use(), 0);
+}
+
+#[test]
+fn a_single_mark_drains_queued_restore_before_reuse_under_capture_pressure() {
+    let fake = Fake::new(64, 3, 1);
+    let mut cache = cache(&fake, 20, 0);
+    let first = seq(100, 12);
+    let (_, _, original) = serve(&mut cache, &fake, 0, &first, &[], 16);
+    cache.release(&fake, &original.pages).unwrap();
+    let next = seq(500, 12);
+    let mut writer = cache.admit(&fake, &next, 16, false,
+        |pages| Placement { pages, ring: 2, len: 0, ring_from: 0 }).unwrap().placement;
+    let logits = fake.forward(&mut writer, &next).unwrap();
+    let admitted = cache.admit(&fake, &first, 16, false,
+        |pages| Placement { pages, ring: 1, len: 0, ring_from: 0 }).unwrap();
+    assert_eq!(admitted.resume, first.len());
+    assert!(!fake.queue.borrow().is_empty(), "restore is still queued");
+    let before = fake.drains.get();
+    assert!(cache.capture(&fake, SnapshotKind::Prompt, &next, &writer,
+        After::from_logits(&logits, true)).unwrap());
+    assert!(fake.drains.get() > before, "old mark readers drain before slot reuse");
+    let mut restored = admitted.placement;
+    let mut longer = first;
+    longer.push(900);
+    fake.forward(&mut restored, &longer).unwrap();
+    fake.forward(&mut writer, &next).unwrap();
+    cache.release(&fake, &restored.pages).unwrap();
+    cache.release(&fake, &writer.pages).unwrap();
+    cache.clear(&fake).unwrap();
+    assert_eq!(cache.pool().free(), 64);
+    assert_eq!(cache.arena().in_use(), 0);
+}
+
+#[test]
+fn zero_mark_budget_skips_capture_without_changing_active_state() {
+    let fake = Fake::new(16, 1, 0);
+    let mut cache = cache(&fake, 20, 0);
+    let prompt = seq(100, 12);
+    let mut placement = cache.admit(&fake, &prompt, 16, false,
+        |pages| Placement { pages, ring: 0, len: 0, ring_from: 0 }).unwrap().placement;
+    let logits = fake.forward(&mut placement, &prompt).unwrap();
+    assert!(!cache.capture(&fake, SnapshotKind::Prompt, &prompt, &placement,
+        After::from_logits(&logits, true)).unwrap());
+    assert_eq!(cache.stats().capture_skips, 1);
+    let mut longer = prompt;
+    longer.push(900);
+    fake.forward(&mut placement, &longer).unwrap();
+    cache.release(&fake, &placement.pages).unwrap();
+    cache.clear(&fake).unwrap();
+    assert_eq!(cache.pool().free(), 16);
+    assert_eq!(cache.arena().in_use(), 0);
+}
+
+#[test]
 fn a_turn_snapshot_serves_the_next_turn_and_the_writer_keeps_its_own_tail() {
     let fake = Fake::new(64, 4, 8);
     let mut cache = cache(&fake, 4, 0);

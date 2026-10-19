@@ -1,7 +1,7 @@
 //! Header lower bound on 2 RTX + 6 Sparks through the shared pool solver: real
 //! TP2 residency, Spark runtime/IO charges and optional whole-layer RTX expert
-//! onboarding. Not runtime admission: coordinator workspaces, graphs, prefix
-//! marks and the EXL3 workspace of the final export set come with the engine.
+//! onboarding and retained marks. Not runtime admission: coordinator workspaces,
+//! graphs and the EXL3 workspace of the final export set come with the engine.
 use super::Model;
 use crate::{placement::*, plan::{Component, ExpertPlacement, Hint, PlanReport}};
 use cuteafd_core::memory_layout::{Basis, Category, DeviceKind, DeviceLayout, Item, MemoryLayout};
@@ -24,7 +24,7 @@ pub(super) fn layout(model: &Model, report: &mut PlanReport, opts: &crate::plan:
     let ranks = requested.spark_ranks();
     let gpus = opts.rtx_bytes.len();
     let mut memory = MemoryLayout { devices: Vec::new(), pool_tokens: 0, waste: Vec::new(), notes: vec![
-        "Kimi K3 header lower bound: coordinator workspaces/graphs/prefix marks not charged; NOT serving admission".into(),
+        "Kimi K3 header lower bound: coordinator workspaces/graphs not charged; NOT serving admission".into(),
         "Spark budgets are offline estimates (including an explicit override), not load/steady census-qualified admission".into(),
     ] };
     let refusal = |report: &mut PlanReport, what: String, how: &str| {
@@ -75,7 +75,21 @@ pub(super) fn layout(model: &Model, report: &mut PlanReport, opts: &crate::plan:
     report.bytes_by_owner.insert("routed expert weights".into(), experts);
     let slots = opts.concurrency.max(1) + 2;
     let state = cfg.kda_layers() as u64 * (cfg.kda_state_bytes() + cfg.kda_conv_bytes()) * slots / 2;
+    let mark_bytes = cfg.kda_layers() as u64 * (cfg.kda_state_bytes() + cfg.kda_conv_bytes()) / 2;
+    let legacy_marks = opts.prefix_slots.unwrap_or_else(|| cuteafd_core::prefix::mark_slots_for(
+        opts.concurrency, opts.mimo_prefix_entries, 2 * mark_bytes, opts.mimo_prefix_mark_bytes));
+    let mark_demands = (0..2).map(|gpu| Demand::new(gpu, Category::Prefix,
+        "Kimi exact KDA marks", mark_bytes, Basis::Formula)).collect::<Vec<_>>();
     let mut fixed = Vec::new();
+    for demand in &mark_demands {
+        let mut demand = demand.clone();
+        let Some(bytes) = demand.bytes.checked_mul(legacy_marks) else {
+            refusal(report, "Kimi mark reservation overflow".into(), "Reduce prefix retention.");
+            return memory;
+        };
+        demand.bytes = bytes;
+        fixed.push(demand);
+    }
     for gpu in 0..2u8 {
         fixed.push(Demand::new(gpu, Category::Weights, "text weights, head/intermediate split", residency.split / 2, Basis::Exact));
         fixed.push(Demand::new(gpu, Category::Weights, "text weights replicated (KDA low-rank A, routers, latent proj, norms)",
@@ -116,8 +130,12 @@ pub(super) fn layout(model: &Model, report: &mut PlanReport, opts: &crate::plan:
             entry_gpu: 0, head_gpu: 1, terminal: TerminalHome::Replicated },
         executor: ExecutorModes { family: "kimi_k3 metadata only", modes: MODES, hops: true, attention: AttentionPlacement::Layers },
     };
-    let onboarded = match solve(&request) {
-        Ok(placed) => {
+    let selected = if legacy_marks == 0 {
+        solve(&request).map(|placed| (placed, MarkSelection { legacy_slots: 0, slots: 0, reduction_reason: None }))
+    } else { solve_with_marks(&request, legacy_marks, 1, &mark_demands) };
+    let onboarded = match selected {
+        Ok((placed, selection)) => {
+            memory.notes.push(selection.summary());
             memory.pool_tokens = placed.pool_tokens;
             report.attention_placement = placed.attention_placement;
             for gpu in 0..2 {

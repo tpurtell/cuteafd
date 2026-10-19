@@ -308,3 +308,37 @@ fn eviction_by_freed_pages_keeps_snapshots_whose_pages_running_requests_hold() {
     cache.release(&family, &a.pages).unwrap();
     assert!(cache.make_room(&family, 16, None).unwrap(), "released, the snapshot frees its pages");
 }
+
+#[test]
+fn a_pending_capture_keeps_the_only_mark_and_skips_competing_capture() {
+    let family = Lagged::new(64, 2, 1);
+    let mut cache = lag_cache(&family, 20, 0);
+    let first = seq(100, 12);
+    let mut a = cache.admit(&family, &first, 16, false,
+        |pages| Placement { pages, ring: 0, len: 0, ring_from: 0 }).unwrap().placement;
+    let logits = family.fake.forward(&mut a, &first).unwrap();
+    let Captured::Queued(ticket) = cache.queue_capture(&family, SnapshotKind::Prompt,
+        &first, &[], &a, After::from_logits(&logits, true)).unwrap() else { panic!("queued capture") };
+    let second = seq(500, 12);
+    let mut b = cache.admit(&family, &second, 16, false,
+        |pages| Placement { pages, ring: 1, len: 0, ring_from: 0 }).unwrap().placement;
+    let logits = family.fake.forward(&mut b, &second).unwrap();
+    assert!(matches!(cache.queue_capture(&family, SnapshotKind::Turn, &second, &[], &b,
+        After::from_logits(&logits, true)).unwrap(), Captured::Skipped));
+    assert_eq!(cache.stats().capture_skips, 1);
+    assert_eq!(cache.arena().in_use(), 1);
+    assert!(!cache.poll_capture(&family, ticket).unwrap());
+    family.land();
+    assert!(cache.poll_capture(&family, ticket).unwrap());
+    let admitted = cache.admit(&family, &first, 16, false,
+        |pages| Placement { pages, ring: 1, len: 0, ring_from: 0 }).unwrap();
+    assert_eq!(admitted.resume, first.len());
+    let mut restored = admitted.placement;
+    let mut longer = first;
+    longer.push(900);
+    family.fake.forward(&mut restored, &longer).unwrap();
+    for placement in [a, b, restored] { cache.release(&family, &placement.pages).unwrap(); }
+    cache.clear(&family).unwrap();
+    assert_eq!(cache.pool().free(), 64);
+    assert_eq!(cache.arena().in_use(), 0);
+}

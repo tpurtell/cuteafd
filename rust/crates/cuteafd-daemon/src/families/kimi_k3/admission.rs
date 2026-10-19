@@ -77,6 +77,7 @@ pub(crate) fn plan_rtx(cfg: &KimiK3Config, catalog: &cuteafd_loader::OfficialV41
 
 pub(crate) struct Admission<'a> {
     pub placement: Placement,
+    pub mark_selection: MarkSelection,
     cfg: KimiK3Config,
     rtx: Option<RtxInventory>,
     rtx_loaded: bool,
@@ -348,7 +349,11 @@ pub(crate) fn admit<'a>(mut inputs: Inputs<'_>) -> Result<Admission<'a>> {
     let devices = inputs.devices;
     let lanes = inputs.lanes as u64;
     let lane_layouts = inputs.lane_layouts.clone();
-    let kda_layout = KdaLayout::new(cfg, inputs.state_slots, inputs.prefix_marks, inputs.lanes)?;
+    let state_slots = inputs.state_slots;
+    let legacy_marks = inputs.prefix_marks;
+    let one_mark = KdaLayout::new(cfg, state_slots, 1, inputs.lanes)?;
+    let mark_demands = (0..2).map(|rank| one_mark.demands(rank).map(|demands| demands[2].clone()))
+        .collect::<Result<Vec<_>>>()?;
     let global_layouts = GlobalLayout::pair(cfg)?;
     let io_layouts = [IoLayout::new(cfg, 0, inputs.rows)?, IoLayout::new(cfg, 1, inputs.rows)?];
     let rtx = inputs.rtx.take();
@@ -363,7 +368,9 @@ pub(crate) fn admit<'a>(mut inputs: Inputs<'_>) -> Result<Admission<'a>> {
         request.expert_gpus = 2;
         request.policy.expert_ownership = ExpertOwnership::AlternatingWhole;
     }
-    let placement = solve(&request)?;
+    let (placement, mark_selection) = solve_with_marks(&request, legacy_marks as u64, 1, &mark_demands)?;
+    let kda_layout = KdaLayout::new(cfg, state_slots, usize::try_from(mark_selection.slots)?, lanes as usize)?;
+    tracing::info!(selection = %mark_selection.summary(), "Kimi retained mark admission");
     EXECUTOR.check(&placement)?;
     let layouts = placement.layers.iter().enumerate().map(|(layer, assignment)|
         LayerLayout::pair(cfg, layer, assignment.mode)).collect::<Result<Vec<_>>>()?;
@@ -382,7 +389,7 @@ pub(crate) fn admit<'a>(mut inputs: Inputs<'_>) -> Result<Admission<'a>> {
     let io_allocated = vec![[false; 2]; lane_layouts.len()];
     let lane_readers = (0..lane_layouts.len()).map(|_| std::array::from_fn(|_| Weak::new())).collect();
     let mla_layouts = [CacheLayout::new(cfg, &placement, 0)?, CacheLayout::new(cfg, &placement, 1)?];
-    let admission = Admission { placement, rtx, rtx_loaded: false, cfg: cfg.clone(), layouts, layer_owners, layer_uploaded, local_bound,
+    let admission = Admission { placement, mark_selection, rtx, rtx_loaded: false, cfg: cfg.clone(), layouts, layer_owners, layer_uploaded, local_bound,
         devices, lanes, lane_layouts, lane_allocated, lane_readers,
         kda_layout, kda_allocated: [false; 2], kda_owners: std::array::from_fn(|_| Weak::new()),
         mla_layouts, mla_allocated: [false; 2], mla_owners: std::array::from_fn(|_| Weak::new()),

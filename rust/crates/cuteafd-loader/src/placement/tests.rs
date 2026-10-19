@@ -1594,3 +1594,62 @@ fn alternating_whole_refuses_owner_overflow_instead_of_moving_layers() {
     req.layers[0].experts.as_mut().unwrap().tp2 = true;
     assert!(matches!(solve(&req), Err(PlacementError::Inventory(_))));
 }
+
+#[test]
+fn fitting_glm_flash_and_mimo_pro_keep_their_legacy_mark_counts() {
+    for (mark_bytes, expected) in [(147_619_840, 34), (39_321_600, 42)] {
+        let slots = cuteafd_core::prefix::mark_slots_for(16, 20, mark_bytes, 2 << 30);
+        assert_eq!(slots, expected);
+        let mut req = request(2, 44 * GIB, 2, 6, Onboard::Auto);
+        let parts = (0..2).map(|gpu| Demand::new(gpu, Category::Prefix,
+            "exact marks", mark_bytes / 2, Basis::Exact)).collect::<Vec<_>>();
+        req.fixed.extend(parts.iter().cloned().map(|mut d| { d.bytes *= slots; d }));
+        let (placement, selection) = solve_with_marks(&req, slots, 1, &parts).unwrap();
+        assert_eq!(selection.slots, expected);
+        assert!(selection.reduction_reason.is_none());
+        assert_eq!(placement, solve(&req).unwrap());
+        assert!(selection.summary().contains("legacy"));
+    }
+}
+
+#[test]
+fn kimi_c8_marks_reduce_only_after_context_and_fixed_floors() {
+    let mut req = request(2, 44 * GIB, 2, 6, Onboard::Layers(0));
+    req.pool.requested = Some(1 << 20);
+    req.pool.floor = 1 << 20;
+    req.pool.target = 1 << 20;
+    // This fixture's KV rate is 16 GiB/rank at 1M tokens. All other
+    // operands are fixed: 8 active states plus weights and workspaces.
+    let mark = 224_686_080;
+    let legacy = cuteafd_core::prefix::mark_slots_for(8, 20, 2 * mark, 2 << 30);
+    assert_eq!(legacy, 18);
+    let parts = (0..2).map(|gpu| Demand::new(gpu, Category::Prefix,
+        "Kimi exact KDA marks", mark, Basis::Exact)).collect::<Vec<_>>();
+    for gpu in 0..2 {
+        req.fixed.push(Demand::new(gpu, Category::Kv, "C8 active states", 8 * mark, Basis::Exact));
+        req.fixed.push(Demand::new(gpu, Category::Weights, "weights and workspaces",
+            44 * GIB - 16 * GIB - 12 * mark, Basis::Exact));
+    }
+    req.fixed.extend(parts.iter().cloned().map(|mut d| { d.bytes *= legacy; d }));
+    let original = req.clone();
+    let (placed, selection) = solve_with_marks(&req, legacy, 1, &parts).unwrap();
+    assert_eq!(selection.slots, 4);
+    assert_eq!(placed.pool_tokens, 1 << 20);
+    assert!(selection.reduction_reason.is_some());
+    assert!(selection.summary().contains("capacity-constrained"));
+    assert_eq!(req, original);
+    for gpu in 0..2 {
+        assert_eq!(placed.items[gpu].iter().find(|d| d.group == "Kimi exact KDA marks").unwrap().bytes, 4 * mark);
+        assert_eq!(placed.items[gpu].iter().find(|d| d.group == "C8 active states").unwrap().bytes, 8 * mark);
+    }
+    // Even one byte short of one complete mark is a typed refusal.
+    for gpu in &mut req.inventory.gpus { gpu.baseline = Baseline::Measured { free_bytes: 44 * GIB - 3 * mark - 1 }; }
+    assert!(matches!(solve_with_marks(&req, legacy, 1, &parts),
+        Err(PlacementError::PrefixMarks { minimum: 1, .. })));
+    req.fixed[0].bytes -= 1;
+    assert!(matches!(solve_with_marks(&req, legacy, 1, &parts),
+        Err(PlacementError::Inventory(_)) | Err(PlacementError::PrefixMarks { .. })));
+    let mut invalid = original;
+    invalid.fixed.last_mut().unwrap().bytes -= 1;
+    assert!(matches!(solve_with_marks(&invalid, legacy, 1, &parts), Err(PlacementError::Inventory(_))));
+}
