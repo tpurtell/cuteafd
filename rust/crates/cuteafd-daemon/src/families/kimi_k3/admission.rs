@@ -1,7 +1,7 @@
 //! Native coordinator inventory passed to the shared startup solver, before
 //! weights, recurrent state or cache owners allocate. This is not the header
 //! lower bound exposed by `plan` and does not admit Spark workers by itself.
-use super::{device::{Lane, LaneLayout}, state::{KdaBank, KdaLayout}, weights::{LayerLayout, LayerWeights, PackedLayer}};
+use super::{device::{Lane, LaneLayout}, mla::{CacheBank, CacheLayout}, state::{KdaBank, KdaLayout}, weights::{LayerLayout, LayerWeights, PackedLayer}};
 use crate::shared::memory::device::{Device, Stream};
 use std::rc::{Rc, Weak};
 use anyhow::{ensure, Context, Result};
@@ -46,6 +46,8 @@ pub(crate) struct Admission<'a> {
     lane_readers: Vec<[Weak<Stream<'a>>; 2]>,
     kda_layout: KdaLayout,
     kda_allocated: [bool; 2],
+    mla_layouts: [CacheLayout; 2],
+    mla_allocated: [bool; 2],
 }
 
 /// The normal Spark lane consumes these selected layer IDs; selection still
@@ -82,6 +84,27 @@ impl<'a> Admission<'a> {
         let bank = self.kda_layout.allocate(device, readers)?;
         self.kda_allocated[rank] = true;
         Ok(bank)
+    }
+
+    pub(crate) fn allocate_mla(&mut self, device: Device<'a>, rank: usize) -> Result<CacheBank<'a>> {
+        let layout = self.check_mla(rank, device.id)?;
+        let readers = self.lane_readers.iter().map(|pair| pair[rank].upgrade()
+            .context("Kimi MLA requires live admitted lane streams")).collect::<Result<Vec<_>>>()?;
+        let bank = layout.allocate(device, readers)?;
+        self.mla_allocated[rank] = true;
+        Ok(bank)
+    }
+
+    fn check_mla(&self, rank: usize, device: i32) -> Result<&CacheLayout> {
+        ensure!(rank < 2 && device == self.devices[rank], "Kimi MLA allocation differs from admitted device");
+        ensure!(!self.mla_allocated[rank], "Kimi MLA bank already allocated");
+        let layout = &self.mla_layouts[rank];
+        let charges = self.placement.items[rank].iter().filter(|item| item.group == "records").collect::<Vec<_>>();
+        ensure!(if layout.bytes() == 0 { charges.is_empty() } else {
+            charges.len() == 1 && charges[0].category == Category::Kv
+                && charges[0].basis == Basis::Formula && charges[0].bytes == layout.bytes() as u64
+        }, "Kimi MLA allocation differs from accepted record charge");
+        Ok(layout)
     }
 
     fn check_kda(&self, rank: usize, device: i32) -> Result<()> {
@@ -131,9 +154,13 @@ pub(crate) fn admit<'a>(inputs: Inputs<'_>) -> Result<Admission<'a>> {
     }
     let lane_allocated = vec![[false; 2]; lane_layouts.len()];
     let lane_readers = (0..lane_layouts.len()).map(|_| std::array::from_fn(|_| Weak::new())).collect();
+    let mla_layouts = [CacheLayout::new(cfg, &placement, 0)?, CacheLayout::new(cfg, &placement, 1)?];
     let admission = Admission { placement, layouts, devices, lanes, lane_layouts, lane_allocated, lane_readers,
-        kda_layout, kda_allocated: [false; 2] };
-    for rank in 0..2 { admission.check_kda(rank, devices[rank])?; }
+        kda_layout, kda_allocated: [false; 2], mla_layouts, mla_allocated: [false; 2] };
+    for rank in 0..2 {
+        admission.check_kda(rank, devices[rank])?;
+        admission.check_mla(rank, devices[rank])?;
+    }
     Ok(admission)
 }
 
@@ -274,6 +301,79 @@ mod tests {
                     item.category == category && item.group.starts_with("Kimi")).map(|item| item.bytes).sum::<u64>();
                 assert_eq!(state(&heads), state(&owned));
             }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn mla_cache_residency_and_pages_follow_accepted_attention_modes() -> Result<()> {
+        let cfg = cfg();
+        let owned = admit(inputs(&cfg))?;
+        let mut i = inputs(&cfg);
+        i.attention = Some(AttentionPlacement::Heads);
+        let heads = admit(i)?;
+        let tokens = owned.placement.pool_tokens as usize;
+        let pages = tokens / MLA_PAGE_ROWS;
+        let layer_bytes = tokens * MLA_RECORD_BYTES;
+        for rank in 0..2 {
+            let layout = owned.check_mla(rank, rank as i32)?;
+            assert_eq!(layout.bytes(), layer_bytes);
+            assert_eq!(heads.check_mla(rank, rank as i32)?.bytes(), 2 * layer_bytes);
+            for layer in 0..cfg.layers {
+                let resident = layer == 1 + 2 * rank;
+                assert_eq!(layout.page_range(layer, 0, 64).is_ok(), resident);
+                assert_eq!(heads.mla_layouts[rank].page_range(layer, 0, 64).is_ok(),
+                    cfg.attention[layer] == KimiAttention::Mla);
+                if !resident { continue; }
+                let mut next = 0;
+                for page in 0..pages {
+                    let (offset, bytes) = layout.page_range(layer, page, 64)?;
+                    assert_eq!(offset, next);
+                    next += bytes;
+                }
+                assert_eq!(next, layer_bytes);
+                assert_eq!(layout.page_range(layer, pages - 1, 1)?,
+                    (layer_bytes - MLA_PAGE_ROWS * MLA_RECORD_BYTES, MLA_RECORD_BYTES));
+                for (page, rows) in [(pages, 1), (0, 0), (0, 65)] {
+                    assert!(layout.page_range(layer, page, rows).is_err());
+                }
+            }
+            assert!(layout.page_range(cfg.layers, 0, 1).is_err());
+        }
+        let mut placement = owned.placement.clone();
+        for invalid in [LayerMode::ContextSplit, LayerMode::Whole { gpu: 2, ffn: FfnMode::Split }] {
+            placement.layers[1].mode = invalid;
+            assert!(CacheLayout::new(&cfg, &placement, 0).is_err());
+        }
+        placement = owned.placement.clone();
+        for pool in [0, 65, u64::MAX] {
+            placement.pool_tokens = pool;
+            assert!(CacheLayout::new(&cfg, &placement, 0).is_err());
+        }
+        assert!(CacheLayout::new(&cfg, &owned.placement, 2).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn mla_allocation_rejects_duplicate_device_and_tampered_record_charges() -> Result<()> {
+        let cfg = cfg();
+        let mut admitted = admit(inputs(&cfg))?;
+        assert!(admitted.check_mla(2, 0).is_err());
+        assert!(admitted.check_mla(0, 1).is_err());
+        admitted.mla_allocated[0] = true;
+        assert!(admitted.check_mla(0, 0).is_err());
+        admitted.mla_allocated[0] = false;
+        for case in 0..5 {
+            let mut admitted = admit(inputs(&cfg))?;
+            let record = admitted.placement.items[0].iter_mut().find(|item| item.group == "records").unwrap();
+            match case {
+                0 => record.bytes -= 1,
+                1 => record.category = Category::Workspace,
+                2 => record.basis = Basis::Exact,
+                3 => { let duplicate = record.clone(); admitted.placement.items[0].push(duplicate); }
+                _ => admitted.placement.items[0].retain(|item| item.group != "records"),
+            }
+            assert!(admitted.check_mla(0, 0).is_err(), "case {case}");
         }
         Ok(())
     }
