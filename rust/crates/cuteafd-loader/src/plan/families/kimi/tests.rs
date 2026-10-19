@@ -119,13 +119,13 @@ fn installed_inventory(root: &std::path::Path, spark: bool) -> std::path::PathBu
     let path = root.join("share/PROGRAMS.json");
     std::fs::write(&path, json!({"schema":1,"sparkinfer_revision":revision,"programs":programs}).to_string()).unwrap();
     let package = root.join("lib/exl3/exl3-kimik3-k23");
-    let layouts = if spark { (0..6).map(|r| format!("tp6-rank{r}")).collect::<Vec<_>>() }
-        else { vec!["rtx-tp1".into()] };
+    let layouts = if spark { (0..6).map(|r| (format!("tp6-rank{r}"), 512)).collect::<Vec<_>>() }
+        else { vec![("rtx-tp1".into(), 3072), ("rtx-tp2".into(), 1536)] };
     let mut variants = Vec::new();
-    for layout in layouts {
+    for (layout, intermediate) in layouts {
         for capacity in [1, 80, 256, 1024, 4096] {
             let directory = format!("{layout}/m{capacity}");
-            let meta = json!({"directory":directory,"capacity":capacity,"intermediate":if spark {512} else {3072},
+            let meta = json!({"directory":directory,"capacity":capacity,"intermediate":intermediate,
                 "experts":896,"top_k":16,"bits":[2,3],"output_dtype":if spark {"bf16"} else {"fp32"},
                 "hidden":3584,"activation":"situ","descriptor_bits":10,"sparkinfer_revision":revision});
             let target = package.join(&directory);
@@ -141,6 +141,45 @@ fn installed_inventory(root: &std::path::Path, spark: bool) -> std::path::PathBu
         "geometry":"kimik3","role":if spark {"spark"} else {"coordinator"},
         "sparkinfer_revision":revision,"variants":variants}).to_string()).unwrap();
     path
+}
+
+#[test]
+fn coordinator_inventory_requires_exact_tp2_exports() {
+    use serde_json::json;
+    for corruption in ["missing-layout", "missing-capacity", "missing-object", "width", "dtype", "capacity", "hidden", "activation"] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = installed_inventory(dir.path(), false);
+        let package = dir.path().join("lib/exl3/exl3-kimik3-k23");
+        validate_expert_inventory(&path, &package).unwrap();
+        let manifest = package.join("manifest.json");
+        let mut inventory: Value = serde_json::from_slice(&std::fs::read(&manifest).unwrap()).unwrap();
+        match corruption {
+            "missing-layout" | "missing-capacity" => {
+                inventory["variants"].as_array_mut().unwrap().retain(|entry| {
+                    let name = entry["directory"].as_str().unwrap();
+                    if corruption == "missing-layout" { !name.starts_with("rtx-tp2/") }
+                    else { name != "rtx-tp2/m80" }
+                });
+                std::fs::write(&manifest, inventory.to_string()).unwrap();
+            }
+            "missing-object" => std::fs::remove_file(package.join("rtx-tp2/m80/libcuteafd_exl3.so")).unwrap(),
+            _ => {
+                let meta_path = package.join("rtx-tp2/m80/v41_exl3.json");
+                let mut meta: Value = serde_json::from_slice(&std::fs::read(&meta_path).unwrap()).unwrap();
+                let (key, value) = match corruption {
+                    "width" => ("intermediate", json!(3072)),
+                    "dtype" => ("output_dtype", json!("bf16")),
+                    "capacity" => ("capacity", json!(16)),
+                    "hidden" => ("hidden", json!(7168)),
+                    "activation" => ("activation", json!("silu")),
+                    _ => unreachable!(),
+                };
+                meta[key] = value;
+                std::fs::write(meta_path, meta.to_string()).unwrap();
+            }
+        }
+        assert!(validate_expert_inventory(&path, &package).is_err(), "accepted {corruption}");
+    }
 }
 
 #[test]

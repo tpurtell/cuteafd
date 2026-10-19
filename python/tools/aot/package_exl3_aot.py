@@ -507,7 +507,7 @@ def profiles_for_role(role: str, geometry: str = 'v41') -> list[tuple]:
     """
     if geometry == 'kimik3':
         return [profile for profile in shard_profiles(geometry, role)
-                if profile[0] == ('tp6-width512' if role == 'spark' else 'rtx-tp1')]
+                if role != 'spark' or profile[0] == 'tp6-width512']
     if geometry != 'v41':
         return shard_profiles(geometry, role)
     if role == 'spark':
