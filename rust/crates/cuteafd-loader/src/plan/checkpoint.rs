@@ -303,6 +303,13 @@ impl Checkpoint {
                     && !has_scale {
                     return Ok(ModuleNumerics::CheckpointPrecision);
                 }
+                if matches!(dtype, cuteafd_core::DType::U8 | cuteafd_core::DType::I8)
+                    && self.contains_tensor(&format!("{module}.weight_scale"))
+                    && !self.contains_tensor(&format!("{module}.weight_scale_2"))
+                    && !self.contains_tensor(&format!("{module}.input_scale"))
+                    && !self.contains_tensor(&format!("{module}.weight_scale_inv")) {
+                    return Ok(ModuleNumerics::CheckpointPrecision);
+                }
                 ensure!(dtype == cuteafd_core::DType::F8E4M3 && has_scale,
                     "{module}.weight: declared W8A8 has partial or invalid FP8 storage ({dtype:?})");
                 Ok(declared)
@@ -822,6 +829,7 @@ mod sliced_tests {
             missing_shards: Vec::new(),
             shard_bytes: 0,
         };
+        checkpoint.tensors.sort_by(|a, b| a.meta.name.cmp(&b.meta.name));
         assert_eq!(checkpoint.module_numerics(fp8_stem).unwrap(), ModuleNumerics::W8A8);
         assert_eq!(checkpoint.module_numerics(bf16_stem).unwrap(), ModuleNumerics::CheckpointPrecision);
         assert_eq!(checkpoint.module_numerics(excluded_stem).unwrap(), ModuleNumerics::CheckpointPrecision);

@@ -736,8 +736,8 @@ mod tests {
         let mixed_tensors = Fp8ExpertTensors::read(dir.path(),mixed_shape).unwrap();
         let groups = mixed_tensors.homogeneous_layers(&[0,1]).unwrap();
         assert_eq!(groups.len(), 2);
-        assert_eq!(groups[0].0.numerics(0), Some(cuteafd_loader::plan::ModuleNumerics::W8A8));
-        assert_eq!(groups[1].0.numerics(1), Some(cuteafd_loader::plan::ModuleNumerics::CheckpointPrecision));
+        assert_eq!(groups[0].0.numerics(0), Some(cuteafd_loader::plan::checkpoint::ModuleNumerics::W8A8));
+        assert_eq!(groups[1].0.numerics(1), Some(cuteafd_loader::plan::checkpoint::ModuleNumerics::CheckpointPrecision));
         let mut a8_info = info.clone();
         a8_info.weights = Fp8MoeWeights::Fp8A8;
         super::validate_checkpoint_contract(&a8_info,&groups[0].0,&[0],6,0,Slicing::Padded).unwrap();
