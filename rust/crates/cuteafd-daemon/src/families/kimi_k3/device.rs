@@ -369,6 +369,41 @@ impl<'a> LocalLane<'a> {
     /// External scheduling/staging uses only the admitted lane's actual owners.
     pub(crate) fn buffer(&self, name: &str) -> Result<CuteafdDeviceBuffer> { self.lane.buffer(name) }
 
+    pub(super) fn rows(&self) -> usize { self.lane.rows() }
+    pub(super) fn lane_index(&self) -> usize { self.lane_index }
+    pub(super) fn has_embedding(&self) -> bool { self.global.buffer("embedding").is_ok() }
+    pub(super) fn config(&self) -> &KimiK3Config { &self.programs.w8.cfg }
+
+    pub(super) fn attention_share(&self, layer: usize) -> Result<crate::shared::placement::layers::AttentionShare> {
+        Ok(self.layer(layer)?.attention)
+    }
+
+    /// Report resident operands and banks, not just the intended placement.
+    pub(super) fn attention_resident(&self, layer: usize) -> Result<(bool, bool)> {
+        use cuteafd_loader::families::kimi_k3::config::KimiAttention;
+        let weights = self.layer(layer)?;
+        Ok(match self.config().attention.get(layer) {
+            Some(KimiAttention::Kda) => (weights.kda().is_ok(), self.kda.layer(layer, self.lane_index).is_ok()),
+            Some(KimiAttention::Mla) => (weights.mla().is_ok(), self.mla.layer(layer).is_ok()),
+            None => bail!("Kimi attention census layer outside inventory"),
+        })
+    }
+
+    /// Copies a completed peer/local result into a fixed admitted operand.
+    /// Producers must already be ordered on this exact lane stream.
+    pub(super) fn adopt(&mut self, name: &str, source: CuteafdDeviceBuffer, rows: usize, width: usize) -> Result<()> {
+        let destination = self.plane(name, rows, width)?;
+        ensure!(source.device_id == destination.device_id && source.bytes >= destination.bytes,
+            "Kimi adopted result device or extent differs from lane");
+        io_disjoint(source, destination)?;
+        self.stream().device.run(|| {
+            // SAFETY: the shared executor retains the source and orders its
+            // producer before this lane; destination is a retained lane plane.
+            unsafe { self.stream().device.library.copy_d2d_async(
+                destination, source, destination.bytes, self.stream().raw) }
+        })
+    }
+
     /// Outside capture: replace metadata contents, never the admitted addresses.
     /// The scheduler retains pages/slots and orders cross-lane users through
     /// completion; a graph's identity uses row shape, not sequence partitions.
