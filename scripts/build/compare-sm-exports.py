@@ -79,6 +79,10 @@ def jobs(scope):
     result.append(("kimi-situ", "export_b12x_dsv4_aot.py",
                    ["--geometry", "kimik3", "--only", ",".join(
                        f"situ_i{width}" for width in (3072, 6144, 16896, 33792))]))
+    result.append(("kimi-ffn", "export_b12x_dsv4_aot.py",
+                   ["--geometry", "kimik3", "--only", ",".join(
+                       f"ffn_{op}_i{width}" for width in (3072, 6144, 16896, 33792)
+                       for op in ("gate_up", "down"))]))
     result.append(("kimi-routing", "export_b12x_dsv4_aot.py",
                    ["--geometry", "kimik3", "--only", "router_scores,expert_input_quant"]))
     if scope == "suspects":

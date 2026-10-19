@@ -392,8 +392,8 @@ def test_kimi_w8_exports_every_residual_transition_and_situ_width(exporter):
         if op == "bf16_projection":
             assert module == "pointwise" and fn == "compile_bf16_projection_aot"
             width = int(stem.rsplit("_i", 1)[1])
-            assert params == ({"width": 7168, "outputs": 2 * width} if "gate_up" in stem
-                              else {"width": width, "outputs": 7168})
+            assert params == ({"width": 7168, "outputs": 2 * width, "compensated": True}
+                              if "gate_up" in stem else {"width": width, "outputs": 7168})
             continue
         assert module == "kimi_residual"
         if op == "situ":
