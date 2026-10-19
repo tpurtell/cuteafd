@@ -381,6 +381,10 @@ impl<'a> LocalLane<'a> {
     pub(super) fn lane_index(&self) -> usize { self.lane_index }
     pub(super) fn has_embedding(&self) -> bool { self.global.buffer("embedding").is_ok() }
     pub(super) fn config(&self) -> &KimiK3Config { &self.cfg }
+    pub(super) fn max_context(&self) -> usize { self.lane.layout.max_context() }
+    pub(super) fn prefix_banks(&self) -> (Rc<super::state::KdaBank<'a>>, Rc<super::mla::CacheBank<'a>>) {
+        (self.kda.clone(), self.mla.clone())
+    }
 
     pub(super) fn attention_share(&self, layer: usize) -> Result<crate::shared::placement::layers::AttentionShare> {
         Ok(self.layer(layer)?.attention)

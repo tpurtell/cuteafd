@@ -509,7 +509,7 @@ fn request(i: Inputs<'_>) -> Result<PlacementRequest> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
 
     fn cfg() -> KimiK3Config {
@@ -520,7 +520,7 @@ mod tests {
         cfg
     }
 
-    fn inputs(cfg: &KimiK3Config) -> Inputs<'_> {
+    pub(in crate::families::kimi_k3) fn inputs(cfg: &KimiK3Config) -> Inputs<'_> {
         Inputs { cfg, gpus: [GpuBudget { capacity_bytes: 96 << 30, headroom_bytes: 2 << 30,
             baseline: Baseline::Measured { free_bytes: 96 << 30 } }; 2], devices: [0, 1], peer_access: true, spark_ranks: 6,
             attention: None, requested_pool: None, state_slots: 2, prefix_marks: 2, rows: 4096, lanes: 2,

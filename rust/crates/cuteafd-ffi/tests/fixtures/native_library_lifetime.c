@@ -162,6 +162,39 @@ int cuteafd_cuda_event_create_ordering(void **out) {
     event('C');
     return 0;
 }
+int cuteafd_cuda_event_create(void **out) {
+    return cuteafd_cuda_event_create_ordering(out);
+}
+
+int cuteafd_cuda_stream_create(void **out) { *out = NULL; return 0; }
+
+int cuteafd_cuda_stream_wait_event(void *stream, void *handle) {
+    (void)stream; (void)handle;
+    event('W');
+    return 0;
+}
+
+int cuteafd_cuda_zero_bytes_async(void *dst, size_t bytes, void *stream) {
+    (void)stream;
+    memset(dst, 0, bytes);
+    return 0;
+}
+
+int cuteafd_copy_d2d_async(struct device_buffer dst, struct device_buffer src,
+                           size_t bytes, void *stream) {
+    (void)stream;
+    if (bytes > dst.bytes || bytes > src.bytes) return 1;
+    memcpy(dst.ptr, src.ptr, bytes);
+    event('C');
+    return pack_status;
+}
+
+int cuteafd_copy_d2h(void *dst, struct device_buffer src, size_t bytes) {
+    if (bytes > src.bytes) return 1;
+    memcpy(dst, src.ptr, bytes);
+    return 0;
+}
+
 int cuteafd_copy_h2d_async(struct device_buffer dst, const void *source,
                          size_t bytes, void *stream) {
     (void)stream;
