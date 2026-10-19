@@ -20,6 +20,18 @@ fn checkpoint_templates_match_transformers_goldens() {
     }
 }
 
+#[test]
+fn generation_annotations_preserve_checkpoint_template_goldens() {
+    for (name, source) in [("exl3_k4", EXL3_K4), ("zai", ZAI)] {
+        let annotated = format!("{{% generation %}}{source}{{% endgeneration %}}");
+        let template = ChatTemplate::new(annotated).unwrap();
+        for case in goldens() {
+            assert_eq!(template.render(&case["context"]).unwrap(),
+                case["expected"][name].as_str().unwrap(), "{name}/{}", case["name"]);
+        }
+    }
+}
+
 /// The OpenAI request a client would send for a golden context: tool-call
 /// arguments as JSON strings, `clear_thinking` under `thinking`.
 fn request_for(context: &Value) -> Value {

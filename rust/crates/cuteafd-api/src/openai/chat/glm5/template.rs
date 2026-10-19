@@ -36,7 +36,12 @@ impl ChatTemplate {
             Err(Error::new(ErrorKind::InvalidOperation, message))
         });
         env.add_function("strftime_now", strftime_now);
-        env.add_template_owned(NAME, source.into())?;
+        env.add_function("__hf_generation", |state: &minijinja::State, kwargs: Kwargs| -> Result<Value, Error> {
+            let caller: Value = kwargs.get("caller")?;
+            kwargs.assert_all_used()?;
+            caller.call(state, &[])
+        });
+        env.add_template_owned(NAME, generation_annotations(source.into())?)?;
         Ok(Self { env })
     }
 
@@ -44,6 +49,55 @@ impl ChatTemplate {
     pub fn render(&self, context: &Json) -> Result<String, Error> {
         self.env.get_template(NAME)?.render(context)
     }
+}
+
+/// Lower Transformers' assistant-mask annotations to equivalent caller blocks.
+/// Use the pinned minijinja lexer, not textual replacement: quoted delimiters,
+/// comments and raw blocks must stay literal, and whitespace controls stay intact.
+fn generation_annotations(source: String) -> Result<String, Error> {
+    use minijinja::machinery::{tokenize, Span, Token, WhitespaceConfig};
+
+    let mut block_start = false;
+    let mut annotation: Option<(&str, Span)> = None;
+    let mut edits = Vec::new();
+    let mut depth = 0usize;
+    for item in tokenize(&source, false, Default::default(), WhitespaceConfig::default()) {
+        let (token, span) = item?;
+        if let Some((name, name_span)) = annotation.take() {
+            if !matches!(token, Token::BlockEnd) {
+                return Err(Error::new(ErrorKind::SyntaxError, "generation annotations take no arguments"));
+            }
+            let replacement = if name == "generation" {
+                depth += 1;
+                "call __hf_generation()"
+            } else {
+                depth = depth.checked_sub(1).ok_or_else(|| {
+                    Error::new(ErrorKind::SyntaxError, "unexpected endgeneration annotation")
+                })?;
+                "endcall"
+            };
+            edits.push((name_span.start_offset as usize, name_span.end_offset as usize, replacement));
+        }
+        if block_start {
+            if let Token::Ident(name @ ("generation" | "endgeneration")) = token {
+                annotation = Some((name, span));
+            }
+        }
+        block_start = matches!(token, Token::BlockStart);
+    }
+    if depth != 0 || annotation.is_some() {
+        return Err(Error::new(ErrorKind::SyntaxError, "unclosed generation annotation"));
+    }
+    if edits.is_empty() { return Ok(source); }
+    let mut lowered = String::with_capacity(source.len());
+    let mut offset = 0;
+    for (start, end, replacement) in edits {
+        lowered.push_str(&source[offset..start]);
+        lowered.push_str(replacement);
+        offset = end;
+    }
+    lowered.push_str(&source[offset..]);
+    Ok(lowered)
 }
 
 /// `strftime_now(format)`: only the date directives templates use in practice.
@@ -251,6 +305,33 @@ mod tests {
             r#"{"b": "\u00e9\ud83d\udca1", "a": [1, 2.0, {}], "c": []}|"#,
             "{\n  \"b\": \"é💡\",\n  \"a\": [\n    1,\n    2.0,\n    {}\n  ],\n  \"c\": []\n}|",
             r#"{"a":[1,2.0,{}],"b":"é💡","c":[]}"#));
+    }
+
+    // Expected strings from Transformers 4.57.1's AssistantTracker extension
+    // with Jinja2 3.1.6, without assistant-mask tracking.
+    #[test]
+    fn generation_annotations_match_transformers() {
+        for (source, context, expected) in [
+            ("prefix{% generation %}hello {{ who }}{% endgeneration %}suffix", json!({"who": "world"}), "prefixhello worldsuffix"),
+            ("A \n  {%- generation +%}\n {{ who }} \n{%- endgeneration -%}\n B\n", json!({"who": "world"}), "A\n worldB"),
+            ("{% set x = 'outside' %}{% generation %}{% set x = 'inside' %}{{x}}{% endgeneration %}|{{x}}", json!({}), "inside|outside"),
+            ("{% for x in [1,2] %}{% generation %}{{loop.index}}={{x}}{% endgeneration %};{% endfor %}", json!({}), "1=1;2=2;"),
+            ("{% generation %}a{% generation %}b{% endgeneration %}c{% endgeneration %}", json!({}), "abc"),
+            ("{{ '{% generation %}' }}{# {% generation %} #}{% raw %}{% generation %}literal{% endgeneration %}{% endraw %}", json!({}), "{% generation %}{% generation %}literal{% endgeneration %}"),
+            ("é{% generation %}\u{1f4a1}{{x}}{% endgeneration %}", json!({"x": "tail"}), "é\u{1f4a1}tail"),
+        ] {
+            assert_eq!(ChatTemplate::new(source).unwrap().render(&context).unwrap(), expected, "{source}");
+        }
+    }
+
+    #[test]
+    fn generation_annotations_reject_invalid_blocks() {
+        for source in ["{% generation %}", "{% endgeneration %}",
+            "{% generation extra %}{% endgeneration %}",
+            "{% generation %}{% endgeneration extra %}",
+            "{% generation %}{% endif %}{% endgeneration %}"] {
+            assert!(ChatTemplate::new(source).is_err(), "{source}");
+        }
     }
 
     #[test]
