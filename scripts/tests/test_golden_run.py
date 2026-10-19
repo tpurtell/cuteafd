@@ -749,6 +749,13 @@ def test_fixture_and_spark_argument_refusals(env, capsys, extra, match):
     assert not runs(env)
 
 
+def test_raw_family_requires_raw_mode(env, capsys):
+    write_slot(env['home'], 'i1')
+    argv = ['--task', 'gr', '--family', 'kimi', '--model', 'org/model', '--arm', 'a=i1:s1', '--', '--x']
+    assert golden.main(argv) == 2
+    assert 'has no golden subcommand' in capsys.readouterr().err
+
+
 def test_dense_native_test_without_sparks(env, monkeypatch):
     write_slot(env['home'], 'i1')
     monkeypatch.setenv('STUB_RUN_OUTPUT', PASSED.replace('layer_chain', 'dense_chain'))
