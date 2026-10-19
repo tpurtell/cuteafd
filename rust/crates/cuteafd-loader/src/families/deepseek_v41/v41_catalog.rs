@@ -816,6 +816,9 @@ fn read_official_v41_catalog_filtered(snapshot: &Path, spark_role: Option<String
 pub fn read_expert_catalog(snapshot: &Path) -> Result<OfficialV41Catalog> {
     let config: serde_json::Value =
         crate::families::deepseek_v41::v41_exl3::read_json(&snapshot.join("config.json"), 1024 * 1024)?;
+    if kimi_catalog_config(&config) {
+        return read_kimi_expert_catalog(snapshot, &config);
+    }
     if config.get("model_type").and_then(serde_json::Value::as_str) == Some("glm5_next") {
         return read_glm_dsa_expert_catalog(snapshot, &config);
     }
@@ -849,6 +852,28 @@ pub fn read_expert_catalog(snapshot: &Path) -> Result<OfficialV41Catalog> {
              tensors onto the six-region W1,W3,W2,S1,S3,S2 staging plan"
         ),
     }
+}
+
+fn kimi_catalog_config(config: &serde_json::Value) -> bool {
+    matches!(config["model_type"].as_str(), Some("kimi_k3" | "kimi_linear"))
+        || config["architectures"].as_array().is_some_and(|architectures| architectures.iter().any(|name|
+            matches!(name.as_str(), Some("KimiK3ForConditionalGeneration" | "KimiLinearForCausalLM"))))
+}
+
+fn read_kimi_expert_catalog(snapshot: &Path, config: &serde_json::Value) -> Result<OfficialV41Catalog> {
+    let cfg = crate::families::kimi_k3::config::KimiK3Config::from_hf(config)?;
+    cfg.release_geometry()?;
+    ensure!(config["quantization_config"]["quant_method"] == "exl3",
+        "Kimi Spark experts require the checkpoint's native EXL3 K2/K3 format");
+    let first_layer = cfg.dense.iter().position(|dense| !dense).context("Kimi config has no routed layers")?;
+    ensure!(cfg.dense[first_layer..].iter().all(|dense| !dense), "Kimi routed layers must follow dense layers");
+    let shape = RoutedExpertShape { layers: cfg.layers, first_layer, experts: cfg.experts,
+        topk: cfg.topk, hidden: cfg.latent, intermediate: cfg.moe_intermediate,
+        draft_stages: 0, draft_experts: 0 };
+    let checkpoint = crate::plan::Checkpoint::inventory(snapshot)?;
+    let catalog = deepseek_v4_exl3_catalog(snapshot, &checkpoint.weight_map, shape, &[2, 3])?;
+    ensure!(catalog.experts.draft_stages == 0, "Kimi K3 has no native draft expert stages");
+    Ok(catalog)
 }
 
 /// GLM 5.x (glm_moe_dsa) and GLM 5.3 Flash (glm5_next) routed experts. Only EXL3 publications serve from
@@ -1158,11 +1183,15 @@ fn read_deepseek_v4_expert_catalog(snapshot: &Path) -> Result<OfficialV41Catalog
     })
 }
 
-/// The decoder layer of a Hugging Face tensor name (`model.layers.{L}.` or
-/// `model.language_model.layers.{L}.`).
+/// Read a decoder layer from the actual header name, independent of its wrapper.
+/// Separate MTP modules are draft stages, not backbone layers.
 fn hf_layer(name: &str) -> Option<usize> {
-    name.strip_prefix("model.layers.").or_else(|| name.strip_prefix("model.language_model.layers."))?
-        .split('.').next()?.parse().ok()
+    if name.starts_with("mtp.") { return None; }
+    let mut segments = name.split('.');
+    while let Some(segment) = segments.next() {
+        if segment == "layers" { return segments.next()?.parse().ok(); }
+    }
+    None
 }
 
 /// Every tensor header of the shards `weight_map` names, each in its shard.
@@ -1228,7 +1257,7 @@ fn deepseek_v4_exl3_catalog(
                 let past_backbone = hf_layer(&tensor.name).is_some_and(|layer| layer >= manifest.experts.layers);
                 ensure!(
                     past_backbone
-                        || (!tensor.name.contains(".mlp.experts.") && !tensor.name.contains(".ffn.experts.")),
+                        || !tensor.name.contains(".experts."),
                     "routed expert tensor {} is not in the EXL3 storage map",
                     tensor.name
                 );
@@ -1382,6 +1411,38 @@ mod tests {
         OfficialV41Config::from_json(include_bytes!("official-v41-config.json"))
             .unwrap()
     }
+    #[test]
+    fn kimi_dispatch_uses_declared_family_before_v41_text_config() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let v41: serde_json::Value = serde_json::from_slice(include_bytes!("official-v41-config.json"))?;
+        assert!(!kimi_catalog_config(&v41));
+        std::fs::write(dir.path().join("config.json"), serde_json::to_vec(&v41)?)?;
+        let direct = format!("{:#}", read_official_v41_catalog(dir.path()).unwrap_err());
+        let dispatched = format!("{:#}", read_expert_catalog(dir.path()).unwrap_err());
+        assert_eq!(dispatched, direct, "V4.1 must retain its official catalog route");
+        let mut kimi = crate::plan::testing::kimi_k3_config();
+        assert!(kimi_catalog_config(&kimi));
+        kimi["quantization_config"]["quant_method"] = "unsupported".into();
+        std::fs::write(dir.path().join("config.json"), serde_json::to_vec(&kimi)?)?;
+        let error = format!("{:#}", read_expert_catalog(dir.path()).unwrap_err());
+        assert!(error.contains("Kimi Spark experts require"), "{error}");
+        kimi.as_object_mut().unwrap().remove("model_type");
+        assert!(kimi_catalog_config(&kimi), "declared architecture also identifies Kimi");
+        assert!(!kimi_catalog_config(&serde_json::json!({"text_config": {"hidden_size": 7168}})),
+            "nested shape alone cannot choose Kimi");
+        Ok(())
+    }
+
+    #[test]
+    fn layer_ordinals_follow_header_segments_not_a_wrapper_allowlist() {
+        for prefix in ["model", "model.language_model", "language_model.model", "custom.encoder.text"] {
+            assert_eq!(hf_layer(&format!("{prefix}.layers.17.block_sparse_moe.experts.895.gate_proj.trellis")), Some(17));
+        }
+        for name in ["mtp.layers.0.mlp.experts.0.gate_proj.trellis", "model.layers.bad.weight", "layers_not.2.weight"] {
+            assert_eq!(hf_layer(name), None);
+        }
+    }
+
     fn assert_glm_coordinator_tensors(catalog: &OfficialV41Catalog) {
         for name in ["model.embed_tokens.weight", "lm_head.weight", "model.norm.weight"] {
             let tensor = catalog.tensor(name).unwrap();

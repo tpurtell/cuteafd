@@ -62,9 +62,20 @@ pub(crate) struct Admission<'a> {
     spark_connected: Vec<bool>,
 }
 
+/// Startup retains these until persistent local lanes acquire the same owners.
+pub(crate) struct LoadedWeights<'a> {
+    pub global: [Rc<GlobalWeights<'a>>; 2],
+    pub layers: Vec<[Rc<LayerWeights<'a>>; 2]>,
+}
+
 /// The normal Spark lane consumes these selected layer IDs; selection still
 /// goes through shared `SparkAdmission` before any transport connects.
 impl<'a> Admission<'a> {
+    pub(crate) fn execution_plan(&self) -> Result<LayerExecutionPlan> {
+        Ok(LayerExecutionPlan::new(&self.placement, hop_spec(self.cfg.hidden,
+            self.lane_layouts[0][0].rows(), self.lanes as usize))?)
+    }
+
     pub(crate) fn working_set(&self) -> SparkWorkingSet {
         SparkWorkingSet { rtx_layers: vec![], spark_layers: self.placement.layers.iter().enumerate()
             .filter_map(|(layer, assignment)| (assignment.experts == ExpertHome::Spark).then_some(layer)).collect(),
@@ -89,6 +100,32 @@ impl<'a> Admission<'a> {
         ensure!(lane < self.spark_connected.len() && !self.spark_connected[lane],
             "Kimi Spark lane already connected or outside admission");
         self.lane_readers[lane][0].upgrade().context("Kimi Spark requires admitted entry stream")
+    }
+
+    /// Stream one packed layer pair at a time after shared admission. Each
+    /// source tensor is read once for both ranks; no routed experts are loaded.
+    pub(crate) fn load_weights(&mut self, devices: [Device<'a>; 2],
+        checkpoint: &cuteafd_loader::plan::Checkpoint) -> Result<LoadedWeights<'a>> {
+        ensure!(KimiK3Config::from_hf(&checkpoint.config)? == self.cfg,
+            "Kimi startup checkpoint differs from admitted config");
+        for rank in 0..2 {
+            self.check_global(rank, devices[rank].id)?;
+            for layer in 0..self.cfg.layers { self.check_layer(rank, layer, devices[rank].id)?; }
+        }
+        let mut global = Vec::new();
+        for rank in 0..2 {
+            let packed = self.global_layouts[rank].pack(&self.cfg,
+                |name| super::weights::read_tensor(checkpoint, name))?;
+            global.push(self.upload_global(devices[rank], rank, packed)?);
+        }
+        let mut layers = Vec::new();
+        for layer in 0..self.cfg.layers {
+            let packed = PackedLayer::pair(&self.cfg, layer, self.placement.layers[layer].mode,
+                |name| super::weights::read_tensor(checkpoint, name))?;
+            let [zero, one] = packed;
+            layers.push([self.upload(devices[0], 0, layer, zero)?, self.upload(devices[1], 1, layer, one)?]);
+        }
+        Ok(LoadedWeights { global: global.try_into().map_err(|_| anyhow::anyhow!("Kimi global rank count"))?, layers })
     }
 
     /// No caller-supplied byte count: upload uses the immutable native layout
@@ -283,6 +320,12 @@ pub(crate) fn admit<'a>(inputs: Inputs<'_>) -> Result<Admission<'a>> {
     Ok(admission)
 }
 
+fn hop_spec(hidden: usize, rows: usize, lanes: usize) -> HopSpec {
+    HopSpec { storage: HopStorage::ReceiveSlots, row_bytes: (hidden * 2) as u64,
+        rows: rows as u64, lanes: lanes as u64, entry_gpu: 0, head_gpu: 1,
+        terminal: TerminalHome::Replicated }
+}
+
 fn request(i: Inputs<'_>) -> Result<PlacementRequest> {
     let cfg = i.cfg;
     ensure!(cfg.layers > 0 && cfg.layers == cfg.attention.len() && cfg.layers == cfg.dense.len(),
@@ -376,8 +419,7 @@ fn request(i: Inputs<'_>) -> Result<PlacementRequest> {
         policy: LayerPolicy { default: vec![LayerMode::HeadSplit], ownership: LayerOwnership::Alternating,
             attention: vec![(AttentionClass::Mla, AttentionPlacement::Layers), (AttentionClass::Kda, AttentionPlacement::Heads)],
             ..Default::default() },
-        hops: HopSpec { storage: HopStorage::ReceiveSlots, row_bytes: (cfg.hidden * 2) as u64, rows: i.rows as u64,
-            lanes: i.lanes as u64, entry_gpu: 0, head_gpu: 1, terminal: TerminalHome::Replicated }, executor: EXECUTOR })
+        hops: hop_spec(cfg.hidden, i.rows, i.lanes), executor: EXECUTOR })
 }
 
 #[cfg(test)]
