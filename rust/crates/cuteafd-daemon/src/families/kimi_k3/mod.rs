@@ -3,6 +3,7 @@
 //! into `device`; see #273 for the work items.
 // Unbound until the serve command lands (W9); the chain is exercised by tests.
 #![allow(dead_code)]
+pub(crate) mod admission;
 pub(crate) mod block;
 pub(crate) mod device;
 pub(crate) mod mla;
