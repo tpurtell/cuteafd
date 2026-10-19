@@ -19,8 +19,8 @@ pub fn validate_expert_inventory(path: &std::path::Path, root: &std::path::Path)
     let lock: serde_json::Value = serde_json::from_str(include_str!(concat!(env!("CARGO_MANIFEST_DIR"),
         "/../../../third_party/sparkinfer.lock.json")))?;
     ensure!(lock["revision"] == revision, "Kimi K3 package/source revision mismatch");
-    let (layouts, width, output) = match package["role"].as_str() {
-        Some("spark") => ((0..6).map(|r| format!("tp6-rank{r}")).collect::<Vec<_>>(), 512, "bf16"),
+    let (layouts, output) = match package["role"].as_str() {
+        Some("spark") => ((0..6).map(|r| (format!("tp6-rank{r}"), 512)).collect::<Vec<_>>(), "bf16"),
         Some("coordinator") => {
             ensure!(programs["sparkinfer_revision"] == revision, "Kimi K3 program/package revision mismatch");
             let inventory = programs["programs"].as_array().unwrap();
@@ -40,12 +40,12 @@ pub fn validate_expert_inventory(path: &std::path::Path, root: &std::path::Path)
                     _ => ensure!(geometry["hidden"] == 3584, "Kimi latent input geometry mismatch"),
                 }
             }
-            (vec!["rtx-tp1".into()], 3072, "fp32")
+            (vec![("rtx-tp1".into(), 3072), ("rtx-tp2".into(), 1536)], "fp32")
         }
         _ => anyhow::bail!("Kimi K3 EXL3 package must declare coordinator or spark role"),
     };
     let variants = package["variants"].as_array().context("Kimi K3 package lacks variants")?;
-    for layout in layouts {
+    for (layout, width) in layouts {
         for capacity in cuteafd_core::Exl3RowPolicy::for_geometry(cuteafd_core::ExpertGeometry::KIMI_K3).capacities(4096)? {
             let directory = format!("{layout}/m{capacity}");
             let entries = variants.iter().filter(|v| v["directory"] == directory).collect::<Vec<_>>();

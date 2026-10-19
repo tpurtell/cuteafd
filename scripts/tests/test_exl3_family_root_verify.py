@@ -63,6 +63,21 @@ def test_all_counts_are_opt_in_and_legacy_build_profiles_remain(geometry):
     assert tool.build_profiles("spark", geometry, all_spark_counts=True) == tool.profiles_for_role("spark", geometry)
 
 
+def test_kimi_coordinator_exports_whole_and_tp2_fp32_latent_experts():
+    tool = load_tool()
+    assert tool.GEOMETRIES["kimik3"] == (3584, 3072, 896, 16)
+    assert tool.activation("kimik3") == "situ"
+    assert tool.build_profiles("coordinator", "kimik3") == [
+        ("rtx-tp1", 3072, 896, 16, "fp32", ["rtx-tp1"]),
+        ("rtx-tp2", 1536, 896, 16, "fp32", ["rtx-tp2"]),
+    ]
+    assert tool.parse_requested_layouts(["rtx-tp2"], "coordinator", "kimik3") == ["rtx-tp2"]
+    assert tool.package_capacities("kimik3", "1,16,80,256,1024,4096") == [1, 80, 256, 1024, 4096]
+    assert tool.build_profiles("spark", "kimik3") == [
+        ("tp6-width512", 512, 896, 16, "bf16", [f"tp6-rank{rank}" for rank in range(6)]),
+    ]
+
+
 def _manifest(path: Path, role: str = "coordinator") -> None:
     path.write_text(json.dumps({"schema": "cuteafd.exl3-package.v1", "role": role}))
 
