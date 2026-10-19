@@ -66,7 +66,8 @@ mod tests {
 impl<'a> Engine<'a> {
     /// Complete startup from the measured shared admission and already charged
     /// exchange owners. Worker reconciliation precedes ordinary lane connection.
-    pub(crate) fn load_admitted(exchange_streams: [Rc<Stream<'a>>; 2],
+    pub(crate) fn load_admitted(library: &'a std::sync::Arc<cuteafd_ffi::NativeLibrary>,
+        exchange_streams: [Rc<Stream<'a>>; 2],
         mut admission: super::admission::Admission<'a>,
         checkpoint: &cuteafd_loader::plan::Checkpoint,
         programs: [std::rc::Rc<super::device::NativePrograms<'a>>; 2],
@@ -82,7 +83,8 @@ impl<'a> Engine<'a> {
         check_exchange_streams(&peer, &exchange_streams)?;
         let devices = programs.each_ref().map(|programs| programs.device);
         ensure!((0..2).all(|rank| devices[rank].id == peer.device(rank))
-            && std::ptr::eq(devices[0].library, devices[1].library),
+            && std::ptr::eq(devices[0].library, devices[1].library)
+            && std::ptr::eq(devices[0].library, library.as_ref()),
             "Kimi startup programs differ from exchange devices/library");
         let rows = u32::try_from(plan.spec().rows)?;
         let endpoints = vec![SparkEndpoint { capacity: rows, ingress: SparkIngress::Fp8K32 };
@@ -114,7 +116,7 @@ impl<'a> Engine<'a> {
         drop((weights, kda, mla));
         pending.wait()?;
         let world = SparkWorld::canonical(6)?;
-        let routed = local.iter().map(|pair| admission.connect_spark(&pair[0],
+        let routed = local.iter().map(|pair| admission.connect_spark(library, &pair[0],
             world, peers.clone(), config.clone())).collect::<Result<Vec<_>>>()?;
         Self::bind(exchange_streams, plan, peer, hops, local, routed, io)
     }
@@ -171,7 +173,7 @@ impl<'a> Engine<'a> {
                 Ok(())
             },
             graphs: || {
-                for routed in &lanes.borrow().routed { routed.release_payloads()?; }
+                for routed in &mut lanes.borrow_mut().routed { routed.release_payloads()?; }
                 Ok(())
             },
             finish: |drained| self.peer.finish_terminal(drained),
@@ -180,11 +182,40 @@ impl<'a> Engine<'a> {
         Ok(())
     }
 
+    /// Cold diagnostic prefix: the admitted inventory is already truncated.
+    /// Never applies output mixing, normalization or vocabulary projection.
+    pub(crate) fn prefix_residual(&self, tokens: &[u32], pages: &[u32],
+        pool: &cuteafd_engine::prefix::RefPagePool) -> Result<Vec<f32>> {
+        submit_scoped(|| self.peer.require_live(), || self.shutdown(), |scope| {
+            let mut lanes = self.lanes.try_borrow_mut()?;
+            ensure!(!tokens.is_empty(), "Kimi diagnostic prefix has no tokens");
+            let sequences = [SequenceRows { slot: 0, start: 0, rows: tokens.len(), pages }];
+            for local in &mut lanes.local[0] { local.stage_attention(&sequences, pool)?; }
+            lanes.io[0][0].embed(tokens, lanes.local[0][0].buffer("delta")?)?;
+            let Lanes { local, routed, .. } = &mut *lanes;
+            let outputs = self.execution.run(scope, &self.peer, &self.hops,
+                &mut local[..1], &mut routed[..1], &[tokens.len()], false,
+                super::layers::Output::Residual)?;
+            let stream = local[0][1].stream();
+            stream.device.run(|| {
+                // SAFETY: this uncaptured diagnostic retains every operand until
+                // the terminal lane has completed, then downloads its BF16 rows.
+                unsafe { stream.device.library.cuda_stream_synchronize(stream.raw)?; }
+                let mut bytes = vec![0; outputs[0].bytes];
+                stream.device.library.copy_d2h(&mut bytes, outputs[0])?;
+                Ok(bytes.chunks_exact(2).map(|bytes| f32::from_bits(
+                    u32::from(u16::from_le_bytes(bytes.try_into().unwrap())) << 16)).collect())
+            })
+        })
+    }
+
     /// Diagnostic embedding-to-logits path. No graph/replay or speculative
     /// transaction qualification is implied by this uncaptured forward.
     pub(crate) fn forward(&self, tokens: &[Vec<u32>], sequences: &[Vec<SequenceRows<'_>>],
         pool: &cuteafd_engine::prefix::RefPagePool,
         mut consume: impl FnMut(usize, usize, usize, &[f32]) -> Result<()>) -> Result<()> {
+        // A truncated inventory has no meaningful model output mix or logits.
+        self.lanes.try_borrow()?.local[0][1].config().release_geometry()?;
         submit_scoped(|| self.peer.require_live(), || self.shutdown(), |scope| {
             let mut lanes = self.lanes.try_borrow_mut()?;
             ensure!(!tokens.is_empty() && tokens.len() == sequences.len() && tokens.len() <= lanes.local.len(),
@@ -201,7 +232,8 @@ impl<'a> Engine<'a> {
             }
             let Lanes { local, routed, io } = &mut *lanes;
             let normalized = self.execution.run(scope, &self.peer, &self.hops,
-                &mut local[..tokens.len()], &mut routed[..tokens.len()], &rows, false)?;
+                &mut local[..tokens.len()], &mut routed[..tokens.len()], &rows, false,
+                super::layers::Output::Normalized)?;
             for (lane, normalized) in normalized.into_iter().enumerate() {
                 let stream = local[lane][1].stream();
                 for first in (0..rows[lane]).step_by(64) {

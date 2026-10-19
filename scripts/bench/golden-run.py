@@ -88,9 +88,9 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[2]
 SUBCOMMANDS = {'dsv4': 'dsv4-golden', 'v41': 'v41-golden', 'glm': 'glm-golden', 'glmf': 'glmf-golden',
                'mimo': 'mimo-golden', 'qwen4': 'qwen4-golden', 'qwen35': 'qwen35-golden',
-               'step5': 'step5-golden'}
+               'step5': 'step5-golden', 'kimi': 'kimi-golden'}
 # Families without a golden subcommand yet: native tests and commands only.
-RAW_FAMILIES = ('kimi',)
+RAW_FAMILIES = ()
 NAME = re.compile(r'[A-Za-z0-9][A-Za-z0-9_.-]*\Z')
 ENV_KEY = re.compile(r'[A-Za-z_][A-Za-z0-9_]*\Z')
 ANSI = re.compile(r'\x1b\[[0-9;]*m')

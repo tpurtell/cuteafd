@@ -18,6 +18,9 @@ struct LaneJoins<'a> {
     landed: RefCell<[Event<'a>; 2]>,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) enum Output { Normalized, Residual }
+
 /// Own these bindings for the engine lifetime, not in a temporary submission:
 /// recorded event nodes, streams and all exchanged operands must survive replay.
 /// The enclosing submission owner aborts all links before draining these streams.
@@ -71,11 +74,11 @@ impl<'a> Execution<'a> {
     }
 
     /// The family has no second scheduler: use the shared layer-major pipeline
-    /// for chunks sharing recurrent history, and return head-rank normalized rows.
+    /// for chunks sharing recurrent history, then materialize the selected terminal view.
     pub(crate) fn run<'e>(&'e self, scope: &crate::shared::experts::rtx::pair::SubmissionScope<'_>,
         peer: &'e PeerExchange<'a>, hops: &'e HopLink<'a>,
         locals: &'e mut [[LocalLane<'a>; 2]], routed: &'e mut [RoutedLane<'a>],
-        rows: &[usize], speculative: bool) -> Result<Vec<CuteafdDeviceBuffer>> {
+        rows: &[usize], speculative: bool, output: Output) -> Result<Vec<CuteafdDeviceBuffer>> {
         ensure!(!rows.is_empty() && rows.len() == locals.len() && rows.len() == routed.len(),
             "Kimi shared pipeline needs matching local, Spark and row lanes");
         let protocol = self.protocol(peer, hops)?;
@@ -84,7 +87,7 @@ impl<'a> Execution<'a> {
         ).collect::<Result<Vec<_>>>()?;
         crate::shared::peer_split::attention::layer_pipeline_with(scope, &self.plan, &protocol,
             crate::shared::peer_split::attention::LaneOrder::OrderedChunks, rows, &mut bindings)?;
-        bindings.iter_mut().map(Bindings::output).collect()
+        bindings.iter_mut().map(|binding| binding.output(output)).collect()
     }
 
     /// Validate every borrowed link before entering the shared executor. No
@@ -361,10 +364,13 @@ impl<'e, 'a> Bindings<'e, 'a> {
 
     /// Called after the shared pipeline, only on the head rank that owns the
     /// output score/norm weights. The other rank's stored history remains intact.
-    pub(crate) fn output(&mut self) -> Result<CuteafdDeviceBuffer> {
+    pub(crate) fn output(&mut self, output: Output) -> Result<CuteafdDeviceBuffer> {
         ensure!(self.pending.is_none() && self.completed == self.protocol.execution.plan.modes().len(),
-            "Kimi output requested before full layer completion");
-        self.local[1].residual(MixSite::Output, self.rows)
+            "Kimi output requested before admitted layer completion");
+        match output {
+            Output::Normalized => self.local[1].residual(MixSite::Output, self.rows),
+            Output::Residual => self.local[1].terminal_residual(self.rows),
+        }
     }
 }
 

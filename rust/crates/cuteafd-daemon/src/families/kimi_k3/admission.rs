@@ -15,6 +15,22 @@ const EXECUTOR: ExecutorModes = ExecutorModes { family: "kimi_k3", modes: MODES,
     hops: true, attention: AttentionPlacement::Layers };
 const FLOOR: u64 = 262_144;
 
+/// Diagnostic inventories retain checkpoint numerics and select only a prefix.
+pub(super) fn prefix(cfg: &KimiK3Config, layers: usize) -> Result<KimiK3Config> {
+    ensure!((1..=cfg.layers).contains(&layers), "Kimi prefix layer count outside checkpoint");
+    let mut selected = cfg.clone();
+    selected.layers = layers;
+    selected.attention.truncate(layers);
+    selected.dense.truncate(layers);
+    Ok(selected)
+}
+
+pub(super) fn check_prefix(full: &KimiK3Config, selected: &KimiK3Config) -> Result<()> {
+    ensure!(prefix(full, selected.layers)? == *selected,
+        "Kimi startup inventory differs from exact checkpoint prefix");
+    Ok(())
+}
+
 /// All demands are still future to the two post-module CUDA samples. The
 /// engine supplies its native programs' lane extents, exchange, graphs and
 /// page tables; global weights, token IO and state banks add their own demands.
@@ -85,13 +101,14 @@ impl<'a> Admission<'a> {
     /// The caller completes shared SparkAdmission reconciliation first. Keep
     /// one transport/intake owner per admitted lane; expired owners cannot be
     /// replaced by an uncharged second allocation.
-    pub(crate) fn connect_spark(&mut self, local: &LocalLane<'a>,
+    pub(crate) fn connect_spark(&mut self, library: &'a std::sync::Arc<cuteafd_ffi::NativeLibrary>,
+        local: &LocalLane<'a>,
         world: cuteafd_transport::expert::SparkWorld, peers: Vec<std::net::SocketAddr>,
         config: cuteafd_transport::TcpTransportConfig) -> Result<super::spark::RoutedLane<'a>> {
         let lane = local.lane_index();
         let expected = self.check_spark(lane)?;
         ensure!(Rc::ptr_eq(&expected, local.stream()), "Kimi Spark lane differs from admitted entry owner");
-        let routed = super::spark::RoutedLane::connect(local, &self.placement, world, peers, config)?;
+        let routed = super::spark::RoutedLane::connect(library, local, &self.placement, world, peers, config)?;
         self.spark_connected[lane] = true;
         Ok(routed)
     }
@@ -106,8 +123,7 @@ impl<'a> Admission<'a> {
     /// source tensor is read once for both ranks; no routed experts are loaded.
     pub(crate) fn load_weights(&mut self, devices: [Device<'a>; 2],
         checkpoint: &cuteafd_loader::plan::Checkpoint) -> Result<LoadedWeights<'a>> {
-        ensure!(KimiK3Config::from_hf(&checkpoint.config)? == self.cfg,
-            "Kimi startup checkpoint differs from admitted config");
+        check_prefix(&KimiK3Config::from_hf(&checkpoint.config)?, &self.cfg)?;
         for rank in 0..2 {
             self.check_global(rank, devices[rank].id)?;
             for layer in 0..self.cfg.layers { self.check_layer(rank, layer, devices[rank].id)?; }
@@ -151,7 +167,7 @@ impl<'a> Admission<'a> {
         programs: Rc<NativePrograms<'a>>) -> Result<LocalLane<'a>> {
         ensure!(rank < 2 && lane < self.lanes as usize && !self.local_bound[lane][rank],
             "Kimi local lane already bound or outside admission");
-        programs.check_config(&self.cfg)?;
+        programs.check_inventory(&self.cfg)?;
         let expected = self.lane_readers[lane][rank].upgrade().context("Kimi local binding requires admitted lane")?;
         ensure!(Rc::ptr_eq(&expected, &allocated.stream) && allocated.stream.device.id == self.devices[rank],
             "Kimi local binding differs from allocated lane owner");
@@ -160,7 +176,7 @@ impl<'a> Admission<'a> {
         let global = self.global_owners[rank].upgrade().context("Kimi local binding requires admitted global weights")?;
         let kda = self.kda_owners[rank].upgrade().context("Kimi local binding requires admitted KDA bank")?;
         let mla = self.mla_owners[rank].upgrade().context("Kimi local binding requires admitted MLA bank")?;
-        let binding = LocalLane::new(allocated, programs, layers, global, lane, kda, mla)?;
+        let binding = LocalLane::new(allocated, programs, self.cfg.clone(), layers, global, lane, kda, mla)?;
         self.local_bound[lane][rank] = true;
         Ok(binding)
     }
@@ -417,7 +433,10 @@ fn request(i: Inputs<'_>) -> Result<PlacementRequest> {
         pool, layers, pool_overhead: vec![0; 2], pool_bounded: i.pool_bounded, fixed, startup: i.startup, movables: vec![],
         expert_workspace: 0, tp2_workspace: [0; 2], onboard: Onboard::Layers(0), expert_gpus: 0, minimum_expert_layers: 0,
         policy: LayerPolicy { default: vec![LayerMode::HeadSplit], ownership: LayerOwnership::Alternating,
-            attention: vec![(AttentionClass::Mla, AttentionPlacement::Layers), (AttentionClass::Kda, AttentionPlacement::Heads)],
+            attention: [(KimiAttention::Mla, AttentionClass::Mla, AttentionPlacement::Layers),
+                (KimiAttention::Kda, AttentionClass::Kda, AttentionPlacement::Heads)].into_iter()
+                .filter(|(kind, _, _)| cfg.attention.contains(kind))
+                .map(|(_, class, placement)| (class, placement)).collect(),
             ..Default::default() },
         hops: hop_spec(cfg.hidden, i.rows, i.lanes), executor: EXECUTOR })
 }
@@ -443,6 +462,28 @@ mod tests {
                 super::super::device::NativeScratch { kda: 1024, mla: [512, 0, 1024] }).unwrap()); 2],
             fixed: (0..2).map(|rank| Demand::new(rank, Category::Workspace, "native engine buffers", 1 << 20, Basis::Exact)).collect(),
             startup: vec![], pool_bounded: vec![] }
+    }
+
+    #[test]
+    fn diagnostic_prefix_admits_only_selected_layers_and_uses_shared_plan() -> Result<()> {
+        let full = KimiK3Config::from_hf(&cuteafd_loader::plan::testing::kimi_k3_config())?;
+        for layers in [1, 2, 4, 5, 12, 92, 93] {
+            let selected = prefix(&full, layers)?;
+            check_prefix(&full, &selected)?;
+            let admitted = admit(inputs(&selected))?;
+            assert_eq!(admitted.execution_plan()?.modes().len(), layers);
+            assert_eq!(admitted.layouts.len(), layers);
+            assert_eq!(admitted.cfg, selected);
+            assert!(admitted.working_set().spark_layers.iter().all(|&layer| layer < layers));
+        }
+        for layers in [0, 94] { assert!(prefix(&full, layers).is_err()); }
+        let mut changed = prefix(&full, 4)?;
+        changed.rms_norm_eps *= 2.0;
+        assert!(check_prefix(&full, &changed).is_err());
+        let mut changed = prefix(&full, 4)?;
+        changed.attention[0] = KimiAttention::Mla;
+        assert!(check_prefix(&full, &changed).is_err());
+        Ok(())
     }
 
     #[test]
@@ -591,7 +632,7 @@ mod tests {
         assert!(admitted.check_layer(1, 0, 1).is_err());
         let source = include_str!("admission.rs").split("#[cfg(test)]").next().unwrap();
         let bind = source.split("pub(crate) fn bind_local").nth(1).unwrap().split("pub(crate) fn upload_global").next().unwrap();
-        assert!(bind.contains("programs.check_config(&self.cfg)?"));
+        assert!(bind.contains("programs.check_inventory(&self.cfg)?"));
         assert!(bind.contains("Rc::ptr_eq(&expected, &allocated.stream)"));
         assert!(bind.contains("self.layer_owners.iter()"));
         assert!(bind.contains("self.global_owners[rank].upgrade()"));
