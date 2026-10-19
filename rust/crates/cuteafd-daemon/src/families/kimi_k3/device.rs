@@ -191,6 +191,7 @@ impl<'a> NativePrograms<'a> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct LaneLayout {
     rows: usize,
+    max_context: usize,
     operands: BTreeMap<&'static str, usize>,
 }
 
@@ -237,7 +238,7 @@ impl LaneLayout {
         plane("KDA scratch", &[scratch.kda])?;
         for (name, bytes) in ["MLA producer scratch", "MLA attention scratch", "MLA output scratch"]
             .into_iter().zip(scratch.mla) { plane(name, &[bytes])?; }
-        let layout = Self { rows, operands };
+        let layout = Self { rows, max_context, operands };
         layout.bytes()?;
         Ok(layout)
     }
@@ -264,7 +265,9 @@ impl LaneLayout {
                 "Kimi allocated lane operand {name} differs from admitted extent/device");
             Ok((*name, allocation))
         }).collect::<Result<BTreeMap<_, _>>>()?;
-        Ok(Lane { stream: std::rc::Rc::new(stream), operands, layout: self.clone() })
+        let lane = Lane { stream: std::rc::Rc::new(stream), operands, layout: self.clone() };
+        lane.prime_attention()?;
+        Ok(lane)
     }
 }
 
@@ -291,12 +294,37 @@ impl Lane<'_> {
     }
 
     pub(crate) fn rows(&self) -> usize { self.layout.rows }
+
+    fn prime_attention(&self) -> Result<()> {
+        for name in ATTENTION_METADATA {
+            let buffer = self.buffer(name)?;
+            self.stream.device.run(|| {
+                // SAFETY: fresh admitted destinations and pinned sources stay live
+                // through the ordered copy; this runs before graph capture.
+                unsafe { self.stream.device.library.copy_h2d_ordered(buffer, &vec![0; buffer.bytes], self.stream.raw) }
+            })?;
+        }
+        self.stream.drain()
+    }
+
+    fn upload_attention(&self, metadata: &AttentionRows) -> Result<()> {
+        metadata.check_layout(&self.layout)?;
+        self.stream.device.run(|| {
+            for (name, bytes) in metadata.uploads() {
+                // SAFETY: this lane retains the fixed destination and stream;
+                // shared staging retains the pinned source outside capture.
+                // This is an ordered copy fence, not a compute drain.
+                unsafe { self.stream.device.library.copy_h2d_ordered(self.buffer(name)?, bytes, self.stream.raw)?; }
+            }
+            Ok(())
+        })
+    }
 }
 
 /// Persistent engine owner, not a per-layer guard. Retain the exact admitted
-/// weights/programs until teardown drains the lane; enqueue methods never wait.
-/// Peer ordering, attention metadata and complete Spark combination belong to
-/// the shared layer executor, not this rank-local operator binding.
+/// weights/programs until teardown drains the lane; native enqueue never waits.
+/// Metadata staging outside capture uses the shared ordered-copy source fence.
+/// Peer ordering and complete Spark combination belong to the shared executor.
 pub(crate) struct LocalLane<'a> {
     lane: Lane<'a>,
     programs: Rc<NativePrograms<'a>>,
@@ -305,6 +333,7 @@ pub(crate) struct LocalLane<'a> {
     lane_index: usize,
     kda: Rc<super::state::KdaBank<'a>>,
     mla: Rc<super::mla::CacheBank<'a>>,
+    attention: Option<AttentionShape>,
 }
 
 impl Drop for LocalLane<'_> {
@@ -323,7 +352,7 @@ impl<'a> LocalLane<'a> {
         global.check_device(device)?;
         kda.check_reader(lane_index, &lane.stream)?;
         mla.check_reader(lane_index, &lane.stream)?;
-        Ok(Self { lane, programs, layers, global, lane_index, kda, mla })
+        Ok(Self { lane, programs, layers, global, lane_index, kda, mla, attention: None })
     }
 
     fn layer(&self, layer: usize) -> Result<&super::weights::LayerWeights<'a>> {
@@ -339,6 +368,63 @@ impl<'a> LocalLane<'a> {
 
     /// External scheduling/staging uses only the admitted lane's actual owners.
     pub(crate) fn buffer(&self, name: &str) -> Result<CuteafdDeviceBuffer> { self.lane.buffer(name) }
+
+    /// Outside capture: replace metadata contents, never the admitted addresses.
+    /// The scheduler retains pages/slots and orders cross-lane users through
+    /// completion; a graph's identity uses row shape, not sequence partitions.
+    pub(crate) fn stage_attention(&mut self, sequences: &[SequenceRows<'_>],
+        pool: &cuteafd_engine::prefix::RefPagePool) -> Result<()> {
+        self.attention = None;
+        ensure!(!pool.is_parity() && pool.capacity().checked_add(pool.reserved()) == Some(self.mla.pages()),
+            "Kimi metadata page pool differs from admitted MLA bank");
+        let metadata = AttentionRows::new(sequences, self.lane.rows(), self.kda.slots(),
+            self.lane.layout.max_context, pool)?;
+        self.lane.upload_attention(&metadata)?;
+        self.attention = Some(AttentionShape { rows: metadata.rows, sequences: metadata.sequences });
+        Ok(())
+    }
+
+    /// Enqueue only rank-local attention. KDA and head-split MLA return a TP2
+    /// partial; whole MLA returns the owner's complete delta. The shared layer
+    /// executor owns the meet/publication and recurrent-slot ordering.
+    pub(crate) fn attention(&mut self, layer: usize, rows: usize, speculative: bool) -> Result<CuteafdDeviceBuffer> {
+        let shape = self.attention.ok_or_else(|| anyhow::anyhow!("Kimi attention metadata not staged"))?;
+        ensure!(shape.rows == rows && (!speculative || rows <= 64), "Kimi attention staged row shape/speculation");
+        let weights = self.layer(layer)?;
+        let output = self.plane("attention output", rows, 7168)?;
+        let device = self.lane.stream.device;
+        match self.programs.w8.cfg.attention.get(layer) {
+            Some(cuteafd_loader::families::kimi_k3::config::KimiAttention::Kda) => {
+                let [state, conv_state, replay] = self.kda.layer(layer, self.lane_index)?;
+                let weights = weights.kda()?;
+                let batch = cuteafd_ffi::KimiKdaBatch { rows, sequences: shape.sequences, state_slots: self.kda.slots(),
+                    speculative, input: self.plane("normalized", rows, 7168)?, state, conv_state,
+                    slots: self.lane.buffer("KDA slots")?, first: self.lane.buffer("KDA first")?,
+                    normalized: self.lane.buffer("KDA normalized")?, output,
+                    replay: (rows <= 64).then_some(replay), scratch: self.lane.buffer("KDA scratch")? };
+                device.run(|| { self.programs.kda[usize::from(rows > 64)].launch(weights, batch, self.lane.stream.raw)?; Ok(()) })?;
+            }
+            Some(cuteafd_loader::families::kimi_k3::config::KimiAttention::Mla) => {
+                let programs = &self.programs.mla[usize::from(weights.attention == crate::shared::placement::layers::AttentionShare::Whole)];
+                let program = if rows > 64 { &programs.extend } else if speculative { &programs.verify } else { &programs.decode };
+                let weights = weights.mla()?;
+                let batch = cuteafd_ffi::KimiMlaBatch { rows, requests: if rows <= 64 { rows } else { 1 },
+                    page_table_width: self.lane.layout.max_context.div_ceil(64), cache_pages: self.mla.pages(),
+                    active_splits: program.splits(), x: self.plane("normalized", rows, 7168)?,
+                    slots: self.lane.buffer("MLA slots")?, cache: self.mla.layer(layer)?,
+                    page_table: self.lane.buffer("MLA page table")?, lengths: self.lane.buffer("MLA lengths")?,
+                    query_offsets: self.lane.buffer("MLA query offsets")?, query: self.lane.buffer("MLA query")?,
+                    q_resid: self.lane.buffer("MLA q residual")?, attention: self.lane.buffer("MLA attention")?,
+                    lse: self.lane.buffer("MLA LSE")?, output,
+                    producer_scratch: self.lane.buffer("MLA producer scratch")?,
+                    attention_scratch: self.lane.buffer("MLA attention scratch")?,
+                    output_scratch: self.lane.buffer("MLA output scratch")? };
+                device.run(|| program.forward(layer, weights, batch, self.lane.stream.raw))?;
+            }
+            None => bail!("Kimi attention layer outside inventory"),
+        }
+        Ok(output)
+    }
 
     /// Seed only the mutable prefix from admitted embedded/delta rows. Slot 0
     /// is written by the first fused residual specialization, not a host copy.
@@ -438,6 +524,15 @@ pub(crate) struct SequenceRows<'p> {
     pub pages: &'p [u32],
 }
 
+const ATTENTION_METADATA: [&str; 6] = ["KDA slots", "KDA first", "MLA slots",
+    "MLA page table", "MLA lengths", "MLA query offsets"];
+
+#[derive(Clone, Copy)]
+struct AttentionShape {
+    rows: usize,
+    sequences: usize,
+}
+
 /// Host metadata is rebuilt outside capture, then copied into fixed lane buffers.
 /// For <=64 rows, MLA treats each query as one request with its own visible
 /// length, so the native request scalar depends only on rows, not partitions.
@@ -520,6 +615,16 @@ impl AttentionRows {
             }
         }
         Ok(metadata)
+    }
+
+    fn check_layout(&self, layout: &LaneLayout) -> Result<()> {
+        ensure!(self.rows <= layout.rows && self.width == layout.max_context.div_ceil(64),
+            "Kimi metadata differs from admitted row capacity/page stride");
+        for (name, bytes) in self.uploads() {
+            ensure!(layout.operands.get(name).is_some_and(|capacity| bytes.len() <= *capacity),
+                "Kimi metadata exceeds admitted operand {name}");
+        }
+        Ok(())
     }
 
     fn uploads(&self) -> [(&'static str, &[u8]); 6] {
@@ -725,7 +830,12 @@ mod tests {
         let cfg = cuteafd_loader::families::kimi_k3::config::KimiK3Config::from_hf(
             &cuteafd_loader::plan::testing::kimi_k3_config())?;
         let layout = LaneLayout::new(&cfg, 64, 256, NativeScratch { kda: 16, mla: [16; 3] })?;
+        metadata.check_layout(&layout)?;
         for (name, bytes) in metadata.uploads() { assert!(bytes.len() <= layout.operands[name]); }
+        let narrow = LaneLayout::new(&cfg, 64, 128, NativeScratch { kda: 16, mla: [16; 3] })?;
+        assert!(metadata.check_layout(&narrow).is_err());
+        let short = LaneLayout::new(&cfg, 4, 256, NativeScratch { kda: 16, mla: [16; 3] })?;
+        assert!(metadata.check_layout(&short).is_err());
         let single = AttentionRows::new(&[SequenceRows { slot: 0, start: 60, rows: 5, pages: &a }],
             64, 4, 256, &pool)?;
         assert_eq!(single.page_table.len(), metadata.page_table.len());
@@ -784,6 +894,61 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires CUTEAFD_NATIVE_LIFETIME_FIXTURE_DIR; CPU-only fake DSO"]
+    fn attention_uploads_reuse_primed_storage_and_retain_sources() -> Result<()> {
+        use cuteafd_ffi::native_library_lifetime_fixture::Fixture;
+        let fixture = Fixture::build()?;
+        let library = fixture.load()?;
+        let device = Device { library: &library, id: 1 };
+        let cfg = KimiK3Config::from_hf(&cuteafd_loader::plan::testing::kimi_k3_config())?;
+        let mut layout = LaneLayout::new(&cfg, 64, 128, NativeScratch { kda: 16, mla: [16; 3] })?;
+        layout.operands.retain(|name, _| ATTENTION_METADATA.contains(name));
+        let operands = device.run(|| layout.operands.iter().map(|(&name, &bytes)|
+            Ok((name, Allocation::new(device, bytes)?))).collect::<Result<BTreeMap<_, _>>>())?;
+        let lane = Lane { stream: Rc::new(Stream { device, raw: std::ptr::null_mut() }), operands, layout };
+        lane.prime_attention()?;
+        let primed = fixture.events()?;
+        assert_eq!(primed.matches('C').count(), 6);
+        assert_eq!(primed.matches('A').count(), 6);
+        let mut pool = cuteafd_engine::prefix::RefPagePool::new(4, 64);
+        let pages = pool.alloc(2)?;
+        let a = AttentionRows::new(&[SequenceRows { slot: 0, start: 63, rows: 2, pages: &pages }],
+            64, 2, 128, &pool)?;
+        let b = AttentionRows::new(&[SequenceRows { slot: 1, start: 62, rows: 2, pages: &pages }],
+            64, 2, 128, &pool)?;
+        let pointers = ATTENTION_METADATA.map(|name| lane.buffer(name).unwrap().ptr);
+        lane.upload_attention(&a)?;
+        lane.upload_attention(&b)?;
+        // The fixture defers DMA until a fence: staging B completes A's copy,
+        // but must not overwrite A's pinned source before that completion.
+        for (name, bytes) in a.uploads() {
+            let buffer = lane.buffer(name)?;
+            // SAFETY: CPU fake DSO allocated ordinary host memory and the
+            // previous ordered-copy fence initialized exactly these bytes.
+            let actual = unsafe { std::slice::from_raw_parts(buffer.ptr.cast::<u8>(), bytes.len()) };
+            assert_eq!(actual, bytes);
+        }
+        let reused = fixture.events()?;
+        assert_eq!(reused.matches('C').count(), 6);
+        assert_eq!(reused.matches('A').count(), 6);
+        assert_eq!(reused.matches('D').count(), 6);
+        assert_eq!(ATTENTION_METADATA.map(|name| lane.buffer(name).unwrap().ptr), pointers);
+        let mut wrong = b;
+        wrong.width += 1;
+        assert!(lane.upload_attention(&wrong).is_err());
+        assert_eq!(fixture.events()?, reused, "reject bad stride before any upload");
+        wrong.width -= 1;
+        fixture.finish_ordered_uploads(&library)?;
+        for (name, bytes) in wrong.uploads() {
+            let buffer = lane.buffer(name)?;
+            // SAFETY: the fixture's explicit completion initialized these live buffers.
+            let actual = unsafe { std::slice::from_raw_parts(buffer.ptr.cast::<u8>(), bytes.len()) };
+            assert_eq!(actual, bytes);
+        }
+        Ok(())
+    }
+
+    #[test]
     fn persistent_local_lane_never_drains_per_operator_and_keeps_device_routes() {
         let source = include_str!("device.rs").split("#[cfg(test)]").next().unwrap();
         let owner = source.split("pub(crate) struct LocalLane").nth(1).unwrap().split("/// Head handles").next().unwrap();
@@ -813,7 +978,7 @@ mod tests {
         let stream = Rc::new(Stream { device, raw: std::ptr::null_mut() });
         let lane = Lane { stream: stream.clone(),
             operands: BTreeMap::from([("delta", Allocation::new(device, 16)?)]),
-            layout: LaneLayout { rows: 1, operands: BTreeMap::from([("delta", 16)]) } };
+            layout: LaneLayout { rows: 1, max_context: 64, operands: BTreeMap::from([("delta", 16)]) } };
         assert!(!fixture.events()?.contains('d'));
         drop(lane);
         let events = fixture.events()?;
