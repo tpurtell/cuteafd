@@ -174,8 +174,8 @@ impl SparkAssignment {
                     plan.device_arena_layout()?.1 as u64
                 }
                 SparkResidentLayout::Fp8 { world, rank, slicing } => {
-                    let tensors = catalog.fp8().context("Spark FP8-family layout needs checkpoint weight/scale headers")?;
-                    tensors.validate_layer(layer)?;
+                    let tensors = catalog.fp8().context("Spark FP8-family layout needs checkpoint weight/scale headers")?
+                        .for_layer(layer)?;
                     let (first, width) = tensors.rank_range_with(world, rank, slicing)?;
                     slice.first = u32::try_from(first)?;
                     slice.width = u32::try_from(width)?;
@@ -373,6 +373,57 @@ mod tests {
             assert_eq!(empty.resident_bytes, 0);
             assert!(empty.slices.is_empty());
             assert_eq!(empty.io, SparkIoBytes::default());
+        }
+    }
+
+    #[test]
+    fn header_assignment_uses_each_layers_native_storage_format() {
+        use crate::formats::fp8_experts::Slicing;
+        use crate::plan::testing::{fp8, t, mimo_flash_config, write_snapshot};
+        use cuteafd_core::{SparkEndpoint, SparkIngress, SparkRings};
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = mimo_flash_config();
+        config["num_hidden_layers"] = 3.into();
+        config["hybrid_layer_pattern"] = serde_json::json!([0, 1, 1]);
+        config["moe_layer_freq"] = serde_json::json!([0, 1, 1]);
+        config["n_routed_experts"] = 2.into();
+        config["num_experts_per_tok"] = 1.into();
+        let mut tensors = Vec::new();
+        for layer in [1, 2] {
+            for expert in 0..2 {
+                for (name, rows, cols) in [("gate", 2048, 4096), ("up", 2048, 4096), ("down", 4096, 2048)] {
+                    let prefix = format!("model.layers.{layer}.mlp.experts.{expert}.{name}_proj");
+                    if layer == 1 { tensors.extend(fp8(&prefix, rows, cols, None)); }
+                    else { tensors.push(t(format!("{prefix}.weight"), "BF16", &[rows, cols])); }
+                }
+            }
+        }
+        write_snapshot(dir.path(), &config, &tensors, None);
+        let catalog = crate::read_expert_catalog(dir.path()).unwrap();
+        let endpoints = [SparkEndpoint { capacity: 64, ingress: SparkIngress::Bf16 }];
+        let rings = SparkRings { max_frame_bytes: 64 << 20, depth: 8, slot_bytes: 8 << 20, alignment: 4096 };
+        for world in [4, 6] {
+            for rank in 0..world {
+                let layout = SparkResidentLayout::Fp8 { world, rank, slicing: Slicing::Blocks(128) };
+                let assign = |layers| SparkAssignment::from_catalog(&catalog,
+                    &SparkWorkingSet { spark_layers: layers, spark_ranks: world,
+                        prefill_lanes: 1, ..Default::default() }, rank, layout, &endpoints, rings).unwrap();
+                let fp8 = assign(vec![1]);
+                let original = catalog.fp8().unwrap();
+                original.validate_layer(1).unwrap();
+                assert_eq!(fp8.resident_bytes,
+                    (original.weight_read_bytes_with(world, rank, Slicing::Blocks(128)).unwrap()
+                        * original.shape().experts) as u64);
+                let bf16 = assign(vec![2]);
+                let mixed = assign(vec![1, 2]);
+                let slice = &bf16.slices[0];
+                assert_eq!(bf16.resident_bytes, 3 * 4096 * u64::from(slice.stored_width) * 2 * 2);
+                assert_eq!(mixed.resident_bytes, fp8.resident_bytes + bf16.resident_bytes);
+                assert_eq!(mixed.slices, [fp8.slices[0].clone(), slice.clone()]);
+                assert_eq!((slice.first, slice.width, slice.stored_width),
+                    (fp8.slices[0].first, fp8.slices[0].width, fp8.slices[0].stored_width));
+                assert_eq!(mixed.io, bf16.io);
+            }
         }
     }
 

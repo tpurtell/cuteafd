@@ -447,9 +447,14 @@ fn spark_admission_is_scoped_to_qualified_native_layers() {
             }
         }
         for world in [4, 6] {
-            for layers in [vec![88], vec![89], vec![90], (3..91).collect()] {
-                let error = format!("{:#}", checkpoint_spark_recipe(&cp, world, &layers).unwrap_err());
-                assert!(error.contains("BF16-tail"), "{error}");
+            for layers in [vec![88], vec![89], vec![90], (88..91).collect()] {
+                assert_eq!(checkpoint_spark_recipe(&cp, world, &layers).unwrap(),
+                    spark_recipe("step5:bf16", 1536, world).unwrap());
+            }
+            if kind == "fp8" {
+                assert!(checkpoint_spark_recipe(&cp, world, &(3..91).collect::<Vec<_>>()).is_ok());
+            } else {
+                assert!(checkpoint_spark_recipe(&cp, world, &(3..91).collect::<Vec<_>>()).is_err());
             }
             for layers in [vec![], vec![3, 3], vec![4, 3], vec![0], vec![91], vec![95]] {
                 assert!(checkpoint_spark_recipe(&cp, world, &layers).is_err());
@@ -486,4 +491,22 @@ fn routed_admission_rechecks_operand_shape_scale_and_role() {
     }
     assert!(model.accepts(&TensorRole::layer(Component::RoutedExpert, 4), stem, &mut operand.clone()).is_err());
     assert!(model.accepts(&TensorRole::layer(Component::DenseFfn, 3), stem, &mut operand.clone()).is_err());
+    for layer in 88..91 {
+        let stem = format!("model.layers.{layer}.moe.gate_proj");
+        let operand = format::detect(&groups[&stem]).unwrap();
+        let role = TensorRole::layer(Component::RoutedExpert, layer);
+        assert!(model.accepts(&role, &stem, &mut operand.clone()).is_ok());
+        for mutation in 0..5 {
+            let mut wrong = operand.clone();
+            match mutation {
+                0 => wrong.logical[0] -= 1,
+                1 => wrong.stored[0] -= 1,
+                2 => wrong.encoding = format::Encoding::F16,
+                3 => wrong.companions.push("bias".into()),
+                _ => wrong.scale = format::detect(&groups["model.layers.3.moe.gate_proj"]).unwrap().scale,
+            }
+            assert!(model.accepts(&role, &stem, &mut wrong).is_err());
+        }
+        assert!(model.accepts(&TensorRole::layer(Component::RoutedExpert, 3), &stem, &mut operand.clone()).is_err());
+    }
 }

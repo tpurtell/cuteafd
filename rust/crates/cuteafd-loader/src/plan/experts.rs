@@ -189,7 +189,8 @@ pub fn spark_recipe(package: &str, intermediate: usize, world: usize) -> Result<
     let nvfp4 = matches!(format, "nvfp4" | "nvfp4a4") && matches!(family, "v41" | "glm" | "glmf" | "qwen4");
     let mxfp4 = (format == "mxfp4" && native) || (format == "fp8" && matches!(family, "mimof" | "mimop"));
     let fp8 = format == "fp8" && matches!(family, "mimo" | "glm" | "glmf" | "qwen4" | "step5");
-    if !(exl3 || nvfp4 || mxfp4 || fp8) {
+    let bf16 = family == "step5" && format == "bf16";
+    if !(exl3 || nvfp4 || mxfp4 || fp8 || bf16) {
         return Err(SparkRecipeRefusal::UnknownPackage(package.into()));
     }
     // V4.1 EXL3 TP6 remains unqualified pending a capped-local fidelity gate.
@@ -311,7 +312,11 @@ mod tests {
         assert_eq!(spark_worlds("step5:fp8", 1536), [4, 6]);
         for world in 0..=8 {
             if !matches!(world, 4 | 6) { assert!(spark_recipe("step5:fp8", 1536, world).is_err()); }
-            for format in ["nvfp4", "nvfp4a4", "bf16", "mxfp4", "exl3-k34"] {
+            if matches!(world, 4 | 6) {
+                assert_eq!(spark_recipe("step5:bf16", 1536, world).unwrap(),
+                    spark_recipe("step5:fp8", 1536, world).unwrap());
+            } else { assert!(spark_recipe("step5:bf16", 1536, world).is_err()); }
+            for format in ["nvfp4", "nvfp4a4", "mxfp4", "exl3-k34"] {
                 assert!(spark_recipe(&format!("step5:{format}"), 1536, world).is_err());
             }
         }

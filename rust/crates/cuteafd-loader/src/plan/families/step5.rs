@@ -393,10 +393,18 @@ impl FamilyModel for Model {
         }
         if role.component == Component::RoutedExpert {
             let contract = self.tensors.get(&format!("{stem}.weight"));
-            if role.layer.is_some_and(|layer| (3..88).contains(&layer))
-                && contract.is_some_and(|tensor| tensor.role == *role && tensor.dtype == DType::F8E4M3
-                    && tensor.shape == operand.logical && tensor.shape == operand.stored)
+            let shape_matches = contract.is_some_and(|tensor| tensor.role == *role
+                && tensor.shape == operand.logical && tensor.shape == operand.stored);
+            if shape_matches && role.layer.is_some_and(|layer| (3..88).contains(&layer))
+                && contract.is_some_and(|tensor| tensor.dtype == DType::F8E4M3)
                 && operand.is_fp8_block(128, &[crate::plan::format::ScaleEncoding::F32]) {
+                return Ok(());
+            }
+            if shape_matches && role.layer.is_some_and(|layer| (88..91).contains(&layer))
+                && contract.is_some_and(|tensor| tensor.dtype == DType::Bf16)
+                && operand.encoding == crate::plan::format::Encoding::Bf16
+                && operand.scale.is_none() && operand.global_scale.is_none()
+                && operand.input_scale.is_none() && operand.companions.is_empty() {
                 return Ok(());
             }
         }
@@ -404,9 +412,16 @@ impl FamilyModel for Model {
         Err(format!("{stem}: {}: {}", hint.what, hint.how))
     }
     fn experts(&self, operand: &QuantOperand) -> Option<ExpertContract> {
-        operand.is_fp8_block(128, &[crate::plan::format::ScaleEncoding::F32]).then(|| ExpertContract {
-            package: "step5:fp8".into(), block: 128,
-            spark_worlds: crate::plan::experts::spark_worlds("step5:fp8", self.cfg.intermediate),
+        let package = if operand.is_fp8_block(128, &[crate::plan::format::ScaleEncoding::F32]) {
+            "step5:fp8"
+        } else if operand.encoding == crate::plan::format::Encoding::Bf16
+            && operand.scale.is_none() && operand.global_scale.is_none()
+            && operand.input_scale.is_none() && operand.companions.is_empty() {
+            "step5:bf16"
+        } else { return None; };
+        Some(ExpertContract {
+            package: package.into(), block: 128,
+            spark_worlds: crate::plan::experts::spark_worlds(package, self.cfg.intermediate),
             local: Err("Step-5 coordinator-local routed experts are not qualified".into()),
         })
     }
