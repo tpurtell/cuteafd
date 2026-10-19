@@ -304,6 +304,20 @@ fn release<P: Placement, M: Clone + Default, F: PrefixFamily<M, Placement = P>>(
     slots.push(placement.slot());
 }
 
+/// Verify and selection can fail before synchronizing their streams. Cache
+/// dirtiness tracks prefix copies, not backend writes, so drain unconditionally.
+/// On either failure, retain both the page references and the state slot.
+fn release_failed<P: Placement, M: Clone + Default, F: PrefixFamily<M, Placement = P>,
+    E: cuteafd_hostcache::copy::CopyEngine>(family: &F, cache: &mut PrefixCache<E, M>,
+    slots: &mut Vec<i32>, placement: &P) -> std::result::Result<(), cuteafd_engine::prefix::PrefixError> {
+    family.drain().map_err(|source| cuteafd_engine::prefix::PrefixError::Family {
+        what: "failed step drain", source,
+    })?;
+    cache.release(family, placement.units())?;
+    slots.push(placement.slot());
+    Ok(())
+}
+
 #[derive(Clone, Copy, Default, serde::Serialize)]
 struct VerifyBucket {
     steps: u64,
@@ -1014,7 +1028,10 @@ pub(crate) fn schedule<'a, B: Backend<'a>>(engine: &B, snapshot: &std::path::Pat
                 for request in active.drain(..) {
                     if let Some(shared) = shared.as_mut() { shared.release(request.ticket.id()); }
                     let _ = request.job.events.send(Err(NativeFailure::Worker(format!("{error:#}"))));
-                    release(&family, &mut cache, &mut free_slots, &request.placement, geometry.family);
+                    if let Err(error) = release_failed(&family, &mut cache, &mut free_slots, &request.placement) {
+                        tracing::error!(%error, family = geometry.family, slot = request.placement.slot(),
+                            "failed step units and state slot quarantined");
+                    }
                 }
                 continue;
             }
@@ -1185,6 +1202,120 @@ fn media_failure(error: cuteafd_engine::media::MediaError) -> cuteafd_api::opena
     }
 }
 
+
+#[cfg(test)]
+mod failed_release_tests {
+    use super::*;
+    use cuteafd_engine::prefix::{After, BoxError, FamilyLayout, MarkSlot, MarkStore,
+        PageOwners, PrefixConfig, ReuseRule, TailCopy};
+    use cuteafd_hostcache::copy::{DeviceRange, StubCopyEngine};
+    use std::cell::Cell;
+
+    #[derive(Clone)]
+    struct Placed { pages: Vec<u32>, slot: i32 }
+    impl Placement for Placed {
+        fn len(&self) -> usize { 64 }
+        fn set_len(&mut self, _: usize) {}
+        fn units(&self) -> &[u32] { &self.pages }
+        fn slot(&self) -> i32 { self.slot }
+        fn spans(&self) -> &[cuteafd_core::MediaSpan] { &[] }
+    }
+
+    #[derive(Default)]
+    struct Queued {
+        writes: RefCell<Vec<u32>>,
+        landed: RefCell<Vec<u32>>,
+        drains: Cell<usize>,
+        fail_on: Cell<usize>,
+    }
+    impl PrefixFamily for Queued {
+        type Placement = Placed;
+        fn layout(&self) -> FamilyLayout {
+            FamilyLayout { page_rows: 64, pages: 2, page_bytes: 64, mark_bytes: 0,
+                draft_bytes: 0, rule: ReuseRule::EXACT, mark_store: MarkStore::Arena,
+                page_owners: PageOwners::Uniform }
+        }
+        fn pages<'p>(&self, placement: &'p Placed) -> &'p [u32] { &placement.pages }
+        fn commit_point(&self, _: &Placed) -> usize { 64 }
+        fn capture(&self, _: MarkSlot, _: &Placed, _: usize) -> Result<(), BoxError> { Ok(()) }
+        fn restore(&self, _: Option<MarkSlot>, _: &mut Placed, _: usize) -> Result<(), BoxError> { Ok(()) }
+        fn copy_rows(&self, _: TailCopy) -> Result<(), BoxError> { Ok(()) }
+        fn drain(&self) -> Result<(), BoxError> {
+            let call = self.drains.get() + 1;
+            self.drains.set(call);
+            if self.fail_on.get() == call { return Err("injected drain failure".into()); }
+            self.landed.borrow_mut().extend(self.writes.borrow_mut().drain(..));
+            Ok(())
+        }
+        fn page_segments(&self, _: u32) -> Vec<DeviceRange> { Vec::new() }
+        fn mark_segments(&self, _: MarkSlot) -> Vec<DeviceRange> { Vec::new() }
+    }
+
+    fn admit(family: &Queued) -> (PrefixCache<StubCopyEngine>, Placed) {
+        let mut cache = PrefixCache::new(family.layout(), PrefixConfig {
+            entries: 1, mark_slots: 0, keep_logits: false, min_tokens: 0,
+        }, None).unwrap();
+        let placement = cache.admit_cold(family, 64, 64, |pages| Placed { pages, slot: 7 })
+            .unwrap().placement;
+        (cache, placement)
+    }
+
+    #[test]
+    fn failed_step_drains_backend_writes_with_a_clean_prefix_cache_before_reuse() {
+        let family = Queued::default();
+        let (mut cache, placement) = admit(&family);
+        let mut slots = Vec::new();
+        family.writes.borrow_mut().extend(&placement.pages);
+        assert_eq!(family.drains.get(), 0);
+        assert_eq!(cache.pool().refs(placement.pages[0]), 1);
+        release_failed(&family, &mut cache, &mut slots, &placement).unwrap();
+        assert_eq!(family.drains.get(), 1);
+        assert!(family.writes.borrow().is_empty());
+        assert_eq!(*family.landed.borrow(), placement.pages);
+        assert_eq!(slots, [7]);
+        assert_eq!(cache.pool().free(), 2);
+        let next = cache.admit_cold(&family, 64, 64, |pages| Placed { pages, slot: slots.pop().unwrap() })
+            .unwrap().placement;
+        assert_eq!(next.pages, placement.pages);
+        assert_eq!(next.slot, 7);
+    }
+
+    #[test]
+    fn failed_step_quarantines_pages_and_slot_when_unconditional_drain_fails() {
+        let family = Queued::default();
+        let (mut cache, placement) = admit(&family);
+        let mut slots = vec![9];
+        family.writes.borrow_mut().extend(&placement.pages);
+        family.fail_on.set(1);
+        assert!(release_failed(&family, &mut cache, &mut slots, &placement).is_err());
+        assert_eq!(family.drains.get(), 1);
+        assert_eq!(*family.writes.borrow(), placement.pages);
+        assert!(family.landed.borrow().is_empty());
+        assert_eq!(slots, [9]);
+        assert_eq!(cache.pool().refs(placement.pages[0]), 1);
+        assert_eq!(cache.pool().free(), 1);
+        let next = cache.admit_cold(&family, 64, 64, |pages| Placed { pages, slot: 9 })
+            .unwrap().placement;
+        assert_ne!(next.pages, placement.pages);
+    }
+
+    #[test]
+    fn failed_step_keeps_slot_and_page_references_when_cache_release_fails() {
+        let family = Queued::default();
+        let (mut cache, placement) = admit(&family);
+        // Capture makes the cache dirty; its release performs a second drain.
+        cache.capture(&family, SnapshotKind::Prompt, &[1; 64], &placement, After::default()).unwrap();
+        assert_eq!(family.drains.get(), 0);
+        assert_eq!(cache.pool().refs(placement.pages[0]), 2);
+        family.fail_on.set(2);
+        let mut slots = vec![9];
+        assert!(release_failed(&family, &mut cache, &mut slots, &placement).is_err());
+        assert_eq!(family.drains.get(), 2);
+        assert_eq!(slots, [9]);
+        assert_eq!(cache.pool().refs(placement.pages[0]), 2);
+        assert_eq!(cache.pool().free(), 1);
+    }
+}
 
 #[cfg(test)]
 mod media_failure_tests {
