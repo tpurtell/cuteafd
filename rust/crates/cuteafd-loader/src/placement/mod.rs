@@ -32,7 +32,7 @@ mod tests;
 pub use inventory::{loaded_code, ArchContext, GraphRank, GraphSet, Lifetime, LoadedCode, ProgramSet, RuntimeSample, ARCH_CONTEXTS};
 pub use pool::PoolPolicy;
 pub use residual::{validate_layer_pipeline_lanes, LAYER_PIPELINE_MAX_LANES, hop_buffer_bytes, plan_hops, residual_homes, Hop, HopKind, HopPoint, HopSpec, HopStorage, LayerExecutionPlan, LayerPlanError, ResidualHome, RoutedReplication, TerminalHome, Transition, HOP_SLOTS};
-pub use solve::{solve, solve_frozen};
+pub use solve::{solve, solve_frozen, solve_with_marks, MarkSelection};
 pub use attention::{AttentionPlacement, ContextBuffers, ContextExchangeLayout, KvDemand, LayerOwnership, CONTEXT_EXCHANGES};
 
 /// What a request asks of the hardware, built by a family from its own
@@ -622,6 +622,8 @@ impl std::fmt::Display for PoolLimits {
 pub enum PlacementError {
     #[error("placement inventory is invalid: {0}")]
     Inventory(&'static str),
+    #[error("placement cannot retain the minimum {minimum} complete exact-restore marks after fixed floors: {reason}")]
+    PrefixMarks { minimum: u64, reason: String },
     #[error("explicit KV pool of {requested} tokens does not fit beside admitted demands (fits {fit}); {limits}")]
     PoolDoesNotFit { requested: u64, fit: u64, limits: PoolLimits },
     #[error("{family} drafter was placed on rtx{gpu}, where this build has no executor for it")]

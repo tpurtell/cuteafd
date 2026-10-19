@@ -3,6 +3,78 @@
 use super::*;
 use cuteafd_core::memory_layout::{Basis, Category, Item};
 
+/// Retained marks are optional only after every non-mark demand and the
+/// requested KV floor have been admitted. Existing callers keep their legacy count.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MarkSelection {
+    pub legacy_slots: u64,
+    pub slots: u64,
+    pub reduction_reason: Option<String>,
+}
+
+impl MarkSelection {
+    pub fn summary(&self) -> String {
+        match &self.reduction_reason {
+            None => format!("prefix marks: legacy, {} complete marks (reservation fits)", self.slots),
+            Some(reason) => format!("prefix marks: capacity-constrained, {} -> {} complete marks; \
+                concurrency/state, weights/workspaces and KV floor retained; {reason}", self.legacy_slots, self.slots),
+        }
+    }
+}
+
+/// `per_slot` names the exact per-GPU demands already charged in `request.fixed`
+/// at `legacy_slots`. Only those demands may change during constrained selection.
+pub fn solve_with_marks(request: &PlacementRequest, legacy_slots: u64, minimum_slots: u64,
+    per_slot: &[Demand]) -> Result<(Placement, MarkSelection), PlacementError> {
+    if minimum_slots == 0 || legacy_slots < minimum_slots || per_slot.is_empty()
+        || per_slot.iter().any(|d| d.category != Category::Prefix || d.bytes == 0) {
+        return Err(PlacementError::Inventory("invalid capacity-constrained mark inventory"));
+    }
+    for (index, mark) in per_slot.iter().enumerate() {
+        if per_slot[..index].iter().any(|d| d.gpu == mark.gpu && d.group == mark.group) {
+            return Err(PlacementError::Inventory("duplicate per-slot mark demand"));
+        }
+        let matching = request.fixed.iter().filter(|d| d.gpu == mark.gpu && d.group == mark.group).collect::<Vec<_>>();
+        if matching.len() != 1 || matching[0].category != Category::Prefix
+            || matching[0].bytes != mark.bytes.checked_mul(legacy_slots).ok_or(PlacementError::Overflow("legacy marks"))? {
+            return Err(PlacementError::Inventory("legacy mark reservation differs from per-slot inventory"));
+        }
+    }
+    let trial = |slots| {
+        let mut candidate = request.clone();
+        for mark in per_slot {
+            let demand = candidate.fixed.iter_mut().find(|d| d.gpu == mark.gpu && d.group == mark.group).unwrap();
+            demand.bytes = mark.bytes.checked_mul(slots).ok_or(PlacementError::Overflow("retained marks"))?;
+        }
+        let placement = solve(&candidate)?;
+        let floor = request.pool.requested.unwrap_or(request.pool.floor);
+        if placement.pool_tokens < floor {
+            return Err(PlacementError::BelowFloor { pool: placement.pool_tokens, floor,
+                layers: placement.onboard_layers, short: floor - placement.pool_tokens,
+                limits: placement.pool_limits.clone() });
+        }
+        Ok(placement)
+    };
+    let capacity_error = |error: &PlacementError| matches!(error,
+        PlacementError::PoolDoesNotFit { .. } | PlacementError::StartupPeak { .. }
+        | PlacementError::Mandatory { .. } | PlacementError::ExpertLayers { .. }
+        | PlacementError::BelowFloor { .. } | PlacementError::SparkFree { .. });
+    let reason = match trial(legacy_slots) {
+        Ok(placement) => return Ok((placement, MarkSelection { legacy_slots, slots: legacy_slots, reduction_reason: None })),
+        Err(error) if capacity_error(&error) => error.to_string(),
+        Err(error) => return Err(error),
+    };
+    // Descend rather than assume the discrete owner/onboard chooser is monotone.
+    for slots in (minimum_slots..legacy_slots).rev() {
+        match trial(slots) {
+            Ok(placement) => return Ok((placement, MarkSelection { legacy_slots, slots, reduction_reason: Some(reason) })),
+            Err(error) if capacity_error(&error) => {},
+            Err(error) => return Err(error),
+        }
+    }
+    Err(PlacementError::PrefixMarks { minimum: minimum_slots, reason })
+}
+
 /// Places `request`. Pure arithmetic over the request: the planner and the
 /// runtime get the same answer for the same inputs.
 pub fn solve(request: &PlacementRequest) -> Result<Placement, PlacementError> {

@@ -100,7 +100,7 @@ pub(crate) fn load<'a>(library: &'a Arc<cuteafd_ffi::NativeLibrary>,
         tracing::info!(executables = set.keys.len(), bytes0 = set.inventory.bytes(0),
             bytes1 = set.inventory.bytes(1), reserve = "estimated", "Kimi startup graph inventory");
     }
-    tracing::info!(placement = %admitted.placement.summary(), "Kimi admitted whole expert ownership");
+    tracing::info!(placement = %admitted.placement.summary(), marks = %admitted.mark_selection.summary(), "Kimi admitted whole expert ownership");
     let plan = admitted.execution_plan()?;
     let admission_free = inventory.gpus.iter().map(|sample| sample.free_bytes).collect::<Vec<_>>();
     let admitted_bytes = admitted.placement.items.iter().map(|items| items.iter().map(|item| item.bytes).sum::<u64>())
