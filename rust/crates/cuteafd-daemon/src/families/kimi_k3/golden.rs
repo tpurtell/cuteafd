@@ -300,7 +300,7 @@ fn native(args: &GoldenArgs, checkpoint: &cuteafd_loader::plan::Checkpoint,
         &library, &programs, checkpoint, full, cfg, super::startup::Options {
             devices: [args.device, args.split_device], native_lib: args.native_lib.as_deref().context("--native-lib required")?,
             peers: args.peers.clone(), rtx_expert_layers: args.rtx_expert_layers,
-            rows, slots: 1, marks: 1, max_context: 1_048_576, pool_tokens: Some(262_144), graphs: false,
+            rows, slots: 1, marks: 1, max_context: 1_048_576, pool_tokens: Some(1_048_576), graphs: false,
             ffn_mode: args.ffn_mode(), hosted_layers: Some(hosted_layers(&std::env::var("CUTEAFD_GOLDEN_EXPERT_LAYERS")?)?),
         })?;
     use cuteafd_engine::prefix::PrefixFamily;
@@ -609,7 +609,7 @@ mod tests {
             capacity_bytes: 96 << 30, headroom_bytes: 2 << 30,
             baseline: cuteafd_loader::placement::Baseline::Measured { free_bytes: (96 << 30) - reserve } }; 2],
             devices: [0, 1], peer_access: true, spark_ranks: 6, attention: None,
-            requested_pool: Some(262144), state_slots: 1, prefix_marks: 1, rows, lanes: 1,
+            requested_pool: Some(1_048_576), state_slots: 1, prefix_marks: 1, rows, lanes: 1,
             lane_layouts: vec![std::array::from_fn(|_| super::super::device::LaneLayout::new(&cfg, rows,
                 1048576, native_scratch).unwrap())], fixed, startup: vec![], pool_bounded: vec![], rtx: Some(rtx) })?;
         assert_eq!(admitted.working_set().rtx_layers, [1, 2, 3, 4, 5]);

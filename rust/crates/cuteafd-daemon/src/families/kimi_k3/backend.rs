@@ -35,6 +35,7 @@ impl<'e, 'a> Backend<'a> for KimiBackend<'e, 'a> {
     type History = ();
     type Coordinates = ();
     type Encoder = crate::shared::qwen::Encoder;
+    type Meta = ();
     type Prefix = KimiPrefix<'a>;
 
     fn geometry(&self) -> scheduler::Geometry {

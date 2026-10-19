@@ -500,7 +500,7 @@ mod tests {
             "tail_bitwise_zero":true, "tail_sha256":digest(&[0u8;128])})).collect();
         let manifest = json!({"family":"kimi_k3", "set_sha256":"sealed", "vocab":163840,
             "root_checkpoint":{"id":"moonshotai/Kimi-K3", "revision":revision}});
-        let qualification = json!({"schema":"cuteafd.fidelity.qualification/1", "kind":"reference",
+        let qualification = json!({"schema":"cuteafd.fidelity.qualification/1", "kind":"reference_only",
             "set_sha256":"sealed", "qualifies":true, "engine_parity":false, "nll":0.7, "scored_tokens":32768,
             "reference_validation":{"passed":true,"engine_parity":false,"set_sha256":"sealed",
                 "scored_tokens":32768,"nll":0.7,"golden_seal_sha256":"e".repeat(64),"full_seal_sha256":"f".repeat(64)},
@@ -518,7 +518,7 @@ mod tests {
     #[test]
     fn kimi_reference_native_source_and_padding_qualify() {
         let (qualification, manifest) = kimi_reference_qualification();
-        assert_eq!(qualification_label(&qualification, &manifest).unwrap(), "reference");
+        assert_eq!(qualification_label(&qualification, &manifest).unwrap(), "reference-only qualified");
     }
 
     macro_rules! kimi_hash_test {

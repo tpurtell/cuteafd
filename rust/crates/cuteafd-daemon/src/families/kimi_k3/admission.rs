@@ -11,7 +11,6 @@ use cuteafd_loader::{families::kimi_k3::config::{KimiAttention, KimiK3Config}, p
 
 const EXECUTOR: ExecutorModes = families::KIMI_K3;
 const MODES: &[LayerMode] = EXECUTOR.modes;
-const FLOOR: u64 = 262_144;
 
 /// Diagnostic inventories retain checkpoint numerics and select only a prefix.
 pub(super) fn prefix(cfg: &KimiK3Config, layers: usize) -> Result<KimiK3Config> {
@@ -430,8 +429,6 @@ fn request(i: Inputs<'_>) -> Result<PlacementRequest> {
         && (1..=2).contains(&i.lanes), "Kimi native admission slot/prefix/row/lane geometry");
     ensure!(cfg.kda_heads == 96 && cfg.kda_head_dim == 128 && cfg.kda_conv == 4
         && cfg.mla_record_values() * 2 == MLA_RECORD_BYTES, "Kimi native state/cache geometry");
-    ensure!(i.requested_pool.filter(|n| *n > 0).is_none_or(|n| n >= FLOOR),
-        "Kimi pool cannot be below the 256K agentic floor");
     ensure!(i.gpus.iter().all(|gpu| matches!(gpu.baseline, Baseline::Measured { .. })),
         "Kimi runtime admission needs post-module CUDA samples");
     // Only startup graphs carry a temporary estimate pending the first serving
@@ -576,14 +573,19 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn automatic_pool_preserves_compiled_context_and_explicit_diagnostic_pool_stays_strict() -> Result<()> {
+    fn automatic_and_explicit_pools_preserve_compiled_context() -> Result<()> {
         let cfg = cfg();
-        for requested in [None, Some(0), Some(FLOOR), Some(2 << 20)] {
+        for requested in [None, Some(0), Some(262_144), Some(2 << 20)] {
             let mut i = inputs(&cfg);
             i.requested_pool = requested;
             let request = request(i)?;
             assert_eq!(request.pool.target, 2 << 20);
-            assert_eq!(request.pool.floor, requested.filter(|&n| n > 0).unwrap_or(1 << 20));
+            assert_eq!(request.pool.floor, requested.filter(|&n| n > 0).unwrap_or(1 << 20).max(1 << 20));
+            if requested.is_some_and(|n| n > 0 && n < 1 << 20) {
+                assert_eq!(solve(&request), Err(PlacementError::RequestedBelowContext {
+                    requested: requested.unwrap(), floor: 1 << 20,
+                }));
+            }
             assert_eq!(request.pool.requested, requested.filter(|&n| n > 0));
         }
         let mut i = inputs(&cfg);
@@ -941,7 +943,7 @@ pub(super) mod tests {
                 0 => i.spark_ranks = 4,
                 1 => i.peer_access = false,
                 2 => i.attention = Some(AttentionPlacement::Context),
-                3 => i.requested_pool = Some(FLOOR - 1),
+                3 => i.requested_pool = Some(262_143),
                 4 => i.prefix_marks = 0,
                 5 => i.gpus[0].baseline = Baseline::Planned { context_bytes: 0, loaded_bytes: 0 },
                 6 => i.fixed[0].basis = Basis::Estimated,
