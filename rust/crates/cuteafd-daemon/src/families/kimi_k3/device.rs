@@ -1,10 +1,12 @@
-//! The coordinator backend's operation table: each op names the export that
-//! binds it. Until an export lands its op refuses with the work item that
-//! owns it (#273), never a substitute arithmetic.
+//! Device-bound native programs and residual scheduling for the coordinator.
+//! The unbound operation backend still refuses with its owning work item
+//! (#273), never substitute arithmetic.
 use super::block::{MixSite, Ops, Routes};
 use anyhow::{bail, ensure, Result};
-use cuteafd_ffi::{programs::Programs, KimiFfn, KimiFfnBatch, KimiPrefixMode, KimiResidual,
-    KimiResidualBatch, KimiResidualSite};
+use cuteafd_ffi::{programs::Programs, Bf16Add, KimiExpertInput, KimiFfn, KimiFfnBatch,
+    KimiKda, KimiKdaCommit, KimiLatent, KimiMlaMode, KimiPrefixMode, KimiResidual,
+    KimiResidualBatch, KimiResidualSite, KimiRmsNorm, KimiRouter};
+use crate::shared::memory::device::Device;
 use cuteafd_loader::families::kimi_k3::config::KimiK3Config;
 
 /// A device-resident batch: `rows` BF16 rows of `width` in one plane.
@@ -86,6 +88,84 @@ impl<'a> W8<'a> {
     }
 }
 
+/// Native module handles for one coordinator device. Load on each actual rank
+/// before measuring its CUDA baseline; this allocates no family tensor storage.
+/// The shared layer executor, not this table, owns cross-device ordering.
+pub(crate) struct NativePrograms<'a> {
+    pub device: Device<'a>,
+    pub w8: W8<'a>,
+    pub norm: KimiRmsNorm<'a>,
+    pub kda: [KimiKda<'a>; 2],
+    pub commit: KimiKdaCommit<'a>,
+    pub mla: [MlaPrograms<'a>; 2],
+    pub latent: KimiLatent<'a>,
+    pub router: KimiRouter<'a>,
+    pub wire: KimiExpertInput<'a>,
+    pub add: Bf16Add<'a>,
+    scratch: NativeScratch,
+}
+
+pub(crate) struct MlaPrograms<'a> {
+    pub decode: super::mla::Mla<'a>,
+    pub verify: super::mla::Mla<'a>,
+    pub extend: super::mla::Mla<'a>,
+}
+
+/// Reusable native temporary storage for one serialized layer lane. These are
+/// validated manifest requirements, not estimated total-engine allowances.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct NativeScratch {
+    pub kda: usize,
+    pub mla: [usize; 3],
+}
+
+impl NativeScratch {
+    fn combine(kda: [usize; 2], mla: impl IntoIterator<Item = [usize; 3]>) -> Result<Self> {
+        let mut scratch = Self { kda: *kda.iter().max().unwrap(), mla: [0; 3] };
+        for requirements in mla {
+            for (current, required) in scratch.mla.iter_mut().zip(requirements) {
+                *current = (*current).max(required);
+            }
+        }
+        scratch.bytes()?;
+        Ok(scratch)
+    }
+
+    pub(crate) fn bytes(&self) -> Result<usize> {
+        self.mla.iter().try_fold(self.kda, |sum, bytes| sum.checked_add(*bytes)
+            .ok_or_else(|| anyhow::anyhow!("Kimi native scratch extent overflow")))
+    }
+}
+
+impl<'a> NativePrograms<'a> {
+    pub(crate) fn load(device: Device<'a>, cfg: &KimiK3Config,
+        programs: &'a Programs<'a>) -> Result<Self> {
+        ensure!(device.id >= 0 && std::ptr::eq(device.library, programs.library()),
+            "Kimi programs and device must share their native library");
+        device.run(|| {
+            let kda = [KimiKda::load(programs, 64, true)?, KimiKda::load(programs, 4096, false)?];
+            // Admission can select owned MLA or explicit head split. Resolve
+            // both before its measured baseline, never lazily after admission.
+            let load_mla = |heads| -> Result<MlaPrograms<'a>> {
+                Ok(MlaPrograms {
+                    decode: super::mla::Mla::load(cfg, programs, heads, 64, KimiMlaMode::Decode)?,
+                    verify: super::mla::Mla::load(cfg, programs, heads, 64, KimiMlaMode::Verify)?,
+                    extend: super::mla::Mla::load(cfg, programs, heads, 4096, KimiMlaMode::Extend)?,
+                })
+            };
+            let mla = [load_mla(48)?, load_mla(96)?];
+            let scratch = NativeScratch::combine(kda.each_ref().map(|p| p.scratch_bytes()),
+                mla.iter().flat_map(|p| [p.decode.scratch_bytes(), p.verify.scratch_bytes(), p.extend.scratch_bytes()]))?;
+            Ok(Self { device, w8: W8::load(cfg, programs)?, norm: KimiRmsNorm::load(programs, cfg.hidden)?,
+                kda, commit: KimiKdaCommit::load(programs)?, mla, latent: KimiLatent::load(programs)?,
+                router: KimiRouter::load(programs)?, wire: KimiExpertInput::load(programs)?,
+                add: device.library.bf16_add()?, scratch })
+        })
+    }
+
+    pub(crate) fn scratch(&self) -> NativeScratch { self.scratch }
+}
+
 /// Which export each op waits on.
 pub(crate) const PENDING: &[(&str, &str)] = &[
     ("residual_mix", "W8 shared residual mixer"),
@@ -150,6 +230,17 @@ mod tests {
         assert!(!output.append);
         assert!(residual_site(&cfg, MixSite::Attention(cfg.layers)).is_err());
         assert!(residual_site(&cfg, MixSite::Ffn(cfg.layers)).is_err());
+    }
+
+    #[test]
+    fn native_scratch_uses_each_manifest_peak_and_checks_total_overflow() -> Result<()> {
+        let scratch = NativeScratch::combine([1024, 4096],
+            [[256, 1024, 4096], [512, 2048, 2048], [128, 8192, 1024]])?;
+        assert_eq!(scratch, NativeScratch { kda: 4096, mla: [512, 8192, 4096] });
+        assert_eq!(scratch.bytes()?, 16_896);
+        assert!(NativeScratch::combine([usize::MAX, 1], [[1, 0, 0]]).is_err());
+        assert!(NativeScratch::combine([0, 0], [[0, usize::MAX, 1]]).is_err());
+        Ok(())
     }
 
     #[test]
