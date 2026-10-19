@@ -291,6 +291,12 @@ pub(crate) struct LayerWeights<'a> {
 }
 
 impl<'a> LayerWeights<'a> {
+    pub(super) fn check_device(&self, device: Device<'_>) -> Result<()> {
+        ensure!(self.operands.values().all(|allocation| allocation.device.id == device.id
+            && std::ptr::eq(allocation.device.library, device.library)), "Kimi layer weight owner differs from lane device");
+        Ok(())
+    }
+
     /// `charged_bytes` is the exact weight demand accepted by shared startup
     /// admission, not available CUDA bytes or an independent family budget.
     /// Uploads are synchronous; no queued work can outlive error cleanup here.

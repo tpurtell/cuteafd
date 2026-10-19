@@ -108,6 +108,7 @@ pub(crate) struct NativePrograms<'a> {
     pub wire: KimiExpertInput<'a>,
     pub add: Bf16Add<'a>,
     scratch: NativeScratch,
+    wire_grid: crate::shared::launch_grid::Fp8QuantizeGrid,
 }
 
 pub(crate) struct MlaPrograms<'a> {
@@ -164,13 +165,20 @@ impl<'a> NativePrograms<'a> {
             Ok(Self { device, w8: W8::load(cfg, programs)?, norm: KimiRmsNorm::load(programs, cfg.hidden)?,
                 kda, commit: KimiKdaCommit::load(programs)?, mla, latent: KimiLatent::load(programs)?,
                 router: KimiRouter::load(programs)?, wire: KimiExpertInput::load(programs)?,
-                add: device.library.bf16_add()?, scratch })
+                add: device.library.bf16_add()?, scratch,
+                wire_grid: crate::shared::launch_grid::Fp8QuantizeGrid::new(device.library.sm_count()?, None)? })
         })
     }
 
     pub(crate) fn scratch(&self) -> NativeScratch { self.scratch }
 
+    pub(super) fn check_config(&self, cfg: &KimiK3Config) -> Result<()> {
+        ensure!(*cfg == self.w8.cfg, "Kimi native programs differ from admitted checkpoint config");
+        Ok(())
+    }
+
     pub(crate) fn lane_layout(&self, cfg: &KimiK3Config, rows: usize, max_context: usize) -> Result<LaneLayout> {
+        self.check_config(cfg)?;
         ensure!(self.mla.iter().all(|p| [p.decode.max_context(), p.verify.max_context(), p.extend.max_context()]
             .into_iter().all(|capacity| max_context <= capacity)), "Kimi lane context exceeds native programs");
         LaneLayout::new(cfg, rows, max_context, self.scratch)
@@ -283,6 +291,136 @@ impl Lane<'_> {
     }
 
     pub(crate) fn rows(&self) -> usize { self.layout.rows }
+}
+
+/// Persistent engine owner, not a per-layer guard. Retain the exact admitted
+/// weights/programs until teardown drains the lane; enqueue methods never wait.
+/// Peer ordering, attention metadata and complete Spark combination belong to
+/// the shared layer executor, not this rank-local operator binding.
+pub(crate) struct LocalLane<'a> {
+    lane: Lane<'a>,
+    programs: Rc<NativePrograms<'a>>,
+    layers: Vec<Rc<super::weights::LayerWeights<'a>>>,
+    global: Rc<GlobalWeights<'a>>,
+}
+
+impl Drop for LocalLane<'_> {
+    fn drop(&mut self) { self.lane.stream.drain_or_abort("Kimi persistent local lane"); }
+}
+
+impl<'a> LocalLane<'a> {
+    pub(super) fn new(lane: Lane<'a>, programs: Rc<NativePrograms<'a>>,
+        layers: Vec<Rc<super::weights::LayerWeights<'a>>>, global: Rc<GlobalWeights<'a>>) -> Result<Self> {
+        let device = lane.stream.device;
+        ensure!(programs.device.id == device.id && std::ptr::eq(programs.device.library, device.library),
+            "Kimi local programs differ from admitted lane device");
+        ensure!(layers.len() == programs.w8.cfg.layers, "Kimi local layer inventory differs from programs");
+        for weights in &layers { weights.check_device(device)?; }
+        global.check_device(device)?;
+        Ok(Self { lane, programs, layers, global })
+    }
+
+    fn layer(&self, layer: usize) -> Result<&super::weights::LayerWeights<'a>> {
+        self.layers.get(layer).map(Rc::as_ref).ok_or_else(|| anyhow::anyhow!("Kimi local layer outside inventory"))
+    }
+
+    fn plane(&self, name: &str, rows: usize, width: usize) -> Result<CuteafdDeviceBuffer> {
+        ensure!((1..=self.lane.rows()).contains(&rows), "Kimi local rows exceed admitted lane");
+        view(self.lane.buffer(name)?, 0, rows * width * 2)
+    }
+
+    pub(crate) fn stream(&self) -> &Rc<Stream<'a>> { &self.lane.stream }
+
+    /// External scheduling/staging uses only the admitted lane's actual owners.
+    pub(crate) fn buffer(&self, name: &str) -> Result<CuteafdDeviceBuffer> { self.lane.buffer(name) }
+
+    /// Seed only the mutable prefix from admitted embedded/delta rows. Slot 0
+    /// is written by the first fused residual specialization, not a host copy.
+    pub(crate) fn seed(&mut self, rows: usize) -> Result<()> {
+        let source = self.plane("delta", rows, 7168)?;
+        let prefix = view(self.lane.buffer("residual arena")?, 8 * self.lane.rows() * 7168 * 2, source.bytes)?;
+        self.lane.stream.device.run(|| {
+            // SAFETY: disjoint admitted allocations retained by this persistent owner.
+            unsafe { self.lane.stream.device.library.copy_d2d_async(prefix, source, source.bytes, self.lane.stream.raw) }
+        })
+    }
+
+    pub(crate) fn residual(&mut self, site: MixSite, rows: usize) -> Result<CuteafdDeviceBuffer> {
+        let (score_weight, norm_weight) = match site {
+            MixSite::Attention(layer) => (self.layer(layer)?.buffer("attention.score")?, self.layer(layer)?.buffer("attention.norm")?),
+            MixSite::Ffn(layer) => (self.layer(layer)?.buffer("ffn.score")?, self.layer(layer)?.buffer("ffn.norm")?),
+            MixSite::Output => (self.global.buffer("output.score")?, self.global.buffer("output.norm")?),
+        };
+        let output = self.plane("normalized", rows, 7168)?;
+        let batch = KimiResidualBatch { rows, arena_rows: self.lane.rows(), arena: self.lane.buffer("residual arena")?,
+            delta: self.plane("delta", rows, 7168)?, score_weight, norm_weight, output };
+        self.lane.stream.device.run(|| self.programs.w8.residual(site, batch, self.lane.stream.raw))?;
+        Ok(output)
+    }
+
+    /// Returns a TP2 partial. The shared executor meets both ranks before this
+    /// partial can become the next fused residual's delta.
+    pub(crate) fn ffn(&mut self, layer: usize, rows: usize) -> Result<CuteafdDeviceBuffer> {
+        let weights = self.layer(layer)?;
+        let output = self.plane("ffn output", rows, 7168)?;
+        let batch = KimiFfnBatch { rows, input: self.plane("normalized", rows, 7168)?,
+            gate_up_weight: weights.buffer("ffn.gate_up")?, down_weight: weights.buffer("ffn.down")?,
+            gate_up: self.lane.buffer("gate-up")?, activated: self.lane.buffer("activated")?, output };
+        self.lane.stream.device.run(|| self.programs.w8.ffn(layer, batch, self.lane.stream.raw))?;
+        Ok(output)
+    }
+
+    /// Route and quantize on this device; normal RouteStaging/SparkLane reads
+    /// these admitted outputs. No CPU Vec<Routes> enters the operator hot path.
+    pub(crate) fn route(&mut self, layer: usize, rows: usize) -> Result<(cuteafd_ffi::KimiRoutes, CuteafdDeviceBuffer)> {
+        let weights = self.layer(layer)?;
+        ensure!(self.programs.w8.cfg.dense.get(layer) == Some(&false), "Kimi dense layer has no routes");
+        let input = self.plane("normalized", rows, 7168)?;
+        let latent = self.plane("latent input", rows, 3584)?;
+        let wire = view(self.lane.buffer("expert wire")?, 0, rows * KimiExpertInput::ROW_BYTES)?;
+        let routes = cuteafd_ffi::KimiRoutes { ids: view(self.lane.buffer("route ids")?, 0, rows * 16 * 4)?,
+            weights: view(self.lane.buffer("route weights")?, 0, rows * 16 * 4)? };
+        let logits = self.lane.buffer("router logits")?;
+        let router = weights.buffer("router.weight")?;
+        let bias = weights.buffer("router.bias")?;
+        let down = weights.buffer("latent.down")?;
+        self.lane.stream.device.run(|| {
+            self.programs.router.launch(rows, input, router, bias, logits, routes, self.lane.stream.raw)?;
+            self.programs.latent.down(rows, input, down, latent, self.lane.stream.raw)?;
+            self.programs.wire.launch(rows, self.programs.wire_grid.blocks(rows, 3584), latent, wire, self.lane.stream.raw)?;
+            Ok(())
+        })?;
+        Ok((routes, wire))
+    }
+
+    /// Invoke only after all six Spark partials have been reduced into the
+    /// admitted expert-combined plane and ordered before this lane's stream.
+    pub(crate) fn latent_up(&mut self, layer: usize, rows: usize) -> Result<CuteafdDeviceBuffer> {
+        let weights = self.layer(layer)?;
+        let combined = self.plane("expert combined", rows, 3584)?;
+        let normalized = self.plane("latent normalized", rows, 3584)?;
+        let output = self.plane("routed output", rows, 7168)?;
+        let norm_weight = weights.buffer("latent.norm")?;
+        let up_weight = weights.buffer("latent.up")?;
+        self.lane.stream.device.run(|| {
+            self.programs.latent.up(rows, combined, norm_weight, normalized, up_weight, output, self.lane.stream.raw)?;
+            Ok(())
+        })?;
+        Ok(output)
+    }
+
+    /// Combine routed output with the executor's completed shared-FFN meet
+    /// in `shared output`, rounding once before this can become residual delta.
+    pub(crate) fn combine_moe(&mut self, rows: usize) -> Result<CuteafdDeviceBuffer> {
+        let a = self.plane("routed output", rows, 7168)?;
+        let b = self.plane("shared output", rows, 7168)?;
+        let output = self.plane("combined output", rows, 7168)?;
+        self.lane.stream.device.run(|| {
+            // SAFETY: the persistent owner retains operands and stream; shared add rejects aliases.
+            unsafe { self.programs.add.launch(a, b, output, rows * 7168, self.lane.stream.raw) }
+        })?;
+        Ok(output)
+    }
 }
 
 /// Head handles/workspaces are lane-local: independent compute streams must
@@ -453,6 +591,44 @@ impl Ops for Pending {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn persistent_local_lane_never_drains_per_operator_and_keeps_device_routes() {
+        let source = include_str!("device.rs").split("#[cfg(test)]").next().unwrap();
+        let owner = source.split("pub(crate) struct LocalLane").nth(1).unwrap().split("/// Head handles").next().unwrap();
+        assert!(owner.contains("programs: Rc<NativePrograms"));
+        assert!(owner.contains("layers: Vec<Rc<super::weights::LayerWeights"));
+        assert!(owner.contains("drain_or_abort(\"Kimi persistent local lane\")"));
+        let methods = owner.split("impl<'a> LocalLane").nth(1).unwrap();
+        for forbidden in [".drain(", "drain_or_abort", ".wait(", "synchronize", "Allocation::new", "sm_count()"] {
+            assert!(!methods.contains(forbidden), "operator path contains {forbidden}");
+        }
+        assert!(methods.contains("Result<(cuteafd_ffi::KimiRoutes, CuteafdDeviceBuffer)>"));
+        assert!(methods.contains("wire_grid.blocks(rows, 3584)"));
+        assert!(!methods.contains("Result<Vec<Routes>>"));
+    }
+
+    #[test]
+    #[ignore = "requires CUTEAFD_NATIVE_LIFETIME_FIXTURE_DIR; CPU-only fake DSO"]
+    fn lane_destruction_drains_before_operands_with_retained_stream() -> Result<()> {
+        use cuteafd_ffi::native_library_lifetime_fixture::Fixture;
+        let fixture = Fixture::build()?;
+        let library = fixture.load()?;
+        let device = Device { library: &library, id: 1 };
+        let stream = Rc::new(Stream { device, raw: std::ptr::null_mut() });
+        let lane = Lane { stream: stream.clone(),
+            operands: BTreeMap::from([("delta", Allocation::new(device, 16)?)]),
+            layout: LaneLayout { rows: 1, operands: BTreeMap::from([("delta", 16)]) } };
+        assert!(!fixture.events()?.contains('d'));
+        drop(lane);
+        let events = fixture.events()?;
+        let first_free = events.find('d').ok_or_else(|| anyhow::anyhow!("lane released no storage"))?;
+        assert_eq!(events[..first_free].matches('S').count(), 1,
+            "lane teardown must drain even when another owner retains its stream: {events}");
+        assert_eq!(events.matches('d').count(), 1);
+        drop(stream);
+        Ok(())
+    }
 
     #[test]
     #[ignore = "requires CUTEAFD_NATIVE_LIFETIME_FIXTURE_DIR; CPU-only fake DSO"]

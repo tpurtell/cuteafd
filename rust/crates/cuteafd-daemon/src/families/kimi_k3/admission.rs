@@ -1,7 +1,7 @@
 //! Native coordinator inventory passed to the shared startup solver, before
 //! weights, recurrent state or cache owners allocate. This is not the header
 //! lower bound exposed by `plan` and does not admit Spark workers by itself.
-use super::{device::{IoLayout, TokenIo, Lane, LaneLayout}, mla::{CacheBank, CacheLayout}, state::{KdaBank, KdaLayout}, weights::{GlobalLayout, GlobalWeights, PackedGlobal, LayerLayout, LayerWeights, PackedLayer}};
+use super::{device::{IoLayout, TokenIo, Lane, LaneLayout, LocalLane, NativePrograms}, mla::{CacheBank, CacheLayout}, state::{KdaBank, KdaLayout}, weights::{GlobalLayout, GlobalWeights, PackedGlobal, LayerLayout, LayerWeights, PackedLayer}};
 use crate::shared::memory::device::{Device, Stream};
 use std::rc::{Rc, Weak};
 use anyhow::{ensure, Context, Result};
@@ -38,7 +38,11 @@ pub(crate) struct Inputs<'a> {
 
 pub(crate) struct Admission<'a> {
     pub placement: Placement,
+    cfg: KimiK3Config,
     layouts: Vec<[LayerLayout; 2]>,
+    layer_owners: Vec<[Weak<LayerWeights<'a>>; 2]>,
+    layer_uploaded: Vec<[bool; 2]>,
+    local_bound: Vec<[bool; 2]>,
     devices: [i32; 2],
     lanes: u64,
     lane_layouts: Vec<[LaneLayout; 2]>,
@@ -66,12 +70,37 @@ impl<'a> Admission<'a> {
 
     /// No caller-supplied byte count: upload uses the immutable native layout
     /// reconciled against the shared solver's accepted weight ledger.
-    pub(crate) fn upload(&self, device: Device<'a>, rank: usize, layer: usize,
-        packed: PackedLayer) -> Result<LayerWeights<'a>> {
-        ensure!(rank < 2, "Kimi upload rank outside TP2");
-        ensure!(device.id == self.devices[rank], "Kimi upload device differs from admitted rank");
+    pub(crate) fn upload(&mut self, device: Device<'a>, rank: usize, layer: usize,
+        packed: PackedLayer) -> Result<Rc<LayerWeights<'a>>> {
+        let layout = self.check_layer(rank, layer, device.id)?;
+        let weights = Rc::new(LayerWeights::upload(device, packed, layout, layout.bytes()?)?);
+        self.layer_owners[layer][rank] = Rc::downgrade(&weights);
+        self.layer_uploaded[layer][rank] = true;
+        Ok(weights)
+    }
+
+    fn check_layer(&self, rank: usize, layer: usize, device: i32) -> Result<&LayerLayout> {
+        ensure!(rank < 2 && device == self.devices[rank], "Kimi upload device differs from admitted rank");
         let layout = &self.layouts.get(layer).context("Kimi upload layer outside admission")?[rank];
-        LayerWeights::upload(device, packed, layout, layout.bytes()?)
+        ensure!(!self.layer_uploaded[layer][rank], "Kimi layer weights already uploaded");
+        Ok(layout)
+    }
+
+    /// Bind once for the engine lifetime. No layer/step method drains this lane.
+    pub(crate) fn bind_local(&mut self, rank: usize, lane: usize, allocated: Lane<'a>,
+        programs: Rc<NativePrograms<'a>>) -> Result<LocalLane<'a>> {
+        ensure!(rank < 2 && lane < self.lanes as usize && !self.local_bound[lane][rank],
+            "Kimi local lane already bound or outside admission");
+        programs.check_config(&self.cfg)?;
+        let expected = self.lane_readers[lane][rank].upgrade().context("Kimi local binding requires admitted lane")?;
+        ensure!(Rc::ptr_eq(&expected, &allocated.stream) && allocated.stream.device.id == self.devices[rank],
+            "Kimi local binding differs from allocated lane owner");
+        let layers = self.layer_owners.iter().map(|pair| pair[rank].upgrade()
+            .context("Kimi local binding requires every admitted layer weight owner")).collect::<Result<Vec<_>>>()?;
+        let global = self.global_owners[rank].upgrade().context("Kimi local binding requires admitted global weights")?;
+        let binding = LocalLane::new(allocated, programs, layers, global)?;
+        self.local_bound[lane][rank] = true;
+        Ok(binding)
     }
 
     pub(crate) fn upload_global(&mut self, device: Device<'a>, rank: usize, packed: PackedGlobal) -> Result<Rc<GlobalWeights<'a>>> {
@@ -205,11 +234,15 @@ pub(crate) fn admit<'a>(inputs: Inputs<'_>) -> Result<Admission<'a>> {
             .try_fold(0u64, |sum, item| sum.checked_add(item.bytes).context("Kimi weight charge overflow"))?;
         ensure!(native == charged, "Kimi rank {rank} native weights differ from shared admission: {native} != {charged}");
     }
+    let layer_owners = (0..layouts.len()).map(|_| std::array::from_fn(|_| Weak::new())).collect();
+    let layer_uploaded = vec![[false; 2]; layouts.len()];
+    let local_bound = vec![[false; 2]; lane_layouts.len()];
     let lane_allocated = vec![[false; 2]; lane_layouts.len()];
     let io_allocated = vec![[false; 2]; lane_layouts.len()];
     let lane_readers = (0..lane_layouts.len()).map(|_| std::array::from_fn(|_| Weak::new())).collect();
     let mla_layouts = [CacheLayout::new(cfg, &placement, 0)?, CacheLayout::new(cfg, &placement, 1)?];
-    let admission = Admission { placement, layouts, devices, lanes, lane_layouts, lane_allocated, lane_readers,
+    let admission = Admission { placement, cfg: cfg.clone(), layouts, layer_owners, layer_uploaded, local_bound,
+        devices, lanes, lane_layouts, lane_allocated, lane_readers,
         kda_layout, kda_allocated: [false; 2], mla_layouts, mla_allocated: [false; 2],
         global_layouts, global_uploaded: [false; 2], global_owners: std::array::from_fn(|_| Weak::new()),
         io_layouts, io_allocated };
@@ -448,6 +481,29 @@ mod tests {
             }
             assert!(admitted.check_mla(0, 0).is_err(), "case {case}");
         }
+        Ok(())
+    }
+
+    #[test]
+    fn native_layer_uploads_are_single_owner_per_rank_even_after_owner_release() -> Result<()> {
+        let cfg = cfg();
+        let mut admitted = admit(inputs(&cfg))?;
+        for layer in 0..cfg.layers {
+            for rank in 0..2 { admitted.check_layer(rank, layer, rank as i32)?; }
+        }
+        for (rank, layer, device) in [(2, 0, 0), (0, cfg.layers, 0), (0, 0, 1)] {
+            assert!(admitted.check_layer(rank, layer, device).is_err());
+        }
+        admitted.layer_uploaded[0][1] = true;
+        assert!(admitted.layer_owners[0][1].upgrade().is_none());
+        assert!(admitted.check_layer(1, 0, 1).is_err());
+        let source = include_str!("admission.rs").split("#[cfg(test)]").next().unwrap();
+        let bind = source.split("pub(crate) fn bind_local").nth(1).unwrap().split("pub(crate) fn upload_global").next().unwrap();
+        assert!(bind.contains("programs.check_config(&self.cfg)?"));
+        assert!(bind.contains("Rc::ptr_eq(&expected, &allocated.stream)"));
+        assert!(bind.contains("self.layer_owners.iter()"));
+        assert!(bind.contains("self.global_owners[rank].upgrade()"));
+        assert!(bind.contains("!self.local_bound[lane][rank]"));
         Ok(())
     }
 
