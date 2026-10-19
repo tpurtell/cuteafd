@@ -86,6 +86,12 @@ pub(crate) struct GlobalWeights<'a> {
 }
 
 impl GlobalWeights<'_> {
+    pub(super) fn check_device(&self, device: Device<'_>) -> Result<()> {
+        ensure!(self.operands.values().all(|allocation| allocation.device.id == device.id
+            && std::ptr::eq(allocation.device.library, device.library)), "Kimi global weight owner differs from IO device");
+        Ok(())
+    }
+
     pub(crate) fn buffer(&self, name: &str) -> Result<CuteafdDeviceBuffer> {
         Ok(self.operands.get(name).with_context(|| format!("Kimi global operand {name} absent on this rank"))?.buffer)
     }

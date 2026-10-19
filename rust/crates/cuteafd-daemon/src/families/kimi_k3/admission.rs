@@ -1,7 +1,7 @@
 //! Native coordinator inventory passed to the shared startup solver, before
 //! weights, recurrent state or cache owners allocate. This is not the header
 //! lower bound exposed by `plan` and does not admit Spark workers by itself.
-use super::{device::{Lane, LaneLayout}, mla::{CacheBank, CacheLayout}, state::{KdaBank, KdaLayout}, weights::{GlobalLayout, GlobalWeights, PackedGlobal, LayerLayout, LayerWeights, PackedLayer}};
+use super::{device::{IoLayout, TokenIo, Lane, LaneLayout}, mla::{CacheBank, CacheLayout}, state::{KdaBank, KdaLayout}, weights::{GlobalLayout, GlobalWeights, PackedGlobal, LayerLayout, LayerWeights, PackedLayer}};
 use crate::shared::memory::device::{Device, Stream};
 use std::rc::{Rc, Weak};
 use anyhow::{ensure, Context, Result};
@@ -16,8 +16,8 @@ const EXECUTOR: ExecutorModes = ExecutorModes { family: "kimi_k3", modes: MODES,
 const FLOOR: u64 = 262_144;
 
 /// All demands are still future to the two post-module CUDA samples. The
-/// engine supplies its native programs' scratch, token I/O, lane workspaces,
-/// exchange, graphs and page tables, rather than estimated family allowances.
+/// engine supplies its native programs' lane extents, exchange, graphs and
+/// page tables; global weights, token IO and state banks add their own demands.
 pub(crate) struct Inputs<'a> {
     pub cfg: &'a KimiK3Config,
     pub gpus: [GpuBudget; 2],
@@ -50,6 +50,9 @@ pub(crate) struct Admission<'a> {
     mla_allocated: [bool; 2],
     global_layouts: [GlobalLayout; 2],
     global_uploaded: [bool; 2],
+    global_owners: [Weak<GlobalWeights<'a>>; 2],
+    io_layouts: [IoLayout; 2],
+    io_allocated: Vec<[bool; 2]>,
 }
 
 /// The normal Spark lane consumes these selected layer IDs; selection still
@@ -71,11 +74,34 @@ impl<'a> Admission<'a> {
         LayerWeights::upload(device, packed, layout, layout.bytes()?)
     }
 
-    pub(crate) fn upload_global(&mut self, device: Device<'a>, rank: usize, packed: PackedGlobal) -> Result<GlobalWeights<'a>> {
+    pub(crate) fn upload_global(&mut self, device: Device<'a>, rank: usize, packed: PackedGlobal) -> Result<Rc<GlobalWeights<'a>>> {
         let layout = self.check_global(rank, device.id)?;
-        let weights = layout.upload(device, packed)?;
+        let weights = Rc::new(layout.upload(device, packed)?);
+        self.global_owners[rank] = Rc::downgrade(&weights);
         self.global_uploaded[rank] = true;
         Ok(weights)
+    }
+
+    pub(crate) fn allocate_io(&mut self, device: Device<'a>, rank: usize, lane: usize) -> Result<TokenIo<'a>> {
+        let layout = self.check_io(rank, lane, device.id)?;
+        let weights = self.global_owners[rank].upgrade().context("Kimi IO requires live admitted global weights")?;
+        let stream = self.lane_readers[lane][rank].upgrade().context("Kimi IO requires a live admitted lane stream")?;
+        let io = layout.allocate(device, stream, weights)?;
+        self.io_allocated[lane][rank] = true;
+        Ok(io)
+    }
+
+    fn check_io(&self, rank: usize, lane: usize, device: i32) -> Result<&IoLayout> {
+        ensure!(rank < 2 && device == self.devices[rank] && lane < self.lanes as usize,
+            "Kimi IO allocation differs from admitted rank/device/lane");
+        ensure!(!self.io_allocated[lane][rank], "Kimi token IO already allocated");
+        let layout = &self.io_layouts[rank];
+        let demand = layout.demand(lane)?;
+        let charges = self.placement.items[rank].iter().filter(|item| item.group == demand.group).collect::<Vec<_>>();
+        ensure!(charges.len() == 1 && charges[0].category == demand.category
+            && charges[0].basis == Basis::Exact && charges[0].bytes == demand.bytes,
+            "Kimi token IO allocation differs from accepted native charge");
+        Ok(layout)
     }
 
     pub(crate) fn global_layout(&self, rank: usize) -> Result<&GlobalLayout> {
@@ -165,6 +191,7 @@ pub(crate) fn admit<'a>(inputs: Inputs<'_>) -> Result<Admission<'a>> {
     let lane_layouts = inputs.lane_layouts.clone();
     let kda_layout = KdaLayout::new(cfg, inputs.state_slots, inputs.prefix_marks, inputs.lanes)?;
     let global_layouts = GlobalLayout::pair(cfg)?;
+    let io_layouts = [IoLayout::new(cfg, 0, inputs.rows)?, IoLayout::new(cfg, 1, inputs.rows)?];
     let request = request(inputs)?;
     let placement = solve(&request)?;
     EXECUTOR.check(&placement)?;
@@ -179,15 +206,18 @@ pub(crate) fn admit<'a>(inputs: Inputs<'_>) -> Result<Admission<'a>> {
         ensure!(native == charged, "Kimi rank {rank} native weights differ from shared admission: {native} != {charged}");
     }
     let lane_allocated = vec![[false; 2]; lane_layouts.len()];
+    let io_allocated = vec![[false; 2]; lane_layouts.len()];
     let lane_readers = (0..lane_layouts.len()).map(|_| std::array::from_fn(|_| Weak::new())).collect();
     let mla_layouts = [CacheLayout::new(cfg, &placement, 0)?, CacheLayout::new(cfg, &placement, 1)?];
     let admission = Admission { placement, layouts, devices, lanes, lane_layouts, lane_allocated, lane_readers,
         kda_layout, kda_allocated: [false; 2], mla_layouts, mla_allocated: [false; 2],
-        global_layouts, global_uploaded: [false; 2] };
+        global_layouts, global_uploaded: [false; 2], global_owners: std::array::from_fn(|_| Weak::new()),
+        io_layouts, io_allocated };
     for rank in 0..2 {
         admission.check_kda(rank, devices[rank])?;
         admission.check_mla(rank, devices[rank])?;
         admission.check_global(rank, devices[rank])?;
+        for lane in 0..lanes as usize { admission.check_io(rank, lane, devices[rank])?; }
     }
     Ok(admission)
 }
@@ -225,6 +255,15 @@ fn request(i: Inputs<'_>) -> Result<PlacementRequest> {
             let demand = layout.demand(rank as u8, lane)?;
             ensure!(!fixed.iter().chain(&i.startup).any(|item| item.gpu == demand.gpu && item.group == demand.group),
                 "Kimi lane operand charge supplied twice");
+            fixed.push(demand);
+        }
+    }
+    for rank in 0..2 {
+        let layout = IoLayout::new(cfg, rank, i.rows)?;
+        for lane in 0..i.lanes {
+            let demand = layout.demand(lane)?;
+            ensure!(!fixed.iter().chain(&i.startup).any(|item| item.gpu == demand.gpu && item.group == demand.group),
+                "Kimi token IO charge supplied twice");
             fixed.push(demand);
         }
     }
@@ -438,6 +477,28 @@ mod tests {
         }
         let mut i = inputs(&cfg);
         i.fixed.push(GlobalLayout::pair(&cfg)?[0].demand()?);
+        assert!(admit(i).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn token_io_admission_rejects_duplicate_device_and_charge_mismatch() -> Result<()> {
+        let cfg = cfg();
+        let mut admitted = admit(inputs(&cfg))?;
+        for rank in 0..2 {
+            for lane in 0..2 { admitted.check_io(rank, lane, rank as i32)?; }
+        }
+        for (rank, lane, device) in [(2, 0, 0), (0, 2, 0), (0, 0, 1)] {
+            assert!(admitted.check_io(rank, lane, device).is_err());
+        }
+        admitted.io_allocated[0][1] = true;
+        assert!(admitted.check_io(1, 0, 1).is_err());
+        admitted.io_allocated[0][1] = false;
+        let group = admitted.io_layouts[1].demand(0)?.group;
+        admitted.placement.items[1].iter_mut().find(|item| item.group == group).unwrap().bytes -= 1;
+        assert!(admitted.check_io(1, 0, 1).is_err());
+        let mut i = inputs(&cfg);
+        i.fixed.push(IoLayout::new(&cfg, 1, i.rows)?.demand(0)?);
         assert!(admit(i).is_err());
         Ok(())
     }
