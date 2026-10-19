@@ -13,15 +13,15 @@ def contract():
     # The geometry helpers deliberately have no torch/CUDA dependence.
     tree = ast.parse((FORK / "b12x/integration/cuteafd/exlr8.py").read_text())
     nodes = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in ("geometry", "scratch_bytes")]
-    namespace = {"ABI_VERSION": 1, "CTAS_PER_SM": 4}
+    namespace = {"ABI_VERSION": 3, "CTAS_PER_SM": 4}
     exec(compile(ast.Module(body=nodes, type_ignores=[]), "exlr8_contract", "exec"), namespace)
     return namespace
 
 
-def test_capacity_scratch_matches_native_v1():
+def test_capacity_scratch_matches_native_v3():
     api = contract()
     g = api["geometry"]()
-    assert g == dict(abi_version=1, hidden=6144, units=16, top_k=8, max_groups=512,
+    assert g == dict(abi_version=3, hidden=6144, units=16, top_k=8, max_groups=512,
                      max_rows=64, split_k_blocks=8, fc1_splits=6, ctas_per_sm=4)
     assert api["scratch_bytes"](g) == dict(fc1=805306368, intermediate=33554432, fc2=201326592)
 
@@ -47,21 +47,20 @@ def test_serving_and_glue_export_inventory():
     builder = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "exlr8_export_programs")
     result = next(n.value for n in builder.body if isinstance(n, ast.Assign) and n.targets[0].id == "result")
     assert [item.elts[0].value for item in result.elts] == [
-        "a16_decode", "a16_serving", "group", "rotate", "reduce", "shared_a16_serving", "shared_group"]
-    for index in (5, 6):
+        "a16_decode", "a16_serving", "group", "shared_a16_serving", "shared_group"]
+    for index in (3, 4):
         shared = {k.arg: k.value.value for k in result.elts[index].elts[-1].body.keywords
                   if isinstance(k.value, ast.Constant)}
         assert shared["shared_expert"] is True
         assert shared["top_k"] == 1 and shared["max_groups"] == 4
     assert shared["experts"] == 1
-    namespace = {name: lambda **kwargs: None for name in (
-        "compile_exlr8_group_aot", "compile_exlr8_rotate_aot", "compile_exlr8_reduce_aot")}
+    namespace = {"compile_exlr8_group_aot": lambda **kwargs: None}
     # Drop the local CUDA-dependent import; constructing the lambdas compiles nothing.
     builder.body = [node for node in builder.body if not isinstance(node, ast.ImportFrom)]
     exec(compile(ast.Module(body=[builder], type_ignores=[]), "exlr8_inventory", "exec"), namespace)
     inventory = namespace["exlr8_export_programs"]
     assert [p[0] for p in inventory("spark")] == ["a16_serving", "group"]
-    assert [p[0] for p in inventory("coordinator")] == ["rotate", "reduce", "shared_a16_serving", "shared_group"]
+    assert [p[0] for p in inventory("coordinator")] == ["shared_a16_serving", "shared_group"]
     with pytest.raises(ValueError):
         inventory("unknown")
 

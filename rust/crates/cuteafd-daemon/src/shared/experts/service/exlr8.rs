@@ -37,7 +37,6 @@ pub(super) struct Worker<'w, 'a> {
 pub(super) fn load<'a>(library: &'a NativeLibrary, catalog: &OfficialV41Catalog,
     config: &NativeExpertServiceConfig, programs: &'a Programs<'a>)
     -> Result<(backend::Weights<'a>, usize)> {
-    cuteafd_loader::plan::exlr8::require_spark_rotation()?;
     let manifest = config.exlr8_manifest.as_deref().context("EXLR8 worker requires a manifest")?;
     let model = config.model_admission.as_ref().context("EXLR8 requires model admission")?;
     ensure!(model.endpoints.iter().all(|endpoint|

@@ -25,13 +25,14 @@ const K1_POINTERS: &[&str] = &[
     "fc1",
     "intermediate",
     "fc2",
+    "signs_out",
     "output",
     "group_count",
 ];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct RoutingIdentity {
-    addresses: [usize; 4],
+    addresses: [usize; 5],
     rows: usize,
     top_k: usize,
     max_groups: usize,
@@ -58,7 +59,7 @@ impl RoutingLifetime {
 
 #[derive(Debug)]
 struct Workspace {
-    ranges: [(usize, usize); 10],
+    ranges: [(usize, usize); 11],
     bytes: usize,
     rows: usize,
     top_k: usize,
@@ -70,8 +71,8 @@ impl Workspace {
     fn plan(spec: &ProgramSpec, rows: usize, set: ExpertSet) -> Result<Self> {
         cuteafd_ffi::exlr8::validate(spec)?;
         ensure!(
-            spec.name == program_names(set).0 && spec.geometry["abi_version"] == 2,
-            "EXLR8 execution requires device-count ABI v2"
+            spec.name == program_names(set).0 && spec.geometry["abi_version"] == 3,
+            "EXLR8 execution requires fused rotation ABI v3"
         );
         ensure!(
             rows > 0 && rows <= 64 && rows <= spec.capacity_rows as usize,
@@ -95,7 +96,7 @@ impl Workspace {
         };
         let (ranges, bytes) = cuteafd_loader::plan::exlr8::residency::execution_workspace_layout(
             rows, hidden, top_k, max_groups, scratch("fc1")?,
-            scratch("intermediate")?, scratch("fc2")?)?;
+            scratch("intermediate")?, scratch("fc2")?, set)?;
         Ok(Self {
             ranges,
             bytes,
@@ -136,23 +137,34 @@ impl<'a> Exlr8Execution<'a> {
         available: usize,
         set: ExpertSet,
     ) -> Result<Self> {
-        cuteafd_loader::plan::exlr8::require_spark_rotation()?;
         let (k1_name, group_name) = program_names(set);
         let k1 = programs.program(k1_name, K1_POINTERS)?;
         let group = programs.program(
             group_name,
             &[
                 "ids",
+                "x",
+                "signs_in",
                 "group_expert",
                 "route_slots",
                 "route_group_lane",
                 "group_count",
+                "activation",
             ],
         )?;
         let layout = Workspace::plan(k1.spec(), rows, set)?;
         ensure!(
-            group.spec().geometry["top_k"] == k1.spec().geometry["top_k"]
-                && group.spec().geometry["max_groups"] == k1.spec().geometry["max_groups"],
+            group.spec().geometry["abi_version"] == 2
+                && group.spec().geometry["top_k"] == k1.spec().geometry["top_k"]
+                && group.spec().geometry["max_groups"] == k1.spec().geometry["max_groups"]
+                && group.spec().geometry["hidden"] == k1.spec().geometry["hidden"]
+                && group.spec().geometry["ctas_per_sm"] == k1.spec().geometry["ctas_per_sm"]
+                && group.spec().geometry["input_format"] == match set {
+                    ExpertSet::Routed => "fp8_k32",
+                    ExpertSet::Shared => "bf16",
+                }
+                && group.spec().geometry["input_row_bytes"].as_u64()
+                    == Some((layout.ranges[0].1 / rows) as u64),
             "EXLR8 grouping and K1 geometry differ"
         );
         ensure!(
@@ -192,6 +204,7 @@ impl<'a> Exlr8Execution<'a> {
                 self.buffer(5)?.ptr as usize,
                 self.buffer(6)?.ptr as usize,
                 self.buffer(7)?.ptr as usize,
+                self.buffer(10)?.ptr as usize,
             ],
             rows: self.layout.rows,
             top_k: self.layout.top_k,
@@ -251,6 +264,7 @@ impl<'a> Exlr8Execution<'a> {
             self.buffer(7)?,
             self.buffer(8)?,
             self.buffer(9)?,
+            self.buffer(10)?,
         ];
         let p = |i: usize| buffers[i].ptr;
         let intermediate = view(buffers[9], 0, self.intermediate_bytes)?;
@@ -263,13 +277,13 @@ impl<'a> Exlr8Execution<'a> {
         // weights own all referenced descriptors, and caller retains the stream.
         unsafe {
             self.group.launch(
-                &[p(1), p(4), p(5), p(6), p(7)],
-                &[Scalar::I32(rows as i32)],
+                &[p(1), p(0), weights.signs(false)?.ptr, p(4), p(5), p(6), p(7), p(10)],
+                &[Scalar::I32(rows as i32), Scalar::I32(self.cta_limit)],
                 stream,
             )?;
             self.k1.launch(
                 &[
-                    p(0),
+                    p(10),
                     weights.pointers()?.ptr,
                     weights.bits()?.ptr,
                     p(4),
@@ -279,6 +293,7 @@ impl<'a> Exlr8Execution<'a> {
                     p(8),
                     intermediate.ptr,
                     fc2.ptr,
+                    weights.signs(true)?.ptr,
                     p(3),
                     p(7),
                 ],
@@ -310,7 +325,7 @@ mod tests {
             ]
             .into(),
             capacity_rows: 64,
-            geometry: serde_json::json!({"abi_version": 2, "hidden": 6144, "units": 16,
+            geometry: serde_json::json!({"abi_version": 3, "hidden": 6144, "units": 16,
                 "top_k": top_k, "max_groups": groups, "max_rows": 64,
                 "split_k_blocks": 8, "fc1_splits": 6, "ctas_per_sm": 4}),
         }
@@ -335,6 +350,16 @@ mod tests {
             assert_eq!(single.ranges[9].1, wide.ranges[9].1);
             assert_eq!(single.ranges[0].1 * 64, wide.ranges[0].1);
             assert_eq!(single.ranges[3].1 * 64, wide.ranges[3].1);
+            assert_eq!(single.ranges[10].1 * 64, wide.ranges[10].1);
+            assert_eq!(wide.ranges[3].1, 64 * 6144 * 2);
+            assert_eq!(wide.ranges[10].1, 64 * 6144 * 2);
+            assert_eq!(wide.ranges[0].1, 64 * match set {
+                ExpertSet::Routed => 6336,
+                ExpertSet::Shared => 12288,
+            });
+            let mut stale = spec.clone();
+            stale.geometry["abi_version"] = serde_json::json!(2);
+            assert!(Workspace::plan(&stale, 64, set).is_err());
             assert!(Workspace::plan(&spec, 0, set).is_err());
             assert!(Workspace::plan(&spec, 65, set).is_err());
             let other = if set == ExpertSet::Shared {
@@ -357,7 +382,7 @@ mod tests {
     #[test]
     fn refuses_reallocated_route_storage_or_shape_after_capture() {
         let identity = RoutingIdentity {
-            addresses: [256, 512, 768, 1024],
+            addresses: [256, 512, 768, 1024, 1280],
             rows: 64,
             top_k: 8,
             max_groups: 512,
@@ -365,7 +390,7 @@ mod tests {
         let mut lifetime = RoutingLifetime::default();
         lifetime.capture(identity).unwrap();
         lifetime.check(identity).unwrap();
-        for index in 0..4 {
+        for index in 0..5 {
             let mut replacement = identity;
             replacement.addresses[index] += 4096;
             assert!(lifetime.check(replacement).is_err());

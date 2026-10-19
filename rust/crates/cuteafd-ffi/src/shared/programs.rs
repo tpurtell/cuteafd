@@ -213,11 +213,9 @@ impl<'a> Programs<'a> {
             }
             if name.starts_with("exlr8_") {
                 super::exlr8::validate_entry(spec, entry)?;
-                // Remove rotate/reduce schemas with the fork pin that drops those exports.
                 let expected: &[(&str, &str)] = match name {
-                    "exlr8_a16_serving" | "exlr8_shared_a16_serving" | "exlr8_rotate" => &[("rows", "int32"), ("cta_limit", "int32")],
-                    "exlr8_group" | "exlr8_shared_group" => &[("rows", "int32")],
-                    "exlr8_reduce" => &[("rows", "int32"), ("ranks", "int32"), ("cta_limit", "int32")],
+                    "exlr8_a16_serving" | "exlr8_shared_a16_serving" => &[("rows", "int32"), ("cta_limit", "int32")],
+                    "exlr8_group" | "exlr8_shared_group" => &[("rows", "int32"), ("cta_limit", "int32")],
                     _ => &[("rows", "int32"), ("groups", "int32"), ("cta_limit", "int32")],
                 };
                 let scalars = entry["scalars"].as_array().context("EXLR8 scalar ABI missing")?;

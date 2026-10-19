@@ -208,7 +208,7 @@ def test_release_inventory_requires_each_roles_exlr8_set(tmp_path):
     wanted = [dict(name='glm-exlr8', family='glm5', programs=['glm'], experts=[], spark_experts=[],
                    spark_count=4, spark_tp=4, dual=False, roles=[], nvfp4=False, audio=False,
                    context_split=False, exlr8=True)]
-    coordinator = ['exlr8_rotate', 'exlr8_reduce', 'exlr8_shared_a16_serving', 'exlr8_shared_group']
+    coordinator = ['exlr8_shared_a16_serving', 'exlr8_shared_group']
     spark = ['exlr8_a16_serving', 'exlr8_group']
     write_programs(tmp_path / 'c', ['glm'], 'coordinator', coordinator)
     write_programs(tmp_path / 'e', [], 'spark', spark)

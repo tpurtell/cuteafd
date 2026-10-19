@@ -197,14 +197,6 @@ mod draft_cli_tests {
     }
 
     #[test]
-    fn native_open_refuses_before_checkpoint_or_library_access() {
-        let args = Parse::try_parse_from(["test", "--snapshot", "/missing-native", "--native-lib", "/missing-library",
-            "--exlr8-manifest", "up1"]).unwrap().engine;
-        assert_eq!(open(&args).err().unwrap().to_string(),
-            "EXLR8 Spark-side rotation kernels not yet integrated");
-    }
-
-    #[test]
     fn native_full_activation_is_narrow_and_preserves_component_goldens() {
         let args = Parse::try_parse_from(["test", "--snapshot", "/native", "--native-lib", "/library",
             "--exlr8-manifest", "up1", "--exlr8-dense-from", "/official", "--split-device", "1",
@@ -389,13 +381,7 @@ pub(crate) struct Opened {
 }
 
 pub(crate) fn open(args: &EngineArgs) -> Result<Opened> {
-    if args.exlr8_manifest.is_some() {
-        cuteafd_loader::plan::exlr8::require_spark_rotation()?;
-    }
     let mut catalog = cuteafd_loader::read_expert_catalog(&args.snapshot)?;
-    if catalog.format() == cuteafd_loader::plan::checkpoint::CheckpointFormat::Exlr8 {
-        cuteafd_loader::plan::exlr8::require_spark_rotation()?;
-    }
     catalog.select_draft(cuteafd_loader::plan::spec::DraftOwnership::None)?;
     cuteafd_core::set_expert_geometry(catalog.routed_experts().geometry()?)
         .map_err(|g| anyhow::anyhow!("geometry already {g:?}"))?;
@@ -431,9 +417,6 @@ impl Opened {
     pub fn with_engine<T>(&self, args: &EngineArgs,
         body: impl FnOnce(&engine::GlmEngine<'_>, Option<&mut SparkLink<'_>>, &tokio::runtime::Runtime) -> Result<T>)
         -> Result<T> {
-        if self.dense_catalog.is_some() || args.exlr8_manifest.is_some() {
-            cuteafd_loader::plan::exlr8::require_spark_rotation()?;
-        }
         let automatic_context = args.max_context == 0;
         let mut context_args = args.clone();
         context_args.max_context = crate::shared::context::checkpoint_context(
