@@ -426,6 +426,9 @@ fn request(i: Inputs<'_>) -> Result<PlacementRequest> {
         "Kimi runtime admission cannot use estimated or out-of-rank demands");
     ensure!(i.lane_layouts.len() == i.lanes && i.lane_layouts.iter().flatten().all(|layout| layout.rows() == i.rows),
         "Kimi lane operand layouts differ from executor geometry");
+    let context = i.lane_layouts[0][0].max_context();
+    ensure!(i.lane_layouts.iter().flatten().all(|layout| layout.max_context() == context),
+        "Kimi lanes must share the compiled context extent");
     let mut fixed = i.fixed;
     for layout in GlobalLayout::pair(cfg)? {
         let demand = layout.demand()?;
@@ -484,12 +487,13 @@ fn request(i: Inputs<'_>) -> Result<PlacementRequest> {
             weights: ModeBytes { whole, split: split_attention },
             kv_unit: KvDemand { unit_bytes_whole: unit, unit_bytes_split: [unit; 2], unit_bytes_context: None },
             fixed_bytes: ModeBytes::default(), extra: vec![], context_indexer: false, colocate: None,
-            // RTX routed-expert onboarding is deliberately not executable yet.
+            // admit() installs the checkpoint's whole-expert costs before solve.
             experts: (!cfg.dense[layer]).then_some(ExpertCost { whole: Bytes2::default(),
                 half: [Bytes2::default(); 2], tp2: false, spark_ok: true }),
             modes: if mla { MODES.to_vec() } else { vec![LayerMode::HeadSplit] } });
     }
-    let mut pool = PoolPolicy::resolve(&i.gpus.map(|gpu| gpu.capacity_bytes), FLOOR, i.requested_pool, MLA_PAGE_ROWS as u64, true);
+    let mut pool = PoolPolicy::resolve(&i.gpus.map(|gpu| gpu.capacity_bytes), context as u64,
+        i.requested_pool, MLA_PAGE_ROWS as u64, true);
     pool.ceiling = pool.target.max(pool.requested.unwrap_or(0));
     Ok(PlacementRequest { inventory: Inventory { gpus: i.gpus.to_vec(), spark_ranks: i.spark_ranks, peer_access: i.peer_access },
         attention_placement: i.attention, context_buffers: ContextBuffers::default(), layers_first_gpu: 0,
@@ -542,6 +546,25 @@ mod tests {
         assert_eq!(admitted.placement.layers[3].experts, ExpertHome::RtxWhole { gpu: 0 });
         assert_eq!(admitted.placement.expert_ranges[0].peak_bytes, 2 * 1024 * 1024 + 2 * 8192 + 4096);
         assert_eq!(admitted.placement.expert_ranges[1].peak_bytes, 1024 * 1024 + 2 * 8192 + 4096);
+        Ok(())
+    }
+
+    #[test]
+    fn automatic_pool_preserves_compiled_context_and_explicit_diagnostic_pool_stays_strict() -> Result<()> {
+        let cfg = cfg();
+        for requested in [None, Some(0), Some(FLOOR), Some(2 << 20)] {
+            let mut i = inputs(&cfg);
+            i.requested_pool = requested;
+            let request = request(i)?;
+            assert_eq!(request.pool.target, 2 << 20);
+            assert_eq!(request.pool.floor, requested.filter(|&n| n > 0).unwrap_or(1 << 20));
+            assert_eq!(request.pool.requested, requested.filter(|&n| n > 0));
+        }
+        let mut i = inputs(&cfg);
+        let full = KimiK3Config::from_hf(&cuteafd_loader::plan::testing::kimi_k3_config())?;
+        i.lane_layouts[1][1] = LaneLayout::new(&full, i.rows, 524_288,
+            super::super::device::NativeScratch { kda: 1024, mla: [512, 0, 1024] })?;
+        assert!(request(i).is_err());
         Ok(())
     }
 
