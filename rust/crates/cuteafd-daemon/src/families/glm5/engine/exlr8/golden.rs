@@ -53,6 +53,7 @@ fn fixture(
     shape: &[usize],
 ) -> Result<Vec<u8>> {
     let size = match dtype {
+        "torch.uint8" => 1usize,
         "torch.bfloat16" => 2usize,
         "torch.float32" | "torch.int32" => 4,
         "torch.float64" => 8,
@@ -173,7 +174,8 @@ fn native_layer3_same_quant() -> Result<()> {
     let dense = PathBuf::from(std::env::var("CUTEAFD_EXLR8_DENSE_SNAPSHOT")?);
     let manifest: Value = serde_json::from_slice(&std::fs::read(root.join("manifest.json"))?)?;
     ensure!(
-        manifest["schema"] == 1
+        manifest["schema"] == 2
+            && manifest["activation_wire"] == "fp8_e4m3_ue8m0_k32_amax_floor_1e-4_routed_only"
             && manifest["seed"] == 408
             && manifest["layer"] == 3
             && manifest["rows"] == serde_json::json!([1, 8, 64, 65])
@@ -322,6 +324,31 @@ fn native_layer3_same_quant() -> Result<()> {
                     transport,
                     runtime,
                 )?;
+                let staged = w.router_host.borrow();
+                let request = expert_request(
+                    staged.bytes(),
+                    3,
+                    rows,
+                    h,
+                    engine.cfg.topk,
+                    false,
+                    engine.spark_bf16,
+                    engine.native_experts.is_some(),
+                )?;
+                ensure!(
+                    request.header.hidden_dtype
+                        == cuteafd_transport::ExpertV2Dtype::Fp8E4m3Ue8m0K32,
+                    "same-quant gate requires standard Fp8K32 requests"
+                );
+                let wire = request.hidden_payload.as_ref();
+                let out = PathBuf::from(std::env::var("CUTEAFD_GOLDEN_OUT")?);
+                std::fs::write(out.join(format!("r{rows}_actual_wire.bin")), wire)?;
+                let expected_wire = load("wire", "torch.uint8", &[rows, h + h / 32])?;
+                ensure!(
+                    wire == expected_wire,
+                    "native request differs from NumPy FP8 K32 oracle at {rows} rows"
+                );
+                drop(staged);
                 let actual = engine.download(&w.h, rows * h * 2)?;
                 let ids = engine.download(&w.route_ids, rows * engine.cfg.topk * 4)?;
                 let expected = load("ids", "torch.int32", &[rows, engine.cfg.topk])?;

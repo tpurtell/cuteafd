@@ -127,7 +127,7 @@ def test_up1_width_inventory_matches_mounted_checkpoint_headers():
             assert payload[f"trellis.{projection}"]["dtype"] == "U8"
 
 
-def official_moe(ref, bank, config, hidden, routes, ids):
+def official_moe(ref, bank, config, hidden, routes, ids, routed_hidden=None):
     """Use vendor expert visitation, BF16 boundaries and index_add without reimplementing them."""
     import torch
 
@@ -154,12 +154,14 @@ def official_moe(ref, bank, config, hidden, routes, ids):
         for p in ("gate", "up", "down")})
     moe = SimpleNamespace(
         gate=lambda x: (None, routes.to(hidden.dtype) if hidden.dtype == torch.float64 else routes, ids),
-        experts=lambda x, i, w: ref.GlmMoeDsaExperts.forward(experts, x, i, w),
+        experts=lambda x, i, w: ref.GlmMoeDsaExperts.forward(
+            experts, x if routed_hidden is None else routed_hidden.to(x.dtype), i, w),
         shared_experts=lambda x: ref.GlmMoeDsaMLP.forward(mlp, x))
     return ref.GlmMoeDsaMoE.forward(moe, hidden)
 
 
-def test_official_moe_binding_matches_pinned_module_on_cpu(monkeypatch):
+@pytest.mark.parametrize("routed_override", [False, True])
+def test_official_moe_binding_matches_pinned_module_on_cpu(monkeypatch, routed_override):
     torch = pytest.importorskip("torch")
     monkeypatch.syspath_prepend(str(ROOT / "third_party/transformers/src"))
     from transformers.models.glm_moe_dsa import modeling_glm_moe_dsa as ref
@@ -186,9 +188,81 @@ def test_official_moe_binding_matches_pinned_module_on_cpu(monkeypatch):
                 getattr(module.shared_experts, projection + "_proj").weight.copy_(weight)
             routing = routes.double() if dtype == torch.float64 else routes
             monkeypatch.setattr(module.gate, "forward", lambda x: (None, routing, ids))
-            expected = module(hidden.to(dtype))
-            actual = official_moe(ref, bank, config, hidden.to(dtype), routes, ids)
+            original = hidden.to(dtype)
+            routed = (hidden.float() + 0.25).bfloat16().float() if routed_override else None
+            if routed_override:
+                # The real MoE still sends original activations to gate/shared.
+                forward = module.experts.forward
+                monkeypatch.setattr(module.experts, "forward", lambda x, i, w: forward(routed.to(dtype), i, w))
+            expected = module(original)
+            vendor_forward = ref.GlmMoeDsaMoE.forward
+            seen = []
+
+            def check_inputs(moe, x):
+                for name in ("gate", "shared_experts"):
+                    operation = getattr(moe, name)
+
+                    def checked(value, name=name, operation=operation):
+                        torch.testing.assert_close(value, original, rtol=0, atol=0)
+                        seen.append(name)
+                        return operation(value)
+
+                    setattr(moe, name, checked)
+                return vendor_forward(moe, x)
+
+            with monkeypatch.context() as patch:
+                patch.setattr(ref.GlmMoeDsaMoE, "forward", check_inputs)
+                actual = official_moe(ref, bank, config, original, routes, ids, routed)
+            assert seen == ["gate", "shared_experts"]
             torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+            if routed_override:
+                all_changed = module(routed.to(dtype))
+                assert not torch.equal(expected, all_changed), "shared input must stay unquantized"
+
+
+@pytest.mark.parametrize("case", ["random", "zeros", "tiny", "maximum", "subnormal", "ties"])
+def test_fp8_wire_numpy_matches_serving_cpu_intrinsics(case):
+    import numpy as np
+    torch = pytest.importorskip("torch")
+    from b12x._lib.intrinsics import pow2_ceil_ue8m0_torch, _ue8m0_output_scale_torch
+
+    hidden = torch.randn((8, 128), generator=torch.Generator().manual_seed(SEED)).bfloat16()
+    if case == "zeros":
+        hidden.zero_()
+        hidden[:, 1::2] = -0.0
+    elif case == "tiny":
+        hidden.mul_(1e-8)
+    elif case == "maximum":
+        hidden.fill_(torch.finfo(torch.bfloat16).max)
+        hidden[:, 1::2].neg_()
+    elif case == "subnormal":
+        hidden = torch.arange(32, dtype=torch.int32).view(torch.bfloat16).reshape(2, 32).repeat(4, 4)
+    elif case == "ties":
+        hidden = torch.tensor([1.0625, 1.1875, 2**-10, 3*2**-10, -0.0, 448, -448, 1.0],
+                              dtype=torch.bfloat16).repeat(8, 16)
+    blocks = hidden.float().reshape(8, -1, 32)
+    _, scales = pow2_ceil_ue8m0_torch(blocks.abs().amax(-1).clamp_min(1e-4) * (1.0 / 448.0))
+    inverse = _ue8m0_output_scale_torch(scales)
+    payload = (blocks * inverse[..., None]).clamp(-448, 448).to(torch.float8_e4m3fn).view(torch.uint8)
+    expected = torch.cat((payload.reshape(8, 128), scales), dim=1).numpy()
+    oracle = load_reference("exlr8_cpu_wire_oracle", "python/reference/exlr8.py")
+    actual = oracle.fp8_k32_wire(hidden.float().numpy())
+    assert actual.tobytes() == expected.tobytes()
+    decoded = payload.view(torch.float8_e4m3fn).float() * torch.exp2(scales.float() - 127)[..., None]
+    if case == "maximum":
+        # 256 * 2**120 = 2**128: serving FP32 reconstruction also overflows.
+        assert (actual[:, 128:] == 247).all()
+        assert (actual[:, :128:2] == 0x78).all()
+        assert (actual[:, 1:128:2] == 0xF8).all()
+        with pytest.warns(RuntimeWarning, match="overflow encountered in multiply"):
+            reconstructed = oracle.fp8_k32_decode(actual)
+        assert np.isinf(reconstructed).all()
+    else:
+        reconstructed = oracle.fp8_k32_decode(actual)
+        assert np.isfinite(reconstructed).all()
+    np.testing.assert_array_equal(reconstructed, decoded.reshape(8, 128).numpy())
+    if case in ("zeros", "tiny", "subnormal"):
+        assert (actual[:, 128:] == 105).all(), "amax floor precludes subnormal wire scales"
 
 
 def save_fixture(root, manifest, name, tensor):
@@ -207,12 +281,16 @@ def generate_outputs(ref, bank, config, router, norm, root, manifest, device):
                                generator=torch.Generator().manual_seed(SEED)).bfloat16().to(device)
         hidden = norm(residual).bfloat16()
         _, routes, ids = router(hidden)
-        official = (residual + official_moe(ref, bank, config, hidden, routes, ids)).float()
-        fp64 = residual.double() + official_moe(ref, bank, config, hidden.double(), routes, ids)
+        oracle = load_reference("exlr8_fixture_wire_oracle", "python/reference/exlr8.py")
+        wire = oracle.fp8_k32_wire(hidden.float().cpu().numpy())
+        routed = torch.from_numpy(oracle.fp8_k32_decode(wire)).to(device)
+        official = (residual + official_moe(ref, bank, config, hidden, routes, ids, routed)).float()
+        fp64 = residual.double() + official_moe(ref, bank, config, hidden.double(), routes, ids, routed)
         assert torch.isfinite(official).all() and torch.isfinite(fp64).all()
         for rows in ROWS:
-            for name, value in {"residual": residual, "hidden": hidden, "ids": ids.int(),
-                                "routes": routes, "official_output": official, "fp64_output": fp64}.items():
+            for name, value in {"residual": residual, "hidden": hidden, "wire": torch.from_numpy(wire),
+                                "ids": ids.int(), "routes": routes,
+                                "official_output": official, "fp64_output": fp64}.items():
                 save_fixture(root, manifest, f"r{rows}_{name}", value[:rows])
     (root / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
 
@@ -256,12 +334,14 @@ def test_generator_cpu_end_to_end_with_real_layer_operands(monkeypatch, tmp_path
     bank = DecodedExperts(Path(configured), selected, oracle, torch)
     generate_outputs(ref, bank, config, router, norm, tmp_path, {"files": {}}, "cpu")
     manifest = json.loads((tmp_path / "manifest.json").read_text())
-    assert len(manifest["files"]) == len(ROWS) * 6
+    assert len(manifest["files"]) == len(ROWS) * 7
     for name, entry in manifest["files"].items():
         data = (tmp_path / (name + ".bin")).read_bytes()
         assert len(data) == entry["bytes"] and hashlib.sha256(data).hexdigest() == entry["sha256"]
         rows = int(name.split("_")[0][1:])
-        assert entry["shape"] == [rows, 2 if name.endswith(("_ids", "_routes")) else config.hidden_size]
+        width = (2 if name.endswith(("_ids", "_routes")) else
+                 config.hidden_size + config.hidden_size // 32 if name.endswith("_wire") else config.hidden_size)
+        assert entry["shape"] == [rows, width]
 
 
 def test_layer3_same_quant_fixtures(monkeypatch):
@@ -295,14 +375,15 @@ def test_layer3_same_quant_fixtures(monkeypatch):
     monkeypatch.setattr(torch, "einsum", torch.einsum)
     install()
     manifest = {
-        "schema": 1, "seed": SEED, "layer": 3, "rows": list(ROWS), "manifest": "up1",
+        "schema": 2, "seed": SEED, "layer": 3, "rows": list(ROWS), "manifest": "up1",
+        "activation_wire": "fp8_e4m3_ue8m0_k32_amax_floor_1e-4_routed_only",
         "checkpoint": "kindlingai/glm-5.3-exlr8-k2-k3-k4", "revision": EXLR8_REVISION,
         "dense_checkpoint": "zai-org/GLM-5.3", "dense_revision": DENSE_REVISION,
         "set_id": selected["set_id"], "error_ratio_bound": 1.01,
         "source_sha256": {p: sha256(ROOT / p) for p in SOURCES},
         "checkpoint_files_sha256": {}, "dense_tensors_sha256": {}, "files": {},
-        "official_arithmetic": "official GLM MoE/Experts/MLP forward; BF16 decoded physical operands and inputs; fixed M128",
-        "fp64_arithmetic": "same oracle-decoded F32 physical operands, BF16 inputs; FP64 projections, silu, routing and residual sum",
+        "official_arithmetic": "official GLM MoE/Experts/MLP forward; BF16 decoded operands; routed FP8 K32 roundtrip, BF16 shared input and router; fixed M128",
+        "fp64_arithmetic": "same oracle-decoded F32 physical operands; identical routed FP8 K32 roundtrip and BF16 shared input; FP64 projections, silu, routing and residual sum",
         "torch": torch.__version__, "cuda": torch.version.cuda, "allow_tf32": False,
     }
     widths = layer_widths(selected["layers"]["3"])

@@ -91,6 +91,55 @@ def e4m3_round(values):
     return np.copysign(np.minimum(np.rint(magnitude / step) * step, 448.0), x)
 
 
+def fp8_k32_wire(values):
+    """Serving GLM wire: FP32 amax floor, bitwise ceil UE8M0, E4M3 RN-satfinite.
+
+    Input values are the already-rounded BF16 activations, represented as FP32.
+    Each row stores hidden E4M3 bytes followed by hidden/32 scale bytes.
+    """
+    x = np.asarray(values, dtype=np.float32)
+    if x.ndim != 2 or x.shape[0] == 0 or x.shape[1] == 0 or x.shape[1] % 32:
+        raise ValueError("FP8 K32 wire requires nonempty rows with width divisible by 32")
+    if not np.isfinite(x).all():
+        raise ValueError("FP8 K32 wire requires finite activations")
+    blocks = x.reshape(x.shape[0], -1, 32)
+    maximum = np.maximum(np.max(np.abs(blocks), axis=-1), np.float32(1e-4))
+    scale_bits = (maximum * np.float32(1.0 / 448.0)).view(np.uint32)
+    rounded_bits = np.where(scale_bits & np.uint32(0x007FFFFF),
+        (scale_bits + np.uint32(0x00800000)) & np.uint32(0x7F800000), scale_bits)
+    scales = ((rounded_bits >> 23) & 255).astype(np.uint8)
+    inverse = np.ldexp(np.ones(scales.shape, dtype=np.float32), 127 - scales.astype(np.int32))
+    rounded = e4m3_round(blocks * inverse[..., None])
+    magnitude = np.abs(rounded)
+    bits = magnitude.view(np.uint32)
+    normal = (((bits >> 23).astype(np.int32) - 120) << 3) | ((bits >> 20) & 7).astype(np.int32)
+    payload = np.where(magnitude < np.float32(2.0 ** -6),
+        np.rint(magnitude * np.float32(512)), normal).astype(np.uint8)
+    payload |= np.signbit(rounded).astype(np.uint8) << 7
+    return np.concatenate((payload.reshape(x.shape), scales), axis=1)
+
+
+def fp8_k32_decode(wire):
+    """Decode with serving FP32 arithmetic before the native H128 transform.
+
+    Rounding the largest finite BF16 input can reconstruct to 2**128, so
+    IEEE overflow to infinity is intentional rather than finite saturation.
+    """
+    wire = np.asarray(wire)
+    if wire.ndim != 2 or wire.dtype != np.uint8 or wire.shape[1] == 0 or wire.shape[1] % 33:
+        raise ValueError("FP8 K32 wire requires uint8 rows of complete 33-byte blocks")
+    hidden = wire.shape[1] // 33 * 32
+    payload = wire[:, :hidden].reshape(wire.shape[0], -1, 32)
+    exponent = ((payload >> 3) & 15).astype(np.int32)
+    mantissa = (payload & 7).astype(np.float32)
+    values = np.where(exponent == 0, mantissa * np.float32(2.0 ** -9),
+        np.ldexp(1 + mantissa / np.float32(8), exponent - 7))
+    values = np.copysign(values, np.where(payload & 128, np.float32(-1), np.float32(1)))
+    scales = np.ldexp(np.ones((wire.shape[0], hidden // 32), dtype=np.float32),
+        wire[:, hidden:].astype(np.int32) - 127)
+    return (values * scales[..., None]).reshape(wire.shape[0], hidden)
+
+
 def decode_tiles(data, k):
     if k not in (2, 3, 4) or len(data) % (32 * k):
         raise ValueError("trellis data must contain complete K2/K3/K4 tiles")

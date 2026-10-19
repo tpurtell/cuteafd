@@ -66,6 +66,54 @@ def test_mxfp8_preserves_zero_and_exact_powers():
     np.testing.assert_array_equal(REF.mxfp8(x), x)
 
 
+def test_fp8_wire_layout_rounding_and_signed_zero():
+    pattern = [1.0625, 1.1875, 2**-10, 3*2**-10, -0.0, 448, -448, 1.0]
+    hidden = np.array([pattern * 4 + [1] * 32], dtype=np.float32)
+    wire = REF.fp8_k32_wire(hidden)
+    assert wire.shape == (1, 66) and wire.dtype == np.uint8
+    np.testing.assert_array_equal(wire[0, :32], [0x38, 0x3A, 0, 2, 0x80, 0x7E, 0xFE, 0x38] * 4)
+    np.testing.assert_array_equal(wire[0, 32:64], 0x78)
+    np.testing.assert_array_equal(wire[0, 64:], [127, 119])
+    decoded = REF.fp8_k32_decode(wire)
+    np.testing.assert_array_equal(decoded[0, :32], [1, 1.25, 0, 2**-8, -0.0, 448, -448, 1] * 4)
+    np.testing.assert_array_equal(decoded[0, 32:], 1)
+    assert np.signbit(decoded[0, 4])
+
+
+def test_fp8_wire_floor_and_scale_boundary():
+    hidden = np.zeros((5, 32), dtype=np.float32)
+    hidden[1] = np.nextafter(np.float32(0), np.float32(1))
+    hidden[2] = np.float32(1e-8)
+    hidden[3] = np.float32(448)
+    hidden[4] = np.nextafter(np.float32(448), np.float32(np.inf))
+    wire = REF.fp8_k32_wire(hidden)
+    np.testing.assert_array_equal(wire[:, 32], [105, 105, 105, 127, 128])
+    np.testing.assert_array_equal(wire[:2, :32], 0)
+
+
+def test_fp8_wire_quantization_is_row_independent():
+    hidden = np.random.default_rng(408).standard_normal((65, 128), dtype=np.float32)
+    wire = REF.fp8_k32_wire(hidden)
+    for rows in (1, 8, 64, 65):
+        np.testing.assert_array_equal(REF.fp8_k32_wire(hidden[:rows]), wire[:rows])
+        np.testing.assert_array_equal(REF.fp8_k32_decode(wire[:rows]), REF.fp8_k32_decode(wire)[:rows])
+
+
+@pytest.mark.parametrize("hidden", [np.zeros(32), np.zeros((0, 32)), np.zeros((1, 0)),
+                                    np.zeros((1, 31)), np.full((1, 32), np.nan),
+                                    np.full((1, 32), np.inf)])
+def test_fp8_wire_rejects_invalid_activations(hidden):
+    with pytest.raises(ValueError, match="FP8 K32 wire requires"):
+        REF.fp8_k32_wire(hidden)
+
+
+@pytest.mark.parametrize("wire", [np.zeros(33, dtype=np.uint8), np.zeros((1, 0), dtype=np.uint8),
+                                  np.zeros((1, 32), dtype=np.uint8), np.zeros((1, 33))])
+def test_fp8_wire_rejects_invalid_extents(wire):
+    with pytest.raises(ValueError, match="FP8 K32 wire requires"):
+        REF.fp8_k32_decode(wire)
+
+
 def test_incomplete_tile_rejected():
     with pytest.raises(ValueError, match="complete"):
         REF.decode_tiles(b"bad", 3)
