@@ -30,6 +30,8 @@ INTENDED = {
         "CUTEAFD_CONSOLE_TEXT": "true",
         "CUTEAFD_ATTENTION_PLACEMENT": "auto",
         "CUTEAFD_FP8_EXPERT_PREFILL": "auto",
+        # Admission follows the launcher's bounded readiness deadline.
+        "CUTEAFD_SPARK_ADMISSION_TIMEOUT_SECONDS": "30",
         # shared_trace_args: the shared draft policy switches, default off.
         "CUTEAFD_DRAFT_SURVIVAL_LENGTHS": "0",
         # shared_thermal_args: the GPU throttle sampler (#114), default on.
