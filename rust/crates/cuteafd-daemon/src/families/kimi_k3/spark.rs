@@ -4,7 +4,7 @@ use super::device::LocalLane;
 use crate::shared::{
     experts::staging::RouteStaging,
     memory::{HostAllocation, device::{Event, Stream}},
-    spark_intake::{SparkIntake, SparkLane},
+    spark_intake::SparkLane,
 };
 use anyhow::{ensure, Context, Result};
 use cuteafd_core::{ExpertGeometry, memory_layout::{Basis, Category}};
@@ -14,7 +14,7 @@ use cuteafd_transport::{expert::SparkWorld, ExpertProtocolV2Request,
     ExpertProtocolV2RowDescriptor, ExpertV2Dtype, ExpertV2SourceKind,
     TcpTransportConfig};
 use cuteafd_transport::protocol_v2::EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16;
-use std::{net::SocketAddr, rc::Rc, time::Duration};
+use std::{net::SocketAddr, rc::Rc, sync::Arc, time::Duration};
 
 const RANKS: usize = 6;
 const LATENT: usize = 3584;
@@ -36,8 +36,9 @@ pub(crate) struct Ticket { layer: usize, rows: usize, sequence: u64 }
 /// joins its transport thread before the intake's planes are released.
 pub(crate) struct RoutedLane<'a> {
     stream: Rc<Stream<'a>>,
-    worker: Option<cuteafd_transport::expert::SparkExpertLane>,
-    intake: SparkIntake<'a>,
+    link: Option<SparkLane<'a>>,
+    library_owner: Arc<cuteafd_ffi::NativeLibrary>,
+    terminal: bool,
     staging: HostAllocation<'a>,
     ready: Event<'a>,
     capacity: usize,
@@ -46,12 +47,20 @@ pub(crate) struct RoutedLane<'a> {
 }
 
 impl Drop for RoutedLane<'_> {
-    fn drop(&mut self) { self.stream.drain_or_abort("Kimi routed lane copies and consumers"); }
+    fn drop(&mut self) {
+        self.stream.drain_or_abort("Kimi routed lane copies and consumers");
+        let link = self.link.take();
+        crate::shared::decode_graph::fatal_drain(
+            self.stream.device.run(|| { drop(link); Ok(()) }), "Kimi routed lane device-scoped release");
+    }
 }
 
 impl<'a> RoutedLane<'a> {
-    pub(super) fn connect(local: &LocalLane<'a>, placement: &Placement, world: SparkWorld,
+    pub(super) fn connect(library_owner: &'a Arc<cuteafd_ffi::NativeLibrary>,
+        local: &LocalLane<'a>, placement: &Placement, world: SparkWorld,
         peers: Vec<SocketAddr>, config: TcpTransportConfig) -> Result<Self> {
+        ensure!(std::ptr::eq(library_owner.as_ref(), local.stream().device.library),
+            "Kimi Spark library owner differs from admitted device");
         ensure!(cuteafd_core::expert_geometry() == ExpertGeometry::KIMI_K3,
             "Kimi Spark helpers require the process latent expert geometry before native loading");
         ensure!(peers.len() == RANKS && local.has_embedding(),
@@ -63,36 +72,44 @@ impl<'a> RoutedLane<'a> {
             "Kimi Spark intake differs from accepted admission");
         let stream = local.stream().clone();
         let layout = RouteStaging::new(local.rows(), TOPK, KimiExpertInput::ROW_BYTES)?;
-        let library = stream.device.library;
+        let library = library_owner.as_ref();
         let (link, staging, ready) = stream.device.run(|| {
             library.v41_compact_reducer()?.require_plane_reduction(RANKS as u32)?;
             Ok((SparkLane::new(library, world, peers, local.rows() as u32, config, LATENT * 2)?,
                 HostAllocation::new(library, layout.bytes)?, Event::new(stream.device)?))
         })?;
         ensure!(link.world_size() == RANKS, "Kimi Spark transport world differs from admission");
-        let SparkLane { lane, intake } = link;
-        Ok(Self { stream, worker: Some(lane), intake, staging, ready,
-            capacity: local.rows(), sequence: 0, pending: None })
+        Ok(Self { stream, link: Some(link), library_owner: Arc::clone(library_owner),
+            terminal: false, staging, ready, capacity: local.rows(), sequence: 0, pending: None })
     }
 
-    /// Single terminal link boundary; planes and upload sources remain owned.
-    /// #511: replace drop-and-join with checked QP quiescence and retention.
+    /// #511: diagnostic-only successful-drain boundary, not failure-safe.
+    /// Keep the whole lane and its exact library owner until copies are drained.
     pub(crate) fn quiesce_links(&mut self) -> Result<()> {
-        drop(self.worker.take());
+        ensure!(self.pending.is_none(), "Kimi interim teardown cannot quiesce a failed wave (#511)");
+        self.terminal = true;
+        tracing::warn!("Kimi diagnostic teardown: not failure-safe; #511 checked quiescence pending");
         Ok(())
     }
 
     pub(crate) fn drain_copies(&self) -> Result<()> {
-        self.stream.device.run(|| self.intake.terminal_drain_copies())
+        self.stream.device.run(|| match &self.link {
+            Some(link) => link.intake.terminal_drain_copies(),
+            None => Ok(()),
+        })
     }
 
-    pub(crate) fn release_payloads(&self) -> Result<()> {
-        ensure!(self.worker.is_none(), "Kimi Spark sources still have a worker owner");
-        self.stream.device.run(|| self.intake.terminal_release_payloads())
+    pub(crate) fn release_payloads(&mut self) -> Result<()> {
+        ensure!(self.terminal && self.pending.is_none(), "Kimi Spark sources are not terminal");
+        self.drain_copies()?;
+        // #511: successful cold diagnostics only. Drop joins before intake release.
+        let link = self.link.take();
+        self.stream.device.run(|| { drop(link); Ok(()) })
     }
 
     fn check(&self, local: &LocalLane<'_>, rows: usize) -> Result<()> {
-        ensure!(self.worker.is_some() && Rc::ptr_eq(&self.stream, local.stream())
+        ensure!(self.link.is_some() && !self.terminal && Rc::ptr_eq(&self.stream, local.stream())
+            && std::ptr::eq(self.library_owner.as_ref(), self.stream.device.library)
             && (1..=self.capacity).contains(&rows),
             "Kimi Spark wave differs from retained lane stream or capacity");
         Ok(())
@@ -125,9 +142,8 @@ impl<'a> RoutedLane<'a> {
         // Retain the terminal wave identity before handing work to the lane.
         self.pending = Some(ticket);
         self.sequence = sequence;
-        let worker = self.worker.as_mut().context("Kimi Spark worker retired")?;
-        self.stream.device.run(|| self.intake.before_dispatch()
-            .and_then(|()| self.intake.submit_lane(worker, rows, Box::new(move || Ok(request)))))?;
+        let link = self.link.as_mut().context("Kimi Spark lane retired")?;
+        self.stream.device.run(|| link.submit(rows, Box::new(move || Ok(request))))?;
         Ok(ticket)
     }
 
@@ -137,16 +153,15 @@ impl<'a> RoutedLane<'a> {
         self.check(local, ticket.rows)?;
         ensure!(self.pending == Some(ticket), "Kimi Spark completion differs from retained wave");
         let output = local.buffer("expert combined")?;
-        let worker = self.worker.as_mut().context("Kimi Spark worker retired")?;
+        let link = self.link.as_mut().context("Kimi Spark lane retired")?;
         self.stream.device.run(|| {
-            let times = worker.wait(Duration::from_secs(120))?;
-            self.intake.after_lane(ticket.rows, times.landed, self.stream.raw)?;
+            link.wait(ticket.rows, Duration::from_secs(120), self.stream.raw)?;
             // SAFETY: wait orders all six live intake planes before this exact
             // lane stream; output is a disjoint admitted latent allocation.
             unsafe { self.stream.device.library.v41_compact_reducer()?.reduce_planes(
-                self.intake.pointers(), RANKS as u32, std::ptr::null(),
+                link.intake.pointers(), RANKS as u32, std::ptr::null(),
                 output.ptr.cast(), ticket.rows as u32, self.stream.raw)?; }
-            self.intake.consumed(self.stream.raw)
+            link.intake.consumed(self.stream.raw)
         })?;
         self.pending = None;
         Ok(())
@@ -174,6 +189,21 @@ fn request(layer: usize, rows: usize, sequence: u64, kind: ExpertV2SourceKind,
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn routed_owner_keeps_shared_lane_and_exact_library_until_terminal_release() {
+        let source = include_str!("spark.rs").split("#[cfg(test)]").next().unwrap();
+        assert!(source.contains("link: Option<SparkLane<'a>>"));
+        assert!(source.contains("library_owner: Arc<cuteafd_ffi::NativeLibrary>"));
+        assert!(source.contains("std::ptr::eq(library_owner.as_ref(), local.stream().device.library)"));
+        assert!(source.contains("Arc::clone(library_owner)"));
+        assert!(!source.contains("let SparkLane {"));
+        let release = source.split("pub(crate) fn release_payloads").nth(1).unwrap()
+            .split("fn check").next().unwrap();
+        assert!(release.find("self.drain_copies()?").unwrap() < release.find("self.link.take()").unwrap());
+        assert!(release.contains("self.stream.device.run(|| { drop(link); Ok(()) })"));
+        assert!(source.contains("not failure-safe"));
+    }
 
     #[test]
     fn request_is_latent_fp8_k16_with_compact_six_rank_returns() -> Result<()> {

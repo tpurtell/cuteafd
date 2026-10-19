@@ -174,7 +174,7 @@ async fn run() -> Result<()> {
         anyhow::ensure!(matches!(&command, Commands::ServeNative(_) | Commands::ServeMimo(_)
             | Commands::ServeQwen4(_) | Commands::ServeQwen35(_) | Commands::ServeGlmf(_) | Commands::ServeGlm(_)
             | Commands::ServeDsv4(_) | Commands::V41Golden(_) | Commands::Dsv4Golden(_) | Commands::GlmGolden(_)
-            | Commands::MimoGolden(_) | Commands::GlmfGolden(_) | Commands::Qwen4Golden(_) | Commands::Qwen35Golden(_) | Commands::Step5Golden(_)),
+            | Commands::MimoGolden(_) | Commands::GlmfGolden(_) | Commands::Qwen4Golden(_) | Commands::Qwen35Golden(_) | Commands::Step5Golden(_) | Commands::KimiGolden(_)),
             "--coordinator-gpu-budget-gib applies only to coordinator serve/golden and plan commands");
         let budget = cuteafd_core::serving_capacity::GpuMemoryBudget::from_gib(gib)?;
         cuteafd_ffi::set_coordinator_gpu_budget(budget.0)?;
@@ -212,6 +212,7 @@ async fn run() -> Result<()> {
         Commands::Qwen4Golden(args) => families::qwen4::run_golden(args).await,
         Commands::Qwen35Golden(args) => families::qwen3_5::run_golden(args).await,
         Commands::Step5Golden(args) => families::step5::golden::run(args),
+        Commands::KimiGolden(args) => families::kimi_k3::golden::run(args),
         Commands::ServeQwen35(args) => families::qwen3_5::serve::run_serve(args).await,
         Commands::ServeQwen4(args) => families::qwen4::serve::run_serve(args).await,
         Commands::ServeGlmf(args) => families::glm5_flash::serve::run_serve(args).await,

@@ -177,6 +177,10 @@ impl<'a> NativePrograms<'a> {
         Ok(())
     }
 
+    pub(super) fn check_inventory(&self, cfg: &KimiK3Config) -> Result<()> {
+        super::admission::check_prefix(&self.w8.cfg, cfg)
+    }
+
     pub(crate) fn lane_layout(&self, cfg: &KimiK3Config, rows: usize, max_context: usize) -> Result<LaneLayout> {
         self.check_config(cfg)?;
         ensure!(self.mla.iter().all(|p| [p.decode.max_context(), p.verify.max_context(), p.extend.max_context()]
@@ -328,6 +332,7 @@ impl Lane<'_> {
 pub(crate) struct LocalLane<'a> {
     lane: Lane<'a>,
     programs: Rc<NativePrograms<'a>>,
+    cfg: KimiK3Config,
     layers: Vec<Rc<super::weights::LayerWeights<'a>>>,
     global: Rc<GlobalWeights<'a>>,
     lane_index: usize,
@@ -341,18 +346,19 @@ impl Drop for LocalLane<'_> {
 }
 
 impl<'a> LocalLane<'a> {
-    pub(super) fn new(lane: Lane<'a>, programs: Rc<NativePrograms<'a>>,
+    pub(super) fn new(lane: Lane<'a>, programs: Rc<NativePrograms<'a>>, cfg: KimiK3Config,
         layers: Vec<Rc<super::weights::LayerWeights<'a>>>, global: Rc<GlobalWeights<'a>>,
         lane_index: usize, kda: Rc<super::state::KdaBank<'a>>, mla: Rc<super::mla::CacheBank<'a>>) -> Result<Self> {
         let device = lane.stream.device;
         ensure!(programs.device.id == device.id && std::ptr::eq(programs.device.library, device.library),
             "Kimi local programs differ from admitted lane device");
-        ensure!(layers.len() == programs.w8.cfg.layers, "Kimi local layer inventory differs from programs");
+        programs.check_inventory(&cfg)?;
+        ensure!(layers.len() == cfg.layers, "Kimi local layer inventory differs from admitted prefix");
         for weights in &layers { weights.check_device(device)?; }
         global.check_device(device)?;
         kda.check_reader(lane_index, &lane.stream)?;
         mla.check_reader(lane_index, &lane.stream)?;
-        Ok(Self { lane, programs, layers, global, lane_index, kda, mla, attention: None })
+        Ok(Self { lane, programs, cfg, layers, global, lane_index, kda, mla, attention: None })
     }
 
     fn layer(&self, layer: usize) -> Result<&super::weights::LayerWeights<'a>> {
@@ -372,7 +378,7 @@ impl<'a> LocalLane<'a> {
     pub(super) fn rows(&self) -> usize { self.lane.rows() }
     pub(super) fn lane_index(&self) -> usize { self.lane_index }
     pub(super) fn has_embedding(&self) -> bool { self.global.buffer("embedding").is_ok() }
-    pub(super) fn config(&self) -> &KimiK3Config { &self.programs.w8.cfg }
+    pub(super) fn config(&self) -> &KimiK3Config { &self.cfg }
 
     pub(super) fn attention_share(&self, layer: usize) -> Result<crate::shared::placement::layers::AttentionShare> {
         Ok(self.layer(layer)?.attention)
@@ -470,6 +476,20 @@ impl<'a> LocalLane<'a> {
             // SAFETY: disjoint admitted allocations retained by this persistent owner.
             unsafe { self.lane.stream.device.library.copy_d2d_async(prefix, source, source.bytes, self.lane.stream.raw) }
         })
+    }
+
+    /// A decoder layer returns prefix plus its final FFN delta, before the
+    /// model's output attention-residual mix or final normalization.
+    pub(crate) fn terminal_residual(&mut self, rows: usize) -> Result<CuteafdDeviceBuffer> {
+        let delta = self.plane("delta", rows, 7168)?;
+        let prefix = view(self.lane.buffer("residual arena")?,
+            8 * self.lane.rows() * 7168 * 2, delta.bytes)?;
+        let output = self.plane("normalized", rows, 7168)?;
+        self.lane.stream.device.run(|| {
+            // SAFETY: the exact persistent lane owns all three disjoint planes.
+            unsafe { self.programs.add.launch(prefix, delta, output, rows * 7168, self.lane.stream.raw) }
+        })?;
+        Ok(output)
     }
 
     pub(crate) fn residual(&mut self, site: MixSite, rows: usize) -> Result<CuteafdDeviceBuffer> {
