@@ -1,6 +1,8 @@
 use super::*;
 use crate::plan::{self, checkpoint::Checkpoint, format, testing::{self, t, Tensor as FixtureTensor}, *};
+use anyhow::Context;
 use serde_json::Value;
+use crate::families::kimi_k3::validate_expert_inventory;
 
 fn config() -> Value { crate::families::kimi_k3::config::tests::release_config() }
 
@@ -94,7 +96,8 @@ fn snapshot(all: bool) -> tempfile::TempDir {
 fn with_layout(ranks: usize, budget: Option<u64>) -> PlanOptions {
     PlanOptions { placement: ExpertPlacement::from_spark_ranks(ranks), spark_budget_bytes: budget,
         layout: Some(layout::LayoutOptions { rtx_bytes: vec![crate::placement::inventory::PRO_TOTAL_BYTES; 2],
-            spark_allocation_budget_bytes: budget, ..Default::default() }), ..Default::default() }
+            // The text card retains device snapshots; host spilling is disabled.
+            host_cache_bytes: Some(0), spark_allocation_budget_bytes: budget, ..Default::default() }), ..Default::default() }
 }
 
 fn installed_inventory(root: &std::path::Path, spark: bool) -> std::path::PathBuf {
@@ -140,18 +143,27 @@ fn installed_inventory(root: &std::path::Path, spark: bool) -> std::path::PathBu
 }
 
 #[test]
-fn routed_acceptance_requires_the_installed_role_inventory() {
+fn header_acceptance_is_independent_of_runtime_inventory() {
     let snapshot = snapshot(false);
     let checkpoint = Checkpoint::open(snapshot.path()).unwrap();
     let trellis = checkpoint.tensors.iter().filter(|t| t.meta.name.contains(".experts.0.w1.")).cloned().collect::<Vec<_>>();
     let mut operand = format::detect(format::group_by_stem(&trellis).values().next().unwrap()).unwrap();
     let stem = format!("{TEXT}layers.1.block_sparse_moe.experts.0.w1");
     let role = TensorRole::layer(Component::RoutedExpert, 1);
-    let mut model = Model::open(&checkpoint).unwrap();
+    let model = Model::open(&checkpoint).unwrap();
+    model.accepts(&role, &stem, &mut operand).unwrap();
+    assert_eq!(model.experts(&operand).unwrap().package, PACKAGE);
+    let mut malformed = operand.clone();
+    malformed.logical[0] += 128;
+    assert!(model.accepts(&role, &stem, &mut malformed).is_err());
+    let mut unsupported = operand.clone();
+    unsupported.encoding = format::Encoding::Exl3 { bits: 3 };
+    assert!(model.accepts(&role, &stem, &mut unsupported).is_err());
+    assert!(model.experts(&unsupported).is_none());
     for spark in [false, true] {
         let dir = tempfile::tempdir().unwrap();
         let path = installed_inventory(dir.path(), spark);
-        model.installed_experts = validate_expert_inventory(&path).map_err(|e| format!("{e:#}"));
+        validate_expert_inventory(&path).unwrap();
         model.accepts(&role, &stem, &mut operand).unwrap();
         if spark {
             let meta_path = dir.path().join("exl3/exl3-kimik3-k23/tp6-rank5/m4096/v41_exl3.json");
@@ -161,8 +173,9 @@ fn routed_acceptance_requires_the_installed_role_inventory() {
         } else {
             std::fs::remove_file(dir.path().join("exl3/exl3-kimik3-k23/rtx-tp1/m80/libcuteafd_exl3.so")).unwrap();
         }
-        model.installed_experts = validate_expert_inventory(&path).map_err(|e| format!("{e:#}"));
-        assert!(model.accepts(&role, &stem, &mut operand).unwrap_err().contains("artifacts unavailable"));
+        assert!(validate_expert_inventory(&path).is_err());
+        model.accepts(&role, &stem, &mut operand).unwrap();
+        assert_eq!(model.experts(&operand).unwrap().package, PACKAGE);
     }
     let dir = tempfile::tempdir().unwrap();
     let path = installed_inventory(dir.path(), false);
@@ -174,7 +187,7 @@ fn routed_acceptance_requires_the_installed_role_inventory() {
 }
 
 #[test]
-fn release_headers_classify_and_name_every_missing_kernel() {
+fn release_headers_classify_native_text_without_installed_artifacts() {
     let dir = snapshot(false);
     let report = plan::plan(dir.path(), &PlanOptions::default()).unwrap();
     assert_eq!(report.family.as_deref(), Some("kimi_k3"));
@@ -197,10 +210,17 @@ fn release_headers_classify_and_name_every_missing_kernel() {
     let operand = format::detect(format::group_by_stem(&trellis).values().next().unwrap()).unwrap();
     let contract = model.experts(&operand).unwrap();
     assert_eq!((contract.package.as_str(), contract.block, contract.spark_worlds.clone()), (PACKAGE, 128, vec![6]));
-    assert!(report.hints.iter().any(|h| h.what.contains("Kimi K3 attention") && h.how.contains("dense_mla")));
+    assert_eq!(experts.rejected, 0);
+    assert_eq!(report.experts.as_ref().unwrap().package, PACKAGE);
+    assert!(report.components.iter().filter(|c| c.component != Component::Vision).all(|c| c.rejected == 0));
+    assert!(!report.hints.iter().any(|h| h.what.contains("W9") || h.what.contains("Kimi K3 attention")));
     // The family's own Spark budget, shown in the report and its rendering.
     assert_eq!(report.spark_budget_bytes, SPARK_BUDGET_BYTES);
     assert!(!report.executable());
+    assert_eq!(model.vision_mode(MediaMode::Auto), MediaMode::Off);
+    let vision_report = plan::plan(dir.path(), &PlanOptions { vision: MediaMode::Rtx(None), ..Default::default() }).unwrap();
+    assert!(!vision_report.wip_launchable());
+    assert!(vision_report.hints.iter().any(|h| h.what.contains("vision execution is not implemented")));
 }
 
 #[test]
@@ -322,16 +342,54 @@ fn max_card_charges_spark_runtime_and_onboards_layers_as_the_fallback() {
     let report = plan::plan(dir.path(), &with_layout(6, Some(100 << 30))).unwrap();
     assert!(!report.fits);
     assert!(report.hints.iter().any(|h| h.what.contains("107.54 GiB/rank, 7.54 GiB over the 100.00 GiB")), "{:#?}", report.hints);
-    // Explicit ceiling replaces the old 108 GiB device estimate too; runtime
-    // remains unqualified even when this offline ledger fits.
+    // Header fit is available to WIP; it is not a release qualification.
     let report = plan::plan(dir.path(), &with_layout(6, Some(112 << 30))).unwrap();
     assert_eq!(report.spark_budget_bytes, 112 << 30);
     let memory = report.memory_layout.as_ref().unwrap();
     assert!(device(memory, DeviceKind::Spark).iter().all(|d| d.capacity_bytes == 112 << 30 && d.free_bytes() > 0));
     assert!(!report.hints.iter().any(|h| h.what.contains("full memory layout needs")));
-    assert!(!report.fits && !report.placement_supported, "header fit is not W9 qualification");
+    assert!(report.fits && report.placement_supported, "{:?}", report.hints);
+    assert!(report.wip_launchable());
+    assert!(!report.executable(), "Kimi remains WIP-only until release qualification");
+    assert_eq!(report.experts.as_ref().unwrap().package, PACKAGE);
     assert!(memory.notes.iter().any(|n| n.contains("offline estimates")));
     // Other card columns are refused by name.
     let report = plan::plan(dir.path(), &with_layout(4, None)).unwrap();
     assert!(report.hints.iter().any(|h| h.what.contains("6 Spark ranks")));
+}
+
+#[test]
+#[ignore = "requires CUTEAFD_KIMI_EXL3_SNAPSHOT; reads real headers only in a manifest-free process"]
+fn mounted_release_plan_is_manifest_independent_and_wip_only() -> anyhow::Result<()> {
+    let snapshot = std::env::var_os("CUTEAFD_KIMI_EXL3_SNAPSHOT").context("Kimi snapshot required")?;
+    ensure!(std::env::var_os("CUTEAFD_PROGRAM_MANIFEST").is_none(), "run with no installed manifest environment");
+    let checkpoint = Checkpoint::open(std::path::Path::new(&snapshot))?;
+    let stem = format!("{TEXT}layers.1.block_sparse_moe.experts.0.w1");
+    let members = checkpoint.tensors.iter().filter(|t| t.meta.name.starts_with(&format!("{stem}.")))
+        .cloned().collect::<Vec<_>>();
+    let mut operand = format::detect(format::group_by_stem(&members).values().next().context("real routed header")?)
+        .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+    assert_eq!(operand.exl3_bits(), Some(2));
+    assert_eq!(operand.logical, [3072, 3584]);
+    let model = Model::open(&checkpoint)?;
+    model.accepts(&TensorRole::expert(Component::RoutedExpert, 1, 0), &stem, &mut operand)
+        .map_err(anyhow::Error::msg)?;
+    assert_eq!(model.experts(&operand).context("K2 package")?.package, PACKAGE);
+    drop(checkpoint);
+    let mut options = with_layout(6, Some(108 << 30));
+    options.vision = MediaMode::Off;
+    options.audio = MediaMode::Off;
+    options.draft_ownership = Some(spec::DraftOwnership::None);
+    let layout = options.layout.as_mut().unwrap();
+    layout.onboard = Some(crate::placement::Onboard::Layers(5));
+    // Match the serving card's automatic pool, not a forced 2M allocation.
+    layout.pool_tokens = None;
+    let report = plan::plan(std::path::Path::new(&snapshot), &options)?;
+    assert_eq!(report.experts.as_ref().context("deployment expert package")?.package, PACKAGE);
+    assert!(report.fits && report.placement_supported && report.wip_launchable(), "{:#?}", report.hints);
+    assert!(!report.executable(), "release readiness is not qualified by a header-only plan");
+    let deployment_options = crate::plan::deployment::DeploymentOptions { rtx_gpus: 2, speculator: "off".into(), ..Default::default() };
+    let deployment = crate::plan::deployment::DeploymentSpec::from_report(&report, &deployment_options);
+    assert!(deployment.is_ok(), "{deployment:?}");
+    Ok(())
 }

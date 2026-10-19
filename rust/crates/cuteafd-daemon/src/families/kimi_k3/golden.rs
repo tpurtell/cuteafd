@@ -290,6 +290,7 @@ fn native(args: &GoldenArgs, checkpoint: &cuteafd_loader::plan::Checkpoint,
     scoring: Option<&[cuteafd_bench::reference::Window]>) -> Result<()> {
     cuteafd_core::set_expert_geometry(ExpertGeometry::KIMI_K3)
         .map_err(|_| anyhow::anyhow!("Kimi golden needs an isolated process"))?;
+    super::startup::preflight(&args.manifest)?;
     // SAFETY: sealed runner supplies the DSO; all borrowing owners drop before it.
     let library = Arc::new(unsafe { cuteafd_ffi::NativeLibrary::load(args.native_lib.as_ref().context("--native-lib required")?)? });
     let programs = library.programs()?.with_manifest(&args.manifest)?;
