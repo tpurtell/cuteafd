@@ -450,6 +450,8 @@ def worker_command(state, arm, rank, record):
     cmd = ['docker', 'run', '-d', '--name', worker_name(state['task'], arm, rank), '--restart', 'no',
            '--label', f"{WORKER_LABEL}={state['task']}/{arm}", '--device', 'nvidia.com/gpu=all', '--network', 'host',
            '--ipc', 'host', '--ulimit', 'memlock=-1:-1', '--device=/dev/infiniband', *record['serving_args']]
+    if sparks.get('memory'):  # a shared Spark's unified memory: cap the container, swap equally
+        cmd += ['--memory', str(sparks['memory']), '--memory-swap', str(sparks['memory'])]
     for source, target in mounts:
         cmd += ['-v', f'{source}:{target}:ro']
     env = {'PATH': f'{SLOT_BIN}:/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin',
@@ -1122,6 +1124,8 @@ def build_state(args, arms):
             raise ValueError('--worker-ready-timeout must be positive seconds')
         if not 1 <= args.expert_port <= 65535:
             raise ValueError('--expert-port out of range')
+        if args.worker_memory_bytes is not None and args.worker_memory_bytes <= args.worker_budget_bytes:
+            raise ValueError('--worker-memory-bytes must exceed --worker-budget-bytes')
         lanes = spark_lanes(args.config, hosts)
         worker_env = {}
         for value in args.worker_env:
@@ -1131,9 +1135,10 @@ def build_state(args, arms):
                       peers_csv=','.join(f'{lane}:{args.expert_port}' for lane in lanes),
                       layers=parse_layers(args.expert_layers) if args.expert_layers else [],
                       env=worker_env, args=list(args.worker_arg), budget=args.worker_budget_bytes,
+                      memory=args.worker_memory_bytes,
                       ready_timeout=args.worker_ready_timeout, poll_s=args.worker_poll)
-    elif args.expert_layers or args.worker_env or args.worker_arg:
-        raise ValueError('--expert-layers, --worker-env and --worker-arg need --spark-hosts')
+    elif args.expert_layers or args.worker_env or args.worker_arg or args.worker_memory_bytes is not None:
+        raise ValueError('--expert-layers, --worker-env, --worker-arg and --worker-memory-bytes need --spark-hosts')
     mode = 'native-test' if args.native_test else 'command' if args.command else 'golden'
     if mode == 'golden':
         golden = golden_args(args.family, args.golden, sparks=sparks is not None)
@@ -1196,6 +1201,8 @@ def main(argv=None):
     parser.add_argument('--worker-arg', action='append', default=[], metavar='ARG',
                         help='extra expertd-native argument (repeatable; e.g. --worker-arg=--exl3-schedule)')
     parser.add_argument('--worker-budget-bytes', type=int, default=DEFAULT_WORKER_BUDGET)
+    parser.add_argument('--worker-memory-bytes', type=int, metavar='N',
+                        help='container memory cap per worker (docker --memory/--memory-swap); above the device budget')
     parser.add_argument('--worker-ready-timeout', type=int, default=1500, help='seconds for worker bootstrap and coordinator model admission')
     parser.add_argument('--worker-poll', type=float, default=5.0, help=argparse.SUPPRESS)
     parser.add_argument('--config', default=str(REPO / 'cuteafd.config'),

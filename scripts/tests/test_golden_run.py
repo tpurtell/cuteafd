@@ -532,7 +532,7 @@ def test_real_experts_start_before_and_stop_before_locks_release(spark_env, monk
             released.append(json.loads(env['state'].read_text()))
             return self.inner.__exit__(*exc)
     monkeypatch.setattr(golden.hwlock, 'hold', Hold)
-    assert golden.main(spark_argv(env, '--worker-ready-timeout', '2400')) == 0
+    assert golden.main(spark_argv(env, '--worker-ready-timeout', '2400', '--worker-memory-bytes', '115964116992')) == 0
     assert order == [['sparks', 'gpu1', 'rhea', 'moa']]
     assert released == [{}]  # every worker and the coordinator removed before the locks went
     calls = docker_calls(env)
@@ -554,6 +554,7 @@ def test_real_experts_start_before_and_stop_before_locks_release(spark_env, monk
                    for m in mounts)
         assert any(m.endswith(':/opt/cuteafd/lib/fp8:ro') for m in mounts)
         assert 'CUTEAFD_PROGRAM_MANIFEST=/opt/cuteafd/share/PROGRAMS.json' in argv
+        assert argv[argv.index('--memory') + 1] == argv[argv.index('--memory-swap') + 1] == '115964116992'
     run_env = json.loads((env['tmp'] / 'run-env.json').read_text())
     assert run_env['CUTEAFD_GOLDEN_PEERS'] == '10.9.0.1:19451,10.9.0.2:19451,10.9.0.3:19451,10.9.0.4:19451'
     assert run_env['CUTEAFD_GOLDEN_SPARK_WORLD'] == '4' and run_env['CUTEAFD_GOLDEN_EXPERT_LAYERS'] == '3'
@@ -724,6 +725,8 @@ def test_fixture_generation_command_mode(env, monkeypatch):
     (['--fixtures', 'TASK/golden/x', '--fixtures-writable'], 'outside golden/'),
     (['--fixtures', 'TASK/fx', '--fixtures-writable', '--spark-hosts', 'dodo'], 'GPU-only'),
     (['--expert-layers', '3'], 'need --spark-hosts'),
+    (['--worker-memory-bytes', '115964116992'], 'need --spark-hosts'),
+    (['--spark-hosts', 'dodo', '--worker-memory-bytes', '1'], 'must exceed --worker-budget-bytes'),
     (['--fixtures', 'relative/dir'], 'absolute'),
 ])
 def test_fixture_and_spark_argument_refusals(env, capsys, extra, match):
