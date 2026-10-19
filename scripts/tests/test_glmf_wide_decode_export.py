@@ -386,14 +386,17 @@ def test_kimi_nope_mla_exports_both_head_layouts_and_all_modes(exporter, decode_
 def test_kimi_w8_exports_every_residual_transition_and_situ_width(exporter):
     programs = exporter.kimi_w8_programs()
     calls = {stem: (op, params, thunk()) for stem, op, params, thunk in programs}
-    assert len(calls) == len(programs) == 44
+    assert len(calls) == len(programs) == 48
     for stem, (op, params, (module, fn, args, kwargs)) in calls.items():
         assert args == () and kwargs == params
         if op == "bf16_projection":
             assert module == "pointwise" and fn == "compile_bf16_projection_aot"
-            width = int(stem.rsplit("_i", 1)[1])
-            assert params == ({"width": 7168, "outputs": 2 * width, "compensated": True}
-                              if "gate_up" in stem else {"width": width, "outputs": 7168})
+            width = int(stem.rsplit("_i", 1)[1].removesuffix("_comp"))
+            expected = ({"width": 7168, "outputs": 2 * width}
+                        if "gate_up" in stem else {"width": width, "outputs": 7168})
+            if stem.endswith("_comp"):
+                expected["compensated"] = True
+            assert params == expected
             continue
         assert module == "kimi_residual"
         if op == "situ":
@@ -404,6 +407,9 @@ def test_kimi_w8_exports_every_residual_transition_and_situ_width(exporter):
             assert params["hidden"] == 7168
             assert params["has_mix"] == (params["candidates"] != 1)
             assert params["append"] == stem.endswith("_append")
+    for width in (3072, 6144, 16896, 33792):
+        assert f"ffn_gate_up_i{width}" in calls
+        assert f"ffn_gate_up_i{width}_comp" in calls
     for candidates in range(2, 10):
         for mode in ("keep", "add", "replace"):
             assert f"attn_res_c{candidates}_{mode}" in calls

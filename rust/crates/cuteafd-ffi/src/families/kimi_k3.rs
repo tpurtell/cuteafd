@@ -301,6 +301,30 @@ impl<'a> KimiSitu<'a> {
     }
 }
 
+/// Gate/up accumulation policy. Compensation is an explicit comparison opt-in.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum KimiFfnMode { #[default] Direct, Compensated }
+impl KimiFfnMode {
+    pub fn name(self) -> &'static str {
+        match self { Self::Direct => "direct", Self::Compensated => "compensated" }
+    }
+
+    pub fn gate_up_stem(self, intermediate: usize) -> String {
+        let suffix = if self == Self::Compensated { "_comp" } else { "" };
+        format!("kimik3_ffn_gate_up_i{intermediate}{suffix}")
+    }
+
+    fn validate(self, spec: &ProgramSpec) -> W8Result<()> {
+        let compensated = spec.geometry.get("compensated");
+        let matches = match self {
+            Self::Direct => compensated.is_none() || compensated.and_then(|v| v.as_bool()) == Some(false),
+            Self::Compensated => compensated.and_then(|v| v.as_bool()) == Some(true),
+        };
+        if !matches { return Err(KimiW8Error::Invalid("FFN gate/up compensation manifest")); }
+        Ok(())
+    }
+}
+
 /// Dense first-layer or shared-expert MLP. The TP2 caller packs intermediate
 /// slices gate-first and owns the partial-output meet after this chain.
 pub struct KimiFfn<'a> {
@@ -322,12 +346,14 @@ pub struct KimiFfnBatch {
     pub output: Buffer,
 }
 impl<'a> KimiFfn<'a> {
-    pub fn load(programs: &'a Programs<'a>, intermediate: usize) -> W8Result<Self> {
+    pub fn load(programs: &'a Programs<'a>, intermediate: usize, mode: KimiFfnMode) -> W8Result<Self> {
         let situ = KimiSitu::load(programs, intermediate)?;
-        let gate_up = programs.program(&format!("kimik3_ffn_gate_up_i{intermediate}"), &["x", "w", "out"])?;
+        let gate_up = programs.program(&mode.gate_up_stem(intermediate), &["x", "w", "out"])?;
         let down = programs.program(&format!("kimik3_ffn_down_i{intermediate}"), &["x", "w", "out"])?;
         validate_projection_manifest(gate_up.spec(), 7168, 2 * intermediate)?;
+        mode.validate(gate_up.spec())?;
         validate_projection_manifest(down.spec(), intermediate, 7168)?;
+        KimiFfnMode::Direct.validate(down.spec())?;
         let rows = situ.rows.min(gate_up.spec().capacity_rows as usize).min(down.spec().capacity_rows as usize);
         Ok(Self { gate_up, situ, down, rows, width: intermediate })
     }
@@ -954,6 +980,25 @@ mod tests {
         for bad in [Buffer { bytes: wire.bytes - 1, ..wire }, Buffer { device_id: 1, ..wire },
             Buffer { ptr: latent.ptr, ..wire }, Buffer { ptr: std::ptr::null_mut(), ..wire }] {
             assert!(validate_expert_input_buffers(rows, rows, 1, latent, bad).is_err());
+        }
+    }
+
+    #[test]
+    fn ffn_selection_defaults_direct_and_rejects_mislabeled_numerics() {
+        assert_eq!(KimiFfnMode::default(), KimiFfnMode::Direct);
+        let site = KimiResidualSite { candidates: 1, prefix: KimiPrefixMode::Keep, append: true };
+        for intermediate in [3072, 6144, 16896, 33792] {
+            for (mode, suffix) in [(KimiFfnMode::Direct, ""), (KimiFfnMode::Compensated, "_comp")] {
+                assert_eq!(mode.gate_up_stem(intermediate), format!("kimik3_ffn_gate_up_i{intermediate}{suffix}"));
+                let mut spec = residual_spec(site);
+                spec.geometry = serde_json::json!({});
+                if mode == KimiFfnMode::Compensated { spec.geometry["compensated"] = true.into(); }
+                mode.validate(&spec).unwrap();
+                spec.geometry["compensated"] = (mode == KimiFfnMode::Direct).into();
+                assert!(mode.validate(&spec).is_err());
+                spec.geometry["compensated"] = "true".into();
+                assert!(mode.validate(&spec).is_err());
+            }
         }
     }
 
