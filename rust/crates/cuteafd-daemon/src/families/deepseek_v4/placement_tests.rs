@@ -147,8 +147,7 @@ fn runtime_with_upload_check(shared: &Shared, case: &Case<'_>, layout: &MemoryLa
         }).collect::<anyhow::Result<Vec<_>>>()?;
         let after = admission::Inputs { gpus: measured, loaded_modes: Some(&modes), ..inputs };
         let mut request = admission::request(&cli.engine, &after)?;
-        request.pool.requested = Some(placement.pool_tokens);
-        request.pool.floor = placement.pool_tokens;
+        request.pool.pin_selected(placement.pool_tokens);
         request.onboard = Onboard::Layers(placement.onboard_layers);
         let checked = cuteafd_loader::placement::solve_frozen(&request, &placement)?;
         assert_eq!(checked, placement, "pre-upload/frozen measured admission differs");

@@ -620,6 +620,8 @@ impl std::fmt::Display for PoolLimits {
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum PlacementError {
+    #[error("explicit KV pool of {requested} tokens is below the compiled/max-context floor of {floor} tokens; increase --pool-tokens (POOL_TOKENS, or KV_POOL_SIZE for a byte pool), or lower --max-context/--max-context-tokens (MAX_CONTEXT_TOKENS) to match")]
+    RequestedBelowContext { requested: u64, floor: u64 },
     #[error("placement inventory is invalid: {0}")]
     Inventory(&'static str),
     #[error("placement cannot retain the minimum {minimum} complete exact-restore marks after fixed floors: {reason}")]

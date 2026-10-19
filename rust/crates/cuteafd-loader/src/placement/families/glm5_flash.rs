@@ -118,6 +118,8 @@ pub fn context_buffers(cfg: &GlmNextConfig, extent: u64, rows: u64, lanes: u64,
 
 #[derive(Debug, Clone)]
 pub struct GlmfInputs<'a> {
+    /// True only when the operator left context automatic.
+    pub automatic_context: bool,
     pub attention: GlmfAttention,
     pub cfg: &'a GlmNextConfig,
     pub layers: usize,
@@ -417,7 +419,7 @@ pub fn request_for_working_set(i: &GlmfInputs<'_>, working: &GlmfWorkingSet) -> 
         inventory: Inventory { gpus: i.gpus.iter().map(|&(capacity_bytes, baseline)| GpuBudget {
             capacity_bytes, headroom_bytes: i.headroom_bytes, baseline }).collect(), spark_ranks: working.spark_ranks, peer_access: ranks == 2 },
         pool: PoolPolicy::resolve(&i.gpus.iter().map(|g| g.0).collect::<Vec<_>>(), i.max_context,
-            i.requested_pool, geometry.logical_unit_rows, working.spark_ranks == 0),
+            i.requested_pool, geometry.logical_unit_rows, working.spark_ranks == 0).with_automatic_context(i.automatic_context),
         pool_bounded: geometry.ranks.iter().enumerate().filter_map(|(rank, g)| {
             let bytes = g.glmf_pool_mark_backing_unit_bytes(i.pool_marks);
             (bytes > 0).then(|| BoundedDemand { gpu: rank as u8, category: Category::Prefix,
@@ -628,6 +630,9 @@ pub fn placed_attention(attention: GlmfAttention, placed: &Placement) -> GlmfAtt
 /// closed-form candidate. Graph-geometry shrinking stays local to each candidate.
 pub fn solve_working_set_with_graphs(i: &GlmfInputs<'_>, target: u64, automatic_context: bool,
     sms: usize, rtx_experts: bool) -> Result<(Placement, GraphSet, GlmfWorkingSet), PlacementError> {
+    let mut resolved = i.clone();
+    resolved.automatic_context = automatic_context;
+    let i = &resolved;
     request(i)?;
     let mut graph_cache = std::collections::BTreeMap::new();
     if i.spark_ranks == 0 {
@@ -768,7 +773,7 @@ mod tests {
 
     fn inputs(cfg: &GlmNextConfig, ranks: usize, capacity: u64) -> GlmfInputs<'_> {
         let context = ArchContext::coordinator(capacity, None).context_bytes;
-        GlmfInputs {
+        GlmfInputs { automatic_context: false,
             attention: Default::default(), cfg, layers: cfg.layers,
             gpus: (0..ranks).map(|rank| (capacity, Baseline::Planned {
                 context_bytes: context + loaded_code("glmf", "exl3", ranks == 2, rank as u8).unwrap().bytes,

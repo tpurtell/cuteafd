@@ -324,7 +324,7 @@ pub fn native_layout(checkpoint: &Checkpoint, options: &LayoutOptions, shared_by
     let rows = if options.prefill_rows == 0 { 4096 } else { options.prefill_rows };
     let context = if options.context_tokens == 0 { 1 << 20 } else { options.context_tokens };
     let requested_pool = options.pool_tokens.filter(|&n| n > 0)
-        .unwrap_or(cuteafd_core::serving_capacity::DEFAULT_GPU_KV_TOKENS);
+        .unwrap_or_else(|| cuteafd_core::serving_capacity::DEFAULT_GPU_KV_TOKENS.max(context));
     let plan = cuteafd_core::coordinator_programs::AttentionReductionPlan::new(
         glm::DECODE_ROWS as usize, None, options.glm5_attention_plan_rows)?;
     let mut manifest = manifest.clone();
@@ -386,6 +386,41 @@ pub fn device_bytes(checkpoint: &Checkpoint, ranks: usize, layers: usize, host_e
 mod tests {
     use super::*;
     use crate::plan::testing::{fp8, glm5_config, glm5_tensors, write_snapshot};
+
+    #[test]
+    fn native_automatic_pool_covers_context_without_relaxing_explicit_pools() {
+        use crate::placement::{families::glm5 as glm, PlacementError};
+        use serde_json::json;
+        let dir = tempfile::tempdir().unwrap();
+        write_snapshot(dir.path(), &glm5_config(), &glm5_tensors(|n, r, k| fp8(n, r, k, None)), None);
+        let checkpoint = Checkpoint::open(dir.path()).unwrap();
+        let mut names = glm::CONTEXT_PROGRAMS.iter().map(|name| name.to_string()).collect::<Vec<_>>();
+        for (cap, mode) in [("m64", "decode"), ("m4096", "prefill")] {
+            names.extend([format!("glm_index_producer_{cap}"), format!("glm2_producer_{cap}"),
+                format!("glm2_sparse_mla_{mode}_{cap}"), format!("glm2_o_{cap}"),
+                format!("glm2_ffn_i1024_{cap}"), format!("glm2_ffn_i6144_{cap}"),
+                format!("glm_index_topk_{mode}_{cap}")]);
+        }
+        names.extend(["glm_sparse_mla_partial_h0_s2_m64".into(), "glm_sparse_mla_partial_h32_s2_m64".into()]);
+        let manifest = json!({"programs": names.into_iter().map(|name|
+            json!({"name": name, "scratch_bytes_at_capacity": {"scratch": 256}})).collect::<Vec<_>>()});
+        let default = cuteafd_core::serving_capacity::DEFAULT_GPU_KV_TOKENS;
+        for context in [1 << 20, default + 128] {
+            for pool_tokens in [None, Some(0)] {
+                let options = LayoutOptions { rtx_bytes: vec![96 << 30; 2],
+                    context_tokens: context, pool_tokens, ..Default::default() };
+                let (memory, placement) = native_layout(&checkpoint, &options, &[256; 2], 256, 6, &manifest).unwrap();
+                assert_eq!(memory.pool_tokens, default.max(context));
+                assert_eq!(placement.pool_tokens, default.max(context));
+            }
+        }
+        let options = LayoutOptions { rtx_bytes: vec![96 << 30; 2],
+            context_tokens: default + 128, pool_tokens: Some(default), ..Default::default() };
+        let error = native_layout(&checkpoint, &options, &[256; 2], 256, 6, &manifest).unwrap_err();
+        assert_eq!(error.downcast_ref::<PlacementError>(), Some(&PlacementError::RequestedBelowContext {
+            requested: default, floor: default + 128,
+        }));
+    }
 
     #[test]
     fn resident_headers_follow_rank_ownership_and_absorbed_kv_packing() {

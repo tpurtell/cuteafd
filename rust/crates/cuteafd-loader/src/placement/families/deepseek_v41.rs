@@ -786,7 +786,7 @@ mod tests {
                     let mut req = request(Inventory { gpus: vec![GpuBudget { capacity_bytes: 1 << 40,
                         headroom_bytes: 0, baseline: Baseline::Measured { free_bytes: 1 << 40 } }; ranks],
                         spark_ranks: 4, peer_access: ranks == 2 },
-                        PoolPolicy { requested: Some(logical * 512), target: logical * 512,
+                        PoolPolicy { compiled_context: logical * 512, requested: Some(logical * 512), target: logical * 512,
                             floor: logical * 512, ceiling: u64::MAX, unit_rows: 512 },
                         vec![0; ranks], vec![], 0, Onboard::Layers(0));
                     assert_eq!(cache_demands(&mut req, &config(), slots, turns, replicated).unwrap(), tails);

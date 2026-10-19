@@ -45,7 +45,8 @@ pub(super) fn snapshot(kind: &str) -> tempfile::TempDir {
 
 fn report(dir: &std::path::Path, gpus: usize, gib: u64, ranks: usize, pool: Option<u64>) -> PlanReport {
     plan::plan(dir, &PlanOptions { placement: ExpertPlacement::from_spark_ranks(ranks),
-        layout: Some(layout::LayoutOptions { rtx_bytes: vec![gib<<30;gpus], pool_tokens: pool, ..Default::default() }),
+        layout: Some(layout::LayoutOptions { rtx_bytes: vec![gib<<30;gpus], pool_tokens: pool,
+            context_tokens: pool.filter(|&n| n > 0).unwrap_or(0), ..Default::default() }),
         ..Default::default() }).unwrap()
 }
 
@@ -400,8 +401,14 @@ fn card_memory_conclusions_and_request_vs_pool_extent() {
     assert!(r.hints.iter().any(|h| h.what.contains("TP4 refused")));
     let r = report(dir.path(),2,96,0,None);
     assert!(r.hints.iter().any(|h| h.what.contains("no 0-Spark")));
-    let r = report(dir.path(),1,96,6,Some(32_768));
-    assert!(r.hints.iter().any(|h| h.what.contains("below 256K")));
+    let r = plan::plan(dir.path(), &PlanOptions {
+        placement: ExpertPlacement::from_spark_ranks(6),
+        layout: Some(layout::LayoutOptions { rtx_bytes: vec![96 << 30],
+            pool_tokens: Some(32_768), context_tokens: 262_144, ..Default::default() }),
+        ..Default::default()
+    }).unwrap();
+    assert!(r.hints.iter().any(|h| h.what.contains("explicit KV pool of 32768 tokens")
+        && h.what.contains("floor of 262144 tokens")), "{:?}", r.hints);
     let r = report(dir.path(),1,96,6,None);
     let memory = r.memory_layout.unwrap();
     assert!(memory.pool_tokens >= 262_144 && memory.pool_tokens < 1<<20);

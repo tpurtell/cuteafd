@@ -372,7 +372,7 @@ fn apply_selected(input: &super::super::PlanInput, options: &LayoutOptions,
     let lanes = resolve_transport_lanes(spark_ranks > 0, cfg.program_family()?,
         if options.prefill_lanes > 0 { Some(options.prefill_lanes.to_string()) }
         else { std::env::var("CUTEAFD_MIMO_PREFILL_LANES").ok() }.as_deref())?;
-    let inputs = crate::placement::families::mimo_v2::MimoInputs {
+    let inputs = crate::placement::families::mimo_v2::MimoInputs { automatic_context: options.context_tokens == 0,
         cfg: &cfg, profile: &profiles.steady, layers: cfg.layers, kv: MimoKvCache::Int8, mtp_stages: 0,
         gpus: devices.iter().enumerate().map(|(rank, device)| (options.rtx_bytes[rank],
             crate::placement::Baseline::Planned { context_bytes: 0,
@@ -605,7 +605,7 @@ mod tests {
                 let (experts, expert_workspace, tp2_workspace, onboard) =
                     expert_costs(&input, &cfg, &opts, ranks, sparks, 4096).unwrap();
                 let lanes = resolve_transport_lanes(true, cfg.program_family().unwrap(), None).unwrap();
-                let inputs = MimoInputs { cfg: &cfg, profile: &costs.steady, layers: cfg.layers,
+                let inputs = MimoInputs { automatic_context: opts.context_tokens == 0, cfg: &cfg, profile: &costs.steady, layers: cfg.layers,
                     kv: MimoKvCache::Int8, mtp_stages: 0, gpus: totals.iter().enumerate().map(|(rank, &total)|
                         (total, Baseline::Measured { free_bytes: total - baseline[rank] })).collect(),
                     headroom_floor: opts.headroom_bytes, spark_ranks: sparks, startup_probe_bytes: 64 << 20,

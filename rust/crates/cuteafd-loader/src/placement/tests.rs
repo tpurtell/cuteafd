@@ -70,11 +70,53 @@ fn one_gpu_runs_whole_layers_and_shrinks_the_pool_before_failing() {
 }
 
 #[test]
+fn explicit_pool_requires_compiled_context_in_live_and_frozen_solves() {
+    let mut req = request(2, 44 * GIB, 2, 6, Onboard::Auto);
+    let original = solve(&req).unwrap();
+    // Auto searches may change floor, never the original compiled extent.
+    req.pool.floor = 0;
+    for requested in [1, 32768, 131071] {
+        req.pool.requested = Some(requested);
+        let expected = PlacementError::RequestedBelowContext { requested, floor: 131072 };
+        assert_eq!(solve(&req), Err(expected.clone()));
+        assert_eq!(solve_frozen(&req, &original), Err(expected.clone()));
+        let text = expected.to_string();
+        for required in [requested.to_string(), "131072".into(), "--pool-tokens".into(), "MAX_CONTEXT_TOKENS".into()] {
+            assert!(text.contains(&required), "{text}");
+        }
+    }
+    req.pool.requested = Some(131072);
+    assert_eq!(solve(&req).unwrap().pool_tokens, 131072);
+    req.pool = PoolPolicy::resolve(&[96 * GIB; 2], 32768, Some(32768), 256, false);
+    assert_eq!(solve(&req).unwrap().pool_tokens, 32768);
+}
+
+#[test]
+fn explicit_diagnostic_pool_clamps_only_automatic_context() {
+    let mut req = request(1, GIB, 2, 4, Onboard::Auto);
+    req.pool = PoolPolicy::resolve(&[96 * GIB], 131072, Some(32768), 256, false)
+        .with_automatic_context(true);
+    let placed = solve(&req).unwrap();
+    assert_eq!(placed.pool_tokens, 32768);
+    assert_eq!(crate::serving_capacity::pool_context(131072, true,
+        placed.pool_tokens as usize, 256).unwrap(), 32512);
+    req.pool = PoolPolicy::resolve(&[96 * GIB], 131072, Some(32768), 256, false);
+    assert_eq!(solve(&req), Err(PlacementError::RequestedBelowContext {
+        requested: 32768, floor: 131072,
+    }));
+}
+
+#[test]
 fn spark_auto_pool_can_shrink_below_context_but_v41_refuses_it() {
     let req = request(1, GIB, 40, 4, Onboard::Auto);
     let placement = solve(&req).unwrap();
     assert_eq!(placement.pool_tokens, 65_536);
     assert!(placement.pool_tokens < req.pool.floor);
+    let mut measured = req.clone();
+    measured.pool.pin_selected(placement.pool_tokens);
+    assert_eq!(measured.pool.requested, None);
+    assert_eq!(solve_frozen(&measured, &placement).unwrap(), placement);
+
     assert!(matches!(families::deepseek_v41::validate_pool_floor(&req.pool, &placement),
         Err(PlacementError::BelowFloor { pool: 65_536, floor: 131_072, .. })));
 }
@@ -806,6 +848,7 @@ fn context_pool_rounding_never_crosses_floor_and_explicit_units_are_even() {
     req.attention_placement = Some(AttentionPlacement::Context);
     req.pool_overhead = vec![0; 2];
     req.pool.unit_rows = 1;
+    req.pool.compiled_context = 3;
     req.pool.floor = 3;
     req.pool.target = 3;
     req.pool.ceiling = 3;
@@ -1381,7 +1424,7 @@ fn bounded_pool_demands_grow_then_saturate_and_reserve_before_experts() {
     for fixed in [false, true] {
         for (free, expected) in [(65, 3), (75, 4), (85, 5), (100, 7)] {
             let mut req = request(1, free, 0, 4, if fixed { Onboard::Layers(0) } else { Onboard::Auto });
-            req.pool = PoolPolicy { requested: None, target: 100, floor: 1, ceiling: 100, unit_rows: 1 };
+            req.pool = PoolPolicy { compiled_context: 1, requested: None, target: 100, floor: 1, ceiling: 100, unit_rows: 1 };
             req.pool_overhead = vec![10];
             req.pool_bounded = vec![BoundedDemand { gpu: 0, category: Category::Kv,
                 group: "bounded table".into(), bytes_per_unit: 5, offset_units: 2, cap_units: 6, basis: Basis::Formula }];
@@ -1393,7 +1436,7 @@ fn bounded_pool_demands_grow_then_saturate_and_reserve_before_experts() {
         }
     }
     let mut req = request(1, 200, 1, 4, Onboard::Auto);
-    req.pool = PoolPolicy { requested: Some(5), target: 5, floor: 5, ceiling: 5, unit_rows: 1 };
+    req.pool = PoolPolicy { compiled_context: 5, requested: Some(5), target: 5, floor: 5, ceiling: 5, unit_rows: 1 };
     req.pool_overhead = vec![10];
     req.expert_workspace = 0;
     req.layers[0].experts.as_mut().unwrap().whole = Bytes2 { resident: 121, staging: 0 };
@@ -1408,7 +1451,7 @@ fn bounded_pool_demands_grow_then_saturate_and_reserve_before_experts() {
 fn pool_failures_name_rank_demands_and_retain_selected_expert_arena() {
     for onboard in [Onboard::Auto, Onboard::Layers(0)] {
         let mut req = request(2, 100, 0, 4, onboard);
-        req.pool = PoolPolicy { requested: Some(6), target: 6, floor: 1, ceiling: 100, unit_rows: 1 };
+        req.pool = PoolPolicy { compiled_context: 1, requested: Some(6), target: 6, floor: 1, ceiling: 100, unit_rows: 1 };
         req.pool_overhead = vec![1, 2];
         req.pool_bounded = vec![BoundedDemand { gpu: 1, category: Category::Prefix,
             group: "recurrent marks".into(), bytes_per_unit: 20, offset_units: 1,
@@ -1461,7 +1504,7 @@ fn successful_pool_limits_retain_auto_onboarded_arenas() {
 #[test]
 fn bounded_only_pool_and_invalid_demands_are_checked() {
     let mut req = request(1, 49, 0, 4, Onboard::Auto);
-    req.pool = PoolPolicy { requested: None, target: 100, floor: 1, ceiling: 100, unit_rows: 1 };
+    req.pool = PoolPolicy { compiled_context: 1, requested: None, target: 100, floor: 1, ceiling: 100, unit_rows: 1 };
     req.pool_overhead = vec![0];
     req.pool_bounded = vec![BoundedDemand { gpu: 0, category: Category::Kv, group: "table".into(),
         bytes_per_unit: 10, offset_units: 0, cap_units: 5, basis: Basis::Formula }];
@@ -1519,6 +1562,7 @@ fn compulsory_prefix_fails_when_even_the_weights_do_not_fit() {
 fn pool_ceiling_is_strict_for_automatic_and_explicit_pools() {
     let mut req = request(1, 32 * GIB, 0, 4, Onboard::Auto);
     req.pool.floor = 0;
+    req.pool.compiled_context = 512;
     req.pool.ceiling = 512;
     req.pool.target = 1024;
     assert_eq!(solve(&req).unwrap().pool_tokens,512);

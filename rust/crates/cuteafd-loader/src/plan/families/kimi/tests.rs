@@ -358,6 +358,7 @@ fn max_card_charges_spark_runtime_and_onboards_layers_as_the_fallback() {
     let mut heads = with_layout(6, None);
     heads.attention_placement = Some(crate::placement::AttentionPlacement::Heads);
     heads.layout.as_mut().unwrap().pool_tokens = Some(262_144);
+    heads.layout.as_mut().unwrap().context_tokens = 262_144;
     let heads_report = plan::plan(dir.path(), &heads).unwrap();
     assert_eq!(heads_report.attention_placement, crate::placement::AttentionPlacement::Heads);
     let head_gpus = device(heads_report.memory_layout.as_ref().unwrap(), DeviceKind::Rtx);
@@ -368,6 +369,7 @@ fn max_card_charges_spark_runtime_and_onboards_layers_as_the_fallback() {
     let mut owned = with_layout(6, None);
     owned.attention_placement = Some(crate::placement::AttentionPlacement::Layers);
     owned.layout.as_mut().unwrap().pool_tokens = Some(262_144);
+    owned.layout.as_mut().unwrap().context_tokens = 262_144;
     let owned_report = plan::plan(dir.path(), &owned).unwrap();
     let owned_gpus = device(owned_report.memory_layout.as_ref().unwrap(), DeviceKind::Rtx);
     for gpu in 0..2 {

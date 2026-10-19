@@ -1414,7 +1414,7 @@ fn v4_workspace_plan_matches_runtime_below_compiled_context() {
         compiled_c128_width(&manifest, "dsv4f").unwrap() * 128, 1, scratch).unwrap();
     for gib in [31.8, 95.5] {
         let total = cuteafd_core::serving_capacity::GpuMemoryBudget::from_gib(gib).unwrap().0;
-        for context in [16384, 32512, 131072] {
+        for context in [16384, 32512, 32768] {
             let report = plan(dir.path(), &PlanOptions { layout: Some(layout::LayoutOptions {
                 rtx_bytes: vec![total], context_tokens: context, pool_tokens: Some(32768),
                 workspace_manifest: Some(path.clone()), ..Default::default()
@@ -1850,7 +1850,7 @@ fn glm5_flash_selected_working_set_drives_plan_request_and_runtime_buffers() {
         let report = plan(dir.path(), &options).unwrap();
         assert!(report.placement_supported, "{}", render(&report));
         let opts = options.layout.as_ref().unwrap();
-        let input = glmf::GlmfInputs { attention: Default::default(), cfg: &cfg, layers: cfg.layers, local_tp2_exl3: false,
+        let input = glmf::GlmfInputs { automatic_context: false, attention: Default::default(), cfg: &cfg, layers: cfg.layers, local_tp2_exl3: false,
             gpus: opts.rtx_bytes.iter().enumerate().map(|(rank, &total)| (total, Baseline::Planned {
                 context_bytes: placement::ArchContext::coordinator(total, None).context_bytes
                     + placement::loaded_code("glmf", "fp8", true, rank as u8).unwrap().bytes,

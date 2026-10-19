@@ -63,10 +63,6 @@ pub(super) fn layout(model: &Model, report: &mut PlanReport, opts: &crate::plan:
         return memory;
     }
     let requested_pool = opts.pool_tokens.filter(|n| *n > 0);
-    if requested_pool.is_some_and(|n| n < FLOOR) {
-        refusal(report, "Kimi K3 pool below the 256K agentic floor is not a card recipe".into(), "Leave the pool automatic.");
-        return memory;
-    }
     let edge = |c| *model.bytes.get(&c).unwrap_or(&0);
     let (embedding, head) = (edge(Component::Embedding), edge(Component::LmHead));
     let residency = model.coordinator;
@@ -119,7 +115,8 @@ pub(super) fn layout(model: &Model, report: &mut PlanReport, opts: &crate::plan:
             headroom_bytes: opts.headroom_bytes, baseline: Baseline::Planned { context_bytes: 0, loaded_bytes: 0 } }).collect(),
             spark_ranks: ranks, peer_access: true },
         attention_placement: report.requested_attention, context_buffers: ContextBuffers::default(), layers_first_gpu: 0,
-        pool: PoolPolicy { requested: requested_pool, target: opts.target_pool_tokens.max(FLOOR), floor: FLOOR,
+        pool: PoolPolicy { compiled_context: opts.context_tokens,
+            requested: requested_pool, target: opts.target_pool_tokens.max(FLOOR), floor: FLOOR,
             ceiling: opts.target_pool_tokens.max(requested_pool.unwrap_or(0)).max(FLOOR), unit_rows: PAGE },
         layers, pool_overhead: vec![0; 2], pool_bounded: Vec::new(), fixed, startup: Vec::new(), movables: Vec::new(),
         expert_workspace: 0, tp2_workspace: [0; 2], onboard, expert_gpus: 2, minimum_expert_layers: 0,

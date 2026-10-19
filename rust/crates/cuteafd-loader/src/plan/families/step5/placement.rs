@@ -69,10 +69,6 @@ pub(super) fn layout(model: &Model, report: &mut PlanReport, opts: &crate::plan:
         }
     }
     let requested = opts.pool_tokens.filter(|n| *n > 0);
-    if requested.is_some_and(|n| n < FLOOR) {
-        refusal(report, "Step-5 pool below 256K agentic floor is not a supported card recipe".into());
-        return memory;
-    }
     let tokens_per_layer = (2*cfg.groups*cfg.dim*2) as u64;
     let full = cfg.full[..cfg.layers].iter().filter(|full| **full).count() as u64;
     let per_token = full*(tokens_per_layer+256/8);
@@ -115,7 +111,8 @@ pub(super) fn layout(model: &Model, report: &mut PlanReport, opts: &crate::plan:
             capacity_bytes: *bytes, headroom_bytes: opts.headroom_bytes,
             baseline: Baseline::Planned { context_bytes: 0, loaded_bytes: 0 } }).collect(), spark_ranks: ranks, peer_access: gpus == 2 },
         attention_placement: Some(AttentionPlacement::Heads), context_buffers: ContextBuffers::default(), layers_first_gpu: 0,
-        pool: PoolPolicy { requested, target: opts.target_pool_tokens.max(FLOOR), floor: FLOOR,
+        pool: PoolPolicy { compiled_context: opts.context_tokens,
+            requested, target: opts.target_pool_tokens.max(FLOOR), floor: FLOOR,
             ceiling: opts.target_pool_tokens.max(requested.unwrap_or(0)).max(FLOOR), unit_rows: PAGE },
         layers, pool_overhead: vec![0;gpus], pool_bounded: vec![summaries], fixed, startup: Vec::new(), movables: vec![],
         expert_workspace: 0, tp2_workspace: [0;2], onboard: Onboard::Auto, expert_gpus: 0, minimum_expert_layers: 0,

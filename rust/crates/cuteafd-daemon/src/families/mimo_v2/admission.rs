@@ -464,7 +464,7 @@ pub(super) fn preflight(
                 small_card_headroom_bytes(sample.total_bytes))?);
     }
     use cuteafd_loader::placement::{Baseline, families::mimo_v2::{MimoInputs, solve_working_set, resolved_capacity}};
-    let inputs = MimoInputs {
+    let inputs = MimoInputs { automatic_context: automatic_context,
         cfg, profile: &spark_profiles.steady, layers, kv, mtp_stages: args.mtp,
         gpus: memory.iter().map(|m| (m.total_bytes, Baseline::Measured { free_bytes: m.baseline_free_bytes })).collect(),
         headroom_floor: 0, spark_ranks, startup_probe_bytes: intake_probe_bytes,

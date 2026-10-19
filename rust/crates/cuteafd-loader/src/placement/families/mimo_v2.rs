@@ -8,6 +8,8 @@ use cuteafd_core::serving_capacity::{CapacityProfile, MemoryReservation, Resolve
 
 #[derive(Clone)]
 pub struct MimoInputs<'a> {
+    /// True only when the operator left context automatic.
+    pub automatic_context: bool,
     pub cfg: &'a MimoV2Config,
     pub profile: &'a CapacityProfile,
     pub layers: usize,
@@ -233,7 +235,7 @@ mod tests {
             let local = profile(false);
             let cost = ExpertCost { whole: Bytes2 { resident: 1 << 30, staging: 0 },
                 half: [Bytes2 { resident: 512 << 20, staging: 0 }; 2], tp2: ranks == 2, spark_ok: true };
-            let inputs = MimoInputs { cfg: &cfg, profile: &spark, layers: 4, kv: MimoKvCache::Int8,
+            let inputs = MimoInputs { automatic_context: false, cfg: &cfg, profile: &spark, layers: 4, kv: MimoKvCache::Int8,
                 mtp_stages: 0, gpus: vec![(96 << 30, Baseline::Measured { free_bytes: 90 << 30 }); ranks],
                 headroom_floor: 0, spark_ranks: 6, startup_probe_bytes: 64 << 20, context: 256 << 10,
                 requested_pool: Some(2 << 20), pool_ceiling_at_target: false, onboard: Onboard::Auto,
@@ -345,7 +347,7 @@ mod tests {
             let cost = ExpertCost { whole: Bytes2 { resident: 1 << 30, staging: 0 },
                 half: [Bytes2 { resident: 512 << 20, staging: 0 }; 2], tp2: ranks == 2, spark_ok: true };
             for onboard in [Onboard::Auto, Onboard::Layers(2)] {
-                let inputs = MimoInputs { cfg: &cfg, profile: &profile, layers: 4, kv: MimoKvCache::Int8,
+                let inputs = MimoInputs { automatic_context: false, cfg: &cfg, profile: &profile, layers: 4, kv: MimoKvCache::Int8,
                     mtp_stages: 0, gpus: vec![(96 << 30, Baseline::Measured { free_bytes: 90 << 30 }); ranks],
                     headroom_floor: 0, spark_ranks: 6, startup_probe_bytes: 64 << 20, context: 256 << 10,
                     requested_pool: None, pool_ceiling_at_target: false, onboard,
@@ -453,7 +455,8 @@ pub fn request(inputs: &MimoInputs<'_>) -> Result<PlacementRequest, CacheGeometr
     let routed = inputs.experts.iter().filter(|cost| cost.is_some()).count();
     let local_package = inputs.expert_workspace > 0 || inputs.tp2_workspace.iter().any(|&bytes| bytes > 0);
     let mut pool = PoolPolicy::resolve(&inputs.gpus.iter().map(|g| g.0).collect::<Vec<_>>(), inputs.context,
-        inputs.requested_pool, profile.pool_unit_rows, inputs.spark_ranks == 0);
+        inputs.requested_pool, profile.pool_unit_rows, inputs.spark_ranks == 0)
+        .with_automatic_context(inputs.automatic_context);
     let onboard = if routed > 0 && !local_package {
         if inputs.spark_ranks == 0 || !(inputs.onboard == Onboard::Auto || inputs.onboard.layers(routed) == Some(0)) {
             return Err(PlacementError::Inventory("MiMo local experts need a matching BF16-input package").into());

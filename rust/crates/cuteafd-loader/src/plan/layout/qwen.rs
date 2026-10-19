@@ -204,7 +204,7 @@ fn placement(input: &super::super::PlanInput, report: &mut PlanReport, options: 
         device.items.push(Item::new(Category::Experts, "package scratch", package, bytes, Basis::Formula));
     }
     let loaded_bytes = device.used_bytes();
-    let inputs = crate::placement::families::qwen4::QwenInputs {
+    let inputs = crate::placement::families::qwen4::QwenInputs { automatic_context: options.context_tokens == 0,
         admission: QwenAdmissionInputs { cfg: &cfg, layers: cfg.layers, mtp, kv_format: options.qwen_kv, manifest,
             prefill_rows: shape.prefill_rows, slots: options.state_slots.unwrap_or(shape.concurrency), mark_bytes: marks,
             full_prefill_logits: logits, ple, future_expert_bytes: 0, headroom: options.headroom_bytes.max(3 * GIB) },
@@ -345,7 +345,7 @@ fn apply(input: &super::super::PlanInput, options: &LayoutOptions, devices: &mut
     let ple = checkpoint.tensors.iter().find(|t| t.meta.name.contains("ngram_embedding.shard_"))
         .map(|t| (resident.ple_row_bytes, t.meta.dtype == cuteafd_core::DType::F8E4M3));
     let headroom = options.headroom_bytes.max(3 * GIB);
-    let inputs = qwen4::QwenDualInputs {
+    let inputs = qwen4::QwenDualInputs { automatic_context: options.context_tokens == 0,
         owner_manifests,
         admission: QwenAdmissionInputs { cfg: &cfg, layers: cfg.layers, mtp, kv_format: options.qwen_kv,
             manifest, prefill_rows: rows, slots: options.state_slots.unwrap_or(concurrency),

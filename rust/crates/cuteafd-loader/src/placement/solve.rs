@@ -78,6 +78,7 @@ pub fn solve_with_marks(request: &PlacementRequest, legacy_slots: u64, minimum_s
 /// Places `request`. Pure arithmetic over the request: the planner and the
 /// runtime get the same answer for the same inputs.
 pub fn solve(request: &PlacementRequest) -> Result<Placement, PlacementError> {
+    request.pool.validate_explicit()?;
     validate_attention(request)?;
     if request.policy.expert_ownership == ExpertOwnership::AlternatingWhole
         && request.layers.iter().any(|layer| layer.experts.is_some_and(|cost| cost.tp2)) {
@@ -178,6 +179,7 @@ fn validate_attention(request: &PlacementRequest) -> Result<(), PlacementError> 
 /// Re-admit loaded owner modes without running the owner chooser again.
 /// Shape, executable-mode and hop checks still run, as do all memory gates.
 pub fn solve_frozen(request: &PlacementRequest, placement: &Placement) -> Result<Placement, PlacementError> {
+    request.pool.validate_explicit()?;
     validate_attention(request)?;
     let mut kinds = Vec::new();
     for &(kind, mode) in &placement.attention_by_kind {

@@ -66,7 +66,7 @@ impl ExpertSource {
 /// the shared admission's fixed items and, with startup graphs, the largest pool whose own graph set
 /// fits beside them.
 pub(super) fn pool_tokens(library: &NativeLibrary, args: &EngineArgs, inputs: &QwenAdmissionInputs<'_>,
-    source: ExpertSource) -> Result<usize> {
+    source: ExpertSource, automatic_context: bool) -> Result<usize> {
     let pending = crate::shared::inventory::pending_code(library, args.device, 0, false, "qwen4", source.code_key(),
         &inputs.manifest.map(|m| cuteafd_loader::placement::ProgramSet::from_manifest(m, &["qwen4"]))
             .unwrap_or_else(|| cuteafd_loader::placement::ProgramSet::from_names(&["qwen4"], [])))?;
@@ -83,14 +83,14 @@ pub(super) fn pool_tokens(library: &NativeLibrary, args: &EngineArgs, inputs: &Q
         mark_bytes: inputs.mark_bytes, full_prefill_logits: inputs.full_prefill_logits,
         ple: inputs.ple, future_expert_bytes: inputs.future_expert_bytes, headroom: inputs.headroom };
     let placement = qwen4::placement(&placement_inputs(args, admission, source,
-        (available as u64, total as u64), pending, enabled))?;
+        (available as u64, total as u64), pending, enabled, automatic_context))?;
     tracing::info!(pool_tokens = placement.pool_tokens, "Qwen shared solver admission before allocation");
     Ok(usize::try_from(placement.pool_tokens)?)
 }
 
 fn placement_inputs<'a>(args: &EngineArgs, admission: QwenAdmissionInputs<'a>, source: ExpertSource,
-    (available, total): (u64, u64), pending: u64, graphs_enabled: bool) -> qwen4::QwenInputs<'a> {
-    qwen4::QwenInputs { admission, capacity_bytes: total,
+    (available, total): (u64, u64), pending: u64, graphs_enabled: bool, automatic_context: bool) -> qwen4::QwenInputs<'a> {
+    qwen4::QwenInputs { automatic_context: automatic_context, admission, capacity_bytes: total,
         baseline: Baseline::Measured { free_bytes: available }, pending_code_bytes: pending,
         max_context: args.max_context as u64, requested_pool: (args.pool_tokens > 0).then_some(args.pool_tokens as u64),
         spark_ranks: source.spark_ranks(),
@@ -266,7 +266,7 @@ mod tests {
         // Even enough capacity for the full table must retain mapped residency.
         for capacity in [96u64 << 30, 192u64 << 30] {
             for onboard in [Onboard::Auto, Onboard::ExpertsFirst { pool_floor: 2 << 20 }] {
-                let mut inputs = qwen4::QwenDualInputs {
+                let mut inputs = qwen4::QwenDualInputs { automatic_context: false,
                     owner_manifests: [None; 2],
                     admission: QwenAdmissionInputs { cfg: &cfg, layers: 48, mtp: false,
                         kv_format: Qwen4KvCache::Bf16, manifest: None, prefill_rows: 4096,
@@ -507,7 +507,7 @@ mod tests {
             fixed.extend(experts.transport);
             if mtp { fixed.extend(qwen4::dual_draft_demands(&catalog, &lib, 16)?); }
             let admission = super::inputs(&args, &cfg, 4, mtp, Some(&manifests[0]), None, 0)?;
-            let runtime = qwen4::dual_placement(&qwen4::QwenDualInputs { owner_manifests: manifests.each_ref().map(Some), admission,
+            let runtime = qwen4::dual_placement(&qwen4::QwenDualInputs { automatic_context: false, owner_manifests: manifests.each_ref().map(Some), admission,
                 gpus: [0, 1].map(|rank| GpuBudget { capacity_bytes: capacities[rank],
                     headroom_bytes: 3 << 30, baseline: Baseline::Measured { free_bytes: capacities[rank]
                         - layout.devices[rank].items.iter().filter(|item| item.group == "context+modules")
@@ -559,9 +559,10 @@ mod tests {
         for (capacity, kv_format) in [32_u64 << 30, 101_973_491_712].into_iter().flat_map(|capacity|
             [Qwen4KvCache::Bf16, Qwen4KvCache::Fp8].map(|format| (capacity, format))) {
             for pool in [None, Some(32768)] {
+                let context = pool.unwrap_or(131072);
                 let report = plan(snapshot.path(), &PlanOptions {
                     placement: ExpertPlacement::Local,
-                    layout: Some(LayoutOptions { rtx_bytes: vec![capacity], context_tokens: 131072,
+                    layout: Some(LayoutOptions { rtx_bytes: vec![capacity], context_tokens: context,
                         pool_tokens: pool, qwen_kv: kv_format, concurrency: 8, state_slots: Some(8), prefix_slots: Some(0),
                         ..Default::default() }), ..Default::default()
                 })?;
@@ -573,14 +574,14 @@ mod tests {
                     "marks" | "graphs" | "graph growth" | "decode step" | "prefill step"))
                     .map(|i| i.bytes).sum::<u64>();
                 let mut args = Cli::try_parse_from(["serve", "--snapshot", snapshot.path().to_str().unwrap(),
-                    "--native-lib", "/nonexistent/lib.so", "--max-context", "131072", "--slots", "8",
+                    "--native-lib", "/nonexistent/lib.so", "--max-context", &context.to_string(), "--slots", "8",
                     "--pool-tokens", &pool.unwrap_or(0).to_string(), "--kv-cache", &kv_format.to_string()])?.engine;
                 args.planner_prefix_bytes = Some(0);
                 args.planner_graph_modes = Some((8, true));
                 let inputs = super::inputs(&args, &cfg, 48, false, None, None, 0)?;
-                let placement = qwen4::placement(&qwen4::QwenInputs { admission: inputs, capacity_bytes: capacity,
+                let placement = qwen4::placement(&qwen4::QwenInputs { automatic_context: false, admission: inputs, capacity_bytes: capacity,
                     baseline: Baseline::Measured { free_bytes: capacity - baseline }, pending_code_bytes: 0,
-                    max_context: 131072, requested_pool: pool, spark_ranks: 0,
+                    max_context: context, requested_pool: pool, spark_ranks: 0,
                     startup_graph_modes: args.planner_graph_modes })?;
                 assert_eq!(placement.pool_tokens, layout.pool_tokens);
                 for item in &placement.items[0] {
@@ -604,12 +605,12 @@ mod tests {
         let cfg = cuteafd_loader::families::qwen4::Qwen4Config::from_hf(
             &cuteafd_loader::plan::testing::qwen4_config(48))?;
         let local = Cli::try_parse_from(["serve", "--snapshot", "/absent/checkpoint", "--native-lib", "/absent/native.so",
-            "--local-experts", "--max-context", "131072"])?.engine;
+            "--local-experts", "--max-context", "32768"])?.engine;
         let mut with_peers = local.clone();
         with_peers.peers = Some("127.0.0.1:1234,127.0.0.1:1235".into());
         let input = |args, source, pending| -> anyhow::Result<_> {
             Ok(placement_inputs(args, super::inputs(args, &cfg, 48, false, None, None, 0)?,
-                source, (96 << 30, 96 << 30), pending, false))
+                source, (96 << 30, 96 << 30), pending, false, false))
         };
         for (source, key) in [(ExpertSource::LocalFp8, "fp8"), (ExpertSource::LocalExl3, "exl3")] {
             assert_eq!(source.code_key(), key);

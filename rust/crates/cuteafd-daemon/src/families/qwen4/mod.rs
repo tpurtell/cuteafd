@@ -434,6 +434,9 @@ impl Opened {
         context_args.max_context = crate::shared::context::checkpoint_context(
             &args.snapshot, &args.manifest, "qwen4", args.max_context)?;
         let args = &context_args;
+        cuteafd_loader::placement::PoolPolicy::resolve(&[], args.max_context as u64,
+            (args.pool_tokens > 0).then_some(args.pool_tokens as u64), 256, false)
+            .with_automatic_context(automatic_context).validate_explicit()?;
         if let Some(peer) = args.split_device {
             return self.with_dual_engine(args, peer, automatic_context, body);
         }
@@ -543,7 +546,7 @@ impl Opened {
             let source = admission::ExpertSource::selected(admitted_experts.as_ref().and_then(Option::as_ref))?;
             admission::pool_tokens(&self.library, args, &admission::inputs(args, &self.cfg, layers, model.mtp.is_some(),
                 manifest_json.as_ref(), ple.as_ref().map(|p| (p.row_bytes as u64, p.fp8)),
-                future_expert_bytes)?, source)?
+                future_expert_bytes)?, source, automatic_context)?
         } else { args.pool_tokens };
         let max_context = crate::shared::context::pool_context("qwen4", args.max_context, automatic_context, pool_tokens, 256)?;
         let pages = pool_tokens.div_ceil(engine::PAGE_ROWS);

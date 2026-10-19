@@ -458,8 +458,7 @@ pub(crate) fn with_engine<T>(
             Baseline::Measured { free_bytes } => *free_bytes, Baseline::Planned { .. } => 0 }).collect::<Vec<_>>());
         let measured_inputs = admission::Inputs { gpus: measured_gpus, loaded_modes: Some(&loaded_modes), ..inputs };
         let mut measured_request = admission::request(args, &measured_inputs)?;
-        measured_request.pool.requested = Some(placement.pool_tokens);
-        measured_request.pool.floor = placement.pool_tokens;
+        measured_request.pool.pin_selected(placement.pool_tokens);
         measured_request.onboard = cuteafd_loader::placement::Onboard::Layers(placement.onboard_layers);
         let checked = cuteafd_loader::placement::solve_frozen(&measured_request, &placement)
             .map_err(|error| anyhow::anyhow!("DeepSeek V4 measured frozen admission: {error}"))?;

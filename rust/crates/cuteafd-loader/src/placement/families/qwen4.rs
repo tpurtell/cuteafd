@@ -23,6 +23,8 @@ pub fn check_dual_layer_owners(owners: &[usize]) -> anyhow::Result<()> {
 }
 
 pub struct QwenInputs<'a> {
+    /// True only when the operator left context automatic.
+    pub automatic_context: bool,
     pub admission: QwenAdmissionInputs<'a>,
     pub capacity_bytes: u64,
     pub baseline: Baseline,
@@ -71,7 +73,7 @@ pub fn request(inputs: &QwenInputs<'_>, graph_bytes: u64) -> anyhow::Result<Plac
         attention_placement: Some(AttentionPlacement::Heads),
         context_buffers: ContextBuffers::default(), layers_first_gpu: 0,
         pool: PoolPolicy::resolve(&[inputs.capacity_bytes], inputs.max_context, inputs.requested_pool,
-            unit_rows, inputs.spark_ranks == 0),
+            unit_rows, inputs.spark_ranks == 0).with_automatic_context(inputs.automatic_context),
         pool_bounded: Vec::new(),
         layers, pool_overhead: vec![overhead], fixed, startup: Vec::new(), movables: Vec::new(),
         minimum_expert_layers: 0,
@@ -405,6 +407,8 @@ pub fn dual_peer_diagnostics(enabled: bool) -> Vec<Demand> {
 }
 
 pub struct QwenDualInputs<'a> {
+    /// True only when the operator left context automatic.
+    pub automatic_context: bool,
     pub admission: QwenAdmissionInputs<'a>,
     pub owner_manifests: [Option<&'a serde_json::Value>; 2],
     pub gpus: [GpuBudget; 2],
@@ -497,7 +501,7 @@ pub fn dual_request(inputs: &QwenDualInputs<'_>, graph_bytes: [u64; 2]) -> anyho
     }
     let capacities = inputs.gpus.map(|g| g.capacity_bytes);
     let mut pool = PoolPolicy::resolve(&capacities, inputs.max_context, inputs.requested_pool,
-        QWEN_UNIT_ROWS as u64, inputs.spark_ranks == 0);
+        QWEN_UNIT_ROWS as u64, inputs.spark_ranks == 0).with_automatic_context(inputs.automatic_context);
     pool.ceiling = pool.target;
     Ok(PlacementRequest {
         inventory: Inventory { gpus: inputs.gpus.to_vec(), spark_ranks: inputs.spark_ranks, peer_access: true },
@@ -605,7 +609,7 @@ mod tests {
         let resident = crate::families::qwen4::resident::Qwen4CheckpointResident {
             ple_table_bytes: 1 << 30, ..Default::default() };
         let extra = dual_ple_demands(&cfg, 4, &resident).unwrap();
-        let inputs = QwenInputs {
+        let inputs = QwenInputs { automatic_context: false,
             admission: QwenAdmissionInputs { cfg: &cfg, layers: 4, mtp: false, kv_format: Qwen4KvCache::Bf16,
                 manifest: None, prefill_rows: 4096, slots: 16, mark_bytes: 0, full_prefill_logits: 0,
                 ple: None, future_expert_bytes: 0, headroom: 0 },
@@ -840,7 +844,7 @@ mod tests {
                     Demand::new(0, Category::Experts, "MTP expert weights", 1300 << 20, Basis::Exact),
                     Demand::new(0, Category::Experts, "MTP expert workspace", 64 << 20, Basis::Formula)]);
             }
-            let inputs = QwenDualInputs { owner_manifests: [None, None],
+            let inputs = QwenDualInputs { automatic_context: false, owner_manifests: [None, None],
                 admission: QwenAdmissionInputs { cfg: &cfg, layers: 48, mtp, kv_format: Qwen4KvCache::Bf16, manifest: None,
                     prefill_rows: 4096, slots: 16, mark_bytes: 0, full_prefill_logits: 0,
                     ple: None, future_expert_bytes: 0, headroom: 3 << 30 },
@@ -899,7 +903,7 @@ mod tests {
                 ]}]});
             let manifests = dual_program_manifests(&manifest, [170, 188],
                 cuteafd_core::coordinator_programs::AttentionReductionPlan::new(64, None, None).unwrap()).unwrap();
-            let inputs = |measured| QwenDualInputs {
+            let inputs = |measured| QwenDualInputs { automatic_context: false,
                 owner_manifests: manifests.each_ref().map(Some),
                 admission: QwenAdmissionInputs { cfg: &cfg, layers: 48, mtp: false, kv_format, manifest: None,
                     prefill_rows: 4096, slots: 16, mark_bytes: 0, full_prefill_logits: 0,
@@ -971,9 +975,9 @@ mod tests {
             [Qwen4KvCache::Bf16, Qwen4KvCache::Fp8].map(|format| (total, format))) {
             for (expert_bytes, mtp) in [(45_u64 << 30, false), (50_u64 << 30, true)] {
                 for requested in [None, Some(32768), Some(2097152)] {
-                    let context = 131072;
+                    let context = requested.unwrap_or(131072).min(131072);
                     let context_bytes = 586_416_128;
-                    let inputs = |baseline| QwenInputs {
+                    let inputs = |baseline| QwenInputs { automatic_context: false,
                         admission: QwenAdmissionInputs { cfg: &cfg, layers: 48, mtp, kv_format, manifest: None,
                             prefill_rows: 4096, slots: 16, mark_bytes: 256 << 20, full_prefill_logits: 0,
                             ple: Some((160, true)), future_expert_bytes: 0, headroom: 3 << 30 },
@@ -1010,7 +1014,7 @@ mod tests {
         let cfg = Qwen4Config::from_hf(&config).unwrap();
         for (mtp, kv_format) in [false, true].into_iter().flat_map(|mtp|
             [Qwen4KvCache::Bf16, Qwen4KvCache::Fp8].map(|format| (mtp, format))) {
-            let inputs = QwenInputs {
+            let inputs = QwenInputs { automatic_context: false,
                 admission: QwenAdmissionInputs { cfg: &cfg, layers: 48, mtp, kv_format, manifest: None,
                     prefill_rows: 4096, slots: 16, mark_bytes: 256 << 20, full_prefill_logits: 0,
                     ple: None, future_expert_bytes: 10 << 30, headroom: 3 << 30 },

@@ -36,6 +36,8 @@ const fn gib(hundredths: u64) -> u64 { hundredths * (1 << 30) / 100 }
 /// checkpoint, the program manifest and the CLI.
 #[derive(Debug, Clone)]
 pub struct V4Inputs<'a> {
+    /// True only when the operator left context automatic.
+    pub automatic_context: bool,
     pub cfg: &'a DeepseekV4Config,
     /// Header-derived uploads; no attention weights hidden in the baseline.
     pub weights: crate::families::deepseek_v4::resident::WeightInventory,
@@ -291,7 +293,7 @@ pub fn request(inputs: &V4Inputs<'_>) -> Result<PlacementRequest, PlacementError
         inventory: Inventory { gpus: budgets, spark_ranks: inputs.spark_ranks, peer_access: gpus == 2 },
         pool: PoolPolicy { ceiling: POOL_CEILING_TOKENS, ..PoolPolicy::resolve(
             &inputs.gpus.iter().map(|g| g.0).collect::<Vec<_>>(), inputs.max_context, inputs.requested_pool,
-            geometry_unit, inputs.spark_ranks == 0) },
+            geometry_unit, inputs.spark_ranks == 0).with_automatic_context(inputs.automatic_context) },
         layers,
         pool_overhead,
         fixed,

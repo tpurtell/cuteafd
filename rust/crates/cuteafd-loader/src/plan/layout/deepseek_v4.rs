@@ -182,7 +182,7 @@ fn solve(report: &PlanReport, input: &super::super::PlanInput, options: &LayoutO
         anyhow::bail!("V4 TP2 expert kernels are missing: export the matching rtx-tp2 package for explicit local layers");
     }
     let id = if cfg.dim == 4096 { "dsv4f" } else { "dsv4p" };
-    let inputs = v4::V4Inputs { cfg: &cfg,
+    let inputs = v4::V4Inputs { automatic_context: options.context_tokens == 0, cfg: &cfg,
         weights: crate::families::deepseek_v4::resident::WeightInventory::from_headers(&cfg, devices.len(),
             shape.native_layers > 0, checkpoint.tensors.iter().map(|t| &t.meta))?,
         cache_stages: shape.native_layers, gpus, headroom_floor: options.headroom_bytes,

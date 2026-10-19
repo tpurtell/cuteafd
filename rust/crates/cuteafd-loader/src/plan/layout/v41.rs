@@ -92,7 +92,8 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
             loader_peak: [bytes, 0], ..Default::default() })
     } else { None };
     let automatic = options.pool_tokens == Some(0);
-    let mut pool = PoolPolicy::resolve(&options.rtx_bytes, shape.context_tokens, options.pool_tokens, 512, spark_ranks == 0);
+    let mut pool = PoolPolicy::resolve(&options.rtx_bytes, shape.context_tokens, options.pool_tokens, 512, spark_ranks == 0)
+        .with_automatic_context(options.context_tokens == 0);
     if pool.requested.is_none() {
         pool.floor = pool.floor.max(shape.context_tokens.div_ceil(512) * 512 + shape.concurrency * 512);
         pool.target = pool.target.min(options.target_pool_tokens).max(pool.floor);
@@ -134,7 +135,7 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
     let mut encoder_request = request.clone();
     if request.inventory.spark_ranks > 0 && request.onboard.layers(40).is_none() {
         encoder_request.onboard = Onboard::Layers(request.minimum_expert_layers);
-        encoder_request.pool.requested = Some(placement.pool_tokens);
+        encoder_request.pool.pin_selected(placement.pool_tokens);
     }
     let encoder_budget = placement::solve(&encoder_request)?;
     let mut encoder_devices = devices.clone();
@@ -194,7 +195,7 @@ fn solve_with_weight_limit(request: &placement::PlacementRequest, draft: Option<
         trial.onboard = Onboard::Layers(placement.onboard_layers - 1);
         // Keep pool-first's admitted pool while reducing only the optional prefix.
         if matches!(request.onboard, Onboard::Auto) {
-            trial.pool.requested = Some(placement.pool_tokens);
+            trial.pool.pin_selected(placement.pool_tokens);
         }
         placement = placement::solve(&trial)?;
     }

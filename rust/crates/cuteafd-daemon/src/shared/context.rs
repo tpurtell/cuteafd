@@ -29,7 +29,7 @@ pub(crate) fn pool_context(family: &str, context: usize, automatic: bool, pool: 
     let supported = cuteafd_loader::serving_capacity::pool_context(context, automatic, pool, unit)
         .map_err(|error| anyhow::anyhow!("{family}: {error}"))?;
     if supported != context {
-        tracing::warn!(family, checkpoint_context = context, admitted_pool = pool, max_context = supported,
+        tracing::info!(family, checkpoint_context = context, admitted_pool = pool, max_context = supported,
             "checkpoint context exceeds admitted pool; serving reduced max_context; set POOL_TOKENS/MAX_CONTEXT_TOKENS to change");
     }
     Ok(supported)
