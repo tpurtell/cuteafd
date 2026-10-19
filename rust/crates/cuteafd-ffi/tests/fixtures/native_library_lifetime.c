@@ -9,6 +9,9 @@ struct host_buffer { void *ptr; size_t bytes; uint64_t flags; };
 static char *event_path;
 static int pack_status, drain_status, drain_calls, drain_after, current_device;
 static size_t memory_total[8], memory_used[8], graph_bytes;
+static int immediate_copies;
+
+void fixture_configure_immediate_copies(void) { immediate_copies = 1; }
 
 void fixture_configure_memory(int device, size_t total, size_t used, size_t graph) {
     memory_total[device] = total;
@@ -195,11 +198,22 @@ int cuteafd_copy_d2h(void *dst, struct device_buffer src, size_t bytes) {
     return 0;
 }
 
+int cuteafd_copy_d2h_async(void *dst, struct device_buffer src, size_t bytes, void *stream) {
+    (void)stream;
+    if (!immediate_copies || bytes > src.bytes || src.device_id != current_device) return 1;
+    memcpy(dst, src.ptr, bytes);
+    event('J');
+    return 0;
+}
+
 int cuteafd_copy_h2d_async(struct device_buffer dst, const void *source,
                          size_t bytes, void *stream) {
     (void)stream;
     if (bytes > dst.bytes) return 1;
-    pending_upload = (struct upload_event){dst.ptr, source, bytes};
+    if (immediate_copies) {
+        if (dst.device_id != current_device) return 1;
+        memcpy(dst.ptr, source, bytes);
+    } else pending_upload = (struct upload_event){dst.ptr, source, bytes};
     event('Q');
     return 0;
 }
@@ -234,7 +248,7 @@ int cuteafd_cuda_event_destroy(void *handle) {
 
 int cuteafd_cuda_stream_query(void *stream, int *ready) {
     (void)stream;
-    *ready = 0;
+    *ready = immediate_copies;
     return 0;
 }
 
