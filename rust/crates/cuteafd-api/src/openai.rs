@@ -51,6 +51,7 @@ pub enum ModelEncoding {
     Glm(Arc<glm5::GlmEncoding>),
     /// Qwen 3.8 Flash Next: the checkpoint's chat template and Qwen3-Coder XML tool calls.
     Qwen(Arc<qwen4::QwenEncoding>),
+    Kimi(Arc<kimi::KimiEncoding>),
 }
 
 impl ModelEncoding {
@@ -60,14 +61,16 @@ impl ModelEncoding {
             Self::DeepseekV4 | Self::DeepseekV41 => vec![DEEPSEEK_EOS_TOKEN_ID],
             Self::Glm(encoding) => encoding.tokens().eos.clone(),
             Self::Qwen(encoding) => encoding.tokens().eos.clone(),
+            Self::Kimi(encoding) => encoding.eos_token_ids(),
         }
     }
 
-    fn think_close_token_id(&self) -> u32 {
+    fn think_close_token_id(&self) -> Option<u32> {
         match self {
-            Self::DeepseekV4 | Self::DeepseekV41 => DEEPSEEK_THINK_CLOSE_TOKEN_ID,
-            Self::Glm(encoding) => encoding.tokens().think_close,
-            Self::Qwen(encoding) => encoding.tokens().think_close,
+            Self::DeepseekV4 | Self::DeepseekV41 => Some(DEEPSEEK_THINK_CLOSE_TOKEN_ID),
+            Self::Glm(encoding) => Some(encoding.tokens().think_close),
+            Self::Qwen(encoding) => Some(encoding.tokens().think_close),
+            Self::Kimi(_) => None,
         }
     }
 }
@@ -145,6 +148,7 @@ impl ModelProfile {
                 "<｜deepseek_image｜>", "<｜begin▁of▁sentence｜>", "<｜end▁of▁sentence｜>",
                 "<｜User｜>", "<｜Assistant｜>", "<｜System｜>", "<think>", "</think>",
                 "<|image_pad|>", "<|image|>", "<|audio_pad|>", "<|im_start|>", "<|im_end|>",
+                kimi::OPEN, kimi::CLOSE, kimi::SEP, kimi::END,
             ].into_iter().map(str::to_owned))) }
     }
 
@@ -190,7 +194,7 @@ impl ModelProfile {
                 ids.dedup();
                 ids
             }
-            ModelEncoding::DeepseekV4 | ModelEncoding::DeepseekV41 => self.eos_token_ids.clone(),
+            ModelEncoding::DeepseekV4 | ModelEncoding::DeepseekV41 | ModelEncoding::Kimi(_) => self.eos_token_ids.clone(),
         }
     }
 }
@@ -207,7 +211,7 @@ mod admission;
 mod constraints;
 mod tools;
 pub mod chat;
-use chat::{deepseek, glm5, qwen4};
+use chat::{deepseek, glm5, kimi, qwen4};
 pub use constraints::NativeConstraint;
 mod images;
 pub mod media;
@@ -529,6 +533,7 @@ type ChatChunks = std::pin::Pin<Box<dyn futures::Stream<Item = Result<ChatChunk,
 enum Templated {
     Glm(Arc<glm5::GlmEncoding>),
     Qwen(Arc<qwen4::QwenEncoding>),
+    Kimi(Arc<kimi::KimiEncoding>),
 }
 
 impl Templated {
@@ -538,7 +543,7 @@ impl Templated {
     fn thinking(&self, body: &Value) -> Result<glm5::GlmThinking, String> {
         match self {
             Self::Glm(encoding) => glm5::resolve_glm_thinking(body, encoding.thinking_off()),
-            Self::Qwen(_) => Ok(glm5::GlmThinking { enabled: glm5::resolve_thinking(body)?, effort: None }),
+            Self::Qwen(_) | Self::Kimi(_) => Ok(glm5::GlmThinking { enabled: glm5::resolve_thinking(body)?, effort: None }),
         }
     }
 }
@@ -548,6 +553,7 @@ enum OutputProcessor {
     Deepseek(glm5::GlmStreamProcessor<ChatGenerator, deepseek::parser::DeepseekOutputParser>),
     Glm(glm5::GlmStreamProcessor<ChatGenerator>),
     Qwen(glm5::GlmStreamProcessor<ChatGenerator, qwen4::QwenOutputParser>),
+    Kimi(glm5::GlmStreamProcessor<ChatGenerator, kimi::KimiOutputParser>),
 }
 
 impl OutputProcessor {
@@ -556,6 +562,7 @@ impl OutputProcessor {
             Self::Deepseek(processor) => Box::pin(processor.process(input)),
             Self::Glm(processor) => Box::pin(processor.process(input)),
             Self::Qwen(processor) => Box::pin(processor.process(input)),
+            Self::Kimi(processor) => Box::pin(processor.process(input)),
         }
     }
 }
@@ -653,7 +660,9 @@ pub(crate) fn build(profile: &ModelProfile, limits: NativeLimits, headers: &axum
         }
     }
     let mut shield = literals::Shield::new(&body);
-    shield.messages(&mut body, &profile.literal_tokens);
+    if !matches!(profile.encoding, ModelEncoding::Kimi(_)) {
+        shield.messages(&mut body, &profile.literal_tokens);
+    }
     let audio_sources = if profile.capabilities.audio {
         if profile.audio_preparer.is_none() { return Err(Rejection::unavailable("audio processor unavailable")); }
         media::audio::take_audio_sources(&mut body).map_err(Rejection::bad)?
@@ -689,6 +698,7 @@ pub(crate) fn build(profile: &ModelProfile, limits: NativeLimits, headers: &axum
     let glm = match &profile.encoding {
         ModelEncoding::Glm(encoding) => Some(Templated::Glm(encoding.clone())),
         ModelEncoding::Qwen(encoding) => Some(Templated::Qwen(encoding.clone())),
+        ModelEncoding::Kimi(encoding) => Some(Templated::Kimi(encoding.clone())),
         ModelEncoding::DeepseekV4 | ModelEncoding::DeepseekV41 => None,
     };
     let assistance = match body.get("tool_decoding_assistance") {
@@ -798,13 +808,18 @@ pub(crate) fn build(profile: &ModelProfile, limits: NativeLimits, headers: &axum
     let syntax = match &glm_request {
         Some((Templated::Glm(_), _, _)) => tools::ToolSyntax::GlmXml,
         Some((Templated::Qwen(_), _, _)) => tools::ToolSyntax::QwenXml,
+        Some((Templated::Kimi(_), _, _)) => tools::ToolSyntax::KimiXtml,
         None => tools::ToolSyntax::Dsml,
     };
     let tool_constraints = tools::ToolConstraints::new(&converted.conversation.tools,
         converted.conversation.tool_choice, selection.required, parallel,
         assistance || response_format.as_ref().is_some_and(|v| v["type"] != "text"), syntax).map_err(Rejection::bad)?;
-    let constraint = constraints::response_constraint(response_format.clone(), converted.conversation.thinking_mode,
-        tool_constraints.as_ref(), profile.encoding.think_close_token_id()).map_err(Rejection::bad)?;
+    let constraint = match profile.encoding.think_close_token_id() {
+        Some(token) => constraints::response_constraint(response_format.clone(), converted.conversation.thinking_mode,
+            tool_constraints.as_ref(), token),
+        None => constraints::kimi_response_constraint(response_format.clone(), converted.conversation.thinking_mode,
+            tool_constraints.as_ref()),
+    }.map_err(Rejection::bad)?;
     let validator = tools::CompletionValidator::new(response_validator, tool_constraints);
     let tools_declared = !converted.conversation.tools.is_empty();
     let stop_token_ids = profile.stop_token_ids(tools_declared);
@@ -816,6 +831,23 @@ pub(crate) fn build(profile: &ModelProfile, limits: NativeLimits, headers: &axum
         .with_include_usage(!streaming || include_usage), tap: tap.clone() };
     let expanded_media_probe = probe.as_ref().is_some_and(|p| !p.spec.media.is_empty() || !p.spec.audio.is_empty());
     let (prompt, image_sources, processor) = match glm_request {
+        Some((Templated::Kimi(encoding), mut raw, thinking)) => {
+            // Keep selected tools and the rendered declaration in agreement.
+            if let Some(name) = selection.name() {
+                if let Some(declared) = raw["tools"].as_array_mut() {
+                    declared.retain(|tool| tool["function"]["name"] == name);
+                }
+                raw["tool_choice"] = json!("required");
+            }
+            let prompt = if expanded_media_probe { String::new() } else {
+                encoding.render_literals(&raw, thinking.enabled, &mut |text| shield.literal(text, &profile.literal_tokens)).map_err(Rejection::bad)?
+            };
+            let parser = kimi::KimiOutputParser::new(kimi::KimiParserOptions { thinking:thinking.enabled,
+                tools:(tools_declared && converted.conversation.tool_choice != deepseek_recipe_core::tools::ToolChoice::None)
+                    .then(|| converted.conversation.tools.clone()),
+                stop_sequences:converted.parsing_options.stop_sequences.clone() });
+            (prompt, Vec::new(), OutputProcessor::Kimi(glm5::GlmStreamProcessor::new(generator, parser)))
+        }
         Some((Templated::Glm(encoding), raw, thinking)) => {
             let tool_choice = match (selection.name(), selection.required) {
                 (Some(name), _) => glm5::GlmToolChoice::Named(name.to_owned()),

@@ -67,6 +67,13 @@ impl Shield {
         }
     }
 
+    /// Shield an already-rendered payload, after JSON decoding and sorting.
+    pub(super) fn literal(&mut self, text: &str, tokens: &LiteralTokens) -> String {
+        let mut text = text.to_owned();
+        self.text(&mut text, tokens, false);
+        text
+    }
+
     pub(super) fn messages(&mut self, body: &mut Value, tokens: &LiteralTokens) {
         for message in body
             .get_mut("messages")

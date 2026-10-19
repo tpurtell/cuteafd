@@ -1,0 +1,786 @@
+{
+  "source_revision": "f831ab66814297da540d832a5235f8e904f29d06",
+  "source_sha256": "49ff03305fdc4be26867972788d36150b67f8a9e852e62bb7959d87482223676",
+  "prompts": [
+    {
+      "name": "system",
+      "body": {
+        "messages": [
+          {
+            "role": "system",
+            "name": "a&\"b",
+            "content": "Be precise"
+          },
+          {
+            "role": "user",
+            "content": "Hello"
+          }
+        ]
+      },
+      "prompt": "<|open|>message role=\"system\" name=\"a&amp;&quot;b\"<|sep|>Be precise<|close|>message<|sep|><|end_of_msg|><|open|>message role=\"user\"<|sep|>Hello<|close|>message<|sep|><|end_of_msg|><|open|>message role=\"assistant\"<|sep|><|open|>think<|sep|>",
+      "literal_spans": []
+    },
+    {
+      "name": "off",
+      "body": {
+        "messages": [
+          {
+            "role": "user",
+            "content": "Hello"
+          }
+        ],
+        "enable_thinking": false
+      },
+      "prompt": "<|open|>message role=\"user\"<|sep|>Hello<|close|>message<|sep|><|end_of_msg|><|open|>message role=\"assistant\"<|sep|><|open|>response<|sep|>",
+      "literal_spans": []
+    },
+    {
+      "name": "turns",
+      "body": {
+        "messages": [
+          {
+            "role": "user",
+            "content": "Hello"
+          },
+          {
+            "role": "assistant",
+            "content": "Hi",
+            "reasoning_content": "  "
+          },
+          {
+            "role": "user",
+            "content": "Again"
+          }
+        ]
+      },
+      "prompt": "<|open|>message role=\"user\"<|sep|>Hello<|close|>message<|sep|><|end_of_msg|><|open|>message role=\"assistant\"<|sep|><|open|>think<|sep|>  <|close|>think<|sep|><|open|>response<|sep|>Hi<|close|>response<|sep|><|close|>message<|sep|><|end_of_msg|><|open|>message role=\"user\"<|sep|>Again<|close|>message<|sep|><|end_of_msg|><|open|>message role=\"assistant\"<|sep|><|open|>think<|sep|>",
+      "literal_spans": []
+    },
+    {
+      "name": "tools",
+      "body": {
+        "messages": [
+          {
+            "role": "user",
+            "content": "Hello"
+          }
+        ],
+        "tools": [
+          {
+            "type": "function",
+            "function": {
+              "name": "lookup",
+              "description": "Find data",
+              "parameters": {
+                "type": "object",
+                "properties": {
+                  "q": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          }
+        ]
+      },
+      "prompt": "<|open|>message role=\"system\" type=\"tool-declare\"<|sep|># Tools\nHere are the available tools, described in JSONSchema.\n\n```json\n[{\"function\":{\"description\":\"Find data\",\"name\":\"lookup\",\"parameters\":{\"properties\":{\"q\":{\"type\":\"string\"}},\"type\":\"object\"}},\"type\":\"function\"}]\n```<|close|>message<|sep|><|end_of_msg|><|open|>message role=\"user\"<|sep|>Hello<|close|>message<|sep|><|end_of_msg|><|open|>message role=\"assistant\"<|sep|><|open|>think<|sep|>",
+      "literal_spans": []
+    },
+    {
+      "name": "results",
+      "body": {
+        "messages": [
+          {
+            "role": "user",
+            "content": "Hello"
+          },
+          {
+            "role": "assistant",
+            "reasoning_content": "search",
+            "content": null,
+            "tool_calls": [
+              {
+                "id": "a",
+                "type": "function",
+                "function": {
+                  "name": "lookup",
+                  "arguments": "{\"q\":\"A & B\",\"n\":1e2,\"items\":[1,2],\"ok\":true}ignored"
+                }
+              },
+              {
+                "id": "b",
+                "function": {
+                  "name": "other",
+                  "arguments": {
+                    "x": [
+                      true,
+                      null
+                    ]
+                  }
+                }
+              }
+            ]
+          },
+          {
+            "role": "tool",
+            "tool_call_id": "b",
+            "name": "stale",
+            "content": "second"
+          },
+          {
+            "role": "tool",
+            "tool_call_id": "a",
+            "content": "first"
+          }
+        ],
+        "tools": [
+          {
+            "type": "function",
+            "function": {
+              "name": "lookup",
+              "description": "Find data",
+              "parameters": {
+                "type": "object",
+                "properties": {
+                  "q": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          }
+        ]
+      },
+      "prompt": "<|open|>message role=\"system\" type=\"tool-declare\"<|sep|># Tools\nHere are the available tools, described in JSONSchema.\n\n```json\n[{\"function\":{\"description\":\"Find data\",\"name\":\"lookup\",\"parameters\":{\"properties\":{\"q\":{\"type\":\"string\"}},\"type\":\"object\"}},\"type\":\"function\"}]\n```<|close|>message<|sep|><|end_of_msg|><|open|>message role=\"user\"<|sep|>Hello<|close|>message<|sep|><|end_of_msg|><|open|>message role=\"assistant\"<|sep|><|open|>think<|sep|>search<|close|>think<|sep|><|open|>response<|sep|><|close|>response<|sep|><|open|>tools<|sep|><|open|>call tool=\"lookup\" index=\"1\"<|sep|><|open|>argument key=\"q\" type=\"string\"<|sep|>A & B<|close|>argument<|sep|><|open|>argument key=\"n\" type=\"number\"<|sep|>1e2<|close|>argument<|sep|><|open|>argument key=\"items\" type=\"array\"<|sep|>[1,2]<|close|>argument<|sep|><|open|>argument key=\"ok\" type=\"boolean\"<|sep|>true<|close|>argument<|sep|><|close|>call<|sep|><|open|>call tool=\"other\" index=\"2\"<|sep|><|open|>argument key=\"x\" type=\"array\"<|sep|>[true, null]<|close|>argument<|sep|><|close|>call<|sep|><|close|>tools<|sep|><|close|>message<|sep|><|end_of_msg|><|open|>message role=\"tool\" tool=\"lookup\" index=\"1\"<|sep|>first<|close|>message<|sep|><|end_of_msg|><|open|>message role=\"tool\" tool=\"other\" index=\"2\"<|sep|>second<|close|>message<|sep|><|end_of_msg|><|open|>message role=\"assistant\"<|sep|><|open|>think<|sep|>",
+      "literal_spans": []
+    },
+    {
+      "name": "results_off",
+      "body": {
+        "messages": [
+          {
+            "role": "user",
+            "content": "Hello"
+          },
+          {
+            "role": "assistant",
+            "reasoning_content": "omit",
+            "content": "Hi",
+            "tool_calls": [
+              {
+                "id": "a",
+                "type": "function",
+                "function": {
+                  "name": "lookup",
+                  "arguments": "{\"q\":\"A & B\",\"n\":1e2,\"items\":[1,2],\"ok\":true}ignored"
+                }
+              },
+              {
+                "id": "b",
+                "function": {
+                  "name": "other",
+                  "arguments": {
+                    "x": [
+                      true,
+                      null
+                    ]
+                  }
+                }
+              }
+            ]
+          }
+        ],
+        "enable_thinking": false
+      },
+      "prompt": "<|open|>message role=\"user\"<|sep|>Hello<|close|>message<|sep|><|end_of_msg|><|open|>message role=\"assistant\"<|sep|><|open|>response<|sep|>Hi<|close|>response<|sep|><|open|>tools<|sep|><|open|>call tool=\"lookup\" index=\"1\"<|sep|><|open|>argument key=\"q\" type=\"string\"<|sep|>A & B<|close|>argument<|sep|><|open|>argument key=\"n\" type=\"number\"<|sep|>1e2<|close|>argument<|sep|><|open|>argument key=\"items\" type=\"array\"<|sep|>[1,2]<|close|>argument<|sep|><|open|>argument key=\"ok\" type=\"boolean\"<|sep|>true<|close|>argument<|sep|><|close|>call<|sep|><|open|>call tool=\"other\" index=\"2\"<|sep|><|open|>argument key=\"x\" type=\"array\"<|sep|>[true, null]<|close|>argument<|sep|><|close|>call<|sep|><|close|>tools<|sep|><|close|>message<|sep|><|end_of_msg|><|open|>message role=\"assistant\"<|sep|><|open|>response<|sep|>",
+      "literal_spans": []
+    },
+    {
+      "name": "raw_json",
+      "body": {
+        "messages": [
+          {
+            "role": "assistant",
+            "tool_calls": [
+              {
+                "function": {
+                  "name": "lookup",
+                  "arguments": "[1,2]"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "prompt": "<|open|>message role=\"assistant\"<|sep|><|open|>think<|sep|><|close|>think<|sep|><|open|>response<|sep|><|close|>response<|sep|><|open|>tools<|sep|><|open|>call tool=\"lookup\" index=\"1\"<|sep|><|open|>json type=\"object\"<|sep|>[1,2]<|close|>json<|sep|><|close|>call<|sep|><|close|>tools<|sep|><|close|>message<|sep|><|end_of_msg|><|open|>message role=\"assistant\"<|sep|><|open|>think<|sep|>",
+      "literal_spans": []
+    },
+    {
+      "name": "dynamic",
+      "body": {
+        "messages": [
+          {
+            "role": "system",
+            "tools": [
+              {
+                "type": "function",
+                "function": {
+                  "name": "lookup",
+                  "description": "Find data",
+                  "parameters": {
+                    "type": "object",
+                    "properties": {
+                      "q": {
+                        "type": "string"
+                      }
+                    }
+                  }
+                }
+              }
+            ]
+          },
+          {
+            "role": "user",
+            "content": "Hello"
+          }
+        ]
+      },
+      "prompt": "<|open|>message role=\"system\" type=\"tool-declare\"<|sep|>## New Tools Available\nThe system dynamically extends the toolset via lazy-loading.\nYou have access to all existing and extended tools.\nHere are the specs for the extended tools.\n\n```json\n[{\"function\":{\"description\":\"Find data\",\"name\":\"lookup\",\"parameters\":{\"properties\":{\"q\":{\"type\":\"string\"}},\"type\":\"object\"}},\"type\":\"function\"}]\n```<|close|>message<|sep|><|end_of_msg|><|open|>message role=\"user\"<|sep|>Hello<|close|>message<|sep|><|end_of_msg|><|open|>message role=\"assistant\"<|sep|><|open|>think<|sep|>",
+      "literal_spans": []
+    },
+    {
+      "name": "low",
+      "body": {
+        "messages": [
+          {
+            "role": "user",
+            "content": "Hello"
+          }
+        ],
+        "reasoning_effort": "low"
+      },
+      "prompt": "<|open|>message role=\"system\" type=\"thinking-effort\"<|sep|>`thinking_effort` guides on how much to think in your thinking channel (not including the response channel), supported values include `low`, `medium`, `high`, and `max`.\nNow the system is invoked with `thinking_effort=low`.<|close|>message<|sep|><|end_of_msg|><|open|>message role=\"user\"<|sep|>Hello<|close|>message<|sep|><|end_of_msg|><|open|>message role=\"assistant\"<|sep|><|open|>think<|sep|>",
+      "literal_spans": []
+    },
+    {
+      "name": "high",
+      "body": {
+        "messages": [
+          {
+            "role": "user",
+            "content": "Hello"
+          }
+        ],
+        "reasoning_effort": "high"
+      },
+      "prompt": "<|open|>message role=\"system\" type=\"thinking-effort\"<|sep|>`thinking_effort` guides on how much to think in your thinking channel (not including the response channel), supported values include `low`, `medium`, `high`, and `max`.\nNow the system is invoked with `thinking_effort=high`.<|close|>message<|sep|><|end_of_msg|><|open|>message role=\"user\"<|sep|>Hello<|close|>message<|sep|><|end_of_msg|><|open|>message role=\"assistant\"<|sep|><|open|>think<|sep|>",
+      "literal_spans": []
+    },
+    {
+      "name": "max",
+      "body": {
+        "messages": [
+          {
+            "role": "user",
+            "content": "Hello"
+          }
+        ],
+        "reasoning_effort": "max"
+      },
+      "prompt": "<|open|>message role=\"system\" type=\"thinking-effort\"<|sep|>`thinking_effort` guides on how much to think in your thinking channel (not including the response channel), supported values include `low`, `medium`, `high`, and `max`.\nNow the system is invoked with `thinking_effort=max`.<|close|>message<|sep|><|end_of_msg|><|open|>message role=\"user\"<|sep|>Hello<|close|>message<|sep|><|end_of_msg|><|open|>message role=\"assistant\"<|sep|><|open|>think<|sep|>",
+      "literal_spans": []
+    },
+    {
+      "name": "required",
+      "body": {
+        "messages": [
+          {
+            "role": "user",
+            "content": "Hello"
+          }
+        ],
+        "tools": [
+          {
+            "type": "function",
+            "function": {
+              "name": "lookup",
+              "description": "Find data",
+              "parameters": {
+                "type": "object",
+                "properties": {
+                  "q": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          }
+        ],
+        "tool_choice": "required"
+      },
+      "prompt": "<|open|>message role=\"system\" type=\"tool-declare\"<|sep|># Tools\nHere are the available tools, described in JSONSchema.\n\n```json\n[{\"function\":{\"description\":\"Find data\",\"name\":\"lookup\",\"parameters\":{\"properties\":{\"q\":{\"type\":\"string\"}},\"type\":\"object\"}},\"type\":\"function\"}]\n```<|close|>message<|sep|><|end_of_msg|><|open|>message role=\"user\"<|sep|>Hello<|close|>message<|sep|><|end_of_msg|><|open|>message role=\"system\" type=\"tool-choice\"<|sep|>The system is invoked with `tool_choice=required`.\nYou MUST call tools in the next message.<|close|>message<|sep|><|end_of_msg|><|open|>message role=\"assistant\"<|sep|><|open|>think<|sep|>",
+      "literal_spans": []
+    },
+    {
+      "name": "none",
+      "body": {
+        "messages": [
+          {
+            "role": "user",
+            "content": "Hello"
+          }
+        ],
+        "tools": [
+          {
+            "type": "function",
+            "function": {
+              "name": "lookup",
+              "description": "Find data",
+              "parameters": {
+                "type": "object",
+                "properties": {
+                  "q": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          }
+        ],
+        "tool_choice": "none"
+      },
+      "prompt": "<|open|>message role=\"system\" type=\"tool-declare\"<|sep|># Tools\nHere are the available tools, described in JSONSchema.\n\n```json\n[{\"function\":{\"description\":\"Find data\",\"name\":\"lookup\",\"parameters\":{\"properties\":{\"q\":{\"type\":\"string\"}},\"type\":\"object\"}},\"type\":\"function\"}]\n```<|close|>message<|sep|><|end_of_msg|><|open|>message role=\"user\"<|sep|>Hello<|close|>message<|sep|><|end_of_msg|><|open|>message role=\"system\" type=\"tool-choice\"<|sep|>The system is invoked with `tool_choice=none`.\nYou MUST NOT call any tools in the next message.<|close|>message<|sep|><|end_of_msg|><|open|>message role=\"assistant\"<|sep|><|open|>think<|sep|>",
+      "literal_spans": []
+    },
+    {
+      "name": "json",
+      "body": {
+        "messages": [
+          {
+            "role": "user",
+            "content": "Hello"
+          }
+        ],
+        "response_format": {
+          "type": "json_object"
+        }
+      },
+      "prompt": "<|open|>message role=\"user\"<|sep|>Hello<|close|>message<|sep|><|end_of_msg|><|open|>message role=\"system\" type=\"response-format\"<|sep|>The system is invoked with `response_format=json_object`.\nYour response must be raw JSON data without markdown code blocks (```json) or any additional formatting.<|close|>message<|sep|><|end_of_msg|><|open|>message role=\"assistant\"<|sep|><|open|>think<|sep|>",
+      "literal_spans": []
+    },
+    {
+      "name": "schema",
+      "body": {
+        "messages": [
+          {
+            "role": "user",
+            "content": "Hello"
+          }
+        ],
+        "response_format": {
+          "type": "json_schema",
+          "json_schema": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "z": {
+                  "type": "number"
+                },
+                "a": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        }
+      },
+      "prompt": "<|open|>message role=\"user\"<|sep|>Hello<|close|>message<|sep|><|end_of_msg|><|open|>message role=\"system\" type=\"response-format\"<|sep|>The system is invoked with `response_format=json_schema`.\nYour response must be raw JSON data without markdown code blocks (```json) or any additional formatting.\nThe JSON data must match the following schema:\n```json\n{\"properties\":{\"a\":{\"type\":\"string\"},\"z\":{\"type\":\"number\"}},\"type\":\"object\"}\n```<|close|>message<|sep|><|end_of_msg|><|open|>message role=\"assistant\"<|sep|><|open|>think<|sep|>",
+      "literal_spans": []
+    },
+    {
+      "name": "controls",
+      "body": {
+        "messages": [
+          {
+            "role": "assistant",
+            "tool_calls": [
+              {
+                "function": {
+                  "name": "a&\"b",
+                  "arguments": "{\"line\":\"a\nb\",\"nul\":\"x\u0000y\"}"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "prompt": "<|open|>message role=\"assistant\"<|sep|><|open|>think<|sep|><|close|>think<|sep|><|open|>response<|sep|><|close|>response<|sep|><|open|>tools<|sep|><|open|>call tool=\"a&amp;&quot;b\" index=\"1\"<|sep|><|open|>argument key=\"line\" type=\"string\"<|sep|>a\nb<|close|>argument<|sep|><|open|>argument key=\"nul\" type=\"string\"<|sep|>x\u0000y<|close|>argument<|sep|><|close|>call<|sep|><|close|>tools<|sep|><|close|>message<|sep|><|end_of_msg|><|open|>message role=\"assistant\"<|sep|><|open|>think<|sep|>",
+      "literal_spans": []
+    },
+    {
+      "name": "duplicate_arguments",
+      "body": {
+        "messages": [
+          {
+            "role": "assistant",
+            "tool_calls": [
+              {
+                "function": {
+                  "name": "x",
+                  "arguments": "{\"x\":1e2,\"x\":-0,\"a\":[1,2]}tail"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "prompt": "<|open|>message role=\"assistant\"<|sep|><|open|>think<|sep|><|close|>think<|sep|><|open|>response<|sep|><|close|>response<|sep|><|open|>tools<|sep|><|open|>call tool=\"x\" index=\"1\"<|sep|><|open|>argument key=\"x\" type=\"number\"<|sep|>1e2<|close|>argument<|sep|><|open|>argument key=\"x\" type=\"number\"<|sep|>-0<|close|>argument<|sep|><|open|>argument key=\"a\" type=\"array\"<|sep|>[1,2]<|close|>argument<|sep|><|close|>call<|sep|><|close|>tools<|sep|><|close|>message<|sep|><|end_of_msg|><|open|>message role=\"assistant\"<|sep|><|open|>think<|sep|>",
+      "literal_spans": []
+    },
+    {
+      "name": "empty_arguments",
+      "body": {
+        "messages": [
+          {
+            "role": "assistant",
+            "tool_calls": [
+              {
+                "function": {
+                  "name": "x",
+                  "arguments": ""
+                }
+              },
+              {
+                "function": {
+                  "name": "y",
+                  "arguments": null
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "prompt": "<|open|>message role=\"assistant\"<|sep|><|open|>think<|sep|><|close|>think<|sep|><|open|>response<|sep|><|close|>response<|sep|><|open|>tools<|sep|><|open|>call tool=\"x\" index=\"1\"<|sep|><|close|>call<|sep|><|open|>call tool=\"y\" index=\"2\"<|sep|><|close|>call<|sep|><|close|>tools<|sep|><|close|>message<|sep|><|end_of_msg|><|open|>message role=\"assistant\"<|sep|><|open|>think<|sep|>",
+      "literal_spans": []
+    },
+    {
+      "name": "unresolved_results",
+      "body": {
+        "messages": [
+          {
+            "role": "assistant",
+            "tool_calls": [
+              {
+                "id": "a",
+                "type": "function",
+                "function": {
+                  "name": "lookup",
+                  "arguments": "{\"q\":\"A & B\",\"n\":1e2,\"items\":[1,2],\"ok\":true}ignored"
+                }
+              },
+              {
+                "id": "b",
+                "function": {
+                  "name": "other",
+                  "arguments": {
+                    "x": [
+                      true,
+                      null
+                    ]
+                  }
+                }
+              }
+            ]
+          },
+          {
+            "role": "tool",
+            "tool_call_id": "b",
+            "name": "stale",
+            "content": "second"
+          },
+          {
+            "role": "tool",
+            "tool_call_id": "missing",
+            "name": "fallback",
+            "content": "first"
+          }
+        ]
+      },
+      "prompt": "<|open|>message role=\"assistant\"<|sep|><|open|>think<|sep|><|close|>think<|sep|><|open|>response<|sep|><|close|>response<|sep|><|open|>tools<|sep|><|open|>call tool=\"lookup\" index=\"1\"<|sep|><|open|>argument key=\"q\" type=\"string\"<|sep|>A & B<|close|>argument<|sep|><|open|>argument key=\"n\" type=\"number\"<|sep|>1e2<|close|>argument<|sep|><|open|>argument key=\"items\" type=\"array\"<|sep|>[1,2]<|close|>argument<|sep|><|open|>argument key=\"ok\" type=\"boolean\"<|sep|>true<|close|>argument<|sep|><|close|>call<|sep|><|open|>call tool=\"other\" index=\"2\"<|sep|><|open|>argument key=\"x\" type=\"array\"<|sep|>[true, null]<|close|>argument<|sep|><|close|>call<|sep|><|close|>tools<|sep|><|close|>message<|sep|><|end_of_msg|><|open|>message role=\"tool\" tool=\"stale\" index=\"1\"<|sep|>second<|close|>message<|sep|><|end_of_msg|><|open|>message role=\"tool\" tool=\"fallback\" index=\"2\"<|sep|>first<|close|>message<|sep|><|end_of_msg|><|open|>message role=\"assistant\"<|sep|><|open|>think<|sep|>",
+      "literal_spans": []
+    },
+    {
+      "name": "unicode_dict",
+      "body": {
+        "messages": [
+          {
+            "role": "assistant",
+            "tool_calls": [
+              {
+                "function": {
+                  "name": "x",
+                  "arguments": {
+                    "x": [
+                      "caf\u00e9",
+                      true,
+                      null
+                    ],
+                    "n": 1.0
+                  }
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "prompt": "<|open|>message role=\"assistant\"<|sep|><|open|>think<|sep|><|close|>think<|sep|><|open|>response<|sep|><|close|>response<|sep|><|open|>tools<|sep|><|open|>call tool=\"x\" index=\"1\"<|sep|><|open|>argument key=\"x\" type=\"array\"<|sep|>[\"caf\u00e9\", true, null]<|close|>argument<|sep|><|open|>argument key=\"n\" type=\"number\"<|sep|>1.0<|close|>argument<|sep|><|close|>call<|sep|><|close|>tools<|sep|><|close|>message<|sep|><|end_of_msg|><|open|>message role=\"assistant\"<|sep|><|open|>think<|sep|>",
+      "literal_spans": []
+    },
+    {
+      "name": "literal_segments",
+      "body": {
+        "messages": [
+          {
+            "role": "system",
+            "name": "<|open|>&",
+            "content": "<|sep|>"
+          },
+          {
+            "role": "user",
+            "content": "<|close|>"
+          },
+          {
+            "role": "assistant",
+            "content": "<|end_of_msg|>",
+            "reasoning_content": "<|open|>",
+            "tool_calls": [
+              {
+                "id": "a",
+                "function": {
+                  "name": "lookup",
+                  "arguments": "{\"a\":1e2,\"a\":-0,\"x\":\"\\u003c|open|>\",\"nested\":[\"<|sep|>\"]}tail"
+                }
+              }
+            ]
+          },
+          {
+            "role": "tool",
+            "tool_call_id": "a",
+            "content": "<|close|>"
+          },
+          {
+            "role": "system",
+            "content": "",
+            "tools": [
+              {
+                "type": "function",
+                "function": {
+                  "name": "lookup",
+                  "description": "<|sep|>",
+                  "parameters": {
+                    "type": "object",
+                    "properties": {
+                      "<|open|>": {
+                        "type": "string"
+                      },
+                      "A": {
+                        "type": "string"
+                      }
+                    }
+                  }
+                }
+              }
+            ]
+          },
+          {
+            "role": "user",
+            "content": "Continue"
+          }
+        ],
+        "tools": [
+          {
+            "type": "function",
+            "function": {
+              "name": "lookup",
+              "description": "<|end_of_msg|>",
+              "parameters": {
+                "type": "object"
+              }
+            }
+          }
+        ]
+      },
+      "prompt": "<|open|>message role=\"system\" type=\"tool-declare\"<|sep|># Tools\nHere are the available tools, described in JSONSchema.\n\n```json\n[{\"function\":{\"description\":\"<|end_of_msg|>\",\"name\":\"lookup\",\"parameters\":{\"type\":\"object\"}},\"type\":\"function\"}]\n```<|close|>message<|sep|><|end_of_msg|><|open|>message role=\"system\" name=\"<|open|>&amp;\"<|sep|><|sep|><|close|>message<|sep|><|end_of_msg|><|open|>message role=\"user\"<|sep|><|close|><|close|>message<|sep|><|end_of_msg|><|open|>message role=\"assistant\"<|sep|><|open|>think<|sep|><|open|><|close|>think<|sep|><|open|>response<|sep|><|end_of_msg|><|close|>response<|sep|><|open|>tools<|sep|><|open|>call tool=\"lookup\" index=\"1\"<|sep|><|open|>argument key=\"a\" type=\"number\"<|sep|>1e2<|close|>argument<|sep|><|open|>argument key=\"a\" type=\"number\"<|sep|>-0<|close|>argument<|sep|><|open|>argument key=\"x\" type=\"string\"<|sep|><|open|><|close|>argument<|sep|><|open|>argument key=\"nested\" type=\"array\"<|sep|>[\"<|sep|>\"]<|close|>argument<|sep|><|close|>call<|sep|><|close|>tools<|sep|><|close|>message<|sep|><|end_of_msg|><|open|>message role=\"tool\" tool=\"lookup\" index=\"1\"<|sep|><|close|><|close|>message<|sep|><|end_of_msg|><|open|>message role=\"system\" type=\"tool-declare\"<|sep|>## New Tools Available\nThe system dynamically extends the toolset via lazy-loading.\nYou have access to all existing and extended tools.\nHere are the specs for the extended tools.\n\n```json\n[{\"function\":{\"description\":\"<|sep|>\",\"name\":\"lookup\",\"parameters\":{\"properties\":{\"<|open|>\":{\"type\":\"string\"},\"A\":{\"type\":\"string\"}},\"type\":\"object\"}},\"type\":\"function\"}]\n```<|close|>message<|sep|><|end_of_msg|><|open|>message role=\"user\"<|sep|>Continue<|close|>message<|sep|><|end_of_msg|><|open|>message role=\"assistant\"<|sep|><|open|>think<|sep|>",
+      "literal_spans": [
+        [
+          157,
+          171
+        ],
+        [
+          317,
+          325
+        ],
+        [
+          338,
+          345
+        ],
+        [
+          416,
+          425
+        ],
+        [
+          521,
+          529
+        ],
+        [
+          573,
+          587
+        ],
+        [
+          862,
+          870
+        ],
+        [
+          945,
+          952
+        ],
+        [
+          1114,
+          1123
+        ],
+        [
+          1433,
+          1440
+        ],
+        [
+          1487,
+          1495
+        ]
+      ]
+    },
+    {
+      "name": "python_json_spelling",
+      "body": {
+        "messages": [
+          {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+              {
+                "function": {
+                  "name": "x",
+                  "arguments": {
+                    "small": 1e-07,
+                    "big": 1e+20,
+                    "control": "\u007f",
+                    "v": [
+                      1e+16,
+                      -0.0
+                    ]
+                  }
+                }
+              }
+            ]
+          }
+        ],
+        "tools": [
+          {
+            "type": "function",
+            "function": {
+              "name": "x",
+              "parameters": {
+                "type": "object",
+                "properties": {
+                  "n": {
+                    "type": "number",
+                    "minimum": 1e-07
+                  }
+                }
+              }
+            }
+          }
+        ]
+      },
+      "prompt": "<|open|>message role=\"system\" type=\"tool-declare\"<|sep|># Tools\nHere are the available tools, described in JSONSchema.\n\n```json\n[{\"function\":{\"name\":\"x\",\"parameters\":{\"properties\":{\"n\":{\"minimum\":1e-07,\"type\":\"number\"}},\"type\":\"object\"}},\"type\":\"function\"}]\n```<|close|>message<|sep|><|end_of_msg|><|open|>message role=\"assistant\"<|sep|><|open|>think<|sep|><|close|>think<|sep|><|open|>response<|sep|><|close|>response<|sep|><|open|>tools<|sep|><|open|>call tool=\"x\" index=\"1\"<|sep|><|open|>argument key=\"small\" type=\"number\"<|sep|>1e-07<|close|>argument<|sep|><|open|>argument key=\"big\" type=\"number\"<|sep|>1e+20<|close|>argument<|sep|><|open|>argument key=\"control\" type=\"string\"<|sep|>\u007f<|close|>argument<|sep|><|open|>argument key=\"v\" type=\"array\"<|sep|>[1e+16, -0.0]<|close|>argument<|sep|><|close|>call<|sep|><|close|>tools<|sep|><|close|>message<|sep|><|end_of_msg|><|open|>message role=\"assistant\"<|sep|><|open|>think<|sep|>",
+      "literal_spans": []
+    }
+  ],
+  "outputs": [
+    {
+      "name": "answer",
+      "thinking": false,
+      "wire": "answer<|close|>response<|sep|><|close|>message<|sep|><|end_of_msg|>",
+      "reasoning": "",
+      "content": "answer",
+      "calls": []
+    },
+    {
+      "name": "tools",
+      "thinking": false,
+      "wire": "<|close|>response<|sep|><|open|>tools<|sep|><|open|>call tool=\"lookup\" index=\"1\"<|sep|><|open|>argument key=\"q\" type=\"string\"<|sep|>A & B<|close|>argument<|sep|><|open|>argument key=\"n\" type=\"number\"<|sep|>1e2<|close|>argument<|sep|><|open|>argument key=\"items\" type=\"array\"<|sep|>[1,2]<|close|>argument<|sep|><|open|>argument key=\"ok\" type=\"boolean\"<|sep|>true<|close|>argument<|sep|><|close|>call<|sep|><|open|>call tool=\"other\" index=\"2\"<|sep|><|open|>argument key=\"x\" type=\"array\"<|sep|>[true, null]<|close|>argument<|sep|><|close|>call<|sep|><|close|>tools<|sep|><|close|>message<|sep|><|end_of_msg|>",
+      "reasoning": "",
+      "content": "",
+      "calls": [
+        {
+          "name": "lookup",
+          "arguments": {
+            "q": "A & B",
+            "n": 100.0,
+            "items": [
+              1,
+              2
+            ],
+            "ok": true
+          }
+        },
+        {
+          "name": "other",
+          "arguments": {
+            "x": [
+              true,
+              null
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "answer",
+      "thinking": true,
+      "wire": "reason<|close|>think<|sep|><|open|>response<|sep|>answer<|close|>response<|sep|><|close|>message<|sep|><|end_of_msg|>",
+      "reasoning": "reason",
+      "content": "answer",
+      "calls": []
+    },
+    {
+      "name": "tools",
+      "thinking": true,
+      "wire": "reason<|close|>think<|sep|><|open|>response<|sep|><|close|>response<|sep|><|open|>tools<|sep|><|open|>call tool=\"lookup\" index=\"1\"<|sep|><|open|>argument key=\"q\" type=\"string\"<|sep|>A & B<|close|>argument<|sep|><|open|>argument key=\"n\" type=\"number\"<|sep|>1e2<|close|>argument<|sep|><|open|>argument key=\"items\" type=\"array\"<|sep|>[1,2]<|close|>argument<|sep|><|open|>argument key=\"ok\" type=\"boolean\"<|sep|>true<|close|>argument<|sep|><|close|>call<|sep|><|open|>call tool=\"other\" index=\"2\"<|sep|><|open|>argument key=\"x\" type=\"array\"<|sep|>[true, null]<|close|>argument<|sep|><|close|>call<|sep|><|close|>tools<|sep|><|close|>message<|sep|><|end_of_msg|>",
+      "reasoning": "reason",
+      "content": "",
+      "calls": [
+        {
+          "name": "lookup",
+          "arguments": {
+            "q": "A & B",
+            "n": 100.0,
+            "items": [
+              1,
+              2
+            ],
+            "ok": true
+          }
+        },
+        {
+          "name": "other",
+          "arguments": {
+            "x": [
+              true,
+              null
+            ]
+          }
+        }
+      ]
+    }
+  ]
+}

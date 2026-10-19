@@ -222,6 +222,76 @@ impl State<'_> {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn kimi_xtml_constraints_use_native_string_tags() {
+        use cuteafd_api::openai::{self, ModelEncoding, ModelProfile, NativeLimits, NativeRequest};
+        use axum::{body::Body, http::Request};
+        use serde_json::json;
+        use tower::ServiceExt;
+        let Some(path) = std::env::var_os("CUTEAFD_NATIVE_LIB") else {
+            eprintln!("skipping: CUTEAFD_NATIVE_LIB is not set");
+            return;
+        };
+        // SAFETY: the test retains this native DSO until all matchers are gone.
+        let library = unsafe { NativeLibrary::load(path).unwrap() };
+        let temp = tempfile::tempdir().unwrap();
+        let mut added = serde_json::Map::new();
+        for (id, content) in [(163587,"<|open|>"),(163588,"<|close|>"),(163589,"<|sep|>"),(163586,"<|end_of_msg|>")] {
+            added.insert(id.to_string(), json!({"content":content}));
+        }
+        std::fs::write(temp.path().join("tokenizer_config.json"), json!({"added_tokens_decoder":added}).to_string()).unwrap();
+        std::fs::write(temp.path().join("generation_config.json"), json!({"eos_token_id":163586}).to_string()).unwrap();
+        let encoding = Arc::new(openai::chat::kimi::KimiEncoding::from_snapshot(temp.path()).unwrap());
+        // Byte vocabulary makes every part of an XTML delimiter span tokens.
+        let mut vocab = serde_json::Map::new();
+        for ch in 32u8..127 { vocab.insert((ch as char).to_string(), json!(ch-32)); }
+        vocab.insert("<eos>".into(), json!(95));
+        let tokenizer = temp.path().join("tokenizer.json");
+        std::fs::write(&tokenizer, json!({"version":"1.0", "added_tokens":[],
+            "model":{"type":"WordLevel", "vocab":vocab, "unk_token":"?"}}).to_string()).unwrap();
+        for thinking in [false, true] {
+            for required in [false, true] {
+                let (tx, mut rx) = tokio::sync::mpsc::channel::<NativeRequest>(1);
+                let profile = ModelProfile::new("kimi-fixture", ModelEncoding::Kimi(encoding.clone()));
+                let app = openai::router_for_model(tx, NativeLimits::default(), Arc::new(std::sync::Mutex::new(serde_json::Value::Null)),
+                    std::time::Duration::from_secs(25), cuteafd_api::openai::ConsoleHub::disabled(), profile);
+                let body = json!({"model":"kimi-fixture", "messages":[{"role":"user","content":"Return JSON"}],
+                    "enable_thinking":thinking, "tool_choice":if required {"required"} else {"auto"},
+                    "tools":[{"type":"function","function":{"name":"lookup","strict":true,
+                        "parameters":{"type":"object","properties":{"x":{"const":"a"}},"required":["x"],"additionalProperties":false}}}],
+                    "response_format":{"type":"json_object"}});
+                let task = tokio::spawn(async move { app.oneshot(Request::post("/v1/chat/completions")
+                    .header("content-type","application/json").body(Body::from(body.to_string())).unwrap()).await.unwrap() });
+                let request = tokio::time::timeout(std::time::Duration::from_secs(10), rx.recv()).await.unwrap().unwrap();
+                let mut compiler = Compiler::with_vocab(&library, tokenizer.clone(), 96, vec![95]);
+                let spec = request.constraint.as_ref().unwrap();
+                let mut state = compiler.matcher(spec).unwrap();
+                let prefix = if thinking {"reason<|close|>think<|sep|><|open|>response<|sep|>"} else {""};
+                let wire = if required {
+                    format!("{prefix}<|close|>response<|sep|><|open|>tools<|sep|><|open|>call tool=\"lookup\" index=\"1\"<|sep|><|open|>json type=\"object\"<|sep|>{{\"x\":\"a\"}}<|close|>json<|sep|><|close|>call<|sep|><|close|>tools<|sep|><|close|>message<|sep|>")
+                } else { format!("{prefix}{{\"ok\":true}}<|close|>response<|sep|><|close|>message<|sep|>") };
+                for (at, byte) in wire.bytes().enumerate() {
+                    state.accept((byte-32) as u32).unwrap_or_else(|e| panic!("thinking={thinking} required={required} byte {at}: {e:#}"));
+                }
+                assert!(state.matcher.is_completed().unwrap());
+                state.accept(95).unwrap();
+                // Optional assisted tools may follow visible response text too.
+                let calls = format!("{prefix}I will look it up.<|close|>response<|sep|><|open|>tools<|sep|><|open|>call tool=\"lookup\" index=\"1\"<|sep|><|open|>json type=\"object\"<|sep|>{{\"x\":\"a\"}}<|close|>json<|sep|><|close|>call<|sep|><|close|>tools<|sep|><|close|>message<|sep|>");
+                let mut with_response = compiler.matcher(spec).unwrap();
+                for byte in calls.bytes() { with_response.accept((byte-32) as u32).unwrap(); }
+                assert!(with_response.matcher.is_completed().unwrap());
+                with_response.accept(95).unwrap();
+                // Schema remains active after the entire multi-token reasoning gate.
+                let mut invalid = compiler.matcher(spec).unwrap();
+                let bad = if required { wire.replace("\"a\"", "\"b\"") }
+                    else { wire.replace("{\"ok\":true}", "not-json") };
+                assert!(bad.bytes().any(|byte| invalid.accept((byte-32) as u32).is_err()));
+                task.abort();
+                let _ = task.await;
+            }
+        }
+    }
+
     /// The XGrammar matcher's mask buffer is reused across rows and
     /// `fill_bitmask` returns whether that row needs a mask at all. A row whose
     /// grammar allows every token must be recorded as `None`; recording the

@@ -172,6 +172,16 @@ fn tojson(value: Value, kwargs: Kwargs) -> Result<Value, Error> {
     Ok(Value::from(out))
 }
 
+/// Native checkpoint encoders use the same Python JSON spelling as templates.
+pub(crate) fn python_json(value: &Json, compact: bool) -> String {
+    let options = PyJson { ensure_ascii: false, sort_keys: false, indent: None,
+        item: if compact { "," } else { ", " }.into(),
+        key: if compact { ":" } else { ": " }.into() };
+    let mut out = String::new();
+    options.write(&mut out, value, 0);
+    out
+}
+
 /// `json.dumps` formatting.
 struct PyJson {
     ensure_ascii: bool,
