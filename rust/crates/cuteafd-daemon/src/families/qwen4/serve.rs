@@ -360,15 +360,18 @@ impl<'e, 'a> Backend<'a> for Qwen4Backend<'e, 'a> {
     }
     fn require_live(&self) -> Result<()> { self.engine.require_live() }
     fn log_table_stats(&self, phase: &str) { self.engine.log_table_stats(phase); }
-    fn prefill_device(&self, placement: &mut Self::Placement, tokens: &[u32], rows: usize)
+    fn prefill_device(&self, placement: &mut Self::Placement, tokens: &[u32], rows: usize,
+        _pool: &cuteafd_engine::prefix::RefPagePool)
         -> Result<Option<crate::shared::token_io::DeviceLogits>> {
         self.engine.prefill_device(placement, tokens, None, None, rows)
     }
-    fn verify_device(&self, sequences: &mut [(&mut Self::Placement, &[u32])], speculative: bool)
+    fn verify_device(&self, sequences: &mut [(&mut Self::Placement, &[u32])], speculative: bool,
+        _pool: &cuteafd_engine::prefix::RefPagePool)
         -> Result<Option<crate::shared::token_io::DeviceLogits>> {
         self.engine.verify_device(sequences, speculative)
     }
-    fn verify_device_ungraphed(&self, sequences: &mut [(&mut Self::Placement, &[u32])], speculative: bool)
+    fn verify_device_ungraphed(&self, sequences: &mut [(&mut Self::Placement, &[u32])], speculative: bool,
+        _pool: &cuteafd_engine::prefix::RefPagePool)
         -> Result<Option<crate::shared::token_io::DeviceLogits>> {
         self.engine.verify_device_ungraphed(sequences, speculative)
     }

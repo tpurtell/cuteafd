@@ -101,6 +101,16 @@ impl<'a> KimiPrefix<'a> {
         Ok(())
     }
 
+    pub(crate) fn check_append(&self, placement: &Placement, rows: usize) -> Result<()> {
+        let end = placement.len.checked_add(rows).context("Kimi prefix frontier overflow")?;
+        self.validate(placement, end)?;
+        let live = self.0.live.borrow();
+        let frontier = live[placement.slot].as_ref().context("Kimi prefix slot is not bound")?;
+        ensure!(rows > 0 && frontier.len == placement.len && placement.state_len == placement.len
+            && frontier.units == placement.units, "Kimi submission differs from bound frontier");
+        Ok(())
+    }
+
     /// Publish only after a complete non-speculative pass or exact accepted-state commit.
     pub(crate) fn commit(&self, placement: &mut Placement, start: usize, rows: usize) -> Result<()> {
         let end = start.checked_add(rows).context("Kimi prefix frontier overflow")?;
@@ -309,6 +319,14 @@ mod tests {
             let boxed = |error: BoxError| anyhow::anyhow!("Kimi prefix fixture: {error}");
             let mut original = Placement { units: vec![0, 1], slot: 0, len: 0, state_len: 0 };
             family.bind(&mut original).map_err(boxed)?;
+            family.check_append(&original, 65)?;
+            assert!(family.check_append(&original, 0).is_err());
+            let mut wrong = original.clone();
+            wrong.state_len = 1;
+            assert!(family.check_append(&wrong, 1).is_err());
+            wrong = original.clone();
+            wrong.units.reverse();
+            assert!(family.check_append(&wrong, 1).is_err());
             let mut expected = Vec::new();
             for rank in 0..2 {
                 for (i, region) in family.state_buffers(rank, 0)?.into_iter().enumerate() {
@@ -328,6 +346,8 @@ mod tests {
             assert_eq!(family.commit_point(&stale), 0, "a later KDA frontier cannot certify an earlier prefix");
             assert!(family.capture(MarkSlot(0), &stale, 64).is_err());
             assert!(family.commit(&mut stale, 64, 1).is_err());
+            assert!(family.check_append(&stale, 1).is_err());
+            family.check_append(&original, 1)?;
             let before = fixture.events()?.len();
             family.capture(MarkSlot(0), &original, 65).map_err(boxed)?;
             let events = fixture.events()?;

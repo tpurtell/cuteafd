@@ -5,7 +5,7 @@ use crate::shared::{experts::rtx::pair::{submit_scoped, teardown, Teardown},
     peer_split::{hop::HopLink, PeerExchange, TerminalState}};
 use anyhow::{ensure, Result};
 use cuteafd_loader::placement::LayerExecutionPlan;
-use std::{cell::RefCell, rc::Rc};
+use std::{cell::{Cell, RefCell}, rc::Rc};
 use crate::shared::memory::device::Stream;
 
 struct Lanes<'a> {
@@ -19,6 +19,7 @@ pub(crate) struct Engine<'a> {
     execution: Execution<'a>,
     lanes: RefCell<Lanes<'a>>,
     prefix: RefCell<Option<super::prefix::KimiPrefix<'a>>>,
+    startup_captures: Cell<Option<u64>>,
     hops: HopLink<'a>,
     peer: PeerExchange<'a>,
     // PeerExchange and HopLink borrow raw handles; keep their exact streams
@@ -177,7 +178,7 @@ impl<'a> Engine<'a> {
         let streams = local.iter().map(|pair| pair.each_ref().map(|local| local.stream().clone())).collect();
         let execution = Execution::new(plan, &peer, &hops, streams)?;
         Ok(Self { execution, lanes: RefCell::new(Lanes { local, routed, io, experts }),
-            prefix: RefCell::new(None), hops, peer, exchange_streams })
+            prefix: RefCell::new(None), startup_captures: Cell::new(None), hops, peer, exchange_streams })
     }
 
     pub(crate) fn prefix_family(&self) -> Result<super::prefix::KimiPrefix<'a>> {
@@ -189,6 +190,99 @@ impl<'a> Engine<'a> {
             [kda0, kda1], [mla0, mla1])?;
         *prefix = Some(family.clone());
         Ok(family)
+    }
+
+    pub(crate) fn geometry(&self) -> Result<crate::shared::qwen::scheduler::Geometry> {
+        let lanes = self.lanes.try_borrow()?;
+        let local = &lanes.local[0][0];
+        let (state, _) = local.prefix_banks();
+        Ok(crate::shared::qwen::scheduler::Geometry { family: "kimi_k3",
+            vocab_size: local.config().vocab_size, max_context: local.max_context(),
+            slots: state.slots(), prefill_rows: local.rows(), decode_rows: local.rows().min(64),
+            full_prefill_logits: false })
+    }
+
+    pub(crate) fn library(&self) -> &'a cuteafd_ffi::NativeLibrary {
+        self.exchange_streams[0].device.library
+    }
+
+    pub(crate) fn devices(&self) -> [i32; 2] {
+        self.exchange_streams.each_ref().map(|stream| stream.device.id)
+    }
+
+    pub(crate) fn require_live(&self) -> Result<()> {
+        self.peer.require_live()?;
+        if let Some(startup) = self.startup_captures.get() {
+            super::graphs::check_captures(startup, cuteafd_ffi::graph_captures())?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn warm_graphs(&self, keys: &[super::graphs::Key]) -> Result<()> {
+        ensure!(self.startup_captures.get().is_none(), "Kimi startup graphs already sealed");
+        let mut lanes = self.lanes.try_borrow_mut()?;
+        let mut consumed = 0;
+        for (lane, pair) in lanes.local.iter_mut().enumerate() {
+            for (rank, local) in pair.iter_mut().enumerate() {
+                let binding = keys.iter().copied().filter(|key| key.lane == lane && key.rank == rank).collect::<Vec<_>>();
+                ensure!(!binding.is_empty(), "Kimi graph inventory omits a binding");
+                local.warm_graphs(&binding, rank)?;
+                consumed += binding.len();
+            }
+        }
+        ensure!(consumed == keys.len(), "Kimi startup graph inventory has unbound keys");
+        self.startup_captures.set(Some(cuteafd_ffi::graph_captures()));
+        Ok(())
+    }
+
+    /// Scheduler submission keeps full logits on the terminal device. Page
+    /// metadata validates against the cache's real refcounts after its COW.
+    pub(crate) fn step_device(&self,
+        sequences: &mut [(&mut super::prefix::Placement, &[u32])],
+        pool: &cuteafd_engine::prefix::RefPagePool, logit_rows: usize, graphed: bool)
+        -> Result<crate::shared::token_io::DeviceLogits> {
+        self.require_live()?;
+        let family = self.prefix_family()?;
+        let rows = sequences.iter().try_fold(0usize, |rows, (_, tokens)|
+            rows.checked_add(tokens.len()).ok_or_else(|| anyhow::anyhow!("Kimi submission rows overflow")))?;
+        ensure!(!sequences.is_empty() && logit_rows > 0 && logit_rows <= rows && logit_rows <= 64,
+            "Kimi device submission logit extent");
+        // Validate every frontier before enqueue: a failed batch cannot publish
+        // only some requests' state. Non-speculative execution commits all rows.
+        for (placement, tokens) in sequences.iter() {
+            family.check_append(placement, tokens.len())?;
+        }
+        let output = submit_scoped(|| self.require_live(), || self.shutdown(), |scope| {
+            let mut lanes = self.lanes.try_borrow_mut()?;
+            lanes.local[0][1].config().release_geometry()?;
+            let metadata = sequences.iter().map(|(placement, tokens)| SequenceRows {
+                slot: placement.slot, start: placement.len, rows: tokens.len(), pages: &placement.units,
+            }).collect::<Vec<_>>();
+            for local in &mut lanes.local[0] { local.stage_attention(&metadata, pool)?; }
+            let tokens = sequences.iter().flat_map(|(_, tokens)| tokens.iter().copied()).collect::<Vec<_>>();
+            lanes.io[0][0].embed(&tokens, lanes.local[0][0].buffer("delta")?)?;
+            let Lanes { local, routed, io, experts } = &mut *lanes;
+            for binding in &mut local[0] { binding.enable_replay(graphed); }
+            let result = self.execution.run(scope, &self.peer, &self.hops,
+                &mut local[..1], &mut routed[..1], &mut experts[..1], &[rows], false,
+                super::layers::Output::Normalized);
+            for binding in &mut local[0] { binding.enable_replay(true); }
+            let normalized = result?[0];
+            let input = crate::shared::prefix::view(normalized,
+                (rows - logit_rows) * 7168 * 2, logit_rows * 7168 * 2)?;
+            let logits = io[0][1].project(input, logit_rows)?;
+            let stream = local[0][1].stream();
+            Ok(crate::shared::token_io::DeviceLogits { ptr: logits.ptr.cast_const(), rows: logit_rows,
+                vocab: local[0][1].config().vocab_size, stride: local[0][1].config().vocab_size,
+                stream: stream.raw, greedy: None })
+        })?;
+        // A nested native operator capturing here is a contract violation too.
+        // Abort/drain before propagating it, never release live graph operands.
+        if let Err(error) = self.require_live() { self.shutdown()?; return Err(error); }
+        for (placement, tokens) in sequences {
+            family.commit(placement, placement.len, tokens.len())?;
+        }
+        Ok(output)
     }
 
     fn shutdown(&self) -> Result<()> {

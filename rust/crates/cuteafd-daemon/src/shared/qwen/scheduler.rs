@@ -80,6 +80,7 @@ pub(crate) trait Backend<'a> {
     type Prefix: PrefixFamily<Placement = Self::Placement>;
 
     fn geometry(&self) -> Geometry;
+    fn message_starts(&self) -> &[&str] { &MESSAGE_STARTS }
     fn library(&self) -> &'a NativeLibrary;
     fn profile(&self) -> &RefCell<[f64; 2]>;
     fn prefix_cache(&self, args: &PrefixArgs, lanes: usize)
@@ -95,11 +96,15 @@ pub(crate) trait Backend<'a> {
     fn prefetch(&self, tokens: &[u32], next: &[u32]);
     fn require_live(&self) -> Result<()>;
     fn log_table_stats(&self, phase: &str);
-    fn prefill_device(&self, placement: &mut Self::Placement, tokens: &[u32], logit_rows: usize)
+    // Family write validation uses the actual cache pool after admission/COW.
+    fn prefill_device(&self, placement: &mut Self::Placement, tokens: &[u32], logit_rows: usize,
+        pool: &cuteafd_engine::prefix::RefPagePool)
         -> Result<Option<DeviceLogits>>;
-    fn verify_device(&self, sequences: &mut [(&mut Self::Placement, &[u32])], speculative: bool)
+    fn verify_device(&self, sequences: &mut [(&mut Self::Placement, &[u32])], speculative: bool,
+        pool: &cuteafd_engine::prefix::RefPagePool)
         -> Result<Option<DeviceLogits>>;
-    fn verify_device_ungraphed(&self, sequences: &mut [(&mut Self::Placement, &[u32])], speculative: bool)
+    fn verify_device_ungraphed(&self, sequences: &mut [(&mut Self::Placement, &[u32])], speculative: bool,
+        pool: &cuteafd_engine::prefix::RefPagePool)
         -> Result<Option<DeviceLogits>>;
     fn verify_bucket_rows(&self, rows: usize, speculative: bool, diagnostic: bool) -> usize;
     fn verify_attention_trace(&self, contexts: &[Vec<usize>], rows: usize) -> serde_json::Value;
@@ -501,7 +506,7 @@ pub(crate) fn schedule<'a, B: Backend<'a>>(engine: &B, snapshot: &std::path::Pat
     // Publish readiness only after all fallible scheduler-owned startup work.
     let (family, mut cache, markers, mut grammars, tokenizer, mut selector, mut shared, mut trace, mut prefills) = initialize(|| {
         let (family, cache) = engine.prefix_cache(prefix, max_sequences)?;
-        let markers = crate::shared::prefix::marker_ids(snapshot, &MESSAGE_STARTS)?;
+        let markers = crate::shared::prefix::marker_ids(snapshot, engine.message_starts())?;
         let grammars = crate::shared::constraints::Compiler::with_vocab(
             engine.library(), snapshot.join("tokenizer.json"), geometry.vocab_size, eos);
         let tokenizer = cuteafd_loader::LoadedTokenizer::from_snapshot(snapshot)?;
@@ -669,9 +674,9 @@ pub(crate) fn schedule<'a, B: Backend<'a>>(engine: &B, snapshot: &std::path::Pat
                 // Teacher-forced scoring: every row's logits, no generation, nothing retained.
                 let scored = probe::score(engine.library(), &job.probe, &tokens, from, geometry.prefill_rows,
                     geometry.decode_rows, probe::verify_rows(&job.probe), geometry.full_prefill_logits, &mut placement,
-                    |placement, chunk, rows| Ok(engine.prefill_device(placement, chunk, rows)?
+                    |placement, chunk, rows| Ok(engine.prefill_device(placement, chunk, rows, cache.pool())?
                         .map(probe::ScoreLogits::Device)),
-                    |placement, chunk| engine.verify_device_ungraphed(&mut [(placement, chunk)], false)?
+                    |placement, chunk| engine.verify_device_ungraphed(&mut [(placement, chunk)], false, cache.pool())?
                         .context("scoring needs every layer"));
                 match scored {
                     Ok(_) => { let _ = job.events.send(Ok(InferenceChunk::Finish { finish_reason: InferenceFinishReason::Length })); }
@@ -736,8 +741,8 @@ pub(crate) fn schedule<'a, B: Backend<'a>>(engine: &B, snapshot: &std::path::Pat
                     let decode = p.job.probe.as_ref().and_then(|probe| probe.spec.cold_steps.get(p.chunks))
                         .is_some_and(|step| step.decode);
                     let logits = if decode {
-                        engine.verify_device_ungraphed(&mut [(&mut p.placement, chunk)], false)?
-                    } else { engine.prefill_device(&mut p.placement, chunk, 1)? };
+                        engine.verify_device_ungraphed(&mut [(&mut p.placement, chunk)], false, cache.pool())?
+                    } else { engine.prefill_device(&mut p.placement, chunk, 1, cache.pool())? };
                     if end == p.tokens.len() {
                         // The first token, while this prompt's logits are the workspace's.
                         let mut logits = logits.context("prefill produced no logits")?;
@@ -984,9 +989,9 @@ pub(crate) fn schedule<'a, B: Backend<'a>>(engine: &B, snapshot: &std::path::Pat
         let timer = Instant::now();
         engine.probe_begin(tokens.len());
         let step = if diagnostic {
-            engine.verify_device_ungraphed(&mut rows, spec)
+            engine.verify_device_ungraphed(&mut rows, spec, cache.pool())
         } else {
-            engine.verify_device(&mut rows, spec)
+            engine.verify_device(&mut rows, spec, cache.pool())
         }.and_then(|logits| logits.context("decode needs every layer"))
             .and_then(|logits| {
                 // Each row draws at the position after it, masked along its sequence's drafts.

@@ -89,7 +89,8 @@ impl<'e, 'a> Backend<'a> for DenseBackend<'e, 'a> {
         self.engine.borrow().require_live()
     }
     fn log_table_stats(&self, _phase: &str) {}
-    fn prefill_device(&self, placement: &mut Placement, tokens: &[u32], logit_rows: usize) -> Result<Option<DeviceLogits>> {
+    fn prefill_device(&self, placement: &mut Placement, tokens: &[u32], logit_rows: usize,
+        _pool: &cuteafd_engine::prefix::RefPagePool) -> Result<Option<DeviceLogits>> {
         ensure!(self.pending.borrow().is_none(), "dense prefill during pending verify");
         let mut engine = self.engine.borrow_mut();
         ensure!(engine.slot_position(placement.slot)? == placement.len, "dense prefill placement/state frontier differs");
@@ -99,7 +100,8 @@ impl<'e, 'a> Backend<'a> for DenseBackend<'e, 'a> {
         placement.state_len = placement.len;
         Ok(Some(output))
     }
-    fn verify_device(&self, sequences: &mut [(&mut Placement, &[u32])], speculative: bool) -> Result<Option<DeviceLogits>> {
+    fn verify_device(&self, sequences: &mut [(&mut Placement, &[u32])], speculative: bool,
+        _pool: &cuteafd_engine::prefix::RefPagePool) -> Result<Option<DeviceLogits>> {
         ensure!(self.pending.borrow().is_none(), "dense verify requires prior commit");
         let slots = sequences.iter().map(|(placement, _)| placement.slot).collect::<Vec<_>>();
         let mut engine = self.engine.borrow_mut();
@@ -128,8 +130,9 @@ impl<'e, 'a> Backend<'a> for DenseBackend<'e, 'a> {
         }
         Ok(Some(output))
     }
-    fn verify_device_ungraphed(&self, sequences: &mut [(&mut Placement, &[u32])], speculative: bool) -> Result<Option<DeviceLogits>> {
-        self.verify_device(sequences, speculative)
+    fn verify_device_ungraphed(&self, sequences: &mut [(&mut Placement, &[u32])], speculative: bool,
+        pool: &cuteafd_engine::prefix::RefPagePool) -> Result<Option<DeviceLogits>> {
+        self.verify_device(sequences, speculative, pool)
     }
     fn verify_bucket_rows(&self, rows: usize, _speculative: bool, _diagnostic: bool) -> usize { rows }
     fn verify_attention_trace(&self, contexts: &[Vec<usize>], rows: usize) -> serde_json::Value {
