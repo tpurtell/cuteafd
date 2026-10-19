@@ -1,4 +1,4 @@
-//! EXL3 TP2 rank execution: raw FP32 partials, without finish or re-quantization.
+//! Shared EXL3 whole/TP2 execution: FP32 token sums, without finish or re-quantization.
 use super::native::{output_bytes, validate_layers, RankCompletion};
 use super::{ExpertInput, PartialDtype, Routes, RtxExpertLayer, RtxSelectionPolicy, RtxShard};
 use crate::shared::experts::{
@@ -25,6 +25,7 @@ pub(crate) struct Exl3Tp2<'a> {
     completion: RankCompletion<Event<'a>>,
     device: Device<'a>,
     rank: u8,
+    shard: RtxShard,
     layers: Vec<usize>,
     geometry: ExpertGeometry,
     row_policy: Exl3RowPolicy,
@@ -42,6 +43,7 @@ pub(crate) struct Exl3Tp2<'a> {
 pub(crate) struct Exl3Tp2Weights<'a> {
     device: Device<'a>,
     rank: u8,
+    shard: RtxShard,
     layers: Vec<usize>,
     geometry: ExpertGeometry,
     row_policy: Exl3RowPolicy,
@@ -78,6 +80,7 @@ impl<'a> Exl3Tp2Weights<'a> {
             completion: RankCompletion::new(Event::new(self.device)?),
             device: self.device,
             rank: self.rank,
+            shard: self.shard,
             layers: self.layers.clone(),
             geometry: self.geometry,
             row_policy: self.row_policy,
@@ -145,6 +148,20 @@ fn selected_directories(
         .into_iter()
         .map(|capacity| package.join(format!("m{capacity}")))
         .collect())
+}
+
+fn validate_whole_package(package: &Path, rows: usize, policy: Exl3RowPolicy,
+    selection: RtxSelectionPolicy, geometry: ExpertGeometry) -> Result<()> {
+    for path in selected_directories(package, rows, policy, selection)? {
+        let meta: serde_json::Value = serde_json::from_slice(&std::fs::read(path.join("v41_exl3.json"))?)?;
+        ensure!(meta["hidden"].as_u64() == Some(geometry.hidden as u64)
+            && meta["intermediate"].as_u64() == Some(geometry.intermediate as u64)
+            && meta["experts"].as_u64() == Some(geometry.experts as u64)
+            && meta["top_k"].as_u64() == Some(geometry.topk as u64)
+            && meta["output_dtype"].as_str() == Some("fp32"),
+            "EXL3 whole package geometry/output differs from complete experts");
+    }
+    Ok(())
 }
 
 impl<'a> Exl3Tp2<'a> {
@@ -338,6 +355,7 @@ impl<'a> Exl3Tp2<'a> {
         let make = |rank: usize, weights| Exl3Tp2Weights {
             device: devices[rank],
             rank: rank as u8,
+            shard: RtxShard::Tp2 { rank: rank as u8 },
             layers: layers.clone(),
             geometry,
             row_policy,
@@ -420,6 +438,53 @@ impl<'a> Exl3Tp2<'a> {
         Ok(ranks)
     }
 
+    pub(crate) fn whole_workspace_bytes(package: &Path, max_rows: usize,
+        geometry: ExpertGeometry, selection: RtxSelectionPolicy) -> Result<usize> {
+        let policy = Exl3RowPolicy::for_geometry(geometry);
+        validate_whole_package(package, max_rows, policy, selection, geometry)?;
+        Self::workspace_bytes_for_selection(package, geometry.hidden as usize,
+            max_rows, policy, selection)
+    }
+
+    /// Complete experts on one admitted device. The same capacity bindings,
+    /// scratch arena and completion protocol serve both whole and TP2 shards.
+    pub(crate) fn load_whole_weights(
+        device: Device<'a>, catalog: &cuteafd_loader::OfficialV41Catalog,
+        package: &Path, layers: Vec<usize>, max_rows: usize, budget: usize,
+        selection: RtxSelectionPolicy,
+    ) -> Result<Exl3Tp2Weights<'a>> {
+        validate_layers(&layers, 0)?;
+        let geometry = expert_geometry();
+        let row_policy = Exl3RowPolicy::for_geometry(geometry);
+        let workspace_bytes = Self::workspace_bytes_for_selection(package,
+            geometry.hidden as usize, max_rows, row_policy, selection)?;
+        validate_whole_package(package, max_rows, row_policy, selection, geometry)?;
+        let plans = layers.iter().map(|&layer| Exl3Weights::plan(catalog,
+            ExpertLayer::BackboneFull { layer })).collect::<Result<Vec<_>>>()?;
+        let mut used = workspace_bytes;
+        for plan in &plans {
+            used = used.checked_add(plan.resident_bytes).context("EXL3 whole resident overflow")?;
+            ensure!(used.checked_add(plan.device_staging_bytes).context("EXL3 whole peak overflow")?
+                <= budget, "EXL3 whole weights + workspace + staging exceed admitted budget");
+        }
+        let label = format!("experts/whole expert layers {layers:?}");
+        let weights = device.own(|| {
+            let _scope = cuteafd_ffi::memory_ledger::scope_owned(&label);
+            let mut weights = Vec::with_capacity(layers.len());
+            let mut remaining = budget.checked_sub(workspace_bytes).context("EXL3 whole workspace exceeds budget")?;
+            for &layer in &layers {
+                let weight = Exl3Weights::load(device.library, catalog,
+                    ExpertLayer::BackboneFull { layer }, remaining)?;
+                remaining -= weight.budget.resident_bytes;
+                weights.push(weight);
+            }
+            Ok(Rc::new(weights))
+        })?;
+        Ok(Exl3Tp2Weights { device, rank: 0, shard: RtxShard::Whole, layers, geometry,
+            row_policy, selection, package: package.to_path_buf(), max_rows, workspace_bytes,
+            weights: Rc::new(weights) })
+    }
+
     fn initialize_lane(&mut self, modules: Option<Vec<Exl3Modules<'a>>>) -> Result<()> {
         let paths = selected_directories(
             &self.package,
@@ -478,6 +543,7 @@ impl<'a> Exl3Tp2<'a> {
         Exl3Tp2Weights {
             device: self.device,
             rank: self.rank,
+            shard: self.shard,
             layers: self.layers.clone(),
             geometry: self.geometry,
             row_policy: self.row_policy,
@@ -541,7 +607,7 @@ impl<'a> Exl3Tp2<'a> {
 
 impl RtxExpertLayer for Exl3Tp2<'_> {
     fn shard(&self) -> RtxShard {
-        RtxShard::Tp2 { rank: self.rank }
+        self.shard
     }
     fn partial(&self) -> PartialDtype {
         PartialDtype::F32
@@ -637,6 +703,32 @@ impl RtxExpertLayer for Exl3Tp2<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn whole_package_rejects_half_width_and_wrong_output_before_allocation() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let directory = temp.path().join("m1");
+        std::fs::create_dir(&directory)?;
+        let geometry = ExpertGeometry::KIMI_K3;
+        let mut meta = serde_json::json!({"hidden":geometry.hidden,
+            "intermediate":geometry.intermediate,"experts":geometry.experts,
+            "top_k":geometry.topk,"output_dtype":"fp32"});
+        let write = |meta: &serde_json::Value| -> Result<()> {
+            Ok(std::fs::write(directory.join("v41_exl3.json"), serde_json::to_vec(meta)?)?)
+        };
+        write(&meta)?;
+        let validate = || validate_whole_package(temp.path(), 1,
+            Exl3RowPolicy::for_geometry(geometry), RtxSelectionPolicy::FirstCapacity, geometry);
+        validate()?;
+        meta["intermediate"] = (geometry.intermediate / 2).into();
+        write(&meta)?;
+        assert!(validate().is_err());
+        meta["intermediate"] = geometry.intermediate.into();
+        meta["output_dtype"] = "bf16".into();
+        write(&meta)?;
+        assert!(validate().is_err());
+        Ok(())
+    }
+
     #[test]
     fn rank1_mid_load_failure_releases_both_rank_owners() {
         use std::{
