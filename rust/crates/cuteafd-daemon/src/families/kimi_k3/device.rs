@@ -341,10 +341,15 @@ pub(crate) struct LocalLane<'a> {
     kda: Rc<super::state::KdaBank<'a>>,
     mla: Rc<super::mla::CacheBank<'a>>,
     attention: Option<AttentionShape>,
+    graphs: Option<super::graphs::Graphs<'a>>,
+    replay_enabled: bool,
 }
 
 impl Drop for LocalLane<'_> {
-    fn drop(&mut self) { self.lane.stream.drain_or_abort("Kimi persistent local lane"); }
+    fn drop(&mut self) {
+        self.lane.stream.drain_or_abort("Kimi persistent local lane");
+        drop(self.graphs.take());
+    }
 }
 
 impl<'a> LocalLane<'a> {
@@ -360,7 +365,7 @@ impl<'a> LocalLane<'a> {
         global.check_device(device)?;
         kda.check_reader(lane_index, &lane.stream)?;
         mla.check_reader(lane_index, &lane.stream)?;
-        Ok(Self { lane, programs, cfg, layers, global, lane_index, kda, mla, attention: None })
+        Ok(Self { lane, programs, cfg, layers, global, lane_index, kda, mla, attention: None, graphs: None, replay_enabled: true })
     }
 
     fn layer(&self, layer: usize) -> Result<&super::weights::LayerWeights<'a>> {
@@ -433,8 +438,8 @@ impl<'a> LocalLane<'a> {
     }
 
     /// Outside capture: replace metadata contents, never the admitted addresses.
-    /// The scheduler retains pages/slots and orders cross-lane users through
-    /// completion; a graph's identity uses row shape, not sequence partitions.
+    /// The scheduler retains pages/slots; graph keys include the KDA sequence
+    /// count because it is a launch scalar, unlike the mutable table contents.
     pub(crate) fn stage_attention(&mut self, sequences: &[SequenceRows<'_>],
         pool: &cuteafd_engine::prefix::RefPagePool) -> Result<()> {
         self.attention = None;
@@ -447,12 +452,51 @@ impl<'a> LocalLane<'a> {
         Ok(())
     }
 
+    pub(crate) fn warm_graphs(&mut self, keys: &[super::graphs::Key], rank: usize) -> Result<()> {
+        use super::graphs::Op;
+        ensure!(self.graphs.is_none() && keys.iter().all(|key|
+            key.lane == self.lane_index && key.rank == rank && key.rows <= self.rows()),
+            "Kimi startup graph keys differ from local binding");
+        let stream = self.stream().clone();
+        let staged = self.attention.take();
+        let graphs = super::graphs::Graphs::capture(&stream, keys, |key| {
+            match key.op {
+                Op::Residual(site) => { self.residual(site, key.rows)?; }
+                Op::Ffn(layer) => { self.ffn(layer, key.rows)?; }
+                Op::Attention { layer, sequences } => {
+                    self.attention = Some(AttentionShape { rows: key.rows, sequences });
+                    self.attention(layer, key.rows, false)?;
+                }
+            }
+            Ok(())
+        });
+        self.attention = staged;
+        self.graphs = Some(graphs?);
+        Ok(())
+    }
+
+    pub(crate) fn enable_replay(&mut self, enabled: bool) { self.replay_enabled = enabled; }
+
+    fn replay(&mut self, rows: usize, op: super::graphs::Op) -> Result<bool> {
+        if !self.replay_enabled { return Ok(false); }
+        let rank = usize::from(!self.has_embedding());
+        let key = super::graphs::Key { lane: self.lane_index, rank, rows, op };
+        let stream = self.stream().clone();
+        self.graphs.as_mut().map_or(Ok(false), |graphs| graphs.launch(key, &stream))
+    }
+
     /// Enqueue only rank-local attention. KDA and head-split MLA return a TP2
     /// partial; whole MLA returns the owner's complete delta. The shared layer
     /// executor owns the meet/publication and recurrent-slot ordering.
     pub(crate) fn attention(&mut self, layer: usize, rows: usize, speculative: bool) -> Result<CuteafdDeviceBuffer> {
         let shape = self.attention.ok_or_else(|| anyhow::anyhow!("Kimi attention metadata not staged"))?;
         ensure!(shape.rows == rows && (!speculative || rows <= 64), "Kimi attention staged row shape/speculation");
+        let sequences = if self.cfg.attention[layer] == cuteafd_loader::families::kimi_k3::config::KimiAttention::Kda {
+            shape.sequences
+        } else { 1 };
+        if !speculative && self.replay(rows, super::graphs::Op::Attention { layer, sequences })? {
+            return self.plane("attention output", rows, 7168);
+        }
         let weights = self.layer(layer)?;
         let output = self.plane("attention output", rows, 7168)?;
         let device = self.lane.stream.device;
@@ -515,6 +559,9 @@ impl<'a> LocalLane<'a> {
     }
 
     pub(crate) fn residual(&mut self, site: MixSite, rows: usize) -> Result<CuteafdDeviceBuffer> {
+        if self.replay(rows, super::graphs::Op::Residual(site))? {
+            return self.plane("normalized", rows, 7168);
+        }
         let (score_weight, norm_weight) = match site {
             MixSite::Attention(layer) => (self.layer(layer)?.buffer("attention.score")?, self.layer(layer)?.buffer("attention.norm")?),
             MixSite::Ffn(layer) => (self.layer(layer)?.buffer("ffn.score")?, self.layer(layer)?.buffer("ffn.norm")?),
@@ -530,6 +577,9 @@ impl<'a> LocalLane<'a> {
     /// Returns a TP2 partial. The shared executor meets both ranks before this
     /// partial can become the next fused residual's delta.
     pub(crate) fn ffn(&mut self, layer: usize, rows: usize) -> Result<CuteafdDeviceBuffer> {
+        if self.replay(rows, super::graphs::Op::Ffn(layer))? {
+            return self.plane("ffn output", rows, 7168);
+        }
         let weights = self.layer(layer)?;
         let output = self.plane("ffn output", rows, 7168)?;
         let batch = KimiFfnBatch { rows, input: self.plane("normalized", rows, 7168)?,

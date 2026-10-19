@@ -9,10 +9,8 @@ use cuteafd_core::memory_layout::{Basis, Category};
 use cuteafd_ffi::{MLA_PAGE_ROWS, MLA_RECORD_BYTES};
 use cuteafd_loader::{families::kimi_k3::config::{KimiAttention, KimiK3Config}, placement::*};
 
-const MODES: &[LayerMode] = &[LayerMode::HeadSplit,
-    LayerMode::Whole { gpu: 0, ffn: FfnMode::Split }, LayerMode::Whole { gpu: 1, ffn: FfnMode::Split }];
-const EXECUTOR: ExecutorModes = ExecutorModes { family: "kimi_k3", modes: MODES,
-    hops: true, attention: AttentionPlacement::Layers };
+const EXECUTOR: ExecutorModes = families::KIMI_K3;
+const MODES: &[LayerMode] = EXECUTOR.modes;
 const FLOOR: u64 = 262_144;
 
 /// Diagnostic inventories retain checkpoint numerics and select only a prefix.
@@ -421,15 +419,29 @@ fn request(i: Inputs<'_>) -> Result<PlacementRequest> {
         "Kimi pool cannot be below the 256K agentic floor");
     ensure!(i.gpus.iter().all(|gpu| matches!(gpu.baseline, Baseline::Measured { .. })),
         "Kimi runtime admission needs post-module CUDA samples");
-    ensure!(i.fixed.iter().chain(&i.startup).all(|d| d.gpu < 2 && d.basis != Basis::Estimated)
+    // Only startup graphs carry a temporary estimate pending the first serving
+    // census. No weight, workspace, fixed or pool charge inherits this exception.
+    ensure!(i.fixed.iter().all(|d| d.gpu < 2 && d.basis != Basis::Estimated)
+        && i.startup.iter().all(|d| d.gpu < 2 && (d.basis != Basis::Estimated
+            || (d.group == super::graphs::RESERVE && d.category == Category::Runtime
+                && d.lifetime == cuteafd_core::memory_layout::ItemLifetime::ReadyResident)))
         && i.pool_bounded.iter().all(|d| d.gpu < 2 && d.basis != Basis::Estimated),
-        "Kimi runtime admission cannot use estimated or out-of-rank demands");
+        "Kimi runtime admission allows estimates only for its named startup graph reserve");
     ensure!(i.lane_layouts.len() == i.lanes && i.lane_layouts.iter().flatten().all(|layout| layout.rows() == i.rows),
         "Kimi lane operand layouts differ from executor geometry");
     let context = i.lane_layouts[0][0].max_context();
     ensure!(i.lane_layouts.iter().flatten().all(|layout| layout.max_context() == context),
         "Kimi lanes must share the compiled context extent");
     let mut fixed = i.fixed;
+    // Solver startup phases are transient peaks. Captured executables survive
+    // readiness, so retain their validated reserve beside the live KV pool.
+    let (graphs, startup): (Vec<_>, Vec<_>) = i.startup.iter().cloned()
+        .partition(|d| d.group == super::graphs::RESERVE);
+    for graph in graphs {
+        ensure!(!fixed.iter().any(|d| d.gpu == graph.gpu && d.group == graph.group),
+            "Kimi startup graph reserve supplied twice");
+        fixed.push(graph);
+    }
     for layout in GlobalLayout::pair(cfg)? {
         let demand = layout.demand()?;
         ensure!(!fixed.iter().chain(&i.startup).any(|item| item.gpu == demand.gpu && item.group == demand.group),
@@ -497,7 +509,7 @@ fn request(i: Inputs<'_>) -> Result<PlacementRequest> {
     pool.ceiling = pool.target.max(pool.requested.unwrap_or(0));
     Ok(PlacementRequest { inventory: Inventory { gpus: i.gpus.to_vec(), spark_ranks: i.spark_ranks, peer_access: i.peer_access },
         attention_placement: i.attention, context_buffers: ContextBuffers::default(), layers_first_gpu: 0,
-        pool, layers, pool_overhead: vec![0; 2], pool_bounded: i.pool_bounded, fixed, startup: i.startup, movables: vec![],
+        pool, layers, pool_overhead: vec![0; 2], pool_bounded: i.pool_bounded, fixed, startup, movables: vec![],
         expert_workspace: 0, tp2_workspace: [0; 2], onboard: Onboard::Layers(0), expert_gpus: 0, minimum_expert_layers: 0,
         policy: LayerPolicy { default: vec![LayerMode::HeadSplit], ownership: LayerOwnership::Alternating,
             attention: [(KimiAttention::Mla, AttentionClass::Mla, AttentionPlacement::Layers),
@@ -870,6 +882,39 @@ pub(super) mod tests {
         let mut i = inputs(&cfg);
         i.fixed.push(KdaLayout::new(&cfg, i.state_slots, i.prefix_marks, i.lanes)?.demands(0)?[0].clone());
         assert!(admit(i).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn only_named_startup_graph_reserve_may_be_estimated() -> Result<()> {
+        let cfg = cfg();
+        let inventory = super::super::graphs::owned_inventory(&cfg, 1, 64, 4)?;
+        let reserve = super::super::graphs::demand(&inventory.inventory, 0);
+        let mut i = inputs(&cfg);
+        i.startup.push(reserve.clone());
+        let admitted = admit(i)?;
+        assert!(admitted.placement.items[0].iter().any(|item|
+            item.group == super::super::graphs::RESERVE && item.basis == Basis::Estimated));
+        for case in 0..7 {
+            let mut i = inputs(&cfg);
+            let mut changed = reserve.clone();
+            match case {
+                0 => changed.group = "unqualified startup allocation".into(),
+                1 => changed.category = Category::Workspace,
+                2 => changed.category = Category::Weights,
+                3 => changed.gpu = 2,
+                4 => changed.lifetime = cuteafd_core::memory_layout::ItemLifetime::PostReadyReserve,
+                5 => { i.fixed.push(changed); assert!(admit(i).is_err()); continue; }
+                _ => {
+                    i.pool_bounded.push(BoundedDemand { gpu: 0, category: Category::Runtime,
+                        group: super::super::graphs::RESERVE.into(), bytes_per_unit: 1,
+                        offset_units: 0, cap_units: 1, basis: Basis::Estimated });
+                    assert!(admit(i).is_err()); continue;
+                }
+            }
+            i.startup.push(changed);
+            assert!(admit(i).is_err(), "case {case}");
+        }
         Ok(())
     }
 

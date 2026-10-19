@@ -3448,7 +3448,7 @@ fn attention_placement_declared_default_preserves_layout_and_modes_refuse_at_pla
                 if executor.check_attention(Some(mode), gpus, peer).is_ok() {
                     assert!(unsupported.config_error.is_none());
                 } else {
-                    assert!(!unsupported.executable());
+                    assert!(!unsupported.executable() && !unsupported.fits && !unsupported.placement_supported);
                     let reason = unsupported.config_error.unwrap();
                     assert!(reason.contains(auto.family.as_deref().unwrap()) && reason.contains(&mode.to_string()), "{reason}");
                     assert!(unsupported.memory_layout.is_none());

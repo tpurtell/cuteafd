@@ -12,7 +12,7 @@ use cuteafd_loader::families::kimi_k3::config::{KimiAttention, KimiK3Config};
 
 /// The mix sites of a layer: before attention and before the FFN; the
 /// model's output mix precedes the final norm.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum MixSite {
     Attention(usize),
     Ffn(usize),

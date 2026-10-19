@@ -204,16 +204,16 @@ fn release_headers_classify_and_name_every_missing_kernel() {
 }
 
 #[test]
-fn context_names_the_missing_native_abi_instead_of_claiming_fit() {
+fn context_refuses_the_missing_executor_instead_of_claiming_fit() {
     let dir = snapshot(false);
     let mut options = with_layout(6, None);
     options.attention_placement = Some(crate::placement::AttentionPlacement::Context);
     let report = plan::plan(dir.path(), &options).unwrap();
-    assert!(!report.placement_supported && !report.fits);
-    assert!(report.hints.iter().any(|h| h.what.contains("kimi_k3 host prefix cache unsupported")
-        && h.what.contains("auto bytes")), "{:?}", report.hints);
-    assert!(report.hints.iter().any(|h| h.what.contains("owned-page query exchange/LSE-combine ABI")), "{:?}", report.hints);
-    assert!(report.memory_layout.as_ref().unwrap().devices.is_empty());
+    assert!(!report.placement_supported && !report.fits && !report.executable());
+    let reason = report.config_error.as_deref().unwrap();
+    assert!(reason.contains("kimi_k3") && reason.contains("context")
+        && reason.contains("executor not implemented"), "{reason}");
+    assert!(report.memory_layout.is_none());
 }
 
 #[test]
