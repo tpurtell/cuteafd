@@ -13,7 +13,8 @@ extern "C" {
 
 // words (16): [0] packed contract (all bytes required):
 //   bits 0..7: ABI version 5 (old unversioned contracts are rejected)
-//   bits 8..15: storage 1=FP8 block128, 2=MXFP4, 4=NVFP4 W4A4, 5=BF16
+//   bits 8..15: storage 1=FP8 block128, 2=MXFP4, 4=NVFP4 W4A4, 5=BF16,
+//               6=FP8 W8A8 (dynamic K128/F32 E4M3 activation quantization across gate, up, and down)
 //   bits 16..23: activation 1=pre-SiLU clamp + BF16 SiLU/product rounding,
 //                          2=post-SiLU clamp + FP32 product/final BF16 rounding
 //   bits 24..31: projection 1=BF16 gate/up and down outputs

@@ -99,25 +99,40 @@ impl Checkpoint {
         super::files::open_role(snapshot, super::files::ReadRole::Coordinator { local_experts, speculator })
     }
 
-    /// Reads the index/configuration plus scale-free declared-A4 weight headers
-    /// to distinguish unquantized modules from incomplete packed storage.
+    /// Reads the index/configuration plus scale-free declared-A4/A8 weight headers
+    /// to distinguish unquantized modules from incomplete quantized storage.
     pub fn inventory(snapshot: &Path) -> Result<Self> {
         let mut checkpoint = Self::open_filtered(snapshot, None, |_| false)?;
-        let mut unscaled = BTreeMap::<String, BTreeSet<String>>::new();
+        let mut unscaled_a4 = BTreeMap::<String, BTreeSet<String>>::new();
+        let mut unscaled_a8 = BTreeMap::<String, BTreeSet<String>>::new();
         for (name, shard) in &checkpoint.weight_map {
             let Some(module) = name.strip_suffix(".weight") else { continue };
-            if checkpoint.declared_numerics(module)? == ModuleNumerics::W4A4
+            let declared = checkpoint.declared_numerics(module)?;
+            if declared == ModuleNumerics::W4A4
                 && ["weight_scale", "weight_scale_2", "input_scale"].iter()
                     .all(|suffix| !checkpoint.contains_tensor(&format!("{module}.{suffix}"))) {
-                unscaled.entry(shard.clone()).or_default().insert(name.clone());
+                unscaled_a4.entry(shard.clone()).or_default().insert(name.clone());
+            } else if declared == ModuleNumerics::W8A8
+                && ["weight_scale_inv", "weight_scale", "input_scale"].iter()
+                    .all(|suffix| !checkpoint.contains_tensor(&format!("{module}.{suffix}"))) {
+                unscaled_a8.entry(shard.clone()).or_default().insert(name.clone());
             }
         }
         // Only anomalous unscaled declarations need headers; group by shard so
         // the many BF16 nextn experts do not reopen the same header per module.
-        for (shard, names) in unscaled {
+        for (shard, names) in unscaled_a4 {
             for meta in read_safetensors_metadata(&snapshot.join(&shard))? {
                 if names.contains(&meta.name) {
                     checkpoint.tensors.push(CheckpointTensor { shard:shard.clone(), meta });
+                }
+            }
+        }
+        for (shard, names) in unscaled_a8 {
+            if let Ok(headers) = read_safetensors_metadata(&snapshot.join(&shard)) {
+                for meta in headers {
+                    if names.contains(&meta.name) {
+                        checkpoint.tensors.push(CheckpointTensor { shard: shard.clone(), meta });
+                    }
                 }
             }
         }
@@ -244,33 +259,56 @@ impl Checkpoint {
             .ok().map(|at| self.tensors[at].meta.dtype.clone());
         match dtype {
             Some(dtype) => self.module_numerics_with_header(stem, dtype),
-            None => self.declared_numerics(stem),
+            None => {
+                let declared = self.declared_numerics(stem)?;
+                if declared == ModuleNumerics::W8A8 && self.contains_tensor(&weight)
+                    && ["weight_scale_inv", "weight_scale", "input_scale"].iter()
+                        .all(|suffix| !self.contains_tensor(&format!("{stem}.{suffix}"))) {
+                    return Ok(ModuleNumerics::CheckpointPrecision);
+                }
+                Ok(declared)
+            }
         }
     }
 
-    /// Complete unquantized BF16 headers override an overbroad ModelOpt declaration;
+    /// Complete unquantized BF16 headers override an overbroad declaration;
     /// partial quantization is never treated as an unquantized checkpoint module.
     pub fn module_numerics_with_header(&self, module: &str, dtype: cuteafd_core::DType) -> Result<ModuleNumerics> {
         let module = module.strip_suffix(".weight").unwrap_or(module);
         let declared = self.declared_numerics(module)?;
-        if declared != ModuleNumerics::W4A4 { return Ok(declared); }
-        let scales = ["weight_scale", "weight_scale_2", "input_scale"]
-            .map(|suffix| self.contains_tensor(&format!("{module}.{suffix}")));
-        if dtype == cuteafd_core::DType::Bf16 && scales.iter().all(|present| !present) {
-            static WARNED: std::sync::OnceLock<std::sync::Mutex<BTreeSet<(PathBuf, String)>>> = std::sync::OnceLock::new();
-            let mut warned = WARNED.get_or_init(Default::default).lock()
-                .map_err(|_| anyhow::anyhow!("checkpoint numerics warning registry poisoned"))?;
-            if warned.insert((self.snapshot.clone(), module.to_owned())) {
-                tracing::warn!(module, "quantization config/header disagreement: declared W4A4 but BF16 header has no quantization scales; preserving checkpoint precision");
+        match declared {
+            ModuleNumerics::W4A4 => {
+                let scales = ["weight_scale", "weight_scale_2", "input_scale"]
+                    .map(|suffix| self.contains_tensor(&format!("{module}.{suffix}")));
+                if dtype == cuteafd_core::DType::Bf16 && scales.iter().all(|present| !present) {
+                    static WARNED: std::sync::OnceLock<std::sync::Mutex<BTreeSet<(PathBuf, String)>>> = std::sync::OnceLock::new();
+                    let mut warned = WARNED.get_or_init(Default::default).lock()
+                        .map_err(|_| anyhow::anyhow!("checkpoint numerics warning registry poisoned"))?;
+                    if warned.insert((self.snapshot.clone(), module.to_owned())) {
+                        tracing::warn!(module, "quantization config/header disagreement: declared W4A4 but BF16 header has no quantization scales; preserving checkpoint precision");
+                    }
+                    return Ok(ModuleNumerics::CheckpointPrecision);
+                }
+                for (suffix, present) in ["weight_scale", "weight_scale_2", "input_scale"].into_iter().zip(scales) {
+                    ensure!(present, "{module}.{suffix}: declared W4A4 has partial or invalid NVFP4 storage ({dtype:?}); missing scale tensor");
+                }
+                ensure!(matches!(dtype, cuteafd_core::DType::U8 | cuteafd_core::DType::I8),
+                    "{module}.weight: declared W4A4 has partial or invalid NVFP4 storage ({dtype:?})");
+                Ok(declared)
             }
-            return Ok(ModuleNumerics::CheckpointPrecision);
+            ModuleNumerics::W8A8 => {
+                let has_scale = ["weight_scale_inv", "weight_scale", "input_scale"].iter()
+                    .any(|suffix| self.contains_tensor(&format!("{module}.{suffix}")));
+                if matches!(dtype, cuteafd_core::DType::Bf16 | cuteafd_core::DType::F32 | cuteafd_core::DType::F16)
+                    && !has_scale {
+                    return Ok(ModuleNumerics::CheckpointPrecision);
+                }
+                ensure!(dtype == cuteafd_core::DType::F8E4M3 && has_scale,
+                    "{module}.weight: declared W8A8 has partial or invalid FP8 storage ({dtype:?})");
+                Ok(declared)
+            }
+            _ => Ok(declared),
         }
-        for (suffix, present) in ["weight_scale", "weight_scale_2", "input_scale"].into_iter().zip(scales) {
-            ensure!(present, "{module}.{suffix}: declared W4A4 has partial or invalid NVFP4 storage ({dtype:?}); missing scale tensor");
-        }
-        ensure!(matches!(dtype, cuteafd_core::DType::U8 | cuteafd_core::DType::I8),
-            "{module}.weight: declared W4A4 has partial or invalid NVFP4 storage ({dtype:?})");
-        Ok(declared)
     }
 
     fn declared_numerics(&self, module: &str) -> Result<ModuleNumerics> {
@@ -291,6 +329,43 @@ impl Checkpoint {
         let q = root.get("quantization").unwrap_or(root);
         if root.get("quant_method").and_then(Value::as_str) != Some("modelopt")
             && root.pointer("/producer/name").and_then(Value::as_str) != Some("modelopt") {
+            if q.get("quant_method").and_then(Value::as_str) == Some("fp8") {
+                if q.get("store_dtype").and_then(Value::as_str) == Some("mxfp4")
+                    || q.get("expert_dtype").and_then(Value::as_str) == Some("fp4")
+                    || self.model_type() == Some("deepseek_v4")
+                    || self.text_config().get("model_type").and_then(Value::as_str) == Some("deepseek_v4") {
+                    return Ok(ModuleNumerics::CheckpointPrecision);
+                }
+                if ["ignore", "exclude_modules", "modules_to_not_convert", "ignored_layers"].iter().any(|key|
+                    q.get(key).or_else(|| root.get(key)).and_then(Value::as_array).is_some_and(|rules|
+                        rules.iter().filter_map(Value::as_str).any(|rule|
+                            module_match(rule, owner) || module_match(rule, module)))) {
+                    return Ok(ModuleNumerics::CheckpointPrecision);
+                }
+                if !(module.contains(".experts.") || module.ends_with("_proj")
+                    || module.ends_with(".w1") || module.ends_with(".w2") || module.ends_with(".w3")) {
+                    return Ok(ModuleNumerics::CheckpointPrecision);
+                }
+                let scheme = q.get("activation_scheme").and_then(Value::as_str);
+                ensure!(scheme == Some("dynamic"),
+                    "{module}: FP8 quantization requires activation_scheme=dynamic, found {scheme:?}");
+                let fmt = q.get("fmt").and_then(Value::as_str).unwrap_or("e4m3");
+                ensure!(fmt == "e4m3",
+                    "{module}: FP8 quantization requires fmt=e4m3, found {fmt:?}");
+                if let Some(scale_fmt) = q.get("scale_fmt").and_then(Value::as_str) {
+                    ensure!(scale_fmt == "f32" || scale_fmt == "fp32",
+                        "{module}: K128/F32 FP8 quantization rejects scale_fmt={scale_fmt:?}");
+                }
+                if let Some(store_dtype) = q.get("store_dtype").and_then(Value::as_str) {
+                    ensure!(store_dtype == "fp8" || store_dtype == "e4m3",
+                        "{module}: FP8 quantization rejects store_dtype={store_dtype:?}");
+                }
+                let block = q.get("weight_block_size").and_then(Value::as_array)
+                    .map(|b| b.iter().filter_map(Value::as_u64).collect::<Vec<_>>());
+                ensure!(block.as_deref() == Some(&[128, 128][..]),
+                    "{module}: FP8 quantization requires weight_block_size=[128, 128], found {block:?}");
+                return Ok(ModuleNumerics::W8A8);
+            }
             return Ok(ModuleNumerics::CheckpointPrecision);
         }
         if ["ignore", "exclude_modules"].iter().any(|key| q.get(key).and_then(Value::as_array).is_some_and(|rules|
@@ -677,6 +752,99 @@ mod sliced_tests {
         let required = BTreeSet::from(["absent.weight".to_string()]);
         assert!(Checkpoint::open_required(dir.path(), "coordinator", &required).unwrap_err()
             .to_string().contains("absent from weight_map"));
+    }
+
+    #[test]
+    fn fp8_dynamic_k128_f32_metadata_and_bf16_header_exclusions() {
+        let fp8_stem = "model.layers.3.moe.gate_up_proj";
+        let bf16_stem = "model.layers.90.moe.gate_up_proj";
+        let excluded_stem = "model.layers.88.moe.down_proj";
+        let mut checkpoint = Checkpoint {
+            snapshot: PathBuf::new(),
+            config: json!({
+                "quantization_config": {
+                    "quant_method": "fp8",
+                    "activation_scheme": "dynamic",
+                    "fmt": "e4m3",
+                    "weight_block_size": [128, 128],
+                    "modules_to_not_convert": [
+                        "model.layers.88.moe.w13_weight",
+                        "model.layers.88.moe.down_proj"
+                    ]
+                }
+            }),
+            quantize_config: None,
+            weight_map: BTreeMap::from([
+                (format!("{fp8_stem}.weight_scale_inv"), "model.safetensors".into()),
+            ]),
+            tensors: vec![
+                CheckpointTensor {
+                    shard: "model.safetensors".into(),
+                    meta: crate::SafetensorsTensorMetadata {
+                        name: format!("{fp8_stem}.weight"),
+                        dtype: cuteafd_core::DType::F8E4M3,
+                        shape: vec![352, 3072, 4096],
+                        byte_offset: 0,
+                        byte_length: 352 * 3072 * 4096,
+                    },
+                },
+                CheckpointTensor {
+                    shard: "model.safetensors".into(),
+                    meta: crate::SafetensorsTensorMetadata {
+                        name: format!("{fp8_stem}.weight_scale_inv"),
+                        dtype: cuteafd_core::DType::F32,
+                        shape: vec![352, 24, 32],
+                        byte_offset: 352 * 3072 * 4096,
+                        byte_length: 352 * 24 * 32 * 4,
+                    },
+                },
+                CheckpointTensor {
+                    shard: "model.safetensors".into(),
+                    meta: crate::SafetensorsTensorMetadata {
+                        name: format!("{bf16_stem}.weight"),
+                        dtype: cuteafd_core::DType::Bf16,
+                        shape: vec![352, 3072, 4096],
+                        byte_offset: 0,
+                        byte_length: 352 * 3072 * 4096 * 2,
+                    },
+                },
+                CheckpointTensor {
+                    shard: "model.safetensors".into(),
+                    meta: crate::SafetensorsTensorMetadata {
+                        name: format!("{excluded_stem}.weight"),
+                        dtype: cuteafd_core::DType::Bf16,
+                        shape: vec![352, 4096, 1536],
+                        byte_offset: 0,
+                        byte_length: 352 * 4096 * 1536 * 2,
+                    },
+                },
+            ],
+            missing_shards: Vec::new(),
+            shard_bytes: 0,
+        };
+        assert_eq!(checkpoint.module_numerics(fp8_stem).unwrap(), ModuleNumerics::W8A8);
+        assert_eq!(checkpoint.module_numerics(bf16_stem).unwrap(), ModuleNumerics::CheckpointPrecision);
+        assert_eq!(checkpoint.module_numerics(excluded_stem).unwrap(), ModuleNumerics::CheckpointPrecision);
+
+        // Partial FP8 storage (missing scale_inv or BF16 with scale_inv) must fail closed.
+        checkpoint.weight_map.remove(&format!("{fp8_stem}.weight_scale_inv"));
+        checkpoint.tensors.retain(|t| t.meta.name != format!("{fp8_stem}.weight_scale_inv"));
+        assert!(checkpoint.module_numerics(fp8_stem).unwrap_err().to_string().contains("partial or invalid"));
+        checkpoint.weight_map.insert(format!("{bf16_stem}.weight_scale_inv"), "model.safetensors".into());
+        assert!(checkpoint.module_numerics(bf16_stem).unwrap_err().to_string().contains("partial or invalid"));
+        checkpoint.weight_map.remove(&format!("{bf16_stem}.weight_scale_inv"));
+        checkpoint.weight_map.insert(format!("{fp8_stem}.weight_scale_inv"), "model.safetensors".into());
+
+        // Invalid arithmetic metadata must fail closed.
+        for bad_qcfg in [
+            json!({"quant_method": "fp8", "activation_scheme": "static", "fmt": "e4m3", "weight_block_size": [128, 128]}),
+            json!({"quant_method": "fp8", "activation_scheme": "dynamic", "fmt": "e5m2", "weight_block_size": [128, 128]}),
+            json!({"quant_method": "fp8", "activation_scheme": "dynamic", "fmt": "e4m3", "weight_block_size": [64, 64]}),
+            json!({"quant_method": "fp8", "activation_scheme": "dynamic", "fmt": "e4m3", "weight_block_size": [128, 128], "scale_fmt": "ue8m0"}),
+        ] {
+            checkpoint.config = json!({ "quantization_config": bad_qcfg });
+            assert!(checkpoint.module_numerics(fp8_stem).is_err(), "accepted invalid qcfg: {bad_qcfg}");
+        }
     }
 }
 

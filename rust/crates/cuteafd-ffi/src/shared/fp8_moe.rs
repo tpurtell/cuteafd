@@ -22,6 +22,9 @@ pub enum Fp8MoeWeights {
     Nvfp4,
     /// Native BF16 row-major matrices; scale pointers are unused.
     Bf16,
+    /// Storage 6: E4M3 with FP32 128x128 block scales and dynamic K128/F32
+    /// E4M3 activation quantization across gate, up, and down projections.
+    Fp8A8,
 }
 
 /// Clamp order and intermediate rounding, independent of projection precision.
@@ -63,7 +66,7 @@ impl Fp8MoeInfo {
     fn from_words(words: [u32; 16]) -> Result<Self> {
         let count = words[9] as usize;
         let [version, format, activation, projection] = words[0].to_le_bytes();
-        ensure!(version == 5 && matches!(format, 1 | 2 | 4 | 5)
+        ensure!(version == 5 && matches!(format, 1 | 2 | 4 | 5 | 6)
             && matches!(activation, 1 | 2) && !(format == 2 && activation == 2) && projection == 1
             && matches!(words[7], 1 | 7) && (1..=6).contains(&count),
             "unsupported FP8 expert package ABI {words:?}");
@@ -86,7 +89,8 @@ impl Fp8MoeInfo {
                 1 => Fp8MoeWeights::Fp8,
                 2 => Fp8MoeWeights::Mxfp4,
                 4 => Fp8MoeWeights::Nvfp4,
-                _ => Fp8MoeWeights::Bf16,
+                5 => Fp8MoeWeights::Bf16,
+                _ => Fp8MoeWeights::Fp8A8,
             },
         };
         // Slices are the widest rank range, zero-padded to 128 (MXFP4 32-blocks
@@ -103,7 +107,7 @@ impl Fp8MoeInfo {
             && info.swiglu_limit.is_finite() && info.swiglu_limit >= 0.0
             && info.capacities[0] > 0 && info.capacities.iter().all(|&c| c <= i32::MAX as usize)
             && info.capacities.windows(2).all(|w| w[0] < w[1])
-            && (!matches!(info.weights, Fp8MoeWeights::Bf16 | Fp8MoeWeights::Nvfp4) || !info.wire_input),
+            && (!matches!(info.weights, Fp8MoeWeights::Bf16 | Fp8MoeWeights::Nvfp4 | Fp8MoeWeights::Fp8A8) || !info.wire_input),
             "inconsistent FP8 expert package info {info:?}");
         Ok(info)
     }
@@ -380,7 +384,7 @@ mod metadata_tests {
 
     #[test]
     fn activation_contract_is_explicit_and_fail_closed() {
-        for format in [1, 2, 4, 5] {
+        for format in [1, 2, 4, 5, 6] {
             for activation in [1, 2] {
                 let mut w = words();
                 w[0] = 5 | format << 8 | activation << 16 | 1 << 24;

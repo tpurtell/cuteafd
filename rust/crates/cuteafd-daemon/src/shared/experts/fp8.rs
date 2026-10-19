@@ -21,21 +21,32 @@ use std::path::{Path, PathBuf};
 
 pub(super) fn validate_checkpoint_contract(info: &Fp8MoeInfo, tensors: &Fp8ExpertTensors, layers: &[usize],
     tp: usize, rank: usize, slicing: Slicing) -> Result<()> {
+    use cuteafd_loader::plan::checkpoint::ModuleNumerics;
     let shape = tensors.shape();
-    let weights = match tensors.format() {
-        ExpertFormat::Bf16 => Fp8MoeWeights::Bf16,
-        ExpertFormat::Fp8Block128 => Fp8MoeWeights::Fp8,
-        ExpertFormat::Mxfp4 => Fp8MoeWeights::Mxfp4,
-        ExpertFormat::Nvfp4 => Fp8MoeWeights::Nvfp4,
+    let weights_ok = match tensors.format() {
+        ExpertFormat::Bf16 => info.weights == Fp8MoeWeights::Bf16,
+        ExpertFormat::Fp8Block128 => matches!(info.weights, Fp8MoeWeights::Fp8 | Fp8MoeWeights::Fp8A8),
+        ExpertFormat::Mxfp4 => info.weights == Fp8MoeWeights::Mxfp4,
+        ExpertFormat::Nvfp4 => info.weights == Fp8MoeWeights::Nvfp4,
     };
     ensure!(info.hidden == shape.hidden && info.experts == shape.experts && info.topk == shape.topk
-        && info.intermediate == shape.intermediate && info.tp == tp && info.weights == weights
+        && info.intermediate == shape.intermediate && info.tp == tp && weights_ok
         && info.slice == tensors.rank_width(tp, rank, slicing)?,
         "expert package does not serve checkpoint geometry/storage at TP{tp}: {info:?}");
-    ensure!(!matches!(weights, Fp8MoeWeights::Bf16 | Fp8MoeWeights::Nvfp4) || !info.wire_input,
-        "native BF16/NVFP4 weights require BF16 input");
+    ensure!(!matches!(info.weights, Fp8MoeWeights::Bf16 | Fp8MoeWeights::Nvfp4 | Fp8MoeWeights::Fp8A8) || !info.wire_input,
+        "native BF16/NVFP4/FP8A8 weights require BF16 input");
     for &layer in layers {
         tensors.validate_layer(layer)?;
+        if info.weights == Fp8MoeWeights::Fp8A8 {
+            ensure!(tensors.numerics(layer) == Some(ModuleNumerics::W8A8),
+                "expert layer {layer}: native W8A8 package requires declared W8A8 checkpoint numerics, found {:?}",
+                tensors.numerics(layer));
+        } else if tensors.format() == ExpertFormat::Fp8Block128
+            && tensors.numerics(layer) == Some(ModuleNumerics::W8A8)
+            && tensors.activation(layer).is_some() {
+            anyhow::bail!("expert layer {layer}: declared W8A8 checkpoint numerics require native Fp8A8 package, found {:?}",
+                info.weights);
+        }
         let activation = tensors.activation(layer).unwrap_or(shape.geometry()?.activation());
         let (mode, limit) = match activation {
             cuteafd_core::FfnActivation::SiluBf16Product { limit } =>
@@ -707,6 +718,33 @@ mod tests {
             }
             assert!(super::validate_checkpoint_contract(&wrong,&tensors,&[0],6,0,Slicing::Padded).is_err());
         }
+
+        let mixed_shape = cuteafd_loader::RoutedExpertShape { layers:2,first_layer:0,experts:2,topk:1,
+            hidden:128,intermediate:1536,draft_stages:0,draft_experts:0 };
+        let mixed_fixture = [
+            t("model.layers.0.moe.gate_proj.weight","F8_E4M3",&[2,1536,128]),
+            t("model.layers.0.moe.gate_proj.weight_scale_inv","F32",&[2,12,1]),
+            t("model.layers.0.moe.up_proj.weight","F8_E4M3",&[2,1536,128]),
+            t("model.layers.0.moe.up_proj.weight_scale_inv","F32",&[2,12,1]),
+            t("model.layers.0.moe.down_proj.weight","F8_E4M3",&[2,128,1536]),
+            t("model.layers.0.moe.down_proj.weight_scale_inv","F32",&[2,1,12]),
+            t("model.layers.1.moe.gate_proj.weight","BF16",&[2,1536,128]),
+            t("model.layers.1.moe.up_proj.weight","BF16",&[2,1536,128]),
+            t("model.layers.1.moe.down_proj.weight","BF16",&[2,128,1536]),
+        ];
+        write_snapshot(dir.path(),&source["config"],&mixed_fixture,None);
+        let mixed_tensors = Fp8ExpertTensors::read(dir.path(),mixed_shape).unwrap();
+        let groups = mixed_tensors.homogeneous_layers(&[0,1]).unwrap();
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].0.numerics(0), Some(cuteafd_loader::plan::ModuleNumerics::W8A8));
+        assert_eq!(groups[1].0.numerics(1), Some(cuteafd_loader::plan::ModuleNumerics::CheckpointPrecision));
+        let mut a8_info = info.clone();
+        a8_info.weights = Fp8MoeWeights::Fp8A8;
+        super::validate_checkpoint_contract(&a8_info,&groups[0].0,&[0],6,0,Slicing::Padded).unwrap();
+        let mut legacy_fp8 = a8_info.clone();
+        legacy_fp8.weights = Fp8MoeWeights::Fp8;
+        assert!(super::validate_checkpoint_contract(&legacy_fp8,&groups[0].0,&[0],6,0,Slicing::Padded).is_err());
+        assert!(super::validate_checkpoint_contract(&a8_info,&groups[1].0,&[1],6,0,Slicing::Padded).is_err());
     }
 
     #[test]

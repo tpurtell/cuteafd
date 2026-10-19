@@ -131,6 +131,7 @@ pub struct Fp8ExpertTensors {
     format: ExpertFormat,
     tensors: Arc<HashMap<String, Located>>,
     activations: Vec<cuteafd_core::FfnActivation>,
+    numerics: Arc<HashMap<usize, crate::plan::checkpoint::ModuleNumerics>>,
 }
 
 /// How a package lays a TP rank's intermediate slice out.
@@ -283,7 +284,8 @@ impl Fp8ExpertTensors {
             _ => Vec::new(),
         };
         let mut catalog = Self { snapshot: snapshot.to_path_buf(), shape, prefix: prefix.to_string(), mtp_layers,
-            format: ExpertFormat::Fp8Block128, tensors: Arc::new(tensors), activations };
+            format: ExpertFormat::Fp8Block128, tensors: Arc::new(tensors), activations,
+            numerics: Arc::new(HashMap::new()) };
         let first_layer = layers.and_then(|selected| selected.first().copied()).unwrap_or(shape.first_layer);
         let first = catalog.name(first_layer, 0, Fp8Projection::Gate);
         if catalog.located(&first)?.dtype == DType::Bf16 {
@@ -295,21 +297,30 @@ impl Fp8ExpertTensors {
                 && catalog.tensors.contains_key(&format!("{first}_scale_2"));
             catalog.format = if nvfp4 { ExpertFormat::Nvfp4 } else { ExpertFormat::Mxfp4 };
         }
+        let mut layer_numerics = HashMap::new();
         for name in catalog.tensors.keys().filter(|name| name.ends_with(".weight")) {
             use crate::plan::checkpoint::ModuleNumerics;
             let source = source_names.get(name).map(String::as_str).unwrap_or(name);
             let numerics = checkpoint.module_numerics_with_header(source, catalog.tensors[name].dtype.clone())?;
             let nvfp4 = catalog.tensors.contains_key(&format!("{name}_scale_2"));
+            let layer = name.strip_prefix(prefix).and_then(|n| n.strip_prefix("layers."))
+                .and_then(|n| n.split('.').next()).and_then(|n| n.parse::<usize>().ok())
+                .or_else(|| name.strip_prefix("mtp.layers.").and_then(|n| n.split('.').next())
+                    .and_then(|n| n.parse::<usize>().ok()).and_then(|s| shape.layers.checked_add(s)));
+            if let Some(layer) = layer {
+                if let Some(&prev) = layer_numerics.get(&layer) {
+                    ensure!(prev == numerics, "{name}: conflicting expert layer numerics {prev:?} vs {numerics:?}");
+                } else {
+                    layer_numerics.insert(layer, numerics);
+                }
+            }
             match numerics {
                 ModuleNumerics::W4A4 => ensure!(nvfp4, "{name}: declared W4A4 needs native NVFP4 weights"),
                 ModuleNumerics::W8A8 => {
                     ensure!(!nvfp4, "{name}: declared W8A8 cannot execute as W4A4");
-                    let qwen = checkpoint.model_type() == Some("qwen4_exp")
-                        || checkpoint.text_config().get("model_type").and_then(serde_json::Value::as_str)
-                            == Some("qwen4_exp_text");
-                    ensure!(qwen && name.starts_with("mtp.layers."),
-                        "{name}: declared expert W8A8 needs a both-projection native kernel");
-                    // Qwen MTP is an explicitly reported, temporary deviation.
+                    let fp8_block = catalog.tensors[name].dtype == DType::F8E4M3
+                        && catalog.tensors.contains_key(&format!("{name}_scale_inv"));
+                    ensure!(fp8_block, "{name}: declared expert W8A8 needs F8_E4M3 weights with 128x128 scale_inv");
                 }
                 ModuleNumerics::CheckpointPrecision | ModuleNumerics::W8CheckpointActivations => {
                     ensure!(!nvfp4 || checkpoint.quantization().is_none(),
@@ -317,6 +328,7 @@ impl Fp8ExpertTensors {
                 }
             }
         }
+        catalog.numerics = Arc::new(layer_numerics);
         // One expert of the first routed layer fixes the format contract.
         for projection in Fp8Projection::ALL {
             catalog.check(first_layer, 0, projection)?;
@@ -331,6 +343,11 @@ impl Fp8ExpertTensors {
     /// Family-declared arithmetic, when it differs from the process geometry's legacy default.
     pub fn activation(&self, layer: usize) -> Option<cuteafd_core::FfnActivation> {
         self.activations.get(layer).copied()
+    }
+
+    /// Declared module numerics for `layer`, resolved from checkpoint quantization config and headers.
+    pub fn numerics(&self, layer: usize) -> Option<crate::plan::checkpoint::ModuleNumerics> {
+        self.numerics.get(&layer).copied()
     }
 
     pub fn format(&self) -> ExpertFormat {
@@ -375,6 +392,7 @@ impl Fp8ExpertTensors {
             let format = self.layer_format(layer)?;
             if let Some((view, ids)) = groups.last_mut().filter(|(view, ids)|
                 view.format == format && view.activation(ids[0]) == self.activation(layer)
+                    && view.numerics(ids[0]) == self.numerics(layer)
                     && ids.last().is_some_and(|last| last.checked_add(1) == Some(layer))) {
                 view.validate_layer(layer)?;
                 ids.push(layer);
@@ -822,7 +840,7 @@ mod tests {
         let shape = RoutedExpertShape { layers: 78, first_layer: 3, experts: 256, topk: 8, hidden: 6144, intermediate,
             draft_stages: 0, draft_experts: 0 };
         Fp8ExpertTensors { snapshot: PathBuf::new(), shape, prefix: "model.".into(), mtp_layers: false, format,
-            tensors: Arc::new(HashMap::new()), activations: Vec::new() }
+            tensors: Arc::new(HashMap::new()), activations: Vec::new(), numerics: Arc::new(HashMap::new()) }
     }
 
     fn ranges(tensors: &Fp8ExpertTensors, tp: usize) -> Vec<(usize, usize)> {
@@ -857,6 +875,10 @@ mod tests {
         assert_eq!(groups[2].0.format(), ExpertFormat::Bf16);
         assert!(groups.iter().all(|(view, _)| Arc::ptr_eq(&view.tensors, &tensors.tensors)));
         assert_eq!(tensors.homogeneous_layers(&[3, 7])?.len(), 2);
+        Arc::make_mut(&mut tensors.numerics).insert(3, crate::plan::checkpoint::ModuleNumerics::W8A8);
+        Arc::make_mut(&mut tensors.numerics).insert(4, crate::plan::checkpoint::ModuleNumerics::CheckpointPrecision);
+        assert_eq!(tensors.homogeneous_layers(&[3, 4])?.iter().map(|(_, ids)| ids.clone()).collect::<Vec<_>>(),
+            vec![vec![3], vec![4]]);
         assert!(tensors.homogeneous_layers(&[]).is_err());
         assert!(tensors.homogeneous_layers(&[4, 3]).is_err());
         assert!(tensors.homogeneous_layers(&[3, 3]).is_err());

@@ -25,7 +25,7 @@ fn validate_info(info: &Fp8MoeInfo, tensors: &Fp8ExpertTensors, rank: usize, sli
     ensure!(rank < 2 && max_rows > 0, "invalid FP8 MoE TP2 rank/capacity");
     let shape = tensors.shape();
     let weights_match = matches!((tensors.format(), info.weights),
-        (ExpertFormat::Fp8Block128, Fp8MoeWeights::Fp8)
+        (ExpertFormat::Fp8Block128, Fp8MoeWeights::Fp8 | Fp8MoeWeights::Fp8A8)
         | (ExpertFormat::Bf16, Fp8MoeWeights::Bf16)
         | (ExpertFormat::Mxfp4, Fp8MoeWeights::Mxfp4)
         | (ExpertFormat::Nvfp4, Fp8MoeWeights::Nvfp4));

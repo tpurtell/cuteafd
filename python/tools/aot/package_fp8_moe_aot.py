@@ -76,7 +76,7 @@ MXFP4_ROLE_LAYOUTS = {"spark": ("tp6", "tp2"), "coordinator": ("tp1", "tp2")}
 # NVFP4 slices own whole 16-value blocks: every Spark world the FP8 worker runs.
 NVFP4_ROLE_LAYOUTS = {"spark": ("tp4", "tp2", "tp3", "tp6"), "coordinator": ("tp1", "tp2")}
 ABI_VERSION = 5
-STORAGE = {"fp8": 1, "mxfp4": 2, "nvfp4a4": 4, "bf16": 5}
+STORAGE = {"fp8": 1, "mxfp4": 2, "nvfp4a4": 4, "bf16": 5, "fp8a8": 6}
 ACTIVATION = {"silu_bf16_product": 1, "silu_post_clamp_fp32_product": 2}
 PROJECTION = {"bf16": 1}
 ROLE_COMPUTE = {"spark": (12, 1), "coordinator": (12, 0)}
@@ -85,11 +85,11 @@ ROLE_COMPUTE = {"spark": (12, 1), "coordinator": (12, 0)}
 ROLE_INPUT = {"spark": "wire", "coordinator": "bf16"}
 
 
-def input_kind(role: str, weights: str, requested: str | None = None) -> str:
-    """NVFP4 quantizes the original BF16 row once with each expert's scale."""
-    if weights in ("nvfp4", "bf16"):
+def input_kind(role: str, weights: str, requested: str | None = None, kind: str | None = None) -> str:
+    """NVFP4 and native W8A8 quantize the original BF16 row directly."""
+    if weights in ("nvfp4", "bf16") or kind == "fp8a8":
         if requested not in (None, "bf16"):
-            raise ValueError(f"{weights.upper()} requires BF16 input; FP8 K32 wire loses checkpoint numerics")
+            raise ValueError(f"{(kind or weights).upper()} requires BF16 input; FP8 K32 wire loses checkpoint numerics")
         return "bf16"
     return requested or ROLE_INPUT[role]
 
@@ -356,8 +356,8 @@ def info_words(g, capacities: list[int], wire: bool) -> list[int]:
         raise ValueError("unknown expert storage/activation/projection contract")
     if g.kind == "mxfp4" and g.activation != "silu_bf16_product":
         raise ValueError("MXFP4 supports only the pre-SiLU activation contract")
-    if wire and g.weights in ("nvfp4", "bf16"):
-        raise ValueError("NVFP4/BF16 packages require BF16 input")
+    if wire and (g.weights in ("nvfp4", "bf16") or g.kind == "fp8a8"):
+        raise ValueError("NVFP4/BF16/FP8A8 packages require BF16 input")
     if not capacities or any(c <= 0 or c > 0x7fffffff for c in capacities) or capacities != sorted(set(capacities)):
         raise ValueError("capacities must be positive, strictly increasing int32 values")
     contract = ABI_VERSION | STORAGE[g.kind] << 8 | ACTIVATION[g.activation] << 16 | PROJECTION[g.projection] << 24
@@ -423,7 +423,7 @@ def build(args: argparse.Namespace) -> None:
             widths = sorted(set(exact_widths(base.intermediate, tp)), reverse=True)
             if tp > 1 and widths and base.with_tp(tp).slice * tp > base.intermediate:
                 layouts += [f"tp{tp}-w{w}" for w in widths if f"tp{tp}-w{w}" not in layouts]
-    wire = input_kind(args.role, base.weights, args.input) == "wire"
+    wire = input_kind(args.role, base.weights, args.input, base.kind) == "wire"
     if args.output.exists():
         raise SystemExit(f"{args.output} exists; remove it or choose another --output")
     args.output.parent.mkdir(parents=True, exist_ok=True)
@@ -465,7 +465,8 @@ def build(args: argparse.Namespace) -> None:
             manifest["layouts"][layout] = {
                 "tp": tp, "hidden": g.hidden, "slice": g.slice, "experts": g.experts, "top_k": g.top_k,
                 "intermediate": g.intermediate, "swiglu_limit": g.swiglu_limit, "input": "wire" if wire else "bf16",
-                "weights": g.weights, "activation": g.activation, "projection": g.projection, "abi_version": ABI_VERSION,
+                "weights": g.weights, "storage": g.kind, "activation": g.activation, "projection": g.projection,
+                "abi_version": ABI_VERSION,
                 "weight_read_grouping": [{"capacity": p["capacity"], "form": p["form"],
                                           **p["weight_read_grouping"]} for p in programs],
                 "capacities": capacity_scratch(programs),
@@ -505,8 +506,8 @@ def verify(package: Path, *, revision: str | None = None, role: str | None = Non
             raise ValueError(f"{package}/{name}: missing or unknown expert activation/projection ABI")
         if info.get("weights") == "mxfp4" and info["activation"] != "silu_bf16_product":
             raise ValueError(f"{package}/{name}: MXFP4 supports only the pre-SiLU activation contract")
-        if info.get("weights") in ("nvfp4", "bf16") and info.get("input") != "bf16":
-            raise ValueError(f"{package}/{name}: {info['weights'].upper()} requires BF16 input")
+        if (info.get("weights") in ("nvfp4", "bf16") or info.get("storage") == "fp8a8") and info.get("input") != "bf16":
+            raise ValueError(f"{package}/{name}: {(info.get('storage') or info['weights']).upper()} requires BF16 input")
         if input_kind is not None and info.get("input") != input_kind:
             raise ValueError(f"{package}/{name}: input {info.get('input')} differs from {input_kind}")
         if min_capacity is not None and not any(c["capacity"] >= min_capacity for c in info["capacities"]):
@@ -531,7 +532,9 @@ def main() -> None:
     create.add_argument("--role", choices=sorted(ROLE_LAYOUTS), required=True)
     create.add_argument("--geometry", choices=("mimo", "mimop", "mimof", "glm", "glmf", "qwen4", "glm_nvfp4", "glmf_nvfp4",
                                                "qwen4_nvfp4", "glm_nvfp4a4", "glmf_nvfp4a4", "qwen4_nvfp4a4",
-                                               "glmfdense_nvfp4", "glmfdense_nvfp4a4", "step5", "step5_bf16", "step5_nvfp4"),
+                                               "glmfdense_nvfp4", "glmfdense_nvfp4a4", "step5", "step5_fp8a8",
+                                               "step5_bf16", "step5_nvfp4", "mimo_fp8a8", "glm_fp8a8",
+                                               "glmf_fp8a8", "qwen4_fp8a8"),
                         required=True)
     create.add_argument("--layouts", help="comma list (default: tp4,tp2,tp6 where they split for spark, "
                         "tp1 for coordinator)")

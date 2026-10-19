@@ -705,12 +705,12 @@ impl<'a> GlmLoader<'a> {
             for (ops, attention) in ops.iter_mut().zip(attention) { ops.extend(attention); }
         }
         let mlp = if dense { format!("{p}.mlp") } else { format!("{p}.mlp.shared_experts") };
-        let mlp_numerics = if native_shared && !dense {
+        let declared_mlp = if native_shared && !dense {
             cuteafd_loader::plan::checkpoint::ModuleNumerics::CheckpointPrecision
         } else { checkpoint.module_numerics(&format!("{mlp}.gate_proj"))? };
         if dense || !native_shared {
         for projection in ["up_proj", "down_proj"] {
-            ensure!(checkpoint.module_numerics(&format!("{mlp}.{projection}"))? == mlp_numerics,
+            ensure!(checkpoint.module_numerics(&format!("{mlp}.{projection}"))? == declared_mlp,
                 "{mlp}: mixed declared MLP arithmetic is unsupported");
         }
         let (gate_up, down) = ([format!("{mlp}.gate_proj.weight"), format!("{mlp}.up_proj.weight")],
@@ -735,6 +735,14 @@ impl<'a> GlmLoader<'a> {
             ops[0].insert("gate", self.one(&format!("{p}.mlp.gate.weight"))?);
             ops[0].insert("gate.bias", self.one(&format!("{p}.mlp.gate.e_score_correction_bias"))?);
         }
+        // GlmLayer.mlp_numerics == W8A8 selects the ModelOpt per-tensor static-scale
+        // FFN program; 128x128 block-FP8 MLPs use w_gate_up_scale/w_down_scale.
+        let mlp_numerics = if declared_mlp == cuteafd_loader::plan::checkpoint::ModuleNumerics::W8A8
+            && self.catalog.tensor(&format!("{mlp}.gate_proj.weight_scale_inv")).is_ok() {
+            cuteafd_loader::plan::checkpoint::ModuleNumerics::CheckpointPrecision
+        } else {
+            declared_mlp
+        };
         if mlp_numerics == cuteafd_loader::plan::checkpoint::ModuleNumerics::W8A8 {
             ensure!(ops.iter().all(|operands| operands.contains_key("w_gate_up_tscale")
                 && operands.contains_key("w_down_tscale")),

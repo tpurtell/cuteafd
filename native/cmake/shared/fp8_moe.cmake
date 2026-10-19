@@ -119,20 +119,30 @@ or (glm|glmf|qwen4):nvfp4[a4] (ModelOpt NVFP4, calibrated W4A4 at all row counts
   list(APPEND CUTEAFD_FP8_MOE_MANIFESTS "${package}/manifest.json")
   if(CUTEAFD_FP8_MOE_ROLE STREQUAL "spark" AND geometry IN_LIST CUTEAFD_FP8_MOE_BF16_FAMILIES AND NOT entry MATCHES ":nvfp4")
     set(bf16_package "${package}-bf16")
-    add_custom_command(
-      OUTPUT "${bf16_package}/manifest.json"
-      COMMAND ${CUTEAFD_SPARKINFER_VERIFY_COMMAND}
-      COMMAND "${CMAKE_COMMAND}" -E rm -rf "${bf16_package}"
-      COMMAND "${CMAKE_COMMAND}" -E env ${CUTEAFD_SPARKINFER_PYTHON_ENV}
-        "${Python3_EXECUTABLE}" "${CUTEAFD_FP8_MOE_TOOL}" build
-        --role spark --input bf16 --geometry "${geometry}" --capacities "${CUTEAFD_FP8_MOE_CAPACITIES}" ${exact_slices} ${requested_layouts}
-        --build-dir "${CMAKE_CURRENT_BINARY_DIR}/fp8_moe_exports_bf16" --output "${bf16_package}"
-        --cxx "${CMAKE_CXX_COMPILER}" --cuda-include "${CUTEAFD_FP8_MOE_CUDA_INCLUDE}"
-        --cuda-libdir "$<TARGET_FILE_DIR:CUDA::cudart>" --runtime "${CUTEAFD_B12X_AOT_RUNTIME_LIBRARY}"
-      DEPENDS "${CUTEAFD_FP8_MOE_TOOL}" "${stamp}"
-        ${CUTEAFD_SPARKINFER_PROVENANCE_INPUTS} ${CUTEAFD_SPARKINFER_EXPORT_INPUTS}
-      COMMENT "Building exact FP8 expert package fp8-${geometry}-bf16 (spark, BF16 input)"
-      VERBATIM)
+    if(geometry STREQUAL "step5")
+      add_custom_command(
+        OUTPUT "${bf16_package}/manifest.json"
+        COMMAND "${CMAKE_COMMAND}" -E rm -rf "${bf16_package}"
+        COMMAND "${CMAKE_COMMAND}" -E copy_directory "${package}" "${bf16_package}"
+        DEPENDS "${package}/manifest.json"
+        COMMENT "Copying native BF16-input FP8 expert package fp8-${geometry}-bf16 (spark, BF16 input)"
+        VERBATIM)
+    else()
+      add_custom_command(
+        OUTPUT "${bf16_package}/manifest.json"
+        COMMAND ${CUTEAFD_SPARKINFER_VERIFY_COMMAND}
+        COMMAND "${CMAKE_COMMAND}" -E rm -rf "${bf16_package}"
+        COMMAND "${CMAKE_COMMAND}" -E env ${CUTEAFD_SPARKINFER_PYTHON_ENV}
+          "${Python3_EXECUTABLE}" "${CUTEAFD_FP8_MOE_TOOL}" build
+          --role spark --input bf16 --geometry "${geometry}" --capacities "${CUTEAFD_FP8_MOE_CAPACITIES}" ${exact_slices} ${requested_layouts}
+          --build-dir "${CMAKE_CURRENT_BINARY_DIR}/fp8_moe_exports_bf16" --output "${bf16_package}"
+          --cxx "${CMAKE_CXX_COMPILER}" --cuda-include "${CUTEAFD_FP8_MOE_CUDA_INCLUDE}"
+          --cuda-libdir "$<TARGET_FILE_DIR:CUDA::cudart>" --runtime "${CUTEAFD_B12X_AOT_RUNTIME_LIBRARY}"
+        DEPENDS "${CUTEAFD_FP8_MOE_TOOL}" "${stamp}"
+          ${CUTEAFD_SPARKINFER_PROVENANCE_INPUTS} ${CUTEAFD_SPARKINFER_EXPORT_INPUTS}
+        COMMENT "Building exact FP8 expert package fp8-${geometry}-bf16 (spark, BF16 input)"
+        VERBATIM)
+    endif()
     list(APPEND CUTEAFD_FP8_MOE_MANIFESTS "${bf16_package}/manifest.json")
   endif()
 endforeach()
