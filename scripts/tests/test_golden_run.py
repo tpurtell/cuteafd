@@ -552,6 +552,7 @@ def test_real_experts_start_before_and_stop_before_locks_release(spark_env, monk
         assert any('/spark-expert/workspace/.cuteafd-wip/libcuteafd_native.so:/opt/cuteafd/lib/libcuteafd_native.so:ro' in m
                    for m in mounts)
         assert any(m.endswith(':/opt/cuteafd/lib/fp8:ro') for m in mounts)
+        assert 'CUTEAFD_PROGRAM_MANIFEST=/opt/cuteafd/share/PROGRAMS.json' in argv
     run_env = json.loads((env['tmp'] / 'run-env.json').read_text())
     assert run_env['CUTEAFD_GOLDEN_PEERS'] == '10.9.0.1:19451,10.9.0.2:19451,10.9.0.3:19451,10.9.0.4:19451'
     assert run_env['CUTEAFD_GOLDEN_SPARK_WORLD'] == '4' and run_env['CUTEAFD_GOLDEN_EXPERT_LAYERS'] == '3'
