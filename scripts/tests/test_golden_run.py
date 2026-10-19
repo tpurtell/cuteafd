@@ -265,6 +265,7 @@ def test_env_per_arm_and_container_mounts(env, monkeypatch):
     for call, mode in zip(calls, ['heads', 'context']):
         envs = [call[i + 1] for i, a in enumerate(call) if a == '-e']
         assert f'CUTEAFD_ATTENTION_PLACEMENT={mode}' in envs and 'RUST_LOG=warn' in envs
+        assert 'CUTEAFD_PROGRAM_MANIFEST=/opt/cuteafd/share/PROGRAMS.json' in envs
         assert call[call.index('--user') + 1] == f'{os.getuid()}:{os.getgid()}'
         assert '--gpus' not in call
         assert [call[i + 1] for i, a in enumerate(call) if a == '--device'
