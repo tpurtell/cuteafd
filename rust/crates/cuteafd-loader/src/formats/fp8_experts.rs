@@ -297,6 +297,10 @@ impl Fp8ExpertTensors {
                 && catalog.tensors.contains_key(&format!("{first}_scale_2"));
             catalog.format = if nvfp4 { ExpertFormat::Nvfp4 } else { ExpertFormat::Mxfp4 };
         }
+        // One expert of the first routed layer fixes the format contract.
+        for projection in Fp8Projection::ALL {
+            catalog.check(first_layer, 0, projection)?;
+        }
         let mut layer_numerics = HashMap::new();
         for name in catalog.tensors.keys().filter(|name| name.ends_with(".weight")) {
             use crate::plan::checkpoint::ModuleNumerics;
@@ -329,10 +333,6 @@ impl Fp8ExpertTensors {
             }
         }
         catalog.numerics = Arc::new(layer_numerics);
-        // One expert of the first routed layer fixes the format contract.
-        for projection in Fp8Projection::ALL {
-            catalog.check(first_layer, 0, projection)?;
-        }
         Ok(catalog)
     }
 

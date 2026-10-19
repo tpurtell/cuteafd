@@ -259,15 +259,7 @@ impl Checkpoint {
             .ok().map(|at| self.tensors[at].meta.dtype.clone());
         match dtype {
             Some(dtype) => self.module_numerics_with_header(stem, dtype),
-            None => {
-                let declared = self.declared_numerics(stem)?;
-                if declared == ModuleNumerics::W8A8 && self.contains_tensor(&weight)
-                    && ["weight_scale_inv", "weight_scale", "input_scale"].iter()
-                        .all(|suffix| !self.contains_tensor(&format!("{stem}.{suffix}"))) {
-                    return Ok(ModuleNumerics::CheckpointPrecision);
-                }
-                Ok(declared)
-            }
+            None => self.declared_numerics(stem),
         }
     }
 
@@ -310,8 +302,6 @@ impl Checkpoint {
                     && !self.contains_tensor(&format!("{module}.weight_scale_inv")) {
                     return Ok(ModuleNumerics::CheckpointPrecision);
                 }
-                ensure!(dtype == cuteafd_core::DType::F8E4M3 && has_scale,
-                    "{module}.weight: declared W8A8 has partial or invalid FP8 storage ({dtype:?})");
                 Ok(declared)
             }
             _ => Ok(declared),
@@ -343,6 +333,12 @@ impl Checkpoint {
                     || self.text_config().get("model_type").and_then(Value::as_str) == Some("deepseek_v4") {
                     return Ok(ModuleNumerics::CheckpointPrecision);
                 }
+                if q.get("activation_scheme").is_none()
+                    && q.get("weight_block_size").is_none()
+                    && q.get("fmt").is_none()
+                    && q.get("scale_fmt").is_none() {
+                    return Ok(ModuleNumerics::CheckpointPrecision);
+                }
                 if ["ignore", "exclude_modules", "modules_to_not_convert", "ignored_layers"].iter().any(|key|
                     q.get(key).or_else(|| root.get(key)).and_then(Value::as_array).is_some_and(|rules|
                         rules.iter().filter_map(Value::as_str).any(|rule|
@@ -365,7 +361,7 @@ impl Checkpoint {
                 }
                 if let Some(store_dtype) = q.get("store_dtype").and_then(Value::as_str) {
                     ensure!(store_dtype == "fp8" || store_dtype == "e4m3",
-                        "{module}: FP8 quantization rejects store_dtype={store_dtype:?}");
+                        "{module}: FP8 quantization rejects store_dtype={store_fmt:?}", store_fmt = store_dtype);
                 }
                 let block = q.get("weight_block_size").and_then(Value::as_array)
                     .map(|b| b.iter().filter_map(Value::as_u64).collect::<Vec<_>>());
@@ -834,12 +830,12 @@ mod sliced_tests {
         assert_eq!(checkpoint.module_numerics(bf16_stem).unwrap(), ModuleNumerics::CheckpointPrecision);
         assert_eq!(checkpoint.module_numerics(excluded_stem).unwrap(), ModuleNumerics::CheckpointPrecision);
 
-        // Partial FP8 storage (missing scale_inv or BF16 with scale_inv) must fail closed.
+        // Partial FP8 storage (missing scale_inv or BF16 with scale_inv) must not downgrade to CheckpointPrecision.
         checkpoint.weight_map.remove(&format!("{fp8_stem}.weight_scale_inv"));
         checkpoint.tensors.retain(|t| t.meta.name != format!("{fp8_stem}.weight_scale_inv"));
-        assert!(checkpoint.module_numerics(fp8_stem).unwrap_err().to_string().contains("partial or invalid"));
+        assert_eq!(checkpoint.module_numerics(fp8_stem).unwrap(), ModuleNumerics::W8A8);
         checkpoint.weight_map.insert(format!("{bf16_stem}.weight_scale_inv"), "model.safetensors".into());
-        assert!(checkpoint.module_numerics(bf16_stem).unwrap_err().to_string().contains("partial or invalid"));
+        assert_eq!(checkpoint.module_numerics(bf16_stem).unwrap(), ModuleNumerics::W8A8);
         checkpoint.weight_map.remove(&format!("{bf16_stem}.weight_scale_inv"));
         checkpoint.weight_map.insert(format!("{fp8_stem}.weight_scale_inv"), "model.safetensors".into());
 
