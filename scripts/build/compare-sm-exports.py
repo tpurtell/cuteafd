@@ -156,6 +156,7 @@ def jobs(scope):
                    ["--geometry", geometry, "--capacities", CAPACITIES])
                   for geometry in EXL3_GEOMETRIES)
     result.extend([
+        ("kimi-k6-dense", "export_b12x_dsv4_aot.py", ["--geometry", "kimi_k6_dense"]),
         ("exlr8", "export_b12x_dsv4_aot.py", ["--geometry", "exlr8"]),
         ("exlr8-dense-trellis", "export_b12x_dsv4_aot.py",
          ["--geometry", "exlr8_dense", "--only",
